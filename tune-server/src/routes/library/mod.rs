@@ -17,6 +17,8 @@ mod collection_folders;
 pub(crate) mod collections;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
+// #4805 — les crédits d'un album lus juste après son identification.
+mod credits_apres_identification;
 mod duplicates;
 // Le mode « Modifier » de la fiche album (GO du 25/09/2026).
 mod edition;
@@ -33,7 +35,7 @@ mod genres;
 // LA définition du genre, partagée avec `/dashboard/stats` (#4527) : une seule
 // fonction, pour que « Genres » et « Genres écoutés » se comparent.
 pub(crate) use genres::genres_de_l_album;
-mod identification_lot;
+pub(crate) mod identification_lot;
 mod ingest;
 mod lyrics_pass;
 mod proposals;
@@ -41,6 +43,9 @@ mod query_multi;
 mod ratings;
 mod reidentify;
 mod reports;
+// tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
+// fichiers de CETTE machine.
+mod reveler;
 mod search;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
@@ -53,6 +58,8 @@ pub(crate) mod stats;
 mod tracks;
 pub(crate) mod write_tags;
 
+/// Les versions d'une piste regroupées par enregistrement (#2264).
+mod versions_groupes;
 use axum::Router;
 use axum::routing::{get, patch, post};
 use serde::Deserialize;
@@ -186,38 +193,29 @@ pub(super) fn artwork_is_hex_hash(s: &str) -> bool {
     (s.len() == 32 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
+#[doc(hidden)] // `pub` pour le témoin d'intégration de #5512 seulement.
+pub fn artwork_cache_dir() -> std::path::PathBuf {
     if let Ok(v) = std::env::var("TUNE_ARTWORK_DIR") {
         return std::path::PathBuf::from(v);
     }
     // #5467 — en build de test, jamais le chemin relatif `artwork_cache` (qui
     // tombait dans l'arbre source) ni le vrai dossier macOS de l'utilisateur.
-    #[cfg(test)]
+    // #5512 : tests d'intégration compris ; `None` dans le binaire publié.
     if let Some(dossier) = crate::isolement_disque_tests_5467::dossier_illustrations() {
         return dossier;
     }
 
-    // On Windows, resolve relative artwork_cache to %LOCALAPPDATA%\TuneServer\
-    // to avoid writing into read-only Program Files or an unpredictable CWD.
-    #[cfg(target_os = "windows")]
-    {
-        let data_dir = std::env::var("LOCALAPPDATA")
-            .map(|d| format!("{d}\\TuneServer"))
-            .unwrap_or_else(|_| "TuneServer".into());
-        return std::path::PathBuf::from(format!("{data_dir}\\artwork_cache"));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            let app_support = std::path::PathBuf::from(home)
-                .join("Library/Application Support/Tune/artwork_cache");
-            return app_support;
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    std::path::PathBuf::from("artwork_cache")
+    // #5513 — `TUNE_ARTWORK_DIR`, puis le cache qu'impose la configuration
+    // d'un appareil Tune OS déplacé, sinon le défaut historique de chaque
+    // plateforme (règle et défauts dans `crate::chemins_de_donnees`).
+    use crate::chemins_de_donnees as chemins;
+    chemins::cache_de_pochettes(None, chemins::cache_impose_retenu(), || {
+        chemins::cache_de_pochettes_par_defaut(
+            chemins::Plateforme::courante(),
+            std::env::var_os("HOME").as_deref(),
+            std::env::var("LOCALAPPDATA").ok().as_deref(),
+        )
+    })
 }
 
 /// Une réponse de refus uniforme pour les opérations explicites de la
@@ -342,6 +340,9 @@ pub fn router() -> Router<AppState> {
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
+        // tune-web-client#1875 — admin, depuis cette machine seulement.
+        .route("/reveal/available", get(reveler::revelation_disponible))
+        .route("/albums/{id}/reveal", post(reveler::reveler_album))
         .route("/albums/{id}/completeness", get(albums::album_completeness))
         .route("/albums/{id}/editions", get(albums::album_editions))
         // BIB-A2 (phase 0) : `/albums/eclates` AVANT `/albums/{id}`, comme `hidden`.
@@ -445,9 +446,23 @@ pub fn router() -> Router<AppState> {
         )
         .route("/tracks/{id}/audio", get(tracks::stream_track_audio))
         .route("/tracks/{id}/rescan", post(tracks::rescan_track))
+        .route(
+            "/tracks/{id}/tenues",
+            get(tracks::champs_tenus_get).delete(tracks::champs_tenus_retablir),
+        )
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))
+        // #2264 — les mêmes candidats, regroupés par enregistrement, avec la
+        // version jouée par défaut ; et la règle de choix, réglable.
+        .route(
+            "/tracks/{id}/versions/groups",
+            get(versions_groupes::track_version_groups),
+        )
+        .route(
+            "/versions/rule",
+            get(versions_groupes::get_version_rule).put(versions_groupes::put_version_rule),
+        )
         .route(
             "/tracks/{id}/synced-lyrics",
             get(tracks::track_synced_lyrics),
@@ -683,6 +698,11 @@ pub fn router() -> Router<AppState> {
             get(collections::collection_albums),
         )
         .route(
+            // #5527, #5528 — les manquants d'un dossier, avec leurs remplaçants.
+            "/collections/{id}/missing",
+            get(collections::collection_missing),
+        )
+        .route(
             "/collections/{id}/albums/{album_id}",
             post(collections::add_album_to_collection)
                 .delete(collections::remove_album_from_collection),
@@ -790,3 +810,7 @@ mod routage_tests {
         assert_eq!(noms.into_iter().collect::<Vec<_>>(), ["m::a"]);
     }
 }
+
+#[cfg(test)]
+#[path = "banc_rail_5993.rs"]
+mod banc_rail_5993;

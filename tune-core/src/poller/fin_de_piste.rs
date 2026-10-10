@@ -678,14 +678,16 @@ impl PositionPoller {
     /// - `GetMediaInfo` (`CurrentURI`, `NextURI`) : le transport a-t-il
     ///   pris la suivante ?
     ///
-    /// Lecture seule : rien ici ne change la décision.
+    /// #4382 (rc2, 05/10) — rend `true` quand le transport déclare LUI-MÊME
+    /// avoir ignoré le `Next` (`next_ignore_4382`) : la surveillance n'a plus
+    /// rien à attendre, et l'appareil est retenu pour ne plus en recevoir.
     pub(super) async fn echantillonner_la_surveillance(
         &self,
         zone_id: i64,
         device_id: &str,
         adoption: &AdoptionHorloge,
         status: &OutputStatus,
-    ) {
+    ) -> bool {
         let octets_tires = self.orchestrator.streamer_bytes_sent(&adoption.flux).await;
         let octets_depuis_adoption =
             decisions::octets_depuis_adoption(octets_tires, adoption.octets_a_l_adoption);
@@ -720,6 +722,45 @@ impl PositionPoller {
             media_suivante = ?media_suivante,
             "gapless_surveillance_echantillon"
         );
+        let ignore = super::next_ignore_4382::next_ignore_par_le_transport(
+            adoption.preuve,
+            media_courante.as_deref(),
+            media_suivante.as_deref(),
+            &adoption.flux,
+            status.position_ms,
+            adoption.position_figee_ms,
+        );
+        if ignore {
+            let nouveau = self
+                .appareils_qui_ignorent_next
+                .lock()
+                .map(|mut a| a.insert(device_id.to_string()))
+                .unwrap_or(false);
+            warn!(
+                zone_id,
+                device = %device_id,
+                age_ms = adoption.depuis.elapsed().as_millis() as u64,
+                retenu = nouveau,
+                "gapless_next_ignore_par_le_transport_relance"
+            );
+        }
+        ignore
+    }
+
+    /// #4382 — cet appareil a-t-il déjà déclaré ignorer un `Next` ? Alors on
+    /// ne le lui demande plus : la fin de piste relance aussitôt
+    /// (`SetAVTransportURI` + `Play`) au lieu de payer la fenêtre de
+    /// surveillance à chaque transition.
+    pub(super) fn next_deja_ignore(&self, zone_id: i64, device_id: &str) -> bool {
+        let ignore = self
+            .appareils_qui_ignorent_next
+            .lock()
+            .map(|a| a.contains(device_id))
+            .unwrap_or(false);
+        if ignore {
+            info!(zone_id, device = %device_id, "gapless_bascule_evitee_next_ignore");
+        }
+        ignore
     }
 
     /// #4173 — la fin à l'horloge ADOPTE l'enchaînement du renderer.
@@ -805,6 +846,12 @@ impl PositionPoller {
                         ADOPTION_HORLOGE_DELAI_SECS
                     },
                     octets_a_l_adoption: octets_tires,
+                    // L'instantané du tour est pris AVANT l'avance : il nomme
+                    // encore la piste finie.
+                    flux_fini: zone_state
+                        .now_playing
+                        .as_ref()
+                        .and_then(|np| np.stream_id.clone()),
                 });
             }
             None => {
@@ -813,11 +860,83 @@ impl PositionPoller {
         }
     }
 
+    /// #5411 (fil 2031) — l'écran va avancer parce que la position du
+    /// renderer est retombée, ou parce qu'il est reparti après un arrêt dans
+    /// la garde. Si le renderer nomme ENCORE le flux de la piste finie, il ne
+    /// joue pas la suivante : il rejoue la piste finie (Sony BD-P2100 : « le
+    /// N est rejoué du début, le N+1 a été remplacé par le N »). L'avance
+    /// devient alors provisoire : rend la surveillance à poser, celle d'une
+    /// bascule. L'URI qui passe au flux armé la confirme ; sinon, le délai
+    /// écoulé, le repli joue la piste affichée — aucune piste n'est sautée.
+    ///
+    /// À appeler AVANT `advance_queue_metadata`, qui consomme le flux armé.
+    /// `None` — le cas de tout renderer qui ne rapporte pas d'URI, ou qui
+    /// nomme le flux armé — laisse l'avance d'avant intacte.
+    pub(super) async fn rejeu_de_la_piste_finie(
+        &self,
+        zone_id: i64,
+        zone_state: &crate::playback::ZoneState,
+        status: &OutputStatus,
+        duree_de_la_piste_finie_ms: u64,
+    ) -> Option<AdoptionHorloge> {
+        // Sans durée connue, le recul de position ne se juge pas : la règle
+        // d'avant.
+        if duree_de_la_piste_finie_ms == 0 {
+            return None;
+        }
+        let flux_fini = zone_state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.clone());
+        let flux_arme = self.orchestrator.flux_pre_arme(zone_id).await;
+        if !decisions::renderer_rejoue_la_piste_finie(
+            status.current_uri.as_deref(),
+            flux_fini.as_deref(),
+            flux_arme.as_deref(),
+            matches!(zone_state.repeat, RepeatMode::One),
+        ) {
+            return None;
+        }
+        warn!(
+            zone_id,
+            position_ms = status.position_ms,
+            uri = ?status.current_uri,
+            flux_fini = ?flux_fini,
+            flux_arme = ?flux_arme,
+            "gapless_retombee_sur_la_piste_finie_surveillee"
+        );
+        // Le débit tiré du flux armé se mesure à partir d'ici.
+        let octets_a_l_adoption = match flux_arme.as_deref() {
+            Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+            None => None,
+        };
+        Some(AdoptionHorloge {
+            depuis: Instant::now(),
+            // La référence du recul : la fin de la piste finie, d'où le
+            // renderer vient de retomber.
+            position_figee_ms: duree_de_la_piste_finie_ms,
+            flux: flux_arme.unwrap_or_default(),
+            preuve: decisions::EnchainementArme::RejeuDeLaPisteFinie,
+            delai_secs: BASCULE_DELAI_SECS,
+            octets_a_l_adoption,
+            flux_fini,
+        })
+    }
+
     pub(super) async fn resolve_gapless_next(
         &self,
         zone_id: i64,
         next_pos: i64,
     ) -> Result<crate::orchestrator::ResolvedQueueItem, String> {
+        #[cfg(test)]
+        {
+            // #5970 — banc : une résolution artificiellement lente.
+            let (retard, appels) = RESOLUTION_LENTE_5970.with(|c| c.get());
+            RESOLUTION_LENTE_5970.with(|c| c.set((retard, appels + 1)));
+            if let Some(d) = retard {
+                tokio::time::sleep(d).await;
+            }
+        }
         match self
             .orchestrator
             .resolve_queue_item_url(zone_id, next_pos)
@@ -838,6 +957,7 @@ impl PositionPoller {
         zone_id: i64,
         zone_state: &crate::playback::ZoneState,
         device_id: &str,
+        fin_estimee: Instant,
     ) -> GaplessPrep {
         // #4806 / #5143 — une suivante BANNIE (locale ou de service) n'est
         // jamais armée : armée, elle serait jouée par le renderer sans que la
@@ -884,7 +1004,7 @@ impl PositionPoller {
         // surface failures at warn. These paths were debug-only, so streaming
         // gapless instability (Tidal DASH download slowness, URL/token issues)
         // was invisible in production journald. Logging only — no behaviour change.
-        self.armer_le_flux_suivant(zone_id, next_pos, device_id, arme)
+        self.armer_le_flux_suivant(zone_id, next_pos, device_id, arme, fin_estimee)
             .await
     }
 
@@ -977,9 +1097,35 @@ impl PositionPoller {
         next_pos: i64,
         device_id: &str,
         arme: Option<ArmedNext>,
+        fin_estimee: Instant,
     ) -> GaplessPrep {
         let t0 = Instant::now();
-        match self.resolve_gapless_next(zone_id, next_pos).await {
+        // #5970 — la résolution est attendue DANS le tick, qui sonde toutes
+        // les zones : elle a un budget, pris sur ce qui reste de la piste en
+        // cours. Hors budget, on renonce à l'enchaînement pour cette piste ;
+        // la fin de piste jouera la suivante explicitement. Une session déjà
+        // créée par la résolution interrompue est ramassée comme toute
+        // session inactive.
+        let budget =
+            decisions::budget_de_resolution_gapless(fin_estimee.saturating_duration_since(t0));
+        let resolution = match tokio::time::timeout(
+            budget,
+            self.resolve_gapless_next(zone_id, next_pos),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                warn!(
+                    zone_id,
+                    budget_ms = budget.as_millis() as u64,
+                    resolve_ms = t0.elapsed().as_millis() as u64,
+                    "gapless_preparation_abandonnee_hors_budget"
+                );
+                return GaplessPrep::Abandonnee;
+            }
+        };
+        match resolution {
             Ok(resolved) => {
                 let resolve_ms = t0.elapsed().as_millis() as u64;
                 let is_streaming = resolved.stream_id.is_some();
@@ -1091,6 +1237,21 @@ impl PositionPoller {
                         track_number: resolved.track_number,
                         disc_number: resolved.disc_number,
                     };
+                    // #5970 — prête trop tard : la piste en cours est finie
+                    // ou presque, le renderer peut déjà être arrêté. Un
+                    // `SetNext` n'y ferait rien ; la fin de piste la jouera
+                    // par `SetAVTransportURI` + `Play`, une seule fois.
+                    if decisions::suivante_trop_tardive_pour_setnext(
+                        fin_estimee.saturating_duration_since(Instant::now()),
+                    ) {
+                        warn!(
+                            zone_id,
+                            resolve_ms,
+                            prep_ms = t0.elapsed().as_millis() as u64,
+                            "gapless_suivante_prete_trop_tard"
+                        );
+                        return GaplessPrep::Abandonnee;
+                    }
                     if let Err(e) = output.set_next_media(&media).await {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
                         GaplessPrep::NotArmed
@@ -1129,6 +1290,15 @@ impl PositionPoller {
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// #5970 — banc : retard imposé à la résolution de la suivante, et nombre
+    /// de résolutions tentées. Par fil : `#[tokio::test]` tourne sur le fil
+    /// du test, les autres tests n'en voient rien.
+    pub(super) static RESOLUTION_LENTE_5970: std::cell::Cell<(Option<Duration>, usize)> =
+        const { std::cell::Cell::new((None, 0)) };
 }
 
 #[cfg(test)]

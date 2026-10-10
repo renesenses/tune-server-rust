@@ -80,9 +80,10 @@ pub struct Album {
     ///
     /// 🔴 `None` veut dire INCONNU, et l'inconnu est l'état NORMAL : la
     /// couverture MBID mesurée est de 0,9 % sur le .18 et 88,4 % sur le .15.
-    /// Rien ne le devine — ni le nombre de titres, ni la durée. Un client qui
-    /// lit `null` doit le dire ou s'abstenir, jamais classer d'office : un tri
-    /// faux est pire qu'une section absente (#4767).
+    /// Cette colonne ne porte QUE le type explicite : la règle de repli par
+    /// pistes et durée (#5616, [`crate::metadata::release_type::type_deduit`])
+    /// n'y écrit jamais ; la fiche artiste publie son résultat à part, sous
+    /// `inferred_release_type`.
     ///
     /// Les `secondary-types` (Live, Compilation, Soundtrack, Remix…) ne
     /// changent JAMAIS cette valeur — un album live reste un `album`. Pour
@@ -102,6 +103,12 @@ const BADGE_HIRES_SAMPLE_RATE_AU_DELA: i32 = 48000;
 const BADGE_HIRES_BIT_DEPTH_AU_DELA: i32 = 16;
 /// Formats avec perte, comparés à l'égalité exacte.
 const BADGE_FORMATS_LOSSY: [&str; 5] = ["mp3", "ogg", "opus", "wma", "aac"];
+/// Formats SANS badge, prioritaires sur tout le reste (fil 2126, décision de
+/// Bertrand du 04/10 : « ni palier ni badge »). `m4a` est le conteneur MP4
+/// dont le codec n'a pas été lu (`AudioFormat::M4a`) : ce peut être de l'AAC
+/// comme de l'ALAC, et tout badge — `cd` par défaut jusqu'ici, ou `hi-res`
+/// sur sa seule fréquence — affirmerait ce que personne n'a mesuré.
+const BADGE_FORMATS_INDETERMINES: [&str; 1] = ["m4a"];
 
 impl Album {
     pub fn to_json(&self) -> serde_json::Value {
@@ -119,7 +126,9 @@ impl Album {
         let fmt = self.format.as_deref().unwrap_or("");
         let sr = self.sample_rate.unwrap_or(0);
         let bd = self.bit_depth.unwrap_or(0);
-        if BADGE_DSD_MARQUEURS.iter().any(|m| fmt.contains(m)) {
+        if BADGE_FORMATS_INDETERMINES.contains(&fmt) {
+            None
+        } else if BADGE_DSD_MARQUEURS.iter().any(|m| fmt.contains(m)) {
             Some("dsd".into())
         } else if sr > BADGE_HIRES_SAMPLE_RATE_AU_DELA || bd > BADGE_HIRES_BIT_DEPTH_AU_DELA {
             Some("hi-res".into())
@@ -144,8 +153,8 @@ impl Album {
     /// piste au-delà de 44,1 kHz ou de 16 bits suffisait, DSD compris — et
     /// rendait sous « Hi-Res » des albums sans badge et des DSD (Rhorn,
     /// fil 2032). Le prédicat est donc DÉRIVÉ des mêmes constantes que le
-    /// badge, dans le même ordre de priorité (DSD, puis hi-res, puis lossy,
-    /// puis cd).
+    /// badge, dans le même ordre de priorité (format sans badge, puis DSD,
+    /// puis hi-res, puis lossy, puis cd).
     ///
     /// Portable SQLite et PostgreSQL sans marqueur lié : `COALESCE` rend à
     /// `NULL` la valeur que `unwrap_or` lui donne en Rust (`''` et `0`), et
@@ -170,13 +179,23 @@ impl Album {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        Some(match badge {
+        let indetermine = format!(
+            "{fmt} IN ({})",
+            BADGE_FORMATS_INDETERMINES
+                .iter()
+                .map(|f| format!("'{f}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let predicat = match badge {
             "dsd" => format!("({dsd})"),
             "hires" | "hi-res" => format!("(NOT ({dsd}) AND ({hires}))"),
             "lossy" => format!("(NOT ({dsd}) AND NOT ({hires}) AND {lossy})"),
             "cd" => format!("(NOT ({dsd}) AND NOT ({hires}) AND NOT ({lossy}) AND {fmt} <> '')"),
             _ => return None,
-        })
+        };
+        // Un format sans badge ne sort sous AUCUN filtre (fil 2126).
+        Some(format!("(NOT ({indetermine}) AND {predicat})"))
     }
 
     pub fn new(title: String) -> Self {
@@ -511,6 +530,29 @@ mod tests {
         a.sample_rate = Some(44100);
         a.bit_depth = Some(16);
         assert_eq!(a.quality(), Some("cd".into()));
+    }
+
+    /// Fil 2126 — un album `m4a` (codec non lu) ne porte AUCUN badge, même
+    /// à 96 kHz : c'était `cd` par défaut, ou `hi-res` sur la seule fréquence.
+    #[test]
+    fn album_quality_m4a_sans_badge() {
+        for (sr, bd) in [
+            (None, None),
+            (Some(44100), None),
+            (Some(96000), None),
+            (Some(96000), Some(24)),
+        ] {
+            let mut a = Album::new("M4A".into());
+            a.format = Some("m4a".into());
+            a.sample_rate = sr;
+            a.bit_depth = bd;
+            assert_eq!(
+                a.quality(),
+                None,
+                "m4a {sr:?}/{bd:?} ne doit porter aucun badge"
+            );
+            assert_eq!(a.to_json()["quality"], serde_json::Value::Null);
+        }
     }
 
     #[test]

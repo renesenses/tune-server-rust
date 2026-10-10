@@ -57,6 +57,27 @@ fn frame_aligned_chunk_len(preferred: usize, bit_depth: u16, channels: u16) -> u
     if aligned == 0 { frame } else { aligned }
 }
 
+/// Nombre d'échantillons entrelacés d'une fenêtre de `max_duration_s`
+/// secondes, arrondi à un nombre ENTIER de trames (fil 2133).
+///
+/// L'ancien calcul `(durée × débit × canaux) as usize` arrondissait le
+/// produit entier : une piste CUE de 263,346 s en stéréo 44,1 kHz donnait
+/// 23 227 117 échantillons, un nombre impair, et la découpe vers un fichier
+/// temporaire (zone Sonos) échouait ensuite dans
+/// `validate_channel_adaptation` (« PCM sample count … is not aligned to 2
+/// source channels »). On arrondit d'abord en trames, puis on multiplie par
+/// les canaux, comme le chemin DSD le faisait déjà.
+///
+/// `max_duration_s <= 0.0` est la convention « pas de limite » : `usize::MAX`.
+pub(crate) fn echantillons_de_la_fenetre(max_duration_s: f64, rate: u32, channels: u32) -> usize {
+    if max_duration_s > 0.0 {
+        let trames = (max_duration_s * f64::from(rate)) as usize;
+        trames.saturating_mul(channels.max(1) as usize)
+    } else {
+        usize::MAX
+    }
+}
+
 /// Resolve the actual audio bit depth from codec parameters.
 ///
 /// Symphonia's ISOMP4 demuxer does not populate `bits_per_sample` for ALAC
@@ -905,11 +926,33 @@ impl StageCache {
 /// Budget disque du cache de staging (octets). Assez pour une longue session
 /// d'écoute ALAC (celle d'Yves : 1,3 Go), borné pour ne pas saturer le disque
 /// système. Surchargeable par `TUNE_STAGE_CACHE_BYTES`.
+///
+/// Fil 2167 — les copies vivent dans le dossier temporaire : quand c'est un
+/// `tmpfs`, les 3 Go seraient de la RAM. Sans réglage explicite, le budget
+/// suit alors la mémoire de la machine
+/// ([`crate::chemins_de_travail::plafond_de_cache`]).
 fn stage_cache_budget() -> u64 {
-    std::env::var("TUNE_STAGE_CACHE_BYTES")
+    let reglage = std::env::var("TUNE_STAGE_CACHE_BYTES")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3 * 1024 * 1024 * 1024) // 3 Go
+        .and_then(|v| v.parse().ok());
+    stage_cache_budget_dans(
+        // tmp-autorise: on LIT le type du système de fichiers, rien n'y est créé.
+        &std::env::temp_dir(),
+        reglage,
+        crate::chemins_de_travail::memoire_vive_totale(),
+    )
+}
+
+/// [`stage_cache_budget`] avec le dossier, le réglage et la RAM PASSÉS (garde
+/// du fil 2167).
+fn stage_cache_budget_dans(dossier: &Path, reglage: Option<u64>, ram: Option<u64>) -> u64 {
+    crate::chemins_de_travail::plafond_de_cache_pour(
+        dossier,
+        "prechargement",
+        3 * 1024 * 1024 * 1024, // 3 Go
+        reglage,
+        ram,
+    )
 }
 
 static STAGE_CACHE: LazyLock<Mutex<StageCache>> =
@@ -1325,6 +1368,40 @@ pub fn decode_to_pcm(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
+    let decoded = decode_natif(
+        file_path,
+        target_sample_rate,
+        target_channels,
+        seek_s,
+        max_duration_s,
+    )?;
+    adapt_decoded_audio(decoded, target_sample_rate, target_channels)
+}
+
+/// L'adaptation commune de [`decode_to_pcm`] (canaux puis cadence), appliquée
+/// à un décodage NATIF de [`decode_natif`].
+///
+/// #5519 — `decode_to_pcm(f, r, c, s, d)` vaut EXACTEMENT
+/// `adapter_pcm(decode_natif(f, r, c, s, d)?, r, c)` : c'est sa définition.
+/// L'analyse ReplayGain s'en sert pour tirer l'empreinte et son premier
+/// segment d'UN seul décodage, au bit près.
+pub(crate) fn adapter_pcm(
+    decoded: DecodedAudio,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+) -> Result<DecodedAudio, String> {
+    adapt_decoded_audio(decoded, target_sample_rate, target_channels)
+}
+
+/// Le décodage de [`decode_to_pcm`] AVANT l'adaptation : cadence et canaux du
+/// fichier (sauf DSD, dont le décodeur vise directement `target_sample_rate`).
+pub(crate) fn decode_natif(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Result<DecodedAudio, String> {
     if target_sample_rate == Some(0) {
         return Err("requested PCM sample rate must be greater than zero".into());
     }
@@ -1462,7 +1539,7 @@ pub fn decode_to_pcm(
         );
     }
 
-    adapt_decoded_audio(decoded, target_sample_rate, target_channels)
+    Ok(decoded)
 }
 
 /// Sniff whether an Ogg stream carries Opus (`OpusHead`) rather than Vorbis.
@@ -1990,6 +2067,18 @@ fn borner_la_fin(
     relais_tx
 }
 
+/// Prefixe de l'erreur rendue quand symphonia ne reconnait aucun format dans
+/// le flux du decodeur progressif. Cette sonde precede l'en-tete WAV : une
+/// erreur qui le porte n'a donc encore rien ecrit dans la session.
+const PREFIXE_ECHEC_DE_SONDE: &str = "probe: ";
+
+/// #5553 — vrai si le decodeur progressif a echoue AVANT d'avoir envoye son
+/// premier octet (en-tete WAV compris), a la sonde du format. L'appelant peut
+/// alors reprendre la piste par un autre chemin sans rien avoir a defaire.
+pub fn echec_avant_le_premier_octet(erreur: &str) -> bool {
+    erreur.starts_with(PREFIXE_ECHEC_DE_SONDE)
+}
+
 /// Variante HTTP seekable du decodeur progressif. La source a deja prouve le
 /// support de `Range`; Symphonia peut donc lire l'atome `moov` a la fin d'un
 /// M4A puis revenir aux premiers paquets sans telecharger tout le media (#1885).
@@ -2388,7 +2477,7 @@ fn decode_to_pcm_streaming_inner(
             FormatOptions::default(),
             MetadataOptions::default(),
         )
-        .map_err(|e| format!("probe: {e}"))?;
+        .map_err(|e| format!("{PREFIXE_ECHEC_DE_SONDE}{e}"))?;
 
     let track = format
         .default_track(TrackType::Audio)
@@ -3016,11 +3105,11 @@ fn decode_ape_to_pcm(
     let (start_frame, mut skip_interleaved) = ape_start_position(&mut decoder, &header, seek_s)?;
     // `max_duration_s` borne le décodage : on s'arrête dès que la fenêtre est
     // pleine, sans décoder la fin de la piste pour la jeter ensuite.
-    let max_samples: usize = if max_duration_s > 0.0 {
-        (max_duration_s * header.sample_rate as f64 * header.channels as f64) as usize
-    } else {
-        usize::MAX
-    };
+    let max_samples: usize = echantillons_de_la_fenetre(
+        max_duration_s,
+        header.sample_rate,
+        u32::from(header.channels),
+    );
     let start_sample = (start_frame as u64).saturating_mul(u64::from(header.blocks_per_frame));
     let expected_out = (header
         .total_samples
@@ -3728,41 +3817,52 @@ fn decode_symphonia(
     // error by returning an EMPTY segment: the analyzers break on the resulting
     // `is_empty()`. The first segment (seek_s == 0.0, no seek) always decodes
     // normally, so the analysis still runs over the head of the track.
+    //
+    // 🔴 Le démultiplexeur se pose sur le DÉBUT du paquet qui contient la
+    // cible (`actual_ts <= required_ts`) : trame FLAC de 4 096 échantillons,
+    // paquet simulé du WAV. Sans rogner le résidu `required_ts - actual_ts`,
+    // la fenêtre rendue commençait jusqu'à un paquet AVANT `seek_s`. L'analyse
+    // par segments de 30 s (`analyzer::mesurer_a_partir_de`) avance son seek
+    // du nombre exact de trames reçues : chaque jonction rejouait donc la fin
+    // du segment précédent — échantillons comptés deux fois, et une
+    // discontinuité que le suréchantillonnage 4× du vrai pic lisait comme un
+    // over (FLAC 20 min : 0,507 au lieu de 0,455). Même rognage que le chemin
+    // de lecture en continu (`decode_to_pcm_streaming_inner`).
+    let mut trames_a_sauter: u64 = 0;
     if seek_s > 0.0 {
         let seconds = seek_s as i64;
         let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
         let time = Time::try_new(seconds, nanos).unwrap_or(Time::ZERO);
-        if format
-            .seek(
-                SeekMode::Coarse,
-                SeekTo::Time {
-                    time,
-                    track_id: Some(track_id),
-                },
-            )
-            .is_err()
-        {
-            debug!(
-                file = file_path,
-                seek_s, "decode_symphonia_seek_failed_returning_empty"
-            );
-            return Ok(DecodedAudio {
-                samples_i32: Vec::new(),
-                bit_depth: source_bd,
-                sample_rate: source_rate,
-                channels: source_channels,
-                duration_s: 0.0,
-                integrite: Default::default(),
-            });
+        match format.seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time,
+                track_id: Some(track_id),
+            },
+        ) {
+            Ok(seeked) => {
+                trames_a_sauter = (seeked.required_ts.get() - seeked.actual_ts.get()).max(0) as u64;
+                decoder.reset();
+            }
+            Err(_) => {
+                debug!(
+                    file = file_path,
+                    seek_s, "decode_symphonia_seek_failed_returning_empty"
+                );
+                return Ok(DecodedAudio {
+                    samples_i32: Vec::new(),
+                    bit_depth: source_bd,
+                    sample_rate: source_rate,
+                    channels: source_channels,
+                    duration_s: 0.0,
+                    integrite: Default::default(),
+                });
+            }
         }
     }
 
     let mut all_samples: Vec<i32> = Vec::new();
-    let max_samples = if max_duration_s > 0.0 {
-        (max_duration_s * source_rate as f64 * source_channels as f64) as usize
-    } else {
-        usize::MAX
-    };
+    let max_samples = echantillons_de_la_fenetre(max_duration_s, source_rate, source_channels);
     // 🔴 #2218 T4 — les deux `Err(_)` muets de cette boucle sont la CAUSE
     // mesurée du défaut FLAC : un octet abîmé au milieu des trames coûtait
     // 23,2 % de la piste, `decode_to_pcm` rendait `Ok(_)`, et pas une ligne
@@ -3829,7 +3929,16 @@ fn decode_symphonia(
 
         let mut packet_samples: Vec<i32> = Vec::new();
         decoded.copy_to_vec_interleaved::<i32>(&mut packet_samples);
-        all_samples.extend_from_slice(&packet_samples);
+        // Rognage à l'échantillon près des trames qui précèdent `seek_s`.
+        let mut debut = 0usize;
+        if trames_a_sauter > 0 {
+            let ch = source_channels.max(1) as usize;
+            let trames = (packet_samples.len() / ch) as u64;
+            let rognees = trames_a_sauter.min(trames);
+            trames_a_sauter -= rognees;
+            debut = rognees as usize * ch;
+        }
+        all_samples.extend_from_slice(&packet_samples[debut..]);
         // Débit de décodage observable sans coût (#3140) : un paquet FLAC vaut
         // quelques dizaines de millisecondes d'audio. Inerte sans balise.
         super::decode_progress::publier(
@@ -4516,6 +4625,56 @@ fn dsd_needed_samples(
         .saturating_mul(channels.max(1))
 }
 
+/// Le convertisseur d'un décodage DSF/DFF borné, repris au plus près AVANT
+/// la fenêtre FIR de la première trame demandée (plafond-analyse).
+///
+/// Jusqu'ici un DSF ou un DFF se décodait TOUJOURS depuis son premier bit,
+/// puis le PCM d'avant `seek_s` était jeté. L'analyse ReplayGain/DR lit la
+/// piste par segments de 30 s : chaque segment re-convertissait donc tout ce
+/// qui le précédait. Le temps était quadratique en durée, et la mémoire
+/// résidente du segment croissait avec sa position — toute la piste en PCM
+/// `i32` au dernier segment. C'est ce que le plafond `MAX_ANALYSIS_EST_BYTES`
+/// masquait en écartant les longues pistes DSD.
+///
+/// `chercher` positionne le lecteur sur un octet par canal (arrondi au bloc
+/// par le lecteur, toujours EN DEÇÀ de la cible) et rend l'octet atteint. Le
+/// convertisseur rendu reprend là, et sa première sortie est rendue avec
+/// lui : le PCM est identique au bit près à celui du décodage depuis le début
+/// (`decode_dsf_repris_identique_au_decodage_depuis_le_debut`).
+fn reprendre_le_flux_dsd(
+    dsd_rate: u32,
+    output_rate: u32,
+    channels: usize,
+    lsb_first: bool,
+    seek_s: f64,
+    chercher: impl FnOnce(usize) -> Result<usize, String>,
+) -> Result<(super::dsd_to_pcm::DsdToPcmStreamer, usize), String> {
+    use super::dsd_to_pcm::DsdToPcmStreamer;
+    let depuis_le_debut = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, lsb_first);
+    let trame = if seek_s > 0.0 {
+        (seek_s * output_rate as f64) as usize
+    } else {
+        0
+    };
+    let premier_bit = depuis_le_debut.premier_bit_de_la_sortie(trame);
+    if premier_bit < 8 {
+        return Ok((depuis_le_debut, 0));
+    }
+    let atteint = chercher(premier_bit as usize / 8)?;
+    let repris =
+        DsdToPcmStreamer::a_partir_de(dsd_rate, output_rate, channels, lsb_first, atteint * 8);
+    let premiere = repris.prochaine_sortie();
+    // Le lecteur n'a pas le droit de dépasser la cible ; s'il l'a fait, la
+    // trame demandée n'est plus calculable : on refuse plutôt que de rendre
+    // un PCM décalé.
+    if premiere > trame {
+        return Err(format!(
+            "dsd: reprise au-delà de la fenêtre demandée (octet {atteint}, trame {premiere} > {trame})"
+        ));
+    }
+    Ok((repris, premiere))
+}
+
 fn decode_dsd_to_pcm(
     file_path: &str,
     ext: &str,
@@ -4548,6 +4707,9 @@ fn decode_dsd_to_pcm(
     // qui contient `seek_s` : il ne reste que l'écart à l'intérieur de cette
     // trame (moins de 1/75 s).
     let mut seek_pcm_s = seek_s;
+    // Les trames PCM que la reprise au bloc a déjà sautées (DSF et DFF bruts) :
+    // `all_samples` commence à cette trame-là, pas à la trame 0.
+    let mut deja_saute: usize = 0;
 
     let (dsd_rate, output_rate, channels) = if ext == "iso" {
         let chemin = Path::new(file_path);
@@ -4580,13 +4742,26 @@ fn decode_dsd_to_pcm(
         let dsd_rate = info.sample_rate;
         let channels = info.channels as usize;
         let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
-        // Pre-reserve the whole output so the Vec doesn't repeatedly reallocate
-        // as it grows: output samples ≈ (dsd_samples / decimation) * channels.
         let decimation = (dsd_rate / output_rate).max(1) as u64;
-        all_samples.reserve((info.total_samples / decimation) as usize * channels);
-        let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, true);
+        let total_samples = info.total_samples;
         let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
-        let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels);
+        // plafond-analyse : partir du bloc qui précède la fenêtre, pas du
+        // début du fichier. Voir `reprendre_le_flux_dsd`.
+        let (mut streamer, premiere) =
+            reprendre_le_flux_dsd(dsd_rate, output_rate, channels, true, seek_s, |octets| {
+                reader.seek_to_bytes_per_channel(octets)
+            })?;
+        deja_saute = premiere;
+        let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels)
+            .saturating_sub(premiere * channels);
+        // Pre-reserve the output so the Vec doesn't repeatedly reallocate as it
+        // grows — but only what this window needs: reserving the WHOLE file at
+        // every 30 s segment committed gigabytes for a long DSD256 track.
+        all_samples.reserve(
+            ((total_samples / decimation) as usize * channels)
+                .saturating_sub(premiere * channels)
+                .min(needed),
+        );
         while let Some(dsd_chunk) = reader.next_chunk()? {
             append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
             // Débit de décodage observable sans coût (#3140) : un super-bloc
@@ -4614,11 +4789,31 @@ fn decode_dsd_to_pcm(
         // DFF has no explicit sample count; estimate from the data chunk size
         // (data_size bytes * 8 DSD samples/byte, then decimated).
         let decimation = (dsd_rate / output_rate).max(1) as u64;
-        all_samples.reserve((info.data_size.saturating_mul(8) / decimation) as usize);
-        let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, false);
         let read_chunk = 32768 / channels * channels;
         let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
-        let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels);
+        // plafond-analyse : même reprise que la branche DSF, pour du DSD BRUT.
+        // Un DST se recherche par trame (`LecteurDst::rechercher`) : il garde
+        // son décodage depuis le début, inchangé.
+        let (mut streamer, premiere) = if info.is_dst() {
+            (
+                DsdToPcmStreamer::new(dsd_rate, output_rate, channels, false),
+                0,
+            )
+        } else {
+            reprendre_le_flux_dsd(dsd_rate, output_rate, channels, false, seek_s, |octets| {
+                reader
+                    .seek_to_interleaved_byte(octets.saturating_mul(channels), channels)
+                    .map(|entrelaces| entrelaces / channels.max(1))
+            })?
+        };
+        deja_saute = premiere;
+        let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels)
+            .saturating_sub(premiere * channels);
+        all_samples.reserve(
+            ((info.data_size.saturating_mul(8) / decimation) as usize)
+                .saturating_sub(premiere * channels)
+                .min(needed),
+        );
         while let Some(dsd_chunk) = reader.next_chunk()? {
             append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
             // Même balise que la branche DSF (#3140).
@@ -4640,7 +4835,8 @@ fn decode_dsd_to_pcm(
         (seek_pcm_s * output_rate as f64) as usize
     } else {
         0
-    };
+    }
+    .saturating_sub(deja_saute);
     let skip_samples = skip_frames * channels;
 
     let max_frames = if max_duration_s > 0.0 {
@@ -4704,6 +4900,37 @@ mod decode_integration_tests {
             mtime: 0,
             size: 0,
         }
+    }
+
+    /// Fil 2167 — TÉMOIN : sur un `tmpfs`, les copies de préchargement ne
+    /// tiennent pas plus d'un trente-deuxième de la RAM.
+    ///
+    /// Le budget est calculé pour un VRAI `tmpfs` (`/dev/shm`) et 16 Gio de
+    /// RAM, puis quarante copies de 100 Mio entrent dans le cache — une
+    /// longue écoute depuis un partage réseau. Avant le correctif : budget de
+    /// 3 Gio, soit 3 Gio de RAM tenus. Après : au plus 512 Mio.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sur_tmpfs_le_cache_de_prechargement_reste_borne_par_la_ram() {
+        let shm = std::path::Path::new("/dev/shm");
+        if !crate::chemins_de_travail::est_en_memoire(shm) {
+            eprintln!("témoin ignoré : /dev/shm n'est pas un tmpfs sur cette machine");
+            return;
+        }
+        const MIO: u64 = 1024 * 1024;
+        let budget = super::stage_cache_budget_dans(shm, None, Some(16 * 1024 * MIO));
+        let mut c = super::StageCache::new(budget);
+        for i in 0..40 {
+            c.insert(cle(&format!("piste-{i}")), faux_stage(100 * MIO));
+        }
+        assert!(
+            c.bytes <= 512 * MIO,
+            "les copies de préchargement tiennent {} Mio sur un tmpfs (16 Gio de RAM) : \
+             plus de 512 Mio de mémoire vive",
+            c.bytes / MIO
+        );
+        // Un réglage explicite l'emporte toujours.
+        assert_eq!(super::stage_cache_budget_dans(shm, Some(7), None), 7);
     }
 
     #[test]
@@ -4999,6 +5226,142 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
             "bounded window should be ~0.005 s, got {} frames",
             frames,
         );
+    }
+
+    /// Octets DSD pseudo-aléatoires déterministes.
+    fn octets_dsd(n: usize, graine: u32) -> Vec<u8> {
+        let mut s = graine;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// DSF stéréo DSD64 de `octets_par_canal` octets par canal, blocs de 4096
+    /// octets, dernier bloc incomplet (bourré de zéros, comme le format).
+    fn ecrire_dsf_aleatoire(path: &str, octets_par_canal: usize) {
+        let canaux = 2usize;
+        let bloc = 4096usize;
+        let flux: Vec<Vec<u8>> = (0..canaux)
+            .map(|c| octets_dsd(octets_par_canal, 0xb209 + c as u32))
+            .collect();
+        let blocs = octets_par_canal.div_ceil(bloc);
+        let mut data = Vec::new();
+        for b in 0..blocs {
+            for f in &flux {
+                let mut morceau = vec![0u8; bloc];
+                let fin = ((b + 1) * bloc).min(octets_par_canal);
+                morceau[..fin - b * bloc].copy_from_slice(&f[b * bloc..fin]);
+                data.extend_from_slice(&morceau);
+            }
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"DSD ");
+        buf.extend_from_slice(&28u64.to_le_bytes());
+        buf.extend_from_slice(&(28 + 52 + 12 + data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&52u64.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&(canaux as u32).to_le_bytes());
+        buf.extend_from_slice(&2_822_400u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&(octets_par_canal as u64 * 8).to_le_bytes());
+        buf.extend_from_slice(&(bloc as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&(12 + data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&data);
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    /// DFF (DSDIFF) stéréo DSD64 NON compressé, octets entrelacés par canal.
+    fn ecrire_dff_aleatoire(path: &str, octets_par_canal: usize) {
+        let data = octets_dsd(octets_par_canal * 2, 0x0dff_b209);
+        let mut fver = Vec::new();
+        fver.extend_from_slice(b"FVER");
+        fver.extend_from_slice(&4u64.to_be_bytes());
+        fver.extend_from_slice(&0x0105_0000u32.to_be_bytes());
+        let mut prop = Vec::new();
+        prop.extend_from_slice(b"SND ");
+        prop.extend_from_slice(b"FS  ");
+        prop.extend_from_slice(&4u64.to_be_bytes());
+        prop.extend_from_slice(&2_822_400u32.to_be_bytes());
+        prop.extend_from_slice(b"CHNL");
+        prop.extend_from_slice(&10u64.to_be_bytes());
+        prop.extend_from_slice(&2u16.to_be_bytes());
+        prop.extend_from_slice(b"SLFTSRGT");
+        prop.extend_from_slice(b"CMPR");
+        prop.extend_from_slice(&4u64.to_be_bytes());
+        prop.extend_from_slice(b"DSD ");
+        let frm8 = 4 + fver.len() + 12 + prop.len() + 12 + data.len();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"FRM8");
+        buf.extend_from_slice(&(frm8 as u64).to_be_bytes());
+        buf.extend_from_slice(b"DSD ");
+        buf.extend_from_slice(&fver);
+        buf.extend_from_slice(b"PROP");
+        buf.extend_from_slice(&(prop.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&prop);
+        buf.extend_from_slice(b"DSD ");
+        buf.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&data);
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    /// plafond-analyse — un décodage DSF/DFF borné qui commence loin dans le
+    /// fichier rend, au bit près, la tranche correspondante du décodage
+    /// complet. Il ne part plus du premier bit (voir `reprendre_le_flux_dsd`),
+    /// et ne doit pourtant rien changer au PCM : ni décalage d'une trame, ni
+    /// fenêtre FIR amputée, ni fin de fichier différente.
+    #[test]
+    fn decode_dsf_repris_identique_au_decodage_depuis_le_debut() {
+        // 1,2 s de DSD64 : 103 blocs de 4096 octets, le dernier incomplet.
+        let octets = 423_360usize;
+        for ext in ["dsf", "dff"] {
+            let f = tempfile::Builder::new()
+                .suffix(&format!(".{ext}"))
+                .tempfile()
+                .unwrap();
+            let p = f.path().to_str().unwrap().to_string();
+            if ext == "dsf" {
+                ecrire_dsf_aleatoire(&p, octets);
+            } else {
+                ecrire_dff_aleatoire(&p, octets);
+            }
+            for rate in [176_400u32, 88_200] {
+                let complet = decode_dsd_to_pcm(&p, ext, Some(rate), None, 0.0, 0.0).unwrap();
+                assert!(complet.samples_i32.len() > 2 * rate as usize);
+                for seek in [0.0, 0.000_01, 0.0013, 0.093, 0.5, 0.977_7, 1.19, 1.25] {
+                    for duree in [0.1, 0.0] {
+                        let borne =
+                            decode_dsd_to_pcm(&p, ext, Some(rate), None, seek, duree).unwrap();
+                        let debut =
+                            (((seek * rate as f64) as usize) * 2).min(complet.samples_i32.len());
+                        let fin = if duree > 0.0 {
+                            (debut + ((duree * rate as f64) as usize) * 2)
+                                .min(complet.samples_i32.len())
+                        } else {
+                            complet.samples_i32.len()
+                        };
+                        assert_eq!(
+                            borne.samples_i32.len(),
+                            fin - debut,
+                            "{ext} {rate} Hz, seek {seek} s, durée {duree} s : longueur"
+                        );
+                        assert!(
+                            borne.samples_i32 == complet.samples_i32[debut..fin],
+                            "{ext} {rate} Hz, seek {seek} s, durée {duree} s : le PCM repris \
+                             doit être la tranche exacte du décodage complet"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -6105,6 +6468,46 @@ mod borne_de_fin_tests {
         assert_eq!(octets_pour(0.0, Some(44_100), Some(2), Some(16)), None);
         assert_eq!(octets_pour(-1.0, Some(44_100), Some(2), Some(16)), None);
         assert_eq!(octets_pour(f64::NAN, Some(44_100), Some(2), Some(16)), None);
+    }
+
+    /// Fil 2133 (Levente Toth, zone Sonos) : la piste « Draw the Line »
+    /// d'un album FLAC + CUE dure 263,346 s. L'ancien calcul de la fenêtre
+    /// donnait 23 227 117 échantillons entrelacés, un nombre IMPAIR en
+    /// stéréo : la découpe vers le fichier temporaire échouait en
+    /// « PCM sample count … is not aligned to 2 source channels ».
+    #[test]
+    fn fenetre_cue_2133_compte_des_trames_entieres() {
+        assert_eq!(
+            echantillons_de_la_fenetre(263.346, TAUX, 2),
+            11_613_558 * 2,
+            "263,346 s en stéréo 44,1 kHz : 11 613 558 trames entières"
+        );
+        assert_eq!(echantillons_de_la_fenetre(0.0, TAUX, 2), usize::MAX);
+    }
+
+    /// Fil 2133, de bout en bout : une tranche CUE dont les bornes donnent un
+    /// nombre impair d'échantillons (1,007 s × 88 200 = 88 817,4) se découpe
+    /// par `decode_to_pcm`, le chemin du fichier temporaire d'une zone Sonos,
+    /// sans erreur et à la bonne longueur : 44 408 trames, 88 816 échantillons.
+    #[test]
+    fn tranche_cue_a_bornes_impaires_se_decoupe_en_trames_2133() {
+        let d = tempfile::TempDir::new().unwrap();
+        let f = d.path().join("image.wav");
+        ecrire_wav(&f, 3_000);
+        let duree_s = 1_007.0 / 1000.0;
+        assert_eq!(
+            (duree_s * TAUX as f64 * 2.0) as usize % 2,
+            1,
+            "témoin : l'ancien calcul doit tomber sur un nombre impair"
+        );
+        let decode = decode_to_pcm(&f.to_string_lossy(), Some(TAUX), Some(2), 0.5, duree_s)
+            .expect("une tranche CUE à bornes impaires doit se découper sans erreur");
+        assert_eq!(decode.channels, 2);
+        assert_eq!(
+            decode.samples_i32.len(),
+            44_408 * 2,
+            "la tranche doit compter des trames entières"
+        );
     }
 }
 

@@ -5,6 +5,8 @@
 //! ils chargent `docs/contrat-web.json`, appellent le vrai routeur Axum et
 //! confrontent la réponse à la carte commitée.
 
+#[path = "web_contracts/balayage_1897.rs"]
+mod balayage_1897;
 #[path = "web_contracts/history_1897.rs"]
 mod history_1897;
 #[path = "web_contracts/library_1897.rs"]
@@ -747,15 +749,15 @@ const PREFIXE_GREFFONS: &str = "/ext/";
 /// Routes tolérées NOMMÉMENT, jamais par une règle vague. Une entrée se
 /// justifie par sa cause et se retire dès que la dette est payée.
 ///
-/// Ces deux-là sont des chemins que la carte cite et que le routeur assemblé
-/// ne sert pas — c'est MESURÉ, par cette garde et par `curl` sur le .18. Ce
+/// Ce sont des chemins que la carte cite et que le routeur assemblé ne sert
+/// pas (`/streaming/youtube/moods/{}` en est sorti : la route existe depuis
+/// #5247) — c'est MESURÉ, par cette garde et par `curl` sur le .18. Ce
 /// qui suit chaque entrée est le relevé, pas un correctif : la première
 /// rédaction de ce fichier proposait une cause plausible et fausse pour
 /// chacune, et une cause fausse coûte plus cher qu'un simple constat.
-const FANTOMES_TOLERES: &[(&str, &str)] = &[
-    (
-        "/dj/waveform/{}",
-        "#1897 — RELEVÉ. Le serveur de série ne sert RIEN sous `/api/v1/dj/…` : \
+const FANTOMES_TOLERES: &[(&str, &str)] = &[(
+    "/dj/waveform/{}",
+    "#1897 — RELEVÉ. Le serveur de série ne sert RIEN sous `/api/v1/dj/…` : \
          `routes/mod.rs` l'écrit en toutes lettres depuis #917 (« the stock \
          server no longer serves /dj »). Les mêmes chemins existent, declares \
          par la caisse `plugins/tune-dj`, montee sous `/api/v1/ext/dj/…` — \
@@ -764,19 +766,7 @@ const FANTOMES_TOLERES: &[(&str, &str)] = &[
          `/api/v1/ext/dj/status/1` rend 404 lui AUSSI : prefixer l'appel web \
          par `/ext` ne corrigerait rien. Ce qu'il faut trancher d'abord : le \
          greffon DJ doit-il etre livre et installe, ou l'ecran retire ?",
-    ),
-    (
-        "/streaming/youtube/moods/{}",
-        "#1897 — RELEVÉ. Le segment `streaming` est le BON : \
-         `/api/v1/streaming/youtube/moods` rend 200 sur le .18, et cette garde \
-         ne le signale pas. Seule la variante a parametre \
-         `/streaming/youtube/moods/{params}`, qu'appelle \
-         `api.ts:getYoutubeMoodPlaylists`, n'a aucune route. Le gestionnaire de \
-         base rend `{\"moods\":[],\"message\":\"YouTube moods not yet \
-         implemented\"}` : c'est un TALON serveur a finir, pas un chemin faux \
-         cote client.",
-    ),
-];
+)];
 
 /// `/streaming/{}/albums{}` → `/api/v1/streaming/1/albums`.
 ///
@@ -1065,6 +1055,213 @@ async fn la_completude_compte_la_plage_dynamique_et_dit_d_ou_elle_vient() {
         p["total_tracks"], 5,
         "le dénominateur est bien le total. payload={p}"
     );
+}
+
+/// 🔴 #5834 (fil 2157, « Analyse plage dynamique reste bloquée à 97 % ») —
+/// les pistes sans DR qu'AUCUNE passe ne mesurera, et qu'aucun compteur ne
+/// nommait.
+///
+/// La passe ReplayGain estampille `rg_analyzed` + `rg_skipped_oversized` une
+/// piste trop longue pour son budget mémoire, sans plage dynamique ; le
+/// rattrapage du DR l'écarte (`CANDIDATS_DR_WHERE`) et ne pose donc jamais
+/// `dr_indisponible`. Une piste CUE (`file_path` vide) n'entre dans aucune
+/// passe. Ni l'une ni l'autre n'était comptée : la carte Santé les rangeait
+/// « en attente », pour toujours, et sa jauge ne finissait pas.
+///
+/// Le témoin vérifie aussi qu'aucune piste n'est comptée deux fois : une
+/// piste trop longue qui a un DR (lu dans ses tags) ou déjà marquée
+/// indisponible ne compte pas parmi les trop longues.
+#[tokio::test]
+async fn la_completude_nomme_les_pistes_que_la_plage_dynamique_ne_mesurera_jamais_5834() {
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let pistes = tune_core::db::track_repo::TrackRepo::with_backend(etat.backend.clone());
+    let meta =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(etat.backend.clone());
+
+    let poser = |nom: &str, fichier: bool| -> i64 {
+        let mut t = tune_core::db::models::Track::new(nom.into());
+        t.file_path = fichier.then(|| format!("/music/{nom}.flac"));
+        pistes.create(&t).expect("piste temoin")
+    };
+    let trop_longue = |id: i64| {
+        meta.set(id, "rg_analyzed", "1700000000")
+            .expect("temoin rg");
+        meta.set(id, "rg_skipped_oversized", "1")
+            .expect("trop longue");
+    };
+
+    // Trop longue, sans DR : la seule à compter parmi les trop longues.
+    let longue = poser("longue-sans-dr", true);
+    trop_longue(longue);
+    // Trop longue mais DR lu dans les tags : elle a son DR, elle ne manque pas.
+    let longue_taguee = poser("longue-taguee", true);
+    trop_longue(longue_taguee);
+    meta.set(longue_taguee, "dr_track", "9").expect("dr tague");
+    meta.set(longue_taguee, "dr_source", "tag").expect("source");
+    // Trop longue ET indisponible : déjà comptée dans `dynamic_range_unavailable`.
+    let longue_ecartee = poser("longue-ecartee", true);
+    trop_longue(longue_ecartee);
+    meta.set(longue_ecartee, "dr_indisponible", "1")
+        .expect("ecartee");
+    // Une piste CUE sans DR, et une piste CUE dont le DR vient d'ailleurs.
+    let _cue = poser("cue-sans-dr", false);
+    let cue_taguee = poser("cue-taguee", false);
+    meta.set(cue_taguee, "dr_track", "11").expect("dr cue");
+    // Une piste ordinaire en attente : ni l'un ni l'autre.
+    let _vierge = poser("vierge", true);
+
+    let app = tune_server::routes::router(etat);
+    let p = get_json(&app, "/api/v1/library/stats/completeness")
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+
+    assert_eq!(
+        p["dynamic_range_oversized"], 1,
+        "une seule piste est trop longue pour l'analyse ET sans DR ni marque \
+         « indisponible » — sans ce compteur la carte Santé la croit en \
+         attente pour toujours (fil 2157). payload={p}"
+    );
+    assert_eq!(
+        p["dynamic_range_without_file"], 1,
+        "une seule piste sans fichier propre (CUE) n'a pas de DR. payload={p}"
+    );
+    assert_eq!(
+        p["dynamic_range_unavailable"], 1,
+        "la piste trop longue déjà écartée reste comptée là, et une seule fois. payload={p}"
+    );
+    assert_eq!(p["with_dynamic_range"], 2, "payload={p}");
+    assert_eq!(p["total_tracks"], 6, "payload={p}");
+}
+
+/// Fil 2157 — une piste sans DR d'une racine EXCLUE des analyses (#5593)
+/// n'est candidate d'aucune passe, ni comptée par aucun des compteurs
+/// ci-dessus. La route la nomme à part : sans quoi la carte Santé l'attend
+/// pour toujours, la passe au repos.
+#[tokio::test]
+async fn la_completude_nomme_les_pistes_sans_dr_hors_du_perimetre_2157() {
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let pistes = tune_core::db::track_repo::TrackRepo::with_backend(etat.backend.clone());
+    let poser = |chemin: &str| {
+        let mut t = tune_core::db::models::Track::new(chemin.into());
+        t.file_path = Some(chemin.to_string());
+        pistes.create(&t).expect("piste temoin")
+    };
+    poser("/music/a.flac");
+    poser("/nas/b.flac");
+    poser("/nas/c.flac");
+
+    let app = tune_server::routes::router(etat.clone());
+    let p = get_json(&app, "/api/v1/library/stats/completeness")
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+    assert_eq!(
+        p["dynamic_range_out_of_scope"], 0,
+        "rien d'exclu, rien hors périmètre. payload={p}"
+    );
+
+    tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone())
+        .set(
+            tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+            r#"["/nas"]"#,
+        )
+        .expect("reglage");
+    let p = get_json(&app, "/api/v1/library/stats/completeness")
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+    assert_eq!(
+        p["dynamic_range_out_of_scope"], 2,
+        "les deux pistes de la racine exclue n'attendent aucune passe. payload={p}"
+    );
+}
+
+/// Décision du 06/10 — la jauge de la plage dynamique vaut les pistes
+/// TRAITÉES sur le TOTAL : avec un DR, ou déclarées non gérables (sans
+/// fichier, mesure impossible, trop longue, racine exclue). Elle n'atteint
+/// 100 % que lorsque chaque piste est l'un ou l'autre. Une piste REPORTÉE
+/// (fichier qui ne répond pas) n'est pas traitée.
+#[tokio::test]
+async fn la_completude_compte_les_pistes_traitees_sur_le_total() {
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let pistes = tune_core::db::track_repo::TrackRepo::with_backend(etat.backend.clone());
+    let meta =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(etat.backend.clone());
+    let poser = |chemin: Option<&str>, nom: &str| -> i64 {
+        let mut t = tune_core::db::models::Track::new(nom.into());
+        t.file_path = chemin.map(str::to_string);
+        pistes.create(&t).expect("piste temoin")
+    };
+
+    let mesuree = poser(Some("/music/mesuree.flac"), "mesuree");
+    meta.set(mesuree, "dr_track", "12").expect("dr");
+    // DR lu dans les tags ET marque d'échec : comptée une fois, avec un DR.
+    let taguee = poser(Some("/music/taguee.flac"), "taguee");
+    meta.set(taguee, "dr_track", "9").expect("dr");
+    meta.set(taguee, "dr_indisponible", "1").expect("marque");
+    let illisible = poser(Some("/music/illisible.ape"), "illisible");
+    meta.set(illisible, "dr_indisponible", "1").expect("marque");
+    let longue = poser(Some("/music/longue.dsf"), "longue");
+    meta.set(longue, "rg_analyzed", "1700000000")
+        .expect("temoin");
+    meta.set(longue, "rg_skipped_oversized", "1")
+        .expect("trop longue");
+    let _cue = poser(None, "cue");
+    let _exclue = poser(Some("/nas/exclue.flac"), "exclue");
+    let reportee = poser(Some("/music/reportee.flac"), "reportee");
+    meta.set(
+        reportee,
+        "rg_path_unresolved",
+        &tune_core::library::local_path::deferral_stamp(4_000_000_000),
+    )
+    .expect("report frais");
+    let vierge = poser(Some("/music/vierge.flac"), "vierge");
+    tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone())
+        .set(
+            tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+            r#"["/nas"]"#,
+        )
+        .expect("reglage");
+
+    let app = tune_server::routes::router(etat.clone());
+    let p = get_json(&app, "/api/v1/library/stats/completeness")
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+    assert_eq!(p["total_tracks"], 8, "payload={p}");
+    assert_eq!(
+        p["dynamic_range_processed"], 6,
+        "2 avec DR + 4 non gérables ; la reportée et la vierge restent à faire. payload={p}"
+    );
+    assert_eq!(p["dynamic_range_unmanageable"], 4, "payload={p}");
+    assert_eq!(
+        p["dynamic_range_unmeasurable"], 1,
+        "la piste taguée a un DR : elle n'est pas « mesure impossible ». payload={p}"
+    );
+    assert_eq!(
+        p["dynamic_range_unavailable"], 2,
+        "l'ancien champ ne change pas. payload={p}"
+    );
+    let somme = p["dynamic_range_unmeasurable"].as_i64().unwrap()
+        + p["dynamic_range_oversized"].as_i64().unwrap()
+        + p["dynamic_range_without_file"].as_i64().unwrap()
+        + p["dynamic_range_out_of_scope"].as_i64().unwrap();
+    assert_eq!(
+        somme, 4,
+        "les quatre causes partitionnent les non gérables. payload={p}"
+    );
+
+    // La reportée finit indisponible, la vierge est mesurée : 100 %.
+    meta.set(reportee, "dr_indisponible", "1").expect("marque");
+    meta.set(vierge, "dr_track", "10").expect("dr");
+    let p = get_json(&app, "/api/v1/library/stats/completeness")
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+    assert_eq!(
+        p["dynamic_range_processed"], p["total_tracks"],
+        "payload={p}"
+    );
+    assert_eq!(p["dynamic_range_unmanageable"], 5, "payload={p}");
 }
 
 #[path = "web_contracts/album_tracks_1897.rs"]

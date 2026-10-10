@@ -881,6 +881,186 @@ fn au_dela_de_200_artistes_le_decoupage_les_emmene_tous() {
 }
 
 // ---------------------------------------------------------------------------
+// #5523 — au-delà du plafond, on garde les artistes ÉCOUTÉS, pas l'alphabet.
+//
+// Tades (fil 2045, ticket 205) : 12 443 artistes, et une liste de concerts qui
+// « s'arrête toujours au F de Florent Pagny ». La requête gardait les
+// `PLAFOND` premiers noms par `ORDER BY name`. Ces tests construisent une
+// bibliothèque de la même taille et lisent la VRAIE constante `PLAFOND`.
+// ---------------------------------------------------------------------------
+
+/// `n` artistes de remplissage, tous classés avant « G » par l'alphabet
+/// (« Artiste 00000 », « Artiste 00001 »…).
+fn remplir_d_artistes(state: &AppState, n: usize) {
+    state
+        .backend
+        .execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < {}) \
+             INSERT INTO artists (name) SELECT printf('Artiste %05d', i) FROM n;",
+            n - 1
+        ))
+        .expect("artistes de remplissage");
+}
+
+/// Plus d'artistes de remplissage que le plafond n'en garde (`PLAFOND` +
+/// 2 000), tous classés avant « G » par l'alphabet, puis les artistes que
+/// l'utilisateur écoute vraiment, de G à Z. Le remplissage suit la VRAIE
+/// constante : relever le plafond ne fait pas passer la bibliothèque dessous.
+fn bibliotheque_de_tades() -> AppState {
+    let state = new_state();
+    remplir_d_artistes(&state, tune_concerts::PLAFOND + 2_000);
+    for nom in ECOUTES_G_A_Z.iter().map(|(n, _)| n).chain([
+        &"Yann Tiersen",
+        &"Hubert-Felix Thiefaine",
+        &"Zebda",
+    ]) {
+        state
+            .backend
+            .execute("INSERT INTO artists (name) VALUES (?)", &[nom])
+            .expect("inserer l'artiste");
+    }
+    // Les écoutes, au nombre indiqué, une par jour.
+    for (nom, ecoutes) in ECOUTES_G_A_Z {
+        for jour in 0..*ecoutes {
+            let quand = format!("2026-09-{:02}T20:00:00Z", 1 + jour % 28);
+            state
+                .backend
+                .execute(
+                    "INSERT INTO listen_history (title, artist_name, source, listened_at) \
+                     VALUES ('piste', ?, 'local', ?)",
+                    &[nom, &quand],
+                )
+                .expect("inserer l'ecoute");
+        }
+    }
+    // Un favori jamais écouté.
+    state
+        .backend
+        .execute(
+            "INSERT INTO favorites (item_type, item_id) \
+             SELECT 'artist', id FROM artists WHERE name = 'Yann Tiersen'",
+            &[],
+        )
+        .expect("inserer le favori");
+    // Un artiste jamais écouté, mais présent par 30 pistes.
+    for i in 0..30 {
+        let chemin = format!("/musique/hft/{i:02}.flac");
+        state
+            .backend
+            .execute(
+                "INSERT INTO tracks (title, artist_id, file_path) \
+                 SELECT 'piste', id, ? FROM artists WHERE name = 'Hubert-Felix Thiefaine'",
+                &[&chemin],
+            )
+            .expect("inserer la piste");
+    }
+    // Zebda n'est entendu qu'à la radio : ce n'est pas une écoute de la
+    // bibliothèque (même règle que le palmarès `top_artists`).
+    for _ in 0..50 {
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history (title, artist_name, source) \
+                 VALUES ('piste', 'Zebda', 'radio')",
+                &[],
+            )
+            .expect("inserer l'ecoute radio");
+    }
+    state
+}
+
+/// Des artistes de G à Z, avec leur nombre d'écoutes.
+const ECOUTES_G_A_Z: &[(&str, usize)] = &[
+    ("Gojira", 3),
+    ("Jean-Louis Aubert", 1),
+    ("Mylene Farmer", 7),
+    ("Noir Desir", 12),
+    ("Stromae", 5),
+    ("Vianney", 2),
+    ("Zaz", 9),
+];
+
+/// ⭐ Le plafond relevé : une bibliothèque de la taille de celle de Tades
+/// (12 443 artistes, #5523) est abonnée EN ENTIER. Rouge avec l'ancien
+/// plafond de 5 000 : 7 443 artistes restaient sans concerts.
+#[test]
+fn une_bibliotheque_de_12_443_artistes_est_abonnee_en_entier() {
+    let state = new_state();
+    remplir_d_artistes(&state, 12_443);
+
+    let gardes = tune_concerts::artistes_de_la_bibliotheque(&state.backend).unwrap();
+
+    assert_eq!(
+        gardes.len(),
+        12_443,
+        "les 12 443 artistes de Tades doivent tous etre abonnes (plafond : {})",
+        tune_concerts::PLAFOND
+    );
+}
+
+/// ⭐ #5523 : les artistes écoutés de G à Z sont abonnés, malgré plus de
+/// `PLAFOND` noms qui les précèdent dans l'alphabet. Rouge avec l'ancien
+/// `ORDER BY name` : aucun d'eux n'entrait dans les `PLAFOND` premières places.
+#[test]
+fn au_dela_du_plafond_les_artistes_ecoutes_de_g_a_z_sont_gardes() {
+    let state = bibliotheque_de_tades();
+
+    let gardes = noms(&tune_concerts::artistes_de_la_bibliotheque(&state.backend).unwrap());
+
+    assert_eq!(
+        gardes.len(),
+        tune_concerts::PLAFOND,
+        "le plafond ne bouge pas : la bibliotheque le depasse, on en garde PLAFOND"
+    );
+    for (nom, _) in ECOUTES_G_A_Z {
+        assert!(
+            gardes.iter().any(|g| g == nom),
+            "{nom} est ecoute : il doit etre abonne, meme apres plus de PLAFOND noms en A"
+        );
+    }
+    assert!(
+        gardes.iter().any(|g| g == "Yann Tiersen"),
+        "un artiste en favori doit etre abonne"
+    );
+    assert!(
+        gardes.iter().any(|g| g == "Hubert-Felix Thiefaine"),
+        "un artiste present par ses pistes passe devant un nom sans pistes"
+    );
+    assert!(
+        !gardes.iter().any(|g| g == "Zebda"),
+        "une ecoute de radio n'est pas une ecoute de la bibliotheque"
+    );
+}
+
+/// L'ordre de pertinence lui-même : favori, puis écoutes décroissantes, puis
+/// pistes, puis le reste par ordre alphabétique.
+#[test]
+fn les_artistes_sont_classes_par_favori_ecoutes_puis_pistes() {
+    let state = bibliotheque_de_tades();
+
+    let gardes = noms(&tune_concerts::artistes_de_la_bibliotheque(&state.backend).unwrap());
+
+    assert_eq!(
+        &gardes[..9],
+        &[
+            "Yann Tiersen",
+            "Noir Desir",
+            "Zaz",
+            "Mylene Farmer",
+            "Stromae",
+            "Gojira",
+            "Vianney",
+            "Jean-Louis Aubert",
+            "Hubert-Felix Thiefaine",
+        ],
+    );
+    assert_eq!(
+        gardes[9], "Artiste 00000",
+        "sans ecoute ni piste, l'alphabet departage, comme avant"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // L'apport de #2178 (64e8378f), reporté du cœur vers le greffon.
 //
 // Le lot apprend à tout le nuage à rendre un 429 entier : motif nommé, délai

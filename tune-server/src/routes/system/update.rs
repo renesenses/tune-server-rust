@@ -28,9 +28,9 @@ const SCAN_GUARD_STALE_SECS: u64 = 12 * 3600;
 /// user re-triggers it and the next auto-update kills it again).
 ///
 /// L'horodatage est EXIGÉ. Sans lui la fenêtre d'ancienneté n'a rien à
-/// mesurer, et le report que ce garde-fou pose n'a plus aucune sortie — il
-/// n'existe même pas de `force` pour le contourner ici, contrairement au
-/// garde-fou de la lecture (#2976).
+/// mesurer, et le report que ce garde-fou pose n'a plus aucune sortie (#2976).
+/// (Depuis #5531, `force` arrête le scan au lieu de le laisser différer la
+/// mise à jour : voir [`refus_du_scan`].)
 fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> bool {
     let settings = SettingsRepo::with_backend(backend.clone());
     let scanning = settings.get("scan_status").ok().flatten().as_deref() == Some("scanning");
@@ -65,6 +65,120 @@ fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBacke
         // coupé se relance. L'asymétrie tranche dans ce sens (#2976).
         None => false,
     }
+}
+
+/// #5531 — combien de temps une mise à jour forcée attend que le scan qu'elle
+/// arrête rende la main. Depuis #5552 le parcours ne lit plus un fichier après
+/// « Arrêter » : il ne reste que les lectures déjà en vol, chacune sous son
+/// propre délai. Passé ce plafond, l'installation continue — le repère de
+/// reprise est déjà posé, et le lot interrompu, jamais validé, est annulé par
+/// SQLite au redémarrage.
+const ARRET_DU_SCAN_MAX: Duration = Duration::from_secs(30);
+const ARRET_DU_SCAN_POLL: Duration = Duration::from_millis(100);
+
+/// Un scan retient-il la mise à jour ? Le réglage daté ([`scan_in_progress`])
+/// OU le droit de scanner tenu : `scan_status` est un réglage, et un réglage
+/// peut dire `idle` pendant que le parcours lit encore (#5552).
+fn scan_retient_la_mise_a_jour(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> bool {
+    scan_in_progress(backend) || super::scan::droit_de_scanner_tenu()
+}
+
+/// La garde du scan, commune aux chemins autonome et Homebrew (#5531).
+///
+/// Sans `force`, un scan en cours diffère la mise à jour, comme avant. Avec
+/// `force`, décision de Bertrand du 30/09/2026 : **arrêter, installer,
+/// relancer**. Le scan est arrêté proprement (le même arrêt que le bouton
+/// « Arrêter », #5552), un repère persistant « scan à reprendre » est posé, et
+/// l'installation continue. Au démarrage suivant, le scan reprend en
+/// incrémental : les fichiers déjà rangés ne sont pas relus.
+///
+/// Rend la réponse de refus, ou `None` pour laisser l'installation continuer.
+/// L'arrêt lui-même est [`arreter_le_scan_si_besoin`], appelé par la route au
+/// dernier moment utile : une fois qu'elle SAIT qu'elle va installer. Un scan
+/// arrêté pour une installation qui n'a pas lieu (déjà à jour, GitHub
+/// injoignable) serait un scan arrêté pour rien.
+pub(crate) fn refus_du_scan(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    force: bool,
+) -> Option<axum::response::Response> {
+    if !force && scan_retient_la_mise_a_jour(backend) {
+        warn!("update_deferred_scan_in_progress");
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "status": "blocked",
+                    "reason": "scan_in_progress",
+                    "force_available": true,
+                    "force_hint": "POST /system/update/install?force=true",
+                    "message": "Update deferred: a library scan is in progress. Installing now (force) stops the scan; it resumes after the restart and skips the files already scanned."
+                })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
+/// Mise à jour forcée, installation décidée : si un scan la retient, l'arrêter
+/// et poser le repère de reprise (#5531).
+async fn arreter_le_scan_si_besoin(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    if scan_retient_la_mise_a_jour(backend) {
+        arreter_le_scan_pour_installer(backend, ARRET_DU_SCAN_MAX, ARRET_DU_SCAN_POLL).await;
+    }
+}
+
+/// Arrête le scan en cours pour une mise à jour forcée (#5531). `true` si le
+/// scan a rendu la main dans le délai.
+///
+/// Le repère est posé AVANT la demande d'arrêt : un processus tué entre les
+/// deux reprend quand même son scan. Et le scan arrêté ne l'efface pas — il ne
+/// l'efface qu'en allant au bout.
+pub(crate) async fn arreter_le_scan_pour_installer(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    max: Duration,
+    poll: Duration,
+) -> bool {
+    super::scan::poser_reprise_du_scan(backend);
+    let scan_actif = super::scan::demander_l_arret_du_scan();
+    warn!(
+        scan_actif,
+        "update_force_arret_du_scan — scan arrêté pour installer, repris au redémarrage"
+    );
+    match attendre_la_fin_du_scan(max, poll).await {
+        Ok(attente) => {
+            info!(
+                attente_ms = attente.as_millis() as u64,
+                "update_force_scan_arrete"
+            );
+            true
+        }
+        Err(attente) => {
+            warn!(
+                attente_ms = attente.as_millis() as u64,
+                "update_force_scan_toujours_actif — installation poursuivie, le scan reprendra au redémarrage"
+            );
+            false
+        }
+    }
+}
+
+/// Attend que plus aucun scan ne tienne le droit de scanner, au plus `max`.
+/// `Ok(attente)` s'il l'a rendu, `Err(attente)` sinon.
+async fn attendre_la_fin_du_scan(max: Duration, poll: Duration) -> Result<Duration, Duration> {
+    let debut = tokio::time::Instant::now();
+    while super::scan::droit_de_scanner_tenu() {
+        let attente = debut.elapsed();
+        if attente >= max {
+            return Err(attente);
+        }
+        tokio::time::sleep(poll.min(max - attente)).await;
+    }
+    Ok(debut.elapsed())
 }
 
 /// Query string of `POST /system/update/install`.
@@ -2231,10 +2345,12 @@ pub(super) async fn update_check(State(state): State<AppState>) -> Json<Value> {
 /// cycle in the background and returns immediately.  Progress is exposed via
 /// `GET /system/update/status` (`phase` field).
 ///
-/// `?force=true` overrides the *request-time* deferral guard that protects work
-/// in progress (currently: playback). The UI sets it on the install button,
-/// which sits directly under the warning that playback will stop. It does NOT
-/// override the restart deferral — see [`defer_restart_until_quiet`].
+/// `?force=true` overrides the *request-time* deferral guards that protect work
+/// in progress: playback, and — since #5531 — a library scan, which is then
+/// stopped cleanly and resumed incrementally at the next start (see
+/// [`refus_du_scan`]). The UI sets it on the install button, which sits
+/// directly under the warning that playback will stop. It does NOT override
+/// the restart deferral — see [`defer_restart_until_quiet`].
 pub(super) async fn update_install(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
@@ -2305,17 +2421,9 @@ pub(super) async fn update_install(
                 // Le chemin Homebrew redémarre le serveur, tout comme le chemin
                 // autonome : les mêmes reports s'appliquent, mot pour mot. Ils
                 // sont répétés ici parce que cette branche rend avant eux.
-                if scan_in_progress(&state.backend) {
-                    warn!("update_deferred_scan_in_progress");
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(json!({
-                            "status": "blocked",
-                            "reason": "scan_in_progress",
-                            "message": "Update deferred: a library scan is in progress. It will be applied automatically once the scan finishes."
-                        })),
-                    )
-                        .into_response();
+                // #5531 — `force` arrête le scan au lieu d'être ignoré.
+                if let Some(refus) = refus_du_scan(&state.backend, force) {
+                    return refus;
                 }
                 if !force && !playing.is_empty() {
                     let zones = zones_qui_retiennent(&state.backend, &playing);
@@ -2333,6 +2441,7 @@ pub(super) async fn update_install(
                     )
                         .into_response();
                 }
+                arreter_le_scan_si_besoin(&state.backend).await;
                 match spawn_homebrew_upgrade(&plan, std::process::id()) {
                     Ok(()) => {
                         info!(
@@ -2442,17 +2551,14 @@ pub(super) async fn update_install(
     // Defer instead: the client's periodic auto-update simply retries and lands
     // once the scan finishes. Manual updates get the same clear message. Bounded
     // by a staleness window so a crashed scan can never block updates forever.
-    if scan_in_progress(&state.backend) {
-        warn!("update_deferred_scan_in_progress");
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "status": "blocked",
-                "reason": "scan_in_progress",
-                "message": "Update deferred: a library scan is in progress. It will be applied automatically once the scan finishes."
-            })),
-        )
-            .into_response();
+    //
+    // #5531 — sauf `force` : le scan est alors arrêté proprement, un repère
+    // « scan à reprendre » est posé, et il reprend en incrémental au démarrage
+    // suivant. Avant, `force` ne levait que la garde de lecture, et rien ne
+    // permettait de mettre à jour pendant un scan de 500 000 pistes (Tades).
+    // L'arrêt lui-même attend la décision d'installer (plus bas).
+    if let Some(refus) = refus_du_scan(&state.backend, force) {
+        return refus;
     }
 
     // Guard: don't even DOWNLOAD while music is playing. The restart re-execs
@@ -2550,6 +2656,10 @@ pub(super) async fn update_install(
     if cfg!(target_os = "macos") {
         info!(voie = ?voie, asset = %asset.name, "update_macos_voie");
     }
+
+    // #5531 — l'installation est décidée : arrêter le scan qui la retenait.
+    // Seul `force` arrive ici avec un scan en cours (`refus_du_scan`).
+    arreter_le_scan_si_besoin(&state.backend).await;
 
     info!(
         version = %release.version,
@@ -2867,6 +2977,19 @@ pub(super) async fn update_install(
         // l'état de lecture d'il y a un téléchargement. Borné par
         // `RESTART_DEFERRAL_MAX` pour qu'une zone oubliée en lecture ne bloque
         // pas les mises à jour à vie.
+        // #5531 — un scan qu'une mise à jour forcée a arrêté et qui n'avait
+        // pas encore rendu la main : lui laisser finir ses lectures en vol
+        // plutôt que de le couper par l'échange d'image. Borné ; le repère de
+        // reprise est posé de toute façon.
+        if super::scan::droit_de_scanner_tenu()
+            && let Err(attente) =
+                attendre_la_fin_du_scan(ARRET_DU_SCAN_MAX, ARRET_DU_SCAN_POLL).await
+        {
+            warn!(
+                attente_ms = attente.as_millis() as u64,
+                "update_restart_scan_toujours_actif"
+            );
+        }
         if playback_in_progress(&state.playback).await {
             set_phase("restart_pending_playback");
         }

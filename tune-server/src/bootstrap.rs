@@ -97,6 +97,22 @@ pub async fn run_with(opts: RunOptions) {
         std::process::exit(0);
     }
 
+    // #5617 — mode ponctuel « premier accès » de Tune OS : appelé en root par
+    // une unité de l'image, HORS du bac à sable de tune.service, il applique la
+    // politique du mot de passe du compte `tune` puis sort. Même place que
+    // `--version` : avant tout journal, port ou base.
+    #[cfg(target_os = "linux")]
+    if crate::tune_os_password::premier_acces_requested(std::env::args().skip(1)) {
+        std::process::exit(crate::tune_os_password::run_premier_acces());
+    }
+    // #3206 — mot de passe oublié du compte `tune`, depuis la console
+    // physique : l'assistant de l'image vérifie le terminal, puis appelle ce
+    // mode en root. Même politique que le premier accès.
+    #[cfg(target_os = "linux")]
+    if crate::tune_os_password::reinitialisation_requested(std::env::args().skip(1)) {
+        std::process::exit(crate::tune_os_password::run_reinitialisation());
+    }
+
     // On Windows, catch panics early and log to file so users can report crashes
     // instead of seeing "tune-server.exe has stopped working" with no info.
     #[cfg(windows)]
@@ -193,7 +209,12 @@ pub async fn run_with(opts: RunOptions) {
 
     let config = TuneConfig::load();
 
-    let chemin_du_journal = installer_le_journal(&config.log_level);
+    let _chemin_du_journal = installer_le_journal(&config.log_level);
+
+    // #5513 : pour `artwork_cache_dir()` et le rapport de scan, qui n'ont
+    // pas la configuration sous la main. #5596 : après le journal, pour que
+    // le choix du cache de pochettes de l'appareil s'y lise.
+    crate::chemins_de_donnees::retenir(&config);
 
     // #5461 — lancé depuis `<exe>.old` par une version affectée ? Le dire, et
     // relancer sur place le binaire installé quand c'est sûr. Avant tout fil,
@@ -202,17 +223,22 @@ pub async fn run_with(opts: RunOptions) {
     crate::binaire_installe::reparer_un_lancement_depuis_la_sauvegarde();
 
     // #4924 : relever l'état du processus PENDANT un gel de l'exécuteur, sans
-    // ptrace ni sudo. Les relevés vont à côté du journal.
+    // ptrace ni sudo. Fil 2117/2124 (#5677) : les relevés vont dans le dossier
+    // de données (`diagnostics/gels/`), qui survit aux redémarrages ; sur
+    // Tune OS, `/tmp` est PRIVÉ au service et effacé à chaque relance. Le
+    // dossier temporaire par compte (#4770) n'est plus qu'un repli.
     {
-        let dossier = chemin_du_journal
-            .as_deref()
-            .and_then(|c| c.parent())
-            .map(std::path::Path::to_path_buf)
-            // #4770 : sans journal, un dossier par compte plutôt que la
-            // racine temporaire partagée.
-            .unwrap_or_else(|| {
-                tune_core::chemins_de_travail::racine_de_travail("tune-gel-executeur")
-            });
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let donnees = crate::gel_executeur::dossier_de_donnees(
+            std::env::var("TUNE_DATA_DIR").ok().as_deref(),
+            &config.db_path,
+            &cwd,
+        );
+        let dossier = crate::gel_executeur::dossier_des_releves(
+            &donnees,
+            tune_core::chemins_de_travail::racine_de_travail("tune-gel-executeur"),
+        );
+        tracing::info!(dossier = %dossier.display(), "gel_executeur_releves");
         std::mem::forget(crate::gel_executeur::demarrer_en_production(dossier));
     }
 
@@ -242,13 +268,19 @@ pub async fn run_with(opts: RunOptions) {
         let mut ipv6_attempted = addr.is_ipv6();
         #[cfg(unix)]
         let mut reclaim_tried = false;
+        let mut instance_sondee = false;
         for attempt in 1..=10u32 {
             match socket.bind(&addr.into()) {
                 Ok(()) => break,
                 // Premier échec sur la socket IPv6 : la pile est peut-être
                 // désactivée sur la machine. On repasse en IPv4 seule plutôt
                 // que d'épuiser les tentatives puis de sortir en erreur.
-                Err(e) if ipv6_attempted => {
+                // #5640 — sauf si le port est simplement PRIS : la pile IPv6
+                // marche, une autre instance tient le port (sous Windows,
+                // l'ancien processus d'un « Redémarrer » pendant ses derniers
+                // instants). On attend avec la socket double pile, sinon le
+                // serveur relancé n'écoutait plus qu'en IPv4 (#1321).
+                Err(e) if ipv6_attempted && crate::config::repli_ipv4_apres_echec(&e) => {
                     tracing::info!(error = %e, "bind IPv6 impossible, repli sur IPv4 seule");
                     ipv6_attempted = false;
                     socket = crate::config::ipv4_listen_socket();
@@ -256,6 +288,40 @@ pub async fn run_with(opts: RunOptions) {
                     continue;
                 }
                 Err(e) if attempt < 10 => {
+                    // #5640 — « Ouvrir l'instance existante » : lancé par le
+                    // raccourci alors qu'un Tune de la même version tient
+                    // déjà le port ? Ouvrir le navigateur dessus et s'arrêter
+                    // proprement, au lieu d'attendre 20 s puis d'échouer. Une
+                    // relance interne (« Redémarrer », mise à jour) attend,
+                    // elle, que l'ancien rende le port.
+                    if !instance_sondee && e.kind() == std::io::ErrorKind::AddrInUse {
+                        instance_sondee = true;
+                        use crate::instance_existante as ie;
+                        let en_place = ie::sonder_tune_sur_le_port(config.port);
+                        let conduite = ie::conduite_port_pris(
+                            ie::Lancement::depuis_l_environnement(),
+                            en_place.as_deref(),
+                            tune_core::version(),
+                        );
+                        if conduite == ie::ConduitePortPris::OuvrirLExistante {
+                            let url = format!("http://localhost:{}", config.port);
+                            let phrase = format!(
+                                "Tune tourne déjà sur le port {} : ouverture de l'instance existante ({url}), ce lancement s'arrête.",
+                                config.port
+                            );
+                            eprintln!("{phrase}");
+                            info!(%url, port = config.port, "instance_existante_ouverte — {phrase}");
+                            ie::ouvrir_le_navigateur(&url);
+                            std::process::exit(0);
+                        }
+                        if let Some(version) = en_place.as_deref() {
+                            info!(
+                                port = config.port,
+                                version_en_place = %version,
+                                "port_tenu_par_un_tune — relance interne ou autre version : on attend le port"
+                            );
+                        }
+                    }
                     tracing::warn!(%addr, attempt, error = %e, "bind failed, retrying in 2s");
                     // The port is held by another process. If it is a *stale*
                     // tune-server instance (an old build that wasn't stopped
@@ -324,6 +390,12 @@ pub async fn run_with(opts: RunOptions) {
     crate::boot_status::set_phase("attente du disque de données");
     crate::routes::appliance_storage::wait_for_data_volume(&config.db_path).await;
 
+    // Dossier de données non inscriptible (image Docker sous `tune`, `/data`
+    // monté depuis un dossier de l'hôte appartenant à root) : un rapport
+    // lisible et une sortie `EX_CONFIG`, au lieu d'une panique dans
+    // `AppState::new` et d'une boucle de redémarrage muette.
+    crate::dossiers_inscriptibles::verifier_ou_sortir(&config);
+
     crate::boot_status::set_phase("base de données");
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");
@@ -357,8 +429,22 @@ pub async fn run_with(opts: RunOptions) {
         settings.set("server_last_alive_at", &now.to_string()).ok();
     }
 
-    // Auto-scan music directories at startup
-    let scan_done = if config.auto_scan {
+    // Remonter les partages reseau AVANT toute lecture de la bibliotheque : un
+    // partage absent fait voir un repertoire vide, et le scan qui suit conclut
+    // « 0 fichier » (#1692).
+    //
+    // #5682 (fil 2115) — le commentaire le disait, le code faisait l'inverse :
+    // le scan de démarrage et le surveillant partaient AVANT ce remontage, et
+    // un NAS monté une seconde trop tard laissait la bibliothèque vide jusqu'à
+    // la relance du serveur. Le PREMIER essai de chaque partage est attendu
+    // ici (borné par `smb::ESSAI_TIMEOUT` par dialecte) ; les nouveaux essais
+    // d'un partage injoignable partent en fond, sans retenir le serveur HTTP.
+    crate::boot_status::set_phase("partages réseau");
+    crate::startup::remount_network_shares(&state).await;
+
+    // Auto-scan music directories at startup — et, même sans `auto_scan`,
+    // la reprise d'un scan qu'une mise à jour forcée a arrêté (#5531).
+    let scan_done = if crate::auto_scan::scan_au_demarrage(config.auto_scan, &state.backend) {
         Some(crate::auto_scan::spawn_auto_scan(
             state.backend.clone(),
             state.event_bus.clone(),
@@ -370,12 +456,6 @@ pub async fn run_with(opts: RunOptions) {
     // File watcher for live directory changes (waits for auto-scan to finish
     // before monitoring, to avoid racing with the scanner on macOS FSEvents)
     crate::auto_scan::spawn_file_watcher(state.backend.clone(), scan_done, state.event_bus.clone());
-
-    // Remonter les partages reseau AVANT toute lecture de la bibliotheque : un
-    // partage absent fait voir un repertoire vide, et le scan qui suit conclut
-    // « 0 fichier » (#1692).
-    crate::boot_status::set_phase("partages réseau");
-    crate::startup::remount_network_shares(&state).await;
 
     // Register local audio outputs (USB DAC, headphones, speakers)
     crate::boot_status::set_phase("sorties audio");
@@ -422,6 +502,11 @@ pub async fn run_with(opts: RunOptions) {
     crate::boot_status::set_phase("découverte réseau");
     let oh_event_listener = crate::startup::create_oh_listener().await;
 
+    // Les profils de commande `SetAVTransportURI` appris par appareil après
+    // un refus (501/714/716) survivent au redémarrage : la mémoire est
+    // branchée sur la base AVANT la découverte, qui les relit.
+    tune_core::outputs::dlna_repli_set_uri::installer_persistance(state.backend.clone());
+
     // SSDP discovery (DLNA / OpenHome)
     crate::discovery_setup::spawn_ssdp_handler(&state, &config, oh_event_listener);
 
@@ -454,6 +539,7 @@ pub async fn run_with(opts: RunOptions) {
         port = config.port,
         db = %config.db_path,
         web = %crate::config::resolve_web_dir().display(),
+        fils_de_travail = crate::fils_de_travail::retenu(),
         "tune_server_starting"
     );
 
@@ -537,25 +623,17 @@ pub async fn run_with(opts: RunOptions) {
             }
             let url = format!("http://localhost:{port}");
             info!(url = %url, "opening_browser");
-            #[cfg(target_os = "macos")]
-            let _ = std::process::Command::new("open").arg(&url).spawn();
-            #[cfg(target_os = "windows")]
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", "start", "", &url])
-                .spawn();
-            #[cfg(target_os = "linux")]
-            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            crate::instance_existante::ouvrir_le_navigateur(&url);
         });
     }
 
-    if let Err(e) = axum::serve(
-        listener,
-        // ConnectInfo<SocketAddr> lets handlers see the client IP (used to
-        // disambiguate browser zones created by different machines — Bertrand).
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal(shutdown_state))
-    .await
+    // #4645 — le transport HTTP tourne sur son propre moteur, et les flux
+    // audio (`/stream/…`) y sont servis sur place : un gel de l'exécuteur
+    // principal ne tait plus le renderer. Le reste des requêtes est traité ici
+    // comme avant. `ConnectInfo<SocketAddr>` reste posé sur chaque requête
+    // (zones navigateur distinguées par l'adresse du client — Bertrand).
+    if let Err(e) =
+        crate::aiguillage_des_flux::servir(listener, app, shutdown_signal(shutdown_state)).await
     {
         tracing::error!(error = %e, "server_fatal_error");
         #[cfg(windows)]

@@ -59,6 +59,13 @@ pub fn router() -> Router<AppState> {
         .route("/scan-host", get(scan_host))
         .route("/smb/discover", get(list_smb_shares).post(trigger_smb_scan))
         .route("/smb/mounts", get(list_smb_mounts))
+        // Fil 2145 : « Oublier ce partage » DEMONTE puis supprime la ligne.
+        // `DELETE /mounts/{id}` supprime la ligne sans demonter : le partage
+        // restait monte, invisible, jusqu'au prochain redemarrage.
+        .route(
+            "/smb/mounts/{id}",
+            axum::routing::delete(oublier_un_partage),
+        )
         .route("/smb/mount", post(mount_smb_share))
         .route("/media-servers/{id}/browse", get(browse_media_server))
         // Phase 2 du chantier `unifier-serveurs-upnp-et-bibliotheque` :
@@ -185,6 +192,201 @@ async fn delete_mount(State(state): State<AppState>, Path(id): Path<i64>) -> imp
         )
         .ok();
     StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize, Default)]
+struct OublierQuery {
+    /// L'utilisateur a confirme : des racines de la bibliotheque dependent du
+    /// partage.
+    #[serde(default)]
+    confirmer: bool,
+    /// Retirer aussi ces racines de la bibliotheque, par le chemin existant
+    /// de retrait de dossier (decision de Bertrand, 05/10).
+    #[serde(default)]
+    retirer_racines: bool,
+    /// Le nombre de pistes montre a l'utilisateur et accepte : meme contrat
+    /// que `confirm_purge` de `POST /system/music-dirs/remove` (#1943).
+    #[serde(default)]
+    confirmer_purge: Option<u64>,
+}
+
+/// Les racines de la bibliotheque qui vivent sous `mount_path` (le point
+/// lui-meme, ou un dossier en dessous). Comparaison sur chemins normalises,
+/// au separateur pres : `/mnt/nas_Music2` ne depend pas de `/mnt/nas_Music`.
+pub(crate) fn racines_dependantes(music_dirs: &[String], mount_path: &str) -> Vec<String> {
+    use tune_core::scanner::walker::normalize_path;
+    let point = normalize_path(mount_path);
+    let point = point.trim_end_matches(['/', '\\']);
+    if point.is_empty() {
+        return Vec::new();
+    }
+    music_dirs
+        .iter()
+        .filter(|d| {
+            let d = normalize_path(d);
+            let d = d.trim_end_matches(['/', '\\']);
+            d == point
+                || d.strip_prefix(point)
+                    .is_some_and(|reste| reste.starts_with(['/', '\\']))
+        })
+        .cloned()
+        .collect()
+}
+
+/// `DELETE /network/smb/mounts/{id}` — « Oublier ce partage » (fil 2145).
+///
+/// Dans cet ordre : refuser si une racine de la bibliotheque en depend et que
+/// l'utilisateur n'a pas confirme (409, avec la liste) ; demonter si le point
+/// est monte ; supprimer la ligne ; retirer le point de montage s'il est vide.
+///
+/// Un demontage qui echoue garde la ligne : supprimer d'abord laisserait un
+/// partage monte que plus rien ne nomme, ni l'ecran ni le demarrage.
+///
+/// Les racines dependantes : `?retirer_racines=true` les retire de la
+/// bibliotheque par le chemin de `POST /system/music-dirs/remove`
+/// (`retirer_un_dossier`), avec la purge de leurs pistes si
+/// `confirmer_purge` couvre le nombre montre dans le 409 (`pistes`). Sans
+/// l'option, elles restent declarees ; une racine absente est protegee de la
+/// purge par le scan (`verdict_purge`, #1652).
+async fn oublier_un_partage(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<OublierQuery>,
+) -> axum::response::Response {
+    use tune_core::db::backend::ToSqlValue;
+    let ligne = state
+        .backend
+        .query_one(
+            "SELECT mount_path FROM network_mounts WHERE id = ? AND mount_type = 'smb'",
+            &[&id as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten();
+    let Some(mount_path) = ligne.and_then(|r| r.first().and_then(|v| v.as_string())) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "partage_inconnu", "message": "Ce partage n'est plus enregistré." })),
+        )
+            .into_response();
+    };
+
+    let racines = racines_dependantes(
+        &crate::routes::system::get_music_dirs_list(&state.backend),
+        &mount_path,
+    );
+    if !racines.is_empty() && !q.confirmer {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "racines_dependantes",
+                "message": format!(
+                    "{} dossier(s) de la bibliothèque se trouvent sur ce partage.",
+                    racines.len()
+                ),
+                "racines": racines,
+                // Ce que la purge emporterait si l'utilisateur retire aussi
+                // ces dossiers : il doit le voir avant d'accepter.
+                "pistes": crate::routes::system::pistes_qui_partiraient(&state, &racines),
+            })),
+        )
+            .into_response();
+    }
+
+    let chemin = std::path::Path::new(&mount_path);
+    let mut demonte = false;
+    if smb::est_un_point_de_montage(chemin) {
+        // Hors root (Tune OS sous `tune`, #3206) : par l'assistant, via sudo.
+        let res = tokio::time::timeout(
+            Duration::from_secs(15),
+            smb::commande_de_demontage(
+                crate::privilege::euid(),
+                &crate::privilege::sudo(),
+                &mount_path,
+            )
+            .lancer(),
+        )
+        .await;
+        let echec = match res {
+            Ok(Ok(out)) if out.status.success() => None,
+            Ok(Ok(out)) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if crate::privilege::est_un_refus_d_elevation(&stderr) {
+                    warn!(id, path = %mount_path, error = %stderr, "smb_umount_elevation_refusee");
+                    Some(crate::privilege::message_de_refus(&stderr))
+                } else {
+                    Some(stderr)
+                }
+            }
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_) => Some("délai dépassé".to_string()),
+        };
+        if let Some(cause) = echec.filter(|_| smb::est_un_point_de_montage(chemin)) {
+            warn!(id, path = %mount_path, error = %cause, "smb_oubli_demontage_echoue");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "demontage_impossible",
+                    "message": format!(
+                        "Impossible de démonter {mount_path} : {cause}. Le partage est conservé."
+                    ),
+                })),
+            )
+                .into_response();
+        }
+        demonte = true;
+    }
+
+    if let Err(e) = state.backend.execute(
+        "DELETE FROM network_mounts WHERE id = ?",
+        &[&id as &dyn ToSqlValue],
+    ) {
+        warn!(id, error = %e, "smb_oubli_suppression_echouee");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "suppression_impossible", "message": e.to_string() })),
+        )
+            .into_response();
+    }
+    // `remove_dir` ne retire qu'un dossier VIDE : jamais de la musique.
+    if !smb::est_un_point_de_montage(chemin) {
+        let _ = std::fs::remove_dir(chemin);
+    }
+    // Les racines ne partent qu'APRES le demontage et la suppression reussis :
+    // un oubli refuse ne doit rien avoir retire de la bibliotheque.
+    let mut racines_retirees = Vec::new();
+    let mut pistes_retirees = 0u64;
+    let mut purge_refusee = false;
+    if q.retirer_racines {
+        for r in &racines {
+            match crate::routes::system::retirer_un_dossier(&state, r, q.confirmer_purge) {
+                Ok(v) => {
+                    pistes_retirees += v["purged"].as_u64().unwrap_or(0);
+                    purge_refusee |= v["purge_refused"].as_bool().unwrap_or(false);
+                    racines_retirees.push(r.clone());
+                }
+                Err(e) => {
+                    warn!(id, racine = %r, error = %e.message, "smb_oubli_retrait_racine_echoue")
+                }
+            }
+        }
+    }
+    info!(
+        id, path = %mount_path, demonte, racines = racines.len(),
+        racines_retirees = racines_retirees.len(), pistes_retirees, "smb_partage_oublie"
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "oublie": true,
+            "demonte": demonte,
+            "racines": racines,
+            "racines_retirees": racines_retirees,
+            "pistes_retirees": pistes_retirees,
+            "purge_refusee": purge_refusee,
+        })),
+    )
+        .into_response()
 }
 
 /// Verser dans le registre DURABLE ce que la découverte tient en mémoire.
@@ -418,6 +620,23 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
 // SMB discovery and mount management
 // ---------------------------------------------------------------------------
 
+/// L'adresse a retenir parmi celles qu'un service mDNS annonce.
+///
+/// `get_addresses()` est un `HashSet` : `first()` y prenait une adresse au
+/// hasard, et un Synology qui publie aussi son IPv6 etait propose tantot sous
+/// l'une, tantot sous l'autre. Daniel Levy (fil 2145) s'est retrouve avec le
+/// meme partage enregistre deux fois. On prefere l'IPv4, puis une IPv6 hors
+/// lien local (une `fe80::` sans zone ne se monte pas), et on trie pour que le
+/// choix soit le meme d'une decouverte a l'autre.
+pub(crate) fn adresse_preferee(addrs: &[std::net::IpAddr]) -> Option<std::net::IpAddr> {
+    let rang = |a: &std::net::IpAddr| match a {
+        std::net::IpAddr::V4(_) => 0,
+        std::net::IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) != 0xfe80 => 1,
+        std::net::IpAddr::V6(_) => 2,
+    };
+    addrs.iter().copied().min_by_key(|a| (rang(a), *a))
+}
+
 /// Discover network shares via mDNS service browsing (_smb._tcp).
 async fn list_shares() -> Json<Value> {
     let result = tokio::task::spawn_blocking(|| {
@@ -431,12 +650,14 @@ async fn list_shares() -> Json<Value> {
             match receiver.recv_timeout(Duration::from_millis(500)) {
                 Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
                     let host = info.get_hostname().trim_end_matches('.').to_string();
-                    let addrs: Vec<String> = info
+                    let addrs: Vec<std::net::IpAddr> = info
                         .get_addresses()
                         .iter()
-                        .map(|a| a.to_ip_addr().to_string())
+                        .map(|a| a.to_ip_addr())
                         .collect();
-                    let ip = addrs.first().cloned().unwrap_or_default();
+                    let ip = adresse_preferee(&addrs)
+                        .map(|a| a.to_string())
+                        .unwrap_or_default();
                     let name = info
                         .get_fullname()
                         .split("._smb._tcp")
@@ -855,8 +1076,10 @@ async fn mount_smb_share(
     Json(body): Json<MountRequest>,
 ) -> impl IntoResponse {
     let share_safe = body.share_name.replace(['/', '\\', ' '], "_");
-    let mount_path = body
+    let chemin_impose = body.mount_path.is_some();
+    let mut mount_path = body
         .mount_path
+        .clone()
         .unwrap_or_else(|| format!("/mnt/{}_{}", body.host, share_safe));
 
     // Dry run: just test reachability without mounting
@@ -884,8 +1107,70 @@ async fn mount_smb_share(
         .into_response();
     }
 
+    // Fil 2145 (Daniel Levy) : le meme NAS, enregistre une fois sous son IPv6
+    // (decouverte) et une fois sous son IPv4 (saisie), donnait deux lignes et
+    // deux montages du meme dossier — `montage_existant` compare des textes.
+    // On demande donc au serveur son identite SMB2 et on la compare a celle des
+    // partages du meme nom deja enregistres sous une AUTRE adresse. Seulement
+    // quand le chemin n'est pas impose : un chemin choisi a la main reste
+    // celui de l'utilisateur.
+    let mut ligne_cible = None;
+    let mut serveur_du_jumeau = None;
+    if !chemin_impose {
+        let lignes = lignes_smb(&state.backend);
+        if let Some(j) = jumeau_parmi(&body.host, &body.share_name, lignes, |h| async move {
+            smb::guid_du_serveur(&h, 445).await
+        })
+        .await
+        {
+            if smb::est_un_point_de_montage(std::path::Path::new(&j.mount_path)) {
+                info!(
+                    id = j.id, host = %body.host, jumeau = %j.server, share = %body.share_name,
+                    "smb_meme_serveur_deja_monte"
+                );
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": j.id,
+                        "mounted": true,
+                        "mount_path": j.mount_path,
+                        "existant": true,
+                        "deja_monte": true,
+                        "meme_serveur_que": j.server,
+                    })),
+                )
+                    .into_response();
+            }
+            // Le jumeau n'est pas monte : on monte par la nouvelle adresse, au
+            // point du jumeau, et sa ligne passe a cette adresse. Le chemin ne
+            // change pas — une racine de bibliotheque peut en dependre.
+            info!(
+                id = j.id, host = %body.host, jumeau = %j.server, share = %body.share_name,
+                "smb_meme_serveur_ligne_reprise"
+            );
+            mount_path = j.mount_path.clone();
+            ligne_cible = Some(j.id);
+            serveur_du_jumeau = Some(j.server);
+        }
+    }
+
     // Create mount directory
-    if let Err(e) = tokio::fs::create_dir_all(&mount_path).await {
+    //
+    // Hors root (Tune OS sous `tune`, #3206), /mnt appartient a root et le
+    // reste : c'est l'assistant privilegie qui cree le point, apres l'avoir
+    // verifie. Un /mnt ouvert au compte du service lui permettrait d'y poser
+    // un lien vers /etc et d'y faire monter un partage par root.
+    let creation = match tokio::fs::create_dir_all(&mount_path).await {
+        Err(e)
+            if crate::privilege::euid() != 0
+                && e.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            info!(path = %mount_path, "smb_mount_dir_par_l_assistant");
+            Ok(())
+        }
+        autre => autre,
+    };
+    if let Err(e) = creation {
         // Journalise AUSSI, et pas seulement dans la reponse HTTP : le client
         // web n'affichait que le statut, donc la cause n'existait nulle part
         // (#1847).
@@ -903,6 +1188,34 @@ async fn mount_smb_share(
             Json(json!({ "message": message, "error": motif })),
         )
             .into_response();
+    }
+
+    // Fil 2145 : le point est DEJA monte. Lancer `mount.cifs` par-dessus
+    // rendait `mount error(16)` (EBUSY), puis l'echelle descendait jusqu'a
+    // SMB 1.0 et l'utilisateur lisait « Operation not supported ». Le
+    // remontage au demarrage faisait ce test (`startup.rs`,
+    // `monter_un_partage`) ; la route interactive ne l'avait jamais fait.
+    if smb::est_un_point_de_montage(std::path::Path::new(&mount_path)) {
+        let source = smb::source_du_montage(std::path::Path::new(&mount_path));
+        let admis: Vec<&str> = std::iter::once(body.host.as_str())
+            .chain(serveur_du_jumeau.as_deref())
+            .collect();
+        match source.as_deref() {
+            Some(src)
+                if !admis
+                    .iter()
+                    .any(|h| smb::meme_source(src, h, &body.share_name)) =>
+            {
+                warn!(host = %body.host, path = %mount_path, source = %src, "smb_mount_point_occupe");
+                return point_occupe(&mount_path, Some(src));
+            }
+            _ => {
+                // Meme source, ou source illisible (hors Linux) : le partage
+                // est la, on l'enregistre et on rend son chemin.
+                info!(host = %body.host, share = %body.share_name, path = %mount_path, "smb_mount_deja_monte");
+                return persister_le_montage(&state, ligne_cible, &body, &mount_path, None, true);
+            }
+        }
     }
 
     // Dialecte qui a effectivement monte le partage, a persister pour que le
@@ -955,22 +1268,26 @@ async fn mount_smb_share(
 
         let mut dernier = None;
         for dialecte in smb::DIALECTES {
-            let mut opts = format!("username={user},password={pass}");
-            if let Some(v) = dialecte {
-                opts.push_str(&format!(",vers={v}"));
-            }
-            // JAMAIS `opts` dans une trace : il porte le mot de passe.
             info!(
                 host = %body.host,
                 share = %body.share_name,
                 dialect = smb::etiquette(dialecte),
                 "smb_mount_attempt"
             );
+            // root : `mount.cifs` direct ; sinon l'assistant, via sudo, le
+            // mot de passe sur son entree (#3206).
             let res = tokio::time::timeout(
                 smb::ESSAI_TIMEOUT,
-                Command::new("mount.cifs")
-                    .args([&unc, &mount_path, "-o", &opts])
-                    .output(),
+                smb::commande_de_montage(
+                    crate::privilege::euid(),
+                    &crate::privilege::sudo(),
+                    &unc,
+                    &mount_path,
+                    user,
+                    pass,
+                    dialecte,
+                )
+                .lancer(),
             )
             .await;
 
@@ -1002,8 +1319,9 @@ async fn mount_smb_share(
                     );
                     // Un refus d'authentification ne se repare pas en changeant
                     // de dialecte : inutile de faire patienter l'utilisateur
-                    // vingt secondes de plus pour la meme reponse.
-                    smb::est_refus_d_authentification(&stderr)
+                    // vingt secondes de plus pour la meme reponse. Un point
+                    // deja occupe (EBUSY) non plus (fil 2145).
+                    smb::arrete_l_echelle(&stderr)
                 }
                 Ok(Err(e)) => {
                     // mount.cifs absent ou non executable : reessayer avec un
@@ -1028,10 +1346,26 @@ async fn mount_smb_share(
         dernier.expect("DIALECTES n'est jamais vide")
     };
 
-    let mount_ok = match mount_result {
-        Ok(Ok(out)) if out.status.success() => true,
+    match mount_result {
+        Ok(Ok(out)) if out.status.success() => {}
         Ok(Ok(out)) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
+            // La vraie cause, et non l'erreur du dernier dialecte essaye.
+            if smb::est_deja_monte(&stderr) {
+                return point_occupe(&mount_path, None);
+            }
+            if crate::privilege::est_un_refus_d_elevation(&stderr) {
+                // Deja journalise par l'echelle (`smb_mount_failed`) ; ici,
+                // le message dit a l'utilisateur ce qui manque.
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": "elevation_refusee",
+                        "message": crate::privilege::message_de_refus(&stderr),
+                    })),
+                )
+                    .into_response();
+            }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": format!("mount failed: {stderr}") })),
@@ -1054,40 +1388,177 @@ async fn mount_smb_share(
         }
     };
 
-    // Persist to database
+    persister_le_montage(
+        &state,
+        ligne_cible,
+        &body,
+        &mount_path,
+        dialecte_retenu,
+        false,
+    )
+}
+
+/// 409 : le point de montage est occupe par autre chose que ce partage.
+fn point_occupe(mount_path: &str, source: Option<&str>) -> axum::response::Response {
+    let message = match source {
+        Some(src) => format!(
+            "Le point de montage {mount_path} est déjà occupé par un autre montage ({src}). \
+             Démontez-le, ou choisissez un autre point de montage."
+        ),
+        None => format!(
+            "Le point de montage {mount_path} est déjà occupé (le système répond « Device or \
+             resource busy »). Le partage y est peut-être déjà monté."
+        ),
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "message": message, "error": "point_de_montage_occupe" })),
+    )
+        .into_response()
+}
+
+/// Une ligne SMB enregistree : `(id, server, share, mount_path)`.
+type LigneSmb = (i64, String, String, String);
+
+fn lignes_smb(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> Vec<LigneSmb> {
+    backend
+        .query_many(
+            "SELECT id, server, share, mount_path FROM network_mounts \
+             WHERE mount_type = 'smb' ORDER BY id",
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            Some((
+                r.first()?.as_i64()?,
+                r.get(1)?.as_string()?,
+                r.get(2)?.as_string()?,
+                r.get(3)?.as_string()?,
+            ))
+        })
+        .collect()
+}
+
+/// Une ligne qui designe le MEME partage du MEME serveur, sous une autre
+/// adresse.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Jumeau {
+    pub id: i64,
+    pub server: String,
+    pub mount_path: String,
+}
+
+/// Chercher, parmi `lignes`, le meme partage du meme serveur enregistre sous
+/// une autre adresse que `hote` (fil 2145 : IPv6 et IPv4 d'un Synology).
+///
+/// `sonde` rend l'identite SMB2 (`ServerGuid`) d'une adresse ; elle est
+/// injectee pour l'epreuve. Si `hote` ne repond pas ou n'a pas d'identite, on
+/// ne conclut rien : mieux vaut une ligne en trop que deux NAS confondus.
+pub(crate) async fn jumeau_parmi<S, F>(
+    hote: &str,
+    partage: &str,
+    lignes: Vec<LigneSmb>,
+    mut sonde: S,
+) -> Option<Jumeau>
+where
+    S: FnMut(String) -> F,
+    F: std::future::Future<Output = Option<smb::GuidServeur>>,
+{
+    let hote_nu = hote.trim_start_matches('[').trim_end_matches(']');
+    let candidats: Vec<LigneSmb> = lignes
+        .into_iter()
+        .filter(|(_, server, share, _)| {
+            share.eq_ignore_ascii_case(partage)
+                && !server
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .eq_ignore_ascii_case(hote_nu)
+        })
+        .collect();
+    if candidats.is_empty() {
+        return None;
+    }
+    let identite = sonde(hote.to_string()).await?;
+    for (id, server, _, mount_path) in candidats {
+        if sonde(server.clone()).await == Some(identite) {
+            return Some(Jumeau {
+                id,
+                server,
+                mount_path,
+            });
+        }
+    }
+    None
+}
+
+/// Enregistrer le montage qui vient d'etre etabli (ou constate, `deja_monte`).
+///
+/// `ligne_cible` : la ligne d'un jumeau (meme serveur, autre adresse) a
+/// reprendre plutot que d'en ajouter une.
+fn persister_le_montage(
+    state: &AppState,
+    ligne_cible: Option<i64>,
+    body: &MountRequest,
+    mount_path: &str,
+    dialecte_retenu: Option<String>,
+    deja_monte: bool,
+) -> axum::response::Response {
     use tune_core::db::backend::ToSqlValue;
+    let mount_path = mount_path.to_string();
     // Remonter un partage deja enregistre passe souvent par cet ecran plutot
     // que par le bouton de remontage : sans ce controle on ajoutait une ligne
     // jumelle (#2453), et depuis l'index unique on echouerait. On rafraichit
     // la ligne existante — le dialecte retenu et le constat de montage sont
     // justement ce qui vient d'etre etabli.
-    if let Some(id) = montage_existant(
-        &state.backend,
-        "smb",
-        &body.host,
-        &body.share_name,
-        &mount_path,
-    ) {
-        let _ = state.backend.execute(
-            "UPDATE network_mounts SET username = ?, password = ?, smb_version = ?, \
-             mount_state = ?, active = 1 WHERE id = ?",
-            &[
-                &body.username as &dyn ToSqlValue,
-                &body.password as &dyn ToSqlValue,
-                &dialecte_retenu as &dyn ToSqlValue,
-                &"mounted" as &dyn ToSqlValue,
-                &id as &dyn ToSqlValue,
-            ],
-        );
-        tracing::info!(id, host = %body.host, share = %body.share_name, "montage_reseau_rafraichi");
+    let existante = ligne_cible.or_else(|| {
+        montage_existant(
+            &state.backend,
+            "smb",
+            &body.host,
+            &body.share_name,
+            &mount_path,
+        )
+    });
+    if let Some(id) = existante {
+        let res = if deja_monte {
+            // Rien n'a ete monte : ni les identifiants saisis ni un dialecte
+            // n'ont ete eprouves. On ne note que le constat — ecraser les
+            // identifiants qui montent ce partage au demarrage par ceux d'un
+            // formulaire peut-etre vide le perdrait au prochain redemarrage.
+            state.backend.execute(
+                "UPDATE network_mounts SET mount_state = ?, active = 1 WHERE id = ?",
+                &[&"mounted" as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+            )
+        } else {
+            state.backend.execute(
+                "UPDATE network_mounts SET server = ?, mount_path = ?, username = ?, \
+                 password = ?, smb_version = COALESCE(?, smb_version), \
+                 mount_state = ?, active = 1 WHERE id = ?",
+                &[
+                    &body.host as &dyn ToSqlValue,
+                    &mount_path as &dyn ToSqlValue,
+                    &body.username as &dyn ToSqlValue,
+                    &body.password as &dyn ToSqlValue,
+                    &dialecte_retenu as &dyn ToSqlValue,
+                    &"mounted" as &dyn ToSqlValue,
+                    &id as &dyn ToSqlValue,
+                ],
+            )
+        };
+        if let Err(e) = res {
+            warn!(id, error = %e, "montage_reseau_rafraichissement_echoue");
+        }
+        tracing::info!(id, host = %body.host, share = %body.share_name, deja_monte, "montage_reseau_rafraichi");
         return (
             StatusCode::OK,
             Json(json!({
                 "id": id,
-                "mounted": mount_ok,
+                "mounted": true,
                 "mount_path": mount_path,
                 "smb_version": dialecte_retenu,
                 "existant": true,
+                "deja_monte": deja_monte,
             })),
         )
             .into_response();
@@ -1122,7 +1593,8 @@ async fn mount_smb_share(
                 StatusCode::CREATED,
                 Json(json!({
                     "id": id,
-                    "mounted": mount_ok,
+                    "mounted": true,
+                    "deja_monte": deja_monte,
                     "mount_path": mount_path,
                     "smb_version": dialecte_retenu,
                 })),
@@ -1968,6 +2440,16 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                     // `res@size` : jamais rendu jusqu'ici. L'indexation de la
                     // phase 2 en fait une composante de la clé d'identité.
                     let size = best.and_then(|r| r.size);
+                    // Numéros de piste et de disque : `upnp:originalTrackNumber`
+                    // est la balise normalisée ; `upnp:originalDiscNumber` est
+                    // celle des serveurs qui disent le disque. Jamais lus
+                    // jusqu'ici : l'import de la bibliothèque unifiée rangeait
+                    // 0 sur chaque piste, et la fiche d'album se triait par
+                    // titre. Absent, illisible ou 0 : `null`, rien d'inventé.
+                    let track_number = extract_xml_tag(element, "upnp:originalTrackNumber")
+                        .and_then(|v| numero_didl(&v));
+                    let disc_number = extract_xml_tag(element, "upnp:originalDiscNumber")
+                        .and_then(|v| numero_didl(&v));
                     items.push(json!({
                         "id": id,
                         "title": title,
@@ -1981,6 +2463,8 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                         "channels": channels,
                         "protocol_info": protocol_info,
                         "size": size,
+                        "track_number": track_number,
+                        "disc_number": disc_number,
                     }));
                 }
 
@@ -2182,6 +2666,18 @@ fn texte_didl(brut: &str) -> String {
     quick_xml::escape::unescape(brut)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| brut.to_string())
+}
+
+/// Un numéro de piste ou de disque DIDL : les chiffres de tête, strictement
+/// positifs. « 3/12 » donne 3 ; « 0 », « » ou « A1 » ne donnent rien — 0 n'est
+/// pas un numéro, c'est l'absence de numéro.
+fn numero_didl(brut: &str) -> Option<u32> {
+    let chiffres: String = brut
+        .trim()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    chiffres.parse::<u32>().ok().filter(|n| *n > 0)
 }
 
 fn extract_xml_tag(element: &str, tag: &str) -> Option<String> {
@@ -2432,6 +2928,52 @@ mod tests {
         );
         // Témoin : un texte sans entité traverse inchangé.
         assert_eq!(items[0]["album"].as_str(), Some("Caravelle"));
+    }
+
+    /// b209 — le numéro de piste d'un serveur UPnP. Le DIDL ci-dessous a la
+    /// forme exacte de celui qu'un serveur Tune rend à `Browse` sur un album
+    /// (relevé sur le LAN le 07/10/2026, adresses remplacées) : le numéro est
+    /// dans `upnp:originalTrackNumber`, et rien ne le lisait — l'import
+    /// rangeait 0 sur chaque piste.
+    #[test]
+    fn le_numero_de_piste_et_de_disque_sont_lus_et_zero_n_en_est_pas_un() {
+        let item = |id: &str, numeros: &str| {
+            format!(
+                r#"<item id="track/{id}" parentID="album/1" restricted="1"><dc:title>T{id}</dc:title><dc:creator>Artiste</dc:creator><upnp:artist>Artiste</upnp:artist><upnp:class>object.item.audioItem.musicTrack</upnp:class><upnp:album>Album</upnp:album>{numeros}<res protocolInfo="http-get:*:audio/flac:*" duration="0:06:38.493" sampleFrequency="44100" bitsPerSample="16" nrAudioChannels="2" size="31909580">http://serveur.invalid/api/v1/library/tracks/{id}/audio</res></item>"#
+            )
+        };
+        let didl = format!(
+            r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">{}{}{}{}</DIDL-Lite>"#,
+            item(
+                "1",
+                "<upnp:originalTrackNumber>7</upnp:originalTrackNumber><upnp:originalDiscNumber>2</upnp:originalDiscNumber>"
+            ),
+            item(
+                "2",
+                "<upnp:originalTrackNumber>0</upnp:originalTrackNumber>"
+            ),
+            item("3", ""),
+            item(
+                "4",
+                "<upnp:originalTrackNumber> 3/12 </upnp:originalTrackNumber>"
+            ),
+        );
+        let soap = format!(
+            "<Envelope><Body><BrowseResponse><Result>{}</Result></BrowseResponse></Body></Envelope>",
+            xml_escape(&didl)
+        );
+        let (_c, items) = parse_didl_browse_response(&soap);
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            items[0]["track_number"].as_u64(),
+            Some(7),
+            "sans le correctif : absent"
+        );
+        assert_eq!(items[0]["disc_number"].as_u64(), Some(2));
+        assert!(items[1]["track_number"].is_null(), "0 n'est pas un numéro");
+        assert!(items[1]["disc_number"].is_null());
+        assert!(items[2]["track_number"].is_null(), "rien n'est inventé");
+        assert_eq!(items[3]["track_number"].as_u64(), Some(3));
     }
 
     #[test]
@@ -2695,5 +3237,379 @@ mod tests_browse_dit_son_echec_4134 {
         assert!(reponse_porte_un_result(BROWSE_VIDE));
         assert!(!reponse_porte_un_result(SOAP_FAULT));
         assert!(reponse_porte_un_result("<Result xmlns=\"x\"></Result>"));
+    }
+}
+
+/// Fil 2145 (Daniel Levy, « Disparition bibliothèque sur unité NAS ») : un
+/// partage deja monte faisait echouer l'assistant avec un message faux, et le
+/// meme NAS vu sous deux adresses donnait deux lignes.
+#[cfg(test)]
+mod tests_montage_2145 {
+    use super::{Jumeau, adresse_preferee, jumeau_parmi};
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn la_decouverte_prefere_l_ipv4() {
+        let synology = [
+            ip("fd12:3456:789a::58d1"),
+            ip("192.168.10.69"),
+            ip("fe80::1"),
+        ];
+        assert_eq!(adresse_preferee(&synology), Some(ip("192.168.10.69")));
+        // L'ordre de la collection ne change rien.
+        let mut inverse = synology;
+        inverse.reverse();
+        assert_eq!(adresse_preferee(&inverse), Some(ip("192.168.10.69")));
+        // Sans IPv4 : l'IPv6 routable plutot que le lien local.
+        assert_eq!(
+            adresse_preferee(&[ip("fe80::1"), ip("fd12::58d1")]),
+            Some(ip("fd12::58d1"))
+        );
+        assert_eq!(adresse_preferee(&[]), None);
+    }
+
+    fn lignes() -> Vec<(i64, String, String, String)> {
+        vec![
+            (
+                1,
+                "fd12::58d1".into(),
+                "Music".into(),
+                "/mnt/fd12::58d1_Music".into(),
+            ),
+            (
+                2,
+                "192.168.10.80".into(),
+                "Music".into(),
+                "/mnt/192.168.10.80_Music".into(),
+            ),
+            (
+                3,
+                "fd12::58d1".into(),
+                "Video".into(),
+                "/mnt/fd12::58d1_Video".into(),
+            ),
+        ]
+    }
+
+    /// L'identite SMB2 de chaque adresse du banc : le Synology de Daniel a
+    /// deux adresses et un seul GUID ; un autre NAS en a un autre.
+    async fn sonde(h: String) -> Option<crate::smb::GuidServeur> {
+        match h.as_str() {
+            "192.168.10.69" | "fd12::58d1" | "[fd12::58d1]" => Some(*b"daniel-synology!"),
+            "192.168.10.80" => Some(*b"un-autre-serveur"),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn le_meme_nas_sous_son_ipv4_retrouve_sa_ligne_ipv6() {
+        let j = jumeau_parmi("192.168.10.69", "music", lignes(), sonde).await;
+        assert_eq!(
+            j,
+            Some(Jumeau {
+                id: 1,
+                server: "fd12::58d1".into(),
+                mount_path: "/mnt/fd12::58d1_Music".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn un_autre_nas_ou_un_autre_partage_n_est_pas_un_jumeau() {
+        // Autre serveur (GUID different) : aucune fusion.
+        let lignes_autre = vec![lignes()[1].clone()];
+        assert_eq!(
+            jumeau_parmi("192.168.10.69", "Music", lignes_autre, sonde).await,
+            None
+        );
+        // Meme serveur, autre partage.
+        assert_eq!(
+            jumeau_parmi("192.168.10.69", "Photo", lignes(), sonde).await,
+            None
+        );
+        // Serveur sans identite (SMB1, injoignable) : on ne conclut rien.
+        assert_eq!(
+            jumeau_parmi("10.0.0.9", "Music", lignes(), sonde).await,
+            None
+        );
+        // La meme adresse n'est pas un jumeau : `montage_existant` s'en charge.
+        let meme = vec![lignes()[0].clone()];
+        assert_eq!(
+            jumeau_parmi("[fd12::58d1]", "Music", meme, sonde).await,
+            None
+        );
+    }
+
+    /// Un point de montage occupe par AUTRE CHOSE que le partage demande :
+    /// `/proc`, toujours monte sur Linux. Avant le correctif, la route lancait
+    /// `mount.cifs` par-dessus (EBUSY, ou commande absente) et rendait 500 avec
+    /// l'erreur du dernier dialecte ; elle doit rendre 409 et nommer la cause,
+    /// sans lancer de montage ni ecrire de ligne.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn un_point_occupe_par_autre_chose_rend_409_et_sa_cause() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let backend = etat.backend.clone();
+        let app = crate::routes::router(etat);
+        let corps = serde_json::json!({
+            "host": "192.168.10.69",
+            "share_name": "Music",
+            "mount_path": "/proc",
+        });
+        let rep = app
+            .oneshot(
+                Request::post("/api/v1/network/smb/mount")
+                    .header("content-type", "application/json")
+                    .body(Body::from(corps.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let statut = rep.status();
+        let octets = axum::body::to_bytes(rep.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&octets).unwrap_or_default();
+        assert_eq!(statut, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"], "point_de_montage_occupe", "{v}");
+        let message = v["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("/proc") && message.contains("proc"),
+            "{message}"
+        );
+        let n = backend
+            .query_many("SELECT id FROM network_mounts", &[])
+            .unwrap()
+            .len();
+        assert_eq!(n, 0, "aucune ligne ne doit etre ecrite");
+    }
+}
+
+/// Fil 2145 : « Oublier ce partage » demonte, puis supprime, et demande
+/// confirmation si la bibliotheque en depend.
+#[cfg(test)]
+mod tests_oubli_2145 {
+    use super::racines_dependantes;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[test]
+    fn une_racine_depend_du_point_ou_d_un_dossier_dessous() {
+        let dirs = vec![
+            "/mnt/nas_Music".to_string(),
+            "/mnt/nas_Music/Jazz/".to_string(),
+            "/mnt/nas_Music2".to_string(),
+            "/home/daniel/Musique".to_string(),
+        ];
+        assert_eq!(
+            racines_dependantes(&dirs, "/mnt/nas_Music/"),
+            vec![
+                "/mnt/nas_Music".to_string(),
+                "/mnt/nas_Music/Jazz/".to_string()
+            ]
+        );
+        assert!(racines_dependantes(&dirs, "/mnt/autre").is_empty());
+        assert!(racines_dependantes(&dirs, "").is_empty());
+    }
+
+    async fn appel(app: &axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let rep = app.clone().oneshot(req).await.unwrap();
+        let statut = rep.status();
+        let octets = axum::body::to_bytes(rep.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (statut, serde_json::from_slice(&octets).unwrap_or_default())
+    }
+
+    fn lignes(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> usize {
+        backend
+            .query_many("SELECT id FROM network_mounts", &[])
+            .unwrap()
+            .len()
+    }
+
+    /// Un partage non monte, dont une racine de bibliotheque depend : sans
+    /// confirmation, 409 et rien ne bouge ; confirme, la ligne disparait, le
+    /// point vide aussi, et la racine reste declaree.
+    #[tokio::test]
+    async fn oublier_un_partage_demande_confirmation_puis_supprime() {
+        use tune_core::db::backend::ToSqlValue;
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let backend = etat.backend.clone();
+        let point = tune_core::test_scratch::scratch_dir("tune_oubli_2145").join("nas_Music");
+        std::fs::create_dir_all(&point).unwrap();
+        let point_s = point.to_string_lossy().to_string();
+        let id = backend
+            .execute_returning_id(
+                "INSERT INTO network_mounts (mount_type, server, share, mount_path) VALUES ('smb', ?, ?, ?)",
+                &[&"192.168.10.69" as &dyn ToSqlValue, &"Music" as &dyn ToSqlValue, &point_s as &dyn ToSqlValue],
+            )
+            .unwrap();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&vec![point_s.clone()]).unwrap(),
+            )
+            .unwrap();
+        let app = crate::routes::router(etat);
+
+        let (statut, v) = appel(
+            &app,
+            Request::delete(format!("/api/v1/network/smb/mounts/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"], "racines_dependantes");
+        assert_eq!(v["racines"][0], point_s.as_str());
+        assert_eq!(lignes(&backend), 1, "rien ne doit bouger sans confirmation");
+
+        let (statut, v) = appel(
+            &app,
+            Request::delete(format!("/api/v1/network/smb/mounts/{id}?confirmer=true"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{v}");
+        assert_eq!(v["oublie"], true);
+        assert_eq!(v["demonte"], false, "le point n'etait pas monte");
+        assert_eq!(lignes(&backend), 0, "la ligne doit etre supprimee");
+        assert!(!point.exists(), "le point de montage vide est retire");
+        assert_eq!(
+            crate::routes::system::get_music_dirs_list(&backend),
+            vec![point_s],
+            "la racine reste declaree : son sort est le geste « retirer un dossier »"
+        );
+
+        let (statut, _) = appel(
+            &app,
+            Request::delete(format!("/api/v1/network/smb/mounts/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::NOT_FOUND);
+    }
+
+    /// Decision de Bertrand (05/10) : la confirmation propose de retirer aussi
+    /// les dossiers, avec la purge habituelle de leurs pistes. Le 409 dit
+    /// combien de pistes partiraient ; confirme avec ce nombre, les racines
+    /// sont retirees par le chemin de `POST /system/music-dirs/remove` et
+    /// leurs pistes purgees ; une racine qui ne depend pas du partage reste,
+    /// avec ses pistes.
+    #[tokio::test]
+    async fn oublier_en_retirant_les_racines_purge_leurs_pistes() {
+        use tune_core::db::backend::ToSqlValue;
+        use tune_core::db::models::Track;
+        use tune_core::db::track_repo::TrackRepo;
+        let n = tune_core::scanner::walker::normalize_path;
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let backend = etat.backend.clone();
+        let base = tune_core::test_scratch::scratch_dir("tune_oubli_2145_c");
+        let point = base.join("nas_Music");
+        let autre = base.join("disque_local");
+        std::fs::create_dir_all(&point).unwrap();
+        let (point_s, autre_s) = (n(&point.to_string_lossy()), n(&autre.to_string_lossy()));
+        let id = backend
+            .execute_returning_id(
+                "INSERT INTO network_mounts (mount_type, server, share, mount_path) VALUES ('smb', ?, ?, ?)",
+                &[&"192.168.10.69" as &dyn ToSqlValue, &"Music" as &dyn ToSqlValue, &point_s as &dyn ToSqlValue],
+            )
+            .unwrap();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&vec![point_s.clone(), autre_s.clone()]).unwrap(),
+            )
+            .unwrap();
+        let repo = TrackRepo::with_backend(backend.clone());
+        for chemin in [
+            format!("{point_s}/a.flac"),
+            format!("{point_s}/Jazz/b.flac"),
+            format!("{autre_s}/c.flac"),
+        ] {
+            let mut t = Track::new(format!("piste {chemin}"));
+            t.file_path = Some(chemin);
+            repo.create(&t).unwrap();
+        }
+        let app = crate::routes::router(etat);
+
+        let (statut, v) = appel(
+            &app,
+            Request::delete(format!("/api/v1/network/smb/mounts/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["pistes"], 2, "deux pistes vivent sur le partage : {v}");
+
+        let (statut, v) = appel(
+            &app,
+            Request::delete(format!(
+                "/api/v1/network/smb/mounts/{id}?confirmer=true&retirer_racines=true&confirmer_purge=2"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{v}");
+        assert_eq!(v["racines_retirees"][0], point_s.as_str(), "{v}");
+        assert_eq!(v["pistes_retirees"], 2, "{v}");
+        assert_eq!(v["purge_refusee"], false, "{v}");
+        assert_eq!(lignes(&backend), 0);
+        assert_eq!(
+            crate::routes::system::get_music_dirs_list(&backend),
+            vec![autre_s.clone()],
+            "seule la racine du partage est retiree"
+        );
+        let restantes = backend
+            .query_many("SELECT file_path FROM tracks", &[])
+            .unwrap();
+        assert_eq!(restantes.len(), 1, "la piste de l'autre racine reste");
+    }
+
+    /// Sans racine dependante, l'oubli se fait sans confirmation. Un point qui
+    /// porte des fichiers n'est jamais efface.
+    #[tokio::test]
+    async fn sans_racine_l_oubli_est_direct_et_ne_touche_pas_aux_fichiers() {
+        use tune_core::db::backend::ToSqlValue;
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let backend = etat.backend.clone();
+        let point = tune_core::test_scratch::scratch_dir("tune_oubli_2145_b").join("nas_Music");
+        std::fs::create_dir_all(&point).unwrap();
+        std::fs::write(point.join("residu.flac"), b"x").unwrap();
+        let point_s = point.to_string_lossy().to_string();
+        let id = backend
+            .execute_returning_id(
+                "INSERT INTO network_mounts (mount_type, server, share, mount_path) VALUES ('smb', ?, ?, ?)",
+                &[&"fd12::58d1" as &dyn ToSqlValue, &"Music" as &dyn ToSqlValue, &point_s as &dyn ToSqlValue],
+            )
+            .unwrap();
+        let app = crate::routes::router(etat);
+        let (statut, v) = appel(
+            &app,
+            Request::delete(format!("/api/v1/network/smb/mounts/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{v}");
+        assert_eq!(lignes(&backend), 0);
+        assert!(
+            point.join("residu.flac").exists(),
+            "aucun fichier ne doit etre efface"
+        );
     }
 }

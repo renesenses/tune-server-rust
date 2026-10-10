@@ -131,6 +131,49 @@ pub struct NowPlaying {
     /// Inconnus pour un ancien client ou une source non mesurée.
     #[serde(default)]
     pub channels: Option<u16>,
+    /// #2264 — quelle VERSION joue, et pourquoi : la règle de choix appliquée
+    /// au lancement (`local`, `quality`, `service:<nom>`), le choix explicite
+    /// fait dans « Autres versions », et le REPLI quand la version préférée
+    /// était indisponible. La source et la qualité de la version jouée sont
+    /// déjà celles des champs ci-dessus ; ce champ dit en plus ce qui a été
+    /// DEMANDÉ et si l'on s'en est écarté.
+    ///
+    /// `None` : aucune règle n'a eu à se prononcer (radio, podcast, piste
+    /// sans autre exemplaire connu, enchaînement d'une ligne de file sans
+    /// substitution). `#[serde(default)]` : un client plus ancien l'ignore.
+    #[serde(default)]
+    pub version: Option<VersionJouee>,
+}
+
+/// La piste DEMANDÉE quand la règle en a fait jouer une autre (#2264).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PisteDemandee {
+    pub track_id: Option<i64>,
+    pub source: String,
+    pub source_id: Option<String>,
+}
+
+/// Ce que la règle de version a décidé pour la piste en cours (#2264).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionJouee {
+    /// `rule` : la règle a choisi. `explicit` : la version a été choisie à la
+    /// main dans « Autres versions », et la règle ne s'est pas appliquée.
+    pub origin: String,
+    /// La règle en vigueur pour le profil de la zone (`local`, `quality`,
+    /// `service:<nom>`), même quand le choix est explicite.
+    pub rule: String,
+    /// D'où vient la règle : `profile`, `setting` (défaut global) ou
+    /// `default`.
+    pub rule_origin: String,
+    /// La piste lancée, quand ce n'est PAS celle qui joue ; `None` sinon.
+    pub requested: Option<PisteDemandee>,
+    /// Vrai quand la version préférée par la règle était indisponible et que
+    /// la suivante disponible joue à sa place. Le client l'affiche
+    /// (« version de repli ») ; le journal porte `version_de_repli`.
+    pub fallback: bool,
+    /// La source de la version préférée indisponible (`qobuz`, `local`…),
+    /// quand `fallback` est vrai.
+    pub unavailable_source: Option<String>,
 }
 
 impl NowPlaying {
@@ -173,6 +216,7 @@ impl NowPlaying {
             // encodage (#2074).
             bitrate_kbps: None,
             channels: u16::try_from(track.channels).ok().filter(|n| *n > 0),
+            version: None,
         }
     }
 }
@@ -835,6 +879,40 @@ impl HorlogeDeSortie {
     }
 }
 
+/// #4384 — de quoi dire ce que la sortie locale DEMANDAIT avant le rabot à
+/// l'unité : volume utilisateur × ReplayGain (préampli et compensation de
+/// niveau compris), et la bascule DoP qui remplace tout par l'unité.
+///
+/// Les mêmes `Arc` que les rappels de rendu (`LocalOutput::gain_demande`),
+/// relus à chaque appel. `effective_volume_units` rabote ce produit à 1,0 :
+/// « +6 dB de préampli à volume plein » ne produit rien, et sans ce nombre
+/// l'écran ne pouvait pas le dire.
+#[derive(Clone)]
+pub struct GainDemande {
+    /// Volume réglé par l'utilisateur, en millièmes.
+    pub volume_utilisateur: Arc<std::sync::atomic::AtomicU32>,
+    /// Facteur ReplayGain × compensation empaqueté par
+    /// `outputs::local::composer_le_facteur_de_rendu` : les 16 bits bas
+    /// portent le facteur, en millièmes.
+    pub facteur_de_rendu: Arc<std::sync::atomic::AtomicU32>,
+    /// Flux DoP en cours : le gain est alors l'unité exacte, rien n'est
+    /// demandé ni raboté.
+    pub dop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl GainDemande {
+    /// Le produit demandé AVANT rabot, en millièmes. `None` en DoP.
+    pub fn units(&self) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        if self.dop.load(Ordering::Relaxed) {
+            return None;
+        }
+        let volume = u64::from(self.volume_utilisateur.load(Ordering::SeqCst));
+        let facteur = u64::from(self.facteur_de_rendu.load(Ordering::SeqCst) & 0xFFFF);
+        Some(((volume * facteur + 500) / 1000).min(u64::from(u32::MAX)) as u32)
+    }
+}
+
 pub struct PlaybackManager {
     zones: Arc<Mutex<HashMap<i64, ZoneState>>>,
     event_tx: broadcast::Sender<PlaybackEvent>,
@@ -881,6 +959,9 @@ pub struct PlaybackManager {
     /// son estimation.
     cretes_de_sortie:
         std::sync::Mutex<HashMap<i64, Arc<crate::audio::crete_de_sortie::CretesDeSortie>>>,
+    /// #4384 — ce que la sortie locale qui joue la zone demandait avant le
+    /// rabot à l'unité. Voir [`GainDemande`]. Absent = pas de sortie locale.
+    gains_demandes: std::sync::Mutex<HashMap<i64, GainDemande>>,
 }
 
 impl Default for PlaybackManager {
@@ -902,6 +983,7 @@ impl PlaybackManager {
             gains_moyens_du_dsp: std::sync::Mutex::new(HashMap::new()),
             horloges_de_sortie: std::sync::Mutex::new(HashMap::new()),
             cretes_de_sortie: std::sync::Mutex::new(HashMap::new()),
+            gains_demandes: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -942,6 +1024,12 @@ impl PlaybackManager {
         self.cretes_de_sortie
             .lock()
             .expect("cretes_de_sortie lock")
+            .remove(&zone_id);
+        // Et ce qu'elle demandait avant rabot (#4384) : un rendu réseau cuit
+        // son gain dans le flux, il n'a pas de rabot à dire.
+        self.gains_demandes
+            .lock()
+            .expect("gains_demandes lock")
             .remove(&zone_id);
     }
 
@@ -1053,6 +1141,30 @@ impl PlaybackManager {
             }
             _ => rendu,
         }
+    }
+
+    /// #4384 — partage ce que la sortie locale qui va jouer cette zone
+    /// demande avant le rabot à l'unité. Voir [`Self::gain_demande_units`].
+    pub fn brancher_le_gain_demande(&self, zone_id: i64, gain: GainDemande) {
+        self.gains_demandes
+            .lock()
+            .expect("gains_demandes lock")
+            .insert(zone_id, gain);
+    }
+
+    /// #4384 — volume × ReplayGain (préampli et compensation compris) que la
+    /// sortie locale de la zone DEMANDE, en millièmes, AVANT le rabot à
+    /// l'unité de `effective_volume_units`. Au-dessus de `1000`, le rabot
+    /// mord : le gain de rendu reste à l'unité.
+    ///
+    /// `None` : pas de sortie locale branchée (un rendu réseau cuit le gain
+    /// dans le flux), ou flux DoP (gain unité imposé).
+    pub fn gain_demande_units(&self, zone_id: i64) -> Option<u32> {
+        self.gains_demandes
+            .lock()
+            .expect("gains_demandes lock")
+            .get(&zone_id)
+            .and_then(GainDemande::units)
     }
 
     /// La génération de niveaux d'une zone (créée au premier accès).
@@ -1334,6 +1446,26 @@ impl PlaybackManager {
     }
 
     pub async fn play(&self, zone_id: i64, np: NowPlaying) {
+        let _ = self.play_en_rendant_le_flux_remplace(zone_id, np).await;
+    }
+
+    /// [`Self::play`], qui rend en plus la session de flux de la lecture
+    /// qu'elle REMPLACE, lue sous le même verrou que l'écriture.
+    ///
+    /// Ticket 134 : trois « suivant » rapprochés. Chaque
+    /// `play_inner` notait la session à fermer à son DÉPART. Les deux
+    /// dernières lectures ont donc noté la même (celle de la première) ; la
+    /// session de la deuxième, remplacée par la troisième, n'a été fermée par
+    /// personne. Son décodeur est resté bloqué sur un canal plein jusqu'au
+    /// délai d'envoi (300 s alors, 1 800 s depuis #4917).
+    ///
+    /// `None` quand rien n'était en lecture, quand la lecture remplacée
+    /// n'avait pas de session, ou quand c'est la même session.
+    pub async fn play_en_rendant_le_flux_remplace(
+        &self,
+        zone_id: i64,
+        np: NowPlaying,
+    ) -> Option<String> {
         let mut zones = self.zones.lock().await;
         let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
             zone_id,
@@ -1417,6 +1549,11 @@ impl PlaybackManager {
         state.browser_unattended_at = None;
         // np is no longer read after this — the event payload is built from
         // `state` via now_playing_event_data() below — so move instead of clone.
+        let flux_remplace = state
+            .now_playing
+            .as_ref()
+            .and_then(|ancienne| ancienne.stream_id.clone())
+            .filter(|ancien| np.stream_id.as_deref() != Some(ancien.as_str()));
         state.now_playing = Some(np);
         // Nouveau morceau → nouvel ancrage temporel de métadonnée.
         state.metadata_changed_at_ms = Some(epoch_ms());
@@ -1435,6 +1572,7 @@ impl PlaybackManager {
             zone_id,
             data,
         });
+        flux_remplace
     }
 
     pub async fn pause(&self, zone_id: i64) {
@@ -2034,6 +2172,32 @@ impl PlaybackManager {
             zone_id,
             data: serde_json::json!({ "position_ms": position_ms }),
         });
+    }
+
+    /// Fil 2062 / #5550 — pose une durée sur la piste en cours qui n'en avait
+    /// pas, et l'annonce (`track_changed`) pour que l'interface l'affiche.
+    /// Sans effet sur une piste dont la durée est déjà connue.
+    pub async fn adopter_la_duree_rapportee(&self, zone_id: i64, duration_ms: i64) -> bool {
+        if duration_ms <= 0 {
+            return false;
+        }
+        let data = {
+            let mut zones = self.zones.lock().await;
+            let Some(state) = zones.get_mut(&zone_id) else {
+                return false;
+            };
+            let Some(np) = state.now_playing.as_mut().filter(|np| np.duration_ms <= 0) else {
+                return false;
+            };
+            np.duration_ms = duration_ms;
+            now_playing_event_data(state)
+        };
+        self.emit(PlaybackEvent {
+            event: "track_changed".into(),
+            zone_id,
+            data,
+        });
+        true
     }
 
     /// Update the NowPlaying metadata for a zone without resetting position.

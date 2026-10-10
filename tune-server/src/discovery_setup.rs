@@ -59,6 +59,41 @@ pub(crate) fn urls_evenements_dlna(
         .collect()
 }
 
+/// #5793 — l'URL absolue du SCPD de `RenderingControl` d'un appareil
+/// découvert, si son descriptif l'annonce (capacité `scpd_urls`, posée par
+/// `ssdp::build_renderer_device`).
+pub(crate) fn scpd_rendering_control(
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+) -> Option<String> {
+    let urls = dev
+        .capabilities
+        .get("scpd_urls")
+        .and_then(|v| {
+            serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+        })
+        .unwrap_or_default();
+    urls.get("renderingcontrol")
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| resolve_control_url(&dev.host, dev.port, p))
+}
+
+/// #3967 — l'URL absolue du SCPD d'`AVTransport`, même source que
+/// [`scpd_rendering_control`].
+pub(crate) fn scpd_av_transport(
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+) -> Option<String> {
+    let urls = dev
+        .capabilities
+        .get("scpd_urls")
+        .and_then(|v| {
+            serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+        })
+        .unwrap_or_default();
+    urls.get("avtransport")
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| resolve_control_url(&dev.host, dev.port, p))
+}
+
 pub(crate) fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
     if control_url.starts_with("http://") || control_url.starts_with("https://") {
         control_url.to_string()
@@ -213,7 +248,12 @@ async fn retirer_serveur_multimedia(
 /// Set a zone's online state and, if it actually changed, broadcast a
 /// `zone.updated` event so controllers see availability flip in real time.
 /// (`set_online_by_device` alone is silent — clients never learned of it.)
-fn set_zone_online(event_bus: &EventBus, db: &Arc<dyn DbBackend>, device_id: &str, online: bool) {
+pub(crate) fn set_zone_online(
+    event_bus: &EventBus,
+    db: &Arc<dyn DbBackend>,
+    device_id: &str,
+    online: bool,
+) {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
     let prev = zone_repo
         .get_by_device_id(device_id)
@@ -493,7 +533,7 @@ fn spawn_ssdp_event_handler(
 /// consommateurs lisent cet evenement — plugins abonnes, passerelle
 /// `developer_api` — et n'ont pas a etre migres pour que l'interface se repare.
 /// Un evenement qui satisfait les deux formes ne casse personne.
-fn charge_utile_zone_creee(
+pub(crate) fn charge_utile_zone_creee(
     zone_repo: &tune_core::db::zone_repo::ZoneRepo,
     zone_id: i64,
     mut plat: serde_json::Value,
@@ -840,7 +880,9 @@ async fn handle_ssdp_discovered(
                 oh_listener.clone(),
                 urls_evenements_dlna(&dev.host, dev.port, &evt_urls),
             )
-            .with_upnp_silence(crate::config::resolve_upnp_silence(db, &dev.id));
+            .with_upnp_silence(crate::config::resolve_upnp_silence(db, &dev.id))
+            .with_rendering_control_scpd(scpd_rendering_control(dev))
+            .with_av_transport_scpd(scpd_av_transport(dev));
             let mut reg = outputs.lock().await;
             register_discovered_output(
                 &mut reg,
@@ -853,6 +895,13 @@ async fn handle_ssdp_discovered(
             registered = true;
             info!(name = %dev.name, id = %dev.id, "dlna_output_registered");
             drop(reg);
+            // Les profils de commande appris pour cet appareil lors d'une vie
+            // précédente de Tune : relus ici, oubliés si la version logicielle
+            // publiée a changé.
+            tune_core::outputs::dlna_repli_set_uri::charger_pour_appareil(
+                &dev.id,
+                dev.capabilities.get("firmware").and_then(|v| v.as_str()),
+            );
             // Persist LOCATION + UUID so a lazy-SSDP renderer (Cyrus Stream X2)
             // can be re-probed over HTTP after a restart instead of vanishing
             // until it next answers multicast (#1126).

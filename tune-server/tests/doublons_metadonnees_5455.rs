@@ -122,25 +122,22 @@ fn remplir(state: &AppState) -> Vec<(i64, i64)> {
     for id in 1..=PISTES {
         let trames = trames_du_morceau(&mut alea);
         let duree = 90_000 + alea.tirer(390_000);
-        piste(
-            &mut sql,
-            id,
-            &format!("Titre {}", alea.tirer(3_000)),
-            duree,
-            &serialiser(&trames),
-        );
+        let titre = format!("Titre {}", alea.tirer(3_000));
+        piste(&mut sql, id, &titre, duree, &serialiser(&trames));
         if id % (PISTES / COPIES) == 0 && (origines.len() as i64) < COPIES {
-            origines.push((id, trames, duree));
+            origines.push((id, trames, duree, titre));
         }
     }
-    for (k, (origine, trames, duree)) in origines.into_iter().enumerate() {
+    for (k, (origine, trames, duree, titre)) in origines.into_iter().enumerate() {
         let id = PISTES + 1 + k as i64;
         // La même piste réencodée : un peu de bruit, un rembourrage d'encodeur.
         let copie: Vec<(i64, i64)> = trames
             .iter()
             .map(|(e, z)| (e + alea.tirer(5) as i64 - 2, z + alea.tirer(5) as i64 - 2))
             .collect();
-        piste(&mut sql, id, "Copie", duree + 200, &serialiser(&copie));
+        // Le même titre : depuis #5976, deux titres différents ne sont
+        // jamais le même enregistrement.
+        piste(&mut sql, id, &titre, duree + 200, &serialiser(&copie));
         plantees.push((origine, id));
     }
     sql.push_str("COMMIT;");

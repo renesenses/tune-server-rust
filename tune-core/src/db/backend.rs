@@ -41,6 +41,14 @@ pub trait DbBackend: Send + Sync {
     /// The engine type for SQL dialect dispatch.
     fn engine(&self) -> Engine;
 
+    /// #5993 — un jeton qui change à chaque écriture validée dans la base,
+    /// quelle que soit la connexion qui l'a faite. Sert à garder en mémoire
+    /// un résultat de lecture coûteux tant que rien n'a été écrit. `None` :
+    /// le moteur ne sait pas le dire, et l'appelant ne garde rien.
+    fn jeton_des_donnees(&self) -> Option<(u64, i64)> {
+        None
+    }
+
     /// Execute a statement that doesn't return rows (INSERT/UPDATE/
     /// DELETE/DDL). Returns the number of affected rows.
     fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String>;
@@ -169,6 +177,42 @@ pub trait DbBackend: Send + Sync {
         params: &[&dyn ToSqlValue],
     ) -> Result<Option<Vec<SqlValue>>, String> {
         self.query_one(sql, params)
+    }
+
+    /// Comme [`Self::query_one_strong`], SANS attendre l'écrivain (#5871).
+    ///
+    /// La connexion d'écriture est lue si elle est libre — la lecture voit
+    /// alors tout, comme une lecture forte. Si un autre fil la tient, la
+    /// lecture passe par le pool : elle y trouve la dernière valeur VALIDÉE,
+    /// au lieu de faire la queue derrière l'écrivain. Un scan qui écrit sans
+    /// relâche reprend la connexion dès qu'il la rend (le `Mutex` n'est pas
+    /// équitable) : une lecture forte attendait la fin d'une phase
+    /// d'écriture entière, et la préparation d'une lecture DLNA, qui en fait
+    /// une vingtaine, passait de 100 ms à 9-13 s (Tades, fil 2160).
+    ///
+    /// Ce que la lecture ne voit pas en passant par le pool : une écriture
+    /// non validée d'une transaction ouverte par un AUTRE fil. Les écrivains
+    /// ordinaires attendent la fin du lot de scan avant d'écrire
+    /// (`transaction_du_lot.rs`) : ce qu'ils posent est validé, donc visible
+    /// du pool. Le fil qui tient lui-même la transaction du lot lit, lui,
+    /// toujours par la connexion d'écriture.
+    ///
+    /// Par défaut : la lecture forte (PostgreSQL n'a qu'un pool).
+    fn query_one_frais(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        self.query_one_strong(sql, params)
+    }
+
+    /// Variante à plusieurs lignes de [`Self::query_one_frais`].
+    fn query_many_frais(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.query_many_strong(sql, params)
     }
 
     /// Point de cession d'une longue transaction brute (`BEGIN IMMEDIATE`
@@ -532,9 +576,49 @@ fn sqlite_lire_lignes(
     Ok(out)
 }
 
+/// Le corps des lectures « fraîches » SQLite (#5871) : la connexion
+/// d'écriture si elle est libre ou si le fil courant y tient son lot, le pool
+/// de lecture sinon. Voir `DbBackend::query_one_frais`.
+fn sqlite_lire_frais(
+    db: &crate::db::sqlite::SqliteDb,
+    sql: &str,
+    params: &[&dyn ToSqlValue],
+    une_seule: bool,
+) -> Result<Vec<Vec<SqlValue>>, String> {
+    let ecrivain = db.connection();
+    let tenue = match ecrivain.essayer_sans_attendre() {
+        Some(t) => Some(t),
+        // Le propriétaire d'un lot ouvert lit ce qu'il y a écrit : seul
+        // l'écrivain le voit. Il attend donc la connexion, comme avant.
+        None if ecrivain.lot_au_fil_courant() => Some(
+            ecrivain
+                .lock_sans_attendre_le_lot()
+                .unwrap_or_else(|p| p.into_inner()),
+        ),
+        None => None,
+    };
+    let Some(conn) = tenue else {
+        return if une_seule {
+            DbBackend::query_one(db, sql, params).map(|l| l.into_iter().collect())
+        } else {
+            DbBackend::query_many(db, sql, params)
+        };
+    };
+    let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = owned
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect();
+    sqlite_lire_lignes(&conn, sql, &refs, une_seule.then_some(1))
+}
+
 impl DbBackend for crate::db::sqlite::SqliteDb {
     fn engine(&self) -> Engine {
         Engine::Sqlite
+    }
+
+    fn jeton_des_donnees(&self) -> Option<(u64, i64)> {
+        crate::db::sqlite::SqliteDb::jeton_des_donnees(self)
     }
 
     fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String> {
@@ -585,7 +669,10 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
             .collect();
+        // #5677 : visible du relevé d'un gel pendant l'attente ET la lecture.
+        let en_cours = super::lectures_en_cours::inscrire(sql);
         let conn = self.read_connection();
+        en_cours.executer();
         let debut = std::time::Instant::now();
         let resultat = sqlite_lire_lignes(&conn, sql, &refs, Some(1)).map(|mut l| l.pop());
         signaler_lecture_lente(sql, conn.attente(), debut.elapsed());
@@ -602,7 +689,10 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
             .collect();
+        // #5677 : visible du relevé d'un gel pendant l'attente ET la lecture.
+        let en_cours = super::lectures_en_cours::inscrire(sql);
         let conn = self.read_connection();
+        en_cours.executer();
         let debut = std::time::Instant::now();
         let resultat = sqlite_lire_lignes(&conn, sql, &refs, None);
         signaler_lecture_lente(sql, conn.attente(), debut.elapsed());
@@ -680,6 +770,22 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
             out.push(cols);
         }
         Ok(out)
+    }
+
+    fn query_one_frais(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        sqlite_lire_frais(self, sql, params, true).map(|mut l| l.pop())
+    }
+
+    fn query_many_frais(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        sqlite_lire_frais(self, sql, params, false)
     }
 
     fn query_one_strong(

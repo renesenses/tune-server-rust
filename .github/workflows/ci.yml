@@ -152,7 +152,16 @@ jobs:
             scripts/detecter-impact-ci.sh \
             scripts/determiner-profil-ci.sh \
             scripts/verifier-fermeture.sh \
-            scripts/verifier-refs-issues.sh
+            scripts/verifier-refs-issues.sh \
+            scripts/docker-install.sh \
+            packaging/docker/entrypoint.sh \
+            packaging/docker/test-entrypoint.sh
+
+      # Entrypoint de l'image (PUID/PGID) : simulation, puis vrais
+      # setpriv/usermod/chown en root dans debian:bookworm-slim, la base de
+      # Dockerfile.dist.
+      - name: Entrypoint de l image Docker
+        run: bash packaging/docker/test-entrypoint.sh --conteneur
 
       # Les workflows historiques portent quelques remarques shellcheck, mais
       # leur YAML et leurs expressions sont valides. On garde le controle
@@ -362,7 +371,9 @@ jobs:
           exit 1
       # plugin-catalog: {"features":"all","base":["audio-embedding"]}
       - run: cargo check -p tune-server --features audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
-      - run: cargo test --no-fail-fast -p tune-core --features audio-embedding
+      # #4378 : `dst` est livrée par toutes les recettes de publication ; ses
+      # témoins (`audio::dff::tests_dst`) doivent donc tourner ici.
+      - run: cargo test --no-fail-fast -p tune-core --features audio-embedding,dst
       # Le témoin HTTP des reports est derrière audio-embedding (#4187).
       # plugin-catalog: {"features":"fast","base":["local-audio","oaat","cloud-relay","audio-embedding"]}
       - run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features local-audio,oaat,cloud-relay,audio-embedding,bandcamp,cd,circle,entree-audio acoustic_reports_4187
@@ -763,18 +774,17 @@ jobs:
       #
       # Garde : `toute_caisse_du_workspace_est_nommee_par_une_porte_clippy`
       # (tune-server/tests/workflows_bornes.rs).
-      # #4378 : `dst` est dans cette base — et NULLE PART ailleurs. La porte
-      # clippy est le seul endroit où le décodeur DST doit être compilé :
-      # ci.yml ne publie rien. La feature reste hors de `default` et hors de
-      # toutes les lignes de build de release.yml / docker.yml / Dockerfile,
-      # parce que la licence de `dst-decoder` n'est pas tranchée
-      # (Apache-2.0 déclarée contre en-tête ISO/Philips). Garde :
-      # tune-core/tests/dst_desarmee_4378.rs.
+      # #4378 : `dst` est dans cette base. Désarmée le 20/09/2026, la feature
+      # est livrée depuis l'arbitrage de licence du 06/10/2026 : elle est dans
+      # toutes les lignes de build de release.yml / docker.yml / Dockerfile, et
+      # ses témoins tournent dans `cargo test -p tune-core` ci-dessus. Garde :
+      # tune-core/tests/dst_armee_4378.rs.
       # #5453 : `journal-de-test` (tune-core) n'expose qu'un utilitaire de test ;
       # le nommer ici fait linter le module hors `cfg(test)`, tel que le voient
       # les tests de tune-server. Garde : toute_feature_declaree_est_activee_par_une_porte_clippy.
-      # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst","journal-de-test"],"packages":"workspace"}
-      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,journal-de-test,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio -- -D clippy::correctness
+      # #5512 : `isolement-disque-de-test` (tune-core), même motif que `journal-de-test`.
+      # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst","journal-de-test","isolement-disque-de-test"],"packages":"workspace"}
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,journal-de-test,isolement-disque-de-test,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio -- -D clippy::correctness
 
   audit:
     name: Security Audit

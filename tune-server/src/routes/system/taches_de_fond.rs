@@ -67,13 +67,12 @@ fn etat_de(state: &AppState, tache: Tache) -> Etat {
     if est_en_pause(tache) {
         return Etat::EnPause;
     }
-    let cascade = tune_core::audio::replaygain::progression::releve().actif;
     let en_cours = match tache {
-        Tache::ReplayGain | Tache::Empreintes => cascade,
-        Tache::PlageDynamique => {
-            state.passe_dr.releve().actif
-                || cascade
-                || tune_core::taches_de_fond::rapports_dr::en_cours()
+        Tache::ReplayGain | Tache::Empreintes | Tache::PlageDynamique => {
+            cascade_en_cours(tache, tune_core::taches_de_fond::ordre::rang_au_travail())
+                || (tache == Tache::PlageDynamique
+                    && (state.passe_dr.releve().actif
+                        || tune_core::taches_de_fond::rapports_dr::en_cours()))
         }
         // Le module `embedding` est derrière `audio-embedding` : sans la
         // feature, la passe acoustique n'existe pas, donc elle ne tourne pas.
@@ -92,6 +91,33 @@ fn etat_de(state: &AppState, tache: Tache) -> Etat {
         Etat::EnCours
     } else {
         Etat::AuRepos
+    }
+}
+
+/// Un traitement de la cascade travaille-t-il, selon le rang qui décode ?
+///
+/// #5519 / tune-web-client#1828 — le signal était l'avancement ReplayGain
+/// (`progression::releve().actif`), c'est-à-dire « une campagne ReplayGain est
+/// OUVERTE ». Elle le reste tant qu'il reste des pistes, y compris quand la
+/// plage dynamique « En premier » tient le créneau : les trois cartes disaient
+/// alors « en cours » ensemble. Le rang au travail dit QUI décode.
+///
+/// La passe ReplayGain pose aussi l'empreinte et la plage dynamique des pistes
+/// qu'elle décode : elle fait donc avancer les trois.
+pub(crate) fn cascade_en_cours(
+    tache: Tache,
+    rang: Option<tune_core::taches_de_fond::ordre::Rang>,
+) -> bool {
+    use tune_core::taches_de_fond::ordre::Rang;
+    match (tache, rang) {
+        (_, None) => false,
+        (_, Some(Rang::ReplayGain)) => matches!(
+            tache,
+            Tache::ReplayGain | Tache::Empreintes | Tache::PlageDynamique
+        ),
+        (Tache::Empreintes, Some(Rang::Empreintes)) => true,
+        (Tache::PlageDynamique, Some(Rang::PlageDynamique)) => true,
+        _ => false,
     }
 }
 
@@ -151,6 +177,10 @@ pub(crate) fn instantane(state: &AppState) -> Value {
         // #5168 — le rattrapage des rapports `foo_dr.txt` : tourne-t-il, et
         // qu'a fait son dernier passage.
         "dynamic_range_sidecar": tune_core::taches_de_fond::rapports_dr::releve(),
+        // #4805 (idée 4) — l'identification par empreinte AcoustID peut-elle
+        // tourner ? Sans `fpcalc` (Tune OS aujourd'hui) ou sans clé, la passe
+        // est désactivée et ce bloc dit pourquoi, pour l'écran Santé.
+        "acoustid": crate::routes::library::identification_lot::acoustid::disponibilite(state),
     })
 }
 
@@ -318,6 +348,38 @@ fn reponse_avec_relances(
         .event_bus
         .emit("system.background_tasks", corps.clone());
     (StatusCode::OK, Json(corps)).into_response()
+}
+
+#[cfg(test)]
+mod tests_5519 {
+    use super::*;
+    use tune_core::taches_de_fond::ordre::Rang;
+
+    /// tune-web-client#1828 — avec la plage dynamique « En premier », le
+    /// rattrapage DR décode pendant que la campagne ReplayGain reste ouverte :
+    /// la carte ReplayGain ne doit PAS dire « en cours », la carte DR si.
+    #[test]
+    fn le_rang_au_travail_dit_qui_est_en_cours() {
+        let dr = Some(Rang::PlageDynamique);
+        assert!(!cascade_en_cours(Tache::ReplayGain, dr));
+        assert!(!cascade_en_cours(Tache::Empreintes, dr));
+        assert!(cascade_en_cours(Tache::PlageDynamique, dr));
+
+        // La passe ReplayGain pose aussi empreinte et plage dynamique.
+        let rg = Some(Rang::ReplayGain);
+        for t in [Tache::ReplayGain, Tache::Empreintes, Tache::PlageDynamique] {
+            assert!(cascade_en_cours(t, rg), "{t:?}");
+        }
+
+        let emp = Some(Rang::Empreintes);
+        assert!(cascade_en_cours(Tache::Empreintes, emp));
+        assert!(!cascade_en_cours(Tache::ReplayGain, emp));
+        assert!(!cascade_en_cours(Tache::PlageDynamique, emp));
+
+        for t in [Tache::ReplayGain, Tache::Empreintes, Tache::PlageDynamique] {
+            assert!(!cascade_en_cours(t, None), "{t:?}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -697,7 +697,15 @@ pub(crate) fn scenario_attacher_detacher(db: &Arc<dyn DbBackend>) {
     assert_eq!(vue(db, coffret).album.coffret.as_deref(), Some("auto"));
     let n = detacher(db, coffret, 2).unwrap();
     let v = vue(db, coffret);
-    assert_eq!(disques(&v), vec![(1, None, 2), (2, None, 2)]);
+    // Fil 2094 — la réunion a fait du titre d'origine de chaque disque son
+    // sous-titre : il le garde après le détachement d'un autre disque.
+    assert_eq!(
+        disques(&v),
+        vec![
+            (1, Some("Casino Classics, Disc 1"), 2),
+            (2, Some("Casino Classics, Disc 3"), 2)
+        ]
+    );
     assert_eq!(
         v.tracks
             .iter()

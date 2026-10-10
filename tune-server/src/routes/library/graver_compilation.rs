@@ -105,6 +105,11 @@ pub(crate) async fn graver_compilation(
     if body.album_ids.is_empty() {
         return (StatusCode::BAD_REQUEST, "aucun album").into_response();
     }
+    // Graver n'a pas d'autre effet que d'écrire dans les fichiers : désactivé
+    // (le défaut), on refuse — le drapeau reste en base, où il est déjà.
+    if !crate::routes::ecriture_fichiers::autorisee(&state) {
+        return crate::routes::ecriture_fichiers::refus("graver_compilation");
+    }
 
     let mut bilan = Bilan::default();
     for id in &body.album_ids {
@@ -217,6 +222,21 @@ mod tests {
         )
         .expect("piste");
 
+        // Réglage jamais touché : refus, fichier intact.
+        let refus = graver_compilation(
+            State(state.clone()),
+            Json(GraverCompilationRequest { album_ids: vec![1] }),
+        )
+        .await
+        .into_response();
+        assert_eq!(refus.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            drapeau_vu_par_le_scan(&chemin),
+            None,
+            "réglage désactivé : la gravure ne doit pas toucher au fichier"
+        );
+
+        crate::routes::ecriture_fichiers::activer_pour_test(&state.backend);
         let corps = GraverCompilationRequest { album_ids: vec![1] };
         let _ = graver_compilation(State(state.clone()), Json(corps)).await;
         assert_eq!(

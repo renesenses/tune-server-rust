@@ -488,6 +488,25 @@ fn local_signal_path_uses_the_runtime_backend_contract_and_its_reason() {
     );
 }
 
+/// #4176 — PURE allumé, rien d'armé : l'étape DSP le dit en clair au lieu
+/// d'annoncer « DSP contourné par PURE » sur un chemin déjà intact.
+#[test]
+fn pure_sans_objet_est_dit_dans_l_etape_dsp() {
+    let (zone, mut ps, backend) = local_runtime_zone(100.0, OutputVolumeState::Unity, Vec::new());
+    if let Some(runtime) = ps.output_signal_path.as_mut() {
+        runtime.bit_perfect = true;
+        runtime.dsp = OutputDspState::PureSansObjet;
+    }
+
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
+
+    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        step_desc(&sp, "DSP").as_deref(),
+        Some("PURE actif : aucun traitement armé, rien à contourner")
+    );
+}
+
 /// Monte une zone locale Windows dont la sonde a publié `reasons`.
 fn local_runtime_zone(
     volume_percent: f64,
@@ -1220,11 +1239,12 @@ fn decoded_radio_source_uses_the_detected_source_rate() {
     assert_eq!(step_desc(&sp, "Source").as_deref(), Some("MP3 48kHz"));
 }
 
-// Sans session ET sans métadonnées, il n'y a rien à lire : le repli reste
-// celui d'avant. Ce test existe pour que la suppression du repli soit un
-// choix explicite si elle a lieu un jour, pas un effet de bord.
+// Sans session ET sans métadonnées, il n'y a rien à lire. Le repli en dur
+// 44100/16 a été retiré EXPRÈS (fil 2119 : un WAV 24/176,4 annoncé
+// « FLAC 44kHz/16bit ») : le codec connu s'affiche seul, sans chiffres
+// inventés.
 #[test]
-fn no_wire_no_metadata_still_falls_back() {
+fn no_wire_no_metadata_does_not_invent_rate_2119() {
     let (backend, zone) = dlna_zone();
     let np = NowPlaying {
         title: "Track".into(),
@@ -1239,10 +1259,7 @@ fn no_wire_no_metadata_still_falls_back() {
         ..Default::default()
     };
     let sp = build_signal_path(&ps, &zone, &backend, Some("LHC"), "none", None).unwrap();
-    assert_eq!(
-        step_desc(&sp, "Source").as_deref(),
-        Some("FLAC 44kHz/16bit")
-    );
+    assert_eq!(step_desc(&sp, "Source").as_deref(), Some("FLAC"));
 }
 
 // Le fil prime sur la règle. Ici la zone force le LPCM 16 bits, mais la
@@ -1423,6 +1440,79 @@ fn replaygain_active_shows_step_and_breaks_bit_perfect() {
     assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
     // Le RG ne rend pas la SOURCE lossy : le badge qualité reste vert.
     assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
+}
+
+/// #5683 — l'étape ReplayGain se décide sur PURE, jamais sur le curseur de
+/// volume. Le constructeur du panneau est relu à 100 %, à 35 % puis de
+/// nouveau à 100 % : l'étape est là, identique, les trois fois ; et PURE
+/// l'éteint aux deux volumes. (Le défaut observé venait d'une zone non
+/// relue après la bascule PURE : voir le test d'orchestrateur
+/// `toute_bascule_pure_annonce_la_zone_au_client_5683`.)
+fn chemin_au_volume_5683(
+    backend: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    ps: &ZoneState,
+    pct: f64,
+) -> Value {
+    let repo = ZoneRepo::with_backend(backend.clone());
+    repo.update_volume(zone_id, pct).unwrap();
+    let zone = repo.get(zone_id).unwrap().unwrap();
+    build_signal_path(
+        ps,
+        &zone,
+        backend,
+        Some("Node"),
+        "none",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn l_etape_replaygain_suit_pure_et_jamais_le_curseur_de_volume_5683() {
+    let (backend, zone) = dlna_zone_migrated();
+    let zone_id = zone.id.unwrap();
+    let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+    SettingsRepo::with_backend(backend.clone())
+        .set(tune_core::audio::replaygain::MODE_KEY, "track")
+        .unwrap();
+
+    let attendu = Some("ReplayGain (track, -4.2 dB, tags du fichier)".to_string());
+    // (1) PURE inactif, volume 100 %, tags présents : l'étape est là.
+    let plein = chemin_au_volume_5683(&backend, zone_id, &ps, 100.0);
+    assert_eq!(
+        step_desc(&plein, "ReplayGain"),
+        attendu,
+        "volume 100 % : {plein}"
+    );
+    assert_eq!(step_desc(&plein, "Volume"), None);
+    // (2) Bouger le curseur ne la fait ni apparaître ni disparaître.
+    let bas = chemin_au_volume_5683(&backend, zone_id, &ps, 35.0);
+    assert_eq!(
+        step_desc(&bas, "ReplayGain"),
+        attendu,
+        "volume 35 % : {bas}"
+    );
+    assert_eq!(step_desc(&bas, "Volume").as_deref(), Some("Volume 35%"));
+    let retour = chemin_au_volume_5683(&backend, zone_id, &ps, 100.0);
+    assert_eq!(
+        step_desc(&retour, "ReplayGain"),
+        attendu,
+        "retour à 100 % : {retour}"
+    );
+
+    // PURE éteint l'étape, quel que soit le curseur.
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+    for pct in [100.0, 35.0] {
+        let pur = chemin_au_volume_5683(&backend, zone_id, &ps, pct);
+        assert_eq!(
+            step_desc(&pur, "ReplayGain"),
+            None,
+            "PURE à {pct} % : {pur}"
+        );
+    }
 }
 
 // RG off (défaut) : la même piste taguée n'affiche rien et reste
@@ -3247,25 +3337,101 @@ fn codec_connu_4346_lossless_reste_un_booleen_sans_code() {
 fn wasapi_sans_contrat_exclusif_se_nomme_partage_et_n_est_pas_bit_perfect_4172() {
     use super::signal_path::{etiquette_du_transport_local, transport_partage_est_intact};
     assert_eq!(
-        etiquette_du_transport_local("WASAPI", false),
+        etiquette_du_transport_local("WASAPI", false, None),
         "WASAPI (shared \u{2014} Windows mixer)"
     );
     assert_eq!(
-        etiquette_du_transport_local("WASAPI", true),
+        etiquette_du_transport_local("WASAPI", true, None),
         "WASAPI (exclusive)"
     );
     assert_eq!(
-        etiquette_du_transport_local("ASIO", true),
+        etiquette_du_transport_local("ASIO", true, None),
         "ASIO (exclusive)"
     );
     assert_eq!(
-        etiquette_du_transport_local("CoreAudio", false),
+        etiquette_du_transport_local("CoreAudio", false, None),
         "CoreAudio"
     );
-    assert_eq!(etiquette_du_transport_local("ALSA", false), "ALSA");
-    assert!(!transport_partage_est_intact("WASAPI"), "mixeur Windows");
-    assert!(transport_partage_est_intact("CoreAudio"), "inchangé");
-    assert!(transport_partage_est_intact("ALSA"), "inchangé");
+    assert_eq!(etiquette_du_transport_local("ALSA", false, None), "ALSA");
+    assert!(
+        !transport_partage_est_intact("WASAPI", None),
+        "mixeur Windows"
+    );
+    assert!(transport_partage_est_intact("CoreAudio", None), "inchangé");
+    assert!(
+        transport_partage_est_intact("ALSA", None),
+        "PCM inconnu : inchangé"
+    );
+}
+
+// ── Fil 2161 — ALSA sur un greffon (`default`, `dmix:`…) n'est pas le DAC ──
+
+/// Le témoin du fil 2161 : une zone ALSA dont le PCM est `alsa:default` (Tune
+/// OS : `plug` → `dmix` à 48 kHz sur la carte 0, l'Eversolo DAC-Z8) ne se dit
+/// plus « ALSA » intact. Le DAC affichait 48 kHz pendant que le panneau
+/// annonçait 44,1 kHz bit-perfect.
+#[test]
+fn alsa_sur_un_greffon_se_nomme_partage_et_n_est_pas_intact_2161() {
+    use super::signal_path::{
+        etiquette_du_transport_local, pcm_alsa_est_un_greffon, transport_partage_est_intact,
+    };
+    for greffon in [
+        "alsa:default",
+        "default",
+        "alsa:dmix:CARD=DACZ8,DEV=0",
+        "alsa:plughw:CARD=0,DEV=0",
+        "alsa:sysdefault:CARD=0",
+        "alsa:pipewire",
+        "alsa:pulse",
+    ] {
+        assert!(pcm_alsa_est_un_greffon(Some(greffon)), "{greffon}");
+        assert!(
+            !transport_partage_est_intact("ALSA", Some(greffon)),
+            "{greffon} convertit à sa propre cadence : pas intact"
+        );
+        assert_eq!(
+            etiquette_du_transport_local("ALSA", false, Some(greffon)),
+            "ALSA (shared \u{2014} software mixer)",
+            "{greffon}"
+        );
+    }
+    // Le PCM matériel, celui que #1655 fait retenir pour l'Eversolo : intact.
+    for materiel in ["alsa:hw:CARD=0,DEV=0", "hw:CARD=DACZ8,DEV=0", "Alsa:HW:1,0"] {
+        assert!(!pcm_alsa_est_un_greffon(Some(materiel)), "{materiel}");
+        assert!(
+            transport_partage_est_intact("ALSA", Some(materiel)),
+            "{materiel}"
+        );
+        assert_eq!(
+            etiquette_du_transport_local("ALSA", false, Some(materiel)),
+            "ALSA"
+        );
+    }
+    // Inconnu ou vide : rien n'est conclu, le verdict d'avant reste.
+    assert!(!pcm_alsa_est_un_greffon(None));
+    assert!(!pcm_alsa_est_un_greffon(Some("")));
+    // Le PCM ne concerne qu'ALSA : il ne change rien ailleurs.
+    assert!(transport_partage_est_intact(
+        "CoreAudio",
+        Some("alsa:default")
+    ));
+    assert_eq!(
+        etiquette_du_transport_local("CoreAudio", false, Some("alsa:default")),
+        "CoreAudio"
+    );
+}
+
+/// Le PCM d'une zone se lit dans le parc publié, et seulement pour une zone
+/// `local:` : un identifiant DLNA ou absent ne rend rien.
+#[test]
+fn le_pcm_d_une_zone_non_locale_est_inconnu_2161() {
+    use super::signal_path::pcm_de_la_zone_locale;
+    assert_eq!(pcm_de_la_zone_locale(None), None);
+    assert_eq!(pcm_de_la_zone_locale(Some("uuid:diretta-renderer")), None);
+    assert_eq!(
+        pcm_de_la_zone_locale(Some("local:appareil-absent-du-parc-2161")),
+        None
+    );
 }
 
 /// La garde du BRANCHEMENT : le bras `"local"` de `decrire_le_transport`
@@ -3276,12 +3442,21 @@ fn le_transport_local_dit_son_mode_et_son_verdict_4172() {
     let bras = src.find("\"local\" => {").expect("le bras local");
     let bloc = &src[bras..bras + 1_500];
     assert!(
-        bloc.contains("etiquette_du_transport_local(audio_backend, exclusif_observe)"),
-        "le nom vient de l'étiquette"
+        bloc.contains("etiquette_du_transport_local(audio_backend, exclusif_observe, pcm_local)"),
+        "le nom vient de l'étiquette, PCM compris (fil 2161)"
     );
     assert!(
-        bloc.contains("None => transport_partage_est_intact(audio_backend)"),
-        "sans contrat, le verdict est celui du mode partagé"
+        bloc.contains("None => transport_partage_est_intact(audio_backend, pcm_local)"),
+        "sans contrat, le verdict est celui du mode partagé, PCM compris (fil 2161)"
+    );
+    // Fil 2161 — le PCM qui arrive au bras est celui du parc, pour la zone.
+    assert!(
+        src.contains("pcm_de_la_zone_locale(zone.output_device_id.as_deref())"),
+        "le PCM de la zone est lu dans le parc publié"
+    );
+    assert!(
+        src.contains("pcm_local.as_deref(),"),
+        "et il est passé à decrire_le_transport"
     );
 }
 
@@ -3601,10 +3776,8 @@ fn un_flac_ffmpeg_vers_le_reseau_annonce_son_conteneur_reecrit_4350() {
     );
     // #4800 — l'en-tête de ce fichier se lit, et une trame le suit : le
     // conteneur est réécrit sans décodage, et l'écran le dit.
-    assert!(
-        transcoder["detail"]
-            .as_str()
-            .is_some_and(|d| d.contains("trames copiées telles quelles")),
+    assert_eq!(
+        transcoder["detail"], DETAIL_FLAC_ENTETE_NEUF,
         "{transcoder}"
     );
     assert!(
@@ -3612,6 +3785,33 @@ fn un_flac_ffmpeg_vers_le_reseau_annonce_son_conteneur_reecrit_4350() {
         "le résumé ne doit plus annoncer un passthrough : {sp}"
     );
     assert_eq!(verdict(&sp), Some(true), "aucun échantillon touché : {sp}");
+}
+
+/// Le détail nomme-t-il ffmpeg, sous l'un de ses noms ?
+fn nomme_ffmpeg(detail: &str) -> bool {
+    let d = detail.to_lowercase();
+    d.contains("ffmpeg") || d.contains("lavf")
+}
+
+/// #5525 — Tune ne lance aucun ffmpeg pour servir ce FLAC : il refait
+/// l'en-tête en Rust. Le chemin du signal ne doit donc pas le nommer — sinon
+/// il se lit « Tune a réécrit le FLAC avec ffmpeg » (réunion Yves, 30/09).
+#[test]
+fn le_conteneur_reecrit_ne_nomme_pas_ffmpeg_5525() {
+    for detail in [DETAIL_FLAC_ENTETE_NEUF, DETAIL_FLAC_REENCODE] {
+        assert!(!nomme_ffmpeg(detail), "le détail nomme ffmpeg : {detail}");
+        assert!(
+            detail.contains("Tune"),
+            "le détail doit dire qui réécrit : {detail}"
+        );
+    }
+    // Contre-épreuve : l'ancien texte, lui, est bien attrapé.
+    for ancien in [
+        "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, en-tête neuf, trames copiées telles quelles",
+        "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, ré-encodé sans perte",
+    ] {
+        assert!(nomme_ffmpeg(ancien), "la garde doit attraper : {ancien}");
+    }
 }
 
 /// Les contre-épreuves : ce qui ne part PAS ré-encodé ne doit pas l'annoncer.
@@ -4305,4 +4505,153 @@ fn entree_audio_en_direct_dit_sa_compensation_et_ne_revendique_pas_le_bit_perfec
     for sid in ["ea-0", "ea-2", "ea-r"] {
         tune_core::source_pcm::retirer_direct(sid);
     }
+}
+
+// ── #5524 — « Fréquence max par zone » : même famille sous le plafond ──
+//
+// Yves Corbat, Ruark Audio R5 (DLNA) : la zone doit pouvoir être limitée à
+// 44,1 kHz. Le réglage `max_sample_rate` existait ; la cadence servie était
+// le plafond LUI-MÊME. Elle est désormais la plus haute cadence de la
+// famille de la source (44,1 ou 48) qui tient sous le plafond, et le plafond
+// quand aucune ne tient. La VRAIE décision de l'orchestrateur et le panneau
+// du chemin du signal sont lus sur la même base, la même zone, la même piste.
+
+/// Joue une piste FLAC `source_hz`/24 bits sur une zone DLNA plafonnée à
+/// `plafond` et rend (décision, chemin du signal).
+async fn plafond_5524(
+    source_hz: i32,
+    plafond: Option<u32>,
+) -> (tune_core::orchestrator::ResolvedQueueItem, Value) {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    let repo = ZoneRepo::with_backend(backend.clone());
+    repo.update_max_sample_rate(zone_id, plafond).unwrap();
+    let zone = repo.get(zone_id).unwrap().unwrap();
+    assert_eq!(
+        zone.max_sample_rate, plafond,
+        "témoin : le réglage est persisté"
+    );
+    let track_id = piste_flac(&backend, source_hz, 24);
+    let r = decision(&backend, zone_id, track_id).await;
+    let sp = build_signal_path(
+        &en_lecture(track_id, "flac", source_hz as u32, 24),
+        &zone,
+        &backend,
+        Some("Ruark R5"),
+        "",
+        None,
+    )
+    .unwrap();
+    (r, sp)
+}
+
+fn resampler_to_hz(sp: &Value) -> Option<u64> {
+    sp.get("steps")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("Resampler"))
+        .and_then(|s| s.get("to_hz").and_then(Value::as_u64))
+}
+
+#[tokio::test]
+async fn frequence_max_5524_les_cas_de_la_demande() {
+    for (source, plafond, attendu) in [
+        (96_000, 44_100, 44_100),
+        (88_200, 44_100, 44_100),
+        (192_000, 96_000, 96_000),
+        (48_000, 44_100, 44_100),
+    ] {
+        let (r, sp) = plafond_5524(source, Some(plafond)).await;
+        assert_eq!(
+            r.sample_rate,
+            Some(attendu),
+            "{source} Hz sous {plafond} Hz : cadence servie"
+        );
+        assert_eq!(
+            r.mime_type, "audio/flac",
+            "{source}/{plafond} : le sans-perte reste FLAC"
+        );
+        assert_eq!(
+            r.bit_depth,
+            Some(24),
+            "{source}/{plafond} : profondeur conservée"
+        );
+        assert_eq!(
+            resampler_to_hz(&sp),
+            Some(attendu as u64),
+            "{source}/{plafond} : le chemin du signal nomme la cadence servie : {sp}"
+        );
+        assert_eq!(
+            verdict(&sp),
+            Some(false),
+            "rééchantillonné : pas bit-perfect"
+        );
+    }
+}
+
+/// La règle de famille elle-même : 176,4 sous 96 part en 88,2 (÷2), et non
+/// en 96 comme le faisait `out_sr = max_sr`.
+#[tokio::test]
+async fn frequence_max_5524_reste_dans_la_famille_de_la_source() {
+    for (source, plafond, attendu) in [(176_400, 96_000, 88_200), (192_000, 88_200, 48_000)] {
+        let (r, sp) = plafond_5524(source, Some(plafond)).await;
+        assert_eq!(r.sample_rate, Some(attendu), "{source} sous {plafond}");
+        assert_eq!(r.bit_depth, Some(24));
+        assert_eq!(resampler_to_hz(&sp), Some(attendu as u64), "{sp}");
+        assert_eq!(
+            step_desc(&sp, "Resampler").as_deref(),
+            Some(format!("{}kHz \u{2192} {}kHz", source / 1000, attendu / 1000).as_str())
+        );
+    }
+}
+
+#[tokio::test]
+async fn frequence_max_5524_auto_ne_change_rien() {
+    for source in [44_100, 48_000, 96_000, 192_000] {
+        let (r, sp) = plafond_5524(source, None).await;
+        assert_eq!(r.sample_rate, Some(source as u32), "Auto, {source}");
+        assert_eq!(r.bit_depth, Some(24));
+        assert_eq!(step_desc(&sp, "Resampler"), None, "Auto, {source} : {sp}");
+    }
+}
+
+/// Fil 2119 — une source dont ni la lecture en cours, ni la base, ni le fil
+/// ne nomment le format est INCONNUE. Elle était annoncée « FLAC 44kHz/16bit »
+/// et « Sans perte » par un repli en dur, pour un WAV 24/176,4 servi intact.
+#[test]
+fn source_inconnue_n_est_plus_annoncee_flac_16_44_2119() {
+    let (backend, zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "03 - Eugen Jochum - 3. Veris leta facies".into(),
+            source: "upnp".into(),
+            source_id: Some("http://203.0.113.9:8888/api/v1/library/tracks/24011/audio".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let sp = build_signal_path(&ps, &zone, &backend, Some("My Devialet"), "none", None).unwrap();
+    let source = step_desc(&sp, "Source").unwrap();
+    assert!(
+        !source.contains("FLAC") && !source.contains("44kHz") && !source.contains("16bit"),
+        "aucun format inventé pour une source inconnue, vu : {source}"
+    );
+    assert_eq!(source, CODEC_INCONNU);
+    assert_eq!(
+        step_field(&sp, "Source", "code").and_then(|v| v.as_str()),
+        Some("source_codec_unknown"),
+        "l'étape Source doit DIRE que le codec est inconnu (#4346)"
+    );
+    assert_eq!(
+        sp["lossless"],
+        Value::Null,
+        "inconnu, ni sans perte ni avec"
+    );
+    let tout = sp.to_string();
+    assert!(
+        !tout.contains("0Hz/0bit") && !tout.contains("0kHz/0bit"),
+        "pas de chiffres nuls affichés : {tout}"
+    );
 }

@@ -1,6 +1,6 @@
 # Tune Server (Rust)
 
-Multi-room music server written in Rust. Manages a local audio library with full-text search, streams from Tidal/Qobuz/Deezer/Spotify, outputs to DLNA renderers and Chromecast devices, and serves a web client for control.
+Multi-room music server written in Rust. Manages a local audio library with full-text search, streams from Tidal/Qobuz/Deezer (Spotify: browsing only), outputs to DLNA renderers and Chromecast devices, and serves a web client for control.
 
 ## Quick Start
 
@@ -37,11 +37,46 @@ tarball.
 docker run -d \
   --name tune-server \
   --network host \
+  --device /dev/snd \
+  --group-add audio \
   -v /path/to/music:/music:ro \
   -v tune-data:/data \
   -e TUNE_AUTO_SCAN=true \
-  renesenses/tune:dev
+  renesenses/tune:latest
 ```
+
+`--device /dev/snd --group-add audio` give the container the host's sound
+devices, for local output to a USB DAC plugged into this machine. Drop both
+lines on a host without `/dev/snd` (Docker Desktop on macOS/Windows, a headless
+VPS): network zones (DLNA, AirPlay, Chromecast...) do not need them. The image
+also keeps the host's own group of `/dev/snd` when it is not `audio` (29), as on
+Fedora (63).
+
+### Podman (Fedora)
+
+Rootless Podman under SELinux needs three more options: `--userns=keep-id` runs
+Tune as your own user (who already has access to the DAC from the desktop
+session), `--group-add keep-groups` keeps your host groups such as `audio`, and
+`--security-opt label=disable` lets the container open `/dev/snd` and read your
+music without relabelling it.
+
+```bash
+mkdir -p ~/.local/share/tune
+podman run -d \
+  --name tune-server \
+  --network host \
+  --userns=keep-id \
+  --group-add keep-groups \
+  --device /dev/snd \
+  --security-opt label=disable \
+  -v ~/Music:/music:ro \
+  -v ~/.local/share/tune:/data \
+  -e HOME=/data \
+  -e TUNE_AUTO_SCAN=true \
+  docker.io/renesenses/tune:latest
+```
+
+Rootful Podman (`sudo podman run`) takes the same options as `docker run` above.
 
 ### docker-compose
 
@@ -60,7 +95,7 @@ Copy `tune.toml.example` to `tune.toml` and edit, or use environment variables:
 | `TUNE_PORT` | 8888 | HTTP port |
 | `TUNE_DB_PATH` | tune.db | SQLite database path |
 | `TUNE_MUSIC_DIRS` | [] | Music directories (JSON array or comma-separated) |
-| `TUNE_AUTO_SCAN` | false | Scan library on startup |
+| `TUNE_AUTO_SCAN` | false | Scan library on startup. Overridden by Settings › Library › « Scan library on startup » once the user sets it (setting `library_scan_on_startup`; order: user setting, then `TUNE_AUTO_SCAN` / `auto_scan` in `tune.toml`, then `false`; applies at the next start) |
 
 > **Docker — starting with no library folder.** The image ships `TUNE_MUSIC_DIRS='["/music"]'` and `TUNE_AUTO_SCAN=true`, and its `VOLUME ["/music"]` makes Docker create an *empty anonymous volume* when you mount nothing there. Set `TUNE_MUSIC_DIRS=[]` to start with no library folder at all and pick your folders from Settings. Since v0.9.143 a folder that does not exist, is not a directory, or is completely empty is no longer seeded on first run (it is logged as `music_dirs_semis_dossier_ecarte`), so an unmounted `/music` no longer sends the startup scan off on the wrong folder. Mount `/data` on a persistent path so the first run only ever happens once.
 | `TUNE_SCAN_IO_CONCURRENCY` | *auto* | Parallel tag reads during a scan. Auto-detected from the storage: **4** on a spinning disk, **32** otherwise. Set it only to override that guess — a slow NAS may want less, a high-latency share more. Clamped to 1..=256. |
@@ -83,10 +118,10 @@ tune-server/       Axum HTTP server (385 route handlers, 30 modules)
 - **Library**: Parallel file scanning (rayon), metadata extraction (lofty), FTS5 full-text search
 - **Ingest**: File a new folder into the library — preview the destination paths from a naming
   template, move or copy, then a targeted scan. Every job is undoable
-- **Streaming**: Tidal (OAuth + HiRes FLAC), Qobuz (signed URLs), Deezer (ARL), Spotify
+- **Streaming**: Tidal (OAuth + HiRes FLAC), Qobuz (signed URLs), Deezer (ARL); Spotify can be browsed and searched, but its tracks do not play
 - **Outputs**: DLNA/UPnP (AVTransport SOAP), Chromecast (rust_cast), local (cpal)
 - **Discovery**: SSDP multicast + mDNS, auto-zone creation
-- **Playback**: Multi-zone, play queue, shuffle, repeat, crossfade, gapless
+- **Playback**: Multi-zone, play queue, shuffle, repeat, gapless
 - **Playlists**: Local + smart playlists (JSON rules engine) + cross-service sync
 - **Scrobbling**: Last.fm session auth + now playing
 - **Real-time**: WebSocket events for all state changes
@@ -192,4 +227,4 @@ the same one through `spotify_redirect_uri` in `tune.toml` or
 
 ## License
 
-MIT
+Business Source License 1.1 — see [LICENSE](LICENSE).

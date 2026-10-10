@@ -16,9 +16,12 @@
 //! qui suffit à annoncer la bonne durée et à refuser la lecture par un message
 //! juste — au lieu de prétendre que le fichier n'a pas de données audio.
 //!
-//! Avec la feature `dst` (désarmée par défaut, #4378), `DffStreamReader` décode
-//! ces trames au fil de l'eau avec le crate `dst-decoder` et rend du DSD brut,
-//! identique bit à bit à libdstdec, la référence ISO/Philips.
+//! Avec la feature `dst` (hors `default`, mais livrée par toutes les recettes
+//! de publication depuis l'arbitrage de licence du 06/10/2026, #4378),
+//! `DffStreamReader` décode ces trames au fil de l'eau avec le crate
+//! `dst-decoder` et rend du DSD brut, identique bit à bit à libdstdec, la
+//! référence ISO/Philips. Le CRC `DSTC`, quand le fichier le porte, est
+//! vérifié trame par trame (voir [`crc_dstc`]).
 //!
 //! All multi-byte values are big-endian.
 //! DSD bit ordering: MSB first within each byte.
@@ -471,6 +474,11 @@ impl DffStreamReader {
     /// octet entrelacé garde le même sens qu'en DSD brut.
     #[cfg(feature = "dst")]
     fn open_dst(path: &str, info: &DffInfo) -> Result<Self, String> {
+        // Refus nommé AVANT d'allouer quoi que ce soit : une lecture qui
+        // tourne sous le temps réel se hache sans rien dire.
+        if let Some(motif) = refus_dst_hors_temps_reel(info.sample_rate, info.channels) {
+            return Err(motif);
+        }
         let decodeur = dst_decoder::decoder::DstDecoder::new(
             info.channels as usize,
             info.sample_rate as usize,
@@ -501,6 +509,7 @@ impl DffStreamReader {
                 trame: 0,
                 a_jeter: 0,
                 compresse: Vec::new(),
+                trames_crc_fausses: 0,
             }),
         })
     }
@@ -551,16 +560,20 @@ impl DffStreamReader {
 
 /// Décodage DST au fil de l'eau (#4378), trame par trame.
 ///
-/// ⚖️ **Pourquoi la feature `dst` est DÉSARMÉE (décision de Bertrand,
-/// 20/09/2026).** Le crate `dst-decoder` se déclare Apache-2.0 (crates.io,
-/// GitHub, fichier `LICENSE`) mais son README reproduit l'en-tête ISO/Philips
-/// du code de référence — « Copyright is not released for non MPEG-4 Audio
-/// conforming products » — et un avertissement brevets. La question n'est pas
-/// tranchée. Le code part donc écrit, mesuré, et allumable par personne : la
-/// feature n'est dans aucun `default` ni dans aucune ligne de build publiée.
-/// Pour l'allumer il faut UN arbitrage juridique de Bertrand, pas une ligne de
-/// workflow — et la garde `tune-core/tests/dst_desarmee_4378.rs` rougit si on
-/// essaie sans.
+/// ⚖️ **Licence.** Le crate `dst-decoder` se déclare Apache-2.0 (crates.io,
+/// GitHub, fichier `LICENSE`) ; son README reproduit l'en-tête ISO/Philips du
+/// code de référence et un avertissement brevets. Désarmée le 20/09/2026 en
+/// attendant l'arbitrage, la feature est ARMÉE depuis le 06/10/2026 : Bertrand
+/// accepte la licence. La garde `tune-core/tests/dst_armee_4378.rs` exige
+/// désormais qu'elle soit dans TOUTES les lignes de build publiées. Le dépôt
+/// n'a pas de fichier de licences tierces : la licence et l'en-tête sont
+/// cités au manifeste, à la déclaration de la dépendance.
+///
+/// ⚠️ **Le DST n'a pas de contrôle propre.** Mesuré sur 20 000 trames
+/// abîmées le 06/10/2026 : 7 790 erreurs, 12 210 décodées « sans erreur » —
+/// donc du bruit. Le seul contrôle est le chunk optionnel `DSTC` (CRC-32 du
+/// DSD décodé, DSDIFF 1.5 § 3.4.3). Quand il est là, une trame dont le CRC ne
+/// correspond pas est rendue en SILENCE DSD, jamais telle quelle.
 ///
 /// Une trame DST (1/75 s sur un SACD) se décode SEULE : filtres et tables de
 /// probabilité voyagent dans chaque trame. La recherche saute donc les
@@ -580,6 +593,8 @@ struct LecteurDst {
     /// Octets décodés à jeter en tête de la prochaine trame (recherche).
     a_jeter: usize,
     compresse: Vec<u8>,
+    /// Trames dont le `DSTC` contredisait le DSD décodé, rendues en silence.
+    trames_crc_fausses: u64,
 }
 
 #[cfg(feature = "dst")]
@@ -638,6 +653,18 @@ impl LecteurDst {
             self.decodeur
                 .decode_frame(&self.compresse, &mut dsd)
                 .map_err(|e| format!("DFF: cannot decode DST frame {}: {e}", self.trame))?;
+            if !self.crc_de_la_trame_tient(file, &dsd)? {
+                // Une trame que le DST rend « sans erreur » mais que son CRC
+                // dément est du BRUIT pleine échelle : la remplacer par le
+                // silence DSD, et le dire.
+                self.trames_crc_fausses += 1;
+                tracing::warn!(
+                    trame = self.trame,
+                    trames_crc_fausses = self.trames_crc_fausses,
+                    "dff_dst_crc_faux_trame_rendue_en_silence"
+                );
+                dsd.fill(SILENCE_DSD);
+            }
             self.trame += 1;
             let jeter = std::mem::take(&mut self.a_jeter).min(dsd.len());
             if jeter > 0 {
@@ -646,6 +673,46 @@ impl LecteurDst {
             return Ok(Some(dsd));
         }
         Ok(None)
+    }
+
+    /// Le `DSTC` qui suit la trame tout juste décodée, s'il existe, confirme-t-il
+    /// le DSD rendu ? `true` sans `DSTC` : le chunk est optionnel (DSDIFF 1.5
+    /// § 3.4.3), et l'absence de contrôle n'est pas une faute. Le curseur ne
+    /// franchit le sous-chunk suivant QUE s'il est un `DSTC` ; tout autre
+    /// sous-chunk — ou un en-tête abîmé — reste pour l'appel suivant, qui le
+    /// lira ou le refusera comme avant.
+    fn crc_de_la_trame_tient(
+        &mut self,
+        file: &mut FichierSource,
+        dsd: &[u8],
+    ) -> Result<bool, String> {
+        let avant = self.curseur;
+        let (id, taille) = match self.sous_chunk_suivant(file) {
+            Ok(Some(entete)) => entete,
+            Ok(None) | Err(_) => {
+                self.curseur = avant;
+                return Ok(true);
+            }
+        };
+        if &id != b"DSTC" {
+            self.curseur = avant;
+            return Ok(true);
+        }
+        if taille != 4 {
+            return Err(format!(
+                "DFF: cannot decode DST frame {}: its DSTC chunk holds {taille} bytes, \
+                 a 4-byte CRC is expected",
+                self.trame
+            ));
+        }
+        file.seek(SeekFrom::Start(
+            self.curseur - taille_avec_remplissage(taille),
+        ))
+        .map_err(|e| format!("dff seek: {e}"))?;
+        let mut crc = [0u8; 4];
+        file.read_exact(&mut crc)
+            .map_err(|e| format!("dff read DSTC: {e}"))?;
+        Ok(u32::from_be_bytes(crc) == crc_dstc(dsd))
     }
 
     fn rechercher(&mut self, file: &mut FichierSource, cible: usize) -> Result<usize, String> {
@@ -665,6 +732,98 @@ impl LecteurDst {
         Ok(cible)
     }
 }
+
+/// L'octet de silence DSD (motif de repos `0110 1001`, MSB d'abord), celui que
+/// les fixtures et le convertisseur emploient déjà.
+pub const SILENCE_DSD: u8 = 0x69;
+
+/// Le polynôme du CRC `DSTC`, sans son terme `x^32` :
+/// G(x) = x^32 + x^31 + x^4 + 1 (DSDIFF 1.5, § 3.4.3).
+const POLYNOME_DSTC: u32 = 0x8000_0011;
+
+/// CRC d'une trame DSD décodée, tel que le chunk `DSTC` le porte.
+///
+/// DSDIFF 1.5, § 3.4.3 : les octets entrelacés de la trame forment UN flux de
+/// bits, MSB du premier octet en tête ; on y ajoute 32 bits nuls et on divise
+/// par G(x) en arithmétique modulo 2 ; le reste est le CRC, octet de poids
+/// fort en premier. Aucune valeur initiale ni inversion finale : c'est la
+/// division longue nue, que la forme « registre » ci-dessous calcule sans
+/// avoir à ajouter les 32 zéros.
+pub fn crc_dstc(dsd: &[u8]) -> u32 {
+    let mut crc = 0u32;
+    for &octet in dsd {
+        crc ^= u32::from(octet) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ POLYNOME_DSTC
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// Débit DSD de référence : DSD64 stéréo, en bits par seconde.
+const DEBIT_DSD64_STEREO: u64 = 2_822_400 * 2;
+
+/// Combien de fois le débit DSD64 stéréo ce processeur décode-t-il en DST en
+/// gardant une marge sur le temps réel ?
+///
+/// Mesures du crate `dst-decoder` 0.1.2, échantillon FATE DSD64 stéréo :
+/// - x86_64 avec AVX2 (machine de compilation, 06/10/2026) : 7,1 × le temps
+///   réel. Plafond 4 : DSD256 stéréo ou DSD64 5.1 passent, marge ≥ 1,7.
+/// - arm64, Mac Apple Silicon (#4518) : 2,5 × le temps réel, et le crate n'y a
+///   AUCUN chemin SIMD (ses trois blocs `unsafe` sont du SSE2/AVX2). Plafond
+///   2 : DSD128 stéréo passe (marge 1,25) ; DSD256 stéréo (0,6 ×) et DSD64
+///   5.1 (0,8 ×) se refusent. Un Raspberry Pi est plus lent qu'un Apple
+///   Silicon : non mesuré, le plafond y est un minimum, pas une promesse.
+const fn multiple_dsd64_stereo_tenable() -> u64 {
+    if cfg!(target_arch = "x86_64") { 4 } else { 2 }
+}
+
+/// Refus nommé d'un flux DST que ce processeur ne décode pas en temps réel.
+///
+/// Fonction pure : la cadence et le nombre de canaux viennent de l'en-tête.
+/// Un refus vaut mieux qu'une lecture hachée sans explication ; le message
+/// porte le mot « decode » pour que la route de lecture rende un 502 (contenu
+/// illisible) et non un 500, comme les autres refus DST.
+pub fn refus_dst_hors_temps_reel(sample_rate: u32, channels: u32) -> Option<String> {
+    let debit = u64::from(sample_rate) * u64::from(channels);
+    let plafond = DEBIT_DSD64_STEREO * multiple_dsd64_stereo_tenable();
+    if debit <= plafond {
+        return None;
+    }
+    let dsd = u64::from(sample_rate) / 44_100;
+    Some(format!(
+        "DFF: cannot decode DST audio in real time on this processor ({}): \
+         DSD{dsd} × {channels} channels needs {:.1}× the DSD64 stereo rate, \
+         this build sustains {}× — convert the file to uncompressed DSD",
+        std::env::consts::ARCH,
+        debit as f64 / DEBIT_DSD64_STEREO as f64,
+        multiple_dsd64_stereo_tenable()
+    ))
+}
+
+/// Un `.dff` dont les données sont compressées en DST ? Lu dans l'en-tête,
+/// jamais déduit de l'extension seule. `false` pour tout autre fichier, ou un
+/// en-tête illisible (le refus de lecture, lui, viendra du décodeur).
+///
+/// C'est la question que doit poser tout chemin qui SERT le fichier tel quel
+/// à un renderer : un DST brut n'est pas du DSD, un renderer qui le lirait
+/// comme tel rendrait du bruit (#4378).
+pub fn est_un_dff_dst(path: &str) -> bool {
+    let est_dff = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("dff"));
+    est_dff && parse_dff(path).is_ok_and(|info| info.is_dst())
+}
+
+/// Motif rendu à un renderer qui demande les octets BRUTS d'un DSDIFF DST.
+pub const MOTIF_DST_JAMAIS_BRUT: &str = "DSDIFF compressé en DST : le fichier brut \
+     n'est pas du DSD lisible par un renderer — lancer la lecture depuis une zone Tune, \
+     qui le décode";
 
 /// Parse DFF header from an in-memory buffer (for testing).
 pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
@@ -1322,5 +1481,268 @@ mod tests_dst {
             (secondes - 10.0 / 75.0).abs() < 0.01,
             "10 trames à 75 trames/s = 133 ms, obtenu {secondes:.3} s"
         );
+    }
+
+    /// Le fichier FATE, réécrit avec un `DSTC` après chaque `DSTF` — la forme
+    /// « avec CRC » de la figure 5 de DSDIFF 1.5. Les CRC sont ceux du DSD de
+    /// référence (`crcs`), ou ce que l'appelant veut y mettre.
+    fn fixture_avec_dstc(crcs: &[Vec<u8>]) -> Vec<u8> {
+        let octets = std::fs::read(fixture()).unwrap();
+        // Le chunk `DST ` de premier niveau — PAS la valeur « DST » du `CMPR`,
+        // qui porte les mêmes quatre octets plus haut.
+        let mut dst = 16;
+        while &octets[dst..dst + 4] != b"DST " {
+            let taille = read_u64_be(&octets, dst + 4) as usize;
+            dst += 12 + taille + (taille & 1);
+        }
+        let taille_dst = read_u64_be(&octets, dst + 4) as usize;
+        let (debut, fin) = (dst + 12, dst + 12 + taille_dst);
+        let mut contenu = Vec::new();
+        let mut o = debut;
+        let mut rang = 0;
+        while o + 12 <= fin {
+            let taille = read_u64_be(&octets, o + 4) as usize;
+            let occupe = taille + (taille & 1);
+            contenu.extend_from_slice(&octets[o..o + 12 + occupe]);
+            if &octets[o..o + 4] == b"DSTF" {
+                let crc = &crcs[rang];
+                contenu.extend_from_slice(b"DSTC");
+                contenu.extend_from_slice(&(crc.len() as u64).to_be_bytes());
+                contenu.extend_from_slice(crc);
+                if crc.len() % 2 == 1 {
+                    contenu.push(0);
+                }
+                rang += 1;
+            }
+            o += 12 + occupe;
+        }
+        assert_eq!(rang, 10, "la fixture porte 10 trames DSTF");
+        let mut sortie = octets[..dst].to_vec();
+        sortie.extend_from_slice(b"DST ");
+        sortie.extend_from_slice(&(contenu.len() as u64).to_be_bytes());
+        sortie.extend_from_slice(&contenu);
+        sortie.extend_from_slice(&octets[fin..]);
+        let total = (sortie.len() - 12) as u64;
+        sortie[4..12].copy_from_slice(&total.to_be_bytes());
+        sortie
+    }
+
+    fn crcs_de_reference() -> Vec<Vec<u8>> {
+        tout_lire(&mut ouvrir())
+            .chunks(9_408)
+            .map(|trame| crc_dstc(trame).to_be_bytes().to_vec())
+            .collect()
+    }
+
+    fn lire_fichier(octets: &[u8]) -> (tempfile::NamedTempFile, Result<Vec<u8>, String>) {
+        let tmp = tempfile::Builder::new().suffix(".dff").tempfile().unwrap();
+        std::fs::write(tmp.path(), octets).unwrap();
+        let chemin = tmp.path().to_str().unwrap().to_string();
+        let info = parse_dff(&chemin).unwrap();
+        let mut lecteur = DffStreamReader::open(&chemin, &info, 4096).unwrap();
+        let mut tout = Vec::new();
+        let resultat = loop {
+            match lecteur.next_chunk() {
+                Ok(Some(morceau)) => tout.extend_from_slice(&morceau),
+                Ok(None) => break Ok(tout),
+                Err(e) => break Err(e),
+            }
+        };
+        (tmp, resultat)
+    }
+
+    /// Contre-épreuve du témoin suivant : des `DSTC` justes ne changent RIEN
+    /// au DSD rendu, et la recherche les traverse sans se décaler.
+    #[test]
+    fn dff_dst_avec_dstc_justes_se_decode_comme_la_reference() {
+        let octets = fixture_avec_dstc(&crcs_de_reference());
+        let (tmp, dsd) = lire_fichier(&octets);
+        let dsd = dsd.expect("des CRC justes ne doivent rien refuser");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&dsd)),
+            SHA256_REFERENCE,
+            "avec des DSTC justes, le DSD doit rester celui de la référence"
+        );
+        let chemin = tmp.path().to_str().unwrap();
+        let info = parse_dff(chemin).unwrap();
+        let mut lecteur = DffStreamReader::open(chemin, &info, 4096).unwrap();
+        let cible = 7 * 9_408 + 77 * 2;
+        assert_eq!(lecteur.seek_to_interleaved_byte(cible, 2).unwrap(), cible);
+        assert_eq!(tout_lire(&mut lecteur), dsd[cible..]);
+    }
+
+    /// 🔴 #4378 — une trame que le DST décode « sans erreur » mais que son
+    /// `DSTC` dément devient du SILENCE, jamais du bruit.
+    ///
+    /// La corruption est cherchée, pas supposée : on retourne un bit de la
+    /// trame 3 jusqu'à trouver une charge que le décodeur accepte et dont le
+    /// DSD diffère de la référence — le cas exact des 12 210 trames abîmées
+    /// sur 20 000 que le crate rendait sans erreur (mesure du 06/10/2026).
+    #[test]
+    fn dff_dst_trame_au_crc_faux_devient_du_silence() {
+        let reference = tout_lire(&mut ouvrir());
+        let base = fixture_avec_dstc(&crcs_de_reference());
+        let trame_3 = base
+            .windows(4)
+            .enumerate()
+            .filter(|(_, w)| *w == b"DSTF")
+            .nth(3)
+            .map(|(i, _)| i)
+            .unwrap();
+        let charge = trame_3 + 12;
+        let taille = read_u64_be(&base, trame_3 + 4) as usize;
+        let mut trouve = None;
+        'recherche: for decalage in (8..taille).step_by(97) {
+            for bit in 0..8 {
+                let mut octets = base.clone();
+                octets[charge + decalage] ^= 1 << bit;
+                // Le décodeur seul, sans le CRC : la trame passe-t-elle ?
+                let mut dec = dst_decoder::decoder::DstDecoder::new(2, 2_822_400).unwrap();
+                let mut dsd = vec![0u8; 9_408];
+                let accepte = dec
+                    .decode_frame(&octets[charge..charge + taille], &mut dsd)
+                    .is_ok();
+                if accepte && dsd[..] != reference[3 * 9_408..4 * 9_408] {
+                    trouve = Some(octets);
+                    break 'recherche;
+                }
+            }
+        }
+        let octets = trouve.expect(
+            "aucune corruption d'un bit acceptée par le décodeur : le témoin ne \
+             mesurerait rien",
+        );
+        let (_tmp, dsd) = lire_fichier(&octets);
+        let dsd = dsd.expect("un CRC faux ne doit pas couper la lecture");
+        assert_eq!(dsd.len(), reference.len(), "aucune trame perdue ni ajoutée");
+        assert!(
+            dsd[3 * 9_408..4 * 9_408].iter().all(|&o| o == SILENCE_DSD),
+            "la trame 3, dont le DSTC ne correspond pas, doit être rendue en \
+             silence DSD (0x69) — pas le DSD faux que le décodeur a produit"
+        );
+        assert_eq!(
+            dsd[..3 * 9_408],
+            reference[..3 * 9_408],
+            "les trames saines d'avant restent intactes"
+        );
+        assert_eq!(
+            dsd[4 * 9_408..],
+            reference[4 * 9_408..],
+            "les trames saines d'après restent intactes"
+        );
+    }
+
+    /// Un `DSTC` qui ne porte pas 4 octets ne peut rien confirmer : erreur
+    /// nommée, pas un DSD réputé vérifié.
+    #[test]
+    fn dff_dst_dstc_de_taille_fausse_est_une_erreur_nommee() {
+        let mut crcs = crcs_de_reference();
+        crcs[0] = vec![1, 2, 3];
+        let (_tmp, dsd) = lire_fichier(&fixture_avec_dstc(&crcs));
+        let err = dsd.expect_err("un DSTC de 3 octets doit être refusé");
+        assert!(err.contains("DST frame 0") && err.contains("DSTC"), "{err}");
+        assert!(
+            err.contains("decode"),
+            "le mot « decode » mène au 502 : {err}"
+        );
+    }
+
+    /// 🔴 #4378 — un DST que ce processeur ne tient pas en temps réel se
+    /// refuse À L'OUVERTURE, par un message qui le dit. DSD256 en six canaux :
+    /// 12 fois le débit DSD64 stéréo, au-delà du plafond de toutes les
+    /// architectures — et une cadence que le crate accepte, pour que le refus
+    /// mesuré soit le NÔTRE et pas celui du décodeur.
+    #[test]
+    fn dff_dst_hors_temps_reel_se_refuse_a_l_ouverture() {
+        let chemin = fixture();
+        let mut info = parse_dff(&chemin).unwrap();
+        info.sample_rate = 256 * 44_100;
+        info.channels = 6;
+        let err = match DffStreamReader::open(&chemin, &info, 4096) {
+            Ok(_) => panic!("un DST DSD256 5.1 ne doit pas s'ouvrir pour se lire haché"),
+            Err(e) => e,
+        };
+        assert!(err.contains("real time") && err.contains("DSD256"), "{err}");
+        assert!(
+            err.contains("decode"),
+            "le mot « decode » mène au 502 : {err}"
+        );
+    }
+}
+
+/// #4378 — le CRC `DSTC` et le plafond de temps réel, sans la feature : ce
+/// sont des fonctions pures, elles se prouvent dans toutes les configurations.
+#[cfg(test)]
+mod tests_dstc_et_temps_reel {
+    use super::*;
+
+    /// La définition de DSDIFF 1.5 § 3.4.3, mot pour mot : le flux de bits
+    /// suivi de 32 zéros, divisé par G(x) = x^32 + x^31 + x^4 + 1 en division
+    /// longue modulo 2. Lente et littérale exprès : c'est l'oracle de la forme
+    /// « registre » de [`crc_dstc`].
+    fn crc_par_division_longue(dsd: &[u8]) -> u32 {
+        const G: u64 = (1 << 32) | (1 << 31) | (1 << 4) | 1;
+        let mut bits: Vec<u8> = dsd
+            .iter()
+            .flat_map(|o| (0..8).rev().map(move |b| (o >> b) & 1))
+            .collect();
+        bits.extend(std::iter::repeat_n(0, 32));
+        let mut reste: u64 = 0;
+        for bit in bits {
+            reste = (reste << 1) | u64::from(bit);
+            if reste & (1 << 32) != 0 {
+                reste ^= G;
+            }
+        }
+        reste as u32
+    }
+
+    #[test]
+    fn crc_dstc_suit_la_division_longue_de_la_specification() {
+        assert_eq!(crc_dstc(&[]), 0);
+        // Un seul bit de poids fort : x^7 · x^32 mod G.
+        assert_eq!(crc_dstc(&[0x80]), crc_par_division_longue(&[0x80]));
+        let mut graine = 0x1234_5678u32;
+        for taille in [1usize, 2, 3, 7, 64, 588, 9_408] {
+            let octets: Vec<u8> = (0..taille)
+                .map(|_| {
+                    graine ^= graine << 13;
+                    graine ^= graine >> 17;
+                    graine ^= graine << 5;
+                    graine as u8
+                })
+                .collect();
+            assert_eq!(
+                crc_dstc(&octets),
+                crc_par_division_longue(&octets),
+                "{taille} octets"
+            );
+        }
+        // Le silence DSD n'a pas un CRC nul : une trame remise à 0x69 ne
+        // passerait pas pour vérifiée par accident.
+        assert_ne!(crc_dstc(&[SILENCE_DSD; 9_408]), 0);
+    }
+
+    #[test]
+    fn plafond_de_temps_reel_du_dst() {
+        // SACD : DSD64, stéréo et 5.1. La stéréo passe partout.
+        assert!(refus_dst_hors_temps_reel(2_822_400, 2).is_none());
+        assert!(refus_dst_hors_temps_reel(5_644_800, 2).is_none());
+        let dsd256_stereo = refus_dst_hors_temps_reel(11_289_600, 2);
+        let dsd64_51 = refus_dst_hors_temps_reel(2_822_400, 6);
+        if cfg!(target_arch = "x86_64") {
+            assert!(dsd256_stereo.is_none(), "x86_64 AVX2 : 7,1 × mesuré");
+            assert!(dsd64_51.is_none());
+        } else {
+            let motif = dsd256_stereo.expect("ARM : DSD256 stéréo tourne à 0,6 × le temps réel");
+            assert!(
+                motif.contains("DSD256") && motif.contains("real time"),
+                "{motif}"
+            );
+            assert!(dsd64_51.is_some(), "ARM : DSD64 5.1 tourne à 0,8 ×");
+        }
+        // Au-delà de tout plafond.
+        let motif = refus_dst_hors_temps_reel(22_579_200, 2).expect("DSD512 stéréo");
+        assert!(motif.contains("decode") && motif.contains(std::env::consts::ARCH));
     }
 }

@@ -66,6 +66,20 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// #5512 — vrai quand la caisse est construite pour des TESTS de
+/// `tune-server`, intégration comprise.
+///
+/// `cfg(test)` ne s'allume que pour la caisse qu'on teste : la lib de
+/// `tune-server` liée par ses tests d'intégration (`tune-server/tests/`) est
+/// construite SANS lui. L'isolement disque de #5467, compilé sous
+/// `#[cfg(test)]`, ne les couvrait donc pas, et `artwork_cache/`,
+/// `queue_state/` et `tune-scan-report.json` réapparaissaient dans l'arbre.
+///
+/// La feature `isolement-disque-de-test` n'est allumée que par les
+/// `[dev-dependencies]` de `tune-server` (resolver 2) : dans tout binaire
+/// publié, cette constante vaut `false` et le code qu'elle garde disparaît.
+pub const ISOLEMENT_DISQUE_DE_TEST: bool = cfg!(feature = "isolement-disque-de-test");
+
 /// Le compteur qui rend le nom unique. `Relaxed` suffit : on ne demande
 /// aucun ordre entre fils, seulement que deux `fetch_add` rendent deux
 /// valeurs distinctes — ce que l'atomicité garantit à elle seule.

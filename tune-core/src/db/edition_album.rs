@@ -73,6 +73,7 @@ use super::coffrets_auto::{self, CLE_COFFRET, Marqueur};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::Track;
 use crate::TuneError;
+use crate::library::local_path::{dossier_comparable, dossier_et_nom};
 use crate::library::regle_compilation::IndicesCompilation;
 use crate::metadata::tag_writer::{BalisesEdition, DrapeauAEcrire};
 
@@ -341,6 +342,20 @@ pub fn tenir_la_disposition(
     figer(db, album_id, &heritage)
 }
 
+/// Fil 2094 — après que des noms de disque ont été posés sur un album DÉJÀ
+/// composé (rattrapage des coffrets) : si sa disposition est tenue, elle est
+/// retenue à nouveau depuis les pistes actuelles, noms de disque compris, et
+/// ses renommages de pistes sont repris. Sinon la relecture des fichiers
+/// rendrait à chaque disque le nom retenu AVANT, c'est-à-dire aucun. Un
+/// album sans disposition tenue n'est pas touché : on n'en crée pas.
+pub fn retenir_les_noms_de_disque(db: &Arc<dyn DbBackend>, album_id: i64) -> Result<(), TuneError> {
+    let tenue = lire_edition(db, album_id)?;
+    if !tenue.disposition {
+        return Ok(());
+    }
+    figer(db, album_id, &[&tenue])
+}
+
 // ---------------------------------------------------------------------------
 // Les TENUES — ce que les analyses n'écrasent plus
 // ---------------------------------------------------------------------------
@@ -355,6 +370,28 @@ pub struct Tenue {
     pub artiste_id: Option<i64>,
 }
 
+/// Fil 2094 — un disque d'un coffret AUTOMATIQUE, tel que la réunion l'a
+/// composé ([`coffrets_auto::reunir`]) : l'album-coffret, le numéro du disque
+/// et, si la réunion l'a posé, son sous-titre (le titre d'origine).
+///
+/// La réunion n'écrit rien dans les fichiers, et ne tient pas la disposition
+/// (la passe doit pouvoir y ajouter un disque arrivé plus tard). Le scan qui
+/// relisait les fichiers rendait donc chaque disque au disque 1, sans nom, et
+/// la passe suivante ne le réunissait plus : le coffret n'est plus qu'un
+/// album. Le marqueur `coffret` retient déjà, pour « Défaire », le DOSSIER de
+/// chaque disque, son numéro et les sous-titres posés : c'est lui qui tient
+/// ces valeurs, sans rien stocker de plus. Défaire retire le marqueur, donc
+/// cette tenue avec lui.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisqueDeCoffret {
+    /// La tenue que [`Tenues::de_la_piste`] rend pour une piste sans tenue à
+    /// elle : l'album-coffret, rien d'autre. [`Tenues::appliquer_tenue`] pose
+    /// alors le disque.
+    tenue: Tenue,
+    disque: i32,
+    sous_titre: Option<String>,
+}
+
 /// Toutes les tenues de la bibliothèque, par chemin de fichier — et, pour une
 /// tranche découpée par une feuille CUE, qui n'a pas de chemin, par son
 /// identité `(cue_media_path, cue_start_ms)` (#5319). Chargé UNE fois par
@@ -364,23 +401,32 @@ pub struct Tenues {
     par_chemin: HashMap<String, Tenue>,
     par_cue: HashMap<(String, i64), Tenue>,
     albums_disposes: HashSet<i64>,
+    /// Fil 2094 — les disques des coffrets AUTOMATIQUES, par dossier
+    /// (forme `dossier_comparable`) : voir [`DisqueDeCoffret`].
+    disques_de_coffret: HashMap<String, DisqueDeCoffret>,
     /// #5314 — `(tracks.genre, tracks.genres)` recopiés du genre de l'album,
     /// par album (marqueur `genre_pistes`, voir
     /// [`super::genre_album_pistes`]).
     genres_par_album: HashMap<i64, (String, String)>,
+    /// 05/10/2026 — les champs d'une piste corrigés à la main (édition de
+    /// piste, tagger, compositeur…), appliqués EN DERNIER : c'est la
+    /// correction la plus précise. Voir [`super::champs_tenus`].
+    champs: super::champs_tenus::Registre,
 }
 
 impl Tenues {
     /// Un défaut de lecture rend un ensemble VIDE en le disant au journal :
     /// on ne bloque pas un scan sur une table de métadonnées illisible.
     pub fn charger(db: &Arc<dyn DbBackend>) -> Self {
-        match Self::essayer(db) {
+        let mut t = match Self::essayer(db) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(erreur = %e, "editions_tenues_illisibles");
                 Self::default()
             }
-        }
+        };
+        t.champs = super::champs_tenus::Registre::charger(db);
+        t
     }
 
     fn essayer(db: &Arc<dyn DbBackend>) -> Result<Self, TuneError> {
@@ -445,6 +491,7 @@ impl Tenues {
                 t.genres_par_album.insert(id, colonnes);
             }
         }
+        t.disques_de_coffret = disques_de_coffret(db)?;
         for (album_id, e) in editions {
             if e.disposition {
                 t.albums_disposes.insert(album_id);
@@ -470,7 +517,10 @@ impl Tenues {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.par_chemin.is_empty() && self.par_cue.is_empty() && self.genres_par_album.is_empty()
+        self.par_chemin.is_empty()
+            && self.par_cue.is_empty()
+            && self.genres_par_album.is_empty()
+            && self.champs.is_empty()
     }
 
     pub fn get(&self, chemin: &str) -> Option<&Tenue> {
@@ -493,6 +543,23 @@ impl Tenues {
                 let media = track.cue_media_path.as_deref()?;
                 self.get_cue(media, track.cue_start_ms?)
             })
+            .or_else(|| self.coffret_de_la_piste(track).map(|c| &c.tenue))
+    }
+
+    /// Fil 2094 — le disque de coffret automatique qui vit dans le dossier de
+    /// la piste : celui du fichier, ou de l'image d'une tranche CUE.
+    fn coffret_de_la_piste(&self, track: &Track) -> Option<&DisqueDeCoffret> {
+        if self.disques_de_coffret.is_empty() {
+            return None;
+        }
+        let chemin = track
+            .file_path
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .or(track.cue_media_path.as_deref())?;
+        let (dossier, _) = dossier_et_nom(chemin)?;
+        self.disques_de_coffret
+            .get(dossier_comparable(dossier).as_ref())
     }
 
     /// Les albums dont la disposition des disques est tenue à la main.
@@ -500,12 +567,22 @@ impl Tenues {
         &self.albums_disposes
     }
 
+    /// Fil 2094 — cet album est-il un coffret AUTOMATIQUE dont les disques
+    /// sont tenus ([`DisqueDeCoffret`]) ? Distinct de
+    /// [`Self::albums_disposes`] : la passe des coffrets doit pouvoir y
+    /// ajouter un disque arrivé plus tard.
+    pub fn est_un_coffret_auto(&self, album_id: i64) -> bool {
+        self.disques_de_coffret
+            .values()
+            .any(|d| d.tenue.album_id == album_id)
+    }
+
     /// Pose sur une ligne piste — construite depuis les balises, pas encore
     /// écrite — ce que l'utilisateur a tenu. Rend vrai si la ligne a changé.
     pub fn appliquer(&self, track: &mut Track) -> bool {
         // Par chemin, sinon par identité CUE (#5319).
         let tenue = self.de_la_piste(track);
-        let change = tenue.is_some();
+        let mut change = tenue.is_some();
         if let Some(t) = tenue {
             self.appliquer_tenue(t, track);
         }
@@ -514,7 +591,11 @@ impl Tenues {
         if let Some((genre, genres)) = track.album_id.and_then(|a| self.genres_par_album.get(&a)) {
             track.genre = Some(genre.clone());
             track.genres = Some(genres.clone());
-            return true;
+            change = true;
+        }
+        // 05/10/2026 — les champs corrigés à la main sur la piste, en dernier.
+        if self.champs.appliquer(track) {
+            change = true;
         }
         change
     }
@@ -525,6 +606,21 @@ impl Tenues {
             track.disc_number = *disque;
             track.track_number = *numero;
             track.disc_subtitle = nom.clone();
+        } else if let Some(c) = self.coffret_de_la_piste(track) {
+            // Fil 2094 — une disposition tenue à la main prime ; à défaut, le
+            // disque d'un coffret automatique garde son numéro et le
+            // sous-titre que la réunion lui a donné. Un nom que porte la
+            // balise (DISCSUBTITLE) reste le sien : la réunion ne le
+            // remplaçait pas non plus.
+            track.album_id = Some(c.tenue.album_id);
+            track.disc_number = c.disque;
+            if track
+                .disc_subtitle
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+            {
+                track.disc_subtitle = c.sous_titre.clone();
+            }
         }
         if let Some(titre) = &t.titre {
             track.title = titre.clone();
@@ -533,6 +629,58 @@ impl Tenues {
             track.artist_id = Some(a);
         }
     }
+}
+
+/// Fil 2094 — les disques de tous les coffrets AUTOMATIQUES, lus dans leur
+/// marqueur, par dossier. Un coffret manuel tient sa disposition à la main
+/// (`edition_pistes`) : il n'est pas lu ici.
+fn disques_de_coffret(
+    db: &Arc<dyn DbBackend>,
+) -> Result<HashMap<String, DisqueDeCoffret>, TuneError> {
+    let sql = format!(
+        "SELECT m.album_id, m.value FROM album_metadata m \
+         JOIN albums a ON a.id = m.album_id WHERE m.key = {}",
+        marque(db.engine(), 1)
+    );
+    let mut rendu = HashMap::new();
+    for r in db.query_many_strong(&sql, &[&CLE_COFFRET as &dyn ToSqlValue])? {
+        let (Some(album_id), Some(v)) = (
+            r.first().and_then(|v| v.as_i64()),
+            r.get(1).and_then(|v| v.as_string()),
+        ) else {
+            continue;
+        };
+        let Ok(m) = serde_json::from_str::<Marqueur>(&v) else {
+            continue;
+        };
+        if !m.est_auto() {
+            continue;
+        }
+        for d in &m.disques {
+            let (Ok(disque), false) = (i32::try_from(d.n), d.dossier.trim().is_empty()) else {
+                continue;
+            };
+            let sous_titre = m
+                .sous_titres
+                .contains(&d.n)
+                .then(|| d.titre.trim().to_string())
+                .filter(|s| !s.is_empty());
+            rendu.insert(
+                dossier_comparable(&d.dossier).into_owned(),
+                DisqueDeCoffret {
+                    tenue: Tenue {
+                        album_id,
+                        disposition: None,
+                        titre: None,
+                        artiste_id: None,
+                    },
+                    disque,
+                    sous_titre,
+                },
+            );
+        }
+    }
+    Ok(rendu)
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,6 +1554,8 @@ fn dossier_stocke(chemin: &str) -> Option<&str> {
 ///   retirés : un scan rend chaque piste à l'album de son dossier. Les
 ///   titres et artistes de piste renommés à la main restent tenus, sur
 ///   l'album où la piste se trouve désormais.
+/// - Le NOM de disque donné dans le coffret ne reste pas (#5644) : chaque
+///   piste reprend celui de sa balise DISCSUBTITLE, ou aucun.
 ///
 /// Refus `pas_un_coffret_manuel` pour tout album sans marqueur `manuel` — un
 /// coffret automatique se défait par sa propre route.
@@ -1490,6 +1640,19 @@ pub fn defaire_coffret_manuel(
     )?;
     repo.update_track_count(album_id)?;
 
+    // #5644 — le NOM de chaque disque redevient celui que porte sa balise
+    // (DISCSUBTITLE), comme « Rétablir les disques » : un nom donné au disque
+    // dans le coffret ne suit pas l'album séparé. Fichier illisible ou
+    // tranche CUE : plus de nom, la relecture suivante le rendra s'il existe.
+    let balises = relire_les_balises(&lignes);
+    for l in &lignes {
+        let nom = balises.get(&l.id).and_then(|b| b.nom_disque.clone());
+        db.execute(
+            &format!("UPDATE tracks SET disc_subtitle = {p1} WHERE id = {p2}"),
+            &[&nom as &dyn ToSqlValue, &l.id],
+        )?;
+    }
+
     // Le titre : rendu seulement s'il est encore celui de la composition.
     if let (Some(compose), Some(origine)) = (&marqueur.titre_compose, marqueur.disques.first())
         && *compose == coffret.title
@@ -1499,6 +1662,11 @@ pub fn defaire_coffret_manuel(
             ne_plus_tenir(db, album_id, "title")?;
         }
     }
+    // Fil 2094 — les sous-titres que la composition avait posés.
+    let rendus: Vec<i64> = std::iter::once(album_id)
+        .chain(recrees.iter().copied())
+        .collect();
+    super::coffrets_auto::retirer_les_sous_titres(db, &rendus, &marqueur)?;
     AlbumMetadataRepo::with_backend(db.clone()).delete(album_id, CLE_COFFRET)?;
 
     // Plus de disposition tenue ; les renommages de pistes suivent la piste.
@@ -1548,6 +1716,8 @@ struct Balises {
     annee: Option<i32>,
     genre: Option<String>,
     label: Option<String>,
+    /// #5616 — le type de sortie de la balise (`RELEASETYPE` et variantes).
+    type_de_sortie: Option<String>,
     disque: Option<i32>,
     numero: Option<i32>,
     nom_disque: Option<String>,
@@ -1592,6 +1762,7 @@ fn relire_les_balises(lignes: &[Ligne]) -> HashMap<i64, Balises> {
                 }),
                 genre: non_vide(a.genre.clone()),
                 label: None,
+                type_de_sortie: None,
                 disque: Some(1),
                 numero: Some(p.numero as i32),
                 nom_disque: None,
@@ -1608,6 +1779,7 @@ fn relire_les_balises(lignes: &[Ligne]) -> HashMap<i64, Balises> {
                 annee: m.year.map(|y| y as i32).filter(|y| *y > 0),
                 genre: non_vide(m.genre),
                 label: non_vide(m.label),
+                type_de_sortie: m.release_type,
                 disque: m.disc_number.map(|d| d as i32),
                 numero: m.track_number.map(|n| n as i32),
                 nom_disque: non_vide(m.disc_subtitle),
@@ -1655,8 +1827,9 @@ pub const CHAMPS_RETABLISSABLES: [&str; 9] = [
 ///   piste qui ouvre l'album (disque, puis numéro). Sans balise, `year`,
 ///   `label` et `genre` sont vidés ; `title` et `album_artist` gardent leur
 ///   valeur — un album a toujours un titre et un artiste.
-/// - `release_type` : aucune balise ne le porte ; il est vidé, et
-///   l'enrichissement pourra le reposer.
+/// - `release_type` : la valeur de la balise `RELEASETYPE` (et variantes,
+///   #5616) ; sans balise, il est vidé, et l'enrichissement pourra le
+///   reposer.
 /// - `compilation_mode` : le mode revient à `auto` (la règle juge).
 /// - `tracks` : titres et artistes de pistes renommés reprennent ceux des
 ///   balises. La disposition des disques, si elle est tenue, reste.
@@ -1805,7 +1978,11 @@ pub fn retablir(db: &Arc<dyn DbBackend>, album_id: i64, champ: &str) -> Result<(
                 "title" => ("title", "title", texte(|b| b.album.clone())),
                 "label" => ("label", "label", texte(|b| b.label.clone())),
                 "genre" => ("genre", "genre", texte(|b| b.genre.clone())),
-                "release_type" => ("release_type", "release_type", None),
+                "release_type" => (
+                    "release_type",
+                    "release_type",
+                    texte(|b| b.type_de_sortie.clone()),
+                ),
                 "year" => ("year", "year", None),
                 _ => ("artist", "artist_id", None),
             };

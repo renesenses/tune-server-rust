@@ -23,8 +23,8 @@ use super::empreinte_du_puits_r1::{DspAuRepos, etage};
 use super::*;
 use crate::outputs::traits::{CaptureOutput, FormatOuvert};
 
-const CADENCE: u32 = 48_000;
-const CANAUX: u16 = 2;
+pub(super) const CADENCE: u32 = 48_000;
+pub(super) const CANAUX: u16 = 2;
 const DUREE_S: u32 = 8;
 /// Le transfert complet de la piste, imposé par le serveur factice.
 const TRANSFERT_COMPLET_MS: u64 = 4_000;
@@ -65,13 +65,13 @@ fn flac_48k() -> Vec<u8> {
 }
 
 /// Un serveur multimédia factice qui sert `corps` en [`TRANSFERT_COMPLET_MS`].
-struct ServeurLent {
-    url: String,
+pub(super) struct ServeurLent {
+    pub(super) url: String,
     fil: Option<JoinHandle<()>>,
 }
 
 impl ServeurLent {
-    fn servir(corps: Arc<Vec<u8>>) -> Self {
+    pub(super) fn servir(corps: Arc<Vec<u8>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!(
             "http://{}/files/Freebox/Musiques/Io%20Capitano.flac",
@@ -128,7 +128,7 @@ impl Drop for ServeurLent {
 }
 
 /// Ce que `play_url` fait d'un flux non-WAV, jusqu'à l'en-tête décodé.
-fn ouvrir_comme_play_url(
+pub(super) fn ouvrir_comme_play_url(
     url: &str,
     arret: &Arc<AtomicBool>,
 ) -> (LecteurHttpAnnulable, Vec<u8>, (u16, u32, u16, usize)) {
@@ -233,7 +233,7 @@ fn jouer(
 
 /// Le décodeur des FICHIERS LOCAUX sur le même FLAC posé sur disque : la
 /// référence octet pour octet (en-tête WAV compris).
-fn reference_fichier_local(flac: &[u8]) -> Vec<u8> {
+pub(super) fn reference_fichier_local(flac: &[u8]) -> Vec<u8> {
     let mut fichier = tempfile::Builder::new()
         .suffix(".flac")
         .tempfile()
@@ -465,7 +465,7 @@ fn chemin_compresse_5439_play_url_branche_le_decodage_continu() {
     );
     let pos_continu = production.find(&branchement).unwrap();
     let pos_ancienne = production
-        .find("decode_compressed_stream(&all_data)")
+        .find("decode_compressed_stream(&all_data,&force_silent)")
         .expect("la branche d'avant reste pour les autres formats");
     assert!(
         pos_continu < pos_ancienne,

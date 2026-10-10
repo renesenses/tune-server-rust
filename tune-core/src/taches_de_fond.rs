@@ -78,6 +78,14 @@ pub mod ordre;
 /// Le rattrapage des rapports `foo_dr.txt`, sans décodage (#5168).
 pub mod rapports_dr;
 
+/// Le périmètre des passes qui décodent : racines exclues (#5593).
+pub mod perimetre;
+/// La vitesse des passes qui décodent : fichiers à la fois (#5519).
+pub mod vitesse;
+
+/// La clé du signal PCM des FLAC, lue dans l'en-tête, sans décodage (#5594).
+pub mod cle_pcm;
+
 /// Un traitement de fond que l'utilisateur peut suspendre.
 ///
 /// ⚠️ **Le scan n'en est pas**, et ce n'est pas un oubli : voir
@@ -260,6 +268,9 @@ pub fn hydrater(backend: &Arc<dyn DbBackend>) {
     // #5169 — le réglage d'ordre est une décision de l'utilisateur, comme la
     // pause : il survit au redémarrage par le même chemin.
     ordre::hydrater(backend);
+    // #4681 — la politique de cession à la lecture, réglable, par le même
+    // chemin.
+    priorite::politique::hydrater(backend);
     if masque != 0 {
         tracing::info!(
             suspendus = ?suspendus().iter().map(|t| t.id()).collect::<Vec<_>>(),

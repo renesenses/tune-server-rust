@@ -7,6 +7,9 @@
 #![allow(clippy::result_large_err)]
 
 mod adresse_d_accueil;
+pub mod aiguillage_des_flux;
+#[cfg(test)]
+mod aiguillage_des_flux_tests_4645;
 pub mod auth;
 pub mod auto_resume;
 pub mod auto_scan;
@@ -24,15 +27,24 @@ pub mod catalogue_services;
 /// Pourquoi un dossier configuré est-il injoignable, et que peut y faire
 /// l'utilisateur. Voir [`chemin_inaccessible`] pour le cas Windows.
 pub mod chemin_inaccessible;
+/// #5513 — les chemins de données retenus au démarrage.
+pub mod chemins_de_donnees;
 pub mod config;
 pub mod discovery_setup;
+/// Dossiers de données inscriptibles, contrôlés avant la base (`EX_CONFIG`).
+pub mod dossiers_inscriptibles;
+/// Plancher de fils de travail du moteur tokio (fil 2124, #5677).
+pub mod fils_de_travail;
 /// Détecteur de gel de l'exécuteur et relevé automatique (#4924).
 pub mod gel_executeur;
+mod instance_existante;
 pub use tune_http_types::error;
 pub mod i18n;
 pub mod journal;
 mod lecture_bornee;
 pub mod lien_de_partage;
+/// Rendre au système, à froid, la mémoire libre que garde l'allocateur.
+pub mod memoire_a_froid;
 /// #4677 — relevé, au démarrage, des règles du pare-feu Windows pour
 /// `tune-server.exe` (lecture seule, une ligne de journal).
 pub mod pare_feu_windows;
@@ -42,6 +54,10 @@ pub mod plugins;
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins_host;
 pub mod premium_guard;
+/// Actions root d'un service qui ne tourne pas en root (Tune OS, #3206).
+pub mod privilege;
+/// Détail du RSS (`RssAnon`, `RssFile`, `RssShmem`) pour `memory_diagnostics`.
+pub mod releve_memoire;
 pub mod reprise_des_passes;
 pub mod routes;
 pub mod scan_import;
@@ -56,6 +72,9 @@ mod tune_os_password;
 pub mod windows_migrate;
 
 #[cfg(test)]
+mod aleatoire_selection_5526_tests;
+// #5512 : compilé partout, actif seulement en build de test (lib ET
+// intégration) — voir `isolement_disque_tests_5467::actif`.
 mod isolement_disque_tests_5467;
 #[cfg(test)]
 mod labels_albums_4836_tests;

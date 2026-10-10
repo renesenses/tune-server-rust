@@ -957,13 +957,46 @@ fn schema_incomplet(e: &str) -> bool {
 fn cles_de_zone(id: i64) -> (String, [String; 4]) {
     (
         format!("zone_{id}_"),
-        [
-            format!("dac_profile_{id}"),
-            format!("room_profile_{id}"),
-            format!("ir_path_{id}"),
-            format!("upnp_renderer_udn_{id}"),
-        ],
+        CLES_DE_ZONE_SUFFIXEES.map(|prefixe| format!("{prefixe}{id}")),
     )
+}
+
+/// Les quatre clés de zone qui portent l'identifiant en SUFFIXE (voir
+/// [`cles_de_zone`]). Une seule liste, lue par le report des doublons et par
+/// l'export de configuration.
+const CLES_DE_ZONE_SUFFIXEES: [&str; 4] = [
+    "dac_profile_",
+    "room_profile_",
+    "ir_path_",
+    "upnp_renderer_udn_",
+];
+
+/// Le gabarit d'un réglage de zone rangé dans `settings` : l'identifiant de
+/// la zone et la clé où il est remplacé par `{id}` (`zone_7_crossfeed` →
+/// `(7, "zone_{id}_crossfeed")`, `dac_profile_7` → `(7, "dac_profile_{id}")`).
+/// `None` pour une clé qui n'appartient à aucune zone — `zone_groups`,
+/// `zone_auto_create` ou `room_profile_index` ne portent pas d'identifiant.
+///
+/// C'est ce qui permet à l'export de configuration de rattacher ces réglages
+/// à leur zone plutôt qu'à un numéro, qui ne désigne pas la même zone d'une
+/// machine à l'autre.
+pub fn gabarit_de_cle_de_zone(cle: &str) -> Option<(i64, String)> {
+    let chiffres = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(reste) = cle.strip_prefix("zone_")
+        && let Some((id, quoi)) = reste.split_once('_')
+        && chiffres(id)
+        && !quoi.is_empty()
+    {
+        return Some((id.parse().ok()?, format!("zone_{{id}}_{quoi}")));
+    }
+    for prefixe in CLES_DE_ZONE_SUFFIXEES {
+        if let Some(id) = cle.strip_prefix(prefixe)
+            && chiffres(id)
+        {
+            return Some((id.parse().ok()?, format!("{prefixe}{{id}}")));
+        }
+    }
+    None
 }
 
 /// Reporte sur `cible` les réglages `settings` de `doublon` qu'elle n'a pas
@@ -1130,7 +1163,11 @@ impl ZoneRepo {
         // get_by_device_id) does NOT help here: the row exists, only the field is
         // stale, so the fallback never triggers. Mirror list()'s unconditional
         // strong read. A single zone by id is a tiny query.
-        let rows = self.db.query_many_strong(&sql, &params)?;
+        //
+        // #5871 — forte quand l'écrivain est libre, par le pool quand un
+        // autre fil le tient : une PATCH validée y est visible, et la
+        // préparation d'une lecture ne fait plus la queue derrière un scan.
+        let rows = self.db.query_many_frais(&sql, &params)?;
         Ok(rows.first().map(row_to_zone))
     }
 
@@ -1190,10 +1227,23 @@ impl ZoneRepo {
     /// comme avant. Relue par son identifiant ([`Self::get`] ne filtre pas le
     /// masquage) ; une zone réellement effacée entre-temps est simplement
     /// ignorée.
+    ///
+    /// 🔴 #5322 — SAUF une zone que l'utilisateur a lui-même retirée
+    /// (supprimer, tout supprimer, fusionner : les motifs de
+    /// [`MotifMasquage::ecrase_un_masquage_existant`]). FabienM (0.9.167, fil
+    /// 2013) supprimait sa zone « Parents » DLNA EN PAUSE : le DELETE la
+    /// masquait bien, puis cette exception la remettait dans la liste à chaque
+    /// rafraîchissement — « je clique sur Supprimer cette zone et je refresh la
+    /// page, elle est toujours là ». L'exception ne vaut que pour un masquage
+    /// que l'utilisateur n'a PAS demandé (appareil ignoré, motif inconnu
+    /// d'avant la migration 112) : c'est le cas du DMP-A6 ci-dessus.
     pub fn list_avec_masquees_en_lecture(&self, en_lecture: &[i64]) -> Result<Vec<Zone>, String> {
         let mut zones = self.list()?;
         for &id in en_lecture {
             if zones.iter().any(|z| z.id == Some(id)) {
+                continue;
+            }
+            if self.retiree_par_l_utilisateur(id) {
                 continue;
             }
             if let Some(zone) = self.get(id)? {
@@ -1201,6 +1251,25 @@ impl ZoneRepo {
             }
         }
         Ok(zones)
+    }
+
+    /// La zone `id` est-elle masquée par un geste EXPLICITE de l'utilisateur
+    /// (#5322) ? Lecture forte : le client relit `/zones` juste après son
+    /// DELETE, et une lecture en retard rendrait la zone « visible ».
+    ///
+    /// Motif inconnu, base sans la colonne, erreur de lecture : `false` — on
+    /// garde alors le comportement de #5077 (la zone qui joue se montre).
+    fn retiree_par_l_utilisateur(&self, id: i64) -> bool {
+        let sql = self.dialect_sql(sql::etat_de_masquage, sql::etat_de_masquage);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        let Ok(Some(ligne)) = self.db.query_one_strong(&sql, &params) else {
+            return false;
+        };
+        let masquee = ligne.first().and_then(|v| v.as_i64()).unwrap_or(0) != 0;
+        let motif = ligne.get(1).and_then(|v| v.as_string());
+        masquee
+            && MotifMasquage::depuis_stocke(motif.as_deref())
+                .is_some_and(MotifMasquage::ecrase_un_masquage_existant)
     }
 
     pub fn create(
@@ -2816,9 +2885,12 @@ impl ZoneRepo {
     /// Un chemin automatique qui masque une zone passe par [`Self::masquer`]
     /// avec SON motif. Ce défaut-ci est le prudent : un appelant qui aurait
     /// oublié de nommer sa raison obtient le motif que rien ne répare.
-    pub fn delete(&self, id: i64) -> Result<(), String> {
+    ///
+    /// Rend le nombre de lignes masquées (#5322) : `0` veut dire qu'aucune
+    /// zone ne porte cet identifiant. Le jeter faisait répondre `204` à la
+    /// route pour une suppression qui n'avait rien touché.
+    pub fn delete(&self, id: i64) -> Result<usize, String> {
         self.masquer(id, MotifMasquage::SuppressionUtilisateur)
-            .map(|_| ())
     }
 
     /// Masque la zone `id` en retenant POURQUOI et QUAND (#5077). Rend le

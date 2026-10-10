@@ -46,8 +46,14 @@ pub struct SpotifyService {
     refresh_token: Option<String>,
     username: Option<String>,
     user_id: Option<String>,
-    code_verifier: Option<String>,
+    /// Fil 221 — les autorisations entamees et pas encore echangees, la plus
+    /// recente en dernier. Chacune garde le `state` envoye a Spotify et le
+    /// verificateur PKCE dont le `code_challenge` a ete envoye avec.
+    tentatives: Vec<TentativePkce>,
     redirect_uri: String,
+    /// `TOKEN_URL` et `API_BASE`, sauf en test ou une doublure locale repond.
+    token_url: String,
+    api_base: String,
     token_expires: Option<std::time::Instant>,
     enabled_override: Option<bool>,
     /// Posé par un appel HTTP qui s'est vu refuser le jeton (401).
@@ -154,6 +160,42 @@ pub fn refus_redirection(uri: &str) -> Option<RefusRedirection> {
 /// `code`. La coller dans Tune termine l'echange (meme verificateur PKCE, meme
 /// `redirect_uri`). Un code nu est accepte tel quel.
 pub fn code_depuis_rappel(colle: &str) -> Result<String, String> {
+    rappel_depuis_colle(colle).map(|r| r.code)
+}
+
+/// Fil 221 — au plus tant d'autorisations entamees gardees en memoire : deux
+/// onglets, ou un second clic sur « Se connecter », ne s'ecrasent plus.
+const TENTATIVES_MAX: usize = 4;
+
+const AUCUNE_TENTATIVE: &str = "spotify: aucune connexion en cours (no code verifier) — \
+     le serveur a pu redemarrer depuis l'ouverture du lien. Cliquez de nouveau sur \
+     Se connecter, puis collez la nouvelle adresse de retour";
+
+const TENTATIVE_INCONNUE: &str = "spotify: cette adresse de retour vient d'une autre \
+     tentative de connexion (ou d'avant un redemarrage du serveur). Cliquez de nouveau \
+     sur Se connecter, puis collez la nouvelle adresse de retour";
+
+/// Une autorisation entamee : le `state` envoye et son verificateur PKCE.
+struct TentativePkce {
+    state: String,
+    verifier: String,
+}
+
+/// Ce qu'une adresse de retour apporte : le code, et le `state` s'il y est.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RappelSpotify {
+    pub code: String,
+    pub state: Option<String>,
+}
+
+fn octets_aleatoires<const N: usize>() -> [u8; N] {
+    let mut octets = [0u8; N];
+    getrandom::getrandom(&mut octets).expect("OS RNG unavailable");
+    octets
+}
+
+/// Comme [`code_depuis_rappel`], en gardant le `state` de l'adresse collee.
+pub fn rappel_depuis_colle(colle: &str) -> Result<RappelSpotify, String> {
     let colle = colle.trim();
     if colle.is_empty() {
         return Err("spotify: adresse de rappel vide".into());
@@ -162,25 +204,89 @@ pub fn code_depuis_rappel(colle: &str) -> Result<String, String> {
         if colle.contains("://") || colle.contains('/') {
             return Err("spotify: l'adresse collee ne contient pas de code".into());
         }
-        return Ok(colle.to_owned());
+        // Fil 221 — Yan Tasset y a colle son Client ID : il partait vers
+        // `api/token` comme un code, et Spotify repondait `invalid_client`.
+        if ressemble_a_un_client_id(colle) {
+            return Err(
+                "spotify: ceci est un Client ID (32 caracteres hexadecimaux), \
+                        pas l'adresse de retour. Enregistrez-le dans le champ Client ID, \
+                        puis collez ici l'adresse complete de la page 127.0.0.1 \
+                        (elle contient ?code=...)"
+                    .into(),
+            );
+        }
+        return Ok(RappelSpotify {
+            code: colle.to_owned(),
+            state: None,
+        });
     };
     let requete = requete.split('#').next().unwrap_or(requete);
     let mut erreur = None;
+    let mut code = None;
+    let mut state = None;
     for paire in requete.split('&') {
         let (cle, valeur) = paire.split_once('=').unwrap_or((paire, ""));
         let valeur = urlencoding::decode(valeur)
             .map(|v| v.into_owned())
             .unwrap_or_else(|_| valeur.to_owned());
         match cle {
-            "code" if !valeur.is_empty() => return Ok(valeur),
+            "code" if !valeur.is_empty() => code = Some(valeur),
+            "state" if !valeur.is_empty() => state = Some(valeur),
             "error" => erreur = Some(valeur),
             _ => {}
         }
+    }
+    if let Some(code) = code {
+        return Ok(RappelSpotify { code, state });
     }
     Err(match erreur {
         Some(e) => format!("spotify: {e}"),
         None => "spotify: l'adresse collee ne contient pas de code".into(),
     })
+}
+
+/// Fil 221 (Yan Tasset) — debut du refus d'`authenticate` quand le serveur
+/// n'a aucun Client ID : la route de streaming et l'ecran le reconnaissent.
+pub const CLIENT_ID_ABSENT: &str = "spotify: aucun Client ID configure";
+
+/// Un Client ID est-il REELLEMENT configure ? Vide et `"placeholder"` (le
+/// defaut de la caisse) ne le sont pas : avec eux, Spotify repond
+/// `invalid_client` a tout.
+pub fn client_id_configure(client_id: &str) -> bool {
+    let id = client_id.trim();
+    !id.is_empty() && id != DEFAULT_CLIENT_ID
+}
+
+/// Fil 221 — un Client ID Spotify est une suite de 32 caracteres
+/// hexadecimaux. Un code d'autorisation, lui, en compte bien davantage et
+/// n'est jamais de cette forme : un texte nu de cette forme colle dans le
+/// champ de l'adresse de retour est un Client ID, pas un code.
+pub fn ressemble_a_un_client_id(texte: &str) -> bool {
+    let t = texte.trim();
+    t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Le Client ID que le service doit employer — fil 221.
+///
+/// Ordre de priorite, du plus fort au plus faible :
+/// 1. la variable `TUNE_SPOTIFY_CLIENT_ID` (l'exploitant l'impose) ;
+/// 2. le reglage `spotify_client_id` en base, saisi dans Reglages ;
+/// 3. `spotify_client_id` de `tune.toml`.
+///
+/// `None` : rien de tout cela. `with_config` se rabat alors sur l'ancienne
+/// variable `SPOTIFY_CLIENT_ID`, puis sur `"placeholder"` (non configure).
+/// Une valeur vide ou egale a `"placeholder"` compte comme absente.
+pub fn resolve_client_id(
+    tune_env: Option<&str>,
+    reglage: Option<&str>,
+    toml: Option<&str>,
+) -> Option<String> {
+    [tune_env, reglage, toml]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|id| client_id_configure(id))
+        .map(str::to_owned)
 }
 
 /// L'URI que Tune enverra REELLEMENT a Spotify, lue depuis l'environnement du
@@ -232,12 +338,54 @@ impl SpotifyService {
             refresh_token: None,
             username: None,
             user_id: None,
-            code_verifier: None,
+            tentatives: Vec::new(),
             redirect_uri,
+            token_url: TOKEN_URL.to_owned(),
+            api_base: API_BASE.to_owned(),
             token_expires: None,
             enabled_override: None,
             token_rejected: AtomicBool::new(false),
         }
+    }
+
+    /// Fil 221 — le Client ID saisi dans Reglages, applique a chaud. Un
+    /// echange PKCE entame avec l'ancien identifiant ne peut pas aboutir avec
+    /// le nouveau : son verificateur est oublie.
+    pub fn set_client_id(&mut self, client_id: &str) {
+        self.client_id = client_id.trim().to_owned();
+        self.tentatives.clear();
+    }
+
+    /// Fil 221 — la tentative dont un code de retour releve.
+    ///
+    /// Le `state` du retour la designe ; un code colle nu (sans `state`)
+    /// revient a la plus recente. Rien n'est consomme ici : la tentative ne
+    /// s'efface qu'apres un echange reussi.
+    fn tentative_pour(&self, state: Option<&str>) -> Result<usize, String> {
+        if self.tentatives.is_empty() {
+            return Err(AUCUNE_TENTATIVE.into());
+        }
+        match state {
+            None => Ok(self.tentatives.len() - 1),
+            Some(state) => self
+                .tentatives
+                .iter()
+                .rposition(|t| t.state == state)
+                .ok_or_else(|| TENTATIVE_INCONNUE.into()),
+        }
+    }
+
+    #[cfg(test)]
+    fn avec_doublure(mut self, base: &str) -> Self {
+        self.token_url = format!("{base}/api/token");
+        self.api_base = format!("{base}/v1");
+        self
+    }
+
+    /// Fil 221 — ce que `GET /system/env` publie : `false` tant que le
+    /// service tourne avec `"placeholder"`.
+    pub fn client_id_est_configure(&self) -> bool {
+        client_id_configure(&self.client_id)
     }
 
     /// Enregistre un refus de jeton pour que le prochain tick le rafraîchisse.
@@ -250,17 +398,10 @@ impl SpotifyService {
     }
 
     fn generate_pkce() -> (String, String) {
-        let verifier: String = (0..128)
-            .map(|i| {
-                let seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .subsec_nanos()
-                    .wrapping_add(i as u32);
-                let idx = (seed % 62) as usize;
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[idx] as char
-            })
-            .collect();
+        // 96 octets du generateur du systeme, en base64url : 128 caracteres,
+        // tous dans l'alphabet admis par la RFC 7636. L'ancienne graine
+        // (`subsec_nanos() + i`) rendait une suite quasi constante.
+        let verifier = base64url_encode(&octets_aleatoires::<96>());
 
         let mut hasher = Sha256::new();
         hasher.update(verifier.as_bytes());
@@ -270,9 +411,9 @@ impl SpotifyService {
         (verifier, challenge)
     }
 
-    fn auth_url(&self, challenge: &str) -> String {
+    fn auth_url(&self, challenge: &str, state: &str) -> String {
         format!(
-            "{AUTH_URL}?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={challenge}",
+            "{AUTH_URL}?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={challenge}&state={state}",
             urlencoding::encode(&self.client_id),
             urlencoding::encode(&self.redirect_uri),
             urlencoding::encode(SCOPES),
@@ -283,7 +424,7 @@ impl SpotifyService {
         let token = self.access_token.as_deref().ok_or("not authenticated")?;
         let resp = self
             .client
-            .get(format!("{API_BASE}{path}"))
+            .get(format!("{}{path}", self.api_base))
             .header("Authorization", format!("Bearer {token}"))
             .send()
             .await
@@ -334,6 +475,7 @@ impl SpotifyService {
 
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
+            ai_generated: None,
             release_type: None,
             id: item["id"].as_str().unwrap_or("").into(),
             title: item["name"].as_str().unwrap_or("").into(),
@@ -411,7 +553,7 @@ impl SpotifyService {
         let token = self.access_token.as_deref().ok_or("not authenticated")?;
         let resp = self
             .client
-            .put(format!("{API_BASE}{path}"))
+            .put(format!("{}{path}", self.api_base))
             .header("Authorization", format!("Bearer {token}"))
             .send()
             .await
@@ -431,7 +573,7 @@ impl SpotifyService {
         let token = self.access_token.as_deref().ok_or("not authenticated")?;
         let resp = self
             .client
-            .delete(format!("{API_BASE}{path}"))
+            .delete(format!("{}{path}", self.api_base))
             .header("Authorization", format!("Bearer {token}"))
             .send()
             .await
@@ -455,7 +597,7 @@ impl SpotifyService {
         let token = self.access_token.as_deref().ok_or("not authenticated")?;
         let resp = self
             .client
-            .post(format!("{API_BASE}{path}"))
+            .post(format!("{}{path}", self.api_base))
             .header("Authorization", format!("Bearer {token}"))
             .json(&body)
             .send()
@@ -500,20 +642,49 @@ impl StreamingService for SpotifyService {
         &mut self,
         credentials: &serde_json::Value,
     ) -> Result<AuthStatus, TuneError> {
+        // Fil 221 — sans Client ID, l'URL d'autorisation portait
+        // `client_id=placeholder` et l'echange d'un code finissait en
+        // `invalid_client` : refuser tout de suite, en disant ou le poser.
+        if !self.client_id_est_configure() {
+            return Err(format!(
+                "{CLIENT_ID_ABSENT} : enregistrez celui de votre application Spotify \
+                 (developer.spotify.com, tableau de bord) dans Reglages > Acces et jetons > \
+                 Services de streaming, ou posez TUNE_SPOTIFY_CLIENT_ID"
+            )
+            .into());
+        }
         // #2680 — `callback_url` : l'adresse de rappel collee depuis un autre
         // poste, ou le rappel `127.0.0.1` ne peut pas aboutir.
-        let code = match credentials.get("callback_url").and_then(|v| v.as_str()) {
-            Some(colle) => Some(code_depuis_rappel(colle)?),
+        let rappel = match credentials.get("callback_url").and_then(|v| v.as_str()) {
+            Some(colle) => Some(rappel_depuis_colle(colle)?),
             None => credentials
                 .get("code")
                 .and_then(|v| v.as_str())
-                .map(str::to_owned),
+                .map(|code| RappelSpotify {
+                    code: code.to_owned(),
+                    state: credentials
+                        .get("state")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned),
+                }),
         };
-        if let Some(code) = code.as_deref() {
-            let verifier = self.code_verifier.take().ok_or("no code verifier")?;
+        // Fil 221 — `GET /streaming/spotify/status`, que l'ecran sonde toutes
+        // les 3 s pendant l'attente, appelle `authenticate({"poll": true})`.
+        // Sans ce garde, chaque sondage relancait une autorisation et
+        // ECRASAIT le verificateur : le code colle ensuite ne correspondait
+        // plus (`invalid_grant code_verifier was incorrect`). Spotify n'a pas
+        // de flux a sonder : un sondage rend l'etat, rien de plus.
+        if rappel.is_none() && credentials.get("poll").is_some() {
+            return Ok(self.auth_status().await);
+        }
+        if let Some(RappelSpotify { code, state }) = rappel {
+            let code = code.as_str();
+            let indice = self.tentative_pour(state.as_deref())?;
+            let verifier = self.tentatives[indice].verifier.clone();
             let resp = self
                 .client
-                .post(TOKEN_URL)
+                .post(&self.token_url)
                 .form(&[
                     ("grant_type", "authorization_code"),
                     ("code", code),
@@ -533,12 +704,22 @@ impl StreamingService for SpotifyService {
                     .get("error_description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                // Fil 221 — un code ne sert qu'une fois, mais le verificateur
+                // reste bon pour le MEME lien d'autorisation : la tentative
+                // est gardee, rouvrir le lien donne un nouveau code.
+                let conseil = if err == "invalid_grant" {
+                    " — un code ne sert qu'une fois : rouvrez le lien d'autorisation, \
+                     puis collez la NOUVELLE adresse de retour"
+                } else {
+                    ""
+                };
                 return Err(format!(
-                    "spotify: {err} {detail} (redirect_uri envoyee : {})",
+                    "spotify: {err} {detail} (redirect_uri envoyee : {}){conseil}",
                     self.redirect_uri
                 )
                 .into());
             }
+            self.tentatives.clear();
 
             self.access_token = data["access_token"].as_str().map(Into::into);
             self.refresh_token = data["refresh_token"].as_str().map(Into::into);
@@ -556,10 +737,16 @@ impl StreamingService for SpotifyService {
         }
 
         let (verifier, challenge) = Self::generate_pkce();
-        self.code_verifier = Some(verifier);
+        let state = base64url_encode(&octets_aleatoires::<16>());
+        let url = self.auth_url(&challenge, &state);
+        self.tentatives.push(TentativePkce { state, verifier });
+        if self.tentatives.len() > TENTATIVES_MAX {
+            let trop = self.tentatives.len() - TENTATIVES_MAX;
+            self.tentatives.drain(..trop);
+        }
         Ok(AuthStatus {
             authenticated: false,
-            verification_url: Some(self.auth_url(&challenge)),
+            verification_url: Some(url),
             ..Default::default()
         })
     }
@@ -791,6 +978,7 @@ impl StreamingService for SpotifyService {
                         && !albums.iter().any(|a: &StreamAlbum| a.id == *album_id)
                     {
                         albums.push(StreamAlbum {
+                            ai_generated: None,
                             release_type: None,
                             id: album_id.clone(),
                             title: album_title.clone(),
@@ -887,7 +1075,7 @@ impl StreamingService for SpotifyService {
 
         let resp = self
             .client
-            .post(TOKEN_URL)
+            .post(&self.token_url)
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token.as_str()),
@@ -1182,6 +1370,97 @@ mod tests {
         assert!(code_depuis_rappel("").is_err());
     }
 
+    /// Fil 221 (Yan Tasset) — le Client ID colle dans le champ de l'adresse
+    /// de retour partait vers `api/token` comme un code : Spotify repondait
+    /// `invalid_client`, et l'ecran accusait l'URI de redirection.
+    #[test]
+    fn fil_221_un_client_id_colle_n_est_pas_pris_pour_un_code() {
+        let client_id = "0123456789abcdef0123456789ABCDEF";
+        let err = code_depuis_rappel(client_id).expect_err("un Client ID n'est pas un code");
+        assert!(err.contains("Client ID"), "{err}");
+        assert!(err.contains("pas l'adresse de retour"), "{err}");
+        // Entoure d'espaces, c'est toujours lui.
+        assert!(code_depuis_rappel(&format!("  {client_id} ")).is_err());
+        // Un vrai code (long, base64url) reste accepte tel quel.
+        let code = "AQB".to_owned() + &"x_-9".repeat(60);
+        assert_eq!(code_depuis_rappel(&code), Ok(code.clone()));
+        // Le meme Client ID DANS une adresse de rappel n'est pas en cause.
+        assert_eq!(
+            code_depuis_rappel(&format!("http://127.0.0.1:8888/cb?code={client_id}")),
+            Ok(client_id.to_owned())
+        );
+    }
+
+    /// Fil 221 — sans Client ID, `authenticate` rendait une URL
+    /// `client_id=placeholder` (« Ouvrir la page de connexion » menait a une
+    /// erreur Spotify) et echangeait un code voue a `invalid_client`.
+    #[tokio::test]
+    async fn fil_221_sans_client_id_authenticate_refuse_en_le_disant() {
+        for absent in ["placeholder", "", "   "] {
+            let mut svc = SpotifyService::with_config(None, None, 8888);
+            svc.set_client_id(absent);
+            assert!(!svc.client_id_est_configure());
+            let err = svc
+                .authenticate(&json!({}))
+                .await
+                .expect_err("aucune URL d'autorisation sans Client ID");
+            assert!(err.to_string().starts_with(CLIENT_ID_ABSENT), "{err}");
+            assert!(err.to_string().contains("TUNE_SPOTIFY_CLIENT_ID"), "{err}");
+            let err = svc
+                .authenticate(&json!({"callback_url": "http://127.0.0.1:8888/cb?code=abc"}))
+                .await
+                .expect_err("aucun echange de code sans Client ID");
+            assert!(err.to_string().starts_with(CLIENT_ID_ABSENT), "{err}");
+        }
+    }
+
+    /// Fil 221 — le Client ID enregistre s'applique a chaud : l'URL
+    /// d'autorisation suivante le porte, sans redemarrage.
+    #[tokio::test]
+    async fn fil_221_le_client_id_s_applique_a_chaud() {
+        let mut svc = SpotifyService::with_config(None, None, 8888);
+        svc.set_client_id("placeholder");
+        svc.set_client_id(" 0123456789abcdef0123456789abcdef ");
+        assert!(svc.client_id_est_configure());
+        let st = svc
+            .authenticate(&json!({}))
+            .await
+            .expect("URL d'autorisation");
+        let url = st.verification_url.expect("une URL");
+        assert!(
+            url.contains("client_id=0123456789abcdef0123456789abcdef"),
+            "{url}"
+        );
+        assert_eq!(svc.tentatives.len(), 1);
+        // Changer d'identifiant oublie l'echange PKCE entame avec l'ancien.
+        svc.set_client_id("fedcba9876543210fedcba9876543210");
+        assert!(svc.tentatives.is_empty());
+    }
+
+    /// Fil 221 — l'ordre : la variable d'environnement, puis le reglage en
+    /// base, puis `tune.toml`. Vide et `placeholder` comptent comme absents.
+    #[test]
+    fn fil_221_ordre_de_resolution_du_client_id() {
+        assert_eq!(
+            resolve_client_id(Some("env"), Some("base"), Some("toml")).as_deref(),
+            Some("env")
+        );
+        assert_eq!(
+            resolve_client_id(None, Some("base"), Some("toml")).as_deref(),
+            Some("base")
+        );
+        assert_eq!(
+            resolve_client_id(Some(""), Some(" base "), Some("toml")).as_deref(),
+            Some("base")
+        );
+        assert_eq!(
+            resolve_client_id(None, Some("placeholder"), Some("toml")).as_deref(),
+            Some("toml")
+        );
+        assert_eq!(resolve_client_id(None, None, Some("placeholder")), None);
+        assert_eq!(resolve_client_id(None, None, None), None);
+    }
+
     /// Le chemin `callback_url` passe bien par l'echange de code : sans
     /// verificateur PKCE (aucune autorisation lancee), il echoue sur CE motif,
     /// et non comme un simple sondage qui rendrait une nouvelle URL.
@@ -1207,7 +1486,7 @@ mod tests {
             Some("https://tune.example/api/v1/streaming/spotify/callback"),
             DEFAULT_API_PORT,
         );
-        let url = svc.auth_url("challenge-test");
+        let url = svc.auth_url("challenge-test", "etat-test");
 
         assert!(url.contains("client_id=client-test"));
         assert!(url.contains(
@@ -1537,5 +1816,233 @@ mod tests {
 
         svc.user_id = Some("user123".into());
         assert!(svc.supports_write());
+    }
+
+    // ── Fil 221 : le verificateur PKCE survit a l'attente ─────────────────
+    //
+    // Doublure locale de `accounts.spotify.com/api/token` et de `/v1/me` :
+    // aucune requete ne part vers Spotify. Comme Spotify, elle refuse un
+    // `code_verifier` dont le SHA-256 n'est pas le `code_challenge` du lien
+    // d'autorisation, et un code deja servi.
+
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Doublure {
+        /// `code` -> `code_challenge` du lien qui l'a produit.
+        codes: Arc<Mutex<Vec<(String, String)>>>,
+        servis: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn parametre(url: &str, cle: &str) -> Option<String> {
+        let requete = url.split_once('?')?.1;
+        requete.split('&').find_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            (k == cle).then(|| urlencoding::decode(v).unwrap().into_owned())
+        })
+    }
+
+    async fn jeton_double(
+        axum::extract::State(d): axum::extract::State<Doublure>,
+        corps: String,
+    ) -> axum::Json<serde_json::Value> {
+        let champ = |cle: &str| parametre(&format!("?{corps}"), cle).unwrap_or_default();
+        let (code, verifier) = (champ("code"), champ("code_verifier"));
+        let refus = |d: &str| json!({"error": "invalid_grant", "error_description": d});
+        if d.servis.lock().unwrap().contains(&code) {
+            return axum::Json(refus("Invalid authorization code"));
+        }
+        let attendu = d
+            .codes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(c, _)| *c == code)
+            .map(|(_, ch)| ch.clone());
+        let Some(attendu) = attendu else {
+            return axum::Json(refus("Invalid authorization code"));
+        };
+        d.servis.lock().unwrap().push(code);
+        if base64url_encode(&Sha256::digest(verifier.as_bytes())) != attendu {
+            return axum::Json(refus("code_verifier was incorrect"));
+        }
+        axum::Json(json!({"access_token": "a", "refresh_token": "r", "expires_in": 3600}))
+    }
+
+    async fn doublure() -> (String, Doublure) {
+        let d = Doublure::default();
+        let app = axum::Router::new()
+            .route("/api/token", axum::routing::post(jeton_double))
+            .route(
+                "/v1/me",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"display_name": "Essai", "id": "u1"}))
+                }),
+            )
+            .with_state(d.clone());
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", ecoute.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
+        (base, d)
+    }
+
+    /// Ouvre une autorisation ; rend le `state` du lien. Spotify, apres
+    /// consentement, emettra `code` pour CE lien (donc pour son challenge).
+    async fn ouvrir(svc: &mut SpotifyService, d: &Doublure, code: &str) -> String {
+        let url = svc
+            .authenticate(&json!({"device_flow": true}))
+            .await
+            .unwrap()
+            .verification_url
+            .expect("lien d'autorisation");
+        let challenge = parametre(&url, "code_challenge").expect("code_challenge");
+        d.codes.lock().unwrap().push((code.into(), challenge));
+        parametre(&url, "state").expect("le lien porte un state")
+    }
+
+    fn retour(code: &str, state: Option<&str>) -> serde_json::Value {
+        let mut url = format!("http://127.0.0.1:8888{REDIRECT_PATH}?code={code}");
+        if let Some(state) = state {
+            url.push_str(&format!("&state={state}"));
+        }
+        json!({"callback_url": url})
+    }
+
+    async fn service_double() -> (SpotifyService, Doublure) {
+        let (base, d) = doublure().await;
+        let svc =
+            SpotifyService::with_config(Some("client-essai"), None, 8888).avec_doublure(&base);
+        (svc, d)
+    }
+
+    /// Le cas du fil : l'ecran sonde `GET /status` toutes les 3 s pendant
+    /// qu'on consent sur Spotify et qu'on recopie l'adresse 127.0.0.1. Ces
+    /// sondages ne doivent pas changer le verificateur.
+    #[tokio::test]
+    async fn fil_221_les_sondages_n_ecrasent_pas_le_verificateur() {
+        for avec_state in [true, false] {
+            let (mut svc, d) = service_double().await;
+            let state = ouvrir(&mut svc, &d, "code-1").await;
+            for _ in 0..10 {
+                let st = svc.authenticate(&json!({"poll": true})).await.unwrap();
+                assert!(!st.authenticated);
+                assert!(
+                    st.verification_url.is_none(),
+                    "un sondage ne relance pas l'autorisation"
+                );
+            }
+            let st = svc
+                .authenticate(&retour("code-1", avec_state.then_some(state.as_str())))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("echange apres 30 s d'attente (state: {avec_state}) : {e}")
+                });
+            assert!(st.authenticated);
+            assert!(
+                svc.tentatives.is_empty(),
+                "un echange reussi solde les tentatives"
+            );
+        }
+    }
+
+    /// Deux clics sur « Se connecter » (ou deux onglets) : le retour du
+    /// PREMIER lien s'echange encore avec son propre verificateur.
+    #[tokio::test]
+    async fn fil_221_deux_demarrages_ne_s_ecrasent_pas() {
+        let (mut svc, d) = service_double().await;
+        let premier = ouvrir(&mut svc, &d, "code-a").await;
+        let _second = ouvrir(&mut svc, &d, "code-b").await;
+        let st = svc
+            .authenticate(&retour("code-a", Some(&premier)))
+            .await
+            .unwrap_or_else(|e| panic!("le premier lien doit aboutir : {e}"));
+        assert!(st.authenticated);
+    }
+
+    /// Le second clic sur « Valider » : le premier essai ne doit pas avoir
+    /// consomme la tentative (`no code verifier`). Le code, lui, est brule :
+    /// on le dit, et un nouveau code du meme lien aboutit.
+    #[tokio::test]
+    async fn fil_221_un_echec_ne_consomme_pas_la_tentative() {
+        let (mut svc, d) = service_double().await;
+        let state = ouvrir(&mut svc, &d, "code-1").await;
+        // Le code est servi une premiere fois ailleurs (rappel automatique,
+        // premier « Valider ») : Spotify le refuse ensuite.
+        d.servis.lock().unwrap().push("code-1".into());
+        let err = svc
+            .authenticate(&retour("code-1", Some(&state)))
+            .await
+            .expect_err("un code deja servi est refuse")
+            .to_string();
+        assert!(err.contains("Invalid authorization code"), "{err}");
+        assert!(err.contains("un code ne sert qu'une fois"), "{err}");
+        let err = svc
+            .authenticate(&retour("code-1", Some(&state)))
+            .await
+            .expect_err("toujours brule")
+            .to_string();
+        assert!(
+            !err.contains("no code verifier"),
+            "le second clic ne doit pas perdre la tentative : {err}"
+        );
+        // Rouvrir le MEME lien rend un nouveau code, pour le meme challenge.
+        let challenge = d.codes.lock().unwrap()[0].1.clone();
+        d.codes.lock().unwrap().push(("code-2".into(), challenge));
+        let st = svc
+            .authenticate(&retour("code-2", Some(&state)))
+            .await
+            .unwrap();
+        assert!(st.authenticated);
+    }
+
+    /// Une adresse d'une autre tentative (ou d'avant un redemarrage) est
+    /// reconnue et nommee, au lieu d'un `invalid_grant` opaque.
+    #[tokio::test]
+    async fn fil_221_adresse_d_une_autre_tentative() {
+        let (mut svc, d) = service_double().await;
+        let err = svc
+            .authenticate(&retour("code-x", Some("etat-inconnu")))
+            .await
+            .expect_err("aucune tentative en cours")
+            .to_string();
+        assert!(err.contains("aucune connexion en cours"), "{err}");
+        ouvrir(&mut svc, &d, "code-1").await;
+        let err = svc
+            .authenticate(&retour("code-1", Some("etat-inconnu")))
+            .await
+            .expect_err("state etranger")
+            .to_string();
+        assert!(err.contains("autre tentative"), "{err}");
+    }
+
+    #[test]
+    fn fil_221_rappel_colle_garde_le_state() {
+        assert_eq!(
+            rappel_depuis_colle("http://127.0.0.1:8888/cb?code=abc&state=xyz").unwrap(),
+            RappelSpotify {
+                code: "abc".into(),
+                state: Some("xyz".into())
+            }
+        );
+        assert_eq!(
+            rappel_depuis_colle("http://127.0.0.1:8888/cb?state=xyz&code=abc#")
+                .unwrap()
+                .code,
+            "abc"
+        );
+        assert_eq!(rappel_depuis_colle("abc").unwrap().state, None);
+    }
+
+    #[test]
+    fn fil_221_verificateur_pkce_aleatoire_et_conforme() {
+        let (v1, c1) = SpotifyService::generate_pkce();
+        let (v2, _) = SpotifyService::generate_pkce();
+        assert_ne!(v1, v2);
+        assert_eq!(v1.len(), 128);
+        assert!(
+            v1.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        );
+        assert_eq!(c1, base64url_encode(&Sha256::digest(v1.as_bytes())));
     }
 }

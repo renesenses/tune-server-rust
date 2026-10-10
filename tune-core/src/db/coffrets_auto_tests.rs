@@ -670,8 +670,9 @@ pub(crate) fn scenario_cue_deux_disques(db: &Arc<dyn DbBackend>) {
         "le coffret CUE doit figurer dans l'onglet"
     );
 
-    // RESCAN : l'écrivain CUE réécrit chaque feuille et rend le disque 2 à
-    // un album de son dossier ; la passe qui suit le scan le réunit de nouveau.
+    // RESCAN : l'écrivain CUE réécrit chaque feuille. Les tranches du disque 2
+    // restent dans le coffret (tenue du marqueur `coffret`, fil 2094), et le
+    // titre du coffret n'est pas rendu à la feuille du disque 1.
     scanner();
     passe(db).unwrap();
     let apres_rescan = albums_avec_pistes(db);
@@ -885,4 +886,893 @@ pub(crate) fn scenario_windows(db: &Arc<dyn DbBackend>) {
 #[test]
 fn chemins_windows_sur_sqlite() {
     scenario_windows(&sqlite());
+}
+
+/// `(numéro de disque, sous-titre)` des pistes d'un album, distincts, triés.
+fn sous_titres_de(db: &Arc<dyn DbBackend>, album: i64) -> Vec<(i64, Option<String>)> {
+    let (p1, _) = placeholders(db);
+    let mut v: Vec<(i64, Option<String>)> = db
+        .query_many(
+            &format!(
+                "SELECT DISTINCT COALESCE(disc_number, 1), disc_subtitle FROM tracks \
+                 WHERE album_id = {p1}"
+            ),
+            &[&album as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            (
+                r.first().and_then(|v| v.as_i64()).unwrap_or(-1),
+                r.get(1).and_then(|v| v.as_string()),
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Fil 2094 (décision de Bertrand du 05/10/2026) — réunir un coffret fait du
+/// titre d'ORIGINE de chaque disque son sous-titre de disque, sauf quand il
+/// est celui du coffret ; un nom déjà porté par un disque reste le sien ;
+/// « Défaire » retire ce que la réunion a posé, et rien d'autre.
+///
+/// Avant : la fiche affichait « Disque 1 », « Disque 2 » — les titres
+/// d'origine ne vivaient que dans le marqueur `coffret`.
+pub(crate) fn scenario_sous_titres_2094(db: &Arc<dyn DbBackend>) {
+    let _ = db.execute("DELETE FROM album_metadata", &[]);
+    let _ = db.execute("DELETE FROM album_distinct_pairs", &[]);
+    let _ = SettingsRepo::with_backend(db.clone()).delete(CLE_REFUS);
+    let bach = artiste(db, "Jean-Sébastien Bach");
+    let r = "/m/CLASSIQUE/Bach";
+    let d1 = disque(
+        db,
+        "Cantates, Disc 1",
+        bach,
+        &format!("{r}/Cantates, Disc 1"),
+        2,
+        1,
+    );
+    let d2 = disque(
+        db,
+        "Cantates, Disc 2",
+        bach,
+        &format!("{r}/Cantates, Disc 2"),
+        2,
+        2,
+    );
+    // Le disque 3 porte DÉJÀ un nom (balise DISCSUBTITLE) sur une piste.
+    let d3 = disque(
+        db,
+        "Cantates, Disc 3",
+        bach,
+        &format!("{r}/Cantates, Disc 3"),
+        2,
+        3,
+    );
+    let (p1, p2) = placeholders(db);
+    db.execute(
+        &format!(
+            "UPDATE tracks SET disc_subtitle = {p1} WHERE id = \
+             (SELECT MIN(id) FROM tracks WHERE album_id = {p2})"
+        ),
+        &[&"BWV 140" as &dyn ToSqlValue, &d3],
+    )
+    .unwrap();
+    assert_eq!(sous_titres_de(db, d1), vec![(1, None)], "avant : aucun nom");
+
+    let rapport = passe(db).unwrap();
+    assert_eq!(rapport.reunis, 1, "{rapport:?}");
+    assert_eq!(titre(db, d1), "Cantates");
+    assert!(!existe(db, d2) && !existe(db, d3));
+    assert_eq!(
+        sous_titres_de(db, d1),
+        vec![
+            (1, Some("Cantates, Disc 1".into())),
+            (2, Some("Cantates, Disc 2".into())),
+            (3, None),
+            (3, Some("BWV 140".into())),
+        ],
+        "chaque disque prend son titre d'origine ; le disque 3 garde le sien, entier"
+    );
+    let m = marqueurs(db).unwrap();
+    assert_eq!(m[&d1].sous_titres, vec![1, 2]);
+
+    // DÉFAIRE : les sous-titres posés partent, le nom du disque 3 reste.
+    let recrees = defaire(db, d1).unwrap();
+    assert_eq!(sous_titres_de(db, d1), vec![(1, None)]);
+    let mut restes: Vec<(i64, Option<String>)> = recrees
+        .iter()
+        .flat_map(|id| sous_titres_de(db, *id))
+        .collect();
+    restes.sort();
+    assert_eq!(
+        restes,
+        vec![(2, None), (3, None), (3, Some("BWV 140".into()))],
+        "rien de ce que la réunion avait posé ne reste"
+    );
+
+    // TÉMOIN — des disques au titre IDENTIQUE à celui du coffret : aucun
+    // sous-titre (27 « Arkhangelsk »). Composés à la main faute de marqueur
+    // chiffré dans le titre : la fonction est appelée comme la route le fait.
+    let ark = artiste(db, "Arkhangelsk");
+    let a1 = disque(db, "Arkhangelsk", ark, "/m/Arkhangelsk/CD01", 1, 1);
+    let a2 = disque(db, "Arkhangelsk", ark, "/m/Arkhangelsk/CD02", 1, 1);
+    let (p1, p2) = placeholders(db);
+    db.execute(
+        &format!("UPDATE tracks SET disc_number = 2 WHERE album_id = {p1}"),
+        &[&a2 as &dyn ToSqlValue],
+    )
+    .unwrap();
+    db.execute(
+        &format!("UPDATE tracks SET album_id = {p1} WHERE album_id = {p2}"),
+        &[&a1 as &dyn ToSqlValue, &a2],
+    )
+    .unwrap();
+    let retenus = |n, d: &str| DisqueRetenu {
+        n,
+        titre: "Arkhangelsk".into(),
+        dossier: d.into(),
+        artiste_id: Some(ark),
+    };
+    let poses = poser_les_sous_titres(
+        db,
+        a1,
+        &[
+            retenus(1, "/m/Arkhangelsk/CD01"),
+            retenus(2, "/m/Arkhangelsk/CD02"),
+        ],
+        "ARKHANGELSK ",
+    )
+    .unwrap();
+    assert!(
+        poses.is_empty(),
+        "titre identique (casse, espaces) : {poses:?}"
+    );
+    assert_eq!(sous_titres_de(db, a1), vec![(1, None), (2, None)]);
+}
+
+#[test]
+fn sous_titres_2094_sur_sqlite() {
+    scenario_sous_titres_2094(&sqlite());
+}
+
+/// Un coffret composé À LA MAIN, comme le fait `POST /library/albums/coffret`
+/// AVANT le fil 2094 : disques renumérotés dans l'ordre, absorbés dans le
+/// premier, titre posé, marqueur `manuel` qui retient les disques, et
+/// disposition tenue — mais AUCUN sous-titre.
+fn coffret_manuel_d_avant_2094(
+    db: &Arc<dyn DbBackend>,
+    titre_du_coffret: &str,
+    ids: &[i64],
+    disques: Vec<DisqueRetenu>,
+) {
+    let (p1, p2) = placeholders(db);
+    for (rang, id) in ids.iter().enumerate() {
+        db.execute(
+            &format!("UPDATE tracks SET disc_number = {p1} WHERE album_id = {p2}"),
+            &[&((rang + 1) as i64) as &dyn ToSqlValue, id],
+        )
+        .unwrap();
+    }
+    let repo = AlbumRepo::with_backend(db.clone());
+    for &id in &ids[1..] {
+        repo.absorber(ids[0], id).unwrap();
+    }
+    repo.force_update_title(ids[0], titre_du_coffret).unwrap();
+    let m = Marqueur {
+        disques,
+        titre_compose: Some(titre_du_coffret.to_string()),
+        ..Marqueur::manuel()
+    };
+    AlbumMetadataRepo::with_backend(db.clone())
+        .set(ids[0], CLE_COFFRET, &serde_json::to_string(&m).unwrap())
+        .unwrap();
+    crate::db::edition_album::tenir_la_disposition(db, ids[0], &[]).unwrap();
+}
+
+fn retenu(n: u32, titre: &str, dossier: &str) -> DisqueRetenu {
+    DisqueRetenu {
+        n,
+        titre: titre.into(),
+        dossier: dossier.into(),
+        artiste_id: None,
+    }
+}
+
+/// Fil 2094 — le RATTRAPAGE des coffrets composés avant que la composition
+/// pose les sous-titres : même règle (pas le titre du coffret, jamais sur un
+/// nom existant), marqueur mis à jour pour que « Défaire » reste exact,
+/// disposition tenue retenue à nouveau, une seule fois.
+pub(crate) fn scenario_rattrapage_sous_titres_2094(db: &Arc<dyn DbBackend>) {
+    let _ = db.execute("DELETE FROM album_metadata", &[]);
+    let _ = db.execute("DELETE FROM album_distinct_pairs", &[]);
+    let reglages = SettingsRepo::with_backend(db.clone());
+    let _ = reglages.delete(CLE_REFUS);
+    let _ = reglages.delete(CLE_RATTRAPAGE_SOUS_TITRES_2094);
+    let meta = AlbumMetadataRepo::with_backend(db.clone());
+    let (p1, p2) = placeholders(db);
+
+    // A. Un coffret AUTOMATIQUE réuni avant le fil 2094. Le disque 3 porte
+    //    déjà un nom (balise DISCSUBTITLE) sur une piste.
+    let bach = artiste(db, "Jean-Sébastien Bach");
+    let r = "/m/CLASSIQUE/Oratorio";
+    let d1 = disque(
+        db,
+        "Oratorio, Disc 1",
+        bach,
+        &format!("{r}/Oratorio, Disc 1"),
+        2,
+        1,
+    );
+    disque(
+        db,
+        "Oratorio, Disc 2",
+        bach,
+        &format!("{r}/Oratorio, Disc 2"),
+        2,
+        2,
+    );
+    let d3 = disque(
+        db,
+        "Oratorio, Disc 3",
+        bach,
+        &format!("{r}/Oratorio, Disc 3"),
+        2,
+        3,
+    );
+    db.execute(
+        &format!(
+            "UPDATE tracks SET disc_subtitle = {p1} WHERE id = \
+             (SELECT MIN(id) FROM tracks WHERE album_id = {p2})"
+        ),
+        &[&"BWV 248" as &dyn ToSqlValue, &d3],
+    )
+    .unwrap();
+    assert_eq!(passe(db).unwrap().reunis, 1);
+    // Revenir à l'état d'une base d'avant 2094 : ni sous-titre posé par la
+    // réunion, ni `sous_titres` dans le marqueur.
+    let mut avant = marqueurs(db).unwrap()[&d1].clone();
+    retirer_les_sous_titres(db, &[d1], &avant).unwrap();
+    avant.sous_titres.clear();
+    meta.set(d1, CLE_COFFRET, &serde_json::to_string(&avant).unwrap())
+        .unwrap();
+    assert_eq!(
+        sous_titres_de(db, d1),
+        vec![(1, None), (2, None), (3, None), (3, Some("BWV 248".into()))],
+        "base d'avant 2094"
+    );
+
+    // B. Un coffret MANUEL, disposition tenue. Son disque 3 a quitté le
+    //    dossier que le marqueur retient : il est laissé.
+    let x = artiste(db, "Xenakis");
+    let m1 = disque(db, "101 - Disc A", x, "/m/Manuel/101 A", 2, 1);
+    let m2 = disque(db, "101 - Disc B", x, "/m/Manuel/101 B", 2, 1);
+    let m3 = disque(db, "101 - Disc C", x, "/m/Ailleurs", 1, 1);
+    coffret_manuel_d_avant_2094(
+        db,
+        "101",
+        &[m1, m2, m3],
+        vec![
+            retenu(1, "101 - Disc A", "/m/Manuel/101 A"),
+            retenu(2, "101 - Disc B", "/m/Manuel/101 B"),
+            retenu(3, "101 - Disc C", "/m/Manuel/101 C"),
+        ],
+    );
+
+    // C. Un coffret manuel SANS disques retenus (avant #5319, ou « attacher ») :
+    //    les titres d'origine sont perdus.
+    let y = artiste(db, "Yes");
+    let s1 = disque(db, "Relayer", y, "/m/Yes/Relayer", 1, 1);
+    let s2 = disque(db, "Fragile", y, "/m/Yes/Fragile", 1, 1);
+    coffret_manuel_d_avant_2094(db, "Yes Box", &[s1, s2], vec![]);
+
+    // D. TÉMOIN — des disques au titre identique à celui du coffret.
+    let ark = artiste(db, "Arkhangelsk");
+    let a1 = disque(db, "Arkhangelsk", ark, "/m/Arkhangelsk/CD01", 1, 1);
+    let a2 = disque(db, "Arkhangelsk", ark, "/m/Arkhangelsk/CD02", 1, 1);
+    coffret_manuel_d_avant_2094(
+        db,
+        "Arkhangelsk",
+        &[a1, a2],
+        vec![
+            retenu(1, "ARKHANGELSK ", "/m/Arkhangelsk/CD01"),
+            retenu(2, "Arkhangelsk", "/m/Arkhangelsk/CD02"),
+        ],
+    );
+
+    let rapport = rattraper_les_sous_titres(db).unwrap();
+    assert_eq!(
+        rapport,
+        RattrapageSousTitres {
+            deja_fait: false,
+            coffrets: 4,
+            coffrets_rattrapes: 2,
+            disques_sous_titres: 4,
+            titres_inconnus: 1,
+            disques_sous_titres_par_balise: 0,
+            // Le coffret « Yes Box » : ses fichiers n'existent pas.
+            fichiers_illisibles: 2,
+            disques_deplaces: 1,
+            echecs: 0,
+        }
+    );
+    assert_eq!(
+        sous_titres_de(db, d1),
+        vec![
+            (1, Some("Oratorio, Disc 1".into())),
+            (2, Some("Oratorio, Disc 2".into())),
+            (3, None),
+            (3, Some("BWV 248".into())),
+        ],
+        "coffret auto : chaque disque prend son titre d'origine, le disque 3 garde le sien"
+    );
+    assert_eq!(
+        sous_titres_de(db, m1),
+        vec![
+            (1, Some("101 - Disc A".into())),
+            (2, Some("101 - Disc B".into())),
+            (3, None),
+        ],
+        "coffret manuel : le disque 3, déplacé, est laissé"
+    );
+    assert_eq!(sous_titres_de(db, s1), vec![(1, None), (2, None)]);
+    assert_eq!(sous_titres_de(db, a1), vec![(1, None), (2, None)]);
+    let m = marqueurs(db).unwrap();
+    assert_eq!(m[&d1].sous_titres, vec![1, 2]);
+    assert_eq!(m[&m1].sous_titres, vec![1, 2]);
+    assert_eq!(
+        m[&m1].titre_compose.as_deref(),
+        Some("101"),
+        "le reste du marqueur est gardé"
+    );
+    assert!(m[&s1].sous_titres.is_empty() && m[&a1].sous_titres.is_empty());
+    // La disposition tenue du coffret manuel retient le nouveau nom : une
+    // relecture des fichiers ne l'effacera pas.
+    let tenue = &crate::db::edition_album::editions_tenues(db, &[m1]).unwrap()[0];
+    assert!(tenue.disposition);
+    let noms: BTreeSet<(i32, Option<String>)> = tenue
+        .pistes
+        .iter()
+        .map(|p| (p.disque, p.nom_disque.clone()))
+        .collect();
+    assert_eq!(
+        noms,
+        BTreeSet::from([
+            (1, Some("101 - Disc A".to_string())),
+            (2, Some("101 - Disc B".to_string())),
+            (3, None),
+        ])
+    );
+    assert!(
+        reglages
+            .get(CLE_RATTRAPAGE_SOUS_TITRES_2094)
+            .unwrap()
+            .is_some()
+    );
+
+    // UNE SEULE FOIS : un nom retiré par l'utilisateur depuis ne revient pas.
+    db.execute(
+        &format!(
+            "UPDATE tracks SET disc_subtitle = NULL WHERE album_id = {p1} \
+             AND COALESCE(disc_number, 1) = {p2}"
+        ),
+        &[&d1 as &dyn ToSqlValue, &1i64],
+    )
+    .unwrap();
+    assert_eq!(
+        rattraper_les_sous_titres(db).unwrap(),
+        RattrapageSousTitres {
+            deja_fait: true,
+            ..Default::default()
+        }
+    );
+    assert_eq!(sous_titres_de(db, d1)[0], (1, None));
+
+    // DÉFAIRE reste exact : ce que le rattrapage a posé part, le reste reste.
+    let recrees = defaire(db, d1).unwrap();
+    let mut restes: Vec<(i64, Option<String>)> = std::iter::once(d1)
+        .chain(recrees.iter().copied())
+        .flat_map(|id| sous_titres_de(db, id))
+        .collect();
+    restes.sort();
+    restes.dedup();
+    assert_eq!(
+        restes,
+        vec![(1, None), (2, None), (3, None), (3, Some("BWV 248".into()))]
+    );
+    let recrees = crate::db::edition_album::defaire_coffret_manuel(db, m1).unwrap();
+    let restes: BTreeSet<Option<String>> = std::iter::once(m1)
+        .chain(recrees.iter().copied())
+        .flat_map(|id| sous_titres_de(db, id))
+        .map(|(_, s)| s)
+        .collect();
+    assert_eq!(restes, BTreeSet::from([None]), "coffret manuel défait");
+}
+
+#[test]
+fn rattrapage_sous_titres_2094_sur_sqlite() {
+    scenario_rattrapage_sous_titres_2094(&sqlite());
+}
+
+/// Fil 2094 — un coffret automatique réuni auquel s'ajoute un disque arrivé
+/// plus tard : le marqueur garde les sous-titres de la première réunion, et
+/// « Défaire » les retire tous.
+pub(crate) fn scenario_disque_tardif_2094(db: &Arc<dyn DbBackend>) {
+    let _ = db.execute("DELETE FROM album_metadata", &[]);
+    let _ = db.execute("DELETE FROM album_distinct_pairs", &[]);
+    let _ = SettingsRepo::with_backend(db.clone()).delete(CLE_REFUS);
+    let h = artiste(db, "Haendel");
+    let r = "/m/CLASSIQUE/Messiah";
+    let d1 = disque(
+        db,
+        "Messiah, Disc 1",
+        h,
+        &format!("{r}/Messiah, Disc 1"),
+        2,
+        1,
+    );
+    disque(
+        db,
+        "Messiah, Disc 2",
+        h,
+        &format!("{r}/Messiah, Disc 2"),
+        2,
+        2,
+    );
+    assert_eq!(passe(db).unwrap().reunis, 1);
+    assert_eq!(marqueurs(db).unwrap()[&d1].sous_titres, vec![1, 2]);
+
+    disque(
+        db,
+        "Messiah, Disc 3",
+        h,
+        &format!("{r}/Messiah, Disc 3"),
+        2,
+        3,
+    );
+    let rapport = passe(db).unwrap();
+    assert_eq!(
+        rapport.reunis, 1,
+        "le disque 3 rejoint le coffret : {rapport:?}"
+    );
+    assert_eq!(
+        sous_titres_de(db, d1),
+        vec![
+            (1, Some("Messiah, Disc 1".into())),
+            (2, Some("Messiah, Disc 2".into())),
+            (3, Some("Messiah, Disc 3".into())),
+        ]
+    );
+    assert_eq!(
+        marqueurs(db).unwrap()[&d1].sous_titres,
+        vec![1, 2, 3],
+        "les sous-titres de la première réunion restent au marqueur"
+    );
+    let recrees = defaire(db, d1).unwrap();
+    let restes: BTreeSet<Option<String>> = std::iter::once(d1)
+        .chain(recrees.iter().copied())
+        .flat_map(|id| sous_titres_de(db, id))
+        .map(|(_, s)| s)
+        .collect();
+    assert_eq!(restes, BTreeSet::from([None]));
+}
+
+#[test]
+fn disque_tardif_2094_sur_sqlite() {
+    scenario_disque_tardif_2094(&sqlite());
+}
+
+/// Une copie d'un vrai fichier du dépôt (`tests/fixtures/<gabarit>`), sa
+/// balise ALBUM posée à `album`.
+fn fichier_tague(dossier: &std::path::Path, nom: &str, gabarit: &str, album: &str) -> String {
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::tag::{Accessor, Tag};
+    std::fs::create_dir_all(dossier).unwrap();
+    let chemin = dossier.join(nom);
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(gabarit),
+        &chemin,
+    )
+    .unwrap();
+    let mut f = lofty::read_from_path(&chemin).unwrap();
+    if f.primary_tag().is_none() {
+        let genre = f.primary_tag_type();
+        f.insert_tag(Tag::new(genre));
+    }
+    f.primary_tag_mut().unwrap().set_album(album.to_string());
+    f.save_to_path(&chemin, WriteOptions::default()).unwrap();
+    chemin.to_string_lossy().into_owned()
+}
+
+/// #5644 — pose la balise DISCSUBTITLE (le NOM du disque) sur un fichier.
+fn baliser_nom_de_disque(chemin: &str, nom: &str) {
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::tag::ItemKey;
+    let mut f = lofty::read_from_path(chemin).unwrap();
+    f.primary_tag_mut()
+        .unwrap()
+        .insert_text(ItemKey::SetSubtitle, nom.to_string());
+    f.save_to_path(chemin, WriteOptions::default()).unwrap();
+}
+
+/// Fil 2094 (décision de Bertrand du 05/10/2026) — un coffret dont le
+/// marqueur ne retient AUCUN titre d'origine : le rattrapage relit la balise
+/// ALBUM de la PREMIÈRE piste de chaque disque, sur de vrais FLAC et MP3, et
+/// applique la même règle. Le marqueur est complété : « Défaire » retire ce
+/// qui a été posé.
+pub(crate) fn scenario_rattrapage_par_les_balises_2094(db: &Arc<dyn DbBackend>) {
+    let _ = db.execute("DELETE FROM album_metadata", &[]);
+    let _ = db.execute("DELETE FROM album_distinct_pairs", &[]);
+    let reglages = SettingsRepo::with_backend(db.clone());
+    let _ = reglages.delete(CLE_REFUS);
+    let _ = reglages.delete(CLE_RATTRAPAGE_SOUS_TITRES_2094);
+    let racine = tempfile::tempdir().unwrap();
+    let r = racine.path();
+    let y = artiste(db, "Yes");
+    let un_disque = |titre: &str, dossier: &std::path::Path, pistes: &[(i32, String)]| {
+        let id = album(db, titre, y, &dossier.to_string_lossy());
+        for (n, chemin) in pistes {
+            piste(db, id, y, *n, 1, chemin);
+        }
+        id
+    };
+    // Disque 1 (FLAC) : la piste 2 est ENREGISTRÉE avant la piste 1, avec
+    // une autre balise — c'est la PREMIÈRE piste qui fait foi.
+    let dossier1 = r.join("Yes Box/CD1");
+    let p2 = fichier_tague(&dossier1, "02.flac", "test.flac", "Relayer (bonus)");
+    let p1 = fichier_tague(&dossier1, "01.flac", "test.flac", "Relayer");
+    let b1 = un_disque("Yes Box", &dossier1, &[(2, p2), (1, p1)]);
+    // Disque 2 (MP3, ID3v2).
+    let dossier2 = r.join("Yes Box/CD2");
+    let b2 = un_disque(
+        "Fragile",
+        &dossier2,
+        &[(1, fichier_tague(&dossier2, "01.mp3", "test.mp3", "Fragile"))],
+    );
+    // Disque 3 : balise identique au titre du coffret — rien.
+    let dossier3 = r.join("Yes Box/CD3");
+    let b3 = un_disque(
+        "Yes Box",
+        &dossier3,
+        &[(
+            1,
+            fichier_tague(&dossier3, "01.flac", "test.flac", "YES box"),
+        )],
+    );
+    // Disque 4 : fichier ABSENT (partage démonté) — laissé, compté.
+    let dossier4 = r.join("Yes Box/CD4");
+    let b4 = un_disque(
+        "Yes Box",
+        &dossier4,
+        &[(1, dossier4.join("01.flac").to_string_lossy().into_owned())],
+    );
+    // Disque 5 : porte DÉJÀ un nom — jamais remplacé.
+    let dossier5 = r.join("Yes Box/CD5");
+    // #5644 — le nom vient de sa balise DISCSUBTITLE : le défaire le garde.
+    let f5 = fichier_tague(&dossier5, "01.flac", "test.flac", "90125");
+    baliser_nom_de_disque(&f5, "Bonus");
+    let b5 = un_disque("Yes Box", &dossier5, &[(1, f5)]);
+    let (p1, p2) = placeholders(db);
+    db.execute(
+        &format!("UPDATE tracks SET disc_subtitle = {p1} WHERE album_id = {p2}"),
+        &[&"Bonus" as &dyn ToSqlValue, &b5],
+    )
+    .unwrap();
+    coffret_manuel_d_avant_2094(db, "Yes Box", &[b1, b2, b3, b4, b5], vec![]);
+    // Le marqueur d'un coffret d'avant #5319 : ni disques, ni titre composé.
+    AlbumMetadataRepo::with_backend(db.clone())
+        .set(
+            b1,
+            CLE_COFFRET,
+            &serde_json::to_string(&Marqueur::manuel()).unwrap(),
+        )
+        .unwrap();
+
+    let rapport = rattraper_les_sous_titres(db).unwrap();
+    assert_eq!(
+        rapport,
+        RattrapageSousTitres {
+            deja_fait: false,
+            coffrets: 1,
+            coffrets_rattrapes: 1,
+            disques_sous_titres: 2,
+            titres_inconnus: 0,
+            disques_sous_titres_par_balise: 2,
+            fichiers_illisibles: 1,
+            disques_deplaces: 0,
+            echecs: 0,
+        }
+    );
+    assert_eq!(
+        sous_titres_de(db, b1),
+        vec![
+            (1, Some("Relayer".into())),
+            (2, Some("Fragile".into())),
+            (3, None),
+            (4, None),
+            (5, Some("Bonus".into())),
+        ],
+        "balise de la première piste ; titre du coffret, fichier absent et nom existant laissés"
+    );
+    let m = marqueurs(db).unwrap();
+    assert_eq!(m[&b1].sous_titres, vec![1, 2]);
+    assert_eq!(
+        m[&b1]
+            .disques
+            .iter()
+            .map(|d| (d.n, d.titre.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "Relayer"), (2, "Fragile")],
+        "les titres relus rejoignent le marqueur"
+    );
+    let tenue = &crate::db::edition_album::editions_tenues(db, &[b1]).unwrap()[0];
+    assert!(
+        tenue
+            .pistes
+            .iter()
+            .filter(|p| p.disque == 2)
+            .all(|p| p.nom_disque.as_deref() == Some("Fragile")),
+        "la disposition tenue retient le nom relu"
+    );
+
+    // DÉFAIRE : ce qui a été posé part, « Bonus » reste.
+    let recrees = crate::db::edition_album::defaire_coffret_manuel(db, b1).unwrap();
+    let restes: BTreeSet<Option<String>> = std::iter::once(b1)
+        .chain(recrees.iter().copied())
+        .flat_map(|id| sous_titres_de(db, id))
+        .map(|(_, s)| s)
+        .collect();
+    assert_eq!(restes, BTreeSet::from([None, Some("Bonus".to_string())]));
+}
+
+#[test]
+fn rattrapage_par_les_balises_2094_sur_sqlite() {
+    scenario_rattrapage_par_les_balises_2094(&sqlite());
+}
+
+/// #5644 (Marco Polo, fil 2009) — DÉFAIRE un coffret composé à la main ne
+/// laisse pas sur l'album séparé le NOM donné au disque dans le coffret.
+/// Chaque piste reprend le nom de sa balise DISCSUBTITLE, ou aucun.
+pub(crate) fn scenario_defaire_rend_le_nom_de_la_balise_5644(db: &Arc<dyn DbBackend>) {
+    let _ = db.execute("DELETE FROM album_metadata", &[]);
+    let _ = db.execute("DELETE FROM album_distinct_pairs", &[]);
+    let _ = SettingsRepo::with_backend(db.clone()).delete(CLE_REFUS);
+    let racine = tempfile::tempdir().unwrap();
+    let r = racine.path();
+    let a = artiste(db, "Marco Polo");
+    let un_disque = |titre: &str, dossier: &std::path::Path, chemin: String| {
+        let id = album(db, titre, a, &dossier.to_string_lossy());
+        piste(db, id, a, 1, 1, &chemin);
+        id
+    };
+    let d1 = r.join("Box/CD1");
+    let b1 = un_disque(
+        "Premier",
+        &d1,
+        fichier_tague(&d1, "01.flac", "test.flac", "Premier"),
+    );
+    let d2 = r.join("Box/CD2");
+    let b2 = un_disque(
+        "Second",
+        &d2,
+        fichier_tague(&d2, "01.flac", "test.flac", "Second"),
+    );
+    let d3 = r.join("Box/CD3");
+    let f3 = fichier_tague(&d3, "01.flac", "test.flac", "Troisieme");
+    baliser_nom_de_disque(&f3, "Live");
+    let b3 = un_disque("Troisieme", &d3, f3);
+    coffret_manuel_d_avant_2094(db, "Box", &[b1, b2, b3], vec![]);
+    // Renommage des disques dans le coffret, comme l'écrit l'édition.
+    let (p1, p2) = placeholders(db);
+    for (nom, n) in [("Disque A", 1i64), ("Disque B", 2), ("Disque C", 3)] {
+        db.execute(
+            &format!(
+                "UPDATE tracks SET disc_subtitle = {p1} WHERE album_id = {p2} AND disc_number = {n}"
+            ),
+            &[&nom as &dyn ToSqlValue, &b1],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        sous_titres_de(db, b1),
+        vec![
+            (1, Some("Disque A".into())),
+            (2, Some("Disque B".into())),
+            (3, Some("Disque C".into())),
+        ]
+    );
+
+    let recrees = crate::db::edition_album::defaire_coffret_manuel(db, b1).unwrap();
+    assert_eq!(recrees.len(), 2);
+    let mut noms: Vec<Option<String>> = std::iter::once(b1)
+        .chain(recrees.iter().copied())
+        .flat_map(|id| sous_titres_de(db, id))
+        .map(|(_, s)| s)
+        .collect();
+    noms.sort();
+    assert_eq!(
+        noms,
+        vec![None, None, Some("Live".to_string())],
+        "#5644 : le nom donné dans le coffret ne reste pas sur les albums séparés ; \
+         seule la balise DISCSUBTITLE (« Live ») est rendue"
+    );
+}
+
+#[test]
+fn defaire_rend_le_nom_de_la_balise_5644_sur_sqlite() {
+    scenario_defaire_rend_le_nom_de_la_balise_5644(&sqlite());
+}
+
+/// Fil 2094, suite de #5812 — la RELECTURE des fichiers d'un coffret
+/// automatique (scan forcé, surveillant, « Relire les balises ») reconstruit
+/// chaque ligne piste depuis ses balises : chaque disque au disque 1, sans
+/// nom, dans l'album de son dossier. Les tenues ([`Tenues`]) rendent à chaque
+/// piste ce que la réunion a composé, d'après le marqueur `coffret` — et plus
+/// rien une fois le coffret DÉFAIT.
+///
+/// La relecture est jouée comme la jouent le scan et la route de relecture :
+/// une ligne refaite depuis les balises, puis `Tenues::appliquer`.
+pub(crate) fn scenario_relecture_coffret_auto_2094(db: &Arc<dyn DbBackend>) {
+    use super::super::edition_album::{CLE_EDITION_PISTES, EditionPistes, PisteTenue, Tenues};
+    let _ = db.execute("DELETE FROM album_metadata", &[]);
+    let _ = db.execute("DELETE FROM album_distinct_pairs", &[]);
+    let _ = SettingsRepo::with_backend(db.clone()).delete(CLE_REFUS);
+    let g = artiste(db, "Laurent Garnier");
+    let r = "/m/ELECTRO/Laurent Garnier - Early Works";
+    // Le numéro n'est QUE dans le titre d'album : les balises disent disque 1
+    // partout, les dossiers ne disent rien.
+    let d1 = disque(
+        db,
+        "Early Works, Disc 1",
+        g,
+        &format!("{r}/Premiere partie"),
+        2,
+        1,
+    );
+    disque(
+        db,
+        "Early Works, Disc 2",
+        g,
+        &format!("{r}/Seconde partie"),
+        2,
+        1,
+    );
+    // Le disque 3 porte son nom dans ses balises (DISCSUBTITLE).
+    let d3 = disque(
+        db,
+        "Early Works, Disc 3",
+        g,
+        &format!("{r}/Troisieme partie"),
+        2,
+        1,
+    );
+    let (p1, p2) = placeholders(db);
+    db.execute(
+        &format!("UPDATE tracks SET disc_subtitle = {p1} WHERE album_id = {p2}"),
+        &[&"Les remixes" as &dyn ToSqlValue, &d3],
+    )
+    .unwrap();
+    assert_eq!(passe(db).unwrap().reunis, 1);
+    let attendu = vec![
+        (1, Some("Early Works, Disc 1".to_string())),
+        (2, Some("Early Works, Disc 2".to_string())),
+        (3, Some("Les remixes".to_string())),
+    ];
+    assert_eq!(sous_titres_de(db, d1), attendu, "montage");
+    assert_eq!(marqueurs(db).unwrap()[&d1].sous_titres, vec![1, 2]);
+
+    // Une piste RENOMMÉE à la main (tenue sans disposition) : son titre est
+    // tenu, son disque l'est par le coffret.
+    let pistes = TrackRepo::with_backend(db.clone());
+    let premiere = pistes
+        .list_by_album(d1)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.file_path.as_deref() == Some(&format!("{r}/Seconde partie/01.flac")))
+        .expect("la piste 1 du disque 2");
+    let renommage = EditionPistes {
+        disposition: false,
+        pistes: vec![PisteTenue {
+            id: premiere.id.unwrap(),
+            chemin: premiere.file_path.clone(),
+            disque: 2,
+            numero: 1,
+            titre: Some("Renommée à la main".into()),
+            ..Default::default()
+        }],
+    };
+    AlbumMetadataRepo::with_backend(db.clone())
+        .set(
+            d1,
+            CLE_EDITION_PISTES,
+            &serde_json::to_string(&renommage).unwrap(),
+        )
+        .unwrap();
+
+    // La relecture : chaque ligne refaite depuis ses balises.
+    let relire = |t: &Track| {
+        let mut relue = t.clone();
+        relue.album_id = None;
+        relue.disc_number = 1;
+        relue.title = format!("piste {}", t.track_number);
+        relue.disc_subtitle = t
+            .file_path
+            .as_deref()
+            .filter(|c| c.contains("/Troisieme partie/"))
+            .map(|_| "Les remixes".to_string());
+        relue
+    };
+    let tenues = Tenues::charger(db);
+    let mut relues = Vec::new();
+    for t in pistes.list_by_album(d1).unwrap() {
+        let mut relue = relire(&t);
+        assert!(tenues.appliquer(&mut relue), "{:?} : tenue", t.file_path);
+        assert_eq!(
+            (
+                relue.album_id,
+                relue.disc_number,
+                relue.disc_subtitle.clone()
+            ),
+            (Some(d1), t.disc_number, t.disc_subtitle.clone()),
+            "{:?} : la relecture rend la piste à son coffret, son disque, son nom",
+            t.file_path
+        );
+        relues.push(relue);
+    }
+    assert_eq!(relues.len(), 6);
+    let renommee = relues.iter().find(|t| t.id == premiere.id).unwrap();
+    assert_eq!(
+        renommee.title, "Renommée à la main",
+        "le renommage reste tenu"
+    );
+    // La relecture ÉCRITE : rien n'a bougé.
+    for t in &relues {
+        pistes.update(t).unwrap();
+    }
+    assert_eq!(sous_titres_de(db, d1), attendu, "après la relecture écrite");
+
+    // DÉFAIRE : le marqueur part, la tenue avec lui. La relecture suivante
+    // rend à chaque piste ce que disent ses balises.
+    let recrees = defaire(db, d1).unwrap();
+    assert_eq!(recrees.len(), 2);
+    let tenues = Tenues::charger(db);
+    for id in std::iter::once(d1).chain(recrees.iter().copied()) {
+        for t in pistes.list_by_album(id).unwrap() {
+            let mut relue = relire(&t);
+            let tenue = tenues.appliquer(&mut relue);
+            assert_eq!(
+                tenue,
+                t.id == premiere.id,
+                "{:?} : seul le renommage reste tenu",
+                t.file_path
+            );
+            assert_eq!(
+                (relue.disc_number, relue.disc_subtitle.as_deref()),
+                (
+                    1,
+                    t.file_path
+                        .as_deref()
+                        .filter(|c| c.contains("/Troisieme partie/"))
+                        .map(|_| "Les remixes")
+                ),
+                "{:?} : plus aucun disque de coffret",
+                t.file_path
+            );
+            assert_eq!(
+                relue.album_id, None,
+                "{:?} : la piste n'est ramenée à aucun album, ni au coffret défait",
+                t.file_path
+            );
+        }
+    }
+}
+
+#[test]
+fn relecture_coffret_auto_2094_sur_sqlite() {
+    scenario_relecture_coffret_auto_2094(&sqlite());
 }

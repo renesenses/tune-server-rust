@@ -202,6 +202,25 @@ pub(super) fn annoter_l_ombre_du_crossfeed(
     }
 }
 
+/// L'étape « Crossfeed » (`code: "crossfeed"`) prend le nom du greffon natif
+/// tiers de la famille du crossfeed quand c'est lui qui traite (`greffon`) :
+/// le crossfeed intégré est alors éteint, l'appeler « Crossfeed » désignerait
+/// l'autre. Le `code` reste `crossfeed` pour les clients qui le lisent ;
+/// `plugin` porte l'identifiant du greffon. Sans greffon, rien ne change.
+pub(super) fn nommer_le_crossfeed_du_greffon(steps: &mut [Value], greffon: Option<&str>) {
+    let Some(id) = greffon else {
+        return;
+    };
+    let nom = tune_core::audio::natifs_tiers::nom_affichable(id);
+    for etape in steps.iter_mut().filter(|e| e["code"] == "crossfeed") {
+        etape["name"] = json!(nom);
+        etape["description"] = json!(format!(
+            "{nom} dans le flux (greffon, voies gauche et droite croisées)"
+        ));
+        etape["plugin"] = json!(id);
+    }
+}
+
 /// #5171 — la réserve de l'égaliseur de la zone, pour l'écran : le mode, le
 /// pré-gain réellement appliqué par canal (au débit de référence) et, en mode
 /// réaliste, le compteur du limiteur. `None` quand l'égaliseur ne modifie pas
@@ -265,15 +284,24 @@ pub(super) fn zone_replaygain_step(
     zone_id: i64,
     track_id: Option<i64>,
 ) -> Option<ReplayGainStep> {
-    use tune_core::audio::replaygain::{
-        GainSource, ReplayGainSettings, RetenueAntiEcretage, gain_factor_with_peak,
-        stored_gain_source, stored_gain_with_peak,
-    };
     // PURE : le PCM atteint la sortie intact, le gain n'est jamais appliqué.
     if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
         return None;
     }
-    let tid = track_id?;
+    replaygain_step_hors_pure(backend, track_id?)
+}
+
+/// L'étape ReplayGain telle qu'elle serait HORS PURE — le corps de
+/// [`zone_replaygain_step`], sans la garde PURE. #5633 la relit sous PURE pour
+/// dire ce que PURE laisse de côté.
+fn replaygain_step_hors_pure(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    tid: i64,
+) -> Option<ReplayGainStep> {
+    use tune_core::audio::replaygain::{
+        GainSource, ReplayGainSettings, RetenueAntiEcretage, gain_factor_with_peak,
+        stored_gain_source, stored_gain_with_peak,
+    };
     let settings = ReplayGainSettings::load(backend);
     let (gain, source, peak_kind) = stored_gain_with_peak(backend, tid, settings.mode)?;
     let (factor, retenue) = gain_factor_with_peak(gain, settings, peak_kind);
@@ -331,7 +359,66 @@ pub(super) fn zone_replaygain_step(
         alters_audio,
         peak_kind: peak_kind.as_str(),
         peak_headroom_db,
+        gain_db: applied_db,
     })
+}
+
+/// #5633 — ce que PURE laisse de côté : le ReplayGain que la piste en cours
+/// recevrait hors PURE.
+///
+/// PURE garde le chemin intouché, ReplayGain compris : c'est voulu (le
+/// bit-perfect). Mais rien ne le disait, et basculer PURE sur une piste de
+/// bibliothèque à −8 dB de ReplayGain la faisait monter de 8 dB sans
+/// explication (fil 1797). L'objet dit le gain (dB, pré-ampli et
+/// anti-écrêtage compris, comme l'étape hors PURE) et sa granularité.
+///
+/// `None` hors PURE (l'étape « ReplayGain » le dit déjà), en mode off, sans
+/// gain stocké, ou quand le gain ne changerait aucun échantillon.
+pub(super) fn replaygain_ignore_par_pure(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    track_id: Option<i64>,
+) -> Option<Value> {
+    if !tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
+        return None;
+    }
+    let rg = replaygain_step_hors_pure(backend, track_id?)?;
+    if !rg.alters_audio {
+        return None;
+    }
+    Some(json!({
+        "gain_db": (rg.gain_db * 100.0).round() / 100.0 + 0.0,
+        "granularity": rg.granularity,
+    }))
+}
+
+/// #4384 — ReplayGain armé, mais aucun gain stocké pour la piste en cours :
+/// le facteur reste 1,0 et le préampli n'est PAS appliqué (il s'ajoute au
+/// tag, il ne le remplace pas — `gain_factor_detail`).
+///
+/// Rend `{ "mode", "preamp_db" }`, ou `None` en mode off, sans piste
+/// identifiée, ou quand la piste porte un gain. La garde PURE est à
+/// l'appelant.
+pub(super) fn replaygain_sans_gain_tague(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    track_id: Option<i64>,
+) -> Option<Value> {
+    use tune_core::audio::replaygain::{ReplayGainMode, ReplayGainSettings, stored_gain_with_peak};
+    let settings = ReplayGainSettings::load(backend);
+    if settings.mode == ReplayGainMode::Off {
+        return None;
+    }
+    let tid = track_id?;
+    if stored_gain_with_peak(backend, tid, settings.mode).is_some() {
+        return None;
+    }
+    Some(json!({
+        "mode": match settings.mode {
+            ReplayGainMode::Album => "album",
+            _ => "track",
+        },
+        "preamp_db": (settings.preamp_db * 100.0).round() / 100.0 + 0.0,
+    }))
 }
 
 /// L'étape ReplayGain du chemin du signal, description ET faits bruts.
@@ -352,6 +439,10 @@ pub(super) struct ReplayGainStep {
     /// Cette étape multiplie-t-elle réellement les échantillons ? Faux pour un
     /// refus, qui laisse le fil intact.
     alters_audio: bool,
+    /// #5633 — le gain qui multiplie les échantillons, en dB (pré-ampli et
+    /// anti-écrêtage compris ; 0 pour un refus). Le même nombre que la
+    /// description, sans analyser une chaîne française.
+    gain_db: f64,
 }
 
 /// Ce que l'étage ReplayGain a écrêté depuis le DÉMARRAGE DU PROCESSUS
@@ -468,6 +559,15 @@ pub(super) fn output_stage_label(container: &str, sample_rate: i32, bit_depth: i
             );
         }
         return dsd_resolution_label(sample_rate);
+    }
+    // Fil 2119 — une source au format inconnu porte 0 : on n'écrit pas
+    // « 0Hz/0bit », on tait le chiffre qu'on ne connaît pas (même règle que
+    // l'étape Source).
+    if sample_rate <= 0 {
+        return container.to_string();
+    }
+    if bit_depth <= 0 {
+        return format!("{container} {sr}kHz", sr = sample_rate / 1000);
     }
     if sample_rate >= 1000 {
         format!(
@@ -640,10 +740,16 @@ pub(super) fn build_signal_path(
     // #4354 — lu AVANT que `forcages` parte dans `Analyse` : le verdict PURE
     // se rend en fin de fonction, une fois les étapes décrites.
     let dsd_decime_en_pcm = forcages.dsd_decime_en_pcm;
+    // Fil 2161 — le PCM ALSA réellement visé : `alsa:default` est un greffon
+    // (dmix, PipeWire) qui convertit à SA cadence, `hw:` est le DAC.
+    let pcm_local = (output_type == "local")
+        .then(|| pcm_de_la_zone_locale(zone.output_device_id.as_deref()))
+        .flatten();
     let (transport_bit_perfect, transport_desc, output_format_name) = decrire_le_transport(
         output_type,
         audio_backend,
         runtime_signal_path,
+        pcm_local.as_deref(),
         &source,
         &forcages,
     );
@@ -687,11 +793,19 @@ pub(super) fn build_signal_path(
         runtime_signal_path,
         analyse,
     );
+    // Un greffon natif tiers de la famille du crossfeed remplace le crossfeed
+    // intégré : l'étape porte SON nom, et l'ombre de la tête du crossfeed
+    // intégré, éteint, n'a rien à y annoncer.
+    let greffon_de_crossfeed = tune_core::audio::natifs_tiers::greffon_de_crossfeed_de_la_zone(
+        &tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone()),
+        zone_id_courant,
+    );
+    nommer_le_crossfeed_du_greffon(&mut etapes.steps, greffon_de_crossfeed.as_deref());
     // #5081 — la coupure et la pente de l'ombre de la tête, sur l'étape
     // crossfeed quand elle existe.
     annoter_l_ombre_du_crossfeed(
         &mut etapes.steps,
-        zone_crossfeed_ombre(backend, zone_id_courant),
+        zone_crossfeed_ombre(backend, zone_id_courant).filter(|_| greffon_de_crossfeed.is_none()),
     );
     if let Some((etape, _)) = capture {
         let apres_la_source = etapes.steps.len().min(1);
@@ -739,6 +853,21 @@ pub(super) fn build_signal_path(
         {
             v["exemplaire"] = json!(e);
         }
+        // #5633 — PURE ignore le ReplayGain, et le dit : le gain que la piste
+        // en cours recevrait hors PURE. Clé ABSENTE hors PURE ou sans gain.
+        if pure
+            && let Some(rg) = replaygain_ignore_par_pure(backend, zone_id_courant, np.track_id)
+        {
+            v["pure_replaygain_ignored"] = rg;
+        }
+        // #4384 — ReplayGain armé, piste sans gain stocké : le facteur reste
+        // 1,0 et le préampli n'est PAS appliqué. Sans cette clé, l'étape
+        // ReplayGain disparaissait sans un mot, et un préampli réglé
+        // semblait sans effet. Clé ABSENTE sous PURE, en mode off ou quand
+        // la piste a un gain.
+        if !pure && let Some(rg) = replaygain_sans_gain_tague(backend, np.track_id) {
+            v["replaygain_untagged"] = rg;
+        }
         v
     })
 }
@@ -764,6 +893,19 @@ pub(crate) const CODEC_INCONNU: &str = "?";
 /// #4346 — code stable des étapes (`Source`, `Decoder`, `Transcoder`) dont la
 /// description nomme un codec inconnu par [`CODEC_INCONNU`].
 pub(crate) const CODE_CODEC_INCONNU: &str = "source_codec_unknown";
+
+/// #5525 — le détail d'une étape `flac_container_rewritten` quand Tune sert
+/// les trames sous un en-tête neuf (#4800). C'est Tune, en Rust, qui refait
+/// l'en-tête : aucun ffmpeg ne tourne. L'ancien texte (« FLAC écrit par
+/// ffmpeg (Lavf) ») décrivait le fichier d'origine, mais se lisait comme
+/// « Tune a réécrit le FLAC avec ffmpeg » (réunion avec Yves Corbat, 30/09).
+pub(crate) const DETAIL_FLAC_ENTETE_NEUF: &str =
+    "Fichier d'origine sans somme MD5 : en-tête FLAC refait par Tune, trames audio intactes";
+
+/// #5525 — le même détail quand l'en-tête n'a pas pu être lu et que Tune
+/// décode puis ré-encode (#4350).
+pub(crate) const DETAIL_FLAC_REENCODE: &str =
+    "Fichier d'origine sans somme MD5 : FLAC ré-encodé sans perte par Tune";
 
 /// #5051 — l'étape « Capture » d'une entrée audio en direct, et si le signal
 /// servi est encore, à l'octet près, celui capté. `None` hors entrée audio.
@@ -1031,8 +1173,13 @@ fn assembler_les_etapes(
             bit_depth
         });
         let out_sample_rate = wire_sample_rate.map(|v| v as i32).unwrap_or_else(|| {
+            // #5524 — la cadence de même famille sous le plafond, celle que
+            // la décision sert (`cadence_sous_plafond`), pas le plafond brut.
             max_sample_rate
-                .map(|m| (sample_rate as u32).min(m) as i32)
+                .map(|m| {
+                    tune_core::audio::formats::cadence_sous_plafond(sample_rate as u32, Some(m))
+                        as i32
+                })
                 .unwrap_or(sample_rate)
         });
         // Garde-fou #1315 : le nom du conteneur est deviné, les chiffres sont
@@ -1054,9 +1201,9 @@ fn assembler_les_etapes(
             // décodage, premier son immédiat) ou, si l'en-tête n'a pas pu
             // être lu, le décodage-ré-encodage de #4350.
             etape["detail"] = json!(if conteneur_flac_copie {
-                "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, en-tête neuf, trames copiées telles quelles"
+                DETAIL_FLAC_ENTETE_NEUF
             } else {
-                "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, ré-encodé sans perte"
+                DETAIL_FLAC_REENCODE
             });
         }
         steps.push(etape);
@@ -1104,14 +1251,18 @@ fn assembler_les_etapes(
             "bit_perfect": false,
         }));
     } else if let Some(max_sr) = max_sample_rate.filter(|_| resampling_active) {
+        // #5524 — la cadence SERVIE (même famille sous le plafond), celle
+        // de la décision : 176,4 sous 96 s'annonce « → 88,2 kHz », pas 96.
+        let cible =
+            tune_core::audio::formats::cadence_sous_plafond(sample_rate as u32, Some(max_sr));
         let src_khz = sample_rate / 1000;
-        let dst_khz = max_sr / 1000;
-        rate_conversion = Some((sample_rate as u32, max_sr));
+        let dst_khz = cible / 1000;
+        rate_conversion = Some((sample_rate as u32, cible));
         steps.push(json!({
             "name": "Resampler",
             "code": "rate_conversion",
             "from_hz": sample_rate as u32,
-            "to_hz": max_sr,
+            "to_hz": cible,
             "description": format!("{src_khz}kHz \u{2192} {dst_khz}kHz"),
             "bit_perfect": false,
         }));
@@ -1139,6 +1290,13 @@ fn assembler_les_etapes(
             "clipping_guard": rg.clipping_guard,
             "peak_kind": rg.peak_kind,
             "peak_headroom_db": rg.peak_headroom_db,
+            // #5633 — additif : le gain en nombre.
+            "gain_db": (rg.gain_db * 100.0).round() / 100.0 + 0.0,
+            // #4384 — additif : OÙ le gain est appliqué. Sur une sortie
+            // locale, il est composé avec le volume puis raboté à l'unité
+            // (`playback.audio_levels` dit ce qui en reste) ; sur un rendu
+            // réseau, il est cuit dans le flux envoyé.
+            "applied_in": if output_type == "local" { "local_output" } else { "stream" },
             "metrics": replaygain_ecretage_metrics(),
         }));
     }
@@ -1191,6 +1349,12 @@ fn assembler_les_etapes(
                 false,
             )),
             OutputDspState::BypassedPure => Some(("DSP contourné par PURE", true)),
+            // #4176 — PURE allumé sur un chemin déjà intact : le dire, plutôt
+            // que d'annoncer un contournement qui ne change rien.
+            OutputDspState::PureSansObjet => Some((
+                "PURE actif : aucun traitement armé, rien à contourner",
+                true,
+            )),
             OutputDspState::BypassedDop => Some(("DSP contourné pour DoP", true)),
             OutputDspState::Unknown => Some(("État DSP indéterminé", false)),
             OutputDspState::Inactive => None,
@@ -1522,15 +1686,22 @@ fn rendre_les_verdicts(
 /// le mode partagé, et on le NOMME : c'est la seule ligne du panneau qui dise
 /// à l'auditeur que « Mode Audiophile » n'a pas pris le périphérique — le
 /// réglage qui le prend s'appelle « Exclusif (bit-perfect) », ailleurs.
+///
+/// Fil 2161 — `pcm_alsa` : le PCM ALSA que la zone ouvre (`alsa:default`,
+/// `alsa:hw:CARD=0,DEV=0`), tel que le parc l'a retenu. Un PCM qui n'est pas
+/// `hw:` est un greffon logiciel et se nomme comme tel, au même titre que le
+/// mode partagé de WASAPI.
 pub(super) fn etiquette_du_transport_local<'a>(
     audio_backend: &'a str,
     exclusif_observe: bool,
+    pcm_alsa: Option<&str>,
 ) -> &'a str {
     match audio_backend {
         "ASIO" => "ASIO (exclusive)",
         "WASAPI" if exclusif_observe => "WASAPI (exclusive)",
         "WASAPI" => "WASAPI (shared \u{2014} Windows mixer)",
         "CoreAudio" => "CoreAudio",
+        "ALSA" if pcm_alsa_est_un_greffon(pcm_alsa) => "ALSA (shared \u{2014} software mixer)",
         "ALSA" => "ALSA",
         other => other,
     }
@@ -1539,17 +1710,63 @@ pub(super) fn etiquette_du_transport_local<'a>(
 /// #4172 — sans contrat de signal, le transport local est-il intact ?
 ///
 /// WASAPI : non — le mode partagé passe par le mixeur Windows (flottant,
-/// volume de session, mélange, cadence du mixeur). CoreAudio et ALSA sans
-/// contrat : inchangé, `true` — ces chemins n'ont pas de mixeur imposé de la
-/// même façon et rien de mesuré ne dit le contraire.
-pub(super) fn transport_partage_est_intact(audio_backend: &str) -> bool {
-    audio_backend != "WASAPI"
+/// volume de session, mélange, cadence du mixeur). CoreAudio sans contrat :
+/// inchangé, `true` — rien de mesuré ne dit le contraire.
+///
+/// ALSA (fil 2161) : intact seulement si la zone ouvre le PCM MATÉRIEL, ou si
+/// son PCM est inconnu (comportement d'avant). Un greffon (`default`,
+/// `dmix:`, `plughw:`, `pipewire`, `pulse`…) accepte toutes les cadences et
+/// convertit vers la sienne : `dmix` est fixé à 48 kHz
+/// (`defaults.pcm.dmix.rate`). Gérard (Eversolo DAC-Z8, Tune OS, rc2) : zone
+/// sur `alsa:default`, Tune ouvre 44,1 kHz, le DAC affiche 48 kHz, et le
+/// panneau disait « ALSA », bit-perfect, 44,1 kHz.
+pub(super) fn transport_partage_est_intact(audio_backend: &str, pcm_alsa: Option<&str>) -> bool {
+    match audio_backend {
+        "WASAPI" => false,
+        "ALSA" => !pcm_alsa_est_un_greffon(pcm_alsa),
+        _ => true,
+    }
+}
+
+/// Fil 2161 — ce PCM ALSA est-il un greffon logiciel, et non le matériel ?
+///
+/// `None` (PCM inconnu : parc pas encore publié, zone sans périphérique) ne
+/// conclut rien et rend `false`. Même critère que la découverte
+/// (`alsa_pcm_is_direct_hardware`) : seul `hw:` atteint le pilote sans
+/// conversion.
+pub(super) fn pcm_alsa_est_un_greffon(pcm_alsa: Option<&str>) -> bool {
+    use tune_core::outputs::pseudo_peripherique_alsa::{greffon_alsa, pcm_alsa as nom_du_pcm};
+    pcm_alsa
+        .map(|endpoint| greffon_alsa(nom_du_pcm(endpoint.trim())))
+        .is_some_and(|greffon| !greffon.is_empty() && !greffon.eq_ignore_ascii_case("hw"))
+}
+
+/// Fil 2161 — le PCM ALSA que la zone locale `output_device_id` ouvre, lu dans
+/// le DERNIER parc publié (aucune énumération : même règle que
+/// `canaux_des_peripheriques_locaux`). `None` hors `local-audio`, pour une
+/// zone non locale, ou quand le parc ne connaît pas l'appareil.
+pub(super) fn pcm_de_la_zone_locale(output_device_id: Option<&str>) -> Option<String> {
+    let nom = output_device_id?.strip_prefix("local:")?;
+    #[cfg(feature = "local-audio")]
+    {
+        tune_core::outputs::local::cached_audio_devices()
+            .into_iter()
+            .find(|appareil| appareil.name == nom)
+            .map(|appareil| appareil.endpoint_id)
+            .filter(|endpoint| !endpoint.is_empty())
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        let _ = nom;
+        None
+    }
 }
 
 fn decrire_le_transport<'a>(
     output_type: &'a str,
     audio_backend: &'a str,
     runtime_signal_path: Option<&OutputSignalPathStatus>,
+    pcm_local: Option<&str>,
     source: &Source,
     forcages: &Forcages,
 ) -> (bool, &'a str, &'static str) {
@@ -1677,10 +1894,11 @@ fn decrire_le_transport<'a>(
             // panneau disait « WASAPI », bit-perfect. Il dit désormais le
             // mode, et le verdict qui va avec.
             let exclusif_observe = runtime_signal_path.is_some();
-            let transport = etiquette_du_transport_local(audio_backend, exclusif_observe);
+            let transport =
+                etiquette_du_transport_local(audio_backend, exclusif_observe, pcm_local);
             let intact = match runtime_signal_path {
                 Some(status) => runtime_transport_is_intact(status),
-                None => transport_partage_est_intact(audio_backend),
+                None => transport_partage_est_intact(audio_backend, pcm_local),
             };
             (intact, transport, format_name)
         }
@@ -2200,11 +2418,17 @@ fn decrire_la_source<'w>(
             .flatten()
     });
 
+    // Fil 2119 — quand ni la lecture en cours ni la base ne nomment le
+    // format, il est INCONNU. Le repli « flac » / 44100 / 16 d'avant affirmait
+    // « FLAC 44kHz/16bit — Sans perte » pour un WAV 24/176,4 servi intact :
+    // une valeur inventée, publiée avec l'aplomb d'une mesure. Une chaîne
+    // vide ne se reconnaît comme aucun codec : `format_name` tombe sur
+    // [`CODEC_INCONNU`] (#4346), et fréquence et profondeur restent à 0.
     let fmt_str = np
         .format
         .clone()
         .or_else(|| track.as_ref().and_then(|t| t.format.clone()))
-        .unwrap_or_else(|| "flac".into());
+        .unwrap_or_default();
     let source_format = AudioFormat::from_extension(&fmt_str);
     let is_dsd = matches!(fmt_str.as_str(), "dsd" | "dsf" | "dff");
     // For DSD files, prefer the track's original sample rate and bit depth
@@ -2228,7 +2452,8 @@ fn decrire_la_source<'w>(
             // même aplomb qu'une vraie mesure, et fausse dès que le fichier
             // était en Hi-Res (métadonnées non lues au scan).
             .or_else(|| wire_sample_rate.map(|v| v as i32))
-            .unwrap_or(44100)
+            // Fil 2119 — 0 veut dire « inconnu », jamais 44100.
+            .unwrap_or(0)
     };
     let bit_depth = if is_dsd {
         track
@@ -2241,7 +2466,8 @@ fn decrire_la_source<'w>(
             .or_else(|| np.bit_depth.map(|v| v as i32))
             .or_else(|| track.as_ref().and_then(|t| t.bit_depth))
             .or_else(|| wire_bit_depth.map(|v| v as i32))
-            .unwrap_or(16)
+            // Fil 2119 — 0 veut dire « inconnu », jamais 16.
+            .unwrap_or(0)
     };
 
     let format_name = if is_dsd {

@@ -59,6 +59,18 @@ async fn poster_en_anglais(app: &axum::Router, chemin: &str, corps: Value) -> (S
     .await
 }
 
+async fn poster_en_francais(app: &axum::Router, chemin: &str, corps: Value) -> (StatusCode, Value) {
+    envoyer(
+        app,
+        Request::post(chemin)
+            .header("Content-Type", "application/json")
+            .header("Accept-Language", "fr-FR,fr;q=0.9")
+            .body(Body::from(corps.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
 async fn mettre_a_jour(app: &axum::Router, chemin: &str, corps: Value) -> (StatusCode, Value) {
     envoyer(
         app,
@@ -120,7 +132,21 @@ async fn creer_une_radio_avec_le_point_virgule_du_ticket_est_refuse() {
     assert_eq!(corps["error"], "radio_url_separateur_faux");
 
     // Le message doit désigner la faute. « URL invalide » n'aurait rien
-    // appris à Tades ; le nom du schéma attendu, si.
+    // appris à Tades ; le nom du schéma attendu, si. Sans Accept-Language, le
+    // serveur répond en anglais (#5913).
+    let message = corps["message"].as_str().expect("message absent");
+    assert!(message.contains("http://"), "message = {message}");
+    assert!(message.contains("colon"), "message = {message}");
+    assert!(message.contains("http;//"), "message = {message}");
+
+    // Demandé en français, le même refus est traduit.
+    let (status, corps) = poster_en_francais(
+        &app,
+        "/api/v1/radios",
+        json!({"name": "ClassicHD", "stream_url": "http;//classic-hd.example.net/stream"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "corps = {corps}");
     let message = corps["message"].as_str().expect("message absent");
     assert!(message.contains("http://"), "message = {message}");
     assert!(message.contains("deux-points"), "message = {message}");

@@ -114,11 +114,19 @@
 //! `POST /library/albums/{id}/reidentify` ne bouge pas : un refus y reste un
 //! `not_found`, comme avant.
 //!
-//! Reste ce que cette PR ne fait **pas** : même sans arrêt, un album introuvable
-//! le restera au lancement suivant et sera ré-interrogé. Éviter cette
-//! re-interrogation demande une marque « déjà tenté, rien trouvé », donc une
-//! migration — c'est une économie (~20 min par relance), pas un déblocage, et
-//! elle fait l'objet d'une PR distincte (#4991, point (b)).
+//! ## La marque « déjà tenté, rien trouvé » (#4991, point (b))
+//!
+//! Même sans arrêt, un album introuvable restait en tête de file : il ne reçoit
+//! pas de `musicbrainz_release_id`, et la sélection `ORDER BY al.id` le rendait
+//! au même rang à chaque relance. La reprise réattaquait donc l'amas qui venait
+//! d'échouer avant d'atteindre quoi que ce soit de neuf.
+//!
+//! Un album auquel MusicBrainz a répondu « je n'ai pas ce pressage » reçoit
+//! maintenant `albums.identification_tentee_le` (migration SQLite 116, PG 080),
+//! et la sélection range **d'abord les albums jamais tentés**, puis les tentés
+//! du plus ancien au plus récent. Un refus du service ne pose pas la marque :
+//! l'album n'a pas été jugé, il garde son rang. Aucun album n'est exclu : un
+//! album tenté reste candidat, il passe seulement derrière le neuf.
 
 //!
 //! # La passe « labels seulement » (#4836)
@@ -136,6 +144,14 @@
 //! Un album dont la release n'a pas de label reste dans la sélection ; pour
 //! qu'une reprise ne le repaye pas, l'état garde le dernier album traité
 //! (`dernier_album_id`), et une passe en pause ou arrêtée repart après lui.
+//!
+//! # La passe par empreinte AcoustID (#4805, idée 4)
+//!
+//! `POST /library/identify-all?mode=acoustid`, pour les albums que la
+//! recherche texte n'a pas trouvés (marque de #5763). Empreinte `fpcalc`,
+//! une requête AcoustID par piste, vote d'album « à la Picard » ; sans
+//! majorité, rien n'est écrit. Même droit, même pause, même état que les deux
+//! autres modes. Voir [`acoustid`].
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -151,8 +167,11 @@ use tune_core::metadata::musicbrainz_release::{self, LectureRelease};
 use tune_core::metadata::reidentify::combler_label_album;
 use tune_core::taches_de_fond::{Tache, est_en_pause};
 
-use super::reidentify::{EchecIdentification, identifier_album};
+use super::reidentify::{EchecIdentification, Identification, identifier_album};
 use crate::state::AppState;
+
+/// La passe par empreinte AcoustID (#4805, idée 4) : `?mode=acoustid`.
+pub(crate) mod acoustid;
 
 /// La clé de `settings` qui porte l'avancement, sur le modèle de
 /// `enrich_all_status`. En base et non en mémoire : une passe de 2 h 23
@@ -268,6 +287,9 @@ const SECONDES_PAR_ALBUM_LABELS: f64 = 1.3;
 pub(super) struct ParametresLot {
     #[serde(default)]
     mode: Option<String>,
+    /// `mode=artistes` (#4805, étape C) : au plus tant de fiches par tour.
+    #[serde(default)]
+    limite: Option<usize>,
 }
 
 /// La sélection de la passe « labels seulement » (#4836) : les albums locaux
@@ -306,7 +328,43 @@ pub(super) fn sql_candidats_identification() -> &'static str {
          SELECT 1 FROM tracks t \
          WHERE t.album_id = al.id AND COALESCE(t.source, 'local') = 'local' \
        ) \
-     ORDER BY al.id"
+     ORDER BY CASE WHEN al.identification_tentee_le IS NULL THEN 0 ELSE 1 END, \
+       al.identification_tentee_le, al.id"
+}
+
+/// 🔴 #4991 (b) — l'album sort-il de ce tour marqué « déjà tenté, rien
+/// trouvé » ? Seulement si MusicBrainz a RÉPONDU sans pressage. Un refus
+/// (`503`, coupure, délai) ne dit rien de l'album : le marquer le ferait
+/// reculer en file pour une panne du service.
+pub(super) fn tente_sans_resultat(verdict: &str, refus_musicbrainz: bool) -> bool {
+    // #4805 D — `ambiguous` COMPRIS : MusicBrainz a répondu, l'album a été
+    // jugé. Sans la marque, un amas d'albums ambigus resterait en tête de
+    // file et la reprise le réattaquerait (#4991 (b)).
+    !refus_musicbrainz && matches!(verdict, "not_found" | "ambiguous")
+}
+
+/// Pose la marque de [`tente_sans_resultat`] quand elle s'applique. Un échec
+/// d'écriture est journalisé, jamais rendu : sans la marque, l'album garde son
+/// rang au prochain lancement, la passe en cours reste juste.
+pub(super) fn consigner_la_tentative(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    album_id: i64,
+    verdict: &str,
+    refus_musicbrainz: bool,
+) {
+    if !tente_sans_resultat(verdict, refus_musicbrainz) {
+        return;
+    }
+    // « Maintenant » écrit par le moteur, en ISO-8601 UTC sur les deux.
+    use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
+    let maintenant = match backend.engine() {
+        Engine::Sqlite => SqliteDialect.now_iso8601(),
+        Engine::Postgres => PostgresDialect.now_iso8601(),
+    };
+    let sql = format!("UPDATE albums SET identification_tentee_le = {maintenant} WHERE id = ?");
+    if let Err(e) = backend.execute(&sql, &[&album_id as &dyn ToSqlValue]) {
+        warn!(album_id, error = %e, "identification_lot_marque_non_posee");
+    }
 }
 
 /// Le corps du refus Premium.
@@ -343,23 +401,77 @@ fn etat_au_repos() -> Value {
         "traites": 0,
         "identifies": 0,
         "sans_correspondance": 0,
+        "ambigus": 0,
         "pistes_identifiees": 0,
+        "albums_sans_enregistrements": 0,
+        "sources": {},
         "raison": Value::Null,
     })
 }
 
+/// Les comptes d'une passe. Une seule structure, pour que l'état écrit en
+/// cours de passe et celui de la fin ne puissent pas diverger.
+#[derive(Debug, Default, Clone)]
+pub(super) struct CompteDuLot {
+    pub traites: usize,
+    pub identifies: usize,
+    /// Rien n'a été posé : `not_found`, `no_tracks`, et `ambiguous`.
+    pub sans_correspondance: usize,
+    /// Parmi `sans_correspondance`, les albums auxquels MusicBrainz a
+    /// répondu sans qu'aucun pressage soit sûr (#4805 D). Rien n'est écrit.
+    pub ambigus: usize,
+    pub pistes: usize,
+    /// Parmi `identifies`, les albums posés SANS enregistrements : trop peu
+    /// de titres concordaient avec le pressage (#4805 D, garde des
+    /// enregistrements).
+    pub albums_sans_enregistrements: usize,
+    /// Les identifiés, par origine du pressage (`balise_release`,
+    /// `balise_enregistrement`, `code_barres`, `recherche`).
+    pub sources: std::collections::BTreeMap<&'static str, usize>,
+    /// #4805, étape B — artistes munis d'un MBID par les crédits du pressage,
+    /// et cas ambigus laissés sans écriture. Journal de fin de passe seulement.
+    pub artistes_mbid_poses: usize,
+    pub artistes_ambigus: usize,
+}
+
+impl CompteDuLot {
+    /// Compte l'issue d'un album traité.
+    pub(super) fn enregistrer(&mut self, issue: &Identification) {
+        self.traites += 1;
+        match issue.verdict {
+            "reidentified" | "unchanged" => {
+                self.identifies += 1;
+                self.pistes += issue.applied.as_ref().map_or(0, |a| a.tracks_matched);
+                if issue.concordance.is_some_and(|c| !c.suffisante()) {
+                    self.albums_sans_enregistrements += 1;
+                }
+                if let Some(source) = issue.source {
+                    *self.sources.entry(source).or_default() += 1;
+                }
+                if let Some(b) = issue.artistes.as_ref() {
+                    self.artistes_mbid_poses += b.ecrits;
+                    self.artistes_ambigus += b.ambigus;
+                }
+            }
+            verdict => {
+                // `not_found`, `no_tracks`, `ambiguous` : rien n'a été posé.
+                self.sans_correspondance += 1;
+                if verdict == "ambiguous" {
+                    self.ambigus += 1;
+                }
+            }
+        }
+    }
+}
+
 /// Écrit l'avancement. Une seule fabrique, pour que l'état servi pendant la
 /// passe et celui servi à la fin ne puissent pas porter des clés différentes.
-#[allow(clippy::too_many_arguments)]
 fn ecrire_etat(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     task_id: &str,
     status: &str,
     total: usize,
-    traites: usize,
-    identifies: usize,
-    sans_correspondance: usize,
-    pistes: usize,
+    compte: &CompteDuLot,
     raison: Option<&str>,
 ) {
     let reglages = SettingsRepo::with_backend(backend.clone());
@@ -371,10 +483,13 @@ fn ecrire_etat(
                 "mode": "identification",
                 "task_id": task_id,
                 "total": total,
-                "traites": traites,
-                "identifies": identifies,
-                "sans_correspondance": sans_correspondance,
-                "pistes_identifiees": pistes,
+                "traites": compte.traites,
+                "identifies": compte.identifies,
+                "sans_correspondance": compte.sans_correspondance,
+                "ambigus": compte.ambigus,
+                "pistes_identifiees": compte.pistes,
+                "albums_sans_enregistrements": compte.albums_sans_enregistrements,
+                "sources": compte.sources,
                 "raison": raison,
             })
             .to_string(),
@@ -402,9 +517,16 @@ pub(super) async fn identification_lot_start(
     State(state): State<AppState>,
     Query(parametres): Query<ParametresLot>,
 ) -> impl IntoResponse {
+    let mut par_empreinte = false;
     let labels_seulement = match parametres.mode.as_deref() {
         None | Some("") | Some("identification") => false,
         Some("labels") => true,
+        Some("acoustid") => {
+            par_empreinte = true;
+            false
+        }
+        // #4805, étape C — la passe artistes, aiguillée après les gardes.
+        Some("artistes") => false,
         Some(autre) => {
             // Un mode inconnu ne retombe pas sur l'identification : ce serait
             // lancer trois heures de requêtes que personne n'a demandées.
@@ -414,7 +536,7 @@ pub(super) async fn identification_lot_start(
                     "code": "mode_inconnu",
                     "error": "mode_inconnu",
                     "mode": autre,
-                    "modes": ["identification", "labels"],
+                    "modes": ["identification", "labels", "artistes", "acoustid"],
                 })),
             );
         }
@@ -477,6 +599,12 @@ pub(super) async fn identification_lot_start(
     if labels_seulement {
         return lancer_la_passe_labels(state, deja).await;
     }
+    if par_empreinte {
+        return acoustid::lancer(state, deja).await;
+    }
+    if parametres.mode.as_deref() == Some("artistes") {
+        return artistes::lancer_la_passe_artistes(state, deja, parametres.limite).await;
+    }
 
     // 4. La sélection réussit AVANT le 202 : une panne SQL n'est pas une
     //    bibliothèque déjà identifiée (#3810).
@@ -517,7 +645,14 @@ pub(super) async fn identification_lot_start(
         duree_estimee_s,
         "identification_lot_demarre"
     );
-    ecrire_etat(&state.backend, &task_id, "running", total, 0, 0, 0, 0, None);
+    ecrire_etat(
+        &state.backend,
+        &task_id,
+        "running",
+        total,
+        &CompteDuLot::default(),
+        None,
+    );
 
     let etat_tache = state.clone();
     let task_id_tache = task_id.clone();
@@ -548,10 +683,7 @@ pub(super) async fn identification_lot_start(
 /// pause, une chaîne d'identification, un délai de cadence, un disjoncteur.
 async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
     let total = albums.len();
-    let mut traites = 0usize;
-    let mut identifies = 0usize;
-    let mut sans_correspondance = 0usize;
-    let mut pistes = 0usize;
+    let mut compte = CompteDuLot::default();
     let mut disjoncteur = Disjoncteur::default();
 
     for (rang, album_id) in albums.into_iter().enumerate() {
@@ -562,8 +694,8 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
         if est_en_pause(Tache::Identification) {
             info!(
                 task_id = %task_id,
-                traites,
-                restants = total - traites,
+                traites = compte.traites,
+                restants = total - compte.traites,
                 "identification_lot_en_pause"
             );
             ecrire_etat(
@@ -571,10 +703,7 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
                 &task_id,
                 "paused",
                 total,
-                traites,
-                identifies,
-                sans_correspondance,
-                pistes,
+                &compte,
                 Some("pause_utilisateur"),
             );
             return;
@@ -589,19 +718,25 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
             musicbrainz_release::rate_limit_delay().await;
         }
 
-        match identifier_album(&state, album_id).await {
+        match identifier_album(&state, album_id, None).await {
             Ok(issue) => {
-                traites += 1;
-                match issue.verdict {
-                    "reidentified" | "unchanged" => {
-                        identifies += 1;
-                        pistes += issue.applied.as_ref().map_or(0, |a| a.tracks_matched);
-                    }
-                    _ => {
-                        // `not_found` comme `no_tracks` : rien n'a été posé.
-                        sans_correspondance += 1;
-                    }
-                }
+                // #4805 D — `ambiguous` est compté à part, et rien n'est posé.
+                compte.enregistrer(&issue);
+                // #4991 (b) — un album que MusicBrainz n'a pas passe derrière
+                //    les albums jamais tentés au prochain lancement.
+                consigner_la_tentative(
+                    &state.backend,
+                    album_id,
+                    issue.verdict,
+                    issue.refus_musicbrainz,
+                );
+                // #4805 — les crédits du pressage posé, lus aussitôt dans la
+                //    release gardée en base, sur une tâche à part.
+                super::credits_apres_identification::apres_identification(
+                    &state,
+                    album_id,
+                    issue.verdict,
+                );
                 // 🔴 #4991 — une SEULE expression décide, et elle est couverte
                 //    par ses témoins. Le compteur du disjoncteur ne se touche
                 //    nulle part ailleurs dans cette boucle.
@@ -614,12 +749,12 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
                 // L'album a disparu entre la sélection et son tour — un scan a
                 // pu passer. Ce n'est pas un échec MusicBrainz : le compteur de
                 // disjoncteur ne bouge pas.
-                traites += 1;
+                compte.traites += 1;
                 disjoncteur.enregistrer(EffetSurLeDisjoncteur::Inchange);
             }
             Err(EchecIdentification::Base(e)) => {
                 warn!(task_id = %task_id, album_id, error = %e, "identification_lot_album_echoue");
-                traites += 1;
+                compte.traites += 1;
                 disjoncteur.enregistrer(EffetSurLeDisjoncteur::Inchange);
             }
         }
@@ -632,7 +767,7 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
         if disjoncteur.a_saute() {
             warn!(
                 task_id = %task_id,
-                traites,
+                traites = compte.traites,
                 refus_consecutifs = disjoncteur.refus_consecutifs(),
                 "identification_lot_arret_musicbrainz_injoignable"
             );
@@ -641,49 +776,30 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
                 &task_id,
                 "stopped",
                 total,
-                traites,
-                identifies,
-                sans_correspondance,
-                pistes,
+                &compte,
                 Some(RAISON_MUSICBRAINZ_INJOIGNABLE),
             );
             return;
         }
 
-        if traites.is_multiple_of(ALBUMS_PAR_ECRITURE) {
-            ecrire_etat(
-                &state.backend,
-                &task_id,
-                "running",
-                total,
-                traites,
-                identifies,
-                sans_correspondance,
-                pistes,
-                None,
-            );
+        if compte.traites.is_multiple_of(ALBUMS_PAR_ECRITURE) {
+            ecrire_etat(&state.backend, &task_id, "running", total, &compte, None);
         }
     }
 
     info!(
         task_id = %task_id,
         total,
-        identifies,
-        sans_correspondance,
-        pistes_identifiees = pistes,
+        identifies = compte.identifies,
+        sans_correspondance = compte.sans_correspondance,
+        ambigus = compte.ambigus,
+        pistes_identifiees = compte.pistes,
+        albums_sans_enregistrements = compte.albums_sans_enregistrements,
+        artistes_mbid_poses = compte.artistes_mbid_poses,
+        artistes_ambigus = compte.artistes_ambigus,
         "identification_lot_termine"
     );
-    ecrire_etat(
-        &state.backend,
-        &task_id,
-        "done",
-        total,
-        traites,
-        identifies,
-        sans_correspondance,
-        pistes,
-        None,
-    );
+    ecrire_etat(&state.backend, &task_id, "done", total, &compte, None);
 }
 
 /// Le curseur de reprise de la passe « labels seulement » : le dernier album
@@ -1210,6 +1326,81 @@ mod tests {
     /// Le refus Premium nomme la route gratuite. Sans elle, le message dirait
     /// à l'utilisateur que l'identification est payante — l'inverse de la
     /// décision 4.
+    /// #4991 (b) — l'amas de douze introuvables puis un album trouvable, sur
+    /// une vraie base. Premier lancement : MusicBrainz répond « rien » pour
+    /// les douze, et la boucle consigne chacun par la MÊME fonction qu'elle
+    /// appelle. Relance : le trouvable (13) passe en tête, les douze déjà
+    /// tentés derrière lui, dans l'ordre de leur tentative.
+    fn base_amas() -> crate::state::AppState {
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        for id in 1..=13i64 {
+            let titre = format!("Album {id}");
+            etat.backend
+                .execute(
+                    "INSERT INTO albums (id, title, source, musicbrainz_release_id) \
+                     VALUES (?, ?, 'local', NULL)",
+                    &[&id as &dyn ToSqlValue, &titre],
+                )
+                .unwrap();
+            let piste = id * 10;
+            etat.backend
+                .execute(
+                    "INSERT INTO tracks (id, title, album_id, source) VALUES (?, 'p', ?, 'local')",
+                    &[&piste as &dyn ToSqlValue, &id],
+                )
+                .unwrap();
+        }
+        etat
+    }
+
+    #[tokio::test]
+    async fn la_reprise_ne_reattaque_pas_l_amas_deja_tente() {
+        let etat = base_amas();
+        let premier = retenus(&etat);
+        assert_eq!(premier, (1..=13).collect::<Vec<i64>>());
+
+        // Premier lancement : la tête de file, douze `not_found` d'affilée.
+        for &album_id in &premier[..12] {
+            consigner_la_tentative(&etat.backend, album_id, "not_found", false);
+        }
+
+        let reprise = retenus(&etat);
+        assert_eq!(
+            reprise.first(),
+            Some(&13),
+            "le seul album jamais tenté doit passer en tête : sans la marque, la \
+             reprise rejoue les douze introuvables avant lui (#4991). Reçu : {reprise:?}"
+        );
+        assert_eq!(
+            reprise.len(),
+            13,
+            "aucun album n'est exclu : un album tenté reste candidat, derrière le neuf"
+        );
+        assert_eq!(&reprise[1..], &premier[..12]);
+    }
+
+    #[tokio::test]
+    async fn un_refus_ne_fait_pas_reculer_l_album() {
+        let etat = base_amas();
+        // MusicBrainz a refusé (503) : l'album n'a pas été jugé.
+        consigner_la_tentative(&etat.backend, 1, "not_found", true);
+        // Album identifié ou sans piste : rien à marquer.
+        consigner_la_tentative(&etat.backend, 2, "reidentified", false);
+        consigner_la_tentative(&etat.backend, 3, "no_tracks", false);
+        assert_eq!(retenus(&etat), (1..=13).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn seule_une_reponse_sans_pressage_pose_la_marque() {
+        assert!(tente_sans_resultat("not_found", false));
+        assert!(!tente_sans_resultat("not_found", true));
+        assert!(!tente_sans_resultat("reidentified", false));
+        assert!(!tente_sans_resultat("unchanged", false));
+        assert!(!tente_sans_resultat("no_tracks", false));
+        // #4805 D — un album ambigu a été jugé : il passe derrière le neuf.
+        assert!(tente_sans_resultat("ambiguous", false));
+    }
+
     #[test]
     fn le_refus_premium_nomme_la_route_gratuite() {
         let corps = refus_premium();
@@ -1220,3 +1411,7 @@ mod tests {
         );
     }
 }
+
+// #4805, étape C — la passe artistes par le réseau, sous le même pilote.
+#[path = "identification_artistes.rs"]
+mod artistes;

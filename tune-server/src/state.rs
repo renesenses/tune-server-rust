@@ -61,6 +61,11 @@ pub struct AppState {
     /// à la fois, son relevé lisible. Tenu ici et non en `static` : la route
     /// qui le lit a déjà l'état, et un test ne pollue pas le suivant.
     pub passe_dr: Arc<tune_core::audio::replaygain::plage_dynamique::PasseDr>,
+    /// Le dernier comptage « analysées / éligibles » de la bibliothèque pour
+    /// le ReplayGain (#5597), resservi une minute : l'écran État du serveur
+    /// sonde en boucle, et le comptage parcourt toute la table `tracks`.
+    pub bibliotheque_rg:
+        Arc<tune_core::audio::replaygain::bibliotheque::CacheBibliothequeReplayGain>,
     pub upnp: Option<UpnpState>,
     pub config: Arc<TuneConfig>,
     pub http_client: reqwest::Client,
@@ -103,6 +108,11 @@ pub struct AppState {
     pub rooms: Arc<Mutex<tune_core::collaborative::RoomManager>>,
     pub upnp_index_lock: Arc<Mutex<()>>,
     pub media_servers: Arc<Mutex<HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>>>,
+    /// Le dernier `Seek` reçu par la route, par zone : sa position et son
+    /// heure d'arrivée. Sert à ne pas envoyer deux fois au renderer le MÊME
+    /// déplacement reçu deux fois coup sur coup (ticket 193, voir
+    /// [`crate::routes::playback::seek_en_double`]).
+    pub derniers_seeks: Arc<std::sync::Mutex<HashMap<i64, (u64, Instant)>>>,
     /// mDNS scanner handle, populated by
     /// [`crate::discovery_setup::spawn_mdns_handler`] once discovery starts. Kept
     /// here (not just as a local `_mdns_handle`) so routes can list the peer Tune
@@ -349,7 +359,7 @@ impl AppState {
         // #5467 — en build de test, les chemins relatifs de la configuration
         // (`tune.db`, `artwork_cache`) ne se résolvent plus depuis le répertoire
         // courant, c'est-à-dire l'arbre source. Sans effet en production.
-        #[cfg(test)]
+        // #5512 : tests d'intégration compris, d'où l'absence de `cfg(test)`.
         let tune_config = crate::isolement_disque_tests_5467::isoler_config(tune_config);
         // Engine selection: check TUNE_DATABASE_URL for PostgreSQL, else
         // default to SQLite.
@@ -423,9 +433,25 @@ impl AppState {
         );
         qobuz.set_proxy_first(qobuz_proxy_first);
         services.register(Box::new(qobuz));
+        // Fil 221 — le Client ID saisi dans Reglages (`spotify_client_id` en
+        // base) l'emporte sur `tune.toml`, mais pas sur `TUNE_SPOTIFY_CLIENT_ID`
+        // (voir `resolve_client_id`). `tune_config.spotify_client_id` porte
+        // deja la variable quand elle est posee : elle est relue ici pour
+        // passer AVANT le reglage.
+        let spotify_client_id = {
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+            let reglage = settings.get("spotify_client_id").ok().flatten();
+            let env = std::env::var("TUNE_SPOTIFY_CLIENT_ID").ok();
+            tune_core::streaming::spotify::resolve_client_id(
+                env.as_deref(),
+                reglage.as_deref(),
+                tune_config.spotify_client_id.as_deref(),
+            )
+        };
         services.register(Box::new(
             tune_core::streaming::spotify::SpotifyService::with_config(
-                tune_config.spotify_client_id.as_deref(),
+                spotify_client_id.as_deref(),
                 tune_config.spotify_redirect_uri.as_deref(),
                 // Le port REELLEMENT ecoute (`bootstrap.rs` lie `config.port`),
                 // pas le defaut de la caisse : l'URI de redirection envoyee a
@@ -529,6 +555,9 @@ impl AppState {
             comptes_collections,
             background_tasks,
             passe_dr: Arc::new(tune_core::audio::replaygain::plage_dynamique::PasseDr::new()),
+            bibliotheque_rg: Arc::new(
+                tune_core::audio::replaygain::bibliotheque::CacheBibliothequeReplayGain::new(),
+            ),
             upnp: Some(upnp),
             config: Arc::new(tune_config),
             http_client,
@@ -549,6 +578,7 @@ impl AppState {
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
             upnp_index_lock: Arc::new(Mutex::new(())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
+            derniers_seeks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mdns_scanner: Arc::new(std::sync::Mutex::new(None)),
             active_audio_backend: Arc::new(std::sync::RwLock::new(None)),
             annuaire_radios: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -664,6 +694,7 @@ impl AppState {
                             // que les scripts ne créent les tables (chasse PG
                             // du 25/09/2026, voir `ensure_schema`).
                             pg.ensure_schema().await;
+                            reparer_premieres_vues_5389(&pg, db_path).await;
                             let backend =
                                 tune_core::db::backend::PostgresBackend::new(pg.pool().clone());
                             Ok::<_, String>(Arc::new(backend) as Arc<dyn DbBackend>)
@@ -693,6 +724,35 @@ impl AppState {
     pub async fn save_tokens(&self) {
         let registry = self.services.lock().await;
         registry.save_all_tokens(&self.backend).await;
+    }
+}
+
+/// Réparation des bases basculées vers PostgreSQL sans `file_first_seen`
+/// (#5389), au démarrage sur PostgreSQL, une seule fois : les dates d'ajout
+/// sont relues dans la base SQLite d'origine (`db_path`) si elle existe encore.
+/// Ne bloque jamais le démarrage : une erreur se journalise et le serveur part.
+#[cfg(feature = "postgres")]
+async fn reparer_premieres_vues_5389(pg: &tune_core::db::postgres::PostgresDb, db_path: &str) {
+    use tune_core::db::pg_migrate::{
+        ReparationPremieresVues, reparer_premieres_vues_depuis_sqlite,
+    };
+    match reparer_premieres_vues_depuis_sqlite(pg.pool(), std::path::Path::new(db_path)).await {
+        Ok(ReparationPremieresVues::DejaFaite) => {}
+        Ok(ReparationPremieresVues::SourceAbsente) => info!(
+            source = %db_path,
+            "file_first_seen_5389_source_sqlite_absente — dates d'ajout d'une bascule \
+             antérieure à v0.9.169 non réparables sans l'ancienne base SQLite"
+        ),
+        Ok(ReparationPremieresVues::Faite { lignes }) => info!(
+            source = %db_path,
+            lignes,
+            "file_first_seen_5389_dates_d_ajout_recopiees_depuis_sqlite"
+        ),
+        Err(e) => tracing::warn!(
+            source = %db_path,
+            error = %e,
+            "file_first_seen_5389_reparation_echouee"
+        ),
     }
 }
 

@@ -16,6 +16,14 @@ const REMOTE_CONFIG_URL: &str = "https://mozaiklabs.fr/storage/api/v1/streaming-
 /// affiche déjà : une page de plus est une page qu'on voit apparaître.
 const QOBUZ_TAILLE_DE_PAGE: &str = "50";
 
+/// Les deux ressources que la sonde de diagnostic peut demander à Qobuz
+/// (#5530) — voir [`QobuzService::reponse_brute_de_diagnostic`].
+#[derive(Clone, Copy, Debug)]
+pub enum RessourceBrute<'a> {
+    Album(&'a str),
+    Piste(&'a str),
+}
+
 pub struct QobuzService {
     client: Client,
     app_id: String,
@@ -62,6 +70,15 @@ pub struct QobuzService {
     /// cache éditorial par la clé. Y verser les albums d'une navigation en
     /// chasserait les démentis de genre qu'il est le seul à porter.
     cache_album: Mutex<HashMap<String, EntreeCache>>,
+    /// Lectures de favoris EN VOL, par type (`tracks`, `albums`, `artists`).
+    ///
+    /// Ce n'est PAS un cache — la règle du cache éditorial tient : « jamais
+    /// les favoris ». Une entrée ne vit que le temps de la requête : les
+    /// demandes identiques arrivées PENDANT qu'elle court en partagent la
+    /// réponse, et la suivante repart à Qobuz. L'écran des favoris en lançait
+    /// deux ou trois à la fois à son ouverture (ticket 179 : titres ×2,
+    /// albums ×3), chacune paginant toute la liste — 2315 albums, 47 pages.
+    favoris_en_vol: Mutex<HashMap<String, std::sync::Arc<FavorisEnVol>>>,
     /// Base d'API forcée, pour brancher les LECTURES sur un serveur simulé.
     ///
     /// `None` en production : l'ordre direct/proxy habituel s'applique. Seul
@@ -70,6 +87,9 @@ pub struct QobuzService {
     /// d'identifiants.
     base_forcee: Option<String>,
 }
+
+/// Une lecture de favoris partagée par les demandes qui l'attendent.
+type FavorisEnVol = tokio::sync::OnceCell<Result<Vec<serde_json::Value>, String>>;
 
 /// Une réponse éditoriale, et l'instant où elle a été obtenue.
 struct EntreeCache {
@@ -547,6 +567,7 @@ impl QobuzService {
             session_expired: false,
             cache_editorial: Mutex::new(HashMap::new()),
             cache_album: Mutex::new(HashMap::new()),
+            favoris_en_vol: Mutex::new(HashMap::new()),
             base_forcee: None,
         }
     }
@@ -824,6 +845,34 @@ impl QobuzService {
                 None => Err(e),
             },
         }
+    }
+
+    /// La réponse BRUTE de `/album/get` ou `/track/get`, pour la sonde de
+    /// diagnostic `GET /streaming/qobuz/debug/raw-keys` (#5530).
+    ///
+    /// Deux ressources seulement, fixées ici : la route ne peut pas servir de
+    /// relais vers un chemin Qobuz arbitraire. Pas de cache — on veut ce que
+    /// Qobuz rend maintenant — et l'album est borné à 100 pistes, ce qui suffit
+    /// à voir l'union de leurs clés.
+    ///
+    /// En cas d'échec, seul le code HTTP remonte : le message d'erreur de
+    /// `reqwest` porte l'URL complète, `app_id` compris, et la sonde promet de
+    /// ne rendre aucune URL.
+    pub async fn reponse_brute_de_diagnostic(
+        &self,
+        ressource: RessourceBrute<'_>,
+    ) -> Result<serde_json::Value, Option<u16>> {
+        let resultat = match ressource {
+            RessourceBrute::Album(id) => {
+                self.api_get_avec_statut("/album/get", &[("album_id", id), ("limit", "100")])
+                    .await
+            }
+            RessourceBrute::Piste(id) => {
+                self.api_get_avec_statut("/track/get", &[("track_id", id)])
+                    .await
+            }
+        };
+        resultat.map_err(|(statut, _message)| statut)
     }
 
     /// La réponse de `/album/get` pour cet album — une seule fois par album.
@@ -1301,14 +1350,46 @@ impl QobuzService {
     /// divergé — c'est exactement ce qui s'était produit sur cette route avec
     /// les playlists (#2370), où l'aller et la reprise après rafraîchissement
     /// du jeton ne dispatchaient déjà plus pareil.
+    ///
+    /// Les demandes concurrentes d'un même type partagent UNE requête en vol
+    /// (voir `favoris_en_vol`) ; aucune réponse n'est gardée après elle.
     async fn favoris_bruts(&self, type_qobuz: &str) -> Result<Vec<serde_json::Value>, TuneError> {
-        Ok(self
-            .api_get_all_pages(
-                "/favorite/getUserFavorites",
-                &[("type", type_qobuz)],
-                type_qobuz,
-            )
-            .await?)
+        let vol = {
+            let mut en_vol = self
+                .favoris_en_vol
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            en_vol
+                .entry(type_qobuz.to_string())
+                .or_insert_with(|| std::sync::Arc::new(FavorisEnVol::new()))
+                .clone()
+        };
+        let reponse = vol
+            .get_or_init(|| async {
+                self.api_get_all_pages(
+                    "/favorite/getUserFavorites",
+                    &[("type", type_qobuz)],
+                    type_qobuz,
+                )
+                .await
+            })
+            .await
+            .clone();
+        // La requête a abouti : la suivante repart à Qobuz. On ne retire que
+        // NOTRE vol — un autre a pu le remplacer entre-temps.
+        {
+            let mut en_vol = self
+                .favoris_en_vol
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if en_vol
+                .get(type_qobuz)
+                .is_some_and(|v| std::sync::Arc::ptr_eq(v, &vol))
+            {
+                en_vol.remove(type_qobuz);
+            }
+        }
+        Ok(reponse?)
     }
 
     /// La clé sous laquelle Qobuz date la mise en favori d'un élément de
@@ -1336,6 +1417,18 @@ impl QobuzService {
             brut,
             Self::CLES_DATE_FAVORI,
         );
+        // #5530 — une piste favorite hérite du marquage IA de son ALBUM, si
+        // l'objet `album` imbriqué le porte. `StreamTrack` n'a pas ce champ
+        // (le marquage est d'album) : il voyage à côté, sous un nom qui dit
+        // d'où il vient, jusqu'à la reprise des favoris.
+        if fav_type == "tracks"
+            && let (Some(objet), Some(ia)) = (
+                element.as_object_mut(),
+                brut["album"]["ai_generated"].as_bool(),
+            )
+        {
+            objet.insert("album_ai_generated".into(), serde_json::Value::Bool(ia));
+        }
         element
     }
 
@@ -1465,6 +1558,10 @@ impl QobuzService {
             // pistes répondent « no url » : l'écran a besoin de la date pour
             // le dire, la lecture pour le refuser proprement.
             released_at: item["released_at"].as_i64(),
+            // #5530 — le marquage « généré par IA » de Qobuz, au niveau de
+            // l'album, tel que `album/get` le rend (booléen). Une autre forme
+            // ou l'absence : on ne conclut rien.
+            ai_generated: item["ai_generated"].as_bool(),
         }
     }
 
@@ -4042,6 +4139,62 @@ mod tests {
             "release_date_original": "1959-12-14",
         }));
         assert_eq!(sans.released_at, None);
+    }
+
+    /// #5530 — la FORME relevée par la sonde `raw-keys` sur le .18 (05/10/2026)
+    /// pour un album que Qobuz marque comme IA : `ai_generated` booléen à la
+    /// racine de `album/get`, `release_tags` tableau vide. Seuls le titre et
+    /// l'identifiant de l'album sont repris ; aucune autre donnée de la réponse.
+    fn album_ia_releve() -> serde_json::Value {
+        json!({
+            "id": "tj9je5zd70wsc",
+            "title": "Psychedelic Mongolian Trip Hop (\"Painted Yurts, Painted Souls\") AI Album",
+            "ai_generated": true,
+            "release_tags": [],
+        })
+    }
+
+    #[test]
+    fn map_album_lit_le_marquage_ia_de_qobuz_5530() {
+        let album = QobuzService::map_album(&album_ia_releve());
+        assert_eq!(album.ai_generated, Some(true));
+        // Et l'API le rend au client sous ce nom.
+        let rendu = serde_json::to_value(&album).unwrap();
+        assert_eq!(rendu["ai_generated"], json!(true));
+    }
+
+    /// L'album témoin (Kind of Blue) ne porte PAS la clé : rien n'est conclu,
+    /// et rien n'est sérialisé.
+    #[test]
+    fn un_album_sans_la_cle_n_est_pas_marque_5530() {
+        let album =
+            QobuzService::map_album(&json!({"id": "5099749522428", "title": "Kind of Blue"}));
+        assert_eq!(album.ai_generated, None);
+        let rendu = serde_json::to_value(&album).unwrap();
+        assert!(rendu.get("ai_generated").is_none(), "{rendu}");
+        // `false` explicite se lit tel quel ; une chaîne ne vaut rien.
+        let non = QobuzService::map_album(&json!({"id": "1", "ai_generated": false}));
+        assert_eq!(non.ai_generated, Some(false));
+        let chaine = QobuzService::map_album(&json!({"id": "1", "ai_generated": "true"}));
+        assert_eq!(chaine.ai_generated, None);
+    }
+
+    /// Un favori PISTE emporte le marquage de son album imbriqué ; un favori
+    /// ALBUM le porte sous `ai_generated`.
+    #[test]
+    fn le_favori_emporte_le_marquage_ia_5530() {
+        let album = QobuzService::favori_date(&album_ia_releve(), "albums");
+        assert_eq!(album["ai_generated"], json!(true));
+        let piste = QobuzService::favori_date(
+            &json!({"id": 7, "title": "Piste", "album": album_ia_releve()}),
+            "tracks",
+        );
+        assert_eq!(piste["album_ai_generated"], json!(true));
+        let sans = QobuzService::favori_date(
+            &json!({"id": 8, "title": "Piste", "album": {"id": "x"}}),
+            "tracks",
+        );
+        assert!(sans.get("album_ai_generated").is_none(), "{sans}");
     }
 
     #[test]
@@ -6908,6 +7061,98 @@ mod tests_credits_4993 {
             appels_album.load(Ordering::SeqCst),
             1,
             "un seul /album/get pour tout l'album"
+        );
+    }
+}
+
+/// Ticket 179 — l'écran des favoris demandait la même liste deux ou trois fois
+/// à la fois, et chaque demande paginait toute la liste chez Qobuz.
+///
+/// Contre-épreuve : sans le partage de `favoris_bruts`, les trois demandes
+/// concurrentes font trois requêtes, et
+/// `trois_demandes_concurrentes_ne_font_qu_une_requete` rougit sur le compteur.
+#[cfg(test)]
+mod tests_favoris_en_vol {
+    use super::*;
+    use axum::extract::Query;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::collections::HashMap as Carte;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Un Qobuz simulé qui compte ses `/favorite/getUserFavorites` et met
+    /// `latence` à répondre, le temps que les demandes se chevauchent.
+    async fn qobuz_favoris_simule(latence: Duration) -> (String, Arc<AtomicUsize>) {
+        let appels = Arc::new(AtomicUsize::new(0));
+        let compteur = appels.clone();
+        let app = Router::new().route(
+            "/favorite/getUserFavorites",
+            get(move |Query(q): Query<Carte<String, String>>| {
+                let compteur = compteur.clone();
+                async move {
+                    compteur.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(latence).await;
+                    let type_ = q.get("type").cloned().unwrap_or_default();
+                    let item = match type_.as_str() {
+                        "tracks" => json!({"id": 11, "title": "Summertime", "duration": 200}),
+                        _ => json!({"id": "a1", "title": "Ella", "artist": {"name": "Ella"}}),
+                    };
+                    Json(json!({ type_: {"items": [item], "total": 1} }))
+                }
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), appels)
+    }
+
+    #[tokio::test]
+    async fn trois_demandes_concurrentes_ne_font_qu_une_requete() {
+        let (base, appels) = qobuz_favoris_simule(Duration::from_millis(300)).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let (a, b, c) = tokio::join!(
+            svc.get_user_albums(),
+            svc.get_user_albums(),
+            svc.get_user_albums()
+        );
+        for r in [a, b, c] {
+            assert_eq!(r.expect("favoris simulés").len(), 1, "chacun a sa réponse");
+        }
+        assert_eq!(
+            appels.load(Ordering::SeqCst),
+            1,
+            "les demandes concurrentes partagent la même requête"
+        );
+    }
+
+    #[tokio::test]
+    async fn rien_n_est_garde_apres_la_requete_et_les_types_ne_se_melent_pas() {
+        let (base, appels) = qobuz_favoris_simule(Duration::from_millis(10)).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        svc.get_user_albums().await.expect("premier");
+        svc.get_user_albums().await.expect("second");
+        assert_eq!(
+            appels.load(Ordering::SeqCst),
+            2,
+            "pas de cache : une demande APRÈS la précédente repart à Qobuz"
+        );
+
+        let (albums, titres) = tokio::join!(svc.get_user_albums(), svc.get_user_tracks());
+        assert_eq!(albums.expect("albums")[0].title, "Ella");
+        assert_eq!(titres.expect("titres")[0].title, "Summertime");
+        assert_eq!(appels.load(Ordering::SeqCst), 4, "un vol par type");
+        assert!(
+            svc.favoris_en_vol.lock().unwrap().is_empty(),
+            "aucun vol ne survit à sa requête"
         );
     }
 }

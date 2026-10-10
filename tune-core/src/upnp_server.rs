@@ -22,10 +22,20 @@ use crate::discovery::ssdp;
 /// Parcours par dossiers (#4318) — le rayon « Folders ».
 mod dossiers;
 
+/// #5885 — banc d'une grande bibliothèque FLAC + DSF parcourue par pages.
+#[cfg(test)]
+mod grande_bibliotheque_5885_tests;
+
 /// L'ordre alphabétique du serveur média, partagé avec les listes paginées de
 /// l'API REST de la bibliothèque (#4956) : un même rayon se lit dans le même
 /// ordre sur un lecteur DLNA et dans le client web.
 pub(crate) use dossiers::{CleAlphabetique, cle_alphabetique};
+
+/// L'ordre des dossiers du serveur média (sans casse ni accents, nombres par
+/// leur valeur), partagé avec l'écran Répertoires de l'API REST (#5582) : un
+/// même dossier se lit dans le même ordre sur un lecteur DLNA et dans le
+/// client web, et « haydn » ne part plus après « Z ».
+pub use dossiers::comparer_naturel;
 
 // ---------------------------------------------------------------------------
 // Shared state for UPnP routes
@@ -664,14 +674,6 @@ const SEARCH_CAPS: &str = "upnp:class,dc:title,upnp:artist,dc:creator,upnp:album
 /// La pagination des pistes est celle de `browse_all_tracks`, deja eprouvee —
 /// le client redemande par tranches, exactement comme sur « All Tracks ».
 fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
-    let update_id = match crate::db::upnp_revision::read(state.backend.as_ref()) {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(error = %e, "upnp_revision_unavailable");
-            return soap_fault(501, "Action Failed");
-        }
-    };
-
     let (container_id, criteria, start, count, sort_criteria) = parse_search_request(soap_body);
     debug!(
         container = %container_id,
@@ -697,37 +699,30 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
     };
     let base_url = state.base_url();
 
-    let didl = match criteres.cible {
-        Some(CibleRecherche::Pistes) => match search_tracks_in_container(
+    let construire = || match criteres.cible {
+        Some(CibleRecherche::Pistes) => search_tracks_in_container(
             state,
             &container_id,
             start,
             count,
             &base_url,
             &criteres.filtre,
-        ) {
-            Some(result) => result,
-            None => return soap_fault(710, "No such container"),
-        },
-        Some(cible) => {
-            match search_containers_in_container(
-                state,
-                cible,
-                &container_id,
-                start,
-                count,
-                &criteres.filtre,
-            ) {
-                Some(result) => result,
-                None => return soap_fault(710, "No such container"),
-            }
-        }
-        None => empty_didl(),
+        ),
+        Some(cible) => search_containers_in_container(
+            state,
+            cible,
+            &container_id,
+            start,
+            count,
+            &criteres.filtre,
+        ),
+        None => Some(empty_didl()),
     };
-
-    if crate::db::upnp_revision::read(state.backend.as_ref()) != Ok(update_id) {
-        return soap_fault(720, "Cannot process the request: catalog changed");
-    }
+    let (didl, update_id) = match page_sous_revision_stable(state, "Search", construire) {
+        Ok((Some(didl), update_id)) => (didl, update_id),
+        Ok((None, _)) => return soap_fault(710, "No such container"),
+        Err(fault) => return fault,
+    };
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1464,12 +1459,6 @@ fn search_tracks_in_container(
     }
 }
 
-/// Assez large pour une bibliotheque reelle (2 222 albums sur la
-/// bibliotheque de reference), assez borne pour qu'un `Search` ne batisse
-/// jamais un DIDL de plusieurs megaoctets en memoire. Meme regle et meme
-/// ordre de grandeur que `candidats_par_titre` pour les pistes.
-const MAX_CANDIDATS_CONTENEURS: i64 = 10_000;
-
 /// Les rubriques NON-pistes d'un `Search` : artistes, albums, genres, radios,
 /// listes de lecture.
 ///
@@ -1483,10 +1472,16 @@ const MAX_CANDIDATS_CONTENEURS: i64 = 10_000;
 /// trace. Les rubriques existent pourtant deja — ce sont celles de `browse_*`,
 /// et ce sont leurs emetteurs DIDL qui servent ici.
 ///
-/// La lecture est BORNEE puis paginee en memoire, parce qu'un predicat de
-/// titre doit s'appliquer AVANT la page — sinon deux pages successives ne
-/// porteraient pas sur le meme ensemble. `TotalMatches` reflete donc ce qui a
-/// ete retenu, comme pour `candidats_par_titre`.
+/// La rubrique est lue ENTIÈRE puis paginée en mémoire, parce qu'un prédicat
+/// de titre doit s'appliquer AVANT la page — sinon deux pages successives ne
+/// porteraient pas sur le même ensemble. La page, elle, reste bornée par
+/// [`paginer`] : c'est elle, pas la lecture, qui fait la taille du DIDL.
+///
+/// #5885 — artistes et albums étaient lus sous un plafond de 10 000, APRÈS
+/// le tri alphabétique : au-delà, la fin de l'alphabet n'existait pas pour
+/// `Search`, avec un `TotalMatches` qui l'annonçait comme complet. `Browse`
+/// lit la même rubrique sans plafond ([`TOUTE_LA_RUBRIQUE`]) ; les deux
+/// verbes rendent désormais le même ensemble.
 fn search_containers_in_container(
     state: &UpnpState,
     cible: CibleRecherche,
@@ -1512,7 +1507,7 @@ fn search_containers_in_container(
         CibleRecherche::Pistes => None,
         CibleRecherche::Artistes => {
             let mut artistes = ArtistRepo::with_backend(state.backend.clone())
-                .list(MAX_CANDIDATS_CONTENEURS, 0)
+                .list(TOUTE_LA_RUBRIQUE, 0)
                 .unwrap_or_default();
             trier_artistes(&mut artistes);
             let retenus = retenir(artistes, filtre, champ_d_artiste);
@@ -1521,7 +1516,7 @@ fn search_containers_in_container(
         }
         CibleRecherche::Albums => {
             let mut albums = AlbumRepo::with_backend(state.backend.clone())
-                .list(MAX_CANDIDATS_CONTENEURS, 0)
+                .list(TOUTE_LA_RUBRIQUE, 0)
                 .unwrap_or_default();
             trier_albums(&mut albums);
             let retenus = retenir(albums, filtre, champ_d_album);
@@ -1790,30 +1785,84 @@ fn parse_search_request(soap_xml: &str) -> (String, String, u64, u64, String) {
     (container_id, criteria, start, count, sort_criteria)
 }
 
-fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
-    let update_id = match crate::db::upnp_revision::read(state.backend.as_ref()) {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(error = %e, "upnp_revision_unavailable");
-            return soap_fault(501, "Action Failed");
-        }
-    };
+/// Nombre de constructions d'une même page avant de renoncer à la servir
+/// pendant une écriture du catalogue (#5885).
+const TENTATIVES_PAGE_STABLE: usize = 5;
 
+/// Construit une page `Browse`/`Search` sous un `SystemUpdateID` STABLE, et
+/// rend la page avec ce compteur.
+///
+/// #4201 a posé la règle : une page construite pendant qu'une écriture change
+/// le catalogue n'est pas publiée — elle pourrait mêler l'avant et l'après.
+/// Mais le refus allait jusqu'au point de contrôle, en fault 720 (HTTP 500), à
+/// la PREMIÈRE écriture concurrente. Or le scan d'une grande bibliothèque et
+/// ses passes de fond (pochettes, tags) écrivent sans cesse, et une page du
+/// rayon « Albums » relit tout le rayon pour le trier (#4956) : sur 6 000
+/// albums, chaque page coûte autant que la rubrique entière. Un point de
+/// contrôle (BubbleUPnP, mconnect, Kazoo) qui reçoit un fault au milieu du
+/// parcours s'arrête là, et la liste des albums s'arrête avec lui — « la
+/// moitié des albums absente en UPnP » (#5885).
+///
+/// La page est donc reconstruite, jusqu'à [`TENTATIVES_PAGE_STABLE`] fois,
+/// tant que le compteur bouge pendant sa construction. La règle de #4201 tient
+/// toujours : aucune page n'est publiée avec un compteur qu'elle n'a pas vu
+/// du début à la fin. Le fault 720 ne reste que pour un catalogue qui change
+/// à CHAQUE construction — et il se journalise, pour qu'on le voie enfin.
+///
+/// `Err` porte le fault SOAP à servir : 501 si le compteur est illisible
+/// (jamais de valeur inventée), 720 si le catalogue n'a jamais tenu.
+fn page_sous_revision_stable<T>(
+    state: &UpnpState,
+    action: &'static str,
+    mut construire: impl FnMut() -> T,
+) -> Result<(T, u32), String> {
+    let lire = || {
+        crate::db::upnp_revision::read(state.backend.as_ref()).map_err(|e| {
+            warn!(error = %e, "upnp_revision_unavailable");
+            soap_fault(501, "Action Failed")
+        })
+    };
+    let mut avant = lire()?;
+    for tentative in 1..=TENTATIVES_PAGE_STABLE {
+        let page = construire();
+        let apres = lire()?;
+        if apres == avant {
+            if tentative > 1 {
+                debug!(action, tentative, "upnp_page_reconstruite_apres_ecriture");
+            }
+            return Ok((page, avant));
+        }
+        avant = apres;
+    }
+    warn!(
+        action,
+        tentatives = TENTATIVES_PAGE_STABLE,
+        "upnp_page_refusee_catalogue_en_mouvement"
+    );
+    Err(soap_fault(
+        720,
+        "Cannot process the request: catalog changed",
+    ))
+}
+
+fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
     debug!(body_len = soap_body.len(), "upnp_content_directory_request");
 
     let (object_id, browse_flag, start, count) = parse_browse_request(soap_body);
 
     let direct_children = browse_flag != "BrowseMetadata";
 
-    let didl = if direct_children {
-        browse_direct_children(state, &object_id, start, count)
-    } else {
-        browse_metadata(state, &object_id)
+    let construire = || {
+        if direct_children {
+            browse_direct_children(state, &object_id, start, count)
+        } else {
+            browse_metadata(state, &object_id)
+        }
     };
-
-    if crate::db::upnp_revision::read(state.backend.as_ref()) != Ok(update_id) {
-        return soap_fault(720, "Cannot process the request: catalog changed");
-    }
+    let (didl, update_id) = match page_sous_revision_stable(state, "Browse", construire) {
+        Ok(page) => page,
+        Err(fault) => return fault,
+    };
 
     let total_matches = didl.total;
     let number_returned = didl.returned;
@@ -3924,6 +3973,11 @@ mod tests {
         }
     }
 
+    /// #4201, ajusté par #5885 : une page modifiée pendant sa lecture n'est
+    /// jamais publiée SOUS LE COMPTEUR D'AVANT. Une écriture isolée fait
+    /// reconstruire la page, publiée avec le compteur qu'elle a vu de bout en
+    /// bout ; seul un catalogue qui change à chaque construction rend le
+    /// fault 720.
     #[test]
     fn system_update_id_refuse_une_page_modifiee_pendant_sa_lecture() {
         use crate::db::backend::{DbBackend, DbTxHandle, SqlValue, ToSqlValue};
@@ -3933,6 +3987,9 @@ mod tests {
         struct ConcurrentWriter {
             db: Arc<dyn DbBackend>,
             reads: AtomicUsize,
+            // `true` : une écriture avant CHAQUE relecture du compteur, sauf
+            // la première — un catalogue qui ne tient jamais.
+            toujours: bool,
         }
         impl DbBackend for ConcurrentWriter {
             fn engine(&self) -> crate::db::engine::Engine {
@@ -3972,9 +4029,10 @@ mod tests {
                 sql: &str,
                 p: &[&dyn ToSqlValue],
             ) -> Result<Option<Vec<SqlValue>>, String> {
-                if sql.contains("upnp_catalog_revision")
-                    && self.reads.fetch_add(1, Ordering::SeqCst) == 1
-                {
+                if sql.contains("upnp_catalog_revision") && {
+                    let n = self.reads.fetch_add(1, Ordering::SeqCst);
+                    if self.toujours { n >= 1 } else { n == 1 }
+                } {
                     self.db
                         .execute_batch("INSERT INTO tracks (title) VALUES ('Ajout concurrent')")?;
                 }
@@ -3987,15 +4045,38 @@ mod tests {
                 "<ContainerID>0</ContainerID><SearchCriteria>*</SearchCriteria></u:Search>",
             );
         for request in [corps_browse("0", "BrowseDirectChildren"), search] {
+            // Une écriture concurrente isolée : la page est reconstruite, et
+            // publiée sous le compteur d'APRÈS l'écriture.
+            let mut state = test_state();
+            let avant = crate::db::upnp_revision::read(state.backend.as_ref()).unwrap();
+            state.backend = Arc::new(ConcurrentWriter {
+                db: state.backend,
+                reads: AtomicUsize::new(0),
+                toujours: false,
+            });
+            let response = build_browse_response(&state, &request);
+            let apres = crate::db::upnp_revision::read(state.backend.as_ref()).unwrap();
+            assert_ne!(avant, apres, "le banc doit avoir écrit");
+            assert!(
+                !is_soap_fault(&response),
+                "#5885 : une écriture isolée ne doit pas couper le parcours : {response}"
+            );
+            assert!(
+                response.contains(&format!("<UpdateID>{apres}</UpdateID>")),
+                "la page reconstruite porte le compteur qu'elle a vu ({apres}) : {response}"
+            );
+
+            // Un catalogue qui change à chaque construction : refus explicite.
             let mut state = test_state();
             state.backend = Arc::new(ConcurrentWriter {
                 db: state.backend,
                 reads: AtomicUsize::new(0),
+                toujours: true,
             });
             let response = build_browse_response(&state, &request);
             assert!(
                 response.contains("<errorCode>720</errorCode>"),
-                "une page modifiée pendant la lecture ne doit pas être publiée : {response}"
+                "une page jamais stable ne doit pas être publiée : {response}"
             );
         }
     }

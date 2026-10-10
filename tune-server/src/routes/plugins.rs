@@ -93,56 +93,101 @@ async fn wasm_dispatch(
     } else {
         serde_json::from_slice(&body).unwrap_or(Value::Null)
     };
-    let req = json!({
-        "method": method.as_str(),
-        "path": format!("/{subpath}"),
-        "query": query.unwrap_or_default(),
-        "body": body_json,
-    });
-    let req_str = req.to_string();
+    match appeler_greffon_wasm(
+        &state,
+        &id,
+        method.as_str(),
+        &format!("/{subpath}"),
+        &query.unwrap_or_default(),
+        body_json,
+        None,
+    )
+    .await
+    {
+        Ok((status, corps)) => (status, Json(corps)).into_response(),
+        Err((status, corps)) => (status, Json(corps)).into_response(),
+    }
+}
+
+/// Appeler une route d'un greffon wasm CHARGÉ, depuis le serveur lui-même.
+///
+/// Le corps de [`wasm_dispatch`], sans la garde premium — qui reste l'affaire
+/// de l'appelant : c'est une décision de route, pas de transport. Sert aussi
+/// aux routes historiques que #4741 fait passer par le greffon « Playlists
+/// converter », seul moteur de transfert de playlists du serveur.
+///
+/// `profil` : le profil au nom duquel le greffon agit pendant CET appel (voir
+/// [`crate::plugins_host::avec_profil_de_l_appel`]). `None` garde la règle
+/// d'avant : le réglage global `active_profile_id`.
+///
+/// `Ok((statut, corps))` : la réponse du greffon, quel que soit son statut.
+/// `Err((statut, corps))` : le greffon n'a pas pu répondre (absent, en panne,
+/// réponse illisible).
+#[cfg(feature = "plugins-wasm")]
+pub(crate) async fn appeler_greffon_wasm(
+    state: &AppState,
+    id: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: Value,
+    profil: Option<i64>,
+) -> Result<(StatusCode, Value), (StatusCode, Value)> {
+    let present = state
+        .wasm_plugins
+        .get()
+        .is_some_and(|registry| registry.get(id).is_some());
+    if !present {
+        return Err((
+            StatusCode::NOT_FOUND,
+            json!({ "error": "plugin not found", "id": id }),
+        ));
+    }
+
+    let req_str = json!({
+        "method": method,
+        "path": path,
+        "query": query,
+        "body": body,
+    })
+    .to_string();
 
     // The wasm call (and every host-function it triggers) runs on a blocking
     // thread: the Store isn't Sync — serialise per plugin via its Mutex — and
     // the host's async capabilities `block_on` the runtime, which is only sound
     // off a runtime worker.
     let wasm_plugins = state.wasm_plugins.clone();
-    let plugin_id = id.clone();
+    let plugin_id = id.to_string();
     let call = tokio::task::spawn_blocking(move || {
         let registry = wasm_plugins.get().expect("registry present");
         let loaded = registry.get(&plugin_id).expect("plugin present");
         let mut plugin = loaded.plugin.blocking_lock();
-        plugin.handle_route(&req_str)
+        crate::plugins_host::avec_profil_de_l_appel(profil, || plugin.handle_route(&req_str))
     })
     .await;
 
     let resp_str = match call {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            return (
+            return Err((
                 StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": "plugin_error", "message": e })),
-            )
-                .into_response();
+                json!({ "error": "plugin_error", "message": e }),
+            ));
         }
         Err(e) => {
-            return (
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "plugin_task_failed", "message": e.to_string() })),
-            )
-                .into_response();
+                json!({ "error": "plugin_task_failed", "message": e.to_string() }),
+            ));
         }
     };
 
-    let parsed: Value = match serde_json::from_str(&resp_str) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": "plugin_bad_response", "message": e.to_string() })),
-            )
-                .into_response();
-        }
-    };
+    let parsed: Value = serde_json::from_str(&resp_str).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            json!({ "error": "plugin_bad_response", "message": e.to_string() }),
+        )
+    })?;
 
     let status = parsed
         .get("status")
@@ -150,8 +195,7 @@ async fn wasm_dispatch(
         .and_then(|c| u16::try_from(c).ok())
         .and_then(|c| StatusCode::from_u16(c).ok())
         .unwrap_or(StatusCode::OK);
-    let out_body = parsed.get("body").cloned().unwrap_or(Value::Null);
-    (status, Json(out_body)).into_response()
+    Ok((status, parsed.get("body").cloned().unwrap_or(Value::Null)))
 }
 
 /// Les fiches héritées de la clef de réglages `plugins`, débarrassées de
@@ -247,6 +291,12 @@ fn completer_compatible(mut fiche: Value, compatible: bool) -> Value {
     fiche
 }
 
+/// Le `display_name` d'une fiche SDK : celui que le greffon déclare
+/// ([`tune_core::plugin_sdk::TunePlugin::display_name`]), sinon l'identifiant.
+fn nom_affiche<'a>(declare: &'a str, nom: &'a str) -> &'a str {
+    if declare.is_empty() { nom } else { declare }
+}
+
 async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut plugins: Vec<Value> = fiches_locales_honorables(&state).await;
@@ -291,7 +341,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     {
         let mut card = serde_json::json!({
             "name": info.name,
-            "display_name": info.name,
+            "display_name": nom_affiche(&info.display_name, &info.name),
             "description": info.description,
             "version": info.version,
             "type": "sdk",
@@ -332,7 +382,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         };
         let mut card = serde_json::json!({
             "name": info.name,
-            "display_name": info.name,
+            "display_name": nom_affiche(&info.display_name, &info.name),
             "description": info.description,
             "version": info.version,
             "type": "sdk",
@@ -453,7 +503,7 @@ fn carte_en_erreur(
 ) -> Value {
     let mut card = json!({
         "name": error.name,
-        "display_name": error.name,
+        "display_name": nom_affiche(&error.display_name, &error.name),
         "description": error.description,
         "version": error.version,
         "type": "sdk",

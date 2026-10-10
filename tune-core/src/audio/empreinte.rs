@@ -13,8 +13,11 @@
 //! Granularite : deux contenus de meme enveloppe et de hauteur dominante
 //! voisine (un sinus pur de 440 Hz, un melange 220/330/440) se ressemblent
 //! pour elle. Elle reconnait un MEME enregistrement sous deux encodages ; elle
-//! ne classe pas des morceaux differents, et BIB-B3 la croise avec la duree,
-//! le titre et l'artiste avant de nommer un doublon.
+//! ne classe pas des morceaux differents. Avant de nommer un doublon,
+//! [`grouper_par_contenu_avec_durees_et_titres`] la croise avec la DUREE
+//! reelle (a une seconde pres, #5455) et le TITRE (#5976 : titres normalises
+//! egaux, memes mentions de version — « Titre » et « Titre (Instrumental) »
+//! ne sont pas le meme enregistrement). L'artiste n'est PAS compare.
 //!
 //! Ce module est pur : aucune base, aucun réseau, aucune dépendance nouvelle,
 //! présent dans le binaire par défaut (Tune OS sur Raspberry Pi n'a ni la
@@ -122,13 +125,30 @@ impl Empreinte {
 /// `Err` si le fichier ne se décode pas ; `Ok(None)` s'il ne contient que du
 /// silence.
 pub fn empreinte_du_fichier(chemin: &str) -> Result<Option<Empreinte>, String> {
-    let decode = decode_to_pcm(
-        chemin,
-        Some(TAUX),
-        Some(1),
-        0.0,
-        FENETRE_S + MARGE_SILENCE_S,
-    )?;
+    let decode = decode_to_pcm(chemin, Some(TAUX), Some(1), 0.0, FENETRE_DECODEE_S)?;
+    empreinte_d_un_decodage_adapte(decode)
+}
+
+/// La fenêtre de tête que décode l'empreinte, marge de silence comprise.
+pub(crate) const FENETRE_DECODEE_S: f64 = FENETRE_S + MARGE_SILENCE_S;
+
+/// L'empreinte tirée d'un décodage NATIF de la fenêtre de tête
+/// (`decode::decode_natif(chemin, Some(TAUX), Some(1), 0.0, FENETRE_DECODEE_S)`).
+///
+/// #5519 — [`empreinte_du_fichier`] vaut exactement ceci appliqué à ce
+/// décodage-là : `decode_to_pcm` n'est que `adapter_pcm ∘ decode_natif`. La
+/// passe ReplayGain l'appelle sur le décodage qu'elle fait déjà, au lieu de
+/// relire le fichier.
+pub(crate) fn empreinte_d_un_decodage_natif(
+    natif: crate::audio::decode::DecodedAudio,
+) -> Result<Option<Empreinte>, String> {
+    let decode = crate::audio::decode::adapter_pcm(natif, Some(TAUX), Some(1))?;
+    empreinte_d_un_decodage_adapte(decode)
+}
+
+fn empreinte_d_un_decodage_adapte(
+    decode: crate::audio::decode::DecodedAudio,
+) -> Result<Option<Empreinte>, String> {
     if decode.channels != 1 || decode.sample_rate != TAUX {
         return Err(format!(
             "decodeur hors contrat : {} canaux a {} Hz",
@@ -381,9 +401,100 @@ pub fn grouper_par_contenu_avec_durees(
     empreintes: &[(i64, Empreinte)],
     durees_ms: &[Option<i64>],
 ) -> Vec<Vec<i64>> {
+    grouper_par_contenu_avec_durees_et_titres(empreintes, durees_ms, &[])
+}
+
+/// Les mentions de VERSION qu'un titre peut porter : deux pistes dont l'une
+/// en porte une que l'autre n'a pas ne sont pas le même enregistrement, quoi
+/// qu'en dise l'empreinte (#5976). Comparées mot à mot, sur le titre
+/// normalisé par [`titre_normalise`] (minuscules, sans accents).
+pub const MENTIONS_DE_VERSION: &[&str] = &[
+    "instrumental",
+    "instrumentale",
+    "instru",
+    "karaoke",
+    "live",
+    "remix",
+    "remixed",
+    "rmx",
+    "mix",
+    "demo",
+    "acoustic",
+    "acoustique",
+    "unplugged",
+    "edit",
+    "remaster",
+    "remastered",
+    "remasterise",
+    "remasterisee",
+    "mono",
+    "stereo",
+    "version",
+    "extended",
+    "orchestral",
+    "acapella",
+    "cappella",
+    "alternate",
+    "outtake",
+    "rehearsal",
+    "dub",
+];
+
+/// Le titre tel que le compare le faisceau « même enregistrement » : sans
+/// accents, en minuscules, toute ponctuation ramenée à une espace, espaces
+/// réduites. « Nightfall » et « NIGHTFALL ! » sont le même titre ;
+/// « Nightfall » et « Nightfall (Instrumental) » non.
+pub fn titre_normalise(titre: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    let replie: String = titre
+        .nfkd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    replie.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Les mentions de version ([`MENTIONS_DE_VERSION`]) d'un titre normalisé,
+/// triées et sans doublon.
+fn mentions_de_version(normalise: &str) -> Vec<&'static str> {
+    let mut m: Vec<&'static str> = normalise
+        .split(' ')
+        .filter_map(|mot| MENTIONS_DE_VERSION.iter().copied().find(|v| *v == mot))
+        .collect();
+    m.sort_unstable();
+    m.dedup();
+    m
+}
+
+/// #5976 — deux titres peuvent-ils désigner le même enregistrement ? Non si
+/// l'un porte une mention de version que l'autre n'a pas, ni si, connus tous
+/// les deux, leurs formes normalisées diffèrent. Un titre absent ou vide ne
+/// borne que par les mentions.
+pub fn titres_compatibles(a: Option<&str>, b: Option<&str>) -> bool {
+    let na = a.map(titre_normalise).unwrap_or_default();
+    let nb = b.map(titre_normalise).unwrap_or_default();
+    if mentions_de_version(&na) != mentions_de_version(&nb) {
+        return false;
+    }
+    na.is_empty() || nb.is_empty() || na == nb
+}
+
+/// [`grouper_par_contenu_avec_durees`], où deux pistes ne se comparent en
+/// outre que si leurs titres (`titres[i]`) sont [`titres_compatibles`] —
+/// #5976 : sans lui, « Nightfall » et « Nightfall (Instrumental) », même
+/// mixage sans la voix, même durée à la seconde, même première minute,
+/// passaient pour le même enregistrement. Un tableau de titres vide ou trop
+/// court ne borne rien au-delà de sa longueur.
+pub fn grouper_par_contenu_avec_durees_et_titres(
+    empreintes: &[(i64, Empreinte)],
+    durees_ms: &[Option<i64>],
+    titres: &[Option<String>],
+) -> Vec<Vec<i64>> {
     use std::collections::BTreeMap;
     let longueur = |i: usize| empreintes[i].1.trames.len();
     let duree = |i: usize| durees_ms.get(i).copied().flatten().filter(|d| *d > 0);
+    let titre = |i: usize| titres.get(i).map(|t| t.as_deref());
     let cumuls: Vec<Cumuls> = empreintes.iter().map(|(_, e)| Cumuls::de(e)).collect();
     // LIAISON COMPLÈTE, pas transitive : une piste n'entre dans un groupe que
     // si elle est « même contenu » avec CHACUN de ses membres, et deux groupes
@@ -391,6 +502,11 @@ pub fn grouper_par_contenu_avec_durees(
     // banc réel, une seule paire douteuse suffisait à souder Coltrane,
     // Gainsbourg et Nougaro dans un groupe de cent pistes.
     let meme = |i: usize, j: usize| {
+        if let (Some(a), Some(b)) = (titre(i), titre(j))
+            && !titres_compatibles(a, b)
+        {
+            return false;
+        }
         if let (Some(a), Some(b)) = (duree(i), duree(j))
             && (a - b).abs() > TOLERANCE_DUREE_MS
         {
@@ -855,5 +971,71 @@ mod tests {
             vec![vec![1, 2]],
             "une durée inconnue ne borne rien, la liaison complète écarte le troisième"
         );
+    }
+
+    /// #5976 — Xandria, *Sacrificium* : « Nightfall » et « Nightfall
+    /// (Instrumental) », même mixage sans la voix, même durée à la seconde,
+    /// même première minute. L'empreinte les confond ; le titre les sépare.
+    #[test]
+    fn un_instrumental_de_meme_duree_et_meme_empreinte_n_est_pas_le_meme_enregistrement() {
+        let plate = Empreinte {
+            version: VERSION.to_string(),
+            trames: vec![[150, 150]; 600],
+        };
+        let e = [(1, plate.clone()), (2, plate.clone()), (3, plate)];
+        let durees = [Some(236_000), Some(236_000), Some(236_400)];
+        assert_eq!(
+            grouper_par_contenu_avec_durees(&e, &durees),
+            vec![vec![1, 2, 3]],
+            "sans les titres, les trois passent pour le même enregistrement"
+        );
+        let titres = [
+            Some("Nightfall".to_string()),
+            Some("Nightfall (Instrumental)".to_string()),
+            Some("NIGHTFALL !".to_string()),
+        ];
+        assert_eq!(
+            grouper_par_contenu_avec_durees_et_titres(&e, &durees, &titres),
+            vec![vec![1, 3]],
+            "l'instrumental reste seul ; la casse et la ponctuation ne comptent pas"
+        );
+    }
+
+    #[test]
+    fn titres_compatibles_refuse_une_mention_de_version_ou_un_autre_titre() {
+        let ok = |a: &str, b: &str| titres_compatibles(Some(a), Some(b));
+        assert!(ok("Nightfall", "Nightfall"));
+        assert!(ok("Été indien", "ETE INDIEN"), "accents et casse repliés");
+        assert!(
+            ok("Don't Stop", "Don’t  Stop"),
+            "apostrophes et espaces repliées"
+        );
+        for v in [
+            "Nightfall (Instrumental)",
+            "Nightfall - Live",
+            "Nightfall [Remastered 2011]",
+            "Nightfall (Radio Edit)",
+            "Nightfall (Demo)",
+            "Nightfall (Acoustic Version)",
+            "Nightfall (Karaoke)",
+            "Nightfall (Mono)",
+            "Nightfall (Remix)",
+        ] {
+            assert!(!ok("Nightfall", v), "{v}");
+            assert!(!ok(v, "Nightfall"), "{v} (symétrique)");
+        }
+        assert!(!ok("Nightfall", "Stardust"), "deux titres différents");
+        assert!(
+            ok("Live Forever", "Live Forever"),
+            "« live » des deux côtés"
+        );
+        assert!(
+            !ok("Song (Live)", "Song (Instrumental)"),
+            "deux mentions différentes"
+        );
+        // Un titre inconnu ne borne que par les mentions.
+        assert!(titres_compatibles(None, Some("Nightfall")));
+        assert!(titres_compatibles(Some(""), Some("Nightfall")));
+        assert!(!titres_compatibles(None, Some("Nightfall (Live)")));
     }
 }

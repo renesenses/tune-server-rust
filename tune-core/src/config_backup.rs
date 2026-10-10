@@ -8,22 +8,21 @@
 //! # Streaming tokens
 //!
 //! Streaming credentials are OAuth refresh tokens for paid accounts, and a
-//! snapshot leaves the machine: `cloud-push` PUTs it to mozaiklabs.fr. They
+//! snapshot leaves the machine as a downloaded file. They
 //! used to be XOR'd with a fixed key compiled into every binary, which is not
 //! encryption — anyone holding a Tune build could read every token in every
 //! snapshot they could reach (audit item 7).
 //!
 //! They are now sealed in a [`Envelope`]: a random data key encrypts them, and
 //! that data key is wrapped under both the user's passphrase and a recovery key
-//! shown once. Without one of those two secrets the tokens are unreadable, so
-//! the cloud store holds an opaque blob.
+//! shown once. Without one of those two secrets the tokens are unreadable.
 //!
 //! Two consequences worth knowing:
 //!
 //! - [`export_config`] produces a snapshot with **no tokens at all**. Sealing
 //!   requires the passphrase, so it is [`export_config_sealed`] that carries
 //!   them. Everything else — zones, playlists, favourites — restores without
-//!   any secret, so an unattended `cloud-pull` onto a fresh machine still
+//!   any secret, so a restore onto a fresh machine still
 //!   rebuilds the install and only asks for a passphrase to re-attach the
 //!   streaming services.
 //! - Snapshots written before this change are still readable on import
@@ -34,7 +33,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
@@ -361,7 +359,9 @@ fn sqlvalue_to_json(v: &SqlValue) -> Value {
     }
 }
 
-fn export_zones(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
+/// Aussi lu par l'export GRATUIT de configuration (`crate::config_export`),
+/// qui part de ces colonnes et y ajoute les réglages de zone.
+pub(crate) fn export_zones(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
     let cols = &[
         "id",
         "name",
@@ -398,7 +398,10 @@ fn export_settings(
     let mut room_profiles = Vec::new();
 
     for (key, value) in all {
-        if is_sensitive(&key) {
+        // La liste fixe ci-dessus ne nommait ni les jetons de service ni ceux
+        // du compte : le filtre COMMUN des secrets (`crate::secrets`, celui de
+        // l'export gratuit) s'applique aussi ici (#5654).
+        if is_sensitive(&key) || crate::secrets::est_secret(&key) {
             debug!(key = %key, "config_export_skip_sensitive");
             continue;
         }
@@ -414,7 +417,7 @@ fn export_settings(
     Ok((general, eq_presets, room_profiles))
 }
 
-fn export_playlists(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
+pub(crate) fn export_playlists(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
     let playlist_rows = backend.query_many(
         "SELECT id, name, description FROM playlists ORDER BY id",
         &[],
@@ -517,7 +520,7 @@ fn export_favorites(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> 
     Ok(rows_to_json(rows, cols))
 }
 
-fn export_radios(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
+pub(crate) fn export_radios(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
     let cols = &[
         "id",
         "name",
@@ -552,10 +555,21 @@ fn export_alarms(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
         "volume",
         "fade_in_seconds",
         "name",
+        "days_of_week",
+        "skip_holidays",
+        "multi_zone_ids",
+        "one_shot",
+        "source_name",
+        "fade_duration_s",
     ];
+    // `days_of_week` (the mask the scheduler reads first), `skip_holidays`
+    // and `multi_zone_ids` were missing: every restored alarm rang daily, on
+    // one zone, holidays included (#5669).
     let rows = backend.query_many(
         "SELECT id, zone_id, time, enabled, days, source_type, \
-         source_id, volume, fade_in_seconds, name \
+         source_id, volume, fade_in_seconds, name, days_of_week, \
+         skip_holidays, multi_zone_ids, one_shot, source_name, \
+         fade_duration_s \
          FROM alarms ORDER BY id",
         &[],
     )?;
@@ -887,119 +901,136 @@ fn import_playlists(
         )?;
 
         if let Some(tracks) = pl["tracks"].as_array() {
-            for t in tracks {
-                let title = t["title"].as_str().unwrap_or_default();
-                let artist = t["artist_name"].as_str().unwrap_or_default();
-                let album = t["album_title"].as_str().unwrap_or_default();
-                let source = t["source"].as_str().unwrap_or("local");
-                let source_id = t["source_id"].as_str().unwrap_or_default();
-                let position = t["position"].as_i64().unwrap_or(0);
-
-                // #5066 — un titre de service (#4922) ne se cherche pas dans
-                // `tracks` : il se RECREE tel quel, `track_id` NUL, avec ses
-                // colonnes d'affichage. Le CHECK de la table exige `source` et
-                // `source_id` ; une ligne qui ne les a pas est signalee.
-                if t["kind"].as_str() == Some("service") {
-                    let texte = |cle: &str| {
-                        t[cle]
-                            .as_str()
-                            .filter(|s| !s.trim().is_empty())
-                            .map(str::to_string)
-                    };
-                    let (Some(source), Some(source_id)) = (texte("source"), texte("source_id"))
-                    else {
-                        warnings.push(format!(
-                            "playlist '{name}': service track at position {position} \
-                             has no source/source_id, skipped"
-                        ));
-                        continue;
-                    };
-                    backend.execute(
-                        "INSERT INTO playlist_tracks (playlist_id, position, source, source_id, \
-                         title, artist, album, album_source_id, duration_ms, cover_url) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        &[
-                            &pl_id as &dyn ToSqlValue,
-                            &position as &dyn ToSqlValue,
-                            &source as &dyn ToSqlValue,
-                            &source_id as &dyn ToSqlValue,
-                            &texte("title") as &dyn ToSqlValue,
-                            &texte("artist_name") as &dyn ToSqlValue,
-                            &texte("album_title") as &dyn ToSqlValue,
-                            &texte("album_source_id") as &dyn ToSqlValue,
-                            &t["duration_ms"].as_i64() as &dyn ToSqlValue,
-                            &texte("cover_url") as &dyn ToSqlValue,
-                        ],
-                    )?;
-                    continue;
-                }
-
-                let track_row = if !source_id.is_empty() {
-                    backend.query_one(
-                        "SELECT id FROM tracks WHERE source = ? AND source_id = ?",
-                        &[
-                            &source.to_string() as &dyn ToSqlValue,
-                            &source_id.to_string() as &dyn ToSqlValue,
-                        ],
-                    )?
-                } else {
-                    // #4927 — `tracks` n'a ni `artist_name` ni `album_title` :
-                    // l'artiste et l'album sont des cles etrangeres. Une piste
-                    // locale se retrouve par titre + nom d'artiste, et l'album
-                    // departage deux homonymes (une sauvegarde sans
-                    // `album_title` prend la premiere, comme avant).
-                    backend.query_one(
-                        "SELECT t.id FROM tracks t \
-                         LEFT JOIN artists ar ON ar.id = t.artist_id \
-                         LEFT JOIN albums al ON al.id = t.album_id \
-                         WHERE t.title = ? AND COALESCE(ar.name, '') = ? \
-                         ORDER BY CASE WHEN COALESCE(al.title, '') = ? THEN 0 ELSE 1 END, t.id \
-                         LIMIT 1",
-                        &[
-                            &title.to_string() as &dyn ToSqlValue,
-                            &artist.to_string() as &dyn ToSqlValue,
-                            &album.to_string() as &dyn ToSqlValue,
-                        ],
-                    )?
-                };
-
-                // #5113 — titre et artiste ne la retrouvent pas : son
-                // empreinte, si la sauvegarde la porte et qu'elle designe UNE
-                // seule piste de la cible.
-                let track_row = match track_row {
-                    Some(row) => Some(row),
-                    None => piste_par_empreinte(backend, t)?,
-                };
-
-                let Some(row) = track_row else {
-                    // #5113 — elle etait abandonnee sans un mot : la playlist
-                    // revenait plus courte et rien ne le disait.
-                    let chemin = t["file_path"]
-                        .as_str()
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or("unknown path: backup predates it");
-                    warnings.push(format!(
-                        "playlist '{name}': track at position {position} not found in the \
-                         library, skipped: '{title}' by '{artist}' ({chemin})"
-                    ));
-                    continue;
-                };
-                let track_id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
-                backend.execute(
-                    "INSERT INTO playlist_tracks (playlist_id, track_id, position) \
-                     VALUES (?, ?, ?)",
-                    &[
-                        &pl_id as &dyn ToSqlValue,
-                        &track_id as &dyn ToSqlValue,
-                        &position as &dyn ToSqlValue,
-                    ],
-                )?;
-            }
+            inserer_les_pistes(backend, pl_id, name, tracks, warnings)?;
         }
 
         count += 1;
     }
     Ok(count)
+}
+
+/// Insère les pistes d'une playlist sauvegardée dans la playlist `pl_id`.
+///
+/// Extrait d'[`import_playlists`] pour la restauration depuis le cloud
+/// (#5654), qui REMPLACE le contenu d'une playlist homonyme : mêmes règles de
+/// rapprochement (service, `source_id`, titre + artiste, empreinte), mêmes
+/// avertissements. N'écrit que `playlist_tracks` : la bibliothèque n'est
+/// jamais touchée.
+pub(crate) fn inserer_les_pistes(
+    backend: &Arc<dyn DbBackend>,
+    pl_id: i64,
+    name: &str,
+    tracks: &[Value],
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    for t in tracks {
+        let title = t["title"].as_str().unwrap_or_default();
+        let artist = t["artist_name"].as_str().unwrap_or_default();
+        let album = t["album_title"].as_str().unwrap_or_default();
+        let source = t["source"].as_str().unwrap_or("local");
+        let source_id = t["source_id"].as_str().unwrap_or_default();
+        let position = t["position"].as_i64().unwrap_or(0);
+
+        // #5066 — un titre de service (#4922) ne se cherche pas dans
+        // `tracks` : il se RECREE tel quel, `track_id` NUL, avec ses
+        // colonnes d'affichage. Le CHECK de la table exige `source` et
+        // `source_id` ; une ligne qui ne les a pas est signalee.
+        if t["kind"].as_str() == Some("service") {
+            let texte = |cle: &str| {
+                t[cle]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+            };
+            let (Some(source), Some(source_id)) = (texte("source"), texte("source_id")) else {
+                warnings.push(format!(
+                    "playlist '{name}': service track at position {position} \
+                     has no source/source_id, skipped"
+                ));
+                continue;
+            };
+            backend.execute(
+                "INSERT INTO playlist_tracks (playlist_id, position, source, source_id, \
+                 title, artist, album, album_source_id, duration_ms, cover_url) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                &[
+                    &pl_id as &dyn ToSqlValue,
+                    &position as &dyn ToSqlValue,
+                    &source as &dyn ToSqlValue,
+                    &source_id as &dyn ToSqlValue,
+                    &texte("title") as &dyn ToSqlValue,
+                    &texte("artist_name") as &dyn ToSqlValue,
+                    &texte("album_title") as &dyn ToSqlValue,
+                    &texte("album_source_id") as &dyn ToSqlValue,
+                    &t["duration_ms"].as_i64() as &dyn ToSqlValue,
+                    &texte("cover_url") as &dyn ToSqlValue,
+                ],
+            )?;
+            continue;
+        }
+
+        let track_row = if !source_id.is_empty() {
+            backend.query_one(
+                "SELECT id FROM tracks WHERE source = ? AND source_id = ?",
+                &[
+                    &source.to_string() as &dyn ToSqlValue,
+                    &source_id.to_string() as &dyn ToSqlValue,
+                ],
+            )?
+        } else {
+            // #4927 — `tracks` n'a ni `artist_name` ni `album_title` :
+            // l'artiste et l'album sont des cles etrangeres. Une piste
+            // locale se retrouve par titre + nom d'artiste, et l'album
+            // departage deux homonymes (une sauvegarde sans
+            // `album_title` prend la premiere, comme avant).
+            backend.query_one(
+                "SELECT t.id FROM tracks t \
+                 LEFT JOIN artists ar ON ar.id = t.artist_id \
+                 LEFT JOIN albums al ON al.id = t.album_id \
+                 WHERE t.title = ? AND COALESCE(ar.name, '') = ? \
+                 ORDER BY CASE WHEN COALESCE(al.title, '') = ? THEN 0 ELSE 1 END, t.id \
+                 LIMIT 1",
+                &[
+                    &title.to_string() as &dyn ToSqlValue,
+                    &artist.to_string() as &dyn ToSqlValue,
+                    &album.to_string() as &dyn ToSqlValue,
+                ],
+            )?
+        };
+
+        // #5113 — titre et artiste ne la retrouvent pas : son
+        // empreinte, si la sauvegarde la porte et qu'elle designe UNE
+        // seule piste de la cible.
+        let track_row = match track_row {
+            Some(row) => Some(row),
+            None => piste_par_empreinte(backend, t)?,
+        };
+
+        let Some(row) = track_row else {
+            // #5113 — elle etait abandonnee sans un mot : la playlist
+            // revenait plus courte et rien ne le disait.
+            let chemin = t["file_path"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("unknown path: backup predates it");
+            warnings.push(format!(
+                "playlist '{name}': track at position {position} not found in the \
+                 library, skipped: '{title}' by '{artist}' ({chemin})"
+            ));
+            continue;
+        };
+        let track_id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+        backend.execute(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position) \
+             VALUES (?, ?, ?)",
+            &[
+                &pl_id as &dyn ToSqlValue,
+                &track_id as &dyn ToSqlValue,
+                &position as &dyn ToSqlValue,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// #5113 — retrouver une piste de la sauvegarde par son empreinte
@@ -1066,7 +1097,7 @@ fn import_favorites(
     Ok(count)
 }
 
-fn import_radios(
+pub(crate) fn import_radios(
     backend: &Arc<dyn DbBackend>,
     radios: &[Value],
     _warnings: &mut Vec<String>,
@@ -1114,10 +1145,18 @@ fn import_radios(
     Ok(count)
 }
 
+/// Optional text field of a backed-up alarm (absent / null / empty → `None`).
+fn alarm_text(a: &Value, key: &str) -> Option<String> {
+    a[key]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn import_alarms(
     backend: &Arc<dyn DbBackend>,
     alarms: &[Value],
-    _warnings: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Result<usize, String> {
     let mut count = 0;
     for a in alarms {
@@ -1142,20 +1181,50 @@ fn import_alarms(
             continue;
         }
 
+        // Days: the backed-up mask as is. A backup made before #5669 has no
+        // `days_of_week`: the column default ("1111111", what such a restore
+        // has always produced) applies — the legacy `days` text is not
+        // trusted, the scheduler never read it next to a mask.
+        let days_of_week = match a["days_of_week"].as_str() {
+            Some(m) if crate::alarms::is_days_mask(m) => m.to_string(),
+            other => {
+                if let Some(m) = other {
+                    warnings.push(format!(
+                        "alarm {name:?}: invalid days_of_week {m:?}, restored as every day"
+                    ));
+                }
+                "1111111".to_string()
+            }
+        };
+        // Same binding as the alarm API: an opaque text id (radio uuid,
+        // service id), a numeric one from SQLite is turned into its text.
+        let source_id: Option<String> = a["source_id"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| a["source_id"].as_i64().map(|n| n.to_string()));
+
         backend.execute(
             "INSERT INTO alarms (zone_id, time, enabled, days, source_type, \
-             source_id, volume, fade_in_seconds, name) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             source_id, volume, fade_in_seconds, name, days_of_week, \
+             skip_holidays, multi_zone_ids, one_shot, source_name, \
+             fade_duration_s) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 &zone_id as &dyn ToSqlValue,
                 &time.to_string() as &dyn ToSqlValue,
                 &a["enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
                 &a["days"].as_str().unwrap_or("1,2,3,4,5,6,7").to_string() as &dyn ToSqlValue,
                 &a["source_type"].as_str().unwrap_or("playlist").to_string() as &dyn ToSqlValue,
-                &a["source_id"].as_i64() as &dyn ToSqlValue,
+                &source_id as &dyn ToSqlValue,
                 &a["volume"].as_f64().unwrap_or(0.3) as &dyn ToSqlValue,
                 &a["fade_in_seconds"].as_i64().unwrap_or(30) as &dyn ToSqlValue,
                 &name.to_string() as &dyn ToSqlValue,
+                &days_of_week as &dyn ToSqlValue,
+                &a["skip_holidays"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
+                &alarm_text(a, "multi_zone_ids") as &dyn ToSqlValue,
+                &a["one_shot"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
+                &alarm_text(a, "source_name") as &dyn ToSqlValue,
+                &a["fade_duration_s"].as_i64().unwrap_or(60) as &dyn ToSqlValue,
             ],
         )?;
         count += 1;
@@ -1244,23 +1313,6 @@ fn import_legacy_tokens(
     Ok(count)
 }
 
-// ── Snapshot fingerprint ────────────────────────────────────────────
-
-impl ConfigSnapshot {
-    /// SHA-256 digest of the snapshot content (for cloud deduplication).
-    pub fn fingerprint(&self) -> String {
-        let json = serde_json::to_vec(self).unwrap_or_default();
-        let mut hasher = Sha256::new();
-        hasher.update(&json);
-        format!("{:x}", hasher.finalize())
-    }
-
-    /// Approximate size in bytes when serialised as JSON.
-    pub fn size_bytes(&self) -> usize {
-        serde_json::to_vec(self).map(|v| v.len()).unwrap_or(0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1298,28 +1350,6 @@ mod tests {
         assert!(is_room_profile_key("room_profile_1"));
         assert!(is_room_profile_key("room_profile_index"));
         assert!(!is_room_profile_key("theme"));
-    }
-
-    #[test]
-    fn snapshot_fingerprint_deterministic() {
-        let snap = ConfigSnapshot {
-            version: "0.8.0".into(),
-            created_at: "2026-06-25T00:00:00Z".into(),
-            zones: vec![],
-            settings: vec![],
-            playlists: vec![],
-            favorites: vec![],
-            radio_stations: vec![],
-            alarms: vec![],
-            eq_presets: vec![],
-            room_profiles: vec![],
-            streaming_tokens: vec![],
-            sealed_tokens: None,
-        };
-        let fp1 = snap.fingerprint();
-        let fp2 = snap.fingerprint();
-        assert_eq!(fp1, fp2);
-        assert_eq!(fp1.len(), 64);
     }
 
     #[test]
@@ -1371,6 +1401,143 @@ mod tests {
         assert!(row.is_some());
     }
 
+    /// #5654 — l'export Premium ne laisse sortir AUCUN jeton : ni de service,
+    /// ni du compte, ni de liaison. Témoin : la liste fixe seule les laissait
+    /// passer.
+    #[test]
+    fn l_export_premium_ne_porte_aucun_jeton() {
+        let backend = fresh_backend();
+        let settings = SettingsRepo::with_backend(backend.clone());
+        for (k, v) in [
+            ("discogs_token", "jeton-discogs"),
+            ("auth_tokens_qobuz", "{\"user_auth_token\":\"jeton-qobuz\"}"),
+            ("mozaik_refresh_token", "jeton-compte"),
+            ("cloud_server_link_token", "jeton-liaison"),
+            ("theme", "dark"),
+        ] {
+            settings.set(k, v).unwrap();
+        }
+        let snapshot = export_config(&backend).unwrap();
+        let texte = serde_json::to_string(&snapshot).unwrap();
+        for jeton in [
+            "jeton-discogs",
+            "jeton-qobuz",
+            "jeton-compte",
+            "jeton-liaison",
+        ] {
+            assert!(
+                !texte.contains(jeton),
+                "l'export Premium porte un secret en clair : {jeton}"
+            );
+        }
+        assert!(snapshot.settings.iter().any(|(k, _)| k == "theme"));
+    }
+
+    // ── Alarms round trip (#5669) ───────────────────────────────────
+
+    fn fresh_backend() -> Arc<dyn DbBackend> {
+        use crate::db::migrations;
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn alarm_row(backend: &Arc<dyn DbBackend>, name: &str) -> Vec<crate::db::backend::SqlValue> {
+        backend
+            .query_one(
+                "SELECT days_of_week, skip_holidays, multi_zone_ids, zone_id, one_shot, \
+                 CAST(source_id AS TEXT), source_name, fade_duration_s \
+                 FROM alarms WHERE name = ?",
+                &[&name.to_string() as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .expect("alarm restored")
+    }
+
+    /// A weekday alarm that skips holidays and rings two zones comes back
+    /// identical — it used to come back daily, single-zone, holidays included.
+    #[test]
+    fn alarm_days_holidays_and_zones_survive_export_import_5669() {
+        let src = fresh_backend();
+        for z in ["Salon", "Chambre"] {
+            src.execute(
+                "INSERT INTO zones (name, volume) VALUES (?, ?)",
+                &[&z.to_string() as &dyn ToSqlValue, &50i64 as &dyn ToSqlValue],
+            )
+            .unwrap();
+        }
+        src.execute(
+            "INSERT INTO alarms (name, time, days, zone_id, source_type, source_id, \
+             source_name, days_of_week, skip_holidays, multi_zone_ids, one_shot, \
+             fade_duration_s) \
+             VALUES ('Semaine', '06:45', '0,1,2,3,4', 1, 'radio', 'fip-uuid', 'FIP', \
+             '1111100', 1, '[1,2]', 0, 120)",
+            &[],
+        )
+        .unwrap();
+
+        // Through JSON, like a real backup file.
+        let snapshot = export_config(&src).unwrap();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let snapshot: ConfigSnapshot = serde_json::from_str(&json).unwrap();
+
+        let dst = fresh_backend();
+        let report = import_config(&dst, snapshot).unwrap();
+        assert_eq!(report.alarms_restored, 1);
+
+        let r = alarm_row(&dst, "Semaine");
+        assert_eq!(r[0].as_str(), Some("1111100"), "days_of_week");
+        assert_eq!(r[1].as_i64(), Some(1), "skip_holidays");
+        assert_eq!(r[2].as_str(), Some("[1,2]"), "multi_zone_ids");
+        assert_eq!(r[3].as_i64(), Some(1), "zone_id");
+        assert_eq!(r[4].as_i64(), Some(0), "one_shot");
+        assert_eq!(r[5].as_str(), Some("fip-uuid"), "source_id");
+        assert_eq!(r[6].as_str(), Some("FIP"), "source_name");
+        assert_eq!(r[7].as_i64(), Some(120), "fade_duration_s");
+
+        // And the scheduler reads it as Mon..Fri.
+        let alarm = serde_json::json!({ "days_of_week": r[0].as_str() });
+        assert_eq!(
+            crate::alarms::resolve_alarm_days(&alarm),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    /// A backup written before #5669 carries none of these fields: it is
+    /// still accepted, with today's defaults (every day, no holiday skip,
+    /// single zone).
+    #[test]
+    fn alarm_from_backup_without_new_fields_gets_defaults_5669() {
+        let snapshot: ConfigSnapshot = serde_json::from_value(serde_json::json!({
+            "version": "0.9.150",
+            "created_at": "2026-08-01T00:00:00Z",
+            "zones": [], "settings": [], "playlists": [], "favorites": [],
+            "radio_stations": [],
+            "alarms": [{
+                "id": 7, "zone_id": null, "time": "07:30", "enabled": 1,
+                "days": "0,1,2,3,4", "source_type": "radio", "source_id": 42,
+                "volume": 0.4, "fade_in_seconds": 30, "name": "Ancien"
+            }],
+            "eq_presets": [], "room_profiles": [], "streaming_tokens": []
+        }))
+        .unwrap();
+
+        let dst = fresh_backend();
+        let report = import_config(&dst, snapshot).unwrap();
+        assert_eq!(report.alarms_restored, 1);
+
+        let r = alarm_row(&dst, "Ancien");
+        assert_eq!(r[0].as_str(), Some("1111111"), "days_of_week default");
+        assert_eq!(r[1].as_i64(), Some(0), "skip_holidays default");
+        assert_eq!(r[2].as_str(), None, "multi_zone_ids default");
+        assert_eq!(r[4].as_i64(), Some(0), "one_shot default");
+        assert_eq!(r[5].as_str(), Some("42"), "numeric source_id kept");
+        assert_eq!(r[7].as_i64(), Some(60), "fade_duration_s default");
+    }
+
     // ── Sealed streaming tokens ─────────────────────────────────────
 
     const VAULT: &str = r#"{"tidal":{"refresh_token":"tidal-refresh-secret"}}"#;
@@ -1390,8 +1557,8 @@ mod tests {
     }
 
     /// The heart of audit item 7: a snapshot that leaves the machine must not
-    /// carry a recoverable token. Previously `cloud-push` PUT them to
-    /// mozaiklabs.fr XOR'd with a key compiled into every binary.
+    /// carry a recoverable token. Previously they left XOR'd with a key
+    /// compiled into every binary.
     #[test]
     fn a_sealed_snapshot_leaks_no_token() {
         let backend = seeded_backend();
@@ -1406,8 +1573,8 @@ mod tests {
         assert!(snapshot.streaming_tokens.is_empty());
     }
 
-    /// The plain export must never carry tokens: it is what an unattended
-    /// cloud-push sends, with no passphrase to seal them.
+    /// The plain export must never carry tokens: nothing seals them without
+    /// a passphrase.
     #[test]
     fn the_plain_export_carries_no_tokens() {
         let backend = seeded_backend();
@@ -1454,7 +1621,7 @@ mod tests {
     }
 
     /// Everything except the tokens must restore with no secret at all —
-    /// otherwise a cloud-pull onto a new machine is useless without a
+    /// otherwise a restore onto a new machine is useless without a
     /// passphrase.
     #[test]
     fn a_restore_without_the_secret_still_rebuilds_the_install() {

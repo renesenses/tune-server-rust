@@ -72,12 +72,17 @@ impl SettingsRepo {
     pub fn get(&self, key: &str) -> Result<Option<String>, String> {
         let sql = self.dialect_sql(sql::get_by_key, sql::get_by_key);
         let params: [&dyn ToSqlValue; 1] = [&key];
-        // Use query_one_strong to read through the write connection.
         // Settings are frequently read immediately after a write (e.g.
         // saving a Discogs token then checking discogs_token_set in
-        // get_config). The read-only WAL snapshot may lag behind the
-        // writer, returning stale NULL for a key that was just upserted.
-        match self.db.query_one_strong(&sql, &params)? {
+        // get_config) : la connexion d'écriture est lue quand elle est
+        // libre, pour voir la valeur posée l'instant d'avant.
+        //
+        // #5871 — mais sans jamais ATTENDRE l'écrivain : un scan la
+        // reprenait dès qu'il la rendait, et chacune des vingt lectures de
+        // réglages de la préparation DSP attendait une phase d'écriture
+        // entière (9 à 13 s chez Tades). Tenue par un autre fil, la lecture
+        // passe par le pool et y lit la dernière valeur validée.
+        match self.db.query_one_frais(&sql, &params)? {
             None => Ok(None),
             Some(row) => Ok(row.first().and_then(|v| v.as_string())),
         }

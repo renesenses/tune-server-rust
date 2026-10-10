@@ -471,7 +471,21 @@ fn compact(src: &str) -> String {
 /// traitée, et que `play_url` lui confie la réserve.
 #[test]
 fn branchement_5204_le_bras_asio_enchaine_sur_sa_route_native() {
-    let bras = compact(include_str!("bras_asio.rs"));
+    // #5643 — le bras DSD natif vit dans le même fichier, après le bras PCM,
+    // et lève aussi `chain_exhausted` à l'ouverture (il n'enchaîne pas) : la
+    // garde porte sur le bras PCM seul, le DSD natif a sa propre ligne.
+    let fichier = include_str!("bras_asio.rs");
+    let (pcm, dsd_natif) = fichier
+        .split_once("// #5643, lot C — le DSD natif.")
+        .expect("la section DSD natif de bras_asio.rs");
+    let bras = compact(pcm);
+    assert_eq!(
+        compact(dsd_natif)
+            .matches("chain_exhausted.store(true,Ordering::SeqCst);")
+            .count(),
+        1,
+        "le bras DSD natif se déclare non enchaînable dès l'ouverture"
+    );
     assert!(
         bras.contains("ifhttp_eof_asio&&letRoute::Native{etage,puits}=&mutroute{"),
         "la chaîne ne part que de la route native, à la fin de flux"

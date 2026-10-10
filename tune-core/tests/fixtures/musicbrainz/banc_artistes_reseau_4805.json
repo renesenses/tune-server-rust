@@ -1,0 +1,3698 @@
+{
+  "enregistre_le": "2026-10-05",
+  "methode": "Banc #4805, étape C : la passe artistes par le réseau rejouée sur la bibliothèque du banc de l'étape B élargie (EXTENSION). Recherche /artist?query= (limit 10), confirmations /release-group et /recording (arid:, limit 25). 1 requête / 1,1 s, User-Agent TuneServer, depuis Shrek. Réponses réduites aux champs lus.",
+  "reponses": {
+    "artist?artist:\"Chet Baker\" OR alias:\"Chet Baker\" OR sortname:\"Chet Baker\"": {
+      "artists": [
+        {
+          "aliases": [
+            {
+              "name": "Chet",
+              "sort-name": "Chet"
+            },
+            {
+              "name": "Chey Baker",
+              "sort-name": "Chey Baker"
+            },
+            {
+              "name": "Baker Chet",
+              "sort-name": "Baker Chet"
+            }
+          ],
+          "disambiguation": "American jazz trumpeter and vocalist",
+          "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+          "name": "Chet Baker",
+          "score": 100,
+          "sort-name": "Baker, Chet"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "58f9c836-30a1-4330-9274-e2dd5bc75008",
+          "name": "Chet Baker Quartet",
+          "score": 76,
+          "sort-name": "Baker, Chet, Quartet"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "0c6919d1-34b1-4aff-a008-f3ea29bcfa77",
+          "name": "Chet Baker and Gerry Mulligan",
+          "score": 76,
+          "sort-name": "Chet Baker and Gerry Mulligan"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "621e7a7c-726c-4eef-9eab-436dc7e37a7b",
+          "name": "Chet Baker Quintet",
+          "score": 70,
+          "sort-name": "Baker, Chet, Quintet"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "2570d5c6-b9dc-4060-8bef-9955394f285c",
+          "name": "The Gerry Mulligan Chet Baker Quartet",
+          "score": 70,
+          "sort-name": "The Gerry Mulligan Chet Baker Quartet"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "e8ec1e0f-e5ce-4b5e-8a75-f53d52e9b886",
+          "name": "Chet Baker Quartet & Russ Freeman",
+          "score": 70,
+          "sort-name": "Chet Baker Quartet & Russ Freeman"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "efc99722-cfb7-4619-bb8d-d3563322e030",
+          "name": "Chet Baker Trio",
+          "score": 69,
+          "sort-name": "Baker, Chet, Trio"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "da35c976-59c2-4452-b869-083a39139ed2",
+          "name": "The Chet Baker & Art Pepper Sextet",
+          "score": 67,
+          "sort-name": "Chet Baker & Art Pepper Sextet, The"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "8e527300-c3bb-4d58-a8df-67b768bbaa44",
+          "name": "Chet Baker con l'orchestra diretta da Piero Umiliani",
+          "score": 64,
+          "sort-name": "Chet Baker con l'orchestra diretta da Piero Umiliani"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "45d8fb4a-1e6e-4d52-8e2d-dce54e4618b6",
+          "name": "Chet Baker Sextet",
+          "score": 64,
+          "sort-name": "Baker, Chet, Sextet"
+        }
+      ]
+    },
+    "artist?artist:\"Daniel Guichard\" OR alias:\"Daniel Guichard\" OR sortname:\"Daniel Guichard\"": {
+      "artists": [
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "89464436-3a17-4039-8279-d1d21e979e73",
+          "name": "Daniel Guichard",
+          "score": 100,
+          "sort-name": "Guichard, Daniel"
+        }
+      ]
+    },
+    "artist?artist:\"Fela Anikulapo Kuti\" OR alias:\"Fela Anikulapo Kuti\" OR sortname:\"Fela Anikulapo Kuti\"": {
+      "artists": [
+        {
+          "aliases": [
+            {
+              "name": "フェラ・クティ",
+              "sort-name": "フェラ・クティ"
+            },
+            {
+              "name": "Fela Ransome Kuti",
+              "sort-name": "Ransome Kuti, Fela"
+            },
+            {
+              "name": "Fela Anikulapo-kuti",
+              "sort-name": "Anikulapo-Kuti, Fela"
+            },
+            {
+              "name": "Fela Anikulapo Kuti",
+              "sort-name": "Anikulapo Kuti, Fela"
+            },
+            {
+              "name": "Olufela Olusegun Oludotun Ransome-Kuti",
+              "sort-name": "Ransome-Kuti, Olufela Olusegun Oludotun"
+            },
+            {
+              "name": "Fela & Egypt 80",
+              "sort-name": "Fela & Egypt 80"
+            },
+            {
+              "name": "Fela and Africa 70",
+              "sort-name": "Fela and Africa 70"
+            },
+            {
+              "name": "Fela Anikulapo Kuti & Africa '70",
+              "sort-name": "Fela Anikulapo Kuti & Africa '70"
+            },
+            {
+              "name": "Fela",
+              "sort-name": "Fela"
+            }
+          ],
+          "disambiguation": null,
+          "id": "6514cffa-fbe0-4965-ad88-e998ead8a82a",
+          "name": "Fela Kuti",
+          "score": 100,
+          "sort-name": "Kuti, Fela"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Fela Ransome Kuti & Africa 70",
+              "sort-name": "Fela Ransome Kuti & Africa 70"
+            },
+            {
+              "name": "Fela Kuti & Africa '70",
+              "sort-name": "Fela Kuti & Africa '70"
+            },
+            {
+              "name": "Fela Ransome Kuti & the Africa '70",
+              "sort-name": "Fela Ransome Kuti & the Africa '70"
+            },
+            {
+              "name": "Fela Anikulapo Kuti & Afrika 70",
+              "sort-name": "Fela Anikulapo Kuti & Afrika 70"
+            },
+            {
+              "name": "Fela Ransome-Kuti and Africa '70",
+              "sort-name": "Fela Ransome-Kuti and Africa '70"
+            },
+            {
+              "name": "Fela Kuti & Afrika 70",
+              "sort-name": "Kuti, Fela & Afrika 70"
+            }
+          ],
+          "disambiguation": null,
+          "id": "dc45f2dc-ef36-4a7a-aa52-97495fca8ced",
+          "name": "Africa 70",
+          "score": 68,
+          "sort-name": "Africa 70"
+        }
+      ]
+    },
+    "artist?artist:\"Guns N’ Roses\" OR alias:\"Guns N’ Roses\" OR sortname:\"Guns N’ Roses\"": {
+      "artists": [
+        {
+          "aliases": [
+            {
+              "name": "ガンズ・アンド・ローゼズ",
+              "sort-name": "ガンズ・アンド・ローゼズ"
+            },
+            {
+              "name": "Guns and Roses",
+              "sort-name": "Guns and Roses"
+            },
+            {
+              "name": "Guns -N- Roses",
+              "sort-name": "Guns -N- Roses"
+            },
+            {
+              "name": "guns 'n' roses",
+              "sort-name": "guns 'n' roses"
+            },
+            {
+              "name": "Guns'N Roses",
+              "sort-name": "Guns'N Roses"
+            },
+            {
+              "name": "Guns'N'Roses",
+              "sort-name": "Guns'N'Roses"
+            },
+            {
+              "name": "GNR",
+              "sort-name": "GNR"
+            },
+            {
+              "name": "Guns´n Roses",
+              "sort-name": "Guns´n Roses"
+            },
+            {
+              "name": "Gn'R",
+              "sort-name": "Gn'R"
+            },
+            {
+              "name": "Guns 'N Roses",
+              "sort-name": "Guns 'N Roses"
+            },
+            {
+              "name": "Guns N'Roses",
+              "sort-name": "Guns N'Roses"
+            },
+            {
+              "name": "Guns N´ Roses",
+              "sort-name": "Guns N´ Roses"
+            },
+            {
+              "name": "Guns N Roses",
+              "sort-name": "Guns N Roses"
+            },
+            {
+              "name": "Guns & Roses",
+              "sort-name": "Guns & Roses"
+            },
+            {
+              "name": "Guns 'N' Roses",
+              "sort-name": "Guns 'N' Roses"
+            }
+          ],
+          "disambiguation": "American hard rock band from Los Angeles",
+          "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+          "name": "Guns N’ Roses",
+          "score": 100,
+          "sort-name": "Guns N’ Roses"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "7e042aab-e8dc-476e-8b67-c366337857a5",
+          "name": "Machine Guns N Roses",
+          "score": 52,
+          "sort-name": "Machine Guns N Roses"
+        },
+        {
+          "aliases": [],
+          "disambiguation": "Netherlands",
+          "id": "07a3e342-cfe2-494b-a548-47db4c228322",
+          "name": "Ultimate Guns 'n Roses Tribute",
+          "score": 48,
+          "sort-name": "Ultimate Guns 'n Roses Tribute"
+        },
+        {
+          "aliases": [],
+          "disambiguation": "Australian Guns N' Roses 87-93 era tribute",
+          "id": "e5a5fa4f-74ef-4807-acb1-24c6b5ccf50e",
+          "name": "GN'R - The Australian Guns N' Roses Tribute Show",
+          "score": 38,
+          "sort-name": "GN'R - The Australian Guns N' Roses Tribute Show"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "8140aed3-7fba-402d-974b-abff5cdcf8d7",
+          "name": "Garden of Roses",
+          "score": 30,
+          "sort-name": "Garden of Roses (Guns N‘ Roses tribute)"
+        },
+        {
+          "aliases": [],
+          "disambiguation": "Florida tribute band",
+          "id": "06074a01-bf04-442a-93c9-a49f8a3e79fb",
+          "name": "Pretty Tied Up - Guns N' Roses Tribute Band",
+          "score": 28,
+          "sort-name": "Pretty Tied Up"
+        }
+      ]
+    },
+    "artist?artist:\"John Williams\" OR alias:\"John Williams\" OR sortname:\"John Williams\"": {
+      "artists": [
+        {
+          "aliases": [
+            {
+              "name": "Towner",
+              "sort-name": "Towner"
+            },
+            {
+              "name": "John Williams",
+              "sort-name": "Williams, John"
+            },
+            {
+              "name": "John Towner",
+              "sort-name": "John Towner"
+            },
+            {
+              "name": "Williams",
+              "sort-name": "Williams"
+            },
+            {
+              "name": "John Willams",
+              "sort-name": "John Willams"
+            },
+            {
+              "name": "Johnny Williams",
+              "sort-name": "Williams, Johnny"
+            },
+            {
+              "name": "John T. Williams",
+              "sort-name": "John T. Williams"
+            },
+            {
+              "name": "John William",
+              "sort-name": "John William"
+            },
+            {
+              "name": "ジョン ウィリアムズ",
+              "sort-name": "ジョン ウィリアムズ"
+            },
+            {
+              "name": "ジョン・ウィリアムズ",
+              "sort-name": "ジョン・ウィリアムズ"
+            },
+            {
+              "name": "J. Williams",
+              "sort-name": "J. Williams"
+            },
+            {
+              "name": "Jhon Williams",
+              "sort-name": "Jhon Williams"
+            },
+            {
+              "name": "John Wiliams",
+              "sort-name": "John Wiliams"
+            },
+            {
+              "name": "John Towner Williams",
+              "sort-name": "Towner Williams, John"
+            },
+            {
+              "name": "Towner Williams",
+              "sort-name": "Towner Williams"
+            },
+            {
+              "name": "John Williems",
+              "sort-name": "John Williems"
+            }
+          ],
+          "disambiguation": "American score composer and conductor",
+          "id": "53b106e7-0cc6-42cc-ac95-ed8d30a3a98e",
+          "name": "John Williams",
+          "score": 100,
+          "sort-name": "Williams, John"
+        },
+        {
+          "aliases": [
+            {
+              "name": "John Williams and His Memphis Stompers",
+              "sort-name": "John Williams and His Memphis Stompers"
+            },
+            {
+              "name": "John Williams & His Memphis Stompers",
+              "sort-name": "John Williams & His Memphis Stompers"
+            }
+          ],
+          "disambiguation": "John Williams and his Memphis Stompers was a pseudonym for Andy Kirk's Clouds of Joy",
+          "id": "eecda04a-3dd8-4af9-ba73-045b61d68b5f",
+          "name": "John Williams' Memphis Stompers",
+          "score": 83,
+          "sort-name": "John Williams' Memphis Stompers"
+        },
+        {
+          "aliases": [],
+          "disambiguation": "1991 hip-house rapper",
+          "id": "0b784050-1545-4985-87af-bfbfc13c38ca",
+          "name": "John Williams",
+          "score": 78,
+          "sort-name": "John Williams"
+        },
+        {
+          "aliases": [
+            {
+              "name": "John Christopher Williams",
+              "sort-name": "Williams, John Christopher"
+            },
+            {
+              "name": "John C. Williams",
+              "sort-name": "John C. Williams"
+            }
+          ],
+          "disambiguation": "classical guitarist",
+          "id": "8b8a38a9-a290-4560-84f6-3d4466e8d791",
+          "name": "John Williams",
+          "score": 78,
+          "sort-name": "Williams, John"
+        },
+        {
+          "aliases": [
+            {
+              "name": "John Owen Williams",
+              "sort-name": "Williams, John Owen"
+            },
+            {
+              "name": "Major ‘Mad’ John Williams",
+              "sort-name": "Major ‘Mad’ John Williams"
+            },
+            {
+              "name": "John Owen",
+              "sort-name": "Owen, John"
+            }
+          ],
+          "disambiguation": "English A&R executive, producer, songwriter...",
+          "id": "eb5d7680-0c00-4b0c-b6eb-9605ff77723d",
+          "name": "John Williams",
+          "score": 70,
+          "sort-name": "Williams, John"
+        },
+        {
+          "aliases": [
+            {
+              "name": "John Williams & the Tic‐Tocks",
+              "sort-name": "John Williams & the Tic‐Tocks"
+            },
+            {
+              "name": "John Williams and the Ticktocks",
+              "sort-name": "John Williams and the Ticktocks"
+            }
+          ],
+          "disambiguation": null,
+          "id": "d7206ed6-0166-4b5f-bb6a-ee292afe1c5e",
+          "name": "John Williams & the Tick Tocks",
+          "score": 65,
+          "sort-name": "Williams, John & the Tick Tocks"
+        },
+        {
+          "aliases": [],
+          "disambiguation": "John Owen Williams",
+          "id": "a6dd8690-78f1-4219-afbf-5dd36b6b5444",
+          "name": "The John Williams Syndicate",
+          "score": 65,
+          "sort-name": "John Williams Syndicate, The"
+        },
+        {
+          "aliases": [],
+          "disambiguation": "acoustic blues guitarist",
+          "id": "fb9719bf-c477-4223-b319-986eb4168a91",
+          "name": "John Williams",
+          "score": 61,
+          "sort-name": "Williams, John"
+        },
+        {
+          "aliases": [
+            {
+              "name": "John B",
+              "sort-name": "John B"
+            },
+            {
+              "name": "Jon B",
+              "sort-name": "Jon B"
+            },
+            {
+              "name": "John B U.K.",
+              "sort-name": "John B U.K."
+            },
+            {
+              "name": "John Williams",
+              "sort-name": "John Williams"
+            },
+            {
+              "name": "John B. Williams",
+              "sort-name": "John B. Williams"
+            },
+            {
+              "name": "John Bryn Williams",
+              "sort-name": "Williams, John Bryn"
+            },
+            {
+              "name": "J.B. Williams",
+              "sort-name": "J.B. Williams"
+            },
+            {
+              "name": "johnbbeta",
+              "sort-name": "johnbbeta"
+            },
+            {
+              "name": "JohnB",
+              "sort-name": "JohnB"
+            },
+            {
+              "name": "johnbdnb",
+              "sort-name": "johnbdnb"
+            }
+          ],
+          "disambiguation": "drum & bass artist; John B. Williams",
+          "id": "353856b7-8d79-4136-9ac6-7e47954e5be9",
+          "name": "John B",
+          "score": 60,
+          "sort-name": "John B"
+        },
+        {
+          "aliases": [],
+          "disambiguation": "accordion and concertina player",
+          "id": "d08ce74d-f303-4311-9204-17805d494300",
+          "name": "John Williams",
+          "score": 60,
+          "sort-name": "Williams, John"
+        }
+      ]
+    },
+    "artist?artist:\"Keith Jarrett\" OR alias:\"Keith Jarrett\" OR sortname:\"Keith Jarrett\"": {
+      "artists": [
+        {
+          "aliases": [
+            {
+              "name": "Keith Jarett",
+              "sort-name": "Keith Jarett"
+            },
+            {
+              "name": "Keith Jarrett Quartet",
+              "sort-name": "Keith Jarrett Quartet"
+            },
+            {
+              "name": "Keith Jarret",
+              "sort-name": "Keith Jarret"
+            }
+          ],
+          "disambiguation": "pianist",
+          "id": "061c4920-3ea6-4835-98f6-02f3b82f5e3a",
+          "name": "Keith Jarrett",
+          "score": 100,
+          "sort-name": "Jarrett, Keith"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Keith Jarrett, Gary Peacock & Jack DeJohnette",
+              "sort-name": "Jarrett, Jack, Peacock, Gary, DeJohnette, Jack"
+            },
+            {
+              "name": "Keith Jarrett Standards Trio",
+              "sort-name": "Jarrett, Keith, Standards Trio"
+            },
+            {
+              "name": "Keith Jarrett Trio",
+              "sort-name": "Jarrett, Keith, Trio"
+            }
+          ],
+          "disambiguation": "aka Keith Jarrett Trio – 2nd formation",
+          "id": "7ef355a4-d2a4-43a0-9fcd-e4ce8b82501f",
+          "name": "Keith Jarrett, Gary Peacock, Jack DeJohnette",
+          "score": 83,
+          "sort-name": "Jarrett, Keith, Peacock, Gary, DeJohnette, Jack"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Tasman Keith Jarrett",
+              "sort-name": "Jarrett, Tasman Keith"
+            }
+          ],
+          "disambiguation": null,
+          "id": "fb8926f7-f20d-4c23-b094-5381102ac0f0",
+          "name": "Tasman Keith",
+          "score": 62,
+          "sort-name": "Keith, Tasman"
+        },
+        {
+          "aliases": [],
+          "disambiguation": "late 1960s formation - Jarrett, Haden, Motian",
+          "id": "19e48a4b-7aff-4794-a76f-1e7ed20caa4e",
+          "name": "Keith Jarrett Trio",
+          "score": 59,
+          "sort-name": "Jarrett, Keith Trio"
+        },
+        {
+          "aliases": [],
+          "disambiguation": "performance poet",
+          "id": "c19d8a5d-152f-454b-a328-990942bb9d67",
+          "name": "Keith Jarrett",
+          "score": 58,
+          "sort-name": "Jarrett, Keith"
+        }
+      ]
+    },
+    "artist?artist:\"Les Copains du Lycée de Bligny\" OR alias:\"Les Copains du Lycée de Bligny\" OR sortname:\"Les Copains du Lycée de Bligny\"": {
+      "artists": []
+    },
+    "artist?artist:\"Mstislav Rostropovitch\" OR alias:\"Mstislav Rostropovitch\" OR sortname:\"Mstislav Rostropovitch\"": {
+      "artists": [
+        {
+          "aliases": [
+            {
+              "name": "Mstislav Leopoldovitj Rostropovitj",
+              "sort-name": "Rostropovitj, Mstislav Leopoldovitj"
+            },
+            {
+              "name": "Mstislav Rostropovitj",
+              "sort-name": "Rostropovitj, Mstislav"
+            },
+            {
+              "name": "Mstislav Rostropovitsj",
+              "sort-name": "Rostropovitsj, Mstislav"
+            },
+            {
+              "name": "Mstislav Rostropovich",
+              "sort-name": "Rostropovich, Mstislav"
+            },
+            {
+              "name": "Mstislaw Leopoldowitsch Rostropowitsch",
+              "sort-name": "Rostropowitsch, Mstislaw Leopoldowitsch"
+            },
+            {
+              "name": "Mstislaw Rostropowitsch",
+              "sort-name": "Rostropowitsch, Mstislaw"
+            },
+            {
+              "name": "Mstislav Rostropovitch",
+              "sort-name": "Mstislav Rostropovitch"
+            }
+          ],
+          "disambiguation": "cellist/conductor",
+          "id": "e2b294b7-f705-4317-a96b-fd94da3719e5",
+          "name": "Мстислав Ростропович",
+          "score": 100,
+          "sort-name": "Rostropovich, Mstislav"
+        }
+      ]
+    },
+    "artist?artist:\"Nina Simone\" OR alias:\"Nina Simone\" OR sortname:\"Nina Simone\"": {
+      "artists": [
+        {
+          "aliases": [
+            {
+              "name": "Nina Simone",
+              "sort-name": "Simone, Nina"
+            },
+            {
+              "name": "Nina Simone & Her Orchestra",
+              "sort-name": "Simone, Nina & Her Orchestra"
+            },
+            {
+              "name": "Nina Simons",
+              "sort-name": "Nina Simons"
+            },
+            {
+              "name": "Simone",
+              "sort-name": "Simone"
+            },
+            {
+              "name": "Eunice Kathleen Waymon",
+              "sort-name": "Waymon, Eunice Kathleen"
+            },
+            {
+              "name": "ニーナ・シモン",
+              "sort-name": "ニーナ・シモン"
+            }
+          ],
+          "disambiguation": null,
+          "id": "2944824d-4c26-476f-a981-be849081942f",
+          "name": "Nina Simone",
+          "score": 100,
+          "sort-name": "Simone, Nina"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "193fd609-ae95-4e6b-983f-221dc3c52655",
+          "name": "Nina Simone & Her Trio",
+          "score": 44,
+          "sort-name": "Simone, Nina & Trio, Her"
+        }
+      ]
+    },
+    "artist?artist:\"Prince\" OR alias:\"Prince\" OR sortname:\"Prince\"": {
+      "artists": [
+        {
+          "aliases": [
+            {
+              "name": "The Artist (Formerly Known as Prince)",
+              "sort-name": "The Artist (Formerly Known as Prince)"
+            },
+            {
+              "name": "The Artist Formerly Known as Prince",
+              "sort-name": "The Artist Formerly Known as Prince"
+            },
+            {
+              "name": "O(+>",
+              "sort-name": "O(+>"
+            },
+            {
+              "name": "Purple Yoda",
+              "sort-name": "Purple Yoda"
+            },
+            {
+              "name": "Evolsidog",
+              "sort-name": "Evolsidog"
+            },
+            {
+              "name": "Gemini",
+              "sort-name": "Gemini"
+            },
+            {
+              "name": "The Symbol",
+              "sort-name": "Symbol, The"
+            },
+            {
+              "name": "Joey Coco",
+              "sort-name": "Coco, Joey"
+            },
+            {
+              "name": "(us 1) PRINCE",
+              "sort-name": "(us 1) PRINCE"
+            },
+            {
+              "name": "Ƭ̵̬̊",
+              "sort-name": "Ƭ̵̬̊"
+            },
+            {
+              "name": "The Love Symbol",
+              "sort-name": "The Love Symbol"
+            },
+            {
+              "name": "Camille",
+              "sort-name": "Camille"
+            },
+            {
+              "name": "Paisley Park",
+              "sort-name": "Park, Paisley"
+            },
+            {
+              "name": "Alexander Nevermind",
+              "sort-name": "Nevermind, Alexander"
+            },
+            {
+              "name": "Prince Rogers Nelson",
+              "sort-name": "Nelson, Prince Rogers"
+            },
+            {
+              "name": "O(+>)",
+              "sort-name": "O(+>)"
+            },
+            {
+              "name": "Formerly Prince",
+              "sort-name": "Formerly Prince"
+            },
+            {
+              "name": "Symbol",
+              "sort-name": "Symbol"
+            },
+            {
+              "name": "T.A.F.K.A.P.",
+              "sort-name": "T.A.F.K.A.P."
+            },
+            {
+              "name": "♀♂",
+              "sort-name": "♀♂"
+            },
+            {
+              "name": "Jamie Starr",
+              "sort-name": "Jamie Starr"
+            },
+            {
+              "name": "Prince",
+              "sort-name": "Prince"
+            }
+          ],
+          "disambiguation": "“The Artist Formerly Known as…”",
+          "id": "070d193a-845c-479f-980e-bef15710653e",
+          "name": "Prince",
+          "score": 100,
+          "sort-name": "Prince"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Robert Prince",
+              "sort-name": "Prince, Robert"
+            },
+            {
+              "name": "Robert Caskin Prince III",
+              "sort-name": "Prince III, Robert Caskin"
+            },
+            {
+              "name": "Bobby Prince",
+              "sort-name": "Prince, Bobby"
+            }
+          ],
+          "disambiguation": "video game composer",
+          "id": "0b27f6b8-96db-465e-a94e-5184f63e8fad",
+          "name": "Bobby Prince",
+          "score": 83,
+          "sort-name": "Prince, Bobby"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Bonnie ‘Prince’ Billie",
+              "sort-name": "Bonnie ‘Prince’ Billie"
+            },
+            {
+              "name": "Palace Music",
+              "sort-name": "Palace Music"
+            },
+            {
+              "name": "Bonnie Prince Billy",
+              "sort-name": "Bonnie Prince Billy"
+            },
+            {
+              "name": "Bonnie Prince Billie",
+              "sort-name": "Bonnie Prince Billie"
+            },
+            {
+              "name": "Bonny Billy",
+              "sort-name": "Bonny Billy"
+            },
+            {
+              "name": "Bonnie ‘Prince’ Billy",
+              "sort-name": "Bonnie ‘Prince’ Billy"
+            }
+          ],
+          "disambiguation": null,
+          "id": "7b0a63b2-b8e8-490e-b724-1d30cb5edfe3",
+          "name": "Bonnie “Prince” Billy",
+          "score": 78,
+          "sort-name": "Billy, Bonnie “Prince”"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Prince Allah",
+              "sort-name": "Prince Allah"
+            }
+          ],
+          "disambiguation": null,
+          "id": "e2b60aeb-ee20-410a-82f9-e6d273af0e45",
+          "name": "Prince Alla",
+          "score": 75,
+          "sort-name": "Prince Alla"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Jammy James",
+              "sort-name": "Jammy James"
+            },
+            {
+              "name": "Prince Jammy's Group",
+              "sort-name": "Prince Jammy's Group"
+            }
+          ],
+          "disambiguation": null,
+          "id": "7d2f071d-ffa4-4ce7-bea2-0685374c1b2a",
+          "name": "Prince Jammy",
+          "score": 74,
+          "sort-name": "Prince Jammy"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Far I",
+              "sort-name": "Far I"
+            },
+            {
+              "name": "King Cry Cry",
+              "sort-name": "King Cry Cry"
+            },
+            {
+              "name": "Prince Far-I",
+              "sort-name": "Prince Far-I"
+            },
+            {
+              "name": "Prince Fari",
+              "sort-name": "Prince Fari"
+            }
+          ],
+          "disambiguation": null,
+          "id": "86f26c3e-c6ac-4829-ac22-f1a2133d4ffe",
+          "name": "Prince Far I",
+          "score": 72,
+          "sort-name": "Prince Far I"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Prince Fall",
+              "sort-name": "Prince Fall"
+            }
+          ],
+          "disambiguation": "France",
+          "id": "e43beb57-a015-4ed9-bcd6-490674518a49",
+          "name": "Prince",
+          "score": 72,
+          "sort-name": "Prince"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Microwave Prince 2",
+              "sort-name": "Microwave Prince 2"
+            }
+          ],
+          "disambiguation": null,
+          "id": "af6177c1-86b6-48a8-a19a-ff89869071af",
+          "name": "Microwave Prince",
+          "score": 71,
+          "sort-name": "Microwave Prince"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Alex Prince",
+              "sort-name": "Alex Prince"
+            },
+            {
+              "name": "Alexandra Prinz",
+              "sort-name": "Prinz, Alexandra"
+            }
+          ],
+          "disambiguation": "German house singer, How we Livin, Deep Dish",
+          "id": "4939dfab-2d9f-462a-aa12-8ff648248063",
+          "name": "Alexandra Prince",
+          "score": 70,
+          "sort-name": "Prince, Alexandra"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Prince Lincoln",
+              "sort-name": "Prince Lincoln"
+            }
+          ],
+          "disambiguation": null,
+          "id": "bb679a78-d503-4d1d-b8dd-9217784a3e44",
+          "name": "Prince Lincoln Thompson",
+          "score": 70,
+          "sort-name": "Thompson, Prince Lincoln"
+        }
+      ]
+    },
+    "artist?artist:\"Ryuichi Sakamoto\" OR alias:\"Ryuichi Sakamoto\" OR sortname:\"Ryuichi Sakamoto\"": {
+      "artists": [
+        {
+          "aliases": [
+            {
+              "name": "Alva Noto and Ryuichi Sakamoto",
+              "sort-name": "Alva Noto and Ryuichi Sakamoto"
+            }
+          ],
+          "disambiguation": null,
+          "id": "6edc70bb-c340-4ae6-bdd4-d5fb0c7411de",
+          "name": "Alva Noto + Ryuichi Sakamoto",
+          "score": 100,
+          "sort-name": "Alva Noto + Sakamoto, Ryuichi"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "130ef082-bdc1-4ec1-a1a9-f2783b0e28d5",
+          "name": "Ryuichi Sakamoto & Hildur Guðnadóttir",
+          "score": 82,
+          "sort-name": "Ryuichi Sakamoto and Hildur Guðnadóttir"
+        },
+        {
+          "aliases": [
+            {
+              "name": "사카모토 류이치",
+              "sort-name": "사카모토 류이치"
+            },
+            {
+              "name": "Ryūichi Sakamoto",
+              "sort-name": "Sakamoto, Ryūichi"
+            },
+            {
+              "name": "Ryūichi Sakamoto",
+              "sort-name": "Sakamoto, Ryūichi"
+            },
+            {
+              "name": "Ryūichi Sakamoto",
+              "sort-name": "Sakamoto, Ryūichi"
+            },
+            {
+              "name": "Ryūichi Sakamoto",
+              "sort-name": "Sakamoto, Ryūichi"
+            },
+            {
+              "name": "坂本 龍一",
+              "sort-name": "坂本 龍一"
+            },
+            {
+              "name": "坂本龍一",
+              "sort-name": "サカモト リュウイチ"
+            },
+            {
+              "name": "R.S.",
+              "sort-name": "R.S."
+            },
+            {
+              "name": "Sakamoto Ryuuichi",
+              "sort-name": "Sakamoto Ryuuichi"
+            },
+            {
+              "name": "Sakamoto Ryūichi",
+              "sort-name": "Sakamoto, Ryūichi"
+            },
+            {
+              "name": "Ryuchi Sakamoto",
+              "sort-name": "Ryuchi Sakamoto"
+            },
+            {
+              "name": "Riuichi Sakamoto",
+              "sort-name": "Riuichi Sakamoto"
+            },
+            {
+              "name": "Ryuichi Sakamamoto",
+              "sort-name": "Ryuichi Sakamamoto"
+            },
+            {
+              "name": "坂本龙一",
+              "sort-name": "坂本龙一"
+            },
+            {
+              "name": "Ryûichi Sakamoto",
+              "sort-name": "Ryûichi Sakamoto"
+            }
+          ],
+          "disambiguation": "Japanese composer, pianist, singer, songwriter",
+          "id": "a7f7df4a-77d8-4f12-8acd-5c60c93f4de8",
+          "name": "坂本龍一",
+          "score": 80,
+          "sort-name": "Sakamoto, Ryūichi"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "09e0a06e-e76d-4ffa-b4da-9b1f96bcaf2b",
+          "name": "Alva Noto, Ryuichi Sakamoto, and Hildur Guðnadóttir",
+          "score": 72,
+          "sort-name": "Alva Noto, Ryuichi Sakamoto, and Hildur Guðnadóttir"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "f9e27179-cdc7-4c05-b300-d779437d40f9",
+          "name": "Ryuichi Sakamoto, Alva Noto & Bryce Dessner",
+          "score": 72,
+          "sort-name": "Ryuichi Sakamoto, Alva Noto and Bryce Dessner"
+        },
+        {
+          "aliases": [],
+          "disambiguation": null,
+          "id": "691ba3ee-551d-4bb1-9d06-bead35575495",
+          "name": "Ryuichi Sakamoto, Bryce Dessner, and Hildur Guðnadóttir",
+          "score": 72,
+          "sort-name": "Ryuichi Sakamoto, Bryce Dessner, and Hildur Guðnadóttir"
+        }
+      ]
+    },
+    "artist?artist:\"Tchaïkovski\" OR alias:\"Tchaïkovski\" OR sortname:\"Tchaïkovski\"": {
+      "artists": [
+        {
+          "aliases": [],
+          "disambiguation": "clarinet",
+          "id": "b221dc10-8f5a-4640-9262-6ef3fe464115",
+          "name": "Anna Tchaikovski",
+          "score": 100,
+          "sort-name": "Tchaikovski, Anna"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Tchaikovsky Pyotr Ilyich",
+              "sort-name": "Tchaikovsky P.I."
+            },
+            {
+              "name": "Piotr Ilyich Tchaikovsky",
+              "sort-name": "Tchaikovsky, Piotr Ilyich"
+            },
+            {
+              "name": "Петр Ильич Чайковский",
+              "sort-name": "Петр Ильич Чайковский"
+            },
+            {
+              "name": "Tchaikoskvy",
+              "sort-name": "Tchaikoskvy"
+            },
+            {
+              "name": "Tchaikovskij",
+              "sort-name": "Tchaikovskij"
+            },
+            {
+              "name": "Pyotr Il'yich Tchaikovsky",
+              "sort-name": "Pyotr Il'yich Tchaikovsky"
+            },
+            {
+              "name": "Iljitsch",
+              "sort-name": "Iljitsch"
+            },
+            {
+              "name": "Peter Tchaikovsky",
+              "sort-name": "Tchaikovsky, Peter"
+            },
+            {
+              "name": "Tschaikowski",
+              "sort-name": "Tschaikowski"
+            },
+            {
+              "name": "Čajkovski",
+              "sort-name": "Čajkovski"
+            },
+            {
+              "name": "Tschaikovsky",
+              "sort-name": "Tschaikovsky"
+            },
+            {
+              "name": "Ilitsch",
+              "sort-name": "Ilitsch"
+            },
+            {
+              "name": "Tschaikowsky",
+              "sort-name": "Tschaikowsky"
+            },
+            {
+              "name": "Pjotr Iljitj Tjajkovskij",
+              "sort-name": "Tjajkovskij, Pjotr Iljitj"
+            },
+            {
+              "name": "Tchaikovsky",
+              "sort-name": "Tchaikovsky"
+            },
+            {
+              "name": "ピョートル・チャイコフスキー",
+              "sort-name": "チャイコフスキー ピョートル"
+            },
+            {
+              "name": "Illich",
+              "sort-name": "Illich"
+            },
+            {
+              "name": "Ciaikosvsky",
+              "sort-name": "Ciaikosvsky"
+            },
+            {
+              "name": "Ilic",
+              "sort-name": "Ilic"
+            },
+            {
+              "name": "Tchaikowski",
+              "sort-name": "Tchaikowski"
+            },
+            {
+              "name": "Pyotor",
+              "sort-name": "Pyotor"
+            },
+            {
+              "name": "Tchaikovshy",
+              "sort-name": "Tchaikovshy"
+            },
+            {
+              "name": "Tchaikivsky",
+              "sort-name": "Tchaikivsky"
+            },
+            {
+              "name": "Tschaikowskij",
+              "sort-name": "Tschaikowskij"
+            },
+            {
+              "name": "Chaikovsky",
+              "sort-name": "Chaikovsky"
+            },
+            {
+              "name": "Tchaïkovki",
+              "sort-name": "Tchaïkovki"
+            },
+            {
+              "name": "Tchaikovisky",
+              "sort-name": "Tchaikovisky"
+            },
+            {
+              "name": "Ilich",
+              "sort-name": "Ilich"
+            },
+            {
+              "name": "Pyotr Tchaikovsky",
+              "sort-name": "Tchaikovsky, Pyotr"
+            },
+            {
+              "name": "Hich",
+              "sort-name": "Hich"
+            },
+            {
+              "name": "Piotr Ilitch Tchaïkovski",
+              "sort-name": "Tchaïkovski, Piotr Ilitch"
+            },
+            {
+              "name": "Пётр Ильич Чайковский",
+              "sort-name": "Чайковский, Пётр Ильич"
+            },
+            {
+              "name": "Peter I. Tschaikowsky",
+              "sort-name": "Tschaikowsky, Peter I."
+            },
+            {
+              "name": "Tchaikovsly",
+              "sort-name": "Tchaikovsly"
+            },
+            {
+              "name": "Tchaikovski",
+              "sort-name": "Tchaikovski"
+            },
+            {
+              "name": "Èajkovskij",
+              "sort-name": "Èajkovskij"
+            },
+            {
+              "name": "Tchaikovskyes",
+              "sort-name": "Tchaikovskyes"
+            },
+            {
+              "name": "Tchaikovsy",
+              "sort-name": "Tchaikovsy"
+            },
+            {
+              "name": "Tchakovsky",
+              "sort-name": "Tchakovsky"
+            },
+            {
+              "name": "Peter Ilich Tchaikovsky",
+              "sort-name": "Tchaikovsky, Peter Ilich"
+            },
+            {
+              "name": "Tchaikowsky",
+              "sort-name": "Tchaikowsky"
+            },
+            {
+              "name": "Tsjaikovsky",
+              "sort-name": "Tsjaikovsky"
+            },
+            {
+              "name": "彼得·伊里奇·柴科夫斯基",
+              "sort-name": "彼得·伊里奇·柴科夫斯基"
+            },
+            {
+              "name": "Tjakovski",
+              "sort-name": "Tjakovski"
+            },
+            {
+              "name": "Peter Tschaikowsky",
+              "sort-name": "Tschaikowsky, Peter"
+            },
+            {
+              "name": "Tjakovsky",
+              "sort-name": "Tjakovsky"
+            },
+            {
+              "name": "Tchiakovsky",
+              "sort-name": "Tchiakovsky"
+            },
+            {
+              "name": "II'yich",
+              "sort-name": "II'yich"
+            },
+            {
+              "name": "Ilyitch",
+              "sort-name": "Ilyitch"
+            },
+            {
+              "name": "P. Čaikovskis",
+              "sort-name": "P. Čaikovskis"
+            },
+            {
+              "name": "Txhaikovsky",
+              "sort-name": "Txhaikovsky"
+            },
+            {
+              "name": "Illyich",
+              "sort-name": "Illyich"
+            },
+            {
+              "name": "Tchaikovskys",
+              "sort-name": "Tchaikovskys"
+            },
+            {
+              "name": "Peter Iljitsch Tschaikowsky",
+              "sort-name": "Tschaikowsky, Peter Iljitsch"
+            },
+            {
+              "name": "Llyich",
+              "sort-name": "Llyich"
+            },
+            {
+              "name": "Peter Ilyich Tchaikovsky",
+              "sort-name": "Tchaikovsky, Peter Ilyich"
+            },
+            {
+              "name": "Petr Ilich Chajkovskij",
+              "sort-name": "Petr Ilich Chajkovskij"
+            },
+            {
+              "name": "Il'yich",
+              "sort-name": "Il'yich"
+            },
+            {
+              "name": "Tchailovisky",
+              "sort-name": "Tchailovisky"
+            },
+            {
+              "name": "Ciaikovsky",
+              "sort-name": "Ciaikovsky"
+            },
+            {
+              "name": "Ilych",
+              "sort-name": "Ilych"
+            },
+            {
+              "name": "Illitch",
+              "sort-name": "Illitch"
+            },
+            {
+              "name": "Tsjaikovski",
+              "sort-name": "Tsjaikovski"
+            },
+            {
+              "name": "Pjotrs Čaikovskis",
+              "sort-name": "Čaikovskis, Pjotrs"
+            },
+            {
+              "name": "Piotr Iljitsch Tschaikowski",
+              "sort-name": "Tschaikowski"
+            },
+            {
+              "name": "Tchikovsky",
+              "sort-name": "Tchikovsky"
+            },
+            {
+              "name": "Peter Tschaikovsky",
+              "sort-name": "Peter Tschaikovsky"
+            },
+            {
+              "name": "Tsjajkovskij",
+              "sort-name": "Tsjajkovskij"
+            },
+            {
+              "name": "Csajkovszkij",
+              "sort-name": "Csajkovszkij"
+            },
+            {
+              "name": "Pjotr Iljics Csajkovszkij",
+              "sort-name": "Csajkovszkij, Pjotr Iljics"
+            },
+            {
+              "name": "Pëtr Il’ič Čajkovskij",
+              "sort-name": "Čajkovskij, Pëtr Il’ič"
+            },
+            {
+              "name": "Pēteris Čaikovskis",
+              "sort-name": "Čaikovskis, Pēteris"
+            },
+            {
+              "name": "Piotr Ilitch Tchaïkovski",
+              "sort-name": "Tchaïkovski, Piotr Ilitch"
+            },
+            {
+              "name": "Piotr Ilyich Tchaikovski",
+              "sort-name": "Tchaikovski, Piotr Ilyich"
+            },
+            {
+              "name": "Пётр Чайковский",
+              "sort-name": "Чайковский, Пётр"
+            },
+            {
+              "name": "Петро Ілліч Чайковський",
+              "sort-name": "Чайковський, Петро Ілліч"
+            },
+            {
+              "name": "Pjotr Tsjajkovskij",
+              "sort-name": "Pjotr Tsjajkovskij"
+            },
+            {
+              "name": "Pjotr Tsjajkovskij",
+              "sort-name": "Tsjajkovskij, Pjotr"
+            },
+            {
+              "name": "Pjotr Iljitsj Tsjaikovski",
+              "sort-name": "Tsjaikovski, Pjotr Iljitsj"
+            },
+            {
+              "name": "Pjotr Tšaikovski",
+              "sort-name": "Tšaikovski, Pjotr"
+            },
+            {
+              "name": "표트르 일리치 차이콥스키",
+              "sort-name": "차이콥스키, 표트르 일리치"
+            },
+            {
+              "name": "Pjotr Iljitsj Tsjaíkovskíj",
+              "sort-name": "Tsjaíkovskíj, Pjotr Iljitsj"
+            },
+            {
+              "name": "Piotr Czajkowski",
+              "sort-name": "Czajkowski, Piotr"
+            },
+            {
+              "name": "Pjotr Iljitsch Tschaikowski",
+              "sort-name": "Tschaikowski, Pjotr Iljitsch"
+            },
+            {
+              "name": "بيتر إليتش تشايكوفسكي",
+              "sort-name": "بيتر إليتش تشايكوفسكي"
+            },
+            {
+              "name": "Pjotr Iljitj Tjajkovskij",
+              "sort-name": "Tjajkovskij, Pjotr Iljitj"
+            },
+            {
+              "name": "Pjotr Tsjaikofski",
+              "sort-name": "Tsjaikofski, Pjotr"
+            },
+            {
+              "name": "Pyotr İlyiç Çaykovski",
+              "sort-name": "Pyotr İlyiç Çaykovski"
+            },
+            {
+              "name": "Pjotr Tjajkovskij",
+              "sort-name": "Tjajkovskij, Pjotr"
+            },
+            {
+              "name": "彼得·伊里奇·柴可夫斯基",
+              "sort-name": "彼得·伊里奇·柴可夫斯基"
+            },
+            {
+              "name": "Pjotr Tšaikovski",
+              "sort-name": "Tšaikovski, Pjotr"
+            },
+            {
+              "name": "Piotr Iljič Čajkovskij",
+              "sort-name": "Piotr Iljič Čajkovskij"
+            },
+            {
+              "name": "チャイコフスキー",
+              "sort-name": "チャイコフスキー"
+            },
+            {
+              "name": "Pyotr Ilyich Tchaikovsky",
+              "sort-name": "Tchaikovsky, Pyotr Ilyich"
+            }
+          ],
+          "disambiguation": "Russian romantic composer",
+          "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+          "name": "Пётр Ильич Чайковский",
+          "score": 90,
+          "sort-name": "Tchaikovsky, Pyotr Ilyich"
+        },
+        {
+          "aliases": [
+            {
+              "name": "Orquesta Sinfónica Chaikovski",
+              "sort-name": "Orquesta Sinfónica Chaikovski"
+            },
+            {
+              "name": "Großes Symphonieorchester des staatlichen Rundfunks der UdSSR",
+              "sort-name": "Großes Symphonieorchester des staatlichen Rundfunks der UdSSR"
+            },
+            {
+              "name": "Orchestre Symphonique de la Radio TV d'URSS",
+              "sort-name": "Orchestre Symphonique de la Radio TV d'URSS"
+            },
+            {
+              "name": "State Radio Committee Orchestra",
+              "sort-name": "State Radio Committee Orchestra"
+            },
+            {
+              "name": "Grand Symphony Orchestra of All-Union National Radio Service and Central Television Networks",
+              "sort-name": "Grand Symphony Orchestra of All-Union National Radio Service and Central Television Networks"
+            },
+            {
+              "name": "Large Symphony Orchestra of USSR Radio and TV",
+              "sort-name": "USSR Radio and TV, Large Symphony Orchestra of"
+            },
+            {
+              "name": "Оркестр Всесоюзного радио",
+              "sort-name": "Оркестр Всесоюзного радио"
+            },
+            {
+              "name": "Большой симфонический оркестр",
+              "sort-name": "Большой симфонический оркестр"
+            },
+            {
+              "name": "Оркестр Всесоюзного радиокомитета",
+              "sort-name": "Оркестр Всесоюзного радиокомитета"
+            },
+            {
+              "name": "USSR State Radio Symphony Orchestra",
+              "sort-name": "USSR State Radio Symphony Orchestra"
+            },
+            {
+              "name": "Moscow RTV Orchestra",
+              "sort-name": "Moscow RTV Orchestra"
+            },
+            {
+              "name": "USSR Radio Symphony Orchestra",
+              "sort-name": "USSR Radio Symphony Orchestra"
+            },
+            {
+              "name": "Большой симфонический оркестр Всесоюзного радио и Центрального телевидения",
+              "sort-name": "Большой симфонический оркестр Всесоюзного радио и Центрального телевидения"
+            },
+            {
+              "name": "Moskous Radiosymfonieorkest",
+              "sort-name": "Moskous Radiosymfonieorkest"
+            },
+            {
+              "name": "Moscow State Radio and TV Symphony Orchestra",
+              "sort-name": "Moscow State Radio and TV Symphony Orchestra"
+            },
+            {
+              "name": "All-Union Radio and Television Symphony Orchestra",
+              "sort-name": "All-Union Radio and Television Symphony Orchestra"
+            },
+            {
+              "name": "Большой Симфонический Оркестр Гостелерадио СССР",
+              "sort-name": "Большой Симфонический Оркестр Гостелерадио СССР"
+            },
+            {
+              "name": "USSR Radio and Symphony Orchestra",
+              "sort-name": "USSR Radio and Symphony Orchestra"
+            },
+            {
+              "name": "USSR TV and Radio Symphony Orchestra",
+              "sort-name": "USSR TV and Radio Symphony Orchestra"
+            },
+            {
+              "name": "Moscow Radio Symphony Orchestra",
+              "sort-name": "Moscow Radio Symphony Orchestra"
+            },
+            {
+              "name": "Большой симфонический оркестр Всесоюзного радио",
+              "sort-name": "Большой симфонический оркестр Всесоюзного радио"
+            },
+            {
+              "name": "Great Symphony Orchestra of the All-Union Radio",
+              "sort-name": "Great Symphony Orchestra of the All-Union Radio"
+            },
+            {
+              "name": "Moscow Radio and Television Orchestra",
+              "sort-name": "Moscow Radio and Television Orchestra"
+            },
+            {
+              "name": "Tchaikovsky Symphony Orchestra of Moscow Radio",
+              "sort-name": "Tchaikovsky Symphony Orchestra of Moscow Radio"
+            },
+            {
+              "name": "Moscow Tchaikovsky Symphony Orchestra",
+              "sort-name": "Moscow Tchaikovsky Symphony Orchestra"
+            },
+            {
+              "name": "Tchaikovsky Symphony Orchestra",
+              "sort-name": "Tchaikovsky Symphony Orchestra"
+            },
+            {
+              "name": "Orchestre symphonique Tchaïkovski de la Radio de Moscou",
+              "sort-name": "Orchestre symphonique Tchaïkovski de la Radio de Moscou"
+            },
+            {
+              "name": "Большой симфонический оркестр имени П. И. Чайковского",
+              "sort-name": "Большой симфонический оркестр имени П. И. Чайковского"
+            },
+            {
+              "name": "Tsjaikovski-symfonieorkest",
+              "sort-name": "Tsjaikovski-symfonieorkest"
+            }
+          ],
+          "disambiguation": "bso.ru, founded 1930, not Mikhailov's 1978 orch.",
+          "id": "81b70969-a9c0-4fcf-8461-24cf72901368",
+          "name": "Большой симфонический оркестр имени П. И. Чайковского",
+          "score": 58,
+          "sort-name": "Tchaikovsky Symphony Orchestra"
+        }
+      ]
+    },
+    "recording?arid:061c4920-3ea6-4835-98f6-02f3b82f5e3a AND (recording:\"Köln, January 24, 1975, Part I\")": {
+      "recordings": [
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "061c4920-3ea6-4835-98f6-02f3b82f5e3a",
+                "name": "Keith Jarrett"
+              },
+              "name": "Keith Jarrett"
+            }
+          ],
+          "id": "efa85037-66ba-4910-ab97-86124ea515f3",
+          "score": 100,
+          "title": "Köln, January 24, 1975, Part I"
+        }
+      ]
+    },
+    "recording?arid:070d193a-845c-479f-980e-bef15710653e AND (recording:\"When Doves Cry\" OR recording:\"Purple Rain\")": {
+      "recordings": [
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "5d3ef164-81f6-439d-abcd-c60fd10e8ea4",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "cc304d9a-e2d3-46ab-8744-e66426247f22",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "cf209c3a-853e-4e33-9c08-fe351d661499",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            },
+            {
+              "artist": {
+                "id": "4c8ead39-b9df-4c56-a27c-51bc049cfd48",
+                "name": "The Revolution"
+              },
+              "name": "The Revolution"
+            }
+          ],
+          "id": "73661d64-cc86-42a8-8d55-4e113323bb0c",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "4d37e3fd-0f52-43e8-a567-c2c80f201f90",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "3a60e9c5-c920-46e3-a60e-da6b8ec93642",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "f1fdcbc4-f90b-45f3-86b4-1d3977e7191f",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "e9f0a3b1-1c09-4242-b1ae-b0e279ac805b",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            },
+            {
+              "artist": {
+                "id": "4c8ead39-b9df-4c56-a27c-51bc049cfd48",
+                "name": "The Revolution"
+              },
+              "name": "The Revolution"
+            }
+          ],
+          "id": "5cd8dda9-2a0e-4f0c-8fa8-75e3176c79ad",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            },
+            {
+              "artist": {
+                "id": "4c8ead39-b9df-4c56-a27c-51bc049cfd48",
+                "name": "The Revolution"
+              },
+              "name": "The Revolution"
+            }
+          ],
+          "id": "0370b578-a05c-4101-b6d0-e34791214f40",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            },
+            {
+              "artist": {
+                "id": "4c8ead39-b9df-4c56-a27c-51bc049cfd48",
+                "name": "The Revolution"
+              },
+              "name": "The Revolution"
+            }
+          ],
+          "id": "ab3a17f0-a43a-41a7-8706-fc321724f694",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "313303f5-da5f-41d1-b706-170eca33da91",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "040f4d9b-cbef-49ce-8502-4e22b3c48568",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "79a8b688-4cf3-455b-ae37-c588e7105fdc",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "00a0fe25-9b46-40cc-854b-baa32d48cc8c",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "ba48bfba-b526-4248-bc31-046e11ec57eb",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            },
+            {
+              "artist": {
+                "id": "4c8ead39-b9df-4c56-a27c-51bc049cfd48",
+                "name": "The Revolution"
+              },
+              "name": "The Revolution"
+            }
+          ],
+          "id": "6f13e9d5-74a1-47c8-9ac5-bf7b4ad7707f",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "549c6ba2-f0a4-4204-93bc-93dcbe714f8c",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "118bef6a-2502-42fc-beaa-b659604db4e7",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            },
+            {
+              "artist": {
+                "id": "4c8ead39-b9df-4c56-a27c-51bc049cfd48",
+                "name": "The Revolution"
+              },
+              "name": "The Revolution"
+            }
+          ],
+          "id": "69b8c640-b9f0-4c2c-b9f6-79f00ff8bdb8",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "3bbeaa2a-1528-4f7e-b857-ff660bad4438",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            },
+            {
+              "artist": {
+                "id": "4c8ead39-b9df-4c56-a27c-51bc049cfd48",
+                "name": "The Revolution"
+              },
+              "name": "The Revolution"
+            }
+          ],
+          "id": "be56fc8b-81e4-4593-bed0-582d4d3e6b64",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            },
+            {
+              "artist": {
+                "id": "4c8ead39-b9df-4c56-a27c-51bc049cfd48",
+                "name": "The Revolution"
+              },
+              "name": "The Revolution"
+            }
+          ],
+          "id": "de86fcec-f0e5-4640-a38c-bcb7d48990dc",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            },
+            {
+              "artist": {
+                "id": "4c8ead39-b9df-4c56-a27c-51bc049cfd48",
+                "name": "The Revolution"
+              },
+              "name": "The Revolution"
+            }
+          ],
+          "id": "219d6d71-5143-4e4f-8d02-bf4f80ed9bff",
+          "score": 100,
+          "title": "When Doves Cry"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "070d193a-845c-479f-980e-bef15710653e",
+                "name": "Prince"
+              },
+              "name": "Prince"
+            }
+          ],
+          "id": "1a268fc1-9e3d-480b-8a08-2cce6eae3779",
+          "score": 100,
+          "title": "When Doves Cry"
+        }
+      ]
+    },
+    "recording?arid:1ba1d493-7114-45e2-b163-a36d49a0c065 AND (recording:\"My Funny Valentine\")": {
+      "recordings": [
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "d89ad431-6e0e-46c4-86b0-d6b05cfe8de2",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "8f2422ab-0ec6-4c92-80c4-afe9622fab32",
+                "name": "Stan Getz"
+              },
+              "name": "Stan Getz"
+            },
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "c336a1eb-0815-4646-afc6-c384dd7875e9",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "0ec1cbf5-7424-4d2c-94de-039f7cc8c4e3",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "267601a2-3d53-4b1f-ae15-e7dd8c264e0e",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "0389ae67-28c0-45ff-afea-199fe0503764",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1f0cdc02-c8d5-4228-8227-37ec0c289b48",
+                "name": "Charlie Haden"
+              },
+              "name": "Charlie Haden"
+            },
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            },
+            {
+              "artist": {
+                "id": "6cc85fde-63df-4576-8bb7-7db27fdcc311",
+                "name": "Enrico Pieranunzi"
+              },
+              "name": "Enrico Pieranunzi"
+            },
+            {
+              "artist": {
+                "id": "53019232-166e-4788-8b13-23e60ffced44",
+                "name": "Billy Higgins"
+              },
+              "name": "Billy Higgins"
+            }
+          ],
+          "id": "6bbf2f39-5830-4abf-b85a-d8943bf6d560",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "58f70430-db48-4ee1-88f3-3ad70c7c4b2b",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "4c4fa861-2289-447e-b0af-20285268462e",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "013722d1-b4d3-455f-80ee-2a2b6db931d5",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "0e0a0139-b80e-4dc2-a72e-23cedf0c1e50",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "68f19808-1f7b-46d4-bd1d-71aaf0f6b267",
+                "name": "Gerry Mulligan"
+              },
+              "name": "Gerry Mulligan"
+            },
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "02034a37-b8a0-4635-bf82-614e00fee83f",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "c0ca3375-2679-4420-9066-2285bf5ac442",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "79ade9e6-cf69-4751-8955-0e234939da70",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "fea60026-ab66-43a1-9d6e-276d30321012",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "2807a38d-f920-4402-b94c-da01942d4e78",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "2537e08b-c30d-40d2-bac2-96d2f9032f27",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "dc14096f-c73b-41ce-ae0a-0b178cbba79b",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "0b5b8dc9-6fe4-492b-99ce-032e7aba533d",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "df17de2d-960c-40a5-bf5a-8bfe07169cb4",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "6451f417-a8c1-4c65-8554-3c3c4dacf77d",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            },
+            {
+              "artist": {
+                "id": "68f19808-1f7b-46d4-bd1d-71aaf0f6b267",
+                "name": "Gerry Mulligan"
+              },
+              "name": "Gerry Mulligan"
+            }
+          ],
+          "id": "29bebb81-0da8-483c-8251-120f20b56d86",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "e0935e35-f94a-4fdc-93ea-3a4dfa30d1e4",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "cd545846-4689-4322-b29a-d08b5417e2a5",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "58c9a70d-9731-4955-98b8-0d2517274bfc",
+          "score": 100,
+          "title": "My Funny Valentine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "68f19808-1f7b-46d4-bd1d-71aaf0f6b267",
+                "name": "Gerry Mulligan"
+              },
+              "name": "Gerry Mulligan"
+            },
+            {
+              "artist": {
+                "id": "1ba1d493-7114-45e2-b163-a36d49a0c065",
+                "name": "Chet Baker"
+              },
+              "name": "Chet Baker"
+            }
+          ],
+          "id": "cd56c26f-9244-450d-ad2c-8398402dc37c",
+          "score": 100,
+          "title": "My Funny Valentine"
+        }
+      ]
+    },
+    "recording?arid:2944824d-4c26-476f-a981-be849081942f AND (recording:\"Feeling Good\" OR recording:\"My Baby Just Cares for Me\" OR recording:\"Sinnerman\")": {
+      "recordings": [
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "62345198-2542-48b1-9f09-7257983cb578",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "b889b9ad-9669-4986-b039-b260788f268e",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "22a387f0-0955-4748-987f-dcb360fbb9dd",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "4d0e0002-f59d-465f-afb5-ef7858af9e57",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "258ef41a-2407-4385-a58d-b7bff1005557",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "64164759-46a6-420d-8fdc-5665d820f649",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "dbedefc5-4f46-42f8-9ae2-f0682451589e",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "16ecf836-9bd2-4c6e-b32e-90e6694fdf8c",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "ea6ab90f-f9e8-408f-b635-8af37c98aad7",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "a30da0bb-425c-49f4-862b-6848977c0b35",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "85a66757-78f7-4422-8124-3e6dfd866204",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "36417e64-d77d-4eb5-b215-5aa77b1450fb",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "f1d928ed-d0ee-4b43-96d8-b94d2fb05301",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "2ae7f88a-191e-4a83-a090-b617105cd94d",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "1d18963e-9a3b-481d-99c4-a703bc3273fb",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "1952aa0b-778b-4769-ae3f-9fdd10b48c5a",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "807c49b9-b27b-40d3-84a3-bc1cf4e1e844",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "15918e4b-bc65-46d6-9bf2-2b38034d04c7",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "60d407fd-a51c-4f2c-9e17-80c3da155182",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "f96f7650-7114-4171-a525-afe4b61cfaba",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "35d3365d-b230-4b79-a030-c07db2560c9c",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "b731d97a-2ee7-46f7-9637-7e87e8b47522",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "39ff870e-3549-4077-a3ed-0488410ce14d",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "0c54a12a-8fd4-464f-a560-52a20b003d78",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "2944824d-4c26-476f-a981-be849081942f",
+                "name": "Nina Simone"
+              },
+              "name": "Nina Simone"
+            }
+          ],
+          "id": "a2c3d299-167c-47d4-ae4a-2f8b607645c6",
+          "score": 100,
+          "title": "My Baby Just Cares for Me"
+        }
+      ]
+    },
+    "recording?arid:53b106e7-0cc6-42cc-ac95-ed8d30a3a98e AND (recording:\"Thème principal\")": {
+      "recordings": [
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "53b106e7-0cc6-42cc-ac95-ed8d30a3a98e",
+                "name": "John Williams"
+              },
+              "name": "John Williams"
+            }
+          ],
+          "id": "1a09017b-3271-45da-b700-74c6ea6b468e",
+          "score": 100,
+          "title": "Superman : Theme Principal"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "53b106e7-0cc6-42cc-ac95-ed8d30a3a98e",
+                "name": "John Williams"
+              },
+              "name": "John Williams"
+            }
+          ],
+          "id": "51ec4252-8afc-459b-a745-2efc46a3cd41",
+          "score": 100,
+          "title": "Star Wars: Thème principal"
+        }
+      ]
+    },
+    "recording?arid:89464436-3a17-4039-8279-d1d21e979e73 AND (recording:\"Piste 01\" OR recording:\"Piste 02\")": {
+      "recordings": []
+    },
+    "recording?arid:e2b294b7-f705-4317-a96b-fd94da3719e5 AND (recording:\"Suite No. 1 in G major, BWV 1007: I. Prélude\")": {
+      "recordings": [
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "e2b294b7-f705-4317-a96b-fd94da3719e5",
+                "name": "Мстислав Ростропович"
+              },
+              "name": "Mstislav Rostropovich"
+            }
+          ],
+          "id": "fa8fcfd9-9de8-4351-9fa8-bf9a522a5c8c",
+          "score": 100,
+          "title": "Cello Suite no. 1 in G major, BWV 1007: I. Prélude"
+        }
+      ]
+    },
+    "recording?arid:eeb1195b-f213-4ce1-b28c-8565211f8e43 AND (recording:\"Sweet Child O' Mine\")": {
+      "recordings": [
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "b1cbf8b3-8823-43b9-bc13-4bc3b2f2577e",
+          "score": 100,
+          "title": "Sweet Child o' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "d7553b48-8444-4840-93ca-bdf1d9e34bf2",
+          "score": 100,
+          "title": "Sweet Child O’ Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "6000e7b0-f28c-4edd-ba89-a405b6685f7d",
+          "score": 100,
+          "title": "Sweet Child o’ Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "002523d0-d5d4-491f-a3ac-d4f1d54e2385",
+          "score": 100,
+          "title": "Sweet Child o' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "598c1d84-39eb-454c-b908-e391ac7dfe8c",
+          "score": 100,
+          "title": "Sweet Child o’ Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "401721f1-c7b6-4a88-a1df-ae363f3570c1",
+          "score": 100,
+          "title": "Sweet Child o' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "373c6246-fe0c-4b4a-b59b-d2e449b9898b",
+          "score": 100,
+          "title": "Sweet Child O' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "586fd9b2-e1bd-499d-b498-891dc4db2c41",
+          "score": 100,
+          "title": "Sweet Child o’ Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "d2671f7f-ee7d-4b82-b1b1-8489a7c03523",
+          "score": 100,
+          "title": "Sweet Child o’ Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "9577b13c-dac1-441e-9495-308e66cb420c",
+          "score": 100,
+          "title": "Sweet Child o' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "1002c32c-4c4f-49f8-ad67-692db0f358c6",
+          "score": 100,
+          "title": "Sweet Child O' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "ca950e52-ce5a-4d16-9ddf-35748bb9abfa",
+          "score": 100,
+          "title": "Sweet Child O’ Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "68bb6205-771f-4b51-98d1-57aa1b82cfda",
+          "score": 100,
+          "title": "Sweet Child O' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "99352cc4-372b-4e74-8f3b-90b21ea50810",
+          "score": 100,
+          "title": "Sweet Child O' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "3c6ffcb1-4167-40d0-a368-b05657dce636",
+          "score": 100,
+          "title": "Sweet Child o’ Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "991daea8-b716-4ff7-b452-9d673dd996eb",
+          "score": 100,
+          "title": "Sweet Child O' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "5a77ce12-d97d-4356-8de4-ea1bb0b8ffa8",
+          "score": 100,
+          "title": "Sweet Child o’ Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "d9bca7cd-3a1c-4a0c-8334-006a570a0d29",
+          "score": 100,
+          "title": "Sweet Child O' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "7e0ef65c-d589-4867-ace6-3ef0761ab185",
+          "score": 100,
+          "title": "Sweet Child O’ Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "b568124b-8340-4477-948e-1f93018089a8",
+          "score": 100,
+          "title": "Sweet Child O' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "9040f953-e9cd-41ca-9039-057e0fb25143",
+          "score": 100,
+          "title": "Sweet Child o' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "ebf47036-d3b5-4334-868e-9326828d987c",
+          "score": 100,
+          "title": "Sweet Child O' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "50310997-bff8-4eef-891b-394eabc0639f",
+          "score": 100,
+          "title": "Sweet Child O' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "9c69fcdf-2143-44df-89c0-34c841a904bf",
+          "score": 100,
+          "title": "Sweet Child o' Mine"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+                "name": "Guns N’ Roses"
+              },
+              "name": "Guns N’ Roses"
+            }
+          ],
+          "id": "5bb9891d-6004-4607-b77c-2054df635d86",
+          "score": 100,
+          "title": "Sweet Child O' Mine"
+        }
+      ]
+    },
+    "release-group?arid:061c4920-3ea6-4835-98f6-02f3b82f5e3a AND (releasegroup:\"Concert à Cologne\")": {
+      "release-groups": []
+    },
+    "release-group?arid:070d193a-845c-479f-980e-bef15710653e AND (releasegroup:\"Prince - Les tubes\" OR releasegroup:\"Les tubes\")": {
+      "release-groups": []
+    },
+    "release-group?arid:2944824d-4c26-476f-a981-be849081942f AND (releasegroup:\"Best of perso\")": {
+      "release-groups": []
+    },
+    "release-group?arid:53b106e7-0cc6-42cc-ac95-ed8d30a3a98e AND (releasegroup:\"Mes musiques de films\")": {
+      "release-groups": []
+    },
+    "release-group?arid:6514cffa-fbe0-4965-ad88-e998ead8a82a AND (releasegroup:\"Zombie\")": {
+      "release-groups": [
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "6514cffa-fbe0-4965-ad88-e998ead8a82a",
+                "name": "Fela Kuti"
+              },
+              "name": "Fẹla"
+            },
+            {
+              "artist": {
+                "id": "dc45f2dc-ef36-4a7a-aa52-97495fca8ced",
+                "name": "Africa 70"
+              },
+              "name": "Afrika 70"
+            }
+          ],
+          "id": "517cbfb2-2279-4af9-8ca7-1c4c1a444925",
+          "score": 100,
+          "title": "Zombie"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "6514cffa-fbe0-4965-ad88-e998ead8a82a",
+                "name": "Fela Kuti"
+              },
+              "name": "Fela Kuti"
+            },
+            {
+              "artist": {
+                "id": "dc45f2dc-ef36-4a7a-aa52-97495fca8ced",
+                "name": "Africa 70"
+              },
+              "name": "Africa 70"
+            }
+          ],
+          "id": "d3de5856-816a-4759-bf9c-d5ff0e5cd740",
+          "score": 82,
+          "title": "Na Poi / Zombie"
+        }
+      ]
+    },
+    "release-group?arid:89464436-3a17-4039-8279-d1d21e979e73 AND (releasegroup:\"Vacances 1998 (cassette)\")": {
+      "release-groups": []
+    },
+    "release-group?arid:9ddd7abc-9e1b-471d-8031-583bc6bc8be9 AND (releasegroup:\"Tchaïkovski - Casse-Noisette\" OR releasegroup:\"Casse-Noisette\")": {
+      "release-groups": [
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Peter Ilyich Tchaikovsky"
+            },
+            {
+              "artist": {
+                "id": "f80eab85-8ca0-4526-9669-241aeb479017",
+                "name": "London Festival Orchestra"
+              },
+              "name": "London Festival Orchestra"
+            },
+            {
+              "artist": {
+                "id": "61c3b824-fa39-4217-8234-181182baecbc",
+                "name": "Alberto Lizzio"
+              },
+              "name": "Alberto Lizzio"
+            }
+          ],
+          "id": "ceeb5955-8d1f-4139-a33d-7b6a6d281ec3",
+          "score": 100,
+          "title": "Casse Noisette"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Tchaïkovski"
+            },
+            {
+              "artist": {
+                "id": "98c3e4e1-2f01-4ead-911f-8d4b95a6c461",
+                "name": "小澤征爾"
+              },
+              "name": "Seiji Ozawa"
+            }
+          ],
+          "id": "a75cfcf0-08e3-4895-8811-75b4983c8e6a",
+          "score": 100,
+          "title": "Casse-noisette"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Peter Tchaikovsky"
+            }
+          ],
+          "id": "03773b23-daa0-4da2-9ff2-aab3f16ff31a",
+          "score": 100,
+          "title": "Casse-Noisette"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "27870d47-bb98-42d1-bf2b-c7e972e6befc",
+                "name": "George Frideric Handel"
+              },
+              "name": "Handel"
+            },
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Tchaikovsky"
+            },
+            {
+              "artist": {
+                "id": "5610302e-bfd9-421c-80e2-03d790a0f5e5",
+                "name": "Philharmonia Orchestra"
+              },
+              "name": "Philharmonia Orchestra"
+            },
+            {
+              "artist": {
+                "id": "d2ced2f1-6b58-47cf-ae87-5943e2ab6d99",
+                "name": "Herbert von Karajan"
+              },
+              "name": "Herbert von Karajan"
+            }
+          ],
+          "id": "b87bd8f5-3783-4bf8-a317-16ba29cb799d",
+          "score": 71,
+          "title": "Water Music / Casse-Noisette Suite"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Пётр Ильич Чайковский"
+            }
+          ],
+          "id": "97138ff6-5c3d-4dcd-86f1-aa4a327bbe0a",
+          "score": 71,
+          "title": "Casse-noisette suite op. 71 a"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "0e43fe9d-c472-4b62-be9e-55f971a023e1",
+                "name": "Сергей Сергеевич Прокофьев"
+              },
+              "name": "Prokofiev"
+            },
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Tchaïkovski"
+            },
+            {
+              "artist": {
+                "id": "da447efe-b2d7-4c62-8743-1d969a108200",
+                "name": "Pierre Perret"
+              },
+              "name": "Pierre Perret"
+            },
+            {
+              "artist": {
+                "id": "53b106e7-0cc6-42cc-ac95-ed8d30a3a98e",
+                "name": "John Williams"
+              },
+              "name": "John Williams"
+            },
+            {
+              "artist": {
+                "id": "cba412a5-4f8d-4999-827a-92b63e112892",
+                "name": "Boston Pops Orchestra"
+              },
+              "name": "The Boston Pops"
+            }
+          ],
+          "id": "b8521d82-a30e-43f7-aa2e-d51606e4b2e7",
+          "score": 67,
+          "title": "Pierre et le Loup / Casse-Noisette"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Cajkovskij"
+            },
+            {
+              "artist": {
+                "id": "2630df0b-56ab-445c-a25f-dbaae15458f3",
+                "name": "Sir Andrew Davis"
+              },
+              "name": "Andrew Davis"
+            },
+            {
+              "artist": {
+                "id": "c70e7c06-65e9-42bd-9059-4973fd20e127",
+                "name": "Eugene Ormandy"
+              },
+              "name": "Eugene Ormandy"
+            }
+          ],
+          "id": "c143001e-ec7b-456d-9cd6-4b0e5456e96d",
+          "score": 67,
+          "title": "Ballets: Casse-noisette, Le Lac des Cygnes..."
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Пётр Ильич Чайковский"
+            }
+          ],
+          "id": "78117f13-ff80-47e8-aa97-dd70459b8ea5",
+          "score": 67,
+          "title": "Casse-Noisette - Le lac des cygnes"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Tchaikovsky"
+            }
+          ],
+          "id": "dfb77b24-fac2-4c68-854f-bcd91da07933",
+          "score": 60,
+          "title": "Invitation to the Ballet: Tchaikovsky’s Nutcracker Suite (Casse-Noisette)"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Пётр Ильич Чайковский"
+            },
+            {
+              "artist": {
+                "id": "aba54319-1b8e-44b1-837a-5f415a3ea129",
+                "name": "Antal Doráti"
+              },
+              "name": "Antal Doráti"
+            },
+            {
+              "artist": {
+                "id": "ca668bdc-b289-4ca9-b4d2-5a20ff057fb5",
+                "name": "Кирилл Кондрашин"
+              },
+              "name": "Кирилл Кондрашин"
+            },
+            {
+              "artist": {
+                "id": "cd673bce-4d0b-4272-b331-39772bb4995f",
+                "name": "Евгений Фёдорович Светланов"
+              },
+              "name": "Евгений Фёдорович Светланов"
+            },
+            {
+              "artist": {
+                "id": "2c8254d8-06db-4bae-a3e6-a0debcf785ae",
+                "name": "Sir Adrian Boult"
+              },
+              "name": "Sir Adrian Boult"
+            },
+            {
+              "artist": {
+                "id": "fdfea72e-82f6-4d99-9ddb-992b5861dd31",
+                "name": "Сергей Кусевицкий"
+              },
+              "name": "Сергей Кусевицкий"
+            }
+          ],
+          "id": "168229c1-7936-4f2b-abfb-5512196f9333",
+          "score": 58,
+          "title": "Casse-Noisette; Capriccio italien; La Tempête; Hamlet; Roméo et Juliette"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Tchaikovsky"
+            },
+            {
+              "artist": {
+                "id": "cb6a1638-319f-4bfb-8f38-0fcd4392b864",
+                "name": "Anima Eterna Brugge"
+              },
+              "name": "Anima Eterna Brugge"
+            },
+            {
+              "artist": {
+                "id": "095b3b6e-573b-4207-b149-3842e176d5f7",
+                "name": "Jos van Immerseel"
+              },
+              "name": "Jos van Immerseel"
+            }
+          ],
+          "id": "78831b5e-3799-47c7-8d8d-1b2ee6b52a48",
+          "score": 55,
+          "title": "Symphonie nº 4 en fa mineur / Suite de Casse-Noisette"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Tchaikovsky"
+            },
+            {
+              "artist": {
+                "id": "9914f9f9-36c0-4156-8799-6544c60ab08c",
+                "name": "Orchestre de la Suisse Romande"
+              },
+              "name": "L’Orchestre de la Suisse Romande"
+            },
+            {
+              "artist": {
+                "id": "b6cb51fd-caab-4fc5-be1c-51caf2bb49a0",
+                "name": "Ernest Ansermet"
+              },
+              "name": "Ernest Ansermet"
+            }
+          ],
+          "id": "2ee3ba36-e59d-341e-a46d-4daafe879221",
+          "score": 52,
+          "title": "Le Lac des cygnes / Casse-Noisette / La Belle au bois dormant"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Tchaikovsky"
+            },
+            {
+              "artist": {
+                "id": "5610302e-bfd9-421c-80e2-03d790a0f5e5",
+                "name": "Philharmonia Orchestra"
+              },
+              "name": "Philharmonia Orchestra"
+            },
+            {
+              "artist": {
+                "id": "5a11323c-b9e0-403a-b064-6dec680c8c8f",
+                "name": "John Lanchbery"
+              },
+              "name": "John Lanchbery"
+            }
+          ],
+          "id": "8e3b5491-2e0f-4bd2-a006-2b97906b11e7",
+          "score": 52,
+          "title": "Casse-noisette / La Belle au bois-dormant / Le Lac des cygnes"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "9ddd7abc-9e1b-471d-8031-583bc6bc8be9",
+                "name": "Пётр Ильич Чайковский"
+              },
+              "name": "Peter Tchaikovsky"
+            },
+            {
+              "artist": {
+                "id": "227b1359-4587-44d8-8616-6275816cb999",
+                "name": "Minnesota Orchestra"
+              },
+              "name": "Minnesota Orchestra"
+            },
+            {
+              "artist": {
+                "id": "97e78ecf-0d07-461f-817d-16765bc9da25",
+                "name": "Leonard Slatkin"
+              },
+              "name": "Leonard Slatkin"
+            },
+            {
+              "artist": {
+                "id": "f80eab85-8ca0-4526-9669-241aeb479017",
+                "name": "London Festival Orchestra"
+              },
+              "name": "London Festival Orchestra"
+            },
+            {
+              "artist": {
+                "id": "12701390-aa76-4f6d-8617-061eae8be822",
+                "name": "Alfred Scholz"
+              },
+              "name": "Alfred Scholz"
+            }
+          ],
+          "id": "ea0b7b35-72cd-4690-83e9-2a83f7e7b5de",
+          "score": 42,
+          "title": "Casse-Noisette, Ballet Suite Op. 71 / Le Lac de Cygnes, Ballet Suite Op. 20 / Romeo et Juliette Ballet Suite"
+        }
+      ]
+    },
+    "release-group?arid:a7f7df4a-77d8-4f12-8acd-5c60c93f4de8 AND (releasegroup:\"async\")": {
+      "release-groups": [
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "a7f7df4a-77d8-4f12-8acd-5c60c93f4de8",
+                "name": "坂本龍一"
+              },
+              "name": "Ryuichi Sakamoto"
+            }
+          ],
+          "id": "bd6cfcaf-605f-44ff-8d1f-52833306e30c",
+          "score": 100,
+          "title": "async"
+        },
+        {
+          "artist-credit": [
+            {
+              "artist": {
+                "id": "a7f7df4a-77d8-4f12-8acd-5c60c93f4de8",
+                "name": "坂本龍一"
+              },
+              "name": "Ryuichi Sakamoto"
+            }
+          ],
+          "id": "f3e6d0de-2118-47fd-ac5b-51461a7a8067",
+          "score": 90,
+          "title": "async remodels"
+        }
+      ]
+    },
+    "release-group?arid:e2b294b7-f705-4317-a96b-fd94da3719e5 AND (releasegroup:\"Bach - Suites pour violoncelle\" OR releasegroup:\"Suites pour violoncelle\")": {
+      "release-groups": []
+    },
+    "release-group?arid:eeb1195b-f213-4ce1-b28c-8565211f8e43 AND (releasegroup:\"Live perso\")": {
+      "release-groups": []
+    }
+  },
+  "requetes": 34
+}

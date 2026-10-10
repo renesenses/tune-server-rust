@@ -132,6 +132,7 @@ fn titre_qobuz(source_id: &str) -> QueueInput {
         duration_ms: 200_000,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     }
 }
 

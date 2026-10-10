@@ -91,9 +91,134 @@ pub(crate) fn colonne_piste(champ: &str) -> Option<Colonne> {
         "track_number" => nombre("t.track_number"),
         "disc_number" => nombre("t.disc_number"),
         "bpm" => nombre("t.bpm"),
-        "rating" => nombre("t.rating"),
+        // #5547 — deux critères d'ALBUM que les collections offraient et que
+        // les playlists refusaient (condition FAUSSE). Au niveau de la piste,
+        // c'est l'album de la piste qui répond : « albums de 12 pistes » rend
+        // les pistes de ces albums, « sans pochette » celles d'un album sans
+        // pochette. Mêmes colonnes que `build_album_query`.
+        "track_count" => nombre("al.track_count"),
+        "cover_path" => texte("al.cover_path"),
         _ => return None,
     })
+}
+
+/// La valeur d'une règle, en texte : une chaîne telle quelle, un NOMBRE écrit
+/// en chiffres.
+///
+/// #5547 — l'éditeur des collections envoie un champ numérique comme nombre
+/// JSON (`{"value": 1969}`), et celui des playlists le fait désormais aussi.
+/// Le moteur des playlists ne lisait que les chaînes : `1969` y devenait `""`,
+/// donc `year = 0`. Une liste, un objet ou l'absence restent `""`, comme avant.
+pub(crate) fn texte_de(valeur: Option<&serde_json::Value>) -> String {
+    match valeur {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Une date de règle en SQL : les formes relatives `now-90d`, `90d`, `90`
+/// valent « il y a N jours » ; tout le reste est une date littérale.
+///
+/// Sortie de `smart_collections` (#5547) sans un caractère changé, pour que
+/// les playlists lisent une date comme les collections.
+pub(crate) fn horodatage_sql(input: &str) -> String {
+    // Relative forms: "now-90d", "90d", "90" — N days ago. The seeded
+    // "🆕 Récents" collection stores the bare "90d" form, which used to fall
+    // through to a literal string ('90d') that no date ever compares against.
+    let rest = input.strip_prefix("now-").unwrap_or(input);
+    let digits = rest.strip_suffix('d').unwrap_or(rest);
+    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+        let days: i64 = digits.parse().unwrap_or(30);
+        return format!("DATETIME('now', '-{days} days')");
+    }
+    format!("'{}'", input.replace('\'', "''"))
+}
+
+/// Les deux bornes d'une règle « entre » portant sur des DATES, en SQL.
+///
+/// Même lecture que les collections : un tableau de deux chaînes, bornes par
+/// défaut larges.
+pub(crate) fn bornes_de_dates(valeur: Option<&serde_json::Value>) -> Option<(String, String)> {
+    let arr = valeur?.as_array()?;
+    let lo = arr.first().and_then(|v| v.as_str()).unwrap_or("2000-01-01");
+    let hi = arr.get(1).and_then(|v| v.as_str()).unwrap_or("2099-01-01");
+    Some((horodatage_sql(lo), horodatage_sql(hi)))
+}
+
+/// Les deux bornes d'une règle « entre » portant sur des NOMBRES.
+///
+/// Même lecture que `build_album_query` : un tableau `[lo, hi]`, ou la chaîne
+/// `"lo,hi"`. `None` si la valeur n'a pas deux bornes.
+pub(crate) fn bornes_de_nombres(valeur: Option<&serde_json::Value>) -> Option<(i64, i64)> {
+    let nombre = |v: &serde_json::Value| {
+        v.as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+    };
+    match valeur? {
+        serde_json::Value::Array(arr) if arr.len() == 2 => Some((
+            nombre(&arr[0]).unwrap_or(0),
+            nombre(&arr[1]).unwrap_or(i64::MAX),
+        )),
+        serde_json::Value::String(s) => {
+            let (lo, hi) = s.split_once(',')?;
+            Some((
+                lo.trim().parse::<i64>().unwrap_or(0),
+                hi.trim().parse::<i64>().unwrap_or(i64::MAX),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Les sous-conditions d'une règle « crédit » (`{"role", "artist_name",
+/// "instrument"}`), sur l'alias `tc` de `track_credits`.
+///
+/// Sortie de `build_album_query` (#5547) sans un caractère changé : la piste
+/// et l'album lisent un crédit de la même façon. Vide si l'objet ne nomme
+/// rien.
+pub(crate) fn conditions_credit(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let mut sub_conds = Vec::new();
+    if let Some(role) = obj
+        .get("role")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        sub_conds.push(format!(
+            "LOWER(tc.role) LIKE LOWER('%{}%')",
+            role.replace('\'', "''")
+        ));
+    }
+    if let Some(artist) = obj
+        .get("artist_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        sub_conds.push(format!(
+            "LOWER(tc.artist_name) LIKE LOWER('%{}%')",
+            artist.replace('\'', "''")
+        ));
+    }
+    if let Some(instr) = obj
+        .get("instrument")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        // MÊME canonisation qu'à l'écriture des crédits
+        // (#2799 §4). L'enrichissement range désormais
+        // « grand piano » / « electric piano » sous `piano` ;
+        // si la règle cherchait le libellé brut saisi par
+        // l'utilisateur, une collection `instrument: Grand
+        // Piano` ne trouverait plus rien alors que les lignes
+        // existent. Deux normalisations, deux résultats.
+        let canon = tune_core::metadata::instruments::canoniser_instrument(instr);
+        let motif = if canon.is_empty() { instr } else { &canon };
+        sub_conds.push(format!(
+            "LOWER(tc.instrument) LIKE LOWER('%{}%')",
+            motif.replace('\'', "''")
+        ));
+    }
+    sub_conds
 }
 
 /// L'opérateur BRUT d'une règle, quelle que soit la clé qui le porte.
@@ -218,8 +343,129 @@ pub(crate) fn condition(col: Colonne, op: &str, valeur: &str) -> Option<String> 
     })
 }
 
+/// La condition d'une règle dont la valeur n'est pas qu'un texte : « entre »
+/// (deux bornes) et « parmi » (une liste). Les autres opérateurs passent par
+/// [`condition`].
+///
+/// #5547 — l'éditeur des collections propose les deux, celui des playlists
+/// désormais aussi, et `condition` ne sait pas les lire : ils y rendaient
+/// FAUX.
+///
+/// « Parmi » compare sans tenir compte de la casse, des deux côtés — « Rock,
+/// Jazz » trouve « rock ». (La traduction des collections abaisse la colonne
+/// et pas la liste : elle ne trouve qu'une valeur écrite en minuscules. Elle
+/// n'est pas touchée ici, pour ne rien changer aux collections enregistrées ;
+/// voir tune-server-rust#5547.)
+pub(crate) fn condition_valeur(
+    col: Colonne,
+    op: &str,
+    valeur: Option<&serde_json::Value>,
+) -> Option<String> {
+    let sql = col.sql;
+    match op {
+        "between" if col.genre == Genre::Nombre => {
+            let (lo, hi) = bornes_de_nombres(valeur)?;
+            Some(format!("{sql} BETWEEN {lo} AND {hi}"))
+        }
+        "in" => {
+            let items: Vec<String> = match valeur? {
+                serde_json::Value::Array(arr) => arr.iter().map(|v| texte_de(Some(v))).collect(),
+                serde_json::Value::String(s) => {
+                    s.split(',').map(|x| x.trim().to_string()).collect()
+                }
+                _ => return None,
+            };
+            let items: Vec<String> = items.into_iter().filter(|x| !x.is_empty()).collect();
+            if items.is_empty() {
+                return None;
+            }
+            Some(if col.genre == Genre::Texte {
+                let liste: Vec<String> = items
+                    .iter()
+                    .map(|x| format!("LOWER('{}')", x.replace('\'', "''")))
+                    .collect();
+                format!("LOWER({sql}) IN ({})", liste.join(","))
+            } else {
+                let liste: Vec<String> = items
+                    .iter()
+                    .map(|x| x.parse::<i64>().unwrap_or(0).to_string())
+                    .collect();
+                format!("{sql} IN ({})", liste.join(","))
+            })
+        }
+        _ => condition(col, op, &texte_de(valeur)),
+    }
+}
+
+/// La NOTE d'un album pour le profil actif — « Note » (`rating`), #5547.
+///
+/// Les deux moteurs compilaient `t.rating`, colonne qui n'existe pas : la
+/// requête échouait (`no such column: t.rating`) et l'aperçu rendait une
+/// erreur 500, aux collections comme aux playlists (.18, 0.9.169). Les notes
+/// vivent dans `album_ratings`, une ligne par album ET par profil.
+///
+/// Décision de Bertrand (30/09/2026) : la note de l'ALBUM pour le profil
+/// actif ; dans une playlist, celle de l'album de chaque piste. `album` est
+/// donc `al.id` (collections) ou `t.album_id` (playlists).
+///
+/// Opérateurs de la famille numérique. Un album SANS note donne `NULL` : il ne
+/// passe aucune comparaison — ni « ≥ N », ni « ≠ N », ni « entre ». La famille
+/// n'a pas d'opérateur « n'est pas noté », et aucun n'est ajouté.
+///
+/// `None` : opérateur hors de la famille. Sans profil, rien ne passe (`FAUX`),
+/// comme pour les favoris : sans profil, la note est inconnue.
+pub(crate) fn condition_note(
+    album: &str,
+    op: &str,
+    valeur: Option<&serde_json::Value>,
+    profile_id: Option<i64>,
+) -> Option<String> {
+    let entier = || texte_de(valeur).trim().parse::<i64>().unwrap_or(0);
+    let comparaison = match op {
+        "=" | "!=" | ">=" | ">" | "<=" | "<" => format!("{op} {}", entier()),
+        "between" => {
+            let (lo, hi) = bornes_de_nombres(valeur)?;
+            format!("BETWEEN {lo} AND {hi}")
+        }
+        _ => return None,
+    };
+    let Some(pid) = profile_id else {
+        return Some(FAUX.to_string());
+    };
+    Some(format!(
+        "(SELECT arn.rating FROM album_ratings arn \
+         WHERE arn.album_id = {album} AND arn.profile_id = {pid}) {comparaison}"
+    ))
+}
+
 /// La condition à poser quand rien ne se traduit : FAUX.
 pub(crate) const FAUX: &str = "1 = 0";
+
+/// #5530 — « Généré par IA » sur une ligne de la BIBLIOTHÈQUE.
+///
+/// Le marquage est celui que Qobuz pose sur un album de son catalogue ; un
+/// fichier local n'en porte aucun. « non » retient donc toute la bibliothèque,
+/// « oui » n'en retient rien. Ce ne sont pas des règles REFUSÉES : la réponse
+/// est connue, elle est simplement constante — d'où des littéraux distincts de
+/// [`FAUX`], que les rapports d'aperçu lisent comme « intraduisible ».
+pub(crate) fn condition_marquage_ia_bibliotheque(op: &str) -> Option<&'static str> {
+    match op {
+        "is_false" => Some("1 = 1"),
+        "is_true" => Some("0 = 1"),
+        _ => None,
+    }
+}
+
+/// #5530 — la même règle sur une colonne `ai_generated` d'un favori de
+/// service (TEXT : `'1'` marqué, `'0'` non, NULL inconnu). Un marquage
+/// inconnu n'est PAS un marquage : « non » retient la ligne.
+pub(crate) fn condition_marquage_ia_colonne(col: &str, op: &str) -> Option<String> {
+    match op {
+        "is_false" => Some(format!("({col} IS NULL OR {col} != '1')")),
+        "is_true" => Some(format!("{col} = '1'")),
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 mod tests {

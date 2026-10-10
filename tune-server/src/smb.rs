@@ -50,6 +50,158 @@ pub fn depuis_etiquette(etiquette: &str) -> Option<&str> {
     }
 }
 
+/// Options passees a `mount.cifs` pour un essai.
+///
+/// `iocharset=utf8` est impose : sans lui, le noyau convertit les noms de
+/// fichiers avec le jeu de caracteres par defaut du systeme, qui n'est pas
+/// toujours UTF-8. Tout caractere qu'il ne sait pas representer — apostrophe
+/// typographique ’, n tilde ñ, e accent aigu decompose, œ — devient alors un
+/// `?` dans le nom que liste le partage. Le fichier apparait au scan, mais
+/// `?` n'est pas son vrai nom : l'ouvrir echoue par `No such file or
+/// directory`, et la piste est perdue pour la bibliotheque.
+///
+/// Les deux appelants (route interactive et remontage au demarrage) passent
+/// par ici : un partage monte en UTF-8 depuis l'assistant doit le rester au
+/// redemarrage.
+///
+/// La chaine porte le mot de passe : elle ne doit JAMAIS aller dans une trace.
+pub fn options_de_montage(user: &str, pass: &str, dialecte: Option<&str>) -> String {
+    let mut opts = format!("username={user},password={pass},iocharset=utf8");
+    if let Some(v) = dialecte {
+        opts.push_str(&format!(",vers={v}"));
+    }
+    opts
+}
+
+/// La commande d'UN essai de montage Linux, selon le compte du service (#3206).
+///
+/// - root : `mount.cifs <unc> <point> -o <options>`, comme toujours ;
+/// - autre compte : `sudo -n tune-os-privilege smb-mount <unc> <point>
+///   <utilisateur> <dialecte>`, le mot de passe sur l'entrée standard. C'est
+///   l'assistant qui compose les options, avec les MÊMES que
+///   [`options_de_montage`] plus `uid`/`gid` du compte appelant et
+///   `nosuid,nodev,noexec`.
+///
+/// Les deux appelants (route interactive, remontage au démarrage) passent par
+/// ici pour la même raison que l'échelle : ce qui monte d'un côté doit monter
+/// de l'autre.
+pub fn commande_de_montage(
+    euid: u32,
+    sudo: &str,
+    unc: &str,
+    point: &str,
+    user: &str,
+    pass: &str,
+    dialecte: Option<&str>,
+) -> crate::privilege::Commande {
+    use crate::privilege::Commande;
+    if euid == 0 {
+        let opts = options_de_montage(user, pass, dialecte);
+        Commande::directe("mount.cifs", &[unc, point, "-o", &opts])
+    } else {
+        Commande::par_l_assistant(sudo, "smb-mount", &[unc, point, user, etiquette(dialecte)])
+            .avec_entree(pass)
+    }
+}
+
+/// La commande de démontage d'un partage, selon le compte du service.
+pub fn commande_de_demontage(euid: u32, sudo: &str, point: &str) -> crate::privilege::Commande {
+    use crate::privilege::Commande;
+    if euid == 0 {
+        Commande::directe("umount", &[point])
+    } else {
+        Commande::par_l_assistant(sudo, "smb-umount", &[point])
+    }
+}
+
+#[cfg(test)]
+mod commande_de_montage_tests {
+    use super::*;
+    use crate::privilege::{ASSISTANT, SUDO};
+
+    #[test]
+    fn en_root_rien_ne_change() {
+        let c = commande_de_montage(0, SUDO, "//nas/m", "/mnt/nas_m", "u", "p", Some("2.0"));
+        assert_eq!(c.programme, "mount.cifs");
+        assert_eq!(
+            c.args,
+            vec![
+                "//nas/m",
+                "/mnt/nas_m",
+                "-o",
+                "username=u,password=p,iocharset=utf8,vers=2.0"
+            ]
+        );
+        assert_eq!(c.entree, None);
+        let d = commande_de_demontage(0, SUDO, "/mnt/nas_m");
+        assert_eq!(
+            (d.programme.as_str(), d.args.clone()),
+            ("umount", vec!["/mnt/nas_m".to_string()])
+        );
+    }
+
+    #[test]
+    fn hors_root_l_assistant_recoit_le_mot_de_passe_sur_l_entree() {
+        for dialecte in DIALECTES {
+            let c =
+                commande_de_montage(1000, SUDO, "//nas/m", "/mnt/nas_m", "u", "p@ss,1", dialecte);
+            assert_eq!(c.programme, SUDO);
+            assert_eq!(
+                c.args,
+                vec![
+                    "-n",
+                    ASSISTANT,
+                    "smb-mount",
+                    "//nas/m",
+                    "/mnt/nas_m",
+                    "u",
+                    etiquette(dialecte)
+                ]
+            );
+            assert!(
+                !c.args.iter().any(|a| a.contains("p@ss")),
+                "le mot de passe ne doit pas passer en argument (sudo journalise la ligne)"
+            );
+            assert_eq!(c.entree.as_deref(), Some("p@ss,1"));
+        }
+        let d = commande_de_demontage(1000, SUDO, "/mnt/nas_m");
+        assert_eq!(d.args, vec!["-n", ASSISTANT, "smb-umount", "/mnt/nas_m"]);
+    }
+
+    /// Un refus de sudo ne se répare pas en changeant de dialecte.
+    #[test]
+    fn un_refus_de_sudo_arrete_l_echelle() {
+        assert!(arrete_l_echelle("sudo: a password is required"));
+    }
+}
+
+#[cfg(test)]
+mod options_de_montage_tests {
+    use super::options_de_montage;
+
+    /// Retour de terrain : sans `iocharset=utf8`, les noms avec ’, ñ ou é passaient
+    /// en `?` et les fichiers devenaient introuvables.
+    #[test]
+    fn chaque_essai_monte_en_utf8() {
+        for dialecte in super::DIALECTES {
+            let opts = options_de_montage("u", "p", dialecte);
+            assert!(
+                opts.split(',').any(|o| o == "iocharset=utf8"),
+                "essai {dialecte:?} sans iocharset=utf8 : {opts}"
+            );
+        }
+    }
+
+    #[test]
+    fn le_dialecte_reste_une_option_a_part() {
+        assert_eq!(
+            options_de_montage("u", "p", Some("1.0")),
+            "username=u,password=p,iocharset=utf8,vers=1.0"
+        );
+        assert!(!options_de_montage("u", "p", None).contains("vers="));
+    }
+}
+
 /// L'echelle a parcourir, le dialecte connu d'abord.
 ///
 /// Un partage qui a deja monte en SMB 1.0 remonte en SMB 1.0 du premier coup :
@@ -81,6 +233,200 @@ pub fn est_refus_d_authentification(stderr: &str) -> bool {
     bas.contains("permission denied")
         || bas.contains("access denied")
         || bas.contains("bad user name or password")
+}
+
+/// Le message de `mount.cifs` dit-il que le point de montage est deja occupe ?
+///
+/// `mount error(16): Device or resource busy` (EBUSY) : le noyau refuse un
+/// second montage sur un point deja monte. Changer de dialecte n'y fera rien —
+/// et c'est pourtant ce que faisait l'echelle : apres l'EBUSY, elle essayait
+/// `vers=2.0` puis `vers=1.0`, que le NAS refusait (`error(95)`), et c'est ce
+/// DERNIER message que l'utilisateur lisait. Daniel Levy (fil 2145) a ainsi vu
+/// « Operation not supported » pour un partage qui etait simplement deja monte.
+pub fn est_deja_monte(stderr: &str) -> bool {
+    let bas = stderr.to_lowercase();
+    bas.contains("error(16)") || bas.contains("device or resource busy")
+}
+
+/// Faut-il arreter l'echelle des dialectes sur cet echec ?
+///
+/// Seuls les echecs qu'un autre dialecte ne reparera pas l'arretent : un refus
+/// d'identifiants, et un point de montage deja occupe (fil 2145). Les deux
+/// appelants — la route interactive et le remontage au demarrage — passent par
+/// ici, pour ne pas diverger (voir l'en-tete du module).
+///
+/// Un refus de sudo (service hors root sans regle sudoers, #3206) non plus.
+pub fn arrete_l_echelle(stderr: &str) -> bool {
+    est_refus_d_authentification(stderr)
+        || est_deja_monte(stderr)
+        || crate::privilege::est_un_refus_d_elevation(stderr)
+}
+
+/// Defaire les echappements octaux de `/proc/self/mounts` (`\040` pour une
+/// espace, `\011`, `\012`, `\134`).
+fn desechapper_octal(champ: &str) -> String {
+    let octets = champ.as_bytes();
+    let mut sortie = Vec::with_capacity(octets.len());
+    let mut i = 0;
+    while i < octets.len() {
+        if octets[i] == b'\\'
+            && i + 3 < octets.len()
+            && (b'0'..=b'3').contains(&octets[i + 1])
+            && octets[i + 2..i + 4]
+                .iter()
+                .all(|c| (b'0'..=b'7').contains(c))
+        {
+            let v =
+                (octets[i + 1] - b'0') * 64 + (octets[i + 2] - b'0') * 8 + (octets[i + 3] - b'0');
+            sortie.push(v);
+            i += 4;
+        } else {
+            sortie.push(octets[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&sortie).into_owned()
+}
+
+/// La source montee sur `chemin`, lue dans une table au format
+/// `/proc/self/mounts`. Le DERNIER montage l'emporte : c'est lui qui est
+/// visible quand plusieurs sont empiles sur le meme point.
+pub fn source_dans_la_table(table: &str, chemin: &str) -> Option<String> {
+    let chemin = chemin.trim_end_matches('/');
+    let chemin = if chemin.is_empty() { "/" } else { chemin };
+    table.lines().rev().find_map(|ligne| {
+        let mut champs = ligne.split_whitespace();
+        let source = champs.next()?;
+        let cible = champs.next()?;
+        (desechapper_octal(cible) == chemin).then(|| desechapper_octal(source))
+    })
+}
+
+/// La source effectivement montee sur `chemin` (`//hote/partage` pour un
+/// montage CIFS). `None` quand on ne sait pas la lire : hors Linux, ou table
+/// des montages illisible.
+pub fn source_du_montage(chemin: &std::path::Path) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    let canonique = std::fs::canonicalize(chemin).unwrap_or_else(|_| chemin.to_path_buf());
+    source_dans_la_table(&table, &canonique.to_string_lossy())
+}
+
+/// `source` (lue dans la table des montages) designe-t-elle `//hote/partage` ?
+///
+/// La comparaison ignore la casse (SMB l'ignore, pour l'hote comme pour le
+/// partage), le sens des barres (`\\hote\partage`), les crochets d'une IPv6
+/// litterale et une barre finale.
+pub fn meme_source(source: &str, hote: &str, partage: &str) -> bool {
+    fn normaliser(s: &str) -> String {
+        s.replace('\\', "/")
+            .replace(['[', ']'], "")
+            .trim_end_matches('/')
+            .to_lowercase()
+    }
+    normaliser(source) == normaliser(&format!("//{hote}/{partage}"))
+}
+
+/// Identifiant de serveur SMB2 (`ServerGuid` de la reponse NEGOTIATE).
+pub type GuidServeur = [u8; 16];
+
+/// Une requete SMB2 NEGOTIATE minimale, cadree NetBIOS (port 445).
+///
+/// Les dialectes 2.0.2 a 3.0.2 seulement : 3.1.1 exigerait des contextes de
+/// negociation, inutiles pour lire le `ServerGuid`.
+pub fn requete_negotiate() -> Vec<u8> {
+    const DIALECTES_SMB2: [u16; 4] = [0x0202, 0x0210, 0x0300, 0x0302];
+    let mut smb = Vec::with_capacity(64 + 36 + 8);
+    // En-tete SMB2 (64 octets).
+    smb.extend_from_slice(&[0xFE, b'S', b'M', b'B']);
+    smb.extend_from_slice(&64u16.to_le_bytes()); // StructureSize
+    smb.extend_from_slice(&0u16.to_le_bytes()); // CreditCharge
+    smb.extend_from_slice(&0u32.to_le_bytes()); // Status
+    smb.extend_from_slice(&0u16.to_le_bytes()); // Command = NEGOTIATE
+    smb.extend_from_slice(&1u16.to_le_bytes()); // CreditRequest
+    smb.extend_from_slice(&0u32.to_le_bytes()); // Flags
+    smb.extend_from_slice(&0u32.to_le_bytes()); // NextCommand
+    smb.extend_from_slice(&0u64.to_le_bytes()); // MessageId
+    smb.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+    smb.extend_from_slice(&0u32.to_le_bytes()); // TreeId
+    smb.extend_from_slice(&0u64.to_le_bytes()); // SessionId
+    smb.extend_from_slice(&[0u8; 16]); // Signature
+    // Corps NEGOTIATE.
+    smb.extend_from_slice(&36u16.to_le_bytes()); // StructureSize
+    smb.extend_from_slice(&(DIALECTES_SMB2.len() as u16).to_le_bytes());
+    smb.extend_from_slice(&1u16.to_le_bytes()); // SecurityMode : signature possible
+    smb.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+    smb.extend_from_slice(&0u32.to_le_bytes()); // Capabilities
+    smb.extend_from_slice(b"Tune-client-guid"); // ClientGuid (16 octets)
+    smb.extend_from_slice(&0u64.to_le_bytes()); // ClientStartTime
+    for d in DIALECTES_SMB2 {
+        smb.extend_from_slice(&d.to_le_bytes());
+    }
+    let mut trame = Vec::with_capacity(4 + smb.len());
+    trame.push(0);
+    let n = smb.len() as u32;
+    trame.extend_from_slice(&n.to_be_bytes()[1..]);
+    trame.extend_from_slice(&smb);
+    trame
+}
+
+/// Le `ServerGuid` d'une reponse NEGOTIATE (trame NetBIOS comprise).
+///
+/// `None` si la reponse n'est pas un NEGOTIATE SMB2 reussi, ou si le GUID est
+/// nul : un GUID nul ne distingue personne, le prendre pour une identite
+/// ferait confondre deux serveurs.
+pub fn guid_de_la_reponse(trame: &[u8]) -> Option<GuidServeur> {
+    let smb = trame.get(4..)?;
+    if smb.get(0..4)? != [0xFE, b'S', b'M', b'B'] {
+        return None;
+    }
+    let statut = u32::from_le_bytes(smb.get(8..12)?.try_into().ok()?);
+    let commande = u16::from_le_bytes(smb.get(12..14)?.try_into().ok()?);
+    if statut != 0 || commande != 0 {
+        return None;
+    }
+    let corps = smb.get(64..)?;
+    if u16::from_le_bytes(corps.get(0..2)?.try_into().ok()?) != 65 {
+        return None;
+    }
+    let guid: GuidServeur = corps.get(8..24)?.try_into().ok()?;
+    (guid != [0u8; 16]).then_some(guid)
+}
+
+/// Demander son `ServerGuid` au serveur SMB `hote:port`.
+///
+/// C'est ce qui reconnait un meme NAS sous deux adresses (fil 2145 : un
+/// Synology vu en IPv6 par la decouverte, puis en IPv4 par la saisie). Samba
+/// derive ce GUID du nom NetBIOS du serveur (`smbd_server_guid`), Windows le
+/// garde en registre : il est donc le meme sur toutes les interfaces d'une
+/// machine, quelle que soit l'adresse par laquelle on l'interroge.
+///
+/// `None` si le serveur ne repond pas, ou seulement en SMB1 : on ne sait
+/// alors pas conclure, et l'appelant ne doit rien fusionner.
+pub async fn guid_du_serveur(hote: &str, port: u16) -> Option<GuidServeur> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let hote = hote.trim_start_matches('[').trim_end_matches(']');
+    let essai = async {
+        let mut flux = tokio::net::TcpStream::connect((hote, port)).await.ok()?;
+        flux.write_all(&requete_negotiate()).await.ok()?;
+        let mut entete = [0u8; 4];
+        flux.read_exact(&mut entete).await.ok()?;
+        let n = u32::from_be_bytes([0, entete[1], entete[2], entete[3]]) as usize;
+        if n > 64 * 1024 {
+            return None;
+        }
+        let mut reste = vec![0u8; n];
+        flux.read_exact(&mut reste).await.ok()?;
+        let mut trame = entete.to_vec();
+        trame.extend_from_slice(&reste);
+        guid_de_la_reponse(&trame)
+    };
+    tokio::time::timeout(Duration::from_secs(3), essai)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Le chemin est-il reellement un point de montage ?
@@ -153,6 +499,173 @@ mod tests {
         ));
         assert!(!est_refus_d_authentification("Device or resource busy"));
         assert!(!est_refus_d_authentification(""));
+    }
+
+    /// Fil 2145 (Daniel Levy) : `negocie` rendait `mount error(16): Device or
+    /// resource busy`, l'echelle continuait sur 2.0 puis 1.0, et l'utilisateur
+    /// lisait l'`error(95)` du dernier essai. L'EBUSY doit arreter l'echelle.
+    #[test]
+    fn un_point_deja_occupe_arrete_l_echelle() {
+        let ebusy = "mount error(16): Device or resource busy\n\
+                     Refer to the mount.cifs(8) manual page (e.g. man mount.cifs)";
+        assert!(est_deja_monte(ebusy));
+        assert!(arrete_l_echelle(ebusy));
+        assert!(arrete_l_echelle("mount error(13): Permission denied"));
+        // Un dialecte refuse, lui, doit laisser l'echelle continuer.
+        assert!(!arrete_l_echelle(
+            "mount error(95): Operation not supported"
+        ));
+        assert!(!arrete_l_echelle("mount error(22): Invalid argument"));
+        assert!(!est_deja_monte("mount error(112): Host is down"));
+    }
+
+    #[test]
+    fn la_source_d_un_point_se_lit_dans_la_table_des_montages() {
+        let table = "\
+proc /proc proc rw,nosuid 0 0
+//192.168.10.69/Music /mnt/192.168.10.69_Music cifs rw,vers=3.1.1 0 0
+//fd12::1/Ma\\040Musique /mnt/fd12::1_Ma_Musique cifs rw 0 0
+tmpfs /mnt/empile tmpfs rw 0 0
+//nas/A /mnt/empile cifs rw 0 0
+";
+        assert_eq!(
+            source_dans_la_table(table, "/mnt/192.168.10.69_Music").as_deref(),
+            Some("//192.168.10.69/Music")
+        );
+        assert_eq!(
+            source_dans_la_table(table, "/mnt/192.168.10.69_Music/").as_deref(),
+            Some("//192.168.10.69/Music"),
+            "une barre finale ne change pas le point"
+        );
+        assert_eq!(
+            source_dans_la_table(table, "/mnt/fd12::1_Ma_Musique").as_deref(),
+            Some("//fd12::1/Ma Musique"),
+            "les echappements octaux sont defaits"
+        );
+        assert_eq!(
+            source_dans_la_table(table, "/mnt/empile").as_deref(),
+            Some("//nas/A"),
+            "le dernier montage empile est celui qu'on voit"
+        );
+        assert_eq!(source_dans_la_table(table, "/mnt/absent"), None);
+    }
+
+    #[test]
+    fn la_meme_source_s_ecrit_de_plusieurs_facons() {
+        assert!(meme_source(
+            "//192.168.10.69/Music",
+            "192.168.10.69",
+            "Music"
+        ));
+        assert!(meme_source(
+            "//192.168.10.69/music/",
+            "192.168.10.69",
+            "Music"
+        ));
+        assert!(meme_source(r"\\NAS\Music", "nas", "music"));
+        assert!(meme_source("//fd12::1/Music", "[fd12::1]", "Music"));
+        assert!(!meme_source(
+            "//192.168.10.69/Video",
+            "192.168.10.69",
+            "Music"
+        ));
+        assert!(!meme_source(
+            "//192.168.10.70/Music",
+            "192.168.10.69",
+            "Music"
+        ));
+        assert!(!meme_source("tmpfs", "192.168.10.69", "Music"));
+    }
+
+    /// Une reponse NEGOTIATE SMB2 telle qu'un serveur la rend.
+    fn reponse_negotiate(guid: GuidServeur, statut: u32) -> Vec<u8> {
+        let mut smb = vec![0u8; 64];
+        smb[0..4].copy_from_slice(&[0xFE, b'S', b'M', b'B']);
+        smb[4..6].copy_from_slice(&64u16.to_le_bytes());
+        smb[8..12].copy_from_slice(&statut.to_le_bytes());
+        let mut corps = vec![0u8; 64];
+        corps[0..2].copy_from_slice(&65u16.to_le_bytes());
+        corps[4..6].copy_from_slice(&0x0302u16.to_le_bytes());
+        corps[8..24].copy_from_slice(&guid);
+        smb.extend_from_slice(&corps);
+        let mut trame = vec![0u8];
+        trame.extend_from_slice(&(smb.len() as u32).to_be_bytes()[1..]);
+        trame.extend_from_slice(&smb);
+        trame
+    }
+
+    #[test]
+    fn la_requete_negotiate_est_bien_cadree() {
+        let r = requete_negotiate();
+        let n = u32::from_be_bytes([0, r[1], r[2], r[3]]) as usize;
+        assert_eq!(r[0], 0);
+        assert_eq!(n, r.len() - 4, "longueur NetBIOS");
+        assert_eq!(&r[4..8], &[0xFE, b'S', b'M', b'B']);
+        assert_eq!(u16::from_le_bytes([r[68], r[69]]), 36, "StructureSize");
+        assert_eq!(n, 64 + 36 + 2 * 4);
+    }
+
+    #[test]
+    fn le_guid_se_lit_dans_la_reponse() {
+        let guid = *b"daniel-synology!";
+        assert_eq!(guid_de_la_reponse(&reponse_negotiate(guid, 0)), Some(guid));
+        // Un refus (STATUS_NOT_SUPPORTED) ou un GUID nul n'identifient rien.
+        assert_eq!(
+            guid_de_la_reponse(&reponse_negotiate(guid, 0xC00000BB)),
+            None
+        );
+        assert_eq!(guid_de_la_reponse(&reponse_negotiate([0; 16], 0)), None);
+        // Une reponse SMB1 (0xFF 'SMB') non plus.
+        let mut smb1 = reponse_negotiate(guid, 0);
+        smb1[4] = 0xFF;
+        assert_eq!(guid_de_la_reponse(&smb1), None);
+        assert_eq!(guid_de_la_reponse(&[0, 0]), None);
+    }
+
+    /// Un faux serveur SMB2 qui rend `guid` a chaque NEGOTIATE.
+    async fn faux_serveur(adresse: &str, guid: GuidServeur) -> Option<u16> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let ecoute = tokio::net::TcpListener::bind((adresse, 0)).await.ok()?;
+        let port = ecoute.local_addr().ok()?.port();
+        tokio::spawn(async move {
+            while let Ok((mut flux, _)) = ecoute.accept().await {
+                let mut entete = [0u8; 4];
+                if flux.read_exact(&mut entete).await.is_err() {
+                    continue;
+                }
+                let n = u32::from_be_bytes([0, entete[1], entete[2], entete[3]]) as usize;
+                let mut reste = vec![0u8; n];
+                let _ = flux.read_exact(&mut reste).await;
+                let _ = flux.write_all(&reponse_negotiate(guid, 0)).await;
+            }
+        });
+        Some(port)
+    }
+
+    /// Le cas du fil 2145 rejoue : le meme serveur interroge par son IPv4 et
+    /// par son IPv6 rend le meme GUID ; un autre serveur, un autre.
+    #[tokio::test]
+    async fn le_meme_serveur_se_reconnait_par_ses_deux_adresses() {
+        let nas = *b"daniel-synology!";
+        let p4 = faux_serveur("127.0.0.1", nas).await.expect("ecoute IPv4");
+        let par_ipv4 = guid_du_serveur("127.0.0.1", p4).await;
+        assert_eq!(par_ipv4, Some(nas));
+        if let Some(p6) = faux_serveur("::1", nas).await {
+            assert_eq!(guid_du_serveur("[::1]", p6).await, par_ipv4);
+        }
+        let autre = faux_serveur("127.0.0.1", *b"un-autre-serveur")
+            .await
+            .unwrap();
+        assert_ne!(guid_du_serveur("127.0.0.1", autre).await, par_ipv4);
+    }
+
+    #[tokio::test]
+    async fn un_serveur_muet_n_a_pas_d_identite() {
+        // Port ferme : on ne sait pas, et on le dit.
+        let ecoute = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = ecoute.local_addr().unwrap().port();
+        drop(ecoute);
+        assert_eq!(guid_du_serveur("127.0.0.1", port).await, None);
     }
 
     /// La casse de `mount.cifs` varie selon les versions.

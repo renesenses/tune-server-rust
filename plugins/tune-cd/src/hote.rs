@@ -110,6 +110,7 @@ impl HoteLecture for HoteOrchestrateur {
                 media_format: Some("wav".into()),
                 track_number: Some(premier.numero as u32),
                 disc_number: Some(1),
+                album_ref: None,
             })
             .await?;
         // Réaffirmée APRÈS play(), pour la même raison que `POST /zones/{id}/play` :

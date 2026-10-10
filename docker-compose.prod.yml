@@ -1,10 +1,16 @@
-## Tune Server — Production with PostgreSQL
+## Tune Server — Production
 ##
 ## Usage:
 ##   1. Replace /path/to/music with your music library path
-##   2. Change POSTGRES_PASSWORD for production use
-##   3. docker compose -f docker-compose.prod.yml up -d
-##   4. Open http://localhost:8888
+##   2. docker compose -f docker-compose.prod.yml up -d
+##   3. Open http://localhost:8888
+##
+## Database: SQLite, stored in the tune-data volume (/data/tune.db, set by the
+## image's TUNE_DB_PATH). The published renesenses/tune image is built WITHOUT
+## the `postgres` cargo feature: given a TUNE_DATABASE_URL it refuses to start
+## ("PostgreSQL engine requested but the `postgres` feature is not enabled").
+## PostgreSQL therefore needs an image you build yourself with
+## `--features postgres`; it cannot work with this image.
 ##
 ## For DLNA/SSDP/mDNS discovery, add network_mode: host to the tune service
 ## and remove the ports mapping (host mode exposes all ports directly).
@@ -27,27 +33,14 @@ services:
       - /path/to/music:/music:ro
     environment:
       - TUNE_MUSIC_DIRS=["/music"]
-      - TUNE_DATABASE_URL=postgres://tune:tune@db:5432/tune
-    depends_on:
-      db:
-        condition: service_healthy
     restart: unless-stopped
-
-  db:
-    image: postgres:16-alpine
-    container_name: tune-db
-    volumes:
-      - pg-data:/var/lib/postgresql/data
-    environment:
-      POSTGRES_USER: tune
-      POSTGRES_PASSWORD: tune
-      POSTGRES_DB: tune
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tune"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+    # Local audio output to a USB DAC on this host (#5968): uncomment both.
+    # The host must have /dev/snd (not Docker Desktop on macOS/Windows).
+    # Podman/Fedora: see "Podman" in the README.
+    # devices:
+    #   - /dev/snd:/dev/snd
+    # group_add:
+    #   - audio
 
 volumes:
   tune-data:
-  pg-data:

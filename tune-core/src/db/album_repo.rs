@@ -662,6 +662,30 @@ pub mod sql {
         "SELECT a.id, a.musicbrainz_release_group_id FROM albums a WHERE (a.release_type IS NULL OR a.release_type = '') AND a.musicbrainz_release_group_id IS NOT NULL AND a.musicbrainz_release_group_id != '' ORDER BY a.id"
     }
 
+    /// #5616 — le type lu dans la balise du fichier, posé SEULEMENT si la
+    /// colonne est vide : un type déjà connu (MusicBrainz, service, édition
+    /// manuelle, ou une balise lue avant) n'est jamais écrasé par un scan.
+    pub fn set_release_type_if_empty<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET release_type = {} WHERE id = {} \
+             AND (release_type IS NULL OR release_type = '')",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    /// Section « Live » — les types SECONDAIRES lus dans la balise, posés
+    /// SEULEMENT si la colonne est vide : même règle que
+    /// [`set_release_type_if_empty`], une valeur connue n'est jamais écrasée.
+    pub fn set_release_secondary_types_if_empty<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET release_secondary_types = {} WHERE id = {} \
+             AND (release_secondary_types IS NULL OR release_secondary_types = '')",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     /// Écrit le type de sortie d'un album (#4767).
     ///
     /// Paramètre lié et non littéral, contrairement à [`set_compilation`] : la
@@ -947,6 +971,90 @@ pub fn sql_combler_les_labels_d_album() -> String {
     )
 }
 
+/// Le format de l'album tel que ses PISTES le disent (#5413, suite) : le plus
+/// fréquent, départagé par ordre alphabétique — un `LIMIT 1` nu rendrait une
+/// ligne quelconque, et le badge d'un dossier mêlant MP3 et FLAC changerait
+/// d'un scan à l'autre. `NULL` quand aucune piste ne porte de format.
+/// Corrélé sur `albums.id`, SQL commun à SQLite et PostgreSQL.
+fn sql_format_des_pistes() -> &'static str {
+    "(SELECT t.format FROM tracks t \
+      WHERE t.album_id = albums.id AND t.format IS NOT NULL AND t.format != '' \
+      GROUP BY t.format ORDER BY COUNT(*) DESC, t.format ASC LIMIT 1)"
+}
+
+/// La plus haute valeur de `tracks.{champ}` de l'album, `0` écarté (une
+/// propriété illisible au scan ne vaut pas « 0 Hz »). `NULL` sans valeur.
+fn sql_max_des_pistes(champ: &str) -> String {
+    format!(
+        "(SELECT MAX(t.{champ}) FROM tracks t \
+          WHERE t.album_id = albums.id AND t.{champ} > 0)"
+    )
+}
+
+/// Les trois colonnes que lit le badge de qualité ([`Album::quality`]) — et
+/// donc le filtre `?quality=` ([`Album::quality_sql`]) — recalculées depuis
+/// les PISTES de l'album (#5413, régression v0.9.169).
+///
+/// Jusqu'à v0.9.169, ces colonnes étaient en comblement seul
+/// (`COALESCE(albums.sample_rate, MAX(pistes))`) : posées au premier passage,
+/// jamais recalculées. Un album dont les fichiers avaient changé depuis (CD
+/// remplacé par sa version 24/96, dossier regroupé autrement) gardait des
+/// valeurs périmées. Tant que le filtre lisait les pistes, cela ne se voyait
+/// que sur le badge ; depuis que le filtre suit le badge (#5430, v0.9.169),
+/// Rhorn (fil 2032) est passé de 151 albums sous « Hi-Res » à UN seul — une
+/// compilation WAV 16/44 aux colonnes figées sur une autre valeur.
+///
+/// Les pistes l'emportent donc désormais ; la valeur de l'album n'est gardée
+/// que si AUCUNE piste n'en porte (album sans piste locale, UPnP ou
+/// streaming indexé sans propriétés). Corrélé sur `albums.id` : il sert tel
+/// quel à la remontée d'un album (`WHERE id = ?`), aux remontées du scan et au
+/// recalage de démarrage. SQL commun à SQLite et PostgreSQL.
+pub fn sql_qualite_reprise_des_pistes() -> String {
+    format!(
+        "format = {}, sample_rate = {}, bit_depth = {}",
+        sql_qualite_calculee("format"),
+        sql_qualite_calculee("sample_rate"),
+        sql_qualite_calculee("bit_depth"),
+    )
+}
+
+/// La valeur que [`sql_qualite_reprise_des_pistes`] écrit dans `champ`.
+fn sql_qualite_calculee(champ: &str) -> String {
+    let des_pistes = match champ {
+        "format" => sql_format_des_pistes().to_string(),
+        _ => sql_max_des_pistes(champ),
+    };
+    format!("COALESCE({des_pistes}, albums.{champ})")
+}
+
+/// Le recalage GLOBAL de la qualité des albums sur leurs pistes (#5413),
+/// borné aux seuls albums dont une des trois colonnes change.
+///
+/// Rejoué à chaque démarrage (`migrations::run_migrations` et
+/// `run_pg_migrations`), comme [`sql_combler_les_labels_d_album`] : une
+/// bibliothèque scannée avant le correctif est rattrapée dès la mise à jour,
+/// sans attendre un scan — et un scan ne suffirait pas sur les albums que le
+/// scan incrémental ne touche pas. Le `WHERE` rend la passe idempotente
+/// jusque dans son bilan : un second passage ne touche aucune ligne, et
+/// PostgreSQL ne réécrit pas toute la table à chaque démarrage.
+pub fn sql_recaler_la_qualite_des_albums() -> String {
+    let change = |champ: &str, neutre: &str| {
+        format!(
+            "COALESCE({}, {neutre}) <> COALESCE(albums.{champ}, {neutre})",
+            sql_qualite_calculee(champ)
+        )
+    };
+    format!(
+        "UPDATE albums SET {} \
+         WHERE EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id) \
+           AND ({} OR {} OR {})",
+        sql_qualite_reprise_des_pistes(),
+        change("format", "''"),
+        change("sample_rate", "0"),
+        change("bit_depth", "0"),
+    )
+}
+
 /// Le prédicat « ce champ de l'album est tenu par une édition manuelle » (C3),
 /// corrélé sur `albums.id`, pour les passes SQL du scan qui réécrivent un
 /// champ d'album sans passer par le dépôt. SQL commun aux deux moteurs.
@@ -1197,50 +1305,11 @@ impl AlbumRepo {
     }
 
     /// Les dossiers de l'utilisateur (`settings['collections']`, liste JSON de
-    /// `{…, "album_ids": […]}`) : le doublon y cède sa place à la cible.
+    /// `{…, "album_ids": […], "album_labels": {…}}`) : le doublon y cède sa
+    /// place à la cible, identifiant ET étiquette (#5528) — voir
+    /// [`super::dossiers_des_collections::remplacer_dans_les_dossiers`].
     fn reecrire_les_collections(&self, cible: i64, doublon: i64) -> Result<usize, TuneError> {
-        let settings = super::settings_repo::SettingsRepo::with_backend(self.db.clone());
-        let Some(brut) = settings.get("collections").ok().flatten() else {
-            return Ok(0);
-        };
-        let Ok(mut collections) = serde_json::from_str::<Vec<serde_json::Value>>(&brut) else {
-            return Ok(0);
-        };
-        let mut reecrites = 0usize;
-        for collection in collections.iter_mut() {
-            let Some(ids) = collection
-                .get("album_ids")
-                .and_then(|v| v.as_array())
-                .cloned()
-            else {
-                continue;
-            };
-            let mut sortie: Vec<i64> = Vec::with_capacity(ids.len());
-            let mut change = false;
-            for id in ids.iter().filter_map(|v| v.as_i64()) {
-                let id = if id == doublon {
-                    change = true;
-                    cible
-                } else {
-                    id
-                };
-                if !sortie.contains(&id) {
-                    sortie.push(id);
-                }
-            }
-            if change {
-                collection["album_ids"] = serde_json::json!(sortie);
-                reecrites += 1;
-            }
-        }
-        if reecrites > 0 {
-            let texte =
-                serde_json::to_string(&collections).map_err(|e| TuneError::from(e.to_string()))?;
-            settings
-                .set("collections", &texte)
-                .map_err(TuneError::from)?;
-        }
-        Ok(reecrites)
+        super::dossiers_des_collections::remplacer_dans_les_dossiers(&self.db, doublon, cible)
     }
 
     /// Les arbitrages « distincts » qui nommaient le doublon n'ont plus d'objet.
@@ -1366,6 +1435,26 @@ impl AlbumRepo {
             }
         }
         Ok(trouves)
+    }
+
+    /// `(id, titre, artiste)` de TOUS les albums — de quoi proposer un
+    /// remplaçant à un album disparu d'un dossier (#5528). Lu à la demande,
+    /// jamais sur la liste des dossiers.
+    pub fn identites(&self) -> Result<Vec<(i64, String, Option<String>)>, TuneError> {
+        let rows = self.db.query_many(
+            "SELECT a.id, a.title, ar.name FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id",
+            &[],
+        )?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| {
+                Some((
+                    cols.first().and_then(|v| v.as_i64())?,
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()),
+                ))
+            })
+            .collect())
     }
 
     pub fn get_by_title(&self, title: &str) -> Result<Option<Album>, TuneError> {
@@ -1945,6 +2034,28 @@ impl AlbumRepo {
             .db
             .query_one_strong(&sql, &params)?
             .and_then(|row| row.first()?.as_i64()))
+    }
+
+    /// #5837 — la ligne album que le fichier `chemin` occupe DÉJÀ en base,
+    /// `None` s'il n'est pas indexé ou n'a pas d'album.
+    ///
+    /// Lecture `_strong`, comme tout ce chemin : le scan tient sa transaction
+    /// de lot, et un lecteur du pool ne verrait pas ce qu'elle vient d'écrire.
+    pub fn album_du_fichier(&self, chemin: &str) -> Result<Option<Album>, TuneError> {
+        let ph = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "{} WHERE a.id = (SELECT tf.album_id FROM tracks tf WHERE tf.file_path = {ph} \
+             AND tf.album_id IS NOT NULL LIMIT 1)",
+            sql::select_album()
+        );
+        let params: [&dyn ToSqlValue; 1] = [&chemin];
+        Ok(self
+            .db
+            .query_one_strong(&sql, &params)?
+            .map(|row| row_to_album(&row)))
     }
 
     /// The folder recorded for an album, `None` when it predates the column.
@@ -2611,15 +2722,21 @@ impl AlbumRepo {
         Ok(self.db.execute(&sql_combler_les_labels_d_album(), &[])?)
     }
 
+    /// Recale la qualité de TOUS les albums sur leurs pistes — voir
+    /// [`sql_recaler_la_qualite_des_albums`]. Rend le nombre d'albums recalés.
+    pub fn recaler_la_qualite_depuis_les_pistes(&self) -> Result<usize, TuneError> {
+        Ok(self.db.execute(&sql_recaler_la_qualite_des_albums(), &[])?)
+    }
+
     pub fn update_quality_from_tracks(&self, album_id: i64) -> Result<(), TuneError> {
-        // 7 references to the same album_id parameter. SQLite uses `?`
-        // for each; PG would use $1..$7 — we build the placeholder list
+        // 4 references to the same album_id parameter. SQLite uses `?`
+        // for each; PG would use $1..$4 — we build the placeholder list
         // via the dialect to keep both engines happy.
         let p = match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(1),
             Engine::Postgres => PostgresDialect.placeholder(1),
         };
-        let plist = (1..=7)
+        let plist = (1..=4)
             .map(|i| match self.db.engine() {
                 Engine::Sqlite => SqliteDialect.placeholder(i),
                 Engine::Postgres => PostgresDialect.placeholder(i),
@@ -2635,20 +2752,23 @@ impl AlbumRepo {
         // the whole catalogue, identical to the cover card — #3 Fabien). NULLIF
         // treats a stored '' as re-fillable and the `!= ''` guard only ever
         // sources a real, non-empty genre. Valid on SQLite and PostgreSQL.
+        // #5413 : format, fréquence et profondeur sont RECALCULÉS depuis les
+        // pistes (plus en comblement seul) — voir
+        // [`sql_qualite_reprise_des_pistes`].
         let sql = format!(
             "UPDATE albums SET
-                format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = {} AND t.format IS NOT NULL LIMIT 1)),
-                sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = {})),
-                bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = {})),
+                {qualite},
                 genre = COALESCE(NULLIF(albums.genre, ''), (SELECT t.genre FROM tracks t WHERE t.album_id = {} AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1)),
                 genres = COALESCE(NULLIF(albums.genres, ''), (SELECT t.genres FROM tracks t WHERE t.album_id = {} AND t.genres IS NOT NULL AND t.genres != '' LIMIT 1)),
                 disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = {}))
             WHERE id = {}",
-            plist[0], plist[1], plist[2], plist[3], plist[4], plist[5], plist[6]
+            plist[0],
+            plist[1],
+            plist[2],
+            plist[3],
+            qualite = sql_qualite_reprise_des_pistes(),
         );
-        let params: [&dyn ToSqlValue; 7] = [
-            &album_id, &album_id, &album_id, &album_id, &album_id, &album_id, &album_id,
-        ];
+        let params: [&dyn ToSqlValue; 4] = [&album_id, &album_id, &album_id, &album_id];
         self.db.execute(&sql, &params)?;
         // #4836 : le label des pistes remonte avec le reste.
         self.update_label_from_tracks(album_id)?;
@@ -2676,6 +2796,11 @@ impl AlbumRepo {
             }
             Ok(())
         })?;
+        // #5528 — les albums vidés viennent de disparaître : les dossiers
+        // « Collections » suivent ceux dont les pistes sont passées ailleurs.
+        if count > 0 {
+            super::dossiers_des_collections::suivre_sans_echouer(&self.db);
+        }
         Ok(count)
     }
 
@@ -2852,6 +2977,74 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// #5616 — pose le type lu dans la balise d'un fichier, seulement si
+    /// l'album n'en a pas encore. Rend `true` quand la ligne a changé.
+    pub fn poser_type_de_sortie_si_vide(
+        &self,
+        album_id: i64,
+        type_de_sortie: &str,
+    ) -> Result<bool, TuneError> {
+        let sql = self.dialect_sql(
+            sql::set_release_type_if_empty,
+            sql::set_release_type_if_empty,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&type_de_sortie, &album_id];
+        Ok(self.db.execute(&sql, &params)? > 0)
+    }
+
+    /// Section « Live » — pose les types secondaires lus dans la balise
+    /// (`live;remix`), seulement si l'album n'en a pas encore. Rend `true`
+    /// quand la ligne a changé.
+    pub fn poser_types_secondaires_si_vides(
+        &self,
+        album_id: i64,
+        types_secondaires: &str,
+    ) -> Result<bool, TuneError> {
+        let sql = self.dialect_sql(
+            sql::set_release_secondary_types_if_empty,
+            sql::set_release_secondary_types_if_empty,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&types_secondaires, &album_id];
+        Ok(self.db.execute(&sql, &params)? > 0)
+    }
+
+    /// Section « Live » — les types secondaires de chaque album demandé, en une
+    /// requête. Un album sans type secondaire connu est ABSENT de la table.
+    ///
+    /// Lecture à part, comme [`Self::attacher_added_at`] : `select_album`, le
+    /// SELECT commun de tous les écrans d'albums, ne nomme pas la colonne, et
+    /// seule la fiche artiste s'en sert.
+    pub fn types_secondaires_par_album(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<String>>, TuneError> {
+        use crate::metadata::release_type::secondaires_de_la_colonne;
+        let mut par_id = std::collections::HashMap::new();
+        for chunk in ids.chunks(5000) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, release_secondary_types FROM albums \
+                 WHERE id IN ({id_list}) AND release_secondary_types IS NOT NULL \
+                 AND release_secondary_types != ''"
+            );
+            for row in &self.db.query_many(&sql, &[])? {
+                let id = row.first().and_then(|v| v.as_i64());
+                let brut = row.get(1).and_then(|v| v.as_string());
+                if let (Some(id), Some(brut)) = (id, brut) {
+                    let types = secondaires_de_la_colonne(&brut);
+                    if !types.is_empty() {
+                        par_id.insert(id, types);
+                    }
+                }
+            }
+        }
+        Ok(par_id)
+    }
+
     pub fn list_recent(&self, limit: i64) -> Result<Vec<Album>, TuneError> {
         let sql = self.dialect_sql(sql::list_recent, sql::list_recent);
         let params: [&dyn ToSqlValue; 1] = [&limit];
@@ -2998,6 +3191,101 @@ impl AlbumRepo {
                 tracing::warn!(error = %e, "added_at_by_ids a échoué — liste sans date d'ajout")
             }
         }
+    }
+
+    /// Nombre de pistes et durée totale de chaque album demandé, en une
+    /// requête groupée (#5616) — l'entrée de la règle de repli
+    /// [`crate::metadata::release_type::type_deduit`].
+    ///
+    /// La durée passe par [`crate::db::home_queries::DUREE_MS`] : la colonne
+    /// est BIGINT en SQLite et peut être TEXT en PostgreSQL (`pg_migrate`),
+    /// où `SUM(text)` n'existe pas. `SUM` rend NUMERIC sur PostgreSQL : d'où
+    /// les `CAST(… AS BIGINT)`.
+    pub fn pistes_par_album(
+        &self,
+        ids: &[i64],
+    ) -> Result<
+        std::collections::HashMap<i64, crate::metadata::release_type::PistesDuDisque>,
+        TuneError,
+    > {
+        use crate::db::home_queries::DUREE_MS;
+        let mut par_id = std::collections::HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(5000) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT t.album_id, COUNT(*), \
+                        CAST(COALESCE(SUM(CASE WHEN {DUREE_MS} > 0 THEN {DUREE_MS} ELSE 0 END), 0) AS BIGINT), \
+                        CAST(SUM(CASE WHEN COALESCE({DUREE_MS}, 0) > 0 THEN 0 ELSE 1 END) AS BIGINT), \
+                        CAST(COALESCE(MAX(CASE WHEN {DUREE_MS} > 0 THEN {DUREE_MS} ELSE 0 END), 0) AS BIGINT) \
+                 FROM tracks t WHERE t.album_id IN ({id_list}) GROUP BY t.album_id"
+            );
+            for row in &self.db.query_many(&sql, &[])? {
+                let entier = |i: usize| row.get(i).and_then(|v| v.as_i64());
+                if let (Some(id), Some(n), Some(ms), Some(inconnues), Some(max_ms)) =
+                    (entier(0), entier(1), entier(2), entier(3), entier(4))
+                {
+                    par_id.insert(
+                        id,
+                        crate::metadata::release_type::PistesDuDisque {
+                            nombre: u32::try_from(n).unwrap_or(u32::MAX),
+                            duree_totale_ms: u64::try_from(ms).unwrap_or(0),
+                            durees_inconnues: u32::try_from(inconnues).unwrap_or(u32::MAX),
+                            piste_la_plus_longue_ms: u64::try_from(max_ms).unwrap_or(0),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(par_id)
+    }
+
+    /// Le type DÉDUIT de chaque album qui en reçoit un (#5616), par
+    /// identifiant. Un album au type explicite, une compilation, un album
+    /// sans piste ou à durée inconnue n'y figurent pas. Un échec de lecture
+    /// rend une table vide : la page reste celle d'avant, rien n'est inventé.
+    pub fn types_deduits(
+        &self,
+        albums: &[Album],
+    ) -> std::collections::HashMap<i64, crate::metadata::release_type::TypeDeSortie> {
+        use crate::metadata::release_type::{TypeDeSortie, type_deduit};
+        // Seuls les albums qui POURRAIENT recevoir un type sont mesurés.
+        let candidats: Vec<i64> = albums
+            .iter()
+            .filter(|a| {
+                !a.is_compilation
+                    && a.release_type
+                        .as_deref()
+                        .and_then(TypeDeSortie::depuis_mot)
+                        .is_none()
+            })
+            .filter_map(|a| a.id)
+            .collect();
+        if candidats.is_empty() {
+            return Default::default();
+        }
+        let pistes = match self.pistes_par_album(&candidats) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "pistes_par_album a échoué — aucun type déduit");
+                return Default::default();
+            }
+        };
+        albums
+            .iter()
+            .filter_map(|a| {
+                let id = a.id?;
+                type_deduit(
+                    a.release_type.as_deref(),
+                    a.is_compilation,
+                    pistes.get(&id).copied(),
+                )
+                .map(|t| (id, t))
+            })
+            .collect()
     }
 
     /// Jointure GROUPÉE qui donne le Dynamic Range de CHAQUE album en une
@@ -3317,6 +3605,7 @@ impl AlbumRepo {
             include_hidden,
             dr,
             seed,
+            None,
             false,
         )
         .map(|(albums, _)| albums)
@@ -3358,8 +3647,87 @@ impl AlbumRepo {
             include_hidden,
             dr,
             seed,
+            None,
             true,
         )
+    }
+
+    /// [`Self::list_filtered_seeded_avec_total`], restreint aux albums qui
+    /// répondent à `recherche` (fil 1684) : titre de l'album, artiste de
+    /// l'album, artiste d'une de ses pistes, compositeur d'une de ses pistes.
+    /// Les facettes, le tri et la pagination s'y appliquent comme sans
+    /// recherche, et le total est celui de l'ensemble FILTRÉ (recherche ET
+    /// facettes) : c'est le nombre de résultats.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_filtered_recherche_avec_total(
+        &self,
+        limit: i64,
+        offset: i64,
+        sort: &str,
+        order: &str,
+        format: Option<&str>,
+        quality: Option<&str>,
+        compilation: Option<bool>,
+        include_hidden: bool,
+        dr: Option<DrRange>,
+        seed: Option<i64>,
+        recherche: &str,
+    ) -> Result<(Vec<Album>, Option<i64>), TuneError> {
+        self.lister_filtre(
+            limit,
+            offset,
+            sort,
+            order,
+            format,
+            quality,
+            compilation,
+            include_hidden,
+            dr,
+            seed,
+            Some(recherche),
+            true,
+        )
+    }
+
+    /// Le prédicat de la recherche de l'écran Bibliothèque (fil 1684).
+    ///
+    /// Un album répond quand la saisie (repliée : casse et accents ignorés,
+    /// comme la recherche globale `search_where`) apparaît dans son titre, le
+    /// nom de son artiste, le nom de l'artiste d'UNE de ses pistes, ou le
+    /// compositeur d'UNE de ses pistes. C'est ce que le champ promet : on y
+    /// tape « Coltrane » et l'on veut aussi les albums d'autres artistes où
+    /// il joue une piste, « Ravel » et l'on veut ses œuvres sous le nom de
+    /// leur chef.
+    ///
+    /// Les marqueurs se prennent dans la séquence commune (`next_ph`), AVANT
+    /// ceux de LIMIT/OFFSET — piège n°2 de `facet_filter` : PostgreSQL
+    /// numérote, SQLite lit par position, il faut une valeur par occurrence.
+    fn recherche_wheres(
+        recherche: &str,
+        make_ph: &dyn Fn(usize) -> String,
+        next_ph: &mut usize,
+        bind_values: &mut Vec<SqlValue>,
+    ) -> Option<String> {
+        let saisie = recherche.replace('"', "");
+        let saisie = saisie.trim();
+        if saisie.is_empty() {
+            return None;
+        }
+        let motif = crate::db::engine::motif_like(saisie);
+        let mut ph = || {
+            let p = make_ph(*next_ph);
+            *next_ph += 1;
+            bind_values.push(SqlValue::Text(motif.clone()));
+            p
+        };
+        let (p1, p2, p3, p4) = (ph(), ph(), ph(), ph());
+        Some(format!(
+            "(LOWER(unaccent(a.title)) LIKE LOWER(unaccent({p1})) \
+             OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({p2})) \
+             OR EXISTS (SELECT 1 FROM tracks rt LEFT JOIN artists rar ON rar.id = rt.artist_id \
+             WHERE rt.album_id = a.id AND (LOWER(unaccent(rar.name)) LIKE LOWER(unaccent({p3})) \
+             OR LOWER(unaccent(rt.composer)) LIKE LOWER(unaccent({p4})))))"
+        ))
     }
 
     /// Les identifiants que rend `sql` (colonnes `a.id, a.title, ar.name,
@@ -3436,6 +3804,10 @@ impl AlbumRepo {
         // doublons en pagination. C'est la route HTTP qui en tire une quand le
         // client n'en donne pas, et qui la lui renvoie.
         seed: Option<i64>,
+        // Fil 1684 — la recherche de l'écran Bibliothèque, sur TOUTE la base
+        // (voir [`Self::recherche_wheres`]). `None` = pas de filtre, et le SQL
+        // est celui d'avant au caractère près.
+        recherche: Option<&str>,
         // `true` = compter l'ensemble filtré dans la même requête (#4800) ;
         // `false` = le SQL d'avant, au caractère près, pour les appelants qui
         // n'ont que faire du total (Browse UPnP, maintenance).
@@ -3569,6 +3941,13 @@ impl AlbumRepo {
                 &mut next_ph,
                 &mut bind_values,
             ));
+        }
+
+        // Fil 1684 — la recherche, après le DR et avant LIMIT/OFFSET.
+        if let Some(pred) = recherche
+            .and_then(|q| Self::recherche_wheres(q, &make_ph, &mut next_ph, &mut bind_values))
+        {
+            wheres.push(pred);
         }
 
         let where_clause = if wheres.is_empty() {
@@ -5780,9 +6159,275 @@ pub(crate) mod tests {
         );
     }
 
+    /// Fil 2126 — un album `m4a` (codec non lu) ne sort sous AUCUN filtre de
+    /// qualité, et sa fiche n'y montre aucune piste : le filtre suit le badge,
+    /// et il n'en a pas. Témoin : un FLAC 96/24 sort bien sous « Hi-Res ».
+    #[test]
+    fn i2126_un_album_m4a_ne_sort_sous_aucun_filtre_de_qualite() {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db: Arc<dyn DbBackend> = Arc::new(test_db());
+        let aid = ArtistRepo::with_backend(db.clone())
+            .create(&Artist::new("Artiste 2126".into()))
+            .unwrap();
+        let albums = AlbumRepo::with_backend(db.clone());
+        let pistes = TrackRepo::with_backend(db);
+        let mut ids = Vec::new();
+        for (titre, format, sr, bd) in [
+            ("Album M4A 96", "m4a", Some(96000), None),
+            ("Album M4A 44", "m4a", Some(44100), None),
+            ("Témoin FLAC 96-24", "flac", Some(96000), Some(24)),
+        ] {
+            let mut a = Album::new(titre.into());
+            a.artist_id = Some(aid);
+            a.format = Some(format.into());
+            a.sample_rate = sr;
+            a.bit_depth = bd;
+            let id = albums.create(&a).unwrap();
+            let mut t = Track::new(format!("{titre} 1"));
+            t.album_id = Some(id);
+            t.artist_id = Some(aid);
+            t.track_number = 1;
+            t.duration_ms = 1000;
+            t.file_path = Some(format!("/music/2126/{titre}/1.{format}"));
+            t.format = Some(format.into());
+            t.sample_rate = sr;
+            t.bit_depth = bd;
+            pistes.create(&t).unwrap();
+            ids.push((titre, format, id));
+        }
+        let lister = |q: &str| -> Vec<i64> {
+            albums
+                .list_filtered(100, 0, "id", "asc", None, Some(q), None, false, None)
+                .unwrap()
+                .into_iter()
+                .filter_map(|a| a.id)
+                .collect()
+        };
+        for q in ["dsd", "hires", "hi-res", "lossy", "cd"] {
+            let rendus = lister(q);
+            for (titre, format, id) in &ids {
+                if *format != "m4a" {
+                    continue;
+                }
+                assert!(
+                    !rendus.contains(id),
+                    "« {titre} » (m4a, codec non lu) est rendu sous ?quality={q} : \
+                     un album sans badge ne doit sortir sous aucun filtre (fil 2126)"
+                );
+                assert!(
+                    pistes
+                        .list_by_album_filtered(*id, None, Some(q))
+                        .unwrap()
+                        .is_empty(),
+                    "la fiche de « {titre} » montre des pistes sous ?quality={q}"
+                );
+            }
+        }
+        let temoin = ids.iter().find(|(_, f, _)| *f == "flac").unwrap().2;
+        assert!(
+            lister("hires").contains(&temoin),
+            "témoin : le FLAC 96/24 sort sous Hi-Res"
+        );
+    }
+
     #[test]
     fn i5413_les_filtres_de_qualite_suivent_le_badge() {
         scenario_filtres_de_qualite_5413(Arc::new(test_db()));
+    }
+
+    /// Titres de la bibliothèque « ancienne » de
+    /// [`scenario_bibliotheque_ancienne_5413_avant`].
+    const ANCIENNE_ANIMALS: &str = "Animals 24-96 figé en CD";
+    const ANCIENNE_SANS_QUALITE: &str = "Hi-Res sans qualité d'album";
+    const ANCIENNE_WAV: &str = "Compilation WAV 4 CD";
+    const ANCIENNE_MP3: &str = "Soirée MP3";
+    const ANCIENNE_DSF: &str = "SACD";
+    const ANCIENNE_SANS_PISTE: &str = "Hi-Res sans piste locale";
+
+    /// Les titres rendus sous `?quality={q}` (`None` : sans filtre).
+    fn titres_sous_filtre_5413(
+        albums: &AlbumRepo,
+        q: Option<&str>,
+    ) -> std::collections::BTreeSet<String> {
+        albums
+            .list_filtered(100, 0, "id", "asc", None, q, None, false, None)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.title)
+            .collect()
+    }
+
+    /// #5413, régression v0.9.169 (Rhorn, fil 2032, réponse 7320) — 1er
+    /// temps : une bibliothèque scannée AVANT le correctif, telle que le
+    /// comblement seul l'a laissée. Colonnes de qualité d'album figées au
+    /// premier passage (Animals remplacé par sa version 24/96, compilation WAV
+    /// figée sur une autre valeur) ou jamais posées (NULL). Constate le
+    /// symptôme : sous « Hi-Res », la compilation WAV 16/44 et rien de ce qui
+    /// est vraiment hi-res.
+    ///
+    /// Partagé avec PostgreSQL (`postgres_e2e::pg_5413_bibliotheque_ancienne`),
+    /// le redémarrage se jouant entre les deux temps.
+    pub(crate) fn scenario_bibliotheque_ancienne_5413_avant(db: Arc<dyn DbBackend>) {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        use std::collections::BTreeSet;
+        let aid = ArtistRepo::with_backend(db.clone())
+            .create(&Artist::new("Artiste 5413 ancienne".into()))
+            .unwrap();
+        let albums = AlbumRepo::with_backend(db.clone());
+        let pistes = TrackRepo::with_backend(db);
+        type Colonnes = (Option<&'static str>, Option<i32>, Option<i32>);
+        let cas: Vec<(&str, Colonnes, Vec<Colonnes>)> = vec![
+            (
+                ANCIENNE_ANIMALS,
+                (Some("flac"), Some(44100), Some(16)),
+                vec![(Some("flac"), Some(96000), Some(24)); 2],
+            ),
+            (
+                ANCIENNE_SANS_QUALITE,
+                (None, None, None),
+                vec![(Some("flac"), Some(192000), Some(24)); 2],
+            ),
+            (
+                ANCIENNE_WAV,
+                (Some("wav"), Some(96000), Some(24)),
+                vec![(Some("wav"), Some(44100), Some(16)); 4],
+            ),
+            (
+                ANCIENNE_MP3,
+                (None, None, None),
+                vec![
+                    (Some("mp3"), Some(44100), None),
+                    (Some("mp3"), Some(44100), None),
+                    (Some("flac"), Some(44100), Some(16)),
+                ],
+            ),
+            (
+                ANCIENNE_DSF,
+                (None, None, None),
+                vec![(Some("dsf"), Some(2_822_400), Some(1)); 2],
+            ),
+            // Aucune piste : la valeur de l'album est la seule source, elle
+            // doit survivre au recalage.
+            (
+                ANCIENNE_SANS_PISTE,
+                (Some("flac"), Some(96000), Some(24)),
+                vec![],
+            ),
+        ];
+        for (titre, (f, sr, bd), ps) in &cas {
+            let mut a = Album::new((*titre).into());
+            a.artist_id = Some(aid);
+            a.format = f.map(Into::into);
+            a.sample_rate = *sr;
+            a.bit_depth = *bd;
+            let album_id = albums.create(&a).unwrap();
+            for (n, (pf, psr, pbd)) in ps.iter().enumerate() {
+                let mut t = Track::new(format!("{titre} {n}"));
+                t.album_id = Some(album_id);
+                t.artist_id = Some(aid);
+                t.track_number = n as i32 + 1;
+                t.duration_ms = 1000;
+                t.file_path = Some(format!("/music/5413-ancienne/{titre}/{n}"));
+                t.format = pf.map(Into::into);
+                t.sample_rate = *psr;
+                t.bit_depth = *pbd;
+                pistes.create(&t).unwrap();
+            }
+        }
+        assert_eq!(titres_sous_filtre_5413(&albums, None).len(), cas.len());
+        // Le symptôme de Rhorn, reproduit : la compilation 16/44 sort sous
+        // « Hi-Res », les vrais hi-res n'y sont pas.
+        assert_eq!(
+            titres_sous_filtre_5413(&albums, Some("hires")),
+            BTreeSet::from([ANCIENNE_WAV.to_string(), ANCIENNE_SANS_PISTE.to_string()]),
+            "bibliothèque ancienne AVANT recalage : le témoin doit montrer le \
+             symptôme de v0.9.169"
+        );
+    }
+
+    /// #5413, 2e temps — après le redémarrage (recalage de
+    /// `run_migrations` / `run_pg_migrations`) : le filtre Hi-Res rend les
+    /// albums hi-res selon leurs pistes, la compilation 16/44 n'y est plus,
+    /// et pour chaque filtre l'ensemble rendu est EXACTEMENT celui des albums
+    /// qui portent le badge. Puis : la passe est idempotente, et la remontée
+    /// du scan (`update_quality_from_tracks`) recalcule aussi, au lieu de
+    /// combler.
+    pub(crate) fn scenario_bibliotheque_ancienne_5413_apres(db: Arc<dyn DbBackend>) {
+        use std::collections::BTreeSet;
+        let albums = AlbumRepo::with_backend(db.clone());
+        let set = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        let attendus = [
+            (
+                "hires",
+                "hi-res",
+                set(&[ANCIENNE_ANIMALS, ANCIENNE_SANS_QUALITE, ANCIENNE_SANS_PISTE]),
+            ),
+            ("dsd", "dsd", set(&[ANCIENNE_DSF])),
+            ("lossy", "lossy", set(&[ANCIENNE_MP3])),
+            ("cd", "cd", set(&[ANCIENNE_WAV])),
+        ];
+        let tous = albums
+            .list_filtered(100, 0, "id", "asc", None, None, None, false, None)
+            .unwrap();
+        for (filtre, badge, attendu) in &attendus {
+            let portent_le_badge: BTreeSet<String> = tous
+                .iter()
+                .filter(|a| a.quality().as_deref() == Some(*badge))
+                .map(|a| a.title.clone())
+                .collect();
+            assert_eq!(
+                &portent_le_badge, attendu,
+                "badges après recalage, `{badge}`"
+            );
+            assert_eq!(
+                &titres_sous_filtre_5413(&albums, Some(filtre)),
+                attendu,
+                "?quality={filtre} après recalage : le filtre et le badge \
+                 doivent rendre le même ensemble"
+            );
+        }
+        assert!(
+            !titres_sous_filtre_5413(&albums, Some("hires")).contains(ANCIENNE_WAV),
+            "la compilation WAV 16/44 ne doit plus sortir sous Hi-Res"
+        );
+        // Idempotence : rejouée, la passe ne touche plus aucune ligne.
+        assert_eq!(albums.recaler_la_qualite_depuis_les_pistes().unwrap(), 0);
+
+        // La remontée par album du scan RECALCULE : on refige la compilation
+        // sur une valeur hi-res, une passe de scan sur cet album la rend à
+        // ses pistes.
+        let wav = tous
+            .iter()
+            .find(|a| a.title == ANCIENNE_WAV)
+            .and_then(|a| a.id)
+            .unwrap();
+        db.execute(
+            &format!("UPDATE albums SET sample_rate = 96000, bit_depth = 24 WHERE id = {wav}"),
+            &[],
+        )
+        .unwrap();
+        assert!(titres_sous_filtre_5413(&albums, Some("hires")).contains(ANCIENNE_WAV));
+        albums.update_quality_from_tracks(wav).unwrap();
+        let relu = albums.get(wav).unwrap().unwrap();
+        assert_eq!(
+            (relu.format.as_deref(), relu.sample_rate, relu.bit_depth),
+            (Some("wav"), Some(44100), Some(16)),
+            "update_quality_from_tracks doit recalculer, pas seulement combler"
+        );
+        assert!(!titres_sous_filtre_5413(&albums, Some("hires")).contains(ANCIENNE_WAV));
+    }
+
+    /// #5413, régression v0.9.169 — le recalage de DÉMARRAGE rattrape une
+    /// bibliothèque ancienne sous SQLite (`run_migrations`).
+    #[test]
+    fn i5413_bibliotheque_ancienne_rattrapee_au_demarrage() {
+        let sqlite = test_db();
+        let db: Arc<dyn DbBackend> = Arc::new(sqlite.clone());
+        scenario_bibliotheque_ancienne_5413_avant(db.clone());
+        crate::db::migrations::run_migrations(&sqlite).expect("redémarrage");
+        scenario_bibliotheque_ancienne_5413_apres(db);
     }
 
     #[test]
@@ -6465,6 +7110,114 @@ pub(crate) mod tests {
                 .unwrap(),
         );
         assert_eq!(tout.len(), 2, "sans filtre, les deux albums : {tout:?}");
+    }
+
+    /// Fil 1684 — la recherche de l'écran Bibliothèque porte sur toute la
+    /// base : titre de l'album, artiste de l'album, artiste d'UNE piste,
+    /// compositeur d'UNE piste — casse et accents ignorés. Elle se combine aux
+    /// facettes, et le total est celui de l'ensemble filtré.
+    ///
+    /// Avant, `GET /library/albums` n'avait pas de recherche : le client
+    /// filtrait ce qu'il tenait, sur le titre et l'artiste de l'album seuls.
+    ///
+    /// Le même scénario tourne sur PostgreSQL
+    /// (`postgres_e2e::pg_1684_recherche_de_la_bibliotheque`).
+    pub(crate) fn scenario_recherche_de_la_bibliotheque_1684(db: Arc<dyn DbBackend>) {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let artistes = ArtistRepo::with_backend(db.clone());
+        let repo = AlbumRepo::with_backend(db.clone());
+        let pistes = TrackRepo::with_backend(db.clone());
+        let nouvel = |nom: &str| artistes.create(&Artist::new(nom.into())).unwrap();
+        let miles = nouvel("Miles Davis");
+        let coltrane = nouvel("John Coltrane");
+        let orchestre = nouvel("Orchestre de Paris");
+        let album = |titre: &str, artiste: i64| {
+            let mut a = Album::new(titre.into());
+            a.artist_id = Some(artiste);
+            repo.create(&a).unwrap()
+        };
+        let piste = |album_id: i64, artiste: i64, n: i32, compositeur: Option<&str>| {
+            let mut t = Track::new(format!("piste {n}"));
+            t.album_id = Some(album_id);
+            t.artist_id = Some(artiste);
+            t.track_number = n;
+            t.composer = compositeur.map(str::to_string);
+            t.file_path = Some(format!("/m/{album_id}/{n}.flac"));
+            pistes.create(&t).unwrap();
+        };
+        let kind = album("Kind of Blue", miles);
+        piste(kind, miles, 1, None);
+        piste(kind, coltrane, 2, None);
+        let bolero = album("Boléro", orchestre);
+        piste(bolero, orchestre, 1, Some("Maurice Ravel"));
+        let ete = album("Été indien", orchestre);
+        piste(ete, orchestre, 1, None);
+        let comp = album("Jazz sur Seine", miles);
+        piste(comp, coltrane, 1, None);
+        repo.mark_compilation(comp).unwrap();
+
+        let chercher = |q: &str, compilation: Option<bool>, limit: i64| {
+            let (v, total) = repo
+                .list_filtered_recherche_avec_total(
+                    limit,
+                    0,
+                    "title",
+                    "asc",
+                    None,
+                    None,
+                    compilation,
+                    false,
+                    None,
+                    None,
+                    q,
+                )
+                .unwrap();
+            (v.into_iter().map(|a| a.title).collect::<Vec<_>>(), total)
+        };
+
+        // L'artiste d'une PISTE : Coltrane ne signe aucun de ces albums.
+        assert_eq!(
+            chercher("coltrane", None, 50),
+            (
+                vec!["Jazz sur Seine".into(), "Kind of Blue".into()],
+                Some(2)
+            )
+        );
+        // Le COMPOSITEUR d'une piste.
+        assert_eq!(
+            chercher("ravel", None, 50),
+            (vec!["Boléro".into()], Some(1))
+        );
+        // L'artiste de l'album, et le titre — accents ignorés dans les deux sens.
+        assert_eq!(chercher("ORCHESTRE", None, 50).1, Some(2));
+        assert_eq!(
+            chercher("ete", None, 50),
+            (vec!["Été indien".into()], Some(1))
+        );
+        assert_eq!(chercher("bolero", None, 50).0, vec!["Boléro".to_string()]);
+        // Combinée à une facette, et paginée : le total reste celui de
+        // l'ensemble filtré, pas celui de la page.
+        assert_eq!(
+            chercher("coltrane", Some(false), 50),
+            (vec!["Kind of Blue".into()], Some(1))
+        );
+        assert_eq!(
+            chercher("coltrane", None, 1),
+            (vec!["Jazz sur Seine".into()], Some(2))
+        );
+        // Rien : une page vide.
+        assert_eq!(chercher("zzz", None, 50), (Vec::<String>::new(), None));
+        // TÉMOIN — sans recherche, la liste d'avant.
+        let tout = repo
+            .list_filtered(100, 0, "title", "asc", None, None, None, false, None)
+            .unwrap();
+        assert_eq!(tout.len(), 4);
+    }
+
+    #[test]
+    fn la_recherche_de_la_bibliotheque_couvre_artistes_de_piste_et_compositeurs_1684() {
+        scenario_recherche_de_la_bibliotheque_1684(Arc::new(test_db()));
     }
 
     /// #4767 — le type de sortie s'ECRIT et se RELIT, et un album sans MBID

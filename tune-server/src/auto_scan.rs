@@ -66,7 +66,18 @@ pub fn build_track_from_metadata_opts(
         seul.juger().compilation
     });
 
-    let album_artist_name = if is_compilation {
+    // Fil 1881 — un `ALBUMARTIST` générique (« Various », « VA »…) sur un
+    // album que la règle ne juge pas compilation (`COMPILATION=0`, C1) :
+    // l'album prend l'artiste neutre de la convention, et chaque piste garde
+    // son ARTIST. Même décision que le scan par lots
+    // (`scan_import::TrackImporter::import`).
+    let artiste_d_album_neutre = !is_compilation
+        && meta
+            .album_artist
+            .as_deref()
+            .is_some_and(crate::scan_import::is_various_artists);
+
+    let album_artist_name = if is_compilation || artiste_d_album_neutre {
         "Various Artists"
     } else {
         meta.album_artist.as_deref().unwrap_or_else(|| {
@@ -88,7 +99,7 @@ pub fn build_track_from_metadata_opts(
         .as_deref()
         .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME);
 
-    let album_artist_mbid = if is_compilation {
+    let album_artist_mbid = if is_compilation || artiste_d_album_neutre {
         None
     } else {
         meta.musicbrainz_album_artist_id
@@ -126,7 +137,9 @@ pub fn build_track_from_metadata_opts(
     };
     let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
 
-    let track_artist = if is_compilation && track_artist_name != album_artist_name {
+    let track_artist = if (is_compilation || artiste_d_album_neutre)
+        && track_artist_name != album_artist_name
+    {
         match artist_repo.get_or_create(
             track_artist_name,
             meta.musicbrainz_artist_id.as_deref(),
@@ -272,6 +285,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         if music_dirs.is_empty() {
             info!("auto_scan_skipped_no_dirs");
+            // Rien à reprendre sans dossier : le repère de #5531 n'a plus
+            // d'objet, il ne doit pas relancer ce scan à chaque démarrage.
+            crate::routes::system::scan::effacer_reprise_du_scan(&db);
             suivi.rien_a_faire(Some("aucun dossier de musique configure"));
             // Mark the scan "done" even on this early exit: the file watcher
             // waits on this flag before it starts watching.
@@ -311,10 +327,20 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         if !exclude_patterns.is_empty() {
             info!(patterns = ?exclude_patterns, "scan_exclude_paths_active");
         }
-        let list_result = tune_core::scanner::walker::list_audio_files_with_excludes(
+        // #5552 — « Arrêter » est lu à chaque entrée du parcours. Interrompu,
+        // il ne rend aucune liste, et le scan s'arrête sans rien écrire : une
+        // liste partielle ferait croire à des fichiers disparus.
+        let Some(list_result) = tune_core::scanner::walker::list_audio_files_avec_arret(
             &music_dirs,
             &exclude_patterns,
-        );
+            tune_core::scanner::walker::CADENCE_PROGRESSION_PARCOURS,
+            &mut |_| {},
+            &crate::routes::system::scan::scan_cancel_requested,
+        ) else {
+            scan_de_demarrage_arrete(&event_bus, "parcours");
+            scan_done_clone.store(true, Ordering::Release);
+            return;
+        };
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
@@ -435,9 +461,34 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // Shared with the manual scan (routes::system::scan) so the two pre-scan
         // skip filters can't diverge on the NFC key again (the "scan
         // interminable" bug: NFD-named files missing the map and re-read over SMB).
+        // #5552 — après « Arrêter », plus aucun `stat` : le reste de la liste
+        // passe pour inchangé, et le scan s'arrête juste après la partition.
+        //
+        // Une date tronquée d'avant #5223, à taille égale, est tenue pour
+        // inchangée et réécrite précise après la partition, sans relecture.
+        let dates_a_preciser = std::sync::Mutex::new(Vec::new());
         let is_changed = |path: &std::path::Path| {
-            crate::routes::system::scan::file_needs_scan(path, &existing_tracks)
-                && crate::routes::system::scan::file_needs_scan(path, &existing_copies)
+            use crate::routes::system::scan::EtatDuFichier;
+            if crate::routes::system::scan::scan_cancel_requested() {
+                return false;
+            }
+            match crate::routes::system::scan::etat_du_fichier(path, &existing_tracks) {
+                EtatDuFichier::Inchange => false,
+                EtatDuFichier::DateAPreciser {
+                    chemin,
+                    mtime,
+                    taille,
+                } => {
+                    dates_a_preciser
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((chemin, mtime, taille));
+                    false
+                }
+                EtatDuFichier::ARelire => {
+                    crate::routes::system::scan::file_needs_scan(path, &existing_copies)
+                }
+            }
         };
         // `scan_io_concurrency()` et non 32 en dur : ce pool ignorait
         // `TUNE_SCAN_IO_CONCURRENCY`, donc régler la variable ne calmait que la
@@ -455,6 +506,17 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 Some(pool) => pool.install(|| files.into_par_iter().partition(|p| is_changed(p))),
                 None => files.into_iter().partition(|p| is_changed(p)),
             };
+        if crate::routes::system::scan::scan_cancel_requested() {
+            scan_de_demarrage_arrete(&event_bus, "prefiltre");
+            scan_done_clone.store(true, Ordering::Release);
+            return;
+        }
+        crate::routes::system::scan::preciser_les_dates(
+            &db,
+            dates_a_preciser
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
         let pre_skipped = total_discovered - files_to_scan.len();
 
         info!(
@@ -497,6 +559,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 ecartes: &files_ecartes,
             },
         )
+        .avec_sous_arbres_proteges(crate::routes::system::scan::sous_arbres_vides_avant_import(
+            &music_dirs,
+            &existing_tracks,
+            &existing_copies,
+            &discovered_paths,
+        ))
         .avec_pochettes_differees();
         // #5202 — les métadonnées étendues se relisent AVANT la transaction du
         // lot, chaque fichier sous délai, comme dans le scan manuel.
@@ -534,10 +602,17 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         // #4896 — les balises lues, par album : voir `BalisesVuesParAlbum`.
         let mut balises_vues = BalisesVuesParAlbum::default();
-        let stats = tune_core::scanner::walker::scan_files_batched(
+        // #5552 — l'arrêt est passé au PARCOURS, comme dans le scan manuel :
+        // après « Arrêter », plus un fichier n'est ouvert. Avec
+        // `scan_files_batched`, seul le rappel du lot le lisait, APRÈS que le
+        // parcours eut lu les balises et l'empreinte des ~500 fichiers du lot,
+        // et ce pour chaque lot restant : une à deux heures de lecture disque
+        // inutile chez LANDES Philippe (fil 2063).
+        let stats = tune_core::scanner::walker::scan_files_batched_avec_arret(
             &files_to_scan,
             true,
             tune_core::scanner::walker::SCAN_BATCH_SIZE,
+            crate::routes::system::scan::scan_cancel_requested,
             |batch, batch_idx, _total_files| {
                 // Cooperative cancellation: once "Arrêter le scan" was pressed,
                 // skip all remaining batches so the startup scan drains quickly
@@ -578,7 +653,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
                 let is_sqlite = db.engine() == tune_core::db::engine::Engine::Sqlite;
-                let sqlite_write_guard = is_sqlite.then(crate::sqlite_write_gate::scan_batch);
+                let mut sqlite_write_guard = is_sqlite.then(crate::sqlite_write_gate::scan_batch);
                 if is_sqlite && db.execute("BEGIN IMMEDIATE", &[]).is_ok() {
                     // Se nommer : tout `write_tx` concurrent echouera tant
                     // que ce lot tient la connexion, et sans cette
@@ -592,7 +667,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     // Un écrivain (favori, édition, enrichissement…) attend que
                     // ce lot ferme sa transaction : lui céder la place entre deux
                     // fichiers, plutôt qu'à la fin du lot (transaction_du_lot.rs).
-                    db.ceder_aux_ecrivains();
+                    // Ticket 190 : une écriture de file en attente de la porte
+                    // passe aussi (`ceder_le_lot`).
+                    crate::sqlite_write_gate::ceder_le_lot(
+                        db.as_ref(),
+                        &mut sqlite_write_guard,
+                        "scan:auto",
+                    );
                     if let Some(unsupported) = &sf.unsupported {
                         tracing::info!(
                             path = %sf.path,
@@ -903,6 +984,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // made it into the discovered set).
         // Hissé hors du bloc pour la réconciliation des favoris (#1943).
         let mut racines_videes: Vec<String> = Vec::new();
+        // Hissé pour la passe des pochettes : un montage imbriqué tombé laisse
+        // sa racine répondre, et ce qu'il contient n'est pas jugé.
+        let mut sous_arbres: Vec<String> = Vec::new();
         // Le scan automatique purge lui aussi (voir `pruned` plus bas), et il
         // émet lui aussi `library.scan.completed`. Son rapport ne portait
         // AUCUN compteur de purge : le bandeau annonçait donc « 0 supprimés »
@@ -945,8 +1029,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
             // `missing_dirs`, ni `error_dirs`, ni `emptied_roots` ne le voient,
             // et tout le sous-arbre partait sans un mot (#1943).
-            let sous_arbres =
-                crate::routes::system::scan::sous_arbres_vides(&existing_refs, &discovered_paths);
+            sous_arbres = crate::routes::system::scan::sous_arbres_vides(
+                &music_dirs,
+                &existing_refs,
+                &discovered_paths,
+            );
             if !sous_arbres.is_empty() {
                 tracing::error!(
                     dossiers = ?sous_arbres,
@@ -1097,12 +1184,31 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         // #5034 — APRÈS la purge : même confrontation des pochettes à leur
         // fichier source que le scan manuel.
-        tune_core::library::pochette_disque::suivre_les_fichiers_sources(
-            &db,
-            &cache_dir,
-            &[],
-            false,
-        );
+        let exclus_pochettes: Vec<String> =
+            error_dirs.iter().chain(&sous_arbres).cloned().collect();
+        // #5682 (fil 2115) — seulement si les racines ont répondu. Le NAS en
+        // retard au démarrage faisait voir chaque fichier source « disparu » :
+        // les pistes étaient conservées, mais les pochettes retirées.
+        if tune_core::library::pochette_disque::le_suivi_peut_conclure(
+            crate::routes::system::scan::scan_cancel_requested(),
+            &missing_dirs,
+            &racines_videes,
+        ) {
+            tune_core::library::pochette_disque::suivre_les_fichiers_sources(
+                &db,
+                &cache_dir,
+                &[],
+                &exclus_pochettes,
+                false,
+            );
+        } else {
+            tracing::warn!(
+                missing = ?missing_dirs,
+                emptied = ?racines_videes,
+                "auto_scan_pochettes_non_suivies — racine absente ou vidée : les pochettes \
+                 tirées du disque sont CONSERVÉES (#5682)"
+            );
+        }
 
         // Clean up orphan albums with 0 tracks (ghost entries from
         // artist_id changes or interrupted scans) — bug #593.
@@ -1181,7 +1287,26 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             }
             // Coffrets automatiques (GO du 25/09/2026) — même passe qu'après
             // `POST /system/scan`.
-            tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan_auto");
+            // #5685 — un coffret qui vient d'être réuni prend tout de suite
+            // l'image du dossier qui réunit ses disques, sans attendre le scan
+            // suivant.
+            // #5682 — même garde que la passe de fin de scan : rien n'est
+            // conclu d'une racine absente ou vidée.
+            if tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan_auto").reunis > 0
+                && tune_core::library::pochette_disque::le_suivi_peut_conclure(
+                    crate::routes::system::scan::scan_cancel_requested(),
+                    &missing_dirs,
+                    &racines_videes,
+                )
+            {
+                tune_core::library::pochette_disque::suivre_les_fichiers_sources(
+                    &db,
+                    &cache_dir,
+                    &[],
+                    &exclus_pochettes,
+                    false,
+                );
+            }
         }
 
         info!(
@@ -1221,7 +1346,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             tune_core::library::folder_playlists::sync_folder_playlists(&db);
         }
 
-        let report = serde_json::json!({
+        let arrete = crate::routes::system::scan::scan_cancel_requested();
+        let mut report = serde_json::json!({
             "total_files": stats.total_files,
             "missing_dirs": missing_dirs.clone(),
             "missing_dir_reasons": missing_dir_reasons.clone(),
@@ -1270,6 +1396,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             },
         });
 
+        // Même clé que le scan manuel : le client sait qu'il a été ARRÊTÉ.
+        if arrete {
+            report["cancelled"] = serde_json::json!(true);
+        }
+
         // La liste demandée (#2050) — mêmes clés que le scan manuel, sans quoi
         // le rapport dépendrait de QUEL scan l'a produit. Comme dans
         // `ChiffresDeFinDeScan::rapport_du_fichier`, elle ne sort QUE par le
@@ -1295,9 +1426,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             .any(|n| *n >= tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES)
         );
 
-        let report_path = std::env::var("TUNE_DB_PATH")
-            .unwrap_or_else(|_| "tune.db".into())
-            .replace(".db", "-scan-report.json");
+        let report_path = crate::routes::system::scan::chemin_du_rapport_de_scan();
         if let Ok(json) = serde_json::to_string_pretty(&report_fichier) {
             std::fs::write(&report_path, json).ok();
         }
@@ -1323,9 +1452,95 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         );
         suivi.terminer(verdict, Some(modifies), Some(&detail));
 
+        // #5531 — le scan est allé au bout : s'il reprenait un scan arrêté par
+        // une mise à jour, le repère est levé. Arrêté, il le garde — c'est la
+        // mise à jour forcée qui vient de le poser.
+        if !arrete {
+            crate::routes::system::scan::effacer_reprise_du_scan(&db);
+        }
+
         scan_done_clone.store(true, Ordering::Release);
     });
     scan_done
+}
+
+/// #5552 — le scan de démarrage s'arrête AVANT la lecture des fichiers : rien
+/// n'a été écrit. Le client apprend la fin par le même événement que le scan
+/// manuel arrêté ; `scan_status` retombe à `idle` par `ScanStatusGuard`, à la
+/// sortie de la tâche.
+fn scan_de_demarrage_arrete(event_bus: &EventBus, etape: &str) {
+    info!(etape, "auto_scan_arrete — rien n'a été écrit");
+    event_bus.emit(
+        "library.scan.completed",
+        serde_json::json!({ "cancelled": true, "auto": true }),
+    );
+}
+
+/// #5531 — le scan de démarrage doit-il tourner ? Oui si l'installation le
+/// demande (`auto_scan`), et aussi, seule exception, quand une mise à jour
+/// forcée a arrêté un scan : il reprend alors en incrémental
+/// (`file_needs_scan` saute les fichiers inchangés).
+pub fn scan_au_demarrage(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
+    let voulu = scan_au_demarrage_voulu(auto_scan, db);
+    if voulu != auto_scan {
+        info!(
+            voulu,
+            deploiement = auto_scan,
+            "auto_scan_regle_par_l_utilisateur — le réglage « library_scan_on_startup » prime sur la configuration de déploiement"
+        );
+    }
+    scan_au_demarrage_ou_reprise(voulu, db)
+}
+
+/// Réglage utilisateur « Analyser la bibliothèque au démarrage »
+/// (Réglages › Bibliothèque), rangé dans la table `settings`.
+///
+/// Ordre de précédence, du plus fort au plus faible :
+///
+/// 1. ce réglage, s'il a été posé (`"true"` ou `"false"`) ;
+/// 2. sinon la configuration de déploiement : `TUNE_AUTO_SCAN`, ou
+///    `auto_scan` dans `tune.toml` (`config.auto_scan`) ;
+/// 3. sinon `false`, le défaut du binaire.
+///
+/// Une installation où personne n'a touché à l'interrupteur n'a pas la ligne :
+/// elle garde donc exactement le comportement de sa configuration. La valeur
+/// est lue au démarrage ; la changer prend effet au démarrage suivant.
+pub const CLE_SCAN_AU_DEMARRAGE: &str = "library_scan_on_startup";
+
+/// Le choix de l'utilisateur, lu dans la valeur brute de
+/// [`CLE_SCAN_AU_DEMARRAGE`]. `None` : pas de choix lisible, la configuration
+/// de déploiement décide.
+pub fn choix_utilisateur_scan_au_demarrage(brut: Option<&str>) -> Option<bool> {
+    let texte = brut?.trim().trim_matches('"').trim().to_ascii_lowercase();
+    match texte.as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Le scan de démarrage voulu, selon l'ordre de précédence de
+/// [`CLE_SCAN_AU_DEMARRAGE`]. `auto_scan` est la valeur de déploiement.
+pub fn scan_au_demarrage_voulu(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
+    let brut = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get(CLE_SCAN_AU_DEMARRAGE)
+        .ok()
+        .flatten();
+    choix_utilisateur_scan_au_demarrage(brut.as_deref()).unwrap_or(auto_scan)
+}
+
+/// Le scan voulu, ou la reprise d'un scan arrêté par une mise à jour (#5531).
+fn scan_au_demarrage_ou_reprise(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
+    if auto_scan {
+        return true;
+    }
+    let reprise = crate::routes::system::scan::reprise_du_scan_demandee(db);
+    if reprise {
+        info!(
+            "auto_scan_reprise_apres_mise_a_jour — scan arrêté par une mise à jour forcée, repris en incrémental"
+        );
+    }
+    reprise
 }
 
 /// Spawn the file watcher that monitors music directories for live changes.
@@ -1755,6 +1970,130 @@ pub(crate) fn verdict_suppression_surveillant(
 /// Rend l'album du fichier quand ses balises ne s'accordent plus avec la ligne
 /// album de son dossier (titre ou artiste d'album) : c'est la liste que
 /// [`realigner_albums_sur_les_balises`] reprend en fin de lot.
+/// Le fichier sur le disque a-t-il encore la taille et la date que sa ligne
+/// enregistre ? Comparaison exacte (#5223), par un simple `stat`, sans lire le
+/// contenu : c'est la garde « fichier inchangé » du surveillant.
+pub(crate) fn disque_conforme_a_la_ligne(ligne: &Track, chemin: &str) -> bool {
+    // #5299 — une piste DANS une image : sa taille propre et la date de
+    // l'image, comme le scan les enregistre (`iso9660::taille_et_mtime`).
+    if tune_core::audio::iso9660::est_chemin_virtuel(chemin) {
+        let Some((taille, mtime)) =
+            tune_core::audio::iso9660::taille_et_mtime(std::path::Path::new(chemin))
+        else {
+            return false;
+        };
+        return ligne.file_size == Some(taille as i64) && ligne.file_mtime == Some(mtime);
+    }
+    let Ok(fs_meta) = std::fs::metadata(chemin) else {
+        return false;
+    };
+    let fs_mtime = fs_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64());
+    ligne.file_size == Some(fs_meta.len() as i64)
+        && match (ligne.file_mtime, fs_mtime) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+}
+
+/// [`disque_conforme_a_la_ligne`] pour un chemin : faux s'il n'est pas indexé.
+pub(crate) fn fichier_conforme_a_la_base(db: &Arc<dyn DbBackend>, chemin: &str) -> bool {
+    TrackRepo::with_backend(db.clone())
+        .get_by_path(chemin)
+        .ok()
+        .flatten()
+        .is_some_and(|ligne| disque_conforme_a_la_ligne(&ligne, chemin))
+}
+
+/// Fil 2134 — retire du lot les ajouts et modifications de fichiers DÉJÀ
+/// indexés dont la taille et la date n'ont pas bougé depuis leur ligne.
+///
+/// La relecture d'un fichier ordinaire les sautait déjà
+/// (`watcher_skip_unchanged`), mais le lot comptait encore comme un
+/// changement : il annonçait `library.updated`, et le dossier d'une feuille
+/// CUE était relu en entier (`relire_les_feuilles_cue_du_lot` ne regarde pas
+/// cette garde). C'est ce qui se passait après la gravure des DR chez
+/// Levente Toth : Tune réécrivait 1 121 fichiers, puis le surveillant les
+/// relisait, relisait les dossiers CUE voisins, et la bibliothèque se
+/// rechargeait chez le client à chaque lot.
+///
+/// Un fichier non indexé, une feuille CUE, une suppression ou un événement de
+/// dossier ou de pochette restent dans le lot.
+pub(crate) fn ecarter_les_fichiers_conformes(
+    db: &Arc<dyn DbBackend>,
+    changes: Vec<tune_core::scanner::watcher::FileChange>,
+) -> Vec<tune_core::scanner::watcher::FileChange> {
+    use tune_core::scanner::watcher::ChangeType;
+    let avant = changes.len();
+    let gardes: Vec<_> = changes
+        .into_iter()
+        .filter(|c| {
+            !(matches!(c.change_type, ChangeType::Added | ChangeType::Modified)
+                && fichier_conforme_a_la_base(db, &c.path))
+        })
+        .collect();
+    if gardes.len() < avant {
+        tracing::debug!(
+            ecartes = avant - gardes.len(),
+            restants = gardes.len(),
+            "watcher_fichiers_conformes_ecartes (fil 2134)"
+        );
+    }
+    gardes
+}
+
+/// Écart minimal entre deux annonces `library.updated` du surveillant
+/// (fil 2134).
+pub(crate) const ESPACEMENT_DES_ANNONCES: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Fil 2134 — la cadence de l'annonce `library.updated` du surveillant.
+///
+/// Elle partait à CHAQUE lot qui portait un changement : une fois toutes les
+/// 0,96 s dans le journal de Levente Toth pendant une rafale d'écritures, et
+/// le client jetait puis rechargeait sa bibliothèque à chaque fois. Désormais :
+///
+/// * le premier lot qui change après un calme s'annonce tout de suite (un
+///   album déposé apparaît sans attendre) ;
+/// * pendant une rafale, une annonce au plus toutes les
+///   [`ESPACEMENT_DES_ANNONCES`] ; les lots retenus entre deux sont regroupés ;
+/// * au premier lot sans changement qui suit des lots retenus, une annonce
+///   FINALE : rien de ce qui a changé ne reste sans annonce.
+#[derive(Debug, Default)]
+pub(crate) struct CadenceDesAnnonces {
+    derniere: Option<std::time::Instant>,
+    lots_retenus: u32,
+}
+
+impl CadenceDesAnnonces {
+    /// Après un lot du surveillant : `Some(lots regroupés)` s'il faut annoncer
+    /// maintenant, `None` sinon.
+    pub(crate) fn apres_le_lot(
+        &mut self,
+        a_change: bool,
+        maintenant: std::time::Instant,
+    ) -> Option<u32> {
+        if !a_change {
+            if self.lots_retenus == 0 {
+                return None;
+            }
+            return Some(self.annoncer(maintenant));
+        }
+        self.lots_retenus += 1;
+        let espace = self
+            .derniere
+            .is_none_or(|d| maintenant.saturating_duration_since(d) >= ESPACEMENT_DES_ANNONCES);
+        espace.then(|| self.annoncer(maintenant))
+    }
+
+    fn annoncer(&mut self, maintenant: std::time::Instant) -> u32 {
+        self.derniere = Some(maintenant);
+        std::mem::take(&mut self.lots_retenus)
+    }
+}
+
 pub(crate) fn reimporter_fichier_surveillant(
     db: &Arc<dyn DbBackend>,
     change: &tune_core::scanner::watcher::FileChange,
@@ -1787,24 +2126,12 @@ pub(crate) fn reimporter_fichier_surveillant(
     // Même garde pour un « ajout » sur un chemin connu (#4896).
     // #5223 : comparer toute la date enregistrée, sans l'arrondir ni tolérer
     // 500 ms ; une copie préallouée peut finir à taille égale dans cet intervalle.
-    if let Some(existing) = existante
-        && let Ok(fs_meta) = std::fs::metadata(&change.path)
+    if existante
+        .as_ref()
+        .is_some_and(|existing| disque_conforme_a_la_ligne(existing, &change.path))
     {
-        let fs_size = fs_meta.len() as i64;
-        let fs_mtime = fs_meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs_f64());
-        let unchanged = existing.file_size == Some(fs_size)
-            && match (existing.file_mtime, fs_mtime) {
-                (Some(a), Some(b)) => a == b,
-                _ => false,
-            };
-        if unchanged {
-            tracing::debug!(path = %change.path, "watcher_skip_unchanged");
-            return None;
-        }
+        tracing::debug!(path = %change.path, "watcher_skip_unchanged");
+        return None;
     }
     let files: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(&change.path)];
     let (scanned, _) = tune_core::scanner::walker::scan_files_parallel(&files, true, None);
@@ -2312,12 +2639,15 @@ pub(crate) fn traiter_le_lot_du_surveillant(
     let (images, changes): (Vec<_>, Vec<_>) = changes
         .into_iter()
         .partition(|c| c.change_type == ChangeType::ImageDePochette);
-    let (dossiers, fichiers): (Vec<_>, Vec<_>) = changes.into_iter().partition(|c| {
+    let (dossiers, mut fichiers): (Vec<_>, Vec<_>) = changes.into_iter().partition(|c| {
         matches!(
             c.change_type,
             ChangeType::DossierApparu | ChangeType::DossierDisparu
         )
     });
+    // #5299 — une image `.iso` de données se déplie en ses pistes AVANT tout :
+    // ses disparitions comptent dans l'arbitrage des suppressions ci-dessous.
+    deplier_les_images_iso_du_lot(db, &mut fichiers);
     // Racines illisibles À CET INSTANT. Calculée une fois par
     // lot, et seulement s'il porte une suppression : `read_dir`
     // sur un partage réseau tombé peut bloquer plusieurs
@@ -2685,6 +3015,98 @@ fn relire_les_feuilles_cue_du_lot(
     images_decoupees
 }
 
+/// #5299 — une image `.iso` signalée par le surveillant n'était pas relayée :
+/// une image de données ajoutée n'était indexée qu'au scan suivant, et une
+/// image retirée laissait ses pistes en base jusque-là.
+///
+/// Chaque image du lot quitte le lot et y est remplacée par ses pistes, sous
+/// leur chemin virtuel (`image.iso!/dossier/piste.flac`) :
+/// - les fichiers audio que l'image porte À CET INSTANT, en `Added` — la
+///   relecture saute ceux dont la taille et la date n'ont pas bougé ;
+/// - les pistes que la base tient dans l'image et qu'elle ne porte plus (image
+///   retirée, réécrite), en `Deleted` — l'arbitrage des suppressions
+///   (racine illisible, hors périmètre) s'y applique comme à tout fichier.
+///
+/// Le disque tranche, pas le genre de l'événement : une image présente est
+/// lue, une image absente n'a plus de pistes. Une image SACD n'est pas
+/// dépliée ici (sa lecture passe par le découpage du scan) : elle attend le
+/// scan suivant, comme avant. Une image présente mais illisible (partage
+/// réseau qui hoquette) ne retire rien.
+fn deplier_les_images_iso_du_lot(
+    db: &Arc<dyn DbBackend>,
+    fichiers: &mut Vec<tune_core::scanner::watcher::FileChange>,
+) {
+    use tune_core::scanner::watcher::{ChangeType, FileChange, est_une_image_iso};
+    if !fichiers
+        .iter()
+        .any(|c| est_une_image_iso(std::path::Path::new(&c.path)))
+    {
+        return;
+    }
+    let (images, autres): (Vec<_>, Vec<_>) = std::mem::take(fichiers)
+        .into_iter()
+        .partition(|c| est_une_image_iso(std::path::Path::new(&c.path)));
+    *fichiers = autres;
+    let poser =
+        |fichiers: &mut Vec<FileChange>, change_type: ChangeType, path: String| match fichiers
+            .iter_mut()
+            .find(|c| c.path == path)
+        {
+            Some(present) => present.change_type = change_type,
+            None => fichiers.push(FileChange { change_type, path }),
+        };
+    let track_repo = TrackRepo::with_backend(db.clone());
+    for image in images {
+        let chemin = std::path::Path::new(&image.path);
+        let presentes: Vec<String> = if chemin.is_file() {
+            if tune_core::audio::iso_sacd::is_sacd_iso(chemin) {
+                tracing::debug!(image = %image.path, "watcher_iso_sacd_attend_le_scan (#5299)");
+                continue;
+            }
+            match tune_core::audio::iso9660::contenu_audio(chemin) {
+                Ok(contenu) => contenu
+                    .pistes
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(image = %image.path, error = %e, "watcher_iso_illisible (#5299)");
+                    continue;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        // Les pistes que la base tient DANS cette image : celles du dossier de
+        // l'image dont le chemin commence par `image.iso!/`.
+        let prefixe = tune_core::audio::iso9660::chemin_virtuel(chemin, "");
+        let indexees: Vec<String> = chemin
+            .parent()
+            .and_then(|d| track_repo.fichiers_sous_dossier(&d.to_string_lossy()).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(p, _)| p)
+            .filter(|p| p.starts_with(&prefixe))
+            .collect();
+        let mut retirees = 0usize;
+        for p in indexees {
+            if !presentes.contains(&p) {
+                retirees += 1;
+                poser(fichiers, ChangeType::Deleted, p);
+            }
+        }
+        info!(
+            image = %image.path,
+            pistes = presentes.len(),
+            retirees,
+            "watcher_image_iso_depliee (#5299)"
+        );
+        for p in presentes {
+            poser(fichiers, ChangeType::Added, p);
+        }
+    }
+}
+
 /// La porte des lots de scan (`sqlite_write_gate`), prise par le surveillant
 /// autour de chacune de ses écritures — SQLite seulement.
 ///
@@ -2726,9 +3148,15 @@ fn suivre_les_images_de_pochette(
             .albums_sous_dossier(&dossier.to_string_lossy())
             .unwrap_or_default()
         {
-            // Les seuls fichiers DU dossier : une image ne décrit pas les
-            // sous-dossiers (`find_folder_cover` ne regarde que le parent).
-            if std::path::Path::new(&piste).parent() == Some(dossier) {
+            // Les fichiers DU dossier, et ceux des dossiers de disques qu'il
+            // réunit (#5685, `Coffret/CD1/…`, au plus `REMONTEE_MAX` niveaux) :
+            // la règle ne retient l'image commune que si le dossier n'abrite
+            // que cet album (`pochette_disque::dossier_commun`).
+            if std::path::Path::new(&piste).parent().is_some_and(|p| {
+                p.ancestors()
+                    .take(tune_core::library::pochette_disque::REMONTEE_MAX + 1)
+                    .any(|a| a == dossier)
+            }) {
                 albums.insert(album);
             }
         }
@@ -3072,6 +3500,16 @@ pub fn spawn_file_watcher(
     if music_dirs.is_empty() {
         return;
     }
+    // Fil 2148 (#5792) — le délai des sondes de partage réseau, réglable.
+    tune_core::scanner::watcher::regler_intervalle_reseau(
+        tune_core::scanner::watcher::resolve_network_poll_interval(
+            settings
+                .get(tune_core::scanner::watcher::NETWORK_POLL_INTERVAL_KEY)
+                .ok()
+                .flatten()
+                .as_deref(),
+        ),
+    );
 
     // Le surveillant supprime des lignes de `tracks` : il passe par le MÊME
     // arbitrage que la purge de fin de scan (#1943), dans
@@ -3142,6 +3580,7 @@ pub fn spawn_file_watcher(
             let mut pending_settle: Vec<tune_core::scanner::watcher::FileChange> = Vec::new();
             // #4896 — dossiers disparus que le lot précédent n'a pas expliqués.
             let mut dossiers_en_attente: Vec<String> = Vec::new();
+            let mut cadence = CadenceDesAnnonces::default();
             loop {
                 // Every ~2 min (each idle iteration blocks ~2s): re-watch
                 // roots that appeared or came back after an unmount, and
@@ -3162,6 +3601,10 @@ pub fn spawn_file_watcher(
                 changes.append(&mut pending_settle);
                 let (changes, still_writing) = settle_partition(changes, &watcher_excludes);
                 pending_settle = still_writing;
+                // Fil 2134 — les écritures de Tune lui-même (gravure des DR,
+                // qui remet la ligne d'accord avec le disque) ne sont pas des
+                // changements : ni relecture, ni annonce.
+                let changes = ecarter_les_fichiers_conformes(&db, changes);
                 // Un dossier disparu en attente se tranche au lot suivant, même
                 // sans nouvel événement : ce lot-là compte comme un changement.
                 let had_changes = !changes.is_empty() || !dossiers_en_attente.is_empty();
@@ -3193,25 +3636,30 @@ pub fn spawn_file_watcher(
                     if cleaned > 0 {
                         info!(cleaned, "watcher_orphan_albums_cleaned");
                     }
-
-                    // DIRE que la bibliotheque a change.
-                    //
-                    // Le surveillant importait en silence : il ne recevait meme
-                    // pas le bus d'evenements, il ne POUVAIT donc rien annoncer.
-                    // Les listes du client restaient telles quelles, et il
-                    // fallait changer d'onglet puis revenir pour voir arriver
-                    // les albums qu'on venait de deposer — c'est mot pour mot
-                    // le contournement que Patatorz decrit (fil forum #1517).
-                    //
-                    // Un evenement PROPRE, et non `library.scan.completed` :
-                    // celui-la fait afficher au client une banniere « prete »,
-                    // qui n'aurait aucun sens a chaque fichier depose. Ici on
-                    // veut seulement que les listes se rechargent.
+                }
+                // DIRE que la bibliotheque a change.
+                //
+                // Le surveillant importait en silence : il ne recevait meme
+                // pas le bus d'evenements, il ne POUVAIT donc rien annoncer.
+                // Les listes du client restaient telles quelles, et il
+                // fallait changer d'onglet puis revenir pour voir arriver
+                // les albums qu'on venait de deposer — c'est mot pour mot
+                // le contournement que Patatorz decrit (fil forum #1517).
+                //
+                // Un evenement PROPRE, et non `library.scan.completed` :
+                // celui-la fait afficher au client une banniere « prete »,
+                // qui n'aurait aucun sens a chaque fichier depose. Ici on
+                // veut seulement que les listes se rechargent.
+                //
+                // Fil 2134 — au plus une annonce toutes les
+                // `ESPACEMENT_DES_ANNONCES`, plus une finale quand l'activité
+                // retombe (voir `CadenceDesAnnonces`).
+                if let Some(lots) = cadence.apres_le_lot(had_changes, std::time::Instant::now()) {
                     event_bus.emit(
                         tune_core::event_types::EventType::LibraryUpdated.as_str(),
                         serde_json::json!({ "source": "watcher" }),
                     );
-                    info!("watcher_library_updated_emis");
+                    info!(lots, "watcher_library_updated_emis");
                 }
             }
         }
@@ -3239,6 +3687,10 @@ mod scan_realigne_tests_4896;
 mod scan_metadonnees_etendues_tests_5043;
 
 #[cfg(test)]
+#[path = "conservation_replaygain_tests_5597.rs"]
+mod conservation_replaygain_tests_5597;
+
+#[cfg(test)]
 #[path = "surveillant_pendant_un_lot_de_scan_tests.rs"]
 mod surveillant_pendant_un_lot_de_scan_tests;
 
@@ -3247,12 +3699,20 @@ mod surveillant_pendant_un_lot_de_scan_tests;
 mod surveillant_feuille_cue_tests_5073;
 
 #[cfg(test)]
+#[path = "surveillant_images_iso_tests_5299.rs"]
+mod surveillant_images_iso_tests_5299;
+
+#[cfg(test)]
 #[path = "scan_feuille_cue_tests_5108.rs"]
 mod scan_feuille_cue_tests_5108;
 
 #[cfg(test)]
 #[path = "pochettes_disque_tests_5034.rs"]
 mod pochettes_disque_tests_5034;
+
+#[cfg(test)]
+#[path = "pochettes_nas_absent_tests_5682.rs"]
+mod pochettes_nas_absent_tests_5682;
 
 #[cfg(test)]
 #[path = "pochettes_majorite_tests_5454.rs"]
@@ -3281,3 +3741,38 @@ mod compteur_demarrage_tests_5371;
 #[cfg(test)]
 #[path = "coffret_manuel_scan_tests_5319.rs"]
 mod coffret_manuel_scan_tests_5319;
+
+#[cfg(test)]
+#[path = "champs_tenus_scan_tests.rs"]
+mod champs_tenus_scan_tests;
+
+#[cfg(test)]
+#[path = "arret_du_scan_de_demarrage_tests_5552.rs"]
+mod arret_du_scan_de_demarrage_tests_5552;
+
+#[cfg(test)]
+#[path = "mise_a_jour_pendant_un_scan_tests_5531.rs"]
+mod mise_a_jour_pendant_un_scan_tests_5531;
+
+#[cfg(test)]
+#[path = "date_arrondie_tests_5552.rs"]
+mod date_arrondie_tests_5552;
+
+#[cfg(test)]
+#[path = "surveillant_annonces_tests_2134.rs"]
+mod surveillant_annonces_tests_2134;
+
+#[cfg(test)]
+#[path = "coffret_auto_relu_tests_2094.rs"]
+mod coffret_auto_relu_tests_2094;
+
+#[cfg(test)]
+#[path = "album_renomme_relu_tests_5919.rs"]
+mod album_renomme_relu_tests_5919;
+#[cfg(test)]
+#[path = "scan_au_demarrage_reglage_tests.rs"]
+mod scan_au_demarrage_reglage_tests;
+
+#[cfg(test)]
+#[path = "surveillant_artiste_generique_tests_1881.rs"]
+mod surveillant_artiste_generique_tests_1881;

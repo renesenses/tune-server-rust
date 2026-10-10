@@ -169,6 +169,11 @@ pub(super) struct ZonePollState {
     /// de transition (durée/position) et le DMP-A8 rapporte des durées
     /// inexactes — fausse transition garantie. Cleared au changement de
     /// génération et à chaque transition, comme `gapless_arm_logged`.
+    ///
+    /// #5970 — le même verrou tient pour une préparation ABANDONNÉE (hors
+    /// budget, ou prête trop tard pour un `SetNext`) : même conduite, même
+    /// cycle de vie — ne pas re-résoudre, laisser la fin de piste jouer la
+    /// suivante.
     pub(super) gapless_dsd_skip_pos: Option<i64>,
     /// La LIGNE de file (`queue_items.id`) que le renderer a ACCEPTEE comme
     /// piste suivante, et la position qu'elle occupait alors (#3026).
@@ -190,6 +195,10 @@ pub(super) struct ZonePollState {
     /// bascule par `Next` au lieu du repli ; `Inconnue` — le défaut de toute
     /// sortie qui ne sait pas répondre — laisse la conduite d'avant intacte.
     pub(super) suivante_preparee: SuivantePreparee,
+    /// #3967 — la génération de piste pour laquelle « l'appareil n'annonce
+    /// pas `SetNextAVTransportURI` » a déjà été journalisé : une ligne par
+    /// piste, pas une par sondage de la fenêtre d'armement.
+    pub(super) suivante_non_annoncee_signalee: Option<u64>,
     /// Une avance prononcée à l'HORLOGE a adopté l'enchaînement du renderer
     /// au lieu de le relancer (#4173) : ce que l'on surveille jusqu'à ce que
     /// le renderer donne signe de vie sur la piste adoptée, ou que le délai
@@ -243,6 +252,12 @@ pub(super) struct ZonePollState {
     /// Codec amont déjà annoncé pour la radio en cours. Le conteneur WAV de
     /// sortie ne dit rien de la compression de la station (#4346).
     pub(super) radio_source_annonce: (Option<String>, Option<RadioSourceInfo>),
+    /// #5522 — depuis quand la piste est « en lecture » sans que sa position
+    /// ait jamais quitté 0. Voir [`super::demarrage_fige_5522`].
+    pub(super) fige_a_zero_depuis: Option<Instant>,
+    /// #5522 — octets servis relevés au tour précédent, pour dire si le flux
+    /// avance encore (un renderer qui tamponne n'est pas figé).
+    pub(super) octets_du_demarrage: Option<u64>,
 }
 
 impl ZonePollState {
@@ -295,12 +310,15 @@ impl ZonePollState {
             gapless_dsd_skip_pos: None,
             gapless_armed: None,
             suivante_preparee: SuivantePreparee::Inconnue,
+            suivante_non_annoncee_signalee: None,
             adoption_horloge: None,
             famine: decisions::SuiviFamine::default(),
             famine_releve_at: None,
             etat: EtatDeLecture::Neuve,
             contrat_annonce: (None, None),
             radio_source_annonce: (None, None),
+            fige_a_zero_depuis: None,
+            octets_du_demarrage: None,
         }
     }
 
@@ -359,6 +377,11 @@ pub(super) enum GaplessPrep {
     /// acceptée : la tient-il vraiment ?
     Armed(Option<ArmedNext>, SuivantePreparee),
     DsdNextSkipped,
+    /// #5970 — la suivante n'a pas été résolue dans son budget, ou l'a été
+    /// trop près de la fin de la piste en cours pour un `SetNext`. Comme
+    /// pour le DSD : on ne re-tente pas pour cette position (le tick ne se
+    /// fige pas une seconde fois), et la fin de piste la joue explicitement.
+    Abandonnee,
     NotArmed,
 }
 
@@ -395,6 +418,11 @@ pub(super) struct AdoptionHorloge {
     /// flux (≈ le débit de lecture) ou s'il ne fait que le garder en tampon
     /// (≈ rien) — la position gelée ne le dit pas.
     pub(super) octets_a_l_adoption: Option<u64>,
+    /// #5411 — le flux de la piste FINIE, celle que l'écran vient de
+    /// quitter. Un renderer qui le nomme encore pendant la surveillance la
+    /// rejoue : son mouvement ne confirme rien
+    /// ([`decisions::suite_de_l_adoption`]).
+    pub(super) flux_fini: Option<String>,
 }
 
 // ── REF-9 (#2219) — l'énumération d'états, en ombre ─────────────────────

@@ -168,6 +168,7 @@ impl Banc {
                 media_format: Some("flac".into()),
                 track_number: None,
                 disc_number: None,
+                album_ref: None,
             })
             .await?;
         // En production, `transport.rs` marque la zone `Playing` une fois

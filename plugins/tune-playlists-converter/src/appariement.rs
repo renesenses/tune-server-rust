@@ -42,6 +42,10 @@
 //! — « mieux vaut un manque qu'un faux transfert ».
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::hote::Hote;
+use crate::snapshots::LOCAL;
 
 /// Tolérance sur la durée, en millisecondes. **±3 secondes** (Bertrand,
 /// 22/09/2026). La borne est INCLUSIVE : 3000 ms d'écart concordent, 3001 non.
@@ -153,48 +157,187 @@ pub fn juger(duree_source_ms: u64, candidat: Option<Candidat>) -> Result<Candida
     Ok(c)
 }
 
-/// Lire le candidat dans la réponse de `host_streaming_match_track`.
+/// Lire le candidat de TÊTE dans la réponse de `host_streaming_match_track`.
 ///
 /// Forme rendue par l'hôte (#4716) :
 /// `{"service": "...", "matched": <StreamTrack>|null, "score": f64,
 ///   "approximate": bool}`, où `StreamTrack` sérialise son identifiant sous
 /// `source_id` (voir `tune_core::streaming::traits`).
-pub fn candidat_de_la_reponse(reponse: &serde_json::Value) -> Option<Candidat> {
+pub fn candidat_de_la_reponse(reponse: &Value) -> Option<Candidat> {
     let piste = reponse.get("matched")?;
     if piste.is_null() {
         return None;
     }
-    Some(Candidat {
-        id: piste
-            .get("source_id")
-            .or_else(|| piste.get("id"))
-            .and_then(serde_json::Value::as_str)
+    Some(candidat_de_la_piste(
+        piste,
+        reponse.get("score").and_then(Value::as_f64).unwrap_or(0.0),
+        reponse
+            .get("approximate")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        false,
+    ))
+}
+
+/// Une piste rendue par l'hôte, réduite à ce que la règle juge.
+///
+/// `local` : en bibliothèque, l'identifiant qui compte est l'entier
+/// `track_id` ; `source_id` y désigne, s'il existe, l'ORIGINE streaming de la
+/// piste — l'écrire dans une playlist locale n'aurait aucun sens.
+fn candidat_de_la_piste(piste: &Value, score: f64, approximatif: bool, local: bool) -> Candidat {
+    let texte = |cles: &[&str]| {
+        cles.iter()
+            .find_map(|c| piste.get(*c).and_then(Value::as_str))
             .unwrap_or_default()
-            .to_string(),
-        titre: piste
-            .get("title")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        artiste: piste
-            .get("artist_name")
-            .or_else(|| piste.get("artist"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+            .to_string()
+    };
+    let id_local = if local {
+        piste
+            .get("track_id")
+            .and_then(Value::as_i64)
+            .map(|n| n.to_string())
+    } else {
+        None
+    };
+    Candidat {
+        id: id_local.unwrap_or_else(|| texte(&["source_id", "id"])),
+        titre: texte(&["title"]),
+        artiste: texte(&["artist_name", "artist"]),
         duree_ms: piste
             .get("duration_ms")
-            .and_then(serde_json::Value::as_u64)
+            .and_then(Value::as_u64)
             .unwrap_or(0),
-        score: reponse
-            .get("score")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0),
-        approximatif: reponse
-            .get("approximate")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-    })
+        score,
+        approximatif,
+    }
+}
+
+/// Un ISRC comparable : sans tirets ni espaces, en capitales — la règle de
+/// `tune_core::library::track_matcher::normaliser_isrc`, que le greffon ne peut
+/// pas importer (il ne dépend pas de `tune-core`). Les services ne
+/// l'écrivent pas tous de la même façon (`GB-AYE-69-00001` / `gbaye6900001`).
+fn isrc_normalise(isrc: &str) -> String {
+    isrc.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// Le classement complet rendu par l'hôte, verdict en tête, chaque candidat
+/// avec son ISRC normalisé.
+///
+/// L'hôte rend `candidates` depuis #4716 (`[{track, score, approximate}]`) ;
+/// une réponse sans ce champ (hôte plus ancien) se lit sur `matched` seul.
+fn classement(reponse: &Value, local: bool) -> Vec<(Candidat, String)> {
+    let isrc_de = |piste: &Value| {
+        isrc_normalise(
+            piste
+                .get("isrc")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
+    };
+    let liste = reponse
+        .get("candidates")
+        .and_then(Value::as_array)
+        .filter(|l| !l.is_empty());
+    match liste {
+        Some(liste) => liste
+            .iter()
+            .filter_map(|entree| {
+                let piste = entree.get("track").filter(|p| !p.is_null())?;
+                let score = entree.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+                let approximatif = entree
+                    .get("approximate")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Some((
+                    candidat_de_la_piste(piste, score, approximatif, local),
+                    isrc_de(piste),
+                ))
+            })
+            .collect(),
+        None => match reponse.get("matched").filter(|p| !p.is_null()) {
+            Some(piste) => {
+                let mut c = candidat_de_la_reponse(reponse).expect("matched non nul");
+                if local {
+                    c = candidat_de_la_piste(piste, c.score, c.approximatif, true);
+                }
+                vec![(c, isrc_de(piste))]
+            }
+            None => Vec::new(),
+        },
+    }
+}
+
+/// Choisir, dans la réponse de l'hôte, le candidat à transférer (#4741).
+///
+/// L'ordre est celui de l'épique :
+///
+/// 1. **L'ISRC.** Un candidat dont l'ISRC est celui de la source désigne le
+///    même enregistrement : le flou du titre (une autre langue, une autre
+///    graphie) ne l'écarte pas. La **durée** reste exigée — la décision du
+///    22/09 veut les trois critères, et un ISRC mal saisi chez un service
+///    existe ; un écart de plus de 3 s le fait retomber dans l'étape 2.
+/// 2. **Titre + artiste + durée.** Le premier candidat du classement qui tient
+///    les trois, et pas seulement le premier tout court : quand le verdict de
+///    tête rate la durée (un remaster), le suivant peut être la bonne édition.
+/// 3. Sinon **introuvable**, avec la raison du verdict de TÊTE — c'est lui que
+///    l'utilisateur reconnaîtra en lisant le rapport.
+pub fn choisir(
+    duree_source_ms: u64,
+    isrc_source: &str,
+    reponse: &Value,
+    local: bool,
+) -> Result<Candidat, Raison> {
+    let classement = classement(reponse, local);
+
+    let isrc = isrc_normalise(isrc_source);
+    if !isrc.is_empty() {
+        for (candidat, isrc_candidat) in &classement {
+            if *isrc_candidat == isrc {
+                let mut c = candidat.clone();
+                c.approximatif = false;
+                if let Ok(c) = juger(duree_source_ms, Some(c)) {
+                    return Ok(c);
+                }
+            }
+        }
+    }
+
+    for (candidat, _) in &classement {
+        if let Ok(c) = juger(duree_source_ms, Some(candidat.clone())) {
+            return Ok(c);
+        }
+    }
+
+    juger(
+        duree_source_ms,
+        classement.into_iter().next().map(|(c, _)| c),
+    )
+}
+
+/// Apparier un titre CHEZ un service, ou dans la bibliothèque locale.
+///
+/// Le seul chemin d'appariement du greffon : le transfert (#4717) et les liens
+/// (#4719) passent tous deux par ici. Une erreur de l'hôte devient une RAISON,
+/// pas un arrêt : le reste de la playlist s'apparie quand même.
+pub fn apparier_chez<H: Hote + ?Sized>(
+    hote: &H,
+    service: &str,
+    titre: &str,
+    artiste: &str,
+    isrc: &str,
+    duree_ms: u64,
+) -> Result<Candidat, Raison> {
+    let local = service == LOCAL;
+    let reponse = if local {
+        hote.library_match_track(titre, artiste, isrc, duree_ms)
+    } else {
+        hote.streaming_match_track(service, titre, artiste, isrc, duree_ms)
+    }
+    .map_err(|message| Raison::ServiceEnErreur { message })?;
+    choisir(duree_ms, isrc, &reponse, local)
 }
 
 #[cfg(test)]

@@ -32,13 +32,21 @@
 //! passe dans le même binaire rendrait ces témoins intermittents. Les tests
 //! d'ici se sérialisent d'ailleurs entre eux, pour la même raison.
 //!
-//! ## Pourquoi PAS `start_paused`
+//! ## Où tombe la pause, et pourquoi ce n'est plus une course
 //!
-//! La première propriété se joue sur une course RÉELLE : un lot en cours, une
-//! pause posée par un autre fil pendant qu'il travaille. L'horloge virtuelle de
-//! tokio rendrait les 400 ms de pause entre fichiers gratuites, le lot entier
-//! se jouerait avant que la pause n'arrive, et le témoin ne garderait plus
-//! rien.
+//! La première propriété exige une pause posée PENDANT le lot. Elle se jouait
+//! sur une course réelle : un fil guettait le premier témoin toutes les 5 ms,
+//! et la pause fixe de 400 ms entre deux fichiers lui laissait le temps
+//! d'arriver. #5519 a retiré cette pause : des fichiers indécodables passent
+//! alors en quelques microsecondes, le lot entier se jouait parfois avant que
+//! le guetteur ne se réveille (« 8 pistes traitées sur 8 », 2 échecs sur 6).
+//!
+//! La pause était donc posée DANS l'écriture du premier témoin `rg_analyzed`.
+//! Depuis la suite de #5519, les témoins d'un tour s'écrivent ENSEMBLE, à sa
+//! fin : une pause accrochée à eux tomberait après le lot. Elle est posée
+//! maintenant quand la garde de lancement relit le réglage pour la première
+//! fois APRÈS qu'un fichier a fini ([`PauseALaGarde`]) : même instant — une
+//! piste finie, le lot en plein travail —, toujours aucune course.
 
 use std::sync::Arc;
 
@@ -46,7 +54,7 @@ use tune_core::audio::replaygain::{
     TourDeCascade, analyze_track_batch, compter_les_candidats_replaygain, progression,
     un_tour_de_cascade,
 };
-use tune_core::db::backend::DbBackend;
+use tune_core::db::backend::{DbBackend, SqlValue, ToSqlValue};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::taches_de_fond::{
@@ -127,6 +135,89 @@ fn comptees(backend: &Arc<dyn DbBackend>, clef: &str) -> i64 {
         .unwrap_or(-1)
 }
 
+/// Une base qui met le ReplayGain en pause quand la garde de lancement relit
+/// le mode pour la `(apres + 1)`-ième fois. Tout le reste passe tel quel à la
+/// base réelle.
+///
+/// La garde de `analyze_track_batch` relit le mode avant CHAQUE fichier lancé,
+/// et rien d'autre ne le relit pendant un lot : les `apres` premières lectures
+/// lancent le premier créneau (autant de fichiers que la largeur), la suivante
+/// n'a lieu qu'après la fin d'un fichier. La pause est posée AVANT que cette
+/// lecture ne soit servie : la garde qui suit la voit déjà.
+struct PauseALaGarde {
+    interne: Arc<dyn DbBackend>,
+    apres: usize,
+    lectures: std::sync::Mutex<usize>,
+}
+
+impl PauseALaGarde {
+    fn poser(interne: Arc<dyn DbBackend>) -> Arc<dyn DbBackend> {
+        let apres = tune_core::taches_de_fond::vitesse::largeur_courante(&interne);
+        Arc::new(Self {
+            interne,
+            apres,
+            lectures: std::sync::Mutex::new(0),
+        })
+    }
+
+    fn avant_lecture(&self, p: &[&dyn ToSqlValue]) {
+        let lit_le_mode = p.first().is_some_and(
+            |v| matches!(v.to_sql_value(), SqlValue::Text(ref k) if k == "replaygain_mode"),
+        );
+        if !lit_le_mode {
+            return;
+        }
+        let mut n = self.lectures.lock().unwrap();
+        *n += 1;
+        if *n == self.apres + 1 {
+            mettre_en_pause(&self.interne, Tache::ReplayGain).expect("poser la pause");
+        }
+    }
+}
+
+impl DbBackend for PauseALaGarde {
+    fn engine(&self) -> tune_core::db::engine::Engine {
+        self.interne.engine()
+    }
+    fn execute(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<usize, String> {
+        self.interne.execute(sql, p)
+    }
+    fn last_insert_rowid(&self) -> i64 {
+        self.interne.last_insert_rowid()
+    }
+    fn query_one(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Option<Vec<SqlValue>>, String> {
+        self.avant_lecture(p);
+        self.interne.query_one(sql, p)
+    }
+    fn query_many(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.interne.query_many(sql, p)
+    }
+    fn write_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn tune_core::db::backend::DbTxHandle) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.interne.write_tx(f)
+    }
+    fn execute_batch(&self, sql: &str) -> Result<(), String> {
+        self.interne.execute_batch(sql)
+    }
+    fn query_one_strong(
+        &self,
+        sql: &str,
+        p: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        self.avant_lecture(p);
+        self.interne.query_one_strong(sql, p)
+    }
+    fn query_many_strong(
+        &self,
+        sql: &str,
+        p: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.interne.query_many_strong(sql, p)
+    }
+}
+
 /// Remettre le mécanisme à neuf entre deux témoins du même binaire.
 fn a_neuf() {
     oublier_pour_les_essais();
@@ -152,21 +243,17 @@ async fn une_pause_en_plein_lot_s_arrete_a_une_frontiere_et_ne_perd_rien() {
     let tmp = tempfile::tempdir().expect("dossier temporaire");
     let backend = bibliotheque(tmp.path());
 
-    let pour_le_lot = backend.clone();
+    // La pause tombe à la première garde relue APRÈS la fin d'une piste : le
+    // lot travaille, d'autres pistes peuvent être en vol (#5519, plusieurs
+    // fichiers à la fois), aucune ne doit plus partir.
+    let guetteur = PauseALaGarde::poser(backend.clone());
+    let pour_le_lot = guetteur.clone();
     let lot = tokio::spawn(async move { analyze_track_batch(&pour_le_lot).await });
-
-    // Attendre qu'UNE piste soit effectivement sortie du balayage : la pause
-    // doit tomber sur une passe qui travaille, pas sur une passe qui n'a pas
-    // encore démarré.
-    let mut tours = 0;
-    while comptees(&backend, "rg_analyzed") < 1 {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        tours += 1;
-        assert!(tours < 2_000, "le lot n'a jamais traité la moindre piste");
-    }
-    mettre_en_pause(&backend, Tache::ReplayGain).expect("poser la pause");
-
     let pendant = lot.await.expect("le lot ne doit pas paniquer") as i64;
+    assert!(
+        est_en_pause(Tache::ReplayGain),
+        "le lot n'a jamais traité la moindre piste : la pause n'a pas été posée"
+    );
 
     // — il s'est arrêté —
     assert!(
@@ -617,5 +704,188 @@ fn la_passe_des_biographies_d_albums_porte_la_meme_garde() {
         corps.contains("attendre_la_reprise(") && corps.contains("Tache::Enrichissement"),
         "🔴 la passe des biographies d'albums ne consulte pas la pause \
          « Enrichissement », alors que l'écran la compte dedans"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Une pause qui tombe entre la sélection d'un lot et son premier fichier
+// ---------------------------------------------------------------------------
+//
+// #5469 — le lot a trouvé ses candidats, puis sa garde de lancement voit la
+// pause et rend 0 sans avoir rien décodé. Ce 0 n'est pas un repos : le travail
+// est toujours devant lui. Lu comme un repos, il faisait descendre la cascade
+// au rang suivant (le ReplayGain suspendu lançait la plage dynamique), ou, au
+// dernier rang, rendait `Repos` et la boucle s'endormait 15 minutes : la
+// reprise n'avait plus d'effet avant un quart d'heure.
+
+/// Une base qui pose la pause de `tache` quand le lot lit SES candidats, juste
+/// avant de les lui servir. La garde de lancement qui suit la voit donc déjà :
+/// c'est exactement la fenêtre visée, et sans aucune course.
+struct PauseALaSelection {
+    interne: Arc<dyn DbBackend>,
+    tache: Tache,
+    posee: std::sync::atomic::AtomicBool,
+}
+
+impl PauseALaSelection {
+    fn poser(interne: Arc<dyn DbBackend>, tache: Tache) -> Arc<dyn DbBackend> {
+        Arc::new(Self {
+            interne,
+            tache,
+            posee: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// La sélection du lot de `tache`, et elle seule (pas les comptages).
+    fn est_la_selection(&self, sql: &str) -> bool {
+        if !sql.starts_with("SELECT t.id") {
+            return false;
+        }
+        match self.tache {
+            Tache::PlageDynamique => sql.contains("'dr_track'"),
+            Tache::ReplayGain => sql.contains("ORDER BY t.id"),
+            _ => false,
+        }
+    }
+
+    fn avant_selection(&self, sql: &str) {
+        if self.est_la_selection(sql) && !self.posee.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            mettre_en_pause(&self.interne, self.tache).expect("poser la pause");
+        }
+    }
+}
+
+impl DbBackend for PauseALaSelection {
+    fn engine(&self) -> tune_core::db::engine::Engine {
+        self.interne.engine()
+    }
+    fn execute(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<usize, String> {
+        self.interne.execute(sql, p)
+    }
+    fn last_insert_rowid(&self) -> i64 {
+        self.interne.last_insert_rowid()
+    }
+    fn query_one(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Option<Vec<SqlValue>>, String> {
+        self.interne.query_one(sql, p)
+    }
+    fn query_many(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.avant_selection(sql);
+        self.interne.query_many(sql, p)
+    }
+    fn write_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn tune_core::db::backend::DbTxHandle) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.interne.write_tx(f)
+    }
+    fn execute_batch(&self, sql: &str) -> Result<(), String> {
+        self.interne.execute_batch(sql)
+    }
+    fn query_one_strong(
+        &self,
+        sql: &str,
+        p: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        self.interne.query_one_strong(sql, p)
+    }
+    fn query_many_strong(
+        &self,
+        sql: &str,
+        p: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.avant_selection(sql);
+        self.interne.query_many_strong(sql, p)
+    }
+}
+
+/// La plage dynamique suspendue entre sa sélection et son premier fichier :
+/// le tour doit se dire SUSPENDU, pas au repos. Au repos, la boucle de fond
+/// dort `IDLE_SLEEP_SECS` (15 min) et la reprise reste sans effet tout ce
+/// temps ; suspendu, elle fait sa sieste de pause (5 s) et repart.
+#[tokio::test]
+async fn une_pause_de_la_plage_dynamique_avant_son_premier_fichier_n_est_pas_un_repos_5469() {
+    let _serialise = VERROU.lock().await;
+    a_neuf();
+    let tmp = tempfile::tempdir().expect("dossier temporaire");
+    let backend = PauseALaSelection::poser(
+        bibliotheque_prete_pour_le_dr(tmp.path()),
+        Tache::PlageDynamique,
+    );
+
+    let tour = un_tour_de_cascade(&backend).await;
+
+    assert!(
+        est_en_pause(Tache::PlageDynamique),
+        "le montage du témoin est en défaut : la sélection de la plage \
+         dynamique n'a jamais été lue, la pause n'a pas été posée"
+    );
+    assert_eq!(
+        comptees(&backend, "dr_track") + comptees(&backend, "dr_indisponible"),
+        0,
+        "le montage du témoin est en défaut : la pause devait tomber avant le \
+         premier fichier"
+    );
+    assert_eq!(
+        tour,
+        TourDeCascade::Suspendue(Tache::PlageDynamique),
+        "🔴 UNE PLAGE DYNAMIQUE SUSPENDUE EST PRISE POUR UNE PASSE AU REPOS \
+         ({tour:?}). La boucle de fond s'endort alors 15 minutes, et « Reprendre » \
+         ne relance rien pendant ce temps (#5469)."
+    );
+
+    // Et la reprise repart bien : le travail est toujours là.
+    reprendre(&backend, Tache::PlageDynamique).expect("lever la pause");
+    let apres = un_tour_de_cascade(&backend).await;
+    assert!(
+        matches!(apres, TourDeCascade::Travail(_)),
+        "après la reprise, la plage dynamique devait travailler : {apres:?}"
+    );
+}
+
+/// Le ReplayGain suspendu entre sa sélection et son premier fichier ne doit
+/// pas lancer la plage dynamique : c'est le piège central (§3), dans la
+/// fenêtre que la garde de tête de la cascade ne voit pas.
+///
+/// La moitié des pistes a déjà son ReplayGain : elles sont candidates à la
+/// plage dynamique. L'autre moitié attend le ReplayGain.
+#[tokio::test]
+async fn une_pause_du_replaygain_avant_son_premier_fichier_ne_lance_pas_la_plage_dynamique_5469() {
+    let _serialise = VERROU.lock().await;
+    a_neuf();
+    let tmp = tempfile::tempdir().expect("dossier temporaire");
+    let db = SqliteDb::open_in_memory().expect("base mémoire");
+    peupler(&db, tmp.path());
+    for i in 1..=PISTES / 2 {
+        db.execute(
+            "INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'rg_analyzed', '1')",
+            &[&i],
+        )
+        .expect("témoin rg_analyzed");
+    }
+    let interne: Arc<dyn DbBackend> = Arc::new(db);
+    assert!(
+        compter_les_candidats_replaygain(&interne) > 0,
+        "le montage du témoin est en défaut : le ReplayGain doit avoir du travail"
+    );
+    let backend = PauseALaSelection::poser(interne, Tache::ReplayGain);
+
+    let tour = un_tour_de_cascade(&backend).await;
+
+    assert!(
+        est_en_pause(Tache::ReplayGain),
+        "le montage du témoin est en défaut : la pause n'a pas été posée"
+    );
+    let touchees = comptees(&backend, "dr_track") + comptees(&backend, "dr_indisponible");
+    assert_eq!(
+        touchees, 0,
+        "🔴 UNE PAUSE DU REPLAYGAIN A LANCÉ LA PLAGE DYNAMIQUE ({touchees} \
+         pistes décodées par le rang 3). Le lot du ReplayGain a rendu 0 parce \
+         qu'il était suspendu, pas parce qu'il était au repos (#5469)."
+    );
+    assert_eq!(
+        tour,
+        TourDeCascade::Suspendue(Tache::ReplayGain),
+        "🔴 la cascade devait s'arrêter sur le rang suspendu : {tour:?}"
     );
 }

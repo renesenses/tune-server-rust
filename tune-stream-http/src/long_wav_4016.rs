@@ -171,8 +171,15 @@ async fn long_wav_4016_reconnect_replays_the_corrected_header() {
     let s = session(true, 2_760_000).await;
     let first = body(response(s.clone(), None).await).await;
     let replay = body(response(s.clone(), Some(0)).await).await;
-    assert_eq!(replay, first[..44], "réserve identique à l'en-tête envoyé");
-    read_beyond_limits(replay);
+    assert_eq!(
+        replay[..44],
+        first[..44],
+        "réserve identique à l'en-tête envoyé"
+    );
+    // Depuis le début, la retenue rejoue la piste à l'octet : l'en-tête
+    // corrigé PUIS le signal que la première connexion a emporté.
+    assert_eq!(replay, first, "rejeu exact depuis la retenue");
+    read_beyond_limits(replay[..44].to_vec());
     assert_eq!(
         s.octets_du_canal.load(SeqCst),
         50,
@@ -221,7 +228,11 @@ fn long_wav_4016_switches_only_above_the_signed_ceiling() {
     for size in [0, 1, i32::MAX as u64 - 36, i32::MAX as u64 - 35, u64::MAX] {
         let h = build_wav_header(1, 1000, 8, Some(size));
         let data = u32::from_le_bytes(h[40..44].try_into().unwrap());
-        if size <= i32::MAX as u64 - 36 {
+        if size == 0 {
+            // Forum #2189 — une durée nulle est une durée inconnue : le plafond
+            // signé, jamais un chunk `data` vide que le renderer refermerait.
+            assert_eq!(u64::from(data), i32::MAX as u64 - 36);
+        } else if size <= i32::MAX as u64 - 36 {
             assert_eq!(u64::from(data), size);
         } else {
             assert_eq!(data, u32::MAX, "aucune fausse fin au plafond signé");

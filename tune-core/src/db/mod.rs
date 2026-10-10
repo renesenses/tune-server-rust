@@ -8,8 +8,13 @@ pub mod album_metadata_repo;
 pub mod album_repo;
 pub mod artist_repo;
 pub mod backend;
+pub mod champs_tenus;
 pub mod coffrets_auto;
 pub mod collection_folder_repo;
+/// Un disque par dossier pour un album sans DISCNUMBER réparti en dossiers frères.
+pub mod disques_par_dossier;
+/// Les dossiers « Collections » suivent leurs albums (#5527, #5528).
+pub mod dossiers_des_collections;
 pub mod edition_album;
 pub mod engine;
 pub mod facet_filter;
@@ -23,6 +28,8 @@ pub mod history_repo;
 pub mod home_queries;
 /// Appareils ignorés (#1280) — faire taire un appareil, pas ses zones.
 pub mod ignored_device_repo;
+/// Lectures SQLite en cours, pour le relevé d'un gel de l'exécuteur (#5677).
+pub mod lectures_en_cours;
 /// Registre DURABLE des serveurs multimédia (#2219, phase 1) — sur le modèle
 /// de `network_mounts` : l'intention d'un côté, le constat de l'autre.
 pub mod media_server_repo;
@@ -52,7 +59,14 @@ mod postgres_e2e;
 pub mod profile_repo;
 pub mod radio_repo;
 pub mod rating_repo;
+/// Fil 2138 — rattrapage unique des dates d'ajout figées au premier scan.
+pub mod rattrapage_dates_ajout_2138;
 pub mod rattrapage_metadonnees_5043;
+/// La référence d'album d'une piste Bandcamp, retrouvée dans la file, les
+/// favoris ou l'historique pour resigner son URL de flux (fil 2121).
+pub mod reference_d_album;
+/// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
+pub(crate) mod replieur_wal;
 pub mod settings_repo;
 pub mod source_link_repo;
 pub mod sqlite;
@@ -66,7 +80,6 @@ pub mod track_repo;
 /// attend qu'elle se ferme.
 pub(crate) mod transaction_du_lot;
 pub mod tx_holder;
-/// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
 pub mod verrou_ecriture;
 pub mod zone_motif_masquage;
 pub mod zone_repo;
@@ -76,9 +89,17 @@ mod album_dr_provenance_tests;
 #[cfg(test)]
 mod ecrivains_pendant_un_lot_de_scan_tests;
 #[cfg(test)]
+mod filtre_dr_190_tests;
+#[cfg(test)]
 mod lenteur_albums_4800_tests;
 #[cfg(test)]
 mod lenteur_pistes_5138_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
+#[cfg(test)]
+mod replieur_wal_tests;
+/// Fil 2130 — « Reprendre l'écoute » : jointure en UNION ALL et index de
+/// `listen_history.album_id`, preuves d'équivalence et de migration.
+#[cfg(test)]
+mod reprendre_l_ecoute_2130_tests;
 pub mod upnp_revision;

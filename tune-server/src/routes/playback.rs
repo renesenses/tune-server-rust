@@ -1,8 +1,23 @@
 #[cfg(test)]
+#[path = "playback/album_ref_bandcamp_2121_tests.rs"]
+mod album_ref_bandcamp_2121_tests;
+#[cfg(test)]
+#[path = "playback/journal_pause_reprise_tests.rs"]
+mod journal_pause_reprise_tests;
+#[cfg(test)]
+#[path = "playback/seek_en_double_193_tests.rs"]
+mod seek_en_double_193_tests;
+#[cfg(test)]
 #[path = "playback/session_locale_tests.rs"]
 mod session_locale_tests;
 #[path = "playback/session_message.rs"]
 mod session_message;
+#[cfg(test)]
+#[path = "playback/titre_seul_album_5372_tests.rs"]
+mod titre_seul_album_5372_tests;
+#[cfg(test)]
+#[path = "playback/version_jouee_2264_tests.rs"]
+mod version_jouee_2264_tests;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -374,6 +389,7 @@ pub(crate) fn entrees_de_file(
                 duration_ms: s.duration_ms.unwrap_or(0),
                 track_number: None,
                 disc_number: None,
+                album_ref: None,
             },
         })
         .collect()
@@ -714,13 +730,25 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             Some(sid) => state.streamer.stream_output_wire(sid).await,
             None => None,
         };
-        // #5353 — le backend de la sortie de CETTE zone.
-        let audio_backend = crate::routes::zones::backend_affiche_de_la_zone(
+        // #5353 — le backend de la sortie de CETTE zone, et le signalement
+        // d'une sortie hors du backend choisi : le client remplace son objet
+        // zone par cette réponse (`syncZone`), le champ doit donc y être.
+        let backend_sortie = crate::routes::zones::backend_de_la_sortie_de_la_zone(
             state,
             zone.output_device_id.as_deref(),
-            audio_backend,
         )
         .await;
+        let audio_backend = crate::routes::zones::backend_affiche_pour_la_sortie(
+            audio_backend,
+            backend_sortie.as_deref(),
+        );
+        if let Some(obj) = v.as_object_mut() {
+            crate::routes::zones::injecter_backend_de_sortie(
+                obj,
+                &state.effective_audio_backend(),
+                backend_sortie.as_deref(),
+            );
+        }
         let signal_path = crate::routes::zones::build_signal_path_pub(
             &zone_state,
             zone,
@@ -838,6 +866,68 @@ fn avertissements_de_lecture(
         .to_vec()
 }
 
+/// #5372 — l'album d'un titre de service lancé SEUL, et la place du titre
+/// dedans.
+///
+/// Un titre de streaming lancé depuis une recherche, une tuile d'accueil ou
+/// l'historique arrive sans `streaming_album_id` : la route en faisait une
+/// file d'UN titre, qui s'arrêtait à sa fin (« piste suivante » grisée). La
+/// décision du 05/10 : jouer l'album à partir de ce titre, comme pour un titre
+/// de la bibliothèque.
+///
+/// `Err(motif)` dit pourquoi l'album n'a pas pu servir ; l'appelant garde
+/// alors la file d'un seul titre, comme avant.
+async fn album_du_titre_de_service(
+    state: &AppState,
+    source: &str,
+    source_id: &str,
+) -> Result<
+    (
+        String,
+        Vec<tune_core::streaming::traits::StreamTrack>,
+        usize,
+    ),
+    String,
+> {
+    /// Deux appels au service au plus ; au-delà, on ne fait pas attendre le
+    /// départ de la lecture pour une file plus longue.
+    const DELAI: std::time::Duration = std::time::Duration::from_secs(5);
+    let resolution = async {
+        let registry = state.services.lock().await;
+        let svc = registry
+            .get(source)
+            .ok_or_else(|| "service_absent".to_string())?;
+        let svc = svc.read().await;
+        let titre = svc
+            .get_track(source_id)
+            .await
+            .map_err(|e| format!("titre_illisible: {e}"))?;
+        let album_id = titre
+            .album_id
+            .filter(|a| !a.trim().is_empty())
+            .ok_or_else(|| "titre_sans_album".to_string())?;
+        let pistes = svc
+            .get_album_tracks(&album_id)
+            .await
+            .map_err(|e| format!("album_illisible: {e}"))?;
+        let index = position_du_titre_dans_l_album(&pistes, source_id)
+            .ok_or_else(|| "titre_absent_de_l_album".to_string())?;
+        Ok((album_id, pistes, index))
+    };
+    match tokio::time::timeout(DELAI, resolution).await {
+        Ok(r) => r,
+        Err(_) => Err("delai_depasse".to_string()),
+    }
+}
+
+/// La place de `source_id` dans les pistes d'un album de service.
+fn position_du_titre_dans_l_album(
+    pistes: &[tune_core::streaming::traits::StreamTrack],
+    source_id: &str,
+) -> Option<usize> {
+    pistes.iter().position(|t| t.id == source_id)
+}
+
 #[derive(Deserialize, Default)]
 struct PlayRequest {
     track_id: Option<i64>,
@@ -877,6 +967,18 @@ struct PlayRequest {
     // le client l'ENONCER ; ils priment sur toute deduction.
     context_type: Option<String>,
     context_id: Option<String>,
+    /// Web#1923, web#1924 : la page de l'album d'un titre Bandcamp lancé SEUL
+    /// (`source` + `source_id`), quand le client la connaît (recherche, page
+    /// d'artiste, genres). Rangée avec la ligne de file si elle est sûre
+    /// (`zones::page_d_album_bandcamp_sure`), ignorée pour toute autre source.
+    album_ref: Option<String>,
+    /// #2264 — `true` quand l'auditeur a choisi CETTE version à la main
+    /// (panneau « Autres versions ») : la règle de version ne s'applique pas
+    /// à cette lecture. Absent ou `false` : lancement normal, la règle du
+    /// profil choisit la version jouée. Ne vaut que pour une piste seule
+    /// (`track_id`, ou `source` + `source_id`).
+    #[serde(default)]
+    explicit_version: bool,
 }
 
 /// Les cinq natures d'objet que l'auditeur peut demander, telles que FabienM
@@ -1222,6 +1324,9 @@ struct QueueAddRequest {
     // Batch streaming tracks: [{source, source_id, title?, artist_name?, ...}]
     #[serde(default)]
     tracks: Vec<StreamingTrackItem>,
+    /// Web#1923, web#1924 : la page de l'album du titre Bandcamp seul
+    /// (`source` + `source_id`). Même règle que `PlayRequest.album_ref`.
+    album_ref: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1235,6 +1340,8 @@ struct StreamingTrackItem {
     duration_ms: Option<i64>,
     track_number: Option<i64>,
     disc_number: Option<i64>,
+    /// La page de l'album de cette ligne, pour une piste Bandcamp.
+    album_ref: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1507,6 +1614,10 @@ mod sqlite_scan_queue_arbitration_tests {
         );
     }
 }
+
+/// Ticket 190 — une écriture de file n'attend plus un lot de scan entier.
+#[cfg(test)]
+mod file_pendant_un_lot_de_scan_190;
 
 #[cfg(test)]
 mod refus_bitperfect_strict_3973 {
@@ -1826,6 +1937,25 @@ async fn play(
         .playback
         .set_session_profile(zone_id, Some(profile.id()))
         .await;
+    // #2264 — un choix fait dans « Autres versions » prime sur la règle de
+    // version : épinglé pour la lecture qui suit, qu'elle passe par la file
+    // ou non. Une liste ou un conteneur n'est pas un choix de version.
+    if let Some(Json(b)) = body.as_ref()
+        && b.explicit_version
+        && b.track_ids.is_none()
+        && b.album_id.is_none()
+        && b.playlist_id.is_none()
+        && b.streaming_album_id.is_none()
+        && b.streaming_playlist_id.is_none()
+        && (b.track_id.is_some() || b.source_id.is_some())
+    {
+        state.orchestrator.epingler_version_explicite(
+            zone_id,
+            b.track_id,
+            b.source.as_deref(),
+            b.source_id.as_deref(),
+        );
+    }
     // When called with an empty body (e.g. Play after Stop), resume the
     // current track instead of returning 400 "no track source specified".
     let body = match body {
@@ -1859,6 +1989,7 @@ async fn play(
                     media_format: None,
                     track_number: None,
                     disc_number: None,
+                    album_ref: None,
                 };
                 ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
                 return match state.orchestrator.play(orch_req).await {
@@ -2002,6 +2133,7 @@ async fn play(
                         media_format: None,
                         track_number: None,
                         disc_number: None,
+                        album_ref: None,
                     };
                     return match state.orchestrator.play(orch_req).await {
                         Ok(result) => {
@@ -2058,26 +2190,83 @@ async fn play(
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
+    // #5372 — un titre de service lancé SEUL (recherche, tuile, historique) :
+    // s'il n'est pas déjà dans la file, jouer son ALBUM à partir de lui, comme
+    // pour un titre de la bibliothèque, au lieu d'une file d'un seul titre qui
+    // s'arrête à sa fin. Le titre déjà en file (Stop puis Play) et la base
+    // illisible (#2569) gardent leur chemin, plus bas ; un album introuvable
+    // aussi. Le contexte de session posé au-dessus reste celui du geste.
+    let mut body = body;
+    let mut pistes_de_l_album: Option<Vec<tune_core::streaming::traits::StreamTrack>> = None;
+    if let (Some(source), Some(source_id)) = (body.source.clone(), body.source_id.clone())
+        && body.track_id.is_none()
+        && body.track_ids.is_none()
+        && body.streaming_album_id.is_none()
+        && body.streaming_playlist_id.is_none()
+    {
+        let deja = file_deja_chargee(
+            queue_repo
+                .get_ordered(zone_id)
+                .as_deref()
+                .map_err(String::as_str),
+            Some(source.as_str()),
+            source_id.as_str(),
+        );
+        if deja == FileDejaChargee::RemplacerParCeTitre {
+            match album_du_titre_de_service(&state, &source, &source_id).await {
+                Ok((album_id, pistes, index)) => {
+                    info!(
+                        zone_id,
+                        source = %source,
+                        index,
+                        longueur = pistes.len(),
+                        "titre_seul_joue_dans_son_album"
+                    );
+                    body.streaming_album_id = Some(album_id);
+                    body.start_index = Some(index as i64);
+                    pistes_de_l_album = Some(pistes);
+                }
+                // Une source qui n'est pas un service (serveur de médias,
+                // radio) n'a pas d'album à chercher : rien à dire en INFO.
+                Err(motif) if motif == "service_absent" => {}
+                Err(motif) => {
+                    info!(
+                        zone_id,
+                        source = %source,
+                        motif = %motif,
+                        "titre_seul_album_introuvable_file_d_un_titre"
+                    );
+                }
+            }
+        }
+    }
+
     // --- Streaming album: fetch tracks from the service, queue them, play first ---
     if let (Some(source), Some(album_id)) = (&body.source, &body.streaming_album_id) {
-        let registry = state.services.lock().await;
-        let svc = match registry.get(source) {
-            Some(s) => s,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("unknown service: {source}"),
-                )
-                    .into_response();
-            }
+        // #5372 — l'album déjà lu pour un titre seul ne se relit pas.
+        let tracks = if let Some(t) = pistes_de_l_album.take() {
+            t
+        } else {
+            let registry = state.services.lock().await;
+            let svc = match registry.get(source) {
+                Some(s) => s,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("unknown service: {source}"),
+                    )
+                        .into_response();
+                }
+            };
+            let svc = svc.read().await;
+            let tracks = match svc.get_album_tracks(album_id).await {
+                Ok(t) => t,
+                Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+            };
+            drop(svc);
+            drop(registry);
+            tracks
         };
-        let svc = svc.read().await;
-        let tracks = match svc.get_album_tracks(album_id).await {
-            Ok(t) => t,
-            Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-        };
-        drop(svc);
-        drop(registry);
 
         if tracks.is_empty() {
             return (StatusCode::BAD_REQUEST, "album has no tracks").into_response();
@@ -2143,9 +2332,25 @@ async fn play(
                 )
             })
             .collect();
-        if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_items) {
+        // La référence d'album de chaque piste (migration 114) : pour Bandcamp,
+        // la page qui permettra de resigner l'URL de flux quand elle expirera
+        // (fil 2121).
+        let album_refs: Vec<Option<String>> = tracks.iter().map(|t| t.album_id.clone()).collect();
+        if let Err(e) =
+            queue_repo.set_streaming_queue_avec_albums(zone_id, &queue_items, &album_refs)
+        {
             warn!(zone_id, error = %e, "set_streaming_queue_failed");
         }
+        // #5372 — la branche prise et la longueur de la file, en INFO : sans
+        // elles, un rapport ne distingue pas un album d'un titre seul.
+        info!(
+            zone_id,
+            source = %source,
+            branche = "album_de_service",
+            position = start,
+            longueur = tracks.len(),
+            "file_de_lecture_ecrite"
+        );
         state
             .playback
             .update_queue_info(zone_id, start as i64, tracks.len() as i64)
@@ -2169,6 +2374,7 @@ async fn play(
             media_format: None,
             track_number: first.track_number,
             disc_number: first.disc_number,
+            album_ref: first.album_id.clone(),
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -2284,7 +2490,13 @@ async fn play(
                 )
             })
             .collect();
-        if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_items) {
+        // La référence d'album de chaque piste (migration 114) : pour Bandcamp,
+        // la page qui permettra de resigner l'URL de flux quand elle expirera
+        // (fil 2121).
+        let album_refs: Vec<Option<String>> = tracks.iter().map(|t| t.album_id.clone()).collect();
+        if let Err(e) =
+            queue_repo.set_streaming_queue_avec_albums(zone_id, &queue_items, &album_refs)
+        {
             warn!(zone_id, error = %e, "set_streaming_queue_failed");
         }
         state
@@ -2310,6 +2522,7 @@ async fn play(
             media_format: None,
             track_number: first.track_number,
             disc_number: first.disc_number,
+            album_ref: first.album_id.clone(),
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -2379,6 +2592,15 @@ async fn play(
                 .flatten()
                 .and_then(|z| z.output_device_id)
         });
+        // Web#1923, web#1924 : la page d'album envoyée par le client, sinon
+        // celle que Tune a rangée (#5922). Elle part aussi à l'orchestrateur,
+        // qui l'écrit dans l'historique et s'en sert pour resigner le flux.
+        let album_ref_val = crate::routes::zones::reference_d_album_de_la_demande(
+            &state,
+            source_for_q.as_deref().unwrap_or(""),
+            &source_id_val,
+            body.album_ref.as_deref(),
+        );
         let orch_req = tune_core::orchestrator::PlayRequest {
             zone_id,
             output_device_id,
@@ -2397,6 +2619,7 @@ async fn play(
             media_format: body.media_format,
             track_number: None,
             disc_number: None,
+            album_ref: album_ref_val.clone(),
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -2422,6 +2645,13 @@ async fn play(
                     FileDejaChargee::Garder { position, longueur } => {
                         // Keep the full queue, just move the current position onto it
                         // (its unified position, valid whether the queue is mixed).
+                        info!(
+                            zone_id,
+                            branche = "titre_seul_deja_en_file",
+                            position,
+                            longueur,
+                            "file_de_lecture_ecrite"
+                        );
                         state
                             .playback
                             .update_queue_info(zone_id, position, longueur)
@@ -2435,6 +2665,10 @@ async fn play(
                             zone_id,
                             &[QueueInput::Streaming {
                                 source: source_for_q.clone().unwrap_or_else(|| "streaming".into()),
+                                // Web#1926 : un titre Bandcamp seul garde la
+                                // page de son album, envoyée par le client ou
+                                // déjà connue de Tune, pour « Aller à l'album ».
+                                album_ref: album_ref_val,
                                 source_id: source_id_val,
                                 title: title_val,
                                 artist: artist_val,
@@ -2447,6 +2681,13 @@ async fn play(
                         ) {
                             warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
                         }
+                        info!(
+                            zone_id,
+                            branche = "titre_seul",
+                            position = 0,
+                            longueur = 1,
+                            "file_de_lecture_ecrite"
+                        );
                         state.playback.update_queue_info(zone_id, 0, 1).await;
                         persist_queue_async(&state, zone_id);
                     }
@@ -2574,6 +2815,7 @@ async fn play(
                 media_format: None,
                 track_number: None,
                 disc_number: None,
+                album_ref: None,
             };
             ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
             return match state.orchestrator.play(orch_req).await {
@@ -2784,6 +3026,7 @@ async fn play(
         media_format: body.media_format,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
 
     ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
@@ -2900,6 +3143,9 @@ async fn playpause(
 }
 
 async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+    // Une ligne par ordre, comme `api_next_requested` : sans elle, une pause
+    // n’apparaissait dans le journal qu’en sortie Windows exclusive.
+    info!(zone_id = zone_id, origine = "api", "pause_requested");
     let device_id = get_zone_device_id(&state, zone_id);
     match state
         .orchestrator
@@ -2916,6 +3162,7 @@ async fn resume(
     Path(zone_id): Path<i64>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    info!(zone_id = zone_id, origine = "api", "resume_requested");
     let lang = crate::i18n::lang_from_header(&headers);
     let current = state.playback.get_state(zone_id).await;
 
@@ -2953,6 +3200,7 @@ async fn resume(
             media_format: None,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         };
         ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
         return match state.orchestrator.play(orch_req).await {
@@ -3017,6 +3265,10 @@ async fn resume(
                         .and_then(|v| v.as_str())
                         .map(String::from),
                     duration_ms: first.get("duration_ms").and_then(|v| v.as_i64()),
+                    album_ref: first
+                        .get("album_ref")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
                     ..Default::default()
                 };
                 return match state.orchestrator.play(orch_req).await {
@@ -3054,6 +3306,7 @@ async fn resume(
                     media_format: None,
                     track_number: None,
                     disc_number: None,
+                    album_ref: None,
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
@@ -3102,9 +3355,18 @@ async fn resume(
 }
 
 async fn stop(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let device_id = get_zone_device_id(&state, zone_id);
-    state.orchestrator.stop(zone_id, device_id.as_deref()).await;
+    arreter_la_zone(&state, zone_id).await;
     Json(build_zone_json(&state, zone_id).await)
+}
+
+/// L'arrêt du bouton Stop : `get_zone_device_id` puis `orchestrator.stop`,
+/// qui persiste la position, écrit `last_play_state = "stopped"` en base,
+/// envoie `stop()` à la sortie (locale, DLNA…) et ferme la session de flux.
+/// Tout geste qui ARRÊTE une zone passe par ici (#5571) — pas par
+/// `PlaybackManager::stop`, qui ne change que l'état en mémoire.
+async fn arreter_la_zone(state: &AppState, zone_id: i64) {
+    let device_id = get_zone_device_id(state, zone_id);
+    state.orchestrator.stop(zone_id, device_id.as_deref()).await;
 }
 
 /// Reject playback commands on an orphan zone (a DB row with no
@@ -3189,11 +3451,38 @@ pub(crate) fn radio_hors_file_interdit_le_suivant(
     source_en_cours == Some("radio") && source_de_la_ligne_courante != Some("radio")
 }
 
+/// Ticket 134 — le verrou de décision de « suivant », par zone.
+///
+/// `next` répond tout de suite et lance `play_from_queue` en tâche de fond.
+/// La position de la zone n'avançait que dans cette tâche, après ses lectures
+/// de base (et une écriture de curseur, qui peut attendre sur un hôte lent).
+/// Un deuxième « suivant » arrivé dans l'intervalle relisait l'ANCIENNE
+/// position et visait la même piste : trois appuis rapprochés avançaient de
+/// trois pistes, ou d'une seule, selon le temps qu'avait pris la base.
+///
+/// Règle (inchangée) : un appui = une piste. Elle tient désormais quelle que
+/// soit la vitesse de la base : sous ce verrou, `next` lit la position, la
+/// décide ET la pose avant de rendre la main. Deux zones ne s'attendent
+/// jamais.
+fn verrou_du_suivant(zone_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Verrous =
+        std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>;
+    static VERROUS: std::sync::OnceLock<Verrous> = std::sync::OnceLock::new();
+    let table = VERROUS.get_or_init(Default::default);
+    let mut table = match table.lock() {
+        Ok(t) => t,
+        Err(p) => p.into_inner(),
+    };
+    table.entry(zone_id).or_default().clone()
+}
+
 async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_next_requested");
     if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
         return resp;
     }
+    let verrou = verrou_du_suivant(zone_id);
+    let decision = verrou.lock().await;
     let current = state.playback.get_state(zone_id).await;
 
     // #3342 — une radio ne fait pas avancer une file qui n'est pas la sienne.
@@ -3252,6 +3541,14 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
             return Json(json!({ "status": "stopped", "reason": "end_of_queue" })).into_response();
         }
     };
+    // Ticket 134 — la position est posée AVANT de rendre le verrou : le
+    // « suivant » d'après part d'ici, pas de la piste que la tâche de lecture
+    // n'a pas encore quittée. `play_from_queue` repose la même valeur.
+    state
+        .playback
+        .update_queue_info(zone_id, next_pos, current.queue_length)
+        .await;
+    drop(decision);
     let s = state.clone();
     tokio::spawn(async move {
         if let Err(e) = s.orchestrator.play_from_queue(zone_id, next_pos).await {
@@ -3267,6 +3564,10 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
 
     Json(json!({ "status": "playing", "queue_position": next_pos })).into_response()
 }
+
+#[cfg(test)]
+#[path = "playback/precedent_deux_appuis_5770_tests.rs"]
+mod precedent_deux_appuis_5770_tests;
 
 /// Dernier « précédent » ayant relancé la piste au lieu de reculer, par zone.
 ///
@@ -3310,12 +3611,92 @@ pub(crate) fn precedent_doit_relancer(position_ms: i64, vient_de_redemarrer: boo
     position_ms > SEUIL_RELANCE_MS && !vient_de_redemarrer
 }
 
-async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+/// Position que « précédent » doit rejouer quand il RECULE (et ne relance pas).
+///
+/// Fil 2143 (Fabien, #5758) — en lecture aléatoire, « suivant » suit la
+/// permutation (`next_position_manual`), mais « précédent » reculait d'un rang
+/// dans l'ordre LINÉAIRE de la file : il jouait un titre qu'on n'avait pas
+/// entendu juste avant. Ici, l'aléatoire remonte le tirage : le titre joué
+/// avant le titre courant est celui qui le précède dans `shuffle_order`.
+///
+/// Au premier rang du tirage, rien n'a été joué avant : on reste sur la piste
+/// courante, comme `max(0)` le fait en lecture linéaire. Sans tirage
+/// matérialisé (ou si la position n'y figure pas), on retombe sur l'ordre
+/// linéaire, inchangé.
+pub(crate) fn position_precedente(zone_state: &tune_core::playback::ZoneState) -> i64 {
+    let lineaire = (zone_state.queue_position - 1).max(0);
+    if !zone_state.shuffle || zone_state.shuffle_order.is_empty() {
+        return lineaire;
+    }
+    let courant = zone_state.queue_position;
+    // Le curseur est resynchronisé à chaque changement de position
+    // (`update_queue_info`) ; on le vérifie quand même, et on cherche la
+    // position dans le tirage s'il ne pointe pas sur la piste courante.
+    let rang = usize::try_from(zone_state.shuffle_index)
+        .ok()
+        .filter(|&i| zone_state.shuffle_order.get(i).map(|&p| p as i64) == Some(courant))
+        .or_else(|| {
+            zone_state
+                .shuffle_order
+                .iter()
+                .position(|&p| p as i64 == courant)
+        });
+    match rang {
+        Some(0) => courant.max(0),
+        Some(i) => zone_state.shuffle_order[i - 1] as i64,
+        None => lineaire,
+    }
+}
+
+/// Corps facultatif de `POST /zones/{id}/previous`.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct PrecedentRequest {
+    /// Position de lecture vue par le CLIENT, en millisecondes. Lue seulement
+    /// pour une zone navigateur : voir [`position_vue_par_precedent`].
+    pub position_ms: Option<i64>,
+}
+
+/// La position sur laquelle « précédent » décide de relancer ou de reculer.
+///
+/// FabienM, fil 1476 (05/10/2026, rc2) : sur « Cet ordinateur », le premier
+/// appui ne relance jamais la piste, il saute à la précédente. Cause : une
+/// zone navigateur n'a pas de périphérique, le sondeur ne relève donc jamais
+/// sa position (`poller/tick.rs`, branche `None => … continue`). Le serveur
+/// croit la piste à 0 ms (ou à la cible du dernier déplacement), et la règle
+/// de #1929 recule toujours. Seul l'onglet qui joue connaît la vraie
+/// position : il l'envoie, et on la prend — pour une zone navigateur
+/// seulement. Ailleurs, la position relevée sur la sortie fait foi.
+pub(crate) fn position_vue_par_precedent(
+    zone_navigateur: bool,
+    position_serveur_ms: i64,
+    position_client_ms: Option<i64>,
+) -> i64 {
+    match position_client_ms {
+        Some(ms) if zone_navigateur && ms >= 0 => ms,
+        _ => position_serveur_ms,
+    }
+}
+
+async fn previous(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    CorpsJsonOptionnel(body): CorpsJsonOptionnel<PrecedentRequest>,
+) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_previous_requested");
     if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
         return resp;
     }
     let current = state.playback.get_state(zone_id).await;
+    let zone_navigateur = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .is_some_and(|z| z.output_type.as_deref() == Some("browser"));
+    let position_ms = position_vue_par_precedent(
+        zone_navigateur,
+        current.position_ms,
+        body.and_then(|b| b.position_ms),
+    );
 
     // Un second appui rapproché veut dire « recule », quoi que dise la
     // position. On consomme la marque : un troisième appui relancera de
@@ -3331,7 +3712,7 @@ async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> im
         }
     };
 
-    if precedent_doit_relancer(current.position_ms, vient_de_redemarrer) {
+    if precedent_doit_relancer(position_ms, vient_de_redemarrer) {
         let device_id = get_zone_device_id(&state, zone_id);
         if let Err(error) = state
             .orchestrator
@@ -3347,7 +3728,7 @@ async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> im
         return Json(json!({ "status": "restarted" })).into_response();
     }
 
-    let prev_pos = (current.queue_position - 1).max(0);
+    let prev_pos = position_precedente(&current);
 
     let s = state.clone();
     tokio::spawn(async move {
@@ -3362,6 +3743,39 @@ async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> im
     Json(json!({ "status": "playing", "queue_position": prev_pos })).into_response()
 }
 
+/// Fenêtre pendant laquelle un second `Seek` vers la MÊME position, sur la
+/// même zone, est tenu pour un doublon du premier.
+const FENETRE_SEEK_EN_DOUBLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Ticket 193 — le même `Seek` reçu deux fois coup sur coup ne part qu'une
+/// fois vers la sortie.
+///
+/// Un simple clic sur la barre de progression du client web envoie DEUX
+/// `POST /seek` à la même position : `mouseup` (fin d'un glisser de longueur
+/// nulle) puis `click`. Le journal du ticket montre les deux à 149 ms
+/// d'écart, donc deux `Seek` SOAP au renderer, donc deux recherches par le
+/// lecteur du renderer, chacune relayée en requêtes de plage vers le CDN.
+/// Le second n'apporte rien : la position demandée est déjà celle du premier.
+///
+/// Rend `true` pour un doublon (à ne pas transmettre). Sinon note ce `Seek`
+/// comme le dernier de la zone et rend `false`. Une position différente, ou
+/// la même au-delà de la fenêtre, passe toujours.
+pub(crate) fn seek_en_double(
+    registre: &mut std::collections::HashMap<i64, (u64, std::time::Instant)>,
+    zone_id: i64,
+    position_ms: u64,
+    maintenant: std::time::Instant,
+) -> bool {
+    if let Some(&(position, recu)) = registre.get(&zone_id)
+        && position == position_ms
+        && maintenant.saturating_duration_since(recu) < FENETRE_SEEK_EN_DOUBLE
+    {
+        return true;
+    }
+    registre.insert(zone_id, (position_ms, maintenant));
+    false
+}
+
 async fn seek(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
@@ -3373,6 +3787,24 @@ async fn seek(
         return refus;
     }
     let position_ms = body.position_ms as u64;
+    // Ticket 193 — relevé à l'ARRIVÉE, avant d'attendre la sortie : le doublon
+    // arrive pendant que le premier `Seek` tient encore le renderer.
+    let en_double = {
+        let mut registre = state
+            .derniers_seeks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        seek_en_double(
+            &mut registre,
+            zone_id,
+            position_ms,
+            std::time::Instant::now(),
+        )
+    };
+    if en_double {
+        info!(zone_id, position_ms, "seek_en_double_ignore");
+        return Json(json!({ "position_ms": position_ms })).into_response();
+    }
     let device_id = get_zone_device_id(&state, zone_id);
     match state
         .orchestrator
@@ -3380,7 +3812,10 @@ async fn seek(
         .await
     {
         Ok(()) => Json(json!({ "position_ms": position_ms })).into_response(),
-        Err(error) => output_command_error_response(error),
+        Err(error) => {
+            state.orchestrator.dire_deplacement_refuse(zone_id, &error);
+            output_command_error_response(error)
+        }
     }
 }
 
@@ -3691,6 +4126,27 @@ async fn get_queue(
                     _ => false,
                 };
                 obj.insert("banned".into(), Value::Bool(bannie));
+                // Fil forum 2143, point 8 — « Aller à l'album » dans le menu
+                // d'un titre de la file. Le client n'offre l'entrée que si la
+                // piste désigne son album : `album_id` (entier de bibliothèque)
+                // pour une ligne locale, `album_id_service` pour une ligne de
+                // service (le champ que lit déjà `routageAlbum`). Deux clefs
+                // ADDITIVES, toujours présentes, `null` quand rien n'est connu.
+                // La référence brute `album_ref` reste, elle, hors du JSON.
+                obj.insert("album_id".into(), json!(e.album_id));
+                obj.insert("album_id_service".into(), json!(e.album_id_service()));
+                // Fil forum 2143 (#5758) — « Aller à l'artiste », sur le même
+                // modèle : `artist_id` (entier de bibliothèque) pour une ligne
+                // locale, `artist_id_service` pour une ligne de service. Deux
+                // clefs ADDITIVES, toujours présentes, `null` quand rien n'est
+                // connu. ⚠️ `queue_items` ne garde pas l'artiste CHEZ LE
+                // SERVICE (seul `album_ref` l'est, migration 114) : la clef de
+                // service vaut donc `null` aujourd'hui, et le client retombe,
+                // pour une ligne de service, sur la recherche par nom
+                // (`destinationArtiste`). La remplir demande une colonne
+                // `artist_ref` et sa migration, hors de ce correctif.
+                obj.insert("artist_id".into(), json!(e.artist_id));
+                obj.insert("artist_id_service".into(), Value::Null);
             }
             let suivant = entries.get(idx + 1);
             let promesse = tune_core::playback::gapless::enchainement_sans_blanc(
@@ -3989,6 +4445,12 @@ async fn queue_add(
             }));
         }
         inputs.push(QueueInput::Streaming {
+            album_ref: crate::routes::zones::reference_d_album_de_la_demande(
+                &state,
+                source,
+                source_id,
+                body.album_ref.as_deref(),
+            ),
             source: source.clone(),
             source_id: source_id.clone(),
             title: meta.title,
@@ -4024,6 +4486,12 @@ async fn queue_add(
             }));
         }
         inputs.push(QueueInput::Streaming {
+            album_ref: crate::routes::zones::reference_d_album_de_la_demande(
+                &state,
+                &item.source,
+                &item.source_id,
+                item.album_ref.as_deref(),
+            ),
             source: item.source.clone(),
             source_id: item.source_id.clone(),
             title: meta.title,
@@ -4099,6 +4567,11 @@ async fn queue_add(
     }
     let total = queue_repo.count_all(zone_id).unwrap_or(0);
     let current_pos = state.playback.get_state(zone_id).await.queue_position;
+    // #5770 — une insertion AVANT la piste en cours (« Lire à partir d'ici »
+    // remet les titres précédents en tête, `position: 0`) la décale : le
+    // curseur la suit. Garder l'ancien curseur le faisait pointer sur une
+    // ligne insérée.
+    let current_pos = bilan.curseur_apres(current_pos, total - count as i64);
     state
         .playback
         .update_queue_info(zone_id, current_pos, total)
@@ -4126,6 +4599,7 @@ async fn queue_add(
             "added": count,
             "queue_length": total,
             "position": start,
+            "queue_position": current_pos,
         }),
     );
     (
@@ -4149,10 +4623,17 @@ async fn queue_add(
         // `unresolved` (#4261) est additif lui aussi : la liste des pistes de
         // service enfilées sous « Unknown » faute de réponse du service, avec
         // le motif. Vide quand tout est résolu.
+        //
+        // `queue_position` (#5770) est additif aussi : le curseur de lecture
+        // APRÈS l'insertion. Sa présence dit au client que ce serveur fait
+        // suivre la piste en cours quand on insère avant elle ; un serveur
+        // plus ancien ne l'envoie pas, et le client s'abstient alors d'insérer
+        // en tête.
         Json(json!({
             "added": count,
             "queue_length": total,
             "position": start,
+            "queue_position": current_pos,
             "items": enfiles,
             "unresolved": non_resolues,
         })),
@@ -4580,7 +5061,9 @@ async fn set_sleep(
     Json(body): Json<SleepRequest>,
 ) -> Json<Value> {
     if body.minutes == 0 {
-        SLEEP_TIMERS.lock().unwrap().remove(&zone_id);
+        if SLEEP_TIMERS.lock().unwrap().remove(&zone_id).is_some() {
+            info!(zone_id, "sleep_timer_cancelled");
+        }
         return Json(json!({ "sleep_timer": null, "zone_id": zone_id }));
     }
 
@@ -4594,37 +5077,54 @@ async fn set_sleep(
         !existed
     };
 
+    info!(zone_id, minutes = body.minutes, "sleep_timer_armed");
     if starting {
-        let playback = state.playback.clone();
+        let state = state.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let playing = playback.get_state(zone_id).await.state
-                    == tune_core::playback::PlayState::Playing;
-                let left = {
-                    let mut timers = SLEEP_TIMERS.lock().unwrap();
-                    match timers.get_mut(&zone_id) {
-                        None => break, // cancelled
-                        Some(secs) => {
-                            if playing && *secs > 0 {
-                                *secs -= 1;
-                            }
-                            *secs
-                        }
-                    }
-                };
-                if left == 0 {
-                    playback.stop(zone_id).await;
-                    SLEEP_TIMERS.lock().unwrap().remove(&zone_id);
-                    break;
-                }
-            }
+            decompter_le_minuteur(state, zone_id, std::time::Duration::from_secs(1)).await;
         });
     }
 
     Json(json!({
         "sleep_timer": { "minutes": body.minutes, "zone_id": zone_id },
     }))
+}
+
+/// Le décompte d'un minuteur de sommeil : une seconde de `SLEEP_TIMERS` par
+/// `pas`, seulement pendant la lecture. À zéro, la zone est arrêtée par
+/// [`arreter_la_zone`] — le MÊME chemin que le bouton Stop.
+///
+/// 🔴 #5571 (Levente, fil 2068) : l'échéance appelait `PlaybackManager::stop`,
+/// qui écrit `PlayState::Stopped` en mémoire et émet `stopped`, sans jamais
+/// parler à la sortie. Une zone navigateur se taisait (l'onglet obéit à
+/// l'évènement), mais une sortie locale ou un renderer DLNA continuait de
+/// jouer pendant que l'écran affichait « arrêté ».
+///
+/// `pas` n'existe que pour les tests : la route passe une seconde.
+async fn decompter_le_minuteur(state: AppState, zone_id: i64, pas: std::time::Duration) {
+    loop {
+        tokio::time::sleep(pas).await;
+        let playing = state.playback.get_state(zone_id).await.state
+            == tune_core::playback::PlayState::Playing;
+        let left = {
+            let mut timers = SLEEP_TIMERS.lock().unwrap();
+            match timers.get_mut(&zone_id) {
+                None => break, // annulé
+                Some(secs) => {
+                    if playing && *secs > 0 {
+                        *secs -= 1;
+                    }
+                    *secs
+                }
+            }
+        };
+        if left == 0 {
+            info!(zone_id, "sleep_timer_expired");
+            arreter_la_zone(&state, zone_id).await;
+            SLEEP_TIMERS.lock().unwrap().remove(&zone_id);
+            break;
+        }
+    }
 }
 
 async fn get_sleep(State(_state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
@@ -5015,7 +5515,16 @@ async fn do_transfer(
                 )
             })
             .collect();
-        if let Err(e) = queue_repo.set_streaming_queue(target_zone, &tracks) {
+        // La référence d'album suit la piste d'une zone à l'autre (fil 2121) :
+        // sans elle, une piste Bandcamp transférée ne pourrait plus être
+        // resignée.
+        let album_refs: Vec<Option<String>> = streaming_items
+            .iter()
+            .map(|item| item["album_ref"].as_str().map(String::from))
+            .collect();
+        if let Err(e) =
+            queue_repo.set_streaming_queue_avec_albums(target_zone, &tracks, &album_refs)
+        {
             warn!(from_zone, target_zone, error = %e, "transfer_streaming_queue_failed");
         }
     }
@@ -5086,14 +5595,36 @@ async fn do_transfer(
                         )
                         .await
                 {
-                    return output_command_error_response(error);
+                    // Un `Seek` REFUSÉ par l'appareil (701/710/711) ne doit
+                    // pas couper le transfert en son milieu : la cible joue
+                    // déjà, depuis le début de la piste. Arrêter là laissait
+                    // la source jouer aussi, et la file de la cible non
+                    // enregistrée. Tout autre échec garde l'ancienne conduite.
+                    if tune_core::orchestrator::PlaybackOrchestrator::message_deplacement_refuse(
+                        &error,
+                    )
+                    .is_none()
+                    {
+                        return output_command_error_response(error);
+                    }
+                    tracing::warn!(
+                        target_zone,
+                        position_ms = source_position_ms,
+                        error = %error,
+                        "transfert_seek_refuse_cible_joue_depuis_le_debut"
+                    );
                 }
                 // Une source en pause reste en pause sur la cible : transférer
                 // ne veut pas dire relancer.
-                if source_paused
-                    && let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await
-                {
-                    return output_command_error_response(error);
+                if source_paused {
+                    info!(
+                        zone_id = target_zone,
+                        origine = "transfert",
+                        "pause_requested"
+                    );
+                    if let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await {
+                        return output_command_error_response(error);
+                    }
                 }
             }
             Err(e) => {
@@ -5478,6 +6009,7 @@ async fn invoke_zone_pin(
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -5620,9 +6152,11 @@ async fn set_audiophile(
     // deux mondes, ni bit-perfect ni réglable.
     if !was_full_volume && will_be_full_volume {
         let device_id = get_zone_device_id(&state, zone_id);
+        // #5695 — le réglage n'est pas encore écrit : `set_volume` ne verrait
+        // pas le verrou et composerait le trim (100 % × −1,6 dB = 83 %).
         if let Err(error) = state
             .orchestrator
-            .set_volume(zone_id, 1.0, device_id.as_deref())
+            .set_volume_pure_force(zone_id, device_id.as_deref())
             .await
         {
             return output_command_error_response(error);
@@ -6148,6 +6682,7 @@ pub async fn shuffle_all(
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -6359,6 +6894,7 @@ mod contrat_suivant_radio_tests {
                 cover_url: None,
                 track_number: None,
                 disc_number: None,
+                album_ref: None,
             })
             .collect();
         PlayQueueRepo::with_backend(state.backend.clone())
@@ -7031,6 +7567,9 @@ mod file_deja_chargee_2569 {
             bit_depth: None,
             track_number: None,
             disc_number: None,
+            album_ref: None,
+            album_id: None,
+            artist_id: None,
         }
     }
 
@@ -7641,6 +8180,7 @@ mod vider_la_file_arrete_le_peripherique_3669 {
                     duration_ms: 200_000,
                     track_number: None,
                     disc_number: None,
+                    album_ref: None,
                 }],
             )
             .expect("mise en file");
@@ -7767,6 +8307,7 @@ mod vider_la_suite_4169 {
             duration_ms: 200_000,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         }
     }
 
@@ -8269,5 +8810,432 @@ mod tests_depart_jouable {
             "12 entrees entrent, 12 entrees restent : la piste enjambee \
              demeure atteignable a la main"
         );
+    }
+}
+
+/// 🔴 #5571 — à l'échéance, le minuteur de sommeil ARRÊTE LA SORTIE, par le
+/// chemin du bouton Stop.
+///
+/// Chaque test arme un minuteur de deux secondes de lecture, le décompte au
+/// pas de 10 ms jusqu'à zéro, et mesure ce qui sort du serveur : les `Stop`
+/// reçus par la sortie factice et `last_play_state` en base.
+///
+/// Contre-épreuve : remettre `state.playback.stop(zone_id)` à la place de
+/// `arreter_la_zone` dans `decompter_le_minuteur` (l'appel d'avant le
+/// correctif). Ça compile, et les trois premiers tests tombent : zéro `Stop`
+/// reçu, et la base reste à « playing ».
+#[cfg(test)]
+mod minuteur_de_sommeil_arrete_la_sortie_5571 {
+    use super::{SLEEP_TIMERS, decompter_le_minuteur};
+    use crate::state::AppState;
+    use std::time::Duration;
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::outputs::mock::MockOutput;
+    use tune_core::playback::{NowPlaying, PlayState};
+
+    /// `SLEEP_TIMERS` est global et chaque base `:memory:` numérote ses
+    /// zones à partir de 1 : les tests de ce module passent l'un après l'autre.
+    static UN_A_LA_FOIS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    const APPAREIL: &str = "sortie-factice-5571";
+    const PAS: Duration = Duration::from_millis(10);
+
+    /// Une zone qui JOUE, sur une sortie factice du type donné (`None` : zone
+    /// navigateur, sans appareil côté serveur).
+    async fn zone_en_lecture(output_type: Option<&str>) -> (AppState, i64) {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("AppState");
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zone_id = match output_type {
+            Some(t) => {
+                let id = repo.create("Salon", Some(t), Some(APPAREIL)).expect("zone");
+                state
+                    .outputs
+                    .lock()
+                    .await
+                    .register(Box::new(MockOutput::new(APPAREIL, "Factice").with_type(t)));
+                id
+            }
+            None => repo.create("Mac", Some("browser"), None).expect("zone"),
+        };
+        state
+            .playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    title: "9 Crimes".into(),
+                    source: "local".into(),
+                    track_id: Some(1),
+                    duration_ms: 600_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        repo.save_play_state(zone_id, "playing")
+            .expect("état initial");
+        (state, zone_id)
+    }
+
+    async fn arrets_recus(state: &AppState) -> u64 {
+        let registre = state.outputs.lock().await;
+        let arc = registre.get(APPAREIL).expect("sortie enregistrée");
+        let sortie = arc.lock().await;
+        sortie
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("MockOutput")
+            .stop_call_count()
+    }
+
+    /// Arme `secondes` et décompte jusqu'à l'échéance (borne : 5 s).
+    async fn aller_jusqu_a_zero(state: &AppState, zone_id: i64, secondes: u64) {
+        SLEEP_TIMERS.lock().unwrap().insert(zone_id, secondes);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            decompter_le_minuteur(state.clone(), zone_id, PAS),
+        )
+        .await
+        .expect("le minuteur doit arriver à zéro");
+    }
+
+    async fn verifier_l_arret_par_la_sortie(output_type: &str) {
+        let _tour = UN_A_LA_FOIS.lock().await;
+        let (state, zone_id) = zone_en_lecture(Some(output_type)).await;
+        assert_eq!(
+            arrets_recus(&state).await,
+            0,
+            "rien d'arrêté avant l'échéance"
+        );
+
+        aller_jusqu_a_zero(&state, zone_id, 2).await;
+
+        assert_eq!(
+            arrets_recus(&state).await,
+            1,
+            "sortie {output_type} : l'échéance doit envoyer UN Stop à la sortie — \
+             sans lui, l'écran dit « arrêté » et la musique continue (#5571)"
+        );
+        assert_eq!(
+            ZoneRepo::with_backend(state.backend.clone()).get_last_play_state(zone_id),
+            Some("stopped".into()),
+            "sortie {output_type} : la base doit dire « stopped », comme après le bouton Stop"
+        );
+        assert_eq!(
+            state.playback.get_state(zone_id).await.state,
+            PlayState::Stopped
+        );
+        assert!(
+            !SLEEP_TIMERS.lock().unwrap().contains_key(&zone_id),
+            "le minuteur échu doit disparaître"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_echeance_la_sortie_locale_recoit_un_stop() {
+        verifier_l_arret_par_la_sortie("local").await;
+    }
+
+    #[tokio::test]
+    async fn a_echeance_le_renderer_dlna_recoit_un_stop() {
+        verifier_l_arret_par_la_sortie("dlna").await;
+    }
+
+    /// Zone navigateur : pas d'appareil côté serveur, c'est l'évènement
+    /// `stopped` qui fait taire l'onglet. Il doit partir, et la base doit
+    /// suivre comme pour le bouton Stop.
+    #[tokio::test]
+    async fn a_echeance_la_zone_navigateur_est_arretee_comme_par_le_bouton_stop() {
+        let _tour = UN_A_LA_FOIS.lock().await;
+        let (state, zone_id) = zone_en_lecture(None).await;
+        let mut evenements = state.playback.subscribe();
+
+        aller_jusqu_a_zero(&state, zone_id, 2).await;
+
+        let mut arret_annonce = false;
+        while let Ok(e) = evenements.try_recv() {
+            if e.event == "stopped" && e.zone_id == zone_id {
+                arret_annonce = true;
+            }
+        }
+        assert!(arret_annonce, "l'onglet n'obéit qu'à l'évènement `stopped`");
+        assert_eq!(
+            ZoneRepo::with_backend(state.backend.clone()).get_last_play_state(zone_id),
+            Some("stopped".into()),
+            "zone navigateur : la base doit dire « stopped », comme après le bouton Stop"
+        );
+    }
+
+    /// Garde du décompte : une zone en PAUSE ne consomme pas son minuteur et
+    /// n'est donc jamais arrêtée par lui. L'arrêt vient de l'échéance, pas du
+    /// simple fait que la tâche tourne.
+    #[tokio::test]
+    async fn une_zone_en_pause_ne_consomme_pas_son_minuteur() {
+        let _tour = UN_A_LA_FOIS.lock().await;
+        let (state, zone_id) = zone_en_lecture(Some("local")).await;
+        state.playback.pause(zone_id).await;
+        SLEEP_TIMERS.lock().unwrap().insert(zone_id, 2);
+
+        let fini = tokio::time::timeout(
+            Duration::from_millis(200),
+            decompter_le_minuteur(state.clone(), zone_id, PAS),
+        )
+        .await;
+
+        let reste = SLEEP_TIMERS.lock().unwrap().remove(&zone_id);
+        assert!(fini.is_err(), "en pause, le minuteur ne doit pas échoir");
+        assert_eq!(reste, Some(2), "en pause, pas une seconde décomptée");
+        assert_eq!(arrets_recus(&state).await, 0);
+    }
+}
+
+/// Fil 2143 (#5758) — « précédent » en lecture aléatoire remonte l'ordre
+/// réellement joué (le tirage), pas l'ordre linéaire de la file.
+#[cfg(test)]
+mod precedent_aleatoire_tests {
+    use super::position_precedente;
+    use tune_core::playback::{RepeatMode, ZoneState};
+
+    fn aleatoire(position: i64, rang: i64) -> ZoneState {
+        ZoneState {
+            queue_position: position,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: rang,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn en_aleatoire_precedent_rend_le_titre_tire_juste_avant() {
+        // Tirage 3 → 1 → 4 : on écoute 4, le titre d'avant est 1 (pas 3).
+        assert_eq!(position_precedente(&aleatoire(4, 2)), 1);
+        // On écoute 0 (rang 3), le titre d'avant est 4 (pas -1 → 0).
+        assert_eq!(position_precedente(&aleatoire(0, 3)), 4);
+    }
+
+    #[test]
+    fn au_premier_rang_du_tirage_precedent_reste_sur_la_piste() {
+        assert_eq!(position_precedente(&aleatoire(3, 0)), 3);
+    }
+
+    #[test]
+    fn un_curseur_desynchronise_est_rattrape_par_la_position() {
+        // Curseur périmé (rang 0 = piste 3) alors que la piste 2 joue : la
+        // piste 2 est au rang 4, le titre d'avant est 0.
+        assert_eq!(position_precedente(&aleatoire(2, 0)), 0);
+        assert_eq!(position_precedente(&aleatoire(2, -1)), 0);
+    }
+
+    #[test]
+    fn sans_aleatoire_le_recul_lineaire_est_inchange() {
+        let mut s = aleatoire(4, 2);
+        s.shuffle = false;
+        s.shuffle_order.clear();
+        assert_eq!(position_precedente(&s), 3);
+        s.queue_position = 0;
+        assert_eq!(position_precedente(&s), 0);
+    }
+
+    #[test]
+    fn aleatoire_sans_tirage_materialise_retombe_sur_le_lineaire() {
+        let mut s = aleatoire(4, 2);
+        s.shuffle_order.clear();
+        assert_eq!(position_precedente(&s), 3);
+    }
+
+    /// Le handler `POST /previous` s'en sert bel et bien : la réponse annonce
+    /// la position du titre tiré juste avant.
+    #[tokio::test]
+    async fn la_route_previous_suit_le_tirage() {
+        use crate::state::AppState;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+        use tune_core::db::zone_repo::ZoneRepo;
+        use tune_core::playback::NowPlaying;
+
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let zid = ZoneRepo::with_backend(state.backend.clone())
+            .create("Salon", Some("mock"), Some("sortie-essai"))
+            .expect("creation de zone");
+        let longueur = 20i64;
+        let items: Vec<QueueInput> = (0..longueur)
+            .map(|i| QueueInput::Streaming {
+                source: "qobuz".into(),
+                source_id: format!("t{i}"),
+                title: format!("t{i}"),
+                artist: "Fabien".into(),
+                album: None,
+                duration_ms: 197_000,
+                cover_url: None,
+                track_number: None,
+                disc_number: None,
+                album_ref: None,
+            })
+            .collect();
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zid, &items)
+            .expect("mise en file");
+        state
+            .playback
+            .play(
+                zid,
+                NowPlaying {
+                    title: "t0".into(),
+                    source: "qobuz".into(),
+                    source_id: Some("t0".into()),
+                    duration_ms: 0,
+                    ..Default::default()
+                },
+            )
+            .await;
+        state.playback.update_queue_info(zid, 0, longueur).await;
+        state.playback.set_shuffle(zid, true).await;
+        let ordre = state.playback.get_state(zid).await.shuffle_order;
+        assert_eq!(ordre.len() as i64, longueur);
+
+        // Un rang du tirage où le recul linéaire et le recul dans le tirage
+        // DIFFÈRENT, sinon le test ne prouverait rien.
+        let rang = (1..ordre.len())
+            .find(|&k| (ordre[k] as i64 - 1).max(0) != ordre[k - 1] as i64)
+            .expect("un tirage de 20 pistes n'est pas l'ordre linéaire");
+        // On « joue » le tirage jusqu'à ce rang, comme `next` l'aurait fait.
+        state
+            .playback
+            .update_queue_info(zid, ordre[rang] as i64, longueur)
+            .await;
+
+        let reponse = super::previous(
+            State(state.clone()),
+            Path(zid),
+            crate::routes::corps_json_optionnel::CorpsJsonOptionnel(None),
+        )
+        .await
+        .into_response();
+        let octets = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&octets).unwrap();
+        assert_eq!(
+            v.get("queue_position"),
+            Some(&serde_json::json!(ordre[rang - 1])),
+            "tirage {ordre:?}, piste courante {} (rang {rang}) : précédent \
+             doit rejouer {} (le titre tiré avant), pas {} (l'ordre linéaire) : {v}",
+            ordre[rang],
+            ordre[rang - 1],
+            (ordre[rang] as i64 - 1).max(0),
+        );
+    }
+}
+
+/// Fil 1476 (FabienM, rc2) — sur une zone navigateur, le serveur ne relève
+/// pas la position : « précédent » prend celle que l'onglet envoie.
+#[cfg(test)]
+mod precedent_zone_navigateur_tests {
+    use super::position_vue_par_precedent;
+    use crate::routes::corps_json_optionnel::CorpsJsonOptionnel;
+    use crate::state::AppState;
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::playback::NowPlaying;
+
+    #[test]
+    fn la_position_du_client_ne_compte_que_pour_une_zone_navigateur() {
+        assert_eq!(position_vue_par_precedent(true, 0, Some(45_000)), 45_000);
+        assert_eq!(position_vue_par_precedent(true, 12_000, None), 12_000);
+        assert_eq!(position_vue_par_precedent(true, 12_000, Some(-5)), 12_000);
+        assert_eq!(position_vue_par_precedent(false, 0, Some(45_000)), 0);
+    }
+
+    /// Une zone (navigateur ou non) qui joue la 2e piste d'une file de 3,
+    /// position serveur à 0 — ce que voit le serveur d'une zone navigateur.
+    async fn zone(type_de_sortie: &str, appareil: Option<&str>) -> (AppState, i64) {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let zid = ZoneRepo::with_backend(state.backend.clone())
+            .create("Cet ordinateur", Some(type_de_sortie), appareil)
+            .expect("zone");
+        let items: Vec<QueueInput> = ["a", "b", "c"]
+            .iter()
+            .map(|id| QueueInput::Streaming {
+                source: "qobuz".into(),
+                source_id: (*id).into(),
+                title: (*id).to_string(),
+                artist: "Fabien".into(),
+                album: None,
+                duration_ms: 197_000,
+                cover_url: None,
+                track_number: None,
+                disc_number: None,
+                album_ref: None,
+            })
+            .collect();
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zid, &items)
+            .expect("file");
+        state
+            .playback
+            .play(
+                zid,
+                NowPlaying {
+                    title: "b".into(),
+                    source: "qobuz".into(),
+                    source_id: Some("b".into()),
+                    duration_ms: 197_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        state.playback.update_queue_info(zid, 1, 3).await;
+        (state, zid)
+    }
+
+    async fn appui(state: &AppState, zid: i64, corps: Option<i64>) -> serde_json::Value {
+        let corps = corps.map(|ms| super::PrecedentRequest {
+            position_ms: Some(ms),
+        });
+        let r = super::previous(State(state.clone()), Path(zid), CorpsJsonOptionnel(corps))
+            .await
+            .into_response();
+        let o = axum::body::to_bytes(r.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&o).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sur_une_zone_navigateur_le_premier_appui_relance_puis_le_second_recule() {
+        let (state, zid) = zone("browser", None).await;
+        let v = appui(&state, zid, Some(45_000)).await;
+        assert_eq!(
+            v["status"], "restarted",
+            "45 s dans la piste : relance, pas recul : {v}"
+        );
+        // Second appui dans les 6 s (#1929) : on recule, quelle que soit la
+        // position annoncée.
+        let v = appui(&state, zid, Some(1_000)).await;
+        assert_eq!(v["status"], "playing", "{v}");
+        assert_eq!(v["queue_position"], 0, "{v}");
+    }
+
+    #[tokio::test]
+    async fn sans_position_du_client_le_comportement_est_celui_d_avant() {
+        let (state, zid) = zone("browser", None).await;
+        let v = appui(&state, zid, None).await;
+        assert_eq!(v["status"], "playing", "{v}");
+        assert_eq!(v["queue_position"], 0, "{v}");
+    }
+
+    #[tokio::test]
+    async fn une_zone_avec_sortie_ignore_la_position_du_client() {
+        let (state, zid) = zone("mock", Some("sortie-essai")).await;
+        let v = appui(&state, zid, Some(45_000)).await;
+        assert_eq!(
+            v["status"], "playing",
+            "la position relevée (0) fait foi : {v}"
+        );
+        assert_eq!(v["queue_position"], 0, "{v}");
     }
 }

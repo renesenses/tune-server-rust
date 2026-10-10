@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 use super::traits::{
-    MediaDuTransport, OutputCapabilities, OutputSignalPathStatus, OutputStatus, OutputTarget,
-    PlayMedia, SuivantePreparee, TransportState,
+    AnnonceSuivante, MediaDuTransport, OutputCapabilities, OutputSignalPathStatus, OutputStatus,
+    OutputTarget, PlayMedia, SuivantePreparee, TransportState,
 };
 
 #[derive(Debug, Clone)]
@@ -63,9 +63,27 @@ pub struct MockOutput {
     /// #3967 — le `Next` fait-il VRAIMENT avancer l'appareil ? Un renderer qui
     /// acquitte `Next` sans bouger est le cas que le repli doit rattraper.
     bascule_honoree: Arc<AtomicBool>,
+    /// #4382 — `media_du_transport` rend `None` (transport qui ne publie
+    /// pas `GetMediaInfo`) : la lecture est comptée, sans contenu.
+    transport_muet: Arc<AtomicBool>,
     /// Fil 1915 — le constat que la sortie remet au sondeur par
     /// `take_output_failure` (une seule fois, comme les vraies sorties).
     echec: Arc<std::sync::Mutex<Option<String>>>,
+    /// #5574 — armé, `play_media` REFUSE avec ce motif et l'appareil garde
+    /// l'URI qu'il tenait : le renderer DLNA qui acquitte Play mais tient
+    /// encore l'ancien flux, vu depuis l'orchestrateur.
+    refus_de_lecture: Arc<std::sync::Mutex<Option<String>>>,
+    /// Fil 2095 — chaque `seek` reçu, dans l'ordre, refusé ou non.
+    seek_calls: Arc<std::sync::Mutex<Vec<u64>>>,
+    /// Fil 2095 — armé, `seek` REFUSE avec ce motif (renderer qui répond
+    /// 701 « Transition not available ») et la position ne bouge pas.
+    refus_de_seek: Arc<std::sync::Mutex<Option<String>>>,
+    /// #3967 — ce que le SCPD de l'appareil dit de `SetNextAVTransportURI`.
+    /// Défaut `Inconnue` : l'armement d'avant, pour tous les témoins écrits.
+    annonce_suivante: Arc<std::sync::Mutex<AnnonceSuivante>>,
+    /// #3967 — armé, `set_next_media` REFUSE avec ce motif (faute SOAP 401
+    /// d'un renderer qui n'implémente pas l'action). L'appel est compté.
+    refus_de_set_next: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl MockOutput {
@@ -93,8 +111,43 @@ impl MockOutput {
             bascule_calls: Arc::new(AtomicU64::new(0)),
             media_du_transport_calls: Arc::new(AtomicU64::new(0)),
             bascule_honoree: Arc::new(AtomicBool::new(true)),
+            transport_muet: Arc::new(AtomicBool::new(false)),
             echec: Arc::new(std::sync::Mutex::new(None)),
+            refus_de_lecture: Arc::new(std::sync::Mutex::new(None)),
+            seek_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            refus_de_seek: Arc::new(std::sync::Mutex::new(None)),
+            annonce_suivante: Arc::new(std::sync::Mutex::new(AnnonceSuivante::Inconnue)),
+            refus_de_set_next: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// #3967 — ce que l'appareil annoncera de `SetNextAVTransportURI`.
+    pub fn annoncer_la_suivante(&self, annonce: AnnonceSuivante) {
+        *self.annonce_suivante.lock().unwrap() = annonce;
+    }
+
+    /// #3967 — faire refuser (ou de nouveau accepter, `None`) les
+    /// `set_next_media` suivants.
+    pub fn refuser_le_set_next(&self, motif: Option<&str>) {
+        *self.refus_de_set_next.lock().unwrap() = motif.map(str::to_string);
+    }
+
+    /// Fil 2095 — faire refuser (ou de nouveau accepter, `None`) les `seek`
+    /// suivants. Le refus est compté comme un appel.
+    pub fn refuser_le_seek(&self, motif: Option<&str>) {
+        *self.refus_de_seek.lock().unwrap() = motif.map(str::to_string);
+    }
+
+    /// Fil 2095 — les cibles des `seek` reçus, dans l'ordre.
+    pub fn seek_calls(&self) -> Vec<u64> {
+        self.seek_calls.lock().unwrap().clone()
+    }
+
+    /// #5574 — faire refuser (ou de nouveau accepter, `None`) les `play_media`
+    /// suivants. Le refus est compté comme un appel, et l'URI tenue ne change
+    /// pas.
+    pub fn refuser_la_lecture(&self, motif: Option<&str>) {
+        *self.refus_de_lecture.lock().unwrap() = motif.map(str::to_string);
     }
 
     /// Poser (ou retirer) le contrat de signal publié par la sortie (#4559).
@@ -255,6 +308,11 @@ impl MockOutput {
         self.bascule_honoree.store(honoree, Ordering::Relaxed);
     }
 
+    /// #4382 — le transport cesse de dire ce qu'il joue et ce qu'il tient.
+    pub fn transport_muet(&self, muet: bool) {
+        self.transport_muet.store(muet, Ordering::Relaxed);
+    }
+
     /// Fil 1915 — poser un constat sur le canal `take_output_failure`.
     pub fn poser_echec(&self, constat: &str) {
         *self.echec.lock().unwrap() = Some(constat.to_string());
@@ -310,6 +368,14 @@ impl OutputTarget for MockOutput {
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        let refus = self.refus_de_lecture.lock().unwrap().clone();
+        if let Some(motif) = refus {
+            self.play_calls.lock().await.push(PlayCall {
+                url: media.url.to_string(),
+                title: media.title.map(String::from),
+            });
+            return Err(motif);
+        }
         *self.state.lock().await = TransportState::Playing;
         *self.current_uri.lock().await = Some(media.url.to_string());
         self.position_ms.store(0, Ordering::Relaxed);
@@ -339,6 +405,11 @@ impl OutputTarget for MockOutput {
     }
 
     async fn seek(&self, position_ms: u64) -> Result<(), String> {
+        self.seek_calls.lock().unwrap().push(position_ms);
+        let refus = self.refus_de_seek.lock().unwrap().clone();
+        if let Some(motif) = refus {
+            return Err(motif);
+        }
         self.position_ms.store(position_ms, Ordering::Relaxed);
         if self.seek_laisse_en_pause.load(Ordering::Relaxed) {
             *self.state.lock().await = TransportState::Paused;
@@ -392,12 +463,20 @@ impl OutputTarget for MockOutput {
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        *self.next_uri.lock().await = Some(media.url.to_string());
         self.set_next_calls.lock().await.push(PlayCall {
             url: media.url.to_string(),
             title: media.title.map(String::from),
         });
+        let refus = self.refus_de_set_next.lock().unwrap().clone();
+        if let Some(motif) = refus {
+            return Err(motif);
+        }
+        *self.next_uri.lock().await = Some(media.url.to_string());
         Ok(())
+    }
+
+    async fn annonce_la_suivante(&self) -> AnnonceSuivante {
+        *self.annonce_suivante.lock().unwrap()
     }
 
     async fn suivante_preparee(&self, url: &str) -> SuivantePreparee {
@@ -434,6 +513,9 @@ impl OutputTarget for MockOutput {
     async fn media_du_transport(&self) -> Option<MediaDuTransport> {
         self.media_du_transport_calls
             .fetch_add(1, Ordering::Relaxed);
+        if self.transport_muet.load(Ordering::Relaxed) {
+            return None;
+        }
         Some(MediaDuTransport {
             courante: self.current_uri.lock().await.clone(),
             suivante: self.next_uri.lock().await.clone(),

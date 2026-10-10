@@ -8,6 +8,10 @@
 //! pour muet et le reste du lot n'est plus lu. « Arrêter » est regardé pendant
 //! l'attente, toutes les [`TRANCHE_ATTENTE`].
 //!
+//! Le fil de lecture hérite du contexte tokio de l'appelant : une lecture qui
+//! touche la base (la règle de pochette) doit pouvoir joindre le runtime sur
+//! PostgreSQL.
+//!
 //! Un appel système bloqué ne s'interrompt pas : le fil qui le porte est
 //! abandonné et rendra la main quand le noyau la lui rendra. Sa réponse
 //! tardive tombe dans un canal fermé, sans effet.
@@ -47,9 +51,17 @@ pub(crate) fn lire_avec_delai<T: Send + 'static>(
     arret: &dyn Fn() -> bool,
 ) -> Lecture<T> {
     let (tx, rx) = mpsc::sync_channel(1);
+    // Le contexte tokio de l'appelant, transmis au fil de lecture : le
+    // backend PostgreSQL rejoint le runtime par `Handle::current()`, qui
+    // panique (« there is no reactor running ») sur un fil brut. Sans lui, la
+    // règle de pochette (`suivre_la_piste`), qui écrit en base depuis ce fil,
+    // paniquait à chaque album sur PostgreSQL et la pochette n'était pas
+    // suivie. SQLite n'en a pas besoin ; hors runtime, rien n'est transmis.
+    let runtime = tokio::runtime::Handle::try_current().ok();
     let lance = std::thread::Builder::new()
         .name(format!("scan-{quoi}"))
         .spawn(move || {
+            let _contexte = runtime.as_ref().map(|h| h.enter());
             let _ = tx.send(lire());
         });
     if let Err(e) = lance {
@@ -256,4 +268,49 @@ pub(crate) fn lire_metadonnees_du_lot(
         "scan_extended_metadata_complete"
     );
     Some(resultat)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Le fil de lecture joint le runtime de l'appelant comme le fait le
+    /// backend PostgreSQL (`block_in_place` + `Handle::current().block_on`).
+    /// Sans le contexte transmis, ce fil paniquait (« there is no reactor
+    /// running ») et la lecture rendait `Echouee`.
+    #[test]
+    fn le_fil_de_lecture_porte_le_runtime_de_l_appelant() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let lu = rt.block_on(async {
+            tokio::task::spawn_blocking(|| {
+                lire_avec_delai(
+                    "test",
+                    || {
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async { 42 })
+                        })
+                    },
+                    Duration::from_secs(10),
+                    &|| false,
+                )
+            })
+            .await
+            .expect("spawn_blocking")
+        });
+        assert!(
+            matches!(lu, Lecture::Lue(42)),
+            "la lecture bornée doit joindre le runtime de l'appelant (PostgreSQL)"
+        );
+    }
+
+    /// Hors runtime, la lecture reste possible (SQLite, outils).
+    #[test]
+    fn hors_runtime_la_lecture_reste_possible() {
+        let lu = lire_avec_delai("test", || 7, Duration::from_secs(10), &|| false);
+        assert!(matches!(lu, Lecture::Lue(7)));
+    }
 }

@@ -21,8 +21,10 @@ mod premium_audio_host;
 pub use tune_streaming_http::deezer_proxy_handler;
 pub mod developer_api;
 pub mod devices;
+pub mod diag_qobuz;
 pub mod digest;
 pub mod discogs;
+pub(crate) mod ecriture_fichiers;
 pub mod eq_pro;
 pub mod export;
 pub(crate) mod filtre_sources;
@@ -61,7 +63,6 @@ pub mod party;
 pub mod peers;
 pub mod playback;
 pub mod playlist_manager;
-pub mod playlist_transfer;
 pub mod playlists;
 pub mod plugins;
 pub mod podcasts;
@@ -291,7 +292,7 @@ async fn api_fallback(
 
 /// Minimal HTML-entity escaping for untrusted text reflected into a page on the
 /// server's own origin. Order matters: `&` first so we don't double-escape.
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -394,7 +395,8 @@ pub fn router_with_plugins(
     state: AppState,
     plugin_routers: crate::plugins::PluginRouters,
 ) -> Router {
-    let contexte_sendspin = sendspin::ContexteSendspin::pour_base(&state.config.db_path);
+    let contexte_sendspin = sendspin::ContexteSendspin::pour_base(&state.config.db_path)
+        .avec_zones(sendspin::RaccordZones::depuis_etat(&state));
     let streamer_sessions = state.streamer.sessions_state();
 
     let web_dir = crate::config::resolve_web_dir()
@@ -433,7 +435,12 @@ pub fn router_with_plugins(
         .nest("/alarms", radios::alarms_router())
         .nest("/search", search::router())
         .nest("/devices", devices::router())
-        .nest("/streaming", streaming::router())
+        // #5530 — sonde de diagnostic, réservée à l'administrateur : l'arbre
+        // des clés de `album/get` / `track/get`, sans leurs valeurs.
+        .nest(
+            "/streaming",
+            streaming::router().route("/qobuz/debug/raw-keys", get(diag_qobuz::cles_brutes)),
+        )
         .nest("/profiles", profiles::router())
         .nest("/tags", tags::router())
         .nest("/metadata", metadata::router())
@@ -455,7 +462,6 @@ pub fn router_with_plugins(
         // it mounts at /api/v1/ext/dj. The stock server no longer serves /dj.
         .nest("/party", party::router())
         .nest("/playlist-manager", playlist_manager::router())
-        .nest("/playlist-transfer", playlist_transfer::router())
         .nest("/zone-manager", zone_manager::router())
         .nest("/snapcast", snapcast::router())
         .nest("/sonos", sonos::router())
@@ -575,7 +581,12 @@ pub fn router_with_plugins(
             state.clone(),
             analytics_middleware,
         ))
-        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024));
+        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
+        // #5677 : le relevé d'un gel dit quelle route calcule sur un fil de
+        // travail pris (gabarit seulement, jamais l'URL).
+        .layer(axum::middleware::from_fn(
+            crate::gel_executeur::travailleurs::surveiller_les_polls,
+        ));
 
     // UPnP MediaServer routes (ContentDirectory / ConnectionManager)
     let upnp_routes = state

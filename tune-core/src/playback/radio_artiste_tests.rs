@@ -545,6 +545,7 @@ impl StreamingService for ServiceSimule {
             return Ok(Vec::new());
         }
         let album = |id: &str, artiste: &str, artiste_id: Option<&str>| StreamAlbum {
+            ai_generated: None,
             id: id.into(),
             title: format!("Titre {id}"),
             artist: artiste.into(),

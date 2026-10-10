@@ -7,12 +7,15 @@ mod admin;
 pub use admin::peers_payload;
 mod backup;
 mod config;
+// Fil 2145 : « Oublier ce partage » retire ses racines par le MEME chemin.
+pub(crate) use config::{pistes_qui_partiraient, retirer_un_dossier};
 mod config_backup;
 mod convert;
 mod database;
 #[cfg(test)]
 mod diagnostic_sans_ecrivain_tests;
 pub(crate) mod diagnostics;
+pub(crate) mod sauvegarde_cloud;
 // `pub(crate)` depuis #2507 : `enrich::QuotaDuJour` est la lecture unique du
 // compteur journalier, et les essais de `routes/library/artwork.rs` la lisent
 // pour épuiser le quota comme le serveur le compte.
@@ -107,6 +110,12 @@ pub fn router() -> Router<AppState> {
         // L'écran Santé affichait `IDLE` pendant des heures de balayage faute
         // de cette route.
         .route("/replaygain/progress", get(replaygain::replaygain_progress))
+        // #5882 — refaire, sur demande, les mesures prises avant le correctif
+        // du vrai pic. Le `POST` rend les mesures périmées à la passe, par lots.
+        .route(
+            "/replaygain/reanalyze",
+            get(replaygain::replaygain_reanalyze_status).post(replaygain::replaygain_reanalyze),
+        )
         // #4185 — la plage dynamique n'avait AUCUN geste : sa mesure était le
         // troisième rang de la cascade de fond, après le ReplayGain et les
         // empreintes. Le `POST` la lance tout de suite (202 / 409), le `GET`
@@ -175,6 +184,7 @@ pub fn router() -> Router<AppState> {
             post(config::purge_orphan_tracks),
         )
         .route("/browse-dirs", get(config::browse_dirs))
+        .route("/browse-dirs/estimate", get(config::estimate_dir))
         .route("/env", get(config::get_env))
         .route("/diagnostics", get(diagnostics::diagnostics))
         .route("/cleanup", post(enrich::cleanup))
@@ -228,6 +238,10 @@ pub fn router() -> Router<AppState> {
         .route("/discover-servers", get(admin::discover_servers))
         .route("/config/export", get(config::export_config))
         .route("/config/import", post(config::import_config))
+        .route(
+            "/config/import/preview",
+            post(config::preview_import_config),
+        )
         // Import routes
         //
         // #3914 : l'écran d'import TÉLÉVERSE un fichier (`multipart/form-data`,
@@ -332,7 +346,8 @@ pub fn router() -> Router<AppState> {
             "/playlist-hub/{hub_id}/transfer",
             post(playlist_hub::transfer),
         )
-        // Cloud config backup — full server config export/import/push/pull.
+        // Config backup — full server config export/import (the cloud copy is
+        // `/config-backup/cloud/*` below).
         // GET export omits streaming tokens; POST takes the passphrase and
         // returns them sealed (audit item 7).
         .route(
@@ -346,11 +361,28 @@ pub fn router() -> Router<AppState> {
                 .post(config_backup::set_passphrase)
                 .put(config_backup::change_passphrase),
         )
-        .route("/config-backup/cloud-push", post(config_backup::cloud_push))
-        .route("/config-backup/cloud-pull", post(config_backup::cloud_pull))
+        // Sauvegarde cloud AUTOMATIQUE et tournante des personnalisations,
+        // chiffrée avant l'envoi, restaurable sur une machine neuve (#5654).
+        .route("/config-backup/cloud/status", get(sauvegarde_cloud::status))
         .route(
-            "/config-backup/cloud-status",
-            get(config_backup::cloud_status),
+            "/config-backup/cloud/enable",
+            post(sauvegarde_cloud::enable),
+        )
+        .route(
+            "/config-backup/cloud/disable",
+            post(sauvegarde_cloud::disable),
+        )
+        .route(
+            "/config-backup/cloud/backup-now",
+            post(sauvegarde_cloud::backup_now),
+        )
+        .route(
+            "/config-backup/cloud/snapshots",
+            get(sauvegarde_cloud::snapshots),
+        )
+        .route(
+            "/config-backup/cloud/restore",
+            post(sauvegarde_cloud::restore),
         )
         // Weekly digest — new releases from library artists
         .route("/new-releases", get(new_releases_handler))

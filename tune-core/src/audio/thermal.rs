@@ -137,10 +137,11 @@ impl ThermalGate {
 /// Un relevé de température lu dans sysfs : la puce ou la zone qui l'expose,
 /// l'étiquette du capteur quand il en a une, et la valeur en °C.
 ///
-/// La lecture est UNE (`lire_capteurs`) ; ce sont les deux consommateurs qui
-/// choisissent différemment dans les mêmes relevés : le garde prend le point le
-/// plus chaud des `hwmon`, l'écran « État du serveur » veut le paquet CPU
-/// (#5189).
+/// La lecture est UNE (`lire_capteurs`), le capteur du paquet CPU aussi
+/// (`temperature_paquet_cpu`) : le garde et l'écran « État du serveur » lisent
+/// tous deux le processeur d'abord (#5189). Ils ne diffèrent que par leur repli
+/// quand aucune sonde CPU n'existe : le maximum des `hwmon` pour le garde, le
+/// maximum de toutes les zones pour l'écran.
 #[derive(Debug, Clone, PartialEq)]
 struct Releve {
     /// Nom de la puce `hwmon` (`coretemp`, `k10temp`, `nvme`…) ou type de la
@@ -222,16 +223,28 @@ fn maximum<'a>(releves: impl Iterator<Item = &'a Releve>) -> Option<f64> {
     releves.map(|r| r.celsius).reduce(f64::max)
 }
 
-/// Le choix du GARDE : le point le plus chaud des `hwmon`.
+/// Le REPLI du garde, quand aucune sonde CPU n'est reconnue : le point le plus
+/// chaud des `hwmon`.
 ///
-/// On prend le **maximum** des capteurs plutôt qu'un capteur nommé : les noms
-/// varient d'une plateforme à l'autre (`coretemp` sur Intel, `k10temp` sur
-/// AMD, `cpu_thermal` sur Raspberry Pi, `soc_thermal` sur bien des SBC) et un
-/// serveur audio tourne sur tout ça. Le maximum est aussi la grandeur qui
-/// décide : c'est le point le plus chaud qui éteint une machine, pas la
-/// moyenne.
+/// Les noms de puces varient d'une plateforme à l'autre (`soc_thermal` sur
+/// bien des SBC, puces de cartes exotiques) et un serveur audio tourne sur tout
+/// ça : sans capteur CPU identifiable, le maximum reste la grandeur prudente.
 fn plus_chaud_hwmon(releves: &[Releve]) -> Option<f64> {
     maximum(releves.iter().filter(|r| r.hwmon))
+}
+
+/// Le choix du GARDE (#5189) : la température du processeur quand une sonde
+/// CPU existe — la même que l'écran affiche —, sinon le point le plus chaud
+/// des `hwmon`.
+///
+/// Prendre le maximum de toutes les puces faisait décider le garde sur le GPU
+/// intégré (`amdgpu`), un NVMe ou un disque (`drivetemp`) : sur un AMD
+/// GX-222GC sans ventilateur, `amdgpu` à 80,0 °C suspendait les analyses
+/// alors que `k10temp` lisait 79,4 °C. Les analyses chargent le CPU ; c'est
+/// lui que le garde surveille. Dès qu'une sonde CPU existe, aucune autre puce
+/// n'entre donc dans la décision.
+fn temperature_garde(releves: &[Releve]) -> Option<f64> {
+    temperature_paquet_cpu(releves).or_else(|| plus_chaud_hwmon(releves))
 }
 
 /// Capteurs qui mesurent le paquet CPU, par ordre de préférence (#5189).
@@ -257,9 +270,9 @@ fn rang_etiquette(etiquette: Option<&str>) -> u8 {
     }
 }
 
-/// Le choix de l'ÉCRAN : le paquet CPU quand un capteur le désigne, sinon le
-/// maximum de toutes les zones lues. `None` sans aucun capteur.
-fn choisir_temperature_processeur(releves: &[Releve]) -> Option<f64> {
+/// Le paquet CPU, quand un capteur de `CAPTEURS_PAQUET_CPU` le désigne ;
+/// `None` si aucune sonde CPU n'est reconnue. Partagé par le garde et l'écran.
+fn temperature_paquet_cpu(releves: &[Releve]) -> Option<f64> {
     for nom in CAPTEURS_PAQUET_CPU {
         let puce: Vec<&Releve> = releves.iter().filter(|r| r.capteur == *nom).collect();
         let Some(meilleur) = puce
@@ -274,13 +287,19 @@ fn choisir_temperature_processeur(releves: &[Releve]) -> Option<f64> {
                 .filter(|r| rang_etiquette(r.etiquette.as_deref()) == meilleur),
         );
     }
-    maximum(releves.iter())
+    None
 }
 
-/// Température CPU la plus élevée exposée par le système, en °C (garde).
+/// Le choix de l'ÉCRAN : le paquet CPU quand un capteur le désigne, sinon le
+/// maximum de toutes les zones lues. `None` sans aucun capteur.
+fn choisir_temperature_processeur(releves: &[Releve]) -> Option<f64> {
+    temperature_paquet_cpu(releves).or_else(|| maximum(releves.iter()))
+}
+
+/// Température sur laquelle le garde décide, en °C : le processeur d'abord.
 #[cfg(target_os = "linux")]
 fn cpu_temp_celsius() -> Option<f64> {
-    plus_chaud_hwmon(&lire_capteurs(std::path::Path::new("/sys")))
+    temperature_garde(&lire_capteurs(std::path::Path::new("/sys")))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -290,8 +309,8 @@ fn cpu_temp_celsius() -> Option<f64> {
 
 /// Température du processeur à AFFICHER (#5189, écran « État du serveur »).
 ///
-/// Même lecture sysfs que le garde, autre choix : le capteur du paquet CPU
-/// quand il est identifiable, sinon le maximum des zones. `None` sans capteur
+/// Même lecture sysfs et même capteur CPU que le garde ; seul le repli
+/// diffère : sans capteur CPU identifiable, le maximum des zones. `None` sans capteur
 /// (macOS, Windows, conteneur ou machine virtuelle sans `/sys` peuplé).
 ///
 /// Lecture synchrone de fichiers sysfs : l'appelant asynchrone la passe par
@@ -429,9 +448,80 @@ mod tests {
         choisir_temperature_processeur(&lire_capteurs(racine))
     }
 
+    fn garde(racine: &std::path::Path) -> Option<f64> {
+        temperature_garde(&lire_capteurs(racine))
+    }
+
+    /// Le cas du testeur (AMD GX-222GC sans ventilateur, forum fil 1972) :
+    /// le GPU intégré à 80,0 °C, le CPU à 79,4 °C. Le garde décide sur le CPU,
+    /// donc les analyses continuent.
+    #[test]
+    fn garde_amd_ignore_le_gpu_integre() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        puce(r, 0, "amdgpu", &[(1, "80000", Some("edge"))]);
+        puce(r, 1, "k10temp", &[(1, "79375", None)]);
+        assert_eq!(garde(r), Some(79.375));
+        let mut g = ThermalGate::new();
+        assert_eq!(
+            g.decide(garde(r)),
+            Verdict::Go {
+                temp_c: Some(79.375),
+                leaving: false
+            },
+            "le GPU intégré (amdgpu 80 °C) ne doit pas suspendre les analyses"
+        );
+        // Et le CPU au seuil, lui, les suspend toujours.
+        std::fs::write(r.join("class/hwmon/hwmon1/temp1_input"), "80000\n").unwrap();
+        assert!(matches!(g.decide(garde(r)), Verdict::Hold { .. }));
+    }
+
+    #[test]
+    fn garde_intel_coretemp_ignore_nvme_et_drivetemp() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        puce(
+            r,
+            0,
+            "coretemp",
+            &[
+                (1, "61000", Some("Package id 0")),
+                (2, "59000", Some("Core 0")),
+            ],
+        );
+        puce(r, 1, "nvme", &[(1, "84850", Some("Composite"))]);
+        puce(r, 2, "drivetemp", &[(1, "82000", None)]);
+        puce(r, 3, "nouveau", &[(1, "90000", None)]);
+        assert_eq!(garde(r), Some(61.0));
+    }
+
+    #[test]
+    fn garde_raspberry_pi_cpu_thermal() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        puce(r, 0, "rpi_volt", &[]);
+        puce(r, 1, "cpu_thermal", &[(1, "66200", None)]);
+        puce(r, 2, "drivetemp", &[(1, "81000", None)]);
+        assert_eq!(garde(r), Some(66.2));
+    }
+
+    /// Repli : aucune sonde CPU reconnue → le maximum des `hwmon`, quelles
+    /// qu'elles soient. Un garde qui n'a que le GPU ou le disque pour mesurer
+    /// s'en sert plutôt que de travailler à l'aveugle.
+    #[test]
+    fn garde_sans_sonde_cpu_retombe_sur_le_maximum_des_hwmon() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        puce(r, 0, "soc_thermal", &[(1, "64000", None)]);
+        puce(r, 1, "amdgpu", &[(1, "81000", None)]);
+        zone(r, 0, "acpitz", "95000");
+        assert_eq!(garde(r), Some(81.0));
+        assert_eq!(garde(&r.join("absent")), None);
+    }
+
     /// Machine Intel typique : un NVMe et la zone ACPI plus chauds que le
-    /// paquet. L'écran doit montrer le PAQUET, pas le maximum — et le garde,
-    /// lui, garde son maximum des `hwmon`, inchangé.
+    /// paquet. L'écran doit montrer le PAQUET, pas le maximum — et le garde
+    /// décide lui aussi sur le paquet, pas sur le NVMe.
     #[test]
     fn intel_affiche_le_paquet_et_pas_le_nvme() {
         let t = tempfile::tempdir().unwrap();
@@ -449,7 +539,7 @@ mod tests {
         puce(r, 2, "nvme", &[(1, "71850", Some("Composite"))]);
         zone(r, 0, "acpitz", "27800");
         assert_eq!(affichee(r), Some(52.0));
-        assert_eq!(plus_chaud_hwmon(&lire_capteurs(r)), Some(71.85));
+        assert_eq!(garde(r), Some(52.0));
     }
 
     /// Contre-épreuve : sans puce CPU reconnaissable (machine virtuelle,
@@ -462,8 +552,9 @@ mod tests {
         puce(r, 0, "nvme", &[(1, "41000", None)]);
         zone(r, 0, "acpitz", "47500");
         assert_eq!(affichee(r), Some(47.5));
-        // Et la zone ne fait PAS bouger le garde : il ne lit que les hwmon.
-        assert_eq!(plus_chaud_hwmon(&lire_capteurs(r)), Some(41.0));
+        // Et la zone ne fait PAS bouger le garde : son repli ne lit que les
+        // hwmon, NVMe compris faute de mieux.
+        assert_eq!(garde(r), Some(41.0));
     }
 
     #[test]

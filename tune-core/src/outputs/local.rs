@@ -1,3 +1,4 @@
+mod boucle_locale_5639;
 mod lecture_http;
 use lecture_http::LecteurHttpAnnulable;
 
@@ -1039,6 +1040,18 @@ impl LocalOutput {
         self.volume.clone()
     }
 
+    /// #4384 — ce que cette sortie DEMANDE avant le rabot à l'unité
+    /// d'[`effective_volume_units`] : ses propres `Arc` (volume utilisateur,
+    /// facteur de rendu, bascule DoP), relus à chaque appel. Voir
+    /// `PlaybackManager::gain_demande_units`.
+    pub fn gain_demande(&self) -> crate::playback::GainDemande {
+        crate::playback::GainDemande {
+            volume_utilisateur: self.user_volume.clone(),
+            facteur_de_rendu: self.rg_factor.clone(),
+            dop: self.dop_active.clone(),
+        }
+    }
+
     /// Create a new `LocalOutput` with explicit exclusive-mode control.
     pub fn new_with_exclusive(device_name: String, exclusive_mode: bool) -> Self {
         Self::with_options(device_name, exclusive_mode, "auto")
@@ -1185,16 +1198,58 @@ impl LocalOutput {
     /// interrupteur de compensation basculé ensuite passe par le volume seul
     /// (`recalculer_la_compensation` divise par ce qui est porté), sans rien
     /// changer à ce qui est déjà dans l'anneau.
+    ///
+    /// #5215 (lot eq-niveau) — l'égaliseur ne porte que la part que le
+    /// volume COURANT peut rendre, `min(compensation, 1 / (volume ×
+    /// ReplayGain × compensation du crossfeed))`. Le reste, raboté à l'unité,
+    /// n'est de toute façon pas rendu. Porter TOUT faisait descendre le volume
+    /// de ce qui était porté (`effective_volume_units` divise par la part
+    /// portée) : à 100 %, couper l'égaliseur remontait alors le volume AU
+    /// RAPPEL, d'un coup, pendant que l'anneau jouait encore les échantillons
+    /// de l'égaliseur — une marche de toute la compensation, avant le fondu de
+    /// `prendre_la_releve`, qui lui ne voyait rien bouger. Ainsi borné, le
+    /// volume effectif ne dépend plus de la présence de l'égaliseur au volume
+    /// d'installation : la bascule entière tient dans le fondu.
     fn faire_porter_la_compensation(&self, eq: &mut Option<super::super::audio::eq::EqProcessor>) {
         if let Some(p) = eq.as_mut() {
             let facteur = if self.compensation_de_niveau.load(Ordering::Relaxed)
                 && !self.pure_bypass.load(Ordering::Relaxed)
             {
-                10.0_f64.powf(-p.gain_moyen_db() / 20.0)
+                10.0_f64
+                    .powf(-p.gain_moyen_db() / 20.0)
+                    .min(self.marge_du_volume_hors_egaliseur())
             } else {
                 1.0
             };
             p.porter_la_compensation(facteur);
+        }
+    }
+
+    /// #5215 — ce que le rabot à l'unité laisse encore passer, en linéaire,
+    /// une fois appliqués le volume (celui d'avant la sourdine si elle est
+    /// mise), le ReplayGain et la compensation du crossfeed installé :
+    /// `1 / produit`, infini à volume nul.
+    fn marge_du_volume_hors_egaliseur(&self) -> f64 {
+        let volume = if self.muted.load(Ordering::SeqCst) {
+            self.pre_mute_volume.load(Ordering::SeqCst)
+        } else {
+            self.user_volume.load(Ordering::SeqCst)
+        };
+        let crossfeed_db = self
+            .crossfeed
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|p| p.gain_moyen_db()))
+            .filter(|db| db.is_finite())
+            .unwrap_or(0.0);
+        let produit = f64::from(volume) / 1000.0
+            * f64::from(self.replaygain_seul.load(Ordering::SeqCst))
+            / 1000.0
+            * 10.0_f64.powf(-crossfeed_db / 20.0);
+        if produit > 0.0 {
+            1.0 / produit
+        } else {
+            f64::INFINITY
         }
     }
 
@@ -1381,6 +1436,21 @@ impl LocalOutput {
     /// côté de `set_pure_bypass`.
     pub fn set_strict_bitperfect(&self, strict: bool) {
         self.strict_bitperfect.store(strict, Ordering::Relaxed);
+    }
+
+    /// #5643 — cette sortie prend-elle le bras ASIO exclusif de `play_url` ?
+    /// La MÊME règle que le fil de lecture (`bras_de_cette_plateforme`) :
+    /// l'orchestrateur ne peut pas promettre du DSD natif à une sortie qui
+    /// ouvrirait WASAPI ou le chemin partagé. Toujours faux hors Windows.
+    pub fn sort_par_asio_exclusif(&self) -> bool {
+        enchainement_exclusif::bras_de_cette_plateforme(self.exclusive_mode, &self.audio_backend)
+            == enchainement_exclusif::BrasDeLecture::AsioExclusif
+    }
+
+    /// #5643 — le nom du périphérique, tel que la sortie l'ouvrira (la clé de
+    /// la capacité DSD sondée, `outputs::capacite_dsd_natif`).
+    pub fn nom_du_peripherique(&self) -> &str {
+        &self.device_name
     }
 
     #[cfg(test)]
@@ -1996,7 +2066,18 @@ impl CompressedDecodeFailure {
 ///
 /// Rend `Err(motif)` plutôt que `None` : l'appelant doit pouvoir DIRE pourquoi
 /// il s'arrête (#3270), et un `Option` ne portait rien à dire.
-fn decode_compressed_stream(data: &[u8]) -> Result<(u16, u32, Vec<f32>), CompressedDecodeFailure> {
+///
+/// `Ok(None)` : un arrêt est tombé PENDANT le décodage (#4295, fil 2006).
+/// `arret` est le `force_silent` de la lecture, relu à chaque paquet. Ce n'est
+/// pas un échec : rien n'est à dire à l'écran. Avant, la boucle décodait la
+/// piste ENTIÈRE quoi qu'il arrive : `stop()` attendait 2 000 ms, détachait le
+/// fil (`local_audio_stop_thread_detached`), puis `play_url` attendait encore
+/// 1 500 ms le PCM qu'il tenait (`local_audio_ouverture_forcee_…`). Sur une
+/// machine lente, ces 3,5 s s'entendaient entre deux morceaux.
+fn decode_compressed_stream(
+    data: &[u8],
+    arret: &AtomicBool,
+) -> Result<Option<(u16, u32, Vec<f32>)>, CompressedDecodeFailure> {
     use std::io::Cursor;
     use symphonia::core::codecs::CodecParameters;
     use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -2041,6 +2122,13 @@ fn decode_compressed_stream(data: &[u8]) -> Result<(u16, u32, Vec<f32>), Compres
     let mut all_samples: Vec<f32> = Vec::new();
 
     loop {
+        if arret.load(Ordering::Relaxed) {
+            debug!(
+                samples = all_samples.len(),
+                "local_audio_decode_compressed_interrupted_by_stop"
+            );
+            return Ok(None);
+        }
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
             Ok(None) => break,
@@ -2073,7 +2161,7 @@ fn decode_compressed_stream(data: &[u8]) -> Result<(u16, u32, Vec<f32>), Compres
         "local_audio_decoded_compressed_stream"
     );
 
-    Ok((channels, sample_rate, all_samples))
+    Ok(Some((channels, sample_rate, all_samples)))
 }
 
 /// WAV format tag constants.
@@ -3412,7 +3500,20 @@ fn local_dsp_runtime_state(
         return OutputDspState::BypassedDop;
     }
     if pure_bypass.load(Ordering::Relaxed) {
-        return OutputDspState::BypassedPure;
+        // #4176 — dire si PURE contourne quelque chose. Un verrou
+        // empoisonné ne permet pas de l'affirmer : on garde alors le
+        // « contourné » d'avant, qui reste vrai.
+        let rien_d_arme = !mono_downmix.load(Ordering::Relaxed)
+            && eq
+                .lock()
+                .is_ok_and(|g| g.as_ref().is_none_or(|p| p.est_neutre_au_repos()))
+            && convolver.lock().is_ok_and(|g| g.is_none())
+            && crossfeed.lock().is_ok_and(|g| g.is_none());
+        return if rien_d_arme {
+            OutputDspState::PureSansObjet
+        } else {
+            OutputDspState::BypassedPure
+        };
     }
     // Le repli mono est une vraie transformation : il doit APPARAÎTRE dans le
     // verdict, sans quoi le panneau annoncerait un chemin intouché pendant que
@@ -3471,7 +3572,10 @@ fn windows_signal_path_status(
     match dsp {
         OutputDspState::Applied => reasons.push(OutputSignalReason::DspApplied),
         OutputDspState::Unknown => reasons.push(OutputSignalReason::DspStateUnknown),
-        OutputDspState::Inactive | OutputDspState::BypassedPure | OutputDspState::BypassedDop => {}
+        OutputDspState::Inactive
+        | OutputDspState::BypassedPure
+        | OutputDspState::PureSansObjet
+        | OutputDspState::BypassedDop => {}
     }
     if volume == OutputVolumeState::Applied {
         reasons.push(OutputSignalReason::SoftwareVolume);
@@ -4863,6 +4967,63 @@ impl OutputTarget for LocalOutput {
             // instead of waiting forever on a ring buffer nobody drains.
             let device_gone = Arc::new(AtomicBool::new(false));
 
+            // #5643 — un flux DSD brut : l'orchestrateur ne le sert qu'à une
+            // sortie ASIO exclusive dont le pilote déclare le DSD natif à la
+            // cadence du fichier. Reconnu AVANT le WAV, dont il n'a pas
+            // l'en-tête ; rien du chemin PCM ne le voit.
+            if let Some(entete) = crate::audio::dsd_brut::lire_entete(&header_buf) {
+                if !ouverture_encore_voulue(
+                    force_silent.load(Ordering::SeqCst),
+                    stop_rx.try_recv().is_ok(),
+                ) {
+                    if play_generation.load(Ordering::SeqCst) == my_generation {
+                        playing.store(false, Ordering::SeqCst);
+                    }
+                    return;
+                }
+                #[cfg(all(target_os = "windows", feature = "asio"))]
+                if enchainement_exclusif::bras_de_cette_plateforme(exclusive_mode, &audio_backend)
+                    == enchainement_exclusif::BrasDeLecture::AsioExclusif
+                {
+                    bras_asio::jouer_dsd_natif_via_asio(bras_asio::EntreesDsdNatif {
+                        device_name,
+                        url,
+                        entete,
+                        header_buf,
+                        reader,
+                        seek_offset,
+                        my_generation,
+                        paused,
+                        playing,
+                        force_silent,
+                        stop_rx,
+                        open_failure,
+                        position_ms,
+                        play_generation,
+                        track_ended_naturally,
+                        track_ended_generation,
+                        dop_active,
+                        chain_exhausted: chain_exhausted_ref,
+                    });
+                    return;
+                }
+                warn!(
+                    device = %device_name,
+                    cadence = entete.cadence,
+                    canaux = entete.canaux,
+                    "local_audio_dsd_natif_recu_sans_bras_asio"
+                );
+                if let Ok(mut slot) = open_failure.lock() {
+                    *slot = Some(format!(
+                        "« {device_name} » : flux DSD natif reçu, mais cette sortie n'est pas \
+                         un pilote ASIO exclusif."
+                    ));
+                }
+                force_silent.store(true, Ordering::SeqCst);
+                playing.store(false, Ordering::SeqCst);
+                return;
+            }
+
             // #5439 — un flux décodé en continu repart du début de la piste :
             // son seek passe par le saut d'octets du chemin PCM.
             let mut pre_seeked = pre_seeked;
@@ -4959,15 +5120,41 @@ impl OutputTarget for LocalOutput {
                 // #3270 : l'échec passe par `open_failure`, le canal que le
                 // sondeur draine. Un `return` nu laissait la zone s'arrêter
                 // sans que l'écran apprenne jamais pourquoi.
+                //
+                // #4295 (fil 2006) — le décodage relit `force_silent` à chaque
+                // paquet : un arrêt tombé ici rend la main tout de suite, au
+                // lieu de finir la piste entière pendant que `stop()` détache
+                // le fil et que la lecture suivante attend le périphérique.
                 let (dec_channels, dec_sample_rate, decoded_samples) =
-                    match decode_compressed_stream(&all_data) {
-                        Ok(decoded) => decoded,
+                    match decode_compressed_stream(&all_data, &force_silent) {
+                        Ok(Some(decoded)) => decoded,
                         Err(reason) => {
                             record_compressed_decode_failure(reason, &device_name, &open_failure);
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }
+                        Ok(None) => {
+                            if play_generation.load(Ordering::SeqCst) == my_generation {
+                                playing.store(false, Ordering::SeqCst);
+                            }
+                            return;
+                        }
                     };
+
+                // #4295 — même porte que le chemin PCM avant `ouvrir` : un
+                // arrêt reçu entre la fin du décodage et l'ouverture ne doit
+                // pas faire ouvrir le PCM `hw:` exclusif à un fil déjà
+                // congédié, pendant que la lecture suivante le réclame.
+                if !ouverture_encore_voulue(
+                    force_silent.load(Ordering::SeqCst),
+                    stop_rx.try_recv().is_ok(),
+                ) {
+                    debug!("local_audio_compressed_open_skipped_stop_received");
+                    if play_generation.load(Ordering::SeqCst) == my_generation {
+                        playing.store(false, Ordering::SeqCst);
+                    }
+                    return;
+                }
 
                 // Now play the decoded f32 samples using cpal shared mode
                 let dec_ch = dec_channels;
@@ -5381,6 +5568,11 @@ impl OutputTarget for LocalOutput {
                 let total_output_samples = samples.len() as u64;
                 let output_frames = total_output_samples / output_ch as u64;
                 let output_duration_ms = (output_frames as f64 / output_sr as f64 * 1000.0) as u64;
+                // Fil 2062 / #5550 — une piste arrivée sans durée prend celle que
+                // le décodeur vient de mesurer ; une durée connue reste.
+                if duration_ms_arc.load(Ordering::SeqCst) == 0 {
+                    duration_ms_arc.store(output_duration_ms + seek_offset, Ordering::SeqCst);
+                }
                 let mut fed_samples = initial_written as u64;
 
                 if initial_written < samples.len() {
@@ -6874,13 +7066,21 @@ impl PromotionDuFilDeRendu {
         let issue = crate::audio::ordonnancement_rt::demander_pour_le_fil_courant();
         journaliser_l_ordonnancement(&issue);
         note_realtime_scheduling(issue);
+        // Une fois par processus, hors du fil de rendu (lot audio-rt).
+        crate::audio::ordonnancement_rt::verrouiller_la_memoire_en_arriere_plan();
     }
 }
 
 /// La ligne de journal du ticket : obtenu ou refusé, et pourquoi. Une fois par
 /// fil de rendu, avant que la porte de préchargement ne laisse passer le son.
 fn journaliser_l_ordonnancement(issue: &crate::audio::ordonnancement_rt::OrdonnancementTempsReel) {
-    use crate::audio::ordonnancement_rt::OrdonnancementTempsReel;
+    use crate::audio::ordonnancement_rt::{OrdonnancementTempsReel, RepliNice};
+    // Une ligne par verdict et par processus : chaque réouverture du flux crée
+    // un fil de rendu neuf, qui ne doit pas répéter la même ligne.
+    if !crate::audio::ordonnancement_rt::premiere_fois(issue) {
+        debug!(?issue, "local_audio_realtime_scheduling — verdict inchangé");
+        return;
+    }
     match issue {
         OrdonnancementTempsReel::Obtenu {
             policy,
@@ -6896,11 +7096,29 @@ fn journaliser_l_ordonnancement(issue: &crate::audio::ordonnancement_rt::Ordonna
             priority,
             rlimit_rtprio,
             cause,
+            fallback: RepliNice::Obtenu { nice, rlimit_nice },
+        } => info!(
+            priority,
+            rlimit_rtprio = ?rlimit_rtprio,
+            cause = %cause,
+            nice,
+            rlimit_nice = ?rlimit_nice,
+            "local_audio_realtime_scheduling — SCHED_FIFO refusé, le fil de rendu reste en SCHED_OTHER à nice {nice} (#3206)"
+        ),
+        OrdonnancementTempsReel::Refuse {
+            priority,
+            rlimit_rtprio,
+            cause,
+            fallback,
         } => warn!(
             priority,
             rlimit_rtprio = ?rlimit_rtprio,
             cause = %cause,
-            "local_audio_realtime_scheduling — ordonnancement temps réel refusé, le fil de rendu reste en SCHED_OTHER (#3206)"
+            fallback = ?fallback,
+            "local_audio_realtime_scheduling — ordonnancement temps réel refusé, le fil de rendu reste en SCHED_OTHER, nice inchangé (#3206)"
+        ),
+        OrdonnancementTempsReel::Desactive => info!(
+            "local_audio_realtime_scheduling — TUNE_AUDIO_RT_PRIORITY=0 : rien demandé, le fil de rendu reste en SCHED_OTHER (#3206)"
         ),
         OrdonnancementTempsReel::SansObjet => {}
     }
@@ -7055,6 +7273,9 @@ mod cadence_du_flux_compresse;
 mod decodage_en_continu;
 #[cfg(test)]
 mod decodage_en_continu_5439;
+// #5550 — le même chemin, sur une source 24 bits : bit-perfect jusqu'au puits.
+#[cfg(test)]
+mod decodage_en_continu_24bits_5550;
 #[cfg(test)]
 mod flux_compresse_a_la_cadence_source_5439;
 
@@ -7144,6 +7365,10 @@ mod canaux_de_la_source_i3632;
 /// l'UPnP et les fichiers téléversés y passent sans transcodage WAV.
 #[cfg(test)]
 mod decode_failure_tests;
+// #4295 (fil 2006) — un arrêt pendant le décodage d'un flux compressé chargé
+// en entier rend la main au lieu de décoder toute la piste.
+#[cfg(test)]
+mod decodage_compresse_interrompu_4295;
 
 /// #3108 — « la zone reste figée à 2 s, sans message ».
 ///

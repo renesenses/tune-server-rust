@@ -791,9 +791,9 @@ mod tests {
 
         assert_ne!(fr["message"], en["message"]);
         assert_ne!(fr["message"], de["message"]);
-        // Sans en-tête, français — la langue par défaut de l'application.
+        // Sans en-tête, anglais — le repli du serveur comme du client web.
         let (_, defaut, _) = reponse(429, corps_429(Some(60)), &HeaderMap::new()).await;
-        assert_eq!(defaut["message"], fr["message"]);
+        assert_eq!(defaut["message"], en["message"]);
     }
 
     #[tokio::test]

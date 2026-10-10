@@ -19,7 +19,7 @@ const CLE_REFUS: &str = "premium.required";
 /// `lang` est déjà résolu (`i18n::lang_from_header`). Le nom du droit reste
 /// tel quel : « DSP & EQ », « Cloud Relay » sont des noms de produit, pas des
 /// phrases — c'est la PHRASE qui se traduit, et elle seule.
-fn corps_du_refus(feature: Feature, lang: &str) -> Value {
+pub(crate) fn corps_du_refus(feature: Feature, lang: &str) -> Value {
     json!({
         "error": "premium_required",
         // Le CODE est le terme stable du contrat : un client qui porte ses
@@ -42,12 +42,12 @@ fn corps_du_refus(feature: Feature, lang: &str) -> Value {
 /// feature is available, or an `Err(Response)` with HTTP 402 and a
 /// structured JSON body when it is not.
 ///
-/// Le refus est composé en **français**, le défaut de l'application, faute de
-/// requête sous la main. Une route qui tient ses en-têtes doit préférer
+/// Le refus est composé en **anglais**, le repli du serveur
+/// ([`crate::i18n::FALLBACK`]), faute de requête sous la main. Une route qui tient ses en-têtes doit préférer
 /// [`require_premium_localise`] : le `message` y suit la langue choisie par
 /// l'utilisateur. Le `code`, lui, est le même par les deux chemins.
 pub async fn require_premium(license: &LicenseManager, feature: Feature) -> Result<(), Response> {
-    require_premium_dans_la_langue(license, feature, "fr").await
+    require_premium_dans_la_langue(license, feature, crate::i18n::FALLBACK).await
 }
 
 /// Comme [`require_premium`], mais le `message` du refus suit l'en-tête

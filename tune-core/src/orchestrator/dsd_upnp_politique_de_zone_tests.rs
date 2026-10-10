@@ -207,6 +207,7 @@ fn demande(zone_id: i64, sample_rate: u32, bit_depth: u16) -> PlayRequest {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     }
 }
 

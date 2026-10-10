@@ -93,12 +93,55 @@ fn parse_days(days_str: Option<&str>) -> Vec<u32> {
     result
 }
 
-/// Resolve active days for an alarm.  Prefers `days_of_week` (7-char
-/// bitmask) when present; falls back to legacy `days` (CSV/named).
-fn resolve_alarm_days(alarm: &serde_json::Value) -> Vec<u32> {
+/// `true` when `mask` is a valid 7-char `days_of_week` bitmask (Mon..Sun).
+pub fn is_days_mask(mask: &str) -> bool {
+    mask.len() == 7 && mask.chars().all(|c| c == '0' || c == '1')
+}
+
+/// Strict conversion of a `days` value into the 7-char `days_of_week` mask
+/// the scheduler reads first.
+///
+/// **One convention, the server's everywhere: 0 = Monday … 6 = Sunday**
+/// (`num_days_from_monday`, `parse_days`, the bitmask order). Accepted:
+/// `daily`, `weekdays`, `weekends`, or a CSV of `0..=6` / `mon..sun`.
+///
+/// Unlike `parse_days` (lenient, used on stored rows), an unknown token or
+/// an empty value is an ERROR: the route must refuse it (422) rather than
+/// store a mask that silently drops — or adds — a day.
+pub fn days_to_mask(days: &str) -> Result<String, String> {
+    let s = days.trim().to_lowercase();
+    let idx: Vec<u32> = match s.as_str() {
+        "" => return Err("empty days".into()),
+        "daily" => (0..7).collect(),
+        "weekdays" => (0..5).collect(),
+        "weekends" => vec![5, 6],
+        _ => {
+            let names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+            let mut v = Vec::new();
+            for p in s.split(',') {
+                let p = p.trim();
+                let d = names
+                    .iter()
+                    .position(|n| *n == p)
+                    .map(|i| i as u32)
+                    .or_else(|| p.parse::<u32>().ok().filter(|&d| d <= 6))
+                    .ok_or_else(|| format!("invalid day {p:?}"))?;
+                v.push(d);
+            }
+            v
+        }
+    };
+    Ok((0..7)
+        .map(|d| if idx.contains(&d) { '1' } else { '0' })
+        .collect())
+}
+
+/// Resolve active days for an alarm (0 = Mon … 6 = Sun).  Prefers
+/// `days_of_week` (7-char bitmask) when present; falls back to legacy
+/// `days` (CSV/named).
+pub fn resolve_alarm_days(alarm: &serde_json::Value) -> Vec<u32> {
     if let Some(dow) = alarm.get("days_of_week").and_then(|v| v.as_str())
-        && dow.len() == 7
-        && dow.chars().all(|c| c == '0' || c == '1')
+        && is_days_mask(dow)
     {
         return parse_days_of_week(dow);
     }
@@ -162,12 +205,44 @@ impl SnoozeState {
 
 // ─── Fade-in ───────────────────────────────────────────────────
 
+/// Pourquoi le fondu d'un réveil doit s'arrêter avant son terme (#5669).
+///
+/// Le fondu était une tâche détachée qui réécrivait le volume toutes les
+/// 0,5 s pendant `fade_duration_s` (60 s par défaut), quoi que fasse
+/// l'utilisateur. Cyrille Moutia (fil 2111, 1.0.0-rc1) : pause du réveil à
+/// 10:42:25, album Qobuz relancé à 10:42:47, et le fondu tournait encore à
+/// 10:43:03 en écrasant les gestes de volume qu'il faisait sur SA musique.
+///
+/// La règle : dès que l'utilisateur agit sur la zone, le fondu rend la main.
+/// Une action se lit dans l'état de la zone, entre deux pas :
+/// - une autre lecture : `track_generation` a bougé depuis le lancement de la
+///   source du réveil (tout `PlaybackManager::play` l'incrémente) ;
+/// - une pause ou un arrêt : la zone ne joue plus ;
+/// - un volume : la zone n'a plus le volume que le fondu vient de poser.
+fn reprise_en_main(
+    etat: &crate::playback::ZoneState,
+    generation_du_reveil: u64,
+    volume_pose: Option<f64>,
+) -> Option<&'static str> {
+    if etat.track_generation != generation_du_reveil {
+        return Some("autre_lecture");
+    }
+    if etat.state != crate::playback::PlayState::Playing {
+        return Some("pause_ou_arret");
+    }
+    match volume_pose {
+        Some(v) if (etat.volume - v).abs() > 1e-6 => Some("volume"),
+        _ => None,
+    }
+}
+
 async fn fade_in_volume(
     orchestrator: &PlaybackOrchestrator,
     zone_id: i64,
     device_id: Option<String>,
     target: f64,
     duration_s: u64,
+    generation_du_reveil: u64,
 ) {
     if duration_s == 0 {
         let _ = orchestrator
@@ -177,16 +252,35 @@ async fn fade_in_volume(
     }
     let steps = (duration_s * 2).max(1);
     let step_delay = std::time::Duration::from_millis((duration_s * 1000) / steps);
+    // Le volume que la zone porte après NOTRE dernier pas. Relu dans l'état
+    // plutôt que supposé : une zone à volume fixe le pose à 1,0, et un pas
+    // refusé par la sortie ne change rien.
+    let mut volume_pose: Option<f64> = None;
     for i in 0..=steps {
+        let etat = orchestrator.playback.get_state(zone_id).await;
+        if let Some(raison) = reprise_en_main(&etat, generation_du_reveil, volume_pose) {
+            info!(zone_id, step = i, steps, raison, "alarm_fade_cancelled");
+            return;
+        }
         let vol = (i as f64 / steps as f64) * target;
         let _ = orchestrator
             .set_volume(zone_id, vol, device_id.as_deref())
             .await;
+        volume_pose = Some(orchestrator.playback.get_state(zone_id).await.volume);
         tokio::time::sleep(step_delay).await;
     }
 }
 
 // ─── Scheduler ─────────────────────────────────────────────────
+
+/// Ce qu'un déclenchement a fait de chaque zone visée (#5669).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ZonesDuReveil {
+    /// Zones où la source du réveil a été lancée.
+    pub sonnees: Vec<i64>,
+    /// Zones laissées à leur musique : elles jouaient déjà.
+    pub sautees: Vec<i64>,
+}
 
 pub struct AlarmScheduler {
     db: Arc<dyn DbBackend>,
@@ -251,7 +345,7 @@ impl AlarmScheduler {
                 && alarm_enabled(&alarm)
             {
                 fired_today.insert(alarm_id);
-                self.fire_alarm(&alarm).await;
+                self.sonner(&alarm, false).await;
             }
         }
 
@@ -297,7 +391,7 @@ impl AlarmScheduler {
 
             if now.hour() == h && now.minute() == m {
                 fired_today.insert(alarm_id);
-                self.fire_alarm(alarm).await;
+                self.sonner(alarm, false).await;
             }
         }
 
@@ -307,7 +401,22 @@ impl AlarmScheduler {
     /// Fire an alarm: play its source on the target zone(s) with optional
     /// fade-in.  Public so the test endpoint (`POST /alarms/{id}/test`) can
     /// trigger it directly.
-    pub async fn fire_alarm(&self, alarm: &serde_json::Value) {
+    ///
+    /// Décision de Bertrand du 05/10 (#5669) : le bouton d'essai ne coupe pas
+    /// la musique non plus. Sur une zone qui joue déjà, il ne joue rien ; la
+    /// route répond 409 `zone_en_lecture` quand aucune zone n'a sonné.
+    pub async fn fire_alarm(&self, alarm: &serde_json::Value) -> ZonesDuReveil {
+        self.sonner(alarm, true).await
+    }
+
+    /// `essai` : `true` pour le bouton d'essai, `false` pour le planificateur.
+    ///
+    /// Décision de Bertrand du 05/10 (#5669) : quand un réveil sonne sur une
+    /// zone qui JOUE déjà, Tune ignore le réveil sur cette zone. La musique en
+    /// cours n'est pas interrompue et le saut est journalisé
+    /// (`alarm_skipped_zone_playing`). Cyrille Moutia (fil 2111) avait vu son
+    /// album Qobuz coupé par France Inter, un réveil d'essai oublié.
+    async fn sonner(&self, alarm: &serde_json::Value, essai: bool) -> ZonesDuReveil {
         let alarm_id = alarm["id"].as_i64().unwrap_or(0);
         // Owner of this alarm: its playback is tagged to that profile's history
         // (inherited by any autoplay after). None → NULL, never guessed.
@@ -359,8 +468,27 @@ impl AlarmScheduler {
         );
 
         let zone_repo = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone());
+        let mut zones = ZonesDuReveil::default();
 
         for &target_zone in &target_zones {
+            if self
+                .orchestrator
+                .playback
+                .get_state(target_zone)
+                .await
+                .state
+                == crate::playback::PlayState::Playing
+            {
+                info!(
+                    alarm_id,
+                    name = alarm["name"].as_str().unwrap_or(""),
+                    zone_id = target_zone,
+                    "alarm_skipped_zone_playing"
+                );
+                zones.sautees.push(target_zone);
+                continue;
+            }
+            zones.sonnees.push(target_zone);
             let device_id = zone_repo
                 .get(target_zone)
                 .ok()
@@ -385,6 +513,7 @@ impl AlarmScheduler {
                 media_format: None,
                 track_number: None,
                 disc_number: None,
+                album_ref: None,
             };
             // Stamp the alarm owner as the zone's session profile BEFORE the
             // play so record_listen tags the alarm's listen to that person
@@ -394,27 +523,50 @@ impl AlarmScheduler {
                 .set_session_profile(target_zone, alarm_profile_id)
                 .await;
             if let Err(e) = self.orchestrator.play(req).await {
+                // Rien ne joue la source du réveil : pas de fondu sur la zone.
                 warn!(alarm_id, zone_id = target_zone, error = %e, "alarm_play_error");
+                continue;
             }
 
-            // Fade in volume in background
+            // Fade in volume in background. La génération est lue ICI, juste
+            // après le lancement : c'est elle qui dit « le réveil joue
+            // encore » au fondu, même si la tâche démarre en retard.
+            let generation = self
+                .orchestrator
+                .playback
+                .get_state(target_zone)
+                .await
+                .track_generation;
             let orch = self.orchestrator.clone();
             tokio::spawn(async move {
-                fade_in_volume(&orch, target_zone, device_id, volume, fade_s).await;
+                fade_in_volume(&orch, target_zone, device_id, volume, fade_s, generation).await;
             });
         }
 
-        // Update last_fired_at
-        let now_str = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        self.db
-            .execute(
-                "UPDATE alarms SET last_fired_at = ? WHERE id = ?",
-                &[&now_str as &dyn ToSqlValue, &alarm_id],
-            )
-            .ok();
+        // Update last_fired_at — seulement si le réveil a sonné quelque part.
+        // Un réveil sauté sur toutes ses zones n'a pas sonné (#5669).
+        if !zones.sonnees.is_empty() {
+            let now_str = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+            self.db
+                .execute(
+                    "UPDATE alarms SET last_fired_at = ? WHERE id = ?",
+                    &[&now_str as &dyn ToSqlValue, &alarm_id],
+                )
+                .ok();
+        } else {
+            info!(
+                alarm_id,
+                name = alarm["name"].as_str().unwrap_or(""),
+                zones = ?target_zones,
+                "alarm_skipped"
+            );
+        }
 
-        // One-shot: disable after firing
-        if alarm["one_shot"].as_i64().unwrap_or(0) != 0 {
+        // One-shot: disable after firing. Un réveil unique sauté par le
+        // planificateur compte comme son occurrence : il ne doit pas ressurgir
+        // le lendemain. Un ESSAI qui n'a rien joué ne consomme rien.
+        let essai_sans_effet = essai && zones.sonnees.is_empty();
+        if alarm["one_shot"].as_i64().unwrap_or(0) != 0 && !essai_sans_effet {
             self.db
                 .execute(
                     "UPDATE alarms SET enabled = '0' WHERE id = ?",
@@ -423,6 +575,7 @@ impl AlarmScheduler {
                 .ok();
             info!(alarm_id, "alarm_one_shot_disabled");
         }
+        zones
     }
 
     fn list_enabled_alarms(&self) -> Result<Vec<serde_json::Value>, String> {
@@ -545,6 +698,39 @@ mod tests {
     }
 
     #[test]
+    fn days_to_mask_uses_monday_zero() {
+        // 0 = lundi : « en semaine » = lun..ven, jamais samedi.
+        assert_eq!(days_to_mask("0,1,2,3,4").unwrap(), "1111100");
+        assert_eq!(days_to_mask("weekdays").unwrap(), "1111100");
+        assert_eq!(days_to_mask("weekends").unwrap(), "0000011");
+        assert_eq!(days_to_mask("daily").unwrap(), "1111111");
+        assert_eq!(days_to_mask(" mon, FRI ").unwrap(), "1000100");
+        // 6 = dimanche (et non samedi).
+        assert_eq!(days_to_mask("6").unwrap(), "0000001");
+        // Agrees with the scheduler's own reading of the same value.
+        for v in ["0,1,2,3,4", "5,6", "mon,wed,fri", "3"] {
+            let m = days_to_mask(v).unwrap();
+            assert_eq!(parse_days_of_week(&m), parse_days(Some(v)), "{v}");
+        }
+    }
+
+    #[test]
+    fn days_to_mask_refuses_invalid_days() {
+        for v in ["", "  ", "7", "1,2,9", "-1", "lundi", "1,,2", "1;2"] {
+            assert!(days_to_mask(v).is_err(), "{v:?} accepted");
+        }
+    }
+
+    #[test]
+    fn is_days_mask_strict() {
+        assert!(is_days_mask("1111100"));
+        assert!(is_days_mask("0000000"));
+        for v in ["", "111110", "11111000", "11111x0", "1,2,3"] {
+            assert!(!is_days_mask(v), "{v:?}");
+        }
+    }
+
+    #[test]
     fn parse_multi_zone_ids_valid() {
         let alarm = serde_json::json!({ "multi_zone_ids": "[1,3,5]" });
         assert_eq!(parse_multi_zone_ids(&alarm), vec![1, 3, 5]);
@@ -578,3 +764,6 @@ mod tests {
         assert!(!is_french_holiday(2025, 3, 15));
     }
 }
+
+#[cfg(test)]
+mod reprise_en_main_5669;

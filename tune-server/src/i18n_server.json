@@ -1439,6 +1439,42 @@
     "ro": "ARL acceptat: conectat la Deezer ({user}).",
     "sv": "ARL godkänd: ansluten till Deezer ({user})."
   },
+  "svctok.spotify.clientIdSaved": {
+    "fr": "Client ID Spotify enregistré. Vous pouvez maintenant vous connecter.",
+    "en": "Spotify Client ID saved. You can now sign in.",
+    "de": "Spotify-Client-ID gespeichert. Sie können sich jetzt anmelden.",
+    "es": "Client ID de Spotify guardado. Ya puede iniciar sesión.",
+    "it": "Client ID di Spotify salvato. Ora puoi accedere.",
+    "zh": "Spotify Client ID 已保存。现在可以登录。",
+    "ja": "Spotify の Client ID を保存しました。サインインできます。",
+    "ko": "Spotify Client ID가 저장되었습니다. 이제 로그인할 수 있습니다.",
+    "ro": "Client ID Spotify salvat. Acum vă puteți conecta.",
+    "sv": "Spotify Client ID sparat. Du kan nu logga in."
+  },
+  "svctok.spotify.clientIdInvalid": {
+    "fr": "Ce n’est pas un Client ID Spotify : il se compose de lettres et de chiffres (32 caractères hexadécimaux), à copier depuis votre application sur developer.spotify.com.",
+    "en": "This is not a Spotify Client ID: it is made of letters and digits (32 hexadecimal characters), copied from your app on developer.spotify.com.",
+    "de": "Das ist keine Spotify-Client-ID: Sie besteht aus Buchstaben und Ziffern (32 Hexadezimalzeichen) und stammt aus Ihrer App auf developer.spotify.com.",
+    "es": "Esto no es un Client ID de Spotify: se compone de letras y cifras (32 caracteres hexadecimales), copiado de su aplicación en developer.spotify.com.",
+    "it": "Questo non è un Client ID di Spotify: è composto da lettere e cifre (32 caratteri esadecimali), da copiare dalla tua app su developer.spotify.com.",
+    "zh": "这不是 Spotify Client ID：它由字母和数字组成（32 个十六进制字符），请从 developer.spotify.com 上您的应用中复制。",
+    "ja": "これは Spotify の Client ID ではありません。英数字（16 進数 32 文字）で、developer.spotify.com のアプリからコピーします。",
+    "ko": "Spotify Client ID가 아닙니다. 문자와 숫자(16진수 32자)로 이루어지며 developer.spotify.com의 앱에서 복사합니다.",
+    "ro": "Acesta nu este un Client ID Spotify: este format din litere și cifre (32 de caractere hexazecimale), copiat din aplicația dvs. de pe developer.spotify.com.",
+    "sv": "Detta är inget Spotify Client ID: det består av bokstäver och siffror (32 hexadecimala tecken), kopierat från din app på developer.spotify.com."
+  },
+  "svctok.spotify.clientIdEnv": {
+    "fr": "La variable TUNE_SPOTIFY_CLIENT_ID est posée sur ce serveur et l’emporte : modifiez-la, puis redémarrez le serveur.",
+    "en": "TUNE_SPOTIFY_CLIENT_ID is set on this server and takes precedence: change it, then restart the server.",
+    "de": "TUNE_SPOTIFY_CLIENT_ID ist auf diesem Server gesetzt und hat Vorrang: Ändern Sie sie und starten Sie den Server neu.",
+    "es": "TUNE_SPOTIFY_CLIENT_ID está definida en este servidor y tiene prioridad: modifíquela y reinicie el servidor.",
+    "it": "TUNE_SPOTIFY_CLIENT_ID è impostata su questo server e ha la precedenza: modificala, poi riavvia il server.",
+    "zh": "此服务器已设置 TUNE_SPOTIFY_CLIENT_ID 且优先：请修改它，然后重启服务器。",
+    "ja": "このサーバーでは TUNE_SPOTIFY_CLIENT_ID が設定されており優先されます。変更してからサーバーを再起動してください。",
+    "ko": "이 서버에 TUNE_SPOTIFY_CLIENT_ID가 설정되어 있어 우선합니다. 변경한 뒤 서버를 다시 시작하세요.",
+    "ro": "TUNE_SPOTIFY_CLIENT_ID este setată pe acest server și are prioritate: modificați-o, apoi reporniți serverul.",
+    "sv": "TUNE_SPOTIFY_CLIENT_ID är satt på denna server och har företräde: ändra den och starta sedan om servern."
+  },
   "svctok.test.validationUnavailable": {
     "fr": "Validation non disponible pour ce service.",
     "en": "Validation not available for this service.",
@@ -1974,6 +2010,54 @@
     "ko": "Tune 온라인 서비스가 이 서버에서 너무 많은 요청을 받아 당분간 이후 요청을 거부합니다. {minutes}분 후에 다시 시도하세요.",
     "ro": "Serviciul online Tune a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încearcă din nou peste {minutes} min.",
     "sv": "Tunes onlinetjänst har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min."
+  },
+  "cloud.ssoTitre": {
+    "fr": "Connexion au compte mozaiklabs impossible pour le moment",
+    "en": "Could not sign in to your mozaiklabs account for now",
+    "de": "Anmeldung beim mozaiklabs-Konto derzeit nicht möglich",
+    "es": "No se puede iniciar sesión en la cuenta de mozaiklabs por ahora",
+    "it": "Accesso all'account mozaiklabs al momento impossibile",
+    "zh": "暂时无法登录 mozaiklabs 账户",
+    "ja": "現在 mozaiklabs アカウントにサインインできません",
+    "ko": "지금은 mozaiklabs 계정에 로그인할 수 없습니다",
+    "ro": "Conectarea la contul mozaiklabs nu este posibilă deocamdată",
+    "sv": "Det går inte att logga in på mozaiklabs-kontot just nu"
+  },
+  "cloud.ssoNonLie": {
+    "fr": "Le compte n'a pas été lié à ce serveur. Relance la connexion depuis Tune.",
+    "en": "The account was not linked to this server. Start the sign-in again from Tune.",
+    "de": "Das Konto wurde nicht mit diesem Server verknüpft. Starte die Anmeldung erneut in Tune.",
+    "es": "La cuenta no se ha vinculado a este servidor. Vuelve a iniciar sesión desde Tune.",
+    "it": "L'account non è stato collegato a questo server. Riavvia l'accesso da Tune.",
+    "zh": "该账户未关联到此服务器。请在 Tune 中重新登录。",
+    "ja": "アカウントはこのサーバーにリンクされていません。Tune からもう一度サインインしてください。",
+    "ko": "계정이 이 서버에 연결되지 않았습니다. Tune에서 다시 로그인하세요.",
+    "ro": "Contul nu a fost asociat cu acest server. Reia conectarea din Tune.",
+    "sv": "Kontot har inte kopplats till den här servern. Logga in igen från Tune."
+  },
+  "cloud.ssoRetour": {
+    "fr": "Retour à Tune",
+    "en": "Back to Tune",
+    "de": "Zurück zu Tune",
+    "es": "Volver a Tune",
+    "it": "Torna a Tune",
+    "zh": "返回 Tune",
+    "ja": "Tune に戻る",
+    "ko": "Tune으로 돌아가기",
+    "ro": "Înapoi la Tune",
+    "sv": "Tillbaka till Tune"
+  },
+  "cloud.ssoEchec": {
+    "fr": "La connexion n'a pas abouti.",
+    "en": "The sign-in did not complete.",
+    "de": "Die Anmeldung wurde nicht abgeschlossen.",
+    "es": "El inicio de sesión no se ha completado.",
+    "it": "L'accesso non è andato a buon fine.",
+    "zh": "登录未完成。",
+    "ja": "サインインは完了しませんでした。",
+    "ko": "로그인이 완료되지 않았습니다.",
+    "ro": "Conectarea nu s-a finalizat.",
+    "sv": "Inloggningen slutfördes inte."
   },
   "metadata.enrich.cleLastfmAbsente": {
     "fr": "L'enrichissement des biographies nécessite une clé API Last.fm. Renseignez le réglage « lastfm_api_key » pour l'activer.",

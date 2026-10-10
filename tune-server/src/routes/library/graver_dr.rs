@@ -143,33 +143,122 @@ fn ecrire_statut(state_backend: &std::sync::Arc<dyn tune_core::db::backend::DbBa
         .ok();
 }
 
+/// État « la passe est morte avant d'avoir fini » (fil 2137, ticket 229).
+///
+/// Le réglage [`REGLAGE_STATUT`] est réécrit tous les [`JALON_AVANCEMENT`]
+/// pistes avec `status = running`. Une passe tuée en route (redémarrage,
+/// `kill`, panne) laisse donc derrière elle un `running` que plus personne ne
+/// viendra changer. Le renvoyer tel quel grisait le bouton « Graver » à vie,
+/// redémarrage compris. Les compteurs (`total`, `written`, `already`,
+/// `skipped`, `errors`) sont gardés : ce sont ceux du dernier jalon écrit.
+const ETAT_INTERROMPU: &str = "interrupted";
+
+/// Le dernier état enregistré, corrigé par le registre de CE processus.
+///
+/// * tâche au registre → `running`, quoi que dise la base ;
+/// * `running` en base sans tâche au registre → `interrupted`.
+///
+/// La relecture évite un faux « interrompu » à la fin normale d'une passe :
+/// celle-ci écrit `done` AVANT de lâcher sa garde de registre. Si la tâche a
+/// disparu entre la première lecture et le contrôle, la seconde lecture voit
+/// donc déjà `done`.
+fn statut_courant(state: &AppState) -> Value {
+    let mut v = lire_statut(state);
+    if en_cours(state) {
+        v["status"] = json!("running");
+        return v;
+    }
+    if v["status"] == "running" {
+        v = lire_statut(state);
+        if en_cours(state) {
+            v["status"] = json!("running");
+        } else if v["status"] == "running" {
+            v["status"] = json!(ETAT_INTERROMPU);
+        }
+    }
+    v
+}
+
+/// Au démarrage, aucune passe ne tourne encore dans ce processus : un
+/// `running` en base est forcément l'héritage d'un processus mort. On le
+/// réécrit `interrupted`, compteurs gardés, pour que la base dise la même
+/// chose que `GET /library/dr/gravure`. Appelé par
+/// `background::spawn_background_tasks`, avant que les routes ne servent.
+pub(crate) fn marquer_passe_interrompue_au_demarrage(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    let repo = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    let Some(mut v) = repo
+        .get(REGLAGE_STATUT)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    else {
+        return;
+    };
+    if v["status"] != "running" {
+        return;
+    }
+    v["status"] = json!(ETAT_INTERROMPU);
+    ecrire_statut(backend, &v);
+    info!(etat = %v, "graver_dr_passe_interrompue");
+}
+
 /// GET /library/dr/gravure
 ///
 /// L'inventaire du moment ET le dernier état de la passe, en une réponse :
 /// l'écran a besoin des deux pour dire « 1 234 à graver » avant, et
 /// « 1 234 gravées, 3 déjà présentes, 0 erreur » après.
+///
+/// `status` vaut `idle`, `running`, `done` ou `interrupted` (voir
+/// [`ETAT_INTERROMPU`]).
 pub(crate) async fn statut(State(state): State<AppState>) -> Json<Value> {
     let (inv, _) = inventaire(&state);
-    let mut v = lire_statut(&state);
-    if en_cours(&state) {
-        v["status"] = json!("running");
-    }
+    let mut v = statut_courant(&state);
     v["a_graver"] = json!(inv.a_graver);
     v["hors_format"] = json!(inv.hors_format);
     v["dans_les_fichiers"] = json!(deja_dans_les_fichiers(&state));
+    v[crate::routes::ecriture_fichiers::CHAMP_REPONSE] =
+        json!(crate::routes::ecriture_fichiers::autorisee(&state));
     Json(v)
+}
+
+/// Fil 2134 (Levente Toth) — après la gravure, la ligne de la piste reprend
+/// la taille et la date du fichier réécrit.
+///
+/// Seul le tag `DYNAMIC RANGE` a changé, et la base porte déjà sa valeur.
+/// Sans cela, le surveillant voyait chaque fichier gravé comme modifié : il
+/// le relisait, relisait le dossier entier quand une feuille CUE l'accompagne,
+/// et annonçait « bibliothèque modifiée » à chaque lot (1 121 fichiers gravés,
+/// une annonce toutes les 0,96 s chez le client). Le scan complet, lui, aurait
+/// relu les mêmes fichiers pour rien.
+fn remettre_la_ligne_en_phase(pistes: &tune_core::db::track_repo::TrackRepo, chemin: &str) {
+    let Some((taille, mtime)) =
+        tune_core::audio::iso9660::taille_et_mtime(std::path::Path::new(chemin))
+    else {
+        return;
+    };
+    if let Err(e) = pistes.update_mtime_and_size(chemin, mtime, taille as i64) {
+        warn!(chemin = %chemin, error = %e, "dr_ligne_non_remise_en_phase");
+    }
 }
 
 /// POST /library/dr/gravure
 ///
 /// Lance la passe en tâche de fond. 202 avec l'inventaire ; 409 si elle tourne
 /// déjà — deux passes concurrentes réécriraient les mêmes fichiers.
-pub(crate) async fn lancer(State(state): State<AppState>) -> impl IntoResponse {
+pub(crate) async fn lancer(State(state): State<AppState>) -> axum::response::Response {
+    // La gravure n'a pas d'autre effet que d'écrire dans les fichiers :
+    // désactivée (le défaut), elle refuse — le DR reste en base.
+    if !crate::routes::ecriture_fichiers::autorisee(&state) {
+        return crate::routes::ecriture_fichiers::refus("graver_dr");
+    }
     if en_cours(&state) {
         return (
             StatusCode::CONFLICT,
             Json(json!({"status": "running", "error": "already running"})),
-        );
+        )
+            .into_response();
     }
     let (inv, candidates) = inventaire(&state);
     let total = candidates.len();
@@ -191,6 +280,7 @@ pub(crate) async fn lancer(State(state): State<AppState>) -> impl IntoResponse {
     tokio::spawn(async move {
         let _garde = garde;
         let repo = TrackMetadataRepo::with_backend(backend.clone());
+        let pistes = tune_core::db::track_repo::TrackRepo::with_backend(backend.clone());
         let (mut written, mut already, mut skipped, mut errors) = (0i32, 0i32, 0i32, 0i32);
         taches.update_progress(TACHE_GRAVER_DR, 0, total as u64, "Dynamic Range");
 
@@ -209,12 +299,20 @@ pub(crate) async fn lancer(State(state): State<AppState>) -> impl IntoResponse {
                             "already": already, "skipped": skipped, "errors": errors}),
                 );
             }
+            // Fil 2134 — la ligne était-elle d'accord avec le disque AVANT
+            // la gravure ? Seulement alors, elle peut être remise d'accord
+            // après : sinon un changement venu d'ailleurs, pas encore relu,
+            // passerait pour l'écriture de Tune.
+            let en_phase = crate::auto_scan::fichier_conforme_a_la_base(&backend, chemin);
             match graver_dr(chemin, dr).await {
                 Ok(GravureDr::Ecrite) => {
                     written += 1;
                     // Le fichier porte la valeur : c'est désormais le tag qui
                     // fait foi, et c'est ce que le prochain scan dira aussi.
                     let _ = repo.set(*track_id, "dr_source", "tag");
+                    if en_phase {
+                        remettre_la_ligne_en_phase(&pistes, chemin);
+                    }
                     debug!(track_id, chemin = %chemin, dr = %dr, "dr_grave");
                 }
                 Ok(GravureDr::DejaPresente(du_fichier)) => {
@@ -253,6 +351,7 @@ pub(crate) async fn lancer(State(state): State<AppState>) -> impl IntoResponse {
         StatusCode::ACCEPTED,
         Json(json!({"status": "accepted", "total": total, "hors_format": inv.hors_format})),
     )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -261,7 +360,9 @@ mod tests {
     use tune_core::db::backend::ToSqlValue;
 
     fn etat() -> AppState {
-        AppState::new(":memory:", 0, Default::default()).unwrap()
+        let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+        crate::routes::ecriture_fichiers::activer_pour_test(&s.backend);
+        s
     }
 
     fn piste(state: &AppState, id: i64, chemin: &str, dr: Option<(&str, &str)>) {
@@ -305,6 +406,17 @@ mod tests {
             vec![1, 2]
         );
         assert_eq!(deja_dans_les_fichiers(&s), 1);
+    }
+
+    /// Réglage « Écrire les modifications dans les fichiers audio » jamais
+    /// touché : 409, rien au registre, aucun fichier ouvert.
+    #[tokio::test]
+    async fn reglage_absent_la_gravure_refuse() {
+        let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+        piste(&s, 1, "/m/a.flac", Some(("12", "analysis")));
+        let r = lancer(State(s.clone())).await.into_response();
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        assert!(!en_cours(&s));
     }
 
     /// La passe s'inscrit au registre (#2129) et ne se laisse pas doubler.
@@ -376,6 +488,166 @@ mod tests {
         // Plus rien à graver pour la piste 1 ; la 2 reste (introuvable ≠ gravée).
         let (inv, _) = inventaire(&s);
         assert_eq!(inv.a_graver, 1);
+    }
+}
+
+/// Fil 2137 / ticket 229 : une passe morte en route ne doit pas griser le
+/// bouton à vie.
+#[cfg(test)]
+mod tests_passe_interrompue_2137 {
+    use super::*;
+
+    fn etat() -> AppState {
+        let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+        crate::routes::ecriture_fichiers::activer_pour_test(&s.backend);
+        s
+    }
+
+    /// La photo qu'une passe tuée laisse en base : le jalon des 50 pistes.
+    fn photo_d_une_passe_morte(s: &AppState) {
+        ecrire_statut(
+            &s.backend,
+            &json!({"status": "running", "total": 4046, "written": 40,
+                    "already": 10, "skipped": 0, "errors": 0}),
+        );
+    }
+
+    #[tokio::test]
+    async fn running_sans_tache_au_registre_est_rendu_interrupted() {
+        let s = etat();
+        photo_d_une_passe_morte(&s);
+        assert!(!en_cours(&s));
+        let Json(v) = statut(State(s.clone())).await;
+        assert_eq!(v["status"], "interrupted", "{v}");
+        // Le dernier compteur est gardé, pour « interrompue à 50 / 4 046 ».
+        assert_eq!(v["total"], 4046, "{v}");
+        assert_eq!(v["written"], 40, "{v}");
+        assert_eq!(v["already"], 10, "{v}");
+        // Et la relance n'est pas refusée.
+        let r = lancer(State(s.clone())).await.into_response();
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+    }
+
+    /// L'AUTRE sens : une passe vivante reste `running`.
+    #[tokio::test]
+    async fn running_avec_tache_au_registre_reste_running() {
+        let s = etat();
+        photo_d_une_passe_morte(&s);
+        let _garde = s
+            .background_tasks
+            .begin(TACHE_GRAVER_DR, "Gravure", "maintenance");
+        let Json(v) = statut(State(s.clone())).await;
+        assert_eq!(v["status"], "running", "{v}");
+    }
+
+    #[test]
+    fn le_demarrage_reecrit_running_en_interrupted_compteurs_gardes() {
+        let s = etat();
+        photo_d_une_passe_morte(&s);
+        marquer_passe_interrompue_au_demarrage(&s.backend);
+        let v = lire_statut(&s);
+        assert_eq!(v["status"], "interrupted", "{v}");
+        assert_eq!(v["total"], 4046, "{v}");
+        assert_eq!(v["written"], 40, "{v}");
+    }
+
+    #[test]
+    fn le_demarrage_ne_touche_ni_done_ni_un_reglage_absent() {
+        let s = etat();
+        marquer_passe_interrompue_au_demarrage(&s.backend);
+        assert_eq!(lire_statut(&s), json!({"status": "idle"}));
+        let fini = json!({"status": "done", "total": 3, "written": 3,
+                          "already": 0, "skipped": 0, "errors": 0});
+        ecrire_statut(&s.backend, &fini);
+        marquer_passe_interrompue_au_demarrage(&s.backend);
+        assert_eq!(lire_statut(&s), fini);
+    }
+}
+
+/// Fil 2134 (Levente Toth) — la gravure ne doit pas faire réimporter au
+/// surveillant les fichiers qu'elle vient de réécrire.
+#[cfg(test)]
+mod tests_ligne_en_phase_2134 {
+    use super::*;
+    use tune_core::db::backend::ToSqlValue;
+
+    /// Une copie de la fixture FLAC, indexée avec un DR calculé. `en_phase` :
+    /// la ligne porte la taille et la date du disque ; sinon, une date
+    /// d'avant (un changement venu d'ailleurs que le surveillant n'a pas
+    /// encore relu).
+    fn banc(en_phase: bool) -> (tempfile::TempDir, String, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let cible = dir.path().join("x.flac");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../tune-core/tests/fixtures/test.flac"),
+            &cible,
+        )
+        .unwrap();
+        let chemin = cible.to_string_lossy().into_owned();
+        let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+        crate::routes::ecriture_fichiers::activer_pour_test(&s.backend);
+        let (taille, mtime) = tune_core::audio::iso9660::taille_et_mtime(&cible).unwrap();
+        let mtime = if en_phase { mtime } else { mtime - 3600.0 };
+        let taille = taille as i64;
+        s.backend
+            .execute(
+                "INSERT INTO tracks (id, title, file_path, file_size, file_mtime) \
+                 VALUES (1, 'x', ?1, ?2, ?3)",
+                &[&chemin as &dyn ToSqlValue, &taille, &mtime],
+            )
+            .unwrap();
+        let repo = TrackMetadataRepo::with_backend(s.backend.clone());
+        repo.set(1, "dr_track", "12").unwrap();
+        repo.set(1, "dr_source", "analysis").unwrap();
+        (dir, chemin, s)
+    }
+
+    async fn graver(s: &AppState) {
+        let r = lancer(State(s.clone())).await.into_response();
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        for _ in 0..200 {
+            if !en_cours(s) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(!en_cours(s), "la passe n'a pas fini");
+        assert_eq!(lire_statut(s)["written"], 1, "{}", lire_statut(s));
+    }
+
+    /// Le fichier a bien été réécrit (sa date a changé), et pourtant sa
+    /// ligne est d'accord avec le disque : le surveillant l'écartera de son
+    /// lot, sans relecture ni annonce.
+    #[tokio::test]
+    async fn le_fichier_grave_reste_conforme_a_sa_ligne_2134() {
+        let (_dir, chemin, s) = banc(true);
+        let stat = || tune_core::audio::iso9660::taille_et_mtime(std::path::Path::new(&chemin));
+        let avant = stat();
+        assert!(crate::auto_scan::fichier_conforme_a_la_base(
+            &s.backend, &chemin
+        ));
+        graver(&s).await;
+        assert_ne!(avant, stat(), "témoin : la gravure a réécrit le fichier");
+        assert!(
+            crate::auto_scan::fichier_conforme_a_la_base(&s.backend, &chemin),
+            "après la gravure, la ligne doit porter la taille et la date du fichier gravé"
+        );
+    }
+
+    /// Une ligne qui n'était PAS d'accord avec le disque avant la gravure le
+    /// reste : le changement venu d'ailleurs sera relu par le surveillant ou
+    /// le prochain scan, au lieu de passer pour l'écriture de Tune.
+    #[tokio::test]
+    async fn une_ligne_deja_en_retard_n_est_pas_remise_en_phase_2134() {
+        let (_dir, chemin, s) = banc(false);
+        assert!(!crate::auto_scan::fichier_conforme_a_la_base(
+            &s.backend, &chemin
+        ));
+        graver(&s).await;
+        assert!(!crate::auto_scan::fichier_conforme_a_la_base(
+            &s.backend, &chemin
+        ));
     }
 }
 

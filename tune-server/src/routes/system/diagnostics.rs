@@ -835,11 +835,16 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let (audio_outputs, audio_backend_name, asio_avail, audio_backend_status) = {
         #[cfg(feature = "local-audio")]
         {
+            // #5612 — hors de l'ordonnanceur et borné : un balayage bloqué
+            // dans le greffon ALSA de PipeWire ne doit pas figer le serveur.
             let devs: Vec<String> =
-                tune_core::outputs::local::list_audio_devices_with_backend(audio_backend_pref)
-                    .iter()
-                    .map(|d| d.name.clone())
-                    .collect();
+                tune_core::outputs::local::list_audio_devices_with_backend_bounded(
+                    audio_backend_pref,
+                )
+                .await
+                .iter()
+                .map(|d| d.name.clone())
+                .collect();
             let name = tune_core::outputs::local::active_backend_name(audio_backend_pref);
             let asio = tune_core::outputs::local::asio_available();
             // #1395 — le rapport de diagnostic est ce que le testeur colle sur
@@ -930,6 +935,11 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // avait été DEMANDÉ, ni pourquoi les deux diffèrent. `null` sans
         // sortie locale compilée.
         "audio_backend_status": audio_backend_status,
+        // #3206 — politique et priorité OBTENUES par le fil de rendu local
+        // (`render_thread`, `null` avant toute lecture), limites RT et
+        // memlock du processus, verrouillage mémoire. Présent même sans
+        // `local-audio` : c'est ce qui dit si les limites de Tune OS servent.
+        "audio_realtime": tune_core::audio::ordonnancement_rt::fiche(),
         "asio_available": asio_avail,
         // #3205 — famine de l'anneau par sortie : `ring_starvation_events`
         // compte les rappels comblés par des zéros, `..._missing_samples`
@@ -976,6 +986,8 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "platform": std::env::consts::OS,
         "pid": std::process::id(),
         "cpu_count": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        // #5677 : le nombre réel de fils de l'exécuteur (plancher de #5718).
+        "worker_threads": crate::fils_de_travail::retenu(),
         "db": {
             "engine": db_backend,
             "migration_version": db_version,
@@ -2491,6 +2503,16 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // que le testeur colle sur le forum — et c'est ce rapport, sur un parc
     // réel, qui doit décider si le noyau RT de Tune OS sert à quelque chose.
     md.push_str(&section_famine_anneau(&ring_starvation));
+    // #5677 : les relevés de gel restaient sur la machine du testeur (tickets
+    // 223, 224) ; le rapport joint désormais les deux plus récents. Lus hors
+    // de l'exécuteur : ce sont des fichiers.
+    md.push_str(
+        &tokio::task::spawn_blocking(|| {
+            crate::gel_executeur::section_du_rapport(crate::gel_executeur::dossier_retenu(), 2)
+        })
+        .await
+        .unwrap_or_default(),
+    );
     // #3479 : sans cette section, un etage d'egalisation qui rend du SILENCE
     // ne laissait aucune trace dans ce que le testeur depose — ni ici, ni dans
     // le journal. Reivax66 a fourni 25 lignes `eq_change_journal` toutes
@@ -3105,7 +3127,7 @@ async fn envoyer_le_rapport(
         }
         Ok(resp) => {
             let status = resp.status().as_u16();
-            tracing::warn!(status, images = nb_images, "bug_report_submit_rejected");
+            journaliser_le_refus(status, nb_images, resp.headers());
             // #5068 — la limite d'envoi du site garde son 429 : ce n'est pas
             // une panne, et un 5xx ferait lever à l'interface un bandeau
             // « Server error » en plus de la phrase de l'écran.
@@ -3123,6 +3145,25 @@ async fn envoyer_le_rapport(
                 json!({ "error": format!("could not reach the bug service: {e}") }),
             )
         }
+    }
+}
+
+/// La ligne de journal d'un rapport refusé par le site (#5590).
+///
+/// Elle porte le délai imposé par le site (`Retry-After`), sous le même nom que
+/// `cloud_rate_limit_persisted` : `retry_after_seconds`. Sans lui, le « revenez
+/// dans 43 minutes » lu à l'écran ne se rapprochait d'aucun autre refus du
+/// journal, sinon de mémoire et à la minute près. Sans en-tête exploitable, le
+/// champ est absent : on n'invente aucun délai.
+fn journaliser_le_refus(status: u16, nb_images: usize, headers: &reqwest::header::HeaderMap) {
+    match tune_core::cloud::rate_limit::retry_after_secs(headers) {
+        Some(retry_after_seconds) => tracing::warn!(
+            status,
+            images = nb_images,
+            retry_after_seconds,
+            "bug_report_submit_rejected"
+        ),
+        None => tracing::warn!(status, images = nb_images, "bug_report_submit_rejected"),
     }
 }
 
@@ -4812,5 +4853,69 @@ mod portraits_d_artistes_4845 {
             "- Portraits d'artistes (grille Artistes) : 1/4 affichables — sans image 1, \
              cache perdu 1, URL distante 1 ; sources : auto 2, community 1\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_refus_du_rapport_5590 {
+    use super::journaliser_le_refus;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Journal(Arc<Mutex<Vec<u8>>>);
+    impl Write for Journal {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capter(geste: impl FnOnce()) -> String {
+        let journal = Journal::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(abonne, geste);
+        let octets = journal.0.lock().unwrap().clone();
+        String::from_utf8(octets).unwrap()
+    }
+
+    /// Le cas du ticket : un 429 du site avec son `Retry-After`. La ligne dit
+    /// le délai, pour qu'on le rapproche des autres refus du même journal.
+    #[test]
+    fn le_refus_dit_le_delai_impose_par_le_site() {
+        let mut entetes = reqwest::header::HeaderMap::new();
+        entetes.insert(reqwest::header::RETRY_AFTER, "2556".parse().unwrap());
+        let ligne = capter(|| journaliser_le_refus(429, 0, &entetes));
+        assert!(ligne.contains("bug_report_submit_rejected"), "{ligne}");
+        assert!(ligne.contains("status=429"), "{ligne}");
+        assert!(
+            ligne.contains("retry_after_seconds=2556"),
+            "le délai du site manque à la ligne du refus : {ligne}"
+        );
+    }
+
+    /// Sans en-tête exploitable, aucun délai n'est inventé.
+    #[test]
+    fn sans_retry_after_aucun_delai_n_est_invente() {
+        let entetes = reqwest::header::HeaderMap::new();
+        let ligne = capter(|| journaliser_le_refus(502, 1, &entetes));
+        assert!(ligne.contains("bug_report_submit_rejected"), "{ligne}");
+        assert!(
+            ligne.contains("status=502") && ligne.contains("images=1"),
+            "{ligne}"
+        );
+        assert!(!ligne.contains("retry_after"), "{ligne}");
     }
 }

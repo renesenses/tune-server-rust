@@ -62,6 +62,34 @@ async fn get_svc(
     // registry lock drops here
 }
 
+/// Comme [`get_svc`], mais refuse un service DÉSACTIVÉ.
+///
+/// Les routes `/{service}/…` prenaient le service que l'URL nommait sans
+/// regarder la case « Actif » des Réglages. Un Qobuz désactivé, et même jamais
+/// connecté, était donc encore interrogé dès que l'écran le demandait : la page
+/// découverte appelait `featured-playlists/by-tag`, Tune relayait vers
+/// `/playlist/getTags`, Qobuz répondait 500 et Tune rendait 502 — quatre fois
+/// dans un même journal de testeur, pour un service que l'utilisateur avait
+/// éteint.
+///
+/// Les routes qui choisissent elles-mêmes leurs services passent déjà par
+/// `utilisable()` (#5103). Celles-ci, où c'est le CLIENT qui nomme le service,
+/// passent par ici : 409 et un motif (une liste vide pour les favoris, comme
+/// pour une source sans favoris), sans un seul appel au service. Restent
+/// sur [`get_svc`] les routes qui doivent fonctionner service éteint : état,
+/// connexion, déconnexion, activation, rappels OAuth.
+async fn get_svc_actif(
+    state: &StreamingHttpState,
+    name: &str,
+) -> Result<Arc<RwLock<Box<dyn StreamingService>>>, (StatusCode, String)> {
+    let arc = get_svc(state, name).await?;
+    if !arc.read().await.enabled() {
+        tracing::debug!(service = name, "streaming_service_desactive_appel_refuse");
+        return Err((StatusCode::CONFLICT, format!("service désactivé : {name}")));
+    }
+    Ok(arc)
+}
+
 /// Type de favori de streaming demandé sur `/{service}/favorites/{fav_type}`.
 ///
 /// Ce type existe pour une seule raison : `service_favorites` dispatche le
@@ -368,7 +396,7 @@ pub fn purge_contenu_utilisateur(service: &str) {
 /// Reduce boilerplate for read-only handlers: get_svc + lock + call + respond.
 macro_rules! with_svc {
     ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
-        let arc = match get_svc($state, $service).await {
+        let arc = match get_svc_actif($state, $service).await {
             Ok(s) => s,
             Err(e) => return e.into_response(),
         };
@@ -388,7 +416,7 @@ macro_rules! with_svc {
 /// sans y penser d'un gestionnaire éditorial vers un gestionnaire de favoris.
 macro_rules! with_svc_editorial {
     ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
-        let arc = match get_svc($state, $service).await {
+        let arc = match get_svc_actif($state, $service).await {
             Ok(s) => s,
             Err(e) => return e.into_response(),
         };
@@ -398,7 +426,7 @@ macro_rules! with_svc_editorial {
 }
 macro_rules! with_svc_mut {
     ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
-        let arc = match get_svc($state, $service).await {
+        let arc = match get_svc_actif($state, $service).await {
             Ok(s) => s,
             Err(e) => return e.into_response(),
         };
@@ -557,6 +585,7 @@ where
         .route("/youtube/home", get(youtube_home))
         .route("/youtube/charts", get(youtube_charts))
         .route("/youtube/moods", get(youtube_moods))
+        .route("/youtube/moods/{params}", get(youtube_mood))
         .route("/youtube/library", get(youtube_library))
         .route("/spotify/callback", get(spotify_callback))
         .route("/tidal/callback", get(tidal_callback))
@@ -615,7 +644,35 @@ async fn service_album(
     State(state): State<StreamingHttpState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc.get_album(&album_id).await)
+    let backend = state.backend.clone();
+    with_svc!(&state, &service, |svc| svc
+        .get_album(&album_id)
+        .await
+        .inspect(|album| ranger_le_marquage_ia(&backend, &service, album)))
+}
+
+/// #5530 — la fiche d'un album de service est le moment où Tune lit son
+/// marquage « généré par IA » de première main (`album/get` chez Qobuz). On le
+/// range sur les favoris qui désignent cet album — l'album lui-même, et les
+/// pistes dont la référence d'album le nomme —, pour qu'une règle de playlist
+/// intelligente puisse l'écarter sans rappeler le service.
+///
+/// Rien n'est écrit quand le service ne dit rien (`None`). Une erreur de base
+/// est journalisée, jamais rendue : la fiche reste servie.
+fn ranger_le_marquage_ia(
+    backend: &Arc<dyn DbBackend>,
+    service: &str,
+    album: &tune_core::streaming::StreamAlbum,
+) {
+    let Some(ia) = album.ai_generated else {
+        return;
+    };
+    let repo = tune_core::db::streaming_favorites_repo::StreamingFavoritesRepo::with_backend(
+        backend.clone(),
+    );
+    if let Err(e) = repo.marquer_album_ia(service, &album.id, ia) {
+        tracing::warn!(service, erreur = %e, "marquage_ia_favoris_impossible");
+    }
 }
 
 async fn service_album_tracks(
@@ -631,7 +688,7 @@ async fn service_artist(
     State(state): State<StreamingHttpState>,
     Path((service, artist_id)): Path<(String, String)>,
 ) -> Response {
-    let arc = match get_svc(&state, &service).await {
+    let arc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -927,7 +984,7 @@ async fn service_playlist_tags(
     headers: axum::http::HeaderMap,
 ) -> Response {
     let langues = etiquettes_langue::langues_demandees(&headers);
-    let arc = match get_svc(&state, &service).await {
+    let arc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -966,7 +1023,7 @@ async fn service_featured_playlists_by_tag(
     headers: axum::http::HeaderMap,
 ) -> Response {
     let langues = etiquettes_langue::langues_demandees(&headers);
-    let arc = match get_svc(&state, &service).await {
+    let arc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -1293,7 +1350,7 @@ async fn service_track_similar(
     Path((service, track_id)): Path<(String, String)>,
     Query(q): Query<SimilairesQuery>,
 ) -> Response {
-    let arc = match get_svc(&state, &service).await {
+    let arc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -1356,7 +1413,7 @@ async fn service_track_url(
     State(state): State<StreamingHttpState>,
     Path((service, track_id)): Path<(String, String)>,
 ) -> Response {
-    let svc = match get_svc(&state, &service).await {
+    let svc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -1374,7 +1431,7 @@ async fn service_track_url(
             if svc.refresh_if_needed().await.unwrap_or(false) {
                 drop(svc);
                 state.save_tokens().await;
-                let svc = match get_svc(&state, &service).await {
+                let svc = match get_svc_actif(&state, &service).await {
                     Ok(s) => s,
                     Err(e) => return e.into_response(),
                 };
@@ -1467,7 +1524,7 @@ async fn service_favorites(
     Path((service, fav_type)): Path<(String, String)>,
     Query(tri): Query<TriQuery>,
 ) -> Response {
-    let arc = match get_svc(&state, &service).await {
+    let arc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
         // A non-streaming source (e.g. "upnp"/"radio"/"podcast" media-server
         // items) has no streaming favorites. Return an empty list (200) rather
@@ -1514,7 +1571,7 @@ async fn service_favorites(
             };
             if rafraichi {
                 state.save_tokens().await;
-                let arc = match get_svc(&state, &service).await {
+                let arc = match get_svc_actif(&state, &service).await {
                     Ok(s) => s,
                     Err(e) => return e.into_response(),
                 };
@@ -1586,24 +1643,114 @@ async fn service_auth_url(
 }
 
 // ---------------------------------------------------------------------------
-// Stubs & OAuth callbacks
+// YouTube Music : découverte et bibliothèque du compte (#1897, #5247)
 // ---------------------------------------------------------------------------
+//
+// Ces quatre routes étaient des talons : listes vides et « not yet
+// implemented ». Elles rendent désormais les rayons réels de YouTube Music, ou
+// une erreur franche (502 si YouTube refuse ou si sa réponse n'est plus
+// lisible, 404 pour un pays ou une ambiance invalide, 409 service désactivé).
 
-async fn youtube_home() -> Json<Value> {
-    Json(json!({"sections": [], "message": "YouTube home not yet implemented"}))
+/// Le service YouTube TYPÉ : la découverte n'appartient pas au trait commun,
+/// aucun autre service n'a d'ambiances ni de tendances par pays.
+macro_rules! with_youtube {
+    ($state:expr, |$yt:ident| $body:expr) => {{
+        let arc = match get_svc_actif($state, "youtube").await {
+            Ok(s) => s,
+            Err(e) => return e.into_response(),
+        };
+        let svc = arc.read().await;
+        let Some($yt) = svc
+            .as_any()
+            .downcast_ref::<tune_core::streaming::youtube::YouTubeService>()
+        else {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "le service inscrit sous « youtube » n'est pas YouTube Music",
+            )
+                .into_response();
+        };
+        $body
+    }};
 }
 
-async fn youtube_charts() -> Json<Value> {
-    Json(json!({"charts": [], "message": "YouTube charts not yet implemented"}))
+/// GET /streaming/youtube/home → `{sections: Rayon[]}`.
+async fn youtube_home(State(state): State<StreamingHttpState>) -> Response {
+    with_youtube!(&state, |yt| svc_response_editorial(
+        yt.accueil()
+            .await
+            .map(|sections| json!({ "sections": sections }))
+    ))
 }
 
-async fn youtube_moods() -> Json<Value> {
-    Json(json!({"moods": [], "message": "YouTube moods not yet implemented"}))
+#[derive(Deserialize)]
+struct ChartsQuery {
+    country: Option<String>,
 }
 
-async fn youtube_library() -> Json<Value> {
-    Json(json!({"playlists": [], "albums": [], "artists": []}))
+/// GET /streaming/youtube/charts?country=FR → `{country, country_source,
+/// sections: Rayon[]}`. Pays : réglage `youtube_charts_country`, sinon
+/// `country`, sinon le monde (`ZZ`).
+async fn youtube_charts(
+    State(state): State<StreamingHttpState>,
+    Query(q): Query<ChartsQuery>,
+) -> Response {
+    // Le réglage explicite du service l'emporte ; à défaut, le `?country=`
+    // (le web y envoie la région de la langue du navigateur), puis le monde.
+    let reglage = SettingsRepo::with_backend(state.backend.clone())
+        .get(tune_core::streaming::youtube_decouverte::CLE_PAYS_TENDANCES)
+        .ok()
+        .flatten();
+    let (pays, origine) = tune_core::streaming::youtube_decouverte::choisir_pays(
+        reglage.as_deref(),
+        q.country.as_deref(),
+    );
+    // PAS de cache navigateur ici (`svc_response`, pas `_editorial`) : la même
+    // URL change de pays dès que le réglage change, et le serveur garde déjà
+    // les rayons trente minutes.
+    with_youtube!(&state, |yt| svc_response(yt.tendances(&pays).await.map(
+        |sections| json!({
+            "country": pays.trim().to_ascii_uppercase(),
+            "country_source": origine.cle(),
+            "sections": sections,
+        })
+    )))
 }
+
+/// GET /streaming/youtube/moods → `CategorieAmbiances[]` (un TABLEAU : c'est
+/// ce que lisent le web et Flutter).
+async fn youtube_moods(State(state): State<StreamingHttpState>) -> Response {
+    with_youtube!(&state, |yt| svc_response_editorial(yt.ambiances().await))
+}
+
+/// GET /streaming/youtube/moods/{params} → `{sections: Rayon[]}`, les
+/// playlists d'une ambiance ou d'un genre.
+async fn youtube_mood(
+    State(state): State<StreamingHttpState>,
+    Path(params): Path<String>,
+) -> Response {
+    with_youtube!(&state, |yt| svc_response_editorial(
+        yt.contenu_ambiance(&params)
+            .await
+            .map(|sections| json!({ "sections": sections }))
+    ))
+}
+
+/// GET /streaming/youtube/library → `{playlists, tracks}` du compte (#5247),
+/// ou l'erreur de Google telle quelle. Les mêmes lectures servent
+/// `/streaming/youtube/playlists` et `/favorites/tracks`.
+async fn youtube_library(State(state): State<StreamingHttpState>) -> Response {
+    with_svc!(&state, "youtube", |svc| async {
+        let playlists = svc.get_user_playlists().await?;
+        let tracks = svc.get_user_tracks().await?;
+        Ok::<_, tune_core::TuneError>(json!({ "playlists": playlists, "tracks": tracks }))
+    }
+    .await)
+}
+
+// ---------------------------------------------------------------------------
+// OAuth callbacks
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct SpotifyCallbackQuery {
@@ -1774,6 +1921,12 @@ async fn compare_services(
             }
         };
         let svc = svc.read().await;
+        // Même règle que `get_svc_actif` : un service éteint n'est pas
+        // interrogé.
+        if !svc.enabled() {
+            results.insert(name.to_string(), json!({"error": "service désactivé"}));
+            continue;
+        }
         match svc.search(query, 10).await {
             Ok(sr) => {
                 results.insert(
@@ -2034,7 +2187,18 @@ mod tests_cache_utilisateur {
         async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
             Err("hors sujet".into())
         }
-        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+        /// #5530 — un seul album connu, marqué IA comme le rend Qobuz.
+        async fn get_album(&self, a: &str) -> Result<StreamAlbum, TuneError> {
+            if a == "tj9je5zd70wsc" {
+                return Ok(StreamAlbum {
+                    id: a.to_string(),
+                    title:
+                        "Psychedelic Mongolian Trip Hop (\"Painted Yurts, Painted Souls\") AI Album"
+                            .to_string(),
+                    ai_generated: Some(true),
+                    ..Default::default()
+                });
+            }
             Err("hors sujet".into())
         }
         async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
@@ -2249,6 +2413,52 @@ mod tests_cache_utilisateur {
             Arc::new(Mutex::new(registre)),
             Arc::new(EventBus::new()),
         )
+    }
+
+    /// #5530 — servir la fiche d'un album marqué IA range le marquage sur le
+    /// favori qui le désigne, et la fiche le rend au client.
+    #[tokio::test]
+    async fn la_fiche_d_un_album_marque_range_le_marquage_sur_ses_favoris_5530() {
+        let db = SqliteDb::open_in_memory().expect("sqlite en memoire");
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let nom = "essai-ia-5530";
+        let repo = tune_core::db::streaming_favorites_repo::StreamingFavoritesRepo::with_backend(
+            backend.clone(),
+        );
+        repo.add(1, "album", nom, "tj9je5zd70wsc", None, None, None, None)
+            .unwrap();
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(ServiceCompteur {
+            nom: nom.to_string(),
+            lectures: Arc::new(AtomicUsize::new(0)),
+            delai: Duration::ZERO,
+            recherches: RecherchesVues::default(),
+            date_brute: None,
+        }));
+        let etat = StreamingHttpState::new(
+            backend.clone(),
+            Arc::new(Mutex::new(registre)),
+            Arc::new(EventBus::new()),
+        );
+        let r = service_album(
+            State(etat),
+            Path((nom.to_string(), "tj9je5zd70wsc".to_string())),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let corps = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&corps).unwrap();
+        assert_eq!(v["ai_generated"], json!(true), "{v}");
+        let fav = repo.list(1, Some("album")).unwrap();
+        assert_eq!(
+            fav[0].ai_generated,
+            Some(true),
+            "le favori n'a pas reçu le marquage de la fiche"
+        );
     }
 
     /// Aucun tri demandé — le cas de tous les appels d'avant #2001.
@@ -3355,3 +3565,9 @@ mod temoin_rubriques_dans_la_langue_demandee {
         );
     }
 }
+
+#[cfg(test)]
+mod service_desactive_jamais_appele_tests;
+
+#[cfg(test)]
+mod youtube_decouverte_tests;

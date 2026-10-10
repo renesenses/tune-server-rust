@@ -351,13 +351,14 @@ pub(super) async fn proxy_artwork(
     // Idem pour la pochette d.un serveur Tune découvert (#4954), voir
     // `pochette_d_un_serveur_tune_decouvert`.
     // Jamais par l'exemption DIDL, jamais pour une URL déjà signée.
-    if let Err(Echec::Refus(ref refus)) = resultat
-        && q.sig.is_none()
-        && exemption.is_none()
-        && matches!(
-            refus,
+    let refus_rattrapable = matches!(
+        resultat,
+        Err(Echec::Refus(
             artwork_proxy::Refus::AdresseInterdite { .. } | artwork_proxy::Refus::HoteRefuse(_)
-        )
+        ))
+    ) && q.sig.is_none()
+        && exemption.is_none();
+    if refus_rattrapable
         && (artwork_proxy::pochette_de_bibliotheque(&state.backend, &q.url)
             || pochette_d_un_serveur_tune_decouvert(&state, &q.url).await)
     {
@@ -376,6 +377,13 @@ pub(super) async fn proxy_artwork(
         if resultat.is_ok() {
             tracing::debug!(url = %q.url, "artwork_proxy_pochette_bibliotheque_reseau_local");
         }
+    } else if refus_rattrapable
+        && let Some(relaye) = pochette_d_un_serveur_multimedia_decouvert(&state, &q.url).await
+    {
+        // #4895 — pochette d'un serveur multimédia tiers du réseau local, hors
+        // bibliothèque (lecture en cours, file). Si l'hôte:port n'est pas au
+        // registre, le refus d'origine reste et est journalisé plus bas.
+        resultat = relaye;
     }
 
     match resultat {
@@ -412,6 +420,80 @@ pub(super) async fn proxy_artwork(
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
+}
+
+/// #4895 — relaie la pochette d'un serveur multimédia du réseau local
+/// découvert par SSDP, ou `None` si l'hôte:port de l'URL n'est pas EXACTEMENT
+/// celui d'un serveur du registre courant (présent et dans sa fenêtre
+/// `max-age`).
+///
+/// Le registre est relevé une fois — fraîcheur reprise du balayage, comme
+/// `synchroniser_le_registre` — puis le relais le revérifie à chaque saut de
+/// redirection. Un refus de la réponse (type, taille, redirection) est
+/// journalisé ici et rendu comme une panne d'amont.
+async fn pochette_d_un_serveur_multimedia_decouvert(
+    state: &AppState,
+    url: &str,
+) -> Option<
+    Result<tune_core::library::artwork_proxy::Relaye, tune_core::library::artwork_proxy::Echec>,
+> {
+    use tune_core::discovery::ssdp::{MediaServerVerdict, media_server_verdict};
+    use tune_core::library::artwork_proxy::{
+        self, Echec, EchecTelechargement, POCHETTE_SERVEUR_MULTIMEDIA_TAILLE_MAX,
+    };
+
+    let (hote, port) =
+        artwork_proxy::pochette_de_serveur_multimedia(&reqwest::Url::parse(url).ok()?)?;
+    let vue_du_balayage = state.scanner.media_servers().await;
+    let serveurs: Vec<(String, u16)> = {
+        let mut registre = state.media_servers.lock().await;
+        tune_core::discovery::presence_serveur::reprendre_la_fraicheur(
+            &mut registre,
+            vue_du_balayage,
+        );
+        registre
+            .values()
+            .filter(|s| {
+                media_server_verdict(false, s.age(), s.max_age)
+                    != MediaServerVerdict::ExpiredNeedsProbe
+            })
+            .map(|s| {
+                (
+                    s.host
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .to_ascii_lowercase(),
+                    s.port,
+                )
+            })
+            .collect()
+    };
+    if !serveurs
+        .iter()
+        .any(|(h, p)| *p == port && h.eq_ignore_ascii_case(&hote))
+    {
+        return None;
+    }
+    let resultat = state
+        .relais_pochettes_lan
+        .relayer_pochette_de_serveur_multimedia(
+            url,
+            &serveurs,
+            POCHETTE_SERVEUR_MULTIMEDIA_TAILLE_MAX,
+        )
+        .await;
+    Some(match resultat {
+        Ok(image) => {
+            tracing::debug!(url = %url, "artwork_proxy_pochette_serveur_multimedia");
+            Ok(image)
+        }
+        Err(EchecTelechargement::Refus(refus)) => Err(Echec::Refus(refus)),
+        Err(EchecTelechargement::Amont(e)) => Err(Echec::Amont(e)),
+        Err(autre) => {
+            tracing::warn!(url = %url, refus = %autre, "artwork_proxy_serveur_multimedia_reponse_refusee");
+            Err(Echec::Amont(autre.to_string()))
+        }
+    })
 }
 
 /// #4954 — l'URL est-elle la pochette d'un serveur Tune DÉCOUVERT ?
@@ -2078,8 +2160,9 @@ pub(super) async fn rescan_album_artwork(
     }
     let cache_dir = artwork_cache_dir();
     // Relecture du DISQUE, sans sonde héritée : c'est le rattrapage manuel
-    // (#3028). Même règle que le scan complet (#5034) — la jaquette intégrée
-    // d'abord, puis l'image du dossier ; source et fichier écrits avec la
+    // (#3028). Même règle que le scan complet (#5034) — l'image du dossier
+    // d'abord (celui des pistes, ou celui qui réunit les disques d'un coffret,
+    // #5685), puis la jaquette intégrée ; source et fichier écrits avec la
     // pochette ; une pochette TÉLÉVERSÉE n'est jamais écrasée ; une pochette
     // du disque dont le fichier a disparu est retirée.
     let found_hash = match tune_core::library::pochette_disque::reevaluer_l_album(

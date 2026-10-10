@@ -30,7 +30,16 @@ use crate::state::AppState;
 ///   démarrer — les deux valent `0 / 0`, et les confondre afficherait une
 ///   bibliothèque entièrement analysée sur une machine qui n'a encore rien fait ;
 /// - `enabled` : l'analyse est armée. Une passe désarmée n'avancera pas, et la
-///   carte doit le dire plutôt que d'afficher une jauge immobile.
+///   carte doit le dire plutôt que d'afficher une jauge immobile ;
+/// - `library_analyzed` / `library_eligible` (#5597) : l'avancement de la
+///   BIBLIOTHÈQUE — pistes avec un fichier qui portent `rg_analyzed` ou
+///   `rg_track_gain`, sur pistes avec un fichier. Lus en base, ils survivent à
+///   un redémarrage, contrairement à `processed` / `total` qui repartent de
+///   zéro à chaque campagne. Comptés au plus une fois par minute (cache de
+///   l'état), `null` quand l'analyse est coupée ou que la requête échoue.
+/// - `library_total` / `library_processed` (décision du 06/10) : la jauge
+///   « traitées sur total » ; `library_without_file`, `library_out_of_scope`
+///   et `library_failed` disent pourquoi une piste traitée n'a pas de gain.
 pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<Value> {
     let avancement = tune_core::audio::replaygain::progression::releve();
     let enabled = tune_core::audio::replaygain::analysis_enabled(&state.backend);
@@ -66,6 +75,15 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
         0
     };
     let remaining = (total - processed).max(0);
+    // #5597 — la jauge de campagne repart de 0 à chaque démarrage et se lisait
+    // comme une perte de travail. Le couple de la bibliothèque, lui, est lu en
+    // base. Mis en cache : l'écran sonde en boucle, le comptage parcourt
+    // toute la table `tracks` (528 000 pistes chez un testeur).
+    let bibliotheque = if enabled {
+        state.bibliotheque_rg.lire(&state.backend)
+    } else {
+        None
+    };
     let waiting_reason = (remaining == 0 && deferred > 0).then_some("unresolved_paths");
     Json(json!({
         "active": avancement.actif,
@@ -77,5 +95,129 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
         "updated_at": avancement.maj_epoch,
         "reported": avancement.a_parle(),
         "enabled": enabled,
+        "library_analyzed": bibliotheque.map(|b| b.analysees),
+        "library_eligible": bibliotheque.map(|b| b.eligibles),
+        // Décision du 06/10 — la jauge vaut `library_processed` sur
+        // `library_total` (toute la bibliothèque) : une piste est traitée
+        // quand elle a un témoin ou qu'elle est déclarée non gérable. Les
+        // causes des non gérées sont nommées à part ; `library_failed` est
+        // déjà parmi les traitées. Une piste reportée n'est pas traitée.
+        "library_total": bibliotheque.map(|b| b.total),
+        "library_processed": bibliotheque.map(|b| b.traitees),
+        "library_without_file": bibliotheque.map(|b| b.sans_fichier),
+        "library_out_of_scope": bibliotheque.map(|b| b.hors_perimetre),
+        "library_failed": bibliotheque.map(|b| b.echecs),
+        // #5519 / tune-web-client#1828 — la passe DÉCODE-t-elle en ce moment ?
+        // `active` dit seulement qu'une campagne est ouverte : elle le reste
+        // quand la plage dynamique « En premier » passe devant, et la carte
+        // affichait « en cours » sur une jauge figée.
+        "working": avancement.actif
+            && tune_core::taches_de_fond::ordre::rang_au_travail()
+                == Some(tune_core::taches_de_fond::ordre::Rang::ReplayGain),
     }))
+}
+
+/// Le relevé de la remesure (#5882) : combien de mesures de Tune sont
+/// d'avant la version courante, et si une campagne les rend à la passe.
+/// Compté sur le pool bloquant : le `COUNT` parcourt `tracks`.
+async fn releve_de_remesure(state: &AppState) -> Value {
+    use tune_core::audio::replaygain::rattrapage_crete;
+    let backend = state.backend.clone();
+    let (perimees, cretes) = tokio::task::spawn_blocking(move || {
+        (
+            tune_core::audio::replaygain::remesure::compter_les_mesures_perimees(&backend),
+            rattrapage_crete::compter_les_cretes_a_refaire(&backend),
+        )
+    })
+    .await
+    .unwrap_or((None, None));
+    json!({
+        "stale": perimees,
+        "running": tune_core::audio::replaygain::remesure::en_cours(),
+        "algo": tune_core::audio::replaygain::RG_ALGO,
+        "enabled": tune_core::audio::replaygain::analysis_enabled(&state.backend),
+        // #2713 — crêtes vraies à refaire par le rattrapage de fond (sans
+        // toucher aux gains), et la version qu'elles recevront.
+        "true_peak_stale": cretes,
+        "true_peak_algo": rattrapage_crete::TRUE_PEAK_ALGO,
+    })
+}
+
+/// `GET /system/replaygain/reanalyze` — le relevé de la remesure.
+///
+/// - `stale` : mesures ReplayGain de Tune d'avant `algo` (sans version, ou
+///   d'une version plus ancienne), périmètre des analyses compris. `null` si
+///   le comptage échoue ;
+/// - `running` : une campagne les rend à la passe, par lots ;
+/// - `algo` : la version courante de la mesure ;
+/// - `enabled` : l'analyse ReplayGain est armée. Sans elle, rien ne
+///   remesurerait ;
+/// - `true_peak_stale` : crêtes vraies de Tune d'avant `true_peak_algo`, que
+///   le rattrapage de fond refait seul, sans campagne ni effacement (#2713).
+///   `null` si le comptage échoue.
+pub(crate) async fn replaygain_reanalyze_status(State(state): State<AppState>) -> Json<Value> {
+    Json(releve_de_remesure(&state).await)
+}
+
+/// `POST /system/replaygain/reanalyze` — refaire les mesures ReplayGain et
+/// true peak prises avant le correctif des jonctions de segments (#5882).
+///
+/// Rien n'est mesuré ici et aucun fichier audio n'est écrit : la campagne
+/// efface en base, par lots, les mesures périmées, et la passe ReplayGain les
+/// refait à son rythme. Les gains lus dans les tags ne sont jamais touchés.
+///
+/// Réponses :
+/// - **202** `{"status":"started", …relevé}` ;
+/// - **200** `{"status":"nothing_to_do", …relevé}` : aucune mesure périmée ;
+/// - **409** `{"status":"already_running", …relevé}` ;
+/// - **409** `{"status":"analysis_disabled", …relevé}` : l'analyse ReplayGain
+///   est coupée, rien ne remesurerait ;
+/// - **500** `{"status":"error", "error": …}`.
+pub(crate) async fn replaygain_reanalyze(
+    State(state): State<AppState>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    use tune_core::audio::replaygain::remesure;
+
+    let avec_statut = |statut: &str, mut releve: Value| {
+        if let Some(obj) = releve.as_object_mut() {
+            obj.insert("status".into(), json!(statut));
+        }
+        Json(releve)
+    };
+    if remesure::en_cours() {
+        let releve = releve_de_remesure(&state).await;
+        return (StatusCode::CONFLICT, avec_statut("already_running", releve));
+    }
+    let releve = releve_de_remesure(&state).await;
+    if !tune_core::audio::replaygain::analysis_enabled(&state.backend) {
+        return (
+            StatusCode::CONFLICT,
+            avec_statut("analysis_disabled", releve),
+        );
+    }
+    if releve.get("stale").and_then(Value::as_i64) == Some(0) {
+        return (StatusCode::OK, avec_statut("nothing_to_do", releve));
+    }
+    let backend = state.backend.clone();
+    match tokio::task::spawn_blocking(move || remesure::demander(&backend)).await {
+        Ok(Ok(remesure::Demande::Lancee)) => {
+            let mut releve = releve;
+            if let Some(obj) = releve.as_object_mut() {
+                obj.insert("running".into(), json!(true));
+            }
+            (StatusCode::ACCEPTED, avec_statut("started", releve))
+        }
+        Ok(Ok(remesure::Demande::DejaEnCours)) => {
+            (StatusCode::CONFLICT, avec_statut("already_running", releve))
+        }
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "error": e})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "error": e.to_string()})),
+        ),
+    }
 }
