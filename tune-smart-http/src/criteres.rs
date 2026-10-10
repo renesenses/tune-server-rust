@@ -635,6 +635,10 @@ pub(crate) mod tests {
 /// playlists du .18 et les formes que l'ancien éditeur écrivait (`equals`,
 /// `gte`, `operator`, `is_empty`, `branch_of`…). Chaque colonne — clause,
 /// tri, borne, refusées — doit ressortir au caractère près.
+///
+/// Seule retouche voulue depuis : la clause « Favori · est · Piste » (#5997,
+/// forum #2127) départage désormais les éditions par l'album et l'ISRC — la
+/// ligne gelée correspondante a été mise à jour avec elle.
 #[cfg(test)]
 mod anciennes_regles {
     use crate::smart_playlists::build_smart_query_rapport;

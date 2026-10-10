@@ -86,6 +86,7 @@ fn ligne(reference: &str, titre: &str) -> QueueInput {
         track_number: None,
         disc_number: None,
         album_ref: None,
+        artist_ref: None,
     }
 }
 

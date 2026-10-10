@@ -2329,6 +2329,11 @@ impl StreamingService for TidalService {
         ))
     }
 
+    /// #5997 — favoris en miroir : la vérité est chez le service.
+    fn favoris_miroir(&self) -> bool {
+        true
+    }
+
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let user_id = self.user_id.ok_or("no user_id")?;
         let (path_type, form_key) = match fav_type {

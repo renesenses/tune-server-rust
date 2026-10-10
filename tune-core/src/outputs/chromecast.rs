@@ -32,6 +32,21 @@ const CAST_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 /// à une zone (`TUNE_POLLER_STATUS_TIMEOUT_SECS`, 5 s par défaut). UN réessai,
 /// jamais une boucle.
 const CAST_PLAY_RETRY_TIMEOUT: Duration = Duration::from_secs(3);
+/// #6061 — budget du réessai quand la première tentative a JOINT le
+/// récepteur (il a rendu son statut) et a quand même épuisé son budget.
+///
+/// FabienM, zone Parents, rc3 (fil 2199, 09/10) : `chromecast_play_retry_after_deadline`
+/// à 2 000 ms, puis le réessai expire à 3 001 ms et la zone s'arrête ; la
+/// relance manuelle, 72 s plus tard, passe en 305 ms avec
+/// `session_reused=true`. Notre application tournait donc sur l'appareil :
+/// c'est l'une des deux tentatives qui l'avait lancée. L'appareil répondait,
+/// c'est le lancement de l'application réceptrice qui dépassait 2 + 3 s.
+///
+/// Un appareil qui RÉPOND mais lance lentement n'est pas un appareil mort :
+/// il mérite d'attendre la fin de son lancement. Un appareil muet (aucun
+/// statut rendu dans le premier budget) garde le réessai court de #5323 : le
+/// pire cas d'un appareil mort ne bouge pas (2 + 3 s).
+const CAST_PLAY_RETRY_TIMEOUT_APPAREIL_JOINT: Duration = Duration::from_secs(8);
 const MAX_CAST_COMMAND_WORKERS: usize = 4;
 static CAST_COMMAND_SLOTS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_CAST_COMMAND_WORKERS)));
@@ -118,17 +133,23 @@ fn est_une_echeance(error: &str) -> bool {
 /// suite. L'erreur finale est préfixée `retry:` pour que le bandeau et le
 /// journal disent qu'un réessai a eu lieu ; la première erreur, avec sa
 /// mesure, part dans la ligne `chromecast_play_retry_after_deadline`.
-async fn play_with_one_retry<F, Fut>(
+///
+/// #6061 — le budget du réessai est décidé APRÈS la première tentative
+/// (`retry_budget`), parce qu'il dépend de ce qu'elle a appris : l'appareil
+/// a-t-il répondu ? Voir [`budget_du_reessai`].
+async fn play_with_one_retry<F, Fut, R>(
     first_budget: Duration,
-    retry_budget: Duration,
+    retry_budget: R,
     mut attempt: F,
 ) -> Result<(), String>
 where
     F: FnMut(Duration) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
+    R: FnOnce() -> Duration,
 {
     match attempt(first_budget).await {
         Err(first) if est_une_echeance(&first) => {
+            let retry_budget = retry_budget();
             tracing::warn!(
                 first_error = %first,
                 retry_budget_ms = retry_budget.as_millis() as u64,
@@ -140,6 +161,16 @@ where
         }
         other => other,
     }
+}
+
+/// #6061 — le budget du réessai d'une lecture.
+///
+/// `appareil_joint` : l'appareil a-t-il rendu son statut (`GET_STATUS`)
+/// pendant la première tentative ? Si oui, il répond et c'est son lancement
+/// qui traîne : `joint`. Sinon, rien ne dit qu'il soit
+/// vivant : le réessai court `ordinaire` de #5323.
+fn budget_du_reessai(appareil_joint: bool, ordinaire: Duration, joint: Duration) -> Duration {
+    if appareil_joint { joint } else { ordinaire }
 }
 
 async fn run_cast_command<T, F>(
@@ -522,6 +553,9 @@ pub struct ChromecastOutput {
     /// #5323 — budget du réessai unique de `play_media`, voir
     /// [`CAST_PLAY_RETRY_TIMEOUT`].
     play_retry_timeout: Duration,
+    /// #6061 — le même réessai quand la première tentative a joint
+    /// l'appareil, voir [`CAST_PLAY_RETRY_TIMEOUT_APPAREIL_JOINT`].
+    play_retry_timeout_joint: Duration,
     command_slots: Arc<Semaphore>,
     /// Fil 2121 — ce que Tune a chargé sur le récepteur, et l'erreur de
     /// lecture qu'il en a rapportée, en attente du sondeur. Voir
@@ -609,6 +643,7 @@ impl ChromecastOutput {
             port,
             command_timeout: CAST_COMMAND_TIMEOUT,
             play_retry_timeout: CAST_PLAY_RETRY_TIMEOUT,
+            play_retry_timeout_joint: CAST_PLAY_RETRY_TIMEOUT_APPAREIL_JOINT,
             command_slots: Arc::clone(&CAST_COMMAND_SLOTS),
             chargement: Arc::default(),
         }
@@ -624,6 +659,7 @@ impl ChromecastOutput {
     fn with_command_limits(mut self, timeout: Duration, slots: Arc<Semaphore>) -> Self {
         self.command_timeout = timeout;
         self.play_retry_timeout = timeout;
+        self.play_retry_timeout_joint = timeout;
         self.command_slots = slots;
         self
     }
@@ -689,7 +725,20 @@ impl OutputTarget for ChromecastOutput {
         // Chaque tentative rebâtit sa connexion et REDEMANDE le statut : le
         // `LAUNCH` parti la première fois est retrouvé, pas renvoyé.
         self.chargement().charger(media.url);
-        play_with_one_retry(self.command_timeout, self.play_retry_timeout, |timeout| {
+        // #6061 — posé par la tentative dès que l'appareil rend son statut :
+        // le réessai saura s'il a répondu.
+        let appareil_joint = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let joint_lu = Arc::clone(&appareil_joint);
+        let (ordinaire, joint) = (self.play_retry_timeout, self.play_retry_timeout_joint);
+        let budget = move || {
+            budget_du_reessai(
+                joint_lu.load(std::sync::atomic::Ordering::SeqCst),
+                ordinaire,
+                joint,
+            )
+        };
+        play_with_one_retry(self.command_timeout, budget, |timeout| {
+            let appareil_joint = Arc::clone(&appareil_joint);
             let cast_media = build_cast_media(media);
             let chargement = Arc::clone(&self.chargement);
             let url = media.url.to_string();
@@ -711,6 +760,13 @@ impl OutputTarget for ChromecastOutput {
                 // en échec retombe sur le lancement — le comportement d'avant.
                 let app_id = app_id_du_lecteur();
                 let status = device.receiver.get_status().ok();
+                // #6061 — l'appareil a RÉPONDU : son statut est arrivé. Pas
+                // avant : la connexion TLS s'établit paresseusement, une
+                // socket ouverte ne prouve pas qu'il y ait quelqu'un derrière
+                // (le pair muet du banc l'a montré).
+                if status.is_some() {
+                    appareil_joint.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 let plan = plan_play(status.as_ref().map(|s| s.applications.as_slice()), &app_id);
 
                 let (transport_id, session_id, session_reused, raison) = match plan {
@@ -1643,7 +1699,7 @@ mod deadline_tests {
 
         let resultat = play_with_one_retry(
             Duration::from_millis(100),
-            Duration::from_millis(300),
+            || Duration::from_millis(300),
             |budget| recepteur.jouer(budget),
         )
         .await;
@@ -1665,7 +1721,7 @@ mod deadline_tests {
 
         let erreur = play_with_one_retry(
             Duration::from_millis(100),
-            Duration::from_millis(150),
+            || Duration::from_millis(150),
             |budget| recepteur.jouer(budget),
         )
         .await
@@ -1692,7 +1748,7 @@ mod deadline_tests {
 
         let erreur = play_with_one_retry(
             Duration::from_millis(100),
-            Duration::from_millis(100),
+            || Duration::from_millis(100),
             |_| {
                 tentatives.fetch_add(1, Ordering::SeqCst);
                 async { Err("chromecast connect: Connection refused (os error 111)".to_string()) }
@@ -1728,11 +1784,17 @@ mod deadline_tests {
     #[tokio::test]
     async fn la_lecture_reessaie_une_fois_sur_un_appareil_muet_et_le_sondage_jamais() {
         let (port, connexions, server) = pair_silencieux_qui_compte().await;
-        let output = test_output(
+        let mut output = test_output(
             port,
             Duration::from_millis(150),
             Arc::new(Semaphore::new(MAX_CAST_COMMAND_WORKERS)),
         );
+        // #6061 — le réessai LONG est réservé à un appareil qui a répondu. Ce
+        // pair accepte TCP mais ne répond jamais : il doit garder le réessai
+        // court, et la borne `duree < 2 s` ci-dessous le prouve. (Une première
+        // version posait le drapeau dès l'ouverture de la connexion : ce test
+        // a duré 30 s, le TLS de `rust_cast` s'établissant paresseusement.)
+        output.play_retry_timeout_joint = Duration::from_secs(30);
 
         let debut = Instant::now();
         let erreur = output
@@ -1763,14 +1825,66 @@ mod deadline_tests {
         server.abort();
     }
 
-    /// Le budget de production reste borné par ce que le poller accorde déjà
-    /// à une zone (5 s) : un premier `Play` lent ne doit pas l'immobiliser
-    /// plus longtemps qu'un appareil mort.
+    /// Le budget de production d'un appareil MUET reste borné par ce que le
+    /// poller accorde déjà à une zone (5 s) : un appareil mort ne doit pas
+    /// l'immobiliser plus longtemps qu'avant. #6061 : seul un appareil qui a
+    /// répondu obtient plus, et jamais plus de 10 s au total.
     #[test]
     fn le_pire_cas_de_la_lecture_tient_dans_le_delai_du_poller() {
         let output = ChromecastOutput::new("c".into(), "c".into(), "127.0.0.1".into(), 8009);
         assert!(output.play_retry_timeout > output.command_timeout);
         assert!(output.command_timeout + output.play_retry_timeout <= Duration::from_secs(5));
+        assert!(output.play_retry_timeout_joint > output.play_retry_timeout);
+        assert!(
+            output.command_timeout + output.play_retry_timeout_joint <= Duration::from_secs(10)
+        );
+    }
+
+    /// #6061 — FabienM, zone Parents, rc3 : la première tentative JOINT
+    /// l'appareil (l'application finit par tourner : la relance manuelle
+    /// réutilise sa session), mais le lancement dépasse 2 + 3 s. Le réessai
+    /// d'un appareil qui a répondu doit attendre la fin du lancement au lieu
+    /// d'arrêter la zone.
+    #[tokio::test]
+    async fn un_appareil_qui_repond_mais_lance_lentement_joue_au_reessai() {
+        // Lancement en 350 ms : plus que 100 + 100 (le réessai court), moins
+        // que 100 + 400 (le réessai d'un appareil joint).
+        let recepteur = RecepteurQuiSeReveille::new(Duration::from_millis(350));
+        let joint = std::sync::atomic::AtomicBool::new(false);
+
+        let resultat = play_with_one_retry(
+            Duration::from_millis(100),
+            || {
+                budget_du_reessai(
+                    joint.load(Ordering::SeqCst),
+                    Duration::from_millis(100),
+                    Duration::from_millis(400),
+                )
+            },
+            |budget| {
+                // Le statut est arrivé : seul le lancement traîne.
+                joint.store(true, Ordering::SeqCst);
+                recepteur.jouer(budget)
+            },
+        )
+        .await;
+
+        assert_eq!(
+            resultat,
+            Ok(()),
+            "un appareil qui a répondu doit avoir le temps de finir son lancement (fil 2199)"
+        );
+        assert_eq!(recepteur.tentatives.load(Ordering::SeqCst), 2);
+    }
+
+    /// #6061 — la règle elle-même : le réessai long ne va qu'à un appareil
+    /// qui a répondu ; un appareil muet garde le budget de #5323.
+    #[test]
+    fn le_reessai_long_est_reserve_a_un_appareil_qui_a_repondu() {
+        let court = Duration::from_secs(3);
+        let long = Duration::from_secs(8);
+        assert_eq!(budget_du_reessai(true, court, long), long);
+        assert_eq!(budget_du_reessai(false, court, long), court);
     }
 }
 

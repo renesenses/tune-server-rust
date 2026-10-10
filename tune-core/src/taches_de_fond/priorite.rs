@@ -55,8 +55,10 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-/// Pause marquée entre deux éléments d'une passe freinée, tant qu'une zone
-/// joue.
+pub mod politique;
+
+/// Pause marquée par défaut entre deux éléments d'une passe freinée, tant
+/// qu'une zone joue — réglable : [`politique::Politique::pause_between_items_ms`].
 ///
 /// Cinq secondes : l'enrichissement MusicBrainz passe d'une piste par seconde
 /// à une toutes les six, un scan de 500 fichiers par lot s'étale — et le
@@ -133,7 +135,8 @@ pub fn noter_etat_de_lecture(zone_id: i64, etat: &str) {
         tracing::info!(
             zone_id,
             zones = n,
-            pause_entre_elements_ms = PAUSE_EN_LECTURE.as_millis() as u64,
+            pause_entre_elements_ms = politique::politique().pause_between_items_ms,
+            freins = politique::politique().enabled,
             "taches_de_fond_ralenties_pour_la_lecture"
         );
     } else {
@@ -210,11 +213,11 @@ pub fn ralenties() -> Vec<&'static str> {
 /// rend `true`. Sinon rend `false` sans dormir — le cas courant doit être
 /// gratuit.
 pub async fn ceder_a_la_lecture(id: &'static str) -> bool {
-    if !lecture_en_cours() {
+    let Some(p) = politique::freins_actifs() else {
         return false;
-    }
+    };
     noter_cedee(id);
-    tokio::time::sleep(PAUSE_EN_LECTURE).await;
+    tokio::time::sleep(p.pause_entre_elements()).await;
     true
 }
 
@@ -223,11 +226,11 @@ pub async fn ceder_a_la_lecture(id: &'static str) -> bool {
 ///
 /// ⚠️ Jamais depuis un fil de l'exécuteur : elle y dormirait en le tenant.
 pub fn ceder_a_la_lecture_bloquant(id: &'static str) -> bool {
-    if !lecture_en_cours() {
+    let Some(p) = politique::freins_actifs() else {
         return false;
-    }
+    };
     noter_cedee(id);
-    std::thread::sleep(PAUSE_EN_LECTURE);
+    std::thread::sleep(p.pause_entre_elements());
     true
 }
 
@@ -248,7 +251,14 @@ where
     T: Send + 'static,
 {
     let debut = Instant::now();
-    let resultat = tokio::task::spawn_blocking(travail).await;
+    // Le fil qui fait le travail est « de fond » le temps du travail : ses
+    // lectures et ses écritures SQLite laissent passer celles de la lecture
+    // ([`politique`]).
+    let resultat = tokio::task::spawn_blocking(move || {
+        let _fond = politique::marquer_le_fil_de_fond();
+        travail()
+    })
+    .await;
     let duree = debut.elapsed();
     if duree >= ECRITURE_LONGUE {
         tracing::info!(
@@ -282,6 +292,10 @@ pub struct ReleveDePriorite {
     pub throttled: Vec<&'static str>,
     /// La pause marquée entre deux éléments d'une passe freinée.
     pub pause_between_items_ms: u64,
+    /// La politique en vigueur (réglage `background_playback_policy`).
+    pub policy: politique::Politique,
+    /// Ce que les freins ont fait depuis le démarrage.
+    pub brakes: politique::ReleveDesFreins,
 }
 
 /// Le relevé, sans la moindre requête : l'écran le sonde en boucle.
@@ -298,7 +312,9 @@ pub fn releve() -> ReleveDePriorite {
         playing_zone_ids: zones,
         since_epoch_s: (depuis != 0).then_some(depuis),
         throttled: ralenties(),
-        pause_between_items_ms: PAUSE_EN_LECTURE.as_millis() as u64,
+        pause_between_items_ms: politique::politique().pause_between_items_ms,
+        policy: politique::politique(),
+        brakes: politique::releve_des_freins(),
     }
 }
 
@@ -314,4 +330,5 @@ pub fn oublier_la_lecture_pour_les_essais() {
     LECTURE.store(false, Ordering::Relaxed);
     DEPUIS.store(0, Ordering::Relaxed);
     vider_les_cedees();
+    politique::oublier_pour_les_essais();
 }

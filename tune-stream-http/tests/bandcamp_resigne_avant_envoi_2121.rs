@@ -312,6 +312,7 @@ impl Banc {
                     track_number: None,
                     disc_number: None,
                     album_ref: page.map(String::from),
+                    artist_ref: None,
                 }],
             )
             .unwrap();

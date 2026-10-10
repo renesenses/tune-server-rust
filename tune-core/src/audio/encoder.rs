@@ -428,6 +428,101 @@ fn encode_block_from_buffers(
     Ok(())
 }
 
+/// FLAC « en trames » pour un transport qui envoie des trames COMPLÈTES une
+/// à une, chacune dans son propre message (Sendspin `player@v1`, #3326).
+///
+/// À la différence du flux de [`AudioEncoder`], rien n'est retenu entre deux
+/// appels : [`Self::trame`] encode exactement les trames PCM reçues en UNE
+/// trame FLAC (taille de bloc fixe annoncée dans STREAMINFO, la dernière
+/// pouvant être plus courte), et [`Self::entete`] rend `fLaC` suivi du bloc
+/// STREAMINFO, seul bloc de métadonnées, que le récepteur reçoit à part.
+pub struct EncodeurTramesFlac {
+    sample_rate: u32,
+    bit_depth: u32,
+    channels: u32,
+    taille_bloc: u16,
+    numero: u32,
+}
+
+impl EncodeurTramesFlac {
+    /// `taille_bloc` : le nombre de trames de chaque trame FLAC (sauf la
+    /// dernière). Profondeurs 16 et 24 bits, 1 à 8 canaux.
+    pub fn nouveau(
+        sample_rate: u32,
+        bit_depth: u32,
+        channels: u32,
+        taille_bloc: u16,
+    ) -> Result<Self, String> {
+        if !matches!(bit_depth, 16 | 24) {
+            return Err(format!("flac: profondeur {bit_depth} non produite"));
+        }
+        if !(1..=8).contains(&channels) {
+            return Err(format!("flac: {channels} canaux"));
+        }
+        if !(16..=u16::MAX).contains(&taille_bloc) || sample_rate == 0 || sample_rate >= 1 << 20 {
+            return Err("flac: bloc ou frequence hors bornes".into());
+        }
+        Ok(Self {
+            sample_rate,
+            bit_depth,
+            channels,
+            taille_bloc,
+            numero: 0,
+        })
+    }
+
+    /// `fLaC` puis STREAMINFO (dernier bloc de métadonnées). Total
+    /// d'échantillons inconnu (0) et MD5 nul : un flux n'a pas de fin connue.
+    #[must_use]
+    pub fn entete(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(42);
+        out.extend_from_slice(b"fLaC");
+        let entete_bloc: u32 = (1 << 31) | 34;
+        out.extend_from_slice(&entete_bloc.to_be_bytes());
+        out.extend_from_slice(&self.taille_bloc.to_be_bytes());
+        out.extend_from_slice(&self.taille_bloc.to_be_bytes());
+        out.extend_from_slice(&[0u8; 6]);
+        let sr_ch_bps: u32 =
+            (self.sample_rate << 12) | ((self.channels - 1) << 9) | ((self.bit_depth - 1) << 4);
+        out.extend_from_slice(&sr_ch_bps.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&[0u8; 16]);
+        out
+    }
+
+    /// Encode `pcm` (entier petit-boutiste entrelacé, trames entières, au
+    /// plus `taille_bloc` trames) en UNE trame FLAC.
+    pub fn trame(&mut self, pcm: &[u8]) -> Result<Vec<u8>, String> {
+        let octets_trame = (self.bit_depth / 8 * self.channels) as usize;
+        if pcm.is_empty() || pcm.len() % octets_trame != 0 {
+            return Err("flac: PCM vide ou trame incomplete".into());
+        }
+        let n = pcm.len() / octets_trame;
+        if n > usize::from(self.taille_bloc) {
+            return Err("flac: plus de trames que la taille de bloc".into());
+        }
+        let entrelaces = pcm_to_i32(pcm, self.bit_depth)?;
+        let ch = self.channels as usize;
+        let mut canaux = vec![Vec::with_capacity(n); ch];
+        for (i, s) in entrelaces.into_iter().enumerate() {
+            canaux[i % ch].push(s);
+        }
+        let tranches: Vec<&[i32]> = canaux.iter().map(Vec::as_slice).collect();
+        let mut out = Vec::with_capacity(pcm.len() / 2 + 32);
+        encode_flac_frame_slices(
+            &mut out,
+            &tranches,
+            n,
+            self.sample_rate,
+            self.bit_depth,
+            self.channels,
+            self.numero,
+        )?;
+        self.numero = self.numero.wrapping_add(1);
+        Ok(out)
+    }
+}
+
 /// Finalize the FLAC stream: encode remaining samples, patch STREAMINFO, return output.
 fn flac_finish(
     mut state: FlacStreamState,
@@ -1866,5 +1961,65 @@ mod tests {
             "l'encodeur écrit du FLAC pour une cible AIFF — l'étiquette servie \
              doit donc venir de format_effectif, pas de la cible demandée"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_trames_flac_sendspin {
+    use super::*;
+
+    /// #3326 — FLAC « une trame par morceau » (Sendspin `player@v1`) : l'en-tête
+    /// `fLaC` + STREAMINFO suivi des trames encodées une à une se décode à
+    /// l'identique, dernière trame courte comprise.
+    #[test]
+    fn i3326_trames_flac_isolees_sans_perte_octet_pour_octet() {
+        let (taux, bloc, n) = (44_100u32, 2_205u16, 2_205 * 4 + 1_000);
+        let mut pcm = Vec::with_capacity(n * 6);
+        for i in 0..n {
+            let g = ((i as f64 * 0.031).sin() * 8_000_000.0) as i32;
+            let d = (((i * 7_919) % 16_000_000) as i32) - 8_000_000;
+            pcm.extend_from_slice(&g.to_le_bytes()[..3]);
+            pcm.extend_from_slice(&d.to_le_bytes()[..3]);
+        }
+        let mut enc = EncodeurTramesFlac::nouveau(taux, 24, 2, bloc).unwrap();
+        let mut flux = enc.entete();
+        assert_eq!(&flux[..4], b"fLaC");
+        assert_eq!(flux.len(), 42, "fLaC + en-tete de bloc + STREAMINFO (34)");
+        assert_eq!(flux[4] & 0x80, 0x80, "STREAMINFO est le dernier bloc");
+        for morceau in pcm.chunks(usize::from(bloc) * 6) {
+            flux.extend_from_slice(&enc.trame(morceau).unwrap());
+        }
+        let tmp = tempfile::Builder::new().suffix(".flac").tempfile().unwrap();
+        std::fs::write(tmp.path(), &flux).unwrap();
+        let dec =
+            crate::audio::decode::decode_to_pcm(tmp.path().to_str().unwrap(), None, None, 0.0, 0.0)
+                .expect("le flux FLAC en trames se decode");
+        assert_eq!(
+            (dec.sample_rate, dec.channels, dec.bit_depth),
+            (taux, 2, 24)
+        );
+        let attendu = pcm_to_i32(&pcm, 24).unwrap();
+        assert_eq!(
+            dec.samples_i32.len(),
+            attendu.len(),
+            "nombre d'echantillons"
+        );
+        assert!(
+            dec.samples_i32 == attendu,
+            "FLAC sans perte, echantillon pour echantillon"
+        );
+    }
+
+    #[test]
+    fn i3326_trames_flac_refusent_ce_qu_elles_ne_savent_pas_faire() {
+        assert!(EncodeurTramesFlac::nouveau(48_000, 32, 2, 2_400).is_err());
+        assert!(EncodeurTramesFlac::nouveau(48_000, 16, 2, 8).is_err());
+        let mut e = EncodeurTramesFlac::nouveau(48_000, 16, 2, 100).unwrap();
+        assert!(e.trame(&[0u8; 3]).is_err(), "trame incomplete");
+        assert!(
+            e.trame(&vec![0u8; 101 * 4]).is_err(),
+            "plus long que le bloc"
+        );
+        assert!(e.trame(&[0u8; 400]).is_ok());
     }
 }
