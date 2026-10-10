@@ -1102,7 +1102,7 @@ pub fn est_une_image_de_pochette(chemin: &Path) -> bool {
     chemin
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| FOLDER_COVER_NAMES.iter().any(|c| c.eq_ignore_ascii_case(n)))
+        .is_some_and(|n| crate::library::artwork::rang_de_pochette(n).is_some())
 }
 
 #[cfg(test)]
