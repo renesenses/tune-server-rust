@@ -13,6 +13,7 @@ use tune_core::source_pcm::{FluxPcm, FormatPcm, FournisseurPcm};
 use crate::discid::disc_id;
 use crate::flux::FluxPiste;
 use crate::lecteur::LecteurDisque;
+use crate::memoire::MemoireCd;
 use crate::toc::{OCTETS_PAR_SECTEUR, duree_ms_de_secteurs, secteur_de_position};
 
 /// Le nom de la source, dans la file et dans `now_playing.source`.
@@ -36,6 +37,19 @@ pub fn plage(debut_piste: u32, secteurs: u32, depuis_ms: u64) -> (u32, u32) {
 
 pub struct FournisseurCd {
     pub lecteur: Arc<dyn LecteurDisque>,
+    /// #6043 — le disque chargé en mémoire. `None`, ou réglage désactivé :
+    /// chaque piste relit le lecteur en temps réel (`FluxPiste`).
+    pub memoire: Option<Arc<MemoireCd>>,
+}
+
+impl FournisseurCd {
+    /// Sans chargement en mémoire : la lecture en temps réel.
+    pub fn direct(lecteur: Arc<dyn LecteurDisque>) -> Self {
+        Self {
+            lecteur,
+            memoire: None,
+        }
+    }
 }
 
 impl FournisseurPcm for FournisseurCd {
@@ -57,23 +71,32 @@ impl FournisseurPcm for FournisseurCd {
             .ok_or_else(|| format!("la piste {numero} n'est pas une piste audio de ce disque"))?;
         let secteurs = toc.secteurs(numero).unwrap_or(0);
         let (debut, fin) = plage(piste.debut, secteurs, depuis_ms);
+        let chargement = self
+            .memoire
+            .as_ref()
+            .and_then(|m| m.chargement(&self.lecteur, &toc, disc_demande, generation, debut));
         tracing::info!(
             piste = numero,
             depuis_ms,
             premier_secteur = debut,
             fin_exclue = fin,
+            en_memoire = chargement.is_some(),
             "cd_piste_ouverte"
         );
-        Ok(FluxPcm {
-            format: FormatPcm::CD,
-            octets: (fin - debut) as u64 * OCTETS_PAR_SECTEUR as u64,
-            duree_ms: duree_ms_de_secteurs(secteurs),
-            lecteur: Box::new(FluxPiste::new_avec_generation(
+        let lecteur: Box<dyn std::io::Read + Send> = match chargement {
+            Some(c) => Box::new(c.flux(debut, fin)),
+            None => Box::new(FluxPiste::new_avec_generation(
                 self.lecteur.clone(),
                 debut,
                 fin,
                 generation,
             )),
+        };
+        Ok(FluxPcm {
+            format: FormatPcm::CD,
+            octets: (fin - debut) as u64 * OCTETS_PAR_SECTEUR as u64,
+            duree_ms: duree_ms_de_secteurs(secteurs),
+            lecteur,
         })
     }
 }
@@ -87,7 +110,7 @@ mod tests {
 
     fn fournisseur() -> (FournisseurCd, Arc<LecteurSimule>) {
         let l = Arc::new(LecteurSimule::new(toc_du_vecteur()));
-        (FournisseurCd { lecteur: l.clone() }, l)
+        (FournisseurCd::direct(l.clone()), l)
     }
 
     fn lire(f: &FournisseurCd, piste: u8, depuis_ms: u64) -> (FluxPcm, Vec<u8>) {
