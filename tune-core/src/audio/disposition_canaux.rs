@@ -109,6 +109,33 @@ impl Disposition {
         };
         Some(Self(p.to_vec()))
     }
+    /// Le badge affiché sous la pochette (« 4.0 », « 5.1 », « 7.1 »…).
+    ///
+    /// Compté sur les POSITIONS déclarées, pas sur le nombre de canaux :
+    /// voies pleine bande au sol, puis LFE, puis hauteurs. Un 4.0 (FL FR BL
+    /// BR, masque 0x33) n'est plus un « 5.1 », un 6.0 (FL FR FC BL BR BC)
+    /// non plus. `None` pour la mono et la stéréo, comme
+    /// [`crate::audio::channels::channel_badge`].
+    pub fn badge(&self) -> Option<String> {
+        if self.canaux() <= 2 {
+            return None;
+        }
+        const HAUTEURS: u32 = TC | TFL | TFC | TFR | TBL | TBC | TBR;
+        let compte = |filtre: &dyn Fn(u32) -> bool| self.0.iter().filter(|p| filtre(**p)).count();
+        let lfe = compte(&|p| p == LFE);
+        let hauteurs = compte(&|p| p & HAUTEURS != 0);
+        let sol = self.0.len() - lfe - hauteurs;
+        let nom = if hauteurs > 0 {
+            format!("{sol}.{lfe}.{hauteurs}")
+        } else {
+            format!("{sol}.{lfe}")
+        };
+        // Mêmes libellés que les dispositions nommées du serveur (#5576).
+        Some(match nom.as_str() {
+            "7.1.4" | "9.1.6" => format!("{nom} Atmos / Auro-3D"),
+            _ => nom,
+        })
+    }
     /// Cette disposition est-elle exactement celle que Tune supposait ?
     pub fn est_par_defaut(&self) -> bool {
         Self::par_defaut(self.canaux()).as_ref() == Some(self)
@@ -197,7 +224,7 @@ fn wav(f: &mut (impl Read + Seek)) -> Option<Disposition> {
     None
 }
 
-fn flac(f: &mut impl Read) -> Option<Disposition> {
+fn flac(f: &mut (impl Read + Seek)) -> Option<Disposition> {
     let mut canaux = 0u16;
     let mut lu = 4u64;
     loop {
@@ -208,12 +235,20 @@ fn flac(f: &mut impl Read) -> Option<Disposition> {
         if lu > LECTURE_MAX {
             return None;
         }
-        let corps = lire_n(f, taille)?;
         match h[0] & 0x7F {
             // STREAMINFO : canaux sur 3 bits, octet 12 (bits 1..3), plus 1.
-            0 if corps.len() >= 13 => canaux = u16::from((corps[12] >> 1) & 0x07) + 1,
-            4 => return commentaire_flac(&corps, canaux),
-            _ => {}
+            0 => {
+                let corps = lire_n(f, taille)?;
+                if corps.len() >= 13 {
+                    canaux = u16::from((corps[12] >> 1) & 0x07) + 1;
+                }
+            }
+            4 => return commentaire_flac(&lire_n(f, taille)?, canaux),
+            // Les autres blocs (PICTURE de plusieurs Mio…) sont SAUTÉS : le
+            // badge de la bibliothèque lit cet en-tête à chaque liste.
+            _ => {
+                f.seek(SeekFrom::Current(taille as i64)).ok()?;
+            }
         }
         if dernier {
             return None;
