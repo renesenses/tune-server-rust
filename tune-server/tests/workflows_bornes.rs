@@ -239,7 +239,12 @@ fn tune_os_recoit_version_sha_source_et_checksums_immuables() {
         // demarrage reel dans qemu-system-aarch64 : le train l'attend et la
         // matrice staged l'exige.
         "wait_workflow build-arm64-vm-image.yml",
-        "aarch64-vm-.*\\.qcow2$",
+        // Nom EXACT de l'asset (tune-os scripts/build-arm64-vm-image.sh),
+        // version tiree du tag OS, et son .sha256.
+        "OS_V=\"${OS_TAG#tune-os-rpi-v}\"",
+        "VM_RE=\"tune-os-fedora[0-9]+-aarch64-vm-${OS_V//./\\\\.}-[0-9]{8}\\\\.qcow2\"",
+        "grep -Eq \"^${VM_RE}\\$\" <<<\"$ASSETS\"",
+        "grep -Eq \"^${VM_RE}\\\\.sha256\\$\" <<<\"$ASSETS\"",
     ] {
         assert!(
             os.contains(preuve),
@@ -274,7 +279,13 @@ fn la_promotion_est_manuelle_armee_et_idempotente() {
     );
     assert!(promotion.contains("Android inchange : absent du manifeste a quatre composants"));
     // #5529 — la promotion ne publie pas une release OS sans l'image VM ARM64.
-    assert!(promotion.contains("aarch64-vm-.*\\.qcow2$"));
+    assert!(
+        promotion.contains(
+            "VM_RE=\"tune-os-fedora[0-9]+-aarch64-vm-${OS_V//./\\\\.}-[0-9]{8}\\\\.qcow2\""
+        )
+    );
+    assert!(promotion.contains("grep -Eq \"^${VM_RE}\\$\" <<<\"$OS_ASSETS\""));
+    assert!(promotion.contains("grep -Eq \"^${VM_RE}\\\\.sha256\\$\" <<<\"$OS_ASSETS\""));
 }
 
 #[test]
