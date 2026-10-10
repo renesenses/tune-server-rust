@@ -15,6 +15,7 @@ mod database;
 #[cfg(test)]
 mod diagnostic_sans_ecrivain_tests;
 pub(crate) mod diagnostics;
+pub(crate) mod sauvegarde_cloud;
 // `pub(crate)` depuis #2507 : `enrich::QuotaDuJour` est la lecture unique du
 // compteur journalier, et les essais de `routes/library/artwork.rs` la lisent
 // pour épuiser le quota comme le serveur le compte.
@@ -345,7 +346,8 @@ pub fn router() -> Router<AppState> {
             "/playlist-hub/{hub_id}/transfer",
             post(playlist_hub::transfer),
         )
-        // Cloud config backup — full server config export/import/push/pull.
+        // Config backup — full server config export/import (the cloud copy is
+        // `/config-backup/cloud/*` below).
         // GET export omits streaming tokens; POST takes the passphrase and
         // returns them sealed (audit item 7).
         .route(
@@ -359,11 +361,28 @@ pub fn router() -> Router<AppState> {
                 .post(config_backup::set_passphrase)
                 .put(config_backup::change_passphrase),
         )
-        .route("/config-backup/cloud-push", post(config_backup::cloud_push))
-        .route("/config-backup/cloud-pull", post(config_backup::cloud_pull))
+        // Sauvegarde cloud AUTOMATIQUE et tournante des personnalisations,
+        // chiffrée avant l'envoi, restaurable sur une machine neuve (#5654).
+        .route("/config-backup/cloud/status", get(sauvegarde_cloud::status))
         .route(
-            "/config-backup/cloud-status",
-            get(config_backup::cloud_status),
+            "/config-backup/cloud/enable",
+            post(sauvegarde_cloud::enable),
+        )
+        .route(
+            "/config-backup/cloud/disable",
+            post(sauvegarde_cloud::disable),
+        )
+        .route(
+            "/config-backup/cloud/backup-now",
+            post(sauvegarde_cloud::backup_now),
+        )
+        .route(
+            "/config-backup/cloud/snapshots",
+            get(sauvegarde_cloud::snapshots),
+        )
+        .route(
+            "/config-backup/cloud/restore",
+            post(sauvegarde_cloud::restore),
         )
         // Weekly digest — new releases from library artists
         .route("/new-releases", get(new_releases_handler))

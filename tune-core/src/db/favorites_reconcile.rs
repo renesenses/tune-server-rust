@@ -301,6 +301,38 @@ impl FavoritesReconciler {
         Ok(stats)
     }
 
+    /// Identité lisible (nom, artiste, chemin) d'un item favori vivant, pour
+    /// la sauvegarde cloud des personnalisations (#5654) : un identifiant de
+    /// bibliothèque ne désigne rien sur une autre machine.
+    pub(crate) fn identite_vivante(
+        &self,
+        item_type: &str,
+        item_id: i64,
+    ) -> Result<Option<(String, String, String)>, String> {
+        Ok(self
+            .lookup_live(item_type, item_id)?
+            .map(|i| (i.name, i.artist, i.path)))
+    }
+
+    /// L'item vivant de CETTE bibliothèque qui porte cette identité, par les
+    /// mêmes règles que la réconciliation (homonymes refusés).
+    pub(crate) fn retrouver(
+        &self,
+        item_type: &str,
+        name: &str,
+        artist: &str,
+        path: &str,
+    ) -> Result<Option<i64>, String> {
+        self.find_live_id(
+            item_type,
+            &Identity {
+                name: name.to_string(),
+                artist: artist.to_string(),
+                path: path.to_string(),
+            },
+        )
+    }
+
     /// Identité de l'item vivant référencé par (item_type, item_id), ou None
     /// s'il n'existe plus.
     fn lookup_live(&self, item_type: &str, item_id: i64) -> Result<Option<Identity>, String> {

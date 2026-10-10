@@ -15,6 +15,9 @@ mod session_message;
 #[cfg(test)]
 #[path = "playback/titre_seul_album_5372_tests.rs"]
 mod titre_seul_album_5372_tests;
+#[cfg(test)]
+#[path = "playback/version_jouee_2264_tests.rs"]
+mod version_jouee_2264_tests;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -969,6 +972,13 @@ struct PlayRequest {
     /// d'artiste, genres). Rangée avec la ligne de file si elle est sûre
     /// (`zones::page_d_album_bandcamp_sure`), ignorée pour toute autre source.
     album_ref: Option<String>,
+    /// #2264 — `true` quand l'auditeur a choisi CETTE version à la main
+    /// (panneau « Autres versions ») : la règle de version ne s'applique pas
+    /// à cette lecture. Absent ou `false` : lancement normal, la règle du
+    /// profil choisit la version jouée. Ne vaut que pour une piste seule
+    /// (`track_id`, ou `source` + `source_id`).
+    #[serde(default)]
+    explicit_version: bool,
 }
 
 /// Les cinq natures d'objet que l'auditeur peut demander, telles que FabienM
@@ -1927,6 +1937,25 @@ async fn play(
         .playback
         .set_session_profile(zone_id, Some(profile.id()))
         .await;
+    // #2264 — un choix fait dans « Autres versions » prime sur la règle de
+    // version : épinglé pour la lecture qui suit, qu'elle passe par la file
+    // ou non. Une liste ou un conteneur n'est pas un choix de version.
+    if let Some(Json(b)) = body.as_ref()
+        && b.explicit_version
+        && b.track_ids.is_none()
+        && b.album_id.is_none()
+        && b.playlist_id.is_none()
+        && b.streaming_album_id.is_none()
+        && b.streaming_playlist_id.is_none()
+        && (b.track_id.is_some() || b.source_id.is_some())
+    {
+        state.orchestrator.epingler_version_explicite(
+            zone_id,
+            b.track_id,
+            b.source.as_deref(),
+            b.source_id.as_deref(),
+        );
+    }
     // When called with an empty body (e.g. Play after Stop), resume the
     // current track instead of returning 400 "no track source specified".
     let body = match body {

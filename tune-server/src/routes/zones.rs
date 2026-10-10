@@ -1510,6 +1510,10 @@ mod signal_path_ombre_5081_tests;
 #[cfg(test)]
 mod signal_path_crossfeed_greffon_tests;
 
+// #6044 — l'étape « Réaffectation des canaux » du chemin du signal.
+#[cfg(test)]
+mod signal_path_reaffectation_6044_tests;
+
 // #5633 — PURE ignore le ReplayGain, et le chemin du signal le dit.
 #[cfg(test)]
 mod signal_path_pure_replaygain_5633_tests;

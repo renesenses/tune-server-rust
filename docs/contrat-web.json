@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "42576e35ac7af127826cd4c39cbf4195e6328c9c",
+    "web_sha": "f972adc05498806bebcc3c34451f8f5ced213cd8",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -100,7 +100,7 @@
     {
       "route": "/converter/presets",
       "methode": "GET",
-      "type": "(retour de fonction)",
+      "type": "ConverterPreset",
       "liste": true,
       "champs_obligatoires": [
         "id",
@@ -108,10 +108,13 @@
         "format",
         "quality",
         "sample_rate",
-        "bit_depth",
-        "estimated_size_per_min"
+        "bit_depth"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "dsd_sample_rate",
+        "sample_rate_choices",
+        "estimated_size_per_min"
+      ]
     },
     {
       "route": "/converter/start",
@@ -1068,46 +1071,6 @@
       ],
       "champs_optionnels": [
         "path"
-      ]
-    },
-    {
-      "route": "/library/albums/{}/similar",
-      "methode": "GET",
-      "type": "Album",
-      "liste": true,
-      "champs_obligatoires": [
-        "id",
-        "title"
-      ],
-      "champs_optionnels": [
-        "added_at",
-        "focus_track_ids",
-        "credit_roles",
-        "artist_id",
-        "artist_name",
-        "year",
-        "original_year",
-        "release_date",
-        "original_date",
-        "genre",
-        "genres",
-        "disc_count",
-        "track_count",
-        "cover_path",
-        "source",
-        "source_id",
-        "sample_rate",
-        "bit_depth",
-        "format",
-        "quality",
-        "label",
-        "catalog_number",
-        "dynamic_range",
-        "is_compilation",
-        "release_type",
-        "inferred_release_type",
-        "release_secondary_types",
-        "dynamic_range_source"
       ]
     },
     {
@@ -2631,12 +2594,14 @@
       "liste": true,
       "champs_obligatoires": [
         "name",
-        "version",
-        "status",
-        "description"
+        "enabled"
       ],
       "champs_optionnels": [
-        "error_message"
+        "installed",
+        "version",
+        "display_name",
+        "description",
+        "restart_required"
       ]
     },
     {
@@ -2649,19 +2614,19 @@
         "display_name",
         "description",
         "version",
-        "category",
         "compatible",
-        "installed",
-        "update_available",
-        "status"
+        "installed"
       ],
       "champs_optionnels": [
+        "category",
         "author",
         "icon",
         "install_count",
         "platforms",
         "enabled",
         "installed_version",
+        "update_available",
+        "status",
         "error_message",
         "error_reason",
         "setup_duration_ms",
@@ -2729,19 +2694,19 @@
         "display_name",
         "description",
         "version",
-        "category",
         "compatible",
-        "installed",
-        "update_available",
-        "status"
+        "installed"
       ],
       "champs_optionnels": [
+        "category",
         "author",
         "icon",
         "install_count",
         "platforms",
         "enabled",
         "installed_version",
+        "update_available",
+        "status",
         "error_message",
         "error_reason",
         "setup_duration_ms",
@@ -3258,70 +3223,30 @@
       "champs_optionnels": []
     },
     {
+      "route": "/streaming/youtube/charts",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "country",
+        "sections"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/streaming/youtube/home",
       "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
-        "sections",
-        "data"
+        "sections"
       ],
       "champs_optionnels": []
     },
     {
-      "route": "/streaming/youtube/library",
-      "methode": "GET",
-      "type": "Track",
-      "liste": true,
-      "champs_obligatoires": [
-        "id",
-        "title"
-      ],
-      "champs_optionnels": [
-        "album_id",
-        "album_id_service",
-        "album_title",
-        "artist_id",
-        "artist_id_service",
-        "artist_name",
-        "album_artist",
-        "disc_number",
-        "disc_subtitle",
-        "grouping",
-        "track_number",
-        "duration_ms",
-        "file_path",
-        "cue_media_path",
-        "cue_start_ms",
-        "cue_end_ms",
-        "path_terms",
-        "format",
-        "sample_rate",
-        "bit_depth",
-        "channels",
-        "channel_badge",
-        "cover_path",
-        "source",
-        "source_id",
-        "gapless_next",
-        "genre",
-        "year",
-        "label",
-        "composer",
-        "isrc",
-        "bpm",
-        "comments",
-        "musicbrainz_recording_id",
-        "dynamic_range",
-        "play_count",
-        "last_played_at",
-        "banned"
-      ]
-    },
-    {
       "route": "/streaming/youtube/moods",
       "methode": "GET",
-      "type": "(en ligne)",
+      "type": "YtCategorieAmbiances",
       "liste": true,
       "champs_obligatoires": [
         "title",
@@ -3333,12 +3258,9 @@
       "route": "/streaming/youtube/moods/{}",
       "methode": "GET",
       "type": "(en ligne)",
-      "liste": true,
+      "liste": false,
       "champs_obligatoires": [
-        "title",
-        "playlistId",
-        "description",
-        "cover_path"
+        "sections"
       ],
       "champs_optionnels": []
     },
@@ -4061,18 +3983,6 @@
       "champs_optionnels": []
     },
     {
-      "route": "/system/admin/errors",
-      "methode": "GET",
-      "type": "AdminError",
-      "liste": true,
-      "champs_obligatoires": [
-        "ts",
-        "level",
-        "event"
-      ],
-      "champs_optionnels": []
-    },
-    {
       "route": "/system/admin/health",
       "methode": "GET",
       "type": "AdminHealth",
@@ -4089,26 +3999,6 @@
         "scan_status",
         "disk_free_gb",
         "disk_total_gb"
-      ],
-      "champs_optionnels": []
-    },
-    {
-      "route": "/system/admin/zones",
-      "methode": "GET",
-      "type": "AdminZone",
-      "liste": true,
-      "champs_obligatoires": [
-        "id",
-        "name",
-        "state",
-        "output_type",
-        "device_name",
-        "online",
-        "current_track",
-        "position_ms",
-        "volume",
-        "buffer",
-        "group_id"
       ],
       "champs_optionnels": []
     },
@@ -6307,11 +6197,6 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/streaming/youtube/charts",
-      "type": "Record<string, any[]>",
-      "raison": "type non structurel"
-    },
-    {
       "route": "/playlist-manager/services",
       "type": "Record<string, { authenticated: boolean; supports_write: boolean; supports_delete?: boolean }>",
       "raison": "type non structurel"
@@ -6768,7 +6653,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 332,
-    "appels_non_resolus": 160
+    "routes_cartographiees": 329,
+    "appels_non_resolus": 159
   }
 }
