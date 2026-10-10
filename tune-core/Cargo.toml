@@ -724,3 +724,10 @@ required-features = ["audio-embedding"]
 [[test]]
 name = "wav24_chaine_progressive_b209bf"
 path = "tests/wav24_chaine_progressive_b209bf.rs"
+
+# #4770 — le dossier de travail des scripts d'image (témoin shell joué depuis
+# Rust). `autotests = false` : sans cette cible, le fichier ne serait jamais
+# compilé.
+[[test]]
+name = "scripts_image_dossier_de_travail_4770"
+path = "tests/scripts_image_dossier_de_travail_4770.rs"
