@@ -140,6 +140,20 @@ premier_acces() {
     publish_runtime
 }
 
+# --reinitialiser (#3206): forgotten password of `tune`. Tune OS no longer
+# grants this account passwordless sudo, so `sudo passwd tune` from the
+# console is gone. The image's console-only helper
+# (/usr/local/libexec/tune-os-mot-de-passe-oublie) checks the terminal, then
+# calls `tune-server --tune-os-reinitialiser-mot-de-passe`, which lands here:
+# the SAME rotation as the first access — a fresh random password, expired at
+# once so that the owner's next choice goes through pam_pwquality (cracklib) —
+# published for the console screens only. Nothing is written to stdout or
+# stderr but the generic notice of rotate_and_expire.
+reinitialiser() {
+    rotate_and_expire "reset-from-console"
+    publish_runtime
+}
+
 main() {
     [[ ${EUID:-$(id -u)} -eq 0 ]] || {
         echo "Tune OS: cette opération doit être exécutée par root" >&2
@@ -150,7 +164,8 @@ main() {
         --migrate-legacy) migrate_legacy ;;
         --acknowledge) acknowledge_change ;;
         --premier-acces) premier_acces ;;
-        *) echo "usage: $0 --first-boot|--migrate-legacy|--acknowledge|--premier-acces" >&2; return 2 ;;
+        --reinitialiser) reinitialiser ;;
+        *) echo "usage: $0 --first-boot|--migrate-legacy|--acknowledge|--premier-acces|--reinitialiser" >&2; return 2 ;;
     esac
 }
 

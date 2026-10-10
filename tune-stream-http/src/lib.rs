@@ -588,6 +588,40 @@ pub async fn handle_stream(
             return (StatusCode::RANGE_NOT_SATISFIABLE, h).into_response();
         }
     }
+    // ── Le même rejeu depuis 0, sur un flux chunké ──
+    //
+    // Zone 10 du .18 (Eversolo DMP-A8, `dlna_wav24`, 1.0.0-rc2, 08/10) : une
+    // conversion Qobuz progressive n'a pas de durée, donc pas de
+    // `wav_length`, et la branche ci-dessus ne la voyait pas. Trois
+    // `bytes=0-` de `Lavf/58.45.100` : la troisième recevait l'en-tête rejoué
+    // PUIS le tuyau à l'octet 38 139 668, 2 min 24 s dans la piste — un
+    // en-tête collé au milieu du signal, là où un fichier rend le début. Le
+    // morceau s'entendait « déformé, avec du bruit ». La retenue est tenue
+    // tout pareil sur ce flux : tant qu'elle commence à 0, on la rejoue à
+    // l'octet, en-tête compris. Rien ne change d'autre : pas de longueur
+    // annoncée, toujours un 200 chunké.
+    if wav_length.is_none() && retenue_possible && depuis_le_debut && reprise_candidate == Some(0) {
+        let (retenue_debut, retenue_fin) = session.etendue_retenue();
+        if retenue_debut == 0 {
+            reprise_exacte = Some(0);
+            info!(
+                stream_id,
+                range = range_hdr,
+                retenue_fin,
+                "reprise_rejouee_depuis_la_retenue — flux chunké : une lecture demande le DÉBUT \
+                 après qu'une connexion précédente a tiré le tuyau ; servi à l'octet depuis 0"
+            );
+        } else {
+            warn!(
+                stream_id,
+                range = range_hdr,
+                retenue_debut,
+                retenue_fin,
+                "debut_de_piste_perdu — flux chunké : la retenue a déjà glissé, l'en-tête est \
+                 rejoué puis le direct"
+            );
+        }
+    }
 
     let finite_range_start = range_demande.filter(|s| longueur.is_none_or(|len| *s < len));
     let use_partial = finite_range_start.is_some() && longueur.is_some();
@@ -5147,6 +5181,9 @@ mod long_wav_4016;
 
 #[cfg(test)]
 mod reprise_navigateur_5426;
+
+#[cfg(test)]
+mod relais_wav24_b209bf;
 
 /// #4645 — la mesure du terrain perdu pendant le service d'un fichier.
 ///

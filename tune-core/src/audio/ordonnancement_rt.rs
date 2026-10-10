@@ -40,6 +40,17 @@
 //! - [`fiche`] rend le tout pour `/system/diagnostics` (`audio_realtime`),
 //!   même avant toute lecture et même sans `local-audio`.
 //!
+//! ## Lot b209 (07/10) : le repli `nice`, pour le service sous `User=tune`
+//!
+//! Le service de Tune OS descend de root vers l'utilisateur `tune` : le droit
+//! temps réel vient alors **seulement** des limites (`LimitRTPRIO=`,
+//! `limits.d`), jamais d'un privilège. Quand le noyau refuse `SCHED_FIFO`
+//! (`EPERM`), le fil reste en `SCHED_OTHER` mais demande un `nice` négatif
+//! ([`NICE_VISE`]) **si `RLIMIT_NICE` le permet** ([`decider_le_nice`]) — sans
+//! root ni `CAP_SYS_NICE`. Le verdict porte ce repli (`fallback`), dans le
+//! journal comme dans `/system/diagnostics`. `TUNE_AUDIO_RT_PRIORITY=0` coupe
+//! les deux : rien n'est demandé.
+//!
 //! ⚠️ Ce qu'aucune épreuve ne peut établir ici : l'effet sur les xruns d'un
 //! DAC réel. La machine de compilation n'a ni carte son ni droit temps réel
 //! (`ulimit -r` = 0) ; le chemin « obtenu » n'y est prouvé que par la décision
@@ -87,6 +98,8 @@ pub enum OrdonnancementTempsReel {
         rlimit_rtprio: Option<u32>,
         /// L'erreur du noyau, en clair.
         cause: String,
+        /// Le repli tenté après le refus : un `nice` négatif, s'il est permis.
+        fallback: RepliNice,
     },
     /// Rien n'a été demandé : `TUNE_AUDIO_RT_PRIORITY=0`.
     Desactive,
@@ -99,6 +112,44 @@ impl OrdonnancementTempsReel {
     pub fn obtenu(&self) -> bool {
         matches!(self, Self::Obtenu { .. })
     }
+}
+
+/// Le `nice` visé quand `SCHED_FIFO` est refusé : celui que PulseAudio prend
+/// pour son propre fil (−11), assez pour passer devant le scanner (+10) et le
+/// serveur HTTP (0), assez loin de −20 pour ne pas affamer le système.
+pub const NICE_VISE: i32 = -11;
+const _: () = assert!(NICE_VISE < 0 && NICE_VISE > -20);
+
+/// Le repli quand le noyau refuse `SCHED_FIFO` : le fil reste en
+/// `SCHED_OTHER`, à un `nice` négatif si `RLIMIT_NICE` le permet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RepliNice {
+    /// Le fil tourne en `SCHED_OTHER` à ce `nice`.
+    Obtenu {
+        nice: i32,
+        /// La limite douce `RLIMIT_NICE` (`None` = illimitée).
+        rlimit_nice: Option<u32>,
+    },
+    /// Non tenté : la limite n'autorise aucun `nice` négatif.
+    NonPermis { rlimit_nice: Option<u32> },
+    /// Tenté, refusé par le noyau ; le fil garde son `nice`.
+    Refuse { nice: i32, cause: String },
+}
+
+/// Le `nice` à demander, pur : `None` quand la limite douce `RLIMIT_NICE` ne
+/// permet aucun `nice` négatif. Sous Linux, la limite `l` autorise jusqu'à
+/// `20 − l` (`l = 0`, le défaut : rien ; `l = 39`, le `nice -19` de
+/// `limits.d` : jusqu'à −19). `None` = illimitée.
+pub fn decider_le_nice(vise: i32, limite_douce: Option<u32>) -> Option<i32> {
+    let plancher = match limite_douce {
+        None => -20,
+        Some(l) => 20 - (l.min(40) as i32),
+    };
+    if plancher >= 0 {
+        return None;
+    }
+    Some(vise.max(plancher).min(-1))
 }
 
 /// La priorité à demander, bornée par la limite douce `RLIMIT_RTPRIO`
@@ -241,7 +292,10 @@ fn premiere_fois_dans(
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{OrdonnancementTempsReel, POLITIQUE, Reglage, VerrouillageMemoire, decider};
+    use super::{
+        NICE_VISE, OrdonnancementTempsReel, POLITIQUE, Reglage, RepliNice, VerrouillageMemoire,
+        decider, decider_le_nice,
+    };
 
     /// `sched_param` à la priorité donnée, les autres champs à zéro. Jamais
     /// par littéral : la structure de musl porte quatre champs de plus
@@ -268,6 +322,56 @@ mod linux {
             return None;
         }
         Some(lim.rlim_cur.min(u32::MAX as libc::rlim_t) as u32)
+    }
+
+    /// Limite douce `RLIMIT_NICE` du processus ; `None` = illimitée.
+    pub fn limite_nice() -> Option<u32> {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY : comme `limite_rtprio`.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NICE, &mut lim) };
+        if rc != 0 {
+            return Some(0);
+        }
+        if lim.rlim_cur == libc::RLIM_INFINITY {
+            return None;
+        }
+        Some(lim.rlim_cur.min(u32::MAX as libc::rlim_t) as u32)
+    }
+
+    /// Identifiant noyau du fil courant : sous Linux, `PRIO_PROCESS` avec un
+    /// tid ne vise que ce fil (comme le scanner, `walker.rs`).
+    fn tid() -> libc::id_t {
+        // SAFETY : appel sans argument ni effet de bord.
+        unsafe { libc::syscall(libc::SYS_gettid) as libc::id_t }
+    }
+
+    /// `nice` du fil courant, tel que le noyau le tient.
+    #[cfg(test)]
+    pub fn nice_du_fil_courant() -> i32 {
+        // SAFETY : lecture sans effet de bord.
+        unsafe { libc::getpriority(libc::PRIO_PROCESS as _, tid()) }
+    }
+
+    /// Le repli après un refus de `SCHED_FIFO` : un `nice` négatif pour le fil
+    /// courant, s'il est permis.
+    pub fn replier_sur_nice() -> RepliNice {
+        let rlimit_nice = limite_nice();
+        let Some(nice) = decider_le_nice(NICE_VISE, rlimit_nice) else {
+            return RepliNice::NonPermis { rlimit_nice };
+        };
+        // SAFETY : appel sans pointeur ; au pire le noyau refuse.
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS as _, tid(), nice) };
+        if rc == 0 {
+            RepliNice::Obtenu { nice, rlimit_nice }
+        } else {
+            RepliNice::Refuse {
+                nice,
+                cause: std::io::Error::last_os_error().to_string(),
+            }
+        }
     }
 
     /// Politique et priorité du fil courant, telles que le noyau les tient —
@@ -349,6 +453,7 @@ mod linux {
                 priority,
                 rlimit_rtprio,
                 cause: std::io::Error::from_raw_os_error(rc).to_string(),
+                fallback: replier_sur_nice(),
             }
         }
     }
@@ -469,6 +574,8 @@ pub struct FicheTempsReel {
     /// Limites douces du processus (Linux) ; `null` ailleurs.
     pub rlimit_rtprio: Option<Limite>,
     pub rlimit_memlock_bytes: Option<Limite>,
+    /// `RLIMIT_NICE` : ce qu'autorise le repli `nice` quand `SCHED_FIFO` est refusé.
+    pub rlimit_nice: Option<Limite>,
     /// euid 0 : le noyau accorde `SCHED_FIFO` sans regarder `RLIMIT_RTPRIO`.
     pub root: Option<bool>,
     /// Politique et priorité obtenues par le fil de rendu ; `null` tant
@@ -489,6 +596,7 @@ pub fn fiche() -> FicheTempsReel {
             setting: reglage_courant(),
             rlimit_rtprio: Some(Limite::de(linux::limite_rtprio().map(u64::from))),
             rlimit_memlock_bytes: Some(Limite::de(linux::limite_memlock())),
+            rlimit_nice: Some(Limite::de(linux::limite_nice().map(u64::from))),
             root: Some(linux::est_root()),
             render_thread,
             memory_lock,
@@ -501,6 +609,7 @@ pub fn fiche() -> FicheTempsReel {
             setting: reglage_courant(),
             rlimit_rtprio: None,
             rlimit_memlock_bytes: None,
+            rlimit_nice: None,
             root: None,
             render_thread,
             memory_lock,
@@ -587,6 +696,36 @@ mod tests {
         assert_eq!(decider(Reglage::Desactive, Some(95), 99), None);
     }
 
+    /// Le repli `nice`, refus : sous la limite par défaut (`RLIMIT_NICE` = 0)
+    /// et jusqu'à 20, aucun `nice` négatif n'est permis, rien n'est demandé.
+    #[test]
+    fn le_nice_n_est_pas_demande_quand_la_limite_le_refuse() {
+        for l in [0, 1, 19, 20] {
+            assert_eq!(decider_le_nice(NICE_VISE, Some(l)), None, "limite {l}");
+        }
+    }
+
+    /// Le repli `nice`, accord : la limite borne le `nice` visé, qui reste
+    /// négatif ; `limits.d` de Tune OS (`nice -19`, soit 39) accorde −11.
+    #[test]
+    fn le_nice_suit_la_limite_quand_elle_l_accorde() {
+        assert_eq!(decider_le_nice(NICE_VISE, Some(39)), Some(-11));
+        assert_eq!(decider_le_nice(NICE_VISE, Some(31)), Some(-11));
+        assert_eq!(decider_le_nice(NICE_VISE, Some(25)), Some(-5));
+        assert_eq!(decider_le_nice(NICE_VISE, Some(21)), Some(-1));
+        assert_eq!(decider_le_nice(NICE_VISE, None), Some(-11));
+        // Une limite absurde (> 40) se lit comme 40 : −20 au plus.
+        assert_eq!(decider_le_nice(-30, Some(1000)), Some(-20));
+    }
+
+    /// Réglage désactivé : ni `SCHED_FIFO` ni repli, quelles que soient les
+    /// limites — `demander` s'arrête avant le noyau.
+    #[test]
+    fn desactive_ne_decide_ni_fifo_ni_nice() {
+        assert_eq!(decider(lire_reglage(Some("0")), Some(95), 99), None);
+        assert_eq!(decider(lire_reglage(Some("off")), None, 99), None);
+    }
+
     /// Le verrouillage mémoire : seule une limite illimitée l'autorise.
     #[test]
     fn le_verrouillage_n_est_tente_que_sous_limite_illimitee() {
@@ -608,6 +747,9 @@ mod tests {
             priority: 70,
             rlimit_rtprio: Some(0),
             cause: "Operation not permitted (os error 1)".into(),
+            fallback: RepliNice::NonPermis {
+                rlimit_nice: Some(0),
+            },
         };
         assert!(premiere_fois_dans(&memoire, &refuse));
         assert!(!premiere_fois_dans(&memoire, &refuse));
@@ -634,6 +776,10 @@ mod tests {
                 "{json}"
             );
             assert!(json["root"].is_boolean(), "{json}");
+            assert!(
+                json["rlimit_nice"].is_u64() || json["rlimit_nice"] == "unlimited",
+                "{json}"
+            );
         }
         #[cfg(not(target_os = "linux"))]
         assert_eq!(json["applicable"], false);
@@ -655,10 +801,17 @@ mod tests {
             priority: 70,
             rlimit_rtprio: Some(0),
             cause: "EPERM".into(),
+            fallback: RepliNice::Obtenu {
+                nice: NICE_VISE,
+                rlimit_nice: Some(31),
+            },
         };
         let json = serde_json::to_value(&refuse).unwrap();
         assert_eq!(json["state"], "refuse");
         assert_eq!(json["rlimit_rtprio"], 0);
+        assert_eq!(json["fallback"]["state"], "obtenu");
+        assert_eq!(json["fallback"]["nice"], NICE_VISE);
+        assert_eq!(json["fallback"]["rlimit_nice"], 31);
         assert!(!refuse.obtenu());
         assert!(obtenu.obtenu());
     }
@@ -727,10 +880,15 @@ mod tests {
             // SAFETY : abaisser sa propre limite est toujours permis.
             let rc = unsafe { libc::setrlimit(libc::RLIMIT_RTPRIO, &zero) };
             assert_eq!(rc, 0, "setrlimit(RLIMIT_RTPRIO, 0)");
+            // SAFETY : idem.
+            let rc = unsafe { libc::setrlimit(libc::RLIMIT_NICE, &zero) };
+            assert_eq!(rc, 0, "setrlimit(RLIMIT_NICE, 0)");
+            let nice_avant = linux::nice_du_fil_courant();
             let issue = demander_selon(lire_reglage(None));
             let apres = linux::politique_du_fil_courant();
             println!("ISSUE={issue:?}");
             println!("APRES={apres:?}");
+            println!("NICE={}->{}", nice_avant, linux::nice_du_fil_courant());
             return;
         }
         // SAFETY : lecture sans effet de bord.
@@ -764,6 +922,103 @@ mod tests {
         assert!(
             stdout.contains(&format!("APRES=({}, 0)", libc::SCHED_OTHER)),
             "le fil doit rester en SCHED_OTHER :\n{stdout}"
+        );
+        assert!(
+            stdout.contains("fallback: NonPermis { rlimit_nice: Some(0) }"),
+            "sans RLIMIT_NICE, le repli n'est pas tenté :\n{stdout}"
+        );
+        let nice = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("NICE="))
+            .expect("ligne NICE");
+        let (avant, apres) = nice.split_once("->").unwrap();
+        assert_eq!(avant, apres, "le nice ne doit pas bouger :\n{stdout}");
+    }
+
+    /// Le repli accordé, sur le vrai noyau : sous `RLIMIT_RTPRIO = 0`, si la
+    /// limite dure `RLIMIT_NICE` permet un `nice` négatif, l'enfant la monte
+    /// (permis jusqu'à la limite dure, sans privilège) et le fil doit finir en
+    /// `SCHED_OTHER` au `nice` annoncé. Sans objet là où la limite dure est
+    /// à 0 (la machine de compilation) : le chemin n'y est prouvé que par la
+    /// décision pure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sous_rlimit_nice_le_repli_est_obtenu() {
+        const MARQUEUR: &str = "TUNE_TEST_REPLI_NICE_ENFANT";
+        let mut dure = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY : lecture dans une valeur locale.
+        unsafe { libc::getrlimit(libc::RLIMIT_NICE, &mut dure) };
+        if std::env::var_os(MARQUEUR).is_some() {
+            let zero = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY : abaisser sa propre limite est toujours permis.
+            unsafe { libc::setrlimit(libc::RLIMIT_RTPRIO, &zero) };
+            let nice = libc::rlimit {
+                rlim_cur: dure.rlim_max,
+                rlim_max: dure.rlim_max,
+            };
+            // SAFETY : monter la limite douce jusqu'à la dure est permis.
+            unsafe { libc::setrlimit(libc::RLIMIT_NICE, &nice) };
+            let issue = std::thread::spawn(|| {
+                let issue = demander_selon(lire_reglage(None));
+                (
+                    issue,
+                    linux::politique_du_fil_courant(),
+                    linux::nice_du_fil_courant(),
+                )
+            })
+            .join()
+            .unwrap();
+            println!("ISSUE={:?}", issue.0);
+            println!("APRES={:?}", issue.1);
+            println!("NICE={}", issue.2);
+            return;
+        }
+        // SAFETY : lecture sans effet de bord.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("root : SCHED_FIFO accordé, le repli est sans objet");
+            return;
+        }
+        let permis = dure.rlim_max == libc::RLIM_INFINITY || dure.rlim_max > 20;
+        if !permis {
+            eprintln!(
+                "RLIMIT_NICE dure = {} : aucun nice négatif permis ici, chemin prouvé par la décision pure",
+                dure.rlim_max
+            );
+            return;
+        }
+        let sortie = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("audio::ordonnancement_rt::tests::sous_rlimit_nice_le_repli_est_obtenu")
+            .arg("--nocapture")
+            .env(MARQUEUR, "1")
+            .env_remove(VARIABLE_PRIORITE)
+            .output()
+            .expect("lancer l'enfant");
+        let stdout = String::from_utf8_lossy(&sortie.stdout);
+        assert!(sortie.status.success(), "l'enfant a échoué :\n{stdout}");
+        assert!(
+            stdout.contains("fallback: Obtenu { nice: "),
+            "attendu un repli obtenu :\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("APRES=({}, 0)", libc::SCHED_OTHER)),
+            "le repli reste en SCHED_OTHER :\n{stdout}"
+        );
+        let nice: i32 = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("NICE="))
+            .and_then(|n| n.trim().parse().ok())
+            .expect("ligne NICE");
+        assert!(nice < 0, "nice négatif attendu, lu {nice}");
+        assert!(
+            stdout.contains(&format!("nice: {nice},")),
+            "le verdict doit annoncer le nice que le noyau tient :\n{stdout}"
         );
     }
 
