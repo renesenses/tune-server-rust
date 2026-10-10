@@ -285,13 +285,21 @@ async fn conversation_avec_cle(
     ws.send(Message::Binary(sortie[..n].to_vec().into()))
         .await
         .unwrap();
-    let reponse = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
-        .await
-        .unwrap();
-    let b = binaire(reponse);
-    clair.resize(MAX_NOISE, 0);
-    let n = transport.read_message(&b, &mut clair).unwrap();
-    let reponse: serde_json::Value = serde_json::from_slice(&clair[1..n]).unwrap();
+    // Une session appairée qui annonce un format produisible (ici FLAC, que
+    // le serveur doit produire) reçoit le rôle `player@v1` puis le
+    // `group/update` que la spécification exige : il précède la réponse.
+    let reponse = loop {
+        let reponse = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .unwrap();
+        let b = binaire(reponse);
+        clair.resize(MAX_NOISE, 0);
+        let n = transport.read_message(&b, &mut clair).unwrap();
+        let reponse: serde_json::Value = serde_json::from_slice(&clair[1..n]).unwrap();
+        if reponse["type"] != "group/update" {
+            break reponse;
+        }
+    };
     assert_eq!(
         reponse["type"], "server/time",
         "le canal doit rester disponible pour l'appairage"
@@ -522,3 +530,6 @@ mod persistance_3326;
 
 #[path = "sendspin_runtime_3326.rs"]
 mod runtime_3326;
+
+#[path = "sendspin/lecteur_s2c_3326.rs"]
+mod lecteur_s2c_3326;

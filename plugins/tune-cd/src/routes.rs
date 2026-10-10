@@ -9,6 +9,14 @@
 //!   refus `409 lecture_en_cours` qui nomme les zones ; avec `forcer`, ces
 //!   zones sont d'abord arrêtées, puis le disque est éjecté.
 //!
+//! * `GET  /memoire` — « Charger le CD en mémoire » (#6043) : réglages, RAM
+//!   disponible et progression du chargement ;
+//! * `POST /memoire` — `{ "actif": true, "plafond_mio": 800 }`, chacun
+//!   facultatif ; désactiver libère le disque chargé.
+//!
+//! `GET /etat` porte aussi `chargement` : la progression du disque chargé en
+//! mémoire, `null` sans chargement.
+//!
 //! Pendant une extraction (#2466, `extraction/routes.rs`), `/jouer` et
 //! `/ejecter` refusent par `409 extraction_en_cours`, même avec `forcer` :
 //! on annule d'abord l'extraction.
@@ -23,6 +31,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
+use tune_core::db::backend::DbBackend;
+use tune_core::db::settings_repo::SettingsRepo;
 
 use crate::discid::disc_id;
 use crate::ejection::ZonesDuDisque;
@@ -32,6 +42,7 @@ use crate::hote::{ElementFile, HoteLecture};
 use crate::lecteur::{
     ErreurCd, ErreurEjection, LecteurDisque, Presence, plateforme_prise_en_charge,
 };
+use crate::memoire::{CLE_ACTIF, CLE_PLAFOND_MIO, MIO, MemoireCd};
 use crate::musicbrainz::{Consultation, InfosDisque};
 use crate::toc::Toc;
 
@@ -47,6 +58,10 @@ pub struct EtatRoutes {
     pub reveil: Arc<Notify>,
     /// #2466 — les extractions. `None` : routes d'extraction absentes.
     pub extraction: Option<Arc<Extractions>>,
+    /// #6043 — le disque chargé en mémoire. `None` : pas de chargement.
+    pub memoire: Option<Arc<MemoireCd>>,
+    /// #6043 — pour ranger les réglages du chargement. `None` : non rangés.
+    pub backend: Option<Arc<dyn DbBackend>>,
 }
 
 pub fn router(etat: EtatRoutes) -> Router<()> {
@@ -55,6 +70,7 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
         .route("/disque", get(disque))
         .route("/jouer", post(jouer))
         .route("/ejecter", post(ejecter))
+        .route("/memoire", get(memoire).post(regler_memoire))
         .with_state(etat.clone());
     match etat.extraction.clone() {
         Some(ex) => base.merge(crate::extraction::routes::router(etat, ex)),
@@ -127,7 +143,70 @@ async fn etat_du_lecteur(State(etat): State<EtatRoutes>) -> Json<Value> {
         "plateforme_prise_en_charge": plateforme_prise_en_charge(),
         "lecteur": chemin,
         "presence": presence,
+        "chargement": etat.memoire.as_ref().and_then(|m| m.progression()),
     }))
+}
+
+/// #6043 — les réglages du chargement en mémoire et sa progression.
+fn etat_memoire(m: Option<&MemoireCd>) -> Value {
+    match m {
+        Some(m) => {
+            let r = m.reglages();
+            json!({
+                "disponible": true,
+                "actif": r.actif,
+                "plafond_mio": r.plafond_octets / MIO,
+                "ram_disponible_mio": m.ram_disponible().map(|o| o / MIO),
+                "chargement": m.progression(),
+            })
+        }
+        None => json!({ "disponible": false, "actif": false, "chargement": null }),
+    }
+}
+
+async fn memoire(State(etat): State<EtatRoutes>) -> Json<Value> {
+    Json(etat_memoire(etat.memoire.as_deref()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DemandeMemoire {
+    actif: Option<bool>,
+    plafond_mio: Option<u64>,
+}
+
+async fn regler_memoire(State(etat): State<EtatRoutes>, Json(d): Json<DemandeMemoire>) -> Response {
+    let Some(m) = etat.memoire.clone() else {
+        return refus(
+            StatusCode::NOT_FOUND,
+            "memoire_indisponible",
+            "Le chargement en mémoire n'est pas disponible.".into(),
+        );
+    };
+    if let Some(backend) = etat.backend.clone() {
+        let repo = SettingsRepo::with_backend(backend);
+        let mut r = Ok(());
+        if let Some(a) = d.actif {
+            r = r.and(repo.set(CLE_ACTIF, if a { "true" } else { "false" }));
+        }
+        if let Some(p) = d.plafond_mio {
+            r = r.and(repo.set(CLE_PLAFOND_MIO, &p.to_string()));
+        }
+        if let Err(e) = r {
+            return refus(StatusCode::INTERNAL_SERVER_ERROR, "reglage", e);
+        }
+    }
+    let (actif, plafond) = (d.actif, d.plafond_mio.map(|p| p * MIO));
+    let m2 = m.clone();
+    let _ = tokio::task::spawn_blocking(move || m2.regler(actif, plafond)).await;
+    Json(etat_memoire(Some(&m))).into_response()
+}
+
+/// #6043 — rend la mémoire du disque chargé (éjection, extraction).
+pub(crate) async fn liberer_memoire(etat: &EtatRoutes) {
+    if let Some(m) = etat.memoire.clone() {
+        let _ = tokio::task::spawn_blocking(move || m.liberer()).await;
+    }
 }
 
 /// Les pistes audio de la TOC, nommées par MusicBrainz ou « Piste N ».
@@ -328,6 +407,9 @@ async fn ejecter(State(etat): State<EtatRoutes>, corps: Option<Json<DemandeEject
         }
     }
 
+    // #6043 — le chargement en mémoire lit encore le disque : l'arrêter
+    // avant d'éjecter, et rendre la mémoire.
+    liberer_memoire(&etat).await;
     let l = lecteur.clone();
     let resultat = tokio::task::spawn_blocking(move || l.ejecter_disque())
         .await
@@ -406,6 +488,8 @@ mod tests {
                 consultation: c,
                 zones: Arc::default(),
                 reveil: Arc::default(),
+                memoire: None,
+                backend: None,
                 extraction: None,
             },
             hote,
@@ -436,6 +520,68 @@ mod tests {
 
     fn simule() -> Option<Arc<dyn LecteurDisque>> {
         Some(Arc::new(LecteurSimule::new(toc_du_vecteur())))
+    }
+
+    /// #6043 — `/memoire` lit et règle le chargement ; `/etat` en porte la
+    /// progression.
+    #[tokio::test]
+    async fn memoire_se_regle_et_etat_porte_la_progression() {
+        use crate::memoire::{Fin, MemoireCd, Reglages};
+        use crate::toc::{PisteToc, Toc};
+        let toc = Toc::nouvelle(
+            vec![PisteToc {
+                numero: 1,
+                debut: 0,
+                audio: true,
+            }],
+            100,
+        )
+        .unwrap();
+        let l: Arc<dyn LecteurDisque> = Arc::new(LecteurSimule::new(toc.clone()));
+        let m = Arc::new(MemoireCd::new(Reglages {
+            actif: true,
+            plafond_octets: u64::MAX,
+        }));
+        let (mut e, _) = etat(Some(l.clone()), Arc::new(SansReseau));
+        e.memoire = Some(m.clone());
+
+        let (_, v) = appel(router(e.clone()), "GET", "/etat", None).await;
+        assert!(v["chargement"].is_null(), "{v}");
+        let c = m.chargement(&l, &toc, &disc_id(&toc), 0, 0).unwrap();
+        assert_eq!(c.attendre_la_fin(), Some(Fin::Termine));
+        let (_, v) = appel(router(e.clone()), "GET", "/etat", None).await;
+        assert_eq!(v["chargement"]["pourcentage"], 100, "{v}");
+        assert_eq!(v["chargement"]["fin"], "termine");
+        assert_eq!(v["chargement"]["secteurs_total"], 100);
+
+        let (code, v) = appel(router(e.clone()), "GET", "/memoire", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            (v["disponible"].clone(), v["actif"].clone()),
+            (json!(true), json!(true))
+        );
+        let (code, v) = appel(
+            router(e.clone()),
+            "POST",
+            "/memoire",
+            Some(json!({ "actif": false })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["actif"], false);
+        assert!(v["chargement"].is_null(), "désactiver libère : {v}");
+        assert!(!m.reglages().actif);
+
+        // Sans chargement en mémoire (greffon ancien) : 404 au réglage.
+        let (e, _) = etat(simule(), Arc::new(SansReseau));
+        let (code, _) = appel(
+            router(e),
+            "POST",
+            "/memoire",
+            Some(json!({ "actif": true })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
     }
 
     /// Témoin 8 — les routes rendent la bonne forme.

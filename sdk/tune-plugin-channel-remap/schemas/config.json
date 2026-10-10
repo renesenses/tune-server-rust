@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ChannelRemapSettings",
+  "description": "Le réglage tel qu'il est enregistré et échangé avec l'écran.",
+  "type": "object",
+  "properties": {
+    "enabled": {
+      "type": "boolean",
+      "default": false
+    },
+    "gains_db": {
+      "type": "array",
+      "default": [
+        [
+          0.0,
+          null
+        ],
+        [
+          null,
+          0.0
+        ]
+      ],
+      "items": {
+        "type": "array",
+        "items": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        }
+      }
+    },
+    "inputs": {
+      "type": "integer",
+      "format": "uint16",
+      "default": 2,
+      "maximum": 32,
+      "minimum": 1
+    },
+    "normalize": {
+      "type": "boolean",
+      "default": true
+    },
+    "outputs": {
+      "type": "integer",
+      "format": "uint16",
+      "default": 2,
+      "maximum": 32,
+      "minimum": 1
+    },
+    "preset": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": "identity"
+    }
+  }
+}

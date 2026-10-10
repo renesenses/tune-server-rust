@@ -144,11 +144,11 @@ fn group(s: &str) -> String {
 
 // ── Hex ─────────────────────────────────────────────────────────────
 
-fn hex_encode(data: &[u8]) -> String {
+pub(crate) fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     if !s.len().is_multiple_of(2) {
         return Err("odd-length hex string".into());
     }
@@ -306,6 +306,74 @@ impl Envelope {
             return Ok(dek);
         }
         Err("wrong passphrase or recovery key".into())
+    }
+
+    // ── Sauvegarde automatique (#5654) ──────────────────────────────
+    //
+    // Une sauvegarde AUTOMATIQUE se scelle sans que personne ne tape la
+    // phrase de passe : le serveur garde donc la DEK en local (réglage secret,
+    // jamais exporté) et scelle avec elle. Les deux emplacements de clé, eux,
+    // voyagent avec chaque instantané : sur une machine neuve, la phrase de
+    // passe ou la clé de secours rouvre la DEK.
+
+    /// Crée une DEK neuve, enveloppée sous `passphrase` et sous une clé de
+    /// secours générée. Rend les deux emplacements, la clé de secours (à
+    /// montrer UNE fois) et la DEK elle-même (à ranger en local).
+    pub fn nouvelle_cle(
+        passphrase: &str,
+    ) -> Result<(KeySlot, KeySlot, RecoveryKey, [u8; 32]), String> {
+        if passphrase.is_empty() {
+            return Err("passphrase must not be empty".into());
+        }
+        let dek = random_bytes(DEK_LEN)?;
+        let recovery_raw = base32_encode(&random_bytes(RECOVERY_ENTROPY)?);
+        let passphrase_slot = wrap_dek(passphrase, &dek)?;
+        let recovery_slot = wrap_dek(&recovery_raw, &dek)?;
+        let dek: [u8; DEK_LEN] = dek
+            .try_into()
+            .map_err(|_| "DEK has the wrong length".to_string())?;
+        Ok((
+            passphrase_slot,
+            recovery_slot,
+            RecoveryKey(group(&recovery_raw)),
+            dek,
+        ))
+    }
+
+    /// Scelle `plaintext` sous une DEK déjà connue, avec ses emplacements.
+    pub fn sceller_avec(
+        dek: &[u8; 32],
+        passphrase_slot: &KeySlot,
+        recovery_slot: &KeySlot,
+        plaintext: &[u8],
+    ) -> Result<Self, String> {
+        let nonce = random_bytes(NONCE_LEN)?;
+        let ciphertext = seal(dek, &nonce, plaintext)?;
+        Ok(Envelope {
+            version: ENVELOPE_VERSION,
+            passphrase_slot: passphrase_slot.clone(),
+            recovery_slot: recovery_slot.clone(),
+            nonce: hex_encode(&nonce),
+            ciphertext: hex_encode(&ciphertext),
+        })
+    }
+
+    /// La DEK, rouverte par la phrase de passe OU la clé de secours.
+    pub fn cle_de_donnees(&self, secret: &str) -> Result<[u8; 32], String> {
+        self.unwrap_with(secret)
+    }
+
+    /// Ouvre la charge avec la DEK elle-même (sauvegarde de CE serveur).
+    pub fn ouvrir_avec(&self, dek: &[u8; 32]) -> Result<Vec<u8>, String> {
+        if self.version != ENVELOPE_VERSION {
+            return Err(format!(
+                "unsupported envelope version {} (this build understands {ENVELOPE_VERSION})",
+                self.version
+            ));
+        }
+        let nonce = hex_decode(&self.nonce)?;
+        let ciphertext = hex_decode(&self.ciphertext)?;
+        unseal(dek, &nonce, &ciphertext)
     }
 
     /// Replace the passphrase slot, keeping the DEK and the recovery key.
