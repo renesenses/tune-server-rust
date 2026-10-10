@@ -6322,6 +6322,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/playlist-manager/batch-transfer",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/playlist-manager/merge",
       "type": "any",
       "raison": "type non structurel"
