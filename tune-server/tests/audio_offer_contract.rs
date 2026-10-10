@@ -59,6 +59,11 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
             include_str!("../../sdk/tune-plugin-declick/manifest.json"),
             "declick",
         ),
+        // #6044 — gratuit, comme l'égaliseur (décision du 10/10/2026).
+        (
+            include_str!("../../sdk/tune-plugin-channel-remap/manifest.json"),
+            "free",
+        ),
     ] {
         let manifest: Value = serde_json::from_str(raw).unwrap();
         assert_eq!(

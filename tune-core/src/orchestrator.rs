@@ -182,6 +182,28 @@ fn spawn_paced_levels_forwarder(
     play_seq: u64,
     start_position_ms: i64,
 ) -> tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow> {
+    spawn_paced_levels_forwarder_mesure(bus, playback, zone_id, play_seq, start_position_ms).0
+}
+
+/// #3818 — le même forwarder, qui rend en plus ce qu'il a CONSOMMÉ de sa
+/// file, en millisecondes de piste : chaque fenêtre reçue, publiée ou sautée,
+/// y ajoute sa durée. C'est l'horloge que le frein du décodage-pour-niveaux
+/// doit regarder à côté de la position rapportée par la zone : sans elle, une
+/// position rapportée qui ne progresse pas arrête le décodeur à 30 s
+/// d'avance, et le forwarder — cadencé sur l'horloge murale — vide sa file
+/// à 31-32 s de piste. Plus une trame jusqu'à la piste suivante.
+fn spawn_paced_levels_forwarder_mesure(
+    bus: Arc<EventBus>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    play_seq: u64,
+    start_position_ms: i64,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    Arc<std::sync::atomic::AtomicI64>,
+) {
+    let consomme_ms = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let consomme = consomme_ms.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
     tokio::spawn(async move {
         // Le forwarder est le métronome du signal : il reçoit les fenêtres
@@ -233,6 +255,10 @@ fn spawn_paced_levels_forwarder(
         let mut fenetres_sautees: u64 = 0;
         'forwarder: while let Some(raw) = rx.recv().await {
             fenetres_recues += 1;
+            consomme.fetch_add(
+                raw.window.as_millis() as i64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             // La boucle RAPPORTE la position lue au moment où la zone est
             // effectivement en lecture : c'est cette valeur-là, et aucune autre,
             // qui sert au rattrapage plus bas. Un `0` initial n'était jamais lu
@@ -399,12 +425,17 @@ fn spawn_paced_levels_forwarder(
             // sortie locale et en DoP : rien n'y est raboté.
             let gain_demande_units = playback.gain_demande_units(zone_id);
             let gain = gain_units as f64 / 1000.0;
-            let mut lvl = crate::audio::levels::compute_levels_avec_gain(
+            // #4969 — la carte des canaux de la sortie locale : les niveaux
+            // par canal décrivent alors les voies qui SORTENT (réaffectation
+            // #6044, disposition déclarée #6057), pas l'ordre du fichier.
+            let carte = playback.carte_des_canaux(zone_id);
+            let mut lvl = crate::audio::levels::compute_levels_vers_la_sortie(
                 &pcm,
                 raw.bit_depth,
                 raw.channels,
                 raw.sample_rate,
                 gain,
+                carte.as_ref(),
             );
             // #4384 — la CRÊTE, elle, se lit sur les échantillons tels qu'ils
             // partent vers le DAC quand la sortie locale les a relevés : après
@@ -429,8 +460,7 @@ fn spawn_paced_levels_forwarder(
             bus.emit(
                 "playback.audio_levels",
                 avec_les_niveaux_par_canal(
-                    &lvl.canaux,
-                    raw.channels,
+                    &lvl,
                     avec_le_gain_demande(
                         gain_demande_units,
                         serde_json::json!({
@@ -540,7 +570,7 @@ fn spawn_paced_levels_forwarder(
             fenetres_sautees,
         );
     });
-    tx
+    (tx, consomme_ms)
 }
 
 /// #4384 — champs ADDITIFS de `playback.audio_levels`, posés seulement sur
@@ -566,10 +596,14 @@ fn avec_le_gain_demande(
 }
 
 /// #4969 — champs ADDITIFS de `playback.audio_levels`, posés seulement à partir
-/// de trois canaux : `channel_levels`, le niveau de chaque canal dans l'ordre
-/// du flux (`rms_db`, `peak_db`, `over`), et `channel_names`, le nom de chaque
-/// canal dans l'ordre par défaut FLAC/WAV quand il en existe un (voir
-/// [`crate::audio::levels::noms_des_canaux_par_defaut`]).
+/// de trois canaux : `channel_levels`, le niveau de chaque canal (`rms_db`,
+/// `peak_db`, `over`), et `channel_names`, le nom de chaque canal quand il en
+/// existe un (voir [`crate::audio::levels::noms_des_canaux_par_defaut`]).
+///
+/// Sur une sortie locale branchée, ces canaux sont ceux du PÉRIPHÉRIQUE,
+/// après réaffectation (#6044) et routage par la disposition déclarée
+/// (#6057), et `output_channels` en donne le nombre ; un repli vers la
+/// stéréo n'en pose aucun. Ailleurs, ils suivent l'ordre de la source.
 ///
 /// En stéréo rien ne change : un client ancien, application iOS comprise, ne
 /// voit aucun champ de plus, et un client neuf se garde de leur absence.
@@ -577,15 +611,14 @@ fn avec_le_gain_demande(
 /// rendu réseau qui replie la piste en stéréo (#4573), il n'a plus que deux
 /// canaux, et ces champs restent absents.
 fn avec_les_niveaux_par_canal(
-    canaux: &[crate::audio::levels::NiveauDeCanal],
-    channels: u16,
+    lvl: &crate::audio::levels::AudioLevels,
     mut niveaux: serde_json::Value,
 ) -> serde_json::Value {
-    if canaux.is_empty() {
+    if lvl.canaux.is_empty() {
         return niveaux;
     }
     niveaux["channel_levels"] = serde_json::Value::Array(
-        canaux
+        lvl.canaux
             .iter()
             .map(|c| {
                 serde_json::json!({
@@ -596,8 +629,11 @@ fn avec_les_niveaux_par_canal(
             })
             .collect(),
     );
-    if let Some(noms) = crate::audio::levels::noms_des_canaux_par_defaut(channels) {
+    if let Some(noms) = lvl.noms_des_canaux {
         niveaux["channel_names"] = serde_json::json!(noms);
+    }
+    if let Some(sorties) = lvl.canaux_de_sortie {
+        niveaux["output_channels"] = serde_json::json!(sorties);
     }
     niveaux
 }
@@ -739,10 +775,18 @@ async fn attendre_que_la_sortie_joue(
 /// main la forme du décodage-pour-niveaux, puits compris, mais avec un drain
 /// inconditionnel — et a réintroduit la fuite (#3144). Le bloc du passthrough,
 /// lui, ne l'avait jamais eue depuis #1423.
+///
+/// #3818 — `consomme_ms` est ce que le forwarder a déjà tiré de sa file
+/// (voir [`spawn_paced_levels_forwarder_mesure`]) : l'avance se mesure contre
+/// la plus avancée des deux horloges ([`reference_du_frein`]). Un forwarder
+/// qui ne publie rien ne consomme rien, si bien que le plafond reste le même ;
+/// un forwarder qui publie n'est plus jamais affamé par une position
+/// rapportée qui ne bouge pas.
 fn spawn_braked_levels_sink(
     playback: Arc<PlaybackManager>,
     zone_id: i64,
     levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    consomme_ms: Arc<std::sync::atomic::AtomicI64>,
 ) -> (
     tokio::sync::mpsc::Sender<Vec<u8>>,
     tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
@@ -778,7 +822,10 @@ fn spawn_braked_levels_sink(
                 if relais.is_closed() {
                     return;
                 }
-                let position = playback.get_state(zone_id).await.position_ms;
+                let position = reference_du_frein(
+                    playback.get_state(zone_id).await.position_ms,
+                    consomme_ms.load(std::sync::atomic::Ordering::Relaxed),
+                );
                 if !levels_decode_doit_freiner(
                     avance_ms.load(std::sync::atomic::Ordering::Relaxed),
                     position,
@@ -836,8 +883,10 @@ fn spawn_local_file_levels_decode(
 ) {
     tokio::spawn(async move {
         let cadence = playback.clone();
-        let levels_tx = spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
-        let (sink_tx, relais_tx) = spawn_braked_levels_sink(cadence, zone_id, levels_tx);
+        let (levels_tx, consomme_ms) =
+            spawn_paced_levels_forwarder_mesure(bus, playback, zone_id, play_seq, 0);
+        let (sink_tx, relais_tx) =
+            spawn_braked_levels_sink(cadence, zone_id, levels_tx, consomme_ms);
         let ready = std::sync::Arc::new(tokio::sync::Notify::new());
         let result = tokio::task::spawn_blocking(move || {
             crate::audio::decode::decode_to_pcm_streaming_with_levels(
@@ -874,6 +923,19 @@ const PROXY_LEVELS_MAX_AHEAD_MS: i64 = 30_000;
 /// après une avance gapless.
 fn levels_decode_doit_freiner(avance_ms: i64, position_rapportee_ms: i64) -> bool {
     avance_ms > position_rapportee_ms + PROXY_LEVELS_MAX_AHEAD_MS
+}
+
+/// #3818 — contre quoi le frein mesure l'avance : la plus avancée de la
+/// position RAPPORTÉE par la zone et de ce que le forwarder a CONSOMMÉ.
+///
+/// La position rapportée seule ne suffit pas : quand elle ne progresse pas
+/// alors que la zone joue (renderer muet sur sa position, échantillons
+/// écartés par le sondeur), le décodeur s'arrêtait à 30 s d'avance et les
+/// niveaux mouraient à 31-32 s de piste (Pierre M, fil 2181). La consommation
+/// seule non plus : un forwarder en retard sur le son rattrape en sautant des
+/// fenêtres, et c'est la position rapportée qui dit jusqu'où.
+fn reference_du_frein(position_rapportee_ms: i64, consomme_ms: i64) -> i64 {
+    position_rapportee_ms.max(consomme_ms)
 }
 
 /// Décode un flux HTTP en arrière-plan, UNIQUEMENT pour les VU-mètres.
@@ -1041,7 +1103,8 @@ fn spawn_proxy_levels_probe_task(
     play_seq: u64,
 ) {
     tokio::spawn(async move {
-        let levels_tx = spawn_paced_levels_forwarder(bus, playback.clone(), zone_id, play_seq, 0);
+        let (levels_tx, consomme_ms) =
+            spawn_paced_levels_forwarder_mesure(bus, playback.clone(), zone_id, play_seq, 0);
         let reported = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
 
         let sampler_pos = reported.clone();
@@ -1050,7 +1113,16 @@ fn spawn_proxy_levels_probe_task(
         tokio::spawn(async move {
             while !sampler_probe_tx.is_closed() {
                 let state = sampler_playback.get_state(zone_id).await;
-                sampler_pos.store(state.position_ms, std::sync::atomic::Ordering::Relaxed);
+                // #3818 — même référence que le puits freiné des fichiers
+                // locaux : une position rapportée figée n'affame plus la
+                // sonde à 30 s d'avance.
+                sampler_pos.store(
+                    reference_du_frein(
+                        state.position_ms,
+                        consomme_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    ),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             }
         });
@@ -1219,6 +1291,9 @@ pub struct PlaybackOrchestrator {
     pub(crate) sources_physiques: Arc<crate::sources_physiques::RegistreSources>,
     /// #5662 — les files de volume par (sortie, zone) : voir `volume_coalescent`.
     pub(crate) volume_coalesceur: volume_coalescent::CoalesceurDeVolume,
+    /// #2264 — la mémoire de la règle de version : choix explicites en
+    /// attente, réponses des services. Voir `version_de_lecture`.
+    pub(crate) versions: version_de_lecture::EtatDesVersions,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -1586,6 +1661,7 @@ impl PlaybackOrchestrator {
             sources_url: crate::source_url::SourcesUrl::default(),
             sources_physiques: Arc::default(),
             volume_coalesceur: volume_coalescent::CoalesceurDeVolume::default(),
+            versions: Default::default(),
         }
     }
 
@@ -1700,6 +1776,8 @@ mod duree_du_flux_2062;
 #[cfg(test)]
 mod duree_du_flux_2062_tests;
 mod resolve_direct;
+/// #2264 — la règle de version appliquée à la lecture.
+mod version_de_lecture;
 // #4894 — capacité LPCM par type de sortie, quand aucun Sink n'est sondable.
 mod capacite_lpcm_par_sortie;
 // #4863 — une source PCM fournie par un greffon (lecture d'un CD).
@@ -1884,9 +1962,16 @@ mod crete_apres_dsp_4384;
 /// l'alimentation de l'anneau.
 #[cfg(test)]
 mod niveaux_a_la_sortie_1908;
+/// #3818 — les niveaux ne meurent plus à 31-32 s sur une position figée.
+#[cfg(test)]
+mod niveaux_frein_3818;
 /// #4969 — un flux multicanal publie le niveau de chaque canal.
 #[cfg(test)]
 mod niveaux_par_canal_4969;
+/// #4969 — les niveaux par canal suivent les voies qui SORTENT : un vrai WAV
+/// 5.1, un canal à la fois, à travers réaffectation et disposition.
+#[cfg(test)]
+mod niveaux_par_canal_de_sortie_4969;
 #[cfg(test)]
 mod niveaux_relais_unique_5078_5051;
 #[cfg(test)]

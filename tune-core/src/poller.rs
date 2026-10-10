@@ -536,6 +536,9 @@ pub struct PositionPoller {
     /// piste relance aussitôt. Vit le temps du processus, HORS de
     /// ZonePollState, que chaque relance recrée.
     appareils_qui_ignorent_next: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// #4382 — fins de piste établies par le guet de la dernière seconde
+    /// (`sondage_accelere_4382`), par zone. Partagée avec les guetteurs.
+    fins_precises: sondage_accelere_4382::FinsPrecises,
     /// Horodatage de la dernière relance automatique après « démarrage mort »
     /// par zone (#2394). Vit HORS de ZonePollState : la relance recrée l'état
     /// de sondage, un drapeau dedans repartirait à zéro et bouclerait. Une
@@ -609,6 +612,7 @@ impl PositionPoller {
             shared_metrics,
             event_bus: None,
             appareils_qui_ignorent_next: std::sync::Mutex::new(std::collections::HashSet::new()),
+            fins_precises: Default::default(),
             relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
             reprises_renderer_cale: Mutex::new(std::collections::HashMap::new()),
             zones_masquees_signalees: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1006,6 +1010,8 @@ mod fin_de_piste;
 /// #4382 — un `Next` acquitté que le transport déclare ignoré.
 mod next_ignore_4382;
 pub(crate) mod refus_de_piste;
+/// #4382 — sondage accéléré dans la dernière seconde (renderer qui n'enchaîne pas seul).
+mod sondage_accelere_4382;
 
 mod tick;
 
@@ -1025,6 +1031,11 @@ mod volume_pure_5695_tests;
 
 /// #5662 — un renderer à 100 % ignoré par l'adoption est signalé au journal.
 mod volume_100_ignore_5662;
+/// #6008 — l'adoption du volume du renderer est dite au journal.
+mod volume_adopte_6008;
+/// #6008 — son banc, sur le vrai sondeur.
+#[cfg(test)]
+mod volume_adopte_6008_tests;
 
 #[cfg(test)]
 mod tests;
