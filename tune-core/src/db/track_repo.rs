@@ -2787,19 +2787,21 @@ impl TrackRepo {
         // `is_active`), c'est le socle de la vue. Le compteur juste en
         // dessous partage `where_clause`, donc liste et total ne peuvent pas
         // diverger.
-        conditions.push(hidden_tracks_excluded().to_string());
+        //
         // Doublon distant (#4146) : les pistes d'un album `upnp` dont
         // l'équivalent LOCAL existe sortent de la vue, comme leur album sort
         // de la grille. Même statut que ci-dessus — socle, pas facette.
-        conditions.push(crate::db::facet_filter::pistes_album_distant_double_exclu(
-            engine,
-        ));
+        //
         // Copie de moindre qualité (#4101) : le repli que la fiche d'album,
         // la file et `albums.track_count` appliquent depuis #1362 manquait à
         // cette route — la SEULE que la vue Oxygen appelle. Socle, pas
         // facette : le compteur juste en dessous partage `where_clause`, donc
         // la fenêtre suivante part du bon décalage.
-        conditions.push(crate::db::facet_filter::copie_de_moindre_qualite_exclue());
+        //
+        // #5977 — les trois viennent de `socle_de_la_vue_des_pistes`, que le
+        // rail des facettes pose aussi : ses effectifs ne peuvent plus compter
+        // ce que cette liste replie.
+        conditions.extend(crate::db::facet_filter::socle_de_la_vue_des_pistes(engine));
 
         (conditions, owned_params)
     }

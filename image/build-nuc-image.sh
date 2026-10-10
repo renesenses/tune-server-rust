@@ -24,7 +24,10 @@ IMAGE_NAME="tune-os-x86_64"
 IMAGE_SIZE="3G"
 DEBIAN_RELEASE="bookworm"
 DEBIAN_MIRROR="http://deb.debian.org/debian"
-WORK_DIR="/tmp/tune-os-build"
+# #4770 — un dossier neuf par fabrication, ou TUNE_OS_WORK_DIR (lib-work-dir.sh).
+# shellcheck source=lib-work-dir.sh
+source "${SCRIPT_DIR}/lib-work-dir.sh"
+WORK_DIR="$(tune_os_work_dir tune-os-build)"
 ROOTFS="${WORK_DIR}/rootfs"
 IMAGE_FILE="${WORK_DIR}/${IMAGE_NAME}.img"
 LOOP_DEV=""
@@ -52,6 +55,7 @@ cleanup() {
     if [[ -n "$LOOP_DEV" ]]; then
         losetup -d "$LOOP_DEV" 2>/dev/null || true
     fi
+    tune_os_work_dir_nettoyer "$WORK_DIR"
 }
 trap cleanup EXIT
 

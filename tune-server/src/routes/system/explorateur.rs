@@ -291,8 +291,8 @@ pub(crate) fn estimer_le_contenu(
             };
             if genre.is_dir() {
                 let chemin = entree.path();
-                if nom == "$RECYCLE.BIN"
-                    || nom == "System Volume Information"
+                // Fil 2207 — mêmes corbeilles que le scan, casse ignorée.
+                if tune_core::scanner::dossier_systeme_ignore(&nom)
                     || dans_un_arbre_systeme(&chemin.to_string_lossy())
                 {
                     continue;
@@ -593,6 +593,39 @@ mod tests {
                 dossiers: 2,
                 complete: true
             }
+        );
+    }
+
+    /// Fil forum 2207 — l'estimation annonce ce que le scan trouverait : les
+    /// corbeilles de NAS (`#recycle`, `@eaDir`, `$Recycle.Bin`…, casse
+    /// ignorée) n'y entrent pas plus que dans le scan.
+    #[cfg(unix)]
+    #[test]
+    fn l_estimation_ignore_les_corbeilles_des_nas_2207() {
+        let base = arbre_de_test("tune-estimation-corbeilles-2207");
+        for corbeille in [
+            "#Recycle",
+            "@EADIR",
+            "$Recycle.Bin",
+            "system volume information",
+        ] {
+            let d = base.join("Artiste").join(corbeille);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("x.flac"), b"x").unwrap();
+        }
+        let e = estimer_le_contenu(
+            &base,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            ESTIMATION_ENTREES_MAX,
+        );
+        assert_eq!(
+            e,
+            Estimation {
+                fichiers_audio: 3,
+                dossiers: 2,
+                complete: true
+            },
+            "🔴 fil 2207 — l'estimation compte les corbeilles de NAS"
         );
     }
 

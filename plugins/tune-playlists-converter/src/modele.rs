@@ -9,8 +9,7 @@ use crate::appariement::Raison;
 pub struct Demande {
     /// `"local"` pour la bibliothèque, sinon le nom d'un service authentifié.
     pub source_service: String,
-    /// Le service d'arrivée. Voir `moteur` : la bibliothèque locale ne peut pas
-    /// encore être une CIBLE, faute de capacité d'appariement local côté hôte.
+    /// Le service d'arrivée, ou `"local"` pour la bibliothèque (#4741).
     pub cible_service: String,
     /// Les identifiants source. Des entiers en texte pour `"local"`, les
     /// identifiants du service sinon. Plusieurs = le mode par lot.
@@ -19,6 +18,11 @@ pub struct Demande {
     /// repris **à l'identique**, ce que demande le ticket.
     #[serde(default)]
     pub suffixe_nom: Option<String>,
+    /// Le nom de la playlist créée, choisi par l'utilisateur. Ne vaut que pour
+    /// UNE playlist (refusé sur un lot) et prime sur `suffixe_nom` : c'est le
+    /// champ « nom » de la fenêtre d'import du gestionnaire de playlists.
+    #[serde(default)]
+    pub nom_cible: Option<String>,
 }
 
 /// Un titre dont les trois critères concordent : il sera versé tel quel.

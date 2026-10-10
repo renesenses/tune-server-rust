@@ -36,6 +36,9 @@ impl TunePlugin for PremiumAudio {
             "equalizer" => "Égaliseur : profil, graphique, paramétrique, presets et AutoEq",
             "crossfeed" => "Crossfeed casque : intensité, retard et ombre de la tête, à chaud",
             "converter" => "Convertisseur audio : codecs de l'hôte, métadonnées et exports",
+            "channel-remap" => {
+                "Réaffectation des canaux : matrice en dB par zone et par album (4.0, 5.1…)"
+            }
             _ => "Dé-ploc : silence en tête/queue et passages par zéro, FLAC/WAV",
         }
     }
@@ -51,6 +54,7 @@ impl TunePlugin for PremiumAudio {
             "crossfeed" => include_str!("../../sdk/tune-plugin-crossfeed/manifest.json"),
             "converter" => include_str!("../../sdk/tune-plugin-converter/manifest.json"),
             "declick" => include_str!("../../sdk/tune-plugin-declick/manifest.json"),
+            "channel-remap" => include_str!("../../sdk/tune-plugin-channel-remap/manifest.json"),
             _ => return Err("unknown premium audio plugin".into()),
         };
         let manifest: tune_plugin_sdk::manifest::Manifest =
@@ -102,6 +106,13 @@ pub fn descriptor(id: &str) -> Value {
             "batch",
         ),
         "declick" => ("declick", vec!["/api/v1/declick"], "declick", "batch"),
+        // #6044 — gratuit, comme l'égaliseur (même droit `dsp_eq`).
+        "channel-remap" => (
+            "reaffectation",
+            vec!["/api/v1/channel-remap"],
+            "dsp_eq",
+            "dsp",
+        ),
         _ => return Value::Null,
     };
     json!({"sdk": {"major":0,"minor":1}, "kind":kind, "premium":premium_plugins::requires_premium(id), "entitlement":entitlement, "configuration_version":1,"native_loaded":tune_plugin_native::provider(id).is_some(),"activation_error":tune_plugin_native::failure(id),

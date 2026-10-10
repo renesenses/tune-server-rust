@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::traits::*;
+use super::youtube_decouverte::{CategorieAmbiances, Rayon};
 use crate::TuneError;
 
 // YouTube Data API v3
@@ -32,15 +33,84 @@ const NATIVE_FAILURE_THRESHOLD: u32 = 2;
 const NATIVE_CIRCUIT_COOLDOWN_SECS: u64 = 15 * 60;
 
 // ---------------------------------------------------------------------------
-// Google OAuth 2.0 — Device Code Flow (YouTube TV client, publicly known)
+// Google OAuth 2.0 — Device Code Flow
 // ---------------------------------------------------------------------------
 
+/// Client de REPLI : le client « YouTube TV » public, qui n'appartient pas à
+/// Tune. Il ne sert que si aucun client à nous n'est configuré (voir
+/// [`ClientOAuth::resoudre`]).
 const GOOGLE_CLIENT_ID: &str =
     "43212718137-t3p59j0tov6ak6jdsuj9leqpdmmmqpt4.apps.googleusercontent.com";
 const GOOGLE_CLIENT_SECRET: &str = "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";
 const GOOGLE_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+/// Portée du client de repli, inchangée : c'est celle que les comptes déjà
+/// connectés ont accordée.
 const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/youtube";
+/// Portée de NOTRE client : Tune ne fait que LIRE le compte (#5247).
+const GOOGLE_SCOPE_LECTURE: &str = "https://www.googleapis.com/auth/youtube.readonly";
+
+/// Variables d'environnement du client OAuth Google de Tune (#5247). Lues à
+/// l'EXÉCUTION en priorité, sinon figées à la COMPILATION (`option_env!`, pour
+/// les binaires publiés : le secret vient alors d'un secret de CI, jamais du
+/// dépôt).
+pub const ENV_CLIENT_ID: &str = "TUNE_YOUTUBE_CLIENT_ID";
+pub const ENV_CLIENT_SECRET: &str = "TUNE_YOUTUBE_CLIENT_SECRET";
+
+/// Le client OAuth Google employé pour la connexion au compte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientOAuth {
+    pub id: String,
+    pub secret: String,
+    pub scope: &'static str,
+    /// Vrai pour le client de repli (YouTube TV public).
+    pub repli: bool,
+}
+
+impl ClientOAuth {
+    /// Exécution, puis compilation, puis repli. Une paire n'est retenue que
+    /// COMPLÈTE : un identifiant sans son secret (ou l'inverse) ne fabrique
+    /// pas un client à moitié configuré, qui échouerait au premier échange.
+    pub fn resoudre(
+        execution: (Option<&str>, Option<&str>),
+        compilation: (Option<&str>, Option<&str>),
+    ) -> Self {
+        let complet = |(id, secret): (Option<&str>, Option<&str>)| match (
+            id.map(str::trim).filter(|v| !v.is_empty()),
+            secret.map(str::trim).filter(|v| !v.is_empty()),
+        ) {
+            (Some(id), Some(secret)) => Some((id.to_string(), secret.to_string())),
+            _ => None,
+        };
+        match complet(execution).or_else(|| complet(compilation)) {
+            Some((id, secret)) => Self {
+                id,
+                secret,
+                scope: GOOGLE_SCOPE_LECTURE,
+                repli: false,
+            },
+            None => Self {
+                id: GOOGLE_CLIENT_ID.into(),
+                secret: GOOGLE_CLIENT_SECRET.into(),
+                scope: GOOGLE_SCOPE,
+                repli: true,
+            },
+        }
+    }
+
+    /// Le client de ce processus : environnement, puis valeurs de compilation.
+    pub fn depuis_l_environnement() -> Self {
+        let id = std::env::var(ENV_CLIENT_ID).ok();
+        let secret = std::env::var(ENV_CLIENT_SECRET).ok();
+        Self::resoudre(
+            (id.as_deref(), secret.as_deref()),
+            (
+                option_env!("TUNE_YOUTUBE_CLIENT_ID"),
+                option_env!("TUNE_YOUTUBE_CLIENT_SECRET"),
+            ),
+        )
+    }
+}
 /// OAuth 2.0 Device Authorization Grant type (RFC 8628). The URN segment is
 /// `grant-type` with a HYPHEN — an underscore makes Google reject the token
 /// poll with "Invalid grant_type", so device-code login never completes.
@@ -48,6 +118,10 @@ const GOOGLE_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_
 
 /// Refresh the access token when less than this many seconds until expiry.
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
+
+/// Pages de 50 lues au plus dans la bibliothèque du compte (playlists, titres
+/// aimés) : 1 000 éléments. Chaque page coûte une unité du quota de l'API Data.
+const MAX_PAGES_COMPTE: usize = 20;
 
 /// YouTube Music context body for internal API calls.
 /// This mimics the web client request format that YouTube Music expects.
@@ -343,6 +417,14 @@ pub struct YouTubeService {
     browse_cache_ttl: Duration,
     /// Optional YouTube Data API v3 key for higher quota.
     api_key: Option<String>,
+    /// Racine de l'API interne de YouTube Music (InnerTube). `YTM_API_BASE`
+    /// en production ; un serveur local dans les essais, qui rejouent des
+    /// réponses enregistrées sans toucher au réseau.
+    ytm_base: String,
+    /// Racine de l'API YouTube Data v3. `YT_API_BASE` en production.
+    data_api_base: String,
+    /// Client OAuth Google de la connexion au compte (#5247).
+    oauth: ClientOAuth,
     enabled_override: Option<bool>,
 
     // -- OAuth state ----------------------------------------------------------
@@ -384,6 +466,13 @@ impl YouTubeService {
             browse_cache: Mutex::new(HashMap::new()),
             browse_cache_ttl: Duration::from_secs(1800), // 30 minutes
             api_key,
+            ytm_base: YTM_API_BASE.into(),
+            data_api_base: YT_API_BASE.into(),
+            oauth: {
+                let c = ClientOAuth::depuis_l_environnement();
+                info!(repli = c.repli, scope = c.scope, "youtube_client_oauth");
+                c
+            },
             enabled_override: None,
             // OAuth — not authenticated until user completes Device Code flow
             access_token: None,
@@ -393,6 +482,26 @@ impl YouTubeService {
             pending_device_auth: None,
             device_auth_started: None,
         }
+    }
+
+    /// Service dont les deux API pointent vers `ytm_base` et `data_api_base`
+    /// — un serveur local qui rejoue des réponses enregistrées. Réservé aux
+    /// essais : aucun appel ne quitte alors la machine.
+    pub fn avec_bases(ytm_base: &str, data_api_base: &str) -> Self {
+        Self {
+            ytm_base: ytm_base.trim_end_matches('/').into(),
+            data_api_base: data_api_base.trim_end_matches('/').into(),
+            api_key: None,
+            ..Self::new()
+        }
+    }
+
+    /// Pose un jeton d'accès sans passer par Google. Réservé aux essais de la
+    /// bibliothèque du compte (#5247), contre un serveur local.
+    pub fn avec_jeton_pour_essai(mut self, jeton: &str) -> Self {
+        self.access_token = Some(jeton.into());
+        self.token_expires = Some(Instant::now() + Duration::from_secs(3600));
+        self
     }
 
     // ------------------------------------------------------------------
@@ -414,7 +523,7 @@ impl YouTubeService {
         // This only bites once a token exists — it regressed search/browse the
         // moment #381 made YouTube login actually succeed (Jean Marie, Bilou:
         // "erreur 502" on search in v0.8.251).
-        let url = format!("{YTM_API_BASE}/{endpoint}?prettyPrint=false");
+        let url = format!("{}/{endpoint}?prettyPrint=false", self.ytm_base);
 
         let req = self
             .client
@@ -487,24 +596,39 @@ impl YouTubeService {
     // YouTube Data API v3 helper (optional, higher quota)
     // ------------------------------------------------------------------
 
-    /// GET from the YouTube Data API v3 (requires API key).
+    /// L'API Data v3 est-elle joignable : par la clé d'API, ou à défaut par
+    /// le jeton OAuth du compte (#5247) ?
+    fn data_api_disponible(&self) -> bool {
+        self.api_key.is_some() || self.is_authenticated()
+    }
+
+    /// GET from the YouTube Data API v3.
+    ///
+    /// La clé d'API (`TUNE_YOUTUBE_API_KEY`) passe en premier, comme avant. À
+    /// défaut, le jeton OAuth du compte sert de laissez-passer : sur
+    /// `googleapis.com` il est ATTENDU, contrairement à InnerTube qu'il
+    /// empoisonne (voir `ytm_post`). Jamais les deux à la fois.
     async fn yt_api_get(
         &self,
         endpoint: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
-        let api_key = self
-            .api_key
-            .as_deref()
-            .ok_or("no YouTube API key configured")?;
-
-        let url = format!("{YT_API_BASE}/{endpoint}");
+        let url = format!("{}/{endpoint}", self.data_api_base);
         let mut query: Vec<(&str, &str)> = params.to_vec();
-        query.push(("key", api_key));
+        let mut req = self.client.get(&url);
+        if let Some(api_key) = self.api_key.as_deref() {
+            query.push(("key", api_key));
+        } else if let Some(jeton) = self
+            .access_token
+            .as_deref()
+            .filter(|_| self.is_authenticated())
+        {
+            req = req.bearer_auth(jeton);
+        } else {
+            return Err("no YouTube API key configured and no YouTube account connected".into());
+        }
 
-        let resp = self
-            .client
-            .get(&url)
+        let resp = req
             .query(&query)
             .send()
             .await
@@ -514,7 +638,7 @@ impl YouTubeService {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
             info!(endpoint, status, body = %body.chars().take(200).collect::<String>(), "yt_api_error");
-            return Err(format!("yt {endpoint}: {status}"));
+            return Err(motif_erreur_data_api(endpoint, status, &body));
         }
 
         resp.json().await.map_err(|e| format!("yt json parse: {e}"))
@@ -881,7 +1005,10 @@ impl YouTubeService {
             .client
             .post(GOOGLE_DEVICE_CODE_URL)
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(format!("client_id={GOOGLE_CLIENT_ID}&scope={GOOGLE_SCOPE}"))
+            .body(format!(
+                "client_id={}&scope={}",
+                self.oauth.id, self.oauth.scope
+            ))
             .send()
             .await
             .map_err(|e| {
@@ -958,10 +1085,11 @@ impl YouTubeService {
             .post(GOOGLE_TOKEN_URL)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(format!(
-                "client_id={GOOGLE_CLIENT_ID}\
-                 &client_secret={GOOGLE_CLIENT_SECRET}\
+                "client_id={}\
+                 &client_secret={}\
                  &device_code={device_code}\
-                 &grant_type={GOOGLE_DEVICE_GRANT_TYPE}"
+                 &grant_type={GOOGLE_DEVICE_GRANT_TYPE}",
+                self.oauth.id, self.oauth.secret
             ))
             .send()
             .await
@@ -1049,10 +1177,11 @@ impl YouTubeService {
             .post(GOOGLE_TOKEN_URL)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(format!(
-                "client_id={GOOGLE_CLIENT_ID}\
-                 &client_secret={GOOGLE_CLIENT_SECRET}\
+                "client_id={}\
+                 &client_secret={}\
                  &refresh_token={refresh_token}\
-                 &grant_type=refresh_token"
+                 &grant_type=refresh_token",
+                self.oauth.id, self.oauth.secret
             ))
             .send()
             .await
@@ -1891,6 +2020,160 @@ impl YouTubeService {
         self.ytm_post("browse", body).await
     }
 
+    /// Une page de navigation InnerTube, analysée par `analyser`, puis gardée
+    /// trente minutes SOUS SA FORME ANALYSÉE : la page brute d'une ambiance
+    /// pèse près de 3 Mo, ses rayons quelques dizaines de ko.
+    ///
+    /// Une réponse 200 dont `analyser` ne tire RIEN n'est pas « rien à
+    /// montrer » : c'est un format que Tune ne sait plus lire. L'erreur est
+    /// rendue, pour que l'écran le dise au lieu d'afficher un vide, et rien
+    /// n'entre en cache.
+    async fn page_decouverte<T>(
+        &self,
+        cle: &str,
+        mut corps: serde_json::Value,
+        analyser: fn(&serde_json::Value) -> Vec<T>,
+    ) -> Result<Vec<T>, TuneError>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        if let Some(garde) = self.browse_cache_get(cle).await
+            && let Ok(valeur) = serde_json::from_value::<Vec<T>>(garde)
+        {
+            return Ok(valeur);
+        }
+        corps["context"] = ytm_context();
+        let data = self
+            .ytm_post("browse", corps)
+            .await
+            .map_err(|e| TuneError::Streaming(format!("youtube {cle}: {e}")))?;
+        let valeur = analyser(&data);
+        if valeur.is_empty() {
+            return Err(TuneError::Streaming(format!(
+                "youtube {cle}: nothing recognised in the YouTube Music response"
+            )));
+        }
+        if let Ok(garde) = serde_json::to_value(&valeur) {
+            self.browse_cache_set(cle.into(), garde).await;
+        }
+        Ok(valeur)
+    }
+
+    async fn rayons_de(
+        &self,
+        cle: &str,
+        corps: serde_json::Value,
+    ) -> Result<Vec<Rayon>, TuneError> {
+        self.page_decouverte(cle, corps, super::youtube_decouverte::parser_rayons)
+            .await
+    }
+
+    /// Les rayons de l'accueil de YouTube Music (`FEmusic_home`).
+    pub async fn accueil(&self) -> Result<Vec<Rayon>, TuneError> {
+        self.rayons_de("decouverte_home", json!({"browseId": "FEmusic_home"}))
+            .await
+    }
+
+    /// Les tendances d'un pays (`FEmusic_charts`) : classements vidéo et
+    /// artistes. `pays` est un code à deux lettres (`ZZ` = monde).
+    pub async fn tendances(&self, pays: &str) -> Result<Vec<Rayon>, TuneError> {
+        let pays = super::youtube_decouverte::code_pays(pays).ok_or_else(|| {
+            TuneError::NotFound(format!("youtube charts: unknown country code {pays:?}"))
+        })?;
+        self.rayons_de(
+            &format!("decouverte_charts_{pays}"),
+            json!({"browseId": "FEmusic_charts", "formData": {"selectedValues": [pays]}}),
+        )
+        .await
+    }
+
+    /// Les ambiances et les genres (`FEmusic_moods_and_genres`).
+    pub async fn ambiances(&self) -> Result<Vec<CategorieAmbiances>, TuneError> {
+        self.page_decouverte(
+            "decouverte_moods",
+            json!({"browseId": "FEmusic_moods_and_genres"}),
+            super::youtube_decouverte::parser_ambiances,
+        )
+        .await
+    }
+
+    /// Le contenu d'une ambiance ou d'un genre : ses rayons de playlists.
+    pub async fn contenu_ambiance(&self, params: &str) -> Result<Vec<Rayon>, TuneError> {
+        if params.is_empty() || params.len() > 200 {
+            return Err(TuneError::NotFound("youtube mood: invalid params".into()));
+        }
+        self.rayons_de(
+            &format!("decouverte_mood_{params}"),
+            json!({"browseId": "FEmusic_moods_and_genres_category", "params": params}),
+        )
+        .await
+    }
+
+    // ------------------------------------------------------------------
+    // Bibliothèque du compte — API YouTube Data v3 + jeton OAuth (#5247)
+    // ------------------------------------------------------------------
+
+    /// GET authentifié par le jeton du COMPTE, jamais par la clé d'API : les
+    /// requêtes `mine=true` et `myRating=like` désignent l'utilisateur, une
+    /// clé ne le désigne pas.
+    async fn data_api_du_compte(
+        &self,
+        endpoint: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, TuneError> {
+        let jeton = self
+            .access_token
+            .as_deref()
+            .filter(|_| self.is_authenticated())
+            .ok_or_else(|| TuneError::Streaming("youtube: no YouTube account connected".into()))?;
+        let resp = self
+            .client
+            .get(format!("{}/{endpoint}", self.data_api_base))
+            .bearer_auth(jeton)
+            .query(params)
+            .send()
+            .await
+            .map_err(|e| TuneError::Streaming(format!("yt {endpoint}: {e}")))?;
+        let status = resp.status().as_u16();
+        if !resp.status().is_success() {
+            let corps = resp.text().await.unwrap_or_default();
+            warn!(endpoint, status, corps = %corps.chars().take(300).collect::<String>(), "youtube_data_api_compte_refus");
+            return Err(TuneError::Streaming(motif_erreur_data_api(
+                endpoint, status, &corps,
+            )));
+        }
+        resp.json()
+            .await
+            .map_err(|e| TuneError::Streaming(format!("yt {endpoint} json: {e}")))
+    }
+
+    /// Toutes les pages d'une liste de l'API Data (50 par page), bornées à
+    /// `MAX_PAGES_COMPTE` pages.
+    async fn pages_du_compte(
+        &self,
+        endpoint: &str,
+        params: &[(&str, &str)],
+    ) -> Result<Vec<serde_json::Value>, TuneError> {
+        let mut items = Vec::new();
+        let mut suite: Option<String> = None;
+        for _ in 0..MAX_PAGES_COMPTE {
+            let mut p: Vec<(&str, &str)> = params.to_vec();
+            p.push(("maxResults", "50"));
+            if let Some(ref jeton) = suite {
+                p.push(("pageToken", jeton));
+            }
+            let page = self.data_api_du_compte(endpoint, &p).await?;
+            if let Some(a) = page["items"].as_array() {
+                items.extend(a.iter().cloned());
+            }
+            suite = page["nextPageToken"].as_str().map(String::from);
+            if suite.is_none() {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
     /// Fetch video details in batch via YouTube Data API v3.
     /// Falls back gracefully if no API key is configured.
     async fn fetch_videos_batch(&self, video_ids: &[String]) -> Vec<StreamTrack> {
@@ -1899,7 +2182,7 @@ impl YouTubeService {
         }
 
         // Try Data API v3 first (more reliable metadata)
-        if self.api_key.is_some() {
+        if self.data_api_disponible() {
             let mut tracks = Vec::new();
             for chunk in video_ids.chunks(50) {
                 let ids = chunk.join(",");
@@ -2488,6 +2771,42 @@ impl YouTubeService {
     }
 }
 
+/// Le motif d'un refus de l'API Data v3, lisible par l'auditeur ET par le
+/// journal : statut HTTP, `reason` de Google et son message.
+///
+/// `accessNotConfigured` est la réponse attendue si le projet Google du client
+/// OAuth n'a pas activé l'API YouTube Data v3 : le jeton est valide, mais ce
+/// client ne peut pas lire le compte. C'est la question que #5247 laisse
+/// ouverte ; elle se tranchera dans le message, pas dans une liste vide.
+pub(crate) fn motif_erreur_data_api(endpoint: &str, status: u16, corps: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(corps).unwrap_or_default();
+    let raison = v["error"]["errors"][0]["reason"]
+        .as_str()
+        .or_else(|| v["error"]["status"].as_str())
+        .unwrap_or("");
+    let message: String = v["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect();
+    match (raison.is_empty(), message.is_empty()) {
+        (true, true) => format!("yt {endpoint}: {status}"),
+        (false, true) => format!("yt {endpoint}: {status} {raison}"),
+        (true, false) => format!("yt {endpoint}: {status} {message}"),
+        (false, false) => format!("yt {endpoint}: {status} {raison}: {message}"),
+    }
+}
+
+/// Le nom d'artiste d'une vidéo de l'API Data : une chaîne « Topic » générée
+/// par YouTube Music porte le suffixe « - Topic », qui n'est pas un nom.
+fn artiste_de_chaine(chaine: &str) -> String {
+    chaine
+        .strip_suffix(" - Topic")
+        .unwrap_or(chaine)
+        .to_string()
+}
+
 /// Map a resolved YouTube stream URL to `(mime_type, codec)`. YouTube delivers
 /// either MP4/AAC (itag 140, "m4a") or WebM/Opus. The codec string becomes the
 /// transcode temp-file extension: "m4a" routes to the native Symphonia decoder,
@@ -2894,15 +3213,19 @@ impl StreamingService for YouTubeService {
             }
         }
 
-        // Try Data API (playlist items)
-        if self.api_key.is_some() {
+        // Try Data API (playlist items) — par la clé, ou par le jeton du compte :
+        // une playlist PRIVÉE du compte n'existe pas pour InnerTube sans
+        // jeton, seule l'API Data la lit (#5247).
+        if self.data_api_disponible() {
             let mut video_ids: Vec<String> = Vec::new();
             let mut page_token: Option<String> = None;
+            // L'API Data ne connaît pas le préfixe `VL` d'InnerTube.
+            let playlist_id = album_id.strip_prefix("VL").unwrap_or(album_id);
 
             loop {
                 let mut params = vec![
                     ("part", "snippet"),
-                    ("playlistId", album_id),
+                    ("playlistId", playlist_id),
                     ("maxResults", "50"),
                 ];
                 let page_token_str;
@@ -3038,56 +3361,35 @@ impl StreamingService for YouTubeService {
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
         // Try YTM browse
         if let Ok(data) = self.ytm_browse(playlist_id).await {
-            let header = &data["header"];
-
-            // Try musicDetailHeaderRenderer (playlist header format)
-            let title = header["musicDetailHeaderRenderer"]["title"]["runs"]
-                .as_array()
-                .and_then(|runs| runs.first())
-                .and_then(|r| r["text"].as_str())
-                .or_else(|| {
-                    header["musicEditablePlaylistDetailHeaderRenderer"]
-                        ["header"]["musicDetailHeaderRenderer"]["title"]["runs"]
-                        .as_array()
-                        .and_then(|runs| runs.first())
-                        .and_then(|r| r["text"].as_str())
-                })
-                .unwrap_or("Unknown");
-
-            let description = header["musicDetailHeaderRenderer"]["description"]["runs"]
-                .as_array()
-                .and_then(|runs| runs.first())
-                .and_then(|r| r["text"].as_str())
-                .filter(|d| !d.is_empty())
-                .map(String::from);
-
-            let cover =
-                header["musicDetailHeaderRenderer"]["thumbnail"]["croppedSquareThumbnailRenderer"]
-                    ["thumbnail"]["thumbnails"]
-                    .as_array()
-                    .and_then(|arr| arr.last())
-                    .and_then(|t| t["url"].as_str())
-                    .map(String::from);
-
+            let entete = super::youtube_decouverte::entete_playlist(&data);
             let tracks = Self::parse_browse_tracks(&data);
 
-            return Ok(StreamPlaylist {
-                id: playlist_id.into(),
-                name: title.into(),
-                description,
-                cover_path: cover,
-                track_count: tracks.len() as u32,
-                owner: None,
-                covers: Vec::new(),
-            });
+            // Une page sans en-tête NI titre n'est pas cette playlist (une
+            // playlist privée du compte, invisible sans jeton) : on passe à
+            // l'API Data plutôt que de rendre « Unknown » et zéro titre.
+            if entete.title.is_some() || !tracks.is_empty() {
+                return Ok(StreamPlaylist {
+                    id: playlist_id.into(),
+                    name: entete.title.unwrap_or_else(|| "Unknown".into()),
+                    description: entete.description,
+                    cover_path: entete.cover_path,
+                    track_count: tracks.len() as u32,
+                    owner: None,
+                    covers: Vec::new(),
+                });
+            }
         }
 
-        // Try Data API v3
-        if self.api_key.is_some()
+        // Try Data API v3 (clé d'API ou jeton du compte, #5247)
+        if self.data_api_disponible()
             && let Ok(data) = self
                 .yt_api_get(
                     "playlists",
-                    &[("part", "snippet,contentDetails"), ("id", playlist_id)],
+                    &[
+                        ("part", "snippet,contentDetails"),
+                        // L'API Data ne connaît pas le préfixe `VL` d'InnerTube.
+                        ("id", playlist_id.strip_prefix("VL").unwrap_or(playlist_id)),
+                    ],
                 )
                 .await
             && let Some(item) = data["items"].as_array().and_then(|a| a.first())
@@ -3130,9 +3432,63 @@ impl StreamingService for YouTubeService {
     // User collections (no-op without OAuth)
     // ------------------------------------------------------------------
 
+    /// Les playlists du compte (#5247), par l'API Data v3 et le jeton OAuth.
+    ///
+    /// Sans compte connecté, ou si Google refuse le jeton (projet du client
+    /// OAuth sans l'API Data activée : `accessNotConfigured`), l'erreur est
+    /// RENDUE : une liste vide affirmerait « aucune playlist » à quelqu'un qui
+    /// en a.
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
-        // Requires Google OAuth — not implemented for now
-        Ok(vec![])
+        let items = self
+            .pages_du_compte(
+                "playlists",
+                &[("part", "snippet,contentDetails"), ("mine", "true")],
+            )
+            .await?;
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                let id = item["id"].as_str().filter(|i| !i.is_empty())?;
+                let snippet = &item["snippet"];
+                Some(StreamPlaylist {
+                    // L'identifiant BRUT (`PL…`) : InnerTube sans jeton ne voit
+                    // pas une playlist privée, `get_playlist` et sa liste de
+                    // titres retombent alors sur l'API Data avec ce même jeton.
+                    id: id.into(),
+                    name: snippet["title"].as_str().unwrap_or("").into(),
+                    description: snippet["description"]
+                        .as_str()
+                        .filter(|d| !d.is_empty())
+                        .map(Into::into),
+                    cover_path: Self::best_thumbnail(&snippet["thumbnails"]),
+                    track_count: item["contentDetails"]["itemCount"].as_u64().unwrap_or(0) as u32,
+                    owner: snippet["channelTitle"].as_str().map(Into::into),
+                    covers: Vec::new(),
+                })
+            })
+            .collect())
+    }
+
+    /// Les titres aimés du compte (#5247) : `videos?myRating=like`, réduits à
+    /// la catégorie Musique (`categoryId` 10). Les autres vidéos aimées sur
+    /// YouTube (tutoriels, actualités…) ne sont pas des titres.
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
+        let items = self
+            .pages_du_compte(
+                "videos",
+                &[("part", "snippet,contentDetails"), ("myRating", "like")],
+            )
+            .await?;
+        Ok(items
+            .iter()
+            .filter(|v| v["snippet"]["categoryId"].as_str() == Some("10"))
+            .map(|v| {
+                let mut t = Self::map_video(v);
+                t.artist = artiste_de_chaine(&t.artist);
+                t
+            })
+            .filter(|t| !t.id.is_empty())
+            .collect())
     }
 
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
@@ -3313,6 +3669,42 @@ impl StreamingService for YouTubeService {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // #5247 — le client OAuth de Tune remplace le client TV public dès qu'il
+    // est configuré, et seulement s'il l'est entièrement.
+    #[test]
+    fn client_oauth_repli_sans_configuration() {
+        let c = ClientOAuth::resoudre((None, None), (None, None));
+        assert!(c.repli);
+        assert_eq!(c.id, GOOGLE_CLIENT_ID);
+        assert_eq!(c.scope, GOOGLE_SCOPE);
+    }
+
+    #[test]
+    fn client_oauth_de_tune_en_lecture_seule() {
+        let c = ClientOAuth::resoudre((Some(" id-tune "), Some("secret-tune")), (None, None));
+        assert!(!c.repli);
+        assert_eq!(
+            (c.id.as_str(), c.secret.as_str()),
+            ("id-tune", "secret-tune")
+        );
+        assert_eq!(c.scope, "https://www.googleapis.com/auth/youtube.readonly");
+    }
+
+    #[test]
+    fn client_oauth_execution_avant_compilation_et_paire_complete_seulement() {
+        let c = ClientOAuth::resoudre(
+            (Some("id-exec"), Some("secret-exec")),
+            (Some("id-build"), Some("secret-build")),
+        );
+        assert_eq!(c.id, "id-exec");
+        // Un identifiant d'exécution SANS secret ne casse pas le client de
+        // compilation : il est ignoré.
+        let c = ClientOAuth::resoudre((Some("id-exec"), None), (Some("id-build"), Some("s")));
+        assert_eq!(c.id, "id-build");
+        let c = ClientOAuth::resoudre((Some("id-exec"), Some("  ")), (None, None));
+        assert!(c.repli);
+    }
 
     #[test]
     fn youtube_service_name() {

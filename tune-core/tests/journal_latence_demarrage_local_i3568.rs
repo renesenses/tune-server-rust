@@ -387,6 +387,7 @@ async fn le_demarrage_sur_sortie_locale_dit_ses_trois_durees_au_niveau_livre() {
                 track_number: Some(1),
                 disc_number: Some(1),
                 album_ref: None,
+                artist_ref: None,
             }],
         )
         .expect("file");
