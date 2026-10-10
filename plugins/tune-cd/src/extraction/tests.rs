@@ -197,6 +197,8 @@ impl Banc {
             consultation: c,
             zones: Arc::default(),
             reveil: Arc::default(),
+            memoire: None,
+            backend: None,
             extraction: Some(ex.clone()),
         };
         Banc {

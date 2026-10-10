@@ -38,53 +38,17 @@ use tune_core::db::{
 /// signalée (`::warning::`) pour être retirée — sans rougir : la régénération
 /// de la carte au gel d'une release ne doit pas être bloquée par une dette
 /// PAYÉE.
-const DIVERGENCES_TOLEREES: &[(&str, &str, &str)] = &[
-    (
-        "GET",
-        "/converter/presets",
-        "le client declare `estimated_size_per_min` obligatoire ; le serveur ne \
-         l'a jamais rendu et l'ecran ne l'affiche que s'il existe — le type web \
-         le rend facultatif",
-    ),
-    (
-        "GET",
-        "/library/albums/{}/similar",
-        "contrat mort : `getSimilarAlbums` n'a aucun appelant, retire du client",
-    ),
-    (
-        "GET",
-        "/plugins",
-        "`InstalledPlugin` decrit un ancien contrat (`status`) que ses six \
-         appelants contournent deja par `as unknown as`, et `MergedPlugin` exige \
-         `category`, `update_available` et `status`, que la liste n'emet pas \
-         (l'ecran les lit deja en facultatifs) — les deux types web sont \
-         realignes sur la reponse",
-    ),
-    (
-        "GET",
-        "/streaming/youtube/home",
-        "contrat mort : `getYouTubeHome` n'a aucun appelant, retire du client",
-    ),
-    (
-        "GET",
-        "/streaming/youtube/library",
-        "contrat mort : `getYouTubeLibrary` n'a aucun appelant, retire du client",
-    ),
-    (
-        "GET",
-        "/system/admin/errors",
-        "contrat mort : `getAdminErrors` n'a aucun appelant, retire du client",
-    ),
-    (
-        "GET",
-        "/system/admin/zones",
-        "contrat mort : `getAdminZones` n'a aucun appelant, retire du client",
-    ),
-];
+///
+/// Vide depuis la carte régénérée au client web de #5247 (qui contient
+/// web#2007) : les sept dettes nommées jusque-là y étaient toutes payées.
+const DIVERGENCES_TOLEREES: &[(&str, &str, &str)] = &[];
 
 /// Plancher de routes réellement prouvées (200 + champs vérifiés). Mesuré à
-/// l'écriture du balayage (75) ; il ne doit que monter.
-const PLANCHER_PROUVEES: usize = 75;
+/// l'écriture du balayage (75), puis à 81 avec la carte régénérée au client
+/// web de #5247 : les quatre lectures de la découverte YouTube Music (accueil,
+/// tendances, ambiances, contenu d'une ambiance) y sont prouvées contre le
+/// faux YouTube. Il ne doit que monter.
+const PLANCHER_PROUVEES: usize = 81;
 
 /// Chaînes de requête sans lesquelles la route refuse (400) et ne prouve rien.
 const REQUETES: &[(&str, &str)] = &[("/library/search", "q=balayage")];
@@ -96,9 +60,57 @@ struct Temoins {
     piste: i64,
 }
 
-fn amorcer() -> (axum::Router, Temoins) {
+/// Le `params` d'une ambiance que le faux YouTube connaît (« Chill », tiré de
+/// la réponse enregistrée `moods.json`).
+const AMBIANCE_TEMOIN: &str = "ggMPOg1uX1JOQWZFeDByc2Jm";
+
+/// Faux YouTube Music LOCAL pour le balayage (#5247).
+///
+/// Les routes de découverte YouTube ne sont plus des talons : elles appellent
+/// InnerTube. Le balayage joue CHAQUE lecture de la carte ; sans ce faux, il
+/// partirait sur le réseau depuis la CI. Le faux rejoue les réponses réelles
+/// enregistrées (`tune-core/tests/fixtures/youtube/`), si bien que les routes
+/// sont PROUVÉES ici au lieu d'être comptées « non prouvées ».
+async fn faux_youtube() -> String {
+    use axum::{Json, routing::post};
+    async fn browse(Json(corps): Json<Value>) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let nom = match corps["browseId"].as_str().unwrap_or("") {
+            "FEmusic_home" => "home",
+            "FEmusic_charts" => "charts_fr",
+            "FEmusic_moods_and_genres" => "moods",
+            "FEmusic_moods_and_genres_category" if corps["params"] == AMBIANCE_TEMOIN => {
+                "mood_category"
+            }
+            _ => return StatusCode::BAD_REQUEST.into_response(),
+        };
+        let chemin = format!(
+            "{}/../tune-core/tests/fixtures/youtube/{nom}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let texte = std::fs::read_to_string(&chemin).expect("fixture youtube");
+        Json(serde_json::from_str::<Value>(&texte).expect("fixture json")).into_response()
+    }
+    let app = axum::Router::new().route("/youtubei/v1/browse", post(browse));
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("port local");
+    let adresse = ecoute.local_addr().expect("adresse locale");
+    tokio::spawn(async move { axum::serve(ecoute, app).await.expect("faux youtube") });
+    format!("http://{adresse}")
+}
+
+async fn amorcer() -> (axum::Router, Temoins) {
     let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
         .expect("etat serveur isole");
+    let faux = faux_youtube().await;
+    etat.services.lock().await.register(Box::new(
+        tune_core::streaming::youtube::YouTubeService::avec_bases(
+            &format!("{faux}/youtubei/v1"),
+            // L'API Data n'a pas de faux : rien ici ne doit l'appeler.
+            "http://127.0.0.1:9/youtube/v3",
+        ),
+    ));
     let artistes = ArtistRepo::with_backend(etat.backend.clone());
     let albums = AlbumRepo::with_backend(etat.backend.clone());
     let pistes = TrackRepo::with_backend(etat.backend.clone());
@@ -145,13 +157,14 @@ fn chemin_reel(route: &str, t: &Temoins) -> Option<String> {
     for (i, segment) in segments.iter().enumerate() {
         if *segment == "{}" {
             let id = match i.checked_sub(1).map(|p| segments[p]) {
-                Some("zones") => t.zone,
-                Some("artists") => t.artiste,
-                Some("albums") => t.album,
-                Some("tracks") => t.piste,
+                Some("zones") => t.zone.to_string(),
+                Some("artists") => t.artiste.to_string(),
+                Some("albums") => t.album.to_string(),
+                Some("tracks") => t.piste.to_string(),
+                Some("moods") => AMBIANCE_TEMOIN.to_string(),
                 _ => return None,
             };
-            sortie.push(id.to_string());
+            sortie.push(id);
         } else if segment.contains("{}") {
             // Interpolation de chaîne de requête collée au segment.
             sortie.push(segment.replace("{}", ""));
@@ -196,7 +209,7 @@ async fn jouer(app: &axum::Router, chemin: &str) -> Result<(StatusCode, Vec<u8>)
 #[tokio::test]
 async fn chaque_lecture_cartographiee_rend_les_champs_que_le_web_lit() {
     let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
-    let (app, temoins) = amorcer();
+    let (app, temoins) = amorcer().await;
 
     let mut issues: BTreeMap<String, Issue> = BTreeMap::new();
     for contrat in carte.routes.iter().filter(|c| c.methode == "GET") {

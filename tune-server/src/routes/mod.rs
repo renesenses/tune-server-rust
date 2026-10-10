@@ -65,7 +65,6 @@ pub mod party;
 pub mod peers;
 pub mod playback;
 pub mod playlist_manager;
-pub mod playlist_transfer;
 pub mod playlists;
 pub mod plugins;
 pub mod podcasts;
@@ -398,7 +397,8 @@ pub fn router_with_plugins(
     state: AppState,
     plugin_routers: crate::plugins::PluginRouters,
 ) -> Router {
-    let contexte_sendspin = sendspin::ContexteSendspin::pour_base(&state.config.db_path);
+    let contexte_sendspin = sendspin::ContexteSendspin::pour_base(&state.config.db_path)
+        .avec_zones(sendspin::RaccordZones::depuis_etat(&state));
     let streamer_sessions = state.streamer.sessions_state();
 
     let web_dir = crate::config::resolve_web_dir()
@@ -464,7 +464,6 @@ pub fn router_with_plugins(
         // it mounts at /api/v1/ext/dj. The stock server no longer serves /dj.
         .nest("/party", party::router())
         .nest("/playlist-manager", playlist_manager::router())
-        .nest("/playlist-transfer", playlist_transfer::router())
         .nest("/zone-manager", zone_manager::router())
         .nest("/snapcast", snapcast::router())
         .nest("/sonos", sonos::router())

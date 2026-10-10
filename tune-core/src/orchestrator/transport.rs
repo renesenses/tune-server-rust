@@ -724,6 +724,13 @@ impl PlaybackOrchestrator {
         // lit `req.track_id`.
         self.resoudre_l_uri_en_piste_de_bibliotheque(&mut req);
 
+        // #2264 — la RÈGLE DE VERSION, au point unique où une demande devient
+        // une lecture : piste, playlist, favori, file, historique, reprise y
+        // passent tous. Elle peut remplacer la piste demandée par un autre
+        // exemplaire du même enregistrement (bibliothèque, service), et dit
+        // pourquoi ; la piste en cours le publiera (`NowPlaying::version`).
+        let version_jouee = self.appliquer_la_regle_de_version(&mut req).await;
+
         // Clean up any gapless-prepared session for this zone before
         // creating a new stream.
         self.cleanup_gapless_session(req.zone_id).await;
@@ -781,7 +788,8 @@ impl PlaybackOrchestrator {
             cover_path: req.cover_url.clone().or(resolved.cover_url.clone()),
             album: req.album_title.clone().or(resolved.album.clone()),
         };
-        let np = self.composer_le_now_playing(&req, &resolved, &habillage);
+        let mut np = self.composer_le_now_playing(&req, &resolved, &habillage);
+        np.version = version_jouee;
 
         // Ticket 134 — la session REMPLACÉE se lit au moment du remplacement,
         // pas au départ de cette lecture : une autre lecture a pu s'intercaler
@@ -1254,6 +1262,9 @@ impl PlaybackOrchestrator {
                 .as_ref()
                 .and_then(|t| u16::try_from(t.channels).ok())
                 .filter(|n| *n > 0),
+            // #2264 — posé par `play_inner` après la composition : c'est la
+            // décision de `appliquer_la_regle_de_version`.
+            version: None,
         }
     }
 

@@ -58,6 +58,8 @@ pub(crate) mod stats;
 mod tracks;
 pub(crate) mod write_tags;
 
+/// Les versions d'une piste regroupées par enregistrement (#2264).
+mod versions_groupes;
 use axum::Router;
 use axum::routing::{get, patch, post};
 use serde::Deserialize;
@@ -451,6 +453,16 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))
+        // #2264 — les mêmes candidats, regroupés par enregistrement, avec la
+        // version jouée par défaut ; et la règle de choix, réglable.
+        .route(
+            "/tracks/{id}/versions/groups",
+            get(versions_groupes::track_version_groups),
+        )
+        .route(
+            "/versions/rule",
+            get(versions_groupes::get_version_rule).put(versions_groupes::put_version_rule),
+        )
         .route(
             "/tracks/{id}/synced-lyrics",
             get(tracks::track_synced_lyrics),
@@ -798,3 +810,7 @@ mod routage_tests {
         assert_eq!(noms.into_iter().collect::<Vec<_>>(), ["m::a"]);
     }
 }
+
+#[cfg(test)]
+#[path = "banc_rail_5993.rs"]
+mod banc_rail_5993;

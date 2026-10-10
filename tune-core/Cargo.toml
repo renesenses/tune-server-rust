@@ -207,6 +207,12 @@ path = "tests/pause_taches_de_fond.rs"
 name = "priorite_lecture_taches_de_fond"
 path = "tests/priorite_lecture_taches_de_fond.rs"
 
+# #4681 (suite) — la politique de cession à la lecture : un binaire à lui
+# seul, le témoin de lecture et la politique sont des états de processus.
+[[test]]
+name = "cession_a_la_lecture_4681"
+path = "tests/cession_a_la_lecture_4681.rs"
+
 # #5169 — l'ordre de la cascade selon le reglage de priorite de la plage
 # dynamique. Binaire a lui seul : reglage, pauses et verrou d'analyse sont des
 # etats de PROCESSUS (`autotests = false` : sans cette entree, jamais compile).
@@ -719,3 +725,10 @@ required-features = ["audio-embedding"]
 [[test]]
 name = "wav24_chaine_progressive_b209bf"
 path = "tests/wav24_chaine_progressive_b209bf.rs"
+
+# #4770 — le dossier de travail des scripts d'image (témoin shell joué depuis
+# Rust). `autotests = false` : sans cette cible, le fichier ne serait jamais
+# compilé.
+[[test]]
+name = "scripts_image_dossier_de_travail_4770"
+path = "tests/scripts_image_dossier_de_travail_4770.rs"

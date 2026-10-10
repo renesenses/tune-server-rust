@@ -5,6 +5,11 @@ Flash to a NUC, mini-PC, or Raspberry Pi — boot — Tune runs.
 
 ## Quick Start
 
+Each build gets its own fresh work directory (`mktemp -d` under `$TMPDIR`,
+removed on exit), so two builds on the same host no longer wipe each other
+(#4770). Set `TUNE_OS_WORK_DIR=/abs/path` to pin it — it is emptied at start
+and kept on exit, which is how CI reads `debootstrap.log` after a failure.
+
 ### Build NUC/x86_64 image (on a Linux x86_64 host)
 
 ```bash
