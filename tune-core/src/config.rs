@@ -65,11 +65,10 @@ pub struct TuneConfig {
     /// `playback::crossfade::CrossfadeHandler`, lui-même sans appelant, retiré
     /// par #2211.
     ///
-    /// Le fondu enchaîné n'existe sous aucune forme aujourd'hui : la route
-    /// `POST /zones/{id}/crossfade` refuse l'activation par un 501
-    /// `crossfade_unavailable` depuis #2689, et un vrai fondu demandera de
-    /// mélanger deux flux PCM décodés sur la sortie locale — pas une rampe de
-    /// volume.
+    /// Le fondu enchaîné réel (#2211) ne les lit pas non plus : c'est un
+    /// réglage PAR ZONE (`zone_{id}_crossfade_s`, `audio::fondu_de_zone`),
+    /// appliqué par la sortie locale qui mélange deux flux PCM décodés — pas
+    /// une rampe de volume.
     ///
     /// Laissés en place plutôt que retirés : sortir un champ d'une
     /// configuration publique est un arbitrage de Bertrand, pas une retouche
@@ -813,6 +812,31 @@ pub fn est_etiquette_locale_generique(nom: &str) -> bool {
     ETIQUETTES_LOCALES_GENERIQUES
         .iter()
         .any(|e| e.eq_ignore_ascii_case(nom))
+}
+
+/// #3067 — le nom à donner à une zone NAVIGATEUR restée sur une étiquette
+/// générique de zone locale.
+///
+/// Avant le 11/07/2026 (`f0b50822`), `POST /zones` créait la zone navigateur
+/// sous le nom que lui passait le client, `settings.thisComputer` : « Cet
+/// ordinateur » ou « This computer ». C'est exactement l'étiquette de la zone
+/// LOCALE du même poste. Fuccaro (fil 1634, Windows 11, DAC en WASAPI/PURE)
+/// voyait donc « Cet ordinateur » à côté de « This Computer », deux noms pour
+/// une même chose — et ne savait plus laquelle sortait le son. Depuis, une
+/// zone navigateur neuve porte l'adresse du client ; les anciennes, non.
+///
+/// Rend `None` pour tout autre nom : une zone navigateur suffixée par son
+/// adresse, ou renommée par l'utilisateur, n'est jamais touchée.
+pub fn nom_de_zone_navigateur_heritee(nom: &str) -> Option<&'static str> {
+    let nom = nom.trim();
+    if !est_etiquette_locale_generique(nom) {
+        return None;
+    }
+    if nom.eq_ignore_ascii_case("Cet ordinateur") {
+        Some("Ce navigateur")
+    } else {
+        Some("This browser")
+    }
 }
 
 /// Le nom à donner à une zone locale qu'on s'apprête à CRÉER (#1770).

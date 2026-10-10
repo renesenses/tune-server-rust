@@ -9,6 +9,9 @@ pub mod canaux_declares;
 pub mod canaux_reseau_4573;
 
 pub mod bitperfect_strict;
+/// #4969 — la carte des canaux de SORTIE (réaffectation, disposition,
+/// adaptation), mesurée par impulsions : les niveaux par canal la suivent.
+pub mod carte_des_canaux;
 pub mod channels;
 /// #5071 — la compensation de niveau cuite dans le flux réseau, bornée à la
 /// crête (jamais d'écrêtage).
@@ -25,6 +28,9 @@ pub mod decode_progress;
 /// #6059 — servir un FLAC, AIFF ou DSF natif à partir d'une position.
 pub mod depart_natif;
 pub mod dff;
+/// #6057 — la disposition des canaux déclarée par le fichier (WAV, FLAC, DSF,
+/// DFF) et le routage par position vers la sortie.
+pub mod disposition_canaux;
 /// Dither TPDF — UNE implémentation, partagée par tous les étages qui
 /// repassent du flottant à l'entier (#4075, #4076).
 pub mod dither;
@@ -59,6 +65,9 @@ pub mod faststart;
 /// Mémoire du volume d'avant l'armement du mode bit-perfect (#2395).
 pub mod fixed_volume;
 pub mod flac_vendeur;
+/// #2211 — le réglage de fondu d'une zone et la consigne de chaque frontière
+/// (même album, live, DSD) que l'orchestrateur remet à la sortie locale.
+pub mod fondu_de_zone;
 /// Le fondu enchaîné qui superpose vraiment deux pistes (#2211) — deux flux
 /// `f32` décodés, une enveloppe par échantillon, un seul puits. Aucun volume
 /// de sortie n'est touché : c'est tout le sujet du ticket.
@@ -96,6 +105,9 @@ pub mod pcm_teneur;
 /// `test` de la CI, qui ne compile pas `local-audio`.
 pub mod periode_alsa;
 pub mod pipeline;
+/// #6044 — le greffon « Réaffectation des canaux » : réglage par zone et par
+/// album, résolution de la règle qui s'applique à une piste.
+pub mod reaffectation_canaux;
 pub mod replaygain;
 pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
