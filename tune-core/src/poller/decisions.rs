@@ -99,7 +99,7 @@ use super::{
     POSITION_PAST_END_TICKS, RENDERER_CALE_REPRISE_COOLDOWN_SECS, RENDERER_CALE_RESTE_MIN_MS,
     REPRISE_CALE_DELAI_DE_CONSTAT_MS, REPRISE_CALE_DELAI_MAX_DE_CONSTAT_MS,
     REPRISE_CALE_ECART_TOLERE_MS, STOPPED_TICKS_THRESHOLD, SuivantePreparee,
-    TICKS_GELE_DLNA_AVEC_SETNEXT,
+    TICKS_GELE_DLNA_AVEC_SETNEXT, TransportState,
 };
 
 /// Margin (ms) added to the track duration before position-based
@@ -646,6 +646,18 @@ pub fn position_reset(last_position_ms: u64, position_ms: u64, gapless_armed: bo
     last_position_ms > 30_000 && position_ms < 5_000 && gapless_armed
 }
 
+/// #3967 — une chute de position (`position_reset`) observée alors que le
+/// transport ne JOUE pas doit-elle être différée au sondage suivant ?
+///
+/// Seul `Playing` atteste un passage : `Stopped` à zéro est la signature d'un
+/// renderer qui a acquitté `SetNextAVTransportURI` sans enchaîner, et
+/// `Transitioning` / `Paused` ne disent pas encore ce qui va jouer. Différer
+/// ne perd rien : la position d'avant est gardée, et un `Playing` près de
+/// zéro au sondage suivant conclut au passage.
+pub fn chute_a_differer_hors_lecture(chute_brute: bool, etat: TransportState) -> bool {
+    chute_brute && etat != TransportState::Playing
+}
+
 /// The `position_reset` fallback advances metadata only, assuming the
 /// renderer auto-transitioned internally — its position dropped to 0 because
 /// it is already playing the next track. That premise holds only for outputs
@@ -1016,6 +1028,47 @@ pub fn should_arm_gapless(
     !gapless_sent
         && effective_duration_ms > GAPLESS_WINDOW_MS
         && position_ms >= effective_duration_ms - GAPLESS_WINDOW_MS
+}
+
+/// #5970 — marge laissée, après la résolution de la suivante, pour attendre
+/// ses premiers octets (`wait_stream_data_ready`, 5 s au plus) et poser le
+/// `SetNextAVTransportURI` avant la fin de la piste en cours.
+pub const PREPARATION_GAPLESS_MARGE_MS: u64 = 8_000;
+/// #5970 — budget minimal de résolution : une suivante normale se résout en
+/// 200 ms environ, on lui laisse toujours sa chance.
+pub const PREPARATION_GAPLESS_PLANCHER_MS: u64 = 2_000;
+/// #5970 — budget maximal de résolution. Le tick attend la préparation, et
+/// le tick sonde TOUTES les zones : au-delà, ce sont elles qui se figent.
+pub const PREPARATION_GAPLESS_PLAFOND_MS: u64 = 10_000;
+/// #5970 — en deçà de ce reste avant la fin estimée, une suivante prête ne
+/// part plus en `SetNextAVTransportURI` : la fin de piste la jouera
+/// explicitement (`SetAVTransportURI` + `Play`), par le repli existant.
+pub const SETNEXT_TARDIF_MARGE_MS: u64 = 2_000;
+/// #5970 — au-delà, la durée de préparation de la suivante est journalisée
+/// en INFO (`gapless_preparation_lente`).
+pub const PREPARATION_GAPLESS_LENTE_MS: u64 = 2_000;
+
+/// #5970 — le temps accordé à la résolution de la suivante, selon ce qui
+/// reste de la piste en cours : `reste - marge`, borné à
+/// [`PREPARATION_GAPLESS_PLANCHER_MS`, `PREPARATION_GAPLESS_PLAFOND_MS`].
+///
+/// Sans borne, une résolution de 50,8 s (journal du ticket 240) gelait le
+/// sondeur et posait le `SetNext` 40 s après la fin de la piste.
+pub fn budget_de_resolution_gapless(reste: std::time::Duration) -> std::time::Duration {
+    let ms = (reste.as_millis() as u64)
+        .saturating_sub(PREPARATION_GAPLESS_MARGE_MS)
+        .clamp(
+            PREPARATION_GAPLESS_PLANCHER_MS,
+            PREPARATION_GAPLESS_PLAFOND_MS,
+        );
+    std::time::Duration::from_millis(ms)
+}
+
+/// #5970 — la suivante, prête, arrive-t-elle trop tard pour un
+/// `SetNextAVTransportURI` ? `reste` est le temps restant jusqu'à la fin
+/// estimée de la piste en cours (zéro si elle est passée).
+pub fn suivante_trop_tardive_pour_setnext(reste: std::time::Duration) -> bool {
+    (reste.as_millis() as u64) <= SETNEXT_TARDIF_MARGE_MS
 }
 
 /// La piste mise en attente a-t-elle expire ?

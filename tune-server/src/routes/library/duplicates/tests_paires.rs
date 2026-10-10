@@ -117,7 +117,9 @@ async fn les_paires_portent_leur_critere_et_recommandent_la_meilleure_copie() {
     piste(
         &state,
         4,
-        "Sinnerman (autre)",
+        // #5976 : même titre une fois normalisé (casse, ponctuation),
+        // mais pas pour `LOWER(title)` : seul le faisceau contenu les réunit.
+        "SINNERMAN !",
         "/m/b/sinnerman.m4a",
         "aac",
         44100,

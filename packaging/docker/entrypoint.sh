@@ -14,11 +14,19 @@
 #
 # Started as non-root (`docker run --user ...`), it changes nothing and starts
 # the server directly.
+#
+# Local audio output (#5968): a USB DAC is reached through /dev/snd, passed
+# with `--device /dev/snd` (compose: `devices: [/dev/snd:/dev/snd]`). Its
+# nodes keep the HOST group id (29 on Debian/Ubuntu, 63 on Fedora...), so the
+# server keeps, besides the groups of `tune` in the image (`audio` among
+# them), the group owning /dev/snd and every `--group-add` of the container.
+# `setpriv --init-groups` alone would drop the last two.
 set -eu
 
 TUNE_BIN="${TUNE_ENTRYPOINT_BIN:-/app/tune-server}"
 TUNE_USER=tune
 DATA_DIR="${TUNE_ENTRYPOINT_DATA_DIR:-/data}"
+SND_DIR="${TUNE_ENTRYPOINT_SND_DIR:-/dev/snd}"
 
 die() {
     echo "FATAL: $*" >&2
@@ -75,5 +83,26 @@ fi
 HOME="$(getent passwd "$TUNE_USER" | cut -d: -f6)"
 export HOME
 
-exec setpriv --reuid="$TUNE_USER" --regid="$TUNE_USER" --init-groups \
+# Supplementary groups (#5968): those of `tune`, then the owner of the sound
+# devices and the container's `--group-add` (root's own 0 and the unmapped
+# 65534 of a rootless user namespace excluded: neither can be granted).
+groups=""
+add_group() {
+    case "$1" in '' | 0 | 65534 | *[!0-9]*) return 0 ;; esac
+    case ",$groups," in *",$1,"*) return 0 ;; esac
+    groups="${groups:+$groups,}$1"
+}
+for g in $(id -G "$TUNE_USER"); do
+    case ",$groups," in *",$g,"*) ;; *) groups="${groups:+$groups,}$g" ;; esac
+done
+for node in "$SND_DIR"/*; do
+    if [ -c "$node" ]; then
+        add_group "$(stat -L -c %g "$node")"
+    fi
+done
+for g in $(id -G); do
+    add_group "$g"
+done
+
+exec setpriv --reuid="$TUNE_USER" --regid="$TUNE_USER" --groups="$groups" \
     "$TUNE_BIN" "$@"

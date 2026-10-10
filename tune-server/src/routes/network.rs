@@ -296,14 +296,28 @@ async fn oublier_un_partage(
     let chemin = std::path::Path::new(&mount_path);
     let mut demonte = false;
     if smb::est_un_point_de_montage(chemin) {
+        // Hors root (Tune OS sous `tune`, #3206) : par l'assistant, via sudo.
         let res = tokio::time::timeout(
             Duration::from_secs(15),
-            Command::new("umount").arg(&mount_path).output(),
+            smb::commande_de_demontage(
+                crate::privilege::euid(),
+                &crate::privilege::sudo(),
+                &mount_path,
+            )
+            .lancer(),
         )
         .await;
         let echec = match res {
             Ok(Ok(out)) if out.status.success() => None,
-            Ok(Ok(out)) => Some(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+            Ok(Ok(out)) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if crate::privilege::est_un_refus_d_elevation(&stderr) {
+                    warn!(id, path = %mount_path, error = %stderr, "smb_umount_elevation_refusee");
+                    Some(crate::privilege::message_de_refus(&stderr))
+                } else {
+                    Some(stderr)
+                }
+            }
             Ok(Err(e)) => Some(e.to_string()),
             Err(_) => Some("délai dépassé".to_string()),
         };
@@ -1141,7 +1155,22 @@ async fn mount_smb_share(
     }
 
     // Create mount directory
-    if let Err(e) = tokio::fs::create_dir_all(&mount_path).await {
+    //
+    // Hors root (Tune OS sous `tune`, #3206), /mnt appartient a root et le
+    // reste : c'est l'assistant privilegie qui cree le point, apres l'avoir
+    // verifie. Un /mnt ouvert au compte du service lui permettrait d'y poser
+    // un lien vers /etc et d'y faire monter un partage par root.
+    let creation = match tokio::fs::create_dir_all(&mount_path).await {
+        Err(e)
+            if crate::privilege::euid() != 0
+                && e.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            info!(path = %mount_path, "smb_mount_dir_par_l_assistant");
+            Ok(())
+        }
+        autre => autre,
+    };
+    if let Err(e) = creation {
         // Journalise AUSSI, et pas seulement dans la reponse HTTP : le client
         // web n'affichait que le statut, donc la cause n'existait nulle part
         // (#1847).
@@ -1239,19 +1268,26 @@ async fn mount_smb_share(
 
         let mut dernier = None;
         for dialecte in smb::DIALECTES {
-            let opts = smb::options_de_montage(user, pass, dialecte);
-            // JAMAIS `opts` dans une trace : il porte le mot de passe.
             info!(
                 host = %body.host,
                 share = %body.share_name,
                 dialect = smb::etiquette(dialecte),
                 "smb_mount_attempt"
             );
+            // root : `mount.cifs` direct ; sinon l'assistant, via sudo, le
+            // mot de passe sur son entree (#3206).
             let res = tokio::time::timeout(
                 smb::ESSAI_TIMEOUT,
-                Command::new("mount.cifs")
-                    .args([&unc, &mount_path, "-o", &opts])
-                    .output(),
+                smb::commande_de_montage(
+                    crate::privilege::euid(),
+                    &crate::privilege::sudo(),
+                    &unc,
+                    &mount_path,
+                    user,
+                    pass,
+                    dialecte,
+                )
+                .lancer(),
             )
             .await;
 
@@ -1317,6 +1353,18 @@ async fn mount_smb_share(
             // La vraie cause, et non l'erreur du dernier dialecte essaye.
             if smb::est_deja_monte(&stderr) {
                 return point_occupe(&mount_path, None);
+            }
+            if crate::privilege::est_un_refus_d_elevation(&stderr) {
+                // Deja journalise par l'echelle (`smb_mount_failed`) ; ici,
+                // le message dit a l'utilisateur ce qui manque.
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": "elevation_refusee",
+                        "message": crate::privilege::message_de_refus(&stderr),
+                    })),
+                )
+                    .into_response();
             }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2392,6 +2440,16 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                     // `res@size` : jamais rendu jusqu'ici. L'indexation de la
                     // phase 2 en fait une composante de la clé d'identité.
                     let size = best.and_then(|r| r.size);
+                    // Numéros de piste et de disque : `upnp:originalTrackNumber`
+                    // est la balise normalisée ; `upnp:originalDiscNumber` est
+                    // celle des serveurs qui disent le disque. Jamais lus
+                    // jusqu'ici : l'import de la bibliothèque unifiée rangeait
+                    // 0 sur chaque piste, et la fiche d'album se triait par
+                    // titre. Absent, illisible ou 0 : `null`, rien d'inventé.
+                    let track_number = extract_xml_tag(element, "upnp:originalTrackNumber")
+                        .and_then(|v| numero_didl(&v));
+                    let disc_number = extract_xml_tag(element, "upnp:originalDiscNumber")
+                        .and_then(|v| numero_didl(&v));
                     items.push(json!({
                         "id": id,
                         "title": title,
@@ -2405,6 +2463,8 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                         "channels": channels,
                         "protocol_info": protocol_info,
                         "size": size,
+                        "track_number": track_number,
+                        "disc_number": disc_number,
                     }));
                 }
 
@@ -2606,6 +2666,18 @@ fn texte_didl(brut: &str) -> String {
     quick_xml::escape::unescape(brut)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| brut.to_string())
+}
+
+/// Un numéro de piste ou de disque DIDL : les chiffres de tête, strictement
+/// positifs. « 3/12 » donne 3 ; « 0 », « » ou « A1 » ne donnent rien — 0 n'est
+/// pas un numéro, c'est l'absence de numéro.
+fn numero_didl(brut: &str) -> Option<u32> {
+    let chiffres: String = brut
+        .trim()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    chiffres.parse::<u32>().ok().filter(|n| *n > 0)
 }
 
 fn extract_xml_tag(element: &str, tag: &str) -> Option<String> {
@@ -2856,6 +2928,52 @@ mod tests {
         );
         // Témoin : un texte sans entité traverse inchangé.
         assert_eq!(items[0]["album"].as_str(), Some("Caravelle"));
+    }
+
+    /// b209 — le numéro de piste d'un serveur UPnP. Le DIDL ci-dessous a la
+    /// forme exacte de celui qu'un serveur Tune rend à `Browse` sur un album
+    /// (relevé sur le LAN le 07/10/2026, adresses remplacées) : le numéro est
+    /// dans `upnp:originalTrackNumber`, et rien ne le lisait — l'import
+    /// rangeait 0 sur chaque piste.
+    #[test]
+    fn le_numero_de_piste_et_de_disque_sont_lus_et_zero_n_en_est_pas_un() {
+        let item = |id: &str, numeros: &str| {
+            format!(
+                r#"<item id="track/{id}" parentID="album/1" restricted="1"><dc:title>T{id}</dc:title><dc:creator>Artiste</dc:creator><upnp:artist>Artiste</upnp:artist><upnp:class>object.item.audioItem.musicTrack</upnp:class><upnp:album>Album</upnp:album>{numeros}<res protocolInfo="http-get:*:audio/flac:*" duration="0:06:38.493" sampleFrequency="44100" bitsPerSample="16" nrAudioChannels="2" size="31909580">http://serveur.invalid/api/v1/library/tracks/{id}/audio</res></item>"#
+            )
+        };
+        let didl = format!(
+            r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">{}{}{}{}</DIDL-Lite>"#,
+            item(
+                "1",
+                "<upnp:originalTrackNumber>7</upnp:originalTrackNumber><upnp:originalDiscNumber>2</upnp:originalDiscNumber>"
+            ),
+            item(
+                "2",
+                "<upnp:originalTrackNumber>0</upnp:originalTrackNumber>"
+            ),
+            item("3", ""),
+            item(
+                "4",
+                "<upnp:originalTrackNumber> 3/12 </upnp:originalTrackNumber>"
+            ),
+        );
+        let soap = format!(
+            "<Envelope><Body><BrowseResponse><Result>{}</Result></BrowseResponse></Body></Envelope>",
+            xml_escape(&didl)
+        );
+        let (_c, items) = parse_didl_browse_response(&soap);
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            items[0]["track_number"].as_u64(),
+            Some(7),
+            "sans le correctif : absent"
+        );
+        assert_eq!(items[0]["disc_number"].as_u64(), Some(2));
+        assert!(items[1]["track_number"].is_null(), "0 n'est pas un numéro");
+        assert!(items[1]["disc_number"].is_null());
+        assert!(items[2]["track_number"].is_null(), "rien n'est inventé");
+        assert_eq!(items[3]["track_number"].as_u64(), Some(3));
     }
 
     #[test]
