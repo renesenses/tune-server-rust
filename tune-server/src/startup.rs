@@ -465,6 +465,8 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
         // Re-probe auto-discovered renderers whose lazy SSDP responder won't
         // resurface them after a restart (Cyrus Stream X2, #1126).
         crate::discovery_setup::reregister_known_renderers(&state_clone).await;
+        // #4626 — les sorties prêtées par les agents Tune appairés.
+        crate::agent_tune::maitre::reinscrire_les_agents(&state_clone).await;
     });
 
     // Re-probe auto-discovered DLNA renderers from their persisted LOCATION,

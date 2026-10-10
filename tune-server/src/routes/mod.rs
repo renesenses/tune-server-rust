@@ -1,4 +1,6 @@
 pub mod active_profile;
+/// #4626 — appairage maître / agent et ordres entre serveurs Tune.
+pub mod agent_tune;
 pub mod ai;
 pub mod airplay_pairing;
 pub mod appliance;
@@ -455,6 +457,8 @@ pub fn router_with_plugins(
         .nest("/dashboard", dashboard::router())
         .nest("/digest", digest::router())
         .nest("/peers", peers::router())
+        // #4626 — gestes de l'utilisateur (code, appairage, oubli).
+        .nest("/agent-tune", agent_tune::router())
         .nest("/podcasts", podcasts::router())
         .nest("/plugins", plugins::router())
         .nest("/marketplace", marketplace::router())
@@ -656,6 +660,14 @@ pub fn router_with_plugins(
     app = app.nest(
         "/upnp/renderer",
         upnp_media_renderer::router().with_state(state.clone()),
+    );
+    // #4626 — ce qu'un serveur Tune demande à un autre (maître → agent). À la
+    // RACINE, hors de la couche d'authentification : un maître n'a pas de
+    // session chez l'agent. Chaque route vérifie elle-même le jeton
+    // d'appairage, sauf l'annonce publique et l'appairage gardé par le code.
+    app = app.nest(
+        "/agent-tune",
+        agent_tune::router_entre_serveurs().with_state(state.clone()),
     );
 
     // Mount all installed skins on /{skin_id}

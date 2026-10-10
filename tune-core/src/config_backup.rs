@@ -121,6 +121,12 @@ const SENSITIVE_KEYS: &[&str] = &[
     "credentials_vault",
     "server_id",
     "hardware_fingerprint",
+    // #4626 — l'identité maître/agent et les secrets d'appairage : une
+    // sauvegarde restaurée sur une autre machine ne doit ni en cloner
+    // l'identité, ni emporter les jetons qui pilotent les sorties d'un agent.
+    "agent_tune_identite",
+    "agent_tune_agents",
+    "agent_tune_maitres",
 ];
 
 fn is_sensitive(key: &str) -> bool {
