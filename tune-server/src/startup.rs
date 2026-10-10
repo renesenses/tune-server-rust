@@ -682,6 +682,18 @@ fn deduplicate_zones(state: &AppState) {
             tracing::warn!(error = %e, "zone_dedup_failed");
         }
     }
+    // #3067 — une zone navigateur héritée ne porte plus le nom de la zone
+    // locale du même poste (« Cet ordinateur » à côté de « This Computer »).
+    match zone_repo.distinguer_zones_navigateur_generiques() {
+        Ok(renommees) => {
+            for (zone_id, nom) in renommees {
+                info!(zone_id, name = %nom, "zone_navigateur_generique_renommee");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "zone_navigateur_generique_renommage_echoue");
+        }
+    }
     // Add a unique index on output_device_id (idempotent) so duplicate zones
     // can never be created again at the SQL level.
     if let Err(e) = state.backend.execute_batch(
