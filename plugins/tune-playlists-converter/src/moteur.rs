@@ -33,18 +33,25 @@
 //!   greffon ne parle pas HTTP — il n'a pas la permission `net`. Il verse par
 //!   paquets de [`TAILLE_PAQUET`] parce que c'est la taille d'un lot TIDAL, et
 //!   parce qu'un paquet versé est un point de reprise.
-//! * **La bibliothèque locale comme CIBLE.** Il faudrait apparier un titre
-//!   dans la bibliothèque, et l'interface hôte de la tranche 1 n'expose aucune
-//!   capacité de recherche locale (`host_search` / un
-//!   `host_library_match_track`, permission `library`, n'existent pas). La
-//!   demande est refusée explicitement plutôt que silencieusement approximée.
+//! * **Supprimer quoi que ce soit.** Ni chez un service, ni dans la
+//!   bibliothèque : aucune capacité de suppression n'existe.
+//!
+//! ## La bibliothèque locale, des deux côtés (#4741)
+//!
+//! `"local"` vaut comme SOURCE (ids entiers de playlists) et comme CIBLE :
+//! l'appariement passe alors par `host_library_match_track`, la création par
+//! `host_playlist_create` et l'ajout par `host_playlist_add_tracks` — les
+//! mêmes gestes que le retour en arrière d'un snapshot local
+//! ([`crate::snapshots::creer`], [`crate::snapshots::ajouter`]). Un seul moteur
+//! pour « service → service », « service → bibliothèque » et
+//! « bibliothèque → service ».
 
 use serde_json::{Value, json};
 
 use crate::appariement::{self, Raison};
 use crate::hote::Hote;
 use crate::modele::{Appariee, Demande, EnTeteLot, Introuvable, Lot, PlaylistDuLot, etat};
-use crate::snapshots::Snapshots;
+use crate::snapshots::{self, LOCAL, Snapshots};
 
 /// Taille d'un paquet de titres versé chez la cible.
 ///
@@ -94,8 +101,14 @@ impl<'h, H: Hote + ?Sized> Convertisseur<'h, H> {
         let mut playlists = Vec::with_capacity(demande.playlists.len());
         for (rang, source_id) in demande.playlists.iter().enumerate() {
             let (source_nom, pistes) = self.lire_la_source(demande, source_id, &noms)?;
-            let cible_nom = match demande.suffixe_nom.as_deref() {
-                Some(suffixe) if !suffixe.is_empty() => format!("{source_nom}{suffixe}"),
+            let nom_impose = demande
+                .nom_cible
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty());
+            let cible_nom = match (nom_impose, demande.suffixe_nom.as_deref()) {
+                (Some(nom), _) => nom.to_string(),
+                (None, Some(suffixe)) if !suffixe.is_empty() => format!("{source_nom}{suffixe}"),
                 // Sans suffixe, le nom est repris À L'IDENTIQUE. C'est ce que
                 // « transférer à l'identique » veut dire, et le contraire de ce
                 // que faisait la route (« … (transferred) »).
@@ -263,16 +276,7 @@ impl<'h, H: Hote + ?Sized> Convertisseur<'h, H> {
     ) -> Result<(), String> {
         let mut vient_d_etre_creee = false;
         if pl.cible_playlist_id.is_none() {
-            let reponse = self.hote.streaming_playlist_create(
-                cible,
-                &pl.cible_nom,
-                Some("Transféré par Tune"),
-            )?;
-            let id = reponse
-                .get("playlist_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "réponse sans playlist_id à la création".to_string())?
-                .to_string();
+            let id = snapshots::creer(self.hote, cible, &pl.cible_nom, Some("Transféré par Tune"))?;
             pl.cible_playlist_id = Some(id);
             // 🔴 Persister TOUT DE SUITE : entre cette ligne et le premier
             // paquet, une coupure laisserait une playlist orpheline que la
@@ -304,12 +308,10 @@ impl<'h, H: Hote + ?Sized> Convertisseur<'h, H> {
         }
 
         let restant = pl.restant_a_verser();
-        for paquet in restant.chunks(TAILLE_PAQUET) {
-            self.hote
-                .streaming_playlist_add_tracks(cible, &cible_playlist_id, paquet)?;
+        snapshots::ajouter(self.hote, cible, &cible_playlist_id, &restant, |paquet| {
             pl.versees.extend(paquet.iter().cloned());
-            self.ecrire_la_playlist(lot_id, pl)?;
-        }
+            self.ecrire_la_playlist(lot_id, pl)
+        })?;
         Ok(())
     }
 
@@ -377,11 +379,10 @@ impl<'h, H: Hote + ?Sized> Convertisseur<'h, H> {
         if d.source_service.is_empty() || d.cible_service.is_empty() {
             return Err("source_service et cible_service sont obligatoires".into());
         }
-        if d.cible_service == "local" {
+        if d.playlists.len() > 1 && d.nom_cible.as_deref().is_some_and(|n| !n.trim().is_empty()) {
             return Err(
-                "cible_locale_non_supportee : l'interface hôte n'expose aucune capacité \
-                 d'appariement dans la bibliothèque locale (permission `library`). \
-                 Transférer vers la bibliothèque demande cette capacité (#4716)."
+                "demande_invalide : nom_cible ne vaut que pour une seule playlist ; \
+                 pour un lot, utiliser suffixe_nom"
                     .into(),
             );
         }
@@ -395,7 +396,7 @@ impl<'h, H: Hote + ?Sized> Convertisseur<'h, H> {
     /// service pour tout le lot ; vide pour une source locale, dont le nom
     /// arrive avec les pistes.
     fn noms_des_playlists_source(&self, source: &str) -> Result<Vec<(String, String)>, String> {
-        if source == "local" {
+        if source == LOCAL {
             return Ok(Vec::new());
         }
         let reponse = self.hote.streaming_playlists(source)?;
@@ -423,7 +424,7 @@ impl<'h, H: Hote + ?Sized> Convertisseur<'h, H> {
         source_id: &str,
         noms: &[(String, String)],
     ) -> Result<(String, Vec<PisteSource>), String> {
-        let reponse = if d.source_service == "local" {
+        let reponse = if d.source_service == LOCAL {
             let id: i64 = source_id
                 .parse()
                 .map_err(|_| format!("identifiant de playlist locale non entier : {source_id}"))?;
@@ -477,23 +478,16 @@ impl<'h, H: Hote + ?Sized> Convertisseur<'h, H> {
         }
     }
 
-    /// Apparier une piste chez la cible, et appliquer la règle des trois
-    /// critères. Une erreur de l'hôte devient une RAISON, pas un arrêt : le
-    /// reste de la playlist s'apparie quand même.
+    /// Apparier une piste chez la cible — service ou bibliothèque — par le
+    /// seul chemin d'appariement du greffon ([`appariement::apparier_chez`]).
     fn apparier(&self, cible: &str, piste: &PisteSource) -> Result<appariement::Candidat, Raison> {
-        let reponse = self
-            .hote
-            .streaming_match_track(
-                cible,
-                &piste.titre,
-                &piste.artiste,
-                &piste.isrc,
-                piste.duree_ms,
-            )
-            .map_err(|message| Raison::ServiceEnErreur { message })?;
-        appariement::juger(
+        appariement::apparier_chez(
+            self.hote,
+            cible,
+            &piste.titre,
+            &piste.artiste,
+            &piste.isrc,
             piste.duree_ms,
-            appariement::candidat_de_la_reponse(&reponse),
         )
     }
 
