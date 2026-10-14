@@ -25,6 +25,8 @@ pub mod decode;
 /// Balise d'avancement du décodage (#3140) — le débit réel de l'hôte, mesuré
 /// sur le décodage en cours, sans le coûter.
 pub mod decode_progress;
+/// #6059 — servir un FLAC, AIFF ou DSF natif à partir d'une position.
+pub mod depart_natif;
 pub mod dff;
 /// #6057 — la disposition des canaux déclarée par le fichier (WAV, FLAC, DSF,
 /// DFF) et le routage par position vers la sortie.
@@ -44,6 +46,9 @@ mod dsd_ordre_canaux_et_phase;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
 pub mod dsf;
+pub mod dsf_depuis_dst;
+#[cfg(test)]
+mod dsf_depuis_dst_tests_6221;
 /// #4833 — le DSF décodé au fil de l'eau depuis HTTP produit le même PCM que
 /// le fichier (mesuré : comptes, cadence, RMS, corrélation, vitesse).
 #[cfg(test)]
@@ -107,6 +112,7 @@ pub mod pipeline;
 /// album, résolution de la règle qui s'applique à une piste.
 pub mod reaffectation_canaux;
 pub mod replaygain;
+pub mod repli_dsd_4354;
 pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]

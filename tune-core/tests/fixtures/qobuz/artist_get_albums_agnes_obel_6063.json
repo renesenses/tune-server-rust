@@ -1,0 +1,842 @@
+{
+ "_enregistrement": "API Qobuz publique, GET /api.json/0.2/artist/get?artist_id=551325&extra=albums&limit=100, 12/10/2026 (#6063). Reduite aux champs lus par map_album ; aucun item ne porte release_type ni product_type.",
+ "id": 551325,
+ "name": "Agnes Obel",
+ "albums": {
+  "total": 52,
+  "items": [
+   {
+    "id": "5414939568176",
+    "title": "Aventine",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 11,
+    "duration": 2458,
+    "media_count": 1,
+    "released_at": 1380492000,
+    "release_date_original": "2013-09-30",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 48
+   },
+   {
+    "id": "5414939114878",
+    "title": "Philharmonics",
+    "version": "Deluxe Edition",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 23,
+    "duration": 5078,
+    "media_count": 1,
+    "released_at": 1286143200,
+    "release_date_original": "2010-10-04",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "e3j7lzexax05q",
+    "title": "The Meaning of Flowers",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 12,
+    "duration": 3108,
+    "media_count": 1,
+    "released_at": 1789682400,
+    "release_date_original": "2026-09-18",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414939943546",
+    "title": "Citizen of Glass",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 10,
+    "duration": 2451,
+    "media_count": 1,
+    "released_at": 1477000800,
+    "release_date_original": "2016-10-21",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414939568275",
+    "title": "Aventine (Bonus Track Version)",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 12,
+    "duration": 2662,
+    "media_count": 1,
+    "released_at": 1380492000,
+    "release_date_original": "2013-09-30",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 48
+   },
+   {
+    "id": "5414939772573",
+    "title": "Aventine",
+    "version": "Deluxe Version",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 22,
+    "duration": 5353,
+    "media_count": 1,
+    "released_at": 1380492000,
+    "release_date_original": "2013-09-30",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "mnp7j5w4llqha",
+    "title": "Myopia",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 10,
+    "duration": 2387,
+    "media_count": 1,
+    "released_at": 1582239600,
+    "release_date_original": "2020-02-21",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "ffe6b5sf1dogc",
+    "title": "Philharmonics",
+    "version": "Deluxe Edition",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 27,
+    "duration": 5870,
+    "media_count": 1,
+    "released_at": 1286143200,
+    "release_date_original": "2010-10-04",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "ju5znqdzktk6o",
+    "title": "Laymelli",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 2,
+    "duration": 634,
+    "media_count": 1,
+    "released_at": 1787263200,
+    "release_date_original": "2026-08-21",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "au26p87kzfiyb",
+    "title": "Late Night Tales: Agnes Obel",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 11,
+    "duration": 5096,
+    "media_count": 1,
+    "released_at": 1527199200,
+    "release_date_original": "2018-05-25",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "m8zh34ynzt4mb",
+    "title": "Myopia",
+    "version": "Instrumentals",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 5,
+    "duration": 1428,
+    "media_count": 1,
+    "released_at": 1582239600,
+    "release_date_original": "2020-02-21",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "i18t3mn3vgfva",
+    "title": "Philharmonics",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 13,
+    "duration": 2569,
+    "media_count": 1,
+    "released_at": 1286143200,
+    "release_date_original": "2010-10-04",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "wapunbel8vlfb",
+    "title": "Foe (Original Motion Picture Score)",
+    "version": null,
+    "artist": {
+     "id": 2814280,
+     "name": "Park Jiha"
+    },
+    "tracks_count": 24,
+    "duration": 4110,
+    "media_count": 1,
+    "released_at": 1704409200,
+    "release_date_original": "2024-01-05",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 48
+   },
+   {
+    "id": "5414939943478",
+    "title": "Familiar",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 234,
+    "media_count": 1,
+    "released_at": 1467237600,
+    "release_date_original": "2016-06-30",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5413356519570",
+    "title": "Philharmonics",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 12,
+    "duration": 2390,
+    "media_count": 1,
+    "released_at": 1286143200,
+    "release_date_original": "2010-10-04",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "l29j85homtryc",
+    "title": "Live from Brooklyn",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 4,
+    "duration": 1187,
+    "media_count": 1,
+    "released_at": 1621548000,
+    "release_date_original": "2021-05-21",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5413356520279",
+    "title": "Riverside EP",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 3,
+    "duration": 693,
+    "media_count": 1,
+    "released_at": 1275170400,
+    "release_date_original": "2010-05-30",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "rkzleeozzoy1a",
+    "title": "Live 2022, Vol. 2",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 2,
+    "duration": 564,
+    "media_count": 1,
+    "released_at": 1691100000,
+    "release_date_original": "2023-08-04",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414939415272",
+    "title": "The Curse",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 351,
+    "media_count": 1,
+    "released_at": 1369000800,
+    "release_date_original": "2013-05-20",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "t1s0apepicjja",
+    "title": "Live 2022, Vol. 1",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 2,
+    "duration": 650,
+    "media_count": 1,
+    "released_at": 1688680800,
+    "release_date_original": "2023-07-07",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414939951619",
+    "title": "It's Happening Again",
+    "version": "Instrumental",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 260,
+    "media_count": 1,
+    "released_at": 1479423600,
+    "release_date_original": "2016-11-18",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "bmia2pps6ay3b",
+    "title": "Can't Be",
+    "version": "Rone Remix",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 209,
+    "media_count": 1,
+    "released_at": 1624572000,
+    "release_date_original": "2021-06-25",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 96
+   },
+   {
+    "id": "5414939135477",
+    "title": "Riverside",
+    "version": "Lulu Rouge remix",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 315,
+    "media_count": 1,
+    "released_at": 1306101600,
+    "release_date_original": "2011-05-23",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "yx4cq5stwlewb",
+    "title": "The Echoes of Women - International Women's Day 2024",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 43,
+    "duration": 9311,
+    "media_count": 1,
+    "released_at": 1709852400,
+    "release_date_original": "2024-03-08",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414939955631",
+    "title": "Citizen of Glass ",
+    "version": "Instrumental",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 169,
+    "media_count": 1,
+    "released_at": 1477000800,
+    "release_date_original": "2016-10-21",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "epjdbihgd9u7b",
+    "title": "Poem About Death",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 184,
+    "media_count": 1,
+    "released_at": 1522879200,
+    "release_date_original": "2018-04-05",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414940004120",
+    "title": "Stretch Your Eyes ",
+    "version": "Quiet Village Remix",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 566,
+    "media_count": 1,
+    "released_at": 1507240800,
+    "release_date_original": "2017-10-06",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414939956690",
+    "title": "Stretch Your Eyes ",
+    "version": "Radio Edit",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 247,
+    "media_count": 1,
+    "released_at": 1488495600,
+    "release_date_original": "2017-03-03",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414939601477",
+    "title": "The Curse ",
+    "version": "Remixes",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 3,
+    "duration": 980,
+    "media_count": 1,
+    "released_at": 1369000800,
+    "release_date_original": "2013-05-20",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414939961991",
+    "title": "Mary",
+    "version": "Instrumental",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 347,
+    "media_count": 1,
+    "released_at": 1495749600,
+    "release_date_original": "2017-05-26",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "yja5plvwqe0qb",
+    "title": "Stretch Your Eyes ",
+    "version": "Ambient Acapella",
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 367,
+    "media_count": 1,
+    "released_at": 1516921200,
+    "release_date_original": "2018-01-26",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5051083061315",
+    "title": "Brother Sparrow",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 2,
+    "duration": 591,
+    "media_count": 1,
+    "released_at": 1316037600,
+    "release_date_original": "2011-09-15",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414939591075",
+    "title": "iTunes Festival London 2013",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 5,
+    "duration": 1063,
+    "media_count": 1,
+    "released_at": 1380060000,
+    "release_date_original": "2013-09-25",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 96
+   },
+   {
+    "id": "nufwl9dzl3vga",
+    "title": "Island Of Doom",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 329,
+    "media_count": 1,
+    "released_at": 1572303600,
+    "release_date_original": "2019-10-29",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414939946097",
+    "title": "Golden Green",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 240,
+    "media_count": 1,
+    "released_at": 1472680800,
+    "release_date_original": "2016-09-01",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5413356521276",
+    "title": "Just So",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 215,
+    "media_count": 1,
+    "released_at": 1286661600,
+    "release_date_original": "2010-10-10",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414939949838",
+    "title": "Stretch Your Eyes",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 311,
+    "media_count": 1,
+    "released_at": 1475791200,
+    "release_date_original": "2016-10-07",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "s69gmrzwgfwqa",
+    "title": "Riverside (arr. piano)",
+    "version": null,
+    "artist": {
+     "id": 2028942,
+     "name": "Music Lab Collective"
+    },
+    "tracks_count": 1,
+    "duration": 166,
+    "media_count": 1,
+    "released_at": 1760652000,
+    "release_date_original": "2025-10-17",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 48
+   },
+   {
+    "id": "hhbi8oqxhktra",
+    "title": "Familiar (feat. AG Sems)",
+    "version": null,
+    "artist": {
+     "id": 11576431,
+     "name": "Brent Allan"
+    },
+    "tracks_count": 1,
+    "duration": 269,
+    "media_count": 1,
+    "released_at": 1627077600,
+    "release_date_original": "2021-07-24",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "5414939950162",
+    "title": "Grasshopper",
+    "version": null,
+    "artist": {
+     "id": 551325,
+     "name": "Agnes Obel"
+    },
+    "tracks_count": 1,
+    "duration": 158,
+    "media_count": 1,
+    "released_at": 1476828000,
+    "release_date_original": "2016-10-19",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "pkz9jk6wvh7pa",
+    "title": "Falling, Catching",
+    "version": null,
+    "artist": {
+     "id": 2281662,
+     "name": "Chris Snelling"
+    },
+    "tracks_count": 1,
+    "duration": 122,
+    "media_count": 1,
+    "released_at": 1465077600,
+    "release_date_original": "2016-06-05",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "ti4x6zp0vpora",
+    "title": "The Curse ",
+    "version": "Live Acoustic",
+    "artist": {
+     "id": 22304889,
+     "name": "Echoes of Maya"
+    },
+    "tracks_count": 1,
+    "duration": 224,
+    "media_count": 1,
+    "released_at": 1761865200,
+    "release_date_original": "2025-10-31",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 48
+   },
+   {
+    "id": "mhp5dydt3mg2b",
+    "title": "Fuel to Fire",
+    "version": null,
+    "artist": {
+     "id": 5859937,
+     "name": "Jessie Black"
+    },
+    "tracks_count": 1,
+    "duration": 334,
+    "media_count": 1,
+    "released_at": 1707692400,
+    "release_date_original": "2024-02-12",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "r557plnp1kykc",
+    "title": "Pass Them By",
+    "version": null,
+    "artist": {
+     "id": 5859937,
+     "name": "Jessie Black"
+    },
+    "tracks_count": 1,
+    "duration": 195,
+    "media_count": 1,
+    "released_at": 1769382000,
+    "release_date_original": "2026-01-26",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "3610154201504",
+    "title": "Riverside",
+    "version": null,
+    "artist": {
+     "id": 1216176,
+     "name": "Cyriaque"
+    },
+    "tracks_count": 1,
+    "duration": 237,
+    "media_count": 1,
+    "released_at": 1385334000,
+    "release_date_original": "2013-11-25",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "njy9blmff18ib",
+    "title": "Brother Sparrow",
+    "version": null,
+    "artist": {
+     "id": 22304889,
+     "name": "Echoes of Maya"
+    },
+    "tracks_count": 1,
+    "duration": 238,
+    "media_count": 1,
+    "released_at": 1747951200,
+    "release_date_original": "2025-05-23",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 48
+   },
+   {
+    "id": "f86jpg5hudhuc",
+    "title": "Riverside",
+    "version": null,
+    "artist": {
+     "id": 2433716,
+     "name": "Safe Travel"
+    },
+    "tracks_count": 1,
+    "duration": 207,
+    "media_count": 1,
+    "released_at": 1685656800,
+    "release_date_original": "2023-06-02",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "cnjh7wej7s9eb",
+    "title": "Riverside",
+    "version": "Cover Mix",
+    "artist": {
+     "id": 296303,
+     "name": "Raz"
+    },
+    "tracks_count": 1,
+    "duration": 145,
+    "media_count": 1,
+    "released_at": 1701298800,
+    "release_date_original": "2023-11-30",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "dxzfvoyg4xtcb",
+    "title": "Pass Them By",
+    "version": null,
+    "artist": {
+     "id": 3480151,
+     "name": "The Seed"
+    },
+    "tracks_count": 1,
+    "duration": 214,
+    "media_count": 1,
+    "released_at": 1611961200,
+    "release_date_original": "2021-01-30",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "zandn9hx3hm7b",
+    "title": "Chord Left",
+    "version": null,
+    "artist": {
+     "id": 15957514,
+     "name": "David de Miguel"
+    },
+    "tracks_count": 1,
+    "duration": 149,
+    "media_count": 1,
+    "released_at": 1473631200,
+    "release_date_original": "2016-09-12",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "oh3cuhuiim5sz",
+    "title": "Trojan",
+    "version": null,
+    "artist": {
+     "id": 35272429,
+     "name": "Plug Pirate"
+    },
+    "tracks_count": 1,
+    "duration": 383,
+    "media_count": 1,
+    "released_at": 1789682400,
+    "release_date_original": "2026-09-18",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   },
+   {
+    "id": "t7odeh04avvlc",
+    "title": "Falling, Catching",
+    "version": null,
+    "artist": {
+     "id": 15957514,
+     "name": "David de Miguel"
+    },
+    "tracks_count": 1,
+    "duration": 129,
+    "media_count": 1,
+    "released_at": 1470952800,
+    "release_date_original": "2016-08-12",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1
+   }
+  ]
+ }
+}

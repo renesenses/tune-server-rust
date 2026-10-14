@@ -27,6 +27,20 @@ extern "C" {
 int32_t tune_server_start(uint16_t port, const char *db_path,
                           const char *music_dirs_json, const char *web_dir);
 
+/* Racine du conteneur de l'application (iOS : NSHomeDirectory()), A APPELER
+ * AVANT tune_server_start. Si la base a ete ecrite sous une autre racine qui
+ * n'existe plus (iOS a deplace l'application), ses chemins sont reecrits sous
+ * la nouvelle au demarrage.
+ * Retour : 0 succes, -2 si root est NULL, relatif ou "/". */
+int32_t tune_server_set_container_root(const char *root);
+
+/* Scan INCREMENTAL des dossiers de musique, en tache de fond (retour au
+ * premier plan : fichiers deposes pendant la suspension). Le surveillant de
+ * fichiers, lui, demarre seul avec le serveur. Ne pas appeler depuis un fil
+ * du runtime du serveur.
+ * Retour : 0 scan lance, 1 un scan tourne deja, -1 serveur pas pret. */
+int32_t tune_server_scan(void);
+
 /* Arret propre. Retour : 0 succes, -1 pas demarre. */
 int32_t tune_server_stop(void);
 

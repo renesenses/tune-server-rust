@@ -2561,6 +2561,19 @@ impl PlaybackOrchestrator {
         let (session_id, tx, data_ready) = self
             .ouvrir_la_session_wav(wav_info, service_name, &codec_lower, sr, bd)
             .await;
+        // #6130 — diagnostic : de quoi relire, à la prochaine connexion du
+        // renderer, ce qui a fabriqué ce flux. Ne change rien au rendu.
+        let contexte = crate::http::streamer::ContexteDeConversion {
+            zone_id: req.zone_id,
+            source: format!(
+                "service={service_name} codec={codec_lower} annonce={}/{} decodeur_sortie={sr}/{bd} canaux=2",
+                stream_data.quality.sample_rate, stream_data.quality.bit_depth
+            ),
+            chaine: dsp.decrire(),
+            precedente: self.decrire_la_piste_precedente(req.zone_id).await,
+        };
+        self.poser_le_contexte_de_conversion(&session_id, contexte)
+            .await;
         let tx = spawn_streaming_dsp_relay(dsp, bd, true, tx);
         let tache = self.capturer_pour_le_transcodage(
             req,

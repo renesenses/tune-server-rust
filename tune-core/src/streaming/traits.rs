@@ -142,6 +142,18 @@ pub struct StreamPlaylist {
     pub cover_path: Option<String>,
     pub track_count: u32,
     pub owner: Option<String>,
+    /// L'utilisateur peut-il MODIFIER cette playlist (ajouter, retirer des
+    /// titres) ? `Some(true)` : elle est à lui ; `Some(false)` : il la suit
+    /// seulement (playlist éditoriale ou d'un autre compte) ; `None` : le
+    /// service ne permet pas de le dire.
+    ///
+    /// renesenses/tune-web-client#2097 (FabienM, fil 2236, rc4) : la fenêtre
+    /// « Ajouter à une playlist » proposait les playlists Qobuz SUIVIES, et
+    /// Qobuz refusait l'ajout en 401 (« Current authenticated user is not
+    /// authorized »). `/playlist/getUserPlaylists` mélange les deux, et rien
+    /// ne permettait au client de les distinguer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editable: Option<bool>,
     /// Jusqu'à QUATRE pochettes distinctes, pour la mosaïque 2×2.
     ///
     /// Bertrand, 21/09 : « Est-il possible d'associer 4 covers distinctes à
@@ -1036,6 +1048,7 @@ mod tests {
             cover_path: None,
             track_count: 10,
             owner: Some("testuser".into()),
+            editable: None,
             covers: Vec::new(),
         };
         let json = serde_json::to_value(&playlist).unwrap();

@@ -90,8 +90,16 @@ pub fn coeurs() -> usize {
 
 /// Combien de fichiers un lot décode à la fois, MAINTENANT. Relu à chaque lot :
 /// un changement de réglage agit au lot suivant, sans redémarrage.
+///
+/// #5410 — sans température lisible (macOS, Windows sans zone thermique ou à
+/// zone figée, machine virtuelle), un fichier à la fois quelle que soit la
+/// vitesse : la garde thermique ne peut rien arrêter, la largeur se replie
+/// (`audio::thermal::brider_sans_thermometre`).
 pub fn largeur_courante(backend: &Arc<dyn DbBackend>) -> usize {
-    vitesse(backend).largeur(coeurs())
+    crate::audio::thermal::brider_sans_thermometre(
+        vitesse(backend).largeur(coeurs()),
+        &crate::audio::thermal::lecture_thermique(),
+    )
 }
 
 #[cfg(test)]

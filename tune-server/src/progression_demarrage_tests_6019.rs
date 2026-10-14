@@ -55,6 +55,11 @@ async fn scan_de_demarrage_sur(db: &Arc<dyn DbBackend>, bus: &Arc<EventBus>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn le_scan_de_demarrage_annonce_son_parcours_6019() {
+    // #6163 — le droit de scanner est global au processus : sans ce verrou,
+    // ce scan de démarrage le prenait pendant que le témoin du scan manuel
+    // (`progression_scan_manuel_tests_6019`) exigeait de l'obtenir, et l'un
+    // des deux rougissait selon l'ordre d'arrivée.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let base = tune_core::test_scratch::scratch_dir("progression-6019-base");
     let racine = tune_core::test_scratch::scratch_dir_in(
         std::env::current_dir().unwrap(),

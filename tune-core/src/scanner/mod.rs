@@ -42,6 +42,25 @@ pub fn chemin_sous_un_dossier_systeme(chemin: &str) -> bool {
     chemin.split(['/', '\\']).any(dossier_systeme_ignore)
 }
 
+/// #6148 — un fichier AppleDouble de macOS (`._piste.flac`). macOS en pose un
+/// à côté de chaque fichier copié vers un volume non HFS (NAS, clé exFAT) : il
+/// porte l'extension audio mais ne contient que des métadonnées. Ce n'est
+/// jamais une piste (« visible mais illisible », fil 2224 ; doublons fantômes
+/// d'Elie).
+///
+/// Seule règle de ces noms : le parcours du scan, le surveillant de dossiers,
+/// l'import des fichiers annexes et le dépliage des images ISO l'appellent.
+pub fn est_un_nom_appledouble(nom: &str) -> bool {
+    nom.starts_with("._")
+}
+
+/// [`est_un_nom_appledouble`] appliqué au dernier composant de `chemin`.
+pub fn est_un_fichier_appledouble(chemin: &std::path::Path) -> bool {
+    chemin
+        .file_name()
+        .is_some_and(|n| est_un_nom_appledouble(&n.to_string_lossy()))
+}
+
 /// Tune's own streaming/prefetch temp files (written to the system temp dir
 /// during transcodes) must never be indexed as library tracks, even when the
 /// configured music folder is a parent of the temp dir (e.g. the whole user

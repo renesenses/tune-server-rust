@@ -434,6 +434,22 @@ pub mod sql {
         )
     }
 
+    /// #5463 — les identifiants MusicBrainz de la sortie et de son groupe,
+    /// lus dans les balises du fichier image d'une feuille CUE. Chacun n'est
+    /// posé que si la colonne est VIDE : une valeur connue (identification,
+    /// édition, scan précédent) n'est jamais écrasée.
+    pub fn poser_identifiants_mb_si_vides<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET \
+             musicbrainz_release_id = COALESCE(NULLIF(musicbrainz_release_id, ''), {}), \
+             musicbrainz_release_group_id = COALESCE(NULLIF(musicbrainz_release_group_id, ''), {}) \
+             WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
     /// #5463 — le code-barres d'un album, que seule une feuille CUE
     /// (`CATALOG`) fournit au scan.
     pub fn force_update_barcode<D: SqlDialect>(d: &D) -> String {
@@ -2662,6 +2678,26 @@ impl AlbumRepo {
     /// feuille CUE EST la source de métadonnées de l'album qu'elle décrit,
     /// c'est tout son objet. Ailleurs, deux titres en désaccord désignent deux
     /// éditions et ne se tranchent pas ici.
+    /// Comble les identifiants MusicBrainz d'un album CUE depuis les balises de
+    /// son fichier image (#5463) — seulement là où l'album n'en a pas.
+    pub fn poser_identifiants_mb_si_vides(
+        &self,
+        album_id: i64,
+        sortie: Option<&str>,
+        groupe: Option<&str>,
+    ) -> Result<(), TuneError> {
+        if sortie.is_none() && groupe.is_none() {
+            return Ok(());
+        }
+        let sql = self.dialect_sql(
+            sql::poser_identifiants_mb_si_vides,
+            sql::poser_identifiants_mb_si_vides,
+        );
+        let params: [&dyn ToSqlValue; 3] = [&sortie, &groupe, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     /// Pose le code-barres de l'album (#5463). `Album::update` ne l'écrit pas.
     pub fn force_update_barcode(&self, album_id: i64, barcode: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::force_update_barcode, sql::force_update_barcode);

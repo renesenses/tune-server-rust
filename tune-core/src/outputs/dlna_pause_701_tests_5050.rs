@@ -41,12 +41,20 @@ pub(crate) struct Etat {
     /// Ce que `GetPositionInfo` rend dans `RelTime` ; `None` : la réponse
     /// n'en porte pas (position illisible).
     pub(crate) rel_time: Option<&'static str>,
+    /// Le renderer refuse aussi `Stop` (701) : le repli de #5050 n'a plus
+    /// prise, le refus de la Pause remonte.
+    pub(crate) stop_refuse: bool,
+    /// Un `Stop` a été acquitté : le transport est `STOPPED`.
+    pub(crate) arrete: bool,
 }
 
 impl Etat {
     pub(crate) fn courant(&self) -> &'static str {
         if self.en_pause {
             return "PAUSED_PLAYBACK";
+        }
+        if self.arrete {
+            return "STOPPED";
         }
         match self.scenario {
             Scenario::TransitionPuisLecture(d) if self.debut.elapsed() < d => "TRANSITIONING",
@@ -97,6 +105,8 @@ pub(crate) async fn renderer(scenario: Scenario) -> Renderer {
         scenario,
         en_pause: false,
         rel_time: None,
+        stop_refuse: false,
+        arrete: false,
     }));
     let (r, e) = (recues.clone(), etat.clone());
     let app = Router::new().route(
@@ -127,6 +137,13 @@ pub(crate) async fn renderer(scenario: Scenario) -> Renderer {
                         "<s:Envelope><s:Body><u:GetPositionInfoResponse><Track>1</Track><TrackDuration>0:05:00</TrackDuration>{rel}</u:GetPositionInfoResponse></s:Body></s:Envelope>"
                     );
                     (StatusCode::OK, corps)
+                } else if action.ends_with("#Stop\"") {
+                    if etat.stop_refuse {
+                        (StatusCode::INTERNAL_SERVER_ERROR, FAUTE_701.to_string())
+                    } else {
+                        etat.arrete = true;
+                        (StatusCode::OK, "<u:StopResponse/>".to_string())
+                    }
                 } else if action.ends_with("#Pause\"") {
                     if etat.courant() == "PLAYING" {
                         etat.en_pause = true;
@@ -208,11 +225,13 @@ async fn un_renderer_deja_en_pause_n_est_pas_un_echec() {
     assert_eq!(r.compte("Pause"), 1, "rien à renvoyer");
 }
 
-/// Une transition qui ne finit pas : l'attente est bornée, aucune Pause
-/// n'est martelée pendant qu'il transite, et le refus nomme l'état.
+/// Une transition qui ne finit pas, chez un renderer qui refuse AUSSI le
+/// `Stop` : l'attente est bornée, aucune Pause n'est martelée pendant qu'il
+/// transite, et le refus nomme l'état.
 #[tokio::test]
 async fn une_transition_qui_ne_finit_pas_rend_le_refus_en_nommant_l_etat() {
     let r = renderer(Scenario::Fige("TRANSITIONING")).await;
+    r.etat.lock().unwrap().stop_refuse = true;
     let debut = Instant::now();
     let erreur = r
         .output
@@ -228,6 +247,53 @@ async fn une_transition_qui_ne_finit_pas_rend_le_refus_en_nommant_l_etat() {
         "attente non bornée : {duree:?}"
     );
     assert_eq!(r.compte("Pause"), 1, "pas de Pause pendant la transition");
+    assert_eq!(r.compte("Stop"), 1, "le repli a été tenté une fois");
+    assert!(
+        !r.output.device_released_on_pause(),
+        "Stop refusé : rien n'a changé"
+    );
+}
+
+/// #5050, fil 2236 (FabienM, 12/10/2026, Beosound Stage, rc4) : la Pause est
+/// refusée en 701, le transport reste en `TRANSITIONING` au-delà du délai
+/// (`dlna_pause_701_abandon attente_ms=5240`), et l'auditeur n'avait plus
+/// aucun moyen d'arrêter la zone. Le repli : un `Stop`, acquitté, et la
+/// sortie annonce qu'une reprise sur place ne relancerait rien.
+///
+/// Contre-épreuve : retirer l'appel à `arreter_faute_de_pause` dans
+/// `pause_apres_refus_701` fait tomber ce test (le 701 remonte).
+#[tokio::test]
+async fn une_pause_figee_en_transition_se_replie_sur_stop() {
+    let r = renderer(Scenario::Fige("TRANSITIONING")).await;
+    let debut = Instant::now();
+    r.output
+        .pause()
+        .await
+        .expect("figé en TRANSITIONING : le repli sur Stop rend la zone pilotable");
+    assert!(
+        debut.elapsed() >= PAUSE_701_BUDGET,
+        "le délai est d'abord laissé"
+    );
+    assert_eq!(r.compte("Pause"), 1, "une seule Pause, refusée");
+    assert_eq!(r.compte("Stop"), 1, "un seul Stop, après le délai");
+    assert_eq!(r.etat.lock().unwrap().courant(), "STOPPED");
+    assert!(
+        r.output.device_released_on_pause(),
+        "la reprise doit rétablir la piste, pas envoyer un Play sur place"
+    );
+    // Un nouvel arrêt demandé par l'auditeur efface le constat.
+    r.output.stop().await.unwrap();
+    assert!(!r.output.device_released_on_pause());
+}
+
+/// Arrêté (le premier refus du journal, `etat="STOPPED"`) : rien n'est en
+/// transition, aucun Stop de repli n'est envoyé.
+#[tokio::test]
+async fn un_renderer_arrete_ne_recoit_pas_de_stop_de_repli() {
+    let r = renderer(Scenario::Fige("STOPPED")).await;
+    let _ = r.output.pause().await;
+    assert_eq!(r.compte("Stop"), 0);
+    assert!(!r.output.device_released_on_pause());
 }
 
 /// Arrêté : aucune attente n'y change rien, le refus remonte aussitôt.
@@ -311,6 +377,7 @@ async fn un_refus_701_journalise_la_position_et_l_etat_du_transport() {
     let _garde = journal.abonner();
     let r = renderer(Scenario::Fige("TRANSITIONING")).await;
     r.etat.lock().unwrap().rel_time = Some("0:00:56");
+    r.etat.lock().unwrap().stop_refuse = true;
 
     let evenement = ["dlna", "pause", "701", "position", "lue"].join("_");
     let premier = r.output.pause().await;

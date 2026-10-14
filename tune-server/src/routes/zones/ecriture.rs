@@ -221,6 +221,19 @@ fn valider_le_patch(
     {
         return Err(refus_de_valeur(id, "name", name, "vide"));
     }
+    // #2991 — une voie inconnue est REFUSÉE, jamais rangée en base : relue,
+    // elle vaudrait « désactivé » et ferait croire à un choix enregistré.
+    if let Some(ref mode) = body.dlna_radio_title
+        && tune_core::outputs::dlna::titre_radio_2991::ModeTitreRadioDidl::depuis_api(mode)
+            .is_none()
+    {
+        return Err(refus_de_valeur(
+            id,
+            "dlna_radio_title",
+            mode,
+            "voie inconnue (attendu : off, next, reload)",
+        ));
+    }
 
     // Ce refus précède strictement la première écriture : un PATCH qui porte
     // d'autres champs ne doit rien modifier si l'accord manque.
@@ -652,6 +665,21 @@ async fn persister_l_upnp(
         ecrire!("upnp_renderer", enabled, r);
         // Annonce (ou retrait de l'annonce) sans attendre le cycle de 10 min.
         crate::routes::upnp_media_renderer::advertiser_wakeup().notify_one();
+    }
+    // #2991 — titre radio par DIDL → setting zone_{id}_dlna_radio_title.
+    // Clé supprimée à « off ». Lu à chaque changement de morceau radio : rien
+    // à rafraîchir en vol. La valeur est déjà validée par `valider_le_patch`.
+    if let Some(ref brut) = body.dlna_radio_title {
+        use tune_core::outputs::dlna::titre_radio_2991::{ModeTitreRadioDidl, cle_de_zone};
+        let mode = ModeTitreRadioDidl::depuis_api(brut).unwrap_or(ModeTitreRadioDidl::Desactive);
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = cle_de_zone(id);
+        let r = if mode == ModeTitreRadioDidl::Desactive {
+            settings.delete(&key)
+        } else {
+            settings.set(&key, mode.as_str())
+        };
+        ecrire!("dlna_radio_title", mode.as_str(), r);
     }
     // Silence UPnP (#2263) → setting zone_{id}_upnp_silence. Même forme que
     // `upnp_renderer` : clé supprimée à la désactivation.

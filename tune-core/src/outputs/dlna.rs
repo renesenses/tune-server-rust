@@ -39,6 +39,10 @@ pub(crate) mod pause_701_tests_5050;
 #[path = "dlna_volume_scpd_tests_5793.rs"]
 mod volume_scpd_tests_5793;
 
+/// #2991 — le titre radio réémis par DIDL, pour les lecteurs qui ignorent l'ICY.
+#[path = "dlna_titre_radio_2991.rs"]
+pub mod titre_radio_2991;
+
 #[path = "dlna_volume_illisible_5662.rs"]
 pub(crate) mod volume_illisible_5662;
 
@@ -621,6 +625,13 @@ pub struct DlnaOutput {
     /// Seule valeur disponible en mode silence si le renderer n'a jamais
     /// poussé de `Volume`.
     dernier_volume_pct: AtomicU64,
+    /// #6008 — le volume que l'appareil tenait avant la dernière pose d'URI,
+    /// en pour-cent : le dernier que Tune a posé, ou à défaut le dernier lu
+    /// hors de la fenêtre qui suit une pose. `u64::MAX` = inconnu.
+    volume_connu_pct: AtomicU64,
+    /// #6008 — instant de la dernière pose d'URI acceptée. Ouvre la fenêtre
+    /// pendant laquelle un volume remonté par l'appareil est corrigé.
+    uri_posee_a: std::sync::Mutex<Option<std::time::Instant>>,
     /// #5793 — URL du SCPD de `RenderingControl`, telle que le descriptif de
     /// l'appareil l'annonce. `None` : sortie construite sans descriptif, le
     /// profil standard s'applique.
@@ -652,6 +663,13 @@ pub struct DlnaOutput {
     /// #5050 — instant de la dernière ligne `dlna_pause_701_position_lue` :
     /// borne son débit à une par `DIAG_701_INTERVALLE` et par renderer.
     dernier_diag_701: std::sync::Mutex<Option<std::time::Instant>>,
+    /// #5050 (fil 2236) — la dernière `Pause` n'a pas pris : le renderer est
+    /// resté en `TRANSITIONING` au-delà de `PAUSE_701_BUDGET`, et Tune l'a
+    /// ARRÊTÉ à la place. La reprise ne peut pas être un `Play` « sur
+    /// place » : lu par `device_released_on_pause()`, l'orchestrateur rétablit
+    /// la piste à la position de la pause. Retombe au `play_media` et au
+    /// `stop` suivants.
+    arrete_au_lieu_de_pause: AtomicBool,
     /// La position rendue par le dernier `get_status` était-elle extrapolée ?
     /// Lu par `GET /api/devices/{id}/status` pour que l'estimation ne se fasse
     /// jamais passer pour une mesure.
@@ -670,6 +688,9 @@ pub struct DlnaOutput {
     /// milieu du morceau. Le couple n'est donc utilisé que si l'URI en cours
     /// est bien celle qu'il décrit.
     duree_annoncee: tokio::sync::Mutex<Option<(String, u64)>>,
+    /// #2991 — la dernière pose d'URI acceptée (URI, MIME annoncé, niveau de
+    /// DIDL) : ce que la réémission du titre radio doit rejouer à l'identique.
+    pose_courante: std::sync::Mutex<Option<titre_radio_2991::PoseCourante>>,
 }
 
 /// Au bout de combien de temps de contradiction entre l'état poussé et la
@@ -677,6 +698,16 @@ pub struct DlnaOutput {
 /// passer un tour de sondage où la position n'a pas eu le temps de bouger,
 /// assez court pour que le sondeur ne bâtisse rien sur un état faux.
 const INCOHERENCE_AVANT_ARBITRAGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// #6008 — combien de temps après une pose d'URI un volume remonté par
+/// l'appareil est tenu pour un saut de l'appareil, et corrigé. Le saut de la
+/// Cabasse Abyss arrive au démarrage du flux (fil 2187) ; 15 s couvrent la
+/// pose, le `Play` et le pré-tampon du renderer.
+pub(crate) const FENETRE_VOLUME_APRES_URI: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// #6008 — la hausse, en fraction, qui fait APPRENDRE la règle à un appareil
+/// qui ne la porte pas encore. Dix points : un saut, pas un arrondi.
+pub(crate) const HAUSSE_QUI_APPREND: f64 = 0.10;
 
 /// Ancre d'extrapolation de la position en mode « silence UPnP ».
 #[derive(Debug, Clone)]
@@ -785,6 +816,8 @@ impl DlnaOutput {
             incoherence_depuis: tokio::sync::Mutex::new(None),
             derniere_position_ms: AtomicU64::new(u64::MAX),
             dernier_volume_pct: AtomicU64::new(u64::MAX),
+            volume_connu_pct: AtomicU64::new(u64::MAX),
+            uri_posee_a: std::sync::Mutex::new(None),
             scpd_rendering_control: std::sync::RwLock::new(None),
             profil_volume: tokio::sync::OnceCell::new(),
             scpd_av_transport: std::sync::RwLock::new(None),
@@ -793,8 +826,10 @@ impl DlnaOutput {
             volume_relu: AtomicBool::new(false),
             niveau_acquitte: Arc::default(),
             dernier_diag_701: std::sync::Mutex::new(None),
+            arrete_au_lieu_de_pause: AtomicBool::new(false),
             position_extrapolee: AtomicBool::new(false),
             duree_annoncee: tokio::sync::Mutex::new(None),
+            pose_courante: std::sync::Mutex::new(None),
             contact: std::sync::Mutex::new(super::dlna_contact::JournalDeContact::default()),
         }
     }
@@ -1316,7 +1351,110 @@ impl DlnaOutput {
     async fn memoriser_volume(&self, niveau_pct: u64, niveau_appareil: u32) {
         let niveau_pct = niveau_pct.min(100);
         self.dernier_volume_pct.store(niveau_pct, Ordering::Relaxed);
+        self.volume_connu_pct.store(niveau_pct, Ordering::Relaxed);
         self.event_state.lock().await.volume = Some(niveau_appareil);
+    }
+
+    /// #6008 — ouvre la fenêtre de surveillance du volume : une URI vient
+    /// d'être acceptée.
+    fn noter_pose_d_uri(&self) {
+        *self.uri_posee_a.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::time::Instant::now());
+    }
+
+    /// #6008 — le volume que l'appareil tenait avant la pose, en fraction.
+    fn volume_connu(&self) -> Option<f64> {
+        match self.volume_connu_pct.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            v => Some(v as f64 / 100.0),
+        }
+    }
+
+    /// #6008 — après une pose d'URI acceptée, sur un appareil qui porte la
+    /// règle « volume remonté à l'URI », repose le dernier volume connu.
+    async fn reimposer_le_volume_apres_uri(&self) {
+        if !super::dlna_repli_set_uri::volume_remonte_a_l_uri(&self.device_id) {
+            return;
+        }
+        let Some(cible) = self.volume_connu() else {
+            return;
+        };
+        match self.set_volume(cible).await {
+            Ok(()) => info!(
+                device = %self.name,
+                device_id = %self.device_id,
+                volume_pct = (cible * 100.0).round() as u64,
+                "dlna_volume_reimpose_apres_uri"
+            ),
+            Err(e) => warn!(
+                device = %self.name,
+                error = %e,
+                "dlna_volume_reimpose_apres_uri_echoue"
+            ),
+        }
+    }
+
+    /// #6008 — le volume LU sur l'appareil, corrigé s'il a remonté de
+    /// lui-même juste après une pose d'URI.
+    ///
+    /// Hors de la fenêtre [`FENETRE_VOLUME_APRES_URI`], la lecture devient le
+    /// volume connu et passe telle quelle. Dans la fenêtre, un écart avec le
+    /// volume connu ne vient pas de Tune (ses commandes mettent le volume
+    /// connu à jour) : l'appareil a bougé seul. Une HAUSSE d'au moins
+    /// [`HAUSSE_QUI_APPREND`] apprend la règle ; un appareil qui la porte voit
+    /// toute hausse de plus de 2 points corrigée sur-le-champ, et le sondeur
+    /// reçoit le volume réimposé, pas le saut.
+    async fn volume_apres_controle_d_uri(&self, lu: f64) -> f64 {
+        let dans_la_fenetre = self
+            .uri_posee_a
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|t| t.elapsed() <= FENETRE_VOLUME_APRES_URI);
+        let connu = self.volume_connu();
+        let (true, Some(connu)) = (dans_la_fenetre, connu) else {
+            self.volume_connu_pct.store(
+                (lu * 100.0).round().clamp(0.0, 100.0) as u64,
+                Ordering::Relaxed,
+            );
+            return lu;
+        };
+        // Seule une HAUSSE se corrige : une baisse dans la fenêtre est plus
+        // sûrement la main de l'auditeur (télécommande, application), et elle
+        // ne fait courir aucun risque au matériel.
+        if lu - connu <= 0.02 {
+            return lu;
+        }
+        let regle = super::dlna_repli_set_uri::volume_remonte_a_l_uri(&self.device_id);
+        let apprend = !regle && lu - connu >= HAUSSE_QUI_APPREND;
+        if !regle && !apprend {
+            return lu;
+        }
+        if apprend {
+            warn!(
+                device = %self.name,
+                device_id = %self.device_id,
+                avant_pct = (connu * 100.0).round() as u64,
+                remonte_pct = (lu * 100.0).round() as u64,
+                "dlna_volume_remonte_a_l_uri_detecte"
+            );
+            super::dlna_repli_set_uri::memoriser_volume_remonte_a_l_uri(&self.device_id);
+        }
+        match self.set_volume(connu).await {
+            Ok(()) => {
+                info!(
+                    device = %self.name,
+                    device_id = %self.device_id,
+                    lu_pct = (lu * 100.0).round() as u64,
+                    volume_pct = (connu * 100.0).round() as u64,
+                    "dlna_volume_reimpose_apres_saut"
+                );
+                connu
+            }
+            Err(e) => {
+                warn!(device = %self.name, error = %e, "dlna_volume_reimpose_apres_saut_echoue");
+                lu
+            }
+        }
     }
 
     /// #5575 — porte un acquittement de `SetVolume` au journal INFO, à débit
@@ -1555,6 +1693,17 @@ impl DlnaOutput {
                 pauses_renvoyees,
                 "dlna_pause_701_abandon"
             );
+            // #5050 (fil 2236, 12/10) — encore en TRANSITIONING, budget
+            // épuisé : le Beosound Stage de FabienM n'en sortait JAMAIS, sans
+            // un son, et refusait toutes les Pause suivantes. Rendre le refus
+            // laissait la zone ni pilotable ni arrêtable. `Stop` est permis
+            // depuis tout état du transport (UPnP AVTransport 2.4.4) : on s'y
+            // replie, et la reprise rétablira la piste à la position.
+            if conduite == ConduiteApresRefusPause::Attendre
+                && self.arreter_faute_de_pause(debut).await
+            {
+                return Ok(());
+            }
             let raison = acquitter_commande_soap("Pause", refus)
                 .err()
                 .unwrap_or_else(|| "Pause rejected".to_string());
@@ -1565,6 +1714,37 @@ impl DlnaOutput {
                 ),
                 None => raison,
             });
+        }
+    }
+
+    /// #5050 (fil 2236) — repli de `pause_apres_refus_701` : un `Stop` à la
+    /// place d'une `Pause` que le renderer n'accepte pas, figé en
+    /// `TRANSITIONING`. Vrai si le `Stop` est acquitté ; un refus ou un échec
+    /// de transport laisse remonter le refus de la `Pause`, comme avant.
+    ///
+    /// Les abonnements aux évènements restent en place (ce n'est pas un arrêt
+    /// demandé par l'auditeur, la piste reste celle de la zone).
+    async fn arreter_faute_de_pause(&self, debut: std::time::Instant) -> bool {
+        let attente_ms = debut.elapsed().as_millis() as u64;
+        match self.av_action("Stop", "<InstanceID>0</InstanceID>").await {
+            Ok(reponse) if !faute_commande_soap(&reponse) => {
+                self.arrete_au_lieu_de_pause.store(true, Ordering::SeqCst);
+                warn!(device = %self.name, attente_ms, "dlna_pause_701_repli_stop");
+                true
+            }
+            Ok(reponse) => {
+                warn!(
+                    device = %self.name,
+                    attente_ms,
+                    upnp_code = code_de_faute_upnp(&reponse).as_deref().unwrap_or("unknown"),
+                    "dlna_pause_701_repli_stop_refuse"
+                );
+                false
+            }
+            Err(error) => {
+                warn!(device = %self.name, attente_ms, %error, "dlna_pause_701_repli_stop_echec");
+                false
+            }
         }
     }
 
@@ -2240,7 +2420,16 @@ impl OutputTarget for DlnaOutput {
         crate::upnp_renderer::parse_upnp_time(&extract_tag(&reponse, "RelTime")?)
     }
 
+    /// #5050 (fil 2236) — la pause a été remplacée par un `Stop` (voir
+    /// `arreter_faute_de_pause`) : rien à reprendre « sur place ».
+    fn device_released_on_pause(&self) -> bool {
+        self.arrete_au_lieu_de_pause.load(Ordering::SeqCst)
+    }
+
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        self.arrete_au_lieu_de_pause.store(false, Ordering::SeqCst);
+        // #6059 — le départ que porte l'URL (flux natif relancé à la position).
+        super::dlna_depart_natif::noter_url_posee(&self.device_id, media.url);
         // Les abonnements de la piste précédente d'abord : sans ce retrait,
         // chaque lecture en empilerait deux de plus dans le récepteur, tous
         // renouvelés toutes les 250 s pour un flux mort.
@@ -2445,6 +2634,8 @@ impl OutputTarget for DlnaOutput {
                     duree_ms = debut_set_uri.elapsed().as_millis() as u64,
                     "dlna_set_uri_ok"
                 );
+                self.noter_pose_courante(media, &attempt_mime, niveau_didl);
+                self.noter_pose_d_uri();
                 break;
             }
 
@@ -2874,6 +3065,10 @@ impl OutputTarget for DlnaOutput {
             .await;
         self.annoncer_duree(media.url, media.duration_ms).await;
         self.subscribe_events().await;
+        // #6008 — décision de Bertrand du 12/10 : sur un appareil qui remonte
+        // son volume à chaque nouvelle URI, Tune repose le dernier volume.
+        self.noter_pose_d_uri();
+        self.reimposer_le_volume_apres_uri().await;
         Ok(())
     }
 
@@ -2897,6 +3092,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn stop(&self) -> Result<(), String> {
+        self.arrete_au_lieu_de_pause.store(false, Ordering::SeqCst);
         self.unsubscribe_events().await;
         self.av_action("Stop", "<InstanceID>0</InstanceID>").await?;
         info!(device = %self.name, "dlna_stop");
@@ -3133,6 +3329,12 @@ impl OutputTarget for DlnaOutput {
                     v => v as f64 / 100.0,
                 },
             };
+            // #6008 — même en silence : un saut de volume se corrige. Aucune
+            // action ne part tant que l'appareil ne remonte pas son volume.
+            let volume = match evt_volume {
+                Some(_) => self.volume_apres_controle_d_uri(volume).await,
+                None => volume,
+            };
             return Ok(OutputStatus {
                 state: etat,
                 position_ms,
@@ -3214,6 +3416,7 @@ impl OutputTarget for DlnaOutput {
                 // dispense pas d'avoir un volume juste.
                 None => self.lire_volume().await?,
             };
+            let volume = self.volume_apres_controle_d_uri(volume).await;
 
             return Ok(OutputStatus {
                 state: etat,
@@ -3239,6 +3442,7 @@ impl OutputTarget for DlnaOutput {
         // un quart du trafic SOAP envoyé au renderer, pour une valeur que
         // personne ne lisait (#2263). L'état coupé se lit maintenant en local.
         let volume = self.lire_volume().await?;
+        let volume = self.volume_apres_controle_d_uri(volume).await;
         let state = etat_du_transport(&transport_resp);
 
         let position_ms = extract_tag(&position_resp, "RelTime")

@@ -268,6 +268,16 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_4889 -- --nocapture
 
+      # #6179 — une ligne de playlist survit à sa piste : migration 089 (clé
+      # étrangère en SET NULL, CHECK à trois formes), déclencheur qui fige
+      # l'identité avant la suppression, réconciliation qui la rattache, sur
+      # les deux naissances (native et bascule tout-TEXT). Schémas de côté,
+      # supprimés à la fin.
+      - name: Lignes de playlist introuvables sur PostgreSQL (#6179)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_6179 -- --nocapture
+
       # #5003 — les gardes de migration lisent le schéma COURANT : un schéma
       # voisin portant les mêmes tables (tout-TEXT, ou déjà BIGINT) ne doit
       # rien changer au schéma que Tune reçoit. Le test monte SES bases
@@ -739,6 +749,57 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_etiquette_collection_5026 -- --nocapture --test-threads=1
+
+      # #6121 — la règle « Artiste de l'album » : COALESCE sur la balise
+      # ALBUMARTIST dans les collections, sous-requête corrélée sur
+      # `al.artist_id` dans les playlists. Les deux aperçus par le vrai
+      # routeur ; sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Règle Artiste de l'album sur PostgreSQL (#6121)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_artiste_de_l_album_6121 -- --nocapture --test-threads=1
+
+      # #6271 — collections : « finit par » et les motifs sur un nombre
+      # (`CAST(… AS TEXT)` au lieu de `LOWER(entier)`, refusé par PostgreSQL).
+      - name: Motifs des collections sur un nombre sur PostgreSQL (#6271)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_motifs_collections_6271 -- --nocapture --test-threads=1
+
+      # #6250 — « ne contient pas » : `NOT EXISTS` sur les pistes de l'album
+      # dans les collections, négation tolérante au NULL dans les playlists.
+      # Sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Règle « ne contient pas » sur PostgreSQL (#6250)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_ne_contient_pas_6250 -- --nocapture --test-threads=1
+
+      # #6122 — « dans les N derniers jours » : des littéraux calculés à chaque
+      # requête (secondes pour `file_mtime`, ISO pour `listened_at`) au lieu de
+      # `DATETIME('now', …)`, propre à SQLite. Sans cette étape, l'épreuve
+      # prendrait son « saut annoncé ».
+      - name: Règle « dans les N derniers jours » sur PostgreSQL (#6122)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_date_relative_6122 -- --nocapture --test-threads=1
+
+      # #6143 — « après », « avant », « entre » et `now-90d` des collections et
+      # des playlists : bornes calculées en Rust (secondes pour `file_mtime`,
+      # ISO pour `listened_at`) au lieu de `DATETIME()`, propre à SQLite. Sans
+      # cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Règles de date des collections et playlists sur PostgreSQL (#6143)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_regles_de_date_6143 -- --nocapture --test-threads=1
+
+      # #6124 — la date de sortie originale et la version : sous-requête
+      # corrélée sur `track_metadata`, `albums.original_year` INTEGER, et la
+      # concordance des pistes d'un album (COUNT BIGINT). Sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Date originale et version sur PostgreSQL (#6124)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_balises_6124 -- --nocapture --test-threads=1
 
       # #5192 — la recherche et le texte libre d'Oxygen trouvent une piste par
       # le nom de son dernier dossier et celui de son fichier. Sur la VRAIE

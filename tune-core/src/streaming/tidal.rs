@@ -1334,6 +1334,7 @@ impl TidalService {
                 }),
             track_count: item["numberOfTracks"].as_u64().unwrap_or(0) as u32,
             owner: item["creator"]["name"].as_str().map(Into::into),
+            editable: None,
             covers: Vec::new(),
         }
     }

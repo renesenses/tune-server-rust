@@ -132,6 +132,38 @@ impl PositionPoller {
                              lecteur réseau ne l'apprendra pas"
                         );
                     }
+                    // #2991 — second canal, opt-in par zone : réémettre le
+                    // DIDL vers un renderer DLNA qui ignore l'ICY. Zone non
+                    // réglée : une lecture de réglage, rien d'autre. La SOAP
+                    // part dans une tâche à part pour ne pas tenir le tour
+                    // du sondeur pendant l'aller-retour réseau.
+                    if crate::outputs::dlna::titre_radio_2991::mode_de_zone(&self.db, zone_id)
+                        != crate::outputs::dlna::titre_radio_2991::ModeTitreRadioDidl::Desactive
+                    {
+                        let titre = crate::outputs::dlna::titre_radio_2991::TitreRadio {
+                            titre: new_np.title.clone(),
+                            artiste: new_np.artist_name.clone(),
+                            album: Some(station_name.clone()),
+                            pochette: self
+                                .orchestrator
+                                .resolve_cover_url(new_np.cover_path.as_deref()),
+                        };
+                        let db = self.db.clone();
+                        let outputs = self.outputs.clone();
+                        let device_id = self.get_zone_device_id(zone_id);
+                        let stream_id = np.stream_id.clone();
+                        tokio::spawn(async move {
+                            super::titre_radio_didl_2991::relayer_titre_radio_par_didl(
+                                &db,
+                                &outputs,
+                                zone_id,
+                                device_id.as_deref(),
+                                stream_id.as_deref(),
+                                &titre,
+                            )
+                            .await;
+                        });
+                    }
                     self.playback.update_now_playing(zone_id, new_np).await;
                     debug!(zone_id, station = %station_name, "radio_metadata_updated");
                 }

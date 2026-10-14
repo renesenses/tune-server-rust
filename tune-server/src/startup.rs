@@ -453,6 +453,15 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
 
     reset_zones_offline(state);
     marquer_enrichissements_interrompus(state);
+    // #6255 — le détecteur de bruit des lecteurs réseau, éteint seulement
+    // par un « non » explicite.
+    tune_core::http::bruit_reseau::regler(tune_core::http::bruit_reseau::resoudre(
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .get(tune_core::http::bruit_reseau::CLE_REGLAGE)
+            .ok()
+            .flatten()
+            .as_deref(),
+    ));
     ouvrir_le_registre_des_executions(state);
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
@@ -519,6 +528,8 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
         // Re-probe auto-discovered renderers whose lazy SSDP responder won't
         // resurface them after a restart (Cyrus Stream X2, #1126).
         crate::discovery_setup::reregister_known_renderers(&state_clone).await;
+        // #4626 — les sorties prêtées par les agents Tune appairés.
+        crate::agent_tune::maitre::reinscrire_les_agents(&state_clone).await;
     });
 
     // Re-probe auto-discovered DLNA renderers from their persisted LOCATION,
@@ -941,6 +952,13 @@ fn recalculer_les_compilations(state: &AppState) {
 /// JAMAIS un favori introuvable — un volume pas encore monté ou un scan à
 /// venir peut encore le ramener ; seule la passe post-scan complet supprime.
 fn reconcile_favorites(state: &AppState) {
+    // #6179 — les lignes de playlist introuvables : rattachées à leur piste
+    // si elle est là, conservées sinon. Jamais supprimées.
+    tune_core::db::playlists_reconcile::reconcilier_et_journaliser(
+        state.backend.clone(),
+        true,
+        "demarrage",
+    );
     let reconciler = tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(
         state.backend.clone(),
     );
@@ -1774,7 +1792,7 @@ pub(crate) struct SortieCandidate<'a> {
 /// Sur CoreAudio et WASAPI, la sortie système est un vrai périphérique : la
 /// question ne s'y pose pas, et la règle ne s'y applique pas.
 #[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
-fn defaut_alsa_logiciel(endpoint_id: &str) -> bool {
+pub(crate) fn defaut_alsa_logiciel(endpoint_id: &str) -> bool {
     use tune_core::outputs::pseudo_peripherique_alsa::{greffon_alsa, pcm_alsa};
     let Some((hote, _)) = endpoint_id.split_once(':') else {
         return false;
@@ -2082,6 +2100,27 @@ pub(crate) async fn enregistrer_les_sorties_locales(
     // règle propre — `local_zone_action` autorise la sortie système par
     // défaut, c'est le sens de #1770 — mais il ne relit plus le réglage
     // lui-même.
+    // #5870 — sur Tune OS, une installation existante dont la zone
+    // automatique est restée sur le greffon `default` (dmix, 48 kHz) passe,
+    // une seule fois, sur le `hw:` de l'unique DAC USB. Avant le calcul de
+    // la zone automatique : `default` n'ayant alors plus de zone, celle-ci
+    // vise le DAC, qui a désormais la sienne — aucune zone neuve.
+    {
+        let sorties_5870: Vec<crate::bascule_tune_os_5870::Sortie<'_>> = devices
+            .iter()
+            .map(|dev| crate::bascule_tune_os_5870::Sortie {
+                nom: dev.name.as_str(),
+                endpoint_id: dev.endpoint_id.as_str(),
+                est_le_defaut: dev.is_default,
+            })
+            .collect();
+        crate::bascule_tune_os_5870::appliquer(
+            &zone_repo,
+            &tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone()),
+            crate::routes::appliance::is_appliance(),
+            &sorties_5870,
+        );
+    }
     let auto_create = zone_repo.zone_auto_create_autorise();
     // Un backend est censé marquer une seule sortie par défaut. `find`
     // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.

@@ -51,6 +51,8 @@ pub enum ColonneDeTri {
     Annee,
     Canaux,
     Bpm,
+    /// La note de la piste lue dans ses balises (#6123).
+    Note,
     Genre,
     Album,
     ArtisteAlbum,
@@ -71,7 +73,7 @@ pub enum ColonneDeTri {
 }
 
 /// Les clés acceptées, dans l'ordre du catalogue du client.
-pub const COLONNES_TRIABLES: [(&str, ColonneDeTri); 24] = [
+pub const COLONNES_TRIABLES: [(&str, ColonneDeTri); 25] = [
     ("title", ColonneDeTri::Titre),
     ("artist", ColonneDeTri::Artiste),
     ("composer", ColonneDeTri::Compositeur),
@@ -79,6 +81,7 @@ pub const COLONNES_TRIABLES: [(&str, ColonneDeTri); 24] = [
     ("year", ColonneDeTri::Annee),
     ("channels", ColonneDeTri::Canaux),
     ("bpm", ColonneDeTri::Bpm),
+    ("rating", ColonneDeTri::Note),
     ("genre", ColonneDeTri::Genre),
     ("album", ColonneDeTri::Album),
     ("albumArtist", ColonneDeTri::ArtisteAlbum),
@@ -160,6 +163,8 @@ impl ColonneDeTri {
             Self::Profondeur => ("t.bit_depth".into(), Vide::NulOuZero),
             Self::Canaux => ("t.channels".into(), Vide::Nul),
             Self::Bpm => ("t.bpm".into(), Vide::Nul),
+            // 0 étoile est une note : seul NULL va en fin de liste.
+            Self::Note => ("t.rating".into(), Vide::Nul),
             Self::Disque => ("CAST(t.disc_number AS INTEGER)".into(), Vide::Nul),
             Self::Taille => ("t.file_size".into(), Vide::Nul),
             Self::Modifie => ("t.file_mtime".into(), Vide::Nul),

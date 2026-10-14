@@ -544,6 +544,32 @@ fn build_cast_media(media: &super::traits::PlayMedia<'_>) -> rust_cast::channels
     }
 }
 
+/// #6062 — ce qu'une reprise trouve chez le récepteur.
+///
+/// FabienM, zone « Enfants » (Chromecast), rc3, fil 2199 : une piste mise en
+/// pause à 15:34, sept reprises entre 15:51 et 15:52, aucun son et AUCUNE
+/// ligne au journal. `resume()` ne jouait que si le récepteur montrait encore
+/// notre application ET une entrée média ; sinon il rendait `Ok(())` sans
+/// rien envoyer. Un récepteur Cast referme l'application ou oublie le média
+/// après un long repos : la reprise « réussissait » alors dans le vide.
+///
+/// `entree` : l'identifiant de session média et l'état de la première entrée
+/// du statut, s'il y en a une. Rend la session à relancer, ou la raison pour
+/// laquelle il n'y a plus rien à reprendre.
+fn reprise_possible(
+    entree: Option<(i32, &rust_cast::channels::media::PlayerState)>,
+) -> Result<i32, &'static str> {
+    use rust_cast::channels::media::PlayerState;
+    match entree {
+        None => Err("media_oublie"),
+        Some((_, PlayerState::Idle)) => Err("media_au_repos"),
+        Some((session, _)) => Ok(session),
+    }
+}
+
+/// Raison d'une reprise impossible quand notre application ne tourne plus.
+const REPRISE_APPLICATION_FERMEE: &str = "application_fermee";
+
 pub struct ChromecastOutput {
     name: String,
     device_id: String,
@@ -589,6 +615,12 @@ struct ChargementCast {
     session_signalee: Option<i32>,
     /// Le constat en attente, drainé par `take_output_failure()`.
     echec: Option<String>,
+    /// #6062 — le récepteur n'a plus de session média de NOTRE lecture à
+    /// reprendre (application refermée, média oublié ou retombé au repos),
+    /// avec la raison. Reflet du dernier statut lu : un statut qui montre de
+    /// nouveau notre média en lecture ou en pause l'efface, et un nouveau
+    /// LOAD aussi. Lu par `device_released_on_pause()`.
+    session_perdue: Option<&'static str>,
 }
 
 impl ChargementCast {
@@ -598,6 +630,14 @@ impl ChargementCast {
             url: Some(url.to_string()),
             ..Self::default()
         };
+    }
+
+    /// #6062 — le statut dit que notre session média n'existe plus. Sans
+    /// LOAD de Tune, il n'y avait rien à perdre.
+    fn perdre_la_session(&mut self, raison: &'static str) {
+        if self.url.is_some() {
+            self.session_perdue = Some(raison);
+        }
     }
 
     /// Lit une entrée du statut média. Rend `true` quand elle porte une
@@ -876,6 +916,8 @@ impl OutputTarget for ChromecastOutput {
         let port = self.port;
         let timeout = self.command_timeout;
         let slots = Arc::clone(&self.command_slots);
+        let chargement = Arc::clone(&self.chargement);
+        let name = self.name.clone();
         run_cast_command(host, port, timeout, slots, move |device| {
             device
                 .connection
@@ -888,23 +930,50 @@ impl OutputTarget for ChromecastOutput {
                 .map_err(|e| format!("status: {e}"))?;
             // #2566 — la commande partait sur la PREMIÈRE application du
             // récepteur. Voir `notre_transport`.
-            if let Some(transport_id) = notre_transport(&status.applications) {
-                device
-                    .connection
-                    .connect(&transport_id)
-                    .map_err(|e| format!("connect transport: {e}"))?;
-                let media_status = device
-                    .media
-                    .get_status(&transport_id, None)
-                    .map_err(|e| format!("media status: {e}"))?;
-                if let Some(entry) = media_status.entries.first() {
+            let session = match notre_transport(&status.applications) {
+                Some(transport_id) => {
+                    device
+                        .connection
+                        .connect(&transport_id)
+                        .map_err(|e| format!("connect transport: {e}"))?;
+                    let media_status = device
+                        .media
+                        .get_status(&transport_id, None)
+                        .map_err(|e| format!("media status: {e}"))?;
+                    reprise_possible(
+                        media_status
+                            .entries
+                            .first()
+                            .map(|e| (e.media_session_id, &e.player_state)),
+                    )
+                    .map(|media_session_id| (transport_id, media_session_id))
+                }
+                None => Err(REPRISE_APPLICATION_FERMEE),
+            };
+            match session {
+                Ok((transport_id, media_session_id)) => {
                     device
                         .media
-                        .play(&transport_id, entry.media_session_id)
+                        .play(&transport_id, media_session_id)
                         .map_err(|e| format!("play: {e}"))?;
+                    Ok::<(), String>(())
+                }
+                // #6062 — plus rien à reprendre : le DIRE, au lieu d'un
+                // `Ok(())` qui laissait la zone « en lecture » sans un son.
+                // Le constat posé ici fait répondre `true` à
+                // `device_released_on_pause()` : l'orchestrateur rétablit la
+                // lecture à la position conservée.
+                Err(raison) => {
+                    chargement
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .perdre_la_session(raison);
+                    tracing::warn!(device = %name, raison, "chromecast_reprise_sans_session");
+                    Err(format!(
+                        "chromecast resume: le récepteur n'a plus de session média à reprendre ({raison})"
+                    ))
                 }
             }
-            Ok::<(), String>(())
         })
         .await
     }
@@ -1106,6 +1175,12 @@ impl OutputTarget for ChromecastOutput {
             // RÉCEPTEUR : ils ne dépendent d'aucune application, et ce chemin
             // continue donc de les rendre comme avant.
             let Some(transport_id) = notre_transport(&recv_status.applications) else {
+                // #6062 — notre application ne tourne plus : une reprise
+                // n'aurait rien à relancer.
+                chargement
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .perdre_la_session(REPRISE_APPLICATION_FERMEE);
                 return Ok(OutputStatus {
                     ended_naturally: false,
                     volume,
@@ -1124,6 +1199,22 @@ impl OutputTarget for ChromecastOutput {
                 .get_status(&transport_id, None)
                 .map_err(|e| format!("media status: {e}"))?;
 
+            // #6062 — le même constat que `resume()` ferait, tenu à jour à
+            // chaque sondage : la reprise d'après saura qu'il faut rétablir.
+            {
+                let mut ch = chargement
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match reprise_possible(
+                    media_status
+                        .entries
+                        .first()
+                        .map(|e| (e.media_session_id, &e.player_state)),
+                ) {
+                    Ok(_) => ch.session_perdue = None,
+                    Err(raison) => ch.perdre_la_session(raison),
+                }
+            }
             let Some(entry) = media_status.entries.first() else {
                 return Ok(OutputStatus {
                     ended_naturally: false,
@@ -1208,6 +1299,14 @@ impl OutputTarget for ChromecastOutput {
     /// [`ChargementCast`]), rendue une seule fois.
     fn take_output_failure(&self) -> Option<String> {
         self.chargement().echec.take()
+    }
+
+    /// #6062 — le récepteur a laissé tomber notre session média pendant la
+    /// pause (constat du dernier sondage ou de la dernière reprise) : une
+    /// reprise « sur place » ne relancerait rien, l'orchestrateur rétablit
+    /// la lecture à la position conservée.
+    fn device_released_on_pause(&self) -> bool {
+        self.chargement().session_perdue.is_some()
     }
 
     async fn is_available(&self) -> bool {
@@ -2837,5 +2936,65 @@ mod erreur_cast_2121_tests {
             "Parents"
         ));
         assert!(out.take_output_failure().is_none());
+    }
+}
+
+/// #6062 — FabienM, fil 2199 : la reprise d'un Chromecast resté en pause
+/// 17 min « réussissait » sans rien envoyer. Ces témoins portent sur la
+/// DÉCISION (relancer la session ou dire qu'elle est perdue) et sur le
+/// constat que lit l'orchestrateur ; le rétablissement lui-même est éprouvé
+/// par `orchestrator::reprise_session_perdue_par_la_sortie_6062`.
+///
+/// Contre-épreuve : faire rendre `Ok(0)` à `reprise_possible` pour `None`
+/// (l'ancien `if let Some(entry)` qui se taisait) fait tomber
+/// `un_recepteur_sans_media_n_a_rien_a_reprendre`.
+#[cfg(test)]
+mod reprise_session_perdue_6062_tests {
+    use super::*;
+    use rust_cast::channels::media::PlayerState;
+
+    #[test]
+    fn un_recepteur_sans_media_n_a_rien_a_reprendre() {
+        assert_eq!(reprise_possible(None), Err("media_oublie"));
+        assert_eq!(
+            reprise_possible(Some((7, &PlayerState::Idle))),
+            Err("media_au_repos")
+        );
+    }
+
+    #[test]
+    fn un_media_en_pause_ou_en_lecture_se_reprend() {
+        assert_eq!(reprise_possible(Some((7, &PlayerState::Paused))), Ok(7));
+        assert_eq!(reprise_possible(Some((8, &PlayerState::Playing))), Ok(8));
+        assert_eq!(reprise_possible(Some((9, &PlayerState::Buffering))), Ok(9));
+    }
+
+    /// Le constat que lit `device_released_on_pause()` : posé seulement
+    /// après un LOAD de Tune, effacé par le LOAD suivant.
+    #[test]
+    fn le_constat_de_session_perdue_suit_les_chargements() {
+        let output = ChromecastOutput::new("c".into(), "c".into(), "127.0.0.1".into(), 8009);
+        output
+            .chargement()
+            .perdre_la_session(REPRISE_APPLICATION_FERMEE);
+        assert!(
+            !output.device_released_on_pause(),
+            "sans LOAD de Tune, il n'y avait rien à perdre"
+        );
+
+        output.chargement().charger("http://tune/stream/a.flac");
+        output
+            .chargement()
+            .perdre_la_session(REPRISE_APPLICATION_FERMEE);
+        assert!(
+            output.device_released_on_pause(),
+            "application refermée pendant la pause : rétablir à la position"
+        );
+
+        output.chargement().charger("http://tune/stream/b.flac");
+        assert!(
+            !output.device_released_on_pause(),
+            "un nouveau LOAD rend une session neuve"
+        );
     }
 }

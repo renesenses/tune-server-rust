@@ -662,6 +662,13 @@ impl PositionPoller {
                     RADIO_POLL_INTERVAL_SECS,
                 )
             {
+                // #6233 — une sortie locale n'a pas de SOAP à ménager : son
+                // contrat de signal (PURE, bit-perfect) est relu à chaque
+                // tour, le reste du sondage radio garde son rythme.
+                if contrat_radio_locale_6233::contrat_relu_entre_deux_sondages_radio(&device_id) {
+                    self.relire_le_contrat_local_entre_deux_sondages_radio(zone_id, &device_id, ps)
+                        .await;
+                }
                 continue;
             }
 
@@ -1342,6 +1349,22 @@ impl PositionPoller {
                             "radio_transient_stopped_tolerating"
                         );
                     }
+                }
+                continue;
+            }
+
+            // #6059 — un `Seek` acquitté mais IGNORÉ (Yamaha R-N2000A, fichier
+            // natif) : l'appareil est profilé, et le flux natif est relancé à
+            // la position que l'utilisateur voulait.
+            if let Some(position) =
+                crate::orchestrator::seek_natif_6059::constater(zone_id, &status)
+            {
+                if let Err(e) = self
+                    .orchestrator
+                    .replay_zone_at_position(zone_id, position, "seek_ignore_6059")
+                    .await
+                {
+                    warn!(zone_id, error = %e, "seek_natif_rattrapage_echoue");
                 }
                 continue;
             }

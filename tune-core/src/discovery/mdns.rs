@@ -332,6 +332,21 @@ impl MdnsScanner {
         state.devices.values().cloned().collect()
     }
 
+    /// Ajoute un appareil comme si mDNS l'avait résolu, ou le retire
+    /// (`None`) : annonce manuelle d'une adresse connue sur un réseau sans
+    /// multicast, et faux annonceur des bancs (#3326). Aucun paquet n'est émis.
+    pub async fn annoncer(&self, id: &str, appareil: Option<DiscoveredDevice>) {
+        let mut state = self.state.lock().await;
+        match appareil {
+            Some(d) => {
+                state.devices.insert(id.to_owned(), d);
+            }
+            None => {
+                state.devices.remove(id);
+            }
+        }
+    }
+
     pub async fn device_count(&self) -> usize {
         let state = self.state.lock().await;
         state.devices.len()

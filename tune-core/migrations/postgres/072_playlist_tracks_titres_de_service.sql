@@ -69,11 +69,18 @@ BEGIN
          WHERE conname = 'playlist_tracks_piste_ou_titre_de_service'
            AND conrelid = 'playlist_tracks'::regclass
     ) THEN
+        -- #6179 : `NOT VALID`. Une bascule depuis une base SQLite de la rc5
+        -- (migration 125) peut copier des lignes INTROUVABLES (ni piste ni
+        -- service), que ce CHECK a deux formes refuserait : la bascule
+        -- echouerait ici, avant que la 089 ne le remplace par celui a trois
+        -- formes, VALIDE lui. `NOT VALID` ne touche pas aux lignes copiees et
+        -- garde chaque ecriture nouvelle ; aucune n'a lieu entre 072 et 089.
+        -- Sans effet sur les bases ou la contrainte existe deja.
         ALTER TABLE playlist_tracks
             ADD CONSTRAINT playlist_tracks_piste_ou_titre_de_service CHECK (
                 (track_id IS NOT NULL AND source IS NULL AND source_id IS NULL)
                 OR (track_id IS NULL AND source IS NOT NULL AND source_id IS NOT NULL)
-            );
+            ) NOT VALID;
     END IF;
 END $$;
 

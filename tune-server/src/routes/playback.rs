@@ -389,11 +389,13 @@ pub(crate) fn entrees_de_file(
     use tune_core::db::playlist_repo::EntryContent;
     entries
         .iter()
-        .map(|e| match &e.content {
-            EntryContent::Local(track_id) => QueueInput::Local {
+        .filter_map(|e| match &e.content {
+            EntryContent::Local(track_id) => Some(QueueInput::Local {
                 track_id: *track_id,
-            },
-            EntryContent::Service(s) => QueueInput::Streaming {
+            }),
+            // #6179 — une piste introuvable n'a rien à jouer.
+            EntryContent::Missing(_) => None,
+            EntryContent::Service(s) => Some(QueueInput::Streaming {
                 source: s.source.clone(),
                 source_id: s.source_id.clone(),
                 title: s.title.clone(),
@@ -412,9 +414,35 @@ pub(crate) fn entrees_de_file(
                     crate::routes::zones::identifiant_de_service_sur(s.album_source_id.as_deref())
                 },
                 artist_ref: None,
-            },
+            }),
         })
         .collect()
+}
+
+/// #6179 — retire les lignes introuvables d'une playlist avant lecture, et
+/// ramène `start_index` (rang dans la liste MONTRÉE, introuvables compris) au
+/// rang de la même ligne parmi les lignes gardées. Un départ sur une ligne
+/// introuvable part de la suivante jouable.
+pub(crate) fn sans_les_introuvables(
+    entries: Vec<tune_core::db::playlist_repo::PlaylistEntry>,
+    start_index: Option<i64>,
+) -> (
+    Vec<tune_core::db::playlist_repo::PlaylistEntry>,
+    Option<i64>,
+) {
+    let depart = start_index.map(|i| {
+        let i = usize::try_from(i).unwrap_or(0);
+        entries
+            .iter()
+            .take(i)
+            .filter(|e| e.missing().is_none())
+            .count() as i64
+    });
+    let jouables = entries
+        .into_iter()
+        .filter(|e| e.missing().is_none())
+        .collect();
+    (jouables, depart)
 }
 
 /// `POST /zones/{id}/play` avec `playlist_id` d'une playlist MIXTE (#4889).
@@ -2887,7 +2915,15 @@ async fn play(
             // garde le chemin ci-dessous, inchangé. L'ordre est celui de
             // `GET /playlists/{id}/tracks` (`get_entries`) : `start_index`
             // désigne la ligne que le client a montrée.
-            Ok(_) => match repo.get_entries(playlist_id) {
+            Ok(_) => match repo.get_entries(playlist_id).map(|e| {
+                // #6179 — le client compte les lignes INTROUVABLES dans ses
+                // rangs (`GET /playlists/{id}/tracks` les montre) ; la file,
+                // elle, ne les reçoit pas. `start_index` est ramené au rang de
+                // la même ligne parmi les lignes jouables.
+                let (jouables, depart) = sans_les_introuvables(e, body.start_index);
+                body.start_index = depart;
+                jouables
+            }) {
                 Ok(entries) if entries.iter().any(|e| e.service().is_some()) => {
                     return jouer_playlist_mixte(
                         &state,
@@ -5889,7 +5925,7 @@ async fn do_transfer(
     if target_device.is_none() {
         // Zone sans appareil côté serveur (navigateur) : c'est l'état qui porte
         // la lecture, le client la reprend de là.
-        state.playback.play(target_zone, np).await;
+        state.playback.play(target_zone, np.clone()).await;
     }
     // 🔴 L'état de la cible n'est PAS posé avant l'orchestrateur quand un
     // appareil l'attend. `playback.play` la marquait « en lecture » sur le même
@@ -5897,65 +5933,24 @@ async fn do_transfer(
     // `RETAP_DEDUP_WINDOW` et rendait la main sans rien envoyer
     // (`orchestrator_play_retap_deduped_same_inflight_track`). Mesuré sur la .18
     // le 17/09/2026 : Eversolo → Décodeur TV, rien sur la cible, source arrêtée.
-    if let Some(ref did) = target_device {
-        match state
+    // #5050 (fil 2236) — lancement, repositionnement et pause sur l'appareil
+    // cible : `PlaybackOrchestrator::transferer_sur_l_appareil`. Une source en
+    // pause n'est plus lancée sur la cible : celle-ci est posée en pause à la
+    // même position, sans rien envoyer à l'appareil.
+    if let Some(ref did) = target_device
+        && let Err(error) = state
             .orchestrator
-            .play_from_queue(target_zone, current.queue_position)
+            .transferer_sur_l_appareil(
+                target_zone,
+                did,
+                current.queue_position,
+                &np,
+                source_position_ms,
+                source_paused,
+            )
             .await
-        {
-            Ok(_) => {
-                // Reprendre à la position de la source. Sous 3 s on repart du
-                // début (même seuil que la route seek) — inutile de chercher
-                // dans un flux qui vient de démarrer.
-                // #4442 — pas un `seek` nu dans la foulée du `Play` : voir
-                // `reprendre_la_position_transferee`.
-                if source_position_ms > 3000
-                    && let Err(error) = state
-                        .orchestrator
-                        .reprendre_la_position_transferee(
-                            target_zone,
-                            did,
-                            source_position_ms,
-                            !source_paused,
-                        )
-                        .await
-                {
-                    // Un `Seek` REFUSÉ par l'appareil (701/710/711) ne doit
-                    // pas couper le transfert en son milieu : la cible joue
-                    // déjà, depuis le début de la piste. Arrêter là laissait
-                    // la source jouer aussi, et la file de la cible non
-                    // enregistrée. Tout autre échec garde l'ancienne conduite.
-                    if tune_core::orchestrator::PlaybackOrchestrator::message_deplacement_refuse(
-                        &error,
-                    )
-                    .is_none()
-                    {
-                        return output_command_error_response(error);
-                    }
-                    tracing::warn!(
-                        target_zone,
-                        position_ms = source_position_ms,
-                        error = %error,
-                        "transfert_seek_refuse_cible_joue_depuis_le_debut"
-                    );
-                }
-                // Une source en pause reste en pause sur la cible : transférer
-                // ne veut pas dire relancer.
-                if source_paused {
-                    info!(
-                        zone_id = target_zone,
-                        origine = "transfert",
-                        "pause_requested"
-                    );
-                    if let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await {
-                        return output_command_error_response(error);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(target_zone, error = %e, "transfer_play_on_target_failed");
-            }
-        }
+    {
+        return output_command_error_response(error);
     }
 
     if stop_source {
@@ -9639,5 +9634,41 @@ mod precedent_zone_navigateur_tests {
             "la position relevée (0) fait foi : {v}"
         );
         assert_eq!(v["queue_position"], 0, "{v}");
+    }
+}
+
+#[cfg(test)]
+mod lecture_d_une_playlist_a_lignes_introuvables_6179 {
+    use super::sans_les_introuvables;
+    use tune_core::db::playlist_repo::{EntryContent, MissingEntry, PlaylistEntry};
+
+    fn ligne(id: i64, content: EntryContent) -> PlaylistEntry {
+        PlaylistEntry {
+            id,
+            position: id,
+            content,
+        }
+    }
+
+    /// #6179 — le client compte la ligne introuvable dans ses rangs, la file
+    /// ne la reçoit pas : `start_index` désigne toujours la même ligne.
+    #[test]
+    fn le_rang_de_depart_suit_la_meme_ligne() {
+        let lignes = vec![
+            ligne(0, EntryContent::Local(10)),
+            ligne(1, EntryContent::Missing(MissingEntry::default())),
+            ligne(2, EntryContent::Local(12)),
+            ligne(3, EntryContent::Local(13)),
+        ];
+        let (jouables, depart) = sans_les_introuvables(lignes.clone(), Some(2));
+        assert_eq!(
+            jouables.iter().map(|e| e.track_id()).collect::<Vec<_>>(),
+            vec![Some(10), Some(12), Some(13)]
+        );
+        assert_eq!(depart, Some(1), "la ligne 2 montrée est la 1 de la file");
+        // Départ SUR la ligne introuvable : la suivante jouable.
+        assert_eq!(sans_les_introuvables(lignes.clone(), Some(1)).1, Some(1));
+        assert_eq!(sans_les_introuvables(lignes.clone(), Some(0)).1, Some(0));
+        assert_eq!(sans_les_introuvables(lignes, None).1, None);
     }
 }

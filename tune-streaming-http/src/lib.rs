@@ -2341,6 +2341,7 @@ mod tests_cache_utilisateur {
                 cover_path: None,
                 track_count: 0,
                 owner: None,
+                editable: None,
                 covers: Vec::new(),
             }])
         }

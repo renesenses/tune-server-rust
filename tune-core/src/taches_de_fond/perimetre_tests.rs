@@ -418,3 +418,166 @@ fn la_selection_clap_respecte_les_racines_exclues() {
     regler(&backend, CLE_RACINES_EXCLUES, serde_json::json!(["/nas"]));
     assert_eq!(rendus(&backend), vec![1, 2]);
 }
+
+// ── #6198 — les genres du CLAP ──────────────────────────────────────────
+
+fn piste_de_genre(db: &SqliteDb, id: i64, chemin: &str, genre: Option<&str>, genres: Option<&str>) {
+    db.execute(
+        "INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms, \
+         sample_rate, channels, genre, genres) VALUES (?, 'T', 1, 1, ?, 1000, 44100, 2, ?, ?)",
+        &[&id, &chemin, &genre, &genres],
+    )
+    .unwrap();
+}
+
+fn candidats_clap(backend: &Arc<dyn DbBackend>) -> Vec<i64> {
+    let mut v: Vec<i64> = embedding_store::candidats_acoustiques(backend, "00000000000", 25)
+        .unwrap()
+        .into_iter()
+        .filter_map(|c| match c {
+            embedding_store::CandidatAcoustique::Pret { track_id, .. } => Some(track_id),
+            _ => None,
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Le genre se cherche dans la colonne `t.genre` OU dans le tableau
+/// `t.genres`, sans la casse. Retenir : une piste sans genre n'est pas
+/// retenue. Écarter : une piste sans genre reste.
+#[test]
+fn le_genre_du_clap_se_cherche_dans_la_colonne_et_dans_le_tableau() {
+    let (db, backend) = base();
+    piste_de_genre(&db, 1, "/m/1.flac", Some("Jazz"), None);
+    piste_de_genre(&db, 2, "/m/2.flac", None, Some(r#"["Pop","Soul"]"#));
+    piste_de_genre(
+        &db,
+        3,
+        "/m/3.flac",
+        Some("Classique"),
+        Some(r#"["Classique"]"#),
+    );
+    piste_de_genre(&db, 4, "/m/4.flac", None, None);
+    piste_de_genre(&db, 5, "/m/5.flac", Some("Rock'n'Roll"), None);
+
+    assert_eq!(clause_genres_inclus(&[]), "");
+    assert_eq!(clause_genres_exclus(&[" ".into()]), "");
+
+    let retenus = clause_genres_inclus(&["jazz".into(), "SOUL".into(), "Rock'n'Roll".into()]);
+    assert_eq!(ids(&backend, &retenus), vec![1, 2, 5]);
+    let ecartes = clause_genres_exclus(&["jazz".into(), "SOUL".into(), "Rock'n'Roll".into()]);
+    assert_eq!(
+        ids(&backend, &ecartes),
+        vec![3, 4],
+        "la piste sans genre reste"
+    );
+
+    // Un joker dans un nom de genre n'élargit rien.
+    assert_eq!(
+        ids(&backend, &clause_genres_inclus(&["%".into()])),
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        ids(&backend, &clause_genres_inclus(&["P_p".into()])),
+        Vec::<i64>::new()
+    );
+}
+
+/// Thierry (#6198) : la passe CLAP — sa sélection ET ses compteurs — ne voit
+/// que les genres retenus, moins les genres écartés, par-dessus les racines
+/// exclues. Une piste écartée ne bloque pas la passe : une fois les retenues
+/// traitées, plus aucun candidat, et la jauge est pleine. Contre-épreuve dans
+/// le même test : la liste levée, la piste écartée redevient du travail.
+#[test]
+fn la_passe_clap_ne_voit_que_les_genres_retenus() {
+    let (db, backend) = base();
+    piste_de_genre(&db, 1, "/local/1.flac", Some("Jazz"), None);
+    piste_de_genre(&db, 2, "/local/2.flac", Some("Metal"), None);
+    piste_de_genre(&db, 3, "/local/3.flac", None, Some(r#"["Jazz","Blues"]"#));
+    piste_de_genre(&db, 4, "/nas/4.flac", Some("Jazz"), None);
+    piste_de_genre(&db, 5, "/local/5.flac", None, None);
+    piste_de_genre(&db, 6, "/local/6.flac", Some("Blues"), None);
+
+    assert_eq!(candidats_clap(&backend), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(embedding_store::eligible_count(&backend), 6);
+
+    // Écarter le métal.
+    regler(
+        &backend,
+        CLE_GENRES_CLAP_EXCLUS,
+        serde_json::json!(["metal"]),
+    );
+    assert_eq!(candidats_clap(&backend), vec![1, 3, 4, 5, 6]);
+    assert_eq!(embedding_store::eligible_count(&backend), 5);
+
+    // Retenir le jazz seul, par-dessus la racine exclue.
+    regler(&backend, CLE_GENRES_CLAP_EXCLUS, serde_json::json!([]));
+    regler(
+        &backend,
+        CLE_GENRES_CLAP_INCLUS,
+        serde_json::json!(["Jazz"]),
+    );
+    regler(&backend, CLE_RACINES_EXCLUES, serde_json::json!(["/nas"]));
+    assert_eq!(candidats_clap(&backend), vec![1, 3]);
+    assert_eq!(embedding_store::eligible_count(&backend), 2);
+
+    // Retenir et écarter à la fois : le blues retiré du jazz+blues.
+    regler(
+        &backend,
+        CLE_GENRES_CLAP_INCLUS,
+        serde_json::json!(["Jazz", "Blues"]),
+    );
+    regler(
+        &backend,
+        CLE_GENRES_CLAP_EXCLUS,
+        serde_json::json!(["blues"]),
+    );
+    assert_eq!(candidats_clap(&backend), vec![1], "3 porte aussi le blues");
+    regler(&backend, CLE_GENRES_CLAP_EXCLUS, serde_json::json!([]));
+    regler(
+        &backend,
+        CLE_GENRES_CLAP_INCLUS,
+        serde_json::json!(["Jazz"]),
+    );
+
+    // Les retenues traitées : plus aucun candidat, la jauge est pleine.
+    let meta = TrackMetadataRepo::new(db.clone());
+    for id in [1, 3] {
+        meta.set(id, "audio_embed_analyzed", embedding_store::MODEL_ID)
+            .unwrap();
+    }
+    assert_eq!(
+        candidats_clap(&backend),
+        Vec::<i64>::new(),
+        "la passe est finie"
+    );
+    assert_eq!(
+        embedding_store::processed_count_in_scope(&backend),
+        embedding_store::eligible_count(&backend)
+    );
+
+    // Contre-épreuve : la liste levée, les autres redeviennent du travail.
+    regler(&backend, CLE_GENRES_CLAP_INCLUS, serde_json::json!([]));
+    assert_eq!(candidats_clap(&backend), vec![2, 5, 6]);
+}
+
+/// Les genres ne touchent QUE le CLAP : ReplayGain, plage dynamique et
+/// empreintes servent à la lecture de chaque piste.
+#[test]
+fn les_genres_ne_touchent_que_le_clap() {
+    let (_db, backend) = base();
+    regler(
+        &backend,
+        CLE_GENRES_CLAP_INCLUS,
+        serde_json::json!(["Jazz"]),
+    );
+    regler(
+        &backend,
+        CLE_GENRES_CLAP_EXCLUS,
+        serde_json::json!(["Metal"]),
+    );
+    assert_eq!(clause_decodage(&backend), "");
+    assert_eq!(clause_hors_perimetre_decodage(&backend), "");
+    assert!(!clause_clap(&backend).is_empty());
+}

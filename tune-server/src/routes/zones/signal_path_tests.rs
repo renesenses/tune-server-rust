@@ -4703,3 +4703,174 @@ fn un_fondu_enchaine_declare_s_annonce_et_fait_tomber_le_verdict() {
     assert_eq!(step_desc(&sp, "Fondu enchaîné"), None);
     assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
 }
+
+// ── #4354 — le repli à 176,4 kHz, et sa raison lisible ──────────────────────
+//
+// Décision de Bertrand du 12/10/2026 : un DSD décimé qui manque son
+// pré-tampon retombe à 176,4 kHz, et le chemin du signal dit pourquoi.
+
+fn transcoder(v: &Value) -> Option<Value> {
+    v.get("steps")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("Transcoder"))
+        .cloned()
+}
+
+/// 🔴 Le repli posé, le fil à 176,4 kHz : l'étape Transcoder porte le code
+/// `dsd_pcm_repli` et la raison, en clair.
+#[test]
+fn le_repli_dsd_a_176_4_se_lit_dans_le_chemin_du_signal_4354() {
+    let (backend, mut zone) = dlna_zone();
+    // Un identifiant propre : le repli vit dans un registre global, partagé
+    // par les tests de ce binaire.
+    zone.id = Some(435411);
+    tune_core::audio::repli_dsd_4354::enregistrer(
+        435411,
+        tune_core::audio::repli_dsd_4354::RepliDsd {
+            de_hz: 352_800,
+            vers_hz: 176_400,
+        },
+    );
+    let sp = build_signal_path(
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        Some("DMP-A8"),
+        "none",
+        Some(&wire_mime("wav", "audio/wav", 176_400, 24)),
+    )
+    .unwrap();
+    tune_core::audio::repli_dsd_4354::oublier(435411);
+
+    let etape = transcoder(&sp).expect("une étape Transcoder");
+    assert_eq!(
+        etape.get("description").and_then(Value::as_str),
+        Some("DSD128 5.6 MHz \u{2192} WAV 176kHz/24bit")
+    );
+    assert_eq!(
+        etape.get("code").and_then(Value::as_str),
+        Some("dsd_pcm_repli"),
+        "l'étape doit porter le code du repli : {etape}"
+    );
+    assert_eq!(
+        etape.get("detail").and_then(Value::as_str),
+        Some(
+            "Repli à 176,4 kHz : la conversion DSD vers 352,8 kHz n'a pas rempli le \
+             pré-tampon à temps sur cet hôte"
+        ),
+        "la raison doit être lisible dans le chemin du signal : {etape}"
+    );
+}
+
+/// Témoin : sans repli posé, le même DSD128 à 176,4 kHz (renderer qui le
+/// demande, plafond de zone) n'invente aucune raison.
+#[test]
+fn sans_repli_l_etape_dsd_ne_porte_aucune_raison_4354() {
+    let (backend, mut zone) = dlna_zone();
+    zone.id = Some(435412);
+    let sp = build_signal_path(
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        Some("DMP-A8"),
+        "none",
+        Some(&wire_mime("wav", "audio/wav", 176_400, 24)),
+    )
+    .unwrap();
+    let etape = transcoder(&sp).expect("une étape Transcoder");
+    assert_eq!(etape.get("code"), None, "{etape}");
+    assert_eq!(etape.get("detail"), None, "{etape}");
+}
+
+// ------------------------------------------------------------------
+// #6221 — un DSDIFF DST servi en DSD natif (DSF fabriqué à la volée).
+
+/// Une piste DFF (DST) DSD64 jouée sur une zone DLNA.
+fn dff_dst_playing() -> ZoneState {
+    ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "Une piste DST".into(),
+            format: Some("dff".into()),
+            sample_rate: Some(2_822_400),
+            bit_depth: Some(1),
+            stream_id: Some("sid-dst".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    }
+}
+
+/// 🔴 Le chemin du signal dit « DST décompressé → DSF », et aucune étape de
+/// conversion PCM : le fil porte du DSD natif.
+#[test]
+fn un_dst_servi_en_dsf_dit_dst_decompresse_vers_dsf_sans_conversion_pcm() {
+    let (backend, zone) = dlna_zone();
+    let fil = StreamInfo {
+        format: "dsf".into(),
+        mime_type: "audio/x-dsf".into(),
+        sample_rate: 2_822_400,
+        bit_depth: 1,
+        channels: 2,
+        dsd_reconstruit_depuis_dst: true,
+        ..Default::default()
+    };
+    let sp = build_signal_path(
+        &dff_dst_playing(),
+        &zone,
+        &backend,
+        Some("SR7009"),
+        "none",
+        Some(&fil),
+    )
+    .unwrap();
+    assert_eq!(
+        step_desc(&sp, "Decoder").as_deref(),
+        Some("DST décompressé \u{2192} DSF")
+    );
+    assert_eq!(transcoder_desc(&sp), None, "aucune conversion PCM n'a lieu");
+    // Toute conversion s'écrit « A → B » : la seule flèche du chemin est
+    // celle de la décompression, et aucune étape ne rééchantillonne.
+    let etapes = sp["steps"].as_array().unwrap();
+    let conversions: Vec<&str> = etapes
+        .iter()
+        .filter_map(|s| s["description"].as_str())
+        .filter(|d| d.contains('\u{2192}'))
+        .collect();
+    assert_eq!(
+        conversions,
+        ["DST décompressé \u{2192} DSF"],
+        "une étape décrit une conversion : {etapes:?}"
+    );
+    assert!(
+        !etapes
+            .iter()
+            .any(|s| matches!(s["name"].as_str(), Some("Transcoder" | "Resampler"))),
+        "étape de conversion PCM : {etapes:?}"
+    );
+    assert_eq!(step_desc(&sp, "Source").as_deref(), Some("DSD64 2.8 MHz"));
+    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(true));
+}
+
+/// Le témoin : le même DFF décodé en PCM garde son étage de conversion, et
+/// n'annonce aucune décompression en DSF.
+#[test]
+fn un_dst_decode_en_pcm_garde_sa_conversion_et_aucun_dsf() {
+    let (backend, zone) = dlna_zone();
+    let sp = build_signal_path(
+        &dff_dst_playing(),
+        &zone,
+        &backend,
+        Some("SR7009"),
+        "none",
+        Some(&wire_mime("wav", "audio/wav", 176_400, 24)),
+    )
+    .unwrap();
+    assert!(transcoder_desc(&sp).is_some());
+    assert_ne!(
+        step_desc(&sp, "Decoder").as_deref(),
+        Some("DST décompressé \u{2192} DSF")
+    );
+}

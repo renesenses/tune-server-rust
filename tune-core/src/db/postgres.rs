@@ -324,6 +324,10 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key TEXT",
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key_seen TEXT",
     "CREATE INDEX IF NOT EXISTS idx_tracks_audio_pcm_key ON tracks(audio_pcm_key)",
+    // #6123 — la note de la piste lue dans ses balises (PG 088). Ici AUSSI :
+    // l'INSERT et l'UPDATE des pistes la NOMMENT. Sans effet sur une colonne
+    // déjà là, TEXT de bascule comprise : c'est la 088 qui la convertit.
+    "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating BIGINT",
     // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,
     // même raison : une base de bascule ne rejouera jamais la 078, alors que
     // l'écriture de la file, des favoris et de l'historique nomme la colonne.

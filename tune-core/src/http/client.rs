@@ -29,15 +29,29 @@ static TLS_CONFIG: LazyLock<rustls::ClientConfig> = LazyLock::new(|| {
     .with_no_client_auth()
 });
 
+/// Nombre d'en-têtes acceptés dans une réponse HTTP/1 (#5522).
+///
+/// hyper en refuse plus de 100 par défaut (`message head is too large`). Le
+/// CDN Qobuz (Akamai) ajoute une paire `X-AK-FWD-ERROR` / `X-AK-GRN` à chaque
+/// nouvel essai interne : mesuré le 11/10/2026, **108 en-têtes** sur la sonde
+/// Range de la piste 921595, qui ne pouvait donc jamais être lue. La marge
+/// couvre un CDN qui réessaie dix fois plus ; la taille totale de l'en-tête
+/// reste bornée par hyper (environ 400 Kio).
+pub const MAX_ENTETES_HTTP1: usize = 1024;
+
 /// A `reqwest` client builder preconfigured with webpki-root TLS. Use this
 /// instead of `reqwest::Client::builder()` everywhere.
 pub fn builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().use_preconfigured_tls(TLS_CONFIG.clone())
+    reqwest::Client::builder()
+        .use_preconfigured_tls(TLS_CONFIG.clone())
+        .http1_max_headers(MAX_ENTETES_HTTP1)
 }
 
 /// Blocking variant of [`builder`].
 pub fn blocking_builder() -> reqwest::blocking::ClientBuilder {
-    reqwest::blocking::Client::builder().use_preconfigured_tls(TLS_CONFIG.clone())
+    reqwest::blocking::Client::builder()
+        .use_preconfigured_tls(TLS_CONFIG.clone())
+        .http1_max_headers(MAX_ENTETES_HTTP1)
 }
 
 /// Décrit une erreur `reqwest` pour un journal, **sans son URL** et avec la
@@ -114,3 +128,7 @@ pub fn long_timeout() -> &'static reqwest::Client {
 pub fn infinite_stream() -> &'static reqwest::Client {
     &INFINITE_CLIENT
 }
+
+#[cfg(test)]
+#[path = "client_tests_5522.rs"]
+mod tests_5522;

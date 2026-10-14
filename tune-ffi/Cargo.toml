@@ -22,7 +22,10 @@ axum = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1"
+# La relocalisation du conteneur réécrit la base avant le démarrage.
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 # `ServiceExt::oneshot` : la garde mobile est testée sur un vrai routeur axum.
 tower = { version = "0.5", features = ["util"] }
+tempfile = "3"

@@ -112,6 +112,15 @@ struct Appareil {
     firmware: Option<String>,
     /// MIME source (minuscules) → profil appris.
     profils: HashMap<String, ProfilDate>,
+    /// #6059 — date à laquelle Tune a vu cet appareil ACQUITTER un `Seek` sans
+    /// l'exécuter (Yamaha R-N2000A). `Some` : un déplacement dans un fichier
+    /// natif relance le flux à la position au lieu d'un `Seek`.
+    seek_inoperant: Option<String>,
+    /// #6008 — date à laquelle Tune a vu cet appareil REMONTER son volume de
+    /// lui-même juste après une pose d'URI (Cabasse Abyss, firmware 25.04.10).
+    /// `Some` : Tune réimpose le dernier volume après chaque
+    /// `SetAVTransportURI`.
+    volume_remonte_a_l_uri: Option<String>,
 }
 
 /// La forme rangée en base, sous `settings[dlna_compat_set_uri:<udn>]`.
@@ -121,6 +130,12 @@ struct Enregistrement {
     firmware: Option<String>,
     #[serde(default)]
     profils: BTreeMap<String, ProfilDate>,
+    /// #6059 — voir [`Appareil::seek_inoperant`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seek_inoperant: Option<String>,
+    /// #6008 — voir [`Appareil::volume_remonte_a_l_uri`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volume_remonte_a_l_uri: Option<String>,
 }
 
 /// Mémoire process : UDN → profils appris, doublée d'une copie en base.
@@ -190,6 +205,12 @@ fn appareil<'a>(m: &'a mut HashMap<String, Appareil>, udn: &str) -> &'a mut Appa
             for (mime, profil) in e.profils {
                 a.profils.entry(mime).or_insert(profil);
             }
+            if a.seek_inoperant.is_none() {
+                a.seek_inoperant = e.seek_inoperant;
+            }
+            if a.volume_remonte_a_l_uri.is_none() {
+                a.volume_remonte_a_l_uri = e.volume_remonte_a_l_uri;
+            }
         }
     }
     a
@@ -203,11 +224,17 @@ fn ecrire_maintenant(db: &Arc<dyn DbBackend>, udn: &str) -> Result<(), String> {
         m.get(udn).map(|a| Enregistrement {
             firmware: a.firmware.clone(),
             profils: a.profils.clone().into_iter().collect(),
+            seek_inoperant: a.seek_inoperant.clone(),
+            volume_remonte_a_l_uri: a.volume_remonte_a_l_uri.clone(),
         })
     });
     let repo = SettingsRepo::with_backend(db.clone());
     match instantane {
-        Some(e) if !e.profils.is_empty() => {
+        Some(e)
+            if !e.profils.is_empty()
+                || e.seek_inoperant.is_some()
+                || e.volume_remonte_a_l_uri.is_some() =>
+        {
             let json = serde_json::to_string(&e).map_err(|e| e.to_string())?;
             repo.set(&cle_reglage(udn), &json)
         }
@@ -279,6 +306,71 @@ pub(crate) fn oublier_profil(udn: &str, mime_source: &str) {
     }
 }
 
+/// #6059 — cet appareil acquitte-t-il un `Seek` sans l'exécuter ? Appris par
+/// [`memoriser_seek_inoperant`], persistant, oublié comme les profils (version
+/// logicielle changée, « Réinitialiser la compatibilité »).
+pub fn seek_inoperant(udn: &str) -> bool {
+    APPAREILS
+        .lock()
+        .ok()
+        .is_some_and(|mut m| appareil(&mut m, udn).seek_inoperant.is_some())
+}
+
+/// #6059 — retient que cet appareil ignore les `Seek`. Idempotent.
+pub fn memoriser_seek_inoperant(udn: &str) {
+    let nouveau = match APPAREILS.lock() {
+        Ok(mut m) => {
+            let a = appareil(&mut m, udn);
+            if a.seek_inoperant.is_some() {
+                false
+            } else {
+                a.seek_inoperant =
+                    Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+                true
+            }
+        }
+        Err(_) => false,
+    };
+    if nouveau {
+        info!(device_id = %udn, "dlna_seek_inoperant_appris");
+        persister(udn);
+    }
+}
+
+/// #6008 — cet appareil remonte-t-il son volume de lui-même à chaque nouvelle
+/// URI ? Appris par [`memoriser_volume_remonte_a_l_uri`], persistant, oublié
+/// comme les profils (version logicielle changée, « Réinitialiser la
+/// compatibilité »).
+pub fn volume_remonte_a_l_uri(udn: &str) -> bool {
+    APPAREILS
+        .lock()
+        .ok()
+        .is_some_and(|mut m| appareil(&mut m, udn).volume_remonte_a_l_uri.is_some())
+}
+
+/// #6008 — retient que cet appareil remonte son volume à la pose d'URI.
+/// Idempotent ; rend `true` la première fois.
+pub fn memoriser_volume_remonte_a_l_uri(udn: &str) -> bool {
+    let nouveau = match APPAREILS.lock() {
+        Ok(mut m) => {
+            let a = appareil(&mut m, udn);
+            if a.volume_remonte_a_l_uri.is_some() {
+                false
+            } else {
+                a.volume_remonte_a_l_uri =
+                    Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+                true
+            }
+        }
+        Err(_) => false,
+    };
+    if nouveau {
+        info!(device_id = %udn, "dlna_volume_remonte_a_l_uri_appris");
+        persister(udn);
+    }
+    nouveau
+}
+
 /// À la découverte d'un appareil : relit ses profils en base, et les OUBLIE
 /// si sa version logicielle a changé depuis qu'ils ont été appris — une mise
 /// à jour peut avoir corrigé le refus, ou en avoir créé un autre.
@@ -293,7 +385,9 @@ pub fn charger_pour_appareil(udn: &str, firmware: Option<&str>) {
         let a = appareil(&mut m, udn);
         if let (Some(ancien), Some(courant)) = (a.firmware.as_deref(), firmware)
             && ancien != courant
-            && !a.profils.is_empty()
+            && (!a.profils.is_empty()
+                || a.seek_inoperant.is_some()
+                || a.volume_remonte_a_l_uri.is_some())
         {
             info!(
                 device_id = %udn,
@@ -303,13 +397,17 @@ pub fn charger_pour_appareil(udn: &str, firmware: Option<&str>) {
                 "dlna_compat_set_uri_oubliee_firmware_change"
             );
             a.profils.clear();
+            a.seek_inoperant = None;
+            a.volume_remonte_a_l_uri = None;
             a_persister = true;
         }
         if let Some(courant) = firmware
             && a.firmware.as_deref() != Some(courant)
         {
             a.firmware = Some(courant.to_string());
-            a_persister |= !a.profils.is_empty();
+            a_persister |= !a.profils.is_empty()
+                || a.seek_inoperant.is_some()
+                || a.volume_remonte_a_l_uri.is_some();
         }
         if !a.profils.is_empty() {
             info!(
@@ -339,6 +437,13 @@ pub struct CompatibiliteAppareil {
     pub device_id: String,
     pub firmware: Option<String>,
     pub profils: Vec<ProfilAppris>,
+    /// #6059 — depuis quand l'appareil ignore les `Seek` (absent : jamais vu).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seek_inoperant_depuis: Option<String>,
+    /// #6008 — depuis quand Tune réimpose le volume après chaque pose d'URI
+    /// (absent : jamais vu).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_reimpose_depuis: Option<String>,
 }
 
 /// Ce que Tune a appris pour cet appareil, relu en base au besoin.
@@ -347,10 +452,14 @@ pub fn compatibilite_de(udn: &str) -> CompatibiliteAppareil {
         device_id: udn.to_string(),
         firmware: None,
         profils: Vec::new(),
+        seek_inoperant_depuis: None,
+        volume_reimpose_depuis: None,
     };
     if let Ok(mut m) = APPAREILS.lock() {
         let a = appareil(&mut m, udn);
         sortie.firmware = a.firmware.clone();
+        sortie.seek_inoperant_depuis = a.seek_inoperant.clone();
+        sortie.volume_reimpose_depuis = a.volume_remonte_a_l_uri.clone();
         sortie.profils = a
             .profils
             .iter()
@@ -374,8 +483,12 @@ pub fn reinitialiser_compatibilite(udn: &str) -> Result<usize, String> {
     let oublies = match APPAREILS.lock() {
         Ok(mut m) => {
             let a = appareil(&mut m, udn);
-            let n = a.profils.len();
+            let n = a.profils.len()
+                + usize::from(a.seek_inoperant.is_some())
+                + usize::from(a.volume_remonte_a_l_uri.is_some());
             a.profils.clear();
+            a.seek_inoperant = None;
+            a.volume_remonte_a_l_uri = None;
             n
         }
         Err(e) => return Err(e.to_string()),

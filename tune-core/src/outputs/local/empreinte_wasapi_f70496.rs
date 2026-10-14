@@ -124,6 +124,7 @@ fn route_directe_d_avant(dsp: &DspAuRepos, octets: &[u8], bit_depth: u16) -> u64
         &dsp.crossfeed,
         &dsp.pure_bypass,
         &dsp.mono_downmix,
+        None,
     )
     .expect("fenêtre PCM complète");
     let mots: Vec<u8> = prepared

@@ -104,6 +104,11 @@ pub(super) struct EtageNatif<'a> {
     crossfeed: &'a std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &'a AtomicBool,
     mono_downmix: &'a AtomicBool,
+    /// #6247 — la réaffectation des canaux et la disposition déclarée de la
+    /// sortie, quand le bras les a branchées
+    /// ([`EtageNatif::avec_l_adaptation_des_canaux`]). `None` : aucun
+    /// déplacement de voie, comme avant.
+    adaptation: Option<AdaptationNative<'a>>,
 }
 
 impl<'a> EtageNatif<'a> {
@@ -133,7 +138,23 @@ impl<'a> EtageNatif<'a> {
             crossfeed,
             pure_bypass,
             mono_downmix,
+            adaptation: None,
         }
+    }
+
+    /// #6247 — brancher la réaffectation des canaux (#6044) et la disposition
+    /// déclarée par le fichier (#6057) de la sortie sur cet étage. Le bras
+    /// WASAPI exclusif ne les recevait pas : la matrice d'une zone ou d'un
+    /// album n'y était jamais appliquée (Didier, Marantz AV 7706, 7.1). Elles
+    /// sont relues à chaque bloc, comme dans l'étage de conversion : une
+    /// règle posée à chaud prend effet au bloc suivant.
+    pub(super) fn avec_l_adaptation_des_canaux(
+        mut self,
+        reaffectation: &'a CreneauReaffectation,
+        disposition: &'a CreneauDisposition,
+    ) -> Self {
+        self.adaptation = Some((reaffectation, disposition));
+        self
     }
 
     /// Le format de la source.
@@ -208,6 +229,7 @@ impl<'a> EtageNatif<'a> {
             self.crossfeed,
             self.pure_bypass,
             self.mono_downmix,
+            self.adaptation,
         ) else {
             // La première sonde 24 bits n'a pas ses 32 trames : les octets
             // restent en quarantaine, aucun mot n'a été produit.
@@ -331,7 +353,15 @@ impl<'a> EtageNatif<'a> {
             self.mono_downmix,
             self.dop_latched,
         ) == OutputDspState::Applied;
-        TransformationsReelles::nouvelles(self.spec, self.sortie, dsp_actif)
+        // #6247 — une matrice de réaffectation appliquée touche le signal,
+        // même règle que `EtageDeConversion::dsp_actif`.
+        let canaux = self.spec.canaux();
+        let reaffecte = self.adaptation.is_some_and(|(reaffectation, _)| {
+            !self.dop_latched
+                && !self.pure_bypass.load(Ordering::Relaxed)
+                && reaffectation.pour(canaux, canaux).is_some()
+        });
+        TransformationsReelles::nouvelles(self.spec, self.sortie, dsp_actif || reaffecte)
     }
 }
 
@@ -696,6 +726,87 @@ mod tests {
         let autre = stereo(ProfondeurPcm::Entier24);
         assert!(!puits.ecrire(autre.bloc(&bloc)));
         assert!(!puits.ecrire(spec.bloc(&bloc)), "un puits mort le reste");
+    }
+
+    /// #6247 — la règle de Didier (Marantz AV 7706, WASAPI exclusif) : une
+    /// grille 8 → 8 qui ne garde que FL et FR, sur une piste 7.1. Le bras
+    /// WASAPI ne branchait pas la réaffectation : les huit voies sortaient
+    /// telles quelles. Branchée, BL…SR sont nuls, FL/FR intacts, le verdict
+    /// n'est plus bit-perfect et les transformations le disent. Sans règle,
+    /// rien ne bouge : le rendu reste celui de la source, au bit près.
+    #[test]
+    fn la_reaffectation_s_applique_sur_le_transport_natif_6247() {
+        use crate::audio::reaffectation_canaux::{ChannelRemapSettings, Matrice};
+        let dsp = Dsp::au_repos();
+        let spec = AudioSpec::nouvelle(48_000, ProfondeurPcm::Entier16, 8).unwrap();
+        let mut gains = vec![vec![None; 8]; 8];
+        gains[0][0] = Some(0.0);
+        gains[1][1] = Some(0.0);
+        let reglage: ChannelRemapSettings = serde_json::from_value(serde_json::json!({
+            "enabled": true, "inputs": 8, "outputs": 8, "gains_db": gains, "normalize": false
+        }))
+        .unwrap();
+        let creneau = CreneauReaffectation::vide();
+        creneau.poser(Matrice::du_reglage_arme(&reglage).map(Arc::new));
+        assert!(creneau.posee(), "la règle 8 → 8 est armée");
+
+        // 64 trames 16 bits, chaque voie à une valeur non nulle distincte.
+        let source: Vec<u8> = (0..64)
+            .flat_map(|t| (0..8).map(move |c| (1000 * (c + 1) + t) as i16))
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        struct Mots(Vec<i32>);
+        impl PuitsNatif for Mots {
+            fn ecrire(&mut self, bloc: BlocPcm<'_>) -> bool {
+                self.0.extend(mots_natifs_du_bloc(bloc));
+                true
+            }
+        }
+        let mut capture = Mots(Vec::new());
+        let mut etage = dsp
+            .etage(spec)
+            .avec_l_adaptation_des_canaux(&creneau, &crate::outputs::local::SANS_DISPOSITION);
+        assert!(matches!(
+            etage.decoder_et_pousser(&source, &mut capture),
+            EcritureNative::Poussee {
+                trames_source: 64,
+                dop: false,
+                bit_perfect: false
+            }
+        ));
+        assert!(creneau.appliquee(), "le bloc est passé par la matrice");
+        assert!(
+            etage.transformations().dsp_actif(),
+            "la matrice est un traitement du signal"
+        );
+        let bruts = pcm_bytes_to_native_i32(&source, 16);
+        let mots = capture.0;
+        assert_eq!(mots.len(), bruts.len());
+        for (t, (trame, attendue)) in mots.chunks(8).zip(bruts.chunks(8)).enumerate() {
+            assert_eq!(&trame[..2], &attendue[..2], "trame {t} : FL/FR intacts");
+            assert_eq!(
+                &trame[2..],
+                &[0; 6],
+                "trame {t} : FC, LFE, BL, BR, SL, SR doivent être muets — la \
+                 réaffectation n'a pas été appliquée par le transport natif"
+            );
+        }
+
+        // Sans règle posée, le transport natif reste bit-perfect.
+        creneau.poser(None);
+        let mut temoin = Mots(Vec::new());
+        let mut etage = dsp
+            .etage(spec)
+            .avec_l_adaptation_des_canaux(&creneau, &crate::outputs::local::SANS_DISPOSITION);
+        assert!(matches!(
+            etage.decoder_et_pousser(&source, &mut temoin),
+            EcritureNative::Poussee {
+                bit_perfect: true,
+                ..
+            }
+        ));
+        assert!(!creneau.appliquee());
+        assert_eq!(temoin.0, bruts, "sans règle, les mots de la source");
     }
 
     /// Un arrêt demandé pendant que l'anneau est plein rend `true` — ce

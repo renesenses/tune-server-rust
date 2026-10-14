@@ -433,6 +433,7 @@ impl DeezerService {
                 .and_then(|count| u32::try_from(count).ok())
                 .unwrap_or(0),
             owner: item["PARENT_USERNAME"].as_str().map(Into::into),
+            editable: None,
             covers: Vec::new(),
         })
     }
@@ -818,6 +819,7 @@ impl DeezerService {
                 .or_else(|| item["picture_medium"].as_str())
                 .map(Into::into),
             track_count: item["nb_tracks"].as_u64().unwrap_or(0) as u32,
+            editable: None,
             owner: item["creator"]["name"].as_str().map(Into::into),
             covers: Vec::new(),
         }

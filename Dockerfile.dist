@@ -12,7 +12,10 @@ ARG TARGETARCH
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl libasound2 python3-pip && \
+      ca-certificates curl libasound2 python3-pip \
+      # fpcalc (Chromaprint) : empreinte sonore de la passe AcoustID (#4805). Sans lui,
+      # Bibliothèque › Enrichissement affiche « fpcalc n’est pas installé » (fil 2235).
+      libchromaprint-tools && \
     pip3 install --break-system-packages yt-dlp && \
     rm -rf /var/lib/apt/lists/*
 

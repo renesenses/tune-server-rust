@@ -441,25 +441,30 @@ const EMPREINTE_ADAPTATION_STEREO_VERS_MONO: u64 = 0x3557_16d1_b565_a7d6;
 // Était 0x4491_3fae_738e_a9ee avec le noyau 64 écrit à la main.
 //
 // #6016 (interpolation Cubique, #4754) a changé le rendu : AVX+FMA remesuré sur
-// Shrek le 10/10 ; SSE3, NEON et scalaire NON remesurés (`None`), à reprendre
-// par #6103. Valeurs du 19/09, interpolation Linéaire, pour mémoire :
+// Shrek le 10/10. #6103, le 12/10 sur Shrek (Xeon E5-2630 v4), par la méthode
+// du 19/09 (rubato forcé sur son noyau, instrumentation non commitée) : SSE3 et
+// scalaire remesurés ; le même banc rend bien les deux relevés AVX+FMA
+// ci-dessous, ce qui vaut contrôle de la méthode. Scalaire : le recoupement sur
+// le Mac reste à faire. NEON : NON remesuré (`None`), aucun hôte aarch64 au
+// banc. Valeurs du 19/09, interpolation Linéaire, pour mémoire :
 // 13_845_619_951_895_521_272 / 12_081_719_003_251_702_559 /
 // 7_823_019_637_321_928_767 / 8_691_608_775_236_771_879.
 const EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000: RelevesParNoyau = RelevesParNoyau {
     avx_fma: 7_674_444_934_208_882_303,
-    sse3: None,
+    sse3: Some(16_371_464_594_054_353_160),
     neon: None,
-    scalaire: None,
+    scalaire: Some(8_996_583_943_213_529_006),
 };
 // Était 0x8c1c_f175_68c3_9aaa avec le noyau 64 écrit à la main.
-// #6016 : même reprise. Valeurs du 19/09 (Linéaire), pour mémoire :
+// #6016 : même reprise, mêmes noyaux remesurés par #6103. Valeurs du 19/09
+// (Linéaire), pour mémoire :
 // 6_036_393_677_556_695_676 / 16_064_891_628_025_049_697 /
 // 5_446_340_049_408_367_490 / 5_331_791_831_370_548_251.
 const EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE: RelevesParNoyau = RelevesParNoyau {
     avx_fma: 9_648_691_482_532_452_327,
-    sse3: None,
+    sse3: Some(8_578_474_791_680_536_000),
     neon: None,
-    scalaire: None,
+    scalaire: Some(3_035_902_412_451_843_507),
 };
 
 /// Le produit scalaire que rubato retient pour ce processeur (#4532).

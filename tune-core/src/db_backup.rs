@@ -489,16 +489,22 @@ mod tests {
         // Le vidage, tel que la route l'appelle.
         let repo = crate::db::track_repo::TrackRepo::new(db);
         repo.delete_all().unwrap();
+        // #6179 — la ligne de playlist survit au vidage, INTROUVABLE : on
+        // compte les lignes qui désignent encore une piste.
         let compter = |chemin: &str| -> i64 {
             rusqlite::Connection::open(chemin)
                 .unwrap()
-                .query_row("SELECT COUNT(*) FROM playlist_tracks", [], |r| r.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM playlist_tracks WHERE track_id IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
                 .unwrap()
         };
         assert_eq!(
             compter(db_path),
             0,
-            "contre-épreuve : le vidage efface bien le contenu des playlists"
+            "contre-épreuve : le vidage retire bien la piste de la playlist"
         );
         assert_eq!(
             compter(&sauvegarde.path),

@@ -116,12 +116,38 @@ pub mod sql {
     /// Toutes les lignes de la playlist, locales ET de service (#4889), dans
     /// l'ordre d'affichage. `id` départage deux lignes de même `position`
     /// (un ajout à une position explicite ne décale pas les suivantes).
+    ///
+    /// #6179 — les colonnes 11 à 15 (`file_path`, `missing_since`, `mbid`,
+    /// `audio_hash`, `audio_fingerprint`) ne servent qu'à la ligne INTROUVABLE.
     pub fn get_entries<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT id, position, track_id, source, source_id, title, artist, album, \
-             album_source_id, duration_ms, cover_url \
+             album_source_id, duration_ms, cover_url, file_path, missing_since, mbid, \
+             audio_hash, audio_fingerprint \
              FROM playlist_tracks WHERE playlist_id = {} ORDER BY position, id",
             d.placeholder(1)
+        )
+    }
+
+    /// Une ligne INTROUVABLE (#6179) recopiée telle quelle — réécriture de
+    /// l'ordre ou duplication : `track_id` et `source` restent NULS, l'identité
+    /// figée de la piste disparue suit la ligne.
+    pub fn insert_missing_entry<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO playlist_tracks (playlist_id, position, title, artist, album, \
+             duration_ms, file_path, audio_hash, audio_fingerprint, mbid, missing_since) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8),
+            d.placeholder(9),
+            d.placeholder(10),
+            d.placeholder(11)
         )
     }
 
@@ -291,21 +317,82 @@ impl ServiceEntry {
     }
 }
 
-/// Ce que porte une ligne de playlist : une piste de la bibliothèque, ou un
-/// titre de service (#4889). Jamais les deux, jamais aucun — le CHECK de la
-/// table le garantit.
+/// Une ligne INTROUVABLE (#6179) : la piste de la bibliothèque qu'elle
+/// désignait a quitté `tracks` (fichier supprimé, déplacé, re-balisé, piste
+/// périmée retirée par un scan). La ligne reste à sa position avec l'identité
+/// figée par le déclencheur `playlist_tracks_garde_l_orpheline`, pour que
+/// l'écran la NOMME — et que la réconciliation (`db/playlists_reconcile.rs`)
+/// la rattache quand la piste reparaît. Seul un geste de l'utilisateur la
+/// retire.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MissingEntry {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub file_path: Option<String>,
+    pub mbid: Option<String>,
+    /// Empreinte d'échantillon du fichier (`tracks.audio_hash`) : survit à un
+    /// déplacement, pas à un re-balisage.
+    pub audio_hash: Option<String>,
+    /// Empreinte du contenu décodé (`tracks.audio_fingerprint`) : survit aux
+    /// deux.
+    pub audio_fingerprint: Option<String>,
+    /// Secondes depuis l'époque Unix, posées par le déclencheur.
+    pub missing_since: Option<i64>,
+}
+
+impl MissingEntry {
+    /// La ligne au format d'une piste, pour les clients : `id` NUL comme une
+    /// ligne de service, mais `source` = `local` et `missing` = vrai. Un
+    /// client qui ne connaît pas `missing` voit une piste sans identifiant,
+    /// qu'il ne sait ni jouer ni enfiler — exactement ce qu'elle est.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": serde_json::Value::Null,
+            "missing": true,
+            "title": self.title.clone().unwrap_or_default(),
+            "artist_name": self.artist,
+            "album_title": self.album,
+            "duration_ms": self.duration_ms.unwrap_or(0),
+            "file_path": self.file_path,
+            "musicbrainz_recording_id": self.mbid,
+            "missing_since": self.missing_since,
+            "source": "local",
+            "source_id": serde_json::Value::Null,
+        })
+    }
+}
+
+/// Ce que porte une ligne de playlist : une piste de la bibliothèque, un
+/// titre de service (#4889), ou — depuis #6179 — une piste INTROUVABLE. Jamais
+/// une piste ET un titre de service : le CHECK de la table le garantit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryContent {
     Local(i64),
     Service(ServiceEntry),
+    Missing(MissingEntry),
 }
 
 impl EntryContent {
-    /// La clef de dédoublonnage : un `tracks.id`, ou la paire du service.
+    /// La clef de dédoublonnage : un `tracks.id`, ou la paire du service. Une
+    /// ligne introuvable n'est le doublon d'aucune autre : sa clef porte son
+    /// chemin et son titre, sous une source qu'aucun service ne prend.
     fn cle(&self) -> (Option<i64>, Option<(String, String)>) {
         match self {
             Self::Local(id) => (Some(*id), None),
             Self::Service(s) => (None, Some((s.source.clone(), s.source_id.clone()))),
+            Self::Missing(m) => (
+                None,
+                Some((
+                    "\u{0}introuvable".to_string(),
+                    format!(
+                        "{}\u{0}{}",
+                        m.file_path.as_deref().unwrap_or_default(),
+                        m.title.as_deref().unwrap_or_default()
+                    ),
+                )),
+            ),
         }
     }
 }
@@ -323,14 +410,22 @@ impl PlaylistEntry {
     pub fn track_id(&self) -> Option<i64> {
         match &self.content {
             EntryContent::Local(id) => Some(*id),
-            EntryContent::Service(_) => None,
+            EntryContent::Service(_) | EntryContent::Missing(_) => None,
         }
     }
 
     pub fn service(&self) -> Option<&ServiceEntry> {
         match &self.content {
-            EntryContent::Local(_) => None,
             EntryContent::Service(s) => Some(s),
+            EntryContent::Local(_) | EntryContent::Missing(_) => None,
+        }
+    }
+
+    /// La piste introuvable de la ligne (#6179), s'il y en a une.
+    pub fn missing(&self) -> Option<&MissingEntry> {
+        match &self.content {
+            EntryContent::Missing(m) => Some(m),
+            EntryContent::Local(_) | EntryContent::Service(_) => None,
         }
     }
 }
@@ -710,12 +805,17 @@ impl PlaylistRepo {
     /// [`reorder_by_ranks`](Self::reorder_by_ranks).
     pub fn reorder_tracks(&self, playlist_id: i64, track_ids: &[i64]) -> Result<(), String> {
         let lignes = self.get_entries(playlist_id)?;
-        if lignes.iter().any(|l| l.service().is_some()) {
+        // #6179 — une ligne INTROUVABLE garde son rang comme un titre de
+        // service : la réécriture nue l'effacerait, et ce n'est pas un geste
+        // de l'utilisateur sur elle.
+        if lignes.iter().any(|l| l.track_id().is_none()) {
             let mut locales = track_ids.iter().copied();
             let mut suite: Vec<EntryContent> = Vec::with_capacity(lignes.len());
             for l in &lignes {
                 match &l.content {
-                    EntryContent::Service(_) => suite.push(l.content.clone()),
+                    EntryContent::Service(_) | EntryContent::Missing(_) => {
+                        suite.push(l.content.clone())
+                    }
                     EntryContent::Local(_) => {
                         if let Some(tid) = locales.next() {
                             suite.push(EntryContent::Local(tid));
@@ -743,16 +843,24 @@ impl PlaylistRepo {
     /// Remplace tout le contenu par `suite`, dans l'ordre, en une transaction.
     fn rewrite_entries(&self, playlist_id: i64, suite: &[EntryContent]) -> Result<(), String> {
         let delete_sql = self.dialect_sql(sql::delete_all_tracks, sql::delete_all_tracks);
-        let local_sql = self.dialect_sql(sql::insert_playlist_track, sql::insert_playlist_track);
-        let service_sql = self.dialect_sql(sql::insert_service_entry, sql::insert_service_entry);
+        let sqls = self.sql_d_insertion();
         self.db.write_tx(&mut |tx| {
             let p: [&dyn ToSqlValue; 1] = [&playlist_id];
             tx.execute(&delete_sql, &p)?;
             for (i, e) in suite.iter().enumerate() {
-                Self::insert_entry(tx, &local_sql, &service_sql, playlist_id, i as i64, e)?;
+                Self::insert_entry(tx, &sqls, playlist_id, i as i64, e)?;
             }
             Ok(())
         })
+    }
+
+    /// Les trois requêtes d'insertion d'une ligne, une par sorte.
+    fn sql_d_insertion(&self) -> SqlDInsertion {
+        SqlDInsertion {
+            locale: self.dialect_sql(sql::insert_playlist_track, sql::insert_playlist_track),
+            service: self.dialect_sql(sql::insert_service_entry, sql::insert_service_entry),
+            introuvable: self.dialect_sql(sql::insert_missing_entry, sql::insert_missing_entry),
+        }
     }
 
     /// Toutes les lignes de la playlist, locales ET de service (#4889), dans
@@ -776,13 +884,30 @@ impl PlaylistRepo {
     /// Écrit UNE ligne dans la transaction en cours.
     fn insert_entry(
         tx: &dyn super::backend::DbTxHandle,
-        local_sql: &str,
-        service_sql: &str,
+        sqls: &SqlDInsertion,
         playlist_id: i64,
         pos: i64,
         contenu: &EntryContent,
     ) -> Result<(), String> {
+        let local_sql = sqls.locale.as_str();
+        let service_sql = sqls.service.as_str();
         match contenu {
+            EntryContent::Missing(m) => {
+                let p: [&dyn ToSqlValue; 11] = [
+                    &playlist_id,
+                    &pos,
+                    &m.title,
+                    &m.artist,
+                    &m.album,
+                    &m.duration_ms,
+                    &m.file_path,
+                    &m.audio_hash,
+                    &m.audio_fingerprint,
+                    &m.mbid,
+                    &m.missing_since,
+                ];
+                tx.execute(&sqls.introuvable, &p)?;
+            }
             EntryContent::Local(tid) => {
                 let p: [&dyn ToSqlValue; 3] = [&playlist_id, tid, &pos];
                 tx.execute(local_sql, &p)?;
@@ -835,8 +960,7 @@ impl PlaylistRepo {
             return Ok(Vec::new());
         }
         let max_pos_sql = self.dialect_sql(sql::max_position, sql::max_position);
-        let local_sql = self.dialect_sql(sql::insert_playlist_track, sql::insert_playlist_track);
-        let service_sql = self.dialect_sql(sql::insert_service_entry, sql::insert_service_entry);
+        let sqls = self.sql_d_insertion();
         let a_ecrire_ref = &a_ecrire;
         self.db.write_tx(&mut |tx| {
             let mp: [&dyn ToSqlValue; 1] = [&playlist_id];
@@ -847,14 +971,7 @@ impl PlaylistRepo {
                 .unwrap_or(-1);
             let depart = position.unwrap_or(max_pos + 1);
             for (i, e) in a_ecrire_ref.iter().enumerate() {
-                Self::insert_entry(
-                    tx,
-                    &local_sql,
-                    &service_sql,
-                    playlist_id,
-                    depart + i as i64,
-                    e,
-                )?;
+                Self::insert_entry(tx, &sqls, playlist_id, depart + i as i64, e)?;
             }
             Ok(())
         })?;
@@ -873,8 +990,7 @@ impl PlaylistRepo {
         entries: &[EntryContent],
     ) -> Result<(i64, Vec<EntryContent>), String> {
         let create_sql = self.dialect_sql(sql::create, sql::create);
-        let local_sql = self.dialect_sql(sql::insert_playlist_track, sql::insert_playlist_track);
-        let service_sql = self.dialect_sql(sql::insert_service_entry, sql::insert_service_entry);
+        let sqls = self.sql_d_insertion();
         let mut vues = std::collections::HashSet::new();
         let a_ecrire: Vec<EntryContent> = entries
             .iter()
@@ -891,7 +1007,7 @@ impl PlaylistRepo {
                 let id = tx.last_insert_rowid();
                 *new_id_ref = id;
                 for (i, e) in a_ecrire_ref.iter().enumerate() {
-                    Self::insert_entry(tx, &local_sql, &service_sql, id, i as i64, e)?;
+                    Self::insert_entry(tx, &sqls, id, i as i64, e)?;
                 }
                 Ok(())
             })?;
@@ -946,15 +1062,35 @@ impl PlaylistRepo {
     }
 }
 
-/// Une ligne de `get_entries`. `None` pour une ligne qui ne serait ni
-/// locale ni de service — le CHECK l'interdit, mais une base passée par un
-/// autre chemin ne doit pas faire tomber toute la liste pour une ligne.
+/// Les requêtes d'insertion d'une ligne de playlist, une par sorte.
+struct SqlDInsertion {
+    locale: String,
+    service: String,
+    introuvable: String,
+}
+
+/// Une ligne de `get_entries`. Sans `track_id` ni `source`, c'est la ligne
+/// INTROUVABLE de #6179 ; `None` pour une ligne de service à moitié remplie
+/// (le CHECK l'interdit, mais une base passée par un autre chemin ne doit pas
+/// faire tomber toute la liste pour une ligne).
 fn row_to_entry(cols: &Vec<SqlValue>) -> Option<PlaylistEntry> {
     let id = cols.first().and_then(|v| v.as_i64())?;
     let position = cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
     let texte = |i: usize| cols.get(i).and_then(|v| v.as_string());
     let content = match cols.get(2).and_then(|v| v.as_i64()) {
         Some(tid) => EntryContent::Local(tid),
+        // #6179 — ni piste, ni titre de service : la ligne INTROUVABLE.
+        None if texte(3).is_none() && texte(4).is_none() => EntryContent::Missing(MissingEntry {
+            title: texte(5),
+            artist: texte(6),
+            album: texte(7),
+            duration_ms: cols.get(9).and_then(|v| v.as_i64()),
+            file_path: texte(11),
+            missing_since: cols.get(12).and_then(|v| v.as_i64()),
+            mbid: texte(13),
+            audio_hash: texte(14),
+            audio_fingerprint: texte(15),
+        }),
         None => EntryContent::Service(ServiceEntry {
             source: texte(3)?,
             source_id: texte(4)?,
@@ -1546,6 +1682,7 @@ mod tests {
             .map(|e| match &e.content {
                 EntryContent::Local(id) => format!("L{id}"),
                 EntryContent::Service(s) => format!("{}:{}", s.source, s.source_id),
+                EntryContent::Missing(m) => format!("?{}", m.title.clone().unwrap_or_default()),
             })
             .collect()
     }
@@ -1965,6 +2102,15 @@ mod tests {
             duree_et_contrainte(&pool).await,
             ("bigint".to_string(), "YES".to_string(), 1)
         );
+        // #6179 — `get_entries` lit les colonnes de la 089 (ligne
+        // introuvable) : la scène les pose, comme le ferait la suite des
+        // scripts. Son propre banc : `pg_6179_*` (playlists_reconcile_tests).
+        sqlx::raw_sql(include_str!(
+            "../../migrations/postgres/089_playlist_tracks_orphelines.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         let backend: Arc<dyn DbBackend> =
             Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
         let locale: i64 = sqlx::query_scalar(

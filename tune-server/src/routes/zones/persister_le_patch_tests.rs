@@ -235,3 +235,36 @@ async fn bitperfect_strict_3973_est_persiste_par_la_route() {
         "désactiver SUPPRIME la clé"
     );
 }
+
+/// #2991 — « Envoyer le titre radio par DLNA » : absent = `off`, `next` et
+/// `reload` se persistent et se relisent, `off` supprime la clé, une voie
+/// inconnue est refusée sans rien écrire.
+#[tokio::test]
+async fn le_titre_radio_par_didl_se_regle_par_la_route() {
+    let (app, state) = serveur();
+    let id = zone_dlna(&app).await;
+    let cle = tune_core::outputs::dlna::titre_radio_2991::cle_de_zone(id);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+
+    assert_eq!(fiche(&app, id).await["dlna_radio_title"], json!("off"));
+
+    for voie in ["next", "reload"] {
+        let (statut, corps) = patch(&app, id, json!({ "dlna_radio_title": voie })).await;
+        assert_eq!(statut, StatusCode::OK, "{corps}");
+        assert_eq!(fiche(&app, id).await["dlna_radio_title"], json!(voie));
+        assert_eq!(settings.get(&cle).unwrap().as_deref(), Some(voie));
+    }
+
+    let (statut, corps) = patch(&app, id, json!({ "dlna_radio_title": "toujours" })).await;
+    assert_eq!(statut, StatusCode::BAD_REQUEST, "{corps}");
+    assert_eq!(
+        settings.get(&cle).unwrap().as_deref(),
+        Some("reload"),
+        "une voie refusée ne doit rien écrire"
+    );
+
+    let (statut, corps) = patch(&app, id, json!({ "dlna_radio_title": "off" })).await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(fiche(&app, id).await["dlna_radio_title"], json!("off"));
+    assert_eq!(settings.get(&cle).unwrap(), None, "« off » supprime la clé");
+}

@@ -34,7 +34,9 @@
 //! une `AppError` 400 — surtout pas « aucun filtre », qui rendrait la
 //! bibliothèque entière.
 
-use tune_core::db::facet_filter::{TrackFilter, normalize, normalize_ints};
+use tune_core::db::facet_filter::{
+    FACETTES_COMBINABLES_EN_ET, TrackFilter, normalize, normalize_ints,
+};
 
 use crate::error::AppError;
 
@@ -110,6 +112,13 @@ pub(super) fn track_filter_from_raw(raw: Option<&str>) -> Result<TrackFilter, Ap
         collection_ids: None,
         collection_track_ids: None,
         q: one("q"),
+        // #2108 — `?all_of=composer&all_of=genre` : ces facettes combinent
+        // leurs valeurs en ET. Une facette hors de la liste des combinables
+        // est ignorée (elle reste en « Ou ») : voir `FACETTES_COMBINABLES_EN_ET`.
+        en_et: texts("all_of")
+            .into_iter()
+            .filter(|k| FACETTES_COMBINABLES_EN_ET.contains(&k.as_str()))
+            .collect(),
     })
 }
 

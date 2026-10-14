@@ -4,9 +4,7 @@ use std::sync::Arc;
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 pub use super::facet_filter::TrackFilter;
-use super::facet_filter::{
-    Placeholders, any_of, banned_tracks_excluded, favorite_condition, hidden_tracks_excluded,
-};
+use super::facet_filter::{Placeholders, banned_tracks_excluded, hidden_tracks_excluded};
 use super::home_queries::{DATE_D_AJOUT, JOINTURE_PREMIERE_VUE};
 use super::models::Track;
 use super::sqlite::SqliteDb;
@@ -677,8 +675,11 @@ pub mod sql {
         // no album_artist to key on and shows track 1's artist for compilations
         // whose files carry no ALBUMARTIST tag (Bilou). The column keeps its
         // position, so row parsing is unchanged.
+        //
+        // `t.rating` (#6123) ferme la liste, au rang 34 : une projection qui
+        // s'arrête avant rend `rating = None`, jamais un décalage.
         format!(
-            "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments, t.cue_media_path, t.cue_start_ms, t.cue_end_ms{}",
+            "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments, t.cue_media_path, t.cue_start_ms, t.cue_end_ms, t.rating{}",
             track_from()
         )
     }
@@ -735,11 +736,11 @@ pub mod sql {
         )
     }
 
-    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments, cover_path, cue_media_path, cue_start_ms, cue_end_ms";
+    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments, cover_path, cue_media_path, cue_start_ms, cue_end_ms, rating";
 
     /// Combien de colonnes `INSERT_COLS` porte — la seule source de vérité du
     /// nombre de paramètres liés, pour les deux moteurs.
-    pub const NB_COLONNES_INSERT: usize = 31;
+    pub const NB_COLONNES_INSERT: usize = 32;
 
     pub fn insert<D: SqlDialect>(d: &D) -> String {
         let placeholders: Vec<String> =
@@ -774,8 +775,8 @@ pub mod sql {
     ];
 
     /// Le nombre de valeurs liées par [`update`] et [`update_du_scan`] : leurs
-    /// 25 colonnes, puis l'`id`.
-    pub const NB_PARAMS_UPDATE: usize = 26;
+    /// 26 colonnes, puis l'`id`.
+    pub const NB_PARAMS_UPDATE: usize = 27;
 
     /// `UPDATE tracks …` qui ÉCRASE tout, y compris ce que le scan ignore.
     ///
@@ -910,6 +911,17 @@ pub mod sql {
             // colonne n'était pas écrite du tout : ne rien effacer garde tout
             // ce qui marchait.
             garde(25, "isrc"),
+            // #6123 — la note de la piste. Le SCAN l'écrit telle que le
+            // fichier la dit : c'est sa SEULE source, une balise retirée puis
+            // rescannée doit retirer la note. Les autres écritures la GARDENT
+            // (`COALESCE`) : plusieurs reconstruisent la ligne sans la relire
+            // (réindexation UPnP, retouche d'une fiche), et effaceraient une
+            // note qu'elles ne connaissent pas.
+            if conserver {
+                brut(26, "rating")
+            } else {
+                format!("rating = COALESCE({}, rating)", d.placeholder(26))
+            },
         ];
         format!(
             "UPDATE tracks SET {} WHERE id = {}",
@@ -2178,6 +2190,7 @@ impl TrackRepo {
             &track.cue_media_path,
             &track.cue_start_ms,
             &track.cue_end_ms,
+            &track.rating,
         ];
         // Capture the new track id atomically, BEFORE the file_first_seen
         // insert below — otherwise `last_insert_rowid()` at the end returns that
@@ -2250,6 +2263,7 @@ impl TrackRepo {
             &track.musicbrainz_recording_id,
             &track.comments,
             &track.isrc,
+            &track.rating,
             &id,
         ];
         // #4546 : figer la date d'ajout AVANT que `file_mtime` ne soit récrit.
@@ -2530,25 +2544,19 @@ impl TrackRepo {
         // plusieurs genres sélectionnés, les deux tests s'étendent ensemble —
         // et les valeurs sont empilées dans l'ordre où les marqueurs sortent :
         // d'abord les N du `IN`, puis les N motifs `LIKE`.
-        if !f.genres.is_empty() {
-            let n = f.genres.len();
-            let in_part = ph
-                .in_list_ci("t.genre", n)
-                .expect("liste non vide déjà vérifiée");
-            // ⚠️ Insensible à la casse des DEUX côtés, comme le `in_list_ci`
-            // ci-dessus : un `LIKE` nu l'est en SQLite, mais PAS en
-            // PostgreSQL. Jumeau strict du rail (`facets::build_conditions`),
-            // qui a reçu la même correction (#1821).
-            let like_part = ph
-                .or_like_ci("t.genres", n)
-                .expect("liste non vide déjà vérifiée");
-            conditions.push(format!("({in_part} OR {like_part})"));
-            for g in &f.genres {
-                owned_params.push(SqlValue::Text(g.clone()));
-            }
-            for g in &f.genres {
-                owned_params.push(SqlValue::Text(format!("%\"{g}\"%")));
-            }
+        //
+        // #2108 : chaque facette « combinable » passe par
+        // `facet_filter::combiner`, qui rend le SQL d'avant en « Ou » (défaut)
+        // et un prédicat par valeur, joints par `AND`, en « Et ». Les blocs
+        // sont ceux du rail (`facets::build_facet_conditions`) : écrits une
+        // fois, dans `facet_filter`.
+        use crate::db::facet_filter::{
+            bloc_contient, bloc_favoris, bloc_genres, bloc_instruments, bloc_listes,
+            bloc_metadonnee, bloc_sans_etiquette, combiner,
+        };
+        if let Some((c, p)) = combiner(ph, &f.genres, f.est_en_et("genre"), bloc_genres) {
+            conditions.push(c);
+            owned_params.extend(p);
         }
 
         if let Some(c) = ph.in_list("t.year", f.years.len()) {
@@ -2586,27 +2594,36 @@ impl TrackRepo {
             }
         }
 
-        if let Some(c) = ph.or_like_ci("t.label", f.labels.len()) {
+        if let Some((c, p)) = combiner(
+            ph,
+            &f.labels,
+            f.est_en_et("label"),
+            bloc_contient("t.label"),
+        ) {
             conditions.push(c);
-            for v in &f.labels {
-                owned_params.push(SqlValue::Text(format!("%{v}%")));
-            }
+            owned_params.extend(p);
         }
 
-        if let Some(c) = ph.or_like_ci("t.composer", f.composers.len()) {
+        if let Some((c, p)) = combiner(
+            ph,
+            &f.composers,
+            f.est_en_et("composer"),
+            bloc_contient("t.composer"),
+        ) {
             conditions.push(c);
-            for v in &f.composers {
-                owned_params.push(SqlValue::Text(format!("%{v}%")));
-            }
+            owned_params.extend(p);
         }
 
         // CRD-6 : l'instrument est un crédit, pas une colonne de `tracks` ;
         // le prédicat jumeau des facettes vit dans `facet_filter`.
-        if let Some(c) = ph.in_list_ci("tc.instrument", f.instruments.len()) {
-            conditions.push(crate::db::facet_filter::instrument_exists(engine, &c));
-            for v in &f.instruments {
-                owned_params.push(SqlValue::Text(v.clone()));
-            }
+        if let Some((c, p)) = combiner(
+            ph,
+            &f.instruments,
+            f.est_en_et("instrument"),
+            bloc_instruments(engine),
+        ) {
+            conditions.push(c);
+            owned_params.extend(p);
         }
 
         // The artist name lives on the joined `artists` table (tracks stores
@@ -2624,19 +2641,14 @@ impl TrackRepo {
 
         // Extended-tag filters via the open `track_metadata` k/v store. The key
         // is a fixed literal; only the values are bound parameters.
-        for (values, key) in [
-            (&f.countries, "release_country"),
-            (&f.moods, "mood"),
-            (&f.source_medias, "source_media"),
+        for (values, key, param) in [
+            (&f.countries, "release_country", "country"),
+            (&f.moods, "mood", "mood"),
+            (&f.source_medias, "source_media", "source_media"),
         ] {
-            if let Some(c) = ph.in_list("tm.value", values.len()) {
-                conditions.push(format!(
-                    "EXISTS (SELECT 1 FROM track_metadata tm \
-                     WHERE tm.track_id = t.id AND tm.key = '{key}' AND {c})"
-                ));
-                for v in values {
-                    owned_params.push(SqlValue::Text(v.clone()));
-                }
+            if let Some((c, p)) = combiner(ph, values, f.est_en_et(param), bloc_metadonnee(key)) {
+                conditions.push(c);
+                owned_params.extend(p);
             }
         }
 
@@ -2724,38 +2736,24 @@ impl TrackRepo {
 
         // Favoris du profil 1 : la piste elle-même, ou son album. Vocabulaire
         // FERMÉ — le SQL est un littéral, jamais l'entrée de la requête.
-        if let Some(c) = any_of(
-            f.favorites
-                .iter()
-                .filter_map(|k| favorite_condition(k))
-                .map(str::to_string)
-                .collect(),
-        ) {
+        if let Some((c, _)) = combiner(ph, &f.favorites, f.est_en_et("favorite"), bloc_favoris) {
             conditions.push(c);
         }
 
-        if let Some(c) = ph.in_list_ci("pl.name", f.playlists.len()) {
-            conditions.push(format!(
-                "EXISTS (SELECT 1 FROM playlist_tracks pt JOIN playlists pl ON pl.id = pt.playlist_id \
-                 WHERE pt.track_id = t.id AND {c})"
-            ));
-            for v in &f.playlists {
-                owned_params.push(SqlValue::Text(v.clone()));
-            }
+        if let Some((c, p)) = combiner(ph, &f.playlists, f.est_en_et("playlist"), bloc_listes) {
+            conditions.push(c);
+            owned_params.extend(p);
         }
 
         // Étiquette manquante : liste FERMÉE, le SQL ne dépend jamais de
         // l'entrée brute. « Manquant » = NULL ou chaîne vide (un tag effacé
         // laisse souvent une chaîne vide, et l'utilisateur ne fait pas la
         // différence).
-        if let Some(c) = any_of(
-            f.untagged
-                .iter()
-                .filter_map(|k| {
-                    crate::db::facet_filter::untagged_condition_for_engine(k, self.db.engine())
-                        .map(str::to_string)
-                })
-                .collect(),
+        if let Some((c, _)) = combiner(
+            ph,
+            &f.untagged,
+            f.est_en_et("untagged"),
+            bloc_sans_etiquette(engine),
         ) {
             conditions.push(c);
         }
@@ -3477,6 +3475,7 @@ impl TrackRepo {
                 &track.cue_media_path,
                 &track.cue_start_ms,
                 &track.cue_end_ms,
+                &track.rating,
             ];
             row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
         }
@@ -3640,6 +3639,7 @@ impl TrackRepo {
                 &track.musicbrainz_recording_id,
                 &track.comments,
                 &track.isrc,
+                &track.rating,
                 &id,
             ];
             row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
@@ -4217,6 +4217,7 @@ fn row_to_track(cols: &Vec<SqlValue>) -> Track {
         cue_media_path: cols.get(31).and_then(|v| v.as_string()),
         cue_start_ms: cols.get(32).and_then(|v| v.as_i64()),
         cue_end_ms: cols.get(33).and_then(|v| v.as_i64()),
+        rating: cols.get(34).and_then(|v| v.as_i64()).map(|n| n as i32),
     }
 }
 
@@ -6425,7 +6426,8 @@ mod tests {
     }
 
     /// Les deux moteurs partagent le même texte : l'ISRC y est la 25e valeur
-    /// liée, l'`id` la 26e — pour SQLite comme pour PostgreSQL.
+    /// liée, la note la 26e (#6123), l'`id` la 27e — pour SQLite comme pour
+    /// PostgreSQL.
     #[test]
     fn le_sql_de_mise_a_jour_porte_l_isrc_sur_les_deux_moteurs_5463() {
         fn verifier<D: SqlDialect>(d: &D) {
@@ -6433,8 +6435,14 @@ mod tests {
                 let isrc = format!("isrc = COALESCE(NULLIF({}, ''), isrc)", d.placeholder(25));
                 assert!(sql.contains(&isrc), "{isrc} absent : {sql}");
                 assert!(
-                    sql.ends_with(&format!("WHERE id = {}", d.placeholder(26))),
-                    "l'id doit être la 26e valeur : {sql}"
+                    sql.contains(&format!("rating = {}", d.placeholder(26)))
+                        || sql
+                            .contains(&format!("rating = COALESCE({}, rating)", d.placeholder(26))),
+                    "la note doit être la 26e valeur : {sql}"
+                );
+                assert!(
+                    sql.ends_with(&format!("WHERE id = {}", d.placeholder(27))),
+                    "l'id doit être la 27e valeur : {sql}"
                 );
             }
         }
@@ -6488,14 +6496,66 @@ mod tests {
             "ordre inversé : la valeur stockée serait figée pour toujours"
         );
         // Les paramètres restent à leur rang, dans les deux formes : 26
-        // depuis que `isrc` est écrit (#5463).
+        // depuis que `isrc` est écrit (#5463), 27 avec `rating` (#6123).
         for forme in [sql::update(&SqliteDialect), sql] {
             assert_eq!(
                 forme.matches('?').count(),
                 sql::NB_PARAMS_UPDATE,
-                "26 paramètres liés, ni plus ni moins : {forme}"
+                "27 paramètres liés, ni plus ni moins : {forme}"
             );
         }
+    }
+
+    /// #6123 — la note de la piste fait l'aller-retour par la base, et le
+    /// scan l'écrit telle que le fichier la dit, retrait compris ; une
+    /// écriture hors scan qui ne la connaît pas ne l'efface pas.
+    #[test]
+    fn la_note_de_la_piste_fait_l_aller_retour_6123() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let mut t = Track::new("Notée".into());
+        t.file_path = Some("/m/notee.flac".into());
+        t.rating = Some(4);
+        let id = repo.create(&t).unwrap();
+        let relue = |repo: &TrackRepo| repo.get(id).unwrap().unwrap().rating;
+        assert_eq!(
+            relue(&repo),
+            Some(4),
+            "la note n'est pas écrite à l'insertion"
+        );
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().to_json()["rating"],
+            serde_json::json!(4),
+            "la note n'est pas exposée dans le JSON de la piste"
+        );
+
+        // Écriture hors scan, ligne reconstruite sans note : gardée.
+        let mut sans = Track::new("Notée".into());
+        sans.id = Some(id);
+        sans.file_path = t.file_path.clone();
+        repo.update(&sans).unwrap();
+        assert_eq!(
+            relue(&repo),
+            Some(4),
+            "une écriture hors scan a effacé la note"
+        );
+
+        // Le scan : la balise change la note, puis son retrait la retire.
+        let mut scan = sans.clone();
+        scan.rating = Some(2);
+        repo.update_batch(std::slice::from_ref(&scan)).unwrap();
+        assert_eq!(
+            relue(&repo),
+            Some(2),
+            "le scan n'a pas écrit la nouvelle note"
+        );
+        scan.rating = None;
+        repo.update_batch(std::slice::from_ref(&scan)).unwrap();
+        assert_eq!(
+            relue(&repo),
+            None,
+            "le scan a gardé une note que le fichier ne porte plus"
+        );
     }
 
     /// La forme PostgreSQL est la même règle, avec ses `$n` dans l'ordre.
@@ -6529,7 +6589,12 @@ mod tests {
             sql.contains("isrc = COALESCE(NULLIF($25, ''), isrc)"),
             "{sql}"
         );
-        assert!(sql.ends_with("WHERE id = $26"), "{sql}");
+        // #6123 — le scan écrit la note telle que le fichier la dit.
+        assert!(
+            sql.contains("rating = $26,") || sql.contains("rating = $26 "),
+            "{sql}"
+        );
+        assert!(sql.ends_with("WHERE id = $27"), "{sql}");
     }
 }
 
@@ -6833,5 +6898,81 @@ pub(crate) mod tests_b209_ordre_dans_l_album {
         );
         assert_eq!(valeur(2, "track_number"), Some(1), "un vrai numéro reste");
         assert_eq!(valeur(1, "disc_number"), Some(1));
+    }
+}
+
+/// #2108 — l'opérateur « Et » entre les valeurs d'une même facette, sur la
+/// liste filtrée : compositeurs (facette « contient ») et genres (colonne OU
+/// tableau JSON, deux marqueurs par valeur).
+#[cfg(test)]
+mod tests_facettes_en_et_2108 {
+    use crate::db::facet_filter::TrackFilter;
+    use crate::db::models::Track;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    #[test]
+    fn les_valeurs_d_une_facette_se_combinent_en_et_sur_demande() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let repo = TrackRepo::new(db.clone());
+        let piste = |titre: &str, compositeur: &str, genre: &str, genres: &str| {
+            let mut t = Track::new(titre.into());
+            t.composer = Some(compositeur.into());
+            t.genre = Some(genre.into());
+            t.genres = Some(genres.into());
+            t.file_path = Some(format!("/m/{titre}.flac"));
+            repo.create(&t).unwrap()
+        };
+        piste(
+            "Deux",
+            "J.S. Bach; A. Vivaldi",
+            "Baroque",
+            r#"["Baroque","Concerto"]"#,
+        );
+        piste("Bach", "J.S. Bach", "Baroque", r#"["Baroque"]"#);
+        piste("Vivaldi", "A. Vivaldi", "Concerto", r#"["Concerto"]"#);
+
+        let titres = |f: TrackFilter| -> Vec<String> {
+            let (pistes, total) = repo.list_filtered(&f, 50, 0).unwrap();
+            let mut t: Vec<String> = pistes.into_iter().map(|p| p.title).collect();
+            t.sort();
+            assert_eq!(total as usize, t.len(), "le total suit la liste");
+            t
+        };
+        let compositeurs = vec!["Bach".to_string(), "Vivaldi".to_string()];
+        let genres = vec!["Baroque".to_string(), "Concerto".to_string()];
+
+        assert_eq!(
+            titres(TrackFilter {
+                composers: compositeurs.clone(),
+                ..Default::default()
+            }),
+            ["Bach", "Deux", "Vivaldi"],
+            "défaut : « Ou »"
+        );
+        assert_eq!(
+            titres(TrackFilter {
+                composers: compositeurs,
+                en_et: vec!["composer".into()],
+                ..Default::default()
+            }),
+            ["Deux"]
+        );
+        assert_eq!(
+            titres(TrackFilter {
+                genres: genres.clone(),
+                ..Default::default()
+            }),
+            ["Bach", "Deux", "Vivaldi"]
+        );
+        assert_eq!(
+            titres(TrackFilter {
+                genres,
+                en_et: vec!["genre".into()],
+                ..Default::default()
+            }),
+            ["Deux"]
+        );
     }
 }

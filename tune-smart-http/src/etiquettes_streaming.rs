@@ -78,7 +78,9 @@ fn condition(rule: &Value, profile_id: i64) -> String {
     let vals = source_streaming::valeurs(rule);
     let colonne = match champ {
         "source" => Some("sit.source"),
-        "artist" | "artist_name" => Some("sit.artist"),
+        // #6121 — la ligne est un ALBUM étiqueté : son artiste est l'artiste
+        // de l'album.
+        "artist" | "artist_name" | "album_artist" => Some("sit.artist"),
         "title" | "album" | "album_title" => Some("sit.title"),
         _ => None,
     };
@@ -363,6 +365,15 @@ mod tests {
             titres(
                 &b,
                 &avec(r#"{"field":"artist","op":"=","value":"artiste a"}"#),
+                "all"
+            ),
+            vec!["Sevy"]
+        );
+        // #6121 — la ligne est un ALBUM : son artiste est l'artiste de l'album.
+        assert_eq!(
+            titres(
+                &b,
+                &avec(r#"{"field":"album_artist","op":"=","value":"artiste a"}"#),
                 "all"
             ),
             vec!["Sevy"]

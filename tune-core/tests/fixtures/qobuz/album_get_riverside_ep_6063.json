@@ -1,0 +1,45 @@
+{
+ "_enregistrement": "API Qobuz publique, GET /api.json/0.2/album/get?album_id=5413356520279, 12/10/2026 (#6063). Reduite aux champs lus.",
+ "id": "5413356520279",
+ "title": "Riverside EP",
+ "version": null,
+ "tracks_count": 3,
+ "duration": 693,
+ "media_count": 1,
+ "release_type": "single",
+ "product_type": "single",
+ "release_tags": [],
+ "released_at": 1275170400,
+ "release_date_original": "2010-05-30",
+ "upc": "5413356520279",
+ "artist": {
+  "id": 551325,
+  "name": "Agnes Obel"
+ },
+ "label": {
+  "name": "Play It Again Sam"
+ },
+ "tracks": {
+  "total": 3,
+  "items": [
+   {
+    "id": 3158864,
+    "title": "Riverside",
+    "track_number": 1,
+    "duration": 257
+   },
+   {
+    "id": 3158865,
+    "title": "Close Watch",
+    "track_number": 2,
+    "duration": 241
+   },
+   {
+    "id": 3158866,
+    "title": "Sons and Daughters",
+    "track_number": 3,
+    "duration": 195
+   }
+  ]
+ }
+}

@@ -269,9 +269,14 @@ async fn delete_playlist(
 /// forme de `Track::to_json`, un titre de service sous celle d'une piste de
 /// streaming (`ServiceEntry::to_json` : `id` nul, `source`, `source_id`).
 ///
-/// Une ligne locale dont la piste a disparu de `tracks` est omise, comme
-/// l'omettait `get_multiple` avant #4889. Une erreur de base est RENDUE : elle
-/// ne se déguise pas en playlist vide (#2797).
+/// #6179 — une ligne dont la piste a quitté `tracks` n'est plus omise : elle
+/// est INTROUVABLE (`MissingEntry::to_json` : `id` nul, `missing` vrai,
+/// titre, artiste, album, durée et chemin de la piste disparue), à son rang.
+/// Le rang d'une ligne dans cette liste reste donc celui de `get_entries`,
+/// celui que `remove_track`, `reorder_tracks` et `start_index` désignent.
+/// Seule une ligne locale PENDANTE (base PostgreSQL basculée, sans clé
+/// étrangère, avant la réconciliation) est encore omise. Une erreur de base
+/// est RENDUE : elle ne se déguise pas en playlist vide (#2797).
 pub(crate) fn lignes_de_la_playlist(
     state: &AppState,
     playlist_id: i64,
@@ -290,6 +295,7 @@ pub(crate) fn lignes_de_la_playlist(
         .filter_map(|e| match &e.content {
             EntryContent::Local(tid) => pistes.get(tid).map(|t| t.to_json()),
             EntryContent::Service(s) => Some(s.to_json()),
+            EntryContent::Missing(m) => Some(m.to_json()),
         })
         .collect())
 }
@@ -592,6 +598,17 @@ fn lignes_a_exporter(state: &AppState, playlist_id: i64) -> Result<Vec<LigneExpo
                 duration_ms: s.duration_ms.unwrap_or(0),
                 file_path: None,
                 service: Some((s.source, s.source_id)),
+            }),
+            // #6179 — une piste introuvable s'exporte sous l'identité figée
+            // de sa piste : la liste exportée garde ce que l'utilisateur y a
+            // mis, et un lecteur qui ne trouve pas le fichier passe.
+            EntryContent::Missing(m) => Some(LigneExportee {
+                title: m.title.unwrap_or_default(),
+                artist: m.artist,
+                album: m.album,
+                duration_ms: m.duration_ms.unwrap_or(0),
+                file_path: m.file_path,
+                service: None,
             }),
         })
         .collect())
@@ -1724,6 +1741,9 @@ async fn diff_playlist_tracks(
                     .flatten()
                     .map(|t| (t.title, t.artist_name.unwrap_or_default())),
                 EntryContent::Service(s) => Some((s.title, s.artist.unwrap_or_default())),
+                EntryContent::Missing(m) => {
+                    Some((m.title.unwrap_or_default(), m.artist.unwrap_or_default()))
+                }
             })
             .collect()
     } else {

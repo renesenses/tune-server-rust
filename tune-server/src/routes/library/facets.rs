@@ -6,7 +6,7 @@ use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::backend::SqlValue;
 use tune_core::db::engine::Engine;
-use tune_core::db::facet_filter::{Placeholders, TrackFilter, any_of, favorite_condition};
+use tune_core::db::facet_filter::{Placeholders, TrackFilter};
 use tune_core::library::quality::{libelle_cadence, libelle_profondeur};
 
 use super::query_multi::track_filter_from_raw;
@@ -343,23 +343,25 @@ fn build_facet_conditions(
     // plusieurs genres cochés, les deux tests s'étendent ensemble ; les valeurs
     // sont empilées dans l'ordre de sortie des marqueurs (les N du `IN`, puis
     // les N motifs `LIKE`).
-    if exclude != "genre" && !sel.genres.is_empty() {
-        let n = sel.genres.len();
-        let in_part = ph.in_list_ci("t.genre", n).expect("liste non vide");
-        // ⚠️ `or_like_ci` des DEUX côtés, comme le `in_list_ci` juste au-dessus
-        // et comme les facettes sœurs (label, compositeur). Un `LIKE` nu est
-        // insensible à la casse en SQLite mais SENSIBLE en PostgreSQL : le
-        // même « JAZZ » dans `t.genres` était trouvé sur l'installation par
-        // défaut et perdu sur PostgreSQL, alors que la colonne `t.genre`, elle,
-        // était comparée sans la casse des deux côtés (#1821).
-        let like_part = ph.or_like_ci("t.genres", n).expect("liste non vide");
-        conds.push(format!("({in_part} OR {like_part})"));
-        for g in &sel.genres {
-            params.push(SqlValue::Text(g.clone()));
-        }
-        for g in &sel.genres {
-            params.push(SqlValue::Text(format!("%\"{g}\"%")));
-        }
+    //
+    // ⚠️ `or_like_ci` des DEUX côtés (`bloc_genres`) : un `LIKE` nu est
+    // insensible à la casse en SQLite mais SENSIBLE en PostgreSQL (#1821).
+    //
+    // #2108 : les facettes « combinables » passent par `combiner`, qui rend le
+    // SQL d'avant en « Ou » et un prédicat par valeur, joints par `AND`, en
+    // « Et ». Les blocs sont ceux de `TrackRepo::list_filtered`, écrits une
+    // fois dans `facet_filter`. L'effectif d'une valeur reste « combien de
+    // pistes si elle était seule cochée » : la facette ne se filtre pas
+    // elle-même, en « Et » comme en « Ou ».
+    use tune_core::db::facet_filter::{
+        bloc_contient, bloc_favoris, bloc_genres, bloc_instruments, bloc_listes, bloc_metadonnee,
+        bloc_sans_etiquette, combiner,
+    };
+    if exclude != "genre"
+        && let Some((c, p)) = combiner(&mut ph, &sel.genres, sel.est_en_et("genre"), bloc_genres)
+    {
+        conds.push(c);
+        params.extend(p);
     }
     if exclude != "year"
         && let Some(c) = ph.in_list("t.year", sel.years.len())
@@ -402,33 +404,42 @@ fn build_facet_conditions(
         }
     }
     if exclude != "label"
-        && let Some(c) = ph.or_like_ci("t.label", sel.labels.len())
+        && let Some((c, p)) = combiner(
+            &mut ph,
+            &sel.labels,
+            sel.est_en_et("label"),
+            bloc_contient("t.label"),
+        )
     {
         conds.push(c);
-        for v in &sel.labels {
-            params.push(SqlValue::Text(format!("%{v}%")));
-        }
+        params.extend(p);
     }
     // `composer` est une facette à part entière : comme les autres, elle ne
     // doit pas se filtrer elle-même, sinon sélectionner « Bach » ne laisserait
     // plus que « Bach » dans la liste des compositeurs.
     if exclude != "composer"
-        && let Some(c) = ph.or_like_ci("t.composer", sel.composers.len())
+        && let Some((c, p)) = combiner(
+            &mut ph,
+            &sel.composers,
+            sel.est_en_et("composer"),
+            bloc_contient("t.composer"),
+        )
     {
         conds.push(c);
-        for v in &sel.composers {
-            params.push(SqlValue::Text(format!("%{v}%")));
-        }
+        params.extend(p);
     }
     // CRD-6 : « instrument » est une facette à part entière — elle ne se filtre
     // pas elle-même — et vient des crédits, pas d'une colonne de `tracks`.
     if exclude != "instrument"
-        && let Some(c) = ph.in_list_ci("tc.instrument", sel.instruments.len())
+        && let Some((c, p)) = combiner(
+            &mut ph,
+            &sel.instruments,
+            sel.est_en_et("instrument"),
+            bloc_instruments(engine),
+        )
     {
-        conds.push(tune_core::db::facet_filter::instrument_exists(engine, &c));
-        for v in &sel.instruments {
-            params.push(SqlValue::Text(v.clone()));
-        }
+        conds.push(c);
+        params.extend(p);
     }
     if exclude != "artist" {
         // `tracks` has no artist_name column (artist is a FK to `artists`), and
@@ -443,22 +454,18 @@ fn build_facet_conditions(
     }
     // Extended-tag filters via the open `track_metadata` k/v store. `source`
     // facet == source_media key. Key is a fixed literal; values are bound.
-    for (values, key, own) in [
-        (&sel.countries, "release_country", "country"),
-        (&sel.moods, "mood", "mood"),
-        (&sel.source_medias, "source_media", "source"),
+    for (values, key, own, param) in [
+        (&sel.countries, "release_country", "country", "country"),
+        (&sel.moods, "mood", "mood", "mood"),
+        (&sel.source_medias, "source_media", "source", "source_media"),
     ] {
         if exclude == own {
             continue;
         }
-        if let Some(c) = ph.in_list("tm.value", values.len()) {
-            conds.push(format!(
-                "EXISTS (SELECT 1 FROM track_metadata tm \
-                 WHERE tm.track_id = t.id AND tm.key = '{key}' AND {c})"
-            ));
-            for v in values {
-                params.push(SqlValue::Text(v.clone()));
-            }
+        if let Some((c, p)) = combiner(&mut ph, values, sel.est_en_et(param), bloc_metadonnee(key))
+        {
+            conds.push(c);
+            params.extend(p);
         }
     }
     // Folder selection (Oxygen drill-down) narrows every facet's counts. The
@@ -557,38 +564,34 @@ fn build_facet_conditions(
     if exclude != "favorite" {
         // Vocabulaire FERMÉ : une valeur inconnue ne filtre RIEN plutôt que
         // de tout exclure — ou, pire, de tout laisser passer.
-        if let Some(c) = any_of(
-            sel.favorites
-                .iter()
-                .filter_map(|k| favorite_condition(k))
-                .map(str::to_string)
-                .collect(),
+        if let Some((c, _)) = combiner(
+            &mut ph,
+            &sel.favorites,
+            sel.est_en_et("favorite"),
+            bloc_favoris,
         ) {
             conds.push(c);
         }
     }
     if exclude != "playlist"
-        && let Some(c) = ph.in_list_ci("pl.name", sel.playlists.len())
+        && let Some((c, p)) = combiner(
+            &mut ph,
+            &sel.playlists,
+            sel.est_en_et("playlist"),
+            bloc_listes,
+        )
     {
-        conds.push(format!(
-            "EXISTS (SELECT 1 FROM playlist_tracks pt JOIN playlists pl ON pl.id = pt.playlist_id \
-                 WHERE pt.track_id = t.id AND {c})"
-        ));
-        for v in &sel.playlists {
-            params.push(SqlValue::Text(v.clone()));
-        }
+        conds.push(c);
+        params.extend(p);
     }
     if exclude != "untagged" {
         // Champs choisis dans une liste FERMÉE : le SQL formaté ci-dessous ne
         // dépend jamais de l'entrée brute.
-        if let Some(c) = any_of(
-            sel.untagged
-                .iter()
-                .filter_map(|f| {
-                    tune_core::db::facet_filter::untagged_condition_for_engine(f, engine)
-                })
-                .map(str::to_string)
-                .collect(),
+        if let Some((c, _)) = combiner(
+            &mut ph,
+            &sel.untagged,
+            sel.est_en_et("untagged"),
+            bloc_sans_etiquette(engine),
         ) {
             conds.push(c);
         }
@@ -1621,6 +1624,10 @@ fn kv_facet(
 #[cfg(test)]
 #[path = "facets_socle_5977_tests.rs"]
 mod socle_5977_tests;
+
+#[cfg(test)]
+#[path = "facettes_et_2108_tests.rs"]
+mod facettes_et_2108_tests;
 
 #[cfg(test)]
 mod tests {

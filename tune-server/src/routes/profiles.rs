@@ -163,6 +163,12 @@ pub fn router() -> Router<AppState> {
         .route("/active", get(get_active_profile))
         .route("/current", get(get_active_profile))
         .route("/switch", post(switch_profile))
+        // #5916 — le dernier profil choisi, par appareil (fil 2168).
+        .route(
+            "/dernier-choisi",
+            get(crate::routes::profil_par_appareil::lire)
+                .put(crate::routes::profil_par_appareil::retenir),
+        )
         .route("/deactivate", post(deactivate_profile))
         .route("/search", get(search_profiles))
         .route(

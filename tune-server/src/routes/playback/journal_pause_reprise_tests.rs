@@ -13,6 +13,9 @@ const PLAYBACK: &str = include_str!("../playback.rs");
 const RENDERER: &str = include_str!("../upnp_media_renderer.rs");
 const GREFFONS: &str = include_str!("../../plugins_host.rs");
 const ASSISTANT: &str = include_str!("../../../../tune-core/src/ai/executor.rs");
+/// #5050 — la pause d'un transfert vit dans l'orchestrateur depuis le fil 2236.
+const TRANSFERT: &str =
+    include_str!("../../../../tune-core/src/orchestrator/transfert_en_pause_5050.rs");
 
 /// Le corps qui suit `debut`, jusqu'au prochain `fn ` de même niveau.
 fn corps<'a>(source: &'a str, debut: &str) -> &'a str {
@@ -55,7 +58,7 @@ fn chaque_pause_et_chaque_reprise_laissent_une_ligne_info() {
         "resume_requested",
         "route resume",
     );
-    let transfert = corps(PLAYBACK, "if source_paused {");
+    let transfert = corps(TRANSFERT, "if source_en_pause {");
     let transfert = &transfert[..transfert.find("Err(e) =>").unwrap_or(transfert.len())];
     exige(
         transfert,

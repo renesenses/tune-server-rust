@@ -1513,6 +1513,59 @@ impl QobuzService {
         }
     }
 
+    /// #6063 — le type de sortie d'un album Qobuz : celui que Qobuz annonce
+    /// (`release_type`), corrigé par le titre et la règle des pistes quand
+    /// Qobuz dit « album » ou ne dit rien
+    /// ([`crate::metadata::release_type::type_d_album_de_service`]).
+    ///
+    /// Les pistes : `tracks_count` et `duration` (secondes), présents dans
+    /// `album/get` comme dans les listes. La piste la plus longue n'est
+    /// connue que si la réponse porte `tracks.items` (`album/get`) ; dans une
+    /// liste, on prend la durée MOYENNE, qui en est un minorant : une piste
+    /// de plus de 10 min cachée dans un disque court y échappe (limite dite).
+    fn type_de_sortie(
+        item: &serde_json::Value,
+    ) -> Option<crate::metadata::release_type::TypeDeSortie> {
+        use crate::metadata::release_type::{
+            PistesDuDisque, depuis_service, type_d_album_de_service,
+        };
+        // Le champ que Qobuz rend pour SON classement (relevé le 12/10/2026 sur
+        // « Riverside EP » : `release_type: "single"`, `product_type:
+        // "single"`, dans `album/get` seulement). `epmini` est le mot de
+        // Qobuz pour un EP court ; `product_type` sert quand `release_type`
+        // manque.
+        let annonce = ["release_type", "product_type"].iter().find_map(|cle| {
+            let brut = item[*cle].as_str()?;
+            if brut.eq_ignore_ascii_case("epmini") {
+                return Some(crate::metadata::release_type::TypeDeSortie::Ep);
+            }
+            depuis_service(brut)
+        });
+        let nombre = item["tracks_count"].as_u64().unwrap_or(0);
+        let duree_ms = item["duration"].as_u64().unwrap_or(0) * 1000;
+        let pistes = (nombre > 0 && duree_ms > 0).then(|| {
+            let plus_longue = item["tracks"]["items"]
+                .as_array()
+                .filter(|items| !items.is_empty())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|t| t["duration"].as_u64())
+                        .max()
+                        .unwrap_or(0)
+                        * 1000
+                })
+                .unwrap_or(duree_ms / nombre);
+            PistesDuDisque {
+                nombre: u32::try_from(nombre).unwrap_or(u32::MAX),
+                duree_totale_ms: duree_ms,
+                durees_inconnues: 0,
+                piste_la_plus_longue_ms: plus_longue,
+            }
+        });
+        type_d_album_de_service(annonce, item["title"].as_str().unwrap_or(""), pistes)
+    }
+
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
             // #4767 — le type que QOBUZ annonce pour SON album. C'est lui
@@ -1521,10 +1574,12 @@ impl QobuzService {
             // vocabulaire (`compilation`, `epMini`…) reste inconnu plutôt que
             // replié sur `album` — un tri faux est pire qu'une section
             // absente.
-            release_type: item["release_type"]
-                .as_str()
-                .and_then(crate::metadata::release_type::depuis_service)
-                .map(|t| t.as_str().to_string()),
+            //
+            // #6063 — mais un « album » annoncé, ou l'absence de type (la
+            // liste `artist/get?extra=albums` n'en porte AUCUN), laisse le
+            // titre et la règle des pistes parler : voir
+            // `type_d_album_de_service`.
+            release_type: Self::type_de_sortie(item).map(|t| t.as_str().to_string()),
             id: item["id"]
                 .as_str()
                 .map(Into::into)
@@ -1846,6 +1901,52 @@ impl QobuzService {
             .map(Into::into)
     }
 
+    /// Les playlists de `/playlist/getUserPlaylists`, avec leur propriétaire
+    /// et le drapeau `editable` (renesenses/tune-web-client#2097).
+    ///
+    /// Qobuz y mélange les playlists de l'utilisateur et celles qu'il SUIT
+    /// (éditoriales ou d'autres comptes). Chaque élément porte son
+    /// `owner.id`, et la réponse porte l'utilisateur en tête (`user.id`) :
+    /// une playlist est modifiable quand les deux concordent. Si l'un des deux
+    /// manque, on ne conclut rien (`None`) plutôt que d'inventer un refus.
+    ///
+    /// Fonction pure, pour être mise sous garde sans serveur simulé.
+    pub(crate) fn map_user_playlists(data: &serde_json::Value) -> Vec<StreamPlaylist> {
+        let id_de = |v: &serde_json::Value| -> Option<String> {
+            match v {
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                _ => None,
+            }
+        };
+        let moi = id_de(&data["user"]["id"]);
+        data["playlists"]["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let proprietaire = id_de(&item["owner"]["id"]);
+                        let editable = match (&moi, &proprietaire) {
+                            (Some(moi), Some(p)) => Some(moi == p),
+                            _ => None,
+                        };
+                        StreamPlaylist {
+                            id: item["id"].as_u64().unwrap_or(0).to_string(),
+                            name: item["name"].as_str().unwrap_or("").into(),
+                            description: item["description"].as_str().map(Into::into),
+                            cover_path: Self::pochette_playlist(item),
+                            track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
+                            owner: item["owner"]["name"].as_str().map(Into::into),
+                            editable,
+                            covers: Self::pochettes_mosaique(item),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Map a Qobuz playlist item (editorial selection or search hit) to
     /// StreamPlaylist.
     fn map_featured_playlist(item: &serde_json::Value) -> StreamPlaylist {
@@ -1860,6 +1961,7 @@ impl QobuzService {
             cover_path: Self::pochette_playlist(item),
             track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
             owner: item["owner"]["name"].as_str().map(Into::into),
+            editable: None,
             covers: Self::pochettes_mosaique(item),
         }
     }
@@ -2511,6 +2613,7 @@ impl StreamingService for QobuzService {
             cover_path: Self::pochette_playlist(&data),
             track_count: data["tracks_count"].as_u64().unwrap_or(0) as u32,
             owner: data["owner"]["name"].as_str().map(Into::into),
+            editable: None,
             covers: Self::pochettes_mosaique(&data),
         })
     }
@@ -3076,24 +3179,7 @@ impl StreamingService for QobuzService {
         let data = self
             .detail_pagine("/playlist/getUserPlaylists", &[], "playlists")
             .await?;
-        let playlists = data["playlists"]["items"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| StreamPlaylist {
-                        id: item["id"].as_u64().unwrap_or(0).to_string(),
-                        name: item["name"].as_str().unwrap_or("").into(),
-                        description: item["description"].as_str().map(Into::into),
-                        cover_path: Self::pochette_playlist(item),
-                        track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
-                        owner: None,
-                        covers: Self::pochettes_mosaique(item),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(playlists)
+        Ok(Self::map_user_playlists(&data))
     }
 
     async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
@@ -4200,6 +4286,115 @@ mod tests {
             "tracks",
         );
         assert!(sans.get("album_ai_generated").is_none(), "{sans}");
+    }
+
+    /// #6063 — « Riverside EP » d'Agnes Obel (exemple de FabienM, fil 2236).
+    /// Réponses de l'API Qobuz publique enregistrées le 12/10/2026, réduites
+    /// aux champs lus : `artist/get?artist_id=…&extra=albums` (la liste de la
+    /// discographie : AUCUN `release_type`) et `album/get?album_id=…`
+    /// (`release_type: "single"`).
+    ///
+    /// Contre-épreuve : rendre à `map_album` le seul `depuis_service` fait
+    /// tomber `riverside_ep_de_la_discographie_qobuz_est_un_ep` (`None`).
+    const RIVERSIDE_LISTE: &str =
+        include_str!("../../tests/fixtures/qobuz/artist_get_albums_agnes_obel_6063.json");
+    const RIVERSIDE_ALBUM_GET: &str =
+        include_str!("../../tests/fixtures/qobuz/album_get_riverside_ep_6063.json");
+
+    fn riverside_dans_la_liste() -> serde_json::Value {
+        let liste: serde_json::Value = serde_json::from_str(RIVERSIDE_LISTE).unwrap();
+        liste["albums"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["title"] == "Riverside EP")
+            .cloned()
+            .expect("Riverside EP est dans la discographie enregistrée")
+    }
+
+    #[test]
+    fn riverside_ep_de_la_discographie_qobuz_est_un_ep() {
+        let brut = riverside_dans_la_liste();
+        assert!(
+            brut.get("release_type").is_none(),
+            "prémisse : la liste ne porte aucun type"
+        );
+        let album = QobuzService::map_album(&brut);
+        assert_eq!(album.release_type.as_deref(), Some("ep"));
+    }
+
+    #[test]
+    fn riverside_ep_garde_le_single_annonce_par_album_get() {
+        let brut: serde_json::Value = serde_json::from_str(RIVERSIDE_ALBUM_GET).unwrap();
+        assert_eq!(
+            brut["release_type"], "single",
+            "prémisse : ce que Qobuz rend"
+        );
+        assert_eq!(
+            brut["product_type"], "single",
+            "prémisse : ce que Qobuz rend"
+        );
+        let album = QobuzService::map_album(&brut);
+        assert_eq!(
+            album.release_type.as_deref(),
+            Some("single"),
+            "le single du service est gardé"
+        );
+    }
+
+    /// La même réponse, annoncée « album » : la règle l'emporte (variante
+    /// construite à partir de l'enregistrement, Qobuz ne la sert pas pour ce
+    /// disque).
+    #[test]
+    fn un_ep_annonce_album_par_qobuz_reste_un_ep() {
+        let mut brut: serde_json::Value = serde_json::from_str(RIVERSIDE_ALBUM_GET).unwrap();
+        brut["release_type"] = json!("album");
+        assert_eq!(
+            QobuzService::map_album(&brut).release_type.as_deref(),
+            Some("ep")
+        );
+        brut["title"] = json!("Riverside");
+        assert_eq!(
+            QobuzService::map_album(&brut).release_type.as_deref(),
+            Some("single"),
+            "3 titres, 11 min 33 : la règle de #5616"
+        );
+    }
+
+    /// Le classement de Qobuz est lu là où il est : `release_type`, à défaut
+    /// `product_type`, et `epmini` (le mot de Qobuz pour un EP) donne un EP.
+    #[test]
+    fn le_classement_de_qobuz_est_lu_dans_release_type_puis_product_type() {
+        let mut brut: serde_json::Value = serde_json::from_str(RIVERSIDE_ALBUM_GET).unwrap();
+        brut.as_object_mut().unwrap().remove("release_type");
+        assert_eq!(
+            QobuzService::map_album(&brut).release_type.as_deref(),
+            Some("single"),
+            "product_type seul"
+        );
+        brut["release_type"] = json!("epmini");
+        brut["title"] = json!("Riverside");
+        assert_eq!(
+            QobuzService::map_album(&brut).release_type.as_deref(),
+            Some("ep")
+        );
+    }
+
+    /// Les vrais albums de la discographie enregistrée ne bougent pas : rien
+    /// n'est inventé pour eux.
+    #[test]
+    fn les_albums_de_la_discographie_enregistree_restent_sans_type() {
+        let liste: serde_json::Value = serde_json::from_str(RIVERSIDE_LISTE).unwrap();
+        for titre in ["Aventine", "Philharmonics", "Citizen of Glass", "Myopia"] {
+            let brut = liste["albums"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["title"] == titre && a["tracks_count"].as_u64() > Some(6))
+                .cloned()
+                .unwrap_or_else(|| panic!("{titre} absent de l'enregistrement"));
+            assert_eq!(QobuzService::map_album(&brut).release_type, None, "{titre}");
+        }
     }
 
     #[test]
@@ -7272,5 +7467,56 @@ mod tests_favoris_en_vol {
             svc.favoris_en_vol.lock().unwrap().is_empty(),
             "aucun vol ne survit à sa requête"
         );
+    }
+}
+
+/// renesenses/tune-web-client#2097 — `/playlist/getUserPlaylists` mélange les
+/// playlists de l'utilisateur et celles qu'il suit ; seules les premières
+/// acceptent un ajout (Qobuz refuse les autres en 401).
+#[cfg(test)]
+mod tests_playlists_proprietaire_2097 {
+    use super::*;
+    use serde_json::json;
+
+    fn reponse() -> serde_json::Value {
+        json!({
+            "user": {"id": 1234, "login": "fabien"},
+            "playlists": {"offset": 0, "limit": 500, "total": 3, "items": [
+                {"id": 11, "name": "Ma playlist", "tracks_count": 3,
+                 "owner": {"id": 1234, "name": "fabien"}},
+                {"id": 22, "name": "Qobuz : Jazz Essentials", "tracks_count": 40,
+                 "owner": {"id": 2, "name": "Qobuz"}},
+                {"id": 33, "name": "Sans propriétaire", "tracks_count": 1}
+            ]}
+        })
+    }
+
+    #[test]
+    fn la_playlist_de_l_utilisateur_est_modifiable_celle_qu_il_suit_non() {
+        let pl = QobuzService::map_user_playlists(&reponse());
+        assert_eq!(pl.len(), 3);
+        assert_eq!(pl[0].editable, Some(true));
+        assert_eq!(pl[0].owner.as_deref(), Some("fabien"));
+        assert_eq!(pl[1].editable, Some(false));
+        assert_eq!(pl[1].owner.as_deref(), Some("Qobuz"));
+    }
+
+    #[test]
+    fn sans_proprietaire_ou_sans_utilisateur_on_ne_conclut_rien() {
+        let pl = QobuzService::map_user_playlists(&reponse());
+        assert_eq!(pl[2].editable, None);
+        let mut sans_user = reponse();
+        sans_user.as_object_mut().unwrap().remove("user");
+        let pl = QobuzService::map_user_playlists(&sans_user);
+        assert!(pl.iter().all(|p| p.editable.is_none()));
+    }
+
+    #[test]
+    fn le_drapeau_voyage_dans_le_json_et_disparait_quand_inconnu() {
+        let pl = QobuzService::map_user_playlists(&reponse());
+        let v = serde_json::to_value(&pl).unwrap();
+        assert_eq!(v[0]["editable"], json!(true));
+        assert_eq!(v[1]["editable"], json!(false));
+        assert!(v[2].get("editable").is_none());
     }
 }

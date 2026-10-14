@@ -8,8 +8,12 @@ pub mod airplay2;
 pub mod asio_blocage_4556;
 #[cfg(all(target_os = "windows", feature = "asio"))]
 pub mod asio_exclusive;
+// #6133 — silence ASIO avant libération ; sans Windows+asio, seul le banc s'en sert.
 pub mod bluos;
 pub mod bridge;
+/// #6171 — les canaux de la carte qu'une zone ASIO utilise. Hors `cfg` : la
+/// route HTTP le lit partout, la correspondance se teste sous Linux.
+pub mod canaux_de_carte_6171;
 #[cfg(test)]
 mod capabilities_test;
 /// #5643 — les cadences DSD natives déclarées par chaque pilote ASIO, sondées
@@ -23,6 +27,8 @@ pub mod dlna;
 pub mod dlna_annonce_suivante;
 pub mod dlna_buffer_stats;
 pub(crate) mod dlna_contact;
+/// #6059 — position d'un flux natif relancé au milieu de la piste.
+pub mod dlna_depart_natif;
 pub(crate) mod dlna_journal_volume;
 pub mod dlna_profil_volume;
 /// Repli conservateur sur un refus de `SetAVTransportURI` (501/714/716),
@@ -32,6 +38,8 @@ pub mod dlna_repli_set_uri;
 mod dlna_repli_set_uri_tests;
 #[cfg(test)]
 mod dlna_test;
+#[cfg(test)]
+mod dlna_volume_apres_uri_tests_6008;
 pub mod hqplayer;
 pub mod identite_de_sortie;
 #[cfg(feature = "local-audio")]
@@ -70,6 +78,8 @@ pub(crate) mod reveil_en_retard_4357;
 pub(crate) mod reveil_rendu_4357;
 /// #3326 — enceinte Sendspin `player@v1` : Tune pousse l'audio horodaté.
 pub mod sendspin;
+#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
+pub(crate) mod silence_avant_liberation_6133;
 pub mod slimproto;
 pub mod squeezebox;
 /// #3967 — ce que le protocole permet de VÉRIFIER d'une suivante préparée,

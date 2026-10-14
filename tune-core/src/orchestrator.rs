@@ -1185,6 +1185,11 @@ pub struct PlaybackOrchestrator {
     /// niveaux de la piste suivante démarrent à l'avance gapless, voir
     /// [`Self::advance_queue_metadata`]. Verrou std : accès courts.
     levels_prewarm: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #5050 (fil 2236) — zones posées en pause par un transfert, sans que
+    /// rien n'ait été envoyé à leur appareil : leur reprise rétablit la piste
+    /// à la position (voir `transfert_en_pause_5050`). Verrou std : accès
+    /// courts.
+    transferts_en_pause: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// Anti-rebond du redémarrage de flux déclenché par un changement
     /// d'égaliseur sur un chemin NON local (#1710, lot 2).
     ///
@@ -1555,6 +1560,50 @@ impl StreamingDsp {
         self.compensation.as_ref().map(|c| c.cible_db())
     }
 
+    /// #6130 — la chaîne telle que le journal de conversion la décrit, dans
+    /// l'ordre de [`Self::process`] : chaque étage avec la fréquence à
+    /// laquelle il a été PRÉPARÉ, puis l'entrée et la sortie du flux qu'il
+    /// traite. Aucun étage ne rééchantillonne : entrée et sortie valent la
+    /// cadence du porteur, et un étage préparé à une autre cadence que celle
+    /// du flux se lit donc d'un coup d'œil. Diagnostic seulement.
+    fn decrire(&self) -> String {
+        let flux = self.sample_rate;
+        let mut etages: Vec<String> = Vec::new();
+        if let Some(f) = self.replaygain {
+            etages.push(format!("replaygain:x{f:.4}@{flux}"));
+        }
+        if let Some(eq) = self.eq.as_ref() {
+            etages.push(eq.decrire());
+        }
+        if self.convolver.is_some() {
+            etages.push(format!("convolveur@{flux}"));
+        }
+        if let Some(cf) = self.crossfeed.as_ref() {
+            let inerte = if self.channels == 2 { "" } else { "(inerte)" };
+            etages.extend(cf.decrire().into_iter().map(|e| format!("{e}{inerte}")));
+        }
+        if let Some(c) = self.compensation.as_ref() {
+            etages.push(format!("compensation:{:+.2}dB@{flux}", c.cible_db()));
+        }
+        if etages.is_empty() {
+            return format!("aucun_etage canaux={}", self.channels);
+        }
+        let etages: Vec<String> = etages
+            .into_iter()
+            .map(|e| format!("{e}[{flux}->{flux}]"))
+            .collect();
+        format!(
+            "{} canaux={}{}",
+            etages.join(" > "),
+            self.channels,
+            if self.en_vol.is_some() {
+                " releve_en_vol"
+            } else {
+                ""
+            }
+        )
+    }
+
     /// Applique les trois étages EN PLACE.
     ///
     /// Sans étage actif, `pcm` n'est pas touché d'un octet : c'est le témoin
@@ -1654,6 +1703,7 @@ impl PlaybackOrchestrator {
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
             dlna_canaux_max: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashSet::new()),
+            transferts_en_pause: std::sync::Mutex::new(std::collections::HashSet::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
             traitement_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1741,6 +1791,10 @@ mod transport;
 mod repli_de_peripherique;
 
 mod resolve_stream;
+// #6130 — quitter une radio sur une sortie DLNA : Stop, puis attendre le renderer.
+mod sortie_de_radio_dlna_6130;
+// #6130 — le contexte d'un flux de conversion, pour son journal.
+mod contexte_de_conversion_6130;
 // #4366 — 403 YouTube : rafraîchir yt-dlp, puis une seule relance.
 mod relance_ytdlp_4366;
 // Lot L3b (rc3) — un `Seek` refusé par un renderer DLNA (701/710/711).
@@ -1748,12 +1802,20 @@ mod relance_ytdlp_4366;
 mod seek_refuse_par_le_renderer;
 
 mod resolve_local;
+// #6059 — Seek ignoré par le renderer : le flux natif relancé à la position.
+pub(crate) mod seek_natif_6059;
+#[cfg(test)]
+mod seek_natif_6059_bout_en_bout;
 
 // #2742 — le crossfeed des pistes de la bibliothèque sur une zone réseau.
 mod crossfeed_bibliotheque_reseau;
 // #5071 — témoins de bout en bout de la compensation de niveau réseau.
 #[cfg(test)]
 mod compensation_reseau_5071_tests;
+
+// #4354 — repli à 176,4 kHz d'un DSD décimé qui manque son pré-tampon.
+#[cfg(test)]
+mod repli_dsd_4354_tests;
 
 // #5871 — la préparation DSP ne fait plus la queue derrière l'écrivain.
 #[cfg(test)]
@@ -1952,6 +2014,10 @@ mod dsd_upnp_politique_de_zone_tests;
 #[cfg(test)]
 mod double_dsp_dsf_aac_sortie_locale_tests;
 
+/// #6221 — un DST vers un renderer qui annonce le DSD part en DSF natif
+/// fabriqué à la volée ; sans DSD annoncé, en PCM comme avant.
+#[cfg(test)]
+mod dst_en_dsf_6221_tests;
 /// #4378 — un DSDIFF compressé DST ne part jamais brut vers un renderer
 /// réseau, même en DSD « natif » : il passe par le décodeur.
 #[cfg(test)]
@@ -2086,6 +2152,10 @@ mod reprise_dlna_position_2095;
 /// ait ouvert le flux.
 #[cfg(test)]
 mod reprise_renderer_cale_2125;
+/// #6062 — fil 2199 : une sortie qui a perdu sa session pendant la pause
+/// (Chromecast) refuse la reprise ; la lecture est rétablie à la position.
+#[cfg(test)]
+mod reprise_session_perdue_par_la_sortie_6062;
 /// #6017 — fil 2194 : avancer dans une piste de la bibliothèque convertie à
 /// la volée recrée le flux à la position au lieu d'un `Seek` SOAP refusé.
 #[cfg(test)]
@@ -2098,6 +2168,13 @@ mod seek_de_reprise_caduc_5476;
 /// renderer qui n'est pas à la position de la pause.
 #[cfg(test)]
 mod seek_de_reprise_conditionnel_5050;
+// #5050 (fil 2236) — transfert depuis une zone en pause : la cible est posée
+// en pause sans rien recevoir.
+/// #6130 — quitter une radio sur une sortie DLNA : `Stop`, attente du départ
+/// du consommateur radio, puis `SetAVTransportURI`.
+#[cfg(test)]
+mod sortie_de_radio_dlna_6130_tests;
+mod transfert_en_pause_5050;
 
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).

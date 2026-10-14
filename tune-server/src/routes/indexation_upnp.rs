@@ -781,8 +781,37 @@ async fn ecrire_avec_pochettes(
         pistes.iter().filter_map(|p| p.pochette.clone()),
     )
     .await;
-    ecrire(state, udn, nom, pistes, bilan, &pochettes);
-    pochettes.len()
+    let nb_pochettes = pochettes.len();
+    // #5677 — `ecrire` est une boucle SYNCHRONE de lectures et d'écritures
+    // SQLite, plusieurs par piste. La synchronisation horaire la repasse sur
+    // toutes les pistes de la source. Appelée ici directement, elle tenait un
+    // fil de l'exécuteur pendant toute la passe (5,2 s de battement arrêté
+    // pour 2 000 pistes sur Shrek, en build de test) : plus de chien de garde,
+    // plus de flux interne pour la sortie locale. Elle part donc sur un fil
+    // de `spawn_blocking`, comme les autres écritures de la synchronisation
+    // (`synchronisation_upnp::hors_executeur`).
+    let (etat, udn, nom) = (state.clone(), udn.to_string(), nom.to_string());
+    let pistes = pistes.to_vec();
+    let mut bilan_de_la_passe = std::mem::take(bilan);
+    let ecriture = tokio::task::spawn_blocking(move || {
+        ecrire(
+            &etat,
+            &udn,
+            &nom,
+            &pistes,
+            &mut bilan_de_la_passe,
+            &pochettes,
+        );
+        bilan_de_la_passe
+    })
+    .await;
+    match ecriture {
+        Ok(rendu) => *bilan = rendu,
+        Err(e) => bilan
+            .erreurs
+            .push(format!("écriture de la passe interrompue : {e}")),
+    }
+    nb_pochettes
 }
 
 /// Écrit l'instantané. **Aucun `DELETE`.**

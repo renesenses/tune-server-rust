@@ -177,10 +177,13 @@ async fn un_album_qui_avance_pose_quatre_commandes_lisibles_sur_une_connexion() 
          file ne peut pas aboutir (#4023). Compté {declarations} :\n{sur_le_fil}"
     );
 
-    // Les deux pistes, dans l'ordre, chacune suivie de son Play.
+    // Les deux pistes, dans l'ordre, chacune précédée de son `PlaylistClear`
+    // (#6115 : `clear="1"` ignoré par le moteur 6.0.4) et suivie de son Play.
     let attendu = format!(
-        "<PlaylistAdd uri=\"{PISTE_1}\" queued=\"0\" clear=\"1\"></PlaylistAdd>\n\
+        "<PlaylistClear />\n\
+         <PlaylistAdd uri=\"{PISTE_1}\" queued=\"0\" clear=\"1\"></PlaylistAdd>\n\
          <Play />\n\
+         <PlaylistClear />\n\
          <PlaylistAdd uri=\"{PISTE_2}\" queued=\"0\" clear=\"1\"></PlaylistAdd>\n\
          <Play />\n"
     );

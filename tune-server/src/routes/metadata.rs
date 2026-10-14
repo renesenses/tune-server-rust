@@ -584,11 +584,33 @@ pub(crate) async fn edit_track(
     if let Some(ref v) = body.title {
         track.title = v.clone();
     }
-    if let Some(ref v) = body.artist {
-        track.artist_name = Some(v.clone());
-    }
-    if let Some(ref v) = body.album {
-        track.album_title = Some(v.clone());
+    // #6245 — un artiste donné par son NOM passe par le chemin de
+    // `batch_set_artist` : l'artiste de ce nom, ou un nouveau, puis son
+    // `artist_id`. Ranger le nom dans `track.artist_name` ne l'enregistrait
+    // pas (`tracks` n'a pas cette colonne) ; et la tenue, posée plus bas,
+    // figeait alors l'ANCIEN `artist_id`, qu'aucun rescan ne défaisait.
+    // Un `artist_id` envoyé avec le nom l'emporte (bloc suivant). Un nom vide
+    // ne change pas l'artiste.
+    let nom_artiste = body
+        .artist
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && body.artist_id.is_none());
+    if let Some(nom) = nom_artiste {
+        match artiste_par_nom(&state.backend, nom) {
+            Ok((artiste, aid, _)) => {
+                track.artist_id = Some(aid);
+                track.artist_name = Some(artiste.name);
+            }
+            Err(e) => {
+                tracing::warn!(track_id = id, error = %e, "edit_track_artiste_par_nom");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Artiste « {nom} » impossible à enregistrer : {e}"),
+                )
+                    .into_response();
+            }
+        }
     }
     // #2574 — même geste que pour `album_id` juste en dessous : on rattache, et
     // on rafraîchit le nom porté par la piste pour que l'écran qui la relit
@@ -618,6 +640,33 @@ pub(crate) async fn edit_track(
         track.album_id = Some(aid);
         if let Ok(Some(album)) = AlbumRepo::with_backend(state.backend.clone()).get(aid) {
             track.album_title = Some(album.title);
+        }
+    }
+    // #6270 — un album donné par son TITRE, même chemin que l'artiste
+    // (#6245) : l'album de ce titre chez le même artiste, sinon un nouveau,
+    // puis son `album_id`. Ranger le titre dans `track.album_title` ne
+    // l'enregistrait pas (`tracks` n'a pas cette colonne), et la tenue figeait
+    // l'ANCIEN `album_id`. Un `album_id` envoyé l'emporte ; un titre vide ne
+    // change pas l'album.
+    let titre_album = body
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && body.album_id.is_none());
+    if let Some(titre) = titre_album {
+        match album_par_titre(&state.backend, titre, &track) {
+            Ok((album, alid, _)) => {
+                track.album_id = Some(alid);
+                track.album_title = Some(album.title);
+            }
+            Err(e) => {
+                tracing::warn!(track_id = id, error = %e, "edit_track_album_par_titre");
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("Album « {titre} » impossible à enregistrer : {e}"),
+                )
+                    .into_response();
+            }
         }
     }
     if let Some(ref v) = body.genre {
@@ -661,10 +710,14 @@ pub(crate) async fn edit_track(
         if body.title.is_some() {
             champs.push(Champ::Titre);
         }
-        if body.artist.is_some() || body.artist_id.is_some() {
+        // #6245 — tenu seulement si l'artiste a réellement changé en base :
+        // `track` porte ici le NOUVEL `artist_id`, c'est lui que la tenue fige.
+        if nom_artiste.is_some() || body.artist_id.is_some() {
             champs.push(Champ::Artiste);
         }
-        if body.album.is_some() || body.album_id.is_some() {
+        // #6270 — tenu seulement si l'album a réellement changé : `track`
+        // porte ici le NOUVEL `album_id`.
+        if titre_album.is_some() || body.album_id.is_some() {
             champs.push(Champ::Album);
         }
         if body.album_artist.is_some() {
@@ -823,6 +876,73 @@ struct BatchSetArtist {
 ///
 /// Aucun rapprochement flou : « Art Blakey » et « Art Blakey & The Jazz
 /// Messengers » sont deux artistes, et c'est à l'utilisateur de le dire.
+/// L'album que désigne un TITRE saisi pour la piste `track` : l'album de ce
+/// titre (sans tenir compte de la casse) chez le même artiste, sinon un album
+/// créé pour lui. Rend l'album, son id, et vrai s'il vient d'être créé.
+///
+/// #6270 — l'artiste est celui de l'album ACTUEL de la piste (renommer
+/// l'album d'une piste la garde dans la discographie du même artiste), à
+/// défaut l'artiste de la piste — déjà mis à jour si l'édition le change.
+/// Sans aucun artiste, seul un album existant de ce titre est repris.
+pub(crate) fn album_par_titre(
+    backend: &Arc<dyn DbBackend>,
+    titre: &str,
+    track: &tune_core::db::models::Track,
+) -> Result<(tune_core::db::models::Album, i64, bool), String> {
+    let repo = AlbumRepo::with_backend(backend.clone());
+    let artiste_de_l_album = track
+        .album_id
+        .and_then(|a| repo.get(a).ok().flatten())
+        .and_then(|a| a.artist_id);
+    let (album, cree) = match artiste_de_l_album.or(track.artist_id) {
+        Some(aid) => match repo
+            .get_by_title_and_artist(titre, aid, None)
+            .map_err(|e| e.to_string())?
+        {
+            Some(a) => (a, false),
+            None => (
+                repo.get_or_create(titre, aid, None)
+                    .map_err(|e| e.to_string())?,
+                true,
+            ),
+        },
+        None => (
+            repo.get_by_title(titre)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "aucun artiste pour créer l'album".to_string())?,
+            false,
+        ),
+    };
+    let id = album.id.ok_or_else(|| "album has no id".to_string())?;
+    Ok((album, id, cree))
+}
+
+/// L'artiste que désigne un NOM saisi : l'artiste existant de ce nom (sans
+/// tenir compte de la casse), sinon un artiste créé. Rend l'artiste, son id,
+/// et vrai s'il vient d'être créé.
+///
+/// #6245 — LE chemin d'un artiste donné par son nom, pour toutes les routes
+/// d'édition : `batch_set_artist`, `edit_track` et le tagger. `tracks` n'a
+/// pas de colonne `artist_name` ; seul `artist_id` désigne l'artiste d'une
+/// piste. Un nom rangé ailleurs est perdu en silence.
+pub(crate) fn artiste_par_nom(
+    backend: &Arc<dyn DbBackend>,
+    nom: &str,
+) -> Result<(tune_core::db::models::Artist, i64, bool), String> {
+    let artist_repo = ArtistRepo::with_backend(backend.clone());
+    let (artiste, cree) = match artist_repo.get_by_name(nom) {
+        Ok(Some(a)) => (a, false),
+        _ => (
+            artist_repo
+                .get_or_create(nom, None, None)
+                .map_err(|e| e.to_string())?,
+            true,
+        ),
+    };
+    let id = artiste.id.ok_or_else(|| "artist has no id".to_string())?;
+    Ok((artiste, id, cree))
+}
+
 async fn batch_set_artist(
     State(state): State<AppState>,
     Json(body): Json<BatchSetArtist>,
@@ -843,26 +963,11 @@ async fn batch_set_artist(
             .into_response();
     }
 
-    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
-    let (artiste, cree) = match artist_repo.get_by_name(&nom) {
-        Ok(Some(a)) => (a, false),
-        _ => match artist_repo.get_or_create(&nom, None, None) {
-            Ok(a) => (a, true),
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()})),
-                )
-                    .into_response();
-            }
-        },
-    };
-    let Some(artist_id) = artiste.id else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "artist has no id"})),
-        )
-            .into_response();
+    let (artiste, artist_id, cree) = match artiste_par_nom(&state.backend, &nom) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+        }
     };
 
     let mut updated = 0i64;

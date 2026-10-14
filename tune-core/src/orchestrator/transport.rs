@@ -703,6 +703,9 @@ impl PlaybackOrchestrator {
         record_history: bool,
     ) -> Result<PlayResult, String> {
         let play_start = std::time::Instant::now();
+        // #5050 — une lecture part : la pose « en pause sans lancer » d'un
+        // transfert ne vaut plus.
+        self.prendre_le_transfert_en_pause(req.zone_id);
         // Zone navigateur : la sortie est l'onglet, pas un appareil. Relevé ici
         // parce que la ligne de zone est déjà lue juste en dessous, et qu'il
         // faudra le savoir bien plus bas, au moment d'annoncer l'écoute
@@ -830,6 +833,16 @@ impl PlaybackOrchestrator {
             .as_deref()
             .is_some_and(|id| id.starts_with("local:"));
         if !is_local {
+            // #6130 — sortie DLNA qui jouait une radio : `Stop`, puis attendre
+            // que le renderer ait lâché la connexion de la radio (au plus 2 s),
+            // AVANT de fermer la session et de poser la nouvelle URI.
+            self.sortir_de_la_radio_dlna(
+                req.zone_id,
+                req.output_device_id.as_deref(),
+                prev_state.now_playing.as_ref(),
+                &sessions_a_fermer,
+            )
+            .await;
             for sid in &sessions_a_fermer {
                 self.streamer.remove_session(sid).await;
             }
@@ -840,6 +853,21 @@ impl PlaybackOrchestrator {
                 &req, &resolved, &habillage, is_local, play_start, resolve_ms,
             )
             .await;
+
+        // #4354 — la barrière a posé un repli DSD à 176,4 kHz : rien n'est
+        // parti au renderer. La session trop lente est fermée et la même
+        // demande est rejouée ; la seconde résolution sert 176,4 kHz, sous
+        // la cadence de repli, donc ne peut pas reboucler.
+        if output_error.as_deref() == Some(crate::audio::repli_dsd_4354::REJOUER_AVEC_LE_REPLI) {
+            if let Some(ref sid) = resolved.stream_id {
+                self.streamer.remove_session(sid).await;
+            }
+            // Le premier passage a inscrit cette piste comme « déjà envoyée » :
+            // sans ce retrait, la garde anti-doublon réseau avalerait la
+            // seconde résolution, alors que rien n'est parti au renderer.
+            self.last_net_play.lock().await.remove(&req.zone_id);
+            return Box::pin(self.play_inner(req, record_history)).await;
+        }
 
         // For local outputs, clean up the old stream now that play_url() has
         // called stop() and the old audio thread is no longer reading.
@@ -1271,7 +1299,7 @@ impl PlaybackOrchestrator {
     /// Quatrième temps : l'envoi à la sortie. Rend `(output_sent,
     /// output_error)`, le couple dont dépendent l'annonce, l'historique et
     /// l'arrêt immédiat en cas de refus.
-    async fn envoyer_a_la_sortie(
+    pub(super) async fn envoyer_a_la_sortie(
         &self,
         req: &PlayRequest,
         resolved: &ResolvedStream,
@@ -1438,7 +1466,65 @@ impl PlaybackOrchestrator {
                         prebuffer_ms,
                         "initial_prebuffer_done"
                     );
+                    // #4354 — décision de Bertrand du 12/10 : un DSD décimé
+                    // au-dessus de 176,4 kHz qui n'a pas rempli sa barrière
+                    // jouerait haché. Rien n'est encore parti au renderer :
+                    // on pose le repli de la zone et `play_inner` résout la
+                    // piste une seconde fois, à 176,4 kHz.
+                    if !is_radio {
+                        let mode = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                            .get_dsd_mode(req.zone_id);
+                        let transport_pcm = crate::orchestrator::transport_dsd(false, true, &mode)
+                            == crate::orchestrator::TransportDsd::Pcm;
+                        if let Some(repli) = crate::audio::repli_dsd_4354::decider(
+                            reached,
+                            local_file_path.as_deref(),
+                            &resolved.mime_type,
+                            resolved.sample_rate,
+                            transport_pcm,
+                        ) {
+                            crate::audio::repli_dsd_4354::enregistrer(req.zone_id, repli);
+                            warn!(
+                                zone_id = req.zone_id,
+                                stream_id = %sid,
+                                de_hz = repli.de_hz,
+                                vers_hz = repli.vers_hz,
+                                prebuffer_ms,
+                                raison = %repli.raison(),
+                                "dsd_pcm_repli_176k"
+                            );
+                            return (
+                                false,
+                                Some(crate::audio::repli_dsd_4354::REJOUER_AVEC_LE_REPLI.into()),
+                            );
+                        }
+                    }
                 }
+            }
+
+            // #5522 — le producteur de la session est déjà mort (téléchargement
+            // amont refusé, `abandonner_la_session_de_transcodage`) : la
+            // session n'existe plus. L'envoyer quand même faisait tirer à la
+            // sortie un `/stream/<id>` en 404, et la zone restait « en
+            // lecture » à 0:00 sans bandeau (Gros Bidon, fil 2212). On ne
+            // l'envoie pas : `output_sent=false` avec un motif arrête la zone
+            // et affiche ce motif, comme un refus de la sortie.
+            if let Some(ref sid) = resolved.stream_id
+                && !self.streamer.session_alive(sid).await
+            {
+                warn!(
+                    zone_id = req.zone_id,
+                    stream_id = %sid,
+                    source = %resolved.source,
+                    "envoi_annule_session_de_flux_abandonnee"
+                );
+                return (
+                    false,
+                    Some(format!(
+                        "Le flux de « {} » n'a pas pu être ouvert auprès du service ({}).",
+                        resolved.title, resolved.source
+                    )),
+                );
             }
 
             // A local output opens this URL in its own reader thread just
@@ -2098,6 +2184,14 @@ impl PlaybackOrchestrator {
                         track_id,
                         media.channels,
                     ));
+                    // #6171 — les canaux de la carte que la zone vise. Ce
+                    // n'est pas un traitement : chaque mot va tel quel à sa
+                    // position, donc PURE compris. Seul le bras ASIO les lit.
+                    local_output.set_canaux_de_carte(
+                        crate::outputs::canaux_de_carte_6171::CanauxDeCarte::lire(
+                            &self.db, zone_id,
+                        ),
+                    );
                     // #6057 — la disposition des canaux que le FICHIER déclare
                     // (masque WAV/FLAC, type DSF, CHNL DFF), pour router chaque
                     // voie par sa position. Rien en PURE : chemin intouché.
@@ -2309,6 +2403,18 @@ impl PlaybackOrchestrator {
             .await
             .now_playing
             .and_then(|np| np.stream_id);
+        // #6059 — un flux natif qui commence DÉJÀ à la position : un `Seek`
+        // par-dessus le décalerait d'autant (et le renderer l'ignore).
+        if let Some(depart_ms) = stream_id
+            .as_deref()
+            .and_then(crate::outputs::dlna_depart_natif::depart_de_session)
+        {
+            info!(
+                zone_id,
+                position_ms, depart_ms, "seek_natif_flux_deja_a_la_position"
+            );
+            return;
+        }
         let session_is_range_seekable = match stream_id {
             Some(ref sid) => self.streamer.is_seekable_session(sid).await,
             None => false,
@@ -2827,6 +2933,24 @@ impl PlaybackOrchestrator {
         device_id: Option<&str>,
         session_message: impl Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync,
     ) -> OutputCommandResult<()> {
+        self.reprendre(zone_id, device_id, &session_message, false)
+            .await
+    }
+
+    /// Corps de [`Self::resume_with_session_error_message`].
+    ///
+    /// `apres_refus_de_la_sortie` (#6062) : second et dernier passage, quand
+    /// la sortie a refusé la reprise « sur place » en disant qu'elle a perdu
+    /// sa session pendant la pause (`device_released_on_pause()` devenu
+    /// vrai). La décision est alors prise comme pour un périphérique rendu :
+    /// rétablir à la position, ou l'expliquer — jamais un second `resume()`.
+    async fn reprendre(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+        session_message: &MessageDeSessionPerdue<'_>,
+        apres_refus_de_la_sortie: bool,
+    ) -> OutputCommandResult<()> {
         // #5476 — génération de CETTE reprise, prise avant le `Play` : toute
         // commande arrivée depuis rend caduc le Seek détaché qu'elle lancera.
         let seq_de_la_reprise = self.playback.marquer_commande_de_transport(zone_id).await;
@@ -2921,14 +3045,22 @@ impl PlaybackOrchestrator {
             // Les accolades rendent le verrou de `outputs` AVANT de prendre celui
             // de la sortie : sans elles, le garde vivrait tout le `match`
             // (clippy 1.98, `blocks_in_conditions`, à ne pas suivre ici).
+            // #5050 (fil 2236) — posée en pause par un transfert : l'appareil
+            // n'a jamais reçu la piste, rien à reprendre sur place.
+            let transfert_en_pause = self.prendre_le_transfert_en_pause(zone_id);
+            if transfert_en_pause {
+                info!(zone_id, position_ms, "resume_apres_transfert_en_pause");
+            }
             #[allow(clippy::blocks_in_conditions)]
-            let peripherique_rendu = match device_id {
-                Some(did) => match { self.outputs.lock().await.get(did) } {
-                    Some(sortie) => sortie.lock().await.device_released_on_pause(),
+            let peripherique_rendu = apres_refus_de_la_sortie
+                || transfert_en_pause
+                || match device_id {
+                    Some(did) => match { self.outputs.lock().await.get(did) } {
+                        Some(sortie) => sortie.lock().await.device_released_on_pause(),
+                        None => false,
+                    },
                     None => false,
-                },
-                None => false,
-            };
+                };
             if peripherique_rendu {
                 info!(
                     zone_id,
@@ -3065,7 +3197,25 @@ impl PlaybackOrchestrator {
             })?;
             let out = output.lock().await;
             let t = out.output_type().to_string();
-            out.checked_resume().await?;
+            if let Err(refus) = out.checked_resume().await {
+                // #6062 — la sortie dit avoir perdu sa session pendant la
+                // pause (Chromecast dont l'application s'est refermée) : la
+                // reprise sur place ne relancera rien, on rétablit à la
+                // position. Une seule fois : le second passage ne revient
+                // jamais ici.
+                if !apres_refus_de_la_sortie && out.device_released_on_pause() {
+                    drop(out);
+                    info!(
+                        zone_id,
+                        position_ms,
+                        error = %refus,
+                        "resume_session_perdue_par_la_sortie_retablissement"
+                    );
+                    return Box::pin(self.reprendre(zone_id, device_id, session_message, true))
+                        .await;
+                }
+                return Err(refus);
+            }
             Some(t)
         } else {
             None
@@ -3125,6 +3275,8 @@ impl PlaybackOrchestrator {
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         // #5476 — rend caduc un Seek de reprise détaché encore en attente.
         self.playback.marquer_commande_de_transport(zone_id).await;
+        // #5050 — arrêtée : la pose d'un transfert en pause ne vaut plus.
+        self.prendre_le_transfert_en_pause(zone_id);
         self.persist_position(zone_id).await;
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(zone_id, "stopped")
@@ -3610,6 +3762,19 @@ impl PlaybackOrchestrator {
                     }
                 }
             } else {
+                // #6059 — un renderer profilé « Seek inopérant » (Yamaha
+                // R-N2000A) : le flux natif est relancé à la position.
+                if let Some(resultat) = self
+                    .deplacer_en_flux_natif_6059(zone_id, did, position_ms, state)
+                    .await
+                {
+                    if let Err(e) = resultat {
+                        warn!(zone_id, error = %e, "seek_natif_echoue");
+                        self.playback.seek(zone_id, original_position_ms).await;
+                        return Err(OutputCommandError::failed(OutputCommand::Seek, e));
+                    }
+                    return Ok(());
+                }
                 let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
                     OutputCommandError::failed(
                         OutputCommand::Seek,
@@ -3617,6 +3782,21 @@ impl PlaybackOrchestrator {
                     )
                 })?;
                 output.lock().await.checked_seek(position_ms).await?;
+                // #6059 — un fichier natif sur une zone DLNA : le sondeur
+                // vérifiera que le renderer a bien exécuté ce `Seek`.
+                if zone_output_type.as_deref() == Some("dlna")
+                    && let Some(np) = state.now_playing.as_ref()
+                    && np.source == "local"
+                    && let Some(sid) = np.stream_id.as_deref()
+                    && self.fichier_natif_de_session(sid).await.is_some()
+                {
+                    super::seek_natif_6059::noter_seek_envoye(
+                        zone_id,
+                        did,
+                        original_position_ms.max(0) as u64,
+                        position_ms,
+                    );
+                }
             }
         }
         Ok(())
@@ -3634,6 +3814,11 @@ impl PlaybackOrchestrator {
         self.streamer.session_alive(stream_id).await
     }
 }
+
+/// #6062 — la traduction, fournie par l'appelant, du message d'une session
+/// perdue (#4193) : `(titre, position mesurée, erreur)`.
+type MessageDeSessionPerdue<'a> =
+    dyn Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync + 'a;
 
 /// Ticket 134 — les sessions de flux qu'une lecture doit fermer une fois la
 /// sortie basculée sur la sienne.

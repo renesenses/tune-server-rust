@@ -110,6 +110,9 @@ pub struct CrossfeedProcessor {
     /// APRÈS le crossfeed intégré, dans l'ordre des identifiants. Vide pour un
     /// crossfeed seul : le chemin reste alors celui d'avant, à l'octet près.
     tiers: Vec<EtageTiers>,
+    /// #6130 — la fréquence à laquelle ces étages ont été PRÉPARÉS (ligne à
+    /// retard, filtres, étages tiers). Diagnostic : voir [`Self::decrire`].
+    sample_rate: u32,
 }
 struct EtageTiers {
     id: String,
@@ -157,6 +160,7 @@ impl CrossfeedProcessor {
                 gain_moyen_db: 0.0,
                 ombre: None,
                 tiers: Vec::new(),
+                sample_rate,
             },
         };
         for (id, reglage) in tiers {
@@ -252,7 +256,26 @@ impl CrossfeedProcessor {
             gain_moyen_db,
             ombre,
             tiers: Vec::new(),
+            sample_rate,
         }
+    }
+
+    /// #6130 — les étages de ce processeur, dans l'ordre d'exécution, avec la
+    /// fréquence à laquelle chacun a été préparé : `crossfeed:<moteur>@<sr>`
+    /// puis `tiers:<id>@<sr>` par étage tiers. Diagnostic seulement.
+    pub fn decrire(&self) -> Vec<String> {
+        let sr = self.sample_rate;
+        let moteur = match &self.engine {
+            CrossfeedEngine::Bundled(_) => Some("integre"),
+            CrossfeedEngine::Native(_) => Some("natif"),
+            CrossfeedEngine::Unavailable => Some("indisponible"),
+            CrossfeedEngine::Aucun => None,
+        };
+        moteur
+            .map(|m| format!("crossfeed:{m}@{sr}"))
+            .into_iter()
+            .chain(self.tiers.iter().map(|t| format!("tiers:{}@{sr}", t.id)))
+            .collect()
     }
 
     /// #5081 — le réglage d'ombre de ce processeur (borné), `None` s'il est

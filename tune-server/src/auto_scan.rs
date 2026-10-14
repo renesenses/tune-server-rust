@@ -1265,6 +1265,14 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // `emptied_roots` inclus depuis #1943 : sans lui, une racine vidée
             // par un montage absent laissait passer la réconciliation, qui
             // supprimait définitivement les favoris. Irréversible.
+            // #6179 — les lignes de playlist dont la piste a été retirée ou
+            // ré-identifiée par ce scan. Aucune n'est supprimée, scan complet
+            // ou non : une playlist ne perd une ligne que par un geste.
+            tune_core::db::playlists_reconcile::reconcilier_et_journaliser(
+                db.clone(),
+                true,
+                "auto_scan",
+            );
             match tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(db.clone())
                 .run(full_scan_ok)
             {
@@ -3674,6 +3682,14 @@ pub fn spawn_file_watcher(
                     if cleaned > 0 {
                         info!(cleaned, "watcher_orphan_albums_cleaned");
                     }
+                    // #6179 — un fichier retouché (supprimé puis réinséré) ou
+                    // renommé revient dans ses playlists dès ce lot : passe
+                    // RAPIDE (chemin, empreintes, MBID — jointures indexées).
+                    tune_core::db::playlists_reconcile::reconcilier_et_journaliser(
+                        db.clone(),
+                        false,
+                        "surveillant",
+                    );
                 }
                 // DIRE que la bibliotheque a change.
                 //

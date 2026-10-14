@@ -157,6 +157,62 @@ pub async fn submit_cover(
     Ok(())
 }
 
+/// Propose la photo de l'appareil d'une zone au catalogue communautaire
+/// (`POST /api/v1/community/device-images`, tune-web-client#2109).
+///
+/// Le site l'enregistre **en attente** et ne la sert à personne avant
+/// l'approbation de Bertrand (« une photo ne peut pas être redescendue avant
+/// que je ne l'aie approuvée », 20/09/2026). La clef est la paire marque +
+/// modèle ; `instance_id` borne à UNE proposition par appareil et par
+/// instance (une seconde remplace la première et repart en attente).
+///
+/// `mime` vient des OCTETS (`sniff_image_ext` puis `cache_mime`), jamais d'un
+/// type annoncé : le site valide une image, il la refuserait sinon.
+pub async fn submit_device_image(
+    base_url: &str,
+    brand: &str,
+    model: &str,
+    instance_id: &str,
+    image_data: &[u8],
+    ext: &str,
+    mime: &str,
+) -> Result<(), CloudError> {
+    let base = base_url.trim_end_matches('/');
+    let url = format!("{base}/api/v1/community/device-images");
+    let client = crate::http::client::shared();
+
+    let image_part = reqwest::multipart::Part::bytes(image_data.to_vec())
+        .file_name(format!("appareil.{ext}"))
+        .mime_str(mime)
+        .map_err(|e| format!("mime error: {e}"))?;
+    let form = reqwest::multipart::Form::new()
+        .text("brand", brand.to_string())
+        .text("model", model.to_string())
+        .text("instance_id", instance_id.to_string())
+        .part("image", image_part);
+
+    let resp = client
+        .post(&url)
+        .multipart(form)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("submit device image failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        debug!(brand, model, status = %status, "device_image_submit_rejected");
+        return Err(CloudError::from_response(
+            format!("device image submit failed: {status}"),
+            resp,
+        )
+        .await);
+    }
+
+    info!(brand, model, "community_device_image_submitted");
+    Ok(())
+}
+
 /// Fetch approved community covers from mozaiklabs.fr.
 /// Pass `since` for incremental sync (ISO 8601 timestamp).
 pub async fn fetch_approved_covers(

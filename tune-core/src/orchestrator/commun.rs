@@ -318,7 +318,7 @@ impl PlaybackOrchestrator {
     /// absolute HTTP URL accessible by network renderers (DLNA/OpenHome).
     /// Hash-only values like `"abc123def"` become `http://IP:PORT/api/v1/artwork/abc123def`.
     /// Full URLs (starting with `http://` or `https://`) are passed through unchanged.
-    pub(super) fn resolve_cover_url(&self, cover: Option<&str>) -> Option<String> {
+    pub(crate) fn resolve_cover_url(&self, cover: Option<&str>) -> Option<String> {
         let c = cover?;
         if c.starts_with("http://") || c.starts_with("https://") {
             return Some(c.to_string());

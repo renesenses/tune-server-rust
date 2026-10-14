@@ -34,7 +34,11 @@
 //!    ses `PERFORMER`, son `REM GENRE`, son `REM DATE` l'emportent. Mais le
 //!    format CUE ne sait pas tout dire, et l'usage est de ranger le reste dans
 //!    les balises du fichier qui l'accompagne — `DISCSUBTITLE` en tête (Gros
-//!    Bidon, fil 2038). Voir [`completer_par_les_balises`].
+//!    Bidon, fil 2038). Voir [`completer_par_les_balises`]. Règle acceptée par
+//!    le testeur le 30/09/2026, appliquée le 11/10 au reste du fichier : la
+//!    ligne album (MBID de sortie et de groupe, dates, type — voir
+//!    [`completer_l_album`]) et les métadonnées étendues, ReplayGain en tête
+//!    (voir [`etendues_a_completer`]). Le fichier ne remplit jamais qu'un vide.
 //!
 //! ## Ce qu'il ne fait pas
 //!
@@ -57,6 +61,7 @@ use crate::db::artist_repo::ArtistRepo;
 use crate::db::backend::DbBackend;
 use crate::db::edition_album::Tenues;
 use crate::db::models::Track;
+use crate::db::track_metadata_repo::TrackMetadataRepo;
 use crate::db::track_repo::TrackRepo;
 
 /// Ce que l'écriture des albums CUE a réellement changé en base.
@@ -187,11 +192,23 @@ struct BalisesImage {
     annee: Option<i32>,
     label: Option<String>,
     compositeur: Option<String>,
+    // Valent pour la LIGNE ALBUM elle-même, que la feuille ne sait pas
+    // remplir : voir [`completer_l_album`].
+    mbid_sortie: Option<String>,
+    mbid_groupe: Option<String>,
+    date_de_sortie: Option<String>,
+    date_originale: Option<String>,
+    annee_originale: Option<i32>,
+    type_de_sortie: Option<String>,
+    types_secondaires: Option<String>,
+
     // Désignent UN enregistrement : réservées à la piste qui occupe le
     // fichier entier.
     isrc: Option<String>,
     mbid_enregistrement: Option<String>,
     bpm: Option<f64>,
+    /// La note de la piste (#6123) : celle d'UN enregistrement.
+    note: Option<i32>,
     commentaire: Option<String>,
 }
 
@@ -212,9 +229,18 @@ impl BalisesImage {
                     .find(|c| c.role == "composer")
                     .map(|c| c.name),
             ),
+            mbid_sortie: texte(m.musicbrainz_release_id),
+            mbid_groupe: texte(m.musicbrainz_release_group_id),
+            date_de_sortie: texte(m.release_date),
+            date_originale: texte(m.original_date),
+            annee_originale: m.original_year.map(|a| a as i32).filter(|a| *a > 0),
+            type_de_sortie: texte(m.release_type),
+            types_secondaires: texte(m.release_secondary_types),
+
             isrc: texte(m.isrc),
             mbid_enregistrement: texte(m.musicbrainz_recording_id),
             bpm: m.bpm.filter(|b| *b > 0.0),
+            note: m.rating.map(i32::from),
             commentaire: texte(m.comment),
         }
     }
@@ -233,6 +259,15 @@ fn lire_balises_image(image: &Path) -> BalisesImage {
             BalisesImage::default()
         }
     }
+}
+
+/// Les métadonnées étendues du fichier image (#5463), lues une fois par image.
+/// Vides pour une image de CD brute, qui ne porte pas de balises (#5298).
+fn lire_etendues_image(image: &Path) -> HashMap<String, String> {
+    if crate::audio::image_cdda::est_image_cdda(image) {
+        return HashMap::new();
+    }
+    crate::metadata::read_extended_metadata(image)
 }
 
 /// Complète une ligne CUE par les balises de son fichier image (#5463).
@@ -275,8 +310,131 @@ fn completer_par_les_balises(t: &mut Track, b: &BalisesImage, fichier_entier: bo
         combler(&mut t.isrc, &b.isrc);
         combler(&mut t.musicbrainz_recording_id, &b.mbid_enregistrement);
         combler(&mut t.bpm, &b.bpm);
+        combler(&mut t.rating, &b.note);
         combler(&mut t.comments, &b.commentaire);
     }
+}
+
+/// Complète la LIGNE ALBUM d'une feuille par les balises de son fichier image
+/// (#5463) : identifiants MusicBrainz de la sortie et de son groupe, dates de
+/// sortie, type de sortie. Le format CUE n'en porte aucun ; le scan ordinaire
+/// les pose depuis les balises de chaque fichier, le chemin CUE les perdait.
+///
+/// Même règle que [`completer_par_les_balises`] : chaque écriture ne remplit
+/// qu'une colonne VIDE. L'année (`REM DATE`) et le titre restent à la feuille ;
+/// un MBID choisi par l'identification ou à la main n'est jamais écrasé.
+fn completer_l_album(album_repo: &AlbumRepo, album_id: i64, b: &BalisesImage) {
+    if let Err(e) = album_repo.poser_identifiants_mb_si_vides(
+        album_id,
+        b.mbid_sortie.as_deref(),
+        b.mbid_groupe.as_deref(),
+    ) {
+        warn!(album_id, error = %e, "cue_mbid_album_non_ecrit");
+    }
+    if (b.annee_originale.is_some() || b.date_de_sortie.is_some() || b.date_originale.is_some())
+        && let Err(e) = album_repo.update_dates(
+            album_id,
+            None,
+            b.annee_originale,
+            b.date_de_sortie.as_deref(),
+            b.date_originale.as_deref(),
+        )
+    {
+        warn!(album_id, error = %e, "cue_dates_album_non_ecrites");
+    }
+    if let Some(t) = b.type_de_sortie.as_deref()
+        && let Err(e) = album_repo.poser_type_de_sortie_si_vide(album_id, t)
+    {
+        warn!(album_id, error = %e, "cue_type_de_sortie_non_pose");
+    }
+    if let Some(t) = b.types_secondaires.as_deref()
+        && let Err(e) = album_repo.poser_types_secondaires_si_vides(album_id, t)
+    {
+        warn!(album_id, error = %e, "cue_types_secondaires_non_poses");
+    }
+}
+
+/// Les clés de `track_metadata` qui décrivent la SORTIE ou le fichier image
+/// entier, et valent donc pour chacune de ses tranches (#5463).
+///
+/// Toute autre clé lue par [`crate::metadata::read_extended_metadata`] —
+/// ReplayGain et DR de PISTE, MBID d'enregistrement, ISRC, crédits, paroles,
+/// tempo… — désigne UN enregistrement : elle ne va qu'à la piste qui occupe le
+/// fichier entier. Le gain de piste d'une image découpée mesure l'image, pas
+/// la tranche ; le recopier sur quinze tranches leur donnerait quinze gains
+/// faux.
+const CLES_ETENDUES_D_ALBUM: &[&str] = &[
+    "rg_album_gain",
+    "rg_album_peak",
+    "rg_album_true_peak",
+    "dr_album",
+    "mb_release_id",
+    "mb_release_group_id",
+    "mb_release_artist_id",
+    "label",
+    "catalog_number",
+    "barcode",
+    "release_country",
+    "release_date",
+    "original_date",
+    "media_type",
+    "source_media",
+    "encoder",
+    "encoder_software",
+    "sort_album",
+    "sort_album_artist",
+    "copyright",
+    "language",
+    "compilation",
+    "composer",
+];
+
+/// Complète les métadonnées étendues (`track_metadata`) d'une piste CUE par
+/// celles de son fichier image (#5463) : ReplayGain, identifiants
+/// MusicBrainz, dates, crédits… que le scan ordinaire range pour tout fichier,
+/// et que le chemin CUE n'écrivait jamais.
+///
+/// 🔴 La feuille prime, le fichier complète :
+/// - une clé que la feuille DÉCLARE pour cette piste (`SONGWRITER` ⇒
+///   `composer`, `ISRC` ⇒ `isrc`, `REM COMMENT` ⇒ `comment`, `CATALOG` ⇒
+///   `barcode`) n'est pas reprise du fichier ;
+/// - une clé déjà en base n'est jamais remplacée : un gain mesuré par Tune, un
+///   crédit édité restent. Le fichier ne remplit que les trous ;
+/// - la portée est respectée : voir [`CLES_ETENDUES_D_ALBUM`].
+fn etendues_a_completer(
+    du_fichier: &HashMap<String, String>,
+    en_base: &HashMap<String, String>,
+    declarees_par_la_feuille: &[&str],
+    fichier_entier: bool,
+) -> HashMap<String, String> {
+    du_fichier
+        .iter()
+        .filter(|(cle, valeur)| {
+            !valeur.trim().is_empty()
+                && !en_base.contains_key(cle.as_str())
+                && !declarees_par_la_feuille.contains(&cle.as_str())
+                && (fichier_entier || CLES_ETENDUES_D_ALBUM.contains(&cle.as_str()))
+        })
+        .map(|(c, v)| (c.clone(), v.clone()))
+        .collect()
+}
+
+/// Les clés de `track_metadata` que la feuille déclare pour cette piste.
+fn cles_declarees_par_la_feuille(piste: &PisteCue, album: &AlbumCue) -> Vec<&'static str> {
+    let mut cles = Vec::new();
+    if piste.compositeur.is_some() || album.compositeur.is_some() {
+        cles.push("composer");
+    }
+    if piste.isrc.is_some() {
+        cles.push("isrc");
+    }
+    if piste.commentaire.is_some() || album.commentaire.is_some() {
+        cles.push("comment");
+    }
+    if album.catalogue.is_some() {
+        cles.push("barcode");
+    }
+    cles
 }
 
 /// Cette piste occupe-t-elle un fichier ENTIER, à elle seule ?
@@ -475,6 +633,8 @@ struct Depots {
     metadonnees: AlbumMetadataRepo,
     /// Ce que l'utilisateur a tenu à la main (#5319).
     tenues: Tenues,
+    /// Les métadonnées étendues des pistes (`track_metadata`, #5463).
+    etendues: TrackMetadataRepo,
 }
 
 impl Depots {
@@ -486,6 +646,7 @@ impl Depots {
             metadonnees: AlbumMetadataRepo::with_backend(db.clone()),
             // Une lecture par passe, comme au scan ordinaire (`TrackImporter`).
             tenues: Tenues::charger(db),
+            etendues: TrackMetadataRepo::with_backend(db.clone()),
         }
     }
 }
@@ -527,6 +688,7 @@ fn ecrire_album_avec(
         pistes: track_repo,
         metadonnees: tenues_meta,
         tenues,
+        etendues: etendues_repo,
     } = depots;
     if album.pistes.is_empty() {
         return;
@@ -564,10 +726,12 @@ fn ecrire_album_avec(
     // Les balises de chaque image, lues une fois (#5463). Pas pour une image
     // SACD : son Master TOC a déjà tout dit, et lofty n'y lit rien.
     let mut balises: HashMap<PathBuf, BalisesImage> = HashMap::new();
+    let mut etendues: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
     if imposition.is_none() {
         for piste in &album.pistes {
             if !balises.contains_key(&piste.media) {
                 balises.insert(piste.media.clone(), lire_balises_image(&piste.media));
+                etendues.insert(piste.media.clone(), lire_etendues_image(&piste.media));
             }
         }
     }
@@ -670,6 +834,15 @@ fn ecrire_album_avec(
         }
     }
 
+    // #5463 — ce que le fichier image dit de la SORTIE, et que la feuille ne
+    // sait pas dire. La première image fait foi, comme pour l'année.
+    if let (Some(id), Some(b)) = (
+        ligne_album,
+        album.pistes.first().and_then(|p| balises.get(&p.media)),
+    ) {
+        completer_l_album(album_repo, id, b);
+    }
+
     // Une sonde par IMAGE, pas par piste : un vinyle en deux faces sonde deux
     // fichiers pour dix pistes.
     let mut sondes: std::collections::HashMap<PathBuf, SondeImage> =
@@ -685,6 +858,8 @@ fn ecrire_album_avec(
     // passera son chemin. L'en retirer le ferait au contraire sortir de
     // `discovered_paths`, et la purge effacerait la ligne qu'on vient d'écrire.
     let mut images_decoupees: HashSet<PathBuf> = HashSet::new();
+    // Les pistes écrites, pour leurs métadonnées étendues (#5463).
+    let mut a_completer: Vec<(Option<i64>, &PisteCue, bool)> = Vec::new();
 
     for piste in &album.pistes {
         let sonde = match imposition {
@@ -795,6 +970,7 @@ fn ecrire_album_avec(
                     Ok(()) => {
                         bilan.pistes_mises_a_jour += 1;
                         ecrites += 1;
+                        a_completer.push((ligne.id, piste, fichier_entier));
                     }
                     Err(e) => {
                         warn!(media = %media, debut, error = %e, "cue_piste_non_mise_a_jour");
@@ -803,15 +979,35 @@ fn ecrire_album_avec(
                 }
             }
             None => match track_repo.create(&ligne) {
-                Ok(_) => {
+                Ok(id) => {
                     bilan.pistes_creees += 1;
                     ecrites += 1;
+                    a_completer.push((Some(id), piste, fichier_entier));
                 }
                 Err(e) => {
                     warn!(media = %media, debut, error = %e, "cue_piste_non_creee");
                     bilan.echecs += 1;
                 }
             },
+        }
+    }
+
+    for (id, piste, fichier_entier) in a_completer {
+        let (Some(id), Some(du_fichier)) = (id, etendues.get(&piste.media)) else {
+            continue;
+        };
+        if du_fichier.is_empty() {
+            continue;
+        }
+        let en_base = etendues_repo.get_all(id).unwrap_or_default();
+        let manquantes = etendues_a_completer(
+            du_fichier,
+            &en_base,
+            &cles_declarees_par_la_feuille(piste, album),
+            fichier_entier,
+        );
+        if let Err(e) = etendues_repo.set_batch(id, &manquantes) {
+            warn!(track_id = id, error = %e, "cue_metadonnees_etendues_non_ecrites");
         }
     }
 
@@ -2305,5 +2501,184 @@ mod tests {
         fs::remove_file(&iso).unwrap();
         assert_eq!(elaguer_les_pistes_cue(&repo, &racines(d.path())), 2);
         assert!(repo.tranches_cue_du_media(&media).unwrap().is_empty());
+    }
+
+    /// #5463, règle arrêtée — ce qu'un FLAC image porte au-delà de la
+    /// feuille : identifiants MusicBrainz de la sortie, dates de sortie, type
+    /// de sortie, ReplayGain. Aucun n'a de place dans le format CUE.
+    const BALISES_ETENDUES_DU_FLAC: &[(&str, &str)] = &[
+        ("DISCSUBTITLE", "Remastered Album"),
+        (
+            "MUSICBRAINZ_ALBUMID",
+            "11111111-2222-3333-4444-555555555555",
+        ),
+        (
+            "MUSICBRAINZ_RELEASEGROUPID",
+            "66666666-7777-8888-9999-000000000000",
+        ),
+        ("RELEASEDATE", "2015-04-13"),
+        ("ORIGINALDATE", "1973-01-23"),
+        ("RELEASETYPE", "album"),
+        ("REPLAYGAIN_ALBUM_GAIN", "-7.10 dB"),
+        ("REPLAYGAIN_ALBUM_PEAK", "0.988525"),
+        ("REPLAYGAIN_TRACK_GAIN", "-6.20 dB"),
+        ("REPLAYGAIN_TRACK_PEAK", "0.912000"),
+        ("COMPOSER", "Compositeur du fichier"),
+    ];
+
+    /// Un dossier CUE sur un FLAC aux balises étendues, dans une base FICHIER
+    /// (pas `:memory:`) : rend la base, le dossier et l'image.
+    fn dossier_etendu(d: &Path, feuille: &str) -> (Arc<dyn DbBackend>, PathBuf, PathBuf) {
+        let dossier = d.join("Rick Wakeman - The Six Wives");
+        fs::create_dir_all(&dossier).unwrap();
+        let image = dossier.join("image.flac");
+        flac_etiquete(&image, BALISES_ETENDUES_DU_FLAC);
+        fs::write(dossier.join("album.cue"), feuille).unwrap();
+        // Les migrations aussi : `track_metadata` en vient, comme en production.
+        let db = SqliteDb::open(&d.join("tune-5463.db").to_string_lossy()).unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        (Arc::new(db), dossier, image)
+    }
+
+    fn etendues(db: &Arc<dyn DbBackend>, image: &Path, debut: i64) -> HashMap<String, String> {
+        let id = TrackRepo::with_backend(db.clone())
+            .get_by_cue_identity(&image.to_string_lossy(), debut)
+            .unwrap()
+            .and_then(|t| t.id)
+            .expect("la tranche doit exister");
+        crate::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone())
+            .get_all(id)
+            .unwrap()
+    }
+
+    /// 🔴 #5463 — l'ALBUM d'une feuille reçoit ce que le fichier image dit de
+    /// la sortie : MBID de la sortie et du groupe, dates, type. Le scan
+    /// ordinaire les pose depuis les balises ; le chemin CUE les perdait.
+    #[test]
+    fn l_album_cue_prend_les_identifiants_et_les_dates_du_fichier_5463() {
+        let d = tempfile::TempDir::new().unwrap();
+        let (db, dossier, image) = dossier_etendu(d.path(), DEUX_TRANCHES_SANS_REM);
+        let (_, bilan, _) = inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
+        assert_eq!(bilan.echecs, 0, "bilan : {bilan:?}");
+        let album_id = TrackRepo::with_backend(db.clone())
+            .get_by_cue_identity(&image.to_string_lossy(), 0)
+            .unwrap()
+            .and_then(|t| t.album_id)
+            .expect("album");
+        let album = AlbumRepo::with_backend(db).get(album_id).unwrap().unwrap();
+        assert_eq!(
+            album.musicbrainz_release_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "#5463 — le MBID de sortie du FLAC doit atteindre l'album CUE"
+        );
+        assert_eq!(
+            album.musicbrainz_release_group_id.as_deref(),
+            Some("66666666-7777-8888-9999-000000000000")
+        );
+        assert_eq!(album.release_date.as_deref(), Some("2015-04-13"));
+        assert_eq!(album.original_date.as_deref(), Some("1973-01-23"));
+        assert_eq!(album.release_type.as_deref(), Some("album"));
+        // Le titre reste celui de la feuille.
+        assert_eq!(album.title, "The Six Wives of Henry VIII");
+    }
+
+    /// 🔴 #5463 — le ReplayGain d'ALBUM du fichier vaut pour toutes ses
+    /// tranches ; celui de PISTE ne vaut pour aucune (il mesure l'image
+    /// entière). La piste qui occupe le fichier entier prend les deux.
+    #[test]
+    fn le_replaygain_du_fichier_complete_les_tranches_selon_sa_portee_5463() {
+        let d = tempfile::TempDir::new().unwrap();
+        let (db, dossier, image) = dossier_etendu(d.path(), DEUX_TRANCHES_SANS_REM);
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
+        for debut in [0, 493] {
+            let m = etendues(&db, &image, debut);
+            assert_eq!(
+                m.get("rg_album_gain").map(String::as_str),
+                Some("-7.10 dB"),
+                "#5463 — le gain d'album du FLAC doit atteindre la tranche {debut} : {m:?}"
+            );
+            assert_eq!(
+                m.get("mb_release_id").map(String::as_str),
+                Some("11111111-2222-3333-4444-555555555555")
+            );
+            assert!(
+                !m.contains_key("rg_track_gain"),
+                "le gain de piste de l'image ne mesure aucune tranche : {m:?}"
+            );
+        }
+
+        let d2 = tempfile::TempDir::new().unwrap();
+        const UNE_PISTE: &str = "PERFORMER \"Rick Wakeman\"\nTITLE \"The Six Wives of Henry VIII\"\nFILE \"image.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Catherine of Aragon\"\n    INDEX 01 00:00:00\n";
+        let (db, dossier, image) = dossier_etendu(d2.path(), UNE_PISTE);
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d2.path()),
+        );
+        let m = etendues(&db, &image, 0);
+        assert_eq!(m.get("rg_track_gain").map(String::as_str), Some("-6.20 dB"));
+        assert_eq!(m.get("rg_album_gain").map(String::as_str), Some("-7.10 dB"));
+    }
+
+    /// LA CONTRE-ÉPREUVE — ce que la feuille déclare (`SONGWRITER`), le
+    /// fichier ne le redit pas dans les métadonnées étendues ; et une valeur
+    /// déjà en base (mesure de Tune, MBID posé par l'identification) n'est
+    /// pas écrasée : le fichier COMPLÈTE.
+    #[test]
+    fn le_fichier_ne_contredit_ni_la_feuille_ni_l_acquis_5463() {
+        let feuille = DEUX_TRANCHES_SANS_REM.replace(
+            "TITLE \"The Six Wives of Henry VIII\"\n",
+            "TITLE \"The Six Wives of Henry VIII\"\nSONGWRITER \"R. Wakeman\"\n",
+        );
+        let d = tempfile::TempDir::new().unwrap();
+        let (db, dossier, image) = dossier_etendu(d.path(), &feuille);
+        let dossiers = std::slice::from_ref(&dossier);
+        inventorier_et_ecrire(db.clone(), dossiers, &racines(d.path()));
+        let m = etendues(&db, &image, 0);
+        assert_ne!(
+            m.get("composer").map(String::as_str),
+            Some("Compositeur du fichier"),
+            "#5463 — le SONGWRITER de la feuille prime sur le COMPOSER du fichier : {m:?}"
+        );
+
+        // L'acquis : un gain mesuré, un MBID d'album corrigé à la main.
+        let repo = TrackRepo::with_backend(db.clone());
+        let une = repo
+            .get_by_cue_identity(&image.to_string_lossy(), 0)
+            .unwrap()
+            .unwrap();
+        let meta = crate::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone());
+        meta.set(une.id.unwrap(), "rg_album_gain", "-9.99 dB")
+            .unwrap();
+        let album_id = une.album_id.unwrap();
+        db.execute(
+            "UPDATE albums SET musicbrainz_release_id = 'mbid-choisi' WHERE id = ?1",
+            &[&album_id],
+        )
+        .unwrap();
+
+        let (_, bilan, _) = inventorier_et_ecrire(db.clone(), dossiers, &racines(d.path()));
+        assert_eq!(
+            (bilan.pistes_creees, bilan.pistes_mises_a_jour),
+            (0, 2),
+            "le rescan met à jour en place : {bilan:?}"
+        );
+        assert_eq!(repo.count().unwrap(), 2, "le rescan ne double aucune piste");
+        let m = etendues(&db, &image, 0);
+        assert_eq!(m.get("rg_album_gain").map(String::as_str), Some("-9.99 dB"));
+        let album = AlbumRepo::with_backend(db)
+            .get(une.album_id.unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(album.musicbrainz_release_id.as_deref(), Some("mbid-choisi"));
     }
 }

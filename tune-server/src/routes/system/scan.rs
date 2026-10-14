@@ -846,10 +846,19 @@ pub fn etat_du_fichier(path: &std::path::Path, existing_tracks: &CarteDesChemins
     // #5299 — même mesure que le parcours (`ScannedFile`), chemins virtuels
     // `image.iso!/…` compris : sans elle, chaque piste d'une image serait
     // relue à chaque scan.
-    let (Some(info), Some((taille, mtime))) = (
-        existing_tracks.get(path_str.as_str()),
-        tune_core::audio::iso9660::taille_et_mtime(path),
-    ) else {
+    //
+    // #6163 — ce `stat` est borné comme celui du parcours : sur un partage
+    // SMB qui ne répond plus pour un fichier, il figeait le préfiltre entier.
+    // Sans réponse, le fichier part « à relire » : le parcours le sautera à
+    // son tour, le journalisera et le rangera dans les échecs du scan, sans
+    // rien écrire en base. Un fichier inconnu de la base est à relire de toute
+    // façon : on ne le mesure plus pour rien.
+    let Some(info) = existing_tracks.get(path_str.as_str()) else {
+        return EtatDuFichier::ARelire;
+    };
+    let tune_core::scanner::walker::StatBorne::Lu(Some((taille, mtime))) =
+        tune_core::scanner::walker::taille_et_mtime_du_scan(path)
+    else {
         return EtatDuFichier::ARelire;
     };
     if !info.taille.is_some_and(|s| s == taille as i64) {
@@ -1579,7 +1588,10 @@ pub(crate) fn marquer_scan_en_cours(
 /// gestes de RÉPARATION de bibliothèque. Aucun d'eux ne doit pouvoir autoriser
 /// une suppression de masse. Seul `trigger_scan`, qui porte une intention
 /// explicite de l'utilisateur, passe par `spawn_library_scan_confirmee`.
-pub(crate) async fn spawn_library_scan(
+///
+/// `pub` pour `tune-ffi` : l'hôte mobile (app iOS revenue au premier plan)
+/// relance un scan incrémental par `tune_server_scan`, sans passer par HTTP.
+pub async fn spawn_library_scan(
     state: AppState,
     force: bool,
     targeted_req: Option<String>,
@@ -3074,6 +3086,13 @@ async fn spawn_library_scan_avec_lecteur(
             // laissait `full_scan_ok = true`, et la réconciliation supprimait
             // DÉFINITIVEMENT les favoris des pistes conservées. Une purge de
             // pistes se répare par un rescan ; une perte de favoris, non.
+            // #6179 — les lignes de playlist dont la piste a été retirée ou
+            // ré-identifiée par ce scan. Aucune n'est supprimée.
+            tune_core::db::playlists_reconcile::reconcilier_et_journaliser(
+                db.clone(),
+                true,
+                "post_scan",
+            );
             match tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(db.clone())
                 .run(full_scan_ok)
             {
@@ -6059,10 +6078,19 @@ mod vidage_sauvegarde_5973 {
                 .query_row("SELECT COUNT(*) FROM playlist_tracks", [], |r| r.get(0))
                 .expect("compte")
         };
+        // #6179 — le vidage n'efface plus le contenu des playlists : la ligne
+        // reste, INTROUVABLE (sans piste), jusqu'au rescan qui la rattache.
+        let introuvables: i64 = rusqlite::Connection::open(&db_path)
+            .expect("ouverture")
+            .query_row(
+                "SELECT COUNT(*) FROM playlist_tracks WHERE track_id IS NULL AND title = 'Titre'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("compte");
         assert_eq!(
-            compter(&db_path),
-            0,
-            "contre-épreuve : le vidage efface le contenu des playlists"
+            introuvables, 1,
+            "le vidage laisse la ligne de playlist, introuvable, avec son titre"
         );
         assert_eq!(
             compter(chemin),

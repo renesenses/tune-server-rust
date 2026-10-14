@@ -40,6 +40,17 @@ fn orchestrateur() -> PlaybackOrchestrator {
 /// Une zone DLNA en DSD « natif », et la piste locale `fixture` copiée sous un
 /// nom en `.dff`.
 async fn resoudre(fixture: &str) -> (Result<ResolvedStream, String>, tempfile::TempDir) {
+    let (_orch, resolu, dir) = resoudre_avec(fixture).await;
+    (resolu, dir)
+}
+/// Comme [`resoudre`], en rendant aussi l'orchestrateur (ses sessions).
+async fn resoudre_avec(
+    fixture: &str,
+) -> (
+    PlaybackOrchestrator,
+    Result<ResolvedStream, String>,
+    tempfile::TempDir,
+) {
     let orch = orchestrateur();
     let dir = tempfile::tempdir().unwrap();
     let chemin = dir.path().join("piste-4378.dff");
@@ -74,7 +85,7 @@ async fn resoudre(fixture: &str) -> (Result<ResolvedStream, String>, tempfile::T
             ..Default::default()
         })
         .await;
-    (resolu, dir)
+    (orch, resolu, dir)
 }
 
 fn est_du_dsd(resolu: &ResolvedStream) -> bool {
@@ -96,25 +107,46 @@ async fn un_dff_dsd_brut_part_en_passthrough_vers_un_renderer_natif() {
     );
 }
 
-/// 🔴 #4378 — le même réglage, un `.dff` DST : le renderer reçoit du décodé,
-/// jamais le fichier DST.
+/// 🔴 #4378 — le même réglage, un `.dff` DST : le renderer ne reçoit JAMAIS
+/// le fichier DST. Depuis #6221, la zone « natif » reçoit un DSF FABRIQUÉ
+/// depuis le DST décodé (fichier virtuel de la session) ; sans la feature
+/// `dst`, rien ne décode le DST et un refus est la seule issue juste.
 #[tokio::test]
 async fn un_dff_dst_n_est_jamais_servi_brut_a_un_renderer() {
-    let (resolu, _dir) = resoudre("dst_fate_dsd64_stereo.dff").await;
+    let (orch, resolu, _dir) = resoudre_avec("dst_fate_dsd64_stereo.dff").await;
     match resolu {
-        Ok(resolu) => assert!(
-            !est_du_dsd(&resolu) && resolu.bit_depth != Some(1),
-            "un DSDIFF DST est parti BRUT vers le renderer ({} / {:?} bits) : \
-             il lirait des trames DST comme du DSD, donc du bruit",
-            resolu.mime_type,
-            resolu.bit_depth
-        ),
-        // Sans la feature `dst`, rien ne décode le DST : un refus est la
-        // seule issue juste. Avec elle, la piste doit se lire.
+        Ok(resolu) => {
+            let sid = resolu.stream_id.clone().expect("session");
+            let session = orch
+                .streamer
+                .sessions_state()
+                .lock()
+                .await
+                .get(&sid)
+                .cloned()
+                .expect("session créée");
+            let virtuelle = session.source_virtuelle.lock().unwrap().clone();
+            if est_du_dsd(&resolu) {
+                // Du DSD sur le fil : ce doit être le DSF fabriqué, jamais
+                // les octets du `.dff` DST.
+                let v = virtuelle.expect(
+                    "un DSDIFF DST est parti BRUT vers le renderer : il lirait \
+                     des trames DST comme du DSD, donc du bruit",
+                );
+                let mut tete = Vec::new();
+                v.lire(0, 4, &mut |m| {
+                    tete.extend_from_slice(&m);
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(&tete, b"DSD ", "le fil porte un DSF, pas le FRM8 DST");
+            } else {
+                assert_ne!(resolu.bit_depth, Some(1));
+            }
+        }
         Err(e) => assert!(
             cfg!(not(feature = "dst")),
-            "avec la feature `dst`, un DSDIFF DST doit se résoudre en flux \
-             décodé : {e}"
+            "avec la feature `dst`, un DSDIFF DST doit se résoudre : {e}"
         ),
     }
 }

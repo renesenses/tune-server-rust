@@ -52,17 +52,21 @@
 //! connexion), et elles appartiennent à Bertrand.
 
 mod contexte;
+pub(crate) mod exclusions;
 pub(crate) mod operateur;
 mod pilote;
+pub(crate) mod prise;
 mod sessions;
+pub(crate) mod sortantes;
 mod zones;
 pub use contexte::ContexteSendspin;
 pub use zones::RaccordZones;
 
 use axum::Router;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use prise::Prise as WebSocket;
 use tracing::{debug, info, warn};
 
 use tune_core::sendspin::transition::{self, ModeTransition};
@@ -120,7 +124,7 @@ async fn point_d_acces(
     ws.max_message_size(128 * 1024)
         .max_frame_size(128 * 1024)
         .on_upgrade(move |socket| async move {
-            if let Err(e) = conduire(socket, mode, contexte).await {
+            if let Err(e) = conduire(WebSocket::Entrante(socket), mode, contexte).await {
                 // Seuls les defauts du client/init en clair produisent server/error.
                 // Les echecs Noise et transport ferment sans message applicatif.
                 warn!(error = %e, mode = mode.nom(), "sendspin_poignee_echouee");
@@ -134,7 +138,7 @@ async fn point_d_acces(
 /// c'est exactement cette forme. Le point important est que la décision se
 /// prend sur ce que le pair **demande**, jamais sur un échec : il n'existe
 /// aucune arête qui mène de « Noise a raté » à « tant pis, en clair ».
-async fn conduire(
+pub(crate) async fn conduire(
     mut socket: WebSocket,
     mode: ModeTransition,
     contexte: ContexteSendspin,
@@ -222,6 +226,15 @@ async fn conduire_chiffre(
         Ok(id) => id,
         Err(raison) => return refuser_init(&mut socket, raison).await,
     };
+    sortantes::noter_client_id(&id);
+    // Liste d'exclusion : une enceinte qu'un autre serveur garde n'est pas
+    // disputée. Refus silencieux (aucun server/init), comme tout échec de la
+    // poignée de main hors `server/error` d'init.
+    if contexte.est_exclu(&[&id]) {
+        info!(client_id = %id, "sendspin_enceinte_exclue_refusee");
+        let _ = socket.send(Message::Close(None)).await;
+        return Err(ErreurSendspin::EtatInattendu("enceinte exclue"));
+    }
     let (identite, psk) = contexte.selectionner(&id).await?;
     let mut poignee = PoigneeServeur::accueillir_avec_psk(&identite, &client_init_texte, &psk)?;
     let client_id = poignee.client_id().to_string();

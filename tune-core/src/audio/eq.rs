@@ -406,6 +406,19 @@ impl EqProcessor {
         }
         stats
     }
+
+    /// #6130 — l'étage tel que le journal le décrit : moteur et fréquence à
+    /// laquelle il a été préparé (`egaliseur:natif@44100`). Diagnostic seulement.
+    pub fn decrire(&self) -> String {
+        let moteur = match &self.engine {
+            Engine::Bundled(_) => "integre",
+            Engine::Native(_) => "natif",
+            Engine::Unavailable => "indisponible",
+            Engine::Neutre => "neutre",
+        };
+        format!("egaliseur:{moteur}@{}", self.sample_rate)
+    }
+
     pub fn is_enabled(&self) -> bool {
         match &self.engine {
             Engine::Bundled(p) => p.is_enabled(),

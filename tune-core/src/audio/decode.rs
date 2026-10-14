@@ -4064,7 +4064,13 @@ fn decode_dsd_streaming(
             data_ready,
             levels_tx,
             rt,
-            || reader.next_chunk(),
+            || {
+                // #4354 — bancs seulement : un hôte trop lent, simulé par
+                // fichier. Absent du binaire livré.
+                #[cfg(test)]
+                super::repli_dsd_4354::frein_de_test(file_path);
+                reader.next_chunk()
+            },
         );
     }
     if ext == "iso" {

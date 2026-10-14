@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
@@ -9,6 +11,12 @@ pub struct BluosOutput {
     host: String,
     port: u16,
     client: Client,
+    /// #6248 — ce Node a déjà acquitté un `/Add` sans rien mettre en file
+    /// (file vide, puis pause sur `/Play?id=0`). Retenu pour la vie de la
+    /// sortie : les pistes suivantes partent directement par `/Play?url=`,
+    /// sans repayer l'échec, et l'enchaînement sans blanc par la file n'est
+    /// plus armé (`supports_internal_gapless`).
+    add_refuse: AtomicBool,
 }
 
 impl BluosOutput {
@@ -22,7 +30,45 @@ impl BluosOutput {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap(),
+            add_refuse: AtomicBool::new(false),
         }
+    }
+
+    /// #6248 — jouer la piste comme un flux « custom » : `/Play?url=<url
+    /// encodée>`, la seule façon documentée par la BluOS Custom Integration
+    /// API (v1.7, § 4.1) de jouer une URL quelconque. C'est le repli d'un Node
+    /// qui refuse `/Add` : la piste joue, hors de la file du Node (donc sans
+    /// enchaînement sans blanc), ce qui vaut mieux que le silence.
+    ///
+    /// Même règle que pour `/Add` : on ne conclut à l'échec que sur un signal
+    /// compris — le Node reste en `pause`.
+    async fn jouer_par_play_url(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        let corps = self.api_get("Play", &[("url", media.url)]).await?;
+        info!(
+            device = %self.name,
+            reply = %truncate_body(&corps),
+            "bluos_play_url_reply"
+        );
+        if xml_text(&corps, "state") == Some("pause") {
+            warn!(
+                device = %self.name,
+                url = media.url,
+                reply = %truncate_body(&corps),
+                "bluos_play_url_rejected"
+            );
+            return Err(format!(
+                "Le lecteur BluOS « {} » refuse la piste : il n'a rien mis en file (/Add) et reste en pause sur /Play?url=. Rien ne sera joué.",
+                self.name
+            ));
+        }
+        info!(
+            device = %self.name,
+            url = media.url,
+            title = media.title.unwrap_or(""),
+            mode = "play_url",
+            "bluos_play"
+        );
+        Ok(())
     }
 
     fn base_url(&self) -> String {
@@ -185,6 +231,13 @@ impl OutputTarget for BluosOutput {
         OutputCapabilities::v1(true, true, true, true, true, true).with_percent_volume()
     }
 
+    /// #6248 — l'enchaînement sans blanc passe par la file du Node (`/Add`).
+    /// Un Node qui la refuse n'enchaînera jamais la piste préparée : ne pas
+    /// l'armer, la fin naturelle avance la file de Tune.
+    fn supports_internal_gapless(&self) -> bool {
+        self.capabilities().can_gapless && !self.add_refuse.load(Ordering::Relaxed)
+    }
+
     fn host(&self) -> Option<&str> {
         Some(&self.host)
     }
@@ -228,6 +281,11 @@ impl OutputTarget for BluosOutput {
                 }
             }
             Err(e) => warn!(device = %self.name, error = %e, "bluos_clear_echec"),
+        }
+
+        // #6248 — ce Node a déjà refusé `/Add` : ne pas repayer l'échec.
+        if self.add_refuse.load(Ordering::Relaxed) {
+            return self.jouer_par_play_url(media).await;
         }
 
         // Play THROUGH the Node's queue (/Add then /Play?id=0), not as a
@@ -305,10 +363,11 @@ impl OutputTarget for BluosOutput {
                 play_reply = %truncate_body(&play_body),
                 "bluos_add_rejected_empty_queue"
             );
-            return Err(format!(
-                "Le lecteur BluOS « {} » a accepte la commande mais n'a rien mis en file : sa file est restee vide et il est reste en pause. Rien ne sera joue.",
-                self.name
-            ));
+            // #6248 — Bilou, rc4 : Tune s'arrêtait là, sans repli. Le Node
+            // sait jouer une URL par `/Play?url=` : retenter, et le retenir.
+            self.add_refuse.store(true, Ordering::Relaxed);
+            warn!(device = %self.name, "bluos_repli_play_url");
+            return self.jouer_par_play_url(media).await;
         }
         info!(
             device = %self.name,
@@ -767,6 +826,8 @@ mod tests {
         code_clear: axum::http::StatusCode,
         corps_clear: String,
         corps_play: String,
+        /// #6248 — la réponse à `/Play?url=` (flux « custom »).
+        corps_play_url: String,
         /// Le temps que le Node met a repondre au `/Clear`. Le bouchon
         /// n'inscrit l'appel qu'APRES cette latence : un `Add` lance sans
         /// attendre s'inscrirait donc AVANT lui.
@@ -783,6 +844,7 @@ mod tests {
                 code_clear: axum::http::StatusCode::OK,
                 corps_clear: CLEAR_OK.to_string(),
                 corps_play: PLAY_STREAM.to_string(),
+                corps_play_url: PLAY_STREAM.to_string(),
                 latence_clear: std::time::Duration::ZERO,
             }
         }
@@ -810,7 +872,12 @@ mod tests {
         uri: axum::http::Uri,
     ) -> (axum::http::StatusCode, String) {
         etat.recues.lock().unwrap().push(uri.to_string());
-        (axum::http::StatusCode::OK, etat.corps_play.clone())
+        let corps = if uri.query().is_some_and(|q| q.starts_with("url=")) {
+            etat.corps_play_url.clone()
+        } else {
+            etat.corps_play.clone()
+        };
+        (axum::http::StatusCode::OK, corps)
     }
 
     async fn demarrer_bouchon(etat: NodeBouchon) -> (u16, tokio::task::JoinHandle<()>) {
@@ -1027,6 +1094,79 @@ mod tests {
         );
         assert_eq!(appels.len(), 3, "{appels:?}");
         assert!(appels[2].contains("id=0"), "{appels:?}");
+    }
+
+    // ── #6248 : le Node refuse `/Add`, Tune se replie sur `/Play?url=` ─────
+
+    /// Le Node de Bilou (rc4, 13/10) : `/Add` rend une file vide, `/Play?id=0`
+    /// le laisse en pause. Tune doit jouer la piste par `/Play?url=` (URL
+    /// encodée), puis retenir le refus : la piste suivante part directement
+    /// par `/Play?url=`, sans `/Add`, et l'enchaînement par la file n'est plus
+    /// armé.
+    #[tokio::test]
+    async fn un_node_qui_refuse_add_joue_par_play_url_6248() {
+        crate::journal_de_test::fiabiliser_la_capture();
+        let etat = NodeBouchon {
+            corps_add: ADD_EMPTY.to_string(),
+            corps_play: PLAY_PAUSE.to_string(),
+            corps_play_url: PLAY_STREAM.to_string(),
+            ..Default::default()
+        };
+        let recues = etat.recues.clone();
+        let (port, tache) = demarrer_bouchon(etat).await;
+        let node = BluosOutput::new("Salon".into(), "d".into(), "127.0.0.1".into(), port);
+        assert!(node.supports_internal_gapless());
+
+        let issue = node.play_media(&media_bilou(FLUX_BILOU)).await;
+        assert!(
+            issue.is_ok(),
+            "le Node sait jouer une URL par /Play?url= : la piste doit partir \
+             au lieu d'arrêter la zone — {issue:?}"
+        );
+        let appels = recues.lock().unwrap().clone();
+        let flux_encode = format!("/Play?url={}", urlencoding::encode(FLUX_BILOU));
+        assert_eq!(appels.len(), 4, "{appels:?}");
+        assert!(appels[0].starts_with("/Clear"), "{appels:?}");
+        assert!(appels[1].starts_with("/Add?"), "{appels:?}");
+        assert_eq!(appels[2], "/Play?id=0", "{appels:?}");
+        assert_eq!(
+            appels[3], flux_encode,
+            "repli par l'URL encodée : {appels:?}"
+        );
+        assert!(
+            !node.supports_internal_gapless(),
+            "un Node qui refuse la file n'enchaînera pas la piste préparée"
+        );
+
+        // La piste suivante : plus d'`/Add`, directement `/Play?url=`.
+        recues.lock().unwrap().clear();
+        let issue = node.play_media(&media_bilou(FLUX_BILOU)).await;
+        tache.abort();
+        assert!(issue.is_ok(), "{issue:?}");
+        let appels = recues.lock().unwrap().clone();
+        assert_eq!(appels.len(), 2, "{appels:?}");
+        assert!(appels[0].starts_with("/Clear"), "{appels:?}");
+        assert_eq!(appels[1], flux_encode, "{appels:?}");
+    }
+
+    /// Le repli lui-même refusé (le Node reste en pause sur `/Play?url=`) :
+    /// l'échec est dit, et nomme les deux voies essayées.
+    #[tokio::test]
+    async fn un_node_qui_refuse_aussi_play_url_echoue_en_le_disant_6248() {
+        crate::journal_de_test::fiabiliser_la_capture();
+        let (issue, log, appels) = jouer_sur_bouchon(NodeBouchon {
+            corps_add: ADD_EMPTY.to_string(),
+            corps_play: PLAY_PAUSE.to_string(),
+            corps_play_url: PLAY_PAUSE.to_string(),
+            ..Default::default()
+        })
+        .await;
+        let erreur = issue.expect_err("rien ne joue : l'échec doit remonter");
+        assert!(erreur.contains("/Play?url="), "{erreur}");
+        assert!(log.contains("bluos_add_rejected_empty_queue"), "{log}");
+        assert!(log.contains("bluos_repli_play_url"), "{log}");
+        assert!(log.contains("bluos_play_url_rejected"), "{log}");
+        assert_eq!(appels.len(), 4, "{appels:?}");
     }
 
     // ── Garde de site : plus aucune commande du Node jetee en silence ──────

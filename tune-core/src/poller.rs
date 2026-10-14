@@ -78,7 +78,10 @@ async fn get_status_with_signal_path_bounded(
 > {
     let poll = async {
         let output = output_arc.lock().await;
-        let status = output.get_status().await?;
+        let mut status = output.get_status().await?;
+        // #6059 — un flux natif relancé à la position : le renderer compte
+        // depuis le début de CE flux, on le rapporte à la piste.
+        crate::outputs::dlna_depart_natif::corriger_le_statut(output.device_id(), &mut status);
         let progress = if status.realtime {
             None
         } else {
@@ -1005,6 +1008,8 @@ impl PositionPoller {
 }
 
 mod radio;
+/// #2991 — le titre radio relayé par DIDL vers un renderer DLNA (opt-in par zone).
+mod titre_radio_didl_2991;
 
 mod fin_de_piste;
 /// #4382 — un `Next` acquitté que le transport déclare ignoré.
@@ -1029,6 +1034,8 @@ mod volume_pure_5695;
 #[cfg(test)]
 mod volume_pure_5695_tests;
 
+/// #6233 — radio sur sortie locale : le contrat de signal relu à chaque tour.
+mod contrat_radio_locale_6233;
 /// #5662 — un renderer à 100 % ignoré par l'adoption est signalé au journal.
 mod volume_100_ignore_5662;
 /// #6008 — l'adoption du volume du renderer est dite au journal.
@@ -1307,6 +1314,11 @@ mod depassement_duree_nagit_pas_guard;
 /// par désarmer.
 #[cfg(test)]
 mod lire_ensuite_dans_la_fenetre_gapless;
+
+/// #4851 — une zone HQPlayer native enchaîne par la playlist de HQPlayer :
+/// la vraie `HqplayerOutput` face à un faux HQPlayer XML, sondeur réel.
+#[cfg(test)]
+mod hqplayer_enchainement_4851;
 
 /// #5143 — une suivante BANNIE n'est ni préchargée, ni armée, ni jouée après
 /// un échec : préchargement, enchaînement sans blanc et reprise désignent la

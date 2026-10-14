@@ -400,7 +400,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- Pistes virtuelles CUE (#1763) : cf le commentaire de CORE_SCHEMA.
     cue_media_path TEXT,
     cue_start_ms BIGINT,
-    cue_end_ms BIGINT
+    cue_end_ms BIGINT,
+    -- Note de la piste (#6123). TEXT ici comme les autres colonnes numeriques :
+    -- la copie lie tout en texte ; la migration 088 la convertit en BIGINT.
+    rating TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -463,7 +466,14 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
     album TEXT,
     album_source_id TEXT,
     duration_ms TEXT,
-    cover_url TEXT
+    cover_url TEXT,
+    -- #6179 : la ligne introuvable garde l'identite de sa piste (PG 089,
+    -- SQLite 125). La 089 convertit `missing_since`.
+    file_path TEXT,
+    audio_hash TEXT,
+    audio_fingerprint TEXT,
+    mbid TEXT,
+    missing_since TEXT
 );
 
 CREATE SEQUENCE IF NOT EXISTS zones_id_seq;
@@ -1246,6 +1256,9 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_fingerprint TEXT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key TEXT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key_seen TEXT;
 CREATE INDEX IF NOT EXISTS idx_tracks_audio_pcm_key ON tracks(audio_pcm_key);
+-- tracks: note de la piste lue dans ses balises (SQLite migration v124 / PG
+-- 088, #6123). TEXT pour la copie ; la 088, rejouee juste apres, la convertit.
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating TEXT;
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE

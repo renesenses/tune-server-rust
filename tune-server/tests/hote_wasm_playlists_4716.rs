@@ -358,6 +358,7 @@ impl StreamingService for ServiceDeBanc {
             covers: Vec::new(),
             track_count: 1,
             owner: None,
+            editable: None,
         }])
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {

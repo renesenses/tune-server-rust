@@ -744,6 +744,14 @@ impl PlaybackOrchestrator {
         let stream_url = self
             .streamer
             .get_stream_url(&session_id, &server_ip, &out_ext);
+        // #6059 — un flux natif qui commence à la position le dit dans son
+        // URL : la sortie DLNA rapporte ensuite la position du renderer à la
+        // piste (`outputs::dlna_depart_natif`).
+        let depart_natif_ms = crate::outputs::dlna_depart_natif::depart_de_session(&session_id);
+        let stream_url = match depart_natif_ms {
+            Some(d) => crate::outputs::dlna_depart_natif::url_avec_depart(&stream_url, d),
+            None => stream_url,
+        };
 
         // For a transcoded WAV/LPCM stream served with an exact byte length
         // (the file-transcode path pre-encodes the whole WAV, so file_size is
@@ -799,7 +807,9 @@ impl PlaybackOrchestrator {
             // ends at real EOF). Fall back to the scanned duration if the probe
             // fails, so a NAS timeout never blanks the duration entirely.
             let probed_secs = crate::audio::analyzer::get_duration(&file_path).await.ok();
-            Some(passthrough_didl_duration_ms(probed_secs, track.duration_ms))
+            let duree = passthrough_didl_duration_ms(probed_secs, track.duration_ms);
+            // #6059 — la DIDL décrit le flux SERVI : ce qui reste après le départ.
+            Some(duree - depart_natif_ms.unwrap_or(0).min(duree.max(0) as u64) as i64)
         } else {
             Some(track.duration_ms)
         };
@@ -1179,14 +1189,52 @@ impl PlaybackOrchestrator {
         {
             // #4378 — un DSDIFF compressé DST n'est pas du DSD : le servir
             // brut ferait lire au renderer des trames DST comme des bits DSD,
-            // donc du bruit. Il passe par le décodeur, quel que soit le mode
-            // DSD de la zone et quoi qu'annonce le renderer.
-            info!(
-                zone_id = req.zone_id,
-                file = %file_path,
-                "dsd_dst_jamais_servi_brut"
+            // donc du bruit. Le FICHIER ne part donc jamais tel quel.
+            //
+            // #6221 — mais quand la zone servirait en natif un `.dsf`/`.dff`
+            // non compressé (même règle : `should_dsd_passthrough`), le
+            // passthrough sert un DSF FABRIQUÉ à la volée depuis le DST
+            // décodé (`audio::dsf_depuis_dst`, voir `servir_en_passthrough`).
+            // Sinon, ou si ce DSF ne peut pas se préparer (feature `dst`
+            // absente, plus de 6 voies, cadence hors temps réel), le DST
+            // passe par le décodeur PCM, comme avant.
+            let did = identifiant_du_renderer(
+                req.output_device_id.as_deref(),
+                zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
             );
-            false
+            let natif = self.should_dsd_passthrough(req.zone_id, did).await;
+            let dsf = if natif {
+                let fp = file_path.to_string();
+                tokio::task::spawn_blocking(move || {
+                    crate::audio::dsf_depuis_dst::DsfDepuisDst::preparer(&fp)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)
+            } else {
+                Err("le renderer ne reçoit pas le DSD natif".into())
+            };
+            match dsf {
+                Ok(dsf) => {
+                    info!(
+                        zone_id = req.zone_id,
+                        file = %file_path,
+                        octets = dsf.total(),
+                        "dsd_dst_servi_en_dsf_reconstruit"
+                    );
+                    true
+                }
+                Err(motif) => {
+                    info!(
+                        zone_id = req.zone_id,
+                        file = %file_path,
+                        natif,
+                        motif = %motif,
+                        "dsd_dst_jamais_servi_brut"
+                    );
+                    false
+                }
+            }
         } else if source_format == Some(AudioFormat::Dsd) && is_network_output {
             let did = identifiant_du_renderer(
                 req.output_device_id.as_deref(),
@@ -2236,6 +2284,29 @@ impl PlaybackOrchestrator {
             cible_encodable(src_fmt.dlna_transcode_target())
         };
         let mut out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
+        // #4354 — la zone a déjà manqué son pré-tampon sur un DSD décimé :
+        // la décimation vise 176,4 kHz. Seulement pour un DSD servi en PCM
+        // à une sortie réseau (jamais en DoP, dont les bits ne se déciment
+        // pas).
+        if src_fmt == AudioFormat::Dsd
+            && is_network_output
+            && transport_dsd(
+                false,
+                true,
+                &ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id),
+            ) == TransportDsd::Pcm
+        {
+            let apres = crate::audio::repli_dsd_4354::cadence_apres_repli(req.zone_id, out_sr);
+            if apres != out_sr {
+                info!(
+                    zone_id = req.zone_id,
+                    de_hz = out_sr,
+                    vers_hz = apres,
+                    "dsd_pcm_repli_176k_applique"
+                );
+                out_sr = apres;
+            }
+        }
         // Apply zone max_sample_rate cap
         if let Some(max_sr) = zone_max_sample_rate {
             if out_sr > max_sr {
@@ -3203,6 +3274,29 @@ impl PlaybackOrchestrator {
             // porte le poste de relève, et donc un égaliseur activé ou changé
             // en cours de piste sans refaire la session UPnP.
             let relais_en_vol = !is_local_output;
+            // #6130 — diagnostic : le contexte relu par le journal de chaque
+            // connexion du renderer. Ne change rien au rendu.
+            let contexte = crate::http::streamer::ContexteDeConversion {
+                zone_id: req.zone_id,
+                source: format!(
+                    "bibliotheque fichier={} source={}/{} decodeur_sortie={out_sr}/{out_bd} canaux={channels}",
+                    std::path::Path::new(file_path.as_str())
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("-"),
+                    decision.sample_rate,
+                    decision.bit_depth,
+                ),
+                chaine: if relais || relais_en_vol {
+                    dsp.decrire()
+                } else {
+                    "aucun_relais (sortie locale : ses etages sont appliques par sa boucle)"
+                        .to_string()
+                },
+                precedente: self.decrire_la_piste_precedente(req.zone_id).await,
+            };
+            self.poser_le_contexte_de_conversion(&session_id, contexte)
+                .await;
             let tx = if relais || relais_en_vol {
                 if relais {
                     tracing::info!(zone_id = req.zone_id, "local_channel_dsp_relay_inserted");
@@ -3388,6 +3482,31 @@ impl PlaybackOrchestrator {
             ref conteneur_flac_neuf,
             ..
         } = *decision;
+        // #6221 — un DSDIFF DST vers un renderer réseau ne part JAMAIS brut
+        // (#4378) : le passthrough sert à sa place un DSF fabriqué à la volée.
+        // La décision (`decider_les_forcages_reseau`) l'a déjà préparé une
+        // fois ; on le reprépare ici (lecture d'en-tête seulement).
+        let dsf_depuis_dst = if source_format == Some(AudioFormat::Dsd)
+            && is_network_output
+            && crate::audio::dff::est_un_dff_dst(file_path)
+        {
+            let fp = file_path.clone();
+            let dsf = tokio::task::spawn_blocking(move || {
+                crate::audio::dsf_depuis_dst::DsfDepuisDst::preparer(&fp)
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r)?;
+            Some(Arc::new(dsf))
+        } else {
+            None
+        };
+        let fmt = if dsf_depuis_dst.is_some() {
+            "dsf".to_string()
+        } else {
+            fmt.clone()
+        };
+        let fmt = &fmt;
         let flux = {
             // Standard passthrough: serve the raw file.
             // For DSD, use the MIME type declared by the renderer (from GetProtocolInfo)
@@ -3431,7 +3550,10 @@ impl PlaybackOrchestrator {
             // FLAC analogue of the WAV size/duration fix in 1046ae8e. Only the
             // network passthrough path is touched; local/OAAT/WAV-transcode
             // paths keep their existing sizing (they never reach this branch).
-            let passthrough_disk_size = if is_network_output {
+            let passthrough_disk_size = if let Some(dsf) = dsf_depuis_dst.as_ref() {
+                // #6221 — la taille du DSF fabriqué, pas celle du `.dff` DST.
+                Some(dsf.total())
+            } else if is_network_output {
                 tokio::fs::metadata(&file_path).await.ok().map(|m| m.len())
             } else {
                 None
@@ -3440,11 +3562,31 @@ impl PlaybackOrchestrator {
             // l'en-tête puis les trames, pas le fichier : `res@size` et
             // Content-Length doivent dire ces octets-là (même raison que
             // #1132 juste au-dessus).
-            let passthrough_file_size = conteneur_flac_neuf
+            // #6059 — renderer profilé « Seek inopérant » (Yamaha R-N2000A) et
+            // relecture à une position : le flux NATIF commence à la trame (ou
+            // au bloc) de cette position, sous un en-tête réécrit. Pas sur le
+            // conteneur FLAC neuf de #4800, qui a déjà sa propre carte.
+            // #6221 — pas sur le DSF fabriqué : la carte de #6059 réécrit
+            // l'en-tête du fichier SUR DISQUE, qui est ici du DST.
+            let depart_natif =
+                if is_network_output && conteneur_flac_neuf.is_none() && dsf_depuis_dst.is_none() {
+                    let did = req
+                        .output_device_id
+                        .as_deref()
+                        .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()));
+                    self.preparer_depart_natif_6059(did, req.seek_ms, file_path)
+                        .await
+                } else {
+                    None
+                };
+            let passthrough_file_size = depart_natif
                 .as_ref()
-                .map(|m| m.total)
+                .map(|d| d.carte.total)
+                .or(conteneur_flac_neuf.as_ref().map(|m| m.total))
                 .or(passthrough_disk_size)
                 .or_else(|| track_file_size.map(|s| s as u64));
+            let duree_servie_ms = (track_duration_ms as u64)
+                .saturating_sub(depart_natif.as_ref().map_or(0, |d| d.depart_ms));
 
             let info = StreamInfo {
                 format: fmt.clone(),
@@ -3453,7 +3595,8 @@ impl PlaybackOrchestrator {
                 bit_depth,
                 channels,
                 file_size: passthrough_file_size,
-                duration_ms: Some(track_duration_ms as u64),
+                duration_ms: Some(duree_servie_ms),
+                dsd_reconstruit_depuis_dst: dsf_depuis_dst.is_some(),
                 ..Default::default()
             };
 
@@ -3461,6 +3604,22 @@ impl PlaybackOrchestrator {
                 .streamer
                 .create_file_session(info, file_path.clone(), false)
                 .await;
+            if let Some(dsf) = dsf_depuis_dst.clone() {
+                info!(
+                    zone_id = req.zone_id,
+                    file = %file_path,
+                    octets = dsf.total(),
+                    canaux = dsf.canaux(),
+                    cadence = dsf.cadence(),
+                    mime = %mime,
+                    "dst_decompresse_en_dsf_servi"
+                );
+                self.streamer.set_source_virtuelle(&session_id, dsf).await;
+            }
+            if let Some(d) = depart_natif {
+                crate::outputs::dlna_depart_natif::inscrire_session(&session_id, d.depart_ms);
+                self.streamer.set_faststart(&session_id, d.carte).await;
+            }
 
             // #4800 — FLAC de l'enregistreur (`Lavf` sans MD5, #4350) vers le
             // réseau : servi tel quel sous son en-tête neuf. La carte est la

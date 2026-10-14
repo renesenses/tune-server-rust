@@ -52,6 +52,7 @@ mod pg_schema_parity;
 mod pg_sqlite_type_parity;
 pub mod play_queue_repo;
 pub mod playlist_repo;
+pub mod playlists_reconcile;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(all(test, feature = "postgres"))]

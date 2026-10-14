@@ -2446,6 +2446,36 @@ impl PlaybackOrchestrator {
         rc::regle_effective_with(&self.db, zone_id, album_id, canaux).map(|r| r.matrice)
     }
 
+    /// #6247 — réappliquer la réaffectation des canaux sur chaque zone qui
+    /// joue une piste de cet album, après `PUT|DELETE
+    /// /channel-remap/albums/{id}`. La règle d'album n'était posée qu'au
+    /// démarrage de la piste suivante : « Enregistrer pour cet album » ne
+    /// changeait rien à la piste en cours. Rend `true` si au moins une sortie
+    /// locale vivante l'a reçue.
+    pub async fn refresh_album_reaffectation(&self, album_id: i64) -> bool {
+        let zones = ZoneRepo::with_backend(self.db.clone())
+            .list()
+            .unwrap_or_default();
+        let mut a_chaud = false;
+        for zone_id in zones.into_iter().filter_map(|z| z.id) {
+            let Some(track_id) = self
+                .playback
+                .get_state(zone_id)
+                .await
+                .now_playing
+                .and_then(|np| np.track_id)
+            else {
+                continue;
+            };
+            let (album_de_la_piste, _) =
+                crate::audio::reaffectation_canaux::album_et_canaux_de_la_piste(&self.db, track_id);
+            if album_de_la_piste == Some(album_id) {
+                a_chaud |= self.refresh_zone_reaffectation(zone_id).await;
+            }
+        }
+        a_chaud
+    }
+
     /// #6044 — réappliquer la réaffectation des canaux à la sortie locale qui
     /// joue, sans attendre la piste suivante. Comme le repli mono : aucun état
     /// à emporter, la nouvelle matrice prend effet au bloc suivant. Rend

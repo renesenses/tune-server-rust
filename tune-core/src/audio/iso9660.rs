@@ -915,7 +915,7 @@ pub fn contenu_audio(image: &Path) -> io::Result<ContenuAudio> {
             continue;
         };
         let nom = f.chemin.rsplit('/').next().unwrap_or("");
-        if nom.starts_with("._") {
+        if crate::scanner::est_un_nom_appledouble(nom) {
             continue;
         }
         if EXTENSIONS_AUDIO_DANS_IMAGE.contains(&ext.as_str()) {

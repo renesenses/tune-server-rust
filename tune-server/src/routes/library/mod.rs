@@ -45,7 +45,7 @@ mod reidentify;
 mod reports;
 // tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
 // fichiers de CETTE machine.
-mod reveler;
+pub(crate) mod reveler;
 mod search;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
@@ -450,6 +450,9 @@ pub fn router() -> Router<AppState> {
             "/tracks/{id}/tenues",
             get(tracks::champs_tenus_get).delete(tracks::champs_tenus_retablir),
         )
+        // #6124 — les balises réellement présentes dans le fichier, relues à
+        // la demande (lecture seule, plafonnée, sans image).
+        .route("/tracks/{id}/file-tags", get(tracks::track_file_tags))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))

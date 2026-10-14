@@ -1279,6 +1279,12 @@ mod tests {
     #[test]
     fn tune_key_mapping_returns_none_for_unknown() {
         assert!(tune_key_to_lofty("unknown_field").is_none());
+        // #5519 : le gain approché depuis `foo_dr.txt` n'est JAMAIS écrit
+        // dans un fichier — sa clé n'a pas de correspondance, l'écrivain la
+        // saute (`tag_writer_unknown_key_skipped`).
+        assert!(
+            tune_key_to_lofty(crate::audio::replaygain::gain_approche::CLE_MESURE_FOO_DR).is_none()
+        );
         assert!(tune_key_to_lofty("").is_none());
     }
 

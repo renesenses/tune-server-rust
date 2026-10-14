@@ -225,6 +225,12 @@ path = "tests/ordre_des_passes_5169.rs"
 name = "rattrapage_foo_dr_5168"
 path = "tests/rattrapage_foo_dr_5168.rs"
 
+# #5519 — le gain approché depuis foo_dr.txt, plafonné par la crête.
+# `autotests = false` : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "gain_approche_foo_dr_5519"
+path = "tests/gain_approche_foo_dr_5519.rs"
+
 # #5594 — la clé du signal PCM des FLAC et son rattrapage par en-tête. Binaire
 # à lui seul : la pause des tâches de fond est un état de PROCESSUS.
 [[test]]
@@ -513,6 +519,9 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_Power",
+    # #5410 — la température des zones thermiques (compteurs PDH « Thermal
+    # Zone Information »), pour la garde thermique des analyses.
+    "Win32_System_Performance",
 ] }
 
 # #2219 — témoin de `resolve_streaming_url` par sa porte publique, avant que

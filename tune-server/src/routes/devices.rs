@@ -85,13 +85,31 @@ async fn list_sendspin_players(
     axum::Extension(contexte): axum::Extension<super::sendspin::ContexteSendspin>,
 ) -> Json<Value> {
     let appairage = contexte.decrire().await;
-    let players = state.discovered_sendspin_players().await;
+    // Liste d'exclusion : chaque enceinte dit si Tune s'interdit de la
+    // contacter, et sous quel identifiant (annonce ou client_id appris).
+    let exclusions = contexte.exclusions();
+    let mut players = state.discovered_sendspin_players().await;
+    for p in &mut players {
+        let client_id = p["websocket_url"]
+            .as_str()
+            .and_then(|u| contexte.client_du_lien(u));
+        let exclu = p["id"].as_str().is_some_and(|i| exclusions.contains(i))
+            || client_id.as_ref().is_some_and(|c| exclusions.contains(c));
+        p["client_id"] = json!(client_id);
+        p["excluded"] = json!(exclu);
+    }
     // #3326 S2-a — les pairs qui ont mené une poignée de main Noise jusqu'au
     // bout, avec ce qu'ils ont dit d'eux dans leur `client/hello`. C'est une
     // liste DIFFÉRENTE de `players` : celle-ci vient du réseau (mDNS), celle-là
     // du protocole. Un pair peut figurer dans l'une sans l'autre — une enceinte
     // qui compose vers nous n'a aucune raison de s'annoncer en mDNS.
-    let pairs = tune_core::sendspin::registre::decrire();
+    let mut pairs = tune_core::sendspin::registre::decrire();
+    for p in &mut pairs {
+        let exclu = p["client_id"]
+            .as_str()
+            .is_some_and(|c| exclusions.contains(c));
+        p["excluded"] = json!(exclu);
+    }
     Json(json!({
         "service": tune_core::discovery::sendspin::SERVICE_LECTEUR,
         "server_service": tune_core::discovery::sendspin::SERVICE_SERVEUR,
@@ -111,6 +129,7 @@ async fn list_sendspin_players(
         "players": players,
         "handshaked_count": pairs.len(),
         "handshaked": pairs,
+        "excluded": exclusions,
     }))
 }
 
@@ -1399,11 +1418,10 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
         // l'ordonnanceur : un balayage bloqué dans le greffon ALSA de PipeWire
         // y garait un fil par chargement de page, jusqu'à ce que le serveur ne
         // réponde plus du tout.
-        let devices = if crate::background::any_local_output_playing(&state).await {
-            tune_core::outputs::local::cached_audio_devices()
-        } else {
-            tune_core::outputs::local::list_audio_devices_with_backend_bounded(backend).await
-        };
+        let devices = crate::background::parc_local_sans_couper_la_lecture(&state, || {
+            tune_core::outputs::local::list_audio_devices_with_backend_bounded(backend)
+        })
+        .await;
         // Publier l'identifiant de registre à côté du nom.
         //
         // Cette charge utile n'en portait aucun, et un client qui veut créer

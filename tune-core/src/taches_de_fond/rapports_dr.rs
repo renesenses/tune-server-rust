@@ -98,6 +98,11 @@ pub struct Bilan {
     pub stats: usize,
     /// Pistes qui ont reçu leur DR d'un rapport.
     pub tracks_written: usize,
+    /// Pistes dont le DR venait déjà d'un rapport, sans ReplayGain, relues
+    /// pour en garder la crête et le RMS (#5519).
+    pub tracks_levels_pending: usize,
+    /// Pistes qui ont reçu crête et RMS d'un rapport (#5519).
+    pub tracks_levels_written: usize,
     /// La passe s'est arrêtée sur une pause de l'utilisateur.
     pub interrupted: bool,
     /// Durée de la passe.
@@ -226,6 +231,9 @@ struct Piste {
     titre: Option<String>,
     canaux: Option<u16>,
     temoin: Option<String>,
+    /// La piste a déjà son DR (lu d'un rapport avant #5519) : elle n'est là
+    /// que pour la crête et le RMS du rapport, faute de ReplayGain.
+    a_un_dr: bool,
 }
 
 /// Les pistes sans DR, par identifiant croissant.
@@ -233,14 +241,28 @@ struct Piste {
 /// Les pistes CUE virtuelles ont `file_path` NUL et leur fichier dans
 /// `cue_media_path` : le dossier est le même, le numéro de piste est celui de
 /// la feuille.
+///
+/// #5519 : s'y ajoutent les pistes dont le DR vient DÉJÀ d'un rapport
+/// (`dr_source = sidecar`, posé avant que le scan garde la crête et le RMS),
+/// qui n'ont aucun ReplayGain et pas encore de `foo_dr_mesure`. Elles sont
+/// relues une fois : la mesure, ou `v1;-`, les fait sortir de la sélection.
 const CANDIDATS_SQL: &str = "SELECT t.id, COALESCE(NULLIF(t.file_path, ''), t.cue_media_path), \
-            t.track_number, t.disc_number, t.title, t.channels, v.value \
+            t.track_number, t.disc_number, t.title, t.channels, v.value, \
+            CASE WHEN EXISTS (SELECT 1 FROM track_metadata m \
+                   WHERE m.track_id = t.id AND m.key = 'dr_track' AND TRIM(m.value) != '') \
+                 THEN 1 ELSE 0 END \
      FROM tracks t \
      LEFT JOIN track_metadata v ON v.track_id = t.id AND v.key = 'dr_rapport_vu' \
      WHERE COALESCE(NULLIF(t.file_path, ''), t.cue_media_path) IS NOT NULL \
        AND COALESCE(NULLIF(t.file_path, ''), t.cue_media_path) != '' \
-       AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+       AND (NOT EXISTS (SELECT 1 FROM track_metadata m \
              WHERE m.track_id = t.id AND m.key = 'dr_track' AND TRIM(m.value) != '') \
+         OR (EXISTS (SELECT 1 FROM track_metadata m \
+               WHERE m.track_id = t.id AND m.key = 'dr_source' AND m.value = 'sidecar') \
+             AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+               WHERE m.track_id = t.id AND m.key = 'rg_track_gain' AND TRIM(m.value) != '') \
+             AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+               WHERE m.track_id = t.id AND m.key = 'foo_dr_mesure'))) \
      ORDER BY t.id";
 
 fn positif(v: Option<i64>) -> Option<u32> {
@@ -265,6 +287,7 @@ fn lire_les_candidats(backend: &Arc<dyn DbBackend>) -> Result<Vec<Piste>, String
                     .and_then(|v| v.as_i64())
                     .and_then(|c| u16::try_from(c).ok()),
                 temoin: r.get(6).and_then(|v| v.as_string()),
+                a_un_dr: r.get(7).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
             })
         })
         .collect())
@@ -286,6 +309,39 @@ fn ecrire_le_dr_du_rapport(repo: &TrackMetadataRepo, track_id: i64, dr: u8) -> b
         && repo
             .set(track_id, "dr_source", crate::metadata::DR_SOURCE_SIDECAR)
             .is_ok()
+}
+
+/// #5519 — garder la crête et le RMS que le rapport donne pour la piste,
+/// faute de ReplayGain. Une piste déjà dotée d'un `rg_track_gain` (relu
+/// juste avant) n'en reçoit pas : une mesure réelle prime. Une piste sans DR
+/// préalable que le rapport ne désigne pas n'est pas marquée : elle reste
+/// candidate pour son DR, et la mémoire du dossier la couvre. Une piste qui
+/// n'était là QUE pour ses niveaux est marquée `v1;-`, pour ne pas revenir.
+fn ecrire_les_niveaux_du_rapport(
+    repo: &TrackMetadataRepo,
+    p: &Piste,
+    rapport: &foo_dr::RapportDr,
+    numero: Option<u32>,
+) -> bool {
+    use crate::audio::replaygain::gain_approche::{CLE_MESURE_FOO_DR, MESURE_ABSENTE, encoder};
+    let existant = repo.get_all(p.id).ok().unwrap_or_default();
+    if existant
+        .get("rg_track_gain")
+        .is_some_and(|g| !g.trim().is_empty())
+    {
+        return false;
+    }
+    match rapport.mesures_pour_la_piste(numero, p.disque, p.titre.as_deref(), p.canaux) {
+        Some(m) => repo
+            .set(p.id, CLE_MESURE_FOO_DR, &encoder(m.crete_db, m.rms_db))
+            .is_ok(),
+        None => {
+            if p.a_un_dr {
+                let _ = repo.set(p.id, CLE_MESURE_FOO_DR, MESURE_ABSENTE);
+            }
+            false
+        }
+    }
 }
 
 /// Le dossier tel que le disque le connaît : le chemin de la base d'abord,
@@ -317,9 +373,13 @@ fn traiter_le_dossier(
     bilan: &mut Bilan,
 ) -> bool {
     let max_id = pistes.iter().map(|p| p.id).max().unwrap_or(0);
+    // #5519 : une piste qui n'est là que pour sa crête et son RMS n'a jamais
+    // été relue pour eux — la mémoire du dossier ne la couvre pas.
+    let niveaux_a_relire = pistes.iter().any(|p| p.a_un_dr);
 
     // 1. La mémoire : un seul `stat` quand rien n'a bougé.
     if !force
+        && !niveaux_a_relire
         && let Some(t) = pistes
             .first()
             .and_then(|p| p.temoin.as_deref())
@@ -362,6 +422,14 @@ fn traiter_le_dossier(
                         .and_then(|s| s.to_str())
                         .and_then(foo_dr::numero_dans_le_nom)
                 });
+                if ecrire_les_niveaux_du_rapport(repo, p, &rapport, numero) {
+                    bilan.tracks_levels_written += 1;
+                }
+                if p.a_un_dr {
+                    // Son DR est déjà là : elle ne compte ni comme écrite ni
+                    // comme restante pour la mémoire du dossier.
+                    continue;
+                }
                 match rapport.dr_pour_la_piste(numero, p.disque, p.titre.as_deref(), p.canaux) {
                     Some(dr) if ecrire_le_dr_du_rapport(repo, p.id, dr) => {
                         bilan.tracks_written += 1;
@@ -383,7 +451,15 @@ fn traiter_le_dossier(
             }
         }
         None => {
-            restantes.extend(pistes.iter().map(|p| p.id));
+            for p in pistes.iter().filter(|p| p.a_un_dr) {
+                // Le rapport a disparu : rien à garder, et ne plus revenir.
+                let _ = repo.set(
+                    p.id,
+                    crate::audio::replaygain::gain_approche::CLE_MESURE_FOO_DR,
+                    crate::audio::replaygain::gain_approche::MESURE_ABSENTE,
+                );
+            }
+            restantes.extend(pistes.iter().filter(|p| !p.a_un_dr).map(|p| p.id));
             mtime_ns(&meta_dossier).map(|mtime| Temoin::SansRapport { mtime, max_id })
         }
     };
@@ -413,7 +489,8 @@ pub fn rattraper(backend: &Arc<dyn DbBackend>, forces: &HashSet<PathBuf>) -> Bil
             return bilan;
         }
     };
-    bilan.tracks_without_dr = pistes.len();
+    bilan.tracks_levels_pending = pistes.iter().filter(|p| p.a_un_dr).count();
+    bilan.tracks_without_dr = pistes.len() - bilan.tracks_levels_pending;
 
     let mut par_dossier: BTreeMap<PathBuf, Vec<Piste>> = BTreeMap::new();
     for p in pistes {
@@ -466,6 +543,8 @@ fn passe_publiee(backend: &Arc<dyn DbBackend>, forces: &HashSet<PathBuf>) -> Bil
         rapports = bilan.reports_found,
         stats = bilan.stats,
         ecrites = bilan.tracks_written,
+        niveaux_en_attente = bilan.tracks_levels_pending,
+        niveaux_ecrits = bilan.tracks_levels_written,
         interrompue = bilan.interrupted,
         duree_ms = bilan.duration_ms,
         "rapports_dr_rattrapage"

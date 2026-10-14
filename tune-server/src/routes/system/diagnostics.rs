@@ -837,10 +837,14 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         {
             // #5612 — hors de l'ordonnanceur et borné : un balayage bloqué
             // dans le greffon ALSA de PipeWire ne doit pas figer le serveur.
+            // #6119 — jamais pendant qu'une sortie locale joue : la page Zones
+            // charge cette fiche, et sonder ASIO y coupait la lecture WASAPI.
             let devs: Vec<String> =
-                tune_core::outputs::local::list_audio_devices_with_backend_bounded(
-                    audio_backend_pref,
-                )
+                crate::background::parc_local_sans_couper_la_lecture(&state, || {
+                    tune_core::outputs::local::list_audio_devices_with_backend_bounded(
+                        audio_backend_pref,
+                    )
+                })
                 .await
                 .iter()
                 .map(|d| d.name.clone())
@@ -882,6 +886,9 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let rss_mb = get_rss_mb();
     // #5189 — température du processeur pour l'écran « État du serveur ».
     let cpu_temp_c = temperature_processeur().await;
+    // #5410 — sans température lisible, les analyses de fond sont bridées à
+    // un fichier à la fois : l'écran doit le dire.
+    let analyses_bridees = bridage_des_analyses().await;
 
     // #3205 — le seul chiffre qui dise si l'audio a réellement sauté.
     let ring_starvation = releve_famine_anneau(&state).await;
@@ -915,8 +922,15 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "process_started_at": state.process_started_at_rfc3339(),
         "memory_rss_mb": rss_mb,
         // #5189 — °C, au dixième ; `null` sans capteur lisible (macOS,
-        // Windows, conteneur, machine virtuelle) ou si sysfs tarde.
+        // Windows sans zone thermique, conteneur, machine virtuelle) ou si la
+        // lecture tarde. #5410 : Windows lit ses zones thermiques ACPI.
         "cpu_temp_c": cpu_temp_c,
+        // #5410 — `null` quand la garde thermique mesure ; sinon le motif
+        // (`temperature_illisible`, `temperature_figee`) : les analyses de
+        // fond tournent alors à `analyses_bridees_largeur` fichier à la fois.
+        "analyses_bridees": analyses_bridees,
+        "analyses_bridees_largeur": analyses_bridees
+            .map(|_| tune_core::audio::thermal::LARGEUR_SANS_THERMOMETRE),
         "db_backend": db_backend,
         "active_zones": zone_count,
         "zone_poller_metrics": zone_poller_metrics,
@@ -959,6 +973,10 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // pas leur zone. Le journal porte `dsp_ecretage` au premier écrêtage
         // d'une piste et à sa fin.
         "dsp_ecretage": tune_core::audio::ecretage::releve(),
+        // #6255 — les derniers `bruit_suspect_reseau` : ce que le serveur a
+        // envoyé à un lecteur réseau et qui s'entendra comme du bruit.
+        "bruit_suspect_reseau": tune_core::http::bruit_reseau::derniers(),
+        "bruit_suspect_reseau_actif": tune_core::http::bruit_reseau::actif(),
         // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
         // une ligne WARN que l'utilisateur ne verra jamais.
         "asio_warm_scan": crate::startup::asio_warm_status(),
@@ -1024,6 +1042,24 @@ async fn temperature_processeur() -> Option<f64> {
     let lecture = tokio::task::spawn_blocking(tune_core::audio::thermal::cpu_package_temp_celsius);
     match tokio::time::timeout(std::time::Duration::from_millis(300), lecture).await {
         Ok(Ok(Some(c))) => Some((c * 10.0).round() / 10.0),
+        _ => None,
+    }
+}
+
+/// #5410 — le motif du bridage des analyses de fond, ou `None` quand la
+/// température est lisible. Même lecture que celle des analyses
+/// (`tune_core::audio::thermal::lecture_thermique`, relue au plus toutes les
+/// 15 s), passée hors de l'exécuteur et abandonnée au-delà de 300 ms comme
+/// la température : un capteur lent ne retient pas le rapport. Un abandon
+/// rend `None` (rien n'est affirmé).
+async fn bridage_des_analyses() -> Option<&'static str> {
+    let lecture = tokio::task::spawn_blocking(|| {
+        tune_core::audio::thermal::lecture_thermique()
+            .motif_du_bridage()
+            .map(|m| m.id())
+    });
+    match tokio::time::timeout(std::time::Duration::from_millis(300), lecture).await {
+        Ok(Ok(motif)) => motif,
         _ => None,
     }
 }
@@ -2557,6 +2593,21 @@ confondre avec la famine de l'anneau, comptee au-dessus)\n\n",
 journal porte `dsp_ecretage` au premier ecretage d'une piste et a sa fin, \
 jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
     );
+    // #6255 — ce que le serveur a ENVOYÉ aux lecteurs réseau et qui
+    // s'entendra comme du bruit (reprise hors trame, décodage décalé, en-tête
+    // au milieu). Le lecteur ne le dit jamais : sans cette section, le bruit
+    // blanc du .18 du 13/10 ne laissait rien dans le rapport.
+    let bruit_reseau = tune_core::http::bruit_reseau::derniers();
+    md.push_str(&tune_core::http::bruit_reseau::section_du_rapport(
+        &bruit_reseau,
+        |id| {
+            zones
+                .iter()
+                .find(|z| z["id"].as_i64() == Some(id))
+                .and_then(|z| z["name"].as_str())
+                .map(str::to_string)
+        },
+    ));
     md.push_str("## Database\n");
     // #3182 : c'était `format!("- Engine: sqlite\n")` — un `format!` sans
     // argument, donc une chaîne littérale, et toute installation PostgreSQL
@@ -2697,6 +2748,8 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         "dsp_egaliseur": dsp_egaliseur,
         // Le pendant JSON de la section « DSP — ecretage » (#2218).
         "dsp_ecretage": dsp_ecretage,
+        // Le pendant JSON de la section « Lecteurs reseau — bruit suspect ».
+        "bruit_suspect_reseau": bruit_reseau,
         "database": {
             // #3182 : même mensonge que la ligne markdown ci-dessus, dans le
             // corps JSON que le client lit.

@@ -735,7 +735,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- chemin vit ici, avec les bornes de la piste dans le fichier.
     cue_media_path TEXT,
     cue_start_ms INTEGER,
-    cue_end_ms INTEGER
+    cue_end_ms INTEGER,
+    -- Note de la piste lue dans ses balises, 0 a 5 (#6123, migration 124).
+    -- NULL = le fichier n'en porte pas. Echelle : `metadata::note`.
+    rating INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -781,10 +784,23 @@ CREATE TABLE IF NOT EXISTS playlists (
 -- artiste, album, duree, pochette, album chez le service) sont copiees a
 -- l'ajout : lister la playlist n'appelle pas le service. Meme forme que
 -- `queue_items`. Jumelle de la migration SQLite 109 et de la PG 072.
+--
+-- #6179 — troisieme forme : la ligne INTROUVABLE (`track_id` ET `source`
+-- nuls). Quand une piste de la bibliotheque disparait (fichier supprime,
+-- deplace, re-balise, piste perimee retiree par un scan), sa ligne de playlist
+-- RESTE, a sa position : le declencheur `playlist_tracks_garde_l_orpheline`
+-- (`migrations/playlist_tracks_orphelines.sql`) y fige l'identite de la piste
+-- (titre, artiste, album, duree dans les colonnes d'affichage ; chemin,
+-- empreintes et MBID dans les colonnes ci-dessous) AVANT la suppression, et
+-- la reconciliation (`db/playlists_reconcile.rs`) la rattache a la piste
+-- quand elle reparait. `ON DELETE SET NULL` et non plus `CASCADE` : meme sans
+-- le declencheur, une suppression de piste ne peut plus effacer une ligne de
+-- playlist. Seul un geste de l'utilisateur la retire. Jumelle de la migration
+-- SQLite 125 et de la PG 089.
 CREATE TABLE IF NOT EXISTS playlist_tracks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
-    track_id INTEGER REFERENCES tracks(id) ON DELETE CASCADE,
+    track_id INTEGER REFERENCES tracks(id) ON DELETE SET NULL,
     position INTEGER NOT NULL DEFAULT 0,
     source TEXT,
     source_id TEXT,
@@ -794,8 +810,14 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
     album_source_id TEXT,
     duration_ms INTEGER,
     cover_url TEXT,
+    file_path TEXT,
+    audio_hash TEXT,
+    audio_fingerprint TEXT,
+    mbid TEXT,
+    missing_since INTEGER,
     CHECK ((track_id IS NOT NULL AND source IS NULL AND source_id IS NULL)
-        OR (track_id IS NULL AND source IS NOT NULL AND source_id IS NOT NULL))
+        OR (track_id IS NULL AND source IS NOT NULL AND source_id IS NOT NULL)
+        OR (track_id IS NULL AND source IS NULL AND source_id IS NULL))
 );
 
 CREATE TABLE IF NOT EXISTS zones (

@@ -50,6 +50,8 @@ async fn scan_de_demarrage_sur(db: &Arc<dyn DbBackend>, bus: &Arc<EventBus>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn le_scan_de_demarrage_compte_les_inchanges_au_total_5371() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let base = tune_core::test_scratch::scratch_dir("compteur-5371-base");
     let racine = tune_core::test_scratch::scratch_dir_in(
         std::env::current_dir().unwrap(),

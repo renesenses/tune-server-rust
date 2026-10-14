@@ -150,6 +150,7 @@ impl Dsp {
             &self.crossfeed,
             &self.pure_bypass,
             &self.mono_downmix,
+            None,
         )
         .expect("fenêtre complète : au moins 32 trames");
         let mots: Vec<u8> = prepared

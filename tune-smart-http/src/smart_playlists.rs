@@ -559,6 +559,7 @@ pub(crate) fn build_smart_query_rapport(
 /// |---|---|
 /// | `added_at` | son FICHIER a été modifié après / avant / entre (`t.file_mtime`, la même date que les collections) ; « jamais » : pas de date |
 /// | `last_played_at` | elle a été écoutée après la date ; sa DERNIÈRE écoute est avant / entre ; « jamais » : aucune écoute |
+/// | `added_at` / `last_played_at` « dans les N derniers jours » (#6122) | même lecture qu'« après », le seuil étant « il y a N jours » à l'heure de la requête |
 /// | `credit` | elle porte ce crédit (rôle, artiste, instrument) |
 ///
 /// `None` : le champ n'est pas l'un des trois — l'appelant continue. Un
@@ -571,22 +572,37 @@ fn condition_hors_colonne(
     value: &str,
     value_raw: Option<&Value>,
 ) -> Option<String> {
-    let date_du_fichier = "DATETIME(t.file_mtime, 'unixepoch')";
     let ecoutes = "SELECT track_id FROM listen_history WHERE track_id IS NOT NULL";
     Some(match (field, op) {
-        ("added_at", ">" | ">=" | "<" | "<=") => {
-            format!(
-                "{date_du_fichier} {op} {}",
-                regles_sql::horodatage_sql(value)
-            )
-        }
-        ("added_at", "between") => match regles_sql::bornes_de_dates(value_raw) {
-            Some((lo, hi)) => format!("{date_du_fichier} BETWEEN {lo} AND {hi}"),
+        // #6143 — la date du fichier se compare en SECONDES à une borne
+        // calculée en Rust : `DATETIME(t.file_mtime, 'unixepoch')` et
+        // `DATETIME('now', …)` sont propres à SQLite, et PostgreSQL les refuse.
+        ("added_at", ">" | ">=" | "<" | "<=") => match regles_sql::horodatage_epoch(value) {
+            Some(ts) => format!("t.file_mtime {op} {ts}"),
+            None => regles_sql::FAUX.to_string(),
+        },
+        ("added_at", "between") => match regles_sql::bornes_epoch(value_raw) {
+            Some((lo, hi)) => format!("t.file_mtime BETWEEN {lo} AND {hi}"),
             None => regles_sql::FAUX.to_string(),
         },
         // « jamais » : un fichier sans date connue — la même lecture que les
         // collections.
         ("added_at", "is_null") => "t.file_mtime IS NULL".to_string(),
+        // #6122 (forum 2217) — « dans les N derniers jours », même lecture que
+        // les collections : seuil lu à l'horloge à chaque requête, comparé en
+        // secondes (`file_mtime`) ou en ISO (`listened_at`).
+        ("added_at", regles_sql::DANS_LES_DERNIERS_JOURS) => {
+            match regles_sql::seuil_de(value_raw) {
+                Some(s) => format!("t.file_mtime >= {}", s.epoch),
+                None => regles_sql::FAUX.to_string(),
+            }
+        }
+        ("last_played_at", regles_sql::DANS_LES_DERNIERS_JOURS) => {
+            match regles_sql::seuil_de(value_raw) {
+                Some(s) => format!("t.id IN ({ecoutes} AND listened_at >= {})", s.iso),
+                None => regles_sql::FAUX.to_string(),
+            }
+        }
         ("last_played_at", ">" | ">=") => format!(
             "t.id IN ({ecoutes} AND listened_at {op} {})",
             regles_sql::horodatage_sql(value)
@@ -1150,6 +1166,32 @@ mod tests {
         let ctx = RefCtx::root(&EmptyResolver, Some(1));
         let (w, _order, _limit) = build_smart_query(rules, "all", "title", "asc", None, &ctx);
         w
+    }
+
+    /// #6143 — aucune règle de date ne compile en `DATETIME(…)`, fonction
+    /// propre à SQLite que PostgreSQL refuse ; et aucune n'est refusée.
+    #[test]
+    fn regles_de_date_sans_datetime_6143() {
+        for champ in ["added_at", "last_played_at"] {
+            for (op, valeur) in [
+                (">", r#""2024-01-01""#),
+                ("<", r#""2024-01-01""#),
+                (">", r#""now-90d""#),
+                ("<", r#""90d""#),
+                ("between", r#"["2018-01-01","now-30d"]"#),
+            ] {
+                let rules = format!(r#"[{{"field":"{champ}","op":"{op}","value":{valeur}}}]"#);
+                let w = where_of(&rules);
+                assert!(
+                    !w.to_uppercase().contains("DATETIME"),
+                    "{champ} {op} {valeur} compile encore en DATETIME (#6143) : {w}"
+                );
+                assert!(
+                    refusees_de(&rules).is_empty(),
+                    "{champ} {op} {valeur} refusée : {w}"
+                );
+            }
+        }
     }
 
     fn refusees_de(rules: &str) -> Vec<String> {

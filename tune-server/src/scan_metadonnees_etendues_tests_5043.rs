@@ -168,6 +168,8 @@ async fn bibliotheque_dantan(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn le_scan_range_les_metadonnees_etendues_sur_une_base_de_fichier() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let (racine, _piste) = piste_sur_disque("base-fichier");
     let etat = etat(racine.path());
 
@@ -191,6 +193,8 @@ async fn le_scan_range_les_metadonnees_etendues_sur_une_base_de_fichier() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn le_scan_complet_rattrape_un_fichier_inchange_sans_metadonnees_etendues() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let (_racine, etat, id) = bibliotheque_dantan("rattrapage").await;
 
     scan_manuel(&etat, true).await;
@@ -212,6 +216,8 @@ async fn le_scan_complet_rattrape_un_fichier_inchange_sans_metadonnees_etendues(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn une_piste_qui_na_que_des_lignes_replaygain_dr_upnp_reste_a_rattraper() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let (_racine, etat, id) = bibliotheque_dantan("piege-rg-dr-upnp").await;
 
     // L'état EXACT des 15 151 pistes du .18 : des lignes en base, posées par
@@ -253,6 +259,8 @@ async fn une_piste_qui_na_que_des_lignes_replaygain_dr_upnp_reste_a_rattraper() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn le_scan_complet_ne_rouvre_pas_un_fichier_qui_a_deja_ses_metadonnees_etendues() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let (_racine, etat, id) = bibliotheque_dantan("deja-pourvu").await;
 
     // Une métadonnée étendue en base, d'une valeur que le fichier ne porte
@@ -279,6 +287,8 @@ async fn le_scan_complet_ne_rouvre_pas_un_fichier_qui_a_deja_ses_metadonnees_ete
 
 #[tokio::test(flavor = "multi_thread")]
 async fn un_fichier_retouche_relit_ses_metadonnees_etendues_meme_sil_en_avait() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let (_racine, piste) = piste_sur_disque("retouche");
     let etat = etat(_racine.path());
     scan_manuel(&etat, false).await;
@@ -316,6 +326,8 @@ async fn un_fichier_retouche_relit_ses_metadonnees_etendues_meme_sil_en_avait() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn un_scan_incremental_ne_rouvre_aucun_fichier_inchange() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let (_racine, etat, id) = bibliotheque_dantan("incremental").await;
 
     scan_manuel(&etat, false).await;

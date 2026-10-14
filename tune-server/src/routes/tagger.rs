@@ -43,7 +43,13 @@ fn get_track_path(state: &AppState, track_id: i64) -> Result<Option<(String, Val
     let row = state
         .backend
         .query_one(
-            "SELECT path, title, artist_name, album_title, genre, year FROM tracks WHERE id = $1",
+            // #6245 — `tracks` n'a ni `path`, ni `artist_name`, ni
+            // `album_title` : la requête échouait et `/tagger/batch` comme
+            // `/tagger/preview` répondaient 500 avant d'avoir rien fait. Les
+            // noms se lisent par jointure, le chemin dans `file_path`.
+            "SELECT t.file_path, t.title, ar.name, al.title, t.genre, t.year FROM tracks t \
+             LEFT JOIN artists ar ON ar.id = t.artist_id \
+             LEFT JOIN albums al ON al.id = t.album_id WHERE t.id = $1",
             &[&track_id as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
@@ -57,7 +63,7 @@ fn get_track_path(state: &AppState, track_id: i64) -> Result<Option<(String, Val
             "artist_name": r.get(2).and_then(|v| v.as_string()),
             "album_title": r.get(3).and_then(|v| v.as_string()),
             "genre": r.get(4).and_then(|v| v.as_string()),
-            "year": r.get(5).and_then(|v| v.as_string()),
+            "year": r.get(5).and_then(|v| v.as_i64()),
         });
         Some((path, info))
     }))
@@ -175,23 +181,51 @@ fn update_track_db(state: &AppState, track_id: i64, fields: &BatchFields) -> Res
             )
             .ok();
     }
-    if let Some(artist) = &fields.artist {
+    // #6245 — `tracks` n'a pas de colonne `artist_name` : l'UPDATE échouait,
+    // et `.ok()` avalait l'erreur. Le nom passe par le chemin de
+    // `batch_set_artist` (l'artiste de ce nom, ou un nouveau), puis
+    // `artist_id`. Un échec remonte. Un nom vide ne change pas l'artiste.
+    let nom_artiste = fields
+        .artist
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+    if let Some(nom) = nom_artiste {
+        let (_, artist_id, _) = crate::routes::metadata::artiste_par_nom(&state.backend, nom)
+            .map_err(AppError::internal)?;
         state
             .backend
             .execute(
-                "UPDATE tracks SET artist_name = $1 WHERE id = $2",
-                &[artist as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
+                "UPDATE tracks SET artist_id = $1 WHERE id = $2",
+                &[&artist_id as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
             )
-            .ok();
+            .map_err(AppError::internal)?;
     }
-    if let Some(album) = &fields.album {
+    // #6270 — même défaut que l'artiste : `album_title` n'est pas une colonne
+    // de `tracks`. Le titre passe par `metadata::album_par_titre` (l'album de
+    // ce titre chez le même artiste, sinon un nouveau), puis `album_id`. Lu
+    // APRÈS l'artiste : un album créé l'est pour le nouvel artiste si la
+    // piste n'avait pas d'album.
+    let titre_album = fields
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    if let Some(titre) = titre_album {
+        let piste = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone())
+            .get(track_id)
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::internal("piste disparue"))?;
+        let (_, album_id, _) =
+            crate::routes::metadata::album_par_titre(&state.backend, titre, &piste)
+                .map_err(AppError::internal)?;
         state
             .backend
             .execute(
-                "UPDATE tracks SET album_title = $1 WHERE id = $2",
-                &[album as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
+                "UPDATE tracks SET album_id = $1 WHERE id = $2",
+                &[&album_id as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
             )
-            .ok();
+            .map_err(AppError::internal)?;
     }
     if let Some(genre) = &fields.genre {
         state
@@ -218,10 +252,13 @@ fn update_track_db(state: &AppState, track_id: i64, fields: &BatchFields) -> Res
         if fields.title.is_some() {
             champs.push(Champ::Titre);
         }
-        if fields.artist.is_some() {
+        // #6245 — tenu après l'UPDATE : `tenir_par_id` relit la ligne, donc
+        // fige le NOUVEL `artist_id`.
+        if nom_artiste.is_some() {
             champs.push(Champ::Artiste);
         }
-        if fields.album.is_some() {
+        // #6270 — tenu après l'UPDATE : fige le NOUVEL `album_id`.
+        if titre_album.is_some() {
             champs.push(Champ::Album);
         }
         if fields.genre.is_some() {

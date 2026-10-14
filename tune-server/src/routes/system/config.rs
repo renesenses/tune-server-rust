@@ -303,6 +303,11 @@ pub(super) async fn get_config(
         if k.starts_with(&format!("{UI_PREFERENCES}:")) {
             continue;
         }
+        // #5916 — le profil choisi par chaque appareil (clé : son adresse IP)
+        // n'est le réglage de personne, et ne se publie pas.
+        if k.starts_with(crate::routes::profil_par_appareil::PREFIXE) {
+            continue;
+        }
         // Voir `BACKEND_ACTIF_PAS_UN_REGLAGE` : une ligne écrite sous ce nom
         // n'est le réglage de personne, et la publier ici la ferait passer
         // pour le réglage auprès du client qui lit ce nom en premier.
@@ -439,6 +444,16 @@ pub(super) async fn get_config(
         // CLAP). Vide par défaut : rien d'exclu, le comportement d'avant.
         (
             tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+            json!([]),
+        ),
+        // #6198 — les genres de la passe CLAP : retenus (vide : tous) et
+        // écartés (vide : aucun). Ils ne touchent que le CLAP.
+        (
+            tune_core::taches_de_fond::perimetre::CLE_GENRES_CLAP_INCLUS,
+            json!([]),
+        ),
+        (
+            tune_core::taches_de_fond::perimetre::CLE_GENRES_CLAP_EXCLUS,
             json!([]),
         ),
         // `replaygain_analysis_enabled` n'est PAS ici : il est publié plus bas
@@ -1231,6 +1246,24 @@ fn normaliser_perimetre_des_analyses(
     Ok(true)
 }
 
+/// #6198 — les genres de la passe CLAP, retenus et écartés : la même forme
+/// que les racines exclues (tableau de chaînes, rognées, sans vide ni
+/// doublon, `null` = vide), refusée en 400 sinon. Ils ne touchent pas
+/// ReplayGain : aucune campagne à refermer.
+fn normaliser_genres_du_clap(values: &mut serde_json::Map<String, Value>) -> Result<(), AppError> {
+    use tune_core::taches_de_fond::perimetre::{
+        CLE_GENRES_CLAP_EXCLUS, CLE_GENRES_CLAP_INCLUS, normaliser,
+    };
+    for cle in [CLE_GENRES_CLAP_INCLUS, CLE_GENRES_CLAP_EXCLUS] {
+        let Some(brut) = values.get(cle) else {
+            continue;
+        };
+        let liste = normaliser(brut).map_err(|e| AppError::bad_request(format!("{cle} : {e}")))?;
+        values.insert(cle.to_string(), json!(liste));
+    }
+    Ok(())
+}
+
 fn normaliser_plafond_aleatoire(
     values: &mut serde_json::Map<String, Value>,
 ) -> Result<(), AppError> {
@@ -1427,6 +1460,7 @@ pub(super) async fn update_config(
     normaliser_vitesse_des_analyses(&mut values)?;
     let politique_de_lecture = normaliser_politique_de_lecture(&mut values)?;
     let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
+    normaliser_genres_du_clap(&mut values)?;
     let intervalle_reseau_demande = normaliser_intervalle_reseau(&mut values)?;
     let scan_au_demarrage_efface = normaliser_scan_au_demarrage(&mut values)?.is_some();
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
@@ -1602,6 +1636,22 @@ pub(super) async fn update_config(
     // démarrage (`regler` journalise ce qui change).
     if let Some(p) = politique_de_lecture {
         tune_core::taches_de_fond::priorite::politique::regler(p);
+    }
+    // #6255 — le détecteur de bruit des lecteurs réseau vaut pour les
+    // connexions qui s'ouvrent ensuite, sans redémarrage.
+    if cles_posees
+        .iter()
+        .any(|c| c == tune_core::http::bruit_reseau::CLE_REGLAGE)
+    {
+        let actif = tune_core::http::bruit_reseau::resoudre(
+            settings
+                .get(tune_core::http::bruit_reseau::CLE_REGLAGE)
+                .ok()
+                .flatten()
+                .as_deref(),
+        );
+        tune_core::http::bruit_reseau::regler(actif);
+        tracing::info!(actif, "network_noise_watch_applied");
     }
     // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
     let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
@@ -3105,11 +3155,12 @@ fn compter_liees(state: &AppState, sql_avant_in: &str, ids: &[i64]) -> i64 {
 /// Rendu AVANT toute suppression, pour que l'écran puisse le montrer. Les
 /// chiffres sont ceux des tables liées telles que le schéma les traite :
 ///
-/// - `playlists` : `playlist_tracks` est en `ON DELETE CASCADE` et les clés
-///   étrangères sont ACTIVES sous SQLite (`PRAGMA foreign_keys=ON`,
-///   `db/sqlite.rs`). Les entrées disparaissent des listes de lecture ; les
-///   listes elles-mêmes restent, éventuellement plus courtes. Aucune référence
-///   pendante.
+/// - `playlists` : depuis #6179, une entrée de liste de lecture ne disparaît
+///   plus avec sa piste : elle reste à son rang, INTROUVABLE, avec le titre,
+///   l'artiste et le chemin de la piste purgée (déclencheur
+///   `playlist_tracks_garde_l_orpheline`, clé étrangère en `SET NULL`), et la
+///   réconciliation la rattache si la piste existe ailleurs. Le compte dit
+///   combien d'entrées passeront introuvables.
 /// - `queue_items` : même cascade — les pistes quittent les files d'attente.
 /// - `listen_history` : `ON DELETE SET NULL`. **L'historique n'est pas
 ///   effacé** : la ligne survit avec son titre et son artiste, et perd son
@@ -3209,6 +3260,15 @@ fn executer_purge(state: &AppState, ids: &[i64]) -> ResultatPurge {
     r.artistes_orphelins = ArtistRepo::with_backend(state.backend.clone())
         .cleanup_orphans()
         .unwrap_or(0);
+
+    // #6179 — les lignes de playlist des pistes purgées sont restées,
+    // introuvables, à leur rang : celles dont la piste existe ailleurs (autre
+    // NAS, même contenu) y sont rattachées tout de suite.
+    tune_core::db::playlists_reconcile::reconcilier_et_journaliser(
+        state.backend.clone(),
+        true,
+        "purge",
+    );
 
     // `favorites` n'a pas de clé étrangère : sans cette réconciliation, les
     // cœurs pointeraient des ids morts. `false` = ne JAMAIS supprimer un
@@ -4273,9 +4333,10 @@ mod purge_hors_perimetre_tests {
 
     // ── Les objets liés ─────────────────────────────────────────────────
 
-    /// Une piste dans une liste de lecture : comportement EXPLICITE. L'entrée
-    /// quitte la liste (cascade), la liste survit, les autres entrées restent,
-    /// et l'impact est annoncé AVANT la suppression.
+    /// Une piste dans une liste de lecture : comportement EXPLICITE. Depuis
+    /// #6179 l'entrée ne quitte plus la liste : elle y reste INTROUVABLE, à
+    /// son rang, la liste survit, les autres entrées restent, et l'impact est
+    /// annoncé AVANT la suppression.
     #[tokio::test]
     async fn une_piste_en_liste_de_lecture_quitte_la_liste_sans_la_detruire() {
         let state = etat();
@@ -4324,8 +4385,22 @@ mod purge_hors_perimetre_tests {
         assert_eq!(
             restant,
             vec![gardee],
-            "l'entrée de la piste retirée doit partir, l'autre rester — aucune \
-             référence pendante"
+            "l'entrée de la piste retirée ne désigne plus aucune piste, l'autre \
+             reste — aucune référence pendante"
+        );
+        let introuvable: i64 = state
+            .backend
+            .query_one(
+                "SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = 1 \
+                 AND track_id IS NULL AND position = 0 AND file_path = '/vieux_nas/Bach/01.flac'",
+                &[],
+            )
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap();
+        assert_eq!(
+            introuvable, 1,
+            "#6179 : l'entrée reste, introuvable, à son rang"
         );
         let listes: i64 = state
             .backend
@@ -5604,6 +5679,82 @@ mod politique_de_lecture_4681_tests {
             normaliser_politique_de_lecture(&mut vide),
             Ok(None)
         ));
+    }
+}
+
+#[cfg(test)]
+mod genres_du_clap_6198_tests {
+    use super::{get_config, normaliser_genres_du_clap};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::taches_de_fond::perimetre::{
+        CLE_GENRES_CLAP_EXCLUS, CLE_GENRES_CLAP_INCLUS, genres_clap_exclus, genres_clap_inclus,
+    };
+
+    /// Publiés vides par défaut, puis tels qu'écrits ; le moteur relit la même
+    /// chose que la route publie.
+    #[tokio::test]
+    async fn les_genres_du_clap_sont_publies_puis_relus() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0;
+        assert_eq!(c[CLE_GENRES_CLAP_INCLUS], json!([]), "{c}");
+        assert_eq!(c[CLE_GENRES_CLAP_EXCLUS], json!([]), "{c}");
+
+        let mut v: serde_json::Map<String, Value> = json!({
+            CLE_GENRES_CLAP_INCLUS: [" Jazz ", "", "Jazz", "Classique"],
+            CLE_GENRES_CLAP_EXCLUS: null,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(normaliser_genres_du_clap(&mut v).is_ok());
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        for (k, val) in v {
+            settings.set(&k, &val.to_string()).unwrap();
+        }
+        let c = get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0;
+        assert_eq!(
+            c[CLE_GENRES_CLAP_INCLUS],
+            json!(["Jazz", "Classique"]),
+            "{c}"
+        );
+        assert_eq!(c[CLE_GENRES_CLAP_EXCLUS], json!([]), "{c}");
+        assert_eq!(
+            genres_clap_inclus(&state.backend),
+            vec!["Jazz", "Classique"]
+        );
+        assert!(genres_clap_exclus(&state.backend).is_empty());
+    }
+
+    /// Une forme qui se relirait « tous les genres » en silence est refusée.
+    #[test]
+    fn une_forme_illisible_est_refusee() {
+        for cle in [CLE_GENRES_CLAP_INCLUS, CLE_GENRES_CLAP_EXCLUS] {
+            for mauvais in [json!("Jazz"), json!(4), json!([1]), json!({})] {
+                let mut v: serde_json::Map<String, Value> =
+                    json!({ cle: mauvais.clone() }).as_object().unwrap().clone();
+                assert!(
+                    normaliser_genres_du_clap(&mut v).is_err(),
+                    "{cle} = {mauvais}"
+                );
+            }
+        }
     }
 }
 

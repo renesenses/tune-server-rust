@@ -34,8 +34,177 @@
 //!    égale à son nombre de termes, et SQLite plafonne à 1 000. Le même filtre
 //!    rendait donc la bonne liste sur PostgreSQL et une liste VIDE sur SQLite.
 //!    `ou_equilibre` ramène la profondeur à `log2(n)`.
+//!
+//! # L'opérateur « Et » (#2108)
+//!
+//! Le « Ou » reste le défaut. Pour les facettes dont une même piste peut
+//! porter PLUSIEURS valeurs à la fois ([`FACETTES_COMBINABLES_EN_ET`] : deux
+//! genres, deux compositeurs dans le même champ, deux instruments crédités,
+//! deux listes de lecture…), la requête peut demander `?all_of=<facette>` :
+//! les valeurs cochées de cette facette se combinent alors en **ET** — la
+//! piste doit les porter TOUTES. C'est la demande de Bertrand (fil 1963) pour
+//! la musique classique. Voir [`combiner`].
 
+use super::backend::SqlValue;
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
+
+/// Les facettes dont une piste peut porter plusieurs valeurs à la fois, et
+/// qui acceptent donc l'opérateur « Et » (#2108) — par leur nom de paramètre
+/// de requête.
+///
+/// Les autres (année, format, fréquence, profondeur, artiste de la piste,
+/// note, DR, année d'enregistrement, provenance) n'ont qu'UNE valeur par
+/// piste : deux valeurs en ET n'y rendraient jamais rien. `?all_of=year` est
+/// donc IGNORÉ, et la facette reste en « Ou » — un filtre qui vide la liste à
+/// coup sûr serait un piège, pas une option.
+pub const FACETTES_COMBINABLES_EN_ET: [&str; 10] = [
+    "genre",
+    "composer",
+    "label",
+    "instrument",
+    "country",
+    "mood",
+    "source_media",
+    "playlist",
+    "favorite",
+    "untagged",
+];
+
+/// Un prédicat de facette et ses valeurs à lier, dans l'ordre des marqueurs.
+pub type Predicat = (String, Vec<SqlValue>);
+
+/// Combine les valeurs d'UNE facette en « Ou » (défaut) ou en « Et » (#2108).
+///
+/// `bloc` écrit le prédicat d'une liste de valeurs en « Ou » — c'est le
+/// constructeur qui existait déjà pour chaque facette. En « Ou », il est
+/// appelé une fois sur toute la liste : le SQL est donc **mot pour mot celui
+/// d'avant #2108**. En « Et », il est appelé une fois PAR valeur, et les
+/// prédicats sont joints par `AND` : « la piste satisfait la valeur 1, ET la
+/// valeur 2… ». Pour une facette de jointure (`EXISTS`), cela fait un `EXISTS`
+/// par valeur — un seul `EXISTS (… = a AND … = b)` chercherait une LIGNE qui
+/// vaille les deux à la fois, c'est-à-dire aucune.
+///
+/// Les marqueurs restent demandés dans l'ordre des valeurs, et chaque valeur
+/// est empilée juste après les siens : le piège n°2 ne peut pas se produire.
+pub fn combiner<T>(
+    ph: &mut Placeholders,
+    valeurs: &[T],
+    et: bool,
+    mut bloc: impl FnMut(&mut Placeholders, &[T]) -> Option<Predicat>,
+) -> Option<Predicat> {
+    if !et || valeurs.len() < 2 {
+        return bloc(ph, valeurs);
+    }
+    let mut termes = Vec::with_capacity(valeurs.len());
+    let mut liees = Vec::new();
+    for v in valeurs {
+        if let Some((c, p)) = bloc(ph, std::slice::from_ref(v)) {
+            termes.push(c);
+            liees.extend(p);
+        }
+    }
+    match termes.len() {
+        0 => None,
+        1 => termes.pop().map(|c| (c, liees)),
+        _ => Some((format!("({})", termes.join(" AND ")), liees)),
+    }
+}
+
+/// Genre : la colonne `t.genre` OU le tableau JSON `t.genres` (#1821 : sans
+/// la casse des DEUX côtés). Les valeurs sont empilées dans l'ordre de sortie
+/// des marqueurs : les N du `IN`, puis les N motifs `LIKE`.
+pub fn bloc_genres(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
+    let n = valeurs.len();
+    let in_part = ph.in_list_ci("t.genre", n)?;
+    let like_part = ph.or_like_ci("t.genres", n)?;
+    let mut p: Vec<SqlValue> = valeurs.iter().map(|g| SqlValue::Text(g.clone())).collect();
+    p.extend(valeurs.iter().map(|g| SqlValue::Text(format!("%\"{g}\"%"))));
+    Some((format!("({in_part} OR {like_part})"), p))
+}
+
+/// Facette « contient » (label, compositeur) : `LIKE '%v%'` sans la casse.
+pub fn bloc_contient(expr: &str) -> impl Fn(&mut Placeholders, &[String]) -> Option<Predicat> + '_ {
+    move |ph, valeurs| {
+        let c = ph.or_like_ci(expr, valeurs.len())?;
+        Some((
+            c,
+            valeurs
+                .iter()
+                .map(|v| SqlValue::Text(format!("%{v}%")))
+                .collect(),
+        ))
+    }
+}
+
+/// CRD-6 : l'instrument est un crédit (`track_credits`), pas une colonne.
+pub fn bloc_instruments(
+    engine: Engine,
+) -> impl Fn(&mut Placeholders, &[String]) -> Option<Predicat> {
+    move |ph, valeurs| {
+        let c = ph.in_list_ci("tc.instrument", valeurs.len())?;
+        Some((
+            instrument_exists(engine, &c),
+            valeurs.iter().map(|v| SqlValue::Text(v.clone())).collect(),
+        ))
+    }
+}
+
+/// Étiquette étendue du magasin ouvert `track_metadata`. `key` est un
+/// littéral du code ; seules les valeurs sont liées.
+pub fn bloc_metadonnee(
+    key: &str,
+) -> impl Fn(&mut Placeholders, &[String]) -> Option<Predicat> + '_ {
+    move |ph, valeurs| {
+        let c = ph.in_list("tm.value", valeurs.len())?;
+        Some((
+            format!(
+                "EXISTS (SELECT 1 FROM track_metadata tm \
+                 WHERE tm.track_id = t.id AND tm.key = '{key}' AND {c})"
+            ),
+            valeurs.iter().map(|v| SqlValue::Text(v.clone())).collect(),
+        ))
+    }
+}
+
+/// Liste de lecture, par son nom, sans la casse.
+pub fn bloc_listes(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
+    let c = ph.in_list_ci("pl.name", valeurs.len())?;
+    Some((
+        format!(
+            "EXISTS (SELECT 1 FROM playlist_tracks pt JOIN playlists pl ON pl.id = pt.playlist_id \
+                 WHERE pt.track_id = t.id AND {c})"
+        ),
+        valeurs.iter().map(|v| SqlValue::Text(v.clone())).collect(),
+    ))
+}
+
+/// Favoris du profil 1 — vocabulaire FERMÉ, aucun marqueur.
+pub fn bloc_favoris(_ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
+    any_of(
+        valeurs
+            .iter()
+            .filter_map(|k| favorite_condition(k))
+            .map(str::to_string)
+            .collect(),
+    )
+    .map(|c| (c, Vec::new()))
+}
+
+/// Étiquette manquante — vocabulaire FERMÉ, aucun marqueur.
+pub fn bloc_sans_etiquette(
+    engine: Engine,
+) -> impl Fn(&mut Placeholders, &[String]) -> Option<Predicat> {
+    move |_ph, valeurs| {
+        any_of(
+            valeurs
+                .iter()
+                .filter_map(|k| untagged_condition_for_engine(k, engine))
+                .map(str::to_string)
+                .collect(),
+        )
+        .map(|c| (c, Vec::new()))
+    }
+}
 
 /// Les champs que compare le TEXTE LIBRE d'Oxygen (#5192), dans l'ordre du
 /// prédicat de [`condition_texte_libre`] — et, mot pour mot, ceux que le
@@ -882,6 +1051,10 @@ pub struct TrackFilter {
     pub collection_track_ids: Option<Vec<i64>>,
     /// Recherche libre — ce n'est pas une facette, elle reste monovaluée.
     pub q: Option<String>,
+    /// Les facettes dont les valeurs se combinent en **ET** (#2108), par leur
+    /// nom de paramètre (`?all_of=composer`). Absente = « Ou ». Seules les
+    /// [`FACETTES_COMBINABLES_EN_ET`] y entrent.
+    pub en_et: Vec<String>,
 }
 
 /// `track_credits.track_id` s'écrit comme `t.id` selon le moteur : entier en
@@ -908,6 +1081,11 @@ pub fn instrument_exists(engine: Engine, inner: &str) -> String {
 }
 
 impl TrackFilter {
+    /// Les valeurs de `facette` se combinent-elles en ET (#2108) ?
+    pub fn est_en_et(&self, facette: &str) -> bool {
+        self.en_et.iter().any(|k| k == facette)
+    }
+
     /// Au moins une facette est-elle active ?
     ///
     /// ⚠️ C'est le garde-fou du piège n°1 vu du dessus : la route ne doit

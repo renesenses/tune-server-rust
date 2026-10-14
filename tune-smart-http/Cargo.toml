@@ -15,6 +15,9 @@ tokio = { workspace = true }
 tune-core = { path = "../tune-core", default-features = false }
 async-trait = { workspace = true }
 tune-http-types = { path = "../tune-http-types" }
+# #6122 — « dans les N derniers jours » : l'instant « il y a N jours » se lit
+# à l'horloge quand la règle se traduit. Déjà au graphe (tune-core).
+chrono = { workspace = true }
 
 # Pour éprouver le HANDLER, et pas seulement les fonctions qu'il appelle : le
 # débranchement d'un appel ne se voit dans aucune garde textuelle (#1231).

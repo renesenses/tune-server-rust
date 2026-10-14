@@ -1961,7 +1961,10 @@ fn les_seeks_apres_reprise_sont_detaches_et_gardes() {
         &apres[..fin]
     };
     for (nom, sig) in [
-        ("resume", "pub async fn resume_with_session_error_message("),
+        // #6062 — le corps de `resume_with_session_error_message` vit
+        // désormais dans `reprendre` (second passage après un refus de la
+        // sortie) : c'est lui que la garde lit.
+        ("resume", "    async fn reprendre(\n"),
         (
             "seek_output_after_replay",
             "pub(super) async fn seek_output_after_replay(",
@@ -10105,5 +10108,111 @@ async fn une_zone_reseau_sans_opt_in_entend_le_crossfeed_sur_un_flux_2742() {
         !statut.unavailable && statut.effective,
         "le statut publié VERROUILLE un crossfeed qui s'entend : diaphonie \
          mesurée {diaphonie_db:.1} dB sur le flux, et pourtant {statut:?}"
+    );
+}
+
+/// #5522 — une session de flux ABANDONNÉE avant l'envoi ne part pas à la
+/// sortie : la zone s'arrête et le dit.
+///
+/// Le journal de Gros Bidon (fil 2212, v1.0.0-rc3) : le téléchargement Qobuz
+/// échoue, `streaming_session_abandonnee_producteur_mort` à 16:46:00.428, puis
+/// `orchestrator_play output_sent=true` à 16:46:00.606. La sortie locale tire
+/// alors `/stream/<id>.wav`, reçoit un 404, et la zone reste « en lecture »
+/// à 0:00 pendant plus de trois minutes, sans bandeau
+/// (`octets_servis_inconnus_zone_non_coupee`). La session était déjà morte
+/// AVANT l'envoi : rien ne justifiait d'envoyer.
+#[tokio::test]
+async fn une_session_abandonnee_avant_l_envoi_arrete_la_zone_au_lieu_de_jouer_un_404_5522() {
+    use crate::http::streamer::StreamInfo;
+
+    let orch = test_orchestrator();
+    let device_id = "mock-5522";
+    orch.outputs
+        .lock()
+        .await
+        .register(Box::new(MockOutput::new(device_id, "Sortie 5522")));
+
+    let info = StreamInfo {
+        format: "wav".to_string(),
+        mime_type: "audio/wav".to_string(),
+        ..StreamInfo::default()
+    };
+    let (morte, _tx, _ready) = orch.streamer.create_session(info, false, 1).await;
+    abandonner_la_session_de_transcodage(&orch.streamer, &morte, None).await;
+
+    let req = super::PlayRequest {
+        zone_id: 2,
+        output_device_id: Some(device_id.into()),
+        track_id: None,
+        source: Some("qobuz".into()),
+        source_id: Some("2206801".into()),
+        title: Some("Time".into()),
+        artist_name: None,
+        album_title: None,
+        cover_url: None,
+        duration_ms: Some(275_000),
+        seek_ms: None,
+        temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: None,
+        track_number: None,
+        disc_number: None,
+        album_ref: None,
+    };
+    let resolved = super::ResolvedStream {
+        url: format!("http://127.0.0.1:8888/stream/{morte}.wav"),
+        mime_type: "audio/wav".into(),
+        title: "Time".into(),
+        artist: None,
+        album: None,
+        duration_ms: Some(275_000),
+        source: "qobuz".into(),
+        cover_url: None,
+        stream_id: Some(morte.clone()),
+        file_size: None,
+        sample_rate: Some(44_100),
+        bit_depth: Some(16),
+        channels: Some(2),
+        origin_url: None,
+        bitrate_kbps: None,
+    };
+    let habillage = super::transport::Habillage {
+        album: None,
+        cover_path: None,
+    };
+
+    let (output_sent, output_error) = orch
+        .envoyer_a_la_sortie(
+            &req,
+            &resolved,
+            &habillage,
+            false,
+            std::time::Instant::now(),
+            0,
+        )
+        .await;
+
+    let outputs = orch.outputs.lock().await;
+    let out = outputs.get(device_id).unwrap();
+    let guard = out.lock().await;
+    let mock = guard
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("mock output");
+    assert_eq!(
+        mock.play_call_count().await,
+        0,
+        "la session est morte avant l'envoi : la sortie ne doit rien recevoir \
+         (sinon 404 sur /stream/<id> et zone figée à 0:00)"
+    );
+    assert!(
+        !output_sent,
+        "output_sent doit être faux : c'est ce qui arrête la zone avec un bandeau"
+    );
+    let message = output_error.expect("un message pour le bandeau de la zone");
+    assert!(
+        message.contains("flux"),
+        "le message doit dire que le flux du service n'a pas pu être ouvert : {message}"
     );
 }

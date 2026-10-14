@@ -2848,6 +2848,37 @@ pub async fn any_local_output_playing(state: &AppState) -> bool {
     false
 }
 
+/// #6119 — le parc local à PUBLIER (fiche de diagnostic, `GET /devices/audio`),
+/// sans jamais sonder le matériel pendant qu'une sortie locale joue.
+///
+/// Gros Bidon (fil 2216, 1.0.0-rc3, Windows, SMSL SU-8 en WASAPI, backend
+/// ASIO choisi) : ouvrir la page Zones coupait la lecture, deux fois de suite.
+/// La page appelle `GET /system/diagnostics`, qui énumérait les sorties avec
+/// le backend affiché, donc ASIO : `select_host("asio")` charge chaque pilote
+/// ASIO, celui du SU-8 prend l'appareil, et le flux WASAPI qui jouait meurt
+/// (`audio_stream_device_lost` 10 ms avant `local_audio_host_selected
+/// backend="asio"`). `GET /devices/audio` se gardait déjà ainsi (DEvir) ; la
+/// fiche de diagnostic, non. Les deux passent désormais par ici.
+#[cfg(feature = "local-audio")]
+pub async fn parc_local_sans_couper_la_lecture<F, Fut>(
+    state: &AppState,
+    enumerer: F,
+) -> Vec<tune_core::outputs::local::AudioDevice>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Vec<tune_core::outputs::local::AudioDevice>>,
+{
+    if any_local_output_playing(state).await {
+        tune_core::outputs::local::cached_audio_devices()
+    } else {
+        enumerer().await
+    }
+}
+
+#[cfg(all(test, feature = "local-audio"))]
+#[path = "parc_local_pendant_la_lecture_6119_tests.rs"]
+mod parc_local_pendant_la_lecture_6119_tests;
+
 /// Whether ANY zone (local or network) is currently playing, read from the
 /// in-memory playback state — no device or network probing. Used on Linux to
 /// suppress the periodic audio re-enumeration during a listening session:

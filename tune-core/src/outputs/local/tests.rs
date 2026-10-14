@@ -2667,6 +2667,7 @@ fn native_windows_preparation_keeps_identity_pcm_out_of_float() {
             &crossfeed,
             &pure,
             &AtomicBool::new(false),
+            None,
         )
         .expect("fenêtre PCM complète");
         assert!(prepared.bit_perfect);
@@ -2699,6 +2700,7 @@ fn native_windows_preparation_forces_dop_onto_the_raw_branch() {
         &crossfeed,
         &pure,
         &AtomicBool::new(false),
+        None,
     )
     .expect("DoP complet");
     assert!(prepared.dop);
@@ -2731,6 +2733,7 @@ fn native_windows_preparation_marks_processed_pcm_as_not_bitperfect() {
         &crossfeed,
         &pure,
         &AtomicBool::new(false),
+        None,
     )
     .expect("PCM complet");
     assert!(!prepared.dop);

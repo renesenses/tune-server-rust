@@ -20,6 +20,7 @@
     { "method": "GET", "path": "/snapshot" },
     { "method": "POST", "path": "/snapshot/restauration/apercu" },
     { "method": "POST", "path": "/snapshot/restauration" },
+    { "method": "POST", "path": "/snapshot/supprimer" },
     { "method": "POST", "path": "/liens" },
     { "method": "GET", "path": "/liens" },
     { "method": "GET", "path": "/lien" },

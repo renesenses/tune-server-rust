@@ -93,13 +93,24 @@ fn le_fil_verifie_l_arret_avant_d_ouvrir_le_peripherique_4176() {
 /// `rapporter`.
 #[test]
 fn un_fil_perime_ne_rapporte_pas_son_echec_d_ouverture_4176() {
-    for (nom, src) in [
-        ("bras_wasapi.rs", include_str!("bras_wasapi.rs")),
-        ("bras_asio.rs", include_str!("bras_asio.rs")),
+    // #6289 : ASIO ouvre désormais les canaux choisis par la zone (#6171).
+    // Ancrer chaque bras sur son appel réel, pas sur une signature commune
+    // périmée ni sur la définition de la méthode.
+    for (nom, src, appel) in [
+        (
+            "bras_wasapi.rs",
+            include_str!("bras_wasapi.rs"),
+            "match BackendWasapi::ouvrir(&demande) {",
+        ),
+        (
+            "bras_asio.rs",
+            include_str!("bras_asio.rs"),
+            "match BackendAsio::ouvrir_sur_les_canaux(&demande, canaux_de_carte.as_ref()) {",
+        ),
     ] {
         let prod = src.split("#[cfg(test)]").next().unwrap();
         let ouvrir = prod
-            .find("::ouvrir(&demande) {")
+            .find(appel)
             .unwrap_or_else(|| panic!("{nom} : l'ouverture"));
         let bloc = &prod[ouvrir..ouvrir + 1_200];
         let generation = bloc
