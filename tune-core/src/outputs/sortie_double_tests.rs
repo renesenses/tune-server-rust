@@ -134,13 +134,38 @@ fn simuler_groupe(
     canaux: usize,
     duree_s: f64,
 ) -> Vec<Bilan> {
+    simuler_scenario(a, bs, canaux, duree_s, &|_| Moment::default()).0
+}
+
+/// Ce que le scénario impose à l'instant `t` : la source se tait-elle (pause,
+/// blanc entre deux pistes), un réajustement est-il demandé (début de pause,
+/// piste suivante), la latence réelle des B change-t-elle.
+#[derive(Default, Clone)]
+struct Moment {
+    silence: bool,
+    reajuster: bool,
+    latences_b: Option<Vec<f64>>,
+}
+
+/// Le retard commun relevé à chaque période de A : `(t, ms)`.
+type HistoireDuRetard = Vec<(f64, f64)>;
+
+fn simuler_scenario(
+    a: Peripherique,
+    bs: &[(Peripherique, f64)],
+    canaux: usize,
+    duree_s: f64,
+    scenario: &dyn Fn(f64) -> Moment,
+) -> (Vec<Bilan>, HistoireDuRetard) {
     use std::rc::Rc;
+    let mut bs: Vec<(Peripherique, f64)> = bs.to_vec();
+    let mut histoire = Vec::new();
     let consigne = CONSIGNE_PAR_DEFAUT_S;
     let capacite = ((consigne + RETARD_MAX_S) * 48_000.0 * 2.0) as usize * canaux;
     let mut membres = Vec::new();
     let mut anneaux = Vec::new();
     let mut consignes = Vec::new();
-    for (b, manuel_s) in bs {
+    for (b, manuel_s) in &bs {
         let mut rec = Recopieur::nouveau(canaux, a.cadence, b.cadence, consigne);
         rec.regler_le_decalage_manuel(*manuel_s);
         consignes.push(rec.consigne());
@@ -176,8 +201,21 @@ fn simuler_groupe(
             break;
         }
         if ta <= tb {
+            let moment = scenario(ta);
+            if let Some(l) = &moment.latences_b {
+                for (b, nouvelle) in bs.iter_mut().zip(l) {
+                    b.0.latence_s = *nouvelle;
+                }
+            }
+            if moment.reajuster {
+                sortie.demander_un_reajustement();
+            }
             for f in 0..a.periode {
-                let x = ((source + f as u64) as f64 * 0.01).sin() as f32 * 0.5;
+                let x = if moment.silence {
+                    0.0
+                } else {
+                    ((source + f as u64) as f64 * 0.01).sin() as f32 * 0.5
+                };
                 for c in 0..canaux {
                     periode_a[f * canaux + c] = x;
                 }
@@ -191,6 +229,7 @@ fn simuler_groupe(
             for (i, (r, _)) in sortie.membres().iter().enumerate() {
                 reperes[i].push((avant[i].0, avant[i].1, 1.0 / r.rapport()));
             }
+            histoire.push((ta, sortie.retard_commun_ms()));
             na += 1;
         } else {
             let b = bs[j].0;
@@ -213,7 +252,9 @@ fn simuler_groupe(
                 // Ce que A fait entendre à l'instant où cette trame de B sort
                 // de son convertisseur.
                 let pos_a = ra * (tb + b.latence_s - a.latence_s) - sortie.retard_trames() as f64;
-                if tb > 0.5 {
+                // Pendant un silence, il n'y a rien à aligner (et les recalages
+                // y insèrent ou y sautent des zéros) : on ne mesure que le son.
+                if tb > 0.5 && !scenario(tb).silence && !scenario(tb - 0.5).silence {
                     ecarts[j].push((tb, (pos_a - pos_b) / f64::from(a.cadence) * 1000.0));
                 }
                 anneau.periode_lue.set(lu);
@@ -230,7 +271,7 @@ fn simuler_groupe(
         }
     }
     let retard_commun_ms = sortie.retard_commun_ms();
-    sortie
+    let bilans = sortie
         .membres()
         .iter()
         .enumerate()
@@ -240,7 +281,8 @@ fn simuler_groupe(
             releve: r.releve(),
             retard_commun_ms,
         })
-        .collect()
+        .collect();
+    (bilans, histoire)
 }
 
 fn pire_ecart(bilan: &Bilan, apres_s: f64) -> f64 {
@@ -640,4 +682,102 @@ fn le_reglage_lit_une_ou_plusieurs_sorties() {
         lire_la_valeur(&ecrire_la_valeur(&["local:A, B".to_string()])),
         vec!["A, B".to_string()]
     );
+}
+
+/// #6132 — le retard commun ne bouge JAMAIS pendant le son. Une carte voit
+/// sa latence passer de 10 à 75 ms en pleine lecture : le retard reste figé.
+/// À la pause, il est recalculé pour elle, et les trois cartes repartent
+/// alignées. Puis sa latence redescend : le retard reste figé — y compris à
+/// un enchaînement sans blanc demandé en plein son — jusqu'à la piste
+/// suivante (un blanc de 300 ms), où il revient à la consigne.
+#[test]
+fn le_retard_commun_se_reajuste_a_la_pause_et_a_la_piste_suivante() {
+    let carte = |ppm: f64, latence_s: f64| Peripherique {
+        cadence: 48_000,
+        ppm,
+        periode: 512,
+        latence_s,
+        horodate: true,
+    };
+    let a = Peripherique {
+        periode: 480,
+        ..carte(0.0, 0.005)
+    };
+    let scenario = |t: f64| Moment {
+        silence: (40.0..42.0).contains(&t) || (100.0..100.3).contains(&t),
+        // À 90 s, une piste suivante sans blanc (gapless) : la demande doit
+        // attendre le silence de 100 s, pas s'appliquer pendant le son.
+        reajuster: (40.0..40.02).contains(&t)
+            || (90.0..90.02).contains(&t)
+            || (100.0..100.02).contains(&t),
+        latences_b: Some(vec![
+            0.010,
+            if (20.0..80.0).contains(&t) {
+                0.075
+            } else {
+                0.010
+            },
+        ]),
+    };
+    let (bilans, histoire) = simuler_scenario(
+        a,
+        &[(carte(70.0, 0.010), 0.0), (carte(-90.0, 0.010), 0.0)],
+        1,
+        130.0,
+        &scenario,
+    );
+    let retard_entre = |de: f64, a: f64| -> (f64, f64) {
+        histoire
+            .iter()
+            .filter(|(t, _)| *t >= de && *t < a)
+            .fold((f64::INFINITY, 0.0f64), |(mn, mx), (_, r)| {
+                (mn.min(*r), mx.max(*r))
+            })
+    };
+    let (avant_min, avant_max) = retard_entre(1.0, 40.0);
+    let (lente_min, lente_max) = retard_entre(42.0, 100.0);
+    let (apres_min, apres_max) = retard_entre(100.3, 130.0);
+    eprintln!(
+        "sortie_double réajustement : retard {avant_min:.1}–{avant_max:.1} ms jusqu'à la pause \
+         (latence passée à 75 ms à 20 s), {lente_min:.1}–{lente_max:.1} ms après la pause, \
+         {apres_min:.1}–{apres_max:.1} ms après la piste suivante"
+    );
+    // Pendant le son, jamais de changement : ni à 20 s, ni à 80 s.
+    assert_eq!(
+        (avant_min, avant_max),
+        (40.0, 40.0),
+        "le retard commun a bougé pendant le son avant la pause"
+    );
+    assert_eq!(
+        lente_min, lente_max,
+        "le retard commun a bougé pendant le son"
+    );
+    assert!(
+        lente_min > 80.0,
+        "à la pause, le retard commun n'a pas été recalculé pour la carte lente : {lente_min:.1} ms"
+    );
+    assert_eq!(
+        (apres_min, apres_max),
+        (40.0, 40.0),
+        "à la piste suivante, le retard commun n'est pas revenu à la consigne"
+    );
+    for (nom, bilan) in [("B1", &bilans[0]), ("B2", &bilans[1])] {
+        let ecart_entre = |de: f64, a: f64| {
+            bilan
+                .ecarts_ms
+                .iter()
+                .filter(|(t, _)| *t >= de && *t < a)
+                .map(|(_, e)| e.abs())
+                .fold(0.0, f64::max)
+        };
+        let (apres_pause, apres_piste) = (ecart_entre(45.0, 80.0), ecart_entre(105.0, 130.0));
+        eprintln!(
+            "sortie_double réajustement, {nom} : écart après la pause = {apres_pause:.3} ms, \
+             après la piste suivante = {apres_piste:.3} ms"
+        );
+        assert!(
+            apres_pause < 0.5 && apres_piste < 0.5,
+            "{nom} non aligné après réajustement : {apres_pause:.3} / {apres_piste:.3} ms"
+        );
+    }
 }

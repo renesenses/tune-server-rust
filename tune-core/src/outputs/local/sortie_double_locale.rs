@@ -120,6 +120,9 @@ pub(super) type Recopie = SortieMultiple<Arc<AnneauDeB>>;
 /// exactement comme avant.
 pub(super) struct Emplacement {
     actif: AtomicBool,
+    /// Un réajustement du retard commun est demandé (pause, piste suivante) ;
+    /// relevé par le rappel de A, qui le transmet à la recopie.
+    reajuster: AtomicBool,
     recopie: std::sync::Mutex<Option<Recopie>>,
 }
 
@@ -128,6 +131,7 @@ pub(super) type EmplacementDeRecopie = Arc<Emplacement>;
 pub(super) fn emplacement_vide() -> EmplacementDeRecopie {
     Arc::new(Emplacement {
         actif: AtomicBool::new(false),
+        reajuster: AtomicBool::new(false),
         recopie: std::sync::Mutex::new(None),
     })
 }
@@ -138,6 +142,12 @@ impl Emplacement {
     /// recopie, celui de chaque B dans le rappel de ce B).
     pub(super) fn est_actif(&self) -> bool {
         self.actif.load(Ordering::Acquire)
+    }
+
+    /// Demander que le retard commun soit recalculé au prochain silence
+    /// (jamais pendant le son : voir `SortieMultiple::demander_un_reajustement`).
+    pub(super) fn demander_un_reajustement(&self) {
+        self.reajuster.store(true, Ordering::Release);
     }
 
     fn installer(&self, recopie: Recopie) {
@@ -168,6 +178,9 @@ pub(super) fn recopier_la_periode(
     if let Ok(mut garde) = emplacement.recopie.try_lock()
         && let Some(recopie) = garde.as_mut()
     {
+        if emplacement.reajuster.swap(false, Ordering::AcqRel) {
+            recopie.demander_un_reajustement();
+        }
         recopie.traiter(data, latence_a);
     }
 }
@@ -216,6 +229,12 @@ pub(super) fn rendre_la_periode_de_a(
         min_buffer_samples,
         data,
     );
+    // #6132 — la pause est un des deux moments où le retard commun peut se
+    // réajuster : la demande attend que la ligne à retard ne rende plus que
+    // du silence.
+    if paused.load(Ordering::Relaxed) {
+        emplacement.demander_un_reajustement();
+    }
     recopier_la_periode(emplacement, data, latence_du_rappel(info));
     let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
     if v != 1.0 {
@@ -306,11 +325,13 @@ impl Drop for SecondesSorties {
     fn drop(&mut self) {
         if let Some(recopie) = self.emplacement.retirer() {
             let retard_commun_ms = recopie.retard_commun_ms();
+            let reajustements = recopie.reajustements();
             for ((recopieur, _), nom) in recopie.membres().iter().zip(&self.noms) {
                 let releve = recopieur.releve();
                 info!(
                     seconde_sortie = %nom,
                     retard_commun_ms,
+                    reajustements,
                     ecart_ms = releve.ecart_ms,
                     derive_ppm = releve.derive_ppm,
                     correction_ppm = releve.correction_ppm,
@@ -606,5 +627,36 @@ mod tests {
         assert_eq!(gain_de_b(Some(0), 1000, 1000), 0);
         assert_eq!(gain_de_b(Some(1000), 1000, 200), 1000);
         assert_eq!(gain_de_b(None, 1000, 300), 300);
+    }
+
+    /// #6132 — la demande de réajustement (pause, piste suivante) passe de
+    /// l'emplacement à la recopie au rappel suivant de A, et y attend son
+    /// silence.
+    #[test]
+    fn la_demande_de_reajustement_atteint_la_recopie() {
+        let emplacement = emplacement_vide();
+        emplacement.installer(SortieMultiple::nouvelle(
+            1,
+            48_000,
+            0.010,
+            vec![(
+                Recopieur::nouveau(1, 48_000, 48_000, 0.010),
+                Arc::new(AnneauDeB::nouveau(48_000)),
+            )],
+        ));
+        let mut son = vec![0.25f32; 480];
+        // Premier rappel : le retard commun se règle puis se fige.
+        recopier_la_periode(&emplacement, &mut son, None);
+        emplacement.demander_un_reajustement();
+        let mut son = vec![0.25f32; 480];
+        recopier_la_periode(&emplacement, &mut son, None);
+        assert!(!emplacement.reajuster.load(Ordering::Acquire));
+        let garde = emplacement.recopie.lock().unwrap();
+        let recopie = garde.as_ref().unwrap();
+        assert!(
+            recopie.reajustement_en_attente(),
+            "pendant le son, la demande doit attendre"
+        );
+        assert_eq!(recopie.reajustements(), 0);
     }
 }

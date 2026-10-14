@@ -357,6 +357,9 @@ pub struct Recopieur {
     /// Retard commun ajouté à la consigne quand une sortie du groupe est plus
     /// lente que ce que la consigne absorbe ([`SortieMultiple`]).
     retard_supplementaire_s: f64,
+    /// Trames de B à ne pas pousser : le recalage d'un réajustement qui
+    /// avance B (pendant un silence, donc des zéros qu'on ne joue pas).
+    a_sauter: usize,
     echantillons_refuses: u64,
     trames_produites: u64,
     latence_a: Option<f64>,
@@ -438,7 +441,17 @@ pub struct SortieMultiple<R> {
     trames_traitees: u64,
     fige: bool,
     retard_supplementaire_s: f64,
+    /// Un réajustement est demandé (pause, piste suivante) : il attend que la
+    /// ligne à retard ne contienne plus que du silence.
+    reajustement_demande: bool,
+    /// Trames de silence consécutives reçues de A, période courante comprise.
+    silence_trames: u64,
+    reajustements: u32,
 }
+
+/// Sous ce niveau (−100 dB), un échantillon est du silence : celui d'une
+/// pause (zéros exacts) ou d'un blanc entre deux pistes, tramage compris.
+const SEUIL_DE_SILENCE: f32 = 1e-5;
 
 impl<R: AnneauSecondaire> SortieMultiple<R> {
     pub fn nouvelle(
@@ -460,30 +473,82 @@ impl<R: AnneauSecondaire> SortieMultiple<R> {
             trames_traitees: 0,
             fige: false,
             retard_supplementaire_s: 0.0,
+            reajustement_demande: false,
+            silence_trames: 0,
+            reajustements: 0,
         }
+    }
+
+    /// Demander que le retard commun soit recalculé — à la pause, à la piste
+    /// suivante. Il ne l'est qu'au premier moment où tout ce que A et les B
+    /// ont encore à jouer est du silence : jamais pendant le son. Une
+    /// transition sans blanc (gapless) attend donc le prochain silence.
+    pub fn demander_un_reajustement(&mut self) {
+        self.reajustement_demande = true;
+    }
+
+    /// Le retard commun voulu, en plus de la consigne, pour la plus lente
+    /// des sorties.
+    fn retard_requis(&self) -> f64 {
+        self.membres
+            .iter()
+            .map(|(r, a)| r.retard_requis_s(a))
+            .fold(0.0, f64::max)
+            .min(RETARD_MAX_S)
+    }
+
+    fn poser_le_retard(&mut self, requis: f64) {
+        self.retard_supplementaire_s = requis;
+        self.retard
+            .regler(((self.consigne_s + requis) * self.cadence_a).round() as usize);
+        for (recopieur, _) in self.membres.iter_mut() {
+            recopieur.regler_le_retard_supplementaire(requis);
+        }
+    }
+
+    /// Un réajustement demandé attend-il encore son silence ?
+    pub fn reajustement_en_attente(&self) -> bool {
+        self.reajustement_demande
+    }
+
+    /// Combien de fois le retard commun a été réajusté depuis le départ.
+    pub fn reajustements(&self) -> u32 {
+        self.reajustements
     }
 
     /// Une période de A : recopiée vers chaque B, puis retardée en place du
     /// retard commun.
     pub fn traiter(&mut self, periode: &mut [f32], latence_a_s: Option<f64>) {
+        let trames = (periode.len() / self.canaux) as u64;
+        if periode.iter().all(|s| s.abs() < SEUIL_DE_SILENCE) {
+            self.silence_trames += trames;
+        } else {
+            self.silence_trames = 0;
+        }
+        // Réajustement : seulement si la ligne à retard, à l'ancienne comme à
+        // la nouvelle longueur, ne rend que du silence. Fait AVANT la recopie
+        // de cette période : le recalage de B se mesure comme la régulation,
+        // avant que la période ne soit poussée.
+        if self.fige && self.reajustement_demande {
+            let requis = self.retard_requis();
+            let nouvelle = ((self.consigne_s + requis) * self.cadence_a).round() as u64;
+            let a_couvrir = nouvelle.max(self.retard.longueur_trames() as u64);
+            if self.silence_trames >= a_couvrir {
+                self.poser_le_retard(requis);
+                for (recopieur, anneau) in self.membres.iter_mut() {
+                    recopieur.recaler(&*anneau);
+                }
+                self.reajustement_demande = false;
+                self.reajustements += 1;
+            }
+        }
         for (recopieur, anneau) in self.membres.iter_mut() {
             recopieur.recopier_vers_b(periode, &*anneau, latence_a_s);
         }
-        let trames = (periode.len() / self.canaux) as u64;
         if !self.fige {
-            let requis = self
-                .membres
-                .iter()
-                .map(|(r, a)| r.retard_requis_s(a))
-                .fold(0.0, f64::max)
-                .min(RETARD_MAX_S);
+            let requis = self.retard_requis();
             if (requis - self.retard_supplementaire_s).abs() > 1e-4 {
-                self.retard_supplementaire_s = requis;
-                self.retard
-                    .regler(((self.consigne_s + requis) * self.cadence_a).round() as usize);
-                for (recopieur, _) in self.membres.iter_mut() {
-                    recopieur.regler_le_retard_supplementaire(requis);
-                }
+                self.poser_le_retard(requis);
             }
             if self.trames_traitees + trames >= self.retard.longueur_trames() as u64 {
                 self.fige = true;
@@ -542,6 +607,7 @@ impl Recopieur {
             consigne_trames_b: consigne_s * cadence_b,
             retard: RetardDeA::nouveau(canaux, retard_trames, retard_trames),
             retard_supplementaire_s: 0.0,
+            a_sauter: 0,
             echantillons_refuses: 0,
             trames_produites: 0,
             latence_a: None,
@@ -585,6 +651,43 @@ impl Recopieur {
         // 5 ms de marge comme le plancher de la consigne, 2 ms de plus pour
         // que le plancher ne morde pas au millième près.
         (periode_b + 0.005 + 0.002 + filtre - disponible).max(0.0)
+    }
+
+    /// Recaler B d'un coup sur sa consigne : pousser des zéros s'il doit être
+    /// plus en retard, sauter des trames s'il doit l'être moins. Appelé par
+    /// [`SortieMultiple`] à un réajustement du retard commun, qui n'a lieu
+    /// que pendant un silence : ce qui est ajouté ou sauté ne s'entend pas.
+    pub fn recaler(&mut self, anneau: &dyn AnneauSecondaire) {
+        let periode_b = anneau.periode_du_lecteur();
+        if periode_b == 0 {
+            return;
+        }
+        let ch = self.canaux;
+        self.compensation_s = self.compensation();
+        let ecoule = anneau.depuis_la_derniere_lecture_s().unwrap_or(0.0);
+        let rempli = (anneau.en_attente() + periode_b) as f64 / ch as f64
+            - ecoule * self.cadence_b
+            - self.a_sauter as f64;
+        let visee = self.consigne().effective(periode_b, self.compensation_s);
+        let ecart = (visee - rempli).round() as i64;
+        if ecart > 0 {
+            let mut reste = ecart as usize;
+            while reste > 0 {
+                let n = reste.min(self.sortie.len() / ch);
+                self.sortie[..n * ch].fill(0.0);
+                let pris = anneau.pousser(&self.sortie[..n * ch]) / ch;
+                self.trames_produites += pris as u64;
+                if pris < n {
+                    break;
+                }
+                reste -= n;
+            }
+        } else {
+            self.a_sauter += ecart.unsigned_abs() as usize;
+        }
+        // L'écart lissé d'avant le saut ne veut plus rien dire ; la part
+        // intégrale (la dérive des quartz) reste.
+        self.regulateur.ecart_lisse = None;
     }
 
     /// Le retard commun ajouté par [`SortieMultiple`].
@@ -676,8 +779,11 @@ impl Recopieur {
         let periode_b = anneau.periode_du_lecteur();
         if periode_b > 0 {
             let ecoule = anneau.depuis_la_derniere_lecture_s().unwrap_or(0.0);
-            let rempli =
-                (anneau.en_attente() + periode_b) as f64 / ch as f64 - ecoule * self.cadence_b;
+            // Les trames qu'un recalage a décidé de sauter sont déjà hors du
+            // compte : elles ne seront jamais jouées.
+            let rempli = (anneau.en_attente() + periode_b) as f64 / ch as f64
+                - ecoule * self.cadence_b
+                - self.a_sauter as f64;
             let visee = self.consigne().effective(periode_b, self.compensation_s);
             let ecart_s = (rempli - visee) / self.cadence_b;
             self.regulateur.mesurer(ecart_s, dt);
@@ -721,11 +827,13 @@ impl Recopieur {
             self.position += pas;
         }
 
-        if n > 0 {
-            let voulu = n * ch;
-            let pris = anneau.pousser(&self.sortie[..voulu]);
+        let saut = self.a_sauter.min(n);
+        self.a_sauter -= saut;
+        if n > saut {
+            let voulu = (n - saut) * ch;
+            let pris = anneau.pousser(&self.sortie[saut * ch..n * ch]);
             self.echantillons_refuses += (voulu - pris) as u64;
-            self.trames_produites += n as u64;
+            self.trames_produites += (n - saut) as u64;
         }
 
         // Ne garder que ce que les sorties suivantes liront encore.

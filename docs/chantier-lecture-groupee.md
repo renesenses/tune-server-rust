@@ -177,6 +177,25 @@ diffère d'une carte à l'autre (quelques ms). Voir les décisions.
   un groupe de volume). Sortie pas encore enregistrée au démarrage : le
   backend local réglé pour la machine décide.
 
+## Réajustement du retard commun (décision du 14/10)
+
+Le retard commun se réajuste **à la pause et à la piste suivante, jamais
+pendant le son** :
+
+- une pause (rappel de A en pause) et un enchaînement de piste
+  (`local_audio_gapless_chaining_next_track`) DEMANDENT le réajustement ; une
+  piste rouverte le recalcule d'office à l'ouverture ;
+- la demande n'est servie que lorsque A ne reçoit plus que du silence depuis
+  au moins la longueur de la ligne à retard (l'ancienne comme la nouvelle) :
+  tout ce que A et les B ont encore à jouer est alors silencieux. Un
+  enchaînement sans blanc attend donc le prochain silence ;
+- au réajustement, chaque B est recalé d'un coup sur sa nouvelle consigne
+  (zéros ajoutés ou trames sautées, dans le silence), sa dérive estimée
+  conservée.
+
+ASIO (décision du 14/10) : le choix de #6358 reste — quand la sortie n'est pas
+encore connue, le backend réglé pour la machine tranche.
+
 ## Étape 2b — lecture groupée avec des membres réseau (serveur)
 
 1. **Propager la lecture d'un groupe.** À la lecture sur le meneur, les suiveurs
@@ -207,8 +226,7 @@ Décision du 13/10 : après l'étape 2.
 - **flux compressé** (non-WAV, décodé dans la sortie) : le même branchement
   sur `build_compressed_f32_stream` ;
 - adaptation des canaux, relevé dans l'API de diagnostic ;
-- retard commun réajusté en cours d'écoute (aujourd'hui figé au départ), par
-  exemple à la pause.
+
 
 ## Étape 3 — les écrans (client web)
 

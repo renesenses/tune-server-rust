@@ -399,6 +399,12 @@ impl BackendCpal<'_> {
     /// la ligne à retard de A est en place avant sa première période. Une
     /// suiveuse refusée est journalisée et les autres jouent — jamais de
     /// silence sur A pour cause de suiveuse.
+    /// #6132 — la piste suivante commence : le retard commun des sorties
+    /// suiveuses pourra se réajuster au prochain silence.
+    pub(super) fn demander_un_reajustement(&self) {
+        self.recopie.demander_un_reajustement();
+    }
+
     pub(super) fn brancher_les_secondes_sorties(
         &mut self,
         demandes: &[crate::outputs::sortie_double::SecondeSortieDemandee],

@@ -6833,6 +6833,11 @@ impl OutputTarget for LocalOutput {
                     next_url = %next.url,
                     "local_audio_gapless_chaining_next_track"
                 );
+                // #6132 — piste suivante : le retard commun des sorties
+                // suiveuses se réajustera au premier silence, jamais pendant
+                // le son. (Une piste rouverte, sans enchaînement, le recalcule
+                // d'office à l'ouverture.)
+                backend.demander_un_reajustement();
 
                 // La bascule des métadonnées et de la position a lieu PLUS BAS,
                 // une fois le flux suivant confirmé chaînable (en-tête WAV lu).
