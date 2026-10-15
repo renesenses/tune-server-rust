@@ -2501,6 +2501,15 @@ impl StreamingService for QobuzService {
                         "qobuz_format_fallback"
                     );
                     if let Ok(url) = self.fetch_track_url(track_id, fid).await {
+                        // #6401 — la même ligne que le repli après une sonde
+                        // de flux en échec (`qobuz_repli_qualite`).
+                        info!(
+                            track_id,
+                            format_demande = format_id,
+                            erreur = %e,
+                            format_obtenu = fid,
+                            "qobuz_repli_qualite"
+                        );
                         return Ok(url);
                     }
                 }

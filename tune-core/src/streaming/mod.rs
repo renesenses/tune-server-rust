@@ -13,6 +13,8 @@ pub mod podcasts;
 pub mod qobuz;
 pub mod qobuz_cles_brutes;
 pub mod qobuz_credits;
+/// #6401 — repli en 16/44,1 d'un flux haute résolution qui échoue au démarrage.
+pub mod qobuz_repli_qualite;
 pub mod quality;
 pub mod radiofrance;
 pub mod registry;

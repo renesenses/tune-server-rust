@@ -350,6 +350,24 @@ impl PlaybackOrchestrator {
         // retry. Passing `None` means the provider's highest/default quality.
         let mut stream_data =
             request_stream_at_quality(&mut **svc, source_id, provider_quality).await?;
+        // #6401 — un flux Qobuz haute résolution qui échoue au démarrage
+        // (erreur HTTP, flux coupé avant le premier octet) est redemandé UNE
+        // fois au format 6, pour cette piste seulement. Toute re-résolution
+        // ultérieure de la piste (URL expirée en cours d'écoute) garde alors
+        // le format 6 : la seconde moitié ne repart pas en HR.
+        let mut qualite_de_reresolution = provider_quality.map(str::to_string);
+        if service_name == "qobuz" {
+            let retenu = crate::streaming::qobuz_repli_qualite::retenir_le_flux(
+                &**svc,
+                crate::http::client::shared(),
+                source_id,
+                provider_quality,
+                stream_data,
+            )
+            .await;
+            stream_data = retenu.flux;
+            qualite_de_reresolution = retenu.jeton;
+        }
         // #5283 — une cadence annoncée NULLE (Qobuz `sampling_rate: 0`) est
         // remplacée par l'en-tête du flux, ou le catalogue, avant que quoi
         // que ce soit ne la lise. Sans effet si la qualité annoncée est
@@ -475,6 +493,7 @@ impl PlaybackOrchestrator {
                 info,
                 is_https,
                 cadence_plafonnee,
+                qualite_de_reresolution,
             )
             .await?
         } else {
@@ -1834,6 +1853,9 @@ impl PlaybackOrchestrator {
         // La cadence à SERVIR quand le plafond de zone s'applique (#4759).
         // `None` : la cadence du service part telle quelle, comme avant.
         cadence_plafonnee: Option<u32>,
+        // Le jeton de qualité des re-résolutions de CETTE piste : celui de la
+        // zone, ou `cd` après un repli Qobuz (#6401).
+        qualite_de_reresolution: Option<String>,
     ) -> Result<FluxHttps, String> {
         let codec_lower = stream_data.quality.codec.to_lowercase();
         // Codecs that legacy DLNA renderers can't decode must be
@@ -1867,6 +1889,7 @@ impl PlaybackOrchestrator {
                 is_https,
                 codec_lower,
                 cadence_plafonnee,
+                qualite_de_reresolution,
             )
             .await
         }
@@ -2101,6 +2124,8 @@ impl PlaybackOrchestrator {
         is_https: bool,
         codec_lower: String,
         cadence_plafonnee: Option<u32>,
+        // Voir `resoudre_flux_https` (#6401).
+        qualite_de_reresolution: Option<String>,
     ) -> Result<FluxHttps, String> {
         let flux = {
             // Non-AAC codecs (FLAC, etc.) — check if the DLNA renderer
@@ -2394,9 +2419,9 @@ impl PlaybackOrchestrator {
                     // maximum du service : sur une zone réglée en `cd`, la
                     // seconde moitié d'une piste arrivait dans un AUTRE format
                     // que la première.
-                    let provider_quality = preference_de_qualite(&self.db, req.zone_id)
-                        .service_token(&service_name)
-                        .map(str::to_string);
+                    // #6401 — après un repli Qobuz, le format 6 et non plus
+                    // le réglage de la zone.
+                    let provider_quality = qualite_de_reresolution.clone();
                     Some(std::sync::Arc::new(move || {
                         let services = services.clone();
                         let service_name = service_name.clone();

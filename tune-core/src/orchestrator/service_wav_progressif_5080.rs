@@ -229,6 +229,7 @@ async fn un_titre_qobuz_a_egaliseur_n_attend_pas_la_piste_entiere_5080() {
             false,
             "flac".into(),
             None,
+            None,
         ),
     )
     .await;
@@ -290,6 +291,7 @@ async fn le_wav_progressif_d_un_service_porte_l_egaliseur_de_la_zone_5080() {
             info_amont(&flux),
             false,
             "flac".into(),
+            None,
             None,
         )
         .await
