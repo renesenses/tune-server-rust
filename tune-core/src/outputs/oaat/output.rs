@@ -712,6 +712,10 @@ impl OutputTarget for OaatOutput {
         *self.stop_tx.lock().await = Some(stop_tx);
 
         let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<OaatCommand>(32);
+        // `endpoint_release` (RFC OAAT §7.3.1) : met la zone en pause par ce
+        // canal, et `liberation` dit à la reprise qu'il faut renégocier.
+        let commandes_liberation = command_tx.clone();
+        let liberation = Arc::new(AtomicBool::new(false));
         *self.command_tx.lock().await = Some(command_tx);
 
         playing.store(true, Ordering::SeqCst);
@@ -757,7 +761,7 @@ impl OutputTarget for OaatOutput {
             let config = ControllerConfig {
                 controller_id,
                 controller_name: "Tune Server".into(),
-                features: vec![],
+                features: vec![oaat_core::message::FEATURE_ENDPOINT_RELEASE.into()],
                 clock_port: super::helpers::oaat_clock_port(),
                 tls: false,
             };
@@ -867,6 +871,12 @@ impl OutputTarget for OaatOutput {
                 }
             }
             let mut endpoint = endpoint.unwrap();
+            surveiller_liberation(
+                &mut endpoint,
+                &device_name,
+                &liberation,
+                &commandes_liberation,
+            );
 
             // Clock sync with timeout
             match tokio::time::timeout(
@@ -1130,8 +1140,20 @@ impl OutputTarget for OaatOutput {
                                         OaatCommand::Resume => {
                                             paused.store(false, Ordering::SeqCst);
                                             start = std::time::Instant::now() - pause_offset;
-                                            endpoint.send_play(&stream_id).await.ok();
-                                            info!(device = %device_name, "oaat: DSD resumed");
+                                            if reprendre_apres_liberation(
+                                                &mut endpoint,
+                                                &device_name,
+                                                &liberation,
+                                                &contrat,
+                                                &refus_negociation,
+                                                &playing,
+                                            )
+                                            .await
+                                                != Reprise::Impossible
+                                            {
+                                                endpoint.send_play(&stream_id).await.ok();
+                                                info!(device = %device_name, "oaat: DSD resumed");
+                                            }
                                         }
                                         OaatCommand::Seek {
                                             position_ms: seek_pos,
@@ -1242,8 +1264,20 @@ impl OutputTarget for OaatOutput {
                                             OaatCommand::Resume => {
                                                 paused.store(false, Ordering::SeqCst);
                                                 start = std::time::Instant::now() - pause_offset;
-                                                endpoint.send_play(&stream_id).await.ok();
-                                                info!(device = %device_name, "oaat: DSD resumed");
+                                                if reprendre_apres_liberation(
+                                                    &mut endpoint,
+                                                    &device_name,
+                                                    &liberation,
+                                                    &contrat,
+                                                    &refus_negociation,
+                                                    &playing,
+                                                )
+                                                .await
+                                                    != Reprise::Impossible
+                                                {
+                                                    endpoint.send_play(&stream_id).await.ok();
+                                                    info!(device = %device_name, "oaat: DSD resumed");
+                                                }
                                             }
                                             OaatCommand::Pause => {}
                                             OaatCommand::SetVolume(level) => {
@@ -1868,7 +1902,25 @@ impl OutputTarget for OaatOutput {
                                     endpoint.send_mute(muted).await.ok();
                                 }
                                 OaatCommand::Pause => paused.store(true, Ordering::SeqCst),
-                                OaatCommand::Resume => paused.store(false, Ordering::SeqCst),
+                                OaatCommand::Resume => {
+                                    paused.store(false, Ordering::SeqCst);
+                                    // Ce chemin n'envoie ni pause ni play : seul
+                                    // un endpoint libéré, qui a fermé son DAC,
+                                    // a besoin de `play` pour repartir.
+                                    if reprendre_apres_liberation(
+                                        &mut endpoint,
+                                        &device_name,
+                                        &liberation,
+                                        &contrat_negocie,
+                                        &refus_negociation,
+                                        &playing,
+                                    )
+                                    .await
+                                        == Reprise::Renegociee
+                                    {
+                                        endpoint.send_play(&stream_id).await.ok();
+                                    }
+                                }
                                 OaatCommand::Seek {
                                     position_ms: seek_pos,
                                 } => {
@@ -2204,6 +2256,12 @@ impl OutputTarget for OaatOutput {
                 match ConnectedEndpoint::connect(&config, endpoint_addr).await {
                     Ok(ep) => {
                         endpoint = ep;
+                        surveiller_liberation(
+                            &mut endpoint,
+                            &device_name,
+                            &liberation,
+                            &commandes_liberation,
+                        );
                         endpoint.clock_sync_bootstrap().await.ok();
                         if let Err(e) = endpoint
                             .send_message(&oaat_core::Message::FormatPropose(
@@ -2271,6 +2329,9 @@ impl OutputTarget for OaatOutput {
                 }
             };
 
+            // Le contrat du payload en cours, pour renégocier à la reprise
+            // après un `endpoint_release` ; suit les changements gapless.
+            let mut contrat_courant = contrat_negocie.clone();
             let mut cur_format = contrat_negocie.format;
             let mut cur_sample_rate = contrat_negocie.sample_rate;
             let mut cur_bits = contrat_negocie.bits_per_sample;
@@ -2418,6 +2479,7 @@ impl OutputTarget for OaatOutput {
                                 ).await {
                                     Some(new_ep) => {
                                         endpoint = new_ep;
+                                        surveiller_liberation(&mut endpoint, &device_name, &liberation, &commandes_liberation);
                                         diag.connected.store(true, Ordering::SeqCst);
                                         info!(device = %device_name, "oaat: watchdog reconnected");
                                     }
@@ -2463,8 +2525,13 @@ impl OutputTarget for OaatOutput {
                                     &mut stream_start_ns,
                                 ) {
                                     paused.store(false, Ordering::SeqCst);
-                                    endpoint.send_play(&stream_id).await.ok();
-                                    info!(device = %device_name, pause_ms = duree_pause.as_millis(), "oaat: resumed");
+                                    if reprendre_apres_liberation(
+                                        &mut endpoint, &device_name, &liberation, &contrat_courant,
+                                        &refus_negociation, &playing,
+                                    ).await != Reprise::Impossible {
+                                        endpoint.send_play(&stream_id).await.ok();
+                                        info!(device = %device_name, pause_ms = duree_pause.as_millis(), "oaat: resumed");
+                                    }
                                 }
                             }
                             OaatCommand::SetVolume(level) => { endpoint.send_volume(level).await.ok(); }
@@ -2925,6 +2992,7 @@ impl OutputTarget for OaatOutput {
                                     source_data_offset = next.info.data_offset;
                                     source_bytes_per_frame =
                                         (source_bits as usize / 8) * source_channels as usize;
+                                    contrat_courant = next_target.clone();
                                     cur_format = next_target.format;
                                     cur_sample_rate = next_target.sample_rate;
                                     cur_bits = next_target.bits_per_sample;
@@ -3060,6 +3128,7 @@ impl OutputTarget for OaatOutput {
                                     ).await {
                                         Some(new_ep) => {
                                             endpoint = new_ep;
+                                            surveiller_liberation(&mut endpoint, &device_name, &liberation, &commandes_liberation);
                                             info!(device = %device_name, "oaat: reconnected, resuming stream");
                                             continue;
                                         }
@@ -3880,6 +3949,13 @@ async fn attendre_accord_format(
     politique: PolitiqueAdaptation,
     delai: std::time::Duration,
 ) -> Result<ContratPropose, RefusNegociation> {
+    // Un endpoint qui partage son DAC peut devoir attendre qu'un autre
+    // lecteur le libère avant d'accepter : RFC OAAT §7.3.1.
+    let delai = if partage_sa_sortie(endpoint) {
+        delai.max(DELAI_ACCORD_ENDPOINT_PARTAGE)
+    } else {
+        delai
+    };
     // Cette fonction ne fait plus QUE fournir le canal. Toute la mecanique est
     // dans `attendre_accord_format_sur` juste en dessous : ce n'est pas une
     // copie du corps, c'est le corps, deplace. Saboter la-bas casse ici.
@@ -3891,6 +3967,124 @@ async fn attendre_accord_format(
         delai,
     )
     .await
+}
+
+/// Attente minimale du `format_accept` d'un endpoint qui annonce
+/// `endpoint_release` (RFC OAAT §7.3.1, au moins 10 s) : son DAC est partagé
+/// avec d'autres lecteurs de l'appareil, et il n'accepte qu'une fois le DAC
+/// ouvert, quand le lecteur précédent l'a rendu (environ 5 s pour Roon).
+const DELAI_ACCORD_ENDPOINT_PARTAGE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// L'endpoint annonce `endpoint_release` : il partage sa sortie avec
+/// d'autres sources et peut la rendre (RFC OAAT §7.3.1).
+fn partage_sa_sortie(endpoint: &oaat_controller::ConnectedEndpoint) -> bool {
+    endpoint
+        .info
+        .features
+        .iter()
+        .any(|f| f == oaat_core::message::FEATURE_ENDPOINT_RELEASE)
+}
+
+/// `endpoint_release` (RFC OAAT §7.3.1) : l'endpoint a rendu son DAC à une
+/// autre source de l'appareil. La zone passe en pause, comme si
+/// l'utilisateur l'avait mise en pause (pas de reprise automatique, et le
+/// chien de garde ne reconnecte pas une zone en pause), et `liberation`
+/// signale à la reprise qu'il faut renégocier.
+///
+/// Les libérations arrivent sur leur propre canal (`release_rx`), pas dans
+/// `response_rx` : elles ne se mêlent pas aux négociations.
+fn surveiller_liberation(
+    endpoint: &mut oaat_controller::ConnectedEndpoint,
+    device_name: &str,
+    liberation: &Arc<AtomicBool>,
+    commandes: &tokio::sync::mpsc::Sender<OaatCommand>,
+) {
+    let (_, vide) = tokio::sync::mpsc::channel(1);
+    let mut release_rx = std::mem::replace(&mut endpoint.release_rx, vide);
+    let device_name = device_name.to_owned();
+    let liberation = liberation.clone();
+    let commandes = commandes.clone();
+    tokio::spawn(async move {
+        while let Some(release) = release_rx.recv().await {
+            info!(
+                device = %device_name,
+                stream_id = %release.stream_id,
+                reason = ?release.reason,
+                "oaat: l'endpoint a rendu sa sortie, zone en pause"
+            );
+            liberation.store(true, Ordering::SeqCst);
+            if commandes.send(OaatCommand::Pause).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reprise {
+    /// Pas de libération : une pause ordinaire, rien à renégocier.
+    PasLiberee,
+    /// Libérée, et le format est de nouveau accepté.
+    Renegociee,
+    /// La renégociation a échoué : la lecture s'arrête.
+    Impossible,
+}
+
+/// Reprise d'une zone dont l'endpoint a rendu sa sortie : il a fermé son DAC,
+/// on renégocie donc le format du payload en cours avant `play` (RFC OAAT
+/// §7.3.1). Même `stream_id` et même format : l'endpoint reprend le flux là
+/// où il en était, un flux FLAC sans nouvel en-tête. En cas d'échec, la
+/// lecture s'arrête et le motif part au sondeur, comme un refus initial.
+async fn reprendre_apres_liberation(
+    endpoint: &mut oaat_controller::ConnectedEndpoint,
+    device_name: &str,
+    liberation: &AtomicBool,
+    contrat: &ContratPropose,
+    refus_negociation: &Arc<std::sync::Mutex<Option<String>>>,
+    playing: &AtomicBool,
+) -> Reprise {
+    if !liberation.swap(false, Ordering::SeqCst) {
+        return Reprise::PasLiberee;
+    }
+    info!(device = %device_name, stream_id = %contrat.stream_id, "oaat: reprise après libération, renégociation");
+    let resultat = match endpoint
+        .send_message(&oaat_core::Message::FormatPropose(
+            oaat_core::message::FormatPropose {
+                stream_id: contrat.stream_id.clone(),
+                format: contrat.format,
+                sample_rate: contrat.sample_rate,
+                channels: contrat.channels,
+                channel_layout: contrat.channel_layout,
+                bits_per_sample: contrat.bits_per_sample as u8,
+                dsd_rate: contrat.dsd_rate,
+            },
+        ))
+        .await
+    {
+        Ok(()) => attendre_accord_format(
+            endpoint,
+            device_name,
+            contrat,
+            PolitiqueAdaptation::ExacteSeulement,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .map(|_| ()),
+        Err(e) => Err(RefusNegociation {
+            stream_id: contrat.stream_id.clone(),
+            raison: format!("renégociation après libération impossible : {e}"),
+            reconnectable: false,
+        }),
+    };
+    match resultat {
+        Ok(()) => Reprise::Renegociee,
+        Err(refus) => {
+            error!(device = %device_name, raison = %refus.raison, "oaat: reprise après libération refusée");
+            signaler_refus_negociation(refus_negociation, &refus);
+            playing.store(false, Ordering::SeqCst);
+            Reprise::Impossible
+        }
+    }
 }
 
 /// Combien de trames ecartees avant de renoncer.
