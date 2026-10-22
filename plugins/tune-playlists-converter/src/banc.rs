@@ -31,6 +31,10 @@ pub struct Piste {
     pub duree_ms: u64,
     /// Vide par défaut, comme chez la plupart des sources (#4741).
     pub isrc: String,
+    /// Le service d'origine d'un titre de service rangé dans une playlist
+    /// LOCALE (#6499), comme la ligne que rend l'hôte réel. Vide par défaut :
+    /// la fiche n'a alors pas de champ `source`.
+    pub source: String,
 }
 
 impl Piste {
@@ -41,7 +45,15 @@ impl Piste {
             artiste: artiste.into(),
             duree_ms,
             isrc: String::new(),
+            source: String::new(),
         }
+    }
+
+    /// Un titre de `service` (#6499) : son `id` est alors son identifiant
+    /// chez ce service.
+    pub fn chez(mut self, service: &str) -> Self {
+        self.source = service.into();
+        self
     }
 
     pub fn avec_isrc(mut self, isrc: &str) -> Self {
@@ -49,13 +61,17 @@ impl Piste {
         self
     }
     fn json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "source_id": self.id,
             "title": self.titre,
             "artist_name": self.artiste,
             "duration_ms": self.duree_ms,
             "isrc": self.isrc,
-        })
+        });
+        if !self.source.is_empty() {
+            v["source"] = json!(self.source);
+        }
+        v
     }
 }
 
@@ -104,6 +120,9 @@ pub struct Journaux {
     /// `ajout:<id>`. C'est ce qui prouve qu'un snapshot est pris AVANT le
     /// premier ajout, et pas seulement « quelque part ».
     pub operations: Vec<String>,
+    /// Les appariements demandés à un service : `(service, titre)` (#6499).
+    /// Un titre repris tel quel n'a rien à y faire.
+    pub appariements: Vec<(String, String)>,
 }
 
 pub struct HoteDeBanc {
@@ -247,6 +266,11 @@ impl HoteDeBanc {
         self.journaux.borrow().ajouts.clone()
     }
 
+    /// Les appariements demandés à un service, dans l'ordre (#6499).
+    pub fn appariements(&self) -> Vec<(String, String)> {
+        self.journaux.borrow().appariements.clone()
+    }
+
     pub fn operations(&self) -> Vec<String> {
         self.journaux.borrow().operations.clone()
     }
@@ -385,8 +409,12 @@ impl Hote for HoteDeBanc {
                 .map(|p| {
                     let mut v = p.json();
                     // Une piste locale porte son identifiant ENTIER sous
-                    // `track_id`, comme la fiche de l'hôte réel.
-                    if let Ok(n) = p.id.parse::<i64>() {
+                    // `track_id`, comme la fiche de l'hôte réel. Un titre de
+                    // service (#6499) n'en a pas, même si son identifiant
+                    // chez le service est fait de chiffres (Qobuz).
+                    if p.source.is_empty()
+                        && let Ok(n) = p.id.parse::<i64>()
+                    {
                         v["track_id"] = json!(n);
                     }
                     v
@@ -478,6 +506,10 @@ impl Hote for HoteDeBanc {
         _isrc: &str,
         _duration_ms: u64,
     ) -> Result<Value, String> {
+        self.journaux
+            .borrow_mut()
+            .appariements
+            .push((service.to_string(), title.to_string()));
         self.reponse_appariement(service, title)
     }
 

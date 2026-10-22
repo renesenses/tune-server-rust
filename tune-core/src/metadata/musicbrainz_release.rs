@@ -305,15 +305,22 @@ pub(crate) fn plausible(
     want_title: &str,
     want_artist: &str,
 ) -> bool {
+    // L'égalité ou l'inclusion, dans un sens ou dans l'autre.
+    let concorde = |a: &str, b: &str| a == b || a.contains(b) || b.contains(a);
+    // #4805, introuvables de la mesure A : 36 albums dont le pressage portait
+    // l'artiste à ses accents (`Étienne Daho`, `Céline Dion`, `Téléphone`)
+    // quand la balise les omettait. La recherche les rendait ; ce filtre les
+    // écartait. Les deux formes se comparent donc aussi sans diacritiques.
+    let sans = normalize_sans_diacritiques;
+
     let norm_title = normalize(want_title);
     let norm_rel_title = normalize(rel_title);
     // Idée : MetaRust — les titres se comparent aussi sans espaces, « Mind
     // State » contre « Mindstate ». Égalité seulement : l'inclusion compacte
     // serait trop lâche (« heart of noise » contient « artofnoise »).
-    if norm_rel_title != norm_title
-        && !norm_title.contains(&norm_rel_title)
-        && !norm_rel_title.contains(&norm_title)
+    if !concorde(&norm_rel_title, &norm_title)
         && normalize_compact(rel_title) != normalize_compact(want_title)
+        && !concorde(&sans(rel_title), &sans(want_title))
     {
         return false;
     }
@@ -322,8 +329,8 @@ pub(crate) fn plausible(
     let norm_rel_artist = normalize(rel_artist);
     if !norm_artist.is_empty()
         && !norm_rel_artist.is_empty()
-        && !norm_artist.contains(&norm_rel_artist)
-        && !norm_rel_artist.contains(&norm_artist)
+        && !concorde(&norm_artist, &norm_rel_artist)
+        && !concorde(&sans(want_artist), &sans(rel_artist))
     {
         return false;
     }
@@ -618,6 +625,19 @@ pub async fn lire_sur_musicbrainz(
     }
 }
 
+/// Le transport de production d'un PARCOURS `/{chemin}?{params}&fmt=json` —
+/// `genre/all` (#6001), `release-group?artist=` (#6288). Même User-Agent,
+/// même base. N'attend pas le créneau : l'appelant appelle
+/// [`rate_limit_delay`] avant chaque page.
+pub async fn parcourir_sur_musicbrainz(
+    chemin: &str,
+    params: &[(&str, String)],
+) -> Result<Value, RefusMusicBrainz> {
+    let mut avec_format: Vec<(&str, String)> = params.to_vec();
+    avec_format.push(("fmt", "json".to_string()));
+    mb_get(chemin, &avec_format).await
+}
+
 /// Best-guess identification: narrow the query with everything we know and
 /// return a hit only if MusicBrainz is confident.
 pub async fn lookup_release(
@@ -692,6 +712,9 @@ fn retire_un_suffixe(titre: &str) -> Option<String> {
     if let Some((reste, _)) = suffixe_d_edition(t) {
         return Some(reste.to_string());
     }
+    if let Some(reste) = parenthese_de_disque(t) {
+        return Some(reste.to_string());
+    }
 
     // 2. `, Disc 1` / ` - CD 2` / `, Disque 3` en fin de titre. Le découpage
     //    par disque est une propriété de NOTRE arborescence, pas du pressage :
@@ -710,10 +733,21 @@ fn retire_un_suffixe(titre: &str) -> Option<String> {
         }
         let avant = t[..pos].trim_end();
         let avant = avant.strip_suffix('-').or_else(|| avant.strip_suffix('–'));
-        let Some(avant) = avant.map(str::trim_end).or_else(|| {
-            // Sans tiret, il faut une virgule : `Singles and More, Disc 1`.
-            t[..pos].trim_end().strip_suffix(',')
-        }) else {
+        let Some(avant) = avant
+            .map(str::trim_end)
+            .or_else(|| {
+                // Sans tiret, il faut une virgule : `Singles and More, Disc 1`.
+                t[..pos].trim_end().strip_suffix(',')
+            })
+            .or_else(|| {
+                // #4805, introuvables de la mesure A : ni tiret ni virgule,
+                // `Histoires CD1`, `Three Sides Live CD 2` (162 albums sur 919).
+                // Le mot de disque doit alors être un mot entier, précédé
+                // d'une espace : `ABCD 2` reste tel quel.
+                let avant = &t[..pos];
+                (avant.ends_with(char::is_whitespace) && pos > 0).then_some(avant)
+            })
+        else {
             continue;
         };
         let avant = avant.trim_end().trim_end_matches(',').trim_end();
@@ -722,6 +756,38 @@ fn retire_un_suffixe(titre: &str) -> Option<String> {
         }
     }
 
+    None
+}
+
+/// La parenthèse ou le crochet FINAL de `t` quand il ne dit qu'un numéro de
+/// disque : `(CD 1)`, `[Disc 2]`, `(Disque 3)`. Rend ce qui précède.
+///
+/// Mesure A de #4805 : `The Song Remains The Same (CD 1)` restait introuvable,
+/// `cd` n'étant pas un marqueur de pressage (il ne doit pas l'être : `(CD
+/// Single)` ou `(Live on CD)` ne sont pas des numéros de disque).
+fn parenthese_de_disque(t: &str) -> Option<&str> {
+    let t = t.trim_end();
+    for (ouvre, ferme) in [('(', ')'), ('[', ']')] {
+        if !t.ends_with(ferme) {
+            continue;
+        }
+        let Some(pos) = t.rfind(ouvre) else { continue };
+        let contenu = t[pos + ouvre.len_utf8()..t.len() - ferme.len_utf8()]
+            .trim()
+            .to_ascii_lowercase();
+        let numero = MOTS_DE_DISQUE
+            .iter()
+            .chain(&["disk"])
+            .find_map(|mot| contenu.strip_prefix(*mot))
+            .map(str::trim);
+        if !numero.is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
+            continue;
+        }
+        let reste = t[..pos].trim_end();
+        if !reste.is_empty() {
+            return Some(reste);
+        }
+    }
     None
 }
 
@@ -1063,10 +1129,57 @@ const ARTISTES_FICTIFS: &[&str] = &[
     "artista desconocido",
 ];
 
+/// Les titres d'album qui n'en sont pas, normalisés par [`normalize`].
+const TITRES_FICTIFS: &[&str] = &[
+    "unknown",
+    "unknown album",
+    "album inconnu",
+    "untitled",
+    "sans titre",
+    "no title",
+    "album",
+];
+
+/// `true` pour un titre d'album qui n'en est pas : `Unknown Album`,
+/// `Untitled`, ou un simple numéro de disque (`Disque 1`, `CD 2`). Sert à ne
+/// pas chercher un tel titre SANS artiste (#4805) : la recherche ramènerait
+/// un pressage quelconque du même nom.
+pub fn est_un_titre_fictif(titre: &str) -> bool {
+    let n = normalize(titre);
+    if n.is_empty() || TITRES_FICTIFS.contains(&n.as_str()) {
+        return true;
+    }
+    let sans_chiffres = n.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' ');
+    sans_chiffres.len() < n.len()
+        && MOTS_DE_DISQUE
+            .iter()
+            .chain(&["disk", "track"])
+            .any(|m| sans_chiffres == *m)
+}
+
 /// `true` pour un artiste qui n'en est pas (`Unknown Artist`, chaîne vide…).
 pub fn est_un_artiste_fictif(nom: &str) -> bool {
     let n = normalize(nom);
     n.is_empty() || ARTISTES_FICTIFS.contains(&n.as_str())
+}
+
+/// Les articles qu'un classement alphabétique renvoie en fin de nom.
+const ARTICLES_EN_FIN: &[&str] = &[
+    "the", "les", "le", "la", "los", "las", "die", "der", "el", "il",
+];
+
+/// `Brecker Brothers, The` → `The Brecker Brothers` (#4805, introuvables de la
+/// mesure A). La phrase Lucene `artist:"Brecker Brothers, The"` ne retrouve
+/// pas le crédit `The Brecker Brothers` : les mots n'y sont pas dans l'ordre.
+fn article_remis_en_tete(nom: &str) -> String {
+    if let Some((tete, article)) = nom.rsplit_once(',') {
+        let article = article.trim();
+        let tete = tete.trim();
+        if !tete.is_empty() && ARTICLES_EN_FIN.contains(&article.to_lowercase().as_str()) {
+            return format!("{article} {tete}");
+        }
+    }
+    nom.to_string()
 }
 
 /// L'artiste à mettre dans la requête MusicBrainz d'un album (#4805).
@@ -1084,12 +1197,50 @@ pub fn artiste_de_requete(artiste_album: Option<&str>, artiste_pistes: Option<&s
         if ALIAS_DE_COMPILATION.contains(&normalize(nom).as_str()) {
             "Various Artists".to_string()
         } else {
-            nom.trim().to_string()
+            article_remis_en_tete(nom.trim())
         }
     };
     match (artiste_album, artiste_pistes) {
         (Some(a), _) if !est_un_artiste_fictif(a) => canonique(a),
         (_, Some(p)) if !est_un_artiste_fictif(p) => canonique(p),
+        // #4805, introuvables de la mesure A (113 albums sur 919) : un artiste
+        // fictif dans la requête (`artist:"Unknown Artist"`) ne ramène rien.
+        // Sans meilleur nom, la requête porte le titre seul ; le choix
+        // (`choix_de_pressage` : score, départage, complétude des pistes)
+        // juge ensuite comme pour tout album.
+        (Some(_), _) | (None, Some(_)) | (None, None) => String::new(),
+    }
+}
+
+/// Qui demande l'identification d'un album : la fiche (un clic de
+/// l'utilisateur sur CET album) ou une passe de lot (`identify-all`, passe de
+/// nuit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrigineDeLaRecherche {
+    /// Le bouton de la fiche album : l'utilisateur regarde le résultat.
+    Fiche,
+    /// Une passe de lot : personne ne regarde album par album.
+    Lot,
+}
+
+/// [`artiste_de_requete`] selon [`OrigineDeLaRecherche`].
+///
+/// Décision de Bertrand (13/10/2026, #4805) : la recherche par le titre seul,
+/// quand l'artiste est fictif (`Unknown Artist`), est RÉSERVÉE au bouton de la
+/// fiche. Sur la mesure A elle identifiait 47 albums de plus mais en rendait
+/// 23 ambigus : à la main, l'utilisateur juge le candidat ; dans un lot,
+/// personne. La passe de lot garde donc la requête d'avant, l'artiste
+/// d'origine tel quel.
+pub fn artiste_de_requete_pour(
+    origine: OrigineDeLaRecherche,
+    artiste_album: Option<&str>,
+    artiste_pistes: Option<&str>,
+) -> String {
+    let requete = artiste_de_requete(artiste_album, artiste_pistes);
+    if !requete.is_empty() || origine == OrigineDeLaRecherche::Fiche {
+        return requete;
+    }
+    match (artiste_album, artiste_pistes) {
         (Some(a), _) => a.trim().to_string(),
         (None, Some(p)) => p.trim().to_string(),
         (None, None) => String::new(),
@@ -1261,6 +1412,11 @@ where
 {
     if title.trim().is_empty() {
         // Rien n'a été demandé à MusicBrainz, et ce n'est pas sa faute.
+        return RechercheDePressages::repondue(Vec::new());
+    }
+    // Sans artiste, un titre qui n'en est pas un (`Unknown Album`, `Disque 1`)
+    // ramènerait n'importe quel pressage du même nom : on ne demande rien.
+    if artist.trim().is_empty() && est_un_titre_fictif(title) {
         return RechercheDePressages::repondue(Vec::new());
     }
 
@@ -2141,6 +2297,29 @@ mod tests {
         );
     }
 
+    /// #4805, introuvables de la mesure A : le numéro de disque sans tiret ni
+    /// virgule, ou seul dans une parenthèse, s'en va de la requête.
+    #[test]
+    fn titre_de_requete_retire_un_numero_de_disque_nu() {
+        for (brut, propre) in [
+            ("Histoires CD1", "Histoires"),
+            ("Three Sides Live CD 2", "Three Sides Live"),
+            ("The New Crystal Silence CD2", "The New Crystal Silence"),
+            (
+                "The Song Remains The Same (CD 1)",
+                "The Song Remains The Same",
+            ),
+            ("Anthologie [Disc 2]", "Anthologie"),
+            ("Box Set Disque 3", "Box Set"),
+        ] {
+            assert_eq!(titre_de_requete(brut).as_deref(), Some(propre), "{brut}");
+        }
+        // Un mot qui finit par « cd », un CD qui n'est pas un numéro.
+        for intact in ["ABCD 2", "Single (CD Single)", "Live on CD", "CD 1"] {
+            assert_eq!(titre_de_requete(intact), None, "{intact}");
+        }
+    }
+
     /// La contrepartie : ne rien retirer quand il n'y a rien a retirer. `None`
     /// est ce qui epargne a l'appelant une seconde requete de 1,1 s identique.
     #[test]
@@ -2544,6 +2723,130 @@ mod tests {
         assert_eq!(artiste_de_requete(Some("Divers Gens"), None), "Divers Gens");
     }
 
+    /// #4805, introuvables de la mesure A : l'article renvoyé en fin de nom
+    /// revient en tête, dans la requête seulement.
+    #[test]
+    fn artiste_de_requete_remet_l_article_en_tete() {
+        for (brut, requete) in [
+            ("Brecker Brothers, The", "The Brecker Brothers"),
+            ("Chemical Brothers, the", "the Chemical Brothers"),
+            ("Ogres de Barbak, Les", "Les Ogres de Barbak"),
+        ] {
+            assert_eq!(artiste_de_requete(Some(brut), None), requete, "{brut}");
+        }
+        // Une virgule qui ne précède pas un article ne change rien.
+        for intact in [
+            "Crosby, Stills, Nash & Young",
+            "Earth, Wind & Fire",
+            "The National",
+        ] {
+            assert_eq!(artiste_de_requete(Some(intact), None), intact, "{intact}");
+        }
+    }
+
+    /// Décision du 13/10/2026 (#4805) : le titre seul pour un artiste fictif
+    /// est réservé à la fiche ; le lot garde l'artiste d'origine.
+    #[test]
+    fn titre_seul_reserve_a_la_fiche() {
+        use OrigineDeLaRecherche::{Fiche, Lot};
+        for (album, pistes) in [
+            (Some("Unknown Artist"), Some("Unknown Artist")),
+            (Some("Unknown Artist"), None),
+            (None, Some("Artiste inconnu")),
+        ] {
+            assert_eq!(
+                artiste_de_requete_pour(Fiche, album, pistes),
+                "",
+                "{album:?}"
+            );
+            assert_ne!(artiste_de_requete_pour(Lot, album, pistes), "", "{album:?}");
+        }
+        assert_eq!(
+            artiste_de_requete_pour(Lot, Some(" Unknown Artist "), None),
+            "Unknown Artist"
+        );
+        // Un vrai artiste : la même requête des deux côtés.
+        for origine in [Fiche, Lot] {
+            assert_eq!(
+                artiste_de_requete_pour(origine, Some("Unknown Artist"), Some("Air")),
+                "Air"
+            );
+            assert_eq!(
+                artiste_de_requete_pour(origine, Some("Brecker Brothers, The"), None),
+                "The Brecker Brothers"
+            );
+            assert_eq!(artiste_de_requete_pour(origine, None, None), "");
+        }
+    }
+
+    /// Sans artiste, un titre fictif ne part pas chez MusicBrainz ; un vrai
+    /// titre, si.
+    #[tokio::test(start_paused = true)]
+    async fn un_titre_fictif_n_est_pas_cherche_sans_artiste() {
+        for fictif in ["Unknown Album", "Disque 1", "CD 2", "Untitled", "Album"] {
+            assert!(est_un_titre_fictif(fictif), "{fictif}");
+        }
+        for vrai in [
+            "Mosaic",
+            "Disque d'or",
+            "CD Single",
+            "Album 1700",
+            "Caravan",
+        ] {
+            assert!(!est_un_titre_fictif(vrai), "{vrai}");
+        }
+        let vues = std::cell::RefCell::new(Vec::new());
+        for titre in ["Unknown Album", "Mosaic"] {
+            let r = recherche_de_pressages_complete(titre, "", Some(9), 15, |requete, _| {
+                vues.borrow_mut().push(requete);
+                std::future::ready(Ok(json!({ "releases": [] })))
+            })
+            .await;
+            assert!(r.candidats.is_empty() && r.refus.is_none());
+        }
+        assert_eq!(
+            *vues.borrow(),
+            vec![r#"release:"Mosaic""#.to_string()],
+            "un titre fictif sans artiste ne part pas ; un vrai titre, si"
+        );
+    }
+
+    /// #4805, introuvables de la mesure A : la balise sans accents, le
+    /// pressage avec. Un autre artiste reste écarté.
+    #[test]
+    fn plausible_compare_aussi_sans_diacritiques() {
+        assert!(plausible(
+            "Corps & Armes",
+            "Étienne Daho",
+            "Corps & Armes",
+            "Etienne Daho"
+        ));
+        assert!(plausible(
+            "S'il suffisait d'aimer",
+            "Céline Dion",
+            "S'il Suffisait D'Aimer",
+            "Celine Dion"
+        ));
+        assert!(plausible(
+            "Réévolution",
+            "Étienne Daho",
+            "Reevolution",
+            "Etienne Daho"
+        ));
+        assert!(!plausible(
+            "Corps & Armes",
+            "Florent Pagny",
+            "Corps & Armes",
+            "Etienne Daho"
+        ));
+        assert!(!plausible(
+            "Autre chose",
+            "Étienne Daho",
+            "Corps & Armes",
+            "Etienne Daho"
+        ));
+    }
+
     #[test]
     fn artiste_de_requete_prefere_l_artiste_des_pistes_a_un_artiste_fictif() {
         assert_eq!(
@@ -2556,15 +2859,13 @@ mod tests {
         );
         assert_eq!(artiste_de_requete(Some(""), Some("Air")), "Air");
         assert_eq!(artiste_de_requete(None, Some("VA")), "Various Artists");
-        // Rien de mieux : l'artiste d'origine, comme avant.
+        // Rien de mieux : le titre seul (#4805, mesure A), jamais un artiste
+        // fictif dans la requête.
         assert_eq!(
             artiste_de_requete(Some("Unknown Artist"), Some("Unknown Artist")),
-            "Unknown Artist"
+            ""
         );
-        assert_eq!(
-            artiste_de_requete(Some("Unknown Artist"), None),
-            "Unknown Artist"
-        );
+        assert_eq!(artiste_de_requete(Some("Unknown Artist"), None), "");
         assert_eq!(artiste_de_requete(None, None), "");
         // Un vrai artiste d'album n'est jamais remplacé par celui des pistes.
         assert_eq!(

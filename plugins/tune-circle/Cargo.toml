@@ -32,6 +32,10 @@ sha2 = { workspace = true }
 # T4 (#5327) : la sonde du flux de contact part dans sa propre tâche, pour ne
 # pas retenir le répartiteur d'événements des greffons.
 tokio = { workspace = true }
+# #6521 : la vignette d'une pochette partagée avec le cercle, réencodée en
+# JPEG depuis ses pixels (aucune métadonnée ne survit), et son envoi en base64.
+image = { workspace = true }
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true }

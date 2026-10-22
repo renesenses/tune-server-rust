@@ -1,0 +1,13 @@
+{
+  "cle_serveur": "iN9VZBNTiwAgFelhmwG9tcxIxyFWRXklY_VGD3MHp2M",
+  "defi": "ZW5yZWdpc3RyZW1lbnQtZGUtdGVzdA",
+  "description": "Le serveur signe le défi d'enregistrement du relais avec sa clé Ed25519. Message : « tune-remote/serveur/v1\\n<server_id>\\n<défi> ».",
+  "inscription": {
+    "description": "Preuve d'inscription de la clé sur le compte. Message : « tune-remote/inscription/v1\\n<server_id>\\n<clé publique> ».",
+    "preuve": "y1b180ryic6vx3HM3LSsszjVoDYT5W2iJ38knlkJSPTU4-dbZTz28DsHK48oDfZ9-fzRzsI-s4Rd7-eEy1FsCQ"
+  },
+  "nom": "defi_serveur",
+  "server_id": "6f1c1f5e-2b0a-4c2e-9d3b-7a51c0de0001",
+  "signature": "y1bYjceHZeJZPtFMtSkkmh6wbjyG1XYOQCNJcbbpUs8cYwsYnXxGhdVEd9P01FEJdu6vxyQs6Smcp2YlROqnBA",
+  "signature_autre_serveur": "85r73KNb8Yqspn3mkl6XbFHcuX3XIh4fC_wQhDjh_rLVlhKhtibKktgMoQ8cQczC7R1JContWMhjufpr0fIqCg"
+}

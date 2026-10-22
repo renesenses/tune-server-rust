@@ -304,21 +304,73 @@ fn la_restauration_ne_fait_jamais_plus_que_l_apercu() {
     assert_eq!(hote.ajouts(), vec![("pl-1".into(), vec!["s-2".into()])]);
 }
 
-/// Le mode « recréer » crée une NOUVELLE playlist et laisse l'ancienne.
+/// Le mode « recréer » crée une NOUVELLE playlist DANS TUNE et laisse
+/// l'ancienne (décision de Bertrand, 08/10/2026) : les pistes du snapshot pris
+/// chez TIDAL sont appariées dans la bibliothèque, celles qui n'y sont pas
+/// sortent en introuvables, et RIEN n'est écrit chez le service.
 #[test]
-fn recreer_cree_une_nouvelle_playlist_et_laisse_l_ancienne() {
+fn recreer_recree_la_playlist_dans_tune_et_n_ecrit_rien_chez_le_service() {
     let (hote, id) = banc_retouche();
+    let hote = hote
+        .avec_verdict_chez(
+            "local",
+            "Imagine",
+            Verdict::exact(Piste::new("41", "Imagine", "John Lennon", 183_500)),
+        )
+        .avec_verdict_chez(
+            "local",
+            "Fragile",
+            Verdict::exact(Piste::new("43", "Fragile", "Sting", 232_000)),
+        );
     let s = Snapshots::new(&hote);
     let (plan, _, a_retirer) = s.apercu_restauration(&id, mode::RECREER).unwrap();
     assert!(a_retirer.is_empty());
+    assert_eq!(plan.cible_service.as_deref(), Some("local"));
+    assert_eq!(plan.a_rajouter_ids, vec!["41", "43"]);
+    assert_eq!(plan.introuvables_ids, vec!["s-2"]);
+    assert_eq!(s.introuvables(&plan)[0].titre, "Come Together");
+    assert!(
+        plan.avertissement.contains("dans Tune"),
+        "{}",
+        plan.avertissement
+    );
+
     let (fait, _) = s.restaurer(&plan.plan_id, true).unwrap();
+    assert_eq!(fait.etat, "termine");
     assert_eq!(
         hote.creations(),
-        vec![("cible-1".into(), "Nuit blanche".into())]
+        vec![("1001".into(), "Nuit blanche".into())],
+        "une playlist LOCALE (identifiant entier) est créée, aucune chez le service"
     );
-    assert_eq!(fait.playlist_recreee_id.as_deref(), Some("cible-1"));
-    assert_eq!(hote.ids_de("cible-1"), vec!["s-1", "s-2", "s-3"]);
+    assert_eq!(fait.playlist_recreee_id.as_deref(), Some("1001"));
+    assert_eq!(hote.ids_de("1001"), vec!["41", "43"]);
+    assert_eq!(
+        hote.ajouts(),
+        vec![("1001".into(), vec!["41".into(), "43".into()])]
+    );
     assert_eq!(hote.ids_de("pl-1"), vec!["s-1", "s-3", "s-4"], "intacte");
+}
+
+/// Un snapshot de la bibliothèque se recrée dans la bibliothèque, à
+/// l'identique : ses identifiants sont déjà ceux de Tune.
+#[test]
+fn recreer_une_playlist_locale_reprend_ses_pistes() {
+    let hote = HoteDeBanc::new().avec_playlist(
+        "7",
+        "Ma sélection",
+        vec![
+            Piste::new("12", "Imagine", "John Lennon", 183_000),
+            Piste::new("13", "Fragile", "Sting", 232_000),
+        ],
+    );
+    let s = Snapshots::new(&hote);
+    let id = s.prendre("local", "7", None, "manuel").unwrap().snapshot_id;
+    let (plan, _, _) = s.apercu_restauration(&id, mode::RECREER).unwrap();
+    assert!(plan.introuvables_ids.is_empty());
+    let (fait, _) = s.restaurer(&plan.plan_id, true).unwrap();
+    let cible = fait.playlist_recreee_id.unwrap();
+    assert_eq!(hote.ids_de(&cible), vec!["12", "13"]);
+    assert_eq!(hote.ids_de("7"), vec!["12", "13"], "intacte");
 }
 
 /// Une playlist LOCALE se garde et se complète par ses identifiants entiers.
@@ -439,4 +491,187 @@ fn les_routes_des_snapshots_rendent_les_codes_attendus() {
         json!({ "snapshot_id": "snap-1-1", "mode": "effacer" }),
     );
     assert_eq!(r["status"], 400, "aucun mode destructeur");
+}
+
+// ---------------------------------------------------------------------------
+// Supprimer une copie (décision de Bertrand du 08/10/2026, #5966)
+// ---------------------------------------------------------------------------
+
+/// La valeur que le greffon a laissée sous `cle`, telle que l'hôte la rend.
+fn valeur_kv(hote: &HoteDeBanc, cle: &str) -> serde_json::Value {
+    use crate::hote::Hote;
+    hote.kv_get(cle).unwrap()["value"].clone()
+}
+
+/// 🔴 Supprimer une copie EFFACE son contenu (en-tête et pages), la retire de
+/// la liste, et ne touche à rien d'autre : ni la playlist chez le service, ni
+/// les autres copies de la même playlist.
+#[test]
+fn supprimer_une_copie_efface_son_contenu_et_rien_d_autre() {
+    let hote = banc();
+    let s = Snapshots::new(&hote);
+    let ancienne = s.prendre("tidal", "pl-1", None, "manuel").unwrap();
+    let mut pistes = trois();
+    pistes.push(Piste::new("s-4", "Roxanne", "The Police", 192_000));
+    hote.remplacer_pistes("pl-1", pistes);
+    hote.avancer(60_000);
+    let recente = s.prendre("tidal", "pl-1", None, "manuel").unwrap();
+    let ops_avant = hote.operations().len();
+
+    let rendu = s.supprimer(&recente.snapshot_id).unwrap();
+    assert_eq!(rendu["supprime"], true, "{rendu}");
+    assert_eq!(rendu["playlists_touchees"], false, "{rendu}");
+
+    // Le contenu n'est plus lisible, ni par la route, ni dans le stockage.
+    let err = s.lire(&recente.snapshot_id).unwrap_err();
+    assert!(err.starts_with("snapshot_expire"), "{err}");
+    assert!(
+        valeur_kv(&hote, "snap:1:1").is_null(),
+        "l'en-tête est effacé"
+    );
+    assert!(
+        valeur_kv(&hote, "snap:1:1:p:0").is_null(),
+        "les pistes sont effacées"
+    );
+
+    // La liste ne la montre plus ; l'autre copie reste entière.
+    let liste = s.lister("tidal", "pl-1").unwrap();
+    let ids: Vec<&str> = liste.iter().map(|e| e.snapshot_id.as_str()).collect();
+    assert_eq!(ids, vec![ancienne.snapshot_id.as_str()]);
+    assert_eq!(s.lire(&ancienne.snapshot_id).unwrap().pistes.len(), 3);
+    assert_eq!(s.playlists().unwrap()[0]["snapshots"], 1);
+
+    // Rien n'est écrit ailleurs que dans le stockage du greffon.
+    assert!(hote.creations().is_empty() && hote.ajouts().is_empty());
+    assert!(
+        hote.operations()[ops_avant..]
+            .iter()
+            .all(|o| o.starts_with("kv:snap:")),
+        "seules les clés de la copie sont réécrites — vu {:?}",
+        &hote.operations()[ops_avant..]
+    );
+    assert_eq!(
+        hote.ids_de("pl-1").len(),
+        4,
+        "la playlist n'est pas touchée"
+    );
+}
+
+/// Une playlist dont on a supprimé toutes les copies sort de la liste des
+/// playlists gardées ; une nouvelle copie la fait revenir, même identique à
+/// celle qu'on a supprimée.
+#[test]
+fn sans_copie_la_playlist_sort_de_la_liste_et_peut_revenir() {
+    let hote = banc();
+    let s = Snapshots::new(&hote);
+    let e = s.prendre("tidal", "pl-1", None, "manuel").unwrap();
+    s.supprimer(&e.snapshot_id).unwrap();
+    assert!(s.playlists().unwrap().is_empty());
+    assert!(s.lister("tidal", "pl-1").unwrap().is_empty());
+
+    let nouvelle = s.prendre("tidal", "pl-1", None, "manuel").unwrap();
+    assert_ne!(
+        nouvelle.snapshot_id, e.snapshot_id,
+        "une copie supprimée n'est pas rendue comme « identique »"
+    );
+    assert_eq!(s.lire(&nouvelle.snapshot_id).unwrap().pistes.len(), 3);
+    assert_eq!(s.playlists().unwrap().len(), 1);
+}
+
+/// Une copie déjà supprimée, ou chassée de l'anneau, se dit introuvable.
+#[test]
+fn supprimer_deux_fois_rend_introuvable() {
+    let hote = banc();
+    let s = Snapshots::new(&hote);
+    let e = s.prendre("tidal", "pl-1", None, "manuel").unwrap();
+    s.supprimer(&e.snapshot_id).unwrap();
+    let err = s.supprimer(&e.snapshot_id).unwrap_err();
+    assert!(err.starts_with("snapshot_expire"), "{err}");
+}
+
+/// 🔴 L'identifiant n'est jamais une clé : seul `snap-<K>-<N>` écrit en
+/// chiffres est accepté. Un chemin (`..`, `/`), une autre clé du stockage ou
+/// une écriture non canonique est refusé AVANT toute écriture.
+#[test]
+fn supprimer_refuse_tout_identifiant_hors_des_copies() {
+    let hote = banc();
+    let s = Snapshots::new(&hote);
+    s.prendre("tidal", "pl-1", None, "manuel").unwrap();
+    let ecritures = hote.operations().len();
+    for id in [
+        "",
+        "..",
+        "../lien:1",
+        "snap-1-1/../lien:1",
+        "snap-1-1/..",
+        "snap:1:0",
+        "lien:1",
+        "compteur_playlists_snap",
+        "snap-1-0",
+        "snap-01-1",
+        "snap-1-+1",
+        " snap-1-1",
+        "snap-1-1 ",
+        "snap-1-1-1",
+        "snap--1-1",
+    ] {
+        let err = s.supprimer(id).unwrap_err();
+        assert!(
+            err.starts_with("demande_invalide"),
+            "`{id}` doit être refusé comme invalide — vu {err}"
+        );
+    }
+    assert_eq!(hote.operations().len(), ecritures, "rien n'est écrit");
+    assert_eq!(s.lister("tidal", "pl-1").unwrap().len(), 1);
+}
+
+#[test]
+fn la_route_de_suppression_rend_les_codes_attendus() {
+    let hote = banc();
+    let r = route(
+        &hote,
+        "POST",
+        "/snapshot",
+        "",
+        json!({ "service": "tidal", "playlist_id": "pl-1" }),
+    );
+    let id = r["body"]["snapshot"]["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let r = route(&hote, "POST", "/snapshot/supprimer", "", json!({}));
+    assert_eq!(r["status"], 400, "snapshot_id manquant : {r}");
+    let r = route(
+        &hote,
+        "POST",
+        "/snapshot/supprimer",
+        "",
+        json!({ "snapshot_id": "../lien:1" }),
+    );
+    assert_eq!(r["status"], 400, "{r}");
+
+    let r = route(
+        &hote,
+        "POST",
+        "/snapshot/supprimer",
+        "",
+        json!({ "snapshot_id": id }),
+    );
+    assert_eq!(r["status"], 200, "{r}");
+    assert_eq!(r["body"]["snapshot_id"], id.as_str());
+    assert_eq!(r["body"]["supprime"], true);
+
+    let r = route(&hote, "GET", "/snapshot", &format!("id={id}"), json!(null));
+    assert_eq!(r["status"], 404, "{r}");
+    let r = route(
+        &hote,
+        "POST",
+        "/snapshot/supprimer",
+        "",
+        json!({ "snapshot_id": id }),
+    );
+    assert_eq!(r["status"], 404, "déjà supprimée : {r}");
+    let r = route(&hote, "GET", "/snapshots", "", json!(null));
+    assert_eq!(r["body"]["count"], 0, "{r}");
 }

@@ -501,7 +501,9 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         let (debut_s, duree_s) = tranche
             .map(|t| (t.debut_s, t.duree_s))
             .unwrap_or((0.0, 0.0));
-        crate::audio::decode::decode_to_pcm(
+        // #6057 — le repli de canaux pour le renderer route par la
+        // disposition que le fichier déclare.
+        crate::audio::decode::decode_to_pcm_routee(
             &source,
             Some(out_sr),
             Some(channels as u32),
@@ -684,6 +686,8 @@ pub(super) async fn abandonner_la_session_de_transcodage(
     if let Some(tmp_path) = tmp_path {
         let _ = std::fs::remove_file(tmp_path);
     }
+    // #6658 — marquée AVANT le retrait : qui la voit morte la sait abandonnée.
+    streamer.marquer_abandonnee(session_id);
     streamer.remove_session(session_id).await;
     warn!(
         stream_id = session_id,

@@ -1142,10 +1142,21 @@ async fn ajouter_a_la_playlist(
             return validation("items", "The items field is invalid.");
         }
     }
-    let premier = 100 + p["items"].as_array().unwrap().len() as i64;
-    for (k, item) in items.iter().enumerate() {
+    // `100 + longueur`, comme toujours ; mais jamais un `item_id` déjà pris
+    // (après un retrait, la longueur redescend — #6688 retire puis ajoute).
+    let mut suivant = 100 + p["items"].as_array().unwrap().len() as i64;
+    for item in items.iter() {
+        while p["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["item_id"] == json!(suivant))
+        {
+            suivant += 1;
+        }
         let mut ligne = item.clone();
-        ligne["item_id"] = json!(premier + k as i64);
+        ligne["item_id"] = json!(suivant);
+        suivant += 1;
         ligne["added_by"] = json!({ "user_id": 1, "name": "Moi" });
         ligne["added_at"] = json!("2026-09-28T10:00:00Z");
         p["items"].as_array_mut().unwrap().push(ligne);

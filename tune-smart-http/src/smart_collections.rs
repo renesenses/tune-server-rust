@@ -668,6 +668,16 @@ async fn delete_collection(
     Json(json!({"deleted": true, "id": id}))
 }
 
+/// #6250 — un critère de collection dont la colonne ne dépend que de
+/// l'ALBUM (`al`, ou `ar` joint sur `al.artist_id`) : sa valeur est la même
+/// sur toutes les lignes album × piste. Les autres lisent la PISTE (`t`).
+fn critere_d_album(field: &str) -> bool {
+    matches!(
+        field,
+        "artist" | "artist_name" | "album" | "album_title" | "title" | "label" | "cover_path"
+    )
+}
+
 // #5547 — la lecture d'une date de règle vit dans `regles_sql`, pour que les
 // playlists la lisent comme les collections.
 use crate::regles_sql::horodatage_sql as resolve_timestamp_sql;
@@ -710,6 +720,8 @@ pub fn build_album_query(
             // tune-core seed/editor spelling — same semantics as is_null.
             "is_empty" | "empty" => "is_null",
             "is_not_empty" | "not_empty" => "is_not_null",
+            // #6250 — « ne contient pas », mêmes graphies que les playlists.
+            "not_contains" | "does_not_contain" | "not_like" => crate::regles_sql::NE_CONTIENT_PAS,
             other => other,
         };
         let value_raw = rule.get("value");
@@ -774,32 +786,33 @@ pub fn build_album_query(
 
         // --- added_at / last_played_at use timestamp logic ---
         if field == "added_at" {
-            let ts = resolve_timestamp_sql(&value);
+            // #6143 — la borne est calculée en Rust, en secondes, et comparée
+            // telle quelle à `file_mtime` : plus de `DATETIME(…, 'unixepoch')`
+            // ni de `DATETIME('now', …)`, propres à SQLite (PostgreSQL les
+            // refuse et l'aperçu tombait). Une date illisible ne retient rien.
+            //
             // NB: "greater_than"/"less_than" normalize to ">="/"<=" above, so
             // both spellings must be matched here — the seeded "🆕 Récents"
             // (added_at greater_than 90d) used to fall through `_ => continue`,
             // dropping its only rule and matching the ENTIRE library.
             let cond = match op {
-                ">" | ">=" => format!(
-                    "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                     WHERE DATETIME(t2.file_mtime, 'unixepoch') {op} {ts})"
-                ),
-                "<" | "<=" => format!(
-                    "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                     WHERE DATETIME(t2.file_mtime, 'unixepoch') {op} {ts})"
-                ),
+                ">" | ">=" | "<" | "<=" => match crate::regles_sql::horodatage_epoch(&value) {
+                    Some(ts) => format!(
+                        "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
+                         WHERE t2.file_mtime {op} {ts})"
+                    ),
+                    None => crate::regles_sql::FAUX.to_string(),
+                },
                 "between" => {
-                    if let Some(arr) = value_raw.and_then(|v| v.as_array()) {
-                        let lo = arr.first().and_then(|v| v.as_str()).unwrap_or("2000-01-01");
-                        let hi = arr.get(1).and_then(|v| v.as_str()).unwrap_or("2099-01-01");
-                        let lo_sql = resolve_timestamp_sql(lo);
-                        let hi_sql = resolve_timestamp_sql(hi);
-                        format!(
-                            "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                             WHERE DATETIME(t2.file_mtime, 'unixepoch') BETWEEN {lo_sql} AND {hi_sql})"
-                        )
-                    } else {
+                    if value_raw.and_then(|v| v.as_array()).is_none() {
                         continue;
+                    }
+                    match crate::regles_sql::bornes_epoch(value_raw) {
+                        Some((lo, hi)) => format!(
+                            "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
+                             WHERE t2.file_mtime BETWEEN {lo} AND {hi})"
+                        ),
+                        None => crate::regles_sql::FAUX.to_string(),
                     }
                 }
                 // #5547 — « jamais » : l'éditeur le propose pour toute date,
@@ -809,6 +822,20 @@ pub fn build_album_query(
                 "is_null" => "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
                      WHERE t2.file_mtime IS NULL)"
                     .to_string(),
+                // #6122 (forum 2217) — « dans les N derniers jours » : le
+                // seuil se lit à l'horloge ICI, à chaque requête. Comparé en
+                // secondes à `file_mtime`, sans `DATETIME` (propre à SQLite).
+                // Un N illisible ne retient rien, jamais tout.
+                crate::regles_sql::DANS_LES_DERNIERS_JOURS => {
+                    match crate::regles_sql::seuil_de(value_raw) {
+                        Some(s) => format!(
+                            "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
+                             WHERE t2.file_mtime >= {})",
+                            s.epoch
+                        ),
+                        None => crate::regles_sql::FAUX.to_string(),
+                    }
+                }
                 _ => continue,
             };
             conditions.push(cond);
@@ -892,6 +919,19 @@ pub fn build_album_query(
                          GROUP BY t3.album_id HAVING MAX(lh.listened_at) BETWEEN {lo} AND {hi})"
                     )
                 }
+                // #6122 — « écouté dans les N derniers jours » : une écoute au
+                // moins depuis le seuil, lu à l'horloge à chaque requête.
+                ("last_played_at", crate::regles_sql::DANS_LES_DERNIERS_JOURS) => {
+                    match crate::regles_sql::seuil_de(value_raw) {
+                        Some(s) => format!(
+                            "al.id IN (SELECT t3.album_id FROM tracks t3 \
+                             JOIN listen_history lh ON lh.track_id = t3.id \
+                             WHERE lh.listened_at >= {} GROUP BY t3.album_id)",
+                            s.iso
+                        ),
+                        None => crate::regles_sql::FAUX.to_string(),
+                    }
+                }
                 ("last_played_at", "is_null") => {
                     "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
                      JOIN listen_history lh ON lh.track_id = t3.id)"
@@ -927,6 +967,16 @@ pub fn build_album_query(
         let col = match field {
             "genre" => "t.genre",
             "artist" | "artist_name" => "ar.name",
+            // #6121 (forum 2218) — « Artiste de l'album » : la balise
+            // ALBUMARTIST d'une piste de l'album, à défaut l'artiste de
+            // l'album (`ar`, joint sur `al.artist_id`). Même lecture que
+            // `regles_sql::colonne_piste`.
+            "album_artist" => "COALESCE(NULLIF(t.album_artist, ''), ar.name)",
+            // #6232 (forum 2218) — « Interprète » : l'album passe dès qu'UNE
+            // de ses pistes porte l'interprète cherché (balise ARTIST, à
+            // défaut l'artiste de la piste). Critère de PISTE : « ne contient
+            // pas » demande qu'AUCUNE piste ne contienne.
+            "track_artist" => crate::regles_sql::SQL_INTERPRETE_DE_LA_PISTE,
             "album" | "album_title" | "title" => "al.title",
             "composer" => "t.composer",
             "label" => "al.label",
@@ -949,6 +999,15 @@ pub fn build_album_query(
             "track_number" => "CAST(t.track_number AS INTEGER)",
             "disc_number" => "CAST(t.disc_number AS INTEGER)",
             "bpm" => "CAST(t.bpm AS INTEGER)",
+            // #6123 — la note d'une piste de l'album (balises, 0 à 5) : un
+            // album passe dès qu'UNE de ses pistes passe. `rating` reste la
+            // note de l'ALBUM, traitée plus haut.
+            "track_rating" => "t.rating",
+            // #6124 — l'année ORIGINALE est une donnée d'album ; la VERSION,
+            // une balise de piste rangée dans `track_metadata` : l'album
+            // passe si l'une de ses pistes la porte.
+            "original_year" => "CAST(al.original_year AS INTEGER)",
+            "version" => crate::regles_sql::SQL_VERSION_DE_LA_PISTE,
             _ => continue,
         };
 
@@ -957,6 +1016,8 @@ pub fn build_album_query(
             "genre"
                 | "artist"
                 | "artist_name"
+                | "album_artist"
+                | "track_artist"
                 | "album"
                 | "album_title"
                 | "title"
@@ -966,14 +1027,55 @@ pub fn build_album_query(
                 | "source"
                 | "folder"
                 | "file_path"
+                | "version"
         );
         let int_val = || value.parse::<i64>().unwrap_or(0);
+
+        // #6271 — un MOTIF (`LIKE`) sur la colonne. Un nombre se compare par
+        // sa forme TEXTUELLE, comme dans les playlists (#1008) : `LOWER()` d'un
+        // entier passe sur SQLite mais PostgreSQL le refuse (`function
+        // lower(integer) does not exist`) et l'aperçu tombait.
+        let motif = |m: &str| {
+            if is_text {
+                format!("LOWER({col}) LIKE LOWER('{m}'){esc_clause}")
+            } else {
+                format!("CAST({col} AS TEXT) LIKE '{m}'{esc_clause}")
+            }
+        };
 
         let cond = match op {
             "=" if is_text => format!("LOWER({col}) = LOWER('{esc}')"),
             "!=" if is_text => format!("LOWER({col}) != LOWER('{esc}')"),
-            "contains" => format!("LOWER({col}) LIKE LOWER('%{esc_like}%'){esc_clause}"),
-            "starts_with" => format!("LOWER({col}) LIKE LOWER('{esc_like}%'){esc_clause}"),
+            "contains" => motif(&format!("%{esc_like}%")),
+            // #6250 — « ne contient pas » : le complément EXACT de « contient »,
+            // qui retient un album dès qu'UNE ligne (album × piste) contient.
+            // Une valeur absente « ne contient pas » (`regles_sql::ne_contient_pas`).
+            //
+            // - Critère d'ALBUM (`ar.name`, `al.*`) : la valeur est la même sur
+            //   toutes les lignes de l'album, la négation se pose sur la ligne.
+            // - Critère de PISTE (genre, compositeur, répertoire…) : nier la
+            //   ligne retiendrait l'album dès qu'UNE piste ne contient pas — un
+            //   album Jazz avec un bonus Rock passerait « genre ne contient pas
+            //   Rock ». L'album passe si AUCUNE de ses pistes ne contient. `t`
+            //   désigne, dans la sous-requête, la piste de l'album ; `al` et
+            //   `ar` restent ceux de la requête.
+            //
+            // Cette règle-ci était ignorée (`_ => continue`) : la collection
+            // rendait toute la bibliothèque.
+            crate::regles_sql::NE_CONTIENT_PAS => {
+                let contient = motif(&format!("%{esc_like}%"));
+                if critere_d_album(field) {
+                    crate::regles_sql::ne_contient_pas(col, &contient)
+                } else {
+                    format!(
+                        "NOT EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = al.id AND {contient})"
+                    )
+                }
+            }
+            "starts_with" => motif(&format!("{esc_like}%")),
+            // #6271 — « finit par » : les playlists le traduisaient, ici la
+            // règle tombait dans `_ => continue` et la collection rendait TOUT.
+            "ends_with" => motif(&format!("%{esc_like}")),
             "is_null" => format!("({col} IS NULL OR {col} = '')"),
             "is_not_null" => format!("({col} IS NOT NULL AND {col} != '')"),
             "=" => format!("{col} = {}", int_val()),
@@ -1088,13 +1190,18 @@ pub(crate) fn sql_albums_de_collection(
         // `al.is_compilation` (#1957) est dans le GROUP BY comme les autres
         // colonnes d'album : PostgreSQL refuse une colonne ni groupée ni
         // agrégée, SQLite l'accepterait. Écrire pour les deux.
+        //
+        // web#2206 — `release_date` et `original_date` en fin de ligne : le
+        // tri « Date de sortie » d'une collection ouverte se fait à l'écran,
+        // sur ces albums ; sans elles il retombait sur l'année.
         "SELECT al.id, al.title, ar.name, al.year, al.cover_path, al.genre, \
-         COUNT(t.id) AS track_count, al.is_compilation \
+         COUNT(t.id) AS track_count, al.is_compilation, al.release_date, al.original_date \
          FROM albums al \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
          LEFT JOIN tracks t ON t.album_id = al.id \
          {} \
-         GROUP BY al.id, al.title, ar.name, al.year, al.cover_path, al.genre, al.is_compilation \
+         GROUP BY al.id, al.title, ar.name, al.year, al.cover_path, al.genre, al.is_compilation, \
+         al.release_date, al.original_date \
          {} {}",
         where_clause, order, limit_clause
     )
@@ -1130,6 +1237,9 @@ fn execute_album_query(
                 // une collection intelligente rend le drapeau comme la liste
                 // d'albums. NUL ⇒ `false`, jamais `null`.
                 "is_compilation": tune_core::db::album_repo::drapeau_compilation(r.get(7)),
+                // web#2206 — mêmes noms que `Album` (la liste de la bibliothèque).
+                "release_date": r.get(8).and_then(|v| v.as_string()),
+                "original_date": r.get(9).and_then(|v| v.as_string()),
             })
         })
         .collect())
@@ -1594,14 +1704,50 @@ mod tests {
     #[test]
     fn resolve_timestamp_relative_forms() {
         // "now-Nd" (editor form) and bare "Nd" (seeded "🆕 Récents") are both
-        // N-days-ago; anything else stays a quoted literal.
-        assert_eq!(
-            resolve_timestamp_sql("now-30d"),
-            "DATETIME('now', '-30 days')"
-        );
-        assert_eq!(resolve_timestamp_sql("90d"), "DATETIME('now', '-90 days')");
-        assert_eq!(resolve_timestamp_sql("90"), "DATETIME('now', '-90 days')");
+        // N-days-ago — désormais un littéral ISO calculé en Rust (#6143) ;
+        // anything else stays a quoted literal.
+        let attendu = |jours: i64| {
+            let d = chrono::Utc::now() - chrono::Duration::days(jours);
+            format!("'{}'", d.format("%Y-%m-%d"))
+        };
+        for (forme, jours) in [("now-30d", 30), ("90d", 90), ("90", 90)] {
+            let sql = resolve_timestamp_sql(forme);
+            assert!(
+                sql.starts_with(&attendu(jours)[..11]) && sql.ends_with("Z'"),
+                "{forme} → {sql}"
+            );
+            assert!(!sql.contains("DATETIME"), "{forme} → {sql}");
+        }
         assert_eq!(resolve_timestamp_sql("2024-01-01"), "'2024-01-01'");
+    }
+
+    /// #6143 — aucune règle de date ne compile en `DATETIME(…)`, fonction
+    /// propre à SQLite que PostgreSQL refuse.
+    #[test]
+    fn regles_de_date_sans_datetime_6143() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        for champ in ["added_at", "last_played_at"] {
+            for (op, valeur) in [
+                ("greater_than", r#""2024-01-01""#),
+                ("less_than", r#""2024-01-01""#),
+                (">", r#""now-90d""#),
+                ("<", r#""90d""#),
+                ("between", r#"["2018-01-01","now-30d"]"#),
+            ] {
+                let rules =
+                    format!(r#"[{{"field":"{champ}","operator":"{op}","value":{valeur}}}]"#);
+                let (where_clause, _, _) =
+                    build_album_query(&rules, "all", "title", "asc", None, &ctx);
+                assert!(
+                    !where_clause.to_uppercase().contains("DATETIME"),
+                    "{champ} {op} {valeur} compile encore en DATETIME (#6143) : {where_clause}"
+                );
+                assert!(
+                    !where_clause.is_empty(),
+                    "{champ} {op} {valeur} : règle perdue"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1613,7 +1759,7 @@ mod tests {
         let rules = r#"[{"field":"added_at","operator":"greater_than","value":"90d"}]"#;
         let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
         assert!(
-            where_clause.contains("DATETIME('now', '-90 days')"),
+            where_clause.contains("t2.file_mtime >= "),
             "added_at rule must compile: {where_clause}"
         );
         assert!(where_clause.contains(">="));
@@ -2767,5 +2913,36 @@ mod genre_couvrant_2149 {
                 .as_i64();
             assert_eq!(n, Some(80), "le compte ne change pas : {regle}");
         }
+    }
+}
+
+/// web#2206 (Jean Valjean, fil 2300) — les albums d'une collection
+/// intelligente portent leur date de sortie : le tri « Date de sortie » de la
+/// collection ouverte se fait à l'écran, sur ces lignes, et retombait sur
+/// l'année faute d'elles.
+#[cfg(test)]
+mod date_de_sortie_2206 {
+    use std::sync::Arc;
+
+    use crate::SmartHttpState;
+
+    #[test]
+    fn les_albums_d_une_collection_portent_leurs_dates() {
+        let db = crate::criteres::tests::bibliotheque();
+        db.execute_batch(
+            "UPDATE albums SET release_date = '1997-03-10', original_date = '1959-08-17' WHERE id = 1;",
+        )
+        .unwrap();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let etat = SmartHttpState::new(backend);
+        let Ok(lignes) = super::execute_album_query(&etat, "", "ORDER BY al.id ASC", "") else {
+            panic!("la requête des albums de la collection échoue");
+        };
+        let kind = lignes.iter().find(|a| a["id"] == 1).expect("album 1");
+        assert_eq!(kind["release_date"], "1997-03-10", "{kind}");
+        assert_eq!(kind["original_date"], "1959-08-17", "{kind}");
+        let giant = lignes.iter().find(|a| a["id"] == 2).expect("album 2");
+        assert!(giant["release_date"].is_null(), "{giant}");
+        assert!(giant["original_date"].is_null(), "{giant}");
     }
 }

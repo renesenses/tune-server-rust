@@ -481,6 +481,7 @@ pub(super) async fn enrich_credits_releases(
     );
 
     let db = state.backend.clone();
+    let http = state.http_client.clone();
     let guard = state.background_tasks.begin(
         cr::TACHE_CREDITS_RELEASES,
         "Crédits MusicBrainz des albums…",
@@ -498,7 +499,22 @@ pub(super) async fn enrich_credits_releases(
                 "Crédits",
             );
         };
-        cr::remplir_credits_depuis_musicbrainz(db, &id_tache, &sur_avancement).await;
+        cr::remplir_credits_depuis_musicbrainz(db.clone(), &id_tache, &sur_avancement).await;
+        // Étape E, suite (#4805, lot 1 — d'après MetaRust, de Xavier Joly) :
+        // les instruments Wikidata des musiciens que MusicBrainz a crédités
+        // sans instrument. Gardés au niveau de l'ARTISTE, jamais écrits dans
+        // `track_credits` ; Wikidata seulement, aucune requête MusicBrainz.
+        let client = http.clone();
+        tune_core::metadata::wikidata::completer_instruments_par(
+            &db,
+            None,
+            INSTRUMENTS_PAR_PASSE,
+            move |url| {
+                let c = client.clone();
+                async move { tune_core::metadata::wikidata::lire_json(&c, url).await }
+            },
+        )
+        .await;
     });
 
     (
@@ -514,6 +530,11 @@ pub(super) async fn enrich_credits_releases(
     )
         .into_response()
 }
+
+/// Plafond d'artistes interrogés sur Wikidata par passe des crédits (#4805,
+/// lot 1) : à 5 requêtes/s et trois requêtes par artiste, environ 20 minutes.
+/// Le reste attend la passe suivante.
+const INSTRUMENTS_PAR_PASSE: usize = 2000;
 
 /// `GET /system/enrich-credits` — état de la passe.
 ///

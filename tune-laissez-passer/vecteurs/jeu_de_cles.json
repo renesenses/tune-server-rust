@@ -1,0 +1,4 @@
+{
+  "jeu": "{\"v\":1,\"version\":1,\"iss\":\"https://mozaiklabs.fr\",\"cles\":[{\"kid\":\"test-2026-10\",\"alg\":\"EdDSA\",\"pk\":\"wFDFY3pE-oYp__PMzOIwDLNipj2Z2V_FQUUmb0MyRFo\",\"valable_du\":1790812800,\"valable_au\":2106345600}]}",
+  "minisig": "untrusted comment: signature from minisign secret key\nRUR0dW5lVEVTVNEew2ycL4r5Jov3hnvVnr375w2CfM4KzE6aoeCH9mu1bxzbO7+T+Nj0+XEocc1XUDFHEVBFcCobDsEgHt+7qgo=\ntrusted comment: tune-remote jeu de cles\nsuuodL1pfLQnbw54E+5MwVFu52codSLaKOL09IEoI8G/klhqhXZ5WRhcQ0O6D6bIfv5YJTQKb19JlY6DHFJGCQ==\n"
+}

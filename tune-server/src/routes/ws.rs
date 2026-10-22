@@ -7,6 +7,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use tokio::time::interval;
 
+use crate::routes::zones::textes_signal::{LangueSignal, langue_requete};
 use crate::state::AppState;
 
 const PING_INTERVAL: Duration = Duration::from_secs(15);
@@ -88,11 +89,14 @@ async fn ws_handler(
     _auth: WsAuthorized,
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<LangueSignal>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    let lang = langue_requete(query.lang.as_deref(), &headers);
     // LAT-Z3 : le client veut voir ses appareils maintenant, pas au prochain
     // tour du scanner. Détaché et borné à une recherche par fenêtre.
     crate::discovery_setup::declencher_la_recherche_a_la_connexion(&state);
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, lang))
 }
 
 fn matches_pattern(event_type: &str, pattern: &str) -> bool {
@@ -109,7 +113,7 @@ fn matches_pattern(event_type: &str, pattern: &str) -> bool {
 /// Merges persisted zone metadata (name/online/type/group) with live playback
 /// state (transport, volume, now-playing, queue) so the client renders the
 /// truth without polling.
-async fn build_snapshot(state: &AppState) -> serde_json::Value {
+async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     // #5077 — même liste que `GET /zones` : une zone masquée qui joue en est.
     let zones = crate::routes::zones::zones_a_montrer(state).await;
@@ -142,7 +146,8 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
             audio_backend,
         )
         .await;
-        let signal_path = crate::routes::zones::build_signal_path_pub(
+        let signal_path = crate::routes::zones::build_signal_path_lang(
+            lang,
             &ps,
             z,
             &state.backend,
@@ -235,7 +240,7 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
     })
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState) {
+async fn handle_socket(mut socket: WebSocket, state: AppState, lang: &str) {
     let mut rx = state.playback.subscribe();
     let mut event_rx = state.event_bus.subscribe();
     let mut patterns: Vec<String> = vec!["*".to_string()];
@@ -252,7 +257,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     // (or a separate REST round-trip). Subscriptions above are already live, so
     // any change during snapshot building is buffered and delivered as a delta.
     {
-        let snapshot = build_snapshot(&state).await;
+        let snapshot = build_snapshot(&state, lang).await;
         let json = serde_json::to_string(&snapshot).unwrap_or_default();
         if socket.send(Message::Text(json.into())).await.is_err() {
             return;
@@ -449,5 +454,103 @@ mod tests_cadence {
         assert!(c.autorise_a(t0));
         assert!(!c.autorise_a(t0 + Duration::from_millis(500)));
         assert!(c.autorise_a(t0 + Duration::from_secs(3)));
+    }
+}
+
+#[cfg(test)]
+mod langue_signal_tests_6496 {
+    use super::*;
+    use axum::{
+        Json,
+        body::{Body, to_bytes},
+        http::Request,
+        routing::get,
+    };
+    use serde_json::Value;
+    use tower::ServiceExt;
+    use tune_core::{db::zone_repo::ZoneRepo, playback::NowPlaying};
+
+    fn texte(zone: &Value) -> &str {
+        zone["signal_path"]["steps"]
+            .as_array()
+            .expect("étapes")
+            .iter()
+            .find(|e| e["name"] == "Niveau")
+            .expect("niveau DSD")["description"]
+            .as_str()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_et_snapshot_ws_gardent_la_langue_de_chaque_client_6496() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zid = repo
+            .create("DSD", Some("hqplayer"), Some("fake:6496"))
+            .unwrap();
+        state
+            .playback
+            .play(
+                zid,
+                NowPlaying {
+                    title: "DSD sans sortie réelle".into(),
+                    format: Some("dsf".into()),
+                    sample_rate: Some(2_822_400),
+                    bit_depth: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let app = Router::new()
+            .nest("/zones", crate::routes::zones::router())
+            .route(
+                "/play-response/{id}",
+                get(
+                    |State(state): State<AppState>,
+                     axum::extract::Path(id): axum::extract::Path<i64>| async move {
+                        tokio::task::yield_now().await;
+                        Json(crate::routes::playback::build_zone_json(&state, id).await)
+                    },
+                ),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::routes::zones::textes_signal::avec_langue,
+            ))
+            .with_state(state.clone());
+        async fn lire(app: Router, uri: String) -> Value {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("Accept-Language", "fr-FR")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap()
+        }
+        let (vi, hu) = tokio::join!(
+            lire(app.clone(), format!("/zones/{zid}?lang=vi")),
+            lire(app.clone(), format!("/play-response/{zid}?lang=hu")),
+        );
+        assert!(
+            texte(&vi).starts_with("DSD gốc:"),
+            "la requête vi doit primer sur le navigateur français : {vi}"
+        );
+        assert!(
+            texte(&hu).starts_with("Natív DSD:"),
+            "la réponse de lecture doit conserver hu : {hu}"
+        );
+        let fr = lire(app.clone(), format!("/zones/{zid}")).await;
+        assert!(texte(&fr).starts_with("DSD natif :"));
+        let liste = lire(app, "/zones?lang=en".into()).await;
+        assert!(texte(&liste[0]).starts_with("Native DSD:"));
+        let (snapshot_vi, snapshot_hu) =
+            tokio::join!(build_snapshot(&state, "vi"), build_snapshot(&state, "hu"));
+        assert!(texte(&snapshot_vi["data"]["zones"][0]).starts_with("DSD gốc:"));
+        assert!(texte(&snapshot_hu["data"]["zones"][0]).starts_with("Natív DSD:"));
     }
 }

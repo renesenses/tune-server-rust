@@ -1,0 +1,19 @@
+{
+  "attendu": {
+    "code": "defi",
+    "resultat": "refuse"
+  },
+  "contexte": {
+    "grace_expiration": 0,
+    "maintenant": 1793000000,
+    "server_id": "6f1c1f5e-2b0a-4c2e-9d3b-7a51c0de0001"
+  },
+  "defi": {
+    "defi": "c2Vzc2lvbi1kZWZpLWRlLXRlc3QtMDEyMzQ1Njc4OTAx",
+    "signature": "iTV3DBtpxSnPJVaYOgJicCcwVdpjvAgtGmxwfYV3_kQx88qDfjeGQLHRz55MZEUwD-UhA-nhgT6OWs26tAxWAA"
+  },
+  "description": "Laissez-passer valide, mais défi signé par une autre clé que cnf.pk : le laissez-passer seul ne suffit pas.",
+  "laissez_passer": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6InR1bmUtcGFzcytqd3QifQ.eyJpc3MiOiJodHRwczovL21vemFpa2xhYnMuZnIiLCJhdWQiOiJ0dW5lLXJlbW90ZSIsInN1YiI6ImNwdF84ZjJhNjEiLCJzaWQiOiI2ZjFjMWY1ZS0yYjBhLTRjMmUtOWQzYi03YTUxYzBkZTAwMDEiLCJkaWQiOiJhcHBfZWRfMDEiLCJjbmYiOnsiYWxnIjoiRWQyNTUxOSIsInBrIjoibjBsRG5wMndsYnhCRWUwbDAxZVYyREc4VmFCSDlMSFg5cTdqZDN1MEVpQSJ9LCJwMnAiOmZhbHNlLCJpYXQiOjE3OTI5OTk0MDAsIm5iZiI6MTc5Mjk5OTQwMCwiZXhwIjoxNzkzMDAzMDAwLCJqdGkiOiJqdGktMDAwMSIsInYiOjF9.CCpJlNXWrDeRyIv2pr9JfcsW4uyYIZDojWkl56wYGBMlhtA6nCqq59Dt7iVc8H-WvFvX2iP4YxU1cYPflMnKBA",
+  "nom": "cle_appareil_differente",
+  "publication": "jeu_de_cles.json"
+}

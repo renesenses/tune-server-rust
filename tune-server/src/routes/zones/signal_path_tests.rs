@@ -2814,6 +2814,78 @@ fn une_sortie_multicanal_mesuree_porte_son_etape_et_garde_le_verdict() {
     assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
 }
 
+/// #6057 — un DFF 5.1 dont la liste `CHNL` n'est pas dans l'ordre de la
+/// sortie : la sortie locale ouvre six voies et les RÉORDONNE selon la
+/// disposition déclarée (#6058). Le chemin du signal annonçait « 6 canaux,
+/// sortie multicanal », bit-perfect, comme si les voies partaient telles
+/// quelles. Il doit dire la réorganisation, mesurée, et retirer le verdict.
+#[test]
+fn une_reorganisation_a_nombre_egal_est_une_etape_du_chemin_6057() {
+    use tune_core::outputs::traits::{AudioSpec, FormatOuvert, ProfondeurPcm};
+    let (backend, zone) = local_zone_migrated();
+    let mut ps = flac_playing();
+    let entree_5_1 = AudioSpec::nouvelle(96_000, ProfondeurPcm::Entier24, 6).unwrap();
+    ps.transformations_reelles = Some(
+        TransformationsReelles::nouvelles(entree_5_1, FormatOuvert::new(96_000, 6), false)
+            .avec_reorganisation_canaux(true),
+    );
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("HDMI"),
+        "CPAL",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+    assert_eq!(
+        step_desc(&sp, "Canaux").as_deref(),
+        Some(
+            "6 canaux (5.1), voies réordonnées selon la disposition déclarée par le \
+             fichier (mesuré)"
+        ),
+        "la sortie a réordonné les voies : le chemin doit le dire, pas annoncer une \
+         sortie multicanal telle quelle (#6057)"
+    );
+    let canaux = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "Canaux")
+        .unwrap();
+    assert_eq!(canaux["bit_perfect"], false, "l'étape n'est pas intacte");
+    assert_eq!(
+        sp.get("bit_perfect").and_then(|b| b.as_bool()),
+        Some(false),
+        "des voies ont changé de place : le flux n'est plus celui de la source"
+    );
+
+    // Une réorganisation en stéréo (voies gauche et droite déclarées
+    // inversées) se dit aussi, alors qu'aucune étape multicanal n'existe.
+    let entree_2 = AudioSpec::nouvelle(96_000, ProfondeurPcm::Entier24, 2).unwrap();
+    ps.transformations_reelles = Some(
+        TransformationsReelles::nouvelles(entree_2, FormatOuvert::new(96_000, 2), false)
+            .avec_reorganisation_canaux(true),
+    );
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("HDMI"),
+        "CPAL",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+    assert!(
+        step_desc(&sp, "Canaux")
+            .as_deref()
+            .is_some_and(|d| d.starts_with("2 canaux") && d.contains("réordonnées")),
+        "stéréo réordonnée : {:?}",
+        step_desc(&sp, "Canaux")
+    );
+    assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // REF-6b côté PRODUCTEUR (#2219, REF-7) — la sortie locale remplit le contrat
 // que #3987 avait posé sans producteur : `EtageDeConversion::transformations()`
@@ -4702,4 +4774,321 @@ fn un_fondu_enchaine_declare_s_annonce_et_fait_tomber_le_verdict() {
     .unwrap();
     assert_eq!(step_desc(&sp, "Fondu enchaîné"), None);
     assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+}
+
+// ── #4354 — le repli à 176,4 kHz, et sa raison lisible ──────────────────────
+//
+// Décision de Bertrand du 12/10/2026 : un DSD décimé qui manque son
+// pré-tampon retombe à 176,4 kHz, et le chemin du signal dit pourquoi.
+
+fn transcoder(v: &Value) -> Option<Value> {
+    v.get("steps")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("Transcoder"))
+        .cloned()
+}
+
+/// 🔴 Le repli posé, le fil à 176,4 kHz : l'étape Transcoder porte le code
+/// `dsd_pcm_repli` et la raison, en clair.
+#[test]
+fn le_repli_dsd_a_176_4_se_lit_dans_le_chemin_du_signal_4354() {
+    let (backend, mut zone) = dlna_zone();
+    // Un identifiant propre : le repli vit dans un registre global, partagé
+    // par les tests de ce binaire.
+    zone.id = Some(435411);
+    tune_core::audio::repli_dsd_4354::enregistrer(
+        435411,
+        tune_core::audio::repli_dsd_4354::RepliDsd {
+            de_hz: 352_800,
+            vers_hz: 176_400,
+        },
+    );
+    let sp = build_signal_path(
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        Some("DMP-A8"),
+        "none",
+        Some(&wire_mime("wav", "audio/wav", 176_400, 24)),
+    )
+    .unwrap();
+    tune_core::audio::repli_dsd_4354::oublier(435411);
+
+    let etape = transcoder(&sp).expect("une étape Transcoder");
+    assert_eq!(
+        etape.get("description").and_then(Value::as_str),
+        Some("DSD128 5.6 MHz \u{2192} WAV 176kHz/24bit")
+    );
+    assert_eq!(
+        etape.get("code").and_then(Value::as_str),
+        Some("dsd_pcm_repli"),
+        "l'étape doit porter le code du repli : {etape}"
+    );
+    assert_eq!(
+        etape.get("detail").and_then(Value::as_str),
+        Some(
+            "Repli à 176,4 kHz : la conversion DSD vers 352,8 kHz n'a pas rempli le \
+             pré-tampon à temps sur cet hôte"
+        ),
+        "la raison doit être lisible dans le chemin du signal : {etape}"
+    );
+}
+
+/// Témoin : sans repli posé, le même DSD128 à 176,4 kHz (renderer qui le
+/// demande, plafond de zone) n'invente aucune raison.
+#[test]
+fn sans_repli_l_etape_dsd_ne_porte_aucune_raison_4354() {
+    let (backend, mut zone) = dlna_zone();
+    zone.id = Some(435412);
+    let sp = build_signal_path(
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        Some("DMP-A8"),
+        "none",
+        Some(&wire_mime("wav", "audio/wav", 176_400, 24)),
+    )
+    .unwrap();
+    let etape = transcoder(&sp).expect("une étape Transcoder");
+    assert_eq!(etape.get("code"), None, "{etape}");
+    assert_eq!(etape.get("detail"), None, "{etape}");
+}
+
+// ------------------------------------------------------------------
+// #6221 — un DSDIFF DST servi en DSD natif (DSF fabriqué à la volée).
+
+/// Une piste DFF (DST) DSD64 jouée sur une zone DLNA.
+fn dff_dst_playing() -> ZoneState {
+    ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "Une piste DST".into(),
+            format: Some("dff".into()),
+            sample_rate: Some(2_822_400),
+            bit_depth: Some(1),
+            stream_id: Some("sid-dst".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    }
+}
+
+/// 🔴 Le chemin du signal dit « DST décompressé → DSF », et aucune étape de
+/// conversion PCM : le fil porte du DSD natif.
+#[test]
+fn un_dst_servi_en_dsf_dit_dst_decompresse_vers_dsf_sans_conversion_pcm() {
+    let (backend, zone) = dlna_zone();
+    let fil = StreamInfo {
+        format: "dsf".into(),
+        mime_type: "audio/x-dsf".into(),
+        sample_rate: 2_822_400,
+        bit_depth: 1,
+        channels: 2,
+        dsd_reconstruit_depuis_dst: true,
+        ..Default::default()
+    };
+    let sp = build_signal_path(
+        &dff_dst_playing(),
+        &zone,
+        &backend,
+        Some("SR7009"),
+        "none",
+        Some(&fil),
+    )
+    .unwrap();
+    assert_eq!(
+        step_desc(&sp, "Decoder").as_deref(),
+        Some("DST décompressé \u{2192} DSF")
+    );
+    assert_eq!(transcoder_desc(&sp), None, "aucune conversion PCM n'a lieu");
+    // Toute conversion s'écrit « A → B » : la seule flèche du chemin est
+    // celle de la décompression, et aucune étape ne rééchantillonne.
+    let etapes = sp["steps"].as_array().unwrap();
+    let conversions: Vec<&str> = etapes
+        .iter()
+        .filter_map(|s| s["description"].as_str())
+        .filter(|d| d.contains('\u{2192}'))
+        .collect();
+    assert_eq!(
+        conversions,
+        ["DST décompressé \u{2192} DSF"],
+        "une étape décrit une conversion : {etapes:?}"
+    );
+    assert!(
+        !etapes
+            .iter()
+            .any(|s| matches!(s["name"].as_str(), Some("Transcoder" | "Resampler"))),
+        "étape de conversion PCM : {etapes:?}"
+    );
+    assert_eq!(step_desc(&sp, "Source").as_deref(), Some("DSD64 2.8 MHz"));
+    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(true));
+}
+
+/// Le témoin : le même DFF décodé en PCM garde son étage de conversion, et
+/// n'annonce aucune décompression en DSF.
+#[test]
+fn un_dst_decode_en_pcm_garde_sa_conversion_et_aucun_dsf() {
+    let (backend, zone) = dlna_zone();
+    let sp = build_signal_path(
+        &dff_dst_playing(),
+        &zone,
+        &backend,
+        Some("SR7009"),
+        "none",
+        Some(&wire_mime("wav", "audio/wav", 176_400, 24)),
+    )
+    .unwrap();
+    assert!(transcoder_desc(&sp).is_some());
+    assert_ne!(
+        step_desc(&sp, "Decoder").as_deref(),
+        Some("DST décompressé \u{2192} DSF")
+    );
+}
+
+#[test]
+fn descriptions_eq_et_replaygain_suivent_les_douze_langues_6496() {
+    let (backend, zone) = dlna_zone_migrated();
+    let (_, ps) = flac_track_with_rg_tag(&backend, "+6.00 dB");
+    let settings = SettingsRepo::with_backend(backend.clone());
+    settings
+        .set(tune_core::audio::replaygain::MODE_KEY, "track")
+        .unwrap();
+    settings.set("plugin_equalizer_installed", "true").unwrap();
+    let profile = tune_core::audio::eq::EqProfile {
+        enabled: true,
+        bands: vec![tune_core::audio::eq::EqBandSpec {
+            gain: 6.0,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    settings
+        .set(
+            &format!("zone_{}_eq_profile", zone.id.unwrap()),
+            &serde_json::to_string(&profile).unwrap(),
+        )
+        .unwrap();
+    let mut descriptions = std::collections::HashSet::new();
+    for (lang, prefixe) in [
+        ("fr", "EQ actif"),
+        ("en", "EQ active"),
+        ("de", "EQ aktiv"),
+        ("es", "EQ activo"),
+        ("it", "EQ attivo"),
+        ("zh", "EQ 已启用"),
+        ("ja", "EQ 有効"),
+        ("ko", "EQ 활성"),
+        ("ro", "EQ activ"),
+        ("sv", "EQ aktiv"),
+        ("vi", "EQ hoạt động"),
+        ("hu", "EQ aktív"),
+    ] {
+        let sp = build_signal_path_lang(
+            lang,
+            &ps,
+            &zone,
+            &backend,
+            Some("DAC"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+        let eq = step_desc(&sp, "DSP").unwrap();
+        assert!(eq.starts_with(prefixe), "EQ en {lang} : {eq}");
+        assert!(
+            descriptions.insert(eq),
+            "chaque langue a sa propre description complète"
+        );
+        let rg = step_desc(&sp, "ReplayGain").unwrap();
+        assert!(
+            rg.contains("+6.0"),
+            "la traduction doit conserver le gain : {rg}"
+        );
+        if lang != "fr" {
+            assert!(
+                !rg.contains("refusés"),
+                "ReplayGain encore français en {lang} : {rg}"
+            );
+        }
+        assert_eq!(
+            step_field(&sp, "ReplayGain", "clipping_guard"),
+            Some(&json!("refused_no_peak"))
+        );
+    }
+}
+
+// ─── #6542 — Devialet AIR ───────────────────────────────────────────────────
+
+fn zone_devialet_air() -> (Arc<dyn DbBackend>, Zone) {
+    let db = SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    tune_core::db::migrations::run_migrations(&db).unwrap();
+    let backend: Arc<dyn DbBackend> = Arc::new(db);
+    let repo = ZoneRepo::with_backend(backend.clone());
+    let id = repo
+        .create(
+            "D400-WIFI",
+            Some("devialet_air"),
+            Some("devialet-air:02:00:5e:00:00:01"),
+        )
+        .unwrap();
+    let zone = repo.get(id).unwrap().unwrap();
+    (backend, zone)
+}
+
+fn flac_a(sample_rate: u32) -> ZoneState {
+    let mut ps = flac_playing();
+    if let Some(np) = ps.now_playing.as_mut() {
+        np.sample_rate = Some(sample_rate);
+    }
+    ps
+}
+
+/// Un FLAC 24/96 vers un Devialet Expert : le transport est nommé, et le
+/// chemin reste bit-perfect (AIR est sans perte jusqu'à 96 kHz).
+#[test]
+fn air_6542_flac_24_96_vers_devialet_air_reste_bit_perfect() {
+    let (backend, zone) = zone_devialet_air();
+    let mut ps = flac_a(96_000);
+    ps.transformations_reelles = Some(TransformationsReelles::nouvelles(
+        tune_core::outputs::traits::AudioSpec::nouvelle(
+            96_000,
+            tune_core::outputs::traits::ProfondeurPcm::Entier24,
+            2,
+        )
+        .unwrap(),
+        tune_core::outputs::traits::FormatOuvert::new(96_000, 2),
+        false,
+    ));
+    let sp = build_signal_path(&ps, &zone, &backend, Some("D400-WIFI"), "none", None).unwrap();
+    assert_eq!(step_desc(&sp, "Transport").as_deref(), Some("Devialet AIR"));
+    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(true));
+    assert_eq!(step_desc(&sp, "Resampler"), None);
+}
+
+/// Un FLAC 24/192 : la sortie rééchantillonne à 96 kHz et le DÉCLARE ; le
+/// chemin du signal montre l'étape et retire le bit-perfect.
+#[test]
+fn air_6542_flac_24_192_vers_devialet_air_affiche_le_reechantillonnage_a_96_khz() {
+    let (backend, zone) = zone_devialet_air();
+    let mut ps = flac_a(192_000);
+    ps.transformations_reelles = Some(TransformationsReelles::nouvelles(
+        tune_core::outputs::traits::AudioSpec::nouvelle(
+            192_000,
+            tune_core::outputs::traits::ProfondeurPcm::Entier24,
+            2,
+        )
+        .unwrap(),
+        tune_core::outputs::traits::FormatOuvert::new(96_000, 2),
+        false,
+    ));
+    let sp = build_signal_path(&ps, &zone, &backend, Some("D400-WIFI"), "none", None).unwrap();
+    assert_eq!(step_desc(&sp, "Transport").as_deref(), Some("Devialet AIR"));
+    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        step_desc(&sp, "Resampler").as_deref(),
+        Some("192kHz \u{2192} 96kHz (mesuré)")
+    );
 }

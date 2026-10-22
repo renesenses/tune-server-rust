@@ -531,7 +531,9 @@ pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Op
     let ext = canonical_cache_ext(ext);
     let filename = format!("{hash}.{ext}");
     let path = cache_dir.join(&filename);
-    if let Err(e) = std::fs::write(&path, data) {
+    if let Err(e) =
+        ecrire_image_atomiquement(&path, |fichier| std::io::Write::write_all(fichier, data))
+    {
         ARTWORK_CACHE_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
         warn!(
             path = %path.display(),
@@ -542,6 +544,18 @@ pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Op
         return None;
     }
     Some(path)
+}
+
+/// Un lecteur voit l'ancienne image complète ou la nouvelle, jamais une
+/// troncature intermédiaire. Le temporaire est nettoyé aussi en cas d'erreur.
+fn ecrire_image_atomiquement(
+    path: &Path,
+    ecrire: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut temporaire = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    ecrire(temporaire.as_file_mut())?;
+    temporaire.persist(path).map_err(|erreur| erreur.error)?;
+    Ok(())
 }
 
 /// Compute a deterministic hash for an artwork cache key.
@@ -814,8 +828,9 @@ pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
     }
     let query = format!("artist:\"{}\"", trimmed.replace('"', ""));
     let url = format!(
-        "https://musicbrainz.org/ws/2/artist/?query={}&fmt=json&limit=1",
-        urlencoding::encode(&query)
+        "https://musicbrainz.org/ws/2/artist/?query={}&fmt=json&limit={}",
+        urlencoding::encode(&query),
+        crate::metadata::MB_ARTIST_CANDIDATES
     );
     let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
@@ -833,13 +848,9 @@ pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
         return None;
     }
     let data: serde_json::Value = resp.json().await.ok()?;
-    let first = data.get("artists")?.as_array()?.first()?;
-    // Only accept a confident match; MB scores the query 0-100.
-    let score = first.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
-    if score < 90 {
-        return None;
-    }
-    first.get("id")?.as_str().map(|s| s.to_string())
+    // #6463 — un score élevé ne dit pas l'identité : « Christophe » rendait
+    // d'abord Christophe Beck. Seul un nom identique, et unique, est retenu.
+    crate::metadata::mb_choisir_artiste(&data, trimmed)
 }
 
 /// Run batch artwork enrichment for all albums missing cover art.
@@ -1067,7 +1078,9 @@ pub async fn batch_enrich_artwork_scoped(
 /// Fetch an artist image from multiple sources (best-effort cascade).
 ///
 /// Order: mozaiklabs community → Fanart.tv → TheAudioDB → MusicBrainz
-/// direct image → MusicBrainz→Wikidata→Wikimedia → Discogs → Last.fm.
+/// direct image → MusicBrainz→Wikidata→Wikimedia → Discogs → Last.fm →
+/// Deezer (exact name only). A concatenated credit is not searched here:
+/// the batch asks [`image_depuis_un_membre`] once this cascade misses.
 ///
 /// `discogs_token` et `lastfm_key` sont TOUS DEUX résolus par l'appelant, dans
 /// les réglages d'abord : les deux dernières marches de la cascade sont les
@@ -1159,6 +1172,54 @@ pub async fn fetch_artist_image(
         }
     }
 
+    // 8. Deezer. Pas de clé, et c'est souvent la seule photo d'un soliste ou
+    // d'un petit ensemble classique (Rachel Podger, Jacques Loussier Trio)
+    // quand Wikidata n'a pas de P18. Même garde que Discogs : nom exact, un
+    // seul homonyme, pas l'image vide de Deezer.
+    if !artist_name.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if let Some(bytes) = fetch_artist_image_deezer(&client, artist_name)
+            .await
+            .and_then(|b| image_retenue(b, refusees))
+        {
+            return Some(bytes);
+        }
+    }
+
+    None
+}
+
+/// Portrait d'un crédit collé, emprunté à l'un de ses membres.
+///
+/// Le MBID trouvé pour le membre n'est PAS écrit sur la fiche du crédit :
+/// « Anton Bruckner; Bernard Haitink & Wiener Philharmoniker » n'est pas
+/// Bernard Haitink. Seule l'image est posée, et les empreintes déjà rejetées
+/// sur cette fiche restent refusées.
+async fn image_depuis_un_membre(
+    credit: &str,
+    allowlist: &[String],
+    discogs_token: Option<&str>,
+    lastfm_key: &str,
+    refusees: &[String],
+) -> Option<Vec<u8>> {
+    let membres = crate::metadata::artist_split::membres_pour_portrait(credit, allowlist);
+    if membres.is_empty() {
+        return None;
+    }
+    for membre in membres {
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        let mbid = search_musicbrainz_artist(&membre).await.unwrap_or_default();
+        if let Some(bytes) =
+            fetch_artist_image(&mbid, &membre, discogs_token, lastfm_key, refusees).await
+        {
+            info!(
+                credit,
+                membre = %membre,
+                "artist_image_from_credit_member"
+            );
+            return Some(bytes);
+        }
+    }
     None
 }
 
@@ -1357,10 +1418,7 @@ async fn fetch_image_from_wikidata(client: &reqwest::Client, qid: &str) -> Optio
 /// accents NI la ponctuation. « Motorhead » et « Motörhead » sont deux entrées
 /// distinctes ; les confondre poserait la mauvaise image.
 fn artist_name_matches_exactly(candidate: &str, wanted: &str) -> bool {
-    let candidate = candidate.trim();
-    let wanted = wanted.trim();
-    // Un nom vide se « retrouve » partout : il ne départage rien.
-    !candidate.is_empty() && !wanted.is_empty() && candidate.to_lowercase() == wanted.to_lowercase()
+    crate::metadata::noms_d_artiste_identiques(candidate, wanted)
 }
 
 /// Retire le désambiguïsateur numérique que Discogs accole aux homonymes :
@@ -1521,6 +1579,43 @@ async fn fetch_artist_image_lastfm(
     };
     let image_url = image_url.to_string();
 
+    download_image(client, &image_url).await
+}
+
+/// URL Deezer d'un artiste dont le nom rendu est exactement celui demandé.
+///
+/// `search/artist` est flou : « Janine Jansen » ramène aussi d'autres
+/// artistes. Deux homonymes exacts, ou l'image vide (`/images/artist//`),
+/// et on ne pose rien.
+fn deezer_pick_image_url<'a>(data: &'a serde_json::Value, artist_name: &str) -> Option<&'a str> {
+    let results = data.get("data")?.as_array()?;
+    let mut exact = results.iter().filter(|artist| {
+        artist
+            .get("name")
+            .and_then(|v| v.as_str())
+            .is_some_and(|name| artist_name_matches_exactly(name, artist_name))
+    });
+    let chosen = exact.next()?;
+    if exact.next().is_some() {
+        return None;
+    }
+    chosen
+        .get("picture_xl")
+        .and_then(|v| v.as_str())
+        .filter(|url| !url.is_empty() && !url.contains("/images/artist//"))
+}
+
+async fn fetch_artist_image_deezer(client: &reqwest::Client, artist_name: &str) -> Option<Vec<u8>> {
+    let url = format!(
+        "https://api.deezer.com/search/artist?q={}",
+        urlencoding::encode(artist_name)
+    );
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let image_url = deezer_pick_image_url(&data, artist_name)?.to_string();
     download_image(client, &image_url).await
 }
 
@@ -1979,7 +2074,9 @@ async fn batch_enrich_artist_artwork_inner(
     let contribution_consentie = crate::cloud::consent::contribution_autorisee(&settings);
     // Discogs token as configured in the app UI (stored in settings), so the
     // by-name Discogs image lookup actually works (Progman: no artist images).
-    let discogs_token = settings
+    // Le jeton PERSONNEL (Réglages ▸ Clés d'API, #4805 lot 1) passe devant ;
+    // l'intégré — réglage, puis environnement — sert à défaut.
+    let integre = settings
         .get("discogs_token")
         .ok()
         .flatten()
@@ -1994,12 +2091,26 @@ async fn batch_enrich_artist_artwork_inner(
                 .ok()
                 .filter(|s| !s.is_empty())
         });
+    let discogs_token = crate::cles_api::resoudre_pour_le_serveur(
+        &settings,
+        crate::cles_api::Service::Discogs,
+        integre,
+    )
+    .map(crate::cles_api::CleResolue::into_valeur);
 
     // La clé Last.fm, résolue comme le jeton Discogs juste au-dessus : le
     // réglage saisi dans Tune d'abord, l'environnement à défaut (#2257).
     // Lue ICI, une fois, et transmise ensuite — plus aucune fonction de ce
     // fichier ne va la chercher elle-même.
     let lastfm_key = cle_lastfm_des_images(&settings);
+    // Même liste que l'aperçu de découpage : un groupe légitime (« Earth,
+    // Wind & Fire ») ne doit pas être illustré par l'un de ses morceaux.
+    let liste_blanche: Vec<String> = settings
+        .get("artist_split_allowlist")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default();
 
     let mut enriched = 0u32;
     let mut failed = 0u32;
@@ -2036,15 +2147,28 @@ async fn batch_enrich_artist_artwork_inner(
         // #4837 : une image rejetée par l'utilisateur ne revient pas, de
         // quelque source qu'elle vienne.
         let refusees = empreintes_rejetees(&db, *artist_id, &mbid);
-        match fetch_artist_image(
+        let mut image = fetch_artist_image(
             &mbid,
             name,
             discogs_token.as_deref(),
             &lastfm_key,
             &refusees,
         )
-        .await
-        {
+        .await;
+        // Crédit collé (« Vivaldi; Janine Jansen ») : la cascade sur la chaîne
+        // entière ne trouve rien. On emprunte le portrait d'un membre, sans
+        // recopier son MBID sur cette fiche.
+        if image.is_none() {
+            image = image_depuis_un_membre(
+                name,
+                &liste_blanche,
+                discogs_token.as_deref(),
+                &lastfm_key,
+                &refusees,
+            )
+            .await;
+        }
+        match image {
             Some(data) => {
                 // Adressage par le CONTENU (#1444), plus par l'identité de
                 // l'artiste. L'ancienne clé était `artist-mbid-{mbid}`, sinon
@@ -2595,6 +2719,59 @@ mod tests {
     // rendaient « terminé, 0 enrichi », et le ticket s'est arrêté là faute de
     // pouvoir départager (« aucun element pour l affirmer ni pour l ecarter »).
     // ---------------------------------------------------------------------
+
+    #[test]
+    fn une_reecriture_ne_tronque_pas_l_image_lue_6351() {
+        use std::io::Write;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = b"image complete";
+        let path = save_to_cache(image, dir.path(), "image", "png").unwrap();
+        let destination = path.clone();
+        let (commence_tx, commence_rx) = mpsc::channel();
+        let (finir_tx, finir_rx) = mpsc::channel();
+        let tache = std::thread::spawn(move || {
+            ecrire_image_atomiquement(&destination, |fichier| {
+                fichier.write_all(b"image")?;
+                commence_tx.send(()).unwrap();
+                finir_rx.recv().unwrap();
+                fichier.write_all(b" complete")
+            })
+        });
+        commence_rx.recv().unwrap();
+        let pendant = std::fs::read(&path);
+        finir_tx.send(()).unwrap();
+        tache.join().unwrap().unwrap();
+        assert_eq!(
+            pendant.unwrap(),
+            image,
+            "image partielle visible pendant la réécriture"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), image);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn une_ecriture_interrompue_conserve_l_image_complete_6351() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = b"image complete";
+        let path = save_to_cache(image, dir.path(), "image", "png").unwrap();
+        let erreur = ecrire_image_atomiquement(&path, |fichier| {
+            fichier.write_all(b"image")?;
+            Err(std::io::Error::other("écriture interrompue pour le témoin"))
+        })
+        .unwrap_err();
+        assert_eq!(erreur.to_string(), "écriture interrompue pour le témoin");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            image,
+            "une erreur a détruit l'image complète"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     /// Le témoin, sur le fait de base : répertoire inscriptible, le fichier
     /// d'image existe après le passage et il n'est pas vide. Vert des deux
@@ -4170,5 +4347,46 @@ mod tests_format_image_televersee {
             cache.path(),
             "https://exemple.invalid/artiste.jpg"
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests_deezer_artiste {
+    use super::deezer_pick_image_url;
+
+    fn payload(names: &[&str]) -> serde_json::Value {
+        let data: Vec<_> = names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "picture_xl": format!("https://cdn-images.dzcdn.net/images/artist/{name}/1000.jpg"),
+                })
+            })
+            .collect();
+        serde_json::json!({ "data": data })
+    }
+
+    #[test]
+    fn deezer_prend_le_nom_exact_et_ignore_le_voisin() {
+        let data = payload(&["Janine Jansen", "Maaisen"]);
+        assert_eq!(
+            deezer_pick_image_url(&data, "Janine Jansen"),
+            Some("https://cdn-images.dzcdn.net/images/artist/Janine Jansen/1000.jpg")
+        );
+        assert!(deezer_pick_image_url(&data, "Antonio Vivaldi; Janine Jansen").is_none());
+    }
+
+    #[test]
+    fn deezer_refuse_deux_homonymes_et_l_image_vide() {
+        let data = payload(&["Bach", "Bach"]);
+        assert!(deezer_pick_image_url(&data, "Bach").is_none());
+        let vide = serde_json::json!({
+            "data": [{
+                "name": "Rachel Podger",
+                "picture_xl": "https://cdn-images.dzcdn.net/images/artist//1000x1000-000000-80-0-0.jpg"
+            }]
+        });
+        assert!(deezer_pick_image_url(&vide, "Rachel Podger").is_none());
     }
 }

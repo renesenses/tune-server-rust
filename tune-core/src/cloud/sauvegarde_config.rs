@@ -20,7 +20,11 @@
 //!   pilote (dossiers de musique, réglages de scan) ;
 //! - les jetons et secrets des services, les mots de passe, les clés : tout
 //!   nom que [`crate::secrets::est_secret`] reconnaît, à l'export ET à la
-//!   restauration, puis une seconde passe sur l'objet entier ;
+//!   restauration, puis une seconde passe sur l'objet entier — à la seule
+//!   exception des jetons nommés dans [`JETONS_QUI_VOYAGENT`] (aujourd'hui le
+//!   jeton Discogs, tune-web-client#902), rangés à part dans la section
+//!   `service_tokens` du contenu, donc DANS l'instantané chiffré, et jamais
+//!   ailleurs ;
 //! - l'identité de la machine et sa liaison au compte (`server_id`, jetons
 //!   du compte, licence, propriétaire), et l'état de la sauvegarde elle-même ;
 //! - le hash de mot de passe des profils, et leur droit d'administration :
@@ -167,6 +171,35 @@ const EXCLUS_PREFIXES: &[&str] = &[
     "telemetry_",
 ];
 
+/// Jetons de service qui voyagent, par exception, DANS l'instantané chiffré
+/// (tune-web-client#902, go de Bertrand du 12/10) : section `service_tokens`
+/// du contenu, ajoutée APRÈS la passe [`retirer_les_secrets`], scellée avec
+/// le reste sous la DEK. Le site ne la voit pas plus que le reste.
+///
+/// Liste FERMÉE et exacte : un jeton de compte (Qobuz, Tidal, Last.fm…) se
+/// renouvelle et se lie à une session, et n'a rien à faire ici ; le jeton
+/// Discogs est un jeton personnel fixe, que l'utilisateur recopiait à la main
+/// sur chaque machine. À la restauration, seule une clé de cette liste est
+/// écrite : un instantané piégé n'écrit pas `jwt_secret` par ce chemin.
+pub const JETONS_QUI_VOYAGENT: &[&str] = &["discogs_token"];
+
+/// Nom de la section du contenu qui porte [`JETONS_QUI_VOYAGENT`].
+pub const SECTION_JETONS: &str = "service_tokens";
+
+/// Les jetons de [`JETONS_QUI_VOYAGENT`] posés sur cette machine (non vides).
+fn jetons_exportes(backend: &Arc<dyn DbBackend>) -> Result<Map<String, Value>, String> {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let mut jetons = Map::new();
+    for cle in JETONS_QUI_VOYAGENT {
+        if let Some(v) = settings.get(cle)?
+            && !v.trim().is_empty()
+        {
+            jetons.insert((*cle).to_string(), Value::String(v));
+        }
+    }
+    Ok(jetons)
+}
+
 // ── Ce qui part ─────────────────────────────────────────────────────
 
 /// Clé de profil `cle:{pid}` reconnue : `(cle, pid)`.
@@ -297,6 +330,12 @@ pub fn construire(backend: &Arc<dyn DbBackend>) -> Result<Value, String> {
     // Seconde passe, sur TOUT l'objet : un secret imbriqué dans un réglage de
     // zone, une préférence ou une ligne exotique ne part pas davantage.
     retirer_les_secrets(&mut contenu);
+    // APRÈS la passe : seuls les jetons de la liste fermée, rangés à part, et
+    // chiffrés avec le reste par [`chiffrer`].
+    let jetons = jetons_exportes(backend)?;
+    if !jetons.is_empty() {
+        contenu.insert(SECTION_JETONS.into(), Value::Object(jetons));
+    }
     Ok(Value::Object(contenu))
 }
 
@@ -559,6 +598,8 @@ pub struct Rapport {
     pub playlists_replaced: usize,
     pub favorites_restored: usize,
     pub radios_restored: usize,
+    /// Jetons de service réécrits (noms seulement, jamais la valeur).
+    pub service_tokens_restored: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -836,6 +877,24 @@ pub fn restaurer(
         }
     }
 
+    // ── Jetons de service : la seule liste fermée, rien d'autre ──
+    if let Some(jetons) = o.get(SECTION_JETONS).and_then(Value::as_object) {
+        for cle in JETONS_QUI_VOYAGENT {
+            let Some(valeur) = jetons
+                .get(*cle)
+                .and_then(Value::as_str)
+                .filter(|v| !v.trim().is_empty())
+            else {
+                continue;
+            };
+            if mode == Mode::Merge && settings.get(cle)?.is_some_and(|v| !v.trim().is_empty()) {
+                continue;
+            }
+            settings.set(cle, valeur)?;
+            rapport.service_tokens_restored.push((*cle).to_string());
+        }
+    }
+
     info!(?mode, ?rapport, "sauvegarde_cloud_restauree");
     Ok(rapport)
 }
@@ -1003,9 +1062,11 @@ impl std::fmt::Display for ErreurSite {
 /// Ce qu'il faut pour parler au site au nom du compte.
 #[derive(Debug, Clone)]
 pub struct Compte {
-    base: String,
-    acces: String,
-    liaison: Option<String>,
+    // `pub(crate)` : l'envoi des écoutes (`ecoutes_au_compte`, #6510) parle
+    // au site au nom du MÊME compte, par la même lecture des réglages.
+    pub(crate) base: String,
+    pub(crate) acces: String,
+    pub(crate) liaison: Option<String>,
     pub server_id: String,
 }
 
@@ -1054,7 +1115,7 @@ fn reseau(e: reqwest::Error) -> ErreurSite {
 
 /// Rafraîchit le jeton du compte après un 401, une fois. Rend le compte à
 /// jour, ou `None` si rien n'a pu être rafraîchi.
-async fn rafraichir(settings: &SettingsRepo) -> Option<Compte> {
+pub(crate) async fn rafraichir(settings: &SettingsRepo) -> Option<Compte> {
     use super::sso::{DEFAULT_CLIENT_ID, MozaikAuth};
     let rt = settings
         .get("mozaik_refresh_token")

@@ -149,6 +149,20 @@ pub fn repondre<H: Hote + ?Sized>(hote: &H, requete: &Value) -> Value {
             }
         }
 
+        // Supprimer UNE copie (décision de Bertrand du 08/10/2026, #5966). Un
+        // POST, comme `/lien/supprimer` : l'hôte ne route vers un greffon que
+        // GET et POST.
+        ("POST", "/snapshot/supprimer") => {
+            let id = texte(&corps, "snapshot_id");
+            if id.is_empty() {
+                return reponse(400, json!({ "error": "snapshot_id manquant" }));
+            }
+            match Snapshots::new(hote).supprimer(&id) {
+                Ok(v) => reponse(200, v),
+                Err(e) => erreur(&e),
+            }
+        }
+
         ("POST", "/snapshot/restauration/apercu") => {
             let snapshot_id = texte(&corps, "snapshot_id");
             if snapshot_id.is_empty() {
@@ -158,15 +172,20 @@ pub fn repondre<H: Hote + ?Sized>(hote: &H, requete: &Value) -> Value {
                 .get("mode")
                 .and_then(Value::as_str)
                 .unwrap_or(mode::COMPLETER);
-            match Snapshots::new(hote).apercu_restauration(&snapshot_id, mode) {
-                Ok((plan, a_rajouter, a_retirer)) => reponse(
-                    200,
-                    json!({
-                        "plan": plan,
-                        "a_rajouter": a_rajouter,
-                        "a_retirer_par_vous": a_retirer,
-                    }),
-                ),
+            let snapshots = Snapshots::new(hote);
+            match snapshots.apercu_restauration(&snapshot_id, mode) {
+                Ok((plan, a_rajouter, a_retirer)) => {
+                    let introuvables = snapshots.introuvables(&plan);
+                    reponse(
+                        200,
+                        json!({
+                            "plan": plan,
+                            "a_rajouter": a_rajouter,
+                            "a_retirer_par_vous": a_retirer,
+                            "introuvables": introuvables,
+                        }),
+                    )
+                }
                 Err(e) => erreur(&e),
             }
         }

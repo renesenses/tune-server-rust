@@ -6,7 +6,7 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia"]
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
 local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture"]
@@ -75,6 +75,12 @@ circle = ["dep:tune-circle"]
 # l'exécution (`default_enabled = false`), au catalogue depuis #5296 (la
 # rubrique Sources du client web le consomme, #5065).
 entree-audio = ["dep:tune-entree-audio"]
+# Assistant IA, étape 1 (chantier assistant-ia) : playlists par phrase et
+# suggestions d'album, avec la clé de l'UTILISATEUR. Gratuit, dans `default`
+# et chargé par défaut (`default_enabled`) : rien ne part tant qu'aucun
+# fournisseur n'est réglé. Inscrit à `sdk/plugins.json`, d'où les lignes de
+# build et de test des workflows sont générées.
+assistant-ia = ["dep:tune-assistant-ia"]
 
 [dependencies]
 tune-plugin-native = { path = "../sdk/tune-plugin-native" }
@@ -101,6 +107,7 @@ tune-circle = { path = "../plugins/tune-circle", optional = true }
 tune-entree-audio = { path = "../plugins/tune-entree-audio", optional = true }
 tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tune-pont-roon = { path = "../plugins/tune-pont-roon", optional = true }
+tune-assistant-ia = { path = "../plugins/tune-assistant-ia", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
@@ -130,6 +137,10 @@ jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }
 unicode-normalization = { workspace = true }
 futures-util = { workspace = true }
+# #3326 — connexions Sendspin initiées par le serveur : Tune compose en
+# WebSocket vers l'enceinte. Version déjà dans Cargo.lock (tune-core,
+# `cloud-relay`) : aucune caisse nouvelle.
+tokio-tungstenite = "0.26"
 socket2 = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 time = { workspace = true }
@@ -186,6 +197,8 @@ tokio = { workspace = true, features = ["test-util"] }
 tune-core = { path = "../tune-core", default-features = false, features = [
     "journal-de-test",
     "isolement-disque-de-test",
+    # #6336 : services remplaçables en test (tests/services_remplacables_6336.rs).
+    "services-factices",
 ] }
 
 # Purge à froid de la mémoire libre gardée par la glibc : binaire à part, le
@@ -206,12 +219,23 @@ path = "tests/sendspin_point_d_acces_s2a.rs"
 name = "pont_lien_d_acces"
 path = "tests/pont_lien_d_acces.rs"
 
+# Le pont se pilote en administrateur ; renouvellement du lien d'accès.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "pont_administration"
+path = "tests/pont_administration.rs"
+
 # #3326 — le mode de transition (un `client/hello` en clair). `autotests =
 # false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
 # la contre-épreuve qui garde le chemin chiffré ne serait exécutée par personne.
 [[test]]
 name = "sendspin_mode_transition"
 path = "tests/sendspin_mode_transition.rs"
+# #4626 — rôle maître / agent : deux serveurs Tune réels, appairage, zone,
+# flux, pause, volume. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "agent_tune_4626"
+path = "tests/agent_tune_4626.rs"
 
 [[test]]
 name = "server_contracts"
@@ -238,6 +262,14 @@ path = "tests/dr_liste_albums_4521.rs"
 [[test]]
 name = "reprise_des_passes_5469"
 path = "tests/reprise_des_passes_5469.rs"
+
+# #6330 / #6282 — « Tout relancer » reprend tout et rend les pistes en échec ;
+# un enrichissement garé se dit en pause. Les pauses sont un état global du
+# processus : cible à part. `autotests = false` : sans cette entrée, jamais
+# compilé.
+[[test]]
+name = "tout_relancer_et_etat_reel_6330_6282"
+path = "tests/tout_relancer_et_etat_reel_6330_6282.rs"
 
 # #5512 — les tests d'intégration n'écrivent plus `artwork_cache/`,
 # `queue_state/` ni `tune-scan-report.json` dans l'arbre. `autotests = false`
@@ -286,6 +318,13 @@ path = "tests/pistes_bibliotheque_lentes_5138.rs"
 [[test]]
 name = "titres_pagines_serveur_1716"
 path = "tests/titres_pagines_serveur_1716.rs"
+
+# tune-web-client#1716, étape 2 — les sources de chaque artiste rendues par
+# `GET /library/artists?provenances=1`. `autotests = false` plus haut : sans
+# cette cible, jamais compilé.
+[[test]]
+name = "sources_des_artistes_1716"
+path = "tests/sources_des_artistes_1716.rs"
 
 # #5438 — un clic sur une collection intelligente ne coupe pas le flux : le
 # vrai routeur sur une vraie socket, 58 359 pistes, 4 fils d'exécuteur.
@@ -371,6 +410,12 @@ path = "tests/radios_libelles_localises.rs"
 name = "favori_bandcamp_survit_a_la_resignature_4577"
 path = "tests/favori_bandcamp_survit_a_la_resignature_4577.rs"
 
+# #5677 — l'écriture d'une passe d'indexation UPnP (synchronisation horaire)
+# ne tient pas un fil de l'exécuteur. Rangée au MILIEU du manifeste.
+[[test]]
+name = "indexation_upnp_hors_executeur_5677"
+path = "tests/indexation_upnp_hors_executeur_5677.rs"
+
 # #4154 — les trois plafonds de l'indexation UPnP : réglables, mémorisés, et
 # qui DISENT quand ils mordent. Mesuré sur les routes montées.
 #
@@ -379,6 +424,10 @@ path = "tests/favori_bandcamp_survit_a_la_resignature_4577.rs"
 [[test]]
 name = "plafonds_indexation_upnp_4154"
 path = "tests/plafonds_indexation_upnp_4154.rs"
+
+[[test]]
+name = "radios_upnp_hors_des_pistes_6500"
+path = "tests/radios_upnp_hors_des_pistes_6500.rs"
 
 [[test]]
 name = "plugin_contracts"
@@ -580,6 +629,20 @@ path = "tests/compilation_le_tag_fait_foi.rs"
 [[test]]
 name = "ambiance_traduction_annoncee_3839"
 path = "tests/ambiance_traduction_annoncee_3839.rs"
+
+# Chantier « Assistant IA », étape 2 : l'ancien `/ai/query` passe par le coffre
+# et le plafond du greffon (sans appel réseau : plafond à zéro).
+[[test]]
+name = "assistant_ia_ancien_assistant_etape2"
+path = "tests/assistant_ia_ancien_assistant_etape2.rs"
+required-features = ["assistant-ia"]
+
+# Chantier « Assistant IA » : `/ai/query` rend le coût exact de la question
+# (`cout_eur`), par la route montée contre un faux fournisseur local.
+[[test]]
+name = "assistant_ia_cout_exact"
+path = "tests/assistant_ia_cout_exact.rs"
+required-features = ["assistant-ia"]
 
 # #3101 : la portée de répertoire de l'audit de bibliothèque. Le motif LIKE de
 # `GET /export/library-audit.csv?dir=…` était écrit à la main, sans séparateur :
@@ -814,6 +877,13 @@ path = "tests/radio_ajout_web_sans_doublon_3543.rs"
 name = "radios_recherche_distinction"
 path = "tests/radios_recherche_distinction.rs"
 
+# #6516 — annuaire radio-metadata.fr : cache local (ETag, hors ligne),
+# rapprochement de « Mes radios », ajout sans doublon. `autotests = false` :
+# sans cette inscription, le témoin ne serait jamais compilé.
+[[test]]
+name = "radios_annuaire_6516"
+path = "tests/radios_annuaire_6516.rs"
+
 # #3383 : la bascule « désactiver la télémétrie » n'éteignait rien — la route
 # n'écrivait pas, et les sept gardes d'envoi ne lisaient que `TUNE_TELEMETRY`.
 # Le témoin passe par les ROUTES MONTÉES puis appelle les décisions de
@@ -932,6 +1002,22 @@ path = "tests/plus_comme_ca_qobuz_fil1906.rs"
 [[test]]
 name = "radio_artiste_5395"
 path = "tests/radio_artiste_5395.rs"
+# #6465 — radio, podcast et préréglage effacent le contexte de session laissé
+# par l'album joué avant (Historique, vignette « en cours »).
+[[test]]
+name = "contexte_de_session_6465"
+path = "tests/contexte_de_session_6465.rs"
+# #6468 — un épisode de podcast sur un renderer réseau passe par le mandataire
+# de Tune (http://) ; une sortie locale garde l'URL ; un refus de la sortie est
+# une erreur HTTP lisible. `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait jamais compilé.
+[[test]]
+name = "podcast_sortie_reseau_6468"
+path = "tests/podcast_sortie_reseau_6468.rs"
+# #6466 — le conteneur de ce que `POST /zones/{id}/queue/add` insère.
+[[test]]
+name = "historique_conteneurs_6466"
+path = "tests/historique_conteneurs_6466.rs"
 # #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
 # que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
 # une variable d'environnement que plus aucune etape ne pose. `autotests =
@@ -1273,6 +1359,12 @@ path = "tests/exemplaires_par_repertoire_4907.rs"
 name = "suppression_playlist_de_service"
 path = "tests/suppression_playlist_de_service.rs"
 
+# #6688 — le badge « Partagée avec un cercle » (`cercles` dans la liste et la
+# fiche des playlists). `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "playlists_badge_cercle_6688"
+path = "tests/playlists_badge_cercle_6688.rs"
+
 # Le cloisonnement par profil du gestionnaire de playlists — dont la FUSION.
 # Le fichier existait depuis #3073, mais `autotests = false` plus haut le
 # laissait hors compilation : la garde qui interdit de fusionner la playlist
@@ -1280,6 +1372,13 @@ path = "tests/suppression_playlist_de_service.rs"
 [[test]]
 name = "playlist_manager_cloisonnement_par_profil"
 path = "tests/playlist_manager_cloisonnement_par_profil.rs"
+
+# La fusion qui apparie d'un catalogue à l'autre relève du même droit que le
+# transfert ; la fusion « au même endroit » reste libre. `autotests = false`
+# plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "playlist_manager_fusion_droit"
+path = "tests/playlist_manager_fusion_droit.rs"
 
 # #4767 — les deux sections de la page artiste (« Compilations »,
 # « Apparitions ») et l'absence d'une section vide.
@@ -1455,6 +1554,69 @@ name = "pg_etiquette_collection_5026"
 path = "tests/pg_etiquette_collection_5026.rs"
 required-features = ["postgres"]
 
+# #6257 — l'ordre des étiquettes sur PostgreSQL : la 091 pose `tags.position`
+# en BIGINT, `PUT /tags/order` l'écrit, les listes le suivent.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "pg_ordre_etiquettes_6257"
+path = "tests/pg_ordre_etiquettes_6257.rs"
+required-features = ["postgres"]
+
+# #6245 — l'artiste d'une piste modifié par son NOM (édition, tagger) :
+# enregistré par `artist_id`, tenu à la NOUVELLE valeur, gardé au rescan.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "artiste_par_nom_6245"
+path = "tests/artiste_par_nom_6245.rs"
+
+# #6270 — l'album d'une piste modifié par son TITRE (édition, tagger) :
+# enregistré par `album_id`, tenu à la NOUVELLE valeur, gardé au rescan.
+[[test]]
+name = "album_par_titre_6270"
+path = "tests/album_par_titre_6270.rs"
+
+# #2574 — `tests/piste_artiste_par_id.rs` existait sans cible : jamais
+# compilé (`autotests = false`). Rattaché avec #6245, son voisin direct.
+[[test]]
+name = "piste_artiste_par_id"
+path = "tests/piste_artiste_par_id.rs"
+
+# #6121 — la règle « Artiste de l'album » (collections et playlists) sur
+# PostgreSQL : les deux aperçus par le vrai routeur.
+[[test]]
+name = "pg_artiste_de_l_album_6121"
+path = "tests/pg_artiste_de_l_album_6121.rs"
+required-features = ["postgres"]
+
+# #6271 — collections : « finit par » et les motifs sur une colonne
+# numérique, sur PostgreSQL.
+[[test]]
+name = "pg_motifs_collections_6271"
+path = "tests/pg_motifs_collections_6271.rs"
+required-features = ["postgres"]
+
+# #6250 — la règle « ne contient pas » (collections et playlists) sur
+# PostgreSQL : les deux aperçus par le vrai routeur.
+[[test]]
+name = "pg_ne_contient_pas_6250"
+path = "tests/pg_ne_contient_pas_6250.rs"
+required-features = ["postgres"]
+
+# #6122 — la règle « dans les N derniers jours » (date d'ajout, dernière
+# écoute) sur PostgreSQL : les deux aperçus par le vrai routeur.
+[[test]]
+name = "pg_date_relative_6122"
+path = "tests/pg_date_relative_6122.rs"
+required-features = ["postgres"]
+
+# #6143 — les règles de date « après », « avant », « entre » et les formes
+# relatives (`now-90d`) sur PostgreSQL, sans `DATETIME()` propre à SQLite :
+# un témoin par opérateur, collections et playlists.
+[[test]]
+name = "pg_regles_de_date_6143"
+path = "tests/pg_regles_de_date_6143.rs"
+required-features = ["postgres"]
+
 # 🔴 #4889 — `tests/playlists_pistes_de_service.rs` existe depuis #1848 et n'a
 # JAMAIS été compilé : `autotests = false` en tête de ce manifeste, et aucune
 # cible ne le déclarait. Il garde maintenant le contrat des titres de service
@@ -1463,6 +1625,13 @@ required-features = ["postgres"]
 [[test]]
 name = "playlists_pistes_de_service"
 path = "tests/playlists_pistes_de_service.rs"
+
+# #6687 — retirer une piste désigne une LIGNE (rang affiché ou `entry_id`),
+# plus jamais la colonne `position`. `autotests = false` : sans cette cible,
+# jamais compilé.
+[[test]]
+name = "playlist_retrait_par_ligne_6687"
+path = "tests/playlist_retrait_par_ligne_6687.rs"
 
 # Favoris LOCAUX sur PostgreSQL (chasse PG du 25/09/2026) : `ProfileRepo` liait
 # `favorites.profile_id`/`item_id` en chaine alors que ces colonnes sont BIGINT
@@ -1545,6 +1714,11 @@ path = "tests/pg_compilation_reprise_5837.rs"
 name = "favori_marquage_ia_5530"
 path = "tests/favori_marquage_ia_5530.rs"
 
+# Favoris radio → playlist Qobuz : aperçu puis création des titres retenus.
+[[test]]
+name = "favoris_radio_playlist_qobuz"
+path = "tests/favoris_radio_playlist_qobuz.rs"
+
 # #5997 — les routes de favoris de service passent par le miroir du service.
 [[test]]
 name = "favoris_miroir_routes_5997"
@@ -1562,3 +1736,63 @@ path = "tests/credits_apres_identification_4805.rs"
 [[test]]
 name = "insertion_avant_la_piste_en_cours_5770"
 path = "tests/insertion_avant_la_piste_en_cours_5770.rs"
+
+# Liens et sauvegardes de `/playlist-manager` : alias dépréciés (en-tête
+# `Deprecation`) pendant une version, doublons du greffon « Playlists
+# converter ». `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "playlist_manager_alias_deprecies"
+path = "tests/playlist_manager_alias_deprecies.rs"
+
+# #6124 — la date de sortie originale et la version sur PostgreSQL : règles
+# des collections et des playlists, concordance de l'album, fiche de piste.
+[[test]]
+name = "pg_balises_6124"
+path = "tests/pg_balises_6124.rs"
+required-features = ["postgres"]
+
+# #6287 — la requête textuelle des règles intelligentes sur PostgreSQL : la
+# négation (`NOT COALESCE`), les combinaisons et le crédit, par la vraie route.
+[[test]]
+name = "pg_requete_textuelle_6287"
+path = "tests/pg_requete_textuelle_6287.rs"
+required-features = ["postgres"]
+
+# #6336 — AirPlay 2, SMB, Qobuz, TIDAL et Deezer éprouvés par le vrai routeur
+# contre des faux locaux. Binaire à lui seul : les substitutions de programmes
+# (`tune_core::services_factices`) sont un état de PROCESSUS. `autotests =
+# false` plus haut : sans cette cible, le banc ne serait JAMAIS compilé.
+[[test]]
+name = "services_remplacables_6336"
+path = "tests/services_remplacables_6336.rs"
+
+# #4681 — « ce qui tourne » (`GET /system/background-tasks/running`) par le
+# vrai routeur. Binaire à lui seul : le témoin de lecture et l'avancement de
+# la cascade sont des états de PROCESSUS.
+[[test]]
+name = "ce_qui_tourne_4681"
+path = "tests/ce_qui_tourne_4681.rs"
+
+# #6336 (suite) — le battement de la licence et la liaison SSO du serveur au
+# compte, contre un faux mozaiklabs déclaré par `services_factices`
+# (`substituer_base`). Binaire à lui seul pour la même raison.
+[[test]]
+name = "licence_sso_remplacables_6336"
+path = "tests/licence_sso_remplacables_6336.rs"
+
+# #6454 — `GET /profiles` ne rend plus `200 []` sur une base en échec : un
+# 500 au code lisible, et une ligne ERROR au journal. Abonné `tracing` GLOBAL,
+# donc un binaire à lui seul et un seul essai dedans (leçon de
+# `panne_sql_journalisee`). `autotests = false` plus haut : sans cette cible,
+# le fichier ne serait jamais compilé.
+[[test]]
+name = "profils_panne_de_base_6454"
+path = "tests/profils_panne_de_base_6454.rs"
+
+# #6212 / #6634 — la gravure du Dynamic Range cède à la lecture et n'écrit pas
+# dans le fichier joué, par la route montée. Binaire à lui seul : le témoin de
+# lecture et la politique des freins sont des états de PROCESSUS. `autotests =
+# false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé.
+[[test]]
+name = "gravure_dr_cede_a_la_lecture_6212"
+path = "tests/gravure_dr_cede_a_la_lecture_6212.rs"

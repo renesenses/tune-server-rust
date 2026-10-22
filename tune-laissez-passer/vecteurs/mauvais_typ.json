@@ -1,0 +1,19 @@
+{
+  "attendu": {
+    "code": "typ",
+    "resultat": "refuse"
+  },
+  "contexte": {
+    "grace_expiration": 0,
+    "maintenant": 1793000000,
+    "server_id": "6f1c1f5e-2b0a-4c2e-9d3b-7a51c0de0001"
+  },
+  "defi": {
+    "defi": "c2Vzc2lvbi1kZWZpLWRlLXRlc3QtMDEyMzQ1Njc4OTAx",
+    "signature": "RViENs3a2oEShmYoVcnKtpRhTeITKAEbXRLpLOeL_IB535Lz14CUFPctu7VuXP4EcCvw8HhiTptRJDAbLmJdCg"
+  },
+  "description": "typ = JWT au lieu de tune-pass+jwt.",
+  "laissez_passer": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL21vemFpa2xhYnMuZnIiLCJhdWQiOiJ0dW5lLXJlbW90ZSIsInN1YiI6ImNwdF84ZjJhNjEiLCJzaWQiOiI2ZjFjMWY1ZS0yYjBhLTRjMmUtOWQzYi03YTUxYzBkZTAwMDEiLCJkaWQiOiJhcHBfZWRfMDEiLCJjbmYiOnsiYWxnIjoiRWQyNTUxOSIsInBrIjoibjBsRG5wMndsYnhCRWUwbDAxZVYyREc4VmFCSDlMSFg5cTdqZDN1MEVpQSJ9LCJwMnAiOmZhbHNlLCJpYXQiOjE3OTI5OTk0MDAsIm5iZiI6MTc5Mjk5OTQwMCwiZXhwIjoxNzkzMDAzMDAwLCJqdGkiOiJqdGktMDAwMSIsInYiOjF9.fbWAfCyBXOs_nqel5OUs-545IG9SO9Mz7rpUHmx2PMtnJhOTw6ykoO8kDHVyBFy2Tn6iIZ6N4GeAW7TwqR3sDw",
+  "nom": "mauvais_typ",
+  "publication": "jeu_de_cles.json"
+}

@@ -32,6 +32,10 @@
 //!    la balise du fichier au scan ([`depuis_valeurs_de_tag`] : `RELEASETYPE`
 //!    et ses variantes, quand la colonne est vide), par MusicBrainz, par le
 //!    service, ou à la main (édition de l'album). Il n'est jamais contredit.
+//!    Une exception, pour les albums DE SERVICE (#6063, 12/10/2026) : un
+//!    « album » annoncé par le service, ou son silence, laisse parler le
+//!    titre (« … EP ») et la règle 2 quand elle conclut à un EP ou à un
+//!    single — voir [`type_d_album_de_service`].
 //! 2. **À défaut**, [`type_deduit`] range le disque d'après ses PISTES :
 //!    * single : de 1 à [`SINGLE_PISTES_MAX`] pistes et moins de
 //!      [`SINGLE_DUREE_MAX_MS`] au total ;
@@ -298,6 +302,71 @@ pub fn est_live(secondaires: &[String]) -> bool {
     secondaires.iter().any(|t| t == SECONDAIRE_LIVE)
 }
 
+/// Les mots qui, juste AVANT « live », en font un verbe : « Long Live Rock
+/// 'n' Roll », « I Want to Live », « We'll Live ».
+const LIVE_VERBE_SI_PRECEDE_DE: [&str; 21] = [
+    "i", "you", "we", "they", "to", "will", "would", "can", "could", "must", "shall", "should",
+    "long", "ll", "let", "gonna", "wanna", "might", "may", "never", "still",
+];
+
+/// Les mots qui, juste APRÈS « live », en font un verbe : « Live Through
+/// This », « Live Forever », « Live to Tell », « Live Your Life », « Live It
+/// Up ». « and let » couvre « Live and Let Die » sans écarter « Live and
+/// Dangerous ».
+const LIVE_VERBE_SI_SUIVI_DE: [&[&str]; 14] = [
+    &["through"],
+    &["forever"],
+    &["to"],
+    &["your"],
+    &["my"],
+    &["our"],
+    &["it"],
+    &["with"],
+    &["without"],
+    &["like"],
+    &["for"],
+    &["a"],
+    &["again"],
+    &["and", "let"],
+];
+
+/// Règle PROVISOIRE de la section « Live » par le TITRE (#6464, FabienM,
+/// fil 2302 point 4, go de Bertrand du 20/10/2026) : « si le nom de l'album
+/// contient les mots "Live" ou "unplugged", le ranger dans la section Live »,
+/// en attendant qu'un service publie une métadonnée qui le dise.
+///
+/// Les MOTS, pas les lettres : « Alive », « Olive », « Liverpool »,
+/// « Delivery », « Lively » ne déclenchent rien. Et « live » n'y compte pas
+/// quand il est employé comme VERBE (voir [`LIVE_VERBE_SI_PRECEDE_DE`] et
+/// [`LIVE_VERBE_SI_SUIVI_DE`]) : « Live Through This » (Hole) et « Live
+/// Forever » (Oasis) sont des disques studio. « unplugged » compte toujours.
+///
+/// Elle ne voit pas un live dont le titre ne le dit pas (« Waiting for
+/// Columbus », « Alive! ») : le type secondaire `live` reste la seule réponse
+/// sûre, et [`est_live`] passe avant elle.
+pub fn titre_annonce_un_live(titre: &str) -> bool {
+    let minuscules = titre.to_lowercase();
+    let mots: Vec<&str> = minuscules
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|m| !m.is_empty())
+        .collect();
+    if mots.contains(&"unplugged") {
+        return true;
+    }
+    mots.iter().enumerate().any(|(i, mot)| {
+        if *mot != "live" {
+            return false;
+        }
+        if i > 0 && LIVE_VERBE_SI_PRECEDE_DE.contains(&mots[i - 1]) {
+            return false;
+        }
+        let suite = &mots[i + 1..];
+        !LIVE_VERBE_SI_SUIVI_DE
+            .iter()
+            .any(|motif| suite.starts_with(motif))
+    })
+}
+
 /// Remplit `albums.release_type` depuis MusicBrainz, pour les disques dont le
 /// groupe de sortie est connu.
 ///
@@ -446,10 +515,131 @@ pub fn type_deduit(
     deduire_depuis_pistes(pistes?)
 }
 
+/// #6063 — le titre ANNONCE-t-il un EP ? Vrai quand son dernier mot est
+/// « EP », quelle qu'en soit la casse, avec ou sans parenthèses, crochets ou
+/// tiret : « Riverside EP », « Riverside (EP) », « Riverside - EP ».
+///
+/// Le mot doit être le DERNIER : « EP » au milieu d'un titre (« EP One »)
+/// n'annonce rien, et « Deep » ou « Step » ne sont pas « EP ».
+pub fn titre_annonce_un_ep(titre: &str) -> bool {
+    titre
+        .trim()
+        .trim_end_matches([')', ']', ' '])
+        .rsplit(|c: char| c.is_whitespace() || matches!(c, '(' | '[' | '-' | '–' | '—'))
+        .find(|mot| !mot.is_empty())
+        .is_some_and(|mot| mot.eq_ignore_ascii_case("ep"))
+}
+
+/// #6063 — le type d'un album de SERVICE (Qobuz, Tidal…), à partir de ce que
+/// le service annonce, du titre et de ses pistes.
+///
+/// FabienM (fil 2236, 12/10/2026) : « Riverside EP » d'Agnes Obel, 3 titres,
+/// 11 min 33, rangé dans « Albums ». Réponses Qobuz enregistrées le
+/// 12/10/2026 : `album/get` dit `release_type: "single"`, mais
+/// `artist/get?extra=albums` — la liste qui remplit la discographie — ne
+/// porte AUCUN `release_type`. Sans type, l'album tombait dans « Albums » :
+/// la règle des pistes et de la durée (#5616) ne s'appliquait qu'à la
+/// bibliothèque.
+///
+/// La règle, décision de Bertrand du 12/10/2026 :
+/// * le service dit `ep` ou `single` (ou `broadcast`, `other`) : son type
+///   est gardé, rien n'est déduit ;
+/// * le service dit `album`, ou ne dit rien : un titre qui finit par « EP »
+///   donne un EP ; sinon la règle de repli ([`deduire_depuis_pistes`])
+///   décide, et ne l'emporte que si elle conclut à un EP ou à un single ;
+/// * sinon, le type annoncé reste (ou l'absence de type).
+pub fn type_d_album_de_service(
+    annonce: Option<TypeDeSortie>,
+    titre: &str,
+    pistes: Option<PistesDuDisque>,
+) -> Option<TypeDeSortie> {
+    if !matches!(annonce, None | Some(TypeDeSortie::Album)) {
+        return annonce;
+    }
+    if titre_annonce_un_ep(titre) {
+        return Some(TypeDeSortie::Ep);
+    }
+    match pistes.and_then(deduire_depuis_pistes) {
+        Some(t @ (TypeDeSortie::Ep | TypeDeSortie::Single)) => Some(t),
+        _ => annonce,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn un_titre_qui_finit_par_ep_annonce_un_ep() {
+        for titre in [
+            "Riverside EP",
+            "Riverside (EP)",
+            "Riverside [EP]",
+            "Riverside - EP",
+            "riverside ep ",
+            "Riverside – Ep",
+        ] {
+            assert!(titre_annonce_un_ep(titre), "{titre}");
+        }
+        for titre in ["Deep", "Step by Step", "EP One", "Riverside", "", "Peep"] {
+            assert!(!titre_annonce_un_ep(titre), "{titre}");
+        }
+    }
+
+    /// #6063 — un type de service EP ou single est gardé ; « album » ou
+    /// rien laisse la règle parler, mais seulement pour un EP ou un single.
+    #[test]
+    fn le_type_d_un_album_de_service() {
+        use TypeDeSortie::*;
+        let court = Some(PistesDuDisque {
+            nombre: 3,
+            duree_totale_ms: 693_000,
+            durees_inconnues: 0,
+            piste_la_plus_longue_ms: 257_000,
+        });
+        let long = Some(PistesDuDisque {
+            nombre: 11,
+            duree_totale_ms: 2_458_000,
+            durees_inconnues: 0,
+            piste_la_plus_longue_ms: 300_000,
+        });
+        assert_eq!(
+            type_d_album_de_service(Some(Single), "Riverside EP", court),
+            Some(Single)
+        );
+        assert_eq!(type_d_album_de_service(Some(Ep), "X", long), Some(Ep));
+        assert_eq!(
+            type_d_album_de_service(None, "Riverside EP", None),
+            Some(Ep)
+        );
+        assert_eq!(
+            type_d_album_de_service(Some(Album), "Riverside EP", long),
+            Some(Ep)
+        );
+        assert_eq!(
+            type_d_album_de_service(Some(Album), "Riverside", court),
+            Some(Single)
+        );
+        assert_eq!(
+            type_d_album_de_service(None, "Riverside", court),
+            Some(Single)
+        );
+        assert_eq!(
+            type_d_album_de_service(Some(Album), "Aventine", long),
+            Some(Album)
+        );
+        assert_eq!(
+            type_d_album_de_service(None, "Aventine", long),
+            None,
+            "rien n'est inventé"
+        );
+        assert_eq!(type_d_album_de_service(None, "Aventine", None), None);
+        assert_eq!(
+            type_d_album_de_service(Some(Autre), "Riverside EP", court),
+            Some(Autre)
+        );
+    }
 
     #[test]
     fn les_cinq_types_primaires_de_musicbrainz_sont_reconnus() {

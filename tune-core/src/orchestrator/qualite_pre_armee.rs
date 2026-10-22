@@ -63,6 +63,82 @@ pub(crate) fn format_nomme_par_la_source(source: &str, source_id: Option<&str>) 
     }
 }
 
+/// #6334 — le codec que le service a LIVRÉ, en minuscules (`aac`, `flac`),
+/// tel que `StreamQuality::codec` le nomme. C'est ce qu'il faut annoncer, et
+/// non le conteneur servi : un AAC décodé en WAV pour la sortie restait sinon
+/// annoncé « WAV · 16 bits », c'est-à-dire comme un CD.
+pub(crate) fn format_livre_par_le_service(
+    qualite: &crate::streaming::StreamQuality,
+) -> Option<String> {
+    let codec = qualite.codec.trim().to_lowercase();
+    (!codec.is_empty()).then_some(codec)
+}
+
+/// #6334 — la profondeur à ANNONCER pour un flux de service : aucune pour un
+/// codec avec perte (un AAC n'a pas de « 16 bits »), aucune quand le service
+/// n'en a pas donné (0). Jamais la profondeur du conteneur de sortie.
+pub(crate) fn profondeur_annoncee_par_le_service(
+    qualite: &crate::streaming::StreamQuality,
+    profondeur: u16,
+) -> Option<u32> {
+    (!qualite.avec_perte() && profondeur > 0).then_some(u32::from(profondeur))
+}
+
+/// #6334 — la profondeur qui part SUR LE FIL, pour `PlayMedia` : le DIDL
+/// (`<res bitsPerSample>`) et l'annonce SlimProto décrivent le flux servi, pas
+/// la source. `ResolvedStream.bit_depth` ne porte rien pour un codec avec
+/// perte (l'annonce de la SOURCE) ; décodé pour la sortie en WAV ou FLAC, ce
+/// flux a pourtant une profondeur : celle que les bras réseau (canal AAC,
+/// OAAT, DASH) tirent d'une profondeur nulle, `cap_output_bit_depth(0)`, soit
+/// 16 bits. La sortie locale reçoit, elle, un WAV 32 bits dont elle lit
+/// l'en-tête : comme pour une source sans perte, l'annonce n'y décide de rien.
+/// Relayé tel quel (`audio/mp4`), le flux n'a toujours aucune profondeur.
+pub(crate) fn profondeur_du_fil(resolved: &ResolvedStream) -> Option<u32> {
+    use crate::audio::formats::AudioFormat;
+    if resolved.bit_depth.is_some() {
+        return resolved.bit_depth;
+    }
+    let source_avec_perte = resolved.format_source.as_deref().is_some_and(|codec| {
+        matches!(
+            AudioFormat::from_extension(codec),
+            Some(AudioFormat::Aac | AudioFormat::Mp3 | AudioFormat::Ogg | AudioFormat::Opus)
+        )
+    });
+    let mime = resolved
+        .mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let decode_pour_la_sortie = matches!(
+        mime.as_str(),
+        "audio/wav"
+            | "audio/x-wav"
+            | "audio/wave"
+            | "audio/flac"
+            | "audio/x-flac"
+            | "audio/aiff"
+            | "audio/x-aiff"
+    ) || mime.starts_with("audio/l16")
+        || mime.starts_with("audio/l24");
+    (source_avec_perte && decode_pour_la_sortie)
+        .then(|| u32::from(super::regles::cap_output_bit_depth(0)))
+}
+
+/// #6334 — le débit à annoncer, en kbit/s : celui que le service nomme pour
+/// un codec avec perte (l'AAC 320 de Tidal `HIGH`). Rien pour un sans-perte :
+/// le chemin du signal ne l'afficherait pas, et un chiffre calculé n'est pas
+/// un débit nommé.
+pub(crate) fn debit_annonce_par_le_service(
+    qualite: &crate::streaming::StreamQuality,
+) -> Option<u32> {
+    qualite
+        .bitrate
+        .filter(|b| *b > 0 && qualite.avec_perte())
+        .map(|b| b / 1000)
+}
+
 /// Le dernier repli du format : le type MIME du flux, `audio/` et `x-` ôtés.
 pub(crate) fn format_du_mime(mime: &str) -> String {
     mime.strip_prefix("audio/")
@@ -84,6 +160,7 @@ impl QualitePreArmee {
         Some(Self {
             stream_id,
             format: format_nomme_par_la_source(source, source_id)
+                .or_else(|| resolved.format_source.clone())
                 .or_else(|| Some(format_du_mime(&resolved.mime_type))),
             // `resolution_annoncee(None, resolu, false)` = `resolu` : une
             // source non locale n'a pas de ligne, la valeur résolue fait foi.

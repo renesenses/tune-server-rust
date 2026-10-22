@@ -134,6 +134,7 @@ impl StreamingService for ServiceSimule {
                 covers: Vec::new(),
                 track_count: pistes.len() as _,
                 owner: None,
+                editable: None,
             })
             .collect())
     }
@@ -558,6 +559,66 @@ async fn l_import_dans_la_bibliotheque_passe_par_le_greffon_4741() {
     assert!(journal(&b.ecritures_cible).is_empty());
 }
 
+/// 🔴 #6499 (Bertrand, rc6) — une playlist de la bibliothèque qui mêle un
+/// titre DÉJÀ chez la cible et une piste locale, transférée vers ce service,
+/// par la route et le VRAI `main.wasm`. Le titre de service est versé sous
+/// son identifiant d'origine, à sa place, sans appariement ; la piste locale
+/// est appariée (la bonne édition, pas le remaster). Avant le correctif, le
+/// titre de service n'atteignait même pas le greffon : 1 titre sur 1 annoncé,
+/// un seul versé.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_titre_deja_chez_la_cible_est_repris_tel_quel_6499() {
+    use tune_core::db::playlist_repo::{EntryContent, ServiceEntry};
+
+    let _verrou = crate::lock_environment();
+    let b = banc(true).await;
+    let repo = PlaylistRepo::with_backend(b.state.backend.clone());
+    let id = repo.create("Mixte", None, 1).unwrap();
+    repo.add_entries_deduped(
+        id,
+        &[
+            EntryContent::Service(ServiceEntry {
+                source: "cible".into(),
+                source_id: "c-deja".into(),
+                title: "Déjà chez la cible".into(),
+                artist: Some("Quelqu'un".into()),
+                album: None,
+                album_source_id: None,
+                duration_ms: Some(180_000),
+                cover_url: None,
+            }),
+            EntryContent::Local(1),
+        ],
+        None,
+    )
+    .unwrap();
+
+    let (st, rendu) = appel(
+        &b.app,
+        "POST",
+        "/api/v1/playlist-manager/transfer",
+        json!({
+            "source_service": "local",
+            "source_playlist_id": id.to_string(),
+            "target_service": "cible",
+            "target_name": "Mixte chez la cible",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rendu}");
+    assert_eq!(rendu["total_tracks"], 2, "{rendu}");
+    assert_eq!(rendu["matched"], 2, "{rendu}");
+    assert_eq!(rendu["not_found"], 0, "{rendu}");
+    assert_eq!(
+        journal(&b.ecritures_cible),
+        vec![
+            "creation:Mixte chez la cible".to_string(),
+            "ajout:pl-creee:c-deja,c-bonne".to_string(),
+        ],
+        "{rendu}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3. Les deux autres moteurs ont disparu
 // ---------------------------------------------------------------------------
@@ -712,4 +773,206 @@ async fn dupliquer_dans_la_bibliotheque_reste_gratuit_4741() {
         .find(|p| p.name == "Ma locale (copie)")
         .unwrap_or_else(|| panic!("aucune copie : {rendu}"));
     assert_eq!(repo.get_track_ids(copie.id.unwrap()).unwrap(), vec![1]);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Décisions de Bertrand du 08/10/2026 (#5966)
+// ---------------------------------------------------------------------------
+
+const BASE_GREFFON: &str = "/api/v1/plugins/playlists-converter";
+
+/// 🔴 Les sauvegardes de l'écran v2 restent GRATUITES, et une restauration
+/// recrée la playlist DANS TUNE :
+///
+/// - un compte gratuit prend une copie datée d'une playlist de service, la
+///   liste, puis la restaure ;
+/// - la playlist est recréée dans la bibliothèque, avec la piste que la
+///   bibliothèque possède, et l'autre est rendue dans `introuvables` ;
+/// - elle l'est sous le profil de l'APPELANT (`X-Profile-Id: 2`), pas sous
+///   le profil actif global : l'en-tête est transmis au greffon ;
+/// - rien n'est écrit chez le service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_sauvegarde_v2_est_gratuite_et_se_restaure_dans_tune_5966() {
+    let _verrou = crate::lock_environment();
+    let b = banc_licence(true, false).await;
+
+    let (st, rendu) = appel_profil(
+        &b.app,
+        "POST",
+        &format!("{BASE_GREFFON}/snapshot"),
+        json!({ "service": "source", "playlist_id": "pl-1" }),
+        Some("2"),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "copie datée refusée à un compte gratuit : {rendu}"
+    );
+    let snapshot_id = rendu["snapshot"]["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (st, liste) = appel_profil(
+        &b.app,
+        "GET",
+        &format!("{BASE_GREFFON}/snapshots"),
+        Value::Null,
+        Some("2"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{liste}");
+
+    let (st, apercu) = appel_profil(
+        &b.app,
+        "POST",
+        &format!("{BASE_GREFFON}/snapshot/restauration/apercu"),
+        json!({ "snapshot_id": snapshot_id, "mode": "recreer" }),
+        Some("2"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{apercu}");
+    assert_eq!(apercu["plan"]["a_rajouter_ids"], json!(["1"]), "{apercu}");
+    assert_eq!(
+        apercu["introuvables"][0]["titre"], "Introuvable ailleurs",
+        "{apercu}"
+    );
+
+    let (st, fait) = appel_profil(
+        &b.app,
+        "POST",
+        &format!("{BASE_GREFFON}/snapshot/restauration"),
+        json!({ "plan_id": apercu["plan"]["plan_id"], "accord": true }),
+        Some("2"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{fait}");
+    assert_eq!(fait["plan"]["etat"], "termine", "{fait}");
+
+    let repo = PlaylistRepo::with_backend(b.state.backend.clone());
+    let noms = |profil: i64| -> Vec<String> {
+        repo.list(profil, 100, 0)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect()
+    };
+    let recreee = repo
+        .list(2, 100, 0)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == "Mes classiques")
+        .unwrap_or_else(|| {
+            panic!(
+                "la playlist restaurée doit être dans Tune, chez le profil 2 : {:?} / profil 1 : {:?}",
+                noms(2),
+                noms(1)
+            )
+        });
+    assert_eq!(repo.get_track_ids(recreee.id.unwrap()).unwrap(), vec![1]);
+    assert!(
+        !noms(1).contains(&"Mes classiques".to_string()),
+        "pas chez le profil actif global"
+    );
+    assert!(
+        journal(&b.ecritures_source).is_empty() && journal(&b.ecritures_cible).is_empty(),
+        "une restauration n'écrit rien chez un service"
+    );
+}
+
+/// Témoin de l'exception : seules les copies datées sont gratuites. Les liens
+/// de synchronisation restent Premium.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn les_liens_du_greffon_restent_premium_5966() {
+    let _verrou = crate::lock_environment();
+    let b = banc_licence(true, false).await;
+    let (st, refus) = appel(&b.app, "GET", &format!("{BASE_GREFFON}/liens"), Value::Null).await;
+    assert_eq!(st, StatusCode::PAYMENT_REQUIRED, "{refus}");
+}
+
+/// Supprimer une copie datée depuis le greffon (décision de Bertrand du
+/// 08/10/2026, #5966), par le vrai `main.wasm` et le vrai routeur :
+///
+/// - c'est gratuit, comme les copies elles-mêmes ;
+/// - la copie disparaît de la liste et ne se relit plus ;
+/// - un identifiant qui n'est pas celui d'une copie (`..`, une autre clé du
+///   stockage du greffon) est refusé en 400, sans rien effacer ;
+/// - rien n'est écrit chez un service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supprimer_une_copie_datee_est_gratuit_et_borne_aux_copies_5966() {
+    let _verrou = crate::lock_environment();
+    let b = banc_licence(true, false).await;
+    let (st, rendu) = appel(
+        &b.app,
+        "POST",
+        &format!("{BASE_GREFFON}/snapshot"),
+        json!({ "service": "source", "playlist_id": "pl-1" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rendu}");
+    let snapshot_id = rendu["snapshot"]["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for intrus in [
+        "..",
+        "../compteur_playlists_snap",
+        "snap:1:0",
+        "snap-1-1/..",
+    ] {
+        let (st, refus) = appel(
+            &b.app,
+            "POST",
+            &format!("{BASE_GREFFON}/snapshot/supprimer"),
+            json!({ "snapshot_id": intrus }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "`{intrus}` : {refus}");
+    }
+    let (st, intacte) = appel(
+        &b.app,
+        "GET",
+        &format!("{BASE_GREFFON}/snapshot?id={snapshot_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "un refus n'efface rien : {intacte}");
+
+    let (st, fait) = appel(
+        &b.app,
+        "POST",
+        &format!("{BASE_GREFFON}/snapshot/supprimer"),
+        json!({ "snapshot_id": snapshot_id }),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "supprimer une copie est refusé à un compte gratuit : {fait}"
+    );
+    assert_eq!(fait["supprime"], true, "{fait}");
+
+    let (st, _) = appel(
+        &b.app,
+        "GET",
+        &format!("{BASE_GREFFON}/snapshot?id={snapshot_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, liste) = appel(
+        &b.app,
+        "GET",
+        &format!("{BASE_GREFFON}/snapshots"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{liste}");
+    assert_eq!(liste["count"], 0, "{liste}");
+    assert!(
+        journal(&b.ecritures_source).is_empty() && journal(&b.ecritures_cible).is_empty(),
+        "supprimer une copie n'écrit rien chez un service"
+    );
 }

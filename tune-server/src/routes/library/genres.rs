@@ -15,6 +15,13 @@ pub(super) struct GenreQuery {
 }
 
 pub(super) async fn genre_tree(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let genres = genres_de_la_bibliotheque(&state);
+    genre_tree_de(&state, genres)
+}
+
+/// Les genres de la bibliothèque, un par nom canonique (`genre_key`), triés.
+/// Partagé avec l'arbre MusicBrainz (#6001).
+pub(super) fn genres_de_la_bibliotheque(state: &AppState) -> Vec<String> {
     // Collect all individual genres from both the `genres` JSON array
     // and the legacy `genre` text column (splitting multi-genre strings).
     let raw_genres: Vec<(Option<String>, Option<String>)> = state
@@ -66,7 +73,10 @@ pub(super) async fn genre_tree(State(state): State<AppState>) -> Result<Json<Val
         .into_iter()
         .filter(|g| seen_lc.insert(tune_core::metadata::genre_key(g)))
         .collect();
+    genres
+}
 
+fn genre_tree_de(state: &AppState, genres: Vec<String>) -> Result<Json<Value>, AppError> {
     // Load saved tree from settings (persisted by PUT /genre-tree).
     // If a saved tree exists, use it as the base and add any new genres
     // found in the library that aren't already in any branch.

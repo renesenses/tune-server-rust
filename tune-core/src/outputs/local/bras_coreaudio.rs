@@ -422,6 +422,8 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
     );
     let demande = DemandeDOuverture {
         spec,
+        // #6230 — un transport exclusif ouvre au format de la source.
+        voies_de_la_matrice: None,
         device_name: &device_name,
         endpoint_id: None,
         origin_host: None,

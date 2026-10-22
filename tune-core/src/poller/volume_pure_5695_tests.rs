@@ -131,9 +131,25 @@ impl Banc {
         .await
     }
 
-    async fn commandes_depuis(&self, deja: usize) -> Vec<f64> {
+    pub(super) async fn commandes_depuis(&self, deja: usize) -> Vec<f64> {
         self.avec_mock(async |m| m.volume_calls().await[deja..].to_vec())
             .await
+    }
+
+    /// Pause puis reprise par le VRAI orchestrateur, sur la sortie factice.
+    pub(super) async fn pause_puis_reprise(&self) {
+        let orch = self.poller.orchestrator.clone();
+        orch.pause(self.zone_id, Some(APPAREIL)).await.unwrap();
+        orch.resume(self.zone_id, Some(APPAREIL)).await.unwrap();
+    }
+
+    /// Le volume de la zone en mémoire (celui que le client lit).
+    pub(super) async fn volume_en_memoire(&self) -> f64 {
+        self.poller.playback.get_state(self.zone_id).await.volume
+    }
+
+    pub(super) fn base(&self) -> Arc<dyn crate::db::backend::DbBackend> {
+        self.db.clone()
     }
 
     /// Un tour de la vraie boucle, l'appareil en lecture qui avance.
@@ -160,6 +176,13 @@ impl Banc {
             .playback
             .set_volume(self.zone_id, pour_cent / 100.0)
             .await;
+    }
+
+    /// Pose un réglage clé/valeur (#6541 : les limites de volume).
+    pub(super) fn poser_reglage(&self, cle: &str, valeur: &str) {
+        SettingsRepo::with_backend(self.db.clone())
+            .set(cle, valeur)
+            .unwrap();
     }
 
     pub(super) fn volume_en_base(&self) -> f64 {

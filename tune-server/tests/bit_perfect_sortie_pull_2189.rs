@@ -148,7 +148,8 @@ fn armer_l_eq(state: &AppState, zone_id: i64) {
 async fn chemin_du_signal(app: &axum::Router, zone_id: i64) -> Value {
     let (status, fiche) = envoyer(
         app,
-        Request::get(format!("/api/v1/zones/{zone_id}"))
+        // Les assertions de description ci-dessous portent sur le français.
+        Request::get(format!("/api/v1/zones/{zone_id}?lang=fr"))
             .body(Body::empty())
             .unwrap(),
     )

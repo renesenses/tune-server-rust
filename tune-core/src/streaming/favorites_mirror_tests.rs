@@ -24,6 +24,15 @@ struct Compte {
     panne: bool,
     /// Journal des écritures reçues : `"add tracks 71"`, `"remove albums 9"`.
     appels: Vec<String>,
+    /// Jamais connecté (#6369) : `auth_status` le dit, `utilisable` suit.
+    deconnecte: bool,
+    /// #6461 — le service sait-il dire quelles playlists le compte suit ?
+    relit_playlists: bool,
+    /// La bibliothèque de playlists du compte : `id → editable` (`Some(true)`
+    /// possédée, `Some(false)` suivie, `None` auteur inconnu).
+    playlists: BTreeMap<String, Option<bool>>,
+    /// La lecture des playlists se déclare incomplète (#6461, relecture).
+    playlists_tronquees: bool,
 }
 
 struct ServiceSimule {
@@ -97,7 +106,7 @@ impl StreamingService for ServiceSimule {
     }
     async fn auth_status(&self) -> AuthStatus {
         AuthStatus {
-            authenticated: true,
+            authenticated: !self.compte.lock().unwrap().deconnecte,
             ..Default::default()
         }
     }
@@ -128,8 +137,37 @@ impl StreamingService for ServiceSimule {
     async fn get_playlist_tracks(&self, _id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         Err("hors sujet".into())
     }
+    async fn playlists_de_la_bibliotheque(&self) -> Option<Result<Vec<StreamPlaylist>, TuneError>> {
+        let (relit, tronquee) = {
+            let c = self.compte.lock().unwrap();
+            (c.relit_playlists, c.playlists_tronquees)
+        };
+        if !relit {
+            return None;
+        }
+        if tronquee {
+            return Some(Err("lecture incomplète simulée".into()));
+        }
+        Some(self.get_user_playlists().await)
+    }
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
-        Ok(Vec::new())
+        let c = self.compte.lock().unwrap();
+        if c.panne {
+            return Err("panne réseau simulée".into());
+        }
+        Ok(c.playlists
+            .iter()
+            .map(|(id, editable)| StreamPlaylist {
+                id: id.clone(),
+                name: format!("playlist {id}"),
+                description: None,
+                cover_path: None,
+                track_count: 0,
+                owner: None,
+                editable: *editable,
+                covers: Vec::new(),
+            })
+            .collect())
     }
     /// La projection sérialisée qu'un vrai connecteur rend (`source_id`,
     /// `artist_name`, `album_title`) — celle que la reprise sait lire.
@@ -173,6 +211,9 @@ impl StreamingService for ServiceSimule {
             return Err("panne réseau simulée".into());
         }
         c.appels.push(format!("add {fav_type} {item_id}"));
+        if fav_type == "playlists" {
+            c.playlists.insert(item_id.into(), Some(false));
+        }
         c.favoris.entry(fav_type.into()).or_default().insert(
             item_id.into(),
             (
@@ -190,6 +231,9 @@ impl StreamingService for ServiceSimule {
             return Err("panne réseau simulée".into());
         }
         c.appels.push(format!("remove {fav_type} {item_id}"));
+        if fav_type == "playlists" && c.playlists.get(item_id) == Some(&Some(false)) {
+            c.playlists.remove(item_id);
+        }
         if let Some(m) = c.favoris.get_mut(fav_type) {
             m.remove(item_id);
         }
@@ -703,5 +747,259 @@ async fn pg_5997_favoris_miroir_sur_postgresql() {
                  ALTER TABLE streaming_favorites ALTER COLUMN profile_id SET DEFAULT 1",
             )
             .unwrap();
+    }
+}
+
+/// #6369 — un service en miroir jamais connecté (Tidal, toujours au
+/// registre) n'est pas un échec : Qobuz rafraîchi sans erreur et Tidal non
+/// connecté publient `ok`, pas `echec`. Fil 2279 : le bandeau « le dernier
+/// rafraîchissement a échoué » restait affiché en permanence.
+#[tokio::test]
+async fn un_service_non_connecte_n_est_pas_un_echec_6369() {
+    let (backend, profils, _dir) = base(1);
+    let pid = profils[0];
+    let (qobuz, _) = ServiceSimule::nouveau("miroir-6369-qobuz");
+    let (tidal, compte_tidal) = ServiceSimule::nouveau("miroir-6369-tidal");
+    compte_tidal.lock().unwrap().deconnecte = true;
+
+    let bilan = rafraichir(&qobuz, &backend, pid).await;
+    assert_eq!(bilan.echecs, 0, "{bilan:?}");
+    let bilan = rafraichir(&tidal, &backend, pid).await;
+    assert_eq!(bilan.echecs, 0, "rien n'a été tenté : {bilan:?}");
+    assert_eq!(etat("miroir-6369-tidal").statut, STATUT_NON_CONNECTE);
+
+    let noms = vec![
+        "miroir-6369-qobuz".to_string(),
+        "miroir-6369-tidal".to_string(),
+    ];
+    assert_eq!(
+        statut_global(&noms),
+        "ok",
+        "Tidal non connecté fait publier un échec alors que Qobuz s'est rafraîchi"
+    );
+    // Seul le service non connecté : « aucun service en miroir n'est connecté ».
+    assert_eq!(statut_global(&noms[1..]), "aucun");
+}
+
+/// #6369 — un service CONNECTÉ en panne reste un échec, même à côté d'un
+/// service non connecté.
+#[tokio::test]
+async fn une_panne_d_un_service_connecte_reste_un_echec_6369() {
+    let (backend, profils, _dir) = base(1);
+    let pid = profils[0];
+    let (qobuz, compte_qobuz) = ServiceSimule::nouveau("miroir-6369b-qobuz");
+    let (tidal, compte_tidal) = ServiceSimule::nouveau("miroir-6369b-tidal");
+    compte_tidal.lock().unwrap().deconnecte = true;
+    panne(&compte_qobuz, true);
+    rafraichir(&qobuz, &backend, pid).await;
+    rafraichir(&tidal, &backend, pid).await;
+    let noms = vec![
+        "miroir-6369b-qobuz".to_string(),
+        "miroir-6369b-tidal".to_string(),
+    ];
+    assert_eq!(statut_global(&noms), "echec");
+}
+
+// ---------------------------------------------------------------------------
+// #6461 — playlists suivies relues (FabienM, fil 2302, point 1)
+// ---------------------------------------------------------------------------
+
+fn bibliotheque_de_playlists(compte: &Arc<Mutex<Compte>>, playlists: &[(&str, Option<bool>)]) {
+    let mut c = compte.lock().unwrap();
+    c.relit_playlists = true;
+    for (id, editable) in playlists {
+        c.playlists.insert((*id).into(), *editable);
+    }
+}
+
+/// Témoin 6461-1 — une playlist éditoriale suivie chez le service est un
+/// favori de Tune ; une playlist possédée par le compte n'en est pas un.
+#[tokio::test]
+async fn une_playlist_suivie_chez_le_service_est_un_favori_la_sienne_non_6461() {
+    let (backend, profils, _dir) = base(1);
+    let (arc, compte) = ServiceSimule::nouveau("miroir-6461a");
+    bibliotheque_de_playlists(&compte, &[("edito", Some(false)), ("perso", Some(true))]);
+
+    let bilan = rafraichir(&arc, &backend, profils[0]).await;
+    assert_eq!(bilan.echecs, 0, "{bilan:?}");
+    assert_eq!(
+        liste(&backend, profils[0]),
+        vec![(
+            "miroir-6461a".into(),
+            "edito".into(),
+            Some(ETAT_SYNCHRO.into())
+        )],
+        "la playlist suivie doit porter le cœur, la playlist possédée non"
+    );
+}
+
+/// Témoin 6461-2 — retirer le cœur d'une playlist éditoriale dans Tune la
+/// sort de la bibliothèque du service ; le rafraîchissement suivant ne la
+/// fait pas revenir. Et une playlist que l'auditeur cesse de suivre dans
+/// l'application du service perd son cœur dans Tune.
+#[tokio::test]
+async fn retirer_le_coeur_d_une_playlist_editoriale_la_sort_de_la_bibliotheque_6461() {
+    let (backend, profils, _dir) = base(1);
+    let (arc, compte) = ServiceSimule::nouveau("miroir-6461b");
+    bibliotheque_de_playlists(&compte, &[("edito", Some(false)), ("autre", Some(false))]);
+    rafraichir(&arc, &backend, profils[0]).await;
+    assert_eq!(ids(&backend, profils[0]), vec!["autre", "edito"]);
+
+    let p = retirer(&arc, &backend, "playlist", "edito").await.unwrap();
+    assert_eq!(p, Propagation::Propage);
+    assert!(
+        !compte.lock().unwrap().playlists.contains_key("edito"),
+        "la playlist est restée dans la bibliothèque du service"
+    );
+    rafraichir(&arc, &backend, profils[0]).await;
+    assert_eq!(ids(&backend, profils[0]), vec!["autre"]);
+
+    // Retirée dans l'application du service.
+    compte.lock().unwrap().playlists.remove("autre");
+    let bilan = rafraichir(&arc, &backend, profils[0]).await;
+    assert_eq!(bilan.retires, 1, "{bilan:?}");
+    assert!(
+        ids(&backend, profils[0]).is_empty(),
+        "une playlist qui n'est plus suivie chez le service garde son cœur dans Tune"
+    );
+}
+
+/// Témoin 6461-3 — les prudences : une playlist possédée qui porte un cœur
+/// posé dans Tune n'est pas retirée ; une ligne d'avant la rc4 n'est pas
+/// poussée (aucun abonnement sans geste) ; une lecture dont un auteur manque
+/// ne retire rien.
+#[tokio::test]
+async fn les_playlists_relues_ne_retirent_ni_n_abonnent_sans_certitude_6461() {
+    let (backend, profils, _dir) = base(1);
+    let pid = profils[0];
+    let (arc, compte) = ServiceSimule::nouveau("miroir-6461c");
+    bibliotheque_de_playlists(&compte, &[("perso", Some(true)), ("suivie", Some(false))]);
+    ajouter(&arc, &backend, pid, &favori("playlist", "perso"))
+        .await
+        .unwrap();
+    // `ajouter` a « suivi » la playlist possédée chez le simulé : on rétablit
+    // ce que le service rend vraiment, une playlist à soi.
+    compte
+        .lock()
+        .unwrap()
+        .playlists
+        .insert("perso".into(), Some(true));
+    StreamingFavoritesRepo::with_backend(backend.clone())
+        .add(
+            pid,
+            "playlist",
+            "miroir-6461c",
+            "ancienne",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    compte.lock().unwrap().appels.clear();
+
+    let bilan = rafraichir(&arc, &backend, pid).await;
+    assert_eq!(bilan.retires, 0, "{bilan:?}");
+    assert_eq!(ids(&backend, pid), vec!["ancienne", "perso", "suivie"]);
+    assert!(
+        compte.lock().unwrap().appels.is_empty(),
+        "aucune écriture n'est due : {:?}",
+        compte.lock().unwrap().appels
+    );
+
+    // Auteur inconnu : la lecture est incertaine, rien n'est retiré même
+    // si « suivie » a disparu.
+    {
+        let mut c = compte.lock().unwrap();
+        c.playlists.remove("suivie");
+        c.playlists.insert("mystere".into(), None);
+    }
+    let bilan = rafraichir(&arc, &backend, pid).await;
+    assert_eq!(bilan.retires, 0, "{bilan:?}");
+    assert_eq!(bilan.echecs, 1, "{bilan:?}");
+    assert_eq!(ids(&backend, pid), vec!["ancienne", "perso", "suivie"]);
+}
+
+/// Témoin 6461-4 (relecture de #6616) — une lecture des playlists que le
+/// service déclare incomplète ne retire RIEN : sans cette garde, une liste
+/// tronquée retirerait le cœur de tout ce qui dépasse la coupe.
+#[tokio::test]
+async fn une_lecture_incomplete_des_playlists_ne_retire_rien_6461() {
+    let (backend, profils, _dir) = base(1);
+    let pid = profils[0];
+    let (arc, compte) = ServiceSimule::nouveau("miroir-6461d");
+    bibliotheque_de_playlists(&compte, &[("a", Some(false)), ("b", Some(false))]);
+    rafraichir(&arc, &backend, pid).await;
+    assert_eq!(ids(&backend, pid), vec!["a", "b"]);
+
+    {
+        let mut c = compte.lock().unwrap();
+        c.playlists.remove("b");
+        c.playlists_tronquees = true;
+    }
+    let bilan = rafraichir(&arc, &backend, pid).await;
+    assert_eq!(bilan.retires, 0, "{bilan:?}");
+    assert_eq!(bilan.echecs, 1, "{bilan:?}");
+    assert_eq!(
+        ids(&backend, pid),
+        vec!["a", "b"],
+        "une lecture incomplète a retiré des cœurs"
+    );
+}
+
+/// Témoin 6461-5 (relecture de #6616), de bout en bout : le VRAI connecteur
+/// Qobuz contre un Qobuz factice qui annonce 7 playlists et n'en sert que 3 —
+/// la coupe de `detail_pagine`. Aucune ligne `synchro` ne disparaît.
+#[tokio::test]
+async fn qobuz_tronque_aucune_playlist_synchro_ne_disparait_6461() {
+    use axum::{Json, Router};
+    let app = Router::new().fallback(|uri: axum::http::Uri| async move {
+        if uri.path().ends_with("/playlist/getUserPlaylists") {
+            Json(json!({
+                "user": {"id": 1234},
+                "playlists": {"offset": 0, "limit": 500, "total": 7, "items": [
+                    {"id": 11, "name": "Ma playlist", "owner": {"id": 1234, "name": "fabien"}},
+                    {"id": 22, "name": "Jazz Essentials", "owner": {"id": 2, "name": "Qobuz"}},
+                    {"id": 33, "name": "Classique", "owner": {"id": 2, "name": "Qobuz"}}
+                ]}
+            }))
+        } else {
+            Json(json!({}))
+        }
+    });
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("port libre");
+    let adresse = ecoute.local_addr().expect("adresse locale");
+    tokio::spawn(async move {
+        let _ = axum::serve(ecoute, app).await;
+    });
+    let svc: Box<dyn StreamingService> = Box::new(
+        crate::streaming::qobuz::QobuzService::connecte_a_base_forcee(format!("http://{adresse}")),
+    );
+    let arc: ServiceArc = Arc::new(RwLock::new(svc));
+
+    let (backend, profils, _dir) = base(2);
+    // « 44 » est suivie chez Qobuz mais au-delà de la coupe : la réponse
+    // tronquée ne la nomme pas.
+    for id in ["22", "33", "44"] {
+        ecrire_partout(
+            &backend,
+            &profils,
+            "qobuz",
+            &favori("playlist", id),
+            ETAT_SYNCHRO,
+            None,
+        )
+        .unwrap();
+    }
+    let bilan = rafraichir(&arc, &backend, profils[0]).await;
+    assert_eq!(bilan.retires, 0, "{bilan:?}");
+    for &pid in &profils {
+        assert_eq!(
+            ids(&backend, pid),
+            vec!["22", "33", "44"],
+            "une lecture tronquée de Qobuz a retiré des playlists synchro"
+        );
     }
 }

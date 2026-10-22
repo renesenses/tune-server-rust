@@ -39,6 +39,8 @@ pub mod references;
 pub mod relais;
 pub mod resolution;
 pub mod routes;
+pub mod suivi;
+pub mod vignettes;
 
 use std::sync::Arc;
 
@@ -77,6 +79,9 @@ pub struct HostServices {
     /// T4 (#5327) : l'état des zones, pour savoir si une zone joue encore le
     /// flux d'un contact quand elle tombe en erreur.
     pub playback: Arc<PlaybackManager>,
+    /// #6521 : le cache de pochettes du serveur, d'où sont tirées les
+    /// vignettes partagées avec le cercle (`artwork_cache_dir()` de l'hôte).
+    pub artwork_dir: std::path::PathBuf,
 }
 
 pub struct CirclePlugin {
@@ -85,6 +90,10 @@ pub struct CirclePlugin {
     tache: Option<tokio::task::JoinHandle<()>>,
     /// Construite au `setup` (il faut le bus).
     ecoute: Option<Arc<ecoute::Ecoute>>,
+    /// #6521 : la boucle des vignettes de pochettes.
+    vignettes: Option<tokio::task::JoinHandle<()>>,
+    /// #6688 : la boucle du suivi des playlists partagées.
+    suivi: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CirclePlugin {
@@ -94,6 +103,8 @@ impl CirclePlugin {
             pousseur: None,
             tache: None,
             ecoute: None,
+            vignettes: None,
+            suivi: None,
         }
     }
 }
@@ -160,20 +171,38 @@ impl TunePlugin for CirclePlugin {
             .sources_url()
             .inscrire(ecoute::SOURCE, ecoute.clone());
         self.ecoute = Some(ecoute.clone());
+        // #6521 : les vignettes des pochettes partagées avec le cercle.
+        let vignettes = Arc::new(vignettes::Vignettes::new(
+            self.services.backend.clone(),
+            self.services.artwork_dir.clone(),
+            tune_core::cloud::library_sync::CLOUD_LIBRARY_API,
+        ));
+        // #6688 : le suivi des playlists locales partagées avec un cercle.
+        let suivi = Arc::new(suivi::Suivi::new(relais.clone(), ctx.event_bus.clone()));
         ctx.register_router(
-            routes::router(relais, self.services.license.clone())
+            routes::router(relais.clone(), self.services.license.clone())
+                .merge(routes::router_des_vignettes(relais, vignettes.clone()))
                 .merge(rayons::router(pousseur.clone()))
                 .merge(playlists::router(collaboratif))
+                .merge(suivi::router(suivi.clone()))
                 .merge(ecoute::router(ecoute)),
         );
         // T3 (#5326) : tenir à jour les rayons cochés.
         self.tache = Some(tokio::spawn(pousseur.clone().tourner()));
         self.pousseur = Some(pousseur);
+        self.vignettes = Some(tokio::spawn(vignettes.tourner()));
+        self.suivi = Some(tokio::spawn(suivi.tourner()));
         Ok(())
     }
 
     async fn teardown(&mut self) -> Result<(), String> {
         if let Some(t) = self.tache.take() {
+            t.abort();
+        }
+        if let Some(t) = self.vignettes.take() {
+            t.abort();
+        }
+        if let Some(t) = self.suivi.take() {
             t.abort();
         }
         self.pousseur = None;

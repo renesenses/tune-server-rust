@@ -33,6 +33,11 @@ use crate::db::track_repo::TrackRepo;
 const LOT: Duration = Duration::from_millis(400);
 
 fn base_fichier(epreuve: &str) -> (crate::test_scratch::ScratchDir, Arc<dyn DbBackend>) {
+    let (dossier, db) = base_fichier_sqlite(epreuve);
+    (dossier, db)
+}
+
+fn base_fichier_sqlite(epreuve: &str) -> (crate::test_scratch::ScratchDir, Arc<SqliteDb>) {
     let dossier = crate::test_scratch::scratch_dir(&format!("ecrivains-lot-{epreuve}"));
     let chemin = dossier.join("tune-epreuve.db");
     let db = SqliteDb::open(&chemin.to_string_lossy()).expect("base de fichier");
@@ -254,20 +259,62 @@ fn pendant_un_long_lot(
 
 #[test]
 fn un_long_lot_cede_la_place_a_un_favori_entre_deux_fichiers() {
-    // 40 fichiers de 50 ms : un lot de 2 s. Le favori ne doit attendre que la
-    // fin du fichier en cours, pas celle du lot.
-    let (_d, db) = base_fichier("cession");
+    let (_d, sqlite) = base_fichier_sqlite("cession");
+    let db: Arc<dyn DbBackend> = sqlite.clone();
     let profils = ProfileRepo::with_backend(db.clone());
-    let attente = pendant_un_long_lot(&db, 40, Duration::from_millis(50), true, || {
-        profils.add_favorite(1, "album", 7).unwrap();
+    let (ouvert_tx, ouvert_rx) = mpsc::channel();
+    let (ceder_tx, ceder_rx) = mpsc::channel();
+    let (continuer_tx, continuer_rx) = mpsc::channel();
+    let db_lot = db.clone();
+    let lot = std::thread::spawn(move || {
+        db_lot.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for i in 0..40 {
+            let chemin = format!("/lot/{i}.flac");
+            db_lot
+                .execute(
+                    "INSERT INTO tracks (title, file_path) VALUES ('du lot', ?)",
+                    &[&chemin],
+                )
+                .unwrap();
+            if i == 2 {
+                ouvert_tx.send(()).unwrap();
+                ceder_rx.recv().unwrap();
+                db_lot.ceder_aux_ecrivains();
+                // Ne pas finir le lot avant que le test ait observé le favori.
+                continuer_rx.recv().unwrap();
+            }
+        }
+        db_lot.execute_batch("COMMIT").unwrap();
     });
-    eprintln!(
-        "attente du favori, lot qui cède : {} ms",
-        attente.as_millis()
+    ouvert_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    let (favori_tx, favori_rx) = mpsc::channel();
+    let db_favori = db.clone();
+    let favori = std::thread::spawn(move || {
+        ProfileRepo::with_backend(db_favori)
+            .add_favorite(1, "album", 7)
+            .unwrap();
+        favori_tx.send(()).unwrap();
+    });
+    let limite = Instant::now() + Duration::from_secs(15);
+    while sqlite.connection().ecrivains_du_lot_en_attente_pour_essai() == 0
+        && Instant::now() < limite
+    {
+        std::thread::yield_now();
+    }
+    let en_attente = sqlite.connection().ecrivains_du_lot_en_attente_pour_essai();
+    ceder_tx.send(()).unwrap();
+    let avant_fin = favori_rx.recv_timeout(Duration::from_secs(15)).is_ok();
+    // Toujours libérer les fils, même lors de la contre-épreuve.
+    continuer_tx.send(()).unwrap();
+    lot.join().unwrap();
+    favori.join().unwrap();
+    assert!(
+        en_attente > 0,
+        "le favori doit attendre hors de la transaction du lot"
     );
     assert!(
-        attente < Duration::from_millis(400),
-        "le favori a attendu {attente:?} : le lot ne lui a pas cédé la place"
+        avant_fin,
+        "le lot ne cède pas : le favori ne finit qu'après le COMMIT final"
     );
     assert!(profils.is_favorite(1, "album", 7).unwrap());
     let lignes = db

@@ -123,10 +123,111 @@ fn version_du_temoin_asio(sentinel: &Path) -> Option<String> {
 /// Chemin du témoin : à côté du journal, donc `%LOCALAPPDATA%\TuneServer` sous
 /// Windows — le dossier que l'on demande déjà aux testeurs d'ouvrir.
 fn asio_warm_sentinel_path() -> PathBuf {
+    dans_le_dossier_du_journal(ASIO_WARM_SENTINEL)
+}
+
+fn dans_le_dossier_du_journal(nom: &str) -> PathBuf {
     crate::config::default_log_file_path()
         .parent()
-        .map(|dir| dir.join(ASIO_WARM_SENTINEL))
-        .unwrap_or_else(|| PathBuf::from(ASIO_WARM_SENTINEL))
+        .map(|dir| dir.join(nom))
+        .unwrap_or_else(|| PathBuf::from(nom))
+}
+
+/// #6452 — le témoin de démarrage inachevé, dans le même dossier que
+/// `asio-warm.pending` (`%LOCALAPPDATA%\TuneServer` sous Windows).
+///
+/// Ce n'est pas `asio-warm.pending` : celui-là n'entoure que le préchauffage
+/// ASIO et il est retiré dès que ce balayage revient (0,45 s chez
+/// Jean-Pierre le 20/10), bien avant l'étape qui retient le démarrage. Il dit
+/// « un pilote a emporté le processus », pas « le démarrage n'est pas allé
+/// jusqu'à `listening` ». Voir `tune_core::demarrage_inacheve`.
+pub(crate) fn chemin_du_temoin_de_demarrage() -> PathBuf {
+    dans_le_dossier_du_journal(tune_core::demarrage_inacheve::TEMOIN)
+}
+
+/// Pose le témoin au tout début du démarrage. Rend `true` s'il était déjà là :
+/// le démarrage précédent n'a pas atteint `listening`.
+pub(crate) fn poser_le_temoin_de_demarrage() -> bool {
+    let chemin = chemin_du_temoin_de_demarrage();
+    let (precedent_inacheve, ecrit) = tune_core::demarrage_inacheve::poser_le_temoin(&chemin);
+    match ecrit {
+        Ok(()) => info!(
+            temoin = %chemin.display(),
+            precedent_inacheve,
+            "demarrage_temoin_pose"
+        ),
+        Err(error) => warn!(
+            temoin = %chemin.display(),
+            precedent_inacheve,
+            %error,
+            "demarrage_temoin_non_pose — un blocage de ce démarrage ne sera pas vu au suivant"
+        ),
+    }
+    precedent_inacheve
+}
+
+/// La décision de #6452 pour CET état, sans rien armer : `(décision, hôte
+/// enregistré)`. `on_windows` en paramètre, pour être jugée hors Windows.
+pub(crate) fn hote_de_demarrage_selon(
+    state: &AppState,
+    precedent_inacheve: bool,
+    on_windows: bool,
+) -> (tune_core::demarrage_inacheve::HoteDeCeDemarrage, String) {
+    let demande = state.stored_audio_backend();
+    let decision = tune_core::demarrage_inacheve::decider(precedent_inacheve, &demande, on_windows);
+    (decision, demande)
+}
+
+/// Applique le témoin : sous le repli, CE démarrage se fait sur l'hôte par
+/// défaut, la base garde le choix, le journal et la Santé du serveur le disent.
+///
+/// Appelé après `AppState::new` (le choix est en base) et AVANT
+/// `init_state`, qui lance le préchauffage ASIO.
+pub(crate) async fn appliquer_le_temoin_de_demarrage(state: &AppState, precedent_inacheve: bool) {
+    use tune_core::demarrage_inacheve::{DETAIL, HOTE_PAR_DEFAUT, HoteDeCeDemarrage};
+    let (decision, demande) =
+        hote_de_demarrage_selon(state, precedent_inacheve, cfg!(target_os = "windows"));
+    match decision {
+        HoteDeCeDemarrage::RepliHoteParDefaut => {
+            tune_core::demarrage_inacheve::activer_le_repli(&demande);
+            warn!(
+                hote_demande = %demande,
+                hote_retenu = HOTE_PAR_DEFAUT,
+                temoin = %chemin_du_temoin_de_demarrage().display(),
+                "demarrage_precedent_inacheve_repli_hote_par_defaut — le démarrage précédent \
+                 n'a pas atteint `listening` avec cet hôte : celui-ci se fait sur l'hôte par \
+                 défaut, sans modifier le choix enregistré. S'il aboutit, le suivant retentera \
+                 l'hôte choisi (#6452)."
+            );
+            state
+                .health_monitor
+                .signaler(
+                    tune_core::health_monitor::AlertLevel::Warning,
+                    "audio_local",
+                    DETAIL,
+                )
+                .await;
+        }
+        HoteDeCeDemarrage::Demande if precedent_inacheve => info!(
+            hote = %demande,
+            "demarrage_precedent_inacheve_hote_conserve — aucun hôte plus sûr où se replier"
+        ),
+        HoteDeCeDemarrage::Demande => {}
+    }
+}
+
+/// Retire le témoin : le serveur écoute, le démarrage a abouti.
+pub(crate) fn retirer_le_temoin_de_demarrage() {
+    let chemin = chemin_du_temoin_de_demarrage();
+    match tune_core::demarrage_inacheve::retirer_le_temoin(&chemin) {
+        Ok(()) => info!(temoin = %chemin.display(), "demarrage_temoin_retire"),
+        Err(error) => warn!(
+            temoin = %chemin.display(),
+            %error,
+            "demarrage_temoin_non_retire — le prochain démarrage se croira précédé d'un \
+             démarrage inachevé"
+        ),
+    }
 }
 
 fn asio_warm_status_at(sentinel: &Path, disabled_by_env: bool, supported: bool) -> AsioWarmStatus {
@@ -328,12 +429,35 @@ impl Drop for FinDuPrechauffageAsio {
     }
 }
 
+/// #6452 — sous le repli de démarrage, ce processus ne charge aucun pilote
+/// ASIO : ni préchauffage, ni liste à la demande (réglages, diagnostics). Le
+/// parc local est un repli par construction : le refus d'une zone nommée sous
+/// ASIO peut donc dire pourquoi. Rend `true` quand le repli est armé.
+#[cfg(feature = "local-audio")]
+fn ecarter_asio_sous_le_repli_de_demarrage() -> bool {
+    if tune_core::demarrage_inacheve::repli_actif().is_none() {
+        return false;
+    }
+    tune_core::outputs::local::block_asio_device_enumeration(
+        tune_core::outputs::asio_blocage_4556::MotifDeBlocage::DemarrageInacheve,
+        Some(&chemin_du_temoin_de_demarrage().display().to_string()),
+    );
+    tune_core::outputs::asio_blocage_4556::noter_repli_wasapi_apres_blocage();
+    info!("asio_warm_scan_skipped_after_unfinished_boot");
+    true
+}
+
 /// Lance le préchauffage du cache ASIO, protégé par le témoin de plantage.
 #[cfg(feature = "local-audio")]
 fn spawn_asio_warm_scan() {
     // Sans hôte ASIO compilé, ne pas bloquer le repli WASAPI d'une ancienne
     // préférence "asio", même si un témoin de crash existe encore (#4168).
     if !tune_core::outputs::local::asio_available() {
+        return;
+    }
+
+    // #6452 — sous le repli de démarrage, aucun pilote ASIO n'est chargé.
+    if ecarter_asio_sous_le_repli_de_demarrage() {
         return;
     }
 
@@ -453,6 +577,15 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
 
     reset_zones_offline(state);
     marquer_enrichissements_interrompus(state);
+    // #6255 — le détecteur de bruit des lecteurs réseau, éteint seulement
+    // par un « non » explicite.
+    tune_core::http::bruit_reseau::regler(tune_core::http::bruit_reseau::resoudre(
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .get(tune_core::http::bruit_reseau::CLE_REGLAGE)
+            .ok()
+            .flatten()
+            .as_deref(),
+    ));
     ouvrir_le_registre_des_executions(state);
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
@@ -499,10 +632,14 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
         });
     }
     deduplicate_radios(state);
+    // #6500 — les stations du rayon Radio d'un autre Tune, rangées dans
+    // `tracks` par une indexation UPnP d'avant le correctif : retirées (sauf
+    // celles qu'un favori ou une playlist référence). Idempotente : une
+    // lecture et rien d'écrit sur une base déjà passée. Avant la boucle de
+    // synchronisation, qui ne les ramènera plus.
+    tune_core::db::radios_indexees_upnp_6500::passe_journalisee(&state.backend);
     restore_zone_volumes(state).await;
-    restore_playback_positions(state).await;
-    restore_queues(state, config);
-    restore_queue_metadata(state, config).await;
+    restaurer_la_lecture(state, config).await;
     restore_oaat_groups(state).await;
     persist_initial_settings(state, config);
     resolve_ytdlp(state).await;
@@ -519,6 +656,8 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
         // Re-probe auto-discovered renderers whose lazy SSDP responder won't
         // resurface them after a restart (Cyrus Stream X2, #1126).
         crate::discovery_setup::reregister_known_renderers(&state_clone).await;
+        // #4626 — les sorties prêtées par les agents Tune appairés.
+        crate::agent_tune::maitre::reinscrire_les_agents(&state_clone).await;
     });
 
     // Re-probe auto-discovered DLNA renderers from their persisted LOCATION,
@@ -941,6 +1080,13 @@ fn recalculer_les_compilations(state: &AppState) {
 /// JAMAIS un favori introuvable — un volume pas encore monté ou un scan à
 /// venir peut encore le ramener ; seule la passe post-scan complet supprime.
 fn reconcile_favorites(state: &AppState) {
+    // #6179 — les lignes de playlist introuvables : rattachées à leur piste
+    // si elle est là, conservées sinon. Jamais supprimées.
+    tune_core::db::playlists_reconcile::reconcilier_et_journaliser(
+        state.backend.clone(),
+        true,
+        "demarrage",
+    );
     let reconciler = tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(
         state.backend.clone(),
     );
@@ -1156,8 +1302,18 @@ async fn restore_queue_metadata(state: &AppState, config: &TuneConfig) {
         };
         state.playback.set_repeat(zone_id, repeat).await;
 
-        // Restore shuffle
-        state.playback.set_shuffle(zone_id, snap.shuffle).await;
+        // Restore shuffle — #6526 : la file en base est déjà l'ordre joué si
+        // l'instantané vient d'un serveur qui mélange la file ; sinon (ancien
+        // tirage caché, perdu) la suite est mélangée maintenant.
+        tune_core::playback::melange::restaurer_au_demarrage(
+            &state.backend,
+            &state.playback,
+            zone_id,
+            snap.shuffle,
+            snap.melange_dans_la_file,
+            snap.ordre_d_origine.clone(),
+        )
+        .await;
 
         info!(
             zone_id,
@@ -1319,6 +1475,155 @@ async fn restore_playback_positions(state: &AppState) {
                 "playback_position_restored"
             );
         }
+    }
+}
+
+/// La lecture de chaque zone telle que l'arrêt du serveur l'a laissée : piste
+/// en cours, position, file. Une seule fonction pour que les tests passent par
+/// le même enchaînement que `init_state` (#6380).
+async fn restaurer_la_lecture(state: &AppState, config: &TuneConfig) {
+    restore_playback_positions(state).await;
+    restore_queues(state, config);
+    restore_queue_metadata(state, config).await;
+    // #6380 — APRÈS la file : la piste de service se retrouve dans les lignes
+    // que `restore_queues` vient d'assurer, et sa position dans la file
+    // remplace celle de l'instantané.
+    restore_service_track_positions(state).await;
+}
+
+/// #6380 — la piste en cours d'une zone quand elle vient d'un SERVICE.
+///
+/// Sandro, fil 2284 : album Qobuz en file, serveur redémarré, et l'interface
+/// annonce « Aucune lecture en cours » alors que les 5 lignes de la file sont
+/// en base. `restore_playback_positions` ne sait rendre qu'une piste de
+/// BIBLIOTHÈQUE (`last_track_id`) ; une piste Qobuz, Tidal, Deezer… n'a que
+/// `last_track_source` + `last_track_source_id`, et elle était ignorée.
+///
+/// La fiche vient de la ligne de file qui porte ce `source_id` : titre,
+/// artiste, album, pochette, durée y sont déjà. Aucun appel au service ici —
+/// le démarrage ne doit pas attendre Qobuz, et un service déconnecté ne doit
+/// pas faire disparaître la piste : son erreur viendra à la lecture.
+///
+/// Même état que pour une piste locale (`PlaybackManager::restore_position`) :
+/// zone arrêtée, piste et position tenues, reprise armée. Rien ne joue. Un
+/// `Paused` serait faux ici : « Reprendre » enverrait `resume` à un renderer
+/// qui n'a rien chargé, alors que l'état arrêté passe par le chemin « Lecture
+/// après arrêt », qui relance la piste à `pending_resume_ms`.
+///
+/// La piste absente de la file (file vidée, ou ligne retirée) n'est pas
+/// restaurée : sans la ligne, on n'a rien d'honnête à afficher sans appeler
+/// le service.
+async fn restore_service_track_positions(state: &AppState) {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let queue_repo =
+        tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(state.backend.clone());
+    let Ok(zones) = zone_repo.list() else { return };
+    for zone in &zones {
+        let Some(zone_id) = zone.id else { continue };
+        // Le chemin local (et la radio) reste à `restore_playback_positions`.
+        if zone.last_track_id.is_some() {
+            continue;
+        }
+        let Some(source) = zone.last_track_source.as_deref() else {
+            continue;
+        };
+        if matches!(source, "local" | "radio" | "") {
+            continue;
+        }
+        let Some(source_id) = zone
+            .last_track_source_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let actuel = state.playback.get_state(zone_id).await;
+        if actuel.now_playing.is_some() {
+            continue;
+        }
+        let entries = queue_repo.get_ordered(zone_id).unwrap_or_default();
+        let Some(entry) =
+            ligne_de_la_piste_de_service(&entries, source, source_id, actuel.queue_position)
+        else {
+            info!(
+                zone_id,
+                zone_name = %zone.name,
+                source,
+                queue_len = entries.len(),
+                "playback_position_not_restored_service_track_not_in_queue"
+            );
+            continue;
+        };
+        let np = now_playing_de_la_ligne_de_service(entry, source);
+        let clamped_pos = if np.duration_ms > 0 {
+            zone.last_position_ms
+                .min(np.duration_ms.saturating_sub(1000))
+        } else {
+            zone.last_position_ms
+        };
+        let dur = np.duration_ms;
+        // La position dans la file : celle de la ligne, pour que la piste
+        // suivante soit la bonne à la fin de celle-ci.
+        state
+            .playback
+            .update_queue_info(zone_id, entry.position, entries.len() as i64)
+            .await;
+        state
+            .playback
+            .restore_position(zone_id, clamped_pos.max(0), np)
+            .await;
+        info!(
+            zone_id,
+            zone_name = %zone.name,
+            position_ms = clamped_pos,
+            original_ms = zone.last_position_ms,
+            duration_ms = dur,
+            source,
+            queue_position = entry.position,
+            "playback_position_restored"
+        );
+    }
+}
+
+/// La ligne de file qui porte la piste de service enregistrée. Une piste peut
+/// figurer deux fois : la ligne courante d'abord, puis celle à la position de
+/// file restaurée, puis la première.
+fn ligne_de_la_piste_de_service<'a>(
+    entries: &'a [tune_core::db::play_queue_repo::QueueEntry],
+    source: &str,
+    source_id: &str,
+    position_restauree: i64,
+) -> Option<&'a tune_core::db::play_queue_repo::QueueEntry> {
+    let candidates: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            e.track_id.is_none()
+                && e.source_id.as_deref() == Some(source_id)
+                && e.source.as_deref().is_none_or(|s| s == source)
+        })
+        .collect();
+    candidates
+        .iter()
+        .find(|e| e.is_current)
+        .or_else(|| candidates.iter().find(|e| e.position == position_restauree))
+        .or_else(|| candidates.first())
+        .copied()
+}
+
+fn now_playing_de_la_ligne_de_service(
+    entry: &tune_core::db::play_queue_repo::QueueEntry,
+    source: &str,
+) -> tune_core::playback::NowPlaying {
+    tune_core::playback::NowPlaying {
+        track_id: None,
+        title: entry.title.clone().unwrap_or_default(),
+        artist_name: entry.artist_name.clone(),
+        album_title: entry.album_title.clone(),
+        cover_path: entry.cover_path.clone(),
+        duration_ms: entry.duration_ms.unwrap_or(0).max(0),
+        source: source.to_string(),
+        source_id: entry.source_id.clone(),
+        ..Default::default()
     }
 }
 
@@ -1774,7 +2079,7 @@ pub(crate) struct SortieCandidate<'a> {
 /// Sur CoreAudio et WASAPI, la sortie système est un vrai périphérique : la
 /// question ne s'y pose pas, et la règle ne s'y applique pas.
 #[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
-fn defaut_alsa_logiciel(endpoint_id: &str) -> bool {
+pub(crate) fn defaut_alsa_logiciel(endpoint_id: &str) -> bool {
     use tune_core::outputs::pseudo_peripherique_alsa::{greffon_alsa, pcm_alsa};
     let Some((hote, _)) = endpoint_id.split_once(':') else {
         return false;
@@ -2082,6 +2387,27 @@ pub(crate) async fn enregistrer_les_sorties_locales(
     // règle propre — `local_zone_action` autorise la sortie système par
     // défaut, c'est le sens de #1770 — mais il ne relit plus le réglage
     // lui-même.
+    // #5870 — sur Tune OS, une installation existante dont la zone
+    // automatique est restée sur le greffon `default` (dmix, 48 kHz) passe,
+    // une seule fois, sur le `hw:` de l'unique DAC USB. Avant le calcul de
+    // la zone automatique : `default` n'ayant alors plus de zone, celle-ci
+    // vise le DAC, qui a désormais la sienne — aucune zone neuve.
+    {
+        let sorties_5870: Vec<crate::bascule_tune_os_5870::Sortie<'_>> = devices
+            .iter()
+            .map(|dev| crate::bascule_tune_os_5870::Sortie {
+                nom: dev.name.as_str(),
+                endpoint_id: dev.endpoint_id.as_str(),
+                est_le_defaut: dev.is_default,
+            })
+            .collect();
+        crate::bascule_tune_os_5870::appliquer(
+            &zone_repo,
+            &tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone()),
+            crate::routes::appliance::is_appliance(),
+            &sorties_5870,
+        );
+    }
     let auto_create = zone_repo.zone_auto_create_autorise();
     // Un backend est censé marquer une seule sortie par défaut. `find`
     // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
@@ -4611,5 +4937,296 @@ mod tests_oubli_2145 {
         );
         // Sans identifiant, on ne sait pas : on continue comme avant.
         assert!(ligne_de_partage_existe(&etat, None));
+    }
+}
+
+#[cfg(test)]
+mod restauration_piste_de_service_6380_tests {
+    //! #6380 (Sandro, fil 2284) — au redémarrage, la piste en cours d'une zone
+    //! revient aussi quand elle vient d'un service.
+    //!
+    //! Chaque test passe par `restaurer_la_lecture`, l'enchaînement même
+    //! qu'appelle `init_state`. Base `:memory:`, aucun service connecté, aucun
+    //! appel réseau : c'est aussi la preuve que la piste se présente quand le
+    //! service n'est pas joignable.
+    use super::*;
+    use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::playback::PlayState;
+
+    const DUREE: i64 = 300_000;
+    const POSITION: i64 = 87_000;
+
+    fn etat() -> (AppState, TuneConfig, tempfile::TempDir) {
+        let dossier = tempfile::tempdir().unwrap();
+        let config = TuneConfig {
+            db_path: dossier.path().join("tune.db").to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        (state, config, dossier)
+    }
+
+    /// Une zone et sa file Qobuz de 5 titres, telles que la base les garde
+    /// d'une session à l'autre ; le titre `courant` (index) est la ligne
+    /// courante.
+    fn zone_et_file_qobuz(state: &AppState, courant: i64) -> i64 {
+        let zone_id = ZoneRepo::with_backend(state.backend.clone())
+            .create("Zone 1", Some("dlna"), Some("dlna:diretta"))
+            .unwrap();
+        let file = PlayQueueRepo::with_backend(state.backend.clone());
+        let lignes: Vec<QueueInput> = (1..=5)
+            .map(|n| QueueInput::Streaming {
+                source: "qobuz".into(),
+                source_id: format!("qobuz-{n}"),
+                title: format!("Titre {n}"),
+                artist: "No-Man".into(),
+                album: Some("Returning".into()),
+                cover_url: Some(format!("https://exemple.invalid/pochette-{n}.jpg")),
+                duration_ms: DUREE,
+                track_number: Some(n),
+                disc_number: Some(1),
+                album_ref: Some("album-1".into()),
+                artist_ref: None,
+            })
+            .collect();
+        file.append(zone_id, &lignes).unwrap();
+        file.set_current_pos(zone_id, courant).unwrap();
+        zone_id
+    }
+
+    /// LE cas de Sandro : file Qobuz de 5 titres, le 2e en cours à 87 s.
+    #[tokio::test]
+    async fn la_piste_qobuz_en_cours_revient_a_sa_position_sans_jouer() {
+        let (state, config, _d) = etat();
+        let zone_id = zone_et_file_qobuz(&state, 1);
+        ZoneRepo::with_backend(state.backend.clone())
+            .save_playback_position(zone_id, POSITION, None, Some("qobuz"), Some("qobuz-2"))
+            .unwrap();
+
+        restaurer_la_lecture(&state, &config).await;
+
+        let zone = state.playback.get_state(zone_id).await;
+        let np = zone
+            .now_playing
+            .as_ref()
+            .expect("« Aucune lecture en cours » alors que la file est là (#6380)");
+        assert_eq!(np.title, "Titre 2");
+        assert_eq!(np.source, "qobuz");
+        assert_eq!(np.source_id.as_deref(), Some("qobuz-2"));
+        assert_eq!(np.track_id, None);
+        assert_eq!(np.artist_name.as_deref(), Some("No-Man"));
+        assert_eq!(np.album_title.as_deref(), Some("Returning"));
+        assert_eq!(
+            np.cover_path.as_deref(),
+            Some("https://exemple.invalid/pochette-2.jpg")
+        );
+        assert_eq!(np.duration_ms, DUREE);
+        assert_ne!(zone.state, PlayState::Playing, "rien ne doit repartir seul");
+        assert_eq!(zone.state, PlayState::Stopped);
+        assert_eq!(zone.position_ms, POSITION);
+        assert_eq!(
+            zone.pending_resume_ms,
+            Some(POSITION),
+            "reprise armée à 87 s"
+        );
+        assert_eq!(zone.queue_position, 1, "le 2e titre de la file");
+        assert_eq!(zone.queue_length, 5);
+    }
+
+    /// Le chemin local ne change pas : piste de bibliothèque, même état.
+    #[tokio::test]
+    async fn la_piste_locale_revient_comme_avant() {
+        let (state, config, _d) = etat();
+        state
+            .backend
+            .execute(
+                "INSERT INTO tracks (id, title, duration_ms, file_path) \
+                 VALUES (77, 'Piste locale', 300000, '/musique/piste.flac')",
+                &[],
+            )
+            .unwrap();
+        let zones = ZoneRepo::with_backend(state.backend.clone());
+        let zone_id = zones.create("Salon", None, None).unwrap();
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .set_queue(zone_id, &[77])
+            .unwrap();
+        zones
+            .save_playback_position(zone_id, POSITION, Some(77), Some("local"), None)
+            .unwrap();
+
+        restaurer_la_lecture(&state, &config).await;
+
+        let zone = state.playback.get_state(zone_id).await;
+        let np = zone.now_playing.as_ref().expect("piste locale restaurée");
+        assert_eq!(np.track_id, Some(77));
+        assert_eq!(np.title, "Piste locale");
+        assert_eq!(np.source, "local");
+        assert_eq!(zone.state, PlayState::Stopped);
+        assert_eq!(zone.position_ms, POSITION);
+        assert_eq!(zone.pending_resume_ms, Some(POSITION));
+    }
+
+    /// Une piste de service absente de la file : rien à présenter sans appeler
+    /// le service, donc rien n'est inventé — et la file, elle, reste là.
+    #[tokio::test]
+    async fn une_piste_de_service_absente_de_la_file_n_est_pas_inventee() {
+        let (state, config, _d) = etat();
+        let zone_id = zone_et_file_qobuz(&state, 0);
+        ZoneRepo::with_backend(state.backend.clone())
+            .save_playback_position(zone_id, POSITION, None, Some("qobuz"), Some("qobuz-999"))
+            .unwrap();
+
+        restaurer_la_lecture(&state, &config).await;
+
+        let zone = state.playback.get_state(zone_id).await;
+        assert!(zone.now_playing.is_none());
+        assert_eq!(zone.pending_resume_ms, None);
+        assert_eq!(zone.state, PlayState::Stopped);
+        assert_eq!(
+            PlayQueueRepo::with_backend(state.backend.clone())
+                .count_all(zone_id)
+                .unwrap(),
+            5
+        );
+    }
+
+    /// Contre-épreuve : la ligne est choisie par son `source_id`, pas par la
+    /// ligne courante. Ici la ligne courante est le 1er titre, mais c'est le
+    /// 4e qui jouait ; c'est lui qui revient, à sa place dans la file. Et une
+    /// AUTRE source portant le même identifiant n'est pas prise pour lui.
+    #[tokio::test]
+    async fn la_ligne_restauree_est_celle_de_la_piste_enregistree() {
+        let (state, config, _d) = etat();
+        let zone_id = zone_et_file_qobuz(&state, 0);
+        ZoneRepo::with_backend(state.backend.clone())
+            .save_playback_position(zone_id, POSITION, None, Some("qobuz"), Some("qobuz-4"))
+            .unwrap();
+        restaurer_la_lecture(&state, &config).await;
+        let zone = state.playback.get_state(zone_id).await;
+        assert_eq!(
+            zone.now_playing.as_ref().map(|np| np.title.as_str()),
+            Some("Titre 4")
+        );
+        assert_eq!(zone.queue_position, 3);
+
+        let (state, config, _d) = etat();
+        let zone_id = zone_et_file_qobuz(&state, 1);
+        ZoneRepo::with_backend(state.backend.clone())
+            .save_playback_position(zone_id, POSITION, None, Some("tidal"), Some("qobuz-2"))
+            .unwrap();
+        restaurer_la_lecture(&state, &config).await;
+        assert!(
+            state
+                .playback
+                .get_state(zone_id)
+                .await
+                .now_playing
+                .is_none(),
+            "une piste Tidal ne se restaure pas sur une ligne Qobuz"
+        );
+    }
+}
+
+/// #6452 — le témoin de démarrage inachevé, câblé sur l'état du serveur.
+#[cfg(test)]
+mod temoin_de_demarrage_6452_tests {
+    use super::*;
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::demarrage_inacheve::{HOTE_PAR_DEFAUT, HoteDeCeDemarrage};
+
+    /// Ce qu'écrit le choix d'ASIO dans les réglages (#4184).
+    fn etat_avec_asio() -> AppState {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let reglages = SettingsRepo::with_backend(state.backend.clone());
+        reglages.set("local_audio_backend", "asio").unwrap();
+        reglages.set("local_exclusive_mode", "true").unwrap();
+        reglages
+            .set(tune_core::config::REGLAGE_EXCLUSIF_ARME_PAR_ASIO, "true")
+            .unwrap();
+        state
+    }
+
+    /// Témoin présent + ASIO : ce démarrage part sur l'hôte par défaut, en
+    /// partagé, et le choix en base est inchangé. C'est le test qui rougit
+    /// contre le code d'avant : `effective_audio_backend` rendait « asio »
+    /// à chaque démarrage, quoi qu'il soit arrivé au précédent.
+    #[test]
+    fn temoin_present_et_asio_demarrent_sur_l_hote_par_defaut() {
+        let state = etat_avec_asio();
+        let (decision, demande) = hote_de_demarrage_selon(&state, true, true);
+        assert_eq!(decision, HoteDeCeDemarrage::RepliHoteParDefaut);
+        assert_eq!(demande, "asio");
+
+        let repli = Some(demande.as_str());
+        assert_eq!(state.effective_audio_backend_selon(repli), HOTE_PAR_DEFAUT);
+        assert!(
+            !state.requested_exclusive_mode_selon(repli),
+            "l'écho de l'exclusif posé par le choix d'ASIO ne vaut rien sous le repli"
+        );
+        // Le choix enregistré n'a pas bougé.
+        let reglages = SettingsRepo::with_backend(state.backend.clone());
+        assert_eq!(
+            reglages.get("local_audio_backend").unwrap().as_deref(),
+            Some("asio")
+        );
+        assert_eq!(state.stored_audio_backend(), "asio");
+    }
+
+    /// Témoin absent : ASIO, comme avant.
+    #[test]
+    fn temoin_absent_garde_asio() {
+        let state = etat_avec_asio();
+        let (decision, _) = hote_de_demarrage_selon(&state, false, true);
+        assert_eq!(decision, HoteDeCeDemarrage::Demande);
+        assert_eq!(state.effective_audio_backend_selon(None), "asio");
+        assert!(state.requested_exclusive_mode_selon(None));
+    }
+
+    /// Témoin présent mais hôte WASAPI : rien à replier.
+    #[test]
+    fn temoin_present_en_wasapi_ne_change_rien() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set("local_audio_backend", "wasapi")
+            .unwrap();
+        let (decision, _) = hote_de_demarrage_selon(&state, true, true);
+        assert_eq!(decision, HoteDeCeDemarrage::Demande);
+        assert_eq!(state.effective_audio_backend_selon(Some("asio")), "wasapi");
+    }
+
+    /// L'ordre du démarrage : témoin posé AVANT l'ouverture de la base,
+    /// appliqué AVANT `init_state` (qui lance le préchauffage ASIO) et avant
+    /// les sorties audio, retiré APRÈS `listening`. Garde de texte : le
+    /// démarrage complet ne se joue pas dans un test.
+    #[test]
+    fn le_bootstrap_pose_applique_puis_retire_le_temoin() {
+        let source = include_str!("bootstrap.rs");
+        let position = |motif: &str| {
+            let trouvees: Vec<usize> = source.match_indices(motif).map(|(i, _)| i).collect();
+            assert_eq!(
+                trouvees.len(),
+                1,
+                "« {motif} » doit apparaître une fois : {trouvees:?}"
+            );
+            trouvees[0]
+        };
+        let pose = position("crate::startup::poser_le_temoin_de_demarrage()");
+        let base = position("AppState::new(&config.db_path");
+        let applique = position("crate::startup::appliquer_le_temoin_de_demarrage(");
+        let init = position("crate::startup::init_state(&state, &config)");
+        let sorties = position("crate::startup::register_local_outputs(&state)");
+        let ecoute = position("info!(%addr, \"listening\")");
+        let retire = position("crate::startup::retirer_le_temoin_de_demarrage()");
+        assert!(pose < base, "le témoin doit être posé avant la base");
+        assert!(
+            base < applique && applique < init,
+            "appliqué après la base, avant init_state"
+        );
+        assert!(applique < sorties, "appliqué avant les sorties audio");
+        assert!(
+            ecoute < retire,
+            "retiré seulement une fois le serveur à l'écoute"
+        );
     }
 }

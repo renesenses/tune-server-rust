@@ -246,7 +246,7 @@ pub async fn lookup_artist(name: &str) -> Option<String> {
         .get(format!("{MB_API}/artist"))
         .query(&[
             ("query", &query),
-            ("limit", &"1".to_string()),
+            ("limit", &super::MB_ARTIST_CANDIDATES.to_string()),
             ("fmt", &"json".to_string()),
         ])
         .header("User-Agent", MB_UA)
@@ -259,13 +259,8 @@ pub async fn lookup_artist(name: &str) -> Option<String> {
         _ => return None,
     };
 
-    let artists = data.get("artists")?.as_array()?;
-    let best = artists.first()?;
-    let score = best.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
-    if score < 90 {
-        return None;
-    }
-    best.get("id").and_then(|v| v.as_str()).map(String::from)
+    // #6463 — le premier résultat n'est pas forcément l'artiste cherché.
+    super::mb_choisir_artiste(&data, name)
 }
 
 /// Batch-match artists without MBID by searching MusicBrainz.

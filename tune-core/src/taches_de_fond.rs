@@ -114,13 +114,16 @@ pub enum Tache {
     /// requêtes sortantes mesurées sur les 3 909 albums locaux du .18 ne
     /// peuvent pas être une passe qu'on ne peut plus arrêter.
     Identification,
+    /// La détection des faux hi-res (#6285) : un extrait de chaque piste sans
+    /// perte décodé, sa bande passante et ses bits effectifs mesurés.
+    FauxHiRes,
 }
 
 impl Tache {
     /// Toutes les tâches, dans l'ordre d'affichage de l'écran « État du
     /// serveur ». C'est la liste que balaient l'interrupteur général et le
     /// relevé : ajouter une tâche ici suffit à l'y faire entrer.
-    pub const TOUTES: [Tache; 7] = [
+    pub const TOUTES: [Tache; 8] = [
         Tache::ReplayGain,
         Tache::Empreintes,
         Tache::PlageDynamique,
@@ -128,6 +131,7 @@ impl Tache {
         Tache::Enrichissement,
         Tache::ImagesArtistes,
         Tache::Identification,
+        Tache::FauxHiRes,
     ];
 
     /// Identifiant STABLE — c'est le mot que lisent l'API et le client web.
@@ -147,6 +151,7 @@ impl Tache {
             Tache::Enrichissement => "enrichment",
             Tache::ImagesArtistes => "artist_images",
             Tache::Identification => "identification",
+            Tache::FauxHiRes => "hires_check",
         }
     }
 
@@ -171,6 +176,7 @@ impl Tache {
             Tache::Enrichissement => "tache_de_fond_pause_enrichment",
             Tache::ImagesArtistes => "tache_de_fond_pause_artist_images",
             Tache::Identification => "tache_de_fond_pause_identification",
+            Tache::FauxHiRes => "tache_de_fond_pause_hires_check",
         }
     }
 

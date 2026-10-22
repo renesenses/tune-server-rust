@@ -38,12 +38,27 @@
 //!
 //! # Playlists
 //!
-//! Poussées, jamais relues. Chez Qobuz une playlist ne passe pas par
-//! `/favorite/create` mais par `/playlist/subscribe` (#2370,
-//! `MOTIF_PLAYLIST_HORS_FAVORITE_CREATE`) : le miroir appelle le même
-//! `add_favorite("playlists")` que le connecteur route déjà là. Aucune liste
-//! de playlists suivies n'étant établie, une ligne `playlist` n'est jamais
-//! retirée par un rafraîchissement.
+//! Chez Qobuz une playlist ne passe pas par `/favorite/create` mais par
+//! `/playlist/subscribe` (#2370, `MOTIF_PLAYLIST_HORS_FAVORITE_CREATE`) : le
+//! miroir appelle le même `add_favorite("playlists")` que le connecteur route
+//! déjà là.
+//!
+//! Relues seulement chez un service qui sait dire lesquelles il SUIT
+//! ([`StreamingService::playlists_de_la_bibliotheque`], #6461) : une playlist
+//! suivie est un favori, une playlist suivie qui ne l'est plus a été retirée
+//! de la bibliothèque du service. Trois prudences propres aux playlists :
+//!
+//! * une playlist POSSÉDÉE par le compte n'est ni ajoutée ni retirée — chez
+//!   Qobuz elle est dans la bibliothèque sans être un favori (FabienM, fil
+//!   2302) ;
+//! * une playlist dont le service ne dit pas l'auteur (`editable` absent)
+//!   rend la lecture incertaine : rien n'est réconcilié pour ce type ;
+//! * une ligne d'avant la rc4 (`miroir_etat` NULL) que le service ne suit pas
+//!   reste telle quelle — elle n'a jamais été poussée, et la pousser
+//!   abonnerait le compte à une playlist sans geste de l'auditeur.
+//!
+//! Ailleurs, une ligne `playlist` n'est jamais retirée par un
+//! rafraîchissement.
 //!
 //! Contrat d'API complet : description de la PR #5997.
 
@@ -190,7 +205,7 @@ pub struct BilanMiroir {
 pub struct EtatMiroir {
     pub miroir: bool,
     pub dernier_rafraichissement: Option<String>,
-    /// `jamais`, `ok` ou `echec`.
+    /// `jamais`, `ok`, `echec` ou `non_connecte` ([`STATUT_NON_CONNECTE`]).
     pub statut: &'static str,
     pub erreur: Option<String>,
     pub en_attente: usize,
@@ -252,6 +267,47 @@ pub fn invalider(service: &str) {
 pub fn est_perime(service: &str, ttl: Duration) -> bool {
     let e = etat(service);
     e.perime || e.instant.is_none_or(|i| i.elapsed() >= ttl)
+}
+
+/// Le statut d'un service en miroir qui n'est pas connecté (jamais
+/// configuré, session fermée) : ce n'est PAS un échec de rafraîchissement
+/// (#6369). Tidal est toujours au registre ; le compter en échec faisait
+/// afficher « le dernier rafraîchissement a échoué » à quiconque n'a que
+/// Qobuz, à chaque ouverture des Favoris.
+pub const STATUT_NON_CONNECTE: &str = "non_connecte";
+
+/// L'état global des miroirs `noms`, publié dans `X-Tune-Favoris-Miroir` :
+/// `aucun`, `echec`, `en_attente` ou `ok`.
+///
+/// Un service non connecté ne décide ni de `echec` ni de `ok` : il ne compte
+/// que par ses écritures en attente (elles attendent bel et bien). Si aucun
+/// service n'est connecté et que rien n'attend, c'est `aucun` — « aucun
+/// service en miroir n'est connecté », le sens que le client lui donne.
+pub fn statut_global(noms: &[String]) -> &'static str {
+    let etats: Vec<EtatMiroir> = noms.iter().map(|n| etat(n)).collect();
+    let connectes: Vec<&EtatMiroir> = etats
+        .iter()
+        .filter(|e| e.statut != STATUT_NON_CONNECTE)
+        .collect();
+    if connectes.iter().any(|e| e.statut == "echec") {
+        "echec"
+    } else if etats.iter().any(|e| e.en_attente > 0) {
+        "en_attente"
+    } else if connectes.is_empty() {
+        "aucun"
+    } else {
+        "ok"
+    }
+}
+
+fn noter_non_connecte(service: &str, en_attente: usize) {
+    let mut e = etats().lock().unwrap_or_else(|p| p.into_inner());
+    let etat = e.entry(service.to_string()).or_default();
+    etat.instant = Some(Instant::now());
+    etat.perime = false;
+    etat.statut = STATUT_NON_CONNECTE;
+    etat.erreur = Some("service non connecté".into());
+    etat.en_attente = en_attente;
 }
 
 fn noter_rafraichissement(service: &str, bilan: &BilanMiroir) {
@@ -633,6 +689,16 @@ fn etats_locaux(
     Ok(out)
 }
 
+/// Ce qu'une lecture réussie laisse de côté (#6461).
+#[derive(Default)]
+struct Reserves {
+    /// Identifiants (normalisés) que la réconciliation ne touche pas : le
+    /// service les nomme, mais pas comme favoris (playlists possédées).
+    hors_favoris: HashSet<String>,
+    /// Ne pas pousser les lignes d'avant la rc4 que le service ignore.
+    garder_les_anciennes: bool,
+}
+
 /// Réconcilie un type relu AVEC SUCCÈS chez le service.
 fn reconcilier(
     backend: &Arc<dyn DbBackend>,
@@ -640,6 +706,7 @@ fn reconcilier(
     service: &str,
     item_type: &str,
     entrees: Vec<Entree>,
+    reserves: &Reserves,
     bilan: &mut BilanMiroir,
 ) -> Result<(), String> {
     let repo = StreamingFavoritesRepo::with_backend(backend.clone());
@@ -679,7 +746,7 @@ fn reconcilier(
         }
     }
     for (id, etat) in locaux {
-        if chez_service.contains(&id) {
+        if chez_service.contains(&id) || reserves.hors_favoris.contains(&id) {
             continue;
         }
         match etat.as_deref() {
@@ -695,6 +762,7 @@ fn reconcilier(
             }
             // Ligne d'avant la rc4 que le service ne connaît pas : un cœur
             // posé dans Tune vaut un favori chez le service — à pousser.
+            None if reserves.garder_les_anciennes => {}
             None => {
                 poser_etat(
                     backend,
@@ -710,6 +778,50 @@ fn reconcilier(
         }
     }
     Ok(())
+}
+
+/// Les playlists que le compte SUIT, comme favoris, et celles qu'il possède,
+/// à laisser hors de la réconciliation (#6461).
+///
+/// `Err` — et donc rien de retiré — si la lecture a échoué ou est incomplète
+/// (le service le dit), ou dès qu'une playlist ne dit pas son auteur : on ne
+/// devine pas si elle est suivie ou possédée.
+fn trier_les_playlists(
+    lecture: Result<Vec<crate::streaming::traits::StreamPlaylist>, crate::error::TuneError>,
+) -> Result<(Vec<Entree>, Reserves), String> {
+    let playlists = lecture.map_err(|e| e.to_string())?;
+    let mut suivies = Vec::new();
+    let mut reserves = Reserves {
+        garder_les_anciennes: true,
+        ..Reserves::default()
+    };
+    for p in playlists {
+        match p.editable {
+            Some(false) => suivies.push(Entree {
+                item_type: "playlist",
+                service_id: p.id,
+                title: Some(p.name),
+                artist: None,
+                album: None,
+                cover_url: p.cover_path,
+                created_at: None,
+                ai_generated: None,
+                isrc: None,
+            }),
+            Some(true) => {
+                reserves
+                    .hors_favoris
+                    .insert(identite_de_favori(&p.id).into_owned());
+            }
+            None => {
+                return Err(format!(
+                    "playlist {} sans auteur connu : suivie ou possédée, on ne sait pas",
+                    p.id
+                ));
+            }
+        }
+    }
+    Ok((suivies, reserves))
 }
 
 /// Pousse au service les écritures en attente.
@@ -767,11 +879,11 @@ pub async fn rafraichir(
         let svc = arc.read().await;
         let service = svc.name().to_string();
         if !svc.utilisable().await {
-            bilan.echecs = 1;
+            // #6369 — non connecté n'est pas un échec : rien n'a été tenté.
             bilan.erreur = Some("service non connecté".into());
             drop(svc);
             bilan.en_attente = compter_en_attente(backend, &service);
-            noter_rafraichissement(&service, &bilan);
+            noter_non_connecte(&service, bilan.en_attente);
             return bilan;
         }
         let mut lectures = Vec::new();
@@ -780,17 +892,25 @@ pub async fn rafraichir(
             ("albums", "album"),
             ("artists", "artist"),
         ] {
-            lectures.push((item_type, lire_les_favoris(&**svc, fav_type).await));
+            lectures.push((
+                item_type,
+                lire_les_favoris(&**svc, fav_type)
+                    .await
+                    .map(|e| (e, Reserves::default())),
+            ));
+        }
+        if let Some(lecture) = svc.playlists_de_la_bibliotheque().await {
+            lectures.push(("playlist", trier_les_playlists(lecture)));
         }
         (service, lectures)
     };
     let profils = profils(backend, appelant);
     for (item_type, lecture) in lectures {
         match lecture {
-            Ok(entrees) => {
-                if let Err(e) =
-                    reconcilier(backend, &profils, &service, item_type, entrees, &mut bilan)
-                {
+            Ok((entrees, reserves)) => {
+                if let Err(e) = reconcilier(
+                    backend, &profils, &service, item_type, entrees, &reserves, &mut bilan,
+                ) {
                     warn!(service = %service, item_type, erreur = %e, "favoris_miroir_base_refuse");
                     bilan.echecs += 1;
                     bilan.erreur = Some(e);

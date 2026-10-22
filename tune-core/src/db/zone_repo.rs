@@ -108,6 +108,22 @@ mod pg_5263_tests {
     }
 }
 
+/// Une ligne de `sql::zones_masquees*` : id, nom, appareil, protocole, hôte,
+/// MAC, motif, date.
+fn ligne_de_zone_masquee(r: &[SqlValue]) -> Option<ZoneMasquee> {
+    let texte = |i: usize| r.get(i).and_then(|v| v.as_string());
+    Some(ZoneMasquee {
+        id: r.first().and_then(|v| v.as_i64())?,
+        name: texte(1).unwrap_or_default(),
+        device_id: texte(2).unwrap_or_default(),
+        protocole: texte(3).unwrap_or_default(),
+        host: texte(4).unwrap_or_default(),
+        mac: texte(5).filter(|m| !m.trim().is_empty()),
+        motif: texte(6),
+        masquee_le: texte(7),
+    })
+}
+
 /// Drapeau, motif et date du masquage d'une zone (#5077). `motif` NUL =
 /// inconnu : masquage d'avant la migration 112, ou zone visible.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -621,6 +637,15 @@ pub mod sql {
              FROM zones WHERE COALESCE(is_hidden, 0) = 1 AND motif_masquage = {} ORDER BY id",
             d.placeholder(1)
         )
+    }
+
+    /// TOUTES les zones masquées, quel que soit leur motif — y compris un
+    /// motif NUL (#6378 : le rapport de bogue doit les montrer).
+    pub fn zones_masquees() -> String {
+        "SELECT id, COALESCE(name, ''), COALESCE(output_device_id, ''), \
+         COALESCE(output_type, ''), COALESCE(host, ''), mac, motif_masquage, masquee_le \
+         FROM zones WHERE COALESCE(is_hidden, 0) = 1 ORDER BY id"
+            .to_string()
     }
 
     /// L'état de masquage d'une zone : drapeau, motif, date (#5077).
@@ -2994,19 +3019,18 @@ impl ZoneRepo {
         let lignes = self.db.query_many_strong(&sql, &params)?;
         Ok(lignes
             .iter()
-            .filter_map(|r| {
-                let texte = |i: usize| r.get(i).and_then(|v| v.as_string());
-                Some(ZoneMasquee {
-                    id: r.first().and_then(|v| v.as_i64())?,
-                    name: texte(1).unwrap_or_default(),
-                    device_id: texte(2).unwrap_or_default(),
-                    protocole: texte(3).unwrap_or_default(),
-                    host: texte(4).unwrap_or_default(),
-                    mac: texte(5).filter(|m| !m.trim().is_empty()),
-                    motif: texte(6),
-                    masquee_le: texte(7),
-                })
-            })
+            .filter_map(|r| ligne_de_zone_masquee(r))
+            .collect())
+    }
+
+    /// Toutes les zones masquées, motif NUL compris (#6378). `ZoneRepo::count`
+    /// et `list` les ignorent : sans cette lecture, un rapport de bogue écrit
+    /// « Zones (0) » pour un testeur dont la seule zone est masquée.
+    pub fn zones_masquees(&self) -> Result<Vec<ZoneMasquee>, String> {
+        let lignes = self.db.query_many(&sql::zones_masquees(), &[])?;
+        Ok(lignes
+            .iter()
+            .filter_map(|r| ligne_de_zone_masquee(r))
             .collect())
     }
 

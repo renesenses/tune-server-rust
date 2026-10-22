@@ -1,6 +1,7 @@
 pub mod auto_dj;
 pub mod dj_player;
 pub mod gapless;
+pub mod melange;
 pub mod queue;
 pub mod radio_artiste;
 // `crossfade` a été retiré ici (#2211), pour la même raison que
@@ -211,11 +212,13 @@ impl NowPlaying {
             year: track.year,
             album_id: track.album_id,
             artist_id: track.artist_id,
-            // Une piste de la bibliothèque n'annonce pas de débit : sa
-            // résolution réelle est lue au scan et déjà portée ci-dessus. Le
-            // champ existe pour les flux distants qui, eux, nomment leur
-            // encodage (#2074).
-            bitrate_kbps: None,
+            // #6332 — le débit moyen du FICHIER, lu au scan et stocké dans
+            // `tracks.bitrate_kbps` (il était lu puis jeté). `None` tant que la
+            // ligne ne le porte pas encore : le rescan suivant le complète.
+            bitrate_kbps: track
+                .bitrate_kbps
+                .and_then(|b| u32::try_from(b).ok())
+                .filter(|b| *b > 0),
             channels: u16::try_from(track.channels).ok().filter(|n| *n > 0),
             version: None,
         }
@@ -273,11 +276,14 @@ pub struct ZoneState {
     pub repeat: RepeatMode,
     pub queue_position: i64,
     pub queue_length: i64,
-    /// Materialised shuffle order: a permutation of the queue indices
-    /// `[0, queue_length)`. Empty when shuffle is off. Regenerated when shuffle
-    /// is enabled or the queue length changes, and re-synced on every position
-    /// update. `next_position` follows this order so shuffle plays every track
-    /// exactly once per cycle (repeat-off stops at the end; repeat-all loops).
+    /// Ancien ordre de tirage CACHÉ : une permutation des rangs de la file que
+    /// `next_position` suivait quand il n'était pas vide.
+    ///
+    /// 🔴 #6526 — plus jamais matérialisé : l'aléatoire réordonne désormais
+    /// les lignes de la file elle-même (`playback::melange`), si bien que la
+    /// file relue est l'ordre joué et que l'avance suit la file. Le champ reste
+    /// vide en production ; les décisions qui le lisent retombent alors sur
+    /// l'ordre de la file.
     #[serde(skip)]
     pub shuffle_order: Vec<usize>,
     /// Current index into `shuffle_order` (-1 before the first track). The next
@@ -954,6 +960,12 @@ pub struct PlaybackManager {
     /// [`Self::position_audible_ms`]. Absent = sortie qui ne dit pas ce
     /// qu'elle retient (rendu réseau) : le forwarder garde son cadencement.
     horloges_de_sortie: std::sync::Mutex<HashMap<i64, HorlogeDeSortie>>,
+    /// #6526 — l'ordre de la file AVANT que l'aléatoire ne la rebatte, en
+    /// identifiants de ligne (`queue_items.id`), par zone. C'est lui que la
+    /// désactivation rétablit (`melange::retablir_l_ordre`). Absent = rien à
+    /// rétablir. Verrou synchrone : accès courts, jamais tenus à travers un
+    /// await.
+    ordres_d_origine: std::sync::Mutex<HashMap<i64, Vec<i64>>>,
     /// #4384 — les crêtes relevées APRÈS le DSP par la sortie locale qui joue
     /// la zone. Voir [`crate::audio::crete_de_sortie`] et
     /// [`Self::crete_de_sortie`]. Absent = aucun relevé : le forwarder garde
@@ -987,6 +999,7 @@ impl PlaybackManager {
             gains_de_sortie: std::sync::Mutex::new(HashMap::new()),
             gains_moyens_du_dsp: std::sync::Mutex::new(HashMap::new()),
             horloges_de_sortie: std::sync::Mutex::new(HashMap::new()),
+            ordres_d_origine: std::sync::Mutex::new(HashMap::new()),
             cretes_de_sortie: std::sync::Mutex::new(HashMap::new()),
             gains_demandes: std::sync::Mutex::new(HashMap::new()),
             sondes_des_canaux: std::sync::Mutex::new(HashMap::new()),
@@ -1617,6 +1630,16 @@ impl PlaybackManager {
         flux_remplace
     }
 
+    /// Banc seulement : fait remonter la pause de `de` dans le passé.
+    /// `paused_at` est un `Instant` que `tokio::time::pause()` n'atteint pas.
+    #[cfg(test)]
+    pub(crate) async fn vieillir_la_pause_pour_test(&self, zone_id: i64, de: std::time::Duration) {
+        let mut zones = self.zones.lock().await;
+        if let Some(state) = zones.get_mut(&zone_id) {
+            state.paused_at = state.paused_at.and_then(|t| t.checked_sub(de));
+        }
+    }
+
     pub async fn pause(&self, zone_id: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
@@ -1887,6 +1910,10 @@ impl PlaybackManager {
     /// suivent au démarrage, sur une zone qui n'est pas encore en mémoire. Les
     /// laisser en `get_mut` reviendrait à corriger un des trois et laisser ses
     /// deux sœurs jeter la valeur restaurée en silence.
+    ///
+    /// 🔴 #6526 — ne pose plus que le MODE. Le mélange lui-même réordonne la
+    /// file en base (`melange::basculer_l_aleatoire`, appelé par la route) :
+    /// aucun ordre caché n'est plus tiré ici.
     pub async fn set_shuffle(&self, zone_id: i64, enabled: bool) {
         {
             let mut zones = self.zones.lock().await;
@@ -1895,22 +1922,11 @@ impl PlaybackManager {
                 ..Default::default()
             });
             state.shuffle = enabled;
-            if enabled {
-                // Build a fresh order around the currently playing track so
-                // the next advance goes to a different track.
-                state.shuffle_order = generate_shuffle_order(
-                    state.queue_length.max(0) as usize,
-                    state.queue_position.max(0) as usize,
-                );
-                state.shuffle_index = if state.shuffle_order.is_empty() {
-                    -1
-                } else {
-                    0
-                };
-            } else {
-                state.shuffle_order.clear();
-                state.shuffle_index = -1;
-            }
+            state.shuffle_order.clear();
+            state.shuffle_index = -1;
+        }
+        if !enabled {
+            self.oublier_l_ordre_d_origine(zone_id);
         }
         self.emit(PlaybackEvent {
             event: "shuffle".into(),
@@ -1995,6 +2011,21 @@ impl PlaybackManager {
         // celle d'avant — exactement la vignette étrangère qu'on répare.
         z.session_context_title = context_title;
         z.session_context_cover = context_cover;
+    }
+
+    /// Un nouveau geste de lecture qui ne désigne aucun conteneur — une
+    /// station, un épisode de podcast, une radio d'artiste, un préréglage —
+    /// efface le contexte de session laissé par le geste précédent (#6465).
+    ///
+    /// Seul `POST /zones/{id}/play` posait ce contexte, et les autres routes
+    /// de lecture n'y touchaient pas : l'album joué avant restait la session
+    /// de la zone. L'Historique rangeait alors la radio ou le podcast DANS cet
+    /// album, les titres d'une radio d'artiste s'écrivaient sous lui, et la
+    /// vignette « en cours » renvoyait à lui (`/zones/{id}/album-en-cours`
+    /// lit d'abord le contexte de session). Fil 2302, points 7, 8 et 9.
+    pub async fn effacer_contexte_de_session(&self, zone_id: i64) {
+        self.set_session_context(zone_id, None, None, None, None, None)
+            .await;
     }
 
     /// Observe actual work independently of the displayed media position.
@@ -2184,28 +2215,38 @@ impl PlaybackManager {
         });
         state.queue_position = position;
         state.queue_length = length;
-        if state.shuffle {
-            let len = length.max(0) as usize;
-            let pos = position.max(0) as usize;
-            if len == 0 {
-                state.shuffle_order.clear();
-                state.shuffle_index = -1;
-            } else if state.shuffle_order.len() != len {
-                // Queue length changed (tracks added/removed, or the order
-                // was lost across a restart — it is not persisted). Rebuild
-                // around the current track.
-                state.shuffle_order = generate_shuffle_order(len, pos);
-                state.shuffle_index = 0;
-            } else if let Some(idx) = state.shuffle_order.iter().position(|&p| p == pos) {
-                // Sync the cursor to the track now playing so the next
-                // advance follows the order from here.
-                state.shuffle_index = idx as i64;
-            } else {
-                // Position not in the order (shouldn't happen) — rebuild.
-                state.shuffle_order = generate_shuffle_order(len, pos);
-                state.shuffle_index = 0;
-            }
+        // #6526 — plus de tirage caché à refaire ici : sous l'aléatoire, la
+        // file EST l'ordre joué. Le tirage refait à chaque changement de
+        // longueur rebattait les titres déjà joués et envoyait un « Lire
+        // ensuite » n'importe où.
+    }
+
+    /// #6526 — l'ordre d'origine retenu pour la zone (vide = rien à rétablir).
+    pub fn ordre_d_origine(&self, zone_id: i64) -> Vec<i64> {
+        self.ordres_d_origine
+            .lock()
+            .expect("ordres_d_origine lock")
+            .get(&zone_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// #6526 — retient l'ordre d'origine de la file (identifiants de ligne).
+    pub fn retenir_l_ordre_d_origine(&self, zone_id: i64, ordre: Vec<i64>) {
+        let mut ordres = self.ordres_d_origine.lock().expect("ordres_d_origine lock");
+        if ordre.is_empty() {
+            ordres.remove(&zone_id);
+        } else {
+            ordres.insert(zone_id, ordre);
         }
+    }
+
+    /// #6526 — oublie l'ordre d'origine de la zone.
+    pub fn oublier_l_ordre_d_origine(&self, zone_id: i64) {
+        self.ordres_d_origine
+            .lock()
+            .expect("ordres_d_origine lock")
+            .remove(&zone_id);
     }
 
     pub fn emit_position(&self, zone_id: i64, position_ms: i64) {

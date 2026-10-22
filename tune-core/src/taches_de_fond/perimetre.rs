@@ -11,6 +11,14 @@
 //! | Clé                                   | Valeur                     | Vide          |
 //! |---------------------------------------|----------------------------|---------------|
 //! | `background_analysis_excluded_roots`  | tableau de racines exclues | rien d'exclu  |
+//! | `audio_embedding_genres_included`     | genres retenus pour le CLAP | tous les genres |
+//! | `audio_embedding_genres_excluded`     | genres écartés du CLAP     | aucun écarté  |
+//!
+//! Les deux listes de genres (#6198, Thierry, plus de 550 000 pistes) ne
+//! touchent QUE la passe CLAP : ReplayGain, plage dynamique et empreintes
+//! servent à la lecture de chaque piste, le CLAP seulement à la recherche par
+//! ambiance. Une piste écartée n'est ni sélectionnée ni comptée : la passe ne
+//! l'attend pas et se termine sans elle.
 //!
 //! Le réglage vit dans `settings`, à côté de `music_dirs` qui porte les racines
 //! elles-mêmes : aucune table, donc aucune migration. Une racine retirée de
@@ -54,6 +62,12 @@ use crate::db::settings_repo::SettingsRepo;
 /// Les racines de bibliothèque exclues des passes qui décodent.
 pub const CLE_RACINES_EXCLUES: &str = "background_analysis_excluded_roots";
 
+/// Les genres auxquels la passe CLAP est réservée (#6198). Vide : tous.
+pub const CLE_GENRES_CLAP_INCLUS: &str = "audio_embedding_genres_included";
+
+/// Les genres que la passe CLAP n'analyse pas (#6198). Vide : aucun.
+pub const CLE_GENRES_CLAP_EXCLUS: &str = "audio_embedding_genres_excluded";
+
 /// Borne du nombre d'entrées d'une liste : une clause de mille préfixes
 /// coûterait à chaque `COUNT(*)` de la page État, pour un réglage qui en compte
 /// une poignée.
@@ -79,6 +93,16 @@ fn liste(backend: &Arc<dyn DbBackend>, cle: &str) -> Vec<String> {
 /// Les racines exclues, telles que réglées.
 pub fn racines_exclues(backend: &Arc<dyn DbBackend>) -> Vec<String> {
     liste(backend, CLE_RACINES_EXCLUES)
+}
+
+/// Les genres retenus pour le CLAP, tels que réglés. Vide : tous.
+pub fn genres_clap_inclus(backend: &Arc<dyn DbBackend>) -> Vec<String> {
+    liste(backend, CLE_GENRES_CLAP_INCLUS)
+}
+
+/// Les genres écartés du CLAP, tels que réglés. Vide : aucun.
+pub fn genres_clap_exclus(backend: &Arc<dyn DbBackend>) -> Vec<String> {
+    liste(backend, CLE_GENRES_CLAP_EXCLUS)
 }
 
 /// La forme unique d'une liste du périmètre : un tableau de chaînes, rognées,
@@ -190,6 +214,61 @@ fn termes_des_racines(expr: &str, racines: &[String]) -> Option<String> {
     Some(termes.join(" OR "))
 }
 
+/// Le test « la piste porte l'un des `genres` » : la colonne `t.genre`
+/// comparée en entier, OU le tableau JSON `t.genres` — l'union même que teste
+/// le filtre Genre des facettes (`TrackRepo::conditions_du_filtre`).
+/// Insensible à la casse des deux côtés (`LOWER`), sur les deux moteurs.
+/// `COALESCE` partout : le test vaut vrai ou faux, jamais NULL, ce qui rend
+/// son `NOT` sûr. `None` si la liste est vide.
+///
+/// Le motif `LIKE` ne porte que des genres sans joker : un `%` ou un `_` dans
+/// un nom de genre élargirait la recherche au tableau. Ces genres-là ne sont
+/// cherchés que dans la colonne, par égalité.
+fn termes_des_genres(genres: &[String]) -> Option<String> {
+    let genres: Vec<&str> = genres
+        .iter()
+        .map(|g| g.trim())
+        .filter(|g| !g.is_empty())
+        .collect();
+    if genres.is_empty() {
+        return None;
+    }
+    let dans_la_colonne = genres
+        .iter()
+        .map(|g| format!("LOWER({})", litteral(g)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut termes = vec![format!(
+        "LOWER(COALESCE(t.genre, '')) IN ({dans_la_colonne})"
+    )];
+    termes.extend(genres.iter().filter(|g| !g.contains(['%', '_'])).map(|g| {
+        format!(
+            "LOWER(COALESCE(t.genres, '')) LIKE LOWER({})",
+            litteral(&format!("%\"{g}\"%"))
+        )
+    }));
+    Some(termes.join(" OR "))
+}
+
+/// `" AND (…)"` : ne garde que les pistes portant l'un des `genres`. Vide si
+/// aucun genre. Une piste SANS genre n'est donc pas retenue quand la liste est
+/// réglée : c'est ce que l'écran du réglage dit à l'utilisateur.
+pub fn clause_genres_inclus(genres: &[String]) -> String {
+    match termes_des_genres(genres) {
+        Some(t) => format!(" AND ({t})"),
+        None => String::new(),
+    }
+}
+
+/// `" AND NOT (…)"` : écarte les pistes portant l'un des `genres`. Vide si
+/// aucun genre. Une piste sans genre reste analysée.
+pub fn clause_genres_exclus(genres: &[String]) -> String {
+    match termes_des_genres(genres) {
+        Some(t) => format!(" AND NOT ({t})"),
+        None => String::new(),
+    }
+}
+
 /// La clause du périmètre pour ReplayGain, plage dynamique et empreintes : les
 /// racines exclues, sur `t.file_path`.
 pub fn clause_decodage(backend: &Arc<dyn DbBackend>) -> String {
@@ -203,12 +282,16 @@ pub fn clause_hors_perimetre_decodage(backend: &Arc<dyn DbBackend>) -> String {
 }
 
 /// La clause du périmètre du CLAP : les racines exclues, sur le chemin
-/// OUVRABLE (le support d'une piste de feuille CUE compte).
+/// OUVRABLE (le support d'une piste de feuille CUE compte), puis les genres
+/// retenus et les genres écartés (#6198). Une piste doit passer les trois.
 pub fn clause_clap(backend: &Arc<dyn DbBackend>) -> String {
-    clause_hors_racines(
+    let mut c = clause_hors_racines(
         crate::db::track_repo::sql::CHEMIN_OUVRABLE,
         &racines_exclues(backend),
-    )
+    );
+    c.push_str(&clause_genres_inclus(&genres_clap_inclus(backend)));
+    c.push_str(&clause_genres_exclus(&genres_clap_exclus(backend)));
+    c
 }
 
 #[cfg(test)]

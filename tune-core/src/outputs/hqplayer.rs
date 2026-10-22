@@ -59,6 +59,101 @@ pub struct HqplayerOutput {
     /// Le sondage tourne en boucle : sans ce garde, une réponse d'une forme
     /// inattendue écrirait une ligne toutes les secondes.
     etat_inconnu_dit: Arc<AtomicBool>,
+    /// #4851 — la piste suivante que Tune a posée d'avance dans la playlist
+    /// de HQPlayer, tant que HQPlayer n'est pas passé dessus.
+    ///
+    /// Un `SetNextAVTransportURI` DLNA REMPLACE la suivante ; un
+    /// `PlaylistAdd clear="0"` l'AJOUTE. Sans ce suivi, un second armement
+    /// (« Lire ensuite » dans la fenêtre, préparation expirée) laisserait la
+    /// suivante périmée dans la playlist, jouée AVANT la bonne.
+    enchainement: Arc<std::sync::Mutex<Enchainement>>,
+    /// #6115 — le dernier état de transport que `Status` a rapporté.
+    ///
+    /// `play_media` le lit pour savoir si une piste joue (ou est en pause)
+    /// au moment de lancer un AUTRE titre : il faut alors arrêter HQPlayer
+    /// avant de vider sa playlist. Un HQPlayer jamais sondé vaut `None`, et
+    /// l'enchaînement d'avant le correctif reste celui-là.
+    dernier_etat: Arc<std::sync::Mutex<Option<TransportState>>>,
+}
+
+/// #6115 — la borne d'attente de l'arrêt avant de lancer un autre titre.
+const ATTENTE_ARRET: std::time::Duration = std::time::Duration::from_secs(2);
+/// #6115 — l'intervalle entre deux `Status` pendant cette attente.
+const SONDE_ARRET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// #4851 — ce que la sortie sait de la suivante posée chez HQPlayer.
+#[derive(Debug, Default)]
+struct Enchainement {
+    /// L'URI ajoutée d'avance, que HQPlayer n'a pas encore commencé à jouer.
+    suivante: Option<String>,
+    /// La dernière position lue par `Status`, pour voir HQPlayer repartir de
+    /// zéro sur la suivante quand il ne rapporte pas d'URI.
+    position_ms: u64,
+    /// La dernière durée lue par `Status`.
+    duree_ms: u64,
+}
+
+/// #4851 — HQPlayer est-il passé de lui-même sur la suivante posée ?
+///
+/// Deux preuves, l'une ou l'autre :
+/// - `Status` nomme l'URI de la suivante (`<metadata uri="…">`) ;
+/// - la position, qui était dans les 35 dernières secondes de la piste,
+///   retombe sous 5 s. C'est la forme de la transition quand HQPlayer ne
+///   rapporte pas d'URI ; un recul manuel au début de la piste ne se fait
+///   pas, en pratique, à moins de 35 s de sa fin.
+fn passee_sur_la_suivante(
+    suivante: &str,
+    uri_en_cours: Option<&str>,
+    position_avant_ms: u64,
+    duree_avant_ms: u64,
+    position_ms: u64,
+) -> bool {
+    if uri_en_cours.map(str::trim) == Some(suivante) {
+        return true;
+    }
+    duree_avant_ms > 0
+        && position_avant_ms + 35_000 >= duree_avant_ms
+        && position_ms < 5_000
+        && position_avant_ms > position_ms + 5_000
+}
+
+/// #4851 — l'index que HQPlayer donne LUI-MÊME à `uri` dans sa réponse
+/// `PlaylistGet` (`<PlaylistItem index="…" uri="…"/>`).
+///
+/// L'index est relu, jamais calculé : le protocole ne dit pas s'il part de
+/// 0 ou de 1, et `PlaylistRemove` attend celui de HQPlayer.
+fn index_dans_la_playlist(xml: &str, uri: &str) -> Option<String> {
+    use quick_xml::{Reader, events::Event};
+
+    let mut reader = Reader::from_str(xml);
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(tag) | Event::Empty(tag)
+                if tag.name().as_ref().eq_ignore_ascii_case(b"PlaylistItem") =>
+            {
+                let mut index = None;
+                let mut meme_uri = false;
+                for attribute in tag.attributes().flatten() {
+                    let valeur = attribute
+                        .decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )
+                        .ok()?;
+                    match attribute.key.as_ref() {
+                        b"index" => index = Some(valeur.trim().to_string()),
+                        b"uri" => meme_uri = valeur.trim() == uri,
+                        _ => {}
+                    }
+                }
+                if meme_uri {
+                    return index;
+                }
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
 }
 
 impl HqplayerOutput {
@@ -70,7 +165,95 @@ impl HqplayerOutput {
             port,
             connection: Arc::new(Mutex::new(None)),
             etat_inconnu_dit: Arc::new(AtomicBool::new(false)),
+            enchainement: Arc::new(std::sync::Mutex::new(Enchainement::default())),
+            dernier_etat: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn dernier_etat(&self) -> std::sync::MutexGuard<'_, Option<TransportState>> {
+        self.dernier_etat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// #6115 — arrête HQPlayer et attend que `Status` rapporte l'arrêt,
+    /// au plus [`ATTENTE_ARRET`].
+    ///
+    /// Retour terrain (hifi25nl, rc4) : en pleine lecture, `PlaylistAdd
+    /// clear="1"` puis `Play` laisse HQPlayer sur le titre précédent ; son
+    /// intégration Audiolinux envoie `hqp-control2 --stop` avant `--play`.
+    /// La source de HQPlayer Control 6.0.1 montre que `Stop` est une commande
+    /// à part, acquittée (`stopComplete`), et que l'état `3` (STOPREQ) précède
+    /// l'arrêt effectif (`0`) : d'où l'attente sur `Status`, pas seulement
+    /// l'envoi. La borne dépassée n'est pas une erreur : le lancement suit,
+    /// et le journal le dit.
+    async fn arreter_et_attendre(&self) -> Result<(), String> {
+        self.action("<Stop />").await?;
+        let debut = tokio::time::Instant::now();
+        let limite = debut + ATTENTE_ARRET;
+        loop {
+            let reste = limite.saturating_duration_since(tokio::time::Instant::now());
+            if reste.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(reste, self.command(r#"<Status subscribe="0" />"#)).await {
+                Ok(Ok(reponse)) => {
+                    if etat_reconnu(&reponse) == Some(TransportState::Stopped) {
+                        *self.dernier_etat() = Some(TransportState::Stopped);
+                        info!(
+                            device = %self.name,
+                            attente_ms = debut.elapsed().as_millis() as u64,
+                            "hqplayer_arret_avant_lancement"
+                        );
+                        return Ok(());
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!(device = %self.name, error = %e, "hqplayer_arret_status_illisible");
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Réponse coupée en plein vol : la connexion ne doit pas
+                    // garder un reste de `Status` pour la commande suivante.
+                    *self.connection.lock().await = None;
+                    break;
+                }
+            }
+            tokio::time::sleep(
+                SONDE_ARRET.min(limite.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
+        }
+        warn!(
+            device = %self.name,
+            borne_ms = ATTENTE_ARRET.as_millis() as u64,
+            "hqplayer_arret_non_confirme — lancement sans arret rapporte par Status"
+        );
+        Ok(())
+    }
+
+    fn enchainement(&self) -> std::sync::MutexGuard<'_, Enchainement> {
+        self.enchainement
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// #4851 — retire de la playlist de HQPlayer une suivante posée d'avance
+    /// et devenue périmée. Son index est relu par `PlaylistGet`.
+    ///
+    /// Absente de la playlist, il n'y a rien à retirer. Une playlist
+    /// illisible est une erreur : ajouter la nouvelle suivante par-dessus
+    /// ferait jouer les deux.
+    async fn retirer_la_suivante(&self, uri: &str) -> Result<(), String> {
+        let playlist = self.command(r#"<PlaylistGet picture="0" />"#).await?;
+        let Some(index) = index_dans_la_playlist(&playlist, uri) else {
+            info!(device = %self.name, uri, "hqplayer_suivante_perimee_absente");
+            return Ok(());
+        };
+        let xml = format!(r#"<PlaylistRemove index="{}" />"#, escape_xml(&index));
+        self.action(&xml).await?;
+        info!(device = %self.name, uri, index, "hqplayer_suivante_perimee_retiree");
+        Ok(())
     }
 
     /// Probe a host to find which port HQPlayer is listening on.
@@ -447,13 +630,8 @@ async fn probe_hqplayer(host: &str, port: u16) -> Result<bool, String> {
 /// L'état de transport **reconnu** dans une réponse `<Status>` de HQPlayer,
 /// ou `None` quand son champ d'état n'est pas reconnu.
 ///
-/// Séparé de [`parse_state_from_xml`] pour une raison précise : la valeur de
-/// repli est `Stopped`, et `Stopped` n'est pas un état neutre pour le
-/// sondeur. C'est **lui** qui déclenche l'avance de file après cinq sondes
-/// (`STOPPED_TICKS_THRESHOLD`) et l'arrêt de zone après trente
-/// (`STOPPED_FAILURE_THRESHOLD`). « Je n'ai pas compris la réponse » et « le
-/// lecteur est à l'arrêt » ne peuvent donc pas rendre la même chose sans que
-/// personne ne le sache : le repli reste, mais il est désormais **dit**.
+/// Un état inconnu n'est pas un arrêt : `get_status` le rend comme erreur
+/// de sondage, pour que le sondeur ne le prenne pas pour une fin de piste.
 fn etat_reconnu(xml: &str) -> Option<TransportState> {
     use quick_xml::{Reader, events::Event};
 
@@ -520,15 +698,6 @@ fn etat_reconnu(xml: &str) -> Option<TransportState> {
     }
 }
 
-/// Parse transport state from HQPlayer XML status response.
-///
-/// Le comportement ne change pas : une réponse non reconnue vaut `Stopped`.
-/// Voir [`etat_reconnu`] pour ce que cela coûte, et `get_status` pour la
-/// ligne qui le signale.
-fn parse_state_from_xml(xml: &str) -> TransportState {
-    etat_reconnu(xml).unwrap_or(TransportState::Stopped)
-}
-
 /// Extract an attribute value from XML by attribute name.
 fn extract_xml_attr(xml: &str, attr_name: &str) -> Option<String> {
     let pattern = format!("{}=\"", attr_name);
@@ -584,7 +753,9 @@ impl OutputTarget for HqplayerOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, true, true, false, false).with_percent_volume()
+        // #4851 — `can_gapless` : la suivante est posée d'avance dans la
+        // playlist de HQPlayer (`set_next_media`), qui enchaîne lui-même.
+        OutputCapabilities::v1(true, true, true, true, false, true).with_percent_volume()
     }
 
     fn host(&self) -> Option<&str> {
@@ -593,22 +764,51 @@ impl OutputTarget for HqplayerOutput {
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         info!(device = %self.name, url = media.url, "hqplayer_play");
+        // #4851 — `clear="1"` vide la playlist : plus de suivante posée.
+        self.enchainement().suivante = None;
+
+        // #6115 — un AUTRE titre alors qu'une piste joue ou est en pause :
+        // HQPlayer d'abord arrêté — `PlaylistClear` garde la piste qui JOUE
+        // et un `Play` sur un moteur qui joue ne change rien (pont LMS, moteur
+        // 6.0.4). L'enchaînement sans blanc (#4851) ne passe pas par ici
+        // (`set_next_media`, `clear="0"`) et n'est pas touché.
+        let etat = *self.dernier_etat();
+        if matches!(
+            etat,
+            Some(TransportState::Playing | TransportState::Paused | TransportState::Transitioning)
+        ) {
+            self.arreter_et_attendre().await.map_err(|e| {
+                warn!(error = %e, "hqplayer_stop_before_play_failed");
+                e
+            })?;
+        }
 
         // ACTION commands go through the fire-and-forget path: HQPlayer 6 executes
         // transport commands but sends NO reply, so blocking on a response would
         // hit the 5s read timeout and fail the play. `action` writes and only
         // briefly drains any v4/v5 ack. See `send_action` for the full rationale.
         //
-        // This is the only place that puts TWO commands on one control
+        // This is the only place that puts SEVERAL commands on one control
         // connection, which is why #4023 showed up here and nowhere else: the
         // second one must NOT be preceded by another XML declaration, or
         // HQPlayer's stream parser dies on it and `Play` is never executed.
 
+        // #6115 (suite) — vider la playlist par un `PlaylistClear` EXPLICITE,
+        // quel que soit l'état, arrêt compris (Piero, fil 2240 : « even if I
+        // stop the previous one »). `clear="1"` seul ne suffit pas : le pont
+        // LMS-HQPlayer de Simon Arnold l'a mesuré ignoré par le moteur 6.0.4
+        // (`PlaylistAdd` répond OK et AJOUTE), la playlist devient
+        // [précédent, nouveau] et `Play` repart sur l'entrée courante, le
+        // précédent. Son chargement vérifié en direct est `Stop`,
+        // `PlaylistClear`, `PlaylistAdd`, `Play`. `clear="1"` reste écrit :
+        // c'est l'orthographe documentée, et il ne coûte rien.
+        self.action("<PlaylistClear />").await.map_err(|e| {
+            warn!(error = %e, "hqplayer_playlist_clear_failed");
+            e
+        })?;
+
         // Add URI to playlist (clear existing, start playing)
-        let xml = format!(
-            r#"<PlaylistAdd uri="{}" queued="0" clear="1"></PlaylistAdd>"#,
-            escape_xml(media.url)
-        );
+        let xml = playlist_add_xml(media, true);
         self.action(&xml).await.map_err(|e| {
             warn!(error = %e, "hqplayer_playlist_add_failed");
             e
@@ -636,6 +836,7 @@ impl OutputTarget for HqplayerOutput {
 
     async fn stop(&self) -> Result<(), String> {
         self.action("<Stop />").await?;
+        self.enchainement().suivante = None;
         info!(device = %self.name, "hqplayer_stop");
         Ok(())
     }
@@ -644,6 +845,31 @@ impl OutputTarget for HqplayerOutput {
         let seconds = position_ms as f64 / 1000.0;
         let xml = format!(r#"<Seek position="{seconds:.1}" />"#);
         self.action(&xml).await?;
+        Ok(())
+    }
+
+    /// #4851 — l'enchaînement par la file de HQPlayer : la suivante est
+    /// AJOUTÉE à sa playlist pendant que la piste en cours joue, sans la
+    /// vider (`clear="0"`) et sans `Play`. HQPlayer passe de lui-même à
+    /// l'entrée suivante de sa playlist ; le sondeur le voit à la durée et à
+    /// la position de `Status`, comme après un `SetNextAVTransportURI`.
+    async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        let precedente = self.enchainement().suivante.clone();
+        if let Some(precedente) = precedente {
+            if precedente == media.url {
+                debug!(device = %self.name, url = media.url, "hqplayer_suivante_deja_posee");
+                return Ok(());
+            }
+            self.retirer_la_suivante(&precedente).await?;
+            self.enchainement().suivante = None;
+        }
+        let xml = playlist_add_xml(media, false);
+        self.action(&xml).await.map_err(|e| {
+            warn!(error = %e, "hqplayer_suivante_add_failed");
+            e
+        })?;
+        self.enchainement().suivante = Some(media.url.to_string());
+        info!(device = %self.name, url = media.url, "hqplayer_suivante_posee");
         Ok(())
     }
 
@@ -664,24 +890,19 @@ impl OutputTarget for HqplayerOutput {
     async fn get_status(&self) -> Result<OutputStatus, String> {
         let response = self.command(r#"<Status subscribe="0" />"#).await?;
 
-        // #4023 — une réponse dont l'état n'est pas reconnu retombe sur
-        // `Stopped`, et `Stopped` est ce qui fait avancer la file au bout de
-        // cinq sondes puis arrêter la zone au bout de trente. Si un jour un
-        // HQPlayer répond dans une forme que ce parseur ne couvre pas, le
-        // symptôme est « l'album s'arrête après une piste » et RIEN dans le
-        // journal ne le dit. Une ligne, UNE seule par sortie : ce sondage
-        // tourne en boucle et #4025 vient justement de le faire taire.
-        if etat_reconnu(&response).is_none() && !self.etat_inconnu_dit.swap(true, Ordering::Relaxed)
-        {
-            warn!(
-                device = %self.name,
-                reponse = %response.trim().chars().take(400).collect::<String>(),
-                "hqplayer_status_etat_inconnu — aucun etat reconnu dans la reponse Status ; \
-                 lue comme `stopped`, ce qui fait avancer la file puis arreter la zone"
-            );
-        }
-
-        let state = parse_state_from_xml(&response);
+        // #6515 — ne jamais fabriquer Stopped à partir d'une réponse
+        // inconnue : le sondeur pourrait l'interpréter comme une fin de piste.
+        let Some(state) = etat_reconnu(&response) else {
+            if !self.etat_inconnu_dit.swap(true, Ordering::Relaxed) {
+                warn!(
+                    device = %self.name,
+                    reponse = %response.trim().chars().take(400).collect::<String>(),
+                    "hqplayer_status_etat_inconnu — état absent ou non reconnu ; sondage rejeté"
+                );
+            }
+            return Err("hqplayer_status_etat_inconnu: état Status absent ou non reconnu".into());
+        };
+        *self.dernier_etat() = Some(state);
         let position = extract_xml_attr(&response, "position")
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0);
@@ -703,6 +924,27 @@ impl OutputTarget for HqplayerOutput {
 
         let position_ms = (position * 1000.0) as u64;
         let duration_ms = (duration * 1000.0) as u64;
+
+        // #4851 — HQPlayer a-t-il commencé la suivante posée d'avance ? Elle
+        // devient alors la piste en cours, et un armement ultérieur n'a plus
+        // rien à retirer.
+        {
+            let mut suivi = self.enchainement();
+            if let Some(suivante) = suivi.suivante.as_deref()
+                && passee_sur_la_suivante(
+                    suivante,
+                    current_uri.as_deref(),
+                    suivi.position_ms,
+                    suivi.duree_ms,
+                    position_ms,
+                )
+            {
+                debug!(device = %self.name, uri = suivante, "hqplayer_suivante_commencee");
+                suivi.suivante = None;
+            }
+            suivi.position_ms = position_ms;
+            suivi.duree_ms = duration_ms;
+        }
 
         Ok(OutputStatus {
             state,
@@ -728,6 +970,38 @@ impl OutputTarget for HqplayerOutput {
 }
 
 /// Escape special XML characters in a string.
+/// La commande `PlaylistAdd` d'un média, `clear` vidant la playlist.
+///
+/// #6177 (kiran, fil 2233) — HQPlayer n'affichait que « HTTP stream » : seule
+/// l'URI partait. Le protocole porte les étiquettes dans un élément enfant
+/// `<metadata …/>`, dont chaque attribut est une étiquette (HQPlayer Control
+/// 6.0.1, `clControlInterface::playlistAdd` ; les mêmes clés sont relues dans
+/// `Status`). On n'écrit que ce que l'on sait : pas d'attribut vide, et aucun
+/// élément du tout sans étiquette — la commande reste alors celle d'avant.
+fn playlist_add_xml(media: &PlayMedia<'_>, clear: bool) -> String {
+    let etiquettes: String = [
+        ("artist", media.artist),
+        ("album", media.album),
+        ("song", media.title),
+    ]
+    .into_iter()
+    .filter_map(|(cle, valeur)| {
+        let valeur = valeur.map(str::trim).filter(|v| !v.is_empty())?;
+        Some(format!(r#" {cle}="{}""#, escape_xml(valeur)))
+    })
+    .collect();
+    let metadonnees = if etiquettes.is_empty() {
+        String::new()
+    } else {
+        format!("<metadata{etiquettes} />")
+    };
+    format!(
+        r#"<PlaylistAdd uri="{}" queued="0" clear="{}">{metadonnees}</PlaylistAdd>"#,
+        escape_xml(media.url),
+        if clear { 1 } else { 0 }
+    )
+}
+
 fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -770,19 +1044,28 @@ mod tests {
     #[test]
     fn parse_state_playing() {
         let xml = r#"<Status state="playing" position="10.5" duration="300.0"/>"#;
-        assert_eq!(parse_state_from_xml(xml), TransportState::Playing);
+        assert_eq!(
+            etat_reconnu(xml).expect("état reconnu"),
+            TransportState::Playing
+        );
     }
 
     #[test]
     fn parse_state_paused() {
         let xml = r#"<Status state="paused" position="10.5"/>"#;
-        assert_eq!(parse_state_from_xml(xml), TransportState::Paused);
+        assert_eq!(
+            etat_reconnu(xml).expect("état reconnu"),
+            TransportState::Paused
+        );
     }
 
     #[test]
     fn parse_state_stopped() {
         let xml = r#"<Status state="stopped"/>"#;
-        assert_eq!(parse_state_from_xml(xml), TransportState::Stopped);
+        assert_eq!(
+            etat_reconnu(xml).expect("état reconnu"),
+            TransportState::Stopped
+        );
     }
 
     #[test]
@@ -799,6 +1082,38 @@ mod tests {
         let xml = r#"<Status><Title>Test Song</Title><Artist>Test Artist</Artist></Status>"#;
         assert_eq!(extract_xml_text(xml, "Title"), Some("Test Song".into()));
         assert_eq!(extract_xml_text(xml, "Artist"), Some("Test Artist".into()));
+    }
+
+    /// #6177 — l'URI seule faisait afficher « HTTP stream » à HQPlayer.
+    #[test]
+    fn playlist_add_porte_les_etiquettes_du_morceau_6177() {
+        let media = PlayMedia {
+            url: "http://10.0.0.2:8888/stream/abc.flac",
+            title: Some("Echoes"),
+            artist: Some("Pink Floyd"),
+            album: Some("Meddle & co"),
+            ..Default::default()
+        };
+        assert_eq!(
+            playlist_add_xml(&media, true),
+            r#"<PlaylistAdd uri="http://10.0.0.2:8888/stream/abc.flac" queued="0" clear="1"><metadata artist="Pink Floyd" album="Meddle &amp; co" song="Echoes" /></PlaylistAdd>"#,
+            "#6177 : HQPlayer ne reçoit que l'URI et affiche « HTTP stream »"
+        );
+        assert!(playlist_add_xml(&media, false).contains(r#"clear="0"><metadata "#));
+    }
+
+    /// Sans étiquette connue, la commande est celle d'avant, sans élément vide.
+    #[test]
+    fn playlist_add_sans_etiquette_reste_nu() {
+        let media = PlayMedia {
+            url: "http://h/s.flac",
+            title: Some("  "),
+            ..Default::default()
+        };
+        assert_eq!(
+            playlist_add_xml(&media, false),
+            r#"<PlaylistAdd uri="http://h/s.flac" queued="0" clear="0"></PlaylistAdd>"#
+        );
     }
 
     #[test]
@@ -834,3 +1149,11 @@ mod tests {
 #[cfg(test)]
 #[path = "hqplayer_state_tests_4377.rs"]
 mod state_tests_4377;
+
+#[cfg(test)]
+#[path = "hqplayer_enchainement_tests_4851.rs"]
+pub(crate) mod enchainement_tests_4851;
+
+#[cfg(test)]
+#[path = "hqplayer_lancement_tests_6115.rs"]
+mod lancement_tests_6115;

@@ -35,6 +35,12 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_position_poller(state);
     spawn_token_refresher(state);
     spawn_tune_tested_refresher(state);
+    // #6285 — la passe des faux hi-res. Elle DORT tant que son réglage n'est
+    // pas armé (`analyse_faux_hires_active`), et sinon cède à la pause, à la
+    // chaleur, à la lecture et au créneau unique des analyses.
+    tokio::spawn(tune_core::audio::faux_hires_passe::courir(
+        state.backend.clone(),
+    ));
     spawn_upnp_advertiser(state, config).await;
     // Renderers UPnP par zone (#1750) : annonceur propre, relu à chaque
     // cycle — l'opt-in d'une zone prend effet sans redémarrage.
@@ -57,6 +63,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // dans `credits.rs` tient cette ligne : l'ordonnanceur de scan a été du
     // code mort pendant des mois pour une ligne comme celle-ci.
     crate::routes::library::credits::spawn_passe_automatique_credits(state);
+    // #4805 (13/10/2026) — la passe de nuit des albums refusés par
+    // MusicBrainz. Éteinte par défaut ; un test de câblage garde la ligne.
+    crate::routes::library::identification_lot::nuit::spawn_passe_de_nuit(state);
     spawn_community_sync(state);
     spawn_replaygain_analysis(state);
     spawn_lyrics_catchup(state);
@@ -68,6 +77,12 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // Sauvegarde cloud automatique des personnalisations (#5654). Un test de
     // câblage garde la ligne.
     crate::routes::system::sauvegarde_cloud::spawn(state);
+    // « Mes écoutes, tous serveurs » (#6510) : l'envoi des écoutes au compte,
+    // opt-in et désactivé par défaut. Un test de câblage garde la ligne.
+    tune_core::cloud::ecoutes_au_compte::spawn(state.backend.clone(), state.http_client.clone());
+    // Notes et écoutes de la communauté (#6545) : consentement séparé,
+    // désactivé par défaut. Un test de câblage garde la ligne.
+    tune_core::cloud::notes_communautaires::spawn(state.backend.clone(), state.http_client.clone());
     spawn_local_audio_rescan(state);
     // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
     // `spawn_scan_scheduler` était du code mort, la bascule des clients écrivait
@@ -1435,6 +1450,19 @@ fn spawn_telemetry_reporter(state: &AppState) {
 /// memoire. Elles sont locales et n'appellent personne.
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// L'adresse de production du battement.
+const BASE_DU_BATTEMENT: &str = "https://mozaiklabs.fr";
+
+/// `POST {base}/api/v1/heartbeat`. La base est celle de production, sauf dans
+/// un banc compilé avec `services-factices` qui en a déclaré une autre : hors
+/// de cette feature, `base_substituee` rend toujours `None` (#6336).
+fn url_du_battement() -> String {
+    let base =
+        tune_core::services_factices::base_substituee(tune_core::services_factices::MOZAIKLABS)
+            .unwrap_or_else(|| BASE_DU_BATTEMENT.to_string());
+    format!("{base}/api/v1/heartbeat")
+}
+
 /// Reprise rapprochée après un battement — ou une revalidation de clé — en
 /// échec : 1 min, puis 5, puis 15, puis la cadence horaire. Sans elle, un
 /// hôte injoignable au démarrage (réseau pas encore monté, coupure) laissait
@@ -1511,7 +1539,10 @@ pub fn plan_du_tour(settings: &tune_core::db::settings_repo::SettingsRepo) -> He
 /// comment here used to claim the loop ran "ALWAYS regardless of
 /// TUNE_TELEMETRY", and the code agreed with it: the opt-out cut nothing.
 /// The account premium refresh keeps running either way, see [`heartbeat_plan`].
-fn spawn_heartbeat(state: &AppState) {
+///
+/// `pub` pour les bancs d'essai (#6336) : ils lancent CETTE boucle, contre un
+/// faux mozaiklabs, et lisent son verdict par le vrai routeur.
+pub fn spawn_heartbeat(state: &AppState) {
     let backend = state.backend.clone();
     let services = state.services.clone();
     let outputs = state.outputs.clone();
@@ -1828,7 +1859,7 @@ fn spawn_heartbeat(state: &AppState) {
                 &settings,
                 tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
                 client
-                    .post("https://mozaiklabs.fr/api/v1/heartbeat")
+                    .post(url_du_battement())
                     .header("Accept", "application/json")
                     .json(&payload),
             )
@@ -2216,6 +2247,14 @@ async fn refresh_account_premium(
             .await
             .ok();
         }
+        // Clé du serveur (#6603) : inscrite sur le compte si elle ne l'est
+        // pas encore — un serveur relié avant la version qui l'inscrit.
+        tune_core::cloud::cle_serveur::inscrire_depuis_les_reglages(
+            backend,
+            tune_core::http::client::shared(),
+        )
+        .await
+        .ok();
 
         // 🔴 C'est ICI que le défaut devenait permanent.
         //
@@ -2607,14 +2646,20 @@ fn spawn_radio_logo_refresh(state: &AppState) {
                 annuaire_injoignable = bilan.annuaire_injoignable,
                 "radio_logos_backfilled_at_startup"
             );
-            if !bilan.annuaire_injoignable {
-                return;
-            }
-            let Some(secs) = delais.next() else {
-                tracing::warn!("radio_logos_directory_unreachable_giving_up");
-                return;
+            // #6516 — l'annuaire se relève CHAQUE JOUR (cache local, `ETag`).
+            // Relevé réussi : rendez-vous dans 24 h. Échec : les relances
+            // rapprochées d'avant, puis le rythme quotidien — une panne ne
+            // fait plus abandonner le relevé pour toute la vie du serveur.
+            let attente = if bilan.annuaire_a_jour {
+                delais = RATTRAPAGE_LOGOS_DELAIS_SECS.iter();
+                crate::routes::radios_annuaire::PERIODE_DE_RELEVE
+            } else if let Some(secs) = delais.next() {
+                std::time::Duration::from_secs(*secs)
+            } else {
+                tracing::warn!("radio_logos_directory_unreachable_retry_tomorrow");
+                crate::routes::radios_annuaire::PERIODE_DE_RELEVE
             };
-            tokio::time::sleep(std::time::Duration::from_secs(*secs)).await;
+            tokio::time::sleep(attente).await;
         }
     });
 }
@@ -2848,6 +2893,41 @@ pub async fn any_local_output_playing(state: &AppState) -> bool {
     false
 }
 
+/// #6119 — le parc local à PUBLIER (fiche de diagnostic, `GET /devices/audio`),
+/// sans jamais sonder le matériel pendant qu'une sortie locale joue.
+///
+/// Gros Bidon (fil 2216, 1.0.0-rc3, Windows, SMSL SU-8 en WASAPI, backend
+/// ASIO choisi) : ouvrir la page Zones coupait la lecture, deux fois de suite.
+/// La page appelle `GET /system/diagnostics`, qui énumérait les sorties avec
+/// le backend affiché, donc ASIO : `select_host("asio")` charge chaque pilote
+/// ASIO, celui du SU-8 prend l'appareil, et le flux WASAPI qui jouait meurt
+/// (`audio_stream_device_lost` 10 ms avant `local_audio_host_selected
+/// backend="asio"`). `GET /devices/audio` se gardait déjà ainsi (DEvir) ; la
+/// fiche de diagnostic, non. Les deux passent désormais par ici.
+#[cfg(feature = "local-audio")]
+pub async fn parc_local_sans_couper_la_lecture<F, Fut>(
+    state: &AppState,
+    enumerer: F,
+) -> Vec<tune_core::outputs::local::AudioDevice>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Vec<tune_core::outputs::local::AudioDevice>>,
+{
+    if any_local_output_playing(state).await {
+        tune_core::outputs::local::cached_audio_devices()
+    } else {
+        enumerer().await
+    }
+}
+
+#[cfg(all(test, feature = "local-audio"))]
+#[path = "parc_local_pendant_la_lecture_6119_tests.rs"]
+mod parc_local_pendant_la_lecture_6119_tests;
+
+#[cfg(all(test, feature = "local-audio"))]
+#[path = "sortie_locale_disparue_6551_tests.rs"]
+mod sortie_locale_disparue_6551_tests;
+
 /// Whether ANY zone (local or network) is currently playing, read from the
 /// in-memory playback state — no device or network probing. Used on Linux to
 /// suppress the periodic audio re-enumeration during a listening session:
@@ -2947,6 +3027,70 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
         None => return,
     };
 
+    appliquer_le_parc_local(state, &devices, &configured_backend, is_asio_configured).await;
+}
+
+/// Ce que le rescan à chaud peut dire d'une sortie locale ABSENTE de son
+/// balayage (#6551).
+#[cfg(feature = "local-audio")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PorteeDuRescanLocal {
+    /// Le balayage couvre l'hôte de cette sortie : son absence veut dire
+    /// qu'elle a disparu (AirPods éloignés, DAC USB débranché).
+    Balayee,
+    /// Le balayage ne PEUT pas la voir : son absence ne prouve rien, et la
+    /// retirer du registre appellerait le `Drop` du pilote ASIO (`abort()`,
+    /// DEvir, 19/06).
+    HorsDePortee,
+}
+
+/// #6551 — la sortie absente du balayage a-t-elle disparu, ou le balayage
+/// ne pouvait-il simplement pas la voir ?
+///
+/// Le rescan à chaud n'ouvre JAMAIS l'hôte ASIO : il force WASAPI quand ASIO
+/// est configuré, et seule la valeur `asio` ouvre cet hôte
+/// (`plan_audio_enumeration`, `select_host`). Une sortie ASIO est donc
+/// toujours hors de sa portée ; toute autre sortie locale y est.
+///
+/// `sortie` vaut `(hôte d'origine, backend d'ouverture)` d'une `LocalOutput`,
+/// ou `None` pour une sortie `local:` d'un autre type : on ne sait pas ce qui
+/// l'a énumérée, on la garde.
+///
+/// La garde qu'elle remplace (`was_in_scan_scope`, 19/06) cherchait le nom de
+/// la sortie dans le balayage même dont elle était absente : elle était
+/// toujours fausse, et AUCUNE sortie disparue n'était retirée, sur aucune
+/// plateforme — la zone restait « en ligne » (alec_eiffel, fil 2340).
+#[cfg(feature = "local-audio")]
+pub(crate) fn portee_du_rescan_local(sortie: Option<(Option<&str>, &str)>) -> PorteeDuRescanLocal {
+    let Some((origine, backend_d_ouverture)) = sortie else {
+        return PorteeDuRescanLocal::HorsDePortee;
+    };
+    let asio = match origine.map(str::trim).filter(|o| !o.is_empty()) {
+        Some(o) => o.eq_ignore_ascii_case("asio"),
+        // Origine inconnue : le backend d'ouverture vaut alors le réglage tel
+        // quel (`openable_local_backend`), `asio` compris.
+        None => backend_d_ouverture.eq_ignore_ascii_case("asio"),
+    };
+    if asio {
+        PorteeDuRescanLocal::HorsDePortee
+    } else {
+        PorteeDuRescanLocal::Balayee
+    }
+}
+
+/// Le parc que vient de rendre le balayage, appliqué au registre et aux zones :
+/// enregistrer les nouvelles sorties, retirer les disparues et mettre leurs
+/// zones hors ligne, remettre en ligne celles qui reviennent.
+///
+/// Séparé de [`rescan_local_audio_devices`] pour qu'un test puisse lui donner
+/// un parc sans matériel (#6551).
+#[cfg(feature = "local-audio")]
+pub(crate) async fn appliquer_le_parc_local(
+    state: &AppState,
+    devices: &[tune_core::outputs::local::AudioDevice],
+    configured_backend: &str,
+    is_asio_configured: bool,
+) {
     {
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
         // #2269 — l'identité des sorties locales, AVANT d'enregistrer ou de
@@ -3040,7 +3184,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
 
         let mut registered_count = 0;
 
-        for dev in &devices {
+        for dev in devices {
             let device_id = format!("local:{}", dev.name);
 
             // Already registered — still ensure a zone exists (may have been deleted)
@@ -3062,7 +3206,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             // machine disparaissait sur un périphérique que personne n'avait
             // demandé en exclusif (jfpaquet, Asus Essence STX II).
             let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
-                &configured_backend,
+                configured_backend,
                 Some(dev.backend.as_str()),
                 state.requested_exclusive_mode(),
                 // #5353 — le `true` écrit par le choix d'ASIO n'est pas une
@@ -3073,7 +3217,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
                 dev.name.clone(),
                 (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
                 statut_exclusif.effective,
-                &configured_backend,
+                configured_backend,
             )
             .with_origin_host(&dev.backend);
             outputs.register(Box::new(local_out));
@@ -3090,21 +3234,16 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             new_devices_to_zone.push((device_id, dev.name.clone(), dev.is_default));
         }
 
-        // Remove WASAPI devices that have disappeared (USB DAC unplugged),
-        // but only if not actively playing.
-        // On Windows, only remove devices that were found in the current
-        // scan backend (WASAPI). Devices registered by ASIO at startup
-        // won't appear in WASAPI scans — don't remove them, as dropping
+        // Remove devices that have disappeared (AirPods out of range, USB DAC
+        // unplugged), but only if not actively playing.
+        // Devices registered by ASIO at startup never appear in this scan
+        // (it never opens the ASIO host) — don't remove them, as dropping
         // ASIO outputs can crash the process via the driver FFI.
         for old_id in &existing_ids {
             if new_device_ids.contains(old_id) {
                 continue;
             }
 
-            // Only remove if the device name matches one we could have
-            // discovered with the current scan backend.  If the scan used
-            // WASAPI but this device was registered by ASIO at startup,
-            // it won't be in new_device_ids but we must NOT remove it.
             // If the scan returned nothing, skip all removals — an empty
             // result means the backend couldn't enumerate (e.g. WASAPI held
             // exclusively by foobar2000), not that everything disappeared.
@@ -3112,24 +3251,31 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
                 debug!("local_audio_rescan_empty_skipping_all_removals");
                 break;
             }
-            let old_name = old_id.strip_prefix("local:").unwrap_or(old_id);
-            let was_in_scan_scope = devices.iter().any(|d| d.name == old_name);
-            if !was_in_scan_scope {
-                debug!(device_id = %old_id, "local_audio_skipping_removal_different_backend");
-                continue;
-            }
 
-            let is_playing = if let Some(output) = outputs.get(old_id) {
+            // #6551 — l'absence ne vaut disparition que pour une sortie que ce
+            // balayage pouvait voir : on le demande à l'hôte qui l'a énumérée.
+            let (portee, is_playing) = if let Some(output) = outputs.get(old_id) {
                 let output = output.lock().await;
-                match output.get_status().await {
+                let portee = portee_du_rescan_local(
+                    output
+                        .as_any()
+                        .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+                        .map(|l| (l.origin_host(), l.audio_backend())),
+                );
+                let is_playing = match output.get_status().await {
                     Ok(status) => {
                         status.state == tune_core::outputs::traits::TransportState::Playing
                     }
                     Err(_) => false,
-                }
+                };
+                (portee, is_playing)
             } else {
-                false
+                (PorteeDuRescanLocal::HorsDePortee, false)
             };
+            if portee == PorteeDuRescanLocal::HorsDePortee {
+                debug!(device_id = %old_id, "local_audio_skipping_removal_different_backend");
+                continue;
+            }
 
             if !is_playing {
                 outputs.remove(old_id);
@@ -3178,12 +3324,27 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
         .map(str::to_owned);
 
         for (device_id, dev_name, is_default) in &new_devices_to_zone {
+            let zone_connue = zone_repo.get_by_device_id(device_id).ok().flatten();
+            // #6551 — une zone mise hors ligne par la phase 2a revient en
+            // ligne d'elle-même avec son appareil, et les télécommandes le
+            // savent (miroir de l'événement `online: false`).
+            let revient_en_ligne = zone_connue.as_ref().is_some_and(|z| !z.online);
+            if revient_en_ligne {
+                state.event_bus.emit_typed(
+                    tune_core::event_types::EventType::ZoneUpdated,
+                    serde_json::json!({ "device_id": device_id, "online": true }),
+                );
+                info!(device_id = %device_id, "local_audio_zone_back_online");
+            }
             // When ASIO is configured, don't create new zones for WASAPI
             // devices discovered by the fallback rescan. Users should only
             // see ASIO zones (e.g. "HoloAudio ASIO Driver"), not confusing
             // generic WASAPI names like "Haut-parleurs" for the same DAC.
             // Only update online status for WASAPI zones that already exist.
             if is_asio_configured {
+                if zone_connue.is_some() {
+                    let _ = zone_repo.set_online_by_device(device_id, true);
+                }
                 continue;
             }
             // #1770 : même règle qu'au démarrage — l'étiquette générique ne se
@@ -3200,11 +3361,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             // système. Les autres sorties restent enregistrées pour que
             // l'interface puisse les proposer à la création manuelle. Une zone
             // déjà connue est reconnectée normalement.
-            let zone_exists = zone_repo
-                .get_by_device_id(device_id)
-                .ok()
-                .flatten()
-                .is_some();
+            let zone_exists = zone_connue.is_some();
             let is_system_default = system_default_device_id.as_deref() == Some(device_id.as_str());
             let action =
                 crate::startup::local_zone_action(zone_exists, auto_create, is_system_default);
@@ -3440,6 +3597,42 @@ mod tests_licence_proprietaire_battement {
         assert!(
             source[debut..fin].contains("routes::system::sauvegarde_cloud::spawn(state);"),
             "la passe de sauvegarde cloud n'est plus lancee au demarrage"
+        );
+    }
+
+    /// #6510 — sans cet appel, l'envoi des écoutes au compte serait du code
+    /// mort : la bascule dirait « activé » et rien ne partirait jamais.
+    #[test]
+    fn l_envoi_des_ecoutes_au_compte_est_lance() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains(concat!(
+                "tune_core::cloud::ecoutes_au_compte::",
+                "spawn(state.backend.clone(), state.http_client.clone());"
+            )),
+            "l'envoi des écoutes au compte n'est plus lancé au démarrage"
+        );
+    }
+
+    /// #6545 — sans cet appel, le partage communautaire serait du code mort :
+    /// la bascule dirait « activé » et rien ne partirait jamais.
+    #[test]
+    fn le_partage_communautaire_est_lance() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains(concat!(
+                "tune_core::cloud::notes_communautaires::",
+                "spawn(state.backend.clone(), state.http_client.clone());"
+            )),
+            "le partage communautaire n'est plus lancé au démarrage"
         );
     }
 

@@ -51,6 +51,8 @@ async fn scan_de_demarrage(db: &Arc<dyn DbBackend>) -> serde_json::Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn un_album_renomme_n_est_pas_relu_a_chaque_demarrage_5919() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let r = racine("album-renomme-5919");
     let musique = r.join("musique");
     let (_, pistes) = album_dans(&musique, "Disc 13", None, None);

@@ -1,0 +1,19 @@
+{
+  "attendu": {
+    "code": "alg",
+    "resultat": "refuse"
+  },
+  "contexte": {
+    "grace_expiration": 0,
+    "maintenant": 1793000000,
+    "server_id": "6f1c1f5e-2b0a-4c2e-9d3b-7a51c0de0001"
+  },
+  "defi": {
+    "defi": "c2Vzc2lvbi1kZWZpLWRlLXRlc3QtMDEyMzQ1Njc4OTAx",
+    "signature": "RViENs3a2oEShmYoVcnKtpRhTeITKAEbXRLpLOeL_IB535Lz14CUFPctu7VuXP4EcCvw8HhiTptRJDAbLmJdCg"
+  },
+  "description": "alg = none, sans signature.",
+  "laissez_passer": "eyJhbGciOiJub25lIiwia2lkIjoidGVzdC0yMDI2LTEwIiwidHlwIjoidHVuZS1wYXNzK2p3dCJ9.eyJpc3MiOiJodHRwczovL21vemFpa2xhYnMuZnIiLCJhdWQiOiJ0dW5lLXJlbW90ZSIsInN1YiI6ImNwdF84ZjJhNjEiLCJzaWQiOiI2ZjFjMWY1ZS0yYjBhLTRjMmUtOWQzYi03YTUxYzBkZTAwMDEiLCJkaWQiOiJhcHBfZWRfMDEiLCJjbmYiOnsiYWxnIjoiRWQyNTUxOSIsInBrIjoibjBsRG5wMndsYnhCRWUwbDAxZVYyREc4VmFCSDlMSFg5cTdqZDN1MEVpQSJ9LCJwMnAiOmZhbHNlLCJpYXQiOjE3OTI5OTk0MDAsIm5iZiI6MTc5Mjk5OTQwMCwiZXhwIjoxNzkzMDAzMDAwLCJqdGkiOiJqdGktMDAwMSIsInYiOjF9.",
+  "nom": "mauvais_alg_none",
+  "publication": "jeu_de_cles.json"
+}

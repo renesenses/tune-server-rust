@@ -34,6 +34,7 @@ pub fn router() -> Router<AppState> {
         .route("/bridge/access-link", get(bridge_access_link))
         .route("/bridge/enable", post(bridge_enable))
         .route("/bridge/disable", post(bridge_disable))
+        .route("/bridge/rotate-token", post(bridge_rotate_token))
         .route("/license/status", get(license_status))
         .route("/license/activate", post(license_activate))
         .route("/license/deactivate", post(license_deactivate))
@@ -370,6 +371,11 @@ async fn sso_callback(
         let http_client = state.http_client.clone();
         tokio::spawn(async move {
             tune_core::cloud::library_sync::lier_depuis_les_reglages(&backend, &http_client)
+                .await
+                .ok();
+            // Clé du serveur (#6603) : inscrite sur le compte une fois le
+            // serveur relié, si le pont l'a créée.
+            tune_core::cloud::cle_serveur::inscrire_depuis_les_reglages(&backend, &http_client)
                 .await
                 .ok();
         });
@@ -1003,6 +1009,15 @@ async fn bridge_status(State(state): State<AppState>) -> Json<Value> {
         "server_id": server_id,
         "relay_url": bridge_url,
         "has_token": bridge_token.is_some(),
+        // Écoute à distance par compte (#6603) : l'écran « Accès à distance »
+        // explique le parcours ; l'ancien lien est obsolète, et coupé dès que
+        // le relais l'a dit.
+        // Tant que le relais n'ouvre pas de sessions par laissez-passer, rien
+        // ne change : le lien n'est pas obsolète et rien n'est à expliquer.
+        "acces_par_compte": tune_core::cloud::cle_serveur::laissez_passer_actif(&settings)
+            .then_some(MESSAGE_ACCES_PAR_COMPTE),
+        "lien_obsolete": tune_core::cloud::cle_serveur::laissez_passer_actif(&settings),
+        "lien_herite_coupe": tune_core::cloud::cle_serveur::lien_herite_coupe(&settings),
         "access_url": if enabled {
             Some(format!("https://bridge.mozaiklabs.fr/{server_id}/"))
         } else {
@@ -1010,6 +1025,10 @@ async fn bridge_status(State(state): State<AppState>) -> Json<Value> {
         },
     }))
 }
+
+/// Ce que les Réglages disent à la place du lien d'accès (#6603).
+pub const MESSAGE_ACCES_PAR_COMPTE: &str =
+    "Ouvrez Tune Remote et connectez-vous à votre compte mozaiklabs";
 
 /// Lien d'accès à distance, jeton compris, pour le PROPRIÉTAIRE seulement.
 ///
@@ -1024,16 +1043,7 @@ async fn bridge_access_link(
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let enabled = settings
-        .get("bridge_enabled")
-        .ok()
-        .flatten()
-        .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false)
-        || std::env::var("TUNE_BRIDGE_ENABLED")
-            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false);
-    if !enabled {
+    if !pont_active(&settings) {
         return (
             StatusCode::CONFLICT,
             Json(json!({"error": "bridge_disabled"})),
@@ -1052,21 +1062,103 @@ async fn bridge_access_link(
         )
             .into_response();
     };
-    let server_id = TelemetryReporter::get_or_create_server_id(&settings);
+    reponse_lien_d_acces(&settings, &token)
+}
+
+/// Le pont est-il activé (réglage `bridge_enabled`, ou `TUNE_BRIDGE_ENABLED`) ?
+fn pont_active(settings: &SettingsRepo) -> bool {
+    settings
+        .get("bridge_enabled")
+        .ok()
+        .flatten()
+        .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+        || std::env::var("TUNE_BRIDGE_ENABLED")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false)
+}
+
+/// La réponse porteuse du lien d'accès (`…/{server_id}/#token=…`), commune à
+/// `bridge_access_link` et à `bridge_rotate_token`. Jamais mise en cache.
+fn reponse_lien_d_acces(settings: &SettingsRepo, token: &str) -> axum::response::Response {
+    // #6603 — l'écoute à distance passe par le compte mozaiklabs. Pendant la
+    // coexistence, l'ancien lien reste servi, marqué obsolète ; une fois que
+    // le relais a dit qu'il ne l'accepte plus, il n'existe plus : 410.
+    if tune_core::cloud::cle_serveur::lien_herite_coupe(settings) {
+        return (
+            StatusCode::GONE,
+            Json(json!({
+                "error": "lien_obsolete",
+                "message": MESSAGE_ACCES_PAR_COMPTE,
+            })),
+        )
+            .into_response();
+    }
+    let server_id = TelemetryReporter::get_or_create_server_id(settings);
     let access_url = format!("https://bridge.mozaiklabs.fr/{server_id}/");
     let link = format!("{access_url}#token={token}");
+    let obsolete = tune_core::cloud::cle_serveur::laissez_passer_actif(settings);
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(json!({
             "server_id": server_id,
             "access_url": access_url,
             "link": link,
+            "obsolete": obsolete,
+            "message": obsolete.then_some(MESSAGE_ACCES_PAR_COMPTE),
         })),
     )
         .into_response()
 }
 
-async fn bridge_enable(State(state): State<AppState>) -> impl IntoResponse {
+/// Renouvelle le lien d'accès à distance : nouveau jeton de pont, et le
+/// relais oublie l'ancien.
+///
+/// Administrateur seulement dès que l'authentification est active, 409 tant
+/// que le pont est éteint (comme `bridge_access_link`). Le nouveau jeton est
+/// enregistré, puis remis au client du relais s'il tourne : la session
+/// ouverte avec l'ancien se referme et se réinscrit avec le nouveau
+/// (`RelayClient::renouveler_jeton`). Le relais oublie les jetons d'un serveur
+/// dont la connexion se ferme : l'ancien lien, ses QR codes et les apps
+/// appairées avec lui cessent d'ouvrir quoi que ce soit.
+///
+/// Réponse : le nouveau lien, de la forme de `bridge_access_link`.
+async fn bridge_rotate_token(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if !pont_active(&settings) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "bridge_disabled"})),
+        )
+            .into_response();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    if let Err(e) = settings.set("bridge_token", &token) {
+        warn!(error = %e, "bridge token renewal not saved");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "bridge_token_not_saved"})),
+        )
+            .into_response();
+    }
+    #[cfg(feature = "cloud-relay")]
+    if let Some(client) = state.relay_client.get() {
+        client.renouveler_jeton(token.clone());
+    }
+    // Jamais le jeton dans le journal.
+    info!("bridge token renewed");
+    reponse_lien_d_acces(&settings, &token)
+}
+
+/// Active le pont. Administrateur seulement dès que l'authentification est
+/// active : la réponse porte le jeton de pont.
+async fn bridge_enable(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     // Premium gate: Cloud Relay requires Premium
     if let Err(resp) = crate::premium_guard::require_premium(
         &state.license,
@@ -1092,17 +1184,26 @@ async fn bridge_enable(State(state): State<AppState>) -> impl IntoResponse {
     let server_id = TelemetryReporter::get_or_create_server_id(&settings);
     info!(server_id = %server_id, "bridge enabled");
 
-    Json(json!({
+    let mut reponse = json!({
         "enabled": true,
         "server_id": server_id,
-        "bridge_token": token,
         "access_url": format!("https://bridge.mozaiklabs.fr/{server_id}/"),
         "note": "restart server to activate the relay connection"
-    }))
-    .into_response()
+    });
+    // #6603 — le jeton du pont ne sert plus qu'à l'ancien lien. Une fois ce
+    // lien coupé par le relais, il n'a plus à sortir d'ici.
+    if !tune_core::cloud::cle_serveur::lien_herite_coupe(&settings) {
+        reponse["bridge_token"] = json!(token);
+    }
+    Json(reponse).into_response()
 }
 
-async fn bridge_disable(State(state): State<AppState>) -> Json<Value> {
+/// Éteint le pont. Administrateur seulement dès que l'authentification est
+/// active.
+async fn bridge_disable(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let _ = settings.set("bridge_enabled", "false");
     info!("bridge disabled");

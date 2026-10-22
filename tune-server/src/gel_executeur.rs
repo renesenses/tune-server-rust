@@ -294,10 +294,23 @@ pub fn demarrer_en_production(dossier: PathBuf) -> Arc<Veille> {
 }
 
 fn ecrire_le_releve(dossier: &Path, texte: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+    ecrire_le_releve_avec(dossier, |fichier| fichier.write_all(texte.as_bytes()))
+}
+
+/// Le nom public n'apparaît qu'une fois le relevé COMPLET. Un lecteur du
+/// rapport de bogue peut parcourir ce dossier pendant l'écriture (#6346).
+/// Le temporaire est sur le même disque et ne porte pas le nom d'un relevé.
+fn ecrire_le_releve_avec(
+    dossier: &Path,
+    ecrire: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<PathBuf, String> {
     let horodatage = horodatage().replace([':', '-'], "");
     let chemin = dossier.join(format!("{PREFIXE_RELEVE}{horodatage}{SUFFIXE_RELEVE}"));
     std::fs::create_dir_all(dossier).map_err(|e| e.to_string())?;
-    std::fs::write(&chemin, texte).map_err(|e| e.to_string())?;
+    let mut temporaire = tempfile::NamedTempFile::new_in(dossier).map_err(|e| e.to_string())?;
+    ecrire(temporaire.as_file_mut()).map_err(|e| e.to_string())?;
+    temporaire.persist(&chemin).map_err(|e| e.to_string())?;
     elaguer_les_releves(dossier, PLAFOND_RELEVES);
     Ok(chemin)
 }
@@ -581,7 +594,15 @@ mod tests {
         let mut trouve = Vec::new();
         while debut.elapsed() < Duration::from_millis(3500) && trouve.is_empty() {
             std::thread::sleep(Duration::from_millis(50));
-            trouve = fichiers(dir.path());
+            // Seuls les noms définitifs sont des relevés : le temporaire
+            // d'une écriture en cours n'est pas encore publié.
+            trouve = fichiers(dir.path())
+                .into_iter()
+                .filter(|p| {
+                    let nom = p.file_name().unwrap().to_string_lossy();
+                    nom.starts_with(PREFIXE_RELEVE) && nom.ends_with(SUFFIXE_RELEVE)
+                })
+                .collect();
         }
         assert_eq!(trouve.len(), 1, "un relevé attendu PENDANT le gel");
         let texte = std::fs::read_to_string(&trouve[0]).unwrap();
@@ -601,6 +622,66 @@ mod tests {
         );
         drop(veille);
         rt.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// Un lecteur arrive exactement entre deux écritures : il ne voit aucun
+    /// relevé partiel. Les canaux imposent cet ordre sans délai ni retry.
+    #[test]
+    fn un_releve_n_est_visible_qu_apres_son_ecriture_complete_6346() {
+        use std::io::Write;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (commence, debut) = mpsc::channel();
+        let (reprendre, reprise) = mpsc::channel();
+        let chemin = dir.path().to_path_buf();
+        let auteur = std::thread::spawn(move || {
+            ecrire_le_releve_avec(&chemin, |fichier| {
+                fichier.write_all("gel_executeur — debut\n".as_bytes())?;
+                commence.send(()).unwrap();
+                reprise.recv().unwrap();
+                fichier.write_all(b"== lectures SQLite en cours ==\nfin\n")
+            })
+        });
+        debut.recv().unwrap();
+        let pendant = derniers_releves(dir.path(), 10);
+        // Libérer puis joindre le fil AVANT les assertions, même si le témoin
+        // rougit : aucune écriture détachée ne survit au dossier temporaire.
+        reprendre.send(()).unwrap();
+        let publie = auteur.join().unwrap().unwrap();
+        assert_eq!(
+            pendant,
+            (vec![], 0),
+            "un relevé incomplet a été publié pendant son écriture"
+        );
+        let (releves, total) = derniers_releves(dir.path(), 10);
+        assert_eq!(total, 1);
+        assert_eq!(releves.len(), 1);
+        assert_eq!(
+            releves[0].1,
+            "gel_executeur — debut\n== lectures SQLite en cours ==\nfin\n"
+        );
+        assert!(publie.is_file());
+        assert_eq!(
+            fichiers(dir.path()).len(),
+            1,
+            "temporaire laissé sur disque"
+        );
+    }
+
+    #[test]
+    fn une_ecriture_de_releve_interrompue_ne_publie_rien_6346() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let erreur = ecrire_le_releve_avec(dir.path(), |fichier| {
+            fichier.write_all(b"debut seulement")?;
+            Err(std::io::Error::other("ecriture interrompue pour le temoin"))
+        })
+        .unwrap_err();
+        assert!(erreur.contains("ecriture interrompue pour le temoin"));
+        assert_eq!(derniers_releves(dir.path(), 10), (vec![], 0));
+        assert!(fichiers(dir.path()).is_empty(), "temporaire non nettoyé");
     }
 
     /// Fil 2117/2124 : `TUNE_DATA_DIR` d'abord (Tune OS le pose), une valeur

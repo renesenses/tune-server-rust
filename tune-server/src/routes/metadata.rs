@@ -584,11 +584,33 @@ pub(crate) async fn edit_track(
     if let Some(ref v) = body.title {
         track.title = v.clone();
     }
-    if let Some(ref v) = body.artist {
-        track.artist_name = Some(v.clone());
-    }
-    if let Some(ref v) = body.album {
-        track.album_title = Some(v.clone());
+    // #6245 — un artiste donné par son NOM passe par le chemin de
+    // `batch_set_artist` : l'artiste de ce nom, ou un nouveau, puis son
+    // `artist_id`. Ranger le nom dans `track.artist_name` ne l'enregistrait
+    // pas (`tracks` n'a pas cette colonne) ; et la tenue, posée plus bas,
+    // figeait alors l'ANCIEN `artist_id`, qu'aucun rescan ne défaisait.
+    // Un `artist_id` envoyé avec le nom l'emporte (bloc suivant). Un nom vide
+    // ne change pas l'artiste.
+    let nom_artiste = body
+        .artist
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && body.artist_id.is_none());
+    if let Some(nom) = nom_artiste {
+        match artiste_par_nom(&state.backend, nom) {
+            Ok((artiste, aid, _)) => {
+                track.artist_id = Some(aid);
+                track.artist_name = Some(artiste.name);
+            }
+            Err(e) => {
+                tracing::warn!(track_id = id, error = %e, "edit_track_artiste_par_nom");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Artiste « {nom} » impossible à enregistrer : {e}"),
+                )
+                    .into_response();
+            }
+        }
     }
     // #2574 — même geste que pour `album_id` juste en dessous : on rattache, et
     // on rafraîchit le nom porté par la piste pour que l'écran qui la relit
@@ -618,6 +640,33 @@ pub(crate) async fn edit_track(
         track.album_id = Some(aid);
         if let Ok(Some(album)) = AlbumRepo::with_backend(state.backend.clone()).get(aid) {
             track.album_title = Some(album.title);
+        }
+    }
+    // #6270 — un album donné par son TITRE, même chemin que l'artiste
+    // (#6245) : l'album de ce titre chez le même artiste, sinon un nouveau,
+    // puis son `album_id`. Ranger le titre dans `track.album_title` ne
+    // l'enregistrait pas (`tracks` n'a pas cette colonne), et la tenue figeait
+    // l'ANCIEN `album_id`. Un `album_id` envoyé l'emporte ; un titre vide ne
+    // change pas l'album.
+    let titre_album = body
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && body.album_id.is_none());
+    if let Some(titre) = titre_album {
+        match album_par_titre(&state.backend, titre, &track) {
+            Ok((album, alid, _)) => {
+                track.album_id = Some(alid);
+                track.album_title = Some(album.title);
+            }
+            Err(e) => {
+                tracing::warn!(track_id = id, error = %e, "edit_track_album_par_titre");
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("Album « {titre} » impossible à enregistrer : {e}"),
+                )
+                    .into_response();
+            }
         }
     }
     if let Some(ref v) = body.genre {
@@ -661,10 +710,14 @@ pub(crate) async fn edit_track(
         if body.title.is_some() {
             champs.push(Champ::Titre);
         }
-        if body.artist.is_some() || body.artist_id.is_some() {
+        // #6245 — tenu seulement si l'artiste a réellement changé en base :
+        // `track` porte ici le NOUVEL `artist_id`, c'est lui que la tenue fige.
+        if nom_artiste.is_some() || body.artist_id.is_some() {
             champs.push(Champ::Artiste);
         }
-        if body.album.is_some() || body.album_id.is_some() {
+        // #6270 — tenu seulement si l'album a réellement changé : `track`
+        // porte ici le NOUVEL `album_id`.
+        if titre_album.is_some() || body.album_id.is_some() {
             champs.push(Champ::Album);
         }
         if body.album_artist.is_some() {
@@ -823,6 +876,73 @@ struct BatchSetArtist {
 ///
 /// Aucun rapprochement flou : « Art Blakey » et « Art Blakey & The Jazz
 /// Messengers » sont deux artistes, et c'est à l'utilisateur de le dire.
+/// L'album que désigne un TITRE saisi pour la piste `track` : l'album de ce
+/// titre (sans tenir compte de la casse) chez le même artiste, sinon un album
+/// créé pour lui. Rend l'album, son id, et vrai s'il vient d'être créé.
+///
+/// #6270 — l'artiste est celui de l'album ACTUEL de la piste (renommer
+/// l'album d'une piste la garde dans la discographie du même artiste), à
+/// défaut l'artiste de la piste — déjà mis à jour si l'édition le change.
+/// Sans aucun artiste, seul un album existant de ce titre est repris.
+pub(crate) fn album_par_titre(
+    backend: &Arc<dyn DbBackend>,
+    titre: &str,
+    track: &tune_core::db::models::Track,
+) -> Result<(tune_core::db::models::Album, i64, bool), String> {
+    let repo = AlbumRepo::with_backend(backend.clone());
+    let artiste_de_l_album = track
+        .album_id
+        .and_then(|a| repo.get(a).ok().flatten())
+        .and_then(|a| a.artist_id);
+    let (album, cree) = match artiste_de_l_album.or(track.artist_id) {
+        Some(aid) => match repo
+            .get_by_title_and_artist(titre, aid, None)
+            .map_err(|e| e.to_string())?
+        {
+            Some(a) => (a, false),
+            None => (
+                repo.get_or_create(titre, aid, None)
+                    .map_err(|e| e.to_string())?,
+                true,
+            ),
+        },
+        None => (
+            repo.get_by_title(titre)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "aucun artiste pour créer l'album".to_string())?,
+            false,
+        ),
+    };
+    let id = album.id.ok_or_else(|| "album has no id".to_string())?;
+    Ok((album, id, cree))
+}
+
+/// L'artiste que désigne un NOM saisi : l'artiste existant de ce nom (sans
+/// tenir compte de la casse), sinon un artiste créé. Rend l'artiste, son id,
+/// et vrai s'il vient d'être créé.
+///
+/// #6245 — LE chemin d'un artiste donné par son nom, pour toutes les routes
+/// d'édition : `batch_set_artist`, `edit_track` et le tagger. `tracks` n'a
+/// pas de colonne `artist_name` ; seul `artist_id` désigne l'artiste d'une
+/// piste. Un nom rangé ailleurs est perdu en silence.
+pub(crate) fn artiste_par_nom(
+    backend: &Arc<dyn DbBackend>,
+    nom: &str,
+) -> Result<(tune_core::db::models::Artist, i64, bool), String> {
+    let artist_repo = ArtistRepo::with_backend(backend.clone());
+    let (artiste, cree) = match artist_repo.get_by_name(nom) {
+        Ok(Some(a)) => (a, false),
+        _ => (
+            artist_repo
+                .get_or_create(nom, None, None)
+                .map_err(|e| e.to_string())?,
+            true,
+        ),
+    };
+    let id = artiste.id.ok_or_else(|| "artist has no id".to_string())?;
+    Ok((artiste, id, cree))
+}
+
 async fn batch_set_artist(
     State(state): State<AppState>,
     Json(body): Json<BatchSetArtist>,
@@ -843,26 +963,11 @@ async fn batch_set_artist(
             .into_response();
     }
 
-    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
-    let (artiste, cree) = match artist_repo.get_by_name(&nom) {
-        Ok(Some(a)) => (a, false),
-        _ => match artist_repo.get_or_create(&nom, None, None) {
-            Ok(a) => (a, true),
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()})),
-                )
-                    .into_response();
-            }
-        },
-    };
-    let Some(artist_id) = artiste.id else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "artist has no id"})),
-        )
-            .into_response();
+    let (artiste, artist_id, cree) = match artiste_par_nom(&state.backend, &nom) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+        }
     };
 
     let mut updated = 0i64;
@@ -1247,13 +1352,52 @@ async fn enrich_artist(
         .or_else(|| std::env::var("LASTFM_API_KEY").ok())
         .unwrap_or_default();
 
-    if lastfm_key.is_empty() {
-        // Même forme que l'absence de clé Radio France (`podcasts.rs`) : un
-        // code stable pour qui programme contre l'API, le nom exact du réglage
-        // qui active la source, et un message dans la langue de l'interface —
-        // là où ne partait qu'une phrase technique anglaise. Le statut reste
-        // 200 : le client déployé lit `data`/`bio`, ne trouve rien et annonce
-        // « aucune information trouvée », exactement comme avant.
+    // Client partagé : voir `tune_core::http::client`. Apporte aussi un délai
+    // d'attente, qu'un client reqwest construit à la main n'a pas du tout.
+    let client = tune_core::http::client::shared();
+    let nom = artist.name.as_str();
+    let (cle, langue) = (lastfm_key.as_str(), lang.as_str());
+    let lastfm = move || async move {
+        let r = client
+            .get("http://ws.audioscrobbler.com/2.0/")
+            .query(&[
+                ("method", "artist.getinfo"),
+                ("artist", nom),
+                ("api_key", cle),
+                ("format", "json"),
+                // La langue de l'interface, plus « fr » en dur (#1849).
+                ("lang", langue),
+            ])
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .ok()
+            .filter(|r| r.status().is_success())?;
+        r.json::<serde_json::Value>().await.ok()
+    };
+    let wikipedia = move |wiki_lang: String| async move {
+        client
+            .get(format!(
+                "https://{wiki_lang}.wikipedia.org/api/rest_v1/page/summary/{}",
+                urlencoding::encode(nom)
+            ))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .ok()?
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+    };
+
+    let enrichie =
+        enrichir_bio_artiste(&lang, &encyclopedies, &lastfm_key, lastfm, wikipedia).await;
+
+    // Sans clé et sans rien de Wikipédia : la réponse d'avant pour ce cas, qui
+    // dit QUEL réglage ouvrirait la source manquante. Même forme que l'absence
+    // de clé Radio France (`podcasts.rs`). Le statut reste 200 : le client lit
+    // `data`/`bio`, ne trouve rien et annonce « aucune information trouvée ».
+    if lastfm_key.is_empty() && enrichie.as_ref().is_none_or(|e| e.bio.is_empty()) {
         return Json(json!({
             "error": "lastfm_cle_absente",
             "message": crate::i18n::t(&lang, "metadata.enrich.cleLastfmAbsente"),
@@ -1261,158 +1405,197 @@ async fn enrich_artist(
         }))
         .into_response();
     }
+    let Some(e) = enrichie else {
+        return Json(json!(null)).into_response();
+    };
 
-    // Client partagé : voir `tune_core::http::client`. Apporte aussi un délai
-    // d'attente, qu'un client reqwest construit à la main n'a pas du tout.
-    let client = tune_core::http::client::shared();
-    let resp = client
-        .get("http://ws.audioscrobbler.com/2.0/")
-        .query(&[
-            ("method", "artist.getinfo"),
-            ("artist", &artist.name),
-            ("api_key", &lastfm_key),
-            ("format", "json"),
-            // La langue de l'interface, plus « fr » en dur (#1849).
-            ("lang", lang.as_str()),
-        ])
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await;
-
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            if let Ok(data) = r.json::<serde_json::Value>().await {
-                let bio_obj = &data["artist"]["bio"];
-                let summary = bio_obj["summary"].as_str().unwrap_or("");
-                let content = bio_obj["content"].as_str().unwrap_or("");
-                let tags: Vec<String> = data["artist"]["tags"]["tag"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|t| t["name"].as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let similar: Vec<serde_json::Value> = data["artist"]["similar"]["artist"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                let listeners = data["artist"]["stats"]["listeners"].as_str().unwrap_or("0");
-                let playcount = data["artist"]["stats"]["playcount"].as_str().unwrap_or("0");
-
-                // Strip all HTML tags from Last.fm bio
-                let clean = |s: &str| -> String {
-                    let mut result = String::with_capacity(s.len());
-                    let mut in_tag = false;
-                    for c in s.chars() {
-                        if c == '<' {
-                            in_tag = true;
-                        } else if c == '>' {
-                            in_tag = false;
-                        } else if !in_tag {
-                            result.push(c);
-                        }
-                    }
-                    result
-                        .split("Read more on Last.fm")
-                        .next()
-                        .unwrap_or(&result)
-                        .trim()
-                        .to_string()
-                };
-
-                let mut bio = clean(content);
-                let bio_summary = clean(summary);
-
-                // Track the provenance of the winning bio (Last.fm by default).
-                let mut bio_source = String::new();
-                let mut bio_license = String::new();
-                let mut bio_lang = String::new();
-                let mut bio_url: Option<String> = None;
-                if !bio.is_empty() {
-                    bio_source = "lastfm".to_string();
-                    bio_license = "CC-BY-SA-3.0".to_string();
-                    // Last.fm a répondu dans la langue demandée juste au-dessus.
-                    bio_lang = lang.clone();
-                    bio_url = data["artist"]["url"].as_str().map(String::from);
-                }
-
-                // Fallback to Wikipedia if Last.fm bio is empty.
-                //
-                // Une seule boucle sur `encyclopedies` (langue de l'interface
-                // d'abord, anglais en repli) là où deux blocs jumeaux codaient
-                // `en` puis `fr` en dur.
-                if bio.is_empty() || bio.len() < 20 {
-                    for (rang, wiki_lang) in encyclopedies.iter().enumerate() {
-                        // Le premier passage est déjà autorisé par la garde
-                        // ci-dessus ; les suivants ne servent que si ce qu'on
-                        // tient reste maigre — le seuil d'avant.
-                        if rang > 0 && !(bio.is_empty() || bio.len() < 50) {
-                            break;
-                        }
-                        if let Ok(wiki) = client
-                            .get(format!(
-                                "https://{wiki_lang}.wikipedia.org/api/rest_v1/page/summary/{}",
-                                urlencoding::encode(&artist.name)
-                            ))
-                            .timeout(std::time::Duration::from_secs(10))
-                            .send()
-                            .await
-                            && let Ok(wd) = wiki.json::<serde_json::Value>().await
-                            && let Some(extract) = wd["extract"].as_str()
-                            && extract.len() > bio.len()
-                        {
-                            bio = extract.to_string();
-                            bio_source = "wikipedia".to_string();
-                            bio_license = "CC-BY-SA-4.0".to_string();
-                            bio_lang = wiki_lang.clone();
-                            bio_url = wd["content_urls"]["desktop"]["page"]
-                                .as_str()
-                                .map(String::from);
-                        }
-                    }
-                }
-
-                // Update artist bio in DB if content is richer
-                if bio.len() > artist.bio.as_deref().unwrap_or("").len() {
-                    if bio_source.is_empty() {
-                        let _ = repo.update_bio(id, &bio);
-                    } else {
-                        let _ = repo.update_bio_full(
-                            id,
-                            &bio,
-                            &bio_source,
-                            bio_url.clone(),
-                            &bio_license,
-                            &bio_lang,
-                        );
-                    }
-                }
-
-                return Json(json!({
-                    "data": {
-                        "bio": bio,
-                        // La langue réellement obtenue, comme le
-                        // `bio_provenance.lang` de la route sœur
-                        // `/library/artists/{id}/bio` : sans elle, un client
-                        // ne peut pas savoir si la notice qu'il affiche est
-                        // bien dans la langue qu'il a demandée. Champ ajouté,
-                        // aucun retiré.
-                        "bio_lang": bio_lang,
-                        "bio_summary": bio_summary,
-                        "tags": tags,
-                        "similar_artists": similar,
-                        "listeners": listeners,
-                        "playcount": playcount,
-                        "enrichment_status": "complete"
-                    }
-                }))
-                .into_response();
-            }
-            Json(json!(null)).into_response()
+    // Update artist bio in DB if content is richer
+    if e.bio.len() > artist.bio.as_deref().unwrap_or("").len() {
+        if e.bio_source.is_empty() {
+            let _ = repo.update_bio(id, &e.bio);
+        } else {
+            let _ = repo.update_bio_full(
+                id,
+                &e.bio,
+                &e.bio_source,
+                e.bio_url.clone(),
+                &e.bio_license,
+                &e.bio_lang,
+            );
         }
-        _ => Json(json!(null)).into_response(),
     }
+
+    Json(json!({
+        "data": {
+            "bio": e.bio,
+            // La langue réellement obtenue, comme le
+            // `bio_provenance.lang` de la route sœur
+            // `/library/artists/{id}/bio` : sans elle, un client
+            // ne peut pas savoir si la notice qu'il affiche est
+            // bien dans la langue qu'il a demandée. Champ ajouté,
+            // aucun retiré.
+            "bio_lang": e.bio_lang,
+            "bio_summary": e.bio_summary,
+            "tags": e.tags,
+            "similar_artists": e.similar,
+            "listeners": e.listeners,
+            "playcount": e.playcount,
+            "enrichment_status": "complete"
+        }
+    }))
+    .into_response()
+}
+
+/// Ce que `GET /metadata/artists/{id}/enrich` a rapporté, avant écriture.
+#[derive(Debug, Default)]
+struct BioEnrichie {
+    bio: String,
+    bio_summary: String,
+    bio_source: String,
+    bio_license: String,
+    bio_lang: String,
+    bio_url: Option<String>,
+    tags: Vec<String>,
+    similar: Vec<serde_json::Value>,
+    listeners: String,
+    playcount: String,
+}
+
+/// Le corps de `enrich_artist`, séparé de ses accès réseau.
+///
+/// `lastfm` rend la réponse `artist.getinfo` (ou `None` : échec, statut non
+/// 2xx, corps illisible) ; `wikipedia(langue)` rend le résumé REST de
+/// l'article au nom de l'artiste dans cette langue.
+///
+/// # #6462 — « Enrichir la biographie » ne donnait rien sans clé Last.fm
+///
+/// FabienM (fil 2302, rc6) n'a pas de biographie d'Alain Souchon dans sa
+/// bibliothèque, Bertrand si ; le bouton « Enrichir la biographie » ne lui
+/// rend rien. La route sortait AVANT tout appel quand `lastfm_api_key` était
+/// vide, avec `lastfm_cle_absente` — alors que Wikipédia, qui ne demande
+/// aucune clé, n'est interrogée qu'à défaut de Last.fm, quelques lignes plus
+/// bas. Sans clé, le repli n'était donc jamais atteint, et c'est précisément
+/// le cas où il sert. Même chose quand Last.fm échouait : `null` sans
+/// Wikipédia.
+///
+/// Désormais Last.fm n'est interrogée qu'avec une clé ; sa réponse, ou son
+/// absence, laisse toujours la main à Wikipédia. `None` n'est rendu que si
+/// RIEN n'a répondu, ce qui garde le `null` d'avant pour une panne réseau
+/// complète.
+async fn enrichir_bio_artiste<FL, FutL, FW, FutW>(
+    lang: &str,
+    encyclopedies: &[String],
+    lastfm_key: &str,
+    lastfm: FL,
+    wikipedia: FW,
+) -> Option<BioEnrichie>
+where
+    FL: FnOnce() -> FutL,
+    FutL: std::future::Future<Output = Option<serde_json::Value>>,
+    FW: Fn(String) -> FutW,
+    FutW: std::future::Future<Output = Option<serde_json::Value>>,
+{
+    let mut repondu = false;
+    let mut e = BioEnrichie {
+        listeners: "0".to_string(),
+        playcount: "0".to_string(),
+        ..Default::default()
+    };
+
+    if !lastfm_key.is_empty()
+        && let Some(data) = lastfm().await
+    {
+        repondu = true;
+        let bio_obj = &data["artist"]["bio"];
+        let summary = bio_obj["summary"].as_str().unwrap_or("");
+        let content = bio_obj["content"].as_str().unwrap_or("");
+        e.tags = data["artist"]["tags"]["tag"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        e.similar = data["artist"]["similar"]["artist"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        e.listeners = data["artist"]["stats"]["listeners"]
+            .as_str()
+            .unwrap_or("0")
+            .to_string();
+        e.playcount = data["artist"]["stats"]["playcount"]
+            .as_str()
+            .unwrap_or("0")
+            .to_string();
+
+        e.bio = nettoyer_bio_lastfm(content);
+        e.bio_summary = nettoyer_bio_lastfm(summary);
+
+        // Track the provenance of the winning bio (Last.fm by default).
+        if !e.bio.is_empty() {
+            e.bio_source = "lastfm".to_string();
+            e.bio_license = "CC-BY-SA-3.0".to_string();
+            // Last.fm a répondu dans la langue demandée juste au-dessus.
+            e.bio_lang = lang.to_string();
+            e.bio_url = data["artist"]["url"].as_str().map(String::from);
+        }
+    }
+
+    // Fallback to Wikipedia if Last.fm bio is empty.
+    //
+    // Une seule boucle sur `encyclopedies` (langue de l'interface
+    // d'abord, anglais en repli) là où deux blocs jumeaux codaient
+    // `en` puis `fr` en dur.
+    if e.bio.is_empty() || e.bio.len() < 20 {
+        for (rang, wiki_lang) in encyclopedies.iter().enumerate() {
+            // Le premier passage est déjà autorisé par la garde
+            // ci-dessus ; les suivants ne servent que si ce qu'on
+            // tient reste maigre — le seuil d'avant.
+            if rang > 0 && !(e.bio.is_empty() || e.bio.len() < 50) {
+                break;
+            }
+            let Some(wd) = wikipedia(wiki_lang.clone()).await else {
+                continue;
+            };
+            repondu = true;
+            if let Some(extract) = wd["extract"].as_str()
+                && extract.len() > e.bio.len()
+            {
+                e.bio = extract.to_string();
+                e.bio_source = "wikipedia".to_string();
+                e.bio_license = "CC-BY-SA-4.0".to_string();
+                e.bio_lang = wiki_lang.clone();
+                e.bio_url = wd["content_urls"]["desktop"]["page"]
+                    .as_str()
+                    .map(String::from);
+            }
+        }
+    }
+
+    repondu.then_some(e)
+}
+
+/// Retire le balisage HTML d'une bio Last.fm et son « Read more on Last.fm ».
+fn nettoyer_bio_lastfm(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            result.push(c);
+        }
+    }
+    result
+        .split("Read more on Last.fm")
+        .next()
+        .unwrap_or(&result)
+        .trim()
+        .to_string()
 }
 
 async fn similar_artists(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
@@ -2224,8 +2407,10 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
         .get_credential("lastfm", "api_key")
         .or_else(|| settings.get("lastfm_api_key").ok().flatten())
         .filter(|s| !s.is_empty());
-    let discogs_token = svc_mgr
-        .get_credential("discogs", "token")
+    // #4805 lot 1 : le jeton PERSONNEL d'abord ; le gestionnaire de services
+    // et la configuration ensuite.
+    let discogs_token = crate::routes::discogs::discogs_token(&state)
+        .or_else(|| svc_mgr.get_credential("discogs", "token"))
         .or_else(|| state.config.discogs_token.clone())
         .filter(|s| !s.is_empty());
 
@@ -2452,6 +2637,46 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
     .into_response()
 }
 
+/// #4805 lot 2 (d'après MetaRust, de Xavier Joly) — la pochette en place
+/// est-elle GARDÉE face à `candidate` ? Oui quand c'est le même visuel
+/// (empreinte dHash) sans gain d'au moins 1,4 fois en pixels : la remplacer
+/// ferait perdre de la définition, ou ne changerait rien. Une autre image, ou
+/// la même nettement plus nette, remplace comme avant : cette route est une
+/// demande explicite de nouvelle pochette.
+///
+/// Rend la réponse à servir quand la pochette est gardée.
+fn pochette_en_place_gardee(
+    cover_path: Option<&str>,
+    candidate: &[u8],
+    cache_dir: &std::path::Path,
+    source: &str,
+) -> Option<axum::response::Response> {
+    use tune_core::library::pochette_visuelle::{self, Decision};
+    let en_place = cover_path?;
+    let existante = pochette_visuelle::octets_en_cache(cache_dir, en_place);
+    let decision = pochette_visuelle::decider(existante.as_deref(), candidate);
+    tracing::info!(
+        cover_path = en_place,
+        source,
+        decision = decision.code(),
+        "pochette_decision_visuelle"
+    );
+    match decision {
+        Decision::Garder { distance } => Some(
+            Json(json!({
+                "ok": true,
+                "kept": true,
+                "cover_path": en_place,
+                "source": source,
+                "decision": "meme_visuel",
+                "distance": distance,
+            }))
+            .into_response(),
+        ),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // POST /covers/album/{id} — web client compatibility endpoint
 // ---------------------------------------------------------------------------
@@ -2516,6 +2741,16 @@ async fn fetch_album_cover(
         && let Some(data) = tune_core::library::artwork::fetch_cover_art(mbid_val).await
     {
         let cache_dir = super::library::artwork_cache_dir();
+        // #4805 lot 2 — la même pochette, pas plus nette, ne remplace pas
+        // celle en place (empreinte visuelle, d'après MetaRust).
+        if let Some(gardee) = pochette_en_place_gardee(
+            album.cover_path.as_deref(),
+            &data,
+            &cache_dir,
+            "coverartarchive",
+        ) {
+            return gardee;
+        }
         // Adressage par le CONTENU (#1444). Route de RE-téléchargement
         // (`force_update_cover_path`) : écrire sous `artwork_hash(mbid)`
         // gardait l'adresse déjà distribuée, servie `immutable,
@@ -2540,13 +2775,9 @@ async fn fetch_album_cover(
     }
 
     // Step 3: Try Discogs fallback
-    let discogs_token = state
-        .config
-        .discogs_token
-        .clone()
-        .or_else(|| std::env::var("TUNE_DISCOGS_TOKEN").ok())
-        .or_else(|| std::env::var("DISCOGS_TOKEN").ok())
-        .unwrap_or_default();
+    // #4805 lot 1 : le jeton PERSONNEL d'abord, puis le réglage, la
+    // configuration et l'environnement (`routes::discogs::discogs_token`).
+    let discogs_token = crate::routes::discogs::discogs_token(&state).unwrap_or_default();
 
     if !discogs_token.is_empty() && !album.title.is_empty() {
         let cache_dir = super::library::artwork_cache_dir();
@@ -2579,6 +2810,14 @@ async fn fetch_album_cover(
                     .into_response();
             };
             let cache_dir = super::library::artwork_cache_dir();
+            if let Some(gardee) = pochette_en_place_gardee(
+                album.cover_path.as_deref(),
+                &octets,
+                &cache_dir,
+                "discogs",
+            ) {
+                return gardee;
+            }
             let Some(hash) =
                 tune_core::library::artwork::cache_fetched_image(&octets, &cache_dir, "jpg")
             else {
@@ -2618,13 +2857,9 @@ async fn search_covers(
     State(state): State<AppState>,
     Query(params): Query<CoverSearchParams>,
 ) -> impl IntoResponse {
-    let discogs_token = state
-        .config
-        .discogs_token
-        .clone()
-        .or_else(|| std::env::var("TUNE_DISCOGS_TOKEN").ok())
-        .or_else(|| std::env::var("DISCOGS_TOKEN").ok())
-        .unwrap_or_default();
+    // #4805 lot 1 : le jeton PERSONNEL d'abord, puis le réglage, la
+    // configuration et l'environnement (`routes::discogs::discogs_token`).
+    let discogs_token = crate::routes::discogs::discogs_token(&state).unwrap_or_default();
 
     let cache_dir = super::library::artwork_cache_dir();
     let cache_str = cache_dir.to_string_lossy().to_string();
@@ -3748,5 +3983,176 @@ mod tests_genre_repare_5314 {
             (Some("Jazz"), Some(r#"["Jazz"]"#)),
             "#5314 : le genre réparé de l'album doit descendre sur sa piste"
         );
+    }
+}
+
+/// #4805 lot 2 — le re-téléchargement d'une pochette ne remplace pas la même
+/// image par une version moins définie.
+#[cfg(test)]
+mod pochette_visuelle_4805 {
+    use super::pochette_en_place_gardee;
+    use std::io::Cursor;
+
+    fn png(cote: u32, inverse: bool) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(cote, cote, |x, y| {
+            let clair = (x < cote / 2) ^ inverse;
+            let t = (y * 60 / cote) as u8;
+            let v = if clair { 200u8 } else { 20u8 };
+            image::Rgb([v + t / 2, v + t / 2, v + t / 2])
+        });
+        let mut out = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn la_meme_pochette_moins_definie_est_gardee_une_autre_remplace() {
+        let cache = tempfile::tempdir().unwrap();
+        let en_place = png(600, false);
+        let h = tune_core::library::artwork::cache_fetched_image(&en_place, cache.path(), "png")
+            .unwrap();
+        // Même visuel, quatre fois moins de pixels : gardée.
+        assert!(
+            pochette_en_place_gardee(Some(&h), &png(300, false), cache.path(), "coverartarchive")
+                .is_some(),
+            "la même pochette, moins définie, ne doit pas remplacer celle en place"
+        );
+        // Même visuel, quatre fois plus de pixels : remplace.
+        assert!(
+            pochette_en_place_gardee(Some(&h), &png(1200, false), cache.path(), "coverartarchive")
+                .is_none()
+        );
+        // Un autre visuel : remplace (demande explicite).
+        assert!(
+            pochette_en_place_gardee(Some(&h), &png(600, true), cache.path(), "discogs").is_none()
+        );
+        // Pas de pochette en place : remplace.
+        assert!(
+            pochette_en_place_gardee(None, &png(300, false), cache.path(), "discogs").is_none()
+        );
+    }
+}
+
+/// #6462 — « Enrichir la biographie » sans clé Last.fm interroge Wikipédia.
+///
+/// Les deux sources sont des fermetures factices : aucun appel réseau. Les
+/// réponses reprennent la forme réelle de `artist.getinfo` et du résumé REST
+/// de Wikipédia, raccourcies.
+#[cfg(test)]
+mod bio_sans_cle_lastfm_6462 {
+    use super::enrichir_bio_artiste;
+    use serde_json::{Value, json};
+    use std::cell::Cell;
+
+    const EXTRAIT_FR: &str = "Alain Souchon, né le 27 mai 1944 à Casablanca, est un \
+        auteur-compositeur-interprète et acteur français.";
+
+    fn resume_wikipedia(langue: &str) -> Option<Value> {
+        (langue == "fr").then(|| {
+            json!({
+                "title": "Alain Souchon",
+                "extract": EXTRAIT_FR,
+                "content_urls": {"desktop": {"page": "https://fr.wikipedia.org/wiki/Alain_Souchon"}}
+            })
+        })
+    }
+
+    fn encyclopedies() -> Vec<String> {
+        vec!["fr".to_string(), "en".to_string()]
+    }
+
+    #[tokio::test]
+    async fn sans_cle_lastfm_wikipedia_donne_la_bio() {
+        let lastfm_appelee = Cell::new(false);
+        let e = enrichir_bio_artiste(
+            "fr",
+            &encyclopedies(),
+            "",
+            || {
+                lastfm_appelee.set(true);
+                async { None }
+            },
+            |langue: String| async move { resume_wikipedia(&langue) },
+        )
+        .await;
+        assert!(
+            !lastfm_appelee.get(),
+            "sans clé, Last.fm ne doit pas être interrogée"
+        );
+        let e = e.expect(
+            "#6462 — sans clé Last.fm, Wikipédia doit être interrogée : \
+             la bio d'Alain Souchon y est",
+        );
+        assert_eq!(e.bio, EXTRAIT_FR);
+        assert_eq!(e.bio_source, "wikipedia");
+        assert_eq!(e.bio_license, "CC-BY-SA-4.0");
+        assert_eq!(e.bio_lang, "fr");
+        assert_eq!(
+            e.bio_url.as_deref(),
+            Some("https://fr.wikipedia.org/wiki/Alain_Souchon")
+        );
+    }
+
+    #[tokio::test]
+    async fn last_fm_en_echec_laisse_la_main_a_wikipedia() {
+        let e = enrichir_bio_artiste(
+            "fr",
+            &encyclopedies(),
+            "cle",
+            || async { None },
+            |langue: String| async move { resume_wikipedia(&langue) },
+        )
+        .await
+        .expect("#6462 — un échec de Last.fm ne doit pas empêcher Wikipédia");
+        assert_eq!(e.bio_source, "wikipedia");
+        assert_eq!(e.bio, EXTRAIT_FR);
+    }
+
+    #[tokio::test]
+    async fn la_bio_last_fm_reste_prioritaire() {
+        let wikipedia_appelee = Cell::new(false);
+        let e = enrichir_bio_artiste(
+            "fr",
+            &encyclopedies(),
+            "cle",
+            || async {
+                Some(json!({"artist": {
+                    "url": "https://www.last.fm/music/Alain+Souchon",
+                    "bio": {
+                        "summary": "Chanteur <a href=\"x\">français</a>.",
+                        "content": "Alain Souchon est un chanteur <b>français</b> né en 1944. Read more on Last.fm"
+                    },
+                    "tags": {"tag": [{"name": "chanson francaise"}]},
+                    "stats": {"listeners": "12", "playcount": "34"}
+                }}))
+            },
+            |langue: String| {
+                wikipedia_appelee.set(true);
+                async move { resume_wikipedia(&langue) }
+            },
+        )
+        .await
+        .expect("Last.fm a répondu");
+        assert!(!wikipedia_appelee.get(), "une bio Last.fm suffit");
+        assert_eq!(e.bio, "Alain Souchon est un chanteur français né en 1944.");
+        assert_eq!(e.bio_summary, "Chanteur français.");
+        assert_eq!(e.bio_source, "lastfm");
+        assert_eq!(e.tags, vec!["chanson francaise".to_string()]);
+        assert_eq!((e.listeners.as_str(), e.playcount.as_str()), ("12", "34"));
+    }
+
+    #[tokio::test]
+    async fn rien_n_a_repondu() {
+        let e = enrichir_bio_artiste(
+            "fr",
+            &encyclopedies(),
+            "",
+            || async { None },
+            |_langue: String| async { None },
+        )
+        .await;
+        assert!(e.is_none());
     }
 }

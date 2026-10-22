@@ -40,10 +40,16 @@ fn bibliotheque_illisible(racine: &std::path::Path) {
 }
 
 /// Lance le VRAI scan de démarrage, la porte d'écriture SQLite tenue, et rend
-/// la main quand il entre dans la lecture des lots (`library.scan.started`,
-/// émis après le préfiltre). Rend aussi la porte : tant que l'appelant la
-/// tient, le scan lit son premier lot puis s'y bloque, à l'entrée de sa
-/// transaction.
+/// la main quand il entre dans la lecture des lots : le `library.scan.started`
+/// émis APRÈS le préfiltre, le seul qui porte `to_scan`. Rend aussi la porte :
+/// tant que l'appelant la tient, le scan lit son premier lot puis s'y bloque,
+/// à l'entrée de sa transaction.
+///
+/// Depuis #6019 (e19fd66cb), le scan annonce aussi un `library.scan.started`
+/// de phase `indexing` dès son départ, AVANT le parcours. Rendre la main sur
+/// celui-là, c'est laisser « Arrêter » tomber pendant le parcours : le scan
+/// s'arrête alors sans rien écrire, sans passer par la porte, et `fini` se
+/// lève sous la porte tenue — l'épreuve échouait une fois sur trois.
 ///
 /// Les autres essais du binaire ne se sérialisent pas tous sur le verrou des
 /// scans : l'un d'eux peut tenir le droit de scanner, et le scan de démarrage
@@ -68,7 +74,12 @@ pub(super) async fn demarrer_jusqu_a_la_lecture(
         let fini = crate::auto_scan::spawn_auto_scan(db.clone(), bus.clone());
         loop {
             match suivant(rx) {
-                Some(ev) if ev.event_type == "library.scan.started" => return (fini, porte),
+                Some(ev)
+                    if ev.event_type == "library.scan.started"
+                        && ev.data.get("to_scan").is_some() =>
+                {
+                    return (fini, porte);
+                }
                 Some(_) => continue,
                 None => {}
             }

@@ -11,6 +11,8 @@ mod balayage_1897;
 mod history_1897;
 #[path = "web_contracts/library_1897.rs"]
 mod library_1897;
+#[path = "web_contracts/secrets_materiel_tiers_6173.rs"]
+mod secrets_materiel_tiers_6173;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};

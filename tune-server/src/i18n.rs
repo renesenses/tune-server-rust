@@ -19,7 +19,14 @@ use axum::http::HeaderMap;
 /// Languages the UI ships with. Order is irrelevant; membership gates the
 /// `Accept-Language` parse so an unsupported browser locale falls back to
 /// [`FALLBACK`].
-pub const SUPPORTED: &[&str] = &["fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv"];
+///
+/// Douze langues depuis le hongrois et le vietnamien (rc7) — les mêmes que
+/// l'interface web (`tune-web-client/src/lib/locales/`). Chaque clé de
+/// `i18n_server.json` doit porter chacune d'elles : le test
+/// `chaque_cle_porte_chaque_langue` le garde.
+pub const SUPPORTED: &[&str] = &[
+    "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi",
+];
 
 /// Langue de repli du serveur : l'anglais, comme le client web. Ni un en-tête
 /// absent, ni une langue que l'interface ne parle pas (`pt-BR`), ni une clé
@@ -119,14 +126,18 @@ pub fn lang_from_request(param: Option<&str>, headers: &HeaderMap) -> String {
 /// to French — the language the table is written in first —, then to the key
 /// itself.
 pub fn t(lang: &str, key: &str) -> String {
-    if let Some(per_lang) = table().get(key) {
-        for langue in [lang, FALLBACK, "fr"] {
-            if let Some(v) = per_lang.get(langue) {
-                return v.clone();
-            }
-        }
-    }
-    key.to_string()
+    t_opt(lang, key).unwrap_or_else(|| key.to_string())
+}
+
+/// Comme [`t`], mais `None` quand la clé n'existe pas dans la table, au lieu
+/// de rendre la clé brute. Pour un texte qui a déjà une valeur par défaut —
+/// la description qu'un greffon déclare lui-même (#6458) — et qui ne doit être
+/// remplacé que si une traduction existe.
+pub fn t_opt(lang: &str, key: &str) -> Option<String> {
+    let per_lang = table().get(key)?;
+    [lang, FALLBACK, "fr"]
+        .into_iter()
+        .find_map(|langue| per_lang.get(langue).cloned())
 }
 
 #[cfg(test)]
@@ -219,6 +230,94 @@ mod tests {
         assert_ne!(t("en", cle), t("fr", cle), "la clé témoin a deux textes");
         assert_eq!(t("pt", cle), t("en", cle));
         assert_eq!(t("xx", "cle.qui.n.existe.pas"), "cle.qui.n.existe.pas");
+    }
+
+    /// Le hongrois et le vietnamien sont des langues de l'interface : un
+    /// `Accept-Language` qui les demande doit les obtenir, et non l'anglais.
+    ///
+    /// Contre-épreuve : retirer `"hu"` et `"vi"` de `SUPPORTED` fait rougir
+    /// ce test (les deux en-têtes retombent sur `"en"`).
+    #[test]
+    fn le_hongrois_et_le_vietnamien_sont_servis() {
+        assert_eq!(lang_from_header(&en_tetes("hu-HU,hu;q=0.9,en;q=0.8")), "hu");
+        assert_eq!(lang_from_header(&en_tetes("vi-VN,vi;q=0.9,en;q=0.8")), "vi");
+        assert_eq!(
+            t("hu", "metafield.composer"),
+            "Szerző",
+            "le texte hongrois de la table"
+        );
+        assert_eq!(t("vi", "metafield.composer"), "Nhà soạn nhạc");
+        assert_eq!(
+            t("vi", "ai.zonesAvailable"),
+            "Các vùng phát khả dụng: {zones}",
+            "« zone » se dit « vùng phát », comme dans l'interface web"
+        );
+        // Une langue inconnue de l'interface retombe sur l'anglais.
+        assert_eq!(lang_from_header(&en_tetes("pt-BR")), "en");
+        assert_eq!(t("pt", "metafield.composer"), t("en", "metafield.composer"));
+    }
+
+    /// Les jetons `{…}` d'un texte : `{title}`, `{n}`…
+    fn jetons(texte: &str) -> Vec<String> {
+        let mut vus: Vec<String> = Vec::new();
+        let mut reste = texte;
+        while let Some(debut) = reste.find('{') {
+            let Some(fin) = reste[debut..].find('}') else {
+                break;
+            };
+            vus.push(reste[debut..debut + fin + 1].to_string());
+            reste = &reste[debut + fin + 1..];
+        }
+        vus.sort();
+        vus
+    }
+
+    /// Complétude de la table : chaque clé porte CHAQUE langue de
+    /// [`super::SUPPORTED`], non vide, avec les mêmes jetons `{…}` que
+    /// l'anglais. Une langue absente d'une clé se replierait en silence sur
+    /// l'anglais — exactement le défaut que l'ajout du hongrois et du
+    /// vietnamien aurait laissé passer sur les 199 clés.
+    ///
+    /// Contre-épreuve : retirer une ligne `"vi"` (ou `"hu"`) de
+    /// `i18n_server.json`, ou y supprimer un `{title}`, fait rougir ce test en
+    /// nommant la clé et la langue.
+    #[test]
+    fn chaque_cle_porte_chaque_langue() {
+        let mut manques: Vec<String> = Vec::new();
+        assert!(!super::table().is_empty(), "i18n_server.json illisible");
+        let mut cles: Vec<&String> = super::table().keys().collect();
+        cles.sort();
+        for cle in cles {
+            let par_langue = &super::table()[cle];
+            let reference = par_langue.get("en").map(|s| jetons(s));
+            for langue in super::SUPPORTED {
+                match par_langue.get(*langue) {
+                    None => manques.push(format!("{cle} : «{langue}» absente")),
+                    Some(v) if v.trim().is_empty() => {
+                        manques.push(format!("{cle} : «{langue}» vide"))
+                    }
+                    Some(v) => {
+                        if let Some(attendus) = &reference
+                            && &jetons(v) != attendus
+                        {
+                            manques.push(format!(
+                                "{cle} : «{langue}» n'a pas les jetons {attendus:?} de l'anglais"
+                            ));
+                        }
+                    }
+                }
+            }
+            for langue in par_langue.keys() {
+                if !super::SUPPORTED.contains(&langue.as_str()) {
+                    manques.push(format!("{cle} : langue «{langue}» hors de SUPPORTED"));
+                }
+            }
+        }
+        assert!(
+            manques.is_empty(),
+            "table incomplète :\n{}",
+            manques.join("\n")
+        );
     }
 
     #[test]

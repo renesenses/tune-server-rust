@@ -1060,6 +1060,146 @@ async fn pg_6079_la_file_garde_l_artiste_de_service() {
     let _ = db.execute("DELETE FROM queue_items", &[]);
 }
 
+/// #6466 — le conteneur de chaque élément de file sur PostgreSQL : la
+/// jumelle 092 se rejoue (idempotence), `poser_apres` ne touche que les
+/// lignes ajoutées, la lecture à la position vérifie la piste, et la copie
+/// du transfert apparie les lignes.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_6466_le_conteneur_des_elements_de_file() {
+    use crate::db::contexte_de_file::{self, ContexteDeFile};
+    use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use crate::db::zone_repo::ZoneRepo;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let _ = db.execute("DELETE FROM queue_items", &[]);
+    let url = std::env::var("TUNE_TEST_PG_URL").expect("posée : pg_or_skip l'a vérifié");
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../migrations/postgres/092_queue_items_contexte.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("la migration 092 doit se rejouer");
+    let zones = ZoneRepo::with_backend(db.clone());
+    let salon = zones
+        .create("Salon", Some("dlna"), Some("uuid:6466-a"))
+        .unwrap();
+    let enfants = zones
+        .create("Enfants", Some("dlna"), Some("uuid:6466-b"))
+        .unwrap();
+    let repo = PlayQueueRepo::with_backend(db.clone());
+    let ligne = |id: &str| QueueInput::Streaming {
+        source: "qobuz".into(),
+        source_id: id.into(),
+        title: format!("Titre {id}"),
+        artist: "Artiste".into(),
+        album: None,
+        cover_url: None,
+        duration_ms: 1_000,
+        track_number: None,
+        disc_number: None,
+        album_ref: None,
+        artist_ref: None,
+    };
+    repo.append(salon, &[ligne("a1"), ligne("a2")]).unwrap();
+    let avant = contexte_de_file::dernier_identifiant(&db, salon);
+    assert!(avant > 0, "le plus grand identifiant doit être lu (bigint)");
+    repo.append(salon, &[ligne("p1")]).unwrap();
+    let playlist = ContexteDeFile {
+        nature: "playlist".into(),
+        id: Some("p42".into()),
+        service: Some("qobuz".into()),
+        titre: Some("Ma playlist".into()),
+        pochette: None,
+    };
+    assert_eq!(
+        contexte_de_file::poser_apres(&db, salon, avant, &playlist).unwrap(),
+        1
+    );
+    assert_eq!(
+        contexte_de_file::contexte_de_la_piste_jouee(&db, salon, 2, None, Some("p1")),
+        Some(playlist.clone())
+    );
+    assert_eq!(
+        contexte_de_file::contexte_de_la_piste_jouee(&db, salon, 0, None, Some("a1")),
+        None,
+        "une ligne sans conteneur suit la session"
+    );
+    repo.append(enfants, &[ligne("a1"), ligne("a2"), ligne("p1")])
+        .unwrap();
+    assert_eq!(
+        contexte_de_file::copier_les_contextes(&db, salon, enfants),
+        1
+    );
+    assert_eq!(
+        contexte_de_file::contexte_de_la_piste_jouee(&db, enfants, 2, None, Some("p1")),
+        Some(playlist)
+    );
+    let _ = db.execute("DELETE FROM queue_items", &[]);
+}
+
+/// #6285 — la passe des faux hi-res sur PostgreSQL : la jumelle 093 se
+/// rejoue, les candidats se choisissent (sans perte, locaux, pas encore
+/// mesurés), et le verdict s'écrit puis se réécrit (`ON CONFLICT`).
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_6285_les_verdicts_des_faux_hires() {
+    use crate::audio::faux_hires::Mesure;
+    use crate::audio::faux_hires_passe::{compter_les_candidats, enregistrer, prochains_candidats};
+    use crate::db::backend::ToSqlValue;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let _ = db.execute("DELETE FROM hires_verifications", &[]);
+    let url = std::env::var("TUNE_TEST_PG_URL").expect("posée : pg_or_skip l'a vérifié");
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../migrations/postgres/093_hires_verifications.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("la migration 093 doit se rejouer");
+    for (id, format) in [(1i64, "flac"), (2, "mp3"), (3, "wav")] {
+        let chemin = format!("/m/{id}.{format}");
+        let format = format.to_string();
+        db.execute(
+            "INSERT INTO tracks (id, title, file_path, format, source, duration_ms) \
+             VALUES (?, 't', ?, ?, 'local', 60000)",
+            &[&id as &dyn ToSqlValue, &chemin, &format],
+        )
+        .unwrap();
+    }
+    assert_eq!(compter_les_candidats(&db), 2);
+    let ids: Vec<i64> = prochains_candidats(&db, 10)
+        .iter()
+        .map(|c| c.track_id)
+        .collect();
+    assert_eq!(ids, vec![1, 3]);
+    let mesure = Mesure {
+        sample_rate: 96_000,
+        bits_declares: 24,
+        bits_effectifs: Some(16),
+        coupure_hz: Some(20_000.0),
+        silencieux: false,
+    };
+    enregistrer(&db, 1, &Ok(mesure)).unwrap();
+    enregistrer(&db, 1, &Ok(mesure)).unwrap();
+    enregistrer(&db, 3, &Err("illisible".into())).unwrap();
+    assert_eq!(compter_les_candidats(&db), 0);
+    let r = db
+        .query_one(
+            "SELECT verdict, raison, bits_effectifs, coupure_hz FROM hires_verifications WHERE track_id = 1",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(r[0].as_string().as_deref(), Some("douteux"));
+    assert_eq!(r[1].as_string().as_deref(), Some("bits_de_remplissage"));
+    assert_eq!(r[2].as_i64(), Some(16));
+    assert_eq!(r[3].as_f64(), Some(20_000.0));
+    let _ = db.execute("DELETE FROM hires_verifications", &[]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_settings_round_trip() {
     use crate::db::settings_repo::SettingsRepo;
@@ -3195,6 +3335,17 @@ async fn pg_1684_recherche_de_la_bibliotheque() {
     let db = pg_or_skip!();
     reset_schema(&db);
     crate::db::album_repo::tests::scenario_recherche_de_la_bibliotheque_1684(db);
+}
+
+/// #4319 — le texte libre mot à mot sur le VRAI moteur : dix marqueurs `$n`
+/// par mot, `unaccent`, et les identifiants de piste projetés en texte pour
+/// `track_metadata`, `track_credits` et `album_metadata`. Même scénario que
+/// `le_texte_libre_cherche_chaque_mot_sur_sqlite_4319`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_4319_texte_libre_mot_a_mot() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::facet_filter::texte_libre_mots_4319_tests::scenario_texte_libre_mot_a_mot_4319(db);
 }
 
 /// Fil 2094 — les sous-titres de disque d'un coffret réuni, sur le VRAI

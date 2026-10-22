@@ -12,8 +12,8 @@ use tune_core::source_pcm::{FluxPcm, FormatPcm, FournisseurPcm};
 
 use crate::discid::disc_id;
 use crate::flux::FluxPiste;
-use crate::lecteur::LecteurDisque;
-use crate::memoire::MemoireCd;
+use crate::lecteur::{LecteurDisque, Presence};
+use crate::memoire::{Chargement, MemoireCd};
 use crate::toc::{OCTETS_PAR_SECTEUR, duree_ms_de_secteurs, secteur_de_position};
 
 /// Le nom de la source, dans la file et dans `now_playing.source`.
@@ -52,11 +52,59 @@ impl FournisseurCd {
     }
 }
 
+impl FournisseurCd {
+    /// #6410 — le disque est entier en mémoire et n'est plus dans le lecteur
+    /// (éjecté, ou un autre disque inséré depuis) : la piste s'ouvre dans la
+    /// mémoire, sans toucher au lecteur.
+    fn disque_hors_lecteur(&self, disc: &str, presence: Presence) -> Option<Arc<Chargement>> {
+        let m = self.memoire.as_ref()?;
+        m.disque_garde()
+            .or_else(|| {
+                // L'éjection précède de moins d'une seconde le tour du
+                // surveillant : le disque complet sert déjà.
+                (presence != Presence::Disque)
+                    .then(|| m.disque_complet())
+                    .flatten()
+            })
+            .filter(|c| c.disc_id == disc)
+    }
+
+    fn ouvrir_en_memoire(
+        c: &Arc<Chargement>,
+        numero: u8,
+        depuis_ms: u64,
+    ) -> Result<FluxPcm, String> {
+        let toc = c.toc();
+        let piste = toc
+            .piste(numero)
+            .filter(|p| p.audio)
+            .ok_or_else(|| format!("la piste {numero} n'est pas une piste audio de ce disque"))?;
+        let secteurs = toc.secteurs(numero).unwrap_or(0);
+        let (debut, fin) = plage(piste.debut, secteurs, depuis_ms);
+        tracing::info!(
+            piste = numero,
+            depuis_ms,
+            premier_secteur = debut,
+            fin_exclue = fin,
+            "cd_piste_ouverte_disque_ejecte_en_memoire"
+        );
+        Ok(FluxPcm {
+            format: FormatPcm::CD,
+            octets: (fin - debut) as u64 * OCTETS_PAR_SECTEUR as u64,
+            duree_ms: duree_ms_de_secteurs(secteurs),
+            lecteur: Box::new(c.flux(debut, fin)),
+        })
+    }
+}
+
 impl FournisseurPcm for FournisseurCd {
     fn ouvrir(&self, source_id: &str, depuis_ms: u64) -> Result<FluxPcm, String> {
         let (disc_demande, numero) = lire_source_id(source_id)
             .ok_or_else(|| format!("piste de CD illisible : {source_id}"))?;
-        self.lecteur.presence();
+        let presence = self.lecteur.presence();
+        if let Some(c) = self.disque_hors_lecteur(disc_demande, presence) {
+            return Self::ouvrir_en_memoire(&c, numero, depuis_ms);
+        }
         let generation = self.lecteur.generation_lecteur();
         let toc = self.lecteur.lire_toc().map_err(|e| e.to_string())?;
         if self.lecteur.generation_lecteur() != generation {

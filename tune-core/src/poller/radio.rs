@@ -29,9 +29,15 @@ impl PositionPoller {
             // précédent au lieu de revenir au logo.
             let radio_repo = crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
             let mut logo_station: Option<String> = None;
+            // #6516 — le lien de la station avec sa fiche d'annuaire : le
+            // relais la retrouve d'abord par lui.
+            let mut lien_annuaire: Option<String> = None;
             let (station_name, stream_url) =
                 if let Some(station) = station_du_now_playing(&radio_repo, source_id) {
                     logo_station = station.logo_url.clone();
+                    lien_annuaire = station
+                        .id
+                        .and_then(|id| radio_repo.lien_annuaire(id).ok().flatten());
                     (station.name.clone(), station.url.clone())
                 } else {
                     // Station introuvable en base : on retombe sur
@@ -43,9 +49,17 @@ impl PositionPoller {
                     (name, source_id.clone())
                 };
 
-            if let Some(meta) =
-                crate::radio_metadata::fetch_radio_metadata(&station_name, &stream_url).await
-            {
+            // #6516 — une station suivie par radio-metadata.fr se lit d'abord
+            // sur le relais ; la zone passe alors à la cadence du relais
+            // (`zone_a_relire`), les autres gardent celle du sondeur.
+            let (meta, par_le_relais) = crate::radio_metadata::fetch_radio_metadata_liee(
+                lien_annuaire.as_deref(),
+                &station_name,
+                &stream_url,
+            )
+            .await;
+            crate::radio_metadata_relais::noter_zone(zone_id, par_le_relais);
+            if let Some(meta) = meta {
                 // La pochette du titre quand la station la donne, le
                 // logo sinon. Bertrand : « mettre la pochette de
                 // l'album et non le logo de la radio ».
@@ -131,6 +145,38 @@ impl PositionPoller {
                             "radio_refresh_channel — le morceau a changé mais l'écran du \
                              lecteur réseau ne l'apprendra pas"
                         );
+                    }
+                    // #2991 — second canal, opt-in par zone : réémettre le
+                    // DIDL vers un renderer DLNA qui ignore l'ICY. Zone non
+                    // réglée : une lecture de réglage, rien d'autre. La SOAP
+                    // part dans une tâche à part pour ne pas tenir le tour
+                    // du sondeur pendant l'aller-retour réseau.
+                    if crate::outputs::dlna::titre_radio_2991::mode_de_zone(&self.db, zone_id)
+                        != crate::outputs::dlna::titre_radio_2991::ModeTitreRadioDidl::Desactive
+                    {
+                        let titre = crate::outputs::dlna::titre_radio_2991::TitreRadio {
+                            titre: new_np.title.clone(),
+                            artiste: new_np.artist_name.clone(),
+                            album: Some(station_name.clone()),
+                            pochette: self
+                                .orchestrator
+                                .resolve_cover_url(new_np.cover_path.as_deref()),
+                        };
+                        let db = self.db.clone();
+                        let outputs = self.outputs.clone();
+                        let device_id = self.get_zone_device_id(zone_id);
+                        let stream_id = np.stream_id.clone();
+                        tokio::spawn(async move {
+                            super::titre_radio_didl_2991::relayer_titre_radio_par_didl(
+                                &db,
+                                &outputs,
+                                zone_id,
+                                device_id.as_deref(),
+                                stream_id.as_deref(),
+                                &titre,
+                            )
+                            .await;
+                        });
                     }
                     self.playback.update_now_playing(zone_id, new_np).await;
                     debug!(zone_id, station = %station_name, "radio_metadata_updated");

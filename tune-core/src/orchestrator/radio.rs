@@ -310,7 +310,7 @@ struct CanauxRadio<'a> {
 /// et la piste audio retenue.
 struct Sonde {
     format: Box<dyn symphonia::core::formats::FormatReader>,
-    decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
+    decoder: radio_ogg::DecodeurRadio,
     track_id: u32,
     source_channels: u16,
     source_sample_rate: u32,
@@ -344,6 +344,9 @@ enum SuitePaquet {
     AutrePiste,
     /// `continue` : trame indécodable, sautée.
     TrameSautee,
+    /// `continue` : Ogg chaîné, un nouveau flux logique (le titre suivant)
+    /// commence ; le décodeur est reconstruit sans quitter la connexion.
+    FluxLogiqueSuivant,
     /// `break` : l'amont a terminé son flux (`Ok(None)`) — on se reconnecte.
     AmontTermine,
     /// `break` : l'amont a coupé (fin de fichier inattendue) — on se reconnecte.
@@ -473,7 +476,10 @@ fn une_connexion(etat: &mut EtatRadio, url: &str, canaux: &CanauxRadio<'_>) -> S
     // ---- Decode loop ----
     loop {
         match decoder_un_paquet(etat, canaux, &mut sonde, &sortie) {
-            SuitePaquet::PaquetServi | SuitePaquet::AutrePiste | SuitePaquet::TrameSautee => {
+            SuitePaquet::PaquetServi
+            | SuitePaquet::AutrePiste
+            | SuitePaquet::TrameSautee
+            | SuitePaquet::FluxLogiqueSuivant => {
                 continue;
             }
             SuitePaquet::AmontTermine | SuitePaquet::AmontCoupe | SuitePaquet::ErreurDePaquet => {
@@ -526,7 +532,6 @@ fn se_connecter_et_sonder(etat: &mut EtatRadio, url: &str) -> Result<Sonde, Suit
 /// texte de la fermeture `setup` d'origine, tel quel.
 fn sonder_la_station(url: &str) -> Result<Sonde, String> {
     use symphonia::core::codecs::CodecParameters;
-    use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
@@ -580,7 +585,14 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
         hint.with_extension("mp3");
     } else if path_part.ends_with(".aac") || path_part.ends_with(".m4a") {
         hint.with_extension("aac");
-    } else if path_part.ends_with(".ogg") {
+    } else if path_part.ends_with(".ogg")
+        || path_part.ends_with(".oga")
+        || path_part.ends_with(".opus")
+        || ogg_par_le_type(&content_type)
+    {
+        // Un montage Icecast Ogg n'a pas toujours d'extension (`/live`,
+        // `/vorbis`) : son type MIME le dit (`application/ogg`,
+        // `audio/ogg; codecs=opus`, `audio/opus`).
         hint.with_extension("ogg");
     } else if path_part.ends_with(".flac") {
         hint.with_extension("flac");
@@ -616,9 +628,8 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
         .unwrap_or(2);
     let source_sample_rate = audio_params.sample_rate.unwrap_or(44100);
 
-    let decoder = symphonia::default::get_codecs()
-        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
-        .map_err(|e| format!("radio decoder init failed: {e}"))?;
+    // Opus : libopus, symphonia ne le décode pas (voir `radio_ogg`).
+    let decoder = radio_ogg::DecodeurRadio::pour(&audio_params)?;
 
     use symphonia::core::codecs::audio::well_known::*;
     let source_format = match audio_params.codec {
@@ -812,6 +823,25 @@ fn decoder_un_paquet(
             debug!("radio_local_decode_eof");
             return SuitePaquet::AmontCoupe; // upstream dropped — reconnect
         }
+        Err(symphonia::core::errors::Error::ResetRequired) => {
+            // Ogg chaîné : le titre suivant ouvre un nouveau flux logique.
+            // Avant, ce cas tombait dans la branche d'erreur ci-dessous et
+            // coûtait un GET complet à chaque changement de titre.
+            return match radio_ogg::piste_du_flux_suivant(
+                &*sonde.format,
+                sonde.source_channels,
+                sonde.source_sample_rate,
+            ) {
+                Some((track_id, decoder)) => {
+                    sonde.track_id = track_id;
+                    sonde.decoder = decoder;
+                    let titre = radio_ogg::titre_du_flux_logique(&mut *sonde.format);
+                    tracing::info!(titre = ?titre, "radio_ogg_flux_logique_suivant");
+                    SuitePaquet::FluxLogiqueSuivant
+                }
+                None => SuitePaquet::ErreurDePaquet,
+            };
+        }
         Err(e) => {
             // FIP-style upstream body error — reconnect in place.
             warn!(error = %e, "radio_local_decode_packet_error");
@@ -823,20 +853,15 @@ fn decoder_un_paquet(
         return SuitePaquet::AutrePiste;
     }
 
-    let decoded = match sonde.decoder.decode(&packet) {
-        Ok(d) => d,
+    // Decoded audio as interleaved samples before output quantization.
+    let mut interleaved: Vec<f32> = Vec::new();
+    let channels = match sonde.decoder.decoder(&packet, &mut interleaved) {
+        Ok(c) => c,
         Err(e) => {
             debug!(error = %e, "radio_local_decode_frame_skip");
             return SuitePaquet::TrameSautee;
         }
     };
-
-    // Convert decoded audio buffer to interleaved samples before output quantization
-    let channels = decoded.spec().channels().count();
-    let frames = decoded.frames();
-
-    let mut interleaved: Vec<f32> = Vec::with_capacity(frames * channels);
-    decoded.copy_to_vec_interleaved::<f32>(&mut interleaved);
 
     // Upsample low-rate (HE-AAC 22050) PCM to the renderer-safe rate
     // before packing the output PCM, so the bytes match the advertised WAV
@@ -943,6 +968,20 @@ fn reprendre_apres_coupure(
     std::thread::sleep(std::time::Duration::from_millis(500));
     SuiteRadio::Reconnecter
 }
+
+/// Le type MIME d'un flux Ogg : `application/ogg`, `audio/ogg`,
+/// `audio/ogg; codecs=opus`, `audio/opus`, `audio/vorbis`.
+fn ogg_par_le_type(content_type: &str) -> bool {
+    let ct = content_type.to_ascii_lowercase();
+    let essence = ct.split(';').next().unwrap_or("").trim();
+    matches!(
+        essence,
+        "application/ogg" | "audio/ogg" | "audio/opus" | "audio/vorbis" | "audio/x-ogg"
+    )
+}
+
+#[path = "radio_ogg.rs"]
+mod radio_ogg;
 
 #[cfg(test)]
 #[path = "radio_source_tests.rs"]

@@ -343,10 +343,7 @@ async fn read_source(source: &str) -> Result<(Vec<SourceTrack>, Vec<String>), Ap
                 let p = entry.path();
                 if p.is_file()
                     && ingest::is_extra_file(&p)
-                    && !p
-                        .file_name()
-                        .map(|n| n.to_string_lossy().starts_with("._"))
-                        .unwrap_or(false)
+                    && !tune_core::scanner::est_un_fichier_appledouble(&p)
                 {
                     extras.push(p.to_string_lossy().to_string());
                 }

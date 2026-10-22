@@ -233,7 +233,10 @@ impl Airplay2Output {
     /// Spawn the daemon, wait for `ready`, and start the single background stdout
     /// reader that updates playback state AND pairing progress. Does NOT connect.
     async fn spawn_daemon(&self) -> Result<DaemonProcess, String> {
-        let binary = find_daemon_binary();
+        // #6336 — un banc d'essai peut lui substituer un faux démon ; dans un
+        // binaire publié, `substitut` rend toujours `None`.
+        let binary =
+            crate::services_factices::substitut(DAEMON_BINARY).unwrap_or_else(find_daemon_binary);
         info!(binary = %binary, device = %self.name, "airplay2: starting daemon");
 
         let mut child = Command::new(&binary)

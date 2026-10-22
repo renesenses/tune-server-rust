@@ -343,6 +343,18 @@ async fn rollback(
 struct UninstallOptions {
     #[serde(default)]
     remove_native: bool,
+    /// #6256 — désinstallation COMPLÈTE d'un greffon natif tiers : déchargé,
+    /// sorti des chaînes, toutes ses versions retirées du disque.
+    #[serde(default)]
+    purge: bool,
+    /// #6256 — avec `purge` : garder les réglages de zone et les profils pour
+    /// une réinstallation. Absent, ils sont GARDÉS : effacer ce que
+    /// l'utilisateur a réglé doit être demandé, jamais supposé.
+    #[serde(default = "garder_par_defaut")]
+    keep_settings: bool,
+}
+fn garder_par_defaut() -> bool {
+    true
 }
 async fn uninstall(
     _admin: RequireAdmin,
@@ -350,6 +362,9 @@ async fn uninstall(
     Path(id): Path<String>,
     Json(options): Json<UninstallOptions>,
 ) -> Response {
+    if options.purge {
+        return purger(&state, &id, options.keep_settings).await;
+    }
     if !managed(&id) {
         return refusal("unknown plugin".into());
     }
@@ -372,9 +387,126 @@ async fn uninstall(
         .into_response()
 }
 
+/// #6256 — ce que la désinstallation complète a fait.
+#[derive(Debug)]
+pub(crate) struct Desinstallation {
+    /// Un fournisseur chargé a été retiré du registre.
+    pub decharge: bool,
+    /// Le dossier du greffon existait et a été retiré.
+    pub fichiers_retires: bool,
+    /// Les lignes de réglages effacées (vide quand elles sont gardées).
+    pub reglages_effaces: Vec<String>,
+}
+
+/// #6256 — désinstalle complètement le greffon natif TIERS `id` installé sous
+/// `root`. Les quatre emplacements intégrés n'y passent jamais : ils ont leur
+/// propre cycle (`premium_audio_plugins`).
+///
+/// Dans l'ordre, pour qu'un échec laisse un état sûr :
+///
+/// 1. les drapeaux passent à `false` : plus aucune chaîne nouvelle ne demande
+///    l'étage (`natifs_tiers::demande`) ;
+/// 2. le fournisseur quitte le registre, et son échec de chargement est
+///    oublié ; un étage vivant garde la bibliothèque jusqu'à sa destruction ;
+/// 3. le dossier `root/<id>` est retiré, et lui seul. S'il ne peut pas l'être
+///    (fichier encore ouvert sous Windows), l'erreur remonte et AUCUN réglage
+///    n'est effacé : relancer la désinstallation après un redémarrage finit
+///    le travail ;
+/// 4. sans `garder_les_reglages`, les réglages de zone, les profils et les
+///    drapeaux sont effacés. Sinon seule la version notée disparaît.
+///
+/// Rien n'est supprimé hors du dossier du greffon : en particulier, les
+/// fichiers que la bibliothèque aurait écrits ailleurs ne sont ni cherchés ni
+/// effacés — l'hôte ne sait pas où ils sont.
+pub(crate) fn desinstaller_completement(
+    root: &std::path::Path,
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    id: &str,
+    garder_les_reglages: bool,
+) -> Result<Desinstallation, String> {
+    if !tune_core::audio::natifs_tiers::identifiant_admissible(id) {
+        return Err("only third-party native plugins can be purged".into());
+    }
+    for suffix in ["installed", "enabled"] {
+        settings.set(&format!("plugin_{id}_{suffix}"), "false")?;
+    }
+    let decharge = tune_plugin_native::unregister(id);
+    tune_plugin_native::forget_failure(id);
+    let fichiers_retires = tune_plugin_native::package::remove(root, id)?;
+    let reglages_effaces = if garder_les_reglages {
+        settings.delete(&format!("plugin_{id}_version"))?;
+        Vec::new()
+    } else {
+        tune_core::audio::natifs_tiers::oublier_les_reglages(settings, id)?
+    };
+    Ok(Desinstallation {
+        decharge,
+        fichiers_retires,
+        reglages_effaces,
+    })
+}
+
+/// `POST /audio-plugins/{id}/uninstall` avec `purge: true` (#6256).
+async fn purger(state: &AppState, id: &str, garder_les_reglages: bool) -> Response {
+    let tiers = tune_core::audio::natifs_tiers::identifiant_admissible(id)
+        && (is_third_party(id)
+            || root().join(id).exists()
+            || tune_plugin_native::provider(id).is_some());
+    if !tiers {
+        return refusal("unknown third-party native plugin".into());
+    }
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    // Lues AVANT la désinstallation, qui baisse les drapeaux du greffon.
+    let zones_du_greffon = state
+        .orchestrator
+        .zones_qui_utilisent_le_greffon_tiers(id)
+        .await;
+    let bilan = match desinstaller_completement(&root(), &settings, id, garder_les_reglages) {
+        Ok(bilan) => bilan,
+        Err(e) => {
+            tracing::warn!(%id, error = %e, "native_audio_purge_failed");
+            return refusal(e);
+        }
+    };
+    // Sortir des chaînes SANS redémarrage : l'étage casque de chaque sortie
+    // locale qui joue AVEC ce greffon est rebâti, sans lui. Les autres zones
+    // ne sont pas touchées : les rebâtir ne leur retirerait rien et pourrait
+    // s'entendre. Un flux réseau déjà préparé le porte jusqu'à la fin de sa
+    // piste ; la suivante ne l'a plus.
+    let mut zones_rebaties = Vec::new();
+    for zone in zones_du_greffon {
+        if state
+            .orchestrator
+            .rebatir_l_etage_casque_en_direct(zone)
+            .await
+        {
+            zones_rebaties.push(zone);
+        }
+    }
+    tracing::info!(
+        %id,
+        decharge = bilan.decharge,
+        fichiers_retires = bilan.fichiers_retires,
+        reglages_effaces = bilan.reglages_effaces.len(),
+        "native_audio_purged"
+    );
+    Json(json!({
+        "id": id,
+        "installed": false,
+        "unloaded": bilan.decharge,
+        "files_removed": bilan.fichiers_retires,
+        "configuration_preserved": garder_les_reglages,
+        "settings_removed": bilan.reglages_effaces,
+        "zones_refreshed_live": zones_rebaties,
+        "restart_required": false,
+    }))
+    .into_response()
+}
+
 async fn asset(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     if !managed(&id) {
         return refusal("unknown plugin".into());
@@ -383,7 +515,7 @@ async fn asset(
     {
         return response;
     }
-    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, &id) {
+    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, &id, &headers) {
         return response;
     }
     let keys = match trusted_keys() {
@@ -444,3 +576,7 @@ mod cle_de_mozaiklabs_5149 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "native_audio_desinstallation_6256_tests.rs"]
+mod desinstallation_6256_tests;

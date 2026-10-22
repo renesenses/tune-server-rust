@@ -94,7 +94,42 @@ fn strip_suffixes(text: &str) -> String {
             result.truncate(pos);
         }
     }
+    if let Some(pos) = debut_mention_remaster(&result) {
+        result.truncate(pos);
+    }
     result.trim().to_string()
+}
+
+/// Où commence une mention de réédition dont l'année PRÉCÈDE le mot :
+/// « (2017 Remaster) », « [2011 Remastered Version] », « - 2009 Remaster ».
+///
+/// Les motifs ci-dessus ne voient que « (remaster… » : la forme que Qobuz et
+/// Spotify emploient le plus souvent, l'année d'abord, leur échappait. Le
+/// favori radio « Ashes to Ashes » ne retrouvait alors « Ashes to Ashes
+/// (2017 Remaster) » qu'en « approximatif » (chantier favoris radio → Qobuz,
+/// 14/10/2026). Seul un groupe qui CONTIENT « remaster » est coupé : une
+/// parenthèse ordinaire du titre reste en place.
+fn debut_mention_remaster(text: &str) -> Option<usize> {
+    let mut debut = None;
+    for (i, c) in text.char_indices() {
+        let fin = match c {
+            '(' => ')',
+            '[' => ']',
+            '-' if text[..i].ends_with(' ') && text[i + 1..].starts_with(' ') => '\0',
+            _ => continue,
+        };
+        let reste = &text[i + c.len_utf8()..];
+        let groupe = if fin == '\0' {
+            reste
+        } else {
+            reste.split(fin).next().unwrap_or(reste)
+        };
+        if groupe.contains("remaster") {
+            debut = Some(if c == '-' { i.saturating_sub(1) } else { i });
+            break;
+        }
+    }
+    debut
 }
 
 pub fn similarity(a: &str, b: &str) -> f64 {
@@ -443,6 +478,22 @@ mod tests {
             normalize("Bohemian Rhapsody (Remastered 2011)"),
             "bohemian rhapsody"
         );
+    }
+
+    #[test]
+    fn normalize_remaster_annee_en_tete() {
+        assert_eq!(normalize("Heroes (2017 Remaster)"), "heroes");
+        assert_eq!(
+            normalize("Ashes to Ashes [1999 Remastered Version]"),
+            "ashes to ashes"
+        );
+        assert_eq!(normalize("Heroes - 2017 Remaster"), "heroes");
+        // Une parenthèse ordinaire du titre n'est pas coupée.
+        assert_eq!(
+            normalize("(Sittin' On) The Dock of the Bay"),
+            "(sittin' on) the dock of the bay"
+        );
+        assert_eq!(normalize("Ob-La-Di, Ob-La-Da"), "ob-la-di, ob-la-da");
     }
 
     #[test]

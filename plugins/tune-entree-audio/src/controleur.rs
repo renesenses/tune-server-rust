@@ -12,13 +12,26 @@
 //! redémarre la capture au nouveau format natif, et relance la lecture de la
 //! zone : la zone reçoit un NOUVEAU flux, cohérent de bout en bout. L'ancien
 //! est tenu en silence jusqu'à sa relève (`Fin::Relance`).
+//!
+//! ## Arrêt quand la zone passe à autre chose
+//!
+//! La zone qui écoute peut s'arrêter par son bouton Stop, ou passer à une
+//! autre source, sans passer par `POST /arreter`. [`Controleur::suivre_les_zones`]
+//! écoute les événements de lecture : après un `stopped`, `started` ou
+//! `track_changed` de CETTE zone, et un délai laissé aux lancements en vol
+//! ([`DELAI_AVANT_ARRET`]), la capture s'arrête si la zone n'écoute plus
+//! l'entrée. Le périphérique est rendu tout de suite (sous macOS, le témoin
+//! du micro s'éteint) au lieu d'attendre [`CAPTURE_SANS_ECOUTE`]. Une pause
+//! garde la capture : la reprise repart du direct.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::runtime::Handle;
+use tokio::sync::broadcast;
 use tracing::{info, warn};
+use tune_core::playback::PlaybackEvent;
 use tune_core::source_pcm::{Consommation, FluxDirect, FormatPcm};
 
 use crate::anneau::{Anneau, Fin};
@@ -34,6 +47,10 @@ pub const PERIODE_SURVEILLANCE: Duration = Duration::from_millis(500);
 /// Une capture que plus aucune session n'écoute s'arrête après ce délai (la
 /// zone a été arrêtée autrement que par `/arreter`, ou a changé de source).
 pub const CAPTURE_SANS_ECOUTE: Duration = Duration::from_secs(30);
+/// Après un événement de la zone qui écoute, le temps laissé à un lancement
+/// (un `play` arrête d'abord ce que la zone jouait, une relance de fréquence
+/// relance la zone) avant de juger que la zone n'écoute plus l'entrée.
+pub const DELAI_AVANT_ARRET: Duration = Duration::from_secs(2);
 
 struct Active {
     entree: String,
@@ -91,6 +108,27 @@ pub struct Controleur {
     /// Sérialise les démarrages SANS tenir l'état.
     demarrages: Mutex<()>,
     demarrage_en_cours: Mutex<Option<(String, Instant)>>,
+    /// Lancements de zone en vol (`jouer`, relance de fréquence) : tant qu'il
+    /// y en a, un `stopped` de la zone est celui du lancement, pas un arrêt.
+    lancements: AtomicU64,
+    /// Voir [`DELAI_AVANT_ARRET`] (réglable pour les témoins).
+    pub delai_avant_arret: Mutex<Duration>,
+}
+
+/// Compte un lancement en vol le temps de sa vie.
+struct Lancement<'a>(&'a AtomicU64);
+
+impl<'a> Lancement<'a> {
+    fn new(n: &'a AtomicU64) -> Self {
+        n.fetch_add(1, Ordering::SeqCst);
+        Self(n)
+    }
+}
+
+impl Drop for Lancement<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Controleur {
@@ -107,6 +145,8 @@ impl Controleur {
             periode_surveillance: PERIODE_SURVEILLANCE,
             demarrages: Mutex::new(()),
             demarrage_en_cours: Mutex::new(None),
+            lancements: AtomicU64::new(0),
+            delai_avant_arret: Mutex::new(DELAI_AVANT_ARRET),
         })
     }
 
@@ -301,6 +341,7 @@ impl Controleur {
         };
         let entree = entree.to_string();
         rt.spawn(async move {
+            let _lancement = Lancement::new(&moi.lancements);
             let format = moi.instantane().map(|i| i.format);
             let Some(format) = format else { return };
             if let Err(e) = moi
@@ -315,6 +356,7 @@ impl Controleur {
 
     /// `POST /jouer` : démarre la capture et lance la zone.
     pub async fn jouer(&self, entree: &str, zone_id: i64) -> Result<(String, FormatPcm), String> {
+        let _lancement = Lancement::new(&self.lancements);
         let (nom, format) = {
             let entree = entree.to_string();
             let moi = self.moi.upgrade().ok_or("contrôleur arrêté")?;
@@ -378,6 +420,72 @@ impl Controleur {
                 a.arreter(Fin::Normale);
             }
         }
+    }
+
+    /// La zone qui écoute la capture active, s'il y en a une.
+    pub fn zone_ecoutante(&self) -> Option<i64> {
+        self.verrou().as_ref().and_then(|a| a.zone_id)
+    }
+
+    /// La zone `zone_id` a changé d'état : si c'est elle qui écoute, qu'aucun
+    /// lancement n'est en vol et qu'elle n'écoute plus l'entrée (arrêtée, ou
+    /// passée à une autre source), la capture s'arrête. Rend `true` si elle
+    /// a été arrêtée.
+    pub async fn zone_a_change(&self, zone_id: i64) -> bool {
+        let (anneau, entree) = {
+            let g = self.verrou();
+            match g.as_ref() {
+                Some(a) if a.zone_id == Some(zone_id) => (a.anneau.clone(), a.entree.clone()),
+                _ => return false,
+            }
+        };
+        let en_vol =
+            || self.lancements.load(Ordering::SeqCst) > 0 || self.demarrage_en_cours().is_some();
+        if en_vol() || self.hote.ecoute_l_entree(zone_id).await || en_vol() {
+            return false;
+        }
+        info!(entree = %entree, zone_id, "entree_audio_capture_arretee_zone_ailleurs");
+        self.arreter_capture_de(&anneau);
+        true
+    }
+
+    /// Suit les événements de lecture et arrête la capture dès que la zone
+    /// qui écoute passe à autre chose (voir l'en-tête du module).
+    pub fn suivre_les_zones(
+        self: &Arc<Self>,
+        mut evenements: broadcast::Receiver<PlaybackEvent>,
+    ) -> tokio::task::JoinHandle<()> {
+        let moi = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let zone = match evenements.recv().await {
+                    Ok(e)
+                        if matches!(e.event.as_str(), "stopped" | "started" | "track_changed") =>
+                    {
+                        Some(e.zone_id)
+                    }
+                    Ok(_) => None,
+                    // Des événements perdus : on rejuge la zone qui écoute.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        moi.upgrade().and_then(|c| c.zone_ecoutante())
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                };
+                let Some(zone) = zone else { continue };
+                let delai = {
+                    let Some(c) = moi.upgrade() else { return };
+                    if c.zone_ecoutante() != Some(zone) {
+                        continue;
+                    }
+                    *c.delai_avant_arret
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                };
+                tokio::time::sleep(delai).await;
+                let Some(c) = moi.upgrade() else { return };
+                c.zone_a_change(zone).await;
+            }
+        })
     }
 
     pub fn arreter_capture(&self) {
@@ -574,5 +682,138 @@ mod tests {
         assert!(nb > 0);
         assert_eq!(s.demarrages.lock().unwrap().len(), 1, "une seule capture");
         c.arreter_capture();
+    }
+
+    // ── Arrêt quand la zone passe à autre chose ─────────────────────────
+
+    fn evenement(event: &str, zone_id: i64) -> PlaybackEvent {
+        PlaybackEvent {
+            event: event.into(),
+            zone_id,
+            data: serde_json::Value::Null,
+        }
+    }
+
+    /// Un contrôleur qui écoute la zone 3 depuis « Yeti X », suivi par un
+    /// canal d'événements que le témoin alimente.
+    async fn en_ecoute(
+        hote: Arc<HoteTemoin>,
+    ) -> (
+        Arc<Controleur>,
+        broadcast::Sender<PlaybackEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let c = controleur(Simulees::avec("Yeti X", 48_000), hote);
+        *c.delai_avant_arret.lock().unwrap() = Duration::from_millis(50);
+        let (tx, rx) = broadcast::channel(16);
+        let suivi = c.suivre_les_zones(rx);
+        c.jouer("Yeti X", 3).await.unwrap();
+        assert_eq!(c.zone_ecoutante(), Some(3));
+        (c, tx, suivi)
+    }
+
+    async fn capture_arretee_sous(c: &Controleur, delai: Duration) -> bool {
+        let fin = Instant::now() + delai;
+        while Instant::now() < fin {
+            if c.instantane().is_none() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        c.instantane().is_none()
+    }
+
+    /// Le bouton Stop de la zone (pas `POST /arreter`) rend le périphérique
+    /// tout de suite, au lieu des 30 s de `CAPTURE_SANS_ECOUTE`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn le_stop_de_la_zone_arrete_la_capture_aussitot() {
+        let hote = Arc::new(HoteTemoin::default());
+        let (c, tx, suivi) = en_ecoute(hote.clone()).await;
+        hote.arretees.lock().await.push(3);
+        tx.send(evenement("stopped", 3)).unwrap();
+        assert!(
+            capture_arretee_sous(&c, Duration::from_secs(2)).await,
+            "la capture tourne encore après le Stop de la zone"
+        );
+        suivi.abort();
+    }
+
+    /// La zone passe à une autre source : la capture s'arrête aussi.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn une_autre_source_sur_la_zone_arrete_la_capture() {
+        let hote = Arc::new(HoteTemoin::default());
+        let (c, tx, suivi) = en_ecoute(hote.clone()).await;
+        hote.autre_source.lock().await.push(3);
+        tx.send(evenement("track_changed", 3)).unwrap();
+        assert!(capture_arretee_sous(&c, Duration::from_secs(2)).await);
+        suivi.abort();
+    }
+
+    /// Un événement d'une AUTRE zone, ou de la zone qui écoute encore (une
+    /// pause, le `stopped` de ce qu'elle jouait avant), ne touche à rien.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn la_capture_reste_tant_que_la_zone_ecoute() {
+        let hote = Arc::new(HoteTemoin::default());
+        let (c, tx, suivi) = en_ecoute(hote.clone()).await;
+        hote.arretees.lock().await.push(9);
+        tx.send(evenement("stopped", 9)).unwrap();
+        tx.send(evenement("stopped", 3)).unwrap();
+        tx.send(evenement("paused", 3)).unwrap();
+        tx.send(evenement("position", 3)).unwrap();
+        assert!(!capture_arretee_sous(&c, Duration::from_millis(400)).await);
+        assert_eq!(c.zone_ecoutante(), Some(3));
+        c.arreter_capture();
+        suivi.abort();
+    }
+
+    /// Un `play` arrête d'abord ce que la zone jouait : le `stopped` qui en
+    /// vient, pendant que le lancement est en vol, n'arrête pas la capture
+    /// qu'il est en train de brancher.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn le_stopped_d_un_lancement_en_vol_ne_coupe_rien() {
+        let hote = Arc::new(HoteTemoin::default());
+        hote.autre_source.lock().await.push(3);
+        *hote.duree_jouer.lock().unwrap() = Duration::from_millis(600);
+        let c = controleur(Simulees::avec("Yeti X", 48_000), hote.clone());
+        *c.delai_avant_arret.lock().unwrap() = Duration::from_millis(50);
+        let (tx, rx) = broadcast::channel(16);
+        let suivi = c.suivre_les_zones(rx);
+        let lancement = {
+            let c = c.clone();
+            tokio::spawn(async move { c.jouer("Yeti X", 3).await })
+        };
+        // La capture est ouverte, la zone n'écoute pas encore.
+        let fin = Instant::now() + Duration::from_secs(2);
+        while c.zone_ecoutante() != Some(3) && Instant::now() < fin {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(c.zone_ecoutante(), Some(3));
+        tx.send(evenement("stopped", 3)).unwrap();
+        lancement.await.unwrap().unwrap();
+        tx.send(evenement("started", 3)).unwrap();
+        assert!(
+            !capture_arretee_sous(&c, Duration::from_millis(400)).await,
+            "le stopped du lancement a coupé la capture"
+        );
+        c.arreter_capture();
+        suivi.abort();
+    }
+
+    /// Le contrôleur rendu, le suivi s'éteint de lui-même.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn le_suivi_s_eteint_avec_le_controleur() {
+        let c = controleur(
+            Simulees::avec("Yeti X", 48_000),
+            Arc::new(HoteTemoin::default()),
+        );
+        let (tx, rx) = broadcast::channel(16);
+        let suivi = c.suivre_les_zones(rx);
+        drop(c);
+        tx.send(evenement("stopped", 3)).unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), suivi)
+            .await
+            .expect("le suivi ne s'est pas éteint")
+            .unwrap();
     }
 }

@@ -434,6 +434,22 @@ pub mod sql {
         )
     }
 
+    /// #5463 — les identifiants MusicBrainz de la sortie et de son groupe,
+    /// lus dans les balises du fichier image d'une feuille CUE. Chacun n'est
+    /// posé que si la colonne est VIDE : une valeur connue (identification,
+    /// édition, scan précédent) n'est jamais écrasée.
+    pub fn poser_identifiants_mb_si_vides<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET \
+             musicbrainz_release_id = COALESCE(NULLIF(musicbrainz_release_id, ''), {}), \
+             musicbrainz_release_group_id = COALESCE(NULLIF(musicbrainz_release_group_id, ''), {}) \
+             WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
     /// #5463 — le code-barres d'un album, que seule une feuille CUE
     /// (`CATALOG`) fournit au scan.
     pub fn force_update_barcode<D: SqlDialect>(d: &D) -> String {
@@ -2662,6 +2678,26 @@ impl AlbumRepo {
     /// feuille CUE EST la source de métadonnées de l'album qu'elle décrit,
     /// c'est tout son objet. Ailleurs, deux titres en désaccord désignent deux
     /// éditions et ne se tranchent pas ici.
+    /// Comble les identifiants MusicBrainz d'un album CUE depuis les balises de
+    /// son fichier image (#5463) — seulement là où l'album n'en a pas.
+    pub fn poser_identifiants_mb_si_vides(
+        &self,
+        album_id: i64,
+        sortie: Option<&str>,
+        groupe: Option<&str>,
+    ) -> Result<(), TuneError> {
+        if sortie.is_none() && groupe.is_none() {
+            return Ok(());
+        }
+        let sql = self.dialect_sql(
+            sql::poser_identifiants_mb_si_vides,
+            sql::poser_identifiants_mb_si_vides,
+        );
+        let params: [&dyn ToSqlValue; 3] = [&sortie, &groupe, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     /// Pose le code-barres de l'album (#5463). `Album::update` ne l'écrit pas.
     pub fn force_update_barcode(&self, album_id: i64, barcode: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::force_update_barcode, sql::force_update_barcode);
@@ -4649,7 +4685,7 @@ impl AlbumRepo {
 ///     découpe par `json_array_contains_lower`. Un contenu qui n'est pas un
 ///     tableau de chaînes ne rend rien, comme `json_each` sur une valeur
 ///     illisible.
-fn jetons_de_genre(genre: Option<&str>, genres_json: Option<&str>) -> Vec<String> {
+pub(crate) fn jetons_de_genre(genre: Option<&str>, genres_json: Option<&str>) -> Vec<String> {
     let mut jetons = Vec::new();
     if let Some(brut) = genre {
         let decoupe = brut
@@ -6646,6 +6682,45 @@ pub(crate) mod tests {
         ]);
         assert_eq!(vues, 5);
         assert_eq!(compte, Some(5));
+    }
+
+    /// #6222 — dans une compilation personnelle (un disque, numéros d'origine
+    /// en double), deux versions d'un même morceau portent le même numéro et
+    /// le même titre : « Yesterday » n° 13 des Beatles et sa reprise. L'écran
+    /// les montre toutes les deux (#6609) ; le compte doit en dire autant.
+    #[test]
+    fn dans_une_compilation_le_compte_suit_l_ecran_6222() {
+        let (compte, vues) = compte_et_lignes_vues(&[
+            (1, 13, "Yesterday", "flac"),
+            (1, 1, "Angie", "flac"),
+            (1, 13, "Yesterday", "flac"),
+            (1, 1, "Creep", "flac"),
+        ]);
+        assert_eq!(vues, 4, "l'écran montre les deux « Yesterday »");
+        assert_eq!(
+            compte,
+            Some(4),
+            "le compte enregistré doit dire la même chose que l'écran : \
+             la clé disque/numéro/titre replie les deux « Yesterday » en une"
+        );
+    }
+
+    /// #6222 — un coffret de deux disques n'est jamais en ordre de fichiers :
+    /// ses copies se replient à l'écran comme dans le compte.
+    #[test]
+    fn un_coffret_garde_le_repli_des_copies_dans_son_compte_6222() {
+        let (compte, vues) = compte_et_lignes_vues(&[
+            (1, 1, "Un", "flac"),
+            (1, 1, "Deux", "flac"),
+            (1, 2, "Trois", "aiff"),
+            (1, 2, "Trois", "aac"),
+            (2, 1, "Quatre", "flac"),
+        ]);
+        assert_eq!(
+            vues, 4,
+            "deux disques : les copies de « Trois » se replient"
+        );
+        assert_eq!(compte, Some(4));
     }
 
     #[test]

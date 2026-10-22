@@ -385,6 +385,39 @@ pub fn cle_d_identite_album(udn: &str, titre: &str, artiste: Option<&str>) -> St
     format!("{udn}|{:016x}", fnv1a64(matiere.as_bytes()))
 }
 
+/// **Cet item DIDL est-il une station de radio ?** (#6500)
+///
+/// Deux signes, et seulement deux, tous deux lus dans le DIDL :
+///
+/// 1. la classe UPnP `object.item.audioItem.audioBroadcast` (ou une classe qui
+///    en dérive) — la façon normalisée de dire « flux diffusé » ;
+/// 2. la forme qu'a une station dans le serveur média d'un **Tune** :
+///    `id="radio/<n>"` sous `parentID="radios"`. Ce rayon publie ses stations
+///    en `musicTrack` quand on le PARCOURT (`RADIO_CLASSE_BROWSE`,
+///    `tune-core/src/upnp_server.rs`, pour le Marantz ND8006) : la classe ne
+///    les trahit donc pas, et c'est par là qu'elles sont entrées sur le `.18`
+///    (31 stations, `upnp_object_id = radio/<n>`, relevé du 19/10/2026).
+///
+/// Ni la durée nulle ni l'absence de taille ne sont des signes : sept vraies
+/// pistes UPnP du `.18` ont une durée nulle.
+pub(crate) fn est_une_station_de_radio(item: &Value) -> bool {
+    let classe_diffusee = item.get("class").and_then(Value::as_str).is_some_and(|c| {
+        c.trim()
+            .to_ascii_lowercase()
+            .starts_with("object.item.audioitem.audiobroadcast")
+    });
+    let station_de_tune = item
+        .get("parent_id")
+        .and_then(Value::as_str)
+        .is_some_and(|p| p == "radios")
+        && item
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| id.strip_prefix("radio/"))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|o| o.is_ascii_digit()));
+    classe_diffusee || station_de_tune
+}
+
 /// Ce que l'indexation retient d'un item DIDL.
 #[derive(Debug, Clone)]
 struct PisteDistante {
@@ -469,6 +502,8 @@ struct Bilan {
     mises_a_jour: usize,
     sans_url: usize,
     sans_taille: usize,
+    /// #6500 — les stations de radio croisées et écartées.
+    radios_ecartees: usize,
     albums_ajoutes: usize,
     /// #4581 — les coquilles distantes retirées par cette passe.
     albums_vides_retires: usize,
@@ -600,6 +635,7 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
             "ajoutees": bilan.ajoutees,
             "mises_a_jour": bilan.mises_a_jour,
             "ecartees_sans_url_de_lecture": bilan.sans_url,
+            "ecartees_radios": bilan.radios_ecartees,
             "sans_res_size": bilan.sans_taille,
         },
         "albums_ajoutes": bilan.albums_ajoutes,
@@ -706,6 +742,13 @@ async fn recolter(
         bilan.items_vus += items.len();
 
         for item in &items {
+            // #6500 — une station n'est pas une piste : la ranger dans
+            // `tracks` la mettait en tête de Bibliothèque > Pistes (pas
+            // d'artiste, donc triée la première), sans durée ni album.
+            if est_une_station_de_radio(item) {
+                bilan.radios_ecartees += 1;
+                continue;
+            }
             let Some(piste) = PisteDistante::depuis_item(item) else {
                 bilan.erreurs.push(format!(
                     "{nom} : une piste sans titre ne peut pas être identifiée"
@@ -781,8 +824,37 @@ async fn ecrire_avec_pochettes(
         pistes.iter().filter_map(|p| p.pochette.clone()),
     )
     .await;
-    ecrire(state, udn, nom, pistes, bilan, &pochettes);
-    pochettes.len()
+    let nb_pochettes = pochettes.len();
+    // #5677 — `ecrire` est une boucle SYNCHRONE de lectures et d'écritures
+    // SQLite, plusieurs par piste. La synchronisation horaire la repasse sur
+    // toutes les pistes de la source. Appelée ici directement, elle tenait un
+    // fil de l'exécuteur pendant toute la passe (5,2 s de battement arrêté
+    // pour 2 000 pistes sur Shrek, en build de test) : plus de chien de garde,
+    // plus de flux interne pour la sortie locale. Elle part donc sur un fil
+    // de `spawn_blocking`, comme les autres écritures de la synchronisation
+    // (`synchronisation_upnp::hors_executeur`).
+    let (etat, udn, nom) = (state.clone(), udn.to_string(), nom.to_string());
+    let pistes = pistes.to_vec();
+    let mut bilan_de_la_passe = std::mem::take(bilan);
+    let ecriture = tokio::task::spawn_blocking(move || {
+        ecrire(
+            &etat,
+            &udn,
+            &nom,
+            &pistes,
+            &mut bilan_de_la_passe,
+            &pochettes,
+        );
+        bilan_de_la_passe
+    })
+    .await;
+    match ecriture {
+        Ok(rendu) => *bilan = rendu,
+        Err(e) => bilan
+            .erreurs
+            .push(format!("écriture de la passe interrompue : {e}")),
+    }
+    nb_pochettes
 }
 
 /// Écrit l'instantané. **Aucun `DELETE`.**

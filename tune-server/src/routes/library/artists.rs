@@ -10,7 +10,7 @@ use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
 
-use super::{Pagination, api_cache_get, api_cache_set, artwork_cache_dir, now_iso_utc};
+use super::{api_cache_get, api_cache_set, artwork_cache_dir, now_iso_utc};
 
 #[derive(Deserialize)]
 pub(super) struct LangQuery {
@@ -205,13 +205,65 @@ pub(super) async fn artists_doublons(State(state): State<AppState>) -> Json<Valu
     }))
 }
 
+/// `GET /library/artists` : la pagination, et `provenances=1` (tune-web-client#1716).
+#[derive(Deserialize)]
+pub(super) struct ArtistsQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    /// `1` / `true` : chaque artiste porte `provenances`, ses albums et pistes
+    /// visibles par clé de provenance. Absent : la réponse d'avant, au
+    /// caractère près, et aucune requête de plus.
+    provenances: Option<String>,
+}
+
+fn veut_les_sources(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "true"))
+}
+
+/// Pose `provenances` sur chaque artiste de la page — tune-web-client#1716.
+///
+/// L'onglet Artistes chargeait toute la bibliothèque (pistes ET albums) pour
+/// calculer ces sources dans le navigateur. Elles viennent maintenant d'ici,
+/// pour la page seulement. Un artiste sans album ni piste visible reçoit `{}` :
+/// le client le lit comme « aucune source », comme avant.
+fn joindre_les_sources(
+    items: &mut [Value],
+    sources: &tune_core::db::artist_repo::SourcesDesArtistes,
+) {
+    for item in items {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let id = obj.get("id").and_then(Value::as_i64);
+        let s = id.and_then(|id| sources.get(&id));
+        obj.insert("provenances".into(), json!(s.cloned().unwrap_or_default()));
+    }
+}
+
 pub(super) async fn list_artists(
     State(state): State<AppState>,
-    Query(p): Query<Pagination>,
+    Query(p): Query<ArtistsQuery>,
 ) -> Json<Value> {
-    let repo = ArtistRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
+    // Les lectures sont synchrones (rusqlite) : hors de l'exécuteur, comme
+    // `GET /library/tracks` (#5138). Les sources parcourent les pistes.
+    let avec_sources = veut_les_sources(p.provenances.as_deref());
+    match tokio::task::spawn_blocking(move || {
+        lire_la_page_d_artistes(&state, limit, offset, avec_sources)
+    })
+    .await
+    {
+        Ok(corps) => Json(corps),
+        Err(e) => {
+            tracing::error!(error = %e, "list_artists_tache_bloquante_perdue");
+            Json(json!({"items": [], "total": 0, "limit": limit, "offset": offset}))
+        }
+    }
+}
+
+fn lire_la_page_d_artistes(state: &AppState, limit: i64, offset: i64, avec_sources: bool) -> Value {
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let total = repo.count().unwrap_or(0);
     let items = match repo.list(limit, offset) {
         Ok(artists) => artists,
@@ -226,7 +278,22 @@ pub(super) async fn list_artists(
             Vec::new()
         }
     };
-    Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
+    if !avec_sources {
+        return json!({"items": items, "total": total, "limit": limit, "offset": offset});
+    }
+    let ids: Vec<i64> = items.iter().filter_map(|a| a.id).collect();
+    // Un échec ne pose PAS `provenances` : un `{}` dirait « aucune source » à
+    // tort, alors que son absence fait retomber le client sur son calcul.
+    let sources = match repo.sources_des_artistes(&ids) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "list_artists_sources_query_failed");
+            return json!({"items": items, "total": total, "limit": limit, "offset": offset});
+        }
+    };
+    let mut items: Vec<Value> = items.iter().map(|a| json!(a)).collect();
+    joindre_les_sources(&mut items, &sources);
+    json!({"items": items, "total": total, "limit": limit, "offset": offset})
 }
 
 pub(super) async fn get_artist(
@@ -442,6 +509,73 @@ fn repli_sur_la_bio_stockee(
     }
 }
 
+// ── #6555 — les similaires d'un artiste de la BIBLIOTHÈQUE (fil 2341) ──────
+//
+// Bilou : « lorsque on sélectionne un artiste et que l'on clique sur un des
+// choix d'artistes similaires […] il faut remonter à l'artiste initial puis
+// redescendre ». La fiche d'un artiste de la bibliothèque lit ses
+// similaires (« À propos ») par `GET /library/artists/{id}/metadata`. Cette
+// route, et sa sœur `/similar`, interrogeaient `https://mozaiklabs.fr/api/
+// {mbid}` : une adresse MORTE (404), le cloud vit sous `/api/v1/artists`.
+// Elles retombaient sur la fiche locale, SANS similaires. La fiche n'en
+// montrait donc qu'après « Enrichir » (Last.fm), en mémoire seulement : ouvrir
+// un voisin rechargeait la fiche, et ses propres similaires n'y étaient pas.
+//
+// Même correction que #1730 pour `/metadata/artists/{id}/similar` : le
+// client du cloud (`ArtistEnrichmentClient`), qui porte l'adresse de
+// référence et lit le réglage `artist_enrichment_api` ; et, pour un artiste
+// sans MBID (neuf sur dix en bibliothèque), la résolution EXACTE par le nom.
+
+/// Délai du cloud pour une fiche : elle charge ses similaires sans bloquer
+/// la discographie, mais une fiche ouverte ne doit pas attendre une minute.
+const DELAI_CLOUD_FICHE_SECS: u64 = 10;
+
+fn client_cloud(
+    state: &AppState,
+) -> tune_core::metadata::artist_enrichment::ArtistEnrichmentClient {
+    let base = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get("artist_enrichment_api")
+        .ok()
+        .flatten();
+    tune_core::metadata::artist_enrichment::ArtistEnrichmentClient::new(
+        base.as_deref(),
+        DELAI_CLOUD_FICHE_SECS,
+    )
+}
+
+/// Le MBID sous lequel le cloud connaît l'artiste : le sien, ou celui que la
+/// recherche EXACTE par le nom rend. La résolution est gardée 24 h, un échec
+/// aussi : une fiche ouverte dix fois ne coûte qu'une recherche.
+async fn mbid_cloud(
+    state: &AppState,
+    client: &mut tune_core::metadata::artist_enrichment::ArtistEnrichmentClient,
+    artiste: &tune_core::db::models::Artist,
+) -> Option<String> {
+    if let Some(m) = artiste
+        .musicbrainz_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        return Some(m.to_string());
+    }
+    let cle = format!("cache:meta-nom:{}", artiste.name.trim().to_lowercase());
+    if let Some(v) = api_cache_get(&state.backend, &cle)
+        && v.is_object()
+    {
+        return v.get("mbid").and_then(|m| m.as_str()).map(str::to_owned);
+    }
+    let trouve = client.resolve_mbid(&artiste.name).await;
+    api_cache_set(&state.backend, &cle, &json!({ "mbid": trouve }));
+    trouve
+}
+
+/// Une fiche du cloud digne de ce nom : `{"data": {…}}`. Un `{}` (ancienne
+/// réponse illisible gardée en cache) n'en est pas une.
+fn fiche_cloud_valide(v: &Value) -> bool {
+    v.get("data").is_some_and(|d| d.is_object())
+}
+
 pub(super) async fn artist_similar(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -451,26 +585,24 @@ pub(super) async fn artist_similar(
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(ref mbid) = artist.musicbrainz_id else {
+    let mut client = client_cloud(&state);
+    let Some(mbid) = mbid_cloud(&state, &mut client, &artist).await else {
         return Json(json!({"artist": artist.name, "artists": []})).into_response();
     };
     let cache_key = format!("cache:similar:{mbid}");
-    if let Some(cached) = api_cache_get(&state.backend, &cache_key) {
+    if let Some(cached) = api_cache_get(&state.backend, &cache_key)
+        && cached
+            .get("artists")
+            .is_some_and(|a| a.as_array().is_some_and(|a| !a.is_empty()))
+    {
         return Json(cached).into_response();
     }
-    match state
-        .http_client
-        .get(format!("https://mozaiklabs.fr/api/{mbid}/similar"))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            let data: Value = resp.json().await.unwrap_or(json!({}));
-            api_cache_set(&state.backend, &cache_key, &data);
-            Json(data).into_response()
-        }
-        _ => Json(json!({"mbid": mbid, "artists": []})).into_response(),
+    let voisins = client.get_similar(&mbid).await;
+    let data = json!({"artist": artist.name, "mbid": mbid, "artists": voisins});
+    if !voisins.is_empty() {
+        api_cache_set(&state.backend, &cache_key, &data);
     }
+    Json(data).into_response()
 }
 
 pub(super) async fn artist_metadata(
@@ -482,27 +614,28 @@ pub(super) async fn artist_metadata(
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(ref mbid) = artist.musicbrainz_id else {
+    let mut client = client_cloud(&state);
+    let Some(mbid) = mbid_cloud(&state, &mut client, &artist).await else {
         return Json(json!(artist)).into_response();
     };
     let cache_key = format!("cache:meta:{mbid}");
-    if let Some(cached) = api_cache_get(&state.backend, &cache_key) {
+    if let Some(cached) = api_cache_get(&state.backend, &cache_key)
+        && fiche_cloud_valide(&cached)
+    {
         return Json(cached).into_response();
     }
-    match state
-        .http_client
-        .get(format!("https://mozaiklabs.fr/api/{mbid}"))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            let data: Value = resp.json().await.unwrap_or(json!({}));
-            api_cache_set(&state.backend, &cache_key, &data);
-            Json(data).into_response()
+    match client.get_artist(&mbid).await {
+        Some(fiche) if fiche_cloud_valide(&fiche.fields) => {
+            api_cache_set(&state.backend, &cache_key, &fiche.fields);
+            Json(fiche.fields).into_response()
         }
         _ => Json(json!(artist)).into_response(),
     }
 }
+
+#[cfg(test)]
+#[path = "similaires_en_chaine_tests_6555.rs"]
+mod similaires_en_chaine_tests_6555;
 
 /// Paramètres de `GET /library/artists/{id}/albums`.
 #[derive(Deserialize)]
@@ -513,6 +646,8 @@ pub(super) struct ArtistAlbumsQuery {
     /// forme pour tout le monde casserait ce qui marche.
     sections: Option<String>,
 }
+
+use tune_core::metadata::release_type;
 
 pub(super) async fn artist_albums(
     State(state): State<AppState>,
@@ -550,10 +685,15 @@ pub(super) async fn artist_albums(
                     o.insert("release_secondary_types".into(), json!(types));
                 }
             }
-            (
-                types.is_some_and(|t| tune_core::metadata::release_type::est_live(t)),
-                v,
-            )
+            // #6464 — règle PROVISOIRE par le titre (« Live », « unplugged »),
+            // seulement quand aucun type secondaire n'est connu : une réponse
+            // explicite (`live` ou non) n'est jamais contredite par le titre.
+            let par_le_type = types.is_some_and(|t| release_type::est_live(t));
+            let par_le_titre = types.is_none() && release_type::titre_annonce_un_live(&a.title);
+            if par_le_titre && let Some(o) = v.as_object_mut() {
+                o.insert("live_by_title".into(), json!(true));
+            }
+            (par_le_type || par_le_titre, v)
         })
         .collect();
 

@@ -113,9 +113,18 @@ pub(super) fn joindre_dr_par_piste(
     // séparait. Même appariement que sur les pistes d'un album — la fonction
     // est PARTAGÉE, un second lecteur écrit ici aurait fini par diverger.
     let dr_source = super::albums::provenance_du_dr(&meta_repo, &track_ids, &dr);
+    // #6124 — la date de sortie ORIGINALE et la VERSION (original, réédition,
+    // remaster…), lues au scan (`read_extended_metadata`). Même contrat que
+    // le DR : la clé est ABSENTE quand le fichier ne porte pas la balise.
+    let (original_date, version) = super::albums::date_originale_et_version(&meta_repo, &track_ids);
     let mut items = super::albums::attach_track_tags(
         items,
-        &[("dynamic_range", &dr), ("dynamic_range_source", &dr_source)],
+        &[
+            ("dynamic_range", &dr),
+            ("dynamic_range_source", &dr_source),
+            ("original_date", &original_date),
+            ("version", &version),
+        ],
     );
     // #3518 — « Idéalement sur la même route que les autres listes de pistes,
     // pour que le tableau ait les mêmes colonnes partout » : ce chemin est le
@@ -1143,6 +1152,20 @@ pub(super) async fn track_all_tags(
     };
 
     let mut result = serde_json::to_value(&track).unwrap_or_default();
+    // #6124 — la date de sortie originale et la version, lues au scan dans
+    // `track_metadata` : la fiche les montre avec les autres champs de la
+    // piste. Absentes quand le fichier ne les porte pas.
+    let (original_date, version) = super::albums::date_originale_et_version(
+        &TrackMetadataRepo::with_backend(state.backend.clone()),
+        &[id],
+    );
+    if let Some(obj) = result.as_object_mut() {
+        for (cle, carte) in [("original_date", &original_date), ("version", &version)] {
+            if let Some(v) = carte.get(&id) {
+                obj.insert(cle.into(), json!(v));
+            }
+        }
+    }
 
     // Try reading raw file tags with lofty — sur la graphie du disque (#1865).
     if let Some(path) = track
@@ -1778,6 +1801,67 @@ pub(super) async fn track_metadata_get(
             Json(json!(meta)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// `GET /api/v1/library/tracks/{id}/file-tags` — les balises RÉELLEMENT présentes
+/// dans le fichier de la piste (#6124), relues À LA DEMANDE et jamais
+/// stockées : clé d'origine, valeur, bloc (`vorbis`, `id3v2`, `mp4`, `ape`…).
+///
+/// Lecture seule. Ni image ni donnée binaire ; une valeur est coupée à
+/// `PLAFOND_VALEUR` caractères et la liste à `PLAFOND_BALISES` entrées, et la
+/// réponse le dit (`truncated`). 404 pour une piste inconnue. Une piste sans
+/// fichier local (service) ou un fichier illisible rend `available: false`
+/// avec un motif, jamais une erreur : la fiche l'affiche tel quel.
+pub(super) async fn track_file_tags(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = TrackRepo::with_backend(state.backend.clone());
+    let track = match repo.get(id) {
+        Ok(Some(t)) => t,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    // Une piste de feuille CUE lit les balises de son image.
+    let Some(chemin) = track
+        .file_path
+        .clone()
+        .or_else(|| track.cue_media_path.clone())
+        .filter(|c| !c.is_empty())
+    else {
+        return Json(json!({
+            "track_id": id,
+            "available": false,
+            "reason": "no_local_file",
+            "tags": [],
+        }))
+        .into_response();
+    };
+    let lu = tokio::task::spawn_blocking(move || {
+        tune_core::metadata::balises_brutes::lire_balises_du_fichier(std::path::Path::new(&chemin))
+    })
+    .await;
+    match lu {
+        Ok(Ok(b)) => {
+            let mut v = json!(b);
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("track_id".into(), json!(id));
+                obj.insert("available".into(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::info!(track_id = id, error = %e, "balises_du_fichier_illisibles");
+            Json(json!({
+                "track_id": id,
+                "available": false,
+                "reason": "unreadable",
+                "tags": [],
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -3702,3 +3786,7 @@ mod tests_octets_dans_une_image_5299 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "balises_6124_tests.rs"]
+mod balises_6124_tests;

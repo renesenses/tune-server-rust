@@ -677,4 +677,103 @@ mod tests {
             "témoin : aucun compositeur ne correspond"
         );
     }
+
+    /// #4319 (Tades, fil 2264) — dans la portée « Mahler Mehta »,
+    /// `albums-detailed?folder=…&q=mahler mehta` rend la 2 ET la 3. Pour la 3,
+    /// « Mahler » n'est que dans le titre de l'album et « Mehta » que dans le
+    /// chef d'orchestre de l'étiquette : la saisie entière, cherchée d'un seul
+    /// tenant, ne la trouvait pas. Témoin : un mot absent exclut.
+    #[tokio::test]
+    async fn la_recherche_par_mots_trouve_la_3_par_le_chef_d_orchestre_4319() {
+        use crate::state::AppState;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use tune_core::db::backend::ToSqlValue;
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Mahler Mehta'), (2, 'Los Angeles Philharmonic')",
+            &[],
+        )
+        .expect("artistes");
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES \
+             (1, 'Mahler - Symphony No. 2', 1), (2, 'Mahler - Symphony No. 3', 2)",
+            &[],
+        )
+        .expect("albums");
+        for (id, titre, artiste, album, chemin) in [
+            (
+                1,
+                "Allegro maestoso",
+                1,
+                1,
+                "/m/XX/Mahler Mehta/Deux/a.flac",
+            ),
+            (2, "Kräftig", 2, 2, "/m/XX/Mahler Mehta/Trois/a.flac"),
+        ] {
+            b.execute(
+                "INSERT INTO tracks (id, title, artist_id, album_id, source, file_path) \
+                 VALUES (?1, ?2, ?3, ?4, 'local', ?5)",
+                &[
+                    &(id as i64) as &dyn ToSqlValue,
+                    &titre,
+                    &(artiste as i64),
+                    &(album as i64),
+                    &chemin,
+                ],
+            )
+            .expect("piste");
+        }
+        b.execute(
+            "INSERT INTO track_metadata (track_id, key, value) VALUES (2, 'conductor', 'Zubin Mehta')",
+            &[],
+        )
+        .expect("chef");
+        let albums = |q: &'static str| {
+            let state = state.clone();
+            async move {
+                let reponse = super::super::router()
+                    .with_state(state)
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!(
+                                "/albums-detailed?limit=10&folder=%2Fm%2FXX%2FMahler%20Mehta&q={q}"
+                            ))
+                            .body(Body::empty())
+                            .expect("requête"),
+                    )
+                    .await
+                    .expect("réponse");
+                let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+                    .await
+                    .expect("corps");
+                let v: Value = serde_json::from_slice(&octets).expect("json");
+                let mut ids: Vec<i64> = v["items"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("items absents : {v}"))
+                    .iter()
+                    .filter_map(|c| c["album_id"].as_i64())
+                    .collect();
+                ids.sort_unstable();
+                ids
+            }
+        };
+        assert_eq!(
+            albums("mahler%20mehta").await,
+            vec![1, 2],
+            "« mahler mehta » : la 2 par l'artiste, la 3 par le titre et le chef"
+        );
+        assert_eq!(
+            albums("mahler%203%20mehta").await,
+            vec![2],
+            "« mahler 3 mehta »"
+        );
+        assert_eq!(
+            albums("mahler%203%20karajan").await,
+            Vec::<i64>::new(),
+            "témoin : Karajan ne dirige rien ici"
+        );
+    }
 }

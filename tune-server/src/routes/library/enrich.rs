@@ -545,6 +545,26 @@ pub(crate) async fn demarrer_enrich_all(
                                 .ok();
                             mbid_artiste_pose = Some(aid);
                         }
+                        // #6474, point 2 — le nom de tri MusicBrainz de
+                        // l'artiste de la piste, tiré des crédits que cette
+                        // réponse porte déjà : posé si la fiche n'en a pas,
+                        // jamais sur une balise ni une saisie. APRÈS le MBID,
+                        // qui le rattache.
+                        if let Some(aid) = artist_id {
+                            match tune_core::metadata::artistes_du_pressage::poser_le_nom_de_tri(
+                                &backend_ecriture,
+                                aid,
+                                &details.artist_credits,
+                            ) {
+                                Ok(true) => {
+                                    debug!(artist_id = aid, "enrich_nom_de_tri_musicbrainz")
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    warn!(artist_id = aid, error = %e, "enrich_nom_de_tri_echec")
+                                }
+                            }
+                        }
                         (result, details, mbid_artiste_pose)
                     },
                 )
@@ -666,7 +686,44 @@ pub(super) async fn enrich_all_status(State(state): State<AppState>) -> Json<Val
         // only `status` while idle made the typed response false and forced
         // callers to paper over missing fields (#1897).
         .unwrap_or(json!({"status": "idle", "enriched": 0, "total": 0}));
-    Json(result)
+    Json(statut_reel(
+        result,
+        tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::Enrichissement),
+        state
+            .background_tasks
+            .snapshot()
+            .iter()
+            .any(|t| t.id == "enrich_all"),
+    ))
+}
+
+/// #6282 — le réglage `enrich_all_status` dit « running » du lancement de la
+/// passe à sa fin, et RIEN entre les deux ne le réécrit quand elle se gare.
+/// Kimon (fil 2259) : enrichissement suspendu, la carte de l'écran État du
+/// serveur disait « en pause » et les Réglages « En cours… » au même instant,
+/// sur « 0 sur 110 781 ».
+///
+/// Le statut servi est donc l'état RÉEL, pas le réglage tel quel :
+/// * `paused` quand la passe vit mais que l'enrichissement est suspendu —
+///   elle est garée à sa frontière ;
+/// * `interrupted` quand le réglage dit « running » sans aucune passe au
+///   registre : un arrêt du serveur l'a tuée avant sa fin (la reprise de
+///   #5469 en relancera une, qui réécrira « running »).
+///
+/// Sur une passe ouverte (« running » en base), `paused` est aussi servi en
+/// booléen, pour un client qui lit le statut comme `running | done | idle`.
+/// Un relevé `done` ou `idle` est servi tel quel.
+fn statut_reel(mut releve: Value, en_pause: bool, passe_vivante: bool) -> Value {
+    let running = releve.get("status").and_then(Value::as_str) == Some("running");
+    if running && let Some(obj) = releve.as_object_mut() {
+        if !passe_vivante {
+            obj.insert("status".into(), json!("interrupted"));
+        } else if en_pause {
+            obj.insert("status".into(), json!("paused"));
+        }
+        obj.insert("paused".into(), json!(passe_vivante && en_pause));
+    }
+    releve
 }
 
 // ── MusicBrainz helper functions (HTTP autonome ; l'analyse des reponses est
@@ -871,6 +928,9 @@ async fn mb_fetch_recording_details(
         release_id,
         release_group_id,
         musicbrainz_artist_id,
+        // #6474 — les crédits et leur `sort-name`, déjà dans la réponse
+        // (`inc=artist-credits`) : aucune requête de plus.
+        artist_credits: tune_core::metadata::musicbrainz_release::credits_d_artiste(&data),
     })
 }
 

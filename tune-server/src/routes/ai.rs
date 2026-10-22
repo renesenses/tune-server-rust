@@ -5,7 +5,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use tune_core::ai::client::{AnthropicClient, ContentBlock, Message, MessageContent};
+#[cfg(not(feature = "assistant-ia"))]
+use tune_core::ai::client::AnthropicClient;
+use tune_core::ai::client::{ContentBlock, Message, MessageContent};
 use tune_core::ai::executor::ToolExecutor;
 use tune_core::ai::recommendations;
 use tune_core::ai::tools::all_tools;
@@ -38,11 +40,47 @@ fn language_directive(lang: &str) -> &'static str {
         "ja" => "Reply to the user in Japanese unless they clearly write in another language.",
         "ko" => "Reply to the user in Korean unless they clearly write in another language.",
         "ro" => "Reply to the user in Romanian unless they clearly write in another language.",
+        "sv" => "Reply to the user in Swedish unless they clearly write in another language.",
+        "hu" => "Reply to the user in Hungarian unless they clearly write in another language.",
+        "vi" => "Reply to the user in Vietnamese unless they clearly write in another language.",
         _ => "Reply to the user in French unless they clearly write in another language.",
     }
 }
 
 const MAX_TOOL_ROUNDS: usize = 5;
+
+/// Ce que la bibliothèque envoie au modèle, borné (étape 3 du chantier
+/// « Assistant IA ») : c'est ce qui fixe le coût d'une question.
+///
+/// - un résultat d'outil part tronqué à 6 000 caractères (≈ 1 500 jetons) ;
+///   `search_library` rend déjà au plus 10 artistes, 10 albums et 10 pistes ;
+/// - une question n'envoie pas plus de 24 000 caractères de résultats en tout
+///   (≈ 6 000 jetons) : au-delà, l'outil s'exécute mais le modèle ne reçoit
+///   qu'un avis « limite atteinte » ;
+/// - 5 tours d'outils au plus, plus le tour final.
+pub(crate) const MAX_CARACTERES_PAR_RESULTAT: usize = 6_000;
+pub(crate) const MAX_CARACTERES_PAR_QUESTION: usize = 24_000;
+
+/// Le résultat d'un outil tel que le modèle le reçoit, borné. `envoyes` :
+/// les caractères de résultats déjà envoyés pour cette question.
+pub(crate) fn resultat_borne(resultat: &str, envoyes: &mut usize) -> String {
+    const AVIS_TRONQUE: &str = " …[résultat tronqué]";
+    const AVIS_LIMITE: &str = "{\"error\":\"limite_de_bibliotheque\",\"message\":\"Limite de données de la bibliothèque atteinte pour cette question : réponds avec ce que tu sais déjà.\"}";
+    if *envoyes >= MAX_CARACTERES_PAR_QUESTION {
+        return AVIS_LIMITE.to_string();
+    }
+    let place = MAX_CARACTERES_PAR_RESULTAT.min(MAX_CARACTERES_PAR_QUESTION - *envoyes);
+    let n = resultat.chars().count();
+    let sortie = if n <= place {
+        resultat.to_string()
+    } else {
+        let mut t: String = resultat.chars().take(place).collect();
+        t.push_str(AVIS_TRONQUE);
+        t
+    };
+    *envoyes += n.min(place);
+    sortie
+}
 
 #[derive(Deserialize)]
 struct AiQuery {
@@ -74,6 +112,164 @@ pub fn router() -> Router<AppState> {
         .route("/smart-radio", post(ai_smart_radio))
 }
 
+/// Celui à qui l'ancien assistant parle.
+///
+/// Étape 2 du chantier « Assistant IA » : un serveur qui porte le greffon
+/// (`assistant-ia`, dans le `default`) ne lit plus la clé EN CLAIR
+/// `anthropic_api_key` — elle est migrée dans le coffre du greffon — et chaque
+/// tour est compté au tarif de l'assistant et refusé plafond atteint. Le
+/// pilotage par outils est écrit pour l'API Messages : il faut que le
+/// fournisseur de l'assistant soit Anthropic ; sinon, repli local, comme sans
+/// clé. Le chemin historique ne reste que pour un binaire compilé sans le
+/// greffon.
+///
+/// Étape 3 (« extension de l'existant », Bertrand, 13/10/2026) : le dialogue
+/// part chez le fournisseur de l'assistant QUEL QU'IL SOIT (Anthropic,
+/// compatible OpenAI, Gemini, Ollama) — la passerelle traduit les outils et
+/// les tours. Toujours sur la bibliothèque locale seule (les outils de
+/// `tune_core::ai::tools`), et bornée : voir [`MAX_CARACTERES_PAR_RESULTAT`].
+enum Interlocuteur {
+    #[cfg(not(feature = "assistant-ia"))]
+    Historique(AnthropicClient),
+    #[cfg(feature = "assistant-ia")]
+    Assistant(tune_assistant_ia::Passerelle),
+}
+
+/// Pourquoi un tour n'a pas eu lieu.
+enum Refus {
+    /// Une erreur du client historique : 500, comme avant.
+    #[cfg(not(feature = "assistant-ia"))]
+    Erreur(String),
+    /// Un refus de l'assistant (plafond atteint, clé refusée…) : rendu en
+    /// réponse lisible, jamais en 401.
+    #[cfg(feature = "assistant-ia")]
+    Assistant { code: &'static str, message: String },
+}
+
+/// Jetons de sortie d'un tour par l'assistant (le défaut du client historique).
+#[cfg(feature = "assistant-ia")]
+const MAX_JETONS_PAR_TOUR: u32 = 1024;
+
+impl Interlocuteur {
+    /// Étape 3 : l'état du plafond de l'assistant (`plafond`, avec l'alerte à
+    /// 80 %) joint à la réponse, comme pour les autres usages, et le coût
+    /// EXACT de la question (`cout_eur`) : la somme de ce qui a été compté à
+    /// chacun de ses tours, au tarif daté de l'assistant. Le chemin
+    /// historique ne compte rien et ne porte aucun des deux.
+    fn avec_plafond(&self, mut v: Value, cout_micro_eur: u64) -> Value {
+        match self {
+            #[cfg(not(feature = "assistant-ia"))]
+            Self::Historique(_) => {
+                let _ = cout_micro_eur;
+            }
+            #[cfg(feature = "assistant-ia")]
+            Self::Assistant(p) => {
+                v["plafond"] = p.etat_plafond();
+                v["cout_eur"] = json!(tune_assistant_ia::couts::micro_en_euros(cout_micro_eur));
+            }
+        }
+        v
+    }
+
+    fn choisir(state: &AppState, settings: &SettingsRepo) -> Option<Self> {
+        #[cfg(feature = "assistant-ia")]
+        {
+            let _ = settings;
+            let p = crate::plugins::passerelle_assistant(&state.backend);
+            p.migrer();
+            p.dialogue_pret().then_some(Self::Assistant(p))
+        }
+        #[cfg(not(feature = "assistant-ia"))]
+        {
+            let _ = state;
+            let api_key = settings
+                .get("anthropic_api_key")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if api_key.is_empty() {
+                return None;
+            }
+            let model = settings
+                .get("anthropic_model")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            Some(Self::Historique(AnthropicClient::new(api_key, model)))
+        }
+    }
+
+    async fn chat(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        tools: &[tune_core::ai::client::Tool],
+        cout_micro_eur: &mut u64,
+    ) -> Result<tune_core::ai::client::ApiResponse, Refus> {
+        match self {
+            #[cfg(not(feature = "assistant-ia"))]
+            Self::Historique(client) => {
+                let _ = cout_micro_eur;
+                client
+                    .chat(system, messages, tools)
+                    .await
+                    .map_err(Refus::Erreur)
+            }
+            #[cfg(feature = "assistant-ia")]
+            Self::Assistant(p) => {
+                let illisible = || Refus::Assistant {
+                    code: "erreur_fournisseur",
+                    message: "Réponse illisible du fournisseur.".into(),
+                };
+                let messages = serde_json::to_value(&messages).map_err(|_| illisible())?;
+                let outils = serde_json::to_value(tools).map_err(|_| illisible())?;
+                let (v, cout) = p
+                    .discuter_compte(system, &messages, &outils, MAX_JETONS_PAR_TOUR)
+                    .await
+                    .map_err(|e| Refus::Assistant {
+                        code: e.code(),
+                        message: e.message(),
+                    })?;
+                // Compté AVANT la lecture : un tour payé dont la réponse est
+                // illisible reste dans le coût de la question.
+                *cout_micro_eur += cout;
+                serde_json::from_value(v).map_err(|_| illisible())
+            }
+        }
+    }
+}
+
+/// La réponse d'un refus, ou l'erreur HTTP du chemin historique.
+fn sortie_de_refus(
+    client: &Interlocuteur,
+    r: Refus,
+    actions: &[Value],
+    zone_id: i64,
+    cout_micro_eur: u64,
+) -> Result<Json<Value>, AppError> {
+    match r {
+        #[cfg(not(feature = "assistant-ia"))]
+        Refus::Erreur(e) => {
+            let _ = (client, actions, zone_id, cout_micro_eur);
+            Err(AppError::internal(format!("Claude API error: {e}")))
+        }
+        #[cfg(feature = "assistant-ia")]
+        Refus::Assistant { code, message } => {
+            info!(code, "ai_query_refusee_par_l_assistant");
+            // Les tours déjà payés de la question restent dans son coût.
+            Ok(Json(client.avec_plafond(
+                json!({
+                    "reply": message,
+                    "error": code,
+                    "actions": actions,
+                    "zone_id": zone_id,
+                }),
+                cout_micro_eur,
+            )))
+        }
+    }
+}
+
 async fn ai_query(
     headers: axum::http::HeaderMap,
     State(state): State<AppState>,
@@ -85,23 +281,10 @@ async fn ai_query(
 
     info!(zone_id, message = %body.message, "ai_query");
 
-    let api_key = settings
-        .get("anthropic_api_key")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-
-    if api_key.is_empty() {
+    let Some(client) = Interlocuteur::choisir(&state, &settings) else {
         return local_ai_query(state, &body.message, zone_id, &lang).await;
-    }
+    };
 
-    let model = settings
-        .get("anthropic_model")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-
-    let client = AnthropicClient::new(api_key, model);
     // Answer in the UI language, not always French (#1143).
     let system = format!("{SYSTEM_PROMPT} {}", language_directive(&lang));
     let tools = all_tools();
@@ -118,12 +301,19 @@ async fn ai_query(
     }];
 
     let mut actions: Vec<Value> = Vec::new();
+    let mut envoyes = 0usize;
+    let mut cout_micro_eur = 0u64;
 
     for round in 0..MAX_TOOL_ROUNDS {
-        let response = client
-            .chat(&system, messages.clone(), &tools)
+        let response = match client
+            .chat(&system, messages.clone(), &tools, &mut cout_micro_eur)
             .await
-            .map_err(|e| AppError::internal(format!("Claude API error: {e}")))?;
+        {
+            Ok(r) => r,
+            Err(r) => {
+                return sortie_de_refus(&client, r, &actions, executor.zone_id(), cout_micro_eur);
+            }
+        };
 
         let tool_uses: Vec<_> = response
             .content
@@ -139,11 +329,14 @@ async fn ai_query(
                 actions = actions.len(),
                 "ai_done"
             );
-            return Ok(Json(json!({
-                "reply": reply,
-                "actions": actions,
-                "zone_id": executor.zone_id(),
-            })));
+            return Ok(Json(client.avec_plafond(
+                json!({
+                    "reply": reply,
+                    "actions": actions,
+                    "zone_id": executor.zone_id(),
+                }),
+                cout_micro_eur,
+            )));
         }
 
         let assistant_blocks: Vec<ContentBlock> = response.content.clone();
@@ -159,7 +352,7 @@ async fn ai_query(
                 actions.push(json!({ "tool": name, "input": input, "result": result }));
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
-                    content: result.to_string(),
+                    content: resultat_borne(&result.to_string(), &mut envoyes),
                 });
             }
         }
@@ -174,17 +367,23 @@ async fn ai_query(
         }
     }
 
-    let final_response = client
-        .chat(&system, messages, &[])
+    let final_response = match client
+        .chat(&system, messages, &[], &mut cout_micro_eur)
         .await
-        .map_err(|e| AppError::internal(format!("Claude API error: {e}")))?;
+    {
+        Ok(r) => r,
+        Err(r) => return sortie_de_refus(&client, r, &actions, executor.zone_id(), cout_micro_eur),
+    };
 
     let reply = extract_text(&final_response.content);
-    Ok(Json(json!({
-        "reply": reply,
-        "actions": actions,
-        "zone_id": executor.zone_id(),
-    })))
+    Ok(Json(client.avec_plafond(
+        json!({
+            "reply": reply,
+            "actions": actions,
+            "zone_id": executor.zone_id(),
+        }),
+        cout_micro_eur,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -862,4 +1061,79 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests_bornes {
+    use super::*;
+
+    #[test]
+    fn un_resultat_court_part_tel_quel_et_compte() {
+        let mut envoyes = 0;
+        assert_eq!(
+            resultat_borne("{\"ok\":true}", &mut envoyes),
+            "{\"ok\":true}"
+        );
+        assert_eq!(envoyes, 11);
+    }
+
+    #[test]
+    fn un_resultat_long_est_tronque_a_la_limite_par_resultat() {
+        let mut envoyes = 0;
+        // Un caractère de deux octets, absent de l'avis de troncature.
+        let long = "ä".repeat(MAX_CARACTERES_PAR_RESULTAT + 500);
+        let r = resultat_borne(&long, &mut envoyes);
+        assert!(r.ends_with("[résultat tronqué]"));
+        assert_eq!(
+            r.chars().filter(|c| *c == 'ä').count(),
+            MAX_CARACTERES_PAR_RESULTAT,
+            "tronqué sur un caractère entier, pas un octet"
+        );
+        assert_eq!(envoyes, MAX_CARACTERES_PAR_RESULTAT);
+    }
+
+    #[test]
+    fn une_question_n_envoie_pas_plus_que_sa_limite() {
+        let mut envoyes = 0;
+        let bloc = "x".repeat(MAX_CARACTERES_PAR_RESULTAT);
+        let mut total = 0;
+        for _ in 0..10 {
+            let r = resultat_borne(&bloc, &mut envoyes);
+            if !r.contains("limite_de_bibliotheque") {
+                total += r.chars().count();
+            }
+        }
+        assert_eq!(total, MAX_CARACTERES_PAR_QUESTION);
+        assert_eq!(envoyes, MAX_CARACTERES_PAR_QUESTION);
+        let r = resultat_borne("{}", &mut envoyes);
+        let v: Value = serde_json::from_str(&r).expect("l'avis est du JSON");
+        assert_eq!(v["error"], "limite_de_bibliotheque");
+    }
+}
+
+#[cfg(test)]
+mod language_directive_tests {
+    use super::language_directive;
+
+    /// Chaque langue de l'interface nomme SA langue à l'assistant. Le suédois,
+    /// puis le hongrois et le vietnamien, tombaient dans le `_` : l'assistant
+    /// répondait en français à un utilisateur réglé en suédois.
+    ///
+    /// Contre-épreuve : retirer le bras `"vi"` fait rougir ce test sur «vi».
+    #[test]
+    fn chaque_langue_de_l_interface_a_sa_consigne() {
+        let francais = language_directive("fr");
+        for lang in crate::i18n::SUPPORTED {
+            if *lang == "fr" {
+                continue;
+            }
+            assert_ne!(
+                language_directive(lang),
+                francais,
+                "«{lang}» reçoit la consigne française"
+            );
+        }
+        assert!(language_directive("hu").contains("Hungarian"));
+        assert!(language_directive("vi").contains("Vietnamese"));
+    }
 }

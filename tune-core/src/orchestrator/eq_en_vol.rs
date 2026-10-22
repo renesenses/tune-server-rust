@@ -43,6 +43,11 @@ pub(crate) struct EqEnVol {
     /// Le porteur cuit une compensation de niveau (#5071) calculée depuis
     /// l'égaliseur de départ : la relève ne la recalcule pas.
     pub(crate) compensation_cuite: bool,
+    /// #6211 — le porteur sert un flux SANS FIN (radio) : aucune piste
+    /// suivante ne relaiera le préampli gardé d'un égaliseur coupé : sa part
+    /// supérieure à 1 s'éteint dès la coupure, jamais de hausse (décision du
+    /// 21/10, `EqProcessor::eteindre_le_preampli_garde`).
+    pub(crate) flux_sans_fin: bool,
 }
 
 impl EqEnVol {
@@ -50,6 +55,7 @@ impl EqEnVol {
     pub(crate) fn pour_la_radio() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             cuit_seulement_l_egaliseur: true,
+            flux_sans_fin: true,
             ..Default::default()
         })
     }
@@ -99,6 +105,11 @@ impl EqEnVol {
             .filter(EqProcessor::is_enabled);
         let actif = neuf.is_some();
         *courant = EqProcessor::prendre_la_releve(neuf, courant.take());
+        if self.flux_sans_fin
+            && let Some(eq) = courant.as_mut()
+        {
+            eq.eteindre_le_preampli_garde();
+        }
         self.releves.fetch_add(1, Ordering::Relaxed);
         tracing::info!(sample_rate, channels, actif, "eq_en_vol_releve");
     }
@@ -254,6 +265,89 @@ mod tests {
         assert!(
             f64::from(saut) < 1.5 * f64::from(saut_sinus) * 10f64.powf(9.0 / 20.0),
             "marche audible dans le flux : saut {saut} pour {saut_sinus} sur le sinus sec"
+        );
+    }
+
+    /// #6211, décision de Bertrand du 21/10 (« jamais de hausse » vaut
+    /// partout, radio comprise ; elle remplace celle du 19/10 sur ce point) —
+    /// sur une RADIO (flux sans fin), couper l'égaliseur en vol garde le
+    /// préampli négatif : le RMS reste celui du préampli, il ne remonte
+    /// jamais vers le niveau d'avant l'égaliseur, sans marche ni relance de
+    /// la station.
+    #[test]
+    fn sur_une_radio_couper_l_egaliseur_ne_fait_jamais_monter_le_niveau_6211() {
+        let poste = EqEnVol::pour_la_radio();
+        let mut eq = None;
+        let bloc = 1_024;
+        let mut position = 0usize;
+        let mut servi: Vec<f32> = Vec::new();
+        let mut passer = |eq: &mut Option<crate::audio::eq::EqProcessor>, n: usize| {
+            let mut rendu = Vec::new();
+            for _ in 0..n {
+                let mut b: Vec<f32> = (position..position + bloc)
+                    .flat_map(|i| {
+                        let v = (0.25
+                            * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / f64::from(SR))
+                                .sin()) as f32;
+                        [v, v]
+                    })
+                    .collect();
+                poste.relever(eq, SR, 2);
+                crate::orchestrator::radio::apply_radio_eq(eq, &mut b);
+                position += bloc;
+                rendu.extend(b.chunks(2).map(|t| t[0]));
+            }
+            servi.extend_from_slice(&rendu);
+            rendu
+        };
+        let rms = |v: &[f32]| {
+            (v.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+        };
+
+        let avant = rms(&passer(&mut eq, 8));
+        poste.poser(Some(profil()));
+        let egalise = passer(&mut eq, 20);
+        let preampli = eq
+            .as_ref()
+            .and_then(|e| e.preamp_db(0))
+            .expect("égaliseur monté");
+        assert!(preampli < -1.0, "prémisse : réserve de {preampli} dB");
+        assert!(
+            (20.0 * (rms(&egalise[egalise.len() / 2..]) / avant).log10()).abs() > 1.0,
+            "prémisse : l'égaliseur change le niveau du sinus"
+        );
+        poste.poser(None);
+        // 3 s de rampe à 44,1 kHz = ~130 blocs de 1 024 trames ; marge. Le
+        // fondu de la courbe fini (300 ms ≈ 13 blocs), aucun bloc ne dépasse
+        // le niveau du préampli.
+        let _ = passer(&mut eq, 16);
+        for n in 0..150 {
+            let bloc_db = 20.0 * (rms(&passer(&mut eq, 1)) / avant).log10();
+            assert!(
+                bloc_db < preampli + 0.1,
+                "radio, égaliseur coupé : le niveau monte à {bloc_db:+.2} dB au bloc {n} \
+                 (préampli {preampli:+.2} dB) — jamais de hausse (décision du 21/10)"
+            );
+        }
+        let apres = rms(&passer(&mut eq, 8));
+        let ecart_db = 20.0 * (apres / avant).log10();
+        assert!(
+            (ecart_db - preampli).abs() < 0.5,
+            "radio, égaliseur coupé : {ecart_db:+.2} dB, le préampli \
+             {preampli:+.2} dB doit rester gardé"
+        );
+        assert!(
+            eq.as_ref().is_some_and(|e| e.est_neutre()),
+            "le préampli gardé reste porté par un égaliseur neutre"
+        );
+        let saut = servi
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0_f32, f32::max);
+        let saut_sinus = 0.25 * 2.0 * std::f32::consts::PI * 1000.0 / SR as f32;
+        assert!(
+            saut < 1.5 * saut_sinus * 10f32.powf(9.0 / 20.0),
+            "marche audible : saut {saut} pour {saut_sinus} sur le sinus sec"
         );
     }
 

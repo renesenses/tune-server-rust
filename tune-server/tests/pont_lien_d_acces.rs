@@ -156,3 +156,81 @@ async fn le_statut_public_ne_publie_toujours_pas_le_jeton() {
         "le statut laisse sortir le jeton"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #6603 — écoute à distance par le compte mozaiklabs : l'ancien lien est
+// obsolète pendant la coexistence, puis n'existe plus quand le relais le dit.
+// ---------------------------------------------------------------------------
+
+const LIEN_HERITE_ACCEPTE: &str = tune_core::cloud::cle_serveur::LIEN_HERITE_ACCEPTE;
+const LAISSEZ_PASSER_ACTIF: &str = tune_core::cloud::cle_serveur::LAISSEZ_PASSER_ACTIF;
+
+#[tokio::test]
+async fn tant_que_le_relais_n_ouvre_pas_de_sessions_par_laissez_passer_rien_ne_change() {
+    let state = new_state();
+    enable_auth(&state);
+    pont_actif_avec_jeton(&state);
+
+    let (status, corps, _) = get(&state, ROUTE, Some(&tok("admin", 1))).await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+    let v: Value = serde_json::from_str(&corps).unwrap();
+    assert_eq!(v["obsolete"], false);
+    assert!(v["message"].is_null());
+
+    let (_, corps, _) = get(
+        &state,
+        "/api/v1/cloud/bridge/status",
+        Some(&tok("admin", 1)),
+    )
+    .await;
+    let v: Value = serde_json::from_str(&corps).unwrap();
+    assert_eq!(v["lien_obsolete"], false);
+    assert!(v["acces_par_compte"].is_null());
+}
+
+#[tokio::test]
+async fn pendant_la_coexistence_le_lien_est_servi_et_marque_obsolete() {
+    let state = new_state();
+    enable_auth(&state);
+    pont_actif_avec_jeton(&state);
+    reglages(&state).set(LIEN_HERITE_ACCEPTE, "true").unwrap();
+    reglages(&state).set(LAISSEZ_PASSER_ACTIF, "true").unwrap();
+
+    let (status, corps, _) = get(&state, ROUTE, Some(&tok("admin", 1))).await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+    let v: Value = serde_json::from_str(&corps).unwrap();
+    assert!(v["link"].as_str().is_some_and(|l| l.contains(FAUX_JETON)));
+    assert_eq!(v["obsolete"], true);
+    assert_eq!(
+        v["message"].as_str(),
+        Some("Ouvrez Tune Remote et connectez-vous à votre compte mozaiklabs")
+    );
+}
+
+#[tokio::test]
+async fn apres_la_coupure_par_le_relais_le_lien_repond_410_sans_jeton() {
+    let state = new_state();
+    enable_auth(&state);
+    pont_actif_avec_jeton(&state);
+    reglages(&state).set(LIEN_HERITE_ACCEPTE, "false").unwrap();
+    reglages(&state).set(LAISSEZ_PASSER_ACTIF, "true").unwrap();
+
+    let (status, corps, _) = get(&state, ROUTE, Some(&tok("admin", 1))).await;
+    assert_eq!(status, StatusCode::GONE, "{corps}");
+    assert!(
+        !corps.contains(FAUX_JETON),
+        "le jeton sort encore : {corps}"
+    );
+    let v: Value = serde_json::from_str(&corps).unwrap();
+    assert_eq!(v["error"], "lien_obsolete");
+
+    let (_, corps, _) = get(
+        &state,
+        "/api/v1/cloud/bridge/status",
+        Some(&tok("admin", 1)),
+    )
+    .await;
+    let v: Value = serde_json::from_str(&corps).unwrap();
+    assert_eq!(v["lien_herite_coupe"], true);
+    assert_eq!(v["lien_obsolete"], true);
+}

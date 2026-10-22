@@ -165,6 +165,14 @@ fn condition(rule: &Value, objet: Objet) -> String {
     let colonne = match (champ, objet) {
         ("source", _) => Some("sf.service"),
         ("artist" | "artist_name", _) => Some("sf.artist"),
+        // #6121 — l'artiste d'un favori ALBUM est l'artiste de l'album ; un
+        // favori PISTE ne connaît que son interprète, la règle y est fausse.
+        ("album_artist", Objet::Album) => Some("sf.artist"),
+        // #6232 — « Interprète » : un favori ne connaît qu'un artiste, celui
+        // que le service annonce. C'est l'interprète d'une piste, et, pour un
+        // album, celui de ses pistes — le même repli que la bibliothèque, où
+        // une piste sans balise ARTIST prend l'artiste de son album.
+        ("track_artist", _) => Some("sf.artist"),
         // Dans une PLAYLIST, `title` est le titre de la piste et `album` celui
         // de son album ; dans une COLLECTION, `title` est le titre de l'album.
         ("title", Objet::Piste) => Some("sf.title"),
@@ -426,6 +434,22 @@ mod tests {
             sql.ends_with("ORDER BY LOWER(sf.artist) DESC LIMIT 50"),
             "{sql}"
         );
+    }
+
+    /// #6121 — « Artiste de l'album » sur un favori ALBUM de service : son
+    /// artiste est celui de l'album. Sur une piste, le favori ne connaît que
+    /// l'interprète : la règle est FAUSSE, comme toute donnée absente.
+    #[test]
+    fn l_artiste_de_l_album_filtre_les_albums_favoris() {
+        let r = r#"[{"field":"source","op":"eq","value":"qobuz"},
+                    {"field":"album_artist","op":"=","value":"Miles Davis"}]"#;
+        let sql = requete(r, "all", Objet::Album, 1, "title", "asc", None).unwrap();
+        assert!(
+            sql.contains("LOWER(sf.artist) = LOWER('Miles Davis')"),
+            "{sql}"
+        );
+        let sql = requete(r, "all", Objet::Piste, 1, "title", "asc", None).unwrap();
+        assert!(sql.contains("AND 1=0"), "{sql}");
     }
 
     /// #5530 — de bout en bout sur une base MIGRÉE : la fiche d'un album

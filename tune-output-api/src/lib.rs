@@ -2003,6 +2003,9 @@ pub struct TransformationsReelles {
     /// #2211 — un fondu enchaîné superpose deux pistes en ce moment même.
     /// Faux hors du recouvrement : le fondu ne touche le signal que là.
     fondu_enchaine: bool,
+    /// #6057 — la sortie a réordonné des voies à nombre de canaux égal,
+    /// selon la disposition que le fichier déclare.
+    reorganisation_canaux: bool,
 }
 
 impl TransformationsReelles {
@@ -2016,7 +2019,27 @@ impl TransformationsReelles {
             ouvert,
             dsp_actif,
             fondu_enchaine: false,
+            reorganisation_canaux: false,
         }
+    }
+
+    /// #6057 — la même déclaration, en disant si la sortie RÉORDONNE des
+    /// voies sans en changer le nombre : un DFF dont la liste `CHNL` n'est
+    /// pas dans l'ordre de la sortie, un WAV dont le masque place les
+    /// latéraux là où la sortie attend les arrière. Additif : `nouvelles` le
+    /// pose à faux, et une sortie qui ne réordonne rien n'a rien à changer.
+    #[must_use]
+    pub const fn avec_reorganisation_canaux(mut self, actif: bool) -> Self {
+        self.reorganisation_canaux = actif;
+        self
+    }
+
+    /// #6057 — des voies ont-elles changé de place, à nombre de canaux égal ?
+    /// Chaque échantillon garde sa valeur mais quitte sa voie : le flux livré
+    /// n'est plus celui de la source, le verdict bit-perfect tombe.
+    #[must_use]
+    pub const fn reorganisation_canaux(&self) -> bool {
+        self.reorganisation_canaux
     }
 
     /// #2211 — la même déclaration, en disant si un fondu enchaîné mélange

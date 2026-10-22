@@ -83,6 +83,10 @@ pub(super) async fn lancer_radio_artiste(
         .playback
         .set_session_profile(zone_id, Some(profile.id()))
         .await;
+    // #6465 — la radio n'est pas l'album ou la playlist joué avant : sans
+    // cela, ses titres s'écrivaient sous lui dans l'Historique et la vignette
+    // en cours y renvoyait. Après le refus « radio vide », qui ne touche rien.
+    state.playback.effacer_contexte_de_session(zone_id).await;
     let items: Vec<QueueInput> = lot
         .candidats
         .iter()

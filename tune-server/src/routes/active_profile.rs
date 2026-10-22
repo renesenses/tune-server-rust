@@ -61,7 +61,11 @@ pub use tune_http_types::ActiveProfile;
 /// - unauthenticated → refused. The middleware normally rejects these before we
 ///   get here; if the extractor runs outside that layer we must not let an
 ///   anonymous caller pick an identity.
-fn header_allowed(auth_enabled: bool, caller: Option<&AuthUser>, requested: i64) -> bool {
+pub(crate) fn header_allowed(
+    auth_enabled: bool,
+    caller: Option<&AuthUser>,
+    requested: i64,
+) -> bool {
     if !auth_enabled {
         return true;
     }

@@ -119,6 +119,11 @@ pub(super) struct ZonePollState {
     /// Consecutive `Playing` polls with neither renderer position nor served
     /// bytes progressing. See `decisions::dlna_playing_stall_eligible`.
     pub(super) playing_stall_ticks: u8,
+    /// Instant du PREMIER tour de la série `playing_stall_ticks` en cours
+    /// (#6702). Trente tours ne font pas trente secondes : après un tour
+    /// bloqué, `tokio::time::interval` rattrape les tours manqués en rafale.
+    /// Voir [`super::decisions::lecture_sans_progres_etablie`].
+    pub(super) playing_stall_depuis: Option<Instant>,
     /// Ticks CONSECUTIFS ou la position rapportee est a la fin de la piste — ou
     /// au-dela — alors que l'appareil annonce toujours jouer. Voir
     /// [`decisions::position_au_dela_de_la_duree`] et [`DEPASSEMENT_DUREE_TICKS`].
@@ -299,6 +304,7 @@ impl ZonePollState {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            playing_stall_depuis: None,
             depassement_duree_ticks: 0,
             depassement_duree_signale: false,
             stall_declines: 0,

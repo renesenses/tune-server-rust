@@ -157,6 +157,12 @@ impl PositionPoller {
             {
                 self.volume_100_ignore_constate(zone_id, zone.volume / 100.0, status.volume);
             }
+            // #6541 — au-dessus de la limite de sécurité de la zone, le volume
+            // de l'appareil est ramené, jamais adopté (`volume_plafond_6541`).
+            let plafond_tenu = !zone.fixed_volume
+                && !in_startup_grace
+                && !in_volume_grace
+                && self.volume_plafond_reimpose(zone_id, status.volume).await;
             if !zone.fixed_volume
                 && !in_startup_grace
                 && !in_volume_grace
@@ -170,7 +176,8 @@ impl PositionPoller {
                 // actually moved since the last poll (see decisions::
                 // should_adopt_device_volume), so a stale default (Fabien's
                 // Devialet stuck at 50%) can't overwrite the saved volume.
-                if decisions::should_adopt_device_volume(prev_device_vol, status.volume, db_vol)
+                if !plafond_tenu
+                    && decisions::should_adopt_device_volume(prev_device_vol, status.volume, db_vol)
                     && !self.volume_pure_reimpose(zone_id, status.volume).await
                 {
                     self.playback.set_volume(zone_id, status.volume).await;
@@ -444,6 +451,17 @@ impl PositionPoller {
                     ) {
                         ps.last_radio_poll = Instant::now();
                         self.refresh_radio_metadata(zone_id, zone_state).await;
+                    } else if decisions::relais_radio_du(
+                        zone_state.state == PlayState::Playing,
+                        zone_state.now_playing.as_ref().map(|np| np.source.as_str()),
+                        crate::radio_metadata_relais::zone_a_relire(
+                            zone_id,
+                            crate::radio_metadata_relais::periode_client(),
+                        ),
+                    ) {
+                        // #6516 — station suivie par radio-metadata.fr : le
+                        // relais se relit à sa propre cadence (5 s par défaut).
+                        self.refresh_radio_metadata(zone_id, zone_state).await;
                     }
 
                     // Zone navigateur : l'annonce « en écoute » que le
@@ -662,6 +680,27 @@ impl PositionPoller {
                     RADIO_POLL_INTERVAL_SECS,
                 )
             {
+                // #6233 — une sortie locale n'a pas de SOAP à ménager : son
+                // contrat de signal (PURE, bit-perfect) est relu à chaque
+                // tour, le reste du sondage radio garde son rythme.
+                if contrat_radio_locale_6233::contrat_relu_entre_deux_sondages_radio(&device_id) {
+                    self.relire_le_contrat_local_entre_deux_sondages_radio(zone_id, &device_id, ps)
+                        .await;
+                }
+                // #6516 — entre deux sondages du renderer, une station suivie
+                // par radio-metadata.fr relit son titre sur le relais, à la
+                // cadence du relais. Aucun appel SOAP : le renderer garde le
+                // rythme de 15 s qui le ménage.
+                if decisions::relais_radio_du(
+                    zone_state.state == PlayState::Playing,
+                    zone_state.now_playing.as_ref().map(|np| np.source.as_str()),
+                    crate::radio_metadata_relais::zone_a_relire(
+                        zone_id,
+                        crate::radio_metadata_relais::periode_client(),
+                    ),
+                ) {
+                    self.refresh_radio_metadata(zone_id, zone_state).await;
+                }
                 continue;
             }
 
@@ -946,6 +985,50 @@ impl PositionPoller {
                 }
             };
 
+            // ── #6612 — plage hors fichier après une reprise : nouveau flux ──
+            //
+            // Le Yamaha R-N2000A rouvre le flux, au `Play` qui suit une pause,
+            // par une plage au-delà de la fin ; il reçoit un 416 et s'arrête.
+            // La session l'a noté : un renderer qui ne joue pas repart par un
+            // NOUVEAU flux, à la position de la reprise.
+            if let Some(sid) = zone_state
+                .now_playing
+                .as_ref()
+                .and_then(|np| np.stream_id.clone())
+            {
+                use crate::orchestrator::plage_hors_fichier_6612::{
+                    SuiteDePlageHorsFichier, suite_de_plage_hors_fichier,
+                };
+                let age = self
+                    .orchestrator
+                    .streamer
+                    .age_plage_hors_fichier(&sid)
+                    .await;
+                match suite_de_plage_hors_fichier(age, status.state) {
+                    SuiteDePlageHorsFichier::Rien | SuiteDePlageHorsFichier::Attendre => {}
+                    SuiteDePlageHorsFichier::Oublier => {
+                        self.orchestrator
+                            .streamer
+                            .oublier_plage_hors_fichier(&sid)
+                            .await;
+                    }
+                    SuiteDePlageHorsFichier::Reprendre => {
+                        self.orchestrator
+                            .streamer
+                            .oublier_plage_hors_fichier(&sid)
+                            .await;
+                        if self
+                            .orchestrator
+                            .reprendre_apres_plage_hors_fichier(zone_id, &device_id)
+                            .await
+                        {
+                            poll_states.remove(&zone_id);
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // ── Fil 2125 (#5711) — le saut de la reprise a-t-il pris ? ──
             //
             // Jugé sur la position MESURÉE par la sortie, avant toute garde
@@ -1151,8 +1234,13 @@ impl PositionPoller {
                     // Edge-triggered like the main volume-sync path, so a radio
                     // renderer reporting a stale default can't keep resetting the
                     // saved volume (Fabien's Devialet Salon reverting to 50).
+                    // #6541 — la limite de sécurité, comme au site principal.
+                    let plafond_tenu = !zone_fixed_volume
+                        && !in_vol_grace
+                        && self.volume_plafond_reimpose(zone_id, status.volume).await;
                     if !zone_fixed_volume
                         && !in_vol_grace
+                        && !plafond_tenu
                         && status.volume < 0.999
                         && decisions::should_adopt_device_volume(
                             ps.last_device_volume,
@@ -1346,6 +1434,22 @@ impl PositionPoller {
                 continue;
             }
 
+            // #6059 — un `Seek` acquitté mais IGNORÉ (Yamaha R-N2000A, fichier
+            // natif) : l'appareil est profilé, et le flux natif est relancé à
+            // la position que l'utilisateur voulait.
+            if let Some(position) =
+                crate::orchestrator::seek_natif_6059::constater(zone_id, &status)
+            {
+                if let Err(e) = self
+                    .orchestrator
+                    .replay_zone_at_position(zone_id, position, "seek_ignore_6059")
+                    .await
+                {
+                    warn!(zone_id, error = %e, "seek_natif_rattrapage_echoue");
+                }
+                continue;
+            }
+
             // Check whether we're in the seek grace period: after a seek the
             // in-memory position is authoritative and the output may still
             // report the old (pre-seek) position until the stream restarts.
@@ -1504,8 +1608,13 @@ impl PositionPoller {
             if !zone_fixed_volume && !in_vol_grace2 {
                 self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
             }
+            // #6541 — la limite de sécurité, comme au site principal.
+            let plafond_tenu = !zone_fixed_volume
+                && !in_vol_grace2
+                && self.volume_plafond_reimpose(zone_id, status.volume).await;
             if !zone_fixed_volume
                 && !in_vol_grace2
+                && !plafond_tenu
                 && status.volume > 0.001
                 && status.volume < 0.999
                 && decisions::should_adopt_device_volume(
@@ -1848,6 +1957,63 @@ impl PositionPoller {
             }
 
             if position_reset {
+                // #6477 — un renderer qui lâche la piste en cours dès le
+                // `SetNext` (FiiO K17) : la règle s'apprend pour l'appareil,
+                // et les pistes suivantes ne lui envoient plus de `SetNext`
+                // (voir `armer_le_flux_suivant`).
+                // Un déplacement ou une relance de Tune depuis l'armement
+                // explique la retombée : rien à apprendre.
+                let geste_de_tune_depuis_l_armement = ps.gapless_sent_at.is_some_and(|arme| {
+                    zone_state.last_seek_at.is_some_and(|t| t >= arme)
+                        || zone_state.last_restart_at.is_some_and(|t| t >= arme)
+                });
+                // Le flux de la piste qui vient de retomber : l'a-t-il tiré
+                // jusqu'au bout ?
+                let flux_fini = zone_state
+                    .now_playing
+                    .as_ref()
+                    .and_then(|np| np.stream_id.clone());
+                let (servis, total) = match flux_fini.as_deref() {
+                    Some(sid) if ps.gapless_sent_at.is_some() => (
+                        self.orchestrator.streamer_bytes_sent(sid).await,
+                        self.orchestrator.streamer_total_bytes(sid).await,
+                    ),
+                    _ => (None, None),
+                };
+                if !geste_de_tune_depuis_l_armement
+                    && decisions::set_next_a_coupe_la_piste(
+                        ps.gapless_sent_at.map(|t| t.elapsed().as_millis() as u64),
+                        prev_position_ms,
+                        track_duration_ms,
+                        servis,
+                        total,
+                    )
+                {
+                    let est_dlna = {
+                        let outputs = self.outputs.lock().await;
+                        match outputs.get(&device_id) {
+                            Some(arc) => arc.lock().await.output_type() == "dlna",
+                            None => false,
+                        }
+                    };
+                    if est_dlna {
+                        warn!(
+                            zone_id,
+                            device_id = %device_id,
+                            prev_pos = prev_position_ms,
+                            track_dur = track_duration_ms,
+                            arm_to_advance_ms = ps
+                                .gapless_sent_at
+                                .map(|t| t.elapsed().as_millis() as u64),
+                            octets_servis = ?servis,
+                            octets_total = ?total,
+                            "dlna_set_next_coupe_la_piste_detecte"
+                        );
+                        crate::outputs::dlna_repli_set_uri::memoriser_set_next_coupe_la_piste(
+                            &device_id,
+                        );
+                    }
+                }
                 if !played_enough {
                     warn!(
                         zone_id,
@@ -3633,13 +3799,24 @@ impl PositionPoller {
                                 current_bytes,
                             );
                             ps.last_bytes_sent = current_bytes;
-                            if ps.playing_stall_ticks >= PLAYING_STALL_THRESHOLD {
+                            // #6702 — trente tours ET trente secondes : une
+                            // rafale de tours rattrapés ne coupe plus une
+                            // lecture saine.
+                            if decisions::lecture_sans_progres_etablie(
+                                ps.playing_stall_ticks,
+                                &mut ps.playing_stall_depuis,
+                                Instant::now(),
+                            ) {
                                 warn!(
                                     zone_id,
                                     position_ms = status.position_ms,
                                     peak_position_ms = ps.peak_position_ms,
                                     bytes_sent = current_bytes,
                                     stall_ticks = ps.playing_stall_ticks,
+                                    stall_secs = ps
+                                        .playing_stall_depuis
+                                        .map(|t| t.elapsed().as_secs())
+                                        .unwrap_or(0),
                                     wall_secs = wall_elapsed,
                                     "dlna_playing_without_progress_stopping_zone"
                                 );

@@ -40,6 +40,12 @@ pub struct RecordingDetails {
     /// L'oeuvre interpretee, quand l'enregistrement en declare une. Le
     /// compositeur se lit sur elle, pas sur l'enregistrement.
     pub work_id: Option<String>,
+    /// Les artistes credites de l'enregistrement, avec leur MBID et leur nom
+    /// de tri MusicBrainz (`artist.sort-name`) : la passe d'enrichissement en
+    /// tire le nom de tri de l'artiste de la piste, sans requete de plus
+    /// (#6474, point 2). Hors du JSON rendu : c'est une matiere de travail.
+    #[serde(skip)]
+    pub artist_credits: Vec<crate::metadata::musicbrainz_release::CreditArtiste>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +339,7 @@ impl MetadataEnricher {
             release_group_id,
             musicbrainz_artist_id,
             work_id,
+            artist_credits: crate::metadata::musicbrainz_release::credits_d_artiste(&data),
         })
     }
 

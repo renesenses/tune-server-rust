@@ -23,10 +23,27 @@
 //! | `POST /location` | `{scope, city, country, radius_km, located, ambiguous?}` |
 //! | `GET /location` | la dernière localisation enregistrée, même forme |
 //!
+//! # Par profil (tune-web-client#1755)
+//!
+//! Les trois routes lisent `X-Profile-Id` (l'en-tête que le client pose sur
+//! chaque requête). Un profil qui EXISTE a sa propre localisation, rangée sous
+//! [`cle_localisation_du_profil`] ; sans profil, ou pour un profil qui n'a
+//! encore rien choisi, c'est la clé d'avant, [`CLE_LOCALISATION`] — la
+//! dernière localisation acceptée par le nuage, quel que soit le profil.
+//!
+//! Le nuage, lui, garde UNE localisation par instance. `GET /upcoming` d'un
+//! profil dont la localisation n'est pas celle que le nuage applique la lui
+//! renvoie donc d'abord (`POST /location`), sous un verrou qui sérialise les
+//! échanges avec le nuage : deux profils à l'écran en même temps ne se volent
+//! plus leur commune entre le renvoi et la lecture. La localisation du profil
+//! part aussi avec chaque lecture (`city`, `postal_code`, `country`, `scope`,
+//! `radius_km` en paramètres de `/upcoming`), pour un nuage qui saurait la lire
+//! sans rien garder ; celui d'aujourd'hui les ignore.
+//!
 //! Le périmètre de `/upcoming` est celui que le NUAGE a appliqué : il le garde
 //! par instance (`concert_locations`) et l'applique lui-même à la lecture. Le
-//! greffon n'envoie donc que l'identité de l'instance, et remonte à l'écran
-//! le périmètre rendu — sans lui, l'écran affiche « 3 concerts » sans pouvoir
+//! greffon envoie l'identité de l'instance et le lieu du profil, puis remonte
+//! à l'écran le périmètre rendu — sans lui, l'écran affiche « 3 concerts » sans pouvoir
 //! dire « à moins de 100 km de Dijon », ni proposer d'élargir.
 //!
 //! Trois crans, jamais un filtre binaire (arbitrage du 29/08) : rayon de 50,
@@ -87,7 +104,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::extract::{RawQuery, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -96,6 +113,7 @@ use tracing::{debug, info, warn};
 
 use tune_core::cloud::refusal::CloudError;
 use tune_core::db::backend::DbBackend;
+use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::event_bus::TuneEvent;
 use tune_core::license::{Feature, LicenseManager, ModuleRefusal};
@@ -109,6 +127,18 @@ const CONCERTS_API: &str = "https://mozaiklabs.fr/api/v1/premium/concerts";
 /// `GET /location` n'aurait rien à rendre. Elle n'est écrite qu'après un
 /// succès du nuage — elle dit ce que le nuage applique, pas ce qu'on a tenté.
 pub const CLE_LOCALISATION: &str = "plugin_concerts_localisation";
+
+/// Le réglage où la localisation d'UN profil est gardée
+/// (`plugin_concerts_localisation:{profile_id}`, tune-web-client#1755). Écrit,
+/// comme [`CLE_LOCALISATION`], après un succès du nuage seulement.
+pub fn cle_localisation_du_profil(profil: i64) -> String {
+    format!("{CLE_LOCALISATION}:{profil}")
+}
+
+/// Les champs d'une localisation qui partent au nuage, dans l'ordre où ils
+/// partent en paramètres de `/upcoming` ; deux localisations sont « la même »
+/// quand ces champs-là sont égaux.
+pub const CHAMPS_DU_LIEU: [&str; 5] = ["city", "postal_code", "country", "scope", "radius_km"];
 
 /// Les trois crans, dans les mots du nuage (`PerimetreConcerts::valeurs()`).
 pub const PERIMETRES: [&str; 3] = ["radius", "country", "world"];
@@ -418,6 +448,12 @@ struct EtatConcerts {
     /// La racine de l'API du nuage : [`CONCERTS_API`] en production, un banc
     /// local dans les essais ([`router_vers`]).
     racine: Arc<str>,
+    /// Sérialise les échanges qui touchent à la localisation du nuage — le
+    /// renvoi de celle d'un profil puis la lecture, ou un enregistrement
+    /// (tune-web-client#1755). Le nuage n'en garde qu'une par instance : sans
+    /// ce verrou, un profil B pourrait poser la sienne entre le renvoi de A et
+    /// la lecture de A.
+    verrou_du_nuage: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl EtatConcerts {
@@ -451,6 +487,89 @@ impl EtatConcerts {
             .flatten()
             .unwrap_or_default()
     }
+
+    /// Le profil que nomme `X-Profile-Id`, s'il EXISTE. Un en-tête illisible
+    /// ou un profil supprimé ailleurs valent « pas de profil » : on ne range
+    /// rien sous un profil fantôme (même lecture que `ActiveProfile`).
+    fn profil(&self, headers: &HeaderMap) -> Option<i64> {
+        let id = headers
+            .get("X-Profile-Id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|&id| id > 0)?;
+        ProfileRepo::with_backend(self.backend.clone())
+            .get(id)
+            .ok()
+            .flatten()
+            .map(|_| id)
+    }
+
+    fn lire_reglage(&self, cle: &str) -> Option<Value> {
+        self.settings()
+            .get(cle)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .filter(Value::is_object)
+    }
+
+    /// La localisation que le nuage applique : la dernière qu'il a acceptée.
+    fn localisation_du_nuage(&self) -> Option<Value> {
+        self.lire_reglage(CLE_LOCALISATION)
+    }
+
+    /// La localisation PROPRE à ce profil, sans repli.
+    fn localisation_propre(&self, profil: Option<i64>) -> Option<Value> {
+        profil.and_then(|p| self.lire_reglage(&cle_localisation_du_profil(p)))
+    }
+
+    /// La localisation à servir à ce profil : la sienne, sinon celle que le
+    /// nuage applique (la clé d'avant, partagée).
+    fn localisation(&self, profil: Option<i64>) -> Option<Value> {
+        self.localisation_propre(profil)
+            .or_else(|| self.localisation_du_nuage())
+    }
+
+    /// Garde une localisation acceptée par le nuage : c'est désormais celle
+    /// qu'il applique, et, si un profil l'a demandée, celle de ce profil.
+    fn garder_localisation(&self, profil: Option<i64>, gardee: &Value) {
+        let texte = gardee.to_string();
+        let settings = self.settings();
+        let mut cles = vec![CLE_LOCALISATION.to_string()];
+        cles.extend(profil.map(cle_localisation_du_profil));
+        for cle in cles {
+            if let Err(e) = settings.set(&cle, &texte) {
+                // Le nuage a accepté : c'est lui qui filtre. La copie locale ne
+                // sert qu'à `GET /location` et au renvoi par profil.
+                warn!(error = %e, cle = %cle, "concerts_localisation_non_gardee");
+            }
+        }
+    }
+}
+
+/// Deux localisations désignent-elles le même lieu pour le nuage ?
+/// Comparées sur [`CHAMPS_DU_LIEU`] seulement : `located` ou `ambiguous` sont
+/// des verdicts du nuage, pas des choix.
+pub fn meme_lieu(a: &Value, b: &Value) -> bool {
+    let champ = |v: &Value, c: &str| v.get(c).filter(|x| !x.is_null()).cloned();
+    CHAMPS_DU_LIEU.iter().all(|c| champ(a, c) == champ(b, c))
+}
+
+/// Les paramètres de `/upcoming` qui portent une localisation : ses
+/// [`CHAMPS_DU_LIEU`] non nuls, en texte.
+pub fn parametres_du_lieu(lieu: &Value) -> Vec<(&'static str, String)> {
+    CHAMPS_DU_LIEU
+        .iter()
+        .filter_map(|&c| {
+            let v = lieu.get(c)?;
+            let texte = match v {
+                Value::String(s) if !s.trim().is_empty() => s.clone(),
+                Value::Number(n) => n.to_string(),
+                _ => return None,
+            };
+            Some((c, texte))
+        })
+        .collect()
 }
 
 /// Le routeur de production, qui parle à `mozaiklabs.fr`.
@@ -473,6 +592,7 @@ pub fn router_vers(
             backend,
             license,
             racine: Arc::from(racine),
+            verrou_du_nuage: Arc::new(tokio::sync::Mutex::new(())),
         })
 }
 
@@ -491,6 +611,7 @@ fn client_du_nuage() -> Result<reqwest::Client, reqwest::Error> {
 /// **code stable**, traduisible côté client, et le détail part au journal.
 async fn concerts_a_venir(
     State(etat): State<EtatConcerts>,
+    headers: HeaderMap,
     RawQuery(requete): RawQuery,
 ) -> Response {
     if let Some(refus) = etat.refus().await {
@@ -511,7 +632,27 @@ async fn concerts_a_venir(
     };
 
     let page = Page::depuis_requete(requete.as_deref());
-    match recuperer_concerts_depuis(&etat.racine, &client, &instance_id, page).await {
+    let profil = etat.profil(&headers);
+
+    // tune-web-client#1755 — le renvoi de la localisation de ce profil et la
+    // lecture se font sous le même verrou : rien ne s'intercale entre eux.
+    let _verrou = etat.verrou_du_nuage.lock().await;
+    if let Some(propre) = etat.localisation_propre(profil) {
+        let applique = etat.localisation_du_nuage();
+        if !applique.as_ref().is_some_and(|a| meme_lieu(a, &propre)) {
+            if let Err(echec) =
+                renvoyer_localisation(&etat, &client, &instance_id, profil, &propre).await
+            {
+                return match echec {
+                    EchecLocalisation::Refusee => localisation_invalide(None),
+                    EchecLocalisation::Nuage(e) => refus_du_nuage(&e, false),
+                };
+            }
+        }
+    }
+    let lieu = etat.localisation(profil);
+    let lieu = lieu.as_ref().map(parametres_du_lieu).unwrap_or_default();
+    match recuperer_concerts_au_lieu(&etat.racine, &client, &instance_id, page, &lieu).await {
         Ok(corps) => Json(corps).into_response(),
         Err(e) => {
             warn!(error = %e, retry_after = ?e.retry_after(), "concerts_fetch_failed");
@@ -526,18 +667,14 @@ async fn concerts_a_venir(
 /// code. Les champs restent des chaînes (vides) et le rayon vaut celui du
 /// nuage par défaut (100 km) : l'écran pré-remplit son formulaire avec, et un
 /// `null` y casserait un `.trim()`.
-async fn lire_localisation(State(etat): State<EtatConcerts>) -> Response {
+///
+/// Par profil (tune-web-client#1755) : celle du profil de `X-Profile-Id`, sinon
+/// la dernière acceptée par le nuage (la clé d'avant).
+async fn lire_localisation(State(etat): State<EtatConcerts>, headers: HeaderMap) -> Response {
     if let Some(refus) = etat.refus().await {
         return refus;
     }
-    let gardee = etat
-        .settings()
-        .get(CLE_LOCALISATION)
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .filter(Value::is_object);
-    match gardee {
+    match etat.localisation(etat.profil(&headers)) {
         Some(localisation) => Json(localisation).into_response(),
         None => Json(json!({
             "scope": "world",
@@ -567,7 +704,14 @@ async fn lire_localisation(State(etat): State<EtatConcerts>) -> Response {
 /// 429 `concerts.rate_limited` (+ délai), 502 `concerts.unavailable`. Tout
 /// échec est un statut d'erreur : l'écran, qui ne regarde que les exceptions
 /// sur cette route, prendrait sinon un corps sans `scope` pour un succès.
-async fn poser_localisation(State(etat): State<EtatConcerts>, corps: Bytes) -> Response {
+///
+/// Par profil (tune-web-client#1755) : la localisation acceptée devient celle
+/// du profil de `X-Profile-Id`, en plus de celle que le nuage applique.
+async fn poser_localisation(
+    State(etat): State<EtatConcerts>,
+    headers: HeaderMap,
+    corps: Bytes,
+) -> Response {
     if let Some(refus) = etat.refus().await {
         return refus;
     }
@@ -595,24 +739,65 @@ async fn poser_localisation(State(etat): State<EtatConcerts>, corps: Bytes) -> R
         }
     };
 
+    let profil = etat.profil(&headers);
+    let _verrou = etat.verrou_du_nuage.lock().await;
     match enregistrer_localisation_vers(&etat.racine, &client, &instance_id, &demande).await {
         Ok(rendu) => {
-            let mut gardee = rendu.clone();
-            if let (Some(objet), Some(cp)) = (gardee.as_object_mut(), demande.get("postal_code")) {
-                objet.insert("postal_code".into(), cp.clone());
-            }
-            if let Err(e) = etat.settings().set(CLE_LOCALISATION, &gardee.to_string()) {
-                // Le nuage a accepté : c'est lui qui filtre. La copie locale ne
-                // sert qu'à `GET /location` — la perdre ne défait rien.
-                warn!(error = %e, "concerts_localisation_non_gardee");
-            }
-            info!(scope = ?rendu.get("scope"), located = ?rendu.get("located"), "concerts_localisation_enregistree");
+            etat.garder_localisation(profil, &a_garder(&rendu, &demande));
+            info!(
+                profil = ?profil,scope = ?rendu.get("scope"), located = ?rendu.get("located"), "concerts_localisation_enregistree");
             Json(rendu).into_response()
         }
         Err(EchecLocalisation::Refusee) => localisation_invalide(None),
         Err(EchecLocalisation::Nuage(e)) => {
             warn!(error = %e, retry_after = ?e.retry_after(), "concerts_location_failed");
             refus_du_nuage(&e, false)
+        }
+    }
+}
+
+/// Ce qu'on garde d'une localisation acceptée : ce que le nuage a retenu, et
+/// le code postal demandé (le nuage ne le rend pas).
+fn a_garder(rendu: &Value, demande: &Value) -> Value {
+    let mut gardee = rendu.clone();
+    if let (Some(objet), Some(cp)) = (gardee.as_object_mut(), demande.get("postal_code")) {
+        objet.insert("postal_code".into(), cp.clone());
+    }
+    gardee
+}
+
+/// Renvoie au nuage la localisation PROPRE d'un profil, qui n'est pas celle
+/// qu'il applique (tune-web-client#1755). Appelée sous le verrou du nuage.
+///
+/// Un échec arrête la lecture : le nuage pourrait sinon servir les concerts
+/// du profil précédent. Le refus et son éventuel délai sont rendus au client.
+async fn renvoyer_localisation(
+    etat: &EtatConcerts,
+    client: &reqwest::Client,
+    instance_id: &str,
+    profil: Option<i64>,
+    propre: &Value,
+) -> Result<(), EchecLocalisation> {
+    let demande = match valider_localisation(propre) {
+        Ok(d) => d,
+        Err(champ) => {
+            warn!(profil = ?profil, champ, "concerts_localisation_du_profil_illisible");
+            return Err(EchecLocalisation::Refusee);
+        }
+    };
+    match enregistrer_localisation_vers(&etat.racine, client, instance_id, &demande).await {
+        Ok(rendu) => {
+            etat.garder_localisation(profil, &a_garder(&rendu, &demande));
+            info!(profil = ?profil, "concerts_localisation_du_profil_renvoyee");
+            Ok(())
+        }
+        Err(EchecLocalisation::Refusee) => {
+            warn!(profil = ?profil, "concerts_localisation_du_profil_refusee");
+            Err(EchecLocalisation::Refusee)
+        }
+        Err(EchecLocalisation::Nuage(e)) => {
+            warn!(profil = ?profil, error = %e, "concerts_localisation_du_profil_non_renvoyee");
+            Err(EchecLocalisation::Nuage(e))
         }
     }
 }
@@ -1088,7 +1273,22 @@ pub async fn recuperer_concerts_depuis(
     instance_id: &str,
     page: Page,
 ) -> Result<Value, CloudError> {
+    recuperer_concerts_au_lieu(racine, http_client, instance_id, page, &[]).await
+}
+
+/// [`recuperer_concerts_depuis`], avec la localisation du profil en paramètres
+/// ([`parametres_du_lieu`], tune-web-client#1755). Le nuage d'aujourd'hui les
+/// ignore et applique celle qu'il garde ; ils ne remplacent donc PAS le renvoi
+/// de [`concerts_a_venir`].
+pub async fn recuperer_concerts_au_lieu(
+    racine: &str,
+    http_client: &reqwest::Client,
+    instance_id: &str,
+    page: Page,
+    lieu: &[(&'static str, String)],
+) -> Result<Value, CloudError> {
     let mut requete = vec![("instance_id", instance_id.to_string())];
+    requete.extend(lieu.iter().cloned());
     if let Some(limit) = page.limit {
         requete.push(("limit", limit.to_string()));
     }
@@ -1101,14 +1301,19 @@ pub async fn recuperer_concerts_depuis(
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .map_err(|e| format!("concerts: {e}"))?;
+        // L'URL porte la localisation du profil (`city`, `postal_code`,
+        // `country`) : elle ne doit pas finir au journal (`concerts_fetch_failed`).
+        .map_err(|e| format!("concerts: {}", e.without_url()))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         return Err(CloudError::from_response(format!("concerts: HTTP {status}"), resp).await);
     }
 
-    let data: Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse: {}", e.without_url()))?;
     let corps = corps_a_venir(&data);
     info!(
         count = corps["concerts"].as_array().map_or(0, Vec::len),
@@ -1531,6 +1736,36 @@ mod essais {
     /// SANS LE DIRE : sur les 1 747 artistes du serveur de référence, 1 547
     /// n'étaient jamais abonnés et personne ne pouvait le savoir. Ce témoin
     /// compte les appels **reçus par le nuage**, pas les tranches d'un vecteur.
+    /// Une erreur réseau sur `/upcoming` ne recopie pas l'URL, qui porte la
+    /// localisation du profil : sinon `concerts_fetch_failed` la journalise.
+    #[tokio::test]
+    async fn i1755_l_erreur_reseau_ne_recopie_pas_la_localisation() {
+        // Port 1 sur la boucle locale : connexion refusée, sans sortir du poste.
+        let err = recuperer_concerts_au_lieu(
+            "http://127.0.0.1:1",
+            tune_core::http::client::shared(),
+            "inst-1",
+            Page::default(),
+            &[
+                ("city", "Villeneuve-Témoin".to_string()),
+                ("postal_code", "99999".to_string()),
+            ],
+        )
+        .await
+        .expect_err("le port 1 refuse la connexion");
+        let texte = err.to_string();
+        assert!(
+            texte.starts_with("concerts: "),
+            "erreur inattendue : {texte}"
+        );
+        for fuite in ["Villeneuve", "99999", "postal_code", "/upcoming"] {
+            assert!(
+                !texte.contains(fuite),
+                "l'erreur journalisée recopie l'URL ({fuite}) : {texte}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn quatre_cent_cinquante_artistes_partent_en_trois_appels_et_aucun_ne_se_perd() {
         let banc = banc(vec![
@@ -2189,6 +2424,35 @@ mod essais {
         assert!(
             !cible.contains("limit=") && !cible.contains("offset="),
             "{cible}"
+        );
+    }
+
+    /// tune-web-client#1755 — deux localisations sont « la même » sur les
+    /// champs qui partent au nuage, pas sur ses verdicts (`located`).
+    #[test]
+    fn i1755_le_meme_lieu_se_juge_sur_les_champs_qui_partent() {
+        let dijon = json!({"city":"Dijon","postal_code":"21000","country":"FR",
+                           "scope":"radius","radius_km":50,"located":true});
+        let verdict_autre = json!({"city":"Dijon","postal_code":"21000","country":"FR",
+                                   "scope":"radius","radius_km":50,"located":false});
+        assert!(meme_lieu(&dijon, &verdict_autre));
+        let rayon_autre = json!({"city":"Dijon","postal_code":"21000","country":"FR",
+                                 "scope":"radius","radius_km":100});
+        assert!(!meme_lieu(&dijon, &rayon_autre));
+        // Un champ nul vaut un champ absent.
+        assert!(meme_lieu(
+            &json!({"city":"Lyon","country":"FR","scope":"country","radius_km":null}),
+            &json!({"city":"Lyon","country":"FR","scope":"country","postal_code":null}),
+        ));
+        assert_eq!(
+            parametres_du_lieu(&dijon),
+            vec![
+                ("city", "Dijon".to_string()),
+                ("postal_code", "21000".to_string()),
+                ("country", "FR".to_string()),
+                ("scope", "radius".to_string()),
+                ("radius_km", "50".to_string()),
+            ]
         );
     }
 

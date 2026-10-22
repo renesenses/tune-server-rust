@@ -17,18 +17,14 @@ fn base() -> (Arc<SqliteDb>, tempfile::TempDir) {
     (Arc::new(db), dir)
 }
 
-/// Le gel du .18, en petit : un fil tient la connexion d'écriture quatre
-/// secondes ; pendant ce temps, quatre tâches veulent écrire sur un exécuteur
-/// de DEUX fils. Une requête HTTP doit quand même être servie en moins d'une
-/// seconde.
-///
-/// Avant le correctif, les deux fils de l'exécuteur dorment dans le `futex`
-/// du `std::sync::Mutex` : plus personne n'accepte la connexion, la requête
-/// attend la libération (4 s) et le témoin rougit sur son délai.
+/// Le gel du .18, en petit : un fil tient la connexion jusqu'à la réponse
+/// HTTP. Quatre écrivains se présentent sur un exécuteur de DEUX fils.
+/// La requête doit être servie alors que le détenteur n'a pas encore rendu.
+/// Sans block_in_place, les deux fils dorment dans le futex et la garde
+/// de 15 secondes échoue ; cette garde n'est pas une mesure de performance.
 #[test]
 fn un_detenteur_long_du_verrou_n_affame_plus_l_executeur() {
-    const TENUE: Duration = Duration::from_secs(4);
-    const DELAI_HTTP: Duration = Duration::from_secs(1);
+    const DELAI_HTTP: Duration = Duration::from_secs(15);
 
     let (db, _dir) = base();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -60,11 +56,12 @@ fn un_detenteur_long_du_verrou_n_affame_plus_l_executeur() {
 
     // Le détenteur : un fil ordinaire, comme une passe de fond.
     let (pris_tx, pris_rx) = mpsc::channel();
+    let (rendre_tx, rendre_rx) = mpsc::channel();
     let db_detenteur = db.clone();
     let detenteur = std::thread::spawn(move || {
         let _garde = db_detenteur.connection().lock().unwrap();
         pris_tx.send(()).unwrap();
-        std::thread::sleep(TENUE);
+        rendre_rx.recv().unwrap();
     });
     pris_rx.recv().unwrap();
 
@@ -77,8 +74,12 @@ fn un_detenteur_long_du_verrou_n_affame_plus_l_executeur() {
             let _ = DbBackend::execute(&*db, "INSERT INTO t (x) VALUES (1)", &[]);
         });
     }
-    std::thread::sleep(Duration::from_millis(200));
+    let limite = Instant::now() + Duration::from_secs(15);
+    while db.connection().releve().attentes.len() < 2 && Instant::now() < limite {
+        std::thread::yield_now();
+    }
 
+    let attentes_observees = db.connection().releve().attentes.len();
     let debut = Instant::now();
     let mut client = std::net::TcpStream::connect(adresse).unwrap();
     client.set_read_timeout(Some(DELAI_HTTP)).unwrap();
@@ -89,17 +90,21 @@ fn un_detenteur_long_du_verrou_n_affame_plus_l_executeur() {
     let lu = client.read_to_string(&mut reponse);
     let duree = debut.elapsed();
 
+    rendre_tx.send(()).unwrap();
     detenteur.join().unwrap();
     rt.shutdown_timeout(Duration::from_secs(5));
+    assert!(
+        attentes_observees >= 2,
+        "les écrivains ne se sont pas présentés au verrou"
+    );
 
     assert!(
-        lu.is_ok() && reponse.contains("200 OK") && duree < DELAI_HTTP,
+        lu.is_ok() && reponse.contains("200 OK"),
         "l'exécuteur est resté figé derrière le verrou d'écriture : réponse {:?} en {} ms \
-         (délai {} ms, détention {} ms)",
+         (garde {} ms, détenteur libéré seulement après cette réponse)",
         lu.map(|_| reponse),
         duree.as_millis(),
-        DELAI_HTTP.as_millis(),
-        TENUE.as_millis()
+        DELAI_HTTP.as_millis()
     );
 }
 
@@ -120,7 +125,11 @@ fn les_ecrivains_en_attente_aboutissent_apres_la_liberation() {
             rt.spawn(async move { DbBackend::execute(&*db, "INSERT INTO t (x) VALUES (1)", &[]) })
         })
         .collect();
-    std::thread::sleep(Duration::from_millis(200));
+    let limite = Instant::now() + Duration::from_secs(15);
+    while db.connection().releve().attentes.len() < 6 && Instant::now() < limite {
+        std::thread::yield_now();
+    }
+    let attentes_observees = db.connection().releve().attentes.len();
     drop(garde);
     rt.block_on(async {
         for t in taches {
@@ -131,6 +140,10 @@ fn les_ecrivains_en_attente_aboutissent_apres_la_liberation() {
         .unwrap()
         .unwrap()[0]
         .as_i64();
+    assert_eq!(
+        attentes_observees, 6,
+        "les six écrivains doivent attendre avant la libération"
+    );
     assert_eq!(n, Some(6));
 }
 
@@ -159,21 +172,22 @@ fn la_sentinelle_nomme_une_detention_au_dela_du_seuil() {
     let verrou = verrou_d_essai(Duration::from_millis(100));
     sentinelle.surveiller(&verrou);
 
+    let (rendre_tx, rendre_rx) = mpsc::channel();
     let fil = std::thread::Builder::new()
         .name("detenteur-4924".into())
         .spawn({
             let verrou = verrou.clone();
             move || {
                 let _g = verrou.lock().unwrap();
-                std::thread::sleep(Duration::from_millis(400));
+                rendre_rx.recv().unwrap();
             }
         })
         .unwrap();
 
-    let sig = rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("aucun signalement pour une détention de 400 ms au seuil de 100 ms");
+    let sig = rx.recv_timeout(Duration::from_secs(15));
+    rendre_tx.send(()).unwrap();
     fil.join().unwrap();
+    let sig = sig.expect("la sentinelle doit signaler le détenteur avant sa libération");
     assert!(
         sig.detenteur.lieu.contains("verrou_ecriture_tests_4924.rs"),
         "le lieu doit désigner l'appelant de lock(), obtenu : {}",
@@ -188,17 +202,25 @@ fn la_sentinelle_nomme_une_detention_au_dela_du_seuil() {
 /// En deçà du seuil, la sentinelle se tait.
 #[test]
 fn la_sentinelle_se_tait_en_deca_du_seuil() {
-    let (sentinelle, rx) = sentinelle_d_essai();
     let verrou = verrou_d_essai(Duration::from_millis(300));
-    sentinelle.surveiller(&verrou);
-    for _ in 0..5 {
-        let _g = verrou.lock().unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let garde = verrou.lock().unwrap();
+    let debut = verrou
+        .etat
+        .detention
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .depuis;
     assert!(
-        rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        examiner_a(&verrou.etat, debut + Duration::from_millis(20)).is_none(),
         "une détention de 20 ms ne doit rien signaler au seuil de 300 ms"
     );
+    assert!(
+        examiner_a(&verrou.etat, debut + Duration::from_millis(300)).is_some(),
+        "la même détention doit être signalée au seuil"
+    );
+    drop(garde);
     assert!(
         verrou.releve().detenteur.is_none(),
         "le relevé doit être vidé à la libération"
@@ -210,9 +232,7 @@ fn la_sentinelle_se_tait_en_deca_du_seuil() {
 /// attend un seul détenteur ».
 #[test]
 fn le_releve_nomme_ceux_qui_attendent() {
-    let (sentinelle, rx) = sentinelle_d_essai();
     let verrou = verrou_d_essai(Duration::from_millis(150));
-    sentinelle.surveiller(&verrou);
 
     let garde = verrou.lock().unwrap();
     let attente = std::thread::Builder::new()
@@ -224,7 +244,10 @@ fn le_releve_nomme_ceux_qui_attendent() {
             }
         })
         .unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    let limite = Instant::now() + Duration::from_secs(15);
+    while verrou.releve().attentes.is_empty() && Instant::now() < limite {
+        std::thread::yield_now();
+    }
     let releve = verrou.releve();
     assert_eq!(releve.attentes.len(), 1, "{releve}");
     assert_eq!(releve.attentes[0].fil, "attente-4924");
@@ -235,9 +258,15 @@ fn le_releve_nomme_ceux_qui_attendent() {
     );
     assert!(releve.to_string().contains("en attente : 1"), "{releve}");
 
-    let sig = rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("signalement");
+    let debut = verrou
+        .etat
+        .detention
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .depuis;
+    let sig = examiner_a(&verrou.etat, debut + Duration::from_millis(150)).expect("signalement");
     assert_eq!(sig.attentes, 1);
     drop(garde);
     attente.join().unwrap();

@@ -837,10 +837,14 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         {
             // #5612 — hors de l'ordonnanceur et borné : un balayage bloqué
             // dans le greffon ALSA de PipeWire ne doit pas figer le serveur.
+            // #6119 — jamais pendant qu'une sortie locale joue : la page Zones
+            // charge cette fiche, et sonder ASIO y coupait la lecture WASAPI.
             let devs: Vec<String> =
-                tune_core::outputs::local::list_audio_devices_with_backend_bounded(
-                    audio_backend_pref,
-                )
+                crate::background::parc_local_sans_couper_la_lecture(&state, || {
+                    tune_core::outputs::local::list_audio_devices_with_backend_bounded(
+                        audio_backend_pref,
+                    )
+                })
                 .await
                 .iter()
                 .map(|d| d.name.clone())
@@ -882,6 +886,9 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let rss_mb = get_rss_mb();
     // #5189 — température du processeur pour l'écran « État du serveur ».
     let cpu_temp_c = temperature_processeur().await;
+    // #5410 — sans température lisible, les analyses de fond sont bridées à
+    // un fichier à la fois : l'écran doit le dire.
+    let analyses_bridees = bridage_des_analyses().await;
 
     // #3205 — le seul chiffre qui dise si l'audio a réellement sauté.
     let ring_starvation = releve_famine_anneau(&state).await;
@@ -915,8 +922,15 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "process_started_at": state.process_started_at_rfc3339(),
         "memory_rss_mb": rss_mb,
         // #5189 — °C, au dixième ; `null` sans capteur lisible (macOS,
-        // Windows, conteneur, machine virtuelle) ou si sysfs tarde.
+        // Windows sans zone thermique, conteneur, machine virtuelle) ou si la
+        // lecture tarde. #5410 : Windows lit ses zones thermiques ACPI.
         "cpu_temp_c": cpu_temp_c,
+        // #5410 — `null` quand la garde thermique mesure ; sinon le motif
+        // (`temperature_illisible`, `temperature_figee`) : les analyses de
+        // fond tournent alors à `analyses_bridees_largeur` fichier à la fois.
+        "analyses_bridees": analyses_bridees,
+        "analyses_bridees_largeur": analyses_bridees
+            .map(|_| tune_core::audio::thermal::LARGEUR_SANS_THERMOMETRE),
         "db_backend": db_backend,
         "active_zones": zone_count,
         "zone_poller_metrics": zone_poller_metrics,
@@ -959,6 +973,10 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // pas leur zone. Le journal porte `dsp_ecretage` au premier écrêtage
         // d'une piste et à sa fin.
         "dsp_ecretage": tune_core::audio::ecretage::releve(),
+        // #6255 — les derniers `bruit_suspect_reseau` : ce que le serveur a
+        // envoyé à un lecteur réseau et qui s'entendra comme du bruit.
+        "bruit_suspect_reseau": tune_core::http::bruit_reseau::derniers(),
+        "bruit_suspect_reseau_actif": tune_core::http::bruit_reseau::actif(),
         // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
         // une ligne WARN que l'utilisateur ne verra jamais.
         "asio_warm_scan": crate::startup::asio_warm_status(),
@@ -1016,14 +1034,35 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
 ///
 /// Réutilise la lecture sysfs du garde thermique
 /// (`tune_core::audio::thermal::cpu_package_temp_celsius`) : paquet CPU quand
-/// il est identifiable, sinon maximum des zones. La lecture est synchrone et
-/// certains pilotes `hwmon` (disques) peuvent tarder : elle passe par
-/// `spawn_blocking` et abandonne au-delà de 300 ms. Le rapport de diagnostic
+/// il est identifiable, sinon maximum des zones. Quand le serveur tourne,
+/// c'est la médiane des relevés de fond (#5320) : lire la sonde ICI tombait
+/// sur la pointe que provoque la collecte de l'écran. Sans échantillonneur,
+/// la lecture est synchrone et certains pilotes `hwmon` (disques) peuvent
+/// tarder : elle passe par `spawn_blocking` et abandonne au-delà de 300 ms.
+/// Le rapport de diagnostic
 /// ne doit jamais attendre un capteur.
 async fn temperature_processeur() -> Option<f64> {
     let lecture = tokio::task::spawn_blocking(tune_core::audio::thermal::cpu_package_temp_celsius);
     match tokio::time::timeout(std::time::Duration::from_millis(300), lecture).await {
         Ok(Ok(Some(c))) => Some((c * 10.0).round() / 10.0),
+        _ => None,
+    }
+}
+
+/// #5410 — le motif du bridage des analyses de fond, ou `None` quand la
+/// température est lisible. Même lecture que celle des analyses
+/// (`tune_core::audio::thermal::lecture_thermique`, relue au plus toutes les
+/// 15 s), passée hors de l'exécuteur et abandonnée au-delà de 300 ms comme
+/// la température : un capteur lent ne retient pas le rapport. Un abandon
+/// rend `None` (rien n'est affirmé).
+async fn bridage_des_analyses() -> Option<&'static str> {
+    let lecture = tokio::task::spawn_blocking(|| {
+        tune_core::audio::thermal::lecture_thermique()
+            .motif_du_bridage()
+            .map(|m| m.id())
+    });
+    match tokio::time::timeout(std::time::Duration::from_millis(300), lecture).await {
+        Ok(Ok(motif)) => motif,
         _ => None,
     }
 }
@@ -2095,6 +2134,44 @@ fn ligne_albums_masques(compte: Option<i64>) -> String {
     }
 }
 
+/// #6378 — les zones masquées, avec leur appareil, leur motif et leur date de
+/// masquage. Le titre `## Zones (N)` ne compte que les zones visibles : un
+/// testeur dont la seule zone était masquée envoyait un « Zones (0) » qui ne
+/// disait rien de la zone qu'il utilisait. Un motif NUL est un masquage
+/// d'avant la migration 112, que la réparation automatique ne touche pas.
+fn lignes_zones_masquees(
+    masquees: &Result<Vec<tune_core::db::zone_repo::ZoneMasquee>, String>,
+) -> String {
+    let liste = match masquees {
+        Ok(liste) => liste,
+        Err(e) => return format!("- Zones masquées : illisibles ({e})\n"),
+    };
+    let mut md = format!("- Zones masquées : {}\n", liste.len());
+    for z in liste {
+        let protocole = if z.protocole.is_empty() {
+            "?"
+        } else {
+            z.protocole.as_str()
+        };
+        let appareil = if z.device_id.is_empty() {
+            "?"
+        } else {
+            z.device_id.as_str()
+        };
+        let motif = z
+            .motif
+            .as_deref()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or("inconnu (masquage d'avant la migration 112)");
+        let date = z.masquee_le.as_deref().unwrap_or("date inconnue");
+        md.push_str(&format!(
+            "  - zone {} « {} » ({protocole}) — appareil {appareil} — motif : {motif} — masquée le {date}\n",
+            z.id, z.name
+        ));
+    }
+    md
+}
+
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
@@ -2137,6 +2214,10 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         .iter()
         .map(|z| json!({ "id": z.id, "name": z.name, "output_type": z.output_type }))
         .collect();
+    // #6378 — `count()` et `list()` ignorent les zones masquées : sans cette
+    // lecture, « Zones (0) » ne distingue pas « aucune zone » de « la seule
+    // zone utilisée est masquée ».
+    let zones_masquees = zone_repo.zones_masquees();
 
     // Streaming services status
     let registry = state.services.lock().await;
@@ -2327,6 +2408,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             z["output_type"].as_str().unwrap_or("?")
         ));
     }
+    md.push_str(&lignes_zones_masquees(&zones_masquees));
     md.push_str(&format!(
         "- Zone settings not persisted: {zone_settings_ignored}\n"
     ));
@@ -2557,6 +2639,21 @@ confondre avec la famine de l'anneau, comptee au-dessus)\n\n",
 journal porte `dsp_ecretage` au premier ecretage d'une piste et a sa fin, \
 jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
     );
+    // #6255 — ce que le serveur a ENVOYÉ aux lecteurs réseau et qui
+    // s'entendra comme du bruit (reprise hors trame, décodage décalé, en-tête
+    // au milieu). Le lecteur ne le dit jamais : sans cette section, le bruit
+    // blanc du .18 du 13/10 ne laissait rien dans le rapport.
+    let bruit_reseau = tune_core::http::bruit_reseau::derniers();
+    md.push_str(&tune_core::http::bruit_reseau::section_du_rapport(
+        &bruit_reseau,
+        |id| {
+            zones
+                .iter()
+                .find(|z| z["id"].as_i64() == Some(id))
+                .and_then(|z| z["name"].as_str())
+                .map(str::to_string)
+        },
+    ));
     md.push_str("## Database\n");
     // #3182 : c'était `format!("- Engine: sqlite\n")` — un `format!` sans
     // argument, donc une chaîne littérale, et toute installation PostgreSQL
@@ -2676,6 +2773,18 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         "zones": {
             "count": zone_count,
             "items": zones,
+            // #6378 — `null` si la table n'a pas pu être lue.
+            "hidden": zones_masquees.as_ref().ok().map(|liste| liste
+                .iter()
+                .map(|z| json!({
+                    "id": z.id,
+                    "name": z.name,
+                    "output_type": z.protocole,
+                    "device_id": z.device_id,
+                    "motif": z.motif,
+                    "masquee_le": z.masquee_le,
+                }))
+                .collect::<Vec<_>>()),
         },
         "zone_settings_ignored": zone_settings_ignored,
         "asio_warm_scan": asio_warm_scan,
@@ -2697,6 +2806,8 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         "dsp_egaliseur": dsp_egaliseur,
         // Le pendant JSON de la section « DSP — ecretage » (#2218).
         "dsp_ecretage": dsp_ecretage,
+        // Le pendant JSON de la section « Lecteurs reseau — bruit suspect ».
+        "bruit_suspect_reseau": bruit_reseau,
         "database": {
             // #3182 : même mensonge que la ligne markdown ci-dessus, dans le
             // corps JSON que le client lit.
@@ -4917,5 +5028,58 @@ mod tests_refus_du_rapport_5590 {
             "{ligne}"
         );
         assert!(!ligne.contains("retry_after"), "{ligne}");
+    }
+}
+
+#[cfg(test)]
+mod zones_masquees_au_rapport_6378 {
+    use super::lignes_zones_masquees;
+    use tune_core::db::zone_repo::ZoneMasquee;
+
+    fn masquee(id: i64, nom: &str, motif: Option<&str>, le: Option<&str>) -> ZoneMasquee {
+        ZoneMasquee {
+            id,
+            name: nom.into(),
+            device_id: format!("uuid:{id}"),
+            protocole: "dlna".into(),
+            host: "10.0.0.3".into(),
+            mac: None,
+            motif: motif.map(Into::into),
+            masquee_le: le.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn chaque_zone_masquee_porte_son_appareil_son_motif_et_sa_date() {
+        let md = lignes_zones_masquees(&Ok(vec![
+            masquee(1, "Diretta Renderer", None, None),
+            masquee(
+                4,
+                "Garage",
+                Some("suppression_utilisateur"),
+                Some("2026-10-12 10:00:00"),
+            ),
+        ]));
+        assert!(md.starts_with("- Zones masquées : 2\n"), "{md}");
+        assert!(
+            md.contains(
+                "zone 1 « Diretta Renderer » (dlna) — appareil uuid:1 — motif : inconnu (masquage d'avant la migration 112) — masquée le date inconnue"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains("zone 4 « Garage » (dlna) — appareil uuid:4 — motif : suppression_utilisateur — masquée le 2026-10-12 10:00:00"),
+            "{md}"
+        );
+        assert!(!md.contains("10.0.0.3"), "l'hôte n'est pas recopié : {md}");
+    }
+
+    #[test]
+    fn aucune_zone_masquee_se_dit_et_une_lecture_ratee_aussi() {
+        assert_eq!(lignes_zones_masquees(&Ok(vec![])), "- Zones masquées : 0\n");
+        assert_eq!(
+            lignes_zones_masquees(&Err("no such column".into())),
+            "- Zones masquées : illisibles (no such column)\n"
+        );
     }
 }

@@ -151,6 +151,10 @@ impl TunePlugin for CdPlugin {
             lu(memoire::CLE_PLAFOND_MIO).as_deref(),
         ));
         tracing::info!(reglages = ?memoire.reglages(), ram_disponible = ?memoire.ram_disponible(), "cd_memoire_reglages");
+        // #6596 — la progression du chargement, en évènements.
+        if let Some(bus) = ctx.event_bus.clone() {
+            memoire.observer(memoire::observateur_du_bus(bus));
+        }
         self.memoire = Some(memoire.clone());
         let etat_routes = routes::EtatRoutes {
             lecteur: lecteur.clone(),
@@ -163,10 +167,13 @@ impl TunePlugin for CdPlugin {
             backend: Some(self.services.backend.clone()),
         };
         // #5065 — la source `cd` du registre commun des sources physiques.
-        let publication = Arc::new(source::PublicationSource::new(
-            self.services.orchestrator.sources_physiques().clone(),
-            &etat_routes,
-        ));
+        let publication = Arc::new(
+            source::PublicationSource::new(
+                self.services.orchestrator.sources_physiques().clone(),
+                &etat_routes,
+            )
+            .avec_bus(ctx.event_bus.clone()),
+        );
         publication.publier_sans_lecteur();
         // #5161 — sur les plateformes prises en charge, `lecteur` est toujours là : un lecteur
         // absent au démarrage se branche plus tard, et c'est la surveillance

@@ -35,9 +35,15 @@ pub mod plage_dynamique;
 /// jauge doit dire après un redémarrage, quand la campagne repart de zéro.
 pub mod bibliotheque;
 
+/// #5519 — le gain APPROCHÉ tiré d'un rapport `foo_dr.txt`, plafonné par la
+/// crête, quand la piste n'a aucun ReplayGain. Jamais écrit dans un fichier.
+pub mod gain_approche;
 /// #2713 — la crête vraie versionnée, et le rattrapage des crêtes mesurées
 /// par l'ancien algorithme.
 pub mod rattrapage_crete;
+/// #6330 — « Tout relancer » rend à la cascade les pistes en échec, et la
+/// réveille si elle dort au repos.
+pub mod reessai;
 /// Refaire, sur demande, les mesures prises avant le correctif du vrai pic
 /// (#5882) : la campagne qui les rend à la passe, par lots.
 pub mod remesure;
@@ -1123,7 +1129,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                     &mut dernier_repos,
                     etat.motif_de_repos(),
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
+                // #6330 — « Tout relancer » écourte ce repos : des pistes
+                // rendues à la passe n'attendent pas un quart d'heure.
+                reessai::dormir_au_repos(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
             } else {
                 // More to do — loop again promptly.
                 tokio::time::sleep(pause_entre_deux_tours(&backend)).await;
@@ -2734,6 +2742,10 @@ pub enum GainSource {
     /// Mesuré par la passe EBU R128 de Tune, ou calculé par elle
     /// (gain d'album dérivé des gains de piste).
     Analysis,
+    /// APPROCHÉ depuis la crête et le RMS d'un rapport `foo_dr.txt` voisin
+    /// (#5519), faute de tout ReplayGain : voir [`gain_approche`]. Une
+    /// mesure réelle (tag ou analyse) le remplace dès qu'elle existe.
+    FooDrApprox,
 }
 
 impl GainSource {
@@ -2742,6 +2754,7 @@ impl GainSource {
         match self {
             Self::FileTags => "file_tags",
             Self::Analysis => "analysis",
+            Self::FooDrApprox => "foo_dr_approx",
         }
     }
 
@@ -2750,6 +2763,7 @@ impl GainSource {
         match self {
             Self::FileTags => "tags du fichier",
             Self::Analysis => "analyse Tune",
+            Self::FooDrApprox => "approché (foo_dr)",
         }
     }
 }
@@ -3034,7 +3048,7 @@ pub fn stored_gain_with_peak(
             };
             Some((TrackGain { gain_db, peak }, kind))
         };
-    match mode {
+    let mesure = match mode {
         ReplayGainMode::Album => pick("rg_album_gain", "rg_album_peak", "rg_album_true_peak")
             .map(|(g, kind)| (g, ReplayGainMode::Album, kind))
             .or_else(|| {
@@ -3043,7 +3057,35 @@ pub fn stored_gain_with_peak(
             }),
         _ => pick("rg_track_gain", "rg_track_peak", "rg_track_true_peak")
             .map(|(g, kind)| (g, ReplayGainMode::Track, kind)),
-    }
+    };
+    // #5519 — ni gain d'album ni gain de piste : l'approximation tirée du
+    // rapport `foo_dr.txt` voisin, si le scan en a gardé les mesures. Elle
+    // n'existe qu'en granularité PISTE (le rapport mesure des pistes), et
+    // elle est bornée ici même par la crête et le plafond dBTP réglé — la
+    // crête est ensuite remise comme pic d'échantillon, pour que
+    // l'anti-écrêtage habituel s'applique par-dessus.
+    mesure.or_else(|| {
+        let (crete_db, rms_db) = meta
+            .get(gain_approche::CLE_MESURE_FOO_DR)
+            .and_then(|v| gain_approche::decoder(v))?;
+        let plafond_db = SettingsRepo::with_backend(backend.clone())
+            .get(TRUE_PEAK_CEILING_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+            .clamp(-1.0, 0.0);
+        let gain_db = gain_approche::gain_approche_db(crete_db, rms_db, plafond_db);
+        let pic = 10f64.powf(crete_db / 20.0);
+        Some((
+            TrackGain {
+                gain_db,
+                peak: (pic > 0.0 && pic <= PEAK_MAX_PLAUSIBLE).then_some(pic),
+            },
+            ReplayGainMode::Track,
+            PeakKind::SamplePeak,
+        ))
+    })
 }
 
 /// D'où vient le gain que [`stored_gain_detail`] vient de rendre (#1627).
@@ -3076,7 +3118,25 @@ fn gain_source_from_meta(
         // `None` avant. Le traiter comme `Track` évite un cas mort.
         _ => ("rg_track_gain", TRACK_SOURCE_KEY),
     };
-    meta.get(gain_key)?;
+    if meta
+        .get(gain_key)
+        .cloned()
+        .and_then(parse_gain_db)
+        .is_none()
+    {
+        // #5519 : sans aucun gain de piste, c'est l'approximation foo_dr qui
+        // s'applique (granularité piste seulement, comme dans
+        // `stored_gain_with_peak`).
+        let approche = granularity != ReplayGainMode::Album
+            && meta
+                .get(gain_approche::CLE_MESURE_FOO_DR)
+                .and_then(|v| gain_approche::decoder(v))
+                .is_some();
+        if approche {
+            return Some(GainSource::FooDrApprox);
+        }
+        meta.get(gain_key)?;
+    }
     if meta
         .get(source_key)
         .is_some_and(|v| v.trim() == SOURCE_ANALYSIS)

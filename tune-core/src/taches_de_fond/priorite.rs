@@ -30,7 +30,8 @@
 //! 2. **Une cadence réduite** : pendant qu'une zone joue, une passe qui
 //!    passe par [`ceder_a_la_lecture`] (ou sa jumelle bloquante) marque une
 //!    pause de [`PAUSE_EN_LECTURE`] entre deux éléments — deux artistes, deux
-//!    pistes à enrichir, deux lots de scan. Elle ne s'ARRÊTE pas : une écoute
+//!    pistes à enrichir, deux lots de scan, deux fichiers où graver le
+//!    Dynamic Range ([`ID_GRAVER_DR`]). Elle ne s'ARRÊTE pas : une écoute
 //!    de toute une journée ne doit pas geler l'enrichissement jusqu'au soir.
 //!    Les passes qui décodent, elles, continuent de tout céder, comme avant.
 //! 3. **Un relevé** : quelles passes ont cédé à la lecture, depuis quand une
@@ -96,6 +97,13 @@ static CEDEES: Mutex<Option<HashMap<&'static str, Instant>>> = Mutex::new(None);
 /// [`super::Tache`] (voir [`super::pourquoi_le_scan_n_est_pas_suspendable`])
 /// mais qui cède à la lecture comme les autres.
 pub const ID_SCAN: &str = "scan";
+
+/// Identifiant de relevé de la gravure du Dynamic Range dans les fichiers
+/// (`POST /library/dr/gravure`) — le même que son entrée au registre
+/// `background_tasks`. Elle n'est pas une [`super::Tache`] (elle part d'un
+/// geste de l'utilisateur, pas de la cascade), mais elle réécrit des fichiers
+/// et cède à la lecture comme les autres passes freinées (#6212, #6634).
+pub const ID_GRAVER_DR: &str = "graver_dr";
 
 fn maintenant_unix() -> u64 {
     std::time::SystemTime::now()
@@ -288,7 +296,7 @@ pub struct ReleveDePriorite {
     /// Depuis quand (secondes Unix) ; `None` au repos.
     pub since_epoch_s: Option<u64>,
     /// Les passes qui ont cédé à la lecture dans la fenêtre — identifiants de
-    /// [`super::Tache::id`], plus [`ID_SCAN`].
+    /// [`super::Tache::id`], plus [`ID_SCAN`] et [`ID_GRAVER_DR`].
     pub throttled: Vec<&'static str>,
     /// La pause marquée entre deux éléments d'une passe freinée.
     pub pause_between_items_ms: u64,

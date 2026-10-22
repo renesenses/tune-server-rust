@@ -144,12 +144,20 @@ async fn banc() -> (AppState, i64, Arc<AtomicUsize>) {
 /// Le corps qu'envoient la recherche Qobuz, les tuiles d'accueil et
 /// l'historique : `source` + `source_id`, ni `track_ids` ni album.
 async fn lancer_le_titre(state: &AppState, zid: i64, source_id: &str) {
-    let corps = serde_json::json!({
-        "source": "qobuz",
-        "source_id": source_id,
-        "title": "Titre",
-        "artist_name": "Artiste",
-    });
+    lancer(
+        state,
+        zid,
+        serde_json::json!({
+            "source": "qobuz",
+            "source_id": source_id,
+            "title": "Titre",
+            "artist_name": "Artiste",
+        }),
+    )
+    .await;
+}
+
+async fn lancer(state: &AppState, zid: i64, corps: serde_json::Value) {
     let rep = router()
         .with_state(state.clone())
         .oneshot(
@@ -247,4 +255,40 @@ fn la_place_du_titre_dans_l_album() {
     let pistes = vec![piste("t1", 1, Some(ALBUM)), piste("t2", 2, Some(ALBUM))];
     assert_eq!(position_du_titre_dans_l_album(&pistes, "t2"), Some(1));
     assert_eq!(position_du_titre_dans_l_album(&pistes, "t9"), None);
+}
+
+/// #6469 — la TÊTE d'une liste que le client enfile lui-même (« Écouter le
+/// best of » d'un artiste de service) ne joue pas son album. Le best of
+/// d'ABBA partait de « Slipping Through My Fingers », titre d'une compilation
+/// Qobuz : toute la compilation entrait en file avant les autres titres phares
+/// (FabienM, fil 2302 point 14).
+#[tokio::test]
+async fn la_tete_d_une_liste_ne_joue_pas_son_album_6469() {
+    let (state, zid, compteur) = banc().await;
+    lancer(
+        &state,
+        zid,
+        serde_json::json!({
+            "source": "qobuz",
+            "source_id": "t2",
+            "title": "Titre 2",
+            "artist_name": "Artiste",
+            "queue_follows": true,
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        compteur.load(Ordering::SeqCst),
+        0,
+        "la tête d'une liste a relu son album : le best of joue la compilation du premier titre"
+    );
+    let file = PlayQueueRepo::with_backend(state.backend.clone())
+        .get_ordered(zid)
+        .unwrap();
+    assert!(
+        file.len() <= 1,
+        "au plus le titre de tête en file, la suite vient du client ({} en file)",
+        file.len()
+    );
 }

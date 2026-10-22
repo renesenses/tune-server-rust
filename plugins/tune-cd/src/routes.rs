@@ -7,12 +7,23 @@
 //! * `POST /ejecter` — `{ "forcer": true }` facultatif : éjecte le disque du
 //!   lecteur courant (fil 2135). Si une zone le joue (ou le tient en pause),
 //!   refus `409 lecture_en_cours` qui nomme les zones ; avec `forcer`, ces
-//!   zones sont d'abord arrêtées, puis le disque est éjecté.
+//!   zones sont d'abord arrêtées, puis le disque est éjecté. #6410 : si le
+//!   disque est ENTIER en mémoire, ni refus ni arrêt — la lecture continue
+//!   depuis la mémoire (`lecture_continue` nomme les zones).
 //!
 //! * `GET  /memoire` — « Charger le CD en mémoire » (#6043) : réglages, RAM
 //!   disponible et progression du chargement ;
 //! * `POST /memoire` — `{ "actif": true, "plafond_mio": 800 }`, chacun
 //!   facultatif ; désactiver libère le disque chargé.
+//! * `POST /memoire/charger` — #6596 : charge le disque inséré en mémoire SANS
+//!   rien jouer (ni file ni lecture d'aucune zone touchée) et rend l'état de
+//!   `GET /memoire`. La progression part ensuite en évènements
+//!   `cd.memoire.progression` puis `cd.memoire.termine` ; `POST /jouer` lancé
+//!   après se sert dans la mémoire. Refus : `404 memoire_indisponible`,
+//!   `409 memoire_desactivee` (réglage coupé), `409 extraction_en_cours`,
+//!   `409 memoire_occupee` (un AUTRE disque tient la mémoire et une zone le
+//!   joue, ou son chargement est en cours : le charger le couperait), et
+//!   ceux de `/disque` (`aucun_lecteur`, `aucun_disque`, `lecture_toc`).
 //!
 //! `GET /etat` porte aussi `chargement` : la progression du disque chargé en
 //! mémoire, `null` sans chargement.
@@ -71,6 +82,7 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
         .route("/jouer", post(jouer))
         .route("/ejecter", post(ejecter))
         .route("/memoire", get(memoire).post(regler_memoire))
+        .route("/memoire/charger", post(charger_en_memoire))
         .with_state(etat.clone());
     match etat.extraction.clone() {
         Some(ex) => base.merge(crate::extraction::routes::router(etat, ex)),
@@ -199,6 +211,90 @@ async fn regler_memoire(State(etat): State<EtatRoutes>, Json(d): Json<DemandeMem
     let (actif, plafond) = (d.actif, d.plafond_mio.map(|p| p * MIO));
     let m2 = m.clone();
     let _ = tokio::task::spawn_blocking(move || m2.regler(actif, plafond)).await;
+    Json(etat_memoire(Some(&m))).into_response()
+}
+
+/// #6596 — « Charger en mémoire » : le disque inséré, sans rien jouer. Ce
+/// geste ne passe JAMAIS par `etat.hote` : la file et la lecture des zones
+/// restent ce qu'elles sont, rien n'est coupé d'office.
+async fn charger_en_memoire(State(etat): State<EtatRoutes>) -> Response {
+    let Some(m) = etat.memoire.clone() else {
+        return refus(
+            StatusCode::NOT_FOUND,
+            "memoire_indisponible",
+            "Le chargement en mémoire n'est pas disponible.".into(),
+        );
+    };
+    if !m.reglages().actif {
+        return refus(
+            StatusCode::CONFLICT,
+            "memoire_desactivee",
+            "Le chargement du CD en mémoire est désactivé dans les réglages.".into(),
+        );
+    }
+    if extraction_en_cours(&etat).is_some() {
+        return refus(
+            StatusCode::CONFLICT,
+            "extraction_en_cours",
+            "Le disque est en cours d'extraction : annulez-la pour le charger.".into(),
+        );
+    }
+    let Some(lecteur) = etat.lecteur.clone() else {
+        let (code, motif, message) = aucun_lecteur();
+        return refus(code, motif, message);
+    };
+    // La génération AVANT la TOC, comme `FournisseurCd::ouvrir` : un lecteur
+    // changé entre les deux fait tomber le chargement en `ejecte`.
+    let l = lecteur.clone();
+    let generation = tokio::task::spawn_blocking(move || l.generation_lecteur())
+        .await
+        .unwrap_or_default();
+    let toc = match toc_ou_refus(&etat).await {
+        Ok(v) => v,
+        Err((code, motif, message)) => return refus(code, motif, message),
+    };
+    let disc = disc_id(&toc);
+    // Relecture rc7 — un AUTRE disque tient la mémoire (A gardé après son
+    // éjection, #6410, ou encore en chargement). Le libérer couperait la
+    // zone qui le joue : on refuse, rien n'est coupé d'office. Gardé mais
+    // joué par personne, il ne sert plus : le chargement de B le remplace.
+    let m2 = m.clone();
+    let d2 = disc.clone();
+    let autre = tokio::task::spawn_blocking(move || m2.autre_disque_en_memoire(&d2))
+        .await
+        .ok()
+        .flatten();
+    if let Some((autre, en_chargement)) = autre {
+        let zones = zones_qui_jouent_le_disque(&etat).await;
+        if en_chargement || !zones.is_empty() {
+            tracing::info!(disc_id = %disc, en_memoire = %autre, zones = ?zones, "cd_memoire_occupee_refus");
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "memoire_occupee",
+                    "message": "Un autre disque est encore en mémoire et joue : \
+                                attendez la fin de sa lecture ou arrêtez-la avant de charger celui-ci.",
+                    "disc_id_en_memoire": autre,
+                    "zones": zones,
+                })),
+            )
+                .into_response();
+        }
+    }
+    let m2 = m.clone();
+    let lance = tokio::task::spawn_blocking(move || {
+        m2.charger_le_disque(&lecteur, &toc, &disc, generation)
+            .is_some()
+    })
+    .await
+    .unwrap_or(false);
+    if !lance {
+        return refus(
+            StatusCode::CONFLICT,
+            "memoire_desactivee",
+            "Le chargement du CD en mémoire est désactivé dans les réglages.".into(),
+        );
+    }
     Json(etat_memoire(Some(&m))).into_response()
 }
 
@@ -378,6 +474,34 @@ async fn ejecter(State(etat): State<EtatRoutes>, corps: Option<Json<DemandeEject
         Presence::Disque => {}
     }
 
+    // #6410 — le disque est ENTIER en mémoire : comme sur Daphile, la
+    // lecture continue après l'éjection, sans confirmation ni arrêt. Le
+    // surveillant garde la mémoire au passage à « vide ».
+    let m = etat.memoire.clone();
+    let en_memoire =
+        tokio::task::spawn_blocking(move || m.is_some_and(|m| m.disque_complet().is_some()))
+            .await
+            .unwrap_or(false);
+    if en_memoire {
+        let continuent = zones_qui_jouent_le_disque(&etat).await;
+        tracing::info!(zones = ?continuent, "cd_ejection_disque_entier_en_memoire");
+        let l = lecteur.clone();
+        let resultat = tokio::task::spawn_blocking(move || l.ejecter_disque())
+            .await
+            .unwrap_or_else(|e| Err(ErreurEjection::Echec(e.to_string())));
+        etat.reveil.notify_one();
+        return match resultat {
+            Ok(()) => Json(json!({
+                "ejecte": true,
+                "lecteur": lecteur.chemin(),
+                "zones_arretees": [],
+                "lecture_continue": continuent,
+            }))
+            .into_response(),
+            Err(e) => refus_d_ejection(e),
+        };
+    }
+
     let zones = zones_qui_jouent_le_disque(&etat).await;
     if !zones.is_empty() && !forcer {
         return (
@@ -423,21 +547,27 @@ async fn ejecter(State(etat): State<EtatRoutes>, corps: Option<Json<DemandeEject
             "zones_arretees": zones,
         }))
         .into_response(),
-        Err(ErreurEjection::AucunLecteur) => {
+        Err(e) => refus_d_ejection(e),
+    }
+}
+
+fn refus_d_ejection(e: ErreurEjection) -> Response {
+    match e {
+        ErreurEjection::AucunLecteur => {
             let (code, motif, message) = aucun_lecteur();
             refus(code, motif, message)
         }
-        Err(ErreurEjection::AucunDisque) => refus(
+        ErreurEjection::AucunDisque => refus(
             StatusCode::CONFLICT,
             "aucun_disque",
             "Le lecteur est vide.".into(),
         ),
-        Err(ErreurEjection::NonPrisEnCharge) => refus(
+        ErreurEjection::NonPrisEnCharge => refus(
             StatusCode::NOT_IMPLEMENTED,
             "ejection_non_prise_en_charge",
             "Ce lecteur ne peut pas être éjecté par Tune.".into(),
         ),
-        Err(ErreurEjection::Echec(raison)) => refus(
+        ErreurEjection::Echec(raison) => refus(
             StatusCode::BAD_GATEWAY,
             "ejection",
             format!("Le système a refusé l'éjection : {raison}"),
@@ -584,6 +714,302 @@ mod tests {
         assert_eq!(code, StatusCode::NOT_FOUND);
     }
 
+    // ─── #6596 : charger en mémoire sans jouer ────────────────────────────
+
+    /// Trois pistes : 300, 800 et 400 secteurs.
+    fn petite_toc() -> Toc {
+        use crate::toc::PisteToc;
+        let p = |numero, debut| PisteToc {
+            numero,
+            debut,
+            audio: true,
+        };
+        Toc::nouvelle(vec![p(1, 0), p(2, 300), p(3, 1_100)], 1_500).unwrap()
+    }
+
+    /// Un lecteur simulé, la mémoire branchée sur un VRAI bus (l'observateur
+    /// de production), et la zone 4 qui joue la radio.
+    async fn banc_memoire(
+        l: Arc<LecteurSimule>,
+        actif: bool,
+    ) -> (
+        EtatRoutes,
+        Arc<HoteTemoin>,
+        Arc<MemoireCd>,
+        tokio::sync::broadcast::Receiver<tune_core::event_bus::TuneEvent>,
+    ) {
+        use crate::memoire::{Reglages, observateur_du_bus};
+        let bus = tune_core::event_bus::EventBus::new();
+        let rx = bus.subscribe();
+        let m = Arc::new(MemoireCd::new(Reglages {
+            actif,
+            plafond_octets: u64::MAX,
+        }));
+        m.observer(observateur_du_bus(bus));
+        let (mut e, hote) = etat(Some(l), Arc::new(SansReseau));
+        e.memoire = Some(m.clone());
+        hote.sources.lock().await.insert(4, "radio".into());
+        (e, hote, m, rx)
+    }
+
+    /// Les évènements `cd.memoire.*` reçus, jusqu'à `cd.memoire.termine`
+    /// (2 s au plus).
+    async fn evenements_du_chargement(
+        rx: &mut tokio::sync::broadcast::Receiver<tune_core::event_bus::TuneEvent>,
+    ) -> Vec<(String, Value)> {
+        use crate::memoire::EVT_TERMINE;
+        let mut v = Vec::new();
+        let lire = async {
+            loop {
+                let ev = rx.recv().await.unwrap();
+                if !ev.event_type.starts_with("cd.memoire.") {
+                    continue;
+                }
+                let fin = ev.event_type == EVT_TERMINE;
+                v.push((ev.event_type, ev.data));
+                if fin {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), lire)
+            .await
+            .expect("cd.memoire.termine n'est jamais parti");
+        v
+    }
+
+    /// Ce que la zone 4 joue, et ce qu'on a demandé à l'hôte : rien ne doit
+    /// avoir bougé.
+    async fn rien_n_a_bouge(e: &EtatRoutes, hote: &HoteTemoin) {
+        let files = hote.files.lock().await.len();
+        assert_eq!(files, 0, "charger en mémoire a posé une file");
+        assert!(
+            hote.arrets.lock().await.is_empty(),
+            "charger en mémoire a arrêté une zone"
+        );
+        assert_eq!(
+            hote.sources.lock().await.get(&4).map(String::as_str),
+            Some("radio"),
+            "la zone 4 ne joue plus sa radio"
+        );
+        assert!(e.zones.lock().await.is_empty(), "une zone suit le disque");
+    }
+
+    /// #6596 — `POST /memoire/charger` charge le disque ENTIER sans toucher
+    /// à la file ni à la lecture d'aucune zone ; la progression part en
+    /// évènements jusqu'à « prêt », et `GET /memoire` la rend. Un second
+    /// appel reprend le même chargement, sans relire le lecteur.
+    #[tokio::test]
+    async fn charger_en_memoire_ne_touche_ni_a_la_file_ni_a_la_lecture() {
+        use crate::memoire::{EVT_PROGRESSION, EVT_TERMINE, Fin};
+        let toc = petite_toc();
+        let l = Arc::new(LecteurSimule::new(toc.clone()));
+        let (e, hote, m, mut rx) = banc_memoire(l.clone(), true).await;
+
+        let (code, v) = appel(router(e.clone()), "POST", "/memoire/charger", None).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert_eq!(v["chargement"]["disc_id"], disc_id(&toc), "{v}");
+        let evs = evenements_du_chargement(&mut rx).await;
+        let c = m.courant().unwrap();
+        assert_eq!(c.attendre_la_fin(), Some(Fin::Termine));
+
+        // Les états : en cours (pourcentages croissants, sans fin), puis prêt.
+        let (dernier, avant) = evs.split_last().unwrap();
+        assert!(!avant.is_empty(), "aucune progression annoncée : {evs:?}");
+        assert!(
+            avant
+                .iter()
+                .any(|(_, d)| d["pourcentage"].as_i64().is_some_and(|p| p > 0)),
+            "aucune progression intermédiaire annoncée : {evs:?}"
+        );
+        let mut pct = -1i64;
+        for (t, d) in avant {
+            assert_eq!(t, EVT_PROGRESSION, "{evs:?}");
+            assert!(d["fin"].is_null(), "{d}");
+            let p = d["pourcentage"].as_i64().unwrap();
+            assert!(p > pct && p < 100, "progression {p} après {pct}");
+            pct = p;
+        }
+        assert_eq!(dernier.0, EVT_TERMINE);
+        assert_eq!(dernier.1["fin"], "termine");
+        assert_eq!(dernier.1["pourcentage"], 100);
+        assert_eq!(dernier.1["disc_id"], disc_id(&toc));
+
+        let (_, v) = appel(router(e.clone()), "GET", "/memoire", None).await;
+        assert_eq!(v["chargement"]["fin"], "termine", "{v}");
+        assert_eq!(v["chargement"]["pistes_chargees"], json!([1, 2, 3]));
+        rien_n_a_bouge(&e, &hote).await;
+
+        let appels = l.appels();
+        let (code, _) = appel(router(e.clone()), "POST", "/memoire/charger", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(Arc::ptr_eq(&m.courant().unwrap(), &c), "rechargé de zéro");
+        assert_eq!(l.appels(), appels, "le disque chargé a été relu");
+        rien_n_a_bouge(&e, &hote).await;
+        m.liberer();
+    }
+
+    /// #6596 — la lecture lancée APRÈS le chargement se sert dans la copie
+    /// en mémoire : les octets de la piste sont exacts et le lecteur n'est
+    /// plus lu. « Lire le disque » reste le geste qui remplace la file.
+    #[tokio::test]
+    async fn lire_apres_le_chargement_se_sert_dans_la_memoire() {
+        use crate::fournisseur::FournisseurCd;
+        use crate::memoire::Fin;
+        use crate::simule::contenu_des_secteurs;
+        use std::io::Read;
+        use tune_core::source_pcm::FournisseurPcm;
+        let l = Arc::new(LecteurSimule::new(petite_toc()));
+        let (e, hote, m, mut rx) = banc_memoire(l.clone(), true).await;
+        let (code, _) = appel(router(e.clone()), "POST", "/memoire/charger", None).await;
+        assert_eq!(code, StatusCode::OK);
+        evenements_du_chargement(&mut rx).await;
+        let c = m.courant().unwrap();
+        assert_eq!(c.attendre_la_fin(), Some(Fin::Termine));
+        let appels = l.appels();
+
+        let (code, v) = appel(
+            router(e.clone()),
+            "POST",
+            "/jouer",
+            Some(json!({"zone_id": 4, "piste": 2})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        let source_id = {
+            let files = hote.files.lock().await;
+            assert_eq!((files[0].0, files[0].2), (4, 1));
+            files[0].1[1].source_id.clone()
+        };
+        // Le chemin de l'hôte : l'orchestrateur ouvre la piste par la source
+        // PCM `cd`, c'est-à-dire ce fournisseur.
+        let f = FournisseurCd {
+            lecteur: l.clone(),
+            memoire: Some(m.clone()),
+        };
+        let mut flux = f.ouvrir(&source_id, 0).unwrap();
+        let mut v = Vec::new();
+        flux.lecteur.read_to_end(&mut v).unwrap();
+        assert_eq!(v, contenu_des_secteurs(300, 800), "piste 2, au bit près");
+        assert_eq!(
+            l.appels(),
+            appels,
+            "la lecture a relu le lecteur : elle ne sert pas la copie en mémoire"
+        );
+        assert!(
+            Arc::ptr_eq(&m.courant().unwrap(), &c),
+            "la lecture a relancé un autre chargement"
+        );
+        m.liberer();
+    }
+
+    /// #6596, relecture rc7 — A est entier en mémoire, éjecté (gardé, #6410)
+    /// et joué par la zone 7 ; B est inséré. « Charger en mémoire » B est
+    /// REFUSÉ (`409 memoire_occupee`) : A reste en mémoire et lisible, sa
+    /// zone n'est pas touchée. Plus personne ne joue A : B se charge.
+    #[tokio::test]
+    async fn charger_un_autre_disque_ne_coupe_pas_celui_qui_joue_depuis_la_memoire() {
+        use crate::fournisseur::{FournisseurCd, source_id};
+        use crate::memoire::Fin;
+        use crate::simule::contenu_des_secteurs;
+        use std::io::Read;
+        use tune_core::source_pcm::FournisseurPcm;
+        let toc = petite_toc();
+        let l = Arc::new(LecteurSimule::new(toc.clone()));
+        let (e, hote, m, _rx) = banc_memoire(l.clone(), true).await;
+        // A : entier en mémoire, joué par la zone 7, puis éjecté et gardé.
+        let ld: Arc<dyn LecteurDisque> = l.clone();
+        let a = m.chargement(&ld, &toc, "disque-A", 0, 0).unwrap();
+        assert_eq!(a.attendre_la_fin(), Some(Fin::Termine));
+        hote.sources.lock().await.insert(7, SOURCE.into());
+        e.zones.lock().await.insert(7);
+        l.ejecter();
+        assert!(m.garder_apres_ejection(), "A gardé après son éjection");
+        // B inséré (un autre disc_id que A).
+        l.inserer();
+        assert_ne!(disc_id(&toc), "disque-A");
+
+        let (code, v) = appel(router(e.clone()), "POST", "/memoire/charger", None).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"], "memoire_occupee");
+        assert_eq!(v["disc_id_en_memoire"], "disque-A");
+        assert_eq!(v["zones"], json!([7]));
+
+        assert!(
+            m.disque_garde().is_some_and(|g| Arc::ptr_eq(&g, &a)),
+            "A a été libéré : la zone qui le jouait est coupée"
+        );
+        let f = FournisseurCd {
+            lecteur: l.clone(),
+            memoire: Some(m.clone()),
+        };
+        let mut flux = f.ouvrir(&source_id("disque-A", 2), 0).unwrap();
+        let mut lu = Vec::new();
+        flux.lecteur.read_to_end(&mut lu).unwrap();
+        assert_eq!(lu, contenu_des_secteurs(300, 800), "A n'est plus lisible");
+        assert!(
+            hote.arrets.lock().await.is_empty(),
+            "une zone a été arrêtée"
+        );
+        assert!(hote.files.lock().await.is_empty(), "une file a été posée");
+
+        // La zone 7 passe à autre chose : plus rien ne joue A, B se charge.
+        hote.sources.lock().await.insert(7, "radio".into());
+        let (code, v) = appel(router(e.clone()), "POST", "/memoire/charger", None).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert_eq!(v["chargement"]["disc_id"], disc_id(&toc));
+        m.liberer();
+    }
+
+    /// #6596 — les refus disent pourquoi, et un chargement qui échoue (disque
+    /// retiré en route) l'annonce : `fin` = `ejecte`, mémoire rendue.
+    #[tokio::test]
+    async fn charger_en_memoire_refuse_ou_echoue_en_le_disant() {
+        // Sans chargement en mémoire (greffon ancien) : 404.
+        let (e, _) = etat(simule(), Arc::new(SansReseau));
+        let (code, v) = appel(router(e), "POST", "/memoire/charger", None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert_eq!(v["error"], "memoire_indisponible");
+
+        // Réglage coupé : 409, rien n'est lancé.
+        let l = Arc::new(LecteurSimule::new(petite_toc()));
+        let (e, hote, m, _rx) = banc_memoire(l.clone(), false).await;
+        let (code, v) = appel(router(e.clone()), "POST", "/memoire/charger", None).await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(v["error"], "memoire_desactivee");
+        assert!(m.courant().is_none());
+        assert_eq!(l.appels(), 0);
+        rien_n_a_bouge(&e, &hote).await;
+
+        // Lecteur vide : 409 aucun_disque.
+        let l = Arc::new(LecteurSimule::new(petite_toc()));
+        l.ejecter();
+        let (e, _, m, _rx) = banc_memoire(l, true).await;
+        let (code, v) = appel(router(e), "POST", "/memoire/charger", None).await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(v["error"], "aucun_disque");
+        assert!(m.courant().is_none());
+
+        // Retiré pendant le chargement : l'échec est annoncé.
+        let l = Arc::new(LecteurSimule::new(petite_toc()));
+        l.ejecter_apres(3);
+        let (e, hote, m, mut rx) = banc_memoire(l, true).await;
+        let (code, _) = appel(router(e.clone()), "POST", "/memoire/charger", None).await;
+        assert_eq!(code, StatusCode::OK);
+        let evs = evenements_du_chargement(&mut rx).await;
+        let (t, d) = evs.last().unwrap();
+        assert_eq!(t, crate::memoire::EVT_TERMINE);
+        assert_eq!(d["fin"], "ejecte", "{d}");
+        assert_eq!(
+            (d["octets_ram"].clone(), d["octets_fichier"].clone()),
+            (json!(0), json!(0))
+        );
+        let (_, v) = appel(router(e.clone()), "GET", "/memoire", None).await;
+        assert_eq!(v["chargement"]["fin"], "ejecte", "{v}");
+        rien_n_a_bouge(&e, &hote).await;
+        m.liberer();
+    }
+
     /// Témoin 8 — les routes rendent la bonne forme.
     #[tokio::test]
     async fn etat_rend_le_lecteur_et_la_presence() {
@@ -725,6 +1151,48 @@ mod tests {
         assert_eq!(code, StatusCode::CONFLICT);
         assert_eq!(v["error"], "aucun_disque");
         assert_eq!(l.ejections(), 1);
+    }
+
+    /// #6410 — le disque est ENTIER en mémoire : l'éjection passe sans
+    /// confirmation, n'arrête aucune zone et ne rend pas la mémoire.
+    #[tokio::test]
+    async fn ejecter_un_disque_entier_en_memoire_ne_coupe_pas_la_lecture() {
+        use crate::memoire::{Fin, Reglages};
+        use crate::toc::PisteToc;
+        let p = |numero, debut| PisteToc {
+            numero,
+            debut,
+            audio: true,
+        };
+        let toc = Toc::nouvelle(vec![p(1, 0), p(2, 300)], 600).unwrap();
+        let l = Arc::new(LecteurSimule::new(toc.clone()));
+        let (mut e, hote) = etat(Some(l.clone()), Arc::new(SansReseau));
+        let m = Arc::new(MemoireCd::new(Reglages {
+            actif: true,
+            plafond_octets: u64::MAX,
+        }));
+        e.memoire = Some(m.clone());
+        let (code, _) = appel(
+            router(e.clone()),
+            "POST",
+            "/jouer",
+            Some(json!({"zone_id": 3})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let ld: Arc<dyn LecteurDisque> = l.clone();
+        let c = m.chargement(&ld, &toc, &disc_id(&toc), 0, 0).unwrap();
+        assert_eq!(c.attendre_la_fin(), Some(Fin::Termine));
+
+        let (code, v) = appel(router(e.clone()), "POST", "/ejecter", None).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert_eq!(v["zones_arretees"], json!([]));
+        assert_eq!(v["lecture_continue"], json!([3]));
+        assert_eq!(l.ejections(), 1);
+        assert!(hote.arrets.lock().await.is_empty(), "la zone joue encore");
+        assert!(e.zones.lock().await.contains(&3));
+        assert!(m.disque_complet().is_some(), "mémoire gardée");
+        m.liberer();
     }
 
     /// Une zone joue le disque : sans confirmation, REFUS qui nomme la zone,

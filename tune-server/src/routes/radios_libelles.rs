@@ -134,6 +134,16 @@ pub fn enrichir_station(station: &mut Value, lang: &str) {
         .and_then(code_pays)
     {
         objet.insert("country_code".into(), Value::String(code.into()));
+    } else if let Some(code) = objet
+        .get("country")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|c| c.len() == 2 && c.chars().all(|ch| ch.is_ascii_alphabetic()))
+    {
+        // #6516 — l'annuaire v2 écrit déjà le pays en code ISO (`FR`) : une
+        // station ajoutée depuis l'annuaire le garde tel quel.
+        let code = code.to_ascii_uppercase();
+        objet.insert("country_code".into(), Value::String(code));
     }
     if let Some(cle) = objet
         .get("genre")

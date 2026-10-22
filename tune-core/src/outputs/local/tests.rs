@@ -695,6 +695,11 @@ fn pure_sans_traitement_arme_dit_qu_il_n_y_a_rien_a_contourner() {
 
 /// #4176 — témoin : avec un égaliseur armé, PURE contourne vraiment, et le
 /// contrat le dit toujours.
+///
+/// ⚠️ #6522 — un égaliseur DANS la chaîne avec PURE allumé est un état que
+/// l'orchestrateur ne produit pas (PURE vide la chaîne). Ce test ne garde que
+/// la lecture de la chaîne ; l'état réel est gardé par
+/// `orchestrator/verdict_pure_reglages_6522_tests.rs`.
 #[test]
 fn pure_avec_un_egaliseur_arme_le_contourne_toujours() {
     let status = runtime_contract(true, false, 1000, Some(test_eq()), true);
@@ -2655,7 +2660,7 @@ fn native_windows_preparation_keeps_identity_pcm_out_of_float() {
         let convolver = std::sync::Mutex::new(None);
         let crossfeed = std::sync::Mutex::new(None);
         let pure = AtomicBool::new(false);
-        let prepared = prepare_windows_native_pcm(
+        let prepared = prepare_windows_native_pcm_a_voies_egales(
             &source,
             bit_depth,
             2,
@@ -2667,6 +2672,7 @@ fn native_windows_preparation_keeps_identity_pcm_out_of_float() {
             &crossfeed,
             &pure,
             &AtomicBool::new(false),
+            None,
         )
         .expect("fenêtre PCM complète");
         assert!(prepared.bit_perfect);
@@ -2687,7 +2693,7 @@ fn native_windows_preparation_forces_dop_onto_the_raw_branch() {
         176400, 0.3, 0.3,
     )));
     let pure = AtomicBool::new(false);
-    let prepared = prepare_windows_native_pcm(
+    let prepared = prepare_windows_native_pcm_a_voies_egales(
         &source,
         24,
         2,
@@ -2699,6 +2705,7 @@ fn native_windows_preparation_forces_dop_onto_the_raw_branch() {
         &crossfeed,
         &pure,
         &AtomicBool::new(false),
+        None,
     )
     .expect("DoP complet");
     assert!(prepared.dop);
@@ -2719,7 +2726,7 @@ fn native_windows_preparation_marks_processed_pcm_as_not_bitperfect() {
     let convolver = std::sync::Mutex::new(None);
     let crossfeed = std::sync::Mutex::new(None);
     let pure = AtomicBool::new(false);
-    let prepared = prepare_windows_native_pcm(
+    let prepared = prepare_windows_native_pcm_a_voies_egales(
         &source,
         24,
         2,
@@ -2731,6 +2738,7 @@ fn native_windows_preparation_marks_processed_pcm_as_not_bitperfect() {
         &crossfeed,
         &pure,
         &AtomicBool::new(false),
+        None,
     )
     .expect("PCM complet");
     assert!(!prepared.dop);
@@ -4225,6 +4233,174 @@ fn le_preampli_garde_vaut_pour_les_pistes_suivantes_5215() {
     assert!(!sortie.has_eq(), "l'égaliseur ne compte pas comme actif");
 }
 
+/// #6211, décision de Bertrand du 21/10 (« jamais de hausse » vaut PARTOUT,
+/// radio comprise ; elle remplace celle du 19/10 sur ce point). Radio jouée
+/// en local, préampli négatif, coupure de l'égaliseur : le niveau ne monte
+/// jamais. La courbe s'efface à niveau constant, puis le préampli reste
+/// gardé jusqu'au prochain geste, sans marche ; le neutre reste monté.
+#[test]
+fn radio_preampli_negatif_coupure_de_l_egaliseur_le_niveau_ne_monte_jamais_6211() {
+    let sortie = LocalOutput::new("Casque".to_string());
+    sortie.set_compensation_de_niveau(false);
+    sortie.set_flux_sans_fin(true);
+    let eq = egaliseur_a_preampli_negatif_5215();
+    let preampli = eq.preamp_db(0).expect("préampli chiffré");
+    assert!(
+        preampli < -10.0,
+        "prémisse : grosse réserve ({preampli} dB)"
+    );
+    let plafond = (AMPLITUDE_5215 * 10f64.powf(preampli / 20.0)) as f32 * 1.012;
+    let mut trame = 0;
+    sortie.replace_eq_live(Some(eq));
+    let mut signal = jouer_5215(&sortie, &mut trame, 60);
+    sortie.replace_eq_live(None);
+    let coupure = signal.len();
+    // 3 s de rampe = 300 paquets de 10 ms ; 100 de marge.
+    signal.extend(jouer_5215(&sortie, &mut trame, 400));
+    for (i, fenetre) in signal[coupure..].chunks(4800).enumerate() {
+        let crete = crete_5215(fenetre);
+        assert!(
+            crete <= plafond,
+            "radio, égaliseur coupé, préampli {preampli:.2} dB : le niveau est monté \
+             (crête {crete} > {plafond} à {:.1} s de la coupure) — jamais de hausse \
+             (décision du 21/10)",
+            i as f64 * 0.1
+        );
+    }
+    let marche = plus_grande_marche_5215(&signal);
+    assert!(
+        marche <= MARCHE_MAX_5215,
+        "une marche de {marche} après la coupure (seuil {MARCHE_MAX_5215})"
+    );
+    assert!(
+        sortie.eq.lock().unwrap().is_some(),
+        "le préampli négatif reste gardé dans la chaîne de la radio"
+    );
+}
+
+/// #6211 — sur une PISTE, rien ne change : la règle #5215 garde le
+/// préampli après la coupure, même bien au-delà de la rampe des radios.
+#[test]
+fn sur_une_piste_le_preampli_reste_garde_au_dela_de_l_extinction_6211() {
+    let sortie = LocalOutput::new("Casque".to_string());
+    sortie.set_compensation_de_niveau(false);
+    sortie.set_flux_sans_fin(false);
+    let eq = egaliseur_a_preampli_negatif_5215();
+    let preampli = eq.preamp_db(0).expect("préampli chiffré");
+    sortie.set_eq(Some(eq));
+    let attendu = (AMPLITUDE_5215 * 10f64.powf(preampli / 20.0)) as f32;
+    let mut trame = 0;
+    let mut signal = jouer_5215(&sortie, &mut trame, 20);
+    sortie.replace_eq_live(None);
+    signal.extend(jouer_5215(&sortie, &mut trame, 350));
+    let crete = crete_5215(&signal[signal.len() - 4800..]);
+    assert!(
+        (crete / attendu - 1.0).abs() < 0.012,
+        "piste, égaliseur coupé : crête {crete}, attendu {attendu} (préampli gardé)"
+    );
+}
+
+/// #6524 (b), arbitrage de Bertrand du 21/10 : « jamais de hausse ».
+/// Préampli négatif (le cas normal), coupure de l'égaliseur : la courbe
+/// s'efface, puis RIEN ne fait remonter le niveau, ni la fin du fondu, ni
+/// l'extinction, ni les pistes suivantes. Le gain reste gardé jusqu'au
+/// prochain geste de l'auditeur, et la sortie dit « DSP appliqué », ce qui
+/// est vrai.
+#[test]
+fn preampli_negatif_coupure_de_l_egaliseur_le_niveau_ne_monte_jamais_6524() {
+    let sortie = LocalOutput::new("Haut-parleurs".to_string());
+    sortie.set_compensation_de_niveau(false);
+    sortie.set_flux_sans_fin(false);
+    let eq = egaliseur_a_preampli_negatif_5215();
+    let preampli = eq.preamp_db(0).expect("préampli chiffré");
+    assert!(
+        preampli < -1.0,
+        "prémisse : préampli négatif ({preampli} dB)"
+    );
+    let plafond = (AMPLITUDE_5215 * 10f64.powf(preampli / 20.0)) as f32 * 1.012;
+    sortie.set_eq(Some(eq));
+    let mut trame = 0;
+    let mut signal = jouer_5215(&sortie, &mut trame, 20);
+    sortie.replace_eq_live(None);
+    let coupure = signal.len();
+    // 4 s sur la piste coupée : fondu de la courbe (0,3 s) et bien au-delà
+    // de l'extinction (3 s) ; puis deux pistes suivantes, l'égaliseur coupé.
+    signal.extend(jouer_5215(&sortie, &mut trame, 400));
+    for _ in 0..2 {
+        sortie.set_eq(None);
+        signal.extend(jouer_5215(&sortie, &mut trame, 100));
+    }
+    for (i, fenetre) in signal[coupure..].chunks(4800).enumerate() {
+        let crete = crete_5215(fenetre);
+        assert!(
+            crete <= plafond,
+            "égaliseur coupé, préampli {preampli:.2} dB : le niveau est monté \
+             (crête {crete} > {plafond} à {:.1} s de la coupure) — jamais de \
+             hausse (#6524 b, arbitrage du 21/10)",
+            i as f64 * 0.1
+        );
+    }
+    let marche = plus_grande_marche_5215(&signal);
+    assert!(
+        marche <= MARCHE_MAX_5215,
+        "une marche de {marche} après la coupure (seuil {MARCHE_MAX_5215})"
+    );
+    assert!(
+        sortie.eq.lock().unwrap().is_some(),
+        "le préampli négatif reste gardé dans la chaîne"
+    );
+    assert_eq!(
+        local_dsp_runtime_state(
+            &sortie.eq,
+            &sortie.convolver,
+            &sortie.crossfeed,
+            &sortie.pure_bypass,
+            &sortie.mono_downmix,
+            false,
+        ),
+        OutputDspState::Applied,
+        "un gain agit encore : « DSP appliqué » est vrai"
+    );
+}
+
+/// #6524 (b) — un égaliseur coupé devenu l'identité (fondu fini, rien de
+/// gardé) mais pas encore retiré par la boucle ne touche pas le signal : le
+/// verdict ne doit pas dire « DSP appliqué » (`eq.is_some()` le disait).
+#[test]
+fn un_neutre_au_repos_n_est_pas_un_dsp_applique_6524() {
+    let profil = crate::audio::eq::EqProfile {
+        enabled: true,
+        bands: vec![crate::audio::eq::EqBandSpec {
+            freq: 8000.0,
+            gain: -6.0,
+            q: 1.0,
+            band_type: "peak".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let eq = crate::audio::eq::EqProcessor::new(&profil, TAUX_5215, 2);
+    let mut neutre = crate::audio::eq::EqProcessor::prendre_la_releve(None, Some(eq))
+        .expect("la coupure en vol rend un neutre qui porte le fondu");
+    let mut bloc = vec![0.25_f32; TAUX_5215 as usize]; // 0,5 s stéréo
+    neutre.process_interleaved(&mut bloc);
+    assert!(neutre.est_neutre_au_repos(), "prémisse : identité exacte");
+    let sortie = LocalOutput::new("Haut-parleurs".to_string());
+    *sortie.eq.lock().unwrap() = Some(neutre);
+    assert_eq!(
+        local_dsp_runtime_state(
+            &sortie.eq,
+            &sortie.convolver,
+            &sortie.crossfeed,
+            &sortie.pure_bypass,
+            &sortie.mono_downmix,
+            false,
+        ),
+        OutputDspState::Inactive,
+        "un neutre au repos est l'identité : pas de « DSP appliqué » (#6524 b)"
+    );
+}
+
 /// Sous PURE, rien ne reste monté : le préampli gardé n'est pas reporté.
 #[test]
 fn sous_pure_le_preampli_garde_n_est_pas_reporte_5215() {
@@ -4475,13 +4651,18 @@ async fn bascule_au_volume_5215(volume: f64, activer: bool) -> (Vec<f32>, f32, f
     let mut dac = jouer_avec_anneau_5227(&sortie, &mut anneau, &mut trame, LATENCE_5227 + 31);
     let avant = crete_5215(&dac[dac.len() - 1200..]);
     sortie.replace_eq_live(activer.then(egaliseur_compensable_5227));
+    // Le régime d'arrivée se lit à la fin du fondu de la courbe (30 paquets
+    // après la bascule, au DAC) : au-delà, une coupure retire la part du
+    // gain gardé supérieure à 1 (#6524 b, jamais de hausse). La suite est
+    // jouée pour la marche.
     dac.extend(jouer_avec_anneau_5227(
         &sortie,
         &mut anneau,
         &mut trame,
-        LATENCE_5227 + 60,
+        LATENCE_5227 + 29,
     ));
     let fin = crete_5215(&dac[dac.len() - 1200..]);
+    dac.extend(jouer_avec_anneau_5227(&sortie, &mut anneau, &mut trame, 31));
     (dac, avant, fin)
 }
 

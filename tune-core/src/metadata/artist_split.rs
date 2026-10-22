@@ -392,6 +392,68 @@ pub fn primary_artist(raw: &str, extra_allowlist: &[String], split_risky: bool) 
         .unwrap_or_else(|| raw.trim().to_string())
 }
 
+/// Words that mark an ensemble rather than a person. Used only to order
+/// portrait candidates: a conductor or soloist is tried before the orchestra
+/// that shares the credit.
+const ENSEMBLE_MARKERS: &[&str] = &[
+    "orchestra",
+    "orchestre",
+    "philharmon",
+    "symphony",
+    "symphon",
+    "sinfoni",
+    "filarmon",
+    "baroque",
+    "trio",
+    "quartet",
+    "quatuor",
+    "quintet",
+    "quintette",
+    "ensemble",
+    "choir",
+    "choeur",
+    "chœur",
+    "chorale",
+    "chorus",
+    "consort",
+    "kammerorchester",
+    "kamerorkest",
+    "musiciennes",
+    "musiciens",
+    "solisten",
+];
+
+fn est_ensemble(name: &str) -> bool {
+    let folded = fold_diacritics(name).to_lowercase();
+    ENSEMBLE_MARKERS
+        .iter()
+        .any(|marker| folded.contains(marker))
+}
+
+/// Who to illustrate when the stored artist is a concatenated credit.
+///
+/// Image sources match one person or one ensemble, never
+/// `"Antonio Vivaldi; Janine Jansen"`. A leading `;` credit is the composer
+/// (already its own artist row), so the portrait comes from the performers,
+/// and a person is tried before the orchestra beside them:
+/// `"Anton Bruckner; Bernard Haitink & Wiener Philharmoniker"` → Haitink,
+/// then the Philharmoniker. An unsplit name returns nothing.
+pub fn membres_pour_portrait(raw: &str, extra_allowlist: &[String]) -> Vec<String> {
+    let analysis = analyze_artist_credit(raw, extra_allowlist, true);
+    if analysis.tokens.len() < 2 {
+        return Vec::new();
+    }
+    let mut tokens = analysis.tokens;
+    if analysis.separators.contains(&Separator::Semicolon) {
+        tokens.remove(0);
+    }
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    tokens.sort_by_key(|token| est_ensemble(token));
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,5 +693,35 @@ mod tests {
             }
         }
         assert!(vus > 10, "le balayage doit trouver des cas ({vus})");
+    }
+
+    #[test]
+    fn portrait_des_credits_classiques_prend_l_interprete() {
+        assert_eq!(
+            membres_pour_portrait(
+                "Anton Bruckner; Bernard Haitink & Wiener Philharmoniker",
+                &[]
+            ),
+            vec!["Bernard Haitink", "Wiener Philharmoniker"]
+        );
+        assert_eq!(
+            membres_pour_portrait("Antonio Vivaldi; Jacques Loussier Trio", &[]),
+            vec!["Jacques Loussier Trio"]
+        );
+        assert_eq!(
+            membres_pour_portrait("Antonio Vivaldi; Janine Jansen", &[]),
+            vec!["Janine Jansen"]
+        );
+        assert_eq!(
+            membres_pour_portrait("Antonio Vivaldi; Rachel Podger, Brecon Baroque", &[]),
+            vec!["Rachel Podger", "Brecon Baroque"]
+        );
+    }
+
+    #[test]
+    fn un_nom_simple_ou_un_groupe_allowliste_n_a_pas_de_membre() {
+        assert!(membres_pour_portrait("Keith Jarrett", &[]).is_empty());
+        assert!(membres_pour_portrait("Simon & Garfunkel", &[]).is_empty());
+        assert!(membres_pour_portrait("Earth, Wind & Fire", &[]).is_empty());
     }
 }

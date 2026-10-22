@@ -1,4 +1,4 @@
-use super::{DELAI_SILENCE_ETABLI, PositionPoller, decisions};
+use super::{DELAI_SILENCE_ETABLI, PositionPoller, TAILLE_MAXIMALE_D_UNE_SONDE, decisions};
 use crate::db::migrations::run_migrations;
 use crate::db::sqlite::SqliteDb;
 use crate::db::zone_repo::ZoneRepo;
@@ -216,6 +216,29 @@ async fn la_zone_navigateur_sans_onglet_cesse_detre_annoncee() {
     assert!(fatal, "rien ne se rétablira tout seul");
 }
 
+/// #6066 — par la vraie porte : l'iPhone (AVPlayer) a sondé le flux, deux
+/// octets, puis l'a refusé. Rien ne joue ; la zone ne doit pas rester
+/// annoncée « en lecture » pour autant.
+#[tokio::test]
+async fn la_zone_navigateur_seulement_sondee_cesse_detre_annoncee_6066() {
+    let mut banc = Banc::monter().await;
+    let zone_id = banc.zone_en_lecture("Ce téléphone", "browser", 2).await;
+    let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+
+    assert!(
+        banc.poller.abandonner_lecture_sans_destination(&zs).await,
+        "#6066 : deux octets de sonde ont tenu la lecture pour reçue"
+    );
+    assert_eq!(
+        banc.playback.get_state(zone_id).await.state,
+        PlayState::Stopped
+    );
+    let (message, _) = banc
+        .erreur(zone_id)
+        .expect("l'utilisateur doit être prévenu");
+    assert!(message.starts_with("zone_browser_unattended:"), "{message}");
+}
+
 /// #2588 — l'abandon ne doit pas emporter l'explication du silence.
 ///
 /// L'arrêt fait retomber `output_reach` à `"ok"`, et le bandeau « aucun
@@ -309,7 +332,23 @@ fn le_doute_profite_toujours_a_la_lecture() {
         "flux inconnu du streamer : ce n'est pas une preuve de silence"
     );
     assert!(
-        !abandon(Some(vieux), Some(1)),
-        "un seul octet servi suffit à prouver que quelqu'un écoute"
+        !abandon(Some(vieux), Some(TAILLE_MAXIMALE_D_UNE_SONDE + 1)),
+        "au-delà d'une sonde, quelqu'un consomme le flux"
     );
+}
+
+/// #6066 — le cas du terrain : AVPlayer sonde `bytes=0-1` (deux octets), puis
+/// refuse le flux. Rien ne joue, et la zone restait annoncée « en lecture »
+/// sans fin, faute d'un zéro exact.
+#[test]
+fn une_sonde_de_plage_ne_fait_pas_une_destination_6066() {
+    use decisions::lecture_sans_destination_abandonnee as abandon;
+    let vieux = DELAI_SILENCE_ETABLI + Duration::from_secs(1);
+    for sonde in [1, 2, 4096, TAILLE_MAXIMALE_D_UNE_SONDE] {
+        assert!(
+            abandon(Some(vieux), Some(sonde)),
+            "#6066 : {sonde} octets tirés par une sonde ont suffi à tenir la lecture \
+             pour reçue, alors que rien ne joue"
+        );
+    }
 }

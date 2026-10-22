@@ -13,7 +13,7 @@
 //! | `DELETE /playlists/{id}/items/{item_id}?version=`    | idem, requête comprise                       |
 //! | `PUT /playlists/{id}/order` `{ item_ids, version }`  | idem                                         |
 //! | `POST /playlists/{id}/resolve`                       | `GET /playlists/{id}`, résolu ICI            |
-//! | `POST /playlists/{id}/play` `{ zone_id }`            | `GET /playlists/{id}`, résolu et joué ICI    |
+//! | `POST /playlists/{id}/play` `{ zone_id, from_item_id?, item_ids? }` | `GET /playlists/{id}`, résolu et joué ICI |
 //! | `GET /recoverable-playlists`                         | idem                                         |
 //! | `GET /recoverable-playlists/{id}`                    | idem                                         |
 //! | `DELETE /recoverable-playlists/{id}`                 | idem (« je n'en veux pas »)                  |
@@ -79,6 +79,14 @@ pub const CODE_ZONE_REQUISE: &str = "circle.zone_required";
 pub const CODE_RIEN_A_JOUER: &str = "circle.nothing_playable";
 /// `play` : la zone n'a pas pu lancer la lecture.
 pub const CODE_LECTURE_ECHOUEE: &str = "circle.play_failed";
+/// `play` : `from_item_id` et `item_ids` ensemble, ou l'un des deux mal formé.
+pub const CODE_SELECTION_INVALIDE: &str = "circle.invalid_selection";
+/// `play` : un `item_id` désigné n'est plus (ou pas) dans la playlist — un
+/// autre membre l'a retiré entre-temps. Rien n'est joué : l'écran relit.
+pub const CODE_MORCEAU_INCONNU: &str = "circle.unknown_item";
+/// `play` `from_item_id` : le morceau de départ est introuvable chez
+/// l'appelant. Rien n'est joué : on ne commence pas sur un autre titre.
+pub const CODE_MORCEAU_INJOUABLE: &str = "circle.item_not_playable";
 /// `copy` : la playlist locale n'a pas pu être écrite ; le droit de
 /// récupération est gardé.
 pub const CODE_COPIE_ECHOUEE: &str = "circle.copy_failed";
@@ -186,7 +194,13 @@ async fn lire(State(e): State<Arc<Collaboratif>>, Path(id): Path<String>) -> Res
     if !identifiant_valide(&id) {
         return introuvable();
     }
-    en_reponse(lire_la_playlist(&e.relais, &id).await)
+    // #6688 — la fiche d'une playlist de cercle qui suit une playlist locale
+    // porte `follow`.
+    crate::suivi::avec_le_suivi(
+        &e.relais.reglages(),
+        &id,
+        lire_la_playlist(&e.relais, &id).await,
+    )
 }
 
 async fn lire_la_playlist(relais: &Relais, id: &str) -> Issue {
@@ -607,16 +621,103 @@ async fn resolue(e: &Collaboratif, issue: Issue) -> Result<(Value, Vec<Resolu>),
     let Some(playlist) = playlist.filter(|p| p["items"].is_array()) else {
         return Err(Box::new(en_reponse(issue)));
     };
+    let items: Vec<&Value> = playlist["items"].as_array().into_iter().flatten().collect();
+    let resolus = resoudre_les_morceaux(e, &items).await;
+    Ok((playlist, resolus))
+}
+
+/// Résout CES morceaux chez l'appelant, dans cet ordre.
+async fn resoudre_les_morceaux(e: &Collaboratif, items: &[&Value]) -> Vec<Resolu> {
     let services = e.resolveur.services_utilisables().await;
     let mut resolus = Vec::new();
-    for item in playlist["items"].as_array().into_iter().flatten() {
+    for item in items {
         let trouvee = e
             .resolveur
             .resoudre(&Reference::lire(item), &services)
             .await;
         resolus.push((item["item_id"].clone(), trouvee));
     }
-    Ok((playlist, resolus))
+    resolus
+}
+
+/// Un `item_id` du cloud sous une forme comparable : il est opaque (nombre
+/// ou texte), et l'écran peut le renvoyer sous l'une ou l'autre.
+fn cle_de_morceau(v: &Value) -> Option<String> {
+    match v {
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// Ce que `play` doit jouer (web#2219).
+#[derive(Debug, PartialEq, Eq)]
+enum Choix {
+    /// Toute la playlist (corps sans sélection : le contrat d'origine).
+    Tout,
+    /// La playlist À PARTIR de ce morceau ; la suite part en file.
+    Depuis(String),
+    /// Ces morceaux, dans cet ordre (« Lire ce titre seulement », lecture
+    /// aléatoire mélangée par l'écran).
+    Seulement(Vec<String>),
+}
+
+fn choix_de_lecture(demande: &Value) -> Result<Choix, Box<Response>> {
+    let invalide = || {
+        Box::new(refus(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({ "code": CODE_SELECTION_INVALIDE }),
+        ))
+    };
+    let depuis = demande.get("from_item_id").filter(|v| !v.is_null());
+    let seulement = demande.get("item_ids").filter(|v| !v.is_null());
+    match (depuis, seulement) {
+        (None, None) => Ok(Choix::Tout),
+        (Some(_), Some(_)) => Err(invalide()),
+        (Some(d), None) => cle_de_morceau(d).map(Choix::Depuis).ok_or_else(invalide),
+        (None, Some(l)) => {
+            let liste = l
+                .as_array()
+                .filter(|l| !l.is_empty() && l.len() <= MORCEAUX_MAX);
+            let Some(liste) = liste else {
+                return Err(invalide());
+            };
+            liste
+                .iter()
+                .map(cle_de_morceau)
+                .collect::<Option<Vec<_>>>()
+                .map(Choix::Seulement)
+                .ok_or_else(invalide)
+        }
+    }
+}
+
+/// Les morceaux que `choix` désigne, dans l'ordre où les jouer. `Err` : les
+/// identifiants qui ne sont pas (ou plus) dans la playlist.
+fn morceaux_choisis<'a>(items: &'a [Value], choix: &Choix) -> Result<Vec<&'a Value>, Vec<String>> {
+    let rang = |cle: &str| {
+        items
+            .iter()
+            .position(|i| cle_de_morceau(&i["item_id"]).as_deref() == Some(cle))
+    };
+    match choix {
+        Choix::Tout => Ok(items.iter().collect()),
+        Choix::Depuis(cle) => rang(cle)
+            .map(|r| items[r..].iter().collect())
+            .ok_or_else(|| vec![cle.clone()]),
+        Choix::Seulement(cles) => {
+            let inconnus: Vec<String> =
+                cles.iter().filter(|c| rang(c).is_none()).cloned().collect();
+            if !inconnus.is_empty() {
+                return Err(inconnus);
+            }
+            Ok(cles
+                .iter()
+                .filter_map(|c| rang(c))
+                .map(|r| &items[r])
+                .collect())
+        }
+    }
 }
 
 /// `(item_id, ce qu'il est devenu chez l'appelant)`.
@@ -667,6 +768,20 @@ fn en_file(trouvee: &Trouvee) -> Option<QueueInput> {
     }
 }
 
+/// `POST /playlists/{id}/play` `{ zone_id, from_item_id?, item_ids? }` :
+/// la file de la zone est REMPLACÉE par les morceaux jouables chez
+/// l'appelant, et le premier part.
+///
+/// - sans sélection : toute la playlist, dans son ordre ;
+/// - `from_item_id` : la playlist à partir de ce morceau, la suite en file
+///   (web#2219) ; un départ introuvable chez l'appelant est refusé
+///   ([`CODE_MORCEAU_INJOUABLE`]) plutôt que de commencer sur un autre titre ;
+/// - `item_ids` : ces morceaux, dans l'ordre donné (« Lire ce titre
+///   seulement », lecture aléatoire mélangée par l'écran) ;
+/// - les deux ensemble, ou une liste vide : [`CODE_SELECTION_INVALIDE`] ;
+///   un identifiant absent de la playlist : [`CODE_MORCEAU_INCONNU`].
+///
+/// `missing` et `resolution` ne parlent que des morceaux choisis.
 async fn jouer(
     State(e): State<Arc<Collaboratif>>,
     Path(id): Path<String>,
@@ -675,18 +790,43 @@ async fn jouer(
     if !identifiant_valide(&id) {
         return introuvable();
     }
-    let Some(zone_id) = lu(&corps)["zone_id"].as_i64() else {
+    let demande = lu(&corps);
+    let Some(zone_id) = demande["zone_id"].as_i64() else {
         return refus(
             StatusCode::UNPROCESSABLE_ENTITY,
             json!({ "code": CODE_ZONE_REQUISE }),
         );
     };
-    let (_, resolus) = match resolue(&e, lire_la_playlist(&e.relais, &id).await).await {
-        Ok(v) => v,
+    let choix = match choix_de_lecture(&demande) {
+        Ok(c) => c,
         Err(r) => return *r,
     };
+    // La playlist est relue au cloud à chaque fois (404 = plus partagée) ;
+    // seuls les morceaux choisis sont résolus : « Lire ce titre seulement »
+    // ne cherche pas les 2 000 autres chez les services.
+    let issue = lire_la_playlist(&e.relais, &id).await;
+    let Some(playlist) = playlist_de_l_issue(&issue) else {
+        return en_reponse(issue);
+    };
+    let items = playlist["items"].as_array().cloned().unwrap_or_default();
+    let choisis = match morceaux_choisis(&items, &choix) {
+        Ok(v) => v,
+        Err(inconnus) => {
+            return refus(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({ "code": CODE_MORCEAU_INCONNU, "unknown": inconnus }),
+            );
+        }
+    };
+    let resolus = resoudre_les_morceaux(&e, &choisis).await;
     let rendu = bilan(&resolus);
     let manquants = manquants(&resolus);
+    if matches!(choix, Choix::Depuis(_)) && resolus.first().is_some_and(|(_, t)| t.is_none()) {
+        return refus(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({ "code": CODE_MORCEAU_INJOUABLE, "missing": manquants, "resolution": rendu }),
+        );
+    }
     let file: Vec<QueueInput> = resolus
         .iter()
         .filter_map(|(_, t)| t.as_ref().and_then(en_file))
@@ -772,7 +912,13 @@ async fn renoncer(State(e): State<Arc<Collaboratif>>, Path(id): Path<String>) ->
 /// défaut), comme les playlists créées par un greffon WASM
 /// (`plugins_host::profil_actif`).
 fn profil_actif(e: &Collaboratif) -> i64 {
-    SettingsRepo::with_backend(e.resolveur.backend().clone())
+    profil_actif_de(e.resolveur.backend())
+}
+
+/// [`profil_actif`], depuis la base seule (#6688 : le lien de suivi désigne
+/// une playlist de ce profil).
+pub(crate) fn profil_actif_de(backend: &Arc<dyn tune_core::db::backend::DbBackend>) -> i64 {
+    SettingsRepo::with_backend(backend.clone())
         .get("active_profile_id")
         .ok()
         .flatten()
@@ -801,7 +947,8 @@ fn en_ligne_de_playlist(trouvee: &Trouvee) -> Option<EntryContent> {
 /// locale déjà commencée : `circle_copie_recuperable:{id de l'archive}` →
 /// identifiant de la playlist locale.
 ///
-/// C'est le SEUL état que T5 garde ici, et il ne dit rien du cercle : deux
+/// Avec le lien de suivi de #6688 ([`crate::suivi::PREFIXE_SUIVI`]), c'est le
+/// seul état que T5 garde ici, et il ne dit rien du cercle : deux
 /// identifiants, pour qu'une seconde copie complète la même playlist au lieu
 /// d'en créer une autre. Il vit dans `settings`, comme le stockage des
 /// greffons WASM, et disparaît quand l'archive est libérée. Il ne sert rien

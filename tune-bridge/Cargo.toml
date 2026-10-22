@@ -25,6 +25,17 @@ bytes = { workspace = true }
 dashmap = "6"
 reqwest = { workspace = true }
 dotenvy = { workspace = true }
+async-trait = { workspace = true }
+# Laissez-passer d'ecoute a distance (#6603) : la meme regle de verification
+# que le serveur, sans dependre de tune-core.
+tune-laissez-passer = { path = "../tune-laissez-passer" }
 
 [dev-dependencies]
 tempfile = "3"
+# Le faux site des tests signe avec les cles de test des vecteurs.
+tune-laissez-passer = { path = "../tune-laissez-passer", features = ["fabrique"] }
+# #6564 : un faux serveur Tune sur une vraie WebSocket, et l'ancien format
+# base64, dans les tests de bout en bout du pont. #6603 : aussi un vrai
+# client WebSocket pour verifier la fermeture d'une session coupee.
+tokio-tungstenite = "0.26"
+base64 = "0.22"

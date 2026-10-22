@@ -64,7 +64,7 @@ async fn autoriser(state: &AppState, id: &str, headers: &HeaderMap) -> Result<()
         headers,
     )
     .await?;
-    crate::premium_audio_plugins::require_installed(state, id)
+    crate::premium_audio_plugins::require_installed(state, id, headers)
 }
 
 fn settings(state: &AppState) -> SettingsRepo {

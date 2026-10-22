@@ -419,9 +419,7 @@ impl LibrespotDaemon {
             .spawn()
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    "librespot est introuvable : l'installer (macOS : brew install librespot) \
-                     ou indiquer son chemin dans TUNE_LIBRESPOT. Spotify Premium est exigé."
-                        .to_string()
+                    consigne_librespot_introuvable(std::env::consts::OS).to_string()
                 } else {
                     format!("librespot start ({binaire}): {e}")
                 }
@@ -662,9 +660,58 @@ pub fn build_wav_header() -> Vec<u8> {
     header
 }
 
+/// #6396 — la consigne quand `librespot` manque, pour le système où tourne
+/// le serveur. Tune ne livre ce binaire nulle part hors des images Docker :
+/// le message ne parlait que de macOS (`brew`), et un utilisateur Windows
+/// n'apprenait ni qu'il fallait un `librespot.exe`, ni où le déclarer.
+pub(crate) fn consigne_librespot_introuvable(os: &str) -> &'static str {
+    match os {
+        "macos" => {
+            "librespot est introuvable : Tune ne le livre pas. L'installer \
+             (brew install librespot) ou indiquer son chemin dans la variable \
+             TUNE_LIBRESPOT, puis redémarrer Tune. Spotify Premium est exigé."
+        }
+        "windows" => {
+            "librespot.exe est introuvable : Tune ne le livre pas sous Windows. \
+             Placer librespot.exe dans un dossier du PATH, ou indiquer son chemin \
+             complet dans la variable d'environnement TUNE_LIBRESPOT, puis \
+             redémarrer Tune. Spotify Premium est exigé."
+        }
+        _ => {
+            "librespot est introuvable : Tune ne le livre pas hors des images \
+             Docker. L'installer (paquet de la distribution ou cargo install \
+             librespot) ou indiquer son chemin dans la variable TUNE_LIBRESPOT, \
+             puis redémarrer Tune. Spotify Premium est exigé."
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6396 — un utilisateur Windows apprend qu'il lui faut un
+    /// `librespot.exe` et où le déclarer ; la consigne macOS reste à macOS.
+    #[test]
+    fn librespot_introuvable_la_consigne_suit_le_systeme_6396() {
+        let windows = consigne_librespot_introuvable("windows");
+        assert!(windows.contains("librespot.exe"), "{windows}");
+        assert!(windows.contains("PATH"), "{windows}");
+        assert!(windows.contains("TUNE_LIBRESPOT"), "{windows}");
+        assert!(
+            !windows.contains("brew"),
+            "pas de consigne macOS sous Windows : {windows}"
+        );
+        let linux = consigne_librespot_introuvable("linux");
+        assert!(!linux.contains("brew"), "{linux}");
+        assert!(linux.contains("TUNE_LIBRESPOT"), "{linux}");
+        let macos = consigne_librespot_introuvable("macos");
+        assert!(macos.contains("brew install librespot"), "{macos}");
+        for m in [windows, linux, macos] {
+            assert!(m.contains("Tune ne le livre pas"), "{m}");
+            assert!(m.contains("Spotify Premium"), "{m}");
+        }
+    }
 
     #[test]
     fn wav_header_size() {

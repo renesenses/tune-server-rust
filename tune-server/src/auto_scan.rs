@@ -109,7 +109,14 @@ pub fn build_track_from_metadata_opts(
     let album_artist_entry = match artist_repo.get_or_create(
         album_artist_name,
         album_artist_mbid,
-        meta.album_artist_sort.as_deref(),
+        // #6474 — ALBUMARTISTSORT, à défaut l'ARTISTSORT de la piste quand
+        // elle est de l'artiste de l'album.
+        tune_core::db::artist_repo::nom_de_tri_de_l_artiste_d_album(
+            meta.album_artist_sort.as_deref(),
+            meta.artist_sort.as_deref(),
+            album_artist_name,
+            track_artist_name,
+        ),
     ) {
         Ok(a) => {
             if let Some(ref mbid) = a.musicbrainz_id {
@@ -143,7 +150,8 @@ pub fn build_track_from_metadata_opts(
         match artist_repo.get_or_create(
             track_artist_name,
             meta.musicbrainz_artist_id.as_deref(),
-            None,
+            // #6474 — ARTISTSORT nourrit le nom de tri de l'artiste de la piste.
+            meta.artist_sort.as_deref(),
         ) {
             Ok(a) => Some(a),
             Err(e) => {
@@ -438,18 +446,21 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         };
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
-        // #6019 — le parcours est fini, la passe `stat` commence : sur un
-        // partage réseau, c'est la plus longue. L'écran garde le compte des
-        // fichiers repérés au lieu d'un badge sans chiffre.
-        event_bus.emit(
-            "library.scan.progress",
-            serde_json::json!({
-                "phase": "indexing",
-                "scanned": total_discovered as i64,
-                "added": 0i64,
-                "total": 0i64,
-            }),
-        );
+        // #6019, #6371 — le parcours est fini, la passe `stat` commence : sur
+        // un partage réseau, c'est la plus longue (des dizaines de minutes
+        // pour 550 000 pistes chez Tades). Elle s'annonce comme celle du scan
+        // manuel : vérifiés sur repérés, au départ, à la cadence du parcours
+        // et à la fin.
+        use crate::routes::system::scan::{avancement_du_prefiltre, dossier_de};
+        let annoncer_le_prefiltre = |verifies: usize, dossier: Option<String>| {
+            event_bus.emit(
+                "library.scan.progress",
+                avancement_du_prefiltre(verifies, total_discovered, dossier.as_deref()),
+            );
+        };
+        annoncer_le_prefiltre(0, files.first().and_then(|p| dossier_de(p)));
+        let prefiltre_verifies = std::sync::atomic::AtomicUsize::new(0);
+        let prefiltre_derniere_annonce = std::sync::Mutex::new(std::time::Instant::now());
 
         // NFC-normalized set of every path found on disk this scan. Used after
         // the scan to prune tracks whose files were deleted while the server was
@@ -510,6 +521,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             if crate::routes::system::scan::scan_cancel_requested() {
                 return false;
             }
+            let verifies = prefiltre_verifies.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Ok(mut derniere) = prefiltre_derniere_annonce.try_lock()
+                && derniere.elapsed() >= tune_core::scanner::walker::CADENCE_PROGRESSION_PARCOURS
+            {
+                *derniere = std::time::Instant::now();
+                annoncer_le_prefiltre(verifies, dossier_de(path));
+            }
             match crate::routes::system::scan::etat_du_fichier(path, &existing_tracks) {
                 EtatDuFichier::Inchange => false,
                 EtatDuFichier::DateAPreciser {
@@ -556,6 +574,10 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 .unwrap_or_else(|e| e.into_inner()),
         );
         let pre_skipped = total_discovered - files_to_scan.len();
+        annoncer_le_prefiltre(
+            prefiltre_verifies.load(Ordering::Relaxed),
+            files_to_scan.last().and_then(|p| dossier_de(p)),
+        );
 
         info!(
             total = total_discovered,
@@ -573,6 +595,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 "unchanged": pre_skipped,
                 "auto": true,
             }),
+        );
+        // #6371 — les inchangés sont faits : la barre devient déterminée tout
+        // de suite, comme au scan manuel, au lieu d'attendre le premier lot
+        // (aucun si rien n'a changé).
+        let premier_dossier = files_to_scan.first().and_then(|p| dossier_de(p));
+        event_bus.emit(
+            "library.scan.progress",
+            crate::routes::system::scan::debut_de_la_lecture(
+                pre_skipped,
+                total_discovered,
+                premier_dossier.as_deref(),
+            ),
         );
 
         let cache_dir = crate::routes::library::artwork_cache_dir();
@@ -1265,6 +1299,14 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // `emptied_roots` inclus depuis #1943 : sans lui, une racine vidée
             // par un montage absent laissait passer la réconciliation, qui
             // supprimait définitivement les favoris. Irréversible.
+            // #6179 — les lignes de playlist dont la piste a été retirée ou
+            // ré-identifiée par ce scan. Aucune n'est supprimée, scan complet
+            // ou non : une playlist ne perd une ligne que par un geste.
+            tune_core::db::playlists_reconcile::reconcilier_et_journaliser(
+                db.clone(),
+                true,
+                "auto_scan",
+            );
             match tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(db.clone())
                 .run(full_scan_ok)
             {
@@ -1470,6 +1512,16 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         }
 
         event_bus.emit("library.scan.completed", report);
+
+        // #6332 — le débit des pistes déjà en base, inchangées, que ce scan
+        // n'a pas relues : complété dans un fil à part, hors du droit de
+        // scanner, interrompu par le scan suivant (`lancer_en_fond`).
+        if !arrete {
+            tune_core::library::debit_des_pistes::lancer_en_fond(
+                db.clone(),
+                crate::routes::system::scan::droit_de_scanner_tenu,
+            );
+        }
 
         // Le compteur du registre est ce qui a CHANGE, pas ce qui a ete vu :
         // un scan qui relit 40 000 fichiers inchanges n'a rien fait, et
@@ -3674,6 +3726,14 @@ pub fn spawn_file_watcher(
                     if cleaned > 0 {
                         info!(cleaned, "watcher_orphan_albums_cleaned");
                     }
+                    // #6179 — un fichier retouché (supprimé puis réinséré) ou
+                    // renommé revient dans ses playlists dès ce lot : passe
+                    // RAPIDE (chemin, empreintes, MBID — jointures indexées).
+                    tune_core::db::playlists_reconcile::reconcilier_et_journaliser(
+                        db.clone(),
+                        false,
+                        "surveillant",
+                    );
                 }
                 // DIRE que la bibliotheque a change.
                 //
@@ -3806,6 +3866,10 @@ mod surveillant_annonces_tests_2134;
 #[cfg(test)]
 #[path = "coffret_auto_relu_tests_2094.rs"]
 mod coffret_auto_relu_tests_2094;
+
+#[cfg(test)]
+#[path = "coffrets_reglage_tests_6554.rs"]
+mod coffrets_reglage_tests_6554;
 
 #[cfg(test)]
 #[path = "album_renomme_relu_tests_5919.rs"]

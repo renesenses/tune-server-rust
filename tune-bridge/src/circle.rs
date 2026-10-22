@@ -48,7 +48,8 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
 
-use crate::state::{CorpsRelaye, PendingResponse, RelayState};
+use crate::state::{Attente, CorpsRelaye, PendingResponse, RelayState};
+use crate::trafic::{Categorie, Erreur};
 
 /// Code d'un billet refusé (ou de tout ce qui n'en est pas un).
 pub const CODE_REFUSE: &str = "not_found";
@@ -320,28 +321,50 @@ pub async fn flux_de_cercle(
     };
 
     // Les deux `Arc` sortent du garde de la DashMap avant toute attente.
-    let (ws_tx, pending) = match state.servers.get(&server_id) {
-        Some(conn) => (conn.ws_tx.clone(), conn.pending.clone()),
+    let (ws_tx, pending, compteurs) = match state.servers.get(&server_id) {
+        Some(conn) => (
+            conn.ws_tx.clone(),
+            conn.pending.clone(),
+            conn.trafic.clone(),
+        ),
         None => {
+            state.trafic.erreur(Erreur::ServeurAbsent);
             info!(server_id = %server_id, "circle_proprietaire_absent");
             return refus(StatusCode::SERVICE_UNAVAILABLE, CODE_PROPRIETAIRE_ABSENT);
         }
     };
 
     let request_id = uuid::Uuid::new_v4().to_string();
+    let range = range_de_l_auditeur(&headers);
     let message = serde_json::json!({
         "type": MESSAGE_FLUX_DE_CERCLE,
         "id": request_id,
         "track_id": track_id,
-        "range": range_de_l_auditeur(&headers),
-    });
+        "range": range,
+    })
+    .to_string();
 
     let (tx, rx) = tokio::sync::oneshot::channel::<PendingResponse>();
-    pending.lock().await.insert(request_id.clone(), tx);
-    if ws_tx.send(message.to_string()).await.is_err() {
+    pending
+        .lock()
+        .await
+        .insert(request_id.clone(), Attente::nouvelle(tx, Categorie::Cercle));
+    if ws_tx.send(message.clone()).await.is_err() {
         pending.lock().await.remove(&request_id);
+        state.trafic.erreur(Erreur::ServeurAbsent);
         return refus(StatusCode::SERVICE_UNAVAILABLE, CODE_PROPRIETAIRE_ABSENT);
     }
+    state
+        .trafic
+        .sortie(&compteurs, Categorie::Cercle, message.len());
+    let comptage = crate::stream_proxy::Comptage {
+        trafic: state.trafic.clone(),
+        serveur: compteurs,
+        categorie: Categorie::Cercle,
+        cle: format!("circle:{track_id}"),
+        range,
+        debut,
+    };
     info!(
         server_id = %server_id,
         track_id = %track_id,
@@ -350,10 +373,14 @@ pub async fn flux_de_cercle(
     );
 
     match tokio::time::timeout(Duration::from_secs(30), rx).await {
-        Ok(Ok(resp)) => reponse_a_l_auditeur(resp),
-        Ok(Err(_)) => StatusCode::BAD_GATEWAY.into_response(),
+        Ok(Ok(resp)) => reponse_a_l_auditeur(resp, comptage),
+        Ok(Err(_)) => {
+            state.trafic.erreur(Erreur::CanalRompu);
+            StatusCode::BAD_GATEWAY.into_response()
+        }
         Err(_) => {
             pending.lock().await.remove(&request_id);
+            state.trafic.erreur(Erreur::Delai);
             warn!(server_id = %server_id, "circle_flux_delai_depasse");
             StatusCode::GATEWAY_TIMEOUT.into_response()
         }
@@ -361,7 +388,10 @@ pub async fn flux_de_cercle(
 }
 
 /// La réponse du serveur du contact, réduite aux en-têtes d'un flux audio.
-fn reponse_a_l_auditeur(mut resp: PendingResponse) -> Response {
+fn reponse_a_l_auditeur(
+    mut resp: PendingResponse,
+    comptage: crate::stream_proxy::Comptage,
+) -> Response {
     resp.headers
         .retain(|nom, _| ENTETES_TRANSMIS.contains(&nom.to_ascii_lowercase().as_str()));
     if resp.status >= 400 {
@@ -370,7 +400,7 @@ fn reponse_a_l_auditeur(mut resp: PendingResponse) -> Response {
         resp.body = CorpsRelaye::Entier(None);
         resp.headers.clear();
     }
-    let mut r = crate::stream_proxy::reponse_relayee(resp);
+    let mut r = crate::stream_proxy::reponse_relayee_comptee(resp, Some(comptage));
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
@@ -467,7 +497,7 @@ mod tests {
     fn serveur_connecte(state: &RelayState) -> mpsc::Receiver<String> {
         let (tx, rx) = mpsc::channel::<String>(16);
         state
-            .register_server("srv".into(), "Salon".into(), JETON_DE_PONT.into(), tx)
+            .register_server("srv".into(), "Salon".into(), JETON_DE_PONT.into(), None, tx)
             .unwrap();
         rx
     }
@@ -594,6 +624,34 @@ mod tests {
             Some(format!("Bearer {JETON_DE_SERVICE}").as_str())
         );
         assert_eq!(c.appels[0].1, serde_json::json!({ "ticket": BILLET }));
+    }
+
+    /// #6512 : une écoute de contact est comptée en `circle`, jamais en
+    /// `audio`, et sous le serveur du PROPRIÉTAIRE — c'est lui qui émet.
+    #[tokio::test]
+    async fn une_ecoute_de_contact_est_comptee_en_circle_chez_le_proprietaire() {
+        let (base, _cloud) = faux_cloud(vec![accord("srv", serde_json::json!("42"))]).await;
+        let state = pont(&base, Some(JETON_DE_SERVICE));
+        let rx = serveur_connecte(&state);
+        let serveur = serveur_qui_repond(state.clone(), rx);
+
+        let r = appeler(&state, BILLET, avec_range("bytes=0-3")).await;
+        let msg = serveur.await.unwrap();
+        assert_eq!(corps(r).await, b"fLaC".to_vec());
+
+        let m = state.trafic.clore_minute(0);
+        assert_eq!(
+            m.categories.circle.out,
+            4 + msg.to_string().len() as u64,
+            "le son rendu + la demande au serveur du proprietaire"
+        );
+        assert!(m.categories.circle.r#in > 0);
+        assert_eq!((m.categories.audio.r#in, m.categories.audio.out), (0, 0));
+        assert_eq!(m.sessions.started, 1);
+        assert_eq!(m.sessions.completed, 1);
+        assert_eq!(m.servers.len(), 1);
+        assert_eq!(m.servers[0].server_id, "srv");
+        assert_eq!(m.servers[0].stream_out, m.categories.circle.out);
     }
 
     /// Billet refusé : 404, rien n'est émis.

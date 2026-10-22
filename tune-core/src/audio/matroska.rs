@@ -100,6 +100,10 @@ pub struct SondeMatroska {
     /// La durée annoncée par `Info/Duration`, en millisecondes.
     pub duration_ms: Option<u64>,
     pub balises: BalisesMatroska,
+    /// #6353 — une piste AC-3, E-AC-3 ou TrueHD, lue SANS décodage : ce que
+    /// ses en-têtes de trame disent (codec, canaux, fréquence, Atmos).
+    /// `None` pour toute autre piste, ou si aucun en-tête n'a été trouvé.
+    pub flux_dolby: Option<super::flux_dolby::FluxDolby>,
 }
 
 impl SondeMatroska {
@@ -289,6 +293,11 @@ pub fn sonder(path: &Path) -> Result<SondeMatroska, String> {
         ramasser_les_balises(revision, &mut balises);
     }
 
+    let flux_dolby = match &piste {
+        PisteAudio::NonDecodable { codec } => lire_le_flux_dolby(format.as_mut(), codec),
+        _ => None,
+    };
+
     Ok(SondeMatroska {
         piste,
         sample_rate,
@@ -296,7 +305,37 @@ pub fn sonder(path: &Path) -> Result<SondeMatroska, String> {
         bit_depth,
         duration_ms,
         balises,
+        flux_dolby,
     })
+}
+
+/// Paquets lus au plus pour trouver un en-tête : TrueHD répète sa
+/// synchronisation majeure toutes les 128 unités d'accès au plus.
+const PAQUETS_POUR_LE_FLUX: usize = 256;
+
+/// #6353 — lit, sans les décoder, les premiers paquets de la piste audio
+/// par défaut et rend ce que leurs en-têtes Dolby disent.
+fn lire_le_flux_dolby(
+    format: &mut dyn FormatReader,
+    codec: &str,
+) -> Option<super::flux_dolby::FluxDolby> {
+    use super::flux_dolby::{CodecDolby, analyser_les_paquets};
+    let codec = match codec {
+        "ac3" => CodecDolby::Ac3,
+        "eac3" => CodecDolby::Eac3,
+        "truehd" => CodecDolby::TrueHd,
+        _ => return None,
+    };
+    let piste = format.default_track(TrackType::Audio)?.id;
+    let mut paquets = Vec::new();
+    while paquets.len() < PAQUETS_POUR_LE_FLUX {
+        match format.next_packet() {
+            Ok(Some(p)) if p.track_id == piste => paquets.push(p.data.to_vec()),
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
+    analyser_les_paquets(codec, paquets.iter().map(Vec::as_slice))
 }
 
 /// La première piste audio de ce Matroska est-elle de l'Opus ?

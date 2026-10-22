@@ -1,0 +1,19 @@
+{
+  "attendu": {
+    "code": "emetteur",
+    "resultat": "refuse"
+  },
+  "contexte": {
+    "grace_expiration": 0,
+    "maintenant": 1793000000,
+    "server_id": "6f1c1f5e-2b0a-4c2e-9d3b-7a51c0de0001"
+  },
+  "defi": {
+    "defi": "c2Vzc2lvbi1kZWZpLWRlLXRlc3QtMDEyMzQ1Njc4OTAx",
+    "signature": "RViENs3a2oEShmYoVcnKtpRhTeITKAEbXRLpLOeL_IB535Lz14CUFPctu7VuXP4EcCvw8HhiTptRJDAbLmJdCg"
+  },
+  "description": "iss autre que https://mozaiklabs.fr.",
+  "laissez_passer": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6InR1bmUtcGFzcytqd3QifQ.eyJpc3MiOiJodHRwczovL21vemFpa2xhYnMuZXhhbXBsZSIsImF1ZCI6InR1bmUtcmVtb3RlIiwic3ViIjoiY3B0XzhmMmE2MSIsInNpZCI6IjZmMWMxZjVlLTJiMGEtNGMyZS05ZDNiLTdhNTFjMGRlMDAwMSIsImRpZCI6ImFwcF9lZF8wMSIsImNuZiI6eyJhbGciOiJFZDI1NTE5IiwicGsiOiJuMGxEbnAyd2xieEJFZTBsMDFlVjJERzhWYUJIOUxIWDlxN2pkM3UwRWlBIn0sInAycCI6ZmFsc2UsImlhdCI6MTc5Mjk5OTQwMCwibmJmIjoxNzkyOTk5NDAwLCJleHAiOjE3OTMwMDMwMDAsImp0aSI6Imp0aS0wMDAxIiwidiI6MX0.xkIG1c-ftX0FCrIgRI9b0mg6ASMnbdLO2uunqkJNbxJtJ79xxJv9UCq-z_crJUb6i0BdQ8aZvRdElIawJvN2BQ",
+  "nom": "mauvais_emetteur",
+  "publication": "jeu_de_cles.json"
+}

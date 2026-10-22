@@ -117,6 +117,14 @@ impl AdvancedHealthMonitor {
         self.alerts.lock().await.iter().cloned().collect()
     }
 
+    /// Une alerte posée par le serveur lui-même, hors des contrôles
+    /// périodiques — #6452 : le démarrage qui s'est fait sans ASIO parce que
+    /// le précédent n'avait pas abouti. Elle part dans `/system/health/monitor`
+    /// et `/system/health/alerts`.
+    pub async fn signaler(&self, level: AlertLevel, category: &str, message: &str) {
+        self.add_alert(level, category, message).await;
+    }
+
     pub async fn run_checks(&self) -> HealthReport {
         let mut checks = std::collections::HashMap::new();
         let mut overall = AlertLevel::Ok;

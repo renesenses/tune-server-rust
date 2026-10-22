@@ -245,6 +245,18 @@ impl DeezerService {
         }
     }
 
+    /// #6336 — un service dont la passerelle et l'API publique sont `gw` et
+    /// `api`, pour éprouver la connexion par ARL à travers le vrai routeur sans
+    /// joindre Deezer. Réservé aux bancs d'essai : aucun binaire publié ne le
+    /// compile.
+    #[cfg(any(test, feature = "services-factices"))]
+    pub fn avec_bases_de_test(gw: String, api: String) -> Self {
+        let mut svc = Self::new();
+        svc.gw_url = gw;
+        svc.api_url = api;
+        svc
+    }
+
     pub fn set_proxy_base_url(&mut self, url: Option<String>) {
         self.proxy_base_url = url;
     }
@@ -433,6 +445,7 @@ impl DeezerService {
                 .and_then(|count| u32::try_from(count).ok())
                 .unwrap_or(0),
             owner: item["PARENT_USERNAME"].as_str().map(Into::into),
+            editable: None,
             covers: Vec::new(),
         })
     }
@@ -818,6 +831,7 @@ impl DeezerService {
                 .or_else(|| item["picture_medium"].as_str())
                 .map(Into::into),
             track_count: item["nb_tracks"].as_u64().unwrap_or(0) as u32,
+            editable: None,
             owner: item["creator"]["name"].as_str().map(Into::into),
             covers: Vec::new(),
         }
@@ -890,6 +904,22 @@ impl DeezerService {
             .as_array()
             .map(|items| items.iter().map(mapper).collect())
             .unwrap_or_default()
+    }
+
+    /// #6231 — les albums d'une page de `/search/album` qui appartiennent au
+    /// genre, et le nombre de résultats examinés. Deezer donne à chaque album
+    /// son genre principal (`genre_id`) ; le genre `0` (« Tous ») couvre tout.
+    fn albums_du_genre(page: &serde_json::Value, genre_id: &str) -> (Vec<StreamAlbum>, usize) {
+        let items = page["data"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let albums = items
+            .iter()
+            .filter(|i| {
+                genre_id == "0"
+                    || i["genre_id"].as_i64().map(|n| n.to_string()).as_deref() == Some(genre_id)
+            })
+            .map(Self::map_album)
+            .collect();
+        (albums, items.len())
     }
 }
 
@@ -1442,6 +1472,49 @@ impl StreamingService for DeezerService {
         Ok(Self::collect_data(&data, Self::map_genre))
     }
 
+    /// #6231 — la recherche du catalogue, restreinte au genre. `/search/album`
+    /// n'accepte pas de filtre de genre (mesuré le 13/10/2026) : on garde les
+    /// albums du genre parmi ses résultats, jusqu'à 3 pages de 100.
+    async fn search_genre_albums(
+        &self,
+        genre_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<RechercheDansUnGenre, TuneError> {
+        const PAGE: usize = 100;
+        const PAGES: usize = 3;
+        let voulu = limit.clamp(1, PAGE * PAGES);
+        let encoded = urlencoding::encode(query);
+        let mut albums: Vec<StreamAlbum> = Vec::new();
+        let mut examined = 0usize;
+        for rang in 0..PAGES {
+            let page = self
+                .api_get(&format!(
+                    "/search/album?q={encoded}&limit={PAGE}&index={}",
+                    rang * PAGE
+                ))
+                .await?;
+            let (trouves, vus) = Self::albums_du_genre(&page, genre_id);
+            examined += vus;
+            albums.extend(trouves);
+            if albums.len() >= voulu || vus < PAGE || page["next"].is_null() {
+                break;
+            }
+        }
+        albums.truncate(voulu);
+        info!(
+            genre_id,
+            examined,
+            found = albums.len(),
+            "deezer_genre_search"
+        );
+        Ok(RechercheDansUnGenre {
+            albums,
+            examined,
+            genre_filter: "results",
+        })
+    }
+
     async fn get_genre_albums(
         &self,
         genre_id: &str,
@@ -1676,6 +1749,27 @@ impl StreamingService for DeezerService {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #6231 — `/search/album` porte le genre principal de chaque album
+    /// (`genre_id`, relevé le 13/10/2026 : Roxy Music = 152).
+    #[test]
+    fn recherche_dans_un_genre_6231_garde_les_albums_du_genre() {
+        let page = json!({"data": [
+            {"id": 1, "title": "Avalon", "genre_id": 152, "artist": {"name": "Roxy Music"}},
+            {"id": 2, "title": "Kind of Blue", "genre_id": 129, "artist": {"name": "Miles Davis"}},
+            {"id": 3, "title": "Sans genre", "artist": {"name": "X"}}
+        ]});
+        let (rock, vus) = DeezerService::albums_du_genre(&page, "152");
+        assert_eq!(vus, 3);
+        assert_eq!(rock.len(), 1);
+        assert_eq!(rock[0].title, "Avalon");
+        // CONTRE-ÉPREUVE : un autre genre n'attrape pas Roxy Music.
+        let (jazz, _) = DeezerService::albums_du_genre(&page, "129");
+        assert_eq!(jazz.len(), 1);
+        assert_eq!(jazz[0].title, "Kind of Blue");
+        // « Tous » (0) : tout.
+        assert_eq!(DeezerService::albums_du_genre(&page, "0").0.len(), 3);
+    }
 
     #[test]
     fn map_track_basic() {

@@ -561,7 +561,12 @@ fn la_remontee_passe_par_le_canal_deja_ouvert_et_pas_par_un_second() {
 fn l_anneau_cpal_partage_tient_aussi_les_deux_secondes_du_constat() {
     let sans_blancs: String = BACKEND.chars().filter(|c| !c.is_whitespace()).collect();
     for contenance in [
-        "letring_cap=(output_config.sample_rateasusize)*(output_config.channelsasusize)*2;",
+        // #6230 — la première ouverture passe par `ouvrir_a`, qui sert à la
+        // fois les voies d'une matrice de réaffectation et la configuration
+        // retenue (`ouvrir_a(&output_config)`) : même contenance, au format
+        // tenté.
+        "letring_cap=(cfg.sample_rateasusize)*(cfg.channelsasusize)*2;",
+        "ouvrir_a(&output_config)",
         "letring_cap_fb=(source_cfg.sample_rateasusize)*(source_cfg.channelsasusize)*2;",
         "letcap=(cand.sample_rateasusize)*(cand.channelsasusize)*2;",
     ] {

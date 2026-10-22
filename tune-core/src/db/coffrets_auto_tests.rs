@@ -1776,3 +1776,145 @@ pub(crate) fn scenario_relecture_coffret_auto_2094(db: &Arc<dyn DbBackend>) {
 fn relecture_coffret_auto_2094_sur_sqlite() {
     scenario_relecture_coffret_auto_2094(&sqlite());
 }
+
+// ---------------------------------------------------------------------------
+// #6554 — le réglage « Coffrets automatiques » (fil 2294, Marco Polo et Gros
+// Bidon). Go de Bertrand du 19/10/2026.
+// ---------------------------------------------------------------------------
+
+fn couper_la_reunion(db: &Arc<dyn DbBackend>) {
+    SettingsRepo::with_backend(db.clone())
+        .set(CLE_REGLAGE_AUTO, "false")
+        .unwrap();
+}
+
+#[test]
+fn reglage_6554_absent_vaut_actif_et_seules_les_formes_fausses_le_coupent() {
+    assert_eq!(reglage_auto_depuis_valeur(None), REGLAGE_AUTO_DEFAUT);
+    assert!(
+        reglage_auto_depuis_valeur(None),
+        "défaut : le comportement d'avant"
+    );
+    for vrai in ["true", "1", "\"true\"", "yes", "on", "illisible", ""] {
+        assert!(
+            reglage_auto_depuis_valeur(Some(vrai)),
+            "{vrai:?} doit laisser la réunion active"
+        );
+    }
+    for faux in ["false", "0", "\"false\"", "no", "off", " FALSE "] {
+        assert!(
+            !reglage_auto_depuis_valeur(Some(faux)),
+            "{faux:?} doit couper la réunion"
+        );
+    }
+    let db = sqlite();
+    assert!(reunion_automatique_active(&db), "base neuve : actif");
+    couper_la_reunion(&db);
+    assert!(!reunion_automatique_active(&db));
+}
+
+/// Réglage coupé AVANT la première passe : rien n'est réuni, et l'onglet
+/// Coffrets ne montre plus les albums seulement rangés disque par disque.
+#[test]
+fn reglage_6554_coupe_la_passe_ne_reunit_rien_et_l_onglet_ne_montre_que_les_marques() {
+    let db = sqlite();
+    let b = poser_le_banc(&db);
+    couper_la_reunion(&db);
+
+    let r = passe(&db).unwrap();
+    assert_eq!(
+        r,
+        RapportPasse::default(),
+        "la passe ne doit rien faire : {r:?}"
+    );
+    for id in [b.ew1, b.ew2, b.ls1, b.ls2] {
+        assert!(
+            existe(&db, id),
+            "le disque {id} a été absorbé alors que la réunion est coupée"
+        );
+    }
+    assert_eq!(titre(&db, b.ew1), "Early Works, Disc 1");
+    assert_eq!(titre(&db, b.ew2), "Early Works, Disc 2");
+
+    let l: Vec<i64> = lister(&db).unwrap().iter().map(|c| c.album_id).collect();
+    assert!(
+        !l.contains(&b.ancien),
+        "un album réparti disque par disque SANS marqueur n'est plus un coffret quand le réglage est coupé : {l:?}"
+    );
+    assert!(
+        l.contains(&b.manuel),
+        "le coffret composé à la main reste listé : {l:?}"
+    );
+}
+
+/// Réglage coupé APRÈS une passe : les coffrets déjà réunis restent réunis
+/// et restent listés (on doit pouvoir les défaire) ; un nouveau disque
+/// frère n'y est plus ajouté ; « Défaire » marche toujours.
+#[test]
+fn reglage_6554_coupe_apres_coup_laisse_les_coffrets_reunis_et_listes() {
+    let db = sqlite();
+    let b = poser_le_banc(&db);
+    assert_eq!(
+        passe(&db).unwrap().reunis,
+        2,
+        "montage : la passe active réunit"
+    );
+    couper_la_reunion(&db);
+
+    let lg = "/m/ELECTRO/Laurent Garnier";
+    let garnier = AlbumRepo::with_backend(db.clone())
+        .get(b.ew1)
+        .unwrap()
+        .and_then(|a| a.artist_id)
+        .unwrap();
+    let ew3 = disque(
+        &db,
+        "Early Works, Disc 3",
+        garnier,
+        &format!("{lg}/2003-Early Works, Disc 3"),
+        1,
+        1,
+    );
+    assert_eq!(passe(&db).unwrap(), RapportPasse::default());
+    assert!(
+        existe(&db, ew3),
+        "le disque 3 arrivé après la coupure reste un album"
+    );
+    assert_eq!(
+        titre(&db, b.ew1),
+        "Early Works",
+        "le coffret déjà réuni le reste"
+    );
+
+    let l: Vec<i64> = lister(&db).unwrap().iter().map(|c| c.album_id).collect();
+    for id in [b.ew1, b.ls1, b.manuel] {
+        assert!(
+            l.contains(&id),
+            "coffret marqué {id} absent de la liste {l:?}"
+        );
+    }
+    assert!(!l.contains(&b.ancien), "{l:?}");
+
+    assert_eq!(defaire(&db, b.ew1).unwrap().len(), 1);
+    assert_eq!(passe(&db).unwrap(), RapportPasse::default());
+    assert_eq!(
+        titre(&db, b.ew1),
+        "Early Works, Disc 1",
+        "défait, il ne revient pas"
+    );
+}
+
+/// Réglage remis : la passe reprend, l'onglet aussi.
+#[test]
+fn reglage_6554_remis_la_passe_et_l_onglet_reprennent() {
+    let db = sqlite();
+    let b = poser_le_banc(&db);
+    couper_la_reunion(&db);
+    assert_eq!(passe(&db).unwrap().reunis, 0);
+    SettingsRepo::with_backend(db.clone())
+        .set(CLE_REGLAGE_AUTO, "true")
+        .unwrap();
+    assert_eq!(passe(&db).unwrap().reunis, 2);
+    let l: Vec<i64> = lister(&db).unwrap().iter().map(|c| c.album_id).collect();
+    assert!(l.contains(&b.ancien) && l.contains(&b.ew1), "{l:?}");
+}

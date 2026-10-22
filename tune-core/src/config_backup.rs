@@ -119,6 +119,12 @@ const SENSITIVE_KEYS: &[&str] = &[
     "credentials_vault",
     "server_id",
     "hardware_fingerprint",
+    // #4626 — l'identité maître/agent et les secrets d'appairage : une
+    // sauvegarde restaurée sur une autre machine ne doit ni en cloner
+    // l'identité, ni emporter les jetons qui pilotent les sorties d'un agent.
+    "agent_tune_identite",
+    "agent_tune_agents",
+    "agent_tune_maitres",
 ];
 
 fn is_sensitive(key: &str) -> bool {
@@ -444,7 +450,7 @@ pub(crate) fn export_playlists(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value
              t.source, t.source_id, t.isrc, t.duration_ms, pt.track_id, \
              pt.source, pt.source_id, pt.title, pt.artist, pt.album, \
              pt.album_source_id, pt.duration_ms, pt.cover_url, \
-             t.file_path, t.audio_hash \
+             t.file_path, t.audio_hash, pt.file_path, pt.audio_hash \
              FROM playlist_tracks pt \
              LEFT JOIN tracks t ON t.id = pt.track_id \
              LEFT JOIN artists ar ON ar.id = t.artist_id \
@@ -474,6 +480,25 @@ pub(crate) fn export_playlists(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value
                         // Cles en plus : un serveur anterieur les ignore.
                         "file_path": texte(17),
                         "audio_hash": texte(18),
+                    });
+                }
+                // #6179 — ligne INTROUVABLE (ni piste ni service) : elle part
+                // sous la forme d'une piste locale, avec l'identite figee de
+                // la piste disparue. La restauration la cherche comme
+                // n'importe quelle piste locale (titre + artiste, empreinte),
+                // et la signale si elle ne la trouve pas.
+                if texte(9).is_none() && texte(10).is_none() {
+                    return serde_json::json!({
+                        "position": position,
+                        "title": texte(11).unwrap_or_default(),
+                        "artist_name": texte(12).unwrap_or_default(),
+                        "album_title": texte(13).unwrap_or_default(),
+                        "source": "local",
+                        "source_id": "",
+                        "isrc": Value::Null,
+                        "duration_ms": entier(15).unwrap_or(0),
+                        "file_path": texte(19),
+                        "audio_hash": texte(20),
                     });
                 }
                 // Titre de service : `kind` le distingue d'une piste de la

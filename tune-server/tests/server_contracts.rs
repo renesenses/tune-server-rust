@@ -138,6 +138,9 @@ mod output_provider_seam;
 mod paroles_ecriture_fichiers;
 #[path = "paroles_source_lrclib.rs"]
 mod paroles_source_lrclib;
+// #6287 — la requête textuelle des règles intelligentes, par le vrai routeur.
+#[path = "requete_textuelle_6287.rs"]
+mod requete_textuelle_6287;
 // #2373 (T4) : un partage de playlist se REPREND. Le parcours entier passe
 // par le routeur — partager, lire, revoquer, puis 404 sur le MEME jeton.
 #[path = "partage_playlist_revoque_2373.rs"]

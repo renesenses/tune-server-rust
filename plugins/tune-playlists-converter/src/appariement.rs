@@ -317,6 +317,40 @@ pub fn choisir(
     )
 }
 
+/// Un titre qui est DÉJÀ chez le service visé se reprend tel quel (#6499).
+///
+/// Bertrand, 19/10/2026 : « un titre déjà sur le service cible est repris tel
+/// quel, sans appariement ». La source le désigne par `source` (le service) et
+/// `source_id` (son identifiant chez lui) : si `source` est la cible, c'est
+/// déjà le bon identifiant — rien à chercher, rien à juger, l'ordre de la
+/// playlist est gardé. Ne vaut que vers un SERVICE : dans la bibliothèque, un
+/// titre se désigne par l'entier `tracks.id`, que `source_id` n'est jamais.
+pub fn reprise_directe(
+    cible: &str,
+    source: &str,
+    source_id: &str,
+    titre: &str,
+    artiste: &str,
+    duree_ms: u64,
+) -> Option<Candidat> {
+    let source_id = source_id.trim();
+    if cible == LOCAL
+        || cible.is_empty()
+        || !source.eq_ignore_ascii_case(cible)
+        || source_id.is_empty()
+    {
+        return None;
+    }
+    Some(Candidat {
+        id: source_id.to_string(),
+        titre: titre.to_string(),
+        artiste: artiste.to_string(),
+        duree_ms,
+        score: 1.0,
+        approximatif: false,
+    })
+}
+
 /// Apparier un titre CHEZ un service, ou dans la bibliothèque locale.
 ///
 /// Le seul chemin d'appariement du greffon : le transfert (#4717) et les liens
@@ -461,6 +495,27 @@ mod tests {
     fn matched_null_ne_rend_aucun_candidat() {
         let reponse = serde_json::json!({ "service": "qobuz", "matched": null });
         assert!(candidat_de_la_reponse(&reponse).is_none());
+    }
+
+    /// #6499 — reprise directe : même service seulement, identifiant présent,
+    /// jamais vers la bibliothèque.
+    #[test]
+    fn la_reprise_directe_ne_vaut_que_pour_le_service_d_origine() {
+        let c = reprise_directe(
+            "qobuz",
+            "qobuz",
+            "58640120",
+            "So What",
+            "Miles Davis",
+            562_000,
+        )
+        .expect("un titre Qobuz vers Qobuz est repris");
+        assert_eq!(c.id, "58640120");
+        assert!(!c.approximatif);
+        assert!(reprise_directe("qobuz", "tidal", "t-1", "x", "y", 1).is_none());
+        assert!(reprise_directe("qobuz", "", "1", "x", "y", 1).is_none());
+        assert!(reprise_directe("qobuz", "qobuz", "  ", "x", "y", 1).is_none());
+        assert!(reprise_directe(LOCAL, LOCAL, "12", "x", "y", 1).is_none());
     }
 
     /// La raison se sérialise avec son code : c'est ce que l'écran lit.

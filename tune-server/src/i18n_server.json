@@ -1,4 +1,228 @@
 {
+  "plugin.unavailable": {
+    "fr": "Ce plugin doit être installé et activé.",
+    "en": "This plugin must be installed and enabled.",
+    "de": "Dieses Plugin muss installiert und aktiviert sein.",
+    "es": "Este plugin debe estar instalado y activado.",
+    "it": "Questo plugin deve essere installato e attivato.",
+    "zh": "此插件必须已安装并启用。",
+    "ja": "このプラグインはインストールして有効にする必要があります。",
+    "ko": "이 플러그인을 설치하고 활성화해야 합니다.",
+    "ro": "Acest plugin trebuie să fie instalat și activat.",
+    "sv": "Det här tillägget måste vara installerat och aktiverat.",
+    "hu": "Ezt a bővítményt telepíteni és engedélyezni kell.",
+    "vi": "Plugin này phải được cài đặt và bật."
+  },
+  "plugin.description.equalizer": {
+    "fr": "Égaliseur : profil, graphique, paramétrique, presets et AutoEq",
+    "en": "Equalizer: profile, graphic, parametric, presets and AutoEq",
+    "de": "Equalizer: Profil, grafisch, parametrisch, Presets und AutoEq",
+    "es": "Ecualizador: perfil, gráfico, paramétrico, presets y AutoEq",
+    "it": "Equalizzatore: profilo, grafico, parametrico, preset e AutoEq",
+    "zh": "均衡器：配置文件、图示、参数、预设和 AutoEq",
+    "ja": "イコライザー：プロファイル、グラフィック、パラメトリック、プリセット、AutoEq",
+    "ko": "이퀄라이저: 프로필, 그래픽, 파라메트릭, 프리셋 및 AutoEq",
+    "ro": "Egalizator: profil, grafic, parametric, presetări și AutoEq",
+    "sv": "Equalizer: profil, grafisk, parametrisk, förinställningar och AutoEq",
+    "hu": "Hangszínszabályzó: profil, grafikus, parametrikus, előbeállítások és AutoEq",
+    "vi": "Bộ cân bằng (EQ): hồ sơ, đồ họa, tham số, preset và AutoEq"
+  },
+  "plugin.description.crossfeed": {
+    "fr": "Crossfeed casque : intensité, retard et ombre de la tête, à chaud",
+    "en": "Headphone crossfeed: intensity, delay and head shadow, applied live",
+    "de": "Kopfhörer-Crossfeed: Intensität, Verzögerung und Kopfschatten, live angewendet",
+    "es": "Crossfeed para auriculares: intensidad, retardo y sombra de la cabeza, en caliente",
+    "it": "Crossfeed per cuffie: intensità, ritardo e ombra della testa, in tempo reale",
+    "zh": "耳机 Crossfeed：强度、延迟和头部阴影，实时生效",
+    "ja": "ヘッドホン用 Crossfeed：強度、遅延、頭部の影をリアルタイムで適用",
+    "ko": "헤드폰 Crossfeed: 강도, 지연, 머리 그림자를 실시간으로 적용",
+    "ro": "Crossfeed pentru căști: intensitate, întârziere și umbra capului, aplicate din mers",
+    "sv": "Crossfeed för hörlurar: intensitet, fördröjning och huvudskugga, direkt",
+    "hu": "Fejhallgatós crossfeed: erősség, késleltetés és fejárnyék, menet közben",
+    "vi": "Crossfeed cho tai nghe: cường độ, độ trễ và bóng đầu, áp dụng tức thì"
+  },
+  "plugin.description.converter": {
+    "fr": "Convertisseur audio : codecs de l'hôte, métadonnées et exports",
+    "en": "Audio converter: host codecs, metadata and exports",
+    "de": "Audiokonverter: Codecs des Hosts, Metadaten und Exporte",
+    "es": "Conversor de audio: códecs del equipo, metadatos y exportaciones",
+    "it": "Convertitore audio: codec dell'host, metadati ed esportazioni",
+    "zh": "音频转换器：主机编解码器、元数据和导出",
+    "ja": "オーディオコンバーター：ホストのコーデック、メタデータ、エクスポート",
+    "ko": "오디오 변환기: 호스트 코덱, 메타데이터 및 내보내기",
+    "ro": "Convertor audio: codecurile gazdei, metadate și exporturi",
+    "sv": "Ljudkonverterare: värdens codecs, metadata och export",
+    "hu": "Hangkonverter: a gazdagép kodekjei, metaadatok és exportálás",
+    "vi": "Bộ chuyển đổi âm thanh: codec của máy chủ, siêu dữ liệu và xuất file"
+  },
+  "plugin.description.channel-remap": {
+    "fr": "Réaffectation des canaux : matrice en dB par zone et par album (4.0, 5.1…)",
+    "en": "Channel remapping: dB matrix per zone and per album (4.0, 5.1…)",
+    "de": "Kanalzuordnung: dB-Matrix pro Zone und pro Album (4.0, 5.1…)",
+    "es": "Reasignación de canales: matriz en dB por zona y por álbum (4.0, 5.1…)",
+    "it": "Riassegnazione dei canali: matrice in dB per zona e per album (4.0, 5.1…)",
+    "zh": "声道重映射：按区域和专辑设置的 dB 矩阵（4.0、5.1…）",
+    "ja": "チャンネル再割り当て：ゾーン別・アルバム別の dB マトリクス（4.0、5.1…）",
+    "ko": "채널 재할당: 존별, 앨범별 dB 매트릭스(4.0, 5.1…)",
+    "ro": "Reasignarea canalelor: matrice în dB pe zonă și pe album (4.0, 5.1…)",
+    "sv": "Kanalomfördelning: dB-matris per zon och per album (4.0, 5.1…)",
+    "hu": "Csatorna-átrendezés: dB-mátrix zónánként és albumonként (4.0, 5.1…)",
+    "vi": "Phân bổ lại kênh: ma trận dB theo vùng phát và theo album (4.0, 5.1…)"
+  },
+  "plugin.description.declick": {
+    "fr": "Dé-ploc : silence en tête/queue et passages par zéro, FLAC/WAV",
+    "en": "Declick: leading/trailing silence and zero crossings, FLAC/WAV",
+    "de": "Declick: Stille am Anfang/Ende und Nulldurchgänge, FLAC/WAV",
+    "es": "Declick: silencio al inicio/final y pasos por cero, FLAC/WAV",
+    "it": "Declick: silenzio iniziale/finale e passaggi per lo zero, FLAC/WAV",
+    "zh": "去爆音：首尾静音和过零点，FLAC/WAV",
+    "ja": "デクリック：先頭・末尾の無音とゼロクロス、FLAC/WAV",
+    "ko": "디클릭: 앞뒤 무음과 영점 교차, FLAC/WAV",
+    "ro": "Declick: liniște la început/sfârșit și treceri prin zero, FLAC/WAV",
+    "sv": "Declick: tystnad i början/slutet och nollgenomgångar, FLAC/WAV",
+    "hu": "Kattanásszűrő: csend az elején/végén és nullátmenetek, FLAC/WAV",
+    "vi": "Khử tiếng lách cách: khoảng lặng đầu/cuối và điểm qua 0, FLAC/WAV"
+  },
+  "plugin.description.cd": {
+    "fr": "Lecture directe d'un CD audio vers une zone, et extraction en FLAC ou WAV vers la bibliothèque (Linux, macOS et Windows)",
+    "en": "Play an audio CD directly to a zone, and rip it to FLAC or WAV into the library (Linux, macOS and Windows)",
+    "de": "Audio-CD direkt in einer Zone abspielen und als FLAC oder WAV in die Bibliothek rippen (Linux, macOS und Windows)",
+    "es": "Reproducción directa de un CD de audio en una zona y extracción en FLAC o WAV a la biblioteca (Linux, macOS y Windows)",
+    "it": "Riproduzione diretta di un CD audio in una zona ed estrazione in FLAC o WAV nella libreria (Linux, macOS e Windows)",
+    "zh": "将音频 CD 直接播放到某个区域，并以 FLAC 或 WAV 抓取到音乐库（Linux、macOS 和 Windows）",
+    "ja": "オーディオ CD をゾーンで直接再生し、FLAC または WAV でライブラリへ取り込み（Linux、macOS、Windows）",
+    "ko": "오디오 CD를 존에서 바로 재생하고 FLAC 또는 WAV로 라이브러리에 추출(Linux, macOS, Windows)",
+    "ro": "Redare directă a unui CD audio într-o zonă și extragere în FLAC sau WAV în bibliotecă (Linux, macOS și Windows)",
+    "sv": "Spela en ljud-cd direkt i en zon och rippa den till FLAC eller WAV i biblioteket (Linux, macOS och Windows)",
+    "hu": "Audio-CD közvetlen lejátszása egy zónán, és bemásolása FLAC vagy WAV formátumban a gyűjteménybe (Linux, macOS és Windows)",
+    "vi": "Phát trực tiếp CD âm thanh tới một vùng phát, và trích xuất sang FLAC hoặc WAV vào thư viện (Linux, macOS và Windows)"
+  },
+  "plugin.description.circle": {
+    "fr": "Tune Circle — partage entre proches invités. Gratuit ; l'écoute à distance est Premium.",
+    "en": "Tune Circle — sharing with invited friends and family. Free; remote listening is Premium.",
+    "de": "Tune Circle — Teilen mit eingeladenen Angehörigen. Kostenlos; das Hören aus der Ferne ist Premium.",
+    "es": "Tune Circle — compartir con allegados invitados. Gratis; la escucha remota es Premium.",
+    "it": "Tune Circle — condivisione con amici e familiari invitati. Gratuito; l'ascolto remoto è Premium.",
+    "zh": "Tune Circle — 与受邀亲友分享。免费；远程收听为 Premium 功能。",
+    "ja": "Tune Circle — 招待した家族や友人と共有。無料。リモート再生は Premium です。",
+    "ko": "Tune Circle — 초대한 가족·지인과 공유. 무료이며 원격 감상은 Premium입니다.",
+    "ro": "Tune Circle — partajare cu apropiații invitați. Gratuit; ascultarea la distanță este Premium.",
+    "sv": "Tune Circle — delning med inbjudna nära och kära. Gratis; lyssning på distans är Premium.",
+    "hu": "Tune Circle — megosztás meghívott hozzátartozókkal. Ingyenes; a távoli hallgatás Premium.",
+    "vi": "Tune Circle — chia sẻ với người thân được mời. Miễn phí; nghe từ xa là tính năng Premium."
+  },
+  "plugin.description.assistant-ia": {
+    "fr": "Playlists intelligentes décrites en une phrase et suggestions d'enrichissement des albums, avec votre propre clé (Anthropic, compatible OpenAI, Gemini, Ollama)",
+    "en": "Smart playlists described in one sentence and album enrichment suggestions, with your own key (Anthropic, OpenAI-compatible, Gemini, Ollama)",
+    "de": "Intelligente Playlists in einem Satz beschrieben und Vorschläge zur Anreicherung von Alben, mit Ihrem eigenen Schlüssel (Anthropic, OpenAI-kompatibel, Gemini, Ollama)",
+    "es": "Listas inteligentes descritas en una frase y sugerencias para enriquecer los álbumes, con su propia clave (Anthropic, compatible con OpenAI, Gemini, Ollama)",
+    "it": "Playlist intelligenti descritte in una frase e suggerimenti per arricchire gli album, con la tua chiave (Anthropic, compatibile OpenAI, Gemini, Ollama)",
+    "zh": "用一句话描述的智能播放列表与专辑信息补全建议，使用您自己的密钥（Anthropic、兼容 OpenAI、Gemini、Ollama）",
+    "ja": "一文で説明するスマートプレイリストとアルバム情報の補完提案。ご自身のキーを使用（Anthropic、OpenAI 互換、Gemini、Ollama）",
+    "ko": "한 문장으로 설명하는 스마트 재생목록과 앨범 정보 보강 제안. 본인의 키 사용(Anthropic, OpenAI 호환, Gemini, Ollama)",
+    "ro": "Liste inteligente descrise într-o frază și sugestii de îmbogățire a albumelor, cu propria cheie (Anthropic, compatibil OpenAI, Gemini, Ollama)",
+    "sv": "Smarta spellistor beskrivna i en mening och förslag för att berika album, med din egen nyckel (Anthropic, OpenAI-kompatibel, Gemini, Ollama)",
+    "hu": "Egy mondatban leírt intelligens lejátszási listák és albumkiegészítési javaslatok, a saját kulcsával (Anthropic, OpenAI-kompatibilis, Gemini, Ollama)",
+    "vi": "Danh sách phát thông minh mô tả bằng một câu và gợi ý làm giàu thông tin album, với khóa của riêng bạn (Anthropic, tương thích OpenAI, Gemini, Ollama)"
+  },
+  "plugin.description.entree-audio": {
+    "fr": "Capter une entrée audio (USB, S/PDIF, optique) et la diffuser en direct vers une zone",
+    "en": "Capture an audio input (USB, S/PDIF, optical) and stream it live to a zone",
+    "de": "Einen Audioeingang (USB, S/PDIF, optisch) erfassen und live an eine Zone streamen",
+    "es": "Capturar una entrada de audio (USB, S/PDIF, óptica) y difundirla en directo a una zona",
+    "it": "Acquisire un ingresso audio (USB, S/PDIF, ottico) e trasmetterlo in diretta a una zona",
+    "zh": "采集音频输入（USB、S/PDIF、光纤）并实时传输到某个区域",
+    "ja": "オーディオ入力（USB、S/PDIF、光）を取り込み、ゾーンへライブ配信",
+    "ko": "오디오 입력(USB, S/PDIF, 광)을 받아 존으로 실시간 전송",
+    "ro": "Captarea unei intrări audio (USB, S/PDIF, optică) și difuzarea ei în direct către o zonă",
+    "sv": "Fånga en ljudingång (USB, S/PDIF, optisk) och strömma den direkt till en zon",
+    "hu": "Hangbemenet (USB, S/PDIF, optikai) rögzítése és élő továbbítása egy zónára",
+    "vi": "Thu một ngõ vào âm thanh (USB, S/PDIF, quang) và phát trực tiếp tới một vùng phát"
+  },
+  "plugin.description.pont-roon": {
+    "fr": "Pont Roon (Premium) : crédits, images d'artistes et pochettes récoltés sur un Core Roon",
+    "en": "Roon bridge (Premium): credits, artist images and covers gathered from a Roon Core",
+    "de": "Roon-Brücke (Premium): Credits, Künstlerbilder und Cover von einem Roon Core übernommen",
+    "es": "Puente Roon (Premium): créditos, imágenes de artistas y portadas obtenidos de un Roon Core",
+    "it": "Ponte Roon (Premium): crediti, immagini degli artisti e copertine raccolti da un Roon Core",
+    "zh": "Roon 桥接（Premium）：从 Roon Core 获取制作人员名单、艺术家图片和封面",
+    "ja": "Roon ブリッジ（Premium）：Roon Core からクレジット、アーティスト画像、ジャケットを取得",
+    "ko": "Roon 브리지(Premium): Roon Core에서 크레딧, 아티스트 이미지, 커버를 가져옴",
+    "ro": "Punte Roon (Premium): credite, imagini ale artiștilor și coperți preluate de pe un Roon Core",
+    "sv": "Roon-brygga (Premium): medverkande, artistbilder och omslag hämtade från en Roon Core",
+    "hu": "Roon-híd (Premium): közreműködők, előadóképek és borítók egy Roon Core-ból",
+    "vi": "Cầu nối Roon (Premium): ghi công, ảnh nghệ sĩ và ảnh bìa lấy từ một Roon Core"
+  },
+  "plugin.description.dj": {
+    "fr": "Mode DJ : fondu enchaîné, platines, forme d'onde et analyse du BPM",
+    "en": "DJ mode: crossfade, decks, waveform and BPM analysis",
+    "de": "DJ-Modus: Crossfade, Decks, Wellenform und BPM-Analyse",
+    "es": "Modo DJ: crossfade, platos, forma de onda y análisis de BPM",
+    "it": "Modalità DJ: crossfade, deck, forma d'onda e analisi dei BPM",
+    "zh": "DJ 模式：交叉淡入淡出、碟机、波形和 BPM 分析",
+    "ja": "DJ モード：クロスフェード、デッキ、波形、BPM 解析",
+    "ko": "DJ 모드: 크로스페이드, 덱, 파형 및 BPM 분석",
+    "ro": "Mod DJ: crossfade, deck-uri, formă de undă și analiză BPM",
+    "sv": "DJ-läge: övertoning, decks, vågform och BPM-analys",
+    "hu": "DJ mód: áttűnés, lejátszók, hullámforma és BPM-elemzés",
+    "vi": "Chế độ DJ: crossfade, deck, dạng sóng và phân tích BPM"
+  },
+  "plugin.description.karaoke": {
+    "fr": "Paroles synchronisées façon karaoké (réutilise tune-core::lyrics)",
+    "en": "Karaoke-style synchronized lyrics (reuses tune-core::lyrics)",
+    "de": "Synchronisierte Songtexte im Karaoke-Stil (nutzt tune-core::lyrics)",
+    "es": "Letras sincronizadas estilo karaoke (reutiliza tune-core::lyrics)",
+    "it": "Testi sincronizzati in stile karaoke (riusa tune-core::lyrics)",
+    "zh": "卡拉 OK 式同步歌词（复用 tune-core::lyrics）",
+    "ja": "カラオケ風の同期歌詞（tune-core::lyrics を再利用）",
+    "ko": "노래방 스타일 동기화 가사(tune-core::lyrics 재사용)",
+    "ro": "Versuri sincronizate în stil karaoke (reutilizează tune-core::lyrics)",
+    "sv": "Synkroniserade låttexter i karaokestil (återanvänder tune-core::lyrics)",
+    "hu": "Karaoke-stílusú szinkronizált dalszöveg (a tune-core::lyrics modult használja)",
+    "vi": "Lời bài hát đồng bộ kiểu karaoke (dùng lại tune-core::lyrics)"
+  },
+  "plugin.description.concerts": {
+    "fr": "Concerts (Premium) : les dates à venir des artistes de votre bibliothèque, autour de chez vous",
+    "en": "Concerts (Premium): upcoming dates for the artists in your library, near you",
+    "de": "Konzerte (Premium): kommende Termine der Künstler Ihrer Bibliothek in Ihrer Nähe",
+    "es": "Conciertos (Premium): las próximas fechas de los artistas de su biblioteca, cerca de usted",
+    "it": "Concerti (Premium): le prossime date degli artisti della tua libreria, vicino a te",
+    "zh": "演唱会（Premium）：您音乐库中艺术家在您附近即将举行的演出",
+    "ja": "コンサート（Premium）：ライブラリのアーティストの近くで予定されている公演",
+    "ko": "콘서트(Premium): 라이브러리 아티스트의 가까운 곳 예정 공연",
+    "ro": "Concerte (Premium): datele viitoare ale artiștilor din biblioteca ta, în apropiere",
+    "sv": "Konserter (Premium): kommande datum för artisterna i ditt bibliotek, nära dig",
+    "hu": "Koncertek (Premium): a gyűjteménye előadóinak közelgő fellépései az Ön közelében",
+    "vi": "Hòa nhạc (Premium): lịch diễn sắp tới của các nghệ sĩ trong thư viện của bạn, gần chỗ bạn"
+  },
+  "plugin.description.bandcamp": {
+    "fr": "Bandcamp : recherche, découverte, tags et lecture (mp3-128)",
+    "en": "Bandcamp: search, discovery, tags and playback (mp3-128)",
+    "de": "Bandcamp: Suche, Entdecken, Tags und Wiedergabe (mp3-128)",
+    "es": "Bandcamp: búsqueda, descubrimiento, etiquetas y reproducción (mp3-128)",
+    "it": "Bandcamp: ricerca, scoperta, tag e riproduzione (mp3-128)",
+    "zh": "Bandcamp：搜索、发现、标签和播放（mp3-128）",
+    "ja": "Bandcamp：検索、発見、タグ、再生（mp3-128）",
+    "ko": "Bandcamp: 검색, 발견, 태그 및 재생(mp3-128)",
+    "ro": "Bandcamp: căutare, descoperire, etichete și redare (mp3-128)",
+    "sv": "Bandcamp: sökning, upptäckt, taggar och uppspelning (mp3-128)",
+    "hu": "Bandcamp: keresés, felfedezés, címkék és lejátszás (mp3-128)",
+    "vi": "Bandcamp: tìm kiếm, khám phá, thẻ và phát (mp3-128)"
+  },
+  "plugin.description.xtune": {
+    "fr": "Vinyl turntable player — interface platine vinyle immersive",
+    "en": "Vinyl turntable player — immersive turntable interface",
+    "de": "Vinyl-Plattenspieler — immersive Plattenspieler-Oberfläche",
+    "es": "Reproductor de tocadiscos — interfaz inmersiva de tocadiscos",
+    "it": "Giradischi in vinile — interfaccia immersiva da giradischi",
+    "zh": "黑胶唱机播放器 — 沉浸式唱机界面",
+    "ja": "レコードプレーヤー — 没入感のあるターンテーブル画面",
+    "ko": "바이닐 턴테이블 플레이어 — 몰입형 턴테이블 인터페이스",
+    "ro": "Pick-up de vinil — interfață imersivă de pick-up",
+    "sv": "Vinylskivspelare — uppslukande skivspelargränssnitt",
+    "hu": "Bakelit lemezjátszó — magával ragadó lemezjátszó-felület",
+    "vi": "Máy quay đĩa than — giao diện mâm đĩa sống động"
+  },
   "premium.required": {
     "fr": "« {feature} » nécessite Tune Premium.",
     "en": "{feature} requires Tune Premium.",
@@ -9,7 +233,9 @@
     "ja": "「{feature}」には Tune Premium が必要です。",
     "ko": "'{feature}'에는 Tune Premium이 필요합니다.",
     "ro": "„{feature}” necesită Tune Premium.",
-    "sv": "”{feature}” kräver Tune Premium."
+    "sv": "”{feature}” kräver Tune Premium.",
+    "hu": "„{feature}” használatához Tune Premium szükséges.",
+    "vi": "“{feature}” yêu cầu Tune Premium."
   },
   "metafield.album_artist": {
     "fr": "Artiste de l'album",
@@ -21,7 +247,9 @@
     "ja": "アルバムアーティスト",
     "ko": "앨범 아티스트",
     "ro": "Artist album",
-    "sv": "Albumartist"
+    "sv": "Albumartist",
+    "hu": "Album előadója",
+    "vi": "Nghệ sĩ album"
   },
   "metafield.sort_artist": {
     "fr": "Tri artiste",
@@ -33,7 +261,9 @@
     "ja": "アーティスト並べ替え",
     "ko": "아티스트 정렬",
     "ro": "Sortare artist",
-    "sv": "Sorteringsartist"
+    "sv": "Sorteringsartist",
+    "hu": "Előadó rendezése",
+    "vi": "Sắp xếp nghệ sĩ"
   },
   "metafield.sort_album": {
     "fr": "Tri album",
@@ -45,7 +275,9 @@
     "ja": "アルバム並べ替え",
     "ko": "앨범 정렬",
     "ro": "Sortare album",
-    "sv": "Sorteringsalbum"
+    "sv": "Sorteringsalbum",
+    "hu": "Album rendezése",
+    "vi": "Sắp xếp album"
   },
   "metafield.disc_number": {
     "fr": "N° disque",
@@ -57,7 +289,9 @@
     "ja": "ディスク番号",
     "ko": "디스크 번호",
     "ro": "Nr. disc",
-    "sv": "Skivnr"
+    "sv": "Skivnr",
+    "hu": "Lemez sorszáma",
+    "vi": "Số đĩa"
   },
   "metafield.disc_subtitle": {
     "fr": "Sous-titre disque",
@@ -69,7 +303,9 @@
     "ja": "ディスクサブタイトル",
     "ko": "디스크 부제",
     "ro": "Subtitlu disc",
-    "sv": "Skivundertitel"
+    "sv": "Skivundertitel",
+    "hu": "Lemez alcíme",
+    "vi": "Phụ đề đĩa"
   },
   "metafield.track_number": {
     "fr": "N° piste",
@@ -81,7 +317,9 @@
     "ja": "トラック番号",
     "ko": "트랙 번호",
     "ro": "Nr. piesă",
-    "sv": "Spårnr"
+    "sv": "Spårnr",
+    "hu": "Szám sorszáma",
+    "vi": "Số bài"
   },
   "metafield.genre": {
     "fr": "Genre",
@@ -93,7 +331,9 @@
     "ja": "ジャンル",
     "ko": "장르",
     "ro": "Gen",
-    "sv": "Genre"
+    "sv": "Genre",
+    "hu": "Műfaj",
+    "vi": "Thể loại"
   },
   "metafield.genres": {
     "fr": "Genres (multi)",
@@ -105,7 +345,9 @@
     "ja": "ジャンル（複数）",
     "ko": "장르 (다중)",
     "ro": "Genuri (multiple)",
-    "sv": "Genrer (flera)"
+    "sv": "Genrer (flera)",
+    "hu": "Műfajok (több)",
+    "vi": "Thể loại (nhiều)"
   },
   "metafield.year": {
     "fr": "Année",
@@ -117,7 +359,9 @@
     "ja": "年",
     "ko": "연도",
     "ro": "An",
-    "sv": "År"
+    "sv": "År",
+    "hu": "Év",
+    "vi": "Năm"
   },
   "metafield.composer": {
     "fr": "Compositeur",
@@ -129,7 +373,9 @@
     "ja": "作曲者",
     "ko": "작곡가",
     "ro": "Compozitor",
-    "sv": "Kompositör"
+    "sv": "Kompositör",
+    "hu": "Szerző",
+    "vi": "Nhà soạn nhạc"
   },
   "metafield.conductor": {
     "fr": "Chef d'orchestre",
@@ -141,7 +387,9 @@
     "ja": "指揮者",
     "ko": "지휘자",
     "ro": "Dirijor",
-    "sv": "Dirigent"
+    "sv": "Dirigent",
+    "hu": "Karmester",
+    "vi": "Nhạc trưởng"
   },
   "metafield.lyricist": {
     "fr": "Parolier",
@@ -153,7 +401,9 @@
     "ja": "作詞者",
     "ko": "작사가",
     "ro": "Textier",
-    "sv": "Textförfattare"
+    "sv": "Textförfattare",
+    "hu": "Szövegíró",
+    "vi": "Người viết lời"
   },
   "metafield.performer": {
     "fr": "Interprète",
@@ -165,7 +415,9 @@
     "ja": "演奏者",
     "ko": "연주자",
     "ro": "Interpret",
-    "sv": "Utövare"
+    "sv": "Utövare",
+    "hu": "Előadó",
+    "vi": "Người biểu diễn"
   },
   "metafield.remixer": {
     "fr": "Remixeur",
@@ -177,7 +429,9 @@
     "ja": "リミキサー",
     "ko": "리믹서",
     "ro": "Remixer",
-    "sv": "Remixare"
+    "sv": "Remixare",
+    "hu": "Remixer",
+    "vi": "Người remix"
   },
   "metafield.label": {
     "fr": "Label",
@@ -189,7 +443,9 @@
     "ja": "レーベル",
     "ko": "레이블",
     "ro": "Casă de discuri",
-    "sv": "Skivbolag"
+    "sv": "Skivbolag",
+    "hu": "Kiadó",
+    "vi": "Hãng đĩa"
   },
   "metafield.producer": {
     "fr": "Producteur",
@@ -201,7 +457,9 @@
     "ja": "プロデューサー",
     "ko": "프로듀서",
     "ro": "Producător",
-    "sv": "Producent"
+    "sv": "Producent",
+    "hu": "Producer",
+    "vi": "Nhà sản xuất"
   },
   "metafield.bpm": {
     "fr": "BPM",
@@ -213,7 +471,9 @@
     "ja": "BPM",
     "ko": "BPM",
     "ro": "BPM",
-    "sv": "BPM"
+    "sv": "BPM",
+    "hu": "BPM",
+    "vi": "BPM"
   },
   "metafield.mood": {
     "fr": "Ambiance",
@@ -225,7 +485,9 @@
     "ja": "ムード",
     "ko": "분위기",
     "ro": "Atmosferă",
-    "sv": "Stämning"
+    "sv": "Stämning",
+    "hu": "Hangulat",
+    "vi": "Tâm trạng"
   },
   "metafield.grouping": {
     "fr": "Regroupement",
@@ -237,7 +499,9 @@
     "ja": "グループ",
     "ko": "그룹",
     "ro": "Grupare",
-    "sv": "Gruppering"
+    "sv": "Gruppering",
+    "hu": "Csoportosítás",
+    "vi": "Nhóm"
   },
   "metafield.compilation": {
     "fr": "Compilation",
@@ -249,7 +513,9 @@
     "ja": "コンピレーション",
     "ko": "컴필레이션",
     "ro": "Compilație",
-    "sv": "Samlingsalbum"
+    "sv": "Samlingsalbum",
+    "hu": "Válogatás",
+    "vi": "Tuyển tập"
   },
   "metafield.comment": {
     "fr": "Commentaire",
@@ -261,7 +527,9 @@
     "ja": "コメント",
     "ko": "설명",
     "ro": "Comentariu",
-    "sv": "Kommentar"
+    "sv": "Kommentar",
+    "hu": "Megjegyzés",
+    "vi": "Ghi chú"
   },
   "metafield.lyrics": {
     "fr": "Paroles",
@@ -273,7 +541,9 @@
     "ja": "歌詞",
     "ko": "가사",
     "ro": "Versuri",
-    "sv": "Sångtext"
+    "sv": "Sångtext",
+    "hu": "Dalszöveg",
+    "vi": "Lời bài hát"
   },
   "metafield.isrc": {
     "fr": "ISRC",
@@ -285,7 +555,9 @@
     "ja": "ISRC",
     "ko": "ISRC",
     "ro": "ISRC",
-    "sv": "ISRC"
+    "sv": "ISRC",
+    "hu": "ISRC",
+    "vi": "ISRC"
   },
   "metafield.barcode": {
     "fr": "Code-barres",
@@ -297,7 +569,9 @@
     "ja": "バーコード",
     "ko": "바코드",
     "ro": "Cod de bare",
-    "sv": "Streckkod"
+    "sv": "Streckkod",
+    "hu": "Vonalkód",
+    "vi": "Mã vạch"
   },
   "metafield.catalog_number": {
     "fr": "Réf. catalogue",
@@ -309,7 +583,9 @@
     "ja": "カタログ番号",
     "ko": "카탈로그 번호",
     "ro": "Nr. catalog",
-    "sv": "Katalognr"
+    "sv": "Katalognr",
+    "hu": "Katalógusszám",
+    "vi": "Số catalog"
   },
   "metafield.media_type": {
     "fr": "Support",
@@ -321,7 +597,9 @@
     "ja": "メディアタイプ",
     "ko": "매체 종류",
     "ro": "Tip de suport",
-    "sv": "Medietyp"
+    "sv": "Medietyp",
+    "hu": "Hordozó típusa",
+    "vi": "Loại phương tiện"
   },
   "metafield.musicbrainz_recording_id": {
     "fr": "MusicBrainz Recording ID",
@@ -333,7 +611,9 @@
     "ja": "MusicBrainz Recording ID",
     "ko": "MusicBrainz Recording ID",
     "ro": "MusicBrainz Recording ID",
-    "sv": "MusicBrainz Recording ID"
+    "sv": "MusicBrainz Recording ID",
+    "hu": "MusicBrainz felvétel-azonosító",
+    "vi": "ID bản thu MusicBrainz"
   },
   "metafield.musicbrainz_release_id": {
     "fr": "MusicBrainz Release ID",
@@ -345,7 +625,9 @@
     "ja": "MusicBrainz Release ID",
     "ko": "MusicBrainz Release ID",
     "ro": "MusicBrainz Release ID",
-    "sv": "MusicBrainz Release ID"
+    "sv": "MusicBrainz Release ID",
+    "hu": "MusicBrainz kiadás-azonosító",
+    "vi": "ID phát hành MusicBrainz"
   },
   "metafield.musicbrainz_release_group_id": {
     "fr": "MusicBrainz Release Group ID",
@@ -357,7 +639,9 @@
     "ja": "MusicBrainz Release Group ID",
     "ko": "MusicBrainz Release Group ID",
     "ro": "MusicBrainz Release Group ID",
-    "sv": "MusicBrainz Release Group ID"
+    "sv": "MusicBrainz Release Group ID",
+    "hu": "MusicBrainz kiadáscsoport-azonosító",
+    "vi": "ID nhóm phát hành MusicBrainz"
   },
   "metafield.release_date": {
     "fr": "Date de sortie",
@@ -369,7 +653,9 @@
     "ja": "リリース日",
     "ko": "발매일",
     "ro": "Dată de lansare",
-    "sv": "Utgivningsdatum"
+    "sv": "Utgivningsdatum",
+    "hu": "Megjelenés dátuma",
+    "vi": "Ngày phát hành"
   },
   "metafield.original_date": {
     "fr": "Date originale",
@@ -381,7 +667,9 @@
     "ja": "オリジナル日付",
     "ko": "원본 날짜",
     "ro": "Dată originală",
-    "sv": "Originaldatum"
+    "sv": "Originaldatum",
+    "hu": "Eredeti dátum",
+    "vi": "Ngày gốc"
   },
   "metafield.original_year": {
     "fr": "Année originale",
@@ -393,7 +681,9 @@
     "ja": "オリジナル年",
     "ko": "원본 연도",
     "ro": "An original",
-    "sv": "Originalår"
+    "sv": "Originalår",
+    "hu": "Eredeti év",
+    "vi": "Năm gốc"
   },
   "metafield.format": {
     "fr": "Format audio",
@@ -405,7 +695,9 @@
     "ja": "オーディオ形式",
     "ko": "오디오 형식",
     "ro": "Format audio",
-    "sv": "Ljudformat"
+    "sv": "Ljudformat",
+    "hu": "Hangformátum",
+    "vi": "Định dạng âm thanh"
   },
   "metafield.sample_rate": {
     "fr": "Fréquence d'échantillonnage",
@@ -417,7 +709,9 @@
     "ja": "サンプリングレート",
     "ko": "샘플링 레이트",
     "ro": "Frecvență de eșantionare",
-    "sv": "Samplingsfrekvens"
+    "sv": "Samplingsfrekvens",
+    "hu": "Mintavételi frekvencia",
+    "vi": "Tần số lấy mẫu"
   },
   "metafield.bit_depth": {
     "fr": "Profondeur de bits",
@@ -429,7 +723,9 @@
     "ja": "ビット深度",
     "ko": "비트 심도",
     "ro": "Adâncime de biți",
-    "sv": "Bitdjup"
+    "sv": "Bitdjup",
+    "hu": "Bitmélység",
+    "vi": "Độ sâu bit"
   },
   "metafield.channels": {
     "fr": "Canaux",
@@ -441,7 +737,9 @@
     "ja": "チャンネル",
     "ko": "채널",
     "ro": "Canale",
-    "sv": "Kanaler"
+    "sv": "Kanaler",
+    "hu": "Csatornák",
+    "vi": "Kênh"
   },
   "metafield.duration_ms": {
     "fr": "Durée",
@@ -453,7 +751,9 @@
     "ja": "再生時間",
     "ko": "재생 시간",
     "ro": "Durată",
-    "sv": "Speltid"
+    "sv": "Speltid",
+    "hu": "Időtartam",
+    "vi": "Thời lượng"
   },
   "metafield.file_size": {
     "fr": "Taille du fichier",
@@ -465,7 +765,9 @@
     "ja": "ファイルサイズ",
     "ko": "파일 크기",
     "ro": "Dimensiune fișier",
-    "sv": "Filstorlek"
+    "sv": "Filstorlek",
+    "hu": "Fájlméret",
+    "vi": "Kích thước file"
   },
   "metafield.file_path": {
     "fr": "Chemin du fichier",
@@ -477,7 +779,9 @@
     "ja": "ファイルパス",
     "ko": "파일 경로",
     "ro": "Cale fișier",
-    "sv": "Filsökväg"
+    "sv": "Filsökväg",
+    "hu": "Fájl elérési útja",
+    "vi": "Đường dẫn file"
   },
   "metafield.encoder": {
     "fr": "Encodeur",
@@ -489,7 +793,9 @@
     "ja": "エンコーダー",
     "ko": "인코더",
     "ro": "Codificator",
-    "sv": "Kodare"
+    "sv": "Kodare",
+    "hu": "Kódoló",
+    "vi": "Bộ mã hóa"
   },
   "metafield.encoder_software": {
     "fr": "Logiciel d'encodage",
@@ -501,7 +807,9 @@
     "ja": "エンコードソフトウェア",
     "ko": "인코더 소프트웨어",
     "ro": "Software de codare",
-    "sv": "Kodningsprogram"
+    "sv": "Kodningsprogram",
+    "hu": "Kódolószoftver",
+    "vi": "Phần mềm mã hóa"
   },
   "metafield.source_media": {
     "fr": "Support source",
@@ -513,7 +821,9 @@
     "ja": "ソース媒体",
     "ko": "소스 매체",
     "ro": "Suport sursă",
-    "sv": "Källmedium"
+    "sv": "Källmedium",
+    "hu": "Forráshordozó",
+    "vi": "Phương tiện nguồn"
   },
   "metafield.mb_release_track_id": {
     "fr": "MusicBrainz Release Track ID",
@@ -525,7 +835,9 @@
     "ja": "MusicBrainz Release Track ID",
     "ko": "MusicBrainz Release Track ID",
     "ro": "MusicBrainz Release Track ID",
-    "sv": "MusicBrainz Release Track ID"
+    "sv": "MusicBrainz Release Track ID",
+    "hu": "MusicBrainz kiadásszám-azonosító",
+    "vi": "ID bài trong phát hành MusicBrainz"
   },
   "metafield.release_country": {
     "fr": "Pays de sortie",
@@ -537,7 +849,9 @@
     "ja": "リリース国",
     "ko": "발매 국가",
     "ro": "Țara de lansare",
-    "sv": "Utgivningsland"
+    "sv": "Utgivningsland",
+    "hu": "Megjelenés országa",
+    "vi": "Quốc gia phát hành"
   },
   "metafield.copyright": {
     "fr": "Copyright",
@@ -549,7 +863,9 @@
     "ja": "Copyright",
     "ko": "Copyright",
     "ro": "Copyright",
-    "sv": "Copyright"
+    "sv": "Copyright",
+    "hu": "Szerzői jog",
+    "vi": "Bản quyền"
   },
   "metafield.language": {
     "fr": "Langue",
@@ -561,7 +877,9 @@
     "ja": "言語",
     "ko": "언어",
     "ro": "Limbă",
-    "sv": "Språk"
+    "sv": "Språk",
+    "hu": "Nyelv",
+    "vi": "Ngôn ngữ"
   },
   "metafield.rg_track_gain": {
     "fr": "ReplayGain piste",
@@ -573,7 +891,9 @@
     "ja": "ReplayGain トラック",
     "ko": "ReplayGain 트랙",
     "ro": "ReplayGain piesă",
-    "sv": "ReplayGain spår"
+    "sv": "ReplayGain spår",
+    "hu": "ReplayGain (szám)",
+    "vi": "ReplayGain bài hát"
   },
   "metafield.rg_album_gain": {
     "fr": "ReplayGain album",
@@ -585,7 +905,9 @@
     "ja": "ReplayGain アルバム",
     "ko": "ReplayGain 앨범",
     "ro": "ReplayGain album",
-    "sv": "ReplayGain album"
+    "sv": "ReplayGain album",
+    "hu": "ReplayGain (album)",
+    "vi": "ReplayGain album"
   },
   "metacat.Identification": {
     "fr": "Identification",
@@ -597,7 +919,9 @@
     "ja": "識別",
     "ko": "식별",
     "ro": "Identificare",
-    "sv": "Identifiering"
+    "sv": "Identifiering",
+    "hu": "Azonosítás",
+    "vi": "Nhận dạng"
   },
   "metacat.Crédits": {
     "fr": "Crédits",
@@ -609,7 +933,9 @@
     "ja": "クレジット",
     "ko": "크레딧",
     "ro": "Credite",
-    "sv": "Medverkande"
+    "sv": "Medverkande",
+    "hu": "Közreműködők",
+    "vi": "Ghi công"
   },
   "metacat.Classification": {
     "fr": "Classification",
@@ -621,7 +947,9 @@
     "ja": "分類",
     "ko": "분류",
     "ro": "Clasificare",
-    "sv": "Klassificering"
+    "sv": "Klassificering",
+    "hu": "Besorolás",
+    "vi": "Phân loại"
   },
   "metacat.Texte": {
     "fr": "Texte",
@@ -633,7 +961,9 @@
     "ja": "テキスト",
     "ko": "텍스트",
     "ro": "Text",
-    "sv": "Text"
+    "sv": "Text",
+    "hu": "Szöveg",
+    "vi": "Văn bản"
   },
   "metacat.Identifiants": {
     "fr": "Identifiants",
@@ -645,7 +975,9 @@
     "ja": "識別子",
     "ko": "식별자",
     "ro": "Identificatori",
-    "sv": "Identifierare"
+    "sv": "Identifierare",
+    "hu": "Azonosítók",
+    "vi": "Mã định danh"
   },
   "metacat.Dates": {
     "fr": "Dates",
@@ -657,7 +989,9 @@
     "ja": "日付",
     "ko": "날짜",
     "ro": "Date",
-    "sv": "Datum"
+    "sv": "Datum",
+    "hu": "Dátumok",
+    "vi": "Ngày tháng"
   },
   "metacat.Technique": {
     "fr": "Technique",
@@ -669,7 +1003,9 @@
     "ja": "技術",
     "ko": "기술",
     "ro": "Tehnic",
-    "sv": "Tekniskt"
+    "sv": "Tekniskt",
+    "hu": "Műszaki adatok",
+    "vi": "Kỹ thuật"
   },
   "metacat.ReplayGain": {
     "fr": "ReplayGain",
@@ -681,7 +1017,9 @@
     "ja": "ReplayGain",
     "ko": "ReplayGain",
     "ro": "ReplayGain",
-    "sv": "ReplayGain"
+    "sv": "ReplayGain",
+    "hu": "ReplayGain",
+    "vi": "ReplayGain"
   },
   "svctok.musicbrainz.purpose": {
     "fr": "Années + crédits + couvertures (ID releases).",
@@ -693,7 +1031,9 @@
     "ja": "年 + クレジット + カバー（release ID）。",
     "ko": "연도 + 크레딧 + 커버(release ID).",
     "ro": "Ani + credite + coperți (ID-uri de lansare).",
-    "sv": "År + medverkande + omslag (release-ID:n)."
+    "sv": "År + medverkande + omslag (release-ID:n).",
+    "hu": "Évek + közreműködők + borítók (kiadás-azonosítók).",
+    "vi": "Năm + ghi công + ảnh bìa (ID phát hành)."
   },
   "svctok.musicbrainz.pricing": {
     "fr": "100 % gratuit, base de données ouverte.",
@@ -705,7 +1045,9 @@
     "ja": "100% 無料、オープンデータベース。",
     "ko": "100% 무료, 오픈 데이터베이스.",
     "ro": "100% gratuit, bază de date deschisă.",
-    "sv": "100 % gratis, öppen databas."
+    "sv": "100 % gratis, öppen databas.",
+    "hu": "100% ingyenes, nyílt adatbázis.",
+    "vi": "Miễn phí 100%, cơ sở dữ liệu mở."
   },
   "svctok.musicbrainz.step1": {
     "fr": "Aucun token requis — MusicBrainz est gratuit et anonyme.",
@@ -717,7 +1059,9 @@
     "ja": "token は不要 — MusicBrainz は無料で匿名です。",
     "ko": "token 불필요 — MusicBrainz는 무료이며 익명입니다.",
     "ro": "Niciun token necesar — MusicBrainz este gratuit și anonim.",
-    "sv": "Ingen token krävs — MusicBrainz är gratis och anonymt."
+    "sv": "Ingen token krävs — MusicBrainz är gratis och anonymt.",
+    "hu": "Nem kell token — a MusicBrainz ingyenes és névtelen.",
+    "vi": "Không cần token — MusicBrainz miễn phí và ẩn danh."
   },
   "svctok.discogs.purpose": {
     "fr": "Années + couvertures + crédits pour pressages obscurs.",
@@ -729,7 +1073,9 @@
     "ja": "希少なプレスの年 + カバー + クレジット。",
     "ko": "희귀 프레싱의 연도 + 커버 + 크레딧.",
     "ro": "Ani + coperți + credite pentru presaje obscure.",
-    "sv": "År + omslag + medverkande för ovanliga pressningar."
+    "sv": "År + omslag + medverkande för ovanliga pressningar.",
+    "hu": "Évek + borítók + közreműködők ritka préselésekhez.",
+    "vi": "Năm + ảnh bìa + ghi công cho các bản ép hiếm."
   },
   "svctok.discogs.pricing": {
     "fr": "Compte + token personnel gratuits ; API gratuite avec quota (60 req/min).",
@@ -741,7 +1087,9 @@
     "ja": "アカウント + 個人 token は無料。API は無料で上限あり（60 req/min）。",
     "ko": "계정 + 개인 token 무료. 할당량이 있는 무료 API(60 req/min).",
     "ro": "Cont + token personal gratuite; API gratuit cu cotă (60 req/min).",
-    "sv": "Gratis konto + personlig token; gratis API med kvot (60 req/min)."
+    "sv": "Gratis konto + personlig token; gratis API med kvot (60 req/min).",
+    "hu": "Ingyenes fiók + személyes token; ingyenes API kvótával (60 kérés/perc).",
+    "vi": "Tài khoản miễn phí + token cá nhân; API miễn phí có hạn mức (60 yêu cầu/phút)."
   },
   "svctok.discogs.step1": {
     "fr": "Connecte-toi sur discogs.com.",
@@ -753,7 +1101,9 @@
     "ja": "discogs.com にログインします。",
     "ko": "discogs.com에 로그인하세요.",
     "ro": "Autentifică-te pe discogs.com.",
-    "sv": "Logga in på discogs.com."
+    "sv": "Logga in på discogs.com.",
+    "hu": "Jelentkezzen be a discogs.com oldalon.",
+    "vi": "Đăng nhập vào discogs.com."
   },
   "svctok.discogs.step2": {
     "fr": "Va dans Settings → Developers.",
@@ -765,7 +1115,9 @@
     "ja": "Settings → Developers に移動します。",
     "ko": "Settings → Developers로 이동하세요.",
     "ro": "Mergi la Settings → Developers.",
-    "sv": "Gå till Settings → Developers."
+    "sv": "Gå till Settings → Developers.",
+    "hu": "Nyissa meg: Settings → Developers.",
+    "vi": "Vào Settings → Developers."
   },
   "svctok.discogs.step3": {
     "fr": "Clique 'Generate new token'.",
@@ -777,7 +1129,9 @@
     "ja": "'Generate new token' をクリックします。",
     "ko": "'Generate new token'을 클릭하세요.",
     "ro": "Apasă „Generate new token”.",
-    "sv": "Klicka på 'Generate new token'."
+    "sv": "Klicka på 'Generate new token'.",
+    "hu": "Kattintson a „Generate new token” gombra.",
+    "vi": "Nhấn “Generate new token”."
   },
   "svctok.discogs.step4": {
     "fr": "Colle le token ici.",
@@ -789,7 +1143,9 @@
     "ja": "ここに token を貼り付けます。",
     "ko": "여기에 token을 붙여넣으세요.",
     "ro": "Lipește token-ul aici.",
-    "sv": "Klistra in token här."
+    "sv": "Klistra in token här.",
+    "hu": "Illessze be ide a tokent.",
+    "vi": "Dán token vào đây."
   },
   "svctok.lastfm.purpose": {
     "fr": "Genres + scrobbling.",
@@ -801,7 +1157,9 @@
     "ja": "ジャンル + scrobbling。",
     "ko": "장르 + scrobbling.",
     "ro": "Genuri + scrobbling.",
-    "sv": "Genrer + scrobbling."
+    "sv": "Genrer + scrobbling.",
+    "hu": "Műfajok + scrobbling.",
+    "vi": "Thể loại + scrobbling."
   },
   "svctok.lastfm.pricing": {
     "fr": "API gratuite pour usage non commercial.",
@@ -813,7 +1171,9 @@
     "ja": "非商用利用向けの無料 API。",
     "ko": "비상업적 용도의 무료 API.",
     "ro": "API gratuit pentru uz necomercial.",
-    "sv": "Gratis API för icke-kommersiellt bruk."
+    "sv": "Gratis API för icke-kommersiellt bruk.",
+    "hu": "Ingyenes API nem kereskedelmi használatra.",
+    "vi": "API miễn phí cho mục đích phi thương mại."
   },
   "svctok.lastfm.step1": {
     "fr": "Va sur last.fm/api/account/create",
@@ -825,7 +1185,9 @@
     "ja": "last.fm/api/account/create にアクセスします",
     "ko": "last.fm/api/account/create로 이동하세요",
     "ro": "Mergi la last.fm/api/account/create",
-    "sv": "Gå till last.fm/api/account/create"
+    "sv": "Gå till last.fm/api/account/create",
+    "hu": "Nyissa meg: last.fm/api/account/create",
+    "vi": "Truy cập last.fm/api/account/create"
   },
   "svctok.lastfm.step2": {
     "fr": "Renseigne un nom d'application.",
@@ -837,7 +1199,9 @@
     "ja": "アプリケーション名を入力します。",
     "ko": "애플리케이션 이름을 입력하세요.",
     "ro": "Introdu un nume de aplicație.",
-    "sv": "Ange ett programnamn."
+    "sv": "Ange ett programnamn.",
+    "hu": "Adja meg az alkalmazás nevét.",
+    "vi": "Nhập tên ứng dụng."
   },
   "svctok.lastfm.step3": {
     "fr": "Récupère 'API key' et 'Shared secret'.",
@@ -849,7 +1213,9 @@
     "ja": "'API key' と 'Shared secret' を取得します。",
     "ko": "'API key'와 'Shared secret'을 받으세요.",
     "ro": "Obține „API key” și „Shared secret”.",
-    "sv": "Hämta din 'API key' och 'Shared secret'."
+    "sv": "Hämta din 'API key' och 'Shared secret'.",
+    "hu": "Másolja ki az „API key” és a „Shared secret” értékét.",
+    "vi": "Lấy “API key” và “Shared secret”."
   },
   "svctok.lastfm.step4": {
     "fr": "Colle ici puis Enregistrer.",
@@ -861,7 +1227,9 @@
     "ja": "ここに貼り付けて保存します。",
     "ko": "여기에 붙여넣은 후 저장하세요.",
     "ro": "Lipește aici, apoi Salvează.",
-    "sv": "Klistra in här och spara sedan."
+    "sv": "Klistra in här och spara sedan.",
+    "hu": "Illessze be ide, majd mentse.",
+    "vi": "Dán vào đây rồi Lưu."
   },
   "svctok.lastfm.fieldApiSecret": {
     "fr": "API Secret (pour scrobbling)",
@@ -873,7 +1241,9 @@
     "ja": "API Secret（scrobbling 用）",
     "ko": "API Secret(scrobbling용)",
     "ro": "API Secret (pentru scrobbling)",
-    "sv": "API Secret (för scrobbling)"
+    "sv": "API Secret (för scrobbling)",
+    "hu": "API Secret (a scrobblinghoz)",
+    "vi": "API Secret (để scrobbling)"
   },
   "svctok.genius.purpose": {
     "fr": "Paroles.",
@@ -885,7 +1255,9 @@
     "ja": "歌詞。",
     "ko": "가사.",
     "ro": "Versuri.",
-    "sv": "Sångtexter."
+    "sv": "Sångtexter.",
+    "hu": "Dalszövegek.",
+    "vi": "Lời bài hát."
   },
   "svctok.genius.pricing": {
     "fr": "API gratuite.",
@@ -897,7 +1269,9 @@
     "ja": "無料 API。",
     "ko": "무료 API.",
     "ro": "API gratuit.",
-    "sv": "Gratis API."
+    "sv": "Gratis API.",
+    "hu": "Ingyenes API.",
+    "vi": "API miễn phí."
   },
   "svctok.genius.step1": {
     "fr": "Crée un compte sur genius.com.",
@@ -909,7 +1283,9 @@
     "ja": "genius.com でアカウントを作成します。",
     "ko": "genius.com에서 계정을 만드세요.",
     "ro": "Creează un cont pe genius.com.",
-    "sv": "Skapa ett konto på genius.com."
+    "sv": "Skapa ett konto på genius.com.",
+    "hu": "Hozzon létre fiókot a genius.com oldalon.",
+    "vi": "Tạo tài khoản trên genius.com."
   },
   "svctok.genius.step2": {
     "fr": "Va dans API Clients.",
@@ -921,7 +1297,9 @@
     "ja": "API Clients に移動します。",
     "ko": "API Clients로 이동하세요.",
     "ro": "Mergi la API Clients.",
-    "sv": "Gå till API Clients."
+    "sv": "Gå till API Clients.",
+    "hu": "Nyissa meg az API Clients oldalt.",
+    "vi": "Vào API Clients."
   },
   "svctok.genius.step3": {
     "fr": "Crée une application et copie le token.",
@@ -933,7 +1311,9 @@
     "ja": "アプリケーションを作成し、token をコピーします。",
     "ko": "애플리케이션을 만들고 token을 복사하세요.",
     "ro": "Creează o aplicație și copiază token-ul.",
-    "sv": "Skapa ett program och kopiera token."
+    "sv": "Skapa ett program och kopiera token.",
+    "hu": "Hozzon létre egy alkalmazást, és másolja ki a tokent.",
+    "vi": "Tạo một ứng dụng và sao chép token."
   },
   "svctok.radiofrance.purpose": {
     "fr": "Podcasts et émissions de Radio France.",
@@ -945,7 +1325,9 @@
     "ja": "Radio France のポッドキャストと番組。",
     "ko": "Radio France 팟캐스트와 프로그램.",
     "ro": "Podcasturi și emisiuni Radio France.",
-    "sv": "Poddar och program från Radio France."
+    "sv": "Poddar och program från Radio France.",
+    "hu": "Radio France podcastok és műsorok.",
+    "vi": "Podcast và chương trình của Radio France."
   },
   "svctok.radiofrance.pricing": {
     "fr": "API gratuite.",
@@ -957,7 +1339,9 @@
     "ja": "無料 API。",
     "ko": "무료 API.",
     "ro": "API gratuit.",
-    "sv": "Gratis API."
+    "sv": "Gratis API.",
+    "hu": "Ingyenes API.",
+    "vi": "API miễn phí."
   },
   "svctok.radiofrance.step1": {
     "fr": "Crée un compte sur developers.radiofrance.fr.",
@@ -969,7 +1353,9 @@
     "ja": "developers.radiofrance.fr でアカウントを作成します。",
     "ko": "developers.radiofrance.fr에서 계정을 만드세요.",
     "ro": "Creează un cont pe developers.radiofrance.fr.",
-    "sv": "Skapa ett konto på developers.radiofrance.fr."
+    "sv": "Skapa ett konto på developers.radiofrance.fr.",
+    "hu": "Hozzon létre fiókot a developers.radiofrance.fr oldalon.",
+    "vi": "Tạo tài khoản trên developers.radiofrance.fr."
   },
   "svctok.radiofrance.step2": {
     "fr": "Demande l'accès à l'API Open Radio France.",
@@ -981,7 +1367,9 @@
     "ja": "Open Radio France API へのアクセスを申請します。",
     "ko": "Open Radio France API 접근 권한을 신청하세요.",
     "ro": "Solicită acces la API-ul Open Radio France.",
-    "sv": "Begär åtkomst till Open Radio France-API:et."
+    "sv": "Begär åtkomst till Open Radio France-API:et.",
+    "hu": "Kérjen hozzáférést az Open Radio France API-hoz.",
+    "vi": "Yêu cầu quyền truy cập Open Radio France API."
   },
   "svctok.radiofrance.step3": {
     "fr": "Copie la clé API et colle-la ici.",
@@ -993,7 +1381,9 @@
     "ja": "API キーをコピーしてここに貼り付けます。",
     "ko": "API 키를 복사해 여기에 붙여 넣으세요.",
     "ro": "Copiază cheia API și lipește-o aici.",
-    "sv": "Kopiera API-nyckeln och klistra in den här."
+    "sv": "Kopiera API-nyckeln och klistra in den här.",
+    "hu": "Másolja ki az API-kulcsot, és illessze be ide.",
+    "vi": "Sao chép khóa API và dán vào đây."
   },
   "svctok.tidal.purpose": {
     "fr": "Streaming hi-res + années + couvertures.",
@@ -1005,7 +1395,9 @@
     "ja": "ハイレゾストリーミング + 年 + カバー。",
     "ko": "Hi-res 스트리밍 + 연도 + 커버.",
     "ro": "Streaming hi-res + ani + coperți.",
-    "sv": "Hi-res-streaming + år + omslag."
+    "sv": "Hi-res-streaming + år + omslag.",
+    "hu": "Hi-res streaming + évek + borítók.",
+    "vi": "Streaming hi-res + năm + ảnh bìa."
   },
   "svctok.tidal.pricing": {
     "fr": "Abonnement Tidal HiFi requis (≈ 11€/mois).",
@@ -1017,7 +1409,9 @@
     "ja": "Tidal HiFi の登録が必要（≈ 11€/月）。",
     "ko": "Tidal HiFi 구독 필요(≈ 11€/월).",
     "ro": "Este necesar un abonament Tidal HiFi (≈ 11€/lună).",
-    "sv": "Tidal HiFi-abonnemang krävs (≈ 11€/månad)."
+    "sv": "Tidal HiFi-abonnemang krävs (≈ 11€/månad).",
+    "hu": "Tidal HiFi előfizetés szükséges (≈ 11 €/hó).",
+    "vi": "Cần gói Tidal HiFi (≈ 11€/tháng)."
   },
   "svctok.tidal.step1": {
     "fr": "Tidal utilise OAuth — utilise la page Streaming → Tidal pour te connecter.",
@@ -1029,7 +1423,9 @@
     "ja": "Tidal は OAuth を使用します — 接続には Streaming → Tidal ページを使用してください。",
     "ko": "Tidal은 OAuth를 사용합니다 — 연결하려면 Streaming → Tidal 페이지를 사용하세요.",
     "ro": "Tidal folosește OAuth — folosește pagina Streaming → Tidal pentru a te conecta.",
-    "sv": "Tidal använder OAuth — använd sidan Streaming → Tidal för att ansluta."
+    "sv": "Tidal använder OAuth — använd sidan Streaming → Tidal för att ansluta.",
+    "hu": "A Tidal OAuth-t használ — a csatlakozáshoz használja a Streaming → Tidal oldalt.",
+    "vi": "Tidal dùng OAuth — hãy dùng trang Streaming → Tidal để kết nối."
   },
   "svctok.qobuz.purpose": {
     "fr": "Streaming hi-res + années + couvertures.",
@@ -1041,7 +1437,9 @@
     "ja": "ハイレゾストリーミング + 年 + カバー。",
     "ko": "Hi-res 스트리밍 + 연도 + 커버.",
     "ro": "Streaming hi-res + ani + coperți.",
-    "sv": "Hi-res-streaming + år + omslag."
+    "sv": "Hi-res-streaming + år + omslag.",
+    "hu": "Hi-res streaming + évek + borítók.",
+    "vi": "Streaming hi-res + năm + ảnh bìa."
   },
   "svctok.qobuz.pricing": {
     "fr": "Abonnement Qobuz Studio requis (≈ 13€/mois).",
@@ -1053,7 +1451,9 @@
     "ja": "Qobuz Studio の登録が必要（≈ 13€/月）。",
     "ko": "Qobuz Studio 구독 필요(≈ 13€/월).",
     "ro": "Este necesar un abonament Qobuz Studio (≈ 13€/lună).",
-    "sv": "Qobuz Studio-abonnemang krävs (≈ 13€/månad)."
+    "sv": "Qobuz Studio-abonnemang krävs (≈ 13€/månad).",
+    "hu": "Qobuz Studio előfizetés szükséges (≈ 13 €/hó).",
+    "vi": "Cần gói Qobuz Studio (≈ 13€/tháng)."
   },
   "svctok.qobuz.step1": {
     "fr": "Qobuz utilise login/password — utilise la page Streaming → Qobuz pour te connecter.",
@@ -1065,7 +1465,9 @@
     "ja": "Qobuz はログイン/パスワードを使用します — 接続には Streaming → Qobuz ページを使用してください。",
     "ko": "Qobuz는 로그인/비밀번호를 사용합니다 — 연결하려면 Streaming → Qobuz 페이지를 사용하세요.",
     "ro": "Qobuz folosește login/parolă — folosește pagina Streaming → Qobuz pentru a te conecta.",
-    "sv": "Qobuz använder inloggning/lösenord — använd sidan Streaming → Qobuz för att ansluta."
+    "sv": "Qobuz använder inloggning/lösenord — använd sidan Streaming → Qobuz för att ansluta.",
+    "hu": "A Qobuz felhasználónevet és jelszót használ — a csatlakozáshoz használja a Streaming → Qobuz oldalt.",
+    "vi": "Qobuz dùng tên đăng nhập/mật khẩu — hãy dùng trang Streaming → Qobuz để kết nối."
   },
   "svctok.spotify.purpose": {
     "fr": "Streaming + connectivité.",
@@ -1077,7 +1479,9 @@
     "ja": "ストリーミング + 接続。",
     "ko": "스트리밍 + 연결.",
     "ro": "Streaming + conectivitate.",
-    "sv": "Streaming + anslutning."
+    "sv": "Streaming + anslutning.",
+    "hu": "Streaming + csatlakoztathatóság.",
+    "vi": "Streaming + kết nối."
   },
   "svctok.spotify.pricing": {
     "fr": "Compte Spotify gratuit ou Premium (≈ 11€/mois).",
@@ -1089,7 +1493,9 @@
     "ja": "無料または Premium の Spotify アカウント（≈ 11€/月）。",
     "ko": "무료 또는 Premium Spotify 계정(≈ 11€/월).",
     "ro": "Cont Spotify gratuit sau Premium (≈ 11€/lună).",
-    "sv": "Gratis eller Premium Spotify-konto (≈ 11€/månad)."
+    "sv": "Gratis eller Premium Spotify-konto (≈ 11€/månad).",
+    "hu": "Ingyenes vagy Premium Spotify-fiók (≈ 11 €/hó).",
+    "vi": "Tài khoản Spotify miễn phí hoặc Premium (≈ 11€/tháng)."
   },
   "svctok.spotify.step1": {
     "fr": "Spotify utilise OAuth — utilise la page Streaming → Spotify pour te connecter.",
@@ -1101,7 +1507,9 @@
     "ja": "Spotify は OAuth を使用します — 接続には Streaming → Spotify ページを使用してください。",
     "ko": "Spotify는 OAuth를 사용합니다 — 연결하려면 Streaming → Spotify 페이지를 사용하세요.",
     "ro": "Spotify folosește OAuth — folosește pagina Streaming → Spotify pentru a te conecta.",
-    "sv": "Spotify använder OAuth — använd sidan Streaming → Spotify för att ansluta."
+    "sv": "Spotify använder OAuth — använd sidan Streaming → Spotify för att ansluta.",
+    "hu": "A Spotify OAuth-t használ — a csatlakozáshoz használja a Streaming → Spotify oldalt.",
+    "vi": "Spotify dùng OAuth — hãy dùng trang Streaming → Spotify để kết nối."
   },
   "svctok.deezer.purpose": {
     "fr": "Streaming.",
@@ -1113,7 +1521,9 @@
     "ja": "ストリーミング。",
     "ko": "스트리밍.",
     "ro": "Streaming.",
-    "sv": "Streaming."
+    "sv": "Streaming.",
+    "hu": "Streaming.",
+    "vi": "Streaming."
   },
   "svctok.deezer.pricing": {
     "fr": "Compte gratuit ou Deezer HiFi (≈ 12€/mois) pour FLAC.",
@@ -1125,7 +1535,9 @@
     "ja": "FLAC には無料アカウントまたは Deezer HiFi（≈ 12€/月）。",
     "ko": "FLAC를 위해 무료 계정 또는 Deezer HiFi(≈ 12€/월).",
     "ro": "Cont gratuit sau Deezer HiFi (≈ 12€/lună) pentru FLAC.",
-    "sv": "Gratis konto eller Deezer HiFi (≈ 12€/månad) för FLAC."
+    "sv": "Gratis konto eller Deezer HiFi (≈ 12€/månad) för FLAC.",
+    "hu": "Ingyenes fiók vagy Deezer HiFi (≈ 12 €/hó) a FLAC-hoz.",
+    "vi": "Tài khoản miễn phí hoặc Deezer HiFi (≈ 12€/tháng) để nghe FLAC."
   },
   "svctok.deezer.step1": {
     "fr": "Connecte-toi sur deezer.com.",
@@ -1137,7 +1549,9 @@
     "ja": "deezer.com にログインします。",
     "ko": "deezer.com에 로그인하세요.",
     "ro": "Autentifică-te pe deezer.com.",
-    "sv": "Logga in på deezer.com."
+    "sv": "Logga in på deezer.com.",
+    "hu": "Jelentkezzen be a deezer.com oldalon.",
+    "vi": "Đăng nhập vào deezer.com."
   },
   "svctok.deezer.step2": {
     "fr": "DevTools (F12) → Application → Cookies → cherche 'arl'.",
@@ -1149,7 +1563,9 @@
     "ja": "DevTools (F12) → Application → Cookies → 'arl' を探します。",
     "ko": "DevTools (F12) → Application → Cookies → 'arl'을 찾으세요.",
     "ro": "DevTools (F12) → Application → Cookies → caută „arl”.",
-    "sv": "DevTools (F12) → Application → Cookies → leta efter 'arl'."
+    "sv": "DevTools (F12) → Application → Cookies → leta efter 'arl'.",
+    "hu": "DevTools (F12) → Application → Cookies → keresse az „arl” sütit.",
+    "vi": "DevTools (F12) → Application → Cookies → tìm “arl”."
   },
   "svctok.deezer.step3": {
     "fr": "Colle le token ARL ici.",
@@ -1161,7 +1577,9 @@
     "ja": "ここに ARL token を貼り付けます。",
     "ko": "여기에 ARL token을 붙여넣으세요.",
     "ro": "Lipește token-ul ARL aici.",
-    "sv": "Klistra in ARL-token här."
+    "sv": "Klistra in ARL-token här.",
+    "hu": "Illessze be ide az ARL tokent.",
+    "vi": "Dán token ARL vào đây."
   },
   "svctok.deezer.fieldArl": {
     "fr": "ARL token (depuis cookies deezer.com)",
@@ -1173,7 +1591,9 @@
     "ja": "ARL token（deezer.com の cookies から）",
     "ko": "ARL token(deezer.com cookies에서)",
     "ro": "ARL token (din cookie-urile deezer.com)",
-    "sv": "ARL token (från deezer.com-cookies)"
+    "sv": "ARL token (från deezer.com-cookies)",
+    "hu": "ARL token (a deezer.com sütijeiből)",
+    "vi": "Token ARL (từ cookie của deezer.com)"
   },
   "svctok.err.discogsNotConfigured": {
     "fr": "Token Discogs non configuré.",
@@ -1185,7 +1605,9 @@
     "ja": "Discogs token が設定されていません。",
     "ko": "Discogs token이 설정되지 않았습니다.",
     "ro": "Token Discogs neconfigurat.",
-    "sv": "Discogs-token är inte konfigurerad."
+    "sv": "Discogs-token är inte konfigurerad.",
+    "hu": "Nincs beállítva Discogs token.",
+    "vi": "Chưa cấu hình token Discogs."
   },
   "svctok.err.lastfmNotConfigured": {
     "fr": "API Key Last.fm non configurée.",
@@ -1197,7 +1619,9 @@
     "ja": "Last.fm API Key が設定されていません。",
     "ko": "Last.fm API Key가 설정되지 않았습니다.",
     "ro": "API Key Last.fm neconfigurat.",
-    "sv": "Last.fm API Key är inte konfigurerad."
+    "sv": "Last.fm API Key är inte konfigurerad.",
+    "hu": "Nincs beállítva Last.fm API-kulcs.",
+    "vi": "Chưa cấu hình khóa API Last.fm."
   },
   "svctok.err.tokenConfiguredNoValidation": {
     "fr": "Token configuré (validation non disponible).",
@@ -1209,7 +1633,9 @@
     "ja": "token を設定しました（検証は利用できません）。",
     "ko": "token이 설정되었습니다(검증 불가).",
     "ro": "Token configurat (validare indisponibilă).",
-    "sv": "Token konfigurerad (validering ej tillgänglig)."
+    "sv": "Token konfigurerad (validering ej tillgänglig).",
+    "hu": "A token be van állítva (ellenőrzés nem érhető el).",
+    "vi": "Đã cấu hình token (không thể kiểm tra)."
   },
   "svctok.err.geniusNotConfigured": {
     "fr": "Token Genius non configuré.",
@@ -1221,7 +1647,9 @@
     "ja": "Genius token が設定されていません。",
     "ko": "Genius token이 설정되지 않았습니다.",
     "ro": "Token Genius neconfigurat.",
-    "sv": "Genius-token är inte konfigurerad."
+    "sv": "Genius-token är inte konfigurerad.",
+    "hu": "Nincs beállítva Genius token.",
+    "vi": "Chưa cấu hình token Genius."
   },
   "svctok.err.radiofranceNotConfigured": {
     "fr": "Clé API Radio France non configurée.",
@@ -1233,7 +1661,9 @@
     "ja": "Radio France の API キーが設定されていません。",
     "ko": "Radio France API 키가 설정되지 않았습니다.",
     "ro": "Cheia API Radio France neconfigurată.",
-    "sv": "Radio France-API-nyckeln är inte konfigurerad."
+    "sv": "Radio France-API-nyckeln är inte konfigurerad.",
+    "hu": "Nincs beállítva Radio France API-kulcs.",
+    "vi": "Chưa cấu hình khóa API Radio France."
   },
   "ai.nextTrack": {
     "fr": "Piste suivante : {title}",
@@ -1245,7 +1675,9 @@
     "ja": "次のトラック：{title}",
     "ko": "다음 트랙: {title}",
     "ro": "Piesa următoare: {title}",
-    "sv": "Nästa spår: {title}"
+    "sv": "Nästa spår: {title}",
+    "hu": "Következő szám: {title}",
+    "vi": "Bài tiếp theo: {title}"
   },
   "ai.volumeSet": {
     "fr": "Volume réglé à {value}%.",
@@ -1257,7 +1689,9 @@
     "ja": "音量を{value}%に設定しました。",
     "ko": "볼륨을 {value}%로 설정했습니다.",
     "ro": "Volum setat la {value}%.",
-    "sv": "Volym inställd på {value} %."
+    "sv": "Volym inställd på {value} %.",
+    "hu": "Hangerő beállítva: {value}%.",
+    "vi": "Đã đặt âm lượng {value}%."
   },
   "ai.nowPlaying": {
     "fr": "En cours : {track} — {artist}",
@@ -1269,7 +1703,9 @@
     "ja": "再生中：{track} — {artist}",
     "ko": "재생 중: {track} — {artist}",
     "ro": "Se redă acum: {track} — {artist}",
-    "sv": "Spelas nu: {track} — {artist}"
+    "sv": "Spelas nu: {track} — {artist}",
+    "hu": "Most szól: {track} — {artist}",
+    "vi": "Đang phát: {track} — {artist}"
   },
   "ai.nothingPlaying": {
     "fr": "Rien ne joue actuellement.",
@@ -1281,7 +1717,9 @@
     "ja": "現在何も再生されていません。",
     "ko": "지금 재생 중인 곡이 없습니다.",
     "ro": "Nu se redă nimic în acest moment.",
-    "sv": "Inget spelas just nu."
+    "sv": "Inget spelas just nu.",
+    "hu": "Jelenleg semmi sem szól.",
+    "vi": "Hiện không có gì đang phát."
   },
   "ai.playingCount": {
     "fr": "▶ {title} — {artist} ({count} pistes)",
@@ -1293,7 +1731,9 @@
     "ja": "▶ {title} — {artist}（{count} 曲）",
     "ko": "▶ {title} — {artist} ({count}곡)",
     "ro": "▶ {title} — {artist} ({count} piese)",
-    "sv": "▶ {title} — {artist} ({count} spår)"
+    "sv": "▶ {title} — {artist} ({count} spår)",
+    "hu": "▶ {title} — {artist} ({count} szám)",
+    "vi": "▶ {title} — {artist} ({count} bài)"
   },
   "ai.playing": {
     "fr": "▶ {title} — {artist}",
@@ -1305,7 +1745,9 @@
     "ja": "▶ {title} — {artist}",
     "ko": "▶ {title} — {artist}",
     "ro": "▶ {title} — {artist}",
-    "sv": "▶ {title} — {artist}"
+    "sv": "▶ {title} — {artist}",
+    "hu": "▶ {title} — {artist}",
+    "vi": "▶ {title} — {artist}"
   },
   "ai.notFoundLibrary": {
     "fr": "Je n'ai rien trouvé pour « {query} » dans la bibliothèque.",
@@ -1317,7 +1759,9 @@
     "ja": "ライブラリで「{query}」に該当するものが見つかりませんでした。",
     "ko": "라이브러리에서 “{query}”에 대한 결과를 찾지 못했습니다.",
     "ro": "Nu am găsit nimic pentru „{query}” în biblioteca ta.",
-    "sv": "Jag hittade inget för ”{query}” i ditt bibliotek."
+    "sv": "Jag hittade inget för ”{query}” i ditt bibliotek.",
+    "hu": "Nem találtam semmit erre: „{query}” a gyűjteményében.",
+    "vi": "Tôi không tìm thấy gì cho “{query}” trong thư viện của bạn."
   },
   "ai.noResults": {
     "fr": "Aucun résultat pour « {query} ».",
@@ -1329,7 +1773,9 @@
     "ja": "「{query}」の結果はありません。",
     "ko": "“{query}”에 대한 결과가 없습니다.",
     "ro": "Niciun rezultat pentru „{query}”.",
-    "sv": "Inga resultat för ”{query}”."
+    "sv": "Inga resultat för ”{query}”.",
+    "hu": "Nincs találat erre: „{query}”.",
+    "vi": "Không có kết quả cho “{query}”."
   },
   "ai.nArtists": {
     "fr": "{n} artiste(s)",
@@ -1341,7 +1787,9 @@
     "ja": "{n} 組のアーティスト",
     "ko": "아티스트 {n}명",
     "ro": "{n} artist/artiști",
-    "sv": "{n} artist(er)"
+    "sv": "{n} artist(er)",
+    "hu": "{n} előadó",
+    "vi": "{n} nghệ sĩ"
   },
   "ai.nAlbums": {
     "fr": "{n} album(s)",
@@ -1353,7 +1801,9 @@
     "ja": "{n} 枚のアルバム",
     "ko": "앨범 {n}개",
     "ro": "{n} album(e)",
-    "sv": "{n} album"
+    "sv": "{n} album",
+    "hu": "{n} album",
+    "vi": "{n} album"
   },
   "ai.nTracks": {
     "fr": "{n} piste(s)",
@@ -1365,7 +1815,9 @@
     "ja": "{n} 曲",
     "ko": "{n}곡",
     "ro": "{n} piesă/piese",
-    "sv": "{n} spår"
+    "sv": "{n} spår",
+    "hu": "{n} szám",
+    "vi": "{n} bài"
   },
   "ai.resultsFor": {
     "fr": "Résultats pour « {query} » : {parts}",
@@ -1377,7 +1829,9 @@
     "ja": "「{query}」の結果：{parts}",
     "ko": "“{query}” 검색 결과: {parts}",
     "ro": "Rezultate pentru „{query}”: {parts}",
-    "sv": "Resultat för ”{query}”: {parts}"
+    "sv": "Resultat för ”{query}”: {parts}",
+    "hu": "Találatok erre: „{query}”: {parts}",
+    "vi": "Kết quả cho “{query}”: {parts}"
   },
   "ai.zonesAvailable": {
     "fr": "Zones disponibles : {zones}",
@@ -1389,7 +1843,9 @@
     "ja": "利用可能なゾーン：{zones}",
     "ko": "사용 가능한 구역: {zones}",
     "ro": "Zone disponibile: {zones}",
-    "sv": "Tillgängliga zoner: {zones}"
+    "sv": "Tillgängliga zoner: {zones}",
+    "hu": "Elérhető zónák: {zones}",
+    "vi": "Các vùng phát khả dụng: {zones}"
   },
   "ai.noZone": {
     "fr": "Aucune zone trouvée.",
@@ -1401,7 +1857,9 @@
     "ja": "ゾーンが見つかりませんでした。",
     "ko": "구역을 찾을 수 없습니다.",
     "ro": "Nu s-a găsit nicio zonă.",
-    "sv": "Inga zoner hittades."
+    "sv": "Inga zoner hittades.",
+    "hu": "Nem található zóna.",
+    "vi": "Không tìm thấy vùng phát nào."
   },
   "ai.notUnderstood": {
     "fr": "Désolé, je n'ai pas compris « {msg} ». Essayez « joue [artiste/album] » ou « cherche [terme] ».",
@@ -1413,7 +1871,9 @@
     "ja": "すみません、「{msg}」を理解できませんでした。「[アーティスト/アルバム] を再生」または「[キーワード] を検索」とお試しください。",
     "ko": "죄송합니다, “{msg}”를 이해하지 못했습니다. “[아티스트/앨범] 재생” 또는 “[검색어] 검색”을 시도해 보세요.",
     "ro": "Îmi pare rău, nu am înțeles „{msg}”. Încearcă „redă [artist/album]” sau „caută [termen]”.",
-    "sv": "Tyvärr, jag förstod inte ”{msg}”. Prova ”spela [artist/album]” eller ”sök [term]”."
+    "sv": "Tyvärr, jag förstod inte ”{msg}”. Prova ”spela [artist/album]” eller ”sök [term]”.",
+    "hu": "Elnézést, nem értettem: „{msg}”. Próbálja így: „play [előadó/album]” vagy „search [kifejezés]”.",
+    "vi": "Xin lỗi, tôi không hiểu “{msg}”. Hãy thử “play [nghệ sĩ/album]” hoặc “search [từ khóa]”."
   },
   "svctok.test.musicbrainz": {
     "fr": "MusicBrainz disponible (aucun token requis).",
@@ -1425,7 +1885,9 @@
     "ja": "MusicBrainz は利用可能です（token 不要）。",
     "ko": "MusicBrainz 사용 가능 (token 불필요).",
     "ro": "MusicBrainz disponibil (niciun token necesar).",
-    "sv": "MusicBrainz tillgängligt (ingen token krävs)."
+    "sv": "MusicBrainz tillgängligt (ingen token krävs).",
+    "hu": "MusicBrainz elérhető (nem kell token).",
+    "vi": "MusicBrainz khả dụng (không cần token)."
   },
   "svctok.deezer.connected": {
     "fr": "ARL accepté : connecté à Deezer ({user}).",
@@ -1437,7 +1899,9 @@
     "ja": "ARL が承認されました：Deezer に接続しました（{user}）。",
     "ko": "ARL 승인됨: Deezer에 연결됨 ({user}).",
     "ro": "ARL acceptat: conectat la Deezer ({user}).",
-    "sv": "ARL godkänd: ansluten till Deezer ({user})."
+    "sv": "ARL godkänd: ansluten till Deezer ({user}).",
+    "hu": "ARL elfogadva: csatlakozva a Deezerhez ({user}).",
+    "vi": "Đã chấp nhận ARL: đã kết nối Deezer ({user})."
   },
   "svctok.spotify.clientIdSaved": {
     "fr": "Client ID Spotify enregistré. Vous pouvez maintenant vous connecter.",
@@ -1449,7 +1913,9 @@
     "ja": "Spotify の Client ID を保存しました。サインインできます。",
     "ko": "Spotify Client ID가 저장되었습니다. 이제 로그인할 수 있습니다.",
     "ro": "Client ID Spotify salvat. Acum vă puteți conecta.",
-    "sv": "Spotify Client ID sparat. Du kan nu logga in."
+    "sv": "Spotify Client ID sparat. Du kan nu logga in.",
+    "hu": "Spotify Client ID elmentve. Most már bejelentkezhet.",
+    "vi": "Đã lưu Spotify Client ID. Giờ bạn có thể đăng nhập."
   },
   "svctok.spotify.clientIdInvalid": {
     "fr": "Ce n’est pas un Client ID Spotify : il se compose de lettres et de chiffres (32 caractères hexadécimaux), à copier depuis votre application sur developer.spotify.com.",
@@ -1461,7 +1927,9 @@
     "ja": "これは Spotify の Client ID ではありません。英数字（16 進数 32 文字）で、developer.spotify.com のアプリからコピーします。",
     "ko": "Spotify Client ID가 아닙니다. 문자와 숫자(16진수 32자)로 이루어지며 developer.spotify.com의 앱에서 복사합니다.",
     "ro": "Acesta nu este un Client ID Spotify: este format din litere și cifre (32 de caractere hexazecimale), copiat din aplicația dvs. de pe developer.spotify.com.",
-    "sv": "Detta är inget Spotify Client ID: det består av bokstäver och siffror (32 hexadecimala tecken), kopierat från din app på developer.spotify.com."
+    "sv": "Detta är inget Spotify Client ID: det består av bokstäver och siffror (32 hexadecimala tecken), kopierat från din app på developer.spotify.com.",
+    "hu": "Ez nem Spotify Client ID: betűkből és számjegyekből áll (32 hexadecimális karakter), és a developer.spotify.com oldalon lévő alkalmazásából kell kimásolni.",
+    "vi": "Đây không phải Spotify Client ID: mã này gồm chữ và số (32 ký tự thập lục phân), được sao chép từ ứng dụng của bạn trên developer.spotify.com."
   },
   "svctok.spotify.clientIdEnv": {
     "fr": "La variable TUNE_SPOTIFY_CLIENT_ID est posée sur ce serveur et l’emporte : modifiez-la, puis redémarrez le serveur.",
@@ -1473,7 +1941,9 @@
     "ja": "このサーバーでは TUNE_SPOTIFY_CLIENT_ID が設定されており優先されます。変更してからサーバーを再起動してください。",
     "ko": "이 서버에 TUNE_SPOTIFY_CLIENT_ID가 설정되어 있어 우선합니다. 변경한 뒤 서버를 다시 시작하세요.",
     "ro": "TUNE_SPOTIFY_CLIENT_ID este setată pe acest server și are prioritate: modificați-o, apoi reporniți serverul.",
-    "sv": "TUNE_SPOTIFY_CLIENT_ID är satt på denna server och har företräde: ändra den och starta sedan om servern."
+    "sv": "TUNE_SPOTIFY_CLIENT_ID är satt på denna server och har företräde: ändra den och starta sedan om servern.",
+    "hu": "Ezen a szerveren be van állítva a TUNE_SPOTIFY_CLIENT_ID, és ez élvez elsőbbséget: módosítsa, majd indítsa újra a szervert.",
+    "vi": "TUNE_SPOTIFY_CLIENT_ID đã được đặt trên máy chủ này và được ưu tiên: hãy thay đổi nó rồi khởi động lại máy chủ."
   },
   "svctok.test.validationUnavailable": {
     "fr": "Validation non disponible pour ce service.",
@@ -1485,7 +1955,9 @@
     "ja": "このサービスでは検証を利用できません。",
     "ko": "이 서비스에서는 검증을 사용할 수 없습니다.",
     "ro": "Validare indisponibilă pentru acest serviciu.",
-    "sv": "Validering är inte tillgänglig för den här tjänsten."
+    "sv": "Validering är inte tillgänglig för den här tjänsten.",
+    "hu": "Ennél a szolgáltatásnál az ellenőrzés nem érhető el.",
+    "vi": "Không thể kiểm tra với dịch vụ này."
   },
   "svctok.err.generic": {
     "fr": "Erreur : {error}",
@@ -1497,7 +1969,9 @@
     "ja": "エラー：{error}",
     "ko": "오류: {error}",
     "ro": "Eroare: {error}",
-    "sv": "Fel: {error}"
+    "sv": "Fel: {error}",
+    "hu": "Hiba: {error}",
+    "vi": "Lỗi: {error}"
   },
   "radio.addedTitle": {
     "fr": "✓ Radio ajoutée",
@@ -1509,7 +1983,9 @@
     "ja": "✓ ラジオを追加しました",
     "ko": "✓ 라디오 추가됨",
     "ro": "✓ Radio adăugat",
-    "sv": "✓ Radio tillagd"
+    "sv": "✓ Radio tillagd",
+    "hu": "✓ Rádió hozzáadva",
+    "vi": "✓ Đã thêm đài"
   },
   "radio.addedBody": {
     "fr": "{name} a été ajoutée à vos favoris Tune.",
@@ -1521,7 +1997,9 @@
     "ja": "{name} を Tune のお気に入りに追加しました。",
     "ko": "{name}이(가) Tune 즐겨찾기에 추가되었습니다.",
     "ro": "{name} a fost adăugat la favoritele tale Tune.",
-    "sv": "{name} har lagts till bland dina Tune-favoriter."
+    "sv": "{name} har lagts till bland dina Tune-favoriter.",
+    "hu": "{name} bekerült a Tune kedvencei közé.",
+    "vi": "{name} đã được thêm vào mục yêu thích Tune của bạn."
   },
   "radio.alreadyThereTitle": {
     "fr": "✓ Radio déjà présente",
@@ -1533,7 +2011,9 @@
     "ja": "✓ ラジオは登録済み",
     "ko": "✓ 라디오가 이미 있습니다",
     "ro": "✓ Radio deja prezent",
-    "sv": "✓ Radion finns redan"
+    "sv": "✓ Radion finns redan",
+    "hu": "✓ A rádió már szerepel",
+    "vi": "✓ Đài đã có sẵn"
   },
   "radio.alreadyThereBody": {
     "fr": "{name} est déjà dans votre catalogue Tune. Elle a été remise dans vos favoris — aucun doublon n'a été créé.",
@@ -1545,7 +2025,9 @@
     "ja": "{name} はすでに Tune のカタログにあります。お気に入りに戻しました。重複は作成されていません。",
     "ko": "{name}은(는) 이미 Tune 목록에 있습니다. 즐겨찾기에 다시 추가했으며 중복 항목은 만들지 않았습니다.",
     "ro": "{name} este deja în catalogul tău Tune. A fost pusă din nou la favorite — nu a fost creat niciun duplicat.",
-    "sv": "{name} finns redan i din Tune-katalog. Den har lagts tillbaka bland dina favoriter – ingen dubblett skapades."
+    "sv": "{name} finns redan i din Tune-katalog. Den har lagts tillbaka bland dina favoriter – ingen dubblett skapades.",
+    "hu": "{name} már szerepel a Tune katalógusában. Visszakerült a kedvencei közé — nem jött létre másodpéldány.",
+    "vi": "{name} đã có trong danh mục Tune của bạn. Đài đã được đưa lại vào mục yêu thích — không tạo bản trùng lặp."
   },
   "radio.canCloseTab": {
     "fr": "Vous pouvez fermer cet onglet.",
@@ -1557,7 +2039,9 @@
     "ja": "このタブを閉じてかまいません。",
     "ko": "이 탭을 닫아도 됩니다.",
     "ro": "Poți închide această filă.",
-    "sv": "Du kan stänga den här fliken."
+    "sv": "Du kan stänga den här fliken.",
+    "hu": "Bezárhatja ezt a lapot.",
+    "vi": "Bạn có thể đóng tab này."
   },
   "radio.errorTitle": {
     "fr": "Erreur",
@@ -1569,7 +2053,9 @@
     "ja": "エラー",
     "ko": "오류",
     "ro": "Eroare",
-    "sv": "Fel"
+    "sv": "Fel",
+    "hu": "Hiba",
+    "vi": "Lỗi"
   },
   "net.smbAccessDenied": {
     "fr": "Accès refusé (guest). Essayez avec un identifiant/mot de passe. ({error})",
@@ -1581,7 +2067,9 @@
     "ja": "アクセスが拒否されました（guest）。ユーザー名／パスワードでお試しください。({error})",
     "ko": "접근이 거부되었습니다 (guest). 아이디/비밀번호로 시도하세요. ({error})",
     "ro": "Acces refuzat (guest). Încearcă cu un nume de utilizator/parolă. ({error})",
-    "sv": "Åtkomst nekad (guest). Prova med användarnamn/lösenord. ({error})"
+    "sv": "Åtkomst nekad (guest). Prova med användarnamn/lösenord. ({error})",
+    "hu": "Hozzáférés megtagadva (vendég). Próbálja felhasználónévvel és jelszóval. ({error})",
+    "vi": "Truy cập bị từ chối (khách). Hãy thử với tên người dùng/mật khẩu. ({error})"
   },
   "net.smbScanFailed": {
     "fr": "Impossible de scanner {host} : {error}",
@@ -1593,7 +2081,9 @@
     "ja": "{host} をスキャンできません：{error}",
     "ko": "{host}을(를) 스캔할 수 없습니다: {error}",
     "ro": "Imposibil de scanat {host}: {error}",
-    "sv": "Det gick inte att skanna {host}: {error}"
+    "sv": "Det gick inte att skanna {host}: {error}",
+    "hu": "Nem sikerült átvizsgálni: {host}: {error}",
+    "vi": "Không thể quét {host}: {error}"
   },
   "net.wifiCommandFailed": {
     "fr": "Échec de la commande réseau : {error}",
@@ -1605,7 +2095,9 @@
     "ja": "ネットワークコマンドが失敗しました：{error}",
     "ko": "네트워크 명령이 실패했습니다: {error}",
     "ro": "Comanda de rețea a eșuat: {error}",
-    "sv": "Nätverkskommandot misslyckades: {error}"
+    "sv": "Nätverkskommandot misslyckades: {error}",
+    "hu": "A hálózati parancs sikertelen: {error}",
+    "vi": "Lệnh mạng thất bại: {error}"
   },
   "net.wifiUnavailable": {
     "fr": "Gestion WiFi indisponible sur cet appareil ({error})",
@@ -1617,7 +2109,9 @@
     "ja": "このデバイスでは WiFi 管理を利用できません（{error}）",
     "ko": "이 기기에서는 WiFi 관리를 사용할 수 없습니다 ({error})",
     "ro": "Gestionarea WiFi nu este disponibilă pe acest dispozitiv ({error})",
-    "sv": "WiFi-hantering är inte tillgänglig på den här enheten ({error})"
+    "sv": "WiFi-hantering är inte tillgänglig på den här enheten ({error})",
+    "hu": "A WiFi-kezelés nem érhető el ezen az eszközön ({error})",
+    "vi": "Không thể quản lý WiFi trên thiết bị này ({error})"
   },
   "net.wifiTimeout": {
     "fr": "Délai dépassé lors de l'opération WiFi",
@@ -1629,7 +2123,9 @@
     "ja": "WiFi 操作がタイムアウトしました",
     "ko": "WiFi 작업 시간이 초과되었습니다",
     "ro": "Operațiunea WiFi a expirat",
-    "sv": "WiFi-åtgärden tog för lång tid"
+    "sv": "WiFi-åtgärden tog för lång tid",
+    "hu": "A WiFi-művelet túllépte az időkorlátot",
+    "vi": "Thao tác WiFi đã hết thời gian chờ"
   },
   "net.wifiBadPassword": {
     "fr": "Mot de passe WiFi incorrect",
@@ -1641,7 +2137,9 @@
     "ja": "WiFi パスワードが正しくありません",
     "ko": "WiFi 비밀번호가 올바르지 않습니다",
     "ro": "Parolă WiFi incorectă",
-    "sv": "Felaktigt WiFi-lösenord"
+    "sv": "Felaktigt WiFi-lösenord",
+    "hu": "Hibás WiFi-jelszó",
+    "vi": "Mật khẩu WiFi không đúng"
   },
   "svctok.listenbrainz.purpose": {
     "fr": "Scrobbling libre (MetaBrainz) — seul ou en plus de Last.fm (Premium).",
@@ -1653,7 +2151,9 @@
     "ja": "オープンな scrobbling（MetaBrainz）— 単独でも Last.fm と併用（Premium）でも。",
     "ko": "오픈 스크로블링(MetaBrainz) — 단독 또는 Last.fm과 병행(Premium).",
     "ro": "Scrobbling liber (MetaBrainz) — singur sau alături de Last.fm (Premium).",
-    "sv": "Öppen scrobbling (MetaBrainz) — ensam eller vid sidan av Last.fm (Premium)."
+    "sv": "Öppen scrobbling (MetaBrainz) — ensam eller vid sidan av Last.fm (Premium).",
+    "hu": "Nyílt scrobbling (MetaBrainz) — önmagában vagy a Last.fm mellett (Premium).",
+    "vi": "Scrobbling mở (MetaBrainz) — dùng riêng hoặc cùng Last.fm (Premium)."
   },
   "svctok.listenbrainz.pricing": {
     "fr": "100 % gratuit et open source (MetaBrainz).",
@@ -1665,7 +2165,9 @@
     "ja": "100% 無料・オープンソース（MetaBrainz）。",
     "ko": "100% 무료 오픈소스(MetaBrainz).",
     "ro": "100% gratuit și open source (MetaBrainz).",
-    "sv": "100 % gratis och öppen källkod (MetaBrainz)."
+    "sv": "100 % gratis och öppen källkod (MetaBrainz).",
+    "hu": "100% ingyenes és nyílt forráskódú (MetaBrainz).",
+    "vi": "Miễn phí 100% và mã nguồn mở (MetaBrainz)."
   },
   "svctok.listenbrainz.step1": {
     "fr": "Crée un compte gratuit sur listenbrainz.org.",
@@ -1677,7 +2179,9 @@
     "ja": "listenbrainz.org で無料アカウントを作成。",
     "ko": "listenbrainz.org에서 무료 계정을 만드세요.",
     "ro": "Creează un cont gratuit pe listenbrainz.org.",
-    "sv": "Skapa ett gratiskonto på listenbrainz.org."
+    "sv": "Skapa ett gratiskonto på listenbrainz.org.",
+    "hu": "Hozzon létre ingyenes fiókot a listenbrainz.org oldalon.",
+    "vi": "Tạo tài khoản miễn phí trên listenbrainz.org."
   },
   "svctok.listenbrainz.step2": {
     "fr": "Ouvre Settings (icône profil).",
@@ -1689,7 +2193,9 @@
     "ja": "Settings（プロフィールアイコン）を開く。",
     "ko": "Settings(프로필 아이콘)를 여세요.",
     "ro": "Deschide Settings (pictograma de profil).",
-    "sv": "Öppna Inställningar (profilikonen)."
+    "sv": "Öppna Inställningar (profilikonen).",
+    "hu": "Nyissa meg a Settings menüt (profil ikon).",
+    "vi": "Mở Settings (biểu tượng hồ sơ)."
   },
   "svctok.listenbrainz.step3": {
     "fr": "Copie le « User token » et colle-le ici.",
@@ -1701,7 +2207,9 @@
     "ja": "「User token」をコピーしてここに貼り付け。",
     "ko": "「User token」을 복사해 여기에 붙여넣으세요.",
     "ro": "Copiază «User token» și lipește-l aici.",
-    "sv": "Kopiera ”User token” och klistra in den här."
+    "sv": "Kopiera ”User token” och klistra in den här.",
+    "hu": "Másolja ki a „User token” értékét, és illessze be ide.",
+    "vi": "Sao chép “User token” và dán vào đây."
   },
   "zonegroup.needsTwoZones": {
     "fr": "Il faut au moins deux zones différentes pour créer un groupe.",
@@ -1713,7 +2221,9 @@
     "ja": "グループを作成するには、異なるゾーンが少なくとも 2 つ必要です。",
     "ko": "그룹을 만들려면 서로 다른 영역이 두 개 이상 필요합니다.",
     "ro": "Un grup are nevoie de cel puțin două zone diferite.",
-    "sv": "En grupp kräver minst två olika zoner."
+    "sv": "En grupp kräver minst två olika zoner.",
+    "hu": "Egy csoporthoz legalább két különböző zóna kell.",
+    "vi": "Một nhóm cần ít nhất hai vùng phát khác nhau."
   },
   "zonegroup.unknownZone": {
     "fr": "La zone n° {id} n'existe plus. Rafraîchissez la liste des zones.",
@@ -1725,7 +2235,9 @@
     "ja": "ゾーン番号 {id} は存在しません。ゾーン一覧を更新してください。",
     "ko": "{id}번 영역이 더 이상 존재하지 않습니다. 영역 목록을 새로 고치세요.",
     "ro": "Zona nr. {id} nu mai există. Reîmprospătați lista de zone.",
-    "sv": "Zon nr {id} finns inte längre. Uppdatera zonlistan."
+    "sv": "Zon nr {id} finns inte längre. Uppdatera zonlistan.",
+    "hu": "A(z) #{id} zóna már nem létezik. Frissítse a zónák listáját.",
+    "vi": "Vùng phát #{id} không còn tồn tại. Hãy làm mới danh sách vùng phát."
   },
   "zone.freeCapReached": {
     "fr": "Vous utilisez déjà vos {n} zones gratuites. Jouer sur une zone de plus demande Tune Premium — les protocoles (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) sont tous inclus dans la version gratuite.",
@@ -1737,7 +2249,9 @@
     "ja": "無料の {n} ゾーンをすべて使用中です。さらにゾーンで再生するには Tune Premium が必要です。プロトコル（DLNA、AirPlay 2、BluOS、Chromecast、OpenHome）はすべて無料版に含まれています。",
     "ko": "무료 영역 {n}개를 이미 모두 사용 중입니다. 영역을 하나 더 재생하려면 Tune Premium이 필요합니다. 프로토콜(DLNA, AirPlay 2, BluOS, Chromecast, OpenHome)은 모두 무료 버전에 포함되어 있습니다.",
     "ro": "Folosiți deja cele {n} zone gratuite. Redarea într-o zonă în plus necesită Tune Premium — protocoalele (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) sunt toate incluse în versiunea gratuită.",
-    "sv": "Du använder redan dina {n} gratiszoner. Att spela i ytterligare en zon kräver Tune Premium — protokollen (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) ingår alla i gratisversionen."
+    "sv": "Du använder redan dina {n} gratiszoner. Att spela i ytterligare en zon kräver Tune Premium — protokollen (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) ingår alla i gratisversionen.",
+    "hu": "Már mind a(z) {n} ingyenes zónáját használja. Még egy zónán való lejátszáshoz Tune Premium szükséges — a protokollok (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) mind benne vannak az ingyenes változatban.",
+    "vi": "Bạn đang dùng hết {n} vùng phát miễn phí. Phát trên thêm một vùng phát nữa cần Tune Premium — các giao thức (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) đều có trong bản miễn phí."
   },
   "zonegroup.sameOutput": {
     "fr": "Les zones « {a} » et « {b} » utilisent la même sortie audio : elles ne peuvent pas être groupées. Supprimez-en une, ou donnez-lui une autre sortie.",
@@ -1749,7 +2263,9 @@
     "ja": "ゾーン「{a}」と「{b}」は同じオーディオ出力を使用しているため、グループ化できません。どちらか一方を削除するか、別の出力を割り当ててください。",
     "ko": "'{a}' 영역과 '{b}' 영역은 같은 오디오 출력을 사용하므로 그룹으로 묶을 수 없습니다. 둘 중 하나를 삭제하거나 다른 출력을 지정하세요.",
     "ro": "Zonele „{a}” și „{b}” folosesc aceeași ieșire audio: nu pot fi grupate. Ștergeți una dintre ele sau atribuiți-i altă ieșire.",
-    "sv": "Zonerna ”{a}” och ”{b}” använder samma ljudutgång: de kan inte grupperas. Ta bort en av dem eller ge den en annan utgång."
+    "sv": "Zonerna ”{a}” och ”{b}” använder samma ljudutgång: de kan inte grupperas. Ta bort en av dem eller ge den en annan utgång.",
+    "hu": "A(z) „{a}” és „{b}” zóna ugyanazt a hangkimenetet használja: nem csoportosíthatók. Törölje az egyiket, vagy adjon neki másik kimenetet.",
+    "vi": "Vùng phát “{a}” và “{b}” dùng cùng một đầu ra âm thanh: không thể nhóm lại. Hãy xóa một vùng phát, hoặc gán cho nó đầu ra khác."
   },
   "browse.hint.windowsMappedDrive": {
     "fr": "« {drive} » est un lecteur réseau mappé : sous Windows, une lettre de lecteur n'appartient qu'à la session qui l'a créée et reste invisible au service Tune. Indiquez le chemin UNC du partage (\\\\serveur\\partage) au lieu de la lettre.",
@@ -1761,7 +2277,9 @@
     "ja": "「{drive}」は割り当てられたネットワークドライブです。Windows ではドライブ文字は作成したセッションにのみ属し、Tune のサービスからは見えません。ドライブ文字ではなく共有の UNC パス（\\\\サーバー\\共有）を指定してください。",
     "ko": "“{drive}”는 매핑된 네트워크 드라이브입니다. Windows에서 드라이브 문자는 이를 만든 세션에만 속하며 Tune 서비스에서는 보이지 않습니다. 드라이브 문자 대신 공유의 UNC 경로(\\\\서버\\공유)를 입력하세요.",
     "ro": "„{drive}” este o unitate de rețea mapată: în Windows, o literă de unitate aparține doar sesiunii care a creat-o și rămâne invizibilă pentru serviciul Tune. Indicați calea UNC a partajării (\\\\server\\partajare) în loc de literă.",
-    "sv": "”{drive}” är en ansluten nätverksenhet: i Windows tillhör en enhetsbokstav endast den session som skapade den och förblir osynlig för Tune-tjänsten. Ange resursens UNC-sökväg (\\\\server\\resurs) i stället för bokstaven."
+    "sv": "”{drive}” är en ansluten nätverksenhet: i Windows tillhör en enhetsbokstav endast den session som skapade den och förblir osynlig för Tune-tjänsten. Ange resursens UNC-sökväg (\\\\server\\resurs) i stället för bokstaven.",
+    "hu": "„{drive}” egy csatlakoztatott hálózati meghajtó: Windowson a meghajtóbetűjel csak az azt létrehozó munkamenethez tartozik, és a Tune szolgáltatás számára láthatatlan. A betűjel helyett a megosztás UNC-útvonalát használja (\\\\server\\share).",
+    "vi": "“{drive}” là ổ đĩa mạng được ánh xạ: trên Windows, ký tự ổ đĩa chỉ thuộc về phiên đã tạo ra nó và dịch vụ Tune không nhìn thấy được. Hãy dùng đường dẫn UNC của thư mục chia sẻ (\\\\server\\share) thay cho ký tự ổ đĩa."
   },
   "browse.hint.uncUnreachable": {
     "fr": "Ce partage réseau est injoignable. Vérifiez que le serveur est allumé et accessible, et que les identifiants enregistrés sont toujours valides.",
@@ -1773,15 +2291,37 @@
     "ja": "このネットワーク共有に接続できません。サーバーの電源が入っていて到達可能か、保存された認証情報がまだ有効かを確認してください。",
     "ko": "이 네트워크 공유에 연결할 수 없습니다. 서버가 켜져 있고 접근 가능한지, 저장된 자격 증명이 여전히 유효한지 확인하세요.",
     "ro": "Această partajare de rețea este inaccesibilă. Verificați dacă serverul este pornit și accesibil și dacă datele de autentificare salvate sunt încă valide.",
-    "sv": "Den här nätverksresursen går inte att nå. Kontrollera att servern är påslagen och nåbar och att de sparade inloggningsuppgifterna fortfarande är giltiga."
+    "sv": "Den här nätverksresursen går inte att nå. Kontrollera att servern är påslagen och nåbar och att de sparade inloggningsuppgifterna fortfarande är giltiga.",
+    "hu": "Ez a hálózati megosztás nem érhető el. Ellenőrizze, hogy a szerver be van-e kapcsolva és elérhető-e, és hogy a tárolt hitelesítő adatok még érvényesek-e.",
+    "vi": "Không thể truy cập thư mục chia sẻ mạng này. Hãy kiểm tra máy chủ đã bật và truy cập được, và thông tin đăng nhập đã lưu vẫn còn hợp lệ."
   },
   "settings.communityContribution.label": {
     "fr": "Partager mes métadonnées enrichies avec la communauté",
-    "en": "Share my enriched metadata with the community"
+    "en": "Share my enriched metadata with the community",
+    "de": "Meine angereicherten Metadaten mit der Community teilen",
+    "es": "Compartir mis metadatos enriquecidos con la comunidad",
+    "it": "Condividi i miei metadati arricchiti con la comunità",
+    "zh": "与社区分享我丰富后的元数据",
+    "ja": "補完したメタデータをコミュニティと共有する",
+    "ko": "보강된 메타데이터를 커뮤니티와 공유",
+    "ro": "Partajează cu comunitatea metadatele mele îmbogățite",
+    "sv": "Dela mina berikade metadata med communityn",
+    "hu": "Bővített metaadataim megosztása a közösséggel",
+    "vi": "Chia sẻ siêu dữ liệu đã bổ sung của tôi với cộng đồng"
   },
   "settings.communityContribution.description": {
     "fr": "Quand ce réglage est activé, Tune envoie au cloud communautaire mozaiklabs.fr les biographies d'artistes et d'albums de votre bibliothèque (nom de l'artiste, titre de l'album, identifiant MusicBrainz, texte de la biographie, source, licence et langue) ainsi que les images d'artistes récupérées automatiquement, accompagnées d'un identifiant d'installation anonyme. Ni vos fichiers, ni vos chemins de dossiers, ni votre historique d'écoute ne sont concernés. Désactivé par défaut : tant que vous ne l'activez pas, aucune de ces données ne quitte votre machine.",
-    "en": "When this setting is on, Tune sends your library's artist and album biographies (artist name, album title, MusicBrainz ID, biography text, source, licence and language) plus the artist images it fetched automatically to the mozaiklabs.fr community cloud, together with an anonymous installation identifier. Your files, your folder paths and your listening history are not involved. Off by default: until you turn it on, none of this data leaves your machine."
+    "en": "When this setting is on, Tune sends your library's artist and album biographies (artist name, album title, MusicBrainz ID, biography text, source, licence and language) plus the artist images it fetched automatically to the mozaiklabs.fr community cloud, together with an anonymous installation identifier. Your files, your folder paths and your listening history are not involved. Off by default: until you turn it on, none of this data leaves your machine.",
+    "de": "Wenn diese Einstellung aktiviert ist, sendet Tune die Künstler- und Albumbiografien Ihrer Bibliothek (Künstlername, Albumtitel, MusicBrainz-ID, Biografietext, Quelle, Lizenz und Sprache) sowie die automatisch abgerufenen Künstlerbilder zusammen mit einer anonymen Installationskennung an die Community-Cloud mozaiklabs.fr. Ihre Dateien, Ihre Ordnerpfade und Ihr Wiedergabeverlauf sind nicht betroffen. Standardmäßig deaktiviert: Solange Sie sie nicht aktivieren, verlässt keine dieser Daten Ihren Rechner.",
+    "es": "Cuando este ajuste está activado, Tune envía a la nube comunitaria mozaiklabs.fr las biografías de artistas y álbumes de tu biblioteca (nombre del artista, título del álbum, identificador MusicBrainz, texto de la biografía, fuente, licencia e idioma), así como las imágenes de artistas obtenidas automáticamente, junto con un identificador de instalación anónimo. Tus archivos, tus rutas de carpetas y tu historial de escucha no se ven afectados. Desactivado por defecto: mientras no lo actives, ninguno de estos datos sale de tu equipo.",
+    "it": "Quando questa impostazione è attiva, Tune invia al cloud comunitario mozaiklabs.fr le biografie di artisti e album della tua libreria (nome dell'artista, titolo dell'album, identificativo MusicBrainz, testo della biografia, fonte, licenza e lingua) e le immagini degli artisti recuperate automaticamente, insieme a un identificativo di installazione anonimo. I tuoi file, i percorsi delle cartelle e la cronologia di ascolto non sono coinvolti. Disattivata per impostazione predefinita: finché non la attivi, nessuno di questi dati lascia il tuo computer.",
+    "zh": "开启此设置后，Tune 会将您音乐库中的艺术家和专辑简介（艺术家名称、专辑标题、MusicBrainz ID、简介文本、来源、许可和语言）以及自动获取的艺术家图片，连同一个匿名安装标识符，发送到 mozaiklabs.fr 社区云。您的文件、文件夹路径和收听历史不在其列。默认关闭：在您开启之前，这些数据都不会离开您的设备。",
+    "ja": "この設定をオンにすると、Tune はライブラリ内のアーティストとアルバムの紹介文（アーティスト名、アルバム名、MusicBrainz ID、紹介文の本文、出典、ライセンス、言語）と、自動取得したアーティスト画像を、匿名のインストール識別子とともに mozaiklabs.fr のコミュニティクラウドへ送信します。ファイル、フォルダーのパス、再生履歴は対象外です。既定ではオフです。オンにしない限り、これらのデータがお使いのマシンの外に出ることはありません。",
+    "ko": "이 설정을 켜면 Tune은 라이브러리의 아티스트 및 앨범 소개(아티스트 이름, 앨범 제목, MusicBrainz ID, 소개 본문, 출처, 라이선스, 언어)와 자동으로 가져온 아티스트 이미지를 익명 설치 식별자와 함께 mozaiklabs.fr 커뮤니티 클라우드로 보냅니다. 파일, 폴더 경로, 청취 기록은 포함되지 않습니다. 기본값은 꺼짐입니다. 켜기 전까지는 이 데이터가 기기를 벗어나지 않습니다.",
+    "ro": "Când această setare este activată, Tune trimite în cloudul comunitar mozaiklabs.fr biografiile artiștilor și albumelor din biblioteca ta (numele artistului, titlul albumului, identificatorul MusicBrainz, textul biografiei, sursa, licența și limba), precum și imaginile artiștilor preluate automat, împreună cu un identificator de instalare anonim. Fișierele tale, căile dosarelor și istoricul de ascultare nu sunt implicate. Dezactivată implicit: cât timp nu o activezi, niciuna dintre aceste date nu părăsește calculatorul tău.",
+    "sv": "När den här inställningen är på skickar Tune biografierna över artister och album i ditt bibliotek (artistnamn, albumtitel, MusicBrainz-ID, biografitext, källa, licens och språk) samt de artistbilder som hämtats automatiskt till communitymolnet mozaiklabs.fr, tillsammans med en anonym installationsidentifierare. Dina filer, dina mappsökvägar och din lyssningshistorik berörs inte. Av som standard: så länge du inte slår på den lämnar ingen av dessa data din dator.",
+    "hu": "Ha ez a beállítás be van kapcsolva, a Tune elküldi a mozaiklabs.fr közösségi felhőbe a gyűjteménye előadóinak és albumainak életrajzait (előadó neve, album címe, MusicBrainz-azonosító, az életrajz szövege, forrása, licence és nyelve), valamint az automatikusan letöltött előadóképeket, egy névtelen telepítésazonosítóval együtt. Az Ön fájljai, mappaútvonalai és hallgatási előzményei nem érintettek. Alapértelmezés szerint ki van kapcsolva: amíg be nem kapcsolja, ezekből az adatokból semmi sem hagyja el a gépét.",
+    "vi": "Khi bật cài đặt này, Tune gửi tiểu sử nghệ sĩ và album trong thư viện của bạn (tên nghệ sĩ, tên album, ID MusicBrainz, nội dung tiểu sử, nguồn, giấy phép và ngôn ngữ) cùng ảnh nghệ sĩ được tải tự động lên đám mây cộng đồng mozaiklabs.fr, kèm một mã cài đặt ẩn danh. File, đường dẫn thư mục và lịch sử nghe của bạn không liên quan. Tắt theo mặc định: khi bạn chưa bật, không dữ liệu nào trong số này rời khỏi máy của bạn."
   },
   "settings.replayGainSource.off": {
     "fr": "Désactivé",
@@ -1793,7 +2333,9 @@
     "ja": "無効",
     "ko": "사용 안 함",
     "ro": "Dezactivat",
-    "sv": "Av"
+    "sv": "Av",
+    "hu": "Ki",
+    "vi": "Tắt"
   },
   "settings.replayGainSource.file_tags": {
     "fr": "Tags des fichiers",
@@ -1805,7 +2347,9 @@
     "ja": "ファイルのタグ",
     "ko": "파일 태그",
     "ro": "Etichetele fișierelor",
-    "sv": "Filernas taggar"
+    "sv": "Filernas taggar",
+    "hu": "Fájlcímkék",
+    "vi": "Thẻ của file"
   },
   "settings.replayGainSource.tags_then_analysis": {
     "fr": "Tags des fichiers, puis analyse",
@@ -1817,7 +2361,9 @@
     "ja": "ファイルのタグ、次に解析",
     "ko": "파일 태그, 그다음 분석",
     "ro": "Etichetele fișierelor, apoi analiză",
-    "sv": "Filernas taggar, sedan analys"
+    "sv": "Filernas taggar, sedan analys",
+    "hu": "Fájlcímkék, majd elemzés",
+    "vi": "Thẻ của file, sau đó phân tích"
   },
   "radio.recherche.aucunResultat": {
     "fr": "Aucune station de ce nom dans le catalogue Tune. Vous pouvez l'ajouter par son adresse de flux.",
@@ -1829,7 +2375,9 @@
     "ja": "その名前の放送局は Tune のカタログにありません。ストリームのアドレスを使って追加できます。",
     "ko": "해당 이름의 방송국이 Tune 카탈로그에 없습니다. 스트림 주소로 직접 추가할 수 있습니다.",
     "ro": "Niciun post cu acest nume în catalogul Tune. Îl puteți adăuga folosind adresa fluxului său.",
-    "sv": "Ingen station med det namnet i Tune-katalogen. Du kan lägga till den med dess strömadress."
+    "sv": "Ingen station med det namnet i Tune-katalogen. Du kan lägga till den med dess strömadress.",
+    "hu": "Nincs ilyen nevű állomás a Tune katalógusában. A stream címével hozzáadhatja.",
+    "vi": "Không có đài nào mang tên này trong danh mục Tune. Bạn có thể thêm đài bằng địa chỉ luồng phát."
   },
   "radio.recherche.annuaireSeul": {
     "fr": "Cette station n'est pas encore dans votre catalogue, mais l'annuaire Tune la connaît. Ajoutez-la d'un geste — son adresse de flux est déjà là.",
@@ -1841,7 +2389,9 @@
     "ja": "この放送局はまだお使いのカタログにありませんが、Tune のディレクトリには登録されています。ワンクリックで追加できます — ストリームのアドレスはすでにあります。",
     "ko": "이 방송국은 아직 카탈로그에 없지만 Tune 디렉터리에 등록되어 있습니다. 한 번의 클릭으로 추가하세요 — 스트림 주소는 이미 준비되어 있습니다.",
     "ro": "Acest post nu este încă în catalogul dumneavoastră, dar directorul Tune îl cunoaște. Adăugați-l dintr-un clic — adresa fluxului este deja disponibilă.",
-    "sv": "Den här stationen finns ännu inte i din katalog, men Tune-katalogen känner till den. Lägg till den med ett klick — strömadressen finns redan."
+    "sv": "Den här stationen finns ännu inte i din katalog, men Tune-katalogen känner till den. Lägg till den med ett klick — strömadressen finns redan.",
+    "hu": "Ez az állomás még nincs a katalógusában, de a Tune címtára ismeri. Adja hozzá egy kattintással — a stream címe már megvan.",
+    "vi": "Đài này chưa có trong danh mục của bạn, nhưng thư mục Tune đã biết đài này. Thêm chỉ với một cú nhấp — địa chỉ luồng phát đã có sẵn."
   },
   "radio.recherche.echec": {
     "fr": "La recherche de stations n'a pas pu aboutir : le catalogue n'a pas répondu. Ce n'est pas une station manquante — réessayez, et redémarrez Tune si cela persiste.",
@@ -1853,7 +2403,9 @@
     "ja": "放送局の検索を完了できませんでした。カタログが応答していません。放送局が存在しないわけではありません。再試行し、続く場合は Tune を再起動してください。",
     "ko": "방송국 검색을 완료하지 못했습니다. 카탈로그가 응답하지 않았습니다. 방송국이 없는 것이 아닙니다. 다시 시도하고, 계속되면 Tune을 다시 시작하세요.",
     "ro": "Căutarea posturilor nu a putut fi finalizată: catalogul nu a răspuns. Nu este vorba de un post lipsă — reîncercați și reporniți Tune dacă persistă.",
-    "sv": "Stationssökningen kunde inte slutföras: katalogen svarade inte. Det handlar inte om en saknad station — försök igen och starta om Tune om det kvarstår."
+    "sv": "Stationssökningen kunde inte slutföras: katalogen svarade inte. Det handlar inte om en saknad station — försök igen och starta om Tune om det kvarstår.",
+    "hu": "Az állomáskeresés nem fejeződött be: a katalógus nem válaszolt. Ez nem hiányzó állomás — próbálja újra, és ha továbbra is fennáll, indítsa újra a Tune-t.",
+    "vi": "Không thể hoàn tất tìm kiếm đài: danh mục không phản hồi. Đây không phải là đài bị thiếu — hãy thử lại, và khởi động lại Tune nếu lỗi vẫn còn."
   },
   "radio.url.vide": {
     "fr": "L'adresse du flux est vide. Collez l'adresse complète de la station, par exemple https://example.net/stream.mp3",
@@ -1865,7 +2417,9 @@
     "ja": "ストリームのアドレスが空です。放送局の完全なアドレスを貼り付けてください。例: https://example.net/stream.mp3",
     "ko": "스트림 주소가 비어 있습니다. 방송국의 전체 주소를 붙여넣으세요. 예: https://example.net/stream.mp3",
     "ro": "Adresa fluxului este goală. Lipiți adresa completă a postului, de exemplu https://example.net/stream.mp3",
-    "sv": "Strömadressen är tom. Klistra in stationens fullständiga adress, till exempel https://example.net/stream.mp3"
+    "sv": "Strömadressen är tom. Klistra in stationens fullständiga adress, till exempel https://example.net/stream.mp3",
+    "hu": "A stream címe üres. Illessze be az állomás teljes címét, például https://example.net/stream.mp3",
+    "vi": "Địa chỉ luồng phát đang trống. Hãy dán địa chỉ đầy đủ của đài, ví dụ https://example.net/stream.mp3"
   },
   "radio.url.separateurFaux": {
     "fr": "L'adresse commence par « {debut} » : après « {schema} » il faut deux-points, pas ce caractère. Écrivez « {schema}:// » et la station se lira.",
@@ -1877,7 +2431,9 @@
     "ja": "アドレスが「{debut}」で始まっています。「{schema}」の後ろは、この文字ではなくコロンが必要です。「{schema}://」と書けば再生されます。",
     "ko": "주소가 “{debut}”로 시작합니다. “{schema}” 뒤에는 이 문자가 아니라 콜론이 와야 합니다. “{schema}://”로 쓰면 방송이 재생됩니다.",
     "ro": "Adresa începe cu „{debut}”: după „{schema}” trebuie două puncte, nu acest caracter. Scrieți „{schema}://” și postul se va reda.",
-    "sv": "Adressen börjar med ”{debut}”: efter ”{schema}” krävs ett kolon, inte det tecknet. Skriv ”{schema}://” så spelas stationen upp."
+    "sv": "Adressen börjar med ”{debut}”: efter ”{schema}” krävs ett kolon, inte det tecknet. Skriv ”{schema}://” så spelas stationen upp.",
+    "hu": "A cím így kezdődik: „{debut}”: a(z) „{schema}” után kettőspont kell, nem ez a karakter. Írja így: „{schema}://”, és az állomás szólni fog.",
+    "vi": "Địa chỉ bắt đầu bằng “{debut}”: sau “{schema}” phải là dấu hai chấm, không phải ký tự này. Hãy viết “{schema}://” và đài sẽ phát được."
   },
   "radio.url.sansSchema": {
     "fr": "L'adresse du flux doit commencer par http:// ou https://, et « {debut} » ne commence par ni l'un ni l'autre. Collez l'adresse complète du flux, pas seulement le nom du site.",
@@ -1889,7 +2445,9 @@
     "ja": "ストリームのアドレスは http:// または https:// で始まる必要がありますが、「{debut}」はどちらでもありません。サイト名だけでなく、ストリームの完全なアドレスを貼り付けてください。",
     "ko": "스트림 주소는 http:// 또는 https://로 시작해야 하는데 “{debut}”은(는) 둘 다 아닙니다. 사이트 이름이 아니라 스트림의 전체 주소를 붙여넣으세요.",
     "ro": "Adresa fluxului trebuie să înceapă cu http:// sau https://, iar „{debut}” nu începe cu niciuna dintre ele. Lipiți adresa completă a fluxului, nu doar numele site-ului.",
-    "sv": "Strömadressen måste börja med http:// eller https://, och ”{debut}” börjar med ingetdera. Klistra in strömmens fullständiga adress, inte bara webbplatsens namn."
+    "sv": "Strömadressen måste börja med http:// eller https://, och ”{debut}” börjar med ingetdera. Klistra in strömmens fullständiga adress, inte bara webbplatsens namn.",
+    "hu": "A stream címének http:// vagy https:// előtaggal kell kezdődnie, és a(z) „{debut}” egyikkel sem kezdődik. Illessze be a stream teljes címét, ne csak a webhely nevét.",
+    "vi": "Địa chỉ luồng phát phải bắt đầu bằng http:// hoặc https://, còn “{debut}” không bắt đầu bằng cái nào. Hãy dán địa chỉ luồng phát đầy đủ, không chỉ tên trang web."
   },
   "radio.url.schemaNonLisible": {
     "fr": "Tune ne sait ouvrir que les flux http:// et https:// ; « {schema}:// » n'est pas pris en charge.",
@@ -1901,7 +2459,9 @@
     "ja": "Tune が開けるのは http:// と https:// のストリームだけです。「{schema}://」には対応していません。",
     "ko": "Tune은 http:// 및 https:// 스트림만 열 수 있습니다. “{schema}://”는 지원하지 않습니다.",
     "ro": "Tune poate deschide doar fluxuri http:// și https://; „{schema}://” nu este acceptat.",
-    "sv": "Tune kan bara öppna strömmar via http:// och https://; ”{schema}://” stöds inte."
+    "sv": "Tune kan bara öppna strömmar via http:// och https://; ”{schema}://” stöds inte.",
+    "hu": "A Tune csak http:// és https:// streameket tud megnyitni; a(z) „{schema}://” nem támogatott.",
+    "vi": "Tune chỉ mở được luồng http:// và https://; “{schema}://” không được hỗ trợ."
   },
   "radio.url.sansHote": {
     "fr": "L'adresse n'indique aucun serveur après « {schema}:// ». Il manque le nom d'hôte, par exemple {schema}://example.net/stream.mp3",
@@ -1913,7 +2473,9 @@
     "ja": "「{schema}://」の後にサーバーが指定されていません。ホスト名が抜けています。例: {schema}://example.net/stream.mp3",
     "ko": "“{schema}://” 뒤에 서버가 지정되어 있지 않습니다. 호스트 이름이 빠졌습니다. 예: {schema}://example.net/stream.mp3",
     "ro": "Adresa nu indică niciun server după „{schema}://”. Lipsește numele gazdei, de exemplu {schema}://example.net/stream.mp3",
-    "sv": "Adressen anger ingen server efter ”{schema}://”. Värdnamnet saknas, till exempel {schema}://example.net/stream.mp3"
+    "sv": "Adressen anger ingen server efter ”{schema}://”. Värdnamnet saknas, till exempel {schema}://example.net/stream.mp3",
+    "hu": "A cím nem nevez meg szervert a(z) „{schema}://” után. Hiányzik a gépnév, például {schema}://example.net/stream.mp3",
+    "vi": "Địa chỉ không có tên máy chủ sau “{schema}://”. Thiếu tên máy chủ, ví dụ {schema}://example.net/stream.mp3"
   },
   "radio.url.pasUnFlux": {
     "fr": "Cette adresse répond bien, mais elle rend « {type} » et non un flux audio : c'est une page web, pas la station. Sur le site de la radio, cherchez le lien « écouter » ou « flux » et copiez CETTE adresse-là.",
@@ -1925,7 +2487,9 @@
     "ja": "このアドレスは応答しますが、音声ストリームではなく「{type}」を返します。放送局ではなくウェブページです。放送局のサイトで「聴く」または「ストリーム」のリンクを探し、そのアドレスをコピーしてください。",
     "ko": "이 주소는 응답하지만 오디오 스트림이 아니라 “{type}”을(를) 반환합니다. 방송국이 아니라 웹 페이지입니다. 방송국 사이트에서 “듣기” 또는 “스트림” 링크를 찾아 그 주소를 복사하세요.",
     "ro": "Această adresă răspunde, dar returnează „{type}” în loc de un flux audio: este o pagină web, nu postul. Pe site-ul postului, căutați linkul „ascultă” sau „flux” și copiați ACEA adresă.",
-    "sv": "Adressen svarar, men den returnerar ”{type}” i stället för en ljudström: det är en webbsida, inte stationen. Leta efter länken ”lyssna” eller ”ström” på stationens webbplats och kopiera DEN adressen."
+    "sv": "Adressen svarar, men den returnerar ”{type}” i stället för en ljudström: det är en webbsida, inte stationen. Leta efter länken ”lyssna” eller ”ström” på stationens webbplats och kopiera DEN adressen.",
+    "hu": "Ez a cím válaszol, de hangstream helyett „{type}” típust ad vissza: ez egy weboldal, nem az állomás. Az állomás webhelyén keresse a „listen” vagy „stream” hivatkozást, és AZT a címet másolja ki.",
+    "vi": "Địa chỉ này có phản hồi, nhưng trả về “{type}” thay vì luồng âm thanh: đây là một trang web, không phải đài. Trên trang của đài, hãy tìm liên kết “listen” hoặc “stream” và sao chép CHÍNH địa chỉ đó."
   },
   "radio.url.espace": {
     "fr": "L'adresse du flux contient un espace, ce qu'une adresse de flux ne comporte jamais. Vérifiez qu'elle n'a pas été coupée au collage.",
@@ -1937,7 +2501,9 @@
     "ja": "ストリームのアドレスに空白が含まれています。ストリームのアドレスに空白は入りません。貼り付けの際に途中で切れていないか確認してください。",
     "ko": "스트림 주소에 공백이 들어 있습니다. 스트림 주소에는 공백이 없습니다. 붙여넣을 때 잘리지 않았는지 확인하세요.",
     "ro": "Adresa fluxului conține un spațiu, ceea ce nu se întâmplă niciodată la o adresă de flux. Verificați dacă nu a fost tăiată la lipire.",
-    "sv": "Strömadressen innehåller ett mellanslag, vilket en strömadress aldrig gör. Kontrollera att den inte klipptes av vid inklistringen."
+    "sv": "Strömadressen innehåller ett mellanslag, vilket en strömadress aldrig gör. Kontrollera att den inte klipptes av vid inklistringen.",
+    "hu": "A stream címében szóköz van, ami stream címében sosem fordul elő. Ellenőrizze, hogy beillesztéskor nem sérült-e.",
+    "vi": "Địa chỉ luồng phát chứa dấu cách, điều không bao giờ có trong một địa chỉ luồng phát. Hãy kiểm tra xem nó có bị hỏng khi dán không."
   },
   "radio.import.refusees": {
     "fr": "{refusees} station(s) sur {total} n'ont pas été importées : leur adresse de flux ne peut pas être ouverte. Chacune est listée ci-dessous avec l'adresse fautive et ce qu'il faut y corriger.",
@@ -1949,7 +2515,9 @@
     "ja": "{total} 局中 {refusees} 局がインポートされませんでした。ストリームのアドレスを開けません。誤ったアドレスと修正点を下に一覧しています。",
     "ko": "{total}개 방송국 중 {refusees}개를 가져오지 못했습니다. 스트림 주소를 열 수 없습니다. 각각의 잘못된 주소와 고쳐야 할 부분을 아래에 적어 두었습니다.",
     "ro": "{refusees} din {total} posturi nu au fost importate: adresa fluxului lor nu poate fi deschisă. Fiecare este listat mai jos cu adresa greșită și ce trebuie corectat.",
-    "sv": "{refusees} av {total} stationer importerades inte: deras strömadress går inte att öppna. Var och en listas nedan med den felaktiga adressen och vad som måste rättas."
+    "sv": "{refusees} av {total} stationer importerades inte: deras strömadress går inte att öppna. Var och en listas nedan med den felaktiga adressen och vad som måste rättas.",
+    "hu": "{total} állomásból {refusees} nem lett importálva: a stream címük nem nyitható meg. Alább mindegyik szerepel a hibás címmel és azzal, amit javítani kell benne.",
+    "vi": "{refusees} trên {total} đài không được nhập: không thể mở địa chỉ luồng phát của chúng. Mỗi đài được liệt kê bên dưới cùng địa chỉ bị lỗi và điều cần sửa."
   },
   "podcasts.radiofrance.cleAbsente": {
     "fr": "La source Radio France nécessite une clé API. Renseignez le réglage « radiofrance_api_key » pour l'activer.",
@@ -1961,7 +2529,9 @@
     "ja": "Radio France ソースには API キーが必要です。設定「radiofrance_api_key」を入力すると有効になります。",
     "ko": "Radio France 소스를 사용하려면 API 키가 필요합니다. \"radiofrance_api_key\" 설정을 입력하면 활성화됩니다.",
     "ro": "Sursa Radio France necesită o cheie API. Completați setarea „radiofrance_api_key” pentru a o activa.",
-    "sv": "Källan Radio France kräver en API-nyckel. Ange inställningen ”radiofrance_api_key” för att aktivera den."
+    "sv": "Källan Radio France kräver en API-nyckel. Ange inställningen ”radiofrance_api_key” för att aktivera den.",
+    "hu": "A Radio France forráshoz API-kulcs szükséges. Az engedélyezéséhez adja meg a „radiofrance_api_key” beállítást.",
+    "vi": "Nguồn Radio France cần khóa API. Hãy đặt cài đặt “radiofrance_api_key” để bật nguồn này."
   },
   "support.tropDeRequetes": {
     "fr": "Le service de support a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie un peu plus tard.",
@@ -1973,7 +2543,9 @@
     "ja": "サポートサービスはこのサーバーから多すぎるリクエストを受け取ったため、しばらく後続のリクエストを拒否します。少し時間をおいて再試行してください。",
     "ko": "지원 서비스가 이 서버에서 너무 많은 요청을 받아 당분간 이후 요청을 거부합니다. 잠시 후 다시 시도하세요.",
     "ro": "Serviciul de asistență a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încercați din nou puțin mai târziu.",
-    "sv": "Supporttjänsten har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen lite senare."
+    "sv": "Supporttjänsten har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen lite senare.",
+    "hu": "A támogatási szolgáltatás túl sok kérést kapott erről a szerverről, és egyelőre elutasítja a további kéréseket. Próbálja újra kicsit később.",
+    "vi": "Dịch vụ hỗ trợ đã nhận quá nhiều yêu cầu từ máy chủ này và tạm thời từ chối các yêu cầu tiếp theo. Hãy thử lại sau ít phút."
   },
   "support.tropDeRequetesDelai": {
     "fr": "Le service de support a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie dans {minutes} min.",
@@ -1985,7 +2557,9 @@
     "ja": "サポートサービスはこのサーバーから多すぎるリクエストを受け取ったため、しばらく後続のリクエストを拒否します。{minutes} 分後に再試行してください。",
     "ko": "지원 서비스가 이 서버에서 너무 많은 요청을 받아 당분간 이후 요청을 거부합니다. {minutes}분 후에 다시 시도하세요.",
     "ro": "Serviciul de asistență a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încercați din nou peste {minutes} min.",
-    "sv": "Supporttjänsten har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min."
+    "sv": "Supporttjänsten har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min.",
+    "hu": "A támogatási szolgáltatás túl sok kérést kapott erről a szerverről, és egyelőre elutasítja a további kéréseket. Próbálja újra {minutes} perc múlva.",
+    "vi": "Dịch vụ hỗ trợ đã nhận quá nhiều yêu cầu từ máy chủ này và tạm thời từ chối các yêu cầu tiếp theo. Hãy thử lại sau {minutes} phút."
   },
   "cloud.tropDeRequetes": {
     "fr": "Le service en ligne Tune a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie un peu plus tard.",
@@ -1997,7 +2571,9 @@
     "ja": "Tune のオンラインサービスはこのサーバーから多すぎるリクエストを受け取ったため、しばらく後続のリクエストを拒否します。少し時間をおいて再試行してください。",
     "ko": "Tune 온라인 서비스가 이 서버에서 너무 많은 요청을 받아 당분간 이후 요청을 거부합니다. 잠시 후 다시 시도하세요.",
     "ro": "Serviciul online Tune a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încearcă din nou puțin mai târziu.",
-    "sv": "Tunes onlinetjänst har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen lite senare."
+    "sv": "Tunes onlinetjänst har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen lite senare.",
+    "hu": "A Tune online szolgáltatása túl sok kérést kapott erről a szerverről, és egyelőre elutasítja a további kéréseket. Próbálja újra kicsit később.",
+    "vi": "Dịch vụ trực tuyến của Tune đã nhận quá nhiều yêu cầu từ máy chủ này và tạm thời từ chối các yêu cầu tiếp theo. Hãy thử lại sau ít phút."
   },
   "cloud.tropDeRequetesDelai": {
     "fr": "Le service en ligne Tune a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie dans {minutes} min.",
@@ -2009,7 +2585,9 @@
     "ja": "Tune のオンラインサービスはこのサーバーから多すぎるリクエストを受け取ったため、しばらく後続のリクエストを拒否します。{minutes} 分後に再試行してください。",
     "ko": "Tune 온라인 서비스가 이 서버에서 너무 많은 요청을 받아 당분간 이후 요청을 거부합니다. {minutes}분 후에 다시 시도하세요.",
     "ro": "Serviciul online Tune a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încearcă din nou peste {minutes} min.",
-    "sv": "Tunes onlinetjänst har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min."
+    "sv": "Tunes onlinetjänst har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min.",
+    "hu": "A Tune online szolgáltatása túl sok kérést kapott erről a szerverről, és egyelőre elutasítja a további kéréseket. Próbálja újra {minutes} perc múlva.",
+    "vi": "Dịch vụ trực tuyến của Tune đã nhận quá nhiều yêu cầu từ máy chủ này và tạm thời từ chối các yêu cầu tiếp theo. Hãy thử lại sau {minutes} phút."
   },
   "cloud.ssoTitre": {
     "fr": "Connexion au compte mozaiklabs impossible pour le moment",
@@ -2021,7 +2599,9 @@
     "ja": "現在 mozaiklabs アカウントにサインインできません",
     "ko": "지금은 mozaiklabs 계정에 로그인할 수 없습니다",
     "ro": "Conectarea la contul mozaiklabs nu este posibilă deocamdată",
-    "sv": "Det går inte att logga in på mozaiklabs-kontot just nu"
+    "sv": "Det går inte att logga in på mozaiklabs-kontot just nu",
+    "hu": "Egyelőre nem sikerült bejelentkezni a mozaiklabs-fiókjába",
+    "vi": "Hiện chưa thể đăng nhập vào tài khoản mozaiklabs của bạn"
   },
   "cloud.ssoNonLie": {
     "fr": "Le compte n'a pas été lié à ce serveur. Relance la connexion depuis Tune.",
@@ -2033,7 +2613,9 @@
     "ja": "アカウントはこのサーバーにリンクされていません。Tune からもう一度サインインしてください。",
     "ko": "계정이 이 서버에 연결되지 않았습니다. Tune에서 다시 로그인하세요.",
     "ro": "Contul nu a fost asociat cu acest server. Reia conectarea din Tune.",
-    "sv": "Kontot har inte kopplats till den här servern. Logga in igen från Tune."
+    "sv": "Kontot har inte kopplats till den här servern. Logga in igen från Tune.",
+    "hu": "A fiók nem lett ehhez a szerverhez kapcsolva. Indítsa újra a bejelentkezést a Tune-ból.",
+    "vi": "Tài khoản chưa được liên kết với máy chủ này. Hãy bắt đầu lại việc đăng nhập từ Tune."
   },
   "cloud.ssoRetour": {
     "fr": "Retour à Tune",
@@ -2045,7 +2627,9 @@
     "ja": "Tune に戻る",
     "ko": "Tune으로 돌아가기",
     "ro": "Înapoi la Tune",
-    "sv": "Tillbaka till Tune"
+    "sv": "Tillbaka till Tune",
+    "hu": "Vissza a Tune-hoz",
+    "vi": "Quay lại Tune"
   },
   "cloud.ssoEchec": {
     "fr": "La connexion n'a pas abouti.",
@@ -2057,7 +2641,9 @@
     "ja": "サインインは完了しませんでした。",
     "ko": "로그인이 완료되지 않았습니다.",
     "ro": "Conectarea nu s-a finalizat.",
-    "sv": "Inloggningen slutfördes inte."
+    "sv": "Inloggningen slutfördes inte.",
+    "hu": "A bejelentkezés nem fejeződött be.",
+    "vi": "Đăng nhập chưa hoàn tất."
   },
   "metadata.enrich.cleLastfmAbsente": {
     "fr": "L'enrichissement des biographies nécessite une clé API Last.fm. Renseignez le réglage « lastfm_api_key » pour l'activer.",
@@ -2069,7 +2655,9 @@
     "ja": "経歴の補完には Last.fm の API キーが必要です。設定「lastfm_api_key」を入力すると有効になります。",
     "ko": "전기 보강에는 Last.fm API 키가 필요합니다. \"lastfm_api_key\" 설정을 입력하면 활성화됩니다.",
     "ro": "Îmbogățirea biografiilor necesită o cheie API Last.fm. Completați setarea „lastfm_api_key” pentru a o activa.",
-    "sv": "Berikning av biografier kräver en API-nyckel för Last.fm. Ange inställningen ”lastfm_api_key” för att aktivera den."
+    "sv": "Berikning av biografier kräver en API-nyckel för Last.fm. Ange inställningen ”lastfm_api_key” för att aktivera den.",
+    "hu": "Az életrajzok bővítéséhez Last.fm API-kulcs szükséges. Az engedélyezéséhez adja meg a „lastfm_api_key” beállítást.",
+    "vi": "Bổ sung tiểu sử cần khóa API Last.fm. Hãy đặt cài đặt “lastfm_api_key” để bật tính năng này."
   },
   "playback.sessionLostAtPosition": {
     "fr": "La lecture de « {title} » ne peut pas reprendre à {position} : sa session de flux n’est plus disponible. Les sessions expirent après {minutes} minutes sans lecture ; un redémarrage du serveur peut aussi les supprimer. Relancez la piste.",
@@ -2081,7 +2669,9 @@
     "ja": "「{title}」を {position} から再開できません。再生セッションが利用できなくなっています。セッションは再生されないまま {minutes} 分経つと失効し、サーバーの再起動でも失われることがあります。曲をもう一度再生してください。",
     "ko": "“{title}”을(를) {position}에서 재개할 수 없습니다. 재생 세션을 더 이상 사용할 수 없습니다. 세션은 재생 없이 {minutes}분이 지나면 만료되며 서버를 다시 시작해도 사라질 수 있습니다. 트랙을 다시 재생하세요.",
     "ro": "„{title}” nu poate fi reluată de la {position}: sesiunea de redare nu mai este disponibilă. Sesiunile expiră după {minutes} minute fără redare; repornirea serverului le poate elimina și ea. Porniți din nou piesa.",
-    "sv": "”{title}” kan inte återupptas vid {position}: uppspelningssessionen är inte längre tillgänglig. Sessioner upphör efter {minutes} minuter utan uppspelning; en omstart av servern kan också ta bort dem. Starta spåret igen."
+    "sv": "”{title}” kan inte återupptas vid {position}: uppspelningssessionen är inte längre tillgänglig. Sessioner upphör efter {minutes} minuter utan uppspelning; en omstart av servern kan också ta bort dem. Starta spåret igen.",
+    "hu": "A(z) „{title}” nem folytatható innen: {position}: a lejátszási munkamenete már nem érhető el. A munkamenetek {minutes} perc lejátszás nélküli idő után lejárnak; a szerver újraindítása is törölheti őket. Indítsa újra a számot.",
+    "vi": "Không thể tiếp tục “{title}” tại {position}: phiên phát của bài không còn khả dụng. Các phiên hết hạn sau {minutes} phút không phát; khởi động lại máy chủ cũng có thể xóa chúng. Hãy phát lại bài hát."
   },
   "playback.sessionLostBrowser": {
     "fr": "La lecture de « {title} » ne peut pas reprendre là où elle en était : sa session de flux n’est plus disponible et le serveur ne connaît pas la position de lecture dans le navigateur. Les sessions expirent après {minutes} minutes sans lecture ; un redémarrage du serveur peut aussi les supprimer. Relancez la piste.",
@@ -2093,7 +2683,9 @@
     "ja": "「{title}」を前回の位置から再開できません。再生セッションが利用できなくなっており、サーバーはブラウザーの再生位置を把握していません。セッションは再生されないまま {minutes} 分経つと失効し、サーバーの再起動でも失われることがあります。曲をもう一度再生してください。",
     "ko": "“{title}”을(를) 멈춘 위치에서 재개할 수 없습니다. 재생 세션을 더 이상 사용할 수 없으며 서버는 브라우저의 재생 위치를 알지 못합니다. 세션은 재생 없이 {minutes}분이 지나면 만료되며 서버를 다시 시작해도 사라질 수 있습니다. 트랙을 다시 재생하세요.",
     "ro": "„{title}” nu poate fi reluată din locul unde s-a oprit: sesiunea nu mai este disponibilă, iar serverul nu cunoaște poziția redării în browser. Sesiunile expiră după {minutes} minute fără redare; repornirea serverului le poate elimina și ea. Porniți din nou piesa.",
-    "sv": "”{title}” kan inte återupptas där det stoppades: sessionen är inte längre tillgänglig och servern känner inte till uppspelningspositionen i webbläsaren. Sessioner upphör efter {minutes} minuter utan uppspelning; en omstart av servern kan också ta bort dem. Starta spåret igen."
+    "sv": "”{title}” kan inte återupptas där det stoppades: sessionen är inte längre tillgänglig och servern känner inte till uppspelningspositionen i webbläsaren. Sessioner upphör efter {minutes} minuter utan uppspelning; en omstart av servern kan också ta bort dem. Starta spåret igen.",
+    "hu": "A(z) „{title}” nem folytatható ott, ahol abbamaradt: a lejátszási munkamenete már nem érhető el, és a szerver nem ismeri a böngészőbeli lejátszási pozíciót. A munkamenetek {minutes} perc lejátszás nélküli idő után lejárnak; a szerver újraindítása is törölheti őket. Indítsa újra a számot.",
+    "vi": "Không thể tiếp tục “{title}” tại chỗ đã dừng: phiên phát của bài không còn khả dụng và máy chủ không biết vị trí phát trong trình duyệt. Các phiên hết hạn sau {minutes} phút không phát; khởi động lại máy chủ cũng có thể xóa chúng. Hãy phát lại bài hát."
   },
   "playback.sessionLostCause": {
     "fr": "Cause: {cause}",
@@ -2105,7 +2697,9 @@
     "ja": "原因: {cause}",
     "ko": "원인: {cause}",
     "ro": "Cauză: {cause}",
-    "sv": "Orsak: {cause}"
+    "sv": "Orsak: {cause}",
+    "hu": "Ok: {cause}",
+    "vi": "Nguyên nhân: {cause}"
   },
   "bitperfect.strict.refused": {
     "fr": "Bit-perfect strict : lecture refusée — la sortie ne lit pas le {requested} kHz sans conversion (elle tourne à {device} kHz). Désactivez « Bit-perfect strict » dans les réglages de la zone pour jouer avec conversion.",
@@ -2117,7 +2711,9 @@
     "ja": "厳格ビットパーフェクト：再生を拒否しました — この出力は変換なしで {requested} kHz を再生できません（{device} kHz で動作しています）。変換して再生するには、ゾーン設定で「厳格ビットパーフェクト」をオフにしてください。",
     "ko": "엄격한 비트퍼펙트: 재생이 거부되었습니다 — 이 출력은 변환 없이 {requested} kHz를 재생할 수 없습니다({device} kHz로 동작 중). 변환하여 재생하려면 존 설정에서 '엄격한 비트퍼펙트'를 끄세요.",
     "ro": "Bit-perfect strict: redare refuzată — ieșirea nu poate reda {requested} kHz fără conversie (funcționează la {device} kHz). Dezactivați „Bit-perfect strict” din setările zonei pentru a reda cu conversie.",
-    "sv": "Strikt bitperfekt: uppspelning nekad — utgången kan inte spela {requested} kHz utan konvertering (den körs på {device} kHz). Stäng av ”Strikt bitperfekt” i zonens inställningar för att spela med konvertering."
+    "sv": "Strikt bitperfekt: uppspelning nekad — utgången kan inte spela {requested} kHz utan konvertering (den körs på {device} kHz). Stäng av ”Strikt bitperfekt” i zonens inställningar för att spela med konvertering.",
+    "hu": "Szigorú bit-perfect: a lejátszás elutasítva — a kimenet nem tud {requested} kHz-et konverzió nélkül lejátszani ({device} kHz-en működik). A konverzióval történő lejátszáshoz kapcsolja ki a „Szigorú bit-perfect” beállítást a zóna beállításaiban.",
+    "vi": "Bit-perfect nghiêm ngặt: từ chối phát — đầu ra không thể phát {requested} kHz mà không chuyển đổi (đầu ra đang chạy ở {device} kHz). Hãy tắt “Bit-perfect nghiêm ngặt” trong cài đặt vùng phát để phát có chuyển đổi."
   },
   "radio.genre.eclectic": {
     "fr": "Éclectique",
@@ -2129,7 +2725,9 @@
     "ja": "エクレクティック",
     "ko": "이클렉틱",
     "ro": "Eclectic",
-    "sv": "Eklektiskt"
+    "sv": "Eklektiskt",
+    "hu": "Eklektikus",
+    "vi": "Đa dạng"
   },
   "radio.genre.frenchSong": {
     "fr": "Chanson française",
@@ -2141,7 +2739,9 @@
     "ja": "シャンソン",
     "ko": "샹송",
     "ro": "Șansonetă franceză",
-    "sv": "Fransk chanson"
+    "sv": "Fransk chanson",
+    "hu": "Francia sanzon",
+    "vi": "Nhạc Pháp (Chanson)"
   },
   "radio.genre.classical": {
     "fr": "Classique",
@@ -2153,7 +2753,9 @@
     "ja": "クラシック",
     "ko": "클래식",
     "ro": "Clasică",
-    "sv": "Klassiskt"
+    "sv": "Klassiskt",
+    "hu": "Klasszikus",
+    "vi": "Cổ điển"
   },
   "radio.genre.contemporary": {
     "fr": "Contemporaine",
@@ -2165,7 +2767,9 @@
     "ja": "現代音楽",
     "ko": "현대음악",
     "ro": "Contemporană",
-    "sv": "Samtida"
+    "sv": "Samtida",
+    "hu": "Kortárs",
+    "vi": "Đương đại"
   },
   "radio.genre.culture": {
     "fr": "Culture",
@@ -2177,7 +2781,9 @@
     "ja": "カルチャー",
     "ko": "문화",
     "ro": "Cultură",
-    "sv": "Kultur"
+    "sv": "Kultur",
+    "hu": "Kultúra",
+    "vi": "Văn hóa"
   },
   "radio.genre.generalist": {
     "fr": "Généraliste",
@@ -2189,7 +2795,9 @@
     "ja": "総合",
     "ko": "종합",
     "ro": "Generalist",
-    "sv": "Allmänt"
+    "sv": "Allmänt",
+    "hu": "Általános",
+    "vi": "Tổng hợp"
   },
   "radio.genre.electronic": {
     "fr": "Électronique",
@@ -2201,7 +2809,9 @@
     "ja": "エレクトロニック",
     "ko": "일렉트로닉",
     "ro": "Electronică",
-    "sv": "Elektroniskt"
+    "sv": "Elektroniskt",
+    "hu": "Elektronikus",
+    "vi": "Điện tử"
   },
   "radio.genre.groove": {
     "fr": "Groove",
@@ -2213,7 +2823,9 @@
     "ja": "グルーヴ",
     "ko": "그루브",
     "ro": "Groove",
-    "sv": "Groove"
+    "sv": "Groove",
+    "hu": "Groove",
+    "vi": "Groove"
   },
   "radio.genre.hipHop": {
     "fr": "Hip-Hop",
@@ -2225,7 +2837,9 @@
     "ja": "ヒップホップ",
     "ko": "힙합",
     "ro": "Hip-Hop",
-    "sv": "Hiphop"
+    "sv": "Hiphop",
+    "hu": "Hip-hop",
+    "vi": "Hip-Hop"
   },
   "radio.genre.jazz": {
     "fr": "Jazz",
@@ -2237,7 +2851,9 @@
     "ja": "ジャズ",
     "ko": "재즈",
     "ro": "Jazz",
-    "sv": "Jazz"
+    "sv": "Jazz",
+    "hu": "Jazz",
+    "vi": "Jazz"
   },
   "radio.genre.metal": {
     "fr": "Metal",
@@ -2249,7 +2865,9 @@
     "ja": "メタル",
     "ko": "메탈",
     "ro": "Metal",
-    "sv": "Metal"
+    "sv": "Metal",
+    "hu": "Metal",
+    "vi": "Metal"
   },
   "radio.genre.world": {
     "fr": "Monde",
@@ -2261,7 +2879,9 @@
     "ja": "ワールド",
     "ko": "월드뮤직",
     "ro": "Muzica lumii",
-    "sv": "Världsmusik"
+    "sv": "Världsmusik",
+    "hu": "Világzene",
+    "vi": "World"
   },
   "radio.genre.pop": {
     "fr": "Pop",
@@ -2273,7 +2893,9 @@
     "ja": "ポップ",
     "ko": "팝",
     "ro": "Pop",
-    "sv": "Pop"
+    "sv": "Pop",
+    "hu": "Pop",
+    "vi": "Pop"
   },
   "radio.genre.reggae": {
     "fr": "Reggae",
@@ -2285,7 +2907,9 @@
     "ja": "レゲエ",
     "ko": "레게",
     "ro": "Reggae",
-    "sv": "Reggae"
+    "sv": "Reggae",
+    "hu": "Reggae",
+    "vi": "Reggae"
   },
   "radio.genre.rock": {
     "fr": "Rock",
@@ -2297,7 +2921,9 @@
     "ja": "ロック",
     "ko": "록",
     "ro": "Rock",
-    "sv": "Rock"
+    "sv": "Rock",
+    "hu": "Rock",
+    "vi": "Rock"
   },
   "radio.genre.blues": {
     "fr": "Blues",
@@ -2309,7 +2935,9 @@
     "ja": "ブルース",
     "ko": "블루스",
     "ro": "Blues",
-    "sv": "Blues"
+    "sv": "Blues",
+    "hu": "Blues",
+    "vi": "Blues"
   },
   "radio.genre.soul": {
     "fr": "Soul",
@@ -2321,7 +2949,9 @@
     "ja": "ソウル",
     "ko": "소울",
     "ro": "Soul",
-    "sv": "Soul"
+    "sv": "Soul",
+    "hu": "Soul",
+    "vi": "Soul"
   },
   "radio.genre.funk": {
     "fr": "Funk",
@@ -2333,7 +2963,9 @@
     "ja": "ファンク",
     "ko": "펑크",
     "ro": "Funk",
-    "sv": "Funk"
+    "sv": "Funk",
+    "hu": "Funk",
+    "vi": "Funk"
   },
   "radio.genre.folk": {
     "fr": "Folk",
@@ -2345,7 +2977,9 @@
     "ja": "フォーク",
     "ko": "포크",
     "ro": "Folk",
-    "sv": "Folkmusik"
+    "sv": "Folkmusik",
+    "hu": "Folk",
+    "vi": "Folk"
   },
   "radio.genre.ambient": {
     "fr": "Ambient",
@@ -2357,18 +2991,22 @@
     "ja": "アンビエント",
     "ko": "앰비언트",
     "ro": "Ambient",
-    "sv": "Ambient"
+    "sv": "Ambient",
+    "hu": "Ambient",
+    "vi": "Ambient"
   },
   "spotify.playback.disabled": {
-    "fr": "Lecture Spotify non activée (option expérimentale dans les Réglages).",
-    "en": "Spotify playback is not enabled (experimental option in Settings).",
-    "de": "Spotify-Wiedergabe ist nicht aktiviert (experimentelle Option in den Einstellungen).",
-    "es": "La reproducción de Spotify no está activada (opción experimental en Ajustes).",
-    "it": "La riproduzione Spotify non è attivata (opzione sperimentale nelle Impostazioni).",
-    "zh": "Spotify 播放未启用（设置中的实验性选项）。",
-    "ja": "Spotify の再生は有効になっていません（設定の試験的オプション）。",
-    "ko": "Spotify 재생이 활성화되지 않았습니다(설정의 실험적 옵션).",
-    "ro": "Redarea Spotify nu este activată (opțiune experimentală în Setări).",
-    "sv": "Spotify-uppspelning är inte aktiverad (experimentellt alternativ i Inställningar)."
+    "fr": "Lecture Spotify non activée : l'option expérimentale se trouve dans Réglages > Spotify > « Lecture Spotify (expérimental) ».",
+    "en": "Spotify playback is not enabled: the experimental option is in Settings > Spotify.",
+    "de": "Spotify-Wiedergabe ist nicht aktiviert: Die experimentelle Option befindet sich unter Einstellungen > Spotify.",
+    "es": "La reproducción de Spotify no está activada: la opción experimental está en Ajustes > Spotify.",
+    "it": "La riproduzione Spotify non è attivata: l'opzione sperimentale si trova in Impostazioni > Spotify.",
+    "zh": "Spotify 播放未启用：实验性选项位于 设置 > Spotify。",
+    "ja": "Spotify の再生は有効になっていません。試験的オプションは 設定 > Spotify にあります。",
+    "ko": "Spotify 재생이 활성화되지 않았습니다. 실험적 옵션은 설정 > Spotify에 있습니다.",
+    "ro": "Redarea Spotify nu este activată: opțiunea experimentală se află în Setări > Spotify.",
+    "sv": "Spotify-uppspelning är inte aktiverad: det experimentella alternativet finns under Inställningar > Spotify.",
+    "hu": "A Spotify-lejátszás nincs engedélyezve: a kísérleti beállítás a Beállítások > Spotify alatt található.",
+    "vi": "Chưa bật phát Spotify: tùy chọn thử nghiệm nằm trong Cài đặt > Spotify."
   }
 }

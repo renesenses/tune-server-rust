@@ -63,7 +63,8 @@ use crate::state::AppState;
 ///   ces passes s'inscrivent déjà par `begin()` le temps qu'elles vivent.
 /// * **`identification`** — même signal, même registre : le pilote de lot de
 ///   `POST /library/identify-all` s'y inscrit sous `identification_lot` (#4805).
-fn etat_de(state: &AppState, tache: Tache) -> Etat {
+/// * **`hires_check`** — un lot de la passe des faux hi-res décode (#6285).
+pub(crate) fn etat_de(state: &AppState, tache: Tache) -> Etat {
     if est_en_pause(tache) {
         return Etat::EnPause;
     }
@@ -83,9 +84,13 @@ fn etat_de(state: &AppState, tache: Tache) -> Etat {
         Tache::Acoustique => tune_core::audio::embedding::balayage_acoustique_en_cours(),
         #[cfg(not(feature = "audio-embedding"))]
         Tache::Acoustique => false,
-        Tache::Enrichissement => inscrite(state, &["enrich_all", "bios", "credits_enrich_auto"]),
-        Tache::ImagesArtistes => inscrite(state, &["artist_artwork", "artwork"]),
-        Tache::Identification => inscrite(state, &["identification_lot"]),
+        // #6282 — la table des inscriptions est celle du drapeau `paused` des
+        // tâches (`background_tasks::tache_suspendable`) : une seule source.
+        Tache::Enrichissement | Tache::ImagesArtistes | Tache::Identification => {
+            inscrite(state, tache)
+        }
+        // #6285 — la passe des faux hi-res : un lot décode-t-il.
+        Tache::FauxHiRes => tune_core::audio::faux_hires_passe::lot_en_cours(),
     };
     if en_cours {
         Etat::EnCours
@@ -121,13 +126,13 @@ pub(crate) fn cascade_en_cours(
     }
 }
 
-/// L'une de ces tâches est-elle inscrite au registre des tâches en cours ?
-fn inscrite(state: &AppState, ids: &[&str]) -> bool {
+/// Une tâche relevant de ce traitement est-elle inscrite au registre ?
+fn inscrite(state: &AppState, tache: Tache) -> bool {
     state
         .background_tasks
         .snapshot()
         .iter()
-        .any(|t| ids.contains(&t.id.as_str()))
+        .any(|t| crate::background_tasks::tache_suspendable(&t.id) == Some(tache))
 }
 
 /// Le bloc que toutes les routes de cette famille rendent, `GET` comprise.
@@ -304,24 +309,92 @@ pub(crate) async fn tout_suspendre(State(state): State<AppState>) -> impl IntoRe
 
 /// `POST /system/background-tasks/resume-all` — tout reprendre.
 pub(crate) async fn tout_reprendre(State(state): State<AppState>) -> impl IntoResponse {
-    match tune_core::taches_de_fond::tout_reprendre(&state.backend) {
-        Ok(()) => {
-            // #5469 — même règle que la reprise d'UN traitement.
-            let mut relancees = Vec::new();
-            for tache in Tache::TOUTES {
-                relancees.extend(
-                    crate::reprise_des_passes::relancer_pour(
-                        &state,
-                        tache,
-                        crate::reprise_des_passes::Origine::Reprendre,
-                    )
-                    .await,
-                );
-            }
-            reponse_avec_relances(&state, relancees)
-        }
+    match reprendre_et_relancer_tout(&state).await {
+        Ok(relancees) => reponse_avec_relances(&state, relancees),
         Err(e) => echec(e).into_response(),
     }
+}
+
+/// Lever toutes les pauses, puis relancer les passes que l'arrêt a tuées.
+async fn reprendre_et_relancer_tout(state: &AppState) -> Result<Vec<&'static str>, String> {
+    tune_core::taches_de_fond::tout_reprendre(&state.backend)?;
+    // #5469 — même règle que la reprise d'UN traitement.
+    let mut relancees = Vec::new();
+    for tache in Tache::TOUTES {
+        relancees.extend(
+            crate::reprise_des_passes::relancer_pour(
+                state,
+                tache,
+                crate::reprise_des_passes::Origine::Reprendre,
+            )
+            .await,
+        );
+    }
+    Ok(relancees)
+}
+
+/// `POST /system/background-tasks/relaunch-all` — « Tout relancer » (#6330).
+///
+/// Benjithom, fil 2270 : « Tout relancer » ne faisait rien sur un ReplayGain
+/// suspendu à 99 % et une plage dynamique suspendue à 95 %. Le bouton ne
+/// connaissait que les trois routes de LANCEMENT (plage dynamique,
+/// métadonnées, images d'artistes), écartait tout ce qui était en pause, et
+/// rien ne rendait à la passe une piste en échec de mesure.
+///
+/// Cette route fait les trois choses que le mot promet, dans cet ordre :
+///
+/// 1. **reprendre** tous les traitements suspendus — ReplayGain compris — et
+///    relancer les passes qu'un arrêt a tuées (même chemin que
+///    `resume-all`, #5469) ;
+/// 2. **rendre à la cascade les pistes en échec** : témoins ReplayGain sans
+///    gain, marques « plage dynamique indisponible », reports de chemin
+///    ([`tune_core::audio::replaygain::reessai`]). Aucune mesure réussie
+///    n'est effacée ;
+/// 3. **réveiller** la cascade si elle dort au repos.
+///
+/// Les passes à lancer (plage dynamique à la demande, métadonnées, images
+/// d'artistes) gardent leurs propres routes : le client les appelle ensuite,
+/// comme avant, pour celles qui étaient au repos.
+///
+/// Rend l'instantané, plus `resumed` (les traitements qui étaient suspendus),
+/// `relaunched` (#5469) et `retried` (les pistes rendues, par passe).
+pub(crate) async fn tout_relancer(State(state): State<AppState>) -> impl IntoResponse {
+    let suspendus: Vec<&'static str> = tune_core::taches_de_fond::suspendus()
+        .into_iter()
+        .map(Tache::id)
+        .collect();
+    let relancees = match reprendre_et_relancer_tout(&state).await {
+        Ok(r) => r,
+        Err(e) => return echec(e).into_response(),
+    };
+    let backend = state.backend.clone();
+    let rendues = match tokio::task::spawn_blocking(move || {
+        tune_core::audio::replaygain::reessai::rendre_les_pistes_en_echec(&backend)
+    })
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return echec(e).into_response(),
+        Err(e) => return echec(e.to_string()).into_response(),
+    };
+    // La jauge ReplayGain ne doit pas resservir les échecs d'avant le clic.
+    state.bibliotheque_rg.oublier();
+    tracing::info!(
+        suspendus = ?suspendus,
+        relancees = ?relancees,
+        pistes_replaygain = rendues.replaygain,
+        pistes_plage_dynamique = rendues.dynamic_range,
+        reports = rendues.deferred,
+        "tout_relancer"
+    );
+    let mut corps = instantane(&state);
+    corps["relaunched"] = json!(relancees);
+    corps["resumed"] = json!(suspendus);
+    corps["retried"] = json!(rendues);
+    state
+        .event_bus
+        .emit("system.background_tasks", corps.clone());
+    (StatusCode::OK, Json(corps)).into_response()
 }
 
 /// Le 200 commun : l'instantané complet, et le même évènement que le registre

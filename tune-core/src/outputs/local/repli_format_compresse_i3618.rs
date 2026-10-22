@@ -168,8 +168,12 @@ fn la_branche_compressee_emprunte_reellement_la_cascade() {
          `device.build_output_stream` isolé y rétablit le défaut de #3618 : \
          une seule tentative, en `f32`, et la zone se tait."
     );
+    // #6230 — la même règle, précédée des voies d'une matrice armée.
+    let sans_espaces: String = bloc.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        bloc.contains("cascade_de_formats(&output_config, &source_config)"),
+        sans_espaces.contains(
+            "cascade_de_formats_avec_la_matrice(config_de_la_matrice.as_ref(),&output_config,&source_config,)"
+        ),
         "la liste des tentatives doit venir de la règle partagée avec le \
          chemin PCM, pas d'une seconde liste recopiée ici"
     );

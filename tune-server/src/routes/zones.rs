@@ -176,6 +176,12 @@ struct PatchZone {
     /// Sans abonnement tenu, l'option ne fait rien : la sortie retombe sur le
     /// sondage complet plutôt que de servir un état inventé.
     upnp_silence: Option<bool>,
+    /// #2991 — « Envoyer le titre radio par DLNA (pour les lecteurs qui
+    /// ignorent l'ICY) ». `"off"` (défaut), `"next"` (`SetNextAVTransportURI`,
+    /// sans coupure) ou `"reload"` (`SetAVTransportURI` sur la même URI,
+    /// coupure probable). Persisté en setting `zone_{id}_dlna_radio_title`,
+    /// clé supprimée à `"off"`. Toute autre valeur est refusée.
+    dlna_radio_title: Option<String>,
     /// Modèle choisi par l'utilisateur (filtré par marque, ou texte libre).
     /// Persisté en setting `zone_{id}_model`. Chaîne vide = efface l'override.
     model: Option<String>,
@@ -313,6 +319,13 @@ fn inject_device_identity(
         .flatten()
         .filter(|v| !v.trim().is_empty());
     obj.insert("image_path".into(), json!(image_path));
+    // #2109 — la photo affichée a-t-elle été proposée au catalogue ? La clef
+    // est TOUJOURS présente (`null` = locale) : un client y lit aussi que ce
+    // serveur sait proposer une photo.
+    obj.insert(
+        "image_share_status".into(),
+        json!(peripheriques::etat_partage_photo(&settings, zone_id)),
+    );
     let trim = settings
         .get(&format!("zone_{zone_id}_gain_trim_db"))
         .ok()
@@ -320,6 +333,8 @@ fn inject_device_identity(
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.0);
     obj.insert("gain_trim_db".into(), json!(trim));
+    // #6541 — les limites de volume, toujours publiées (`null` = aucune).
+    tune_core::audio::volume_limites::publier(obj, backend, zone_id);
     let upnp_renderer = settings
         .get(&format!("zone_{zone_id}_upnp_renderer"))
         .ok()
@@ -338,6 +353,12 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("upnp_silence".into(), json!(upnp_silence));
+    // #2991 — le titre radio par DIDL. TOUJOURS publié : sa présence dit au
+    // client que ce serveur connaît le réglage.
+    obj.insert(
+        "dlna_radio_title".into(),
+        json!(tune_core::outputs::dlna::titre_radio_2991::mode_de_zone(backend, zone_id).as_str()),
+    );
     obj.insert(
         "upnp_silence_effets".into(),
         json!({
@@ -462,6 +483,17 @@ fn inject_device_identity(
         "detected_model".into(),
         json!(detected.filter(|_| !effacee).and_then(|d| d.model.clone())),
     );
+    // #6546 — la plage MAC reconnue et sa marque, comme sur `GET /devices`.
+    // Même règle que la détection juste au-dessus : une identité récusée
+    // (#3660) ne se republie pas par la porte de l'OUI. Seuls les trois
+    // premiers octets sortent ; la MAC complète n'est pas publiée ici.
+    let (mac_prefix, mac_vendor) = tune_core::discovery::mac::plage_et_marque(
+        detected
+            .filter(|_| !effacee)
+            .and_then(|d| d.mac_address.as_deref()),
+    );
+    obj.insert("mac_prefix".into(), json!(mac_prefix));
+    obj.insert("mac_vendor".into(), json!(mac_vendor));
 }
 
 pub fn router() -> Router<AppState> {
@@ -473,7 +505,24 @@ pub fn router() -> Router<AppState> {
         .route("/{id}", get(get_zone).patch(patch_zone).delete(delete_zone))
         // DUP-1 (phase 1) : fusion explicite de deux zones du même appareil.
         .route("/{id}/fusionner-dans/{cible}", post(fusionner_zones))
+        // #6120 — rattacher à la main une zone orpheline à une sortie ASIO
+        // présente (la ré-association automatique refuse ASIO, à bon droit).
+        .route(
+            "/{id}/rattacher",
+            get(rattacher_asio_6120::candidats_au_rattachement)
+                .post(rattacher_asio_6120::rattacher_zone),
+        )
         .route("/{id}/volume", put(update_volume))
+        // #6541 — boutons + / − et limites de volume (sécurité, confort).
+        .route(
+            "/{id}/volume/step",
+            post(limites_de_volume_6541::pas_de_volume),
+        )
+        .route(
+            "/{id}/volume-limits",
+            get(limites_de_volume_6541::lire_les_limites)
+                .put(limites_de_volume_6541::regler_les_limites),
+        )
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
         .route("/{id}/eq/response", get(eq_response))
@@ -493,6 +542,9 @@ pub fn router() -> Router<AppState> {
             "/{id}/image",
             post(zone_image_upload).delete(zone_image_delete),
         )
+        // #2109 — proposer cette photo au catalogue communautaire, sur accord
+        // explicite seulement.
+        .route("/{id}/image/share", post(zone_image_share))
         .route("/{id}/name", put(rename_zone))
         // #1361 — l'album de ce qui joue, et chez qui l'ouvrir, en UNE
         // réponse. Deux orthographes pour la même route : le dépôt en est à
@@ -565,6 +617,9 @@ pub use dsp::*;
 mod lecture;
 pub use lecture::*;
 mod presence;
+mod rattacher_asio_6120;
+// #6541 — boutons + / − et limites de volume d'une zone.
+mod limites_de_volume_6541;
 
 // #5353 — le backend nommé par le chemin du signal est celui de LA sortie.
 mod backend_de_la_sortie_5353;
@@ -581,7 +636,11 @@ mod fusion_tests;
 #[cfg(test)]
 mod identite_appareil_tests;
 #[cfg(test)]
+mod oubli_du_dlna_decouvert_6299;
+#[cfg(test)]
 mod page_d_album_bandcamp_tests;
+#[cfg(test)]
+mod plages_mac_6546_tests;
 #[cfg(test)]
 mod sante_reseau_de_zone_tests;
 #[cfg(test)]
@@ -1372,7 +1431,8 @@ pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) 
                 .streamer
                 .stream_bytes_sent(sid)
                 .await
-                .is_some_and(|n| n > 0),
+                // #6066 — une sonde de plage n'est pas un onglet qui joue.
+                .is_some_and(tune_core::poller::octets_d_une_ecoute),
             None => false,
         }
     } else {
@@ -1529,6 +1589,7 @@ fn output_reach_of(
 }
 
 mod signal_path;
+pub(crate) mod textes_signal;
 pub use signal_path::*;
 
 mod ecriture;
@@ -1572,7 +1633,15 @@ mod signal_path_pure_replaygain_5633_tests;
 
 // #4384 — ReplayGain sans gain tagué, et où le gain s'applique.
 #[cfg(test)]
+mod signal_path_decodeur_sortie_pull_6178_tests;
+#[cfg(test)]
 mod signal_path_gain_sortie_4384_tests;
+// #6166 — le WAV 32 bits interne d'une sortie locale n'est pas une conversion.
+#[cfg(test)]
+mod signal_path_conteneur_local_6166_tests;
+// #6334 — un AAC Tidal servi en WAV se dit AAC, sans profondeur de bits.
+#[cfg(test)]
+mod signal_path_aac_tidal_6334_tests;
 // #2029 — un DSD qui part en DoP se dit « over PCM (DoP) ».
 #[cfg(test)]
 mod signal_path_dop_2029_tests;

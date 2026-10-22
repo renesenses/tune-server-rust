@@ -27,6 +27,8 @@ pub fn router() -> Router<AppState> {
         .route("/list", get(list_devices))
         // Catalogue statique marque→modèles (+ quirks) pour l'UI de config zone.
         .route("/catalog", get(device_catalog))
+        // #6546 — la table des plages MAC reconnues, en lecture seule.
+        .route("/oui-audio", get(oui_audio_table))
         .route("/add", post(add_device))
         .route("/scan", post(scan_devices))
         .route("/rescan", post(rescan_local_devices))
@@ -85,13 +87,31 @@ async fn list_sendspin_players(
     axum::Extension(contexte): axum::Extension<super::sendspin::ContexteSendspin>,
 ) -> Json<Value> {
     let appairage = contexte.decrire().await;
-    let players = state.discovered_sendspin_players().await;
+    // Liste d'exclusion : chaque enceinte dit si Tune s'interdit de la
+    // contacter, et sous quel identifiant (annonce ou client_id appris).
+    let exclusions = contexte.exclusions();
+    let mut players = state.discovered_sendspin_players().await;
+    for p in &mut players {
+        let client_id = p["websocket_url"]
+            .as_str()
+            .and_then(|u| contexte.client_du_lien(u));
+        let exclu = p["id"].as_str().is_some_and(|i| exclusions.contains(i))
+            || client_id.as_ref().is_some_and(|c| exclusions.contains(c));
+        p["client_id"] = json!(client_id);
+        p["excluded"] = json!(exclu);
+    }
     // #3326 S2-a — les pairs qui ont mené une poignée de main Noise jusqu'au
     // bout, avec ce qu'ils ont dit d'eux dans leur `client/hello`. C'est une
     // liste DIFFÉRENTE de `players` : celle-ci vient du réseau (mDNS), celle-là
     // du protocole. Un pair peut figurer dans l'une sans l'autre — une enceinte
     // qui compose vers nous n'a aucune raison de s'annoncer en mDNS.
-    let pairs = tune_core::sendspin::registre::decrire();
+    let mut pairs = tune_core::sendspin::registre::decrire();
+    for p in &mut pairs {
+        let exclu = p["client_id"]
+            .as_str()
+            .is_some_and(|c| exclusions.contains(c));
+        p["excluded"] = json!(exclu);
+    }
     Json(json!({
         "service": tune_core::discovery::sendspin::SERVICE_LECTEUR,
         "server_service": tune_core::discovery::sendspin::SERVICE_SERVEUR,
@@ -111,6 +131,7 @@ async fn list_sendspin_players(
         "players": players,
         "handshaked_count": pairs.len(),
         "handshaked": pairs,
+        "excluded": exclusions,
     }))
 }
 
@@ -387,7 +408,45 @@ fn build_device_list(
         }
     }
 
+    for item in &mut items {
+        inserer_plage_mac(item);
+    }
     items
+}
+
+/// #6546 — la plage MAC reconnue (`AA:BB:CC`) et sa marque, dérivées de
+/// `mac_address` par `tune_core::discovery::mac::plage_et_marque`, qui lit la
+/// même table que la déduction de marque. Les deux clés sont TOUJOURS posées
+/// (`null` quand il n'y a rien à dire) : un client y lit que ce serveur sait
+/// les publier, et distingue « plage hors table » (`mac_prefix` seul) de
+/// « pas de MAC » (les deux à `null`).
+fn inserer_plage_mac(item: &mut Value) {
+    let (plage, marque) =
+        tune_core::discovery::mac::plage_et_marque(item.get("mac_address").and_then(Value::as_str));
+    if let Some(obj) = item.as_object_mut() {
+        obj.insert("mac_prefix".into(), json!(plage));
+        obj.insert("mac_vendor".into(), json!(marque));
+    }
+}
+
+/// `GET /devices/oui-audio` — la table des plages MAC reconnues, groupée par
+/// marque (#6546). Lecture seule : c'est la table embarquée, celle que lit
+/// `vendor_for_mac`, rien n'est recopié. Marques triées par nom, plages dans
+/// l'ordre ; `total` compte les plages.
+async fn oui_audio_table() -> Json<Value> {
+    Json(corps_oui_audio())
+}
+
+fn corps_oui_audio() -> Value {
+    let groupes = tune_core::discovery::mac::plages_par_marque();
+    let total: usize = groupes.iter().map(|(_, plages)| plages.len()).sum();
+    json!({
+        "vendors": groupes
+            .into_iter()
+            .map(|(name, prefixes)| json!({ "name": name, "prefixes": prefixes }))
+            .collect::<Vec<_>>(),
+        "total": total,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -792,6 +851,15 @@ fn load_discovered_dlna(backend: &Arc<dyn DbBackend>) -> Vec<DiscoveredDlnaDevic
     }
 }
 
+/// Les UDN du magasin des DLNA decouverts, pour les bancs d'autres modules.
+#[cfg(test)]
+pub(crate) fn uuids_dlna_decouverts(backend: &Arc<dyn DbBackend>) -> Vec<String> {
+    load_discovered_dlna(backend)
+        .into_iter()
+        .map(|d| d.uuid)
+        .collect()
+}
+
 fn save_discovered_dlna(backend: &Arc<dyn DbBackend>, devices: &[DiscoveredDlnaDevice]) {
     let repo = SettingsRepo::with_backend(backend.clone());
     match serde_json::to_string(devices) {
@@ -987,7 +1055,12 @@ fn dedup_dlna_by_location(devices: Vec<DiscoveredDlnaDevice>) -> Vec<DiscoveredD
 }
 
 /// Retire un appareil du magasin des DLNA decouverts.
-fn forget_discovered_dlna(backend: &Arc<dyn DbBackend>, uuid: &str) {
+///
+/// #6299 — aussi appele par les gestes d'oubli de l'utilisateur
+/// (`DELETE /devices/{id}`, `POST /devices/clear`, suppression de la zone
+/// liee) : sans cela, un renderer parti du reseau etait re-sonde a chaque
+/// demarrage, sans fin, et aucun geste ne l'arretait.
+pub(crate) fn forget_discovered_dlna(backend: &Arc<dyn DbBackend>, uuid: &str) {
     let mut devices = load_discovered_dlna(backend);
     let before = devices.len();
     devices.retain(|d| d.uuid != uuid);
@@ -1399,11 +1472,10 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
         // l'ordonnanceur : un balayage bloqué dans le greffon ALSA de PipeWire
         // y garait un fil par chargement de page, jusqu'à ce que le serveur ne
         // réponde plus du tout.
-        let devices = if crate::background::any_local_output_playing(&state).await {
-            tune_core::outputs::local::cached_audio_devices()
-        } else {
-            tune_core::outputs::local::list_audio_devices_with_backend_bounded(backend).await
-        };
+        let devices = crate::background::parc_local_sans_couper_la_lecture(&state, || {
+            tune_core::outputs::local::list_audio_devices_with_backend_bounded(backend)
+        })
+        .await;
         // Publier l'identifiant de registre à côté du nom.
         //
         // Cette charge utile n'en portait aucun, et un client qui veut créer
@@ -1743,6 +1815,13 @@ async fn clear_devices(State(state): State<AppState>) -> impl IntoResponse {
     }
     // Forget all persisted manual devices too, so a clear is durable.
     save_manual_devices(&state, &[]);
+    // #6299 — et les DLNA decouverts : sans quoi chacun, meme parti du reseau,
+    // est re-sonde au prochain demarrage. Ceux qui sont la reviennent par SSDP.
+    let oublies = load_discovered_dlna(&state.backend).len();
+    if oublies > 0 {
+        save_discovered_dlna(&state.backend, &[]);
+        info!(count = oublies, "discovered_dlna_forgotten_by_clear");
+    }
     Json(json!({"cleared": removed}))
 }
 
@@ -1755,6 +1834,9 @@ async fn delete_device(
     drop(outputs);
     // Also drop it from persistence so it isn't re-registered on next startup.
     forget_manual_device(&state, &device_id);
+    // #6299 — un renderer DLNA decouvert aussi : il etait re-sonde a chaque
+    // demarrage, meme parti du reseau.
+    forget_discovered_dlna(&state.backend, &device_id);
     state.event_bus.emit_typed(
         tune_core::event_types::EventType::DeviceLost,
         json!({ "device_id": device_id }),
@@ -3115,5 +3197,212 @@ mod liste_appareils_ignores_1280 {
             items[0].get("name").and_then(Value::as_str),
             Some("Cabasse Pearl Akoya")
         );
+    }
+}
+
+/// #6299 — un renderer DLNA decouvert puis parti du reseau etait re-sonde a
+/// chaque demarrage, sans fin : `DELETE /devices/{id}` et `POST /devices/clear`
+/// n'oubliaient que les appareils manuels.
+#[cfg(test)]
+mod oubli_des_dlna_decouverts_6299 {
+    use super::*;
+
+    const PARTI: &str = "uuid:4d696e69-444c-164e-9d41-b827eb4c0a0b";
+    const RESTANT: &str = "uuid:56fcb4ae-e909-1c8d-0080-0006787c2e26";
+
+    fn banc() -> (tempfile::TempDir, AppState) {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("tune.db");
+        let state = AppState::new(chemin.to_str().unwrap(), 0, Default::default()).unwrap();
+        for (uuid, hote) in [(PARTI, "192.168.1.40"), (RESTANT, "192.168.1.11")] {
+            persist_discovered_dlna(
+                &state.backend,
+                &DiscoveredDlnaDevice::new(
+                    uuid,
+                    &format!("http://{hote}:8019/root.xml"),
+                    "Renderer",
+                    hote,
+                    8019,
+                ),
+            );
+        }
+        assert_eq!(uuids_dlna_decouverts(&state.backend).len(), 2, "premisse");
+        (dossier, state)
+    }
+
+    #[tokio::test]
+    async fn supprimer_l_appareil_l_oublie_du_magasin_des_decouverts() {
+        let (_dossier, state) = banc();
+        let statut = delete_device(State(state.clone()), Path(PARTI.to_string()))
+            .await
+            .into_response()
+            .status();
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert_eq!(
+            uuids_dlna_decouverts(&state.backend),
+            vec![RESTANT.to_string()],
+            "le renderer supprime ne doit plus etre re-sonde au demarrage"
+        );
+    }
+
+    #[tokio::test]
+    async fn tout_effacer_vide_aussi_le_magasin_des_decouverts() {
+        let (_dossier, state) = banc();
+        let _ = clear_devices(State(state.clone())).await.into_response();
+        assert!(
+            uuids_dlna_decouverts(&state.backend).is_empty(),
+            "apres « effacer », aucun renderer decouvert ne doit rester a re-sonder"
+        );
+    }
+}
+
+/// #6546 — plage MAC et marque par appareil, et la table entière.
+#[cfg(test)]
+mod plages_mac_6546 {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    fn appareil(id: &str, host: &str, mac: Option<&str>) -> DiscoveredDevice {
+        let mut d =
+            DiscoveredDevice::new(id.into(), id.into(), OutputType::Dlna, host.into(), 1400);
+        d.mac_address = mac.map(str::to_string);
+        d
+    }
+
+    /// Les trois cas, plus l'entrée de rattrapage d'une sortie enregistrée
+    /// que la découverte ne voit pas (sans MAC par construction).
+    #[test]
+    fn chaque_appareil_porte_sa_plage_et_sa_marque() {
+        let output_info = vec![json!({
+            "device_id": "dlna:rattrapage",
+            "name": "Rattrapage",
+            "type": "dlna",
+            "host": "192.168.1.99",
+        })];
+        let items = build_device_list(
+            vec![
+                // 00:0E:58 : plage Sonos de la table générée.
+                appareil("sonos", "192.168.1.10", Some("00:0E:58:12:34:56")),
+                appareil("inconnu", "192.168.1.11", Some("02:00:00:AA:BB:CC")),
+                appareil("sans-mac", "192.168.1.12", None),
+            ],
+            &std::collections::HashSet::new(),
+            &output_info,
+        );
+        let par_id = |id: &str| items.iter().find(|i| i["id"] == id).unwrap().clone();
+
+        let sonos = par_id("sonos");
+        assert_eq!(sonos["mac_prefix"], json!("00:0E:58"), "{sonos}");
+        assert_eq!(sonos["mac_vendor"], json!("Sonos"), "{sonos}");
+
+        let inconnu = par_id("inconnu");
+        assert_eq!(inconnu["mac_prefix"], json!("02:00:00"), "{inconnu}");
+        assert_eq!(inconnu["mac_vendor"], Value::Null, "{inconnu}");
+
+        for id in ["sans-mac", "dlna:rattrapage"] {
+            let item = par_id(id);
+            let obj = item.as_object().unwrap();
+            assert!(
+                obj.contains_key("mac_prefix") && obj.contains_key("mac_vendor"),
+                "{item}"
+            );
+            assert_eq!(item["mac_prefix"], Value::Null, "{item}");
+            assert_eq!(item["mac_vendor"], Value::Null, "{item}");
+        }
+    }
+
+    /// La route est servie par le routeur assemblé, en GET, et rend la table
+    /// entière : chaque plage une fois, sous sa marque, marques et plages
+    /// triées, `total` exact.
+    #[tokio::test]
+    async fn la_route_rend_la_table_entiere_groupee_par_marque() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let app = crate::routes::router(state);
+        let rep = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/devices/oui-audio")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rep.status(), StatusCode::OK);
+        let octets = axum::body::to_bytes(rep.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let corps: Value = serde_json::from_slice(&octets).unwrap();
+
+        let vendors = corps["vendors"].as_array().expect("vendors est une liste");
+        assert!(
+            vendors.len() >= 30,
+            "35 marques attendues, {} rendues",
+            vendors.len()
+        );
+        let noms: Vec<&str> = vendors
+            .iter()
+            .map(|v| v["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            noms.windows(2).all(|w| w[0] < w[1]),
+            "marques triées sans doublon : {noms:?}"
+        );
+
+        let mut vues = std::collections::HashSet::new();
+        let mut somme = 0;
+        for v in vendors {
+            let nom = v["name"].as_str().unwrap();
+            let plages: Vec<&str> = v["prefixes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect();
+            assert!(!plages.is_empty(), "{nom} sans plage");
+            assert!(
+                plages.windows(2).all(|w| w[0] < w[1]),
+                "{nom} : plages non triées"
+            );
+            for p in &plages {
+                assert!(vues.insert(p.to_string()), "plage {p} publiée deux fois");
+                assert_eq!(
+                    tune_core::discovery::mac::vendor_for_mac(&format!("{p}:00:00:00")),
+                    Some(nom),
+                    "{p} publiée sous {nom}"
+                );
+            }
+            somme += plages.len();
+        }
+        assert_eq!(corps["total"], json!(somme));
+        assert!(somme > 3000, "table entière attendue, {somme} plages");
+        let sonos = vendors.iter().find(|v| v["name"] == "Sonos").unwrap();
+        assert!(
+            sonos["prefixes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("00:0E:58"))
+        );
+    }
+
+    /// Contre-épreuve permanente de la sonde : une route inconnue sous
+    /// `/devices` ne rend pas 200 — sans quoi le test ci-dessus prouverait
+    /// le routeur et non la route.
+    #[tokio::test]
+    async fn une_route_voisine_inconnue_n_est_pas_servie() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let app = crate::routes::router(state);
+        let rep = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/devices/oui-audio-inexistante")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(rep.status(), StatusCode::OK);
     }
 }

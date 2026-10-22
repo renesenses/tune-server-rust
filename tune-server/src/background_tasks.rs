@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use serde_json::json;
 use tune_core::event_bus::EventBus;
+use tune_core::taches_de_fond::{Tache, est_en_pause};
 
 /// Granular progress for a task, when the runner reports it (e.g. artist-image
 /// enrichment publishes "MusicBrainz 340/1183"). Omitted for tasks that only
@@ -39,6 +40,41 @@ pub struct BackgroundTask {
     /// Optional granular progress; omitted from JSON when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<TaskProgress>,
+    /// #6282 — la tâche est inscrite, mais GARÉE : le traitement dont elle
+    /// relève ([`tache_suspendable`]) est suspendu. Les passes qui tiennent
+    /// leur liste en mémoire se garent vivantes (`attendre_la_reprise`) et
+    /// restent donc au registre ; sans ce champ, le bandeau « Enrichissement… »
+    /// et les Réglages les disaient en cours pendant que la carte de l'écran
+    /// État du serveur les disait en pause (Kimon, fil 2259). Calculé à
+    /// chaque [`BackgroundTasks::snapshot`], jamais stocké.
+    pub paused: bool,
+}
+
+/// Le traitement suspendable dont relève une tâche du registre, par son
+/// identifiant d'inscription. `None` pour une tâche qu'aucune pause
+/// n'arrête (écriture des étiquettes, paroles…).
+///
+/// La table est UNIQUE : l'état des cartes (`routes/system/taches_de_fond.rs`,
+/// `etat_de`) et le drapeau `paused` des tâches la lisent tous deux, pour que
+/// la carte et le bandeau ne puissent plus se contredire.
+///
+/// Chaque identifiant n'est rangé ici que si la passe consulte la pause de ce
+/// traitement à ses frontières.
+pub fn tache_suspendable(id: &str) -> Option<Tache> {
+    match id {
+        // `POST /library/enrich-all`, les biographies, la passe automatique
+        // des crédits, le type de sortie (#4767) et les crédits par disque
+        // (`TACHE_CREDITS_RELEASES`, #4862) : `attendre_la_reprise` /
+        // `attendre_son_tour` sur `Tache::Enrichissement`.
+        "enrich_all" | "bios" | "credits_enrich_auto" | "types_de_sortie" | "credits_releases" => {
+            Some(Tache::Enrichissement)
+        }
+        "artist_artwork" | "artwork" => Some(Tache::ImagesArtistes),
+        "identification_lot" => Some(Tache::Identification),
+        // La plage dynamique à la demande (#4185).
+        "dynamic_range" => Some(Tache::PlageDynamique),
+        _ => None,
+    }
 }
 
 /// Registry of in-progress background tasks. Cheap to clone (shared `Arc`s).
@@ -86,6 +122,7 @@ impl BackgroundTasks {
                     label: label.into(),
                     kind: kind.into(),
                     progress: None,
+                    paused: false,
                 },
             );
         }
@@ -116,6 +153,9 @@ impl BackgroundTasks {
         let map = self.inner.lock().unwrap();
         let mut v: Vec<BackgroundTask> = map.values().cloned().collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
+        for t in &mut v {
+            t.paused = tache_suspendable(&t.id).is_some_and(est_en_pause);
+        }
         v
     }
 

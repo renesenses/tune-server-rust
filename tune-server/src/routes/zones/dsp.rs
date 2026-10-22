@@ -489,7 +489,8 @@ pub(super) async fn set_zone_dsp(
 
     for (key, plugin) in [("eq_profile", "equalizer"), ("crossfeed", "crossfeed")] {
         if body.get(key).is_some()
-            && let Err(response) = crate::premium_audio_plugins::require_installed(&state, plugin)
+            && let Err(response) =
+                crate::premium_audio_plugins::require_installed(&state, plugin, &headers)
         {
             return response;
         }

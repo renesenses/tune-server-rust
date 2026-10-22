@@ -166,7 +166,16 @@ pub async fn lier_depuis_les_reglages(
     let (Some(server_id), Some(jeton)) = (lire("server_id"), lire("mozaik_access_token")) else {
         return Err("cloud link: pas de server_id ou pas de session".into());
     };
-    lier_le_serveur(backend, http_client, CLOUD_LIBRARY_API, &server_id, &jeton).await
+    lier_le_serveur(backend, http_client, &api_de_liaison(), &server_id, &jeton).await
+}
+
+/// La racine de l'API de liaison : [`CLOUD_LIBRARY_API`], sauf dans un banc
+/// compilé avec `services-factices` qui a déclaré une autre racine mozaiklabs
+/// (#6336). Hors de cette feature, `base_substituee` rend toujours `None`.
+fn api_de_liaison() -> String {
+    crate::services_factices::base_substituee(crate::services_factices::MOZAIKLABS)
+        .map(|base| format!("{base}/api/v1/cloud-library"))
+        .unwrap_or_else(|| CLOUD_LIBRARY_API.to_string())
 }
 
 /// Défait la liaison du serveur au compte, chez le cloud :

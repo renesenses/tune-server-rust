@@ -28,6 +28,15 @@
 //!
 //! Aucune écriture dans les fichiers audio : seule la colonne
 //! `artists.musicbrainz_id` bouge, et seulement là où elle était vide.
+//!
+//! # Le nom de tri (#6474, point 2)
+//!
+//! Les mêmes crédits portent le `sort-name` de chaque artiste (« Davis,
+//! Miles »). Une fiche dont le MBID est celui d'un crédit qui la NOMME
+//! reçoit ce nom de tri ([`poser_le_nom_de_tri`]), toujours sans requête de
+//! plus, et seulement si elle n'en a pas — ou si le sien vient déjà de
+//! MusicBrainz. Une balise ARTISTSORT / ALBUMARTISTSORT ou une saisie garde
+//! la priorité (`artists.sort_name_source`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -93,6 +102,8 @@ pub struct BilanArtistes {
     pub ecrits: usize,
     /// `a_poser` que la base a refusés (voir `ecrits`).
     pub refuses_par_la_base: usize,
+    /// Fiches dont le nom de tri MusicBrainz a été posé (#6474).
+    pub noms_de_tri: usize,
 }
 
 fn est_pseudo(mbid: &str) -> bool {
@@ -226,6 +237,61 @@ pub fn poser_les_mbid(
     Ok(ecrits)
 }
 
+/// Le nom de tri MusicBrainz d'une fiche (#6474, point 2), tiré des crédits
+/// qui portent SON MBID et qui la NOMMENT (nom crédité, nom de la fiche
+/// MusicBrainz ou nom de tri, par [`cle_artiste`]). Un pseudo-artiste, un
+/// nom de tri vide ou deux noms de tri différents pour le même artiste ne
+/// donnent rien : aucune règle n'est inventée.
+pub fn nom_de_tri_des_credits(nom: &str, mbid: &str, credits: &[CreditArtiste]) -> Option<String> {
+    let mbid = mbid.trim().to_lowercase();
+    if mbid.is_empty() || est_pseudo(&mbid) || est_un_artiste_fictif(nom) {
+        return None;
+    }
+    let cle = cle_artiste(nom);
+    let noms: BTreeSet<String> = credits
+        .iter()
+        .filter(|c| c.mbid.trim().to_lowercase() == mbid)
+        .filter(|c| {
+            [&c.nom_credite, &c.nom, &c.nom_de_tri]
+                .iter()
+                .any(|n| !n.trim().is_empty() && cle_artiste(n) == cle)
+        })
+        .map(|c| c.nom_de_tri.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if noms.len() == 1 {
+        noms.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// Pose sur la fiche `artiste_id` le nom de tri MusicBrainz que `credits`
+/// lui donnent ([`nom_de_tri_des_credits`]), sans écraser une balise ni une
+/// saisie. Rend `true` si la fiche a changé.
+///
+/// Sert à l'identification (ci-dessous) et à la passe d'enrichissement des
+/// pistes, qui reçoit les mêmes crédits avec l'enregistrement : aucune des
+/// deux ne fait de requête de plus pour lui.
+pub fn poser_le_nom_de_tri(
+    backend: &Arc<dyn DbBackend>,
+    artiste_id: i64,
+    credits: &[CreditArtiste],
+) -> Result<bool, String> {
+    if credits.is_empty() {
+        return Ok(false);
+    }
+    let Some((nom, Some(mbid))) = fiche(backend, artiste_id)? else {
+        return Ok(false);
+    };
+    let Some(tri) = nom_de_tri_des_credits(&nom, &mbid, credits) else {
+        return Ok(false);
+    };
+    crate::db::artist_repo::ArtistRepo::with_backend(backend.clone())
+        .poser_nom_de_tri_musicbrainz(artiste_id, &tri)
+        .map_err(|e| e.to_string())
+}
+
 /// Lit une fiche : `(nom, mbid)`.
 fn fiche(
     backend: &Arc<dyn DbBackend>,
@@ -325,6 +391,22 @@ pub fn rattacher_les_artistes_de_l_album(
     let mut bilan = rattacher(&confrontations);
     bilan.ecrits = poser_les_mbid(backend, &bilan.a_poser)?;
     bilan.refuses_par_la_base = bilan.a_poser.len().saturating_sub(bilan.ecrits);
+
+    // #6474 — le nom de tri, APRÈS les MBID : une fiche qui vient de
+    // recevoir le sien est rattachée par lui. Chaque fiche une fois, avec
+    // tous les crédits sous lesquels elle a été confrontée.
+    let mut credits_par_fiche: BTreeMap<i64, Vec<CreditArtiste>> = BTreeMap::new();
+    for (aid, _, credits) in &a_confronter {
+        credits_par_fiche
+            .entry(*aid)
+            .or_default()
+            .extend(credits.iter().cloned());
+    }
+    for (aid, credits) in &credits_par_fiche {
+        if poser_le_nom_de_tri(backend, *aid, credits)? {
+            bilan.noms_de_tri += 1;
+        }
+    }
     Ok(bilan)
 }
 

@@ -241,6 +241,7 @@ impl PlaybackOrchestrator {
             channels: Some(format.canaux as u32),
             origin_url: None,
             bitrate_kbps: None,
+            format_source: None,
         })
     }
 
@@ -417,6 +418,7 @@ impl PlaybackOrchestrator {
             channels: Some(format.canaux as u32),
             origin_url: None,
             bitrate_kbps: None,
+            format_source: None,
         })
     }
 

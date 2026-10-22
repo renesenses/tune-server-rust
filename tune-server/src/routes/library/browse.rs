@@ -3,7 +3,7 @@ use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{info, warn};
 use tune_http_types::panne_sql::OuDefautJournalise;
 use unicode_normalization::UnicodeNormalization;
 
@@ -247,8 +247,26 @@ fn simuler_un_disque_lent(dossier: &std::path::Path) {
     }
 }
 
+/// Une entrée de `read_dir` est-elle un dossier ? Même réponse que
+/// `entry.path().is_dir()`, sans son aller-retour réseau.
+///
+/// #5998 — `is_dir()` refait un `stat` par entrée, et sur un partage SMB ou
+/// NFS chaque `stat` est un aller-retour vers le NAS. `DirEntry::file_type`
+/// vient de la lecture du dossier elle-même (`d_type` sous Linux, données de
+/// `FindNextFile` sous Windows), sans appel de plus. Un lien symbolique, lui,
+/// doit être SUIVI comme le faisait `is_dir()` : il y retombe, comme une entrée
+/// dont le type n'a pas pu être lu.
+fn est_un_dossier(entry: &std::fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(t) if t.is_symlink() => entry.path().is_dir(),
+        Ok(t) => t.is_dir(),
+        Err(_) => entry.path().is_dir(),
+    }
+}
+
 /// Le corps de `GET /library/browse/dir`, exécuté HORS de l'exécuteur (#5677).
 fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Value, AppError> {
+    let debut = std::time::Instant::now();
     let normalized_query =
         resolve_browse_path(&q.path).ok_or_else(|| AppError::bad_request("invalid path"))?;
     let resolved = std::path::Path::new(&normalized_query);
@@ -328,7 +346,7 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() {
+                if est_un_dossier(&entry) {
                     let dir_path: String = path.to_string_lossy().nfc().collect();
                     let name = path
                         .file_name()
@@ -350,6 +368,7 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
     // Le conseil se calcule sur le chemin TEL QUE CONFIGURE (`q.path`), pas sur
     // le chemin resolu : c'est celui que l'utilisateur a saisi, donc celui qui
     // porte encore la lettre de lecteur qu'il faut lui apprendre a remplacer.
+    let ms_sous_dossiers = debut.elapsed().as_millis() as u64;
     let access_hint = unreadable
         .as_ref()
         .and_then(|_| crate::chemin_inaccessible::conseil(lang, &q.path));
@@ -382,12 +401,7 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
     // pistes restait vide. Les deux points manquants sont repliés ici.
     let repertoire_nfc: String = normalized_query.nfc().collect();
     let dir_prefix = tune_core::db::track_repo::folder_like_pattern(&repertoire_nfc);
-    let postgres = state.backend.engine() == tune_core::db::engine::Engine::Postgres;
-    let (ph, ph2, pos) = if postgres {
-        ("$1", "$2", "strpos")
-    } else {
-        ("?1", "?2", "instr")
-    };
+    let (bas, haut) = tune_core::db::track_repo::bornes_du_dossier(&repertoire_nfc);
     // Le `LIKE` est RÉCURSIF : il ramène aussi les pistes des sous-dossiers,
     // que `est_enfant_direct` écarte ensuite une par une. Sur la racine d'une
     // grande bibliothèque, c'était donc TOUTE la bibliothèque rapatriée — seize
@@ -408,18 +422,8 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
     // autres : sans le `COALESCE`, un album CUE s'ouvrait sur une liste vide.
     // La colonne 16 porte ce chemin pour `est_enfant_direct` ; `file_path`
     // reste publié tel qu'en base (NULL pour une tranche CUE).
-    let sql = format!(
-        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, \
-               t.disc_number, t.track_number, t.duration_ms, t.file_path, \
-               t.format, t.sample_rate, t.bit_depth, t.genre, t.year, al.cover_path, \
-               COALESCE(t.file_path, t.cue_media_path) \
-               FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
-               LEFT JOIN artists ar ON t.artist_id = ar.id \
-               WHERE COALESCE(t.file_path, t.cue_media_path) LIKE {ph}{esc} \
-               AND {pos}(substr(COALESCE(t.file_path, t.cue_media_path), {depart_enfant}), {ph2}) = 0 \
-               ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
-        esc = tune_core::db::track_repo::like_escape_clause()
-    );
+    let sql =
+        tune_core::db::track_repo::sql_pistes_du_dossier(state.backend.engine(), depart_enfant);
     let rows = state
         .backend
         .query_many(
@@ -427,6 +431,8 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
             &[
                 &dir_prefix as &dyn tune_core::db::backend::ToSqlValue,
                 &sep_txt as &dyn tune_core::db::backend::ToSqlValue,
+                &bas as &dyn tune_core::db::backend::ToSqlValue,
+                &haut as &dyn tune_core::db::backend::ToSqlValue,
             ],
         )
         .ou_defaut_journalise();
@@ -462,6 +468,19 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
             }))
         })
         .collect();
+
+    // #5998 — l'ouverture d'un dossier n'apparaissait nulle part au journal :
+    // « plusieurs minutes » chez Tades, et rien pour dire si le temps partait
+    // dans le partage réseau ou dans la base. Une ligne par ouverture, avec
+    // les deux moitiés séparées.
+    info!(
+        path = %normalized_query,
+        ms_total = debut.elapsed().as_millis() as u64,
+        ms_sous_dossiers,
+        sous_dossiers = subdirs.len(),
+        pistes = tracks.len(),
+        "browse_dir_lu"
+    );
 
     // Parent path
     let parent = if q.path != music_root {

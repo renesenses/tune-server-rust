@@ -552,6 +552,7 @@ impl PlaybackOrchestrator {
             // captured through the proxy — and filed under `Stream/`.
             origin_url: prefetched.upstream_url,
             bitrate_kbps: None,
+            format_source: None,
             cover_url: cover_url.clone(),
             file_size: Some(file_size),
         })
@@ -668,6 +669,7 @@ impl PlaybackOrchestrator {
             // needs the service's own URL, not ours.
             origin_url: prefetched.upstream_url,
             bitrate_kbps: None,
+            format_source: None,
         })
     }
 
@@ -774,6 +776,9 @@ impl PlaybackOrchestrator {
             else {
                 return RapportEqAChaud::echoue(device_id, EchecEqLocal::SortiePasUneSortieLocale);
             };
+            // #6522 — armer ou désarmer l'égaliseur (ou la correction de pièce,
+            // qui passe par ici) sous PURE change ce que PURE contourne.
+            self.poser_ce_que_pure_contourne(zone_id, local_output);
             // Pas de flux en cours : la prochaine lecture rebâtira l'EQ de
             // toute façon, et bâtir pour un format inconnu donnerait des
             // coefficients faux.
@@ -1357,6 +1362,68 @@ impl PlaybackOrchestrator {
             .await
             .unwrap_or(false)
     }
+    /// #6256 — rebâtit l'étage casque d'une sortie locale qui joue, et dit
+    /// seulement s'il l'a fait. `refresh_zone_crossfeed` rend `false` aussi
+    /// quand l'étage vient d'être VIDÉ ; une désinstallation, qui vide, a
+    /// besoin de savoir que la sortie l'a reçu.
+    pub async fn rebatir_l_etage_casque_en_direct(&self, zone_id: i64) -> bool {
+        self.pousser_le_crossfeed_en_direct(zone_id).await.is_some()
+    }
+    /// #6256 — les zones dont l'étage casque utilise le greffon natif tiers
+    /// `id`, les seules qu'une désinstallation doit rebâtir : rebâtir une autre
+    /// zone qui joue ne lui retire rien et peut s'entendre (un petit
+    /// claquement). Une zone en est si elle le DEMANDE (greffon demandé, case
+    /// cochée sur la zone) ou si sa sortie locale le PORTE en ce moment.
+    ///
+    /// À lire AVANT de désinstaller : ensuite les drapeaux du greffon sont
+    /// baissés et ses réglages peut-être effacés, et plus aucune zone ne le
+    /// demanderait.
+    pub async fn zones_qui_utilisent_le_greffon_tiers(&self, id: &str) -> Vec<i64> {
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let demande = crate::audio::natifs_tiers::demande(&settings, id);
+        let zones = ZoneRepo::with_backend(self.db.clone())
+            .list()
+            .unwrap_or_default();
+        let mut retenues = Vec::new();
+        for zone in zones {
+            let Some(zone_id) = zone.id else { continue };
+            let cochee = demande
+                && crate::audio::natifs_tiers::reglage_de_zone(&settings, zone_id, id)
+                    .and_then(|r| r.get("enabled").and_then(serde_json::Value::as_bool))
+                    == Some(true);
+            if cochee
+                || self
+                    .etage_casque_porte(zone.output_device_id.as_deref(), id)
+                    .await
+            {
+                retenues.push(zone_id);
+            }
+        }
+        retenues
+    }
+
+    /// La sortie locale `device_id` porte-t-elle un étage du greffon tiers ?
+    async fn etage_casque_porte(&self, device_id: Option<&str>, id: &str) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = (device_id, id);
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = device_id.filter(|d| d.starts_with("local:")) else {
+                return false;
+            };
+            let Some(output_arc) = ({ self.outputs.lock().await.get(device_id) }) else {
+                return false;
+            };
+            let output = output_arc.lock().await;
+            output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+                .is_some_and(|local| local.crossfeed_porte_l_etage_tiers(id))
+        }
+    }
     /// [`Self::refresh_zone_crossfeed`], mais qui dit QUAND le réglage atteint
     /// le son, au lieu d'un booléen à plusieurs sens (#4680).
     ///
@@ -1406,6 +1473,9 @@ impl PlaybackOrchestrator {
             let local_output = output
                 .as_any()
                 .downcast_ref::<crate::outputs::local::LocalOutput>()?;
+            // #6522 — crossfeed et greffons natifs passent par ici : sous PURE,
+            // ce que PURE contourne change avec eux.
+            self.poser_ce_que_pure_contourne(zone_id, local_output);
             // Pas de flux en cours : la prochaine lecture rebâtira le crossfeed
             // de toute façon, et le bâtir pour un taux inconnu donnerait une
             // ligne à retard de la mauvaise longueur.
@@ -1510,6 +1580,7 @@ impl PlaybackOrchestrator {
                 if local_output.flux_en_demarrage() {
                     let pure = self.zone_audiophile(zone_id);
                     local_output.set_pure_bypass(pure);
+                    self.poser_ce_que_pure_contourne(zone_id, local_output);
                     info!(zone_id, pure, "zone_pure_reportee_au_flux_qui_demarre");
                     return true;
                 }
@@ -1518,6 +1589,9 @@ impl PlaybackOrchestrator {
 
             let pure = self.zone_audiophile(zone_id);
             local_output.set_pure_bypass(pure);
+            // #6522, #6524 — le verdict PURE suit les RÉGLAGES, que la bascule
+            // ne change pas ; la chaîne, elle, va être vidée juste en dessous.
+            self.poser_ce_que_pure_contourne(zone_id, local_output);
             // Mêmes expressions que le bloc du chemin de lecture, à dessein :
             // toutes trois rendent `None`/1.0 en PURE, donc l'état repoussé est
             // celui qu'une lecture démarrée maintenant produirait.
@@ -1551,6 +1625,10 @@ impl PlaybackOrchestrator {
                 track_id,
                 local_output.current_format().map(|(_, ch)| u32::from(ch)),
             ));
+            // #6230 — une ouverture pilotée par la matrice (6 → 2) retrouve
+            // les voies de la source en entrant en PURE, et inversement : la
+            // réouverture a lieu plus bas, verrou de la sortie relâché.
+            let rouvrir_pour_les_voies = self.les_voies_imposent_de_rouvrir(zone_id, local_output);
             // Même raison pour la rampe (#1590) : `zone_soft_mute_ms` rend 0 en
             // PURE, donc une zone qui ENTRE en PURE doit la perdre dans le même
             // geste, et une zone qui en sort doit la retrouver — sans attendre
@@ -1570,6 +1648,10 @@ impl PlaybackOrchestrator {
                 replaygain = rg,
                 "zone_pure_dsp_refreshed_live"
             );
+            drop(output);
+            if rouvrir_pour_les_voies {
+                self.rouvrir_pour_les_voies(zone_id).await;
+            }
             true
         }
     }
@@ -1819,6 +1901,37 @@ impl PlaybackOrchestrator {
             return Some("replaygain");
         }
         None
+    }
+
+    /// #6522, #6524 — PURE contourne-t-il un traitement sur la sortie LOCALE
+    /// de cette zone ? Lu dans les réglages ENREGISTRÉS, jamais dans la chaîne
+    /// vivante : PURE vide cette chaîne (les chargeurs rendent `None` en PURE),
+    /// donc sous PURE elle dit toujours « rien d'armé ».
+    ///
+    /// Les traitements de [`Self::traitement_que_pure_gouverne`] — égaliseur,
+    /// correction de pièce, crossfeed, greffon natif tiers — plus le repli
+    /// mono, que PURE gouverne aussi sur la sortie locale (#2362) et que le
+    /// prédicat réseau n'a pas à compter. Le ReplayGain n'est pas compté :
+    /// l'étape DSP parle de la chaîne de traitement, et ce que PURE laisse du
+    /// ReplayGain a déjà son propre signal (`pure_replaygain_ignored`, #5633).
+    ///
+    /// Sous `local-audio` seulement : sans sortie locale, personne ne le lit.
+    #[cfg(feature = "local-audio")]
+    pub(super) fn pure_contourne_un_reglage(&self, zone_id: i64) -> bool {
+        self.traitement_que_pure_gouverne(zone_id, None).is_some()
+            || Self::zone_mono_downmix_configure_with(&self.db, zone_id)
+    }
+
+    /// Pose [`Self::pure_contourne_un_reglage`] sur la sortie locale, à côté
+    /// de `set_pure_bypass` et de chaque réglage poussé à chaud : c'est ce
+    /// drapeau que lit le verdict PURE du contrat de signal.
+    #[cfg(feature = "local-audio")]
+    pub(super) fn poser_ce_que_pure_contourne(
+        &self,
+        zone_id: i64,
+        local_output: &crate::outputs::local::LocalOutput,
+    ) {
+        local_output.set_pure_contourne_un_reglage(self.pure_contourne_un_reglage(zone_id));
     }
 
     /// Build the room-correction FIR convolver for a zone's TRANSCODED stream,
@@ -2288,6 +2401,16 @@ impl PlaybackOrchestrator {
         if crate::audio::audiophile::zone_enabled(db, zone_id) {
             return false;
         }
+        Self::zone_mono_downmix_configure_with(db, zone_id)
+    }
+
+    /// Le repli mono CONFIGURÉ, sans regarder le mode PURE (#6522) : la
+    /// lecture de [`Self::zone_mono_downmix_with`] derrière sa garde, pour que
+    /// [`Self::pure_contourne_un_reglage`] lise la même clé.
+    pub(super) fn zone_mono_downmix_configure_with(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: i64,
+    ) -> bool {
         crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
             .get(&format!("zone_{zone_id}_mono_downmix"))
             .ok()
@@ -2343,6 +2466,7 @@ impl PlaybackOrchestrator {
             };
             let mono = self.zone_mono_downmix(zone_id);
             local_output.set_mono_downmix(mono);
+            self.poser_ce_que_pure_contourne(zone_id, local_output);
             info!(
                 zone_id,
                 device_id = %device_id,
@@ -2446,6 +2570,36 @@ impl PlaybackOrchestrator {
         rc::regle_effective_with(&self.db, zone_id, album_id, canaux).map(|r| r.matrice)
     }
 
+    /// #6247 — réappliquer la réaffectation des canaux sur chaque zone qui
+    /// joue une piste de cet album, après `PUT|DELETE
+    /// /channel-remap/albums/{id}`. La règle d'album n'était posée qu'au
+    /// démarrage de la piste suivante : « Enregistrer pour cet album » ne
+    /// changeait rien à la piste en cours. Rend `true` si au moins une sortie
+    /// locale vivante l'a reçue.
+    pub async fn refresh_album_reaffectation(&self, album_id: i64) -> bool {
+        let zones = ZoneRepo::with_backend(self.db.clone())
+            .list()
+            .unwrap_or_default();
+        let mut a_chaud = false;
+        for zone_id in zones.into_iter().filter_map(|z| z.id) {
+            let Some(track_id) = self
+                .playback
+                .get_state(zone_id)
+                .await
+                .now_playing
+                .and_then(|np| np.track_id)
+            else {
+                continue;
+            };
+            let (album_de_la_piste, _) =
+                crate::audio::reaffectation_canaux::album_et_canaux_de_la_piste(&self.db, track_id);
+            if album_de_la_piste == Some(album_id) {
+                a_chaud |= self.refresh_zone_reaffectation(zone_id).await;
+            }
+        }
+        a_chaud
+    }
+
     /// #6044 — réappliquer la réaffectation des canaux à la sortie locale qui
     /// joue, sans attendre la piste suivante. Comme le repli mono : aucun état
     /// à emporter, la nouvelle matrice prend effet au bloc suivant. Rend
@@ -2492,13 +2646,51 @@ impl PlaybackOrchestrator {
             );
             let armee = matrice.is_some();
             local_output.set_reaffectation(matrice);
+            // #6230 — une règle qui change le nombre de voies (6 → 6 devenue
+            // 6 → 2, ou retirée après une ouverture pilotée) rouvre la sortie.
+            let rouvrir = self.les_voies_imposent_de_rouvrir(zone_id, local_output);
             info!(
                 zone_id,
                 device_id = %device_id,
                 armee,
+                rouvrir,
                 "zone_reaffectation_refreshed_live"
             );
+            drop(output);
+            if rouvrir {
+                self.rouvrir_pour_les_voies(zone_id).await;
+            }
             true
+        }
+    }
+
+    /// #6230 — la matrice vient d'être reposée sur une sortie locale qui joue
+    /// : demande-t-elle un autre nombre de voies que l'ouverture en cours
+    /// ([`crate::outputs::local::LocalOutput::les_voies_imposent_de_rouvrir`]) ?
+    /// L'appelant tient le verrou de la sortie : il le relâche, puis appelle
+    /// [`Self::rouvrir_pour_les_voies`]. Sans règle armée, toujours non.
+    #[cfg(feature = "local-audio")]
+    pub(super) fn les_voies_imposent_de_rouvrir(
+        &self,
+        zone_id: i64,
+        local_output: &crate::outputs::local::LocalOutput,
+    ) -> bool {
+        local_output.les_voies_imposent_de_rouvrir()
+            && self.position_entretenue_par_le_sondeur(zone_id)
+    }
+
+    /// #6230 — rejouer la piste à la position courante, ce qui rouvre la
+    /// sortie sur les voies que la matrice demande. Verrou de la sortie
+    /// relâché par l'appelant.
+    #[cfg(feature = "local-audio")]
+    pub(super) async fn rouvrir_pour_les_voies(&self, zone_id: i64) {
+        let position_ms = self.playback.get_state(zone_id).await.position_ms.max(0) as u64;
+        match self
+            .replay_zone_at_position(zone_id, position_ms, "reaffectation_voies")
+            .await
+        {
+            Ok(()) => info!(zone_id, position_ms, "reaffectation_voies_rouvertes"),
+            Err(e) => warn!(zone_id, error = %e, "reaffectation_voies_reouverture_echouee"),
         }
     }
 
@@ -2534,8 +2726,37 @@ impl PlaybackOrchestrator {
         // volume de groupe, alarmes…) le contournaient.
         let pure_force = crate::audio::audiophile::volume_lock_enabled(&self.db, zone_id)
             && crate::audio::audiophile::zone_enabled(&self.db, zone_id);
-        self.appliquer_volume(zone_id, volume, device_id, pure_force)
-            .await
+        self.appliquer_volume(
+            zone_id,
+            volume,
+            device_id,
+            pure_force,
+            crate::audio::volume_limites::OrigineDuVolume::Absolue,
+        )
+        .await
+    }
+
+    /// #6541 — une consigne venue des boutons + / − : la limite de CONFORT
+    /// ne la retient pas, seule la limite de sécurité la borne
+    /// (`audio::volume_limites`). L'appelant calcule `volume` depuis l'état
+    /// courant ; le reste suit exactement [`Self::set_volume`] (verrou PURE,
+    /// volume fixe, trim, file de la sortie).
+    pub async fn set_volume_au_pas(
+        &self,
+        zone_id: i64,
+        volume: f64,
+        device_id: Option<&str>,
+    ) -> OutputCommandResult<()> {
+        let pure_force = crate::audio::audiophile::volume_lock_enabled(&self.db, zone_id)
+            && crate::audio::audiophile::zone_enabled(&self.db, zone_id);
+        self.appliquer_volume(
+            zone_id,
+            volume,
+            device_id,
+            pure_force,
+            crate::audio::volume_limites::OrigineDuVolume::Pas,
+        )
+        .await
     }
 
     /// #5695 — commande le plein volume d'une zone PURE verrouillée, SANS
@@ -2549,7 +2770,14 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<()> {
-        self.appliquer_volume(zone_id, 1.0, device_id, true).await
+        self.appliquer_volume(
+            zone_id,
+            1.0,
+            device_id,
+            true,
+            crate::audio::volume_limites::OrigineDuVolume::Absolue,
+        )
+        .await
     }
 
     async fn appliquer_volume(
@@ -2558,6 +2786,7 @@ impl PlaybackOrchestrator {
         volume: f64,
         device_id: Option<&str>,
         pure_force: bool,
+        origine: crate::audio::volume_limites::OrigineDuVolume,
     ) -> OutputCommandResult<()> {
         // When fixed_volume is enabled, pin volume to 1.0 (bit-perfect) and
         // skip sending to the device — the DAC/renderer handles volume.
@@ -2586,10 +2815,41 @@ impl PlaybackOrchestrator {
         // Un trim de −1,6 dB faisait partir 0,83 vers le Devialet, que le
         // sondeur rapatriait ensuite en base : « Volume 83 % » sous PURE.
         let volume = if pure_force { 1.0 } else { volume };
+        // #6541 — les limites de la zone, au point de passage unique : la
+        // sécurité borne toute consigne, le confort ne retient qu'une montée
+        // absolue. Décision du 21/10 : en PURE (verrouillé ou non) et à volume
+        // fixe, elles n'ont pas cours (`lire_effectives` les tait) ; le 100 %
+        // de PURE verrouillé part tel qu'avant. `pure_force` sans lecture : la
+        // route qui ARME PURE passe ici avant d'écrire le réglage.
+        let limites = if pure_force {
+            crate::audio::volume_limites::LimitesDeVolume::default()
+        } else {
+            crate::audio::volume_limites::lire_effectives(&self.db, zone_id)
+        };
+        let volume = if limites.est_vide() {
+            volume
+        } else {
+            let actuel = self.playback.get_state(zone_id).await.volume;
+            let retenu = limites.borner(volume, actuel, origine);
+            if retenu < volume {
+                info!(
+                    zone_id,
+                    demande = volume,
+                    retenu,
+                    ?origine,
+                    "volume_borne_par_la_limite_de_zone"
+                );
+            }
+            retenu
+        };
         let device_volume = if pure_force {
             1.0
         } else {
-            volume_avec_trim(volume, gain_trim_db_enregistre(&self.db, zone_id))
+            // Un trim positif ne fait pas passer la limite de sécurité.
+            limites.borner_appareil(volume_avec_trim(
+                volume,
+                gain_trim_db_enregistre(&self.db, zone_id),
+            ))
         };
         let Some(did) = device_id else {
             info!(zone_id, volume, "set_volume_no_device_id");
@@ -2728,6 +2988,8 @@ impl PlaybackOrchestrator {
             let output = { self.outputs.lock().await.get(did) };
             match output {
                 Some(output) => {
+                    // #6541 — aucune limite ici (décision du 21/10) : sur
+                    // une zone à volume fixe, elles n'ont pas cours.
                     info!(zone_id, device_id = did, "fixed_volume_arm_sending");
                     if let Err(error) = output.lock().await.checked_set_volume(1.0).await {
                         warn!(zone_id, error = %error, "fixed_volume_arm_failed");

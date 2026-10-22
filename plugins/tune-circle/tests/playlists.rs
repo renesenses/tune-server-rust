@@ -534,7 +534,10 @@ async fn un_utilisateur_qobuz_rejoue_par_l_identifiant_qobuz() {
     assert_eq!(
         ligne_de(&r.json(), 51),
         json!({ "item_id": 51, "status": "matched", "source": "qobuz",
-                "source_id": "q-so-what", "method": "service_id" })
+                "source_id": "q-so-what", "method": "service_id",
+                "title": "So What", "artist_name": "Miles Davis",
+                "album_title": "Kind of Blue", "duration_ms": 562000,
+                "cover_url": null, "album_ref": null })
     );
     // La forme que lit l'écran (web#1731) : un tableau, dans l'ordre.
     let ids: Vec<Value> = r
@@ -587,7 +590,10 @@ async fn sans_le_service_de_la_reference_le_repli_isrc_trouve_ailleurs() {
     assert_eq!(
         ligne_de(&r.json(), 52),
         json!({ "item_id": 52, "status": "matched", "source": "tidal",
-                "source_id": "t-bon", "method": "isrc" })
+                "source_id": "t-bon", "method": "isrc",
+                "title": "Blue In Green (Remastered)", "artist_name": "Miles Davis",
+                "album_title": "Kind of Blue", "duration_ms": 337000,
+                "cover_url": null, "album_ref": null })
     );
     assert!(
         !b.lus.lock().unwrap().iter().any(|id| id == "q-bleu"),
@@ -618,7 +624,10 @@ async fn repli_texte_puis_introuvable() {
     assert_eq!(
         ligne_de(&j, 51),
         json!({ "item_id": 51, "status": "matched", "source": "deezer",
-                "source_id": "d-9", "method": "text" })
+                "source_id": "d-9", "method": "text",
+                "title": "So What", "artist_name": "Miles Davis",
+                "album_title": "Kind of Blue", "duration_ms": 562000,
+                "cover_url": null, "album_ref": null })
     );
     assert_eq!(
         ligne_de(&j, 53),
@@ -645,7 +654,7 @@ async fn une_piste_de_la_bibliotheque_est_rendue_sans_son_chemin() {
     assert_eq!(
         ligne_de(&r.json(), 51),
         json!({ "item_id": 51, "status": "matched", "source": "local",
-                "source_id": "1", "track_id": 1, "method": "isrc" })
+                "source_id": "1", "track_id": 1, "album_id": 10, "method": "isrc" })
     );
     assert!(!String::from_utf8_lossy(&r.octets).contains("/Users"));
 }
@@ -696,6 +705,208 @@ async fn jouer_sans_zone_ou_sans_rien_de_jouable_ne_lance_rien() {
     assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(r.json()["code"], "circle.nothing_playable");
     assert!(b.lecture.files.lock().unwrap().is_empty());
+}
+
+// 4 bis. Lecture par morceau (web#2219, go de Bertrand du 19/10) ---------------
+
+/// Qobuz connaît 51 par son identifiant et 52 par l'ISRC ; 53 reste introuvable.
+async fn banc_deux_jouables() -> Banc {
+    let mut bleu = piste(
+        "q-bleu",
+        "Blue in Green",
+        "Miles Davis",
+        337_000,
+        Some("USSM15900115"),
+    );
+    bleu.cover_path = Some("https://static.qobuz.com/images/covers/kob.jpg".into());
+    banc(vec![(
+        "qobuz",
+        true,
+        vec![
+            piste("q-so-what", "So What", "Miles Davis", 562_000, None),
+            bleu,
+        ],
+    )])
+    .await
+}
+
+fn file_jouee(b: &Banc) -> Vec<String> {
+    let files = b.lecture.files.lock().unwrap();
+    assert_eq!(files.len(), 1, "une seule lecture attendue");
+    files[0]
+        .1
+        .iter()
+        .map(|e| match e {
+            QueueInput::Streaming { source_id, .. } => source_id.clone(),
+            QueueInput::Local { track_id } => format!("local:{track_id}"),
+        })
+        .collect()
+}
+
+/// ▶ sur une ligne : la playlist À PARTIR de ce morceau, la suite en file.
+/// Les morceaux d'avant ne sont ni joués ni même cherchés chez le service.
+#[tokio::test]
+async fn jouer_a_partir_d_un_morceau_met_la_suite_en_file() {
+    let b = banc_deux_jouables().await;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/play",
+        Some(json!({ "zone_id": 3, "from_item_id": 52 })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
+    assert_eq!(file_jouee(&b), vec!["q-bleu"]);
+    assert_eq!(r.json()["queued"], 1);
+    assert_eq!(r.json()["missing"], json!([53]));
+    let ids: Vec<Value> = r.json()["resolution"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["item_id"].clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![json!(52), json!(53)],
+        "seuls les morceaux choisis sont résolus"
+    );
+    assert!(
+        !b.lus.lock().unwrap().iter().any(|id| id == "q-so-what"),
+        "le morceau d'avant le départ ne doit pas être cherché"
+    );
+
+    // L'identifiant opaque peut revenir en texte : même geste.
+    let b = banc_deux_jouables().await;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/play",
+        Some(json!({ "zone_id": 3, "from_item_id": "51" })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
+    assert_eq!(file_jouee(&b), vec!["q-so-what", "q-bleu"]);
+}
+
+/// « Lire ce titre seulement » : `item_ids` d'un seul morceau. Plusieurs :
+/// dans l'ordre DONNÉ (la lecture aléatoire de l'écran).
+#[tokio::test]
+async fn item_ids_ne_joue_que_ces_morceaux_dans_l_ordre_donne() {
+    let b = banc_deux_jouables().await;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/play",
+        Some(json!({ "zone_id": 3, "item_ids": [52] })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
+    assert_eq!(file_jouee(&b), vec!["q-bleu"]);
+    assert_eq!(r.json()["missing"], json!([]));
+
+    let b = banc_deux_jouables().await;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/play",
+        Some(json!({ "zone_id": 3, "item_ids": [52, 53, 51] })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
+    assert_eq!(file_jouee(&b), vec!["q-bleu", "q-so-what"]);
+    assert_eq!(r.json()["missing"], json!([53]));
+}
+
+/// Un départ introuvable chez moi : rien ne part, plutôt que de commencer
+/// sur un autre titre que celui cliqué.
+#[tokio::test]
+async fn un_depart_introuvable_ne_lance_rien() {
+    let b = banc_deux_jouables().await;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/play",
+        Some(json!({ "zone_id": 3, "from_item_id": 53 })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY, "{:?}", r.json());
+    assert_eq!(r.json()["code"], "circle.item_not_playable");
+    assert!(b.lecture.files.lock().unwrap().is_empty());
+}
+
+/// Les deux sélections ensemble, une liste vide ou un morceau qu'un autre
+/// membre a retiré : refus nommé, rien ne part.
+#[tokio::test]
+async fn une_selection_invalide_ou_perimee_ne_lance_rien() {
+    let b = banc_deux_jouables().await;
+    for (corps, code) in [
+        (
+            json!({ "zone_id": 3, "from_item_id": 51, "item_ids": [52] }),
+            "circle.invalid_selection",
+        ),
+        (
+            json!({ "zone_id": 3, "item_ids": [] }),
+            "circle.invalid_selection",
+        ),
+        (
+            json!({ "zone_id": 3, "item_ids": "51" }),
+            "circle.invalid_selection",
+        ),
+        (
+            json!({ "zone_id": 3, "from_item_id": {} }),
+            "circle.invalid_selection",
+        ),
+        (
+            json!({ "zone_id": 3, "from_item_id": 999 }),
+            "circle.unknown_item",
+        ),
+        (
+            json!({ "zone_id": 3, "item_ids": [51, 999] }),
+            "circle.unknown_item",
+        ),
+    ] {
+        let r = appel(&b.app, "POST", "/playlists/5/play", Some(corps.clone())).await;
+        assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY, "{corps}");
+        assert_eq!(r.json()["code"], code, "{corps}");
+    }
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/play",
+        Some(json!({ "zone_id": 3, "item_ids": [51, 999] })),
+    )
+    .await;
+    assert_eq!(r.json()["unknown"], json!(["999"]));
+    assert!(b.lecture.files.lock().unwrap().is_empty());
+}
+
+/// La résolution rend, pour un titre de service, de quoi l'ENFILER par les
+/// routes de file existantes (« Lire ensuite », « Ajouter à la file ») et sa
+/// pochette chez MON service ; pour une piste de ma bibliothèque, son album.
+#[tokio::test]
+async fn la_resolution_rend_de_quoi_enfiler_et_la_pochette() {
+    let b = banc_deux_jouables().await;
+    let r = appel(&b.app, "POST", "/playlists/5/resolve", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    let l = ligne_de(&r.json(), 52);
+    assert_eq!(l["source"], "qobuz");
+    assert_eq!(l["source_id"], "q-bleu");
+    assert_eq!(l["title"], "Blue in Green");
+    assert_eq!(l["artist_name"], "Miles Davis");
+    assert_eq!(l["album_title"], "Kind of Blue");
+    assert_eq!(l["duration_ms"], 337000);
+    assert_eq!(
+        l["cover_url"],
+        "https://static.qobuz.com/images/covers/kob.jpg"
+    );
+
+    let b = banc(vec![]).await;
+    semer_une_piste_locale(&b.backend);
+    let r = appel(&b.app, "POST", "/playlists/5/resolve", None).await;
+    let l = ligne_de(&r.json(), 51);
+    assert_eq!(l["track_id"], 1);
+    assert_eq!(l["album_id"], 10);
+    assert!(!String::from_utf8_lossy(&r.octets).contains("/Users"));
 }
 
 // 5. Révocation --------------------------------------------------------------

@@ -63,6 +63,8 @@ where
         .route("/{id}/tracks", get(resolve_tracks))
         .route("/{id}/albums", get(smart_collection_albums))
         .route("/preview", post(preview_smart_collection))
+        // #6287 — la requête TEXTUELLE (`crate::requete_texte`).
+        .route("/requete", post(requete_textuelle))
 }
 
 async fn list_smart_playlists(
@@ -559,6 +561,7 @@ pub(crate) fn build_smart_query_rapport(
 /// |---|---|
 /// | `added_at` | son FICHIER a été modifié après / avant / entre (`t.file_mtime`, la même date que les collections) ; « jamais » : pas de date |
 /// | `last_played_at` | elle a été écoutée après la date ; sa DERNIÈRE écoute est avant / entre ; « jamais » : aucune écoute |
+/// | `added_at` / `last_played_at` « dans les N derniers jours » (#6122) | même lecture qu'« après », le seuil étant « il y a N jours » à l'heure de la requête |
 /// | `credit` | elle porte ce crédit (rôle, artiste, instrument) |
 ///
 /// `None` : le champ n'est pas l'un des trois — l'appelant continue. Un
@@ -571,22 +574,37 @@ fn condition_hors_colonne(
     value: &str,
     value_raw: Option<&Value>,
 ) -> Option<String> {
-    let date_du_fichier = "DATETIME(t.file_mtime, 'unixepoch')";
     let ecoutes = "SELECT track_id FROM listen_history WHERE track_id IS NOT NULL";
     Some(match (field, op) {
-        ("added_at", ">" | ">=" | "<" | "<=") => {
-            format!(
-                "{date_du_fichier} {op} {}",
-                regles_sql::horodatage_sql(value)
-            )
-        }
-        ("added_at", "between") => match regles_sql::bornes_de_dates(value_raw) {
-            Some((lo, hi)) => format!("{date_du_fichier} BETWEEN {lo} AND {hi}"),
+        // #6143 — la date du fichier se compare en SECONDES à une borne
+        // calculée en Rust : `DATETIME(t.file_mtime, 'unixepoch')` et
+        // `DATETIME('now', …)` sont propres à SQLite, et PostgreSQL les refuse.
+        ("added_at", ">" | ">=" | "<" | "<=") => match regles_sql::horodatage_epoch(value) {
+            Some(ts) => format!("t.file_mtime {op} {ts}"),
+            None => regles_sql::FAUX.to_string(),
+        },
+        ("added_at", "between") => match regles_sql::bornes_epoch(value_raw) {
+            Some((lo, hi)) => format!("t.file_mtime BETWEEN {lo} AND {hi}"),
             None => regles_sql::FAUX.to_string(),
         },
         // « jamais » : un fichier sans date connue — la même lecture que les
         // collections.
         ("added_at", "is_null") => "t.file_mtime IS NULL".to_string(),
+        // #6122 (forum 2217) — « dans les N derniers jours », même lecture que
+        // les collections : seuil lu à l'horloge à chaque requête, comparé en
+        // secondes (`file_mtime`) ou en ISO (`listened_at`).
+        ("added_at", regles_sql::DANS_LES_DERNIERS_JOURS) => {
+            match regles_sql::seuil_de(value_raw) {
+                Some(s) => format!("t.file_mtime >= {}", s.epoch),
+                None => regles_sql::FAUX.to_string(),
+            }
+        }
+        ("last_played_at", regles_sql::DANS_LES_DERNIERS_JOURS) => {
+            match regles_sql::seuil_de(value_raw) {
+                Some(s) => format!("t.id IN ({ecoutes} AND listened_at >= {})", s.iso),
+                None => regles_sql::FAUX.to_string(),
+            }
+        }
         ("last_played_at", ">" | ">=") => format!(
             "t.id IN ({ecoutes} AND listened_at {op} {})",
             regles_sql::horodatage_sql(value)
@@ -1060,6 +1078,99 @@ async fn preview_smart_collection(
     ))
 }
 
+#[derive(Deserialize)]
+struct RequeteTextuelle {
+    q: String,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
+    max_tracks: Option<i64>,
+}
+
+/// `POST /library/smart-playlists/requete` — #6287 : exécute une requête
+/// écrite dans le langage de `crate::requete_texte`, et rend aussi sa forme
+/// d'éditeur quand elle en a une.
+///
+/// - 200 : `tracks`, `total`, `regles_refusees` (comme l'aperçu), `rules` et
+///   `match_mode` (ou `null` : requête imbriquée ou niée, sans forme
+///   visuelle) ;
+/// - 400 : `{"error": "requete_invalide", "message", "position"}`, la position
+///   en caractères depuis le début de la requête. La requête est bornée
+///   (`LONGUEUR_MAX` caractères, `PROFONDEUR_MAX` imbrications). Un critère
+///   que le moteur refuse sous une négation refuse toute la requête, avec
+///   `position: null`.
+///
+/// Les favoris de SERVICE et les pistes de catalogue qu'ajoute l'aperçu
+/// (règles `source`, `catalogue:`) ne sont pas ajoutés ici : la requête porte
+/// sur la bibliothèque (étape 1, voir la PR).
+async fn requete_textuelle(
+    State(state): State<SmartHttpState>,
+    profile: ActiveProfile,
+    Json(body): Json<RequeteTextuelle>,
+) -> axum::response::Response {
+    let arbre = match crate::requete_texte::analyser(&body.q) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "requete_invalide",
+                    "message": e.message,
+                    "position": e.position,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let sort_by = body.sort_by.as_deref().unwrap_or("title");
+    let sort_order = body.sort_order.as_deref().unwrap_or("asc");
+    let (items, refusees) = {
+        let resolver = DbRefResolver::new(&state.backend);
+        let ctx = RefCtx::root(&resolver, Some(profile.id()));
+        let compilee = crate::requete_texte::compiler(&arbre, &ctx);
+        // Sous NON, un critère refusé (FAUX) deviendrait VRAI et rendrait
+        // toute la bibliothèque : la requête entière est refusée.
+        if !compilee.refusees_sous_non.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "requete_invalide",
+                    "message": format!(
+                        "critère refusé sous une négation (il rendrait toute la bibliothèque) : {}",
+                        compilee.refusees_sous_non.join(", ")
+                    ),
+                    "position": null,
+                })),
+            )
+                .into_response();
+        }
+        // L'ordre et la borne : ceux du moteur, sans règle.
+        let (_w, order, limit_clause, _r) =
+            build_smart_query_rapport("[]", "all", sort_by, sort_order, body.max_tracks, &ctx);
+        match execute_smart_track_query(
+            &state,
+            profile.id(),
+            &format!("WHERE {}", compilee.condition),
+            &order,
+            &limit_clause,
+        ) {
+            Ok(items) => (items, compilee.refusees),
+            Err(e) => return e.into_response(),
+        }
+    };
+    let (rules, match_mode) = match crate::requete_texte::regles_editeur(&arbre) {
+        Some((r, m)) => (Value::Array(r), json!(m)),
+        None => (Value::Null, Value::Null),
+    };
+    Json(json!({
+        "tracks": items,
+        "total": items.len(),
+        "regles_refusees": refusees,
+        "rules": rules,
+        "match_mode": match_mode,
+    }))
+    .into_response()
+}
+
 pub(crate) fn strip_accents(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -1150,6 +1261,32 @@ mod tests {
         let ctx = RefCtx::root(&EmptyResolver, Some(1));
         let (w, _order, _limit) = build_smart_query(rules, "all", "title", "asc", None, &ctx);
         w
+    }
+
+    /// #6143 — aucune règle de date ne compile en `DATETIME(…)`, fonction
+    /// propre à SQLite que PostgreSQL refuse ; et aucune n'est refusée.
+    #[test]
+    fn regles_de_date_sans_datetime_6143() {
+        for champ in ["added_at", "last_played_at"] {
+            for (op, valeur) in [
+                (">", r#""2024-01-01""#),
+                ("<", r#""2024-01-01""#),
+                (">", r#""now-90d""#),
+                ("<", r#""90d""#),
+                ("between", r#"["2018-01-01","now-30d"]"#),
+            ] {
+                let rules = format!(r#"[{{"field":"{champ}","op":"{op}","value":{valeur}}}]"#);
+                let w = where_of(&rules);
+                assert!(
+                    !w.to_uppercase().contains("DATETIME"),
+                    "{champ} {op} {valeur} compile encore en DATETIME (#6143) : {w}"
+                );
+                assert!(
+                    refusees_de(&rules).is_empty(),
+                    "{champ} {op} {valeur} refusée : {w}"
+                );
+            }
+        }
     }
 
     fn refusees_de(rules: &str) -> Vec<String> {

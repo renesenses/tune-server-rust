@@ -24,12 +24,20 @@ mod duplicates;
 mod edition;
 mod edition_balises;
 mod enrich;
+// Lot 1 de l'enrichissement d'après MetaRust, de Xavier Joly (#4805).
+mod enrichissement_metarust;
+// #6288 — MetaRust, « Albums manquants » (discographie MusicBrainz).
+mod albums_manquants_mb;
+// #6001 — liens ProgArchives / Metal Archives / AllMusic, arbre des genres libre.
+mod liens_et_genres_mb;
+mod passes_metarust;
 // #5469 — les passes que `crate::reprise_des_passes` sait relancer.
 pub(crate) use artwork::{demarrer_images_artistes, demarrer_pochettes_albums};
 pub(crate) use enrich::demarrer_enrich_all;
 /// #4907 — ordre des répertoires et répertoire préféré d'un album.
 mod exemplaires;
 mod facets;
+mod faux_hires;
 mod folder_facet;
 mod genres;
 // LA définition du genre, partagée avec `/dashboard/stats` (#4527) : une seule
@@ -37,6 +45,8 @@ mod genres;
 pub(crate) use genres::genres_de_l_album;
 pub(crate) mod identification_lot;
 mod ingest;
+/// #6481 — le livret PDF rangé dans le dossier d'un album.
+mod livrets;
 mod lyrics_pass;
 mod proposals;
 mod query_multi;
@@ -45,7 +55,7 @@ mod reidentify;
 mod reports;
 // tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
 // fichiers de CETTE machine.
-mod reveler;
+pub(crate) mod reveler;
 mod search;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
@@ -292,6 +302,10 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/artists", get(artists::list_artists))
         .route(
+            "/artists/{id}/missing-albums",
+            get(albums_manquants_mb::albums_manquants),
+        )
+        .route(
             "/artists/{id}",
             get(artists::get_artist).put(artists::update_artist),
         )
@@ -450,6 +464,9 @@ pub fn router() -> Router<AppState> {
             "/tracks/{id}/tenues",
             get(tracks::champs_tenus_get).delete(tracks::champs_tenus_retablir),
         )
+        // #6124 — les balises réellement présentes dans le fichier, relues à
+        // la demande (lecture seule, plafonnée, sans image).
+        .route("/tracks/{id}/file-tags", get(tracks::track_file_tags))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))
@@ -475,13 +492,73 @@ pub fn router() -> Router<AppState> {
             "/genre-tree",
             get(genres::genre_tree).put(genres::update_genre_tree),
         )
+        .route(
+            "/genre-tree/musicbrainz",
+            get(liens_et_genres_mb::arbre_musicbrainz),
+        )
+        .route(
+            "/artists/{id}/external-links",
+            get(liens_et_genres_mb::liens_artiste),
+        )
+        .route(
+            "/albums/{id}/external-links",
+            get(liens_et_genres_mb::liens_album),
+        )
         .route("/albums/top-rated", get(albums::top_rated_albums))
+        // Lot 1 de l'enrichissement d'après MetaRust (#4805) : complétude,
+        // instruments Wikidata, propositions Discogs, BPM.
+        .route(
+            "/albums/incomplete",
+            get(enrichissement_metarust::albums_incomplete),
+        )
+        .route(
+            "/albums/{id}/completeness/musicbrainz",
+            get(enrichissement_metarust::album_completeness),
+        )
+        .route(
+            "/albums/{id}/instruments",
+            post(enrichissement_metarust::album_instruments),
+        )
+        .route(
+            "/albums/{id}/discogs",
+            get(enrichissement_metarust::album_discogs),
+        )
+        .route(
+            "/albums/{id}/discogs/search",
+            post(enrichissement_metarust::album_discogs_search),
+        )
+        .route(
+            "/albums/{id}/discogs/{discogs_id}/accept",
+            post(enrichissement_metarust::album_discogs_accept),
+        )
+        .route(
+            "/albums/{id}/discogs/{discogs_id}/reject",
+            post(enrichissement_metarust::album_discogs_reject),
+        )
+        .route("/albums/{id}/bpm", get(enrichissement_metarust::album_bpm))
+        .route(
+            "/albums/{id}/bpm/estimate",
+            post(enrichissement_metarust::album_bpm_estimate),
+        )
         .route("/albums/{id}/rate", post(albums::rate_album))
         .route("/albums/{id}/rating", get(albums::get_album_rating))
+        // #6545 — notes et écoutes de la communauté (agrégats du site, en cache).
+        .route("/albums/{id}/community", get(albums::album_community))
         .route("/tracks/{id}/credits", get(credits::track_credits))
         .route("/artists/{id}/credits", get(credits::artist_credits))
         // #1572 — crédits d’un album : un aller-retour pour toute la fiche.
         .route("/albums/{id}/credits", get(credits::album_credits))
+        // #6285 — le verdict des faux hi-res de l'album et de ses pistes.
+        .route("/albums/{id}/hires", get(faux_hires::verdict_album))
+        // #6285 — l'état de la passe, et son interrupteur (désactivée par
+        // défaut). Segment statique : aucun conflit avec `/albums/{id}`.
+        .route(
+            "/hires-check",
+            get(faux_hires::etat).post(faux_hires::regler),
+        )
+        // #6481 — les livrets PDF du dossier de l'album, et le fichier.
+        .route("/albums/{id}/booklets", get(livrets::livrets_album))
+        .route("/albums/{id}/booklets/{name}", get(livrets::livret_album))
         .route(
             "/tracks/{id}/credits/enrich",
             post(credits::enrich_track_credits),
@@ -612,6 +689,11 @@ pub fn router() -> Router<AppState> {
             get(duplicates::couverture_empreintes).post(duplicates::empreinter_maintenant),
         )
         .route("/duplicates/resolve", post(duplicates::resolve_duplicate))
+        // #6300 — retirer un album en double en entier (masquage, confirmé).
+        .route(
+            "/duplicates/resolve-album",
+            post(duplicates::retirer_album_doublon),
+        )
         .route("/activity", get(stats::library_activity))
         .route("/albums/{id}/bio", get(albums::album_bio))
         .route("/albums/{id}/similar", get(albums::album_similar))
@@ -642,6 +724,15 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/lyrics", get(tracks::track_lyrics))
         .route("/ratings/export", get(ratings::export_ratings))
         .route("/ratings/import", post(ratings::import_ratings))
+        // Lot 2 de l'enrichissement d'après MetaRust (#4805) : les passes de
+        // lot, à la main. Suspendues par la tâche de fond `enrichment`.
+        .route("/bpm-all", post(passes_metarust::bpm_lot_start))
+        .route("/bpm-all/status", get(passes_metarust::bpm_lot_status))
+        .route("/discogs-all", post(passes_metarust::discogs_lot_start))
+        .route(
+            "/discogs-all/status",
+            get(passes_metarust::discogs_lot_status),
+        )
         .route("/enrich-all", post(enrich::enrich_all_library))
         .route("/enrich-all/status", get(enrich::enrich_all_status))
         // #4805 — le pilote de lot de l'identification. Le travail par album
@@ -655,6 +746,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/identify-all/status",
             get(identification_lot::identification_lot_status),
+        )
+        // #4805 (13/10/2026) — la passe de nuit des albums refusés par
+        // MusicBrainz : éteinte par défaut, ce réglage l'allume.
+        .route(
+            "/identify-all/nuit",
+            get(identification_lot::nuit::reglage_nuit).post(identification_lot::nuit::regler_nuit),
         )
         .route("/write-tags", post(write_tags::write_tags_to_files))
         .route("/write-tags/status", get(write_tags::write_tags_status))
@@ -814,3 +911,7 @@ mod routage_tests {
 #[cfg(test)]
 #[path = "banc_rail_5993.rs"]
 mod banc_rail_5993;
+
+#[cfg(test)]
+#[path = "banc_repertoires_5998.rs"]
+mod banc_repertoires_5998;

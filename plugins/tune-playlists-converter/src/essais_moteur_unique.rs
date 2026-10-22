@@ -342,3 +342,161 @@ fn un_approximatif_du_classement_ne_passe_pas_sur_sa_seule_duree() {
     assert!(pl.appariees.is_empty());
     assert_eq!(pl.introuvables[0].raison.code(), "appariement_approximatif");
 }
+
+// ---------------------------------------------------------------------------
+// #6499 — un titre déjà chez la cible est repris tel quel
+// ---------------------------------------------------------------------------
+
+/// La playlist de Bertrand (rc6) : une playlist de la bibliothèque qui mêle
+/// pistes locales, titres Qobuz et un titre TIDAL.
+fn banc_playlist_mixte() -> HoteDeBanc {
+    HoteDeBanc::new()
+        .avec_playlist(
+            "7",
+            "Mixte",
+            vec![
+                Piste::new("1", "Imagine", "John Lennon", 183_000),
+                Piste::new("58640120", "So What", "Miles Davis", 562_000).chez("qobuz"),
+                Piste::new("2", "Hey Jude", "The Beatles", 431_000),
+                Piste::new("t-77", "Freddie Freeloader", "Miles Davis", 589_000).chez("tidal"),
+                Piste::new("q-99", "Blue in Green", "Miles Davis", 337_000).chez("qobuz"),
+            ],
+        )
+        .avec_verdict_chez(
+            "qobuz",
+            "Imagine",
+            Verdict::exact(Piste::new("q-1", "Imagine", "John Lennon", 183_500)),
+        )
+        .avec_verdict_chez(
+            "qobuz",
+            "Hey Jude",
+            Verdict::exact(Piste::new("q-2", "Hey Jude", "The Beatles", 431_000)),
+        )
+        .avec_verdict_chez(
+            "qobuz",
+            "Freddie Freeloader",
+            Verdict::exact(Piste::new(
+                "q-3",
+                "Freddie Freeloader",
+                "Miles Davis",
+                589_000,
+            )),
+        )
+        .avec_verdict_chez(
+            "tidal",
+            "So What",
+            Verdict::exact(Piste::new("t-10", "So What", "Miles Davis", 562_000)),
+        )
+        .avec_verdict_chez(
+            "tidal",
+            "Blue in Green",
+            Verdict::exact(Piste::new("t-11", "Blue in Green", "Miles Davis", 337_000)),
+        )
+        .avec_verdict_chez(
+            "tidal",
+            "Imagine",
+            Verdict::exact(Piste::new("t-12", "Imagine", "John Lennon", 183_000)),
+        )
+        .avec_verdict_chez(
+            "tidal",
+            "Hey Jude",
+            Verdict::exact(Piste::new("t-13", "Hey Jude", "The Beatles", 431_000)),
+        )
+}
+
+/// 🔴 Le témoin de #6499. Vers Qobuz, les titres Qobuz de la playlist sont
+/// versés sous leur identifiant d'origine, À LEUR PLACE, sans qu'aucun
+/// appariement ne soit demandé pour eux ; le titre TIDAL, lui, est apparié.
+/// Le banc ne connaît AUCUN verdict Qobuz pour « So What » ni « Blue in
+/// Green » : avant le correctif, ils sortaient en `aucun_resultat`.
+#[test]
+fn vers_qobuz_les_titres_qobuz_sont_repris_tels_quels_dans_l_ordre_6499() {
+    let hote = banc_playlist_mixte();
+    let moteur = Convertisseur::new(&hote);
+
+    let lot = moteur
+        .apercu(&demande("local", "qobuz", &["7"]))
+        .expect("aperçu");
+    let pl = &lot.playlists[0];
+    assert_eq!(pl.total, 5);
+    let ids: Vec<&str> = pl.appariees.iter().map(|a| a.cible_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["q-1", "58640120", "q-2", "q-3", "q-99"],
+        "les titres Qobuz doivent être repris sous leur source_id, dans l'ordre ; \
+         introuvables : {:?}",
+        pl.introuvables
+    );
+    assert!(pl.introuvables.is_empty(), "{:?}", pl.introuvables);
+
+    let demandes: Vec<String> = hote.appariements().into_iter().map(|(_, t)| t).collect();
+    assert!(
+        !demandes
+            .iter()
+            .any(|t| t == "So What" || t == "Blue in Green"),
+        "un titre déjà chez Qobuz ne s'apparie pas : {demandes:?}"
+    );
+    assert!(
+        demandes.iter().any(|t| t == "Freddie Freeloader"),
+        "le titre TIDAL doit être apparié chez Qobuz : {demandes:?}"
+    );
+
+    let lot = moteur.transferer(&lot.lot_id, true).unwrap();
+    assert_eq!(lot.etat, etat::TERMINE);
+    let cible = lot.playlists[0].cible_playlist_id.clone().unwrap();
+    assert_eq!(
+        hote.ajouts(),
+        vec![(
+            cible,
+            vec![
+                "q-1".to_string(),
+                "58640120".into(),
+                "q-2".into(),
+                "q-3".into(),
+                "q-99".into(),
+            ]
+        )]
+    );
+}
+
+/// La même règle vers TIDAL : le titre TIDAL est repris, les titres Qobuz
+/// sont appariés chez TIDAL comme les pistes locales.
+#[test]
+fn vers_tidal_le_titre_tidal_est_repris_et_les_titres_qobuz_apparies_6499() {
+    let hote = banc_playlist_mixte();
+    let lot = Convertisseur::new(&hote)
+        .apercu(&demande("local", "tidal", &["7"]))
+        .expect("aperçu");
+    let ids: Vec<&str> = lot.playlists[0]
+        .appariees
+        .iter()
+        .map(|a| a.cible_id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["t-12", "t-10", "t-13", "t-77", "t-11"]);
+    let demandes: Vec<String> = hote.appariements().into_iter().map(|(_, t)| t).collect();
+    assert!(
+        !demandes.iter().any(|t| t == "Freddie Freeloader"),
+        "{demandes:?}"
+    );
+}
+
+/// Vers la bibliothèque, rien n'est « déjà chez la cible » : un titre de
+/// service s'y désigne par un `tracks.id`, jamais par son `source_id`.
+#[test]
+fn vers_la_bibliotheque_un_titre_de_service_reste_apparie_6499() {
+    let hote = HoteDeBanc::new()
+        .avec_playlist(
+            "pl-q",
+            "Du service",
+            vec![Piste::new("58640120", "So What", "Miles Davis", 562_000).chez("local")],
+        )
+        .avec_verdict_chez(
+            "local",
+            "So What",
+            Verdict::exact(Piste::new("501", "So What", "Miles Davis", 562_000)),
+        );
+    let lot = Convertisseur::new(&hote)
+        .apercu(&demande("qobuz", "local", &["pl-q"]))
+        .unwrap();
+    assert_eq!(lot.playlists[0].appariees[0].cible_id, "501");
+}

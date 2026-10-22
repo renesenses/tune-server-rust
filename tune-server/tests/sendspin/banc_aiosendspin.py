@@ -36,11 +36,13 @@ import hashlib
 import io
 import json
 import logging
+import socket
 import sys
 from pathlib import Path
 
 import soundfile
 from aiosendspin.client.client import SendspinClient
+from aiosendspin.client.listener import ClientListener
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
 from aiosendspin.models.types import AudioCodec, PlayerCommand, Roles
 from aiosendspin.noise.keys import Identity, generate_psk, psk_id_for
@@ -227,6 +229,8 @@ class Banc:
             self.ouvrir_flux(fmt, format_.codec_header, "stream/start en place")
         synchro = self.client.is_time_synchronized()
         lecture = self.client.compute_play_time(timestamp_us) if synchro else None
+        filtre = getattr(getattr(self.client, "_admitted_connection", None), "_time_filter", None)
+        erreur = filtre.error if synchro and filtre is not None else None
         debut = self.fichier.tell()
         self.fichier.write(donnees)
         self.courant["morceaux"].append(
@@ -239,6 +243,7 @@ class Banc:
                 "arrivee": arrivee,
                 "lecture_predite": lecture,
                 "synchro": synchro,
+                "erreur_filtre_us": erreur,
             }
         )
 
@@ -284,7 +289,13 @@ class Banc:
 
 async def principal() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", required=True)
+    parser.add_argument("--url", help="mode initie par le client : URL du serveur")
+    parser.add_argument(
+        "--ecoute",
+        action="store_true",
+        help="mode initie par le SERVEUR : ecoute sur 127.0.0.1 (ClientListener) "
+        "et attend que Tune compose ; le port est publie en ECOUTE=<port>",
+    )
     parser.add_argument("--dossier", required=True)
     parser.add_argument("--formats", required=True)
     parser.add_argument("--capacite", type=int, default=2_000_000)
@@ -329,7 +340,32 @@ async def principal() -> int:
 
     print(f"CLIENT_ID={identite.peer_id}", flush=True)
     print(f"TOKEN={jeton}", flush=True)
-    await client.connect(args.url)
+    ecouteur = None
+    if args.ecoute:
+        # Connexion initiée par le serveur : l'enceinte écoute, Tune compose.
+        # Boucle locale seulement, pas d'annonce mDNS : le test annonce
+        # l'adresse à Tune lui-même.
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        async def entrante(ws) -> None:
+            await client.attach_websocket(ws)
+
+        ecouteur = ClientListener(
+            identite.peer_id,
+            entrante,
+            port=port,
+            host="127.0.0.1",
+            advertise_mdns=False,
+            client_name="aiosendspin (banc Tune)",
+        )
+        await ecouteur.start()
+        print(f"ECOUTE={port}", flush=True)
+        while not client.connected:
+            await asyncio.sleep(0.05)
+    else:
+        await client.connect(args.url)
     print("CONNECTE", flush=True)
     horloge = asyncio.get_running_loop().create_task(banc.surveiller_horloge())
 
@@ -348,6 +384,8 @@ async def principal() -> int:
             print("FORMAT_ENVOYE", flush=True)
     horloge.cancel()
     await client.disconnect()
+    if ecouteur is not None:
+        await ecouteur.stop()
     (dossier / "journal.json").write_text(json.dumps(banc.journal(), indent=1))
     print("JOURNAL_ECRIT", flush=True)
     return 0

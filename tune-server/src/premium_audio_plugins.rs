@@ -31,6 +31,10 @@ impl TunePlugin for PremiumAudio {
     fn version(&self) -> &str {
         "0.1.0"
     }
+    /// Le texte par défaut, en français. Les fiches de `GET /plugins` le
+    /// remplacent par la traduction de `plugin.description.<id>` dans la
+    /// langue de la requête (`routes::plugins::localiser_la_description`,
+    /// #6458) : ce texte-ci ne s'affiche plus tel quel.
     fn description(&self) -> &str {
         match self.id {
             "equalizer" => "Égaliseur : profil, graphique, paramétrique, presets et AutoEq",
@@ -177,7 +181,15 @@ pub async fn register(loader: &PluginLoader, state: &AppState) {
             .await;
     }
 }
-pub fn require_installed(state: &AppState, id: &str) -> Result<(), axum::response::Response> {
+/// Refus 409 `plugin_unavailable` quand le greffon `id` n'est pas installé et
+/// activé. Le `message` suit la langue de la requête (`Accept-Language`, clé
+/// `plugin.unavailable`) : il était écrit en dur en français pour tout le
+/// monde (#6458). Le code `plugin_unavailable` reste le terme stable.
+pub fn require_installed(
+    state: &AppState,
+    id: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), axum::response::Response> {
     use axum::response::IntoResponse;
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let actif = if tune_core::audio::premium_plugins::contains(id) {
@@ -188,7 +200,16 @@ pub fn require_installed(state: &AppState, id: &str) -> Result<(), axum::respons
     if actif {
         Ok(())
     } else {
-        Err((axum::http::StatusCode::CONFLICT,axum::Json(json!({"error":"plugin_unavailable","plugin":id,"message":"Ce plugin doit être installé et activé."}))).into_response())
+        let lang = crate::i18n::lang_from_header(headers);
+        Err((
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(json!({
+                "error": "plugin_unavailable",
+                "plugin": id,
+                "message": crate::i18n::t(&lang, "plugin.unavailable"),
+            })),
+        )
+            .into_response())
     }
 }
 

@@ -1356,6 +1356,7 @@ mod tests {
     /// la colonne est corrigée, le fichier n'est pas ouvert.
     #[tokio::test]
     async fn reglage_absent_la_colonne_seule_est_corrigee() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         let dir = scratch_dir("tune-compositeur-credits-sans-ecriture");
         let vide = dir.join("vide.flac");
         std::fs::copy(fixture("test.flac"), &vide).unwrap();
@@ -1379,6 +1380,7 @@ mod tests {
 
     #[tokio::test]
     async fn la_passe_remplit_corrige_et_grave_la_balise() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         let dir = scratch_dir("tune-compositeur-credits");
         // 1 — colonne VIDE, crédits à deux auteurs : à remplir.
         let vide = dir.join("vide.flac");
@@ -1459,6 +1461,7 @@ mod tests {
     /// abîmerait sans rien rendre d'erroné.
     #[tokio::test]
     async fn les_caracteres_non_ascii_survivent_a_l_ecriture() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         const NOM: &str = "Henryk Miko\u{0142}aj G\u{00f3}recki";
         assert!(NOM.contains('\u{0142}') && NOM.contains('\u{00f3}'));
 
@@ -1489,6 +1492,7 @@ mod tests {
     /// `write_tags` laisserait le compteur juste et le disque déjà gravé.
     #[tokio::test]
     async fn la_garde_retient_la_reduction_la_consigne_et_laisse_passer_le_reste() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         let dir = scratch_dir("tune-compositeur-garde");
         // 1 — 3 noms dans la colonne, 1 dans les crédits : RETENUE.
         let appauvrie = dir.join("appauvrie.flac");
@@ -1608,6 +1612,7 @@ mod tests {
     /// retirerait.
     #[tokio::test]
     async fn un_champ_vorbis_hors_catalogue_survit_a_la_passe() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         use lofty::config::{ParseOptions, WriteOptions};
         use lofty::file::AudioFile;
         use lofty::flac::FlacFile;
@@ -1684,6 +1689,7 @@ mod tests {
     /// deux passes concurrentes réécriraient les mêmes fichiers.
     #[tokio::test]
     async fn la_passe_s_inscrit_au_registre_et_refuse_un_doublon() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         let dir = scratch_dir("tune-compositeur-doublon");
         let cible = dir.join("x.flac");
         std::fs::copy(fixture("test.flac"), &cible).unwrap();
@@ -1697,12 +1703,15 @@ mod tests {
         assert!(en_cours(&s));
         let r2 = lancer(State(s.clone()), None).await.into_response();
         assert_eq!(r2.status(), StatusCode::CONFLICT);
+        // Garder l'isolement jusqu'à la fin du travail lancé par ce témoin.
+        attendre_la_fin(&s).await;
     }
 
     /// La pause de l'enrichissement arrête la passe à la frontière suivante,
     /// et l'état publié porte le curseur qui dit où reprendre.
     #[tokio::test]
     async fn une_pause_arrete_la_passe_et_laisse_un_curseur() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         let s = etat();
         // Aucun fichier : les pistes défilent vite, seule la frontière compte.
         for id in [1i64, 2, 3] {
@@ -1715,7 +1724,6 @@ mod tests {
             );
             credit(&s, 100 + id, id, "composer", "Górecki", 0);
         }
-        tune_core::taches_de_fond::oublier_pour_les_essais();
         tune_core::taches_de_fond::mettre_en_pause(&s.backend, Tache::Enrichissement).unwrap();
 
         // Lancée en pause : elle refuse de partir plutôt que de se déclarer
@@ -1726,14 +1734,13 @@ mod tests {
             StatusCode::CONFLICT,
             "une passe en pause est partie en silence"
         );
-
-        tune_core::taches_de_fond::oublier_pour_les_essais();
     }
 
     /// Le `GET` rend les CINQ comptes, jamais une réponse partielle — même au
     /// repos, où ils sont tous à zéro (#1897).
     #[tokio::test]
     async fn le_get_rend_les_cinq_comptes_meme_au_repos() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         let s = etat();
         let Json(v) = statut(State(s)).await;
         for cle in [

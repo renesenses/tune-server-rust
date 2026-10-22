@@ -1,154 +1,108 @@
-//! Ticket 190 — la sentinelle ne met plus la pile du détenteur en texte en
-//! tenant le verrou de relevé.
-//!
-//! Le journal du terrain montrait, à la même milliseconde,
-//! `ecriture_sqlite_toujours_tenue tenue_ms=1163` et
-//! `ecriture_sqlite_detention_longue tenue_ms=5414` pour la MÊME prise : la
-//! sentinelle avait relevé la prise à 1,16 s, puis passé plus de quatre
-//! secondes à résoudre les symboles de sa pile sous `detention`. Le
-//! détenteur, qui rendait la connexion, attendait ce verrou ; l'écrivain
-//! suivant aussi, connexion en main.
-//!
-//! L'épreuve rend la mise en texte lente à volonté (1,5 s), pour la seule
-//! pile d'un fil nommé, et mesure ce que paient le détenteur qui rend et
-//! l'écrivain qui suit.
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
+//! Ticket 190 : la mise en texte d'une pile ne retient pas le verrou.
+//! Le formateur reste bloqué par le banc jusqu'à ce que le détenteur ait
+//! rendu puis repris la connexion. Aucun rapport de durées n'est supposé.
+use super::{Sentinelle, VerrouEcriture, armer_les_piles};
 use rusqlite::Connection;
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::time::Duration;
 
-use super::{Sentinelle, Signalement, VerrouEcriture, armer_les_piles};
-
-/// Les fils dont la mise en texte de la pile est retardée, et de combien.
-/// Une entrée par épreuve : elles tournent en parallèle.
-static RETARDS: Mutex<Vec<(&'static str, Duration)>> = Mutex::new(Vec::new());
-
-fn retarder(fil: &'static str, d: Option<Duration>) {
-    let mut r = RETARDS.lock().unwrap_or_else(|e| e.into_inner());
-    r.retain(|(f, _)| *f != fil);
-    if let Some(d) = d {
-        r.push((fil, d));
-    }
+struct Blocage {
+    commence: mpsc::Sender<()>,
+    libre: Mutex<bool>,
+    reveil: Condvar,
 }
+static RETARDS: Mutex<Vec<(&'static str, Arc<Blocage>)>> = Mutex::new(Vec::new());
 
-/// Appelé par `formater_la_pile` sous `cfg(test)`.
-pub(super) fn retard_de_formatage(fil_du_detenteur: &str) {
-    let retard = RETARDS
+pub(super) fn retard_de_formatage(fil: &str) {
+    let blocage = RETARDS
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .find(|(fil, _)| *fil == fil_du_detenteur)
-        .map(|(_, d)| *d);
-    if let Some(d) = retard {
-        std::thread::sleep(d);
-    }
-}
-
-const FIL: &str = "epreuve-190-detenteur";
-const LENTEUR: Duration = Duration::from_millis(1500);
-
-/// Le détenteur tient 200 ms, la sentinelle (seuil 50 ms, tour de 20 ms)
-/// relève sa prise et met sa pile en texte en 1,5 s. Rendre la connexion,
-/// puis la reprendre et la rendre, doit rester bref.
-#[test]
-fn rendre_la_connexion_n_attend_pas_la_mise_en_texte_de_la_pile_190() {
-    armer_les_piles();
-    let verrou = VerrouEcriture::sans_sentinelle(
-        Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
-        Duration::from_millis(50),
-    );
-    let signalements = Arc::new(AtomicUsize::new(0));
-    let compte = signalements.clone();
-    let sentinelle = Sentinelle::demarrer(
-        Duration::from_millis(20),
-        Box::new(move |s: &Signalement| {
-            if s.detenteur.fil == FIL {
-                compte.fetch_add(1, Ordering::SeqCst);
-            }
-        }),
-    );
-    sentinelle.surveiller(&verrou);
-    retarder(FIL, Some(LENTEUR));
-
-    let v = verrou.clone();
-    let (rendre, suivant) = std::thread::Builder::new()
-        .name(FIL.into())
-        .spawn(move || {
-            let tenue = v.lock().unwrap();
-            tenue.execute_batch("SELECT 1").unwrap();
-            // Le temps que la sentinelle relève la prise et commence la
-            // mise en texte de la pile.
-            std::thread::sleep(Duration::from_millis(200));
-            let t0 = Instant::now();
-            drop(tenue);
-            let rendre = t0.elapsed();
-            // L'écrivain suivant : prendre, écrire, rendre.
-            let t1 = Instant::now();
-            let suivante = v.lock().unwrap();
-            suivante.execute_batch("SELECT 1").unwrap();
-            drop(suivante);
-            (rendre, t1.elapsed())
-        })
         .unwrap()
-        .join()
-        .unwrap();
-    retarder(FIL, None);
-    eprintln!("ticket 190 : rendre {rendre:?}, écrivain suivant {suivant:?}");
-
-    // Contre-épreuve : la mise en texte a bien eu lieu, et elle a bien été
-    // lente. Sinon l'épreuve passerait sans rien prouver.
-    let limite = Instant::now() + Duration::from_secs(5);
-    while signalements.load(Ordering::SeqCst) == 0 && Instant::now() < limite {
-        std::thread::sleep(Duration::from_millis(10));
+        .iter()
+        .find(|(nom, _)| *nom == fil)
+        .map(|(_, b)| b.clone());
+    if let Some(b) = blocage {
+        let _ = b.commence.send(());
+        let mut libre = b.libre.lock().unwrap();
+        while !*libre {
+            libre = b.reveil.wait(libre).unwrap();
+        }
     }
-    assert_eq!(
-        signalements.load(Ordering::SeqCst),
-        1,
-        "la sentinelle n'a pas signalé la prise du fil {FIL}"
-    );
-    let borne = Duration::from_millis(300);
-    assert!(
-        rendre < borne && suivant < borne,
-        "rendre la connexion a pris {rendre:?} et l'écrivain suivant {suivant:?} \
-         (borne {borne:?}) : la pile se met encore en texte sous le verrou de relevé"
-    );
 }
 
-/// Le relevé d'un gel (`releve`) suit la même règle : pendant qu'il met en
-/// texte la pile du détenteur, le détenteur rend la connexion sans attendre.
-#[test]
-fn le_releve_d_un_gel_ne_retient_pas_le_detenteur_190() {
+fn eprouver(fil: &'static str, sentinelle: bool) {
     armer_les_piles();
     let verrou = VerrouEcriture::sans_sentinelle(
         Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
-        Duration::from_secs(60),
+        Duration::ZERO,
     );
-    const FIL_RELEVE: &str = "epreuve-190-releve";
+    let (commence_tx, commence_rx) = mpsc::channel();
+    let blocage = Arc::new(Blocage {
+        commence: commence_tx,
+        libre: Mutex::new(false),
+        reveil: Condvar::new(),
+    });
+    RETARDS.lock().unwrap().push((fil, blocage.clone()));
+    let (pris_tx, pris_rx) = mpsc::channel();
+    let (rendre_tx, rendre_rx) = mpsc::channel();
+    let (fini_tx, fini_rx) = mpsc::channel();
     let v = verrou.clone();
-    let (pris_tx, pris_rx) = std::sync::mpsc::channel();
     let detenteur = std::thread::Builder::new()
-        .name(FIL_RELEVE.into())
+        .name(fil.into())
         .spawn(move || {
             let tenue = v.lock().unwrap();
             pris_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(200));
-            let t0 = Instant::now();
+            rendre_rx.recv().unwrap();
             drop(tenue);
-            t0.elapsed()
+            let suivante = v.lock().unwrap();
+            suivante.execute_batch("SELECT 1").unwrap();
+            drop(suivante);
+            fini_tx.send(()).unwrap();
         })
         .unwrap();
     pris_rx.recv().unwrap();
-    retarder(FIL_RELEVE, Some(LENTEUR));
-    let releve = verrou.releve();
-    retarder(FIL_RELEVE, None);
-    let rendre = detenteur.join().unwrap();
-    let photo = releve.detenteur.expect("le relevé nomme le détenteur");
-    assert_eq!(photo.fil, FIL_RELEVE);
-    assert!(photo.pile.is_some(), "piles armées : la pile est au relevé");
+    let v = verrou.clone();
+    let lecture = std::thread::spawn(move || {
+        if sentinelle {
+            let s = Sentinelle {
+                surveilles: Mutex::new(Vec::new()),
+                puits: Box::new(move |sig| {
+                    assert_eq!(sig.detenteur.fil, fil);
+                    assert!(sig.detenteur.pile.is_some());
+                }),
+            };
+            s.surveiller(&v);
+            s.tour();
+        } else {
+            let photo = v.releve().detenteur.expect("le relevé nomme le détenteur");
+            assert_eq!(photo.fil, fil);
+            assert!(photo.pile.is_some());
+        }
+    });
+    let commence = commence_rx.recv_timeout(Duration::from_secs(15)).is_ok();
+    rendre_tx.send(()).unwrap();
+    let rendu = fini_rx.recv_timeout(Duration::from_secs(15)).is_ok();
+    // Libérer même si le défaut gardé a bloqué le détenteur.
+    *blocage.libre.lock().unwrap() = true;
+    blocage.reveil.notify_all();
+    lecture.join().unwrap();
+    detenteur.join().unwrap();
+    RETARDS.lock().unwrap().retain(|(nom, _)| *nom != fil);
     assert!(
-        rendre < Duration::from_millis(300),
-        "rendre la connexion a pris {rendre:?} pendant le relevé : la pile se \
-         met encore en texte sous le verrou de relevé"
+        commence,
+        "le formateur de pile doit être entré avant le rendu"
     );
+    assert!(
+        rendu,
+        "la pile se met encore en texte sous le verrou : rendre puis reprendre la connexion attend le formateur"
+    );
+}
+
+#[test]
+fn rendre_la_connexion_n_attend_pas_la_mise_en_texte_de_la_pile_190() {
+    eprouver("epreuve-190-detenteur", true);
+}
+
+#[test]
+fn le_releve_d_un_gel_ne_retient_pas_le_detenteur_190() {
+    eprouver("epreuve-190-releve", false);
 }

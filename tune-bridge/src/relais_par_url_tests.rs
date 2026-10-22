@@ -29,7 +29,7 @@ async fn pont_de_test() -> PontDeTest {
     let state = Arc::new(RelayState::new());
     let (tx, serveur) = mpsc::channel::<String>(16);
     state
-        .register_server("srv".into(), "Salon".into(), JETON.into(), tx)
+        .register_server("srv".into(), "Salon".into(), JETON.into(), None, tx)
         .unwrap();
     let app = Router::new()
         .route(
@@ -161,17 +161,23 @@ async fn un_mauvais_jeton_dans_lurl_est_refuse() {
     assert!(relayee.is_none());
 }
 
-/// Sans `X-Tune-Profile`, le serveur rend les favoris et l'historique du
-/// profil par defaut : chacun voit ceux d'un autre.
+/// Sans `X-Profile-Id`, le serveur rend les favoris et l'historique du
+/// profil par defaut : chacun voit ceux d'un autre, et la garde de
+/// `/profiles/{id}/favorites` repond 404 « profile not found » des que le
+/// chemin nomme un autre profil (#6479, Daniel LEVY, fil 2328).
+///
+/// Le nom est celui que le serveur LIT (`ActiveProfile`) et que les clients
+/// ENVOIENT (`profileHeader.ts`, `api.dart`) : la liste blanche portait
+/// `x-tune-profile`, que personne n'envoie, et ce test le relayait fidelement.
 #[tokio::test]
 async fn len_tete_de_profil_est_relaye() {
     let mut pont = pont_de_test().await;
     let requete = reqwest::Client::new()
-        .get(format!("{}/favorites", pont.base))
+        .get(format!("{}/profiles/3/favorites/albums", pont.base))
         .header("x-bridge-token", JETON)
-        .header("X-Tune-Profile", "3");
+        .header("X-Profile-Id", "3");
     let (relayee, _, _) = echange(&mut pont, requete, ok_json).await;
-    assert_eq!(relayee.unwrap()["headers"]["x-tune-profile"], "3");
+    assert_eq!(relayee.unwrap()["headers"]["x-profile-id"], "3");
 }
 
 /// Range et validateurs de cache restent relayes ; le jeton du pont, lui,

@@ -188,18 +188,26 @@ async fn copie(passe: Passe) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copie_rapide_5223() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     copie(Passe::Rapide).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copie_demarrage_5223() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     copie(Passe::Demarrage).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copie_surveillant_5223() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     copie(Passe::Surveillant).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copie_complet_temoin_5223() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     copie(Passe::Complet).await;
 }
 
@@ -213,5 +221,7 @@ async fn copie_complet_temoin_5223() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copie_nom_du_dossier_5223() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     copie(Passe::NomDuDossier).await;
 }

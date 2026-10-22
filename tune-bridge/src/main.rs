@@ -1,11 +1,20 @@
 mod api_proxy;
 mod circle;
 mod licence;
+mod morceau_binaire;
 mod protocol;
 #[cfg(test)]
 mod relais_par_url_tests;
+mod session_routes;
+mod sessions;
+#[cfg(test)]
+mod sessions_tests;
+mod site;
 mod state;
 mod stream_proxy;
+mod trafic;
+#[cfg(test)]
+mod trafic_tests;
 mod web_ui;
 mod ws_client;
 mod ws_server;
@@ -16,7 +25,7 @@ use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::response::IntoResponse;
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -48,23 +57,31 @@ async fn main() {
             interval.tick().await;
             let ping = serde_json::json!({"type": "relay.ping"}).to_string();
             for conn in heartbeat_state.servers.iter() {
-                let _ = conn.ws_tx.send(ping.clone()).await;
+                if conn.ws_tx.send(ping.clone()).await.is_ok() {
+                    heartbeat_state
+                        .trafic
+                        .sortie(&conn.trafic, trafic::Categorie::Api, ping.len());
+                }
             }
         }
     });
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/ws/server", get(ws_server_handler))
-        .route("/api/relay/{server_id}/{*path}", any(api_proxy::proxy_api))
-        .route("/ws/client/{server_id}", get(ws_client::ws_client_handler))
-        .route(
-            "/stream/relay/{server_id}/{*stream_path}",
-            get(stream_proxy::proxy_stream),
-        )
-        // Tune Circle T4 (#5327) : l'ecoute chez un contact, par billet
-        // seulement. Voir `circle.rs`.
-        .route("/stream/circle/{ticket}", get(circle::flux_de_cercle));
+    // Trafic du pont (#6512) : agregats par minute, ENVOYES au site avec le
+    // jeton de service du relais. Pourquoi un envoi plutot qu'une route a
+    // interroger : le pont publie son port 9090 sur toutes les interfaces du
+    // VPS (docker-compose.bridge.yml) et le vhost bridge.mozaiklabs.fr le
+    // relaie tout entier. Une route de lecture y serait exposee a Internet,
+    // gardee par un seul secret. L'envoi n'ouvre AUCUNE route : il reutilise
+    // le chemin pont -> site et le jeton qui existent deja pour
+    // `listen/verify`, et le site le garde comme celle-ci (`auth.tune-bridge`).
+    // Les minutes non acceptees attendent 24 h au plus sur le pont.
+    tokio::spawn(trafic::boucle(state.trafic.clone()));
+
+    // Ecoute a distance par laissez-passer (#6603) : jeu de cles du site,
+    // battement de toutes les sessions chaque minute.
+    tokio::spawn(state.sessions.clone().boucle());
+
+    let app = routes();
     // Le client web, s'il est fourni. Monte APRES les routes du relais : axum
     // fait primer les segments statiques (`/api`, `/ws`, `/stream`, `/health`)
     // sur le segment dynamique `{server_id}`, mais l'ordre rend l'intention
@@ -100,6 +117,28 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
+}
+
+/// La table des routes du relais, sans le client web ni les couches : celle
+/// que les tests de bout en bout montent aussi.
+pub(crate) fn routes() -> Router<Arc<RelayState>> {
+    Router::new()
+        .route("/health", get(health))
+        // Sessions d'ecoute a distance (#6603). `renouveler` et `defi` sont
+        // des segments statiques : axum les fait primer sur `{server_id}`.
+        .route("/session/defi/{server_id}", get(session_routes::defi))
+        .route("/session/renouveler", post(session_routes::renouveler))
+        .route("/session/{server_id}", post(session_routes::ouvrir))
+        .route("/ws/server", get(ws_server_handler))
+        .route("/api/relay/{server_id}/{*path}", any(api_proxy::proxy_api))
+        .route("/ws/client/{server_id}", get(ws_client::ws_client_handler))
+        .route(
+            "/stream/relay/{server_id}/{*stream_path}",
+            get(stream_proxy::proxy_stream),
+        )
+        // Tune Circle T4 (#5327) : l'ecoute chez un contact, par billet
+        // seulement. Voir `circle.rs`.
+        .route("/stream/circle/{ticket}", get(circle::flux_de_cercle))
 }
 
 async fn health() -> &'static str {

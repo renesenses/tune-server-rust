@@ -419,6 +419,7 @@ fn gapless_cooldown_suppresses_stopped() {
         gapless_stuck_ticks: 0,
         last_bytes_sent: 0,
         playing_stall_ticks: 0,
+        playing_stall_depuis: None,
         depassement_duree_ticks: 0,
         depassement_duree_signale: false,
         stall_declines: 0,
@@ -493,6 +494,7 @@ fn playing_state_resets_cooldown() {
         gapless_stuck_ticks: 0,
         last_bytes_sent: 0,
         playing_stall_ticks: 0,
+        playing_stall_depuis: None,
         depassement_duree_ticks: 0,
         depassement_duree_signale: false,
         stall_declines: 0,
@@ -812,6 +814,7 @@ fn backoff_exponential() {
         gapless_stuck_ticks: 0,
         last_bytes_sent: 0,
         playing_stall_ticks: 0,
+        playing_stall_depuis: None,
         depassement_duree_ticks: 0,
         depassement_duree_signale: false,
         stall_declines: 0,
@@ -1467,6 +1470,138 @@ fn dlna_playing_stall_declenche_a_la_frontiere_exacte() {
     assert_eq!(ticks, PLAYING_STALL_THRESHOLD);
 }
 
+// ── #6702 — un faux renderer DLNA rejoué tour par tour ──────────────────
+//
+// Chaque échantillon : (instant du tour en ms depuis le début, position
+// rapportée en ms, octets servis cumulés). Rend l'indice du tour qui coupe la
+// zone, ou `None`. Le bras de `tick.rs` n'est rien d'autre que ces deux appels.
+fn faux_renderer_6702(echantillons: &[(u64, u64, u64)]) -> Option<usize> {
+    let t0 = Instant::now();
+    let mut ticks = 0u8;
+    let mut depuis = None;
+    let (mut pos_avant, mut octets_avant) = (echantillons[0].1, echantillons[0].2);
+    for (i, &(t_ms, pos, octets)) in echantillons.iter().enumerate().skip(1) {
+        ticks = decisions::next_dlna_playing_stall_ticks(
+            ticks,
+            true,
+            pos_avant,
+            pos,
+            octets_avant,
+            octets,
+        );
+        pos_avant = pos;
+        octets_avant = octets;
+        let maintenant = t0 + Duration::from_millis(t_ms);
+        if decisions::lecture_sans_progres_etablie(ticks, &mut depuis, maintenant) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Le journal du .18 (21/10, 11:27:44) : le sondeur reprend après un blocage,
+/// la position (204 s) suit le temps réel, et trente tours rattrapés partent
+/// en 247 ms. Le renderer jouait : la zone ne doit pas être coupée.
+#[test]
+fn rafale_de_tours_rattrapes_ne_coupe_pas_une_lecture_saine_6702() {
+    let mut e = vec![(0, 203_000, 51_796_934)];
+    for i in 0..=40u64 {
+        e.push((1_000 + i * 6, 204_000, 51_796_934));
+    }
+    assert_eq!(faux_renderer_6702(&e), None);
+    // Puis le sondeur retrouve son pas : la position avance, la série retombe.
+    let fin = e.last().unwrap().0;
+    for k in 1..=60u64 {
+        e.push((fin + k * 1_000, 204_000 + k * 1_000, 51_796_934));
+    }
+    assert_eq!(faux_renderer_6702(&e), None);
+}
+
+/// Le journal du .18 (21/10, 14:01:35) : pendant le blocage du sondeur, le
+/// renderer a enchaîné sans coupure sur la piste suivante. Au retour, la
+/// position est celle de la NOUVELLE piste (50 s, pic à 270 s sur l'ancienne),
+/// et le compteur d'octets est celui de l'ancien flux, servi en entier : il ne
+/// peut plus monter. La rafale ne coupe pas ; la position qui avance ensuite
+/// remet la série à zéro.
+#[test]
+fn enchainement_pendant_le_blocage_puis_rafale_ne_coupe_pas_6702() {
+    let mut e = vec![(0, 270_000, 101_411_448)];
+    for i in 0..=40u64 {
+        e.push((52_000 + i * 6, 50_000, 101_411_448));
+    }
+    assert_eq!(faux_renderer_6702(&e), None);
+    let fin = e.last().unwrap().0;
+    for k in 1..=60u64 {
+        e.push((fin + k * 1_000, 50_000 + k * 1_000, 101_411_448));
+    }
+    assert_eq!(faux_renderer_6702(&e), None);
+}
+
+/// Position figée, mais le mandataire sert toujours des octets : aucun arrêt,
+/// même au bout de deux minutes.
+#[test]
+fn position_figee_octets_qui_sortent_aucun_arret_6702() {
+    let e: Vec<_> = (0..=120u64)
+        .map(|k| (k * 1_000, 90_000, 10_000_000 + k * 88_200))
+        .collect();
+    assert_eq!(faux_renderer_6702(&e), None);
+}
+
+/// Position figée, aucun octet, un tour par seconde : la zone vraiment bloquée
+/// reste coupée, au bout de trente secondes réelles.
+#[test]
+fn position_figee_aucun_octet_arret_au_bout_de_trente_secondes_6702() {
+    let e: Vec<_> = (0..=60u64)
+        .map(|k| (k * 1_000, 90_000, 10_000_000))
+        .collect();
+    let coupe = faux_renderer_6702(&e).expect("une zone bloquée doit être coupée");
+    // Série ouverte au tour 1 (t = 1 s) ; trente secondes plus tard : t = 31 s.
+    assert_eq!(e[coupe].0, 31_000);
+    assert!(coupe as u8 >= PLAYING_STALL_THRESHOLD);
+}
+
+/// Un vrai blocage de vingt secondes, puis une rafale : la rafale ne fait pas
+/// gagner de temps, l'arrêt attend les trente secondes réelles.
+#[test]
+fn vrai_blocage_puis_rafale_attend_les_trente_secondes_6702() {
+    let mut e: Vec<_> = (0..=20u64)
+        .map(|k| (k * 1_000, 90_000, 10_000_000))
+        .collect();
+    for i in 1..=40u64 {
+        e.push((20_000 + i * 5, 90_000, 10_000_000));
+    }
+    assert_eq!(faux_renderer_6702(&e), None, "pas avant 30 s réelles");
+    for k in 1..=12u64 {
+        e.push((20_200 + k * 1_000, 90_000, 10_000_000));
+    }
+    let coupe = faux_renderer_6702(&e).expect("bloqué 30 s : coupé");
+    assert!(
+        e[coupe].0 >= 31_000 && e[coupe].0 < 32_500,
+        "{}",
+        e[coupe].0
+    );
+}
+
+/// Une remise à zéro faite ailleurs (`playing_stall_ticks = 0`) date à neuf la
+/// série suivante : l'ancien instant ne sert pas.
+#[test]
+fn remise_a_zero_externe_redate_la_serie_6702() {
+    let t0 = Instant::now();
+    let mut depuis = Some(t0);
+    // Série relancée (ticks == 1) quarante secondes plus tard.
+    let t1 = t0 + Duration::from_secs(40);
+    assert!(!decisions::lecture_sans_progres_etablie(1, &mut depuis, t1));
+    assert_eq!(depuis, Some(t1));
+    // Même avec un compteur déjà au seuil, 1 s après le nouveau départ : non.
+    assert!(!decisions::lecture_sans_progres_etablie(
+        PLAYING_STALL_THRESHOLD,
+        &mut depuis,
+        t1 + Duration::from_secs(1)
+    ));
+    assert!(!decisions::lecture_sans_progres_etablie(0, &mut depuis, t1));
+    assert_eq!(depuis, None);
+}
+
 #[test]
 fn un_demarrage_mort_est_un_echec_dlna_sans_aucun_octet_servi() {
     // Le profil du pipeline Eversolo coincé : DLNA, zéro octet tiré.
@@ -1669,6 +1804,7 @@ fn gapless_stuck_forces_track_end() {
         gapless_stuck_ticks: 0,
         last_bytes_sent: 0,
         playing_stall_ticks: 0,
+        playing_stall_depuis: None,
         depassement_duree_ticks: 0,
         depassement_duree_signale: false,
         stall_declines: 0,
@@ -2012,6 +2148,7 @@ fn gapless_stuck_cleared_on_playing() {
         gapless_stuck_ticks: 3,
         last_bytes_sent: 0,
         playing_stall_ticks: 0,
+        playing_stall_depuis: None,
         depassement_duree_ticks: 0,
         depassement_duree_signale: false,
         stall_declines: 0,

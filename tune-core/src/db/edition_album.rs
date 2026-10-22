@@ -2184,7 +2184,8 @@ pub fn balises_effectives(
 /// Les genres qu'« Écrire dans les fichiers » pose sur une piste (#5314) :
 /// le tableau JSON `tracks.genres` s'il en porte au moins un, sinon la
 /// colonne `tracks.genre`, sinon aucun (la balise du fichier reste).
-fn genres_de_piste(genre: Option<String>, genres_json: Option<String>) -> Vec<String> {
+/// « Graver tags » (`POST /library/write-tags`) prend la même règle (#6635).
+pub fn genres_de_piste(genre: Option<String>, genres_json: Option<String>) -> Vec<String> {
     let tableau: Vec<String> = genres_json
         .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
         .unwrap_or_default()

@@ -97,6 +97,11 @@ pub async fn run_with(opts: RunOptions) {
         std::process::exit(0);
     }
 
+    // #6253 — `--sans-console` (Windows) : relancer sans fenêtre de terminal
+    // et sortir. Avant tout journal, port ou base : c'est le DÉTACHÉ qui les
+    // ouvre. Sans le drapeau, ou hors Windows, rend la main aussitôt.
+    crate::lancement_sans_console::appliquer_au_demarrage();
+
     // #5617 — mode ponctuel « premier accès » de Tune OS : appelé en root par
     // une unité de l'image, HORS du bac à sable de tune.service, il applique la
     // politique du mot de passe du compte `tune` puis sort. Même place que
@@ -388,6 +393,12 @@ pub async fn run_with(opts: RunOptions) {
     // la base se mettait à niveau, en silence (#1701, fil forum 1386).
     let boot_responder = boot_socket.map(crate::boot_status::spawn);
 
+    // #6452 — le témoin de démarrage inachevé, posé AVANT tout ce qui peut
+    // retenir le démarrage, retiré à `listening`. S'il était déjà là, le
+    // démarrage précédent n'est pas allé au bout (fil 2248 : ASIO4ALL, page
+    // d'attente sans fin à chaque lancement qui suit le choix d'ASIO).
+    let demarrage_precedent_inacheve = crate::startup::poser_le_temoin_de_demarrage();
+
     // Appliance : ne jamais démarrer sur une base vide si le disque de
     // données externe est absent (docs/DATA-RELOCATION.md).
     crate::boot_status::set_phase("attente du disque de données");
@@ -400,8 +411,18 @@ pub async fn run_with(opts: RunOptions) {
     crate::dossiers_inscriptibles::verifier_ou_sortir(&config);
 
     crate::boot_status::set_phase("base de données");
+    // Le coffre des clés d'API personnelles (#4805, lot 1) : sa clé maîtresse
+    // vit à côté de la base. Posé AVANT tout service qui lirait une clé.
+    tune_core::coffre::installer_le_dossier_du_serveur(tune_core::coffre::dossier_de_la_base(
+        &config.db_path,
+    ));
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");
+
+    // #5320 — la sonde du processeur est relevée en tâche de fond, une fois
+    // par seconde : l'écran et la garde thermique lisent une médiane, pas la
+    // pointe que provoque la requête qui les interroge.
+    tune_core::audio::thermal::demarrer_l_echantillonnage();
 
     crate::boot_status::set_phase("configuration");
     state.restore_tokens().await;
@@ -417,6 +438,11 @@ pub async fn run_with(opts: RunOptions) {
             crate::routes::service_tokens::amorcer_arl_deezer(&state, arl_env.as_deref()).await;
         });
     }
+
+    // #6452 — le choix de l'hôte est en base : c'est ici, et pas plus tôt,
+    // que le témoin peut décider. AVANT `init_state`, qui lance le
+    // préchauffage ASIO, et avant les sorties audio.
+    crate::startup::appliquer_le_temoin_de_demarrage(&state, demarrage_precedent_inacheve).await;
 
     // Restore zone volumes, persist music_dirs/discogs_token to DB
     crate::startup::init_state(&state, &config).await;
@@ -520,7 +546,16 @@ pub async fn run_with(opts: RunOptions) {
     // Sans effet pour le binaire standard : `RunOptions::default()` n'a aucun
     // fournisseur. C'est l'appel dont la disparition a casse l'integration
     // partenaire pendant deux versions (#1510).
-    crate::discovery_setup::spawn_output_providers(&state, opts.output_providers);
+    // #6542 — Devialet AIR, fournisseur DANS l'arbre, sur le même chemin.
+    // Option expérimentale désactivée par défaut : tant qu'elle l'est, le
+    // fournisseur n'ouvre aucune écoute et ne rend aucune sortie.
+    let mut fournisseurs = opts.output_providers;
+    fournisseurs.push(std::sync::Arc::new(
+        tune_core::outputs::devialet_air::FournisseurDevialetAir::new(
+            tune_core::outputs::devialet_air::ContexteAir::depuis_la_base(state.backend.clone()),
+        ),
+    ));
+    crate::discovery_setup::spawn_output_providers(&state, fournisseurs);
 
     // Background tasks: squeezebox poller, session GC, position poller,
     // token refresh, UPnP advertiser, Deezer proxy, alarms, notifications, memory diag
@@ -545,7 +580,19 @@ pub async fn run_with(opts: RunOptions) {
         fils_de_travail = crate::fils_de_travail::retenu(),
         "tune_server_starting"
     );
+    // #6168 — idempotent : rend ce que le moteur a appliqué, ou l'applique
+    // pour un binaire composeur qui ne passe pas par `construire_le_moteur`.
+    let seuil_mmap = tune_core::memoire_rendue::fixer_le_seuil_mmap();
+    tracing::info!(
+        issue = ?seuil_mmap,
+        detail = %seuil_mmap.libelle(),
+        "glibc_seuil_mmap"
+    );
 
+    // #6452 — les deux dernières étapes avant que le routeur ne serve ont
+    // leur nom : un démarrage resté sur la page d'attente ne laissait voir
+    // que « découverte réseau », qui n'était plus l'étape en cours.
+    crate::boot_status::set_phase("Spotify Connect");
     routes::spotify_connect::auto_start(&state).await;
 
     // Clone before `state` is moved into the router — used to auto-resume local
@@ -559,6 +606,7 @@ pub async fn run_with(opts: RunOptions) {
     // Cloné AVANT que le routeur ne consomme `state` : l'arrêt propre en a
     // besoin pour replier le WAL.
     let shutdown_state = state.clone();
+    crate::boot_status::set_phase("routes");
     let app = routes::router_with_plugins(state, plugin_routers);
 
     // Le routeur est prêt : le répondeur de démarrage rend la socket. `stop()`
@@ -571,6 +619,8 @@ pub async fn run_with(opts: RunOptions) {
     // Listener was bound before the DB was opened (see above) — the socket's
     // backlog has been queueing connections since then.
     info!(%addr, "listening");
+    // #6452 — le démarrage a abouti : le suivant n'a rien à replier.
+    crate::startup::retirer_le_temoin_de_demarrage();
 
     // Dire l'adresse COMPLÈTE, une fois, là où quelqu'un la lit (#1272) :
     // fenêtre de console Windows ouverte par `start-tune-server.bat`,

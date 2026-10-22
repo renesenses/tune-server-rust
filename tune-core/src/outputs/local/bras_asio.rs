@@ -108,6 +108,9 @@ pub(super) struct EntreesAsio {
     pub(super) reaffectation: Arc<super::CreneauReaffectation>,
     /// #6057 — la disposition déclarée par le fichier.
     pub(super) disposition: Arc<super::CreneauDisposition>,
+    /// #6171 — les canaux de la carte que la zone vise, lus une fois par
+    /// piste. `None` : les premiers canaux, comme avant.
+    pub(super) canaux_de_carte: Option<crate::outputs::canaux_de_carte_6171::CanauxDeCarte>,
     pub(super) dop_active: Arc<AtomicBool>,
     /// #5204 — la réserve de `set_next_media`, que la route native consomme
     /// à l'EOF pour enchaîner à format égal, et ce qu'elle publie à la zone
@@ -162,12 +165,12 @@ impl BackendAsio<'_> {
     }
 }
 
-impl<'a> BackendLocal<'a> for BackendAsio<'a> {
-    /// `try_with_asio_device_lock` n'est pas appelé ici : `new` prend le
-    /// verrou de périphérique en BLOQUANT, comme avant — une session qui se
-    /// démonte encore fait attendre la suivante au lieu de la faire échouer.
-    /// Le choix du transport et `build_native_stream` sont dans `new`.
-    fn ouvrir(demande: &DemandeDOuverture<'a>) -> Result<Self, RefusDOuverture> {
+impl<'a> BackendAsio<'a> {
+    /// #6171 — `ouvrir`, avec les canaux de la carte que la zone vise.
+    fn ouvrir_sur_les_canaux(
+        demande: &DemandeDOuverture<'a>,
+        canaux_de_carte: Option<&crate::outputs::canaux_de_carte_6171::CanauxDeCarte>,
+    ) -> Result<Self, RefusDOuverture> {
         let spec = demande.spec;
         let sortie = AsioExclusiveOutput::new(
             demande.device_name,
@@ -177,6 +180,7 @@ impl<'a> BackendLocal<'a> for BackendAsio<'a> {
             demande.starvation.clone(),
             demande.volume.clone(),
             demande.paused.clone(),
+            canaux_de_carte,
         )
         .map_err(|erreur| RefusDOuverture::OuvertureExclusiveRefusee {
             backend: "ASIO",
@@ -191,6 +195,16 @@ impl<'a> BackendLocal<'a> for BackendAsio<'a> {
             force_silent: demande.force_silent.as_ref(),
             position_ms: demande.position_ms,
         })
+    }
+}
+
+impl<'a> BackendLocal<'a> for BackendAsio<'a> {
+    /// `try_with_asio_device_lock` n'est pas appelé ici : `new` prend le
+    /// verrou de périphérique en BLOQUANT, comme avant — une session qui se
+    /// démonte encore fait attendre la suivante au lieu de la faire échouer.
+    /// Le choix du transport et `build_native_stream` sont dans `new`.
+    fn ouvrir(demande: &DemandeDOuverture<'a>) -> Result<Self, RefusDOuverture> {
+        Self::ouvrir_sur_les_canaux(demande, None)
     }
 
     /// Le format négocié par `find_exclusive_config` : la cadence source et
@@ -610,6 +624,7 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
         mono_downmix,
         reaffectation,
         disposition,
+        canaux_de_carte,
         dop_active,
         next_media,
         chain_exhausted,
@@ -640,6 +655,8 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
     );
     let demande = DemandeDOuverture {
         spec,
+        // #6230 — un transport exclusif ouvre au format de la source.
+        voies_de_la_matrice: None,
         device_name: &device_name,
         endpoint_id: None,
         origin_host: None,
@@ -662,7 +679,7 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
     // les deux anneaux naissent dans le backend (D2). Un refus est rapporté
     // par `RefusDOuverture::rapporter` → `record_exclusive_open_failure(
     // "ASIO", …)`, mot pour mot ce qu'on écrivait ici.
-    let mut backend = match BackendAsio::ouvrir(&demande) {
+    let mut backend = match BackendAsio::ouvrir_sur_les_canaux(&demande, canaux_de_carte.as_ref()) {
         Ok(backend) => backend,
         Err(refus) => {
             // #4176 — même règle que le bras WASAPI : un fil périmé ne rapporte
@@ -709,16 +726,26 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
     let mut route = match backend.puits() {
         Puits::Natif(puits) => Route::Native {
             etage: EtageNatifAsio {
+                // #6230 (relecture rc7) — l'étage natif porte désormais les
+                // voies de `sortie`. Le puits, lui, reste étiqueté aux canaux
+                // de la source (`spec_du_puits_natif(self.spec)`) : tant que
+                // l'ouverture ASIO n'est pas pilotée (étape 2), l'étage est
+                // monté aux canaux de la SOURCE, comme la route flottante
+                // ci-dessous. Une ouverture de repli à moins de voies (5.1 sur
+                // un DAC stéréo) ne fait donc pas livrer 2 voies à un puits de
+                // 6 (`windows_native_sink_spec_mismatch`, lecture arrêtée) :
+                // les mots restent ceux d'avant cette PR.
                 etage: EtageNatif::monter(
                     spec,
-                    backend.format_ouvert(),
+                    FormatOuvert::new(backend.format_ouvert().cadence, spec.canaux()),
                     &volume,
                     &eq,
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
                     &mono_downmix,
-                ),
+                )
+                .avec_l_adaptation_des_canaux(&reaffectation, &disposition),
                 recu: Vec::new(),
                 contrat: contrat(),
                 reliquat_force_brut: None,

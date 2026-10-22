@@ -28,7 +28,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use super::etage_natif::{EcritureNative, EtageNatif, PuitsAnneauNatif, mots_natifs_du_bloc};
-use super::{NativePcmRing, native_i32_to_pcm_bytes, prepare_windows_native_pcm};
+use super::{NativePcmRing, native_i32_to_pcm_bytes, prepare_windows_native_pcm_a_voies_egales};
 use crate::outputs::traits::{
     AudioSpec, CaptureOutputNatif, FormatOuvert, ProfondeurPcm, PuitsNatif,
 };
@@ -112,7 +112,7 @@ fn spec_du_puits(source: AudioSpec) -> AudioSpec {
 /// La route d'AVANT, telle que `bras_wasapi.rs` l'appelait à `49ecf1fe` :
 /// `prepare_windows_native_pcm` puis les mots sérialisés en octets.
 fn route_directe_d_avant(dsp: &DspAuRepos, octets: &[u8], bit_depth: u16) -> u64 {
-    let prepared = prepare_windows_native_pcm(
+    let prepared = prepare_windows_native_pcm_a_voies_egales(
         octets,
         bit_depth,
         2,
@@ -124,6 +124,7 @@ fn route_directe_d_avant(dsp: &DspAuRepos, octets: &[u8], bit_depth: u16) -> u64
         &dsp.crossfeed,
         &dsp.pure_bypass,
         &dsp.mono_downmix,
+        None,
     )
     .expect("fenêtre PCM complète");
     let mots: Vec<u8> = prepared

@@ -150,6 +150,9 @@ impl SkinManager {
             }
             return None;
         }
+        if !id_de_theme_sur(skin_id) {
+            return None;
+        }
         let dir = self.skins_dir.join(skin_id);
         if dir.exists() && dir.join("skin.json").exists() {
             Some(dir)
@@ -166,7 +169,7 @@ impl SkinManager {
         let manifest_path = (0..archive.len())
             .filter_map(|i| {
                 let file = archive.by_index(i).ok()?;
-                let name = file.name().to_string();
+                let name = file.name().ok()?.into_owned();
                 if name.ends_with("skin.json") && name.matches('/').count() <= 1 {
                     Some(name)
                 } else {
@@ -192,17 +195,18 @@ impl SkinManager {
                 .map_err(|e| format!("read skin.json: {e}"))?;
             serde_json::from_reader(file).map_err(|e| format!("parse skin.json: {e}"))?
         };
-
-        let target_dir = self.skins_dir.join(&manifest.id);
-        if target_dir.exists() {
-            std::fs::remove_dir_all(&target_dir).map_err(|e| format!("remove old skin: {e}"))?;
+        // L'id nomme le dossier du thème ET un préfixe d'URL (`/{id}`).
+        if !id_de_theme_sur(&manifest.id) {
+            return Err(format!("unsafe skin id in skin.json: {:?}", manifest.id));
         }
-        std::fs::create_dir_all(&target_dir).map_err(|e| format!("create skin dir: {e}"))?;
 
-        // Extract files
+        // Plan d'extraction, établi AVANT de toucher au disque : chaque chemin
+        // reste sous le dossier du thème. Seuls les dossiers et les fichiers
+        // ordinaires sont repris — ni lien symbolique, ni droits de l'archive.
+        let mut plan: Vec<(usize, PathBuf, bool)> = Vec::new();
         for i in 0..archive.len() {
-            let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-            let name = file.name().to_string();
+            let file = archive.by_index(i).map_err(|e| e.to_string())?;
+            let name = file.name().map_err(|e| e.to_string())?.into_owned();
 
             let relative = if prefix.is_empty() {
                 name.clone()
@@ -215,18 +219,41 @@ impl SkinManager {
             if relative.is_empty() {
                 continue;
             }
+            if !file.is_dir() && !file.is_file() {
+                continue;
+            }
+            let relative_path = Path::new(&relative);
+            if !relative_path.components().all(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            }) {
+                return Err(format!("unsafe path in archive: {name:?}"));
+            }
+            plan.push((i, relative_path.to_path_buf(), file.is_dir()));
+        }
 
+        let target_dir = self.skins_dir.join(&manifest.id);
+        if target_dir.exists() {
+            std::fs::remove_dir_all(&target_dir).map_err(|e| format!("remove old skin: {e}"))?;
+        }
+        std::fs::create_dir_all(&target_dir).map_err(|e| format!("create skin dir: {e}"))?;
+
+        // Extract files
+        for (i, relative, is_dir) in plan {
             let out_path = target_dir.join(&relative);
-            if file.is_dir() {
+            if is_dir {
                 std::fs::create_dir_all(&out_path).ok();
             } else {
+                let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
                 if let Some(parent) = out_path.parent() {
                     std::fs::create_dir_all(parent).ok();
                 }
                 let mut out_file = std::fs::File::create(&out_path)
-                    .map_err(|e| format!("create {relative}: {e}"))?;
+                    .map_err(|e| format!("create {}: {e}", relative.display()))?;
                 std::io::copy(&mut file, &mut out_file)
-                    .map_err(|e| format!("write {relative}: {e}"))?;
+                    .map_err(|e| format!("write {}: {e}", relative.display()))?;
             }
         }
 
@@ -237,6 +264,9 @@ impl SkinManager {
     pub fn uninstall(&self, skin_id: &str) -> Result<(), String> {
         if skin_id == "default" {
             return Err("cannot uninstall the default skin".into());
+        }
+        if !id_de_theme_sur(skin_id) {
+            return Err(format!("skin '{skin_id}' not found"));
         }
         let dir = self.skins_dir.join(skin_id);
         if !dir.exists() {
@@ -258,6 +288,17 @@ impl SkinManager {
     }
 }
 
+/// Un id de thème devient un nom de dossier sous `skins_dir` et un préfixe
+/// d'URL : une seule composante, sans séparateur ni `.`/`..`.
+fn id_de_theme_sur(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 fn dir_size(path: &Path) -> u64 {
     walkdir::WalkDir::new(path)
         .into_iter()
@@ -266,4 +307,121 @@ fn dir_size(path: &Path) -> u64 {
         .filter(|m| m.is_file())
         .map(|m| m.len())
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SkinManager;
+    use std::io::Write;
+
+    fn manifeste(id: &str) -> Vec<u8> {
+        serde_json::json!({ "id": id, "name": "Essai", "version": "1.0.0" })
+            .to_string()
+            .into_bytes()
+    }
+
+    /// Une archive de thème : (nom, contenu, droits unix éventuels), plus des
+    /// liens symboliques (nom, cible).
+    fn archive(fichiers: &[(&str, &[u8], Option<u32>)], liens: &[(&str, &str)]) -> Vec<u8> {
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (nom, contenu, droits) in fichiers {
+            let mut o = zip::write::SimpleFileOptions::default();
+            if let Some(d) = droits {
+                o = o.unix_permissions(*d);
+            }
+            z.start_file(*nom, o).unwrap();
+            z.write_all(contenu).unwrap();
+        }
+        for (nom, cible) in liens {
+            z.add_symlink(*nom, *cible, zip::write::SimpleFileOptions::default())
+                .unwrap();
+        }
+        z.finish().unwrap().into_inner()
+    }
+
+    fn gestionnaire(racine: &std::path::Path) -> SkinManager {
+        let skins = racine.join("skins");
+        std::fs::create_dir_all(&skins).unwrap();
+        SkinManager::new(skins, racine.join("web"))
+    }
+
+    #[test]
+    fn un_chemin_qui_remonte_hors_du_theme_est_refuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = gestionnaire(tmp.path());
+        let data = archive(
+            &[
+                ("theme/skin.json", &manifeste("essai"), None),
+                ("theme/../../evade.txt", b"x", None),
+                ("theme/../voisin/evade.txt", b"x", None),
+            ],
+            &[],
+        );
+        let err = m.install_from_zip(&data).unwrap_err();
+        assert!(err.contains("unsafe path"), "{err}");
+        assert!(!tmp.path().join("evade.txt").exists());
+        assert!(!tmp.path().join("skins/voisin").exists());
+        assert!(!tmp.path().join("skins/essai").exists());
+    }
+
+    #[test]
+    fn un_id_de_theme_qui_traverse_est_refuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = gestionnaire(tmp.path());
+        let temoin = tmp.path().join("victime");
+        std::fs::create_dir_all(&temoin).unwrap();
+        std::fs::write(temoin.join("garde.txt"), b"garde").unwrap();
+        let data = archive(
+            &[
+                ("skin.json", &manifeste("../victime"), None),
+                ("index.html", b"<p>", None),
+            ],
+            &[],
+        );
+        let err = m.install_from_zip(&data).unwrap_err();
+        assert!(err.contains("unsafe skin id"), "{err}");
+        assert!(
+            temoin.join("garde.txt").exists(),
+            "le dossier voisin a été vidé"
+        );
+        assert!(!temoin.join("index.html").exists());
+        // Et la désinstallation ne sort pas davantage du dossier des thèmes.
+        assert!(m.uninstall("../victime").is_err());
+        assert!(temoin.join("garde.txt").exists());
+        assert!(m.skin_dir("../victime").is_none());
+    }
+
+    #[test]
+    fn ni_lien_symbolique_ni_bit_suid_ne_sont_restaures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = gestionnaire(tmp.path());
+        let data = archive(
+            &[
+                ("skin.json", &manifeste("essai"), None),
+                ("index.html", b"<p>", None),
+                ("outil.sh", b"#!/bin/sh\n", Some(0o6755)),
+            ],
+            &[("sortie", "../../.."), ("absolu", "/etc")],
+        );
+        let manifest = m.install_from_zip(&data).unwrap();
+        assert_eq!(manifest.id, "essai");
+        let dossier = tmp.path().join("skins/essai");
+        assert!(dossier.join("index.html").is_file());
+        for lien in ["sortie", "absolu"] {
+            let meta = std::fs::symlink_metadata(dossier.join(lien));
+            assert!(
+                meta.map(|m| !m.file_type().is_symlink()).unwrap_or(true),
+                "lien symbolique {lien} restauré"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dossier.join("outil.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o7000, 0, "bits spéciaux restaurés : {mode:o}");
+        }
+    }
 }

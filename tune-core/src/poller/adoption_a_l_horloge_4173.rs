@@ -109,6 +109,9 @@ struct Banc {
     playback: Arc<PlaybackManager>,
     outputs: Arc<Mutex<OutputRegistry>>,
     zone_id: i64,
+    /// L'appareil de la zone : [`APPAREIL`] sauf banc qui apprend une règle
+    /// de compatibilité (#6477), qui doit garder la sienne pour lui.
+    appareil: String,
     /// Le flux de la piste qui joue (piste 1), comme `play()` l'aurait posé.
     flux_finie: String,
     _fichiers: Vec<tempfile::NamedTempFile>,
@@ -119,13 +122,18 @@ struct Banc {
 impl Banc {
     /// Zone DLNA en lecture de `FINIE`, file `[FINIE, ARMEE, SUIVANTE]`.
     async fn monter() -> Self {
+        Self::monter_sur(APPAREIL).await
+    }
+
+    /// Même banc, sur un autre appareil.
+    async fn monter_sur(appareil: &str) -> Self {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         run_migrations(&db).unwrap();
         let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
 
         let zone_id = ZoneRepo::with_backend(db.clone())
-            .create("A6", Some("dlna"), Some(APPAREIL))
+            .create("A6", Some("dlna"), Some(appareil))
             .unwrap();
 
         let depot = TrackRepo::with_backend(db.clone());
@@ -158,7 +166,7 @@ impl Banc {
 
         let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
         outputs.lock().await.register(Box::new(
-            MockOutput::new(APPAREIL, "DMP-A6").with_type("dlna"),
+            MockOutput::new(appareil, "DMP-A6").with_type("dlna"),
         ));
         let playback = Arc::new(PlaybackManager::new());
         let streamer = Arc::new(AudioStreamer::new(0));
@@ -223,6 +231,7 @@ impl Banc {
             playback,
             outputs,
             zone_id,
+            appareil: appareil.to_string(),
             flux_finie,
             _fichiers: fichiers,
             poll_states,
@@ -233,7 +242,7 @@ impl Banc {
     /// Les titres partis au renderer par `SetNextAVTransportURI`.
     async fn armees(&self) -> Vec<String> {
         let reg = self.outputs.lock().await;
-        let arc = reg.get(APPAREIL).unwrap();
+        let arc = reg.get(&self.appareil).unwrap();
         let sortie = arc.lock().await;
         let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
         mock.set_next_titles().await
@@ -242,7 +251,7 @@ impl Banc {
     /// L'URL armée chez le renderer.
     async fn url_armee(&self) -> Option<String> {
         let reg = self.outputs.lock().await;
-        let arc = reg.get(APPAREIL).unwrap();
+        let arc = reg.get(&self.appareil).unwrap();
         let sortie = arc.lock().await;
         let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
         mock.next_uri().await
@@ -251,7 +260,7 @@ impl Banc {
     /// Ce que le renderer rapporte jouer (`TrackURI`).
     async fn le_renderer_rapporte(&self, uri: Option<String>) {
         let reg = self.outputs.lock().await;
-        let arc = reg.get(APPAREIL).unwrap();
+        let arc = reg.get(&self.appareil).unwrap();
         let sortie = arc.lock().await;
         let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
         mock.set_current_uri(uri).await;
@@ -260,7 +269,7 @@ impl Banc {
     /// Le renderer passe en pause (geste de l'utilisateur relayé).
     async fn le_renderer_en_pause(&self) {
         let reg = self.outputs.lock().await;
-        let arc = reg.get(APPAREIL).unwrap();
+        let arc = reg.get(&self.appareil).unwrap();
         let sortie = arc.lock().await;
         let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
         mock.set_state(crate::outputs::traits::TransportState::Paused)
@@ -271,7 +280,7 @@ impl Banc {
     /// produit AUCUN : dès qu'il y en a un, il y a eu un blanc.
     async fn play_complets(&self) -> Vec<String> {
         let reg = self.outputs.lock().await;
-        let arc = reg.get(APPAREIL).unwrap();
+        let arc = reg.get(&self.appareil).unwrap();
         let sortie = arc.lock().await;
         let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
         mock.play_titles().await
@@ -283,7 +292,7 @@ impl Banc {
     async fn renderer_a(&mut self, position_ms: u64, horloge_secs: u64) {
         {
             let reg = self.outputs.lock().await;
-            let arc = reg.get(APPAREIL).unwrap();
+            let arc = reg.get(&self.appareil).unwrap();
             let sortie = arc.lock().await;
             let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
             mock.set_state(crate::outputs::traits::TransportState::Playing)
@@ -728,3 +737,8 @@ mod gapless_verifie_3967;
 // suivante prête trop tard part par `Play`, jamais en `SetNext`.
 #[cfg(test)]
 mod preparation_bornee_5970;
+
+/// #6477 (FiiO K17, fil 2323) — un renderer qui lâche la piste en cours dès
+/// le `SetNext` : la règle s'apprend, et la piste suivante part sans `SetNext`.
+#[cfg(test)]
+mod set_next_coupe_la_piste_6477;

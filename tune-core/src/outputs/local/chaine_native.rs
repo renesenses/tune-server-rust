@@ -255,8 +255,14 @@ pub(super) trait FrontiereExclusive {
     /// Le format de la piste courante (celle qui se termine).
     fn spec_courante(&self) -> AudioSpec;
     /// À format égal, prépare l'étage pour la suivante (rien n'est écrit au
-    /// puits) ; sinon `Err(Rouvrir)` et l'étage n'est pas touché.
-    fn enchainer_a_format_egal(&mut self, suivante: AudioSpec) -> Result<(), EnchainementNatif>;
+    /// puits) ; sinon `Err(Rouvrir)` et l'étage n'est pas touché. `amorce` :
+    /// le début du PCM de la suivante, qui décide des voies qu'elle ouvrirait
+    /// quand une grille de réaffectation les pilote (#6230).
+    fn enchainer_a_format_egal(
+        &mut self,
+        suivante: AudioSpec,
+        amorce: &[u8],
+    ) -> Result<(), EnchainementNatif>;
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -265,8 +271,12 @@ impl FrontiereExclusive for EtageNatif<'_> {
         self.spec()
     }
 
-    fn enchainer_a_format_egal(&mut self, suivante: AudioSpec) -> Result<(), EnchainementNatif> {
-        self.enchainer_la_piste(suivante)
+    fn enchainer_a_format_egal(
+        &mut self,
+        suivante: AudioSpec,
+        amorce: &[u8],
+    ) -> Result<(), EnchainementNatif> {
+        self.enchainer_la_piste(suivante, amorce)
     }
 }
 
@@ -293,7 +303,10 @@ pub(super) fn accepter_la_suivante<R: ReserveDeLaChaine, F: FrontiereExclusive +
         Suivante::Refusee => return Err(FinDeChaine::SuivanteRefusee),
         Suivante::Prete { lecteur, entete } => (lecteur, entete),
     };
-    if etage.enchainer_a_format_egal(entete.spec).is_err() {
+    if etage
+        .enchainer_a_format_egal(entete.spec, entete.amorce())
+        .is_err()
+    {
         let courante = etage.spec_courante();
         info!(
             prev_sr = courante.cadence(),

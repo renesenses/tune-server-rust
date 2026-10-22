@@ -46,6 +46,11 @@ use crate::outputs::traits::PuitsNatif;
 pub(super) struct DemandeDOuverture<'a> {
     /// Le format de la SOURCE (R5) : cadence, profondeur, canaux.
     pub(super) spec: AudioSpec,
+    /// #6230 — les voies que la matrice de réaffectation armée demande
+    /// ([`CreneauReaffectation::voies_a_demander`]). Seul le chemin cpal
+    /// partagé les lit : il les tente d'abord, puis retombe sur sa cascade
+    /// ordinaire. Les transports exclusifs ouvrent au format de la source.
+    pub(super) voies_de_la_matrice: Option<u16>,
     pub(super) device_name: &'a str,
     /// Identifiant d'endpoint réglé sur la zone (WASAPI, ALSA `hw:…`).
     pub(super) endpoint_id: Option<&'a str>,
@@ -720,27 +725,62 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                 )
             };
 
-        let ring_cap = (output_config.sample_rate as usize) * (output_config.channels as usize) * 2;
-        starvation.begin_stream(output_config.sample_rate, output_config.channels);
-        let ring_buf = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
-        ring_buf.clear(); // Defensive: zero-fill before callback can read
-        // Minimum buffer: ~200ms of audio before the callback starts reading.
-        // sr * ch / 5 = 200ms of interleaved samples.
-        // #3208 — compté en PÉRIODES dès qu'une période est imposée ; sinon ce
-        // compte-ci, au sample près.
-        let min_buffer_ms =
-            (output_config.sample_rate as usize) * (output_config.channels as usize) / 5;
-        let min_buffer = garde_de_prechargement(&output_config, min_buffer_ms);
-        let stream_result = build_stream(
-            &output_config,
-            ring_buf.clone(),
-            volume.clone(),
-            paused.clone(),
-            silent_cb_outer.clone(),
-            data_started_shared.clone(),
-            min_buffer,
-            soft_mute.clone(),
-        );
+        // #6230 — une matrice de réaffectation armée qui change le nombre de
+        // voies (grille 6 → 2) les demande d'abord, à la cadence retenue. Un
+        // refus n'arrête rien : la cascade ordinaire reprend telle qu'avant,
+        // et le chemin du signal dira que la matrice n'est pas appliquée.
+        let config_de_la_matrice = demande
+            .voies_de_la_matrice
+            .filter(|&voies| voies != output_config.channels)
+            .map(|voies| cpal::StreamConfig {
+                channels: voies,
+                ..output_config.clone()
+            });
+        let ouvrir_a = |cfg: &cpal::StreamConfig| {
+            let ring_cap = (cfg.sample_rate as usize) * (cfg.channels as usize) * 2;
+            starvation.begin_stream(cfg.sample_rate, cfg.channels);
+            let ring_buf = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
+            ring_buf.clear(); // Defensive: zero-fill before callback can read
+            data_started_shared.store(false, Ordering::SeqCst);
+            // Minimum buffer: ~200ms of audio before the callback starts reading.
+            // sr * ch / 5 = 200ms of interleaved samples.
+            // #3208 — compté en PÉRIODES dès qu'une période est imposée ; sinon ce
+            // compte-ci, au sample près.
+            let min_buffer_ms = (cfg.sample_rate as usize) * (cfg.channels as usize) / 5;
+            let min_buffer = garde_de_prechargement(cfg, min_buffer_ms);
+            let stream_result = build_stream(
+                cfg,
+                ring_buf.clone(),
+                volume.clone(),
+                paused.clone(),
+                silent_cb_outer.clone(),
+                data_started_shared.clone(),
+                min_buffer,
+                soft_mute.clone(),
+            );
+            (stream_result, ring_buf)
+        };
+        let par_la_matrice = config_de_la_matrice
+            .as_ref()
+            .and_then(|cfg| match ouvrir_a(cfg) {
+                (Ok(s), ring) => Some((s, cfg.clone(), ring)),
+                (Err(e), _) => {
+                    info!(
+                        device = %device_name,
+                        voies = cfg.channels,
+                        error = %e,
+                        "local_reaffectation_voies_refusees_en_flottant"
+                    );
+                    None
+                }
+            });
+        let (stream_result, output_config, ring_buf) = match par_la_matrice {
+            Some((s, cfg, ring)) => (Ok(s), cfg, ring),
+            None => {
+                let (stream_result, ring_buf) = ouvrir_a(&output_config);
+                (stream_result, output_config, ring_buf)
+            }
+        };
 
         let (stream, actual_config, ring) = match stream_result {
             Ok(s) => (s, output_config, ring_buf),
@@ -779,7 +819,11 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                         // float (bit-perfect integer-only DAC). Cascade integer
                         // formats — i32 then i16 — at the chosen rate, then the
                         // source rate. First one the device accepts wins.
-                        let mut candidates: Vec<cpal::StreamConfig> = vec![output_config.clone()];
+                        // #6230 — les voies de la matrice d'abord, en entier
+                        // aussi : un DAC bit-perfect refuse le flottant.
+                        let mut candidates: Vec<cpal::StreamConfig> =
+                            config_de_la_matrice.iter().cloned().collect();
+                        candidates.push(output_config.clone());
                         if source_cfg.sample_rate != output_config.sample_rate
                             || source_cfg.channels != output_config.channels
                         {

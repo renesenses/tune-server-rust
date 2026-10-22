@@ -160,6 +160,10 @@ pub struct TidalService {
     /// Racine de l'API, déplacée par les seuls témoins vers un serveur factice
     /// (#4803). `None` partout ailleurs : [`API_BASE`].
     base_forcee: Option<String>,
+    /// #6336 — racine OAuth (code d'appareil, jetons), déplacée par les seuls
+    /// bancs d'essai vers un serveur factice. `None` partout ailleurs :
+    /// [`AUTH_BASE`].
+    auth_forcee: Option<String>,
 }
 
 impl Default for TidalService {
@@ -192,7 +196,29 @@ impl TidalService {
             featured_cache: std::sync::Mutex::new(None),
             enabled_override: None,
             base_forcee: None,
+            auth_forcee: None,
         }
+    }
+
+    /// #6336 — un service dont l'API et l'OAuth sont `api` et `auth`, pour
+    /// éprouver la connexion par le vrai routeur sans joindre TIDAL. Réservé
+    /// aux bancs d'essai : aucun binaire publié ne le compile.
+    #[cfg(any(test, feature = "services-factices"))]
+    pub fn avec_bases_de_test(api: String, auth: String) -> Self {
+        let mut svc = Self::new();
+        svc.base_forcee = Some(api);
+        svc.auth_forcee = Some(auth);
+        svc
+    }
+
+    /// Racine de l'API : [`API_BASE`], sauf dans un banc d'essai.
+    fn api_base(&self) -> &str {
+        self.base_forcee.as_deref().unwrap_or(API_BASE)
+    }
+
+    /// Racine OAuth : [`AUTH_BASE`], sauf dans un banc d'essai.
+    fn auth_base(&self) -> &str {
+        self.auth_forcee.as_deref().unwrap_or(AUTH_BASE)
     }
 
     /// Download all DASH segments (init + media) and concatenate them into a
@@ -486,7 +512,7 @@ impl TidalService {
     ) -> Result<TokenResponse, String> {
         let resp = self
             .client
-            .post(format!("{AUTH_BASE}/token"))
+            .post(format!("{}/token", self.auth_base()))
             .form(&[
                 ("client_id", CLIENT_ID),
                 ("client_secret", CLIENT_SECRET),
@@ -592,7 +618,7 @@ impl TidalService {
 
         let resp = self
             .client
-            .post(format!("{AUTH_BASE}/token"))
+            .post(format!("{}/token", self.auth_base()))
             .form(&[
                 ("client_id", CLIENT_ID),
                 ("client_secret", CLIENT_SECRET),
@@ -740,7 +766,7 @@ impl TidalService {
 
     async fn api_get(&self, path: &str) -> Result<serde_json::Value, String> {
         let token = self.get_access_token().await?;
-        let base = self.base_forcee.as_deref().unwrap_or(API_BASE);
+        let base = self.api_base();
         let url = format!("{base}{path}");
         let resp = self
             .client
@@ -964,7 +990,10 @@ impl TidalService {
         quality: &str,
     ) -> Result<serde_json::Value, String> {
         let token = self.get_access_token().await?;
-        let url = format!("{API_BASE}/tracks/{track_id}/playbackinfopostpaywall");
+        let url = format!(
+            "{}/tracks/{track_id}/playbackinfopostpaywall",
+            self.api_base()
+        );
         let params = [
             ("audioquality", quality),
             ("playbackmode", "STREAM"),
@@ -1196,7 +1225,7 @@ impl TidalService {
     /// quoi le deuxième lot d'une playlist de plus de 100 titres échouerait.
     async fn etiquette_playlist(&self, playlist_id: &str) -> Result<String, String> {
         let token = self.get_access_token().await?;
-        let url = format!("{API_BASE}/playlists/{playlist_id}");
+        let url = format!("{}/playlists/{playlist_id}", self.api_base());
         let resp = self
             .client
             .get(&url)
@@ -1225,7 +1254,7 @@ impl TidalService {
         etiquette: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         let token = self.get_access_token().await?;
-        let url = format!("{API_BASE}{path}");
+        let url = format!("{}{path}", self.api_base());
         let poser = |req: reqwest::RequestBuilder| match etiquette {
             Some(e) => req.header(reqwest::header::IF_NONE_MATCH, e),
             None => req,
@@ -1274,7 +1303,7 @@ impl TidalService {
 
     async fn api_delete(&self, path: &str) -> Result<(), String> {
         let token = self.get_access_token().await?;
-        let url = format!("{API_BASE}{path}");
+        let url = format!("{}{path}", self.api_base());
         let resp = self
             .client
             .delete(&url)
@@ -1334,6 +1363,7 @@ impl TidalService {
                 }),
             track_count: item["numberOfTracks"].as_u64().unwrap_or(0) as u32,
             owner: item["creator"]["name"].as_str().map(Into::into),
+            editable: None,
             covers: Vec::new(),
         }
     }
@@ -1519,7 +1549,7 @@ impl StreamingService for TidalService {
         if credentials.get("device_flow").and_then(|v| v.as_bool()) == Some(true) {
             let resp = self
                 .client
-                .post(format!("{AUTH_BASE}/device_authorization"))
+                .post(format!("{}/device_authorization", self.auth_base()))
                 .form(&[("client_id", CLIENT_ID), ("scope", "r_usr w_usr w_sub")])
                 .send()
                 .await
@@ -1581,7 +1611,7 @@ impl StreamingService for TidalService {
 
                 let resp = self
                     .client
-                    .post(format!("{AUTH_BASE}/token"))
+                    .post(format!("{}/token", self.auth_base()))
                     .form(&[
                         ("client_id", CLIENT_ID),
                         ("client_secret", CLIENT_SECRET),
@@ -1823,6 +1853,15 @@ impl StreamingService for TidalService {
         let mut data = None;
         let mut downgraded_fallback: Option<serde_json::Value> = None;
         for &q in fallback_chain {
+            // #6334 — un repli déjà en main vaut au moins cette marche : la
+            // demander rendrait au mieux la même chose, et une réponse
+            // « exacte » à une marche plus basse (`HIGH` → `HIGH`) l'emportait
+            // sur le FLAC reçu plus tôt.
+            if downgraded_fallback.as_ref().is_some_and(|fb| {
+                quality_rank(fb["audioQuality"].as_str().unwrap_or("")) >= quality_rank(q)
+            }) {
+                break;
+            }
             match self.fetch_playback_info(track_id, q).await {
                 Ok(d) => {
                     let has_manifest = d["manifest"].as_str().is_some();
@@ -1840,7 +1879,11 @@ impl StreamingService for TidalService {
                     // Check if Tidal actually returned the requested quality or
                     // downgraded silently (e.g. HI_RES_LOSSLESS → HIGH AAC).
                     let returned_quality = d["audioQuality"].as_str().unwrap_or("UNKNOWN");
-                    let returned_codec = d["codec"].as_str().unwrap_or("UNKNOWN");
+                    // #6334 — `codec` n'existe pas à la racine de la réponse
+                    // v1 : le lire rendait toujours `UNKNOWN`. Le codec est
+                    // celui que nomme le manifeste.
+                    let returned_codec = codec_annonce_par_le_manifeste(&d);
+                    let returned_codec = returned_codec.as_deref().unwrap_or("UNKNOWN");
                     let manifest_mime = d["manifestMimeType"].as_str().unwrap_or("");
                     let bit_depth = d["bitDepth"].as_u64();
                     let sample_rate = d["sampleRate"].as_u64();
@@ -1894,9 +1937,7 @@ impl StreamingService for TidalService {
                             returned = returned_quality,
                             "tidal_quality_downgraded_but_lossless"
                         );
-                        if downgraded_fallback.is_none() {
-                            downgraded_fallback = Some(d);
-                        }
+                        garder_le_meilleur_repli(&mut downgraded_fallback, d);
                     } else {
                         // Got HIGH/LOW (lossy) — save only if nothing better found
                         warn!(
@@ -1906,9 +1947,7 @@ impl StreamingService for TidalService {
                             subscription = ?self.subscription,
                             "tidal_quality_downgraded_to_lossy"
                         );
-                        if downgraded_fallback.is_none() {
-                            downgraded_fallback = Some(d);
-                        }
+                        garder_le_meilleur_repli(&mut downgraded_fallback, d);
                     }
                 }
                 Err(e) => {
@@ -1948,7 +1987,7 @@ impl StreamingService for TidalService {
                 .map_err(|e| format!("utf8: {e}"))?;
 
         // Parse the manifest to get URL + optional codec/mime from the manifest itself
-        let (url, dash_codec, dash_mime) = if manifest_mime == "application/dash+xml" {
+        let (url, man_codec, man_mime) = if manifest_mime == "application/dash+xml" {
             // Log raw manifest content for debugging Hi-Res issues
             debug!(
                 track_id,
@@ -2011,17 +2050,23 @@ impl StreamingService for TidalService {
                 .and_then(|u| u.as_str())
                 .ok_or("no url in manifest")?
                 .to_string();
-            (url, None, None)
+            // #6334 — le manifeste BTS nomme lui-même ce qu'il livre
+            // (`codecs` : `flac`, `mp4a.40.2` ; `mimeType` : `audio/flac`,
+            // `audio/mp4`). Les ignorer faisait déduire le codec de la seule
+            // `audioQuality`, et annoncer `application/vnd.tidal.bts` — le
+            // type du MANIFESTE — comme MIME du flux audio.
+            let (codecs, mime) = codec_et_mime_du_manifeste_bts(&manifest_json);
+            (url, codecs, mime)
         } else {
             (decoded, None, None)
         };
 
         let audio_quality = data["audioQuality"].as_str().unwrap_or("LOSSLESS");
-        let (sample_rate, bit_depth) = Self::parse_quality_metadata(&data, audio_quality);
 
-        // Determine codec: prefer DASH manifest codec, then fall back to audio quality level.
-        // DASH codecs: "flac" → FLAC, "mp4a.40.2" → AAC, "mp4a.40.5" → AAC HE
-        let codec = if let Some(ref dc) = dash_codec {
+        // Determine codec: prefer the manifest's own codec (DASH or BTS), then
+        // fall back to audio quality level.
+        // Manifest codecs: "flac" → FLAC, "mp4a.40.2" → AAC, "mp4a.40.5" → AAC HE
+        let codec = if let Some(ref dc) = man_codec {
             let dc_lower = dc.to_lowercase();
             if dc_lower == "flac" || dc_lower.starts_with("fla") {
                 "FLAC"
@@ -2030,14 +2075,14 @@ impl StreamingService for TidalService {
             } else if dc_lower.starts_with("mqa") {
                 "FLAC" // MQA is delivered as FLAC container
             } else {
-                // Unknown DASH codec — fall back to quality-based detection
+                // Unknown manifest codec — fall back to quality-based detection
                 match audio_quality {
                     "HI_RES_LOSSLESS" | "HI_RES" | "LOSSLESS" => "FLAC",
                     _ => "AAC",
                 }
             }
         } else {
-            // No DASH codec info — determine from audio quality level:
+            // No manifest codec info — determine from audio quality level:
             // HI_RES_LOSSLESS = FLAC Hi-Res, HI_RES = MQA/FLAC, LOSSLESS = FLAC CD
             // Only HIGH and below are AAC
             match audio_quality {
@@ -2046,7 +2091,25 @@ impl StreamingService for TidalService {
             }
         };
 
-        // Determine MIME type: prefer DASH manifest, then derive from codec.
+        // #6334 — un AAC n'a pas de profondeur de bits : 0, jamais le 16 d'un
+        // FLAC CD (`parse_quality_metadata` retombait sur `(44100, 16)` faute
+        // de `bitDepth`). La cadence reste celle que Tidal annonce, sinon
+        // 44,1 kHz, celle de ses AAC.
+        let (sample_rate, bit_depth) = if codec == "AAC" {
+            (
+                data["sampleRate"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(44_100),
+                0,
+            )
+        } else {
+            Self::parse_quality_metadata(&data, audio_quality)
+        };
+
+        // Determine MIME type: prefer the manifest (DASH or BTS), then derive
+        // from codec.
         // For DASH multi-segment downloads (file:// URLs), the file on disk is
         // an fMP4 container — report audio/mp4 so symphonia uses IsoMp4Reader.
         let is_dash_file = url.starts_with("file://");
@@ -2056,7 +2119,7 @@ impl StreamingService for TidalService {
         } else if codec == "FLAC" {
             // DASH might report "audio/flac" or "audio/mp4" for FLAC-in-fMP4 container.
             // For playback, report what the actual codec is.
-            if let Some(ref dm) = dash_mime {
+            if let Some(ref dm) = man_mime {
                 if dm == "audio/flac" || dm == "audio/mp4" {
                     dm.as_str()
                 } else {
@@ -2065,9 +2128,11 @@ impl StreamingService for TidalService {
             } else {
                 "audio/flac"
             }
-        } else if let Some(ref dm) = dash_mime {
+        } else if let Some(ref dm) = man_mime {
             dm.as_str()
-        } else if !manifest_mime.is_empty() && manifest_mime != "application/dash+xml" {
+        } else if manifest_mime.starts_with("audio/") {
+            // #6334 — jamais `application/vnd.tidal.bts` : c'est le type du
+            // manifeste, pas celui des octets audio.
             manifest_mime
         } else {
             "audio/mp4"
@@ -2078,7 +2143,7 @@ impl StreamingService for TidalService {
                 .as_u64()
                 .map(|_| sample_rate * (bit_depth as u32) * 2)
         } else {
-            Some(320_000) // AAC HIGH = 320kbps
+            debit_aac_de_tidal(audio_quality)
         };
 
         // Cache all URLs including file:// from DASH — prevents double-download
@@ -2615,6 +2680,55 @@ impl StreamingService for TidalService {
 }
 
 /// Rank audio quality levels for comparison. Higher = better.
+/// #6334 — le débit d'un AAC Tidal, tel que l'API le définit pour sa
+/// qualité : `HIGH` = 320 kbit/s, `LOW` = 96 kbit/s. Rien pour un AAC rendu
+/// sous une autre étiquette : un chiffre inventé n'est pas un débit nommé.
+fn debit_aac_de_tidal(audio_quality: &str) -> Option<u32> {
+    match audio_quality {
+        "HIGH" => Some(320_000),
+        "LOW" => Some(96_000),
+        _ => None,
+    }
+}
+
+/// #6334 — `codecs` et `mimeType` d'un manifeste BTS déjà décodé.
+fn codec_et_mime_du_manifeste_bts(
+    manifeste: &serde_json::Value,
+) -> (Option<String>, Option<String>) {
+    let champ = |cle: &str| {
+        manifeste[cle]
+            .as_str()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+    };
+    (champ("codecs"), champ("mimeType"))
+}
+
+/// #6334 — le codec que nomme le manifeste d'une réponse `playbackinfo`
+/// (BTS ou DASH), pour le journal de la cascade. `None` s'il n'en nomme pas.
+fn codec_annonce_par_le_manifeste(reponse: &serde_json::Value) -> Option<String> {
+    let brut = base64_decode(reponse["manifest"].as_str()?).ok()?;
+    let texte = String::from_utf8(brut).ok()?;
+    if reponse["manifestMimeType"].as_str() == Some("application/dash+xml") {
+        parse_dash_manifest(&texte)?.codec
+    } else {
+        codec_et_mime_du_manifeste_bts(&serde_json::from_str(&texte).ok()?).0
+    }
+}
+
+/// #6334 — garde, parmi les réponses dégradées de la cascade, celle de la
+/// MEILLEURE qualité rendue, et non la première. `HI_RES_LOSSLESS` peut
+/// revenir en `HIGH`, puis `HI_RES` en `LOSSLESS` : si la marche suivante
+/// échoue (429, délai, réponse sans manifeste), c'est le FLAC qu'il faut
+/// servir, pas l'AAC reçu en premier. À rang égal, la première reste.
+fn garder_le_meilleur_repli(repli: &mut Option<serde_json::Value>, candidat: serde_json::Value) {
+    let rang = |d: &serde_json::Value| quality_rank(d["audioQuality"].as_str().unwrap_or(""));
+    if repli.as_ref().is_none_or(|r| rang(&candidat) > rang(r)) {
+        *repli = Some(candidat);
+    }
+}
+
 fn quality_rank(quality: &str) -> u8 {
     match quality {
         "HI_RES_LOSSLESS" => 4,
@@ -4563,3 +4677,23 @@ mod pagination_recherche_i4803 {
         );
     }
 }
+
+/// Témoins seulement : un service pointé sur un faux Tidal en boucle locale,
+/// armé d'un jeton d'essai. Aucun identifiant ni jeton réel.
+#[cfg(test)]
+impl TidalService {
+    pub(crate) fn pour_un_faux_tidal(base: String) -> Self {
+        let mut svc = Self::new();
+        svc.base_forcee = Some(base);
+        svc.tokens = Mutex::new(TokenState {
+            access_token: Some("jeton-essai".into()),
+            refresh_token: None,
+            token_expires: None,
+        });
+        svc
+    }
+}
+
+#[cfg(test)]
+#[path = "tidal_qualite_livree_6334_tests.rs"]
+mod qualite_livree_6334_tests;

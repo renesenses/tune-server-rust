@@ -232,6 +232,19 @@ impl Resolveur {
 /// piste de la bibliothèque. Pour une piste locale, `source_id` est son
 /// identifiant de ligne, jamais la colonne `source_id` de la base (qui peut
 /// être un chemin).
+///
+/// web#2219 (go de Bertrand du 19/10, rc7) : la ligne dit aussi de quoi
+/// ENFILER le morceau et montrer sa pochette, sans nouvel aller-retour :
+///
+/// - bibliothèque : `album_id`, l'album de la piste CHEZ L'APPELANT (l'écran
+///   en tire la pochette par `/library/artwork`, comme partout) ;
+/// - service : `title`, `artist_name`, `album_title`, `duration_ms`,
+///   `cover_url` et `album_ref`, tels que SON service les rend — les champs
+///   qu'attend `POST /zones/{id}/queue/add` (`tracks[]`) pour « Lire
+///   ensuite » et « Ajouter à la file ».
+///
+/// Rien de cela ne vient du serveur d'un contact : c'est ce que l'appelant
+/// possède déjà, lu dans sa base ou chez son service.
 pub fn ligne(item_id: &Value, trouvee: Option<&Trouvee>) -> Value {
     match trouvee {
         None => json!({
@@ -246,6 +259,7 @@ pub fn ligne(item_id: &Value, trouvee: Option<&Trouvee>) -> Value {
             "source": "local",
             "source_id": piste.id.map(|i| i.to_string()),
             "track_id": piste.id,
+            "album_id": piste.album_id,
             "method": methode.nom(),
         }),
         Some(Trouvee::Service {
@@ -258,6 +272,12 @@ pub fn ligne(item_id: &Value, trouvee: Option<&Trouvee>) -> Value {
             "source": service,
             "source_id": piste.id,
             "method": methode.nom(),
+            "title": piste.title,
+            "artist_name": Some(&piste.artist).filter(|a| !a.is_empty()),
+            "album_title": piste.album,
+            "duration_ms": piste.duration_ms,
+            "cover_url": piste.cover_path,
+            "album_ref": piste.album_id,
         }),
     }
 }

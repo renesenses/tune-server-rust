@@ -320,6 +320,11 @@ pub async fn ensemencer_le_volume_local(
             && crate::audio::audiophile::volume_lock_enabled(db, id)
     });
     let stored = volume_de_graine(zone.volume, zone.fixed_volume || pure_force, trim_db);
+    // #6541 — la graine ne naît pas au-dessus de la limite de sécurité (sauf
+    // en PURE ou à volume fixe, où la limite n'a pas cours).
+    let stored = zone.id.map_or(stored, |id| {
+        crate::audio::volume_limites::lire_effectives(db, id).borner_appareil(stored)
+    });
     if let Err(e) = crate::outputs::OutputTarget::set_volume(sortie, stored).await {
         warn!(device_id = %device_id, error = %e, "local_output_volume_seed_failed");
     } else {
@@ -1280,6 +1285,33 @@ pub(super) fn est_sortie_locale(output_device_id: Option<&str>) -> bool {
     output_device_id.is_some_and(|id| id.starts_with("local:"))
 }
 
+/// `output_type` d'une zone qui joue sur la sortie d'un AGENT Tune (#4626) :
+/// le maître la tient par `tune-server/src/agent_tune`, qui reprend cette
+/// constante. Elle vit ici parce que l'orchestrateur doit la reconnaître
+/// (#6370) et ne dépend pas du serveur.
+pub const TYPE_SORTIE_AGENT_TUNE: &str = "tune_agent";
+/// Préfixe du `device_id` d'une sortie d'agent chez le maître.
+pub const PREFIXE_SORTIE_AGENT_TUNE: &str = "tune-agent:";
+
+/// #6370 — faut-il servir à une sortie d'agent un flux DÉCODÉ qui commence à
+/// la position demandée ?
+///
+/// L'agent ne prête que sa sortie LOCALE (`agent_tune::TYPES_EXPOSES`), qui lit
+/// son flux d'un bout à l'autre et ne sait pas s'y déplacer : son `seek` ne
+/// fait que noter la position. Un déplacement s'y joue donc en relançant le
+/// flux, comme pour une sortie locale du maître. Mais la lecture ordinaire
+/// d'une piste de la bibliothèque part en passthrough, servie depuis l'OCTET
+/// 0 — `seek_ms` n'y est pas lu (#2893). Une relance à une position non nulle
+/// prend donc le bras qui décode, le seul qui démarre à `seek_ms`. Une lecture
+/// depuis le début ne change pas de bras.
+pub(super) fn agent_relance_a_la_position(
+    output_device_id: Option<&str>,
+    seek_ms: Option<u64>,
+) -> bool {
+    output_device_id.is_some_and(|id| id.starts_with(PREFIXE_SORTIE_AGENT_TUNE))
+        && seek_ms.is_some_and(|ms| ms > 0)
+}
+
 /// Une zone navigateur doit-elle recevoir la source décodée en WAV ? Oui pour
 /// tout format que `<audio>` ne décode pas — DSD avant tout (Reivax66, 0.9.44),
 /// WavPack, APE, WMA, AIFF, ALAC, et Matroska (#3633 : `<audio>` n'ouvre pas
@@ -1546,6 +1578,26 @@ mod lecture_locale_tests {
         assert!(!sera_du_flac(Some(AudioFormat::Mp3), false));
         assert!(!sera_du_flac(None, true), "format inconnu : aucune cible");
         assert!(!sera_du_flac(None, false));
+    }
+
+    #[test]
+    fn seule_une_relance_a_une_position_non_nulle_decode_pour_un_agent_6370() {
+        let agent = Some("tune-agent:abc:local:hw:1,0");
+        assert!(agent_relance_a_la_position(agent, Some(2_000)));
+        assert!(
+            !agent_relance_a_la_position(agent, Some(0)),
+            "une lecture depuis le début garde son bras"
+        );
+        assert!(!agent_relance_a_la_position(agent, None));
+        assert!(
+            !agent_relance_a_la_position(Some("local:hw:1,0"), Some(2_000)),
+            "la sortie locale du maître a déjà sa règle"
+        );
+        assert!(!agent_relance_a_la_position(
+            Some("uuid:renderer"),
+            Some(2_000)
+        ));
+        assert!(!agent_relance_a_la_position(None, Some(2_000)));
     }
 
     #[test]

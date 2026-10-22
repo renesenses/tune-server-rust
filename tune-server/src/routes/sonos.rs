@@ -155,8 +155,15 @@ async fn set_room_volume(
             .into_response();
     };
     let output = output.lock().await;
-    match output.checked_set_volume(body.volume).await {
-        Ok(()) => Json(json!({"volume": body.volume})).into_response(),
+    // #6541 — la limite de sécurité de la zone qui porte cet appareil tient
+    // aussi sur ce pilotage direct, qui ne passe pas par la zone.
+    let volume = match tune_core::audio::volume_limites::securite_de_l_appareil(&state.backend, &id)
+    {
+        Some(s) => body.volume.min(s),
+        None => body.volume,
+    };
+    match output.checked_set_volume(volume).await {
+        Ok(()) => Json(json!({"volume": volume})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
 }

@@ -110,3 +110,7 @@ mod plugin_output_provider_seam;
 
 #[path = "audio_offer_contract.rs"]
 mod audio_offer_contract;
+// #6458 — les descriptions des greffons livrés et le refus `plugin_unavailable`
+// suivent la langue de la requête.
+#[path = "descriptions_greffons_langue_6458.rs"]
+mod descriptions_greffons_langue_6458;

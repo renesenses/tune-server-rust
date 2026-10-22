@@ -7,9 +7,11 @@ use tune_core::db::backend::DbBackend;
 pub mod catalogue;
 pub mod collections_par_defaut;
 pub mod comptes;
-pub(crate) mod criteres;
+pub mod criteres;
 mod etiquettes_streaming;
 pub(crate) mod regles_sql;
+/// #6287 — langage de requête textuel, traduit vers les règles de l'éditeur.
+pub mod requete_texte;
 pub mod smart_ai;
 pub mod smart_collections;
 pub mod smart_playlists;

@@ -1061,6 +1061,144 @@ pub(super) async fn zone_image_upload(
     }
 }
 
+/// Clef de réglage qui retient la photo PROPOSÉE au catalogue (#2109).
+///
+/// Elle porte le condensat de la photo envoyée : tant qu'il égale
+/// `zone_{id}_image`, la photo affichée est celle qui attend la relecture. Une
+/// nouvelle photo posée ensuite ne l'égale plus — elle redevient « locale »
+/// sans qu'on ait rien à effacer.
+pub(super) fn cle_photo_proposee(id: i64) -> String {
+    format!("zone_{id}_image_shared")
+}
+
+/// L'état de partage de la photo d'une zone, tel que le client l'affiche :
+/// `"pending"` si la photo affichée a été proposée, `None` sinon (locale).
+///
+/// Il n'existe pas d'état « publiée » ni « refusée » ici : le site
+/// n'expose aucune route qui dise à une instance ce qu'est devenue sa
+/// proposition. Le prétendre serait inventer.
+pub(crate) fn etat_partage_photo(settings: &SettingsRepo, id: i64) -> Option<&'static str> {
+    let image = settings
+        .get(&format!("zone_{id}_image"))
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty())?;
+    let proposee = settings.get(&cle_photo_proposee(id)).ok().flatten()?;
+    (proposee == image).then_some("pending")
+}
+
+/// `POST /zones/{id}/image/share` — proposer la photo de l'appareil au
+/// catalogue communautaire (tune-web-client#2109).
+///
+/// 🔴 Rien ne part sans ce geste : `POST /zones/{id}/image` garde la photo
+/// LOCALE, et seul cet appel, déclenché par un accord explicite à l'écran,
+/// l'envoie. Le site l'enregistre en attente ; rien ne redescend chez
+/// personne avant l'approbation de Bertrand.
+///
+/// La clef du catalogue est la marque CHOISIE (jamais la détectée, souvent
+/// l'OEM : « Shenzhen Zidoo » pour Eversolo) et elle doit figurer au
+/// catalogue — décision du 20/09/2026 : une marque en saisie libre ne crée
+/// pas de clef, la photo reste locale. On envoie le nom CANONIQUE du
+/// catalogue, pas la graphie tapée.
+pub(super) async fn zone_image_share(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let lire = |cle: String| {
+        settings
+            .get(&cle)
+            .ok()
+            .flatten()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+
+    let Some(hash) = lire(format!("zone_{id}_image")) else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "no image"}))).into_response();
+    };
+    let (Some(marque), Some(modele)) = (
+        lire(format!("zone_{id}_brand")),
+        lire(format!("zone_{id}_model")),
+    ) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "device identity required"})),
+        )
+            .into_response();
+    };
+    let Some(canonique) = tune_core::device_catalog::find_brand(&marque) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "brand not in catalog", "brand": marque})),
+        )
+            .into_response();
+    };
+
+    let cache = crate::routes::library::artwork_cache_dir();
+    let octets = tune_core::library::artwork::find_cached(&cache, &hash)
+        .and_then(|(chemin, _)| std::fs::read(chemin).ok());
+    let Some(octets) = octets else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "image file missing"})),
+        )
+            .into_response();
+    };
+    let Some(ext) = tune_core::library::artwork::sniff_image_ext(&octets) else {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(json!({"error": "unsupported image format"})),
+        )
+            .into_response();
+    };
+
+    // Identifiant d'instance STABLE : le site garde une proposition par
+    // appareil ET par instance. Un identifiant tiré à chaque appel empilerait
+    // les doublons dans la file de modération.
+    let instance_id = match settings.get("instance_id").ok().flatten() {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => {
+            let neuf = uuid::Uuid::new_v4().to_string();
+            let _ = settings.set("instance_id", &neuf);
+            neuf
+        }
+    };
+    let base_url = settings
+        .get("mozaik_base_url")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "https://mozaiklabs.fr".to_string());
+
+    match tune_core::cloud::community::submit_device_image(
+        &base_url,
+        &canonique.name,
+        &modele,
+        &instance_id,
+        &octets,
+        ext,
+        tune_core::library::artwork::cache_mime(ext),
+    )
+    .await
+    {
+        Ok(()) => {
+            if let Err(e) = settings.set(&cle_photo_proposee(id), &hash) {
+                warn!(zone_id = id, error = %e, "device_image_share_not_recorded");
+            }
+            Json(json!({
+                "zone_id": id,
+                "image_share_status": etat_partage_photo(&settings, id),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            warn!(zone_id = id, error = %e, "device_image_share_failed");
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
+        }
+    }
+}
+
 /// `DELETE /zones/{id}/image` — retirer la photo, revenir au pictogramme.
 ///
 /// Le FICHIER du cache n'est pas effacé : sa clef est un condensat de contenu,
@@ -1080,3 +1218,7 @@ pub(super) async fn zone_image_delete(
             .into_response(),
     }
 }
+
+#[cfg(test)]
+#[path = "partage_photo_appareil_2109.rs"]
+mod partage_photo_appareil_2109;

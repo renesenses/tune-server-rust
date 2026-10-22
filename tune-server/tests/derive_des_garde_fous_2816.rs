@@ -352,9 +352,9 @@ fn fichiers_poses(dossier: &Path) -> Vec<String> {
 /// `chemin -> (cible qui l'emporte, chemin de module)`.
 ///
 /// La résolution est TRANSITIVE : un agrégateur qui déclare
-/// `#[path = "…"] mod x;` peut lui-même en déclarer d'autres. La garde de
-/// `tests_orphelins.rs` ne descend qu'un cran — assez pour aujourd'hui, pas
-/// pour demain.
+/// `#[path = "…"] mod x;` peut lui-même en déclarer d'autres. Les gardes
+/// `tests_orphelins.rs` le sont aussi depuis #6376, et descendent en plus dans
+/// les sous-dossiers de `tests/` ; celle-ci reste à la racine de `tests/`.
 fn atteints(racine: &Path, chemin_caisse: &str) -> BTreeMap<String, (String, String)> {
     let source = lire(&racine.join(chemin_caisse).join("Cargo.toml"));
     let dossier = racine.join(chemin_caisse).join("tests");

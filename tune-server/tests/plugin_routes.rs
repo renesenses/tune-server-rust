@@ -307,6 +307,17 @@ impl TunePlugin for FailsSetup {
     }
 }
 
+/// Les noms attendus, plus `assistant-ia` quand sa feature est compilée
+/// (chargé par défaut), triés.
+fn avec_assistant_ia(noms: &[&'static str]) -> Vec<&'static str> {
+    let mut v = noms.to_vec();
+    if cfg!(feature = "assistant-ia") {
+        v.push("assistant-ia");
+    }
+    v.sort_unstable();
+    v
+}
+
 /// `plugin_{name}_enabled = false` keeps a plugin out at boot, and it must not
 /// linger in the REST view either.
 ///
@@ -331,10 +342,16 @@ async fn the_enabled_setting_keeps_a_plugin_out() {
         .iter()
         .map(|plugin| plugin.name.as_str())
         .collect();
+    // L'Assistant IA (chantier assistant-ia), quand sa feature est compilée,
+    // est chargé par défaut comme l'égaliseur gratuit : rien ne part tant
+    // qu'aucune clé n'est posée.
+    let mut attendus = vec!["equalizer"];
+    if cfg!(feature = "assistant-ia") {
+        attendus.push("assistant-ia");
+    }
     assert_eq!(
-        names,
-        vec!["equalizer"],
-        "FREE EQ loads by default; the explicitly disabled injected plugin must stay absent"
+        names, attendus,
+        "FREE EQ and the AI assistant load by default; the explicitly disabled injected plugin must stay absent"
     );
 }
 
@@ -353,8 +370,8 @@ async fn an_injected_plugin_loads_and_mounts_its_router() {
     mounts.sort_unstable();
     assert_eq!(
         mounts,
-        vec!["equalizer", "injected"],
-        "FREE EQ and injected plugin both contribute their own router"
+        avec_assistant_ia(&["equalizer", "injected"]),
+        "FREE EQ, the AI assistant and the injected plugin each contribute their own router"
     );
 
     let mut names: Vec<&str> = state
@@ -365,7 +382,7 @@ async fn an_injected_plugin_loads_and_mounts_its_router() {
         .map(|p| p.name.as_str())
         .collect();
     names.sort_unstable();
-    assert_eq!(names, vec!["equalizer", "injected"]);
+    assert_eq!(names, avec_assistant_ia(&["equalizer", "injected"]));
 
     // End to end: the router it registered actually serves, under its own name.
     let app = tune_server::routes::router_with_plugins(state.clone(), routers);

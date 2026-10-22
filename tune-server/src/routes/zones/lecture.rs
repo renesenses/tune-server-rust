@@ -454,6 +454,8 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 super::backend_affiche_pour_la_sortie(audio_backend, backend_sortie.as_deref());
             // #5353 — décision du 29/09 : jouable, mais SIGNALÉE.
             super::injecter_backend_de_sortie(obj, &backend_configure, backend_sortie.as_deref());
+            // #6120 — une zone locale dont la sortie n'est pas enregistrée.
+            super::rattacher_asio_6120::injecter_sortie_absente(obj, z, &registered_output_ids);
             let signal_path = build_signal_path(
                 &ps,
                 z,
@@ -643,6 +645,11 @@ pub(super) async fn get_zone(
                     obj,
                     &state.effective_audio_backend(),
                     backend_sortie.as_deref(),
+                );
+                super::rattacher_asio_6120::injecter_sortie_absente(
+                    obj,
+                    &zone,
+                    &registered_output_ids,
                 );
                 let signal_path = build_signal_path(
                     &ps,

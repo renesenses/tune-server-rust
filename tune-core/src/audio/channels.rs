@@ -599,22 +599,7 @@ pub fn adapt_channels_i32(
     if source_ch < target_ch {
         // #6057 — même routage par position que `adapt_channels_f32`.
         if let Some(matrice) = routage_par_defaut(source_ch, target_ch) {
-            let depth = bit_depth.clamp(8, 32);
-            let (min, max) = (-(1i64 << (depth - 1)), (1i64 << (depth - 1)) - 1);
-            return Ok(samples
-                .chunks_exact(src)
-                .flat_map(|frame| {
-                    matrice.chunks_exact(src).map(move |ligne| {
-                        frame
-                            .iter()
-                            .zip(ligne)
-                            .map(|(&x, &c)| x as f64 * c as f64)
-                            .sum::<f64>()
-                            .round()
-                            .clamp(min as f64, max as f64) as i32
-                    })
-                })
-                .collect());
+            return Ok(appliquer_matrice_i32(samples, src, &matrice, bit_depth));
         }
         for frame in samples.chunks_exact(src) {
             if source_ch == 1 && target_ch >= 2 {
@@ -937,6 +922,62 @@ mod tests {
 /// 44,1 kHz, 16 bits, stéréo. Il reste une garde spécialisée en plus du contrat
 /// commun de `decode_to_pcm` (#2230, #2237).
 ///
+/// #6057 — [`adapt_channels_i32`], mais en routant par la disposition que le
+/// FICHIER déclare, pour le décodage du chemin RÉSEAU (DLNA, OAAT, AirPlay…).
+///
+/// Le chemin réseau change le nombre de canaux quand le renderer en annonce
+/// moins que la source (#4573) ; il le faisait par l'ordre PAR DÉFAUT du
+/// nombre de canaux. Un DSF de type 5 (`FL FR C LFE`) replié en stéréo y était
+/// lu comme un 4.0 `FL FR BL BR` : la centrale partait à gauche seulement, le
+/// LFE à droite. La sortie locale route déjà par position depuis #6058.
+///
+/// 🔴 SEULEMENT quand le nombre de canaux change. À nombre égal, le flux part
+/// tel quel : la sortie locale lit ce même flux et applique ELLE-MÊME la
+/// disposition déclarée (`EtageDeConversion::convertir`) ; la réordonner ici
+/// la ferait appliquer deux fois.
+pub fn adapt_channels_i32_disposee(
+    samples: &[i32],
+    source_ch: u16,
+    target_ch: u16,
+    bit_depth: u16,
+    disposition: Option<&super::disposition_canaux::Disposition>,
+) -> Result<Vec<i32>, String> {
+    if source_ch != target_ch
+        && let Some(d) = disposition.filter(|d| d.canaux() == source_ch && !d.est_par_defaut())
+        && let Some(matrice) = super::disposition_canaux::matrice_de_routage(d, target_ch)
+    {
+        validate_channel_adaptation(samples.len(), source_ch, target_ch)?;
+        return Ok(appliquer_matrice_i32(
+            samples,
+            usize::from(source_ch),
+            &matrice,
+            bit_depth,
+        ));
+    }
+    adapt_channels_i32(samples, source_ch, target_ch, bit_depth)
+}
+
+/// Apply a `target × source` row-major matrix to interleaved integer frames,
+/// rounded and clamped to `bit_depth`.
+fn appliquer_matrice_i32(samples: &[i32], src: usize, matrice: &[f32], bit_depth: u16) -> Vec<i32> {
+    let depth = bit_depth.clamp(8, 32);
+    let (min, max) = (-(1i64 << (depth - 1)), (1i64 << (depth - 1)) - 1);
+    samples
+        .chunks_exact(src)
+        .flat_map(|frame| {
+            matrice.chunks_exact(src).map(move |ligne| {
+                frame
+                    .iter()
+                    .zip(ligne)
+                    .map(|(&x, &c)| x as f64 * c as f64)
+                    .sum::<f64>()
+                    .round()
+                    .clamp(min as f64, max as f64) as i32
+            })
+        })
+        .collect()
+}
+
 /// Toutes les conversions passent par [`adapt_channels_i32`] : AirPlay, le
 /// décodeur et la sortie locale partagent donc réellement la même matrice et la
 /// même réserve de headroom.

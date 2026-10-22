@@ -278,7 +278,7 @@ pub(super) async fn album_credits(
     };
     let sql = format!(
         "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position, \
-                t.title, t.track_number, t.disc_number \
+                t.title, t.track_number, t.disc_number, tc.artist_mbid \
          FROM track_credits tc \
          JOIN tracks t ON {jointure} \
          WHERE {cle_album} \
@@ -303,9 +303,11 @@ pub(super) async fn album_credits(
                 "track_title": r.get(7).and_then(|v| v.as_string()),
                 "track_number": r.get(8).and_then(|v| v.as_i64()),
                 "disc_number": r.get(9).and_then(|v| v.as_i64()),
+                "artist_mbid": r.get(10).and_then(|v| v.as_string()),
             })
         })
         .collect();
+    ajouter_instruments_wikidata(&state.backend, &mut items);
     let (jointure_metadonnees, cle_album_metadonnees) = match state.backend.engine() {
         Engine::Postgres => (
             "CAST(tm.track_id AS TEXT) = CAST(t.id AS TEXT)",
@@ -325,6 +327,57 @@ pub(super) async fn album_credits(
         .map_err(AppError::internal)?;
     ajouter_credits_des_balises(&mut items, balises, true);
     Ok(Json(json!(items)))
+}
+
+/// Les instruments Wikidata d'un musicien que MusicBrainz a crédité SANS
+/// instrument (#4805, lot 1 — d'après MetaRust, de Xavier Joly).
+///
+/// Ils viennent de la fiche de l'ARTISTE (`artiste_instruments`), pas de
+/// l'enregistrement : le champ s'appelle `instruments_wikidata`, à part, et
+/// `instrument` reste celui de MusicBrainz. Un crédit qui a déjà son
+/// instrument n'en reçoit pas.
+pub(crate) fn ajouter_instruments_wikidata(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    items: &mut [Value],
+) {
+    use tune_core::metadata::wikidata::{ROLES_SANS_INSTRUMENT, instruments_gardes};
+    let sans_instrument = |it: &Value| {
+        it.get("instrument")
+            .is_none_or(|i| i.is_null() || i.as_str() == Some(""))
+            && it
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|r| ROLES_SANS_INSTRUMENT.contains(&r))
+    };
+    let mbids: Vec<String> = items
+        .iter()
+        .filter(|it| sans_instrument(it))
+        .filter_map(|it| {
+            it.get("artist_mbid")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    if mbids.is_empty() {
+        return;
+    }
+    let gardes = instruments_gardes(backend, &mbids);
+    for it in items.iter_mut() {
+        if !sans_instrument(it) {
+            continue;
+        }
+        let Some(liste) = it
+            .get("artist_mbid")
+            .and_then(Value::as_str)
+            .and_then(|m| gardes.get(m))
+            .filter(|l| !l.is_empty())
+        else {
+            continue;
+        };
+        if let Some(o) = it.as_object_mut() {
+            o.insert("instruments_wikidata".into(), json!(liste));
+        }
+    }
 }
 
 /// Écrit sur la piste l'enregistrement retenu par le score (CRD-3), pour que
@@ -1067,6 +1120,7 @@ mod tests {
     /// rougir `traitees == 0` : le tour part chercher le MBID sur MusicBrainz.
     #[tokio::test]
     async fn un_tour_suspendu_ne_traite_rien_et_garde_son_curseur() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         use tune_core::db::backend::ToSqlValue;
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let b = &state.backend;
@@ -1081,14 +1135,12 @@ mod tests {
         )
         .unwrap();
 
-        tune_core::taches_de_fond::oublier_pour_les_essais();
         tune_core::taches_de_fond::mettre_en_pause(
             b,
             tune_core::taches_de_fond::Tache::Enrichissement,
         )
         .unwrap();
         let bilan = un_tour_de_credits(&state).await;
-        tune_core::taches_de_fond::oublier_pour_les_essais();
 
         assert_eq!(
             bilan.traitees, 0,

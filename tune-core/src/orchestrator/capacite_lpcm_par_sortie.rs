@@ -15,7 +15,7 @@
 //! |---|---|---|
 //! | `chromecast` | accepte en 16 bits, inconnu au-delà | Google Cast, « Supported Media » : « WAV (LPCM) », sans profondeur ni fréquence (le FLAC, lui, est borné à 96 kHz / 24 bits) |
 //! | `bluos` | accepte en 16 bits, inconnu au-delà | Bluesound, « What Formats are supported by Bluesound? » : WAV listé, aucune profondeur ni fréquence |
-//! | `slimproto` | refuse | `slimproto::build_strm_start` annonce TOUJOURS `f` (FLAC) au lecteur : un WAV y serait décodé comme du FLAC |
+//! | `slimproto` | refuse | jusqu'à #6475, `slimproto::build_strm_start` annonçait TOUJOURS `f` (FLAC) : un WAV y était décodé comme du FLAC. Le codec servi est désormais annoncé, mais la substitution d'un WAV progressif au format habituel n'a pas été essayée sur Squeezelite : le refus reste, par prudence |
 //! | `squeezebox` | inconnu | LMS tire l'URL (`playlist play`) et décide seul ; rien dans Tune ne l'établit |
 //! | `openhome` | inconnu | `OpenHomeOutput` ne sonde aucun Sink ; le protocole n'impose aucun format |
 //! | `dlna` sans `DlnaOutput` | inconnu | pas de Sink à lire (cas d'une sortie de substitution) |
@@ -46,7 +46,8 @@ pub fn capacite_lpcm(output_type: &str, hi_res: bool) -> CapaciteLpcm {
         // Documentation officielle : WAV (LPCM) lu, profondeur non dite.
         "chromecast" | "bluos" if !hi_res => CapaciteLpcm::Accepte,
         "chromecast" | "bluos" => CapaciteLpcm::Inconnu,
-        // `build_strm_start` écrit `b'f'` en dur : le lecteur attend du FLAC.
+        // Jusqu'à #6475 `build_strm_start` écrivait `b'f'` en dur ; le codec
+        // servi est annoncé depuis, mais la substitution WAV n'est pas essayée.
         "slimproto" => CapaciteLpcm::Refuse,
         _ => CapaciteLpcm::Inconnu,
     }

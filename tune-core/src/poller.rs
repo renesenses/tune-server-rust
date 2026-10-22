@@ -78,7 +78,10 @@ async fn get_status_with_signal_path_bounded(
 > {
     let poll = async {
         let output = output_arc.lock().await;
-        let status = output.get_status().await?;
+        let mut status = output.get_status().await?;
+        // #6059 — un flux natif relancé à la position : le renderer compte
+        // depuis le début de CE flux, on le rapporte à la piste.
+        crate::outputs::dlna_depart_natif::corriger_le_statut(output.device_id(), &mut status);
         let progress = if status.realtime {
             None
         } else {
@@ -215,6 +218,16 @@ const STALL_DECLINE_MAX_TICKS: u8 = 10;
 /// advanced once, so slow starts and renderers with no position support remain
 /// outside its scope.
 const PLAYING_STALL_THRESHOLD: u8 = 30;
+/// 🔴 #6702 — le plancher en SECONDES du seuil ci-dessus, comme
+/// [`STOPPED_FAILURE_MIN_SECS`] pour le bras « arrêté » (#4480).
+///
+/// Après un tour bloqué, `tokio::time::interval` rattrape les tours manqués en
+/// rafale : sur le .18 le 21/10, trente tours « figés » en 247 ms, position du
+/// renderer égale au temps écoulé (204 s pour 204 s), renderer encore en train
+/// de jouer — et la zone coupée. La position d'un renderer DLNA avance à la
+/// seconde : des tours espacés de quelques millisecondes la voient forcément
+/// figée.
+const PLAYING_STALL_MIN_SECS: u64 = 30;
 /// Grace period (seconds) after a seek during which the poller does not
 /// overwrite the in-memory position with the value reported by the output.
 /// This prevents the progress bar from snapping back to the pre-seek
@@ -431,6 +444,24 @@ const VOLUME_GRACE_SECS: u64 = 5;
 /// fois « personne ne reçoit ce son » et « en lecture ».
 pub const DELAI_SILENCE_ETABLI: Duration = Duration::from_secs(12);
 
+/// #6066 — au-delà de ce volume, des octets tirés d'un flux disent qu'un
+/// lecteur le consomme ; en deçà, ce n'est qu'une SONDE. AVPlayer tire
+/// `bytes=0-1` (deux octets) avant de refuser un flux, un analyseur lit
+/// quelques Kio d'en-tête : rien ne joue pour autant. 16 Kio, c'est 4 s d'une
+/// radio à 32 kb/s, bien moins que ce qu'un lecteur qui joue a tiré au bout de
+/// [`DELAI_SILENCE_ETABLI`].
+///
+/// Partagé, comme le délai, par le poller (abandon d'une lecture sans
+/// destination) et la vue des zones (`browser_unattended`) : ils doivent dire
+/// la même chose au même instant.
+pub const TAILLE_MAXIMALE_D_UNE_SONDE: u64 = 16 * 1024;
+
+/// Ces octets servis prouvent-ils qu'un lecteur consomme le flux ? Jamais
+/// « un octet » (#6066) : une sonde de plage n'est pas une écoute.
+pub fn octets_d_une_ecoute(octets: u64) -> bool {
+    octets > TAILLE_MAXIMALE_D_UNE_SONDE
+}
+
 /// Pure decision predicates extracted **verbatim** from the poller `tick`
 /// loop. They contain no I/O and no state mutation, so they can be unit-tested
 /// against the *real* code path.
@@ -573,6 +604,9 @@ pub struct PositionPoller {
     /// une fois (voir `volume_pure_concilie`). Une zone en sort dès qu'elle
     /// est vue hors verrou, pour que le prochain armement soit rattrapé.
     volumes_pure_concilies: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #6541 — dernier volume rapporté au-dessus de la limite de sécurité,
+    /// par zone : la consigne n'est recommandée qu'une fois par valeur.
+    volumes_plafonnes: std::sync::Mutex<std::collections::HashMap<i64, f64>>,
     /// #5662 — zones dont le renderer annonce 100 % sans que Tune l'adopte :
     /// l'épisode est dit une fois (`volume_100_ignore_constate`).
     volumes_100_ignores: std::sync::Mutex<std::collections::HashSet<i64>>,
@@ -620,6 +654,7 @@ impl PositionPoller {
             zones_a_position_prouvee: std::sync::Mutex::new(std::collections::HashSet::new()),
             volumes_pure_reimposes: std::sync::Mutex::new(std::collections::HashSet::new()),
             volumes_pure_concilies: std::sync::Mutex::new(std::collections::HashSet::new()),
+            volumes_plafonnes: std::sync::Mutex::new(std::collections::HashMap::new()),
             volumes_100_ignores: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -1005,6 +1040,8 @@ impl PositionPoller {
 }
 
 mod radio;
+/// #2991 — le titre radio relayé par DIDL vers un renderer DLNA (opt-in par zone).
+mod titre_radio_didl_2991;
 
 mod fin_de_piste;
 /// #4382 — un `Next` acquitté que le transport déclare ignoré.
@@ -1023,12 +1060,19 @@ mod demarrage_fige_5522;
 #[cfg(test)]
 mod demarrage_fige_5522_tests;
 
+/// #6541 — au-dessus de la limite de sécurité, le volume du renderer n'est
+/// pas adopté : il est ramené sous la limite.
+mod volume_plafond_6541;
+#[cfg(test)]
+mod volume_plafond_6541_tests;
 /// #5695 — sous PURE verrouillé, réimposer 100 % au lieu d'adopter le volume
 /// du renderer.
 mod volume_pure_5695;
 #[cfg(test)]
 mod volume_pure_5695_tests;
 
+/// #6233 — radio sur sortie locale : le contrat de signal relu à chaque tour.
+mod contrat_radio_locale_6233;
 /// #5662 — un renderer à 100 % ignoré par l'adoption est signalé au journal.
 mod volume_100_ignore_5662;
 /// #6008 — l'adoption du volume du renderer est dite au journal.
@@ -1042,6 +1086,11 @@ mod tests;
 
 #[cfg(test)]
 mod status_timeout_tests;
+
+/// Sourdine par zéro (Eversolo DMP-A8) : le silence commandé n'est pas
+/// rouvert par le volume que l'appareil remonte.
+#[cfg(test)]
+mod volume_sourdine_zero_tests;
 
 /// #3318 — l'instant où l'anneau audio se vide, et le silence que le DAC
 /// reçoit alors. La comptabilité pure, et son branchement dans `tick()`.
@@ -1307,6 +1356,11 @@ mod depassement_duree_nagit_pas_guard;
 /// par désarmer.
 #[cfg(test)]
 mod lire_ensuite_dans_la_fenetre_gapless;
+
+/// #4851 — une zone HQPlayer native enchaîne par la playlist de HQPlayer :
+/// la vraie `HqplayerOutput` face à un faux HQPlayer XML, sondeur réel.
+#[cfg(test)]
+mod hqplayer_enchainement_4851;
 
 /// #5143 — une suivante BANNIE n'est ni préchargée, ni armée, ni jouée après
 /// un échec : préchargement, enchaînement sans blanc et reprise désignent la

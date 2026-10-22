@@ -148,16 +148,38 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParam
         "?"
     };
     // `ar.image_path` : l'image de l'artiste de BIBLIOTHÈQUE, quand la fiche
-    // en a une. Elle dépend de `ar.id` seul, le regroupement ne change donc
-    // pas (#5165).
+    // en a une (#5165).
+    //
+    // 🔴 web#2211 — UNE LIGNE PAR ARTISTE, jamais deux. L'ancienne requête
+    // joignait chaque écoute à TOUTES les fiches de même nom à la casse près
+    // (`LOWER(lh.artist_name) = LOWER(ar.name)`) puis groupait par
+    // `lh.artist_name, ar.id` : deux fiches homonymes dans `artists` (deux
+    // MBID distincts, une fiche d'avant la fusion des graphies…) rendaient
+    // DEUX lignes au même nom, chacune avec TOUTES les écoutes — compte
+    // doublé, et la Recherche du client web, qui indexait sa rangée
+    // « Artistes les plus écoutés » par le nom, levait `each_key_duplicate`
+    // et se figeait (Daniel LEVY, fil 2329, rc6).
+    //
+    // L'historique ne connaît que le NOM : il ne peut pas répartir une écoute
+    // entre deux homonymes. On compte donc par nom à la casse près — la règle
+    // de la bibliothèque (`ArtistRepo::get_by_name`, `LOWER(name) =
+    // LOWER(?)`) — et l'on rattache ce nom à UNE fiche, la plus ancienne,
+    // comme `get_or_create` qui réutilise la première trouvée au lieu d'en
+    // créer une seconde. Le `LIMIT` s'applique avant la jointure : la
+    // sous-requête de fiche ne tourne que pour les lignes rendues.
     let sql = format!(
-        "SELECT lh.artist_name, COUNT(*) as plays, ar.id as artist_id, ar.image_path \
-         FROM listen_history lh \
-         LEFT JOIN artists ar ON LOWER(lh.artist_name) = LOWER(ar.name) \
-         WHERE lh.artist_name IS NOT NULL \
-         GROUP BY lh.artist_name, ar.id, ar.image_path \
-         ORDER BY plays DESC \
-         LIMIT {p1}"
+        "SELECT COALESCE(ar.name, h.artist_name) AS artist_name, h.plays, \
+                ar.id AS artist_id, ar.image_path \
+         FROM (SELECT LOWER(artist_name) AS cle, MIN(artist_name) AS artist_name, \
+                      COUNT(*) AS plays \
+               FROM listen_history \
+               WHERE artist_name IS NOT NULL \
+               GROUP BY LOWER(artist_name) \
+               ORDER BY plays DESC, cle \
+               LIMIT {p1}) h \
+         LEFT JOIN artists ar ON ar.id = \
+              (SELECT MIN(a2.id) FROM artists a2 WHERE LOWER(a2.name) = h.cle) \
+         ORDER BY h.plays DESC, h.cle"
     );
     use tune_core::db::backend::ToSqlValue;
     let rows = state
@@ -458,6 +480,10 @@ async fn export_csv(
 #[cfg(test)]
 #[path = "top_artistes_image_i5165_tests.rs"]
 mod top_artistes_image_i5165_tests;
+
+#[cfg(test)]
+#[path = "top_artistes_homonymes_2211_tests.rs"]
+mod top_artistes_homonymes_2211_tests;
 
 #[cfg(test)]
 mod historique_4041_tests {

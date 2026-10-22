@@ -435,6 +435,7 @@ pub(super) async fn list_duplicates(
             fiche(ligne, true),
         ));
     }
+    let paires = albums_des_paires(&state, paires);
     Ok(Json(json!({
         "duplicates": {
             "by_hash": hash_dups,
@@ -446,6 +447,212 @@ pub(super) async fn list_duplicates(
         "criteres": criteres_json(),
         "total": hash_dups.len() + meta_dups.len() + fp_dups.len() + content_dups.len(),
     })))
+}
+
+/// #6300 — chaque copie d'une paire porte son album (`album_id`,
+/// `album_title`) : c'est ce qui permet à l'écran de regrouper les paires par
+/// couple d'albums et d'offrir « garder cet album, retirer l'autre » au lieu
+/// d'un geste par piste.
+///
+/// Une paire dont l'un des côtés appartient à un album MASQUÉ (#1391) n'est
+/// plus proposée : l'album retiré l'a été par l'utilisateur, ses pistes ne
+/// doivent pas revenir une à une dans les doublons. Le démasquer les y
+/// ramène. Les quatre listes d'origine (`by_hash`…) restent brutes.
+fn albums_des_paires(state: &AppState, paires: Vec<Value>) -> Vec<Value> {
+    let ids: std::collections::BTreeSet<i64> = paires
+        .iter()
+        .flat_map(|p| [p["a"]["id"].as_i64(), p["b"]["id"].as_i64()])
+        .flatten()
+        .collect();
+    if ids.is_empty() {
+        return paires;
+    }
+    let engine = state.backend.engine();
+    let ids: Vec<i64> = ids.into_iter().collect();
+    // id de piste → (album_id, titre de l'album, album masqué)
+    let mut albums: std::collections::HashMap<i64, (Option<i64>, Option<String>, bool)> =
+        std::collections::HashMap::new();
+    for lot in ids.chunks(500) {
+        let marqueurs: Vec<String> = (1..=lot.len()).map(|i| ph(engine, i)).collect();
+        let sql = format!(
+            "SELECT t.id, t.album_id, al.title, \
+                    CASE WHEN {visible} THEN 0 ELSE 1 END \
+             FROM tracks t LEFT JOIN albums al ON al.id = t.album_id \
+             WHERE t.id IN ({ids})",
+            visible = tune_core::db::facet_filter::hidden_tracks_excluded(),
+            ids = marqueurs.join(", "),
+        );
+        let params: Vec<&dyn ToSqlValue> = lot.iter().map(|i| i as &dyn ToSqlValue).collect();
+        for row in state
+            .backend
+            .query_many(&sql, &params)
+            .ou_defaut_journalise()
+        {
+            let Some(id) = row.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            albums.insert(
+                id,
+                (
+                    row.get(1).and_then(|v| v.as_i64()),
+                    row.get(2).and_then(|v| v.as_string()),
+                    row.get(3).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+                ),
+            );
+        }
+    }
+    paires
+        .into_iter()
+        .filter_map(|mut p| {
+            for cote in ["a", "b"] {
+                let id = p[cote]["id"].as_i64()?;
+                let (album_id, album_title, masque) = albums.get(&id).cloned().unwrap_or_default();
+                if masque {
+                    return None;
+                }
+                p[cote]["album_id"] = json!(album_id);
+                p[cote]["album_title"] = json!(album_title);
+            }
+            Some(p)
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+pub(super) struct RetirerAlbumDoublon {
+    keep_album_id: i64,
+    remove_album_id: i64,
+    /// Sans `true`, rien n'est écrit : la route rend le plan à confirmer.
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// Nombre de pistes de `album`.
+fn pistes_de_l_album(state: &AppState, album: i64) -> i64 {
+    state
+        .backend
+        .query_one(
+            &format!(
+                "SELECT COUNT(*) FROM tracks WHERE album_id = {}",
+                ph(state.backend.engine(), 1)
+            ),
+            &[&album as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
+/// Pistes de `retire` qui ont un ÉQUIVALENT dans `garde` : même fichier
+/// (`audio_hash`), ou même titre à trois secondes près — la règle des
+/// doublons « intelligents ». Ce qui n'en a pas disparaîtrait des vues avec
+/// l'album : le plan le dit avant la confirmation.
+fn pistes_avec_equivalent(state: &AppState, garde: i64, retire: i64) -> i64 {
+    let engine = state.backend.engine();
+    state
+        .backend
+        .query_one(
+            &format!(
+                "SELECT COUNT(*) FROM tracks r WHERE r.album_id = {retire} AND EXISTS ( \
+                   SELECT 1 FROM tracks g WHERE g.album_id = {garde} AND ( \
+                     (r.audio_hash IS NOT NULL AND r.audio_hash <> '' AND g.audio_hash = r.audio_hash) \
+                     OR (LOWER(g.title) = LOWER(r.title) \
+                         AND ABS(COALESCE(g.duration_ms, 0) - COALESCE(r.duration_ms, 0)) < 3000)))",
+                retire = ph(engine, 1),
+                garde = ph(engine, 2),
+            ),
+            &[&retire as &dyn ToSqlValue, &garde],
+        )
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
+/// `POST /library/duplicates/resolve-album` — #6300 (Lulu, fil 2205) :
+/// « garder cet album, retirer l'autre », d'un seul geste au lieu de piste
+/// par piste.
+///
+/// 🔴 Retirer, c'est MASQUER (#1391) — la réponse produit déjà donnée à la
+/// même question : les fichiers ne sont pas touchés, aucune ligne n'est
+/// supprimée (playlists, favoris, historique gardent leurs références et
+/// restent jouables), l'album sort des vues et des doublons, et le geste se
+/// défait par `DELETE /library/albums/{id}/hide`. Le masquage survit au
+/// rescan : l'album ne « revient » pas au prochain scan.
+///
+/// Confirmation obligatoire : sans `confirm: true`, la route n'écrit rien et
+/// rend le PLAN (titres, nombre de pistes, pistes sans équivalent dans
+/// l'album gardé). Seuls des albums de la bibliothèque locale se retirent
+/// ici, comme pour les fusions (`409 source_non_locale`).
+pub(super) async fn retirer_album_doublon(
+    State(state): State<AppState>,
+    Json(body): Json<RetirerAlbumDoublon>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    let (garde, retire) = (body.keep_album_id, body.remove_album_id);
+    if garde == retire {
+        return super::refus(
+            StatusCode::BAD_REQUEST,
+            "meme_album",
+            "l'album gardé et l'album retiré doivent être différents".to_string(),
+        );
+    }
+    let repo = tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone());
+    let (Ok(Some(album_garde)), Ok(Some(album_retire))) = (repo.get(garde), repo.get(retire))
+    else {
+        return super::refus(
+            StatusCode::NOT_FOUND,
+            "album_inconnu",
+            format!("albums {garde} / {retire}"),
+        );
+    };
+    if super::albums_non_locaux(&state.backend, &[garde, retire]) > 0 {
+        return super::refus_source_non_locale();
+    }
+    let pistes_retirees = pistes_de_l_album(&state, retire);
+    let avec_equivalent = pistes_avec_equivalent(&state, garde, retire);
+    let plan = json!({
+        "garde": {
+            "album_id": garde,
+            "title": album_garde.title,
+            "artist_name": album_garde.artist_name,
+            "pistes": pistes_de_l_album(&state, garde),
+        },
+        "retire": {
+            "album_id": retire,
+            "title": album_retire.title,
+            "artist_name": album_retire.artist_name,
+            "pistes": pistes_retirees,
+            "pistes_sans_equivalent": (pistes_retirees - avec_equivalent).max(0),
+        },
+        "mode": "masquage",
+        "fichiers_supprimes": 0,
+        "annuler": format!("DELETE /api/v1/library/albums/{retire}/hide"),
+    });
+    if !body.confirm {
+        return axum::response::IntoResponse::into_response(Json(json!({
+            "applique": false,
+            "confirmation_requise": true,
+            "plan": plan,
+        })));
+    }
+    let hidden = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    match hidden.hide_album(retire) {
+        Ok(true) => axum::response::IntoResponse::into_response(Json(json!({
+            "applique": true,
+            "plan": plan,
+        }))),
+        Ok(false) => super::refus(
+            StatusCode::NOT_FOUND,
+            "album_inconnu",
+            format!("album {retire}"),
+        ),
+        Err(e) => {
+            tracing::warn!(album = retire, error = %e, "retrait_album_doublon_echoue");
+            super::refus(StatusCode::INTERNAL_SERVER_ERROR, "retrait_echoue", e)
+        }
+    }
 }
 
 /// BIB-B2 (phase C) — les groupes de pistes dont le CONTENU décodé est le
@@ -854,6 +1061,8 @@ pub(super) mod tests_contenu;
 mod tests_empreintes;
 #[cfg(test)]
 mod tests_paires;
+#[cfg(test)]
+mod tests_retrait_album_6300;
 
 /// Témoins de la règle « bibliothèque LOCALE » — Bertrand, 27/09/2026.
 ///

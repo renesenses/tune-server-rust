@@ -395,6 +395,7 @@ async fn un_401_du_cloud_sans_rafraichissement_rend_non_connecte_jamais_401() {
 fn le_greffon_s_appelle_circle_reste_opt_in_et_est_au_catalogue() {
     use tune_core::plugin_sdk::TunePlugin;
     let backend = base("http://127.0.0.1:9", None);
+    let pochettes = tune_core::test_scratch::scratch_dir("tune-circle-relais-pochettes");
     let services = Arc::new(tokio::sync::Mutex::new(
         tune_core::streaming::ServiceRegistry::new(),
     ));
@@ -416,6 +417,7 @@ fn le_greffon_s_appelle_circle_reste_opt_in_et_est_au_catalogue() {
         services,
         orchestrator,
         playback,
+        artwork_dir: pochettes.to_path_buf(),
     });
     assert_eq!(g.name(), "circle");
     assert!(!g.default_enabled(), "opt-in, comme cd");

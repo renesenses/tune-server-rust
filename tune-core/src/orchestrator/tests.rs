@@ -11,6 +11,9 @@ use std::sync::Arc;
 #[path = "radio_profondeur_tests.rs"]
 mod radio_profondeur_tests;
 
+#[path = "journal_sans_url_6468_tests.rs"]
+mod journal_sans_url_6468_tests;
+
 #[tokio::test]
 async fn local_stream_watch_reports_only_an_unconsumed_live_session_once() {
     use crate::http::streamer::{AudioStreamer, StreamInfo};
@@ -1961,7 +1964,10 @@ fn les_seeks_apres_reprise_sont_detaches_et_gardes() {
         &apres[..fin]
     };
     for (nom, sig) in [
-        ("resume", "pub async fn resume_with_session_error_message("),
+        // #6062 — le corps de `resume_with_session_error_message` vit
+        // désormais dans `reprendre` (second passage après un refus de la
+        // sortie) : c'est lui que la garde lit.
+        ("resume", "    async fn reprendre(\n"),
         (
             "seek_output_after_replay",
             "pub(super) async fn seek_output_after_replay(",
@@ -2592,6 +2598,48 @@ fn les_reglages_de_sortie_locale_viennent_de_la_base() {
         (true, "asio".to_string()),
         "TUNE_LOCAL_AUDIO_BACKEND doit servir de repli comme dans \
          tune-server/src/config.rs"
+    );
+}
+
+/// #6452 — sous le repli de démarrage, la sortie recréée à la volée part sur
+/// l'hôte par défaut et en PARTAGÉ, et la base garde « asio ».
+///
+/// C'est le test qui rougit sans le repli : `recreate_local_and_play`
+/// rouvrirait ASIO, en exclusif, au premier appui sur Lecture, c'est-à-dire
+/// le pilote que le démarrage venait d'écarter.
+#[test]
+fn le_repli_de_demarrage_ecarte_asio_de_la_sortie_recreee() {
+    let orch = test_orchestrator();
+    let reglages = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    // Ce qu'écrit le choix d'ASIO dans les réglages : l'hôte, l'écho de
+    // l'exclusif et son témoin (#4184).
+    reglages.set("local_audio_backend", "asio").unwrap();
+    reglages.set("local_exclusive_mode", "true").unwrap();
+    reglages
+        .set(crate::config::REGLAGE_EXCLUSIF_ARME_PAR_ASIO, "true")
+        .unwrap();
+
+    assert_eq!(
+        orch.reglages_sortie_locale_selon_le_repli(|_| None, Some("asio")),
+        (false, "auto".to_string()),
+        "sous le repli, la sortie recréée doit ouvrir l'hôte par défaut, en partagé"
+    );
+    // Le choix enregistré n'a pas bougé.
+    assert_eq!(
+        reglages.get("local_audio_backend").unwrap().as_deref(),
+        Some("asio")
+    );
+    // Sans repli, ASIO comme avant (exclusif par nature sous Windows).
+    let (_, hote) = orch.reglages_sortie_locale_selon_le_repli(|_| None, None);
+    assert_eq!(hote, "asio");
+
+    // Un exclusif demandé par l'utilisateur lui-même reste honoré.
+    reglages
+        .delete(crate::config::REGLAGE_EXCLUSIF_ARME_PAR_ASIO)
+        .unwrap();
+    assert_eq!(
+        orch.reglages_sortie_locale_selon_le_repli(|_| None, Some("asio")),
+        (true, "auto".to_string())
     );
 }
 
@@ -10106,4 +10154,284 @@ async fn une_zone_reseau_sans_opt_in_entend_le_crossfeed_sur_un_flux_2742() {
         "le statut publié VERROUILLE un crossfeed qui s'entend : diaphonie \
          mesurée {diaphonie_db:.1} dB sur le flux, et pourtant {statut:?}"
     );
+}
+
+/// #5522 — une session de flux ABANDONNÉE avant l'envoi ne part pas à la
+/// sortie : la zone s'arrête et le dit.
+///
+/// Le journal de Gros Bidon (fil 2212, v1.0.0-rc3) : le téléchargement Qobuz
+/// échoue, `streaming_session_abandonnee_producteur_mort` à 16:46:00.428, puis
+/// `orchestrator_play output_sent=true` à 16:46:00.606. La sortie locale tire
+/// alors `/stream/<id>.wav`, reçoit un 404, et la zone reste « en lecture »
+/// à 0:00 pendant plus de trois minutes, sans bandeau
+/// (`octets_servis_inconnus_zone_non_coupee`). La session était déjà morte
+/// AVANT l'envoi : rien ne justifiait d'envoyer.
+#[tokio::test]
+async fn une_session_abandonnee_avant_l_envoi_arrete_la_zone_au_lieu_de_jouer_un_404_5522() {
+    use crate::http::streamer::StreamInfo;
+
+    let orch = test_orchestrator();
+    let device_id = "mock-5522";
+    orch.outputs
+        .lock()
+        .await
+        .register(Box::new(MockOutput::new(device_id, "Sortie 5522")));
+
+    let info = StreamInfo {
+        format: "wav".to_string(),
+        mime_type: "audio/wav".to_string(),
+        ..StreamInfo::default()
+    };
+    let (morte, _tx, _ready) = orch.streamer.create_session(info, false, 1).await;
+    abandonner_la_session_de_transcodage(&orch.streamer, &morte, None).await;
+
+    let req = super::PlayRequest {
+        zone_id: 2,
+        output_device_id: Some(device_id.into()),
+        track_id: None,
+        source: Some("qobuz".into()),
+        source_id: Some("2206801".into()),
+        title: Some("Time".into()),
+        artist_name: None,
+        album_title: None,
+        cover_url: None,
+        duration_ms: Some(275_000),
+        seek_ms: None,
+        temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: None,
+        track_number: None,
+        disc_number: None,
+        album_ref: None,
+    };
+    let resolved = super::ResolvedStream {
+        url: format!("http://127.0.0.1:8888/stream/{morte}.wav"),
+        mime_type: "audio/wav".into(),
+        title: "Time".into(),
+        artist: None,
+        album: None,
+        duration_ms: Some(275_000),
+        source: "qobuz".into(),
+        cover_url: None,
+        stream_id: Some(morte.clone()),
+        file_size: None,
+        sample_rate: Some(44_100),
+        bit_depth: Some(16),
+        channels: Some(2),
+        origin_url: None,
+        bitrate_kbps: None,
+        format_source: None,
+    };
+    let habillage = super::transport::Habillage {
+        album: None,
+        cover_path: None,
+    };
+
+    let (output_sent, output_error) = orch
+        .envoyer_a_la_sortie(
+            &req,
+            &resolved,
+            &habillage,
+            false,
+            std::time::Instant::now(),
+            0,
+        )
+        .await;
+
+    let outputs = orch.outputs.lock().await;
+    let out = outputs.get(device_id).unwrap();
+    let guard = out.lock().await;
+    let mock = guard
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("mock output");
+    assert_eq!(
+        mock.play_call_count().await,
+        0,
+        "la session est morte avant l'envoi : la sortie ne doit rien recevoir \
+         (sinon 404 sur /stream/<id> et zone figée à 0:00)"
+    );
+    assert!(
+        !output_sent,
+        "output_sent doit être faux : c'est ce qui arrête la zone avec un bandeau"
+    );
+    let message = output_error.expect("un message pour le bandeau de la zone");
+    assert!(
+        message.contains("flux"),
+        "le message doit dire que le flux du service n'a pas pu être ouvert : {message}"
+    );
+}
+
+/// #6658 — banc commun : une sortie factice dont `play_media` s'arrête à
+/// mi-chemin (la fenêtre où une sortie locale relâche le flux précédent), et
+/// une session de flux Qobuz VIVANTE au moment de la garde #5522.
+async fn banc_session_morte_pendant_l_envoi_6658(
+    device_id: &'static str,
+) -> (
+    PlaybackOrchestrator,
+    String,
+    super::PlayRequest,
+    super::ResolvedStream,
+    BarriereMock,
+) {
+    use crate::http::streamer::StreamInfo;
+
+    let orch = test_orchestrator();
+    let mock = MockOutput::new(device_id, "Sortie 6658");
+    let barriere = mock.retenir_la_lecture();
+    orch.outputs.lock().await.register(Box::new(mock));
+
+    let info = StreamInfo {
+        format: "wav".to_string(),
+        mime_type: "audio/wav".to_string(),
+        ..StreamInfo::default()
+    };
+    let (sid, _tx, _ready) = orch.streamer.create_session(info, false, 1).await;
+    // `_tx` est lâché ici : la session reste inscrite (son émetteur de
+    // maintien vit avec elle), comme une session dont le producteur n'a pas
+    // encore écrit.
+
+    let req = super::PlayRequest {
+        zone_id: 2,
+        output_device_id: Some(device_id.into()),
+        track_id: None,
+        source: Some("qobuz".into()),
+        source_id: Some("25822841".into()),
+        title: Some("No Amount of Loving".into()),
+        artist_name: None,
+        album_title: None,
+        cover_url: None,
+        duration_ms: Some(180_000),
+        seek_ms: None,
+        temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: None,
+        track_number: None,
+        disc_number: None,
+        album_ref: None,
+    };
+    let resolved = super::ResolvedStream {
+        url: format!("http://127.0.0.1:8888/stream/{sid}.wav"),
+        mime_type: "audio/wav".into(),
+        title: "No Amount of Loving".into(),
+        artist: None,
+        album: None,
+        duration_ms: Some(180_000),
+        source: "qobuz".into(),
+        cover_url: None,
+        stream_id: Some(sid.clone()),
+        file_size: None,
+        sample_rate: Some(192_000),
+        bit_depth: Some(24),
+        channels: Some(2),
+        origin_url: None,
+        bitrate_kbps: None,
+        format_source: None,
+    };
+    (orch, sid, req, resolved, barriere)
+}
+
+type BarriereMock = (
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
+
+/// #6658 — la course du fil 2350 : la session est vivante quand la garde
+/// #5522 la regarde, puis son producteur l'abandonne PENDANT l'envoi à la
+/// sortie (téléchargement Qobuz coupé après un octet). La sortie, qui ouvre
+/// `/stream/<id>` à la fin de l'envoi, tirerait un 404, et la zone resterait
+/// « en lecture » à 0:00 sans un mot. Attendu : la sortie est arrêtée,
+/// `output_sent` est faux et le bandeau dit que le flux n'a pas pu être
+/// ouvert — le chemin d'erreur ordinaire.
+#[tokio::test]
+async fn une_session_abandonnee_pendant_l_envoi_arrete_la_sortie_et_le_dit_6658() {
+    let device_id = "mock-6658-course";
+    let (orch, sid, req, resolved, (entree, feu_vert)) =
+        banc_session_morte_pendant_l_envoi_6658(device_id).await;
+    let habillage = super::transport::Habillage {
+        album: None,
+        cover_path: None,
+    };
+
+    let envoi = orch.envoyer_a_la_sortie(
+        &req,
+        &resolved,
+        &habillage,
+        false,
+        std::time::Instant::now(),
+        0,
+    );
+    let producteur = async {
+        // La garde #5522 est passée : la sortie est entrée dans son envoi.
+        entree.notified().await;
+        assert!(orch.streamer.session_alive(&sid).await);
+        // Le producteur meurt maintenant, avant que la sortie n'ouvre le flux.
+        abandonner_la_session_de_transcodage(&orch.streamer, &sid, None).await;
+        feu_vert.notify_one();
+    };
+    let ((output_sent, output_error), ()) = tokio::join!(envoi, producteur);
+
+    let outputs = orch.outputs.lock().await;
+    let out = outputs.get(device_id).unwrap();
+    let guard = out.lock().await;
+    let mock = guard
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("mock output");
+    assert!(
+        !output_sent,
+        "un flux mort pendant l'envoi ne compte pas comme envoyé : c'est ce \
+         qui arrête la zone avec un bandeau"
+    );
+    assert!(
+        mock.stop_call_count() >= 1,
+        "la sortie qui tient un flux mort doit être arrêtée"
+    );
+    let message = output_error.expect("un message pour le bandeau de la zone");
+    assert!(
+        message.contains("n'a pas pu être ouvert") && message.contains("qobuz"),
+        "le message dit que le flux du service n'a pas pu être ouvert : {message}"
+    );
+}
+
+/// #6658 — contre-témoin : une session RETIRÉE pendant l'envoi sans que son
+/// producteur l'ait abandonnée (Stop, saut de piste, nouvelle lecture) n'est
+/// pas un échec de cette lecture. La sortie n'est pas arrêtée, aucun bandeau.
+#[tokio::test]
+async fn une_session_retiree_sans_abandon_pendant_l_envoi_n_arrete_rien_6658() {
+    let device_id = "mock-6658-retrait";
+    let (orch, sid, req, resolved, (entree, feu_vert)) =
+        banc_session_morte_pendant_l_envoi_6658(device_id).await;
+    let habillage = super::transport::Habillage {
+        album: None,
+        cover_path: None,
+    };
+
+    let envoi = orch.envoyer_a_la_sortie(
+        &req,
+        &resolved,
+        &habillage,
+        false,
+        std::time::Instant::now(),
+        0,
+    );
+    let retrait = async {
+        entree.notified().await;
+        orch.streamer.remove_session(&sid).await;
+        feu_vert.notify_one();
+    };
+    let ((output_sent, output_error), ()) = tokio::join!(envoi, retrait);
+
+    let outputs = orch.outputs.lock().await;
+    let out = outputs.get(device_id).unwrap();
+    let guard = out.lock().await;
+    let mock = guard
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("mock output");
+    assert!(output_sent, "l'envoi a abouti : {output_error:?}");
+    assert_eq!(output_error, None);
+    assert_eq!(mock.stop_call_count(), 0, "rien ne doit arrêter la sortie");
 }

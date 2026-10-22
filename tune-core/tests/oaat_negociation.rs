@@ -36,10 +36,11 @@ fn tous_les_chemins_attendent_leur_reponse() {
     let src = source();
     assert_eq!(
         appels_au_helper(&src),
-        6,
+        7,
         "les chemins qui proposent un format doivent tous appeler \
          `attendre_accord_format` — connexion/reconnexion, DSD natif, PCM direct, \
-         chemin principal et transition gapless. Un `FormatReject` ignoré lance \
+         chemin principal, transition gapless et renégociation de la reprise \
+         après `endpoint_release` (`reprendre_apres_liberation`, #6393). Un `FormatReject` ignoré lance \
          la lecture alors que l'endpoint a dit non ; un `FormatAccept` étranger \
          décale le flux suivant (#2282, #2283)"
     );

@@ -161,11 +161,14 @@ async fn lire_zone(State(state): State<AppState>, Path(id): Path<i64>) -> Json<V
 async fn ecrire_zone(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(corps): Json<Value>,
 ) -> Response {
     // Greffon facultatif (gratuit) : écrire exige qu'il soit installé et
     // activé, comme l'égaliseur (`PUT /zones/{id}/dsp`).
-    if let Err(r) = crate::premium_audio_plugins::require_installed(&state, rc::ID_GREFFON) {
+    if let Err(r) =
+        crate::premium_audio_plugins::require_installed(&state, rc::ID_GREFFON, &headers)
+    {
         return r;
     }
     let reglage = match valider(corps) {
@@ -208,11 +211,14 @@ async fn lire_album(State(state): State<AppState>, Path(id): Path<i64>) -> Json<
 async fn ecrire_album(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(corps): Json<Value>,
 ) -> Response {
     // Greffon facultatif (gratuit) : écrire exige qu'il soit installé et
     // activé, comme l'égaliseur (`PUT /zones/{id}/dsp`).
-    if let Err(r) = crate::premium_audio_plugins::require_installed(&state, rc::ID_GREFFON) {
+    if let Err(r) =
+        crate::premium_audio_plugins::require_installed(&state, rc::ID_GREFFON, &headers)
+    {
         return r;
     }
     let reglage = match valider(corps) {
@@ -228,16 +234,22 @@ async fn ecrire_album(
         )
             .into_response();
     }
+    // #6247 — comme pour une zone : la piste en cours de cet album l'entend
+    // tout de suite, et la réponse le dit.
+    let a_chaud = state.orchestrator.refresh_album_reaffectation(id).await;
     let mut v = forme(&cle, Some(reglage));
     v["album_id"] = json!(id);
+    v["applied_live"] = json!(a_chaud);
     Json(v).into_response()
 }
 
 async fn effacer_album(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let cle = rc::cle_d_album(id);
     let _ = settings(&state).delete(&cle);
+    let a_chaud = state.orchestrator.refresh_album_reaffectation(id).await;
     let mut v = forme(&cle, None);
     v["album_id"] = json!(id);
+    v["applied_live"] = json!(a_chaud);
     Json(v).into_response()
 }
 
@@ -254,6 +266,99 @@ mod tests {
         assert!(r.is_err(), "+40 dB hors bornes");
         let ok = valider(serde_json::to_value(rc::prereglage("quad_to_5_1").unwrap()).unwrap());
         assert_eq!(ok.unwrap().outputs, 6);
+    }
+
+    /// #6247 — « Enregistrer pour cet album » pendant que la zone joue une
+    /// piste de l'album : la sortie locale reçoit la matrice tout de suite, et
+    /// la réponse le dit (`applied_live`). Effacer la règle la retire aussi.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn la_regle_d_album_s_applique_a_la_piste_en_cours_6247() {
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::zone_repo::ZoneRepo;
+        use tune_core::outputs::local::LocalOutput;
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let db = state.backend.clone();
+        db.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Pink Floyd')",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (7, 'The Dark Side Of The Moon', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, channels) \
+             VALUES (42, 'Time', 7, 1, 2)",
+            &[],
+        )
+        .unwrap();
+        settings(&state)
+            .set("plugin_channel-remap_installed", "true")
+            .unwrap();
+        let zone_id = ZoneRepo::with_backend(db.clone())
+            .create("Salon", Some("local"), Some("local:DAC"))
+            .unwrap();
+        state
+            .outputs
+            .lock()
+            .await
+            .register(Box::new(LocalOutput::new("DAC".to_string())));
+        state
+            .playback
+            .play(
+                zone_id,
+                tune_core::playback::NowPlaying {
+                    track_id: Some(42),
+                    title: "Time".into(),
+                    source: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let matrice_posee = || async {
+            let arc = state.outputs.lock().await.get("local:DAC").unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<LocalOutput>()
+                .expect("sortie locale")
+                .has_reaffectation()
+        };
+        assert!(!matrice_posee().await, "rien de posé avant la règle");
+
+        let corps = serde_json::to_value(rc::prereglage("swap_lr").unwrap()).unwrap();
+        let reponse = ecrire_album(
+            State(state.clone()),
+            Path(7),
+            axum::http::HeaderMap::new(),
+            Json(corps),
+        )
+        .await;
+        assert_eq!(reponse.status(), StatusCode::OK);
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&octets).unwrap();
+        assert_eq!(
+            v["applied_live"], true,
+            "la piste en cours est de cet album : la règle doit s'appliquer à chaud"
+        );
+        assert!(
+            matrice_posee().await,
+            "la sortie locale de la zone doit avoir reçu la matrice de l'album \
+             sans attendre la piste suivante"
+        );
+
+        let reponse = effacer_album(State(state.clone()), Path(7)).await;
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&octets).unwrap();
+        assert_eq!(v["applied_live"], true);
+        assert!(!matrice_posee().await, "règle effacée : matrice retirée");
     }
 
     #[test]

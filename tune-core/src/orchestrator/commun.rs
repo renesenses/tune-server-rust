@@ -1,5 +1,14 @@
 use super::*;
 
+/// `(nature, id, service, titre, pochette)` du conteneur d'une écoute.
+pub(super) type ContexteResolu = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 impl PlaybackOrchestrator {
     /// Duplicate-network-play detector. Returns `true` when `(source,
     /// source_id)` was recorded as this zone's last network play within
@@ -318,7 +327,7 @@ impl PlaybackOrchestrator {
     /// absolute HTTP URL accessible by network renderers (DLNA/OpenHome).
     /// Hash-only values like `"abc123def"` become `http://IP:PORT/api/v1/artwork/abc123def`.
     /// Full URLs (starting with `http://` or `https://`) are passed through unchanged.
-    pub(super) fn resolve_cover_url(&self, cover: Option<&str>) -> Option<String> {
+    pub(crate) fn resolve_cover_url(&self, cover: Option<&str>) -> Option<String> {
         let c = cover?;
         if c.starts_with("http://") || c.starts_with("https://") {
             return Some(c.to_string());
@@ -368,14 +377,38 @@ impl PlaybackOrchestrator {
     where
         F: Fn(&str) -> Option<String>,
     {
+        self.reglages_sortie_locale_selon_le_repli(
+            environnement,
+            crate::demarrage_inacheve::repli_actif(),
+        )
+    }
+
+    /// Même résolution, le repli de démarrage (#6452) en PARAMÈTRE : muter le
+    /// repli global depuis un test changerait l'hôte de tous les autres.
+    ///
+    /// Sous le repli, ce démarrage n'ouvre pas ASIO : la sortie reconstruite à
+    /// la volée doit partir, elle aussi, sur l'hôte par défaut et en partagé —
+    /// sinon le premier appui sur Lecture rouvrirait le pilote que le
+    /// démarrage vient d'écarter (`AsioExclusiveOutput`).
+    pub fn reglages_sortie_locale_selon_le_repli<F>(
+        &self,
+        environnement: F,
+        repli: Option<&str>,
+    ) -> (bool, String)
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let reglages = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
-        let backend = reglages
+        let demande_hote = reglages
             .get("local_audio_backend")
             .ok()
             .flatten()
             .filter(|v| !v.trim().is_empty())
             .or_else(|| crate::config::resolve_local_audio_backend(&environnement))
             .unwrap_or_else(|| "auto".to_string());
+        let repli_applique = repli.is_some()
+            && crate::demarrage_inacheve::hote_susceptible_de_bloquer(&demande_hote);
+        let backend = crate::demarrage_inacheve::hote_de_ce_demarrage(demande_hote, repli);
         let demande = reglages
             .get("local_exclusive_mode")
             .ok()
@@ -386,6 +419,16 @@ impl PlaybackOrchestrator {
                     .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
                     .unwrap_or(false)
             });
+        let arme_par_asio = reglages
+            .get(crate::config::REGLAGE_EXCLUSIF_ARME_PAR_ASIO)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+        let demande = crate::demarrage_inacheve::exclusif_de_ce_demarrage(
+            demande,
+            arme_par_asio,
+            repli_applique,
+        );
         // ASIO est exclusif par nature, et c'est une notion Windows (#1268,
         // #3192). La règle vit dans `tune-core::config` et n'est pas recopiée
         // ici : une seule écriture pour les deux chemins.
@@ -536,6 +579,35 @@ impl PlaybackOrchestrator {
                 PorteeDuReglage::Immediate
             }
         }
+    }
+
+    /// #6466 — le conteneur d'UNE écoute : celui que porte l'élément de file
+    /// joué (`queue_items.context_*`, posé par « Lire ensuite », « Ajouter à
+    /// la file » et le transfert de zone), et à défaut celui de la SESSION de
+    /// la zone (le dernier « Lire »), comme avant. Rend `(nature, id,
+    /// service, titre, pochette)`.
+    pub(super) fn contexte_de_l_ecoute(
+        &self,
+        etat: &crate::playback::ZoneState,
+        track_id: Option<i64>,
+        source_id: Option<&str>,
+    ) -> ContexteResolu {
+        if let Some(c) = crate::db::contexte_de_file::contexte_de_la_piste_jouee(
+            &self.db,
+            etat.zone_id,
+            etat.queue_position,
+            track_id,
+            source_id,
+        ) {
+            return (Some(c.nature), c.id, c.service, c.titre, c.pochette);
+        }
+        (
+            etat.session_context_type.clone(),
+            etat.session_context_id.clone(),
+            etat.session_context_source.clone(),
+            etat.session_context_title.clone(),
+            etat.session_context_cover.clone(),
+        )
     }
 
     // Un argument par colonne écrite ; une structure changerait tous les appelants pour un gain de forme (clippy 1.98).
@@ -710,6 +782,8 @@ impl PlaybackOrchestrator {
         // (`play_without_history`) ne doit pas doublonner la ligne.
         if attente.record_history && attente.source != "radio" {
             let etat = self.playback.get_state(zone_id).await;
+            let contexte =
+                self.contexte_de_l_ecoute(&etat, attente.track_id, attente.source_id.as_deref());
             let album_id = attente.track_id.and_then(|tid| {
                 TrackRepo::with_backend(self.db.clone())
                     .get(tid)
@@ -729,12 +803,12 @@ impl PlaybackOrchestrator {
                 attente.cover_path.as_deref(),
                 etat.session_profile_id,
                 ContexteEcoute {
-                    nature: etat.session_context_type.as_deref(),
-                    id: etat.session_context_id.as_deref(),
+                    nature: contexte.0.as_deref(),
+                    id: contexte.1.as_deref(),
                     rang: rang_a_retenir(etat.shuffle, etat.queue_position),
-                    service: etat.session_context_source.as_deref(),
-                    titre: etat.session_context_title.as_deref(),
-                    pochette: etat.session_context_cover.as_deref(),
+                    service: contexte.2.as_deref(),
+                    titre: contexte.3.as_deref(),
+                    pochette: contexte.4.as_deref(),
                 },
                 None,
             );

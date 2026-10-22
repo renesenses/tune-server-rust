@@ -138,7 +138,7 @@ pub const CLE_REGLAGE: &str = "spotify_lecture_experimentale";
 pub const SENTINELLE_NON_ACTIVEE: &str = "spotify_playback_disabled:";
 
 pub const MOTIF_NON_ACTIVEE: &str =
-    "Lecture Spotify non activée (option expérimentale dans les Réglages)";
+    "Lecture Spotify non activée (Réglages > Spotify > « Lecture Spotify (expérimental) »)";
 
 /// Le réglage est-il activé ? Absent ou illisible : non.
 pub fn lecture_activee(db: &Arc<dyn crate::db::backend::DbBackend>) -> bool {

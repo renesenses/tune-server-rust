@@ -1185,6 +1185,15 @@ pub struct PlaybackOrchestrator {
     /// niveaux de la piste suivante démarrent à l'avance gapless, voir
     /// [`Self::advance_queue_metadata`]. Verrou std : accès courts.
     levels_prewarm: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #5050 (fil 2236) — zones posées en pause par un transfert, sans que
+    /// rien n'ait été envoyé à leur appareil : leur reprise rétablit la piste
+    /// à la position (voir `transfert_en_pause_5050`). Verrou std : accès
+    /// courts.
+    transferts_en_pause: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #6612 — la dernière reprise SUR PLACE d'un renderer réseau, par zone :
+    /// (position, instant). Voir `plage_hors_fichier_6612`. Verrou std :
+    /// accès courts.
+    reprises_sur_place: std::sync::Mutex<std::collections::HashMap<i64, (u64, std::time::Instant)>>,
     /// Anti-rebond du redémarrage de flux déclenché par un changement
     /// d'égaliseur sur un chemin NON local (#1710, lot 2).
     ///
@@ -1422,7 +1431,9 @@ pub struct ResolvedStream {
     pub file_size: Option<u64>,
     /// Audio sample rate in Hz for the output stream (e.g. 176400 for DSD64->PCM).
     pub sample_rate: Option<u32>,
-    /// Output bit depth (e.g. 24 for DSD->PCM).
+    /// Output bit depth (e.g. 24 for DSD->PCM). #6334 — `None` for a lossy
+    /// service codec, even decoded to WAV: this is what the SOURCE announces.
+    /// What reaches an output's `PlayMedia` is `profondeur_du_fil`.
     pub bit_depth: Option<u32>,
     /// Number of audio channels.
     pub channels: Option<u32>,
@@ -1441,6 +1452,12 @@ pub struct ResolvedStream {
     /// et la règle écrite dans `tune-bandcamp` veut que ce débit soit
     /// « annoncé comme tel partout où il apparaît ».
     pub bitrate_kbps: Option<u32>,
+    /// #6334 — le codec que le SERVICE a livré (`aac`, `flac`…), en
+    /// minuscules, quand il le nomme. Distinct de `mime_type`, qui décrit le
+    /// CONTENEUR servi : un AAC décodé pour une sortie qui exige du WAV part
+    /// en `audio/wav`, et l'annonce ne doit pas en faire un WAV « CD ».
+    /// `None` hors services de streaming : la source y est nommée ailleurs.
+    pub format_source: Option<String>,
 }
 
 pub struct ResolvedQueueItem {
@@ -1555,6 +1572,50 @@ impl StreamingDsp {
         self.compensation.as_ref().map(|c| c.cible_db())
     }
 
+    /// #6130 — la chaîne telle que le journal de conversion la décrit, dans
+    /// l'ordre de [`Self::process`] : chaque étage avec la fréquence à
+    /// laquelle il a été PRÉPARÉ, puis l'entrée et la sortie du flux qu'il
+    /// traite. Aucun étage ne rééchantillonne : entrée et sortie valent la
+    /// cadence du porteur, et un étage préparé à une autre cadence que celle
+    /// du flux se lit donc d'un coup d'œil. Diagnostic seulement.
+    fn decrire(&self) -> String {
+        let flux = self.sample_rate;
+        let mut etages: Vec<String> = Vec::new();
+        if let Some(f) = self.replaygain {
+            etages.push(format!("replaygain:x{f:.4}@{flux}"));
+        }
+        if let Some(eq) = self.eq.as_ref() {
+            etages.push(eq.decrire());
+        }
+        if self.convolver.is_some() {
+            etages.push(format!("convolveur@{flux}"));
+        }
+        if let Some(cf) = self.crossfeed.as_ref() {
+            let inerte = if self.channels == 2 { "" } else { "(inerte)" };
+            etages.extend(cf.decrire().into_iter().map(|e| format!("{e}{inerte}")));
+        }
+        if let Some(c) = self.compensation.as_ref() {
+            etages.push(format!("compensation:{:+.2}dB@{flux}", c.cible_db()));
+        }
+        if etages.is_empty() {
+            return format!("aucun_etage canaux={}", self.channels);
+        }
+        let etages: Vec<String> = etages
+            .into_iter()
+            .map(|e| format!("{e}[{flux}->{flux}]"))
+            .collect();
+        format!(
+            "{} canaux={}{}",
+            etages.join(" > "),
+            self.channels,
+            if self.en_vol.is_some() {
+                " releve_en_vol"
+            } else {
+                ""
+            }
+        )
+    }
+
     /// Applique les trois étages EN PLACE.
     ///
     /// Sans étage actif, `pcm` n'est pas touché d'un octet : c'est le témoin
@@ -1654,6 +1715,8 @@ impl PlaybackOrchestrator {
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
             dlna_canaux_max: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashSet::new()),
+            transferts_en_pause: std::sync::Mutex::new(std::collections::HashSet::new()),
+            reprises_sur_place: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
             traitement_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1741,6 +1804,10 @@ mod transport;
 mod repli_de_peripherique;
 
 mod resolve_stream;
+// #6130 — quitter une radio sur une sortie DLNA : Stop, puis attendre le renderer.
+mod sortie_de_radio_dlna_6130;
+// #6130 — le contexte d'un flux de conversion, pour son journal.
+mod contexte_de_conversion_6130;
 // #4366 — 403 YouTube : rafraîchir yt-dlp, puis une seule relance.
 mod relance_ytdlp_4366;
 // Lot L3b (rc3) — un `Seek` refusé par un renderer DLNA (701/710/711).
@@ -1748,12 +1815,20 @@ mod relance_ytdlp_4366;
 mod seek_refuse_par_le_renderer;
 
 mod resolve_local;
+// #6059 — Seek ignoré par le renderer : le flux natif relancé à la position.
+pub(crate) mod seek_natif_6059;
+#[cfg(test)]
+mod seek_natif_6059_bout_en_bout;
 
 // #2742 — le crossfeed des pistes de la bibliothèque sur une zone réseau.
 mod crossfeed_bibliotheque_reseau;
 // #5071 — témoins de bout en bout de la compensation de niveau réseau.
 #[cfg(test)]
 mod compensation_reseau_5071_tests;
+
+// #4354 — repli à 176,4 kHz d'un DSD décimé qui manque son pré-tampon.
+#[cfg(test)]
+mod repli_dsd_4354_tests;
 
 // #5871 — la préparation DSP ne fait plus la queue derrière l'écrivain.
 #[cfg(test)]
@@ -1772,6 +1847,9 @@ pub use dsp::PorteeDuReglage;
 // #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
 #[cfg(test)]
 mod volume_pure_5695_tests;
+// #6541 — limites de sécurité et de confort, tenues sur tous les chemins.
+#[cfg(test)]
+mod volume_limites_6541_tests;
 // #4407 — l'égaliseur remplacé en vol dans un flux réseau fabriqué par Tune.
 mod eq_en_vol;
 #[cfg(test)]
@@ -1780,6 +1858,14 @@ mod eq_en_vol_4407_tests;
 // bibliothèque native de test.
 #[cfg(test)]
 mod greffon_natif_tiers_tests;
+// #6256 — la désinstallation d'un greffon natif tiers ne rebâtit que les
+// zones qui l'utilisent.
+#[cfg(all(test, feature = "local-audio"))]
+mod purge_greffon_tiers_6256_tests;
+// #6522, #6524 — le verdict PURE de la sortie locale suit les réglages
+// enregistrés, dans l'état que la vraie bascule produit.
+#[cfg(all(test, feature = "local-audio"))]
+mod verdict_pure_reglages_6522_tests;
 
 /// Fil 2062 / #5550 — durée d'une piste UPnP lue dans les en-têtes du flux.
 mod duree_du_flux_2062;
@@ -1814,7 +1900,10 @@ pub use bandcamp::*;
 mod bandcamp_resignature;
 
 mod qualite_pre_armee;
-pub(crate) use qualite_pre_armee::{QualitePreArmee, format_du_mime, format_nomme_par_la_source};
+pub(crate) use qualite_pre_armee::{
+    QualitePreArmee, debit_annonce_par_le_service, format_du_mime, format_livre_par_le_service,
+    format_nomme_par_la_source, profondeur_annoncee_par_le_service, profondeur_du_fil,
+};
 
 /// Ce qu'on ANNONCE au renderer pour une piste de serveur média : le MIME ne
 /// se devine plus dans la seule URL, qui pour un `<res>` de Tune ne porte
@@ -1872,7 +1961,8 @@ async fn arm_local_stream_consumer_watch(
             format = %session.info.format,
             mime_type = %session.info.mime_type,
             file_path = ?file_path,
-            proxy_url = ?proxy_url,
+            // L'hôte seul : l'URL amont d'un mandataire est souvent signée (#6468).
+            proxy_hote = ?proxy_url.as_deref().map(resolve_direct::hote_pour_le_journal),
             active_consumers,
             "local_stream_never_consumed"
         );
@@ -1952,6 +2042,10 @@ mod dsd_upnp_politique_de_zone_tests;
 #[cfg(test)]
 mod double_dsp_dsf_aac_sortie_locale_tests;
 
+/// #6221 — un DST vers un renderer qui annonce le DSD part en DSF natif
+/// fabriqué à la volée ; sans DSD annoncé, en PCM comme avant.
+#[cfg(test)]
+mod dst_en_dsf_6221_tests;
 /// #4378 — un DSDIFF compressé DST ne part jamais brut vers un renderer
 /// réseau, même en DSD « natif » : il passe par le décodeur.
 #[cfg(test)]
@@ -1964,6 +2058,14 @@ mod mesure_saut_cd_5079;
 /// FLAC (ou le catalogue) ; inconnue, elle est refusée par une erreur nommée.
 #[cfg(test)]
 mod qobuz_cadence_nulle_5283_tests;
+#[cfg(test)]
+mod tidal_aac_annonce_6334_tests;
+
+/// #6401 — le préchargement sans blanc et la sonde de niveaux après une
+/// avance sans blanc passent par le même repli Qobuz en 16/44,1 que la
+/// lecture.
+#[cfg(test)]
+mod qobuz_repli_prechargement_6401_tests;
 
 /// #4384 — la crête d'une zone locale se lit après son DSP.
 #[cfg(test)]
@@ -2077,7 +2179,16 @@ mod curseur_intact_4283;
 /// reprise rétablit à la position au lieu de reprendre « sur place ».
 #[cfg(test)]
 mod pause_rend_le_peripherique_4177;
+#[cfg(test)]
+mod reprise_nouveau_flux_6264_tests;
 
+/// #6612 — une plage hors du fichier à la reprise : nouveau flux, à la position.
+pub(crate) mod plage_hors_fichier_6612;
+
+/// #6380 — la Lecture qui suit un redémarrage ramène le renderer réseau à la
+/// position restaurée (piste Qobuz ; sortie locale inchangée).
+#[cfg(test)]
+mod reprise_au_redemarrage_6380;
 /// Fil 2095 — le rétablissement d'une session morte ramène le renderer
 /// réseau à la position de la pause.
 #[cfg(test)]
@@ -2086,6 +2197,14 @@ mod reprise_dlna_position_2095;
 /// ait ouvert le flux.
 #[cfg(test)]
 mod reprise_renderer_cale_2125;
+/// #6062 — fil 2199 : une sortie qui a perdu sa session pendant la pause
+/// (Chromecast) refuse la reprise ; la lecture est rétablie à la position.
+#[cfg(test)]
+mod reprise_session_perdue_par_la_sortie_6062;
+/// #6476 — fil 2322 : après une reconnexion de Squeezelite, Lecture renvoie
+/// le flux (`strm s`) au lieu d'un `strm u` seul sur un lecteur sans flux.
+#[cfg(test)]
+mod reprise_slimproto_apres_reconnexion_6476;
 /// #6017 — fil 2194 : avancer dans une piste de la bibliothèque convertie à
 /// la volée recrée le flux à la position au lieu d'un `Seek` SOAP refusé.
 #[cfg(test)]
@@ -2098,6 +2217,17 @@ mod seek_de_reprise_caduc_5476;
 /// renderer qui n'est pas à la position de la pause.
 #[cfg(test)]
 mod seek_de_reprise_conditionnel_5050;
+// #5050 (fil 2236) — transfert depuis une zone en pause : la cible est posée
+// en pause sans rien recevoir.
+/// #6466 — l'historique par conteneurs : le conteneur de chaque élément de
+/// file, et le transfert de zone sans doublon.
+#[cfg(test)]
+mod historique_conteneurs_tests_6466;
+/// #6130 — quitter une radio sur une sortie DLNA : `Stop`, attente du départ
+/// du consommateur radio, puis `SetAVTransportURI`.
+#[cfg(test)]
+mod sortie_de_radio_dlna_6130_tests;
+mod transfert_en_pause_5050;
 
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).

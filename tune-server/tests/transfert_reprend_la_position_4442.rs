@@ -180,8 +180,12 @@ async fn le_transfert_reprend_a_la_position_et_ne_reste_pas_en_pause() {
     );
 }
 
-/// Une source en pause reste en pause sur la cible : la relance d'après le
-/// `Seek` ne doit pas faire entendre la piste avant la pause.
+/// Une source en pause reste en pause sur la cible, et rien n'est entendu.
+///
+/// #5050 (fil 2236) — depuis le correctif, la cible n'est même plus LANCÉE :
+/// elle est posée en pause à la position de la source, sans aucun ordre au
+/// renderer (le Beosound Stage restait figé en TRANSITIONING après
+/// Play + Seek + Pause). La reprise rétablit la piste à la position.
 #[tokio::test]
 async fn une_source_en_pause_reste_en_pause_sans_relance() {
     let (app, state, source, cible, _dir) = source_a_80_s().await;
@@ -196,7 +200,14 @@ async fn une_source_en_pause_reste_en_pause_sans_relance() {
     assert_eq!(status, StatusCode::OK, "transfert : {corps}");
 
     let (position, etat, relances) = cible_recue(&state).await;
-    assert_eq!(position, POSITION_SOURCE_MS as u64);
-    assert_eq!(etat, TransportState::Paused);
+    assert_eq!(position, 0, "le renderer cible ne reçoit aucun Seek");
+    assert_ne!(
+        etat,
+        TransportState::Playing,
+        "rien n'est lancé sur la cible"
+    );
     assert_eq!(relances, 0, "aucune relance quand la source était en pause");
+    let zone = state.playback.get_state(cible).await;
+    assert_eq!(zone.state, tune_core::playback::PlayState::Paused);
+    assert_eq!(zone.position_ms, POSITION_SOURCE_MS as i64);
 }

@@ -274,7 +274,7 @@ jobs:
       # `-p tune-server`. L'inserer au milieu de ce bloc fait rougir cette
       # garde-la — mesure sur Shrek avant de la deplacer ici.
       # plugin-catalog: {"features":"fast","base":["oaat","cloud-relay"],"packages":"workspace"}
-      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle --no-default-features --features oaat,cloud-relay,bandcamp,cd,circle,entree-audio
+      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-laissez-passer -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle -p tune-assistant-ia --no-default-features --features oaat,cloud-relay,bandcamp,cd,circle,entree-audio,assistant-ia
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
@@ -320,7 +320,7 @@ jobs:
       # leurs essais avec le jeu de fonctionnalites LIVRE, en plus du jeu
       # reduit du job `test`.
       # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding"],"packages":"plugins"}
-      - run: cargo test --no-fail-fast -p tune-server -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-circle -p tune-entree-audio --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
+      - run: cargo test --no-fail-fast -p tune-server -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-circle -p tune-entree-audio -p tune-assistant-ia --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
 
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
   # `audio-embedding` feature, now shipped in the release + docker builds. This
@@ -370,13 +370,13 @@ jobs:
           echo "::error::apt injoignable apres 3 essais"
           exit 1
       # plugin-catalog: {"features":"all","base":["audio-embedding"]}
-      - run: cargo check -p tune-server --features audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
+      - run: cargo check -p tune-server --features audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
       # #4378 : `dst` est livrée par toutes les recettes de publication ; ses
       # témoins (`audio::dff::tests_dst`) doivent donc tourner ici.
       - run: cargo test --no-fail-fast -p tune-core --features audio-embedding,dst
       # Le témoin HTTP des reports est derrière audio-embedding (#4187).
       # plugin-catalog: {"features":"fast","base":["local-audio","oaat","cloud-relay","audio-embedding"]}
-      - run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features local-audio,oaat,cloud-relay,audio-embedding,bandcamp,cd,circle,entree-audio acoustic_reports_4187
+      - run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features local-audio,oaat,cloud-relay,audio-embedding,bandcamp,cd,circle,entree-audio,assistant-ia acoustic_reports_4187
 
   # Signal Windows sur TOUTE PR qui touche du Rust — plus seulement sur une PR
   # « complete » (#3123).
@@ -424,7 +424,7 @@ jobs:
           save-if: false
       - name: Windows livré sans ASIO
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","postgres","plugins-wasm"]}
-        run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,cloud-relay,postgres,plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
+        run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,cloud-relay,postgres,plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
       - name: Download ASIO SDK
         shell: pwsh
         run: |
@@ -434,7 +434,7 @@ jobs:
           echo "CPAL_ASIO_DIR=$($sdkDir.FullName)" >> $env:GITHUB_ENV
       - name: ASIO
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","asio","postgres","plugins-wasm"]}
-        run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
+        run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
 
   # Un seul ABI/configuration macOS suffit : les deux architectures partagent le
   # meme cfg Rust. Les deux vrais binaires restent construits au push, puis par
@@ -462,7 +462,7 @@ jobs:
           key: x86_64-apple-darwin
           save-if: false
       # plugin-catalog: {"features":"all","base":["plugins-wasm"]}
-      - run: cargo check --package tune-server --features plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
+      - run: cargo check --package tune-server --features plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
 
   # Matrice de LIVRAISON : elle ne fabrique plus cinq artefacts jetables sur
   # chaque SHA de PR. Elle tourne sur chaque push de main/release (et en lancement
@@ -514,7 +514,7 @@ jobs:
       - name: Build (cross)
         if: matrix.cross
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm"]}
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
 
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux' && !matrix.cross
@@ -540,7 +540,7 @@ jobs:
       - name: Build (native, Linux with local-audio)
         if: "!matrix.cross && runner.os == 'Linux'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
 
       # Le SDK ASIO est telecharge AVANT la construction : l'artefact Windows
       # doit porter `local-audio` et `asio`, sinon il est incapable de toute
@@ -565,12 +565,12 @@ jobs:
       - name: Build (native, Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","asio","postgres","plugins-wasm"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
         # plugin-catalog: {"features":"all","base":["plugins-wasm"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
 
       # Garde-fou #3355 : le relais cloud doit etre DANS chaque binaire livre,
       # pas seulement dans la ligne `--features` qui l'a construit.
@@ -783,8 +783,9 @@ jobs:
       # le nommer ici fait linter le module hors `cfg(test)`, tel que le voient
       # les tests de tune-server. Garde : toute_feature_declaree_est_activee_par_une_porte_clippy.
       # #5512 : `isolement-disque-de-test` (tune-core), même motif que `journal-de-test`.
-      # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst","journal-de-test","isolement-disque-de-test"],"packages":"workspace"}
-      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,journal-de-test,isolement-disque-de-test,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio -- -D clippy::correctness
+      # #6336 : `services-factices` (tune-core), même motif : substituts de test seulement.
+      # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst","journal-de-test","isolement-disque-de-test","services-factices"],"packages":"workspace"}
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-laissez-passer -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle -p tune-assistant-ia --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,journal-de-test,isolement-disque-de-test,services-factices,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia -- -D clippy::correctness
 
   audit:
     name: Security Audit
@@ -843,6 +844,10 @@ jobs:
           # dependance a ete remplacee par `opus` / `opusic-sys`, maintenus
           # (#2251). Il n'y a plus d'avis a taire.
           ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384
+      # Cet outil est exclu du workspace et possède son propre verrou.
+      # L'audit de la racine ne couvre donc pas ses dépendances (#6503).
+      - name: Auditer le verrou du moissonneur Roon
+        run: cargo audit --file tools/moissonneur-roon/Cargo.lock --deny warnings
 
   ffi:
     name: FFI mobile (compilation)

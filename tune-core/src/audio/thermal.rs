@@ -12,10 +12,48 @@
 //! principe est le même que pour la mémoire : **une analyse facultative ne doit
 //! jamais mettre la machine en danger**, et être en retard d'une heure ne coûte
 //! rien.
+//!
+//! ## D'où vient la température (#5410, #6176)
+//!
+//! | Système | Source | Droits |
+//! |---|---|---|
+//! | Linux | `/sys/class/hwmon`, `/sys/class/thermal` (paquet CPU d'abord) | aucun |
+//! | Windows | compteurs PDH « Thermal Zone Information » (zones ACPI) | aucun en principe, NON MESURÉ |
+//! | macOS | aucune | — |
+//!
+//! **Windows.** Les compteurs de performance `\Thermal Zone Information(*)\
+//! High Precision Temperature` (dixièmes de kelvin), à défaut `…\Temperature`
+//! (kelvins), lus par l'API PDH. Ce sont les mêmes données que la classe WMI
+//! `Win32_PerfFormattedData_Counters_ThermalZoneInformation` ; lire un compteur
+//! LOCAL ne demande pas de droits d'administrateur selon la documentation —
+//! à vérifier sur une vraie machine. `MSAcpi_ThermalZoneTemperature` (WMI
+//! `root\WMI`), l'autre piste, exige l'administrateur : écartée. Une zone ACPI
+//! n'est pas le paquet CPU — le paquet n'est lisible sans pilote noyau tiers
+//! (le chemin de LibreHardwareMonitor) ni sur Intel ni sur AMD. Sur beaucoup
+//! de cartes de bureau la zone rend une valeur FIXE (27,85 °C, 301 K) : une
+//! valeur qui ne bouge pas de 0,5 °C en dix minutes est déclarée figée
+//! ([`SuiviDeStabilite`]) et vaut « illisible ».
+//!
+//! **macOS.** Pas de voie simple et sans privilèges : le SMC des Mac Intel
+//! se lit par des clés IOKit non documentées, les capteurs des puces Apple
+//! par l'API privée `IOHIDEventSystemClient`, et `powermetrics` exige `root`.
+//! Rien n'est tenté.
+//!
+//! ## Sans température lisible : analyses BRIDÉES
+//!
+//! Un garde qui ne peut pas mesurer ne bloque pas (il ne doit pas inventer une
+//! raison de s'arrêter), mais il ne laisse plus la machine à pleine largeur
+//! sans surveillance : les analyses de fond passent à UN fichier à la fois
+//! ([`brider_sans_thermometre`]), quelle que soit la vitesse réglée, et l'écran
+//! « État du serveur » le dit (`analyses_bridees` du diagnostic). Didier, fil
+//! 2239 : un Ryzen 7 3800X arrêté en surchauffe pendant le calcul de la plage
+//! dynamique, deux fichiers à la fois, sous Windows, sans aucune garde.
 
-// Hors Linux, la lecture sysfs et ses sélecteurs ne servent qu'aux tests : les
-// deux fonctions publiques y rendent `None` sans toucher au disque.
+// Hors Linux, la lecture sysfs et ses sélecteurs ne servent qu'aux tests.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
@@ -24,12 +62,12 @@ use tracing::{info, warn};
 /// 80 °C est franchement chaud pour un serveur au repos, et encore loin du
 /// seuil de throttling des CPU modernes (~100 °C) : on s'arrête avant que le
 /// matériel n'ait à se défendre lui-même, pas après.
-const PAUSE_ABOVE_C: f64 = 80.0;
+pub const PAUSE_ABOVE_C: f64 = 80.0;
 
 /// En dessous de cette température, elles reprennent. L'écart avec le seuil de
 /// pause est ce qui empêche l'oscillation : sans lui, une machine posée juste
 /// au seuil ferait démarrer/arrêter la passe en boucle.
-const RESUME_BELOW_C: f64 = 70.0;
+pub const RESUME_BELOW_C: f64 = 70.0;
 
 /// Décision d'un tour de garde, pour que l'appelant journalise les
 /// *transitions* et non chaque tour de boucle.
@@ -55,11 +93,13 @@ impl ThermalGate {
         Self::default()
     }
 
-    /// Lit la température et tranche. Sans capteur lisible (macOS, Windows,
-    /// conteneur sans `/sys` monté), renvoie toujours `Go` : un garde qui ne
-    /// peut pas mesurer ne doit pas inventer une raison de bloquer.
+    /// Lit la température et tranche. Sans capteur lisible (macOS, zone
+    /// Windows absente ou figée, conteneur sans `/sys` monté), renvoie
+    /// toujours `Go` : un garde qui ne peut pas mesurer ne doit pas inventer
+    /// une raison de bloquer. C'est la LARGEUR des lots qui se replie alors
+    /// ([`brider_sans_thermometre`], #5410).
     pub fn check(&mut self) -> Verdict {
-        self.decide(cpu_temp_celsius())
+        self.decide(lecture_thermique().celsius())
     }
 
     /// Logique pure, séparée de la lecture du système pour être testable
@@ -104,7 +144,9 @@ impl ThermalGate {
     /// attendre. Factorisé ici pour que les deux sweeps se comportent — et
     /// s'expriment — à l'identique.
     pub fn should_hold(&mut self, sweep: &str) -> bool {
-        match self.check() {
+        let verdict = self.check();
+        noter_la_retenue(sweep, matches!(verdict, Verdict::Hold { .. }));
+        match verdict {
             Verdict::Hold {
                 temp_c,
                 entering: true,
@@ -132,6 +174,37 @@ impl ThermalGate {
             Verdict::Go { .. } => false,
         }
     }
+}
+
+/// Les passes qu'une garde tient en ce moment parce que la machine est trop
+/// chaude (#4681, écran « ce qui tourne »). Chaque passe n'en savait rien
+/// au-delà de sa propre garde : ce registre le rend lisible par une route,
+/// sans lecture de capteur de plus.
+static RETENUES: Mutex<std::collections::BTreeSet<String>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+fn noter_la_retenue(sweep: &str, retenue: bool) {
+    let mut r = RETENUES.lock().unwrap_or_else(|e| e.into_inner());
+    if retenue {
+        if !r.contains(sweep) {
+            r.insert(sweep.to_string());
+        }
+    } else {
+        r.remove(sweep);
+    }
+}
+
+/// Les passes arrêtées par la chaleur (au-delà de [`PAUSE_ABOVE_C`], jusqu'au
+/// retour sous [`RESUME_BELOW_C`]), triées. Vide au frais, et vide quand la
+/// température n'est pas lisible : c'est alors la largeur qui se replie
+/// ([`brider_sans_thermometre`]), pas une garde qui retient.
+pub fn passes_retenues_par_la_chaleur() -> Vec<String> {
+    RETENUES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect()
 }
 
 /// Un relevé de température lu dans sysfs : la puce ou la zone qui l'expose,
@@ -296,32 +369,513 @@ fn choisir_temperature_processeur(releves: &[Releve]) -> Option<f64> {
     temperature_paquet_cpu(releves).or_else(|| maximum(releves.iter()))
 }
 
-/// Température sur laquelle le garde décide, en °C : le processeur d'abord.
-#[cfg(target_os = "linux")]
-fn cpu_temp_celsius() -> Option<f64> {
-    temperature_garde(&lire_capteurs(std::path::Path::new("/sys")))
+// ── #5320 : la sonde échantillonnée en tâche de fond, rendue lissée ──────
+
+/// Intervalle entre deux relevés de l'échantillonneur.
+const INTERVALLE_D_ECHANTILLONNAGE: Duration = Duration::from_secs(1);
+
+/// Nombre de relevés sur lesquels la médiane est prise : neuf secondes.
+///
+/// Fil 2260 (réponses 8309 et 8323) : au repos, `Package id 0` reste vers
+/// 30 °C, avec des pointes d'UNE seconde jusqu'à 98 °C toutes les cinq
+/// secondes, provoquées par la collecte de l'écran « État du serveur ». Sur
+/// neuf relevés espacés d'une seconde, ces pointes en occupent deux au plus :
+/// la médiane ne les voit pas. Un échauffement réel, lui, dure : il passe la
+/// médiane en cinq relevés, bien sous les 15 s de [`RELECTURE`].
+const RELEVES_PAR_FENETRE: usize = 9;
+
+/// Au-delà de cet âge, le dernier relevé ne vaut plus mesure : un
+/// échantillonneur bloqué sur un pilote `hwmon` lent ne doit pas figer une
+/// valeur rassurante. La température redevient alors inconnue, donc bridée.
+const PEREMPTION_DES_RELEVES: Duration = Duration::from_secs(30);
+
+/// La médiane d'une série ; `None` si elle est vide.
+fn mediane(valeurs: &[f64]) -> Option<f64> {
+    if valeurs.is_empty() {
+        return None;
+    }
+    let mut triees = valeurs.to_vec();
+    triees.sort_by(f64::total_cmp);
+    let milieu = triees.len() / 2;
+    Some(if triees.len().is_multiple_of(2) {
+        (triees[milieu - 1] + triees[milieu]) / 2.0
+    } else {
+        triees[milieu]
+    })
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Les derniers relevés d'une grandeur, et leur valeur lissée.
+#[derive(Debug, Default)]
+struct FenetreGlissante {
+    releves: std::collections::VecDeque<Option<f64>>,
+    dernier: Option<Instant>,
+}
+
+impl FenetreGlissante {
+    fn pousser(&mut self, valeur: Option<f64>, maintenant: Instant) {
+        if self.releves.len() == RELEVES_PAR_FENETRE {
+            self.releves.pop_front();
+        }
+        self.releves.push_back(valeur);
+        self.dernier = Some(maintenant);
+    }
+
+    /// La médiane des relevés lisibles de la fenêtre.
+    ///
+    /// Jamais moins prudente que la lecture instantanée sur l'inconnu
+    /// (#6450) : sans relevé, avec un dernier relevé illisible ou périmé, la
+    /// valeur est `None`, et la garde bride comme avant.
+    fn lissee(&self, maintenant: Instant) -> Option<f64> {
+        let dernier = self.dernier?;
+        if maintenant.saturating_duration_since(dernier) > PEREMPTION_DES_RELEVES {
+            return None;
+        }
+        self.releves.back().copied().flatten()?;
+        let lisibles: Vec<f64> = self.releves.iter().flatten().copied().collect();
+        mediane(&lisibles)
+    }
+}
+
+/// Les deux grandeurs suivies : celle du garde et celle de l'écran. Elles
+/// viennent d'UNE lecture des capteurs par relevé, et ne diffèrent que par
+/// leur repli (voir [`Releve`]).
+#[derive(Debug, Default)]
+struct Echantillons {
+    garde: FenetreGlissante,
+    ecran: FenetreGlissante,
+}
+
+impl Echantillons {
+    fn relever(&mut self, releves: &[Releve], maintenant: Instant) {
+        self.garde.pousser(temperature_garde(releves), maintenant);
+        self.ecran
+            .pousser(choisir_temperature_processeur(releves), maintenant);
+    }
+}
+
+/// Les relevés de l'échantillonneur ; `None` tant qu'il n'est pas lancé.
+static ECHANTILLONS: Mutex<Option<Echantillons>> = Mutex::new(None);
+
+/// Lance l'échantillonnage de la sonde en tâche de fond (#5320), une fois
+/// par processus ; les appels suivants ne font rien.
+///
+/// Un fil dédié, hors de l'exécuteur et hors des requêtes : la lecture ne
+/// tombe plus sur la pointe que provoque la requête qui la demande, et un
+/// pilote `hwmon` lent ne bloque que lui. Tant qu'il n'est pas lancé (outils,
+/// épreuves), la garde et l'écran lisent la sonde à la demande, comme avant.
+/// Linux seulement : c'est là que vivent les sondes lues (`/sys`).
+pub fn demarrer_l_echantillonnage() {
+    #[cfg(target_os = "linux")]
+    {
+        let mut echantillons = ECHANTILLONS.lock().unwrap_or_else(|e| e.into_inner());
+        if echantillons.is_some() {
+            return;
+        }
+        *echantillons = Some(Echantillons::default());
+        drop(echantillons);
+        let lance = std::thread::Builder::new()
+            .name("tune-thermal".into())
+            .spawn(|| {
+                loop {
+                    let releves = lire_capteurs(std::path::Path::new("/sys"));
+                    if let Some(e) = ECHANTILLONS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_mut()
+                    {
+                        e.relever(&releves, Instant::now());
+                    }
+                    std::thread::sleep(INTERVALLE_D_ECHANTILLONNAGE);
+                }
+            });
+        if let Err(e) = lance {
+            warn!(error = %e, "thermal_sampler_spawn_failed — lecture de la sonde à la demande");
+            *ECHANTILLONS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+}
+
+/// La valeur lissée choisie par `grandeur`, ou `lecture_directe()` quand
+/// l'échantillonneur n'est pas lancé.
+#[cfg(target_os = "linux")]
+fn lissee_ou_directe(
+    grandeur: fn(&Echantillons) -> &FenetreGlissante,
+    lecture_directe: impl FnOnce() -> Option<f64>,
+) -> Option<f64> {
+    let echantillons = ECHANTILLONS.lock().unwrap_or_else(|e| e.into_inner());
+    match echantillons.as_ref() {
+        Some(e) => grandeur(e).lissee(Instant::now()),
+        None => {
+            drop(echantillons);
+            lecture_directe()
+        }
+    }
+}
+
+/// Température sur laquelle le garde décide, en °C : le processeur d'abord,
+/// lissée par l'échantillonneur quand il tourne (#5320).
+#[cfg(target_os = "linux")]
+fn cpu_temp_celsius() -> Option<f64> {
+    lissee_ou_directe(
+        |e| &e.garde,
+        || temperature_garde(&lire_capteurs(std::path::Path::new("/sys"))),
+    )
+}
+
+/// Windows (#5410) : la plus chaude des zones thermiques ACPI lisibles.
+#[cfg(target_os = "windows")]
+fn cpu_temp_celsius() -> Option<f64> {
+    windows_pdh::zones_thermiques_celsius()
+        .into_iter()
+        .reduce(f64::max)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn cpu_temp_celsius() -> Option<f64> {
     None
+}
+
+// ── #5410 : la décision quand la température manque ─────────────────────
+
+/// Pourquoi la température ne compte pas comme une mesure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotifIllisible {
+    /// Aucun capteur lisible (macOS, Windows sans zone thermique, conteneur
+    /// ou machine virtuelle sans `/sys` peuplé).
+    AucunCapteur,
+    /// Une zone qui rend la même valeur depuis longtemps : une constante de
+    /// carte mère, pas un thermomètre (Windows seulement).
+    Figee,
+}
+
+impl MotifIllisible {
+    /// Le mot publié par le diagnostic (`analyses_bridees`).
+    pub fn id(self) -> &'static str {
+        match self {
+            MotifIllisible::AucunCapteur => "temperature_illisible",
+            MotifIllisible::Figee => "temperature_figee",
+        }
+    }
+}
+
+/// Ce que la machine dit de sa température, pour les analyses de fond.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LectureThermique {
+    Lisible(f64),
+    Illisible(MotifIllisible),
+}
+
+impl LectureThermique {
+    /// La température, seulement si elle vaut une mesure.
+    pub fn celsius(self) -> Option<f64> {
+        match self {
+            LectureThermique::Lisible(c) => Some(c),
+            LectureThermique::Illisible(_) => None,
+        }
+    }
+
+    /// Le motif du bridage, `None` quand la température est lisible.
+    pub fn motif_du_bridage(self) -> Option<MotifIllisible> {
+        match self {
+            LectureThermique::Lisible(_) => None,
+            LectureThermique::Illisible(m) => Some(m),
+        }
+    }
+}
+
+/// La largeur des lots d'analyse SANS température lisible : un fichier.
+///
+/// Deux fichiers à la fois tenaient deux cœurs pleins pendant des heures
+/// (12,5 % d'un Ryzen 16 fils chez Didier, fil 2239) ; un seul divise la
+/// chaleur produite par deux, et la passe finit quand même — en retard, ce
+/// qui ne coûte rien.
+pub const LARGEUR_SANS_THERMOMETRE: usize = 1;
+
+/// La largeur réglée (`taches_de_fond::vitesse`), bornée à
+/// [`LARGEUR_SANS_THERMOMETRE`] quand la température n'est pas lisible.
+/// Toujours au moins 1.
+pub fn brider_sans_thermometre(largeur: usize, lecture: &LectureThermique) -> usize {
+    let largeur = largeur.max(1);
+    match lecture {
+        LectureThermique::Lisible(_) => largeur,
+        LectureThermique::Illisible(_) => largeur.min(LARGEUR_SANS_THERMOMETRE),
+    }
+}
+
+/// Lectures nécessaires avant de déclarer une zone figée.
+const LECTURES_AVANT_VERDICT: u32 = 20;
+/// Durée d'observation nécessaire avant de déclarer une zone figée.
+const DUREE_AVANT_VERDICT: Duration = Duration::from_secs(10 * 60);
+/// Écart minimal (°C) qu'un vrai capteur montre en dix minutes.
+const AMPLITUDE_D_UN_VRAI_CAPTEUR_C: f64 = 0.5;
+
+/// Distingue un thermomètre d'une constante (#5410).
+///
+/// Une zone ACPI de carte de bureau rend souvent la même valeur pour
+/// toujours : la croire, c'est laisser tourner les analyses à pleine largeur
+/// sous une garde qui ne se déclenchera jamais. Une zone qui n'a pas bougé
+/// d'un demi-degré en vingt lectures et dix minutes est donc déclarée
+/// FIGÉE ; dès qu'elle bouge, elle est crue pour de bon. Avant le verdict, on
+/// la croit.
+#[derive(Debug, Default)]
+pub struct SuiviDeStabilite {
+    premiere: Option<Instant>,
+    min: f64,
+    max: f64,
+    lectures: u32,
+    a_bouge: bool,
+}
+
+impl SuiviDeStabilite {
+    pub fn observer(&mut self, temp_c: Option<f64>, maintenant: Instant) -> LectureThermique {
+        let Some(t) = temp_c else {
+            return LectureThermique::Illisible(MotifIllisible::AucunCapteur);
+        };
+        match self.premiere {
+            None => {
+                self.premiere = Some(maintenant);
+                self.min = t;
+                self.max = t;
+                self.lectures = 1;
+            }
+            Some(_) => {
+                self.min = self.min.min(t);
+                self.max = self.max.max(t);
+                self.lectures = self.lectures.saturating_add(1);
+            }
+        }
+        if self.max - self.min >= AMPLITUDE_D_UN_VRAI_CAPTEUR_C {
+            self.a_bouge = true;
+        }
+        let observee_assez = self.lectures >= LECTURES_AVANT_VERDICT
+            && self
+                .premiere
+                .is_some_and(|p| maintenant.saturating_duration_since(p) >= DUREE_AVANT_VERDICT);
+        if !self.a_bouge && observee_assez {
+            return LectureThermique::Illisible(MotifIllisible::Figee);
+        }
+        LectureThermique::Lisible(t)
+    }
+}
+
+/// Une lecture sert ce délai : `largeur_courante` et les gardes la
+/// demandent à chaque lot, et une requête PDH n'est pas gratuite.
+const RELECTURE: Duration = Duration::from_secs(15);
+
+/// La zone figée ne se juge que sous Windows : un capteur `hwmon` de Linux a
+/// le degré pour résolution, et un serveur au repos peut le garder dix
+/// minutes sans être une constante. Linux reste tel quel.
+const JUGER_LES_ZONES_FIGEES: bool = cfg!(target_os = "windows");
+
+struct EtatThermique {
+    suivi: SuiviDeStabilite,
+    derniere: Option<(Instant, LectureThermique)>,
+}
+
+static ETAT: Mutex<EtatThermique> = Mutex::new(EtatThermique {
+    suivi: SuiviDeStabilite {
+        premiere: None,
+        min: 0.0,
+        max: 0.0,
+        lectures: 0,
+        a_bouge: false,
+    },
+    derniere: None,
+});
+
+/// Une température (lissée ou non) devenue décision : inconnue, elle bride
+/// les analyses (#5410, maintenu par #6450).
+fn lecture_de(temp_c: Option<f64>) -> LectureThermique {
+    match temp_c {
+        Some(c) => LectureThermique::Lisible(c),
+        None => LectureThermique::Illisible(MotifIllisible::AucunCapteur),
+    }
+}
+
+/// La température de la machine pour les analyses de fond, relue au plus
+/// toutes les 15 s, jugée figée ou non (Windows).
+///
+/// Dans les épreuves de `tune-core`, toujours lisible : leur verdict ne doit
+/// pas dépendre des capteurs de la machine qui les joue (un Mac de CI n'en a
+/// aucun). La décision, elle, est éprouvée en logique pure.
+pub fn lecture_thermique() -> LectureThermique {
+    if cfg!(test) {
+        return LectureThermique::Lisible(45.0);
+    }
+    let maintenant = Instant::now();
+    let mut etat = ETAT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((quand, l)) = etat.derniere
+        && maintenant.saturating_duration_since(quand) < RELECTURE
+    {
+        return l;
+    }
+    let brute = cpu_temp_celsius();
+    let lecture = if JUGER_LES_ZONES_FIGEES {
+        etat.suivi.observer(brute, maintenant)
+    } else {
+        lecture_de(brute)
+    };
+    let precedente = etat.derniere.map(|(_, l)| l.motif_du_bridage());
+    etat.derniere = Some((maintenant, lecture));
+    drop(etat);
+    // Les TRANSITIONS seulement, comme le garde.
+    if precedente != Some(lecture.motif_du_bridage()) {
+        match lecture.motif_du_bridage() {
+            Some(m) => warn!(
+                motif = m.id(),
+                largeur = LARGEUR_SANS_THERMOMETRE,
+                "analyses_bridees_sans_thermometre — température non lisible sur cette machine : \
+                 les analyses de fond passent à un fichier à la fois"
+            ),
+            None if precedente.is_some() => {
+                info!("analyses_debridees — la température est de nouveau lisible")
+            }
+            None => {}
+        }
+    }
+    lecture
+}
+
+/// `"3231"` dixièmes de kelvin (compteur « High Precision Temperature ») en
+/// °C, borné au domaine physique d'un capteur CPU comme sous Linux.
+pub fn celsius_depuis_dixiemes_de_kelvin(dixiemes: f64) -> Option<f64> {
+    celsius_depuis_kelvins(dixiemes / 10.0)
+}
+
+/// Kelvins (compteur « Temperature ») en °C, même borne.
+pub fn celsius_depuis_kelvins(kelvins: f64) -> Option<f64> {
+    let c = kelvins - 273.15;
+    (c.is_finite() && (5.0..=125.0).contains(&c)).then_some(c)
+}
+
+/// Lecture des zones thermiques par l'API PDH (#5410). Aucune dépendance
+/// nouvelle : le crate `windows` est déjà tiré par cpal, il ne gagne qu'une
+/// fonctionnalité (`Win32_System_Performance`).
+///
+/// ⚠️ Compilé pour `x86_64-pc-windows-msvc` (porte de Shrek, CI Windows),
+/// jamais exécuté par les épreuves : son comportement sur une vraie machine
+/// — valeurs, droits — reste à mesurer.
+#[cfg(target_os = "windows")]
+mod windows_pdh {
+    use windows::Win32::System::Performance::{
+        PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA,
+        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
+        PdhOpenQueryW,
+    };
+    use windows::core::{PCWSTR, w};
+
+    /// `PDH_CSTATUS_VALID_DATA` et `PDH_CSTATUS_NEW_DATA`.
+    const VALEUR_VALIDE: [u32; 2] = [0, 1];
+
+    /// Les zones thermiques lisibles, en °C (vide si aucune).
+    pub(super) fn zones_thermiques_celsius() -> Vec<f64> {
+        // Dixièmes de kelvin d'abord (Windows 10 1809+), kelvins sinon.
+        let precises = lire(w!(
+            "\\Thermal Zone Information(*)\\High Precision Temperature"
+        ));
+        if !precises.is_empty() {
+            return precises
+                .into_iter()
+                .filter_map(super::celsius_depuis_dixiemes_de_kelvin)
+                .collect();
+        }
+        lire(w!("\\Thermal Zone Information(*)\\Temperature"))
+            .into_iter()
+            .filter_map(super::celsius_depuis_kelvins)
+            .collect()
+    }
+
+    /// Les valeurs brutes de toutes les instances d'un compteur.
+    fn lire(chemin: PCWSTR) -> Vec<f64> {
+        let mut requete = PDH_HQUERY::default();
+        // SAFETY : appels PDH documentés ; chaque sortie pointe une variable
+        // locale vivante, le tampon est dimensionné par l'appel de sondage et
+        // aligné sur `PDH_FMT_COUNTERVALUE_ITEM_W`, la requête est fermée sur
+        // tous les chemins.
+        unsafe {
+            if PdhOpenQueryW(PCWSTR::null(), 0, &mut requete) != 0 {
+                return Vec::new();
+            }
+            let valeurs = lire_dans(requete, chemin);
+            let _ = PdhCloseQuery(requete);
+            valeurs
+        }
+    }
+
+    unsafe fn lire_dans(requete: PDH_HQUERY, chemin: PCWSTR) -> Vec<f64> {
+        let mut compteur = PDH_HCOUNTER::default();
+        unsafe {
+            if PdhAddEnglishCounterW(requete, chemin, 0, &mut compteur) != 0 {
+                return Vec::new();
+            }
+            // Une température est une valeur instantanée : une collecte suffit.
+            if PdhCollectQueryData(requete) != 0 {
+                return Vec::new();
+            }
+            let mut octets = 0u32;
+            let mut nombre = 0u32;
+            if PdhGetFormattedCounterArrayW(
+                compteur,
+                PDH_FMT_DOUBLE,
+                &mut octets,
+                &mut nombre,
+                None,
+            ) != PDH_MORE_DATA
+                || octets == 0
+            {
+                return Vec::new();
+            }
+            let taille = std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+            let cases = (octets as usize).div_ceil(taille) + 1;
+            let mut tampon = vec![PDH_FMT_COUNTERVALUE_ITEM_W::default(); cases];
+            if PdhGetFormattedCounterArrayW(
+                compteur,
+                PDH_FMT_DOUBLE,
+                &mut octets,
+                &mut nombre,
+                Some(tampon.as_mut_ptr()),
+            ) != 0
+            {
+                return Vec::new();
+            }
+            tampon
+                .iter()
+                .take(nombre as usize)
+                .filter(|i| VALEUR_VALIDE.contains(&i.FmtValue.CStatus))
+                .map(|i| i.FmtValue.Anonymous.doubleValue)
+                .filter(|v| v.is_finite())
+                .collect()
+        }
+    }
 }
 
 /// Température du processeur à AFFICHER (#5189, écran « État du serveur »).
 ///
 /// Même lecture sysfs et même capteur CPU que le garde ; seul le repli
-/// diffère : sans capteur CPU identifiable, le maximum des zones. `None` sans capteur
-/// (macOS, Windows, conteneur ou machine virtuelle sans `/sys` peuplé).
+/// diffère : sans capteur CPU identifiable, le maximum des zones. Sous
+/// Windows (#5410), la plus chaude des zones thermiques ACPI, telle quelle
+/// (figée ou non : le diagnostic le dit à part). `None` sans capteur (macOS,
+/// Windows sans zone, conteneur ou machine virtuelle sans `/sys` peuplé).
 ///
-/// Lecture synchrone de fichiers sysfs : l'appelant asynchrone la passe par
-/// `spawn_blocking` avec un délai, certains pilotes `hwmon` (disques) pouvant
-/// être lents à répondre.
+/// Sous Linux, quand l'échantillonneur tourne
+/// ([`demarrer_l_echantillonnage`], #5320), c'est la médiane des dernières
+/// secondes, relevée hors de la requête. Sinon, lecture synchrone de fichiers
+/// sysfs : l'appelant asynchrone la passe par `spawn_blocking` avec un délai,
+/// certains pilotes `hwmon` (disques) pouvant être lents à répondre.
 #[cfg(target_os = "linux")]
 pub fn cpu_package_temp_celsius() -> Option<f64> {
-    choisir_temperature_processeur(&lire_capteurs(std::path::Path::new("/sys")))
+    lissee_ou_directe(
+        |e| &e.ecran,
+        || choisir_temperature_processeur(&lire_capteurs(std::path::Path::new("/sys"))),
+    )
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub fn cpu_package_temp_celsius() -> Option<f64> {
+    cpu_temp_celsius()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn cpu_package_temp_celsius() -> Option<f64> {
     None
 }
@@ -340,6 +894,23 @@ fn parse_millidegrees(raw: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4681 — une passe retenue par la chaleur se lit au registre, et en
+    /// sort au retour au frais.
+    #[test]
+    fn une_passe_retenue_par_la_chaleur_se_lit_puis_s_efface_4681() {
+        noter_la_retenue("passe-essai-4681", true);
+        noter_la_retenue("passe-essai-4681", true);
+        assert_eq!(
+            passes_retenues_par_la_chaleur()
+                .iter()
+                .filter(|p| p.as_str() == "passe-essai-4681")
+                .count(),
+            1
+        );
+        noter_la_retenue("passe-essai-4681", false);
+        assert!(!passes_retenues_par_la_chaleur().contains(&"passe-essai-4681".to_string()));
+    }
 
     #[test]
     fn parses_millidegrees_and_rejects_nonsense() {
@@ -602,4 +1173,157 @@ mod tests {
         puce(t.path(), 0, "coretemp", &[(1, "0", Some("Package id 0"))]);
         assert_eq!(affichee(t.path()), None);
     }
+
+    // ── #5320 : échantillonnage en tâche de fond, valeur lissée ────────────
+
+    /// Remplit une fenêtre, un relevé par seconde à partir de `debut`.
+    fn fenetre(debut: Instant, releves: &[Option<f64>]) -> FenetreGlissante {
+        let mut f = FenetreGlissante::default();
+        for (i, r) in releves.iter().enumerate() {
+            f.pousser(*r, debut + Duration::from_secs(i as u64));
+        }
+        f
+    }
+
+    #[test]
+    fn mediane_impaire_paire_et_vide() {
+        assert_eq!(mediane(&[31.0, 98.0, 30.0]), Some(31.0));
+        assert_eq!(mediane(&[30.0, 98.0, 31.0, 29.0]), Some(30.5));
+        assert_eq!(mediane(&[42.0]), Some(42.0));
+        assert_eq!(mediane(&[]), None);
+    }
+
+    /// Le relevé du fil 2260 (réponse 8309) : `Package id 0` vers 30 °C,
+    /// avec des pointes d'une seconde à 98 et 95 °C. La valeur rendue est
+    /// celle du repos, même quand le DERNIER relevé est une pointe — celui
+    /// qu'une lecture instantanée aurait affiché.
+    #[test]
+    fn les_pointes_d_une_seconde_ne_passent_pas_la_mediane() {
+        let t0 = Instant::now();
+        let serie = [
+            30.0, 31.0, 98.0, 30.0, 30.0, 29.0, 31.0, 95.0, 30.0, 31.0, 98.0,
+        ];
+        let f = fenetre(t0, &serie.map(Some));
+        let maintenant = t0 + Duration::from_secs(serie.len() as u64 - 1);
+        assert_eq!(f.releves.len(), RELEVES_PAR_FENETRE, "fenêtre bornée");
+        let lissee = f.lissee(maintenant).expect("relevés lisibles");
+        assert!(
+            lissee <= 31.0,
+            "la pointe du dernier relevé (98 °C) a passé le lissage : {lissee} °C"
+        );
+        // Et la garde ne suspend pas les analyses sur une pointe.
+        let mut g = ThermalGate::new();
+        assert!(matches!(g.decide(Some(lissee)), Verdict::Go { .. }));
+    }
+
+    /// Un échauffement qui dure, lui, passe : le lissage n'aveugle pas la
+    /// garde.
+    #[test]
+    fn un_echauffement_qui_dure_passe_la_mediane() {
+        let t0 = Instant::now();
+        let serie = [40.0, 41.0, 40.0, 40.0, 85.0, 86.0, 86.0, 87.0, 88.0];
+        let f = fenetre(t0, &serie.map(Some));
+        let lissee = f.lissee(t0 + Duration::from_secs(8)).unwrap();
+        assert!(lissee >= PAUSE_ABOVE_C, "lissée = {lissee}");
+        let mut g = ThermalGate::new();
+        assert!(matches!(g.decide(Some(lissee)), Verdict::Hold { .. }));
+    }
+
+    /// #6450 : sans température lisible, la garde bride. Le lissage ne doit
+    /// jamais rendre lisible ce que la sonde ne lit plus : des relevés
+    /// anciens à 45 °C ne couvrent pas une sonde devenue muette, ni un
+    /// échantillonneur arrêté.
+    #[test]
+    fn une_temperature_inconnue_reste_inconnue_et_bridee() {
+        let t0 = Instant::now();
+        let cas: [(&str, FenetreGlissante, Instant); 3] = [
+            ("aucun relevé", FenetreGlissante::default(), t0),
+            (
+                "dernier relevé illisible",
+                fenetre(t0, &[Some(45.0), Some(45.0), Some(46.0), Some(45.0), None]),
+                t0 + Duration::from_secs(4),
+            ),
+            (
+                "relevés périmés",
+                fenetre(t0, &[Some(45.0); 9]),
+                t0 + Duration::from_secs(8) + PEREMPTION_DES_RELEVES + Duration::from_secs(1),
+            ),
+        ];
+        for (nom, f, maintenant) in cas {
+            let lissee = f.lissee(maintenant);
+            assert_eq!(lissee, None, "{nom} : la valeur lissée doit être inconnue");
+            let lecture = lecture_de(lissee);
+            assert_eq!(
+                lecture,
+                LectureThermique::Illisible(MotifIllisible::AucunCapteur),
+                "{nom}"
+            );
+            assert_eq!(
+                brider_sans_thermometre(4, &lecture),
+                LARGEUR_SANS_THERMOMETRE,
+                "{nom} : les analyses doivent rester bridées"
+            );
+            assert_eq!(
+                ThermalGate::new().decide(lissee),
+                Verdict::Go {
+                    temp_c: None,
+                    leaving: false
+                },
+                "{nom} : garde inchangée"
+            );
+        }
+        // Un relevé illisible AU MILIEU de la fenêtre, lui, ne fait pas
+        // perdre la mesure : c'est la dernière lecture qui décide.
+        let f = fenetre(t0, &[Some(45.0), None, Some(46.0)]);
+        assert_eq!(f.lissee(t0 + Duration::from_secs(2)), Some(45.5));
+    }
+
+    /// Le câblage : quand l'échantillonneur tourne, ce que lit
+    /// `GET /system/diagnostics` (`cpu_package_temp_celsius`) et ce sur quoi
+    /// la garde décide (`cpu_temp_celsius`) sont les médianes des relevés de
+    /// fond, pas une lecture de la sonde au moment de la requête. Seul essai
+    /// de ce binaire à poser `ECHANTILLONS` ; il le remet à `None`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn la_route_et_la_garde_lisent_la_mediane_de_l_echantillonneur() {
+        let maintenant = Instant::now();
+        let mut e = Echantillons::default();
+        // Le dernier relevé est une pointe : une lecture instantanée la verrait.
+        let serie = [30.0, 31.0, 30.0, 98.0, 30.0, 29.0, 31.0, 30.0, 97.0];
+        for (i, c) in serie.iter().enumerate() {
+            let t = maintenant - Duration::from_secs((serie.len() - 1 - i) as u64);
+            e.garde.pousser(Some(*c), t);
+            e.ecran.pousser(Some(*c), t);
+        }
+        *ECHANTILLONS.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+        let ecran = cpu_package_temp_celsius();
+        let garde = cpu_temp_celsius();
+        *ECHANTILLONS.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        assert_eq!(ecran, Some(30.0), "l'écran ne lit pas la médiane de fond");
+        assert_eq!(garde, Some(30.0), "la garde ne lit pas la médiane de fond");
+    }
+
+    /// Le chemin réel d'un relevé : une lecture des capteurs, deux grandeurs
+    /// (garde et écran), toutes deux lissées.
+    #[test]
+    fn un_releve_alimente_la_garde_et_l_ecran() {
+        let t0 = Instant::now();
+        let mut e = Echantillons::default();
+        for (i, milli) in ["30000", "30000", "98000", "31000", "98000"]
+            .iter()
+            .enumerate()
+        {
+            let t = tempfile::tempdir().unwrap();
+            puce(t.path(), 0, "coretemp", &[(1, milli, Some("Package id 0"))]);
+            puce(t.path(), 1, "nvme", &[(1, "40000", Some("Composite"))]);
+            e.relever(&lire_capteurs(t.path()), t0 + Duration::from_secs(i as u64));
+        }
+        let maintenant = t0 + Duration::from_secs(4);
+        assert_eq!(e.garde.lissee(maintenant), Some(31.0));
+        assert_eq!(e.ecran.lissee(maintenant), Some(31.0));
+    }
 }
+
+#[cfg(test)]
+#[path = "thermal_repli_5410_tests.rs"]
+mod repli_5410_tests;

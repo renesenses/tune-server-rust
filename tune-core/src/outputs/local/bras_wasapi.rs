@@ -87,6 +87,11 @@ pub(super) struct EntreesWasapi {
         Arc<std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>>,
     pub(super) pure_bypass: Arc<AtomicBool>,
     pub(super) mono_downmix: Arc<AtomicBool>,
+    /// #6247 — la réaffectation des canaux de la zone (#6044), que ce bras
+    /// ne recevait pas : elle n'était jamais appliquée en WASAPI exclusif.
+    pub(super) reaffectation: Arc<super::CreneauReaffectation>,
+    /// #6247 — la disposition déclarée par le fichier (#6057).
+    pub(super) disposition: Arc<super::CreneauDisposition>,
     pub(super) dop_active: Arc<AtomicBool>,
     // ── #5204 : l'enchaînement sans blanc ──────────────────────────────
     /// La réserve de `set_next_media`, que ce bras CONSOMME désormais à l'EOF.
@@ -369,6 +374,8 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         crossfeed,
         pure_bypass,
         mono_downmix,
+        reaffectation,
+        disposition,
         dop_active,
         next_media,
         chain_exhausted,
@@ -396,6 +403,8 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
     let device_gone = Arc::new(AtomicBool::new(false));
     let demande = DemandeDOuverture {
         spec,
+        // #6230 — un transport exclusif ouvre au format de la source.
+        voies_de_la_matrice: None,
         device_name: &device_name,
         endpoint_id: endpoint_id.as_deref(),
         origin_host: None,
@@ -473,7 +482,8 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         &crossfeed,
         &pure_bypass,
         &mono_downmix,
-    );
+    )
+    .avec_l_adaptation_des_canaux(&reaffectation, &disposition);
     let mut puits = match backend.puits() {
         Puits::Natif(puits) => puits,
         Puits::Flottant(_) => unreachable!("BackendWasapi ne fournit qu'un puits natif"),

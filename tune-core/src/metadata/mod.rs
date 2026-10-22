@@ -1,15 +1,21 @@
 /// AcoustID « à la Picard » : filtres, marge et vote par album (#4805).
 pub mod acoustid_picard;
+pub mod albums_manquants;
+pub mod arbre_genres;
 pub mod artist_enrichment;
 pub mod artist_split;
 pub mod artistes_du_pressage;
 pub mod auto_fix;
+// Les balises réellement présentes dans un fichier, lues brutes (#6124).
+pub mod balises_brutes;
 pub mod batch;
 pub mod bio_batch;
 pub mod choix_de_pressage;
 pub mod coffrets;
+pub mod completude;
 pub mod credits_mb;
 pub mod credits_release;
+pub mod discogs_propositions;
 pub mod disques_abimes;
 pub mod ecriture_fichiers;
 pub mod empreinte_audio;
@@ -19,11 +25,16 @@ pub mod fingerprint;
 pub mod foo_dr;
 pub mod instruments;
 pub mod lastfm;
+pub mod liens_externes;
 pub mod lyrics;
 pub mod matcher;
 pub mod musicbrainz_release;
 // Les réponses `/release/{mbid}` gardées en base (#4805, idée 3 de MetaRust).
 pub mod musicbrainz_release_cache;
+// La note d'une piste lue dans ses balises, ramenée sur 0 à 5 (#6123).
+pub mod note;
+#[cfg(test)]
+mod note_balises_6123_tests;
 pub mod reidentify;
 // Le type de sortie d'un disque — album, EP, single (#4767).
 pub mod release_type;
@@ -31,6 +42,7 @@ pub mod suggestions;
 // Le MBID des artistes par une recherche MusicBrainz confirmée (#4805, étape C).
 pub mod artistes_par_le_reseau;
 pub mod tag_writer;
+pub mod wikidata;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -50,6 +62,103 @@ use std::path::Path;
 /// live MB API on IU/BTS/坂本龍一 as well as Radiohead/The Beatles/Björk).
 pub(crate) fn mb_artist_query(name: &str) -> String {
     format!("artist:\"{name}\" OR alias:\"{name}\"")
+}
+
+/// Nombre de candidats demandés à `ws/2/artist?query=` quand on cherche un
+/// MBID par le nom : assez pour voir l'artiste exact derrière un homonyme
+/// mieux classé (#6463), et le ou les homonymes exacts qui rendent le nom
+/// ambigu.
+pub(crate) const MB_ARTIST_CANDIDATES: usize = 10;
+
+/// Choisit le MBID d'un artiste dans une réponse `ws/2/artist?query=`.
+///
+/// # #6463 — « Christophe » recevait le portrait de Christophe Beck
+///
+/// FabienM (fil 2302, rc6) : l'artiste « Christophe » de sa bibliothèque porte
+/// une mauvaise image. Les deux recherches par le nom (`lookup_artist` du
+/// matcher et `search_musicbrainz_artist` de la passe d'images) demandaient
+/// `limit=1` et prenaient le premier résultat dès que son score atteignait 90.
+/// Or le score Lucene de MusicBrainz mesure la proximité TEXTUELLE, pas
+/// l'identité. Mesuré le 20/10/2026, pour `artist:"Christophe"` comme pour
+/// `artist:"Christophe" OR alias:"Christophe"` :
+///
+/// ```text
+/// 100  0df890e1-…  Christophe Beck   (Canadian score composer)
+///  98  5cef1748-…  Christophe        (French pop singer)
+/// ```
+///
+/// Le compositeur canadien emportait le MBID, donc ses images (Mozaiklabs par
+/// MBID, Fanart.tv, TheAudioDB, Wikidata). La recherche du client, elle, ne
+/// passe pas par ce MBID : sa vignette vient des services de streaming, d'où
+/// la bonne image au même nom.
+///
+/// La règle est celle que Discogs et Last.fm suivent déjà (#2221) : on ne
+/// retient qu'un candidat dont le NOM est celui cherché
+/// (`noms_d_artiste_identiques`), et s'il y en a plusieurs, on ne choisit pas.
+/// Un MBID faux s'installe durablement (il est persisté, et toute la cascade
+/// d'images s'y fie) ; pas de MBID, c'est seulement la cascade par le nom.
+///
+/// Un ALIAS identique ne compte qu'à défaut de nom identique : c'est lui qui
+/// fait trouver les noms en écriture native (`아이유` → `IU`, voir
+/// [`mb_artist_query`]), mais un alias est aussi ce qui rattache
+/// « Jean-Christophe » à Christophe Beck. Le seuil de score 90 reste exigé.
+pub(crate) fn mb_choisir_artiste(data: &serde_json::Value, wanted: &str) -> Option<String> {
+    let candidats: Vec<&serde_json::Value> = data
+        .get("artists")?
+        .as_array()?
+        .iter()
+        .filter(|a| a.get("score").and_then(|v| v.as_i64()).unwrap_or(0) >= 90)
+        .collect();
+
+    let par_nom: Vec<&serde_json::Value> = candidats
+        .iter()
+        .copied()
+        .filter(|a| {
+            a.get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| noms_d_artiste_identiques(n, wanted))
+        })
+        .collect();
+    let retenus = if par_nom.is_empty() {
+        candidats
+            .into_iter()
+            .filter(|a| {
+                a.get("aliases")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|aliases| {
+                        aliases.iter().any(|al| {
+                            al.get("name")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|n| noms_d_artiste_identiques(n, wanted))
+                        })
+                    })
+            })
+            .collect()
+    } else {
+        par_nom
+    };
+
+    let mut ids = retenus
+        .iter()
+        .filter_map(|a| a.get("id").and_then(|v| v.as_str()));
+    let choisi = ids.next()?;
+    // Deux entrées distinctes répondent au même nom : des homonymes, que rien
+    // ne départage ici.
+    if ids.any(|autre| autre != choisi) {
+        return None;
+    }
+    Some(choisi.to_string())
+}
+
+/// Deux noms d'artiste désignent-ils la MÊME entrée ? À la casse et aux espaces
+/// de bord près, rien d'autre : ni accents ni ponctuation repliés
+/// (« Motorhead » ≠ « Motörhead »). Même règle que
+/// `library::artwork::artist_name_matches_exactly`.
+pub(crate) fn noms_d_artiste_identiques(candidate: &str, wanted: &str) -> bool {
+    let candidate = candidate.trim();
+    let wanted = wanted.trim();
+    // Un nom vide se « retrouve » partout : il ne départage rien.
+    !candidate.is_empty() && !wanted.is_empty() && candidate.to_lowercase() == wanted.to_lowercase()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -75,6 +184,12 @@ pub struct TrackMetadata {
     pub album: Option<String>,
     pub album_artist: Option<String>,
     pub album_artist_sort: Option<String>,
+    /// tune-server-rust#6474 — le nom de TRI de l'interprète de la piste
+    /// (ARTISTSORT Vorbis/APE, `TSOP` ID3v2, `soar` MP4) : « Davis, Miles ».
+    /// Il remplit `artists.sort_name` de l'artiste de la piste quand le
+    /// fichier le porte, comme ALBUMARTISTSORT celui de l'artiste d'album.
+    #[serde(default)]
+    pub artist_sort: Option<String>,
     pub track_number: Option<u32>,
     pub disc_number: Option<u32>,
     pub total_tracks: Option<u32>,
@@ -95,6 +210,15 @@ pub struct TrackMetadata {
     pub format: Option<String>,
     pub file_size: Option<u64>,
     pub bpm: Option<f64>,
+    /// La note de la piste lue dans ses balises, de 0 à 5 (#6123) — l'échelle
+    /// et la table de conversion sont dans [`note`]. `None` : aucune balise de
+    /// note, ou une valeur qu'aucune échelle connue ne produit.
+    #[serde(default)]
+    pub rating: Option<u8>,
+    /// #6332 — le débit moyen du fichier en kbit/s (lofty `audio_bitrate`).
+    /// Lu jusqu'ici pour le seul contrôle de durée des MP3, puis jeté.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
     /// Le tag « compilation » du fichier — `TCMP` en ID3, `COMPILATION` en
     /// VorbisComment, `cpil` en MP4, tous trois rendus par
     /// `ItemKey::FlagCompilation`.
@@ -271,6 +395,7 @@ impl TrackMetadata {
             &mut self.album_artist_sort,
             &mut corrections,
         );
+        sanitize_option("artist_sort", &mut self.artist_sort, &mut corrections);
         sanitize_option("disc_subtitle", &mut self.disc_subtitle, &mut corrections);
         sanitize_option("release_date", &mut self.release_date, &mut corrections);
         sanitize_option("original_date", &mut self.original_date, &mut corrections);
@@ -752,6 +877,9 @@ struct Id3v2Tags {
     /// frames qui ne commencent pas par `T` etaient toutes ignorees ici : sur
     /// un DSD etiquete avec Picard, l'identifiant n'arrivait donc jamais.
     ufid_frames: Vec<(String, String)>,
+    /// POPM frames : adresse -> octet de note BRUT (0-255, 0 = inconnue).
+    /// Gardé brut : lofty rend un « 1 » pour 0 comme pour 1 (#6123).
+    popm_frames: Vec<(String, u8)>,
     /// Whether an APIC (picture) frame was found
     has_picture: bool,
     /// First embedded picture found, as `(mime_type, image_bytes)`.
@@ -782,6 +910,19 @@ impl Id3v2Tags {
             .or_else(|| self.get_txxx("MusicBrainz Recording Id"))
             .or_else(|| self.get_txxx("MusicBrainz Track Id"))
             .filter(|v| !v.is_empty())
+    }
+
+    /// La note de la piste (#6123) : `POPM`, puis `TXXX:RATING`, puis
+    /// `TXXX:FMPS_Rating`. Voir [`note`] pour l'échelle.
+    fn note(&self) -> Option<u8> {
+        self.popm_frames
+            .iter()
+            .find_map(|(adresse, octet)| note::note_depuis_popm_de(adresse, *octet))
+            .or_else(|| self.get_txxx("RATING").and_then(note::note_depuis_valeur))
+            .or_else(|| {
+                self.get_txxx("FMPS_Rating")
+                    .and_then(note::note_depuis_fmps)
+            })
     }
 
     fn get_txxx(&self, description: &str) -> Option<&str> {
@@ -944,6 +1085,7 @@ fn map_id3v22_frame(id: &str) -> Option<&'static str> {
         "TDA" => "TDAT",
         "TXX" => "TXXX", // user-defined text
         "PIC" => "APIC", // attached picture
+        "POP" => "POPM", // popularimeter (note, #6123)
         _ => return None,
     })
 }
@@ -1089,6 +1231,21 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
                 if !owner.is_empty() && !id.is_empty() {
                     tags.ufid_frames.push((owner, id));
                 }
+            }
+            continue;
+        }
+
+        // POPM (#6123) : adresse ISO-8859-1 terminée par un octet nul, puis
+        // l'octet de note, puis le compteur (ignoré). Lu AVANT le filtre des
+        // trames de texte, comme UFID.
+        if frame_id == "POPM" {
+            if let Some(nul) = frame_data.iter().position(|b| *b == 0)
+                && let Some(octet) = frame_data.get(nul + 1)
+            {
+                let adresse = String::from_utf8_lossy(&frame_data[..nul])
+                    .trim()
+                    .to_string();
+                tags.popm_frames.push((adresse, *octet));
             }
             continue;
         }
@@ -1278,8 +1435,8 @@ enum Id3ReadSite {
 ///
 /// Exactement ce que [`parse_id3v2_tag`] consomme : les trames de texte
 /// (`T…`, `TXXX` compris) et `UFID`/`UFI`, où Picard écrit l'identifiant
-/// MusicBrainz. Plus `APIC`/`PIC` quand c'est la pochette qu'on est venu
-/// chercher.
+/// MusicBrainz, et `POPM`/`POP`, la note de la piste (#6123). Plus
+/// `APIC`/`PIC` quand c'est la pochette qu'on est venu chercher.
 ///
 /// Le critère est SÉMANTIQUE, pas une taille : on ne devine pas ce qui est
 /// « gros », on sait ce qui est utile. La trame qui fait déborder le budget est
@@ -1291,6 +1448,8 @@ fn id3v2_frame_worth_reading(frame_id: &[u8], want_picture: bool) -> bool {
     frame_id.first() == Some(&b'T')
         || frame_id == b"UFID".as_slice()
         || frame_id == b"UFI".as_slice()
+        || frame_id == b"POPM".as_slice()
+        || frame_id == b"POP".as_slice()
 }
 
 /// Plafond du seul chemin POCHETTE ([`extract_dsf_cover`]).
@@ -1906,7 +2065,10 @@ fn dsf_dff_fallback_complete(
             tags.year(),
             tags.original_year(),
             tags.original_date().map(|s| s.to_string()),
-            tags.release_date().map(|s| s.to_string()),
+            // web#2206 — à défaut de `TDRL`, la date complète de `TDRC`.
+            tags.release_date()
+                .map(|s| s.to_string())
+                .or_else(|| tags.get("TDRC").and_then(balises_brutes::date_precise)),
             genre,
             genres,
             tags.has_picture,
@@ -2054,12 +2216,19 @@ fn dsf_dff_fallback_complete(
     let mb_release_secondary_types =
         mb_type_brut.and_then(|v| release_type::colonne_des_secondaires([v]));
 
+    // #6474 — le nom de tri de l'interprète (`TSOP`), hors du tuple commun.
+    let artist_sort = id3_tags
+        .as_ref()
+        .and_then(|t| t.get("TSOP"))
+        .map(str::to_string);
+
     Some(TrackMetadata {
         title,
         album,
         artist,
         album_artist,
         album_artist_sort,
+        artist_sort,
         track_number,
         disc_number,
         total_tracks,
@@ -2082,6 +2251,18 @@ fn dsf_dff_fallback_complete(
         duration_ms: duration_ms.or(Some(0)),
         bit_depth: Some(1), // DSD is always 1-bit
         bpm: None,
+        // #6123 — `POPM`, `TXXX:RATING`, `TXXX:FMPS_Rating` du tag DSF ; à
+        // défaut, ce que lofty en a lu (DFF).
+        rating: id3_tags
+            .as_ref()
+            .and_then(Id3v2Tags::note)
+            .or_else(|| tag_lofty.and_then(|t| note_de_la_balise(t, path))),
+        // #6332 — un flux DSD est à débit constant : 1 bit par échantillon et
+        // par canal (DSD64 stéréo : 5 645 kbit/s).
+        bitrate_kbps: sample_rate
+            .zip(channels)
+            .map(|(sr, ch)| sr.saturating_mul(u32::from(ch)) / 1000)
+            .filter(|b| *b > 0),
         compilation,
         label,
         catalog_number,
@@ -2139,6 +2320,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         // l'artiste réel du dossier.
         album_artist: None,
         album_artist_sort: None,
+        artist_sort: None,
         track_number,
         disc_number,
         total_tracks: None,
@@ -2174,6 +2356,8 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         cover_art: None,
         credits: vec![],
         comment: None,
+        rating: None,
+        bitrate_kbps: None,
     })
 }
 
@@ -2567,6 +2751,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         // n'est pas un artiste d'album (#1656, #3232).
         album_artist: None,
         album_artist_sort: None,
+        artist_sort: None,
         track_number,
         disc_number,
         total_tracks: None,
@@ -2606,6 +2791,8 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         cover_art: None,
         credits: vec![],
         comment: None,
+        rating: None,
+        bitrate_kbps: None,
     }
 }
 
@@ -2674,6 +2861,7 @@ fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
         // (#1656, #3232) : seule la balise le renseigne.
         album_artist: balises.album_artist,
         album_artist_sort: None,
+        artist_sort: None,
         track_number: balises.track_number.or(numero_du_nom),
         // 🔴 #4471 — le DOSSIER tranche : voir `disque_arbitre`.
         disc_number: disque_arbitre(balises.disc_number, disque_du_chemin),
@@ -2714,6 +2902,8 @@ fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
         cover_art: None,
         credits: vec![],
         comment: balises.comment,
+        rating: None,
+        bitrate_kbps: None,
     })
 }
 
@@ -2751,6 +2941,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         // `TrackMetadata::artist_from_path`.
         album_artist: None,
         album_artist_sort: None,
+        artist_sort: None,
         track_number,
         disc_number,
         total_tracks: None,
@@ -2790,6 +2981,8 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         cover_art: None,
         credits: vec![],
         comment: None,
+        rating: None,
+        bitrate_kbps: None,
     }
 }
 
@@ -3583,6 +3776,17 @@ mod coffret_multicanal_tests_4846;
 
 #[cfg(test)]
 mod label_tests_4836;
+
+#[cfg(test)]
+mod date_de_sortie_tests_2206;
+#[cfg(test)]
+mod interprete_tests_6232;
+#[cfg(test)]
+mod nom_de_tri_musicbrainz_tests_6474;
+#[cfg(test)]
+mod nom_de_tri_tests_6474;
+#[cfg(test)]
+mod section_live_titre_tests_6464;
 #[cfg(test)]
 mod type_de_sortie_tests_5616;
 
@@ -3729,8 +3933,21 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
 
     let bpm = get(ItemKey::Bpm).and_then(|s| s.parse::<f64>().ok());
 
-    let original_year =
-        get(ItemKey::OriginalReleaseDate).and_then(|s| s.get(..4)?.parse::<u32>().ok());
+    // La tête Vorbis, lue AU PLUS une fois et seulement si un repli la
+    // demande : `SETSUBTITLE` et `ORIGINALRELEASEDATE` (#6124) la partagent.
+    let tete_vorbis = std::cell::OnceCell::new();
+    let tete = || tete_vorbis.get_or_init(|| read_vorbis_header(path));
+    // #6124 — `ORIGINALRELEASEDATE` (Vorbis), que lofty écarte : sans lui,
+    // un album balisé ainsi n'avait pas de date de sortie originale.
+    let original_date = get(ItemKey::OriginalReleaseDate).or_else(|| {
+        tete()
+            .as_deref()
+            .and_then(|h| find_vorbis_comment(h, "ORIGINALRELEASEDATE"))
+            .and_then(|v| balises_brutes::date_valide(&v))
+    });
+    let original_year = original_date
+        .as_deref()
+        .and_then(|s| s.get(..4)?.parse::<u32>().ok());
 
     let total_tracks = tag
         .track_total()
@@ -3862,6 +4079,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         album,
         album_artist: get(ItemKey::AlbumArtist).or_else(|| raw_vorbis_field(path, "album_artist")),
         album_artist_sort: get(ItemKey::AlbumArtistSortOrder),
+        artist_sort: get(ItemKey::TrackArtistSortOrder),
         track_number,
         disc_number,
         total_tracks,
@@ -3871,7 +4089,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         // key in D. Pamingle's Vademecum. Read it raw as a fallback so those
         // files show per-disc subtitles too (Dominique, v0.9.9).
         disc_subtitle: get(ItemKey::SetSubtitle)
-            .or_else(|| raw_vorbis_comment(path, "SETSUBTITLE")),
+            .or_else(|| find_vorbis_comment(tete().as_deref()?, "SETSUBTITLE")),
         year: tag
             .date()
             .map(|d| d.year as u32)
@@ -3883,8 +4101,14 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
                 get(ItemKey::OriginalReleaseDate).and_then(|s| s.get(..4)?.parse::<u32>().ok())
             }),
         original_year,
-        release_date: get(ItemKey::ReleaseDate),
-        original_date: get(ItemKey::OriginalReleaseDate),
+        // web#2206 (fil 2300) — la date de sortie : RELEASEDATE / TDRL, et à
+        // défaut la date COMPLÈTE de la balise DATE / TDRC / ©day (Picard y
+        // écrit la date de sortie de l'édition). Sans elle, `release_date`
+        // restait vide sur toute une bibliothèque (0 album sur 4 255 sur le
+        // .18) et le tri « Date de sortie » retombait partout sur l'année.
+        release_date: get(ItemKey::ReleaseDate)
+            .or_else(|| get(ItemKey::RecordingDate).and_then(|d| balises_brutes::date_precise(&d))),
+        original_date,
         genre,
         genres,
         duration_ms: {
@@ -3923,6 +4147,11 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
             // #5299 — fichier rangé dans une image ISO : sa taille propre.
             .or_else(|| crate::audio::iso9660::taille_et_mtime(path).map(|(t, _)| t)),
         bpm,
+        rating: note_de_la_balise(tag, path),
+        // #6332 — le débit moyen que lofty calcule (en-tête de trame pour un
+        // MP3 CBR, Xing/VBRI pour un VBR, taille du flux sur durée sinon). Lu
+        // jusqu'ici pour le seul contrôle de durée des MP3, puis jeté.
+        bitrate_kbps: props.audio_bitrate().filter(|b| *b > 0),
         compilation,
         label: label_du_tag(&get),
         catalog_number: get(ItemKey::CatalogNumber),
@@ -3959,9 +4188,70 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     })
 }
 
+/// #6123 — la note de la piste, de 0 à 5, dans la balise que lofty a lue,
+/// puis dans ce qu'il en laisse de côté. Échelle et table : [`note`].
+///
+/// lofty range sous `ItemKey::Popularimeter` le `POPM` ID3, le `RATING`
+/// Vorbis et l'atome MP4 `rate` :
+///
+/// * un `POPM` (ou un `RATING:adresse` Vorbis) arrive DÉJÀ converti, sous la
+///   forme `adresse|étoiles|compteur` — avec la table de l'adresse (WMP,
+///   MusicBee, Picard) ;
+/// * un `RATING` Vorbis sans adresse, ou un `rate` MP4, arrive BRUT : « 4 »,
+///   « 80 ».
+///
+/// Ce que lofty ne surface pas se relit à part, et seulement quand la balise
+/// générique n'a rien donné : `TXXX:RATING` / `TXXX:FMPS_Rating` en ID3 (il ne
+/// garde un `TXXX` que si sa description est une clé qu'il connaît), et
+/// `FMPS_RATING` en Vorbis (clé inconnue de lui). La relecture porte sur la
+/// tête du fichier que lofty vient de lire : elle sort du cache du système.
+///
+/// Un `POPM` dont lofty rend « 1 » est relu aussi : lofty rend 1 pour l'octet
+/// 0 (« note inconnue », que les lecteurs écrivent pour ne garder que le
+/// compteur d'écoutes) comme pour une vraie étoile. Sans relecture possible
+/// (tag ID3 qui n'est pas en tête du fichier : AIFF, WAV), le 1 est gardé.
+fn note_de_la_balise(tag: &lofty::tag::Tag, path: &Path) -> Option<u8> {
+    use lofty::tag::{ItemKey, TagType};
+    let id3 = tag.tag_type() == TagType::Id3v2;
+    let mut un_ambigu = false;
+    for brut in tag.get_strings(ItemKey::Popularimeter) {
+        if brut.contains('|') {
+            match note::etoiles_du_popularimetre(brut) {
+                Some(1) if id3 => un_ambigu = true,
+                Some(n) => return Some(n),
+                None => {}
+            }
+        } else if let Some(n) = note::note_depuis_valeur(brut) {
+            return Some(n);
+        }
+    }
+    match tag.tag_type() {
+        TagType::Id3v2 => {
+            match read_dsf_id3v2_raw(path, Some(0), Id3ReadSite::LeadingProbe, false)
+                .and_then(|brut| parse_id3v2_tag(&brut))
+            {
+                // L'octet brut tranche dès qu'il est là ; s'il manque, le 1
+                // de lofty reste la seule information.
+                Some(trames) => trames
+                    .note()
+                    .or_else(|| (un_ambigu && trames.popm_frames.is_empty()).then_some(1)),
+                None => un_ambigu.then_some(1),
+            }
+        }
+        TagType::VorbisComments => {
+            raw_vorbis_comment(path, "FMPS_RATING").and_then(|v| note::note_depuis_fmps(&v))
+        }
+        _ => None,
+    }
+}
+
 pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {
     try_read_metadata(path).ok()
 }
+
+/// #6232 — clé `track_metadata` de la balise ARTIST de la piste, telle
+/// qu'écrite dans le fichier (voir [`read_extended_metadata`]).
+pub const CLE_INTERPRETE_DE_LA_PISTE: &str = "track_artist";
 
 /// Read extended metadata tags beyond the core fields already stored in the tracks table.
 /// Returns a HashMap of key-value pairs suitable for the track_metadata table.
@@ -4000,6 +4290,18 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
         }
         (!valeurs.is_empty()).then(|| valeurs.join("; "))
     };
+
+    // #6232 (forum 2218) — l'INTERPRÈTE de la piste, tel que la balise ARTIST
+    // l'écrit. Sur un album ordinaire, le scan donne à chaque piste l'artiste
+    // de l'ALBUM (`scan_import`, `TrackImporter`) : « The Beatles & Genesis »
+    // sur une piste d'un album des Beatles n'atteignait aucune colonne, et
+    // aucune règle ne pouvait trouver Genesis. La balise est gardée ici,
+    // telle quelle ; le critère « Interprète » des règles intelligentes la
+    // lit (`regles_sql::SQL_INTERPRETE_DE_LA_PISTE`). Toutes les trames, comme
+    // les crédits : un Vorbis peut porter un ARTIST par interprète.
+    if let Some(v) = toutes(ItemKey::TrackArtist) {
+        meta.insert(CLE_INTERPRETE_DE_LA_PISTE.into(), v);
+    }
 
     // Sort-order fields
     if let Some(v) = get(ItemKey::TrackArtistSortOrder) {
@@ -4077,9 +4379,8 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::ReleaseDate) {
         meta.insert("release_date".into(), v);
     }
-    if let Some(v) = get(ItemKey::OriginalReleaseDate) {
-        meta.insert("original_date".into(), v);
-    }
+    // `original_date` et `version` (#6124) : plus bas, une fois la tête
+    // Vorbis lue — leurs clés brutes ne passent pas par lofty.
 
     // Technical
     if let Some(v) = get(ItemKey::EncodedBy) {
@@ -4098,6 +4399,37 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // La tête Vorbis est lue UNE fois, pour `SOURCE` comme pour les quatre
     // graphies du DR plus bas (#5397) : `raw_vorbis_comment` la relisait.
     let header = read_vorbis_header(path);
+    // #6124 — la date de sortie ORIGINALE et la VERSION (original, réédition,
+    // remaster…). lofty ne range sous `OriginalReleaseDate` que
+    // `ORIGINALDATE` / `ORIGINALYEAR` (Vorbis, APE), `TDOR` (et la `TORY`
+    // d'un ID3v2.3, qu'il convertit) et l'atome MP4 `ORIGINALDATE` ; il
+    // écarte `ORIGINALRELEASEDATE`, tout `TXXX:ORIGINAL…`, les atomes MP4
+    // `ORIGINALYEAR` / `ORIGINALRELEASEDATE`, et `VERSION` partout. On relit
+    // donc les clés BRUTES : dans la tête Vorbis déjà lue (aucune E/S de
+    // plus), sinon par le type concret du fichier. La valeur de lofty ne sert
+    // qu'en dernier recours ; une date qui ne commence pas par une année est
+    // écartée (`balises_brutes::date_valide`).
+    {
+        let brutes: Vec<(String, String)> = match header.as_deref() {
+            Some(h) => balises_brutes::CLES_DATE_ORIGINALE
+                .iter()
+                .chain(balises_brutes::CLES_ANNEE_ORIGINALE.iter())
+                .chain(std::iter::once(&balises_brutes::CLE_VERSION))
+                .filter_map(|k| find_vorbis_comment(h, k).map(|v| (k.to_string(), v)))
+                .collect(),
+            None => balises_brutes::lire_balises_du_fichier(path)
+                .map(|b| b.paires())
+                .unwrap_or_default(),
+        };
+        if let Some(v) = balises_brutes::date_originale_parmi(&brutes).or_else(|| {
+            get(ItemKey::OriginalReleaseDate).and_then(|v| balises_brutes::date_valide(&v))
+        }) {
+            meta.insert("original_date".into(), v);
+        }
+        if let Some(v) = balises_brutes::version_parmi(&brutes) {
+            meta.insert("version".into(), v);
+        }
+    }
     if let Some(v) = get(ItemKey::OriginalMediaType)
         .or_else(|| find_vorbis_comment(header.as_deref()?, "SOURCE"))
     {
@@ -4185,7 +4517,13 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // Pas de lecture pour un fichier qui n'est pas dans un dossier, ni quand
     // il n'y a pas de rapport : un `stat` par piste, rien de plus, pour
     // l'immense majorité des bibliothèques qui n'en ont pas.
-    if !meta.contains_key("dr_track")
+    //
+    // #5519 : le rapport est AUSSI lu pour une piste qui a son DR mais pas de
+    // ReplayGain — sa crête et son RMS servent à approcher un gain
+    // (`audio::replaygain::gain_approche`), rangés sous une clé à eux et
+    // jamais sous `rg_track_gain` : une mesure réelle les remplacera.
+    let sans_rg = get(ItemKey::ReplayGainTrackGain).is_none();
+    if (!meta.contains_key("dr_track") || sans_rg)
         && let Some(rapport) = foo_dr::rapport_voisin(path)
     {
         let numero = tag.track().or_else(|| {
@@ -4194,11 +4532,21 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
                 .and_then(foo_dr::numero_dans_le_nom)
         });
         let canaux = tagged.properties().channels().map(u16::from);
-        if let Some(dr) =
-            rapport.dr_pour_la_piste(numero, tag.disk(), tag.title().as_deref(), canaux)
+        if !meta.contains_key("dr_track")
+            && let Some(dr) =
+                rapport.dr_pour_la_piste(numero, tag.disk(), tag.title().as_deref(), canaux)
         {
             meta.insert("dr_track".into(), dr.to_string());
             meta.insert("dr_source".into(), DR_SOURCE_SIDECAR.into());
+        }
+        if sans_rg
+            && let Some(m) =
+                rapport.mesures_pour_la_piste(numero, tag.disk(), tag.title().as_deref(), canaux)
+        {
+            meta.insert(
+                crate::audio::replaygain::gain_approche::CLE_MESURE_FOO_DR.into(),
+                crate::audio::replaygain::gain_approche::encoder(m.crete_db, m.rms_db),
+            );
         }
     }
     if let Some(v) = get(ItemKey::CopyrightMessage) {
@@ -4939,6 +5287,91 @@ mod tests {
         assert_eq!(
             mb_artist_query("The Beatles"),
             "artist:\"The Beatles\" OR alias:\"The Beatles\""
+        );
+    }
+
+    /// Réponse `ws/2/artist?query=artist:"Christophe"` telle que MusicBrainz la
+    /// rend (mesurée le 20/10/2026, champs inutiles retirés) : le compositeur
+    /// canadien passe DEVANT le chanteur français, avec un meilleur score.
+    fn reponse_mb_christophe() -> serde_json::Value {
+        serde_json::json!({
+            "artists": [
+                {"id": "0df890e1-f4f2-4b21-a413-cd8af1af32d8", "score": 100,
+                 "name": "Christophe Beck", "disambiguation": "Canadian score composer",
+                 "aliases": [{"name": "Jean‐Christophe Beck"}, {"name": "Jean‐Christophe"}]},
+                {"id": "5cef1748-13f1-4155-b9f6-71cd4212b960", "score": 98,
+                 "name": "Christophe", "disambiguation": "French pop singer",
+                 "aliases": [{"name": "C. Bevilacqua"}, {"name": "Christophe Bevilacqua"}]},
+                {"id": "6784a34f-3d91-45a5-b7b3-be1eaa1096f1", "score": 91,
+                 "name": "Christophe Rousset"}
+            ]
+        })
+    }
+
+    #[test]
+    fn mb_un_homonyme_mieux_classe_ne_prend_pas_le_mbid_6463() {
+        assert_eq!(
+            mb_choisir_artiste(&reponse_mb_christophe(), "Christophe").as_deref(),
+            Some("5cef1748-13f1-4155-b9f6-71cd4212b960"),
+            "#6463 — « Christophe » doit recevoir le MBID du chanteur français \
+             (nom identique), pas celui de Christophe Beck classé premier"
+        );
+    }
+
+    #[test]
+    fn mb_deux_artistes_du_meme_nom_ne_sont_pas_departages_6463() {
+        let data = serde_json::json!({
+            "artists": [
+                {"id": "a", "score": 100, "name": "Christophe"},
+                {"id": "b", "score": 100, "name": "christophe", "disambiguation": "DJ belge"}
+            ]
+        });
+        assert_eq!(mb_choisir_artiste(&data, "Christophe"), None);
+        // Le même MBID rendu deux fois n'est pas un homonyme.
+        let doublon = serde_json::json!({
+            "artists": [
+                {"id": "a", "score": 100, "name": "Christophe"},
+                {"id": "a", "score": 95, "name": "Christophe"}
+            ]
+        });
+        assert_eq!(
+            mb_choisir_artiste(&doublon, "Christophe").as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn mb_sans_nom_identique_aucun_mbid_6463() {
+        // Le premier résultat, bien noté, ne porte pas le nom cherché.
+        let data = serde_json::json!({
+            "artists": [{"id": "x", "score": 100, "name": "The Beatles"}]
+        });
+        assert_eq!(mb_choisir_artiste(&data, "Beatles"), None);
+        // Nom identique mais score trop faible : le seuil tient toujours.
+        let faible = serde_json::json!({
+            "artists": [{"id": "y", "score": 80, "name": "Christophe"}]
+        });
+        assert_eq!(mb_choisir_artiste(&faible, "Christophe"), None);
+        assert_eq!(
+            mb_choisir_artiste(&serde_json::json!({}), "Christophe"),
+            None
+        );
+    }
+
+    #[test]
+    fn mb_l_alias_natif_reste_trouve_6463() {
+        // Le cas qu'`mb_artist_query` sert : le nom primaire est romanisé,
+        // l'écriture native n'est qu'un alias.
+        let data = serde_json::json!({
+            "artists": [
+                {"id": "iu", "score": 100, "name": "IU", "aliases": [{"name": "아이유"}]}
+            ]
+        });
+        assert_eq!(mb_choisir_artiste(&data, "아이유").as_deref(), Some("iu"));
+        // À défaut de nom identique, un alias identique et unique suffit.
+        assert_eq!(
+            mb_choisir_artiste(&reponse_mb_christophe(), "Jean‐Christophe"),
+            Some("0df890e1-f4f2-4b21-a413-cd8af1af32d8".to_string())
         );
     }
 
@@ -6800,6 +7233,45 @@ mod foo_dr_voisin_4186 {
         let meta = super::read_extended_metadata(&piste);
         assert_eq!(meta.get("dr_track"), None, "Relevé : {meta:?}");
         assert_eq!(meta.get("dr_source"), None, "Relevé : {meta:?}");
+    }
+
+    const RAPPORT_TADES_RU: &[u8] = include_bytes!("../../tests/fixtures/foo_dr_tades_2050_ru.txt");
+
+    /// #5519 — la piste 1 du Mahler 5 de Tades (rapport RÉEL, en russe, fil
+    /// 2050), sans ReplayGain : le scan garde la crête et le RMS du rapport
+    /// sous `foo_dr_mesure`, et JAMAIS sous `rg_track_gain`.
+    #[test]
+    fn une_piste_sans_replaygain_garde_crete_et_rms_du_rapport_5519() {
+        let (_dossier, piste) = album(
+            "niveaux-5519",
+            "01 - Trauermarsch.flac",
+            &[("TRACKNUMBER", "1"), ("DYNAMIC RANGE", "13")],
+            Some((super::foo_dr::NOM_DU_RAPPORT, RAPPORT_TADES_RU)),
+        );
+        let meta = super::read_extended_metadata(&piste);
+        assert_eq!(
+            meta.get("foo_dr_mesure").map(String::as_str),
+            Some("v1;-4.93;-24.8"),
+            "#5519 — sans ReplayGain, la crête (−4,93) et le RMS (−24,80) du \
+             rapport doivent être gardés, même quand le DR vient d'un tag. \
+             Relevé : {meta:?}"
+        );
+        assert_eq!(meta.get("rg_track_gain"), None, "Relevé : {meta:?}");
+        assert_eq!(meta.get("dr_source").map(String::as_str), Some("tag"));
+    }
+
+    /// #5519 — un ReplayGain tagué prime : rien n'est gardé du rapport.
+    #[test]
+    fn un_replaygain_tague_ne_laisse_rien_approcher_5519() {
+        let (_dossier, piste) = album(
+            "niveaux-rg-5519",
+            "01 - Trauermarsch.flac",
+            &[("TRACKNUMBER", "1"), ("REPLAYGAIN_TRACK_GAIN", "-3.20 dB")],
+            Some((super::foo_dr::NOM_DU_RAPPORT, RAPPORT_TADES_RU)),
+        );
+        let meta = super::read_extended_metadata(&piste);
+        assert_eq!(meta.get("foo_dr_mesure"), None, "Relevé : {meta:?}");
+        assert_eq!(meta.get("dr_track").map(String::as_str), Some("13"));
     }
 
     /// Sans tag de numéro, le NOM DE FICHIER le fournit (`03 - ….flac`).

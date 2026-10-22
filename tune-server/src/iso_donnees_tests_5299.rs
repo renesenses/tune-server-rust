@@ -38,6 +38,8 @@ fn balisee(dossier: &Path, fixture: &str, titre: &str, numero: u32) -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn le_scan_indexe_une_image_iso_de_donnees_5299() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let r = racine("iso-donnees-5299");
     let musique = r.join("musique");
     let travail = r.join("travail");

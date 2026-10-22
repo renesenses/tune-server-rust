@@ -124,6 +124,59 @@ fn la_permission_playlists_cree_liste_ajoute_et_relit() {
     assert_eq!(premiere["duration_ms"], 210_000);
 }
 
+/// #6499 — une playlist de la bibliothèque qui mêle pistes locales et titres
+/// Qobuz : `host_playlist_tracks` doit rendre les DEUX sortes de lignes, dans
+/// l'ordre de la playlist, et le titre Qobuz avec son `source` / `source_id`.
+/// Avant le correctif, il ne rendait que les pistes locales (`get_track_ids`),
+/// et le convertisseur perdait les titres Qobuz en chemin.
+#[test]
+fn playlist_tracks_rend_aussi_les_titres_de_service_dans_l_ordre_6499() {
+    use tune_core::db::playlist_repo::{EntryContent, ServiceEntry};
+
+    let state = base_avec_pistes(2);
+    let host = AppStateHost::from_state(&state);
+    let id = host.playlist_create("Mixte", None).unwrap()["playlist_id"]
+        .as_i64()
+        .unwrap();
+    let qobuz = ServiceEntry {
+        source: "qobuz".into(),
+        source_id: "58640120".into(),
+        title: "So What".into(),
+        artist: Some("Miles Davis".into()),
+        album: Some("Kind of Blue".into()),
+        album_source_id: None,
+        duration_ms: Some(562_000),
+        cover_url: None,
+    };
+    PlaylistRepo::with_backend(state.backend.clone())
+        .add_entries_deduped(
+            id,
+            &[
+                EntryContent::Local(1),
+                EntryContent::Service(qobuz),
+                EntryContent::Local(2),
+            ],
+            None,
+        )
+        .expect("ajout des trois lignes");
+
+    let pistes = host.playlist_tracks(id).expect("playlist_tracks");
+    let lignes = pistes["tracks"].as_array().expect("tracks");
+    assert_eq!(
+        lignes.len(),
+        3,
+        "le titre Qobuz de la playlist locale manque à la lecture : {lignes:?}"
+    );
+    assert_eq!(pistes["count"], 3);
+    assert_eq!(lignes[0]["track_id"], 1);
+    assert_eq!(lignes[1]["source"], "qobuz");
+    assert_eq!(lignes[1]["source_id"], "58640120");
+    assert_eq!(lignes[1]["title"], "So What");
+    assert_eq!(lignes[1]["artist_name"], "Miles Davis");
+    assert_eq!(lignes[1]["duration_ms"], 562_000);
+    assert_eq!(lignes[2]["track_id"], 2);
+}
+
 #[test]
 fn playlist_add_tracks_ne_compte_que_ce_qui_est_entre() {
     // Une piste disparue : le greffon doit lire ce qui est ENTRÉ, jamais ce
@@ -358,6 +411,7 @@ impl StreamingService for ServiceDeBanc {
             covers: Vec::new(),
             track_count: 1,
             owner: None,
+            editable: None,
         }])
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {

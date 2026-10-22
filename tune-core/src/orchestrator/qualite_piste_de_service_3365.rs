@@ -87,6 +87,7 @@ fn resolu_qobuz(
         channels: Some(2),
         origin_url: None,
         bitrate_kbps: None,
+        format_source: None,
     }
 }
 

@@ -337,6 +337,7 @@ fn adapt_decoded_audio(
     decoded: DecodedAudio,
     target_sample_rate: Option<u32>,
     target_channels: Option<u32>,
+    disposition: Option<&super::disposition_canaux::Disposition>,
 ) -> Result<DecodedAudio, String> {
     if target_sample_rate == Some(0) {
         return Err("requested PCM sample rate must be greater than zero".into());
@@ -357,11 +358,12 @@ fn adapt_decoded_audio(
         return Err("requested PCM sample rate must be greater than zero".into());
     }
 
-    let mut samples = super::channels::adapt_channels_i32(
+    let mut samples = super::channels::adapt_channels_i32_disposee(
         &decoded.samples_i32,
         source_channels,
         output_channels,
         decoded.bit_depth,
+        disposition,
     )?;
     if decoded.sample_rate != output_rate {
         samples = super::resample::resample_i32(
@@ -412,6 +414,9 @@ struct StreamingPcmAdapter {
     resampler_delay_remaining: usize,
     source_frames_seen: u64,
     output_frames_emitted: u64,
+    /// #6057 — la disposition que le fichier déclare : quand le nombre de
+    /// canaux change, chaque voie est routée par sa position.
+    disposition: Option<super::disposition_canaux::Disposition>,
 }
 
 /// Stateful adapter for progressively received interleaved integer PCM bytes.
@@ -476,15 +481,26 @@ impl StreamingPcmAdapter {
             resampler_delay_remaining,
             source_frames_seen: 0,
             output_frames_emitted: 0,
+            disposition: None,
         })
     }
 
+    /// #6057 — router par la disposition déclarée par le fichier.
+    fn avec_la_disposition(
+        mut self,
+        disposition: Option<super::disposition_canaux::Disposition>,
+    ) -> Self {
+        self.disposition = disposition;
+        self
+    }
+
     fn push(&mut self, samples: &[i32]) -> Result<Vec<i32>, String> {
-        let remixed = super::channels::adapt_channels_i32(
+        let remixed = super::channels::adapt_channels_i32_disposee(
             samples,
             self.source_channels,
             self.output_channels,
             self.bit_depth,
+            self.disposition.as_ref(),
         )?;
         self.source_frames_seen += (remixed.len() / self.output_channels as usize) as u64;
         self.resample(&remixed, false)
@@ -1375,7 +1391,53 @@ pub fn decode_to_pcm(
         seek_s,
         max_duration_s,
     )?;
-    adapt_decoded_audio(decoded, target_sample_rate, target_channels)
+    adapt_decoded_audio(decoded, target_sample_rate, target_channels, None)
+}
+
+/// #6057 — [`decode_to_pcm`] pour le chemin RÉSEAU : quand le nombre de canaux
+/// change (renderer qui en annonce moins, #4573), chaque voie est routée par la
+/// POSITION que le fichier déclare (masque WAV, tag FLAC, type DSF, `CHNL`
+/// DFF), et non par l'ordre par défaut de son nombre de canaux.
+///
+/// `decode_to_pcm` reste tel quel : l'analyse ReplayGain et l'empreinte
+/// reposent sur l'identité `decode_to_pcm == adapter_pcm(decode_natif)` (#5519).
+pub fn decode_to_pcm_routee(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Result<DecodedAudio, String> {
+    let decoded = decode_natif(
+        file_path,
+        target_sample_rate,
+        target_channels,
+        seek_s,
+        max_duration_s,
+    )?;
+    let disposition = disposition_pour_le_routage(file_path, decoded.channels, target_channels);
+    adapt_decoded_audio(
+        decoded,
+        target_sample_rate,
+        target_channels,
+        disposition.as_ref(),
+    )
+}
+
+/// #6057 — la disposition déclarée par le fichier, lue seulement quand elle
+/// peut servir : le nombre de canaux change. Le fichier n'est pas rouvert
+/// pour une piste dont les canaux passent tels quels.
+fn disposition_pour_le_routage(
+    file_path: &str,
+    source_channels: u32,
+    target_channels: Option<u32>,
+) -> Option<super::disposition_canaux::Disposition> {
+    let cible = target_channels.unwrap_or(source_channels);
+    if cible == source_channels || source_channels < 3 {
+        return None;
+    }
+    super::disposition_canaux::declaree_hors_defaut(Path::new(file_path))
+        .filter(|d| u32::from(d.canaux()) == source_channels)
 }
 
 /// L'adaptation commune de [`decode_to_pcm`] (canaux puis cadence), appliquée
@@ -1390,7 +1452,7 @@ pub(crate) fn adapter_pcm(
     target_sample_rate: Option<u32>,
     target_channels: Option<u32>,
 ) -> Result<DecodedAudio, String> {
-    adapt_decoded_audio(decoded, target_sample_rate, target_channels)
+    adapt_decoded_audio(decoded, target_sample_rate, target_channels, None)
 }
 
 /// Le décodage de [`decode_to_pcm`] AVANT l'adaptation : cadence et canaux du
@@ -2545,7 +2607,12 @@ fn decode_to_pcm_streaming_inner(
         output_channels,
         source_rate,
         output_rate,
-    )?;
+    )?
+    .avec_la_disposition(disposition_pour_le_routage(
+        file_path,
+        source_channels,
+        Some(output_channels),
+    ));
 
     let rt = tokio::runtime::Handle::try_current()
         .map_err(|_| "no tokio runtime for streaming decode")?;
@@ -4064,7 +4131,13 @@ fn decode_dsd_streaming(
             data_ready,
             levels_tx,
             rt,
-            || reader.next_chunk(),
+            || {
+                // #4354 — bancs seulement : un hôte trop lent, simulé par
+                // fichier. Absent du binaire livré.
+                #[cfg(test)]
+                super::repli_dsd_4354::frein_de_test(file_path);
+                reader.next_chunk()
+            },
         );
     }
     if ext == "iso" {
@@ -4259,13 +4332,21 @@ fn decoder_le_dsd_par_blocs(
         target_channels.unwrap_or(channels as u32),
         "DSD stream target",
     )?;
+    // #6057 — un DSF de type 5 (`FL FR C LFE`) replié pour un renderer qui
+    // annonce moins de canaux : routé par ses positions déclarées. Pour une
+    // URL (`source_name` n'est pas un fichier), rien n'est lu.
     let mut pcm_adapter = StreamingPcmAdapter::new(
         24,
         source_ch as u32,
         output_ch as u32,
         output_rate,
         output_rate,
-    )?;
+    )?
+    .avec_la_disposition(disposition_pour_le_routage(
+        source_name,
+        source_ch as u32,
+        Some(output_ch as u32),
+    ));
 
     // Accumulate PCM output and flush in chunk_size batches
     let mut pcm_buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
@@ -4427,8 +4508,11 @@ pub fn decode_dsd_to_dop_streaming(
 /// sous le nom de sa première piste. Le lecteur SACD part directement de la
 /// trame de `debut_ms` et s'arrête à celle de `fin_ms`.
 ///
-/// Pour un DSF ou un DFF, la tranche n'est pas encore appliquée par ce
-/// chemin (comportement d'avant, inchangé) : seul l'ISO la reçoit.
+/// #6456 — un DSF ou un DFF la reçoit aussi : `debut_ms` est le déplacement
+/// de l'utilisateur (ou le début d'une piste CUE), `fin_ms` la fin de la
+/// tranche. Sans cela, un saut sur une sortie locale DoP relançait la piste
+/// depuis son premier bit pendant que l'horloge de la zone repartait de la
+/// position visée : le son recommençait, et la fin était déclarée trop tôt.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_dsd_to_dop_streaming_tranche(
     file_path: &str,
@@ -4523,7 +4607,18 @@ fn decode_dsd_to_dop_streaming_inner(
     if ext == "dsf" {
         let info = super::dsf::parse_dsf(file_path)?;
         let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
-        while let Some(dsd_chunk) = reader.next_chunk()? {
+        let (debut_ms, fin_ms) = tranche.unwrap_or((0, None));
+        let atteint = if debut_ms > 0 {
+            let cible = super::dsd_brut::octets_par_canal_pour_ms(dsd_rate, debut_ms) as usize;
+            reader.seek_to_bytes_per_channel(cible)? as u64
+        } else {
+            0
+        };
+        let mut borne = BorneDeTranche::new(dsd_rate, channels, atteint, fin_ms);
+        while let Some(mut dsd_chunk) = reader.next_chunk()? {
+            if !borne.couper(&mut dsd_chunk) {
+                break;
+            }
             process_chunk(&dsd_chunk)?;
         }
     } else if ext == "iso" {
@@ -4536,7 +4631,19 @@ fn decode_dsd_to_dop_streaming_inner(
         let info = super::dff::parse_dff(file_path)?;
         let read_chunk = 32768 / channels * channels;
         let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
-        while let Some(dsd_chunk) = reader.next_chunk()? {
+        let (debut_ms, fin_ms) = tranche.unwrap_or((0, None));
+        let atteint = if debut_ms > 0 {
+            let cible =
+                super::dsd_brut::octets_par_canal_pour_ms(dsd_rate, debut_ms) as usize * channels;
+            (reader.seek_to_interleaved_byte(cible, channels)? / channels) as u64
+        } else {
+            0
+        };
+        let mut borne = BorneDeTranche::new(dsd_rate, channels, atteint, fin_ms);
+        while let Some(mut dsd_chunk) = reader.next_chunk()? {
+            if !borne.couper(&mut dsd_chunk) {
+                break;
+            }
             process_chunk(&dsd_chunk)?;
         }
     }
@@ -4550,6 +4657,45 @@ fn decode_dsd_to_dop_streaming_inner(
         dsd_rate, dop_rate, channels, "decoded_dsd_dop_streaming"
     );
     Ok((24, dop_rate))
+}
+
+/// #6456 — la fin d'une tranche DSF/DFF, en octets PAR CANAL comptés depuis
+/// la position atteinte par le déplacement (l'ISO l'applique lui-même, dans
+/// son lecteur). Même règle que `dsd_brut::lire_dsd_brut`.
+struct BorneDeTranche {
+    canaux: usize,
+    reste_par_canal: Option<u64>,
+}
+
+impl BorneDeTranche {
+    fn new(cadence: u32, canaux: usize, atteint_par_canal: u64, fin_ms: Option<u64>) -> Self {
+        Self {
+            canaux: canaux.max(1),
+            reste_par_canal: fin_ms.map(|fin| {
+                super::dsd_brut::octets_par_canal_pour_ms(cadence, fin)
+                    .saturating_sub(atteint_par_canal)
+            }),
+        }
+    }
+
+    /// Tronque `bloc` (entrelacé) à ce qui reste de la tranche. `false` quand
+    /// la tranche était déjà épuisée : la lecture s'arrête là.
+    fn couper(&mut self, bloc: &mut Vec<u8>) -> bool {
+        let Some(reste) = self.reste_par_canal.as_mut() else {
+            return true;
+        };
+        if *reste == 0 {
+            return false;
+        }
+        let max = usize::try_from(*reste)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(self.canaux);
+        if bloc.len() > max {
+            bloc.truncate(max);
+        }
+        *reste = reste.saturating_sub((bloc.len() / self.canaux) as u64);
+        true
+    }
 }
 
 // Every DoP payload block, including a short first/final block, follows the
@@ -4593,6 +4739,14 @@ mod dop_terminal_tests_2369;
 #[cfg(test)]
 #[path = "pause_longue_4917_tests.rs"]
 mod pause_longue_4917_tests;
+
+#[cfg(test)]
+#[path = "dop_deplacement_tests_6456.rs"]
+mod dop_deplacement_tests_6456;
+
+#[cfg(test)]
+#[path = "disposition_reseau_tests_6057.rs"]
+mod disposition_reseau_tests_6057;
 
 /// Decode a DSD file (DSF or DFF) to PCM using streaming converter.
 ///

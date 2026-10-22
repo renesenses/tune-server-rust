@@ -52,10 +52,13 @@ pub const EVENEMENTS_QUI_INVALIDENT: [&str; 5] = [
 ///
 /// Liste BLANCHE : un champ absent d'ici — ou inconnu — rend la collection
 /// non cachable. Se tromper dans ce sens ne coûte qu'une requête.
-pub const CHAMPS_DE_BIBLIOTHEQUE: [&str; 19] = [
+pub const CHAMPS_DE_BIBLIOTHEQUE: [&str; 22] = [
     "genre",
     "artist",
     "artist_name",
+    "album_artist",
+    // #6232 — la balise ARTIST de la piste, écrite par le scan.
+    "track_artist",
     "album",
     "album_title",
     "title",
@@ -72,6 +75,9 @@ pub const CHAMPS_DE_BIBLIOTHEQUE: [&str; 19] = [
     "track_number",
     "disc_number",
     "bpm",
+    // #6123 — lue dans les balises, elle ne change qu'avec la bibliothèque
+    // (le scan). `rating`, note d'album par profil, n'est PAS ici.
+    "track_rating",
 ];
 
 /// Vrai si toutes les règles portent sur [`CHAMPS_DE_BIBLIOTHEQUE`].
@@ -200,6 +206,14 @@ mod tests {
         }
     }
 
+    /// #6121 — « Artiste de l'album » ne change qu'avec la bibliothèque.
+    #[test]
+    fn l_artiste_de_l_album_est_cachable() {
+        assert!(regles_cachables(
+            r#"[{"field":"album_artist","op":"=","value":"Various Artists"}]"#
+        ));
+    }
+
     #[test]
     fn seules_les_regles_de_bibliotheque_sont_cachables() {
         assert!(regles_cachables(
@@ -211,6 +225,13 @@ mod tests {
         // Une date RELATIVE, l'écoute, la note, une étiquette : jamais.
         assert!(!regles_cachables(
             r#"[{"field":"added_at","operator":"greater_than","value":"90d"}]"#
+        ));
+        // #6122 — la durée glissante change avec l'horloge, sans événement.
+        assert!(!regles_cachables(
+            r#"[{"field":"added_at","op":"in_last","value":30}]"#
+        ));
+        assert!(!regles_cachables(
+            r#"[{"field":"last_played_at","op":"in_last","value":7}]"#
         ));
         assert!(!regles_cachables(
             r#"[{"field":"genre","op":"=","value":"x"},{"field":"play_count","op":">","value":"3"}]"#

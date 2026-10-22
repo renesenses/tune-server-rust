@@ -1,0 +1,48 @@
+[package]
+name = "tune-assistant-ia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Chantier « Assistant IA », étapes 1 et 2 (GO de Bertrand du 12/10/2026). Greffon
+# natif, sur le modèle de `tune-circle` et de `tune-concerts` : ses routes sont
+# montées par l'hôte sous `/api/v1/ext/assistant-ia`. Voir
+# `docs/chantier-assistant-ia.md`.
+#
+# L'utilisateur fournit SA clé ; les appels partent de SON serveur vers SON
+# fournisseur (Anthropic, point d'accès compatible OpenAI, Ollama). Rien ne
+# passe par mozaiklabs.fr.
+#
+# Feature `assistant-ia` de tune-server, dans son `default`, inscrite à
+# `sdk/plugins.json`. Il ne tire aucune dépendance que `tune-core` ne porte
+# déjà.
+
+[dependencies]
+tune-core = { path = "../../tune-core", default-features = false, features = ["plugin-http"] }
+# Étape 2 : l'identité de l'appelant (`AuthUser`) que pose le middleware
+# d'authentification — les réglages sont réservés aux administrateurs.
+tune-http-types = { path = "../../tune-http-types" }
+axum = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# Les appels aux fournisseurs. `tune-core` ne réexporte pas reqwest.
+reqwest = { workspace = true }
+tokio = { workspace = true }
+# Le mois de la consommation.
+chrono = { workspace = true }
+# La clé du cache des réponses.
+sha2 = { workspace = true }
+# Le hasard des identifiants de lot (`suggestions`). La clé d'API, elle, est
+# scellée par le coffre de `tune-core` (`tune_core::coffre`).
+getrandom = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+tracing-subscriber = { workspace = true }
+tempfile = "3"
+# Les VRAIS critères du moteur, pour que les essais de validation lisent la
+# même liste que la production.
+tune-smart-http = { path = "../../tune-smart-http" }

@@ -147,7 +147,7 @@ async fn un_entete_pondere_est_reduit_a_sa_base() {
     );
 }
 
-/// Les dix langues de l'interface passent, et deux langues distinctes ne
+/// Les langues de l'interface (`SUPPORTED`) passent, et deux langues distinctes ne
 /// peuvent pas rendre le même texte : sans cela, un serveur qui répondrait
 /// toujours pareil passerait les cas ci-dessus.
 #[tokio::test]

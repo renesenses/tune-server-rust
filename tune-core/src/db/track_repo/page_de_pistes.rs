@@ -37,11 +37,14 @@ use crate::db::engine::Engine;
 /// La CLÉ est celle du client (`CleColonne` de `colonnesPistes.ts`) : le
 /// navigateur envoie ce qu'il affiche, sans table de traduction à tenir.
 ///
-/// Absentes, et volontairement : `plays` et `lastPlayed` (une jointure par
-/// titre et artiste sur l'historique, `HistoryRepo::plays_for_tracks`), `dr`
-/// (magasin ouvert `track_metadata`), `quality` (deux colonnes, aucun ordre
-/// évident) et `num` (le RANG dans la liste, sur cet onglet). Une clé inconnue
-/// est refusée par la route (400), jamais ignorée en silence.
+/// Absentes, et volontairement : `dr` (magasin ouvert `track_metadata`),
+/// `quality` (deux colonnes, aucun ordre évident) et `num` (le RANG dans la
+/// liste, sur cet onglet). Une clé inconnue est refusée par la route (400),
+/// jamais ignorée en silence.
+///
+/// `plays` et `lastPlayed` (tune-web-client#1470) se trient par une jointure
+/// sur l'historique d'écoute, posée seulement pour ces deux tris
+/// ([`JOINTURE_ECOUTES`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColonneDeTri {
     Titre,
@@ -51,6 +54,8 @@ pub enum ColonneDeTri {
     Annee,
     Canaux,
     Bpm,
+    /// La note de la piste lue dans ses balises (#6123).
+    Note,
     Genre,
     Album,
     ArtisteAlbum,
@@ -68,10 +73,14 @@ pub enum ColonneDeTri {
     Source,
     Modifie,
     Empreinte,
+    /// Le nombre d'écoutes (`play_count`) — tune-web-client#1470.
+    Ecoutes,
+    /// La dernière écoute (`last_played_at`) — tune-web-client#1470.
+    DerniereEcoute,
 }
 
 /// Les clés acceptées, dans l'ordre du catalogue du client.
-pub const COLONNES_TRIABLES: [(&str, ColonneDeTri); 24] = [
+pub const COLONNES_TRIABLES: [(&str, ColonneDeTri); 27] = [
     ("title", ColonneDeTri::Titre),
     ("artist", ColonneDeTri::Artiste),
     ("composer", ColonneDeTri::Compositeur),
@@ -79,6 +88,7 @@ pub const COLONNES_TRIABLES: [(&str, ColonneDeTri); 24] = [
     ("year", ColonneDeTri::Annee),
     ("channels", ColonneDeTri::Canaux),
     ("bpm", ColonneDeTri::Bpm),
+    ("rating", ColonneDeTri::Note),
     ("genre", ColonneDeTri::Genre),
     ("album", ColonneDeTri::Album),
     ("albumArtist", ColonneDeTri::ArtisteAlbum),
@@ -96,7 +106,31 @@ pub const COLONNES_TRIABLES: [(&str, ColonneDeTri); 24] = [
     ("source", ColonneDeTri::Source),
     ("modified", ColonneDeTri::Modifie),
     ("hash", ColonneDeTri::Empreinte),
+    ("plays", ColonneDeTri::Ecoutes),
+    ("lastPlayed", ColonneDeTri::DerniereEcoute),
 ];
+
+/// L'historique d'écoute agrégé par titre et interprète, joint à la piste
+/// (alias `ec`) pour les tris `plays` et `lastPlayed` — tune-web-client#1470.
+///
+/// Le rapprochement est CELUI de `HistoryRepo::plays_for_tracks`, qui remplit
+/// `play_count` et `last_played_at` dans la réponse : radio exclue, égalité
+/// stricte du titre, interprète égal ou absent des deux côtés
+/// (`listen_history.track_id` est toujours NULL, voir ce module). L'ordre suit
+/// donc exactement les nombres que la colonne affiche.
+///
+/// Agrégé UNE fois puis joint, plutôt qu'une sous-requête corrélée par piste :
+/// le tri porte sur toute la bibliothèque filtrée, et PostgreSQL n'a pas
+/// d'index `(title, artist_name)` sur l'historique. L'égalité sur le titre
+/// est la clé de hachage ; la condition sur l'interprète filtre ensuite.
+/// `GROUP BY title, artist_name` : une piste rencontre AU PLUS une ligne,
+/// le `COUNT(*) OVER ()` de la page n'est pas multiplié.
+const JOINTURE_ECOUTES: &str = " LEFT JOIN (SELECT title, artist_name, \
+       COUNT(*) AS n, MAX(listened_at) AS derniere \
+       FROM listen_history WHERE source != 'radio' \
+       GROUP BY title, artist_name) ec \
+     ON ec.title = t.title \
+    AND (ec.artist_name = ar.name OR (ec.artist_name IS NULL AND ar.name IS NULL))";
 
 /// Comment une valeur « vide » se reconnaît, pour la ranger en FIN de liste
 /// dans les deux sens : une cellule vide en tête d'un tri descendant cacherait
@@ -160,9 +194,24 @@ impl ColonneDeTri {
             Self::Profondeur => ("t.bit_depth".into(), Vide::NulOuZero),
             Self::Canaux => ("t.channels".into(), Vide::Nul),
             Self::Bpm => ("t.bpm".into(), Vide::Nul),
+            // 0 étoile est une note : seul NULL va en fin de liste.
+            Self::Note => ("t.rating".into(), Vide::Nul),
             Self::Disque => ("CAST(t.disc_number AS INTEGER)".into(), Vide::Nul),
             Self::Taille => ("t.file_size".into(), Vide::Nul),
             Self::Modifie => ("t.file_mtime".into(), Vide::Nul),
+            // 0 écoute est un compte, pas une cellule vide : rien ne va en fin
+            // de liste, une piste jamais jouée se range avec les zéros.
+            Self::Ecoutes => ("COALESCE(ec.n, 0)".into(), Vide::Nul),
+            // Jamais jouée : pas de date, en fin de liste dans les deux sens.
+            Self::DerniereEcoute => ("ec.derniere".into(), Vide::Nul),
+        }
+    }
+
+    /// La jointure qu'appelle l'expression de tri, s'il en faut une.
+    fn jointure(self) -> &'static str {
+        match self {
+            Self::Ecoutes | Self::DerniereEcoute => JOINTURE_ECOUTES,
+            _ => "",
         }
     }
 }
@@ -185,18 +234,25 @@ const ORDRE_PAR_DEFAUT: &str = "LOWER(ar.name), LOWER(al.title), \
 /// sinon                                    → 'upnp'
 /// ```
 pub fn expression_provenance(engine: Engine) -> String {
+    expression_provenance_de(engine, "t")
+}
+
+/// [`expression_provenance`] sur l'alias `alias` — `a` pour une ligne
+/// d'`albums`, qui porte les mêmes `source` / `source_id` (web#1716 : les
+/// sources d'un artiste réunissent ses albums et ses pistes).
+pub fn expression_provenance_de(engine: Engine, alias: &str) -> String {
     let pos = match engine {
-        Engine::Sqlite => "instr(t.source_id, '|')",
-        Engine::Postgres => "strpos(t.source_id, '|')",
+        Engine::Sqlite => format!("instr({alias}.source_id, '|')"),
+        Engine::Postgres => format!("strpos({alias}.source_id, '|')"),
     };
+    let src = format!("COALESCE(NULLIF(TRIM({alias}.source), ''), 'local')");
     format!(
         "(CASE WHEN {src} = 'upnp' \
            AND {pos} > 1 \
-           AND TRIM(substr(t.source_id, 1, {pos} - 1)) <> '' \
-           AND substr(t.source_id, {pos} + 1, 1) NOT IN ('', '|') \
-         THEN 'upnp:' || TRIM(substr(t.source_id, 1, {pos} - 1)) \
+           AND TRIM(substr({alias}.source_id, 1, {pos} - 1)) <> '' \
+           AND substr({alias}.source_id, {pos} + 1, 1) NOT IN ('', '|') \
+         THEN 'upnp:' || TRIM(substr({alias}.source_id, 1, {pos} - 1)) \
          ELSE {src} END)",
-        src = SOURCE_NORMALISEE,
     )
 }
 
@@ -340,8 +396,9 @@ impl TrackRepo {
         let where_clause = conditions.join(" AND ");
         let limite = ph.take();
         let decalage = ph.take();
+        let jointure = d.tri.map_or("", ColonneDeTri::jointure);
         let sql_ids = format!(
-            "SELECT t.id, COUNT(*) OVER (){} WHERE {where_clause} ORDER BY {ordre} \
+            "SELECT t.id, COUNT(*) OVER (){}{jointure} WHERE {where_clause} ORDER BY {ordre} \
              LIMIT {limite} OFFSET {decalage}",
             sql::track_from()
         );
@@ -471,9 +528,37 @@ mod tests {
         piste("Azur qobuz", abba, None, 1, 200_000, "qobuz", Some("q-1"));
     }
 
+    /// L'historique d'écoute de la petite bibliothèque (tune-web-client#1470) :
+    /// des écoutes comptées, et trois lignes qui ne doivent PAS compter — une
+    /// radio, un homonyme d'un autre interprète, un titre à la casse près.
+    pub(crate) fn historique(db: &dyn crate::db::backend::DbBackend) {
+        for (titre, artiste, source, quand) in [
+            ("Dancing Queen", "ABBA", "local", "2026-10-01T10:00:00Z"),
+            ("Dancing Queen", "ABBA", "local", "2026-09-01T10:00:00Z"),
+            ("Dancing Queen", "ABBA", "qobuz", "2026-08-01T10:00:00Z"),
+            ("Été indien", "Éla Ferré", "local", "2026-10-10T10:00:00Z"),
+            ("Azur qobuz", "ABBA", "radio", "2026-10-12T10:00:00Z"),
+            ("Orphelin", "ABBA", "local", "2026-10-11T10:00:00Z"),
+            ("orphelin", "Éla Ferré", "local", "2026-10-11T10:00:00Z"),
+        ] {
+            let mut ph = Placeholders::new(db.engine());
+            let marqueurs: Vec<String> = (0..4).map(|_| ph.take()).collect();
+            db.execute(
+                &format!(
+                    "INSERT INTO listen_history (title, artist_name, source, listened_at) \
+                     VALUES ({})",
+                    marqueurs.join(", ")
+                ),
+                &[&titre, &artiste, &source, &quand],
+            )
+            .unwrap();
+        }
+    }
+
     fn base() -> (TrackRepo, ArtistRepo, AlbumRepo) {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
         (
             TrackRepo::new(db.clone()),
             ArtistRepo::new(db.clone()),
@@ -550,6 +635,80 @@ mod tests {
         let desc = titres(&repo.page_de_pistes(&d).unwrap());
         assert_eq!(desc.first().map(String::as_str), Some("Azur 100%"));
         assert_eq!(desc.last().map(String::as_str), Some("Été indien"));
+    }
+
+    /// tune-web-client#1470 — « # écoutes » et « Dernière écoute » : l'ordre
+    /// suit les nombres que la réponse affiche (`plays_for_tracks`), 0 est un
+    /// compte, une piste jamais jouée n'a pas de date et va en fin de liste.
+    #[test]
+    fn i1470_le_tri_par_ecoutes_suit_l_historique() {
+        let (repo, ar, al) = base();
+        bibliotheque(&repo, &ar, &al);
+        historique(repo.db.as_ref());
+
+        let mut d = demande();
+        d.tri = ColonneDeTri::depuis_cle("plays");
+        assert_eq!(
+            d.tri,
+            Some(ColonneDeTri::Ecoutes),
+            "sort=plays doit être accepté"
+        );
+        d.descendant = true;
+        let page = repo.page_de_pistes(&d).unwrap();
+        assert_eq!(page.total, 7, "la jointure ne multiplie pas les lignes");
+        assert_eq!(
+            titres(&page)[..2],
+            ["Dancing Queen", "Été indien"],
+            "la plus écoutée en tête"
+        );
+        // L'ordre est celui des comptes que la colonne affiche.
+        let ids: Vec<i64> = page.pistes.iter().filter_map(|t| t.id).collect();
+        let comptes = crate::db::history_repo::HistoryRepo::with_backend(repo.db.clone())
+            .plays_for_tracks(&ids)
+            .unwrap();
+        let affiches: Vec<i64> = ids.iter().map(|id| comptes[id].0).collect();
+        assert_eq!(affiches, [3, 1, 0, 0, 0, 0, 0]);
+        // Croissant : les zéros d'abord (un compte, pas une cellule vide).
+        d.descendant = false;
+        let asc = titres(&repo.page_de_pistes(&d).unwrap());
+        assert_eq!(asc.last().map(String::as_str), Some("Dancing Queen"));
+        assert_eq!(asc[5], "Été indien");
+
+        d.tri = ColonneDeTri::depuis_cle("lastPlayed");
+        assert_eq!(
+            d.tri,
+            Some(ColonneDeTri::DerniereEcoute),
+            "sort=lastPlayed doit être accepté"
+        );
+        for descendant in [true, false] {
+            d.descendant = descendant;
+            let page = repo.page_de_pistes(&d).unwrap();
+            assert_eq!(page.total, 7);
+            let t = titres(&page);
+            let attendu = if descendant {
+                ["Été indien", "Dancing Queen"]
+            } else {
+                ["Dancing Queen", "Été indien"]
+            };
+            assert_eq!(t[..2], attendu, "dernière écoute, descendant={descendant}");
+            // Les cinq jamais jouées (radio exclue) : en fin de liste, dans
+            // l'ordre par défaut de la vue.
+            assert!(
+                !t[2..].contains(&"Dancing Queen".to_string())
+                    && !t[2..].contains(&"Été indien".to_string()),
+                "{t:?}"
+            );
+        }
+        // Pagination : la page 2 du tri par écoutes ne recouvre pas la 1.
+        d.tri = Some(ColonneDeTri::Ecoutes);
+        d.descendant = true;
+        d.limit = 4;
+        let p1 = titres(&repo.page_de_pistes(&d).unwrap());
+        d.offset = 4;
+        let p2 = repo.page_de_pistes(&d).unwrap();
+        assert_eq!(p2.total, 7);
+        assert_eq!(p2.pistes.len(), 3);
+        assert!(titres(&p2).iter().all(|t| !p1.contains(t)));
     }
 
     /// La recherche de l'onglet : titre OU artiste, pliée, littérale.
@@ -682,7 +841,7 @@ mod tests {
                 assert_eq!(page.total, 7, "tri {cle}");
             }
         }
-        assert_eq!(ColonneDeTri::depuis_cle("plays"), None);
+        assert_eq!(ColonneDeTri::depuis_cle("dr"), None);
     }
 
     /// Le MÊME scénario sur PostgreSQL : `strpos` au lieu d'`instr`,
@@ -691,7 +850,7 @@ mod tests {
     ///
     /// Doctrine de `postgres_e2e.rs` : `TUNE_TEST_PG_URL` absente ⇒ saut
     /// annoncé ; posée mais injoignable ⇒ l'épreuve TOMBE. Elle vide
-    /// `tracks`, `albums`, `artists` et `hidden_items` : à lancer seule
+    /// `tracks`, `albums`, `artists`, `hidden_items` et `listen_history` : à lancer seule
     /// (`-- pg_1716 --test-threads=1`).
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread")]
@@ -708,7 +867,13 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("TUNE_TEST_PG_URL posée ({url}) mais injoignable : {e}"));
         let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool));
-        for table in ["hidden_items", "tracks", "albums", "artists"] {
+        for table in [
+            "listen_history",
+            "hidden_items",
+            "tracks",
+            "albums",
+            "artists",
+        ] {
             db.execute(
                 &format!("TRUNCATE TABLE {table} RESTART IDENTITY CASCADE"),
                 &[],
@@ -767,6 +932,32 @@ mod tests {
         d.recherche = Some("ela fer".into());
         d.provenance = Some("upnp".into());
         assert_eq!(repo.page_de_pistes(&d).unwrap().total, 2);
+
+        // tune-web-client#1470 : les écoutes, même ordre que sur SQLite.
+        historique(db.as_ref());
+        let mut d = demande();
+        d.tri = ColonneDeTri::depuis_cle("plays");
+        assert_eq!(
+            d.tri,
+            Some(ColonneDeTri::Ecoutes),
+            "sort=plays doit être accepté"
+        );
+        d.descendant = true;
+        let page = repo.page_de_pistes(&d).unwrap();
+        assert_eq!(page.total, 7);
+        assert_eq!(titres(&page)[..2], ["Dancing Queen", "Été indien"]);
+        d.tri = Some(ColonneDeTri::DerniereEcoute);
+        assert_eq!(
+            titres(&repo.page_de_pistes(&d).unwrap())[..2],
+            ["Été indien", "Dancing Queen"]
+        );
+        // Croissant : une piste jamais jouée reste en fin de liste malgré
+        // `NULLS LAST`/`NULLS FIRST` de PostgreSQL.
+        d.descendant = false;
+        assert_eq!(
+            titres(&repo.page_de_pistes(&d).unwrap())[..2],
+            ["Dancing Queen", "Été indien"]
+        );
 
         // Chaque colonne, chaque sens : un SQL que PostgreSQL accepte.
         for (cle, col) in COLONNES_TRIABLES {

@@ -7,6 +7,8 @@
 #![allow(clippy::result_large_err)]
 
 mod adresse_d_accueil;
+/// #4626 — rôle maître / agent entre deux serveurs Tune du réseau local.
+pub mod agent_tune;
 pub mod aiguillage_des_flux;
 #[cfg(test)]
 mod aiguillage_des_flux_tests_4645;
@@ -38,6 +40,8 @@ pub mod fils_de_travail;
 /// Détecteur de gel de l'exécuteur et relevé automatique (#4924).
 pub mod gel_executeur;
 mod instance_existante;
+/// #6253 — `--sans-console` : relance sans fenêtre de terminal (Windows).
+pub(crate) mod lancement_sans_console;
 pub use tune_http_types::error;
 pub mod i18n;
 pub mod journal;
@@ -72,6 +76,9 @@ mod tune_os_password;
 pub mod windows_migrate;
 
 #[cfg(test)]
+mod pauses_de_fond_tests;
+
+#[cfg(test)]
 mod aleatoire_selection_5526_tests;
 // #5512 : compilé partout, actif seulement en build de test (lib ET
 // intégration) — voir `isolement_disque_tests_5467::actif`.
@@ -86,5 +93,9 @@ pub use bootstrap::run;
 mod premium_audio_plugins;
 
 mod audio_job_journal;
+
+/// #5870 — bascule d'office des zones Tune OS de `alsa:default` vers le DAC.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+mod bascule_tune_os_5870;
 mod catalogue_greffons_audio;
 mod native_audio;

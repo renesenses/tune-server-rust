@@ -5,6 +5,8 @@ pub mod analyzer;
 pub mod ape;
 pub mod audiophile;
 pub mod autoeq;
+/// #6388 — la base AutoEq en ligne : index, recherche, copie locale.
+pub mod autoeq_base;
 pub mod canaux_declares;
 pub mod canaux_reseau_4573;
 
@@ -25,6 +27,8 @@ pub mod decode;
 /// Balise d'avancement du décodage (#3140) — le débit réel de l'hôte, mesuré
 /// sur le décodage en cours, sans le coûter.
 pub mod decode_progress;
+/// #6059 — servir un FLAC, AIFF ou DSF natif à partir d'une position.
+pub mod depart_natif;
 pub mod dff;
 /// #6057 — la disposition des canaux déclarée par le fichier (WAV, FLAC, DSF,
 /// DFF) et le routage par position vers la sortie.
@@ -44,6 +48,9 @@ mod dsd_ordre_canaux_et_phase;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
 pub mod dsf;
+pub mod dsf_depuis_dst;
+#[cfg(test)]
+mod dsf_depuis_dst_tests_6221;
 /// #4833 — le DSF décodé au fil de l'eau depuis HTTP produit le même PCM que
 /// le fichier (mesuré : comptes, cadence, RMS, corrélation, vitesse).
 #[cfg(test)]
@@ -60,9 +67,15 @@ pub mod encoder;
 pub mod eq;
 pub mod eq_presets;
 pub mod faststart;
+/// Faux hi-res : bits effectifs et coupure spectrale (#6285).
+pub mod faux_hires;
+/// La passe de fond des faux hi-res (#6285).
+pub mod faux_hires_passe;
 /// Mémoire du volume d'avant l'armement du mode bit-perfect (#2395).
 pub mod fixed_volume;
 pub mod flac_vendeur;
+/// #6353 — flux Dolby d'un Matroska, reconnus sans décodage.
+pub mod flux_dolby;
 /// #2211 — le réglage de fondu d'une zone et la consigne de chaque frontière
 /// (même album, live, DSD) que l'orchestrateur remet à la sortie locale.
 pub mod fondu_de_zone;
@@ -107,6 +120,8 @@ pub mod pipeline;
 /// album, résolution de la règle qui s'applique à une piste.
 pub mod reaffectation_canaux;
 pub mod replaygain;
+pub mod repli_dsd_4354;
+pub mod reprise_nouveau_flux;
 pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]
@@ -121,10 +136,13 @@ pub mod soft_mute;
 pub mod staged_growth;
 pub mod support;
 pub mod tap;
+pub mod tempo;
 /// CLAP text tower for natural-language acoustic search (Phase 3).
 #[cfg(feature = "audio-embedding")]
 pub mod text_embedding;
 pub mod thermal;
+/// #6541 — limites de sécurité et de confort du volume d'une zone.
+pub mod volume_limites;
 /// Conversion volume linéaire ↔ décibels — le seul endroit (#1274).
 pub mod volume_scale;
 pub mod wav;

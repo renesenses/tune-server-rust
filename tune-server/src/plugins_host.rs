@@ -495,14 +495,34 @@ impl HostContext for AppStateHost {
         let playlist = repo
             .get_for_profile(playlist_id, profil)?
             .ok_or_else(|| format!("playlist introuvable : {playlist_id}"))?;
-        let ids = repo.get_track_ids(playlist_id)?;
-        let pistes = TrackRepo::with_backend(self.backend.clone())
+        // #6499 — TOUTES les lignes, dans l'ordre de la playlist : les pistes
+        // de la bibliothèque ET les titres de service (#4889). `get_track_ids`
+        // ne rend que les premières ; le convertisseur ne voyait donc jamais
+        // les titres Qobuz d'une playlist locale, et la playlist créée chez
+        // Qobuz les perdait sans même les compter parmi les introuvables.
+        // Une ligne introuvable (#6179) n'a ni piste ni identifiant de service
+        // à transmettre : elle reste hors de la liste, comme avant.
+        let entrees = repo.get_entries(playlist_id)?;
+        let ids: Vec<i64> = entrees.iter().filter_map(|e| e.track_id()).collect();
+        let par_id: HashMap<i64, Track> = TrackRepo::with_backend(self.backend.clone())
             .get_multiple(&ids)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter_map(|t| Some((t.id?, t)))
+            .collect();
         // Ce que le convertisseur a besoin de lire pour apparier : titre,
         // artiste, durée, ISRC — la fiche commune à toutes les capacités qui
-        // rendent des pistes locales.
-        let pistes: Vec<Value> = pistes.iter().map(fiche_piste).collect();
+        // rendent des pistes locales. Un titre de service porte en plus
+        // `source` / `source_id` : c'est ce qui permet de le reprendre tel
+        // quel quand la cible est son propre service.
+        let pistes: Vec<Value> = entrees
+            .iter()
+            .filter_map(|e| match (e.track_id(), e.service()) {
+                (Some(id), _) => par_id.get(&id).map(fiche_piste),
+                (None, Some(s)) => Some(s.to_json()),
+                (None, None) => None,
+            })
+            .collect();
         Ok(json!({
             "playlist_id": playlist_id,
             "name": playlist.name,
@@ -897,7 +917,10 @@ fn persist_plugin_archive_in(root: &Path, data: &[u8]) -> Result<String, String>
         }
         // enclosed_name refuses absolute paths and `..` traversal.
         let Some(rel) = file.enclosed_name() else {
-            return Err(format!("unsafe path in archive: {:?}", file.name()));
+            return Err(format!(
+                "unsafe path in archive: {:?}",
+                String::from_utf8_lossy(file.name_raw())
+            ));
         };
         let out_path = dest.join(rel);
         if let Some(parent) = out_path.parent() {
@@ -1484,6 +1507,56 @@ mod tests {
         ]);
         let err = persist_plugin_archive_in(tmp.path(), &data).unwrap_err();
         assert!(err.contains("unsafe plugin id"), "{err}");
+    }
+
+    #[test]
+    fn persist_archive_neither_restores_symlinks_nor_special_bits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default();
+        z.start_file("manifest.json", o).unwrap();
+        z.write_all(&manifest_json("party")).unwrap();
+        z.start_file("main.wasm", o.unix_permissions(0o6755))
+            .unwrap();
+        z.write_all(b"\0asm").unwrap();
+        z.add_symlink("lien", "../..", o).unwrap();
+        z.add_symlink("absolu", "/etc", o).unwrap();
+        let data = z.finish().unwrap().into_inner();
+
+        persist_plugin_archive_in(tmp.path(), &data).unwrap();
+
+        let dir = tmp.path().join("party");
+        for lien in ["lien", "absolu"] {
+            let meta = std::fs::symlink_metadata(dir.join(lien));
+            assert!(
+                meta.map(|m| !m.file_type().is_symlink()).unwrap_or(true),
+                "symlink {lien} restored"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("main.wasm"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o7000, 0, "special bits restored: {mode:o}");
+        }
+    }
+
+    #[test]
+    fn persist_archive_rejects_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("plugins");
+        std::fs::create_dir_all(&root).unwrap();
+        let data = make_zip(&[
+            ("manifest.json", &manifest_json("party")),
+            ("main.wasm", b"\0asm"),
+            ("../../evade.txt", b"x"),
+        ]);
+        let err = persist_plugin_archive_in(&root, &data).unwrap_err();
+        assert!(err.contains("unsafe path"), "{err}");
+        assert!(!tmp.path().join("evade.txt").exists());
     }
 
     #[test]

@@ -741,6 +741,7 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
                     // les fichiers audio.
                     if (is_audio_file(path) || est_une_feuille_cue(path) || est_une_image_iso(path))
                         && !super::is_tune_temp_file(path)
+                        && !super::est_un_fichier_appledouble(path)
                     {
                         let change_type = genre_d_un_fichier(&event.kind, path, &ct);
                         // Fil 2207 — un fichier qui ARRIVE dans une corbeille
@@ -785,6 +786,7 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
                     || est_une_feuille_cue(path)
                     || est_une_image_iso(path)
                     || super::is_tune_temp_file(path)
+                    || super::est_un_fichier_appledouble(path)
                 {
                     continue;
                 }
@@ -910,6 +912,7 @@ pub fn fichiers_audio_sous(dossier: &Path) -> Vec<String> {
                 }
             } else if (is_audio_file(&chemin) || est_une_image_iso(&chemin))
                 && !super::is_tune_temp_file(&chemin)
+                && !super::est_un_fichier_appledouble(&chemin)
             {
                 trouves.push(chemin.to_string_lossy().to_string());
             }
@@ -1278,6 +1281,45 @@ mod tests {
 
     fn ev(kind: EventKind, chemin: &str) -> Event {
         Event::new(kind).add_path(PathBuf::from(chemin))
+    }
+
+    /// #6148 (Patatorz, fil 2224) — un fichier AppleDouble `._x.aiff` posé
+    /// par macOS à côté d'une vraie piste n'est pas une piste : ni l'événement
+    /// d'ajout, ni le contenu d'un dossier apparu ne doivent le livrer à
+    /// `auto_scan`. Le parcours complet l'écartait déjà ; le surveillant non.
+    #[test]
+    fn le_surveillant_ecarte_les_fichiers_appledouble_6148() {
+        use notify::event::{CreateKind, RemoveKind};
+        let vraie = "/Musique/Beck/Everybody's Gotta Learn Sometime/02 - Can't Help.aiff";
+        let double = "/Musique/Beck/Everybody's Gotta Learn Sometime/._02 - Can't Help.aiff";
+        let vu = rejouer(vec![
+            ev(EventKind::Create(CreateKind::File), vraie),
+            ev(EventKind::Create(CreateKind::File), double),
+        ]);
+        assert_eq!(vu.get(vraie), Some(&ChangeType::Added));
+        assert!(
+            !vu.contains_key(double),
+            "AppleDouble livré au scan : {vu:?}"
+        );
+        // Sa disparition n'est pas un dossier disparu non plus.
+        let parti = rejouer(vec![ev(EventKind::Remove(RemoveKind::Any), double)]);
+        assert!(
+            parti.is_empty(),
+            "AppleDouble retiré vu comme un dossier : {parti:?}"
+        );
+
+        let racine = crate::test_scratch::scratch_dir_in(
+            std::env::current_dir().unwrap(),
+            "watcher-appledouble-6148",
+        );
+        let album = racine.join("Beck");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(album.join("03 - I Only Have Eyes.aiff"), b"x").unwrap();
+        fs::write(album.join("._03 - I Only Have Eyes.aiff"), b"x").unwrap();
+        let trouves = fichiers_audio_sous(&album);
+        assert_eq!(trouves.len(), 1, "{trouves:?}");
+        assert!(trouves[0].ends_with("03 - I Only Have Eyes.aiff"));
+        assert!(!trouves[0].contains("._"));
     }
 
     /// #4896 (Didier, fil 1904) — les séquences que le moteur Windows de

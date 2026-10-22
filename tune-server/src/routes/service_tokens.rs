@@ -518,10 +518,9 @@ pub async fn test(
             "validation_message": tr("svctok.test.musicbrainz"),
         })),
         "discogs" => {
-            let token = svc_mgr
-                .get_credential("discogs", "token")
-                .or_else(|| settings.get("discogs_token").ok().flatten())
-                .or_else(|| state.config.discogs_token.clone().filter(|s| !s.is_empty()));
+            let token = crate::routes::discogs::discogs_token(&state)
+                .or_else(|| svc_mgr.get_credential("discogs", "token"))
+                .or_else(|| settings.get("discogs_token").ok().flatten());
             match token {
                 Some(t) => {
                     let (valid, msg) = svc_mgr.validate_discogs(&t).await;

@@ -146,6 +146,138 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
         .merge(etat_de_la_copie)
 }
 
+// #6521 — les vignettes des pochettes partagées avec le cercle -----------------
+
+/// L'état des routes de vignettes.
+pub struct EtatDesVignettes {
+    pub relais: Arc<Relais>,
+    pub vignettes: Arc<crate::vignettes::Vignettes>,
+}
+
+/// | Tune (`/api/v1/ext/circle`)                                   | mozaiklabs (`/api/v1/circle`) |
+/// |---------------------------------------------------------------|-------------------------------|
+/// | `GET /artwork-sharing` → `{ enabled }`                        | — (réglage LOCAL)             |
+/// | `PUT /artwork-sharing` `{ enabled }` → `{ enabled, purged }`  | — ; couper efface chez le cloud (`DELETE …/thumbnails`) |
+/// | `GET /contacts/{user_id}/library/albums/{album_id}/thumbnail` | idem, image relayée, `If-None-Match` compris |
+pub fn router_des_vignettes(
+    relais: Arc<Relais>,
+    vignettes: Arc<crate::vignettes::Vignettes>,
+) -> Router<()> {
+    Router::new()
+        .route(
+            "/artwork-sharing",
+            get(etat_du_partage_des_pochettes).put(regler_le_partage_des_pochettes),
+        )
+        .route(
+            "/contacts/{user_id}/library/albums/{album_id}/thumbnail",
+            get(vignette_d_un_contact),
+        )
+        .with_state(Arc::new(EtatDesVignettes { relais, vignettes }))
+}
+
+async fn etat_du_partage_des_pochettes(State(e): State<Arc<EtatDesVignettes>>) -> Response {
+    Json(json!({
+        "enabled": crate::vignettes::reglage_actif(&e.vignettes.reglages()),
+        "default": true,
+    }))
+    .into_response()
+}
+
+/// `{ "enabled": bool }` et rien d'autre : un autre corps est un 422.
+async fn regler_le_partage_des_pochettes(
+    State(e): State<Arc<EtatDesVignettes>>,
+    corps: Bytes,
+) -> Response {
+    let Some(actif) = serde_json::from_slice::<Value>(&corps)
+        .ok()
+        .and_then(|v| v.get("enabled").and_then(Value::as_bool))
+    else {
+        return refus(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({ "code": "circle.invalid_body" }),
+        );
+    };
+    let efface = e.vignettes.regler(actif).await;
+    Json(json!({ "enabled": actif, "purged": !actif && efface })).into_response()
+}
+
+/// La vignette de la pochette d'un album de contact, relayée. Le cloud juge le
+/// droit (règle du catalogue, 404 sinon) ; seuls 200 JPEG/WebP et 304
+/// passent avec des octets ou un ETag, le reste est un refus nommé.
+async fn vignette_d_un_contact(
+    State(e): State<Arc<EtatDesVignettes>>,
+    Path((user_id, album_id)): Path<(String, String)>,
+    entetes: axum::http::HeaderMap,
+) -> Response {
+    if !identifiant_valide(&user_id) || !identifiant_valide(&album_id) {
+        return introuvable();
+    }
+    use crate::relais::IssueImage;
+    let cache = (
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, max-age=3600"),
+    );
+    match e
+        .relais
+        .lire_image(
+            "GET /contacts/{user_id}/library/albums/{album_id}/thumbnail",
+            &[
+                "contacts",
+                &user_id,
+                "library",
+                "albums",
+                &album_id,
+                "thumbnail",
+            ],
+            entetes.get(header::IF_NONE_MATCH),
+        )
+        .await
+    {
+        IssueImage::NonConnecte => en_reponse(Issue::NonConnecte),
+        IssueImage::Indisponible => en_reponse(Issue::Indisponible { statut_amont: None }),
+        IssueImage::Image {
+            corps,
+            type_mime,
+            etag,
+        } => {
+            let mut r = (StatusCode::OK, Body::from(corps)).into_response();
+            let h = r.headers_mut();
+            h.insert(header::CONTENT_TYPE, type_mime);
+            h.insert(cache.0, cache.1);
+            h.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                axum::http::HeaderValue::from_static("nosniff"),
+            );
+            if let Some(v) = etag {
+                h.insert(header::ETAG, v);
+            }
+            r
+        }
+        IssueImage::Inchangee { etag } => {
+            let mut r = StatusCode::NOT_MODIFIED.into_response();
+            r.headers_mut().insert(cache.0, cache.1);
+            if let Some(v) = etag {
+                r.headers_mut().insert(header::ETAG, v);
+            }
+            r
+        }
+        IssueImage::Refus { statut: 404, .. } => introuvable(),
+        IssueImage::Refus {
+            statut,
+            retry_after,
+        } => {
+            let mut r = refus(
+                StatusCode::from_u16(statut).unwrap_or(StatusCode::BAD_GATEWAY),
+                json!({ "code": CODE_REPONSE_ILLISIBLE }),
+            );
+            if let Some(v) = retry_after {
+                r.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+            r
+        }
+    }
+}
+
 pub(crate) fn refus(statut: StatusCode, corps: Value) -> Response {
     (statut, Json(corps)).into_response()
 }

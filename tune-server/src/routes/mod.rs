@@ -1,4 +1,6 @@
 pub mod active_profile;
+/// #4626 — appairage maître / agent et ordres entre serveurs Tune.
+pub mod agent_tune;
 pub mod ai;
 pub mod airplay_pairing;
 pub mod appliance;
@@ -6,6 +8,8 @@ pub mod appliance_storage;
 pub mod archive;
 pub mod artist_releases;
 pub mod bridge;
+/// #6171 — les canaux de la carte qu'une zone ASIO utilise.
+pub mod canaux_de_carte;
 pub mod cd_rip;
 pub mod cloud;
 pub mod cloud_error;
@@ -22,6 +26,7 @@ mod premium_audio_host;
 pub mod reaffectation_canaux;
 pub use tune_streaming_http::deezer_proxy_handler;
 pub mod developer_api;
+pub mod devialet_air;
 pub mod devices;
 pub mod diag_qobuz;
 pub mod digest;
@@ -68,8 +73,10 @@ pub mod playlist_manager;
 pub mod playlists;
 pub mod plugins;
 pub mod podcasts;
+pub mod profil_par_appareil;
 pub mod profiles;
 pub mod radios;
+pub mod radios_annuaire;
 pub mod radios_libelles;
 pub mod room_calibration;
 pub mod room_correction;
@@ -398,7 +405,15 @@ pub fn router_with_plugins(
     plugin_routers: crate::plugins::PluginRouters,
 ) -> Router {
     let contexte_sendspin = sendspin::ContexteSendspin::pour_base(&state.config.db_path)
-        .avec_zones(sendspin::RaccordZones::depuis_etat(&state));
+        .avec_zones(sendspin::RaccordZones::depuis_etat(&state))
+        .avec_reglages(state.backend.clone());
+    // #3326 — connexions initiées par le serveur : Tune compose vers les
+    // enceintes `_sendspin._tcp` que le scanner mDNS a trouvées.
+    sendspin::sortantes::lancer(
+        state.mdns_scanner.clone(),
+        contexte_sendspin.clone(),
+        tune_core::sendspin::ModeTransition::en_vigueur(),
+    );
     let streamer_sessions = state.streamer.sessions_state();
 
     let web_dir = crate::config::resolve_web_dir()
@@ -457,6 +472,8 @@ pub fn router_with_plugins(
         .nest("/dashboard", dashboard::router())
         .nest("/digest", digest::router())
         .nest("/peers", peers::router())
+        // #4626 — gestes de l'utilisateur (code, appairage, oubli).
+        .nest("/agent-tune", agent_tune::router())
         .nest("/podcasts", podcasts::router())
         .nest("/plugins", plugins::router())
         .nest("/marketplace", marketplace::router())
@@ -469,6 +486,8 @@ pub fn router_with_plugins(
         .nest("/sonos", sonos::router())
         .nest("/squeezebox", squeezebox::router())
         .nest("/spotify-connect", spotify_connect::router())
+        // #6542 — sortie Devialet AIR expérimentale : ses réglages.
+        .nest("/devialet-air", devialet_air::router())
         .nest("/listenbrainz", listenbrainz::router())
         .nest("/scrobbler", scrobbler::router())
         .nest("/soundcloud", soundcloud::router())
@@ -499,6 +518,8 @@ pub fn router_with_plugins(
         .nest("/crossfeed", crossfeed::router())
         // #6044 — réaffectation des canaux : préréglages, réglage de zone, règle d'album.
         .nest("/channel-remap", reaffectation_canaux::router())
+        // #6171 — canaux de la carte d'une zone ASIO.
+        .nest("/output-channels", canaux_de_carte::router())
         .nest("/siri", siri::router())
         .nest("/lastfm-social", lastfm_social::router())
         .nest("/stats/listening", listening_stats::router())
@@ -660,6 +681,14 @@ pub fn router_with_plugins(
         "/upnp/renderer",
         upnp_media_renderer::router().with_state(state.clone()),
     );
+    // #4626 — ce qu'un serveur Tune demande à un autre (maître → agent). À la
+    // RACINE, hors de la couche d'authentification : un maître n'a pas de
+    // session chez l'agent. Chaque route vérifie elle-même le jeton
+    // d'appairage, sauf l'annonce publique et l'appairage gardé par le code.
+    app = app.nest(
+        "/agent-tune",
+        agent_tune::router_entre_serveurs().with_state(state.clone()),
+    );
 
     // Mount all installed skins on /{skin_id}
     for (skin_id, skin_path) in mountable_skins {
@@ -693,6 +722,7 @@ pub fn router_with_plugins(
         }),
     )
     .fallback_service(service_statique_spa(std::path::Path::new(&web_dir)))
+    .layer(axum::middleware::from_fn(zones::textes_signal::avec_langue))
     .layer(axum::middleware::from_fn(cache_control_middleware))
     .layer(axum::Extension(contexte_sendspin))
     .layer(CompressionLayer::new())
@@ -932,12 +962,21 @@ mod eq_refresh_guard {
     /// Indexé par clé et pas seulement par fichier : dispenser `zones.rs` en
     /// bloc le retirerait aussi des deux autres clés, dont il n'a aucune raison
     /// d'être exempté. Une dispense doit être aussi étroite que son motif.
-    const LECTURE_SEULE: &[(&str, &str, &str)] = &[(
-        "_audiophile",
-        "zones.rs",
-        "n'écrit la clé que dans ses propres tests (chemin du signal en PURE) ; \
-         le code de production la LIT via `audiophile::zone_enabled`",
-    )];
+    const LECTURE_SEULE: &[(&str, &str, &str)] = &[
+        (
+            "_audiophile",
+            "zones.rs",
+            "n'écrit la clé que dans ses propres tests (chemin du signal en PURE) ; \
+             le code de production la LIT via `audiophile::zone_enabled`",
+        ),
+        (
+            "_audiophile",
+            "limites_de_volume_6541_tests.rs",
+            "module de tests (`#[cfg(test)] #[path]` de `zones/limites_de_volume_6541.rs`) : \
+             il pose une zone en PURE pour vérifier le refus des limites (#6541) ; la \
+             route de production ne fait que LIRE la clé via `mode_sans_limite`",
+        ),
+    ];
 
     /// Les réglages DSP par zone qui n'atteignent le son que si quelqu'un
     /// rafraîchit la sortie vivante, et la méthode qui le fait.

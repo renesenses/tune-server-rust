@@ -110,29 +110,6 @@ pub fn import_local_playlists(db: &Arc<dyn DbBackend>, dirs: &[String]) -> Playl
     let track_repo = TrackRepo::with_backend(db.clone());
     let playlist_repo = PlaylistRepo::with_backend(db.clone());
 
-    // Build the match indexes once from the freshly-scanned library.
-    let tracks = match track_repo.list_all_local() {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(error = %e, "playlist_scan_load_tracks_failed");
-            return report;
-        }
-    };
-    let mut path_index: HashMap<String, i64> = HashMap::with_capacity(tracks.len());
-    let mut fuzzy_index: HashMap<(String, String, String), i64> = HashMap::new();
-    for t in &tracks {
-        let Some(id) = t.id else { continue };
-        if let Some(fp) = &t.file_path {
-            path_index.insert(path_key(fp), id);
-        }
-        let key = (
-            t.title.to_lowercase(),
-            t.artist_name.clone().unwrap_or_default().to_lowercase(),
-            t.album_title.clone().unwrap_or_default().to_lowercase(),
-        );
-        fuzzy_index.entry(key).or_insert(id);
-    }
-
     // Existing playlist names (default profile) — skip to stay idempotent.
     let existing: HashSet<String> = playlist_repo
         .list(DEFAULT_PROFILE_ID, 100_000, 0)
@@ -141,19 +118,47 @@ pub fn import_local_playlists(db: &Arc<dyn DbBackend>, dirs: &[String]) -> Playl
         .map(|p| p.name)
         .collect();
 
-    for pf in find_playlist_files(dirs) {
-        let Some(name) = pf
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        else {
-            continue;
-        };
-        if existing.contains(&name) {
-            continue;
-        }
+    // #6168 — les fichiers à importer AVANT l'index de la bibliothèque. L'index
+    // était bâti à chaque fin de scan, même sans aucun fichier de playlist, ou
+    // quand tous portaient déjà une playlist du même nom : c'était le pic de
+    // mémoire de la fin du scan (Shrek, 121 000 pistes : de 330 à 885 Mo).
+    // Même filtre qu'avant, sur le même `existing` lu une fois.
+    let a_importer: Vec<(PathBuf, String)> = find_playlist_files(dirs)
+        .into_iter()
+        .filter_map(|pf| {
+            let name = pf
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())?;
+            (!existing.contains(&name)).then_some((pf, name))
+        })
+        .collect();
+    if a_importer.is_empty() {
+        return report;
+    }
 
+    // Build the match indexes once from the freshly-scanned library — page by
+    // page, from the five columns they compare (#6168), never from whole
+    // `Track` rows.
+    let mut path_index: HashMap<String, i64> = HashMap::new();
+    let mut fuzzy_index: HashMap<(String, String, String), i64> = HashMap::new();
+    if let Err(e) = track_repo.pour_chaque_cle_de_playlist(|t| {
+        if let Some(fp) = &t.file_path {
+            path_index.insert(path_key(fp), t.id);
+        }
+        let key = (
+            t.title.to_lowercase(),
+            t.artist_name.unwrap_or_default().to_lowercase(),
+            t.album_title.unwrap_or_default().to_lowercase(),
+        );
+        fuzzy_index.entry(key).or_insert(t.id);
+    }) {
+        warn!(error = %e, "playlist_scan_load_tracks_failed");
+        return report;
+    }
+
+    for (pf, name) in a_importer {
         let raw = match std::fs::read(&pf) {
             Ok(b) => b,
             Err(e) => {

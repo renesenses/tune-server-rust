@@ -458,6 +458,8 @@ fn station_annuaire(nom: &str, url: &str, pays: &str, genre: &str) -> StationAnn
         genre: Some(genre.into()),
         quality: Some("flac".into()),
         website_url: None,
+        // #6516 — les champs de la fiche v2 (clé radio-metadata, flux…).
+        ..Default::default()
     }
 }
 

@@ -40,6 +40,26 @@ const RETRY_FILE_TIMEOUT: Duration = Duration::from_secs(90);
 // tags and only the hash is skipped (Progman: stalled mount, not file size).
 const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 
+// #6163 — le `stat` (taille + date) de chaque fichier, avant la lecture des
+// balises, n'avait AUCUN délai. Sur un partage SMB qui ne répond plus pour un
+// fichier, le fil reste en `wait_for_response [cifs]` (état D) indéfiniment ;
+// un lot attend tous ses fichiers, donc un seul `stat` muet figeait le lot, la
+// progression et le scan entier (Tades, Tune OS, 611 909 pistes : « 99 % »,
+// aucun progrès pendant 2 h 37). Un `stat` sain répond en millisecondes, même
+// sur un NAS chargé : 30 s, c'est le budget d'une lecture de balises.
+const STAT_TIMEOUT: Duration = Duration::from_secs(30);
+
+// Un `stat` dépassé laisse derrière lui un fil bloqué dans le noyau, qu'on ne
+// peut pas tuer. Si le partage entier est tombé, chaque fichier en ajouterait
+// un. Plafond des fils du `stat` (`FilsDuStat`) : au-delà, on n'en crée plus,
+// et un fichier qui attend son tour au-delà du délai est sauté. 8 fois la
+// concurrence du scan : un NAS lent mais vivant ne l'atteint jamais.
+const STAT_EN_VOL_MAX: usize = 8 * SCAN_IO_CONCURRENCY;
+
+/// Motif rangé dans les échecs du scan pour un fichier dont le `stat` n'a pas
+/// répondu à temps (#6163).
+pub const MOTIF_STAT_DEPASSE: &str = "stat sans réponse du stockage (délai dépassé)";
+
 // Per-file metadata reads are I/O-bound: each rayon task blocks on the tag read
 // (lofty), frequently on high-latency network storage. The default rayon pool
 // has only ~CPU-core-count threads, so effective concurrency — and throughput —
@@ -869,6 +889,148 @@ fn read_file_with_timeout(
     Ok((Some(metadata), hash))
 }
 
+/// Issue d'un `stat` borné (#6163).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StatBorne {
+    /// Le `stat` a répondu : `Some((taille, mtime))`, ou `None` si le fichier
+    /// n'existe pas / n'est pas lisible — exactement le résultat d'avant.
+    Lu(Option<(u64, f64)>),
+    /// Pas de réponse dans le délai (ou trop de `stat` déjà bloqués) : le
+    /// fichier est sauté, le lot continue.
+    Depasse,
+}
+
+/// Un `stat` confié aux fils du `stat` : le chemin, la mesure, et où rendre.
+type TravailDeStat = (
+    PathBuf,
+    fn(&Path) -> Option<(u64, f64)>,
+    mpsc::Sender<Option<(u64, f64)>>,
+);
+
+/// Les fils qui font les `stat` du scan (#6163). Réutilisés d'un fichier à
+/// l'autre : créer un fil par fichier coûtait ~40 µs de plus par `stat`
+/// (mesuré, `cout_du_stat_borne_6163`), soit des dizaines de secondes sur un
+/// préfiltre de 600 000 fichiers qui n'en prenait qu'une fraction.
+///
+/// Un fil bloqué dans le noyau par un partage muet est perdu jusqu'à ce que le
+/// noyau le rende. Il en naît un nouveau quand aucun n'est libre, jusqu'à
+/// [`STAT_EN_VOL_MAX`] ; au-delà, le travail attend dans la file, et son
+/// appelant le tient pour dépassé au bout du délai, sans créer de fil de plus.
+struct FilsDuStat {
+    envoi: Mutex<mpsc::Sender<TravailDeStat>>,
+    reception: Arc<Mutex<mpsc::Receiver<TravailDeStat>>>,
+    libres: Arc<AtomicUsize>,
+    vivants: Arc<AtomicUsize>,
+}
+
+impl FilsDuStat {
+    fn global() -> &'static FilsDuStat {
+        static FILS: std::sync::OnceLock<FilsDuStat> = std::sync::OnceLock::new();
+        FILS.get_or_init(|| {
+            let (envoi, reception) = mpsc::channel();
+            FilsDuStat {
+                envoi: Mutex::new(envoi),
+                reception: Arc::new(Mutex::new(reception)),
+                libres: Arc::new(AtomicUsize::new(0)),
+                vivants: Arc::new(AtomicUsize::new(0)),
+            }
+        })
+    }
+
+    /// Un fil de plus si aucun n'est libre et que le plafond le permet.
+    /// `false` si le fil n'a pas pu naître alors qu'aucun n'existe.
+    fn assurer_un_fil(&self) -> bool {
+        if self.libres.load(Ordering::Acquire) > 0 {
+            return true;
+        }
+        if self.vivants.fetch_add(1, Ordering::AcqRel) >= STAT_EN_VOL_MAX {
+            self.vivants.fetch_sub(1, Ordering::AcqRel);
+            return true;
+        }
+        let reception = Arc::clone(&self.reception);
+        let libres = Arc::clone(&self.libres);
+        let vivants = Arc::clone(&self.vivants);
+        let ne = std::thread::Builder::new()
+            .name("scan-stat".into())
+            .spawn(move || {
+                loop {
+                    libres.fetch_add(1, Ordering::AcqRel);
+                    let travail = reception.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    libres.fetch_sub(1, Ordering::AcqRel);
+                    let Ok((chemin, stat, rendre)) = travail else {
+                        break;
+                    };
+                    let _ = rendre.send(stat(&chemin));
+                }
+                vivants.fetch_sub(1, Ordering::AcqRel);
+            });
+        if ne.is_err() {
+            return self.vivants.fetch_sub(1, Ordering::AcqRel) > 1;
+        }
+        true
+    }
+}
+
+/// Taille et date d'un fichier par les fils du `stat`, bornées à `delai`
+/// (#6163).
+///
+/// Même principe que la lecture des balises ([`read_file_with_timeout`]) : le
+/// `stat` d'un montage réseau ne s'interrompt pas, on cesse seulement de
+/// l'attendre. Le fil occupé finit seul quand le noyau rend la main.
+fn stat_borne(path: &Path, delai: Duration, stat: fn(&Path) -> Option<(u64, f64)>) -> StatBorne {
+    let fils = FilsDuStat::global();
+    if !fils.assurer_un_fil() {
+        // Aucun fil n'a pu naître : le `stat` direct, comme avant.
+        return StatBorne::Lu(stat(path));
+    }
+    let (rendre, reponse) = mpsc::channel();
+    let envoye = fils.envoi.lock().unwrap_or_else(|e| e.into_inner()).send((
+        path.to_path_buf(),
+        stat,
+        rendre,
+    ));
+    if envoye.is_err() {
+        return StatBorne::Lu(stat(path));
+    }
+    match reponse.recv_timeout(delai) {
+        Ok(lu) => StatBorne::Lu(lu),
+        Err(_) => {
+            warn!(
+                path = %path.display(),
+                timeout_secs = delai.as_secs(),
+                fils_du_stat = fils.vivants.load(Ordering::Relaxed),
+                "scan_stat_timeout — le stockage ne rend pas la taille du fichier, fichier sauté"
+            );
+            StatBorne::Depasse
+        }
+    }
+}
+
+/// Le `stat` du scan : [`crate::audio::iso9660::taille_et_mtime`] borné à
+/// [`STAT_TIMEOUT`] (#6163). Partagé avec le préfiltre du scan
+/// (`routes::system::scan::etat_du_fichier`), qui fait le même `stat` juste avant.
+pub fn taille_et_mtime_du_scan(path: &Path) -> StatBorne {
+    stat_borne(path, STAT_TIMEOUT, crate::audio::iso9660::taille_et_mtime)
+}
+
+/// Le fichier sauté parce que son `stat` n'a pas répondu (#6163) : rien n'est
+/// écrit en base pour lui (ni balises ni date), sa piste éventuelle reste
+/// telle quelle, et le prochain scan le relira. Il figure dans les échecs.
+fn fichier_au_stat_depasse(path_str: String, echecs: &Mutex<Vec<(String, String)>>) -> ScannedFile {
+    echecs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((path_str.clone(), MOTIF_STAT_DEPASSE.to_string()));
+    ScannedFile {
+        path: path_str,
+        metadata: None,
+        unsupported: None,
+        audio_hash: None,
+        file_size: 0,
+        mtime: 0.0,
+    }
+}
+
 pub struct ListAudioResult {
     pub files: Vec<PathBuf>,
     pub missing_dirs: Vec<String>,
@@ -1428,7 +1590,8 @@ pub fn list_audio_files_avec_arret(
                     // Skip macOS AppleDouble sidecar files (._foo.flac): they carry
                     // the audio extension but are tiny resource-fork metadata, not
                     // real tracks, and were being indexed as bogus duplicates (Elie).
-                    if entry.file_name().to_string_lossy().starts_with("._") {
+                    if crate::scanner::est_un_nom_appledouble(&entry.file_name().to_string_lossy())
+                    {
                         continue;
                     }
                     // Skip Tune's own streaming/transcode temp files
@@ -1762,7 +1925,10 @@ pub fn scan_files_parallel(
 
             // #5299 — un chemin virtuel (`image.iso!/…`) n'a pas de
             // `metadata()` : sa taille propre, la date de l'image.
-            let file_meta = crate::audio::iso9660::taille_et_mtime(path);
+            let file_meta = match taille_et_mtime_du_scan(path) {
+                StatBorne::Lu(lu) => lu,
+                StatBorne::Depasse => return fichier_au_stat_depasse(path_str, &failed_files),
+            };
             let stat_ok = file_meta.is_some();
             let (file_size, mtime) = file_meta.unwrap_or((0, 0.0));
 
@@ -2160,7 +2326,10 @@ pub fn scan_files_batched_avec_arret(
 
             // #5299 — un chemin virtuel (`image.iso!/…`) n'a pas de
             // `metadata()` : sa taille propre, la date de l'image.
-            let file_meta = crate::audio::iso9660::taille_et_mtime(path);
+            let file_meta = match taille_et_mtime_du_scan(path) {
+                StatBorne::Lu(lu) => lu,
+                StatBorne::Depasse => return fichier_au_stat_depasse(path_str, &failed_files),
+            };
             let stat_ok = file_meta.is_some();
             let (file_size, mtime) = file_meta.unwrap_or((0, 0.0));
 
@@ -2382,6 +2551,101 @@ pub fn scan_directories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6163 — un `stat` qui ne rend pas la main (partage SMB muet) ne doit
+    /// plus figer le lot : au bout du délai, le fichier est sauté.
+    fn stat_qui_ne_repond_pas_6163(_: &Path) -> Option<(u64, f64)> {
+        std::thread::sleep(Duration::from_secs(5));
+        Some((1, 1.0))
+    }
+
+    #[test]
+    fn stat_muet_borne_par_le_delai_6163() {
+        let depart = std::time::Instant::now();
+        let issue = stat_borne(
+            Path::new("/partage/muet.flac"),
+            Duration::from_millis(200),
+            stat_qui_ne_repond_pas_6163,
+        );
+        let ecoule = depart.elapsed();
+        assert_eq!(
+            issue,
+            StatBorne::Depasse,
+            "#6163 : un stat sans réponse doit être abandonné au délai, pas attendu"
+        );
+        assert!(
+            ecoule < Duration::from_secs(2),
+            "#6163 : le lot a attendu le stat muet {ecoule:?} au lieu de 200 ms"
+        );
+    }
+
+    #[test]
+    fn stat_borne_rend_taille_et_date_comme_avant_6163() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("piste.flac");
+        std::fs::write(&chemin, [0u8; 42]).unwrap();
+        let attendu = crate::audio::iso9660::taille_et_mtime(&chemin);
+        assert!(attendu.is_some());
+        assert_eq!(taille_et_mtime_du_scan(&chemin), StatBorne::Lu(attendu));
+        assert_eq!(
+            taille_et_mtime_du_scan(&dir.path().join("absent.flac")),
+            StatBorne::Lu(None),
+            "un fichier absent reste `None`, comme le stat direct"
+        );
+    }
+
+    /// #6163 — mesure, pas un témoin : ce que coûte le fil du `stat` borné
+    /// face au `stat` direct, sur 20 000 fichiers locaux, 32 fils comme le
+    /// scan. `cargo test -p tune-core --lib cout_du_stat_borne -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn cout_du_stat_borne_6163() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemins: Vec<PathBuf> = (0..20_000)
+            .map(|i| {
+                let p = dir.path().join(format!("{i}.flac"));
+                std::fs::write(&p, [1u8]).unwrap();
+                p
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(SCAN_IO_CONCURRENCY)
+            .build()
+            .unwrap();
+        let direct = std::time::Instant::now();
+        pool.install(|| {
+            chemins.par_iter().for_each(|p| {
+                assert!(crate::audio::iso9660::taille_et_mtime(p).is_some());
+            })
+        });
+        let direct = direct.elapsed();
+        let borne = std::time::Instant::now();
+        pool.install(|| {
+            chemins.par_iter().for_each(|p| {
+                assert!(matches!(taille_et_mtime_du_scan(p), StatBorne::Lu(Some(_))));
+            })
+        });
+        let borne = borne.elapsed();
+        eprintln!(
+            "cout_du_stat_borne_6163 : direct {direct:?}, borné {borne:?} pour {} fichiers ({:.1} µs de plus par fichier)",
+            chemins.len(),
+            (borne.as_secs_f64() - direct.as_secs_f64()) * 1e6 / chemins.len() as f64
+        );
+    }
+
+    #[test]
+    fn fichier_au_stat_depasse_va_aux_echecs_sans_balises_6163() {
+        let echecs = Mutex::new(Vec::new());
+        let sf = fichier_au_stat_depasse("/partage/muet.flac".into(), &echecs);
+        assert!(sf.metadata.is_none() && sf.audio_hash.is_none());
+        assert_eq!(
+            echecs.into_inner().unwrap(),
+            vec![(
+                "/partage/muet.flac".to_string(),
+                MOTIF_STAT_DEPASSE.to_string()
+            )]
+        );
+    }
 
     #[test]
     fn arret_apres_un_lot_ne_lit_pas_le_suivant_5202() {

@@ -31,10 +31,79 @@ static PHASE: LazyLock<Mutex<&'static str>> = LazyLock::new(|| Mutex::new("déma
 /// en cours de chargement (#5370). Remis à zéro à chaque changement d'étape.
 static CURRENT: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
+/// Depuis quand l'étape en cours a commencé.
+static DEBUT_PHASE: LazyLock<Mutex<std::time::Instant>> =
+    LazyLock::new(|| Mutex::new(std::time::Instant::now()));
+
+/// #6452 — au-delà de ce délai, une étape qui ne se termine pas est signalée
+/// au journal, puis de nouveau à chaque multiple de ce délai.
+pub const SEUIL_ETAPE_LONGUE: Duration = Duration::from_secs(30);
+
 /// Déclare l'étape de démarrage en cours (voir `bootstrap.rs`).
+///
+/// #6452 (fil 2248) — chaque changement d'étape est JOURNALISÉ, avec la durée
+/// de la précédente. Le journal d'un démarrage resté sur la page d'attente ne
+/// disait pas sur quelle étape il s'était arrêté : seule la page le montrait,
+/// et le testeur n'avait plus que le journal à transmettre.
 pub fn set_phase(phase: &'static str) {
-    *PHASE.lock().unwrap_or_else(|e| e.into_inner()) = phase;
+    let precedente =
+        std::mem::replace(&mut *PHASE.lock().unwrap_or_else(|e| e.into_inner()), phase);
+    let duree_precedente_ms = {
+        let mut debut = DEBUT_PHASE.lock().unwrap_or_else(|e| e.into_inner());
+        let duree = debut.elapsed();
+        *debut = std::time::Instant::now();
+        duree.as_millis() as u64
+    };
     set_current(None);
+    tracing::info!(
+        etape = phase,
+        precedente,
+        duree_precedente_ms,
+        "demarrage_etape"
+    );
+}
+
+/// Depuis combien de temps l'étape en cours dure.
+fn duree_de_l_etape() -> Duration {
+    DEBUT_PHASE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .elapsed()
+}
+
+/// #6452 — la veille du répondeur : quand une étape dure, le dire une fois par
+/// tranche de `seuil`, pas à chaque tour de boucle.
+#[derive(Debug)]
+struct Veille {
+    seuil: Duration,
+    etape: &'static str,
+    signalements: u64,
+}
+
+impl Veille {
+    fn new(seuil: Duration) -> Self {
+        Self {
+            seuil,
+            etape: "",
+            signalements: 0,
+        }
+    }
+
+    /// `Some(secondes)` quand l'étape `etape`, commencée il y a `depuis`, doit
+    /// être signalée maintenant. Un changement d'étape remet le compte à zéro.
+    fn observer(&mut self, etape: &'static str, depuis: Duration) -> Option<u64> {
+        if etape != self.etape {
+            self.etape = etape;
+            self.signalements = 0;
+        }
+        let dus = (depuis.as_millis() / self.seuil.as_millis().max(1)) as u64;
+        if dus > self.signalements {
+            self.signalements = dus;
+            Some(depuis.as_secs())
+        } else {
+            None
+        }
+    }
 }
 
 /// L'étape de démarrage en cours.
@@ -78,6 +147,8 @@ fn phase_detail(phase: &str) -> &'static str {
         "sorties audio" => "Tune recherche les sorties audio de cette machine.",
         "greffons" => "Tune charge ses greffons, un par un.",
         "découverte réseau" => "Tune se prépare à découvrir les appareils du réseau.",
+        "Spotify Connect" => "Tune lance Spotify Connect, s'il est activé.",
+        "routes" => "Tune prépare son interface et ses adresses.",
         _ => "Tune termine son démarrage.",
     }
 }
@@ -97,6 +168,14 @@ impl BootResponder {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        // #6452 — la ligne qui dit que le démarrage a passé la main au
+        // routeur : son absence, dans un journal, désigne la dernière
+        // `demarrage_etape` écrite.
+        tracing::info!(
+            etape = phase(),
+            duree_ms = duree_de_l_etape().as_millis() as u64,
+            "demarrage_repondeur_arrete"
+        );
     }
 }
 
@@ -113,7 +192,15 @@ pub fn spawn(listener: TcpListener) -> BootResponder {
     let handle = std::thread::Builder::new()
         .name("tune-boot-responder".into())
         .spawn(move || {
+            let mut veille = Veille::new(SEUIL_ETAPE_LONGUE);
             while !stop_thread.load(Ordering::SeqCst) {
+                // #6452 — une étape qui s'éternise se lit au journal, avec son
+                // nom : c'est ce que la page d'attente montre, et ce que le
+                // journal transmis par un testeur doit pouvoir dire aussi.
+                let etape = phase();
+                if let Some(depuis_s) = veille.observer(etape, duree_de_l_etape()) {
+                    tracing::warn!(etape, depuis_s, "demarrage_etape_longue");
+                }
                 match listener.accept() {
                     Ok((stream, _)) => answer(stream),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -482,7 +569,7 @@ mod tests {
         }
     }
     /// Les étapes que `bootstrap.rs` pose réellement, dans l'ordre.
-    const ETAPES: [&str; 8] = [
+    const ETAPES: [&str; 10] = [
         "démarrage",
         "attente du disque de données",
         "base de données",
@@ -491,7 +578,76 @@ mod tests {
         "sorties audio",
         "greffons",
         "découverte réseau",
+        "Spotify Connect",
+        "routes",
     ];
+
+    /// #6452 — une étape qui dure est signalée une fois par tranche de seuil,
+    /// et un changement d'étape repart de zéro.
+    #[test]
+    fn une_etape_qui_s_eternise_est_signalee_une_fois_par_tranche() {
+        let s = Duration::from_secs(30);
+        let mut v = Veille::new(s);
+        assert_eq!(v.observer("routes", Duration::from_secs(5)), None);
+        assert_eq!(
+            v.observer("routes", Duration::from_secs(31)),
+            Some(31),
+            "#6452 : une étape bloquée depuis 31 s doit être dite au journal"
+        );
+        assert_eq!(
+            v.observer("routes", Duration::from_secs(45)),
+            None,
+            "pas deux fois par tranche"
+        );
+        assert_eq!(v.observer("routes", Duration::from_secs(61)), Some(61));
+        assert_eq!(v.observer("Spotify Connect", Duration::from_secs(2)), None);
+        assert_eq!(
+            v.observer("Spotify Connect", Duration::from_secs(30)),
+            Some(30)
+        );
+    }
+
+    /// #6452 — chaque changement d'étape s'écrit au journal, avec son nom et
+    /// la durée de la précédente.
+    #[test]
+    fn chaque_changement_d_etape_est_journalise() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Capture {
+                self.clone()
+            }
+        }
+        let capture = Capture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(abonne, || set_phase("routes"));
+        let journal = String::from_utf8_lossy(&capture.0.lock().unwrap()).into_owned();
+        let ligne = journal
+            .lines()
+            .find(|l| l.contains("demarrage_etape"))
+            .unwrap_or_else(|| {
+                panic!("#6452 : le changement d'étape doit être journalisé :\n{journal}")
+            });
+        assert!(
+            ligne.contains("etape=\"routes\"") || ligne.contains("etape=routes"),
+            "{ligne}"
+        );
+        assert!(ligne.contains("duree_precedente_ms="), "{ligne}");
+    }
 
     /// #5370 — chaque étape a sa phrase, et la taille de la bibliothèque
     /// n'est citée que pendant la base de données.

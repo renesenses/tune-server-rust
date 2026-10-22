@@ -517,6 +517,29 @@ pub(super) async fn get_album(
                 );
                 obj.insert("dynamic_range_provenance".into(), json!(dr.provenance));
             }
+            // #6124 — la date de sortie ORIGINALE et la VERSION de l'album :
+            // celles que portent TOUTES ses pistes. La date de l'album (scan,
+            // MusicBrainz, retouche) prime ; à défaut, celle sur laquelle les
+            // pistes concordent, et l'année originale qui en découle. La
+            // version n'existe qu'au niveau des pistes : elle sort si toutes
+            // la partagent, et reste ABSENTE sinon.
+            if let Some(obj) = j.as_object_mut() {
+                let concorde =
+                    concordance_des_pistes(&*state.backend, id, &["original_date", "version"]);
+                if let Some(date) = concorde.get("original_date")
+                    && obj.get("original_date").is_none_or(Value::is_null)
+                {
+                    obj.insert("original_date".into(), json!(date));
+                    if obj.get("original_year").is_none_or(Value::is_null)
+                        && let Some(annee) = date.get(..4).and_then(|a| a.parse::<i64>().ok())
+                    {
+                        obj.insert("original_year".into(), json!(annee));
+                    }
+                }
+                if let Some(version) = concorde.get("version") {
+                    obj.insert("version".into(), json!(version));
+                }
+            }
             // #4907 — les EXEMPLAIRES de l'album, un par dossier de musique :
             // racine, format, fréquence, profondeur, joignable, préféré.
             // Champ additif ; un échec de lecture le laisse absent.
@@ -583,12 +606,17 @@ pub(super) async fn album_tracks(
 
     // #3924 — et D'OU elle sort. Voir `provenance_du_dr`.
     let dr_source = provenance_du_dr(&meta_repo, &track_ids, &dynamic_range);
+    // #6124 — date de sortie originale et version, même seam que
+    // `tracks::joindre_dr_par_piste`.
+    let (original_date, version) = date_originale_et_version(&meta_repo, &track_ids);
     let mut items = attach_track_tags(
         items,
         &[
             ("grouping", &grouping),
             ("dynamic_range", &dynamic_range),
             ("dynamic_range_source", &dr_source),
+            ("original_date", &original_date),
+            ("version", &version),
         ],
     );
     // #3518 — « # Plays » et « Last Played », deux colonnes de la maquette V1
@@ -637,6 +665,89 @@ pub(crate) fn attacher_banni(state: &AppState, profile_id: i64, items: &mut [Val
             obj.insert("banned".into(), json!(bannis.contains(&id)));
         }
     }
+}
+
+/// #6124 — la date de sortie ORIGINALE (`track_metadata['original_date']`) et
+/// la VERSION (`track_metadata['version']`) de pistes, lues au scan.
+///
+/// Fonction PARTAGÉE par les deux surfaces de pistes (`album_tracks` et
+/// `tracks::joindre_dr_par_piste`), même raison que [`provenance_du_dr`].
+pub(super) fn date_originale_et_version(
+    repo: &TrackMetadataRepo,
+    track_ids: &[i64],
+) -> (
+    std::collections::HashMap<i64, String>,
+    std::collections::HashMap<i64, String>,
+) {
+    (
+        repo.get_key_for_tracks("original_date", track_ids)
+            .ou_defaut_journalise(),
+        repo.get_key_for_tracks("version", track_ids)
+            .ou_defaut_journalise(),
+    )
+}
+
+/// #6124 — la valeur que portent TOUTES les pistes d'un album pour chacune de
+/// ces clés de `track_metadata` (`original_date`, `version`) ; absente dès
+/// qu'une piste diffère ou n'en porte pas.
+///
+/// Une requête groupée, une autre pour le nombre de pistes. Une panne de base
+/// rend « pas de concordance » (et une ligne de journal) : le champ manque,
+/// il n'est jamais inventé.
+pub(crate) fn concordance_des_pistes(
+    backend: &dyn DbBackend,
+    album_id: i64,
+    cles: &[&str],
+) -> std::collections::HashMap<String, String> {
+    let mut sortie = std::collections::HashMap::new();
+    if cles.is_empty() {
+        return sortie;
+    }
+    let total = backend
+        .query_one(
+            "SELECT COUNT(*) FROM tracks WHERE album_id = ?",
+            &[&album_id as &dyn ToSqlValue],
+        )
+        .ou_defaut_journalise()
+        .and_then(|l| l.first()?.as_i64())
+        .unwrap_or(0);
+    if total == 0 {
+        return sortie;
+    }
+    let marques = vec!["?"; cles.len()].join(", ");
+    let sql = format!(
+        "SELECT m.key, m.value, COUNT(*) FROM track_metadata m \
+         JOIN tracks t ON t.id = m.track_id \
+         WHERE t.album_id = ? AND m.key IN ({marques}) AND m.value <> '' \
+         GROUP BY m.key, m.value"
+    );
+    let mut params: Vec<&dyn ToSqlValue> = vec![&album_id];
+    for c in cles {
+        params.push(c);
+    }
+    let lignes = backend.query_many(&sql, &params).ou_defaut_journalise();
+    let mut vues: std::collections::HashMap<String, (usize, Option<String>)> =
+        std::collections::HashMap::new();
+    for l in lignes {
+        let (Some(cle), Some(valeur), Some(n)) = (
+            l.first().and_then(|v| v.as_string()),
+            l.get(1).and_then(|v| v.as_string()),
+            l.get(2).and_then(|v| v.as_i64()),
+        ) else {
+            continue;
+        };
+        let entree = vues.entry(cle).or_insert((0, None));
+        entree.0 += 1;
+        if n == total {
+            entree.1 = Some(valeur);
+        }
+    }
+    for (cle, (distinctes, valeur)) in vues {
+        if let (1, Some(v)) = (distinctes, valeur) {
+            sortie.insert(cle, v);
+        }
+    }
+    sortie
 }
 
 /// La PROVENANCE du Dynamic Range par piste, appariée à sa valeur (#3924).
@@ -818,6 +929,24 @@ pub(super) async fn get_album_rating(
         Ok(None) => Json(json!({ "rating": null, "album_id": id })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// #6545 — « ★ 4,2 (37 notes) · 1 240 écoutes dans la communauté » : les
+/// agrégats publics de cet album, lus au site et gardés quelques heures.
+/// `available: false` quand le serveur n'est pas relié ou que le site ne
+/// répond pas ; `rating` / `listens` nuls sous trois personnes distinctes.
+pub(super) async fn album_community(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Json<Value> {
+    Json(
+        tune_core::cloud::notes_communautaires::agregats_d_album(
+            &state.backend,
+            &state.http_client,
+            id,
+        )
+        .await,
+    )
 }
 
 pub(super) async fn top_rated_albums(
@@ -2339,6 +2468,13 @@ pub(super) async fn update_album(
                 id,
                 body.apply_genre_to_tracks,
             );
+            // #6418 — la recopie a réécrit `albums.genres` EN BASE ; `album`
+            // en porte encore la valeur d'avant l'édition. La modale reporte
+            // cette réponse dans le magasin, et l'onglet Genres groupe sur ce
+            // tableau d'abord : l'album restait sous son ancien genre.
+            if let Ok(Some(relu)) = repo.get(id) {
+                album.genres = relu.genres;
+            }
         }
     }
 
@@ -3384,6 +3520,9 @@ mod tests_regroupement;
 
 #[cfg(test)]
 mod tests_contenu;
+
+#[cfg(test)]
+mod tests_genres_reponse_6418;
 
 /// #3397 — le témoin qui empêche les deux chemins de `GET /library/albums` de
 /// diverger.
@@ -4664,5 +4803,44 @@ mod tests_recherche_1684 {
                 "{uri} : pas de champ `q` sans recherche"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod communaute_tests_6545 {
+    use crate::state::AppState;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    /// La route est montée et, sans compte relié, ne demande rien au site.
+    #[tokio::test]
+    async fn la_route_communaute_est_montee_et_muette_sans_compte() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute_batch(
+                "INSERT INTO artists (id, name) VALUES (20, 'Miles Davis');\
+                 INSERT INTO albums (id, title, artist_id) VALUES (10, 'Kind of Blue', 20);",
+            )
+            .unwrap();
+        let reponse = crate::routes::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/library/albums/10/community")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reponse.status(), StatusCode::OK);
+        let corps: Value =
+            serde_json::from_slice(&to_bytes(reponse.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            corps,
+            json!({"available": false, "reason": "account_not_linked"})
+        );
     }
 }

@@ -63,6 +63,62 @@ pub const CLE_COFFRET: &str = "coffret";
 /// d'identités ([`Coffret::cle`]).
 pub const CLE_REFUS: &str = "coffrets_auto_refuses";
 
+// ---------------------------------------------------------------------------
+// Le réglage « Coffrets automatiques » — #6554 (fil 2294, Marco Polo et Gros
+// Bidon). Go de Bertrand du 19/10/2026.
+// ---------------------------------------------------------------------------
+
+/// Clé, dans `settings`, du réglage de bibliothèque « Réunir et ranger les
+/// coffrets automatiquement ».
+///
+/// Didier range tous ses albums à plusieurs disques en `Album/CD 1`,
+/// `Album/CD 2`… : ils paraissaient TOUS sous Coffrets, alors que ce sont de
+/// simples albums en plusieurs disques. Marco, lui, tient à la réunion
+/// automatique. D'où un réglage, ACTIF par défaut : rien ne change pour qui
+/// n'y touche pas.
+///
+/// Désactivé :
+///
+/// - la [`passe`] ne réunit plus rien (au démarrage, après un scan, après le
+///   surveillant de fichiers) ;
+/// - [`lister`] ne range plus sous Coffrets un album qui n'est que réparti
+///   disque par disque dans des dossiers : il n'y montre que les coffrets
+///   MARQUÉS — composés à la main, ou réunis automatiquement avant que le
+///   réglage soit coupé (on doit pouvoir les y retrouver pour les défaire).
+///
+/// Ce que le réglage ne touche PAS : le scan, qui fait d'`Album/CD 1` et
+/// `Album/CD 2` UN album à deux disques quand leurs balises portent le même
+/// album (C4). C'est ce que disent les fichiers, pas une devinette de Tune ;
+/// les couper en deux albums homonymes serait pire.
+pub const CLE_REGLAGE_AUTO: &str = "library_auto_box_sets";
+
+/// Valeur quand la clé est absente : **actif**, le comportement d'avant.
+pub const REGLAGE_AUTO_DEFAUT: bool = true;
+
+/// Lit une valeur stockée. Seules les formes « fausses » usuelles coupent la
+/// réunion : une valeur absente ou illisible garde le comportement d'avant.
+pub fn reglage_auto_depuis_valeur(valeur: Option<&str>) -> bool {
+    match valeur {
+        None => REGLAGE_AUTO_DEFAUT,
+        Some(v) => !matches!(
+            v.trim().trim_matches('"').to_ascii_lowercase().as_str(),
+            "false" | "0" | "no" | "off"
+        ),
+    }
+}
+
+/// Tune réunit-il et range-t-il les coffrets automatiquement ? Une base
+/// illisible répond le défaut (actif) : c'est ce que faisait Tune jusqu'ici.
+pub fn reunion_automatique_active(db: &Arc<dyn DbBackend>) -> bool {
+    match SettingsRepo::with_backend(db.clone()).get(CLE_REGLAGE_AUTO) {
+        Ok(v) => reglage_auto_depuis_valeur(v.as_deref()),
+        Err(e) => {
+            tracing::warn!(erreur = %e, "coffrets_auto_reglage_illisible");
+            REGLAGE_AUTO_DEFAUT
+        }
+    }
+}
+
 /// Qui a composé le coffret.
 pub const ORIGINE_AUTO: &str = "auto";
 pub const ORIGINE_MANUEL: &str = "manuel";
@@ -893,7 +949,13 @@ fn tenu_a_la_main(id: i64, inv: &Inventaire) -> bool {
 }
 
 /// LA PASSE — au démarrage et après chaque scan. Ne relit aucun fichier.
+///
+/// #6554 — réglage « Coffrets automatiques » coupé ([`CLE_REGLAGE_AUTO`]) :
+/// elle ne lit ni n'écrit rien. Les coffrets déjà réunis le restent.
 pub fn passe(db: &Arc<dyn DbBackend>) -> Result<RapportPasse, TuneError> {
+    if !reunion_automatique_active(db) {
+        return Ok(RapportPasse::default());
+    }
     let inv = inventaire(db)?;
     let refuses = refus(db);
     // Un échec de lecture rend l'ensemble VIDE — même choix que le
@@ -1084,7 +1146,13 @@ pub struct CoffretListe {
 /// 🔴 La bibliothèque **LOCALE** seulement, et cela se lit sur la SOURCE des
 /// deux côtés — la piste ET l'album. Le chemin de fichier ne tenait pas ce
 /// rôle : une source distante peut en porter un.
+///
+/// #6554 — réglage « Coffrets automatiques » coupé ([`CLE_REGLAGE_AUTO`]) :
+/// seul le premier critère reste. Un album à plusieurs disques rangé
+/// `Album/CD 1`, `Album/CD 2` n'est plus un coffret ; les albums marqués
+/// (composés à la main, ou réunis automatiquement auparavant) le restent.
 pub fn lister(db: &Arc<dyn DbBackend>) -> Result<Vec<CoffretListe>, TuneError> {
+    let disque_par_disque_compte = reunion_automatique_active(db);
     // Le chemin de [`chemin_ouvrable`] : un coffret réuni depuis des feuilles
     // CUE n'a aucune piste à `file_path` (#5317).
     let sql = format!(
@@ -1108,8 +1176,9 @@ pub fn lister(db: &Arc<dyn DbBackend>) -> Result<Vec<CoffretListe>, TuneError> {
         let premier = r.get(2).and_then(|v| v.as_string()).unwrap_or_default();
         let dernier = r.get(3).and_then(|v| v.as_string()).unwrap_or_default();
         let origine = marques.get(&id).map(|m| m.origine.clone());
-        let range_disque_par_disque =
-            disques >= 2 && !meme_dossier(dossier_de(&premier), dossier_de(&dernier));
+        let range_disque_par_disque = disque_par_disque_compte
+            && disques >= 2
+            && !meme_dossier(dossier_de(&premier), dossier_de(&dernier));
         if origine.is_some() || range_disque_par_disque {
             rendu.push(CoffretListe {
                 album_id: id,

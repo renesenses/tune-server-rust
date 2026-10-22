@@ -9,7 +9,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reqwest::header::{ACCEPT, ETAG, HeaderValue, IF_MATCH, RETRY_AFTER};
+use reqwest::header::{
+    ACCEPT, CONTENT_TYPE, ETAG, HeaderValue, IF_MATCH, IF_NONE_MATCH, RETRY_AFTER,
+};
 use reqwest::{Method, StatusCode, Url};
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -42,6 +44,29 @@ pub enum Issue {
     },
     /// Le cloud n'a pas pu répondre : injoignable, délai dépassé, ou 5xx.
     Indisponible { statut_amont: Option<u16> },
+}
+
+/// #6521 : ce qu'a donné la lecture d'une IMAGE au cloud (la vignette d'une
+/// pochette de contact). Les octets ne sont jamais interprétés ici.
+#[derive(Debug)]
+pub enum IssueImage {
+    NonConnecte,
+    Indisponible,
+    /// 200 : `image/jpeg` ou `image/webp` seulement, sinon [`Self::Indisponible`].
+    Image {
+        corps: Vec<u8>,
+        type_mime: HeaderValue,
+        etag: Option<HeaderValue>,
+    },
+    /// 304 : la copie du client est à jour.
+    Inchangee {
+        etag: Option<HeaderValue>,
+    },
+    /// 404 et autres refus : le statut seul ; le corps ne sort pas.
+    Refus {
+        statut: u16,
+        retry_after: Option<HeaderValue>,
+    },
 }
 
 pub struct Relais {
@@ -92,6 +117,84 @@ impl Relais {
     ) -> Issue {
         self.appeler_avec(route, methode, segments, requete, corps, None)
             .await
+    }
+
+    /// #6521 : `GET /api/v1/circle/{segments…}` d'une IMAGE, avec
+    /// l'`If-None-Match` du client. Même session, même rafraîchissement unique
+    /// sur un 401 que [`Self::appeler_avec`].
+    pub async fn lire_image(
+        &self,
+        route: &'static str,
+        segments: &[&str],
+        if_none_match: Option<&HeaderValue>,
+    ) -> IssueImage {
+        let settings = self.reglages();
+        let Some(jeton) = lire(&settings, "mozaik_access_token") else {
+            return IssueImage::NonConnecte;
+        };
+        let base = lire(&settings, "mozaik_base_url").unwrap_or_else(|| BASE_PAR_DEFAUT.into());
+        let Some(url) = url_du_cercle(&base, segments) else {
+            return IssueImage::Indisponible;
+        };
+        let envoyer_image = |jeton: String| {
+            let mut r = tune_core::http::client::shared()
+                .get(url.clone())
+                .bearer_auth(jeton)
+                .header(ACCEPT, "image/webp,image/jpeg")
+                .timeout(DELAI);
+            if let Some(v) = if_none_match {
+                r = r.header(IF_NONE_MATCH, v.clone());
+            }
+            r.send()
+        };
+        let mut envoi = envoyer_image(jeton).await;
+        if matches!(&envoi, Ok(r) if r.status() == StatusCode::UNAUTHORIZED)
+            && let Some(nouveau) = rafraichir(&settings, &base).await
+        {
+            envoi = envoyer_image(nouveau).await;
+        }
+        let reponse = match envoi {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(route, error = %e.without_url(), "circle_cloud_injoignable");
+                return IssueImage::Indisponible;
+            }
+        };
+        let statut = reponse.status();
+        let etag = reponse.headers().get(ETAG).cloned();
+        if statut == StatusCode::UNAUTHORIZED {
+            return IssueImage::NonConnecte;
+        }
+        if statut.is_server_error() {
+            return IssueImage::Indisponible;
+        }
+        if statut == StatusCode::NOT_MODIFIED {
+            return IssueImage::Inchangee { etag };
+        }
+        if statut != StatusCode::OK {
+            return IssueImage::Refus {
+                statut: statut.as_u16(),
+                retry_after: reponse.headers().get(RETRY_AFTER).cloned(),
+            };
+        }
+        let type_mime = reponse.headers().get(CONTENT_TYPE).cloned();
+        let Some(type_mime) = type_mime.filter(|t| {
+            matches!(
+                t.to_str().map(|s| s.split(';').next().unwrap_or("").trim().to_ascii_lowercase()),
+                Ok(ref s) if s == "image/jpeg" || s == "image/webp"
+            )
+        }) else {
+            warn!(route, "circle_vignette_type_refuse");
+            return IssueImage::Indisponible;
+        };
+        match reponse.bytes().await {
+            Ok(corps) => IssueImage::Image {
+                corps: corps.to_vec(),
+                type_mime,
+                etag,
+            },
+            Err(_) => IssueImage::Indisponible,
+        }
     }
 
     /// [`Self::appeler_avec_requete`], avec l'en-tête `If-Match` du client

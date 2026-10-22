@@ -6,6 +6,8 @@ mod admin;
 // et un test qui recopierait la fusion la répliquerait au lieu de la garder.
 pub use admin::peers_payload;
 mod backup;
+// Réglages ▸ Clés d'API (#4805, lot 1 MetaRust).
+pub(crate) mod cles_api;
 mod config;
 // Fil 2145 : « Oublier ce partage » retire ses racines par le MEME chemin.
 pub(crate) use config::{pistes_qui_partiraient, retirer_un_dossier};
@@ -52,6 +54,9 @@ mod replaygain;
 // recopier la règle au lieu de l'appeler — un test qui réplique le code ne le
 // garde pas. Les items du module restent `pub(crate)` sauf ceux exposés
 // expressément.
+/// « Ce qui tourne » : passes de fond, cession à la lecture, avancement,
+/// garde thermique (#4681).
+pub(crate) mod ce_qui_tourne;
 pub mod scan;
 /// Pause et reprise des traitements de fond (#4574) — voir le module.
 pub(crate) mod taches_de_fond;
@@ -89,6 +94,14 @@ pub fn router() -> Router<AppState> {
             get(config::get_config).patch(config::update_config),
         )
         .route("/settings", get(config::get_settings))
+        // Clés d'API PERSONNELLES (#4805, lot 1 MetaRust) : AcoustID et
+        // Discogs, scellées au repos, jamais rendues en clair.
+        .route("/api-keys", get(cles_api::lister))
+        .route(
+            "/api-keys/{service}",
+            axum::routing::put(cles_api::poser).delete(cles_api::retirer),
+        )
+        .route("/api-keys/{service}/test", post(cles_api::tester))
         .route(
             "/settings/theme",
             axum::routing::put(config::set_theme).get(config::get_theme),
@@ -130,6 +143,12 @@ pub fn router() -> Router<AppState> {
         )
         .route("/artist-split-preview", get(scan::artist_split_preview))
         .route("/background-tasks", get(enrich::background_tasks_status))
+        // #4681 — « ce qui tourne » : quelles passes tournent, lesquelles la
+        // lecture ralentit, leur avancement, et le bridage thermique.
+        .route(
+            "/background-tasks/running",
+            get(ce_qui_tourne::ce_qui_tourne_route),
+        )
         // Suspendre et reprendre les traitements de fond (#4574). Le scan avait
         // `/scan/cancel` ; le ReplayGain, la plage dynamique, l'analyse
         // acoustique, l'enrichissement et les images d'artistes n'avaient
@@ -155,6 +174,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/background-tasks/resume-all",
             post(taches_de_fond::tout_reprendre),
+        )
+        // #6330 — « Tout relancer » : tout reprendre ET rendre à la cascade
+        // les pistes en échec (ReplayGain, plage dynamique).
+        .route(
+            "/background-tasks/relaunch-all",
+            post(taches_de_fond::tout_relancer),
         )
         .route(
             "/background-tasks/{id}/pause",

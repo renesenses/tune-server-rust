@@ -169,7 +169,7 @@ use regex::Regex;
 pub const NOM_DU_RAPPORT: &str = "foo_dr.txt";
 
 /// Une ligne de mesure du rapport : une piste, telle que le mesureur l'a vue.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LigneDr {
     /// La plage dynamique, en entier — `DR11` → 11.
     pub dr: u8,
@@ -187,10 +187,28 @@ pub struct LigneDr {
     /// Vrai quand la ligne porte des mesures au-delà des deux canaux avant —
     /// la couche multicanal d'un SACD, ou un fichier 5.1.
     pub multicanal: bool,
+    /// La colonne `Peak` (`Пики` en russe) : la crête d'ÉCHANTILLON de la
+    /// piste, en dBFS (#5519). `None` pour DROffline MkII, qui ne donne
+    /// qu'un true peak (`Max. TPL`) et n'est pas lu ici.
+    pub crete_db: Option<f64>,
+    /// La colonne `RMS` : le niveau RMS de la piste, en dB, NON pondéré
+    /// (#5519). Même réserve pour DROffline.
+    pub rms_db: Option<f64>,
+}
+
+/// Les deux mesures de niveau qu'un rapport TT DR donne pour une piste
+/// (#5519) : de quoi APPROCHER un gain ReplayGain quand la piste n'en a pas
+/// — voir `audio::replaygain::gain_approche`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MesuresDeNiveau {
+    /// Crête d'échantillon, dBFS (≤ 0 sauf master écrêté).
+    pub crete_db: f64,
+    /// RMS non pondéré, dB.
+    pub rms_db: f64,
 }
 
 /// Un rapport lu : ses lignes de piste et, s'il l'annonce, son DR d'album.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RapportDr {
     /// `Official DR value: DR9`. Lu, pas écrit : voir le module.
     pub dr_album: Option<u8>,
@@ -408,6 +426,8 @@ fn assembler(brutes: Vec<LigneBrute>) -> Vec<LigneDr> {
                 titre: titre.trim().to_string(),
                 tronque: l.tronque,
                 multicanal: l.multicanal,
+                crete_db: l.crete_db,
+                rms_db: l.rms_db,
             }
         })
         .collect()
@@ -548,6 +568,8 @@ fn analyser_droffline(texte: &str, colonnes: &[String]) -> RapportDr {
             // canal : ni troncature à reconnaître, ni couche à départager.
             tronque: false,
             multicanal: false,
+            crete_db: None,
+            rms_db: None,
         });
     }
     rapport.lignes = assembler(brutes);
@@ -561,6 +583,8 @@ struct LigneBrute {
     piste: String,
     tronque: bool,
     multicanal: bool,
+    crete_db: Option<f64>,
+    rms_db: Option<f64>,
 }
 
 /// `DR11` → 11. Tolère `DR 11`, `dr11`, `11`.
@@ -638,10 +662,8 @@ fn peut_etre_une_unite(jeton: &str) -> bool {
 ///
 /// `unite_apprise` est l'unité, inconnue de [`est_une_unite`], que la colonne
 /// des crêtes a portée : elle est acceptée derrière le RMS (#5573).
-fn consommer_mesure(jetons: &mut Jetons<'_>, unite_apprise: Option<&str>) -> bool {
-    let Some(j) = jetons.regarder() else {
-        return false;
-    };
+fn consommer_mesure(jetons: &mut Jetons<'_>, unite_apprise: Option<&str>) -> Option<f64> {
+    let j = jetons.regarder()?;
     if est_un_nombre(j) {
         jetons.suivant();
         if jetons
@@ -650,7 +672,10 @@ fn consommer_mesure(jetons: &mut Jetons<'_>, unite_apprise: Option<&str>) -> boo
         {
             jetons.suivant();
         }
-        return true;
+        // `est_un_nombre` admet `1.2.3` : il n'a jamais servi qu'à
+        // reconnaître la colonne. La valeur, elle, doit se lire ; sinon la
+        // ligne reste une mesure de DR, sans niveau (#5519).
+        return Some(j.parse::<f64>().unwrap_or(f64::NAN));
     }
     // `-6.69dBFS` en un seul jeton.
     let sans_unite = j
@@ -660,9 +685,9 @@ fn consommer_mesure(jetons: &mut Jetons<'_>, unite_apprise: Option<&str>) -> boo
         .unwrap_or("");
     if est_un_nombre(sans_unite) {
         jetons.suivant();
-        return true;
+        return Some(sans_unite.parse::<f64>().unwrap_or(f64::NAN));
     }
-    false
+    None
 }
 
 /// Les deux colonnes obligatoires, crête puis RMS.
@@ -674,10 +699,11 @@ fn consommer_mesure(jetons: &mut Jetons<'_>, unite_apprise: Option<&str>) -> boo
 /// -24.80 äÁ` (le même rapport en Windows-1251 relu en Windows-1252), sans
 /// avaler le premier mot d'un titre : dans `DR12 -0.5 -12.4 So What`, la
 /// crête est suivie d'un nombre, il n'y a pas d'unité à apprendre.
-fn consommer_mesures(jetons: &mut Jetons<'_>) -> bool {
-    let Some(j) = jetons.regarder() else {
-        return false;
-    };
+///
+/// Rend (crête, RMS) en dB ; une valeur illisible vaut `NaN` et sera écartée
+/// par l'appelant, sans faire tomber la ligne (le DR reste lu).
+fn consommer_mesures(jetons: &mut Jetons<'_>) -> Option<(f64, f64)> {
+    let j = jetons.regarder()?;
     let mut unite_apprise = None;
     if est_un_nombre(j) {
         let mut essai = Jetons {
@@ -696,7 +722,9 @@ fn consommer_mesures(jetons: &mut Jetons<'_>) -> bool {
             }
         }
     }
-    consommer_mesure(jetons, unite_apprise) && consommer_mesure(jetons, unite_apprise)
+    let crete = consommer_mesure(jetons, unite_apprise)?;
+    let rms = consommer_mesure(jetons, unite_apprise)?;
+    Some((crete, rms))
 }
 
 fn analyser_ligne(ligne: &str, entete_multicanal: bool) -> Option<LigneBrute> {
@@ -709,9 +737,8 @@ fn analyser_ligne(ligne: &str, entete_multicanal: bool) -> Option<LigneBrute> {
     }
     let dr = valeur_dr(premier)?;
     // Peak puis RMS, obligatoires : sans eux ce n'est pas une ligne de mesure.
-    if !consommer_mesures(&mut jetons) {
-        return None;
-    }
+    let (crete, rms) = consommer_mesures(&mut jetons)?;
+    let fini = |v: f64| v.is_finite().then_some(v);
     // Duration, facultative (absente de certains rapports).
     if jetons.regarder().is_some_and(|j| DUREE.is_match(j)) {
         jetons.suivant();
@@ -748,6 +775,8 @@ fn analyser_ligne(ligne: &str, entete_multicanal: bool) -> Option<LigneBrute> {
         piste: piste.trim().to_string(),
         tronque,
         multicanal,
+        crete_db: fini(crete),
+        rms_db: fini(rms),
     })
 }
 
@@ -844,6 +873,43 @@ impl RapportDr {
         titre: Option<&str>,
         canaux: Option<u16>,
     ) -> Option<u8> {
+        let candidates = self.lignes_pour_la_piste(numero, disque, titre, canaux);
+        let valeurs: HashSet<u8> = candidates.iter().map(|l| l.dr).collect();
+        if valeurs.len() == 1 {
+            valeurs.into_iter().next()
+        } else {
+            None
+        }
+    }
+
+    /// La crête et le RMS d'UNE piste (#5519), par le MÊME appariement que
+    /// [`dr_pour_la_piste`](Self::dr_pour_la_piste), et la même règle : les
+    /// lignes retenues doivent porter UNE SEULE paire de valeurs. Deux
+    /// lignes qui divergent sont une ambiguïté, et un gain tiré de la
+    /// mauvaise serait pire qu'aucun.
+    pub fn mesures_pour_la_piste(
+        &self,
+        numero: Option<u32>,
+        disque: Option<u32>,
+        titre: Option<&str>,
+        canaux: Option<u16>,
+    ) -> Option<MesuresDeNiveau> {
+        let candidates = self.lignes_pour_la_piste(numero, disque, titre, canaux);
+        let premiere = candidates.first()?;
+        let (crete_db, rms_db) = (premiere.crete_db?, premiere.rms_db?);
+        let toutes_egales = candidates
+            .iter()
+            .all(|l| l.crete_db == Some(crete_db) && l.rms_db == Some(rms_db));
+        toutes_egales.then_some(MesuresDeNiveau { crete_db, rms_db })
+    }
+
+    fn lignes_pour_la_piste(
+        &self,
+        numero: Option<u32>,
+        disque: Option<u32>,
+        titre: Option<&str>,
+        canaux: Option<u16>,
+    ) -> Vec<&LigneDr> {
         let titre_norme = titre.map(normaliser_titre).filter(|t| !t.is_empty());
         let correspond_au_titre = |l: &LigneDr| -> bool {
             let Some(voulu) = titre_norme.as_deref() else {
@@ -900,12 +966,7 @@ impl RapportDr {
                 candidates = par_couche;
             }
         }
-        let valeurs: HashSet<u8> = candidates.iter().map(|l| l.dr).collect();
-        if valeurs.len() == 1 {
-            valeurs.into_iter().next()
-        } else {
-            None
-        }
+        candidates
     }
 }
 

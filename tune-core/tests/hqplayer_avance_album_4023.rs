@@ -48,14 +48,9 @@
 //!
 //! ## Second temps : ce qui reste fragile, et qui est maintenant DIT
 //!
-//! `parse_state_from_xml` retombe sur `Stopped` pour toute réponse `<Status>`
-//! dont il ne reconnaît aucun mot d'état. Or `Stopped` n'est pas neutre :
-//! c'est lui qui fait avancer la file après cinq sondes et arrêter la zone
-//! après trente. Une réponse d'une forme inattendue produirait donc
-//! exactement « l'album s'arrête après une piste », **sans une ligne pour le
-//! dire**. Le comportement ne change pas — le repli reste `Stopped` — mais il
-//! sort désormais un `warn`, **une seule fois par sortie** (le sondage tourne
-//! en boucle, cf. #4025).
+//! Une réponse `<Status>` sans état reconnu déclenche un diagnostic, une
+//! seule fois par sortie. Depuis #6515, elle rend une erreur de sondage :
+//! inventer `Stopped` risquerait de faire avancer la file sans fin réelle.
 //!
 //! Rien ici ne prouve que HQPlayer v5 réponde dans une forme non reconnue :
 //! ce n'est pas mesuré, et ce témoin ne le prétend pas. Il garde la ligne qui
@@ -75,7 +70,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tune_core::outputs::hqplayer::HqplayerOutput;
-use tune_core::outputs::traits::{OutputTarget, PlayMedia, TransportState};
+use tune_core::outputs::traits::{OutputTarget, PlayMedia};
 
 const PISTE_1: &str = "http://192.168.0.20:8888/stream/aaaa1111.flac";
 const PISTE_2: &str = "http://192.168.0.20:8888/stream/bbbb2222.flac";
@@ -177,10 +172,13 @@ async fn un_album_qui_avance_pose_quatre_commandes_lisibles_sur_une_connexion() 
          file ne peut pas aboutir (#4023). Compté {declarations} :\n{sur_le_fil}"
     );
 
-    // Les deux pistes, dans l'ordre, chacune suivie de son Play.
+    // Les deux pistes, dans l'ordre, chacune précédée de son `PlaylistClear`
+    // (#6115 : `clear="1"` ignoré par le moteur 6.0.4) et suivie de son Play.
     let attendu = format!(
-        "<PlaylistAdd uri=\"{PISTE_1}\" queued=\"0\" clear=\"1\"></PlaylistAdd>\n\
+        "<PlaylistClear />\n\
+         <PlaylistAdd uri=\"{PISTE_1}\" queued=\"0\" clear=\"1\"></PlaylistAdd>\n\
          <Play />\n\
+         <PlaylistClear />\n\
          <PlaylistAdd uri=\"{PISTE_2}\" queued=\"0\" clear=\"1\"></PlaylistAdd>\n\
          <Play />\n"
     );
@@ -193,8 +191,8 @@ async fn un_album_qui_avance_pose_quatre_commandes_lisibles_sur_une_connexion() 
 
     // ── Temps 2 : une réponse `Status` non reconnue est DITE, une fois ───
     //
-    // Le repli `Stopped` ne change pas ; ce qui change, c'est qu'il ne soit
-    // plus muet. Sans cette ligne, une forme de réponse inattendue produit
+    // #6515 : le diagnostic reste, mais le sondage est maintenant refusé.
+    // Sans cette ligne, une forme de réponse inattendue produit
     // « l'album s'arrête après une piste » et rien ne l'explique.
     let ecoute2 = TcpListener::bind("127.0.0.1:0")
         .await
@@ -225,15 +223,13 @@ async fn un_album_qui_avance_pose_quatre_commandes_lisibles_sur_une_connexion() 
         "127.0.0.1".into(),
         port2,
     );
-    let etat1 = sortie2.get_status().await.expect("status 1");
-    let etat2 = sortie2.get_status().await.expect("status 2");
-
-    // Le comportement ne bouge pas : le repli reste `Stopped`.
-    assert_eq!(etat1.state, TransportState::Stopped);
-    assert_eq!(etat2.state, TransportState::Stopped);
-    // Et le reste de la réponse est bien lu — la ligne ne dénonce pas une
-    // réponse illisible, seulement un ÉTAT non reconnu.
-    assert_eq!(etat1.position_ms, 12_500);
+    for _ in 0..2 {
+        let erreur = sortie2
+            .get_status()
+            .await
+            .expect_err("état inconnu : pas un arrêt");
+        assert!(erreur.contains("hqplayer_status_etat_inconnu"));
+    }
 
     let texte = capture.texte();
     let dits = texte

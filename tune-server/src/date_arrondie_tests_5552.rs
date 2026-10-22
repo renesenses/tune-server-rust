@@ -65,6 +65,8 @@ async fn scan_de_demarrage(db: &Arc<dyn DbBackend>) -> serde_json::Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn une_date_tronquee_a_taille_egale_n_est_pas_relue_et_devient_precise_5552() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let r = racine("date-arrondie-5552");
     let musique = r.join("musique");
     let (_, a) = album_dans(&musique, "Arrondie", None, None);

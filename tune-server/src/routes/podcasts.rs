@@ -454,6 +454,45 @@ async fn play_episode(
         body.cover_url.as_deref(),
         body.podcast_name.as_deref(),
     );
+    let output_arc = match device_id.as_deref() {
+        Some(did) => {
+            let outputs = state.outputs.lock().await;
+            outputs.get(did)
+        }
+        None => None,
+    };
+    // #6468 — un renderer réseau (DLNA, OpenHome…) reçoit l'épisode par le
+    // mandataire de Tune, en `http://`, comme les radios et les services :
+    // beaucoup de renderers DLNA n'ouvrent pas le HTTPS d'un hébergeur de
+    // podcasts, acceptent pourtant `SetAVTransportURI` et `Play`, puis
+    // retombent en STOPPED. La sortie locale ouvre l'URL elle-même : elle la
+    // reçoit inchangée.
+    let relais = match output_arc.as_ref() {
+        Some(arc) => {
+            let output_type = arc.lock().await.output_type().to_string();
+            if tune_core::orchestrator::is_network_output_type(Some(&output_type)) {
+                let (url, session) = state
+                    .orchestrator
+                    .relayer_un_flux_distant(
+                        &body.audio_url,
+                        mime_type,
+                        body.duration_ms.map(|d| d as i64),
+                        None,
+                        None,
+                    )
+                    .await;
+                info!(zone_id, output_type, stream_id = %session, "podcast_episode_relaye");
+                Some((url, session))
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    let url_de_sortie = relais
+        .as_ref()
+        .map(|(url, _)| url.as_str())
+        .unwrap_or(&body.audio_url);
     let np = NowPlaying {
         track_id: None,
         title: title.to_string(),
@@ -463,19 +502,19 @@ async fn play_episode(
         duration_ms: body.duration_ms.unwrap_or(0) as i64,
         source: "podcast".into(),
         source_id: Some(body.audio_url.clone()),
-        stream_id: None,
+        stream_id: relais.as_ref().map(|(_, session)| session.clone()),
         ..Default::default()
     };
+    // #6465 — un épisode n'appartient à aucun album ni playlist joué avant.
+    state.playback.effacer_contexte_de_session(zone_id).await;
     state.playback.play(zone_id, np).await;
-    let (output_sent, output_error) = if let Some(ref did) = device_id {
-        let output_arc = {
-            let outputs = state.outputs.lock().await;
-            outputs.get(did)
-        };
-        if let Some(output_arc) = output_arc {
+    // #6468 — un échec n'est plus un `200` : la réponse porte un vrai code
+    // HTTP et un `code` stable, que le client peut afficher.
+    let echec: Option<(StatusCode, &'static str, String)> = match (&device_id, &output_arc) {
+        (Some(_), Some(output_arc)) => {
             let output = output_arc.lock().await;
             let media = tune_core::outputs::PlayMedia {
-                url: &body.audio_url,
+                url: url_de_sortie,
                 mime_type,
                 title: Some(title),
                 artist: Some(podcast_name),
@@ -485,18 +524,28 @@ async fn play_episode(
                 ..Default::default()
             };
             match output.play_media(&media).await {
-                Ok(()) => (true, None),
-                Err(e) => (false, Some(format!("Output device error: {e}"))),
+                Ok(()) => None,
+                Err(e) => Some((
+                    StatusCode::BAD_GATEWAY,
+                    "podcast_sortie_refuse",
+                    format!("Output device error: {e}"),
+                )),
             }
-        } else {
-            (
-                false,
-                Some("Device not yet discovered. Please retry in a few seconds.".into()),
-            )
         }
-    } else {
-        (false, None)
+        (Some(_), None) => Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "podcast_sortie_introuvable",
+            "Device not yet discovered. Please retry in a few seconds.".into(),
+        )),
+        (None, _) => None,
     };
+    let output_sent = device_id.is_some() && echec.is_none();
+    if let Some((_, code, ref erreur)) = echec {
+        // La zone ne joue rien : ne pas la laisser « en lecture », sans quoi
+        // le geste suivant est une Pause que le renderer refuse (701).
+        state.playback.stop(zone_id).await;
+        warn!(zone_id, title, code, error = %erreur, "podcast_episode_play_failed");
+    }
     info!(
         zone_id,
         title,
@@ -505,7 +554,14 @@ async fn play_episode(
         "podcast_episode_play"
     );
     let zone_state = state.playback.get_state(zone_id).await;
-    Json(json!({"zone_id": zone_id, "title": title, "podcast": podcast_name, "audio_url": body.audio_url, "mime_type": mime_type, "output_sent": output_sent, "error": output_error, "state": zone_state})).into_response()
+    let statut = echec.as_ref().map_or(StatusCode::OK, |(s, _, _)| *s);
+    let code = echec.as_ref().map(|(_, c, _)| *c);
+    let output_error = echec.map(|(_, _, e)| e);
+    (
+        statut,
+        Json(json!({"zone_id": zone_id, "title": title, "podcast": podcast_name, "audio_url": body.audio_url, "mime_type": mime_type, "output_sent": output_sent, "error": output_error, "code": code, "state": zone_state})),
+    )
+        .into_response()
 }
 // ─── Vignette mise en cache (#5214) ─────────────────────────────────
 

@@ -46,7 +46,7 @@ use tune_core::cloud::ENTETE_RELAIS;
 
 /// Les en-têtes qui disent qu'un mandataire s'est interposé : le pair de la
 /// socket n'est alors plus l'appelant.
-const ENTETES_MANDATAIRE: &[&str] = &[
+pub(crate) const ENTETES_MANDATAIRE: &[&str] = &[
     ENTETE_RELAIS,
     "x-bridge-token",
     "x-forwarded-for",

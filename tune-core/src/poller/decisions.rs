@@ -494,6 +494,38 @@ pub fn next_dlna_playing_stall_ticks(
     }
 }
 
+/// 🔴 #6702 — la série de tours sans progrès a-t-elle duré assez longtemps,
+/// en TEMPS RÉEL, pour couper la zone ?
+///
+/// `ticks` est le compteur que vient de rendre
+/// [`next_dlna_playing_stall_ticks`]. `depuis` date le premier tour de la
+/// série : il est posé quand la série commence (`ticks == 1`, ou première
+/// rencontre), effacé quand elle retombe à zéro. Les remises à zéro faites
+/// ailleurs dans le sondeur repartent donc d'elles-mêmes d'un instant neuf.
+///
+/// Il faut les DEUX : `PLAYING_STALL_THRESHOLD` tours (des sondages réels) et
+/// `PLAYING_STALL_MIN_SECS` secondes depuis le premier. Une rafale de tours
+/// rattrapés après un blocage du sondeur n'a pas laissé au renderer le temps
+/// d'avancer sa position d'une seconde : elle ne prouve rien.
+pub fn lecture_sans_progres_etablie(
+    ticks: u8,
+    depuis: &mut Option<std::time::Instant>,
+    maintenant: std::time::Instant,
+) -> bool {
+    if ticks == 0 {
+        *depuis = None;
+        return false;
+    }
+    if ticks == 1 || depuis.is_none() {
+        *depuis = Some(maintenant);
+    }
+    ticks >= super::PLAYING_STALL_THRESHOLD
+        && depuis.is_some_and(|t| {
+            maintenant.saturating_duration_since(t)
+                >= std::time::Duration::from_secs(super::PLAYING_STALL_MIN_SECS)
+        })
+}
+
 /// Une relance automatique après démarrage mort est-elle permise ?
 /// Au plus une par fenêtre : si la précédente date de moins de
 /// DEAD_START_RETRY_COOLDOWN_SECS, l'échec suivant coupe la zone comme
@@ -955,13 +987,43 @@ pub fn natural_end(
 /// stored. A renderer that keeps reporting a stale default (Fabien's
 /// Devialet stuck at 50%) reports the same value every tick, so `prev`
 /// never differs from `device` and the user's saved volume is preserved.
+///
+/// Une zone dont la consigne est le SILENCE (au plus
+/// [`CONSIGNE_DE_SILENCE`]) n'adopte jamais une valeur plus haute : voir
+/// [`silence_rouvert_par_l_appareil`].
 pub fn should_adopt_device_volume(
     prev_device_vol: Option<f64>,
     device_vol: f64,
     db_vol: f64,
 ) -> bool {
-    prev_device_vol.is_some_and(|prev| (device_vol - prev).abs() > 0.02)
+    !silence_rouvert_par_l_appareil(device_vol, db_vol)
+        && prev_device_vol.is_some_and(|prev| (device_vol - prev).abs() > 0.02)
         && (device_vol - db_vol).abs() > 0.02
+}
+
+/// Plus haut volume de zone tenu pour une consigne de silence : la
+/// sourdine du client web pose exactement `0`.
+pub const CONSIGNE_DE_SILENCE: f64 = 0.001;
+
+/// La consigne de la zone est le silence, et l'appareil remonte un volume
+/// plus haut : le sondeur ne doit PAS l'adopter.
+///
+/// Eversolo DMP-A8 sur le .18, le 21/10 : la sourdine du client web envoie
+/// `SetVolume 0`, que l'appareil acquitte et applique (plus de son), mais
+/// une à quatre minutes plus tard il remonte de nouveau son ANCIEN volume
+/// (80) sans le rendre. Le sondeur l'adoptait (`volume_adopte_du_renderer
+/// ancien=0.0 nouveau=80.0`) : la zone affichait 80 %, non muette, sur un
+/// appareil muet. Ni la pause, ni la reprise (un `Play` seul), ni une
+/// nouvelle URI ne touchent au volume : le son ne revenait qu'au prochain
+/// coup de curseur, qui renvoie un `SetVolume`.
+///
+/// Garder la consigne de silence ne commande rien et ne monte jamais le
+/// son ; la zone dit la vérité de ce que Tune a commandé, et c'est le geste
+/// de l'auditeur (sourdine levée, curseur) qui rouvre le son. Le prix,
+/// assumé : un volume relevé sur l'appareil lui-même pendant que Tune est à
+/// zéro n'est pas recopié tant que la zone n'a pas quitté le silence.
+pub fn silence_rouvert_par_l_appareil(device_vol: f64, db_vol: f64) -> bool {
+    db_vol <= CONSIGNE_DE_SILENCE && device_vol > db_vol + 0.02
 }
 
 /// The renderer now reports a duration that differs from the current
@@ -1028,6 +1090,47 @@ pub fn should_arm_gapless(
     !gapless_sent
         && effective_duration_ms > GAPLESS_WINDOW_MS
         && position_ms >= effective_duration_ms - GAPLESS_WINDOW_MS
+}
+
+/// #6477 — au-delà de ce délai entre l'armement (`SetNext`) et la retombée
+/// de position, l'enchaînement n'est pas « dès le `SetNext` ».
+pub const COUPE_AU_SETNEXT_DELAI_MAX_MS: u64 = 10_000;
+/// #6477 — en deçà de ce reste de piste au moment de la retombée, c'est une
+/// fin de piste ordinaire, pas une coupure.
+pub const COUPE_AU_SETNEXT_RESTE_MIN_MS: u64 = 10_000;
+
+/// #6477 (FiiO K17, fil 2323) — le renderer a-t-il LÂCHÉ la piste en cours
+/// dès le `SetNextAVTransportURI` ? Trois mesures indépendantes doivent
+/// concorder :
+///
+/// - la position est retombée moins de [`COUPE_AU_SETNEXT_DELAI_MAX_MS`]
+///   après l'armement (une fin ordinaire arrive ~30 s après, au bout de la
+///   fenêtre) ;
+/// - il restait au moins [`COUPE_AU_SETNEXT_RESTE_MIN_MS`] de piste au
+///   dernier sondage (un armement tardif suivi d'une fin ordinaire ne laisse
+///   que quelques secondes) ;
+/// - le flux de la piste n'a été tiré qu'EN PARTIE (`0 < servis < total`) :
+///   le renderer a abandonné sa connexion avant la fin du fichier. Un
+///   renderer qui va au bout a tout tiré ; un flux sans mesure ne prouve rien.
+///
+/// `arm_to_advance_ms` vaut `None` sans armement. Journal du K17 : armement
+/// à 374 s sur 404,7 s, retombée 1,87 s plus tard, 79,9 Mo servis sur
+/// 84,3 Mo, 30 s de musique perdues, deux pistes de suite.
+pub fn set_next_a_coupe_la_piste(
+    arm_to_advance_ms: Option<u64>,
+    prev_position_ms: u64,
+    track_duration_ms: u64,
+    servis: Option<u64>,
+    total: Option<u64>,
+) -> bool {
+    let (Some(delai_ms), Some(servis), Some(total)) = (arm_to_advance_ms, servis, total) else {
+        return false;
+    };
+    track_duration_ms > 0
+        && delai_ms <= COUPE_AU_SETNEXT_DELAI_MAX_MS
+        && track_duration_ms.saturating_sub(prev_position_ms) >= COUPE_AU_SETNEXT_RESTE_MIN_MS
+        && servis > 0
+        && servis < total
 }
 
 /// #5970 — marge laissée, après la résolution de la suivante, pour attendre
@@ -1264,6 +1367,16 @@ pub fn deviceless_radio_refresh_due(
     is_playing && source == Some("radio") && radio_poll_due(since_last_poll, interval_secs)
 }
 
+/// Faut-il relire le titre d'une radio sur le relais radio-metadata (#6516) ?
+///
+/// La zone joue, la source est une radio, et le relais a servi son dernier
+/// titre il y a au moins une période (`zone_a_relire`). Une zone dont le
+/// titre vient du diffuseur ou de l'ICY n'est jamais « à relire » : elle
+/// garde le rythme du sondeur.
+pub fn relais_radio_du(is_playing: bool, source: Option<&str>, zone_a_relire: bool) -> bool {
+    is_playing && source == Some("radio") && zone_a_relire
+}
+
 /// Une lecture sans destination doit-elle cesser d'être annoncée ?
 ///
 /// Une zone sans périphérique de sortie prépare son flux, renonce à
@@ -1286,7 +1399,8 @@ pub fn deviceless_radio_refresh_due(
 /// - le démarrage est daté (`last_play_started_at` est `#[serde(skip)]` :
 ///   après une restauration d'état il vaut `None`, et on ne conclut rien),
 ///   et il remonte à plus que [`DELAI_SILENCE_ETABLI`] ;
-/// - le streamer CONNAÎT ce flux et déclare `0` octet servi. `None`
+/// - le streamer CONNAÎT ce flux et n'en a servi au plus qu'une sonde
+///   ([`super::TAILLE_MAXIMALE_D_UNE_SONDE`], #6066). `None`
 ///   (session inconnue, disparue, requête en échec) n'est pas une preuve
 ///   de silence : on laisse la lecture tranquille.
 ///
@@ -1296,8 +1410,10 @@ pub fn lecture_sans_destination_abandonnee(
     depuis_le_demarrage: Option<std::time::Duration>,
     octets_servis: Option<u64>,
 ) -> bool {
+    // #6066 — une sonde de plage (AVPlayer : deux octets, puis le refus) ne
+    // fait pas une destination : la lecture reste sans auditeur.
     depuis_le_demarrage.is_some_and(|d| d >= super::DELAI_SILENCE_ETABLI)
-        && octets_servis == Some(0)
+        && octets_servis.is_some_and(|n| !super::octets_d_une_ecoute(n))
 }
 
 /// L'autoplay doit-il chercher DANS LE SERVICE de la piste en cours ?

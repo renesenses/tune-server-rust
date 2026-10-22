@@ -71,7 +71,10 @@ fn machine_configuree() -> Arc<dyn DbBackend> {
         ("theme", "sombre"),
         ("eq_presets", r#"[{"name":"HE R10P","bands":31}]"#),
         // Secrets, chacun avec un marqueur qui ne doit apparaître nulle part.
-        ("discogs_token", "SECRET-discogs"),
+        // Le jeton Discogs VOYAGE, chiffré (tune-web-client#902) : marqueur
+        // distinct, il doit apparaître dans `service_tokens` et nulle part
+        // ailleurs.
+        ("discogs_token", "VOYAGE-discogs"),
         ("auth_tokens_qobuz", r#"{"user_auth_token":"SECRET-qobuz"}"#),
         ("auth_tokens_tidal", "SECRET-tidal"),
         ("mozaik_access_token", "SECRET-acces"),
@@ -172,6 +175,105 @@ fn le_contenu_ne_porte_aucun_secret() {
             .iter()
             .any(|r| r["name"] == json!("Radio X"))
     );
+}
+
+// ── Jeton Discogs (tune-web-client#902) ────────────────────────────
+
+/// Le jeton Discogs part, à part, dans `service_tokens` — et seulement lui :
+/// ni dans les réglages, ni en clair dans le blob déposé au site.
+#[test]
+fn le_jeton_discogs_voyage_dans_l_instantane_chiffre() {
+    let b = machine_configuree();
+    let s = reglages(&b);
+    creer_la_cle(&s, PHRASE).unwrap();
+    let cle = cle_locale(&s).unwrap().unwrap();
+    let contenu = construire(&b).unwrap();
+
+    assert_eq!(
+        contenu[SECTION_JETONS]["discogs_token"],
+        json!("VOYAGE-discogs"),
+        "le jeton Discogs ne part pas avec la sauvegarde"
+    );
+    let jetons = contenu[SECTION_JETONS].as_object().unwrap();
+    assert!(
+        jetons
+            .keys()
+            .all(|k| JETONS_QUI_VOYAGENT.contains(&k.as_str())),
+        "un jeton hors de la liste fermée part : {:?}",
+        jetons.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        contenu["settings"].get("discogs_token").is_none(),
+        "le jeton Discogs part aussi parmi les réglages"
+    );
+    let blob = chiffrer(&cle, &contenu).unwrap();
+    assert!(
+        !blob.contains("VOYAGE-discogs"),
+        "le jeton Discogs part en clair au site"
+    );
+}
+
+/// Machine neuve, ouverte par la phrase de passe : le jeton Discogs revient.
+#[test]
+fn une_machine_neuve_retrouve_son_jeton_discogs() {
+    let source = machine_configuree();
+    let s = reglages(&source);
+    creer_la_cle(&s, PHRASE).unwrap();
+    let cle = cle_locale(&s).unwrap().unwrap();
+    let blob = chiffrer(&cle, &construire(&source).unwrap()).unwrap();
+
+    let cible = base_neuve();
+    let (contenu, _) = dechiffrer(&blob, None, Some(PHRASE)).unwrap();
+    let r = restaurer(&cible, &contenu, Mode::Merge).unwrap();
+    assert_eq!(
+        reglages(&cible).get("discogs_token").unwrap().as_deref(),
+        Some("VOYAGE-discogs"),
+        "le jeton Discogs n'est pas revenu sur la machine neuve"
+    );
+    assert_eq!(r.service_tokens_restored, vec!["discogs_token".to_string()]);
+    // Le rapport ne porte que le nom, jamais la valeur.
+    assert!(
+        !serde_json::to_string(&r)
+            .unwrap()
+            .contains("VOYAGE-discogs")
+    );
+}
+
+/// Fusionner garde le jeton déjà posé ici ; remplacer prend celui de
+/// l'instantané.
+#[test]
+fn fusionner_garde_le_jeton_discogs_de_la_machine() {
+    let contenu = construire(&machine_configuree()).unwrap();
+    let cible = base_neuve();
+    let sc = reglages(&cible);
+    sc.set("discogs_token", "jeton-d-ici").unwrap();
+    let r = restaurer(&cible, &contenu, Mode::Merge).unwrap();
+    assert_eq!(
+        sc.get("discogs_token").unwrap().as_deref(),
+        Some("jeton-d-ici")
+    );
+    assert!(r.service_tokens_restored.is_empty());
+    restaurer(&cible, &contenu, Mode::Replace).unwrap();
+    assert_eq!(
+        sc.get("discogs_token").unwrap().as_deref(),
+        Some("VOYAGE-discogs")
+    );
+}
+
+/// Un instantané piégé n'écrit, par `service_tokens`, que la liste fermée.
+#[test]
+fn la_section_des_jetons_n_ecrit_que_la_liste_fermee() {
+    let mut contenu = construire(&machine_configuree()).unwrap();
+    contenu[SECTION_JETONS]["jwt_secret"] = json!("PIEGE");
+    contenu[SECTION_JETONS]["auth_tokens_qobuz"] = json!("PIEGE");
+    contenu[SECTION_JETONS]["sauvegarde_cloud_cle_secrete"] = json!("PIEGE");
+    let cible = base_neuve();
+    let sc = reglages(&cible);
+    sc.set("jwt_secret", "le-vrai").unwrap();
+    restaurer(&cible, &contenu, Mode::Replace).unwrap();
+    assert_eq!(sc.get("jwt_secret").unwrap().as_deref(), Some("le-vrai"));
+    assert!(sc.get("auth_tokens_qobuz").unwrap().is_none());
+    assert!(sc.get(CLE_SECRETE).unwrap().is_none());
 }
 
 /// Ni la bibliothèque ni ce qui la pilote ne partent.

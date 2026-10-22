@@ -1118,6 +1118,15 @@ impl PositionPoller {
         consigne_de_fondu: crate::audio::fondu_enchaine::ConsigneDeJonction,
         fin_estimee: Instant,
     ) -> GaplessPrep {
+        // #6477 — cet appareil lâche la piste en cours dès qu'il reçoit un
+        // `SetNext` (FiiO K17) : ne plus lui en envoyer. Comme une
+        // préparation abandonnée, la position est verrouillée et la fin de
+        // piste joue la suivante (`SetAVTransportURI` + `Play`) : un petit
+        // blanc au lieu de 30 s de musique perdues.
+        if crate::outputs::dlna_repli_set_uri::set_next_coupe_la_piste(device_id) {
+            info!(zone_id, device_id, "gapless_set_next_evite_coupe_la_piste");
+            return GaplessPrep::Abandonnee;
+        }
         let t0 = Instant::now();
         // #5970 — la résolution est attendue DANS le tick, qui sonde toutes
         // les zones : elle a un budget, pris sur ce qui reste de la piste en

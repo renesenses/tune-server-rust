@@ -12,6 +12,7 @@
 pub mod cli_server;
 pub mod discovery;
 mod ecoute;
+pub mod entete_pcm;
 pub use ecoute::EtatEcoute;
 
 use std::collections::HashMap;
@@ -410,18 +411,224 @@ fn strm_status_query() -> ServerMessage {
     }
 }
 
+/// Les octets de format d'une trame `strm s` (#6475) : le codec, puis les
+/// quatre champs PCM (taille d'échantillon, fréquence, canaux, boutisme).
+///
+/// Codes du protocole SlimProto, tels que Squeezelite les enregistre
+/// (`register_*` de ses décodeurs) : `f` FLAC, `p` PCM, `m` MP3, `o` Vorbis,
+/// `u` Opus, `a` AAC, `l` ALAC, `w` WMA, `d` DSD (DSF/DFF). Pour un codec
+/// compressé les champs PCM valent `'?'`, comme LMS les envoie
+/// (`Slim/Player/Squeezebox.pm`, `stream()`). Pour le PCM, jamais : voir
+/// [`entete_pcm`].
+///
+/// Avant #6475, `build_strm_start` annonçait `f` pour TOUT flux : un WAV servi
+/// tel quel partait vers le décodeur FLAC de Squeezelite, qui rejetait chaque
+/// trame, et la piste restait muette (fil 2322).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatStrm {
+    pub codec: u8,
+    pub taille: u8,
+    pub frequence: u8,
+    pub canaux: u8,
+    pub boutisme: u8,
+}
+
+/// Ce qu'un `strm s` annonce : le format, et la tranche d'octets à demander
+/// (`Range: bytes=debut-fin`) quand le flux porte un en-tête à sauter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnnonceStrm {
+    pub format: FormatStrm,
+    pub tranche: Option<(u64, u64)>,
+}
+
+/// Ce que Tune sert, tel que la sortie le sait (`PlayMedia`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FluxServi<'a> {
+    pub mime_type: &'a str,
+    pub url: &'a str,
+    pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u32>,
+    pub channels: Option<u32>,
+    pub file_path: Option<&'a str>,
+    pub file_size: Option<u64>,
+}
+
+enum Famille {
+    Compresse(u8),
+    Wav,
+    Aiff,
+    /// `audio/L16`, `audio/L24` : PCM gros-boutiste SANS en-tête.
+    PcmBrut(u32),
+}
+
+impl FormatStrm {
+    /// FLAC : auto-descriptif, champs PCM à `'?'`. C'est l'ancien octet fixe.
+    pub const FLAC: Self = Self::compresse(b'f');
+
+    const fn compresse(codec: u8) -> Self {
+        Self {
+            codec,
+            taille: b'?',
+            frequence: b'?',
+            canaux: b'?',
+            boutisme: b'?',
+        }
+    }
+
+    fn pcm(c: entete_pcm::ChampsPcm) -> Self {
+        Self {
+            codec: b'p',
+            taille: c.taille,
+            frequence: c.frequence,
+            canaux: c.canaux,
+            boutisme: c.boutisme,
+        }
+    }
+}
+
+fn famille_du_mime(essence: &str, bit_depth: Option<u32>) -> Option<Famille> {
+    let mp4 = if bit_depth.is_some() { b'l' } else { b'a' };
+    Some(match essence {
+        "audio/flac" | "audio/x-flac" => Famille::Compresse(b'f'),
+        "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/vnd.wave" => Famille::Wav,
+        "audio/aiff" | "audio/x-aiff" => Famille::Aiff,
+        "audio/l16" => Famille::PcmBrut(16),
+        "audio/l24" => Famille::PcmBrut(24),
+        "audio/mpeg" | "audio/mp3" | "audio/mpeg3" | "audio/x-mpeg" => Famille::Compresse(b'm'),
+        "audio/ogg" | "audio/vorbis" | "application/ogg" => Famille::Compresse(b'o'),
+        "audio/opus" => Famille::Compresse(b'u'),
+        "audio/aac" | "audio/aacp" | "audio/x-aac" => Famille::Compresse(b'a'),
+        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => Famille::Compresse(mp4),
+        "audio/x-ms-wma" => Famille::Compresse(b'w'),
+        m if crate::orchestrator::est_dsd_brut(m) => Famille::Compresse(b'd'),
+        _ => return None,
+    })
+}
+
+fn famille_de_l_extension(url: &str, bit_depth: Option<u32>) -> Option<Famille> {
+    let chemin = url.split(['?', '#']).next().unwrap_or("");
+    let extension = chemin
+        .rsplit('/')
+        .next()
+        .and_then(|nom| nom.rsplit_once('.'))
+        .map(|(_, ext)| ext.to_ascii_lowercase())?;
+    let mp4 = if bit_depth.is_some() { b'l' } else { b'a' };
+    Some(match extension.as_str() {
+        "flac" => Famille::Compresse(b'f'),
+        "wav" => Famille::Wav,
+        "aif" | "aiff" | "aifc" => Famille::Aiff,
+        "mp3" => Famille::Compresse(b'm'),
+        "ogg" | "oga" => Famille::Compresse(b'o'),
+        "opus" => Famille::Compresse(b'u'),
+        "aac" => Famille::Compresse(b'a'),
+        "m4a" | "mp4" => Famille::Compresse(mp4),
+        "wma" => Famille::Compresse(b'w'),
+        "dsf" | "dff" => Famille::Compresse(b'd'),
+        _ => return None,
+    })
+}
+
+/// Le `strm s` à envoyer pour le flux servi, ou le refus motivé.
+///
+/// - Codec compressé : son code, champs PCM à `'?'`, flux entier.
+/// - WAV / AIFF : seulement si le flux servi EST le fichier source (même
+///   extension, et `file_size` égal à sa taille sur disque — c'est ce que
+///   pose le chemin de service direct du fichier). Les paramètres et la
+///   tranche des échantillons sont lus dans son en-tête ([`entete_pcm`]). Un
+///   WAV fabriqué par Tune (DSP, conversion) n'est pas ce fichier : refusé.
+/// - `audio/L16`/`L24` : sans en-tête, paramètres du MIME ou du média, tous
+///   requis.
+/// - Format inconnu : refusé.
+///
+/// `audio/mp4` (et `.m4a`) couvre ALAC comme AAC : une profondeur connue
+/// désigne l'ALAC (sans perte), son absence l'AAC.
+pub fn annonce_pour(flux: &FluxServi<'_>) -> Result<AnnonceStrm, String> {
+    let mime = flux.mime_type.trim().to_ascii_lowercase();
+    let essence = mime.split(';').next().unwrap_or("").trim();
+    let famille = famille_du_mime(essence, flux.bit_depth)
+        .or_else(|| famille_de_l_extension(flux.url, flux.bit_depth))
+        .ok_or_else(|| format!("format du flux inconnu (MIME « {} »)", flux.mime_type))?;
+    match famille {
+        Famille::Compresse(codec) => Ok(AnnonceStrm {
+            format: FormatStrm::compresse(codec),
+            tranche: None,
+        }),
+        Famille::PcmBrut(bits) => {
+            let parametre = |nom: &str| -> Option<u32> {
+                mime.split(';').skip(1).find_map(|p| {
+                    let (cle, valeur) = p.split_once('=')?;
+                    if cle.trim() == nom {
+                        valeur.trim().parse().ok()
+                    } else {
+                        None
+                    }
+                })
+            };
+            let frequence = parametre("rate")
+                .or(flux.sample_rate)
+                .ok_or("PCM brut : fréquence inconnue")?;
+            let canaux = parametre("channels")
+                .or(flux.channels)
+                .ok_or("PCM brut : nombre de canaux inconnu")?;
+            let champs = entete_pcm::coder_pcm(frequence, bits, canaux, true)?;
+            Ok(AnnonceStrm {
+                format: FormatStrm::pcm(champs),
+                tranche: None,
+            })
+        }
+        Famille::Wav | Famille::Aiff => {
+            let est_wav = matches!(famille, Famille::Wav);
+            let chemin = flux
+                .file_path
+                .map(std::path::Path::new)
+                .ok_or("PCM : aucun fichier source, en-tête inconnu")?;
+            let extension = chemin
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            let extension_attendue = if est_wav {
+                extension == "wav"
+            } else {
+                matches!(extension.as_str(), "aif" | "aiff" | "aifc")
+            };
+            let taille_disque = std::fs::metadata(chemin).ok().map(|m| m.len());
+            if !extension_attendue || taille_disque.is_none() || flux.file_size != taille_disque {
+                return Err("PCM : le flux servi n'est pas le fichier source tel quel, \
+                     son en-tête est inconnu"
+                    .into());
+            }
+            let entete = if est_wav {
+                entete_pcm::lire_wav(chemin)?
+            } else {
+                entete_pcm::lire_aiff(chemin)?
+            };
+            let champs = entete.champs()?;
+            Ok(AnnonceStrm {
+                format: FormatStrm::pcm(champs),
+                tranche: Some((entete.debut, entete.fin())),
+            })
+        }
+    }
+}
+
 /// Build a `strm s` (start-stream) message telling the player to fetch and play
 /// an HTTP stream from this server. `server_ip = 0` tells the player to reuse the
 /// server IP of its control connection (i.e. Tune), so we only need the HTTP port
-/// and the request path. FLAC is self-describing, so the PCM fields are `'?'`.
-pub fn build_strm_start(server_port: u16, http_path: &str) -> ServerMessage {
-    let mut p = Vec::with_capacity(23 + http_path.len() + 20);
+/// and the request path. `annonce` carries the codec actually served and, for
+/// PCM, the byte range of the samples, requested by `Range` exactly like LMS
+/// (`Slim/Player/Protocols/HTTP.pm`) : Squeezelite sends this request verbatim
+/// (`stream.c`, `send_header`) and never strips a WAV/AIFF header itself on
+/// an HTTP stream (#6475).
+pub fn build_strm_start(server_port: u16, http_path: &str, annonce: AnnonceStrm) -> ServerMessage {
+    let format = annonce.format;
+    let mut p = Vec::with_capacity(23 + http_path.len() + 64);
     p.push(b'1'); // autostart: play as soon as buffered
-    p.push(b'f'); // format: FLAC
-    p.push(b'?'); // pcm_sample_size (self-describing)
-    p.push(b'?'); // pcm_sample_rate
-    p.push(b'?'); // pcm_channels
-    p.push(b'?'); // pcm_endian
+    p.push(format.codec);
+    p.push(format.taille); // pcm_sample_size
+    p.push(format.frequence); // pcm_sample_rate
+    p.push(format.canaux); // pcm_channels
+    p.push(format.boutisme); // pcm_endian
     p.push(0); // threshold (KB) before autostart
     p.push(0); // spdif_enable
     p.push(0); // transition_period
@@ -433,7 +640,11 @@ pub fn build_strm_start(server_port: u16, http_path: &str) -> ServerMessage {
     p.extend_from_slice(&server_port.to_be_bytes()); // server_port
     p.extend_from_slice(&0u32.to_be_bytes()); // server_ip = 0 → reuse control server
     // The HTTP request the player issues to fetch the stream.
-    p.extend_from_slice(format!("GET {http_path} HTTP/1.0\r\n\r\n").as_bytes());
+    let range = match annonce.tranche {
+        Some((debut, fin)) => format!("Range: bytes={debut}-{fin}\r\n"),
+        None => String::new(),
+    };
+    p.extend_from_slice(format!("GET {http_path} HTTP/1.0\r\n{range}\r\n").as_bytes());
     ServerMessage::Strm {
         command: b's',
         payload: p,
@@ -987,7 +1198,11 @@ impl SlimProtoServer {
     }
 
     /// Handle a single client connection.
-    async fn handle_client(&self, mut stream: TcpStream, peer: SocketAddr) -> Result<(), String> {
+    pub(crate) async fn handle_client(
+        &self,
+        mut stream: TcpStream,
+        peer: SocketAddr,
+    ) -> Result<(), String> {
         // Non-destructively peek the first bytes so an unusual handshake framing
         // is visible in the log. Tune expects `[len:2][tag:4][payload]`; if a
         // client (Progman's slim2diretta) uses a different framing, read_message

@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::state::AppState;
 
-const SUPPORTED_LOCALES: &[&str] = &["en", "fr", "de", "es", "it", "zh", "ko", "ja"];
+const SUPPORTED_LOCALES: &[&str] = &["en", "fr", "de", "es", "it", "zh", "ko", "ja", "hu", "vi"];
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -673,6 +673,117 @@ fn get_translations(locale: &str) -> Value {
                 "finish": "\u{5b8c}\u{4e86}",
             },
         }),
+        "hu" => json!({
+            "common": {
+                "play": "Lejátszás",
+                "pause": "Szünet",
+                "stop": "Leállítás",
+                "next": "Következő",
+                "previous": "Előző",
+                "search": "Keresés",
+                "settings": "Beállítások",
+                "library": "Gyűjtemény",
+                "artists": "Előadók",
+                "albums": "Albumok",
+                "tracks": "Számok",
+                "genres": "Műfajok",
+                "playlists": "Lejátszási listák",
+                "radios": "Rádiók",
+                "queue": "Lejátszási sor",
+                "favorites": "Kedvencek",
+                "history": "Előzmények",
+                "volume": "Hangerő",
+            },
+            "settings": {
+                "title": "Beállítások",
+                "musicDirs": "Zenei mappák",
+                "streaming": "Streamingszolgáltatások",
+                "zones": "Lejátszási zónák",
+                "system": "Rendszer",
+            },
+            "onboarding": {
+                "welcome": "Üdvözli a Tune!",
+                "addMusic": "Zene hozzáadása",
+                "connectStreaming": "Streamingszolgáltatások csatlakoztatása",
+                "setupZones": "Lejátszási zónák beállítása",
+                "createProfile": "Profil létrehozása",
+                "complete": "A beállítás kész!",
+                "skip": "Kihagyás",
+                "next": "Tovább",
+                "finish": "Kész",
+            },
+        }),
+        "vi" => json!({
+            "common": {
+                "play": "Phát",
+                "pause": "Tạm dừng",
+                "stop": "Dừng",
+                "next": "Tiếp theo",
+                "previous": "Trước",
+                "search": "Tìm kiếm",
+                "settings": "Cài đặt",
+                "library": "Thư viện",
+                "artists": "Nghệ sĩ",
+                "albums": "Album",
+                "tracks": "Bài hát",
+                "genres": "Thể loại",
+                "playlists": "Danh sách phát",
+                "radios": "Đài",
+                "queue": "Hàng đợi",
+                "favorites": "Yêu thích",
+                "history": "Lịch sử",
+                "volume": "Âm lượng",
+            },
+            "settings": {
+                "title": "Cài đặt",
+                "musicDirs": "Thư mục nhạc",
+                "streaming": "Dịch vụ streaming",
+                "zones": "Vùng phát",
+                "system": "Hệ thống",
+            },
+            "onboarding": {
+                "welcome": "Chào mừng bạn đến với Tune!",
+                "addMusic": "Thêm nhạc",
+                "connectStreaming": "Kết nối dịch vụ streaming",
+                "setupZones": "Thiết lập vùng phát",
+                "createProfile": "Tạo hồ sơ",
+                "complete": "Thiết lập hoàn tất!",
+                "skip": "Bỏ qua",
+                "next": "Tiếp",
+                "finish": "Hoàn tất",
+            },
+        }),
         _ => json!({}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SUPPORTED_LOCALES, get_translations, parse_accept_language};
+
+    /// Chaque locale annoncée par `/locales` a ses textes : une locale listée
+    /// sans bloc rendrait `{}` puis le repli anglais.
+    ///
+    /// Contre-épreuve : retirer le bloc `"vi"` de `get_translations` fait
+    /// rougir ce test sur «vi».
+    #[test]
+    fn chaque_locale_annoncee_a_ses_textes() {
+        for locale in SUPPORTED_LOCALES {
+            let t = get_translations(locale);
+            for ns in ["common", "settings", "onboarding"] {
+                assert!(
+                    t[ns].as_object().is_some_and(|o| !o.is_empty()),
+                    "«{locale}» n'a pas d'espace «{ns}»"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn le_hongrois_et_le_vietnamien_sont_detectes() {
+        assert_eq!(parse_accept_language("hu-HU,hu;q=0.9"), "hu");
+        assert_eq!(parse_accept_language("vi-VN,vi;q=0.9,en;q=0.5"), "vi");
+        assert_eq!(get_translations("vi")["settings"]["zones"], "Vùng phát");
+        assert_eq!(parse_accept_language("pt-BR"), "en");
     }
 }

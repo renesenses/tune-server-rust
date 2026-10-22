@@ -39,6 +39,10 @@ pub const CODE_APRES_PLANTAGE: &str = "asio_scan_blocked_after_crash";
 /// PAS contourner un coupe-circuit posé par l'exploitant.
 pub const CODE_PAR_ENVIRONNEMENT: &str = "asio_scan_disabled_by_env";
 
+/// #6452 — ASIO est écarté de CE démarrage parce que le précédent n'a pas
+/// atteint `listening`. Rien à réarmer : le démarrage suivant le retente seul.
+pub const CODE_DEMARRAGE_INACHEVE: &str = "asio_skipped_after_unfinished_boot";
+
 /// Préfixe de la sentinelle portée par `Err(String)` jusqu'à la route HTTP.
 ///
 /// Volontairement DISJOINT de `zone_output_unavailable:` — le caractère qui
@@ -59,6 +63,9 @@ pub enum MotifDeBlocage {
     ApresPlantage,
     /// `TUNE_DISABLE_ASIO_SCAN` est armée.
     ParEnvironnement,
+    /// #6452 — le démarrage précédent n'a pas abouti (témoin
+    /// `demarrage.pending`) : ce démarrage-ci se fait sur l'hôte par défaut.
+    DemarrageInacheve,
 }
 
 impl MotifDeBlocage {
@@ -68,6 +75,7 @@ impl MotifDeBlocage {
         match self {
             Self::ApresPlantage => CODE_APRES_PLANTAGE,
             Self::ParEnvironnement => CODE_PAR_ENVIRONNEMENT,
+            Self::DemarrageInacheve => CODE_DEMARRAGE_INACHEVE,
         }
     }
 
@@ -82,6 +90,7 @@ impl MotifDeBlocage {
         match brut {
             1 => Some(Self::ApresPlantage),
             2 => Some(Self::ParEnvironnement),
+            3 => Some(Self::DemarrageInacheve),
             _ => None,
         }
     }
@@ -90,6 +99,7 @@ impl MotifDeBlocage {
         match self {
             Self::ApresPlantage => 1,
             Self::ParEnvironnement => 2,
+            Self::DemarrageInacheve => 3,
         }
     }
 }
@@ -131,6 +141,13 @@ impl BlocageAsio {
                 "{cible} n'a pas pu être cherchée : le balayage ASIO est désactivé par la \
                  variable d'environnement TUNE_DISABLE_ASIO_SCAN{temoin}. Retirez-la puis \
                  redémarrez Tune, ou choisissez une sortie WASAPI dans les réglages de la zone."
+            ),
+            MotifDeBlocage::DemarrageInacheve => format!(
+                "{cible} n'a pas pu être cherchée. {}{temoin}. Tune a démarré cette fois sur \
+                 l'hôte audio par défaut, sans modifier votre choix d'ASIO ; il retentera ASIO \
+                 au prochain démarrage. En attendant, vous pouvez choisir le même appareil sous \
+                 WASAPI dans les réglages de la zone.",
+                crate::demarrage_inacheve::DETAIL
             ),
         }
     }
@@ -238,7 +255,10 @@ pub fn blocage_expliquant_un_parc_de_repli() -> Option<BlocageAsio> {
 pub fn depuis_sentinelle(message: &str) -> Option<(&str, &str)> {
     let reste = message.strip_prefix(PREFIXE_SENTINELLE)?;
     let (code, phrase) = reste.split_once(':')?;
-    if code != CODE_APRES_PLANTAGE && code != CODE_PAR_ENVIRONNEMENT {
+    if code != CODE_APRES_PLANTAGE
+        && code != CODE_PAR_ENVIRONNEMENT
+        && code != CODE_DEMARRAGE_INACHEVE
+    {
         return None;
     }
     Some((code, phrase))
@@ -356,6 +376,29 @@ mod tests {
             depuis_sentinelle(&format!("{PREFIXE_SENTINELLE}autre_chose:bla")),
             None
         );
+    }
+
+    /// #6452 — le refus d'une zone ASIO sous le repli de démarrage dit la
+    /// cause, ne propose pas de réarmer, et se relit.
+    #[test]
+    fn le_demarrage_inacheve_se_dit_dans_le_refus() {
+        let etat = EtatDeBlocage::default();
+        etat.bloquer(MotifDeBlocage::DemarrageInacheve, None);
+        etat.noter_repli_wasapi_apres_blocage();
+        let blocage = etat.blocage_expliquant_un_parc_de_repli().unwrap();
+        assert_eq!(blocage.motif, MotifDeBlocage::DemarrageInacheve);
+        assert!(!blocage.motif.peut_rearmer());
+        assert!(!code_rearmable(CODE_DEMARRAGE_INACHEVE));
+        let message = blocage.message_fr(Some("ASIO4ALL v2"), "Salon");
+        assert!(
+            message.contains("ASIO non utilisé : le démarrage précédent n'a pas abouti"),
+            "{message}"
+        );
+        assert!(!message.contains("Réarmez"), "{message}");
+        let sentinelle = blocage.sentinelle(&message);
+        let (code, relu) = depuis_sentinelle(&sentinelle).unwrap();
+        assert_eq!(code, CODE_DEMARRAGE_INACHEVE);
+        assert_eq!(relu, message);
     }
 
     /// La route de réarmement est celle qui est MONTÉE : le segment `audio`

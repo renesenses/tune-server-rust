@@ -21,7 +21,12 @@
 //!   `hmac`, `serial`, `username`…) écrites `clé=valeur`, `clé: valeur` ou en
 //!   JSON, les en-têtes `Bearer`/`Basic`, les JWT → [`MASQUE`] ;
 //! - la partie propre à l'appareil des adresses MAC : le préfixe constructeur
-//!   (OUI) reste, c'est lui qui identifie le matériel ;
+//!   (OUI) reste, c'est lui qui identifie le matériel. Quel que soit le format :
+//!   `aa:bb:cc:dd:ee:ff`, `aa-bb-…`, `aabb.ccdd.eeff`, les douze chiffres collés
+//!   en fin d'identifiant ou de nom (`airplay-aabbccddeeff`, `Salon_aabbccddeeff`),
+//!   l'identifiant d'interface EUI-64 d'une IPv6 (`…:aabb:ccff:fedd:eeff`), et
+//!   le dernier groupe des identifiants UPnP (UDN `uuid:…`, USN, `udn:…`), où la
+//!   convention UPnP range la MAC de l'appareil (voir [`RE_IDENTIFIANT`]) ;
 //! - le nom de l'utilisateur local du système, là où il apparaît en toutes
 //!   lettres (nom de machine « MacBook-de-<nom> », nom de serveur…).
 //!
@@ -143,6 +148,117 @@ static RE_MAC_TIRETS: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 
+/// MAC à points, à la Cisco : `aabb.ccdd.eeff`.
+static RE_MAC_POINTS: LazyLock<Regex> =
+    LazyLock::new(|| re(r"(?i-u)\b([0-9a-f]{4})\.([0-9a-f]{2})[0-9a-f]{2}\.[0-9a-f]{4}\b"));
+
+/// Identifiant d'interface EUI-64 d'une adresse IPv6 (lien-local, SLAAC) : la
+/// MAC y est recopiée, `ff:fe` inséré au milieu — `aabb:ccff:fedd:eeff`.
+static RE_MAC_EUI64: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"(?i-u)\b([0-9a-f]{1,4}):([0-9a-f]{0,2}ff):fe[0-9a-f]{2}:[0-9a-f]{1,4}\b")
+});
+
+/// Sonos : `RINCON_<MAC><port>` — la MAC est suivie du port, sans séparateur.
+static RE_MAC_SONOS: LazyLock<Regex> =
+    LazyLock::new(|| re(r"(?i-u)\b(RINCON_[0-9a-f]{6})[0-9a-f]{6}"));
+
+/// Les identifiants qui portent une MAC sans séparateur, en une seule passe
+/// (l'ordre des branches compte, la première qui démarre le plus à gauche
+/// l'emporte) :
+///
+/// 1. `uuid:<id>` / `udn:<id>` — UDN, USN (`uuid:<id>::urn:…`), clé d'appareil.
+///    La convention UPnP met la MAC de l'appareil dans le dernier groupe de
+///    l'UDN (MiniDLNA, la plupart des lecteurs réseau). On ne peut pas savoir,
+///    à la lecture, si ce groupe est une MAC ou du hasard : on masque donc TOUT
+///    groupe de douze chiffres hexadécimaux ou plus d'un UDN. Le préfixe
+///    constructeur reste, comme pour une MAC écrite en clair.
+/// 2. Un UUID nu `8-4-4-4-12` (un UDN dont le préfixe a été retiré, un nom de
+///    zone retombé sur l'identifiant). Il est gardé intact s'il est aléatoire
+///    ou haché au sens de la RFC 9562 (versions 3, 4, 5, 7, variante `8`–`b`) :
+///    par construction il ne contient pas de MAC, et ce sont les identifiants
+///    de Tune lui-même, utiles au diagnostic. Tout autre UUID — version 1, dont
+///    le dernier groupe EST la MAC, ou forme fantaisiste de constructeur — voit
+///    son dernier groupe masqué.
+/// 3. Douze chiffres hexadécimaux en fin de mot : `airplay-aabbccddeeff`,
+///    `mac:aabbccddeeff`, `Salon_aabbccddeeff`, `esp-aabbccddeeff.local`,
+///    `Lecteuraabbccddeeff`. Restent intacts : une suite plus longue de
+///    chiffres hexadécimaux (empreinte, identifiant Chromecast de 32 chiffres),
+///    et douze chiffres DÉCIMAUX (un horodatage, un identifiant de piste), plus
+///    probables qu'une MAC qui n'aurait aucune lettre.
+///
+/// Toutes ces expressions sont en ASCII (`-u`) : les découpes par octet de
+/// [`masque_identifiant`] ne peuvent pas tomber au milieu d'un caractère.
+static RE_IDENTIFIANT: LazyLock<Regex> = LazyLock::new(|| {
+    re(concat!(
+        r"(?i-u)\b(?:uuid|udn):([0-9a-z_-]+)",
+        r"|\b[0-9a-f]{8}-[0-9a-f]{4}-([0-9a-f])[0-9a-f]{3}-([0-9a-f])[0-9a-f]{3}-[0-9a-f]{12}\b",
+        r"|\b[0-9a-z_]*[0-9a-f]{12}\b",
+    ))
+});
+
+/// Ce qui remplace les six derniers chiffres d'une MAC sans séparateur.
+const MASQUE_MAC_COLLEE: &str = "xxxxxx";
+
+/// Les douze chiffres qui terminent `mot`, masqués s'ils ressemblent à une MAC.
+fn masque_fin_de_mot(mot: &str) -> String {
+    let coupe = mot.len() - 12;
+    let (debut, fin) = mot.split_at(coupe);
+    let avant = debut.chars().last();
+    // Un chiffre hexadécimal juste avant : la suite fait plus de douze
+    // chiffres, ce n'est pas une MAC (empreinte, identifiant Chromecast).
+    let suite_plus_longue = avant.is_some_and(|c| c.is_ascii_hexdigit());
+    if suite_plus_longue || fin.bytes().all(|b| b.is_ascii_digit()) {
+        return mot.to_string();
+    }
+    format!("{debut}{}{MASQUE_MAC_COLLEE}", &fin[..6])
+}
+
+/// Dans un UDN, chaque suite d'au moins douze chiffres hexadécimaux perd ses
+/// six derniers chiffres.
+fn masque_udn(id: &str) -> String {
+    let mut sortie = String::with_capacity(id.len());
+    let mut suite = String::new();
+    let vide = |suite: &mut String, sortie: &mut String| {
+        if suite.len() >= 12 {
+            sortie.push_str(&suite[..suite.len() - 6]);
+            sortie.push_str(MASQUE_MAC_COLLEE);
+        } else {
+            sortie.push_str(suite);
+        }
+        suite.clear();
+    };
+    for c in id.chars() {
+        if c.is_ascii_hexdigit() {
+            suite.push(c);
+        } else {
+            vide(&mut suite, &mut sortie);
+            sortie.push(c);
+        }
+    }
+    vide(&mut suite, &mut sortie);
+    sortie
+}
+
+fn masque_identifiant(c: &Captures) -> String {
+    let tout = &c[0];
+    if let Some(id) = c.get(1) {
+        let prefixe = &tout[..id.start() - c.get(0).map_or(0, |m| m.start())];
+        return format!("{prefixe}{}", masque_udn(id.as_str()));
+    }
+    if let (Some(version), Some(variante)) = (c.get(2), c.get(3)) {
+        let aleatoire = matches!(version.as_str(), "3" | "4" | "5" | "7")
+            && matches!(
+                variante.as_str().to_ascii_lowercase().as_str(),
+                "8" | "9" | "a" | "b"
+            );
+        if aleatoire {
+            return tout.to_string();
+        }
+        return format!("{}{MASQUE_MAC_COLLEE}", &tout[..tout.len() - 6]);
+    }
+    masque_fin_de_mot(tout)
+}
+
 /// Noms de compte génériques : les masquer effacerait des mots du diagnostic
 /// (« tune », « music », « fedora ») sans rien protéger.
 const COMPTES_GENERIQUES: &[&str] = &[
@@ -244,6 +360,17 @@ pub fn anonymiser_avec(texte: &str, utilisateur: Option<&str>) -> String {
     });
     let t = RE_MAC_DEUX_POINTS.replace_all(&t, "$1:$2:$3:xx:xx:xx");
     let t = RE_MAC_TIRETS.replace_all(&t, "$1-$2-$3-xx-xx-xx");
+    let t = RE_MAC_POINTS.replace_all(&t, |c: &Captures| {
+        if c[0].bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+            // `2026.1019.1234` : des chiffres, pas une MAC.
+            c[0].to_string()
+        } else {
+            format!("{}.{}xx.xxxx", &c[1], &c[2])
+        }
+    });
+    let t = RE_MAC_EUI64.replace_all(&t, "$1:$2:fexx:xxxx");
+    let t = RE_MAC_SONOS.replace_all(&t, format!("${{1}}{MASQUE_MAC_COLLEE}"));
+    let t = RE_IDENTIFIANT.replace_all(&t, masque_identifiant);
     let mut t = t.into_owned();
     if let Some(nom) = utilisateur
         .map(str::trim)
@@ -403,6 +530,106 @@ mod tests {
         assert_eq!(nettoie("00-1a-2b-3c-4d-5e"), "00-1a-2b-xx-xx-xx");
         // Une heure n'est pas une MAC.
         assert_eq!(nettoie("12:34:56"), "12:34:56");
+    }
+
+    /// Une MAC sort masquée quel que soit son format, constructeur gardé.
+    /// Toutes les adresses sont fabriquées pour l'épreuve.
+    #[test]
+    fn mac_masquee_dans_tous_les_formats() {
+        for (entree, attendu) in [
+            ("aabb.ccdd.eeff", "aabb.ccxx.xxxx"),
+            ("AABB.CCDD.EEFF", "AABB.CCxx.xxxx"),
+            ("id=airplay-A0B1C2D3E4F5", "id=airplay-A0B1C2xxxxxx"),
+            ("mac:a0b1c2d3e4f5", "mac:a0b1c2xxxxxx"),
+            ("Salon_a0b1c2d3e4f5", "Salon_a0b1c2xxxxxx"),
+            (
+                "Lecteur-A0B1C2D3E4F5 en ligne",
+                "Lecteur-A0B1C2xxxxxx en ligne",
+            ),
+            ("hote esp-a0b1c2d3e4f5.local", "hote esp-a0b1c2xxxxxx.local"),
+            ("Lecteura0b1c2d3e4f5", "Lecteura0b1c2xxxxxx"),
+            (
+                "fe80::a2b1:c2ff:fed3:e4f5%en0",
+                "fe80::a2b1:c2ff:fexx:xxxx%en0",
+            ),
+            (
+                "uuid:RINCON_A0B1C2D3E4F501400_MR",
+                "uuid:RINCON_A0B1C2xxxxxx01400_MR",
+            ),
+        ] {
+            assert_eq!(nettoie(entree), attendu, "entrée : {entree}");
+        }
+    }
+
+    /// Le dernier groupe d'un UDN porte la MAC de l'appareil (convention
+    /// UPnP) : il est masqué dans l'UDN, l'USN et la clé d'appareil `udn:`.
+    #[test]
+    fn mac_masquee_dans_les_identifiants_upnp() {
+        for (entree, attendu) in [
+            (
+                "<UDN>uuid:4d696e69-444c-164e-9d41-a0b1c2d3e4f5</UDN>",
+                "<UDN>uuid:4d696e69-444c-164e-9d41-a0b1c2xxxxxx</UDN>",
+            ),
+            (
+                "USN: uuid:5F9EC1B3-ED59-79BB-4530-A0B1C2D3E4F5::urn:schemas-upnp-org:device:MediaRenderer:1",
+                "USN: uuid:5F9EC1B3-ED59-79BB-4530-A0B1C2xxxxxx::urn:schemas-upnp-org:device:MediaRenderer:1",
+            ),
+            // Même un UDN d'allure aléatoire : à la lecture, rien ne dit que
+            // son dernier groupe n'est pas une MAC.
+            (
+                "zone uuid:0f8fad5b-d9cb-469f-a165-a0b1c2d3e4f5",
+                "zone uuid:0f8fad5b-d9cb-469f-a165-a0b1c2xxxxxx",
+            ),
+            (
+                "cle=udn:0f8fad5b-d9cb-469f-a165-a0b1c2d3e4f5",
+                "cle=udn:0f8fad5b-d9cb-469f-a165-a0b1c2xxxxxx",
+            ),
+            (
+                "uuid:0f8fad5bd9cb469fa165a0b1c2d3e4f5",
+                "uuid:0f8fad5bd9cb469fa165a0b1c2xxxxxx",
+            ),
+            // UDN sans préfixe, version 1 : le dernier groupe est la MAC.
+            (
+                "Renderer 4d696e69-444c-164e-9d41-a0b1c2d3e4f5",
+                "Renderer 4d696e69-444c-164e-9d41-a0b1c2xxxxxx",
+            ),
+            // Forme de constructeur hors RFC.
+            (
+                "5f9ec1b3-ed59-79bb-4530-a0b1c2d3e4f5",
+                "5f9ec1b3-ed59-79bb-4530-a0b1c2xxxxxx",
+            ),
+        ] {
+            assert_eq!(nettoie(entree), attendu, "entrée : {entree}");
+        }
+    }
+
+    /// Ce qui ne porte pas de MAC reste intact : UUID aléatoires ou hachés
+    /// (ceux de Tune), empreintes, nombres, adresses du réseau local.
+    #[test]
+    fn identifiants_sans_mac_intacts() {
+        for texte in [
+            "zone_id=0f8fad5b-d9cb-469f-a165-70867728950e",
+            "session 017f22e2-79b0-7cc3-98c4-dc0c0c07398f",
+            "nom 6fa459ea-ee8a-3ca4-894e-db77e160355e",
+            "sha1 da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            "chromecast-0123456789abcdef0123456789abcdef",
+            "track_id=123456789012",
+            "build 2026.1019.1234",
+            "192.168.1.20:9790 fe80::1%en0",
+            "12:34:56",
+        ] {
+            assert_eq!(nettoie(texte), texte);
+        }
+    }
+
+    #[test]
+    fn identifiants_upnp_idempotents() {
+        let une = nettoie(
+            "uuid:4d696e69-444c-164e-9d41-a0b1c2d3e4f5 airplay-a0b1c2d3e4f5 \
+             aabb.ccdd.eeff fe80::a2b1:c2ff:fed3:e4f5 RINCON_A0B1C2D3E4F501400",
+        );
+        assert!(!une.contains("d3e4f5"), "{une}");
+        assert_eq!(nettoie(&une), une);
     }
 
     #[test]

@@ -60,6 +60,43 @@ const fn nombre(sql: &'static str) -> Colonne {
     }
 }
 
+/// #6124 — la VERSION d'une piste (balise `VERSION` : original, réédition,
+/// remaster…), rangée au scan dans `track_metadata` et non dans `tracks`.
+/// Sous-requête corrélée sur la clé primaire `(track_id, key)` ; alias `t`
+/// imposé. Partagée par les playlists et les collections.
+pub(crate) const SQL_VERSION_DE_LA_PISTE: &str =
+    "(SELECT tmv.value FROM track_metadata tmv WHERE tmv.track_id = t.id AND tmv.key = 'version')";
+
+/// #6232 (forum 2218) — l'INTERPRÈTE d'une piste : la balise ARTIST du
+/// fichier (`track_metadata['track_artist']`, écrite au scan), à défaut
+/// l'artiste de la piste en base (`t.artist_id`).
+///
+/// Pourquoi la balise : sur un album ordinaire, le scan donne à chaque piste
+/// l'artiste de l'ALBUM. « The Beatles & Genesis » écrit sur une piste d'un
+/// album des Beatles n'était donc lisible nulle part, et aucune règle ne
+/// trouvait Genesis.
+///
+/// Pourquoi le repli : une piste lue avant cette clé n'a pas la balise en
+/// base. Son artiste est alors l'interprète connu — celui de l'album pour un
+/// album ordinaire, celui de la piste pour une compilation.
+///
+/// 🔴 Une piste dont l'artiste a été CORRIGÉ dans Tune (champ tenu,
+/// `champs_tenus`, où `artist_id` / `artist_name` ne sont écrits que s'ils
+/// sont tenus) lit la base, pas la balise : la correction l'emporte sur le
+/// fichier, comme partout ailleurs.
+///
+/// Sous-requêtes corrélées sur la clé primaire `(track_id, key)` et sur
+/// `artists.id` ; alias `t` imposé. Partagée par les playlists et les
+/// collections.
+pub(crate) const SQL_INTERPRETE_DE_LA_PISTE: &str = "COALESCE(\
+     CASE WHEN EXISTS (SELECT 1 FROM track_metadata tmh WHERE tmh.track_id = t.id \
+       AND tmh.key = 'champs_tenus' \
+       AND (tmh.value LIKE '%\"artist_id\"%' OR tmh.value LIKE '%\"artist_name\"%')) \
+     THEN NULL \
+     ELSE NULLIF((SELECT tmi.value FROM track_metadata tmi WHERE tmi.track_id = t.id \
+       AND tmi.key = 'track_artist'), '') END, \
+     (SELECT tai.name FROM artists tai WHERE tai.id = t.artist_id))";
+
 /// Le vocabulaire des PISTES (playlists intelligentes).
 ///
 /// Les alias sont délibérés : l'éditeur web écrit `artist`, d'anciennes
@@ -70,7 +107,18 @@ pub(crate) fn colonne_piste(champ: &str) -> Option<Colonne> {
         "title" | "track_title" => texte("t.title"),
         "artist" | "artist_name" => texte("ar.name"),
         "album" | "album_title" => texte("al.title"),
-        "album_artist" => texte("t.album_artist"),
+        // #6121 (forum 2218) — la balise ALBUMARTIST de la piste, et à
+        // défaut l'artiste de son ALBUM : une piste sans la balise appartient
+        // quand même à l'album de quelqu'un. `ar` est ici l'interprète de la
+        // piste (`t.artist_id`), d'où la sous-requête sur `al.artist_id`.
+        "album_artist" => texte(
+            "COALESCE(NULLIF(t.album_artist, ''), \
+             (SELECT aal.name FROM artists aal WHERE aal.id = al.artist_id))",
+        ),
+        // #6232 — « Interprète » : la balise ARTIST de la piste, distincte de
+        // « Artiste » (`ar.name`, l'artiste rangé en base, qui est celui de
+        // l'album sur un album ordinaire).
+        "track_artist" => texte(SQL_INTERPRETE_DE_LA_PISTE),
         "genre" => texte("t.genre"),
         // 🔴 Le champ que l'éditeur proposait et que le moteur ignorait
         // ENTIÈREMENT : neuf opérateurs, aucun bras.
@@ -91,6 +139,15 @@ pub(crate) fn colonne_piste(champ: &str) -> Option<Colonne> {
         "track_number" => nombre("t.track_number"),
         "disc_number" => nombre("t.disc_number"),
         "bpm" => nombre("t.bpm"),
+        // #6123 — la note de la piste lue dans ses balises (0 à 5, sans
+        // profil). `rating`, lui, reste la note de l'ALBUM du profil actif
+        // (`condition_note`).
+        "track_rating" => nombre("t.rating"),
+        // #6124 — l'année de sortie ORIGINALE, celle de l'album de la piste
+        // (`albums.original_year`, mêmes colonnes que `build_album_query`) ;
+        // la VERSION, balise de la piste rangée dans `track_metadata`.
+        "original_year" => nombre("al.original_year"),
+        "version" => texte(SQL_VERSION_DE_LA_PISTE),
         // #5547 — deux critères d'ALBUM que les collections offraient et que
         // les playlists refusaient (condition FAUSSE). Au niveau de la piste,
         // c'est l'album de la piste qui répond : « albums de 12 pistes » rend
@@ -117,20 +174,84 @@ pub(crate) fn texte_de(valeur: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// Une date de règle en SQL : les formes relatives `now-90d`, `90d`, `90`
-/// valent « il y a N jours » ; tout le reste est une date littérale.
+/// #6143 — l'instant que désigne une date de règle, calculé en RUST.
 ///
-/// Sortie de `smart_collections` (#5547) sans un caractère changé, pour que
-/// les playlists lisent une date comme les collections.
-pub(crate) fn horodatage_sql(input: &str) -> String {
-    // Relative forms: "now-90d", "90d", "90" — N days ago. The seeded
-    // "🆕 Récents" collection stores the bare "90d" form, which used to fall
-    // through to a literal string ('90d') that no date ever compares against.
+/// Les formes relatives `now-90d`, `90d`, `90` valent « il y a N jours » à
+/// l'horloge `maintenant` (la collection « 🆕 Récents » enregistre la forme
+/// nue `90d`). Sinon, une date ISO : `AAAA-MM-JJ`, avec ou sans heure, lue en
+/// UTC comme le faisait `DATETIME(…, 'unixepoch')`. `None` si illisible.
+///
+/// Ces formes passaient par `DATETIME('now', '-N days')` et
+/// `DATETIME(t.file_mtime, 'unixepoch')`, deux écritures propres à SQLite :
+/// sur PostgreSQL, toute règle « après », « avant » ou « entre » faisait
+/// tomber l'aperçu. Comme `in_last` (#6141), la borne est désormais un
+/// LITTÉRAL que les deux moteurs comparent de la même façon.
+/// Le N d'une date relative `now-Nd`, `Nd` ou `N` ; `None` pour toute autre
+/// écriture. Un N hors d'échelle reste borné (30 jours s'il ne se lit pas).
+fn jours_relatifs(input: &str) -> Option<i64> {
     let rest = input.strip_prefix("now-").unwrap_or(input);
     let digits = rest.strip_suffix('d').unwrap_or(rest);
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-        let days: i64 = digits.parse().unwrap_or(30);
-        return format!("DATETIME('now', '-{days} days')");
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(digits.parse::<i64>().unwrap_or(30).min(JOURS_MAX))
+}
+
+pub(crate) fn instant_de(
+    input: &str,
+    maintenant: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let brut = input.trim();
+    if let Some(jours) = jours_relatifs(brut) {
+        return Some(maintenant - chrono::Duration::days(jours));
+    }
+    if let Ok(d) = chrono::DateTime::parse_from_rfc3339(brut) {
+        return Some(d.with_timezone(&chrono::Utc));
+    }
+    for format in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
+    ] {
+        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(brut, format) {
+            return Some(d.and_utc());
+        }
+    }
+    chrono::NaiveDate::parse_from_str(brut, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|d| d.and_utc())
+}
+
+/// Une date de règle en secondes depuis l'époque : la forme de
+/// `tracks.file_mtime` (REAL sur SQLite, DOUBLE PRECISION sur PostgreSQL).
+/// `None` si la date est illisible — l'appelant pose alors une condition
+/// FAUSSE.
+pub(crate) fn horodatage_epoch(input: &str) -> Option<i64> {
+    instant_de(input, chrono::Utc::now()).map(|d| d.timestamp())
+}
+
+/// Les deux bornes d'une règle « entre » sur `file_mtime`, en secondes. Même
+/// lecture que [`bornes_de_dates`] ; `None` si la valeur n'est pas un tableau
+/// ou si une borne est illisible.
+pub(crate) fn bornes_epoch(valeur: Option<&serde_json::Value>) -> Option<(i64, i64)> {
+    let arr = valeur?.as_array()?;
+    let lo = arr.first().and_then(|v| v.as_str()).unwrap_or("2000-01-01");
+    let hi = arr.get(1).and_then(|v| v.as_str()).unwrap_or("2099-01-01");
+    Some((horodatage_epoch(lo)?, horodatage_epoch(hi)?))
+}
+
+/// Une date de règle en SQL TEXTE, pour `listen_history.listened_at` (ISO
+/// 8601 sur les deux moteurs) : une forme relative devient le littéral ISO
+/// d'« il y a N jours » (#6143, plus de `DATETIME('now', …)`) ; tout le reste
+/// est une date littérale, comparée telle quelle.
+///
+/// Sortie de `smart_collections` (#5547), pour que les playlists lisent une
+/// date comme les collections.
+pub(crate) fn horodatage_sql(input: &str) -> String {
+    if let Some(jours) = jours_relatifs(input) {
+        let d = chrono::Utc::now() - chrono::Duration::days(jours);
+        return format!("'{}'", d.format("%Y-%m-%dT%H:%M:%SZ"));
     }
     format!("'{}'", input.replace('\'', "''"))
 }
@@ -144,6 +265,58 @@ pub(crate) fn bornes_de_dates(valeur: Option<&serde_json::Value>) -> Option<(Str
     let lo = arr.first().and_then(|v| v.as_str()).unwrap_or("2000-01-01");
     let hi = arr.get(1).and_then(|v| v.as_str()).unwrap_or("2099-01-01");
     Some((horodatage_sql(lo), horodatage_sql(hi)))
+}
+
+/// #6122 (forum 2217) — l'opérateur « dans les N derniers jours » des dates :
+/// une durée GLISSANTE, là où « après » attend une date fixe.
+///
+/// La règle enregistre N, jamais une date : l'instant « il y a N jours » se lit
+/// à l'horloge à CHAQUE traduction, donc à chaque requête. Une collection
+/// « ajoutés dans les 30 derniers jours » avance seule avec le calendrier.
+pub(crate) const DANS_LES_DERNIERS_JOURS: &str = "in_last";
+
+/// Au-delà, la durée n'a plus de sens (et la date ne se calcule plus).
+const JOURS_MAX: i64 = 36_500;
+
+/// Le N d'une règle « dans les N derniers jours » : un entier STRICTEMENT
+/// positif, en nombre JSON ou en chiffres. `None` sinon — l'appelant pose
+/// alors une condition FAUSSE, jamais « pas de condition ».
+pub(crate) fn jours_de(valeur: Option<&serde_json::Value>) -> Option<i64> {
+    let n = match valeur? {
+        serde_json::Value::Number(n) => n.as_i64()?,
+        serde_json::Value::String(s) => s.trim().parse::<i64>().ok()?,
+        _ => return None,
+    };
+    (1..=JOURS_MAX).contains(&n).then_some(n)
+}
+
+/// L'instant « il y a N jours », sous les deux formes que la base compare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Seuil {
+    /// En secondes depuis l'époque : la forme de `tracks.file_mtime` (REAL
+    /// sur SQLite, DOUBLE PRECISION sur PostgreSQL).
+    pub epoch: i64,
+    /// En texte ISO 8601 UTC, entre apostrophes : la forme de
+    /// `listen_history.listened_at` (TEXT sur les deux moteurs).
+    pub iso: String,
+}
+
+/// Le seuil de N jours avant `maintenant`.
+///
+/// Des LITTÉRAUX, pas `DATETIME('now', …)` : cette écriture est propre à
+/// SQLite, et PostgreSQL la refuse. Un nombre et une chaîne ISO se comparent
+/// de la même façon sur les deux moteurs.
+pub(crate) fn seuil_jours(jours: i64, maintenant: chrono::DateTime<chrono::Utc>) -> Seuil {
+    let instant = maintenant - chrono::Duration::days(jours);
+    Seuil {
+        epoch: instant.timestamp(),
+        iso: format!("'{}'", instant.format("%Y-%m-%dT%H:%M:%SZ")),
+    }
+}
+
+/// Le seuil d'une règle « dans les N derniers jours », lu à l'horloge MAINTENANT.
+pub(crate) fn seuil_de(valeur: Option<&serde_json::Value>) -> Option<Seuil> {
+    jours_de(valeur).map(|n| seuil_jours(n, chrono::Utc::now()))
 }
 
 /// Les deux bornes d'une règle « entre » portant sur des NOMBRES.
@@ -275,8 +448,25 @@ pub(crate) fn normaliser_op(brut: &str) -> &str {
         "<" | "lt" => "<",
         "is_empty" | "empty" | "is_null" => "is_null",
         "is_not_empty" | "not_empty" | "is_not_null" => "is_not_null",
+        // #6250 — « ne contient pas ». `not_contains` est la graphie du vieux
+        // moteur de tune-core (`Operator::NotContains`).
+        "not_contains" | "does_not_contain" | "not_like" => NE_CONTIENT_PAS,
         autre => autre,
     }
+}
+
+/// #6250 — l'opérateur « ne contient pas », dans sa graphie canonique.
+pub(crate) const NE_CONTIENT_PAS: &str = "not_contains";
+
+/// #6250 — « ne contient pas » : le complément EXACT de « contient ».
+///
+/// 🔴 Une valeur ABSENTE ne contient rien, donc elle « ne contient pas » :
+/// une piste sans genre passe « genre ne contient pas Rock ». Sans le
+/// `IS NULL`, `NOT (NULL LIKE …)` vaut NULL en SQL et la piste disparaissait
+/// des DEUX listes — ni « contient », ni « ne contient pas ». La chaîne vide
+/// n'a pas besoin de cas : `'' LIKE '%x%'` est faux.
+pub(crate) fn ne_contient_pas(sql: &str, contient: &str) -> String {
+    format!("({sql} IS NULL OR NOT ({contient}))")
 }
 
 /// La condition SQL d'une règle, ou `None` si elle n'a pas de sens.
@@ -339,6 +529,10 @@ pub(crate) fn condition(col: Colonne, op: &str, valeur: &str) -> Option<String> 
         ">" => format!("{sql} > {}", entier()),
         "<=" => format!("{sql} <= {}", entier()),
         "<" => format!("{sql} < {}", entier()),
+        // #6250 — « ne contient pas » : le complément de « contient », sur le
+        // texte comme sur la forme textuelle d'un nombre. Les deux moteurs le
+        // perdaient : FAUX ici, règle ignorée aux collections.
+        NE_CONTIENT_PAS => ne_contient_pas(sql, &condition(col, "contains", valeur)?),
         _ => return None,
     })
 }
@@ -470,6 +664,52 @@ pub(crate) fn condition_marquage_ia_colonne(col: &str, op: &str) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6122 — N se lit en nombre ou en chiffres ; zéro, négatif, illisible
+    /// ou démesuré : rien (la règle rendra FAUX).
+    #[test]
+    fn le_nombre_de_jours_se_lit_ou_se_refuse() {
+        use serde_json::json;
+        assert_eq!(jours_de(Some(&json!(30))), Some(30));
+        assert_eq!(jours_de(Some(&json!("30"))), Some(30));
+        assert_eq!(jours_de(Some(&json!(" 7 "))), Some(7));
+        for v in [
+            json!(0),
+            json!(-5),
+            json!("abc"),
+            json!(""),
+            json!(2.5),
+            json!(["30"]),
+            json!(36_501),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(jours_de(Some(&v)), None, "{v}");
+        }
+        assert_eq!(jours_de(None), None);
+    }
+
+    /// #6122 — le seuil suit l'horloge : la même règle (N = 30) lue un jour
+    /// plus tard recule son seuil d'un jour. Rien n'est figé à l'enregistrement.
+    #[test]
+    fn le_seuil_glisse_avec_l_horloge() {
+        use chrono::TimeZone;
+        let t0 = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 11, 12, 0, 0)
+            .unwrap();
+        let s = seuil_jours(30, t0);
+        assert_eq!(s.iso, "'2026-09-11T12:00:00Z'");
+        assert_eq!(s.epoch, t0.timestamp() - 30 * 86_400);
+        let lendemain = seuil_jours(30, t0 + chrono::Duration::days(1));
+        assert_eq!(lendemain.iso, "'2026-09-12T12:00:00Z'");
+        assert_eq!(lendemain.epoch - s.epoch, 86_400);
+        // Et `seuil_de` lit bien l'horloge courante.
+        let maintenant = chrono::Utc::now().timestamp();
+        let vivant = seuil_de(Some(&serde_json::json!(1))).unwrap();
+        assert!(
+            (maintenant - 86_400 - vivant.epoch).abs() <= 5,
+            "{vivant:?}"
+        );
+    }
 
     #[test]
     fn le_compositeur_est_une_colonne_texte() {

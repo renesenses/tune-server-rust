@@ -39,6 +39,15 @@ struct RendererSession {
     // L'URI seule ne distingue pas deux lectures successives du même titre.
     revision: u64,
     play_seq: Option<u64>,
+    /// #6335 — les URI que la façade a écrites dans la FILE de la zone pour
+    /// lui confier la suivante (`[courante, suivante]`). C'est la marque de
+    /// propriété : la façade ne retire ou ne déplace que cette file-là, jamais
+    /// une file que Tune aurait écrite entre-temps (`est_notre_file`).
+    file: Option<Vec<String>>,
+    /// #6335 — quand la zone a ELLE-MÊME enchaîné sur la suivante confiée.
+    /// Un `Next` qui arrive juste après (le contrôleur a jugé la fin à sa
+    /// propre horloge) est alors acquitté sans rien relancer.
+    avance_de_la_zone: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +58,10 @@ struct NextItem {
     duration_ms: Option<i64>,
     /// `NextURIMetaData` reçu, rendu tel quel par `GetMediaInfo` (#5304).
     metadata: String,
+    /// #6335 — la suivante est dans la file de la zone, derrière la courante :
+    /// c'est l'enchaînement sans blanc de la zone qui la jouera, à la fin
+    /// réelle de la piste, et non un `orchestrator.play` de la façade.
+    confiee: bool,
 }
 
 fn sessions() -> &'static Mutex<HashMap<i64, RendererSession>> {
@@ -237,6 +250,13 @@ async fn event_subscription(method: Method) -> Response {
 /// Photo de l'état d'une zone au format UPnP.
 async fn snapshot(state: &AppState, zone_id: i64) -> RendererSnapshot {
     let ps = state.playback.get_state(zone_id).await;
+    // #6335 — la zone a pu enchaîner sur la suivante confiée depuis le
+    // dernier sondage : le contrôleur doit voir tout de suite la nouvelle
+    // `CurrentURI`, pas la piste finie (ni STOPPED, que `zone_reprise_par_tune`
+    // conclurait d'une URI qui ne correspond plus).
+    if constater_l_avance_de_la_zone(zone_id, &ps) {
+        oublier_l_ancienne_courante(state, zone_id).await;
+    }
     let session = sessions()
         .lock()
         .map(|s| s.get(&zone_id).cloned())
@@ -323,7 +343,7 @@ async fn avtransport_control(
             artist,
             duration_ms,
         } => {
-            if let Ok(mut s) = sessions().lock() {
+            let ancienne_file = sessions().lock().ok().and_then(|mut s| {
                 // Nouveau contexte de lecture : la suivante en attente est
                 // celle de l'ANCIEN contexte, elle ne survit pas.
                 s.insert(
@@ -336,8 +356,17 @@ async fn avtransport_control(
                         next: None,
                         revision: nouvelle_revision(),
                         play_seq: None,
+                        file: None,
+                        avance_de_la_zone: None,
                     },
-                );
+                )
+                .and_then(|ancienne| ancienne.file)
+            });
+            // #6335 — ni dans la file : la zone l'enchaînerait à la fin de la
+            // nouvelle piste. Ni chez le renderer réel, qui l'a peut-être déjà
+            // armée : la zone joue encore l'ancienne courante jusqu'au Play.
+            if let Some(file) = ancienne_file {
+                retirer_notre_file(&state, zone_id, &file, Desarmer::Oui).await;
             }
             upnp_renderer::empty_response("SetAVTransportURI")
         }
@@ -348,14 +377,26 @@ async fn avtransport_control(
             duration_ms,
             metadata,
         } => {
-            if let Ok(mut s) = sessions().lock() {
-                s.entry(zone_id).or_default().next = Some(NextItem {
+            let ancienne_file = sessions().lock().ok().and_then(|mut s| {
+                let session = s.entry(zone_id).or_default();
+                session.next = Some(NextItem {
                     uri,
                     title,
                     artist,
                     duration_ms,
                     metadata,
+                    confiee: false,
                 });
+                session.file.take()
+            });
+            // #6335 — la suivante va dans la file de la zone, qui l'enchaîne
+            // sans blanc. Refusée (lecture pas encore lancée, répétition,
+            // aléatoire), une suivante REMPLACÉE ne doit pas rester dans la
+            // file sous son ancienne forme.
+            if !confier_la_suivante_a_la_file(&state, zone_id).await
+                && let Some(file) = ancienne_file
+            {
+                retirer_notre_file(&state, zone_id, &file, Desarmer::Oui).await;
             }
             spawn_gapless_watcher(state.clone(), zone_id);
             upnp_renderer::empty_response("SetNextAVTransportURI")
@@ -425,6 +466,8 @@ async fn avtransport_control(
                         Ok(result) => {
                             if result.error.is_none() {
                                 memoriser_lecture_renderer(&state, zone_id, &session).await;
+                                // #6335 — une suivante posée AVANT le Play.
+                                confier_la_suivante_a_la_file(&state, zone_id).await;
                             }
                             info!(zone_id, uri = %session.uri, "upnp_renderer_play");
                             upnp_renderer::empty_response("Play")
@@ -457,17 +500,25 @@ async fn avtransport_control(
             // clos, la lecture Tune continue.
             let ps = state.playback.get_state(zone_id).await;
             let mut reprise = false;
+            let mut notre_file = None;
             if let Ok(mut s) = sessions().lock()
                 && let Some(session) = s.get_mut(&zone_id)
             {
                 reprise = zone_reprise_par_tune(session, &ps);
                 session.next = None;
+                notre_file = session.file.take();
                 // Zone reprise : garder le propriétaire, pour que la façade
                 // continue de dire STOPPED au lieu de réafficher la lecture Tune.
                 if !reprise {
                     session.play_seq = None;
                 }
                 session.revision = nouvelle_revision();
+            }
+            // #6335 — la suivante effacée sort aussi de la file de la zone :
+            // un Play qui relancerait la courante l'enchaînerait sinon.
+            // Le Stop qui suit arrête le renderer : rien à désarmer.
+            if let Some(file) = notre_file {
+                retirer_notre_file(&state, zone_id, &file, Desarmer::Non).await;
             }
             if reprise {
                 info!(zone_id, "upnp_renderer_stop_ignore_zone_reprise_par_tune");
@@ -513,10 +564,56 @@ async fn avtransport_control(
             // que le watcher, tout de suite, au lieu d'attendre qu'il
             // constate l'arrêt : le flux que le contrôleur a armé est celui
             // qu'on lance, il n'a rien à relancer.
-            match enchainer_la_suivante(&state, zone_id).await {
-                Some(Ok(())) => upnp_renderer::empty_response("Next"),
-                Some(Err(e)) => tune_core::upnp_server::soap_fault(701, &e),
-                None => tune_core::upnp_server::soap_fault(701, "Transition not available"),
+            //
+            // #6335 — sauf si la zone enchaîne ELLE-MÊME : un contrôleur Tune
+            // juge la fin à son horloge et demande `Next` alors que la zone,
+            // en retard du démarrage de son renderer, a encore une seconde ou
+            // deux à jouer. Relancer ici coupait cette fin et recréait le
+            // blanc. Voir `decider_le_next`.
+            let ps = state.playback.get_state(zone_id).await;
+            if constater_l_avance_de_la_zone(zone_id, &ps) {
+                oublier_l_ancienne_courante(&state, zone_id).await;
+            }
+            let decision = sessions()
+                .lock()
+                .ok()
+                .and_then(|s| s.get(&zone_id).cloned())
+                .map(|session| {
+                    decider_le_next(
+                        session.next.as_ref().map(|n| n.confiee),
+                        session
+                            .avance_de_la_zone
+                            .is_some_and(|t| t.elapsed() < AVANCE_RECENTE),
+                        session.play_seq == Some(ps.play_seq) && lecture_de_session(&session, &ps),
+                        ps.state,
+                        ps.position_ms,
+                        ps.now_playing
+                            .as_ref()
+                            .map(|np| np.duration_ms)
+                            .filter(|d| *d > 0)
+                            .or(session.duration_ms)
+                            .unwrap_or(0),
+                    )
+                })
+                .unwrap_or(DecisionNext::Enchainer);
+            match decision {
+                DecisionNext::DejaEnchainee => {
+                    info!(zone_id, "upnp_renderer_next_deja_enchaine_par_la_zone");
+                    upnp_renderer::empty_response("Next")
+                }
+                DecisionNext::LaZoneEnchaine => {
+                    info!(
+                        zone_id,
+                        position_ms = ps.position_ms,
+                        "upnp_renderer_next_laisse_a_l_enchainement_de_la_zone"
+                    );
+                    upnp_renderer::empty_response("Next")
+                }
+                DecisionNext::Enchainer => match enchainer_la_suivante(&state, zone_id).await {
+                    Some(Ok(())) => upnp_renderer::empty_response("Next"),
+                    Some(Err(e)) => tune_core::upnp_server::soap_fault(701, &e),
+                    None => tune_core::upnp_server::soap_fault(701, "Transition not available"),
+                },
             }
         }
         RendererCommand::Unsupported(name) => {
@@ -727,13 +824,358 @@ fn promouvoir_la_suivante(zone_id: i64) -> Option<RendererSession> {
     let mut carte = sessions().lock().ok()?;
     let session = carte.entry(zone_id).or_default();
     let promue = session.next.take()?;
+    installer_la_promue(session, promue);
+    session.play_seq = None;
+    Some(session.clone())
+}
+
+/// La suivante devient la courante de la session — geste commun de la
+/// promotion par la façade et du constat d'une avance de la zone (#6335).
+fn installer_la_promue(session: &mut RendererSession, promue: NextItem) {
     session.uri = promue.uri;
     session.title = promue.title;
     session.artist = promue.artist;
     session.duration_ms = promue.duration_ms;
     session.revision = nouvelle_revision();
-    session.play_seq = None;
-    Some(session.clone())
+}
+
+/// #6335 — la zone a-t-elle ELLE-MÊME enchaîné sur la suivante confiée ?
+///
+/// L'enchaînement sans blanc de la zone (armement du sondeur, `SetNext` vers
+/// le renderer réel, puis `advance_queue_metadata` à la transition constatée)
+/// ne passe pas par la façade. Elle le constate : la zone joue la ligne
+/// `upnp` de la suivante. La session est alors promue SANS rien relancer, et
+/// la lecture inscrite comme la sienne (`play_seq`) — c'est elle que les
+/// gardes de #4324 et #5167 doivent continuer de reconnaître.
+///
+/// Rend `true` quand la promotion a eu lieu.
+fn constater_l_avance_de_la_zone(zone_id: i64, ps: &tune_core::playback::ZoneState) -> bool {
+    let Ok(mut carte) = sessions().lock() else {
+        return false;
+    };
+    let Some(session) = carte.get_mut(&zone_id) else {
+        return false;
+    };
+    let zone_joue_la_suivante = session.next.as_ref().is_some_and(|n| {
+        n.confiee
+            && ps.state != tune_core::playback::PlayState::Stopped
+            && ps.now_playing.as_ref().is_some_and(|np| {
+                np.source == "upnp" && np.source_id.as_deref() == Some(n.uri.as_str())
+            })
+    });
+    if !zone_joue_la_suivante {
+        return false;
+    }
+    let Some(promue) = session.next.take() else {
+        return false;
+    };
+    info!(zone_id, "upnp_renderer_avance_par_la_zone");
+    installer_la_promue(session, promue);
+    session.play_seq = Some(ps.play_seq);
+    session.avance_de_la_zone = Some(std::time::Instant::now());
+    true
+}
+
+/// #6335 (relecture rc7) — la zone a enchaîné sur la suivante confiée : la
+/// façade lui rend sa file. Restée `[courante, suivante]`, une répétition de
+/// toute la file (activée après la confiance) ramènerait la zone à la piste
+/// précédente à la fin de la suivante ; réduite à `[suivante]`, elle la
+/// rejouerait en boucle. Sans ligne `upnp`, la zone est dans l'état d'avant
+/// #6335 : à la fin de la dernière piste armée par le contrôleur, elle
+/// s'arrête — ou suit le contrôleur, dont le prochain `SetNext` réécrit la
+/// file (ou reste tenu par la façade si la répétition le refuse).
+///
+/// Seulement sur la file de la façade (`est_notre_file`), et seulement si sa
+/// deuxième ligne est bien la courante de la session : un `SetNext` arrivé
+/// entre-temps a réécrit `[courante, suivante]`, et rien n'est alors retiré.
+async fn oublier_l_ancienne_courante(state: &AppState, zone_id: i64) {
+    let Some(file) = sessions().lock().ok().and_then(|carte| {
+        carte
+            .get(&zone_id)
+            .filter(|session| {
+                session
+                    .file
+                    .as_ref()
+                    .is_some_and(|f| f.len() >= 2 && f[1] == session.uri)
+            })
+            .and_then(|session| session.file.clone())
+    }) else {
+        return;
+    };
+    let repo = tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(state.backend.clone());
+    let Ok(lignes) = repo.get_ordered(zone_id) else {
+        return;
+    };
+    if !est_notre_file(&lignes, &file) || repo.clear(zone_id).is_err() {
+        return;
+    }
+    state.playback.update_queue_info(zone_id, 0, 0).await;
+    if let Ok(mut carte) = sessions().lock()
+        && let Some(session) = carte.get_mut(&zone_id)
+        && session.file.as_ref() == Some(&file)
+    {
+        session.file = None;
+    }
+    info!(zone_id, "upnp_renderer_file_rendue_apres_l_avance");
+}
+
+/// La file que la façade a écrite est-elle encore celle de la zone ? (#6335)
+///
+/// Comparée ligne à ligne : mêmes URI, même ordre, toutes `upnp`. Une file
+/// que Tune a réécrite entre-temps (l'auditeur a lancé un album) n'est plus
+/// la nôtre, et la façade n'y touche pas.
+fn est_notre_file(lignes: &[tune_core::db::play_queue_repo::QueueEntry], uris: &[String]) -> bool {
+    lignes.len() == uris.len()
+        && lignes.iter().zip(uris).all(|(ligne, uri)| {
+            ligne.source.as_deref() == Some("upnp") && ligne.source_id.as_deref() == Some(uri)
+        })
+}
+
+/// #6335 — confie la suivante posée par `SetNextAVTransportURI` à la FILE
+/// de la zone, derrière la courante : `[courante, suivante]`, curseur sur la
+/// courante.
+///
+/// C'est le mécanisme d'enchaînement sans blanc DÉJÀ en place pour toute
+/// file de zone, quel que soit son type de sortie : le sondeur arme la
+/// suivante dans la fenêtre de fin (`prepare_gapless` : `SetNext` vers un
+/// renderer DLNA, `set_next_media` vers une sortie locale), la transition
+/// est constatée à la fin RÉELLE de la piste et `advance_queue_metadata`
+/// avance la zone sans relance ; sans enchaînement possible, la fin de piste
+/// joue la ligne suivante de la file. La façade n'a plus qu'à le constater
+/// (`constater_l_avance_de_la_zone`).
+///
+/// Refusé, sans rien écrire, tant que la lecture en cours n'est pas celle
+/// de la session (SetNext avant Play : c'est le Play qui confiera), ou
+/// quand l'avance de la file ne choisirait pas la suivante (répétition,
+/// aléatoire — la décision est celle du sondeur, `next_position`). La
+/// suivante reste alors enchaînée par la façade comme avant.
+///
+/// Rend `true` quand la suivante est confiée.
+async fn confier_la_suivante_a_la_file(state: &AppState, zone_id: i64) -> bool {
+    use tune_core::db::play_queue_repo::{PlayQueueRepo, StreamingQueueItem};
+    let ps = state.playback.get_state(zone_id).await;
+    let plan = {
+        let Ok(carte) = sessions().lock() else {
+            return false;
+        };
+        let Some(session) = carte.get(&zone_id) else {
+            return false;
+        };
+        let Some(next) = session.next.as_ref() else {
+            return false;
+        };
+        if next.confiee {
+            return true;
+        }
+        if session.play_seq != Some(ps.play_seq) || !lecture_de_session(session, &ps) {
+            return false;
+        }
+        let ligne = |uri: &str, title: &Option<String>, artist: &Option<String>, d: Option<i64>| {
+            let item: StreamingQueueItem = (
+                uri.to_string(),
+                title.clone().unwrap_or_default(),
+                artist.clone().unwrap_or_default(),
+                None,
+                None,
+                d.unwrap_or(0),
+                Some("upnp".to_string()),
+                None,
+                None,
+            );
+            item
+        };
+        (
+            session.revision,
+            next.uri.clone(),
+            vec![
+                ligne(
+                    &session.uri,
+                    &session.title,
+                    &session.artist,
+                    session.duration_ms,
+                ),
+                ligne(&next.uri, &next.title, &next.artist, next.duration_ms),
+            ],
+        )
+    };
+    let (revision, uri_suivante, lignes) = plan;
+    // L'avance de la file doit choisir la suivante, PUIS s'arrêter après
+    // elle : avec la répétition de toute la file, la fin de la suivante
+    // reviendrait à l'ancienne courante au lieu de s'arrêter comme avant.
+    let mut simulee = ps.clone();
+    simulee.queue_position = 0;
+    simulee.queue_length = 2;
+    let choisit_la_suivante = tune_core::poller::PositionPoller::next_position(&simulee) == Some(1);
+    simulee.queue_position = 1;
+    let s_arrete_apres = tune_core::poller::PositionPoller::next_position(&simulee).is_none();
+    if !(choisit_la_suivante && s_arrete_apres) {
+        info!(
+            zone_id,
+            repeat = ?ps.repeat,
+            shuffle = ps.shuffle,
+            "upnp_renderer_suivante_non_confiee_a_la_file"
+        );
+        return false;
+    }
+    let uris: Vec<String> = lignes.iter().map(|l| l.0.clone()).collect();
+    if let Err(e) =
+        PlayQueueRepo::with_backend(state.backend.clone()).set_streaming_queue(zone_id, &lignes)
+    {
+        warn!(zone_id, error = %e, "upnp_renderer_file_non_ecrite");
+        return false;
+    }
+    state.playback.update_queue_info(zone_id, 0, 2).await;
+    // Le contexte a pu changer pendant l'écriture (Stop, nouvelle URI,
+    // suivante remplacée) : la file écrite n'est alors plus la bonne.
+    let confiee = sessions().lock().ok().is_some_and(|mut carte| {
+        carte.get_mut(&zone_id).is_some_and(|session| {
+            let meme_contexte = session.revision == revision;
+            match session.next.as_mut() {
+                Some(next) if meme_contexte && next.uri == uri_suivante => {
+                    next.confiee = true;
+                    session.file = Some(uris.clone());
+                    true
+                }
+                _ => false,
+            }
+        })
+    });
+    if confiee {
+        info!(zone_id, "upnp_renderer_suivante_confiee_a_la_file");
+    } else {
+        // Écrite à l'instant : le sondeur n'a pas pu l'armer.
+        retirer_notre_file(state, zone_id, &uris, Desarmer::Non).await;
+    }
+    confiee
+}
+
+/// Faut-il aussi effacer la suivante chez le renderer réel ? (#6335)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Desarmer {
+    /// La zone continue de jouer la courante : la suivante retirée a pu être
+    /// armée chez le renderer, qui l'enchaînerait seul.
+    Oui,
+    /// Un arrêt ou une nouvelle lecture suit, ou la file vient d'être écrite.
+    Non,
+}
+
+/// #6335 — retire de la zone la file écrite par la façade, si c'est encore
+/// la sienne (`est_notre_file`).
+async fn retirer_notre_file(state: &AppState, zone_id: i64, uris: &[String], desarmer: Desarmer) {
+    let repo = tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(state.backend.clone());
+    let Ok(lignes) = repo.get_ordered(zone_id) else {
+        return;
+    };
+    if !est_notre_file(&lignes, uris) {
+        return;
+    }
+    if repo.clear(zone_id).is_ok() {
+        state.playback.update_queue_info(zone_id, 0, 0).await;
+        info!(zone_id, "upnp_renderer_file_retiree");
+        if desarmer == Desarmer::Oui {
+            desarmer_la_suivante_du_renderer(state, zone_id).await;
+        }
+    }
+}
+
+/// #6335 — la suivante retirée de la file a pu être déjà armée chez le
+/// renderer réel (`prepare_gapless`, dans la fenêtre de fin) : il
+/// l'enchaînerait seul, et le sondeur ne désarme pas une préparation dont la
+/// suivante a quitté la file (`gapless_arm_outdated(Some, None)`, sens voulu
+/// pour le gapless ordinaire). La façade, qui sait l'avoir retirée, la fait
+/// effacer. Seule une sortie DLNA tient une suivante hors de Tune : les autres
+/// n'ont rien à effacer ici.
+async fn desarmer_la_suivante_du_renderer(state: &AppState, zone_id: i64) {
+    if state.playback.get_state(zone_id).await.state == tune_core::playback::PlayState::Stopped {
+        return;
+    }
+    let Some(device_id) = ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id)
+    else {
+        return;
+    };
+    let Some(sortie) = state.outputs.lock().await.get(&device_id) else {
+        return;
+    };
+    let sortie = sortie.lock().await;
+    let Some(dlna) = sortie
+        .as_any()
+        .downcast_ref::<tune_core::outputs::dlna::DlnaOutput>()
+    else {
+        return;
+    };
+    match dlna.effacer_la_suivante().await {
+        Ok(()) => info!(zone_id, "upnp_renderer_suivante_desarmee"),
+        Err(e) => warn!(zone_id, error = %e, "upnp_renderer_suivante_non_desarmee"),
+    }
+}
+
+/// #6335 — la façade lance ELLE-MÊME la suivante confiée (`Next` en milieu
+/// de piste, repli sur un arrêt) : le curseur de la file passe dessus, sinon
+/// la fin de cette piste rejouerait la même ligne.
+async fn suivre_dans_notre_file(state: &AppState, zone_id: i64, promue: &RendererSession) {
+    let Some(file) = promue.file.as_deref() else {
+        return;
+    };
+    let Some(position) = file.iter().position(|u| *u == promue.uri) else {
+        return;
+    };
+    let repo = tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(state.backend.clone());
+    let Ok(lignes) = repo.get_ordered(zone_id) else {
+        return;
+    };
+    if est_notre_file(&lignes, file) && repo.set_current_pos(zone_id, position as i64).is_ok() {
+        state
+            .playback
+            .update_queue_info(zone_id, position as i64, file.len() as i64)
+            .await;
+    }
+}
+
+/// Fenêtre où un `Next` arrive après que la zone a déjà enchaîné (#6335).
+const AVANCE_RECENTE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Reste de piste sous lequel un `Next` est laissé à l'enchaînement de la
+/// zone (#6335). Le contrôleur Tune du terrain demandait `Next` quand la
+/// zone avait encore 1,6 s à jouer ; un saut voulu par l'auditeur arrive bien
+/// plus tôt.
+const FENETRE_DE_FIN_MS: i64 = 10_000;
+
+/// Ce que fait un `Next` du contrôleur (#6335).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecisionNext {
+    /// La zone a déjà enchaîné sur la suivante : acquitter, rien à relancer.
+    DejaEnchainee,
+    /// La suivante est dans la file et la piste finit : la zone l'enchaînera
+    /// sans blanc à la fin réelle — acquitter sans couper cette fin.
+    LaZoneEnchaine,
+    /// Saut voulu (ou suivante non confiée) : la façade lance la suivante.
+    Enchainer,
+}
+
+fn decider_le_next(
+    suivante_confiee: Option<bool>,
+    avance_recente: bool,
+    lecture_de_la_session: bool,
+    etat: tune_core::playback::PlayState,
+    position_ms: i64,
+    duree_ms: i64,
+) -> DecisionNext {
+    match suivante_confiee {
+        None if avance_recente => DecisionNext::DejaEnchainee,
+        Some(true)
+            if lecture_de_la_session
+                && etat == tune_core::playback::PlayState::Playing
+                && duree_ms > 0
+                && duree_ms - position_ms <= FENETRE_DE_FIN_MS =>
+        {
+            DecisionNext::LaZoneEnchaine
+        }
+        _ => DecisionNext::Enchainer,
+    }
 }
 
 /// Ce que le watcher doit faire à la fin d'un tour, décidé en UNE section
@@ -754,9 +1196,12 @@ enum SuiteDuTour {
 /// le bus (`playback.stopped` n'est jamais émis) : on observe l'état toutes
 /// les 2 s.
 ///
-/// v1 assumée : l'enchaînement passe par un play complet — le contrat UPnP
-/// (le point de contrôle n'a pas à re-commander) est tenu, le zéro-gap réel
-/// viendra avec le préchargement orchestrateur.
+/// #6335 : la suivante est d'abord CONFIÉE à la file de la zone
+/// (`confier_la_suivante_a_la_file`), dont l'enchaînement sans blanc la joue à
+/// la fin réelle de la piste ; le watcher ne fait alors que le constater
+/// (`constater_l_avance_de_la_zone`). Le play complet de la façade ne reste
+/// qu'en repli : suivante non confiée (répétition, aléatoire), ou zone
+/// arrêtée avec la suivante encore en attente.
 ///
 /// #3967 : le watcher ne s'arrête plus après UNE promotion. Un point de
 /// contrôle qui pose la piste N+2 pendant qu'on démarre la piste N+1 — le
@@ -785,6 +1230,13 @@ fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
                 .ok()
                 .and_then(|sessions| sessions.get(&zone_id).map(|s| (s.revision, s.play_seq)));
             let ps = state.playback.get_state(zone_id).await;
+            // #6335 — la zone a enchaîné d'elle-même : la session suit, rien
+            // n'est relancé. Le tour suivant se libère ou attend la suivante.
+            if constater_l_avance_de_la_zone(zone_id, &ps) {
+                oublier_l_ancienne_courante(&state, zone_id).await;
+                continue;
+            }
+            let mut file_perimee = None;
             let suite = {
                 let Ok(mut sessions) = sessions().lock() else {
                     return;
@@ -804,6 +1256,7 @@ fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
                         // périmée, elle ne doit pas s'imposer par-dessus.
                         session.next = None;
                         session.play_seq = None;
+                        file_perimee = session.file.take();
                         info!(zone_id, "upnp_renderer_next_discarded_after_takeover");
                         SuiteDuTour::Liberer
                     } else if ps.state != tune_core::playback::PlayState::Stopped {
@@ -817,6 +1270,11 @@ fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
                     SuiteDuTour::Attendre
                 }
             };
+            // Tune a repris la zone par une nouvelle lecture, qui a reposé
+            // l'URI du renderer réel : rien à y désarmer.
+            if let Some(file) = file_perimee {
+                retirer_notre_file(&state, zone_id, &file, Desarmer::Non).await;
+            }
             match suite {
                 SuiteDuTour::Attendre => continue,
                 SuiteDuTour::Liberer => {
@@ -847,6 +1305,7 @@ fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
 /// sous le verrou, les deux chemins ne peuvent pas la lancer deux fois).
 async fn enchainer_la_suivante(state: &AppState, zone_id: i64) -> Option<Result<(), String>> {
     let promoted = promouvoir_la_suivante(zone_id)?;
+    suivre_dans_notre_file(state, zone_id, &promoted).await;
     let device_id = ZoneRepo::with_backend(state.backend.clone())
         .get(zone_id)
         .ok()
@@ -1444,6 +1903,10 @@ mod controleur_tune_face_au_renderer_tune_5304_tests;
 #[cfg(test)]
 #[path = "upnp_media_renderer_tests_5574.rs"]
 mod url_distante_de_jplay_5574_tests;
+
+#[cfg(test)]
+#[path = "upnp_media_renderer_tests_6335.rs"]
+mod enchainement_par_la_zone_6335_tests;
 
 #[cfg(test)]
 mod publication_de_zone_4626_tests {

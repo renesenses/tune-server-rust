@@ -436,6 +436,38 @@ async fn codec_amont_radio_annonce_une_seule_relecture_de_zone() {
     assert_eq!(banc.annonces(), 0, "la perte stable reste muette");
 }
 
+/// #6233 — Jean Valjean (fil 1825) : une radio sur sa sortie locale WASAPI,
+/// PURE et Bit-perfect justes « de quelques secondes à une à deux dizaines de
+/// secondes » après le clic. Le contrat publié à l'ouverture du périphérique
+/// doit être annoncé au tour suivant, pas au prochain sondage radio (15 s).
+#[tokio::test]
+async fn une_radio_sur_sortie_locale_annonce_son_contrat_au_tour_suivant_6233() {
+    let mut banc = Banc::monter().await;
+    let _session = banc.jouer_radio().await;
+    banc.dater_le_debut(Duration::from_secs(20));
+
+    // Tour 1 — le périphérique n'est pas encore ouvert.
+    banc.sortie(1_000, None).await;
+    banc.tic().await;
+    banc.annonces();
+
+    // Tour 2 — une seconde plus tard, le bras exclusif a publié son contrat.
+    banc.sortie(2_000, Some(contrat_bit_perfect())).await;
+    banc.tic().await;
+    assert_eq!(
+        banc.contrat_servi().await,
+        Some(contrat_bit_perfect()),
+        "le contrat de la sortie locale doit être relevé au tour suivant, \
+         pas au prochain sondage radio dans 15 s (#6233)"
+    );
+    assert_eq!(banc.annonces(), 1, "et annoncé au client, une fois");
+
+    // Tour 3 — inchangé : muet.
+    banc.sortie(3_000, Some(contrat_bit_perfect())).await;
+    banc.tic().await;
+    assert_eq!(banc.annonces(), 0, "un contrat inchangé reste muet");
+}
+
 #[test]
 fn un_nouveau_stream_radio_ne_reutilise_pas_le_codec_precedent() {
     let mut ps = ZonePollState::new(1);

@@ -145,6 +145,7 @@ pub(super) async fn identifier_album(
     state: &AppState,
     album_id: i64,
     release_choisie: Option<&str>,
+    origine: musicbrainz_release::OrigineDeLaRecherche,
 ) -> Result<Identification, EchecIdentification> {
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let album = match album_repo.get(album_id) {
@@ -189,8 +190,13 @@ pub(super) async fn identifier_album(
         .filter_map(|t| t.artist_name.as_deref())
         .find(|nom| !musicbrainz_release::est_un_artiste_fictif(nom))
         .or_else(|| tracks.iter().find_map(|t| t.artist_name.as_deref()));
-    let artist =
-        musicbrainz_release::artiste_de_requete(album.artist_name.as_deref(), artiste_des_pistes);
+    // Décision du 13/10/2026 : sans vrai artiste, le titre seul n'est cherché
+    // que depuis la fiche (`origine`), jamais dans un lot.
+    let artist = musicbrainz_release::artiste_de_requete_pour(
+        origine,
+        album.artist_name.as_deref(),
+        artiste_des_pistes,
+    );
 
     // Les identifiants des balises, lus AVANT d'effacer.
     let balises = balises_de_l_album(&state.backend, &tracks, album.barcode.as_deref());
@@ -457,6 +463,7 @@ async fn poser_le_pressage(
                     sans_correspondance = b.sans_correspondance,
                     ecartes = b.ecartes,
                     refuses_par_la_base = b.refuses_par_la_base,
+                    noms_de_tri = b.noms_de_tri,
                     "reidentify_artistes"
                 );
                 Some(b)
@@ -522,7 +529,14 @@ pub(super) async fn reidentify_album(
             }
         },
     };
-    let issue = match identifier_album(&state, album_id, release_choisie.as_deref()).await {
+    let issue = match identifier_album(
+        &state,
+        album_id,
+        release_choisie.as_deref(),
+        musicbrainz_release::OrigineDeLaRecherche::Fiche,
+    )
+    .await
+    {
         Ok(i) => i,
         Err(EchecIdentification::AlbumIntrouvable) => {
             return (

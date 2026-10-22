@@ -202,6 +202,23 @@ pub static ACOUSTID: LazyLock<RateLimiter> = LazyLock::new(|| RateLimiter::per_s
 /// La clé unique d'AcoustID dans [`ACOUSTID`] : une clé par SERVICE.
 pub const CLE_ACOUSTID: &str = "acoustid";
 
+/// Limiteur partagé de Wikidata (instruments P1303, BPM P1725 — lot 1 de
+/// l'enrichissement MetaRust, #4805). Wikidata ne publie pas de plafond pour
+/// les lectures, mais demande la retenue d'un robot : 5 requêtes par seconde
+/// pour tout le serveur, avec le ralentissement adaptatif commun (503/429).
+pub static WIKIDATA: LazyLock<RateLimiter> = LazyLock::new(|| RateLimiter::per_second(5.0));
+
+/// La clé unique de Wikidata dans [`WIKIDATA`].
+pub const CLE_WIKIDATA: &str = "wikidata";
+
+/// Limiteur partagé de Discogs (<https://www.discogs.com/developers>) : 60
+/// requêtes par minute avec un jeton, 25 sans. Une par seconde tient dans les
+/// deux régimes à la marge près (MetaRust : 1,1 s avec jeton).
+pub static DISCOGS: LazyLock<RateLimiter> = LazyLock::new(|| RateLimiter::per_second(0.9));
+
+/// La clé unique de Discogs dans [`DISCOGS`].
+pub const CLE_DISCOGS: &str = "discogs";
+
 /// Typed result of fetching a binary resource (e.g. an image), so callers can
 /// tell a genuine "not found" from a transient rate-limit or network error.
 #[derive(Debug)]

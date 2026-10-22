@@ -254,6 +254,10 @@ pub fn build_track_row(
         .map(|c| c.name.clone());
     track.year = meta.year.map(|y| y as i32);
     track.bpm = meta.bpm;
+    // #6123 — la note du fichier, déjà ramenée sur 0 à 5 (`metadata::note`).
+    track.rating = meta.rating.map(i32::from);
+    // #6332 — le débit moyen du fichier, lu au scan et jusqu'ici jeté.
+    track.bitrate_kbps = meta.bitrate_kbps.and_then(|b| i32::try_from(b).ok());
     track.label = meta.label.clone();
     track.isrc = meta.isrc.clone();
     track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
@@ -1578,7 +1582,14 @@ impl TrackImporter {
                 .get_or_create(
                     &album_artist_name,
                     album_artist_mbid,
-                    meta.album_artist_sort.as_deref(),
+                    // #6474 — ALBUMARTISTSORT, à défaut l'ARTISTSORT de la
+                    // piste quand elle est de l'artiste de l'album.
+                    tune_core::db::artist_repo::nom_de_tri_de_l_artiste_d_album(
+                        meta.album_artist_sort.as_deref(),
+                        meta.artist_sort.as_deref(),
+                        &album_artist_name,
+                        &track_artist_name,
+                    ),
                 )
                 .ok()
                 .map(Arc::new);
@@ -1601,7 +1612,9 @@ impl TrackImporter {
                     .get_or_create(
                         &track_artist_name,
                         meta.musicbrainz_artist_id.as_deref(),
-                        None,
+                        // #6474 — ARTISTSORT nourrit le nom de tri de
+                        // l'artiste de la piste (il restait vide).
+                        meta.artist_sort.as_deref(),
                     )
                     .ok()
                     .map(Arc::new);
@@ -2409,6 +2422,8 @@ mod tests {
             format: Some("flac".into()),
             year: Some(1959),
             bpm: Some(136.0),
+            rating: Some(4),
+            bitrate_kbps: Some(1_411),
             label: Some("Columbia".into()),
             isrc: Some("USSM15900001".into()),
             musicbrainz_recording_id: Some("rec-1".into()),
@@ -2450,6 +2465,16 @@ mod tests {
         assert_eq!(track.composer.as_deref(), Some("Miles Davis"));
         assert_eq!(track.year, Some(1959));
         assert_eq!(track.bpm, Some(136.0));
+        assert_eq!(
+            track.rating,
+            Some(4),
+            "la note des balises n'atteint pas la ligne (#6123)"
+        );
+        assert_eq!(
+            track.bitrate_kbps,
+            Some(1_411),
+            "le débit lu au scan n'atteint pas la ligne (#6332)"
+        );
         assert_eq!(track.isrc.as_deref(), Some("USSM15900001"));
         assert_eq!(track.comments.as_deref(), Some("remaster"));
     }
@@ -3947,3 +3972,7 @@ mod pochettes_bornees_tests_5202;
 #[cfg(test)]
 #[path = "scan_import_majorite_tests_5454.rs"]
 mod majorite_tests_5454;
+
+#[cfg(test)]
+#[path = "scan_import_nom_de_tri_tests_6474.rs"]
+mod nom_de_tri_tests_6474;

@@ -78,6 +78,10 @@ pub struct AppState {
     /// admet le réseau local (serveurs UPnP intégrés) — voir
     /// `artwork_proxy::pochette_de_bibliotheque`.
     pub relais_pochettes_lan: Arc<tune_core::library::artwork_proxy::Relais>,
+    /// #6388 — la base AutoEq en ligne (recherche d'un casque, import de sa
+    /// correction), lue par le SERVEUR et copiée dans `<données>/cache/autoeq`.
+    /// Champ public : un banc d'essai y pose un catalogue à faux réseau.
+    pub autoeq: Arc<tune_core::audio::autoeq_base::CatalogueAutoEq>,
     pub port: u16,
     /// Origine du compteur `uptime_seconds` : un `Instant` capturé à la
     /// construction de l'état, donc AU DÉMARRAGE DU PROCESSUS. Il repart
@@ -144,6 +148,9 @@ pub struct AppState {
     /// avec le semis de la migration 90, gelé au 30/08 et jamais remis à jour
     /// (#2119).
     pub annuaire_radios: Arc<std::sync::RwLock<Vec<crate::routes::radios::StationAnnuaire>>>,
+    /// #6516 — d'où vient le relevé de l'annuaire (réseau, cache local), sa
+    /// date et son `ETag`. Voir `routes::radios_annuaire`.
+    pub annuaire_etat: Arc<std::sync::RwLock<crate::routes::radios_annuaire::EtatAnnuaire>>,
     pub license: Arc<tune_core::license::LicenseManager>,
     pub skin_manager: Arc<tune_core::skins::SkinManager>,
     /// Compiled-in plugins. Empty until [`crate::plugins::init`] runs, which
@@ -200,6 +207,9 @@ pub struct AppState {
     /// « restart server to activate » — donc un emplacement ecrit une fois
     /// suffit, comme `plugin_names` plus haut.
     pub relay_client: Arc<OnceLock<Arc<tune_core::cloud::relay::RelayClient>>>,
+    /// #4626 — côté agent : le code d'appairage en cours et les sorties
+    /// tenues par un maître. En mémoire seulement.
+    pub agent_tune: Arc<crate::agent_tune::EtatAgentTune>,
 }
 
 impl axum::extract::FromRef<AppState> for tune_streaming_http::StreamingHttpState {
@@ -223,6 +233,22 @@ impl axum::extract::FromRef<AppState> for tune_smart_http::SmartHttpState {
             ))
             .avec_comptes(state.comptes_collections.clone())
     }
+}
+
+/// #6388 — la copie locale de la base AutoEq : `<données>/cache/autoeq`,
+/// le dossier de données étant résolu comme pour la base. Aucune copie pour
+/// une base en mémoire (essais) : rien n'est écrit dans le répertoire courant.
+fn dossier_autoeq(db_path: &str) -> Option<std::path::PathBuf> {
+    if db_path.is_empty() || db_path == ":memory:" {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let donnees = crate::gel_executeur::dossier_de_donnees(
+        std::env::var("TUNE_DATA_DIR").ok().as_deref(),
+        db_path,
+        &cwd,
+    );
+    Some(donnees.join("cache").join("autoeq"))
 }
 
 impl AppState {
@@ -288,13 +314,32 @@ impl AppState {
     /// réglages doit pouvoir montrer les deux — c'est tout l'objet de #3192 :
     /// tant qu'un seul nombre existait, l'écran ne pouvait pas dire que le
     /// choix affiché n'était pas celui qui s'appliquait.
+    ///
+    /// #6452 — sous le repli de démarrage, l'écho du choix d'ASIO
+    /// (`exclusif_arme_par_asio`) ne vaut rien : l'hôte de ce démarrage n'est
+    /// pas ASIO, et la sortie s'ouvre en partagé. La base n'est pas touchée.
     pub fn requested_exclusive_mode(&self) -> bool {
-        tune_core::db::settings_repo::SettingsRepo::with_backend(self.backend.clone())
-            .get("local_exclusive_mode")
-            .ok()
-            .flatten()
-            .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
-            .unwrap_or(self.config.local_exclusive_mode)
+        self.requested_exclusive_mode_selon(tune_core::demarrage_inacheve::repli_actif())
+    }
+
+    /// [`Self::requested_exclusive_mode`], le repli de démarrage en paramètre.
+    pub fn requested_exclusive_mode_selon(&self, repli: Option<&str>) -> bool {
+        let demande =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(self.backend.clone())
+                .get("local_exclusive_mode")
+                .ok()
+                .flatten()
+                .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+                .unwrap_or(self.config.local_exclusive_mode);
+        let repli_applique = repli.is_some()
+            && tune_core::demarrage_inacheve::hote_susceptible_de_bloquer(
+                &self.stored_audio_backend(),
+            );
+        tune_core::demarrage_inacheve::exclusif_de_ce_demarrage(
+            demande,
+            repli_applique && self.exclusif_arme_par_asio(),
+            repli_applique,
+        )
     }
 
     /// Vrai si c'est le CHOIX D'ASIO, et non l'utilisateur, qui a armé
@@ -346,7 +391,24 @@ impl AppState {
 
     /// The audio backend local outputs *should* be built with: the stored
     /// setting (written by the settings page) wins over the config file.
+    ///
+    /// #6452 — sauf pour CE démarrage, quand le précédent n'a pas abouti avec
+    /// un hôte qui peut bloquer (ASIO) : l'hôte par défaut, sans toucher au
+    /// choix enregistré (voir `tune_core::demarrage_inacheve`).
     pub fn effective_audio_backend(&self) -> String {
+        self.effective_audio_backend_selon(tune_core::demarrage_inacheve::repli_actif())
+    }
+
+    /// [`Self::effective_audio_backend`], le repli de démarrage en paramètre :
+    /// muter le repli global depuis un test changerait l'hôte de tous les
+    /// autres.
+    pub fn effective_audio_backend_selon(&self, repli: Option<&str>) -> String {
+        tune_core::demarrage_inacheve::hote_de_ce_demarrage(self.stored_audio_backend(), repli)
+    }
+
+    /// Le CHOIX enregistré, avant tout repli de démarrage : la base d'abord,
+    /// le fichier de configuration (et donc l'environnement) en repli.
+    pub fn stored_audio_backend(&self) -> String {
         tune_core::db::settings_repo::SettingsRepo::with_backend(self.backend.clone())
             .get("local_audio_backend")
             .ok()
@@ -587,6 +649,9 @@ impl AppState {
             relais_pochettes_lan: Arc::new(
                 tune_core::library::artwork_proxy::Relais::reseau_local(),
             ),
+            autoeq: Arc::new(tune_core::audio::autoeq_base::CatalogueAutoEq::production(
+                dossier_autoeq(db_path),
+            )),
             port,
             started_at: Instant::now(),
             process_started_at: time::OffsetDateTime::now_utc(),
@@ -604,6 +669,7 @@ impl AppState {
             mdns_scanner: Arc::new(std::sync::Mutex::new(None)),
             active_audio_backend: Arc::new(std::sync::RwLock::new(None)),
             annuaire_radios: Arc::new(std::sync::RwLock::new(Vec::new())),
+            annuaire_etat: Arc::new(std::sync::RwLock::new(Default::default())),
             license,
             skin_manager,
             plugins,
@@ -615,6 +681,7 @@ impl AppState {
             wasm_plugins: Arc::new(OnceLock::new()),
             #[cfg(feature = "cloud-relay")]
             relay_client: Arc::new(OnceLock::new()),
+            agent_tune: Arc::new(crate::agent_tune::EtatAgentTune::default()),
         })
     }
 

@@ -551,6 +551,11 @@ where
         )
         // #4993 — crédits d'une piste et d'un album de SERVICE, dans la forme
         // de `/library/tracks/{id}/credits` (501 si le service n'en a pas).
+        // #6481 — les livrets PDF que le service publie pour un album.
+        .route(
+            "/{service}/albums/{album_id}/booklets",
+            get(service_album_booklets),
+        )
         .route(
             "/{service}/tracks/{track_id}/credits",
             get(service_track_credits),
@@ -558,6 +563,12 @@ where
         .route(
             "/{service}/albums/{album_id}/credits",
             get(service_album_credits),
+        )
+        // #6480 — le texte de présentation d'un album de service (501 si le
+        // service n'en publie pas).
+        .route(
+            "/{service}/albums/{album_id}/description",
+            get(service_album_description),
         )
         .route("/{service}/playlist-tags", get(service_playlist_tags))
         .route(
@@ -573,6 +584,10 @@ where
         .route(
             "/{service}/genres/{genre_id}/albums",
             get(service_genre_albums),
+        )
+        .route(
+            "/{service}/genres/{genre_id}/search",
+            get(service_genre_search),
         )
         .route("/{service}/favorites/{fav_type}", get(service_favorites))
         .route(
@@ -955,6 +970,31 @@ async fn service_genre_albums(
     }
 }
 
+#[derive(Deserialize)]
+struct GenreSearchQuery {
+    q: String,
+    limit: Option<usize>,
+}
+
+/// #6231 — chercher dans le catalogue du service, restreint à un genre
+/// (`tune_core::streaming::RechercheDansUnGenre`). 501 pour un service qui ne
+/// dit pas le genre de ses albums : l'écran le DIT, au lieu de filtrer en
+/// silence les seules nouveautés.
+async fn service_genre_search(
+    State(state): State<StreamingHttpState>,
+    Path((service, genre_id)): Path<(String, String)>,
+    Query(q): Query<GenreSearchQuery>,
+) -> Response {
+    let query = q.q.trim().to_string();
+    if query.is_empty() {
+        return (StatusCode::BAD_REQUEST, "q is required").into_response();
+    }
+    let limit = q.limit.unwrap_or(50);
+    with_svc!(&state, &service, |svc| svc
+        .search_genre_albums(&genre_id, &query, limit)
+        .await)
+}
+
 async fn service_featured_sections(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
@@ -1043,6 +1083,18 @@ async fn service_album_context(
         .await)
 }
 
+/// #6481 — les livrets PDF d'un album de service (cpadiou77 et Patatorz, fil
+/// forum 2326) : `[{"name": "…", "url": "https://…pdf"}]`, vide s'il n'y en a
+/// pas.
+async fn service_album_booklets(
+    State(state): State<StreamingHttpState>,
+    Path((service, album_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_album_booklets(&album_id)
+        .await)
+}
+
 /// #4993 — crédits d'une piste de service (FabienM, fil forum 1921). Même
 /// forme JSON que `GET /library/tracks/{id}/credits` ; `track_id` est
 /// l'identifiant SUR LE SERVICE. Service sans source de crédits : 501.
@@ -1063,6 +1115,19 @@ async fn service_album_credits(
 ) -> Response {
     with_svc!(&state, &service, |svc| svc
         .get_album_credits(&album_id)
+        .await)
+}
+
+/// #6480 — le texte de présentation d'un album de service (cpadiou77, fil
+/// forum 2327). `{"description": "…", "language": "fr"}` ; `null` quand le
+/// service n'en a pas pour cet album ; 501 quand il n'en publie jamais. Le
+/// texte est déjà débarrassé de tout balisage par le serveur.
+async fn service_album_description(
+    State(state): State<StreamingHttpState>,
+    Path((service, album_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_album_description(&album_id)
         .await)
 }
 
@@ -1302,7 +1367,10 @@ async fn service_logout(
     state.save_tokens().await;
     // Le compte change : ses listes ne doivent pas survivre à la session.
     purge_contenu_utilisateur(&service);
-    Json(json!({ "service": service, "status": "logged_out" })).into_response()
+    // #6173 — `disconnectStreaming` (web) lit `disconnected` ; `status` reste
+    // pour les clients qui le lisaient déjà.
+    Json(json!({ "service": service, "status": "logged_out", "disconnected": true }))
+        .into_response()
 }
 
 /// Nombre de titres rendus par défaut par « Plus comme ça » sur un titre de
@@ -1608,7 +1676,8 @@ async fn service_enable(
     settings
         .set(&format!("streaming_{service}_enabled"), "true")
         .ok();
-    Json(json!({"service": service, "enabled": true})).into_response()
+    // #6173 — `enableStreamingService` (web) lit `status`.
+    Json(json!({"service": service, "enabled": true, "status": "enabled"})).into_response()
 }
 
 async fn service_disable(
@@ -1624,7 +1693,8 @@ async fn service_disable(
     settings
         .set(&format!("streaming_{service}_enabled"), "false")
         .ok();
-    Json(json!({"service": service, "enabled": false})).into_response()
+    // #6173 — `disableStreamingService` (web) lit `status`.
+    Json(json!({"service": service, "enabled": false, "status": "disabled"})).into_response()
 }
 
 async fn service_auth_url(
@@ -2341,6 +2411,7 @@ mod tests_cache_utilisateur {
                 cover_path: None,
                 track_count: 0,
                 owner: None,
+                editable: None,
                 covers: Vec::new(),
             }])
         }
@@ -3094,6 +3165,40 @@ mod temoin_statut_du_refus_i859 {
         String::from_utf8_lossy(&octets).into_owned()
     }
 
+    /// #6231 — la recherche dans un genre existe, et un service qui ne dit pas
+    /// le genre de ses albums répond 501 (défaut du trait), que l'écran affiche.
+    #[tokio::test]
+    async fn recherche_dans_un_genre_6231_route_501_et_400() {
+        use tower::ServiceExt;
+        let (state, name) = etat("genre-6231", Humeur::Refuse);
+        let app = Router::new().nest("/api/v1/streaming", router().with_state(state));
+        let appel = |chemin: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri(chemin)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let r = appel(format!("/api/v1/streaming/{name}/genres/80/search?q=roxy")).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "#6231 : sans recherche par genre, 501 et non 404 ni une liste vide"
+        );
+        let r = appel(format!("/api/v1/streaming/{name}/genres/80/search?q=%20")).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::BAD_REQUEST,
+            "#6231 : saisie vide refusée"
+        );
+    }
+
     #[derive(Clone, Default)]
     struct Journal4039(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -3652,3 +3757,302 @@ mod service_desactive_jamais_appele_tests;
 
 #[cfg(test)]
 mod youtube_decouverte_tests;
+
+/// #6480 — `GET /streaming/{service}/albums/{id}/description` : le texte de
+/// présentation d'un album de service (cpadiou77, fil forum 2327).
+///
+/// Trois réponses, trois essais : le texte (200, objet), « pas pour cet
+/// album » (200, `null`), « jamais chez ce service » (501, le défaut du trait).
+#[cfg(test)]
+mod tests_presentation_album_6480 {
+    use super::*;
+    use tower::ServiceExt;
+    use tune_core::TuneError;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::streaming::traits::{
+        AuthStatus, SearchResults, StreamAlbum, StreamAlbumDescription, StreamArtist,
+        StreamPlaylist, StreamTrack, StreamUrl,
+    };
+
+    #[derive(Clone, Copy)]
+    enum Presentation {
+        /// Le service sait présenter : « a-1 » a un texte, les autres non.
+        Publiee,
+        /// Le service n'en publie jamais : défaut du trait.
+        Jamais,
+    }
+
+    struct ServicePresentation {
+        nom: String,
+        mode: Presentation,
+    }
+
+    const PANNE: &str = "hors sujet";
+
+    #[async_trait::async_trait]
+    impl StreamingService for ServicePresentation {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            &self.nom
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _e: bool) {}
+        async fn authenticate(&mut self, _c: &Value) -> Result<AuthStatus, TuneError> {
+            Ok(AuthStatus::default())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::default()
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album_description(
+            &self,
+            album_id: &str,
+        ) -> Result<Option<StreamAlbumDescription>, TuneError> {
+            match self.mode {
+                Presentation::Publiee => Ok((album_id == "a-1").then(|| StreamAlbumDescription {
+                    description: "Premier paragraphe.\n\nSecond.".into(),
+                    language: Some("fr".into()),
+                })),
+                Presentation::Jamais => Err(TuneError::Unsupported(
+                    "album description not supported for this service".into(),
+                )),
+            }
+        }
+    }
+
+    async fn appel(nom: &str, mode: Presentation, album: &str) -> (StatusCode, String) {
+        let backend: Arc<dyn DbBackend> =
+            Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(ServicePresentation {
+            nom: nom.to_string(),
+            mode,
+        }));
+        let etat = StreamingHttpState::new(
+            backend,
+            Arc::new(Mutex::new(registre)),
+            Arc::new(EventBus::new()),
+        );
+        let app = Router::new().nest("/api/v1/streaming", router().with_state(etat));
+        let r = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/v1/streaming/{nom}/albums/{album}/description"
+                    ))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let statut = r.status();
+        let octets = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        (statut, String::from_utf8_lossy(&octets).into_owned())
+    }
+
+    #[tokio::test]
+    async fn la_presentation_d_un_album_est_servie_en_texte_avec_sa_langue() {
+        let (statut, corps) = appel("presente-6480", Presentation::Publiee, "a-1").await;
+        assert_eq!(
+            statut,
+            StatusCode::OK,
+            "GET /streaming/{{service}}/albums/{{id}}/description doit exister (#6480) : {corps}"
+        );
+        let v: Value = serde_json::from_str(&corps).unwrap();
+        assert_eq!(
+            v,
+            json!({"description": "Premier paragraphe.\n\nSecond.", "language": "fr"})
+        );
+    }
+
+    #[tokio::test]
+    async fn un_album_sans_presentation_rend_null() {
+        let (statut, corps) = appel("sans-texte-6480", Presentation::Publiee, "a-2").await;
+        assert_eq!(statut, StatusCode::OK, "{corps}");
+        assert_eq!(corps, "null");
+    }
+
+    #[tokio::test]
+    async fn un_service_qui_n_en_publie_jamais_repond_501() {
+        let (statut, _) = appel("jamais-6480", Presentation::Jamais, "a-1").await;
+        assert_eq!(statut, StatusCode::NOT_IMPLEMENTED);
+    }
+}
+
+/// #6481 — `GET /streaming/{service}/albums/{id}/booklets` : les livrets PDF
+/// d'un album de service (cpadiou77 et Patatorz, fil forum 2326).
+#[cfg(test)]
+mod tests_livrets_album_6481 {
+    use super::*;
+    use tower::ServiceExt;
+    use tune_core::TuneError;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::streaming::traits::{
+        AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamBooklet, StreamPlaylist,
+        StreamTrack, StreamUrl,
+    };
+
+    struct ServiceAvecLivret {
+        nom: String,
+    }
+
+    const PANNE: &str = "hors sujet";
+
+    #[async_trait::async_trait]
+    impl StreamingService for ServiceAvecLivret {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            &self.nom
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _e: bool) {}
+        async fn authenticate(&mut self, _c: &Value) -> Result<AuthStatus, TuneError> {
+            Ok(AuthStatus::default())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::default()
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album_booklets(
+            &self,
+            album_id: &str,
+        ) -> Result<Vec<StreamBooklet>, TuneError> {
+            Ok(if album_id == "a-1" {
+                vec![StreamBooklet {
+                    name: "Livret".into(),
+                    url: "https://static.qobuz.com/goodies/1.pdf".into(),
+                }]
+            } else {
+                vec![]
+            })
+        }
+    }
+
+    async fn appel(nom: &str, album: &str) -> (StatusCode, String) {
+        let backend: Arc<dyn DbBackend> =
+            Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(ServiceAvecLivret {
+            nom: nom.to_string(),
+        }));
+        let etat = StreamingHttpState::new(
+            backend,
+            Arc::new(Mutex::new(registre)),
+            Arc::new(EventBus::new()),
+        );
+        let app = Router::new().nest("/api/v1/streaming", router().with_state(etat));
+        let r = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/streaming/{nom}/albums/{album}/booklets"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let statut = r.status();
+        let octets = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        (statut, String::from_utf8_lossy(&octets).into_owned())
+    }
+
+    #[tokio::test]
+    async fn les_livrets_d_un_album_de_service_sont_servis() {
+        let (statut, corps) = appel("livret-6481", "a-1").await;
+        assert_eq!(
+            statut,
+            StatusCode::OK,
+            "GET /streaming/{{service}}/albums/{{id}}/booklets doit exister (#6481) : {corps}"
+        );
+        let v: Value = serde_json::from_str(&corps).unwrap();
+        assert_eq!(
+            v,
+            json!([{"name": "Livret", "url": "https://static.qobuz.com/goodies/1.pdf"}])
+        );
+        let (statut, corps) = appel("sans-livret-6481", "a-2").await;
+        assert_eq!((statut, corps.as_str()), (StatusCode::OK, "[]"));
+    }
+}

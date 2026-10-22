@@ -1,0 +1,20 @@
+{
+  "attendu": {
+    "jti": "jti-0001",
+    "resultat": "accepte",
+    "sub": "cpt_8f2a61"
+  },
+  "contexte": {
+    "grace_expiration": 0,
+    "maintenant": 1793000000,
+    "server_id": "6f1c1f5e-2b0a-4c2e-9d3b-7a51c0de0001"
+  },
+  "defi": {
+    "defi": "c2Vzc2lvbi1kZWZpLWRlLXRlc3QtMDEyMzQ1Njc4OTAx",
+    "signature": "5cUWbTprb3Bys-iTB-l385vW2Og4skKrQ9RnNwMIFbgcMmlnFmtVgn8h1TS0z1OHA7PxcTNEvMcoBrmgf30PRw"
+  },
+  "description": "Laissez-passer valide, clé d'appareil P-256 (repli), défi signé en ECDSA r||s.",
+  "laissez_passer": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6InR1bmUtcGFzcytqd3QifQ.eyJpc3MiOiJodHRwczovL21vemFpa2xhYnMuZnIiLCJhdWQiOiJ0dW5lLXJlbW90ZSIsInN1YiI6ImNwdF84ZjJhNjEiLCJzaWQiOiI2ZjFjMWY1ZS0yYjBhLTRjMmUtOWQzYi03YTUxYzBkZTAwMDEiLCJkaWQiOiJhcHBfcDI1Nl8wMSIsImNuZiI6eyJhbGciOiJQLTI1NiIsInBrIjoiQkd1bGUzb005QkxtX1FmNkUyN09icXZrbk1WdWE0dGFMQi1GUHlrUE94T3JCVFdfRjlGcjB2ZGRsYnlrU19XUl9oeThVVTJuMVRnVWFNclhYV0NWS0JvIn0sInAycCI6ZmFsc2UsImlhdCI6MTc5Mjk5OTQwMCwibmJmIjoxNzkyOTk5NDAwLCJleHAiOjE3OTMwMDMwMDAsImp0aSI6Imp0aS0wMDAxIiwidiI6MX0.R5fKfGwaNnd_SxBV_MwakzICR0Ki9i4eNEfyFENMV2npdePvoSB3dWT033QGukpZc3UkwTK1uCeXqwjqCWyBAA",
+  "nom": "valide_p256",
+  "publication": "jeu_de_cles.json"
+}

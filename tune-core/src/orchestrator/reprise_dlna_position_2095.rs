@@ -45,7 +45,7 @@ const DUREE_MS: u64 = 302_973;
 
 /// Un service « qobuz » qui rend une URL HTTPS signée, comme le CDN Akamai.
 /// Rien ne la télécharge dans ce banc : la sortie factice ne tire pas le flux.
-struct QobuzDeBanc;
+pub(super) struct QobuzDeBanc;
 
 fn non_servi() -> TuneError {
     TuneError::Streaming("service de banc : rien d'autre n'est servi".into())

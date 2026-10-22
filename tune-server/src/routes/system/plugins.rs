@@ -12,7 +12,15 @@ use crate::state::AppState;
 /// serveur où `/plugins` l'écarte. Les deux passent désormais par
 /// [`crate::routes::plugins::fiches_locales_honorables`] — un seul tri, une
 /// seule vérité (#2132).
-pub(super) async fn list_system_plugins(State(state): State<AppState>) -> Json<Value> {
-    let plugins = crate::routes::plugins::fiches_locales_honorables(&state).await;
+pub(super) async fn list_system_plugins(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Json<Value> {
+    let mut plugins = crate::routes::plugins::fiches_locales_honorables(&state).await;
+    // #6458 — même description traduite que `GET /plugins`.
+    let lang = crate::i18n::lang_from_header(&headers);
+    for fiche in &mut plugins {
+        crate::routes::plugins::localiser_la_description(fiche, &lang);
+    }
     Json(json!(plugins))
 }

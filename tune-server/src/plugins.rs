@@ -191,6 +191,8 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
                 services: state.services.clone(),
                 orchestrator: state.orchestrator.clone(),
                 playback: state.playback.clone(),
+                // #6521 : les vignettes partagées avec le cercle.
+                artwork_dir: crate::routes::library::artwork_cache_dir(),
             },
         )))
         .await;
@@ -209,6 +211,22 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
         )))
         .await;
 
+    // Assistant IA, étape 1 (chantier assistant-ia). Toujours compilé, gratuit.
+    // La base ; le DOSSIER de la base, où vit la clé maîtresse qui scelle la
+    // clé d'API de l'utilisateur (hors de la base elle-même) ; et les critères
+    // du moteur des règles intelligentes, pour que le schéma imposé au modèle
+    // soit celui du moteur et rien d'autre.
+    #[cfg(feature = "assistant-ia")]
+    loader
+        .register(Box::new(tune_assistant_ia::AssistantIaPlugin::new(
+            tune_assistant_ia::HostServices {
+                backend: state.backend.clone(),
+                dossier_secret: dossier_de_la_base(),
+                criteres: criteres_du_moteur(),
+            },
+        )))
+        .await;
+
     // Pont Roon (#3914) — Premium. La licence est passée pour que le greffon
     // refuse lui-même (402) ; le cache d'illustrations, pour y ranger les
     // images de l'archive sous le même condensat que tout le reste.
@@ -222,6 +240,46 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
             },
         )))
         .await;
+}
+
+#[cfg(feature = "assistant-ia")]
+/// La passerelle de l'Assistant IA (étape 2) : l'ancien `/ai/query` et la
+/// traduction des ambiances y prennent la clé (coffre du greffon, après
+/// migration de l'ancienne clé en clair), le plafond et le fournisseur de
+/// l'assistant. Même base et même dossier de clé maîtresse que le greffon.
+pub(crate) fn passerelle_assistant(
+    backend: &Arc<dyn tune_core::db::backend::DbBackend>,
+) -> tune_assistant_ia::Passerelle {
+    tune_assistant_ia::Passerelle::new(backend.clone(), &dossier_de_la_base())
+}
+
+#[cfg(feature = "assistant-ia")]
+/// Le dossier de la base retenue au démarrage (Docker : `/data`), sinon celui
+/// de `TUNE_DB_PATH`, sinon le dossier courant — là où `tune.db` se pose.
+fn dossier_de_la_base() -> std::path::PathBuf {
+    let base = crate::chemins_de_donnees::base_retenue()
+        .map(String::from)
+        .or_else(|| std::env::var("TUNE_DB_PATH").ok())
+        .unwrap_or_else(|| "tune.db".into());
+    std::path::Path::new(&base)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+#[cfg(feature = "assistant-ia")]
+/// Les critères du moteur des règles intelligentes, dans la forme du greffon.
+fn criteres_du_moteur() -> Vec<tune_assistant_ia::CritereMoteur> {
+    tune_smart_http::criteres::criteres_exposes()
+        .into_iter()
+        .map(|c| tune_assistant_ia::CritereMoteur {
+            collection: c.collection.map(String::from),
+            piste: c.piste.map(String::from),
+            famille: c.famille.to_string(),
+            operateurs: c.operateurs.iter().map(|s| s.to_string()).collect(),
+        })
+        .collect()
 }
 
 /// Builds the plugins an out-of-tree binary wants registered.

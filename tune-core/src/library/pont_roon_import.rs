@@ -137,7 +137,10 @@ pub fn ouvrir_archive<R: Read + std::io::Seek>(
         if f.is_dir() {
             continue;
         }
-        let nom = f.name().to_string();
+        let nom = f
+            .name()
+            .map_err(|e| format!("archive illisible : {e}"))?
+            .into_owned();
         if nom == "export.json" {
             let contenu = lire_entree(f).map_err(|e| format!("archive illisible ({nom}) : {e}"))?;
             let texte = String::from_utf8(contenu)
