@@ -1588,7 +1588,10 @@ pub(crate) fn marquer_scan_en_cours(
 /// gestes de RÉPARATION de bibliothèque. Aucun d'eux ne doit pouvoir autoriser
 /// une suppression de masse. Seul `trigger_scan`, qui porte une intention
 /// explicite de l'utilisateur, passe par `spawn_library_scan_confirmee`.
-pub(crate) async fn spawn_library_scan(
+///
+/// `pub` pour `tune-ffi` : l'hôte mobile (app iOS revenue au premier plan)
+/// relance un scan incrémental par `tune_server_scan`, sans passer par HTTP.
+pub async fn spawn_library_scan(
     state: AppState,
     force: bool,
     targeted_req: Option<String>,

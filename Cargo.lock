@@ -5477,7 +5477,9 @@ name = "tune-ffi"
 version = "1.0.0"
 dependencies = [
  "axum",
+ "rusqlite",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",
