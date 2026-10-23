@@ -86,6 +86,9 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 curve25519-elligator2 = { version = "=0.1.0-alpha.2", default-features = false, features = ["alloc", "digest", "zeroize"] }
 hmac = "0.12" # meme famille digest 0.10 que sha2
 aes-gcm = "0.10"
+# #6357 — segments HLS en AES-128-CBC (RFC 8216 §4.3.2.4). Déjà dans l'arbre
+# (tiré par aes-gcm), aucune caisse nouvelle.
+aes = "0.8"
 subtle = "2.6"
 zeroize = "1"
 data-encoding = "2.11"
@@ -95,6 +98,11 @@ cbc = { workspace = true }
 regex = { workspace = true }
 csv = { workspace = true }
 symphonia = { workspace = true }
+# #6357 — décodeur AAC en pur Rust, HE-AAC (SBR) et HE-AACv2 (PS) compris,
+# pour les radios HLS : symphonia 0.6 ne décode que l'AAC-LC. Apache-2.0,
+# zéro dépendance. Version épinglée (caisse jeune, un seul mainteneur) ;
+# sans la fonction `simd` : construction 100 % sûre, sans `unsafe`.
+rusty_aac = { version = "=1.1.0", default-features = false }
 # Native Monkey's Audio decoder, MIT/Apache-2.0.
 # Local pre-3990 entropy support (#4191): vendor/ape-decoder/TUNE-PATCH.md.
 ape-decoder = { path = "../vendor/ape-decoder", version = "0.3.2" }

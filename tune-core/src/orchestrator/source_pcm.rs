@@ -302,6 +302,7 @@ impl PlaybackOrchestrator {
             format: Some("wav"),
             sample_rate: Some(format.frequence),
             bit_depth: Some(format.bits),
+            ..Default::default()
         });
         if let Some(etat) = flux.etat.clone() {
             inscrire_direct(&session_id, etat);

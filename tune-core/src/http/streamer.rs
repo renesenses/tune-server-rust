@@ -68,6 +68,14 @@ pub struct RadioSourceInfo {
     pub format: Option<&'static str>,
     pub sample_rate: Option<u32>,
     pub bit_depth: Option<u16>,
+    /// #6357 — le protocole de la station quand ce n'est pas un flux continu :
+    /// `Some("hls")` pour une liste `.m3u8`. `None` : Icecast/HTTP.
+    pub transport: Option<&'static str>,
+    /// #6357 — le profil AAC réellement décodé (`AAC-LC`, `HE-AAC`,
+    /// `HE-AACv2`), quand le décodeur le sait. `None` : inconnu.
+    pub profil: Option<&'static str>,
+    /// #6357 — le débit du codec, mesuré sur les trames (kbit/s).
+    pub debit_kbps: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]

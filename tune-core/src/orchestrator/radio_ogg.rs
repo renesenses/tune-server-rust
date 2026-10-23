@@ -32,6 +32,17 @@ const TRAME_OPUS_MAX: usize = 5760;
 pub(super) enum DecodeurRadio {
     /// Tout ce que symphonia décode : MP3, AAC, FLAC, ALAC, Vorbis.
     Symphonia(Box<dyn AudioDecoder>),
+    /// #6357 — l'AAC d'une station HLS, par `rusty_aac` : HE-AAC (SBR) et
+    /// HE-AACv2 (PS) compris, que symphonia 0.6 décode en AAC-LC seul (à la
+    /// moitié de la fréquence, sans les aigus, et sans rien dire). symphonia
+    /// reste le lecteur ADTS : ses paquets sont des unités d'accès brutes.
+    Aac {
+        decodeur: Box<rusty_aac::AacDecoder>,
+        /// La fréquence et les canaux de la dernière trame décodée : ceux de
+        /// la SORTIE (le double du cœur quand le SBR est présent).
+        cadence: Option<u32>,
+        canaux: usize,
+    },
     /// Opus, que symphonia démuxe sans le décoder.
     Opus {
         decodeur: opus::Decoder,
@@ -90,6 +101,36 @@ impl DecodeurRadio {
             .map_err(|e| format!("radio decoder init failed: {e}"))
     }
 
+    /// #6357 — le décodeur `rusty_aac` d'une piste AAC, configuré par la
+    /// sonde ADTS (objet, fréquence et canaux du CŒUR). Le SBR implicite
+    /// (signalé dans les éléments de remplissage, cas des TS de la BBC) est
+    /// reconnu dès la première trame.
+    pub(super) fn aac_pur_rust(params: &AudioCodecParameters) -> Result<Self, String> {
+        let cadence = params
+            .sample_rate
+            .ok_or("radio decoder init failed: aac: fréquence inconnue")?;
+        let canaux = params.channels.as_ref().map(|c| c.count()).unwrap_or(2);
+        let decodeur = rusty_aac::AacDecoder::with_config(rusty_aac::AudioSpecificConfig {
+            object_type: rusty_aac::sbr::AOT_AAC_LC,
+            sample_rate: cadence,
+            channels: u16::try_from(canaux).unwrap_or(2),
+        });
+        Ok(DecodeurRadio::Aac {
+            decodeur: Box::new(decodeur),
+            cadence: None,
+            canaux,
+        })
+    }
+
+    /// La fréquence de la dernière trame décodée, quand le décodeur la
+    /// connaît mieux que la sonde (HE-AAC : le double du cœur).
+    pub(super) fn cadence_decodee(&self) -> Option<u32> {
+        match self {
+            DecodeurRadio::Aac { cadence, .. } => *cadence,
+            _ => None,
+        }
+    }
+
     /// Décode un paquet en échantillons entrelacés, rangés dans `sortie`
     /// (vidée d'abord). Rend le nombre de canaux.
     pub(super) fn decoder(
@@ -105,6 +146,21 @@ impl DecodeurRadio {
                 decode.copy_to_vec_interleaved::<f32>(sortie);
                 Ok(canaux)
             }
+            DecodeurRadio::Aac {
+                decodeur,
+                cadence,
+                canaux,
+            } => match decodeur.decode(&paquet.data, None) {
+                Ok(trame) => {
+                    *cadence = Some(trame.sample_rate);
+                    *canaux = usize::from(trame.channels);
+                    sortie.extend_from_slice(&trame.samples);
+                    Ok(*canaux)
+                }
+                // Paquet vide : rien à décoder, rien à servir.
+                Err(rusty_aac::Error::Again) => Ok(*canaux),
+                Err(e) => Err(format!("aac: {e}")),
+            },
             DecodeurRadio::Opus {
                 decodeur,
                 canaux,

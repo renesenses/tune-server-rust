@@ -1230,6 +1230,7 @@ fn decoded_radio_source_uses_the_detected_source_rate() {
                 format: Some("mp3"),
                 sample_rate: Some(48_000),
                 bit_depth: None,
+                ..Default::default()
             }),
             ..wire("wav", 48_000, 16)
         }),
@@ -3132,6 +3133,7 @@ fn radio_4346_signal_path_preserves_source_codec_and_output_container() {
                 format: codec,
                 sample_rate: rate,
                 bit_depth: bits,
+                ..Default::default()
             }),
             ..wire("wav", rate.unwrap_or(44_100).max(44_100), 16)
         };
@@ -3163,6 +3165,77 @@ fn radio_4346_signal_path_preserves_source_codec_and_output_container() {
             }
             assert!(step_desc(&sp, "Decoder").is_some());
         }
+    }
+}
+
+/// #6357 — une station HLS se nomme par son protocole, son profil réel et
+/// son débit mesuré : « HLS · HE-AAC 97 kbit/s 48kHz », et non un « AAC »
+/// qui tairait le SBR. Le débit de la lecture en cours, quand il existe,
+/// garde la main.
+#[test]
+fn radio_hls_6357_le_chemin_du_signal_nomme_hls_et_le_profil() {
+    use tune_core::http::streamer::RadioSourceInfo;
+    let (backend, mut zone) = dlna_zone();
+    zone.output_type = Some("dlna".into());
+    let ps = |bitrate: Option<u32>| ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            source: "radio".into(),
+            format: Some("wav".into()),
+            bitrate_kbps: bitrate,
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    for (profil, format, np_bitrate, attendu) in [
+        (
+            Some("HE-AAC"),
+            Some("aac"),
+            None,
+            "HLS · HE-AAC 97 kbit/s 48kHz",
+        ),
+        (
+            Some("HE-AACv2"),
+            Some("aac"),
+            None,
+            "HLS · HE-AACv2 97 kbit/s 48kHz",
+        ),
+        (
+            Some("AAC-LC"),
+            Some("aac"),
+            Some(320),
+            "HLS · AAC-LC 320 kbit/s 48kHz",
+        ),
+        (None, Some("mp3"), None, "HLS · MP3 97 kbit/s 48kHz"),
+    ] {
+        let stream = StreamInfo {
+            radio_source: Some(RadioSourceInfo {
+                channels: Some(2),
+                format,
+                sample_rate: Some(48_000),
+                transport: Some("hls"),
+                profil,
+                debit_kbps: Some(97),
+                ..Default::default()
+            }),
+            ..wire("wav", 48_000, 16)
+        };
+        let sp = build_signal_path(
+            &ps(np_bitrate),
+            &zone,
+            &backend,
+            Some("Renderer"),
+            "none",
+            Some(&stream),
+        )
+        .unwrap();
+        assert_eq!(step_desc(&sp, "Source").as_deref(), Some(attendu));
+        assert_eq!(
+            sp["lossless"],
+            json!(false),
+            "un HLS AAC ou MP3 est avec perte"
+        );
     }
 }
 
@@ -3242,6 +3315,7 @@ fn radio_4346_flac_truncated_before_local_output_is_not_bit_perfect() {
                 format: Some("flac"),
                 sample_rate: Some(96_000),
                 bit_depth: Some(24),
+                ..Default::default()
             }),
             ..wire("wav", 96_000, 16)
         };
@@ -3376,6 +3450,7 @@ fn codec_connu_4346_lossless_reste_un_booleen_sans_code() {
                 format: Some(codec),
                 sample_rate: Some(44_100),
                 bit_depth: bits,
+                ..Default::default()
             }),
             ..wire("wav", 44_100, 16)
         };

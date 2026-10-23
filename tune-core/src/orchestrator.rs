@@ -1316,8 +1316,9 @@ pub struct PlaybackOrchestrator {
     /// 3 min 12 s de journal, zéro abandon.
     ///
     /// Seuls les verdicts DÉFINITIFS entrent ici : `radio_not_audio` (le
-    /// serveur rend une page web) et `radio_hls_unsupported` (Tune ne sait pas
-    /// lire ce format). Une coupure réseau n'y entre pas — la reprise
+    /// serveur rend une page web), `radio_hls_unsupported` (Tune ne sait pas
+    /// lire cette forme de HLS) et `radio_flux_interdit` (le diffuseur refuse
+    /// l'accès, #6357) — voir `echec_radio_definitif`. Une coupure réseau n'y entre pas — la reprise
     /// légitime d'un flux qui tombe doit continuer de marcher.
     ///
     /// L'entrée est posée par la tâche de décodage et **effacée à chaque
