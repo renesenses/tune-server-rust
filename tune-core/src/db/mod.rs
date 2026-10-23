@@ -60,6 +60,8 @@ pub mod postgres;
 #[cfg(all(test, feature = "postgres"))]
 mod postgres_e2e;
 pub mod profile_repo;
+/// #6682 — le temps d'écoute radio par station (« Mon écoute »).
+pub mod radio_ecoute;
 pub mod radio_repo;
 /// #6500 — les stations de radio indexées comme pistes par l'UPnP, retirées.
 pub mod radios_indexees_upnp_6500;

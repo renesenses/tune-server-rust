@@ -467,7 +467,13 @@ async fn avtransport_control(
                             if result.error.is_none() {
                                 memoriser_lecture_renderer(&state, zone_id, &session).await;
                                 // #6335 — une suivante posée AVANT le Play.
-                                confier_la_suivante_a_la_file(&state, zone_id).await;
+                                // #6634 — sans elle, la file de la zone ne
+                                // porte plus que la courante : la fin de la
+                                // piste du contrôleur ne doit pas enchaîner
+                                // sur la file d'avant.
+                                if !confier_la_suivante_a_la_file(&state, zone_id).await {
+                                    prendre_la_file_pour_la_courante(&state, zone_id).await;
+                                }
                             }
                             info!(zone_id, uri = %session.uri, "upnp_renderer_play");
                             upnp_renderer::empty_response("Play")
@@ -1049,6 +1055,92 @@ async fn confier_la_suivante_a_la_file(state: &AppState, zone_id: i64) -> bool {
     confiee
 }
 
+/// #6634 — une lecture lancée par le point de contrôle PREND la file de la
+/// zone : `[courante]`, curseur dessus.
+///
+/// Le cas de terrain (Tades, fil 2348) : un Tune Windows lance une piste sur
+/// la façade d'une zone de son Tune OS. `orchestrator.play` (`source="upnp"`)
+/// ne touche ni la file ni son curseur ; la zone gardait donc la file
+/// qu'elle avait AVANT, et sa fin de piste (`handle_track_end`, ou la reprise
+/// après un flux lâché par le renderer) enchaînait sur la ligne suivante de
+/// CETTE file. Le Tune OS « prenait la main » et jouait un album que personne
+/// n'avait demandé, et le `Stop` du contrôleur était ensuite ignoré (zone
+/// reprise par Tune, #5167).
+///
+/// Même modèle que `confier_la_suivante_a_la_file`, qui remplace déjà la file
+/// par `[courante, suivante]` dès que le contrôleur arme une suivante : la
+/// suite de la lecture appartient au contrôleur. Quand une file `[courante]`
+/// ne s'arrêterait pas après la courante (répétition de la piste ou de la
+/// file, décision de `next_position`), la file est vidée : la zone s'arrête
+/// à la fin, comme le contrôleur l'attend.
+async fn prendre_la_file_pour_la_courante(state: &AppState, zone_id: i64) {
+    use tune_core::db::play_queue_repo::{PlayQueueRepo, StreamingQueueItem};
+    let ps = state.playback.get_state(zone_id).await;
+    let plan = {
+        let Ok(carte) = sessions().lock() else {
+            return;
+        };
+        let Some(session) = carte.get(&zone_id) else {
+            return;
+        };
+        if session.play_seq != Some(ps.play_seq) || !lecture_de_session(session, &ps) {
+            return;
+        }
+        let item: StreamingQueueItem = (
+            session.uri.clone(),
+            session.title.clone().unwrap_or_default(),
+            session.artist.clone().unwrap_or_default(),
+            None,
+            None,
+            session.duration_ms.unwrap_or(0),
+            Some("upnp".to_string()),
+            None,
+            None,
+        );
+        (session.revision, item)
+    };
+    let (revision, item) = plan;
+    let mut simulee = ps.clone();
+    simulee.queue_position = 0;
+    simulee.queue_length = 1;
+    let s_arrete_apres = tune_core::poller::PositionPoller::next_position(&simulee).is_none();
+    let repo = PlayQueueRepo::with_backend(state.backend.clone());
+    if !s_arrete_apres {
+        if repo.clear(zone_id).is_ok() {
+            state.playback.update_queue_info(zone_id, 0, 0).await;
+            info!(
+                zone_id,
+                repeat = ?ps.repeat,
+                "upnp_renderer_file_videe_pour_la_courante"
+            );
+        }
+        return;
+    }
+    let uri = item.0.clone();
+    if let Err(e) = repo.set_streaming_queue(zone_id, &[item]) {
+        warn!(zone_id, error = %e, "upnp_renderer_file_non_ecrite");
+        return;
+    }
+    state.playback.update_queue_info(zone_id, 0, 1).await;
+    // Le contexte a pu changer pendant l'écriture (Stop, nouvelle URI,
+    // suivante posée) : la file écrite n'est alors plus la bonne.
+    let prise = sessions().lock().ok().is_some_and(|mut carte| {
+        carte.get_mut(&zone_id).is_some_and(|session| {
+            if session.revision == revision && session.uri == uri && session.file.is_none() {
+                session.file = Some(vec![uri.clone()]);
+                true
+            } else {
+                false
+            }
+        })
+    });
+    if prise {
+        info!(zone_id, "upnp_renderer_file_prise_pour_la_courante");
+    } else {
+        retirer_notre_file(state, zone_id, std::slice::from_ref(&uri), Desarmer::Non).await;
+    }
+}
+
 /// Faut-il aussi effacer la suivante chez le renderer réel ? (#6335)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Desarmer {
@@ -1072,7 +1164,8 @@ async fn retirer_notre_file(state: &AppState, zone_id: i64, uris: &[String], des
     if repo.clear(zone_id).is_ok() {
         state.playback.update_queue_info(zone_id, 0, 0).await;
         info!(zone_id, "upnp_renderer_file_retiree");
-        if desarmer == Desarmer::Oui {
+        // Une file `[courante]` (#6634) n'a rien armé chez le renderer.
+        if desarmer == Desarmer::Oui && uris.len() > 1 {
             desarmer_la_suivante_du_renderer(state, zone_id).await;
         }
     }
