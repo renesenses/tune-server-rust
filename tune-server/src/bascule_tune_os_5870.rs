@@ -225,6 +225,23 @@ pub(crate) fn appliquer(
     verdict
 }
 
+/// #6774 — après une bascule, ramène l'état de lecture EN MÉMOIRE de chaque
+/// zone basculée au niveau de la base, à la baisse seulement
+/// (`reglages_de_volume::aligner_la_lecture`). Sans effet pour tout autre
+/// verdict.
+pub(crate) async fn realigner_la_lecture(state: &crate::state::AppState, verdict: &Verdict) {
+    if let Verdict::Basculer(bascules) = verdict {
+        for b in bascules {
+            tune_core::audio::reglages_de_volume::aligner_la_lecture(
+                &state.backend,
+                &state.playback,
+                b.zone_id,
+            )
+            .await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,5 +485,54 @@ mod tests {
             decider(true, &parc_ggb(), &zones),
             Verdict::Rien("aucune_zone_sur_default")
         );
+    }
+
+    /// #6774 — point laissé ouvert par #6797 : la bascule désarme PURE ou le
+    /// volume fixe EN BASE, mais l'état de lecture en mémoire (chargé avant,
+    /// 100 % pour un volume fixe) restait à 100 %. Il est ramené au niveau de
+    /// la base — 30 % du curseur au plus sans repère (décision du 23/10) — à
+    /// la baisse seulement, et rien n'est envoyé à l'appareil.
+    #[tokio::test]
+    async fn la_bascule_ramene_l_etat_de_lecture_a_la_baisse_seulement() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (zones, settings) = repos(&state.backend);
+        let id = zone_de(&zones, "This Computer", "local:Default Audio Device");
+        zones.update_volume(id, 100.0).unwrap();
+        zones.update_fixed_volume(id, true).unwrap();
+        state.playback.set_volume(id, 1.0).await;
+        let verdict = appliquer(&zones, &settings, true, &parc_ggb());
+        assert!(matches!(verdict, Verdict::Basculer(_)), "{verdict:?}");
+        assert!(!zones.get(id).unwrap().unwrap().fixed_volume);
+
+        realigner_la_lecture(&state, &verdict).await;
+
+        let base = zones.get(id).unwrap().unwrap().volume / 100.0;
+        let memoire = state.playback.get_state(id).await.volume;
+        assert!(
+            memoire <= base + 1e-12,
+            "#6774 : l'état de lecture reste à {memoire} au-dessus de la base {base} après la bascule"
+        );
+        assert!(
+            (base - tune_core::audio::volume_scale::gain_perceptif(0.30)).abs() < 1e-12,
+            "sortie locale sans repère : 30 % du curseur db60, reçu {base}"
+        );
+
+        // Jamais une hausse : une mémoire plus basse que la base reste.
+        state.playback.set_volume(id, 0.001).await;
+        realigner_la_lecture(&state, &verdict).await;
+        assert_eq!(state.playback.get_state(id).await.volume, 0.001);
+    }
+
+    /// Le démarrage appelle bien le réalignement juste après la bascule.
+    #[test]
+    fn le_demarrage_realigne_la_lecture_apres_la_bascule() {
+        let source = include_str!("startup.rs");
+        let bascule = source
+            .find("crate::bascule_tune_os_5870::appliquer(")
+            .expect("la bascule au démarrage");
+        let realigne = source
+            .find("crate::bascule_tune_os_5870::realigner_la_lecture(state, &verdict)")
+            .expect("#6774 : le démarrage ne réaligne pas la lecture après la bascule");
+        assert!(realigne > bascule);
     }
 }

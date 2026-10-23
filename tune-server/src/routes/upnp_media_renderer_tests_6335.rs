@@ -315,42 +315,115 @@ async fn un_next_en_milieu_de_piste_saute_tout_de_suite() {
     );
 }
 
-/// #6335 — sans `SetNextAVTransportURI`, rien ne change : la file de la zone
-/// n'est pas touchée, et `Stop` ou une nouvelle URI ne retirent que la file
-/// que la façade a écrite.
+fn ligne_de_service(uri: &str) -> tune_core::db::play_queue_repo::StreamingQueueItem {
+    (
+        uri.into(),
+        "x".into(),
+        String::new(),
+        None,
+        None,
+        0,
+        Some("qobuz".into()),
+        None,
+        None,
+    )
+}
+
+/// 🔴 #6634 — témoin. La zone avait sa propre file (un album lancé sur le
+/// Tune OS), curseur sur la première ligne. Le contrôleur lance une piste
+/// par SetURI + Play, SANS suivante : la fin de cette piste ne doit pas
+/// enchaîner sur la file d'avant. Avant le correctif, la file et son curseur
+/// restaient ceux du Tune OS, et le sondeur désignait leur ligne suivante —
+/// « Tune OS a pris la main », fil 2348, réponse 8718.
 #[tokio::test]
-async fn sans_suivante_la_file_de_la_zone_n_est_pas_touchee() {
-    use tune_core::db::play_queue_repo::StreamingQueueItem;
+async fn sans_suivante_la_fin_de_la_piste_n_enchaine_pas_sur_l_ancienne_file() {
     let b = Banc::new().await;
-    let ligne = |uri: &str| -> StreamingQueueItem {
-        (
-            uri.into(),
-            "x".into(),
-            String::new(),
-            None,
-            None,
-            0,
-            Some("qobuz".into()),
-            None,
-            None,
-        )
-    };
     PlayQueueRepo::with_backend(b.state.backend.clone())
-        .set_streaming_queue(b.zone, &[ligne("q1"), ligne("q2"), ligne("q3")])
+        .set_streaming_queue(
+            b.zone,
+            &[
+                ligne_de_service("q1"),
+                ligne_de_service("q2"),
+                ligne_de_service("q3"),
+            ],
+        )
         .unwrap();
-    let file_de_l_auditeur = b.file();
+    b.state.playback.update_queue_info(b.zone, 0, 3).await;
 
     b.controleur
         .play_media(&media(COURANTE, "Piste 1"))
         .await
         .expect("SetAVTransportURI + Play");
     assert_eq!(b.lectures().await, 1);
+
+    assert_eq!(
+        b.ligne_que_le_sondeur_armerait().await,
+        None,
+        "#6634 : à la fin de la piste lancée par le contrôleur, la zone ne doit \
+         enchaîner sur AUCUNE ligne de la file d'avant (file : {:?})",
+        b.file()
+    );
     assert_eq!(
         b.file(),
-        file_de_l_auditeur,
-        "SetURI + Play ne touche pas la file"
+        vec![(Some("upnp".into()), Some(COURANTE.into()))],
+        "#6634 : la file de la zone ne porte plus que la courante du contrôleur"
     );
+    let ps = b.state.playback.get_state(b.zone).await;
+    assert_eq!((ps.queue_position, ps.queue_length), (0, 1));
+
+    // La file est celle de la façade : un Stop la retire.
+    b.controleur.stop().await.ok();
+    assert!(b.file().is_empty(), "le Stop retire la file de la façade");
+}
+
+/// #6634 — répétition de la piste sur la zone : une file `[courante]` la
+/// rejouerait sans fin. La file est vidée, la zone s'arrête à la fin.
+#[tokio::test]
+async fn avec_la_repetition_de_la_piste_la_file_d_avant_est_videe() {
+    let b = Banc::new().await;
+    PlayQueueRepo::with_backend(b.state.backend.clone())
+        .set_streaming_queue(b.zone, &[ligne_de_service("q1"), ligne_de_service("q2")])
+        .unwrap();
+    b.state.playback.update_queue_info(b.zone, 0, 2).await;
+    b.state
+        .playback
+        .set_repeat(b.zone, tune_core::playback::RepeatMode::One)
+        .await;
+
+    b.controleur
+        .play_media(&media(COURANTE, "Piste 1"))
+        .await
+        .expect("SetAVTransportURI + Play");
+
+    assert!(b.file().is_empty(), "file : {:?}", b.file());
+    assert_eq!(b.ligne_que_le_sondeur_armerait().await, None);
+}
+
+/// #6335 — `Stop` ou une nouvelle URI ne retirent que la file que la façade a
+/// écrite. Une file que Tune a réécrite entre-temps (l'auditeur a lancé un
+/// album sur la zone) n'est plus la sienne, et elle reste.
+#[tokio::test]
+async fn le_stop_ne_retire_que_la_file_ecrite_par_la_facade() {
+    let b = Banc::new().await;
+    b.controleur
+        .play_media(&media(COURANTE, "Piste 1"))
+        .await
+        .expect("SetAVTransportURI + Play");
+    assert_eq!(b.lectures().await, 1);
     assert!(snapshot(&b.state, b.zone).await.next_uri.is_empty());
+
+    // L'auditeur réécrit la file de la zone dans Tune.
+    PlayQueueRepo::with_backend(b.state.backend.clone())
+        .set_streaming_queue(
+            b.zone,
+            &[
+                ligne_de_service("q1"),
+                ligne_de_service("q2"),
+                ligne_de_service("q3"),
+            ],
+        )
+        .unwrap();
+    let file_de_l_auditeur = b.file();
 
     // Stop sur une file qui n'est pas la nôtre : elle reste.
     b.controleur.stop().await.ok();

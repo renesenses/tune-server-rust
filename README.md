@@ -1,6 +1,33 @@
-# Tune Server (Rust)
+# Tune by Mozaiklabs — a self-hosted multi-room music server, a source-available alternative to Roon
 
-Multi-room music server written in Rust. Manages a local audio library with full-text search, streams from Tidal/Qobuz/Deezer (Spotify: browsing only), outputs to DLNA renderers and Chromecast devices, and serves a web client for control.
+**Tune by Mozaiklabs** is a self-hosted music server written in Rust: a Roon
+alternative you run at home, on macOS, Windows, Linux, Docker, a NAS, a
+Raspberry Pi or a mini-PC running Tune OS. It brings your local library (FLAC,
+ALAC, WAV, AIFF, DSD as DSF/DFF, SACD ISO, MP3, AAC…) and your own streaming
+accounts (Qobuz and TIDAL in high-resolution FLAC, Deezer; Spotify experimental)
+into one interface, and plays **bit-perfect** to the devices on your network,
+room by room (multiroom):
+
+- **DLNA / UPnP AV** renderers, with native DSD where the renderer accepts it — Tune is also a UPnP media server;
+- **OpenHome**, **AirPlay**, **Chromecast**, **Squeezebox / Squeezelite** (built-in SlimProto server), **HQPlayer**;
+- **OAAT**, an open network audio protocol (Apache 2.0), with the Tune Bridge receiver;
+- local outputs to a USB DAC: ALSA, CoreAudio (exclusive), WASAPI (exclusive), ASIO.
+
+It is controlled from any web browser (the server serves the web client) or
+from the Tune Remote apps for iOS and Android (beta). Version 1.0.0 is at the
+release candidate stage.
+
+| | |
+|---|---|
+| Website | <https://mozaiklabs.fr> |
+| Download (macOS, Windows, Linux, Docker, Tune OS) | <https://mozaiklabs.fr/download> |
+| Tune and Roon compared | <https://mozaiklabs.fr/alternative-roon?lang=en> |
+| Pricing (Tune Free, Premium) | <https://mozaiklabs.fr/pricing> |
+| Community forum | <https://mozaiklabs.fr/forum> |
+| Docker image | [`renesenses/tune`](https://hub.docker.com/r/renesenses/tune) |
+| Licence | Source-available: [Business Source License 1.1](LICENSE) — not open source |
+
+Tune is published by **Mozaiklabs**, France.
 
 ## Quick Start
 
@@ -118,7 +145,7 @@ tune-server/       Axum HTTP server (385 route handlers, 30 modules)
 - **Library**: Parallel file scanning (rayon), metadata extraction (lofty), FTS5 full-text search
 - **Ingest**: File a new folder into the library — preview the destination paths from a naming
   template, move or copy, then a targeted scan. Every job is undoable
-- **Streaming**: Tidal (OAuth + HiRes FLAC), Qobuz (signed URLs), Deezer (ARL); Spotify can be browsed and searched, but its tracks do not play
+- **Streaming**: Tidal (OAuth + HiRes FLAC), Qobuz (signed URLs), Deezer (ARL); Spotify experimental — browsing and search, playback through the built-in Spotify Connect receiver (librespot, 16-bit / 44.1 kHz)
 - **Outputs**: DLNA/UPnP (AVTransport SOAP), Chromecast (rust_cast), local (cpal)
 - **Discovery**: SSDP multicast + mDNS, auto-zone creation
 - **Playback**: Multi-zone, play queue, shuffle, repeat, gapless
@@ -227,4 +254,14 @@ the same one through `spotify_redirect_uri` in `tune.toml` or
 
 ## License
 
-Business Source License 1.1 — see [LICENSE](LICENSE).
+Tune by Mozaiklabs is **source-available**, not open source: it is released
+under the **Business Source License 1.1** — see [LICENSE](LICENSE).
+
+- Personal, non-commercial use is allowed, as are evaluation, testing,
+  academic use, contributions and writing about Tune (the *Additional Use
+  Grant* in [LICENSE](LICENSE)).
+- Commercial use — including embedding Tune in hardware or software sold,
+  leased or distributed to third parties — needs a separate commercial
+  licence from Mozaiklabs: licensing@mozaiklabs.fr.
+- Each release becomes available under the **Apache License 2.0** four years
+  after its publication (the *Change Date*).
