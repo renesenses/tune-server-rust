@@ -622,9 +622,24 @@ async fn local_ai_query(
         let result = executor
             .execute("set_volume", json!({ "volume": vol }))
             .await;
+        // #6836 — la réponse dit ce qui a été FAIT : une hausse trop grande
+        // est refusée par l'outil, et la phrase ne doit pas prétendre le
+        // contraire.
+        let reply = match result["error"].as_str() {
+            None => tr("ai.volumeSet").replace(
+                "{value}",
+                &((result["volume"].as_f64().unwrap_or(vol) * 100.0).round() as i32).to_string(),
+            ),
+            Some("volume_raise_too_large") => tr("ai.volumeRaiseLimited").replace(
+                "{value}",
+                &((result["max_volume_allowed"].as_f64().unwrap_or(0.0) * 100.0).floor() as i32)
+                    .to_string(),
+            ),
+            Some(_) => tr("ai.volumeRefused"),
+        };
         actions.push(json!({ "tool": "set_volume", "result": result }));
         return Ok(Json(json!({
-            "reply": tr("ai.volumeSet").replace("{value}", &((vol * 100.0) as i32).to_string()),
+            "reply": reply,
             "actions": actions,
             "zone_id": executor.zone_id(),
         })));
