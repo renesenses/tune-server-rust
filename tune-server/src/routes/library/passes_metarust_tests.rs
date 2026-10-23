@@ -287,6 +287,10 @@ fn ecrire_metronome(chemin: &std::path::Path, bpm: f64, secondes: u32) {
 #[tokio::test]
 async fn la_passe_bpm_mesure_un_vrai_fichier_par_la_route() {
     let _seul = PASSE_BPM_SERIALISEE.lock().await;
+    // #6862 : la passe lit le miroir GLOBAL des pauses (`refus_commun`,
+    // `attendre_la_reprise`) ; un témoin qui suspend l'enrichissement en
+    // parallèle lui rendrait 409 `enrichissement_en_pause` ou la garerait.
+    let _pauses = crate::pauses_de_fond_tests::isoler().await;
     let dossier = tempfile::tempdir().unwrap();
     let chemin = dossier.path().join("metronome.wav");
     ecrire_metronome(&chemin, 120.0, 20);
@@ -384,6 +388,10 @@ fn une_proposition_perimee_est_relue_par_la_passe() {
 #[tokio::test]
 async fn les_passes_sont_gratuites() {
     let _seul = PASSE_BPM_SERIALISEE.lock().await;
+    // #6862 : la passe lit le miroir GLOBAL des pauses (`refus_commun`,
+    // `attendre_la_reprise`) ; un témoin qui suspend l'enrichissement en
+    // parallèle lui rendrait 409 `enrichissement_en_pause` ou la garerait.
+    let _pauses = crate::pauses_de_fond_tests::isoler().await;
     let e = etat();
     assert!(
         !e.license

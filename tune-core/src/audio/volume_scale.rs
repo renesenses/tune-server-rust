@@ -16,6 +16,40 @@
 //! il le veut dire après. Il donne seulement à ce même nombre sa lecture
 //! d'audiophile, l'atténuation en dB par rapport à la pleine échelle.
 //!
+//! ## Le curseur perceptif des sorties logicielles (#6787)
+//!
+//! Sur une sortie LOGICIELLE (sortie locale, zone navigateur), `volume`
+//! multiplie les échantillons : 50 % ne valent que −6 dB, et il fallait
+//! descendre vers 5 % pour un niveau d'écoute (fil ASR #49). Le remède est un
+//! CURSEUR en dB — la loi `db60`, [`gain_perceptif`] : 60 dB de course, chaque
+//! point vaut 0,6 dB, prolongée sous [`GENOU_PERCEPTIF`] (10 %, −54 dB) par
+//! une droite jusqu'au silence.
+//!
+//! **`volume` garde son sens historique partout** — base (`zones.volume`),
+//! API, WebSocket, sauvegardes, réglages enregistrés (limites #6541, mémoire
+//! du volume fixe), état de lecture, rendu : le GAIN linéaire. La loi `db60`
+//! ne vit que dans le curseur, que le client lit et écrit à travers
+//! [`position_perceptive`] et [`gain_perceptif`], quand la zone publie
+//! `volume_curve: "db60"` ([`EchelleDeVolume::code`]). Décision de Bertrand du
+//! 23/10 : un volume enregistré est « converti au même niveau en dB » — une
+//! zone qui jouait à 5 % (−26 dB) se lit à 57 % sur le curseur et joue
+//! EXACTEMENT au même niveau. Ce choix borne, par construction, les trois cas
+//! où un nombre converti en base aurait joué jusqu'à +21 dB plus fort :
+//!
+//! - retour à une version antérieure : la base n'a pas changé de sens, elle
+//!   relit le même gain ;
+//! - zone passée de la sortie locale à un appareil réseau : le nombre est un
+//!   gain, l'appareil le reçoit sur son échelle 0..100 au même dB nominal
+//!   (−26 dB → 5, pas 57) ;
+//! - client qui applique `volume` en linéaire (app iOS #99, Flutter, zone
+//!   navigateur d'un client ancien) : il applique le bon gain.
+//!
+//! Aucune valeur enregistrée n'est donc réécrite : il n'y a pas de migration à
+//! marquer, ni rien qui puisse se rejouer. La seule conversion est celle du
+//! curseur, arrondie vers le BAS : `gain_perceptif(position_perceptive(g)) <=
+//! g`, à moins d'un millième de dB près, et un aller-retour de plus ne change
+//! plus rien (témoins `la_conversion_du_curseur_*`).
+//!
 //! ## Trois règles qu'aucune évolution ne doit casser
 //!
 //! 1. **Le zéro est le silence, pas un plancher.** `linear_to_db(0.0)` rend
@@ -34,6 +68,153 @@
 //! **utilisateur**, celui du curseur, et rien d'autre — le champ `volume_db`
 //! d'une charge utile est donc toujours la lecture en dB du champ `volume`
 //! qui l'accompagne, jamais celle du gain réellement appliqué.
+
+/// #6787 — course de la loi `db60` : 0 % → −60 dB (avant le genou), 100 % →
+/// 0 dB. Chaque point de curseur vaut 0,6 dB.
+pub const PLAGE_PERCEPTIVE_DB: f64 = 60.0;
+
+/// #6787 — sous cette position, la loi en dB laisse place à une droite
+/// jusqu'au silence : 0 reste le silence exact.
+pub const GENOU_PERCEPTIF: f64 = 0.1;
+
+/// Gain linéaire de la loi en dB au genou : 10^(−54/20) ≈ 0,001995.
+fn gain_au_genou() -> f64 {
+    10f64.powf(-PLAGE_PERCEPTIVE_DB * (1.0 - GENOU_PERCEPTIF) / 20.0)
+}
+
+/// #6787 — le gain (linéaire, 0..1) d'une position de curseur `db60`.
+///
+/// * `p >= GENOU_PERCEPTIF` : `10^(−60·(1 − p)/20)` ;
+/// * `0 < p < GENOU_PERCEPTIF` : la droite `gain_au_genou · p / GENOU` ;
+/// * `p <= 0` (ou `NaN`) : 0, le silence ; `p >= 1` : 1.
+///
+/// Repères : 10 % → −54 dB, 25 % → −45 dB, 50 % → −30 dB, 100 % → 0 dB.
+/// Strictement croissante.
+// `!(x > 0.0)` n'est pas `x <= 0.0` : seul le premier écarte `NaN`.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+pub fn gain_perceptif(position: f64) -> f64 {
+    if !(position > 0.0) {
+        return 0.0;
+    }
+    if position >= 1.0 {
+        return 1.0;
+    }
+    if position < GENOU_PERCEPTIF {
+        return gain_au_genou() * position / GENOU_PERCEPTIF;
+    }
+    10f64.powf(-PLAGE_PERCEPTIVE_DB * (1.0 - position) / 20.0)
+}
+
+/// #6787 — la position de curseur `db60` d'un gain linéaire, arrondie vers le
+/// BAS : `gain_perceptif(position_perceptive(g)) <= g` pour tout `g`. Un client
+/// qui relit cette position et la renvoie ne monte donc jamais le son, même
+/// d'un ulp.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+pub fn position_perceptive(gain: f64) -> f64 {
+    if !(gain > 0.0) {
+        return 0.0;
+    }
+    if gain >= 1.0 {
+        return 1.0;
+    }
+    let genou = gain_au_genou();
+    let mut p = if gain < genou {
+        (gain / genou * GENOU_PERCEPTIF).clamp(0.0, GENOU_PERCEPTIF)
+    } else {
+        (1.0 + 20.0 * gain.log10() / PLAGE_PERCEPTIVE_DB).clamp(GENOU_PERCEPTIF, 1.0)
+    };
+    // L'inverse en flottants peut tomber d'un ulp au-dessus : on redescend
+    // jusqu'à la première position qui ne rend pas plus que `gain`.
+    while p > 0.0 && gain_perceptif(p) > gain {
+        p = f64::from_bits(p.to_bits() - 1);
+    }
+    // Et la plus HAUTE position qui ne le dépasse pas : relire puis renvoyer
+    // le curseur une seconde fois rend alors exactement le même gain (point
+    // fixe). Quelques ulp au plus.
+    for _ in 0..8 {
+        let suivante = f64::from_bits(p.to_bits() + 1);
+        if suivante <= 1.0 && gain_perceptif(suivante) <= gain {
+            p = suivante;
+        } else {
+            break;
+        }
+    }
+    p
+}
+
+/// #6787 — la loi du CURSEUR d'une zone. `volume` reste le gain dans les deux
+/// cas ; seule la position que le client affiche en dépend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchelleDeVolume {
+    /// Appareil réseau : le curseur EST le nombre envoyé sur l'échelle 0..100
+    /// de l'appareil, qui a sa propre courbe (pas de double courbe).
+    Lineaire,
+    /// Sortie logicielle (sortie locale, zone navigateur) : curseur `db60`.
+    Perceptive,
+}
+
+impl EchelleDeVolume {
+    /// Seules les sorties dont le volume est un gain numérique appliqué au
+    /// PCM sont perceptives : `local` (bras exclusifs ASIO, WASAPI, CoreAudio
+    /// compris) et `browser`. Tout le reste, et une zone sans sortie, reste
+    /// linéaire.
+    pub fn de_la_sortie(output_type: Option<&str>) -> Self {
+        match output_type {
+            Some("local") | Some("browser") => Self::Perceptive,
+            _ => Self::Lineaire,
+        }
+    }
+
+    /// Code publié dans `volume_curve` (`linear` | `db60`).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Lineaire => "linear",
+            Self::Perceptive => "db60",
+        }
+    }
+
+    /// La position du curseur (0..1) pour le gain `volume`, arrondie vers le
+    /// bas.
+    pub fn position(self, volume: f64) -> f64 {
+        let volume = if volume.is_finite() { volume } else { 0.0 };
+        match self {
+            Self::Lineaire => volume.clamp(0.0, 1.0),
+            Self::Perceptive => position_perceptive(volume),
+        }
+    }
+
+    /// Le gain `volume` (0..1) d'une position de curseur.
+    pub fn gain(self, position: f64) -> f64 {
+        let position = if position.is_finite() { position } else { 0.0 };
+        match self {
+            Self::Lineaire => position.clamp(0.0, 1.0),
+            Self::Perceptive => gain_perceptif(position),
+        }
+    }
+}
+
+/// L'échelle du curseur de la zone `zone_id`, lue en base
+/// (`zones.output_type`). Zone inconnue : linéaire.
+pub fn echelle_de_la_zone(
+    db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    zone_id: i64,
+) -> EchelleDeVolume {
+    let output_type = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_type);
+    EchelleDeVolume::de_la_sortie(output_type.as_deref())
+}
+
+/// #6787 — pose `volume_curve` dans une charge utile de zone, à côté de
+/// `volume` et `volume_db` (qui restent le gain et sa lecture en dB).
+pub fn inserer_courbe(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    echelle: EchelleDeVolume,
+) {
+    obj.insert("volume_curve".into(), serde_json::json!(echelle.code()));
+}
 
 /// Plafond de l'échelle : 0 dB, l'unité. Au-delà, il n'y a pas de volume en
 /// plus, seulement de l'écrêtage.
@@ -354,6 +535,128 @@ mod tests {
                 None,
                 "{resolution:?}"
             );
+        }
+    }
+
+    // ── #6787 — le curseur perceptif des sorties logicielles ──────────────
+
+    #[test]
+    fn les_db_a_10_25_50_100() {
+        for (position, attendu) in [(0.10, -54.0), (0.25, -45.0), (0.50, -30.0), (1.0, 0.0)] {
+            let db = linear_to_db(gain_perceptif(position)).expect("audible");
+            assert!(
+                (db - attendu).abs() < 1e-9,
+                "{position} → {db} dB, attendu {attendu}"
+            );
+        }
+        // Le niveau que le testeur cherchait à 5 % (−26 dB) tombe vers 57 %.
+        let pos = EchelleDeVolume::Perceptive.position(db_to_linear(-26.0).unwrap());
+        assert!((pos - 0.5666).abs() < 1e-3, "{pos}");
+        assert_eq!(gain_perceptif(0.0), 0.0, "0 reste le silence");
+        assert_eq!(gain_perceptif(1.0), 1.0);
+        assert_eq!(gain_perceptif(f64::NAN), 0.0);
+        assert_eq!(position_perceptive(0.0), 0.0);
+        assert_eq!(position_perceptive(1.0), 1.0);
+        assert_eq!(position_perceptive(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn la_loi_est_continue_et_strictement_croissante() {
+        let mut precedent = 0.0;
+        for i in 1..=100_000u32 {
+            let g = gain_perceptif(f64::from(i) / 100_000.0);
+            assert!(g > precedent, "{i} : {g} <= {precedent}");
+            precedent = g;
+        }
+        let juste_avant = gain_perceptif(GENOU_PERCEPTIF - 1e-12);
+        let au_genou = gain_perceptif(GENOU_PERCEPTIF);
+        assert!((au_genou - juste_avant).abs() < 1e-12);
+    }
+
+    #[test]
+    fn seules_les_sorties_logicielles_ont_un_curseur_perceptif() {
+        use EchelleDeVolume::{Lineaire, Perceptive};
+        assert_eq!(EchelleDeVolume::de_la_sortie(Some("local")), Perceptive);
+        assert_eq!(EchelleDeVolume::de_la_sortie(Some("browser")), Perceptive);
+        for t in [
+            "dlna",
+            "openhome",
+            "airplay",
+            "airplay2",
+            "chromecast",
+            "bluos",
+            "sonos",
+            "squeezebox",
+            "slimproto",
+            "hqplayer",
+            "oaat",
+            "bridge",
+        ] {
+            assert_eq!(EchelleDeVolume::de_la_sortie(Some(t)), Lineaire, "{t}");
+        }
+        assert_eq!(EchelleDeVolume::de_la_sortie(None), Lineaire);
+        assert_eq!(Perceptive.code(), "db60");
+        assert_eq!(Lineaire.code(), "linear");
+        // Sur un appareil, le curseur EST le nombre.
+        assert_eq!(Lineaire.position(0.37), 0.37);
+        assert_eq!(Lineaire.gain(0.37), 0.37);
+    }
+
+    /// Décision de Bertrand du 23/10 : un volume enregistré se lit « au même
+    /// niveau en dB ». Pour tout volume stocké de 0 à 100 % par pas de 0,1 %
+    /// et tout trim de −12 à +12 dB, le niveau rendu après qu'un client a lu
+    /// le curseur et l'a renvoyé n'est JAMAIS plus haut qu'avant, et au plus
+    /// 0,01 dB plus bas.
+    #[test]
+    fn la_conversion_du_curseur_ne_monte_jamais_et_garde_le_niveau() {
+        let e = EchelleDeVolume::Perceptive;
+        let tolerance = 10f64.powf(-0.01 / 20.0);
+        for pour_mille in 0..=1000u32 {
+            let stocke = f64::from(pour_mille) / 1000.0;
+            let position = e.position(stocke);
+            let renvoye = e.gain(position);
+            for demi_db in -24..=24i32 {
+                let trim = f64::from(demi_db) / 2.0;
+                let avant = crate::orchestrator::volume_avec_trim(stocke, trim);
+                let apres = crate::orchestrator::volume_avec_trim(renvoye, trim);
+                assert!(
+                    apres <= avant,
+                    "{stocke} (trim {trim} dB) : {apres} > {avant} — le curseur monterait le son"
+                );
+                assert!(
+                    apres >= avant * tolerance,
+                    "{stocke} (trim {trim} dB) : {apres} < {avant} − 0,01 dB"
+                );
+            }
+        }
+        // Et au millionième sur toute l'échelle, sans trim.
+        for i in 0..=1_000_000u32 {
+            let g = f64::from(i) / 1_000_000.0;
+            let r = e.gain(e.position(g));
+            assert!(r <= g, "{g} → {r}");
+            assert!(r >= g * tolerance, "{g} → {r}");
+        }
+    }
+
+    /// La conversion rejouée ne change rien : relire le curseur et le
+    /// renvoyer une deuxième, une dixième fois rend exactement le même gain.
+    #[test]
+    fn la_conversion_du_curseur_rejouee_ne_change_rien() {
+        let e = EchelleDeVolume::Perceptive;
+        for pour_mille in 0..=1000u32 {
+            let stocke = f64::from(pour_mille) / 1000.0;
+            let une_fois = e.gain(e.position(stocke));
+            let mut g = une_fois;
+            for _ in 0..10 {
+                g = e.gain(e.position(g));
+            }
+            assert_eq!(
+                g.to_bits(),
+                une_fois.to_bits(),
+                "{stocke} : {une_fois} puis {g}"
+            );
+            let p = e.position(stocke);
+            assert_eq!(e.position(e.gain(p)).to_bits(), p.to_bits(), "{stocke}");
         }
     }
 }

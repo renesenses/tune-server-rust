@@ -229,6 +229,10 @@ pub(super) async fn pas_de_volume(
         return StatusCode::NOT_FOUND.into_response();
     };
     let actuel = state.playback.get_state(id).await.volume;
+    // #6787 — le pas en points se fait sur le curseur de la zone (`db60` sur
+    // une sortie logicielle) ; `actuel` et la cible restent des gains.
+    let echelle =
+        tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(zone.output_type.as_deref());
     let cible = match (body.step, body.step_db) {
         (Some(_), Some(_)) => {
             return refus(
@@ -242,7 +246,7 @@ pub(super) async fn pas_de_volume(
                 format!("step_db doit être compris entre 0 (exclu) et {PAS_MAXIMAL_DB}"),
             );
         }
-        (None, Some(d)) => volume_limites::cible_du_pas_db(actuel, signe * d),
+        (None, Some(d)) => volume_limites::cible_du_pas_db_du_curseur(echelle, actuel, signe * d),
         (pas, None) => {
             let pas = pas.unwrap_or(PAS_PAR_DEFAUT);
             if !(pas.is_finite() && pas > 0.0 && pas <= PAS_MAXIMAL) {
@@ -251,7 +255,7 @@ pub(super) async fn pas_de_volume(
                     format!("step doit être compris entre 0 (exclu) et {PAS_MAXIMAL}"),
                 );
             }
-            volume_limites::cible_du_pas(actuel, signe * pas)
+            volume_limites::cible_du_pas_du_curseur(echelle, actuel, signe * pas)
         }
     };
     if let Err(error) = state
@@ -265,6 +269,7 @@ pub(super) async fn pas_de_volume(
     let mut obj = serde_json::Map::new();
     obj.insert("zone_id".into(), json!(id));
     tune_core::audio::volume_scale::inserer_volume(&mut obj, retenu);
+    tune_core::audio::volume_scale::inserer_courbe(&mut obj, echelle);
     // `limited` : la sécurité a retenu le pas — le client peut le dire au
     // lieu de laisser croire à un bouton cassé.
     obj.insert("limited".into(), json!(retenu + 1e-9 < cible));

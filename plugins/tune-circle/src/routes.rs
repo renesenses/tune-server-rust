@@ -43,6 +43,10 @@
 //! | `GET /contacts/{user_id}/library/tracks?…`             | idem, requête comprise                 |
 //! | `GET /library-sync`                                    | — (état LOCAL de la copie en ligne)    |
 //!
+//! rc8 (#6900), l'écran de Levente et le globe opt-in, dans [`crate::globe`] :
+//! `GET /contacts/{user_id}/library/summary`, `GET|PUT|DELETE /me/location`,
+//! `GET /contacts/locations`, relayés à l'identique.
+//!
 //! T4, l'écoute chez un contact (#5327), Premium : `POST
 //! /contacts/{user_id}/listen`, dans [`crate::ecoute`].
 //!
@@ -142,6 +146,18 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
             "/contacts/{user_id}/library/tracks",
             get(bibliotheque_pistes),
         )
+        // Tune Circle rc8 (#6900) : l'écran de Levente et le globe opt-in.
+        .route(
+            "/contacts/{user_id}/library/summary",
+            get(crate::globe::resume_de_la_bibliotheque),
+        )
+        .route(
+            "/me/location",
+            get(crate::globe::mon_lieu)
+                .put(crate::globe::poser_mon_lieu)
+                .delete(crate::globe::retirer_mon_lieu),
+        )
+        .route("/contacts/locations", get(crate::globe::lieux_des_contacts))
         .with_state(relais)
         .merge(etat_de_la_copie)
 }
