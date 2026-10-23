@@ -103,6 +103,11 @@ pub struct Demande {
     pub max_jetons: u32,
     /// Demander une réponse JSON quand le fournisseur sait la garantir.
     pub json: bool,
+    /// L'effort de réflexion à demander (`output_config.effort`), pour un
+    /// usage court ([`crate::couts::usage_court`]). Envoyé SEULEMENT aux
+    /// modèles qui l'acceptent ([`crate::couts::accepte_effort`]) : Haiku 4.5
+    /// le refuse par un 400. `None` : l'effort par défaut du modèle.
+    pub effort: Option<&'static str>,
 }
 
 /// Ce que le modèle rend, et ce que l'appel a coûté en jetons.
@@ -352,6 +357,28 @@ pub(crate) fn jetons(v: &Value, cle: &str) -> u64 {
     v.get(cle).and_then(Value::as_u64).unwrap_or(0)
 }
 
+/// Pose `output_config.effort` sur un corps de l'API Messages, si un effort
+/// est demandé ET que `modele` l'accepte. Sinon, le corps reste tel quel.
+pub(crate) fn poser_effort(corps: &mut Value, modele: &str, effort: Option<&str>) {
+    if let Some(e) = effort
+        && crate::couts::accepte_effort(modele)
+    {
+        corps["output_config"] = json!({ "effort": e });
+    }
+}
+
+/// Pose `options.num_ctx` sur un corps d'Ollama (`/api/chat`), d'après la
+/// taille de ce qu'il porte déjà (`messages`, `tools`) et la sortie attendue
+/// ([`crate::couts::num_ctx_ollama`]).
+pub(crate) fn poser_num_ctx(corps: &mut Value, max_sortie: u32) {
+    let taille = corps
+        .get("messages")
+        .map(|m| m.to_string().len())
+        .unwrap_or(0)
+        + corps.get("tools").map(|t| t.to_string().len()).unwrap_or(0);
+    corps["options"] = json!({ "num_ctx": crate::couts::num_ctx_ollama(taille, max_sortie) });
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic
 // ---------------------------------------------------------------------------
@@ -363,12 +390,13 @@ struct Anthropic {
 #[async_trait]
 impl Fournisseur for Anthropic {
     async fn completer(&self, d: &Demande) -> Result<Reponse, ErreurFournisseur> {
-        let corps = json!({
+        let mut corps = json!({
             "model": d.modele,
             "max_tokens": d.max_jetons,
             "system": d.systeme,
             "messages": [{ "role": "user", "content": d.message }],
         });
+        poser_effort(&mut corps, &d.modele, d.effort);
         let rep = client()
             .post(format!("{}/v1/messages", base(&self.acces)))
             .header("x-api-key", self.acces.cle.as_deref().unwrap_or(""))
@@ -495,6 +523,7 @@ impl Fournisseur for Ollama {
         if d.json {
             corps["format"] = json!("json");
         }
+        poser_num_ctx(&mut corps, d.max_jetons);
         let rep = client()
             .post(format!("{}/api/chat", base(&self.acces)))
             .timeout(DELAI)
@@ -620,6 +649,31 @@ mod tests {
             !m.contains("AIza"),
             "#6730 : une clé Gemini part dans le motif : {m}"
         );
+    }
+
+    #[test]
+    fn l_effort_n_est_pose_que_pour_un_modele_qui_l_accepte() {
+        let mut c = json!({"model": "claude-haiku-5-5"});
+        poser_effort(&mut c, "claude-haiku-5-5", Some("low"));
+        assert_eq!(c["output_config"]["effort"], "low");
+        let mut c = json!({"model": "claude-haiku-4-5"});
+        poser_effort(&mut c, "claude-haiku-4-5", Some("low"));
+        assert!(
+            c.get("output_config").is_none(),
+            "Haiku 4.5 refuse `effort` par un 400 : {c}"
+        );
+        let mut c = json!({});
+        poser_effort(&mut c, "claude-haiku-5-5", None);
+        assert!(c.get("output_config").is_none(), "{c}");
+    }
+
+    #[test]
+    fn ollama_recoit_un_contexte_a_la_taille_de_la_demande() {
+        let long = "x".repeat(60_000);
+        let mut c = json!({"messages": [{"role": "user", "content": long}]});
+        poser_num_ctx(&mut c, 4096);
+        let n = c["options"]["num_ctx"].as_u64().unwrap();
+        assert!(n >= 20_000 + 4096, "contexte trop court : {n}");
     }
 
     #[test]
