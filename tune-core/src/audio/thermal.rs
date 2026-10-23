@@ -745,7 +745,8 @@ pub fn lecture_thermique() -> LectureThermique {
                 motif = m.id(),
                 largeur = LARGEUR_SANS_THERMOMETRE,
                 "analyses_bridees_sans_thermometre — température non lisible sur cette machine : \
-                 les analyses de fond passent à un fichier à la fois"
+                 les analyses de fond passent à un fichier à la fois, sauf si le bridage est \
+                 levé dans les réglages (#6713)"
             ),
             None if precedente.is_some() => {
                 info!("analyses_debridees — la température est de nouveau lisible")
