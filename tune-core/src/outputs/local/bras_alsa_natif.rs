@@ -721,7 +721,17 @@ pub(super) fn jouer_via_alsa_natif(mut backend: BackendAlsaNatif<'_>, ctx: Conte
         chain_exhausted.store(true, Ordering::SeqCst);
         debug!("local_audio_gapless_chain_exhausted");
     }
-    let _ = etage.rendre_la_queue(&mut *puits);
+    // #6842 — la chaîne s'arrête sur un puits mort ; la famine est dite au
+    // nom du backend, et un anneau que plus personne ne draine ne se vide pas.
+    let puits_mort = issue.fin == FinDeChaine::PuitsMort || !etage.rendre_la_queue(&mut *puits);
+    if puits_mort {
+        record_feed_stall_failure(
+            "ALSA S32",
+            device_name,
+            position_ms.load(Ordering::Relaxed),
+            open_failure,
+        );
+    }
 
     if issue.http_eof {
         track_ended_naturally.store(true, Ordering::SeqCst);
@@ -733,7 +743,9 @@ pub(super) fn jouer_via_alsa_natif(mut backend: BackendAlsaNatif<'_>, ctx: Conte
         u64::from(sortie.cadence),
         u64::from(sortie.canaux),
     );
-    let _ = backend.drainer(borne);
+    if !puits_mort {
+        let _ = backend.drainer(borne);
+    }
 
     drop(puits);
     drop(backend);
