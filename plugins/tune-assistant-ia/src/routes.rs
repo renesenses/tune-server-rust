@@ -837,7 +837,21 @@ async fn notes_ecrire(
         Ok(r) => r,
         Err(e) => return appel::reponse_erreur(&e),
     };
+    // Une réponse refusée ne doit pas rester servie par le cache : le
+    // prochain essai repartirait sur la même réponse, refusée à nouveau.
+    let oublier = || {
+        if let Some(f) = reglages::Reglages::charger(&etat.backend).famille {
+            etat.cache.effacer(&cache::cle(&[
+                appel::VERSION_CONSIGNES,
+                crate::notes::USAGE_NOTES,
+                f.nom(),
+                &modele,
+                &entree,
+            ]));
+        }
+    };
     let Some(brut) = appel::objet_json(&res.texte) else {
+        oublier();
         return erreur(
             StatusCode::UNPROCESSABLE_ENTITY,
             "reponse_invalide",
@@ -847,6 +861,7 @@ async fn notes_ecrire(
     let notes = match crate::notes::valider(&brut, &ctx) {
         Ok(n) => n,
         Err(code) => {
+            oublier();
             warn!(album_id = id, code, "assistant_ia_notes_hors_schema");
             return erreur(
                 StatusCode::UNPROCESSABLE_ENTITY,

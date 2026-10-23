@@ -181,6 +181,16 @@ async fn une_reponse_sans_paragraphe_source_est_refusee_422() {
         StatusCode::NOT_FOUND,
         "une réponse refusée ne doit rien ranger"
     );
+    // Le nouvel essai repart chez le fournisseur : la réponse refusée n'est
+    // pas servie par le cache.
+    *b.faux.texte.lock().unwrap() = bonne_reponse();
+    let (s, v) = appel(&b, "POST", "/albums/10/notes", None).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "la réponse refusée est restée en cache : {v}"
+    );
+    assert_eq!(b.faux.appels.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
