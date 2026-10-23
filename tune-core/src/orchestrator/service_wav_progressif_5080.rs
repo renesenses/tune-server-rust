@@ -86,7 +86,7 @@ fn zone_du_fil_1949(orch: &PlaybackOrchestrator) -> i64 {
     zone_id
 }
 
-fn requete_qobuz(zone_id: i64) -> PlayRequest {
+pub(super) fn requete_qobuz(zone_id: i64) -> PlayRequest {
     PlayRequest {
         zone_id,
         output_device_id: None,
@@ -109,7 +109,11 @@ fn requete_qobuz(zone_id: i64) -> PlayRequest {
     }
 }
 
-fn flux_qobuz(url: String, sample_rate: u32, bit_depth: u16) -> crate::streaming::StreamUrl {
+pub(super) fn flux_qobuz(
+    url: String,
+    sample_rate: u32,
+    bit_depth: u16,
+) -> crate::streaming::StreamUrl {
     crate::streaming::StreamUrl {
         url,
         mime_type: "audio/flac".into(),
@@ -125,7 +129,7 @@ fn flux_qobuz(url: String, sample_rate: u32, bit_depth: u16) -> crate::streaming
     }
 }
 
-fn info_amont(flux: &crate::streaming::StreamUrl) -> StreamInfo {
+pub(super) fn info_amont(flux: &crate::streaming::StreamUrl) -> StreamInfo {
     StreamInfo {
         format: "flac".into(),
         mime_type: flux.mime_type.clone(),
@@ -140,7 +144,7 @@ fn info_amont(flux: &crate::streaming::StreamUrl) -> StreamInfo {
 /// l'a pas libéré — un téléchargement qui n'en finit pas. Libéré, il répond
 /// 503 : les fils bloquants encore suspendus sur lui se terminent, et le
 /// runtime du test peut s'arrêter.
-async fn cdn_muet() -> (String, tokio::sync::watch::Sender<bool>) {
+pub(super) async fn cdn_muet() -> (String, tokio::sync::watch::Sender<bool>) {
     let (liberer, attente) = tokio::sync::watch::channel(false);
     let app = Router::new().route(
         "/piste.flac",

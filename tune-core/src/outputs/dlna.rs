@@ -528,6 +528,9 @@ pub struct DlnaOutput {
     /// #4971 — boîte noire du contact SOAP : derniers échanges, perte et
     /// retour du renderer portés au journal INFO une fois par bascule.
     contact: std::sync::Mutex<super::dlna_contact::JournalDeContact>,
+    /// #6599 — empreinte du dernier Sink porté au journal : chaque renderer
+    /// y laisse son `GetProtocolInfo` une fois, puis à chaque changement.
+    sink_journalise: std::sync::Mutex<Option<u64>>,
     /// Bornes et mémoire de la redécouverte ciblée (#3829).
     redecouverte: Redecouverte,
     client: Client,
@@ -832,6 +835,7 @@ impl DlnaOutput {
             duree_annoncee: tokio::sync::Mutex::new(None),
             pose_courante: std::sync::Mutex::new(None),
             contact: std::sync::Mutex::new(super::dlna_contact::JournalDeContact::default()),
+            sink_journalise: std::sync::Mutex::new(None),
         }
     }
 
@@ -3744,13 +3748,65 @@ impl DlnaOutput {
             )
             .await?;
         let sink = extract_tag(&body, "Sink").unwrap_or_default();
-        Ok(sink
+        let sink: Vec<String> = sink
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .collect())
+            .collect();
+        self.journaliser_le_sink(&sink);
+        Ok(sink)
+    }
+
+    /// #6599 — porter le Sink sondé au journal INFO, une fois par renderer et
+    /// par contenu. Le rapport de l'Eversolo A6 (fil 2356) ne contenait le
+    /// Sink d'AUCUN renderer : la cible à deux canaux ne pouvait être ni
+    /// confirmée ni contredite.
+    fn journaliser_le_sink(&self, sink: &[String]) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        sink.hash(&mut h);
+        let empreinte = h.finish();
+        {
+            let mut deja = self
+                .sink_journalise
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *deja == Some(empreinte) {
+                return;
+            }
+            *deja = Some(empreinte);
+        }
+        info!(
+            device = %self.name,
+            device_id = %self.device_id,
+            entrees = sink.len(),
+            canaux_max = ?canaux_annonces_par_le_sink(sink),
+            sink = %sink_pour_le_journal(sink),
+            "dlna_sink_sonde"
+        );
     }
 }
+
+/// #6599 — le Sink en une ligne de journal bornée : les entrées séparées par
+/// une virgule, coupées au-delà de [`SINK_JOURNAL_MAX`] octets avec le nombre
+/// d'entrées omises. Un Sink de renderer haut de gamme dépasse souvent cent
+/// entrées ; la ligne doit rester lisible dans un rapport.
+pub fn sink_pour_le_journal(sink: &[String]) -> String {
+    let mut ligne = String::new();
+    for (i, entree) in sink.iter().enumerate() {
+        let sep = if i == 0 { "" } else { "," };
+        if ligne.len() + sep.len() + entree.len() > SINK_JOURNAL_MAX {
+            ligne.push_str(&format!(" … (+{} entrées)", sink.len() - i));
+            return ligne;
+        }
+        ligne.push_str(sep);
+        ligne.push_str(entree);
+    }
+    ligne
+}
+
+/// Borne d'une ligne [`sink_pour_le_journal`], en octets.
+pub const SINK_JOURNAL_MAX: usize = 6000;
 
 #[derive(Debug, Clone, Default)]
 pub struct DsdCapability {
@@ -3919,7 +3975,7 @@ pub struct RendererCapabilities {
 }
 
 impl RendererCapabilities {
-    fn inconclusive(reason: &'static str) -> Self {
+    pub(crate) fn inconclusive(reason: &'static str) -> Self {
         Self {
             reason: Some(reason),
             ..Self::default()
@@ -3955,7 +4011,7 @@ pub fn canaux_annonces_par_le_sink(sink: &[String]) -> Option<u16> {
 
 /// Pure Sink → capabilities mapping (unit-tested; `probe_capabilities` wraps it
 /// around the SOAP call).
-fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities {
+pub(crate) fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities {
     // Param-aware match: LPCM entries carry `;rate=…;channels=…` after the MIME
     // (`audio/L16;rate=44100;channels=2`), so we compare the base MIME only.
     // Also accepts the `audio/x-…` legacy variant and the `*` wildcard, like
@@ -5976,7 +6032,30 @@ mod tests {
 /// #4573 — les canaux ANNONCÉS par le Sink, lus sur des chaînes réelles.
 #[cfg(test)]
 mod canaux_annonces_4573 {
-    use super::{canaux_annonces_par_le_sink, renderer_caps_from_sink};
+    use super::{
+        SINK_JOURNAL_MAX, canaux_annonces_par_le_sink, renderer_caps_from_sink,
+        sink_pour_le_journal,
+    };
+
+    /// #6599 — la ligne du Sink garde chaque entrée lisible et reste bornée.
+    #[test]
+    fn le_sink_au_journal_est_entier_puis_borne() {
+        let court = vec![
+            "http-get:*:audio/L16;rate=44100;channels=2:*".to_string(),
+            "http-get:*:audio/flac:*".to_string(),
+        ];
+        assert_eq!(
+            sink_pour_le_journal(&court),
+            "http-get:*:audio/L16;rate=44100;channels=2:*,http-get:*:audio/flac:*"
+        );
+        let long: Vec<String> = (0..1000)
+            .map(|i| format!("http-get:*:audio/L16;rate={i};channels=2:*"))
+            .collect();
+        let ligne = sink_pour_le_journal(&long);
+        assert!(ligne.len() <= SINK_JOURNAL_MAX + 40, "{}", ligne.len());
+        assert!(ligne.ends_with("entrées)"), "{ligne}");
+        assert!(ligne.starts_with("http-get:*:audio/L16;rate=0;channels=2:*,"));
+    }
 
     fn v(entrees: &[&str]) -> Vec<String> {
         entrees.iter().map(|e| e.to_string()).collect()

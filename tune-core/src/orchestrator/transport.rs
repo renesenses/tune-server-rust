@@ -1000,18 +1000,7 @@ impl PlaybackOrchestrator {
         // Trigger prefetch of the next track in the background.
         // This runs concurrently with the current playback so the next
         // streaming track is already decoded in memory when needed.
-        {
-            let prefetch = self.prefetch.clone();
-            let db = self.db.clone();
-            let services = self.services.clone();
-            let playback = self.playback.clone();
-            let zone_id = req.zone_id;
-            tokio::spawn(async move {
-                prefetch
-                    .prefetch_next(db, services, playback, zone_id)
-                    .await;
-            });
-        }
+        self.lancer_le_prechargement(req.zone_id);
 
         Ok(PlayResult {
             stream_url: Some(resolved.url),

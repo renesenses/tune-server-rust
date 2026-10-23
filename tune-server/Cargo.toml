@@ -1796,3 +1796,10 @@ path = "tests/profils_panne_de_base_6454.rs"
 [[test]]
 name = "gravure_dr_cede_a_la_lecture_6212"
 path = "tests/gravure_dr_cede_a_la_lecture_6212.rs"
+
+# #6738 — les écoutes de la communauté, posées par les routes de la
+# bibliothèque, contre un faux site. `autotests = false` plus haut : sans
+# cette cible, le fichier ne serait JAMAIS compilé.
+[[test]]
+name = "ecoutes_communaute_6738"
+path = "tests/ecoutes_communaute_6738.rs"

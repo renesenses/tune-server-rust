@@ -2171,6 +2171,38 @@ pub fn decode_http_range_to_pcm_streaming_seeked(
     )
 }
 
+/// #6673 — le décodeur progressif à cadence, canaux et profondeur IMPOSÉS,
+/// sur un fichier (`source` absente : `chemin` est son chemin) ou sur une
+/// source quelconque (`chemin` ne sert alors que d'indice de format, comme
+/// `flux-distant.wav`). Sans témoin de données ni niveaux : c'est l'entrée
+/// d'une sortie qui consomme le flux elle-même (AirPlay 1).
+///
+/// Comme toutes les variantes, le premier bloc envoyé est l'en-tête WAV de
+/// 44 octets (dès que `target_bit_depth` est fixé), puis le PCM entrelacé en
+/// petit-boutiste.
+pub fn decode_vers_pcm_en_continu(
+    chemin: &str,
+    source: Option<Box<dyn MediaSource>>,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+) -> Result<(u16, u32), String> {
+    decode_to_pcm_streaming_inner(
+        chemin,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        None,
+        None,
+        0.0,
+        source,
+    )
+}
+
 /// #5439 — le décodeur progressif des fichiers locaux, sur une source quelconque
 /// (le corps HTTP d'un serveur multimédia lu par la sortie locale). Même
 /// boucle symphonia, même en-tête WAV en tête de flux, à la cadence et aux
@@ -4742,7 +4774,7 @@ mod pause_longue_4917_tests;
 
 #[cfg(test)]
 #[path = "dop_deplacement_tests_6456.rs"]
-mod dop_deplacement_tests_6456;
+pub(crate) mod dop_deplacement_tests_6456;
 
 #[cfg(test)]
 #[path = "disposition_reseau_tests_6057.rs"]

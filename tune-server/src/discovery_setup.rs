@@ -1756,32 +1756,31 @@ pub fn spawn_mdns_handler(
                             // same host as an existing zone (e.g. BluOS vs AirPlay for a
                             // Bluesound Node), upgrade the zone to the better protocol
                             // instead of creating a duplicate.
-                            let upgrade_zone = existing.iter().find(|z| {
-                                if let Some(ref old_dev_id) = z.output_device_id {
-                                    // Match by host: device IDs are formatted as
-                                    // "{type}-{host}-{port}", extract the host part
-                                    // from the existing zone's device_id.
-                                    let old_host = old_dev_id.splitn(3, '-').nth(1).unwrap_or("");
-                                    let is_same_host = old_host == dev.host;
-                                    if !is_same_host {
-                                        return false;
-                                    }
-                                    // Only upgrade if new protocol has higher priority
-                                    let old_prio = match z.output_type.as_deref() {
-                                        Some("oaat") => OutputType::Oaat.priority(),
-                                        Some("openhome") => OutputType::Openhome.priority(),
-                                        Some("bluos") => OutputType::Bluos.priority(),
-                                        Some("squeezebox") => OutputType::Squeezebox.priority(),
-                                        Some("dlna") => OutputType::Dlna.priority(),
-                                        Some("chromecast") => OutputType::Chromecast.priority(),
-                                        Some("airplay") => OutputType::Airplay.priority(),
-                                        _ => 0,
-                                    };
-                                    dev.device_type.priority() > old_prio
-                                } else {
-                                    false
+                            let upgrade_zone = zone_a_monter_en_priorite(
+                                &existing,
+                                |id| reg.host_of(id),
+                                &dev.host,
+                                dev.device_type,
+                            );
+                            // #6393 — la montée vers OAAT que permet désormais
+                            // l'hôte du registre ne coupe pas une lecture en
+                            // cours : elle attend une annonce suivante.
+                            let montee_reportee = match upgrade_zone.and_then(|z| z.id) {
+                                Some(zid) if dev.device_type == OutputType::Oaat => {
+                                    playback.get_state(zid).await.state
+                                        == tune_core::playback::PlayState::Playing
                                 }
-                            });
+                                _ => false,
+                            };
+                            if montee_reportee {
+                                info!(
+                                    name = %dev.name,
+                                    id = %dev.id,
+                                    zone = ?upgrade_zone.map(|z| z.name.as_str()),
+                                    "mdns_montee_de_priorite_reportee_zone_en_lecture"
+                                );
+                            }
+                            let upgrade_zone = upgrade_zone.filter(|_| !montee_reportee);
 
                             if let Some(z) = upgrade_zone
                                 && let Some(zid) = z.id
@@ -2194,6 +2193,55 @@ fn physical_zone_conflict(
         }
     }
     None
+}
+
+/// La zone qu'un protocole de priorité SUPÉRIEURE, découvert par mDNS au même
+/// hôte, reprend au lieu d'en créer une seconde (`mdns_montee_de_priorite`).
+///
+/// L'hôte de la zone existante se lisait seulement dans son identifiant, au
+/// format `{type}-{host}-{port}`. Un renderer DLNA porte son UDN SSDP
+/// (`uuid:…`), qui ne contient aucune adresse : la montée ne voyait donc
+/// jamais la zone DLNA d'un appareil Verox, et l'endpoint OAAT annoncé ensuite
+/// au même hôte tombait dans la déduplication entre protocoles
+/// (`mdns_zone_skipped_conflicting_protocol`). Il n'avait jamais de zone,
+/// alors qu'OAAT est le protocole préféré (#6393, constat 1 du 14/10).
+///
+/// Pour un endpoint OAAT, l'hôte vient AUSSI du registre des sorties
+/// (`host_of`), comme pour la déduplication. Les autres protocoles gardent la
+/// seule découpe de l'identifiant : élargir leur montée changerait des zones
+/// existantes (BluOS, Chromecast) sans mesure de terrain.
+fn zone_a_monter_en_priorite<'a>(
+    zones: &'a [tune_core::db::zone_repo::Zone],
+    resolve_host: impl Fn(&str) -> Option<String>,
+    dev_host: &str,
+    nouveau: tune_core::discovery::device::OutputType,
+) -> Option<&'a tune_core::db::zone_repo::Zone> {
+    use tune_core::discovery::device::OutputType;
+    zones.iter().find(|z| {
+        let Some(ref old_dev_id) = z.output_device_id else {
+            return false;
+        };
+        // Device IDs formatted as "{type}-{host}-{port}": the host part.
+        let old_host = old_dev_id.splitn(3, '-').nth(1).unwrap_or("");
+        let is_same_host = old_host == dev_host
+            || (nouveau == OutputType::Oaat
+                && resolve_host(old_dev_id).is_some_and(|h| h.eq_ignore_ascii_case(dev_host)));
+        if !is_same_host {
+            return false;
+        }
+        // Only upgrade if new protocol has higher priority
+        let old_prio = match z.output_type.as_deref() {
+            Some("oaat") => OutputType::Oaat.priority(),
+            Some("openhome") => OutputType::Openhome.priority(),
+            Some("bluos") => OutputType::Bluos.priority(),
+            Some("squeezebox") => OutputType::Squeezebox.priority(),
+            Some("dlna") => OutputType::Dlna.priority(),
+            Some("chromecast") => OutputType::Chromecast.priority(),
+            Some("airplay") => OutputType::Airplay.priority(),
+            _ => 0,
+        };
+        nouveau.priority() > old_prio
+    })
 }
 
 fn find_cross_protocol_zone_conflict<'a>(
@@ -3050,6 +3098,7 @@ mod tests {
     use super::{
         AnnonceAppareil, find_cross_protocol_zone_conflict, may_reanchor, refus_nommes,
         register_discovered_output, resolve_control_url, statut_du_fournisseur,
+        zone_a_monter_en_priorite,
     };
 
     /// LAT-Z3 : la règle de la fenêtre — jamais lancée → due ; lancée il y a
@@ -3272,6 +3321,58 @@ mod tests {
                 "airplay",
             )
             .is_none()
+        );
+    }
+
+    /// 🔴 #6393 (constat 1 du 14/10, Verox) — la zone DLNA d'un appareil
+    /// porte son UDN (`uuid:…`). L'endpoint OAAT annoncé ensuite au même hôte
+    /// doit la reprendre (montée de priorité), au lieu d'être écarté par la
+    /// déduplication entre protocoles et de rester sans zone.
+    #[test]
+    fn un_endpoint_oaat_reprend_la_zone_dlna_uuid_du_meme_hote() {
+        let zones = vec![zone(
+            "cm4 [Verox]-UPnP/AV",
+            "dlna",
+            "uuid:07ea1b2c-3d4e-5f60-7182-93a4b5c6d7e8",
+        )];
+        let resolve = |id: &str| {
+            (id == "uuid:07ea1b2c-3d4e-5f60-7182-93a4b5c6d7e8").then(|| "192.168.75.59".to_string())
+        };
+        assert_eq!(
+            zone_a_monter_en_priorite(&zones, resolve, "192.168.75.59", OutputType::Oaat)
+                .map(|z| z.name.as_str()),
+            Some("cm4 [Verox]-UPnP/AV"),
+            "#6393 : l'endpoint OAAT doit reprendre la zone DLNA du même hôte"
+        );
+        // Un autre hôte : rien.
+        assert!(
+            zone_a_monter_en_priorite(&zones, resolve, "192.168.75.60", OutputType::Oaat).is_none()
+        );
+        // Les autres protocoles gardent la seule découpe de l'identifiant :
+        // un UDN ne les fait pas monter (BluOS n'est pas élargi ici).
+        assert!(
+            zone_a_monter_en_priorite(&zones, resolve, "192.168.75.59", OutputType::Bluos)
+                .is_none()
+        );
+    }
+
+    /// La montée d'avant reste intacte : identifiant `{type}-{host}-{port}`,
+    /// protocole supérieur au même hôte ; jamais vers un protocole inférieur
+    /// ou égal.
+    #[test]
+    fn la_montee_par_l_identifiant_reste_intacte() {
+        let zones = vec![zone("Node", "airplay", "airplay-192.168.1.42-7000")];
+        let aucun = |_: &str| None;
+        assert!(
+            zone_a_monter_en_priorite(&zones, aucun, "192.168.1.42", OutputType::Bluos).is_some()
+        );
+        assert!(
+            zone_a_monter_en_priorite(&zones, aucun, "192.168.1.42", OutputType::Airplay).is_none()
+        );
+        let oaat = vec![zone("Salon", "oaat", "oaat-192.168.1.42-9740")];
+        assert!(
+            zone_a_monter_en_priorite(&oaat, aucun, "192.168.1.42", OutputType::Oaat).is_none(),
+            "une zone OAAT ne remonte jamais vers OAAT"
         );
     }
 

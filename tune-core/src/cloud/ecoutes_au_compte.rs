@@ -21,7 +21,8 @@
 //! Par écoute : un identifiant d'événement opaque ([`identifiant_d_evenement`],
 //! la clé du dédoublonnage côté site), la date, la durée, le profil sous forme
 //! d'empreinte ([`empreinte_de_profil`]), et pour le morceau : ISRC et MBID
-//! d'enregistrement s'ils sont connus, titre, artiste, album, durée.
+//! d'enregistrement s'ils sont connus, MBID de la release et de l'artiste
+//! s'ils sont connus (#6738), titre, artiste, album, durée.
 //!
 //! Jamais : chemin de fichier, adresse IP, nom de zone, nom ou numéro de
 //! profil, pochette, identifiant de service. La requête qui lit l'historique
@@ -164,8 +165,9 @@ fn borne(v: Option<String>) -> Option<String> {
 }
 
 /// Le lot à envoyer : les écoutes après le curseur, hors radio, à partir du
-/// plancher. ISRC et MBID viennent de la piste locale rapprochée par titre ET
-/// album, comme la liste de l'historique (`history_repo::JOINTURE_PISTE`) ;
+/// plancher. ISRC et MBID (et celui de l'artiste) viennent de la piste
+/// locale rapprochée par titre ET album, comme la liste de l'historique
+/// (`history_repo::JOINTURE_PISTE`) ; celui de la release, de l'album ;
 /// une sous-requête `LIMIT 1` par champ, pour qu'un titre présent deux fois
 /// sur un album ne duplique pas l'écoute.
 ///
@@ -178,7 +180,12 @@ pub const SQL_LOT: &str = "SELECT CAST(h.id AS BIGINT), h.listened_at, \
         AND t.isrc IS NOT NULL AND t.isrc <> '' LIMIT 1), \
      (SELECT t.musicbrainz_recording_id FROM tracks t WHERE t.title = h.title \
         AND t.album_id = h.album_id AND t.musicbrainz_recording_id IS NOT NULL \
-        AND t.musicbrainz_recording_id <> '' LIMIT 1) \
+        AND t.musicbrainz_recording_id <> '' LIMIT 1), \
+     (SELECT a.musicbrainz_release_id FROM albums a WHERE a.id = h.album_id \
+        AND a.musicbrainz_release_id IS NOT NULL AND a.musicbrainz_release_id <> '' LIMIT 1), \
+     (SELECT ar.musicbrainz_id FROM tracks t JOIN artists ar ON ar.id = t.artist_id \
+        WHERE t.title = h.title AND t.album_id = h.album_id \
+        AND ar.musicbrainz_id IS NOT NULL AND ar.musicbrainz_id <> '' LIMIT 1) \
      FROM listen_history h \
      WHERE CAST(h.id AS BIGINT) > ? AND COALESCE(h.source, '') <> 'radio' \
        AND h.listened_at >= ? \
@@ -234,6 +241,10 @@ fn lire_le_lot(
                 "track": {
                     "isrc": borne(r.get(7).and_then(|v| v.as_string())),
                     "mbid": borne(r.get(8).and_then(|v| v.as_string())),
+                    // #6738 : l'album (release) et l'artiste, pour que le
+                    // site retrouve leurs écoutes par MBID (site-mozaiklabs#330).
+                    "release_mbid": borne(r.get(9).and_then(|v| v.as_string())),
+                    "artist_mbid": borne(r.get(10).and_then(|v| v.as_string())),
                     "title": titre,
                     "artist": borne(r.get(5).and_then(|v| v.as_string())),
                     "album": borne(r.get(6).and_then(|v| v.as_string())),

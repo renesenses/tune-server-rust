@@ -17,7 +17,7 @@
 //! | `bluos` | accepte en 16 bits, inconnu au-delà | Bluesound, « What Formats are supported by Bluesound? » : WAV listé, aucune profondeur ni fréquence |
 //! | `slimproto` | refuse | jusqu'à #6475, `slimproto::build_strm_start` annonçait TOUJOURS `f` (FLAC) : un WAV y était décodé comme du FLAC. Le codec servi est désormais annoncé, mais la substitution d'un WAV progressif au format habituel n'a pas été essayée sur Squeezelite : le refus reste, par prudence |
 //! | `squeezebox` | inconnu | LMS tire l'URL (`playlist play`) et décide seul ; rien dans Tune ne l'établit |
-//! | `openhome` | inconnu | `OpenHomeOutput` ne sonde aucun Sink ; le protocole n'impose aucun format |
+//! | `openhome` | inconnu ici, mais **sondé** en amont | #6718 : `dlna_accepte_lpcm` lit ce qu'annonce une vraie `OpenHomeOutput` (`Playlist:1 ProtocolInfo`, sinon le Sink du `ConnectionManager`) ; cette réponse par type ne sert plus qu'à une sortie de substitution |
 //! | `dlna` sans `DlnaOutput` | inconnu | pas de Sink à lire (cas d'une sortie de substitution) |
 //! | tout autre type | inconnu | hors de `is_network_output_type` : ni le WAV progressif ni le statut du crossfeed ne les interrogent |
 

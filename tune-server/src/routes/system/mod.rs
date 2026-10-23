@@ -123,6 +123,9 @@ pub fn router() -> Router<AppState> {
         // L'écran Santé affichait `IDLE` pendant des heures de balayage faute
         // de cette route.
         .route("/replaygain/progress", get(replaygain::replaygain_progress))
+        // #6778 — lancer la passe à la demande : réveille la boucle de fond,
+        // qui dort un quart d'heure au repos. Prérequis de web#2295.
+        .route("/replaygain/analyze", post(replaygain::replaygain_analyze))
         // #5882 — refaire, sur demande, les mesures prises avant le correctif
         // du vrai pic. Le `POST` rend les mesures périmées à la passe, par lots.
         .route(

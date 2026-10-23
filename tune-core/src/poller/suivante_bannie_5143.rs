@@ -43,8 +43,8 @@ const PROFIL: i64 = 1;
 /// Un service qui NOTE chaque `get_track_url` et n'en sert aucune : le
 /// préchargement s'arrête là, sans rien décoder. Ce qu'il a noté est
 /// exactement ce qui aurait été téléchargé.
-struct ServiceQuiNote {
-    demandes: Arc<std::sync::Mutex<Vec<String>>>,
+pub(crate) struct ServiceQuiNote {
+    pub(crate) demandes: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 fn non_servi() -> TuneError {
@@ -121,7 +121,7 @@ impl StreamingService for ServiceQuiNote {
     }
 }
 
-fn titre_qobuz(source_id: &str) -> QueueInput {
+pub(crate) fn titre_qobuz(source_id: &str) -> QueueInput {
     QueueInput::Streaming {
         source: "qobuz".into(),
         source_id: source_id.into(),

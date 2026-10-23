@@ -266,6 +266,58 @@ async fn le_lot_porte_le_morceau_et_rien_de_la_machine() {
     );
 }
 
+/// #6738 — les MBID de la release et de l'artiste partent avec l'écoute
+/// quand ils sont connus (site-mozaiklabs#330) ; inconnus : `null`.
+#[tokio::test]
+async fn les_mbid_d_album_et_d_artiste_partent_avec_l_ecoute() {
+    let (url, site) = faux_site().await;
+    let b = base();
+    bibliotheque(&b);
+    b.execute_batch(
+        "UPDATE artists SET musicbrainz_id = '561d854a-6a28-4aa7-8c99-323e6ce46c2a' WHERE id = 20;\
+         UPDATE albums SET musicbrainz_release_id = 'b84ee12a-09ef-421b-82de-0441a926375b' \
+         WHERE id = 10;",
+    )
+    .unwrap();
+    ecoute(
+        &b,
+        1,
+        "So What",
+        Some(10),
+        "local",
+        "2026-10-18T20:00:00Z",
+        None,
+    );
+    ecoute(
+        &b,
+        2,
+        "Blue in Green",
+        None,
+        "qobuz",
+        "2026-10-18T22:00:00Z",
+        None,
+    );
+    relier(&b, &url);
+    activer(&b);
+    assert!(matches!(
+        passe(&b, &http(), maintenant()).await,
+        Issue::Envoye { ecoutes: 2, .. }
+    ));
+
+    let site = site.lock().unwrap();
+    let ecoutes = site.corps[0]["listens"].as_array().unwrap();
+    assert_eq!(
+        ecoutes[0]["track"]["release_mbid"],
+        json!("b84ee12a-09ef-421b-82de-0441a926375b")
+    );
+    assert_eq!(
+        ecoutes[0]["track"]["artist_mbid"],
+        json!("561d854a-6a28-4aa7-8c99-323e6ce46c2a")
+    );
+    assert_eq!(ecoutes[1]["track"]["release_mbid"], Value::Null);
+    assert_eq!(ecoutes[1]["track"]["artist_mbid"], Value::Null);
+}
+
 /// Désactivé, ou sans compte : rien ne part, et le site ne voit rien.
 #[tokio::test]
 async fn rien_ne_part_sans_le_reglage_ni_sans_compte() {
