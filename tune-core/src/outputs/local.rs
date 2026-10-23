@@ -702,6 +702,12 @@ pub struct LocalOutput {
     /// préampli gardé d'un égaliseur coupé s'éteint en fondu au lieu de
     /// valoir jusqu'à une piste suivante qui ne viendra pas.
     flux_sans_fin: AtomicBool,
+    /// #6741 — le volume de l'auditeur (millièmes, celui d'avant la sourdine)
+    /// au moment où l'égaliseur a été activé ; `u32::MAX` : aucun. Couper
+    /// l'égaliseur fait remonter le préampli gardé vers le niveau d'avant,
+    /// jamais au-delà : si le volume a été monté entre-temps, la remontée
+    /// s'arrête au rapport `avant / courant` (`EqProcessor::borner_la_remontee`).
+    volume_avant_egaliseur: AtomicU32,
     /// #3973 — « bit-perfect strict » de la zone qui joue sur cette sortie.
     /// Armé, une conversion de fréquence (ouverture cpal ou changement de
     /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
@@ -1253,6 +1259,7 @@ impl LocalOutput {
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
             flux_sans_fin: AtomicBool::new(false),
+            volume_avant_egaliseur: AtomicU32::new(u32::MAX),
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
             mono_downmix: Arc::new(AtomicBool::new(false)),
@@ -1293,19 +1300,95 @@ impl LocalOutput {
         self.faire_porter_la_compensation(&mut eq);
         {
             let mut emplacement = self.eq.lock().unwrap();
+            self.noter_le_volume_avant_l_egaliseur(&emplacement, &eq);
             // #5215 (décision du 10/10) — l'égaliseur reste coupé : le
-            // préampli gardé à la coupure passe sur cette piste sans saut ; seule
-            // sa part supérieure à 1 y poursuit son extinction, jamais de hausse
-            // (#6524 b). Jamais sous PURE, qui ne doit rien laisser monté.
+            // préampli gardé à la coupure passe sur cette piste sans saut, et sa
+            // rampe s'y poursuit vers le niveau d'avant l'égaliseur (#6524 b,
+            // #6741). Jamais sous PURE, qui ne doit rien laisser monté.
             if eq.is_none() && !self.pure_bypass.load(Ordering::Relaxed) {
                 eq = emplacement
                     .as_ref()
                     .and_then(|p| p.reporter_le_preampli_garde());
             }
             self.eteindre_si_flux_sans_fin(&mut eq);
+            self.borner_la_remontee(&mut eq);
             *emplacement = eq;
         }
         self.recalculer_la_compensation();
+    }
+
+    /// #6741 — le volume que l'auditeur a demandé (celui d'avant la sourdine
+    /// si elle est mise), en millièmes.
+    fn volume_de_l_auditeur(&self) -> u32 {
+        if self.muted.load(Ordering::SeqCst) {
+            self.pre_mute_volume.load(Ordering::SeqCst)
+        } else {
+            self.user_volume.load(Ordering::SeqCst)
+        }
+    }
+
+    /// #6741 — retenir le volume au moment où un égaliseur ACTIF arrive sur
+    /// une chaîne qui n'en portait pas : c'est le « niveau d'avant
+    /// l'égaliseur ». Une chaîne qui garde encore le préampli d'une coupure
+    /// garde aussi sa référence : on n'était pas revenu au niveau d'avant.
+    fn noter_le_volume_avant_l_egaliseur(
+        &self,
+        emplacement: &Option<super::super::audio::eq::EqProcessor>,
+        neuf: &Option<super::super::audio::eq::EqProcessor>,
+    ) {
+        let arrive = neuf.as_ref().is_some_and(|p| !p.est_neutre());
+        let deja = emplacement
+            .as_ref()
+            .is_some_and(|p| !p.est_neutre() || p.preampli_garde().is_some());
+        if arrive && !deja {
+            self.volume_avant_egaliseur
+                .store(self.volume_de_l_auditeur(), Ordering::SeqCst);
+        }
+    }
+
+    /// #6741 — le rapport `volume d'avant l'égaliseur / volume courant`, borné
+    /// à 1 : la remontée d'un préampli gardé ne dépasse jamais le niveau
+    /// d'avant l'égaliseur. Ce rapport est exact ICI : le volume de la sortie
+    /// locale est un gain numérique linéaire (`effective_volume_units`). 0
+    /// (gain gardé) sans référence ; 1 à volume nul (rien ne sort).
+    fn borne_de_remontee(&self) -> f64 {
+        let avant = self.volume_avant_egaliseur.load(Ordering::SeqCst);
+        let courant = self.volume_de_l_auditeur();
+        if avant == u32::MAX {
+            0.0
+        } else if courant == 0 {
+            1.0
+        } else {
+            (f64::from(avant) / f64::from(courant)).min(1.0)
+        }
+    }
+
+    fn borner_la_remontee(&self, eq: &mut Option<super::super::audio::eq::EqProcessor>) {
+        if let Some(eq) = eq.as_mut() {
+            eq.borner_la_remontee(self.borne_de_remontee());
+        }
+    }
+
+    /// #6741 — un geste de volume recalcule la borne du préampli gardé : un
+    /// volume baissé sous celui d'avant l'égaliseur le laisse revenir à 0 dB,
+    /// un volume monté arrête sa remontée au niveau d'avant. Sans saut : la
+    /// rampe repart du gain atteint.
+    fn reborner_le_preampli_garde(&self) {
+        if let Ok(mut eq) = self.eq.lock() {
+            self.borner_la_remontee(&mut eq);
+        }
+    }
+
+    /// #6741 — ce qu'un égaliseur coupé applique encore (voyant de la sortie).
+    pub fn preampli_garde(&self) -> Option<super::super::audio::eq::PreampliGarde> {
+        if self.pure_bypass.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.eq
+            .lock()
+            .ok()?
+            .as_ref()
+            .and_then(|p| p.preampli_garde())
     }
 
     /// #5227 — confier à l'égaliseur qu'on installe la compensation de SON
@@ -1396,6 +1479,7 @@ impl LocalOutput {
         self.faire_porter_la_compensation(&mut eq);
         {
             let mut emplacement = self.eq.lock().unwrap();
+            self.noter_le_volume_avant_l_egaliseur(&emplacement, &eq);
             let precedent = emplacement.take();
             *emplacement = if self.pure_bypass.load(Ordering::Relaxed) {
                 // PURE : la chaîne est contournée, rien à fondre — et rien ne
@@ -1408,6 +1492,7 @@ impl LocalOutput {
                 let mut releve =
                     super::super::audio::eq::EqProcessor::prendre_la_releve(eq, precedent);
                 self.eteindre_si_flux_sans_fin(&mut releve);
+                self.borner_la_remontee(&mut releve);
                 releve
             };
         }
@@ -1423,7 +1508,7 @@ impl LocalOutput {
 
     /// #6211 — sur un flux sans fin, l'extinction du préampli gardé part dès
     /// la coupure ; sur une piste, après le fondu de la courbe. Partout,
-    /// seule sa part supérieure à 1 s'éteint : jamais de hausse (#6524 b,
+    /// la rampe va vers le niveau d'avant l'égaliseur, jamais au-delà (#6741 ;
     /// décision du 21/10, dans `EqProcessor`).
     fn eteindre_si_flux_sans_fin(&self, eq: &mut Option<super::super::audio::eq::EqProcessor>) {
         if self.flux_sans_fin.load(Ordering::Relaxed)
@@ -7733,6 +7818,7 @@ impl OutputTarget for LocalOutput {
         if v > 0 {
             self.muted.store(false, Ordering::SeqCst);
         }
+        self.reborner_le_preampli_garde();
         Ok(())
     }
 
@@ -7755,6 +7841,7 @@ impl OutputTarget for LocalOutput {
             self.muted.store(false, Ordering::SeqCst);
         }
         self.recompute_effective_volume();
+        self.reborner_le_preampli_garde();
         Ok(())
     }
 
@@ -7862,7 +7949,16 @@ impl OutputTarget for LocalOutput {
         // #2211 — le fondu se déclare pendant le recouvrement, et lui seul.
         let fondu = self.fondu_actif.load(Ordering::Relaxed);
         let mesure = self.transformations_reelles.lock().ok().and_then(|t| *t);
-        mesure.map(|t| t.avec_fondu_enchaine(fondu))
+        // #6741 — un égaliseur coupé qui applique encore son préampli le dit :
+        // le voyant nomme ce gain au lieu d'un « DSP appliqué » ambigu.
+        let garde = self.preampli_garde();
+        mesure.map(|t| {
+            let t = t.avec_fondu_enchaine(fondu);
+            match garde {
+                Some(g) => t.avec_preampli_garde(g.db, g.en_retour),
+                None => t,
+            }
+        })
     }
 
     fn ring_starvation(&self) -> Option<OutputRingStarvation> {

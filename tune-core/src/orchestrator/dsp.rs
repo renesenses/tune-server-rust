@@ -1002,12 +1002,32 @@ impl PlaybackOrchestrator {
         stream_id: &str,
         poste: std::sync::Arc<super::eq_en_vol::EqEnVol>,
     ) {
+        // #6741 — le poste connaît le volume de la zone dès sa naissance : la
+        // remontée d'un préampli gardé se borne au niveau d'avant l'égaliseur.
+        if let Some(zone) = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+        {
+            poste.noter_le_volume(zone.volume / 100.0);
+        }
         let mut postes = self.eq_en_vol_des_flux.lock().unwrap();
         let notes = postes.entry(zone_id).or_default();
         notes.retain(|(sid, _)| sid != stream_id);
         notes.push((stream_id.to_string(), poste));
         let trop = notes.len().saturating_sub(Self::FLUX_TRAITES_PAR_ZONE);
         notes.drain(..trop);
+    }
+
+    /// #6741 — une consigne de volume de la zone, transmise aux postes de
+    /// relève de ses flux : la remontée du préampli gardé d'un égaliseur coupé
+    /// ne dépasse jamais le niveau d'avant l'égaliseur.
+    pub(super) fn noter_le_volume_aux_postes(&self, zone_id: i64, volume: f64) {
+        if let Some(notes) = self.eq_en_vol_des_flux.lock().unwrap().get(&zone_id) {
+            for (_, poste) in notes {
+                poste.noter_le_volume(volume);
+            }
+        }
     }
 
     /// #4407 — le poste de relève du flux `stream_id`, s'il en a un.
@@ -2846,6 +2866,7 @@ impl PlaybackOrchestrator {
         };
         let Some(did) = device_id else {
             info!(zone_id, volume, "set_volume_no_device_id");
+            self.noter_le_volume_aux_postes(zone_id, volume);
             self.playback.set_volume(zone_id, volume).await;
             self.playback.mark_volume_changed(zone_id).await;
             ZoneRepo::with_backend(self.db.clone())
@@ -2882,6 +2903,7 @@ impl PlaybackOrchestrator {
                 etat.confirme = Some(self.playback.get_state(zone_id).await.volume);
             }
             etat.dernier_ticket += 1;
+            self.noter_le_volume_aux_postes(zone_id, volume);
             self.playback.set_volume(zone_id, volume).await;
             self.playback.mark_volume_changed(zone_id).await;
             etat.dernier_ticket

@@ -39,6 +39,14 @@ pub async fn list(
         .and_then(|s| s["authenticated"].as_bool())
         .unwrap_or(false);
     let spotify_client_id_ok = spotify_client_id_configure(&state).await;
+    // #6777 — D'OÙ vient le Client ID effectif : l'écran n'offre « Effacer »
+    // que pour un réglage en base, pas pour une variable qui l'impose.
+    let spotify_client_id_source = source_du_client_id_spotify(
+        std::env::var("TUNE_SPOTIFY_CLIENT_ID").ok().as_deref(),
+        settings.get("spotify_client_id").ok().flatten().as_deref(),
+        state.config.spotify_client_id.as_deref(),
+        std::env::var("SPOTIFY_CLIENT_ID").ok().as_deref(),
+    );
     let deezer_auth = streaming_status
         .iter()
         .find(|s| s["name"] == "deezer")
@@ -231,6 +239,8 @@ pub async fn list(
             // Fil 221 — `POST /services/tokens/spotify {"client_id"}` pose le
             // Client ID à chaud ; `GET /system/env` dit s'il l'est.
             "spotify_client_id_configure": spotify_client_id_ok,
+            // #6777 — `db` (effaçable depuis l'écran), `env`, `config` ou `null`.
+            "spotify_client_id_source": spotify_client_id_source,
         }),
         json!({
             "id": "deezer", "name": "Deezer", "kind": "arl_token",
@@ -638,28 +648,104 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<String>) -> im
     // Fil 221 — « Supprimer » vient d'effacer `spotify_client_id` : le
     // service revient, à chaud, à ce que le démarrage aurait résolu sans lui.
     if id == "spotify" {
-        let env = std::env::var("TUNE_SPOTIFY_CLIENT_ID").ok();
-        let repli = tune_core::streaming::spotify::resolve_client_id(
-            env.as_deref(),
-            None,
-            state.config.spotify_client_id.as_deref(),
-        );
-        let svc = state.services.lock().await.get("spotify");
-        if let Some(svc) = svc {
-            let mut garde = svc.write().await;
-            if let Some(spotify) = garde
-                .as_any_mut()
-                .downcast_mut::<tune_core::streaming::spotify::SpotifyService>()
-            {
-                // Même repli que `SpotifyService::with_config`.
-                let repli = repli
-                    .or_else(|| std::env::var("SPOTIFY_CLIENT_ID").ok())
-                    .unwrap_or_else(|| "placeholder".to_owned());
-                spotify.set_client_id(&repli);
-            }
-        }
+        remettre_le_repli_spotify(&state).await;
     }
     StatusCode::NO_CONTENT
+}
+
+/// Le service Spotify revient, à chaud, au Client ID que le démarrage aurait
+/// résolu SANS le réglage en base : `TUNE_SPOTIFY_CLIENT_ID`, `tune.toml`,
+/// `SPOTIFY_CLIENT_ID`, sinon `"placeholder"` (même repli que
+/// `SpotifyService::with_config`).
+async fn remettre_le_repli_spotify(state: &AppState) {
+    let env = std::env::var("TUNE_SPOTIFY_CLIENT_ID").ok();
+    let repli = tune_core::streaming::spotify::resolve_client_id(
+        env.as_deref(),
+        None,
+        state.config.spotify_client_id.as_deref(),
+    );
+    let svc = state.services.lock().await.get("spotify");
+    if let Some(svc) = svc {
+        let mut garde = svc.write().await;
+        if let Some(spotify) = garde
+            .as_any_mut()
+            .downcast_mut::<tune_core::streaming::spotify::SpotifyService>()
+        {
+            let repli = repli
+                .or_else(|| std::env::var("SPOTIFY_CLIENT_ID").ok())
+                .unwrap_or_else(|| "placeholder".to_owned());
+            spotify.set_client_id(&repli);
+        }
+    }
+}
+
+/// #6777 — d'où vient le Client ID Spotify effectif, dans l'ordre de
+/// résolution du démarrage (`resolve_client_id`, puis l'ancienne variable
+/// `SPOTIFY_CLIENT_ID`) : `env`, `db`, `config`, ou `None` (placeholder).
+pub(crate) fn source_du_client_id_spotify(
+    tune_env: Option<&str>,
+    reglage: Option<&str>,
+    toml: Option<&str>,
+    ancienne_env: Option<&str>,
+) -> Option<&'static str> {
+    use tune_core::streaming::spotify::client_id_configure;
+    let vrai = |v: Option<&str>| v.is_some_and(client_id_configure);
+    if vrai(tune_env) {
+        Some("env")
+    } else if vrai(reglage) {
+        Some("db")
+    } else if vrai(toml) {
+        Some("config")
+    } else if vrai(ancienne_env) {
+        Some("env")
+    } else {
+        None
+    }
+}
+
+/// `DELETE /services/tokens/spotify/client-id` (#6777, part serveur de
+/// tune-web-client#2304) — efface le SEUL réglage `spotify_client_id`.
+///
+/// `DELETE /services/tokens/spotify` efface toutes les clés `spotify_*`
+/// (Spotify Connect, nom, zone, lecture expérimentale, adresse de retour…) :
+/// brancher un bouton « Effacer le Client ID » dessus les emporterait sans le
+/// dire. Celle-ci ne touche qu'au Client ID, puis remet le service, à chaud,
+/// sur le repli. Rend la source qui reste (`env`, `config` ou `null`).
+/// Tout autre service que `spotify` : 404.
+pub async fn delete_client_id(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if id != "spotify" {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "client-id n'existe que pour spotify"})),
+        );
+    }
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Err(e) = settings.delete("spotify_client_id") {
+        error!(error = %e, "spotify_client_id_delete_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        );
+    }
+    remettre_le_repli_spotify(&state).await;
+    tracing::info!("spotify_client_id_efface");
+    let source = source_du_client_id_spotify(
+        std::env::var("TUNE_SPOTIFY_CLIENT_ID").ok().as_deref(),
+        None,
+        state.config.spotify_client_id.as_deref(),
+        std::env::var("SPOTIFY_CLIENT_ID").ok().as_deref(),
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "spotify_client_id_configure": spotify_client_id_configure(&state).await,
+            "spotify_client_id_source": source,
+        })),
+    )
 }
 
 /// #5427 — au démarrage, après la restauration des sessions.
@@ -881,3 +967,7 @@ mod tests_arl_deezer_i5427;
 #[cfg(test)]
 #[path = "service_tokens_client_id_spotify_fil221_tests.rs"]
 mod tests_client_id_spotify_fil221;
+
+#[cfg(test)]
+#[path = "service_tokens_effacer_client_id_6777_tests.rs"]
+mod tests_effacer_client_id_6777;

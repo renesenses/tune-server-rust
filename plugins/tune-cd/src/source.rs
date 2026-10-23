@@ -125,31 +125,47 @@ impl PublicationSource {
                     self.inscrire(EtatSource::Vide, "Lecteur CD".into(), json!({}), true);
                     return;
                 };
-                let infos = self.consultation.consulter(&disc_id(&toc)).await;
-                let album = infos
-                    .as_ref()
-                    .map(|i| i.titre.clone())
-                    .filter(|t| !t.is_empty());
-                let artiste = infos
-                    .as_ref()
-                    .map(|i| i.artiste.clone())
-                    .filter(|a| !a.is_empty());
-                let nom = match (&artiste, &album) {
-                    (Some(a), Some(t)) => format!("{a} — {t}"),
-                    (None, Some(t)) => t.clone(),
-                    _ => "CD audio".into(),
-                };
-                let detail = json!({
-                    "album": album,
-                    "artiste": artiste,
-                    "pistes": toc.pistes_audio().count(),
-                    "pochette": infos.as_ref().and_then(|i| i.pochette.clone()),
-                });
-                self.inscrire(EtatSource::Disque, nom.clone(), detail.clone(), true);
-                if insertion {
-                    self.annoncer_insertion(disc_id(&toc), nom, detail);
-                }
+                self.publier_le_disque(&toc, insertion, false).await;
             }
+        }
+    }
+
+    /// #6410 — le disque est sorti du lecteur, mais il est ENTIER en mémoire
+    /// et la lecture continue (comme sur Daphile) : la source dit qu'elle a
+    /// ce disque, jouable, avec `detail.en_memoire = true`. Publier « vide »
+    /// laissait croire qu'il n'y avait plus rien à écouter pendant que la
+    /// zone jouait. La TOC est celle de la mémoire : le lecteur n'est plus lu.
+    pub async fn publier_disque_garde(&self, toc: &crate::toc::Toc) {
+        self.publier_le_disque(toc, false, true).await;
+    }
+
+    async fn publier_le_disque(&self, toc: &crate::toc::Toc, insertion: bool, en_memoire: bool) {
+        let infos = self.consultation.consulter(&disc_id(toc)).await;
+        let album = infos
+            .as_ref()
+            .map(|i| i.titre.clone())
+            .filter(|t| !t.is_empty());
+        let artiste = infos
+            .as_ref()
+            .map(|i| i.artiste.clone())
+            .filter(|a| !a.is_empty());
+        let nom = match (&artiste, &album) {
+            (Some(a), Some(t)) => format!("{a} — {t}"),
+            (None, Some(t)) => t.clone(),
+            _ => "CD audio".into(),
+        };
+        let mut detail = json!({
+            "album": album,
+            "artiste": artiste,
+            "pistes": toc.pistes_audio().count(),
+            "pochette": infos.as_ref().and_then(|i| i.pochette.clone()),
+        });
+        if en_memoire {
+            detail["en_memoire"] = json!(true);
+        }
+        self.inscrire(EtatSource::Disque, nom.clone(), detail.clone(), true);
+        if insertion {
+            self.annoncer_insertion(disc_id(toc), nom, detail);
         }
     }
 
@@ -639,5 +655,92 @@ mod tests {
                 .await,
             Err(ErreurJouer::NonJouable { .. })
         ));
+    }
+
+    /// #6410 — un disque ENTIER en mémoire, éjecté pendant la lecture : la
+    /// lecture continue depuis la mémoire, et la source le dit. Elle publie
+    /// ce disque, jouable (`detail.en_memoire`), et non « vide » ; « Jouer »
+    /// le sert depuis la mémoire, lecteur vide. La mémoire rendue (plus
+    /// aucune zone ne joue le disque), la source revient à « vide ».
+    #[tokio::test]
+    async fn la_source_cd_dit_qu_elle_joue_le_disque_garde_en_memoire() {
+        use crate::ejection::TOURS_AVANT_LIBERATION;
+        use crate::ejection::tests::petite_toc;
+        use crate::fournisseur::SOURCE;
+        use crate::hote::HoteLecture;
+        use crate::memoire::{Fin, Reglages};
+
+        let orch = Arc::new(orchestrateur());
+        let registre = orch.sources_physiques().clone();
+        registre.brancher_bus(Arc::new(EventBus::new()));
+        let lecteur = Arc::new(LecteurSimule::new(petite_toc()));
+        let hote = Arc::new(HoteTemoin::default());
+        let memoire = Arc::new(MemoireCd::new(Reglages {
+            actif: true,
+            plafond_octets: u64::MAX,
+        }));
+        let routes = EtatRoutes {
+            lecteur: Some(lecteur.clone()),
+            hote: hote.clone(),
+            consultation: Arc::new(Fixture),
+            zones: Arc::default(),
+            reveil: Arc::default(),
+            memoire: Some(memoire.clone()),
+            backend: None,
+            extraction: None,
+        };
+        let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
+        let mut s = Surveillant::new(lecteur.clone(), hote.clone(), routes.zones.clone())
+            .avec_publication(publication)
+            .avec_memoire(memoire.clone());
+        hote.sources.lock().await.insert(7, SOURCE.into());
+        routes.zones.lock().await.insert(7);
+
+        s.un_tour().await;
+        assert_eq!(registre.source(ID).unwrap().etat, EtatSource::Disque);
+        let l: Arc<dyn LecteurDisque> = lecteur.clone();
+        let fin = memoire
+            .chargement(&l, &petite_toc(), &disc_id(&petite_toc()), 0, 0)
+            .and_then(|c| c.attendre_la_fin());
+        assert_eq!(fin, Some(Fin::Termine), "le disque est entier en mémoire");
+
+        lecteur.ejecter();
+        s.un_tour().await;
+        let cd = registre.source(ID).unwrap();
+        assert_eq!(
+            cd.etat,
+            EtatSource::Disque,
+            "#6410 — la lecture continue depuis la mémoire, la source publie « {:?} »",
+            cd.etat
+        );
+        assert_eq!(cd.detail["en_memoire"], true, "{}", cd.detail);
+        assert_eq!(cd.detail["pistes"], 3);
+
+        // « Jouer » le disque gardé : servi depuis la mémoire, lecteur vide.
+        let v = registre
+            .jouer(
+                ID,
+                DemandeJouer {
+                    zone_id: 3,
+                    piste: Some(2),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("#6410 — jouer le disque gardé : {e:?}"));
+        assert_eq!(v["piste"], 2);
+        assert_eq!(v["disc_id"], disc_id(&petite_toc()));
+
+        // Plus personne ne joue le disque : mémoire rendue, source « vide ».
+        hote.arreter(7).await;
+        hote.arreter(3).await;
+        for _ in 0..TOURS_AVANT_LIBERATION {
+            s.un_tour().await;
+        }
+        assert!(memoire.disque_garde().is_none(), "mémoire rendue");
+        assert_eq!(
+            registre.source(ID).unwrap().etat,
+            EtatSource::Vide,
+            "la mémoire rendue, la source revient à ce que voit le lecteur"
+        );
     }
 }

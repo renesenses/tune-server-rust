@@ -2151,10 +2151,14 @@ impl ZoneRepo {
     /// #6774 — le seul point d'écriture de `output_device_id` sur une zone
     /// existante. Les réglages `zone_{id}_*` suivent la LIGNE : quand le nouvel
     /// identifiant désigne un AUTRE appareil
-    /// ([`crate::audio::reglages_de_volume::meme_appareil`]), le trim repart de
-    /// 0 dB et l'évènement `reglages_volume_reinitialises_changement_d_appareil`
-    /// est journalisé. Les limites restent. Le même appareil (identifiant
-    /// inchangé, même MAC normalisée, même endpoint local) garde tout.
+    /// ([`crate::audio::reglages_de_volume::meme_appareil`]), PURE verrouillé
+    /// et volume fixe sont désarmés, le volume de la zone ne remonte jamais, un
+    /// trim POSITIF repart de 0 dB et un trim négatif reste
+    /// ([`crate::audio::reglages_de_volume::ajuster_au_changement_d_appareil`],
+    /// décisions de Bertrand du 22/10). Les limites restent. Le même appareil
+    /// (identifiant inchangé, même MAC normalisée, même endpoint local) garde
+    /// tout. L'appelant qui tient l'état de lecture le réaligne ensuite
+    /// ([`crate::audio::reglages_de_volume::aligner_la_lecture`]).
     pub fn changer_d_appareil(
         &self,
         id: i64,
@@ -2173,7 +2177,7 @@ impl ZoneRepo {
                 &rattachement,
             )
         {
-            crate::audio::reglages_de_volume::reinitialiser_le_trim(
+            crate::audio::reglages_de_volume::ajuster_au_changement_d_appareil(
                 &self.db,
                 id,
                 ancien.as_deref(),

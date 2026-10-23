@@ -5212,3 +5212,47 @@ fn l_anneau_flottant_ne_tronque_que_le_pcm_de_plus_de_24_bits_6734() {
     );
     assert!(!tronque(1, true), "DSD");
 }
+
+/// #6741 (suite de #6524 b, Jean Valjean) — égaliseur coupé, préampli gardé :
+/// le voyant de la sortie locale NOMME ce gain au lieu d'un « DSP appliqué »
+/// ambigu, qu'il soit observé au rappel (sonde Windows) ou seulement déclaré
+/// par les transformations réelles.
+#[test]
+fn un_preampli_garde_se_nomme_dans_le_chemin_du_signal_6741() {
+    use tune_core::outputs::traits::{
+        OutputDspState, OutputSampleTransport, OutputSignalPathStatus, OutputSignalReason,
+        OutputVolumeState,
+    };
+    let (backend, zone) = local_zone_migrated();
+    let mut ps = flac_playing();
+    ps.transformations_reelles =
+        Some(transformations_mesurees(96_000, 2, true).avec_preampli_garde(-8.4, false));
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
+    assert_eq!(
+        step_desc(&sp, "DSP").as_deref(),
+        Some("préampli -8.4 dB conservé jusqu’au prochain réglage (mesuré)"),
+        "déclaré par la sortie : le préampli gardé se nomme, chiffre compris"
+    );
+
+    // Sonde du rappel : « DSP appliqué » devient le nom du gain.
+    ps.output_signal_path = Some(OutputSignalPathStatus {
+        bit_perfect: false,
+        sample_transport: OutputSampleTransport::NativeInteger,
+        dsp: OutputDspState::Applied,
+        volume: OutputVolumeState::Unity,
+        reasons: vec![OutputSignalReason::DspApplied],
+    });
+    ps.transformations_reelles =
+        Some(transformations_mesurees(96_000, 2, true).avec_preampli_garde(-3.0, true));
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
+    assert_eq!(
+        step_desc(&sp, "DSP").as_deref(),
+        Some("préampli -3.0 dB, retour en cours au niveau d’avant l’égaliseur"),
+        "pendant la remontée, le voyant dit qu'elle est en cours"
+    );
+
+    // Contre-témoin : sans préampli gardé, rien ne change.
+    ps.transformations_reelles = Some(transformations_mesurees(96_000, 2, true));
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
+    assert_eq!(step_desc(&sp, "DSP").as_deref(), Some("DSP appliqué"));
+}

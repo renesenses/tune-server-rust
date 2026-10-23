@@ -202,3 +202,39 @@ fn la_decouverte_rattache_avec_la_mac_de_l_appareil() {
         "sept rattachements de la découverte doivent porter la MAC de l'appareil, vu {avec_mac}"
     );
 }
+
+/// #6774 suite — un PATCH qui change d'appareil ET réaffirme
+/// `fixed_volume: true` sans `confirm_full_volume` ne réarme pas en douce le
+/// volume fixe que le changement d'appareil vient de désarmer ; l'état de
+/// lecture ne reste pas à 100 %.
+#[tokio::test]
+async fn patch_vers_un_autre_appareil_ne_rearme_pas_le_volume_fixe() {
+    let (app, state) = serveur();
+    let id = zone_reglee(&app, &state, "uuid:p6774-fixe-a").await;
+    let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    repo.update_volume(id, 100.0).unwrap();
+    repo.update_fixed_volume(id, true).unwrap();
+    state.playback.set_volume(id, 1.0).await;
+
+    let (statut, reponse) = envoyer(
+        &app,
+        "PATCH",
+        &format!("/api/v1/zones/{id}"),
+        json!({ "output_device_id": "uuid:p6774-fixe-b", "fixed_volume": true }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{reponse}");
+    let zone = repo.get(id).unwrap().unwrap();
+    assert!(
+        !zone.fixed_volume,
+        "#6774 : le volume fixe de l'ancien appareil a été réarmé sur le nouveau sans confirmation"
+    );
+    assert_eq!(
+        zone.volume, 50.0,
+        "le volume repart de la limite de sécurité (50 %)"
+    );
+    assert!(
+        state.playback.get_state(id).await.volume <= 0.5,
+        "#6774 : l'état de lecture est resté à 100 % après le changement d'appareil"
+    );
+}

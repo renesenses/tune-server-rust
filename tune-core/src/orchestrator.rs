@@ -791,9 +791,27 @@ fn spawn_braked_levels_sink(
     tokio::sync::mpsc::Sender<Vec<u8>>,
     tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
 ) {
+    spawn_braked_levels_sink_depuis(playback, zone_id, levels_tx, consomme_ms, 0)
+}
+
+/// #6456 — le même frein, pour un décodage qui part de `depart_ms` sur
+/// l'horloge de la PISTE (un déplacement) : l'avance décodée se compte
+/// depuis là, comme la position rapportée par la zone. Compté depuis 0, un
+/// décodage relancé à 10 min prenait 10 min d'avance de plus que le
+/// plafond avant de freiner — toute la piste retenue dans la file.
+fn spawn_braked_levels_sink_depuis(
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    consomme_ms: Arc<std::sync::atomic::AtomicI64>,
+    depart_ms: i64,
+) -> (
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+    tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+) {
     // Position DÉCODÉE, alimentée par le relais ci-dessous : c'est elle
     // que le bridage compare à la position rapportée par la zone.
-    let avance_ms = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let avance_ms = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(depart_ms.max(0)));
     // Relais : le décodeur ne sait pas compter son avance, mais chaque
     // fenêtre porte sa durée.
     let (relais_tx, mut relais_rx) =
@@ -881,15 +899,35 @@ fn spawn_local_file_levels_decode(
     play_seq: u64,
     path: String,
 ) {
+    spawn_local_file_levels_decode_depuis(bus, playback, zone_id, play_seq, path, 0, 0);
+}
+
+/// #6456 — [`spawn_local_file_levels_decode`], depuis une position : le
+/// fichier est décodé à partir de `debut_fichier_ms` (son horloge à lui : le
+/// déplacement, plus le début de la tranche d'une image ou d'une feuille
+/// CUE), et les fenêtres sont datées et freinées à partir de `depart_ms`,
+/// la position dans la PISTE. C'est le décodage-pour-niveaux du DoP : le
+/// flux DoP est un porteur DSD emballé, d'où aucun niveau ne se lit, si bien
+/// que le DSD est converti ici en PCM pour les seules aiguilles.
+fn spawn_local_file_levels_decode_depuis(
+    bus: Arc<EventBus>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    play_seq: u64,
+    path: String,
+    debut_fichier_ms: u64,
+    depart_ms: u64,
+) {
+    let depart_ms = i64::try_from(depart_ms).unwrap_or(i64::MAX);
     tokio::spawn(async move {
         let cadence = playback.clone();
         let (levels_tx, consomme_ms) =
-            spawn_paced_levels_forwarder_mesure(bus, playback, zone_id, play_seq, 0);
+            spawn_paced_levels_forwarder_mesure(bus, playback, zone_id, play_seq, depart_ms);
         let (sink_tx, relais_tx) =
-            spawn_braked_levels_sink(cadence, zone_id, levels_tx, consomme_ms);
+            spawn_braked_levels_sink_depuis(cadence, zone_id, levels_tx, consomme_ms, depart_ms);
         let ready = std::sync::Arc::new(tokio::sync::Notify::new());
         let result = tokio::task::spawn_blocking(move || {
-            crate::audio::decode::decode_to_pcm_streaming_with_levels(
+            crate::audio::decode::decode_to_pcm_streaming_seeked(
                 &path,
                 None,
                 None,
@@ -898,6 +936,7 @@ fn spawn_local_file_levels_decode(
                 LEVELS_DECODE_CHUNK,
                 ready,
                 relais_tx,
+                debut_fichier_ms as f64 / 1000.0,
             )
         })
         .await;
@@ -1830,6 +1869,10 @@ mod compensation_reseau_5071_tests;
 #[cfg(test)]
 mod repli_dsd_4354_tests;
 
+// #6772 — l'avance sans blanc relance le préchargement de la piste suivante.
+#[cfg(test)]
+mod prechargement_apres_avance_6772_tests;
+
 // #5871 — la préparation DSP ne fait plus la queue derrière l'écrivain.
 #[cfg(test)]
 mod prepa_lecture_5871_tests;
@@ -1837,6 +1880,10 @@ mod prepa_lecture_5871_tests;
 // #5080 — un flux de service à traitement actif part en WAV progressif.
 #[cfg(test)]
 mod service_wav_progressif_5080;
+
+// #6718 — la même chose vers un renderer OpenHome qui annonce le LPCM.
+#[cfg(test)]
+mod service_wav_progressif_openhome_6718;
 
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
@@ -1850,6 +1897,10 @@ mod volume_pure_5695_tests;
 // #6541 — limites de sécurité et de confort, tenues sur tous les chemins.
 #[cfg(test)]
 mod volume_limites_6541_tests;
+// #6774 — PURE verrouillé et volume fixe ne suivent pas la zone sur un
+// autre appareil.
+#[cfg(test)]
+mod securite_volume_changement_d_appareil_6774_tests;
 // #4407 — l'égaliseur remplacé en vol dans un flux réseau fabriqué par Tune.
 mod eq_en_vol;
 #[cfg(test)]
@@ -2074,6 +2125,9 @@ mod crete_apres_dsp_4384;
 /// l'alimentation de l'anneau.
 #[cfg(test)]
 mod niveaux_a_la_sortie_1908;
+/// #6456 — le DoP publie les niveaux de la piste, depuis la position servie.
+#[cfg(test)]
+mod niveaux_du_dop_6456;
 /// #3818 — les niveaux ne meurent plus à 31-32 s sur une position figée.
 #[cfg(test)]
 mod niveaux_frein_3818;

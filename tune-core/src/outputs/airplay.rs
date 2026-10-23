@@ -1,6 +1,12 @@
 #[path = "airplay_timing.rs"]
 mod timing;
 
+#[path = "airplay_controle.rs"]
+mod controle;
+
+#[path = "airplay_flux_progressif.rs"]
+mod flux_progressif;
+
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -120,6 +126,23 @@ impl HorlogeCadencementRtp {
         Some(duree)
     }
 
+    /// #6673 — la boucle a attendu le decodeur au-dela de `tolere` : decaler
+    /// l'origine du retard, comme pour une pause, au lieu de servir en rafale
+    /// les echeances tombees dans le passe.
+    fn rattraper_un_retard(
+        &mut self,
+        maintenant: tokio::time::Instant,
+        trames: u64,
+        tolere: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        let retard = maintenant.saturating_duration_since(self.echeance(trames));
+        if retard <= tolere {
+            return None;
+        }
+        self.origine += retard;
+        Some(retard)
+    }
+
     fn echeance(&self, trames: u64) -> tokio::time::Instant {
         self.origine + std::time::Duration::from_micros(trames * 1_000_000 / SAMPLE_RATE as u64)
     }
@@ -150,6 +173,9 @@ struct RtspSession {
     session_id: Option<String>,
     server_port: u16,
     timing_port: u16,
+    /// #6751 — le port de contrôle que le récepteur annonce dans sa réponse
+    /// au SETUP : la destination des paquets sync. 0 s'il n'en annonce pas.
+    control_port: u16,
     auxiliary_udp: Option<timing::AuxiliaryUdp>,
 }
 
@@ -223,6 +249,7 @@ impl RtspSession {
             session_id: None,
             server_port: 0,
             timing_port: 0,
+            control_port: 0,
             auxiliary_udp: None,
         })
     }
@@ -258,10 +285,18 @@ impl RtspSession {
 
         let mut reader = BufReader::new(&mut self.stream);
         let mut status_line = String::new();
-        reader
+        let lus = reader
             .read_line(&mut status_line)
             .await
             .map_err(|e| format!("rtsp read status: {e}"))?;
+        // #6751 — un canal fermé par l'appareil sans réponse rendait le code
+        // 0 (« TEARDOWN refused by device: 0 ») : ce n'est pas un refus, c'est
+        // une connexion close. Le dire.
+        if lus == 0 {
+            return Err(format!(
+                "rtsp {method}: connection closed by the device before any response"
+            ));
+        }
 
         let status_code: u32 = status_line
             .split_whitespace()
@@ -360,6 +395,9 @@ impl RtspSession {
                     }
                     if let Some(port_str) = param.strip_prefix("timing_port=") {
                         self.timing_port = port_str.parse().unwrap_or(0);
+                    }
+                    if let Some(port_str) = param.strip_prefix("control_port=") {
+                        self.control_port = port_str.parse().unwrap_or(0);
                     }
                 }
             }
@@ -620,6 +658,15 @@ impl OutputTarget for AirplayOutput {
             .map_err(|e| format!("udp connect {target_addr}: {e}"))?;
         udp.set_nonblocking(true)
             .map_err(|e| format!("udp nonblocking: {e}"))?;
+        // #6751 — sync et retransmissions passent par le port de contrôle que
+        // le récepteur a annoncé.
+        let controle = (session.control_port != 0)
+            .then(|| {
+                session.auxiliary_udp.as_ref().map(|aux| {
+                    aux.controle_vers(std::net::SocketAddr::new(peer.ip(), session.control_port))
+                })
+            })
+            .flatten();
 
         *self.rtsp_session.lock().await = Some(session);
 
@@ -646,6 +693,7 @@ impl OutputTarget for AirplayOutput {
             let result = stream_to_airplay(
                 &url,
                 udp,
+                controle,
                 &playing,
                 &paused,
                 &position_ms,
@@ -779,15 +827,81 @@ impl OutputTarget for AirplayOutput {
     }
 }
 
+// Chemin de sortie audio : regrouper ces arguments en structure toucherait la lecture pour un gain de forme (clippy 1.98).
+#[allow(clippy::too_many_arguments)]
 async fn stream_to_airplay(
     url: &str,
     udp: UdpSocket,
+    controle: Option<controle::ControleRaop>,
     playing: &AtomicBool,
     paused: &AtomicBool,
     position_ms: &AtomicU64,
     stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
     rtp: &CurseurRtpAirplay,
 ) -> Result<(), String> {
+    let ssrc: u32 = rand_random();
+    // #6751 — sync et retransmissions passent par le port de contrôle ; le
+    // flux progressif (#6673) et le repli complet partagent cet émetteur.
+    let udp = controle::EmetteurRaop::new(
+        tokio::net::UdpSocket::from_std(udp).map_err(|e| format!("tokio udp: {e}"))?,
+        controle,
+    );
+
+    // #6673 — voie A : le décodeur progressif alimente la boucle RTP au fil
+    // de l'eau. Le premier paquet part dès le premier bloc décodé, et non plus
+    // après le téléchargement et le décodage de toute la piste.
+    let debut = std::time::Instant::now();
+    let mut flux = flux_progressif::FluxPcmAirplay::ouvrir(url);
+    let issue = diffuser_flux(
+        &mut flux,
+        &udp,
+        playing,
+        paused,
+        position_ms,
+        stop_rx,
+        ssrc,
+        rtp,
+    )
+    .await;
+    if let Some(ms) = issue.premier_paquet_ms(debut) {
+        info!(
+            premier_paquet_ms = ms,
+            "airplay_flux_progressif_premier_paquet"
+        );
+    }
+    if flux.octets_rendus() > 0 || issue.interrompu {
+        if let Some(e) = flux.echec() {
+            warn!(error = %e, "airplay_flux_progressif_interrompu");
+        }
+        return Ok(());
+    }
+
+    // Rien n'a été décodé (format que le décodeur progressif ne lit pas sur
+    // cette source) : le chemin d'avant, qui télécharge et décode tout.
+    warn!(
+        error = flux.echec().unwrap_or("flux vide"),
+        "airplay_flux_progressif_repli_telechargement_complet"
+    );
+    drop(flux);
+    let pcm_be = decoder_la_piste_entiere(url).await?;
+    diffuser_pcm(
+        &pcm_be,
+        &udp,
+        playing,
+        paused,
+        position_ms,
+        stop_rx,
+        ssrc,
+        rtp,
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Le chemin d'avant #6673, gardé en repli : télécharger, décoder TOUTE la
+/// piste, adapter canaux et cadence, convertir en L16.
+async fn decoder_la_piste_entiere(url: &str) -> Result<Vec<u8>, String> {
     // Resolve URL to a local file path (downloading HTTP URLs if needed)
     let (local_path, _tmp_guard) = url_to_local_path(url).await?;
 
@@ -842,24 +956,44 @@ async fn stream_to_airplay(
     }
 
     // Convert i32 samples to i16, then to big-endian bytes for AirPlay RTP
-    let pcm_be = pcm_i32_to_l16_be(&echantillons, decoded.bit_depth);
+    Ok(pcm_i32_to_l16_be(&echantillons, decoded.bit_depth))
+}
 
-    let ssrc: u32 = rand_random();
-    let udp = tokio::net::UdpSocket::from_std(udp).map_err(|e| format!("tokio udp: {e}"))?;
+/// Ce qui alimente la boucle RTP : des blocs de PCM L16 gros-boutiste, de
+/// taille quelconque, jusqu'à `None` (fin du flux).
+trait SourcePcmAirplay {
+    async fn suivant(&mut self) -> Option<Vec<u8>>;
+}
 
-    diffuser_pcm(
-        &pcm_be,
-        &udp,
-        playing,
-        paused,
-        position_ms,
-        stop_rx,
-        ssrc,
-        rtp,
-    )
-    .await;
+impl SourcePcmAirplay for flux_progressif::FluxPcmAirplay {
+    async fn suivant(&mut self) -> Option<Vec<u8>> {
+        flux_progressif::FluxPcmAirplay::suivant(self).await
+    }
+}
 
-    Ok(())
+/// Une piste déjà décodée en entier, rendue d'un seul bloc.
+struct PisteEntiere<'a>(Option<&'a [u8]>);
+
+impl SourcePcmAirplay for PisteEntiere<'_> {
+    async fn suivant(&mut self) -> Option<Vec<u8>> {
+        self.0.take().map(<[u8]>::to_vec)
+    }
+}
+
+/// Ce que la boucle RTP a fait.
+#[derive(Debug, Default)]
+struct IssueDeDiffusion {
+    /// Arrêt (stop, `playing` à faux) avant la fin du flux.
+    interrompu: bool,
+    /// Quand le premier paquet est parti.
+    premier_paquet: Option<std::time::Instant>,
+}
+
+impl IssueDeDiffusion {
+    fn premier_paquet_ms(&self, debut: std::time::Instant) -> Option<u128> {
+        self.premier_paquet
+            .map(|t| t.saturating_duration_since(debut).as_millis())
+    }
 }
 
 /// La sortie des paquets RTP.
@@ -870,14 +1004,6 @@ async fn stream_to_airplay(
 /// journalise en debug, exactement le symptome qu'on veut interdire.
 trait SortieRtp {
     async fn envoyer(&self, pkt: &[u8]);
-}
-
-impl SortieRtp for tokio::net::UdpSocket {
-    async fn envoyer(&self, pkt: &[u8]) {
-        if let Err(e) = self.send(pkt).await {
-            debug!(error = %e, "airplay_rtp_send_error");
-        }
-    }
 }
 
 /// Emet le PCM big-endian en paquets RTP, au rythme reel.
@@ -893,9 +1019,45 @@ async fn diffuser_pcm<S: SortieRtp>(
     ssrc: u32,
     rtp: &CurseurRtpAirplay,
 ) {
+    diffuser_flux(
+        &mut PisteEntiere(Some(pcm_be)),
+        sortie,
+        playing,
+        paused,
+        position_ms,
+        stop_rx,
+        ssrc,
+        rtp,
+    )
+    .await;
+}
+
+/// Au-delà de ce retard sur l'échéance du paquet, la boucle a attendu le
+/// décodeur (sous-alimentation) : l'horloge est recalée plutôt que de servir
+/// en rafale tout ce qui aurait dû partir pendant l'attente (#6673).
+const RETARD_TOLERE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Emet le flux en paquets RTP, au rythme reel, au fur et a mesure que la
+/// source le livre (#6673).
+// Chemin de sortie audio : regrouper ces arguments en structure toucherait la lecture pour un gain de forme (clippy 1.98).
+#[allow(clippy::too_many_arguments)]
+async fn diffuser_flux<F: SourcePcmAirplay, S: SortieRtp>(
+    source: &mut F,
+    sortie: &S,
+    playing: &AtomicBool,
+    paused: &AtomicBool,
+    position_ms: &AtomicU64,
+    stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    ssrc: u32,
+    rtp: &CurseurRtpAirplay,
+) -> IssueDeDiffusion {
     let mut total_frames: u64 = 0;
+    // `tampon[offset..]` : ce que la source a livre et qui n'est pas parti.
+    let mut tampon: Vec<u8> = Vec::new();
     let mut offset: usize = 0;
+    let mut epuise = false;
     let mut horloge = HorlogeCadencementRtp::new(tokio::time::Instant::now());
+    let mut premier_paquet = None;
 
     // Pourquoi un booleen plutot qu'une seconde lecture du receiver :
     // `oneshot::Receiver::try_recv()` CONSOMME. La boucle rend le stop, puis
@@ -905,10 +1067,33 @@ async fn diffuser_pcm<S: SortieRtp>(
     // canal consommable ne se deduit pas deux fois : on le retient.
     let mut interrompu = false;
 
-    'paquets: while offset + BYTES_PER_PACKET <= pcm_be.len() {
+    'paquets: loop {
         // Check for stop signal (non-blocking)
         if stop_rx.try_recv().is_ok() {
             interrompu = true;
+            break;
+        }
+
+        // Remplir jusqu'a un paquet plein, ou jusqu'a la fin du flux. Un
+        // Stop pendant l'attente du decodeur sort tout de suite.
+        while !epuise && tampon.len() - offset < BYTES_PER_PACKET {
+            if offset > 0 {
+                tampon.drain(..offset);
+                offset = 0;
+            }
+            tokio::select! {
+                biased;
+                _ = &mut *stop_rx => {
+                    interrompu = true;
+                    break 'paquets;
+                }
+                bloc = source.suivant() => match bloc {
+                    Some(bloc) => tampon.extend_from_slice(&bloc),
+                    None => epuise = true,
+                },
+            }
+        }
+        if tampon.len() - offset < BYTES_PER_PACKET {
             break;
         }
 
@@ -937,8 +1122,16 @@ async fn diffuser_pcm<S: SortieRtp>(
                 "airplay_horloge_recalee_apres_pause"
             );
         }
+        if let Some(retard) =
+            horloge.rattraper_un_retard(tokio::time::Instant::now(), total_frames, RETARD_TOLERE)
+        {
+            debug!(
+                retard_ms = retard.as_millis(),
+                "airplay_horloge_recalee_apres_attente_du_decodeur"
+            );
+        }
 
-        let audio_buf = &pcm_be[offset..offset + BYTES_PER_PACKET];
+        let audio_buf = &tampon[offset..offset + BYTES_PER_PACKET];
         let Some((seq, timestamp, marqueur)) = rtp.reserver(FRAMES_PER_PACKET as u32, paused)
         else {
             // Pause a croise la frontiere entre la garde ci-dessus et la
@@ -947,6 +1140,7 @@ async fn diffuser_pcm<S: SortieRtp>(
         };
         let pkt = build_rtp_packet(seq, timestamp, ssrc, audio_buf, marqueur);
         sortie.envoyer(&pkt).await;
+        premier_paquet.get_or_insert_with(std::time::Instant::now);
 
         total_frames += FRAMES_PER_PACKET as u64;
         offset += BYTES_PER_PACKET;
@@ -970,7 +1164,7 @@ async fn diffuser_pcm<S: SortieRtp>(
     // borne par rien. Trois conditions, aucune deduite : la boucle a bien
     // epuise ses paquets pleins, la lecture n'a pas ete interrompue, et il
     // reste de quoi remplir au moins une trame.
-    let reste = pcm_be.len() - offset;
+    let reste = tampon.len() - offset;
     if !interrompu
         && playing.load(Ordering::Relaxed)
         && (BYTES_PER_FRAME..BYTES_PER_PACKET).contains(&reste)
@@ -989,12 +1183,17 @@ async fn diffuser_pcm<S: SortieRtp>(
             }
         };
         if let Some((seq, timestamp, marqueur)) = reservation {
-            let pkt = build_rtp_packet(seq, timestamp, ssrc, &pcm_be[offset..fin], marqueur);
+            let pkt = build_rtp_packet(seq, timestamp, ssrc, &tampon[offset..fin], marqueur);
             sortie.envoyer(&pkt).await;
+            premier_paquet.get_or_insert_with(std::time::Instant::now);
             total_frames += trames as u64;
             position_ms.store(total_frames * 1000 / SAMPLE_RATE as u64, Ordering::Relaxed);
             debug!(trames, "airplay_dernier_paquet_partiel");
         }
+    }
+    IssueDeDiffusion {
+        interrompu: interrompu || !playing.load(Ordering::Relaxed),
+        premier_paquet,
     }
 }
 
@@ -1584,3 +1783,11 @@ mod tests {
 #[cfg(test)]
 #[path = "airplay_timing_tests_2217.rs"]
 mod timing_tests_2217;
+
+#[cfg(test)]
+#[path = "airplay_controle_tests_6751.rs"]
+mod controle_tests_6751;
+
+#[cfg(test)]
+#[path = "airplay_flux_progressif_tests_6673.rs"]
+mod flux_progressif_tests_6673;

@@ -10,10 +10,11 @@
 //!
 //! Ce module tient les deux règles communes :
 //!
-//! - [`reinitialiser_le_trim`] : la zone change d'appareil pour un AUTRE
-//!   appareil — le trim repart de 0 dB, les limites restent (elles ne font
-//!   que borner), et l'évènement est journalisé
-//!   (`reglages_volume_reinitialises_changement_d_appareil`) ;
+//! - [`ajuster_au_changement_d_appareil`] : la zone change d'appareil pour
+//!   un AUTRE appareil — PURE verrouillé et volume fixe sont désarmés, le
+//!   volume ne remonte jamais, un trim POSITIF repart de 0 dB (un trim
+//!   négatif reste), les limites restent (elles ne font que borner) ;
+//!   décisions de Bertrand du 22/10 ;
 //! - [`neutraliser`] : la restauration n'a trouvé aucune correspondance sûre
 //!   pour une zone — aucun réglage de volume n'y est posé, ceux qui y
 //!   traînaient sont retirés.
@@ -107,49 +108,186 @@ pub fn meme_appareil(
     }
 }
 
-/// La zone vient de passer sur un AUTRE appareil : le trim repart de 0 dB.
+/// Ce qu'un changement d'appareil a fait aux réglages de volume d'une zone.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ChangementDAppareil {
+    /// Trim POSITIF retiré (il pouvait faire monter le nouvel appareil).
+    pub trim_retire_db: Option<f64>,
+    /// Trim NÉGATIF conservé (il ne fait que baisser).
+    pub trim_garde_db: Option<f64>,
+    /// PURE verrouillé (« Forcer à 100 % ») était armé et a été désarmé.
+    pub pure_desarme: bool,
+    /// Le volume fixe était armé et a été désarmé.
+    pub volume_fixe_desarme: bool,
+    /// Volume de la zone (en %) avant / après, quand un désarmement l'a
+    /// ramené. `None` : rien n'a été désarmé, le volume n'est pas touché.
+    pub volume_ramene: Option<(f64, f64)>,
+}
+
+impl ChangementDAppareil {
+    /// Un mode qui tenait la sortie à 100 % a-t-il été désarmé ?
+    pub fn a_desarme(&self) -> bool {
+        self.pure_desarme || self.volume_fixe_desarme
+    }
+}
+
+fn lire_le_trim(settings: &SettingsRepo, zone_id: i64) -> Option<f64> {
+    settings
+        .get(&cle(GABARITS_DU_TRIM[0], zone_id))
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|t| t.is_finite())
+}
+
+/// La zone vient de passer sur un AUTRE appareil (décisions de Bertrand du
+/// 22/10, #6774). Le nouvel appareil ne doit JAMAIS être tenu plus haut du
+/// seul fait de l'ancien :
 ///
-/// Les limites et le reste restent en place. Rend le trim retiré (`None`
-/// quand il n'y en avait aucun, ou qu'il valait 0). Journalise toujours
-/// `reglages_volume_reinitialises_changement_d_appareil`.
-pub fn reinitialiser_le_trim(
+/// 1. **PURE verrouillé et volume fixe sont désarmés.** Ils tiennent la
+///    sortie à 100 % ; c'était le réglage de l'ancien appareil, l'utilisateur
+///    les réarme lui-même sur le nouveau. Le volume de la zone repart alors
+///    de la valeur la plus basse entre le volume courant, les limites de
+///    confort et de sécurité et le volume mémorisé avant l'armement du volume
+///    fixe — jamais une hausse. Journal
+///    `pure_et_volume_fixe_desarmes_changement_d_appareil`. Rien n'est
+///    commandé à l'appareil ici : seule la base change.
+/// 2. **Le trim NÉGATIF reste** (il ne fait que baisser) ; seul un trim
+///    POSITIF repart à 0 dB. Journal
+///    `reglages_volume_reinitialises_changement_d_appareil`.
+///
+/// Les limites restent : elles ne font que borner.
+pub fn ajuster_au_changement_d_appareil(
     db: &Arc<dyn DbBackend>,
     zone_id: i64,
     ancien_device_id: Option<&str>,
     nouveau_device_id: &str,
     origine: &'static str,
-) -> Option<f64> {
+) -> ChangementDAppareil {
     let settings = SettingsRepo::with_backend(db.clone());
-    let trim_avant = settings
-        .get(&cle(GABARITS_DU_TRIM[0], zone_id))
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|t| *t != 0.0);
-    for gabarit in GABARITS_DU_TRIM {
-        if let Err(e) = settings.delete(&cle(gabarit, zone_id)) {
-            tracing::warn!(zone_id, cle = %cle(gabarit, zone_id), error = %e, "reglage_de_volume_non_retire");
+    let mut rapport = ChangementDAppareil::default();
+
+    // 2. Le trim : seul un trim positif est retiré.
+    match lire_le_trim(&settings, zone_id) {
+        Some(t) if t < 0.0 => rapport.trim_garde_db = Some(t),
+        trim => {
+            rapport.trim_retire_db = trim.filter(|t| *t > 0.0);
+            for gabarit in GABARITS_DU_TRIM {
+                if let Err(e) = settings.delete(&cle(gabarit, zone_id)) {
+                    tracing::warn!(zone_id, cle = %cle(gabarit, zone_id), error = %e, "reglage_de_volume_non_retire");
+                }
+            }
         }
     }
-    if let Some(trim) = trim_avant {
+    tracing::info!(
+        zone_id,
+        ancien = ?ancien_device_id,
+        nouveau = nouveau_device_id,
+        origine,
+        trim_retire_db = ?rapport.trim_retire_db,
+        trim_garde_db = ?rapport.trim_garde_db,
+        "reglages_volume_reinitialises_changement_d_appareil"
+    );
+
+    // 1. PURE verrouillé : désarmé (mode ET « Forcer à 100 % »), les autres
+    // champs de l'objet restent.
+    if crate::audio::audiophile::zone_enabled(db, zone_id)
+        && crate::audio::audiophile::volume_lock_enabled(db, zone_id)
+    {
+        let k = cle("zone_{id}_audiophile", zone_id);
+        let mut objet = settings
+            .get(&k)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        objet["enabled"] = serde_json::Value::Bool(false);
+        objet["lock_volume"] = serde_json::Value::Bool(false);
+        match settings.set(&k, &objet.to_string()) {
+            Ok(()) => rapport.pure_desarme = true,
+            Err(e) => tracing::warn!(zone_id, cle = %k, error = %e, "pure_non_desarme"),
+        }
+    }
+
+    // 1 bis. Volume fixe : désarmé, et sa mémoire (celle de l'ancien
+    // appareil) ne sera rendue par aucun désarmement ultérieur.
+    let repo = crate::db::zone_repo::ZoneRepo::with_backend(db.clone());
+    let zone = repo.get(zone_id).ok().flatten();
+    let memoire_fixe = crate::audio::fixed_volume::peek(db, zone_id);
+    if zone.as_ref().is_some_and(|z| z.fixed_volume) {
+        match repo.update_fixed_volume(zone_id, false) {
+            Ok(()) => {
+                rapport.volume_fixe_desarme = true;
+                crate::audio::fixed_volume::forget(db, zone_id);
+            }
+            Err(e) => tracing::warn!(zone_id, error = %e, "volume_fixe_non_desarme"),
+        }
+    }
+
+    if rapport.a_desarme()
+        && let Some(zone) = zone
+    {
+        let limites = crate::audio::volume_limites::lire(db, zone_id);
+        let avant = zone.volume;
+        let mut apres = avant;
+        for candidat in [
+            limites.confort.map(|f| f * 100.0),
+            limites.securite.map(|f| f * 100.0),
+            memoire_fixe.filter(|_| rapport.volume_fixe_desarme),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if candidat.is_finite() && candidat < apres {
+                apres = candidat;
+            }
+        }
+        let apres = apres.clamp(0.0, 100.0).min(avant.max(0.0));
+        if apres < avant
+            && let Err(e) = repo.update_volume(zone_id, apres)
+        {
+            tracing::warn!(zone_id, error = %e, "volume_non_ramene_changement_d_appareil");
+            rapport.volume_ramene = Some((avant, avant));
+        } else {
+            rapport.volume_ramene = Some((avant, apres));
+        }
         tracing::warn!(
             zone_id,
             ancien = ?ancien_device_id,
             nouveau = nouveau_device_id,
             origine,
-            trim_retire_db = trim,
-            "reglages_volume_reinitialises_changement_d_appareil"
-        );
-    } else {
-        tracing::info!(
-            zone_id,
-            ancien = ?ancien_device_id,
-            nouveau = nouveau_device_id,
-            origine,
-            "reglages_volume_reinitialises_changement_d_appareil"
+            pure_desarme = rapport.pure_desarme,
+            volume_fixe_desarme = rapport.volume_fixe_desarme,
+            volume_avant = avant,
+            volume_apres = ?rapport.volume_ramene.map(|(_, a)| a),
+            "pure_et_volume_fixe_desarmes_changement_d_appareil"
         );
     }
-    trim_avant
+    rapport
+}
+
+/// Après un changement d'appareil, l'état de lecture EN MÉMOIRE ne doit pas
+/// rester au-dessus de la base : le pas des boutons (`POST
+/// /zones/{id}/volume/step`) part de lui, et un 100 % resté en mémoire après
+/// le désarmement de PURE ou du volume fixe ferait repartir le nouvel
+/// appareil de là. N'abaisse que : jamais une hausse.
+pub async fn aligner_la_lecture(
+    db: &Arc<dyn DbBackend>,
+    playback: &crate::playback::PlaybackManager,
+    zone_id: i64,
+) {
+    let Some(zone) = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let base = (zone.volume / 100.0).clamp(0.0, 1.0);
+    if base < playback.get_state(zone_id).await.volume {
+        playback.set_volume(zone_id, base).await;
+    }
 }
 
 /// Retire TOUS les réglages de volume d'une zone : elle revient au neutre

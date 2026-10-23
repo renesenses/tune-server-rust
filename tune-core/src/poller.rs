@@ -1362,7 +1362,7 @@ mod hqplayer_enchainement_4851;
 /// un échec : préchargement, enchaînement sans blanc et reprise désignent la
 /// même suivante que l'avance de la file.
 #[cfg(test)]
-mod suivante_bannie_5143;
+pub(crate) mod suivante_bannie_5143;
 
 /// #6735 — Répéter la piste relance un morceau plus court que les gardes
 /// anti-double-appui de `play` ; un double appui de contrôleur reste coalescé.

@@ -1652,6 +1652,25 @@ fn assembler_les_etapes_lang(
             "eq_non_finite_samples": metrics.eq_non_finite_samples,
         })
     });
+    // #6741 — un égaliseur COUPÉ qui applique encore son préampli le dit,
+    // chiffre compris, au lieu d'un « DSP appliqué » ambigu (#6524 b, Jean
+    // Valjean : −8,4 dB gardés, égaliseur inactif et remis à plat).
+    let preampli_garde = ps
+        .transformations_reelles
+        .as_ref()
+        .and_then(|t| t.preampli_garde())
+        .map(|(db, en_retour)| {
+            fs(
+                lang,
+                if en_retour {
+                    "preampli_en_retour"
+                } else {
+                    "preampli_garde"
+                },
+                &[&format!("{db:.1}")],
+            )
+        });
+    let eq_step_description = preampli_garde.or(eq_step_description);
     if let Some(runtime) = runtime_signal_path {
         let dsp_step = match runtime.dsp {
             OutputDspState::Applied => Some((

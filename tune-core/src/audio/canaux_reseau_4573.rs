@@ -110,6 +110,28 @@ pub fn plafond_de_canaux(
         .filter(|n| *n > 0)
         .min()
 }
+
+/// #6599 — QUI a fixé la cible d'une réduction réseau, pour le journal.
+///
+/// Le rapport de l'Eversolo DMP-A6 (fil 2356) portait trois
+/// `reduction_de_canaux_pour_le_renderer … canaux_cible=2` sans un mot sur la
+/// provenance de ce 2 : ni ligne de sonde pour l'A6, ni trace de la
+/// disposition de la zone. Deux sources seulement peuvent le donner (voir
+/// [`plafond_de_canaux`]) ; la ligne doit nommer celle qui a tranché, avec le
+/// même plancher stéréo que [`canaux_a_servir`]. Codes stables :
+/// `renderer`, `disposition_declaree`, `renderer_et_disposition`.
+pub fn origine_du_plafond(
+    canaux_renderer: Option<u16>,
+    canaux_declares: Option<u16>,
+    cible: u16,
+) -> &'static str {
+    let tranche = |n: Option<u16>| n.filter(|n| *n > 0).map(|n| n.max(2)) == Some(cible);
+    match (tranche(canaux_renderer), tranche(canaux_declares)) {
+        (true, true) => "renderer_et_disposition",
+        (false, true) => "disposition_declaree",
+        _ => "renderer",
+    }
+}
 /// L'étiquette du chemin du signal pour une réduction RÉSEAU mesurée, avec sa
 /// CAUSE. Quand la disposition déclarée — ramenée au plancher stéréo, comme
 /// dans [`canaux_a_servir`] — égale ce qui part sur le fil, c'est le choix de
@@ -157,6 +179,27 @@ mod tests {
         assert!(!reduction_de_canaux_requise(2, Some(6)));
         assert!(!reduction_de_canaux_requise(6, Some(8)));
         assert_eq!(etiquette_de_reduction(2, Some(2)), None);
+    }
+
+    /// #6599 — la ligne de réduction nomme ce qui a fixé la cible.
+    #[test]
+    fn l_origine_du_plafond_nomme_qui_a_tranche() {
+        assert_eq!(origine_du_plafond(Some(2), None, 2), "renderer");
+        assert_eq!(origine_du_plafond(None, Some(2), 2), "disposition_declaree");
+        assert_eq!(
+            origine_du_plafond(Some(8), Some(2), 2),
+            "disposition_declaree"
+        );
+        assert_eq!(
+            origine_du_plafond(Some(2), Some(2), 2),
+            "renderer_et_disposition"
+        );
+        // Plancher stéréo : un renderer en `channels=1` donne une cible de 2.
+        assert_eq!(origine_du_plafond(Some(1), Some(6), 2), "renderer");
+        assert_eq!(
+            origine_du_plafond(Some(6), Some(1), 2),
+            "disposition_declaree"
+        );
     }
 
     /// Un lecteur qui annonce zéro canal est une déclaration absurde : on la
