@@ -1115,6 +1115,20 @@ impl HistoryRepo {
             })
             .collect();
 
+        // ── #6682 — temps d'écoute radio, par station, sur la période ──
+        // À part des classements : `listen_history` n'a pas de radio, ces
+        // lignes viennent de la veille d'écoute (`radio_ecoute`). Un échec de
+        // lecture ne coûte que ce champ, pas le tableau de bord.
+        let premier_jour =
+            days.map(|d| crate::db::radio_ecoute::premier_jour(chrono::Utc::now(), d));
+        let radio_listening =
+            crate::db::radio_ecoute::RadioEcouteRepo::with_backend(self.db.clone())
+                .par_station(premier_jour.as_deref(), zone_id, profile_id, top_n)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(erreur = %e, "radio_ecoute_illisible");
+                    Vec::new()
+                });
+
         // ── Trend (daily) ──
         let trend_days = days.unwrap_or(365);
         let trend_zone_and = match zone_id {
@@ -1397,6 +1411,7 @@ impl HistoryRepo {
             top_albums,
             top_tracks,
             top_radios,
+            radio_listening,
             trend,
             hourly,
             by_zone,
@@ -1666,6 +1681,10 @@ pub struct DashboardData {
     pub top_tracks: Vec<TopTrackEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub top_radios: Vec<TopRadioEntry>,
+    /// #6682 — le temps d'écoute radio par station sur la période, à part des
+    /// classements. Absent quand aucune radio n'a été écoutée.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub radio_listening: Vec<crate::db::radio_ecoute::EcouteRadio>,
     pub trend: Vec<TrendEntry>,
     pub hourly: Vec<HourlyEntry>,
     pub by_zone: Vec<ByZoneEntry>,
