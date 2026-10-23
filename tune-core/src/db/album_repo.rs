@@ -781,6 +781,23 @@ pub mod sql {
         )
     }
 
+    /// TOUS les labels de la bibliothèque (#6736) : nom (espaces de bord
+    /// retirés, comme le regroupement de l'onglet Labels), nombre d'albums
+    /// visibles, et l'identifiant Qobuz d'un album Qobuz de la bibliothèque
+    /// qui porte ce label, s'il y en a un — la correspondance la plus sûre
+    /// pour retrouver le label chez Qobuz. Aucun emplacement.
+    pub fn labels_de_la_bibliotheque<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT TRIM(a.label) AS nom, COUNT(*) AS n, \
+             MAX(CASE WHEN a.source = 'qobuz' THEN a.source_id END) AS qobuz \
+             FROM albums a \
+             WHERE a.label IS NOT NULL AND TRIM(a.label) <> '' AND {} AND {} \
+             GROUP BY TRIM(a.label) ORDER BY TRIM(a.label)",
+            crate::db::facet_filter::hidden_albums_excluded(),
+            crate::db::facet_filter::album_distant_double_exclu(d.engine(), "a"),
+        )
+    }
+
     /// Les LABELS dont le nom contient la recherche, avec leur nombre
     /// d'albums visibles (point 8, Yves Corbat, 17/09/2026). Un label n'a pas
     /// d'identité en base : c'est la chaîne `albums.label`, comme dans
@@ -807,6 +824,15 @@ pub mod sql {
             d.placeholder(7)
         )
     }
+}
+
+/// Un label de la bibliothèque, tel que l'onglet Labels le regroupe (#6736).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelDeBibliotheque {
+    pub nom: String,
+    pub album_count: i64,
+    /// L'identifiant Qobuz d'un album Qobuz de la bibliothèque qui le porte.
+    pub album_qobuz: Option<String>,
 }
 
 /// Une tranche de Dynamic Range, bornes **incluses** (#2144).
@@ -4632,6 +4658,29 @@ impl AlbumRepo {
         ];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
+    }
+
+    /// Tous les labels de la bibliothèque (#6736), voir
+    /// [`sql::labels_de_la_bibliotheque`].
+    pub fn labels_de_la_bibliotheque(&self) -> Result<Vec<LabelDeBibliotheque>, TuneError> {
+        let sql = self.dialect_sql(
+            sql::labels_de_la_bibliotheque,
+            sql::labels_de_la_bibliotheque,
+        );
+        let rows = self.db.query_many(&sql, &[])?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some(LabelDeBibliotheque {
+                    nom: r.first().and_then(|v| v.as_string())?,
+                    album_count: r.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                    album_qobuz: r
+                        .get(2)
+                        .and_then(|v| v.as_string())
+                        .filter(|s| !s.trim().is_empty()),
+                })
+            })
+            .collect())
     }
 
     /// Labels correspondant à la recherche : `(nom, nombre d'albums)`, les

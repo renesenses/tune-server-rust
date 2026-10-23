@@ -45,6 +45,8 @@ mod genres;
 pub(crate) use genres::genres_de_l_album;
 pub(crate) mod identification_lot;
 mod ingest;
+/// `GET /library/labels` et les logos Qobuz des labels (#6736).
+mod labels;
 /// #6481 — le livret PDF rangé dans le dossier d'un album.
 mod livrets;
 mod lyrics_pass;
@@ -640,6 +642,7 @@ pub fn router() -> Router<AppState> {
             axum::routing::patch(ambiances::update_ambiance).delete(ambiances::delete_ambiance),
         )
         .route("/stats", get(stats::library_stats))
+        .route("/labels", get(labels::list_labels))
         .route("/artwork/{hash}", get(artwork::serve_artwork))
         .route("/artwork/proxy", get(artwork::proxy_artwork))
         .route(

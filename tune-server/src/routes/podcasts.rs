@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 use tune_core::playback::NowPlaying;
-use tune_core::streaming::podcasts::PodcastService;
+use tune_core::streaming::podcasts::{EchecResolution, PodcastService};
 use tune_core::streaming::radiofrance::{RadioFranceApi, RfStation};
 use tune_core::streaming::vignette_podcast;
 #[derive(Deserialize)]
@@ -48,6 +48,9 @@ struct EpisodesQuery {
     /// URL, so this lets episodes be previewed by resolving the feed URL from the
     /// id — without subscribing first (Bilou, #1000).
     source_id: Option<String>,
+    /// Pays du palmarès d'où vient `source_id` : la recherche du flux part
+    /// dans sa boutique Apple (#6770).
+    country: Option<String>,
     #[serde(default = "default_episode_limit")]
     limit: usize,
 }
@@ -63,6 +66,23 @@ struct Subscribe {
     image_url: Option<String>,
     description: Option<String>,
     source_id: Option<String>,
+    /// Pays du palmarès d'où vient `source_id` (#6770).
+    country: Option<String>,
+}
+
+/// L'échec de résolution d'un podcast du palmarès, dit au client (#6770) :
+/// un code stable et une phrase lisible, au lieu d'un 400 générique.
+fn echec_de_resolution(e: &EchecResolution) -> AppError {
+    let status = match e {
+        EchecResolution::Introuvable => StatusCode::NOT_FOUND,
+        EchecResolution::SansFluxPublic => StatusCode::UNPROCESSABLE_ENTITY,
+        EchecResolution::Reseau(_) => StatusCode::BAD_GATEWAY,
+    };
+    AppError {
+        status,
+        message: e.message().to_string(),
+        code: Some(e.code().to_string()),
+    }
 }
 #[derive(Deserialize)]
 struct PlayEpisodeRequest {
@@ -155,15 +175,12 @@ async fn subscribe(
                 .into_response();
         }
         let svc = PodcastService::with_client(state.http_client.clone());
-        match svc.resolve_feed_url(apple_id).await {
-            Some(url) => url,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "Could not resolve feed URL from Apple ID"})),
-                )
-                    .into_response();
-            }
+        match svc
+            .resolve_feed_url(apple_id, body.country.as_deref())
+            .await
+        {
+            Ok(url) => url,
+            Err(e) => return echec_de_resolution(&e).into_response(),
         }
     } else {
         body.feed_url.clone()
@@ -350,14 +367,9 @@ async fn episodes_by_feed_url(
                     "feed_url or source_id (apple-…) query parameter is required",
                 ));
             }
-            match svc.resolve_feed_url(apple_id).await {
-                Some(u) => u,
-                None => {
-                    return Err(AppError::bad_request(
-                        "could not resolve feed URL from Apple id",
-                    ));
-                }
-            }
+            svc.resolve_feed_url(apple_id, q.country.as_deref())
+                .await
+                .map_err(|e| echec_de_resolution(&e))?
         }
     };
     match svc.get_feed(&feed_url, q.limit).await {
