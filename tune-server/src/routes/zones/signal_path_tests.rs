@@ -1230,6 +1230,7 @@ fn decoded_radio_source_uses_the_detected_source_rate() {
                 format: Some("mp3"),
                 sample_rate: Some(48_000),
                 bit_depth: None,
+                bitrate_kbps: None,
             }),
             ..wire("wav", 48_000, 16)
         }),
@@ -3132,6 +3133,7 @@ fn radio_4346_signal_path_preserves_source_codec_and_output_container() {
                 format: codec,
                 sample_rate: rate,
                 bit_depth: bits,
+                bitrate_kbps: None,
             }),
             ..wire("wav", rate.unwrap_or(44_100).max(44_100), 16)
         };
@@ -3162,6 +3164,61 @@ fn radio_4346_signal_path_preserves_source_codec_and_output_container() {
                 );
             }
             assert!(step_desc(&sp, "Decoder").is_some());
+        }
+    }
+}
+
+/// #6821 — l'étape Source d'une radio porte le débit que la station annonce
+/// (`icy-br`), comme celle d'un MP3 de bibliothèque. Jamais sur un FLAC, et
+/// rien quand la station ne dit rien.
+#[test]
+fn radio_6821_source_porte_le_debit_annonce() {
+    use tune_core::http::streamer::RadioSourceInfo;
+    let (backend, mut zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            source: "radio".into(),
+            format: Some("wav".into()),
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    for (codec, bits, debit, attendu) in [
+        (Some("mp3"), None, Some(128), "MP3 128 kbit/s 44kHz"),
+        (Some("aac"), None, Some(64), "AAC 64 kbit/s 44kHz"),
+        (Some("mp3"), None, None, "MP3 44kHz"),
+        (Some("flac"), Some(16), Some(900), "FLAC 44kHz/16bit"),
+    ] {
+        let stream = StreamInfo {
+            radio_source: Some(RadioSourceInfo {
+                channels: Some(2),
+                format: codec,
+                sample_rate: Some(44_100),
+                bit_depth: bits,
+                bitrate_kbps: debit,
+            }),
+            ..wire("wav", 44_100, 16)
+        };
+        for output in ["local", "oaat", "dlna"] {
+            zone.output_type = Some(output.into());
+            let sp = build_signal_path(
+                &ps,
+                &zone,
+                &backend,
+                Some("Renderer"),
+                "none",
+                Some(&stream),
+            )
+            .unwrap();
+            assert_eq!(
+                step_desc(&sp, "Source").as_deref(),
+                Some(attendu),
+                "{output}"
+            );
         }
     }
 }
@@ -3242,6 +3299,7 @@ fn radio_4346_flac_truncated_before_local_output_is_not_bit_perfect() {
                 format: Some("flac"),
                 sample_rate: Some(96_000),
                 bit_depth: Some(24),
+                bitrate_kbps: None,
             }),
             ..wire("wav", 96_000, 16)
         };
@@ -3376,6 +3434,7 @@ fn codec_connu_4346_lossless_reste_un_booleen_sans_code() {
                 format: Some(codec),
                 sample_rate: Some(44_100),
                 bit_depth: bits,
+                bitrate_kbps: None,
             }),
             ..wire("wav", 44_100, 16)
         };
