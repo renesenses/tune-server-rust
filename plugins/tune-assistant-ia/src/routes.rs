@@ -738,3 +738,25 @@ async fn lot_annuler(State(etat): State<Etat>, Json(d): Json<DemandeLotAnnulatio
     }
     Json(json!({ "ok": true, "rapports": rapports })).into_response()
 }
+
+/// Le coût ESTIMÉ d'un appel, avant son envoi, au tarif du modèle choisi
+/// (décision du 23/10/2026 : coût estimé avant l'appel, montré avec l'aperçu
+/// de ce qui part). `None` : tarif inconnu ou assistant non configuré —
+/// l'appel serait refusé.
+#[allow(dead_code)]
+pub(crate) fn cout_estime_eur(
+    etat: &Etat,
+    modele: &str,
+    systeme: &str,
+    message: &str,
+    max_sortie: u32,
+) -> Option<f64> {
+    let r = reglages::Reglages::charger(&etat.backend);
+    let tarif = r.tarif(modele)?;
+    Some(couts::micro_en_euros(couts::estimer_micro_eur(
+        tarif,
+        &format!("{systeme}{message}"),
+        max_sortie,
+        r.taux_usd_eur,
+    )))
+}
