@@ -1584,6 +1584,7 @@ impl PlaybackOrchestrator {
         let strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
         let resultat = self
             .anticiper_le_dop(
+                req.zone_id,
                 &track,
                 fichier.clone(),
                 zone_max_sample_rate,

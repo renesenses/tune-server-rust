@@ -33,6 +33,10 @@ struct Compte {
     playlists: BTreeMap<String, Option<bool>>,
     /// La lecture des playlists se déclare incomplète (#6461, relecture).
     playlists_tronquees: bool,
+    /// #5997 — les favoris (titres, albums, artistes) ne sont servis qu'en
+    /// partie : la lecture datée d'affichage rend le PREMIER seulement, comme
+    /// un connecteur réel rend la coupe ; la lecture complète le dit (`Err`).
+    favoris_tronques: bool,
 }
 
 struct ServiceSimule {
@@ -179,11 +183,13 @@ impl StreamingService for ServiceSimule {
         if c.panne {
             return Err("panne réseau simulée".into());
         }
+        let coupe = if c.favoris_tronques { 1 } else { usize::MAX };
         Ok(Some(
             c.favoris
                 .get(fav_type)
                 .map(|m| {
                     m.iter()
+                        .take(coupe)
                         .map(|(id, (t, a, al, isrc))| match fav_type {
                             "artists" => json!({"id": id, "name": t}),
                             "albums" => json!({"source_id": id, "title": t, "artist_name": a}),
@@ -194,6 +200,17 @@ impl StreamingService for ServiceSimule {
                 })
                 .unwrap_or_default(),
         ))
+    }
+    /// #5997 — la lecture que réconcilie le miroir : `Err` quand le compte
+    /// n'est servi qu'en partie, la liste entière sinon.
+    async fn favoris_dates_complets(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        if self.compte.lock().unwrap().favoris_tronques {
+            return Err("lecture des favoris incomplète simulée".into());
+        }
+        self.get_user_favorites_dated(fav_type).await
     }
     // Le repli typé n'est atteint qu'en panne (la lecture datée a échoué).
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
@@ -1002,4 +1019,113 @@ async fn qobuz_tronque_aucune_playlist_synchro_ne_disparait_6461() {
             "une lecture tronquée de Qobuz a retiré des playlists synchro"
         );
     }
+}
+
+/// Témoin #5997 (lot H de la rc8) — une lecture PARTIELLE des favoris chez le
+/// service ne retire AUCUN favori local, pour aucun profil, et le dit.
+///
+/// Le connecteur sert la coupe à l'affichage (`get_user_favorites_dated`) et
+/// déclare la lecture incomplète à la réconciliation
+/// (`favoris_dates_complets`). Réconcilier la coupe retirerait de Tune, à
+/// chaque rafraîchissement, tout favori confirmé qu'elle ne nomme pas.
+#[tokio::test]
+async fn une_lecture_partielle_des_favoris_ne_retire_aucun_favori_5997() {
+    let (backend, profils, _dir) = base(2);
+    let (arc, compte) = ServiceSimule::nouveau("miroir-5997p");
+    for id in ["1", "2", "3"] {
+        poser_chez_le_service(&compte, "tracks", id);
+        poser_chez_le_service(&compte, "albums", &format!("a{id}"));
+    }
+    rafraichir(&arc, &backend, profils[0]).await;
+    let attendu = vec!["1", "2", "3", "a1", "a2", "a3"];
+    for &pid in &profils {
+        assert_eq!(ids(&backend, pid), attendu);
+    }
+
+    compte.lock().unwrap().favoris_tronques = true;
+    let bilan = rafraichir(&arc, &backend, profils[0]).await;
+    assert_eq!(bilan.retires, 0, "{bilan:?}");
+    assert!(
+        bilan.echecs >= 2,
+        "la lecture partielle doit se dire : {bilan:?}"
+    );
+    for &pid in &profils {
+        assert_eq!(
+            ids(&backend, pid),
+            attendu,
+            "une lecture partielle du service a retiré des favoris locaux"
+        );
+    }
+    assert_eq!(etat("miroir-5997p").statut, "echec");
+
+    // Le service sert de nouveau tout : rien n'a été perdu entre-temps.
+    compte.lock().unwrap().favoris_tronques = false;
+    let bilan = rafraichir(&arc, &backend, profils[0]).await;
+    assert_eq!(bilan.retires, 0, "{bilan:?}");
+    assert_eq!(ids(&backend, profils[1]), attendu);
+}
+
+/// Témoin #5997, de bout en bout : le VRAI connecteur Qobuz contre un Qobuz
+/// factice qui annonce 3 titres et n'en sert qu'un, et rend les albums sans
+/// leur clé (réponse d'une autre forme). Aucun favori `synchro` ne disparaît.
+#[tokio::test]
+async fn qobuz_favoris_tronques_aucun_favori_synchro_ne_disparait_5997() {
+    use axum::extract::Query;
+    use axum::{Json, Router};
+    use std::collections::HashMap as Carte;
+    let app = Router::new().fallback(
+        |uri: axum::http::Uri, Query(q): Query<Carte<String, String>>| async move {
+            if !uri.path().ends_with("/favorite/getUserFavorites") {
+                return Json(json!({}));
+            }
+            match q.get("type").map(String::as_str) {
+                Some("tracks") => Json(json!({"tracks": {"offset": 0, "limit": 50, "total": 3,
+                    "items": [{"id": 11, "title": "Summertime", "duration": 200}]}})),
+                Some("artists") => Json(json!({"artists": {"offset": 0, "limit": 50,
+                    "total": 0, "items": []}})),
+                _ => Json(json!({"user": {"id": 1234}})),
+            }
+        },
+    );
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("port libre");
+    let adresse = ecoute.local_addr().expect("adresse locale");
+    tokio::spawn(async move {
+        let _ = axum::serve(ecoute, app).await;
+    });
+    let svc: Box<dyn StreamingService> = Box::new(
+        crate::streaming::qobuz::QobuzService::connecte_a_base_forcee(format!("http://{adresse}")),
+    );
+    let arc: ServiceArc = Arc::new(RwLock::new(svc));
+
+    let (backend, profils, _dir) = base(2);
+    for (t, id) in [
+        ("track", "11"),
+        ("track", "22"),
+        ("track", "33"),
+        ("album", "a1"),
+    ] {
+        ecrire_partout(
+            &backend,
+            &profils,
+            "qobuz",
+            &favori(t, id),
+            ETAT_SYNCHRO,
+            None,
+        )
+        .unwrap();
+    }
+    let bilan = rafraichir(&arc, &backend, profils[0]).await;
+    assert_eq!(bilan.retires, 0, "{bilan:?}");
+    for &pid in &profils {
+        assert_eq!(
+            ids(&backend, pid),
+            vec!["11", "22", "33", "a1"],
+            "une lecture Qobuz tronquée a retiré des favoris locaux"
+        );
+    }
+    // L'écran du service, lui, garde la coupe : rien n'y devient une erreur.
+    let affichage = arc.read().await.get_user_tracks().await.expect("affichage");
+    assert_eq!(affichage.len(), 1);
 }

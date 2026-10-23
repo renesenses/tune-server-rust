@@ -13,14 +13,14 @@ use tokio::sync::mpsc;
 const CADENCE: u32 = 2_822_400;
 const BLOC: usize = 4096;
 /// Octets DSD par canal et par seconde en DSD64.
-const OCTETS_PAR_SECONDE: usize = CADENCE as usize / 8;
+pub(crate) const OCTETS_PAR_SECONDE: usize = CADENCE as usize / 8;
 
 fn octet_temoin(canal: usize, index: usize) -> u8 {
     (((canal * 97 + index * 31 + (index / 251) * 17) % 251) + 1) as u8
 }
 
 /// DSF stéréo, LSB-first, blocs de 4096 octets par canal.
-fn ecrire_dsf(chemin: &std::path::Path, octets_par_canal: usize) {
+pub(crate) fn ecrire_dsf(chemin: &std::path::Path, octets_par_canal: usize) {
     let blocs = octets_par_canal.div_ceil(BLOC);
     let mut data = Vec::new();
     for b in 0..blocs {
