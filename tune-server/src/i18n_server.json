@@ -1693,6 +1693,34 @@
     "hu": "Hangerő beállítva: {value}%.",
     "vi": "Đã đặt âm lượng {value}%."
   },
+  "ai.volumeRaiseLimited": {
+    "fr": "Je ne monte le volume que par petits pas : au plus {value}% pour l'instant. Rien n'a changé.",
+    "en": "I only raise the volume in small steps: at most {value}% for now. Nothing was changed.",
+    "de": "Ich erhöhe die Lautstärke nur in kleinen Schritten: höchstens {value}% im Moment. Nichts wurde geändert.",
+    "es": "Solo subo el volumen en pasos pequeños: como máximo {value}% por ahora. No se ha cambiado nada.",
+    "it": "Alzo il volume solo a piccoli passi: al massimo {value}% per ora. Non è cambiato nulla.",
+    "zh": "我只会小幅调高音量：目前最多 {value}%。未做任何更改。",
+    "ja": "音量は少しずつしか上げません。現在は最大 {value}% です。何も変更していません。",
+    "ko": "볼륨은 조금씩만 올립니다. 지금은 최대 {value}%입니다. 아무것도 바뀌지 않았습니다.",
+    "ro": "Măresc volumul doar în pași mici: cel mult {value}% deocamdată. Nu s-a schimbat nimic.",
+    "sv": "Jag höjer bara volymen i små steg: högst {value} % just nu. Inget har ändrats.",
+    "hu": "A hangerőt csak kis lépésekben emelem: most legfeljebb {value}%. Semmi sem változott.",
+    "vi": "Tôi chỉ tăng âm lượng từng bước nhỏ: tối đa {value}% lúc này. Không có gì thay đổi."
+  },
+  "ai.volumeRefused": {
+    "fr": "Le volume n'a pas pu être réglé. Rien n'a changé.",
+    "en": "The volume could not be set. Nothing was changed.",
+    "de": "Die Lautstärke konnte nicht eingestellt werden. Nichts wurde geändert.",
+    "es": "No se pudo ajustar el volumen. No se ha cambiado nada.",
+    "it": "Non è stato possibile impostare il volume. Non è cambiato nulla.",
+    "zh": "无法设置音量。未做任何更改。",
+    "ja": "音量を設定できませんでした。何も変更していません。",
+    "ko": "볼륨을 설정할 수 없습니다. 아무것도 바뀌지 않았습니다.",
+    "ro": "Volumul nu a putut fi setat. Nu s-a schimbat nimic.",
+    "sv": "Volymen kunde inte ställas in. Inget har ändrats.",
+    "hu": "A hangerőt nem sikerült beállítani. Semmi sem változott.",
+    "vi": "Không thể đặt âm lượng. Không có gì thay đổi."
+  },
   "ai.nowPlaying": {
     "fr": "En cours : {track} — {artist}",
     "en": "Now playing: {track} — {artist}",
