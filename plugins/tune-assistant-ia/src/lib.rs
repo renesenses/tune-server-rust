@@ -29,6 +29,14 @@
 //! | `POST /lot/suggestions` | `{album_ids, budget_eur?}` → aperçu d'un lot, arrêt net au plafond |
 //! | `POST /lot/appliquer` | `{albums: [{album_id, lignes}]}` |
 //! | `POST /lot/annuler` | `{operations: [{album_id, operation_id}]}` |
+//! | `POST /collections/affiner` | `{cible?, actuelle: {name, match_mode, rules}, phrase}` → règles modifiées et écart (#6839) |
+//! | `POST /collections/proposer` | 5 à 10 collections depuis les statistiques de la bibliothèque |
+//! | `POST /collections/nommer` | `{cible?, rules, match_mode?}` → nom et description marqués IA |
+//! | `POST /collections/pourquoi` | `{rules, match_mode?, album_id}` → pourquoi cet album est là |
+//! | `POST /collections/ecoute` | collections d'après l'écoute — Premium (« Mon écoute ») |
+//!
+//! Chaque route de collections accepte `apercu: true` : rien ne part, la
+//! réponse dit ce qui partirait et son coût estimé.
 //!
 //! Gratuit, pour tout le monde : aucune garde Premium. Les RÉGLAGES (`PUT
 //! /reglages`, `POST /tester`) sont réservés aux administrateurs dès que
@@ -37,6 +45,7 @@
 pub mod appel;
 pub mod cache;
 pub mod coffre;
+pub mod collections;
 pub mod couts;
 pub mod dialogue;
 pub mod fournisseur;
@@ -83,6 +92,9 @@ pub struct Etat {
     pub verrou_conso: Arc<tokio::sync::Mutex<()>>,
     /// Sérialise les écritures sur les albums (appliquer, annuler).
     pub verrou_albums: Arc<tokio::sync::Mutex<()>>,
+    /// La licence (#6839, collections d'après l'écoute : Premium, comme
+    /// « Mon écoute »). `None` : se comporte comme SANS Premium.
+    pub licence: Option<Arc<tune_core::license::LicenseManager>>,
 }
 
 impl Etat {
@@ -101,6 +113,27 @@ impl Etat {
             fabrique,
             verrou_conso: appel::verrou_de_consommation(),
             verrou_albums: Arc::new(tokio::sync::Mutex::new(())),
+            licence: None,
+        }
+    }
+
+    /// La licence du serveur, pour les usages Premium.
+    pub fn avec_licence(
+        mut self,
+        licence: Option<Arc<tune_core::license::LicenseManager>>,
+    ) -> Self {
+        self.licence = licence;
+        self
+    }
+
+    /// Premium « Mon écoute » (`Feature::ListeningStats`) ?
+    pub async fn ecoute_premium(&self) -> bool {
+        match &self.licence {
+            Some(l) => {
+                l.check_feature(tune_core::license::Feature::ListeningStats)
+                    .await
+            }
+            None => false,
         }
     }
 }
@@ -145,7 +178,8 @@ impl TunePlugin for AssistantIaPlugin {
             ctx.data_dir.join("cache"),
             services.criteres,
             fournisseur::fabrique_reelle(),
-        );
+        )
+        .avec_licence(ctx.license.clone());
         ctx.register_router(router_vers(etat));
         Ok(())
     }
