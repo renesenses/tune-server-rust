@@ -30,6 +30,20 @@
 //!
 //! Les pistes UPnP, elles, n'ont pas de fichier : il n'y a rien à rouvrir. Le
 //! scan ne leur présente jamais de chemin, la question ne se pose pas ici.
+//!
+//! # #6781 — une clé ajoutée APRÈS coup ne se rattrapait jamais
+//!
+//! « Au moins une métadonnée étendue » ne dit pas QUAND le fichier a été relu.
+//! #6232 (rc7) a ajouté la clé `track_artist` (balise ARTIST, critère
+//! « Interprète de la piste ») : une piste relue avant la rc7 avait déjà ses
+//! crédits, comptait donc comme pourvue, et ne recevait jamais la nouvelle
+//! clé — même au « Scan complet ». La règle lisait alors le repli (l'artiste
+//! de l'ALBUM), et ne trouvait pas la piste (Didier, fil 2218).
+//!
+//! Une piste n'est donc pourvue que si elle porte AUSSI chaque clé de
+//! [`CLES_DE_GENERATION`]. Le prix : une piste SANS balise ARTIST est relue à
+//! chaque scan complet (et à lui seul), faute de pouvoir distinguer « relue,
+//! pas de balise » de « jamais relue ».
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -40,6 +54,12 @@ use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 /// Préfixes de clés de `track_metadata` posés par un écrivain qui n'est PAS la
 /// lecture des balises du fichier. Voir la note de module.
 pub const PREFIXES_RESERVES: [&str; 3] = ["rg_", "dr_", "upnp_"];
+
+/// #6781 — clés que `read_extended_metadata` pose depuis une version
+/// RÉCENTE : leur absence dit que le fichier n'a pas été relu depuis. Voir la
+/// note de module. Une clé ajoutée à la relecture et que les règles lisent
+/// s'ajoute ici.
+pub const CLES_DE_GENERATION: [&str; 1] = [crate::metadata::CLE_INTERPRETE_DE_LA_PISTE];
 
 /// Vrai quand cette clé est une métadonnée étendue, c'est-à-dire quelque chose
 /// que seule la relecture du FICHIER peut poser.
@@ -61,6 +81,9 @@ pub fn est_une_metadonnee_etendue(cle: &str) -> bool {
 /// La requête ne touche QUE `track_metadata` : `track_id` y est un entier sous
 /// SQLite et du texte sous PostgreSQL, et toute jointure avec `tracks.id`
 /// imposerait une conversion par moteur.
+///
+/// #6781 — et chaque clé de [`CLES_DE_GENERATION`] : une sous-requête par
+/// clé, sur la même table (`track_id` comparé à `track_id`, même type).
 pub fn sql_pistes_deja_pourvues() -> String {
     let mut conditions = String::new();
     for (i, prefixe) in PREFIXES_RESERVES.iter().enumerate() {
@@ -68,6 +91,11 @@ pub fn sql_pistes_deja_pourvues() -> String {
             conditions.push_str(" AND ");
         }
         conditions.push_str(&format!("substr(key, 1, {}) <> '{prefixe}'", prefixe.len()));
+    }
+    for cle in CLES_DE_GENERATION {
+        conditions.push_str(&format!(
+            " AND track_id IN (SELECT g.track_id FROM track_metadata g WHERE g.key = '{cle}')"
+        ));
     }
     format!("SELECT DISTINCT track_id FROM track_metadata WHERE {conditions}")
 }
@@ -210,5 +238,60 @@ mod tests {
             !sql.contains("LIKE"),
             "`LIKE` traiterait `_` comme un joker : {sql}"
         );
+    }
+
+    fn base(lignes: &[(i64, &str)]) -> Arc<dyn DbBackend> {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS track_metadata \
+             (track_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT, \
+              PRIMARY KEY (track_id, key));",
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        for (id, cle) in lignes {
+            backend
+                .execute(
+                    "INSERT OR REPLACE INTO track_metadata (track_id, key, value) VALUES (?1, ?2, 'v')",
+                    &[id as &dyn ToSqlValue, cle as &dyn ToSqlValue],
+                )
+                .unwrap();
+        }
+        backend
+    }
+
+    /// #6781 (Didier, fil 2218) — TÉMOIN ROUGE avant le correctif : la piste 1,
+    /// relue avant la rc7 (crédits, pas de `track_artist`), était déclarée
+    /// pourvue, et le scan complet ne lui posait jamais sa balise ARTIST.
+    #[test]
+    fn une_piste_relue_avant_la_cle_track_artist_reste_a_rattraper_6781() {
+        let db = base(&[
+            (1, "composer"),
+            (1, "mb_track_id"),
+            (2, "composer"),
+            (2, "track_artist"),
+            (3, "rg_track_gain"),
+        ]);
+        let pourvues = pistes_deja_pourvues(&db).unwrap();
+        assert!(
+            !pourvues.contains(&1),
+            "relue avant #6232 : à relire pour `track_artist` ({pourvues:?})"
+        );
+        assert!(
+            pourvues.contains(&2),
+            "relue depuis : rien à refaire ({pourvues:?})"
+        );
+        assert!(
+            !pourvues.contains(&3),
+            "#5043 tient toujours ({pourvues:?})"
+        );
+    }
+
+    /// Contre-cas : une piste qui porte `track_artist`, même sans autre
+    /// crédit, a été relue depuis #6232 — le scan complet ne la rouvre pas.
+    #[test]
+    fn la_cle_track_artist_seule_prouve_une_relecture_recente_6781() {
+        let db = base(&[(7, "track_artist"), (7, "dr_track")]);
+        assert!(pistes_deja_pourvues(&db).unwrap().contains(&7));
     }
 }
