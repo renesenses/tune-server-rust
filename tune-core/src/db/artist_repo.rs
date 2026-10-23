@@ -21,6 +21,11 @@ pub const UNKNOWN_ARTIST_NAME: &str = "Unknown Artist";
 /// antérieur à la colonne.
 pub const SOURCE_TRI_MUSICBRAINZ: &str = "musicbrainz";
 
+/// #6773 — la provenance d'un nom de tri « Nom, Prénom » DÉDUIT du nom d'une
+/// personne (`metadata::noms_de_tri::nom_de_tri_deduit`). Il cède à tout :
+/// une balise, MusicBrainz ou une saisie le remplacent.
+pub const SOURCE_TRI_DEDUIT: &str = "deduit";
+
 /// tune-server-rust#6474 — le nom de tri à donner à l'ARTISTE D'ALBUM lu
 /// dans un fichier : ALBUMARTISTSORT s'il est écrit ; sinon l'ARTISTSORT de
 /// la piste, mais seulement quand la piste est de ce même artiste (même nom,
@@ -97,10 +102,11 @@ pub mod sql {
         format!(
             "UPDATE artists SET sort_name = {}, sort_name_source = NULL WHERE id = {} \
              AND (sort_name IS NULL OR TRIM(sort_name) = '' \
-                  OR sort_name_source = '{source}')",
+                  OR sort_name_source IN ('{source}', '{deduit}'))",
             d.placeholder(1),
             d.placeholder(2),
             source = super::SOURCE_TRI_MUSICBRAINZ,
+            deduit = super::SOURCE_TRI_DEDUIT,
         )
     }
 
@@ -111,10 +117,11 @@ pub mod sql {
         format!(
             "UPDATE artists SET sort_name = {}, sort_name_source = '{source}' WHERE id = {} \
              AND (sort_name IS NULL OR TRIM(sort_name) = '' \
-                  OR sort_name_source = '{source}')",
+                  OR sort_name_source IN ('{source}', '{deduit}'))",
             d.placeholder(1),
             d.placeholder(2),
             source = super::SOURCE_TRI_MUSICBRAINZ,
+            deduit = super::SOURCE_TRI_DEDUIT,
         )
     }
 
@@ -659,7 +666,12 @@ impl ArtistRepo {
                 .db
                 .query_one_strong(&sql, &params)?
                 .and_then(|l| l.first().and_then(|v| v.as_string()));
-            if provenance.as_deref() != Some(SOURCE_TRI_MUSICBRAINZ) {
+            // #6773 — un nom de tri déduit cède à la balise, comme celui de
+            // MusicBrainz.
+            if !matches!(
+                provenance.as_deref(),
+                Some(SOURCE_TRI_MUSICBRAINZ) | Some(SOURCE_TRI_DEDUIT)
+            ) {
                 return Ok(artiste);
             }
         }
