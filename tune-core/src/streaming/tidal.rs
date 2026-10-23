@@ -28,6 +28,56 @@ const CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
 const CLIENT_SECRET: &str = "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
 const REDIRECT_URI: &str = "http://localhost:8888/api/v1/streaming/tidal/callback";
 
+/// #6784 — le rappel PKCE de TIDAL ABOUTIT-il dans le navigateur qui a fait
+/// la demande ?
+///
+/// `REDIRECT_URI` est l'adresse déclarée pour l'application TIDAL de Tune :
+/// elle ne se reconstruit pas depuis la requête, TIDAL n'accepterait qu'une
+/// adresse enregistrée. Elle nomme `localhost:8888` — donc la machine du
+/// NAVIGATEUR. Depuis un téléphone ou un autre poste, `localhost` est ce
+/// téléphone ou ce poste, et la connexion n'aboutit jamais.
+///
+/// `hote_vu` est l'hôte par lequel le client a joint le serveur (`Host`, ou
+/// `X-Forwarded-Host` derrière un relais). Vrai seulement si c'est un nom de
+/// boucle locale ET le port de `REDIRECT_URI` : un client de la machine même,
+/// sur le port que le rappel vise. Dans tous les autres cas, l'appelant passe
+/// par le code d'appareil, qui ne dépend d'aucune adresse de retour.
+pub fn rappel_pkce_aboutit(hote_vu: Option<&str>) -> bool {
+    let Some(hote_vu) = hote_vu.map(str::trim).filter(|h| !h.is_empty()) else {
+        return false;
+    };
+    let (hote, port) = separer_hote_et_port(hote_vu);
+    let autorite_du_rappel = REDIRECT_URI
+        .split_once("://")
+        .map(|(_, reste)| reste.split('/').next().unwrap_or(reste))
+        .unwrap_or("");
+    let (_, port_du_rappel) = separer_hote_et_port(autorite_du_rappel);
+    let boucle = matches!(
+        hote.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "[::1]"
+    );
+    boucle && port.is_some() && port == port_du_rappel
+}
+
+/// `hôte[:port]`, IPv6 entre crochets compris (`[::1]:8888`).
+fn separer_hote_et_port(autorite: &str) -> (&str, Option<u16>) {
+    if autorite.starts_with('[') {
+        return match autorite.find(']') {
+            Some(fin) => (
+                &autorite[..=fin],
+                autorite[fin + 1..]
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse().ok()),
+            ),
+            None => (autorite, None),
+        };
+    }
+    match autorite.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().ok()),
+        None => (autorite, None),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -1726,6 +1776,17 @@ impl StreamingService for TidalService {
                 self.refresh_user_info().await;
             }
 
+            return Ok(self.auth_status().await);
+        }
+
+        // #6784 — un SONDAGE ne démarre jamais une autorisation. `GET
+        // /streaming/tidal` et `/auth/status` appellent `authenticate({"poll":
+        // true})` toutes les 3 s pendant l'attente : sans code d'appareil en
+        // cours, ils tombaient ici et relançaient un PKCE, ce qui ÉCRASAIT le
+        // `state` attendu. Le rappel arrivé ensuite était refusé (« state
+        // mismatch »), même sur la machine du serveur. Même garde que Spotify
+        // (fil 221).
+        if credentials.get("poll").is_some() {
             return Ok(self.auth_status().await);
         }
 
@@ -4852,5 +4913,73 @@ mod favoris_complets_5997 {
             .unwrap()
             .unwrap();
         assert_eq!(affichage.len(), 100);
+    }
+}
+
+/// #6784 — l'adresse de retour PKCE de TIDAL et le client qui la demande.
+/// Aucun appel à TIDAL : ni le démarrage du PKCE ni un sondage sans code
+/// d'appareil ne touchent le réseau.
+#[cfg(test)]
+mod retour_oauth_6784 {
+    use super::*;
+    use crate::streaming::traits::StreamingService;
+
+    #[test]
+    fn le_rappel_aboutit_sur_la_machine_du_serveur_au_port_du_rappel() {
+        for hote in [
+            "localhost:8888",
+            "127.0.0.1:8888",
+            "[::1]:8888",
+            "LOCALHOST:8888",
+        ] {
+            assert!(rappel_pkce_aboutit(Some(hote)), "{hote}");
+        }
+    }
+
+    /// TÉMOIN du défaut : depuis un téléphone, l'hôte vu est l'adresse du
+    /// serveur sur le réseau ; `localhost:8888` y désignerait le téléphone.
+    #[test]
+    fn le_rappel_n_aboutit_pas_depuis_une_autre_machine() {
+        for hote in [
+            "192.168.1.18:8888",
+            "tune.local:8888",
+            "tune.example",
+            "[fe80::1]:8888",
+            // Machine du serveur, mais pas le port que le rappel vise.
+            "localhost:9000",
+            "127.0.0.1",
+            "",
+        ] {
+            assert!(!rappel_pkce_aboutit(Some(hote)), "{hote}");
+        }
+        assert!(!rappel_pkce_aboutit(None));
+    }
+
+    /// TÉMOIN ROUGE avant le correctif : le sondage relançait un PKCE et
+    /// remplaçait le `state` attendu ; le rappel arrivé ensuite était refusé.
+    #[tokio::test]
+    async fn un_sondage_n_ecrase_pas_l_autorisation_en_cours() {
+        let mut svc = TidalService::new();
+        let depart = svc.authenticate(&serde_json::json!({})).await.unwrap();
+        assert!(depart.verification_url.is_some(), "le PKCE démarre");
+        let attendu = svc.pending_pkce.as_ref().map(|p| p.state.clone());
+        assert!(attendu.is_some());
+
+        for _ in 0..3 {
+            let sonde = svc
+                .authenticate(&serde_json::json!({"poll": true}))
+                .await
+                .unwrap();
+            assert!(!sonde.authenticated);
+            assert!(
+                sonde.verification_url.is_none(),
+                "un sondage ne rend pas une NOUVELLE autorisation"
+            );
+        }
+        assert_eq!(
+            svc.pending_pkce.as_ref().map(|p| p.state.clone()),
+            attendu,
+            "le `state` attendu par le rappel doit survivre aux sondages"
+        );
     }
 }
