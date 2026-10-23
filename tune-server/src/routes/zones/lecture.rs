@@ -573,7 +573,7 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     Json(json!(result))
 }
 
-pub(super) async fn get_zone(
+pub(crate) async fn get_zone(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
