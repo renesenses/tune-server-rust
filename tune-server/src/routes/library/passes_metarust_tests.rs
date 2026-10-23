@@ -49,6 +49,13 @@ async fn appeler(e: &AppState, methode: &str, chemin: &str) -> (StatusCode, Valu
 /// La sélection BPM ne prend que les albums LOCAUX qui ont au moins une piste
 /// à estimer : un fichier (pas une URL), sans balise BPM, sans estimation
 /// gardée. Elle compte ces pistes, et le curseur la fait repartir après lui.
+
+/// #6862 : `BPM_EN_VOL` est un drapeau GLOBAL du binaire de tests. Deux tests
+/// qui lancent `/bpm-all` en parallèle se voyaient l'un l'autre « en vol »
+/// (409 `passe_deja_en_cours` alors que la passe était `done`). Les tests qui
+/// lancent une passe BPM la prennent à tour de rôle.
+static PASSE_BPM_SERIALISEE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[test]
 fn la_selection_bpm_ne_prend_que_les_pistes_a_estimer() {
     let e = etat();
@@ -279,6 +286,7 @@ fn ecrire_metronome(chemin: &std::path::Path, bpm: f64, secondes: u32) {
 /// — sans toucher la balise. Relancée, la passe n'a plus rien à faire.
 #[tokio::test]
 async fn la_passe_bpm_mesure_un_vrai_fichier_par_la_route() {
+    let _seul = PASSE_BPM_SERIALISEE.lock().await;
     let dossier = tempfile::tempdir().unwrap();
     let chemin = dossier.path().join("metronome.wav");
     ecrire_metronome(&chemin, 120.0, 20);
@@ -375,6 +383,7 @@ fn une_proposition_perimee_est_relue_par_la_passe() {
 /// `402`, les deux passes jamais.
 #[tokio::test]
 async fn les_passes_sont_gratuites() {
+    let _seul = PASSE_BPM_SERIALISEE.lock().await;
     let e = etat();
     assert!(
         !e.license
@@ -392,5 +401,13 @@ async fn les_passes_sont_gratuites() {
         let (s, v) = appeler(&e, "POST", chemin).await;
         assert_ne!(s, StatusCode::PAYMENT_REQUIRED, "{chemin} : {v}");
         assert_ne!(v["code"], "premium_required", "{chemin} : {v}");
+    }
+    // La passe lancée ici tourne encore en tâche de fond : on attend qu'elle
+    // rende le drapeau global avant de rendre le verrou (#6862).
+    for _ in 0..500 {
+        if !BPM_EN_VOL.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
