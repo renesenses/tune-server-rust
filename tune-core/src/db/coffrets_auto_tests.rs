@@ -1918,3 +1918,221 @@ fn reglage_6554_remis_la_passe_et_l_onglet_reprennent() {
     let l: Vec<i64> = lister(&db).unwrap().iter().map(|c| c.album_id).collect();
     assert!(l.contains(&b.ancien) && l.contains(&b.ew1), "{l:?}");
 }
+
+// ---------------------------------------------------------------------------
+// #6411 — le coffret d'un seul tenant (fil 2294, décision du 22/10/2026)
+// ---------------------------------------------------------------------------
+
+/// Un album UNIQUE dans UN dossier, un disque par entrée de `noms` (son nom
+/// de disque, ou `None`), `n` pistes par disque. `cue` : les pistes sont des
+/// tranches d'une image par disque (`file_path` NULL), comme le scan CUE.
+fn album_a_disques(
+    db: &Arc<dyn DbBackend>,
+    titre: &str,
+    dossier: &str,
+    noms: &[Option<&str>],
+    n: i32,
+    cue: bool,
+) -> i64 {
+    let artiste = artiste(db, &format!("Artiste de {titre}"));
+    let id = album(db, titre, artiste, dossier);
+    for (i, nom) in noms.iter().enumerate() {
+        let d = i as i32 + 1;
+        for k in 1..=n {
+            piste(db, id, artiste, k, d, &format!("{dossier}/{d}-{k:02}.flac"));
+        }
+        db.execute(
+            "UPDATE tracks SET disc_subtitle = ? WHERE album_id = ? AND disc_number = ?",
+            &[&nom.map(String::from) as &dyn ToSqlValue, &id, &(d as i64)],
+        )
+        .unwrap();
+        if cue {
+            db.execute(
+                "UPDATE tracks SET cue_media_path = ?, file_path = NULL \
+                 WHERE album_id = ? AND disc_number = ?",
+                &[
+                    &format!("{dossier}/CD{d}.flac") as &dyn ToSqlValue,
+                    &id,
+                    &(d as i64),
+                ],
+            )
+            .unwrap();
+        }
+    }
+    id
+}
+
+fn liste(db: &Arc<dyn DbBackend>) -> Vec<CoffretListe> {
+    lister(db).unwrap()
+}
+
+fn liste_ids(db: &Arc<dyn DbBackend>) -> Vec<i64> {
+    liste(db).iter().map(|c| c.album_id).collect()
+}
+
+const DIRE_STRAITS: [Option<&str>; 6] = [
+    Some("Dire Straits"),
+    Some("Communiqué"),
+    Some("Making Movies"),
+    Some("Love Over Gold"),
+    Some("Brothers in Arms"),
+    Some("On Every Street"),
+];
+
+/// Le cas du fil : six albums en un, un sous-titre par disque, un seul
+/// dossier. Il est sous Coffrets sans geste, sans marqueur, et sa pochette
+/// (la majoritaire, #5454) n'est pas touchée.
+#[test]
+fn un_album_unique_a_six_disques_nommes_est_un_coffret_6411() {
+    let db = sqlite();
+    let ds = album_a_disques(
+        &db,
+        "The Studio Albums 1978-1991",
+        "/m/ROCK/Dire Straits/The Studio Albums",
+        &DIRE_STRAITS,
+        3,
+        false,
+    );
+    AlbumRepo::with_backend(db.clone())
+        .force_update_cover_path(
+            ds,
+            "/covers/on-every-street.jpg",
+            crate::db::models::SourcePochette::Integree,
+        )
+        .unwrap();
+
+    let l = liste(&db);
+    let c = l
+        .iter()
+        .find(|c| c.album_id == ds)
+        .unwrap_or_else(|| panic!("#6411 — le coffret d'un seul tenant manque : {l:?}"));
+    assert_eq!(c.disques, 6);
+    assert_eq!(c.origine, None, "reconnu, pas composé");
+    let album = AlbumRepo::with_backend(db.clone())
+        .get(ds)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        album.cover_path.as_deref(),
+        Some("/covers/on-every-street.jpg"),
+        "la pochette majoritaire reste celle de l'album"
+    );
+    assert_eq!(
+        compte(
+            &db,
+            "SELECT COUNT(*) FROM album_metadata WHERE album_id = {p1}",
+            ds
+        ),
+        0,
+        "rien n'est écrit : reconnu à chaque lecture"
+    );
+}
+
+/// Le seuil, des deux côtés : trois disques nommés en sont un, deux n'en
+/// sont jamais un — le double album studio + instrumental du fil reste un
+/// album.
+#[test]
+fn le_seuil_est_de_trois_disques_un_double_album_nomme_reste_un_album_6411() {
+    let db = sqlite();
+    let double = album_a_disques(
+        &db,
+        "Space 1992: Rise of the Chaos Wizards",
+        "/m/METAL/Gloryhammer/Space 1992",
+        &[Some("Studio"), Some("Instrumental")],
+        10,
+        false,
+    );
+    let triple = album_a_disques(
+        &db,
+        "Trilogie",
+        "/m/ROCK/X/Trilogie",
+        &[Some("Un"), Some("Deux"), Some("Trois")],
+        4,
+        false,
+    );
+    let l = liste_ids(&db);
+    assert!(
+        !l.contains(&double),
+        "un double album n'est pas un coffret : {l:?}"
+    );
+    assert!(
+        l.contains(&triple),
+        "trois disques nommés : un coffret : {l:?}"
+    );
+}
+
+/// Ce qui n'est pas un coffret malgré ses six disques : des disques sans
+/// nom (une intégrale), un seul disque sans nom, des noms qui se répètent
+/// (casse et accents près).
+#[test]
+fn six_disques_sans_noms_distincts_ne_font_pas_un_coffret_6411() {
+    let db = sqlite();
+    let anonyme = album_a_disques(&db, "Ring", "/m/OPERA/Ring", &[None; 6], 2, false);
+    let mut un_trou = DIRE_STRAITS;
+    un_trou[3] = None;
+    let trou = album_a_disques(&db, "Trou", "/m/ROCK/Trou", &un_trou, 2, false);
+    let mut blanc = DIRE_STRAITS;
+    blanc[2] = Some("   ");
+    let blanc = album_a_disques(&db, "Blanc", "/m/ROCK/Blanc", &blanc, 2, false);
+    let bonus = album_a_disques(
+        &db,
+        "Bonus",
+        "/m/ROCK/Bonus",
+        &[Some("Bonus"), Some("bonus"), Some("Bônus ")],
+        2,
+        false,
+    );
+    let l = liste_ids(&db);
+    for (nom, id) in [
+        ("anonyme", anonyme),
+        ("trou", trou),
+        ("blanc", blanc),
+        ("bonus", bonus),
+    ] {
+        assert!(
+            !l.contains(&id),
+            "{nom} ({id}) n'est pas un coffret : {l:?}"
+        );
+    }
+}
+
+/// Une feuille CUE par disque, tranches sans `file_path` : la même règle.
+#[test]
+fn un_coffret_d_images_cue_suit_la_meme_regle_6411() {
+    let db = sqlite();
+    let nomme = album_a_disques(&db, "Cue nommé", "/m/CUE/Nomme", &DIRE_STRAITS, 2, true);
+    let anonyme = album_a_disques(&db, "Cue anonyme", "/m/CUE/Anonyme", &[None; 6], 2, true);
+    let l = liste_ids(&db);
+    assert!(l.contains(&nomme), "{l:?}");
+    assert!(!l.contains(&anonyme), "{l:?}");
+}
+
+/// Réglage « Coffrets automatiques » coupé (#6554) : plus rien n'est
+/// reconnu, comme pour les albums rangés disque par disque.
+#[test]
+fn reglage_coupe_le_coffret_d_un_seul_tenant_n_est_plus_reconnu_6411() {
+    let db = sqlite();
+    let ds = album_a_disques(&db, "DS", "/m/ROCK/DS", &DIRE_STRAITS, 1, false);
+    assert!(liste_ids(&db).contains(&ds));
+    couper_la_reunion(&db);
+    assert!(!liste_ids(&db).contains(&ds));
+}
+
+#[test]
+fn la_regle_d_un_seul_tenant_6411() {
+    let n = |v: &[Option<&str>]| v.iter().map(|x| x.map(String::from)).collect::<Vec<_>>();
+    assert!(coffret_d_un_seul_tenant(&n(&DIRE_STRAITS)));
+    assert!(coffret_d_un_seul_tenant(&n(&[
+        Some("a"),
+        Some("b"),
+        Some("c")
+    ])));
+    assert!(!coffret_d_un_seul_tenant(&n(&[Some("a"), Some("b")])));
+    assert!(!coffret_d_un_seul_tenant(&n(&[Some("a"), Some("b"), None])));
+    assert!(!coffret_d_un_seul_tenant(&n(&[
+        Some("Été"),
+        Some("ete"),
+        Some("x")
+    ])));
+    assert!(!coffret_d_un_seul_tenant(&[]));
+}

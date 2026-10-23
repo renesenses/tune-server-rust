@@ -4153,8 +4153,9 @@ pub(super) async fn regrouper_coffret(
 /// `GET /library/coffrets` — les COFFRETS de la bibliothèque, pour l'onglet
 /// « Coffrets » (GO de Bertrand du 25/09/2026).
 ///
-/// Coffrets automatiques, coffrets composés à la main, et tout album rangé
-/// disque par disque dans des dossiers distincts (voir
+/// Coffrets automatiques, coffrets composés à la main, tout album rangé
+/// disque par disque dans des dossiers distincts, et (#6411) tout album
+/// unique d'au moins trois disques nommés chacun autrement (voir
 /// [`coffrets_auto::lister`]). Chaque entrée est l'album tel que le rend
 /// `GET /library/albums/{id}`, plus :
 ///
