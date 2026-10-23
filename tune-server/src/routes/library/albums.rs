@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::cloud::ecoutes_communaute::{self, Genre};
 use tune_core::db::coffrets_auto;
 use tune_core::metadata::coffrets::{Coffret, coffrets, titre_commun};
 use tune_core::metadata::disques_abimes::{Correction, PisteAExaminer, corrections};
@@ -109,7 +110,18 @@ pub(super) async fn list_albums(
     let backend = state.backend.clone();
     let (limit, offset) = (p.limit.unwrap_or(50), p.offset.unwrap_or(0));
     match tokio::task::spawn_blocking(move || lire_la_page_d_albums(backend, p)).await {
-        Ok(corps) => Json(corps),
+        Ok(mut corps) => {
+            // #6738 — « (5 400) » dans la grille : les écoutes de la
+            // communauté, lues au site par lot et gardées 24 h.
+            ecoutes_communaute::annoter_liste(
+                &state.backend,
+                &state.http_client,
+                Genre::Album,
+                corps.get_mut("items"),
+            )
+            .await;
+            Json(corps)
+        }
         Err(e) => {
             // Le fil a paniqué ou a été annulé : une grille vide plutôt qu'un
             // 500 muet, et le journal dit pourquoi.
@@ -551,6 +563,14 @@ pub(super) async fn get_album(
                 }
                 Err(e) => tracing::warn!(album_id = id, error = %e, "album_exemplaires_illisibles"),
             }
+            // #6738 — le total des écoutes de la communauté, absent sous le seuil.
+            ecoutes_communaute::annoter_un(
+                &state.backend,
+                &state.http_client,
+                Genre::Album,
+                &mut j,
+            )
+            .await;
             Json(j).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -628,6 +648,8 @@ pub(super) async fn album_tracks(
     // #4806 — le titre banni RESTE dans la liste de l'album, grisé par
     // l'écran : c'est ce drapeau qui le dit, jamais un filtre.
     attacher_banni(&state, profile.id(), &mut items);
+    // #6738 — « So What (128) » : les écoutes de la communauté.
+    ecoutes_communaute::annoter(&state.backend, &state.http_client, Genre::Piste, &mut items).await;
     Json(json!(items))
 }
 

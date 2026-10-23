@@ -4774,7 +4774,7 @@ mod pause_longue_4917_tests;
 
 #[cfg(test)]
 #[path = "dop_deplacement_tests_6456.rs"]
-mod dop_deplacement_tests_6456;
+pub(crate) mod dop_deplacement_tests_6456;
 
 #[cfg(test)]
 #[path = "disposition_reseau_tests_6057.rs"]

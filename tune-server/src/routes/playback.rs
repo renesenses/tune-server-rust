@@ -26,6 +26,9 @@ mod lire_artiste_6467;
 #[path = "playback/lire_artiste_6467_tests.rs"]
 mod lire_artiste_6467_tests;
 #[cfg(test)]
+#[path = "playback/tete_de_liste_6399_tests.rs"]
+mod tete_de_liste_6399_tests;
+#[cfg(test)]
 #[path = "playback/titre_seul_album_5372_tests.rs"]
 mod titre_seul_album_5372_tests;
 #[cfg(test)]
@@ -662,6 +665,34 @@ pub(crate) fn file_deja_chargee(
             longueur: entries.len() as i64,
         },
         None => FileDejaChargee::RemplacerParCeTitre,
+    }
+}
+
+/// #6399 — la décision de [`file_deja_chargee`], pour un titre de service
+/// qui est la TÊTE d'une liste (`queue_follows`, #6469) : la file est alors
+/// REMPLACÉE par ce titre, même s'il y figure déjà.
+///
+/// « Lire à partir d'ici » et « Tout lire » sur une liste de service lancent
+/// le titre de tête, puis le client enfile lui-même la suite et remet les 200
+/// titres d'avant en tête (`lectureEnMasse.ts`, `lireListeDepuis`). Garder
+/// la file quand le titre y figure — la relance de la barre de transport,
+/// Stop puis Play, #2569 — faisait de chaque geste un AJOUT : la suite
+/// s'enfilait derrière l'ancienne file. Nguyen Thanh Ha, fils 2289/2290,
+/// favoris Qobuz de 6 763 titres : `titre_seul_deja_en_file … longueur=24530`
+/// puis `queue_add_ok added=4999`, puis `added=200 position=Some(0)`, à
+/// chaque lancement, jusqu'à 39 107 entrées.
+///
+/// Une base illisible garde sa décision : on n'efface pas ce qu'on n'a pas
+/// lu (#2569).
+pub(crate) fn file_pour_un_titre_de_service(
+    lecture: Result<&[tune_core::db::play_queue_repo::QueueEntry], &str>,
+    source: Option<&str>,
+    source_id: &str,
+    tete_de_liste: bool,
+) -> FileDejaChargee {
+    match file_deja_chargee(lecture, source, source_id) {
+        FileDejaChargee::Garder { .. } if tete_de_liste => FileDejaChargee::RemplacerParCeTitre,
+        decision => decision,
     }
 }
 
@@ -2983,6 +3014,8 @@ async fn play(
                 crate::routes::zones::identifiant_de_service_sur(t.artist_id.as_deref())
             })
         });
+        // #6399 — lu avant que `body` ne parte dans la demande de lecture.
+        let tete_de_liste = body.queue_follows;
         let orch_req = tune_core::orchestrator::PlayRequest {
             zone_id,
             output_device_id,
@@ -3019,10 +3052,11 @@ async fn play(
                 // concluait « ce titre n'est pas dans la file », et prenait la
                 // branche qui EFFACE (`clear`). Voir `file_deja_chargee`.
                 let lecture = queue_repo.get_ordered(zone_id);
-                match file_deja_chargee(
+                match file_pour_un_titre_de_service(
                     lecture.as_deref().map_err(String::as_str),
                     source_for_q.as_deref(),
                     source_id_val.as_str(),
+                    tete_de_liste,
                 ) {
                     FileDejaChargee::Garder { position, longueur } => {
                         // Keep the full queue, just move the current position onto it

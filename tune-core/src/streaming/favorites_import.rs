@@ -143,12 +143,24 @@ pub(crate) struct Entree {
 /// Cent favoris à la même seconde ⇒ égalité ⇒ départage alphabétique ; seul
 /// le favori ajouté APRÈS, daté à part, ressortait en tête. Exactement ce
 /// qu'il décrit.
-async fn entrees_datees(svc: &dyn StreamingService, fav_type: &str) -> Option<Vec<Entree>> {
-    let items = svc
-        .get_user_favorites_dated(fav_type)
-        .await
-        .ok()
-        .flatten()?;
+///
+/// 🔴 #5997 — lue par [`StreamingService::favoris_dates_complets`], et son
+/// `Err` REMONTE (`Some(Err)`). Elle était avalée (`.ok()`), et l'appelant
+/// retombait sur la lecture typée — qui, elle, rend sans broncher une liste
+/// partielle. Le miroir l'aurait réconciliée comme entière et aurait retiré
+/// de Tune tout favori confirmé absent de la coupe.
+async fn entrees_datees(
+    svc: &dyn StreamingService,
+    fav_type: &str,
+) -> Option<Result<Vec<Entree>, String>> {
+    let items = match svc.favoris_dates_complets(fav_type).await {
+        Ok(Some(items)) => items,
+        Ok(None) => return None,
+        // Un service hors miroir garde le repli d'avant : rien n'y est
+        // jamais retiré sur la foi d'une lecture.
+        Err(_) if !svc.favoris_miroir() => return None,
+        Err(e) => return Some(Err(e.to_string())),
+    };
     let item_type: &'static str = match fav_type {
         "tracks" => "track",
         "albums" => "album",
@@ -177,48 +189,46 @@ async fn entrees_datees(svc: &dyn StreamingService, fav_type: &str) -> Option<Ve
             })
             .unwrap_or_default()
     };
-    Some(
-        items
-            .iter()
-            .map(|v| match item_type {
-                "track" => Entree {
-                    item_type,
-                    service_id: id(v),
-                    title: texte(v, &["title"]),
-                    artist: texte(v, &["artist_name", "artist"]),
-                    album: texte(v, &["album_title", "album"]),
-                    cover_url: texte(v, &["cover_path"]),
-                    created_at: texte(v, &["created_at"]),
-                    // Greffé par le connecteur depuis l'album imbriqué
-                    // (`QobuzService::favori_date`).
-                    ai_generated: v.get("album_ai_generated").and_then(|x| x.as_bool()),
-                    isrc: texte(v, &["isrc"]).filter(|i| !i.trim().is_empty()),
-                },
-                "album" => Entree {
-                    item_type,
-                    service_id: id(v),
-                    title: texte(v, &["title"]),
-                    artist: texte(v, &["artist_name", "artist"]),
-                    album: None,
-                    cover_url: texte(v, &["cover_path"]),
-                    created_at: texte(v, &["created_at"]),
-                    ai_generated: v.get("ai_generated").and_then(|x| x.as_bool()),
-                    isrc: None,
-                },
-                _ => Entree {
-                    item_type,
-                    service_id: id(v),
-                    title: texte(v, &["name"]),
-                    artist: None,
-                    album: None,
-                    cover_url: texte(v, &["image_path"]),
-                    created_at: texte(v, &["created_at"]),
-                    ai_generated: None,
-                    isrc: None,
-                },
-            })
-            .collect(),
-    )
+    Some(Ok(items
+        .iter()
+        .map(|v| match item_type {
+            "track" => Entree {
+                item_type,
+                service_id: id(v),
+                title: texte(v, &["title"]),
+                artist: texte(v, &["artist_name", "artist"]),
+                album: texte(v, &["album_title", "album"]),
+                cover_url: texte(v, &["cover_path"]),
+                created_at: texte(v, &["created_at"]),
+                // Greffé par le connecteur depuis l'album imbriqué
+                // (`QobuzService::favori_date`).
+                ai_generated: v.get("album_ai_generated").and_then(|x| x.as_bool()),
+                isrc: texte(v, &["isrc"]).filter(|i| !i.trim().is_empty()),
+            },
+            "album" => Entree {
+                item_type,
+                service_id: id(v),
+                title: texte(v, &["title"]),
+                artist: texte(v, &["artist_name", "artist"]),
+                album: None,
+                cover_url: texte(v, &["cover_path"]),
+                created_at: texte(v, &["created_at"]),
+                ai_generated: v.get("ai_generated").and_then(|x| x.as_bool()),
+                isrc: None,
+            },
+            _ => Entree {
+                item_type,
+                service_id: id(v),
+                title: texte(v, &["name"]),
+                artist: None,
+                album: None,
+                cover_url: texte(v, &["image_path"]),
+                created_at: texte(v, &["created_at"]),
+                ai_generated: None,
+                isrc: None,
+            },
+        })
+        .collect()))
 }
 
 /// Les favoris d'UN type chez le service : la lecture datée d'abord (#3489),
@@ -230,7 +240,7 @@ pub(crate) async fn lire_les_favoris(
     fav_type: &str,
 ) -> Result<Vec<Entree>, String> {
     if let Some(datees) = entrees_datees(svc, fav_type).await {
-        return Ok(datees);
+        return datees;
     }
     let entrees = match fav_type {
         "tracks" => svc
