@@ -617,7 +617,10 @@ CREATE TABLE IF NOT EXISTS artists (
     bio_fetched_at TEXT,
     image_path TEXT,
     image_source TEXT,
-    sort_name_source TEXT
+    sort_name_source TEXT,
+    -- Provenance du MBID (migration 133, #6463) : balise, nom, pressage,
+    -- manuel ; NULL = inconnue.
+    musicbrainz_id_source TEXT
 );
 
 CREATE TABLE IF NOT EXISTS albums (

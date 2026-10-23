@@ -316,6 +316,11 @@ pub fn router() -> Router<AppState> {
         .route("/artists/{id}/bio", get(artists::artist_bio))
         .route("/artists/{id}/similar", get(artists::artist_similar))
         .route("/artists/{id}/metadata", get(artists::artist_metadata))
+        // #6463 — « Détacher l'identité » : retire le MBID, provenance `manuel`.
+        .route(
+            "/artists/{id}/detacher-identite",
+            post(artists::detacher_identite),
+        )
         .route("/artists/doublons", get(artists::artists_doublons))
         // BIB-C1 (phase 1) : un artiste absorbe son homographe, à la demande.
         .route(

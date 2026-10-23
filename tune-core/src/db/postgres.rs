@@ -380,6 +380,9 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // bascule ne rejoue pas la 095, et le scan comme l'enrichissement NOMMENT
     // la colonne.
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS sort_name_source TEXT",
+    // #6463 — la provenance du MBID d'artiste (PG 097). Ici AUSSI : une base
+    // de bascule ne rejoue pas la 097, et le scan comme la fiche la NOMMENT.
+    "ALTER TABLE artists ADD COLUMN IF NOT EXISTS musicbrainz_id_source TEXT",
     // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,
     // même raison : une base de bascule ne rejouera jamais la 078, alors que
     // l'écriture de la file, des favoris et de l'historique nomme la colonne.
