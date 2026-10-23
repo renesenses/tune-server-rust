@@ -29,6 +29,9 @@
 //! | `POST /lot/suggestions` | `{album_ids, budget_eur?}` → aperçu d'un lot, arrêt net au plafond |
 //! | `POST /lot/appliquer` | `{albums: [{album_id, lignes}]}` |
 //! | `POST /lot/annuler` | `{operations: [{album_id, operation_id}]}` |
+//! | `POST /albums/{id}/notes` | `{langue?, second_avis?, regenerer?}` → notes de pochette marquées IA ([`notes`]) |
+//! | `GET /albums/{id}/notes` | les dernières notes rangées, ou 404 |
+//! | `DELETE /albums/{id}/notes` | efface les notes rangées |
 //!
 //! Gratuit, pour tout le monde : aucune garde Premium. Les RÉGLAGES (`PUT
 //! /reglages`, `POST /tester`) sont réservés aux administrateurs dès que
@@ -41,6 +44,7 @@ pub mod couts;
 pub mod dialogue;
 pub mod fournisseur;
 pub mod migration;
+pub mod notes;
 pub mod passerelle;
 pub mod pistes;
 pub mod reglages;
