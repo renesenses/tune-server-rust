@@ -528,6 +528,17 @@ fn se_connecter_et_sonder(etat: &mut EtatRadio, url: &str) -> Result<Sonde, Suit
     }
 }
 
+/// #6821 — lit l'en-tête `icy-br` d'une station Icecast/Shoutcast : un débit
+/// en kbit/s (`128`). Certains serveurs en répètent plusieurs, séparés par
+/// une virgule (`128,128`) : seul le premier compte. Toute autre forme, zéro,
+/// ou un chiffre hors de toute radio réelle (au-delà de 10 000 kbit/s) rend
+/// `None` : un débit qu'on ne sait pas lire ne s'affiche pas.
+pub(crate) fn debit_icy(valeur: &str) -> Option<u32> {
+    let premier = valeur.split(',').next()?.trim();
+    let kbps: u32 = premier.parse().ok()?;
+    (1..=10_000).contains(&kbps).then_some(kbps)
+}
+
 /// Le GET, les contrôles de type, la sonde Symphonia et le décodeur : le
 /// texte de la fermeture `setup` d'origine, tel quel.
 fn sonder_la_station(url: &str) -> Result<Sonde, String> {
@@ -573,6 +584,13 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
             "{RADIO_HLS_UNSUPPORTED}: le serveur a répondu « {content_type} », un manifeste HLS et non un flux audio"
         ));
     }
+    // #6821 — le débit que la station annonce (`icy-br`), lu AVANT que la
+    // réponse ne soit livrée au décodeur.
+    let debit_annonce = response
+        .headers()
+        .get("icy-br")
+        .and_then(|v| v.to_str().ok())
+        .and_then(debit_icy);
     info!(url = %url, content_type = %content_type, "radio_local_decode_stream_connected");
 
     let source = ReadOnlySource::new(response);
@@ -656,6 +674,7 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
             .flatten()
             .and_then(|bits| u16::try_from(bits).ok())
             .filter(|bits| *bits > 0),
+        bitrate_kbps: debit_annonce,
     };
 
     Ok(Sonde {

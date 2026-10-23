@@ -58,6 +58,12 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_bio_sync(state);
     spawn_reprise_favoris_streaming(state);
     spawn_veille_favoris_miroir(state);
+    // #6682 — « Mon écoute » : le temps d'écoute radio par station, mesuré
+    // sur ce qui JOUE, quel que soit le chemin qui a lancé la station.
+    tokio::spawn(tune_core::db::radio_ecoute::veille(
+        state.backend.clone(),
+        state.playback.clone(),
+    ));
     // CRD-5 : passe automatique des crédits, bornée par tour et reprenable par
     // curseur, derrière le même droit premium que les biographies. Une garde
     // dans `credits.rs` tient cette ligne : l'ordonnanceur de scan a été du

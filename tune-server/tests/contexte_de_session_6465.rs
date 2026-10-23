@@ -124,3 +124,63 @@ async fn une_station_inconnue_laisse_le_contexte_en_place() {
         (Some("album".into()), Some("101".into()))
     );
 }
+
+/// L'album 202 de la bibliothèque, trois pistes.
+fn un_album_de_trois_pistes(state: &tune_server::state::AppState) {
+    state
+        .backend
+        .execute_batch(
+            "INSERT INTO albums (id, title, source) VALUES (202, 'Album 202', 'local');
+             INSERT INTO tracks (id, title, album_id, file_path, duration_ms, format) VALUES
+               (2021, 'piste 1', 202, '/music/202-1.flac', 200000, 'flac'),
+               (2022, 'piste 2', 202, '/music/202-2.flac', 200000, 'flac'),
+               (2023, 'piste 3', 202, '/music/202-3.flac', 200000, 'flac');",
+        )
+        .unwrap();
+}
+
+/// Fil 2379, point 1 (FabienM, rc7) : « un album en lecture aléatoire → dans
+/// l'historique on n'a pas le conteneur ». La lecture aléatoire d'un album
+/// (`POST /playback/shuffle-all?album_id=`) pose l'album sur la session, comme
+/// « Lire » : sans cela, la session gardait l'album 101 du geste précédent.
+///
+/// Le banc n'a pas de sortie : la lecture elle-même peut échouer, le contexte
+/// est posé avant elle, comme dans `POST /zones/{id}/play`.
+#[tokio::test]
+async fn un_album_lu_en_aleatoire_est_le_conteneur_de_la_session() {
+    let (state, app) = banc().await;
+    un_album_de_trois_pistes(&state);
+    apres_un_album(&state).await;
+    let status = poster(
+        &app,
+        "/api/v1/playback/shuffle-all?zone_id=1&album_id=202",
+        json!({}),
+    )
+    .await;
+    assert_ne!(status, StatusCode::BAD_REQUEST, "l'album a des pistes");
+    assert_eq!(
+        contexte(&state).await,
+        (Some("album".into()), Some("202".into())),
+        "un album lu en aléatoire n'est pas le conteneur de l'Historique"
+    );
+}
+
+/// La bibliothèque entière lue en aléatoire n'est pas un conteneur, et
+/// n'hérite pas de l'album d'avant.
+#[tokio::test]
+async fn la_bibliotheque_lue_en_aleatoire_n_herite_pas_de_l_album() {
+    let (state, app) = banc().await;
+    un_album_de_trois_pistes(&state);
+    apres_un_album(&state).await;
+    let status = poster(&app, "/api/v1/playback/shuffle-all?zone_id=1", json!({})).await;
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "la bibliothèque a des pistes"
+    );
+    assert_eq!(
+        contexte(&state).await,
+        (None, None),
+        "un tirage de la bibliothèque s'est rangé dans l'album 101"
+    );
+}
