@@ -1902,7 +1902,30 @@ impl StreamingService for TidalService {
 
         let mut data = None;
         let mut downgraded_fallback: Option<serde_json::Value> = None;
-        for &q in fallback_chain {
+        // #6334 — la v2 `trackManifests` d'abord (elle rend le FLAC que la v1
+        // refuse au client de Tune). Une réponse sans perte, ou une réponse à
+        // une demande avec perte, sert telle quelle ; un AAC reçu sur une
+        // demande sans perte n'est qu'un repli, et la cascade v1 est jouée
+        // derrière lui. Tout échec de la v2 laisse la v1 faire, comme avant.
+        match self.manifeste_v2(track_id, requested_quality).await {
+            Ok(d) => {
+                let rang = quality_rank(d["audioQuality"].as_str().unwrap_or(""));
+                if rang >= 2 || quality_rank(requested_quality) < 2 {
+                    data = Some(d);
+                } else {
+                    garder_le_meilleur_repli(&mut downgraded_fallback, d);
+                }
+            }
+            Err(e) => {
+                info!(
+                    track_id,
+                    requested = requested_quality,
+                    error = %e,
+                    "tidal_manifeste_v2_echec_repli_v1"
+                );
+            }
+        }
+        for &q in fallback_chain.iter().filter(|_| data.is_none()) {
             // #6334 — un repli déjà en main vaut au moins cette marche : la
             // demander rendrait au mieux la même chose, et une réponse
             // « exacte » à une marche plus basse (`HIGH` → `HIGH`) l'emportait
@@ -2030,6 +2053,11 @@ impl StreamingService for TidalService {
             format!("tidal: no usable stream found for track {track_id} (all qualities failed)")
         })?;
 
+        // #6334 — d'où vient la réponse retenue (journalisé avec le format reçu).
+        let voie = data["voie"]
+            .as_str()
+            .unwrap_or(manifeste_v2::VOIE_V1)
+            .to_string();
         let manifest = data["manifest"].as_str().ok_or("no manifest")?;
         let manifest_mime = data["manifestMimeType"].as_str().unwrap_or("");
         let decoded =
@@ -2235,6 +2263,7 @@ impl StreamingService for TidalService {
                 sample_rate,
                 bit_depth,
                 subscription = ?self.subscription,
+                voie = voie.as_str(),
                 "tidal_stream_url_lossy — Tidal returned AAC instead of FLAC"
             );
         } else {
@@ -2245,6 +2274,7 @@ impl StreamingService for TidalService {
                 codec,
                 sample_rate,
                 bit_depth,
+                voie = voie.as_str(),
                 "tidal_stream_url"
             );
         }
@@ -4769,6 +4799,13 @@ impl TidalService {
 #[cfg(test)]
 #[path = "tidal_qualite_livree_6334_tests.rs"]
 mod qualite_livree_6334_tests;
+
+// #6334 — lecture par `trackManifests` v2, repli v1.
+#[path = "tidal_manifeste_v2.rs"]
+mod manifeste_v2;
+#[cfg(test)]
+#[path = "tidal_manifeste_v2_6334_tests.rs"]
+mod manifeste_v2_6334_tests;
 
 /// #5997 — les favoris Tidal sont relus EN ENTIER, et une lecture incomplète
 /// se dit au miroir au lieu de passer pour la liste entière.
