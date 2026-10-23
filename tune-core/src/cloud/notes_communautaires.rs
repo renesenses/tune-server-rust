@@ -93,23 +93,23 @@ pub enum Issue {
 
 /// Un appel au site au nom du compte, avec la reliaison et le
 /// rafraîchissement uniques de la chaîne des écoutes.
-struct Session<'a> {
-    backend: &'a Arc<dyn DbBackend>,
-    http: &'a reqwest::Client,
-    settings: SettingsRepo,
-    compte: Compte,
-    liaison_tentee: bool,
-    session_rafraichie: bool,
+pub(crate) struct Session<'a> {
+    pub(crate) backend: &'a Arc<dyn DbBackend>,
+    pub(crate) http: &'a reqwest::Client,
+    pub(crate) settings: SettingsRepo,
+    pub(crate) compte: Compte,
+    pub(crate) liaison_tentee: bool,
+    pub(crate) session_rafraichie: bool,
 }
 
-enum Reponse {
+pub(crate) enum Reponse {
     Ok(Value),
     Refus { statut: u16, code: Option<String> },
     Panne(&'static str),
 }
 
 impl Session<'_> {
-    async fn appeler(
+    pub(crate) async fn appeler(
         &mut self,
         methode: reqwest::Method,
         chemin: &str,
@@ -159,7 +159,7 @@ impl Session<'_> {
     }
 }
 
-fn raison(r: &Reponse) -> String {
+pub(crate) fn raison(r: &Reponse) -> String {
     match r {
         Reponse::Ok(_) => "ok".into(),
         Reponse::Panne(p) => (*p).into(),

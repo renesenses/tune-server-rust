@@ -818,13 +818,63 @@ impl TidalService {
     /// Un seul point de lecture pour deux projections : la liste typée, et la
     /// liste sérialisée datée que sert la route des favoris.
     async fn favoris_bruts(&self, type_tidal: &str) -> Result<Vec<serde_json::Value>, TuneError> {
+        Ok(self.lecture_des_favoris(type_tidal).await?.0)
+    }
+
+    /// Taille d'une page de `/users/{id}/favorites/{type}`.
+    const PAGE_FAVORIS: usize = 100;
+    /// Pages relues au plus : 10 000 favoris d'un type.
+    const PAGES_FAVORIS_MAX: usize = 100;
+
+    /// #5997 — TOUTES les pages des favoris d'un type, et le motif si la
+    /// liste n'est pas complète.
+    ///
+    /// La lecture ne demandait que `?limit=100`, sans suite : au-delà de 100
+    /// favoris d'un type, le miroir (#5997) ne voyait pas le reste, et
+    /// retirait de Tune à chaque rafraîchissement tout favori confirmé
+    /// au-delà de la centième place. On pagine désormais jusqu'à
+    /// `totalNumberOfItems`, et on DIT quand on n'y arrive pas.
+    async fn lecture_des_favoris(
+        &self,
+        type_tidal: &str,
+    ) -> Result<(Vec<serde_json::Value>, Option<String>), TuneError> {
         let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
-        let data = self
-            .api_get(&format!(
-                "/users/{user_id}/favorites/{type_tidal}?limit=100"
-            ))
-            .await?;
-        Ok(data["items"].as_array().cloned().unwrap_or_default())
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut total: Option<usize> = None;
+        let mut derniere_page_pleine = false;
+        for page in 0..Self::PAGES_FAVORIS_MAX {
+            let offset = page * Self::PAGE_FAVORIS;
+            let data = self
+                .api_get(&format!(
+                    "/users/{user_id}/favorites/{type_tidal}?limit={}&offset={offset}",
+                    Self::PAGE_FAVORIS
+                ))
+                .await?;
+            let lot = data["items"].as_array().cloned().unwrap_or_default();
+            let recus = lot.len();
+            items.extend(lot);
+            total = data["totalNumberOfItems"].as_u64().map(|t| t as usize);
+            derniere_page_pleine = recus >= Self::PAGE_FAVORIS;
+            let fini = match total {
+                Some(t) => items.len() >= t,
+                None => !derniere_page_pleine,
+            };
+            if fini || recus == 0 {
+                break;
+            }
+        }
+        let incomplete = match total {
+            Some(t) if items.len() < t => Some(format!(
+                "tidal: lecture des favoris « {type_tidal} » incomplète ({} sur {t})",
+                items.len()
+            )),
+            Some(_) => None,
+            None if derniere_page_pleine => Some(format!(
+                "tidal: lecture des favoris « {type_tidal} » sans total annoncé"
+            )),
+            None => None,
+        };
+        Ok((items, incomplete))
     }
 
     /// La clé sous laquelle Tidal date la mise en favori — sur l'ENVELOPPE,
@@ -2386,6 +2436,28 @@ impl StreamingService for TidalService {
             "tracks" | "albums" | "artists" => self.favoris_bruts(fav_type).await?,
             _ => return Ok(None),
         };
+        Ok(Some(
+            enveloppes
+                .iter()
+                .filter_map(|e| Self::favori_date(e, fav_type))
+                .collect(),
+        ))
+    }
+
+    /// #5997 — la même liste datée, mais `Err` si Tidal ne l'a pas servie en
+    /// entier : c'est elle que le miroir réconcilie.
+    async fn favoris_dates_complets(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        if !matches!(fav_type, "tracks" | "albums" | "artists") {
+            return Ok(None);
+        }
+        let (enveloppes, incomplete) = self.lecture_des_favoris(fav_type).await?;
+        if let Some(motif) = incomplete {
+            warn!(fav_type, motif = %motif, "tidal_favoris_lecture_incomplete_5997");
+            return Err(motif.into());
+        }
         Ok(Some(
             enveloppes
                 .iter()
@@ -4697,3 +4769,88 @@ impl TidalService {
 #[cfg(test)]
 #[path = "tidal_qualite_livree_6334_tests.rs"]
 mod qualite_livree_6334_tests;
+
+/// #5997 — les favoris Tidal sont relus EN ENTIER, et une lecture incomplète
+/// se dit au miroir au lieu de passer pour la liste entière.
+#[cfg(test)]
+mod favoris_complets_5997 {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Un TIDAL factice : `total` titres favoris annoncés, servis par pages
+    /// jusqu'à `servis` au plus.
+    async fn faux_tidal(total: usize, servis: usize) -> TidalService {
+        use axum::extract::{Query, State};
+        use axum::routing::get;
+        async fn favoris(
+            State((total, servis)): State<(usize, usize)>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> axum::Json<serde_json::Value> {
+            let offset: usize = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(10);
+            let items: Vec<_> = (offset..(offset + limit).min(servis))
+                .map(|i| {
+                    json!({"created": "2026-10-01T10:00:00.000+0000",
+                        "item": {"id": i + 1, "title": format!("piste {}", i + 1)}})
+                })
+                .collect();
+            axum::Json(json!({"limit": limit, "offset": offset,
+                "totalNumberOfItems": total, "items": items}))
+        }
+        let app = axum::Router::new()
+            .route("/users/7/favorites/tracks", get(favoris))
+            .with_state((total, servis));
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let mut svc = TidalService::new();
+        svc.base_forcee = Some(format!("http://{adresse}"));
+        svc.user_id = Some(7);
+        svc.tokens = Mutex::new(TokenState {
+            access_token: Some("jeton-essai".into()),
+            refresh_token: None,
+            token_expires: None,
+        });
+        svc
+    }
+
+    /// 150 favoris : la lecture ne s'arrête plus à la première page de 100.
+    #[tokio::test]
+    async fn les_favoris_au_dela_de_cent_sont_relus_5997() {
+        let svc = faux_tidal(150, 150).await;
+        let complets = svc
+            .favoris_dates_complets("tracks")
+            .await
+            .expect("lecture complète")
+            .expect("Tidal date ses favoris");
+        assert_eq!(
+            complets.len(),
+            150,
+            "les favoris au-delà de 100 sont perdus"
+        );
+        assert_eq!(svc.get_user_tracks().await.unwrap().len(), 150);
+    }
+
+    /// Tidal annonce 150 favoris et n'en sert que 100 : la lecture du miroir
+    /// est une ERREUR ; l'affichage garde les 100.
+    #[tokio::test]
+    async fn une_lecture_tidal_incomplete_est_une_erreur_pour_le_miroir_5997() {
+        let svc = faux_tidal(150, 100).await;
+        let lecture = svc.favoris_dates_complets("tracks").await;
+        assert!(
+            lecture.is_err(),
+            "une liste partielle a été rendue comme complète : {} éléments",
+            lecture.ok().flatten().map(|v| v.len()).unwrap_or(0)
+        );
+        let affichage = svc
+            .get_user_favorites_dated("tracks")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(affichage.len(), 100);
+    }
+}

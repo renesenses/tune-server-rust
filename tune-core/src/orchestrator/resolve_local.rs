@@ -1142,6 +1142,7 @@ impl PlaybackOrchestrator {
             let tranche = tranche_dop(tranche_cue, req.seek_ms);
             return self
                 .anticiper_le_dop(
+                    req.zone_id,
                     track,
                     file_path.to_string(),
                     source.zone_max_sample_rate,
@@ -1877,8 +1878,10 @@ impl PlaybackOrchestrator {
     /// ici même, cadence et canaux lus DANS LE FICHIER (l'en-tête WAV
     /// décrivait la ligne `tracks`). `None` quand la cadence DoP dépasse le
     /// plafond de la zone : la décision continue sur le chemin ordinaire.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn anticiper_le_dop(
         &self,
+        zone_id: i64,
         track: &crate::db::models::Track,
         file_path: String,
         zone_max_sample_rate: Option<u32>,
@@ -2053,6 +2056,31 @@ impl PlaybackOrchestrator {
                     Err(e) => tracing::warn!(error = %e, "dsd_dop_stream_failed"),
                 }
             });
+
+            // #6456 (Levente, fil 2305) — les VU-mètres restaient vides en
+            // DoP. Le flux DoP est un porteur DSD emballé dans du PCM 24 bits :
+            // aucun niveau ne s'y lit, et rien d'autre ne décodait la piste.
+            // L'avance gapless, elle, mesurait déjà un DSD par le décodage du
+            // fichier (`queue.rs`) : la lecture explicite et le déplacement
+            // passent désormais par le même décodage, bridé, depuis la
+            // position servie. Le flux envoyé au DAC n'est pas touché.
+            if let Some(bus) = self
+                .event_bus
+                .clone()
+                .filter(|_| self.levels_attach_allowed(zone_id))
+            {
+                let play_seq = self.playback.current_play_seq(zone_id).await;
+                let debut_fichier_ms = tranche.map(|(debut, _)| debut).unwrap_or(0);
+                spawn_local_file_levels_decode_depuis(
+                    bus,
+                    self.playback.clone(),
+                    zone_id,
+                    play_seq,
+                    file_path.clone(),
+                    debut_fichier_ms,
+                    seek_ms.unwrap_or(0),
+                );
+            }
 
             let server_ip = self.server_ip();
             let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
