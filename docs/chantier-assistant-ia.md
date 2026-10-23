@@ -493,3 +493,37 @@ seulement si l'assistant est prêt) appelle `/ai/query` — tune-web-client#2182
 ajouter tirés de `actions`, le coût de la question (`cout_eur`) et l'état du
 plafond (`plafond`). Face à un serveur antérieur sans `cout_eur`, il n'affiche
 que la dépense du mois et le plafond.
+
+## 12. Réglages communs (décisions de Bertrand du 23/10/2026)
+
+Suite de l'étude #6834 (`docs/etude-assistant-ia-usages.md`, PR #6835).
+
+- **Claude Haiku 5.5 par défaut partout.** C'était déjà le cas du greffon
+  (`couts::MODELE_ANTHROPIC_PAR_DEFAUT`) ; le client historique
+  (`tune_core::ai::client`, binaire sans le greffon et traduction par une clé
+  héritée) passe de Sonnet 4.6 à Haiku 5.5. Un modèle « classique » détecté
+  ne bascule PAS seul vers Sonnet.
+- **Sonnet 5.5 sur demande** : `appel::Choix::Fort`
+  (`Reglages::modele_fort`) — le modèle « classique » choisi s'il y en a un,
+  sinon Claude Sonnet 5.5 chez Anthropic, sinon le modèle habituel. Les
+  usages qui l'offrent passent `second_avis: true`. `GET /reglages` rend
+  `modele_second_avis`.
+- **`effort: "low"` pour les usages courts** (`couts::USAGES_COURTS` :
+  `test`, `playlist`, `traduction`, `requete`), dans `output_config.effort`,
+  et SEULEMENT pour les modèles qui l'acceptent (`couts::MODELES_AVEC_EFFORT`,
+  liste FERMÉE relevée le 23/10/2026 dans la référence de l'API Claude :
+  Haiku 5.5, Sonnet 5.5 / 5 / 4.6, Opus 4.5 à 5.5, Fable 5 / 5.1). Haiku 4.5
+  et Sonnet 4.5 le refusent par un 400 : ils n'en reçoivent jamais, un modèle
+  inconnu non plus. Les suggestions d'album, de pistes et les lots gardent
+  l'effort par défaut du modèle (`medium` pour Haiku 5.5).
+- **Ollama : `options.num_ctx`** à la taille de la demande
+  (`couts::num_ctx_ollama` : un jeton pour trois caractères, plus la sortie,
+  arrondi au kilo-jeton, borné à 4 096..65 536). Sans lui, Ollama tronquait
+  sans erreur le début d'un contexte plus long que son défaut — la consigne.
+- **Coût estimé avant l'appel** : `couts::estimer_micro_eur` (entrée estimée
+  à un jeton pour trois caractères, sortie au plus), rendu par les aperçus des
+  nouveaux usages (`cout_estime_eur`).
+
+Non mesuré : le gain réel de `effort: low` sur la facture (aucun appel réel
+n'a été fait) ; la qualité de Haiku 5.5 à cet effort sur la playlist par
+phrase.
