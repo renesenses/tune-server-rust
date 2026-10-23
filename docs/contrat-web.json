@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "2a12dab3d07ab6da2fa6bf9264e46df0c160eed2",
+    "web_sha": "2617321f0b12f729bc69a040795f9315ab9891c7",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -1687,6 +1687,20 @@
       "champs_optionnels": [
         "image_url",
         "qobuz_label_id"
+      ]
+    },
+    {
+      "route": "/library/labels/{}/artists",
+      "methode": "GET",
+      "type": "ArtistesDuLabel",
+      "liste": false,
+      "champs_obligatoires": [
+        "name",
+        "bibliotheque"
+      ],
+      "champs_optionnels": [
+        "qobuz_label_id",
+        "decouvrir"
       ]
     },
     {
@@ -6779,7 +6793,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 336,
+    "routes_cartographiees": 337,
     "appels_non_resolus": 154
   }
 }
