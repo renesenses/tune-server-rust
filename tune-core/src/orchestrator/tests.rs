@@ -770,9 +770,7 @@ async fn les_niveaux_disent_le_gain_demande_et_le_rabot_a_l_unite_4384() {
         dop: Arc::new(AtomicBool::new(dop)),
     };
 
-    // #6787 — la position est en millionièmes, et la loi perceptive.
-    const PLEIN: u32 = crate::audio::volume_scale::UNITES_DE_POSITION;
-    let rabote = publier(987_670, Some(demande(PLEIN, 2000, false))).await;
+    let rabote = publier(987_670, Some(demande(1000, 2000, false))).await;
     let db = rabote["output_gain_requested_db"]
         .as_f64()
         .expect("output_gain_requested_db sur une sortie locale");
@@ -782,23 +780,20 @@ async fn les_niveaux_disent_le_gain_demande_et_le_rabot_a_l_unite_4384() {
         "+6 dB à volume plein : le rabot mord"
     );
 
-    // #6787 — curseur à 50 % : −30 dB demandés sur la loi perceptive (−6 dB
-    // sous l'ancienne loi linéaire).
-    let bas = publier(987_671, Some(demande(PLEIN / 2, 1000, false))).await;
+    let bas = publier(987_671, Some(demande(500, 1000, false))).await;
     let db = bas["output_gain_requested_db"].as_f64().expect("champ");
-    // Le gain demandé se publie en millièmes : 32 ‰ = −29,9 dB.
-    assert!((db + 30.0).abs() < 0.15, "−30 dB demandés, lu {db}");
+    assert!((db + 6.02).abs() < 0.05, "−6 dB demandés, lu {db}");
     assert_eq!(bas["output_gain_limited"], false);
 
     // Facteur ×2 dont ×1,5 porté par l'égaliseur : le produit demandé reste ×2.
-    let porte = publier(987_672, Some(demande(PLEIN, (1500 << 16) | 2000, false))).await;
+    let porte = publier(987_672, Some(demande(1000, (1500 << 16) | 2000, false))).await;
     let db = porte["output_gain_requested_db"].as_f64().expect("champ");
     assert!(
         (db - 6.02).abs() < 0.05,
         "la part portée ne compte pas, lu {db}"
     );
 
-    for (zone_id, d) in [(987_673, Some(demande(PLEIN, 2000, true))), (987_674, None)] {
+    for (zone_id, d) in [(987_673, Some(demande(1000, 2000, true))), (987_674, None)] {
         let v = publier(zone_id, d).await;
         assert!(v.get("output_gain_requested_db").is_none(), "{v}");
         assert!(v.get("output_gain_limited").is_none(), "{v}");
@@ -2753,9 +2748,7 @@ async fn brancher_le_gain_suit_la_sortie_locale_puis_la_lache() {
     {
         let arc = orch.outputs.lock().await.get(&device_id).expect("sortie");
         let sortie = arc.lock().await;
-        // #6787 — le curseur à la position qui rend −12 dB (0,25 en gain).
-        let position = crate::audio::volume_scale::position_perceptive(0.25);
-        sortie.set_volume(position).await.expect("set_volume");
+        sortie.set_volume(0.25).await.expect("set_volume");
     }
     assert_eq!(
         orch.playback.gain_de_sortie_units(zone_id),
@@ -6459,12 +6452,11 @@ async fn gain_de_la_sortie_recreee(volume: f64, fixe: bool, trim_db: &str) -> u3
 #[cfg(feature = "local-audio")]
 #[tokio::test]
 async fn la_sortie_locale_recreee_nait_au_volume_de_la_zone_trim_compris() {
-    // #6787 — zone à 70 % : −18 dB sur la loi perceptive, −24 dB trim compris.
-    let gain = gain_de_la_sortie_recreee(70.0, false, "-6").await as f64 / 1000.0;
-    let attendu = 10f64.powf(-24.0 / 20.0);
+    let gain = gain_de_la_sortie_recreee(30.0, false, "-6").await as f64 / 1000.0;
+    let attendu = super::volume_avec_trim(0.30, -6.0);
     assert!(
         (gain - attendu).abs() < 2e-3,
-        "gain de rendu {gain} après recréation, attendu {attendu} (70 % = −18 dB, −6 dB de trim) : \
+        "gain de rendu {gain} après recréation, attendu {attendu} (30 % × −6 dB) : \
          la sortie recréée n'est pas ensemencée avec le volume de la zone"
     );
 }

@@ -2773,7 +2773,7 @@ impl DspDeLaRouteFlottanteWindows {
             mono_downmix: AtomicBool::new(false),
             dop_active: AtomicBool::new(false),
             volume: AtomicU32::new(1000),
-            user_volume: AtomicU32::new(crate::audio::volume_scale::UNITES_DE_POSITION),
+            user_volume: AtomicU32::new(1000),
             rg_factor: AtomicU32::new(1000),
         }
     }
@@ -3178,8 +3178,7 @@ fn sync_volume_to_dop_writes_what_the_callbacks_read() {
     // qu'il appelle, pour qu'une faute à cet endroit ne se découvre pas au
     // build Windows de la release.
     let volume = AtomicU32::new(1000);
-    // #6787 — la position qui rend 0,6 en gain.
-    let user = AtomicU32::new(position_pour_le_gain(0.6));
+    let user = AtomicU32::new(600);
     let rg = AtomicU32::new(708);
 
     sync_volume_to_dop(&volume, &user, &rg, false);
@@ -3206,55 +3205,22 @@ fn dop_pins_the_effective_volume_to_unity() {
 
 #[test]
 fn ordinary_pcm_keeps_the_volume_it_had_before() {
-    // Non-régression : hors DoP, le calcul est celui d'avant — produit
-    // gain du curseur × ReplayGain, borné à l'unité. #6787 — le gain du
-    // curseur suit la loi perceptive (50 % = −30 dB).
-    const PLEIN: u32 = crate::audio::volume_scale::UNITES_DE_POSITION;
-    assert_eq!(effective_volume_units(PLEIN, 1000, false), 1000);
-    assert_eq!(effective_volume_units(PLEIN / 2, 1000, false), 32);
-    assert_eq!(
-        effective_volume_units(position_pour_le_gain(0.5), 1000, false),
-        500
-    );
+    // Non-régression : hors DoP, le calcul est exactement celui d'avant —
+    // produit volume × ReplayGain, borné à l'unité.
+    assert_eq!(effective_volume_units(1000, 1000, false), 1000);
+    assert_eq!(effective_volume_units(500, 1000, false), 500);
     assert_eq!(effective_volume_units(0, 1000, false), 0);
-    assert_eq!(
-        effective_volume_units(position_pour_le_gain(0.8), 500, false),
-        400
-    );
+    assert_eq!(effective_volume_units(800, 500, false), 400);
     // Le plafond à l'unité protège des pics d'un ReplayGain qui pousse.
-    assert_eq!(effective_volume_units(PLEIN, 4000, false), 1000);
-    assert_eq!(
-        effective_volume_units(position_pour_le_gain(0.9), 2000, false),
-        1000
-    );
-}
-
-/// #6787 — sur toute la grille de position, le gain rendu ne dépasse jamais
-/// celui de l'ancienne loi (position × ReplayGain) : la bascule ne monte le
-/// son d'aucune sortie locale, quel que soit le facteur de rendu.
-#[test]
-fn le_rendu_local_ne_depasse_jamais_l_ancienne_loi_6787() {
-    for rg in [300u32, 708, 1000, 1995, 4000] {
-        for millieme in 0..=1000u32 {
-            let ancien = ((f64::from(millieme) / 1000.0) * (f64::from(rg) / 1000.0))
-                .clamp(0.0, 1.0)
-                * 1000.0;
-            let nouveau = effective_volume_units(millieme * 1000, rg, false);
-            assert!(
-                f64::from(nouveau) <= ancien.round(),
-                "{millieme} ‰ × {rg} : {nouveau} > {}",
-                ancien.round()
-            );
-        }
-    }
+    assert_eq!(effective_volume_units(1000, 4000, false), 1000);
+    assert_eq!(effective_volume_units(900, 2000, false), 1000);
 }
 
 #[test]
 fn a_dop_track_survives_a_volume_that_would_have_muted_it() {
     // Le cas de Tades, bout à bout : volume à 60 %, ReplayGain à -3 dB.
     // Avant, le produit (0,42) réécrivait le marqueur et le DAC se taisait.
-    // #6787 — la position qui rend 0,6 en gain.
-    let user = position_pour_le_gain(0.6);
+    let user = 600;
     let rg = 708; // ~ -3 dB
     assert_eq!(effective_volume_units(user, rg, false), 425);
     assert_eq!(effective_volume_units(user, rg, true), 1000);
@@ -3877,7 +3843,7 @@ async fn le_gain_de_rendu_partage_l_atomique_des_rappels() {
     assert_eq!(gain.load(Ordering::SeqCst), 1000, "volume plein au départ");
 
     // Le curseur bouge : l'atomique DÉJÀ distribué doit suivre.
-    sortie.set_volume(curseur(0.5)).await.expect("set_volume");
+    sortie.set_volume(0.5).await.expect("set_volume");
     assert_eq!(
         gain.load(Ordering::SeqCst),
         500,
@@ -3924,13 +3890,11 @@ async fn un_preampli_positif_est_rabote_a_volume_plein_mais_pas_a_mi_course() {
     );
 
     // Curseur à 50 % : le MÊME préampli passe presque entier.
-    sortie.set_volume(curseur(0.5)).await.expect("set_volume");
-    // #6787 — la position est arrondie par défaut : le millième rendu peut
-    // tomber un cran sous 998, jamais au-dessus.
-    let rendu = gain.load(Ordering::SeqCst);
-    assert!(
-        (997..=998).contains(&rendu),
-        "à mi-course, le même +6 dB est appliqué (0,5 × 1,995) : {rendu}"
+    sortie.set_volume(0.5).await.expect("set_volume");
+    assert_eq!(
+        gain.load(Ordering::SeqCst),
+        998,
+        "à mi-course, le même +6 dB est appliqué (0,5 × 1,995)"
     );
 }
 
@@ -3973,12 +3937,12 @@ async fn le_gain_demande_avant_rabot_se_lit_sur_la_sortie_4384() {
     mesure.brancher_le_gain_de_sortie(9, sortie.gain_de_rendu());
     mesure.brancher_le_gain_demande(9, sortie.gain_demande());
 
-    sortie.set_volume(curseur(1.0)).await.expect("set_volume");
+    sortie.set_volume(1.0).await.expect("set_volume");
     sortie.set_replaygain_factor(2.0);
     assert_eq!(mesure.gain_de_rendu_units(9), 1000, "raboté à l'unité");
     assert_eq!(mesure.gain_demande_units(9), Some(2000), "×2 demandés");
 
-    sortie.set_volume(curseur(0.25)).await.expect("set_volume");
+    sortie.set_volume(0.25).await.expect("set_volume");
     assert_eq!(mesure.gain_de_rendu_units(9), 500);
     assert_eq!(mesure.gain_demande_units(9), Some(500), "plus de rabot");
 
@@ -4010,7 +3974,7 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
     mesure.brancher_le_gain_de_sortie(7, sortie.gain_de_rendu());
     mesure.brancher_le_gain_moyen_du_dsp(7, sortie.gain_moyen_du_dsp());
 
-    sortie.set_volume(curseur(0.1)).await.expect("set_volume");
+    sortie.set_volume(0.1).await.expect("set_volume");
     assert_eq!(gain.load(Ordering::SeqCst), 100, "−20 dB, sans DSP");
     assert_eq!(
         dsp.load(Ordering::SeqCst),
@@ -4069,7 +4033,7 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
 
     // Volume plein : la compensation est rabotée à l'unité, jamais au-delà.
     sortie.set_compensation_de_niveau(true);
-    sortie.set_volume(curseur(1.0)).await.expect("set_volume");
+    sortie.set_volume(1.0).await.expect("set_volume");
     let rendu = gain.load(Ordering::SeqCst) as i64;
     assert!(
         (rendu - millemes(eq_db)).abs() <= 1,
@@ -4077,7 +4041,7 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
     );
 
     // PURE : DSP contourné, rien à compenser ni à retrancher de la mesure.
-    sortie.set_volume(curseur(0.1)).await.expect("set_volume");
+    sortie.set_volume(0.1).await.expect("set_volume");
     sortie.set_pure_bypass(true);
     assert_eq!(gain.load(Ordering::SeqCst), 100);
     assert_eq!(dsp.load(Ordering::SeqCst), 1000);
@@ -4603,7 +4567,7 @@ async fn bascule_compensee_5227(activer: bool) -> (f32, f32, f32) {
     use crate::outputs::traits::OutputTarget;
     let sortie = LocalOutput::new("Casque".to_string());
     sortie.set_compensation_de_niveau(true);
-    sortie.set_volume(curseur(0.1)).await.expect("set_volume");
+    sortie.set_volume(0.1).await.expect("set_volume");
     if !activer {
         sortie.set_eq(Some(egaliseur_compensable_5227()));
     }
@@ -4652,7 +4616,7 @@ async fn couper_l_egaliseur_compense_ne_fait_aucune_bouffee_5227() {
 async fn l_interrupteur_de_compensation_ne_fait_aucune_bouffee_5227() {
     use crate::outputs::traits::OutputTarget;
     let sortie = LocalOutput::new("Casque".to_string());
-    sortie.set_volume(curseur(0.1)).await.expect("set_volume");
+    sortie.set_volume(0.1).await.expect("set_volume");
     sortie.set_eq(Some(egaliseur_compensable_5227()));
     let mut anneau = std::collections::VecDeque::new();
     let mut trame = 0;
@@ -4694,10 +4658,7 @@ async fn bascule_au_volume_5215(volume: f64, activer: bool) -> (Vec<f32>, f32, f
     use crate::outputs::traits::OutputTarget;
     let sortie = LocalOutput::new("Casque".to_string());
     sortie.set_compensation_de_niveau(true);
-    sortie
-        .set_volume(curseur(volume))
-        .await
-        .expect("set_volume");
+    sortie.set_volume(volume).await.expect("set_volume");
     if !activer {
         sortie.set_eq(Some(egaliseur_compensable_5227()));
     }
@@ -4777,10 +4738,7 @@ async fn porter_moins_ne_change_pas_le_niveau_rendu_5215() {
     for volume in [1.0_f64, 0.5, 0.1] {
         let sortie = LocalOutput::new("Casque".to_string());
         sortie.set_compensation_de_niveau(true);
-        sortie
-            .set_volume(curseur(volume))
-            .await
-            .expect("set_volume");
+        sortie.set_volume(volume).await.expect("set_volume");
         let eq = egaliseur_compensable_5227();
         let comp = 10f64.powf(-eq.gain_moyen_db() / 20.0);
         sortie.set_eq(Some(eq));
@@ -4840,7 +4798,7 @@ async fn couper_l_egaliseur_rend_le_niveau_d_avant_6741(sans_fin: bool) {
     let sortie = LocalOutput::new("Haut-parleurs".to_string());
     sortie.set_compensation_de_niveau(false);
     sortie.set_flux_sans_fin(sans_fin);
-    sortie.set_volume(curseur(0.5)).await.expect("set_volume");
+    sortie.set_volume(0.5).await.expect("set_volume");
     let avant = AMPLITUDE_5215 * 0.5;
     let mut trame = 0;
     // Le niveau d'avant l'égaliseur, mesuré.
@@ -4929,7 +4887,7 @@ async fn volume_monte_pendant_l_egaliseur_la_remontee_s_arrete_au_niveau_d_avant
     let sortie = LocalOutput::new("Haut-parleurs".to_string());
     sortie.set_compensation_de_niveau(false);
     sortie.set_flux_sans_fin(sans_fin);
-    sortie.set_volume(curseur(0.25)).await.expect("set_volume");
+    sortie.set_volume(0.25).await.expect("set_volume");
     let avant = AMPLITUDE_5215 * 0.25;
     let mut trame = 0;
     jouer_5215(&sortie, &mut trame, 10);
@@ -4937,7 +4895,7 @@ async fn volume_monte_pendant_l_egaliseur_la_remontee_s_arrete_au_niveau_d_avant
     let preampli = eq.preamp_db(0).expect("préampli chiffré");
     sortie.replace_eq_live(Some(eq));
     jouer_5215(&sortie, &mut trame, 40);
-    sortie.set_volume(curseur(1.0)).await.expect("set_volume");
+    sortie.set_volume(1.0).await.expect("set_volume");
     jouer_5215(&sortie, &mut trame, 40);
     sortie.replace_eq_live(None);
     let signal = jouer_sous_le_plafond_6741(&sortie, &mut trame, 800, avant, contexte);
@@ -4962,7 +4920,7 @@ async fn volume_monte_pendant_l_egaliseur_la_remontee_s_arrete_au_niveau_d_avant
     );
     // Le prochain réglage : le volume revient à 25 %. Le gain gardé remonte
     // jusqu'à 0 dB, sans saut, sans jamais dépasser le niveau d'avant.
-    sortie.set_volume(curseur(0.25)).await.expect("set_volume");
+    sortie.set_volume(0.25).await.expect("set_volume");
     let signal = jouer_sous_le_plafond_6741(&sortie, &mut trame, 800, avant, contexte);
     let marche = plus_grande_marche_5215(&signal);
     assert!(
@@ -5000,7 +4958,7 @@ async fn le_preampli_garde_se_declare_dans_les_transformations_reelles_6741() {
         FormatOuvert::new(TAUX_5215, 2),
         true,
     ));
-    sortie.set_volume(curseur(0.25)).await.expect("set_volume");
+    sortie.set_volume(0.25).await.expect("set_volume");
     let mut trame = 0;
     sortie.replace_eq_live(Some(egaliseur_a_preampli_negatif_5215()));
     jouer_5215(&sortie, &mut trame, 20);
@@ -5011,7 +4969,7 @@ async fn le_preampli_garde_se_declare_dans_les_transformations_reelles_6741() {
         None,
         "égaliseur actif : rien de « gardé »"
     );
-    sortie.set_volume(curseur(1.0)).await.expect("set_volume");
+    sortie.set_volume(1.0).await.expect("set_volume");
     sortie.replace_eq_live(None);
     // Le fondu de la courbe (300 ms) passé, la remontée est en cours.
     jouer_5215(&sortie, &mut trame, 40);
@@ -5027,17 +4985,4 @@ async fn le_preampli_garde_se_declare_dans_les_transformations_reelles_6741() {
         .expect("le reste, borné par le volume, est déclaré");
     assert!(!en_retour, "rampe finie");
     assert!((db + 12.04).abs() < 0.2, "{db} dB gardés, attendu ≈ −12,04");
-}
-
-/// #6787 — la position de curseur (0..1) qui rend `gain` sur la loi
-/// perceptive de la sortie locale. Les témoins ci-dessus raisonnent en GAIN
-/// (−20 dB, ×0,5…) : ils posent donc le curseur à la position qui le rend.
-fn curseur(gain: f64) -> f64 {
-    crate::audio::volume_scale::position_perceptive(gain)
-}
-
-/// #6787 — la même, en unités de position (`UNITES_DE_POSITION`), arrondie
-/// au plus proche pour que le gain rendu tombe sur la cible.
-fn position_pour_le_gain(gain: f64) -> u32 {
-    (curseur(gain) * f64::from(crate::audio::volume_scale::UNITES_DE_POSITION)).round() as u32
 }

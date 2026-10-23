@@ -175,11 +175,8 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
             // #1274 — le WebSocket est la surface que le client relit en
             // continu ; le priver du dB obligerait a un GET REST pour un
             // nombre qu'on tient deja. `null` = silence.
-            // #6787 — sur l'échelle de la zone (`volume_curve`).
-            "volume_db": tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(
-                z.output_type.as_deref(),
-            )
-            .vers_db(ps.volume),
+            "volume_db": tune_core::audio::volume_scale::linear_to_db(ps.volume),
+            // #6787 — la loi du curseur (`volume` reste le gain).
             "volume_curve": tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(
                 z.output_type.as_deref(),
             )

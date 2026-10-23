@@ -187,13 +187,6 @@ fn valider_le_patch(
     // 0..1 lui-même. Le refus, lui, est rendu sous la forme que le reste du
     // handler emploie.
     let volume_demande = match tune_core::audio::volume_scale::demande_lineaire(
-        // #6787 — un `volume_db` se lit sur l'échelle de la zone, celle de la
-        // sortie que ce PATCH lui donne s'il en change.
-        tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(
-            body.output_type
-                .as_deref()
-                .or(zone_before.output_type.as_deref()),
-        ),
         body.volume.map(f64::from).map(|v| v / 100.0),
         body.volume_db,
     ) {
@@ -1464,19 +1457,17 @@ pub(super) async fn update_volume(
     // #1274 — l'arbitrage `volume` / `volume_db` et la conversion des dB
     // vivent dans `volume_scale`, pas ici. Cette route ne fait que ramener sa
     // convention historique sur 0..1 avant de la lui passer.
-    // #6787 — un `volume_db` se lit sur l'échelle de la zone.
-    let echelle = tune_core::audio::volume_scale::echelle_de_la_zone(&state.backend, id);
-    let volume_f =
-        match tune_core::audio::volume_scale::demande_lineaire(echelle, lineaire, body.volume_db) {
-            Ok(v) => v,
-            Err(motif) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": "invalid_volume", "message": motif })),
-                )
-                    .into_response();
-            }
-        };
+    let volume_f = match tune_core::audio::volume_scale::demande_lineaire(lineaire, body.volume_db)
+    {
+        Ok(v) => v,
+        Err(motif) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_volume", "message": motif })),
+            )
+                .into_response();
+        }
+    };
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
     // #1274 — la consigne en dB doit avoir un endroit où arriver. Si la

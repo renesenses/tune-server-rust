@@ -433,6 +433,10 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 } else {
                     z.volume / 100.0
                 },
+            );
+            // #6787 — la loi du curseur (`volume` reste le gain).
+            tune_core::audio::volume_scale::inserer_courbe(
+                obj,
                 tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(
                     z.output_type.as_deref(),
                 ),
@@ -619,9 +623,10 @@ pub(super) async fn get_zone(
                 obj.insert("repeat".into(), json!(ps.repeat));
                 // #1274 — même paire qu'au-dessus, depuis la même source :
                 // ici la colonne `zones.volume`, arrondie au pour-cent.
-                tune_core::audio::volume_scale::inserer_volume(
+                tune_core::audio::volume_scale::inserer_volume(obj, zone.volume / 100.0);
+                // #6787 — la loi du curseur (`volume` reste le gain).
+                tune_core::audio::volume_scale::inserer_courbe(
                     obj,
-                    zone.volume / 100.0,
                     tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(
                         zone.output_type.as_deref(),
                     ),

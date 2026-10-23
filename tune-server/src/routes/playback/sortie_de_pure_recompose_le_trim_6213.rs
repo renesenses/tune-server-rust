@@ -67,14 +67,9 @@ async fn sortir_de_pure_renvoie_la_consigne_avec_le_trim_6213() {
 
     assert_eq!(basculer_pure(&app, zone_id, false).await, StatusCode::OK);
 
-    // #6787 — sortie locale : la consigne est une position sur la loi
-    // perceptive, dont le GAIN vaut 100 % × trim −2 dB.
     let attendu = 10f64.powf(-2.0 / 20.0);
     let recu = commandes_de_volume(&state).await;
-    let dernier = recu
-        .last()
-        .copied()
-        .map(tune_core::audio::volume_scale::gain_perceptif);
+    let dernier = recu.last().copied();
     assert!(
         dernier.is_some_and(|v| (v - attendu).abs() < 1e-6),
         "#6213 : après PURE off, l'appareil doit recevoir 100 % × trim −2 dB \

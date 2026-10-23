@@ -306,34 +306,13 @@ pub fn sortie_a_volume_logiciel(output_type: &str) -> bool {
 /// `trim_positif_ignore_volume_materiel`). Un trim négatif reste appliqué :
 /// il ne fait que baisser. Sur la sortie locale, rien ne change : le trim est
 /// un gain numérique, et [`volume_avec_trim`] borne le résultat à l'unité.
-///
-/// #6787 — sur la sortie locale, le volume est une POSITION de curseur sur la
-/// loi perceptive : le trim y est un écart de GAIN en dB
-/// ([`volume_logiciel_avec_trim`]), pas un facteur sur la position.
 pub fn volume_appareil_avec_trim(volume: f64, trim_db: f64, volume_materiel: bool) -> f64 {
     let volume = if volume.is_finite() { volume } else { 0.0 };
-    if !volume_materiel {
-        volume_logiciel_avec_trim(volume, trim_db)
-    } else if trim_db.is_finite() && trim_db > 0.0 {
+    if volume_materiel && trim_db.is_finite() && trim_db > 0.0 {
         volume.clamp(0.0, 1.0)
     } else {
         volume_avec_trim(volume, trim_db)
     }
-}
-
-/// #6787 — la consigne d'une sortie à volume LOGICIEL, trim compris : la
-/// position dont le gain perceptif vaut le gain de `volume` décalé de
-/// `trim_db` (±12 dB), borné à l'unité. Un trim de +6 dB rend +6 dB de gain,
-/// là où multiplier la position en aurait rendu bien davantage. Jamais
-/// au-dessus du gain qu'aurait rendu l'ancienne loi au même trim (témoin
-/// `le_trim_d_une_sortie_logicielle_est_un_ecart_de_gain`).
-pub fn volume_logiciel_avec_trim(volume: f64, trim_db: f64) -> f64 {
-    let trim_db = if trim_db.is_finite() {
-        trim_db.clamp(-12.0, 12.0)
-    } else {
-        0.0
-    };
-    crate::audio::volume_scale::EchelleDeVolume::Perceptive.decaler_en_db(volume, trim_db)
 }
 
 /// #6721 — sous PURE verrouillé (« Forcer à 100 % »), une consigne de volume
@@ -380,15 +359,11 @@ pub fn refuser_une_baisse_sous_pure_verrouille(
 /// Volontairement HORS du gate `local-audio` : c'est de l'arithmétique, sans
 /// dépendance à `outputs::local`, et les tests tournent dans les deux jeux de
 /// fonctionnalités.
-///
-/// #6787 — la graine est celle d'une sortie LOCALE : le trim s'y compose sur
-/// la loi perceptive, comme dans `Orchestrator::set_volume`
-/// ([`volume_appareil_avec_trim`] → [`volume_logiciel_avec_trim`]).
 pub fn volume_de_graine(zone_volume: f64, fixed_volume: bool, trim_db: f64) -> f64 {
     if fixed_volume {
         1.0
     } else {
-        volume_logiciel_avec_trim((zone_volume / 100.0).clamp(0.0, 1.0), trim_db)
+        volume_avec_trim((zone_volume / 100.0).clamp(0.0, 1.0), trim_db)
     }
 }
 
@@ -2021,86 +1996,6 @@ mod flac_ffmpeg_tests {
                 transcodage_requis(motif),
                 "{nom} doit transcoder, conteneur neuf ou pas"
             );
-        }
-    }
-}
-
-/// #6787 — la bascule vers la loi perceptive ne fait JAMAIS monter une sortie
-/// locale. Les valeurs enregistrées (volume de zone, trim, limites #6541) sont
-/// gardées telles quelles ; ce témoin rejoue, pour chacune, le gain qu'elles
-/// rendaient sous l'ancienne loi et celui qu'elles rendent maintenant.
-#[cfg(test)]
-mod bascule_perceptive_6787_tests {
-    use super::*;
-    use crate::audio::volume_limites::{LimitesDeVolume, OrigineDuVolume};
-    use crate::audio::volume_scale::gain_perceptif;
-
-    /// Ancienne loi : le volume de la zone × le facteur du trim, borné à 1.
-    fn gain_avant(zone_pourcent: f64, trim_db: f64) -> f64 {
-        volume_avec_trim((zone_pourcent / 100.0).clamp(0.0, 1.0), trim_db)
-    }
-
-    #[test]
-    fn la_graine_d_une_valeur_enregistree_ne_rend_jamais_plus_qu_avant() {
-        for trim in [-12.0, -6.0, -2.0, 0.0, 1.5, 6.0, 8.5, 12.0] {
-            for dixieme in 0..=1000u32 {
-                let zone = f64::from(dixieme) / 10.0;
-                let apres = gain_perceptif(volume_de_graine(zone, false, trim));
-                let avant = gain_avant(zone, trim);
-                assert!(
-                    apres <= avant + 1e-12,
-                    "zone {zone} %, trim {trim} dB : {apres} > {avant}"
-                );
-            }
-        }
-        // Les deux bouts ne bougent pas : le silence et la pleine échelle.
-        assert_eq!(gain_perceptif(volume_de_graine(0.0, false, 0.0)), 0.0);
-        assert_eq!(gain_perceptif(volume_de_graine(100.0, false, 0.0)), 1.0);
-        assert_eq!(
-            volume_de_graine(20.0, true, -6.0),
-            1.0,
-            "volume fixe inchangé"
-        );
-    }
-
-    #[test]
-    fn la_consigne_envoyee_a_une_sortie_locale_ne_monte_jamais() {
-        // Le chemin de `Orchestrator::set_volume` : trim puis limite de
-        // sécurité, sur une sortie à volume logiciel.
-        for trim in [-6.0, 0.0, 6.0, 12.0] {
-            for centieme in 0..=100u32 {
-                let v = f64::from(centieme) / 100.0;
-                let apres = gain_perceptif(volume_appareil_avec_trim(v, trim, false));
-                assert!(apres <= volume_avec_trim(v, trim) + 1e-12, "{v} @ {trim}");
-            }
-        }
-        // Un appareil réseau garde exactement sa consigne : pas de double
-        // courbe.
-        assert_eq!(volume_appareil_avec_trim(0.36, 0.0, true), 0.36);
-        assert_eq!(
-            volume_appareil_avec_trim(0.36, -6.0, true),
-            volume_avec_trim(0.36, -6.0)
-        );
-    }
-
-    #[test]
-    fn une_limite_enregistree_borne_plus_bas_qu_avant_jamais_plus_haut() {
-        // Les limites #6541 sont des fractions gardées telles quelles : sur
-        // la nouvelle échelle, ce qu'elles laissent passer est le gain de la
-        // limite, toujours sous l'ancien plafond (la fraction elle-même).
-        for millieme in 10..=1000u32 {
-            let s = f64::from(millieme) / 1000.0;
-            let l = LimitesDeVolume {
-                securite: Some(s),
-                confort: Some(s),
-            };
-            for demande in [0.0, 0.3, 0.7, 1.0] {
-                for origine in [OrigineDuVolume::Absolue, OrigineDuVolume::Pas] {
-                    let retenu = l.borner(demande, 0.0, origine);
-                    assert!(gain_perceptif(retenu) <= s + 1e-12, "{s} / {demande}");
-                }
-            }
-            assert!(gain_perceptif(l.borner_appareil(1.0)) <= s);
         }
     }
 }

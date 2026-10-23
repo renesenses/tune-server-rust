@@ -935,14 +935,19 @@ pub fn zone_creee_contrat_client(
         // tout seul.
         obj.insert("repeat".into(), json!(crate::playback::RepeatMode::Off));
         let vol = zone.map(|z| z.volume).unwrap_or(50.0);
+        let lineaire = vol / 100.0;
+        obj.insert("volume".into(), json!(lineaire));
         // #1274 — la lecture en dB accompagne le volume PARTOUT où il sort,
         // ici comprise : ce contrat-ci est celui d'une zone qui vient de
         // naitre, et un client qui affiche des dB ne doit pas avoir a
         // attendre le premier refetch pour en avoir un. `null` = silence.
-        // #6787 — sur l'échelle de la zone, avec `volume_curve`.
-        crate::audio::volume_scale::inserer_volume(
+        obj.insert(
+            "volume_db".into(),
+            json!(crate::audio::volume_scale::linear_to_db(lineaire)),
+        );
+        // #6787 — la loi du curseur de la zone (`volume` reste le gain).
+        crate::audio::volume_scale::inserer_courbe(
             obj,
-            vol / 100.0,
             crate::audio::volume_scale::EchelleDeVolume::de_la_sortie(
                 zone.and_then(|z| z.output_type.as_deref()),
             ),

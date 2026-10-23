@@ -842,19 +842,12 @@ pub struct LocalOutput {
 /// The consequence is deliberate and must be surfaced in the UI: **on a DSD
 /// track the volume slider does nothing.** Silently inert is a better failure
 /// than silently mute, but it is still a failure until the interface says so.
-///
-/// #6787 — `user_units` est une POSITION de curseur (millionièmes,
-/// `UNITES_DE_POSITION`), pas un gain :
-/// le gain utilisateur est [`gain_utilisateur`], la loi perceptive en dB de
-/// `audio::volume_scale`. 0 reste le silence et la pleine position l'unité
-/// exacte (le rendu, lui, reste en millièmes : 1000), de sorte
-/// que le volume fixe, PURE verrouillé et le DoP rendent toujours 1000.
 fn effective_volume_units(user_units: u32, rg_units: u32, dop: bool) -> u32 {
     if dop {
         return 1000;
     }
     let (rg_units, porte_par_l_eq) = decomposer_le_facteur_de_rendu(rg_units);
-    let user = gain_utilisateur(user_units);
+    let user = user_units as f64 / 1000.0;
     let rg = rg_units as f64 / 1000.0;
     // Clamped to unity: above it, a ReplayGain boost would push peaks past
     // full scale and the user, who never touched the slider, would hear
@@ -864,15 +857,6 @@ fn effective_volume_units(user_units: u32, rg_units: u32, dop: bool) -> u32 {
     // déjà dans ses échantillons : le produit rendu reste le même, rabot
     // compris, mais cette part-là traverse l'anneau avec le filtre.
     ((user * rg).clamp(0.0, 1.0) * 1000.0 * 1000.0 / porte_par_l_eq as f64).round() as u32
-}
-
-/// #6787 — le gain linéaire (0..1) que rend une position de curseur en
-/// millionièmes ([`crate::audio::volume_scale::UNITES_DE_POSITION`]), par la
-/// loi perceptive des sorties logicielles
-/// ([`crate::audio::volume_scale::gain_perceptif`]). Jamais au-dessus de la
-/// position elle-même, l'ancienne loi : la bascule ne monte jamais le son.
-pub(crate) fn gain_utilisateur(user_units: u32) -> f64 {
-    crate::audio::volume_scale::gain_des_unites(user_units)
 }
 
 /// #5227 — `rg_factor` porte DEUX nombres, en millièmes : le facteur
@@ -921,7 +905,7 @@ fn dire_le_clamp_a_l_unite(device: &str, user_units: u32, rg_units: u32, dop: bo
         return;
     }
     let rg_units = decomposer_le_facteur_de_rendu(rg_units).0;
-    let demande = gain_utilisateur(user_units) * (rg_units as f64 / 1000.0);
+    let demande = (user_units as f64 / 1000.0) * (rg_units as f64 / 1000.0);
     if demande <= 1.0 {
         return;
     }
@@ -1239,10 +1223,7 @@ impl LocalOutput {
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(1000)),
-            // #6787 — position de curseur, en millionièmes.
-            user_volume: Arc::new(AtomicU32::new(
-                crate::audio::volume_scale::UNITES_DE_POSITION,
-            )),
+            user_volume: Arc::new(AtomicU32::new(1000)),
             rg_factor: Arc::new(AtomicU32::new(1000)),
             replaygain_seul: AtomicU32::new(1000),
             // Même défaut que le réglage de zone : une sortie construite hors
@@ -1250,9 +1231,7 @@ impl LocalOutput {
             // facteur vaut 1 et rien ne change.
             compensation_de_niveau: AtomicBool::new(true),
             gain_moyen_dsp: Arc::new(AtomicU32::new(1000)),
-            pre_mute_volume: Arc::new(AtomicU32::new(
-                crate::audio::volume_scale::UNITES_DE_POSITION,
-            )),
+            pre_mute_volume: Arc::new(AtomicU32::new(1000)),
             muted: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
             seek_offset_ms: Arc::new(AtomicU64::new(0)),
@@ -1370,10 +1349,7 @@ impl LocalOutput {
     /// #6741 — le rapport `volume d'avant l'égaliseur / volume courant`, borné
     /// à 1 : la remontée d'un préampli gardé ne dépasse jamais le niveau
     /// d'avant l'égaliseur. Ce rapport est exact ICI : le volume de la sortie
-    /// locale est un gain numérique (`effective_volume_units`). #6787 — c'est
-    /// le rapport des GAINS que rendent les deux positions
-    /// ([`gain_utilisateur`]), pas celui des positions : sur la loi
-    /// perceptive, 400 → 500 millièmes valent +6 dB, pas +1,9 dB. 0
+    /// locale est un gain numérique linéaire (`effective_volume_units`). 0
     /// (gain gardé) sans référence ; 1 à volume nul (rien ne sort).
     fn borne_de_remontee(&self) -> f64 {
         let avant = self.volume_avant_egaliseur.load(Ordering::SeqCst);
@@ -1383,7 +1359,7 @@ impl LocalOutput {
         } else if courant == 0 {
             1.0
         } else {
-            (gain_utilisateur(avant) / gain_utilisateur(courant)).min(1.0)
+            (f64::from(avant) / f64::from(courant)).min(1.0)
         }
     }
 
@@ -1465,8 +1441,7 @@ impl LocalOutput {
             .and_then(|c| c.as_ref().map(|p| p.gain_moyen_db()))
             .filter(|db| db.is_finite())
             .unwrap_or(0.0);
-        // #6787 — le GAIN de la position, comme `effective_volume_units`.
-        let produit = gain_utilisateur(volume)
+        let produit = f64::from(volume) / 1000.0
             * f64::from(self.replaygain_seul.load(Ordering::SeqCst))
             / 1000.0
             * 10.0_f64.powf(-crossfeed_db / 20.0);
@@ -7837,8 +7812,7 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        // #6787 — la position, en millionièmes, arrondie par défaut.
-        let v = crate::audio::volume_scale::unites_de_position(volume);
+        let v = (volume.clamp(0.0, 1.0) * 1000.0) as u32;
         self.user_volume.store(v, Ordering::SeqCst);
         self.recompute_effective_volume();
         if v > 0 {
@@ -7899,8 +7873,7 @@ impl OutputTarget for LocalOutput {
                 state: TransportState::Playing,
                 position_ms: duration_ms.saturating_add(5000),
                 duration_ms,
-                volume: f64::from(self.user_volume.load(Ordering::Relaxed))
-                    / f64::from(crate::audio::volume_scale::UNITES_DE_POSITION),
+                volume: self.user_volume.load(Ordering::Relaxed) as f64 / 1000.0,
                 muted: self.muted.load(Ordering::Relaxed),
                 current_uri: self.current_uri.lock().unwrap().clone(),
                 track_title: self.track_title.lock().unwrap().clone(),
@@ -7937,8 +7910,7 @@ impl OutputTarget for LocalOutput {
                 .load(Ordering::Relaxed)
                 .saturating_sub(self.fondu_retenue_ms.load(Ordering::Relaxed)),
             duration_ms,
-            volume: f64::from(self.user_volume.load(Ordering::Relaxed))
-                / f64::from(crate::audio::volume_scale::UNITES_DE_POSITION),
+            volume: self.user_volume.load(Ordering::Relaxed) as f64 / 1000.0,
             muted: self.muted.load(Ordering::Relaxed),
             current_uri: self.current_uri.lock().unwrap().clone(),
             track_title: self.track_title.lock().unwrap().clone(),

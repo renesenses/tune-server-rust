@@ -406,64 +406,100 @@ async fn sous_pure_verrouille_baisser_ne_fait_jamais_partir_100_6721() {
     assert_eq!(recus(&state).await, vec![1.0]);
 }
 
-/// #6787 — sur une sortie LOCALE (factice), le volume est une position sur la
-/// loi perceptive : un dB demandé (consigne, limite, pas) est un dB de GAIN,
-/// et les réponses le relisent sur la même échelle (`volume_curve: db60`).
-/// Sur l'appareil réseau du banc ci-dessus, rien ne change (`linear`).
+/// #6787 — décision de Bertrand du 23/10 : sur une sortie LOCALE (factice), un
+/// volume enregistré se lit « au même niveau en dB » sur le curseur `db60`, et
+/// `volume` garde son sens historique, le GAIN :
+///
+/// - (c) un client qui applique `volume` en linéaire (app iOS #99, Flutter,
+///   client web ancien) reçoit 0,05 et joue au même niveau qu'avant, pas
+///   0,57 (+21 dB) ;
+/// - (a) la colonne `zones.volume` reste le gain : une version antérieure
+///   relit le même niveau ;
+/// - un client à jour lit le curseur (57 %), le renvoie : le niveau ne monte
+///   pas, même d'un ulp, et ne baisse pas de plus de 0,01 dB.
 #[tokio::test]
-async fn sur_une_sortie_locale_les_db_suivent_la_loi_perceptive_6787() {
+async fn sur_une_sortie_locale_volume_reste_le_gain_et_le_curseur_est_db60_6787() {
+    use tune_core::audio::volume_scale::EchelleDeVolume;
     const LOCALE: &str = "local:dac-6787";
     let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
     let app = crate::routes::router(state.clone());
-    let id = ZoneRepo::with_backend(state.backend.clone())
-        .create("Bureau", Some("local"), Some(LOCALE))
-        .unwrap();
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let id = repo.create("Bureau", Some("local"), Some(LOCALE)).unwrap();
     state.outputs.lock().await.register(Box::new(
         MockOutput::new(LOCALE, "Bureau").with_type("local"),
     ));
-    state.playback.set_volume(id, 0.2).await;
+    // La zone d'avant la mise à jour : 5 % de gain, −26 dB.
+    repo.update_volume(id, 5.0).unwrap();
+    state.playback.set_volume(id, 0.05).await;
 
-    // −30 dB demandés : la position 0,5, relue −30 dB.
+    let (statut, zone) = appeler(&app, "GET", &format!("/api/v1/zones/{id}"), json!({})).await;
+    assert_eq!(statut, StatusCode::OK, "{zone}");
+    assert_eq!(zone["volume_curve"], "db60", "{zone}");
+    assert!(
+        proche(zone["volume"].as_f64().unwrap(), 0.05),
+        "(c) `volume` doit rester le GAIN 0,05 — un client linéaire jouerait sinon plus fort : {zone}"
+    );
+    assert!(
+        (zone["volume_db"].as_f64().unwrap() + 26.0206).abs() < 1e-3,
+        "{zone}"
+    );
+
+    // Le client à jour : le curseur se lit à ~57 %…
+    let curseur = EchelleDeVolume::Perceptive.position(zone["volume"].as_f64().unwrap());
+    assert!((curseur - 0.5663).abs() < 1e-3, "{curseur}");
+    // …et, renvoyé tel quel, ne monte jamais le son.
+    let renvoye = EchelleDeVolume::Perceptive.gain(curseur);
     let (statut, rendu) = appeler(
+        &app,
+        "POST",
+        &format!("/api/v1/zones/{id}/volume"),
+        json!({ "volume": renvoye }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{rendu}");
+    assert_eq!(rendu["volume_curve"], "db60", "{rendu}");
+    let relu = rendu["volume"].as_f64().unwrap();
+    assert!(
+        relu <= 0.05,
+        "{relu} > 0,05 : le curseur relu a monté le son"
+    );
+    assert!(relu >= 0.05 * 10f64.powf(-0.01 / 20.0), "{relu}");
+    // (a) La base garde le gain, lisible tel quel par une version antérieure.
+    let en_base = repo.get(id).unwrap().unwrap().volume;
+    assert!(
+        en_base <= 5.0 && en_base >= 5.0 * 10f64.powf(-0.01 / 20.0),
+        "(a) zones.volume = {en_base} : la base doit garder le GAIN (5 %)"
+    );
+
+    // −30 dB demandés : le gain 0,0316 (curseur 50 %).
+    let (_, db) = appeler(
         &app,
         "POST",
         &format!("/api/v1/zones/{id}/volume"),
         json!({ "volume_db": -30.0 }),
     )
     .await;
-    assert_eq!(statut, StatusCode::OK, "{rendu}");
-    assert!(proche(rendu["volume"].as_f64().unwrap(), 0.5), "{rendu}");
     assert!(
-        proche(rendu["volume_db"].as_f64().unwrap(), -30.0),
-        "{rendu}"
-    );
-    assert_eq!(rendu["volume_curve"], "db60");
-
-    // Limite de sécurité à −12 dB : la fraction 0,8, publiée à −12 dB.
-    let limites = regler(&app, id, json!({ "safety_db": -12.0 })).await;
-    assert!(
-        proche(limites["volume_limit_safety"].as_f64().unwrap(), 0.8),
-        "{limites}"
-    );
-    assert!(
-        proche(limites["volume_limit_safety_db"].as_f64().unwrap(), -12.0),
-        "{limites}"
+        proche(db["volume"].as_f64().unwrap(), 10f64.powf(-1.5)),
+        "{db}"
     );
 
-    // Un pas de +6 dB depuis −30 dB : −24 dB, la position 0,6.
+    // Un pas de 5 points de curseur depuis −30 dB : −27 dB.
     let (statut, pas) = appeler(
         &app,
         "POST",
         &format!("/api/v1/zones/{id}/volume/step"),
-        json!({ "direction": "up", "step_db": 6.0 }),
+        json!({ "direction": "up", "step": 0.05 }),
     )
     .await;
     assert_eq!(statut, StatusCode::OK, "{pas}");
-    assert!(proche(pas["volume"].as_f64().unwrap(), 0.6), "{pas}");
-    assert!(proche(pas["volume_db"].as_f64().unwrap(), -24.0), "{pas}");
+    assert!(
+        (pas["volume_db"].as_f64().unwrap() + 27.0).abs() < 1e-6,
+        "{pas}"
+    );
     assert_eq!(pas["volume_curve"], "db60");
 
-    // L'appareil réseau, lui, reste sur son échelle : 50 % = −6 dB.
+    // L'appareil réseau, lui, garde son curseur linéaire.
     let (app_reseau, _state, zone_reseau) = serveur().await;
     let (_, lin) = appeler(
         &app_reseau,
@@ -473,8 +509,5 @@ async fn sur_une_sortie_locale_les_db_suivent_la_loi_perceptive_6787() {
     )
     .await;
     assert_eq!(lin["volume_curve"], "linear", "{lin}");
-    assert!(
-        (lin["volume_db"].as_f64().unwrap() + 6.0206).abs() < 1e-3,
-        "{lin}"
-    );
+    assert!(proche(lin["volume"].as_f64().unwrap(), 0.5), "{lin}");
 }

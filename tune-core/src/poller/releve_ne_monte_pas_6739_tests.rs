@@ -184,12 +184,8 @@ fn la_composition_du_trim_selon_la_sortie_6739() {
     }
     assert!(sortie_a_volume_logiciel("local"));
     // Sortie locale : le trim est un gain numérique, jamais au-dessus de 1.
-    // #6787 — un écart de GAIN sur la loi perceptive : +6 dB à 30 % rendent
-    // exactement 6 dB de plus que 30 %.
     let v = volume_appareil_avec_trim(0.3, 6.0, false);
-    let echelle = crate::audio::volume_scale::EchelleDeVolume::Perceptive;
-    let ecart = echelle.vers_db(v).unwrap() - echelle.vers_db(0.3).unwrap();
-    assert!((ecart - 6.0).abs() < 1e-9, "{ecart}");
+    assert!((v - 0.3 * 10f64.powf(6.0 / 20.0)).abs() < 1e-9);
     assert_eq!(volume_appareil_avec_trim(0.9, 12.0, false), 1.0);
     assert_eq!(volume_appareil_avec_trim(1.0, 40.0, false), 1.0);
     // Valeurs illisibles : jamais NaN sur le fil.

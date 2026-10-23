@@ -896,8 +896,7 @@ impl HorlogeDeSortie {
 /// l'écran ne pouvait pas le dire.
 #[derive(Clone)]
 pub struct GainDemande {
-    /// Volume réglé par l'utilisateur : une POSITION de curseur, en
-    /// millionièmes (`audio::volume_scale::UNITES_DE_POSITION`, #6787).
+    /// Volume réglé par l'utilisateur, en millièmes.
     pub volume_utilisateur: Arc<std::sync::atomic::AtomicU32>,
     /// Facteur ReplayGain × compensation empaqueté par
     /// `outputs::local::composer_le_facteur_de_rendu` : les 16 bits bas
@@ -915,14 +914,9 @@ impl GainDemande {
         if self.dop.load(Ordering::Relaxed) {
             return None;
         }
-        // #6787 — `volume_utilisateur` est une position de curseur : le gain
-        // demandé est celui de la loi perceptive, comme au rendu
-        // (`outputs::local::effective_volume_units`).
-        let gain = crate::audio::volume_scale::gain_des_unites(
-            self.volume_utilisateur.load(Ordering::SeqCst),
-        );
-        let facteur = f64::from(self.facteur_de_rendu.load(Ordering::SeqCst) & 0xFFFF);
-        Some((gain * facteur).round().min(f64::from(u32::MAX)) as u32)
+        let volume = u64::from(self.volume_utilisateur.load(Ordering::SeqCst));
+        let facteur = u64::from(self.facteur_de_rendu.load(Ordering::SeqCst) & 0xFFFF);
+        Some(((volume * facteur + 500) / 1000).min(u64::from(u32::MAX)) as u32)
     }
 }
 
