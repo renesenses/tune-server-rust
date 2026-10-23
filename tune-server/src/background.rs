@@ -125,6 +125,10 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     );
     spawn_mp3_duration_repair(state);
     spawn_rattrapage_genres_d_album(state);
+    // #6773 — noms de tri des artistes : rattrapage MusicBrainz des fiches
+    // déjà identifiées, puis déduction « Nom, Prénom ». Un test de câblage
+    // garde la ligne.
+    spawn_rattrapage_noms_de_tri(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config);
     spawn_social_sharing_listener(state);
@@ -220,6 +224,109 @@ fn spawn_rattrapage_genres_d_album(state: &AppState) {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         if let Err(e) = tune_core::db::genre_album_pistes::rattraper_les_genres_tenus(&backend) {
             warn!(error = %e, "rattrapage_genres_tenus_5314_echoue");
+        }
+    });
+}
+
+/// #6773 — le réglage qui marque le rattrapage MusicBrainz des noms de tri
+/// comme fini, et son curseur de reprise.
+const RATTRAPAGE_NOMS_DE_TRI_FAIT: &str = "rattrapage_noms_de_tri_6773_fait";
+const RATTRAPAGE_NOMS_DE_TRI_CURSEUR: &str = "rattrapage_noms_de_tri_6773_curseur";
+/// Fiches par tour : au créneau d'une requête par seconde, un peu plus d'une
+/// minute de MusicBrainz, puis la main aux autres passes.
+const RATTRAPAGE_NOMS_DE_TRI_PAR_TOUR: usize = 60;
+
+/// #6773 — les noms de tri des artistes qui n'en ont pas.
+///
+/// 1. La DÉDUCTION « Nom, Prénom » (sans réseau) pour les artistes sans MBID
+///    ni nom de tri, à chaque démarrage : une requête sur une base déjà
+///    rattrapée.
+/// 2. Le RATTRAPAGE MusicBrainz, UNE fois : les artistes déjà identifiés
+///    (MBID connu) avant que l'identification pose le nom de tri. Mêmes
+///    gardes que la passe automatique des crédits : droit d'enrichissement
+///    automatique, pause « Enrichissement », limiteur MusicBrainz partagé.
+///    Curseur en base : un arrêt ou une panne reprend où il s'était arrêté.
+fn spawn_rattrapage_noms_de_tri(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        let backend = state.backend.clone();
+        let deduction = backend.clone();
+        match tokio::task::spawn_blocking(move || {
+            tune_core::metadata::noms_de_tri::deduire_les_noms_de_tri(&deduction)
+        })
+        .await
+        {
+            Ok(Err(e)) => warn!(error = %e, "noms_de_tri_deduction_echouee"),
+            Err(e) => warn!(error = %e, "noms_de_tri_deduction_echouee"),
+            Ok(Ok(_)) => {}
+        }
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+        if reglages
+            .get(RATTRAPAGE_NOMS_DE_TRI_FAIT)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        loop {
+            if !state
+                .license
+                .check_feature(tune_core::license::Feature::AutoEnrichment)
+                .await
+            {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                continue;
+            }
+            if tune_core::taches_de_fond::est_en_pause(
+                tune_core::taches_de_fond::Tache::Enrichissement,
+            ) {
+                tokio::time::sleep(tune_core::taches_de_fond::CADENCE_RELECTURE_PAUSE).await;
+                continue;
+            }
+            let apres = reglages
+                .get(RATTRAPAGE_NOMS_DE_TRI_CURSEUR)
+                .ok()
+                .flatten()
+                .and_then(|c| c.parse::<i64>().ok())
+                .unwrap_or(0);
+            let bilan = match tune_core::metadata::noms_de_tri::rattraper_par_musicbrainz(
+                &backend,
+                apres,
+                RATTRAPAGE_NOMS_DE_TRI_PAR_TOUR,
+                tune_core::metadata::noms_de_tri::interroger_la_fiche_musicbrainz,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "noms_de_tri_rattrapage_echoue");
+                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                    continue;
+                }
+            };
+            info!(
+                traitees = bilan.traitees,
+                poses = bilan.poses,
+                ecartees = bilan.ecartees,
+                pannes = bilan.pannes,
+                fin_de_liste = bilan.fin_de_liste,
+                "noms_de_tri_rattrapage_tour"
+            );
+            reglages
+                .set(
+                    RATTRAPAGE_NOMS_DE_TRI_CURSEUR,
+                    &bilan.dernier_id.to_string(),
+                )
+                .ok();
+            if bilan.fin_de_liste {
+                reglages.set(RATTRAPAGE_NOMS_DE_TRI_FAIT, "1").ok();
+                return;
+            }
+            // Une panne MusicBrainz : on laisse le limiteur se calmer.
+            let pause = if bilan.pannes > 0 { 600 } else { 5 };
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
         }
     });
 }
@@ -3597,6 +3704,21 @@ mod tests_licence_proprietaire_battement {
         assert!(
             source[debut..fin].contains("routes::system::sauvegarde_cloud::spawn(state);"),
             "la passe de sauvegarde cloud n'est plus lancee au demarrage"
+        );
+    }
+
+    /// #6773 — sans cet appel, le rattrapage des noms de tri serait du code
+    /// mort : les artistes déjà identifiés resteraient rangés à leur prénom.
+    #[test]
+    fn le_rattrapage_des_noms_de_tri_est_lance_6773() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains(concat!("spawn_rattrapage_noms_", "de_tri(state);")),
+            "le rattrapage des noms de tri n'est plus lancé au démarrage"
         );
     }
 
