@@ -1686,6 +1686,10 @@ mod patch_zone_error_guard;
 #[cfg(test)]
 mod persister_le_patch_tests;
 
+/// #6774 — changer l'appareil d'une zone remet son trim à 0 dB.
+#[cfg(test)]
+mod reglages_suivent_l_appareil_6774_tests;
+
 /// Garde-fou #2092 : les charges utiles d'une zone ne doivent plus diverger.
 ///
 /// L'état d'aléatoire et de répétition appartient à la zone et **survit aux

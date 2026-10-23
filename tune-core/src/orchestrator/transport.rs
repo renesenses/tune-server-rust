@@ -566,6 +566,10 @@ impl PlaybackOrchestrator {
             }
             repo.update_output_type(zone_id, &new_type)?;
             repo.update_online(zone_id, true)?;
+            // #6774 — PURE / volume fixe désarmés par le rebond : l'état de
+            // lecture ne reste pas au-dessus de la base.
+            crate::audio::reglages_de_volume::aligner_la_lecture(&self.db, &self.playback, zone_id)
+                .await;
             info!(
                 zone_id,
                 zone_name = %zone.name,
@@ -996,18 +1000,7 @@ impl PlaybackOrchestrator {
         // Trigger prefetch of the next track in the background.
         // This runs concurrently with the current playback so the next
         // streaming track is already decoded in memory when needed.
-        {
-            let prefetch = self.prefetch.clone();
-            let db = self.db.clone();
-            let services = self.services.clone();
-            let playback = self.playback.clone();
-            let zone_id = req.zone_id;
-            tokio::spawn(async move {
-                prefetch
-                    .prefetch_next(db, services, playback, zone_id)
-                    .await;
-            });
-        }
+        self.lancer_le_prechargement(req.zone_id);
 
         Ok(PlayResult {
             stream_url: Some(resolved.url),

@@ -2006,6 +2006,9 @@ pub struct TransformationsReelles {
     /// #6057 — la sortie a réordonné des voies à nombre de canaux égal,
     /// selon la disposition que le fichier déclare.
     reorganisation_canaux: bool,
+    /// tune-server-rust#6741 — un égaliseur COUPÉ applique encore son
+    /// préampli : `(centièmes de dB, en retour)`. `None` hors de ce cas.
+    preampli_garde: Option<(i32, bool)>,
 }
 
 impl TransformationsReelles {
@@ -2020,7 +2023,28 @@ impl TransformationsReelles {
             dsp_actif,
             fondu_enchaine: false,
             reorganisation_canaux: false,
+            preampli_garde: None,
         }
+    }
+
+    /// tune-server-rust#6741 — la même déclaration, en disant qu'un
+    /// égaliseur coupé applique encore son préampli (`db`, négatif dans le
+    /// cas normal), et s'il est en train de revenir au niveau d'avant
+    /// l'égaliseur. Additif, comme [`Self::avec_reorganisation_canaux`].
+    #[must_use]
+    pub fn avec_preampli_garde(mut self, db: f64, en_retour: bool) -> Self {
+        self.preampli_garde = db
+            .is_finite()
+            .then(|| ((db * 100.0).round() as i32, en_retour));
+        self
+    }
+
+    /// tune-server-rust#6741 — le préampli qu'un égaliseur coupé applique
+    /// encore, en dB, et s'il revient vers le niveau d'avant l'égaliseur.
+    #[must_use]
+    pub fn preampli_garde(&self) -> Option<(f64, bool)> {
+        self.preampli_garde
+            .map(|(centiemes, en_retour)| (f64::from(centiemes) / 100.0, en_retour))
     }
 
     /// #6057 — la même déclaration, en disant si la sortie RÉORDONNE des

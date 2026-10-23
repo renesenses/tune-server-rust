@@ -281,6 +281,10 @@ async fn hot_swap_zone(
     if let Err(e) = zone_repo.update_output_device(id, &body.output_device_id) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+    // #6774 — PURE / volume fixe désarmés par le changement d'appareil :
+    // l'état de lecture ne reste pas au-dessus de la base.
+    tune_core::audio::reglages_de_volume::aligner_la_lecture(&state.backend, &state.playback, id)
+        .await;
     if let Some(ref ot) = body.output_type {
         zone_repo.update_output_type(id, ot).ok();
     }
@@ -786,6 +790,13 @@ async fn activate_zone_profile(
 
         if let Some(device_id) = zc.get("output_device_id").and_then(|v| v.as_str()) {
             zone_repo.update_output_device(zone_id, device_id).ok();
+            // #6774 — même règle que le hot-swap.
+            tune_core::audio::reglages_de_volume::aligner_la_lecture(
+                &state.backend,
+                &state.playback,
+                zone_id,
+            )
+            .await;
         }
         if let Some(ot) = zc.get("output_type").and_then(|v| v.as_str()) {
             zone_repo.update_output_type(zone_id, ot).ok();

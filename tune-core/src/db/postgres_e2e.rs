@@ -1699,6 +1699,14 @@ async fn pg_config_backup_zones_volume_fixe() {
     scenarios_zones::temoin_une_sauvegarde_desarmee_repose_son_volume(&db);
     scenarios_zones::temoin_les_autres_champs_du_bloc_ne_bougent_pas(&db);
 
+    // #6774 — la restauration suit l'appareil, pas le numéro de zone.
+    use crate::config_backup::scenarios_restauration_6774 as r6774;
+    r6774::le_trim_suit_l_appareil_et_non_le_numero(&db);
+    r6774::un_reglage_sans_zone_n_est_pas_ecrit(&db);
+    r6774::le_meme_nom_ne_suffit_pas(&db);
+    r6774::la_mac_retrouve_l_appareil(&db);
+    r6774::sans_identite_aucun_reglage_de_volume(&db);
+
     // #4927 — joues ICI plutot que dans une epreuve a part : une autre
     // epreuve `pg_config_backup_*` en parallele viderait `playlists` et
     // `tracks` par son `reset_schema` au milieu de l'aller-retour.

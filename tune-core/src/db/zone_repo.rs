@@ -2086,7 +2086,14 @@ impl ZoneRepo {
                     // `output_device_id` d'abord : c'est LUI l'identite de la
                     // zone, et tout ce qui s'y accroche suit la ligne, pas la
                     // clef. L'identifiant d'endpoint est deja le bon.
-                    self.update_output_device(zone_id, &nouveau_device_id)?;
+                    // #6774 — même endpoint : même périphérique, tout reste.
+                    self.changer_d_appareil(
+                        zone_id,
+                        &nouveau_device_id,
+                        crate::audio::reglages_de_volume::Rattachement::MemePeripherique {
+                            origine: "identite_de_sortie_reassocie",
+                        },
+                    )?;
                     rapport.reassociees.push(Reassociation {
                         zone_id,
                         ancien_device_id,
@@ -2124,11 +2131,93 @@ impl ZoneRepo {
         Ok(())
     }
 
+    /// Change l'appareil d'une zone, SANS preuve que c'est le même (#6774).
+    ///
+    /// Un autre identifiant est traité comme un AUTRE appareil : le trim de
+    /// la zone repart de 0 dB (voir [`Self::changer_d_appareil`]). Un chemin
+    /// qui sait prouver l'identité (même MAC, même endpoint local) appelle
+    /// [`Self::changer_d_appareil`] avec sa preuve.
     pub fn update_output_device(&self, id: i64, device_id: &str) -> Result<(), String> {
+        self.changer_d_appareil(
+            id,
+            device_id,
+            crate::audio::reglages_de_volume::Rattachement::SansPreuve {
+                origine: "update_output_device",
+                mac: None,
+            },
+        )
+    }
+
+    /// #6774 — le seul point d'écriture de `output_device_id` sur une zone
+    /// existante. Les réglages `zone_{id}_*` suivent la LIGNE : quand le nouvel
+    /// identifiant désigne un AUTRE appareil
+    /// ([`crate::audio::reglages_de_volume::meme_appareil`]), PURE verrouillé
+    /// et volume fixe sont désarmés, le volume de la zone ne remonte jamais, un
+    /// trim POSITIF repart de 0 dB et un trim négatif reste
+    /// ([`crate::audio::reglages_de_volume::ajuster_au_changement_d_appareil`],
+    /// décisions de Bertrand du 22/10). Les limites restent. Le même appareil
+    /// (identifiant inchangé, même MAC normalisée, même endpoint local) garde
+    /// tout. L'appelant qui tient l'état de lecture le réaligne ensuite
+    /// ([`crate::audio::reglages_de_volume::aligner_la_lecture`]).
+    pub fn changer_d_appareil(
+        &self,
+        id: i64,
+        device_id: &str,
+        rattachement: crate::audio::reglages_de_volume::Rattachement<'_>,
+    ) -> Result<(), String> {
+        let avant = self.appareil_et_mac(id);
         let sql = self.update_field_sql("output_device_id");
         let params: [&dyn ToSqlValue; 2] = [&device_id, &id];
         self.db.execute(&sql, &params)?;
+        if let Some((ancien, mac)) = avant
+            && !crate::audio::reglages_de_volume::meme_appareil(
+                ancien.as_deref(),
+                mac.as_deref(),
+                device_id,
+                &rattachement,
+            )
+        {
+            crate::audio::reglages_de_volume::ajuster_au_changement_d_appareil(
+                &self.db,
+                id,
+                ancien.as_deref(),
+                device_id,
+                rattachement.origine(),
+            );
+        }
         Ok(())
+    }
+
+    /// `(output_device_id, mac)` de la ligne `id`, masquée ou non ; `None`
+    /// si la ligne n'existe pas. Une base antérieure à la colonne `mac` rend
+    /// une MAC absente plutôt qu'une erreur.
+    fn appareil_et_mac(&self, id: i64) -> Option<(Option<String>, Option<String>)> {
+        let p = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        let texte = |v: Option<&SqlValue>| {
+            v.and_then(|v| v.as_string())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let ligne = self
+            .db
+            .query_one_strong(
+                &format!("SELECT output_device_id FROM zones WHERE id = {p}"),
+                &params,
+            )
+            .ok()
+            .flatten()?;
+        let ancien = texte(ligne.first());
+        let mac = self
+            .db
+            .query_one_strong(&format!("SELECT mac FROM zones WHERE id = {p}"), &params)
+            .ok()
+            .flatten()
+            .and_then(|l| texte(l.first()));
+        Some((ancien, mac))
     }
 
     pub fn update_output_type(&self, id: i64, output_type: &str) -> Result<(), String> {
@@ -2706,10 +2795,18 @@ impl ZoneRepo {
     /// back with a new UPnP UUID: host-based dedup keeps the existing zone (and
     /// its per-zone settings: native FLAC, volume…) instead of spawning a
     /// duplicate, so the device_id is refreshed to the live one.
+    ///
+    /// #6774 — même règle que [`Self::update_output_device`] : sans preuve,
+    /// un autre identifiant est un autre appareil (trim remis à 0 dB).
     pub fn update_device_id(&self, id: i64, device_id: &str) -> Result<(), String> {
-        let sql = self.update_field_sql("output_device_id");
-        let params: [&dyn ToSqlValue; 2] = [&device_id, &id];
-        self.db.execute(&sql, &params).map(|_| ())
+        self.changer_d_appareil(
+            id,
+            device_id,
+            crate::audio::reglages_de_volume::Rattachement::SansPreuve {
+                origine: "update_device_id",
+                mac: None,
+            },
+        )
     }
 
     /// Find an existing (non-hidden) DLNA/OpenHome zone by physical host (IP),
@@ -3208,6 +3305,10 @@ fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
 #[cfg(test)]
 #[path = "zone_navigateur_jumelle_3067_tests.rs"]
 mod zone_navigateur_jumelle_3067_tests;
+
+#[cfg(test)]
+#[path = "reglages_suivent_l_appareil_6774_tests.rs"]
+mod reglages_suivent_l_appareil_6774_tests;
 
 #[cfg(test)]
 mod tests {

@@ -225,6 +225,80 @@ impl OpenHomeOutput {
         Ok(())
     }
 
+    /// #6718 — ce que le renderer ANNONCE savoir lire, au format d'un Sink
+    /// UPnP (`http-get:*:audio/L16;rate=44100;channels=2:*`, …).
+    ///
+    /// D'abord l'action `ProtocolInfo` du service OpenHome `Playlist:1`, qui
+    /// rend exactement cette liste ; sinon le `GetProtocolInfo` du
+    /// `ConnectionManager` UPnP, quand l'appareil en publie un dans le même
+    /// descriptif. Une liste vide veut dire « rien d'annoncé ».
+    async fn protocol_info(&self) -> Result<Vec<String>, String> {
+        let decouper = |liste: String| -> Vec<String> {
+            liste
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let mut erreur = None;
+        if let Some(url) = self.svc_url("playlist") {
+            match self.soap_call(url, SVC_PLAYLIST, "ProtocolInfo", &[]).await {
+                Ok(reponse) => {
+                    if let Some(liste) = extract_tag(&reponse, "Value")
+                        && !liste.trim().is_empty()
+                    {
+                        return Ok(decouper(liste));
+                    }
+                }
+                Err(e) => erreur = Some(e),
+            }
+        }
+        if let Some(url) = self.svc_url("connectionmanager") {
+            let reponse = self
+                .soap_call(
+                    url,
+                    "urn:schemas-upnp-org:service:ConnectionManager:1",
+                    "GetProtocolInfo",
+                    &[],
+                )
+                .await?;
+            return Ok(extract_tag(&reponse, "Sink")
+                .map(decouper)
+                .unwrap_or_default());
+        }
+        match erreur {
+            Some(e) => Err(e),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// #6718 — les capacités du renderer, lues dans ce qu'il annonce, avec la
+    /// MÊME lecture que la sonde DLNA. C'est ce qui ouvre le WAV progressif
+    /// (#5080) à un renderer OpenHome qui annonce le LPCM : avant, la réponse
+    /// par type (« inconnu ») imposait le pré-transcodage complet de toute
+    /// piste traitée.
+    pub async fn probe_capabilities(&self) -> super::dlna::RendererCapabilities {
+        match self.protocol_info().await {
+            Ok(sink) if !sink.is_empty() => {
+                info!(
+                    device = %self.name,
+                    entrees = sink.len(),
+                    sink = %sink.join(","),
+                    "oh_protocol_info_sonde"
+                );
+                super::dlna::renderer_caps_from_sink(sink)
+            }
+            Ok(_) => {
+                warn!(device = %self.name, "oh_protocol_info_vide");
+                super::dlna::RendererCapabilities::inconclusive("empty_sink")
+            }
+            Err(e) => {
+                warn!(device = %self.name, error = %e, "oh_protocol_info_echec");
+                super::dlna::RendererCapabilities::inconclusive("soap_failed")
+            }
+        }
+    }
+
     async fn select_playlist_source(&self) {
         let Some(url) = self.svc_url("product") else {
             info!(device = %self.name, "oh_source_no_product_service");

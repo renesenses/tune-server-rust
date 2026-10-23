@@ -41,6 +41,7 @@ pub mod release_type;
 pub mod suggestions;
 // Le MBID des artistes par une recherche MusicBrainz confirmée (#4805, étape C).
 pub mod artistes_par_le_reseau;
+pub mod noms_de_tri;
 pub mod tag_writer;
 pub mod wikidata;
 

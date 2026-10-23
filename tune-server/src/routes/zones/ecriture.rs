@@ -352,6 +352,22 @@ async fn persister_le_patch(
     body: &PatchZone,
 ) -> Result<(), axum::response::Response> {
     persister_la_zone_et_sa_sortie(state, repo, id, body)?;
+    // #6774 — un changement d'appareil a pu désarmer PURE ou le volume fixe
+    // et ramener le volume de la zone : l'état de lecture en mémoire suit la
+    // base (il ne fait que baisser), et la suite du PATCH lit la zone RELUE.
+    let zone_relue;
+    let zone_before = if body.output_device_id.is_some() {
+        tune_core::audio::reglages_de_volume::aligner_la_lecture(
+            &state.backend,
+            &state.playback,
+            id,
+        )
+        .await;
+        zone_relue = repo.get(id).ok().flatten();
+        zone_relue.as_ref().unwrap_or(zone_before)
+    } else {
+        zone_before
+    };
     persister_le_volume_fixe(state, repo, id, zone_before, command_device_id, body).await?;
     persister_la_lecture(state, repo, id, body)?;
     persister_le_reseau(state, repo, id, body).await?;
@@ -422,6 +438,17 @@ async fn persister_le_volume_fixe(
 ) -> Result<(), axum::response::Response> {
     lier_ecrire_a!(state, id, $);
     if let Some(fixed) = body.fixed_volume {
+        // #6774 — le même PATCH vient de changer d'appareil et de désarmer le
+        // volume fixe : le réarmer exige la confirmation, comme tout armement.
+        // Sans elle, la demande est ignorée — la zone reste désarmée et
+        // l'utilisateur réarme lui-même.
+        if fixed_volume_confirmation_required(zone_before, body) {
+            warn!(
+                zone_id = id,
+                "fixed_volume_rearmement_ignore_changement_d_appareil"
+            );
+            return Ok(());
+        }
         // #2395 — le mode bit-perfect fait UN saut, annoncé et réversible.
         //
         // Seules les TRANSITIONS agissent : un PATCH qui réaffirme l'état

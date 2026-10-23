@@ -97,9 +97,20 @@ pub fn rendre_les_pistes_en_echec(backend: &Arc<dyn DbBackend>) -> Result<Pistes
 /// raccourcit le prochain repos.
 static REVEIL: LazyLock<Notify> = LazyLock::new(Notify::new);
 
+/// Réveils demandés depuis le démarrage : lu par les témoins de
+/// `POST /system/replaygain/analyze` (#6778), qui doivent prouver que le
+/// geste réveille VRAIMENT la boucle, pas seulement qu'il répond 202.
+static REVEILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Réveiller la cascade si elle dort au repos.
 pub fn reveiller_la_cascade() {
+    REVEILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     REVEIL.notify_one();
+}
+
+/// Combien de réveils ont été demandés depuis le démarrage du processus.
+pub fn nombre_de_reveils() -> u64 {
+    REVEILS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Le repos de la boucle de fond : [`super::IDLE_SLEEP_SECS`], ou moins si

@@ -46,6 +46,11 @@ pub mod titre_radio_2991;
 #[path = "dlna_volume_illisible_5662.rs"]
 pub(crate) mod volume_illisible_5662;
 
+/// #6008 (rc7, fil 2401) — une hausse de l'appareil corrigée aussi hors de la
+/// fenêtre d'après pose, sur un appareil qui porte la règle.
+#[path = "dlna_volume_hors_fenetre_6008.rs"]
+pub(crate) mod hors_fenetre_6008;
+
 #[cfg(test)]
 #[path = "dlna_journal_volume_tests_5575.rs"]
 mod journal_volume_tests_5575;
@@ -528,6 +533,9 @@ pub struct DlnaOutput {
     /// #4971 — boîte noire du contact SOAP : derniers échanges, perte et
     /// retour du renderer portés au journal INFO une fois par bascule.
     contact: std::sync::Mutex<super::dlna_contact::JournalDeContact>,
+    /// #6599 — empreinte du dernier Sink porté au journal : chaque renderer
+    /// y laisse son `GetProtocolInfo` une fois, puis à chaque changement.
+    sink_journalise: std::sync::Mutex<Option<u64>>,
     /// Bornes et mémoire de la redécouverte ciblée (#3829).
     redecouverte: Redecouverte,
     client: Client,
@@ -634,6 +642,11 @@ pub struct DlnaOutput {
     /// #6008 — instant de la dernière pose d'URI acceptée. Ouvre la fenêtre
     /// pendant laquelle un volume remonté par l'appareil est corrigé.
     uri_posee_a: std::sync::Mutex<Option<std::time::Instant>>,
+    /// #6008 (rc7, fil 2401) — instant du dernier `SetVolume` DEMANDÉ par
+    /// Tune. Hors de la fenêtre d'après pose, une hausse n'est corrigée
+    /// qu'au-delà d'une grâce qui suit cette demande : une lecture faite
+    /// pendant un glissement de curseur n'est pas un saut de l'appareil.
+    volume_demande_a: std::sync::Mutex<Option<std::time::Instant>>,
     /// #5793 — URL du SCPD de `RenderingControl`, telle que le descriptif de
     /// l'appareil l'annonce. `None` : sortie construite sans descriptif, le
     /// profil standard s'applique.
@@ -819,6 +832,7 @@ impl DlnaOutput {
             derniere_position_ms: AtomicU64::new(u64::MAX),
             dernier_volume_pct: AtomicU64::new(u64::MAX),
             uri_posee_a: std::sync::Mutex::new(None),
+            volume_demande_a: std::sync::Mutex::new(None),
             scpd_rendering_control: std::sync::RwLock::new(None),
             profil_volume: tokio::sync::OnceCell::new(),
             scpd_av_transport: std::sync::RwLock::new(None),
@@ -832,6 +846,7 @@ impl DlnaOutput {
             duree_annoncee: tokio::sync::Mutex::new(None),
             pose_courante: std::sync::Mutex::new(None),
             contact: std::sync::Mutex::new(super::dlna_contact::JournalDeContact::default()),
+            sink_journalise: std::sync::Mutex::new(None),
         }
     }
 
@@ -1415,14 +1430,21 @@ impl DlnaOutput {
     /// [`HAUSSE_QUI_APPREND`] apprend la règle ; un appareil qui la porte voit
     /// toute hausse de plus de 2 points corrigée sur-le-champ, et le sondeur
     /// reçoit le volume réimposé, pas le saut.
-    async fn volume_apres_controle_d_uri(&self, lu: f64) -> f64 {
+    ///
+    /// #6008 (rc7, fil 2401) — sur un appareil qui PORTE déjà la règle, la
+    /// hausse se corrige aussi hors de la fenêtre, tant que Tune lit : voir
+    /// [`hors_fenetre_6008`].
+    async fn volume_apres_controle_d_uri(&self, lu: f64, lecture_de_tune: bool) -> f64 {
         let dans_la_fenetre = self
             .uri_posee_a
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some_and(|t| t.elapsed() <= FENETRE_VOLUME_APRES_URI);
         let connu = self.volume_connu();
-        let (true, Some(connu)) = (dans_la_fenetre, connu) else {
+        if !dans_la_fenetre {
+            return self.volume_hors_fenetre(lu, connu, lecture_de_tune).await;
+        }
+        let Some(connu) = connu else {
             return lu;
         };
         // Seule une HAUSSE se corrige : une baisse dans la fenêtre est plus
@@ -3141,6 +3163,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
+        self.noter_demande_de_volume();
         if let Some(ip) = &self.micromega_ip {
             let target_vol = volume * 100.0;
             let msg = format!("GET /volume HTTP/1.0\r\n\r\nvolume={target_vol:.1}\r\n");
@@ -3339,7 +3362,10 @@ impl OutputTarget for DlnaOutput {
             // #6008 — même en silence : un saut de volume se corrige. Aucune
             // action ne part tant que l'appareil ne remonte pas son volume.
             let volume = match evt_volume {
-                Some(_) => self.volume_apres_controle_d_uri(volume).await,
+                Some(_) => {
+                    let de_tune = self.lecture_de_tune(etat, evt_uri.as_deref());
+                    self.volume_apres_controle_d_uri(volume, de_tune).await
+                }
                 None => volume,
             };
             return Ok(OutputStatus {
@@ -3423,7 +3449,8 @@ impl OutputTarget for DlnaOutput {
                 // dispense pas d'avoir un volume juste.
                 None => self.lire_volume().await?,
             };
-            let volume = self.volume_apres_controle_d_uri(volume).await;
+            let de_tune = self.lecture_de_tune(etat, current_uri.as_deref());
+            let volume = self.volume_apres_controle_d_uri(volume, de_tune).await;
 
             return Ok(OutputStatus {
                 state: etat,
@@ -3449,8 +3476,10 @@ impl OutputTarget for DlnaOutput {
         // un quart du trafic SOAP envoyé au renderer, pour une valeur que
         // personne ne lisait (#2263). L'état coupé se lit maintenant en local.
         let volume = self.lire_volume().await?;
-        let volume = self.volume_apres_controle_d_uri(volume).await;
         let state = etat_du_transport(&transport_resp);
+        let de_tune =
+            self.lecture_de_tune(state, extract_tag(&position_resp, "TrackURI").as_deref());
+        let volume = self.volume_apres_controle_d_uri(volume, de_tune).await;
 
         let position_ms = extract_tag(&position_resp, "RelTime")
             .map(|t| Self::parse_time(&t))
@@ -3744,13 +3773,65 @@ impl DlnaOutput {
             )
             .await?;
         let sink = extract_tag(&body, "Sink").unwrap_or_default();
-        Ok(sink
+        let sink: Vec<String> = sink
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .collect())
+            .collect();
+        self.journaliser_le_sink(&sink);
+        Ok(sink)
+    }
+
+    /// #6599 — porter le Sink sondé au journal INFO, une fois par renderer et
+    /// par contenu. Le rapport de l'Eversolo A6 (fil 2356) ne contenait le
+    /// Sink d'AUCUN renderer : la cible à deux canaux ne pouvait être ni
+    /// confirmée ni contredite.
+    fn journaliser_le_sink(&self, sink: &[String]) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        sink.hash(&mut h);
+        let empreinte = h.finish();
+        {
+            let mut deja = self
+                .sink_journalise
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *deja == Some(empreinte) {
+                return;
+            }
+            *deja = Some(empreinte);
+        }
+        info!(
+            device = %self.name,
+            device_id = %self.device_id,
+            entrees = sink.len(),
+            canaux_max = ?canaux_annonces_par_le_sink(sink),
+            sink = %sink_pour_le_journal(sink),
+            "dlna_sink_sonde"
+        );
     }
 }
+
+/// #6599 — le Sink en une ligne de journal bornée : les entrées séparées par
+/// une virgule, coupées au-delà de [`SINK_JOURNAL_MAX`] octets avec le nombre
+/// d'entrées omises. Un Sink de renderer haut de gamme dépasse souvent cent
+/// entrées ; la ligne doit rester lisible dans un rapport.
+pub fn sink_pour_le_journal(sink: &[String]) -> String {
+    let mut ligne = String::new();
+    for (i, entree) in sink.iter().enumerate() {
+        let sep = if i == 0 { "" } else { "," };
+        if ligne.len() + sep.len() + entree.len() > SINK_JOURNAL_MAX {
+            ligne.push_str(&format!(" … (+{} entrées)", sink.len() - i));
+            return ligne;
+        }
+        ligne.push_str(sep);
+        ligne.push_str(entree);
+    }
+    ligne
+}
+
+/// Borne d'une ligne [`sink_pour_le_journal`], en octets.
+pub const SINK_JOURNAL_MAX: usize = 6000;
 
 #[derive(Debug, Clone, Default)]
 pub struct DsdCapability {
@@ -3919,7 +4000,7 @@ pub struct RendererCapabilities {
 }
 
 impl RendererCapabilities {
-    fn inconclusive(reason: &'static str) -> Self {
+    pub(crate) fn inconclusive(reason: &'static str) -> Self {
         Self {
             reason: Some(reason),
             ..Self::default()
@@ -3955,7 +4036,7 @@ pub fn canaux_annonces_par_le_sink(sink: &[String]) -> Option<u16> {
 
 /// Pure Sink → capabilities mapping (unit-tested; `probe_capabilities` wraps it
 /// around the SOAP call).
-fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities {
+pub(crate) fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities {
     // Param-aware match: LPCM entries carry `;rate=…;channels=…` after the MIME
     // (`audio/L16;rate=44100;channels=2`), so we compare the base MIME only.
     // Also accepts the `audio/x-…` legacy variant and the `*` wildcard, like
@@ -5976,7 +6057,30 @@ mod tests {
 /// #4573 — les canaux ANNONCÉS par le Sink, lus sur des chaînes réelles.
 #[cfg(test)]
 mod canaux_annonces_4573 {
-    use super::{canaux_annonces_par_le_sink, renderer_caps_from_sink};
+    use super::{
+        SINK_JOURNAL_MAX, canaux_annonces_par_le_sink, renderer_caps_from_sink,
+        sink_pour_le_journal,
+    };
+
+    /// #6599 — la ligne du Sink garde chaque entrée lisible et reste bornée.
+    #[test]
+    fn le_sink_au_journal_est_entier_puis_borne() {
+        let court = vec![
+            "http-get:*:audio/L16;rate=44100;channels=2:*".to_string(),
+            "http-get:*:audio/flac:*".to_string(),
+        ];
+        assert_eq!(
+            sink_pour_le_journal(&court),
+            "http-get:*:audio/L16;rate=44100;channels=2:*,http-get:*:audio/flac:*"
+        );
+        let long: Vec<String> = (0..1000)
+            .map(|i| format!("http-get:*:audio/L16;rate={i};channels=2:*"))
+            .collect();
+        let ligne = sink_pour_le_journal(&long);
+        assert!(ligne.len() <= SINK_JOURNAL_MAX + 40, "{}", ligne.len());
+        assert!(ligne.ends_with("entrées)"), "{ligne}");
+        assert!(ligne.starts_with("http-get:*:audio/L16;rate=0;channels=2:*,"));
+    }
 
     fn v(entrees: &[&str]) -> Vec<String> {
         entrees.iter().map(|e| e.to_string()).collect()

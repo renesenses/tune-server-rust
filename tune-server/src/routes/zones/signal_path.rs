@@ -1652,6 +1652,25 @@ fn assembler_les_etapes_lang(
             "eq_non_finite_samples": metrics.eq_non_finite_samples,
         })
     });
+    // #6741 — un égaliseur COUPÉ qui applique encore son préampli le dit,
+    // chiffre compris, au lieu d'un « DSP appliqué » ambigu (#6524 b, Jean
+    // Valjean : −8,4 dB gardés, égaliseur inactif et remis à plat).
+    let preampli_garde = ps
+        .transformations_reelles
+        .as_ref()
+        .and_then(|t| t.preampli_garde())
+        .map(|(db, en_retour)| {
+            fs(
+                lang,
+                if en_retour {
+                    "preampli_en_retour"
+                } else {
+                    "preampli_garde"
+                },
+                &[&format!("{db:.1}")],
+            )
+        });
+    let eq_step_description = preampli_garde.or(eq_step_description);
     if let Some(runtime) = runtime_signal_path {
         let dsp_step = match runtime.dsp {
             OutputDspState::Applied => Some((
@@ -2032,8 +2051,11 @@ fn rendre_les_verdicts(
     // Filtré sur le verdict avec perte : un débit sur un FLAC n'aurait aucun
     // sens, et un album Bandcamp ACHETÉ en lossless ne doit surtout pas
     // hériter du chiffre de l'extrait.
+    // #6821 — une radio n'a pas de fiche : son débit est celui qu'elle annonce
+    // (`icy-br`), relevé à la connexion. Même filtre : jamais sur un FLAC.
     let bitrate_label = np
         .bitrate_kbps
+        .or(source.debit_radio_kbps)
         .filter(|kbps| *kbps > 0 && !is_lossless)
         .map(|kbps| format!(" {kbps} kbit/s"))
         .unwrap_or_default();
@@ -2743,6 +2765,9 @@ struct Source<'w> {
     /// (`StreamInfo::dsd_reconstruit_depuis_dst`, posé par la session) : DSD
     /// natif décompressé, aucune conversion PCM.
     dst_reconstruit_en_dsf: bool,
+    /// #6821 — le débit qu'une RADIO annonce (`icy-br`), relevé par la sonde.
+    /// `None` hors radio : le débit d'un fichier vient de `NowPlaying`.
+    debit_radio_kbps: Option<u32>,
 }
 
 /// The radio decoder emits 16-bit PCM and can adapt low source rates.
@@ -2805,6 +2830,7 @@ fn decrire_la_source<'w>(
             canaux_source: None,
             canaux_du_fil: None,
             dst_reconstruit_en_dsf: false,
+            debit_radio_kbps: radio.bitrate_kbps,
         };
     }
     // Verbatim proxy radios keep their existing wire/NowPlaying metadata
@@ -2976,6 +3002,7 @@ fn decrire_la_source<'w>(
             .map(|c| c as u16),
         canaux_du_fil: wire.map(|w| w.channels).filter(|c| *c > 0),
         dst_reconstruit_en_dsf: is_dsd && wire.is_some_and(|w| w.dsd_reconstruit_depuis_dst),
+        debit_radio_kbps: None,
     }
 }
 

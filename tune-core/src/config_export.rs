@@ -398,7 +398,11 @@ fn texte_a_ranger(valeur: &Value) -> String {
 
 /// Traduit un réglage qui cite des zones par leur numéro. `None` = ne pas
 /// l'écrire (il ne désignerait aucune zone du fichier).
-fn traduire_reglage(cle: &str, valeur: &Value, vers: &dyn Fn(i64) -> Option<i64>) -> Option<Value> {
+pub(crate) fn traduire_reglage(
+    cle: &str,
+    valeur: &Value,
+    vers: &dyn Fn(i64) -> Option<i64>,
+) -> Option<Value> {
     let id_de = |v: &Value| {
         v.as_i64()
             .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))

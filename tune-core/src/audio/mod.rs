@@ -119,6 +119,7 @@ pub mod pipeline;
 /// #6044 — le greffon « Réaffectation des canaux » : réglage par zone et par
 /// album, résolution de la règle qui s'applique à une piste.
 pub mod reaffectation_canaux;
+pub mod reglages_de_volume;
 pub mod replaygain;
 pub mod repli_dsd_4354;
 pub mod reprise_nouveau_flux;

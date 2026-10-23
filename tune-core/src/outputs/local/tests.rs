@@ -4169,20 +4169,23 @@ fn couper_l_egaliseur_en_vol_garde_le_niveau_du_preampli_5215() {
         "couper l'EQ fait une marche de {marche} entre deux échantillons \
          (seuil {MARCHE_MAX_5215})"
     );
-    // À 40 Hz seul le préampli agit : pendant ET après la rampe, le niveau
-    // reste celui du préampli, à 0,1 dB près.
+    // À 40 Hz seul le préampli agit : pendant la rampe de la courbe, le
+    // niveau reste celui du préampli, à 0,1 dB près.
     let bascule = 51 * TRAMES_PAR_PAQUET_5215;
-    for (debut, fin, quand) in [
-        (bascule, bascule + 4800, "pendant la rampe"),
-        (signal.len() - 1200, signal.len(), "après la rampe"),
-    ] {
-        let crete = crete_5215(&signal[debut..fin]);
-        assert!(
-            (crete / attendu - 1.0).abs() < 0.012,
-            "{quand}, couper l'EQ change le niveau : crête {crete}, attendu {attendu} \
-             (préampli {preampli:.2} dB gardé, décision du 10/10)"
-        );
-    }
+    let crete = crete_5215(&signal[bascule..bascule + 4800]);
+    assert!(
+        (crete / attendu - 1.0).abs() < 0.012,
+        "pendant la rampe, couper l'EQ change le niveau : crête {crete}, attendu {attendu} \
+         (préampli {preampli:.2} dB gardé, décision du 10/10)"
+    );
+    // #6741 (décision du 22/10) — après la rampe de la courbe, le préampli
+    // remonte vers le niveau d'avant l'égaliseur, jamais au-delà.
+    let crete = crete_5215(&signal[signal.len() - 1200..]);
+    assert!(
+        crete >= attendu * 0.988 && f64::from(crete) <= AMPLITUDE_5215 * 1.012,
+        "après la rampe : crête {crete}, attendue entre le préampli {attendu} et le niveau \
+         d'avant l'égaliseur {AMPLITUDE_5215} (#6741)"
+    );
     // L'égaliseur ne compte plus comme monté, mais le préampli reste porté.
     assert!(!sortie.has_eq());
     assert!(
@@ -4218,11 +4221,14 @@ fn le_preampli_garde_vaut_pour_les_pistes_suivantes_5215() {
         let debut = signal.len();
         signal.extend(jouer_5215(&sortie, &mut trame, 30));
         let crete = crete_5215(&signal[debut..]);
+        // #6741 (décision du 22/10) — le préampli gardé passe sur les pistes
+        // suivantes sans saut, et sa remontée s'y poursuit vers le niveau
+        // d'avant l'égaliseur, jamais au-delà.
         assert!(
-            (crete / attendu - 1.0).abs() < 0.012,
-            "piste suivante n°{piste}, égaliseur coupé : crête {crete}, attendu {attendu} \
-             (le préampli {preampli:.2} dB gardé doit valoir pour les pistes suivantes, \
-             décision du 10/10)"
+            crete >= attendu * 0.988 && f64::from(crete) <= AMPLITUDE_5215 * 1.012,
+            "piste suivante n°{piste}, égaliseur coupé : crête {crete}, attendue entre le \
+             préampli {attendu} ({preampli:.2} dB) et le niveau d'avant l'égaliseur \
+             {AMPLITUDE_5215} (#5215, #6741)"
         );
     }
     let marche = plus_grande_marche_5215(&signal);
@@ -4233,6 +4239,8 @@ fn le_preampli_garde_vaut_pour_les_pistes_suivantes_5215() {
     assert!(!sortie.has_eq(), "l'égaliseur ne compte pas comme actif");
 }
 
+/// Revu le 22/10 (#6741) : le plafond est le niveau d'avant l'égaliseur, et
+/// le préampli remonte vers lui. Texte d'origine :
 /// #6211, décision de Bertrand du 21/10 (« jamais de hausse » vaut PARTOUT,
 /// radio comprise ; elle remplace celle du 19/10 sur ce point). Radio jouée
 /// en local, préampli négatif, coupure de l'égaliseur : le niveau ne monte
@@ -4249,7 +4257,9 @@ fn radio_preampli_negatif_coupure_de_l_egaliseur_le_niveau_ne_monte_jamais_6211(
         preampli < -10.0,
         "prémisse : grosse réserve ({preampli} dB)"
     );
-    let plafond = (AMPLITUDE_5215 * 10f64.powf(preampli / 20.0)) as f32 * 1.012;
+    // #6741 (décision du 22/10) — le plafond est le niveau d'avant
+    // l'égaliseur : le préampli gardé remonte vers lui, jamais au-delà.
+    let plafond = AMPLITUDE_5215 as f32 * 1.012;
     let mut trame = 0;
     sortie.replace_eq_live(Some(eq));
     let mut signal = jouer_5215(&sortie, &mut trame, 60);
@@ -4261,9 +4271,8 @@ fn radio_preampli_negatif_coupure_de_l_egaliseur_le_niveau_ne_monte_jamais_6211(
         let crete = crete_5215(fenetre);
         assert!(
             crete <= plafond,
-            "radio, égaliseur coupé, préampli {preampli:.2} dB : le niveau est monté \
-             (crête {crete} > {plafond} à {:.1} s de la coupure) — jamais de hausse \
-             (décision du 21/10)",
+            "radio, égaliseur coupé, préampli {preampli:.2} dB : le niveau dépasse celui \
+             d'avant l'égaliseur (crête {crete} > {plafond} à {:.1} s de la coupure, #6741)",
             i as f64 * 0.1
         );
     }
@@ -4272,12 +4281,16 @@ fn radio_preampli_negatif_coupure_de_l_egaliseur_le_niveau_ne_monte_jamais_6211(
         marche <= MARCHE_MAX_5215,
         "une marche de {marche} après la coupure (seuil {MARCHE_MAX_5215})"
     );
+    let fin = crete_5215(&signal[signal.len() - 4800..]);
     assert!(
-        sortie.eq.lock().unwrap().is_some(),
-        "le préampli négatif reste gardé dans la chaîne de la radio"
+        f64::from(fin) > AMPLITUDE_5215 * 10f64.powf(preampli / 20.0) * 1.5,
+        "radio, égaliseur coupé : 4 s après, crête {fin} — le préampli doit remonter vers \
+         le niveau d'avant l'égaliseur (#6741)"
     );
 }
 
+/// Revu le 22/10 (#6741) : le préampli remonte, sans dépasser le niveau
+/// d'avant l'égaliseur. Texte d'origine :
 /// #6211 — sur une PISTE, rien ne change : la règle #5215 garde le
 /// préampli après la coupure, même bien au-delà de la rampe des radios.
 #[test]
@@ -4293,14 +4306,19 @@ fn sur_une_piste_le_preampli_reste_garde_au_dela_de_l_extinction_6211() {
     let mut signal = jouer_5215(&sortie, &mut trame, 20);
     sortie.replace_eq_live(None);
     signal.extend(jouer_5215(&sortie, &mut trame, 350));
+    // #6741 (décision du 22/10) — sur une piste aussi, le préampli remonte
+    // vers le niveau d'avant l'égaliseur, sans jamais le dépasser.
     let crete = crete_5215(&signal[signal.len() - 4800..]);
     assert!(
-        (crete / attendu - 1.0).abs() < 0.012,
-        "piste, égaliseur coupé : crête {crete}, attendu {attendu} (préampli gardé)"
+        crete > attendu * 1.5 && f64::from(crete) <= AMPLITUDE_5215 * 1.012,
+        "piste, égaliseur coupé : crête {crete}, attendue au-dessus du préampli {attendu} \
+         et jamais au-dessus du niveau d'avant l'égaliseur {AMPLITUDE_5215} (#6741)"
     );
 }
 
-/// #6524 (b), arbitrage de Bertrand du 21/10 : « jamais de hausse ».
+/// #6524 (b), arbitrage de Bertrand du 21/10 : « jamais de hausse », revu le
+/// 22/10 (#6741) : jamais au-dessus du niveau d'avant l'égaliseur, vers
+/// lequel le préampli remonte. Texte d'origine :
 /// Préampli négatif (le cas normal), coupure de l'égaliseur : la courbe
 /// s'efface, puis RIEN ne fait remonter le niveau, ni la fin du fondu, ni
 /// l'extinction, ni les pistes suivantes. Le gain reste gardé jusqu'au
@@ -4317,7 +4335,10 @@ fn preampli_negatif_coupure_de_l_egaliseur_le_niveau_ne_monte_jamais_6524() {
         preampli < -1.0,
         "prémisse : préampli négatif ({preampli} dB)"
     );
-    let plafond = (AMPLITUDE_5215 * 10f64.powf(preampli / 20.0)) as f32 * 1.012;
+    // #6741 (décision du 22/10) — le plafond est le niveau d'avant
+    // l'égaliseur : le préampli gardé remonte vers lui (−14 dB à 2 dB/s, 7 s :
+    // encore en cours 6 s après la coupure), jamais au-delà.
+    let plafond = AMPLITUDE_5215 as f32 * 1.012;
     sortie.set_eq(Some(eq));
     let mut trame = 0;
     let mut signal = jouer_5215(&sortie, &mut trame, 20);
@@ -4334,9 +4355,8 @@ fn preampli_negatif_coupure_de_l_egaliseur_le_niveau_ne_monte_jamais_6524() {
         let crete = crete_5215(fenetre);
         assert!(
             crete <= plafond,
-            "égaliseur coupé, préampli {preampli:.2} dB : le niveau est monté \
-             (crête {crete} > {plafond} à {:.1} s de la coupure) — jamais de \
-             hausse (#6524 b, arbitrage du 21/10)",
+            "égaliseur coupé, préampli {preampli:.2} dB : le niveau dépasse celui d'avant \
+             l'égaliseur (crête {crete} > {plafond} à {:.1} s de la coupure, #6524 b, #6741)",
             i as f64 * 0.1
         );
     }
@@ -4347,7 +4367,7 @@ fn preampli_negatif_coupure_de_l_egaliseur_le_niveau_ne_monte_jamais_6524() {
     );
     assert!(
         sortie.eq.lock().unwrap().is_some(),
-        "le préampli négatif reste gardé dans la chaîne"
+        "la remontée du préampli est encore en cours : il reste dans la chaîne"
     );
     assert_eq!(
         local_dsp_runtime_state(
@@ -4735,4 +4755,234 @@ async fn porter_moins_ne_change_pas_le_niveau_rendu_5215() {
             "volume {volume} : part portée {porte} hors de [1, {comp}]"
         );
     }
+}
+
+// ── #6741 : couper l'égaliseur rend le niveau d'avant, sans le dépasser ──
+
+/// Niveau RENDU d'un bloc : crête après la chaîne DSP × volume effectif de la
+/// sortie (la compensation est coupée dans ces témoins, le ReplayGain vaut 1).
+fn niveau_rendu_6741(sortie: &LocalOutput, bloc: &[f32]) -> f64 {
+    f64::from(crete_5215(bloc)) * f64::from(sortie.volume.load(Ordering::SeqCst)) / 1000.0
+}
+
+/// Joue `paquets` paquets et vérifie, fenêtre de 0,1 s par fenêtre, que le
+/// niveau rendu ne dépasse jamais `plafond` (le niveau d'avant l'égaliseur).
+/// Rend le signal joué.
+fn jouer_sous_le_plafond_6741(
+    sortie: &LocalOutput,
+    trame: &mut usize,
+    paquets: usize,
+    plafond: f64,
+    contexte: &str,
+) -> Vec<f32> {
+    let signal = jouer_5215(sortie, trame, paquets);
+    for (i, fenetre) in signal.chunks(4800).enumerate() {
+        let niveau = niveau_rendu_6741(sortie, fenetre);
+        assert!(
+            niveau <= plafond * 1.012,
+            "{contexte} : le niveau rendu {niveau:.5} dépasse celui d'avant l'égaliseur \
+             {plafond:.5} à {:.1} s — la remontée ne doit jamais le franchir (#6741)",
+            i as f64 * 0.1
+        );
+    }
+    signal
+}
+
+/// Le témoin commun piste / radio : volume 50 %, égaliseur à −12 dB de
+/// préampli activé puis coupé. Le niveau revient à celui d'avant
+/// l'égaliseur, progressivement, sans marche ni dépassement ; l'égaliseur
+/// coupé quitte alors la chaîne (bit-perfect rendu).
+async fn couper_l_egaliseur_rend_le_niveau_d_avant_6741(sans_fin: bool) {
+    use crate::outputs::traits::OutputTarget;
+    let contexte = if sans_fin { "radio" } else { "piste" };
+    let sortie = LocalOutput::new("Haut-parleurs".to_string());
+    sortie.set_compensation_de_niveau(false);
+    sortie.set_flux_sans_fin(sans_fin);
+    sortie.set_volume(0.5).await.expect("set_volume");
+    let avant = AMPLITUDE_5215 * 0.5;
+    let mut trame = 0;
+    // Le niveau d'avant l'égaliseur, mesuré.
+    let sec = jouer_5215(&sortie, &mut trame, 20);
+    assert!((niveau_rendu_6741(&sortie, &sec) / avant - 1.0).abs() < 0.012);
+
+    let eq = egaliseur_a_preampli_negatif_5215();
+    let preampli = eq.preamp_db(0).expect("préampli chiffré");
+    assert!(
+        preampli < -10.0,
+        "prémisse : grosse réserve ({preampli} dB)"
+    );
+    sortie.replace_eq_live(Some(eq));
+    jouer_sous_le_plafond_6741(&sortie, &mut trame, 60, avant, contexte);
+    sortie.replace_eq_live(None);
+    let coupure = trame;
+    // −12 dB à 2 dB/s : 6 s de remontée ; 8 s joués.
+    let signal = jouer_sous_le_plafond_6741(&sortie, &mut trame, 800, avant, contexte);
+    let marche = plus_grande_marche_5215(&signal);
+    assert!(
+        marche <= MARCHE_MAX_5215,
+        "{contexte} : une marche de {marche} après la coupure (seuil {MARCHE_MAX_5215}) — jamais un saut"
+    );
+    let a_mi_chemin = niveau_rendu_6741(&sortie, &signal[2 * 48_000..2 * 48_000 + 4800]);
+    assert!(
+        a_mi_chemin < avant * 0.9,
+        "{contexte} : 2 s après la coupure le niveau est déjà revenu ({a_mi_chemin:.4}) — pas de remontée progressive"
+    );
+    let fin = niveau_rendu_6741(&sortie, &signal[signal.len() - 4800..]);
+    assert!(
+        (fin / avant - 1.0).abs() < 0.012,
+        "{contexte} : {:.1} s après la coupure, niveau {fin:.4}, attendu {avant:.4} — couper \
+         l'égaliseur doit rendre le niveau d'avant (#6211, #6524)",
+        (trame - coupure) as f64 / TAUX_5215 as f64
+    );
+    // Rien ne reste dans la chaîne : le voyant redevient vrai.
+    jouer_5215(&sortie, &mut trame, 2);
+    if sortie
+        .eq
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|p| p.est_neutre_au_repos())
+    {
+        *sortie.eq.lock().unwrap() = None;
+    }
+    assert!(
+        sortie.preampli_garde().is_none(),
+        "{contexte} : un préampli reste appliqué après le retour au niveau d'avant"
+    );
+    assert_eq!(
+        local_dsp_runtime_state(
+            &sortie.eq,
+            &sortie.convolver,
+            &sortie.crossfeed,
+            &sortie.pure_bypass,
+            &sortie.mono_downmix,
+            false,
+        ),
+        OutputDspState::Inactive,
+        "{contexte} : plus aucun DSP n'agit"
+    );
+}
+
+#[tokio::test]
+async fn piste_couper_l_egaliseur_rend_le_niveau_d_avant_sans_le_depasser_6741() {
+    couper_l_egaliseur_rend_le_niveau_d_avant_6741(false).await;
+}
+
+#[tokio::test]
+async fn radio_couper_l_egaliseur_rend_le_niveau_d_avant_sans_le_depasser_6741() {
+    couper_l_egaliseur_rend_le_niveau_d_avant_6741(true).await;
+}
+
+/// Le cas qui demandait une BORNE : l'auditeur a monté le volume pendant
+/// que l'égaliseur jouait, pour compenser son préampli (25 % → 100 %, +12 dB).
+/// À la coupure, le signal sec à 100 % sonnerait 12 dB au-dessus du niveau
+/// d'avant l'égaliseur. La remontée s'arrête donc à ce niveau, le reste du
+/// préampli est gardé et le voyant le dit. Un geste qui ramène le volume à
+/// 25 % le laisse revenir, toujours sans dépasser.
+async fn volume_monte_pendant_l_egaliseur_la_remontee_s_arrete_au_niveau_d_avant_6741(
+    sans_fin: bool,
+) {
+    use crate::outputs::traits::OutputTarget;
+    let contexte = if sans_fin { "radio" } else { "piste" };
+    let sortie = LocalOutput::new("Haut-parleurs".to_string());
+    sortie.set_compensation_de_niveau(false);
+    sortie.set_flux_sans_fin(sans_fin);
+    sortie.set_volume(0.25).await.expect("set_volume");
+    let avant = AMPLITUDE_5215 * 0.25;
+    let mut trame = 0;
+    jouer_5215(&sortie, &mut trame, 10);
+    let eq = egaliseur_a_preampli_negatif_5215();
+    let preampli = eq.preamp_db(0).expect("préampli chiffré");
+    sortie.replace_eq_live(Some(eq));
+    jouer_5215(&sortie, &mut trame, 40);
+    sortie.set_volume(1.0).await.expect("set_volume");
+    jouer_5215(&sortie, &mut trame, 40);
+    sortie.replace_eq_live(None);
+    let signal = jouer_sous_le_plafond_6741(&sortie, &mut trame, 800, avant, contexte);
+    let fin = niveau_rendu_6741(&sortie, &signal[signal.len() - 4800..]);
+    assert!(
+        (fin / avant - 1.0).abs() < 0.02,
+        "{contexte} : la remontée doit atteindre le niveau d'avant ({avant:.4}) et s'y \
+         arrêter, mesuré {fin:.4}"
+    );
+    let garde = sortie
+        .preampli_garde()
+        .expect("le reste du préampli est gardé jusqu'au prochain réglage");
+    assert!(
+        !garde.en_retour,
+        "{contexte} : plus de rampe en cours : {garde:?}"
+    );
+    assert!(
+        (garde.db - 20.0 * 0.25_f64.log10()).abs() < 0.2,
+        "{contexte} : gardé {:.2} dB, attendu ≈ −12,04 dB (le rapport 25 % / 100 %) ; \
+         préampli d'origine {preampli:.2} dB",
+        garde.db
+    );
+    // Le prochain réglage : le volume revient à 25 %. Le gain gardé remonte
+    // jusqu'à 0 dB, sans saut, sans jamais dépasser le niveau d'avant.
+    sortie.set_volume(0.25).await.expect("set_volume");
+    let signal = jouer_sous_le_plafond_6741(&sortie, &mut trame, 800, avant, contexte);
+    let marche = plus_grande_marche_5215(&signal);
+    assert!(
+        marche <= MARCHE_MAX_5215,
+        "{contexte} : une marche de {marche} après le réglage (seuil {MARCHE_MAX_5215})"
+    );
+    let fin = niveau_rendu_6741(&sortie, &signal[signal.len() - 4800..]);
+    assert!(
+        (fin / avant - 1.0).abs() < 0.012,
+        "{contexte} : après le réglage, niveau {fin:.4}, attendu {avant:.4}"
+    );
+}
+
+#[tokio::test]
+async fn piste_volume_monte_pendant_l_egaliseur_jamais_au_dessus_du_niveau_d_avant_6741() {
+    volume_monte_pendant_l_egaliseur_la_remontee_s_arrete_au_niveau_d_avant_6741(false).await;
+}
+
+#[tokio::test]
+async fn radio_volume_monte_pendant_l_egaliseur_jamais_au_dessus_du_niveau_d_avant_6741() {
+    volume_monte_pendant_l_egaliseur_la_remontee_s_arrete_au_niveau_d_avant_6741(true).await;
+}
+
+/// Le voyant : tant que le préampli est gardé, la sortie déclare son gain
+/// dans ses transformations réelles ; le chemin du signal le nomme.
+#[tokio::test]
+async fn le_preampli_garde_se_declare_dans_les_transformations_reelles_6741() {
+    use crate::outputs::traits::{
+        AudioSpec, FormatOuvert, OutputTarget, ProfondeurPcm, TransformationsReelles,
+    };
+    let sortie = LocalOutput::new("Haut-parleurs".to_string());
+    sortie.set_compensation_de_niveau(false);
+    *sortie.transformations_reelles.lock().unwrap() = Some(TransformationsReelles::nouvelles(
+        AudioSpec::nouvelle(TAUX_5215, ProfondeurPcm::Entier24, 2).unwrap(),
+        FormatOuvert::new(TAUX_5215, 2),
+        true,
+    ));
+    sortie.set_volume(0.25).await.expect("set_volume");
+    let mut trame = 0;
+    sortie.replace_eq_live(Some(egaliseur_a_preampli_negatif_5215()));
+    jouer_5215(&sortie, &mut trame, 20);
+    assert_eq!(
+        sortie
+            .transformations_reelles()
+            .and_then(|t| t.preampli_garde()),
+        None,
+        "égaliseur actif : rien de « gardé »"
+    );
+    sortie.set_volume(1.0).await.expect("set_volume");
+    sortie.replace_eq_live(None);
+    // Le fondu de la courbe (300 ms) passé, la remontée est en cours.
+    jouer_5215(&sortie, &mut trame, 40);
+    let (db, en_retour) = sortie
+        .transformations_reelles()
+        .and_then(|t| t.preampli_garde())
+        .expect("pendant la remontée, le gain est déclaré");
+    assert!(en_retour && db < -1.0, "{db} dB, en retour {en_retour}");
+    jouer_5215(&sortie, &mut trame, 800);
+    let (db, en_retour) = sortie
+        .transformations_reelles()
+        .and_then(|t| t.preampli_garde())
+        .expect("le reste, borné par le volume, est déclaré");
+    assert!(!en_retour, "rampe finie");
+    assert!((db + 12.04).abs() < 0.2, "{db} dB gardés, attendu ≈ −12,04");
 }

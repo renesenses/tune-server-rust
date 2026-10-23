@@ -29,6 +29,7 @@
 //!   (`deobfuscate`), because users have them. Nothing produces that format
 //!   any more.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -298,7 +299,8 @@ fn build_snapshot(
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let version = crate::version().to_string();
 
-    let zones = export_zones(backend)?;
+    let mut zones = export_zones(backend)?;
+    ajouter_les_mac(backend, &mut zones);
     let (settings, eq_presets, room_profiles) = export_settings(backend)?;
     let playlists = export_playlists(backend)?;
     let favorites = export_favorites(backend)?;
@@ -391,6 +393,27 @@ pub(crate) fn export_zones(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, S
         &[],
     )?;
     Ok(rows_to_json(rows, cols))
+}
+
+/// #6774 — la MAC de l'appareil de chaque zone voyage avec la sauvegarde :
+/// c'est la seconde identité (après `output_device_id`) par laquelle la
+/// restauration retrouve l'appareil. Base antérieure à la colonne : rien
+/// n'est ajouté.
+fn ajouter_les_mac(backend: &Arc<dyn DbBackend>, zones: &mut [Value]) {
+    let Ok(lignes) = backend.query_many("SELECT id, mac FROM zones", &[]) else {
+        return;
+    };
+    let macs: HashMap<i64, String> = lignes
+        .iter()
+        .filter_map(|l| Some((l.first()?.as_i64()?, texte_de(l.get(1))?)))
+        .collect();
+    for z in zones.iter_mut() {
+        if let Some(mac) = z["id"].as_i64().and_then(|id| macs.get(&id))
+            && let Some(obj) = z.as_object_mut()
+        {
+            obj.insert("mac".into(), Value::String(mac.clone()));
+        }
+    }
 }
 
 fn export_settings(
@@ -656,8 +679,15 @@ pub fn import_config_with_secret(
         warnings: Vec::new(),
     };
 
-    report.zones_restored = import_zones(backend, &snapshot.zones, &mut report.warnings)?;
-    report.settings_restored = import_settings(backend, &snapshot.settings, &mut report.warnings)?;
+    let (zones_restored, correspondances) =
+        import_zones(backend, &snapshot.zones, &mut report.warnings)?;
+    report.zones_restored = zones_restored;
+    report.settings_restored = import_settings(
+        backend,
+        &snapshot.settings,
+        &correspondances,
+        &mut report.warnings,
+    )?;
     report.playlists_restored =
         import_playlists(backend, &snapshot.playlists, &mut report.warnings)?;
     report.favorites_restored =
@@ -760,23 +790,120 @@ fn merge_into_vault(
 /// re-arme consciemment par la route, ou pas du tout.
 const FIXED_VOLUME_JAMAIS_REARME: i64 = 0;
 
+/// #6774 — la zone d'arrivée d'une zone de la sauvegarde.
+///
+/// `sure` : l'identité de l'appareil est établie — la ligne d'arrivée porte
+/// le MÊME `output_device_id` que la zone sauvegardée, ou la même MAC. Sans
+/// cela (zone sauvegardée sans appareil), la zone ne reçoit aucun réglage de
+/// volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ZoneDArrivee {
+    pub id: i64,
+    pub sure: bool,
+}
+
+/// Numéro de zone DANS LA SAUVEGARDE → zone d'arrivée sur cette machine.
+pub(crate) type Correspondances = HashMap<i64, ZoneDArrivee>;
+
+fn texte_de(v: Option<&SqlValue>) -> Option<String> {
+    v.and_then(|v| v.as_string())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn premier_id(rows: Option<Vec<SqlValue>>) -> Option<i64> {
+    rows.and_then(|r| r.first().and_then(|v| v.as_i64()))
+}
+
+/// La zone (masquée ou non) dont l'appareil a cette MAC et ce type — une
+/// SEULE, sinon rien (même règle que le ré-ancrage par MAC, #3919).
+fn zone_par_mac(backend: &Arc<dyn DbBackend>, mac: &str, output_type: Option<&str>) -> Option<i64> {
+    let lignes = backend
+        .query_many("SELECT id, mac, output_type FROM zones", &[])
+        .ok()?;
+    let mut trouvees = lignes.iter().filter(|l| {
+        texte_de(l.get(1))
+            .and_then(|m| crate::discovery::mac::normalize_mac(&m))
+            .is_some_and(|m| m == mac)
+            && match (output_type, texte_de(l.get(2))) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
+                _ => false,
+            }
+    });
+    let seule = trouvees.next()?;
+    if trouvees.next().is_some() {
+        return None;
+    }
+    seule.first().and_then(|v| v.as_i64())
+}
+
+/// Restaure les zones et rend où chacune a atterri (#6774).
+///
+/// Rapprochement par IDENTITÉ d'appareil, jamais par nom seul :
+/// 1. même `output_device_id` → cette zone ;
+/// 2. même MAC (et même type), une seule candidate → cette zone, son
+///    identifiant actuel est gardé ;
+/// 3. zone sans appareil ici, de même nom → elle reçoit l'appareil de la
+///    sauvegarde (elle n'en avait aucun) ;
+/// 4. sinon → zone CRÉÉE pour l'appareil de la sauvegarde. Une zone locale de
+///    même nom mais d'un AUTRE appareil n'est plus jamais repointée : c'était
+///    poser les réglages d'un appareil sur un autre.
 fn import_zones(
     backend: &Arc<dyn DbBackend>,
     zones: &[Value],
-    _warnings: &mut Vec<String>,
-) -> Result<usize, String> {
+    warnings: &mut Vec<String>,
+) -> Result<(usize, Correspondances), String> {
     let mut count = 0;
+    let mut correspondances = Correspondances::new();
+    let mut cibles_vues: HashSet<i64> = HashSet::new();
     for z in zones {
         let name = z["name"].as_str().unwrap_or("Unnamed Zone");
         let name = name.to_string();
-
-        let existing = backend.query_one(
-            "SELECT id FROM zones WHERE name = ?",
-            &[&name as &dyn ToSqlValue],
-        )?;
+        let source_id = z["id"].as_i64();
 
         let output_type = z["output_type"].as_str().map(|s| s.to_string());
-        let output_device_id = z["output_device_id"].as_str().map(|s| s.to_string());
+        let output_device_id = z["output_device_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let mac = z["mac"]
+            .as_str()
+            .and_then(crate::discovery::mac::normalize_mac);
+
+        // (id, identité sûre, garder l'appareil actuel de la ligne)
+        let par_appareil = match &output_device_id {
+            Some(a) => premier_id(backend.query_one(
+                "SELECT id FROM zones WHERE output_device_id = ?",
+                &[a as &dyn ToSqlValue],
+            )?),
+            None => None,
+        };
+        let existing: Option<(i64, bool, bool)> = if let Some(id) = par_appareil {
+            Some((id, true, false))
+        } else if let Some(id) = mac
+            .as_deref()
+            .and_then(|m| zone_par_mac(backend, m, output_type.as_deref()))
+        {
+            Some((id, true, true))
+        } else {
+            premier_id(backend.query_one(
+                "SELECT id FROM zones WHERE name = ? \
+                 AND (output_device_id IS NULL OR output_device_id = '') \
+                 ORDER BY id LIMIT 1",
+                &[&name as &dyn ToSqlValue],
+            )?)
+            .map(|id| (id, output_device_id.is_some(), false))
+        };
+        if let Some((id, _, _)) = existing
+            && !cibles_vues.insert(id)
+        {
+            warn!(zone = %name, zone_id = id, "config_import_zone_deja_restauree");
+            warnings.push(format!(
+                "zone '{name}': matches a zone already restored from this backup; skipped"
+            ));
+            continue;
+        }
         // #2886 — `as_i64()` rendait None des que le volume
         // sauvegarde portait une virgule, et la restauration
         // reposait alors 50 % en travers du reglage de l'utilisateur.
@@ -812,14 +939,16 @@ fn import_zones(
         // place ce qui existe (UPDATE) ou le defaut du schema (INSERT).
         let restaurer_le_volume = z["fixed_volume"].as_i64().unwrap_or(0) == 0;
 
-        if existing.is_some() {
+        let arrivee = if let Some((id, sure, garder_l_appareil)) = existing {
             let mut affectations: Vec<&str> = Vec::with_capacity(8);
             let mut params: Vec<&dyn ToSqlValue> = Vec::with_capacity(9);
 
-            affectations.push("output_type = ?");
-            params.push(&output_type);
-            affectations.push("output_device_id = ?");
-            params.push(&output_device_id);
+            if !garder_l_appareil {
+                affectations.push("output_type = ?");
+                params.push(&output_type);
+                affectations.push("output_device_id = ?");
+                params.push(&output_device_id);
+            }
             if restaurer_le_volume {
                 affectations.push("volume = ?");
                 params.push(&volume);
@@ -834,13 +963,11 @@ fn import_zones(
             params.push(&fixed_volume);
             affectations.push("autoplay_enabled = ?");
             params.push(&autoplay_enabled);
-            params.push(&name);
+            params.push(&id);
 
-            let sql = format!(
-                "UPDATE zones SET {} WHERE name = ?",
-                affectations.join(", ")
-            );
+            let sql = format!("UPDATE zones SET {} WHERE id = ?", affectations.join(", "));
             backend.execute(&sql, &params)?;
+            ZoneDArrivee { id, sure }
         } else {
             let mut colonnes: Vec<&str> = Vec::with_capacity(9);
             let mut params: Vec<&dyn ToSqlValue> = Vec::with_capacity(9);
@@ -873,25 +1000,112 @@ fn import_zones(
                 marqueurs
             );
             backend.execute(&sql, &params)?;
+            // Relu plutôt que `last_insert_rowid` : même requête sur les deux
+            // moteurs, et l'id le plus haut de ce nom est celui qu'on vient
+            // de créer (AUTOINCREMENT / SERIAL).
+            let id = premier_id(backend.query_one_strong(
+                "SELECT MAX(id) FROM zones WHERE name = ?",
+                &[&name as &dyn ToSqlValue],
+            )?)
+            .ok_or_else(|| format!("zone '{name}': created but not found"))?;
+            cibles_vues.insert(id);
+            ZoneDArrivee {
+                id,
+                sure: output_device_id.is_some(),
+            }
+        };
+
+        // Une zone sans identité sûre revient au NEUTRE : aucun réglage de
+        // volume ne lui est restauré, et ceux qui traînaient sous son numéro
+        // sont retirés.
+        if !arrivee.sure {
+            let retirees = crate::audio::reglages_de_volume::neutraliser(backend, arrivee.id);
+            warn!(
+                zone = %name,
+                zone_id = arrivee.id,
+                source_id = ?source_id,
+                retirees = ?retirees,
+                "config_import_zone_sans_identite_reglages_de_volume_neutres"
+            );
+            warnings.push(format!(
+                "zone '{name}': no device identity in the backup; volume settings \
+                 (trim, limits, PURE) were not restored"
+            ));
+        }
+        if let Some(source) = source_id {
+            correspondances.insert(source, arrivee);
         }
         count += 1;
     }
-    Ok(count)
+    Ok((count, correspondances))
 }
 
+/// Restaure les réglages. Les réglages de zone (`zone_{id}_…`,
+/// `dac_profile_{id}`…) sont réécrits sous le numéro de la zone D'ARRIVÉE
+/// (#6774) : sous le numéro d'origine, ils tombaient sur la zone qui porte ce
+/// numéro ICI — une autre, d'un autre appareil. Ceux d'une zone absente de la
+/// sauvegarde ne sont pas écrits ; les réglages de volume d'une zone sans
+/// identité sûre non plus.
 fn import_settings(
     backend: &Arc<dyn DbBackend>,
     settings_list: &[(String, String)],
-    _warnings: &mut Vec<String>,
+    correspondances: &Correspondances,
+    warnings: &mut Vec<String>,
 ) -> Result<usize, String> {
     let settings = SettingsRepo::with_backend(backend.clone());
+    let vers = |source: i64| correspondances.get(&source).map(|a| a.id);
     let mut count = 0;
+    let mut sans_zone = 0usize;
+    let mut volume_ecarte = 0usize;
     for (key, value) in settings_list {
         if is_sensitive(key) {
             continue;
         }
+        if let Some((source, gabarit)) = crate::db::zone_repo::gabarit_de_cle_de_zone(key) {
+            let Some(arrivee) = correspondances.get(&source) else {
+                debug!(key = %key, "config_import_reglage_de_zone_sans_zone");
+                sans_zone += 1;
+                continue;
+            };
+            if !arrivee.sure && crate::audio::reglages_de_volume::est_un_reglage_de_volume(&gabarit)
+            {
+                volume_ecarte += 1;
+                continue;
+            }
+            settings.set(&gabarit.replace("{id}", &arrivee.id.to_string()), value)?;
+            count += 1;
+            continue;
+        }
+        if key == "default_zone_id" || key == "zone_groups" {
+            let valeur = Value::String(value.clone());
+            match crate::config_export::traduire_reglage(key, &valeur, &vers) {
+                Some(Value::String(v)) => settings.set(key, &v)?,
+                Some(autre) => settings.set(key, &autre.to_string())?,
+                None => {
+                    sans_zone += 1;
+                    continue;
+                }
+            }
+            count += 1;
+            continue;
+        }
         settings.set(key, value)?;
         count += 1;
+    }
+    if sans_zone > 0 {
+        warn!(
+            ecartes = sans_zone,
+            "config_import_reglages_de_zone_sans_zone"
+        );
+        warnings.push(format!(
+            "{sans_zone} zone setting(s) skipped: their zone is not in the backup"
+        ));
+    }
+    if volume_ecarte > 0 {
+        info!(
+            ecartes = volume_ecarte,
+            "config_import_reglages_de_volume_ecartes"
+        );
     }
     Ok(count)
 }
@@ -1958,6 +2172,51 @@ mod tests {
         scenarios_playlists::l_export_porte_le_chemin_et_l_empreinte(&backend_sqlite());
     }
 
+    /// #6774 — la restauration suit l'appareil, pas le numéro de zone.
+    #[test]
+    fn restauration_6774_le_trim_suit_l_appareil() {
+        scenarios_restauration_6774::le_trim_suit_l_appareil_et_non_le_numero(&backend_sqlite());
+    }
+
+    #[test]
+    fn restauration_6774_un_reglage_sans_zone_n_est_pas_ecrit() {
+        scenarios_restauration_6774::un_reglage_sans_zone_n_est_pas_ecrit(&backend_sqlite());
+    }
+
+    #[test]
+    fn restauration_6774_le_meme_nom_ne_suffit_pas() {
+        scenarios_restauration_6774::le_meme_nom_ne_suffit_pas(&backend_sqlite());
+    }
+
+    #[test]
+    fn restauration_6774_la_mac_retrouve_l_appareil() {
+        scenarios_restauration_6774::la_mac_retrouve_l_appareil(&backend_sqlite());
+    }
+
+    #[test]
+    fn restauration_6774_sans_identite_aucun_reglage_de_volume() {
+        scenarios_restauration_6774::sans_identite_aucun_reglage_de_volume(&backend_sqlite());
+    }
+
+    /// #6774 — l'export porte la MAC de l'appareil de chaque zone.
+    #[test]
+    fn restauration_6774_l_export_porte_la_mac() {
+        let b = backend_sqlite();
+        b.execute(
+            "INSERT INTO zones (name, output_type, output_device_id, mac) VALUES (?, ?, ?, ?)",
+            &[
+                &"X6774".to_string() as &dyn ToSqlValue,
+                &"airplay".to_string() as &dyn ToSqlValue,
+                &"airplay-x6774".to_string() as &dyn ToSqlValue,
+                &"80:0A:80:5C:26:89".to_string() as &dyn ToSqlValue,
+            ],
+        )
+        .unwrap();
+        let s = export_config(&b).unwrap();
+        let z = s.zones.iter().find(|z| z["name"] == "X6774").unwrap();
+        assert_eq!(z["mac"], "80:0A:80:5C:26:89");
+    }
+
     /// #4983 — temoin SQLite de non-regression : le doublon reste ignore.
     #[test]
     fn favoris_restaures_et_doublon_ignore() {
@@ -2024,7 +2283,9 @@ pub(crate) mod scenarios_zones {
         serde_json::json!({
             "name": nom,
             "output_type": "dlna",
-            "output_device_id": "dev-p2c",
+            // #6774 — un appareil PAR zone : la restauration rapproche par
+            // appareil, deux zones sur le même seraient la même zone.
+            "output_device_id": format!("dev-p2c-{nom}"),
             "volume": vol,
             "muted": 0,
             "gapless_enabled": 1,
@@ -2037,7 +2298,9 @@ pub(crate) mod scenarios_zones {
     fn restaurer(backend: &Arc<dyn DbBackend>, zone: Value) {
         let mut avertissements = Vec::new();
         assert_eq!(
-            import_zones(backend, std::slice::from_ref(&zone), &mut avertissements).unwrap(),
+            import_zones(backend, std::slice::from_ref(&zone), &mut avertissements)
+                .unwrap()
+                .0,
             1
         );
     }
@@ -2936,5 +3199,316 @@ pub(crate) mod scenarios_favoris {
         assert_eq!(nombre(backend, NOUVEAU), 1, "le nouveau favori manque");
 
         effacer(backend);
+    }
+}
+
+/// #6774 — la restauration rapproche les zones par IDENTITÉ d'appareil et
+/// réécrit leurs réglages sous le numéro de la zone d'ARRIVÉE.
+///
+/// Écrits contre un `DbBackend` quelconque : joués sur SQLite par le
+/// `mod tests` ci-dessus et sur PostgreSQL par
+/// `db::postgres_e2e::pg_config_backup_zones_volume_fixe`. Chaque scénario
+/// nettoie ses lignes à l'entrée (base PostgreSQL partagée).
+#[cfg(test)]
+pub(crate) mod scenarios_restauration_6774 {
+    use super::*;
+
+    fn effacer(backend: &Arc<dyn DbBackend>, noms: &[&str]) {
+        for nom in noms {
+            let ids: Vec<i64> = backend
+                .query_many(
+                    "SELECT id FROM zones WHERE name = ?",
+                    &[&nom.to_string() as &dyn ToSqlValue],
+                )
+                .unwrap()
+                .iter()
+                .filter_map(|l| l.first().and_then(|v| v.as_i64()))
+                .collect();
+            for id in ids {
+                for (cle, _) in SettingsRepo::with_backend(backend.clone()).all().unwrap() {
+                    if cle.starts_with(&format!("zone_{id}_")) {
+                        SettingsRepo::with_backend(backend.clone())
+                            .delete(&cle)
+                            .unwrap();
+                    }
+                }
+            }
+            backend
+                .execute(
+                    "DELETE FROM zones WHERE name = ?",
+                    &[&nom.to_string() as &dyn ToSqlValue],
+                )
+                .unwrap();
+        }
+    }
+
+    fn zone(backend: &Arc<dyn DbBackend>, nom: &str, ty: &str, appareil: Option<&str>) -> i64 {
+        let appareil = appareil.map(str::to_string);
+        backend
+            .execute(
+                "INSERT INTO zones (name, output_type, output_device_id) VALUES (?, ?, ?)",
+                &[
+                    &nom.to_string() as &dyn ToSqlValue,
+                    &ty.to_string() as &dyn ToSqlValue,
+                    &appareil as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+        backend
+            .query_one_strong(
+                "SELECT MAX(id) FROM zones WHERE name = ?",
+                &[&nom.to_string() as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .unwrap()[0]
+            .as_i64()
+            .unwrap()
+    }
+
+    fn appareil_de(backend: &Arc<dyn DbBackend>, id: i64) -> Option<String> {
+        texte_de(
+            backend
+                .query_one_strong(
+                    "SELECT output_device_id FROM zones WHERE id = ?",
+                    &[&id as &dyn ToSqlValue],
+                )
+                .unwrap()
+                .unwrap()
+                .first(),
+        )
+    }
+
+    fn id_par_appareil(backend: &Arc<dyn DbBackend>, appareil: &str) -> Option<i64> {
+        premier_id(
+            backend
+                .query_one_strong(
+                    "SELECT id FROM zones WHERE output_device_id = ?",
+                    &[&appareil.to_string() as &dyn ToSqlValue],
+                )
+                .unwrap(),
+        )
+    }
+
+    fn lire(backend: &Arc<dyn DbBackend>, cle: &str) -> Option<String> {
+        SettingsRepo::with_backend(backend.clone())
+            .get(cle)
+            .unwrap()
+    }
+
+    fn instantane(zones: Value, reglages: Vec<(String, String)>) -> ConfigSnapshot {
+        let mut s: ConfigSnapshot = serde_json::from_value(serde_json::json!({
+            "version": "1.0.0-rc8",
+            "created_at": "2026-10-22T00:00:00Z",
+            "zones": zones, "settings": [], "playlists": [], "favorites": [],
+            "radio_stations": [], "alarms": [], "eq_presets": [], "room_profiles": [],
+        }))
+        .unwrap();
+        s.settings = reglages;
+        s
+    }
+
+    /// 🔴 avant / 🟢 après — le cas de #6739. La sauvegarde vient d'une autre
+    /// installation : sa zone n° M (ici le numéro du Marantz) était le Meitner,
+    /// réglé à +4,5 dB. Avant, `zone_M_gain_trim_db` était réécrit tel quel —
+    /// sur le Marantz. Après, il suit le Meitner, et rien n'arrive au Marantz.
+    pub(crate) fn le_trim_suit_l_appareil_et_non_le_numero(backend: &Arc<dyn DbBackend>) {
+        const MARANTZ: &str = "R6774 Marantz";
+        const MEITNER: &str = "R6774 Meitner";
+        effacer(backend, &[MARANTZ, MEITNER]);
+        let marantz = zone(backend, MARANTZ, "dlna", Some("uuid:r6774-marantz"));
+        let meitner = zone(backend, MEITNER, "dlna", Some("uuid:r6774-meitner"));
+
+        let sauvegarde = instantane(
+            serde_json::json!([{
+                "id": marantz, "name": MEITNER, "output_type": "dlna",
+                "output_device_id": "uuid:r6774-meitner", "volume": 30.0,
+                "fixed_volume": 0,
+            }]),
+            vec![
+                (format!("zone_{marantz}_gain_trim_db"), "4.5".into()),
+                (
+                    format!("zone_{marantz}_crossfeed"),
+                    "{\"enabled\":true}".into(),
+                ),
+            ],
+        );
+        import_config(backend, sauvegarde).unwrap();
+
+        assert_eq!(
+            lire(backend, &format!("zone_{marantz}_gain_trim_db")),
+            None,
+            "le trim d'un AUTRE appareil a été posé sur le Marantz : la restauration \
+             réécrit zone_{{id}}_* sous le numéro d'origine au lieu de suivre l'appareil (#6774)"
+        );
+        assert_eq!(
+            lire(backend, &format!("zone_{meitner}_gain_trim_db")).as_deref(),
+            Some("4.5"),
+            "le trim doit suivre son appareil (le Meitner)"
+        );
+        assert_eq!(
+            lire(backend, &format!("zone_{meitner}_crossfeed")).as_deref(),
+            Some("{\"enabled\":true}")
+        );
+        assert_eq!(
+            appareil_de(backend, marantz).as_deref(),
+            Some("uuid:r6774-marantz"),
+            "le Marantz garde son appareil"
+        );
+        effacer(backend, &[MARANTZ, MEITNER]);
+    }
+
+    /// 🔴 avant / 🟢 après — un réglage de zone dont la zone n'est pas dans
+    /// la sauvegarde n'est écrit nulle part (avant : sur la zone de ce numéro).
+    pub(crate) fn un_reglage_sans_zone_n_est_pas_ecrit(backend: &Arc<dyn DbBackend>) {
+        const MARANTZ: &str = "R6774 Marantz seul";
+        effacer(backend, &[MARANTZ]);
+        let marantz = zone(backend, MARANTZ, "dlna", Some("uuid:r6774-seul"));
+        let sauvegarde = instantane(
+            serde_json::json!([]),
+            vec![(format!("zone_{marantz}_gain_trim_db"), "8.5".into())],
+        );
+        let rapport = import_config(backend, sauvegarde).unwrap();
+        assert_eq!(
+            lire(backend, &format!("zone_{marantz}_gain_trim_db")),
+            None,
+            "un trim de +8,5 dB sans zone dans la sauvegarde a été posé sur la zone \
+             qui porte ce numéro ici (#6774)"
+        );
+        assert!(
+            rapport.warnings.iter().any(|w| w.contains("zone setting")),
+            "l'écart est dit : {:?}",
+            rapport.warnings
+        );
+        effacer(backend, &[MARANTZ]);
+    }
+
+    /// 🔴 avant / 🟢 après — même NOM, autre appareil : la zone locale n'est
+    /// plus repointée vers l'appareil de la sauvegarde (elle emmenait ses
+    /// réglages et recevait ceux d'un autre). Une zone est créée pour
+    /// l'appareil sauvegardé, et ses réglages la suivent.
+    pub(crate) fn le_meme_nom_ne_suffit_pas(backend: &Arc<dyn DbBackend>) {
+        const SALON: &str = "R6774 Salon";
+        effacer(backend, &[SALON]);
+        let local = zone(backend, SALON, "dlna", Some("uuid:r6774-local"));
+        SettingsRepo::with_backend(backend.clone())
+            .set(&format!("zone_{local}_gain_trim_db"), "-2")
+            .unwrap();
+        let sauvegarde = instantane(
+            serde_json::json!([{
+                "id": 9_100_001i64, "name": SALON, "output_type": "dlna",
+                "output_device_id": "uuid:r6774-sauve", "fixed_volume": 0,
+            }]),
+            vec![("zone_9100001_gain_trim_db".into(), "6".into())],
+        );
+        import_config(backend, sauvegarde).unwrap();
+
+        assert_eq!(
+            appareil_de(backend, local).as_deref(),
+            Some("uuid:r6774-local"),
+            "une zone locale de même nom a été repointée vers un AUTRE appareil (#6774)"
+        );
+        assert_eq!(
+            lire(backend, &format!("zone_{local}_gain_trim_db")).as_deref(),
+            Some("-2"),
+            "la zone locale garde son propre trim"
+        );
+        let creee = id_par_appareil(backend, "uuid:r6774-sauve")
+            .expect("une zone est créée pour l'appareil de la sauvegarde");
+        assert_eq!(
+            lire(backend, &format!("zone_{creee}_gain_trim_db")).as_deref(),
+            Some("6"),
+            "le trim suit son appareil dans la zone créée"
+        );
+        effacer(backend, &[SALON]);
+    }
+
+    /// 🟢 — même appareil retrouvé par sa MAC (identifiant changé) : la zone
+    /// locale reçoit les réglages et garde son identifiant actuel.
+    pub(crate) fn la_mac_retrouve_l_appareil(backend: &Arc<dyn DbBackend>) {
+        const NOM: &str = "R6774 AirPlay";
+        effacer(backend, &[NOM]);
+        let local = zone(backend, NOM, "airplay", Some("airplay-r6774-neuf"));
+        backend
+            .execute(
+                "UPDATE zones SET mac = ? WHERE id = ?",
+                &[&"80:0A:80:5C:26:89".to_string() as &dyn ToSqlValue, &local],
+            )
+            .unwrap();
+        let sauvegarde = instantane(
+            serde_json::json!([{
+                "id": 9_100_002i64, "name": "Ancien nom", "output_type": "airplay",
+                "output_device_id": "airplay-r6774-ancien", "mac": "800a805c2689",
+                "fixed_volume": 0,
+            }]),
+            vec![("zone_9100002_gain_trim_db".into(), "-3".into())],
+        );
+        import_config(backend, sauvegarde).unwrap();
+        assert_eq!(
+            lire(backend, &format!("zone_{local}_gain_trim_db")).as_deref(),
+            Some("-3"),
+            "la même MAC désigne le même appareil : ses réglages reviennent"
+        );
+        assert_eq!(
+            appareil_de(backend, local).as_deref(),
+            Some("airplay-r6774-neuf"),
+            "l'identifiant actuel de l'appareil est gardé"
+        );
+        assert_eq!(id_par_appareil(backend, "airplay-r6774-ancien"), None);
+        effacer(backend, &[NOM, "Ancien nom"]);
+    }
+
+    /// 🔴 avant / 🟢 après — une zone sauvegardée SANS appareil n'a pas
+    /// d'identité : rapprochée par son nom, elle revient au neutre (ni trim,
+    /// ni limites, ni PURE), le reste de ses réglages revient.
+    pub(crate) fn sans_identite_aucun_reglage_de_volume(backend: &Arc<dyn DbBackend>) {
+        const NOM: &str = "R6774 Sans appareil";
+        effacer(backend, &[NOM]);
+        let local = zone(backend, NOM, "dlna", None);
+        SettingsRepo::with_backend(backend.clone())
+            .set(&format!("zone_{local}_volume_limit_comfort"), "0.9")
+            .unwrap();
+        let sauvegarde = instantane(
+            serde_json::json!([{
+                "id": 9_100_003i64, "name": NOM, "output_type": "dlna",
+                "output_device_id": null, "fixed_volume": 0,
+            }]),
+            vec![
+                ("zone_9100003_gain_trim_db".into(), "8.5".into()),
+                ("zone_9100003_volume_limit_safety".into(), "1".into()),
+                (
+                    "zone_9100003_audiophile".into(),
+                    "{\"enabled\":true,\"lock_volume\":true}".into(),
+                ),
+                ("zone_9100003_crossfeed".into(), "{\"enabled\":true}".into()),
+            ],
+        );
+        let rapport = import_config(backend, sauvegarde).unwrap();
+        for cle in [
+            "gain_trim_db",
+            "volume_limit_safety",
+            "volume_limit_comfort",
+            "audiophile",
+        ] {
+            assert_eq!(
+                lire(backend, &format!("zone_{local}_{cle}")),
+                None,
+                "zone sans identité d'appareil : `{cle}` a été restauré ou laissé en place, \
+                 elle devait revenir au neutre (#6774)"
+            );
+        }
+        assert_eq!(
+            lire(backend, &format!("zone_{local}_crossfeed")).as_deref(),
+            Some("{\"enabled\":true}"),
+            "les réglages qui ne touchent pas au volume reviennent"
+        );
+        assert!(
+            rapport
+                .warnings
+                .iter()
+                .any(|w| w.contains("volume settings")),
+            "{:?}",
+            rapport.warnings
+        );
+        effacer(backend, &[NOM]);
     }
 }
