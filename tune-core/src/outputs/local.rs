@@ -8315,6 +8315,11 @@ mod gapless_pure_reechantillonne_5416;
 #[cfg(test)]
 mod gapless_exclusif_5204;
 
+// #6842 — la chaîne native s'arrête sur un puits mort et le dit ; le vidage
+// du bras WASAPI est borné.
+#[cfg(test)]
+mod famine_native_6842;
+
 // #5204, seconde tranche — ASIO exclusif : la route native enchaîne à format
 // égal par la boucle commune, sans refermer le pilote.
 #[cfg(test)]
