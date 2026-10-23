@@ -2996,17 +2996,17 @@
     "vi": "Ambient"
   },
   "spotify.playback.disabled": {
-    "fr": "Lecture Spotify non activée : l'option expérimentale se trouve dans Réglages > Spotify > « Lecture Spotify (expérimental) ».",
-    "en": "Spotify playback is not enabled: the experimental option is in Settings > Spotify.",
-    "de": "Spotify-Wiedergabe ist nicht aktiviert: Die experimentelle Option befindet sich unter Einstellungen > Spotify.",
-    "es": "La reproducción de Spotify no está activada: la opción experimental está en Ajustes > Spotify.",
-    "it": "La riproduzione Spotify non è attivata: l'opzione sperimentale si trova in Impostazioni > Spotify.",
-    "zh": "Spotify 播放未启用：实验性选项位于 设置 > Spotify。",
-    "ja": "Spotify の再生は有効になっていません。試験的オプションは 設定 > Spotify にあります。",
-    "ko": "Spotify 재생이 활성화되지 않았습니다. 실험적 옵션은 설정 > Spotify에 있습니다.",
-    "ro": "Redarea Spotify nu este activată: opțiunea experimentală se află în Setări > Spotify.",
-    "sv": "Spotify-uppspelning är inte aktiverad: det experimentella alternativet finns under Inställningar > Spotify.",
-    "hu": "A Spotify-lejátszás nincs engedélyezve: a kísérleti beállítás a Beállítások > Spotify alatt található.",
-    "vi": "Chưa bật phát Spotify: tùy chọn thử nghiệm nằm trong Cài đặt > Spotify."
+    "fr": "Lecture Spotify non activée : l'option « Lecture Spotify (expérimental) » se trouve dans Réglages › Accès et jetons › Spotify Connect (niveau Avancé).",
+    "en": "Spotify playback is not enabled: the “Spotify playback (experimental)” option is in Settings › Access and tokens › Spotify Connect (Advanced level).",
+    "de": "Spotify-Wiedergabe ist nicht aktiviert: Die Option „Spotify-Wiedergabe (experimentell)“ befindet sich unter Einstellungen › Zugang und Token › Spotify Connect (Stufe Fortgeschritten).",
+    "es": "La reproducción de Spotify no está activada: la opción «Reproducción de Spotify (experimental)» está en Ajustes › Acceso y tokens › Spotify Connect (nivel Avanzado).",
+    "it": "La riproduzione Spotify non è attivata: l'opzione «Riproduzione Spotify (sperimentale)» si trova in Impostazioni › Accesso e token › Spotify Connect (livello Avanzato).",
+    "zh": "Spotify 播放未启用：“Spotify 播放（实验性）”选项位于 设置 › 访问与令牌 › Spotify Connect（高级级别）。",
+    "ja": "Spotify の再生は有効になっていません。「Spotify 再生（試験的）」オプションは 設定 › アクセスとトークン › Spotify Connect（アドバンスト レベル）にあります。",
+    "ko": "Spotify 재생이 활성화되지 않았습니다. 'Spotify 재생(실험적)' 옵션은 설정 › 접근과 토큰 › Spotify Connect(고급 수준)에 있습니다.",
+    "ro": "Redarea Spotify nu este activată: opțiunea „Redare Spotify (experimental)” se află în Setări › Acces și jetoane › Spotify Connect (nivelul Avansat).",
+    "sv": "Spotify-uppspelning är inte aktiverad: alternativet ”Spotify-uppspelning (experimentell)” finns under Inställningar › Åtkomst och tokens › Spotify Connect (nivå Avancerad).",
+    "hu": "A Spotify-lejátszás nincs engedélyezve: a „Spotify-lejátszás (kísérleti)” beállítás a Beállítások › Hozzáférés és tokenek › Spotify Connect alatt található (Haladó szint).",
+    "vi": "Chưa bật phát Spotify: tùy chọn “Phát Spotify (thử nghiệm)” nằm trong Cài đặt › Truy cập và token › Spotify Connect (cấp Nâng cao)."
   }
 }
