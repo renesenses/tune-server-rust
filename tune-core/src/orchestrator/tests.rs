@@ -6585,7 +6585,15 @@ async fn test_set_volume() {
     orch.playback.play(zone_id, np).await;
 
     // Set volume to 80%
-    orch.set_volume(zone_id, 0.8, None).await.unwrap();
+    // #6721 — hausse confirmée : la garde n'est pas l'objet de ce test.
+    orch.set_volume_avec_garde(
+        zone_id,
+        0.8,
+        None,
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let state = orch.playback.get_state(zone_id).await;
     assert!((state.volume - 0.8).abs() < f64::EPSILON);
 
@@ -6595,7 +6603,14 @@ async fn test_set_volume() {
     assert!((state.volume - 0.0).abs() < f64::EPSILON);
 
     // Set volume to 1.0 (max)
-    orch.set_volume(zone_id, 1.0, None).await.unwrap();
+    orch.set_volume_avec_garde(
+        zone_id,
+        1.0,
+        None,
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let state = orch.playback.get_state(zone_id).await;
     assert!((state.volume - 1.0).abs() < f64::EPSILON);
 }
@@ -6624,7 +6639,15 @@ async fn le_trim_ne_touche_pas_le_volume_utilisateur() {
         .set(&format!("zone_{zone_id}_gain_trim_db"), "-6")
         .unwrap();
 
-    orch.set_volume(zone_id, 0.8, None).await.unwrap();
+    // #6721 — hausse confirmée : la garde n'est pas l'objet de ce test.
+    orch.set_volume_avec_garde(
+        zone_id,
+        0.8,
+        None,
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let state = orch.playback.get_state(zone_id).await;
     assert!((state.volume - 0.8).abs() < f64::EPSILON);
     let zone = zone_repo.get(zone_id).unwrap().unwrap();
