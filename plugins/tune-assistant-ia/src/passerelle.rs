@@ -304,12 +304,12 @@ impl Passerelle {
                 if outils.as_array().is_some_and(|o| !o.is_empty()) {
                     corps["tools"] = outils.clone();
                 }
-                fournisseur::client()
-                    .post(format!("{}/v1/messages", fournisseur::base(acces)))
-                    .header("x-api-key", acces.cle.as_deref().unwrap_or(""))
-                    .header("anthropic-version", "2023-06-01")
-                    .timeout(fournisseur::DELAI)
-                    .json(&corps)
+                fournisseur::entetes_anthropic(
+                    fournisseur::client().post(format!("{}/v1/messages", fournisseur::base(acces))),
+                    acces,
+                )
+                .timeout(fournisseur::DELAI)
+                .json(&corps)
             },
             |v| {
                 let u = v.get("usage").cloned().unwrap_or(Value::Null);

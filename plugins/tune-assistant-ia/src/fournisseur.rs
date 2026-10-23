@@ -160,7 +160,7 @@ impl ErreurFournisseur {
             Self::ModeleInconnu => "Ce modèle n'existe pas chez ce fournisseur.".into(),
             Self::Reseau => "Fournisseur injoignable (réseau).".into(),
             Self::Refus => "Le modèle a refusé de répondre.".into(),
-            Self::CleSansEspaceDeTravail => "Cette clé Anthropic n'est rattachée à aucun espace de travail : créez-en une dans un espace de travail (console.anthropic.com › API keys).".into(),
+            Self::CleSansEspaceDeTravail => "Cette clé Anthropic n'est rattachée à aucun espace de travail : renseignez l'identifiant d'espace de travail dans les réglages de l'assistant, ou créez une clé dans un espace de travail (console.anthropic.com › API keys).".into(),
             Self::Autre {
                 statut,
                 motif: Some(m),
@@ -258,6 +258,11 @@ pub struct Acces {
     pub famille: Famille,
     pub url_base: String,
     pub cle: Option<String>,
+    /// #6730 — Anthropic : l'identifiant d'espace de travail, envoyé dans
+    /// l'en-tête `anthropic-workspace-id` quand il est renseigné (clé
+    /// d'organisation). Ce n'est pas un secret : la console l'affiche, et il
+    /// n'ouvre rien sans la clé. Ignoré des autres fournisseurs.
+    pub espace_de_travail: Option<String>,
 }
 
 // La clé ne s'imprime jamais, même dans un `{:?}` de débogage.
@@ -267,6 +272,7 @@ impl std::fmt::Debug for Acces {
             .field("famille", &self.famille)
             .field("url_base", &self.url_base)
             .field("cle", &self.cle.as_ref().map(|_| "********"))
+            .field("espace_de_travail", &self.espace_de_travail)
             .finish()
     }
 }
@@ -286,6 +292,37 @@ pub fn fabrique_reelle() -> Fabrique {
 }
 
 pub(crate) const DELAI: Duration = Duration::from_secs(90);
+
+/// L'en-tête d'Anthropic qui désigne l'espace de travail d'une clé
+/// d'organisation (#6730).
+pub const ENTETE_ESPACE_DE_TRAVAIL: &str = "anthropic-workspace-id";
+
+/// #6730 — les en-têtes d'authentification d'une requête Anthropic : la clé,
+/// la version, et l'espace de travail s'il est renseigné. Un seul endroit
+/// pour les deux chemins (fournisseur et passerelle de `/ai/query`).
+pub(crate) fn entetes_anthropic(
+    requete: reqwest::RequestBuilder,
+    acces: &Acces,
+) -> reqwest::RequestBuilder {
+    let requete = requete
+        .header("x-api-key", acces.cle.as_deref().unwrap_or(""))
+        .header("anthropic-version", "2023-06-01");
+    match acces.espace_de_travail.as_deref().map(str::trim) {
+        Some(id) if !id.is_empty() => requete.header(ENTETE_ESPACE_DE_TRAVAIL, id),
+        _ => requete,
+    }
+}
+
+/// #6730 — un identifiant d'espace de travail acceptable : non vide,
+/// 128 caractères au plus, lettres, chiffres, `_` et `-` seulement (la
+/// console rend `wrkspc_…`). Tout autre caractère pourrait casser l'en-tête.
+pub fn espace_de_travail_valide(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
 
 pub(crate) fn client() -> &'static reqwest::Client {
     tune_core::http::client::shared()
@@ -369,15 +406,15 @@ impl Fournisseur for Anthropic {
             "system": d.systeme,
             "messages": [{ "role": "user", "content": d.message }],
         });
-        let rep = client()
-            .post(format!("{}/v1/messages", base(&self.acces)))
-            .header("x-api-key", self.acces.cle.as_deref().unwrap_or(""))
-            .header("anthropic-version", "2023-06-01")
-            .timeout(DELAI)
-            .json(&corps)
-            .send()
-            .await
-            .map_err(|e| erreur_reseau(Famille::Anthropic, &e))?;
+        let rep = entetes_anthropic(
+            client().post(format!("{}/v1/messages", base(&self.acces))),
+            &self.acces,
+        )
+        .timeout(DELAI)
+        .json(&corps)
+        .send()
+        .await
+        .map_err(|e| erreur_reseau(Famille::Anthropic, &e))?;
         let statut = rep.status().as_u16();
         let texte = rep
             .text()
@@ -628,6 +665,7 @@ mod tests {
             famille: Famille::Anthropic,
             url_base: String::new(),
             cle: Some("sk-ant-secret-123456".into()),
+            espace_de_travail: Some("wrkspc_01Essai".into()),
         };
         let vu = format!("{a:?}");
         assert!(!vu.contains("secret"), "{vu}");

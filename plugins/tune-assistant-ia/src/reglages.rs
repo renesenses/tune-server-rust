@@ -27,6 +27,9 @@ pub const CLE_TAUX: &str = "assistant_ia_taux_usd_eur";
 /// [`tune_core::secrets::est_secret`] reconnaît — gardé par un essai.
 pub const CLE_API_CHIFFREE: &str = "assistant_ia_api_key_chiffree";
 pub const CLE_CONSOMMATION: &str = "assistant_ia_consommation";
+/// #6730 — l'identifiant d'espace de travail Anthropic (en-tête
+/// `anthropic-workspace-id`). Pas un secret : la clé reste au coffre, seule.
+pub const CLE_ESPACE_DE_TRAVAIL: &str = "assistant_ia_anthropic_espace_de_travail";
 
 /// Le plafond mensuel par défaut, en euros.
 pub const PLAFOND_PAR_DEFAUT_EUR: &str = "2";
@@ -43,6 +46,8 @@ pub struct Reglages {
     pub taux_usd_eur: f64,
     /// La clé est-elle posée (scellée) ?
     pub cle_posee: bool,
+    /// #6730 — l'espace de travail Anthropic, vide s'il n'est pas renseigné.
+    pub espace_de_travail: String,
 }
 
 fn lire(s: &SettingsRepo, cle: &str) -> String {
@@ -86,6 +91,7 @@ impl Reglages {
                 .filter(|t| *t > 0.0)
                 .unwrap_or(1.0),
             cle_posee: !lire(&s, CLE_API_CHIFFREE).trim().is_empty(),
+            espace_de_travail: lire(&s, CLE_ESPACE_DE_TRAVAIL).trim().to_string(),
         }
     }
 
@@ -138,10 +144,14 @@ pub fn cle_en_clair(db: &Arc<dyn DbBackend>, coffre: &Coffre) -> EtatCle {
 
 /// L'accès au fournisseur configuré, avec sa clé.
 pub fn acces(r: &Reglages, cle: Option<String>) -> Option<Acces> {
+    let famille = r.famille?;
     Some(Acces {
-        famille: r.famille?,
+        famille,
         url_base: r.url_base.clone(),
         cle,
+        // #6730 — seulement pour Anthropic, et seulement s'il est renseigné.
+        espace_de_travail: (famille == Famille::Anthropic && !r.espace_de_travail.is_empty())
+            .then(|| r.espace_de_travail.clone()),
     })
 }
 
@@ -206,6 +216,8 @@ pub fn vue(db: &Arc<dyn DbBackend>, coffre: &Coffre) -> Value {
         "cle_definie": cle_definie,
         "cle_illisible": cle_illisible,
         "cle_fin": fin,
+        // #6730 — l'identifiant d'espace de travail Anthropic (`""` : aucun).
+        "espace_de_travail_anthropic": r.espace_de_travail,
         "modeles_anthropic": couts::TARIFS_ANTHROPIC.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
         "modeles_gemini": couts::TARIFS_GEMINI.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
         "modele_gemini_par_defaut": couts::MODELE_GEMINI_PAR_DEFAUT,
@@ -274,6 +286,8 @@ pub struct Modification {
     pub taux_usd_eur: Option<Value>,
     /// La clé en clair. `""` l'efface.
     pub cle: Option<String>,
+    /// #6730 — l'identifiant d'espace de travail Anthropic. `""` l'efface.
+    pub espace_de_travail_anthropic: Option<String>,
 }
 
 fn texte_de(v: &Value) -> String {
@@ -317,6 +331,15 @@ pub fn appliquer(db: &Arc<dyn DbBackend>, coffre: &Coffre, m: &Modification) -> 
             return Err("l'adresse doit commencer par http:// ou https://".into());
         }
     }
+    if let Some(id) = &m.espace_de_travail_anthropic {
+        let id = id.trim();
+        if !id.is_empty() && !crate::fournisseur::espace_de_travail_valide(id) {
+            return Err(
+                "identifiant d'espace de travail illisible (lettres, chiffres, _ et - seulement)"
+                    .into(),
+            );
+        }
+    }
     // 2. Écrire.
     let s = SettingsRepo::with_backend(db.clone());
     let poser = |cle: &str, v: &str| s.set(cle, v.trim());
@@ -347,6 +370,14 @@ pub fn appliquer(db: &Arc<dyn DbBackend>, coffre: &Coffre, m: &Modification) -> 
     if let Some(v) = &m.taux_usd_eur {
         poser(CLE_TAUX, &texte_de(v))?;
     }
+    if let Some(id) = &m.espace_de_travail_anthropic {
+        let id = id.trim();
+        if id.is_empty() {
+            s.delete(CLE_ESPACE_DE_TRAVAIL)?;
+        } else {
+            poser(CLE_ESPACE_DE_TRAVAIL, id)?;
+        }
+    }
     if let Some(cle) = &m.cle {
         let cle = cle.trim();
         if cle.is_empty() {
@@ -372,6 +403,7 @@ mod tests {
             prix_perso: prix,
             taux_usd_eur: 1.0,
             cle_posee: true,
+            espace_de_travail: String::new(),
         }
     }
 
