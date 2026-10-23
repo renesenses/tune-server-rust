@@ -815,9 +815,9 @@ fn lister_sous_le_verrou_de_balayage(
         warn!(
             attente_ms = attente.as_millis() as u64,
             appareils_servis = parc.len(),
+            soupcon = soupcon_du_balayage_bloque(std::env::consts::OS),
             "local_audio_scan_in_progress_unresponsive_serving_cache — un balayage des \
-             sorties audio ne rend plus la main (greffon ALSA/PipeWire bloqué ?) : la liste \
-             servie est la dernière connue"
+             sorties audio ne rend plus la main : la liste servie est la dernière connue"
         );
         return parc;
     };
@@ -834,6 +834,22 @@ fn lister_sous_le_verrou_de_balayage(
     publier_le_parc(&result);
     *guard = Some((std::time::Instant::now(), result.clone()));
     result
+}
+
+/// #6452 — ce qui peut retenir un balayage des sorties audio, selon le système.
+///
+/// Les deux avertissements d'un balayage bloqué accusaient « le greffon
+/// ALSA/PipeWire » sur TOUTES les plateformes. Sous Windows, le journal de
+/// borderies.jean-pierre (fil 2248) en portait un toutes les 2 min 10 s avec
+/// l'hôte ASIO actif : le soupçon envoyait le lecteur vers une couche qui n'y
+/// existe pas. Le soupçon reste un soupçon, mais il nomme la couche du système
+/// qui tourne.
+pub(crate) fn soupcon_du_balayage_bloque(os: &str) -> &'static str {
+    match os {
+        "windows" => "pilote ASIO ou WASAPI bloqué ?",
+        "macos" => "pilote CoreAudio bloqué ?",
+        _ => "greffon ALSA/PipeWire bloqué ?",
+    }
 }
 
 /// #5612 — `Mutex::lock` borné dans le temps : `None` si le verrou est encore
@@ -887,8 +903,9 @@ where
         Err(_) => {
             warn!(
                 delai_ms = delai.as_millis() as u64,
+                soupcon = soupcon_du_balayage_bloque(std::env::consts::OS),
                 "local_audio_enumeration_timed_out — l'énumération des sorties audio ne rend \
-                 pas la main (greffon ALSA/PipeWire bloqué ?)"
+                 pas la main"
             );
             None
         }
@@ -1351,3 +1368,7 @@ mod asio_scan_gate_4168_tests {
 #[cfg(test)]
 #[path = "balayage_bloque_5612.rs"]
 mod balayage_bloque_5612;
+
+#[cfg(test)]
+#[path = "soupcon_du_balayage_6452.rs"]
+mod soupcon_du_balayage_6452;
