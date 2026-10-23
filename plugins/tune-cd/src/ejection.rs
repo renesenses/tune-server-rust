@@ -50,6 +50,9 @@ pub struct Surveillant {
     memoire: Option<Arc<MemoireCd>>,
     /// #6410 — tours d'affilée sans zone qui joue le disque gardé.
     tours_sans_lecture: u32,
+    /// #6410 — la source publie le disque gardé en mémoire (lecteur vide) :
+    /// à rendre « vide » quand la mémoire est rendue.
+    garde_publie: bool,
 }
 
 impl Surveillant {
@@ -68,6 +71,7 @@ impl Surveillant {
             reveil: Arc::default(),
             memoire: None,
             tours_sans_lecture: 0,
+            garde_publie: false,
         }
     }
 
@@ -145,9 +149,31 @@ impl Surveillant {
             // d'autre : ni file, ni lecture.
             let insertion = presence == Presence::Disque
                 && (lecteur_remplace || avant.is_some_and(|a| a != Presence::Disque));
-            p.publier(presence, insertion).await;
+            // #6410 — le disque est sorti, mais la lecture continue depuis la
+            // mémoire : la source dit qu'elle a ce disque, pas « vide ».
+            let gardee = if parti && garde {
+                self.memoire.as_ref().and_then(|m| m.disque_garde())
+            } else {
+                None
+            };
+            match gardee {
+                Some(c) => p.publier_disque_garde(c.toc()).await,
+                None => p.publier(presence, insertion).await,
+            }
+            self.garde_publie = parti && garde;
         }
         arretees
+    }
+
+    /// #6410 — la mémoire gardée a été rendue : la source revient à ce que
+    /// voit le lecteur.
+    async fn republier_apres_la_memoire_gardee(&mut self) {
+        if !std::mem::take(&mut self.garde_publie) {
+            return;
+        }
+        if let (Some(p), Some(presence)) = (&self.publication, self.derniere) {
+            p.publier(presence, false).await;
+        }
     }
 
     /// #6410 — le disque gardé en mémoire après son éjection : le rendre
@@ -159,6 +185,7 @@ impl Surveillant {
         };
         if m.disque_garde().is_none() {
             self.tours_sans_lecture = 0;
+            self.republier_apres_la_memoire_gardee().await;
             return;
         }
         let suivies: Vec<i64> = self.zones.lock().await.iter().copied().collect();
@@ -181,6 +208,7 @@ impl Surveillant {
         let _ = tokio::task::spawn_blocking(move || m.liberer()).await;
         // Plus aucune zone ne joue ce disque : elles ne sont plus suivies.
         self.zones.lock().await.clear();
+        self.republier_apres_la_memoire_gardee().await;
     }
 
     /// La boucle de production : une seconde entre deux tours tant qu'une
@@ -276,7 +304,7 @@ pub(crate) mod tests {
     use tune_core::source_pcm::FournisseurPcm;
 
     /// Trois pistes : 300, 800 et 400 secteurs — de quoi charger en entier.
-    fn petite_toc() -> Toc {
+    pub(crate) fn petite_toc() -> Toc {
         let p = |numero, debut| PisteToc {
             numero,
             debut,

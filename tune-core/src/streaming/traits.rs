@@ -963,6 +963,24 @@ pub trait StreamingService: Send + Sync {
         let _ = fav_type;
         Ok(None)
     }
+
+    /// #5997 — la liste datée de [`Self::get_user_favorites_dated`], mais
+    /// seulement si elle est COMPLÈTE : `Err` quand le connecteur sait que le
+    /// service ne l'a pas servie en entier (page manquante, total non tenu,
+    /// réponse sans la clé attendue).
+    ///
+    /// C'est la lecture que réconcilie le miroir des favoris : un favori
+    /// confirmé que le service ne nomme plus y est retiré de Tune, pour tous
+    /// les profils. L'écran Favoris du service, lui, garde la liste partielle
+    /// de `get_user_favorites_dated` : mieux vaut voir 100 titres sur 150 que
+    /// rien. Le défaut délègue, pour les connecteurs qui ne savent rien de
+    /// plus.
+    async fn favoris_dates_complets(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        self.get_user_favorites_dated(fav_type).await
+    }
     /// #4577 — ce service accepte-t-il qu'on ÉCRIVE ses favoris ?
     ///
     /// Bandcamp lit sa liste de souhaits sans session, mais ne l'écrit pas :
