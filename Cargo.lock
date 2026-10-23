@@ -2906,8 +2906,8 @@ dependencies = [
 
 [[package]]
 name = "oaat-controller"
-version = "0.2.5"
-source = "git+https://github.com/renesenses/oaat?rev=ed3b148#ed3b148897e06547e7436b080f8436b78a9064ae"
+version = "0.2.8"
+source = "git+https://github.com/renesenses/oaat?rev=c96021f0#c96021f0f019598efaac8ec320ca886cf40102ed"
 dependencies = [
  "bytes",
  "hostname",
@@ -2923,8 +2923,8 @@ dependencies = [
 
 [[package]]
 name = "oaat-core"
-version = "0.2.5"
-source = "git+https://github.com/renesenses/oaat?rev=ed3b148#ed3b148897e06547e7436b080f8436b78a9064ae"
+version = "0.2.8"
+source = "git+https://github.com/renesenses/oaat?rev=c96021f0#c96021f0f019598efaac8ec320ca886cf40102ed"
 dependencies = [
  "bitflags 2.13.1",
  "bytes",

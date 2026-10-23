@@ -1303,6 +1303,11 @@ mod annonce_navigateur_guard;
 #[cfg(test)]
 mod remontee_des_pannes_de_sortie_tests;
 
+/// #6790 — une sortie qui se met en pause d'elle-même (`endpoint_release`
+/// OAAT) emmène la zone en pause.
+#[cfg(test)]
+mod pause_par_l_appareil_6790_tests;
+
 #[cfg(test)]
 mod lecture_sans_destination_tests;
 
