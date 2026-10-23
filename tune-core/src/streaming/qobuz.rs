@@ -103,7 +103,20 @@ pub struct BasesQobuz {
 }
 
 /// Une lecture de favoris partagée par les demandes qui l'attendent.
-type FavorisEnVol = tokio::sync::OnceCell<Result<Vec<serde_json::Value>, String>>;
+type FavorisEnVol = tokio::sync::OnceCell<Result<ListePaginee, String>>;
+
+/// Une liste paginée relue chez Qobuz, et si elle est COMPLÈTE (#5997).
+///
+/// `incomplete` porte le motif quand la liste ne peut pas être tenue pour
+/// entière : moins d'éléments que le `total` annoncé (Qobuz sert parfois des
+/// pages plus courtes qu'il ne l'annonce, #6616), une réponse sans la clé
+/// attendue, ou une page pleine sans `total`. L'affichage s'en contente ; le
+/// miroir des favoris, lui, ne doit rien retirer sur une telle lecture.
+#[derive(Clone, Debug)]
+struct ListePaginee {
+    items: Vec<serde_json::Value>,
+    incomplete: Option<String>,
+}
 
 /// Une réponse éditoriale, et l'instant où elle a été obtenue.
 struct EntreeCache {
@@ -1205,18 +1218,10 @@ impl QobuzService {
         Ok(data)
     }
 
-    async fn api_get_all_pages(
-        &self,
-        path: &str,
-        base_params: &[(&str, &str)],
-        items_key: &str,
-    ) -> Result<Vec<serde_json::Value>, String> {
-        self.api_get_all_pages_bornee(path, base_params, items_key, usize::MAX)
-            .await
-    }
-
-    /// Comme `api_get_all_pages`, mais cesse de paginer une fois `plafond`
-    /// éléments atteints. Voir `remaining_page_offsets_bornees` (#1969).
+    /// Toutes les pages d'une liste Qobuz, en cessant de paginer une fois
+    /// `plafond` éléments atteints. Voir `remaining_page_offsets_bornees`
+    /// (#1969). Les favoris passent par [`Self::liste_paginee`], qui dit en
+    /// plus si la liste est complète (#5997).
     async fn api_get_all_pages_bornee(
         &self,
         path: &str,
@@ -1224,6 +1229,21 @@ impl QobuzService {
         items_key: &str,
         plafond: usize,
     ) -> Result<Vec<serde_json::Value>, String> {
+        Ok(self
+            .liste_paginee(path, base_params, items_key, plafond)
+            .await?
+            .items)
+    }
+
+    /// La pagination de `api_get_all_pages_bornee`, qui dit en plus si la
+    /// liste rendue est complète (#5997, voir [`ListePaginee`]).
+    async fn liste_paginee(
+        &self,
+        path: &str,
+        base_params: &[(&str, &str)],
+        items_key: &str,
+        plafond: usize,
+    ) -> Result<ListePaginee, String> {
         use futures_util::StreamExt;
         const PAGE_SIZE: usize = 50;
         const MAX_CONCURRENT_PAGES: usize = 4;
@@ -1274,9 +1294,34 @@ impl QobuzService {
             }
         }
 
+        // #5997 — ce que la première page permet de dire de la complétude.
+        let total_annonce = data[items_key]["total"].as_u64().map(|t| t as usize);
+        let cle_presente = data.get(items_key).map(|v| v.is_object()).unwrap_or(false);
+        let complete = |recus: usize| -> Option<String> {
+            if !cle_presente {
+                return Some(format!("qobuz: réponse sans « {items_key} »"));
+            }
+            match total_annonce {
+                Some(t) if recus < t => Some(format!(
+                    "qobuz: lecture de « {items_key} » incomplète ({recus} sur {t})"
+                )),
+                Some(_) => None,
+                // Sans total, une page pleine peut avoir une suite qu'on n'a
+                // pas demandée.
+                None if recus >= PAGE_SIZE => Some(format!(
+                    "qobuz: lecture de « {items_key} » sans total annoncé"
+                )),
+                None => None,
+            }
+        };
+
         let offsets = remaining_page_offsets_bornees(count, total, PAGE_SIZE, plafond);
         if offsets.is_empty() {
-            return Ok(all_items);
+            let incomplete = complete(all_items.len());
+            return Ok(ListePaginee {
+                items: all_items,
+                incomplete,
+            });
         }
 
         // `buffered` preserves page order, so the merged list matches what the
@@ -1308,7 +1353,11 @@ impl QobuzService {
             all_items.extend(page?);
         }
 
-        Ok(all_items)
+        let incomplete = complete(all_items.len());
+        Ok(ListePaginee {
+            items: all_items,
+            incomplete,
+        })
     }
 
     /// Rôles Qobuz d'écriture pure (comparés sans espaces) : un intervenant qui
@@ -1471,6 +1520,29 @@ impl QobuzService {
     /// Les demandes concurrentes d'un même type partagent UNE requête en vol
     /// (voir `favoris_en_vol`) ; aucune réponse n'est gardée après elle.
     async fn favoris_bruts(&self, type_qobuz: &str) -> Result<Vec<serde_json::Value>, TuneError> {
+        Ok(self.lecture_des_favoris(type_qobuz).await?.items)
+    }
+
+    /// Les favoris d'un type, seulement si Qobuz les a servis EN ENTIER
+    /// (#5997) : `Err` sur une lecture incomplète (voir [`ListePaginee`]).
+    ///
+    /// C'est la lecture du miroir des favoris : un favori `synchro` que le
+    /// service ne nomme plus y est retiré de Tune. Une liste coupée à la
+    /// troisième page aurait retiré tout ce qui la dépasse, à chaque
+    /// rafraîchissement.
+    async fn favoris_complets(
+        &self,
+        type_qobuz: &str,
+    ) -> Result<Vec<serde_json::Value>, TuneError> {
+        let lecture = self.lecture_des_favoris(type_qobuz).await?;
+        if let Some(motif) = lecture.incomplete {
+            warn!(type_qobuz, motif = %motif, "qobuz_favoris_lecture_incomplete_5997");
+            return Err(motif.into());
+        }
+        Ok(lecture.items)
+    }
+
+    async fn lecture_des_favoris(&self, type_qobuz: &str) -> Result<ListePaginee, TuneError> {
         let vol = {
             let mut en_vol = self
                 .favoris_en_vol
@@ -1483,10 +1555,11 @@ impl QobuzService {
         };
         let reponse = vol
             .get_or_init(|| async {
-                self.api_get_all_pages(
+                self.liste_paginee(
                     "/favorite/getUserFavorites",
                     &[("type", type_qobuz)],
                     type_qobuz,
+                    usize::MAX,
                 )
                 .await
             })
@@ -3323,6 +3396,24 @@ impl StreamingService for QobuzService {
             return Ok(None);
         }
         let items = self.favoris_bruts(fav_type).await?;
+        Ok(Some(
+            items
+                .iter()
+                .map(|brut| Self::favori_date(brut, fav_type))
+                .collect(),
+        ))
+    }
+
+    /// #5997 — la même liste datée, mais `Err` si Qobuz ne l'a pas servie en
+    /// entier : c'est elle que le miroir réconcilie.
+    async fn favoris_dates_complets(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        if !matches!(fav_type, "tracks" | "albums" | "artists") {
+            return Ok(None);
+        }
+        let items = self.favoris_complets(fav_type).await?;
         Ok(Some(
             items
                 .iter()
