@@ -808,6 +808,21 @@ impl PlaybackOrchestrator {
         self.play_par_l_entree(req, historique, entree).await
     }
 
+    /// Précharge, en tâche de fond, la piste qui suit la piste COURANTE de la
+    /// zone (`PrefetchEngine::prefetch_next`). Appelé quand une piste devient
+    /// courante : au démarrage (`play_inner`) et à l'avance sans blanc (#6772).
+    pub(crate) fn lancer_le_prechargement(&self, zone_id: i64) {
+        let prefetch = self.prefetch.clone();
+        let db = self.db.clone();
+        let services = self.services.clone();
+        let playback = self.playback.clone();
+        tokio::spawn(async move {
+            prefetch
+                .prefetch_next(db, services, playback, zone_id)
+                .await;
+        });
+    }
+
     pub async fn advance_queue_metadata(&self, zone_id: i64, position: i64) -> Result<(), String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
         // #4283 — jumelle de `play_from_queue` : lecture PUIS écriture du
@@ -1037,6 +1052,16 @@ impl PlaybackOrchestrator {
         // court pas sur celle-ci (#4682).
         self.playback.oublier_le_deplacement(zone_id).await;
         self.playback.emit_position(zone_id, 0);
+
+        // #6772 — l'avance sans blanc est un changement de piste qui contourne
+        // `play_inner`, le seul autre lanceur du préchargement. Sans cette
+        // ligne, rien ne préparait la piste N+2 après une avance adoptée : sa
+        // préparation sans blanc partait de zéro (DASH hi-res TIDAL), sortait
+        // de son budget de 10 s, et une transition sur deux avait un blanc.
+        // Même lanceur, mêmes gardes (radio #3342, bannie #5143), que le
+        // démarrage — et APRÈS `update_queue_info` / `update_now_playing`, pour
+        // que la suivante se calcule depuis la piste devenue courante.
+        self.lancer_le_prechargement(zone_id);
 
         // Une avance gapless est une nouvelle écoute confirmée par le sondeur
         // (position remise à zéro, durée changée ou transition Playing après

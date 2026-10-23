@@ -439,12 +439,23 @@ pub(super) async fn list_tracks(
     // bloquants, comme la grille d'albums depuis #4800.
     let (limit, offset) = (p.limit.unwrap_or(50), p.offset.unwrap_or(0));
     let profile_id = profile.id();
+    let (backend, http) = (state.backend.clone(), state.http_client.clone());
     match tokio::task::spawn_blocking(move || {
         lire_la_page_de_pistes(&state, profile_id, p, filter, page_triee)
     })
     .await
     {
-        Ok(corps) => Ok(Json(corps)),
+        Ok(mut corps) => {
+            // #6738 — « So What (128) » : les écoutes de la communauté.
+            tune_core::cloud::ecoutes_communaute::annoter_liste(
+                &backend,
+                &http,
+                tune_core::cloud::ecoutes_communaute::Genre::Piste,
+                corps.get_mut("items"),
+            )
+            .await;
+            Ok(Json(corps))
+        }
         Err(e) => {
             tracing::error!(error = %e, "list_tracks_tache_bloquante_perdue");
             Ok(Json(

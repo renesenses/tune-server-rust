@@ -1,6 +1,9 @@
 #[path = "airplay_timing.rs"]
 mod timing;
 
+#[path = "airplay_controle.rs"]
+mod controle;
+
 #[path = "airplay_flux_progressif.rs"]
 mod flux_progressif;
 
@@ -170,6 +173,9 @@ struct RtspSession {
     session_id: Option<String>,
     server_port: u16,
     timing_port: u16,
+    /// #6751 — le port de contrôle que le récepteur annonce dans sa réponse
+    /// au SETUP : la destination des paquets sync. 0 s'il n'en annonce pas.
+    control_port: u16,
     auxiliary_udp: Option<timing::AuxiliaryUdp>,
 }
 
@@ -243,6 +249,7 @@ impl RtspSession {
             session_id: None,
             server_port: 0,
             timing_port: 0,
+            control_port: 0,
             auxiliary_udp: None,
         })
     }
@@ -278,10 +285,18 @@ impl RtspSession {
 
         let mut reader = BufReader::new(&mut self.stream);
         let mut status_line = String::new();
-        reader
+        let lus = reader
             .read_line(&mut status_line)
             .await
             .map_err(|e| format!("rtsp read status: {e}"))?;
+        // #6751 — un canal fermé par l'appareil sans réponse rendait le code
+        // 0 (« TEARDOWN refused by device: 0 ») : ce n'est pas un refus, c'est
+        // une connexion close. Le dire.
+        if lus == 0 {
+            return Err(format!(
+                "rtsp {method}: connection closed by the device before any response"
+            ));
+        }
 
         let status_code: u32 = status_line
             .split_whitespace()
@@ -380,6 +395,9 @@ impl RtspSession {
                     }
                     if let Some(port_str) = param.strip_prefix("timing_port=") {
                         self.timing_port = port_str.parse().unwrap_or(0);
+                    }
+                    if let Some(port_str) = param.strip_prefix("control_port=") {
+                        self.control_port = port_str.parse().unwrap_or(0);
                     }
                 }
             }
@@ -640,6 +658,15 @@ impl OutputTarget for AirplayOutput {
             .map_err(|e| format!("udp connect {target_addr}: {e}"))?;
         udp.set_nonblocking(true)
             .map_err(|e| format!("udp nonblocking: {e}"))?;
+        // #6751 — sync et retransmissions passent par le port de contrôle que
+        // le récepteur a annoncé.
+        let controle = (session.control_port != 0)
+            .then(|| {
+                session.auxiliary_udp.as_ref().map(|aux| {
+                    aux.controle_vers(std::net::SocketAddr::new(peer.ip(), session.control_port))
+                })
+            })
+            .flatten();
 
         *self.rtsp_session.lock().await = Some(session);
 
@@ -666,6 +693,7 @@ impl OutputTarget for AirplayOutput {
             let result = stream_to_airplay(
                 &url,
                 udp,
+                controle,
                 &playing,
                 &paused,
                 &position_ms,
@@ -799,9 +827,12 @@ impl OutputTarget for AirplayOutput {
     }
 }
 
+// Chemin de sortie audio : regrouper ces arguments en structure toucherait la lecture pour un gain de forme (clippy 1.98).
+#[allow(clippy::too_many_arguments)]
 async fn stream_to_airplay(
     url: &str,
     udp: UdpSocket,
+    controle: Option<controle::ControleRaop>,
     playing: &AtomicBool,
     paused: &AtomicBool,
     position_ms: &AtomicU64,
@@ -809,7 +840,12 @@ async fn stream_to_airplay(
     rtp: &CurseurRtpAirplay,
 ) -> Result<(), String> {
     let ssrc: u32 = rand_random();
-    let udp = tokio::net::UdpSocket::from_std(udp).map_err(|e| format!("tokio udp: {e}"))?;
+    // #6751 — sync et retransmissions passent par le port de contrôle ; le
+    // flux progressif (#6673) et le repli complet partagent cet émetteur.
+    let udp = controle::EmetteurRaop::new(
+        tokio::net::UdpSocket::from_std(udp).map_err(|e| format!("tokio udp: {e}"))?,
+        controle,
+    );
 
     // #6673 — voie A : le décodeur progressif alimente la boucle RTP au fil
     // de l'eau. Le premier paquet part dès le premier bloc décodé, et non plus
@@ -968,14 +1004,6 @@ impl IssueDeDiffusion {
 /// journalise en debug, exactement le symptome qu'on veut interdire.
 trait SortieRtp {
     async fn envoyer(&self, pkt: &[u8]);
-}
-
-impl SortieRtp for tokio::net::UdpSocket {
-    async fn envoyer(&self, pkt: &[u8]) {
-        if let Err(e) = self.send(pkt).await {
-            debug!(error = %e, "airplay_rtp_send_error");
-        }
-    }
 }
 
 /// Emet le PCM big-endian en paquets RTP, au rythme reel.
@@ -1755,6 +1783,10 @@ mod tests {
 #[cfg(test)]
 #[path = "airplay_timing_tests_2217.rs"]
 mod timing_tests_2217;
+
+#[cfg(test)]
+#[path = "airplay_controle_tests_6751.rs"]
+mod controle_tests_6751;
 
 #[cfg(test)]
 #[path = "airplay_flux_progressif_tests_6673.rs"]
