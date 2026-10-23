@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "2a12dab3d07ab6da2fa6bf9264e46df0c160eed2",
+    "web_sha": "835dbae29990a322ea28547702e70cddd3c0c8c6",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -1673,6 +1673,20 @@
         "sans_majorite",
         "raison",
         "en_pause"
+      ]
+    },
+    {
+      "route": "/library/labels",
+      "methode": "GET",
+      "type": "LibraryLabel",
+      "liste": true,
+      "champs_obligatoires": [
+        "name",
+        "album_count"
+      ],
+      "champs_optionnels": [
+        "image_url",
+        "qobuz_label_id"
       ]
     },
     {
@@ -6765,7 +6779,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 335,
+    "routes_cartographiees": 336,
     "appels_non_resolus": 154
   }
 }
