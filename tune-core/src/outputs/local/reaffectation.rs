@@ -66,6 +66,15 @@ pub(crate) fn rouvrir_pour_les_voies(
     }
 }
 
+/// #6230 (étape 2) — la règle, pure : des voies PILOTÉES par une grille ne
+/// s'ouvrent en exclusif que si la sortie en déclare au moins autant (pour
+/// WASAPI : le format du mixeur de l'endpoint). Un nombre déclaré illisible
+/// ou nul refuse : dans le doute, on rouvre au format de la source.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn voies_pilotees_permises(voies: u32, declarees: Option<u32>) -> bool {
+    voies > 0 && declarees.is_some_and(|d| d > 0 && voies <= d)
+}
+
 /// Le créneau vide des étages montés hors d'une `LocalOutput` (témoins).
 #[cfg(test)]
 pub(crate) static SANS_REAFFECTATION: CreneauReaffectation = CreneauReaffectation::vide();
@@ -635,5 +644,28 @@ mod tests {
         creneau.poser(Matrice::du_reglage_arme(&prereglage("swap_lr").unwrap()).map(Arc::new));
         let rendu = adapter_les_canaux(&creneau, vec![0.25, -0.5, 0.125, 0.75], 2, 2, false);
         assert_eq!(rendu, [-0.5, 0.25, 0.75, 0.125]);
+    }
+}
+
+/// #6230 (étape 2) — jamais plus de voies que la sortie n'en déclare.
+#[cfg(test)]
+mod voies_pilotees_6230 {
+    use super::voies_pilotees_permises;
+
+    #[test]
+    fn des_voies_pilotees_ne_depassent_jamais_celles_que_la_sortie_declare_6230() {
+        // Grille 6 → 2 sur une sortie stéréo, ou sur un 7.1 : permis.
+        assert!(voies_pilotees_permises(2, Some(2)));
+        assert!(voies_pilotees_permises(2, Some(8)));
+        // Grille 2 → 6 sur une sortie stéréo : refusé, quoi qu'accepte le
+        // pilote en exclusif.
+        assert!(
+            !voies_pilotees_permises(6, Some(2)),
+            "#6230 : 6 voies pilotées sur une sortie qui en déclare 2"
+        );
+        // Illisible ou absurde : refusé, on rouvre au format source.
+        assert!(!voies_pilotees_permises(2, None));
+        assert!(!voies_pilotees_permises(2, Some(0)));
+        assert!(!voies_pilotees_permises(0, Some(2)));
     }
 }
