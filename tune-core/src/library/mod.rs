@@ -22,6 +22,8 @@ pub mod groupes_versions;
 pub mod importer;
 pub mod ingest;
 pub mod local_path;
+/// Le logo d'un label de la bibliothèque, lu chez Qobuz (#6736).
+pub mod logos_labels;
 pub mod lyrics_pass;
 pub mod m3u_parser;
 pub mod mosaique;

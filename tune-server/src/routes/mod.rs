@@ -557,6 +557,12 @@ pub fn router_with_plugins(
             "/services/tokens/{id}/test",
             axum::routing::post(service_tokens::test),
         )
+        // #6777 — effacer le SEUL Client ID Spotify, pas toutes les clés
+        // `spotify_*` (Spotify Connect…). 404 pour tout autre service.
+        .route(
+            "/services/tokens/{id}/client-id",
+            axum::routing::delete(service_tokens::delete_client_id),
+        )
         .route(
             "/services/lastfm/auth",
             axum::routing::post(service_tokens::lastfm_auth),

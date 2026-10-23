@@ -396,7 +396,19 @@ pub(crate) async fn jouer_disque(
             "Le disque est en cours d'extraction : annulez-la pour le jouer.".into(),
         ));
     }
-    let toc = toc_ou_refus(etat).await?;
+    let toc = match toc_ou_refus(etat).await {
+        Ok(toc) => toc,
+        // #6410 — le lecteur est vide, mais le disque éjecté est gardé
+        // ENTIER en mémoire : la source le publie jouable, « Jouer » le sert
+        // donc depuis la mémoire (la file s'y ouvre, `fournisseur.rs`).
+        Err(refus) if refus.1 == "aucun_disque" => {
+            match etat.memoire.as_ref().and_then(|m| m.disque_garde()) {
+                Some(c) => c.toc().clone(),
+                None => return Err(refus),
+            }
+        }
+        Err(refus) => return Err(refus),
+    };
     let disc = disc_id(&toc);
     let infos = etat.consultation.consulter(&disc).await;
     let file = elements(&toc, &disc, infos.as_ref());
