@@ -157,3 +157,42 @@ async fn le_meme_appareil_garde_pure_verrouille() {
         "même appareil : la baisse reste refusée sous PURE verrouillé"
     );
 }
+
+/// Décision de Bertrand du 23/10 — SANS limite de confort ni de sécurité ni
+/// mémoire du volume fixe : rien n'est envoyé au nouvel appareil au moment du
+/// changement, la base et l'état de lecture repartent de 30 % au plus, et la
+/// graine du nouvel appareil part de 30 %, pas de 100 %.
+#[tokio::test]
+async fn sans_repere_le_nouvel_appareil_repart_de_30_pour_cent() {
+    for mode in [Mode::PureVerrouille, Mode::VolumeFixe] {
+        let (orch, zone_id) = zone_armee(mode).await;
+        SettingsRepo::with_backend(orch.db.clone())
+            .delete(&format!("zone_{zone_id}_volume_limit_comfort"))
+            .unwrap();
+        ZoneRepo::with_backend(orch.db.clone())
+            .update_output_device(zone_id, NOUVEAU)
+            .unwrap();
+        assert!(
+            recus_par(&orch, NOUVEAU).await.is_empty(),
+            "rien n'est commandé à l'appareil au changement"
+        );
+        crate::audio::reglages_de_volume::aligner_la_lecture(&orch.db, &orch.playback, zone_id)
+            .await;
+        let zone = ZoneRepo::with_backend(orch.db.clone())
+            .get(zone_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(zone.volume, 30.0, "#6774 : la base reste à 100 %");
+        assert!(
+            orch.playback.get_state(zone_id).await.volume <= 0.30,
+            "#6774 : l'état de lecture reste à 100 % — le pas des boutons en part"
+        );
+        let graine = MockOutput::new(NOUVEAU, "Graine");
+        super::ensemencer_le_volume_local(&orch.db, &zone, NOUVEAU, &graine).await;
+        let recus = graine.volume_calls().await;
+        assert!(
+            recus.iter().all(|v| *v <= 0.30 + 1e-12),
+            "graine au-dessus de 30 % : {recus:?}"
+        );
+    }
+}

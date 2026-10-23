@@ -375,3 +375,129 @@ async fn sans_consigne_de_tune_aucun_set_volume_au_changement_de_piste() {
         "#6472 : aucun SetVolume ne doit partir au changement de piste quand Tune n'a posé aucune consigne ; envoyés : {envoyes:?}"
     );
 }
+
+/// Appareil qui a APPRIS la règle à la première piste, comme l'Abyss de
+/// pissa7 : Tune pose `consigne`, la piste part (l'appareil remonte à 80 à la
+/// pose, Tune réimpose), puis la fenêtre d'après pose et la grâce d'après
+/// demande sont écoulées. Rend la sortie, son faux renderer et sa tâche.
+async fn abyss_hors_fenetre(
+    udn: &str,
+    consigne: f64,
+) -> (DlnaOutput, FauxRenderer, tokio::task::JoinHandle<()>) {
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    let etat = FauxRenderer::new(true);
+    let (sortie, vie) = demarrer(etat.clone(), udn).await;
+    sortie.set_volume(consigne).await.unwrap();
+    sortie
+        .play_media(&piste("http://127.0.0.1:9/stream/2401-a.flac"))
+        .await
+        .expect("la première piste part");
+    // Dans la fenêtre : le saut de la pose est vu, la règle s'apprend.
+    let statut = sortie.get_status().await.unwrap();
+    assert!(
+        (statut.volume - consigne).abs() < 0.005,
+        "prémisse : le saut de la pose est corrigé dans la fenêtre ({})",
+        statut.volume
+    );
+    assert!(
+        compat::volume_remonte_a_l_uri(udn),
+        "prémisse : règle apprise"
+    );
+    sortie.vieillir_la_pose_d_uri();
+    sortie.vieillir_la_demande_de_volume();
+    (sortie, etat, vie)
+}
+
+/// 🔴 #6008 (pissa7, fil 2401, rc7) — la séquence du journal. Consigne 22 %,
+/// piste lancée, saut à 80 corrigé dans les 15 s ; puis, 33 s après le début
+/// de la piste et sans aucun `SetVolume` de Tune, l'Abyss rapporte de nouveau
+/// 80 (`volume_adopte_du_renderer ancien=22.0 nouveau=80.0`). Hors de la
+/// fenêtre, Tune laissait l'appareil à 80. Désormais il le ramène à 22, le
+/// sondeur reçoit 22, et aucun ordre au-dessus de 22 ne part jamais.
+#[tokio::test]
+async fn hors_fenetre_un_80_de_l_abyss_est_ramene_a_la_consigne() {
+    let udn = "uuid:banc-6008-2401-hors-fenetre";
+    let (sortie, etat, vie) = abyss_hors_fenetre(udn, 0.22).await;
+
+    // L'appareil remonte seul, hors de la fenêtre.
+    *etat.volume.lock().await = 80;
+    let statut = sortie.get_status().await.unwrap();
+    let tenu = *etat.volume.lock().await;
+    let envoyes = etat.set_volume.lock().await.clone();
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+
+    assert_eq!(
+        tenu, 22,
+        "#6008 (fil 2401) : l'Abyss a remonté son volume à 80 % hors de la fenêtre d'après pose, \
+         et Tune l'y a laissé ; il doit le ramener à la consigne de l'auditeur (22 %)"
+    );
+    assert!(
+        (statut.volume - 0.22).abs() < 0.005,
+        "#6008 : le sondeur doit recevoir la consigne réimposée, pas les 80 % ({})",
+        statut.volume
+    );
+    assert!(
+        envoyes.iter().all(|&v| v <= 22),
+        "#6008 : aucun SetVolume au-dessus de la consigne de l'auditeur (22) ; envoyés : {envoyes:?}"
+    );
+}
+
+/// Contre-épreuve : la piste en cours n'est pas celle de Tune (source propre de
+/// l'appareil, autre serveur). Son volume n'est jamais touché.
+#[tokio::test]
+async fn hors_fenetre_une_source_qui_n_est_pas_tune_n_est_pas_touchee() {
+    let udn = "uuid:banc-6008-2401-autre-source";
+    let (sortie, etat, vie) = abyss_hors_fenetre(udn, 0.22).await;
+    let avant = etat.set_volume.lock().await.len();
+
+    *etat.current_uri.lock().await = "http://192.0.2.50:9000/radio-integree".into();
+    *etat.volume.lock().await = 80;
+    let statut = sortie.get_status().await.unwrap();
+    let apres = etat.set_volume.lock().await[avant..].to_vec();
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+
+    assert!((statut.volume - 0.80).abs() < 0.005, "{}", statut.volume);
+    assert!(apres.is_empty(), "aucun SetVolume : {apres:?}");
+}
+
+/// Contre-épreuve : juste après une demande de volume de Tune (glissement de
+/// curseur), une lecture plus haute n'est pas jugée hors fenêtre.
+#[tokio::test]
+async fn hors_fenetre_rien_n_est_corrige_dans_la_grace_d_une_demande() {
+    let udn = "uuid:banc-6008-2401-grace";
+    let (sortie, etat, vie) = abyss_hors_fenetre(udn, 0.22).await;
+    sortie.set_volume(0.22).await.unwrap();
+    let avant = etat.set_volume.lock().await.len();
+
+    *etat.volume.lock().await = 40;
+    let statut = sortie.get_status().await.unwrap();
+    let apres = etat.set_volume.lock().await[avant..].to_vec();
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+
+    assert!((statut.volume - 0.40).abs() < 0.005, "{}", statut.volume);
+    assert!(
+        apres.is_empty(),
+        "aucun SetVolume dans la grâce : {apres:?}"
+    );
+}
+
+/// Contre-épreuve : une BAISSE hors fenêtre (la main de l'auditeur) n'est
+/// jamais corrigée.
+#[tokio::test]
+async fn hors_fenetre_une_baisse_n_est_pas_corrigee() {
+    let udn = "uuid:banc-6008-2401-baisse";
+    let (sortie, etat, vie) = abyss_hors_fenetre(udn, 0.22).await;
+    let avant = etat.set_volume.lock().await.len();
+
+    *etat.volume.lock().await = 10;
+    let statut = sortie.get_status().await.unwrap();
+    let apres = etat.set_volume.lock().await[avant..].to_vec();
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+
+    assert!((statut.volume - 0.10).abs() < 0.005, "{}", statut.volume);
+    assert!(apres.is_empty(), "aucun SetVolume : {apres:?}");
+}

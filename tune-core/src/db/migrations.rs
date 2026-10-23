@@ -2632,6 +2632,28 @@ CREATE INDEX IF NOT EXISTS idx_hires_verifications_verdict ON hires_verification
         name: "artists_sort_name_source",
         up: "",
     },
+    // #6682 (go de Bertrand du 21/10) — « Mon écoute » compte le temps
+    // d'écoute RADIO par station, à part des classements : une ligne par
+    // jour, adresse du flux, zone et profil propriétaire (0 : aucun), que la
+    // veille d'écoute (`db::radio_ecoute::veille`) incrémente. Naît vide.
+    // Jumelle PG : 096.
+    Migration {
+        version: 132,
+        name: "radio_ecoutes",
+        up: "
+CREATE TABLE IF NOT EXISTS radio_ecoutes (
+    jour TEXT NOT NULL,
+    station_url TEXT NOT NULL,
+    station_name TEXT NOT NULL DEFAULT '',
+    zone_id INTEGER NOT NULL DEFAULT 0,
+    profile_id INTEGER NOT NULL DEFAULT 0,
+    listening_ms INTEGER NOT NULL DEFAULT 0,
+    sessions INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (jour, station_url, zone_id, profile_id)
+);
+CREATE INDEX IF NOT EXISTS idx_radio_ecoutes_jour ON radio_ecoutes(jour);
+",
+    },
 ];
 
 /// Migration 127 (#6257) : `tags.position`, 0 pour toutes les etiquettes
@@ -5515,6 +5537,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         95,
         "artists_sort_name_source",
         include_str!("../../migrations/postgres/095_artists_sort_name_source.sql"),
+    ),
+    // Jumelle de la SQLite 132 (#6682) : `radio_ecoutes`, le temps d'écoute
+    // radio par jour et par station. Naît vide.
+    (
+        96,
+        "radio_ecoutes",
+        include_str!("../../migrations/postgres/096_radio_ecoutes.sql"),
     ),
 ];
 
@@ -8936,7 +8965,9 @@ mod tests {
         // Pose la provenance du nom de tri, que le scan et l'enrichissement
         // NOMMENT. Les 92 à 94 sont celles de #6637, #6641 et #6633, à
         // fusionner AVANT.
-        assert_eq!(pg_latest_version(), 95, "latest PG migration must be 95");
+        // 96 : `radio_ecoutes` (#6682), jumelle de la SQLite 132. Crée la
+        // table du temps d'écoute radio, que la veille d'écoute NOMME.
+        assert_eq!(pg_latest_version(), 96, "latest PG migration must be 96");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

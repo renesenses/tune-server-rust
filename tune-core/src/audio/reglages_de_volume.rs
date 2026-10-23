@@ -149,7 +149,8 @@ fn lire_le_trim(settings: &SettingsRepo, zone_id: i64) -> Option<f64> {
 ///    les réarme lui-même sur le nouveau. Le volume de la zone repart alors
 ///    de la valeur la plus basse entre le volume courant, les limites de
 ///    confort et de sécurité et le volume mémorisé avant l'armement du volume
-///    fixe — jamais une hausse. Journal
+///    fixe — jamais une hausse. Sans aucun de ces repères, il repart de 30 %
+///    du curseur au plus ([`plafond_sans_repere`], décision du 23/10). Journal
 ///    `pure_et_volume_fixe_desarmes_changement_d_appareil`. Rien n'est
 ///    commandé à l'appareil ici : seule la base change.
 /// 2. **Le trim NÉGATIF reste** (il ne fait que baisser) ; seul un trim
@@ -231,15 +232,25 @@ pub fn ajuster_au_changement_d_appareil(
         let limites = crate::audio::volume_limites::lire(db, zone_id);
         let avant = zone.volume;
         let mut apres = avant;
-        for candidat in [
+        let reperes: Vec<f64> = [
             limites.confort.map(|f| f * 100.0),
             limites.securite.map(|f| f * 100.0),
             memoire_fixe.filter(|_| rapport.volume_fixe_desarme),
         ]
         .into_iter()
         .flatten()
-        {
-            if candidat.is_finite() && candidat < apres {
+        .filter(|c| c.is_finite())
+        .collect();
+        // Décision de Bertrand du 23/10 : sans limite de confort, ni de
+        // sécurité, ni mémoire du volume fixe, la zone repart de 30 % du
+        // CURSEUR au plus (jamais relevée si elle était plus bas).
+        let candidats = if reperes.is_empty() {
+            vec![plafond_sans_repere(zone.output_type.as_deref(), nouveau_device_id) * 100.0]
+        } else {
+            reperes
+        };
+        for candidat in candidats {
+            if candidat < apres {
                 apres = candidat;
             }
         }
@@ -265,6 +276,37 @@ pub fn ajuster_au_changement_d_appareil(
         );
     }
     rapport
+}
+
+/// Décision de Bertrand du 23/10 (#6774) : position de CURSEUR (0..1) où
+/// repart une zone dont PURE verrouillé ou le volume fixe vient d'être
+/// désarmé au changement d'appareil, quand aucune limite ni mémoire du volume
+/// fixe ne dit plus bas.
+pub const CURSEUR_SANS_REPERE: f64 = 0.30;
+
+/// Le gain (0..1) de [`CURSEUR_SANS_REPERE`] pour une zone qui passe de la
+/// sortie `ancien_output_type` à l'appareil `nouveau_device_id`.
+///
+/// 30 % se lisent sur le curseur de la zone (#6787) : sur un appareil réseau,
+/// 30 sur son échelle 0..100 ; sur une sortie logicielle (curseur `db60`),
+/// −42 dB de gain — et non 30 % de gain (−10,5 dB), qui jouerait 31,5 dB plus
+/// fort que le curseur affiché. Au moment du changement, `output_type` n'est
+/// pas encore réécrit (les appelants écrivent l'appareil d'abord) : l'échelle
+/// retenue est la plus BASSE des deux, celle de l'ancienne sortie ou celle que
+/// l'identifiant du nouvel appareil désigne (`local:`, `browser`). Le plafond
+/// ne dépasse donc jamais 30 % du curseur de la nouvelle sortie.
+pub fn plafond_sans_repere(ancien_output_type: Option<&str>, nouveau_device_id: &str) -> f64 {
+    use crate::audio::volume_scale::EchelleDeVolume;
+    let nouvelle =
+        if nouveau_device_id.starts_with("local:") || nouveau_device_id.starts_with("browser") {
+            EchelleDeVolume::Perceptive
+        } else {
+            EchelleDeVolume::Lineaire
+        };
+    let ancienne = EchelleDeVolume::de_la_sortie(ancien_output_type);
+    nouvelle
+        .gain(CURSEUR_SANS_REPERE)
+        .min(ancienne.gain(CURSEUR_SANS_REPERE))
 }
 
 /// Après un changement d'appareil, l'état de lecture EN MÉMOIRE ne doit pas
