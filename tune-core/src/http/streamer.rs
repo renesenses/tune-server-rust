@@ -68,6 +68,10 @@ pub struct RadioSourceInfo {
     pub format: Option<&'static str>,
     pub sample_rate: Option<u32>,
     pub bit_depth: Option<u16>,
+    /// #6821 — le débit que la station ANNONCE dans son en-tête `icy-br`
+    /// (kbit/s), lu à la connexion. `None` : en-tête absent ou illisible —
+    /// rien n'est déduit du conteneur ni de la fréquence.
+    pub bitrate_kbps: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]

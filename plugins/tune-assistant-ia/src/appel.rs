@@ -123,6 +123,28 @@ impl ErreurAppel {
     }
 }
 
+/// Quel modèle pour un appel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Choix {
+    /// Le modèle habituel (Haiku 5.5 par défaut chez Anthropic).
+    Defaut,
+    /// Le modèle « classique » s'il est choisi, sinon l'habituel.
+    Classique,
+    /// Le second avis demandé par l'utilisateur : Sonnet 5.5 chez Anthropic
+    /// ([`Reglages::modele_fort`]).
+    Fort,
+}
+
+impl Choix {
+    pub fn depuis_classique(classique: bool) -> Self {
+        if classique {
+            Self::Classique
+        } else {
+            Self::Defaut
+        }
+    }
+}
+
 /// Une réponse, et d'où elle vient.
 #[derive(Clone, Debug)]
 pub struct Resultat {
@@ -169,9 +191,34 @@ pub async fn appeler_avec(
     entree_cache: Option<&str>,
     json: bool,
 ) -> Result<Resultat, ErreurAppel> {
+    appeler_choix(
+        m,
+        usage,
+        Choix::depuis_classique(classique),
+        systeme,
+        message,
+        max_jetons,
+        entree_cache,
+        json,
+    )
+    .await
+}
+
+/// [`appeler_avec`], avec le modèle désigné par un [`Choix`].
+#[allow(clippy::too_many_arguments)]
+pub async fn appeler_choix(
+    m: &Moyens<'_>,
+    usage: &str,
+    choix: Choix,
+    systeme: &str,
+    message: &str,
+    max_jetons: u32,
+    entree_cache: Option<&str>,
+    json: bool,
+) -> Result<Resultat, ErreurAppel> {
     let r = Reglages::charger(m.backend);
     let famille = r.famille.ok_or(ErreurAppel::NonConfigure)?;
-    let modele = r.modele_effectif(classique);
+    let modele = r.modele_choisi(choix);
     if modele.is_empty() {
         return Err(ErreurAppel::NonConfigure);
     }
@@ -213,6 +260,8 @@ pub async fn appeler_avec(
         message: message.to_string(),
         max_jetons,
         json,
+        // Décision du 23/10/2026 : `effort: low` pour les usages courts.
+        effort: couts::usage_court(usage).then_some(couts::EFFORT_COURT),
     };
     let rep = fournisseur
         .completer(&demande)
