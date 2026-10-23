@@ -8,6 +8,9 @@ mod journal_pause_reprise_tests;
 #[path = "playback/reprise_apres_redemarrage_dlna_6380_tests.rs"]
 mod reprise_apres_redemarrage_dlna_6380_tests;
 #[cfg(test)]
+#[path = "playback/reprise_service_titre_seul_6380_tests.rs"]
+mod reprise_service_titre_seul_6380_tests;
+#[cfg(test)]
 #[path = "playback/seek_en_double_193_tests.rs"]
 mod seek_en_double_193_tests;
 #[cfg(test)]
@@ -3031,6 +3034,20 @@ async fn play(
         });
         // #6399 — lu avant que `body` ne parte dans la demande de lecture.
         let tete_de_liste = body.queue_follows;
+        // #6380 (Sandro, fil 2404, rc7, Qobuz sur Diretta Renderer) : le bouton
+        // Lecture du client web, zone arrêtée sur une piste de SERVICE, envoie
+        // `{source, source_id}` — c'est CETTE branche, pas le corps vide. Sans
+        // la reprise ici, `playback_position_restored position_ms=19000` au
+        // démarrage, puis aucune `reprise_a_la_position_restauree` au Play :
+        // la piste repartait de 0:00 alors que les pistes locales reprenaient.
+        // Même règle que `{track_id}` : un `seek_ms` explicite reste prioritaire
+        // (ici, comme avant, il n'est pas lu) et la reprise ne vaut que pour la
+        // piste restaurée, une seule fois.
+        let reprise = if body.seek_ms.is_none() {
+            position_de_reprise(&state, zone_id, None, Some(source_id_val.as_str())).await
+        } else {
+            None
+        };
         let orch_req = tune_core::orchestrator::PlayRequest {
             zone_id,
             output_device_id,
@@ -3042,7 +3059,7 @@ async fn play(
             album_title: body.album_title,
             cover_url: body.cover_path,
             duration_ms: body.duration_ms,
-            seek_ms: None,
+            seek_ms: reprise,
             temp_file_path: None,
             sample_rate: body.sample_rate,
             bit_depth: body.bit_depth,
@@ -3051,7 +3068,8 @@ async fn play(
             disc_number: None,
             album_ref: album_ref_val.clone(),
         };
-        return match state.orchestrator.play(orch_req).await {
+        ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
+        return match lancer_la_lecture(&state, orch_req, reprise).await {
             Ok(result) => {
                 // If this track is already part of the loaded streaming queue
                 // (e.g. the user pressed Stop then Play again on a track from an
