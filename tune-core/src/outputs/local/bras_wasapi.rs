@@ -36,8 +36,8 @@
 
 use super::backend::{Observation, RefusDOuverture, Vidage};
 use super::chaine_native::{
-    FinDeChaine, FinDuVidage, HoteDeChaineNative, ReserveDeLaChaine, ReserveHttp, Suivante,
-    attendre_le_vidage, jouer_la_chaine_native,
+    FinDeChaine, HoteDeChaineNative, ReserveDeLaChaine, ReserveHttp, Suivante,
+    jouer_la_chaine_native,
 };
 use super::etage_natif::{EcritureNative, EtageNatif, PuitsAnneauNatif, spec_du_puits_natif};
 use super::*;
@@ -259,6 +259,9 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
     /// en pause ne compte pas. La position publiée ne recule pas : le bras ne
     /// le faisait pas, et ce n'est pas l'objet de #6842.
     fn drainer(&mut self, borne: std::time::Duration) -> Vidage {
+        // Import local : l'en-tête du module reste celui d'avant, pour ne pas
+        // croiser #6230 (étape 2) sur les mêmes lignes.
+        use super::chaine_native::{FinDuVidage, attendre_le_vidage};
         let fed_position_ms = self.position_ms.load(Ordering::Relaxed);
         let anneau = &self.anneau;
         let stop_rx = self.stop_rx;
