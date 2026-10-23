@@ -1135,6 +1135,12 @@ struct PlayRequest {
     // le client l'ENONCER ; ils priment sur toute deduction.
     context_type: Option<String>,
     context_id: Option<String>,
+    /// #6465 — l'espace de noms de `context_id` (`local`, `qobuz`…), quand
+    /// l'appelant l'énonce, comme `queue/add` le lit déjà. Sans lui, c'est
+    /// `source` qui le donne — le service du TITRE de tête : faux pour une
+    /// playlist de la bibliothèque lue en aléatoire dont le premier titre
+    /// tiré est un titre Qobuz.
+    context_source: Option<String>,
     /// #6467 — « Lire » un artiste de la BIBLIOTHÈQUE : le serveur tire au
     /// hasard jusqu'à 50 de ses titres (bannis écartés) et les joue, contexte
     /// `artist`. Voir `lire_artiste_6467`.
@@ -1222,7 +1228,14 @@ fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>, O
         // L'appelant qui ENONCE son contexte enonce aussi le service dans
         // `source`, comme pour toute lecture de service. Son absence dit la
         // bibliotheque : c'est la seule autre provenance possible.
-        let service = body.source.clone().unwrap_or_else(|| LOCAL.to_string());
+        let service = body
+            .context_source
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| body.source.clone())
+            .unwrap_or_else(|| LOCAL.to_string());
         return (Some(t.to_string()), body.context_id.clone(), Some(service));
     }
 
@@ -7213,6 +7226,29 @@ pub struct ShuffleAllQuery {
     folder: Option<String>,
 }
 
+/// #6465 — le conteneur que désigne un tirage `POST /playback/shuffle-all`,
+/// dans le vocabulaire de [`contexte_de_lecture`] : l'album ou l'artiste de la
+/// bibliothèque tiré. Les autres portées (bibliothèque entière, répertoire,
+/// recherche, genre) ne sont pas un conteneur de l'Historique : rien.
+fn contexte_d_un_tirage(q: &ShuffleAllQuery) -> (Option<String>, Option<String>, Option<String>) {
+    const LOCAL: &str = "local";
+    if let Some(id) = q.album_id {
+        return (
+            Some("album".into()),
+            Some(id.to_string()),
+            Some(LOCAL.into()),
+        );
+    }
+    if let Some(id) = q.artist_id {
+        return (
+            Some("artist".into()),
+            Some(id.to_string()),
+            Some(LOCAL.into()),
+        );
+    }
+    (None, None, None)
+}
+
 // Combien de pistes une lecture aléatoire enfile au maximum.
 //
 // C'était une constante à 500, posée pour fermer le gel d'interface de Jean
@@ -7479,6 +7515,32 @@ pub async fn shuffle_all(
             let _ = queue_repo.clear(zone_id);
         }
     }
+
+    // #6465 — le conteneur du tirage, posé sur la session comme le fait
+    // « Lire » (#2441) : l'Historique range les titres joués sous l'album ou
+    // l'artiste tiré. Sans cette pose, la session gardait le geste PRÉCÉDENT
+    // — un album lu en aléatoire ne s'historisait pas comme conteneur (fil
+    // 2379, point 1), et ses titres pouvaient se ranger dans l'album d'avant.
+    // Toujours écraser, même à vide : ce tirage remplace le geste précédent.
+    let (contexte_type, contexte_id, contexte_service) = contexte_d_un_tirage(&q);
+    let (contexte_titre, contexte_pochette) = nom_du_contexte(
+        &state,
+        contexte_type.as_deref(),
+        contexte_id.as_deref(),
+        contexte_service.as_deref(),
+    )
+    .await;
+    state
+        .playback
+        .set_session_context(
+            zone_id,
+            contexte_type,
+            contexte_id,
+            contexte_service,
+            contexte_titre,
+            contexte_pochette,
+        )
+        .await;
 
     let first_id = all_ids[0];
     let track = track_repo.get(first_id).ok().flatten();
@@ -8533,6 +8595,31 @@ mod tests_prereglage {
 #[cfg(test)]
 mod tests_contexte_de_lecture {
     use super::{PlayRequest, contexte_de_lecture};
+
+    /// #6465 — une playlist de la BIBLIOTHÈQUE lue en aléatoire dont le titre
+    /// de tête est un titre Qobuz : le corps porte `source: "qobuz"` (celui du
+    /// titre) et `context_source: "local"` (celui de la playlist). C'est la
+    /// playlist locale 12 qui a été demandée, pas la playlist Qobuz 12.
+    #[test]
+    fn la_source_du_contexte_enoncee_prime_sur_celle_du_titre_6465() {
+        let body = PlayRequest {
+            source: Some("qobuz".into()),
+            source_id: Some("264104097".into()),
+            context_type: Some("playlist".into()),
+            context_id: Some("12".into()),
+            context_source: Some("local".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (
+                Some("playlist".into()),
+                Some("12".into()),
+                Some("local".into())
+            ),
+            "la playlist locale 12 s'est rangée chez Qobuz"
+        );
+    }
 
     /// #2441 — FabienM, fil 1557 : « si je choisis de jouer une playlist
     /// complete, je m'attends a voir cette playlist ». Aujourd'hui le serveur
