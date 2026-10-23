@@ -815,6 +815,30 @@ pub(super) async fn get_config(
             "description": crate::i18n::t(&lang, "settings.communityContribution.description"),
         }),
     );
+    // #6840 — le consentement au partage des écoutes avec le compte. Trois
+    // états (`a_demander`, `accepte`, `refuse`), et `linked` : la question ne
+    // se pose que sur un serveur relié à un compte mozaiklabs.fr. La bascule
+    // `cloud_listens_upload_enabled` est republiée depuis le MÊME état que lit
+    // l'envoi, pour que l'écran ne puisse pas dire « oui » quand rien ne part.
+    {
+        use tune_core::cloud::ecoutes_au_compte as ec;
+        let etat = ec::consentement(&settings);
+        let relie = tune_core::cloud::sauvegarde_config::compte(&settings).is_ok();
+        config.insert(
+            ec::CLE_ACTIVATION.to_string(),
+            json!(etat == ec::Consentement::Accepte),
+        );
+        config.insert(
+            ec::CLE_REPONSE.to_string(),
+            json!({
+                "state": etat.id(),
+                "linked": relie,
+                "answered_at": ec::date_du_consentement(&settings),
+                "dismissals": ec::fermetures_sans_reponse(&settings),
+                "max_dismissals": ec::FERMETURES_MAX,
+            }),
+        );
+    }
     // Derived boolean: web client checks discogs_token_set to display badge.
     // Check both the DB setting and the env/toml fallback so that users
     // who set TUNE_DISCOGS_TOKEN in .env or tune.toml also see it as configured.
@@ -1425,6 +1449,61 @@ fn normaliser_intervalle_reseau(
 /// #4384 — le patch a-t-il touché un réglage dont dépend le facteur
 /// ReplayGain de lecture ? Toutes ces clés partagent le préfixe
 /// `replaygain_` (`audio::replaygain::{MODE_KEY, PREAMP_KEY, …}`).
+/// #6840 — la réponse à la question des écoutes, retirée du patch.
+///
+/// Deux portes, un seul chemin d'écriture
+/// ([`tune_core::cloud::ecoutes_au_compte::enregistrer_reponse`]) :
+/// - `cloud_listens_consent` : `accepte`, `refuse` ou `fermee` (la fenêtre
+///   du démarrage) ; tout autre mot est REFUSÉ ;
+/// - `cloud_listens_upload_enabled` : la bascule des Réglages, vrai vaut
+///   « accepte », faux « refuse ».
+///
+/// Les clés internes (état, date, compteur) ne s'écrivent pas par ce patch
+/// générique : un client ne date pas un consentement à la place du serveur.
+fn prendre_reponse_ecoutes(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<Option<tune_core::cloud::ecoutes_au_compte::Reponse>, AppError> {
+    use tune_core::cloud::ecoutes_au_compte as ec;
+    for interne in [
+        ec::CLE_CONSENTEMENT,
+        ec::CLE_CONSENTEMENT_DATE,
+        ec::CLE_FERMETURES,
+    ] {
+        if values.contains_key(interne) {
+            return Err(AppError::bad_request(format!(
+                "`{interne}` is written by the server; send `{}`: \"accepte\", \"refuse\" or \"fermee\"",
+                ec::CLE_REPONSE
+            )));
+        }
+    }
+    let texte = |v: Value| {
+        v.as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| v.to_string())
+    };
+    let reponse = values.remove(ec::CLE_REPONSE).map(texte);
+    let bascule = values.remove(ec::CLE_ACTIVATION).map(texte);
+    match (reponse, bascule) {
+        (Some(_), Some(_)) => Err(AppError::bad_request(format!(
+            "send either `{}` or `{}`, not both",
+            ec::CLE_REPONSE,
+            ec::CLE_ACTIVATION
+        ))),
+        (Some(mot), None) => ec::Reponse::depuis(&mot).map(Some).ok_or_else(|| {
+            AppError::bad_request(format!(
+                "`{}` must be \"accepte\", \"refuse\" or \"fermee\"",
+                ec::CLE_REPONSE
+            ))
+        }),
+        (None, Some(v)) => Ok(Some(if tune_core::cloud::consent::est_vrai(&v) {
+            ec::Reponse::Oui
+        } else {
+            ec::Reponse::Non
+        })),
+        (None, None) => Ok(None),
+    }
+}
+
 fn touche_le_replaygain(cles_posees: &[String]) -> bool {
     cles_posees.iter().any(|c| c.starts_with("replaygain_"))
 }
@@ -1481,6 +1560,9 @@ pub(super) async fn update_config(
     let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
     normaliser_genres_du_clap(&mut values)?;
     let intervalle_reseau_demande = normaliser_intervalle_reseau(&mut values)?;
+    // #6840 — la réponse à la question des écoutes (ou la bascule des
+    // Réglages) : retirée de la boucle générique, écrite plus bas, datée.
+    let reponse_ecoutes = prendre_reponse_ecoutes(&mut values)?;
     let scan_au_demarrage_efface = normaliser_scan_au_demarrage(&mut values)?.is_some();
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
@@ -1603,6 +1685,18 @@ pub(super) async fn update_config(
     // « la requête est arrivée » de « la requête n'est jamais partie », qui
     // est la seule question que ce ticket n'a pas su résoudre.
     let mut cles_posees: Vec<String> = Vec::with_capacity(values.len());
+    let mut consentement_ecoutes = None;
+    if let Some(r) = reponse_ecoutes {
+        use tune_core::cloud::ecoutes_au_compte as ec;
+        match ec::enregistrer_reponse(&settings, r, chrono::Utc::now()) {
+            Ok(etat) => consentement_ecoutes = Some(etat),
+            Err(e) => {
+                tracing::error!(reglage = ec::CLE_REPONSE, erreur = %e, "reglage_non_ecrit");
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
+            }
+        }
+        cles_posees.push(ec::CLE_REPONSE.to_string());
+    }
     for (key, value) in values {
         let str_val = if value.is_string() {
             value
@@ -1682,6 +1776,9 @@ pub(super) async fn update_config(
     }
 
     let mut reponse = json!({"ok": true});
+    if let Some(etat) = consentement_ecoutes {
+        reponse[tune_core::cloud::ecoutes_au_compte::CLE_REPONSE] = json!(etat.id());
+    }
     // Champ ADDITIF : combien de sorties locales ont reçu le nouveau facteur
     // ReplayGain tout de suite. `0` = rien ne jouait en local ; une zone
     // réseau l'entendra à la piste suivante.
@@ -1906,6 +2003,96 @@ mod envoi_des_ecoutes_tests_6510 {
         let (status, _) = requete(&state, "PATCH", Some(json!({ CLE_PARTAGE: true }))).await;
         assert_eq!(status, StatusCode::OK);
         assert!(partage_active(&reglages));
+    }
+
+    /// #6840 — l'état publié : à demander tant que rien n'est répondu, avec
+    /// `linked` qui dit si la question a lieu d'être.
+    #[tokio::test]
+    async fn le_consentement_est_publie_a_demander_et_relie_6840() {
+        use tune_core::cloud::ecoutes_au_compte::CLE_REPONSE;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let reglages = SettingsRepo::with_backend(state.backend.clone());
+        let (_, config) = requete(&state, "GET", None).await;
+        let c = &config[CLE_REPONSE];
+        assert_eq!(c["state"], json!("a_demander"), "{c}");
+        assert_eq!(c["linked"], json!(false), "non relié publié relié : {c}");
+        assert_eq!(c["answered_at"], Value::Null);
+        assert_eq!(c["dismissals"], json!(0));
+        assert_eq!(c["max_dismissals"], json!(2));
+        assert_eq!(config[CLE_ACTIVATION], json!(false));
+
+        reglages.set("mozaik_access_token", "jeton").unwrap();
+        reglages.set("server_id", "serveur-a").unwrap();
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[CLE_REPONSE]["linked"], json!(true));
+        assert_eq!(config[CLE_REPONSE]["state"], json!("a_demander"));
+    }
+
+    /// #6840 — fermée sans réponse : comptée, redemandée une fois, puis
+    /// refusée ; « Oui » date l'accord et ouvre l'envoi ; un mot inconnu ou
+    /// une clé interne est refusé sans rien écrire.
+    #[tokio::test]
+    async fn la_reponse_s_ecrit_par_patch_et_une_seule_relance_6840() {
+        use tune_core::cloud::ecoutes_au_compte::{
+            CLE_CONSENTEMENT, CLE_CONSENTEMENT_DATE, CLE_REPONSE,
+        };
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let reglages = SettingsRepo::with_backend(state.backend.clone());
+
+        let (status, r) = requete(&state, "PATCH", Some(json!({ CLE_REPONSE: "fermee" }))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(r[CLE_REPONSE], json!("a_demander"));
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[CLE_REPONSE]["dismissals"], json!(1));
+        assert_eq!(config[CLE_REPONSE]["state"], json!("a_demander"));
+        assert!(!envoi_active(&reglages));
+
+        let (_, r) = requete(&state, "PATCH", Some(json!({ CLE_REPONSE: "fermee" }))).await;
+        assert_eq!(
+            r[CLE_REPONSE],
+            json!("refuse"),
+            "redemandée plus d'une fois"
+        );
+        assert!(!envoi_active(&reglages));
+
+        for refus in [
+            json!({ CLE_REPONSE: "oui" }),
+            json!({ CLE_CONSENTEMENT: "accepte" }),
+            json!({ CLE_CONSENTEMENT_DATE: "2020-01-01T00:00:00Z" }),
+            json!({ CLE_REPONSE: "accepte", CLE_ACTIVATION: true }),
+        ] {
+            let (status, _) = requete(&state, "PATCH", Some(refus.clone())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "accepté : {refus}");
+        }
+        assert!(!envoi_active(&reglages), "un patch refusé a ouvert l'envoi");
+
+        let (status, r) = requete(&state, "PATCH", Some(json!({ CLE_REPONSE: "accepte" }))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(r[CLE_REPONSE], json!("accepte"));
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[CLE_REPONSE]["state"], json!("accepte"));
+        assert!(config[CLE_REPONSE]["answered_at"].is_string());
+        assert_eq!(config[CLE_ACTIVATION], json!(true));
+        assert!(envoi_active(&reglages));
+
+        // La bascule des Réglages passe par le même chemin.
+        requete(&state, "PATCH", Some(json!({ CLE_ACTIVATION: false }))).await;
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[CLE_REPONSE]["state"], json!("refuse"));
+    }
+
+    /// #6840 — un serveur qui avait DÉJÀ activé l'envoi avant la rc8 est
+    /// publié « accepté » : pas de re-question.
+    #[tokio::test]
+    async fn deja_active_est_publie_accepte_6840() {
+        use tune_core::cloud::ecoutes_au_compte::CLE_REPONSE;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set(CLE_ACTIVATION, "true")
+            .unwrap();
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[CLE_REPONSE]["state"], json!("accepte"));
+        assert_eq!(config[CLE_ACTIVATION], json!(true));
     }
 }
 
