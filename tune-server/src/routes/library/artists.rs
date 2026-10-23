@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::state::AppState;
+use tune_core::cloud::ecoutes_communaute::{self, Genre};
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
@@ -307,6 +308,14 @@ pub(super) async fn get_artist(
             if let (Some(obj), Ok(Some(prov))) = (j.as_object_mut(), repo.bio_provenance(id)) {
                 obj.insert("bio_provenance".into(), prov);
             }
+            // #6738 — le total des écoutes de la communauté, absent sous le seuil.
+            ecoutes_communaute::annoter_un(
+                &state.backend,
+                &state.http_client,
+                Genre::Artiste,
+                &mut j,
+            )
+            .await;
             Json(j).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -696,6 +705,16 @@ pub(super) async fn artist_albums(
             (par_le_type || par_le_titre, v)
         })
         .collect();
+    // #6738 — les écoutes de la communauté de chaque album de la fiche.
+    let (lives, mut valeurs): (Vec<bool>, Vec<Value>) = items.into_iter().unzip();
+    ecoutes_communaute::annoter(
+        &state.backend,
+        &state.http_client,
+        Genre::Album,
+        &mut valeurs,
+    )
+    .await;
+    let items: Vec<(bool, Value)> = lives.into_iter().zip(valeurs).collect();
 
     // Même lecture du drapeau que `proposals.rs` et `reports.rs`.
     if !q
@@ -852,6 +871,8 @@ pub(super) async fn artist_tracks(
     // Passer par `Vec<Value>` lui donne au passage `channel_badge` (additif).
     let mut items: Vec<Value> = items.iter().map(|t| t.to_json()).collect();
     super::albums::attacher_banni(&state, profile.id(), &mut items);
+    // #6738 — « So What (128) » : les écoutes de la communauté.
+    ecoutes_communaute::annoter(&state.backend, &state.http_client, Genre::Piste, &mut items).await;
     Json(json!(items))
 }
 
