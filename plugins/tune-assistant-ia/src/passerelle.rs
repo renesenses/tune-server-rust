@@ -250,6 +250,7 @@ impl Passerelle {
                             if !fonctions.is_empty() {
                                 corps["tools"] = json!(fonctions);
                             }
+                            fournisseur::poser_num_ctx(&mut corps, max_jetons);
                             fournisseur::client()
                                 .post(format!("{}/api/chat", fournisseur::base(acces)))
                                 .timeout(fournisseur::DELAI)
@@ -304,6 +305,12 @@ impl Passerelle {
                 if outils.as_array().is_some_and(|o| !o.is_empty()) {
                     corps["tools"] = outils.clone();
                 }
+                // Une commande de `/ai/query` est un usage court (23/10/2026).
+                fournisseur::poser_effort(
+                    &mut corps,
+                    modele,
+                    crate::couts::usage_court(USAGE_REQUETE).then_some(crate::couts::EFFORT_COURT),
+                );
                 fournisseur::client()
                     .post(format!("{}/v1/messages", fournisseur::base(acces)))
                     .header("x-api-key", acces.cle.as_deref().unwrap_or(""))
