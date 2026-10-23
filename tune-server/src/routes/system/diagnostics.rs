@@ -1613,6 +1613,9 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     let log_path = crate::config::default_log_file_path()
         .to_string_lossy()
         .into_owned();
+    // #6866 — l'erreur d'un fichier présent mais illisible, gardée pour la fin :
+    // elle ne dispense plus des replis.
+    let mut fichier_illisible: Option<String> = None;
 
     // Read only a bounded tail, off the async runtime. Reading the whole file
     // with read_to_string both blocked a Tokio worker (same trap as
@@ -1629,8 +1632,12 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
         let a_lire = max_lines.saturating_mul(CANDIDATE_FACTOR).max(max_lines);
         let tail =
             tokio::task::spawn_blocking(move || read_log_tail(&path, a_lire, LOG_TAIL_BYTES)).await;
-        match tail {
-            Ok(Ok(brutes)) => {
+        // Une tâche annulée se traite comme un fichier absent : on tente les replis.
+        match tail
+            .unwrap_or(Err(LogTailError::Missing))
+            .map_err(suite_d_un_fichier_non_lu)
+        {
+            Ok(brutes) => {
                 let lues = brutes.len();
                 let (lines, ecartees) = selectionner_lignes(brutes, max_lines);
                 if !ecartees.is_empty() {
@@ -1654,16 +1661,12 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
                     "set_aside": ecartees,
                 }));
             }
-            Ok(Err(LogTailError::Unreadable(e))) => {
-                return Json(json!({
-                    "logs": format!("Log file exists but could not be read: {e}\nPath: {log_path}"),
-                    "lines": 0,
-                    "source": "file_unreadable",
-                    "path": log_path,
-                }));
+            Err(illisible) => {
+                if let Some(ref e) = illisible {
+                    tracing::warn!(path = %log_path, error = %e, "log_export_fichier_illisible_replis_tentes");
+                }
+                fichier_illisible = illisible;
             }
-            // Missing file or a cancelled blocking task: try the fallbacks.
-            Ok(Err(LogTailError::Missing)) | Err(_) => {}
         }
     }
 
@@ -1835,14 +1838,56 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     #[cfg(not(target_os = "linux"))]
     let tentatives = format!("Chemins et sources essayés :\n  - fichier : {log_path}");
 
-    Json(json!({
-        "logs": format!(
-            "Aucun journal accessible. Si Tune tourne en service, la commande \
-             ci-dessous le donne en direct :\n  journalctl -u tune -n 2000 --no-pager\n\n{tentatives}"
-        ),
-        "lines": 0,
-        "source": "none",
-    }))
+    reponse_sans_journal(&log_path, fichier_illisible.as_deref(), &tentatives)
+}
+
+/// #6866 — ce que l'export fait d'un fichier qu'il n'a pas pu lire : `Err(None)`
+/// pour un fichier absent, `Err(Some(erreur))` pour un fichier présent mais
+/// illisible. Dans les deux cas, l'export tente ENSUITE les replis
+/// (journalctl, syslog).
+///
+/// Tune OS, fil 2400 (rc7) : `tune.service` tourne en `User=tune` avec
+/// `ProtectHome=yes`, et le journal par défaut est sous `/home/tune`. Le
+/// service n'y écrit rien (tout part à journald) et l'export recevait
+/// `EACCES` — pas `NotFound`. Il rendait alors « Log file exists but could
+/// not be read: Permission denied » (230 octets) et s'arrêtait là : le repli
+/// `journalctl -u tune`, écrit justement pour Tune OS, n'était jamais tenté.
+fn suite_d_un_fichier_non_lu(e: LogTailError) -> Option<String> {
+    match e {
+        LogTailError::Missing => None,
+        LogTailError::Unreadable(erreur) => Some(erreur),
+    }
+}
+
+/// La réponse quand aucune source n'a rien donné. Un fichier illisible le dit
+/// — sans prétendre qu'il « existe » : `EACCES` sous `ProtectHome` ne dit rien
+/// de son existence — et rappelle la commande qui donne le journal en direct.
+fn reponse_sans_journal(
+    log_path: &str,
+    fichier_illisible: Option<&str>,
+    tentatives: &str,
+) -> Json<Value> {
+    let commande = "journalctl -u tune -n 2000 --no-pager";
+    match fichier_illisible {
+        Some(e) => Json(json!({
+            "logs": format!(
+                "Fichier journal inaccessible au serveur ({e}), et aucun autre journal \
+                 trouvé. Si Tune tourne en service, la commande ci-dessous le donne en \
+                 direct :\n  {commande}\n\n{tentatives}"
+            ),
+            "lines": 0,
+            "source": "file_unreadable",
+            "path": log_path,
+        })),
+        None => Json(json!({
+            "logs": format!(
+                "Aucun journal accessible. Si Tune tourne en service, la commande \
+                 ci-dessous le donne en direct :\n  {commande}\n\n{tentatives}"
+            ),
+            "lines": 0,
+            "source": "none",
+        })),
+    }
 }
 
 // --- Log level management ---
@@ -3779,6 +3824,62 @@ mod log_tail_tests {
         std::fs::write(&path, "a\nb\n").unwrap();
         let lines = read_log_tail(path.to_str().unwrap(), 1000, 1024).unwrap();
         assert_eq!(lines, ["a", "b"]);
+    }
+    /// #6866 (Tune OS, fil 2400) — le journal sous `/home/tune`, que
+    /// `ProtectHome=yes` rend inaccessible : `EACCES`, pas `NotFound`. Un
+    /// fichier illisible ne dispense plus des replis (journalctl, syslog).
+    ///
+    /// Contre-épreuve : faire rendre `None` à `suite_d_un_fichier_non_lu`
+    /// pour `Unreadable` (l'erreur perdue) fait tomber ce test. Le `return`
+    /// anticipé de l'ancien code ne peut plus s'écrire : la branche ne reçoit
+    /// que `Err(Option<String>)` et tombe dans les replis.
+    #[cfg(unix)]
+    #[test]
+    fn un_fichier_illisible_laisse_place_aux_replis() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home-tune");
+        std::fs::create_dir(&home).unwrap();
+        let path = home.join("tune-server.log");
+        std::fs::write(&path, "ligne\n").unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let lu = read_log_tail(path.to_str().unwrap(), 10, 1024);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let Err(e) = lu else {
+            // Compte root : les droits ne s'appliquent pas, la prémisse manque.
+            eprintln!("prémisse absente (droits ignorés) : test sans objet");
+            return;
+        };
+        assert!(
+            matches!(e, LogTailError::Unreadable(_)),
+            "prémisse : EACCES se lit comme illisible, pas comme absent ({e:?})"
+        );
+        assert!(
+            suite_d_un_fichier_non_lu(e).is_some(),
+            "l'erreur est gardée pour la réponse finale"
+        );
+        assert_eq!(suite_d_un_fichier_non_lu(LogTailError::Missing), None);
+    }
+
+    /// Ce que rend l'export quand AUCUN repli n'a rien donné après un fichier
+    /// illisible : la cause, sans « exists », et la commande qui marche.
+    #[test]
+    fn la_reponse_finale_dit_le_fichier_inaccessible_et_la_commande() {
+        let Json(v) = reponse_sans_journal(
+            "/home/tune/.local/state/tune/tune-server.log",
+            Some("Permission denied (os error 13)"),
+            "Chemins et sources essayés : …",
+        );
+        assert_eq!(v["source"], "file_unreadable");
+        assert_eq!(v["lines"], 0);
+        assert_eq!(v["path"], "/home/tune/.local/state/tune/tune-server.log");
+        let logs = v["logs"].as_str().unwrap();
+        assert!(logs.contains("Permission denied"), "{logs}");
+        assert!(logs.contains("journalctl -u tune"), "{logs}");
+        assert!(!logs.contains("exists"), "{logs}");
+
+        let Json(v) = reponse_sans_journal("/x.log", None, "t");
+        assert_eq!(v["source"], "none");
     }
 }
 

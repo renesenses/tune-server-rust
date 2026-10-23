@@ -1693,6 +1693,34 @@
     "hu": "Hangerő beállítva: {value}%.",
     "vi": "Đã đặt âm lượng {value}%."
   },
+  "ai.volumeRaiseLimited": {
+    "fr": "Je ne monte le volume que par petits pas : au plus {value}% pour l'instant. Rien n'a changé.",
+    "en": "I only raise the volume in small steps: at most {value}% for now. Nothing was changed.",
+    "de": "Ich erhöhe die Lautstärke nur in kleinen Schritten: höchstens {value}% im Moment. Nichts wurde geändert.",
+    "es": "Solo subo el volumen en pasos pequeños: como máximo {value}% por ahora. No se ha cambiado nada.",
+    "it": "Alzo il volume solo a piccoli passi: al massimo {value}% per ora. Non è cambiato nulla.",
+    "zh": "我只会小幅调高音量：目前最多 {value}%。未做任何更改。",
+    "ja": "音量は少しずつしか上げません。現在は最大 {value}% です。何も変更していません。",
+    "ko": "볼륨은 조금씩만 올립니다. 지금은 최대 {value}%입니다. 아무것도 바뀌지 않았습니다.",
+    "ro": "Măresc volumul doar în pași mici: cel mult {value}% deocamdată. Nu s-a schimbat nimic.",
+    "sv": "Jag höjer bara volymen i små steg: högst {value} % just nu. Inget har ändrats.",
+    "hu": "A hangerőt csak kis lépésekben emelem: most legfeljebb {value}%. Semmi sem változott.",
+    "vi": "Tôi chỉ tăng âm lượng từng bước nhỏ: tối đa {value}% lúc này. Không có gì thay đổi."
+  },
+  "ai.volumeRefused": {
+    "fr": "Le volume n'a pas pu être réglé. Rien n'a changé.",
+    "en": "The volume could not be set. Nothing was changed.",
+    "de": "Die Lautstärke konnte nicht eingestellt werden. Nichts wurde geändert.",
+    "es": "No se pudo ajustar el volumen. No se ha cambiado nada.",
+    "it": "Non è stato possibile impostare il volume. Non è cambiato nulla.",
+    "zh": "无法设置音量。未做任何更改。",
+    "ja": "音量を設定できませんでした。何も変更していません。",
+    "ko": "볼륨을 설정할 수 없습니다. 아무것도 바뀌지 않았습니다.",
+    "ro": "Volumul nu a putut fi setat. Nu s-a schimbat nimic.",
+    "sv": "Volymen kunde inte ställas in. Inget har ändrats.",
+    "hu": "A hangerőt nem sikerült beállítani. Semmi sem változott.",
+    "vi": "Không thể đặt âm lượng. Không có gì thay đổi."
+  },
   "ai.nowPlaying": {
     "fr": "En cours : {track} — {artist}",
     "en": "Now playing: {track} — {artist}",
@@ -2996,17 +3024,17 @@
     "vi": "Ambient"
   },
   "spotify.playback.disabled": {
-    "fr": "Lecture Spotify non activée : l'option expérimentale se trouve dans Réglages > Spotify > « Lecture Spotify (expérimental) ».",
-    "en": "Spotify playback is not enabled: the experimental option is in Settings > Spotify.",
-    "de": "Spotify-Wiedergabe ist nicht aktiviert: Die experimentelle Option befindet sich unter Einstellungen > Spotify.",
-    "es": "La reproducción de Spotify no está activada: la opción experimental está en Ajustes > Spotify.",
-    "it": "La riproduzione Spotify non è attivata: l'opzione sperimentale si trova in Impostazioni > Spotify.",
-    "zh": "Spotify 播放未启用：实验性选项位于 设置 > Spotify。",
-    "ja": "Spotify の再生は有効になっていません。試験的オプションは 設定 > Spotify にあります。",
-    "ko": "Spotify 재생이 활성화되지 않았습니다. 실험적 옵션은 설정 > Spotify에 있습니다.",
-    "ro": "Redarea Spotify nu este activată: opțiunea experimentală se află în Setări > Spotify.",
-    "sv": "Spotify-uppspelning är inte aktiverad: det experimentella alternativet finns under Inställningar > Spotify.",
-    "hu": "A Spotify-lejátszás nincs engedélyezve: a kísérleti beállítás a Beállítások > Spotify alatt található.",
-    "vi": "Chưa bật phát Spotify: tùy chọn thử nghiệm nằm trong Cài đặt > Spotify."
+    "fr": "Lecture Spotify non activée : l'option « Lecture Spotify (expérimental) » se trouve dans Réglages › Accès et jetons › Spotify Connect (niveau Avancé).",
+    "en": "Spotify playback is not enabled: the “Spotify playback (experimental)” option is in Settings › Access and tokens › Spotify Connect (Advanced level).",
+    "de": "Spotify-Wiedergabe ist nicht aktiviert: Die Option „Spotify-Wiedergabe (experimentell)“ befindet sich unter Einstellungen › Zugang und Token › Spotify Connect (Stufe Fortgeschritten).",
+    "es": "La reproducción de Spotify no está activada: la opción «Reproducción de Spotify (experimental)» está en Ajustes › Acceso y tokens › Spotify Connect (nivel Avanzado).",
+    "it": "La riproduzione Spotify non è attivata: l'opzione «Riproduzione Spotify (sperimentale)» si trova in Impostazioni › Accesso e token › Spotify Connect (livello Avanzato).",
+    "zh": "Spotify 播放未启用：“Spotify 播放（实验性）”选项位于 设置 › 访问与令牌 › Spotify Connect（高级级别）。",
+    "ja": "Spotify の再生は有効になっていません。「Spotify 再生（試験的）」オプションは 設定 › アクセスとトークン › Spotify Connect（アドバンスト レベル）にあります。",
+    "ko": "Spotify 재생이 활성화되지 않았습니다. 'Spotify 재생(실험적)' 옵션은 설정 › 접근과 토큰 › Spotify Connect(고급 수준)에 있습니다.",
+    "ro": "Redarea Spotify nu este activată: opțiunea „Redare Spotify (experimental)” se află în Setări › Acces și jetoane › Spotify Connect (nivelul Avansat).",
+    "sv": "Spotify-uppspelning är inte aktiverad: alternativet ”Spotify-uppspelning (experimentell)” finns under Inställningar › Åtkomst och tokens › Spotify Connect (nivå Avancerad).",
+    "hu": "A Spotify-lejátszás nincs engedélyezve: a „Spotify-lejátszás (kísérleti)” beállítás a Beállítások › Hozzáférés és tokenek › Spotify Connect alatt található (Haladó szint).",
+    "vi": "Chưa bật phát Spotify: tùy chọn “Phát Spotify (thử nghiệm)” nằm trong Cài đặt › Truy cập và token › Spotify Connect (cấp Nâng cao)."
   }
 }
