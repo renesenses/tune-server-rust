@@ -7988,3 +7988,7 @@ mod tests_livrets_qobuz_6481 {
         );
     }
 }
+
+/// #6736 — le logo d'un label, rapproché par `label/search` ou par l'album.
+#[path = "qobuz_logos_labels.rs"]
+mod logos_labels;
