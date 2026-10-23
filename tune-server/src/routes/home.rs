@@ -480,6 +480,8 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
     // Deux lignes d'un meme contexte peuvent porter la MEME `listened_at` (la
     // seconde est a la seconde pres) : la jointure sur le MAX les rend toutes
     // les deux. On garde la premiere, l'ordre etant deja decroissant.
+    // Meme regle pour un contexte coupe en deux groupes par la migration 105
+    // (voir `service_vu`) : la plus recente, qui porte le rang, l'emporte.
     let mut vues = std::collections::HashSet::new();
     let brut: Vec<_> = rows
         .iter()
@@ -496,7 +498,19 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
             // la playlist Qobuz `66898771` porte 3 lignes `source = 'local'`
             // sur 21, pour trois titres de la bibliotheque qu'elle contient.
             let espace = cols.get(10).and_then(|v| v.as_string());
-            vues.insert((nature.clone(), id.clone(), espace.clone()))
+            // Le dedoublonnage porte sur le SERVICE que la vignette annonce,
+            // pas sur l'espace brut (#6833). Une ligne d'avant la migration
+            // 105 (`None`) et une ligne d'apres (`'local'`) du MEME album de
+            // la bibliotheque formaient deux groupes SQL, donc deux vignettes
+            // au meme `album_id`. A `None`, le service est celui de la piste
+            // (le repli ci-dessous) : deux espaces REELLEMENT differents
+            // (Qobuz contre Tidal) restent deux vignettes.
+            let service_vu = espace.clone().unwrap_or_else(|| {
+                cols.get(9)
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_else(|| "local".into())
+            });
+            vues.insert((nature.clone(), id.clone(), service_vu))
                 .then_some((nature, id, espace, cols))
         })
         .collect();
@@ -3331,6 +3345,96 @@ mod tests_contexte_de_service {
         let mut noms: Vec<&str> = items.iter().filter_map(|i| i["title"].as_str()).collect();
         noms.sort_unstable();
         assert_eq!(noms, vec!["Playlist Qobuz", "Playlist Tidal"]);
+    }
+
+    /// #6833 (FabienM, tune-remote-flutter#111) : le MEME album de la
+    /// bibliotheque ecoute avant la migration 105 (`context_source` nul) puis
+    /// apres (`'local'`) sortait DEUX fois, au meme `album_id`.
+    ///
+    /// TEMOIN ROUGE avant le correctif : deux vignettes, `album_id` identique.
+    #[test]
+    fn un_album_ecoute_avant_et_apres_la_migration_105_ne_sort_qu_une_fois() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (name) VALUES ('Miles Davis')", &[])
+            .unwrap();
+        let artiste = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id, track_count) VALUES ('Kind of Blue', ?1, 5)",
+            &[&artiste as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let album = b.last_insert_rowid().to_string();
+        // Avant 105 : la colonne n'existait pas, la ligne la porte NULLE.
+        b.execute(
+            "INSERT INTO listen_history \
+             (title, album_title, source, context_type, context_id, \
+              context_position, listened_at) \
+             VALUES ('So What', 'Kind of Blue', 'local', 'album', ?1, 0, \
+                     '2026-09-01T10:00:00Z')",
+            &[&album as &dyn ToSqlValue],
+        )
+        .unwrap();
+        // Apres 105 : le meme album, espace de noms ecrit.
+        b.execute(
+            "INSERT INTO listen_history \
+             (title, album_title, source, context_type, context_id, \
+              context_source, context_position, listened_at) \
+             VALUES ('Freddie Freeloader', 'Kind of Blue', 'local', 'album', ?1, \
+                     'local', 1, '2026-10-20T10:00:00Z')",
+            &[&album as &dyn ToSqlValue],
+        )
+        .unwrap();
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        let du_meme_album = items
+            .iter()
+            .filter(|i| i["context_id"].as_str() == Some(album.as_str()))
+            .count();
+        assert_eq!(du_meme_album, 1, "un album, une vignette : {items:?}");
+        assert_eq!(
+            items[0]["position"].as_i64(),
+            Some(1),
+            "la vignette gardee est la plus recente, celle qui porte le rang : {items:?}"
+        );
+    }
+
+    /// Contre-cas de #6833 : une ligne d'avant 105 d'une piste QOBUZ et une
+    /// ligne locale au meme identifiant restent deux objets.
+    #[test]
+    fn une_ligne_ancienne_de_service_ne_se_fond_pas_dans_un_album_local() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO listen_history \
+             (title, album_title, source, context_type, context_id, \
+              context_position, listened_at) \
+             VALUES ('September', 'Album Qobuz', 'qobuz', 'playlist', '777', 0, \
+                     '2026-09-01T10:00:00Z')",
+            &[],
+        )
+        .unwrap();
+        ecoute_de_service(
+            &state,
+            "Fantasy",
+            "Album local",
+            "local",
+            "playlist",
+            "777",
+            "local",
+            Some("Playlist locale"),
+            None,
+            "2026-10-20T10:00:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 2, "deux services, deux vignettes : {items:?}");
     }
 
     /// La mesure du .18, telle quelle : la playlist Qobuz `66898771` porte
