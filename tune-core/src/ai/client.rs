@@ -4,7 +4,11 @@ use tracing::{debug, warn};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
-const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+// Décision de Bertrand du 23/10/2026 : Claude Haiku 5.5 par défaut PARTOUT
+// (Sonnet 5.5 seulement sur demande). Ce client historique ne sert plus qu'à
+// un binaire compilé sans le greffon `assistant-ia` et à la traduction des
+// ambiances par une clé héritée.
+const DEFAULT_MODEL: &str = "claude-haiku-5-5";
 const DEFAULT_MAX_TOKENS: u32 = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
