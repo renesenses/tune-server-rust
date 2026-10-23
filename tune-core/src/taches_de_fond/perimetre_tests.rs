@@ -649,6 +649,15 @@ fn les_compteurs_ne_visent_que_les_dossiers_inclus_2173() {
     piste(&db, 1, "/music/Jazz/a.flac");
     piste(&db, 2, "/music/Pop/b.flac");
     piste(&db, 3, "/music/Pop/c.flac");
+    // Le rattrapage de la plage dynamique attend le témoin ReplayGain quand
+    // celui-ci est armé (voir `les_compteurs_excluent_la_racine_reglee`).
+    let meta = TrackMetadataRepo::new(db.clone());
+    for id in [1, 2, 3] {
+        meta.set(id, "rg_analyzed", "1").unwrap();
+    }
+    // Deux pistes de plus, que le ReplayGain n'a pas encore vues.
+    piste(&db, 4, "/music/Jazz/d.flac");
+    piste(&db, 5, "/music/Pop/e.flac");
     let compter = |b: &Arc<dyn DbBackend>| {
         (
             replaygain::compter_les_candidats_replaygain(b),
@@ -657,13 +666,13 @@ fn les_compteurs_ne_visent_que_les_dossiers_inclus_2173() {
         )
     };
     let avant = compter(&backend);
-    assert_eq!(avant, (3, 3, 3), "sans périmètre");
+    assert_eq!(avant, (2, 3, 5), "sans périmètre");
     regler(
         &backend,
         CLE_DOSSIERS_INCLUS,
         serde_json::json!(["/music/Jazz"]),
     );
-    assert_eq!(compter(&backend), (1, 1, 1), "seul le dossier inclus");
+    assert_eq!(compter(&backend), (1, 1, 2), "seul le dossier inclus");
     regler(&backend, CLE_DOSSIERS_INCLUS, serde_json::json!([]));
     assert_eq!(compter(&backend), avant);
 }
