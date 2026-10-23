@@ -108,6 +108,30 @@ impl Reglages {
             .unwrap_or_default()
     }
 
+    /// Le modèle « second avis », demandé explicitement par l'écran (décision
+    /// du 23/10/2026 : Haiku 5.5 par défaut partout, Sonnet 5.5 SUR DEMANDE).
+    /// Le modèle « classique » choisi s'il y en a un ; sinon, chez Anthropic,
+    /// Claude Sonnet 5.5 ; ailleurs, le modèle habituel (aucun autre nom de
+    /// modèle n'est inventé).
+    pub fn modele_fort(&self) -> String {
+        if !self.modele_classique.is_empty() {
+            return self.modele_classique.clone();
+        }
+        if self.famille == Some(Famille::Anthropic) {
+            return couts::MODELE_ANTHROPIC_CLASSIQUE.to_string();
+        }
+        self.modele_effectif(false)
+    }
+
+    /// Le modèle d'un appel, selon le [`crate::appel::Choix`] de l'usage.
+    pub fn modele_choisi(&self, choix: crate::appel::Choix) -> String {
+        match choix {
+            crate::appel::Choix::Defaut => self.modele_effectif(false),
+            crate::appel::Choix::Classique => self.modele_effectif(true),
+            crate::appel::Choix::Fort => self.modele_fort(),
+        }
+    }
+
     /// Le tarif du modèle. `Some(0)` pour Ollama ; `None` si inconnu.
     pub fn tarif(&self, modele: &str) -> Option<Tarif> {
         match self.famille? {
@@ -205,6 +229,9 @@ pub fn vue(db: &Arc<dyn DbBackend>, coffre: &Coffre) -> Value {
         "modele": r.modele,
         "modele_effectif": modele,
         "modele_classique": r.modele_classique,
+        // 23/10/2026 : le modèle du « second avis », demandé explicitement.
+        "modele_second_avis": r.modele_fort(),
+        "effort_usages_courts": crate::couts::accepte_effort(&modele).then_some(crate::couts::EFFORT_COURT),
         "url_base": r.url_base,
         "url_par_defaut": r.famille.map(Famille::url_par_defaut),
         "plafond_eur": couts::micro_en_euros(r.plafond_micro_eur),
@@ -405,6 +432,29 @@ mod tests {
             cle_posee: true,
             espace_de_travail: String::new(),
         }
+    }
+
+    #[test]
+    fn haiku_par_defaut_et_sonnet_seulement_sur_demande() {
+        let r = reglages(Famille::Anthropic, "", None);
+        assert_eq!(
+            r.modele_choisi(crate::appel::Choix::Defaut),
+            "claude-haiku-5-5"
+        );
+        assert_eq!(
+            r.modele_choisi(crate::appel::Choix::Classique),
+            "claude-haiku-5-5",
+            "le classique détecté ne bascule PAS seul vers Sonnet"
+        );
+        assert_eq!(
+            r.modele_choisi(crate::appel::Choix::Fort),
+            "claude-sonnet-5-5"
+        );
+        let g = reglages(Famille::Gemini, "", None);
+        assert_eq!(
+            g.modele_choisi(crate::appel::Choix::Fort),
+            couts::MODELE_GEMINI_PAR_DEFAUT
+        );
     }
 
     #[test]
