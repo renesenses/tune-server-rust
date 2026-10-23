@@ -279,3 +279,86 @@ async fn la_reprise_apres_un_echec_enjambe_la_suivante_bannie() {
         "la bannie n'est jamais lancée"
     );
 }
+
+// --- 4. Le profil de la session (#6824) -----------------------------------
+
+/// #6824 (fil 2281, Meddle / Seamus, rc7) — le titre est banni sous le profil
+/// de l'APPAREIL (2, `X-Profile-Id`), qui a lancé la lecture
+/// (`session_profile_id`) ; le réglage global `active_profile_id` est resté
+/// au profil 1. La suivante jouable — celle de l'armement sans blanc, du
+/// préchargement et de l'avance — doit enjamber ce banni, comme la file le
+/// barre à l'écran.
+///
+/// Contre-épreuve : ignorer `profil_de_session` dans
+/// `profil_des_bannis_de_la_zone` fait tomber ce test (rend B).
+#[tokio::test]
+async fn la_suivante_jouable_suit_les_bannis_du_profil_de_la_session() {
+    let sqlite = SqliteDb::open_in_memory().unwrap();
+    sqlite.init_schema().unwrap();
+    run_migrations(&sqlite).unwrap();
+    let db: Arc<dyn DbBackend> = Arc::new(sqlite);
+    let profil_appareil = crate::db::profile_repo::ProfileRepo::with_backend(db.clone())
+        .create("appareil-6824", None, None)
+        .unwrap();
+    assert_ne!(profil_appareil, PROFIL, "prémisse : deux profils distincts");
+    let zone_id = ZoneRepo::with_backend(db.clone())
+        .create("Salon 6824", Some("oaat"), Some("oaat:banc-6824"))
+        .unwrap();
+    PlayQueueRepo::with_backend(db.clone())
+        .append(
+            zone_id,
+            &[titre_qobuz("A"), titre_qobuz("B"), titre_qobuz("C")],
+        )
+        .unwrap();
+    assert!(
+        HiddenRepo::with_backend(db.clone())
+            .ban_streaming_track(
+                profil_appareil,
+                &TitreDeService {
+                    source: "qobuz".into(),
+                    source_id: "B".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    );
+    let playback = PlaybackManager::new();
+    playback
+        .set_session_profile(zone_id, Some(profil_appareil))
+        .await;
+    playback
+        .play(
+            zone_id,
+            NowPlaying {
+                title: "Titre A".into(),
+                source: "qobuz".into(),
+                source_id: Some("A".into()),
+                duration_ms: 200_000,
+                ..Default::default()
+            },
+        )
+        .await;
+    playback.update_queue_info(zone_id, 0, 3).await;
+    let etat = playback.get_state(zone_id).await;
+    assert_eq!(
+        etat.session_profile_id,
+        Some(profil_appareil),
+        "prémisse : la session appartient au profil de l'appareil"
+    );
+
+    assert_eq!(
+        crate::poller::PositionPoller::prochaine_position_jouable(&db, zone_id, &etat),
+        Some(2),
+        "B est banni sous le profil de la session : la suivante jouable est C"
+    );
+
+    // Témoin : une zone SANS session (redémarrage) garde le repli sur le
+    // profil actif du serveur, sous lequel B n'est pas banni.
+    let mut sans_session = etat.clone();
+    sans_session.session_profile_id = None;
+    assert_eq!(
+        crate::poller::PositionPoller::prochaine_position_jouable(&db, zone_id, &sans_session),
+        Some(1),
+        "sans session, le profil actif du serveur (1) décide"
+    );
+}
