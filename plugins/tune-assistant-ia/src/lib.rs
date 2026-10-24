@@ -29,6 +29,9 @@
 //! | `POST /lot/suggestions` | `{album_ids, budget_eur?}` → aperçu d'un lot, arrêt net au plafond |
 //! | `POST /lot/appliquer` | `{albums: [{album_id, lignes}]}` |
 //! | `POST /lot/annuler` | `{operations: [{album_id, operation_id}]}` |
+//! | `POST /albums/{id}/notes` | `{langue?, second_avis?, regenerer?}` → notes de pochette marquées IA ([`notes`]) |
+//! | `GET /albums/{id}/notes` | les dernières notes rangées, ou 404 |
+//! | `DELETE /albums/{id}/notes` | efface les notes rangées |
 //! | `POST /collections/affiner` | `{cible?, actuelle: {name, match_mode, rules}, phrase}` → règles modifiées et écart (#6839) |
 //! | `POST /collections/proposer` | 5 à 10 collections depuis les statistiques de la bibliothèque |
 //! | `POST /collections/nommer` | `{cible?, rules, match_mode?}` → nom et description marqués IA |
@@ -57,6 +60,7 @@ pub mod diagnostic;
 pub mod dialogue;
 pub mod fournisseur;
 pub mod migration;
+pub mod notes;
 pub mod passerelle;
 pub mod pistes;
 pub mod pseudonymes;

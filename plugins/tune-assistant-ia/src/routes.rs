@@ -54,6 +54,10 @@ pub fn router_vers(etat: Etat) -> Router<()> {
         .route("/collections/ecoute", post(collections_ecoute))
         .route("/diagnostic/apercu", post(diagnostic_apercu))
         .route("/diagnostic", post(diagnostic_envoyer))
+        .route(
+            "/albums/{id}/notes",
+            post(notes_ecrire).get(notes_lire).delete(notes_effacer),
+        )
         .with_state(etat)
 }
 
@@ -1260,4 +1264,160 @@ async fn diagnostic_envoyer(State(etat): State<Etat>, Json(d): Json<EnvoiDiagnos
     v["cout_eur"] = json!(couts::micro_en_euros(res.cout_micro_eur));
     v["plafond"] = appel::etat_plafond(&etat.backend);
     Json(v).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Notes de pochette (23/10/2026)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct DemandeNotes {
+    langue: Option<String>,
+    /// Le second avis (Sonnet 5.5 chez Anthropic), demandé explicitement.
+    #[serde(default)]
+    second_avis: bool,
+    /// Ne pas servir la réponse en cache : un nouvel appel, payé.
+    #[serde(default)]
+    regenerer: bool,
+    /// Rien n'est envoyé : rend ce qui PARTIRAIT et le coût estimé.
+    #[serde(default)]
+    apercu: bool,
+}
+
+async fn notes_ecrire(
+    State(etat): State<Etat>,
+    Path(id): Path<i64>,
+    entetes: HeaderMap,
+    corps: Option<Json<DemandeNotes>>,
+) -> Response {
+    let d = corps.map(|Json(d)| d).unwrap_or_default();
+    let ctx = match crate::notes::charger(&etat.backend, id) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return erreur(
+                StatusCode::NOT_FOUND,
+                "album_introuvable",
+                "Album introuvable.",
+            );
+        }
+        Err(e) => return interne(e),
+    };
+    let langue = langue(d.langue.as_deref(), &entetes);
+    let sources = ctx.sources();
+    let systeme = crate::notes::consigne(&langue, &sources);
+    let message = ctx.message();
+    let choix = if d.second_avis {
+        appel::Choix::Fort
+    } else {
+        appel::Choix::Defaut
+    };
+    let modele = reglages::Reglages::charger(&etat.backend).modele_choisi(choix);
+    if d.apercu {
+        return Json(json!({
+            "ok": true,
+            "apercu": true,
+            "modele": modele,
+            "envoye": { "systeme": systeme, "message": message },
+            "cout_estime_eur": cout_estime_eur(&etat, &modele, &systeme, &message, crate::notes::MAX_JETONS),
+            "plafond": appel::etat_plafond(&etat.backend),
+        }))
+        .into_response();
+    }
+    let entree = format!("{systeme}\n{message}");
+    let res = match appel::appeler_choix(
+        &appel::Moyens::de(&etat),
+        crate::notes::USAGE_NOTES,
+        choix,
+        &systeme,
+        &message,
+        crate::notes::MAX_JETONS,
+        (!d.regenerer).then_some(entree.as_str()),
+        true,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return appel::reponse_erreur(&e),
+    };
+    // Une réponse refusée ne doit pas rester servie par le cache : le
+    // prochain essai repartirait sur la même réponse, refusée à nouveau.
+    let oublier = || {
+        if let Some(f) = reglages::Reglages::charger(&etat.backend).famille {
+            etat.cache.effacer(&cache::cle(&[
+                appel::VERSION_CONSIGNES,
+                crate::notes::USAGE_NOTES,
+                f.nom(),
+                &modele,
+                &entree,
+            ]));
+        }
+    };
+    let Some(brut) = appel::objet_json(&res.texte) else {
+        oublier();
+        return erreur(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reponse_invalide",
+            "Le modèle n'a pas rendu un objet JSON.",
+        );
+    };
+    let notes = match crate::notes::valider(&brut, &ctx) {
+        Ok(n) => n,
+        Err(code) => {
+            oublier();
+            warn!(album_id = id, code, "assistant_ia_notes_hors_schema");
+            return erreur(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                code,
+                "La réponse du modèle ne suit pas le schéma demandé (chaque paragraphe doit citer ses sources).",
+            );
+        }
+    };
+    info!(
+        album_id = id,
+        paragraphes = notes.paragraphes.len(),
+        ecartes = notes.ecartes.len(),
+        "assistant_ia_notes"
+    );
+    let rangees = json!({
+        "album_id": id,
+        "marque": "ia",
+        "bandeau": "Écrit par l'IA à partir de vos métadonnées",
+        "modele": modele,
+        "langue": langue,
+        "cree_le": chrono::Utc::now().to_rfc3339(),
+        "notes": notes,
+        "attributions": ctx.attributions,
+    });
+    etat.cache
+        .ecrire(&crate::notes::cle_rangement(id), &rangees.to_string());
+    let mut v = rangees;
+    v["ok"] = json!(true);
+    v["depuis_cache"] = json!(res.depuis_cache);
+    v["cout_eur"] = json!(couts::micro_en_euros(res.cout_micro_eur));
+    v["plafond"] = appel::etat_plafond(&etat.backend);
+    Json(v).into_response()
+}
+
+async fn notes_lire(State(etat): State<Etat>, Path(id): Path<i64>) -> Response {
+    let rangees = etat
+        .cache
+        .lire(&crate::notes::cle_rangement(id))
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(|_| crate::notes::album_existe(&etat.backend, id));
+    match rangees {
+        Some(mut v) => {
+            v["ok"] = json!(true);
+            Json(v).into_response()
+        }
+        None => erreur(
+            StatusCode::NOT_FOUND,
+            "aucune_note",
+            "Aucune note pour cet album.",
+        ),
+    }
+}
+
+async fn notes_effacer(State(etat): State<Etat>, Path(id): Path<i64>) -> Response {
+    etat.cache.effacer(&crate::notes::cle_rangement(id));
+    Json(json!({ "ok": true })).into_response()
 }
