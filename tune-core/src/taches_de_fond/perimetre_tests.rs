@@ -581,3 +581,98 @@ fn les_genres_ne_touchent_que_le_clap() {
     assert_eq!(clause_hors_perimetre_decodage(&backend), "");
     assert!(!clause_clap(&backend).is_empty());
 }
+
+// ── Fil 2173 : circonscrire les analyses à des dossiers ─────────────────
+
+/// Réglés, les dossiers inclus limitent les passes qui décodent ET le CLAP
+/// aux pistes qui sont dessous ; n'importe quel dossier (pas seulement une
+/// racine), même préfixe borné que les racines exclues. Combinés aux racines
+/// exclues, une piste doit être dedans ET hors des exclues. Et la clause
+/// inverse (les jauges) compte exactement le reste.
+#[test]
+fn les_dossiers_inclus_circonscrivent_les_analyses_2173() {
+    let (db, backend) = base();
+    piste(&db, 1, "/music/Jazz/a.flac");
+    piste(&db, 2, "/music/Jazzy/b.flac");
+    piste(&db, 3, "/music/Pop/c.flac");
+    piste(&db, 4, r"Z:\NAS\Jazz\d.flac");
+    piste(&db, 5, "/music/Jazz/Live/e.flac");
+    let toutes = vec![1, 2, 3, 4, 5];
+    assert_eq!(ids(&backend, &clause_decodage(&backend)), toutes);
+    assert_eq!(clause_hors_perimetre_decodage(&backend), "");
+
+    regler(
+        &backend,
+        CLE_DOSSIERS_INCLUS,
+        serde_json::json!(["/music/Jazz/", "Z:/NAS/Jazz"]),
+    );
+    assert_eq!(
+        dossiers_inclus(&backend),
+        vec!["/music/Jazz/", "Z:/NAS/Jazz"]
+    );
+    assert_eq!(ids(&backend, &clause_decodage(&backend)), vec![1, 4, 5]);
+    assert_eq!(ids(&backend, &clause_clap(&backend)), vec![1, 4, 5]);
+    assert_eq!(
+        ids(&backend, &clause_hors_perimetre_decodage(&backend)),
+        vec![2, 3]
+    );
+
+    // Une racine exclue à l'intérieur d'un dossier inclus l'emporte.
+    regler(
+        &backend,
+        CLE_RACINES_EXCLUES,
+        serde_json::json!(["/music/Jazz/Live"]),
+    );
+    assert_eq!(ids(&backend, &clause_decodage(&backend)), vec![1, 4]);
+    assert_eq!(ids(&backend, &clause_clap(&backend)), vec![1, 4]);
+    assert_eq!(
+        ids(&backend, &clause_hors_perimetre_decodage(&backend)),
+        vec![2, 3, 5]
+    );
+
+    // Seules les exclues : l'inverse d'avant, inchangé.
+    regler(&backend, CLE_DOSSIERS_INCLUS, serde_json::json!([]));
+    assert_eq!(ids(&backend, &clause_decodage(&backend)), vec![1, 2, 3, 4]);
+    assert_eq!(
+        ids(&backend, &clause_hors_perimetre_decodage(&backend)),
+        vec![5]
+    );
+}
+
+/// Les compteurs des passes ne comptent que les pistes des dossiers inclus.
+#[test]
+fn les_compteurs_ne_visent_que_les_dossiers_inclus_2173() {
+    let (db, backend) = base();
+    SettingsRepo::with_backend(backend.clone())
+        .set(replaygain::MODE_KEY, "track")
+        .unwrap();
+    piste(&db, 1, "/music/Jazz/a.flac");
+    piste(&db, 2, "/music/Pop/b.flac");
+    piste(&db, 3, "/music/Pop/c.flac");
+    // Le rattrapage de la plage dynamique attend le témoin ReplayGain quand
+    // celui-ci est armé (voir `les_compteurs_excluent_la_racine_reglee`).
+    let meta = TrackMetadataRepo::new(db.clone());
+    for id in [1, 2, 3] {
+        meta.set(id, "rg_analyzed", "1").unwrap();
+    }
+    // Deux pistes de plus, que le ReplayGain n'a pas encore vues.
+    piste(&db, 4, "/music/Jazz/d.flac");
+    piste(&db, 5, "/music/Pop/e.flac");
+    let compter = |b: &Arc<dyn DbBackend>| {
+        (
+            replaygain::compter_les_candidats_replaygain(b),
+            replaygain::compter_les_candidats_dr(b),
+            embedding_store::eligible_count(b),
+        )
+    };
+    let avant = compter(&backend);
+    assert_eq!(avant, (2, 3, 5), "sans périmètre");
+    regler(
+        &backend,
+        CLE_DOSSIERS_INCLUS,
+        serde_json::json!(["/music/Jazz"]),
+    );
+    assert_eq!(compter(&backend), (1, 1, 2), "seul le dossier inclus");
+    regler(&backend, CLE_DOSSIERS_INCLUS, serde_json::json!([]));
+    assert_eq!(compter(&backend), avant);
+}
