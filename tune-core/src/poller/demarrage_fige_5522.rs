@@ -154,7 +154,9 @@ pub(super) fn la_ligne_est_ce_qui_joue(
         (None, Some(_)) => return false,
         (None, None) => {}
     }
-    let non_vide = |s: Option<&str>| s.filter(|s| !s.trim().is_empty());
+    fn non_vide(s: Option<&str>) -> Option<&str> {
+        s.filter(|s| !s.trim().is_empty())
+    }
     match (
         non_vide(ligne.source_id.as_deref()),
         non_vide(joue.source_id.as_deref()),
