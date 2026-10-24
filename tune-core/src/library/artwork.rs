@@ -2134,11 +2134,23 @@ async fn batch_enrich_artist_artwork_inner(
         // reason untagged libraries end up with almost no artist images. Persist
         // it so future runs and community lookups reuse it. MB asks for ~1 req/s,
         // so only pay that extra delay for artists we actually have to look up.
+        //
+        // #6463 — jamais pour un artiste dont l'utilisateur a détaché
+        // l'identité (« Détacher l'identité ») : la recherche par le nom lui
+        // redonnerait le MBID qu'il vient de retirer. Le MBID trouvé ne sert
+        // à chercher l'image que s'il a été écrit (provenance `nom`).
         let mut mbid = mbid.clone();
-        if mbid.is_empty() {
+        if mbid.is_empty() && !artist_repo.identite_detachee(*artist_id).unwrap_or(true) {
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-            if let Some(found) = search_musicbrainz_artist(name).await {
-                artist_repo.update_mbid(*artist_id, &found).ok();
+            if let Some(found) = search_musicbrainz_artist(name).await
+                && artist_repo
+                    .poser_mbid(
+                        *artist_id,
+                        &found,
+                        crate::db::artist_repo::ProvenanceMbid::Nom,
+                    )
+                    .unwrap_or(false)
+            {
                 info!(artist_id, artist = %name, mbid = %found, "batch_artist_artwork_mbid_resolved");
                 mbid = found;
             }
@@ -2267,13 +2279,19 @@ async fn batch_enrich_artist_artwork_inner(
     let lastfm_available = !lastfm_key.is_empty();
 
     if discogs_available || lastfm_available {
-        let no_mbid_artists = match artist_repo.list_without_image_no_mbid() {
+        let mut no_mbid_artists = match artist_repo.list_without_image_no_mbid() {
             Ok(a) => a,
             Err(e) => {
                 warn!(error = %e, "batch_artist_artwork_no_mbid_list_failed");
                 Vec::new()
             }
         };
+        // La portée vaut aussi pour la phase 3 : une passe lancée pour UN
+        // artiste (« Détacher l'identité », #6463) ne repart pas sur toute la
+        // bibliothèque.
+        if let Some(scope) = &scope {
+            no_mbid_artists.retain(|(id, _)| scope.contient_artiste(*id));
+        }
 
         if !no_mbid_artists.is_empty() {
             info!(

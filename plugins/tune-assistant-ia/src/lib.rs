@@ -34,9 +34,15 @@
 //! | `POST /collections/nommer` | `{cible?, rules, match_mode?}` → nom et description marqués IA |
 //! | `POST /collections/pourquoi` | `{rules, match_mode?, album_id}` → pourquoi cet album est là |
 //! | `POST /collections/ecoute` | collections d'après l'écoute — Premium (« Mon écoute ») |
+//! | `POST /diagnostic/apercu` | `{zone_id?, question, langue?, second_avis?}` → le texte EXACT qui partirait, pseudonymisé, et son coût estimé ([`diagnostic`]) |
+//! | `POST /diagnostic` | `{apercu_id}` → l'envoi de CET aperçu (une seule fois) ; constat, causes, gestes à essayer — aucune action |
 //!
 //! Chaque route de collections accepte `apercu: true` : rien ne part, la
 //! réponse dit ce qui partirait et son coût estimé.
+//!
+//! La transcription vocale (`POST /api/v1/voice-search` de l'hôte) passe par
+//! [`Passerelle::transcrire`] : clé au coffre, coût dans le plafond
+//! ([`transcription`]).
 //!
 //! Gratuit, pour tout le monde : aucune garde Premium. Les RÉGLAGES (`PUT
 //! /reglages`, `POST /tester`) sont réservés aux administrateurs dès que
@@ -47,15 +53,18 @@ pub mod cache;
 pub mod coffre;
 pub mod collections;
 pub mod couts;
+pub mod diagnostic;
 pub mod dialogue;
 pub mod fournisseur;
 pub mod migration;
 pub mod passerelle;
 pub mod pistes;
+pub mod pseudonymes;
 pub mod reglages;
 pub mod regles;
 mod routes;
 pub mod suggestions;
+pub mod transcription;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -78,6 +87,9 @@ pub struct HostServices {
     /// Les critères du moteur des règles intelligentes
     /// (`tune_smart_http::criteres::criteres_exposes`).
     pub criteres: Vec<CritereMoteur>,
+    /// Le diagnostic en lecture seule (23/10/2026) : ce que l'hôte rassemble
+    /// sur une zone. `None` : la route répond « indisponible ».
+    pub diagnostic: Option<diagnostic::Collecte>,
 }
 
 /// L'état partagé des routes.
@@ -95,6 +107,10 @@ pub struct Etat {
     /// La licence (#6839, collections d'après l'écoute : Premium, comme
     /// « Mon écoute »). `None` : se comporte comme SANS Premium.
     pub licence: Option<Arc<tune_core::license::LicenseManager>>,
+    /// La collecte du diagnostic, fournie par l'hôte.
+    pub collecte_diagnostic: Option<diagnostic::Collecte>,
+    /// Les aperçus de diagnostic montrés, en attente de leur envoi.
+    pub apercus: diagnostic::Apercus,
 }
 
 impl Etat {
@@ -113,6 +129,8 @@ impl Etat {
             fabrique,
             verrou_conso: appel::verrou_de_consommation(),
             verrou_albums: Arc::new(tokio::sync::Mutex::new(())),
+            collecte_diagnostic: None,
+            apercus: diagnostic::Apercus::default(),
             licence: None,
         }
     }
@@ -135,6 +153,12 @@ impl Etat {
             }
             None => false,
         }
+    }
+
+    /// La collecte du diagnostic (l'hôte, ou un faux en essai).
+    pub fn avec_diagnostic(mut self, collecte: Option<diagnostic::Collecte>) -> Self {
+        self.collecte_diagnostic = collecte;
+        self
     }
 }
 
@@ -179,7 +203,8 @@ impl TunePlugin for AssistantIaPlugin {
             services.criteres,
             fournisseur::fabrique_reelle(),
         )
-        .avec_licence(ctx.license.clone());
+        .avec_licence(ctx.license.clone())
+        .avec_diagnostic(services.diagnostic);
         ctx.register_router(router_vers(etat));
         Ok(())
     }

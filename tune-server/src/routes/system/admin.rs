@@ -210,6 +210,11 @@ pub(super) async fn admin_zones(State(state): State<AppState>) -> Json<Value> {
             "volume_db": tune_core::audio::volume_scale::linear_to_db(
                 if ps.volume > 0.0 { ps.volume } else { z.volume / 100.0 },
             ),
+            // #6787 — la loi du curseur (`volume` reste le gain).
+            "volume_curve": tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(
+                z.output_type.as_deref(),
+            )
+            .code(),
             "muted": z.muted,
             "current_track": ps.now_playing,
             "position_ms": ps.position_ms,

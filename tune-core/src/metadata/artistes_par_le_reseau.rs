@@ -52,7 +52,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracing::debug;
 
-use crate::db::artist_repo::cle_artiste;
+use crate::db::artist_repo::{ProvenanceMbid, cle_artiste};
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::engine::fold_diacritics;
 use crate::metadata::artistes_du_pressage::{MBID_PSEUDO_ARTISTES, poser_les_mbid};
@@ -477,6 +477,7 @@ pub async fn interroger_musicbrainz(
 pub fn sql_candidats() -> &'static str {
     "SELECT ar.id, ar.name FROM artists ar \
      WHERE TRIM(COALESCE(ar.musicbrainz_id, '')) = '' \
+       AND COALESCE(ar.musicbrainz_id_source, '') <> 'manuel' \
        AND ar.id > ? \
        AND (EXISTS (SELECT 1 FROM albums al WHERE al.artist_id = ar.id \
                       AND COALESCE(al.source, 'local') = 'local') \
@@ -572,7 +573,8 @@ where
     bilan.requetes += examen.requetes;
     match examen.verdict {
         Verdict::Pose { mbid, departage } => {
-            if poser_les_mbid(backend, &[(id, mbid)])? == 1 {
+            // #6463 — trouvé par une recherche du nom : provenance `nom`.
+            if poser_les_mbid(backend, &[(id, mbid)], ProvenanceMbid::Nom)? == 1 {
                 bilan.poses += 1;
                 if departage {
                     bilan.departages += 1;

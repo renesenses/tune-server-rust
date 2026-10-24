@@ -124,6 +124,25 @@ pub fn profil_de_selection_automatique(db: &Arc<dyn DbBackend>) -> i64 {
         .unwrap_or(GLOBAL_PROFILE_ID)
 }
 
+/// #6824 — le profil dont les bannis s'appliquent à la FILE d'une zone : celui
+/// de sa session d'écoute (`ZoneState::session_profile_id`), sinon le profil
+/// actif du serveur.
+///
+/// Meddle / Seamus, fil 2281 : le client web choisit son profil PAR APPAREIL
+/// (`X-Profile-Id`, `localStorage['tune-profile-id']`) sans toucher au réglage
+/// `active_profile_id`. Le bannissement s'écrit sous le profil de l'appareil,
+/// la file le barre sous ce même profil — et l'enjambée lisait le réglage
+/// global : le titre barré à l'écran était joué par « Suivant », par la fin de
+/// piste sans blanc et au départ d'un album.
+pub fn profil_des_bannis_de_la_zone(
+    db: &Arc<dyn DbBackend>,
+    profil_de_session: Option<i64>,
+) -> i64 {
+    profil_de_session
+        .filter(|id| *id > 0)
+        .unwrap_or_else(|| profil_de_selection_automatique(db))
+}
+
 /// #4806 suite — ajoute à l'ensemble d'exclusion d'une radio de SERVICE les
 /// `source_id` que le profil des sélections automatiques a bannis chez ce
 /// service. UNE définition pour les deux radios qui tirent dans le catalogue

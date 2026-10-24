@@ -4,10 +4,13 @@ pub mod community;
 pub mod community_sync;
 pub mod consent;
 pub mod digest;
+#[cfg(feature = "ecoute-directe")]
+pub mod ecoute_directe;
 pub mod ecoutes_au_compte;
 pub mod ecoutes_communaute;
 pub mod library_reconcile;
 pub mod library_sync;
+pub mod mesures_communautaires;
 pub mod metadata_proposals;
 pub mod notes_communautaires;
 pub mod playlist_hub;
