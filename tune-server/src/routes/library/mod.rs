@@ -1,5 +1,6 @@
 mod album_order;
 mod albums;
+mod audit_integrite;
 /// #4806 — le drapeau `banned` des listes de pistes, partagé avec les
 /// playlists et la recherche fédérée qui vivent hors de ce module.
 pub(crate) use albums::attacher_banni;
@@ -487,6 +488,13 @@ pub fn router() -> Router<AppState> {
             get(tracks::track_synced_lyrics),
         )
         .route("/identify", post(tracks::identify_track))
+        .route(
+            "/integrity",
+            get(audit_integrite::status).post(audit_integrite::start),
+        )
+        .route("/integrity/pause", post(audit_integrite::pause))
+        .route("/integrity/report", get(audit_integrite::report))
+        .route("/integrity/report.csv", get(audit_integrite::csv))
         .route("/tracks/{id}/source-links", get(tracks::track_source_links))
         .route("/tracks/{id}/quick-fav", post(tracks::quick_fav_track))
         .route("/albums/{id}/quick-fav", post(albums::quick_fav_album))

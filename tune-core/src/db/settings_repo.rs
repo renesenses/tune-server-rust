@@ -26,7 +26,11 @@ pub mod sql {
     }
 
     pub fn list_all() -> &'static str {
-        "SELECT key, value FROM settings ORDER BY key"
+        // Les lignes du rapport d'audit ne sont pas des préférences. Ne pas
+        // charger des centaines de milliers de chemins dans GET config, ni
+        // dans les recherches de réglages des zones et artistes (#6286).
+        // Le rapport les lit explicitement par préfixe et par pages.
+        "SELECT key, value FROM settings WHERE key NOT LIKE 'audit_integrite_ligne:%' ORDER BY key"
     }
 
     /// Upsert via the SQL standard `ON CONFLICT` form (SQLite 3.24+,
@@ -360,6 +364,20 @@ mod tests {
     }
 
     #[test]
+    fn audit_integrite_rapport_absent_des_preferences() {
+        let repo = fresh_repo();
+        repo.set("audit_integrite_ligne:passe:1", "rapport volumineux")
+            .unwrap();
+        repo.set("audit_integrite_etat", "état compact").unwrap();
+        assert!(repo.get("audit_integrite_ligne:passe:1").unwrap().is_some());
+        assert_eq!(
+            repo.all().unwrap(),
+            vec![("audit_integrite_etat".into(), "état compact".into())],
+            "le rapport ne doit pas alourdir chaque lecture des préférences"
+        );
+    }
+
+    #[test]
     fn settings_multiple_keys() {
         let repo = fresh_repo();
         repo.set("key1", "value1").unwrap();
@@ -432,7 +450,7 @@ mod tests {
         assert_eq!(sql::delete_by_key(&d), "DELETE FROM settings WHERE key = ?");
         assert_eq!(
             sql::list_all(),
-            "SELECT key, value FROM settings ORDER BY key"
+            "SELECT key, value FROM settings WHERE key NOT LIKE 'audit_integrite_ligne:%' ORDER BY key"
         );
     }
 
