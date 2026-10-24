@@ -111,7 +111,10 @@ fn m4a_moov_en_tete(debut: &[u8]) -> bool {
         if taille < 8 {
             return false;
         }
-        pos = match usize::try_from(taille).ok().and_then(|t| pos.checked_add(t)) {
+        pos = match usize::try_from(taille)
+            .ok()
+            .and_then(|t| pos.checked_add(t))
+        {
             Some(p) => p,
             None => return false,
         };

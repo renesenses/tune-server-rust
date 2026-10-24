@@ -42,10 +42,9 @@ const PREMIER_SON_MAX_MS: u64 = 1_500;
 /// `audio/mp4`, annoncé `audio/mpeg` dans le flux) : `ftyp` de 28 octets, puis
 /// `moov` de 691 299 octets.
 const ENTETE_RADIO_FRANCE: [u8; 48] = [
-    0x00, 0x00, 0x00, 0x1c, b'f', b't', b'y', b'p', b'M', b'4', b'A', b' ', 0x00, 0x00, 0x02,
-    0x00, b'M', b'4', b'A', b' ', b'i', b's', b'o', b'm', b'i', b's', b'o', b'2', 0x00, 0x0a,
-    0x8c, 0x63, b'm', b'o', b'o', b'v', 0x00, 0x00, 0x00, 0x6c, b'm', b'v', b'h', b'd', 0x00,
-    0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x1c, b'f', b't', b'y', b'p', b'M', b'4', b'A', b' ', 0x00, 0x00, 0x02, 0x00,
+    b'M', b'4', b'A', b' ', b'i', b's', b'o', b'm', b'i', b's', b'o', b'2', 0x00, 0x0a, 0x8c, 0x63,
+    b'm', b'o', b'o', b'v', 0x00, 0x00, 0x00, 0x6c, b'm', b'v', b'h', b'd', 0x00, 0x00, 0x00, 0x00,
 ];
 
 /// Un ALAC 48 kHz / 16 bits stéréo de [`DUREE_S`] s, tel que le multiplexeur
@@ -92,7 +91,10 @@ fn podcast_6925_un_moov_en_fin_de_fichier_garde_la_branche_d_avant() {
         Some("m4a")
     );
     // Un bloc trop court pour voir `moov` ne promet rien.
-    assert_eq!(extension_decodable_en_continu(&ENTETE_RADIO_FRANCE[..30]), None);
+    assert_eq!(
+        extension_decodable_en_continu(&ENTETE_RADIO_FRANCE[..30]),
+        None
+    );
 }
 
 #[test]

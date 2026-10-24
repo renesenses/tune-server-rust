@@ -380,7 +380,11 @@ mod tests {
         assert!(!relance_encore_valide(None, 3, t0));
     }
 
-    fn ligne(track_id: Option<i64>, source: &str, source_id: &str) -> crate::db::play_queue_repo::QueueEntry {
+    fn ligne(
+        track_id: Option<i64>,
+        source: &str,
+        source_id: &str,
+    ) -> crate::db::play_queue_repo::QueueEntry {
         serde_json::from_value(serde_json::json!({
             "id": 1, "zone_id": 1, "position": 0, "is_current": true,
             "track_id": track_id, "source": source, "source_id": source_id,
@@ -404,21 +408,40 @@ mod tests {
             "la ligne 0 est une radio, l'épisode joue hors de la file : la relancer joue la radio"
         );
         assert!(!la_ligne_est_ce_qui_joue(None, &episode));
-        assert!(!la_ligne_est_ce_qui_joue(Some(&ligne(Some(7), "local", "")), &episode));
+        assert!(!la_ligne_est_ce_qui_joue(
+            Some(&ligne(Some(7), "local", "")),
+            &episode
+        ));
 
         // Ce qui EST la ligne garde la relance de #5522.
-        let meme = ligne(None, "podcast", "https://media.radiofrance-podcast.net/podcast09/ep.m4a");
+        let meme = ligne(
+            None,
+            "podcast",
+            "https://media.radiofrance-podcast.net/podcast09/ep.m4a",
+        );
         assert!(la_ligne_est_ce_qui_joue(Some(&meme), &episode));
         let locale = crate::playback::NowPlaying {
             track_id: Some(7),
             source: "local".into(),
             ..Default::default()
         };
-        assert!(la_ligne_est_ce_qui_joue(Some(&ligne(Some(7), "local", "")), &locale));
-        assert!(!la_ligne_est_ce_qui_joue(Some(&ligne(Some(8), "local", "")), &locale));
+        assert!(la_ligne_est_ce_qui_joue(
+            Some(&ligne(Some(7), "local", "")),
+            &locale
+        ));
+        assert!(!la_ligne_est_ce_qui_joue(
+            Some(&ligne(Some(8), "local", "")),
+            &locale
+        ));
         // Sans identifiant des deux côtés, rien ne prouve une différence.
-        let muette = crate::playback::NowPlaying { source: "qobuz".into(), ..Default::default() };
-        assert!(la_ligne_est_ce_qui_joue(Some(&ligne(None, "qobuz", "")), &muette));
+        let muette = crate::playback::NowPlaying {
+            source: "qobuz".into(),
+            ..Default::default()
+        };
+        assert!(la_ligne_est_ce_qui_joue(
+            Some(&ligne(None, "qobuz", "")),
+            &muette
+        ));
     }
 
     /// Garde de site : la relance consulte la ligne AVANT de la rejouer.
