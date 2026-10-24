@@ -715,7 +715,22 @@ impl OutputTarget for DevialetAirOutput {
                     .interrompre(&mut phase)
                     .await
                     .ok_or("devialet_air: rien à déplacer")?;
-                self.lancer(&mut phase, media, position_ms).await
+                // #6923 — le flux d'avant est déjà coupé : si le flux neuf ne
+                // part pas, la sortie reste arrêtée. Sans motif, le sondeur
+                // prenait cet arrêt pour une fin de piste (pic de position
+                // au-delà de 80 %) et passait au morceau suivant. Le motif
+                // part par `take_output_failure` : la zone s'arrête en le
+                // disant.
+                let relance = self.lancer(&mut phase, media, position_ms).await;
+                if let Err(e) = &relance {
+                    warn!(sortie = %self.nom, position_ms, erreur = %e, "devialet_air_deplacement_echoue");
+                    *self
+                        .echec
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(format!("{} : déplacement impossible ({e})", self.nom));
+                }
+                relance
             }
             autre => {
                 *phase = autre;

@@ -149,6 +149,51 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_oaat_stall_supervisor(state);
     #[cfg(feature = "cloud-relay")]
     spawn_relay_client(state).await;
+    #[cfg(feature = "ecoute-directe")]
+    spawn_ecoute_directe(state).await;
+}
+
+/// Le droit Premium de l'écoute à distance, relu à CHAQUE ouverture de
+/// session directe : le même droit que celui qui lance le client du relais
+/// (`Feature::CloudRelay`).
+#[cfg(feature = "ecoute-directe")]
+struct DroitsParLicence(std::sync::Arc<tune_core::license::LicenseManager>);
+
+#[cfg(feature = "ecoute-directe")]
+#[async_trait::async_trait]
+impl tune_core::cloud::ecoute_directe::DroitsDirect for DroitsParLicence {
+    async fn ecoute_distante_permise(&self) -> bool {
+        self.0
+            .check_feature(tune_core::license::Feature::CloudRelay)
+            .await
+    }
+}
+
+/// #6785 — point d'écoute direct (pair-à-pair), ÉTEINT par défaut : rien
+/// n'écoute tant que `TUNE_ECOUTE_DIRECTE` ou le réglage
+/// `ecoute_directe_active` ne l'allume pas, et jamais sans le droit Premium
+/// de l'écoute à distance.
+#[cfg(feature = "ecoute-directe")]
+async fn spawn_ecoute_directe(state: &AppState) {
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    if !tune_core::cloud::ecoute_directe::active(&reglages) {
+        info!("ecoute_directe_desactivee");
+        return;
+    }
+    if !state
+        .license
+        .check_feature(tune_core::license::Feature::CloudRelay)
+        .await
+    {
+        info!("ecoute_directe_requiert_premium");
+        return;
+    }
+    let droits = std::sync::Arc::new(DroitsParLicence(state.license.clone()));
+    if let Err(e) =
+        tune_core::cloud::ecoute_directe::lancer(state.backend.clone(), state.port, droits).await
+    {
+        warn!(erreur = %e, "ecoute_directe_non_lancee");
+    }
 }
 
 /// Supervise OAAT zones and recover a stalled one with a stop+play restart.

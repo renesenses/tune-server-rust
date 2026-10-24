@@ -340,8 +340,14 @@ impl PlaybackOrchestrator {
             }
 
             let sr = stream_data.quality.sample_rate;
-            let bd = stream_data.quality.bit_depth.clamp(16, 24);
-            let key_bd = if out_fmt == "wav" { 16 } else { bd };
+            // #6909 — même plafond 16 bits que la lecture (`profondeur_dash`).
+            let reglages =
+                super::resolve_stream::reglages_dash(&db, zone_id, stream_data.quality.bit_depth);
+            let key_bd = super::resolve_stream::profondeur_dash(
+                out_fmt,
+                stream_data.quality.bit_depth,
+                reglages,
+            );
             // Pas de racine de cache utilisable pour ce compte (#5133) : rien
             // à chauffer.
             let Some(cp) = crate::transcode_cache::cache_path_streaming(
@@ -372,7 +378,7 @@ impl PlaybackOrchestrator {
                     crate::audio::decode::decode_to_pcm(&dash_file_c, Some(sr), Some(2), 0.0, 0.0)?;
                 let mut pcm_bytes = decoded.pcm_bytes();
                 let mut actual_bd = decoded.bit_depth;
-                if is_wav && actual_bd > 16 {
+                if (is_wav || key_bd == 16) && actual_bd > 16 {
                     pcm_bytes = crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
                     actual_bd = 16;
                 }

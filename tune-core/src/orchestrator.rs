@@ -2203,6 +2203,11 @@ mod tests;
 #[cfg(test)]
 mod bit_depth_cap_tests;
 
+/// #6909 — le pré-transcodage DASH honore « WAV/LPCM » et « 16 bits » de la
+/// zone (Marantz NR1602, fil 2410).
+#[cfg(test)]
+mod reglages_dash_6909_tests;
+
 #[cfg(test)]
 mod dop_routing_tests;
 
