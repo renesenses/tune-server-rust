@@ -1331,6 +1331,30 @@ fn langue_et_encyclopedies(headers: &axum::http::HeaderMap) -> (String, Vec<Stri
     (lang, encyclopedies)
 }
 
+/// #6691 — le réglage (`settings`) qui donne l'adresse de Wikipédia à la
+/// route « Enrichir la biographie », `{lang}` y étant remplacé par la langue
+/// demandée. Il n'existe que pour les essais, qui la pointent sur un faux
+/// serveur local ; aucun écran ne le propose.
+pub(crate) const CLE_WIKIPEDIA_BASE: &str = "wikipedia_base_url";
+
+/// L'adresse de Wikipédia quand le réglage est absent ou vide.
+pub(crate) const WIKIPEDIA_BASE_DEFAUT: &str = "https://{lang}.wikipedia.org";
+
+/// L'adresse du résumé REST de l'article `nom` dans la Wikipédia `lang`.
+/// `lang` vient de [`langue_et_encyclopedies`] : une langue de l'interface,
+/// jamais un texte de l'utilisateur.
+fn adresse_resume_wikipedia(base: Option<&str>, lang: &str, nom: &str) -> String {
+    let base = base
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or(WIKIPEDIA_BASE_DEFAUT);
+    format!(
+        "{}/api/rest_v1/page/summary/{}",
+        base.trim_end_matches('/').replace("{lang}", lang),
+        urlencoding::encode(nom)
+    )
+}
+
 async fn enrich_artist(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -1375,12 +1399,13 @@ async fn enrich_artist(
             .filter(|r| r.status().is_success())?;
         r.json::<serde_json::Value>().await.ok()
     };
+    // #6691 — l'adresse de Wikipédia est un réglage : les essais la pointent
+    // sur un faux serveur. Absente ou vide, c'est la vraie.
+    let base_wikipedia = settings.get(CLE_WIKIPEDIA_BASE).ok().flatten();
+    let base_wikipedia = base_wikipedia.as_deref();
     let wikipedia = move |wiki_lang: String| async move {
         client
-            .get(format!(
-                "https://{wiki_lang}.wikipedia.org/api/rest_v1/page/summary/{}",
-                urlencoding::encode(nom)
-            ))
+            .get(adresse_resume_wikipedia(base_wikipedia, &wiki_lang, nom))
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
@@ -4031,6 +4056,30 @@ mod pochette_visuelle_4805 {
         // Pas de pochette en place : remplace.
         assert!(
             pochette_en_place_gardee(None, &png(300, false), cache.path(), "discogs").is_none()
+        );
+    }
+}
+
+/// #6691 — l'adresse de Wikipédia : le réglage, sinon la vraie.
+#[cfg(test)]
+mod adresse_wikipedia_6691 {
+    use super::adresse_resume_wikipedia;
+
+    #[test]
+    fn sans_reglage_c_est_la_vraie_wikipedia_de_la_langue() {
+        for vide in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                adresse_resume_wikipedia(vide, "fr", "Alain Souchon"),
+                "https://fr.wikipedia.org/api/rest_v1/page/summary/Alain%20Souchon"
+            );
+        }
+    }
+
+    #[test]
+    fn le_reglage_remplace_l_hote_et_garde_la_langue() {
+        assert_eq!(
+            adresse_resume_wikipedia(Some("http://127.0.0.1:9/{lang}/"), "de", "AC/DC"),
+            "http://127.0.0.1:9/de/api/rest_v1/page/summary/AC%2FDC"
         );
     }
 }

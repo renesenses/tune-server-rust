@@ -73,6 +73,9 @@ pub fn tache_suspendable(id: &str) -> Option<Tache> {
         "identification_lot" => Some(Tache::Identification),
         // La plage dynamique à la demande (#4185).
         "dynamic_range" => Some(Tache::PlageDynamique),
+        // L'audit d'intégrité (#6286) : `passe_doit_continuer` lit la pause
+        // de `Tache::Integrite` entre deux paquets décodés.
+        "integrity" => Some(Tache::Integrite),
         _ => None,
     }
 }

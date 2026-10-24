@@ -98,6 +98,8 @@ fn cede_tout(id: &str) -> bool {
         Tache::Acoustique.id(),
         // #6285 — la passe des faux hi-res décode un extrait par piste.
         Tache::FauxHiRes.id(),
+        // #6286 — l'audit d'intégrité décode chaque fichier en entier.
+        Tache::Integrite.id(),
     ]
     .contains(&id)
 }
@@ -187,6 +189,9 @@ fn avancement(state: &AppState, tache: Tache) -> Value {
         // #6285 — la passe ne publie pas d'avancement sans requête (le
         // nombre de candidats se compte en base).
         Tache::FauxHiRes => Value::Null,
+        // #6286 — l'avancement de l'audit se lit sur `GET /library/integrity`
+        // (fichiers traités et total), pas au registre des tâches.
+        Tache::Integrite => Value::Null,
         Tache::Enrichissement | Tache::ImagesArtistes | Tache::Identification => state
             .background_tasks
             .snapshot()
