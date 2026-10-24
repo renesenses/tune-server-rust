@@ -106,7 +106,16 @@ pub const EFFORT_COURT: &str = "low";
 
 /// Les usages courts : une réponse brève, au schéma fermé. Les suggestions
 /// d'album, de pistes et les lots gardent l'effort par défaut du modèle.
-pub const USAGES_COURTS: &[&str] = &["test", "playlist", "traduction", "requete"];
+pub const USAGES_COURTS: &[&str] = &[
+    "test",
+    "playlist",
+    "traduction",
+    "requete",
+    // #6839 — une règle de plus ou de moins, un nom, une explication.
+    "collection_affiner",
+    "collection_nommer",
+    "collection_pourquoi",
+];
 
 pub fn usage_court(usage: &str) -> bool {
     USAGES_COURTS.contains(&usage)

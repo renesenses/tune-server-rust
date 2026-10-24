@@ -56,6 +56,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_telemetry_reporter(state);
     spawn_heartbeat(state);
     spawn_bio_sync(state);
+    spawn_verification_mbid_artistes(state);
     spawn_reprise_favoris_streaming(state);
     spawn_veille_favoris_miroir(state);
     // #6682 — « Mon écoute » : le temps d'écoute radio par station, mesuré
@@ -149,6 +150,51 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_oaat_stall_supervisor(state);
     #[cfg(feature = "cloud-relay")]
     spawn_relay_client(state).await;
+    #[cfg(feature = "ecoute-directe")]
+    spawn_ecoute_directe(state).await;
+}
+
+/// Le droit Premium de l'écoute à distance, relu à CHAQUE ouverture de
+/// session directe : le même droit que celui qui lance le client du relais
+/// (`Feature::CloudRelay`).
+#[cfg(feature = "ecoute-directe")]
+struct DroitsParLicence(std::sync::Arc<tune_core::license::LicenseManager>);
+
+#[cfg(feature = "ecoute-directe")]
+#[async_trait::async_trait]
+impl tune_core::cloud::ecoute_directe::DroitsDirect for DroitsParLicence {
+    async fn ecoute_distante_permise(&self) -> bool {
+        self.0
+            .check_feature(tune_core::license::Feature::CloudRelay)
+            .await
+    }
+}
+
+/// #6785 — point d'écoute direct (pair-à-pair), ÉTEINT par défaut : rien
+/// n'écoute tant que `TUNE_ECOUTE_DIRECTE` ou le réglage
+/// `ecoute_directe_active` ne l'allume pas, et jamais sans le droit Premium
+/// de l'écoute à distance.
+#[cfg(feature = "ecoute-directe")]
+async fn spawn_ecoute_directe(state: &AppState) {
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    if !tune_core::cloud::ecoute_directe::active(&reglages) {
+        info!("ecoute_directe_desactivee");
+        return;
+    }
+    if !state
+        .license
+        .check_feature(tune_core::license::Feature::CloudRelay)
+        .await
+    {
+        info!("ecoute_directe_requiert_premium");
+        return;
+    }
+    let droits = std::sync::Arc::new(DroitsParLicence(state.license.clone()));
+    if let Err(e) =
+        tune_core::cloud::ecoute_directe::lancer(state.backend.clone(), state.port, droits).await
+    {
+        warn!(erreur = %e, "ecoute_directe_non_lancee");
+    }
 }
 
 /// Supervise OAAT zones and recover a stalled one with a stop+play restart.
@@ -2687,6 +2733,47 @@ fn spawn_veille_favoris_miroir(state: &AppState) {
     });
 }
 
+/// #6463, B — délai avant la vérification des MBID d'artiste : le démarrage
+/// et les passes qui le suivent d'abord.
+const VERIFICATION_MBID_DELAI_SECS: u64 = 180;
+/// Après un tour arrêté par MusicBrainz injoignable, on retente plus tard.
+const VERIFICATION_MBID_RELANCE_SECS: u64 = 3600;
+
+/// #6463, B — la reprise des MBID d'artiste faux, en tâche de fond : une
+/// fois, jusqu'au bout de la liste, reprise après chaque arrêt. La règle et
+/// les gardes de débit, de pause et de disjoncteur sont dans
+/// `tune_core::metadata::verification_mbid_artistes` ; ici, le DROIT : la
+/// passe ne part qu'avec l'enrichissement automatique (`AutoEnrichment`),
+/// comme la descente des bios communautaires.
+fn spawn_verification_mbid_artistes(state: &AppState) {
+    let license = state.license.clone();
+    let db = state.backend.clone();
+    tokio::spawn(async move {
+        use tune_core::metadata::verification_mbid_artistes as v;
+        tokio::time::sleep(std::time::Duration::from_secs(VERIFICATION_MBID_DELAI_SECS)).await;
+        loop {
+            if v::lire_l_etat(&db).fin {
+                return;
+            }
+            if !license
+                .check_feature(tune_core::license::Feature::AutoEnrichment)
+                .await
+            {
+                info!("verification_mbid_artistes_sans_droit_d_enrichissement");
+                return;
+            }
+            let etat = v::executer_un_tour(&db, v::lire_la_fiche_musicbrainz).await;
+            if etat.fin {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                VERIFICATION_MBID_RELANCE_SECS,
+            ))
+            .await;
+        }
+    });
+}
+
 fn spawn_bio_sync(state: &AppState) {
     let license = state.license.clone();
     let db = state.backend.clone();
@@ -3749,6 +3836,21 @@ mod tests_licence_proprietaire_battement {
                 "spawn(state.backend.clone(), state.http_client.clone());"
             )),
             "l'envoi des écoutes au compte n'est plus lancé au démarrage"
+        );
+    }
+
+    /// #6463, B — sans cet appel, la reprise des MBID faux serait du code
+    /// mort : « Christophe » et « Ange » garderaient leur MBID.
+    #[test]
+    fn la_verification_des_mbid_d_artiste_est_lancee() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains(concat!("spawn_verification_", "mbid_artistes(state);")),
+            "la vérification des MBID d'artiste n'est plus lancée au démarrage"
         );
     }
 

@@ -37,6 +37,8 @@ sha2 = { workspace = true }
 # Le hasard des identifiants de lot (`suggestions`). La clé d'API, elle, est
 # scellée par le coffre de `tune-core` (`tune_core::coffre`).
 getrandom = "0.2"
+# La pseudonymisation stricte du diagnostic (adresses, chemins, jetons).
+regex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

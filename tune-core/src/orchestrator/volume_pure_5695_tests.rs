@@ -150,7 +150,15 @@ async fn l_armement_de_pure_commande_100_sans_trim_5695() {
 #[tokio::test]
 async fn temoin_hors_pure_le_trim_fait_partir_83_pourcent() {
     let (orch, zone_id) = zone_devialet(false).await;
-    orch.set_volume(zone_id, 1.0, Some(APPAREIL)).await.unwrap();
+    // #6721 — hausse confirmée : la garde n'est pas l'objet de ce témoin.
+    orch.set_volume_avec_garde(
+        zone_id,
+        1.0,
+        Some(APPAREIL),
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let recus = recus(&orch).await;
     assert_eq!(recus.len(), 1);
     assert_eq!(

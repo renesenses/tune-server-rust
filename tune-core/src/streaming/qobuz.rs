@@ -504,7 +504,130 @@ fn log_favorite_result(
     }
 }
 
+/// Un album du catalogue d'un label qu'on peut montrer : écoutable et déjà
+/// sorti. Les précommandes (`streamable` vrai mais date future) rendent « no
+/// url » (502) à la lecture (garde du LMS, `_isReleased`).
+fn sorti_et_ecoutable(item: &serde_json::Value, maintenant: u64) -> bool {
+    let streamable = item["streamable"].as_bool() != Some(false);
+    let released = item["released_at"]
+        .as_u64()
+        .map_or(true, |ts| ts <= maintenant);
+    streamable && released
+}
+
+fn secondes_d_epoque() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 impl QobuzService {
+    /// #6934 — UNE page du catalogue d'un label, par son identifiant : un
+    /// seul `label/get` (`extra=albums`, `limit`, `offset`). Le nom et le logo
+    /// viennent de la même réponse (le logo par [`logos_labels::image_de_label`],
+    /// la lecture du lot L). Sans les précommandes, comme
+    /// [`Self::albums_du_label`] ; `total` reste celui que Qobuz annonce.
+    pub(crate) async fn page_du_label(
+        &self,
+        label_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<LabelPage, TuneError> {
+        let lim = limit.to_string();
+        let off = offset.to_string();
+        let data = self
+            .api_get(
+                "/label/get",
+                &[
+                    ("label_id", label_id),
+                    ("extra", "albums"),
+                    ("limit", &lim),
+                    ("offset", &off),
+                ],
+            )
+            .await?;
+        let maintenant = secondes_d_epoque();
+        let albums = data["albums"]["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|it| sorti_et_ecoutable(it, maintenant))
+                    .map(Self::map_album)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let id = data["id"]
+            .as_u64()
+            .map(|id| id.to_string())
+            .or_else(|| data["id"].as_str().map(Into::into))
+            .unwrap_or_else(|| label_id.to_string());
+        Ok(LabelPage {
+            id,
+            name: data["name"].as_str().unwrap_or("").trim().to_string(),
+            image_url: logos_labels::image_de_label(&data),
+            total: data["albums"]["total"].as_u64().unwrap_or(0) as usize,
+            offset,
+            limit,
+            albums,
+        })
+    }
+
+    /// Le catalogue d'un label (`label/get`, `extra=albums`), paginé et borné
+    /// à 500 albums, sans les précommandes. Partagé par la page d'un label
+    /// ([`StreamingService::get_album_label`]) et la découverte des artistes
+    /// du même label (#6782, [`crate::library::artistes_du_label`]).
+    pub(crate) async fn albums_du_label(
+        &self,
+        label_id: &str,
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
+        // Bounded pagination: big majors (e.g. Columbia) expose 10k+ albums.
+        // We cap at MAX and the app offers a text filter over the loaded set.
+        const MAX: usize = 500;
+        const PAGE: usize = 50;
+        let now = secondes_d_epoque();
+        let mut albums: Vec<StreamAlbum> = Vec::new();
+        let mut offset: usize = 0;
+        loop {
+            let off = offset.to_string();
+            let lim = PAGE.to_string();
+            let data = self
+                .api_get(
+                    "/label/get",
+                    &[
+                        ("label_id", label_id),
+                        ("extra", "albums"),
+                        ("limit", &lim),
+                        ("offset", &off),
+                    ],
+                )
+                .await?;
+            let items = data["albums"]["items"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let n = items.len();
+            // A label's full catalogue includes not-yet-released pre-orders
+            // (streamable=true but a future release date) whose tracks resolve
+            // to "no url" (502) on playback. Keep only released + streamable
+            // albums (mirrors the LMS plugin's `_isReleased` check).
+            albums.extend(
+                items
+                    .iter()
+                    .filter(|it| sorti_et_ecoutable(it, now))
+                    .map(Self::map_album),
+            );
+            let total = data["albums"]["total"].as_u64().unwrap_or(0) as usize;
+            offset += n;
+            if n < PAGE || offset >= total || albums.len() >= MAX {
+                break;
+            }
+        }
+        albums.truncate(MAX);
+        Ok(albums)
+    }
+
     /// Écrire un favori exige le jeton utilisateur : l'app_id seul identifie
     /// l'application, pas le compte. Sans jeton, Qobuz accepte la requête sans
     /// rien enregistrer — un succès en trompe-l'œil. On refuse avant d'émettre.
@@ -3018,61 +3141,25 @@ impl StreamingService for QobuzService {
             .or_else(|| album["label"]["id"].as_str().map(Into::into))
             .ok_or_else(|| TuneError::NotFound("album has no label".into()))?;
         let name = album["label"]["name"].as_str().unwrap_or("").into();
-        // Bounded pagination: big majors (e.g. Columbia) expose 10k+ albums.
-        // We cap at MAX and the app offers a text filter over the loaded set.
-        const MAX: usize = 500;
-        const PAGE: usize = 50;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let mut albums: Vec<StreamAlbum> = Vec::new();
-        let mut offset: usize = 0;
-        loop {
-            let off = offset.to_string();
-            let lim = PAGE.to_string();
-            let data = self
-                .api_get(
-                    "/label/get",
-                    &[
-                        ("label_id", &label_id),
-                        ("extra", "albums"),
-                        ("limit", &lim),
-                        ("offset", &off),
-                    ],
-                )
-                .await?;
-            let items = data["albums"]["items"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let n = items.len();
-            // A label's full catalogue includes not-yet-released pre-orders
-            // (streamable=true but a future release date) whose tracks resolve
-            // to "no url" (502) on playback. Keep only released + streamable
-            // albums (mirrors the LMS plugin's `_isReleased` check).
-            albums.extend(
-                items
-                    .iter()
-                    .filter(|it| {
-                        let streamable = it["streamable"].as_bool() != Some(false);
-                        let released = it["released_at"].as_u64().map_or(true, |ts| ts <= now);
-                        streamable && released
-                    })
-                    .map(Self::map_album),
-            );
-            let total = data["albums"]["total"].as_u64().unwrap_or(0) as usize;
-            offset += n;
-            if n < PAGE || offset >= total || albums.len() >= MAX {
-                break;
-            }
-        }
-        albums.truncate(MAX);
+        let albums = self.albums_du_label(&label_id).await?;
         Ok(LabelInfo {
             id: label_id,
             name,
             albums,
         })
+    }
+
+    async fn get_label(
+        &self,
+        label_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<LabelPage, TuneError> {
+        self.page_du_label(label_id, limit, offset).await
+    }
+
+    async fn get_label_catalogue(&self, label_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
+        self.albums_du_label(label_id).await
     }
 
     async fn get_playlist_tags(&self) -> Result<Vec<PlaylistTag>, TuneError> {
@@ -7992,3 +8079,9 @@ mod tests_livrets_qobuz_6481 {
 /// #6736 — le logo d'un label, rapproché par `label/search` ou par l'album.
 #[path = "qobuz_logos_labels.rs"]
 mod logos_labels;
+
+/// #6934 — une page du catalogue d'un label (`label/get`), sur un Qobuz simulé
+/// qui rend une réponse reconstituée (aucun appel réel, aucun jeton).
+#[cfg(test)]
+#[path = "qobuz_page_du_label_tests.rs"]
+mod page_du_label_tests;

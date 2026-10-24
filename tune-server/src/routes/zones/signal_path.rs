@@ -2056,6 +2056,7 @@ fn rendre_les_verdicts(
     let bitrate_label = np
         .bitrate_kbps
         .or(source.debit_radio_kbps)
+        .or(source.debit_source_kbps)
         .filter(|kbps| *kbps > 0 && !is_lossless)
         .map(|kbps| format!(" {kbps} kbit/s"))
         .unwrap_or_default();
@@ -2765,6 +2766,9 @@ struct Source<'w> {
     /// (`StreamInfo::dsd_reconstruit_depuis_dst`, posé par la session) : DSD
     /// natif décompressé, aucune conversion PCM.
     dst_reconstruit_en_dsf: bool,
+    /// #6357 — le débit du codec mesuré par le décodeur radio (HLS), quand
+    /// la lecture en cours n'en porte pas.
+    debit_source_kbps: Option<u32>,
     /// #6821 — le débit qu'une RADIO annonce (`icy-br`), relevé par la sonde.
     /// `None` hors radio : le débit d'un fichier vient de `NowPlaying`.
     debit_radio_kbps: Option<u32>,
@@ -2781,6 +2785,22 @@ fn radio_wire_preserves_source(np: &tune_core::playback::NowPlaying, source: &So
             && source
                 .wire_bit_depth
                 .is_some_and(|bits| i32::from(bits) >= source.bit_depth))
+}
+
+/// #6357 — le nom d'une source radio HLS : le protocole, puis le profil
+/// réellement décodé quand il est connu, sinon le codec. `None` hors HLS.
+fn libelle_radio_hls(radio: &tune_core::http::streamer::RadioSourceInfo) -> Option<&'static str> {
+    if radio.transport != Some("hls") {
+        return None;
+    }
+    Some(match (radio.profil, radio.format) {
+        (Some("HE-AACv2"), _) => "HLS · HE-AACv2",
+        (Some("HE-AAC"), _) => "HLS · HE-AAC",
+        (Some("AAC-LC"), _) => "HLS · AAC-LC",
+        (_, Some("aac")) => "HLS · AAC",
+        (_, Some("mp3")) => "HLS · MP3",
+        _ => "HLS",
+    })
 }
 
 /// Lit la piste, le fil et la lecture en cours pour décrire la source.
@@ -2812,6 +2832,7 @@ fn decrire_la_source<'w>(
     if let Some(radio) = radio_source {
         let source_format = radio.format.and_then(AudioFormat::from_extension);
         return Source {
+            debit_source_kbps: radio.debit_kbps,
             output_container,
             wire_sample_rate,
             wire_bit_depth,
@@ -2819,9 +2840,14 @@ fn decrire_la_source<'w>(
             is_dsd: false,
             sample_rate: radio.sample_rate.unwrap_or(0) as i32,
             bit_depth: radio.bit_depth.unwrap_or(0) as i32,
-            format_name: source_format
-                .as_ref()
-                .map_or(CODEC_INCONNU, AudioFormat::display_name),
+            // #6357 — une station HLS se nomme avec son protocole et son
+            // profil réel : « HLS · HE-AAC », et non un « AAC » qui tairait
+            // le SBR.
+            format_name: libelle_radio_hls(&radio).unwrap_or_else(|| {
+                source_format
+                    .as_ref()
+                    .map_or(CODEC_INCONNU, AudioFormat::display_name)
+            }),
             is_lossless: source_format.as_ref().is_some_and(AudioFormat::is_lossless),
             codec_connu: source_format.is_some(),
             flac_ffmpeg_vers_le_reseau: false,
@@ -2981,6 +3007,7 @@ fn decrire_la_source<'w>(
             .is_some()
         });
     Source {
+        debit_source_kbps: None,
         output_container,
         wire_sample_rate,
         wire_bit_depth,
