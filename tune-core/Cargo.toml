@@ -554,6 +554,7 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_Power",
+    "Win32_System_Threading",
     # #5410 — la température des zones thermiques (compteurs PDH « Thermal
     # Zone Information »), pour la garde thermique des analyses.
     "Win32_System_Performance",

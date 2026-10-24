@@ -769,6 +769,11 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         // #1274 — lecture en dB du volume rendu juste au-dessus, jamais d'une
         // autre source : les deux champs doivent toujours dire la meme chose.
         "volume_db": tune_core::audio::volume_scale::linear_to_db(zone_state.volume),
+        // #6787 — la loi du curseur (`volume` reste le gain).
+        "volume_curve": tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(
+            zone_db.as_ref().and_then(|z| z.output_type.as_deref()),
+        )
+        .code(),
         "state": zone_state.state,
         "current_track": zone_state.now_playing.as_ref().map(|np| json!({
             "id": np.track_id,
@@ -1766,6 +1771,11 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
                 zone_state.volume
             )),
         );
+        // #6787 — la loi du curseur (`volume` reste le gain).
+        tune_core::audio::volume_scale::inserer_courbe(
+            obj,
+            tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(output_type.as_deref()),
+        );
     }
     Json(v)
 }
@@ -2135,8 +2145,11 @@ mod refus_de_format_3234 {
             let message = corps["message"].as_str().unwrap_or_default();
             assert!(message.contains(phrase), "{lang} : {message}");
             // #6396 — la phrase dit OÙ se trouve l'option : « dans les
-            // Réglages » laissait chercher (Lulu, fil 2288).
-            assert!(message.contains("> Spotify"), "{lang} : {message}");
+            // Réglages » laissait chercher (Lulu, fil 2288). #6857 — et le
+            // chemin est le VRAI : la carte « Spotify Connect » de l'onglet
+            // d'accès, pas une page « Réglages > Spotify » qui n'existe pas.
+            assert!(message.contains("› Spotify Connect"), "{lang} : {message}");
+            assert!(!message.contains("> Spotify"), "{lang} : {message}");
         }
     }
 
@@ -4377,6 +4390,8 @@ async fn set_volume(
         Ok(()) => Json(json!({
             "volume": volume,
             "volume_db": tune_core::audio::volume_scale::linear_to_db(volume),
+            // #6787 — la loi du curseur (`volume` reste le gain).
+            "volume_curve": tune_core::audio::volume_scale::echelle_de_la_zone(&state.backend, zone_id).code(),
         }))
         .into_response(),
         Err(error) => output_command_error_response(error),

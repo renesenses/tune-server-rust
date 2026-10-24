@@ -89,6 +89,12 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // Notes et écoutes de la communauté (#6545) : consentement séparé,
     // désactivé par défaut. Un test de câblage garde la ligne.
     tune_core::cloud::notes_communautaires::spawn(state.backend.clone(), state.http_client.clone());
+    // Résultats d'analyse de la communauté (#5594) : recevoir et contribuer,
+    // deux options désactivées par défaut. Un test de câblage garde la ligne.
+    tune_core::cloud::mesures_communautaires::spawn(
+        state.backend.clone(),
+        state.http_client.clone(),
+    );
     spawn_local_audio_rescan(state);
     // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
     // `spawn_scan_scheduler` était du code mort, la bascule des clients écrivait
@@ -3806,6 +3812,25 @@ mod tests_licence_proprietaire_battement {
                 "spawn(state.backend.clone(), state.http_client.clone());"
             )),
             "le partage communautaire n'est plus lancé au démarrage"
+        );
+    }
+
+    /// #5594 — sans cet appel, les mesures communautaires seraient du code
+    /// mort : les options diraient « activé » et rien ne partirait jamais.
+    #[test]
+    fn les_mesures_communautaires_sont_lancees() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        let corps: String = source[debut..fin].split_whitespace().collect();
+        assert!(
+            corps.contains(concat!(
+                "tune_core::cloud::mesures_communautaires::",
+                "spawn(state.backend.clone(),state.http_client.clone(),);"
+            )),
+            "les mesures communautaires ne sont plus lancées au démarrage"
         );
     }
 

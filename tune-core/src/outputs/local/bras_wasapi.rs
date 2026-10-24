@@ -39,7 +39,7 @@ use super::chaine_native::{
     FinDeChaine, HoteDeChaineNative, ReserveDeLaChaine, ReserveHttp, Suivante,
     jouer_la_chaine_native,
 };
-use super::etage_natif::{EcritureNative, EtageNatif, PuitsAnneauNatif, spec_du_puits_natif};
+use super::etage_natif::{EcritureNative, EtageNatif, PuitsAnneauNatif, spec_du_puits_natif_vers};
 use super::*;
 use crate::outputs::wasapi_exclusive::WasapiExclusiveOutput;
 
@@ -155,8 +155,7 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
     fn ouvrir(demande: &DemandeDOuverture<'a>) -> Result<Self, RefusDOuverture> {
         let sample_rate = demande.spec.cadence();
         let bit_depth = demande.spec.profondeur().bits_declares();
-        let channels = demande.spec.canaux();
-        // WASAPI ouvre au format source : ni cadence, ni canaux, ni repli.
+        // WASAPI ouvre à la cadence source, sans repli de cadence.
         // `audio_backend`, `origin_host`, `exclusive`, `soft_mute` et
         // `device_gone` sont ceux de la demande, le trait les porte pour les
         // bras qui en ont besoin ; celui-ci n'en fait rien.
@@ -168,24 +167,68 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
             demande.device_gone,
         );
 
-        let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-        demande.starvation.begin_stream(sample_rate, channels);
-        let ring = Arc::new(NativePcmRing::new_metered(
-            ring_cap,
-            demande.starvation.clone(),
-        ));
-        ring.clear();
+        // #6230 (étape 2) — une grille qui pilote les voies (6 → 2) est
+        // demandée d'abord, plafonnée aux voies que l'endpoint déclare
+        // (`new_sur_voies_pilotees`). Un refus rouvre une fois au format de
+        // la source : c'est l'ouverture d'avant, et le chemin du signal dit
+        // pourquoi la règle ne s'applique pas (#6595).
+        let anneau_pour = |voies: u16| {
+            let ring_cap = (sample_rate as usize) * (voies as usize) * 2;
+            demande.starvation.begin_stream(sample_rate, voies);
+            let ring = Arc::new(NativePcmRing::new_metered(
+                ring_cap,
+                demande.starvation.clone(),
+            ));
+            ring.clear();
+            ring
+        };
+        let pilotee = demande
+            .voies_de_la_matrice
+            .filter(|&voies| voies != demande.spec.canaux())
+            .and_then(|voies| {
+                let ring = anneau_pour(voies);
+                match WasapiExclusiveOutput::new_sur_voies_pilotees(
+                    demande.device_name,
+                    demande.endpoint_id,
+                    sample_rate,
+                    bit_depth as u32,
+                    u32::from(voies),
+                    ring.clone(),
+                    demande.paused.clone(),
+                ) {
+                    Ok(wasapi) => Some((wasapi, ring)),
+                    Err(erreur) => {
+                        info!(
+                            device = %demande.device_name,
+                            voies,
+                            canaux_source = demande.spec.canaux(),
+                            erreur = %erreur,
+                            "wasapi_exclusive_voies_de_la_grille_refusees_reouverture_au_format_source"
+                        );
+                        None
+                    }
+                }
+            });
+        let ouverture = match pilotee {
+            Some((wasapi, ring)) => Ok((wasapi, ring)),
+            None => {
+                let channels = demande.spec.canaux();
+                let ring = anneau_pour(channels);
+                WasapiExclusiveOutput::new(
+                    demande.device_name,
+                    demande.endpoint_id,
+                    sample_rate,
+                    bit_depth as u32,
+                    u32::from(channels),
+                    ring.clone(),
+                    demande.paused.clone(),
+                )
+                .map(|wasapi| (wasapi, ring))
+            }
+        };
 
-        match WasapiExclusiveOutput::new(
-            demande.device_name,
-            demande.endpoint_id,
-            sample_rate,
-            bit_depth as u32,
-            channels as u32,
-            ring.clone(),
-            demande.paused.clone(),
-        ) {
-            Ok(wasapi) => {
+        match ouverture {
+            Ok((wasapi, ring)) => {
                 let sortie =
                     FormatOuvert::new(wasapi.opened_sample_rate(), wasapi.opened_channels() as u16);
                 Ok(BackendWasapi {
@@ -206,7 +249,9 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
         }
     }
 
-    /// Le format que `Initialize(EXCLUSIVE)` a accepté : celui de la source.
+    /// Le format que `Initialize(EXCLUSIVE)` a accepté : la cadence de la
+    /// source, et ses canaux — ou les voies de la grille quand elle les
+    /// pilote (#6230).
     fn format_ouvert(&self) -> FormatOuvert {
         self.sortie
     }
@@ -214,9 +259,11 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
     /// Le puits d'anneau natif : des blocs `Entier32` (mots alignés à gauche),
     /// poussés en attendant que le fil de rendu draine.
     fn puits(&self) -> Puits<'a> {
+        // #6230 — le puits porte les voies OUVERTES : l'étage natif y livre
+        // des blocs à M voies quand la grille pilote, à N sinon.
         Puits::Natif(Box::new(PuitsAnneauNatif::sur(
             self.anneau.clone(),
-            spec_du_puits_natif(self.spec),
+            spec_du_puits_natif_vers(self.spec, self.sortie.canaux),
             self.stop_rx,
             self.paused,
             self.force_silent,
@@ -411,10 +458,20 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
     // Aucun rappel d'erreur sur ce chemin : le témoin existe pour la
     // demande, personne ne le lève.
     let device_gone = Arc::new(AtomicBool::new(false));
+    // #6230 (étape 2) — les voies que la grille pilote pour cette piste, par
+    // la MÊME décision que la frontière gapless de l'étage natif
+    // (`voies_a_ouvrir_en_exclusif`) : jamais en PURE ni sur un porteur DoP,
+    // jamais sur une amorce 24 bits trop courte pour écarter le DoP.
+    let voies_de_la_matrice = Some(reaffectation.voies_a_ouvrir_en_exclusif(
+        spec,
+        header_buf.get(data_offset..).unwrap_or_default(),
+        pure_bypass.load(Ordering::Relaxed),
+        false,
+    ))
+    .filter(|&voies| voies != spec.canaux());
     let demande = DemandeDOuverture {
         spec,
-        // #6230 — un transport exclusif ouvre au format de la source.
-        voies_de_la_matrice: None,
+        voies_de_la_matrice,
         device_name: &device_name,
         endpoint_id: endpoint_id.as_deref(),
         origin_host: None,
@@ -482,6 +539,14 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
 
     let mut total_frames_fed: u64 = 0;
     let mut bit_perfect_state = None;
+
+    // #6230 — ce que l'ouverture a fait des voies demandées : noté pour les
+    // décisions de réouverture, et dit au journal.
+    reaffectation.constater_l_ouverture(
+        voies_de_la_matrice,
+        backend.format_ouvert().canaux,
+        &device_name,
+    );
 
     let mut etage = EtageNatif::monter(
         spec,
