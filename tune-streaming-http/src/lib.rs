@@ -1248,9 +1248,72 @@ async fn service_status(
     .into_response()
 }
 
+/// L'hôte par lequel le CLIENT a joint le serveur : `X-Forwarded-Host`
+/// derrière un relais ou un mandataire, sinon `Host`. Une `X-Forwarded-For`
+/// qui nomme une adresse hors de la boucle locale dit aussi que le client
+/// n'est pas sur la machine : l'hôte vu ne compte alors plus (`None`).
+fn hote_vu_par_le_client(headers: &axum::http::HeaderMap) -> Option<String> {
+    let premier = |nom: &str| {
+        headers
+            .get(nom)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(origine) = premier("x-forwarded-for") {
+        let boucle = origine
+            .trim_start_matches('[')
+            .split([']', '%'])
+            .next()
+            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
+        if !boucle {
+            return None;
+        }
+    }
+    premier("x-forwarded-host").or_else(|| premier("host"))
+}
+
+/// #6784 — les identifiants réellement passés au service.
+///
+/// Corps vide : le code d'appareil, comme avant. TIDAL, corps sans `code`,
+/// sans `device_flow` ni `poll` : c'est un démarrage PKCE, dont le rappel
+/// vise `localhost:8888`. Il n'aboutit que dans un navigateur de la machine
+/// du serveur (`rappel_pkce_aboutit`). Pour tout autre client — téléphone,
+/// autre poste, relais —, on passe au code d'appareil, qui ne dépend
+/// d'aucune adresse de retour. Le flux local reste le PKCE.
+fn identifiants_pour_le_client(
+    service: &str,
+    body: Option<Value>,
+    headers: &axum::http::HeaderMap,
+) -> Value {
+    let Some(mut credentials) = body else {
+        return json!({"device_flow": true});
+    };
+    if service == "tidal"
+        && let Some(objet) = credentials.as_object_mut()
+        && !["code", "device_flow", "poll"]
+            .iter()
+            .any(|cle| objet.contains_key(*cle))
+    {
+        let hote = hote_vu_par_le_client(headers);
+        if !tune_core::streaming::tidal::rappel_pkce_aboutit(hote.as_deref()) {
+            tracing::info!(
+                hote_vu = hote.as_deref().unwrap_or("?"),
+                "tidal_auth_code_d_appareil : le rappel PKCE vise localhost:8888 et \
+                 n'aboutirait pas chez ce client"
+            );
+            objet.insert("device_flow".into(), json!(true));
+        }
+    }
+    credentials
+}
+
 async fn service_auth(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
+    headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> Response {
     let body: Option<Value> = if raw_body.is_empty() {
@@ -1265,7 +1328,7 @@ async fn service_auth(
     };
 
     let mut svc = svc.write().await;
-    let credentials = body.unwrap_or(json!({"device_flow": true}));
+    let credentials = identifiants_pour_le_client(&service, body, &headers);
 
     match svc.authenticate(&credentials).await {
         Ok(status) => {
@@ -4054,5 +4117,87 @@ mod tests_livrets_album_6481 {
         );
         let (statut, corps) = appel("sans-livret-6481", "a-2").await;
         assert_eq!((statut, corps.as_str()), (StatusCode::OK, "[]"));
+    }
+}
+
+/// #6784 — quel flux TIDAL part, selon le client qui le demande.
+#[cfg(test)]
+mod tests_retour_oauth_6784 {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn entetes(paires: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (nom, valeur) in paires {
+            h.insert(*nom, valeur.parse().unwrap());
+        }
+        h
+    }
+
+    fn par_appareil(v: &Value) -> bool {
+        v.get("device_flow").and_then(Value::as_bool) == Some(true)
+    }
+
+    /// TÉMOIN ROUGE avant le correctif : un téléphone qui envoyait `{}`
+    /// recevait l'adresse PKCE dont le retour vise `localhost`.
+    #[test]
+    fn un_client_distant_passe_par_le_code_d_appareil() {
+        for h in [
+            entetes(&[("host", "192.168.1.18:8888")]),
+            entetes(&[("host", "tune.local:8888")]),
+            // Relais : l'hôte réel est dans X-Forwarded-Host.
+            entetes(&[
+                ("host", "127.0.0.1:8888"),
+                ("x-forwarded-host", "relais.example"),
+            ]),
+            // Mandataire local devant un client distant.
+            entetes(&[
+                ("host", "localhost:8888"),
+                ("x-forwarded-for", "203.0.113.9"),
+            ]),
+            HeaderMap::new(),
+        ] {
+            let v = identifiants_pour_le_client("tidal", Some(json!({})), &h);
+            assert!(par_appareil(&v), "{h:?} → {v}");
+        }
+    }
+
+    /// Le flux local ne change pas : navigateur de la machine du serveur, port
+    /// du rappel.
+    #[test]
+    fn le_navigateur_de_la_machine_garde_le_pkce() {
+        for h in [
+            entetes(&[("host", "localhost:8888")]),
+            entetes(&[("host", "127.0.0.1:8888")]),
+            entetes(&[("host", "localhost:8888"), ("x-forwarded-for", "127.0.0.1")]),
+        ] {
+            let v = identifiants_pour_le_client("tidal", Some(json!({})), &h);
+            assert!(!par_appareil(&v), "{h:?} → {v}");
+        }
+    }
+
+    /// Ce qui n'est pas un démarrage PKCE n'est pas touché : rappel, sondage,
+    /// demande explicite, corps vide, autres services.
+    #[test]
+    fn le_reste_passe_tel_quel() {
+        let distant = entetes(&[("host", "192.168.1.18:8888")]);
+        let rappel = json!({"code": "c", "state": "s"});
+        assert_eq!(
+            identifiants_pour_le_client("tidal", Some(rappel.clone()), &distant),
+            rappel
+        );
+        let sonde = json!({"poll": true});
+        assert_eq!(
+            identifiants_pour_le_client("tidal", Some(sonde.clone()), &distant),
+            sonde
+        );
+        assert!(par_appareil(&identifiants_pour_le_client(
+            "tidal", None, &distant
+        )));
+        let spotify = json!({"callback_url": "http://127.0.0.1:8888/cb?code=x"});
+        assert_eq!(
+            identifiants_pour_le_client("spotify", Some(spotify.clone()), &distant),
+            spotify
+        );
     }
 }

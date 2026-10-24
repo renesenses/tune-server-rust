@@ -442,6 +442,28 @@ unsafe fn sonder_format_exclusif(
 ///
 /// # Safety
 /// `audio_client` doit être un `IAudioClient` valide.
+/// #6230 — le nombre de voies du format du mixeur de l'endpoint : la
+/// configuration de haut-parleurs que Windows déclare pour lui. `None` s'il
+/// est illisible.
+#[cfg(target_os = "windows")]
+unsafe fn canaux_du_mixeur(audio_client: *mut std::ffi::c_void) -> Option<u32> {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    type GetMixFormatFn =
+        unsafe extern "system" fn(*mut c_void, *mut *mut ffi::WAVEFORMATEX) -> ffi::HRESULT;
+    let vtable = unsafe { *(audio_client as *const *const *const c_void) };
+    let get_mix_format: GetMixFormatFn = unsafe { std::mem::transmute(*vtable.add(8)) };
+    let mut format: *mut ffi::WAVEFORMATEX = ptr::null_mut();
+    let hr = unsafe { get_mix_format(audio_client, &mut format) };
+    if hr != ffi::S_OK || format.is_null() {
+        return None;
+    }
+    let entete: ffi::WAVEFORMATEX = unsafe { ptr::read_unaligned(format) };
+    unsafe { ffi::CoTaskMemFree(format as *mut c_void) };
+    Some(u32::from(entete.nChannels))
+}
+
 #[cfg(target_os = "windows")]
 unsafe fn format_du_mixeur(audio_client: *mut std::ffi::c_void) -> Option<String> {
     use std::ffi::c_void;
@@ -533,6 +555,61 @@ impl WasapiExclusiveOutput {
         ring: Arc<NativePcmRing>,
         paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {
+        Self::ouvrir_l_endpoint(
+            device_name,
+            endpoint_id,
+            sample_rate,
+            bit_depth,
+            channels,
+            ring,
+            paused,
+            false,
+        )
+    }
+
+    /// #6230 — ouvrir sur les voies qu'une grille de réaffectation PILOTE
+    /// (6 → 2), et non sur les canaux de la source. Même ouverture que
+    /// [`Self::new`], avec une garde de plus, AVANT toute négociation : si le
+    /// format du mixeur de l'endpoint — la configuration de haut-parleurs que
+    /// Windows déclare pour lui — porte moins de voies que demandé, ou s'il
+    /// est illisible, l'ouverture est refusée
+    /// ([`super::local::voies_pilotees_permises`]).
+    /// Jamais plus de voies que la sortie n'en déclare ; l'appelant rouvre
+    /// alors au format de la source, comme avant.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn new_sur_voies_pilotees(
+        device_name: &str,
+        endpoint_id: Option<&str>,
+        sample_rate: u32,
+        bit_depth: u32,
+        voies: u32,
+        ring: Arc<NativePcmRing>,
+        paused: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        Self::ouvrir_l_endpoint(
+            device_name,
+            endpoint_id,
+            sample_rate,
+            bit_depth,
+            voies,
+            ring,
+            paused,
+            true,
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)]
+    fn ouvrir_l_endpoint(
+        device_name: &str,
+        endpoint_id: Option<&str>,
+        sample_rate: u32,
+        bit_depth: u32,
+        channels: u32,
+        ring: Arc<NativePcmRing>,
+        paused: Arc<AtomicBool>,
+        plafonner_aux_voies_declarees: bool,
+    ) -> Result<Self, String> {
         use ffi::*;
         use std::ffi::c_void;
         use std::ptr;
@@ -594,6 +671,30 @@ impl WasapiExclusiveOutput {
                 }
             };
             release(enumerator);
+
+            // #6230 — des voies pilotées par une grille ne dépassent JAMAIS
+            // celles que l'endpoint déclare (format du mixeur).
+            if plafonner_aux_voies_declarees {
+                let declarees = canaux_du_mixeur(audio_client);
+                if !super::local::voies_pilotees_permises(channels, declarees) {
+                    info!(
+                        device = %resolved.name,
+                        voies = channels,
+                        voies_declarees = ?declarees,
+                        "wasapi_exclusive_voies_pilotees_refusees"
+                    );
+                    release(audio_client);
+                    release(device);
+                    return Err(format!(
+                        "{} déclare {} voie(s) : la grille en demande {channels}",
+                        resolved.name,
+                        declarees.map_or_else(
+                            || "un nombre illisible de".to_string(),
+                            |n| n.to_string()
+                        )
+                    ));
+                }
+            }
 
             // 4-5. Négocier le format en exclusif (#3837).
             //
@@ -1269,6 +1370,18 @@ impl WasapiExclusiveOutput {
         _sample_rate: u32,
         _bit_depth: u32,
         _channels: u32,
+        _ring: Arc<NativePcmRing>,
+        _paused: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        Err("WASAPI Exclusive is only available on Windows".into())
+    }
+
+    pub(crate) fn new_sur_voies_pilotees(
+        _device_name: &str,
+        _endpoint_id: Option<&str>,
+        _sample_rate: u32,
+        _bit_depth: u32,
+        _voies: u32,
         _ring: Arc<NativePcmRing>,
         _paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {

@@ -32,6 +32,7 @@
 pub mod battement;
 pub mod ecoute;
 pub mod ensembles;
+pub mod globe;
 pub mod lecture;
 pub mod playlists;
 pub mod rayons;
