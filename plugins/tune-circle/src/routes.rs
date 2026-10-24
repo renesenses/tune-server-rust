@@ -43,6 +43,15 @@
 //! | `GET /contacts/{user_id}/library/tracks?…`             | idem, requête comprise                 |
 //! | `GET /library-sync`                                    | — (état LOCAL de la copie en ligne)    |
 //!
+//! rc8 (#6900), l'écran de Levente et le globe opt-in, dans [`crate::globe`] :
+//! `GET /contacts/{user_id}/library/summary`, `GET|PUT|DELETE /me/location`,
+//! `GET /contacts/locations`, relayés à l'identique.
+//!
+//! #6935, inviter sans e-mail, dans [`crate::sans_email`] : `POST
+//! /invitations/by-pseudo`, `GET|POST /invitation-links`, `DELETE
+//! /invitation-links/{id}`, `POST /invitations/{id}/block`, `GET /blocks`,
+//! `DELETE /blocks/{user_id}`, relayés à l'identique.
+//!
 //! T4, l'écoute chez un contact (#5327), Premium : `POST
 //! /contacts/{user_id}/listen`, dans [`crate::ecoute`].
 //!
@@ -109,6 +118,22 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
         .route("/invitations/{id}", delete(retirer))
         .route("/invitations/{id}/accept", post(accepter))
         .route("/invitations/{id}/decline", post(refuser))
+        // #6935 : inviter sans e-mail, dans [`crate::sans_email`].
+        .route(
+            "/invitations/by-pseudo",
+            post(crate::sans_email::inviter_par_pseudo),
+        )
+        .route("/invitations/{id}/block", post(crate::sans_email::bloquer))
+        .route(
+            "/invitation-links",
+            get(crate::sans_email::liens).post(crate::sans_email::creer_lien),
+        )
+        .route(
+            "/invitation-links/{id}",
+            delete(crate::sans_email::revoquer_lien),
+        )
+        .route("/blocks", get(crate::sans_email::bloques))
+        .route("/blocks/{user_id}", delete(crate::sans_email::debloquer))
         .route("/members/{user_id}", delete(revoquer))
         .route("/circles", post(creer_cercle))
         .route(
@@ -142,6 +167,18 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
             "/contacts/{user_id}/library/tracks",
             get(bibliotheque_pistes),
         )
+        // Tune Circle rc8 (#6900) : l'écran de Levente et le globe opt-in.
+        .route(
+            "/contacts/{user_id}/library/summary",
+            get(crate::globe::resume_de_la_bibliotheque),
+        )
+        .route(
+            "/me/location",
+            get(crate::globe::mon_lieu)
+                .put(crate::globe::poser_mon_lieu)
+                .delete(crate::globe::retirer_mon_lieu),
+        )
+        .route("/contacts/locations", get(crate::globe::lieux_des_contacts))
         .with_state(relais)
         .merge(etat_de_la_copie)
 }

@@ -70,8 +70,19 @@ pub fn cle_existante(backend: &Arc<dyn DbBackend>) -> Result<Option<CleServeur>,
 
 /// La clé du serveur, créée et rangée dans le coffre au premier appel.
 pub fn cle_du_serveur(backend: &Arc<dyn DbBackend>) -> Result<CleServeur, String> {
-    if let Some(cle) = cle_existante(backend)? {
-        return Ok(cle);
+    let graine = graine_du_serveur(backend)?;
+    CleServeur::depuis_graine(&graine).map_err(|r| format!("cle du serveur : {r}"))
+}
+
+/// La graine de la clé du serveur, créée et rangée dans le coffre au premier
+/// appel. Réservée à la caisse : l'écoute directe (#6785) en tire l'identité
+/// d'endpoint pair-à-pair, qui est la MÊME clé (cahier, § 2.2). Elle ne sort
+/// jamais du processus.
+pub(crate) fn graine_du_serveur(backend: &Arc<dyn DbBackend>) -> Result<[u8; 32], String> {
+    if let Some(g) = graine_du_coffre(backend)? {
+        let mut graine = [0u8; 32];
+        graine.copy_from_slice(&g);
+        return Ok(graine);
     }
     let graine = CleServeur::nouvelle_graine().map_err(|r| format!("cle du serveur : {r}"))?;
     CredentialsVault::with_backend(backend.clone()).store(&ServiceCredential {
@@ -83,7 +94,7 @@ pub fn cle_du_serveur(backend: &Arc<dyn DbBackend>) -> Result<CleServeur, String
         extra: Default::default(),
     })?;
     info!("ecoute_distante_cle_serveur_creee");
-    CleServeur::depuis_graine(&graine).map_err(|r| format!("cle du serveur : {r}"))
+    Ok(graine)
 }
 
 /// Corps de l'inscription.

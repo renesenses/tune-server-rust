@@ -863,9 +863,14 @@ impl PositionPoller {
         zone_state: &crate::playback::ZoneState,
     ) -> Option<i64> {
         let p = Self::next_position(zone_state)?;
-        crate::orchestrator::lignes_bannies_a_enjamber(db, zone_id, p)
-            .0
-            .position_depuis(p)
+        crate::orchestrator::lignes_bannies_a_enjamber(
+            db,
+            zone_id,
+            p,
+            zone_state.session_profile_id,
+        )
+        .0
+        .position_depuis(p)
     }
 
     /// Next-track decision for a MANUAL skip (the `next` button). A manual skip
@@ -1302,6 +1307,11 @@ mod annonce_navigateur_guard;
 /// `tick()` UNE fois, et compte ce qui en sort.
 #[cfg(test)]
 mod remontee_des_pannes_de_sortie_tests;
+
+/// #6790 — une sortie qui se met en pause d'elle-même (`endpoint_release`
+/// OAAT) emmène la zone en pause.
+#[cfg(test)]
+mod pause_par_l_appareil_6790_tests;
 
 #[cfg(test)]
 mod lecture_sans_destination_tests;

@@ -332,4 +332,47 @@ mod tests {
         assert_eq!(lang_from_request(None, &h), "de");
         assert_eq!(lang_from_request(None, &HeaderMap::new()), "en");
     }
+
+    /// #6857 (Alesp, fil 2395) — le refus « Lecture Spotify non activée »
+    /// envoyait à « Réglages > Spotify », qui n'existe pas. Le réglage est
+    /// dans l'onglet « Accès et jetons », carte « Spotify Connect », au niveau
+    /// Avancé. Chaque langue doit nommer la carte et l'onglet tels que
+    /// l'interface les affiche (`tune-web-client/src/lib/locales/*.ts`,
+    /// `settings.tabAccess`).
+    ///
+    /// Contre-épreuve : remettre les anciennes phrases (« Réglages >
+    /// Spotify ») dans `i18n_server.json` fait tomber ce test.
+    #[test]
+    fn le_refus_spotify_donne_le_vrai_chemin_du_reglage() {
+        let onglet = [
+            ("fr", "Accès et jetons"),
+            ("en", "Access and tokens"),
+            ("de", "Zugang und Token"),
+            ("es", "Acceso y tokens"),
+            ("it", "Accesso e token"),
+            ("zh", "访问与令牌"),
+            ("ja", "アクセスとトークン"),
+            ("ko", "접근과 토큰"),
+            ("ro", "Acces și jetoane"),
+            ("sv", "Åtkomst och tokens"),
+            ("hu", "Hozzáférés és tokenek"),
+            ("vi", "Truy cập và token"),
+        ];
+        assert_eq!(onglet.len(), super::SUPPORTED.len());
+        for (lang, libelle) in onglet {
+            let m = t(lang, "spotify.playback.disabled");
+            assert!(
+                m.contains(libelle),
+                "{lang} : onglet « {libelle} » absent de {m:?}"
+            );
+            assert!(
+                m.contains("Spotify Connect"),
+                "{lang} : carte absente de {m:?}"
+            );
+            assert!(
+                !m.contains("> Spotify"),
+                "{lang} : ancien chemin dans {m:?}"
+            );
+        }
+    }
 }

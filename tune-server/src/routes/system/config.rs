@@ -424,6 +424,17 @@ pub(super) async fn get_config(
             tune_core::cloud::notes_communautaires::CLE_PARTAGE,
             json!(tune_core::cloud::notes_communautaires::PARTAGE_DEFAUT),
         ),
+        // #5594 — les résultats d'analyse de la communauté : RECEVOIR et
+        // CONTRIBUER, deux opt-in STRICTS et séparés, publiés avec leur
+        // défaut pour que le client distingue « éteint » de « pas lu ».
+        (
+            tune_core::cloud::mesures_communautaires::CLE_RECEPTION,
+            json!(tune_core::cloud::mesures_communautaires::RECEPTION_DEFAUT),
+        ),
+        (
+            tune_core::cloud::mesures_communautaires::CLE_CONTRIBUTION,
+            json!(tune_core::cloud::mesures_communautaires::CONTRIBUTION_DEFAUT),
+        ),
         ("quality_split", json!(true)),
         // Fil 2148 (#5792) — le délai de la sonde des partages réseau.
         (
@@ -470,6 +481,12 @@ pub(super) async fn get_config(
         // CLAP). Vide par défaut : rien d'exclu, le comportement d'avant.
         (
             tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+            json!([]),
+        ),
+        // Fil 2173 — les dossiers auxquels les passes qui décodent se
+        // limitent. Vide par défaut : toute la bibliothèque.
+        (
+            tune_core::taches_de_fond::perimetre::CLE_DOSSIERS_INCLUS,
             json!([]),
         ),
         // #6198 — les genres de la passe CLAP : retenus (vide : tous) et
@@ -1263,6 +1280,32 @@ fn normaliser_levee_du_bridage(
     Ok(())
 }
 
+/// #5594 — les deux options des mesures communautaires : un booléen (ou
+/// `"true"`/`"false"`), sinon 400. Une autre valeur, gardée telle quelle, se
+/// relirait « non » sans un mot — et un opt-in ne se devine pas.
+fn normaliser_mesures_communautaires(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<(), AppError> {
+    use tune_core::cloud::mesures_communautaires::{CLE_CONTRIBUTION, CLE_RECEPTION};
+    for cle in [CLE_RECEPTION, CLE_CONTRIBUTION] {
+        let Some(brut) = values.get(cle) else {
+            continue;
+        };
+        let valeur = match brut {
+            Value::Bool(b) => *b,
+            Value::String(s) if s.trim() == "true" => true,
+            Value::String(s) if s.trim() == "false" => false,
+            autre => {
+                return Err(AppError::bad_request(format!(
+                    "{cle} : un booléen est attendu, reçu {autre}"
+                )));
+            }
+        };
+        values.insert(cle.to_string(), json!(valeur));
+    }
+    Ok(())
+}
+
 /// #4681 — la politique de cession à la lecture : un objet dont chaque champ
 /// est borné (voir `tune_core::taches_de_fond::priorite::politique`). Un champ
 /// absent prend sa valeur par défaut, `null` remet tout par défaut ; un champ
@@ -1292,14 +1335,21 @@ fn normaliser_politique_de_lecture(
 fn normaliser_perimetre_des_analyses(
     values: &mut serde_json::Map<String, Value>,
 ) -> Result<bool, AppError> {
-    use tune_core::taches_de_fond::perimetre::{CLE_RACINES_EXCLUES, normaliser};
-    let Some(brut) = values.get(CLE_RACINES_EXCLUES) else {
-        return Ok(false);
+    use tune_core::taches_de_fond::perimetre::{
+        CLE_DOSSIERS_INCLUS, CLE_RACINES_EXCLUES, normaliser,
     };
-    let liste = normaliser(brut)
-        .map_err(|e| AppError::bad_request(format!("{CLE_RACINES_EXCLUES} : {e}")))?;
-    values.insert(CLE_RACINES_EXCLUES.to_string(), json!(liste));
-    Ok(true)
+    // Fil 2173 — les dossiers inclus, même forme, même refus, et la même
+    // campagne ReplayGain à refermer : ils changent le périmètre compté.
+    let mut touche = false;
+    for cle in [CLE_RACINES_EXCLUES, CLE_DOSSIERS_INCLUS] {
+        let Some(brut) = values.get(cle) else {
+            continue;
+        };
+        let liste = normaliser(brut).map_err(|e| AppError::bad_request(format!("{cle} : {e}")))?;
+        values.insert(cle.to_string(), json!(liste));
+        touche = true;
+    }
+    Ok(touche)
 }
 
 /// #6198 — les genres de la passe CLAP, retenus et écartés : la même forme
@@ -1515,6 +1565,7 @@ pub(super) async fn update_config(
     normaliser_pays_tendances_youtube(&mut values)?;
     normaliser_vitesse_des_analyses(&mut values)?;
     normaliser_levee_du_bridage(&mut values)?;
+    normaliser_mesures_communautaires(&mut values)?;
     let politique_de_lecture = normaliser_politique_de_lecture(&mut values)?;
     let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
     normaliser_genres_du_clap(&mut values)?;
@@ -5817,6 +5868,50 @@ mod levee_du_bridage_6713_tests {
 }
 
 #[cfg(test)]
+mod mesures_communautaires_5594_tests {
+    use super::{get_config, normaliser_mesures_communautaires};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::cloud::mesures_communautaires::{CLE_CONTRIBUTION, CLE_RECEPTION};
+
+    /// #5594 — les deux options sont publiées DÉSACTIVÉES sur une base neuve.
+    #[tokio::test]
+    async fn les_deux_options_sont_publiees_desactivees() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0;
+        assert_eq!(c[CLE_RECEPTION], false, "{c}");
+        assert_eq!(c[CLE_CONTRIBUTION], false, "{c}");
+    }
+
+    #[test]
+    fn seul_un_booleen_est_admis() {
+        for cle in [CLE_RECEPTION, CLE_CONTRIBUTION] {
+            let mut ok: serde_json::Map<String, Value> =
+                json!({ cle: "true" }).as_object().unwrap().clone();
+            assert!(normaliser_mesures_communautaires(&mut ok).is_ok());
+            assert_eq!(ok[cle], json!(true));
+            for mauvais in [json!("oui"), json!(1), json!(null)] {
+                let mut v: serde_json::Map<String, Value> =
+                    json!({ cle: mauvais }).as_object().unwrap().clone();
+                assert!(
+                    normaliser_mesures_communautaires(&mut v).is_err(),
+                    "{cle} {mauvais}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod politique_de_lecture_4681_tests {
     use super::{get_config, normaliser_politique_de_lecture, update_config};
     use crate::auth::RequireAdmin;
@@ -5997,7 +6092,7 @@ mod perimetre_des_analyses_5593_tests {
     use axum::http::HeaderMap;
     use serde_json::{Value, json};
     use tune_core::db::settings_repo::SettingsRepo;
-    use tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES;
+    use tune_core::taches_de_fond::perimetre::{CLE_DOSSIERS_INCLUS, CLE_RACINES_EXCLUES};
 
     async fn config(state: &AppState) -> Value {
         get_config(
@@ -6043,6 +6138,32 @@ mod perimetre_des_analyses_5593_tests {
             tune_core::taches_de_fond::perimetre::racines_exclues(&state.backend),
             vec!["\\\\192.168.0.126\\musique".to_string()]
         );
+    }
+
+    /// Fil 2173 — les dossiers inclus : publiés vides, normalisés comme les
+    /// racines exclues, refusés sous une autre forme, et leur écriture
+    /// referme la campagne ReplayGain (`Ok(true)`).
+    #[tokio::test]
+    async fn les_dossiers_inclus_sont_publies_vides_et_normalises_2173() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = config(&state).await;
+        assert_eq!(c[CLE_DOSSIERS_INCLUS], json!([]), "{c}");
+        let mut v: serde_json::Map<String, Value> =
+            json!({ CLE_DOSSIERS_INCLUS: [" /music/Jazz ", "", "/music/Jazz"] })
+                .as_object()
+                .unwrap()
+                .clone();
+        assert!(matches!(
+            normaliser_perimetre_des_analyses(&mut v),
+            Ok(true)
+        ));
+        assert_eq!(v[CLE_DOSSIERS_INCLUS], json!(["/music/Jazz"]));
+        let mut mauvais: serde_json::Map<String, Value> =
+            json!({ CLE_DOSSIERS_INCLUS: "/music/Jazz" })
+                .as_object()
+                .unwrap()
+                .clone();
+        assert!(normaliser_perimetre_des_analyses(&mut mauvais).is_err());
     }
 
     /// Une forme qui se relirait « rien d'exclu » en silence est REFUSÉE.

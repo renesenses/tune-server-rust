@@ -8,6 +8,9 @@ mod journal_pause_reprise_tests;
 #[path = "playback/reprise_apres_redemarrage_dlna_6380_tests.rs"]
 mod reprise_apres_redemarrage_dlna_6380_tests;
 #[cfg(test)]
+#[path = "playback/reprise_service_titre_seul_6380_tests.rs"]
+mod reprise_service_titre_seul_6380_tests;
+#[cfg(test)]
 #[path = "playback/seek_en_double_193_tests.rs"]
 mod seek_en_double_193_tests;
 #[cfg(test)]
@@ -766,6 +769,11 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         // #1274 — lecture en dB du volume rendu juste au-dessus, jamais d'une
         // autre source : les deux champs doivent toujours dire la meme chose.
         "volume_db": tune_core::audio::volume_scale::linear_to_db(zone_state.volume),
+        // #6787 — la loi du curseur (`volume` reste le gain).
+        "volume_curve": tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(
+            zone_db.as_ref().and_then(|z| z.output_type.as_deref()),
+        )
+        .code(),
         "state": zone_state.state,
         "current_track": zone_state.now_playing.as_ref().map(|np| json!({
             "id": np.track_id,
@@ -1135,6 +1143,12 @@ struct PlayRequest {
     // le client l'ENONCER ; ils priment sur toute deduction.
     context_type: Option<String>,
     context_id: Option<String>,
+    /// #6465 — l'espace de noms de `context_id` (`local`, `qobuz`…), quand
+    /// l'appelant l'énonce, comme `queue/add` le lit déjà. Sans lui, c'est
+    /// `source` qui le donne — le service du TITRE de tête : faux pour une
+    /// playlist de la bibliothèque lue en aléatoire dont le premier titre
+    /// tiré est un titre Qobuz.
+    context_source: Option<String>,
     /// #6467 — « Lire » un artiste de la BIBLIOTHÈQUE : le serveur tire au
     /// hasard jusqu'à 50 de ses titres (bannis écartés) et les joue, contexte
     /// `artist`. Voir `lire_artiste_6467`.
@@ -1222,7 +1236,14 @@ fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>, O
         // L'appelant qui ENONCE son contexte enonce aussi le service dans
         // `source`, comme pour toute lecture de service. Son absence dit la
         // bibliotheque : c'est la seule autre provenance possible.
-        let service = body.source.clone().unwrap_or_else(|| LOCAL.to_string());
+        let service = body
+            .context_source
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| body.source.clone())
+            .unwrap_or_else(|| LOCAL.to_string());
         return (Some(t.to_string()), body.context_id.clone(), Some(service));
     }
 
@@ -1471,6 +1492,11 @@ struct VolumeRequest {
     /// pas de viser −18 dB, et l'écart entre deux crans varie de 0,09 dB en
     /// haut d'échelle à 6 dB en bas.
     volume_db: Option<f64>,
+    /// #6721 — l'utilisateur CONFIRME une hausse de plus de 10 dB perçus en
+    /// une fois (`audio::garde_de_hausse`). Absent ou `false` : une telle
+    /// hausse est plafonnée au seuil. Jamais persisté.
+    #[serde(default)]
+    confirm_increase: bool,
 }
 
 #[derive(Deserialize)]
@@ -1749,6 +1775,11 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
             json!(tune_core::audio::volume_scale::linear_to_db(
                 zone_state.volume
             )),
+        );
+        // #6787 — la loi du curseur (`volume` reste le gain).
+        tune_core::audio::volume_scale::inserer_courbe(
+            obj,
+            tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(output_type.as_deref()),
         );
     }
     Json(v)
@@ -2119,8 +2150,11 @@ mod refus_de_format_3234 {
             let message = corps["message"].as_str().unwrap_or_default();
             assert!(message.contains(phrase), "{lang} : {message}");
             // #6396 — la phrase dit OÙ se trouve l'option : « dans les
-            // Réglages » laissait chercher (Lulu, fil 2288).
-            assert!(message.contains("> Spotify"), "{lang} : {message}");
+            // Réglages » laissait chercher (Lulu, fil 2288). #6857 — et le
+            // chemin est le VRAI : la carte « Spotify Connect » de l'onglet
+            // d'accès, pas une page « Réglages > Spotify » qui n'existe pas.
+            assert!(message.contains("› Spotify Connect"), "{lang} : {message}");
+            assert!(!message.contains("> Spotify"), "{lang} : {message}");
         }
     }
 
@@ -3003,6 +3037,20 @@ async fn play(
         });
         // #6399 — lu avant que `body` ne parte dans la demande de lecture.
         let tete_de_liste = body.queue_follows;
+        // #6380 (Sandro, fil 2404, rc7, Qobuz sur Diretta Renderer) : le bouton
+        // Lecture du client web, zone arrêtée sur une piste de SERVICE, envoie
+        // `{source, source_id}` — c'est CETTE branche, pas le corps vide. Sans
+        // la reprise ici, `playback_position_restored position_ms=19000` au
+        // démarrage, puis aucune `reprise_a_la_position_restauree` au Play :
+        // la piste repartait de 0:00 alors que les pistes locales reprenaient.
+        // Même règle que `{track_id}` : un `seek_ms` explicite reste prioritaire
+        // (ici, comme avant, il n'est pas lu) et la reprise ne vaut que pour la
+        // piste restaurée, une seule fois.
+        let reprise = if body.seek_ms.is_none() {
+            position_de_reprise(&state, zone_id, None, Some(source_id_val.as_str())).await
+        } else {
+            None
+        };
         let orch_req = tune_core::orchestrator::PlayRequest {
             zone_id,
             output_device_id,
@@ -3014,7 +3062,7 @@ async fn play(
             album_title: body.album_title,
             cover_url: body.cover_path,
             duration_ms: body.duration_ms,
-            seek_ms: None,
+            seek_ms: reprise,
             temp_file_path: None,
             sample_rate: body.sample_rate,
             bit_depth: body.bit_depth,
@@ -3023,7 +3071,8 @@ async fn play(
             disc_number: None,
             album_ref: album_ref_val.clone(),
         };
-        return match state.orchestrator.play(orch_req).await {
+        ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
+        return match lancer_la_lecture(&state, orch_req, reprise).await {
             Ok(result) => {
                 // If this track is already part of the loaded streaming queue
                 // (e.g. the user pressed Stop then Play again on a track from an
@@ -4336,18 +4385,37 @@ async fn set_volume(
     // pour baisser en ordre de plein volume (fil 2366, tweeter détruit).
     match state
         .orchestrator
-        .set_volume(zone_id, demande, device_id.as_deref())
+        .set_volume_avec_garde(
+            zone_id,
+            demande,
+            device_id.as_deref(),
+            tune_core::audio::garde_de_hausse::Hausse::depuis_confirmation(body.confirm_increase),
+        )
         .await
     {
         // #1274 — la réponse rend la valeur EFFECTIVE dans les deux unités.
         // Un client qui règle en dB doit pouvoir constater ce qu'il a obtenu
         // sans refaire le calcul, et surtout constater quand le verrou PURE
         // l'a remonté à 100 % : `volume_db` vaudra alors 0.
-        Ok(()) => Json(json!({
-            "volume": volume,
-            "volume_db": tune_core::audio::volume_scale::linear_to_db(volume),
-        }))
-        .into_response(),
+        Ok(retenu) => {
+            // #6721 — plafonnée par la garde : `volume` et `volume_db` disent
+            // le gain RETENU, et la réponse dit comment confirmer.
+            let volume = if retenu.hausse_plafonnee {
+                retenu.retenu
+            } else {
+                volume
+            };
+            let mut corps = json!({
+                "volume": volume,
+                "volume_db": tune_core::audio::volume_scale::linear_to_db(volume),
+                // #6787 — la loi du curseur (`volume` reste le gain).
+                "volume_curve": tune_core::audio::volume_scale::echelle_de_la_zone(&state.backend, zone_id).code(),
+            });
+            if let Some(obj) = corps.as_object_mut() {
+                retenu.inserer(obj);
+            }
+            Json(corps).into_response()
+        }
         Err(error) => output_command_error_response(error),
     }
 }
@@ -7213,6 +7281,29 @@ pub struct ShuffleAllQuery {
     folder: Option<String>,
 }
 
+/// #6465 — le conteneur que désigne un tirage `POST /playback/shuffle-all`,
+/// dans le vocabulaire de [`contexte_de_lecture`] : l'album ou l'artiste de la
+/// bibliothèque tiré. Les autres portées (bibliothèque entière, répertoire,
+/// recherche, genre) ne sont pas un conteneur de l'Historique : rien.
+fn contexte_d_un_tirage(q: &ShuffleAllQuery) -> (Option<String>, Option<String>, Option<String>) {
+    const LOCAL: &str = "local";
+    if let Some(id) = q.album_id {
+        return (
+            Some("album".into()),
+            Some(id.to_string()),
+            Some(LOCAL.into()),
+        );
+    }
+    if let Some(id) = q.artist_id {
+        return (
+            Some("artist".into()),
+            Some(id.to_string()),
+            Some(LOCAL.into()),
+        );
+    }
+    (None, None, None)
+}
+
 // Combien de pistes une lecture aléatoire enfile au maximum.
 //
 // C'était une constante à 500, posée pour fermer le gel d'interface de Jean
@@ -7479,6 +7570,32 @@ pub async fn shuffle_all(
             let _ = queue_repo.clear(zone_id);
         }
     }
+
+    // #6465 — le conteneur du tirage, posé sur la session comme le fait
+    // « Lire » (#2441) : l'Historique range les titres joués sous l'album ou
+    // l'artiste tiré. Sans cette pose, la session gardait le geste PRÉCÉDENT
+    // — un album lu en aléatoire ne s'historisait pas comme conteneur (fil
+    // 2379, point 1), et ses titres pouvaient se ranger dans l'album d'avant.
+    // Toujours écraser, même à vide : ce tirage remplace le geste précédent.
+    let (contexte_type, contexte_id, contexte_service) = contexte_d_un_tirage(&q);
+    let (contexte_titre, contexte_pochette) = nom_du_contexte(
+        &state,
+        contexte_type.as_deref(),
+        contexte_id.as_deref(),
+        contexte_service.as_deref(),
+    )
+    .await;
+    state
+        .playback
+        .set_session_context(
+            zone_id,
+            contexte_type,
+            contexte_id,
+            contexte_service,
+            contexte_titre,
+            contexte_pochette,
+        )
+        .await;
 
     let first_id = all_ids[0];
     let track = track_repo.get(first_id).ok().flatten();
@@ -8533,6 +8650,31 @@ mod tests_prereglage {
 #[cfg(test)]
 mod tests_contexte_de_lecture {
     use super::{PlayRequest, contexte_de_lecture};
+
+    /// #6465 — une playlist de la BIBLIOTHÈQUE lue en aléatoire dont le titre
+    /// de tête est un titre Qobuz : le corps porte `source: "qobuz"` (celui du
+    /// titre) et `context_source: "local"` (celui de la playlist). C'est la
+    /// playlist locale 12 qui a été demandée, pas la playlist Qobuz 12.
+    #[test]
+    fn la_source_du_contexte_enoncee_prime_sur_celle_du_titre_6465() {
+        let body = PlayRequest {
+            source: Some("qobuz".into()),
+            source_id: Some("264104097".into()),
+            context_type: Some("playlist".into()),
+            context_id: Some("12".into()),
+            context_source: Some("local".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (
+                Some("playlist".into()),
+                Some("12".into()),
+                Some("local".into())
+            ),
+            "la playlist locale 12 s'est rangée chez Qobuz"
+        );
+    }
 
     /// #2441 — FabienM, fil 1557 : « si je choisis de jouer une playlist
     /// complete, je m'attends a voir cette playlist ». Aujourd'hui le serveur

@@ -67,14 +67,21 @@ pub(super) fn emit_radio_playback_error(
         format!(
             "« {station} » n'émet plus d'audio : le serveur renvoie une page web à la place du flux. La station a probablement changé d'adresse."
         )
-    } else if error.starts_with(RADIO_HLS_UNSUPPORTED) {
+    } else if let Some(raison) = error.strip_prefix(RADIO_HLS_UNSUPPORTED) {
         // Nommer HLS, et dire quoi faire. Avant #2307 l'auditeur recevait au
         // mieux le « radio probe failed: … » de symphonia — le nom d'un
         // sous-système qu'il n'a aucune raison de connaître, sur un défaut
         // qu'il ne peut pas corriger. Ici il apprend que sa station est bien
         // vivante, que c'est Tune qui ne sait pas la lire, et quoi demander.
+        // #6357 — Tune lit le HLS ; ce refus ne vise plus que ce qu'il ne lit
+        // pas encore (fMP4, DRM, AC-3…), et la raison est dite.
+        let raison = raison.trim_start_matches(':').trim();
         format!(
-            "« {station} » est diffusée en HLS (manifeste .m3u8) : Tune ne sait pas encore lire ce format de flux. Demandez à la station son adresse de flux directe (MP3 ou AAC), ou choisissez une autre station."
+            "« {station} » est diffusée en HLS (liste .m3u8) sous une forme que Tune ne lit pas encore ({raison}). Demandez à la station son adresse de flux directe (MP3 ou AAC), ou choisissez une autre station."
+        )
+    } else if error.starts_with(RADIO_HLS_INTERDIT) {
+        format!(
+            "« {station} » refuse l'accès à son flux depuis cette connexion (souvent une restriction géographique du diffuseur). Choisissez une autre adresse de la station, ou une autre station."
         )
     } else {
         format!("Impossible de lire la station « {station} » : {error}")
@@ -164,16 +171,34 @@ pub fn non_audio_content_type(content_type: &str) -> Option<String> {
 /// station en `text/html` est morte ou a changé d'adresse, une station en HLS
 /// est bien vivante et c'est Tune qui ne sait pas la lire. Confondre les deux
 /// enverrait l'auditeur chercher une adresse de remplacement qui n'existe pas.
+///
+/// #6357 — Tune lit désormais le HLS (`crate::radio_hls`). Ce préfixe ne
+/// nomme plus que ce qu'il ne lit pas : segments fMP4/CMAF, plages d'octets,
+/// DRM, AC-3/E-AC-3, LATM, liste sans variante AAC ou MP3.
 pub(crate) const RADIO_HLS_UNSUPPORTED: &str = "radio_hls_unsupported";
+
+/// #6357 — préfixe des erreurs « le diffuseur refuse l'accès » (403, 451 sur
+/// une liste ou un segment HLS) : la BBC sert sa variante `uk` en 403 hors du
+/// Royaume-Uni. Définitif comme [`RADIO_NOT_AUDIO`] : trente reconnexions ne
+/// lèveront pas une restriction géographique. Aucun contournement n'est tenté.
+pub(crate) const RADIO_HLS_INTERDIT: &str = "radio_flux_interdit";
+
+/// Un échec qui ne guérira pas en réessayant : page web, HLS illisible,
+/// accès refusé. La boucle de reconnexion le rend tout de suite, et la
+/// relance automatique du sondeur se désarme (#3756).
+pub(crate) fn echec_radio_definitif(erreur: &str) -> bool {
+    erreur.starts_with(RADIO_NOT_AUDIO)
+        || erreur.starts_with(RADIO_HLS_UNSUPPORTED)
+        || erreur.starts_with(RADIO_HLS_INTERDIT)
+}
 
 /// Cette station est-elle publiée en HLS ?
 ///
 /// HLS n'est pas un format de conteneur qu'il suffirait d'ajouter au décodeur :
 /// c'est un PROTOCOLE. Un `.m3u8` est un manifeste qui liste des segments à
 /// télécharger l'un après l'autre, et qu'il faut re-télécharger périodiquement
-/// tant que le direct dure. `decode_radio_stream_to_pcm` fait un GET, un seul,
-/// et pousse le corps dans symphonia. Tune ne sait donc pas lire HLS ; dire
-/// lequel, et le dire à l'auditeur, est tout ce que ce contrôle sert à faire.
+/// tant que le direct dure. Depuis #6357, une station reconnue ici passe par
+/// le chargeur de `crate::radio_hls` au lieu du GET unique des flux Icecast.
 ///
 /// Deux signaux, tous deux SANS AMBIGUÏTÉ — c'est délibérément étroit, parce
 /// qu'un faux positif rendrait muette une station qui marche aujourd'hui :
@@ -315,6 +340,9 @@ struct Sonde {
     source_channels: u16,
     source_sample_rate: u32,
     source_info: crate::http::streamer::RadioSourceInfo,
+    /// #6357 — le PCM de la trame que la sonde HLS a déjà décodée pour
+    /// connaître la vraie fréquence (HE-AAC) : servi avant le paquet suivant.
+    pcm_en_attente: Option<(Vec<f32>, usize)>,
 }
 
 /// Le format de sortie décidé pour une connexion (voir `renderer_safe_wav_rate`).
@@ -405,19 +433,10 @@ pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
     en_vol: Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
     sortie_locale: bool,
 ) -> Result<(), String> {
-    // HLS s'arrête ici, avant le moindre octet de réseau (#2307). Ce
-    // décodeur fait un GET unique ; il n'a aucun chargeur de segments, aucun
-    // rafraîchissement de playlist, rien de ce qu'un direct HLS exige. Sans
-    // cette porte le manifeste partait quand même dans symphonia avec
-    // l'indice « mp3 » (le repli du `hint` plus bas, `.m3u8` ne correspondant
-    // à aucune branche), et l'auditeur récoltait au mieux un « radio probe
-    // failed: ... » illisible, au pire du silence si le probe accrochait une
-    // fausse synchro dans le texte du manifeste. On refuse, et on le DIT.
-    if is_hls_manifest(&url, "") {
-        return Err(format!(
-            "{RADIO_HLS_UNSUPPORTED}: {url} est un manifeste HLS, pas un flux audio décodable"
-        ));
-    }
+    // #6357 — le HLS ne s'arrête plus ici (#2307 le refusait avant le
+    // moindre octet de réseau) : `sonder_la_station` le reconnaît et passe
+    // par le chargeur de segments. Le reste du chemin — format de sortie,
+    // volume, EQ, reconnexions — est celui de toutes les radios.
     let rt =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime for radio decode")?;
 
@@ -511,9 +530,8 @@ fn se_connecter_et_sonder(etat: &mut EtatRadio, url: &str) -> Result<Sonde, Suit
             // flux audio en réessayant trente fois : on remonte l'erreur
             // tout de suite pour qu'elle soit DITE, au lieu de quinze
             // secondes de silence suivies d'un abandon muet.
-            // Ni un manifeste HLS, que trente reconnexions ne
-            // transformeront pas davantage en flux Icecast (#2307).
-            if e.starts_with(RADIO_NOT_AUDIO) || e.starts_with(RADIO_HLS_UNSUPPORTED) {
+            // Ni un HLS illisible (#2307), ni un accès refusé (#6357).
+            if echec_radio_definitif(&e) {
                 return Err(SuiteRadio::Rendre(Err(e)));
             }
             etat.reconnects += 1;
@@ -528,15 +546,30 @@ fn se_connecter_et_sonder(etat: &mut EtatRadio, url: &str) -> Result<Sonde, Suit
     }
 }
 
+/// #6821 — lit l'en-tête `icy-br` d'une station Icecast/Shoutcast : un débit
+/// en kbit/s (`128`). Certains serveurs en répètent plusieurs, séparés par
+/// une virgule (`128,128`) : seul le premier compte. Toute autre forme, zéro,
+/// ou un chiffre hors de toute radio réelle (au-delà de 10 000 kbit/s) rend
+/// `None` : un débit qu'on ne sait pas lire ne s'affiche pas.
+pub(crate) fn debit_icy(valeur: &str) -> Option<u32> {
+    let premier = valeur.split(',').next()?.trim();
+    let kbps: u32 = premier.parse().ok()?;
+    (1..=10_000).contains(&kbps).then_some(kbps)
+}
+
 /// Le GET, les contrôles de type, la sonde Symphonia et le décodeur : le
 /// texte de la fermeture `setup` d'origine, tel quel.
 fn sonder_la_station(url: &str) -> Result<Sonde, String> {
-    use symphonia::core::codecs::CodecParameters;
+    use std::io::Read;
     use symphonia::core::formats::probe::Hint;
-    use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
-    use symphonia::core::meta::MetadataOptions;
     use tracing::info;
+
+    // #6357 — une liste `.m3u8` passe par le chargeur HLS, avant tout GET
+    // de flux continu.
+    if is_hls_manifest(url, "") {
+        return sonder_hls(url, None);
+    }
 
     // No total timeout for infinite radio streams
     let response = crate::http::client::blocking_builder()
@@ -566,16 +599,45 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
             "{RADIO_NOT_AUDIO}: le serveur a répondu « {bad} » au lieu d'un flux audio"
         ));
     }
-    // Un manifeste HLS servi depuis une URL sans extension : seul le
-    // type MIME le dénonce. Même refus nommé que la porte d'entrée.
-    if is_hls_manifest(url, &content_type) {
-        return Err(format!(
-            "{RADIO_HLS_UNSUPPORTED}: le serveur a répondu « {content_type} », un manifeste HLS et non un flux audio"
-        ));
-    }
+    // #6821 — le débit que la station annonce (`icy-br`), lu AVANT que la
+    // réponse ne soit livrée au décodeur.
+    let debit_annonce = response
+        .headers()
+        .get("icy-br")
+        .and_then(|v| v.to_str().ok())
+        .and_then(debit_icy);
     info!(url = %url, content_type = %content_type, "radio_local_decode_stream_connected");
 
-    let source = ReadOnlySource::new(response);
+    // #6357 — une URL sans extension peut servir une liste HLS : sous son
+    // type enregistré, ou sous un type `mpegurl` que les serveurs donnent
+    // aussi aux simples `.m3u`. On regarde les premiers octets : `#EXTM3U`
+    // suivi de balises HLS, c'est une liste à charger ; sinon les octets lus
+    // sont rendus tels quels au décodeur, et rien ne change pour un flux
+    // audio mal étiqueté.
+    let mut response = response;
+    let mut tete = Vec::new();
+    if is_hls_manifest(url, &content_type) || type_mpegurl(&content_type) {
+        let finale = response.url().to_string();
+        (&mut response)
+            .take(64 * 1024)
+            .read_to_end(&mut tete)
+            .map_err(|e| format!("radio HTTP fetch failed: {e}"))?;
+        let texte = String::from_utf8_lossy(&tete);
+        if texte.trim_start_matches('\u{feff}').starts_with("#EXTM3U")
+            && (texte.contains("#EXT-X-TARGETDURATION") || texte.contains("#EXT-X-STREAM-INF"))
+        {
+            let mut texte = texte.into_owned();
+            // Une liste plus longue que la tête lue : on lit le reste, borné.
+            if tete.len() == 64 * 1024 {
+                let mut reste = String::new();
+                let _ = response.take(2 * 1024 * 1024).read_to_string(&mut reste);
+                texte.push_str(&reste);
+            }
+            return sonder_hls(url, Some((finale, texte)));
+        }
+    }
+
+    let source = ReadOnlySource::new(std::io::Cursor::new(tete).chain(response));
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
 
     let mut hint = Hint::new();
@@ -600,27 +662,8 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
         hint.with_extension("mp3");
     }
 
-    let format: Box<dyn symphonia::core::formats::FormatReader> = symphonia::default::get_probe()
-        .probe(
-            &hint,
-            mss,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )
-        .map_err(|e| format!("radio probe failed: {e}"))?;
-
-    // Extract track metadata in a scope so the borrow of `format` ends
-    // before we move it into the return tuple.
-    let (track_id, audio_params) = {
-        let track = format
-            .default_track(TrackType::Audio)
-            .ok_or("radio stream: no audio track found")?;
-        let params = match &track.codec_params {
-            Some(CodecParameters::Audio(params)) => params.clone(),
-            _ => return Err("radio stream: no audio codec parameters".into()),
-        };
-        (track.id, params)
-    };
+    let format = sonder_le_conteneur(&hint, mss)?;
+    let (track_id, audio_params) = piste_audio(&*format)?;
     let source_channels = audio_params
         .channels
         .as_ref()
@@ -630,7 +673,71 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
 
     // Opus : libopus, symphonia ne le décode pas (voir `radio_ogg`).
     let decoder = radio_ogg::DecodeurRadio::pour(&audio_params)?;
+    let mut source_info = source_info_de(&audio_params);
+    // #6821 — le débit annoncé par la station, lu à la connexion.
+    source_info.bitrate_kbps = debit_annonce;
 
+    Ok(Sonde {
+        source_info,
+        format,
+        decoder,
+        track_id,
+        source_channels,
+        source_sample_rate,
+        pcm_en_attente: None,
+    })
+}
+
+/// Les types que les serveurs donnent aux listes `.m3u` comme aux `.m3u8`.
+fn type_mpegurl(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        essence.as_str(),
+        "application/x-mpegurl" | "audio/x-mpegurl" | "audio/mpegurl"
+    )
+}
+
+fn sonder_le_conteneur(
+    hint: &symphonia::core::formats::probe::Hint,
+    mss: symphonia::core::io::MediaSourceStream<'static>,
+) -> Result<Box<dyn symphonia::core::formats::FormatReader>, String> {
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::meta::MetadataOptions;
+    symphonia::default::get_probe()
+        .probe(
+            hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| format!("radio probe failed: {e}"))
+}
+
+/// La piste audio par défaut et ses paramètres.
+fn piste_audio(
+    format: &dyn symphonia::core::formats::FormatReader,
+) -> Result<(u32, symphonia::core::codecs::audio::AudioCodecParameters), String> {
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::formats::TrackType;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or("radio stream: no audio track found")?;
+    let params = match &track.codec_params {
+        Some(CodecParameters::Audio(params)) => params.clone(),
+        _ => return Err("radio stream: no audio codec parameters".into()),
+    };
+    Ok((track.id, params))
+}
+
+/// Ce que la sonde dit de la source, pour le chemin du signal.
+fn source_info_de(
+    audio_params: &symphonia::core::codecs::audio::AudioCodecParameters,
+) -> crate::http::streamer::RadioSourceInfo {
     use symphonia::core::codecs::audio::well_known::*;
     let source_format = match audio_params.codec {
         CODEC_ID_MP3 => Some("mp3"),
@@ -641,7 +748,7 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
         CODEC_ID_OPUS => Some("opus"),
         _ => None,
     };
-    let source_info = crate::http::streamer::RadioSourceInfo {
+    crate::http::streamer::RadioSourceInfo {
         channels: audio_params
             .channels
             .as_ref()
@@ -656,7 +763,101 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
             .flatten()
             .and_then(|bits| u16::try_from(bits).ok())
             .filter(|bits| *bits > 0),
+        ..Default::default()
+    }
+}
+
+/// Combien de paquets la sonde HLS lit au plus pour obtenir une première
+/// trame décodée (une trame vide ou ratée en tête de flux n'est pas rare).
+const PAQUETS_DE_SONDE_HLS: usize = 16;
+
+/// #6357 — une station HLS : la source `radio_hls` (liste, variante,
+/// segments, démultiplexage) rend un flux ADTS ou MP3 continu, poussé dans
+/// symphonia comme le corps d'une station Icecast.
+///
+/// L'AAC est décodé par `rusty_aac`, qui reconstruit le SBR et le PS. Le
+/// piège (étude #6363 §4.4) : en ADTS, un HE-AAC se signale IMPLICITEMENT —
+/// l'en-tête dit « AAC-LC à 24 kHz », la vraie sortie est à 48 kHz. Le
+/// format de sortie étant décidé avant la boucle de décodage
+/// (`preparer_la_sortie`), la première trame est décodée ICI, et c'est sa
+/// fréquence et ses canaux qui font foi ; son PCM est gardé pour être servi
+/// en premier. Sans cela, l'en-tête WAV annoncerait 24 kHz sur du PCM à
+/// 48 kHz : la musique jouerait à demi-vitesse.
+fn sonder_hls(url: &str, deja_lue: Option<(String, String)>) -> Result<Sonde, String> {
+    use symphonia::core::codecs::audio::well_known::CODEC_ID_AAC;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
+    use tracing::{info, warn};
+
+    let source =
+        crate::radio_hls::HlsSource::ouvrir(url, deja_lue, crate::radio_hls::Reglages::default())?;
+    let infos = source.infos.clone();
+    let mss = MediaSourceStream::new(Box::new(ReadOnlySource::new(source)), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension(match infos.charge {
+        crate::radio_hls::Charge::Adts => "aac",
+        crate::radio_hls::Charge::Mp3 => "mp3",
+    });
+    let mut format = sonder_le_conteneur(&hint, mss)?;
+    let (track_id, audio_params) = piste_audio(&*format)?;
+    let mut source_info = source_info_de(&audio_params);
+    let coeur_cadence = audio_params.sample_rate.unwrap_or(44100);
+    let coeur_canaux = audio_params
+        .channels
+        .as_ref()
+        .map(|c| c.count() as u16)
+        .unwrap_or(2);
+
+    let mut decoder = None;
+    let mut pcm_en_attente = None;
+    let (mut source_sample_rate, mut source_channels) = (coeur_cadence, coeur_canaux);
+    if audio_params.codec == CODEC_ID_AAC {
+        match radio_ogg::DecodeurRadio::aac_pur_rust(&audio_params)
+            .and_then(|mut d| premiere_trame(&mut *format, track_id, &mut d).map(|pcm| (d, pcm)))
+        {
+            Ok((d, (pcm, canaux))) => {
+                source_sample_rate = d.cadence_decodee().unwrap_or(coeur_cadence);
+                source_channels = u16::try_from(canaux).unwrap_or(coeur_canaux);
+                pcm_en_attente = Some((pcm, canaux));
+                decoder = Some(d);
+            }
+            Err(e) => {
+                // Repli : symphonia décode au moins le cœur AAC-LC. Moins
+                // bien (sans SBR), mais du son plutôt que rien.
+                warn!(url = %url, error = %e, "hls_aac_repli_symphonia");
+            }
+        }
+    }
+    let decoder = match decoder {
+        Some(d) => d,
+        None => radio_ogg::DecodeurRadio::pour(&audio_params)?,
     };
+    let sbr = source_sample_rate > coeur_cadence;
+    let v2 = infos
+        .codecs
+        .as_deref()
+        .is_some_and(|c| c.to_ascii_lowercase().contains("mp4a.40.29"));
+    source_info.transport = Some("hls");
+    source_info.profil = match (audio_params.codec == CODEC_ID_AAC, sbr, v2) {
+        (false, _, _) => None,
+        (true, true, true) => Some("HE-AACv2"),
+        (true, true, false) => Some("HE-AAC"),
+        (true, false, _) if pcm_en_attente.is_some() => Some("AAC-LC"),
+        // Le repli symphonia ne sait pas dire si le flux porte du SBR.
+        (true, false, _) => None,
+    };
+    source_info.debit_kbps = infos.debit_kbps;
+    source_info.sample_rate = Some(source_sample_rate);
+    source_info.channels = Some(source_channels).filter(|n| *n > 0);
+    info!(
+        url = %url,
+        profil = ?source_info.profil,
+        coeur_hz = coeur_cadence,
+        sortie_hz = source_sample_rate,
+        canaux = source_channels,
+        debit_kbps = ?infos.debit_kbps,
+        "radio_hls_sonde"
+    );
 
     Ok(Sonde {
         source_info,
@@ -665,7 +866,35 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
         track_id,
         source_channels,
         source_sample_rate,
+        pcm_en_attente,
     })
+}
+
+/// Décode des paquets jusqu'à la première trame non vide : son PCM et ses
+/// canaux. Le décodeur garde, dans `cadence_decodee`, la vraie fréquence.
+fn premiere_trame(
+    format: &mut dyn symphonia::core::formats::FormatReader,
+    track_id: u32,
+    decodeur: &mut radio_ogg::DecodeurRadio,
+) -> Result<(Vec<f32>, usize), String> {
+    let mut pcm = Vec::new();
+    let mut derniere_erreur = String::from("aucune trame décodée");
+    for _ in 0..PAQUETS_DE_SONDE_HLS {
+        let paquet = match format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => return Err("flux terminé avant la première trame".into()),
+            Err(e) => return Err(format!("lecture du premier paquet : {e}")),
+        };
+        if paquet.track_id != track_id {
+            continue;
+        }
+        match decodeur.decoder(&paquet, &mut pcm) {
+            Ok(canaux) if !pcm.is_empty() => return Ok((pcm, canaux)),
+            Ok(_) => {}
+            Err(e) => derniere_erreur = e,
+        }
+    }
+    Err(derniere_erreur)
 }
 
 /// Deuxième temps : le format attendu est vérifié, le taux de sortie
@@ -811,56 +1040,75 @@ fn decoder_un_paquet(
         debug!("radio_local_decode_channel_closed_before_packet");
         return SuitePaquet::ConsommateurParti;
     }
-    let packet = match sonde.format.next_packet() {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            debug!("radio_local_decode_stream_ended_upstream");
-            return SuitePaquet::AmontTermine; // upstream ended — reconnect
+    // #6357 — la trame que la sonde HLS a déjà décodée passe en premier.
+    let (mut interleaved, channels) = if let Some(en_attente) = sonde.pcm_en_attente.take() {
+        en_attente
+    } else {
+        let packet = match sonde.format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                debug!("radio_local_decode_stream_ended_upstream");
+                return SuitePaquet::AmontTermine; // upstream ended — reconnect
+            }
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                debug!("radio_local_decode_eof");
+                return SuitePaquet::AmontCoupe; // upstream dropped — reconnect
+            }
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                // Ogg chaîné : le titre suivant ouvre un nouveau flux logique.
+                // Avant, ce cas tombait dans la branche d'erreur ci-dessous et
+                // coûtait un GET complet à chaque changement de titre.
+                return match radio_ogg::piste_du_flux_suivant(
+                    &*sonde.format,
+                    sonde.source_channels,
+                    sonde.source_sample_rate,
+                ) {
+                    Some((track_id, decoder)) => {
+                        sonde.track_id = track_id;
+                        sonde.decoder = decoder;
+                        let titre = radio_ogg::titre_du_flux_logique(&mut *sonde.format);
+                        tracing::info!(titre = ?titre, "radio_ogg_flux_logique_suivant");
+                        SuitePaquet::FluxLogiqueSuivant
+                    }
+                    None => SuitePaquet::ErreurDePaquet,
+                };
+            }
+            Err(e) => {
+                // FIP-style upstream body error — reconnect in place.
+                warn!(error = %e, "radio_local_decode_packet_error");
+                return SuitePaquet::ErreurDePaquet;
+            }
+        };
+
+        if packet.track_id != sonde.track_id {
+            return SuitePaquet::AutrePiste;
         }
-        Err(symphonia::core::errors::Error::IoError(ref e))
-            if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+
+        // Decoded audio as interleaved samples before output quantization.
+        let mut interleaved: Vec<f32> = Vec::new();
+        let channels = match sonde.decoder.decoder(&packet, &mut interleaved) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(error = %e, "radio_local_decode_frame_skip");
+                return SuitePaquet::TrameSautee;
+            }
+        };
+        // #6357 — la fréquence décodée ne doit pas quitter celle de l'en-tête
+        // WAV déjà servi (un HE-AAC qui perdrait son SBR en route) : on se
+        // reconnecte, et la garde `expected_format` décide.
+        if let Some(cadence) = sonde.decoder.cadence_decodee()
+            && cadence != sonde.source_sample_rate
         {
-            debug!("radio_local_decode_eof");
-            return SuitePaquet::AmontCoupe; // upstream dropped — reconnect
-        }
-        Err(symphonia::core::errors::Error::ResetRequired) => {
-            // Ogg chaîné : le titre suivant ouvre un nouveau flux logique.
-            // Avant, ce cas tombait dans la branche d'erreur ci-dessous et
-            // coûtait un GET complet à chaque changement de titre.
-            return match radio_ogg::piste_du_flux_suivant(
-                &*sonde.format,
-                sonde.source_channels,
-                sonde.source_sample_rate,
-            ) {
-                Some((track_id, decoder)) => {
-                    sonde.track_id = track_id;
-                    sonde.decoder = decoder;
-                    let titre = radio_ogg::titre_du_flux_logique(&mut *sonde.format);
-                    tracing::info!(titre = ?titre, "radio_ogg_flux_logique_suivant");
-                    SuitePaquet::FluxLogiqueSuivant
-                }
-                None => SuitePaquet::ErreurDePaquet,
-            };
-        }
-        Err(e) => {
-            // FIP-style upstream body error — reconnect in place.
-            warn!(error = %e, "radio_local_decode_packet_error");
+            warn!(
+                attendu = sonde.source_sample_rate,
+                recu = cadence,
+                "radio_cadence_decodee_changee"
+            );
             return SuitePaquet::ErreurDePaquet;
         }
-    };
-
-    if packet.track_id != sonde.track_id {
-        return SuitePaquet::AutrePiste;
-    }
-
-    // Decoded audio as interleaved samples before output quantization.
-    let mut interleaved: Vec<f32> = Vec::new();
-    let channels = match sonde.decoder.decoder(&packet, &mut interleaved) {
-        Ok(c) => c,
-        Err(e) => {
-            debug!(error = %e, "radio_local_decode_frame_skip");
-            return SuitePaquet::TrameSautee;
-        }
+        (interleaved, channels)
     };
 
     // Upsample low-rate (HE-AAC 22050) PCM to the renderer-safe rate

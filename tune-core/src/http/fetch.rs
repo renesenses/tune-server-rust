@@ -347,27 +347,42 @@ mod tests {
     }
 
     /// Le refus repousse le PROCHAIN créneau : la requête suivante attend
-    /// l'intervalle doublé, pas l'ancien.
+    /// l'intervalle doublé, pas l'ancien ; après un succès, les créneaux
+    /// suivants reviennent à l'intervalle de base.
+    ///
+    /// Le retour à la base se lit dans les créneaux RÉSERVÉS, pas à
+    /// l'horloge : mesurer l'attente de la 4e requête dépendait de l'heure de
+    /// réveil de la 3e, et un réveil tardif de tokio sur une machine chargée
+    /// la raccourcissait sous 90 ms (77 ms mesurés en CI, 76 ms reproduits
+    /// sur Shrek en épinglant le test sur un cœur occupé).
     #[tokio::test]
     async fn apres_un_refus_la_requete_suivante_attend_l_intervalle_double() {
         let rl = RateLimiter::with_interval(Duration::from_millis(100));
+        let prochain = |rl: &RateLimiter| rl.etats()["k"].prochain;
         rl.acquire("k").await;
+        let avant_refus = Instant::now();
         rl.constater("k", 503, None);
-        let debut = Instant::now();
-        rl.acquire("k").await;
+        let creneau = prochain(&rl);
         assert!(
-            debut.elapsed() >= Duration::from_millis(190),
-            "attendu ~200 ms après un 503, mesuré {:?}",
-            debut.elapsed()
+            creneau >= avant_refus + Duration::from_millis(200),
+            "un 503 doit repousser le prochain créneau d'au moins 200 ms"
         );
-        rl.constater("k", 200, None);
         rl.acquire("k").await;
-        let debut = Instant::now();
-        rl.acquire("k").await;
-        let attente = debut.elapsed();
+        // Borne basse seule : un réveil tardif ne peut que l'allonger.
         assert!(
-            attente >= Duration::from_millis(90) && attente < Duration::from_millis(180),
-            "après un succès, l'intervalle doit revenir à 100 ms : {attente:?}"
+            avant_refus.elapsed() >= Duration::from_millis(190),
+            "attendu ~200 ms après un 503, mesuré {:?}",
+            avant_refus.elapsed()
+        );
+        // Ce créneau-là a été réservé avec l'intervalle doublé.
+        assert_eq!(prochain(&rl), creneau + Duration::from_millis(200));
+        rl.constater("k", 200, None);
+        let avant = prochain(&rl);
+        rl.acquire("k").await;
+        assert_eq!(
+            prochain(&rl),
+            avant + Duration::from_millis(100),
+            "après un succès, l'intervalle doit revenir à 100 ms"
         );
     }
 

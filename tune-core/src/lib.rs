@@ -69,6 +69,7 @@ pub mod poller;
 pub mod prefetch;
 pub mod queue_persistence;
 pub mod radio_favorites;
+pub mod radio_hls;
 pub mod radio_metadata;
 pub mod radio_metadata_relais;
 pub mod remote_discovery;

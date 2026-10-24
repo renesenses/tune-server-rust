@@ -137,6 +137,9 @@ async fn pause_room(State(state): State<AppState>, Path(id): Path<String>) -> im
 #[derive(Deserialize)]
 struct VolumeBody {
     volume: f64,
+    /// #6721 — hausse de plus de 10 dB confirmée par l'utilisateur.
+    #[serde(default)]
+    confirm_increase: bool,
 }
 
 /// Set volume on the given Sonos device via its DLNA output.
@@ -162,8 +165,29 @@ async fn set_room_volume(
         Some(s) => body.volume.min(s),
         None => body.volume,
     };
+    // #6721 — ce pilotage direct ne passe pas par la zone : la garde contre
+    // les montées brusques y est appliquée ici, depuis le volume que
+    // l'appareil rapporte (illisible : depuis le silence, par prudence).
+    let actuel = output.get_status().await.map(|s| s.volume).unwrap_or(0.0);
+    let retenu = tune_core::audio::garde_de_hausse::retenir(
+        actuel,
+        volume,
+        tune_core::audio::volume_scale::EchelleDeVolume::Lineaire,
+        tune_core::audio::garde_de_hausse::Hausse::depuis_confirmation(body.confirm_increase),
+    );
+    let garde = tune_core::audio::garde_de_hausse::VolumeRetenu {
+        demande: volume,
+        retenu,
+        hausse_plafonnee: retenu < volume,
+    };
+    let volume = retenu;
     match output.checked_set_volume(volume).await {
-        Ok(()) => Json(json!({"volume": volume})).into_response(),
+        Ok(()) => {
+            let mut corps = serde_json::Map::new();
+            corps.insert("volume".into(), json!(volume));
+            garde.inserer(&mut corps);
+            Json(serde_json::Value::Object(corps)).into_response()
+        }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
 }

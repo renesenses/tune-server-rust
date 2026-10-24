@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+// #6721 — les hausses de ces bancs sont CONFIRMÉES quand la garde contre
+// les montées brusques n'est pas l'objet du test (`garde_de_hausse_6721_tests`).
 use super::PlaybackOrchestrator;
 use crate::audio::volume_limites::{cle_confort, cle_securite};
 use crate::db::migrations::run_migrations;
@@ -96,12 +98,22 @@ async fn le_curseur_tout_a_droite_s_arrete_au_confort_6541() {
 #[tokio::test]
 async fn les_boutons_montent_jusqu_a_la_securite_et_pas_plus_6541() {
     let (orch, zone_id) = zone_limitee(&[]).await;
-    orch.set_volume_au_pas(zone_id, 0.5, Some(APPAREIL))
-        .await
-        .unwrap();
-    orch.set_volume_au_pas(zone_id, 0.95, Some(APPAREIL))
-        .await
-        .unwrap();
+    orch.set_volume_au_pas_avec_garde(
+        zone_id,
+        0.5,
+        Some(APPAREIL),
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
+    orch.set_volume_au_pas_avec_garde(
+        zone_id,
+        0.95,
+        Some(APPAREIL),
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let recus = recus(&orch).await;
     assert!(proche(recus[0], 0.5), "{recus:?}");
     assert!(
@@ -116,9 +128,14 @@ async fn les_boutons_montent_jusqu_a_la_securite_et_pas_plus_6541() {
 #[tokio::test]
 async fn un_trim_positif_ne_franchit_pas_la_securite_6541() {
     let (orch, zone_id) = zone_limitee(&[("zone_{id}_gain_trim_db", "6")]).await;
-    orch.set_volume_au_pas(zone_id, 0.7, Some(APPAREIL))
-        .await
-        .unwrap();
+    orch.set_volume_au_pas_avec_garde(
+        zone_id,
+        0.7,
+        Some(APPAREIL),
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let recus = recus(&orch).await;
     assert!(
         proche(recus[0], 0.7),
@@ -174,7 +191,14 @@ async fn une_limite_ignoree_en_pure_reprend_a_la_sortie_sans_monter_6541() {
         r#"{"enabled":true,"lock_volume":false}"#,
     )])
     .await;
-    orch.set_volume(zone_id, 0.9, Some(APPAREIL)).await.unwrap();
+    orch.set_volume_avec_garde(
+        zone_id,
+        0.9,
+        Some(APPAREIL),
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         recus(&orch).await,
         vec![0.9],
@@ -202,9 +226,14 @@ async fn une_limite_ignoree_en_pure_reprend_a_la_sortie_sans_monter_6541() {
 #[tokio::test]
 async fn au_dessus_du_confort_le_curseur_redescend_6541() {
     let (orch, zone_id) = zone_limitee(&[]).await;
-    orch.set_volume_au_pas(zone_id, 0.5, Some(APPAREIL))
-        .await
-        .unwrap();
+    orch.set_volume_au_pas_avec_garde(
+        zone_id,
+        0.5,
+        Some(APPAREIL),
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     orch.set_volume(zone_id, 0.4, Some(APPAREIL)).await.unwrap();
     orch.set_volume(zone_id, 0.6, Some(APPAREIL)).await.unwrap();
     let recus = recus(&orch).await;
@@ -223,6 +252,13 @@ async fn temoin_sans_limite_le_curseur_part_a_100() {
     let settings = SettingsRepo::with_backend(orch.db.clone());
     settings.delete(&cle_securite(zone_id)).unwrap();
     settings.delete(&cle_confort(zone_id)).unwrap();
-    orch.set_volume(zone_id, 1.0, Some(APPAREIL)).await.unwrap();
+    orch.set_volume_avec_garde(
+        zone_id,
+        1.0,
+        Some(APPAREIL),
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     assert_eq!(recus(&orch).await, vec![1.0]);
 }

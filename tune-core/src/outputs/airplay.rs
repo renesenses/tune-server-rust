@@ -177,6 +177,77 @@ struct RtspSession {
     /// au SETUP : la destination des paquets sync. 0 s'il n'en annonce pas.
     control_port: u16,
     auxiliary_udp: Option<timing::AuxiliaryUdp>,
+    /// #6885 — ce que l'émetteur dit de lui-même dans l'URI et le SDP.
+    identite: IdentiteSessionRaop,
+}
+
+/// #6885 — l'identité qu'un émetteur AirPlay 1 donne de lui-même au
+/// récepteur : l'adresse LOCALE de la connexion RTSP (celle que voit le
+/// récepteur), l'adresse du récepteur, et un identifiant de session tiré une
+/// fois par connexion. Tune annonçait `rtsp://127.0.0.1/1` et
+/// `o=iTunes 1 O IN IP4 127.0.0.1` / `c=IN IP4 127.0.0.1` (avec une lettre
+/// « O » à la place de la version « 0 »), quelle que soit la connexion.
+///
+/// Forme retenue, celle d'OwnTone (`src/outputs/raop.c`) et de l'exemple
+/// iTunes de la spécification AirTunes v2 non officielle :
+/// `rtsp://<ip_locale>/<id>` (`[ip]` en IPv6), `o=iTunes <id> 0 IN IP4|IP6
+/// <ip_locale>`, `c=IN IP4|IP6 <ip_récepteur>`. libraop met aussi
+/// l'adresse locale (getsockname) dans `o=` et le récepteur dans `c=`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IdentiteSessionRaop {
+    id: u32,
+    locale: std::net::IpAddr,
+    recepteur: std::net::IpAddr,
+}
+
+impl IdentiteSessionRaop {
+    fn new(id: u32, locale: std::net::IpAddr, recepteur: std::net::IpAddr) -> Self {
+        // Une socket IPv6 double pile rend `::ffff:a.b.c.d` pour une
+        // connexion IPv4 : c'est une adresse IPv4, l'annoncer comme telle.
+        Self {
+            id,
+            locale: locale.to_canonical(),
+            recepteur: recepteur.to_canonical(),
+        }
+    }
+
+    /// Identifiant numérique tiré au hasard, comme iTunes, libraop et OwnTone.
+    fn tirer_id() -> u32 {
+        let mut octets = [0_u8; 4];
+        getrandom::getrandom(&mut octets).expect("OS RNG unavailable");
+        u32::from_be_bytes(octets)
+    }
+
+    fn uri(&self) -> String {
+        match self.locale {
+            std::net::IpAddr::V4(ip) => format!("rtsp://{ip}/{}", self.id),
+            // L'affichage d'une `Ipv6Addr` ne porte pas d'identifiant de
+            // zone (`%eth0`) : il n'a rien à faire dans l'URI.
+            std::net::IpAddr::V6(ip) => format!("rtsp://[{ip}]/{}", self.id),
+        }
+    }
+
+    fn sdp_announce(&self) -> String {
+        format!(
+            "v=0\r\n\
+             o=iTunes {id} 0 IN {famille_locale} {locale}\r\n\
+             s=iTunes\r\n\
+             c=IN {famille_recepteur} {recepteur}\r\n\
+             t=0 0\r\n\
+             m=audio 0 RTP/AVP 96\r\n\
+             a=rtpmap:96 L16/{SAMPLE_RATE}/{CHANNELS}\r\n\
+             a=fmtp:96 {FRAMES_PER_PACKET} 0 {BYTES_PER_SAMPLE} 40 10 14 {CHANNELS} 255 0 0 {SAMPLE_RATE}\r\n",
+            id = self.id,
+            famille_locale = famille_sdp(&self.locale),
+            locale = self.locale,
+            famille_recepteur = famille_sdp(&self.recepteur),
+            recepteur = self.recepteur,
+        )
+    }
+}
+
+fn famille_sdp(ip: &std::net::IpAddr) -> &'static str {
+    if ip.is_ipv4() { "IP4" } else { "IP6" }
 }
 
 impl AirplayOutput {
@@ -243,6 +314,14 @@ impl RtspSession {
         let stream = tokio::net::TcpStream::connect((host, port))
             .await
             .map_err(|e| format!("airplay connect {host}:{port}: {e}"))?;
+        let locale = stream
+            .local_addr()
+            .map_err(|e| format!("airplay local address: {e}"))?;
+        let recepteur = stream
+            .peer_addr()
+            .map_err(|e| format!("airplay peer address: {e}"))?;
+        let identite =
+            IdentiteSessionRaop::new(IdentiteSessionRaop::tirer_id(), locale.ip(), recepteur.ip());
         Ok(Self {
             stream,
             cseq: 0,
@@ -251,6 +330,7 @@ impl RtspSession {
             timing_port: 0,
             control_port: 0,
             auxiliary_udp: None,
+            identite,
         })
     }
 
@@ -339,28 +419,20 @@ impl RtspSession {
     }
 
     async fn announce(&mut self) -> Result<(), String> {
-        let sdp = format!(
-            "v=0\r\n\
-             o=iTunes 1 O IN IP4 127.0.0.1\r\n\
-             s=iTunes\r\n\
-             c=IN IP4 127.0.0.1\r\n\
-             t=0 0\r\n\
-             m=audio 0 RTP/AVP 96\r\n\
-             a=rtpmap:96 L16/{SAMPLE_RATE}/{CHANNELS}\r\n\
-             a=fmtp:96 {FRAMES_PER_PACKET} 0 {BYTES_PER_SAMPLE} 40 10 14 {CHANNELS} 255 0 0 {SAMPLE_RATE}\r\n"
-        );
+        let sdp = self.identite.sdp_announce();
+        let uri = self.identite.uri();
 
         let (code, _, _) = self
             .send_request(
                 "ANNOUNCE",
-                "rtsp://127.0.0.1/1",
+                &uri,
                 &[("Content-Type", "application/sdp")],
                 Some(&sdp),
             )
             .await?;
 
         if code != 200 {
-            return Err(format!("ANNOUNCE failed: {code}"));
+            return Err(announce_failure_message(code));
         }
         Ok(())
     }
@@ -371,13 +443,9 @@ impl RtspSession {
             control_port, timing_port
         );
 
+        let uri = self.identite.uri();
         let (code, headers, _) = self
-            .send_request(
-                "SETUP",
-                "rtsp://127.0.0.1/1",
-                &[("Transport", &transport)],
-                None,
-            )
+            .send_request("SETUP", &uri, &[("Transport", &transport)], None)
             .await?;
 
         if code != 200 {
@@ -413,9 +481,8 @@ impl RtspSession {
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
         }
-        let (code, _, _) = self
-            .send_request("RECORD", "rtsp://127.0.0.1/1", &headers, None)
-            .await?;
+        let uri = self.identite.uri();
+        let (code, _, _) = self.send_request("RECORD", &uri, &headers, None).await?;
 
         if code != 200 {
             return Err(format!("RECORD failed: {code}"));
@@ -430,8 +497,9 @@ impl RtspSession {
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
         }
+        let uri = self.identite.uri();
         let (code, _, _) = self
-            .send_request("SET_PARAMETER", "rtsp://127.0.0.1/1", &headers, Some(&body))
+            .send_request("SET_PARAMETER", &uri, &headers, Some(&body))
             .await?;
 
         if code != 200 {
@@ -449,8 +517,9 @@ impl RtspSession {
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
         }
+        let uri = self.identite.uri();
         let (code, _, _) = self
-            .send_request("TEARDOWN", "rtsp://127.0.0.1/1", &headers, None)
+            .send_request("TEARDOWN", &uri, &headers, None)
             .await
             .map_err(|error| format!("AirPlay TEARDOWN request failed: {error}"))?;
         if !(200..300).contains(&code) {
@@ -466,9 +535,8 @@ impl RtspSession {
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
         }
-        let (code, _, _) = self
-            .send_request("FLUSH", "rtsp://127.0.0.1/1", &headers, None)
-            .await?;
+        let uri = self.identite.uri();
+        let (code, _, _) = self.send_request("FLUSH", &uri, &headers, None).await?;
         if code != 200 {
             return Err(format!("FLUSH failed: {code}"));
         }
@@ -478,6 +546,20 @@ impl RtspSession {
 
 fn entete_rtp_info(sequence: u16, timestamp: u32) -> String {
     format!("seq={sequence};rtptime={timestamp}")
+}
+
+/// Code stable d'un refus de connexion par le récepteur AirPlay (403 Forbidden).
+pub const CODE_AIRPLAY_RECEIVER_FORBIDDEN: &str = "airplay_receiver_forbidden";
+
+fn announce_failure_message(code: u32) -> String {
+    if code == 403 {
+        return format!(
+            "{CODE_AIRPLAY_RECEIVER_FORBIDDEN}: AirPlay connection refused by the receiver (403 Forbidden): \
+             on macOS, verify that 'Allow AirPlay for' is set to 'Everyone on the same network' \
+             (System Settings → General → AirDrop & Handoff)"
+        );
+    }
+    format!("AirPlay ANNOUNCE failed: {code}")
 }
 
 fn setup_failure_message(code: u32) -> String {
@@ -1223,6 +1305,23 @@ mod tests {
         assert_eq!(setup_failure_message(453), "AirPlay SETUP failed: 453");
     }
 
+    #[test]
+    fn announce_403_explains_macos_receiver_permission() {
+        let message = announce_failure_message(403);
+        assert!(message.contains(CODE_AIRPLAY_RECEIVER_FORBIDDEN));
+        assert!(message.contains("403 Forbidden"));
+        assert!(message.contains("Everyone on the same network"));
+        assert!(message.contains("AirDrop & Handoff"));
+    }
+
+    #[test]
+    fn announce_other_status_keeps_the_rtsp_code() {
+        assert_eq!(
+            announce_failure_message(453),
+            "AirPlay ANNOUNCE failed: 453"
+        );
+    }
+
     #[tokio::test]
     async fn teardown_refusal_is_returned_instead_of_discarded() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1256,7 +1355,10 @@ mod tests {
             .unwrap();
 
         assert!(error.contains("TEARDOWN refused by device: 403"));
-        assert!(request.starts_with("TEARDOWN rtsp://127.0.0.1/1 RTSP/1.0"));
+        assert!(request.starts_with(&format!(
+            "TEARDOWN rtsp://127.0.0.1/{} RTSP/1.0",
+            session.identite.id
+        )));
         assert!(request.contains("Session: stale-session\r\n"));
     }
 
@@ -1385,17 +1487,37 @@ mod tests {
 
     /// La contre-epreuve du rattrapage : un ANNOUNCE refuse n'a rien ouvert.
     /// Envoyer un TEARDOWN pour une session inexistante serait du bruit sur le
-    /// canal de controle d'un appareil qui vient deja de nous dire non.
+    /// canal de controle d'un appareil qui vient deja de nous dire non (#2217).
+    /// Sur 403 (récepteur macOS restreint à l'utilisateur actuel), l'erreur
+    /// guide l'utilisateur vers le bon réglage réseau (#6788).
     #[tokio::test]
     async fn un_announce_refuse_n_envoie_aucun_teardown() {
         let (erreur, methodes) = dialogue_airplay(vec![("ANNOUNCE", "403 Forbidden")]).await;
 
-        assert!(erreur.contains("ANNOUNCE failed: 403"), "obtenu : {erreur}");
+        assert!(
+            erreur.contains(CODE_AIRPLAY_RECEIVER_FORBIDDEN)
+                && erreur.contains("403 Forbidden")
+                && erreur.contains("Everyone on the same network"),
+            "le 403 sur ANNOUNCE doit être nommé et guider l'utilisateur (#6788), obtenu : {erreur}"
+        );
         assert_eq!(
             methodes,
             vec!["ANNOUNCE"],
             "rien n'a ete ouvert : il n'y a rien a rendre"
         );
+    }
+
+    /// #6788 — un récepteur AirPlay (macOS Monterey+) refusant l'ANNOUNCE par
+    /// 403 Forbidden doit remonter un diagnostic actionnable nommant le réglage
+    /// 'Allow AirPlay for: Everyone on the same network'.
+    #[tokio::test]
+    async fn announce_403_sur_recepteur_simule_guide_l_utilisateur() {
+        let (erreur, methodes) = dialogue_airplay(vec![("ANNOUNCE", "403 Forbidden")]).await;
+        assert!(erreur.contains(CODE_AIRPLAY_RECEIVER_FORBIDDEN));
+        assert!(erreur.contains("403 Forbidden"));
+        assert!(erreur.contains("Everyone on the same network"));
+        assert!(erreur.contains("AirDrop & Handoff"));
+        assert_eq!(methodes, vec!["ANNOUNCE"]);
     }
 
     #[test]
@@ -1791,3 +1913,7 @@ mod controle_tests_6751;
 #[cfg(test)]
 #[path = "airplay_flux_progressif_tests_6673.rs"]
 mod flux_progressif_tests_6673;
+
+#[cfg(test)]
+#[path = "airplay_identite_tests_6885.rs"]
+mod identite_tests_6885;
