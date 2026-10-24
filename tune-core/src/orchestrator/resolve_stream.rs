@@ -28,6 +28,78 @@ struct DashWarm {
     force_flac: bool,
 }
 
+/// #6909 — les réglages DLNA de la zone que le pré-transcodage DASH doit
+/// honorer, comme le chemin des fichiers locaux le fait déjà
+/// (`resolve_local.rs`, `ForcagesReseau`). Ils n'étaient pas consultés ici :
+/// « Servir en WAV/LPCM » et « Plafonner à 16 bits » restaient sans effet sur
+/// une piste TIDAL/Qobuz Hi-Res, qui partait toujours en FLAC 24 bits vers un
+/// renderer annonçant `audio/flac` (Marantz NR1602, fil 2410).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ReglagesDash {
+    /// Zone réglée sur « Servir en WAV/LPCM » (`dlna_lpcm`).
+    pub forcer_wav: bool,
+    /// Plafond 16 bits : drapeau de zone `dlna_cap_16bit` OU quirk catalogue
+    /// `force_16bit`, par la même règle que le chemin local
+    /// ([`dlna_cap_16bit_applies`]).
+    pub plafond_16: bool,
+}
+
+/// Lit en base les réglages de la zone qui gouvernent le pré-transcodage DASH.
+/// Hors sortie réseau, aucun ne s'applique.
+pub(crate) fn reglages_dash(
+    db: &Arc<dyn crate::db::backend::DbBackend>,
+    zone_id: i64,
+    profondeur_source: u16,
+) -> ReglagesDash {
+    let depot = ZoneRepo::with_backend(db.clone());
+    let type_de_sortie = depot
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_type);
+    let reseau = is_network_output_type(type_de_sortie.as_deref());
+    ReglagesDash {
+        forcer_wav: reseau && depot.get_dlna_lpcm(zone_id),
+        plafond_16: dlna_cap_16bit_applies(
+            reseau,
+            profondeur_source.clamp(16, 24),
+            depot.get_dlna_cap_16bit(zone_id),
+            crate::device_catalog::resolve_zone_quirks(db, zone_id).force_16bit,
+        ),
+    }
+}
+
+/// Le format du pré-transcodage DASH, quand la décision ne dépend pas de la
+/// sonde `audio/flac` du renderer : navigateur ou zone forcée en WAV → WAV ;
+/// pas d'appareil ou zone forcée en FLAC natif → FLAC. `None` : demander au
+/// renderer. Le forçage WAV l'emporte sur le FLAC natif, comme sur le chemin
+/// local (le WAV/LPCM prime sur les passthroughs).
+pub(crate) fn format_dash_impose(
+    navigateur: bool,
+    reglages: ReglagesDash,
+    sans_appareil: bool,
+    forcer_flac: bool,
+) -> Option<&'static str> {
+    if navigateur || reglages.forcer_wav {
+        Some("wav")
+    } else if sans_appareil || forcer_flac {
+        Some("flac")
+    } else {
+        None
+    }
+}
+
+/// La profondeur servie par le pré-transcodage DASH : 16 bits en WAV (profil
+/// `DLNA.ORG_PN=LPCM`, #1137) et sous plafond 16 bits, sinon celle de la
+/// source.
+pub(crate) fn profondeur_dash(format: &str, profondeur_source: u16, reglages: ReglagesDash) -> u16 {
+    if format == "wav" || reglages.plafond_16 {
+        16
+    } else {
+        profondeur_source.clamp(16, 24)
+    }
+}
+
 /// Ce que le premier temps de `resoudre_flux_dash` a posé pour les suivants :
 /// DSP de zone, sortie navigateur, cache chaud, fichier réservé, format
 /// source, fichier temporaire de destination, appareil visé.
@@ -41,6 +113,8 @@ struct DashPret<'a> {
     bd: u16,
     tmp_path: String,
     dash_did: &'a str,
+    /// #6909 — réglages DLNA de la zone (WAV forcé, plafond 16 bits).
+    reglages: ReglagesDash,
     /// #5524 — la cadence servie est celle du plafond de zone, pas celle du
     /// service : le remux (sans décodage) ne peut pas la servir.
     plafonnee: bool,
@@ -1347,6 +1421,7 @@ impl PlaybackOrchestrator {
             .and_then(|z| z.output_type)
             .as_deref()
             == Some("browser");
+        let reglages = reglages_dash(&self.db, req.zone_id, stream_data.quality.bit_depth);
 
         // Warm-cache (opt-in, TUNE_DASH_WARM_CACHE): a prior play/warm of this
         // exact track+quality+format may have left a finished transcode on
@@ -1358,18 +1433,15 @@ impl PlaybackOrchestrator {
         // the encoded bytes can never disagree.
         let warm: Option<DashWarm> = if dash_warm_cache_enabled() {
             let wsr = sr_servie;
-            let wbd = stream_data.quality.bit_depth.clamp(16, 24);
             let wdid = req.output_device_id.as_deref().unwrap_or("");
             let wflac = ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
-            let wfmt = if is_browser_output {
-                "wav"
-            } else if wdid.is_empty() || wflac || self.dlna_supports_mime(wdid, "audio/flac").await
+            let wfmt = match format_dash_impose(is_browser_output, reglages, wdid.is_empty(), wflac)
             {
-                "flac"
-            } else {
-                "wav"
+                Some(f) => f,
+                None if self.dlna_supports_mime(wdid, "audio/flac").await => "flac",
+                None => "wav",
             };
-            let wkbd = if wfmt == "wav" { 16 } else { wbd };
+            let wkbd = profondeur_dash(wfmt, stream_data.quality.bit_depth, reglages);
             // Le traitement de zone n'entre PAS dans la clé de cache : un
             // flux traité ne peut donc jamais partager la clé d'un flux
             // brut. La garde ne couvrait que l'égaliseur ; le convolveur et
@@ -1539,6 +1611,7 @@ impl PlaybackOrchestrator {
             bd,
             tmp_path,
             dash_did,
+            reglages,
             plafonnee: cadence_plafonnee.is_some(),
         }))
     }
@@ -1551,6 +1624,7 @@ impl PlaybackOrchestrator {
             is_browser_output,
             ref warm,
             dash_did,
+            reglages,
             ..
         } = *p;
         let (dash_enc_format, dash_force_flac) = match warm.as_ref() {
@@ -1558,17 +1632,19 @@ impl PlaybackOrchestrator {
             None => {
                 let force =
                     ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
-                let fmt = if is_browser_output {
-                    // Browser pulls with byte-Range requests; a seektable-less
-                    // FLAC stalls it (see is_browser_output note above). WAV.
-                    "wav"
-                } else if dash_did.is_empty()
-                    || force
-                    || self.dlna_supports_mime(dash_did, "audio/flac").await
-                {
-                    "flac"
-                } else {
-                    "wav"
+                // Browser pulls with byte-Range requests; a seektable-less
+                // FLAC stalls it (see is_browser_output note above). WAV.
+                // #6909 — une zone réglée « WAV/LPCM » reçoit du WAV, même si
+                // le renderer annonce `audio/flac`.
+                let fmt = match format_dash_impose(
+                    is_browser_output,
+                    reglages,
+                    dash_did.is_empty(),
+                    force,
+                ) {
+                    Some(f) => f,
+                    None if self.dlna_supports_mime(dash_did, "audio/flac").await => "flac",
+                    None => "wav",
                 };
                 (fmt, force)
             }
@@ -1580,6 +1656,8 @@ impl PlaybackOrchestrator {
             zone_id = req.zone_id,
             device_id = %dash_did,
             native_flac_override = dash_force_flac,
+            lpcm_override = reglages.forcer_wav,
+            cap_16bit = reglages.plafond_16,
             chosen_format = dash_enc_format,
             "streaming_dash_dlna_format_decision"
         );
@@ -1605,6 +1683,7 @@ impl PlaybackOrchestrator {
             sr,
             bd,
             plafonnee,
+            reglages,
             ..
         } = *p;
         // Streaming remux (#1146, opt-in TUNE_DASH_STREAM_REMUX): chunked-stream
@@ -1614,9 +1693,12 @@ impl PlaybackOrchestrator {
         // needs decoded PCM → keep the file path). Reads the GROWING fMP4 via
         // the dash_growth registry when TUNE_DASH_STREAM_DECODE armed the
         // background download, so playback begins on the first fragments.
+        // #6909 — le remux recopie les trames FLAC telles quelles : il ne
+        // peut pas servir le plafond 16 bits de la zone.
         if dash_enc_format == "flac"
             && !dash_dsp_active
             && !plafonnee
+            && !reglages.plafond_16
             && std::env::var("TUNE_DASH_STREAM_REMUX")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false)
@@ -1726,6 +1808,7 @@ impl PlaybackOrchestrator {
             unique_path,
             sr,
             tmp_path,
+            reglages,
             ..
         } = p;
         // #5114 — lu avant que le porteur parte dans la tâche de décodage :
@@ -1742,6 +1825,8 @@ impl PlaybackOrchestrator {
             // plays SILENCE on renderers like the Ruark R3 / LHC-62 (Yves,
             // #1137). Cap the LPCM fallback at 16-bit; FLAC keeps full hi-res.
             let dash_is_wav = dash_enc_format == "wav";
+            // #6909 — le plafond 16 bits de la zone vaut aussi pour le FLAC.
+            let dash_plafond_16 = reglages.plafond_16;
             // VU-mètres : le PCM décodé de ce pré-transcode part aussi vers le
             // forwarder de niveaux (cadencé par lui — voir #1105). Sans ça,
             // une piste DASH (Tidal HI-RES) sur DLNA/browser laissait les
@@ -1770,6 +1855,7 @@ impl PlaybackOrchestrator {
                 // WAV renderers and EQ zones fall through to the decode path.
                 let remux = !dash_is_wav
                     && !dash_dsp_active
+                    && !dash_plafond_16
                     && std::env::var("TUNE_DASH_REMUX")
                         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                         .unwrap_or(false);
@@ -1791,7 +1877,7 @@ impl PlaybackOrchestrator {
                 let mut pcm_bytes = decoded.pcm_bytes();
                 let mut actual_bd = decoded.bit_depth;
 
-                if dash_is_wav && actual_bd > 16 {
+                if (dash_is_wav || dash_plafond_16) && actual_bd > 16 {
                     pcm_bytes = crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
                     actual_bd = 16;
                 }
