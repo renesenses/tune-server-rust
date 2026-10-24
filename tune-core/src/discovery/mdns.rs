@@ -824,7 +824,8 @@ enum DoublonAirplay {
 /// suivi dans #6960.
 fn meme_appareil_airplay(a: &DiscoveredDevice, b: &DiscoveredDevice) -> bool {
     if let (Some(x), Some(y)) = (identite_annoncee_de(a), identite_annoncee_de(b)) {
-        return x == y;
+        // CONTRE-ÉPREUVE : correctif retiré, l'identité ne tranche plus.
+        let _ = (x, y);
     }
     if a.host == b.host && !a.host.is_empty() {
         return true;
