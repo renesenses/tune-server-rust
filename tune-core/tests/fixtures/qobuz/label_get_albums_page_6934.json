@@ -1,0 +1,56 @@
+{
+ "_origine": "Reponse de GET /label/get?label_id=1150&extra=albums&limit=4&offset=0 RECONSTITUEE pour #6934 (aucun appel a l'API reelle, aucun jeton) : seulement les champs que Tune lit deja ailleurs (map_album, image_de_label du lot L, albums.total, released_at, streamable). Le dernier album est une precommande (2099), l'avant-dernier n'est pas ecoutable.",
+ "id": 1150,
+ "name": "ECM",
+ "image": {
+  "large": "https://static.qobuz.test/images/labels/1150_large.jpg",
+  "small": "https://static.qobuz.test/images/labels/1150_small.jpg"
+ },
+ "albums": {
+  "total": 9,
+  "offset": 0,
+  "limit": 4,
+  "items": [
+   {
+    "id": "0602537344315",
+    "title": "Rarum",
+    "artist": {"id": 20, "name": "Jan Garbarek"},
+    "image": {"large": "https://static.qobuz.test/images/covers/rarum_600.jpg"},
+    "tracks_count": 14,
+    "released_at": 1022882400,
+    "release_date_original": "2002-06-01",
+    "maximum_bit_depth": 16,
+    "maximum_sampling_rate": 44.1,
+    "streamable": true
+   },
+   {
+    "id": "0042284334028",
+    "title": "The Köln Concert",
+    "artist": {"id": 1, "name": "Keith Jarrett"},
+    "image": {"large": "https://static.qobuz.test/images/covers/koln_600.jpg"},
+    "tracks_count": 4,
+    "released_at": 186624000,
+    "release_date_original": "1975-11-30",
+    "maximum_bit_depth": 24,
+    "maximum_sampling_rate": 96,
+    "streamable": true
+   },
+   {
+    "id": "0000000000003",
+    "title": "Retire du catalogue",
+    "artist": {"id": 30, "name": "Arvo Part"},
+    "tracks_count": 6,
+    "released_at": 946684800,
+    "streamable": false
+   },
+   {
+    "id": "0000000000004",
+    "title": "A paraitre",
+    "artist": {"id": 20, "name": "Jan Garbarek"},
+    "tracks_count": 9,
+    "released_at": 4070908800,
+    "streamable": true
+   }
+  ]
+ }
+}
