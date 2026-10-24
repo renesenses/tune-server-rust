@@ -2275,6 +2275,21 @@ pub trait OutputTarget: Send + Sync {
         None
     }
 
+    /// #6790 — the output paused ON ITS OWN, without a command from the host.
+    ///
+    /// An OAAT endpoint that hands its DAC to another player of the device
+    /// sends `endpoint_release`: the output stops sending audio and reports
+    /// `Paused`, but nothing told the zone, which stayed `playing` with a
+    /// frozen position. The poller reads this on each tick of a playing zone
+    /// and pauses the zone as a user pause would (saved position, `paused`
+    /// state), without sending a second pause to the output.
+    ///
+    /// Returned **once**: the implementation clears it. Default `false`: no
+    /// other output pauses by itself.
+    fn take_paused_by_device(&self) -> bool {
+        false
+    }
+
     /// #4177 — la sortie a-t-elle RENDU son périphérique pendant la pause ?
     ///
     /// Une sortie locale Windows en mode exclusif (WASAPI exclusif, ASIO) tient

@@ -154,8 +154,14 @@ async fn le_fondu_s_arrete_quand_l_utilisateur_regle_le_volume() {
     let banc = Banc::monter().await;
     let fondu = banc.lancer_le_fondu().await;
     tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // #6721 — hausse confirmée : la garde n'est pas l'objet de ce test.
     banc.orchestrator
-        .set_volume(banc.zone_id, 0.61, Some(APPAREIL))
+        .set_volume_avec_garde(
+            banc.zone_id,
+            0.61,
+            Some(APPAREIL),
+            crate::audio::garde_de_hausse::Hausse::Confirmee,
+        )
         .await
         .unwrap();
     fondu.await.unwrap();

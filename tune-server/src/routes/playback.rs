@@ -1492,6 +1492,11 @@ struct VolumeRequest {
     /// pas de viser −18 dB, et l'écart entre deux crans varie de 0,09 dB en
     /// haut d'échelle à 6 dB en bas.
     volume_db: Option<f64>,
+    /// #6721 — l'utilisateur CONFIRME une hausse de plus de 10 dB perçus en
+    /// une fois (`audio::garde_de_hausse`). Absent ou `false` : une telle
+    /// hausse est plafonnée au seuil. Jamais persisté.
+    #[serde(default)]
+    confirm_increase: bool,
 }
 
 #[derive(Deserialize)]
@@ -4380,20 +4385,37 @@ async fn set_volume(
     // pour baisser en ordre de plein volume (fil 2366, tweeter détruit).
     match state
         .orchestrator
-        .set_volume(zone_id, demande, device_id.as_deref())
+        .set_volume_avec_garde(
+            zone_id,
+            demande,
+            device_id.as_deref(),
+            tune_core::audio::garde_de_hausse::Hausse::depuis_confirmation(body.confirm_increase),
+        )
         .await
     {
         // #1274 — la réponse rend la valeur EFFECTIVE dans les deux unités.
         // Un client qui règle en dB doit pouvoir constater ce qu'il a obtenu
         // sans refaire le calcul, et surtout constater quand le verrou PURE
         // l'a remonté à 100 % : `volume_db` vaudra alors 0.
-        Ok(()) => Json(json!({
-            "volume": volume,
-            "volume_db": tune_core::audio::volume_scale::linear_to_db(volume),
-            // #6787 — la loi du curseur (`volume` reste le gain).
-            "volume_curve": tune_core::audio::volume_scale::echelle_de_la_zone(&state.backend, zone_id).code(),
-        }))
-        .into_response(),
+        Ok(retenu) => {
+            // #6721 — plafonnée par la garde : `volume` et `volume_db` disent
+            // le gain RETENU, et la réponse dit comment confirmer.
+            let volume = if retenu.hausse_plafonnee {
+                retenu.retenu
+            } else {
+                volume
+            };
+            let mut corps = json!({
+                "volume": volume,
+                "volume_db": tune_core::audio::volume_scale::linear_to_db(volume),
+                // #6787 — la loi du curseur (`volume` reste le gain).
+                "volume_curve": tune_core::audio::volume_scale::echelle_de_la_zone(&state.backend, zone_id).code(),
+            });
+            if let Some(obj) = corps.as_object_mut() {
+                retenu.inserer(obj);
+            }
+            Json(corps).into_response()
+        }
         Err(error) => output_command_error_response(error),
     }
 }

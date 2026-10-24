@@ -16,7 +16,7 @@ use tune_core::db::settings_repo::SettingsRepo;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new()
+    let r = Router::new()
         .route("/sso/authorize", get(sso_authorize))
         .route("/sso/callback", get(sso_callback))
         .route("/sso/status", get(sso_status))
@@ -42,7 +42,12 @@ pub fn router() -> Router<AppState> {
         .route("/library-sync/status", get(library_sync_status))
         .route("/library-sync/trigger", post(library_sync_trigger))
         .route("/library-sync/full-sync", post(library_sync_full))
-        .route("/library-sync/reconcile", post(library_sync_reconcile))
+        .route("/library-sync/reconcile", post(library_sync_reconcile));
+    // #6785 : la route n'existe que dans les builds qui compilent l'écoute
+    // directe (fonction `ecoute-directe`, hors défaut).
+    #[cfg(feature = "ecoute-directe")]
+    let r = r.route("/direct/status", get(direct_status));
+    r
 }
 
 // ---------------------------------------------------------------------------
@@ -966,6 +971,22 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 // ---------------------------------------------------------------------------
 // Bridge (cloud relay)
 // ---------------------------------------------------------------------------
+
+/// #6785 — l'écoute directe : allumée ou non, et, si elle est en service,
+/// de quoi la composer (identité d'endpoint = clé du serveur = `srv_pk`,
+/// adresses directes, relais iroh auto-hébergé). L'app la lit par le relais,
+/// puis tente le direct ; le relais reste son secours.
+#[cfg(feature = "ecoute-directe")]
+async fn direct_status(State(state): State<AppState>) -> Json<Value> {
+    if let Some(en_service) = tune_core::cloud::ecoute_directe::en_service() {
+        return Json(json!({"active": true, "annonce": en_service.annonce()}));
+    }
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    Json(json!({
+        "active": false,
+        "allumee": tune_core::cloud::ecoute_directe::active(&reglages),
+    }))
+}
 
 async fn bridge_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());

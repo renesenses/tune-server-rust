@@ -217,6 +217,12 @@ pub struct OaatOutput {
     /// poller le lit a chaque tick et emet `zone.playback_error` avec
     /// `fatal: true`, ce qui traverse jusqu'au client.
     refus_negociation: Arc<std::sync::Mutex<Option<String>>>,
+    /// #6790 — l'endpoint a rendu sa sortie (`endpoint_release`) et la sortie
+    /// s'est mise en pause d'elle-même : la ZONE doit suivre. Remis une fois
+    /// au poller par `take_paused_by_device()`, qui met la zone en pause comme
+    /// un geste de l'utilisateur. Sans lui, la zone restait `playing`, position
+    /// figée, et le superviseur des blocages la relançait à la reprise.
+    pause_par_l_appareil: Arc<AtomicBool>,
     pub diag: Arc<OaatDiagnostics>,
 }
 
@@ -367,6 +373,7 @@ impl OaatOutput {
             direct_pcm_active: Arc::new(AtomicBool::new(false)),
             chain_exhausted: Arc::new(AtomicBool::new(false)),
             refus_negociation: Arc::new(std::sync::Mutex::new(None)),
+            pause_par_l_appareil: Arc::new(AtomicBool::new(false)),
             // `volume_set` du protocole est en 0–100 (RFC), comme le
             // multiroom et l'endpoint : on stocke la meme echelle. L'ancien
             // 800, divise par 255 a la lecture, rapportait un volume de 314 %.
@@ -715,7 +722,12 @@ impl OutputTarget for OaatOutput {
         // `endpoint_release` (RFC OAAT §7.3.1) : met la zone en pause par ce
         // canal, et `liberation` dit à la reprise qu'il faut renégocier.
         let commandes_liberation = command_tx.clone();
-        let liberation = Arc::new(AtomicBool::new(false));
+        self.pause_par_l_appareil.store(false, Ordering::SeqCst);
+        let liberation = Arc::new(Liberation {
+            renegocier: AtomicBool::new(false),
+            pause_a_signaler: self.pause_par_l_appareil.clone(),
+            diag: self.diag.clone(),
+        });
         *self.command_tx.lock().await = Some(command_tx);
 
         playing.store(true, Ordering::SeqCst);
@@ -3280,6 +3292,15 @@ impl OutputTarget for OaatOutput {
     }
 
     async fn resume(&self) -> Result<(), String> {
+        // #6790 — l'horloge du dernier paquet date d'avant la pause : la
+        // remettre à maintenant AVANT que `paused` ne retombe, sinon le
+        // superviseur des blocages voit une zone « bloquée » pendant que la
+        // reprise renégocie, et la relance depuis 0:00.
+        #[cfg(feature = "oaat")]
+        remettre_l_horloge_des_paquets(&self.diag);
+        // Une pause de l'appareil pas encore remise au poller ne doit pas
+        // remettre en pause la zone qui reprend.
+        self.pause_par_l_appareil.store(false, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
         #[cfg(feature = "oaat")]
         if let Some(tx) = self.command_tx.lock().await.as_ref() {
@@ -3309,6 +3330,7 @@ impl OutputTarget for OaatOutput {
         }
         self.playing.store(false, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
+        self.pause_par_l_appareil.store(false, Ordering::SeqCst);
         // Leave native-DSD mode. play_media() calls stop() before starting the
         // next track, so this resets the flag between tracks; the native DSD
         // path re-sets it if the next track is also native DSD.
@@ -3438,6 +3460,11 @@ impl OutputTarget for OaatOutput {
             .lock()
             .ok()
             .and_then(|mut s| s.take())
+    }
+
+    /// #6790 — `endpoint_release` : la sortie s'est mise en pause d'elle-même.
+    fn take_paused_by_device(&self) -> bool {
+        self.pause_par_l_appareil.swap(false, Ordering::SeqCst)
     }
 
     async fn is_available(&self) -> bool {
@@ -4018,7 +4045,7 @@ fn partage_sa_sortie(endpoint: &oaat_controller::ConnectedEndpoint) -> bool {
 fn surveiller_liberation(
     endpoint: &mut oaat_controller::ConnectedEndpoint,
     device_name: &str,
-    liberation: &Arc<AtomicBool>,
+    liberation: &Arc<Liberation>,
     commandes: &tokio::sync::mpsc::Sender<OaatCommand>,
 ) {
     let (_, vide) = tokio::sync::mpsc::channel(1);
@@ -4034,12 +4061,46 @@ fn surveiller_liberation(
                 reason = ?release.reason,
                 "oaat: l'endpoint a rendu sa sortie, zone en pause"
             );
-            liberation.store(true, Ordering::SeqCst);
+            liberation.renegocier.store(true, Ordering::SeqCst);
             if commandes.send(OaatCommand::Pause).await.is_err() {
                 break;
             }
+            // #6790 — la sortie est en pause ; la zone la suit au prochain
+            // tour du poller (`take_paused_by_device`).
+            liberation.pause_a_signaler.store(true, Ordering::SeqCst);
         }
     });
+}
+
+/// L'état d'une lecture vis-à-vis d'`endpoint_release` (RFC OAAT §7.3.1),
+/// partagé entre la tâche qui écoute les libérations et la boucle de lecture.
+#[cfg(feature = "oaat")]
+struct Liberation {
+    /// L'endpoint a fermé son DAC : la reprise doit renégocier.
+    renegocier: AtomicBool,
+    /// #6790 — la pause est à remettre au poller, pour que la zone la suive.
+    /// Partagé avec `OaatOutput::pause_par_l_appareil`.
+    pause_a_signaler: Arc<AtomicBool>,
+    /// L'horloge du dernier paquet, que lit le superviseur des blocages.
+    diag: Arc<OaatDiagnostics>,
+}
+
+/// Fait repartir de maintenant l'horloge du dernier paquet que lit le
+/// superviseur des blocages (`tune-server/src/background.rs` :
+/// `playing && !paused && last_packet_age_ms > STALL_MS`).
+///
+/// #6790 — à la reprise, `paused` retombe AVANT que le premier paquet ne
+/// reparte, et la renégociation d'un endpoint libéré peut attendre son DAC
+/// jusqu'à `DELAI_ACCORD_ENDPOINT_PARTAGE`. L'horloge datait du moment de la
+/// libération, parfois des minutes plus tôt : le tour suivant du superviseur
+/// voyait un blocage, relançait la zone sans position, et la piste repartait
+/// de 0:00.
+fn remettre_l_horloge_des_paquets(diag: &OaatDiagnostics) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    diag.last_packet_epoch_ms.store(now_ms, Ordering::SeqCst);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4060,14 +4121,17 @@ enum Reprise {
 async fn reprendre_apres_liberation(
     endpoint: &mut oaat_controller::ConnectedEndpoint,
     device_name: &str,
-    liberation: &AtomicBool,
+    liberation: &Liberation,
     contrat: &ContratPropose,
     refus_negociation: &Arc<std::sync::Mutex<Option<String>>>,
     playing: &AtomicBool,
 ) -> Reprise {
-    if !liberation.swap(false, Ordering::SeqCst) {
+    if !liberation.renegocier.swap(false, Ordering::SeqCst) {
         return Reprise::PasLiberee;
     }
+    // #6790 — la renégociation peut attendre le DAC : pas de blocage compté
+    // pendant ce temps (voir `remettre_l_horloge_des_paquets`).
+    remettre_l_horloge_des_paquets(&liberation.diag);
     info!(device = %device_name, stream_id = %contrat.stream_id, "oaat: reprise après libération, renégociation");
     let resultat = match endpoint
         .send_message(&oaat_core::Message::FormatPropose(
@@ -4099,7 +4163,11 @@ async fn reprendre_apres_liberation(
         }),
     };
     match resultat {
-        Ok(()) => Reprise::Renegociee,
+        Ok(()) => {
+            // Le budget du superviseur repart du `play` qui va suivre.
+            remettre_l_horloge_des_paquets(&liberation.diag);
+            Reprise::Renegociee
+        }
         Err(refus) => {
             error!(device = %device_name, raison = %refus.raison, "oaat: reprise après libération refusée");
             signaler_refus_negociation(refus_negociation, &refus);

@@ -223,6 +223,7 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
                 backend: state.backend.clone(),
                 dossier_secret: dossier_de_la_base(),
                 criteres: criteres_du_moteur(),
+                diagnostic: Some(collecte_diagnostic(state.clone())),
             },
         )))
         .await;
@@ -251,6 +252,95 @@ pub(crate) fn passerelle_assistant(
     backend: &Arc<dyn tune_core::db::backend::DbBackend>,
 ) -> tune_assistant_ia::Passerelle {
     tune_assistant_ia::Passerelle::new(backend.clone(), &dossier_de_la_base())
+}
+
+/// Le diagnostic de l'assistant (23/10/2026) : ce que l'hôte rassemble sur
+/// une zone, en LECTURE SEULE. Le greffon filtre, anonymise et pseudonymise
+/// avant tout envoi, et montre le texte exact avant chaque envoi.
+#[cfg(feature = "assistant-ia")]
+fn collecte_diagnostic(state: AppState) -> tune_assistant_ia::diagnostic::Collecte {
+    Arc::new(move |zone_id| {
+        let state = state.clone();
+        Box::pin(async move { Ok(contexte_diagnostic(&state, zone_id).await) })
+    })
+}
+
+#[cfg(feature = "assistant-ia")]
+async fn contexte_diagnostic(
+    state: &AppState,
+    zone_id: Option<i64>,
+) -> tune_assistant_ia::diagnostic::ContexteBrut {
+    use axum::response::IntoResponse;
+    use std::collections::BTreeMap;
+    use tune_core::db::backend::SqlValue;
+
+    let mut noms: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut ajouter = |cat: &str, v: Option<String>| {
+        if let Some(v) = v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            noms.entry(cat.to_string()).or_default().push(v);
+        }
+    };
+    for z in tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .list()
+        .unwrap_or_default()
+    {
+        ajouter("zone", Some(z.name));
+    }
+    for d in state.scanner.devices().await {
+        ajouter("appareil", Some(d.name));
+        ajouter("hote", Some(d.host));
+    }
+    ajouter("hote", Some(tune_core::discovery::system_hostname()));
+    // Les titres récents : ils peuvent apparaître dans le journal.
+    let texte = |v: Option<&SqlValue>| v.and_then(|x| x.as_string());
+    for l in state
+        .backend
+        .query_many(
+            "SELECT title, artist_name, album_title FROM listen_history ORDER BY id DESC LIMIT 100",
+            &[],
+        )
+        .unwrap_or_default()
+    {
+        ajouter("piste", texte(l.first()));
+        ajouter("artiste", texte(l.get(1)));
+        ajouter("album", texte(l.get(2)));
+    }
+    let zone = match zone_id {
+        Some(id) => {
+            let rep = crate::routes::zones::get_zone(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(id),
+            )
+            .await
+            .into_response();
+            if rep.status().is_success() {
+                axum::body::to_bytes(rep.into_body(), 4 << 20)
+                    .await
+                    .ok()
+                    .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o).ok())
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    if let Some(np) = zone.as_ref().and_then(|z| z.get("current_track")) {
+        let champ = |k: &str| np.get(k).and_then(|v| v.as_str()).map(String::from);
+        ajouter("piste", champ("title"));
+        ajouter("artiste", champ("artist").or_else(|| champ("artist_name")));
+        ajouter("album", champ("album").or_else(|| champ("album_title")));
+    }
+    let journal = crate::routes::system::diagnostics::journal_pour_assistant(1000).await;
+    tune_assistant_ia::diagnostic::ContexteBrut {
+        zone,
+        journal,
+        systeme: serde_json::json!({
+            "version": tune_core::version(),
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        }),
+        noms,
+    }
 }
 
 #[cfg(feature = "assistant-ia")]

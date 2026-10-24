@@ -748,7 +748,7 @@ impl PositionPoller {
                 // verrou est une commande de l'orchestrateur en cours sur CETTE
                 // zone (play, pause, seek, stop). Le tick suivant, une seconde
                 // plus tard, la reprendra — et sa boîte aux lettres avec.
-                let failure = {
+                let (failure, pause_par_l_appareil) = {
                     let Ok(output) = output_arc.try_lock() else {
                         debug!(
                             zone_id,
@@ -757,7 +757,7 @@ impl PositionPoller {
                         );
                         continue;
                     };
-                    output.take_output_failure()
+                    (output.take_output_failure(), output.take_paused_by_device())
                 };
                 // Fil 1915 — une piste dont le flux s'est COUPÉ loin de sa
                 // fin n'est pas une panne de sortie : on passe à la suivante
@@ -833,6 +833,21 @@ impl PositionPoller {
                     self.orchestrator
                         .stop(zone_id, device_id_ref.as_deref())
                         .await;
+                    continue;
+                }
+                // #6790 — la sortie s'est mise en pause d'elle-même (un
+                // endpoint OAAT a rendu son DAC à un autre lecteur de
+                // l'appareil). La zone suit, comme pour une pause de
+                // l'utilisateur : position enregistrée, état `paused`. Aucune
+                // pause n'est renvoyée à la sortie (`None`), elle y est déjà.
+                if pause_par_l_appareil {
+                    info!(
+                        zone_id,
+                        device = %device_id,
+                        "zone_en_pause_la_sortie_a_rendu_l_appareil"
+                    );
+                    poll_states.remove(&zone_id);
+                    let _ = self.orchestrator.pause(zone_id, None).await;
                     continue;
                 }
             }

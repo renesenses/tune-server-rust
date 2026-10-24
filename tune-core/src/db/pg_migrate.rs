@@ -1338,6 +1338,8 @@ ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS external_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id);
 -- artists: provenance du nom de tri (SQLite migration v131 / PG 095, #6474).
 ALTER TABLE artists ADD COLUMN IF NOT EXISTS sort_name_source TEXT;
+-- artists: provenance du MBID (SQLite migration v133 / PG 097, #6463).
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS musicbrainz_id_source TEXT;
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE

@@ -70,6 +70,28 @@ pub const DOMAINE_DEFI_SESSION: &str = "tune-remote/session/v1";
 pub const DOMAINE_DEFI_SERVEUR: &str = "tune-remote/serveur/v1";
 /// Préfixe du message que le serveur signe pour inscrire sa clé sur le compte.
 pub const DOMAINE_INSCRIPTION_SERVEUR: &str = "tune-remote/inscription/v1";
+/// Préfixe du message que l'appareil signe pour ouvrir (ou renouveler) une
+/// session DIRECTE, pair-à-pair, sur le serveur lui-même (#6785). Distinct de
+/// [`DOMAINE_DEFI_SESSION`] : une signature donnée au relais ne vaut pas en
+/// direct, ni l'inverse.
+pub const DOMAINE_DEFI_DIRECT: &str = "tune-remote/direct/v1";
+/// Préfixe du message que le serveur signe pour chaque requête qu'il adresse
+/// au site au titre du chemin direct (ouverture, battement) (#6785).
+pub const DOMAINE_REQUETE_SERVEUR: &str = "tune-remote/requete-serveur/v1";
+/// Écart d'horloge toléré par le site sur l'horodatage d'une requête signée
+/// du serveur.
+pub const TOLERANCE_REQUETE_SERVEUR_S: i64 = 120;
+
+/// Le jeu de clés publié le 22/10/2026, signé par la racine de production :
+/// la copie embarquée à la compilation, pour qu'un serveur qui démarre sans
+/// réseau sache vérifier tout de suite (cahier, § 2.4). Le jeu relu au site
+/// le remplace dès qu'il est plus récent.
+pub fn publication_embarquee() -> Publication {
+    Publication {
+        jeu: include_str!("../vecteurs/jeu-publie-20261022/jeu.json").to_string(),
+        minisig: include_str!("../vecteurs/jeu-publie-20261022/jeu.json.minisig").to_string(),
+    }
+}
 
 /// Pourquoi un laissez-passer, un défi ou un jeu de clés est refusé.
 ///
@@ -274,6 +296,22 @@ impl LaissezPasser {
     /// Vérifie la signature du défi de session par la clé de l'appareil.
     pub fn verifier_defi(&self, server_id: &str, defi: &str, signature: &str) -> Result<(), Refus> {
         let message = message_defi_session(server_id, defi);
+        if self.cle_appareil.verifie(&message, signature) {
+            Ok(())
+        } else {
+            Err(Refus::Defi)
+        }
+    }
+
+    /// Vérifie la signature du défi d'une session DIRECTE (#6785) par la clé
+    /// de l'appareil : message [`message_defi_direct`].
+    pub fn verifier_defi_direct(
+        &self,
+        server_id: &str,
+        defi: &str,
+        signature: &str,
+    ) -> Result<(), Refus> {
+        let message = message_defi_direct(server_id, defi);
         if self.cle_appareil.verifie(&message, signature) {
             Ok(())
         } else {
@@ -507,6 +545,75 @@ impl JeuDeCles {
 /// (enregistrement d'un appareil sur le site, défi du serveur) serve ici.
 pub fn message_defi_session(server_id: &str, defi: &str) -> Vec<u8> {
     format!("{DOMAINE_DEFI_SESSION}\n{server_id}\n{defi}").into_bytes()
+}
+
+/// Le message que l'appareil signe pour ouvrir (ou renouveler) une session
+/// DIRECTE sur le serveur (#6785) :
+/// `tune-remote/direct/v1 \n server_id \n défi`, en UTF-8. Le défi est tiré
+/// par le serveur, sur la connexion même, et ne sert qu'une fois.
+pub fn message_defi_direct(server_id: &str, defi: &str) -> Vec<u8> {
+    format!("{DOMAINE_DEFI_DIRECT}\n{server_id}\n{defi}").into_bytes()
+}
+
+/// Le message que le serveur signe pour une requête au site (#6785) :
+///
+/// ```text
+/// tune-remote/requete-serveur/v1
+/// <MÉTHODE>
+/// <chemin, sans l'hôte, requête comprise>
+/// <server_id>
+/// <horodatage, secondes Unix>
+/// <nonce>
+/// <SHA-256 du corps exact, base64url sans remplissage>
+/// ```
+///
+/// Lignes séparées par `\n`, sans `\n` final. Le site vérifie la signature
+/// avec la clé inscrite pour ce `server_id`, refuse un horodatage à plus de
+/// [`TOLERANCE_REQUETE_SERVEUR_S`] de son horloge et un nonce déjà vu dans
+/// cette fenêtre.
+pub fn message_requete_serveur(
+    methode: &str,
+    chemin: &str,
+    server_id: &str,
+    horodatage: i64,
+    nonce: &str,
+    corps: &[u8],
+) -> Vec<u8> {
+    let empreinte = ring::digest::digest(&ring::digest::SHA256, corps);
+    format!(
+        "{DOMAINE_REQUETE_SERVEUR}\n{methode}\n{chemin}\n{server_id}\n{horodatage}\n{nonce}\n{}",
+        URL_SAFE_NO_PAD.encode(empreinte.as_ref())
+    )
+    .into_bytes()
+}
+
+/// Vérifie la signature d'une requête du serveur au site (la règle que le
+/// site applique, rejouée ici pour les tests et pour le contrat).
+#[allow(clippy::too_many_arguments)]
+pub fn verifier_requete_serveur(
+    cle_serveur: &str,
+    methode: &str,
+    chemin: &str,
+    server_id: &str,
+    horodatage: i64,
+    nonce: &str,
+    corps: &[u8],
+    signature: &str,
+) -> Result<(), Refus> {
+    let octets = b64url(cle_serveur).ok_or(Refus::CleAppareil)?;
+    if octets.len() != 32 {
+        return Err(Refus::CleAppareil);
+    }
+    let cle = CleAppareil {
+        alg: AlgCle::Ed25519,
+        octets,
+    };
+    let message = message_requete_serveur(methode, chemin, server_id, horodatage, nonce, corps);
+    if cle.verifie(&message, signature) {
+        Ok(())
+    } else {
+        Err(Refus::Defi)
+    }
 }
 
 /// Le message que le serveur signe pour s'enregistrer sur le relais :

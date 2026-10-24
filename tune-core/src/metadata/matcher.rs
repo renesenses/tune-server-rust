@@ -242,8 +242,13 @@ pub async fn lookup_artist(name: &str) -> Option<String> {
     }
     let client = crate::http::client::shared();
     let query = super::mb_artist_query(name);
+    // La base partagée (`musicbrainz.org` en service) : une doublure locale
+    // la remplace dans les témoins de #6463, jamais en production.
     let resp = client
-        .get(format!("{MB_API}/artist"))
+        .get(format!(
+            "{}/artist",
+            super::musicbrainz_release::base_musicbrainz()
+        ))
         .query(&[
             ("query", &query),
             ("limit", &super::MB_ARTIST_CANDIDATES.to_string()),

@@ -8261,6 +8261,9 @@ mod cadence_du_flux_compresse;
 mod decodage_en_continu;
 #[cfg(test)]
 mod decodage_en_continu_5439;
+// #6925 — le M4A d'un podcast, `moov` en tête, décodé pendant le téléchargement.
+#[cfg(test)]
+mod podcast_m4a_en_continu_6925;
 // #5550 — le même chemin, sur une source 24 bits : bit-perfect jusqu'au puits.
 #[cfg(test)]
 mod decodage_en_continu_24bits_5550;
