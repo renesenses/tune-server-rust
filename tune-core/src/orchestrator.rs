@@ -1898,6 +1898,9 @@ mod volume_pure_5695_tests;
 // #6541 — limites de sécurité et de confort, tenues sur tous les chemins.
 #[cfg(test)]
 mod volume_limites_6541_tests;
+// #6721 — garde générale contre les montées brusques, sur tous les chemins.
+#[cfg(test)]
+mod garde_de_hausse_6721_tests;
 // #6774 — PURE verrouillé et volume fixe ne suivent pas la zone sur un
 // autre appareil.
 #[cfg(test)]

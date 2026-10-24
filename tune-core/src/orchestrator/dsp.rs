@@ -2774,6 +2774,35 @@ impl PlaybackOrchestrator {
             device_id,
             pure_force,
             crate::audio::volume_limites::OrigineDuVolume::Absolue,
+            crate::audio::garde_de_hausse::Hausse::Gardee,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// #6721 — [`Self::set_volume`], qui dit en plus ce que la consigne est
+    /// devenue, et qui laisse passer en entier une hausse CONFIRMÉE par
+    /// l'utilisateur (champ `confirm_increase` des routes). Sans
+    /// confirmation, une hausse de plus de
+    /// [`crate::audio::garde_de_hausse::SEUIL_DE_HAUSSE_DB`] est plafonnée,
+    /// comme sur tous les autres chemins.
+    pub async fn set_volume_avec_garde(
+        &self,
+        zone_id: i64,
+        volume: f64,
+        device_id: Option<&str>,
+        hausse: crate::audio::garde_de_hausse::Hausse,
+    ) -> OutputCommandResult<crate::audio::garde_de_hausse::VolumeRetenu> {
+        let pure_force = crate::audio::audiophile::volume_lock_enabled(&self.db, zone_id)
+            && crate::audio::audiophile::zone_enabled(&self.db, zone_id);
+        refuser_une_baisse_sous_pure_verrouille(zone_id, volume, pure_force)?;
+        self.appliquer_volume(
+            zone_id,
+            volume,
+            device_id,
+            pure_force,
+            crate::audio::volume_limites::OrigineDuVolume::Absolue,
+            hausse,
         )
         .await
     }
@@ -2789,6 +2818,26 @@ impl PlaybackOrchestrator {
         volume: f64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<()> {
+        self.set_volume_au_pas_avec_garde(
+            zone_id,
+            volume,
+            device_id,
+            crate::audio::garde_de_hausse::Hausse::Gardee,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// #6721 — [`Self::set_volume_au_pas`], avec la confirmation explicite
+    /// d'une hausse au-delà du seuil de la garde, et ce que la consigne est
+    /// devenue.
+    pub async fn set_volume_au_pas_avec_garde(
+        &self,
+        zone_id: i64,
+        volume: f64,
+        device_id: Option<&str>,
+        hausse: crate::audio::garde_de_hausse::Hausse,
+    ) -> OutputCommandResult<crate::audio::garde_de_hausse::VolumeRetenu> {
         let pure_force = crate::audio::audiophile::volume_lock_enabled(&self.db, zone_id)
             && crate::audio::audiophile::zone_enabled(&self.db, zone_id);
         refuser_une_baisse_sous_pure_verrouille(zone_id, volume, pure_force)?;
@@ -2798,6 +2847,7 @@ impl PlaybackOrchestrator {
             device_id,
             pure_force,
             crate::audio::volume_limites::OrigineDuVolume::Pas,
+            hausse,
         )
         .await
     }
@@ -2813,14 +2863,19 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<()> {
+        // #6721 — l'armement de PURE est confirmé par l'utilisateur : c'est
+        // l'action explicite qui autorise le 100 % (la garde ne mord pas sous
+        // `pure_force`).
         self.appliquer_volume(
             zone_id,
             1.0,
             device_id,
             true,
             crate::audio::volume_limites::OrigineDuVolume::Absolue,
+            crate::audio::garde_de_hausse::Hausse::Confirmee,
         )
         .await
+        .map(|_| ())
     }
 
     async fn appliquer_volume(
@@ -2830,7 +2885,9 @@ impl PlaybackOrchestrator {
         device_id: Option<&str>,
         pure_force: bool,
         origine: crate::audio::volume_limites::OrigineDuVolume,
-    ) -> OutputCommandResult<()> {
+        hausse: crate::audio::garde_de_hausse::Hausse,
+    ) -> OutputCommandResult<crate::audio::garde_de_hausse::VolumeRetenu> {
+        let demande = volume;
         // When fixed_volume is enabled, pin volume to 1.0 (bit-perfect) and
         // skip sending to the device — the DAC/renderer handles volume.
         let zone = ZoneRepo::with_backend(self.db.clone())
@@ -2842,7 +2899,11 @@ impl PlaybackOrchestrator {
             ZoneRepo::with_backend(self.db.clone())
                 .update_volume(zone_id, 100.0)
                 .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
-            return Ok(());
+            return Ok(crate::audio::garde_de_hausse::VolumeRetenu {
+                demande,
+                retenu: 1.0,
+                hausse_plafonnee: false,
+            });
         }
 
         // Trim de gain par renderer (setting `zone_{id}_gain_trim_db`, ±12 dB) :
@@ -2885,6 +2946,42 @@ impl PlaybackOrchestrator {
             }
             retenu
         };
+        // #6721 — la garde générale contre les montées brusques, au même
+        // point de passage, sur tous les chemins (curseur, API, assistant,
+        // alarmes, groupes, UPnP…) : une hausse de plus de
+        // `SEUIL_DE_HAUSSE_DB` (dB perçus du curseur de la zone,
+        // `volume_curve`) en une consigne est plafonnée, sauf confirmation
+        // explicite. Le repère est le volume courant de la zone en mémoire,
+        // restauré depuis la base au démarrage (`restore_zone_volumes`). PURE
+        // verrouillé (100 % armé par confirmation) n'y passe pas.
+        let (volume, hausse_plafonnee) = if pure_force {
+            (volume, false)
+        } else {
+            let actuel = self.playback.get_state(zone_id).await.volume;
+            let echelle = crate::audio::volume_scale::EchelleDeVolume::de_la_sortie(
+                zone.as_ref().and_then(|z| z.output_type.as_deref()),
+            );
+            let retenu = crate::audio::garde_de_hausse::retenir(actuel, volume, echelle, hausse);
+            if retenu < volume {
+                warn!(
+                    zone_id,
+                    actuel,
+                    demande = volume,
+                    retenu,
+                    seuil_db = crate::audio::garde_de_hausse::SEUIL_DE_HAUSSE_DB,
+                    volume_curve = echelle.code(),
+                    "volume_hausse_plafonnee_par_la_garde"
+                );
+                (retenu, true)
+            } else {
+                (volume, false)
+            }
+        };
+        let retenu_final = crate::audio::garde_de_hausse::VolumeRetenu {
+            demande,
+            retenu: volume,
+            hausse_plafonnee,
+        };
         let Some(did) = device_id else {
             info!(zone_id, volume, "set_volume_no_device_id");
             self.noter_le_volume_aux_postes(zone_id, volume);
@@ -2895,7 +2992,7 @@ impl PlaybackOrchestrator {
                 // -37 dB et COUPAIT le son sous 0,005 lineaire (-46,0205999133 dB).
                 .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
                 .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
-            return Ok(());
+            return Ok(retenu_final);
         };
         let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
             OutputCommandError::failed(
@@ -2938,7 +3035,7 @@ impl PlaybackOrchestrator {
                 device_id = did,
                 "device_set_volume_coalesced"
             );
-            return Ok(());
+            return Ok(retenu_final);
         }
         let sortie = output.lock().await;
         let device_volume = if pure_force {
@@ -2991,6 +3088,7 @@ impl PlaybackOrchestrator {
                         // #2886 — plus d'arrondi a l'entier : il coutait 3 dB vers
                         // -37 dB et COUPAIT le son sous 0,005 lineaire (-46,0205999133 dB).
                         .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
+                        .map(|_| retenu_final)
                         .map_err(|message| {
                             OutputCommandError::failed(OutputCommand::SetVolume, message)
                         })

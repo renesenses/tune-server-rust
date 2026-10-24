@@ -199,3 +199,55 @@ mod tests {
         assert!(!md.contains("Repertoires"));
     }
 }
+
+/// Le résumé de l'assistant, au plus.
+const RESUME_IA_MAX: usize = 1500;
+
+/// La description du signalement, avec le résumé de l'assistant SEULEMENT si
+/// l'utilisateur a coché la case. Le résumé est marqué IA, borné, et repasse
+/// par `anonymiser` (il part sur le forum PUBLIC).
+pub fn description_avec_resume_ia(
+    description: String,
+    resume_ia: Option<&str>,
+    joindre: bool,
+) -> String {
+    let resume = resume_ia
+        .map(str::trim)
+        .filter(|r| joindre && !r.is_empty())
+        .map(|r| r.chars().take(RESUME_IA_MAX).collect::<String>());
+    match resume {
+        None => description,
+        Some(r) => {
+            let r = crate::confidentialite::anonymiser(&r);
+            let cite: Vec<String> = r.lines().map(|l| format!("> {l}")).collect();
+            format!(
+                "{}\n\n### Résumé de l'assistant (IA)\n\n{}",
+                description.trim_end(),
+                cite.join("\n")
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod resume_ia_tests {
+    use super::description_avec_resume_ia;
+
+    #[test]
+    fn le_resume_ia_n_entre_que_si_la_case_est_cochee() {
+        let d =
+            description_avec_resume_ia("Ma zone ne joue pas.".into(), Some("Zone masquée."), false);
+        assert_eq!(
+            d, "Ma zone ne joue pas.",
+            "case décochée : le résumé IA est parti quand même"
+        );
+        let d =
+            description_avec_resume_ia("Ma zone ne joue pas.".into(), Some("Zone masquée."), true);
+        assert!(
+            d.contains("Résumé de l'assistant (IA)") && d.contains("> Zone masquée."),
+            "{d}"
+        );
+        let d = description_avec_resume_ia("x".into(), Some("   "), true);
+        assert_eq!(d, "x");
+    }
+}
