@@ -2150,8 +2150,11 @@ mod refus_de_format_3234 {
             let message = corps["message"].as_str().unwrap_or_default();
             assert!(message.contains(phrase), "{lang} : {message}");
             // #6396 — la phrase dit OÙ se trouve l'option : « dans les
-            // Réglages » laissait chercher (Lulu, fil 2288).
-            assert!(message.contains("> Spotify"), "{lang} : {message}");
+            // Réglages » laissait chercher (Lulu, fil 2288). #6857 — et le
+            // chemin est le VRAI : la carte « Spotify Connect » de l'onglet
+            // d'accès, pas une page « Réglages > Spotify » qui n'existe pas.
+            assert!(message.contains("› Spotify Connect"), "{lang} : {message}");
+            assert!(!message.contains("> Spotify"), "{lang} : {message}");
         }
     }
 

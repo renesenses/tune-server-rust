@@ -4,6 +4,7 @@ pub mod alac_encoder;
 pub mod analyzer;
 pub mod ape;
 pub mod audiophile;
+pub mod audit_integrite;
 pub mod autoeq;
 /// #6388 — la base AutoEq en ligne : index, recherche, copie locale.
 pub mod autoeq_base;

@@ -1936,10 +1936,31 @@ impl PlaybackOrchestrator {
     /// ReplayGain a déjà son propre signal (`pure_replaygain_ignored`, #5633).
     ///
     /// Sous `local-audio` seulement : sans sortie locale, personne ne le lit.
+    ///
+    /// #6780 — et la réaffectation des canaux de la zone (greffon
+    /// `channel-remap`), que PURE coupe aussi (`regle_effective_with` rend
+    /// `None` en PURE) : elle n'était pas comptée, et le bouclier disait
+    /// « rien à contourner » pendant que PURE la contournait.
     #[cfg(feature = "local-audio")]
     pub(super) fn pure_contourne_un_reglage(&self, zone_id: i64) -> bool {
         self.traitement_que_pure_gouverne(zone_id, None).is_some()
             || Self::zone_mono_downmix_configure_with(&self.db, zone_id)
+            || Self::reaffectation_de_zone_armee_with(&self.db, zone_id)
+    }
+
+    /// #6780 — la règle de réaffectation des canaux de la ZONE est-elle
+    /// armée ? Greffon activé, règle enregistrée, matrice qui n'est pas
+    /// l'identité (`reaffectation_canaux::resoudre`, sans piste : la règle
+    /// d'album, qui dépend de la piste, n'est pas lue ici).
+    #[cfg(feature = "local-audio")]
+    fn reaffectation_de_zone_armee_with(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: i64,
+    ) -> bool {
+        use crate::audio::reaffectation_canaux as rc;
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
+        crate::audio::premium_plugins::enabled(&settings, rc::ID_GREFFON)
+            && rc::resoudre(rc::lire(&settings, &rc::cle_de_zone(zone_id)), None, None).is_some()
     }
 
     /// Pose [`Self::pure_contourne_un_reglage`] sur la sortie locale, à côté

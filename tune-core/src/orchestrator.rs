@@ -1912,6 +1912,9 @@ mod eq_en_vol_4407_tests;
 // bibliothèque native de test.
 #[cfg(test)]
 mod greffon_natif_tiers_tests;
+// #6780 — PURE contourne aussi la réaffectation des canaux armée de la zone.
+#[cfg(all(test, feature = "local-audio"))]
+mod pure_reaffectation_6780_tests;
 // #6256 — la désinstallation d'un greffon natif tiers ne rebâtit que les
 // zones qui l'utilisent.
 #[cfg(all(test, feature = "local-audio"))]
