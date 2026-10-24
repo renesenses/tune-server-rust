@@ -153,11 +153,17 @@ impl PlaybackOrchestrator {
         position_ms: u64,
         state: &crate::playback::ZoneState,
     ) -> Option<Result<(), String>> {
-        if !profil::seek_inoperant(did) {
-            return None;
-        }
         let np = state.now_playing.as_ref()?;
         if np.source != "local" {
+            return None;
+        }
+        // #6333 — même relance sur le Devialet, pour une piste Hi-Res.
+        let seek_inoperant = profil::seek_inoperant(did);
+        let relance_hi_res = !seek_inoperant
+            && self
+                .deplacement_hi_res_par_nouveau_flux(zone_id, did, np.bit_depth)
+                .await;
+        if !seek_inoperant && !relance_hi_res {
             return None;
         }
         let sid = np.stream_id.as_deref()?;
@@ -168,6 +174,7 @@ impl PlaybackOrchestrator {
             device_id = %did,
             position_ms,
             fichier = %chemin,
+            raison = if relance_hi_res { "hi_res_6333" } else { "seek_inoperant_6059" },
             "seek_natif_relance_du_flux_a_la_position"
         );
         Some(
@@ -177,16 +184,23 @@ impl PlaybackOrchestrator {
     }
 
     /// Temps 3 : la carte du flux natif décalé, quand la piste se résout vers
-    /// un renderer profilé avec un `seek_ms`. `None` : flux entier, comme avant.
+    /// un renderer profilé avec un `seek_ms` — ou, #6333, vers le Devialet
+    /// avec une piste Hi-Res. `None` : flux entier, comme avant.
     pub(super) async fn preparer_depart_natif_6059(
         &self,
+        zone_id: i64,
         device_id: Option<&str>,
         seek_ms: Option<u64>,
         file_path: &str,
+        bit_depth: Option<u32>,
     ) -> Option<DepartNatif> {
         let seek_ms = seek_ms.filter(|s| *s > 0)?;
         let did = device_id?;
-        if !profil::seek_inoperant(did) {
+        if !profil::seek_inoperant(did)
+            && !self
+                .deplacement_hi_res_par_nouveau_flux(zone_id, did, bit_depth)
+                .await
+        {
             return None;
         }
         FormatNatif::du_chemin(std::path::Path::new(file_path))?;

@@ -1859,6 +1859,10 @@ mod resolve_local;
 pub(crate) mod seek_natif_6059;
 #[cfg(test)]
 mod seek_natif_6059_bout_en_bout;
+// #6333 — Devialet : une avance en Hi-Res relance le flux natif à la position.
+mod deplacement_hi_res_6333;
+#[cfg(test)]
+mod deplacement_hi_res_6333_bout_en_bout;
 
 // #2742 — le crossfeed des pistes de la bibliothèque sur une zone réseau.
 mod crossfeed_bibliotheque_reseau;

@@ -3626,8 +3626,14 @@ impl PlaybackOrchestrator {
                         .output_device_id
                         .as_deref()
                         .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()));
-                    self.preparer_depart_natif_6059(did, req.seek_ms, file_path)
-                        .await
+                    self.preparer_depart_natif_6059(
+                        req.zone_id,
+                        did,
+                        req.seek_ms,
+                        file_path,
+                        Some(u32::from(bit_depth)),
+                    )
+                    .await
                 } else {
                     None
                 };
