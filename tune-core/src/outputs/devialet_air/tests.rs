@@ -553,7 +553,73 @@ async fn air_sans_retour_l_emetteur_s_arrete_et_le_dit() {
     sim.etat().muet = true;
     let (fin, _) = lancer_un_flux(&sim, SESSION_DE_TEST, sinus(44_100, 44_100), 44_100).await;
     match fin {
-        FinDeFlux::Interrompu { motif, .. } => assert!(motif.contains("aucun retour"), "{motif}"),
+        FinDeFlux::Interrompu { motif, .. } => {
+            assert!(motif.contains("aucun retour"), "{motif}");
+            assert!(
+                motif.contains("aucun datagramme reçu sur le port local"),
+                "rien n'est arrivé : le motif doit le dire ({motif})"
+            );
+        }
+        autre => panic!("attendu une interruption, reçu {autre:?}"),
+    }
+}
+
+/// #6911 — un ampli qui répond, mais avec des retours que l'émetteur écarte
+/// (ici : un autre identifiant de flux). Le motif doit dire que des
+/// datagrammes sont ARRIVÉS et pourquoi ils ont été écartés : c'est ce qui
+/// sépare « rien n'arrive » (réseau, pare-feu) de « ça arrive, mais pas sous
+/// la forme attendue » (format, session, flux).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn air_sans_retour_retenu_le_motif_dit_ce_qui_a_ete_ecarte() {
+    let faux_ampli = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let adresse = faux_ampli.local_addr().unwrap();
+    let repondeur = tokio::spawn(async move {
+        let mut b = vec![0u8; 4096];
+        loop {
+            let Ok((_, de)) = faux_ampli.recv_from(&mut b).await else {
+                continue;
+            };
+            let df = retour(&Retour {
+                session: SESSION_DE_TEST,
+                flux: 0x9999,
+                derniere_trame_recue: 0,
+                dernier_paquet_recu: 0,
+                position_jouee: 0,
+                manquants: Vec::new(),
+            });
+            let _ = faux_ampli.send_to(&df, de).await;
+        }
+    });
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let p = ParametresFlux {
+        session: SESSION_DE_TEST,
+        flux: 0x0042,
+        frequence: 44_100,
+        cadence: CADENCE_DE_TEST,
+    };
+    let fin = tokio::time::timeout(
+        Duration::from_secs(10),
+        diffuser(
+            socket,
+            adresse,
+            p,
+            source_de(sinus(44_100, 44_100)),
+            Arc::new(Mutex::new(EtatFlux::default())),
+            sans_garde(),
+        ),
+    )
+    .await
+    .expect("le flux doit se terminer");
+    repondeur.abort();
+    match fin {
+        FinDeFlux::Interrompu { motif, .. } => {
+            assert!(motif.contains("aucun retour"), "{motif}");
+            assert!(
+                motif.contains("reçu(s) et écarté(s)")
+                    && motif.contains("autre session ou d'un autre flux"),
+                "le motif doit dire que des retours sont arrivés et pourquoi ils ont été écartés ({motif})"
+            );
+        }
         autre => panic!("attendu une interruption, reçu {autre:?}"),
     }
 }
@@ -921,6 +987,30 @@ async fn air_pause_envoie_un_arret_et_la_reprise_ouvre_un_flux_neuf() {
     let second = *s.paquets.keys().nth(1).unwrap();
     assert_ne!(second, premier);
     assert_eq!(s.arrets.len(), 2);
+}
+
+/// #6923 — un déplacement dont le flux neuf ne part pas laisse la sortie
+/// arrêtée. Elle doit le DIRE (`take_output_failure`), sinon le sondeur
+/// prend cet arrêt pour une fin de piste et passe au morceau suivant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn air_un_deplacement_qui_ne_relance_pas_le_flux_le_dit() {
+    let b = banc(annonce_de_test(), true).await;
+    let dossier = crate::test_scratch::scratch_dir("devialet-air-seek-6923");
+    let (chemin, _) = wav_16_bits(&dossier, 44_100, 88_200);
+    b.sortie.play_media(&media(&chemin)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Le fichier disparaît : la réouverture du décodeur échoue au déplacement.
+    std::fs::remove_file(&chemin).unwrap();
+    let refus = b.sortie.seek(1_000).await;
+    assert!(refus.is_err(), "le déplacement doit échouer : {refus:?}");
+    let st = b.sortie.get_status().await.unwrap();
+    assert_eq!(st.state, TransportState::Stopped);
+    assert!(!st.ended_naturally, "un échec n'est pas une fin de piste");
+    let motif = b
+        .sortie
+        .take_output_failure()
+        .expect("l'échec du déplacement doit remonter au sondeur");
+    assert!(motif.contains("déplacement impossible"), "{motif}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
