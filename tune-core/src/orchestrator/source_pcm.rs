@@ -225,6 +225,17 @@ impl PlaybackOrchestrator {
         let url = self
             .streamer
             .get_stream_url(&session_id, &self.server_ip(), "wav");
+        // #6915 — un flux ouvert à `depuis_ms` COMMENCE à cette position : un
+        // renderer réseau compte sa position à partir du début de CE flux.
+        // Sans le départ dans l'URL, le sondeur reprenait « 0:05 » pour la
+        // position de la piste, et la relance suivante (changement
+        // d'égaliseur) repartait près du début. Même mécanique que le flux
+        // natif décalé de #6059 (`outputs::dlna_depart_natif`).
+        let url = if depuis_ms > 0 {
+            crate::outputs::dlna_depart_natif::url_avec_depart(&url, depuis_ms)
+        } else {
+            url
+        };
         Ok(ResolvedStream {
             url,
             mime_type: "audio/wav".into(),

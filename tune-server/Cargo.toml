@@ -17,6 +17,9 @@ asio = ["tune-core/asio"]
 dst = ["tune-core/dst"]
 oaat = ["tune-core/oaat"]
 cloud-relay = ["tune-core/cloud-relay"]
+# #6785 : point d'ecoute direct (iroh). HORS defaut : iroh n'entre que dans
+# les builds qui l'allument ; eteint a l'execution par defaut.
+ecoute-directe = ["tune-core/ecoute-directe"]
 postgres = ["tune-core/postgres"]
 # Acoustic Smart Radio: CLAP audio embeddings (onnxruntime). Opt-in build — NOT
 # in default, so the standard matrix never links ort.

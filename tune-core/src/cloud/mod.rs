@@ -4,6 +4,8 @@ pub mod community;
 pub mod community_sync;
 pub mod consent;
 pub mod digest;
+#[cfg(feature = "ecoute-directe")]
+pub mod ecoute_directe;
 pub mod ecoutes_au_compte;
 pub mod ecoutes_communaute;
 pub mod library_reconcile;

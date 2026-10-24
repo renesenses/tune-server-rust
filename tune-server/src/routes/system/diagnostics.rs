@@ -1531,6 +1531,21 @@ fn selectionner_lignes(
     (lignes, vraiment_ecartees)
 }
 
+/// Les dernières lignes du journal pour le diagnostic de l'assistant IA
+/// (23/10/2026), déjà nettoyées par `anonymiser` comme l'export : le greffon
+/// les filtre et les pseudonymise encore avant tout envoi.
+#[cfg(feature = "assistant-ia")]
+pub(crate) async fn journal_pour_assistant(max_lines: usize) -> Vec<String> {
+    let Json(mut journaux) = collect_recent_logs(max_lines).await;
+    tune_core::confidentialite::anonymiser_json(&mut journaux);
+    journaux["logs"]
+        .as_str()
+        .unwrap_or("")
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
 pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
     // #5124 — « Exporter les journaux » : le fichier finit collé dans un fil.
     // Même nettoyage que le rapport de bogue, par la même fonction.
@@ -2903,6 +2918,13 @@ pub(super) async fn bug_report_markdown(
 pub(super) struct BugReportSubmitBody {
     #[serde(default)]
     description: String,
+    /// Le résumé de l'assistant IA (diagnostic), montré à l'utilisateur.
+    #[serde(default)]
+    resume_ia: Option<String>,
+    /// La case « joindre le résumé de l'assistant » : DÉCOCHÉE par défaut
+    /// (décision de Bertrand du 23/10/2026). Sans elle, le résumé est ignoré.
+    #[serde(default)]
+    joindre_resume_ia: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2972,6 +2994,8 @@ async fn lire_captures(
     mut multipart: axum::extract::Multipart,
 ) -> Result<(String, Vec<CaptureJointe>), axum::response::Response> {
     let mut description = String::new();
+    let mut resume_ia: Option<String> = None;
+    let mut joindre_resume_ia = false;
     let mut images: Vec<CaptureJointe> = Vec::new();
 
     loop {
@@ -3027,14 +3051,24 @@ async fn lire_captures(
                     Ok(v) => v,
                     Err(e) => return Err(refus_de_capture("invalid_field", &e.to_string())),
                 };
-                if name == "description" {
-                    description = value;
+                match name.as_str() {
+                    "description" => description = value,
+                    "resume_ia" => resume_ia = Some(value),
+                    "joindre_resume_ia" => joindre_resume_ia = value.trim() == "true",
+                    _ => {}
                 }
             }
         }
     }
 
-    Ok((description, images))
+    Ok((
+        tune_core::bug_report::description_avec_resume_ia(
+            description,
+            resume_ia.as_deref(),
+            joindre_resume_ia,
+        ),
+        images,
+    ))
 }
 
 /// POST /system/bug-report/submit — build the local bug report (diagnostics +
@@ -3092,7 +3126,14 @@ pub(super) async fn submit_bug_report(
         }
     } else {
         match req.extract::<Json<BugReportSubmitBody>, _>().await {
-            Ok(Json(b)) => (b.description, Vec::new()),
+            Ok(Json(b)) => (
+                tune_core::bug_report::description_avec_resume_ia(
+                    b.description,
+                    b.resume_ia.as_deref(),
+                    b.joindre_resume_ia,
+                ),
+                Vec::new(),
+            ),
             Err(rej) => return rej.into_response(),
         }
     };

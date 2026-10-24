@@ -505,6 +505,67 @@ fn log_favorite_result(
 }
 
 impl QobuzService {
+    /// Le catalogue d'un label (`label/get`, `extra=albums`), paginé et borné
+    /// à 500 albums, sans les précommandes. Partagé par la page d'un label
+    /// ([`StreamingService::get_album_label`]) et la découverte des artistes
+    /// du même label (#6782, [`crate::library::artistes_du_label`]).
+    pub(crate) async fn albums_du_label(
+        &self,
+        label_id: &str,
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
+        // Bounded pagination: big majors (e.g. Columbia) expose 10k+ albums.
+        // We cap at MAX and the app offers a text filter over the loaded set.
+        const MAX: usize = 500;
+        const PAGE: usize = 50;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut albums: Vec<StreamAlbum> = Vec::new();
+        let mut offset: usize = 0;
+        loop {
+            let off = offset.to_string();
+            let lim = PAGE.to_string();
+            let data = self
+                .api_get(
+                    "/label/get",
+                    &[
+                        ("label_id", label_id),
+                        ("extra", "albums"),
+                        ("limit", &lim),
+                        ("offset", &off),
+                    ],
+                )
+                .await?;
+            let items = data["albums"]["items"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let n = items.len();
+            // A label's full catalogue includes not-yet-released pre-orders
+            // (streamable=true but a future release date) whose tracks resolve
+            // to "no url" (502) on playback. Keep only released + streamable
+            // albums (mirrors the LMS plugin's `_isReleased` check).
+            albums.extend(
+                items
+                    .iter()
+                    .filter(|it| {
+                        let streamable = it["streamable"].as_bool() != Some(false);
+                        let released = it["released_at"].as_u64().map_or(true, |ts| ts <= now);
+                        streamable && released
+                    })
+                    .map(Self::map_album),
+            );
+            let total = data["albums"]["total"].as_u64().unwrap_or(0) as usize;
+            offset += n;
+            if n < PAGE || offset >= total || albums.len() >= MAX {
+                break;
+            }
+        }
+        albums.truncate(MAX);
+        Ok(albums)
+    }
+
     /// Écrire un favori exige le jeton utilisateur : l'app_id seul identifie
     /// l'application, pas le compte. Sans jeton, Qobuz accepte la requête sans
     /// rien enregistrer — un succès en trompe-l'œil. On refuse avant d'émettre.
@@ -3018,56 +3079,7 @@ impl StreamingService for QobuzService {
             .or_else(|| album["label"]["id"].as_str().map(Into::into))
             .ok_or_else(|| TuneError::NotFound("album has no label".into()))?;
         let name = album["label"]["name"].as_str().unwrap_or("").into();
-        // Bounded pagination: big majors (e.g. Columbia) expose 10k+ albums.
-        // We cap at MAX and the app offers a text filter over the loaded set.
-        const MAX: usize = 500;
-        const PAGE: usize = 50;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let mut albums: Vec<StreamAlbum> = Vec::new();
-        let mut offset: usize = 0;
-        loop {
-            let off = offset.to_string();
-            let lim = PAGE.to_string();
-            let data = self
-                .api_get(
-                    "/label/get",
-                    &[
-                        ("label_id", &label_id),
-                        ("extra", "albums"),
-                        ("limit", &lim),
-                        ("offset", &off),
-                    ],
-                )
-                .await?;
-            let items = data["albums"]["items"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let n = items.len();
-            // A label's full catalogue includes not-yet-released pre-orders
-            // (streamable=true but a future release date) whose tracks resolve
-            // to "no url" (502) on playback. Keep only released + streamable
-            // albums (mirrors the LMS plugin's `_isReleased` check).
-            albums.extend(
-                items
-                    .iter()
-                    .filter(|it| {
-                        let streamable = it["streamable"].as_bool() != Some(false);
-                        let released = it["released_at"].as_u64().map_or(true, |ts| ts <= now);
-                        streamable && released
-                    })
-                    .map(Self::map_album),
-            );
-            let total = data["albums"]["total"].as_u64().unwrap_or(0) as usize;
-            offset += n;
-            if n < PAGE || offset >= total || albums.len() >= MAX {
-                break;
-            }
-        }
-        albums.truncate(MAX);
+        let albums = self.albums_du_label(&label_id).await?;
         Ok(LabelInfo {
             id: label_id,
             name,
