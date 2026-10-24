@@ -2281,6 +2281,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     let version_interface =
         tune_core::interface_web::version_interface(&crate::config::resolve_web_dir());
     let music_dirs = super::get_music_dirs_list(&state.backend);
+    let partages_sans_racine = crate::partages_sans_racine::releve(&state.backend, &music_dirs);
     let scan_status = settings
         .get("scan_status")
         .ok()
@@ -2440,6 +2441,13 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         md.push_str(&ligne_portraits_d_artistes(p));
     }
     md.push_str(&format!("- Music dirs: {}\n", music_dirs.join(", ")));
+    // #6175 — `Music dirs:` vide à côté de deux partages « Monté » : le rapport
+    // de Daniel LEVY ne reliait pas les deux, la cause tient en une ligne.
+    if let Some(phrase) =
+        crate::partages_sans_racine::explication(&music_dirs, &partages_sans_racine)
+    {
+        md.push_str(&format!("- Partages SMB sans dossier déclaré: {phrase}\n"));
+    }
     // #6729 : QUEL scan tient le statut, ou « résiduel » si aucun.
     md.push_str(&format!(
         "- Scan status: {}\n",
@@ -2837,6 +2845,9 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
                 "sources": p.sources,
             })),
             "music_dirs": music_dirs,
+            // #6175 — les partages SMB actifs qu'aucun dossier ne couvre.
+            "mounted_shares_not_declared":
+                crate::partages_sans_racine::en_json(&partages_sans_racine),
             "scan_status": scan_status,
             // #4319 — ce que la RECHERCHE voit, à côté de ce que la
             // bibliothèque contient. Absent sur PostgreSQL.

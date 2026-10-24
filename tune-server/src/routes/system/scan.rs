@@ -1876,7 +1876,13 @@ async fn spawn_library_scan_avec_lecteur_par(
         let result = tokio::task::spawn_blocking(move || {
         let raw_dirs = super::get_music_dirs_list(&db);
         if raw_dirs.is_empty() {
-            tracing::warn!("scan_aborted_no_dirs — no music directories configured");
+            // #6175 — un partage monté mais non déclaré est la cause la plus
+            // probable d'un scan sans dossier : le dire ici, et à l'écran.
+            let partages = crate::partages_sans_racine::releve(&db, &raw_dirs);
+            tracing::warn!(
+                partages_sans_racine = ?partages.iter().map(|p| &p.point).collect::<Vec<_>>(),
+                "scan_aborted_no_dirs — no music directories configured"
+            );
             if let Err(e) = SettingsRepo::with_backend(db).set("scan_status", "idle") {
                 tracing::warn!(error = %e, "scan_status_reset_failed");
             }
@@ -1894,6 +1900,9 @@ async fn spawn_library_scan_avec_lecteur_par(
                     "updated": 0,
                     "skipped": 0,
                     "no_dirs": true,
+                    "mounted_shares_not_declared":
+                        crate::partages_sans_racine::en_json(&partages),
+                    "explanation": crate::partages_sans_racine::explication(&raw_dirs, &partages),
                 }),
             );
             return;

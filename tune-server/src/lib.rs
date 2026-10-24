@@ -52,6 +52,8 @@ pub mod memoire_a_froid;
 /// #4677 — relevé, au démarrage, des règles du pare-feu Windows pour
 /// `tune-server.exe` (lecture seule, une ligne de journal).
 pub mod pare_feu_windows;
+/// #6175 — les partages SMB montés qu'aucun dossier de musique ne couvre.
+pub mod partages_sans_racine;
 pub mod plugins;
 /// P2 of the plugin ABI: AppState-backed [`HostContext`] plus the registry of
 /// loaded wasm plugins. Gated behind `plugins-wasm`; absent from default builds.
