@@ -2149,6 +2149,9 @@ mod niveaux_source_pcm_5078;
 mod resolution_annoncee_tests;
 #[cfg(test)]
 mod saut_de_piste_pcm_5079;
+// #6915 — un CD rouvert à la position : le renderer la rapporte à la piste.
+#[cfg(test)]
+mod depart_du_cd_6915;
 /// #6018 — un titre Spotify joué par librespot, jusqu'à la session de la zone.
 #[cfg(all(test, unix))]
 mod spotify_6018_tests;
