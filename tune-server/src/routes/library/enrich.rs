@@ -516,6 +516,15 @@ pub(crate) async fn demarrer_enrich_all(
                 let backend_ecriture = backend2.clone();
                 let album_id = row.get(10).and_then(|v| v.as_i64());
                 let mb_id = mb_id.clone();
+                // #6463 — l'enregistrement vient des balises (MBID de piste
+                // déjà là) : ses crédits valent un pressage identifié. Trouvé
+                // par une recherche titre + artiste : c'est le NOM qui l'a
+                // désigné, et la vérification de fond pourra le revoir.
+                let provenance_artiste = if existing_mb_id.is_some() {
+                    tune_core::db::artist_repo::ProvenanceMbid::Pressage
+                } else {
+                    tune_core::db::artist_repo::ProvenanceMbid::Nom
+                };
                 tune_core::taches_de_fond::priorite::hors_du_fil_async(
                     tune_core::taches_de_fond::Tache::Enrichissement.id(),
                     move || {
@@ -536,11 +545,23 @@ pub(crate) async fn demarrer_enrich_all(
                                 (artist_id, details.musicbrainz_artist_id.as_ref())
                         {
                             let ambid_val: Option<String> = Some(artist_mbid.clone());
+                            let source_val: Option<&str> = Some(provenance_artiste.as_str());
+                            // #6463 — la provenance avec le MBID, et jamais
+                            // sur une fiche dont l'utilisateur a saisi ou
+                            // détaché l'identité.
                             backend_ecriture
                                 .execute(
-                                    "UPDATE artists SET musicbrainz_id = \
-                                     COALESCE(musicbrainz_id, ?) WHERE id = ?",
-                                    &[&ambid_val as &dyn ToSqlValue, &aid as &dyn ToSqlValue],
+                                    &format!(
+                                        "UPDATE artists SET musicbrainz_id = ?, \
+                                         musicbrainz_id_source = ? WHERE id = ? \
+                                         AND musicbrainz_id IS NULL AND {}",
+                                        tune_core::db::artist_repo::PAS_UN_MBID_MANUEL
+                                    ),
+                                    &[
+                                        &ambid_val as &dyn ToSqlValue,
+                                        &source_val as &dyn ToSqlValue,
+                                        &aid as &dyn ToSqlValue,
+                                    ],
                                 )
                                 .ok();
                             mbid_artiste_pose = Some(aid);

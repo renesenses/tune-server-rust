@@ -30,6 +30,10 @@
 //! | `POST /lot/appliquer` | `{albums: [{album_id, lignes}]}` |
 //! | `POST /lot/annuler` | `{operations: [{album_id, operation_id}]}` |
 //!
+//! La transcription vocale (`POST /api/v1/voice-search` de l'hôte) passe par
+//! [`Passerelle::transcrire`] : clé au coffre, coût dans le plafond
+//! ([`transcription`]).
+//!
 //! Gratuit, pour tout le monde : aucune garde Premium. Les RÉGLAGES (`PUT
 //! /reglages`, `POST /tester`) sont réservés aux administrateurs dès que
 //! l'authentification est active (étape 2).
@@ -47,6 +51,7 @@ pub mod reglages;
 pub mod regles;
 mod routes;
 pub mod suggestions;
+pub mod transcription;
 
 use std::path::PathBuf;
 use std::sync::Arc;

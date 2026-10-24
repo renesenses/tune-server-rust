@@ -56,8 +56,15 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_telemetry_reporter(state);
     spawn_heartbeat(state);
     spawn_bio_sync(state);
+    spawn_verification_mbid_artistes(state);
     spawn_reprise_favoris_streaming(state);
     spawn_veille_favoris_miroir(state);
+    // #6682 — « Mon écoute » : le temps d'écoute radio par station, mesuré
+    // sur ce qui JOUE, quel que soit le chemin qui a lancé la station.
+    tokio::spawn(tune_core::db::radio_ecoute::veille(
+        state.backend.clone(),
+        state.playback.clone(),
+    ));
     // CRD-5 : passe automatique des crédits, bornée par tour et reprenable par
     // curseur, derrière le même droit premium que les biographies. Une garde
     // dans `credits.rs` tient cette ligne : l'ordonnanceur de scan a été du
@@ -83,6 +90,12 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // Notes et écoutes de la communauté (#6545) : consentement séparé,
     // désactivé par défaut. Un test de câblage garde la ligne.
     tune_core::cloud::notes_communautaires::spawn(state.backend.clone(), state.http_client.clone());
+    // Résultats d'analyse de la communauté (#5594) : recevoir et contribuer,
+    // deux options désactivées par défaut. Un test de câblage garde la ligne.
+    tune_core::cloud::mesures_communautaires::spawn(
+        state.backend.clone(),
+        state.http_client.clone(),
+    );
     spawn_local_audio_rescan(state);
     // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
     // `spawn_scan_scheduler` était du code mort, la bascule des clients écrivait
@@ -125,6 +138,10 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     );
     spawn_mp3_duration_repair(state);
     spawn_rattrapage_genres_d_album(state);
+    // #6773 — noms de tri des artistes : rattrapage MusicBrainz des fiches
+    // déjà identifiées, puis déduction « Nom, Prénom ». Un test de câblage
+    // garde la ligne.
+    spawn_rattrapage_noms_de_tri(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config);
     spawn_social_sharing_listener(state);
@@ -133,6 +150,51 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_oaat_stall_supervisor(state);
     #[cfg(feature = "cloud-relay")]
     spawn_relay_client(state).await;
+    #[cfg(feature = "ecoute-directe")]
+    spawn_ecoute_directe(state).await;
+}
+
+/// Le droit Premium de l'écoute à distance, relu à CHAQUE ouverture de
+/// session directe : le même droit que celui qui lance le client du relais
+/// (`Feature::CloudRelay`).
+#[cfg(feature = "ecoute-directe")]
+struct DroitsParLicence(std::sync::Arc<tune_core::license::LicenseManager>);
+
+#[cfg(feature = "ecoute-directe")]
+#[async_trait::async_trait]
+impl tune_core::cloud::ecoute_directe::DroitsDirect for DroitsParLicence {
+    async fn ecoute_distante_permise(&self) -> bool {
+        self.0
+            .check_feature(tune_core::license::Feature::CloudRelay)
+            .await
+    }
+}
+
+/// #6785 — point d'écoute direct (pair-à-pair), ÉTEINT par défaut : rien
+/// n'écoute tant que `TUNE_ECOUTE_DIRECTE` ou le réglage
+/// `ecoute_directe_active` ne l'allume pas, et jamais sans le droit Premium
+/// de l'écoute à distance.
+#[cfg(feature = "ecoute-directe")]
+async fn spawn_ecoute_directe(state: &AppState) {
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    if !tune_core::cloud::ecoute_directe::active(&reglages) {
+        info!("ecoute_directe_desactivee");
+        return;
+    }
+    if !state
+        .license
+        .check_feature(tune_core::license::Feature::CloudRelay)
+        .await
+    {
+        info!("ecoute_directe_requiert_premium");
+        return;
+    }
+    let droits = std::sync::Arc::new(DroitsParLicence(state.license.clone()));
+    if let Err(e) =
+        tune_core::cloud::ecoute_directe::lancer(state.backend.clone(), state.port, droits).await
+    {
+        warn!(erreur = %e, "ecoute_directe_non_lancee");
+    }
 }
 
 /// Supervise OAAT zones and recover a stalled one with a stop+play restart.
@@ -220,6 +282,109 @@ fn spawn_rattrapage_genres_d_album(state: &AppState) {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         if let Err(e) = tune_core::db::genre_album_pistes::rattraper_les_genres_tenus(&backend) {
             warn!(error = %e, "rattrapage_genres_tenus_5314_echoue");
+        }
+    });
+}
+
+/// #6773 — le réglage qui marque le rattrapage MusicBrainz des noms de tri
+/// comme fini, et son curseur de reprise.
+const RATTRAPAGE_NOMS_DE_TRI_FAIT: &str = "rattrapage_noms_de_tri_6773_fait";
+const RATTRAPAGE_NOMS_DE_TRI_CURSEUR: &str = "rattrapage_noms_de_tri_6773_curseur";
+/// Fiches par tour : au créneau d'une requête par seconde, un peu plus d'une
+/// minute de MusicBrainz, puis la main aux autres passes.
+const RATTRAPAGE_NOMS_DE_TRI_PAR_TOUR: usize = 60;
+
+/// #6773 — les noms de tri des artistes qui n'en ont pas.
+///
+/// 1. La DÉDUCTION « Nom, Prénom » (sans réseau) pour les artistes sans MBID
+///    ni nom de tri, à chaque démarrage : une requête sur une base déjà
+///    rattrapée.
+/// 2. Le RATTRAPAGE MusicBrainz, UNE fois : les artistes déjà identifiés
+///    (MBID connu) avant que l'identification pose le nom de tri. Mêmes
+///    gardes que la passe automatique des crédits : droit d'enrichissement
+///    automatique, pause « Enrichissement », limiteur MusicBrainz partagé.
+///    Curseur en base : un arrêt ou une panne reprend où il s'était arrêté.
+fn spawn_rattrapage_noms_de_tri(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        let backend = state.backend.clone();
+        let deduction = backend.clone();
+        match tokio::task::spawn_blocking(move || {
+            tune_core::metadata::noms_de_tri::deduire_les_noms_de_tri(&deduction)
+        })
+        .await
+        {
+            Ok(Err(e)) => warn!(error = %e, "noms_de_tri_deduction_echouee"),
+            Err(e) => warn!(error = %e, "noms_de_tri_deduction_echouee"),
+            Ok(Ok(_)) => {}
+        }
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+        if reglages
+            .get(RATTRAPAGE_NOMS_DE_TRI_FAIT)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        loop {
+            if !state
+                .license
+                .check_feature(tune_core::license::Feature::AutoEnrichment)
+                .await
+            {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                continue;
+            }
+            if tune_core::taches_de_fond::est_en_pause(
+                tune_core::taches_de_fond::Tache::Enrichissement,
+            ) {
+                tokio::time::sleep(tune_core::taches_de_fond::CADENCE_RELECTURE_PAUSE).await;
+                continue;
+            }
+            let apres = reglages
+                .get(RATTRAPAGE_NOMS_DE_TRI_CURSEUR)
+                .ok()
+                .flatten()
+                .and_then(|c| c.parse::<i64>().ok())
+                .unwrap_or(0);
+            let bilan = match tune_core::metadata::noms_de_tri::rattraper_par_musicbrainz(
+                &backend,
+                apres,
+                RATTRAPAGE_NOMS_DE_TRI_PAR_TOUR,
+                tune_core::metadata::noms_de_tri::interroger_la_fiche_musicbrainz,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "noms_de_tri_rattrapage_echoue");
+                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                    continue;
+                }
+            };
+            info!(
+                traitees = bilan.traitees,
+                poses = bilan.poses,
+                ecartees = bilan.ecartees,
+                pannes = bilan.pannes,
+                fin_de_liste = bilan.fin_de_liste,
+                "noms_de_tri_rattrapage_tour"
+            );
+            reglages
+                .set(
+                    RATTRAPAGE_NOMS_DE_TRI_CURSEUR,
+                    &bilan.dernier_id.to_string(),
+                )
+                .ok();
+            if bilan.fin_de_liste {
+                reglages.set(RATTRAPAGE_NOMS_DE_TRI_FAIT, "1").ok();
+                return;
+            }
+            // Une panne MusicBrainz : on laisse le limiteur se calmer.
+            let pause = if bilan.pannes > 0 { 600 } else { 5 };
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
         }
     });
 }
@@ -2568,6 +2733,47 @@ fn spawn_veille_favoris_miroir(state: &AppState) {
     });
 }
 
+/// #6463, B — délai avant la vérification des MBID d'artiste : le démarrage
+/// et les passes qui le suivent d'abord.
+const VERIFICATION_MBID_DELAI_SECS: u64 = 180;
+/// Après un tour arrêté par MusicBrainz injoignable, on retente plus tard.
+const VERIFICATION_MBID_RELANCE_SECS: u64 = 3600;
+
+/// #6463, B — la reprise des MBID d'artiste faux, en tâche de fond : une
+/// fois, jusqu'au bout de la liste, reprise après chaque arrêt. La règle et
+/// les gardes de débit, de pause et de disjoncteur sont dans
+/// `tune_core::metadata::verification_mbid_artistes` ; ici, le DROIT : la
+/// passe ne part qu'avec l'enrichissement automatique (`AutoEnrichment`),
+/// comme la descente des bios communautaires.
+fn spawn_verification_mbid_artistes(state: &AppState) {
+    let license = state.license.clone();
+    let db = state.backend.clone();
+    tokio::spawn(async move {
+        use tune_core::metadata::verification_mbid_artistes as v;
+        tokio::time::sleep(std::time::Duration::from_secs(VERIFICATION_MBID_DELAI_SECS)).await;
+        loop {
+            if v::lire_l_etat(&db).fin {
+                return;
+            }
+            if !license
+                .check_feature(tune_core::license::Feature::AutoEnrichment)
+                .await
+            {
+                info!("verification_mbid_artistes_sans_droit_d_enrichissement");
+                return;
+            }
+            let etat = v::executer_un_tour(&db, v::lire_la_fiche_musicbrainz).await;
+            if etat.fin {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                VERIFICATION_MBID_RELANCE_SECS,
+            ))
+            .await;
+        }
+    });
+}
+
 fn spawn_bio_sync(state: &AppState) {
     let license = state.license.clone();
     let db = state.backend.clone();
@@ -3600,6 +3806,21 @@ mod tests_licence_proprietaire_battement {
         );
     }
 
+    /// #6773 — sans cet appel, le rattrapage des noms de tri serait du code
+    /// mort : les artistes déjà identifiés resteraient rangés à leur prénom.
+    #[test]
+    fn le_rattrapage_des_noms_de_tri_est_lance_6773() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains(concat!("spawn_rattrapage_noms_", "de_tri(state);")),
+            "le rattrapage des noms de tri n'est plus lancé au démarrage"
+        );
+    }
+
     /// #6510 — sans cet appel, l'envoi des écoutes au compte serait du code
     /// mort : la bascule dirait « activé » et rien ne partirait jamais.
     #[test]
@@ -3618,6 +3839,21 @@ mod tests_licence_proprietaire_battement {
         );
     }
 
+    /// #6463, B — sans cet appel, la reprise des MBID faux serait du code
+    /// mort : « Christophe » et « Ange » garderaient leur MBID.
+    #[test]
+    fn la_verification_des_mbid_d_artiste_est_lancee() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains(concat!("spawn_verification_", "mbid_artistes(state);")),
+            "la vérification des MBID d'artiste n'est plus lancée au démarrage"
+        );
+    }
+
     /// #6545 — sans cet appel, le partage communautaire serait du code mort :
     /// la bascule dirait « activé » et rien ne partirait jamais.
     #[test]
@@ -3633,6 +3869,25 @@ mod tests_licence_proprietaire_battement {
                 "spawn(state.backend.clone(), state.http_client.clone());"
             )),
             "le partage communautaire n'est plus lancé au démarrage"
+        );
+    }
+
+    /// #5594 — sans cet appel, les mesures communautaires seraient du code
+    /// mort : les options diraient « activé » et rien ne partirait jamais.
+    #[test]
+    fn les_mesures_communautaires_sont_lancees() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        let corps: String = source[debut..fin].split_whitespace().collect();
+        assert!(
+            corps.contains(concat!(
+                "tune_core::cloud::mesures_communautaires::",
+                "spawn(state.backend.clone(),state.http_client.clone(),);"
+            )),
+            "les mesures communautaires ne sont plus lancées au démarrage"
         );
     }
 

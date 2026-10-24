@@ -2051,8 +2051,11 @@ fn rendre_les_verdicts(
     // Filtré sur le verdict avec perte : un débit sur un FLAC n'aurait aucun
     // sens, et un album Bandcamp ACHETÉ en lossless ne doit surtout pas
     // hériter du chiffre de l'extrait.
+    // #6821 — une radio n'a pas de fiche : son débit est celui qu'elle annonce
+    // (`icy-br`), relevé à la connexion. Même filtre : jamais sur un FLAC.
     let bitrate_label = np
         .bitrate_kbps
+        .or(source.debit_radio_kbps)
         .or(source.debit_source_kbps)
         .filter(|kbps| *kbps > 0 && !is_lossless)
         .map(|kbps| format!(" {kbps} kbit/s"))
@@ -2766,6 +2769,9 @@ struct Source<'w> {
     /// #6357 — le débit du codec mesuré par le décodeur radio (HLS), quand
     /// la lecture en cours n'en porte pas.
     debit_source_kbps: Option<u32>,
+    /// #6821 — le débit qu'une RADIO annonce (`icy-br`), relevé par la sonde.
+    /// `None` hors radio : le débit d'un fichier vient de `NowPlaying`.
+    debit_radio_kbps: Option<u32>,
 }
 
 /// The radio decoder emits 16-bit PCM and can adapt low source rates.
@@ -2850,6 +2856,7 @@ fn decrire_la_source<'w>(
             canaux_source: None,
             canaux_du_fil: None,
             dst_reconstruit_en_dsf: false,
+            debit_radio_kbps: radio.bitrate_kbps,
         };
     }
     // Verbatim proxy radios keep their existing wire/NowPlaying metadata
@@ -3022,6 +3029,7 @@ fn decrire_la_source<'w>(
             .map(|c| c as u16),
         canaux_du_fil: wire.map(|w| w.channels).filter(|c| *c > 0),
         dst_reconstruit_en_dsf: is_dsd && wire.is_some_and(|w| w.dsd_reconstruit_depuis_dst),
+        debit_radio_kbps: None,
     }
 }
 

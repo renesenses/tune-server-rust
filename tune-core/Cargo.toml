@@ -46,6 +46,14 @@ async-trait = { workspace = true }
 # Ecoute a distance par laissez-passer (#6603) : cle Ed25519 du serveur et
 # messages signes, la meme regle que le relais.
 tune-laissez-passer = { path = "../tune-laissez-passer" }
+# Ecoute a distance en direct (#6785), fonction `ecoute-directe` HORS defaut :
+# iroh entre dans l'arbre avec elle seule. Meme version EXACTE que le banc
+# `tools/p2p-mesure` (la branche 1.x d'iroh enchaine les versions). hyper,
+# hyper-util et http-body-util sont deja dans Cargo.lock (axum, reqwest).
+iroh = { version = "=1.3.0", optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 thiserror = { workspace = true }
 urlencoding = { workspace = true }
 cpal = { path = "../vendor/cpal", version = "0.17.3", optional = true }
@@ -173,6 +181,9 @@ objc2-core-audio-types = { version = "0.3", default-features = false, features =
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# Fabrique de laissez-passer (cles de TEST publiees) : tests de l'ecoute
+# directe (#6785). Jamais dans un binaire livre.
+tune-laissez-passer = { path = "../tune-laissez-passer", features = ["fabrique"] }
 axum = { workspace = true }
 # Lean criterion (no plotters/rayon) — just the bench harness.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
@@ -438,6 +449,10 @@ plugin-http = ["dep:axum"]
 asio = ["cpal/asio"]
 oaat = ["dep:oaat-core", "dep:oaat-controller"]
 cloud-relay = ["dep:tokio-tungstenite"]
+# #6785 : point d'ecoute direct (pair-a-pair, iroh) pour l'ecoute a distance
+# de SA bibliotheque. HORS defaut, et eteint a l'execution tant que le reglage
+# `ecoute_directe_active` ou `TUNE_ECOUTE_DIRECTE` ne l'allume pas.
+ecoute-directe = ["dep:iroh", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 postgres = ["dep:sqlx"]
 # Acoustic Smart Radio: CLAP audio embeddings via onnxruntime. NOT in default —
 # only builds that opt in pull `ort`, so the standard 6-target matrix is
@@ -547,6 +562,7 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_Power",
+    "Win32_System_Threading",
     # #5410 — la température des zones thermiques (compteurs PDH « Thermal
     # Zone Information »), pour la garde thermique des analyses.
     "Win32_System_Performance",

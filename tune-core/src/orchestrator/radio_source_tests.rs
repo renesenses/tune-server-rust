@@ -276,3 +276,52 @@ async fn radio_5716_la_sonde_retient_le_codec_de_la_station() {
         "un codec déjà connu n'est pas remplacé par la sonde"
     );
 }
+
+/// #6821 — la sonde relève le débit que la station ANNONCE (`icy-br`), et
+/// rien quand l'en-tête manque. Station factice locale, jamais une vraie.
+async fn debit_sonde(entete: Option<&'static str>) -> Option<u32> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/station.wav", listener.local_addr().unwrap());
+    let corps = wav_a(44_100);
+    let app = axum::Router::new().route(
+        "/{file}",
+        axum::routing::get(move || async move {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert("content-type", "application/octet-stream".parse().unwrap());
+            if let Some(v) = entete {
+                h.insert("icy-br", v.parse().unwrap());
+            }
+            (h, corps)
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let debit = tokio::task::spawn_blocking(move || {
+        sonder_la_station(&url).unwrap().source_info.bitrate_kbps
+    })
+    .await
+    .unwrap();
+    server.abort();
+    debit
+}
+
+#[tokio::test]
+async fn radio_6821_la_sonde_releve_le_debit_annonce() {
+    assert_eq!(debit_sonde(Some("128")).await, Some(128));
+    assert_eq!(debit_sonde(Some("192,192")).await, Some(192));
+    assert_eq!(
+        debit_sonde(None).await,
+        None,
+        "sans en-tête, aucun débit inventé"
+    );
+    assert_eq!(debit_sonde(Some("haut")).await, None);
+}
+
+#[test]
+fn radio_6821_lecture_de_l_entete_icy_br() {
+    assert_eq!(debit_icy("128"), Some(128));
+    assert_eq!(debit_icy(" 64 "), Some(64));
+    assert_eq!(debit_icy("320,320"), Some(320));
+    for illisible in ["", "0", "-128", "128k", "abc", "99999"] {
+        assert_eq!(debit_icy(illisible), None, "« {illisible} »");
+    }
+}

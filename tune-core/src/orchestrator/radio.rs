@@ -546,6 +546,17 @@ fn se_connecter_et_sonder(etat: &mut EtatRadio, url: &str) -> Result<Sonde, Suit
     }
 }
 
+/// #6821 — lit l'en-tête `icy-br` d'une station Icecast/Shoutcast : un débit
+/// en kbit/s (`128`). Certains serveurs en répètent plusieurs, séparés par
+/// une virgule (`128,128`) : seul le premier compte. Toute autre forme, zéro,
+/// ou un chiffre hors de toute radio réelle (au-delà de 10 000 kbit/s) rend
+/// `None` : un débit qu'on ne sait pas lire ne s'affiche pas.
+pub(crate) fn debit_icy(valeur: &str) -> Option<u32> {
+    let premier = valeur.split(',').next()?.trim();
+    let kbps: u32 = premier.parse().ok()?;
+    (1..=10_000).contains(&kbps).then_some(kbps)
+}
+
 /// Le GET, les contrôles de type, la sonde Symphonia et le décodeur : le
 /// texte de la fermeture `setup` d'origine, tel quel.
 fn sonder_la_station(url: &str) -> Result<Sonde, String> {
@@ -588,6 +599,13 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
             "{RADIO_NOT_AUDIO}: le serveur a répondu « {bad} » au lieu d'un flux audio"
         ));
     }
+    // #6821 — le débit que la station annonce (`icy-br`), lu AVANT que la
+    // réponse ne soit livrée au décodeur.
+    let debit_annonce = response
+        .headers()
+        .get("icy-br")
+        .and_then(|v| v.to_str().ok())
+        .and_then(debit_icy);
     info!(url = %url, content_type = %content_type, "radio_local_decode_stream_connected");
 
     // #6357 — une URL sans extension peut servir une liste HLS : sous son
@@ -655,7 +673,9 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
 
     // Opus : libopus, symphonia ne le décode pas (voir `radio_ogg`).
     let decoder = radio_ogg::DecodeurRadio::pour(&audio_params)?;
-    let source_info = source_info_de(&audio_params);
+    let mut source_info = source_info_de(&audio_params);
+    // #6821 — le débit annoncé par la station, lu à la connexion.
+    source_info.bitrate_kbps = debit_annonce;
 
     Ok(Sonde {
         source_info,

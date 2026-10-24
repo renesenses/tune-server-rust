@@ -76,6 +76,10 @@ pub struct RadioSourceInfo {
     pub profil: Option<&'static str>,
     /// #6357 — le débit du codec, mesuré sur les trames (kbit/s).
     pub debit_kbps: Option<u32>,
+    /// #6821 — le débit que la station ANNONCE dans son en-tête `icy-br`
+    /// (kbit/s), lu à la connexion. `None` : en-tête absent ou illisible —
+    /// rien n'est déduit du conteneur ni de la fréquence.
+    pub bitrate_kbps: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]

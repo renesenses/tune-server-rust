@@ -2217,7 +2217,8 @@ async fn spawn_library_scan_avec_lecteur_par(
             tracing::info!(
                 deja_pourvues = deja_pourvues.len(),
                 "scan_rattrapage_metadonnees_etendues — un fichier inchangé n'est rouvert pour \
-                 ses métadonnées étendues que s'il n'en a AUCUNE (#5043)"
+                 ses métadonnées étendues que s'il n'en a AUCUNE, ou pas encore la balise \
+                 ARTIST (#5043, #6781)"
             );
         }
 

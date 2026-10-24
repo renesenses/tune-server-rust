@@ -94,6 +94,11 @@ pub(super) enum FinDeChaine {
     SuivanteRefusee,
     /// La suivante a un autre format : il faut rouvrir le périphérique.
     FormatDifferent,
+    /// #6842 — le puits est mort : le rappel de rendu ne draine plus
+    /// l'anneau (cinq secondes sans qu'un mot ne parte). La lecture s'arrête
+    /// ICI, au lieu de lire le reste du flux dans le vide, et le bras doit
+    /// rapporter la famine (`record_feed_stall_failure`).
+    PuitsMort,
 }
 
 /// Le bilan de la chaîne, pour la fin du bras.
@@ -114,33 +119,58 @@ enum LectureDePiste {
     FinDeFlux,
     Interrompue,
     Erreur,
+    /// #6842 — le puits a refusé un bloc : plus rien ne part.
+    PuitsMort,
 }
 
-/// Décode `octets`, pousse, publie le verdict ; rend les trames consommées.
+/// Ce qu'une poussée a donné : les trames consommées, et si le puits vit
+/// encore.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+struct Pousse {
+    trames: u64,
+    vivant: bool,
+}
+
+/// Décode `octets`, pousse, publie le verdict ; rend les trames consommées
+/// et le verdict du puits.
+///
+/// #6842 — un puits mort n'est plus traité comme une poussée : c'était la
+/// « famine muette » de la carte §1.2, conservée par REF-8. La boucle
+/// s'arrête sur ce verdict.
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn pousser<H: HoteDeChaineNative>(
     hote: &mut H,
     etage: &mut EtageNatif<'_>,
     puits: &mut dyn PuitsNatif,
     octets: &[u8],
-) -> u64 {
-    // Un puits mort est traité comme une poussée : le bras ignorait déjà ce
-    // verdict (« famine muette » de la carte §1.2, conservée telle quelle).
+) -> Pousse {
     match etage.decoder_et_pousser(octets, puits) {
         EcritureNative::Poussee {
             trames_source,
             dop,
             bit_perfect,
+        } => {
+            hote.publier_le_verdict(dop, bit_perfect);
+            Pousse {
+                trames: trames_source,
+                vivant: true,
+            }
         }
-        | EcritureNative::PuitsMort {
+        EcritureNative::PuitsMort {
             trames_source,
             dop,
             bit_perfect,
         } => {
             hote.publier_le_verdict(dop, bit_perfect);
-            trames_source
+            Pousse {
+                trames: trames_source,
+                vivant: false,
+            }
         }
-        EcritureNative::RienAPousser => 0,
+        EcritureNative::RienAPousser => Pousse {
+            trames: 0,
+            vivant: true,
+        },
     }
 }
 
@@ -167,9 +197,17 @@ fn lire_la_piste<H: HoteDeChaineNative>(
         match lecteur.read(tampon) {
             Ok(0) => return LectureDePiste::FinDeFlux,
             Ok(n) => {
-                *trames += pousser(hote, etage, puits, &tampon[..n]);
+                let pousse = pousser(hote, etage, puits, &tampon[..n]);
+                *trames += pousse.trames;
                 let position = (*trames as f64 / cadence as f64 * 1000.0) as u64 + seek_offset;
                 hote.publier_la_position(position);
+                if !pousse.vivant {
+                    warn!(
+                        position_ms = position,
+                        "local_audio_native_chain_stopped_feed_stall"
+                    );
+                    return LectureDePiste::PuitsMort;
+                }
             }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::TimedOut
@@ -225,6 +263,10 @@ pub(super) fn jouer_la_chaine_native<H: HoteDeChaineNative>(
             LectureDePiste::Interrompue => {
                 return issue(FinDeChaine::Interrompue, false, trames, pistes_enchainees);
             }
+            // #6842 — ni reliquat, ni suivante : rien n'atteindrait le DAC.
+            LectureDePiste::PuitsMort => {
+                return issue(FinDeChaine::PuitsMort, false, trames, pistes_enchainees);
+            }
             LectureDePiste::Erreur => {
                 forcer_le_reliquat(etage, puits, &mut trames);
                 return issue(FinDeChaine::LectureEchouee, true, trames, pistes_enchainees);
@@ -238,7 +280,11 @@ pub(super) fn jouer_la_chaine_native<H: HoteDeChaineNative>(
         };
         pistes_enchainees += 1;
         seek_offset = 0;
-        trames = pousser(hote, etage, puits, entete.amorce());
+        let pousse = pousser(hote, etage, puits, entete.amorce());
+        trames = pousse.trames;
+        if !pousse.vivant {
+            return issue(FinDeChaine::PuitsMort, false, trames, pistes_enchainees);
+        }
         lecteur = suivant;
     }
 }
@@ -422,6 +468,69 @@ impl ReserveDeLaChaine for ReserveHttp<'_> {
         self.position_ms.store(0, Ordering::SeqCst);
         if self.dop_active.swap(false, Ordering::SeqCst) {
             sync_volume_to_dop(self.volume, self.user_volume, self.rg_factor, false);
+        }
+    }
+}
+
+/// #6842 — comment s'est fini un vidage borné ([`attendre_le_vidage`]).
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+// Seul le bras WASAPI (Windows) s'en sert hors des témoins.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FinDuVidage {
+    /// L'anneau est vide : tout est parti vers le DAC.
+    Vide,
+    /// Arrêt demandé ou silence forcé.
+    Interrompu,
+    /// La borne calculée par `drain_deadline_for` est atteinte.
+    BorneAtteinte { restant: usize },
+    /// Plus aucun mot n'est parti depuis `sans_progres` : le rappel de rendu
+    /// est mort (#3108).
+    SansProgres { restant: usize },
+}
+
+/// #6842 — le vidage BORNÉ d'un anneau natif, tel que le bras ASIO le fait
+/// depuis REF-8 : il s'arrête sur l'anneau vide, sur un arrêt, sur la borne,
+/// ou quand plus rien ne part pendant `sans_progres`. Le temps passé en pause
+/// ne compte ni dans la borne ni dans l'absence de progrès : un rappel en
+/// pause ne draine pas, il n'est pas mort.
+///
+/// Générique sur l'anneau (des fermetures) pour être jugé sur Linux, alors que
+/// le bras WASAPI, son appelant, ne se compile que sous Windows.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(super) fn attendre_le_vidage(
+    mut disponible: impl FnMut() -> usize,
+    mut interrompre: impl FnMut() -> bool,
+    mut en_pause: impl FnMut() -> bool,
+    borne: std::time::Duration,
+    sans_progres: std::time::Duration,
+    pas: std::time::Duration,
+) -> FinDuVidage {
+    let mut ecoule = std::time::Duration::ZERO;
+    let mut immobile = std::time::Duration::ZERO;
+    let mut dernier = disponible();
+    loop {
+        if interrompre() {
+            return FinDuVidage::Interrompu;
+        }
+        let restant = disponible();
+        if restant == 0 {
+            return FinDuVidage::Vide;
+        }
+        if restant < dernier {
+            dernier = restant;
+            immobile = std::time::Duration::ZERO;
+        } else if immobile >= sans_progres {
+            return FinDuVidage::SansProgres { restant };
+        }
+        if ecoule >= borne {
+            return FinDuVidage::BorneAtteinte { restant };
+        }
+        std::thread::sleep(pas);
+        if !en_pause() {
+            ecoule += pas;
+            immobile += pas;
         }
     }
 }

@@ -2746,6 +2746,11 @@ pub enum GainSource {
     /// (#5519), faute de tout ReplayGain : voir [`gain_approche`]. Une
     /// mesure réelle (tag ou analyse) le remplace dès qu'elle existe.
     FooDrApprox,
+    /// Reçu de la communauté (#5594) : mesuré par au moins deux autres
+    /// installations sur le MÊME signal PCM (clé FLAC exacte), avec la même
+    /// version d'algorithme. Ne comble qu'un vide ; une mesure locale ou un
+    /// tag ne sont jamais remplacés.
+    Community,
 }
 
 impl GainSource {
@@ -2755,6 +2760,7 @@ impl GainSource {
             Self::FileTags => "file_tags",
             Self::Analysis => "analysis",
             Self::FooDrApprox => "foo_dr_approx",
+            Self::Community => "community",
         }
     }
 
@@ -2764,6 +2770,7 @@ impl GainSource {
             Self::FileTags => "tags du fichier",
             Self::Analysis => "analyse Tune",
             Self::FooDrApprox => "approché (foo_dr)",
+            Self::Community => "communauté (mesure partagée)",
         }
     }
 }
@@ -3142,6 +3149,14 @@ fn gain_source_from_meta(
         .is_some_and(|v| v.trim() == SOURCE_ANALYSIS)
     {
         return Some(GainSource::Analysis);
+    }
+    // #5594 — une valeur reçue de la communauté le dit : la prendre pour un
+    // tag du fichier serait un affichage inventé.
+    if meta
+        .get(source_key)
+        .is_some_and(|v| v.trim() == crate::cloud::mesures_communautaires::SOURCE_COMMUNAUTE)
+    {
+        return Some(GainSource::Community);
     }
     // Repli pour les bibliothèques analysées AVANT que ce témoin existe — la
     // quasi-totalité du parc installé. La passe n'analyse QUE les pistes

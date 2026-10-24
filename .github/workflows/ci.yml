@@ -784,8 +784,10 @@ jobs:
       # les tests de tune-server. Garde : toute_feature_declaree_est_activee_par_une_porte_clippy.
       # #5512 : `isolement-disque-de-test` (tune-core), même motif que `journal-de-test`.
       # #6336 : `services-factices` (tune-core), même motif : substituts de test seulement.
-      # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst","journal-de-test","isolement-disque-de-test","services-factices"],"packages":"workspace"}
-      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-laissez-passer -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle -p tune-assistant-ia --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,journal-de-test,isolement-disque-de-test,services-factices,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia -- -D clippy::correctness
+      # #6785 : `ecoute-directe` (tune-core, tune-server), HORS défaut : le P2P n'est
+      # dans aucun binaire livré ; nommé ici pour que la porte lise son code.
+      # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst","journal-de-test","isolement-disque-de-test","services-factices","ecoute-directe"],"packages":"workspace"}
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-laissez-passer -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle -p tune-assistant-ia --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,journal-de-test,isolement-disque-de-test,services-factices,ecoute-directe,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia -- -D clippy::correctness
 
   audit:
     name: Security Audit
