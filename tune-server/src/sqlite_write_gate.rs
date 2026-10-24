@@ -90,7 +90,21 @@ pub(crate) fn ceder_le_lot(
     porte: &mut Option<MutexGuard<'static, ()>>,
     etiquette: &'static str,
 ) -> bool {
-    if porte.is_none() || !file_en_attente() {
+    ceder_le_lot_si(db, porte, etiquette, file_en_attente())
+}
+
+/// [`ceder_le_lot`], la lecture du compteur global d'attente mise à part.
+///
+/// Les tests passent `file_attend` eux-mêmes : le compteur est partagé par
+/// tout le processus, et un test voisin qui écrit une file l'incrémente à
+/// tout moment (rouge intermittent de `sans_file_en_attente_..._190`).
+pub(crate) fn ceder_le_lot_si(
+    db: &dyn tune_core::db::backend::DbBackend,
+    porte: &mut Option<MutexGuard<'static, ()>>,
+    etiquette: &'static str,
+    file_attend: bool,
+) -> bool {
+    if porte.is_none() || !file_attend {
         return db.ceder_aux_ecrivains();
     }
     let debut = Instant::now();
