@@ -424,6 +424,17 @@ pub(super) async fn get_config(
             tune_core::cloud::notes_communautaires::CLE_PARTAGE,
             json!(tune_core::cloud::notes_communautaires::PARTAGE_DEFAUT),
         ),
+        // #5594 — les résultats d'analyse de la communauté : RECEVOIR et
+        // CONTRIBUER, deux opt-in STRICTS et séparés, publiés avec leur
+        // défaut pour que le client distingue « éteint » de « pas lu ».
+        (
+            tune_core::cloud::mesures_communautaires::CLE_RECEPTION,
+            json!(tune_core::cloud::mesures_communautaires::RECEPTION_DEFAUT),
+        ),
+        (
+            tune_core::cloud::mesures_communautaires::CLE_CONTRIBUTION,
+            json!(tune_core::cloud::mesures_communautaires::CONTRIBUTION_DEFAUT),
+        ),
         ("quality_split", json!(true)),
         // Fil 2148 (#5792) — le délai de la sonde des partages réseau.
         (
@@ -1232,6 +1243,32 @@ fn normaliser_vitesse_des_analyses(
     Ok(())
 }
 
+/// #5594 — les deux options des mesures communautaires : un booléen (ou
+/// `"true"`/`"false"`), sinon 400. Une autre valeur, gardée telle quelle, se
+/// relirait « non » sans un mot — et un opt-in ne se devine pas.
+fn normaliser_mesures_communautaires(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<(), AppError> {
+    use tune_core::cloud::mesures_communautaires::{CLE_CONTRIBUTION, CLE_RECEPTION};
+    for cle in [CLE_RECEPTION, CLE_CONTRIBUTION] {
+        let Some(brut) = values.get(cle) else {
+            continue;
+        };
+        let valeur = match brut {
+            Value::Bool(b) => *b,
+            Value::String(s) if s.trim() == "true" => true,
+            Value::String(s) if s.trim() == "false" => false,
+            autre => {
+                return Err(AppError::bad_request(format!(
+                    "{cle} : un booléen est attendu, reçu {autre}"
+                )));
+            }
+        };
+        values.insert(cle.to_string(), json!(valeur));
+    }
+    Ok(())
+}
+
 /// #4681 — la politique de cession à la lecture : un objet dont chaque champ
 /// est borné (voir `tune_core::taches_de_fond::priorite::politique`). Un champ
 /// absent prend sa valeur par défaut, `null` remet tout par défaut ; un champ
@@ -1490,6 +1527,7 @@ pub(super) async fn update_config(
     normaliser_plafond_aleatoire(&mut values)?;
     normaliser_pays_tendances_youtube(&mut values)?;
     normaliser_vitesse_des_analyses(&mut values)?;
+    normaliser_mesures_communautaires(&mut values)?;
     let politique_de_lecture = normaliser_politique_de_lecture(&mut values)?;
     let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
     normaliser_genres_du_clap(&mut values)?;
@@ -5709,6 +5747,50 @@ mod vitesse_des_analyses_5519_tests {
         let mut vide = serde_json::Map::new();
         assert!(normaliser_vitesse_des_analyses(&mut vide).is_ok());
         assert!(vide.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mesures_communautaires_5594_tests {
+    use super::{get_config, normaliser_mesures_communautaires};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::cloud::mesures_communautaires::{CLE_CONTRIBUTION, CLE_RECEPTION};
+
+    /// #5594 — les deux options sont publiées DÉSACTIVÉES sur une base neuve.
+    #[tokio::test]
+    async fn les_deux_options_sont_publiees_desactivees() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0;
+        assert_eq!(c[CLE_RECEPTION], false, "{c}");
+        assert_eq!(c[CLE_CONTRIBUTION], false, "{c}");
+    }
+
+    #[test]
+    fn seul_un_booleen_est_admis() {
+        for cle in [CLE_RECEPTION, CLE_CONTRIBUTION] {
+            let mut ok: serde_json::Map<String, Value> =
+                json!({ cle: "true" }).as_object().unwrap().clone();
+            assert!(normaliser_mesures_communautaires(&mut ok).is_ok());
+            assert_eq!(ok[cle], json!(true));
+            for mauvais in [json!("oui"), json!(1), json!(null)] {
+                let mut v: serde_json::Map<String, Value> =
+                    json!({ cle: mauvais }).as_object().unwrap().clone();
+                assert!(
+                    normaliser_mesures_communautaires(&mut v).is_err(),
+                    "{cle} {mauvais}"
+                );
+            }
+        }
     }
 }
 

@@ -368,3 +368,134 @@ fn le_meme_appareil_garde_pure_volume_fixe_et_trim() {
         Some("4")
     );
 }
+
+// ---------------------------------------------------------------------------
+// #6774 — décision de Bertrand du 23/10 : sans limite de confort, ni de
+// sécurité, ni mémoire du volume fixe, le désarmement ramène la zone à 30 %
+// du CURSEUR au plus, jamais relevée.
+// ---------------------------------------------------------------------------
+
+/// 🔴 avant / 🟢 après : PURE verrouillé à 100 % sans aucun repère — la zone
+/// repart de 30 % (appareil réseau : 30 sur son échelle), pas de 100 %.
+#[test]
+fn pure_verrouille_sans_repere_repart_de_30_pour_cent() {
+    let (repo, db) = repo();
+    let id = repo.create("Salon", Some("dlna"), Some("uuid:a")).unwrap();
+    repo.update_volume(id, 100.0).unwrap();
+    poser_pure_verrouille(&db, id);
+    repo.update_output_device(id, "uuid:b").unwrap();
+    assert!(!pure_force(&db, id));
+    assert_eq!(
+        volume(&repo, id),
+        30.0,
+        "#6774 : sans limite ni mémoire, PURE désarmé laisse la zone à 100 % du nouvel appareil"
+    );
+}
+
+/// Volume fixe armé SANS mémoire d'avant l'armement : 30 % aussi.
+#[test]
+fn volume_fixe_sans_memoire_repart_de_30_pour_cent() {
+    let (repo, _db) = repo();
+    let id = repo.create("Salon", Some("dlna"), Some("uuid:a")).unwrap();
+    repo.update_volume(id, 100.0).unwrap();
+    repo.update_fixed_volume(id, true).unwrap();
+    repo.update_output_device(id, "uuid:b").unwrap();
+    assert!(!repo.get(id).unwrap().unwrap().fixed_volume);
+    assert_eq!(volume(&repo, id), 30.0);
+}
+
+/// Jamais relevée : une zone à 12 % reste à 12 %.
+#[test]
+fn sans_repere_une_zone_plus_basse_n_est_jamais_relevee() {
+    let (repo, db) = repo();
+    let id = repo.create("Salon", Some("dlna"), Some("uuid:a")).unwrap();
+    repo.update_volume(id, 12.0).unwrap();
+    poser_pure_verrouille(&db, id);
+    repo.update_output_device(id, "uuid:b").unwrap();
+    assert_eq!(volume(&repo, id), 12.0);
+}
+
+/// Une limite présente garde la règle du 22/10 : le plus bas des repères,
+/// même au-dessus de 30 %.
+#[test]
+fn avec_une_limite_la_regle_du_22_10_reste() {
+    let (repo, db) = repo();
+    let id = repo.create("Salon", Some("dlna"), Some("uuid:a")).unwrap();
+    repo.update_volume(id, 100.0).unwrap();
+    poser_pure_verrouille(&db, id);
+    SettingsRepo::with_backend(db.clone())
+        .set(&format!("zone_{id}_volume_limit_safety"), "0.6")
+        .unwrap();
+    repo.update_output_device(id, "uuid:b").unwrap();
+    assert_eq!(volume(&repo, id), 60.0);
+}
+
+/// Sortie LOCALE (curseur `db60`, #6787) : 30 % du CURSEUR, soit −42 dB de
+/// gain — pas 30 % de gain (−10,5 dB). Le curseur relu vaut 30 % au plus.
+#[test]
+fn sur_une_sortie_locale_30_pour_cent_du_curseur_db60() {
+    use crate::audio::volume_scale::EchelleDeVolume::Perceptive;
+    let (repo, db) = repo();
+    let id = repo
+        .create("Bureau", Some("local"), Some("local:DAC A"))
+        .unwrap();
+    repo.update_volume(id, 100.0).unwrap();
+    poser_pure_verrouille(&db, id);
+    repo.update_output_device(id, "local:DAC B").unwrap();
+    let gain = volume(&repo, id) / 100.0;
+    let db_rendu = crate::audio::volume_scale::linear_to_db(gain).unwrap();
+    assert!(
+        (db_rendu + 42.0).abs() < 1e-6,
+        "#6774 : 30 % du curseur db60 = −42 dB, reçu {db_rendu} dB"
+    );
+    assert!(Perceptive.position(gain) <= 0.30 + 1e-12);
+}
+
+/// Réseau → local, ou local → réseau : au moment du changement, l'échelle
+/// retenue est la plus basse des deux (`output_type` n'est pas encore
+/// réécrit) — jamais plus de 30 % du curseur de la nouvelle sortie.
+#[test]
+fn le_plafond_retient_l_echelle_la_plus_basse_des_deux_sorties() {
+    use crate::audio::reglages_de_volume::plafond_sans_repere;
+    let db60 = crate::audio::volume_scale::gain_perceptif(0.30);
+    assert_eq!(plafond_sans_repere(Some("dlna"), "uuid:b"), 0.30);
+    assert_eq!(plafond_sans_repere(Some("dlna"), "local:DAC"), db60);
+    assert_eq!(plafond_sans_repere(Some("local"), "uuid:b"), db60);
+    assert_eq!(plafond_sans_repere(Some("local"), "local:DAC"), db60);
+    assert_eq!(plafond_sans_repere(None, "browser:1"), db60);
+
+    // Par le dépôt : une zone réseau à 100 % sous PURE qui passe sur une
+    // sortie locale repart de −42 dB, pas de 30 % de gain.
+    let (repo, db) = repo();
+    let id = repo.create("Salon", Some("dlna"), Some("uuid:a")).unwrap();
+    repo.update_volume(id, 100.0).unwrap();
+    poser_pure_verrouille(&db, id);
+    repo.update_output_device(id, "local:DAC").unwrap();
+    repo.update_output_type(id, "local").unwrap();
+    assert!((volume(&repo, id) - db60 * 100.0).abs() < 1e-9);
+}
+
+/// #6787 (b) — une zone locale à 5 % de gain (curseur `db60` 57 %, −26 dB)
+/// passe sur un appareil réseau : l'appareil repart de 5 sur son échelle, au
+/// même dB nominal, et non de 57. `volume` est un gain : rien à convertir.
+#[test]
+fn une_zone_locale_passee_sur_un_appareil_reseau_ne_monte_pas_6787() {
+    use crate::audio::volume_scale::EchelleDeVolume;
+    let (repo, _db) = repo();
+    let id = repo
+        .create("Bureau", Some("local"), Some("local:DAC A"))
+        .unwrap();
+    repo.update_volume(id, 5.0).unwrap();
+    let curseur_avant = EchelleDeVolume::Perceptive.position(0.05);
+    assert!(curseur_avant > 0.56, "{curseur_avant}");
+    repo.update_output_device(id, "uuid:renderer").unwrap();
+    repo.update_output_type(id, "dlna").unwrap();
+    let zone = repo.get(id).unwrap().unwrap();
+    assert_eq!(
+        zone.volume, 5.0,
+        "(b) l'appareil réseau doit repartir de 5, pas du curseur 57"
+    );
+    let echelle = EchelleDeVolume::de_la_sortie(zone.output_type.as_deref());
+    assert_eq!(echelle, EchelleDeVolume::Lineaire);
+    assert!(echelle.position(zone.volume / 100.0) <= 0.05 + 1e-12);
+}
