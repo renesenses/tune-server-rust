@@ -26,6 +26,61 @@ pub const SOURCE_TRI_MUSICBRAINZ: &str = "musicbrainz";
 /// une balise, MusicBrainz ou une saisie le remplacent.
 pub const SOURCE_TRI_DEDUIT: &str = "deduit";
 
+/// #6463 (décision de Bertrand du 23/10, A) — d'où vient le MBID d'un
+/// artiste : `artists.musicbrainz_id_source`. NULL : inconnue, c'est-à-dire
+/// tout MBID posé avant la migration 133.
+///
+/// Un MBID [`ProvenanceMbid::Manuel`] — saisi dans la fiche, ou retiré par
+/// « Détacher l'identité » — n'est plus jamais retiré, remplacé ni reposé
+/// d'office : toutes les écritures automatiques le gardent dans leur `WHERE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvenanceMbid {
+    /// Lu dans les fichiers au scan (`MUSICBRAINZ_ALBUMARTISTID`,
+    /// `MUSICBRAINZ_ARTISTID`).
+    Balise,
+    /// Trouvé par une recherche MusicBrainz du nom.
+    Nom,
+    /// Tiré des crédits d'un pressage (ou d'un enregistrement) identifié.
+    Pressage,
+    /// Saisi, ou détaché, par l'utilisateur.
+    Manuel,
+}
+
+impl ProvenanceMbid {
+    /// Le mot rangé en base et servi par l'API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProvenanceMbid::Balise => "balise",
+            ProvenanceMbid::Nom => "nom",
+            ProvenanceMbid::Pressage => "pressage",
+            ProvenanceMbid::Manuel => "manuel",
+        }
+    }
+
+    /// Lit le mot rangé en base ; `None` pour NULL ou un mot inconnu.
+    pub fn depuis_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "balise" => Some(ProvenanceMbid::Balise),
+            "nom" => Some(ProvenanceMbid::Nom),
+            "pressage" => Some(ProvenanceMbid::Pressage),
+            "manuel" => Some(ProvenanceMbid::Manuel),
+            _ => None,
+        }
+    }
+}
+
+/// La garde que toute écriture AUTOMATIQUE du MBID porte dans son `WHERE`
+/// (#6463) : une fiche dont l'utilisateur a saisi ou détaché le MBID ne se
+/// touche plus.
+pub const PAS_UN_MBID_MANUEL: &str = "COALESCE(musicbrainz_id_source, '') <> 'manuel'";
+
+/// Les sources d'IMAGE rattachées au MBID : la cascade de la phase 2
+/// (`auto` : Fanart, TheAudioDB, MusicBrainz/Wikidata, par MBID) et le fonds
+/// communautaire (`community`, indexé par MBID). Un MBID retiré emporte ces
+/// images ; une image locale, téléversée, ou trouvée par le nom (Discogs,
+/// Last.fm, Roon) reste (#6463).
+pub const SOURCES_D_IMAGE_DU_MBID: &str = "'auto', 'community'";
+
 /// tune-server-rust#6474 — le nom de tri à donner à l'ARTISTE D'ALBUM lu
 /// dans un fichier : ALBUMARTISTSORT s'il est écrit ; sinon l'ARTISTSORT de
 /// la piste, mais seulement quand la piste est de ce même artiste (même nom,
@@ -149,12 +204,15 @@ pub mod sql {
         )
     }
 
+    /// #6463 — la provenance du MBID part avec lui (`balise` : seul le scan
+    /// crée une fiche avec un MBID).
     pub fn create_minimal<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO artists (name, sort_name, musicbrainz_id) VALUES ({}, {}, {})",
+            "INSERT INTO artists (name, sort_name, musicbrainz_id, musicbrainz_id_source) VALUES ({}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
-            d.placeholder(3)
+            d.placeholder(3),
+            d.placeholder(4)
         )
     }
 
@@ -163,11 +221,25 @@ pub mod sql {
     /// provenance repasse à NULL. Inchangé, il garde la sienne. Le membre
     /// droit d'un `SET` lit l'ANCIENNE ligne, sur SQLite comme sur
     /// PostgreSQL.
+    ///
+    /// #6463 — le MBID d'une fiche `manuel` ne bouge pas ici : `update` sert
+    /// au scan (image locale), au renommage et à la fiche, qui réécrivent la
+    /// fiche ENTIÈRE à partir d'une lecture parfois ancienne. Seule
+    /// [`super::ArtistRepo::poser_mbid_manuel`] écrit un MBID saisi. Un MBID
+    /// CHANGÉ par cette écriture perd sa provenance (NULL : inconnue) ;
+    /// inchangé, il la garde.
     pub fn update<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE artists SET name = {}, sort_name = {}, musicbrainz_id = {}, discogs_id = {}, bio = {}, image_path = {}, image_source = {}, \
+            "UPDATE artists SET name = {}, sort_name = {}, \
+             musicbrainz_id = CASE WHEN COALESCE(musicbrainz_id_source, '') = 'manuel' \
+                                   THEN musicbrainz_id ELSE {} END, \
+             discogs_id = {}, bio = {}, image_path = {}, image_source = {}, \
              sort_name_source = CASE WHEN COALESCE(sort_name, '') = COALESCE({}, '') \
-                                     THEN sort_name_source ELSE NULL END \
+                                     THEN sort_name_source ELSE NULL END, \
+             musicbrainz_id_source = CASE WHEN COALESCE(musicbrainz_id_source, '') = 'manuel' \
+                                          THEN musicbrainz_id_source \
+                                          WHEN COALESCE(musicbrainz_id, '') = COALESCE({}, '') \
+                                          THEN musicbrainz_id_source ELSE NULL END \
              WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2),
@@ -177,7 +249,60 @@ pub mod sql {
             d.placeholder(6),
             d.placeholder(7),
             d.placeholder(8),
-            d.placeholder(9)
+            d.placeholder(9),
+            d.placeholder(10)
+        )
+    }
+
+    /// #6463 — le MBID saisi (ou retiré) par l'utilisateur, marqué `manuel`.
+    pub fn poser_mbid_manuel<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET musicbrainz_id = {}, musicbrainz_id_source = 'manuel' WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    /// #6463 — la provenance du MBID d'un artiste.
+    pub fn provenance_du_mbid<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT musicbrainz_id_source FROM artists WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    /// #6463, B — retire un MBID que la vérification MusicBrainz a jugé
+    /// faux. Gardé dans la requête : la fiche porte TOUJOURS ce MBID (rien
+    /// n'est retiré s'il a changé depuis la lecture), et sa provenance n'est
+    /// ni `manuel` ni `balise` ni `pressage` — seulement inconnue ou `nom`.
+    pub fn retirer_le_mbid_verifie<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET musicbrainz_id = NULL, musicbrainz_id_source = NULL \
+             WHERE id = {} AND LOWER(TRIM(COALESCE(musicbrainz_id, ''))) = LOWER(TRIM({})) \
+               AND (musicbrainz_id_source IS NULL OR musicbrainz_id_source = 'nom')",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    /// #6463 — l'image rattachée au MBID retiré ([`super::SOURCES_D_IMAGE_DU_MBID`]).
+    pub fn oublier_l_image_du_mbid<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET image_path = NULL, image_source = NULL \
+             WHERE id = {} AND image_source IN ({})",
+            d.placeholder(1),
+            super::SOURCES_D_IMAGE_DU_MBID
+        )
+    }
+
+    /// #6463 — la biographie rapportée par l'enrichissement (une provenance
+    /// est rangée avec elle). Une bio saisie, sans provenance, reste.
+    pub fn oublier_la_bio_du_mbid<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET bio = NULL, bio_source = NULL, bio_source_url = NULL, \
+             bio_license = NULL, bio_lang = NULL, bio_fetched_at = NULL \
+             WHERE id = {} AND TRIM(COALESCE(bio_source, '')) <> ''",
+            d.placeholder(1)
         )
     }
 
@@ -256,8 +381,11 @@ pub mod sql {
         "SELECT id, name, COALESCE(musicbrainz_id, '') FROM artists ORDER BY id"
     }
 
+    /// Les artistes sans MBID à chercher par le nom. #6463 : un artiste dont
+    /// l'utilisateur a détaché l'identité (`manuel`) n'y est plus.
     pub fn list_without_mbid() -> &'static str {
-        "SELECT id, name FROM artists WHERE (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
+        "SELECT id, name FROM artists WHERE (musicbrainz_id IS NULL OR musicbrainz_id = '') \
+         AND COALESCE(musicbrainz_id_source, '') <> 'manuel' ORDER BY id"
     }
 
     pub fn list_with_image_no_mbid() -> &'static str {
@@ -374,11 +502,17 @@ pub mod sql {
     /// n'en gardait aucun. D'une passe à l'autre, `artists_without_mbid` ne
     /// bougeait pas et les artistes n'atteignaient jamais les sources d'images
     /// indexées par MBID (Fanart, TheAudioDB, MusicBrainz/Wikidata).
+    ///
+    /// #6463 — la provenance est écrite avec le MBID (emplacement 2), et une
+    /// fiche `manuel` n'est jamais touchée.
     pub fn update_mbid<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE artists SET musicbrainz_id = {} WHERE id = {}",
+            "UPDATE artists SET musicbrainz_id = {}, musicbrainz_id_source = {} WHERE id = {} \
+             AND {}",
             d.placeholder(1),
-            d.placeholder(2)
+            d.placeholder(2),
+            d.placeholder(3),
+            super::PAS_UN_MBID_MANUEL
         )
     }
 
@@ -622,7 +756,9 @@ impl ArtistRepo {
             return self.completer_sort_name(existant, sort_name);
         }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
-        let params: [&dyn ToSqlValue; 3] = [&name, &sort_name, &musicbrainz_id];
+        // #6463 — un MBID reçu ici vient des balises du fichier.
+        let provenance = musicbrainz_id.map(|_| ProvenanceMbid::Balise.as_str());
+        let params: [&dyn ToSqlValue; 4] = [&name, &sort_name, &musicbrainz_id, &provenance];
         let id = self.db.execute_returning_id(&create_sql, &params)?;
         Ok(Artist {
             id: Some(id),
@@ -722,7 +858,7 @@ impl ArtistRepo {
         let id = artist.id.ok_or("artist has no id")?;
         let sql = self.dialect_sql(sql::update, sql::update);
         let musicbrainz_id = usable_musicbrainz_id(artist.musicbrainz_id.as_deref());
-        let params: [&dyn ToSqlValue; 9] = [
+        let params: [&dyn ToSqlValue; 10] = [
             &artist.name,
             &artist.sort_name,
             &musicbrainz_id,
@@ -731,6 +867,7 @@ impl ArtistRepo {
             &artist.image_path,
             &artist.image_source,
             &artist.sort_name,
+            &musicbrainz_id,
             &id,
         ];
         self.db.execute(&sql, &params)?;
@@ -797,8 +934,32 @@ impl ArtistRepo {
             "bio_lang",
             "bio_fetched_at",
         ];
+        // #6463 — la provenance du MBID voyage AVEC lui, avant la reprise
+        // générique qui va peut-être le recopier. Une cible dont
+        // l'utilisateur a détaché l'identité ne reprend PAS le MBID du
+        // doublon : ce serait le réattacher d'office.
+        let cible_detachee = self.identite_detachee(cible)?;
+        if !cible_detachee {
+            let sql = format!(
+                "UPDATE artists SET musicbrainz_id_source = \
+                   (SELECT a.musicbrainz_id_source FROM artists a WHERE a.id = {}) \
+                 WHERE id = {} AND TRIM(COALESCE(musicbrainz_id, '')) = '' \
+                   AND EXISTS (SELECT 1 FROM artists a WHERE a.id = {} \
+                               AND TRIM(COALESCE(a.musicbrainz_id, '')) <> '')",
+                self.marque(1),
+                self.marque(2),
+                self.marque(3)
+            );
+            let params: [&dyn ToSqlValue; 3] = [&doublon, &cible, &doublon];
+            self.db.execute(&sql, &params)?;
+        }
+        let champs: Vec<&str> = CHAMPS
+            .iter()
+            .copied()
+            .filter(|c| !(cible_detachee && *c == "musicbrainz_id"))
+            .collect();
         let champs_repris =
-            absorption::reprendre_les_champs_vides(db, "artists", &CHAMPS, cible, doublon)?;
+            absorption::reprendre_les_champs_vides(db, "artists", &champs, cible, doublon)?;
         let albums = absorption::repointer(db, "albums", "artist_id", None, cible, doublon)?;
         let pistes = absorption::repointer(db, "tracks", "artist_id", None, cible, doublon)?;
         let credits =
@@ -1328,12 +1489,111 @@ impl ArtistRepo {
         }))
     }
 
+    /// Pose le MBID qu'une recherche MusicBrainz DU NOM a trouvé
+    /// (`metadata/matcher.rs`, `library/artwork.rs`) : provenance `nom`
+    /// (#6463). Une fiche `manuel` n'est jamais touchée.
     pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), TuneError> {
+        self.poser_mbid(id, mbid, ProvenanceMbid::Nom).map(|_| ())
+    }
+
+    /// Pose un MBID avec sa provenance (#6463). Rend `true` si la fiche a
+    /// changé ; `false` pour une fiche `manuel`, que rien d'automatique ne
+    /// touche.
+    pub fn poser_mbid(
+        &self,
+        id: i64,
+        mbid: &str,
+        provenance: ProvenanceMbid,
+    ) -> Result<bool, TuneError> {
         let sql = self.dialect_sql(sql::update_mbid, sql::update_mbid);
         let mbid = usable_musicbrainz_id(Some(mbid));
-        // Ordre lié = ordre déclaré : la valeur d'abord, l'identifiant ensuite.
-        self.db.execute(&sql, &[&mbid as &dyn ToSqlValue, &id])?;
+        let provenance = mbid.map(|_| provenance.as_str());
+        // Ordre lié = ordre déclaré : la valeur, sa provenance, l'identifiant.
+        Ok(self.db.execute(
+            &sql,
+            &[
+                &mbid as &dyn ToSqlValue,
+                &provenance as &dyn ToSqlValue,
+                &id,
+            ],
+        )? > 0)
+    }
+
+    /// Le MBID saisi par l'utilisateur, ou son retrait (`None`, « Détacher
+    /// l'identité ») : provenance `manuel` (#6463). Plus rien d'automatique
+    /// ne le remplace ni ne le repose.
+    pub fn poser_mbid_manuel(&self, id: i64, mbid: Option<&str>) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::poser_mbid_manuel, sql::poser_mbid_manuel);
+        let mbid = usable_musicbrainz_id(mbid);
+        self.db
+            .execute(&sql, &[&mbid as &dyn ToSqlValue, &id as &dyn ToSqlValue])?;
         Ok(())
+    }
+
+    /// La provenance du MBID d'un artiste (#6463) ; `None` : inconnue.
+    pub fn provenance_du_mbid(&self, id: i64) -> Result<Option<ProvenanceMbid>, TuneError> {
+        let sql = self.dialect_sql(sql::provenance_du_mbid, sql::provenance_du_mbid);
+        Ok(self
+            .db
+            .query_one_strong(&sql, &[&id as &dyn ToSqlValue])?
+            .and_then(|l| l.first().and_then(|v| v.as_string()))
+            .and_then(|s| ProvenanceMbid::depuis_str(&s)))
+    }
+
+    /// L'utilisateur a-t-il détaché l'identité de cet artiste (#6463) ? Un
+    /// artiste `manuel` SANS MBID : aucune recherche par le nom ne doit lui en
+    /// redonner un.
+    pub fn identite_detachee(&self, id: i64) -> Result<bool, TuneError> {
+        if self.provenance_du_mbid(id)? != Some(ProvenanceMbid::Manuel) {
+            return Ok(false);
+        }
+        Ok(self
+            .get(id)?
+            .is_some_and(|a| usable_musicbrainz_id(a.musicbrainz_id.as_deref()).is_none()))
+    }
+
+    /// #6463, B — retire un MBID que la vérification MusicBrainz a jugé faux,
+    /// s'il est toujours là et de provenance inconnue ou `nom`. Rend `true`
+    /// si la fiche a changé ; l'image et la bio rattachées à ce MBID partent
+    /// avec lui ([`Self::oublier_ce_que_le_mbid_a_apporte`]).
+    pub fn retirer_le_mbid_verifie(&self, id: i64, mbid: &str) -> Result<bool, TuneError> {
+        let sql = self.dialect_sql(sql::retirer_le_mbid_verifie, sql::retirer_le_mbid_verifie);
+        let retire = self
+            .db
+            .execute(&sql, &[&id as &dyn ToSqlValue, &mbid as &dyn ToSqlValue])?
+            > 0;
+        if retire {
+            self.oublier_ce_que_le_mbid_a_apporte(id)?;
+        }
+        Ok(retire)
+    }
+
+    /// #6463 — après le retrait d'un MBID, le portrait et la biographie qu'il
+    /// avait rapportés ne décrivent plus cet artiste (« Ange » gardait la
+    /// photo de la chanteuse) : l'image d'une source rattachée au MBID
+    /// ([`SOURCES_D_IMAGE_DU_MBID`]) et la bio rapportée par l'enrichissement
+    /// (provenance rangée) sont effacées, avec les entrées de cache qui les
+    /// resserviraient. Une image locale, téléversée ou trouvée par le nom, et
+    /// une bio saisie, restent. Rend `(image, bio)` effacées.
+    pub fn oublier_ce_que_le_mbid_a_apporte(&self, id: i64) -> Result<(bool, bool), TuneError> {
+        let p: [&dyn ToSqlValue; 1] = [&id];
+        let sql = self.dialect_sql(sql::oublier_l_image_du_mbid, sql::oublier_l_image_du_mbid);
+        let image = self.db.execute(&sql, &p)? > 0;
+        let sql = self.dialect_sql(sql::oublier_la_bio_du_mbid, sql::oublier_la_bio_du_mbid);
+        let bio = self.db.execute(&sql, &p)? > 0;
+        // La bio du fonds communautaire servie par le NOM est gardée 24 h
+        // sous `cache:artistbio:{nom}:{langue}` : elle resservirait le texte
+        // qu'on vient d'effacer.
+        if let Some(artiste) = self.get(id)? {
+            let settings = super::settings_repo::SettingsRepo::with_backend(self.db.clone());
+            let prefixe = format!("cache:artistbio:{}:", artiste.name);
+            if let Ok(toutes) = settings.all() {
+                for (cle, _) in toutes.iter().filter(|(k, _)| k.starts_with(&prefixe)) {
+                    settings.delete(cle)?;
+                }
+            }
+        }
+        Ok((image, bio))
     }
 
     /// Clear an artist's stored image (path + source) so the next enrichment

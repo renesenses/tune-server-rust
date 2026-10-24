@@ -41,7 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::db::artist_repo::cle_artiste;
+use crate::db::artist_repo::{PAS_UN_MBID_MANUEL, ProvenanceMbid, cle_artiste};
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::metadata::musicbrainz_release::{CreditArtiste, MBReleaseDetail, est_un_artiste_fictif};
 
@@ -213,20 +213,30 @@ pub fn rattacher(confrontations: &[Confrontation<'_>]) -> BilanArtistes {
 /// la colonne doit être vide (rien n'est écrasé, même si une autre passe l'a
 /// remplie entre-temps), et aucune AUTRE fiche ne doit déjà porter ce MBID.
 /// Rend le nombre de fiches effectivement écrites.
+///
+/// #6463 — la provenance part avec le MBID (`pressage` ici, `nom` pour la
+/// passe par le réseau), et une fiche dont l'utilisateur a détaché
+/// l'identité (`manuel`, colonne vide) n'est jamais remplie.
 pub fn poser_les_mbid(
     backend: &Arc<dyn DbBackend>,
     a_poser: &[(i64, String)],
+    provenance: ProvenanceMbid,
 ) -> Result<usize, String> {
     let mut ecrits = 0;
+    let source: Option<&str> = Some(provenance.as_str());
+    let sql = format!(
+        "UPDATE artists SET musicbrainz_id = ?, musicbrainz_id_source = ? \
+         WHERE id = ? AND TRIM(COALESCE(musicbrainz_id, '')) = '' AND {PAS_UN_MBID_MANUEL} \
+         AND NOT EXISTS (SELECT 1 FROM artists autre \
+                         WHERE autre.id <> ? AND LOWER(TRIM(autre.musicbrainz_id)) = ?)"
+    );
     for (id, mbid) in a_poser {
         let valeur: Option<String> = Some(mbid.clone());
         let n = backend.execute(
-            "UPDATE artists SET musicbrainz_id = ? \
-             WHERE id = ? AND TRIM(COALESCE(musicbrainz_id, '')) = '' \
-             AND NOT EXISTS (SELECT 1 FROM artists autre \
-                             WHERE autre.id <> ? AND LOWER(TRIM(autre.musicbrainz_id)) = ?)",
+            &sql,
             &[
                 &valeur as &dyn ToSqlValue,
+                &source as &dyn ToSqlValue,
                 id as &dyn ToSqlValue,
                 id as &dyn ToSqlValue,
                 &valeur as &dyn ToSqlValue,
@@ -389,7 +399,7 @@ pub fn rattacher_les_artistes_de_l_album(
         .collect();
 
     let mut bilan = rattacher(&confrontations);
-    bilan.ecrits = poser_les_mbid(backend, &bilan.a_poser)?;
+    bilan.ecrits = poser_les_mbid(backend, &bilan.a_poser, ProvenanceMbid::Pressage)?;
     bilan.refuses_par_la_base = bilan.a_poser.len().saturating_sub(bilan.ecrits);
 
     // #6474 — le nom de tri, APRÈS les MBID : une fiche qui vient de
@@ -673,7 +683,12 @@ mod tests {
     #[test]
     fn la_garde_de_l_update_protege_une_fiche_remplie_entre_temps() {
         let backend = base();
-        let n = poser_les_mbid(&backend, &[(3, "mb-autre".to_string())]).unwrap();
+        let n = poser_les_mbid(
+            &backend,
+            &[(3, "mb-autre".to_string())],
+            ProvenanceMbid::Pressage,
+        )
+        .unwrap();
         assert_eq!(n, 0);
         assert_eq!(mbid(&backend, 3).as_deref(), Some("mb-sg-local"));
     }

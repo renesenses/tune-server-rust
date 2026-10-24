@@ -432,7 +432,7 @@ impl RtspSession {
             .await?;
 
         if code != 200 {
-            return Err(format!("ANNOUNCE failed: {code}"));
+            return Err(announce_failure_message(code));
         }
         Ok(())
     }
@@ -546,6 +546,20 @@ impl RtspSession {
 
 fn entete_rtp_info(sequence: u16, timestamp: u32) -> String {
     format!("seq={sequence};rtptime={timestamp}")
+}
+
+/// Code stable d'un refus de connexion par le récepteur AirPlay (403 Forbidden).
+pub const CODE_AIRPLAY_RECEIVER_FORBIDDEN: &str = "airplay_receiver_forbidden";
+
+fn announce_failure_message(code: u32) -> String {
+    if code == 403 {
+        return format!(
+            "{CODE_AIRPLAY_RECEIVER_FORBIDDEN}: AirPlay connection refused by the receiver (403 Forbidden): \
+             on macOS, verify that 'Allow AirPlay for' is set to 'Everyone on the same network' \
+             (System Settings → General → AirDrop & Handoff)"
+        );
+    }
+    format!("AirPlay ANNOUNCE failed: {code}")
 }
 
 fn setup_failure_message(code: u32) -> String {
@@ -1291,6 +1305,23 @@ mod tests {
         assert_eq!(setup_failure_message(453), "AirPlay SETUP failed: 453");
     }
 
+    #[test]
+    fn announce_403_explains_macos_receiver_permission() {
+        let message = announce_failure_message(403);
+        assert!(message.contains(CODE_AIRPLAY_RECEIVER_FORBIDDEN));
+        assert!(message.contains("403 Forbidden"));
+        assert!(message.contains("Everyone on the same network"));
+        assert!(message.contains("AirDrop & Handoff"));
+    }
+
+    #[test]
+    fn announce_other_status_keeps_the_rtsp_code() {
+        assert_eq!(
+            announce_failure_message(453),
+            "AirPlay ANNOUNCE failed: 453"
+        );
+    }
+
     #[tokio::test]
     async fn teardown_refusal_is_returned_instead_of_discarded() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1456,17 +1487,37 @@ mod tests {
 
     /// La contre-epreuve du rattrapage : un ANNOUNCE refuse n'a rien ouvert.
     /// Envoyer un TEARDOWN pour une session inexistante serait du bruit sur le
-    /// canal de controle d'un appareil qui vient deja de nous dire non.
+    /// canal de controle d'un appareil qui vient deja de nous dire non (#2217).
+    /// Sur 403 (récepteur macOS restreint à l'utilisateur actuel), l'erreur
+    /// guide l'utilisateur vers le bon réglage réseau (#6788).
     #[tokio::test]
     async fn un_announce_refuse_n_envoie_aucun_teardown() {
         let (erreur, methodes) = dialogue_airplay(vec![("ANNOUNCE", "403 Forbidden")]).await;
 
-        assert!(erreur.contains("ANNOUNCE failed: 403"), "obtenu : {erreur}");
+        assert!(
+            erreur.contains(CODE_AIRPLAY_RECEIVER_FORBIDDEN)
+                && erreur.contains("403 Forbidden")
+                && erreur.contains("Everyone on the same network"),
+            "le 403 sur ANNOUNCE doit être nommé et guider l'utilisateur (#6788), obtenu : {erreur}"
+        );
         assert_eq!(
             methodes,
             vec!["ANNOUNCE"],
             "rien n'a ete ouvert : il n'y a rien a rendre"
         );
+    }
+
+    /// #6788 — un récepteur AirPlay (macOS Monterey+) refusant l'ANNOUNCE par
+    /// 403 Forbidden doit remonter un diagnostic actionnable nommant le réglage
+    /// 'Allow AirPlay for: Everyone on the same network'.
+    #[tokio::test]
+    async fn announce_403_sur_recepteur_simule_guide_l_utilisateur() {
+        let (erreur, methodes) = dialogue_airplay(vec![("ANNOUNCE", "403 Forbidden")]).await;
+        assert!(erreur.contains(CODE_AIRPLAY_RECEIVER_FORBIDDEN));
+        assert!(erreur.contains("403 Forbidden"));
+        assert!(erreur.contains("Everyone on the same network"));
+        assert!(erreur.contains("AirDrop & Handoff"));
+        assert_eq!(methodes, vec!["ANNOUNCE"]);
     }
 
     #[test]
