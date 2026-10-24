@@ -278,18 +278,13 @@ impl PlaybackOrchestrator {
     /// manifest, or on any fetch/parse failure — so the caller keeps the
     /// original URL.
     ///
-    /// `.m3u8` est écarté du déréférencement, et ce n'est PAS parce que « le
-    /// manifeste EST le flux, consommé directement par le lecteur » — ce que
-    /// cette phrase affirmait jusqu'à #2307, en annonçant une capacité qui
-    /// n'a jamais existé. Tune n'a aucun chargeur de segments HLS : le seul
-    /// lecteur de flux radio est `decode_radio_stream_to_pcm`, un GET unique
-    /// poussé dans symphonia. Et déréférencer ne servirait à rien non plus :
-    /// une playlist HLS ne porte que des chemins de segments RELATIFS, donc
-    /// le filtre `http(s)` ci-dessous n'y trouverait rien à rendre (constat
-    /// déjà écrit noir sur blanc dans la migration 86, qui a retiré BBC
-    /// Radio 3 pour cette raison). La garde reste donc telle quelle ; c'est
-    /// la LECTURE qui refuse HLS, en le NOMMANT — voir
-    /// [`RADIO_HLS_UNSUPPORTED`].
+    /// `.m3u8` est écarté du déréférencement : une liste HLS n'est pas une
+    /// playlist à déréférencer vers UN flux, c'est un direct découpé en
+    /// segments (aux chemins RELATIFS, que le filtre `http(s)` ci-dessous
+    /// n'aurait de toute façon rien trouvé à rendre). Depuis #6357, c'est le
+    /// lecteur radio (`decode_radio_stream_to_pcm`) qui la reconnaît et la
+    /// confie au chargeur de segments `crate::radio_hls` ; ce qu'il ne lit
+    /// pas encore est refusé en le NOMMANT — voir [`RADIO_HLS_UNSUPPORTED`].
     pub(super) async fn resolve_playlist_url(&self, url: &str) -> Option<String> {
         let path = url
             .split(['?', '#'])

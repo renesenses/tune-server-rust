@@ -287,16 +287,17 @@ fn le_controle_hls_ne_touche_pas_la_liste_noire_page_web() {
     assert!(!is_hls_manifest("http://example.net/live", "text/html"));
 }
 
-/// L'ÉPREUVE : la fonction de production qui lit réellement les radios,
-/// appelée telle quelle, refuse un manifeste HLS — et le refuse AVANT le
-/// réseau.
+/// #6357 — la fonction de production qui lit réellement les radios, appelée
+/// telle quelle, confie une liste `.m3u8` au chargeur HLS : elle ne la
+/// refuse plus (#2307 la refusait avant le réseau) et ne la traite pas non
+/// plus comme un flux Icecast.
 ///
 /// L'adresse pointe sur `127.0.0.1:9` (discard), qui refuse la connexion
-/// instantanément. Si la garde disparaissait, le décodeur ouvrirait le
-/// réseau et rendrait `radio HTTP fetch failed: …` : l'assertion tombe.
-/// Le test ne peut donc pas passer pour une mauvaise raison.
+/// instantanément. Le chargeur HLS rend alors `radio HLS: …` ; le chemin
+/// Icecast aurait rendu `radio HTTP fetch failed: …`, l'ancienne porte
+/// `radio_hls_unsupported`. Le témoin distingue les trois.
 #[tokio::test]
-async fn le_decodeur_de_production_refuse_le_hls_avant_tout_appel_reseau() {
+async fn le_decodeur_de_production_confie_le_hls_au_chargeur_de_segments() {
     use crate::http::streamer::{AudioStreamer, StreamInfo};
     let streamer = Arc::new(AudioStreamer::new(0));
     let info = StreamInfo {
@@ -308,9 +309,7 @@ async fn le_decodeur_de_production_refuse_le_hls_avant_tout_appel_reseau() {
     // Appelée EXACTEMENT comme la production l'appelle : ses trois sites
     // (sortie locale, OAAT, DLNA proxifiée) l'enveloppent dans
     // `spawn_blocking`, parce que symphonia et `reqwest::blocking` sont
-    // synchrones. Le test emprunte donc le même chemin, et un sabotage de
-    // la garde y produit la vraie erreur réseau plutôt qu'une panique de
-    // runtime qui masquerait ce qui s'est passé.
+    // synchrones.
     let erreur = tokio::task::spawn_blocking(move || {
         decode_radio_stream_to_pcm(
             "http://127.0.0.1:9/live/master.m3u8?token=abc".to_string(),
@@ -325,11 +324,14 @@ async fn le_decodeur_de_production_refuse_le_hls_avant_tout_appel_reseau() {
     })
     .await
     .expect("la tâche de décodage ne doit pas paniquer")
-    .expect_err("un manifeste HLS ne doit jamais être accepté comme flux");
+    .expect_err("une station injoignable échoue à la première connexion");
     assert!(
-        erreur.starts_with(RADIO_HLS_UNSUPPORTED),
-        "le décodeur doit refuser en NOMMANT HLS, pas en laissant symphonia \
-         échouer sur un message obscur : {erreur}"
+        erreur.starts_with("radio HLS"),
+        "une liste .m3u8 doit passer par le chargeur HLS : {erreur}"
+    );
+    assert!(
+        !erreur.starts_with(RADIO_HLS_UNSUPPORTED),
+        "le HLS n'est plus refusé d'office : {erreur}"
     );
 }
 
@@ -6585,7 +6587,15 @@ async fn test_set_volume() {
     orch.playback.play(zone_id, np).await;
 
     // Set volume to 80%
-    orch.set_volume(zone_id, 0.8, None).await.unwrap();
+    // #6721 — hausse confirmée : la garde n'est pas l'objet de ce test.
+    orch.set_volume_avec_garde(
+        zone_id,
+        0.8,
+        None,
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let state = orch.playback.get_state(zone_id).await;
     assert!((state.volume - 0.8).abs() < f64::EPSILON);
 
@@ -6595,7 +6605,14 @@ async fn test_set_volume() {
     assert!((state.volume - 0.0).abs() < f64::EPSILON);
 
     // Set volume to 1.0 (max)
-    orch.set_volume(zone_id, 1.0, None).await.unwrap();
+    orch.set_volume_avec_garde(
+        zone_id,
+        1.0,
+        None,
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let state = orch.playback.get_state(zone_id).await;
     assert!((state.volume - 1.0).abs() < f64::EPSILON);
 }
@@ -6624,7 +6641,15 @@ async fn le_trim_ne_touche_pas_le_volume_utilisateur() {
         .set(&format!("zone_{zone_id}_gain_trim_db"), "-6")
         .unwrap();
 
-    orch.set_volume(zone_id, 0.8, None).await.unwrap();
+    // #6721 — hausse confirmée : la garde n'est pas l'objet de ce test.
+    orch.set_volume_avec_garde(
+        zone_id,
+        0.8,
+        None,
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let state = orch.playback.get_state(zone_id).await;
     assert!((state.volume - 0.8).abs() < f64::EPSILON);
     let zone = zone_repo.get(zone_id).unwrap().unwrap();

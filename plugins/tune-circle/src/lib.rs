@@ -40,6 +40,7 @@ pub mod references;
 pub mod relais;
 pub mod resolution;
 pub mod routes;
+pub mod sans_email;
 pub mod suivi;
 pub mod vignettes;
 
