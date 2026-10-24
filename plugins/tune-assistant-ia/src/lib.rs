@@ -32,6 +32,10 @@
 //! | `POST /diagnostic/apercu` | `{zone_id?, question, langue?, second_avis?}` → le texte EXACT qui partirait, pseudonymisé, et son coût estimé ([`diagnostic`]) |
 //! | `POST /diagnostic` | `{apercu_id}` → l'envoi de CET aperçu (une seule fois) ; constat, causes, gestes à essayer — aucune action |
 //!
+//! La transcription vocale (`POST /api/v1/voice-search` de l'hôte) passe par
+//! [`Passerelle::transcrire`] : clé au coffre, coût dans le plafond
+//! ([`transcription`]).
+//!
 //! Gratuit, pour tout le monde : aucune garde Premium. Les RÉGLAGES (`PUT
 //! /reglages`, `POST /tester`) sont réservés aux administrateurs dès que
 //! l'authentification est active (étape 2).
@@ -51,6 +55,7 @@ pub mod reglages;
 pub mod regles;
 mod routes;
 pub mod suggestions;
+pub mod transcription;
 
 use std::path::PathBuf;
 use std::sync::Arc;

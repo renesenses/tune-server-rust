@@ -39,7 +39,7 @@ use super::chaine_native::{
     FinDeChaine, HoteDeChaineNative, ReserveDeLaChaine, ReserveHttp, Suivante,
     jouer_la_chaine_native,
 };
-use super::etage_natif::{EcritureNative, EtageNatif, PuitsAnneauNatif, spec_du_puits_natif};
+use super::etage_natif::{EcritureNative, EtageNatif, PuitsAnneauNatif, spec_du_puits_natif_vers};
 use super::*;
 use crate::outputs::wasapi_exclusive::WasapiExclusiveOutput;
 
@@ -155,8 +155,7 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
     fn ouvrir(demande: &DemandeDOuverture<'a>) -> Result<Self, RefusDOuverture> {
         let sample_rate = demande.spec.cadence();
         let bit_depth = demande.spec.profondeur().bits_declares();
-        let channels = demande.spec.canaux();
-        // WASAPI ouvre au format source : ni cadence, ni canaux, ni repli.
+        // WASAPI ouvre à la cadence source, sans repli de cadence.
         // `audio_backend`, `origin_host`, `exclusive`, `soft_mute` et
         // `device_gone` sont ceux de la demande, le trait les porte pour les
         // bras qui en ont besoin ; celui-ci n'en fait rien.
@@ -168,24 +167,68 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
             demande.device_gone,
         );
 
-        let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-        demande.starvation.begin_stream(sample_rate, channels);
-        let ring = Arc::new(NativePcmRing::new_metered(
-            ring_cap,
-            demande.starvation.clone(),
-        ));
-        ring.clear();
+        // #6230 (étape 2) — une grille qui pilote les voies (6 → 2) est
+        // demandée d'abord, plafonnée aux voies que l'endpoint déclare
+        // (`new_sur_voies_pilotees`). Un refus rouvre une fois au format de
+        // la source : c'est l'ouverture d'avant, et le chemin du signal dit
+        // pourquoi la règle ne s'applique pas (#6595).
+        let anneau_pour = |voies: u16| {
+            let ring_cap = (sample_rate as usize) * (voies as usize) * 2;
+            demande.starvation.begin_stream(sample_rate, voies);
+            let ring = Arc::new(NativePcmRing::new_metered(
+                ring_cap,
+                demande.starvation.clone(),
+            ));
+            ring.clear();
+            ring
+        };
+        let pilotee = demande
+            .voies_de_la_matrice
+            .filter(|&voies| voies != demande.spec.canaux())
+            .and_then(|voies| {
+                let ring = anneau_pour(voies);
+                match WasapiExclusiveOutput::new_sur_voies_pilotees(
+                    demande.device_name,
+                    demande.endpoint_id,
+                    sample_rate,
+                    bit_depth as u32,
+                    u32::from(voies),
+                    ring.clone(),
+                    demande.paused.clone(),
+                ) {
+                    Ok(wasapi) => Some((wasapi, ring)),
+                    Err(erreur) => {
+                        info!(
+                            device = %demande.device_name,
+                            voies,
+                            canaux_source = demande.spec.canaux(),
+                            erreur = %erreur,
+                            "wasapi_exclusive_voies_de_la_grille_refusees_reouverture_au_format_source"
+                        );
+                        None
+                    }
+                }
+            });
+        let ouverture = match pilotee {
+            Some((wasapi, ring)) => Ok((wasapi, ring)),
+            None => {
+                let channels = demande.spec.canaux();
+                let ring = anneau_pour(channels);
+                WasapiExclusiveOutput::new(
+                    demande.device_name,
+                    demande.endpoint_id,
+                    sample_rate,
+                    bit_depth as u32,
+                    u32::from(channels),
+                    ring.clone(),
+                    demande.paused.clone(),
+                )
+                .map(|wasapi| (wasapi, ring))
+            }
+        };
 
-        match WasapiExclusiveOutput::new(
-            demande.device_name,
-            demande.endpoint_id,
-            sample_rate,
-            bit_depth as u32,
-            channels as u32,
-            ring.clone(),
-            demande.paused.clone(),
-        ) {
-            Ok(wasapi) => {
+        match ouverture {
+            Ok((wasapi, ring)) => {
                 let sortie =
                     FormatOuvert::new(wasapi.opened_sample_rate(), wasapi.opened_channels() as u16);
                 Ok(BackendWasapi {
@@ -206,7 +249,9 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
         }
     }
 
-    /// Le format que `Initialize(EXCLUSIVE)` a accepté : celui de la source.
+    /// Le format que `Initialize(EXCLUSIVE)` a accepté : la cadence de la
+    /// source, et ses canaux — ou les voies de la grille quand elle les
+    /// pilote (#6230).
     fn format_ouvert(&self) -> FormatOuvert {
         self.sortie
     }
@@ -214,9 +259,11 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
     /// Le puits d'anneau natif : des blocs `Entier32` (mots alignés à gauche),
     /// poussés en attendant que le fil de rendu draine.
     fn puits(&self) -> Puits<'a> {
+        // #6230 — le puits porte les voies OUVERTES : l'étage natif y livre
+        // des blocs à M voies quand la grille pilote, à N sinon.
         Puits::Natif(Box::new(PuitsAnneauNatif::sur(
             self.anneau.clone(),
-            spec_du_puits_natif(self.spec),
+            spec_du_puits_natif_vers(self.spec, self.sortie.canaux),
             self.stop_rx,
             self.paused,
             self.force_silent,
@@ -251,31 +298,41 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
         }
     }
 
-    /// Le vidage du bras, **tel quel : sans borne**. La signature en porte
-    /// une ; elle est ignorée, et c'est un défaut nommé — le seul bras dont
-    /// le vidage ne s'arrête que sur stop, silence forcé ou anneau vide. Face
-    /// à un rappel de rendu mort, il ne se vide JAMAIS (#3108, carte §1.2).
-    /// À borner après l'écoute, pas dans une PR « sans changer le rendu ».
-    /// La position publiée ne recule pas non plus : le bras ne le faisait pas.
-    fn drainer(&mut self, _borne: std::time::Duration) -> Vidage {
+    /// Le vidage du bras, BORNÉ depuis #6842 : il s'arrête sur stop, silence
+    /// forcé, anneau vide, sur la borne de `drain_deadline_for`, ou après
+    /// 1,5 s sans qu'un mot ne parte — la règle du bras ASIO. Avant, la borne
+    /// était ignorée (défaut conservé par REF-8) : face à un rappel de rendu
+    /// mort, le vidage ne finissait JAMAIS (#3108, carte §1.2). Le temps passé
+    /// en pause ne compte pas. La position publiée ne recule pas : le bras ne
+    /// le faisait pas, et ce n'est pas l'objet de #6842.
+    fn drainer(&mut self, borne: std::time::Duration) -> Vidage {
+        // Import local : l'en-tête du module reste celui d'avant, pour ne pas
+        // croiser #6230 (étape 2) sur les mêmes lignes.
+        use super::chaine_native::{FinDuVidage, attendre_le_vidage};
         let fed_position_ms = self.position_ms.load(Ordering::Relaxed);
-        let mut drained_naturally = false;
-        // Wait for ring buffer to drain
-        loop {
-            if self.stop_rx.try_recv().is_ok() {
-                break;
-            }
-            if self.force_silent.load(Ordering::Relaxed) {
-                break;
-            }
-            if self.anneau.available() == 0 {
-                drained_naturally = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        let anneau = &self.anneau;
+        let stop_rx = self.stop_rx;
+        let force_silent = self.force_silent;
+        let paused = self.paused;
+        let fin = attendre_le_vidage(
+            || anneau.available(),
+            || stop_rx.try_recv().is_ok() || force_silent.load(Ordering::Relaxed),
+            || paused.load(Ordering::Relaxed),
+            borne,
+            std::time::Duration::from_millis(1500),
+            std::time::Duration::from_millis(50),
+        );
+        if let FinDuVidage::BorneAtteinte { restant } | FinDuVidage::SansProgres { restant } = fin {
+            warn!(
+                device = %self.wasapi.opened_device_name(),
+                ring_available = restant,
+                fed_position_ms,
+                fin = ?fin,
+                "wasapi_drain_timeout"
+            );
         }
         Vidage {
-            vide: drained_naturally,
+            vide: fin == FinDuVidage::Vide,
             restant: self.anneau.available(),
             position_alimentee_ms: fed_position_ms,
         }
@@ -401,10 +458,20 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
     // Aucun rappel d'erreur sur ce chemin : le témoin existe pour la
     // demande, personne ne le lève.
     let device_gone = Arc::new(AtomicBool::new(false));
+    // #6230 (étape 2) — les voies que la grille pilote pour cette piste, par
+    // la MÊME décision que la frontière gapless de l'étage natif
+    // (`voies_a_ouvrir_en_exclusif`) : jamais en PURE ni sur un porteur DoP,
+    // jamais sur une amorce 24 bits trop courte pour écarter le DoP.
+    let voies_de_la_matrice = Some(reaffectation.voies_a_ouvrir_en_exclusif(
+        spec,
+        header_buf.get(data_offset..).unwrap_or_default(),
+        pure_bypass.load(Ordering::Relaxed),
+        false,
+    ))
+    .filter(|&voies| voies != spec.canaux());
     let demande = DemandeDOuverture {
         spec,
-        // #6230 — un transport exclusif ouvre au format de la source.
-        voies_de_la_matrice: None,
+        voies_de_la_matrice,
         device_name: &device_name,
         endpoint_id: endpoint_id.as_deref(),
         origin_host: None,
@@ -473,6 +540,14 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
     let mut total_frames_fed: u64 = 0;
     let mut bit_perfect_state = None;
 
+    // #6230 — ce que l'ouverture a fait des voies demandées : noté pour les
+    // décisions de réouverture, et dit au journal.
+    reaffectation.constater_l_ouverture(
+        voies_de_la_matrice,
+        backend.format_ouvert().canaux,
+        &device_name,
+    );
+
     let mut etage = EtageNatif::monter(
         spec,
         backend.format_ouvert(),
@@ -530,24 +605,27 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
     }
 
-    // Un puits mort (`PuitsMort`) est traité comme une poussée : le bras
-    // ignorait le verdict de `feed_native_ring_abortable` et continuait à
-    // lire. C'est la « famine muette » de la carte §1.2 (aucun
-    // `record_feed_stall_failure` sur ce bras), conservée telle quelle et
-    // nommée comme défaut — à traiter après l'écoute.
+    // #6842 — un puits mort (`PuitsMort`) n'est plus traité comme une
+    // poussée : c'était la « famine muette » de la carte §1.2, conservée par
+    // REF-8. Dès l'amorce, il arrête la lecture et la famine est rapportée.
+    let mut amorce_morte = false;
     match etage.decoder_et_pousser(&pcm_data, &mut *puits) {
         EcritureNative::Poussee {
-            trames_source,
-            dop,
-            bit_perfect,
-        }
-        | EcritureNative::PuitsMort {
             trames_source,
             dop,
             bit_perfect,
         } => {
             total_frames_fed += trames_source;
             publier_le_verdict(dop, bit_perfect);
+        }
+        EcritureNative::PuitsMort {
+            trames_source,
+            dop,
+            bit_perfect,
+        } => {
+            total_frames_fed += trames_source;
+            publier_le_verdict(dop, bit_perfect);
+            amorce_morte = true;
         }
         EcritureNative::RienAPousser => {}
     }
@@ -583,14 +661,24 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
             rg_factor: &rg_factor_ref,
         },
     };
-    let issue = jouer_la_chaine_native(
-        &mut hote,
-        reader,
-        &mut etage,
-        &mut *puits,
-        total_frames_fed,
-        seek_offset,
-    );
+    let issue = if amorce_morte {
+        drop(reader);
+        super::chaine_native::IssueDeLaChaine {
+            fin: FinDeChaine::PuitsMort,
+            http_eof: false,
+            trames: total_frames_fed,
+            pistes_enchainees: 0,
+        }
+    } else {
+        jouer_la_chaine_native(
+            &mut hote,
+            reader,
+            &mut etage,
+            &mut *puits,
+            total_frames_fed,
+            seek_offset,
+        )
+    };
     let total_frames_fed = issue.trames;
     let http_eof_wasapi = issue.http_eof;
     if issue.pistes_enchainees > 0 || issue.fin == FinDeChaine::FormatDifferent {
@@ -617,8 +705,19 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
 
     // WASAPI exclusive now follows the same DSP tail
     // contract as the other local PCM paths (#2209).
-    // Le verdict du puits est ignoré, comme avant (famine muette).
-    let _ = etage.rendre_la_queue(&mut *puits);
+    // #6842 — la queue n'est pas rendue à un puits mort, et un puits qui
+    // meurt sur la queue est une famine comme une autre.
+    let puits_mort = issue.fin == FinDeChaine::PuitsMort || !etage.rendre_la_queue(&mut *puits);
+    if puits_mort {
+        // La famine est DITE, au nom du backend, comme sur les autres bras
+        // (#3108) : le sondeur la relève par `take_output_failure()`.
+        record_feed_stall_failure(
+            "WASAPI",
+            &device_name,
+            position_ms.load(Ordering::Relaxed),
+            &open_failure,
+        );
+    }
 
     // Signal natural track end BEFORE draining when
     // the HTTP stream reached EOF, so the orchestrator
@@ -630,14 +729,16 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         TRACK_END_NOTIFY.notify_one();
     }
 
-    // La borne est celle que le chemin partagé calcule ; `drainer` l'ignore
-    // (vidage sans borne conservé, voir `BackendWasapi::drainer`).
-    let borne = drain_deadline_for(
-        backend.observer().disponible,
-        u64::from(sample_rate),
-        u64::from(channels),
-    );
-    let _ = backend.drainer(borne);
+    // La borne est celle que le chemin partagé calcule ; `drainer` la
+    // respecte depuis #6842. Un puits mort ne se vide pas : on n'attend pas.
+    if !puits_mort {
+        let borne = drain_deadline_for(
+            backend.observer().disponible,
+            u64::from(sample_rate),
+            u64::from(channels),
+        );
+        let _ = backend.drainer(borne);
+    }
 
     drop(puits);
     backend.arreter();
