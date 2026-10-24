@@ -92,6 +92,109 @@ pub const MODELE_ANTHROPIC_CLASSIQUE: &str = "claude-sonnet-5-5";
 /// statut Stable).
 pub const MODELE_GEMINI_PAR_DEFAUT: &str = "gemini-3.5-flash-lite";
 
+// ---------------------------------------------------------------------------
+// Effort de réflexion (décision de Bertrand du 23/10/2026)
+// ---------------------------------------------------------------------------
+
+/// L'effort demandé pour les usages COURTS ([`usage_court`]).
+///
+/// Claude Haiku 5.5 et Sonnet 5.5 réfléchissent par défaut (réflexion
+/// adaptative, effort `medium` pour Haiku 5.5, `high` pour Sonnet 5.5), et
+/// la réflexion se facture comme de la sortie. Pour une réponse brève en JSON
+/// fermé, `low` suffit et coûte moins.
+pub const EFFORT_COURT: &str = "low";
+
+/// Les usages courts : une réponse brève, au schéma fermé. Les suggestions
+/// d'album, de pistes et les lots gardent l'effort par défaut du modèle.
+pub const USAGES_COURTS: &[&str] = &[
+    "test",
+    "playlist",
+    "traduction",
+    "requete",
+    // #6839 — une règle de plus ou de moins, un nom, une explication.
+    "collection_affiner",
+    "collection_nommer",
+    "collection_pourquoi",
+];
+
+pub fn usage_court(usage: &str) -> bool {
+    USAGES_COURTS.contains(&usage)
+}
+
+/// Les modèles Anthropic qui ACCEPTENT `output_config.effort`, relevés le
+/// 23/10/2026 dans la référence de l'API Claude (table « Thinking &
+/// Effort ») : Haiku 5.5, Sonnet 5.5 et 5, Sonnet 4.6, Opus 4.5 à 5.5, Fable 5
+/// et 5.1. **Haiku 4.5 et Sonnet 4.5 le refusent par un 400** (le site l'a
+/// appris à ses dépens) : la liste est FERMÉE, un modèle inconnu n'en reçoit
+/// pas — il garde son effort par défaut plutôt que d'échouer.
+pub const MODELES_AVEC_EFFORT: &[&str] = &[
+    "claude-haiku-5-5",
+    "claude-sonnet-5-5",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "claude-opus-5-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-fable-5-1",
+    "claude-fable-5",
+];
+
+/// `modele` accepte-t-il `output_config.effort` ? Le nom exact, ou suivi d'un
+/// suffixe daté (`claude-opus-4-5-20251101`).
+pub fn accepte_effort(modele: &str) -> bool {
+    let m = modele.trim();
+    MODELES_AVEC_EFFORT.iter().any(|p| {
+        m == *p
+            || m.strip_prefix(p)
+                .and_then(|reste| reste.strip_prefix('-'))
+                .is_some_and(|date| !date.is_empty() && date.chars().all(|c| c.is_ascii_digit()))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Estimations avant l'appel
+// ---------------------------------------------------------------------------
+
+/// Jetons d'entrée ESTIMÉS d'un texte : un jeton pour trois caractères. C'est
+/// prudent (l'anglais compte plutôt quatre caractères par jeton, le français
+/// un peu moins) : l'estimation surestime, jamais l'inverse.
+pub fn estimer_jetons(texte: &str) -> u64 {
+    (texte.chars().count() as u64).div_ceil(3)
+}
+
+/// Le coût ESTIMÉ d'un appel avant son envoi, en micro-euros : l'entrée
+/// estimée et la sortie au plus (`max_sortie`). Montré à l'écran avec
+/// l'aperçu de ce qui part.
+pub fn estimer_micro_eur(tarif: Tarif, entree: &str, max_sortie: u32, taux_usd_eur: f64) -> u64 {
+    cout_micro_eur(
+        tarif,
+        estimer_jetons(entree),
+        u64::from(max_sortie),
+        taux_usd_eur,
+    )
+}
+
+/// Le contexte demandé à Ollama, au moins.
+pub const NUM_CTX_MIN: u32 = 4096;
+/// Le contexte demandé à Ollama, au plus.
+pub const NUM_CTX_MAX: u32 = 65_536;
+
+/// Le `num_ctx` à envoyer à Ollama pour une requête dont l'entrée fait
+/// `caracteres_entree` caractères et la sortie `max_sortie` jetons au plus.
+///
+/// Sans lui, Ollama tronque SANS ERREUR le début d'un contexte plus long que
+/// son défaut (2 048 ou 4 096 jetons selon les versions) — la consigne et le
+/// schéma, justement. Arrondi au kilo-jeton supérieur, borné à
+/// [`NUM_CTX_MIN`]..[`NUM_CTX_MAX`].
+pub fn num_ctx_ollama(caracteres_entree: usize, max_sortie: u32) -> u32 {
+    let besoin = (caracteres_entree as u64).div_ceil(3) + u64::from(max_sortie) + 256;
+    let arrondi = besoin.div_ceil(1024) * 1024;
+    arrondi.clamp(u64::from(NUM_CTX_MIN), u64::from(NUM_CTX_MAX)) as u32
+}
+
 /// Un tarif documenté.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tarif {
@@ -322,6 +425,41 @@ mod tests {
         assert!(RELEVE_GEMINI.a_relever("2027-01-01"));
         assert!(!RELEVE_ANTHROPIC.a_relever("2030-01-01"));
         assert_eq!(jour_courant().len(), 10);
+    }
+
+    #[test]
+    fn l_effort_ne_part_qu_aux_modeles_qui_l_acceptent() {
+        assert!(accepte_effort("claude-haiku-5-5"));
+        assert!(accepte_effort("claude-sonnet-5-5"));
+        assert!(accepte_effort(" claude-opus-4-5-20251101 "));
+        // Le 400 que le site a reçu : Haiku 4.5 refuse `effort`.
+        assert!(!accepte_effort("claude-haiku-4-5"));
+        assert!(!accepte_effort("claude-haiku-4-5-20251001"));
+        assert!(!accepte_effort("claude-sonnet-4-5"));
+        assert!(!accepte_effort("claude-inconnu"));
+        assert!(!accepte_effort("claude-sonnet-5-5x"));
+        assert!(!accepte_effort(""));
+        assert!(usage_court("playlist") && usage_court("test"));
+        assert!(!usage_court("album") && !usage_court("lot"));
+    }
+
+    #[test]
+    fn le_contexte_ollama_couvre_l_entree_et_la_sortie() {
+        assert_eq!(num_ctx_ollama(0, 0), NUM_CTX_MIN);
+        // 60 000 caractères ≈ 20 000 jetons + 4 096 de sortie.
+        let n = num_ctx_ollama(60_000, 4096);
+        assert!(n >= 20_000 + 4096, "{n}");
+        assert_eq!(n % 1024, 0);
+        assert_eq!(num_ctx_ollama(10_000_000, 4096), NUM_CTX_MAX);
+    }
+
+    #[test]
+    fn l_estimation_surestime_plutot_qu_elle_ne_sous_estime() {
+        assert_eq!(estimer_jetons(""), 0);
+        assert_eq!(estimer_jetons("abcd"), 2);
+        let t = tarif_anthropic(MODELE_ANTHROPIC_PAR_DEFAUT).unwrap();
+        // 3 000 caractères = 1 000 jetons (0,0001 $) + 1 000 de sortie (0,0005 $).
+        assert_eq!(estimer_micro_eur(t, &"x".repeat(3000), 1000, 1.0), 600);
     }
 
     #[test]

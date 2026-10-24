@@ -1266,5 +1266,39 @@ async fn la_completude_compte_les_pistes_traitees_sur_le_total() {
     assert_eq!(p["dynamic_range_unmanageable"], 5, "payload={p}");
 }
 
+/// #6840 — la fenêtre du démarrage du client web lit
+/// `config.cloud_listens_consent.{state,linked,dismissals,max_dismissals}`
+/// (`ConsentementEcoutes6840.svelte`, `lib/consentementEcoutes.ts`) : ces
+/// champs sont le contrat, `state` dans les trois mots que le web connaît.
+#[tokio::test]
+async fn le_consentement_des_ecoutes_est_celui_que_lit_le_web_6840() {
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let app = tune_server::routes::router(etat);
+    let p = get_json(&app, "/api/v1/system/config")
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+    let c = &p["cloud_listens_consent"];
+    exige_champs(
+        c,
+        &[
+            "state".to_string(),
+            "linked".to_string(),
+            "answered_at".to_string(),
+            "dismissals".to_string(),
+            "max_dismissals".to_string(),
+        ],
+        "GET /system/config cloud_listens_consent",
+    )
+    .unwrap_or_else(|erreur| panic!("{erreur}; payload={c}"));
+    assert!(
+        ["a_demander", "accepte", "refuse"].contains(&c["state"].as_str().unwrap_or("")),
+        "état hors du vocabulaire du web : {c}"
+    );
+    assert!(c["linked"].is_boolean(), "{c}");
+    assert!(c["dismissals"].is_u64(), "{c}");
+    assert!(c["max_dismissals"].is_u64(), "{c}");
+}
+
 #[path = "web_contracts/album_tracks_1897.rs"]
 mod album_tracks_1897;

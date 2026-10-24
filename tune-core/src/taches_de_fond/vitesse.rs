@@ -31,6 +31,29 @@ use crate::db::settings_repo::SettingsRepo;
 /// La clé du réglage dans `settings`, écrite par `PATCH /system/config`.
 pub const CLE_REGLAGE: &str = "background_analysis_speed";
 
+/// #6713 — « Lever le bridage quand la température est illisible ».
+///
+/// Sans température lisible (Windows sans zone thermique, zone figée, macOS,
+/// machine virtuelle), les analyses de fond passent à UN fichier à la fois
+/// (#5410, maintenu par #6450). Ce réglage, **désactivé par défaut**, rend la
+/// vitesse réglée à l'utilisateur qui le choisit en connaissance de cause. Il
+/// ne lève rien quand une température est lue : la garde thermique arrête
+/// toujours les analyses au-delà de 80 °C. La lecture n'est jamais bridée.
+pub const CLE_LEVER_LE_BRIDAGE: &str = "background_analysis_unthrottle_unreadable_temperature";
+
+/// Désactivé par défaut : le bridage reste la règle.
+pub const LEVER_LE_BRIDAGE_DEFAUT: bool = false;
+
+/// L'utilisateur a-t-il levé le bridage ? Absent, illisible ou autre : non.
+pub fn bridage_leve(backend: &Arc<dyn DbBackend>) -> bool {
+    SettingsRepo::with_backend(backend.clone())
+        .get(CLE_LEVER_LE_BRIDAGE)
+        .ok()
+        .flatten()
+        .map(|v| crate::cloud::consent::est_vrai(&v))
+        .unwrap_or(LEVER_LE_BRIDAGE_DEFAUT)
+}
+
 /// Les trois vitesses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Vitesse {
@@ -95,10 +118,13 @@ pub fn coeurs() -> usize {
 /// zone figée, machine virtuelle), un fichier à la fois quelle que soit la
 /// vitesse : la garde thermique ne peut rien arrêter, la largeur se replie
 /// (`audio::thermal::brider_sans_thermometre`).
+///
+/// #6713 — sauf si l'utilisateur a levé ce bridage ([`bridage_leve`]).
 pub fn largeur_courante(backend: &Arc<dyn DbBackend>) -> usize {
-    crate::audio::thermal::brider_sans_thermometre(
+    crate::audio::thermal::largeur_selon_la_chaleur(
         vitesse(backend).largeur(coeurs()),
         &crate::audio::thermal::lecture_thermique(),
+        bridage_leve(backend),
     )
 }
 

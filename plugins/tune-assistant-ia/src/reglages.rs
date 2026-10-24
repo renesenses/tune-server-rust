@@ -27,6 +27,9 @@ pub const CLE_TAUX: &str = "assistant_ia_taux_usd_eur";
 /// [`tune_core::secrets::est_secret`] reconnaît — gardé par un essai.
 pub const CLE_API_CHIFFREE: &str = "assistant_ia_api_key_chiffree";
 pub const CLE_CONSOMMATION: &str = "assistant_ia_consommation";
+/// #6730 — l'identifiant d'espace de travail Anthropic (en-tête
+/// `anthropic-workspace-id`). Pas un secret : la clé reste au coffre, seule.
+pub const CLE_ESPACE_DE_TRAVAIL: &str = "assistant_ia_anthropic_espace_de_travail";
 
 /// Le plafond mensuel par défaut, en euros.
 pub const PLAFOND_PAR_DEFAUT_EUR: &str = "2";
@@ -43,6 +46,8 @@ pub struct Reglages {
     pub taux_usd_eur: f64,
     /// La clé est-elle posée (scellée) ?
     pub cle_posee: bool,
+    /// #6730 — l'espace de travail Anthropic, vide s'il n'est pas renseigné.
+    pub espace_de_travail: String,
 }
 
 fn lire(s: &SettingsRepo, cle: &str) -> String {
@@ -86,6 +91,7 @@ impl Reglages {
                 .filter(|t| *t > 0.0)
                 .unwrap_or(1.0),
             cle_posee: !lire(&s, CLE_API_CHIFFREE).trim().is_empty(),
+            espace_de_travail: lire(&s, CLE_ESPACE_DE_TRAVAIL).trim().to_string(),
         }
     }
 
@@ -100,6 +106,30 @@ impl Reglages {
         self.famille
             .map(|f| f.modele_par_defaut().to_string())
             .unwrap_or_default()
+    }
+
+    /// Le modèle « second avis », demandé explicitement par l'écran (décision
+    /// du 23/10/2026 : Haiku 5.5 par défaut partout, Sonnet 5.5 SUR DEMANDE).
+    /// Le modèle « classique » choisi s'il y en a un ; sinon, chez Anthropic,
+    /// Claude Sonnet 5.5 ; ailleurs, le modèle habituel (aucun autre nom de
+    /// modèle n'est inventé).
+    pub fn modele_fort(&self) -> String {
+        if !self.modele_classique.is_empty() {
+            return self.modele_classique.clone();
+        }
+        if self.famille == Some(Famille::Anthropic) {
+            return couts::MODELE_ANTHROPIC_CLASSIQUE.to_string();
+        }
+        self.modele_effectif(false)
+    }
+
+    /// Le modèle d'un appel, selon le [`crate::appel::Choix`] de l'usage.
+    pub fn modele_choisi(&self, choix: crate::appel::Choix) -> String {
+        match choix {
+            crate::appel::Choix::Defaut => self.modele_effectif(false),
+            crate::appel::Choix::Classique => self.modele_effectif(true),
+            crate::appel::Choix::Fort => self.modele_fort(),
+        }
     }
 
     /// Le tarif du modèle. `Some(0)` pour Ollama ; `None` si inconnu.
@@ -138,10 +168,14 @@ pub fn cle_en_clair(db: &Arc<dyn DbBackend>, coffre: &Coffre) -> EtatCle {
 
 /// L'accès au fournisseur configuré, avec sa clé.
 pub fn acces(r: &Reglages, cle: Option<String>) -> Option<Acces> {
+    let famille = r.famille?;
     Some(Acces {
-        famille: r.famille?,
+        famille,
         url_base: r.url_base.clone(),
         cle,
+        // #6730 — seulement pour Anthropic, et seulement s'il est renseigné.
+        espace_de_travail: (famille == Famille::Anthropic && !r.espace_de_travail.is_empty())
+            .then(|| r.espace_de_travail.clone()),
     })
 }
 
@@ -195,6 +229,9 @@ pub fn vue(db: &Arc<dyn DbBackend>, coffre: &Coffre) -> Value {
         "modele": r.modele,
         "modele_effectif": modele,
         "modele_classique": r.modele_classique,
+        // 23/10/2026 : le modèle du « second avis », demandé explicitement.
+        "modele_second_avis": r.modele_fort(),
+        "effort_usages_courts": crate::couts::accepte_effort(&modele).then_some(crate::couts::EFFORT_COURT),
         "url_base": r.url_base,
         "url_par_defaut": r.famille.map(Famille::url_par_defaut),
         "plafond_eur": couts::micro_en_euros(r.plafond_micro_eur),
@@ -206,11 +243,18 @@ pub fn vue(db: &Arc<dyn DbBackend>, coffre: &Coffre) -> Value {
         "cle_definie": cle_definie,
         "cle_illisible": cle_illisible,
         "cle_fin": fin,
+        // #6730 — l'identifiant d'espace de travail Anthropic (`""` : aucun).
+        "espace_de_travail_anthropic": r.espace_de_travail,
         "modeles_anthropic": couts::TARIFS_ANTHROPIC.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
         "modeles_gemini": couts::TARIFS_GEMINI.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
         "modele_gemini_par_defaut": couts::MODELE_GEMINI_PAR_DEFAUT,
         "modele_anthropic_par_defaut": couts::MODELE_ANTHROPIC_PAR_DEFAUT,
         "modele_anthropic_classique": couts::MODELE_ANTHROPIC_CLASSIQUE,
+        "transcription": crate::transcription::vue(
+            db,
+            coffre,
+            std::env::var(crate::transcription::VARIABLE_HERITEE).ok().as_deref(),
+        ),
         "consommation": {
             "mois": c.mois,
             "cout_eur": couts::micro_en_euros(c.micro_eur),
@@ -274,6 +318,12 @@ pub struct Modification {
     pub taux_usd_eur: Option<Value>,
     /// La clé en clair. `""` l'efface.
     pub cle: Option<String>,
+    /// #6730 — l'identifiant d'espace de travail Anthropic. `""` l'efface.
+    pub espace_de_travail_anthropic: Option<String>,
+    /// La clé de TRANSCRIPTION (Whisper, OpenAI) en clair, scellée au coffre.
+    /// `""` l'efface. Voir [`crate::transcription`].
+    #[serde(default)]
+    pub cle_transcription: Option<String>,
 }
 
 fn texte_de(v: &Value) -> String {
@@ -317,6 +367,15 @@ pub fn appliquer(db: &Arc<dyn DbBackend>, coffre: &Coffre, m: &Modification) -> 
             return Err("l'adresse doit commencer par http:// ou https://".into());
         }
     }
+    if let Some(id) = &m.espace_de_travail_anthropic {
+        let id = id.trim();
+        if !id.is_empty() && !crate::fournisseur::espace_de_travail_valide(id) {
+            return Err(
+                "identifiant d'espace de travail illisible (lettres, chiffres, _ et - seulement)"
+                    .into(),
+            );
+        }
+    }
     // 2. Écrire.
     let s = SettingsRepo::with_backend(db.clone());
     let poser = |cle: &str, v: &str| s.set(cle, v.trim());
@@ -347,6 +406,14 @@ pub fn appliquer(db: &Arc<dyn DbBackend>, coffre: &Coffre, m: &Modification) -> 
     if let Some(v) = &m.taux_usd_eur {
         poser(CLE_TAUX, &texte_de(v))?;
     }
+    if let Some(id) = &m.espace_de_travail_anthropic {
+        let id = id.trim();
+        if id.is_empty() {
+            s.delete(CLE_ESPACE_DE_TRAVAIL)?;
+        } else {
+            poser(CLE_ESPACE_DE_TRAVAIL, id)?;
+        }
+    }
     if let Some(cle) = &m.cle {
         let cle = cle.trim();
         if cle.is_empty() {
@@ -354,6 +421,9 @@ pub fn appliquer(db: &Arc<dyn DbBackend>, coffre: &Coffre, m: &Modification) -> 
         } else {
             s.set(CLE_API_CHIFFREE, &coffre.sceller(cle)?)?;
         }
+    }
+    if let Some(cle) = &m.cle_transcription {
+        crate::transcription::poser_cle(db, coffre, cle)?;
     }
     Ok(())
 }
@@ -372,7 +442,31 @@ mod tests {
             prix_perso: prix,
             taux_usd_eur: 1.0,
             cle_posee: true,
+            espace_de_travail: String::new(),
         }
+    }
+
+    #[test]
+    fn haiku_par_defaut_et_sonnet_seulement_sur_demande() {
+        let r = reglages(Famille::Anthropic, "", None);
+        assert_eq!(
+            r.modele_choisi(crate::appel::Choix::Defaut),
+            "claude-haiku-5-5"
+        );
+        assert_eq!(
+            r.modele_choisi(crate::appel::Choix::Classique),
+            "claude-haiku-5-5",
+            "le classique détecté ne bascule PAS seul vers Sonnet"
+        );
+        assert_eq!(
+            r.modele_choisi(crate::appel::Choix::Fort),
+            "claude-sonnet-5-5"
+        );
+        let g = reglages(Famille::Gemini, "", None);
+        assert_eq!(
+            g.modele_choisi(crate::appel::Choix::Fort),
+            couts::MODELE_GEMINI_PAR_DEFAUT
+        );
     }
 
     #[test]

@@ -1150,14 +1150,13 @@ impl PlaybackOrchestrator {
                 Ok(Err(e)) => {
                     warn!(error = %e, "radio_local_decode_failed");
                     emit_radio_playback_error(&err_bus, err_zone, &err_station, &e);
-                    // Verdict DÉFINITIF ou simple panne ? Les deux préfixes
-                    // ci-dessous portent déjà, chacun dans son commentaire, la
+                    // Verdict DÉFINITIF ou simple panne ? Les préfixes que
+                    // reconnaît `echec_radio_definitif` portent, chacun dans son commentaire, la
                     // phrase « ne guérira pas en réessayant » — mais personne
                     // ne la lisait hors de la boucle de reconnexion interne.
                     // Une coupure réseau, elle, n'entre pas ici : la reprise
                     // légitime d'un flux qui tombe continue de marcher.
-                    let definitif = e.starts_with(super::radio::RADIO_NOT_AUDIO)
-                        || e.starts_with(super::radio::RADIO_HLS_UNSUPPORTED);
+                    let definitif = super::radio::echec_radio_definitif(&e);
                     if let (true, Some(sid)) = (definitif, refus_source_id.as_deref()) {
                         warn!(
                             zone_id = err_zone,
@@ -1976,8 +1975,7 @@ impl PlaybackOrchestrator {
                     Ok(Err(e)) => {
                         warn!(error = %e, "radio_dlna_decode_failed");
                         emit_radio_playback_error(&err_bus, err_zone, &err_station, &e);
-                        let definitif = e.starts_with(super::radio::RADIO_NOT_AUDIO)
-                            || e.starts_with(super::radio::RADIO_HLS_UNSUPPORTED);
+                        let definitif = super::radio::echec_radio_definitif(&e);
                         if let (true, Some(sid)) = (definitif, refus_source_id.as_deref()) {
                             warn!(
                                 zone_id = err_zone,

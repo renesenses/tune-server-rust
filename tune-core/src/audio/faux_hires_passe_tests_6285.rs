@@ -78,6 +78,38 @@ fn sans_temperature_lisible_la_passe_est_bridee_a_un_fichier_6285() {
     );
 }
 
+/// #6713 — le réglage « lever le bridage » rend la vitesse réglée à la passe
+/// quand la température est illisible ; désactivé (le défaut), elle reste
+/// bridée à un fichier.
+#[test]
+fn le_bridage_leve_par_le_reglage_rend_la_vitesse_reglee_6713() {
+    let db = base();
+    let reglages = SettingsRepo::with_backend(db.clone());
+    reglages
+        .set(vitesse::CLE_REGLAGE, vitesse::Vitesse::Rapide.id())
+        .unwrap();
+    let illisible = LectureThermique::Illisible(MotifIllisible::AucunCapteur);
+    assert!(!vitesse::bridage_leve(&db), "désactivé par défaut");
+    assert_eq!(largeur_de_la_passe(&db, &illisible), 1);
+
+    reglages.set(vitesse::CLE_LEVER_LE_BRIDAGE, "true").unwrap();
+    assert!(vitesse::bridage_leve(&db));
+    assert_eq!(
+        largeur_de_la_passe(&db, &illisible),
+        vitesse::Vitesse::Rapide.largeur(vitesse::coeurs()),
+        "bridage levé : la vitesse réglée"
+    );
+
+    reglages
+        .set(vitesse::CLE_LEVER_LE_BRIDAGE, "false")
+        .unwrap();
+    assert_eq!(
+        largeur_de_la_passe(&db, &illisible),
+        1,
+        "réglage retiré : bridé"
+    );
+}
+
 /// Les candidats : locaux, sans perte, avec un chemin, pas encore mesurés,
 /// dans le périmètre des analyses.
 #[test]

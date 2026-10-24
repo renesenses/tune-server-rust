@@ -33,7 +33,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use super::faux_hires::{Mesure, Verdict, juger, mesurer};
-use crate::audio::thermal::{LectureThermique, ThermalGate, brider_sans_thermometre};
+use crate::audio::thermal::{LectureThermique, ThermalGate, largeur_selon_la_chaleur};
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use crate::db::settings_repo::SettingsRepo;
@@ -108,8 +108,15 @@ pub fn compter_les_candidats(db: &Arc<dyn DbBackend>) -> i64 {
 /// analyses, et UN SEUL quand la température est illisible : c'est le
 /// bridage de #5410, maintenu par la décision de Bertrand du 20/10/2026
 /// (#6450).
+///
+/// #6713 — sauf si l'utilisateur a levé ce bridage
+/// (`vitesse::bridage_leve`) : la même règle que les autres passes.
 pub fn largeur_de_la_passe(db: &Arc<dyn DbBackend>, lecture: &LectureThermique) -> usize {
-    brider_sans_thermometre(vitesse::vitesse(db).largeur(vitesse::coeurs()), lecture)
+    largeur_selon_la_chaleur(
+        vitesse::vitesse(db).largeur(vitesse::coeurs()),
+        lecture,
+        vitesse::bridage_leve(db),
+    )
 }
 
 /// Une piste à mesurer.

@@ -103,6 +103,11 @@ pub struct Demande {
     pub max_jetons: u32,
     /// Demander une réponse JSON quand le fournisseur sait la garantir.
     pub json: bool,
+    /// L'effort de réflexion à demander (`output_config.effort`), pour un
+    /// usage court ([`crate::couts::usage_court`]). Envoyé SEULEMENT aux
+    /// modèles qui l'acceptent ([`crate::couts::accepte_effort`]) : Haiku 4.5
+    /// le refuse par un 400. `None` : l'effort par défaut du modèle.
+    pub effort: Option<&'static str>,
 }
 
 /// Ce que le modèle rend, et ce que l'appel a coûté en jetons.
@@ -160,7 +165,7 @@ impl ErreurFournisseur {
             Self::ModeleInconnu => "Ce modèle n'existe pas chez ce fournisseur.".into(),
             Self::Reseau => "Fournisseur injoignable (réseau).".into(),
             Self::Refus => "Le modèle a refusé de répondre.".into(),
-            Self::CleSansEspaceDeTravail => "Cette clé Anthropic n'est rattachée à aucun espace de travail : créez-en une dans un espace de travail (console.anthropic.com › API keys).".into(),
+            Self::CleSansEspaceDeTravail => "Cette clé Anthropic n'est rattachée à aucun espace de travail : renseignez l'identifiant d'espace de travail dans les réglages de l'assistant, ou créez une clé dans un espace de travail (console.anthropic.com › API keys).".into(),
             Self::Autre {
                 statut,
                 motif: Some(m),
@@ -258,6 +263,11 @@ pub struct Acces {
     pub famille: Famille,
     pub url_base: String,
     pub cle: Option<String>,
+    /// #6730 — Anthropic : l'identifiant d'espace de travail, envoyé dans
+    /// l'en-tête `anthropic-workspace-id` quand il est renseigné (clé
+    /// d'organisation). Ce n'est pas un secret : la console l'affiche, et il
+    /// n'ouvre rien sans la clé. Ignoré des autres fournisseurs.
+    pub espace_de_travail: Option<String>,
 }
 
 // La clé ne s'imprime jamais, même dans un `{:?}` de débogage.
@@ -267,6 +277,7 @@ impl std::fmt::Debug for Acces {
             .field("famille", &self.famille)
             .field("url_base", &self.url_base)
             .field("cle", &self.cle.as_ref().map(|_| "********"))
+            .field("espace_de_travail", &self.espace_de_travail)
             .finish()
     }
 }
@@ -286,6 +297,37 @@ pub fn fabrique_reelle() -> Fabrique {
 }
 
 pub(crate) const DELAI: Duration = Duration::from_secs(90);
+
+/// L'en-tête d'Anthropic qui désigne l'espace de travail d'une clé
+/// d'organisation (#6730).
+pub const ENTETE_ESPACE_DE_TRAVAIL: &str = "anthropic-workspace-id";
+
+/// #6730 — les en-têtes d'authentification d'une requête Anthropic : la clé,
+/// la version, et l'espace de travail s'il est renseigné. Un seul endroit
+/// pour les deux chemins (fournisseur et passerelle de `/ai/query`).
+pub(crate) fn entetes_anthropic(
+    requete: reqwest::RequestBuilder,
+    acces: &Acces,
+) -> reqwest::RequestBuilder {
+    let requete = requete
+        .header("x-api-key", acces.cle.as_deref().unwrap_or(""))
+        .header("anthropic-version", "2023-06-01");
+    match acces.espace_de_travail.as_deref().map(str::trim) {
+        Some(id) if !id.is_empty() => requete.header(ENTETE_ESPACE_DE_TRAVAIL, id),
+        _ => requete,
+    }
+}
+
+/// #6730 — un identifiant d'espace de travail acceptable : non vide,
+/// 128 caractères au plus, lettres, chiffres, `_` et `-` seulement (la
+/// console rend `wrkspc_…`). Tout autre caractère pourrait casser l'en-tête.
+pub fn espace_de_travail_valide(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
 
 pub(crate) fn client() -> &'static reqwest::Client {
     tune_core::http::client::shared()
@@ -352,6 +394,28 @@ pub(crate) fn jetons(v: &Value, cle: &str) -> u64 {
     v.get(cle).and_then(Value::as_u64).unwrap_or(0)
 }
 
+/// Pose `output_config.effort` sur un corps de l'API Messages, si un effort
+/// est demandé ET que `modele` l'accepte. Sinon, le corps reste tel quel.
+pub(crate) fn poser_effort(corps: &mut Value, modele: &str, effort: Option<&str>) {
+    if let Some(e) = effort
+        && crate::couts::accepte_effort(modele)
+    {
+        corps["output_config"] = json!({ "effort": e });
+    }
+}
+
+/// Pose `options.num_ctx` sur un corps d'Ollama (`/api/chat`), d'après la
+/// taille de ce qu'il porte déjà (`messages`, `tools`) et la sortie attendue
+/// ([`crate::couts::num_ctx_ollama`]).
+pub(crate) fn poser_num_ctx(corps: &mut Value, max_sortie: u32) {
+    let taille = corps
+        .get("messages")
+        .map(|m| m.to_string().len())
+        .unwrap_or(0)
+        + corps.get("tools").map(|t| t.to_string().len()).unwrap_or(0);
+    corps["options"] = json!({ "num_ctx": crate::couts::num_ctx_ollama(taille, max_sortie) });
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic
 // ---------------------------------------------------------------------------
@@ -363,21 +427,22 @@ struct Anthropic {
 #[async_trait]
 impl Fournisseur for Anthropic {
     async fn completer(&self, d: &Demande) -> Result<Reponse, ErreurFournisseur> {
-        let corps = json!({
+        let mut corps = json!({
             "model": d.modele,
             "max_tokens": d.max_jetons,
             "system": d.systeme,
             "messages": [{ "role": "user", "content": d.message }],
         });
-        let rep = client()
-            .post(format!("{}/v1/messages", base(&self.acces)))
-            .header("x-api-key", self.acces.cle.as_deref().unwrap_or(""))
-            .header("anthropic-version", "2023-06-01")
-            .timeout(DELAI)
-            .json(&corps)
-            .send()
-            .await
-            .map_err(|e| erreur_reseau(Famille::Anthropic, &e))?;
+        poser_effort(&mut corps, &d.modele, d.effort);
+        let rep = entetes_anthropic(
+            client().post(format!("{}/v1/messages", base(&self.acces))),
+            &self.acces,
+        )
+        .timeout(DELAI)
+        .json(&corps)
+        .send()
+        .await
+        .map_err(|e| erreur_reseau(Famille::Anthropic, &e))?;
         let statut = rep.status().as_u16();
         let texte = rep
             .text()
@@ -495,6 +560,7 @@ impl Fournisseur for Ollama {
         if d.json {
             corps["format"] = json!("json");
         }
+        poser_num_ctx(&mut corps, d.max_jetons);
         let rep = client()
             .post(format!("{}/api/chat", base(&self.acces)))
             .timeout(DELAI)
@@ -623,11 +689,37 @@ mod tests {
     }
 
     #[test]
+    fn l_effort_n_est_pose_que_pour_un_modele_qui_l_accepte() {
+        let mut c = json!({"model": "claude-haiku-5-5"});
+        poser_effort(&mut c, "claude-haiku-5-5", Some("low"));
+        assert_eq!(c["output_config"]["effort"], "low");
+        let mut c = json!({"model": "claude-haiku-4-5"});
+        poser_effort(&mut c, "claude-haiku-4-5", Some("low"));
+        assert!(
+            c.get("output_config").is_none(),
+            "Haiku 4.5 refuse `effort` par un 400 : {c}"
+        );
+        let mut c = json!({});
+        poser_effort(&mut c, "claude-haiku-5-5", None);
+        assert!(c.get("output_config").is_none(), "{c}");
+    }
+
+    #[test]
+    fn ollama_recoit_un_contexte_a_la_taille_de_la_demande() {
+        let long = "x".repeat(60_000);
+        let mut c = json!({"messages": [{"role": "user", "content": long}]});
+        poser_num_ctx(&mut c, 4096);
+        let n = c["options"]["num_ctx"].as_u64().unwrap();
+        assert!(n >= 20_000 + 4096, "contexte trop court : {n}");
+    }
+
+    #[test]
     fn le_debogage_d_un_acces_ne_montre_pas_la_cle() {
         let a = Acces {
             famille: Famille::Anthropic,
             url_base: String::new(),
             cle: Some("sk-ant-secret-123456".into()),
+            espace_de_travail: Some("wrkspc_01Essai".into()),
         };
         let vu = format!("{a:?}");
         assert!(!vu.contains("secret"), "{vu}");

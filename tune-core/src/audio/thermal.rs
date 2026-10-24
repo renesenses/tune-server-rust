@@ -602,6 +602,26 @@ pub fn brider_sans_thermometre(largeur: usize, lecture: &LectureThermique) -> us
     }
 }
 
+/// #6713 — la largeur des lots, avec le choix de l'utilisateur de LEVER le
+/// bridage quand la température est illisible (réglage
+/// `taches_de_fond::vitesse::CLE_LEVER_LE_BRIDAGE`, désactivé par défaut).
+///
+/// Le choix ne porte QUE sur le cas « illisible » (aucun capteur, zone
+/// figée) : une température lisible garde la largeur réglée, et sa garde
+/// ([`ThermalGate`]) arrête toujours les analyses au-delà de
+/// [`PAUSE_ABOVE_C`] — rien ici ne la contourne. Sans le choix, c'est le
+/// bridage de #5410, maintenu par la décision du 20/10/2026 (#6450).
+pub fn largeur_selon_la_chaleur(
+    largeur: usize,
+    lecture: &LectureThermique,
+    bridage_leve: bool,
+) -> usize {
+    match lecture {
+        LectureThermique::Illisible(_) if bridage_leve => largeur.max(1),
+        _ => brider_sans_thermometre(largeur, lecture),
+    }
+}
+
 /// Lectures nécessaires avant de déclarer une zone figée.
 const LECTURES_AVANT_VERDICT: u32 = 20;
 /// Durée d'observation nécessaire avant de déclarer une zone figée.
@@ -725,7 +745,8 @@ pub fn lecture_thermique() -> LectureThermique {
                 motif = m.id(),
                 largeur = LARGEUR_SANS_THERMOMETRE,
                 "analyses_bridees_sans_thermometre — température non lisible sur cette machine : \
-                 les analyses de fond passent à un fichier à la fois"
+                 les analyses de fond passent à un fichier à la fois, sauf si le bridage est \
+                 levé dans les réglages (#6713)"
             ),
             None if precedente.is_some() => {
                 info!("analyses_debridees — la température est de nouveau lisible")

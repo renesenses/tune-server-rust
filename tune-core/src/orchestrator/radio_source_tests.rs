@@ -162,7 +162,7 @@ async fn radio_4346_flac_probe_keeps_original_resolution_5336() {
             format: Some("flac"),
             sample_rate: Some(96_000),
             bit_depth: Some(24),
-            bitrate_kbps: None,
+            ..Default::default()
         }),
         "source must retain 24-bit FLAC even though the radio output is 16-bit WAV"
     );

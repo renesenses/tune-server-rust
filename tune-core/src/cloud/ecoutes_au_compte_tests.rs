@@ -640,3 +640,152 @@ async fn le_rattrapage_est_borne_en_date_et_en_nombre() {
             .all(|c| { c["listens"].as_array().unwrap().len() as i64 <= TAILLE_DU_LOT })
     );
 }
+
+// ---------------------------------------------------------------------------
+// #6840 — le consentement à trois états.
+// ---------------------------------------------------------------------------
+
+/// LE témoin de #6840 : sur un serveur relié, avec des écoutes à envoyer,
+/// RIEN ne part tant que le consentement n'est pas « accepté » — ni quand il
+/// est à demander, ni après « Non », ni après deux fermetures sans réponse.
+/// Seul « Oui » fait partir le lot.
+#[tokio::test]
+async fn rien_ne_part_avant_un_oui_6840() {
+    let (url, site) = faux_site().await;
+    let b = base();
+    bibliotheque(&b);
+    ecoute(
+        &b,
+        1,
+        "So What",
+        Some(10),
+        "local",
+        "2026-10-18T20:00:00Z",
+        Some(1),
+    );
+    relier(&b, &url);
+    let s = reglages(&b);
+
+    // Jamais demandé : à demander, rien ne part.
+    assert_eq!(consentement(&s), Consentement::ADemander);
+    assert_eq!(
+        passe(&b, &http(), maintenant()).await,
+        Issue::Rien("disabled"),
+        "à demander : l'envoi est parti sans réponse"
+    );
+    // Une fermeture sans réponse : toujours à demander, toujours rien.
+    enregistrer_reponse(&s, Reponse::Fermee, maintenant()).unwrap();
+    assert_eq!(consentement(&s), Consentement::ADemander);
+    assert_eq!(
+        passe(&b, &http(), maintenant()).await,
+        Issue::Rien("disabled")
+    );
+    // Deuxième fermeture : refusé, rien.
+    enregistrer_reponse(&s, Reponse::Fermee, maintenant()).unwrap();
+    assert_eq!(consentement(&s), Consentement::Refuse);
+    assert_eq!(
+        passe(&b, &http(), maintenant()).await,
+        Issue::Rien("disabled")
+    );
+    // « Non » explicite : rien.
+    enregistrer_reponse(&s, Reponse::Non, maintenant()).unwrap();
+    assert_eq!(
+        passe(&b, &http(), maintenant()).await,
+        Issue::Rien("disabled")
+    );
+    {
+        let site = site.lock().unwrap();
+        assert!(
+            site.corps.is_empty(),
+            "le site a reçu des écoutes sans consentement : {:?}",
+            site.corps
+        );
+        assert_eq!(site.liaisons, 0);
+    }
+    assert_eq!(curseur(&b), None, "un curseur posé sans consentement");
+
+    // « Oui » : le lot part.
+    assert_eq!(
+        enregistrer_reponse(&s, Reponse::Oui, maintenant()).unwrap(),
+        Consentement::Accepte
+    );
+    assert!(matches!(
+        passe(&b, &http(), maintenant()).await,
+        Issue::Envoye { ecoutes: 1, .. }
+    ));
+    assert_eq!(site.lock().unwrap().corps.len(), 1);
+}
+
+/// Fermée sans réponse : redemandée UNE fois, puis plus jamais. La deuxième
+/// fermeture date le refus ; une troisième ne change rien.
+#[test]
+fn une_seule_relance_apres_une_fermeture_6840() {
+    let b = base();
+    let s = reglages(&b);
+    assert_eq!(fermetures_sans_reponse(&s), 0);
+    assert_eq!(
+        enregistrer_reponse(&s, Reponse::Fermee, maintenant()).unwrap(),
+        Consentement::ADemander,
+        "la première fermeture doit laisser la question à poser une fois encore"
+    );
+    assert_eq!(fermetures_sans_reponse(&s), 1);
+    assert_eq!(date_du_consentement(&s), None);
+    assert_eq!(
+        enregistrer_reponse(&s, Reponse::Fermee, maintenant()).unwrap(),
+        Consentement::Refuse,
+        "la deuxième fermeture doit clore la question"
+    );
+    assert_eq!(fermetures_sans_reponse(&s), FERMETURES_MAX);
+    assert_eq!(
+        date_du_consentement(&s).as_deref(),
+        Some(maintenant().to_rfc3339().as_str())
+    );
+    enregistrer_reponse(&s, Reponse::Fermee, maintenant()).unwrap();
+    assert_eq!(fermetures_sans_reponse(&s), FERMETURES_MAX);
+    assert_eq!(consentement(&s), Consentement::Refuse);
+    // Le réglage reste accessible : un « Oui » plus tard vaut.
+    enregistrer_reponse(&s, Reponse::Oui, maintenant()).unwrap();
+    assert!(envoi_active(&s));
+}
+
+/// Un serveur qui avait DÉJÀ coché la bascule avant la rc8 reste accepté,
+/// sans re-question ; une fermeture ne lui retire rien. Une bascule décochée
+/// avant la rc8 était un geste : refusé, pas « à demander ».
+#[test]
+fn deja_active_reste_accepte_6840() {
+    let b = base();
+    let s = reglages(&b);
+    s.set(CLE_ACTIVATION, "true").unwrap();
+    assert_eq!(consentement(&s), Consentement::Accepte);
+    assert_eq!(
+        enregistrer_reponse(&s, Reponse::Fermee, maintenant()).unwrap(),
+        Consentement::Accepte
+    );
+    assert_eq!(fermetures_sans_reponse(&s), 0);
+    assert!(envoi_active(&s));
+
+    let b = base();
+    let s = reglages(&b);
+    s.set(CLE_ACTIVATION, "false").unwrap();
+    assert_eq!(consentement(&s), Consentement::Refuse);
+}
+
+/// La réponse date le choix et garde la bascule en phase ; un « accepté »
+/// contredit par une bascule écrite fausse depuis vaut refus.
+#[test]
+fn la_reponse_est_datee_et_la_bascule_suit_6840() {
+    let b = base();
+    let s = reglages(&b);
+    enregistrer_reponse(&s, Reponse::Oui, maintenant()).unwrap();
+    assert_eq!(s.get(CLE_ACTIVATION).unwrap().as_deref(), Some("true"));
+    assert_eq!(s.get(CLE_CONSENTEMENT).unwrap().as_deref(), Some("accepte"));
+    assert!(date_du_consentement(&s).is_some());
+    s.set(CLE_ACTIVATION, "false").unwrap();
+    assert_eq!(consentement(&s), Consentement::Refuse);
+    enregistrer_reponse(&s, Reponse::Non, maintenant()).unwrap();
+    assert_eq!(s.get(CLE_ACTIVATION).unwrap().as_deref(), Some("false"));
+    assert_eq!(Reponse::depuis("accepte"), Some(Reponse::Oui));
+    assert_eq!(Reponse::depuis("refuse"), Some(Reponse::Non));
+    assert_eq!(Reponse::depuis("fermee"), Some(Reponse::Fermee));
+    assert_eq!(Reponse::depuis("oui"), None);
+}

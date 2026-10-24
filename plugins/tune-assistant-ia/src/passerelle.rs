@@ -139,6 +139,20 @@ impl Passerelle {
         }
     }
 
+    /// Transcrit un audio (Whisper) : clé au coffre, coût compté dans le
+    /// plafond de l'assistant et refusé AVANT l'envoi s'il le ferait franchir
+    /// ([`crate::transcription`]). `cle_env` : `TUNE_OPENAI_API_KEY`, repli
+    /// rétro-compatible quand aucune clé n'est au coffre.
+    pub async fn transcrire(
+        &self,
+        audio: &[u8],
+        cle_env: Option<&str>,
+    ) -> Result<crate::transcription::Transcription, ErreurAppel> {
+        self.migrer();
+        crate::transcription::transcrire(&self.backend, &self.coffre, &self.verrou, audio, cle_env)
+            .await
+    }
+
     /// L'ancien assistant peut-il dialoguer ? Étape 3 : avec tout
     /// fournisseur de l'assistant prêt (Anthropic, compatible OpenAI, Gemini,
     /// Ollama) — le dialogue à outils est traduit par [`crate::dialogue`].
@@ -250,6 +264,7 @@ impl Passerelle {
                             if !fonctions.is_empty() {
                                 corps["tools"] = json!(fonctions);
                             }
+                            fournisseur::poser_num_ctx(&mut corps, max_jetons);
                             fournisseur::client()
                                 .post(format!("{}/api/chat", fournisseur::base(acces)))
                                 .timeout(fournisseur::DELAI)
@@ -304,12 +319,18 @@ impl Passerelle {
                 if outils.as_array().is_some_and(|o| !o.is_empty()) {
                     corps["tools"] = outils.clone();
                 }
-                fournisseur::client()
-                    .post(format!("{}/v1/messages", fournisseur::base(acces)))
-                    .header("x-api-key", acces.cle.as_deref().unwrap_or(""))
-                    .header("anthropic-version", "2023-06-01")
-                    .timeout(fournisseur::DELAI)
-                    .json(&corps)
+                // Une commande de `/ai/query` est un usage court (23/10/2026).
+                fournisseur::poser_effort(
+                    &mut corps,
+                    modele,
+                    crate::couts::usage_court(USAGE_REQUETE).then_some(crate::couts::EFFORT_COURT),
+                );
+                fournisseur::entetes_anthropic(
+                    fournisseur::client().post(format!("{}/v1/messages", fournisseur::base(acces))),
+                    acces,
+                )
+                .timeout(fournisseur::DELAI)
+                .json(&corps)
             },
             |v| {
                 let u = v.get("usage").cloned().unwrap_or(Value::Null);

@@ -13,8 +13,30 @@
 //!    chaîne de la copie de bibliothèque et de Tune Circle, prise telle
 //!    quelle : [`super::sauvegarde_config::compte`] pour la lire,
 //!    [`super::library_sync::lier_le_serveur`] pour relier une fois ;
-//! 2. le réglage [`CLE_ACTIVATION`] vaut vrai. **Désactivé par défaut** : sans
-//!    geste de l'utilisateur, rien ne part, jamais.
+//! 2. le consentement vaut [`Consentement::Accepte`] (#6840). **Rien n'est
+//!    accepté par défaut** : sans réponse de l'utilisateur, rien ne part,
+//!    jamais.
+//!
+//! ## Le consentement : trois états, pas deux (#6840)
+//!
+//! Jusqu'à la rc8, le seul réglage [`CLE_ACTIVATION`] disait tout, et son
+//! absence valait « non » : impossible de distinguer un utilisateur qui a
+//! refusé d'un utilisateur à qui on n'a jamais rien demandé. Or la rc8 POSE la
+//! question au premier démarrage (consentement actif, CNIL/RGPD : aucune case
+//! précochée). D'où [`consentement`], qui rend :
+//!
+//! - [`Consentement::ADemander`] : jamais répondu — la fenêtre du client
+//!   s'ouvre (sur un serveur relié), et **rien ne part** ;
+//! - [`Consentement::Accepte`] : « Oui, partager », ou la bascule des Réglages
+//!   cochée — seul état qui laisse partir quoi que ce soit ;
+//! - [`Consentement::Refuse`] : « Non », la bascule décochée, ou la question
+//!   fermée [`FERMETURES_MAX`] fois sans réponse (le silence ne vaut jamais
+//!   accord : il vaut « ne plus demander »).
+//!
+//! La réponse s'écrit par [`enregistrer_reponse`], qui date le choix
+//! ([`CLE_CONSENTEMENT_DATE`]) et garde [`CLE_ACTIVATION`] en phase. Un
+//! serveur qui avait DÉJÀ coché la bascule avant la rc8 (activation vraie,
+//! pas d'état écrit) reste [`Consentement::Accepte`] : pas de re-question.
 //!
 //! ## Ce qui part, et ce qui ne part jamais
 //!
@@ -70,6 +92,22 @@ use crate::db::settings_repo::SettingsRepo;
 pub const CLE_ACTIVATION: &str = "cloud_listens_upload_enabled";
 /// Désactivé par défaut : opt-in strict.
 pub const ACTIVATION_DEFAUT: bool = false;
+/// #6840 — l'état du consentement écrit avec la réponse : `accepte` ou
+/// `refuse`. Absent : [`Consentement::ADemander`] (sauf serveur déjà activé).
+/// Préfixe `cloud_` : exclu de la sauvegarde de configuration, comme les
+/// autres réglages de ce serveur-ci auprès du compte.
+pub const CLE_CONSENTEMENT: &str = "cloud_listens_consent_state";
+/// #6840 — la clé de la RÉPONSE dans `PATCH /system/config`
+/// (`accepte`, `refuse`, `fermee`), et celle de l'état publié par
+/// `GET /system/config`. Elle n'est jamais écrite telle quelle en base.
+pub const CLE_REPONSE: &str = "cloud_listens_consent";
+/// #6840 — date de la réponse (RFC 3339).
+pub const CLE_CONSENTEMENT_DATE: &str = "cloud_listens_consent_at";
+/// #6840 — combien de fois la question a été fermée sans réponse.
+pub const CLE_FERMETURES: &str = "cloud_listens_consent_dismissals";
+/// #6840 — fermée sans réponse : redemandée UNE fois au démarrage suivant,
+/// puis plus jamais. À la deuxième fermeture, l'état passe à « refusé ».
+pub const FERMETURES_MAX: u32 = 2;
 /// Dernier `listen_history.id` accepté par le site.
 pub const CLE_CURSEUR: &str = "cloud_listens_cursor";
 /// Plancher de date du rattrapage, fixé à l'activation.
@@ -94,14 +132,145 @@ pub const CADENCE_SECONDES: u64 = 300;
 /// le site accepte).
 pub const LONGUEUR_MAX: usize = 300;
 
-/// L'utilisateur a-t-il activé l'envoi ? Absent, illisible ou autre : non.
-pub fn envoi_active(settings: &SettingsRepo) -> bool {
+/// #6840 — l'état du consentement au partage des écoutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consentement {
+    /// Jamais répondu : la question est à poser, rien ne part.
+    ADemander,
+    /// « Oui » : l'envoi peut partir.
+    Accepte,
+    /// « Non », ou la question fermée [`FERMETURES_MAX`] fois sans réponse.
+    Refuse,
+}
+
+impl Consentement {
+    /// Le mot publié par `GET /system/config` (`cloud_listens_consent.state`).
+    pub fn id(self) -> &'static str {
+        match self {
+            Consentement::ADemander => "a_demander",
+            Consentement::Accepte => "accepte",
+            Consentement::Refuse => "refuse",
+        }
+    }
+}
+
+/// Une réponse à la question, telle que le client l'envoie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reponse {
+    /// « Oui, partager ».
+    Oui,
+    /// « Non ».
+    Non,
+    /// La fenêtre fermée sans réponse.
+    Fermee,
+}
+
+impl Reponse {
+    /// Le mot reçu par `PATCH /system/config` (`cloud_listens_consent`).
+    pub fn depuis(mot: &str) -> Option<Reponse> {
+        match mot.trim() {
+            "accepte" => Some(Reponse::Oui),
+            "refuse" => Some(Reponse::Non),
+            "fermee" => Some(Reponse::Fermee),
+            _ => None,
+        }
+    }
+}
+
+fn lire(settings: &SettingsRepo, cle: &str) -> Option<String> {
     settings
-        .get(CLE_ACTIVATION)
+        .get(cle)
         .ok()
         .flatten()
-        .map(|v| est_vrai(&v))
-        .unwrap_or(ACTIVATION_DEFAUT)
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// L'état du consentement, relu à chaque passage.
+///
+/// - état écrit `refuse` : refusé ;
+/// - état écrit `accepte` : accepté, SAUF si la bascule a été écrite fausse
+///   depuis (une restauration partielle, une écriture directe) : dans le
+///   doute, refusé — jamais l'inverse ;
+/// - pas d'état écrit (ou illisible) : la bascule d'avant la rc8 décide si
+///   elle existe (vraie : accepté, sans re-question ; fausse : refusé, c'était
+///   un geste) ; absente : **à demander**.
+pub fn consentement(settings: &SettingsRepo) -> Consentement {
+    let activation = lire(settings, CLE_ACTIVATION).map(|v| est_vrai(&v));
+    match lire(settings, CLE_CONSENTEMENT).as_deref() {
+        Some("refuse") => Consentement::Refuse,
+        Some("accepte") if activation == Some(false) => Consentement::Refuse,
+        Some("accepte") => Consentement::Accepte,
+        _ => match activation {
+            Some(true) => Consentement::Accepte,
+            Some(false) => Consentement::Refuse,
+            None => Consentement::ADemander,
+        },
+    }
+}
+
+/// La date de la réponse, si elle a été écrite (pas pour un serveur activé
+/// avant la rc8, qui n'en a jamais eu).
+pub fn date_du_consentement(settings: &SettingsRepo) -> Option<String> {
+    lire(settings, CLE_CONSENTEMENT_DATE)
+}
+
+/// Combien de fois la question a été fermée sans réponse.
+pub fn fermetures_sans_reponse(settings: &SettingsRepo) -> u32 {
+    lire(settings, CLE_FERMETURES)
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Écrit la réponse et rend l'état qui en résulte.
+///
+/// `Oui` et `Non` sont des réponses : l'état, la date et la bascule
+/// [`CLE_ACTIVATION`] sont écrits, quel que soit l'état d'avant (c'est aussi
+/// le chemin de la bascule des Réglages). `Fermee` n'en est pas une : elle ne
+/// compte que tant que la question est à poser, et la [`FERMETURES_MAX`]-ième
+/// fait passer à « refusé », daté, pour ne plus jamais redemander.
+///
+/// Ordre des écritures : ce qui ferme la porte d'abord. Une écriture qui
+/// échoue à mi-chemin laisse donc « refusé », jamais « accepté ».
+pub fn enregistrer_reponse(
+    settings: &SettingsRepo,
+    reponse: Reponse,
+    maintenant: DateTime<Utc>,
+) -> Result<Consentement, String> {
+    let date = maintenant.to_rfc3339();
+    match reponse {
+        Reponse::Oui => {
+            settings.set(CLE_ACTIVATION, "true")?;
+            settings.set(CLE_CONSENTEMENT_DATE, &date)?;
+            settings.set(CLE_CONSENTEMENT, Consentement::Accepte.id())?;
+        }
+        Reponse::Non => {
+            settings.set(CLE_CONSENTEMENT, Consentement::Refuse.id())?;
+            settings.set(CLE_ACTIVATION, "false")?;
+            settings.set(CLE_CONSENTEMENT_DATE, &date)?;
+        }
+        Reponse::Fermee => {
+            if consentement(settings) != Consentement::ADemander {
+                return Ok(consentement(settings));
+            }
+            let n = fermetures_sans_reponse(settings).saturating_add(1);
+            if n >= FERMETURES_MAX {
+                settings.set(CLE_CONSENTEMENT, Consentement::Refuse.id())?;
+                settings.set(CLE_ACTIVATION, "false")?;
+                settings.set(CLE_CONSENTEMENT_DATE, &date)?;
+            }
+            settings.set(CLE_FERMETURES, &n.to_string())?;
+        }
+    }
+    let etat = consentement(settings);
+    info!(etat = etat.id(), ?reponse, "cloud_listens_consent_recorded");
+    Ok(etat)
+}
+
+/// L'envoi peut-il partir ? Seulement sur un consentement **accepté** : à
+/// demander, refusé, illisible — non (#6840).
+pub fn envoi_active(settings: &SettingsRepo) -> bool {
+    consentement(settings) == Consentement::Accepte
 }
 
 /// Ce qu'un passage a fait.

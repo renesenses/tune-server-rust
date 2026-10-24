@@ -61,6 +61,11 @@ impl Cache {
         }
     }
 
+    /// Retire une entrée (sans erreur si elle n'existe pas).
+    pub fn effacer(&self, cle: &str) {
+        let _ = std::fs::remove_file(self.chemin(cle));
+    }
+
     fn elaguer(&self) {
         let Ok(entrees) = std::fs::read_dir(&self.dossier) else {
             return;

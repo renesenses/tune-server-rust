@@ -413,6 +413,27 @@ pub struct LabelInfo {
     pub albums: Vec<StreamAlbum>,
 }
 
+/// #6934 — une PAGE du catalogue d'un label, lue par son identifiant chez le
+/// service (Qobuz `label/get`, `extra=albums`) : la page « Label » et son
+/// « Voir tout ».
+///
+/// `total` est le compte que le service annonce pour tout le catalogue,
+/// précommandes comprises ; `albums` n'en garde que les albums sortis et
+/// écoutables, si bien qu'une page peut en compter moins que `limit`. La page
+/// suivante commence à `offset + limit` tant que cette somme est sous `total`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelPage {
+    pub id: String,
+    pub name: String,
+    /// Le logo du label chez le service, seulement une adresse http(s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub albums: Vec<StreamAlbum>,
+}
+
 /// An editorial playlist tag/category (Qobuz `playlist/getTags`): moods,
 /// "Focus", genres… Used to browse curated playlists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -852,6 +873,25 @@ pub trait StreamingService: Send + Sync {
     /// returns it with its full catalogue. Album-based so the shared
     /// `StreamAlbum` model need not carry a label id.
     async fn get_album_label(&self, _album_id: &str) -> Result<LabelInfo, TuneError> {
+        Err(TuneError::Unsupported(
+            "labels not supported for this service".into(),
+        ))
+    }
+    /// #6934 — TOUT le catalogue d'un label (borné par le service : 500
+    /// albums chez Qobuz, sans précommandes), pour en tirer ses artistes.
+    async fn get_label_catalogue(&self, _label_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
+        Err(TuneError::Unsupported(
+            "labels not supported for this service".into(),
+        ))
+    }
+    /// #6934 — une page du catalogue d'un label, par son identifiant chez le
+    /// service. `limit` est déjà borné par la route.
+    async fn get_label(
+        &self,
+        _label_id: &str,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<LabelPage, TuneError> {
         Err(TuneError::Unsupported(
             "labels not supported for this service".into(),
         ))

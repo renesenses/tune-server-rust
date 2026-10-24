@@ -98,6 +98,8 @@ fn cede_tout(id: &str) -> bool {
         Tache::Acoustique.id(),
         // #6285 — la passe des faux hi-res décode un extrait par piste.
         Tache::FauxHiRes.id(),
+        // #6286 — l'audit d'intégrité décode chaque fichier en entier.
+        Tache::Integrite.id(),
     ]
     .contains(&id)
 }
@@ -187,6 +189,9 @@ fn avancement(state: &AppState, tache: Tache) -> Value {
         // #6285 — la passe ne publie pas d'avancement sans requête (le
         // nombre de candidats se compte en base).
         Tache::FauxHiRes => Value::Null,
+        // #6286 — l'avancement de l'audit se lit sur `GET /library/integrity`
+        // (fichiers traités et total), pas au registre des tâches.
+        Tache::Integrite => Value::Null,
         Tache::Enrichissement | Tache::ImagesArtistes | Tache::Identification => state
             .background_tasks
             .snapshot()
@@ -209,14 +214,18 @@ fn avancement(state: &AppState, tache: Tache) -> Value {
 ///
 /// `lecture` vaut `None` quand le capteur n'a pas répondu à temps : la route
 /// ne bloque pas l'écran sur une requête PDH lente, et ne prétend rien.
+///
+/// `bridage_leve` : le réglage de #6713 (`vitesse::bridage_leve`), qui rend
+/// la vitesse réglée quand la température est illisible.
 pub(crate) fn bloc_thermique(
     lecture: Option<LectureThermique>,
     vitesse: Vitesse,
     coeurs: usize,
     gardes_chaudes: &[String],
+    bridage_leve: bool,
 ) -> Value {
     let reglee = vitesse.largeur(coeurs);
-    let effective = lecture.map(|l| thermal::brider_sans_thermometre(reglee, &l));
+    let effective = lecture.map(|l| thermal::largeur_selon_la_chaleur(reglee, &l, bridage_leve));
     let motif = lecture.and_then(|l| l.motif_du_bridage()).map(|m| m.id());
     json!({
         "readable": lecture.map(|l| l.celsius().is_some()),
@@ -225,8 +234,13 @@ pub(crate) fn bloc_thermique(
             .map(|c| (c * 10.0).round() / 10.0),
         // #6450 — sans température lisible, les analyses sont bridées à
         // `width_effective` fichier(s) à la fois, quelle que soit la vitesse.
-        "throttled": motif.is_some(),
+        // #6713 — sauf si l'utilisateur a levé ce bridage : `throttled` est
+        // alors faux, `reason` dit toujours pourquoi la température manque,
+        // et `throttle_lifted_by_user` le dit.
+        "throttled": motif.is_some() && !bridage_leve,
         "reason": motif,
+        "throttle_lifted_by_user": motif.is_some() && bridage_leve,
+        "unthrottle_unreadable_temperature": bridage_leve,
         "speed": vitesse.id(),
         "width_configured": reglee,
         "width_effective": effective,
@@ -315,6 +329,7 @@ pub(crate) fn ce_qui_tourne(state: &AppState, lecture: Option<LectureThermique>)
             tune_core::taches_de_fond::vitesse::vitesse(&state.backend),
             tune_core::taches_de_fond::vitesse::coeurs(),
             &gardes_chaudes,
+            tune_core::taches_de_fond::vitesse::bridage_leve(&state.backend),
         ),
     })
 }
@@ -384,6 +399,7 @@ mod tests {
             Vitesse::Rapide,
             16,
             &[],
+            false,
         );
         assert_eq!(illisible["readable"], false, "{illisible}");
         assert_eq!(illisible["throttled"], true, "{illisible}");
@@ -396,6 +412,7 @@ mod tests {
             Vitesse::Normale,
             16,
             &[],
+            false,
         );
         assert_eq!(figee["reason"], "temperature_figee", "{figee}");
         assert_eq!(figee["width_effective"], 1, "{figee}");
@@ -405,6 +422,7 @@ mod tests {
             Vitesse::Rapide,
             16,
             &["replaygain".to_string()],
+            false,
         );
         assert_eq!(lisible["readable"], true, "{lisible}");
         assert_eq!(lisible["temp_c"], 61.3, "{lisible}");
@@ -414,9 +432,62 @@ mod tests {
         assert_eq!(lisible["held_passes"], json!(["replaygain"]), "{lisible}");
 
         // Capteur trop lent : rien n'est prétendu.
-        let muet = bloc_thermique(None, Vitesse::Normale, 16, &[]);
+        let muet = bloc_thermique(None, Vitesse::Normale, 16, &[], false);
         assert_eq!(muet["readable"], Value::Null, "{muet}");
         assert_eq!(muet["width_effective"], Value::Null, "{muet}");
         assert_eq!(muet["width_configured"], 2, "{muet}");
+    }
+
+    /// #6713 — le bridage levé par l'utilisateur rend la vitesse réglée quand
+    /// la température est ILLISIBLE, et le dit. Il ne change rien quand une
+    /// température est lue : la garde chaude retient toujours ses passes.
+    #[test]
+    fn le_bridage_leve_ne_vaut_que_sans_temperature_6713() {
+        let leve = bloc_thermique(
+            Some(LectureThermique::Illisible(MotifIllisible::AucunCapteur)),
+            Vitesse::Rapide,
+            16,
+            &[],
+            true,
+        );
+        assert_eq!(leve["throttled"], false, "{leve}");
+        assert_eq!(leve["throttle_lifted_by_user"], true, "{leve}");
+        assert_eq!(leve["reason"], "temperature_illisible", "{leve}");
+        assert_eq!(leve["width_effective"], 4, "{leve}");
+        assert_eq!(leve["unthrottle_unreadable_temperature"], true, "{leve}");
+
+        let figee = bloc_thermique(
+            Some(LectureThermique::Illisible(MotifIllisible::Figee)),
+            Vitesse::Normale,
+            16,
+            &[],
+            true,
+        );
+        assert_eq!(figee["width_effective"], 2, "{figee}");
+        assert_eq!(figee["throttle_lifted_by_user"], true, "{figee}");
+
+        // Température lue, et chaude : le réglage n'y touche pas.
+        let chaude = bloc_thermique(
+            Some(LectureThermique::Lisible(85.0)),
+            Vitesse::Rapide,
+            16,
+            &["replaygain".to_string()],
+            true,
+        );
+        assert_eq!(chaude["throttled"], false, "{chaude}");
+        assert_eq!(chaude["throttle_lifted_by_user"], false, "{chaude}");
+        assert_eq!(chaude["held_passes"], json!(["replaygain"]), "{chaude}");
+        assert_eq!(chaude["width_effective"], 4, "{chaude}");
+
+        // Sans le réglage, le bridage par défaut reste (#6450).
+        let defaut = bloc_thermique(
+            Some(LectureThermique::Illisible(MotifIllisible::AucunCapteur)),
+            Vitesse::Rapide,
+            16,
+            &[],
+            false,
+        );
+        assert_eq!(defaut["throttle_lifted_by_user"], false, "{defaut}");
+        assert_eq!(defaut["width_effective"], 1, "{defaut}");
     }
 }

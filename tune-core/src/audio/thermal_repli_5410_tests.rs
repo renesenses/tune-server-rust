@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use super::{
     LectureThermique, MotifIllisible, SuiviDeStabilite, brider_sans_thermometre,
-    celsius_depuis_dixiemes_de_kelvin, celsius_depuis_kelvins,
+    celsius_depuis_dixiemes_de_kelvin, celsius_depuis_kelvins, largeur_selon_la_chaleur,
 };
 
 #[test]
@@ -41,6 +41,41 @@ fn sans_temperature_lisible_les_analyses_passent_a_un_fichier() {
         1,
         "une zone figée bride aussi"
     );
+}
+
+/// #6713 — le bridage levé par l'utilisateur rend la vitesse réglée quand la
+/// température est ILLISIBLE (aucun capteur ou zone figée), et seulement
+/// alors. Sans le réglage, c'est le bridage de #5410 (#6450).
+#[test]
+fn le_bridage_leve_rend_la_vitesse_reglee_sans_temperature_6713() {
+    for motif in [MotifIllisible::AucunCapteur, MotifIllisible::Figee] {
+        let illisible = LectureThermique::Illisible(motif);
+        assert_eq!(
+            largeur_selon_la_chaleur(4, &illisible, true),
+            4,
+            "{motif:?}"
+        );
+        assert_eq!(
+            largeur_selon_la_chaleur(2, &illisible, true),
+            2,
+            "{motif:?}"
+        );
+        assert_eq!(
+            largeur_selon_la_chaleur(0, &illisible, true),
+            1,
+            "jamais zéro"
+        );
+        assert_eq!(
+            largeur_selon_la_chaleur(4, &illisible, false),
+            1,
+            "{motif:?} : sans le réglage, le bridage par défaut reste"
+        );
+    }
+    // Une température LUE ne dépend pas du réglage : la largeur réglée, et
+    // c'est la garde chaude (`ThermalGate`) qui arrête au-delà de 80 °C.
+    let chaude = LectureThermique::Lisible(85.0);
+    assert_eq!(largeur_selon_la_chaleur(4, &chaude, true), 4);
+    assert_eq!(largeur_selon_la_chaleur(4, &chaude, false), 4);
 }
 
 #[test]

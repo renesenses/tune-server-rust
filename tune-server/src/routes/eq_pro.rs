@@ -25,6 +25,8 @@ pub fn router() -> Router<AppState> {
         .route("/autoeq/search", get(autoeq_search))
         .route("/autoeq/import", post(autoeq_import))
         .route("/bands", get(get_bands))
+        // #6709 — modes propres de la pièce : un CALCUL, rien n'est appliqué.
+        .route("/room-modes", post(room_modes))
         .route(
             "/expert-settings",
             get(get_expert_settings).post(set_expert_settings),
@@ -702,6 +704,137 @@ fn enregistrer_profil_autoeq(
     Ok((StatusCode::CREATED, Json(corps)).into_response())
 }
 
+/// Le plus de modes rendus dans `modes` : une grande pièce en compte des
+/// milliers sous 250 Hz, l'écran n'en montre que les plus couplés.
+const MODES_RENDUS_MAX: usize = 60;
+
+/// `x` arrondi à `decimales` décimales (34,3 reste 34,3, pas 34,300000000000004).
+fn arrondi(x: f64, decimales: i32) -> f64 {
+    let k = 10_f64.powi(decimales);
+    (x * k).round() / k
+}
+
+/// #6709 (Tades, fil 2364) — les modes propres d'une pièce, et 5 à 10 filtres
+/// en cloche qui les ATTÉNUENT à la place d'écoute.
+///
+/// ## Un calcul, pas un réglage
+///
+/// La route ne lit ni n'écrit aucune zone : elle rend des bandes. L'écran les
+/// montre, l'auditeur les retouche, puis elles partent par
+/// `POST /zones/{id}/eq`, le chemin de l'égaliseur paramétrique — même
+/// cascade, même préampli automatique, même fondu de bascule (#5215). D'où
+/// l'absence de porte Premium ici : c'est l'écriture qui la porte.
+///
+/// ## Jamais de gain positif
+///
+/// Chaque `filters[].gain` est entre −20 et −3 dB, par construction
+/// ([`tune_core::audio::modes_de_piece::FiltreDeMode::gain_db`]). Les gains
+/// sont arrondis au dixième de dB VERS LE BAS (plus d'atténuation) : un
+/// arrondi ne peut pas en faire un zéro ni un positif.
+///
+/// ## Refus
+///
+/// Corps illisible, champ manquant, dimension nulle, négative, énorme ou non
+/// finie, auditeur hors de la pièce ou derrière les enceintes : `400`, avec
+/// une clé stable (`error`), le champ fautif (`field`) et une phrase
+/// (`message`). Rien n'est borné en silence.
+async fn room_modes(
+    corps: Result<
+        Json<tune_core::audio::modes_de_piece::Piece>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> axum::response::Response {
+    use tune_core::audio::modes_de_piece as m;
+    let piece = match corps {
+        Ok(Json(p)) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "room_body_invalid",
+                    "field": null,
+                    "message": e.body_text(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let prop = match m::proposer(&piece) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": e.cle(),
+                    "field": e.champ(),
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    Json(corps_des_modes(&prop, MODES_RENDUS_MAX)).into_response()
+}
+
+/// Le corps de `POST /eq/room-modes`, séparé de la route pour être testé.
+fn corps_des_modes(
+    prop: &tune_core::audio::modes_de_piece::Proposition,
+    modes_max: usize,
+) -> Value {
+    use tune_core::audio::modes_de_piece as m;
+    let filtres: Vec<Value> = prop
+        .filtres
+        .iter()
+        .map(|f| {
+            // Vers le BAS : −7,04 devient −7,1, jamais −7,0 ni plus haut.
+            let gain = (f.gain_db() * 10.0).floor() / 10.0;
+            json!({
+                "freq": arrondi(f.freq_hz, 1),
+                "gain": gain.max(-m::ATTENUATION_MAX_DB),
+                "q": arrondi(f.q, 1).clamp(m::Q_MIN, m::Q_MAX),
+                "type": "peak",
+                "modes": f.modes,
+            })
+        })
+        .collect();
+    // Les plus couplés d'abord pour le choix, rendus par fréquence.
+    let mut modes: Vec<&m::Mode> = prop.modes.iter().collect();
+    modes.sort_by(|a, b| b.couplage.total_cmp(&a.couplage));
+    modes.truncate(modes_max);
+    modes.sort_by(|a, b| a.freq_hz.total_cmp(&b.freq_hz));
+    let modes: Vec<Value> = modes
+        .into_iter()
+        .map(|md| {
+            json!({
+                "n": md.n,
+                "freq": arrondi(md.freq_hz, 2),
+                "kind": md.nature,
+                "coupling": arrondi(md.couplage, 3),
+            })
+        })
+        .collect();
+    let p = &prop.piece;
+    json!({
+        "filters": filtres,
+        "modes": modes,
+        "modes_total": prop.modes.len(),
+        "assumptions": {
+            "speed_of_sound_m_s": m::VITESSE_DU_SON_M_S,
+            "rt60_s": p.rt60_s,
+            "count": p.nombre,
+            "min_freq_hz": m::FREQUENCE_MIN_HZ,
+            "max_freq_hz": m::FREQUENCE_MAX_HZ,
+            "listener": p.auditeur,
+            "speaker": p.enceinte,
+        },
+        "bounds": {
+            "gain_db": [-m::ATTENUATION_MAX_DB, -m::ATTENUATION_MIN_DB],
+            "q": [m::Q_MIN, m::Q_MAX],
+            "count": [m::FILTRES_MIN, m::FILTRES_MAX],
+        },
+    })
+}
+
 #[derive(Deserialize)]
 struct RechercheAutoEq {
     #[serde(default)]
@@ -1002,3 +1135,7 @@ mod tests {
 #[cfg(test)]
 #[path = "autoeq_en_ligne_tests_6388.rs"]
 mod autoeq_en_ligne_tests_6388;
+
+#[cfg(test)]
+#[path = "modes_de_piece_tests_6709.rs"]
+mod modes_de_piece_tests_6709;
