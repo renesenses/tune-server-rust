@@ -246,6 +246,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_musicbrainz_release_cache -- --nocapture
 
+      # #6463 — provenance du MBID des artistes et reprise des MBID faux par
+      # vérification : la migration et les écritures de la passe, sur une
+      # vraie base. Sans cette étape, le témoin prendrait son saut annoncé.
+      - name: Provenance du MBID des artistes sur PostgreSQL (#6463)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_6463 -- --nocapture --test-threads=1
+
       - name: Provenance du DR album sur PostgreSQL (#3924)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test

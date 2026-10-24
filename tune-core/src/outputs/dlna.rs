@@ -46,6 +46,11 @@ pub mod titre_radio_2991;
 #[path = "dlna_volume_illisible_5662.rs"]
 pub(crate) mod volume_illisible_5662;
 
+/// #6008 (rc7, fil 2401) — une hausse de l'appareil corrigée aussi hors de la
+/// fenêtre d'après pose, sur un appareil qui porte la règle.
+#[path = "dlna_volume_hors_fenetre_6008.rs"]
+pub(crate) mod hors_fenetre_6008;
+
 #[cfg(test)]
 #[path = "dlna_journal_volume_tests_5575.rs"]
 mod journal_volume_tests_5575;
@@ -637,6 +642,11 @@ pub struct DlnaOutput {
     /// #6008 — instant de la dernière pose d'URI acceptée. Ouvre la fenêtre
     /// pendant laquelle un volume remonté par l'appareil est corrigé.
     uri_posee_a: std::sync::Mutex<Option<std::time::Instant>>,
+    /// #6008 (rc7, fil 2401) — instant du dernier `SetVolume` DEMANDÉ par
+    /// Tune. Hors de la fenêtre d'après pose, une hausse n'est corrigée
+    /// qu'au-delà d'une grâce qui suit cette demande : une lecture faite
+    /// pendant un glissement de curseur n'est pas un saut de l'appareil.
+    volume_demande_a: std::sync::Mutex<Option<std::time::Instant>>,
     /// #5793 — URL du SCPD de `RenderingControl`, telle que le descriptif de
     /// l'appareil l'annonce. `None` : sortie construite sans descriptif, le
     /// profil standard s'applique.
@@ -822,6 +832,7 @@ impl DlnaOutput {
             derniere_position_ms: AtomicU64::new(u64::MAX),
             dernier_volume_pct: AtomicU64::new(u64::MAX),
             uri_posee_a: std::sync::Mutex::new(None),
+            volume_demande_a: std::sync::Mutex::new(None),
             scpd_rendering_control: std::sync::RwLock::new(None),
             profil_volume: tokio::sync::OnceCell::new(),
             scpd_av_transport: std::sync::RwLock::new(None),
@@ -1419,14 +1430,21 @@ impl DlnaOutput {
     /// [`HAUSSE_QUI_APPREND`] apprend la règle ; un appareil qui la porte voit
     /// toute hausse de plus de 2 points corrigée sur-le-champ, et le sondeur
     /// reçoit le volume réimposé, pas le saut.
-    async fn volume_apres_controle_d_uri(&self, lu: f64) -> f64 {
+    ///
+    /// #6008 (rc7, fil 2401) — sur un appareil qui PORTE déjà la règle, la
+    /// hausse se corrige aussi hors de la fenêtre, tant que Tune lit : voir
+    /// [`hors_fenetre_6008`].
+    async fn volume_apres_controle_d_uri(&self, lu: f64, lecture_de_tune: bool) -> f64 {
         let dans_la_fenetre = self
             .uri_posee_a
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some_and(|t| t.elapsed() <= FENETRE_VOLUME_APRES_URI);
         let connu = self.volume_connu();
-        let (true, Some(connu)) = (dans_la_fenetre, connu) else {
+        if !dans_la_fenetre {
+            return self.volume_hors_fenetre(lu, connu, lecture_de_tune).await;
+        }
+        let Some(connu) = connu else {
             return lu;
         };
         // Seule une HAUSSE se corrige : une baisse dans la fenêtre est plus
@@ -3145,6 +3163,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
+        self.noter_demande_de_volume();
         if let Some(ip) = &self.micromega_ip {
             let target_vol = volume * 100.0;
             let msg = format!("GET /volume HTTP/1.0\r\n\r\nvolume={target_vol:.1}\r\n");
@@ -3343,7 +3362,10 @@ impl OutputTarget for DlnaOutput {
             // #6008 — même en silence : un saut de volume se corrige. Aucune
             // action ne part tant que l'appareil ne remonte pas son volume.
             let volume = match evt_volume {
-                Some(_) => self.volume_apres_controle_d_uri(volume).await,
+                Some(_) => {
+                    let de_tune = self.lecture_de_tune(etat, evt_uri.as_deref());
+                    self.volume_apres_controle_d_uri(volume, de_tune).await
+                }
                 None => volume,
             };
             return Ok(OutputStatus {
@@ -3427,7 +3449,8 @@ impl OutputTarget for DlnaOutput {
                 // dispense pas d'avoir un volume juste.
                 None => self.lire_volume().await?,
             };
-            let volume = self.volume_apres_controle_d_uri(volume).await;
+            let de_tune = self.lecture_de_tune(etat, current_uri.as_deref());
+            let volume = self.volume_apres_controle_d_uri(volume, de_tune).await;
 
             return Ok(OutputStatus {
                 state: etat,
@@ -3453,8 +3476,10 @@ impl OutputTarget for DlnaOutput {
         // un quart du trafic SOAP envoyé au renderer, pour une valeur que
         // personne ne lisait (#2263). L'état coupé se lit maintenant en local.
         let volume = self.lire_volume().await?;
-        let volume = self.volume_apres_controle_d_uri(volume).await;
         let state = etat_du_transport(&transport_resp);
+        let de_tune =
+            self.lecture_de_tune(state, extract_tag(&position_resp, "TrackURI").as_deref());
+        let volume = self.volume_apres_controle_d_uri(volume, de_tune).await;
 
         let position_ms = extract_tag(&position_resp, "RelTime")
             .map(|t| Self::parse_time(&t))

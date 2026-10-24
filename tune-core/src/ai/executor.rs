@@ -301,12 +301,59 @@ impl ToolExecutor {
         }
     }
 
+    /// #6836 — le volume demandé par le modèle. Trois règles, avant même
+    /// l'orchestrateur :
+    ///
+    /// 1. **Aucun défaut** : un `volume` absent, non numérique, non fini ou
+    ///    hors de 0..1 est REFUSÉ et l'erreur rendue au modèle. Le défaut de
+    ///    0,5 d'avant faisait monter une zone à 20 % sur une question mal
+    ///    comprise.
+    /// 2. **Une baisse passe toujours.**
+    /// 3. **Une hausse passe par petits pas** : au plus
+    ///    [`hausse_maximale_par_appel`] (3 points par défaut) au-dessus du
+    ///    volume courant ; au-delà, refus, et la réponse dit au modèle
+    ///    jusqu'où il peut aller. Jamais un saut de 20 % à 100 %.
+    ///
+    /// La consigne retenue part ensuite par `PlaybackOrchestrator::set_volume`,
+    /// le point de passage unique de toutes les sorties : verrou PURE (refus
+    /// d'une baisse sous « Forcer à 100 % »), volume fixe (tenu à 100 %, rien
+    /// n'est envoyé), limites de sécurité et de confort #6541, trim.
     async fn set_volume(&self, input: Value) -> Value {
-        let volume = input
-            .get("volume")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.5)
-            .clamp(0.0, 1.0);
+        let volume = match input.get("volume").and_then(Value::as_f64) {
+            Some(v) if v.is_finite() && (0.0..=1.0).contains(&v) => v,
+            _ => {
+                warn!(zone_id = self.zone_id, entree = %input, "ai_set_volume_refuse_argument");
+                return json!({
+                    "error": "invalid_volume",
+                    "message": "volume is required: a number between 0.0 and 1.0. \
+                                Nothing was changed.",
+                });
+            }
+        };
+        let actuel = self.playback.get_state(self.zone_id).await.volume;
+        let hausse_max = hausse_maximale_par_appel(&self.db);
+        if volume > actuel + hausse_max + 1e-9 {
+            let plafond = (actuel + hausse_max).min(1.0);
+            warn!(
+                zone_id = self.zone_id,
+                actuel,
+                demande = volume,
+                hausse_max,
+                "ai_set_volume_refuse_hausse"
+            );
+            return json!({
+                "error": "volume_raise_too_large",
+                "message": format!(
+                    "The assistant may raise the volume by at most {:.0} points per request. \
+                     Current volume is {:.0}%; the highest allowed now is {:.0}%. Nothing was changed.",
+                    hausse_max * 100.0,
+                    actuel * 100.0,
+                    plafond * 100.0
+                ),
+                "current_volume": actuel,
+                "max_volume_allowed": plafond,
+            });
+        }
 
         let device_id = self.get_zone_device_id();
         match self
@@ -314,7 +361,12 @@ impl ToolExecutor {
             .set_volume(self.zone_id, volume, device_id.as_deref())
             .await
         {
-            Ok(()) => json!({ "status": "volume_set", "volume": volume }),
+            // La valeur EFFECTIVE (limites, volume fixe), pas la demande.
+            Ok(()) => json!({
+                "status": "volume_set",
+                "volume": self.playback.get_state(self.zone_id).await.volume,
+                "requested": volume,
+            }),
             Err(error) => json!({ "error": "output_command_failed", "detail": error }),
         }
     }
@@ -425,3 +477,27 @@ impl ToolExecutor {
             .and_then(|z| z.output_device_id)
     }
 }
+
+/// #6836 — hausse maximale (fraction 0..1) qu'un appel de l'assistant peut
+/// demander au-dessus du volume courant. VALEUR PROVISOIRE : 3 points, en
+/// attendant la décision de Bertrand. Réglable sans recompiler par le réglage
+/// [`REGLAGE_HAUSSE_MAXIMALE`] (fraction 0..1) ; une valeur absente, illisible
+/// ou hors bornes rend le défaut.
+pub const HAUSSE_MAXIMALE_PAR_APPEL: f64 = 0.03;
+
+/// Clé du réglage qui remplace [`HAUSSE_MAXIMALE_PAR_APPEL`].
+pub const REGLAGE_HAUSSE_MAXIMALE: &str = "ai_volume_max_raise_per_call";
+
+pub fn hausse_maximale_par_appel(db: &Arc<dyn DbBackend>) -> f64 {
+    crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get(REGLAGE_HAUSSE_MAXIMALE)
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        .unwrap_or(HAUSSE_MAXIMALE_PAR_APPEL)
+}
+
+#[cfg(test)]
+#[path = "executor_volume_6836_tests.rs"]
+mod volume_6836_tests;

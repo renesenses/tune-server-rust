@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "db9d3851e659ed832f077abe20881e71a5bea3ae",
+    "web_sha": "d4fa500c594e965546d0af12a46068871ddb97cf",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -1688,6 +1688,81 @@
         "sans_majorite",
         "raison",
         "en_pause"
+      ]
+    },
+    {
+      "route": "/library/integrity",
+      "methode": "GET",
+      "type": "EtatIntegrite",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "total",
+        "traites",
+        "sains",
+        "corrompus",
+        "non_verifiables",
+        "alertes_taille",
+        "erreur",
+        "lecture_prioritaire"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/integrity",
+      "methode": "POST",
+      "type": "EtatIntegrite",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "total",
+        "traites",
+        "sains",
+        "corrompus",
+        "non_verifiables",
+        "alertes_taille",
+        "erreur",
+        "lecture_prioritaire"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/integrity/report",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "etat",
+        "lignes"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/labels",
+      "methode": "GET",
+      "type": "LibraryLabel",
+      "liste": true,
+      "champs_obligatoires": [
+        "name",
+        "album_count"
+      ],
+      "champs_optionnels": [
+        "image_url",
+        "qobuz_label_id"
+      ]
+    },
+    {
+      "route": "/library/labels/{}/artists",
+      "methode": "GET",
+      "type": "ArtistesDuLabel",
+      "liste": false,
+      "champs_obligatoires": [
+        "name",
+        "bibliotheque"
+      ],
+      "champs_optionnels": [
+        "qobuz_label_id",
+        "decouvrir"
       ]
     },
     {
@@ -6694,6 +6769,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/library/integrity/pause",
+      "type": "void",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/system/config/import/preview",
       "type": "unknown",
       "raison": "type non structurel"
@@ -6780,7 +6860,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 336,
-    "appels_non_resolus": 154
+    "routes_cartographiees": 341,
+    "appels_non_resolus": 155
   }
 }

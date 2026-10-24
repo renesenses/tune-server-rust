@@ -1,5 +1,6 @@
 mod album_order;
 mod albums;
+mod audit_integrite;
 /// #4806 — le drapeau `banned` des listes de pistes, partagé avec les
 /// playlists et la recherche fédérée qui vivent hors de ce module.
 pub(crate) use albums::attacher_banni;
@@ -45,6 +46,8 @@ mod genres;
 pub(crate) use genres::genres_de_l_album;
 pub(crate) mod identification_lot;
 mod ingest;
+/// `GET /library/labels` et les logos Qobuz des labels (#6736).
+mod labels;
 /// #6481 — le livret PDF rangé dans le dossier d'un album.
 mod livrets;
 mod lyrics_pass;
@@ -314,6 +317,11 @@ pub fn router() -> Router<AppState> {
         .route("/artists/{id}/bio", get(artists::artist_bio))
         .route("/artists/{id}/similar", get(artists::artist_similar))
         .route("/artists/{id}/metadata", get(artists::artist_metadata))
+        // #6463 — « Détacher l'identité » : retire le MBID, provenance `manuel`.
+        .route(
+            "/artists/{id}/detacher-identite",
+            post(artists::detacher_identite),
+        )
         .route("/artists/doublons", get(artists::artists_doublons))
         // BIB-C1 (phase 1) : un artiste absorbe son homographe, à la demande.
         .route(
@@ -485,6 +493,13 @@ pub fn router() -> Router<AppState> {
             get(tracks::track_synced_lyrics),
         )
         .route("/identify", post(tracks::identify_track))
+        .route(
+            "/integrity",
+            get(audit_integrite::status).post(audit_integrite::start),
+        )
+        .route("/integrity/pause", post(audit_integrite::pause))
+        .route("/integrity/report", get(audit_integrite::report))
+        .route("/integrity/report.csv", get(audit_integrite::csv))
         .route("/tracks/{id}/source-links", get(tracks::track_source_links))
         .route("/tracks/{id}/quick-fav", post(tracks::quick_fav_track))
         .route("/albums/{id}/quick-fav", post(albums::quick_fav_album))
@@ -640,6 +655,8 @@ pub fn router() -> Router<AppState> {
             axum::routing::patch(ambiances::update_ambiance).delete(ambiances::delete_ambiance),
         )
         .route("/stats", get(stats::library_stats))
+        .route("/labels", get(labels::list_labels))
+        .route("/labels/{nom}/artists", get(labels::artistes_du_label))
         .route("/artwork/{hash}", get(artwork::serve_artwork))
         .route("/artwork/proxy", get(artwork::proxy_artwork))
         .route(

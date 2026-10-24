@@ -132,6 +132,49 @@ pub(super) fn relance_encore_valide(
     })
 }
 
+/// #6925 — la ligne de file `ligne` est-elle bien ce que la zone joue ?
+///
+/// La relance rejoue la ligne de file courante. Or un épisode de podcast
+/// lancé depuis sa liste (`POST /podcasts/play`) joue HORS de la file : la
+/// zone garde la `queue_position` de l'écoute d'avant. Laguespa, fil 2415 :
+/// l'épisode « Carte blanche à Ibeyi » figé à 0, la relance a joué la ligne 0
+/// — une radio, « Putting On The Ritz » sur Radio Swiss Jazz.
+///
+/// `false` seulement sur une preuve de différence : une ligne absente, un
+/// `track_id` qui diffère, ou deux `source_id` connus qui diffèrent.
+pub(super) fn la_ligne_est_ce_qui_joue(
+    ligne: Option<&crate::db::play_queue_repo::QueueEntry>,
+    joue: &crate::playback::NowPlaying,
+) -> bool {
+    let Some(ligne) = ligne else {
+        return false;
+    };
+    match (ligne.track_id, joue.track_id) {
+        (Some(a), b) => return b == Some(a),
+        (None, Some(_)) => return false,
+        (None, None) => {}
+    }
+    fn non_vide(s: Option<&str>) -> Option<&str> {
+        s.filter(|s| !s.trim().is_empty())
+    }
+    match (
+        non_vide(ligne.source_id.as_deref()),
+        non_vide(joue.source_id.as_deref()),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+/// Le texte du bandeau, quand ce qui joue n'est pas dans la file : aucune
+/// relance possible sans jouer autre chose (#6925).
+pub(super) fn message_d_arret_hors_file(titre: &str) -> String {
+    format!(
+        "Le morceau n'a pas démarré : « {titre} » est resté à 0:00 pendant \
+         {DEMARRAGE_FIGE_SECS} s. La zone a été arrêtée."
+    )
+}
+
 /// Le texte du bandeau, quand la relance n'a rien changé.
 pub(super) fn message_d_arret(titre: &str) -> String {
     format!(
@@ -168,6 +211,33 @@ impl super::PositionPoller {
         let appareil = self.get_zone_device_id(zone_id);
         match verdict {
             Verdict::Attendre => {}
+            Verdict::Relancer
+                if !zone_state.now_playing.as_ref().is_none_or(|joue| {
+                    let ligne_de_file =
+                        crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
+                            .get_at(zone_id, ligne)
+                            .ok()
+                            .flatten();
+                    la_ligne_est_ce_qui_joue(ligne_de_file.as_ref(), joue)
+                }) =>
+            {
+                // #6925 — rejouer la ligne de file jouerait AUTRE CHOSE que ce
+                // qui est figé : on arrête, avec le bandeau.
+                warn!(
+                    zone_id,
+                    ligne,
+                    titre = %titre,
+                    fige_secs = DEMARRAGE_FIGE_SECS,
+                    "demarrage_fige_hors_file_arret_6925"
+                );
+                self.oublier_la_relance(zone_id);
+                self.arreter_avec_bandeau(
+                    zone_id,
+                    appareil.as_deref(),
+                    message_d_arret_hors_file(&titre),
+                )
+                .await;
+            }
             Verdict::Relancer => {
                 // Noter AVANT d'agir : la relance recrée l'état de sondage, et
                 // c'est cette note seule qui changera la prochaine détection
@@ -308,5 +378,84 @@ mod tests {
             t0 + Duration::from_secs(RELANCE_FIGEE_VALIDE_SECS)
         ));
         assert!(!relance_encore_valide(None, 3, t0));
+    }
+
+    fn ligne(
+        track_id: Option<i64>,
+        source: &str,
+        source_id: &str,
+    ) -> crate::db::play_queue_repo::QueueEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "zone_id": 1, "position": 0, "is_current": true,
+            "track_id": track_id, "source": source, "source_id": source_id,
+        }))
+        .expect("ligne de file")
+    }
+
+    /// #6925 (fil 2415) — un épisode lancé hors de la file n'est pas la ligne
+    /// 0 qu'une radio a laissée : la relance jouerait la radio.
+    #[test]
+    fn hors_file_6925_la_relance_ne_rejoue_pas_une_autre_ligne() {
+        let episode = crate::playback::NowPlaying {
+            title: "Carte blanche à Ibeyi".into(),
+            source: "podcast".into(),
+            source_id: Some("https://media.radiofrance-podcast.net/podcast09/ep.m4a".into()),
+            ..Default::default()
+        };
+        let radio = ligne(None, "radio", "https://stream.srg-ssr.ch/m/rsj/mp3_128");
+        assert!(
+            !la_ligne_est_ce_qui_joue(Some(&radio), &episode),
+            "la ligne 0 est une radio, l'épisode joue hors de la file : la relancer joue la radio"
+        );
+        assert!(!la_ligne_est_ce_qui_joue(None, &episode));
+        assert!(!la_ligne_est_ce_qui_joue(
+            Some(&ligne(Some(7), "local", "")),
+            &episode
+        ));
+
+        // Ce qui EST la ligne garde la relance de #5522.
+        let meme = ligne(
+            None,
+            "podcast",
+            "https://media.radiofrance-podcast.net/podcast09/ep.m4a",
+        );
+        assert!(la_ligne_est_ce_qui_joue(Some(&meme), &episode));
+        let locale = crate::playback::NowPlaying {
+            track_id: Some(7),
+            source: "local".into(),
+            ..Default::default()
+        };
+        assert!(la_ligne_est_ce_qui_joue(
+            Some(&ligne(Some(7), "local", "")),
+            &locale
+        ));
+        assert!(!la_ligne_est_ce_qui_joue(
+            Some(&ligne(Some(8), "local", "")),
+            &locale
+        ));
+        // Sans identifiant des deux côtés, rien ne prouve une différence.
+        let muette = crate::playback::NowPlaying {
+            source: "qobuz".into(),
+            ..Default::default()
+        };
+        assert!(la_ligne_est_ce_qui_joue(
+            Some(&ligne(None, "qobuz", "")),
+            &muette
+        ));
+    }
+
+    /// Garde de site : la relance consulte la ligne AVANT de la rejouer.
+    #[test]
+    fn hors_file_6925_la_relance_consulte_la_ligne() {
+        const TOUT: &str = include_str!("demarrage_fige_5522.rs");
+        let production = &TOUT[..TOUT.find("#[cfg(test)]").expect("module d'épreuves")];
+        let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        let appel = compact
+            .find("la_ligne_est_ce_qui_joue(ligne_de_file.as_ref(),joue)")
+            .expect("la relance ne vérifie plus que la ligne de file est ce qui joue (#6925)");
+        let relance = compact
+            .find("play_from_queue(zone_id,ligne)")
+            .expect("relance introuvable");
+        assert!(appel < relance, "la vérification doit précéder la relance");
     }
 }

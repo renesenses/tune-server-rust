@@ -41,7 +41,10 @@ pub mod release_type;
 pub mod suggestions;
 // Le MBID des artistes par une recherche MusicBrainz confirmée (#4805, étape C).
 pub mod artistes_par_le_reseau;
+pub mod noms_de_tri;
 pub mod tag_writer;
+/// #6463, B — la reprise des MBID d'artiste faux, par vérification MusicBrainz.
+pub mod verification_mbid_artistes;
 pub mod wikidata;
 
 use serde::{Deserialize, Serialize};

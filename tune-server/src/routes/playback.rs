@@ -8,6 +8,9 @@ mod journal_pause_reprise_tests;
 #[path = "playback/reprise_apres_redemarrage_dlna_6380_tests.rs"]
 mod reprise_apres_redemarrage_dlna_6380_tests;
 #[cfg(test)]
+#[path = "playback/reprise_service_titre_seul_6380_tests.rs"]
+mod reprise_service_titre_seul_6380_tests;
+#[cfg(test)]
 #[path = "playback/seek_en_double_193_tests.rs"]
 mod seek_en_double_193_tests;
 #[cfg(test)]
@@ -25,6 +28,9 @@ mod lire_artiste_6467;
 #[cfg(test)]
 #[path = "playback/lire_artiste_6467_tests.rs"]
 mod lire_artiste_6467_tests;
+#[cfg(test)]
+#[path = "playback/tete_de_liste_6399_tests.rs"]
+mod tete_de_liste_6399_tests;
 #[cfg(test)]
 #[path = "playback/titre_seul_album_5372_tests.rs"]
 mod titre_seul_album_5372_tests;
@@ -665,6 +671,34 @@ pub(crate) fn file_deja_chargee(
     }
 }
 
+/// #6399 — la décision de [`file_deja_chargee`], pour un titre de service
+/// qui est la TÊTE d'une liste (`queue_follows`, #6469) : la file est alors
+/// REMPLACÉE par ce titre, même s'il y figure déjà.
+///
+/// « Lire à partir d'ici » et « Tout lire » sur une liste de service lancent
+/// le titre de tête, puis le client enfile lui-même la suite et remet les 200
+/// titres d'avant en tête (`lectureEnMasse.ts`, `lireListeDepuis`). Garder
+/// la file quand le titre y figure — la relance de la barre de transport,
+/// Stop puis Play, #2569 — faisait de chaque geste un AJOUT : la suite
+/// s'enfilait derrière l'ancienne file. Nguyen Thanh Ha, fils 2289/2290,
+/// favoris Qobuz de 6 763 titres : `titre_seul_deja_en_file … longueur=24530`
+/// puis `queue_add_ok added=4999`, puis `added=200 position=Some(0)`, à
+/// chaque lancement, jusqu'à 39 107 entrées.
+///
+/// Une base illisible garde sa décision : on n'efface pas ce qu'on n'a pas
+/// lu (#2569).
+pub(crate) fn file_pour_un_titre_de_service(
+    lecture: Result<&[tune_core::db::play_queue_repo::QueueEntry], &str>,
+    source: Option<&str>,
+    source_id: &str,
+    tete_de_liste: bool,
+) -> FileDejaChargee {
+    match file_deja_chargee(lecture, source, source_id) {
+        FileDejaChargee::Garder { .. } if tete_de_liste => FileDejaChargee::RemplacerParCeTitre,
+        decision => decision,
+    }
+}
+
 /// Whether the server would accept the manual "next" action as an actual
 /// advance instead of stopping the zone at the end of the queue.
 ///
@@ -735,6 +769,11 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         // #1274 — lecture en dB du volume rendu juste au-dessus, jamais d'une
         // autre source : les deux champs doivent toujours dire la meme chose.
         "volume_db": tune_core::audio::volume_scale::linear_to_db(zone_state.volume),
+        // #6787 — la loi du curseur (`volume` reste le gain).
+        "volume_curve": tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(
+            zone_db.as_ref().and_then(|z| z.output_type.as_deref()),
+        )
+        .code(),
         "state": zone_state.state,
         "current_track": zone_state.now_playing.as_ref().map(|np| json!({
             "id": np.track_id,
@@ -1104,6 +1143,12 @@ struct PlayRequest {
     // le client l'ENONCER ; ils priment sur toute deduction.
     context_type: Option<String>,
     context_id: Option<String>,
+    /// #6465 — l'espace de noms de `context_id` (`local`, `qobuz`…), quand
+    /// l'appelant l'énonce, comme `queue/add` le lit déjà. Sans lui, c'est
+    /// `source` qui le donne — le service du TITRE de tête : faux pour une
+    /// playlist de la bibliothèque lue en aléatoire dont le premier titre
+    /// tiré est un titre Qobuz.
+    context_source: Option<String>,
     /// #6467 — « Lire » un artiste de la BIBLIOTHÈQUE : le serveur tire au
     /// hasard jusqu'à 50 de ses titres (bannis écartés) et les joue, contexte
     /// `artist`. Voir `lire_artiste_6467`.
@@ -1191,7 +1236,14 @@ fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>, O
         // L'appelant qui ENONCE son contexte enonce aussi le service dans
         // `source`, comme pour toute lecture de service. Son absence dit la
         // bibliotheque : c'est la seule autre provenance possible.
-        let service = body.source.clone().unwrap_or_else(|| LOCAL.to_string());
+        let service = body
+            .context_source
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| body.source.clone())
+            .unwrap_or_else(|| LOCAL.to_string());
         return (Some(t.to_string()), body.context_id.clone(), Some(service));
     }
 
@@ -1719,6 +1771,11 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
                 zone_state.volume
             )),
         );
+        // #6787 — la loi du curseur (`volume` reste le gain).
+        tune_core::audio::volume_scale::inserer_courbe(
+            obj,
+            tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(output_type.as_deref()),
+        );
     }
     Json(v)
 }
@@ -2088,8 +2145,11 @@ mod refus_de_format_3234 {
             let message = corps["message"].as_str().unwrap_or_default();
             assert!(message.contains(phrase), "{lang} : {message}");
             // #6396 — la phrase dit OÙ se trouve l'option : « dans les
-            // Réglages » laissait chercher (Lulu, fil 2288).
-            assert!(message.contains("> Spotify"), "{lang} : {message}");
+            // Réglages » laissait chercher (Lulu, fil 2288). #6857 — et le
+            // chemin est le VRAI : la carte « Spotify Connect » de l'onglet
+            // d'accès, pas une page « Réglages > Spotify » qui n'existe pas.
+            assert!(message.contains("› Spotify Connect"), "{lang} : {message}");
+            assert!(!message.contains("> Spotify"), "{lang} : {message}");
         }
     }
 
@@ -2970,6 +3030,22 @@ async fn play(
                 crate::routes::zones::identifiant_de_service_sur(t.artist_id.as_deref())
             })
         });
+        // #6399 — lu avant que `body` ne parte dans la demande de lecture.
+        let tete_de_liste = body.queue_follows;
+        // #6380 (Sandro, fil 2404, rc7, Qobuz sur Diretta Renderer) : le bouton
+        // Lecture du client web, zone arrêtée sur une piste de SERVICE, envoie
+        // `{source, source_id}` — c'est CETTE branche, pas le corps vide. Sans
+        // la reprise ici, `playback_position_restored position_ms=19000` au
+        // démarrage, puis aucune `reprise_a_la_position_restauree` au Play :
+        // la piste repartait de 0:00 alors que les pistes locales reprenaient.
+        // Même règle que `{track_id}` : un `seek_ms` explicite reste prioritaire
+        // (ici, comme avant, il n'est pas lu) et la reprise ne vaut que pour la
+        // piste restaurée, une seule fois.
+        let reprise = if body.seek_ms.is_none() {
+            position_de_reprise(&state, zone_id, None, Some(source_id_val.as_str())).await
+        } else {
+            None
+        };
         let orch_req = tune_core::orchestrator::PlayRequest {
             zone_id,
             output_device_id,
@@ -2981,7 +3057,7 @@ async fn play(
             album_title: body.album_title,
             cover_url: body.cover_path,
             duration_ms: body.duration_ms,
-            seek_ms: None,
+            seek_ms: reprise,
             temp_file_path: None,
             sample_rate: body.sample_rate,
             bit_depth: body.bit_depth,
@@ -2990,7 +3066,8 @@ async fn play(
             disc_number: None,
             album_ref: album_ref_val.clone(),
         };
-        return match state.orchestrator.play(orch_req).await {
+        ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
+        return match lancer_la_lecture(&state, orch_req, reprise).await {
             Ok(result) => {
                 // If this track is already part of the loaded streaming queue
                 // (e.g. the user pressed Stop then Play again on a track from an
@@ -3006,10 +3083,11 @@ async fn play(
                 // concluait « ce titre n'est pas dans la file », et prenait la
                 // branche qui EFFACE (`clear`). Voir `file_deja_chargee`.
                 let lecture = queue_repo.get_ordered(zone_id);
-                match file_deja_chargee(
+                match file_pour_un_titre_de_service(
                     lecture.as_deref().map_err(String::as_str),
                     source_for_q.as_deref(),
                     source_id_val.as_str(),
+                    tete_de_liste,
                 ) {
                     FileDejaChargee::Garder { position, longueur } => {
                         // Keep the full queue, just move the current position onto it
@@ -4312,6 +4390,8 @@ async fn set_volume(
         Ok(()) => Json(json!({
             "volume": volume,
             "volume_db": tune_core::audio::volume_scale::linear_to_db(volume),
+            // #6787 — la loi du curseur (`volume` reste le gain).
+            "volume_curve": tune_core::audio::volume_scale::echelle_de_la_zone(&state.backend, zone_id).code(),
         }))
         .into_response(),
         Err(error) => output_command_error_response(error),
@@ -7179,6 +7259,29 @@ pub struct ShuffleAllQuery {
     folder: Option<String>,
 }
 
+/// #6465 — le conteneur que désigne un tirage `POST /playback/shuffle-all`,
+/// dans le vocabulaire de [`contexte_de_lecture`] : l'album ou l'artiste de la
+/// bibliothèque tiré. Les autres portées (bibliothèque entière, répertoire,
+/// recherche, genre) ne sont pas un conteneur de l'Historique : rien.
+fn contexte_d_un_tirage(q: &ShuffleAllQuery) -> (Option<String>, Option<String>, Option<String>) {
+    const LOCAL: &str = "local";
+    if let Some(id) = q.album_id {
+        return (
+            Some("album".into()),
+            Some(id.to_string()),
+            Some(LOCAL.into()),
+        );
+    }
+    if let Some(id) = q.artist_id {
+        return (
+            Some("artist".into()),
+            Some(id.to_string()),
+            Some(LOCAL.into()),
+        );
+    }
+    (None, None, None)
+}
+
 // Combien de pistes une lecture aléatoire enfile au maximum.
 //
 // C'était une constante à 500, posée pour fermer le gel d'interface de Jean
@@ -7445,6 +7548,32 @@ pub async fn shuffle_all(
             let _ = queue_repo.clear(zone_id);
         }
     }
+
+    // #6465 — le conteneur du tirage, posé sur la session comme le fait
+    // « Lire » (#2441) : l'Historique range les titres joués sous l'album ou
+    // l'artiste tiré. Sans cette pose, la session gardait le geste PRÉCÉDENT
+    // — un album lu en aléatoire ne s'historisait pas comme conteneur (fil
+    // 2379, point 1), et ses titres pouvaient se ranger dans l'album d'avant.
+    // Toujours écraser, même à vide : ce tirage remplace le geste précédent.
+    let (contexte_type, contexte_id, contexte_service) = contexte_d_un_tirage(&q);
+    let (contexte_titre, contexte_pochette) = nom_du_contexte(
+        &state,
+        contexte_type.as_deref(),
+        contexte_id.as_deref(),
+        contexte_service.as_deref(),
+    )
+    .await;
+    state
+        .playback
+        .set_session_context(
+            zone_id,
+            contexte_type,
+            contexte_id,
+            contexte_service,
+            contexte_titre,
+            contexte_pochette,
+        )
+        .await;
 
     let first_id = all_ids[0];
     let track = track_repo.get(first_id).ok().flatten();
@@ -8499,6 +8628,31 @@ mod tests_prereglage {
 #[cfg(test)]
 mod tests_contexte_de_lecture {
     use super::{PlayRequest, contexte_de_lecture};
+
+    /// #6465 — une playlist de la BIBLIOTHÈQUE lue en aléatoire dont le titre
+    /// de tête est un titre Qobuz : le corps porte `source: "qobuz"` (celui du
+    /// titre) et `context_source: "local"` (celui de la playlist). C'est la
+    /// playlist locale 12 qui a été demandée, pas la playlist Qobuz 12.
+    #[test]
+    fn la_source_du_contexte_enoncee_prime_sur_celle_du_titre_6465() {
+        let body = PlayRequest {
+            source: Some("qobuz".into()),
+            source_id: Some("264104097".into()),
+            context_type: Some("playlist".into()),
+            context_id: Some("12".into()),
+            context_source: Some("local".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (
+                Some("playlist".into()),
+                Some("12".into()),
+                Some("local".into())
+            ),
+            "la playlist locale 12 s'est rangée chez Qobuz"
+        );
+    }
 
     /// #2441 — FabienM, fil 1557 : « si je choisis de jouer une playlist
     /// complete, je m'attends a voir cette playlist ». Aujourd'hui le serveur

@@ -46,7 +46,7 @@ const MB_API: &str = "https://musicbrainz.org/ws/2";
 /// locale dans les tests (#4836), posée par [`remplacer_la_base_musicbrainz`].
 static BASE_REMPLACEE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
-fn base_musicbrainz() -> String {
+pub(crate) fn base_musicbrainz() -> String {
     BASE_REMPLACEE
         .read()
         .ok()

@@ -2632,6 +2632,49 @@ CREATE INDEX IF NOT EXISTS idx_hires_verifications_verdict ON hires_verification
         name: "artists_sort_name_source",
         up: "",
     },
+    // #6682 (go de Bertrand du 21/10) — « Mon écoute » compte le temps
+    // d'écoute RADIO par station, à part des classements : une ligne par
+    // jour, adresse du flux, zone et profil propriétaire (0 : aucun), que la
+    // veille d'écoute (`db::radio_ecoute::veille`) incrémente. Naît vide.
+    // Jumelle PG : 096.
+    Migration {
+        version: 132,
+        name: "radio_ecoutes",
+        up: "
+CREATE TABLE IF NOT EXISTS radio_ecoutes (
+    jour TEXT NOT NULL,
+    station_url TEXT NOT NULL,
+    station_name TEXT NOT NULL DEFAULT '',
+    zone_id INTEGER NOT NULL DEFAULT 0,
+    profile_id INTEGER NOT NULL DEFAULT 0,
+    listening_ms INTEGER NOT NULL DEFAULT 0,
+    sessions INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (jour, station_url, zone_id, profile_id)
+);
+CREATE INDEX IF NOT EXISTS idx_radio_ecoutes_jour ON radio_ecoutes(jour);
+",
+    },
+    // #6463 (décision de Bertrand du 23/10, A) — d'où vient le MBID d'un
+    // artiste : `artists.musicbrainz_id_source`, `'balise'` (lu dans les
+    // fichiers au scan), `'nom'` (trouvé par une recherche MusicBrainz du
+    // nom), `'pressage'` (crédit d'un pressage identifié) ou `'manuel'`
+    // (saisi ou détaché par l'utilisateur). NULL : inconnu, c'est-à-dire tout
+    // MBID déjà en base avant cette colonne.
+    //
+    // Sans elle, une reprise des MBID faux (« Christophe », « Ange ») ne
+    // pouvait pas distinguer un MBID trouvé par le nom d'un MBID saisi à la
+    // main. Un MBID `manuel` n'est plus jamais retiré ni remplacé d'office.
+    //
+    // Numérotée 133 / PG 097 le 23/10 : la 132 / PG 096 (#6820, « Mon
+    // écoute » radio) est la dernière sur `batch/bugs-rc8-20261022`.
+    //
+    // Colonne posée dans le bloc de version et dans la passe finale, PAS
+    // dans `up` : même règle qu'à la 131. Jumelle PG : 097.
+    Migration {
+        version: 133,
+        name: "artists_musicbrainz_id_source",
+        up: "",
+    },
 ];
 
 /// Migration 127 (#6257) : `tags.position`, 0 pour toutes les etiquettes
@@ -4009,6 +4052,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // nom de tri déjà posé vient d'une balise ou d'une saisie.
             add_column_if_missing(db, "artists", "sort_name_source", "TEXT");
         }
+        if migration.version == 133 {
+            // #6463 — la provenance du MBID d'artiste. NULL pour l'existant :
+            // inconnue.
+            add_column_if_missing(db, "artists", "musicbrainz_id_source", "TEXT");
+        }
         if migration.version == 12 {
             upgrade_fts5_tables(db);
         }
@@ -4611,6 +4659,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // La provenance du nom de tri (migration 131, #6474) — posée ICI aussi :
     // le scan et l'enrichissement la NOMMENT. PG : migration 095.
     add_column_if_missing(db, "artists", "sort_name_source", "TEXT");
+    // La provenance du MBID d'artiste (migration 133, #6463) — posée ICI
+    // aussi : le scan, l'enrichissement et la fiche la NOMMENT. PG : 097.
+    add_column_if_missing(db, "artists", "musicbrainz_id_source", "TEXT");
     // Index de `listen_history.album_id` (migration 115, fil 2130) — posé ICI
     // aussi : une base arrivée sans lui reste juste, mais « Reprendre
     // l'écoute » y redevient lent. PG : migration 079.
@@ -5515,6 +5566,21 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         95,
         "artists_sort_name_source",
         include_str!("../../migrations/postgres/095_artists_sort_name_source.sql"),
+    ),
+    // Jumelle de la SQLite 132 (#6682) : `radio_ecoutes`, le temps d'écoute
+    // radio par jour et par station. Naît vide.
+    (
+        96,
+        "radio_ecoutes",
+        include_str!("../../migrations/postgres/096_radio_ecoutes.sql"),
+    ),
+    // Jumelle de la SQLite 133 (#6463) : `artists.musicbrainz_id_source`, la
+    // provenance du MBID d'artiste (`balise`, `nom`, `pressage`, `manuel`, ou
+    // NULL).
+    (
+        97,
+        "artists_musicbrainz_id_source",
+        include_str!("../../migrations/postgres/097_artists_musicbrainz_id_source.sql"),
     ),
 ];
 
@@ -8936,7 +9002,12 @@ mod tests {
         // Pose la provenance du nom de tri, que le scan et l'enrichissement
         // NOMMENT. Les 92 à 94 sont celles de #6637, #6641 et #6633, à
         // fusionner AVANT.
-        assert_eq!(pg_latest_version(), 95, "latest PG migration must be 95");
+        // 96 : `radio_ecoutes` (#6682), jumelle de la SQLite 132. Crée la
+        // table du temps d'écoute radio, que la veille d'écoute NOMME.
+        // 97 : `artists_musicbrainz_id_source` (#6463), jumelle de la SQLite
+        // 133. Pose la provenance du MBID d'artiste, que le scan,
+        // l'enrichissement et la fiche NOMMENT.
+        assert_eq!(pg_latest_version(), 97, "latest PG migration must be 97");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

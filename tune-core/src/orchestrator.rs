@@ -1909,6 +1909,9 @@ mod eq_en_vol_4407_tests;
 // bibliothèque native de test.
 #[cfg(test)]
 mod greffon_natif_tiers_tests;
+// #6780 — PURE contourne aussi la réaffectation des canaux armée de la zone.
+#[cfg(all(test, feature = "local-audio"))]
+mod pure_reaffectation_6780_tests;
 // #6256 — la désinstallation d'un greffon natif tiers ne rebâtit que les
 // zones qui l'utilisent.
 #[cfg(all(test, feature = "local-audio"))]
@@ -2196,6 +2199,11 @@ mod tests;
 /// quatrieme.
 #[cfg(test)]
 mod bit_depth_cap_tests;
+
+/// #6909 — le pré-transcodage DASH honore « WAV/LPCM » et « 16 bits » de la
+/// zone (Marantz NR1602, fil 2410).
+#[cfg(test)]
+mod reglages_dash_6909_tests;
 
 #[cfg(test)]
 mod dop_routing_tests;

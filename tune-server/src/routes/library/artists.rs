@@ -308,6 +308,16 @@ pub(super) async fn get_artist(
             if let (Some(obj), Ok(Some(prov))) = (j.as_object_mut(), repo.bio_provenance(id)) {
                 obj.insert("bio_provenance".into(), prov);
             }
+            // #6463 — d'où vient le MBID (`balise`, `nom`, `pressage`,
+            // `manuel`, ou null : inconnu). La fiche s'en sert pour proposer
+            // « Détacher l'identité » et dire qu'elle a été détachée.
+            if let Some(obj) = j.as_object_mut() {
+                let provenance = repo.provenance_du_mbid(id).ok().flatten();
+                obj.insert(
+                    "musicbrainz_id_source".into(),
+                    json!(provenance.map(|p| p.as_str())),
+                );
+            }
             // #6738 — le total des écoutes de la communauté, absent sous le seuil.
             ecoutes_communaute::annoter_un(
                 &state.backend,
@@ -567,6 +577,15 @@ async fn mbid_cloud(
         .filter(|m| !m.is_empty())
     {
         return Some(m.to_string());
+    }
+    // #6463 — une identité détachée par l'utilisateur ne se retrouve pas par
+    // le nom : la fiche du cloud serait celle de l'homonyme qu'il a écarté.
+    if let Some(id) = artiste.id
+        && ArtistRepo::with_backend(state.backend.clone())
+            .identite_detachee(id)
+            .unwrap_or(false)
+    {
+        return None;
     }
     let cle = format!("cache:meta-nom:{}", artiste.name.trim().to_lowercase());
     if let Some(v) = api_cache_get(&state.backend, &cle)
@@ -1118,6 +1137,113 @@ pub(super) struct ArtistUpdate {
     musicbrainz_id: Option<String>,
 }
 
+/// Un MBID vide ou réduit à des espaces n'en est pas un.
+fn mbid_utilisable(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+}
+
+/// `POST /library/artists/{id}/detacher-identite` — « Détacher l'identité »
+/// (#6463, décision de Bertrand du 23/10).
+///
+/// « Ange » (fil 2394) portait le MBID d'une chanteuse homonyme, et avec lui
+/// son portrait. Le geste retire le MBID, marque la provenance `manuel`
+/// (détachée par l'utilisateur : aucune passe automatique — scan, recherche
+/// par le nom, pressage, enrichissement — ne le réattache), efface le
+/// portrait et la bio que ce MBID avait rapportés, et relance la recherche
+/// d'image de CET artiste quand son portrait est parti (même garde que le
+/// bouton « Enrichir les images d'artistes » : Premium ou quota du jour).
+///
+/// Pour lui redonner une identité : `PUT /library/artists/{id}` avec un
+/// `musicbrainz_id` (provenance `manuel` aussi).
+pub(super) async fn detacher_identite(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = ArtistRepo::with_backend(state.backend.clone());
+    let artiste = match repo.get(id) {
+        Ok(Some(a)) => a,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let mbid_retire = mbid_utilisable(artiste.musicbrainz_id.as_deref());
+    if let Err(e) = repo.poser_mbid_manuel(id, None) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let (image_effacee, bio_effacee) = if mbid_retire.is_some() {
+        match repo.oublier_ce_que_le_mbid_a_apporte(id) {
+            Ok(effacees) => effacees,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        (false, false)
+    };
+    tracing::info!(
+        artist_id = id,
+        artist = %artiste.name,
+        mbid = mbid_retire.as_deref().unwrap_or(""),
+        image_effacee,
+        bio_effacee,
+        "artiste_identite_detachee"
+    );
+
+    let enrichissement_image = if !image_effacee {
+        "inutile"
+    } else {
+        match crate::routes::system::gate_enrichment(&state).await {
+            Ok(_) => {
+                let db = state.backend.clone();
+                let portee = tune_core::metadata::enrich_scope::EnrichScope {
+                    dir: format!("artiste:{id}"),
+                    album_ids: Default::default(),
+                    artist_ids: [id].into_iter().collect(),
+                    track_count: 0,
+                };
+                tokio::spawn(async move {
+                    tune_core::library::artwork::batch_enrich_artist_artwork_scoped(
+                        db,
+                        artwork_cache_dir(),
+                        Some(portee),
+                    )
+                    .await;
+                });
+                "lance"
+            }
+            Err(_) => "refuse",
+        }
+    };
+
+    let mut corps = match repo.get(id) {
+        Ok(Some(a)) => json!(a),
+        _ => json!({"id": id}),
+    };
+    if let Some(obj) = corps.as_object_mut() {
+        obj.insert("musicbrainz_id_source".into(), json!("manuel"));
+        obj.insert("mbid_retire".into(), json!(mbid_retire));
+        obj.insert("image_effacee".into(), json!(image_effacee));
+        obj.insert("bio_effacee".into(), json!(bio_effacee));
+        obj.insert("enrichissement_image".into(), json!(enrichissement_image));
+    }
+    Json(corps).into_response()
+}
+
 pub(super) async fn update_artist(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -1147,8 +1273,17 @@ pub(super) async fn update_artist(
     if let Some(ref v) = body.bio {
         artist.bio = if v.is_empty() { None } else { Some(v.clone()) };
     }
-    if let Some(ref v) = body.musicbrainz_id {
-        artist.musicbrainz_id = if v.is_empty() { None } else { Some(v.clone()) };
+    // #6463 — un MBID saisi, ou effacé, est une décision de l'utilisateur :
+    // provenance `manuel`. Seulement s'il CHANGE : renvoyer le même MBID avec
+    // un autre champ ne fige pas une provenance `nom` à vérifier.
+    let mbid_avant = mbid_utilisable(artist.musicbrainz_id.as_deref());
+    let mbid_saisi = body
+        .musicbrainz_id
+        .as_deref()
+        .map(|v| mbid_utilisable(Some(v)))
+        .filter(|nouveau| *nouveau != mbid_avant);
+    if let Some(ref nouveau) = mbid_saisi {
+        artist.musicbrainz_id = nouveau.clone();
     }
 
     if let Err(e) = repo.update(&artist) {
@@ -1157,6 +1292,21 @@ pub(super) async fn update_artist(
             Json(json!({"error": format!("update failed: {e}")})),
         )
             .into_response();
+    }
+    if let Some(ref nouveau) = mbid_saisi {
+        if let Err(e) = repo.poser_mbid_manuel(id, nouveau.as_deref()) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("update failed: {e}")})),
+            )
+                .into_response();
+        }
+        // Le portrait et la bio de l'ANCIEN MBID ne décrivent plus l'artiste.
+        if mbid_avant.is_some()
+            && let Err(e) = repo.oublier_ce_que_le_mbid_a_apporte(id)
+        {
+            tracing::warn!(artist_id = id, error = %e, "artist_mbid_images_bio_oubli_echec");
+        }
     }
     if let Err(e) =
         repo.oublier_provenance_si_bio_reecrite(id, bio_avant.as_deref(), artist.bio.as_deref())
@@ -1641,3 +1791,7 @@ mod tests_artistes_homographes {
 
 #[cfg(test)]
 mod tests_absorption;
+
+#[cfg(test)]
+#[path = "identite_artiste_tests_6463.rs"]
+mod identite_artiste_tests_6463;
