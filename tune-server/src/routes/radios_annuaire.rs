@@ -545,8 +545,8 @@ fn repli(s: &str) -> String {
     tune_core::db::engine::fold_diacritics(s).to_lowercase()
 }
 
-/// La fiche répond-elle à la recherche ? Nom, genre, catégories, pays et
-/// description, sans accents ni casse.
+/// La fiche répond-elle à la recherche ? Nom, genre, catégories, pays,
+/// description et mots-clés (le diffuseur, #6964), sans accents ni casse.
 fn correspond(f: &StationAnnuaire, motif: &str) -> bool {
     if motif.is_empty() {
         return true;
@@ -556,6 +556,7 @@ fn correspond(f: &StationAnnuaire, motif: &str) -> bool {
         .chain(f.country.as_deref())
         .chain(f.description.as_deref())
         .chain(f.categories.iter().map(String::as_str))
+        .chain(f.keywords.iter().map(String::as_str))
         .any(|champ| repli(champ).contains(motif))
 }
 

@@ -640,6 +640,11 @@ pub struct StationAnnuaire {
     /// Les catégories de la fiche (leurs `slug`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub categories: Vec<String>,
+    /// #6964 — les mots-clés de la fiche. Le DIFFUSEUR y est (« Radio France »
+    /// pour FIP), alors que le nom d'une station le porte rarement (« WDR 2 »,
+    /// « Bayern 3 » pour l'ARD) : sans eux, chercher le réseau ne trouvait rien.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
     /// TOUTES les adresses de flux publiées de la fiche, `stream_url` compris.
     /// C'est sur elles que se fait le rapprochement avec « Mes radios ».
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -724,6 +729,18 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                 .and_then(Value::as_array)
                 .map(|c| c.iter().filter_map(|c| texte(c, "slug")).collect())
                 .unwrap_or_default();
+            let keywords = item
+                .get("keywords")
+                .and_then(Value::as_array)
+                .map(|k| {
+                    k.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             Some(StationAnnuaire {
                 name,
                 logo_url: texte(item, "logo_url").map(absolue),
@@ -735,6 +752,7 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                 radio_metadata_key: texte(item, "radio_metadata_key"),
                 description: texte(item, "description"),
                 categories,
+                keywords,
                 codec: principal.and_then(|s| texte(s, "format")),
                 bitrate: principal
                     .and_then(|s| s.get("bitrate"))
@@ -760,7 +778,9 @@ fn repli(s: &str) -> String {
 
 /// La station de l'annuaire répond-elle à la requête ?
 ///
-/// Mêmes trois colonnes et même `LIKE %q%` que la recherche locale.
+/// Mêmes trois colonnes et même `LIKE %q%` que la recherche locale, plus les
+/// mots-clés de la fiche (#6964 : « ARD » ne figure dans le nom d'aucune
+/// station de l'ARD, seulement parmi ses mots-clés).
 pub(crate) fn annuaire_correspond(station: &StationAnnuaire, requete: &str) -> bool {
     let motif = repli(requete);
     if motif.is_empty() {
@@ -773,7 +793,42 @@ pub(crate) fn annuaire_correspond(station: &StationAnnuaire, requete: &str) -> b
     ]
     .into_iter()
     .flatten()
+    .chain(station.keywords.iter().map(String::as_str))
     .any(|champ| repli(champ).contains(&motif))
+}
+
+/// #6964 — les stations de « Mes radios » que la requête désigne par un
+/// mot-clé de LEUR fiche (le diffuseur, le plus souvent), et que la recherche
+/// locale ne trouve pas : une station n'a pas de mots-clés en base, seule sa
+/// fiche en a. La fiche se retrouve comme pour l'affichage
+/// ([`super::radios_annuaire::rattacher_a_l_annuaire`]) : lien enregistré,
+/// adresse du flux, nom porté par une seule fiche. Les stations de `deja`
+/// (les résultats de la recherche locale) ne sont pas rendues une seconde fois.
+pub(crate) fn stations_locales_par_mot_cle(
+    annuaire: &[StationAnnuaire],
+    requete: &str,
+    catalogue: &[RadioStation],
+    liens: &std::collections::HashMap<i64, String>,
+    deja: &[RadioStation],
+) -> Vec<RadioStation> {
+    let motif = repli(requete);
+    if motif.is_empty() {
+        return Vec::new();
+    }
+    let index = super::radios_annuaire::IndexAnnuaire::new(annuaire);
+    let deja: std::collections::HashSet<i64> = deja.iter().filter_map(|s| s.id).collect();
+    catalogue
+        .iter()
+        .filter(|st| st.id.is_none_or(|id| !deja.contains(&id)))
+        .filter(|st| {
+            let ext = st.id.and_then(|id| liens.get(&id)).map(String::as_str);
+            index
+                .lien(ext, &st.name, &st.url)
+                .and_then(|(i, _)| index.fiche(i))
+                .is_some_and(|f| f.keywords.iter().any(|k| repli(k).contains(&motif)))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Ce que l'annuaire connaît, que la requête vise, et que le catalogue local
@@ -1650,7 +1705,7 @@ async fn search_radios(
 ) -> Response {
     let lang = crate::i18n::lang_from_header(&headers);
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let (issue, items) = match repo.search(&q.q) {
+    let (issue, mut items) = match repo.search(&q.q) {
         Ok(items) if items.is_empty() => (IssueRecherche::Aucune, items),
         Ok(items) => (IssueRecherche::Resultats, items),
         Err(erreur) => {
@@ -1693,6 +1748,12 @@ async fn search_radios(
                 items.clone()
             }
         };
+        // #6964 — « ARD » trouve aussi le WDR 2 déjà dans « Mes radios » :
+        // le diffuseur est un mot-clé de sa fiche, pas de la station en base.
+        let liens = repo.liens_annuaire().unwrap_or_default();
+        let par_mot_cle =
+            stations_locales_par_mot_cle(&annuaire_releve, &q.q, &catalogue, &liens, &items);
+        items.extend(par_mot_cle);
         (
             PorteeRecherche::CatalogueEtAnnuaire,
             stations_annuaire_absentes(&annuaire_releve, &q.q, &catalogue),
@@ -1703,6 +1764,7 @@ async fn search_radios(
     // part » : c'est le cas de Radio Paradise pour Yacine, et il appelle une
     // autre phrase — celle qui dit que l'ajout tient en un geste.
     let issue = match issue {
+        IssueRecherche::Aucune if !items.is_empty() => IssueRecherche::Resultats,
         IssueRecherche::Aucune if !suggestions.is_empty() => IssueRecherche::AnnuaireSeul,
         autre => autre,
     };
@@ -3829,3 +3891,7 @@ mod tests_validation_url_flux {
 #[cfg(test)]
 #[path = "radios_logos_exacts_tests.rs"]
 mod tests_logos_exacts;
+
+#[cfg(test)]
+#[path = "radios_recherche_diffuseur_6964_tests.rs"]
+mod tests_recherche_diffuseur_6964;
