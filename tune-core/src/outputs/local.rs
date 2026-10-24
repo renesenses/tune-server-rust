@@ -487,6 +487,8 @@ pub(crate) type CreneauDisposition =
 pub(crate) static SANS_DISPOSITION: CreneauDisposition = std::sync::Mutex::new(None);
 use periode::{avec_periode, config_de_flux, garde_de_prechargement};
 pub(crate) use reaffectation::CreneauReaffectation;
+#[cfg(target_os = "windows")]
+pub(crate) use reaffectation::voies_pilotees_permises;
 
 // ---------------------------------------------------------------------------
 // Gapless: pending next track for seamless chaining
@@ -8312,6 +8314,11 @@ mod gapless_pure_reechantillonne_5416;
 // refermer le flux ; sinon elle rouvre le périphérique.
 #[cfg(test)]
 mod gapless_exclusif_5204;
+
+// #6842 — la chaîne native s'arrête sur un puits mort et le dit ; le vidage
+// du bras WASAPI est borné.
+#[cfg(test)]
+mod famine_native_6842;
 
 // #5204, seconde tranche — ASIO exclusif : la route native enchaîne à format
 // égal par la boucle commune, sans refermer le pilote.

@@ -945,6 +945,13 @@ pub fn zone_creee_contrat_client(
             "volume_db".into(),
             json!(crate::audio::volume_scale::linear_to_db(lineaire)),
         );
+        // #6787 — la loi du curseur de la zone (`volume` reste le gain).
+        crate::audio::volume_scale::inserer_courbe(
+            obj,
+            crate::audio::volume_scale::EchelleDeVolume::de_la_sortie(
+                zone.and_then(|z| z.output_type.as_deref()),
+            ),
+        );
     }
     v
 }
