@@ -145,10 +145,7 @@ pub async fn bloques(State(relais): State<Arc<Relais>>) -> Response {
     )
 }
 
-pub async fn debloquer(
-    State(relais): State<Arc<Relais>>,
-    Path(user_id): Path<String>,
-) -> Response {
+pub async fn debloquer(State(relais): State<Arc<Relais>>, Path(user_id): Path<String>) -> Response {
     if !identifiant_valide(&user_id) {
         return introuvable();
     }

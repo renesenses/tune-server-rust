@@ -45,7 +45,12 @@ const JETON_DU_LIEN: &str = "feedfacecafebeef6935feedfacecafebeef6935feedface";
 /// Un cloud qui renvoie le corps reçu (pseudo) et un lien avec son URL.
 async fn cloud_echo() -> String {
     let echo = |corps: Bytes| async move {
-        (StatusCode::CREATED, [(header::CONTENT_TYPE, "application/json")], corps).into_response()
+        (
+            StatusCode::CREATED,
+            [(header::CONTENT_TYPE, "application/json")],
+            corps,
+        )
+            .into_response()
     };
     let app = Router::new()
         .route("/api/v1/circle/invitations/by-pseudo", post(echo))
@@ -77,12 +82,24 @@ async fn ni_pseudo_ni_jeton_au_journal() {
         .init();
 
     let app_ok = app(base(&cloud_echo().await, Some(JETON)));
-    let r = appel(&app_ok, "POST", "/invitations/by-pseudo", Some(json!({ "pseudo": PSEUDO }))).await;
+    let r = appel(
+        &app_ok,
+        "POST",
+        "/invitations/by-pseudo",
+        Some(json!({ "pseudo": PSEUDO })),
+    )
+    .await;
     assert_eq!(r.json()["pseudo"], json!(PSEUDO), "le POST a bien traversé");
     let r = appel(&app_ok, "POST", "/invitation-links", None).await;
     assert!(r.json()["url"].as_str().unwrap().ends_with(JETON_DU_LIEN));
     let app_morte = app(base(&adresse_morte().await, Some(JETON)));
-    appel(&app_morte, "POST", "/invitations/by-pseudo", Some(json!({ "pseudo": PSEUDO }))).await;
+    appel(
+        &app_morte,
+        "POST",
+        "/invitations/by-pseudo",
+        Some(json!({ "pseudo": PSEUDO })),
+    )
+    .await;
 
     let journal = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
     // Contre-épreuve de la capture : un journal vide passerait tout.
@@ -92,9 +109,15 @@ async fn ni_pseudo_ni_jeton_au_journal() {
         "POST /invitations/by-pseudo",
         "POST /invitation-links",
     ] {
-        assert!(journal.contains(attendu), "évènement {attendu} absent de la capture");
+        assert!(
+            journal.contains(attendu),
+            "évènement {attendu} absent de la capture"
+        );
     }
     for secret in [PSEUDO, "Temoin-6935", JETON_DU_LIEN, "rejoindre"] {
-        assert!(!journal.contains(secret), "le journal contient {secret:?} :\n{journal}");
+        assert!(
+            !journal.contains(secret),
+            "le journal contient {secret:?} :\n{journal}"
+        );
     }
 }

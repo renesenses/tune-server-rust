@@ -123,10 +123,7 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
             "/invitations/by-pseudo",
             post(crate::sans_email::inviter_par_pseudo),
         )
-        .route(
-            "/invitations/{id}/block",
-            post(crate::sans_email::bloquer),
-        )
+        .route("/invitations/{id}/block", post(crate::sans_email::bloquer))
         .route(
             "/invitation-links",
             get(crate::sans_email::liens).post(crate::sans_email::creer_lien),
@@ -136,10 +133,7 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
             delete(crate::sans_email::revoquer_lien),
         )
         .route("/blocks", get(crate::sans_email::bloques))
-        .route(
-            "/blocks/{user_id}",
-            delete(crate::sans_email::debloquer),
-        )
+        .route("/blocks/{user_id}", delete(crate::sans_email::debloquer))
         .route("/members/{user_id}", delete(revoquer))
         .route("/circles", post(creer_cercle))
         .route(

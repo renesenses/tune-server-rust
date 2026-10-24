@@ -41,8 +41,14 @@ async fn cloud(State(e): State<Etat>, m: Method, uri: Uri, h: HeaderMap, corps: 
     if f.panne {
         return (StatusCode::INTERNAL_SERVER_ERROR, "<html>oups</html>").into_response();
     }
-    if h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {JETON}")) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthenticated" }))).into_response();
+    if h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+        != Some(&format!("Bearer {JETON}"))
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthenticated" })),
+        )
+            .into_response();
     }
     if f.debit {
         return (
@@ -52,7 +58,8 @@ async fn cloud(State(e): State<Etat>, m: Method, uri: Uri, h: HeaderMap, corps: 
         )
             .into_response();
     }
-    let introuvable = || (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))).into_response();
+    let introuvable =
+        || (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))).into_response();
     match (m.as_str(), chemin.as_str()) {
         ("POST", "/invitations/by-pseudo") => match v.get("pseudo") {
             Some(Value::String(p)) if p == "Moi-Meme" => (
@@ -124,7 +131,11 @@ async fn sans_session_les_routes_rendent_412_et_rien_ne_part() {
     for (m, chemin) in ROUTES {
         let r = appel(&app, m, chemin, corps_de(m, chemin)).await;
         assert_eq!(r.statut, StatusCode::PRECONDITION_FAILED, "{m} {chemin}");
-        assert_eq!(r.json(), json!({ "connected": false, "code": "circle.not_connected" }), "{m} {chemin}");
+        assert_eq!(
+            r.json(),
+            json!({ "connected": false, "code": "circle.not_connected" }),
+            "{m} {chemin}"
+        );
     }
     assert!(etat.lock().unwrap().recus.is_empty());
 }
@@ -134,7 +145,13 @@ async fn chaque_route_part_a_l_identique_et_la_reponse_revient_a_l_octet_pres() 
     let (url, etat) = demarrer().await;
     let app = app(base(&url, Some(JETON)));
 
-    let r = appel(&app, "POST", "/invitations/by-pseudo", Some(json!({ "pseudo": "Bob Marley", "circle_id": 4, "email": "fuite@exemple.fr" }))).await;
+    let r = appel(
+        &app,
+        "POST",
+        "/invitations/by-pseudo",
+        Some(json!({ "pseudo": "Bob Marley", "circle_id": 4, "email": "fuite@exemple.fr" })),
+    )
+    .await;
     assert_eq!(r.statut, StatusCode::CREATED);
     assert_eq!(r.json()["name_or_email"], json!("Bob Marley"));
 
@@ -143,7 +160,13 @@ async fn chaque_route_part_a_l_identique_et_la_reponse_revient_a_l_octet_pres() 
     assert_eq!(r.json(), json!({ "links": [lien()] }));
     assert_eq!(r.entetes.get(header::CACHE_CONTROL).unwrap(), "no-store");
 
-    let r = appel(&app, "POST", "/invitation-links", Some(json!({ "circle_id": 4, "token": "choisi-par-le-client" }))).await;
+    let r = appel(
+        &app,
+        "POST",
+        "/invitation-links",
+        Some(json!({ "circle_id": 4, "token": "choisi-par-le-client" })),
+    )
+    .await;
     assert_eq!(r.statut, StatusCode::CREATED);
     assert_eq!(r.json()["url"], json!(URL_DU_LIEN));
     assert_eq!(
@@ -152,7 +175,11 @@ async fn chaque_route_part_a_l_identique_et_la_reponse_revient_a_l_octet_pres() 
         "l'URL du lien porte son jeton : aucun cache ne la garde"
     );
     let r = appel(&app, "POST", "/invitation-links", None).await;
-    assert_eq!(r.statut, StatusCode::CREATED, "sans corps : un lien sans cercle");
+    assert_eq!(
+        r.statut,
+        StatusCode::CREATED,
+        "sans corps : un lien sans cercle"
+    );
 
     for (m, chemin) in [
         ("DELETE", "/invitation-links/3"),
@@ -170,9 +197,17 @@ async fn chaque_route_part_a_l_identique_et_la_reponse_revient_a_l_octet_pres() 
     assert_eq!(
         recus,
         vec![
-            ("POST".into(), "/invitations/by-pseudo".into(), json!({ "pseudo": "Bob Marley", "circle_id": 4 })),
+            (
+                "POST".into(),
+                "/invitations/by-pseudo".into(),
+                json!({ "pseudo": "Bob Marley", "circle_id": 4 })
+            ),
             ("GET".into(), "/invitation-links".into(), Value::Null),
-            ("POST".into(), "/invitation-links".into(), json!({ "circle_id": 4 })),
+            (
+                "POST".into(),
+                "/invitation-links".into(),
+                json!({ "circle_id": 4 })
+            ),
             ("POST".into(), "/invitation-links".into(), json!({})),
             ("DELETE".into(), "/invitation-links/3".into(), Value::Null),
             ("POST".into(), "/invitations/9/block".into(), Value::Null),
@@ -188,16 +223,38 @@ async fn les_refus_du_cloud_sont_relayes_avec_leur_corps() {
     let (url, etat) = demarrer().await;
     let app = app(base(&url, Some(JETON)));
 
-    let r = appel(&app, "POST", "/invitations/by-pseudo", Some(json!({ "nom": "x" }))).await;
-    assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY, "le cloud juge le pseudo absent");
+    let r = appel(
+        &app,
+        "POST",
+        "/invitations/by-pseudo",
+        Some(json!({ "nom": "x" })),
+    )
+    .await;
+    assert_eq!(
+        r.statut,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "le cloud juge le pseudo absent"
+    );
     assert!(r.json()["errors"]["pseudo"][0].is_string());
     assert_eq!(etat.lock().unwrap().recus[0].2, json!({ "pseudo": null }));
 
-    let r = appel(&app, "POST", "/invitations/by-pseudo", Some(json!({ "pseudo": "Moi-Meme" }))).await;
+    let r = appel(
+        &app,
+        "POST",
+        "/invitations/by-pseudo",
+        Some(json!({ "pseudo": "Moi-Meme" })),
+    )
+    .await;
     assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(r.json(), json!({ "error": "self_invitation" }));
 
-    let r = appel(&app, "POST", "/invitation-links", Some(json!({ "circle_id": 77 }))).await;
+    let r = appel(
+        &app,
+        "POST",
+        "/invitation-links",
+        Some(json!({ "circle_id": 77 })),
+    )
+    .await;
     assert_eq!(r.statut, StatusCode::NOT_FOUND);
     assert_eq!(r.json(), json!({ "error": "not_found" }));
 
