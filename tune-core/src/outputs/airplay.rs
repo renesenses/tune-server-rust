@@ -555,8 +555,9 @@ fn announce_failure_message(code: u32) -> String {
     if code == 403 {
         return format!(
             "{CODE_AIRPLAY_RECEIVER_FORBIDDEN}: AirPlay connection refused by the receiver (403 Forbidden): \
-             on macOS, verify that 'Allow AirPlay for' is set to 'Everyone on the same network' \
-             (System Settings → General → AirDrop & Handoff)"
+             the receiver requires AirPlay 2 pairing or a password and refuses legacy AirPlay 1 (RAOP) connections; \
+             for macOS AirPlay Receiver, pair using AirPlay 2 and verify that 'Allow AirPlay for' is set to \
+             'Everyone on the same network' (System Settings → General → AirDrop & Handoff)"
         );
     }
     format!("AirPlay ANNOUNCE failed: {code}")
@@ -1310,6 +1311,8 @@ mod tests {
         let message = announce_failure_message(403);
         assert!(message.contains(CODE_AIRPLAY_RECEIVER_FORBIDDEN));
         assert!(message.contains("403 Forbidden"));
+        assert!(message.contains("AirPlay 2"));
+        assert!(message.contains("pairing"));
         assert!(message.contains("Everyone on the same network"));
         assert!(message.contains("AirDrop & Handoff"));
     }
