@@ -184,6 +184,22 @@ async fn fetch_radio_metadata_depuis(
         return Some(meta);
     }
 
+    // #6357 — une station HLS n'a pas d'ICY : son titre, quand elle en porte
+    // un, vient de sa liste (`EXTINF`) ou de ses segments (ID3), lus par le
+    // chargeur pendant la lecture. Une liste `.m3u8` sans titre n'a rien à
+    // donner : l'ICY n'y trouverait que le texte de la liste.
+    if let Some(titre) = crate::radio_hls::titre_en_cours(stream_url) {
+        return Some(IcyMetadata {
+            title: titre.titre,
+            artist: titre.artiste,
+            station: None,
+            cover_url: None,
+        });
+    }
+    if crate::orchestrator::is_hls_manifest(stream_url, "") {
+        return None;
+    }
+
     // Fallback: raw ICY metadata
     fetch_icy_metadata(stream_url).await
 }

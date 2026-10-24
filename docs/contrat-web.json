@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "835dbae29990a322ea28547702e70cddd3c0c8c6",
+    "web_sha": "cabd861bcb2e643caa95cab8686d2c43e7a4fb95",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -1676,6 +1676,53 @@
       ]
     },
     {
+      "route": "/library/integrity",
+      "methode": "GET",
+      "type": "EtatIntegrite",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "total",
+        "traites",
+        "sains",
+        "corrompus",
+        "non_verifiables",
+        "alertes_taille",
+        "erreur",
+        "lecture_prioritaire"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/integrity",
+      "methode": "POST",
+      "type": "EtatIntegrite",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "total",
+        "traites",
+        "sains",
+        "corrompus",
+        "non_verifiables",
+        "alertes_taille",
+        "erreur",
+        "lecture_prioritaire"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/integrity/report",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "etat",
+        "lignes"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/library/labels",
       "methode": "GET",
       "type": "LibraryLabel",
@@ -1687,6 +1734,20 @@
       "champs_optionnels": [
         "image_url",
         "qobuz_label_id"
+      ]
+    },
+    {
+      "route": "/library/labels/{}/artists",
+      "methode": "GET",
+      "type": "ArtistesDuLabel",
+      "liste": false,
+      "champs_obligatoires": [
+        "name",
+        "bibliotheque"
+      ],
+      "champs_optionnels": [
+        "qobuz_label_id",
+        "decouvrir"
       ]
     },
     {
@@ -3350,6 +3411,19 @@
       ]
     },
     {
+      "route": "/streaming/{}/albums/{}/context",
+      "methode": "GET",
+      "type": "StreamingAlbumContext",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "genre_id",
+        "genre_name",
+        "label_id",
+        "label_name"
+      ]
+    },
+    {
       "route": "/streaming/{}/albums/{}/tracks",
       "methode": "GET",
       "type": "Track",
@@ -3735,6 +3809,34 @@
       "champs_optionnels": [
         "image_url"
       ]
+    },
+    {
+      "route": "/streaming/{}/labels/{}",
+      "methode": "GET",
+      "type": "StreamingLabelPage",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "total",
+        "offset",
+        "limit",
+        "albums"
+      ],
+      "champs_optionnels": [
+        "image_url"
+      ]
+    },
+    {
+      "route": "/streaming/{}/labels/{}/artists",
+      "methode": "GET",
+      "type": "StreamingLabelArtists",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "artists"
+      ],
+      "champs_optionnels": []
     },
     {
       "route": "/streaming/{}/new-releases",
@@ -6693,6 +6795,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/library/integrity/pause",
+      "type": "void",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/system/config/import/preview",
       "type": "unknown",
       "raison": "type non structurel"
@@ -6779,7 +6886,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 336,
-    "appels_non_resolus": 154
+    "routes_cartographiees": 343,
+    "appels_non_resolus": 155
   }
 }

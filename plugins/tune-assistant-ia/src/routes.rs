@@ -47,6 +47,13 @@ pub fn router_vers(etat: Etat) -> Router<()> {
         .route("/lot/suggestions", post(lot_suggestions))
         .route("/lot/appliquer", post(lot_appliquer))
         .route("/lot/annuler", post(lot_annuler))
+        .route("/collections/affiner", post(collections_affiner))
+        .route("/collections/proposer", post(collections_proposer))
+        .route("/collections/nommer", post(collections_nommer))
+        .route("/collections/pourquoi", post(collections_pourquoi))
+        .route("/collections/ecoute", post(collections_ecoute))
+        .route("/diagnostic/apercu", post(diagnostic_apercu))
+        .route("/diagnostic", post(diagnostic_envoyer))
         .route(
             "/albums/{id}/notes",
             post(notes_ecrire).get(notes_lire).delete(notes_effacer),
@@ -762,6 +769,501 @@ pub(crate) fn cout_estime_eur(
         max_sortie,
         r.taux_usd_eur,
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Collections intelligentes (#6839)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct DemandeCollection {
+    cible: Option<String>,
+    langue: Option<String>,
+    /// (1) La liste à affiner : `{name, match_mode, rules}`.
+    actuelle: Option<Value>,
+    /// (1) Ce que l'utilisateur veut changer.
+    phrase: Option<String>,
+    /// (3), (4) Les règles à nommer ou à expliquer.
+    rules: Option<Vec<Value>>,
+    match_mode: Option<String>,
+    /// (4) L'album à expliquer.
+    album_id: Option<i64>,
+    /// (5) Le profil qui demande : ses écoutes seulement.
+    profil_id: Option<i64>,
+    /// Rien n'est envoyé : ce qui partirait, et son coût estimé.
+    #[serde(default)]
+    apercu: bool,
+}
+
+/// Un appel d'un usage de collections : l'aperçu (rien ne part), ou l'appel
+/// compté et son objet JSON. `Err` : la réponse HTTP à rendre telle quelle.
+async fn appel_collection(
+    etat: &Etat,
+    usage: &str,
+    systeme: &str,
+    message: &str,
+    max_jetons: u32,
+    apercu: bool,
+) -> Result<(Value, appel::Resultat), Response> {
+    let modele = reglages::Reglages::charger(&etat.backend).modele_choisi(appel::Choix::Defaut);
+    if apercu {
+        return Err(Json(json!({
+            "ok": true,
+            "apercu": true,
+            "modele": modele,
+            "envoye": { "systeme": systeme, "message": message },
+            "cout_estime_eur": cout_estime_eur(etat, &modele, systeme, message, max_jetons),
+            "plafond": appel::etat_plafond(&etat.backend),
+        }))
+        .into_response());
+    }
+    // Pas de cache ici : une réponse refusée par le validateur resterait
+    // servie à chaque nouvel essai. Ces appels sont courts (Haiku 5.5).
+    let res = appel::appeler(etat, usage, false, systeme, message, max_jetons, None)
+        .await
+        .map_err(|e| appel::reponse_erreur(&e))?;
+    let brut = appel::objet_json(&res.texte).ok_or_else(|| {
+        erreur(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reponse_invalide",
+            "Le modèle n'a pas rendu un objet JSON.",
+        )
+    })?;
+    Ok((brut, res))
+}
+
+fn hors_schema(usage: &str, code: &'static str) -> Response {
+    warn!(usage, code, "assistant_ia_collection_hors_schema");
+    erreur(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        code,
+        "La réponse du modèle ne suit pas le schéma demandé : rien n'est proposé.",
+    )
+}
+
+fn avec_cout(mut v: Value, etat: &Etat, res: &appel::Resultat) -> Response {
+    v["ok"] = json!(true);
+    v["depuis_cache"] = json!(res.depuis_cache);
+    v["cout_eur"] = json!(couts::micro_en_euros(res.cout_micro_eur));
+    v["plafond"] = appel::etat_plafond(&etat.backend);
+    Json(v).into_response()
+}
+
+/// (1) Affiner en dialoguant une collection ou une playlist existante.
+async fn collections_affiner(
+    State(etat): State<Etat>,
+    entetes: HeaderMap,
+    Json(d): Json<DemandeCollection>,
+) -> Response {
+    let phrase = cache::normaliser_phrase(d.phrase.as_deref().unwrap_or(""));
+    if phrase.is_empty() || phrase.chars().count() > 500 {
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "phrase_invalide",
+            "Dites ce qu'il faut changer en une phrase (500 caractères au plus).",
+        );
+    }
+    let Some(actuelle) = d.actuelle.as_ref().filter(|a| a.is_object()) else {
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "actuelle_requise",
+            "Les règles actuelles sont requises.",
+        );
+    };
+    let avant: Vec<Value> = actuelle
+        .get("rules")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let cible = Cible::depuis(d.cible.as_deref().or(Some("collection")));
+    let langue = langue(d.langue.as_deref(), &entetes);
+    let refs = Referentiel::charger(&etat.backend);
+    let offerts = regles::criteres_offerts(&etat.criteres, cible, &refs);
+    let genres = genres_de_la_bibliotheque(&etat);
+    let systeme = crate::collections::consigne_affiner(&regles::consigne(
+        &offerts, cible, &genres, &refs, &langue,
+    ));
+    let lisibles = crate::collections::regles_lisibles(&avant, &offerts, &refs);
+    let message = json!({
+        "current": {
+            "name": actuelle.get("name"),
+            "match_mode": actuelle.get("match_mode"),
+            "rules": lisibles,
+        },
+        "request": d.phrase.as_deref().unwrap_or("").trim(),
+    })
+    .to_string();
+    let (brut, res) = match appel_collection(
+        &etat,
+        crate::collections::USAGE_AFFINER,
+        &systeme,
+        &message,
+        4096,
+        d.apercu,
+    )
+    .await
+    {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let p = match regles::valider(&brut, &offerts, cible, &refs) {
+        Ok(p) => p,
+        Err(code) => return hors_schema(crate::collections::USAGE_AFFINER, code),
+    };
+    if p.rules.is_empty() {
+        // #6731 : une liste sans règle rendrait toute la bibliothèque.
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "ok": false,
+                "error": "aucune_regle",
+                "message": "Le modèle n'a laissé aucune règle utilisable : rien n'est proposé.",
+                "refusees": p.refusees,
+            })),
+        )
+            .into_response();
+    }
+    let ecart = crate::collections::ecart(&avant, &p.rules);
+    info!(
+        cible = cible.nom(),
+        ajoutees = ecart.ajoutees.len(),
+        retirees = ecart.retirees.len(),
+        "assistant_ia_collection_affinee"
+    );
+    avec_cout(
+        json!({ "cible": cible.nom(), "proposition": p, "ecart": ecart, "avant": avant }),
+        &etat,
+        &res,
+    )
+}
+
+/// (2) Proposer 5 à 10 collections depuis les seules statistiques.
+async fn collections_proposer(
+    State(etat): State<Etat>,
+    entetes: HeaderMap,
+    corps: Option<Json<DemandeCollection>>,
+) -> Response {
+    let d = corps.map(|Json(d)| d).unwrap_or_default();
+    let langue = langue(d.langue.as_deref(), &entetes);
+    let refs = Referentiel::charger(&etat.backend);
+    let offerts = regles::criteres_offerts(&etat.criteres, Cible::Collection, &refs);
+    let systeme = crate::collections::consigne_proposer(
+        &regles::consigne(&offerts, Cible::Collection, &[], &refs, &langue),
+        &langue,
+    );
+    let message = crate::collections::statistiques(&etat.backend, &refs).to_string();
+    propositions(
+        &etat,
+        crate::collections::USAGE_PROPOSER,
+        &systeme,
+        &message,
+        &offerts,
+        &refs,
+        d.apercu,
+    )
+    .await
+}
+
+async fn propositions(
+    etat: &Etat,
+    usage: &str,
+    systeme: &str,
+    message: &str,
+    offerts: &[regles::Offert],
+    refs: &Referentiel,
+    apercu: bool,
+) -> Response {
+    let (brut, res) = match appel_collection(etat, usage, systeme, message, 8192, apercu).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    match crate::collections::valider_propositions(&brut, offerts, refs) {
+        Ok((collections, ecartees)) => {
+            info!(
+                usage,
+                retenues = collections.len(),
+                ecartees = ecartees.len(),
+                "assistant_ia_collections_proposees"
+            );
+            avec_cout(
+                json!({ "collections": collections, "ecartees": ecartees }),
+                etat,
+                &res,
+            )
+        }
+        Err(code) => hors_schema(usage, code),
+    }
+}
+
+/// (3) Nommer et décrire.
+async fn collections_nommer(
+    State(etat): State<Etat>,
+    entetes: HeaderMap,
+    Json(d): Json<DemandeCollection>,
+) -> Response {
+    let rules = d.rules.clone().unwrap_or_default();
+    if rules.is_empty() {
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "regles_requises",
+            "Les règles sont requises.",
+        );
+    }
+    let cible = Cible::depuis(d.cible.as_deref().or(Some("collection")));
+    let langue = langue(d.langue.as_deref(), &entetes);
+    let refs = Referentiel::charger(&etat.backend);
+    let offerts = regles::criteres_offerts(&etat.criteres, cible, &refs);
+    let systeme = crate::collections::consigne_nommer(cible, &langue);
+    let message = json!({
+        "match_mode": d.match_mode.as_deref().unwrap_or("all"),
+        "rules": crate::collections::regles_lisibles(&rules, &offerts, &refs),
+    })
+    .to_string();
+    let (brut, res) = match appel_collection(
+        &etat,
+        crate::collections::USAGE_NOMMER,
+        &systeme,
+        &message,
+        1024,
+        d.apercu,
+    )
+    .await
+    {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    match crate::collections::valider_nom(&brut) {
+        Ok(v) => avec_cout(v, &etat, &res),
+        Err(code) => hors_schema(crate::collections::USAGE_NOMMER, code),
+    }
+}
+
+/// (4) Pourquoi cet album est dans la collection.
+async fn collections_pourquoi(
+    State(etat): State<Etat>,
+    entetes: HeaderMap,
+    Json(d): Json<DemandeCollection>,
+) -> Response {
+    let rules = d.rules.clone().unwrap_or_default();
+    let Some(album_id) = d.album_id else {
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "album_requis",
+            "L'album est requis.",
+        );
+    };
+    if rules.is_empty() {
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "regles_requises",
+            "Les règles sont requises.",
+        );
+    }
+    let champs = match crate::collections::champs_album(&etat.backend, album_id) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return erreur(
+                StatusCode::NOT_FOUND,
+                "album_introuvable",
+                "Album introuvable.",
+            );
+        }
+        Err(e) => return interne(e),
+    };
+    let langue = langue(d.langue.as_deref(), &entetes);
+    let refs = Referentiel::charger(&etat.backend);
+    let offerts = regles::criteres_offerts(&etat.criteres, Cible::Collection, &refs);
+    let lisibles = crate::collections::regles_lisibles(&rules, &offerts, &refs);
+    let numerotees: Vec<Value> = lisibles
+        .iter()
+        .enumerate()
+        .map(|(i, r)| json!({ "index": i, "rule": r }))
+        .collect();
+    let systeme = crate::collections::consigne_pourquoi(&langue);
+    let message = json!({
+        "match_mode": d.match_mode.as_deref().unwrap_or("all"),
+        "rules": numerotees,
+        "album": champs,
+    })
+    .to_string();
+    let (brut, res) = match appel_collection(
+        &etat,
+        crate::collections::USAGE_POURQUOI,
+        &systeme,
+        &message,
+        1024,
+        d.apercu,
+    )
+    .await
+    {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    match crate::collections::valider_pourquoi(&brut, rules.len()) {
+        Ok(v) => avec_cout(v, &etat, &res),
+        Err(code) => hors_schema(crate::collections::USAGE_POURQUOI, code),
+    }
+}
+
+/// (5) Collections d'après l'écoute — Premium, comme « Mon écoute ».
+async fn collections_ecoute(
+    State(etat): State<Etat>,
+    entetes: HeaderMap,
+    corps: Option<Json<DemandeCollection>>,
+) -> Response {
+    if !etat.ecoute_premium().await {
+        return erreur(
+            StatusCode::PAYMENT_REQUIRED,
+            "premium_requis",
+            "Les collections d'après l'écoute font partie de Premium, comme « Mon écoute ».",
+        );
+    }
+    let d = corps.map(|Json(d)| d).unwrap_or_default();
+    let langue = langue(d.langue.as_deref(), &entetes);
+    let refs = Referentiel::charger(&etat.backend);
+    let offerts = regles::criteres_offerts(&etat.criteres, Cible::Collection, &refs);
+    let systeme = crate::collections::consigne_ecoute(
+        &regles::consigne(&offerts, Cible::Collection, &[], &refs, &langue),
+        &langue,
+    );
+    let message = crate::collections::agregats_ecoute(&etat.backend, d.profil_id).to_string();
+    propositions(
+        &etat,
+        crate::collections::USAGE_ECOUTE,
+        &systeme,
+        &message,
+        &offerts,
+        &refs,
+        d.apercu,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic en lecture seule (23/10/2026)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct DemandeDiagnostic {
+    zone_id: Option<i64>,
+    question: Option<String>,
+    langue: Option<String>,
+    #[serde(default)]
+    second_avis: bool,
+}
+
+/// L'aperçu : ce qui partirait, EXACTEMENT, et son coût estimé. Rien ne part.
+async fn diagnostic_apercu(
+    State(etat): State<Etat>,
+    entetes: HeaderMap,
+    Json(d): Json<DemandeDiagnostic>,
+) -> Response {
+    let Some(collecte) = etat.collecte_diagnostic.clone() else {
+        return erreur(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "diagnostic_indisponible",
+            "Le diagnostic n'est pas disponible sur ce serveur.",
+        );
+    };
+    let question = d.question.as_deref().unwrap_or("").trim().to_string();
+    if question.chars().count() > crate::diagnostic::QUESTION_MAX {
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "question_invalide",
+            "La question fait 500 caractères au plus.",
+        );
+    }
+    let brut = match collecte(d.zone_id).await {
+        Ok(b) => b,
+        Err(e) => return interne(e),
+    };
+    let langue = langue(d.langue.as_deref(), &entetes);
+    let p = crate::diagnostic::preparer(&brut, &question, &langue);
+    let choix = if d.second_avis {
+        appel::Choix::Fort
+    } else {
+        appel::Choix::Defaut
+    };
+    let r = reglages::Reglages::charger(&etat.backend);
+    let modele = r.modele_choisi(choix);
+    let corps = json!({
+        "ok": true,
+        "fournisseur": r.famille.map(crate::fournisseur::Famille::nom),
+        "modele": modele,
+        // Ollama : rien ne quitte le réseau de l'utilisateur.
+        "local": r.famille == Some(crate::fournisseur::Famille::Ollama),
+        "envoye": { "systeme": p.systeme, "message": p.message },
+        "lignes_journal": p.lignes_journal,
+        "remplacements": p.pseudonymes.taille(),
+        "cout_estime_eur": cout_estime_eur(&etat, &modele, &p.systeme, &p.message, crate::diagnostic::MAX_JETONS),
+        "plafond": appel::etat_plafond(&etat.backend),
+        "duree_validite_s": crate::diagnostic::APERCU_DUREE.as_secs(),
+    });
+    let id = etat.apercus.ranger(p, choix);
+    let mut corps = corps;
+    corps["apercu_id"] = json!(id);
+    info!(zone = d.zone_id.is_some(), "assistant_ia_diagnostic_apercu");
+    Json(corps).into_response()
+}
+
+#[derive(Deserialize)]
+struct EnvoiDiagnostic {
+    apercu_id: String,
+}
+
+/// L'envoi d'un aperçu MONTRÉ, une seule fois. Aucune action : la réponse
+/// est un constat et des gestes à essayer, que l'utilisateur fait lui-même.
+async fn diagnostic_envoyer(State(etat): State<Etat>, Json(d): Json<EnvoiDiagnostic>) -> Response {
+    let Some(a) = etat.apercus.prendre(d.apercu_id.trim()) else {
+        return erreur(
+            StatusCode::CONFLICT,
+            "apercu_requis",
+            "Montrez d'abord ce qui sera envoyé : cet aperçu n'existe pas, a déjà servi ou a expiré.",
+        );
+    };
+    let res = match appel::appeler_choix(
+        &appel::Moyens::de(&etat),
+        crate::diagnostic::USAGE_DIAGNOSTIC,
+        a.choix,
+        &a.systeme,
+        &a.message,
+        crate::diagnostic::MAX_JETONS,
+        None,
+        true,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return appel::reponse_erreur(&e),
+    };
+    let Some(brut) = appel::objet_json(&res.texte) else {
+        return erreur(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reponse_invalide",
+            "Le modèle n'a pas rendu un objet JSON.",
+        );
+    };
+    let diag = match crate::diagnostic::valider(&brut, &a.message) {
+        Ok(x) => x,
+        Err(code) => {
+            warn!(code, "assistant_ia_diagnostic_hors_schema");
+            return erreur(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                code,
+                "La réponse du modèle ne suit pas le schéma demandé.",
+            );
+        }
+    };
+    info!(
+        causes = diag.causes.len(),
+        ecartes = diag.ecartes.len(),
+        "assistant_ia_diagnostic"
+    );
+    let mut v = crate::diagnostic::pour_l_ecran(&diag, &a.pseudonymes);
+    v["ok"] = json!(true);
+    v["cout_eur"] = json!(couts::micro_en_euros(res.cout_micro_eur));
+    v["plafond"] = appel::etat_plafond(&etat.backend);
+    Json(v).into_response()
 }
 
 // ---------------------------------------------------------------------------

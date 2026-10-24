@@ -1394,7 +1394,7 @@ fn warm_sqlite_cache(state: &AppState) {
 /// est aujourd'hui un choix de l'utilisateur. Et la vraie protection contre le
 /// réveil à plein volume est dans `register_local_outputs`, qui ensemence la
 /// sortie avec la valeur stockée — celle-là agit sur le son. Refs #1596.
-async fn restore_zone_volumes(state: &AppState) {
+pub(crate) async fn restore_zone_volumes(state: &AppState) {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     if let Ok(zones) = zone_repo.list() {
         for zone in &zones {
@@ -2401,12 +2401,18 @@ pub(crate) async fn enregistrer_les_sorties_locales(
                 est_le_defaut: dev.is_default,
             })
             .collect();
-        crate::bascule_tune_os_5870::appliquer(
+        let verdict = crate::bascule_tune_os_5870::appliquer(
             &zone_repo,
             &tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone()),
             crate::routes::appliance::is_appliance(),
             &sorties_5870,
         );
+        // #6774 — la bascule passe par `changer_d_appareil`, qui a pu désarmer
+        // PURE ou le volume fixe et ramener le volume EN BASE. L'état de
+        // lecture en mémoire, lui, a été chargé avant (`restore_zone_volumes`,
+        // 100 % pour un volume fixe) : il est ramené au niveau de la base, à la
+        // baisse seulement. Rien n'est envoyé à l'appareil.
+        crate::bascule_tune_os_5870::realigner_la_lecture(state, &verdict).await;
     }
     let auto_create = zone_repo.zone_auto_create_autorise();
     // Un backend est censé marquer une seule sortie par défaut. `find`

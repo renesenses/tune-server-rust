@@ -32,6 +32,7 @@
 pub mod battement;
 pub mod ecoute;
 pub mod ensembles;
+pub mod globe;
 pub mod lecture;
 pub mod playlists;
 pub mod rayons;
@@ -39,6 +40,7 @@ pub mod references;
 pub mod relais;
 pub mod resolution;
 pub mod routes;
+pub mod sans_email;
 pub mod suivi;
 pub mod vignettes;
 

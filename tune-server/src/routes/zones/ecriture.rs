@@ -279,10 +279,19 @@ async fn commander_la_sortie(
     // du pour-cent entier ou des dB. L'orchestrateur la reçoit en `f64` et la
     // garde telle quelle dans l'état de lecture, vers le device et en base
     // (la colonne n'arrondit plus au pour-cent depuis #2886).
+    // #6721 — `confirm_increase` laisse passer une hausse de plus de 10 dB ;
+    // sans lui, elle est plafonnée (la zone rendue dit le volume retenu).
     if let Some(volume) = volume_demande
         && let Err(error) = state
             .orchestrator
-            .set_volume(id, volume, command_device_id)
+            .set_volume_avec_garde(
+                id,
+                volume,
+                command_device_id,
+                tune_core::audio::garde_de_hausse::Hausse::depuis_confirmation(
+                    body.confirm_increase,
+                ),
+            )
             .await
     {
         return Err(crate::routes::playback::output_command_error_response(
@@ -1486,10 +1495,33 @@ pub(super) async fn update_volume(
 
     match state
         .orchestrator
-        .set_volume(id, volume_f, device_id.as_deref())
+        .set_volume_avec_garde(
+            id,
+            volume_f,
+            device_id.as_deref(),
+            tune_core::audio::garde_de_hausse::Hausse::depuis_confirmation(body.confirm_increase),
+        )
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // #6721 — 204 comme avant pour une consigne appliquée telle quelle ;
+        // 200 et le gain retenu quand la garde l'a plafonnée, pour que le
+        // client propose de confirmer (`confirm_increase`).
+        Ok(retenu) if retenu.hausse_plafonnee => {
+            let mut corps = serde_json::Map::new();
+            retenu.inserer(&mut corps);
+            corps.insert(
+                "volume_db".into(),
+                json!(tune_core::audio::volume_scale::linear_to_db(retenu.retenu)),
+            );
+            corps.insert(
+                "volume_curve".into(),
+                json!(
+                    tune_core::audio::volume_scale::echelle_de_la_zone(&state.backend, id).code()
+                ),
+            );
+            (StatusCode::OK, Json(serde_json::Value::Object(corps))).into_response()
+        }
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => crate::routes::playback::output_command_error_response(error),
     }
 }

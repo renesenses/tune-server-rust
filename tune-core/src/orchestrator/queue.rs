@@ -61,17 +61,25 @@ pub(super) async fn flux_de_la_sonde_de_niveaux(
 /// armement sans blanc, via `PositionPoller::prochaine_position_jouable`.
 /// Chacun parcourait la file à sa façon : la suivante préchargée était B
 /// (banni) quand l'avance jouait C.
+///
+/// #6824 — `profil_de_session` est le profil de la session d'écoute de la zone
+/// (`ZoneState::session_profile_id`, posé par la route de lecture d'après
+/// `X-Profile-Id`). C'est lui qui a banni le titre et lui que la file barre
+/// (`GET /zones/{id}/queue`, `ActiveProfile`). Le profil actif du serveur
+/// n'est que le repli d'une zone sans session (redémarrage, alarme sans
+/// profil) — voir [`crate::db::hidden_repo::profil_des_bannis_de_la_zone`].
 pub fn lignes_bannies_a_enjamber(
     db: &Arc<dyn crate::db::backend::DbBackend>,
     zone_id: i64,
     position: i64,
+    profil_de_session: Option<i64>,
 ) -> (Enjambee, Vec<crate::db::play_queue_repo::QueueEntry>) {
     let queue_repo = PlayQueueRepo::with_backend(db.clone());
     let Ok(total) = queue_repo.count_all(zone_id) else {
         return (Enjambee::Rien, Vec::new());
     };
     let bans = crate::db::hidden_repo::HiddenRepo::with_backend(db.clone());
-    let profil = crate::db::hidden_repo::profil_de_selection_automatique(db);
+    let profil = crate::db::hidden_repo::profil_des_bannis_de_la_zone(db, profil_de_session);
     let mut p = position.max(0);
     let mut enjambees = Vec::new();
     while p < total {
@@ -146,6 +154,7 @@ impl PlaybackOrchestrator {
         target_fmt: String,
     ) {
         let db = self.db.clone();
+        let playback = self.playback.clone();
         tokio::spawn(async move {
             // Locate the current queue position and the item right after it.
             let qrepo = PlayQueueRepo::with_backend(db.clone());
@@ -158,7 +167,8 @@ impl PlaybackOrchestrator {
             };
             // #5143 — la suivante que l'avance jouera : une bannie est
             // enjambée, jamais transcodée pour rien.
-            let Some(next_pos) = lignes_bannies_a_enjamber(&db, zone_id, cur_pos + 1)
+            let session = playback.get_state(zone_id).await.session_profile_id;
+            let Some(next_pos) = lignes_bannies_a_enjamber(&db, zone_id, cur_pos + 1, session)
                 .0
                 .position_depuis(cur_pos + 1)
             else {
@@ -265,6 +275,7 @@ impl PlaybackOrchestrator {
         }
         let db = self.db.clone();
         let services = self.services.clone();
+        let playback = self.playback.clone();
         tokio::spawn(async move {
             // Find the current track in the streaming queue, then the next item.
             let sq = PlayQueueRepo::with_backend(db.clone())
@@ -282,7 +293,8 @@ impl PlaybackOrchestrator {
             let Some(cur_pos) = sq[cur_idx]["position"].as_i64() else {
                 return;
             };
-            let Some(next_pos) = lignes_bannies_a_enjamber(&db, zone_id, cur_pos + 1)
+            let session = playback.get_state(zone_id).await.session_profile_id;
+            let Some(next_pos) = lignes_bannies_a_enjamber(&db, zone_id, cur_pos + 1, session)
                 .0
                 .position_depuis(cur_pos + 1)
             else {
@@ -328,8 +340,14 @@ impl PlaybackOrchestrator {
             }
 
             let sr = stream_data.quality.sample_rate;
-            let bd = stream_data.quality.bit_depth.clamp(16, 24);
-            let key_bd = if out_fmt == "wav" { 16 } else { bd };
+            // #6909 — même plafond 16 bits que la lecture (`profondeur_dash`).
+            let reglages =
+                super::resolve_stream::reglages_dash(&db, zone_id, stream_data.quality.bit_depth);
+            let key_bd = super::resolve_stream::profondeur_dash(
+                out_fmt,
+                stream_data.quality.bit_depth,
+                reglages,
+            );
             // Pas de racine de cache utilisable pour ce compte (#5133) : rien
             // à chauffer.
             let Some(cp) = crate::transcode_cache::cache_path_streaming(
@@ -360,7 +378,7 @@ impl PlaybackOrchestrator {
                     crate::audio::decode::decode_to_pcm(&dash_file_c, Some(sr), Some(2), 0.0, 0.0)?;
                 let mut pcm_bytes = decoded.pcm_bytes();
                 let mut actual_bd = decoded.bit_depth;
-                if is_wav && actual_bd > 16 {
+                if (is_wav || key_bd == 16) && actual_bd > 16 {
                     pcm_bytes = crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
                     actual_bd = 16;
                 }
@@ -602,7 +620,8 @@ impl PlaybackOrchestrator {
     /// `source_id` vaut un id local banni n'est pas enjambée pour autant, et
     /// inversement — voir [`HiddenRepo::ligne_bannie`].
     pub async fn enjamber_les_pistes_bannies(&self, zone_id: i64, position: i64) -> Enjambee {
-        let (verdict, enjambees) = lignes_bannies_a_enjamber(&self.db, zone_id, position);
+        let session = self.playback.get_state(zone_id).await.session_profile_id;
+        let (verdict, enjambees) = lignes_bannies_a_enjamber(&self.db, zone_id, position, session);
         for entry in &enjambees {
             info!(
                 zone_id,

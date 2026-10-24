@@ -231,6 +231,33 @@ pub fn cible_du_pas(actuel: f64, delta: f64) -> f64 {
     (actuel + delta).clamp(0.0, 1.0)
 }
 
+/// #6787 — la cible d'un pas `delta` (fraction de CURSEUR, signée) depuis le
+/// gain `actuel`, sur l'échelle du curseur de la zone : sur une sortie
+/// logicielle, +5 points de curseur `db60` valent +3 dB, quel que soit le
+/// niveau. Rend un gain. Sur un appareil, c'est [`cible_du_pas`].
+pub fn cible_du_pas_du_curseur(
+    echelle: super::volume_scale::EchelleDeVolume,
+    actuel: f64,
+    delta: f64,
+) -> f64 {
+    echelle.gain(cible_du_pas(echelle.position(actuel), delta))
+}
+
+/// #6787 — la cible d'un pas de `delta_db` décibels depuis le gain `actuel`.
+/// Depuis le silence, le premier pas est celui du CURSEUR
+/// ([`PAS_PAR_DEFAUT`] sur l'échelle de la zone) : sur une sortie logicielle,
+/// −68 dB et non −34 dB.
+pub fn cible_du_pas_db_du_curseur(
+    echelle: super::volume_scale::EchelleDeVolume,
+    actuel: f64,
+    delta_db: f64,
+) -> f64 {
+    match super::volume_scale::linear_to_db(actuel) {
+        None if delta_db > 0.0 => echelle.gain(PAS_PAR_DEFAUT),
+        _ => cible_du_pas_db(actuel, delta_db),
+    }
+}
+
 /// La cible d'un pas de `delta_db` décibels depuis `actuel`. Depuis le
 /// silence, un pas en dB ne monte jamais : il part alors du premier pas
 /// linéaire ([`PAS_PAR_DEFAUT`]).
@@ -343,6 +370,41 @@ mod tests {
         assert_eq!(cible_du_pas_db(0.0, -1.0), 0.0);
         assert_eq!(cible_du_pas(0.99, 0.02), 1.0);
         assert_eq!(cible_du_pas(0.01, -0.02), 0.0);
+    }
+
+    /// #6787 — sur une sortie logicielle, le pas en points se fait sur le
+    /// CURSEUR `db60` (0,6 dB par point) et rend un gain ; sur un appareil,
+    /// rien ne change.
+    #[test]
+    fn le_pas_du_curseur_suit_l_echelle_de_la_zone() {
+        use crate::audio::volume_scale::{EchelleDeVolume::*, db_to_linear, linear_to_db};
+        // −30 dB (curseur 50 %) + 5 points = −27 dB.
+        let depuis = db_to_linear(-30.0).unwrap();
+        let cible = cible_du_pas_du_curseur(Perceptive, depuis, 0.05);
+        let db = linear_to_db(cible).unwrap();
+        assert!((db + 27.0).abs() < 1e-6, "{db}");
+        // Vers le bas : −33 dB, jamais au-dessus du point de départ.
+        let bas = cible_du_pas_du_curseur(Perceptive, depuis, -0.05);
+        assert!((linear_to_db(bas).unwrap() + 33.0).abs() < 1e-6);
+        // Un pas nul ne monte pas, même d'un ulp.
+        for i in 0..=1000u32 {
+            let g = f64::from(i) / 1000.0;
+            assert!(cible_du_pas_du_curseur(Perceptive, g, 0.0) <= g, "{g}");
+        }
+        // Appareil : la fraction s'ajoute au nombre, comme avant.
+        assert_eq!(cible_du_pas_du_curseur(Lineaire, 0.30, 0.05), 0.35);
+        // Depuis le silence, le premier pas en dB est celui du curseur.
+        let premier = cible_du_pas_db_du_curseur(Perceptive, 0.0, 3.0);
+        assert_eq!(
+            premier,
+            crate::audio::volume_scale::gain_perceptif(PAS_PAR_DEFAUT)
+        );
+        assert!(premier < PAS_PAR_DEFAUT / 10.0, "{premier}");
+        assert_eq!(
+            cible_du_pas_db_du_curseur(Lineaire, 0.0, 3.0),
+            PAS_PAR_DEFAUT
+        );
+        assert_eq!(cible_du_pas_db_du_curseur(Perceptive, 0.0, -3.0), 0.0);
     }
 
     #[test]
