@@ -250,6 +250,11 @@ pub fn vue(db: &Arc<dyn DbBackend>, coffre: &Coffre) -> Value {
         "modele_gemini_par_defaut": couts::MODELE_GEMINI_PAR_DEFAUT,
         "modele_anthropic_par_defaut": couts::MODELE_ANTHROPIC_PAR_DEFAUT,
         "modele_anthropic_classique": couts::MODELE_ANTHROPIC_CLASSIQUE,
+        "transcription": crate::transcription::vue(
+            db,
+            coffre,
+            std::env::var(crate::transcription::VARIABLE_HERITEE).ok().as_deref(),
+        ),
         "consommation": {
             "mois": c.mois,
             "cout_eur": couts::micro_en_euros(c.micro_eur),
@@ -315,6 +320,10 @@ pub struct Modification {
     pub cle: Option<String>,
     /// #6730 — l'identifiant d'espace de travail Anthropic. `""` l'efface.
     pub espace_de_travail_anthropic: Option<String>,
+    /// La clé de TRANSCRIPTION (Whisper, OpenAI) en clair, scellée au coffre.
+    /// `""` l'efface. Voir [`crate::transcription`].
+    #[serde(default)]
+    pub cle_transcription: Option<String>,
 }
 
 fn texte_de(v: &Value) -> String {
@@ -412,6 +421,9 @@ pub fn appliquer(db: &Arc<dyn DbBackend>, coffre: &Coffre, m: &Modification) -> 
         } else {
             s.set(CLE_API_CHIFFREE, &coffre.sceller(cle)?)?;
         }
+    }
+    if let Some(cle) = &m.cle_transcription {
+        crate::transcription::poser_cle(db, coffre, cle)?;
     }
     Ok(())
 }

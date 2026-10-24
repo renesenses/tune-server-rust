@@ -139,6 +139,20 @@ impl Passerelle {
         }
     }
 
+    /// Transcrit un audio (Whisper) : clé au coffre, coût compté dans le
+    /// plafond de l'assistant et refusé AVANT l'envoi s'il le ferait franchir
+    /// ([`crate::transcription`]). `cle_env` : `TUNE_OPENAI_API_KEY`, repli
+    /// rétro-compatible quand aucune clé n'est au coffre.
+    pub async fn transcrire(
+        &self,
+        audio: &[u8],
+        cle_env: Option<&str>,
+    ) -> Result<crate::transcription::Transcription, ErreurAppel> {
+        self.migrer();
+        crate::transcription::transcrire(&self.backend, &self.coffre, &self.verrou, audio, cle_env)
+            .await
+    }
+
     /// L'ancien assistant peut-il dialoguer ? Étape 3 : avec tout
     /// fournisseur de l'assistant prêt (Anthropic, compatible OpenAI, Gemini,
     /// Ollama) — le dialogue à outils est traduit par [`crate::dialogue`].

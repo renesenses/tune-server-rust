@@ -176,6 +176,11 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
             // continu ; le priver du dB obligerait a un GET REST pour un
             // nombre qu'on tient deja. `null` = silence.
             "volume_db": tune_core::audio::volume_scale::linear_to_db(ps.volume),
+            // #6787 — la loi du curseur (`volume` reste le gain).
+            "volume_curve": tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(
+                z.output_type.as_deref(),
+            )
+            .code(),
             "muted": ps.muted,
             "shuffle": ps.shuffle,
             "repeat": ps.repeat,

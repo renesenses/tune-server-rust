@@ -137,8 +137,11 @@ pub const CLE_REGLAGE: &str = "spotify_lecture_experimentale";
 /// qui le rend en 409 avec un code stable (`spotify_playback_disabled`).
 pub const SENTINELLE_NON_ACTIVEE: &str = "spotify_playback_disabled:";
 
-pub const MOTIF_NON_ACTIVEE: &str =
-    "Lecture Spotify non activée (Réglages > Spotify > « Lecture Spotify (expérimental) »)";
+/// #6857 (Alesp, fil 2395) — le chemin RÉEL du réglage : il n'y a pas de
+/// page « Réglages > Spotify » ; l'interrupteur est dans l'onglet « Accès et
+/// jetons », carte « Spotify Connect », masquée au niveau Débutant
+/// (`v2Settings.ts`, `min: 'intermediate'`, pastille « Avancé »).
+pub const MOTIF_NON_ACTIVEE: &str = "Lecture Spotify non activée (Réglages › Accès et jetons › Spotify Connect › « Lecture Spotify (expérimental) », niveau Avancé)";
 
 /// Le réglage est-il activé ? Absent ou illisible : non.
 pub fn lecture_activee(db: &Arc<dyn crate::db::backend::DbBackend>) -> bool {
