@@ -176,6 +176,11 @@ pub async fn diffuser(
     let mut jouee: u64 = 0;
     let mut jouee_lue_a = t0;
     let mut tampon_reception = vec![0u8; 2048];
+    // #6911 — ce qui est arrivé sur le port local sans être retenu comme
+    // retour de CE flux. Sans ce relevé, « aucun retour Df » ne dit pas si
+    // rien n'est arrivé (filtrage réseau, ampli qui n'écoute pas) ou si des
+    // retours sont arrivés et ont été écartés (format, session, flux).
+    let mut ecartes = Ecartes::default();
 
     loop {
         tokio::select! {
@@ -257,11 +262,24 @@ pub async fn diffuser(
                 if dernier_retour.is_none()
                     && premier_envoi.is_some_and(|t| t.elapsed() > c.delai_premier_retour)
                 {
-                    warn!(flux = p.flux, %ampli, "devialet_air_aucun_retour");
-                    return FinDeFlux::interrompu(
-                        "l'ampli ne répond pas au flux (aucun retour Df) : \
-                         est-il allumé, sur la source AIR, et la session est-elle la bonne ?",
+                    let constat = ecartes.constat();
+                    let local = socket
+                        .local_addr()
+                        .map_or_else(|_| "?".to_owned(), |a| a.to_string());
+                    warn!(
+                        flux = p.flux,
+                        %ampli,
+                        %local,
+                        paquets_envoyes = instantane.paquets_envoyes,
+                        datagrammes_ecartes = ecartes.nombre,
+                        constat = %constat,
+                        "devialet_air_aucun_retour"
                     );
+                    return FinDeFlux::interrompu(format!(
+                        "l'ampli ne répond pas au flux (aucun retour Df) : \
+                         est-il allumé, sur la source AIR, et la session est-elle la bonne ? \
+                         ({constat})"
+                    ));
                 }
                 if dernier_retour.is_some_and(|t| t.elapsed() > c.delai_retour_perdu) {
                     return FinDeFlux::interrompu("l'ampli ne répond plus (retours Df interrompus)");
@@ -280,10 +298,22 @@ pub async fn diffuser(
             recu = socket.recv_from(&mut tampon_reception) => {
                 let Ok((n, de)) = recu else { continue };
                 if de.ip() != ampli.ip() {
+                    ecartes.noter(format!("{n} octets venus de {de}, pas de l'ampli"));
                     continue;
                 }
-                let Ok(df) = analyser_retour(&tampon_reception[..n]) else { continue };
+                let df = match analyser_retour(&tampon_reception[..n]) {
+                    Ok(df) => df,
+                    Err(refus) => {
+                        ecartes.noter(format!("{n} octets de l'ampli refusés : {refus}"));
+                        continue;
+                    }
+                };
                 if df.session != p.session || df.flux != p.flux {
+                    ecartes.noter(format!(
+                        "Df d'une autre session ou d'un autre flux (session {:02x?}, flux {} ; \
+                         attendus {:02x?}, {})",
+                        df.session, df.flux, p.session, p.flux
+                    ));
                     continue;
                 }
                 dernier_retour = Some(Instant::now());
@@ -309,6 +339,33 @@ pub async fn diffuser(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Les datagrammes reçus sur le port local et écartés par l'émetteur.
+#[derive(Default)]
+struct Ecartes {
+    nombre: u64,
+    dernier: Option<String>,
+}
+
+impl Ecartes {
+    fn noter(&mut self, pourquoi: String) {
+        if self.nombre == 0 {
+            debug!(%pourquoi, "devialet_air_datagramme_ecarte");
+        }
+        self.nombre += 1;
+        self.dernier = Some(pourquoi);
+    }
+
+    fn constat(&self) -> String {
+        match &self.dernier {
+            None => "aucun datagramme reçu sur le port local".to_owned(),
+            Some(d) => format!(
+                "{} datagramme(s) reçu(s) et écarté(s), dernier : {d}",
+                self.nombre
+            ),
         }
     }
 }
