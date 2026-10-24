@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "d4fa500c594e965546d0af12a46068871ddb97cf",
+    "web_sha": "c474c0c49c23654268cff76525eb52349219d150",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -3426,6 +3426,19 @@
       ]
     },
     {
+      "route": "/streaming/{}/albums/{}/context",
+      "methode": "GET",
+      "type": "StreamingAlbumContext",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "genre_id",
+        "genre_name",
+        "label_id",
+        "label_name"
+      ]
+    },
+    {
       "route": "/streaming/{}/albums/{}/tracks",
       "methode": "GET",
       "type": "Track",
@@ -3811,6 +3824,34 @@
       "champs_optionnels": [
         "image_url"
       ]
+    },
+    {
+      "route": "/streaming/{}/labels/{}",
+      "methode": "GET",
+      "type": "StreamingLabelPage",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "total",
+        "offset",
+        "limit",
+        "albums"
+      ],
+      "champs_optionnels": [
+        "image_url"
+      ]
+    },
+    {
+      "route": "/streaming/{}/labels/{}/artists",
+      "methode": "GET",
+      "type": "StreamingLabelArtists",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "artists"
+      ],
+      "champs_optionnels": []
     },
     {
       "route": "/streaming/{}/new-releases",
@@ -6860,7 +6901,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 341,
+    "routes_cartographiees": 344,
     "appels_non_resolus": 155
   }
 }

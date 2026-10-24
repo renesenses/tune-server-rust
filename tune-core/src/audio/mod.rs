@@ -85,6 +85,8 @@ pub mod fondu_de_zone;
 /// de sortie n'est touché : c'est tout le sujet du ticket.
 pub mod fondu_enchaine;
 pub mod formats;
+/// #6721 — garde générale contre les montées brusques du volume.
+pub mod garde_de_hausse;
 pub mod http_range;
 pub mod image_cdda;
 /// #5299 — les fichiers audio d'une image ISO de données, lus sans la monter.

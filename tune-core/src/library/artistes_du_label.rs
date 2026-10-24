@@ -63,6 +63,21 @@ impl CatalogueDuLabel for QobuzService {
     }
 }
 
+/// Le catalogue d'un label lu par le trait d'un service quelconque
+/// ([`crate::streaming::StreamingService::get_label_catalogue`]) : la page
+/// « Label » d'un service (#6934) passe par le même cache.
+struct CatalogueDuService<'a>(&'a dyn crate::streaming::StreamingService);
+
+#[async_trait::async_trait]
+impl CatalogueDuLabel for CatalogueDuService<'_> {
+    async fn albums_du_label(&self, label_id: &str) -> Result<Vec<StreamAlbum>, String> {
+        self.0
+            .get_label_catalogue(label_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// La clé d'un nom d'artiste : sans accents, minuscules, espaces resserrés.
 /// « Bill Évans » et « bill  evans » sont le même artiste ; « Bill Evans
 /// Trio » ne l'est pas.
@@ -231,6 +246,20 @@ impl CacheDecouverte {
             .unwrap_or_else(|e| e.into_inner())
             .insert(label_id.to_string(), (maintenant(), lecture.clone()));
         lecture
+    }
+}
+
+impl CacheDecouverte {
+    /// #6934 — comme [`Self::albums`], le catalogue lu par le trait du service
+    /// (`get_label_catalogue`), sous la même clé : l'identifiant du label.
+    pub async fn albums_du_service(
+        &self,
+        service: &dyn crate::streaming::StreamingService,
+        label_id: &str,
+        maintenant: impl Fn() -> u64,
+    ) -> Result<Arc<Vec<StreamAlbum>>, String> {
+        self.albums(&CatalogueDuService(service), label_id, maintenant)
+            .await
     }
 }
 

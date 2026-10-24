@@ -133,7 +133,8 @@ async fn une_securite_sous_le_volume_courant_ramene_la_zone_6541() {
         &app,
         "PUT",
         &format!("/api/v1/zones/{id}/volume"),
-        json!({ "volume": 0.9 }),
+        // #6721 — hausse confirmée : la garde n'est pas l'objet de ce test.
+        json!({ "volume": 0.9, "confirm_increase": true }),
     )
     .await;
     let (statut, _) = appeler(
@@ -315,7 +316,8 @@ async fn une_limite_existante_est_ignoree_en_pure_6541() {
         &app,
         "PUT",
         &format!("/api/v1/zones/{id}/volume"),
-        json!({ "volume": 0.9 }),
+        // #6721 — hausse confirmée : la garde n'est pas l'objet de ce test.
+        json!({ "volume": 0.9, "confirm_increase": true }),
     )
     .await;
     assert_eq!(statut, StatusCode::NO_CONTENT);
@@ -346,7 +348,8 @@ async fn relever_une_limite_n_envoie_aucune_commande_6541() {
         &app,
         "PUT",
         &format!("/api/v1/zones/{id}/volume"),
-        json!({ "volume": 1.0 }),
+        // #6721 — hausse confirmée : la garde n'est pas l'objet de ce test.
+        json!({ "volume": 1.0, "confirm_increase": true }),
     )
     .await;
     assert_eq!(recus(&state).await, vec![0.5]);
@@ -505,7 +508,8 @@ async fn sur_une_sortie_locale_volume_reste_le_gain_et_le_curseur_est_db60_6787(
         &app_reseau,
         "POST",
         &format!("/api/v1/zones/{zone_reseau}/volume"),
-        json!({ "volume": 0.5 }),
+        // #6721 — 20 % → 50 % : hausse confirmée, la garde n'est pas l'objet ici.
+        json!({ "volume": 0.5, "confirm_increase": true }),
     )
     .await;
     assert_eq!(lin["volume_curve"], "linear", "{lin}");

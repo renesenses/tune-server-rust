@@ -1394,7 +1394,7 @@ fn warm_sqlite_cache(state: &AppState) {
 /// est aujourd'hui un choix de l'utilisateur. Et la vraie protection contre le
 /// réveil à plein volume est dans `register_local_outputs`, qui ensemence la
 /// sortie avec la valeur stockée — celle-là agit sur le son. Refs #1596.
-async fn restore_zone_volumes(state: &AppState) {
+pub(crate) async fn restore_zone_volumes(state: &AppState) {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     if let Ok(zones) = zone_repo.list() {
         for zone in &zones {
