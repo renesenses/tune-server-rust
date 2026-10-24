@@ -46,8 +46,15 @@ async fn sortie(orch: &PlaybackOrchestrator, appareil: &str) -> (usize, Vec<u64>
 
 /// Un FLAC de la bibliothèque qui joue sur la zone DLNA, par une session
 /// FICHIER (passthrough natif, cherchable par `Range`).
+///
+/// #6963 — `zone_id` est imposé, propre à chaque test : les `Seek` à juger
+/// sont rangés dans un état global par zone, et chaque base en mémoire
+/// numérote sa première zone 1. Deux tests en parallèle sur la zone 1 se
+/// marchaient dessus (le relancement natif `oublier` le `Seek` que l'autre
+/// venait de noter).
 async fn flac_natif_en_lecture(
     appareil: &str,
+    zone_id: i64,
 ) -> (PlaybackOrchestrator, i64, String, tempfile::TempDir) {
     let orch = orchestrateur();
     let dir = tempfile::tempdir().unwrap();
@@ -84,9 +91,22 @@ async fn flac_natif_en_lecture(
             &[&chemin as &dyn crate::db::backend::ToSqlValue],
         )
         .unwrap();
-    let zone_id = ZoneRepo::with_backend(orch.db.clone())
-        .create("Salon", Some("dlna"), Some(appareil))
+    orch.db
+        .execute(
+            &format!(
+                "INSERT INTO zones (id, name, output_type, output_device_id) \
+                 VALUES ({zone_id}, 'Salon', 'dlna', ?)"
+            ),
+            &[&appareil as &dyn crate::db::backend::ToSqlValue],
+        )
         .unwrap();
+    assert!(
+        ZoneRepo::with_backend(orch.db.clone())
+            .get(zone_id)
+            .unwrap()
+            .is_some(),
+        "zone {zone_id} créée"
+    );
     let mock = MockOutput::new(appareil, "R-N2000A").with_type("dlna");
     orch.outputs.lock().await.register(Box::new(mock));
     let sid = orch
@@ -124,7 +144,7 @@ async fn flac_natif_en_lecture(
 async fn seek_inoperant_relance_le_flux_natif_a_la_position_6059() {
     let _ = profil::base_de_test();
     let appareil = "dlna:uuid-rn2000a-bout-en-bout-6059";
-    let (orch, zone_id, _chemin, _dir) = flac_natif_en_lecture(appareil).await;
+    let (orch, zone_id, _chemin, _dir) = flac_natif_en_lecture(appareil, 60_593).await;
     profil::memoriser_seek_inoperant(appareil);
 
     let resultat = orch.seek(zone_id, CIBLE_MS, Some(appareil)).await;
@@ -182,7 +202,7 @@ async fn seek_inoperant_relance_le_flux_natif_a_la_position_6059() {
 async fn renderer_sain_le_seek_part_et_sera_verifie_6059() {
     let _ = profil::base_de_test();
     let appareil = "dlna:uuid-renderer-sain-bout-en-bout-6059";
-    let (orch, zone_id, _chemin, _dir) = flac_natif_en_lecture(appareil).await;
+    let (orch, zone_id, _chemin, _dir) = flac_natif_en_lecture(appareil, 60_594).await;
     assert!(!profil::seek_inoperant(appareil));
 
     let resultat = orch.seek(zone_id, CIBLE_MS, Some(appareil)).await;
