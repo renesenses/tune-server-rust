@@ -465,3 +465,184 @@ async fn un_ogg_vorbis_chaine_passe_au_titre_suivant_sans_se_reconnecter() {
     );
     assert!(non_nuls > 1_000);
 }
+
+/// L'énergie relative de `signal` (mono) à `hz`, par Goertzel.
+fn puissance_a(signal: &[f32], cadence: u32, hz: f32) -> f64 {
+    let k = 2.0 * (std::f64::consts::TAU * f64::from(hz) / f64::from(cadence)).cos();
+    let (mut s1, mut s2) = (0f64, 0f64);
+    for x in signal {
+        let s0 = f64::from(*x) + k * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    (s1 * s1 + s2 * s2 - k * s1 * s2) / (signal.len() as f64).powi(2)
+}
+
+/// L'énergie au-dessus de 12 kHz rapportée à celle sous 12 kHz, sur une
+/// grille de 250 Hz.
+fn part_au_dessus_de_12_khz(signal: &[f32], cadence: u32) -> f64 {
+    let (mut haut, mut bas) = (0f64, 0f64);
+    let mut hz = 250.0f32;
+    while hz < (cadence / 2) as f32 - 250.0 {
+        let p = puissance_a(signal, cadence, hz);
+        if hz > 12_000.0 {
+            haut += p
+        } else {
+            bas += p
+        }
+        hz += 250.0;
+    }
+    haut / bas.max(f64::MIN_POSITIVE)
+}
+
+/// #6357 — l'échantillon HE-AAC FABRIQUÉ (SBR implicite, cœur à 24 kHz) est
+/// bien du HE-AAC : `rusty_aac` le sort à 48 kHz, avec de l'énergie
+/// au-dessus de 12 kHz, que le cœur ne peut pas porter.
+#[test]
+fn l_echantillon_he_aac_fabrique_se_decode_a_48_khz_avec_ses_aigus() {
+    let adts = crate::radio_hls::fabrique_tests::trames_he_aac(1.0);
+    let mut decodeur = rusty_aac::AacDecoder::new();
+    let (mut pcm, mut cadence, mut canaux) = (Vec::new(), 0, 0);
+    let mut i = 0;
+    while i + 7 <= adts.len() {
+        let longueur = rusty_aac::parse_adts(&adts[i..])
+            .expect("en-tête ADTS")
+            .frame_length;
+        let trame = decodeur
+            .decode(&adts[i..i + longueur], None)
+            .expect("trame HE-AAC");
+        cadence = trame.sample_rate;
+        canaux = trame.channels;
+        pcm.extend(trame.samples.iter().step_by(usize::from(trame.channels)));
+        i += longueur;
+    }
+    assert_eq!(
+        cadence, 48_000,
+        "le SBR double la fréquence du cœur (24 kHz)"
+    );
+    assert_eq!(
+        canaux, 2,
+        "un cœur mono HE-AAC sort en stéréo (PS implicite)"
+    );
+    let part = part_au_dessus_de_12_khz(&pcm[4096..], cadence);
+    assert!(part > 1e-3, "le SBR doit reconstruire des aigus : {part:e}");
+}
+
+/// #6357 — LE TÉMOIN DU BRANCHEMENT. Un faux direct HLS sur 127.0.0.1
+/// (liste maîtresse `mp4a.40.5`, liste média, segments MPEG-TS de HE-AAC à
+/// SBR implicite, comme la BBC hors Royaume-Uni) passe par le décodeur de
+/// PRODUCTION, `decode_radio_stream_to_pcm`, jusqu'au PCM :
+///
+/// * le format publié est 48 kHz stéréo — la sortie du SBR — et non les
+///   24 kHz que l'en-tête ADTS annonce (le piège de l'étude §4.4 : un WAV à
+///   24 kHz sur du PCM à 48 kHz jouerait à demi-vitesse) ;
+/// * le PCM servi porte des aigus au-dessus de 12 kHz ;
+/// * la source publiée dit HLS, HE-AAC, et son débit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_station_hls_he_aac_est_decodee_jusqu_au_pcm_a_48_khz() {
+    use crate::http::streamer::{AudioStreamer, StreamInfo};
+    use crate::radio_hls::fabrique_tests as fab;
+
+    // Trois segments de 2 s, puis un direct immobile.
+    let adts = fab::trames_he_aac(6.0);
+    let mut trames = Vec::new();
+    let mut i = 0;
+    while i + 7 <= adts.len() {
+        let n = rusty_aac::parse_adts(&adts[i..]).unwrap().frame_length;
+        trames.push(adts[i..i + n].to_vec());
+        i += n;
+    }
+    let par_segment = trames.len() / 3;
+    let segments: Vec<Vec<u8>> = trames
+        .chunks(par_segment)
+        .take(3)
+        .enumerate()
+        .map(|(n, t)| fab::segment_ts(&t.concat(), (n * 7 % 16) as u8, true))
+        .collect();
+    let routeur: Arc<fab::Routeur> = Arc::new(move |chemin: &str, _rang: usize| {
+        match chemin {
+        "/bbc/master.m3u8" => fab::ok(
+            fab::TYPE_LISTE,
+            b"#EXTM3U\n#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=101760,CODECS=\"mp4a.40.5\"\naudio=96000.m3u8\n".to_vec(),
+        ),
+        "/bbc/audio=96000.m3u8" => fab::ok(
+            fab::TYPE_LISTE,
+            fab::liste_media(
+                2,
+                500,
+                &(0..3).map(|n| (format!("s-{}.ts", 500 + n), String::new(), false)).collect::<Vec<_>>(),
+                false,
+            ),
+        ),
+        _ => match chemin
+            .strip_prefix("/bbc/s-")
+            .and_then(|r| r.strip_suffix(".ts"))
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            Some(n) if (500..503).contains(&n) => fab::ok(fab::TYPE_TS, segments[n - 500].clone()),
+            _ => fab::introuvable(),
+        },
+    }
+    });
+    let serveur = fab::ServeurHls::lancer(routeur);
+    let url = format!("{}/bbc/master.m3u8", serveur.base);
+
+    let streamer = Arc::new(AudioStreamer::new(0));
+    let info = StreamInfo {
+        format: "wav".to_string(),
+        mime_type: "audio/wav".to_string(),
+        ..StreamInfo::default()
+    };
+    let (id, _tx_session, _ready, session) = streamer.create_radio_session(info, 4).await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let data_ready = Arc::new(tokio::sync::Notify::new());
+    let (session_d, ready_d) = (session.clone(), data_ready.clone());
+    let decodeur = tokio::task::spawn_blocking(move || {
+        decode_radio_stream_to_pcm(url, tx, ready_d, session_d, None, None, false, None)
+    });
+
+    tokio::time::timeout(Duration::from_secs(15), data_ready.notified())
+        .await
+        .expect("le premier morceau doit réveiller le consommateur en moins de 15 s");
+    assert_eq!(
+        session.detected_output_format(),
+        Some((48_000, 2)),
+        "le format publié doit être celui du HE-AAC décodé (48 kHz stéréo), \
+         pas celui du cœur AAC-LC que dit l'en-tête ADTS (24 kHz mono)"
+    );
+    let source = streamer
+        .stream_output_wire(&id)
+        .await
+        .and_then(|w| w.radio_source)
+        .expect("la source radio est publiée");
+    assert_eq!(source.transport, Some("hls"));
+    assert_eq!(source.profil, Some("HE-AAC"));
+    assert_eq!(source.format, Some("aac"));
+    assert!(source.debit_kbps.is_some_and(|k| k > 0), "{source:?}");
+
+    // Deux secondes de PCM 16 bits stéréo : la voie gauche, en flottants.
+    let mut octets = Vec::new();
+    while octets.len() < 2 * 48_000 * 4 {
+        let morceau = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("un morceau de PCM doit arriver en moins de 10 s")
+            .expect("le décodeur ne doit pas fermer le canal");
+        octets.extend(morceau);
+    }
+    let gauche: Vec<f32> = octets
+        .chunks_exact(4)
+        .map(|t| f32::from(i16::from_le_bytes([t[0], t[1]])) / 32768.0)
+        .collect();
+    let part = part_au_dessus_de_12_khz(&gauche[8192..], 48_000);
+    assert!(
+        part > 1e-3,
+        "le PCM servi doit porter les aigus reconstruits par le SBR : {part:e}"
+    );
+
+    drop(rx);
+    let verdict = tokio::time::timeout(Duration::from_secs(15), decodeur)
+        .await
+        .expect("le décodeur doit rendre la main après le départ du consommateur")
+        .expect("la tâche de décodage ne doit pas paniquer");
+    assert_eq!(verdict, Ok(()));
+}

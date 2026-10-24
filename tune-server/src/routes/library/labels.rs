@@ -8,7 +8,7 @@
 //! Sans compte Qobuz (service absent, désactivé ou non connecté) : aucune
 //! passe, aucun appel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -18,11 +18,16 @@ use axum::extract::State;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tune_core::db::album_repo::{AlbumRepo, LabelDeBibliotheque};
+use tune_core::library::artistes_du_label::{
+    ArtisteADecouvrir, CacheDecouverte, CatalogueDuLabel, artistes_de_la_bibliotheque,
+    cles_de_la_bibliotheque, regrouper,
+};
 use tune_core::library::logos_labels::{
     CacheLogosLabels, CatalogueDeLabels, Demande, LabelDuCatalogue, PASSE_MAX, PAUSE_ENTRE_LABELS,
 };
 use tune_core::streaming::StreamingService;
 use tune_core::streaming::qobuz::QobuzService;
+use tune_core::streaming::traits::StreamAlbum;
 use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::state::AppState;
@@ -86,12 +91,25 @@ impl CatalogueDeLabels for QobuzConnecte {
     }
 }
 
-/// Le catalogue Qobuz à interroger, ou `None` sans compte Qobuz connecté —
-/// et alors, aucune passe.
-pub(crate) async fn catalogue_qobuz(state: &AppState) -> Option<Arc<dyn CatalogueDeLabels>> {
+#[async_trait::async_trait]
+impl CatalogueDuLabel for QobuzConnecte {
+    async fn albums_du_label(&self, label_id: &str) -> Result<Vec<StreamAlbum>, String> {
+        let garde = connecte(&self.0).await?;
+        CatalogueDuLabel::albums_du_label(qobuz(garde.as_ref())?, label_id).await
+    }
+}
+
+/// Le service Qobuz actif ET connecté, ou `None` — et alors, aucun appel.
+async fn qobuz_connecte(state: &AppState) -> Option<Arc<QobuzConnecte>> {
     let svc = state.services.lock().await.get_actif("qobuz").await?;
     drop(connecte(&svc).await.ok()?);
     Some(Arc::new(QobuzConnecte(svc)))
+}
+
+/// Le catalogue Qobuz à interroger, ou `None` sans compte Qobuz connecté —
+/// et alors, aucune passe.
+pub(crate) async fn catalogue_qobuz(state: &AppState) -> Option<Arc<dyn CatalogueDeLabels>> {
+    Some(qobuz_connecte(state).await? as Arc<dyn CatalogueDeLabels>)
 }
 
 /// Une entrée de la liste : `image_url` et `qobuz_label_id` sont ABSENTS
@@ -146,6 +164,109 @@ pub(super) async fn list_labels(State(state): State<AppState>) -> Json<Value> {
         lancer_passe(cache, catalogue, &labels, PAUSE_ENTRE_LABELS);
     }
     Json(Value::Array(items))
+}
+
+// ---------------------------------------------------------------------------
+// #6782 — les artistes du même label
+// ---------------------------------------------------------------------------
+
+/// Les deux faces de Qobuz dont la découverte a besoin : rapprocher le label
+/// (lot L), puis lire son catalogue.
+pub(crate) struct QobuzPourLeLabel {
+    pub(crate) labels: Arc<dyn CatalogueDeLabels>,
+    pub(crate) catalogue: Arc<dyn CatalogueDuLabel>,
+}
+
+/// La section « À découvrir » d'un label : `None` sans Qobuz, sans label
+/// Qobuz rapproché, ou quand son catalogue n'a pas pu être lu.
+///
+/// Le label Qobuz est celui que le lot L garde dans l'index des logos. Pour
+/// un label que la liste n'a pas encore rapproché (page ouverte depuis une
+/// fiche album), on le rapproche ici, pour ce seul label — trois appels au
+/// plus, gardés comme ceux de la passe — et seulement si aucune passe ne
+/// tourne.
+pub(crate) async fn section_decouvrir(
+    logos: &CacheLogosLabels,
+    decouverte: &CacheDecouverte,
+    qobuz: Option<QobuzPourLeLabel>,
+    label: &LabelDeBibliotheque,
+    deja: &HashSet<String>,
+) -> Option<(String, Vec<ArtisteADecouvrir>)> {
+    let qobuz = qobuz?;
+    let mut id = logos.entree(&label.nom).and_then(|e| e.qobuz_label_id);
+    if id.is_none() {
+        let demande = Demande {
+            nom: label.nom.clone(),
+            album_du_catalogue: label.album_qobuz.clone(),
+        };
+        let a_faire = logos.a_resoudre(&[demande], maintenant(), 1);
+        if !a_faire.is_empty()
+            && let Some(_passe) = logos.reserver_passe()
+        {
+            logos
+                .resoudre(&*qobuz.labels, a_faire, maintenant, Duration::ZERO)
+                .await;
+        }
+        id = logos.entree(&label.nom).and_then(|e| e.qobuz_label_id);
+    }
+    let id = id?;
+    let albums = decouverte
+        .albums(&*qobuz.catalogue, &id, maintenant)
+        .await
+        .ok()?;
+    Some((id, regrouper(&albums, deja)))
+}
+
+/// `GET /library/labels/{nom}/artists` (#6782) — les artistes du label.
+///
+/// ```json
+/// { "name": "ECM",
+///   "bibliotheque": [{"id": 1, "name": "Keith Jarrett", "album_count": 4,
+///                     "image_url": "/api/v1/library/artists/1/image"}],
+///   "qobuz_label_id": "9",
+///   "decouvrir": [{"name": "Jan Garbarek", "qobuz_artist_id": "20",
+///                  "album_count": 3,
+///                  "album_phare": {"id": "…", "title": "Rarum",
+///                                  "cover_url": "https://…", "year": 2002}}] }
+/// ```
+///
+/// `bibliotheque` est toujours là (vide pour un label inconnu). `decouvrir`
+/// et `qobuz_label_id` sont ABSENTS sans compte Qobuz connecté — aucun appel
+/// alors — ou quand le label n'a pas de correspondant Qobuz, ou que son
+/// catalogue n'a pas pu être lu. `decouvrir` ne contient aucun artiste déjà
+/// présent dans la bibliothèque, sous ce label ou un autre.
+pub(super) async fn artistes_du_label(
+    State(state): State<AppState>,
+    axum::extract::Path(nom): axum::extract::Path<String>,
+) -> Json<Value> {
+    let nom = nom.trim().to_string();
+    let bibliotheque = artistes_de_la_bibliotheque(&state.backend, &nom).ou_defaut_journalise();
+    let mut corps = json!({ "name": nom, "bibliotheque": bibliotheque });
+    let qobuz = qobuz_connecte(&state).await.map(|q| QobuzPourLeLabel {
+        labels: q.clone(),
+        catalogue: q,
+    });
+    if qobuz.is_some() {
+        let label = AlbumRepo::with_backend(state.backend.clone())
+            .labels_de_la_bibliotheque()
+            .ou_defaut_journalise()
+            .into_iter()
+            .find(|l| l.nom == nom)
+            .unwrap_or(LabelDeBibliotheque {
+                nom: nom.clone(),
+                album_count: 0,
+                album_qobuz: None,
+            });
+        let deja = cles_de_la_bibliotheque(&state.backend).ou_defaut_journalise();
+        let logos = cache_de(&super::artwork_cache_dir());
+        if let Some((id, decouvrir)) =
+            section_decouvrir(&logos, CacheDecouverte::global(), qobuz, &label, &deja).await
+        {
+            corps["qobuz_label_id"] = json!(id);
+            corps["decouvrir"] = json!(decouvrir);
+        }
+    }
+    Json(corps)
 }
 
 #[cfg(test)]
@@ -369,5 +490,244 @@ mod tests {
             lancer_passe(cache, compteur.clone(), &liste, Duration::ZERO).is_none(),
             "tout est connu, absence comprise : plus aucun appel"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #6782 — les artistes du même label
+    // -----------------------------------------------------------------------
+
+    fn artiste(state: &AppState, id: i64, nom: &str) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO artists (id, name) VALUES (?, ?)",
+                &[&id as &dyn ToSqlValue, &nom],
+            )
+            .unwrap();
+    }
+
+    fn album_de(state: &AppState, titre: &str, artiste: i64, label: &str) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO albums (title, artist_id, source, track_count, label) \
+                 VALUES (?, ?, 'local', 0, ?)",
+                &[&titre as &dyn ToSqlValue, &artiste, &label],
+            )
+            .unwrap();
+    }
+
+    /// Sans compte Qobuz connecté (démarrage neuf) : la bibliothèque seule,
+    /// ni `decouvrir` ni `qobuz_label_id` — et aucun catalogue construit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sans_qobuz_la_page_du_label_ne_montre_que_la_bibliotheque() {
+        let dossier = tune_core::test_scratch::scratch_dir("labels-6782-route");
+        let chemin = dossier.path().join("tune.db");
+        let (app, state) = demarrer(chemin.to_str().unwrap());
+        artiste(&state, 1, "Keith Jarrett");
+        artiste(&state, 2, "Jan Garbarek");
+        album_de(&state, "Köln", 1, "ECM 6782");
+        album_de(&state, "Facing You", 1, "ECM 6782");
+        album_de(&state, "Officium", 2, "ECM 6782");
+        album_de(&state, "Autre", 2, "Autre 6782");
+
+        let reponse = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/library/labels/ECM%206782/artists")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(reponse.status().is_success(), "{}", reponse.status());
+        let corps: Value = serde_json::from_slice(
+            &axum::body::to_bytes(reponse.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(corps["name"], "ECM 6782");
+        let noms: Vec<(&str, i64)> = corps["bibliotheque"]
+            .as_array()
+            .expect("toujours une liste")
+            .iter()
+            .map(|a| {
+                (
+                    a["name"].as_str().unwrap(),
+                    a["album_count"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(noms, vec![("Keith Jarrett", 2), ("Jan Garbarek", 1)]);
+        assert!(
+            corps.get("decouvrir").is_none(),
+            "absente sans Qobuz : {corps}"
+        );
+        assert!(corps.get("qobuz_label_id").is_none());
+        assert!(qobuz_connecte(&state).await.is_none(), "aucun catalogue");
+    }
+
+    struct FauxQobuz {
+        rapprochements: AtomicUsize,
+        lectures: Mutex<Vec<String>>,
+    }
+
+    impl FauxQobuz {
+        fn nouveau() -> Arc<Self> {
+            Arc::new(Self {
+                rapprochements: AtomicUsize::new(0),
+                lectures: Mutex::new(Vec::new()),
+            })
+        }
+        fn pour_le_label(self: &Arc<Self>) -> Option<QobuzPourLeLabel> {
+            Some(QobuzPourLeLabel {
+                labels: self.clone(),
+                catalogue: self.clone(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CatalogueDeLabels for FauxQobuz {
+        async fn trouver_label(
+            &self,
+            nom: &str,
+            album: Option<&str>,
+        ) -> Result<Option<LabelDuCatalogue>, String> {
+            self.rapprochements.fetch_add(1, Ordering::SeqCst);
+            Ok((album == Some("q-ecm")).then(|| LabelDuCatalogue {
+                id: "9".into(),
+                nom: nom.into(),
+                image_url: None,
+            }))
+        }
+        async fn telecharger_image(&self, _: &str) -> Result<Vec<u8>, String> {
+            Ok(PNG.to_vec())
+        }
+    }
+
+    fn sa(id: &str, artiste: &str, an: u32) -> StreamAlbum {
+        StreamAlbum {
+            ai_generated: None,
+            release_type: None,
+            id: id.into(),
+            title: format!("T{id}"),
+            artist: artiste.into(),
+            artist_id: None,
+            cover_path: None,
+            year: Some(an),
+            track_count: 1,
+            quality: None,
+            released_at: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CatalogueDuLabel for FauxQobuz {
+        async fn albums_du_label(&self, label_id: &str) -> Result<Vec<StreamAlbum>, String> {
+            self.lectures.lock().unwrap().push(label_id.to_string());
+            Ok(vec![
+                sa("1", "Keith Jarrett", 1975),
+                sa("2", "Jan Garbarek", 1994),
+                sa("3", "Jan Garbarek", 2002),
+                sa("4", "Steve Reich", 1978),
+            ])
+        }
+    }
+
+    fn ecm(album_qobuz: Option<&str>) -> LabelDeBibliotheque {
+        LabelDeBibliotheque {
+            nom: "ECM".into(),
+            album_count: 3,
+            album_qobuz: album_qobuz.map(String::from),
+        }
+    }
+
+    /// Le label rapproché par le lot L : son identifiant sert tel quel, sans
+    /// nouveau rapprochement — même quand la passe des LOGOS voudrait le
+    /// redemander (ici, une image en erreur depuis plus d'un jour) ; les
+    /// artistes déjà présents sont retirés ; le catalogue n'est lu qu'une fois.
+    #[tokio::test]
+    async fn le_label_rapproche_donne_ses_artistes_a_decouvrir() {
+        let dossier = tune_core::test_scratch::scratch_dir("labels-6782-connu");
+        let logos = CacheLogosLabels::ouvrir(dossier.path());
+        logos.inscrire(
+            "ECM",
+            EntreeLogo {
+                statut: Statut::Erreur,
+                qobuz_label_id: Some("9".into()),
+                image: None,
+                verifie_le: maintenant() - tune_core::library::logos_labels::DELAI_ERREUR_S - 1,
+            },
+        );
+        let decouverte = CacheDecouverte::default();
+        let faux = FauxQobuz::nouveau();
+        let deja: HashSet<String> = ["keith jarrett".to_string()].into();
+        for _ in 0..3 {
+            let (id, liste) =
+                section_decouvrir(&logos, &decouverte, faux.pour_le_label(), &ecm(None), &deja)
+                    .await
+                    .expect("une section");
+            assert_eq!(id, "9");
+            let noms: Vec<(&str, usize)> = liste
+                .iter()
+                .map(|a| (a.name.as_str(), a.album_count))
+                .collect();
+            assert_eq!(noms, vec![("Jan Garbarek", 2), ("Steve Reich", 1)]);
+        }
+        assert_eq!(faux.rapprochements.load(Ordering::SeqCst), 0);
+        assert_eq!(*faux.lectures.lock().unwrap(), vec!["9"], "pas de rafale");
+    }
+
+    /// Un label que la liste n'a pas encore vu (page ouverte depuis une fiche
+    /// album) : rapproché ici, une fois, par l'album Qobuz de la bibliothèque.
+    /// Un label sans correspondant Qobuz : pas de section, et pas de nouveau
+    /// rapprochement à l'ouverture suivante.
+    #[tokio::test]
+    async fn un_label_encore_inconnu_est_rapproche_une_seule_fois() {
+        let dossier = tune_core::test_scratch::scratch_dir("labels-6782-inconnu");
+        let logos = CacheLogosLabels::ouvrir(dossier.path());
+        let decouverte = CacheDecouverte::default();
+        let faux = FauxQobuz::nouveau();
+        let deja = HashSet::new();
+        let (id, liste) = section_decouvrir(
+            &logos,
+            &decouverte,
+            faux.pour_le_label(),
+            &ecm(Some("q-ecm")),
+            &deja,
+        )
+        .await
+        .expect("rapproché par l'album");
+        assert_eq!((id.as_str(), liste.len()), ("9", 3));
+        assert_eq!(faux.rapprochements.load(Ordering::SeqCst), 1);
+
+        let sans = LabelDeBibliotheque {
+            nom: "Sans Qobuz 6782".into(),
+            album_count: 1,
+            album_qobuz: None,
+        };
+        for _ in 0..2 {
+            assert!(
+                section_decouvrir(&logos, &decouverte, faux.pour_le_label(), &sans, &deja)
+                    .await
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            faux.rapprochements.load(Ordering::SeqCst),
+            2,
+            "l'absence est gardée : un seul rapprochement de plus"
+        );
+        assert_eq!(*faux.lectures.lock().unwrap(), vec!["9"]);
+
+        // Sans Qobuz : rien, et aucun appel.
+        assert!(
+            section_decouvrir(&logos, &decouverte, None, &ecm(Some("q-ecm")), &deja)
+                .await
+                .is_none()
+        );
+        assert_eq!(faux.rapprochements.load(Ordering::SeqCst), 2);
     }
 }

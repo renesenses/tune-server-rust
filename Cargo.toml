@@ -117,8 +117,8 @@ rubato = { path = "vendor/rubato" }
 opus = "0.4.0"
 thiserror = "2"
 unicode-normalization = "0.1"
-oaat-core = { git = "https://github.com/renesenses/oaat", rev = "ed3b148", default-features = false }
-oaat-controller = { git = "https://github.com/renesenses/oaat", rev = "ed3b148", default-features = false }
+oaat-core = { git = "https://github.com/renesenses/oaat", rev = "c96021f0", default-features = false }
+oaat-controller = { git = "https://github.com/renesenses/oaat", rev = "c96021f0", default-features = false }
 flate2 = "1"
 tar = "0.4"
 # zip 9 (RUSTSEC-2026-0367/0368/0369). En 9.x la feature `deflate` tire le

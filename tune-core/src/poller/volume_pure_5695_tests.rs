@@ -133,9 +133,16 @@ impl Banc {
     /// #6739 — une consigne de volume par le VRAI orchestrateur, puis la
     /// grâce de volume écoulée (le sondeur juge le relevé au tour suivant).
     pub(super) async fn consigne(&self, volume: f64) {
+        // #6721 — la consigne du banc est un geste CONFIRMÉ : la garde contre
+        // les montées brusques n'est pas l'objet de ces tests.
         self.poller
             .orchestrator
-            .set_volume(self.zone_id, volume, Some(APPAREIL))
+            .set_volume_avec_garde(
+                self.zone_id,
+                volume,
+                Some(APPAREIL),
+                crate::audio::garde_de_hausse::Hausse::Confirmee,
+            )
             .await
             .unwrap();
         self.poller
