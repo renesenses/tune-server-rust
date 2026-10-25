@@ -219,6 +219,7 @@ impl axum::extract::FromRef<AppState> for tune_streaming_http::StreamingHttpStat
             state.services.clone(),
             state.event_bus.clone(),
         )
+        .avec_http(state.http_client.clone())
     }
 }
 

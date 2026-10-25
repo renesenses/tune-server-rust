@@ -83,13 +83,19 @@ pub enum Genre {
     Album,
     /// Un artiste : `musicbrainz_id`, `name`.
     Artiste,
+    /// Une piste d'un service de streaming (#7026, « Top tracks » d'une fiche
+    /// artiste) : comme [`Genre::Piste`], plus son `isrc` et sa
+    /// `duration_ms`, que le site sait rapprocher (ISRC exact ; repli par les
+    /// noms à 3 s près, jamais entre deux ISRC différents). Un genre à part
+    /// pour que les listes de la bibliothèque gardent la demande d'avant.
+    PisteDeService,
 }
 
 impl Genre {
     /// Le `type` du contrat.
     pub const fn type_du_site(self) -> &'static str {
         match self {
-            Self::Piste => "recording",
+            Self::Piste | Self::PisteDeService => "recording",
             Self::Album => "release",
             Self::Artiste => "artist",
         }
@@ -98,7 +104,9 @@ impl Genre {
     /// (MBID, artiste, titre) : les champs JSON lus sur l'objet.
     const fn champs(self) -> (&'static str, &'static str, Option<&'static str>) {
         match self {
-            Self::Piste => ("musicbrainz_recording_id", "artist_name", Some("title")),
+            Self::Piste | Self::PisteDeService => {
+                ("musicbrainz_recording_id", "artist_name", Some("title"))
+            }
             Self::Album => ("musicbrainz_release_id", "artist_name", Some("title")),
             Self::Artiste => ("musicbrainz_id", "name", None),
         }
@@ -112,7 +120,14 @@ struct Demande {
     mbid: Option<String>,
     artiste: Option<String>,
     titre: Option<String>,
+    /// [`Genre::PisteDeService`] seulement.
+    isrc: Option<String>,
+    /// [`Genre::PisteDeService`] seulement.
+    duree_ms: Option<u64>,
 }
+
+/// Longueur maximale d'un ISRC accepté par le site.
+const ISRC_MAX: usize = 32;
 
 fn texte(objet: &Map<String, Value>, champ: &str, max: usize) -> Option<String> {
     let s = objet.get(champ)?.as_str()?.trim();
@@ -132,7 +147,20 @@ impl Demande {
         let artiste = texte(objet, c_artiste, LONGUEUR_MAX);
         let titre = c_titre.and_then(|c| texte(objet, c, LONGUEUR_MAX));
         let noms_suffisants = artiste.is_some() && (c_titre.is_none() || titre.is_some());
-        if mbid.is_none() && !noms_suffisants {
+        let (isrc, duree_ms) = if genre == Genre::PisteDeService {
+            (
+                texte(objet, "isrc", usize::MAX)
+                    .map(|i| i.to_uppercase())
+                    .filter(|i| i.len() <= ISRC_MAX),
+                objet
+                    .get("duration_ms")
+                    .and_then(Value::as_u64)
+                    .filter(|d| *d > 0 && *d <= 86_400_000),
+            )
+        } else {
+            (None, None)
+        };
+        if mbid.is_none() && isrc.is_none() && !noms_suffisants {
             return None;
         }
         Some(Self {
@@ -140,17 +168,21 @@ impl Demande {
             mbid,
             artiste,
             titre,
+            isrc,
+            duree_ms,
         })
     }
 
     fn cle(&self, base: &str) -> String {
         let bas = |o: &Option<String>| o.as_deref().unwrap_or("").to_lowercase();
         format!(
-            "{base}\x1f{}\x1f{}\x1f{}\x1f{}",
+            "{base}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}",
             self.genre.type_du_site(),
             bas(&self.mbid),
             bas(&self.artiste),
-            bas(&self.titre)
+            bas(&self.titre),
+            bas(&self.isrc),
+            self.duree_ms.map(|d| d.to_string()).unwrap_or_default()
         )
     }
 
@@ -166,6 +198,12 @@ impl Demande {
         }
         if let Some(t) = &self.titre {
             o.insert("title".into(), json!(t));
+        }
+        if let Some(i) = &self.isrc {
+            o.insert("isrc".into(), json!(i));
+        }
+        if let Some(d) = self.duree_ms {
+            o.insert("duration_ms".into(), json!(d));
         }
         Value::Object(o)
     }

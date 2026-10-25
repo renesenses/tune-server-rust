@@ -29,6 +29,8 @@ pub struct StreamingHttpState {
     backend: Arc<dyn DbBackend>,
     services: Arc<Mutex<ServiceRegistry>>,
     event_bus: Arc<EventBus>,
+    /// Le client HTTP qui parle au site (écoutes de la communauté, #7026).
+    http: reqwest::Client,
 }
 
 impl StreamingHttpState {
@@ -41,7 +43,15 @@ impl StreamingHttpState {
             backend,
             services,
             event_bus,
+            http: tune_core::http::client::shared().clone(),
         }
+    }
+
+    /// Le client HTTP du serveur, au lieu du client partagé par défaut.
+    #[must_use]
+    pub fn avec_http(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
     }
 
     async fn save_tokens(&self) {
@@ -772,14 +782,37 @@ async fn service_artist_albums(
         .await)
 }
 
+/// #7026 — les titres phares, classés par nombre total d'écoutes sur Tune
+/// (`play_count`, agrégé par le site), avec les écoutes de ce serveur
+/// (`last_played_at`) : voir [`tune_core::streaming::titres_phares_ecoutes`].
+/// Le verrou du service est rendu AVANT d'interroger le site et la base.
 async fn service_artist_top_tracks(
     State(state): State<StreamingHttpState>,
     Path((service, artist_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
+    let arc = match get_svc_actif(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let pistes = arc
+        .read()
+        .await
         .get_artist_top_tracks(&artist_id)
         .await
-        .map(dedoublonner_titres_phares))
+        .map(dedoublonner_titres_phares);
+    let pistes = match pistes {
+        Ok(p) => p,
+        Err(e) => return svc_response::<()>(Err(e)),
+    };
+    let mut items: Vec<Value> = pistes.iter().map(|p| json!(p)).collect();
+    tune_core::streaming::titres_phares_ecoutes::enrichir_et_classer(
+        &state.backend,
+        &state.http,
+        &service,
+        &mut items,
+    )
+    .await;
+    Json(Value::Array(items)).into_response()
 }
 
 /// Écart de durée sous lequel deux titres phares de même nom et de même

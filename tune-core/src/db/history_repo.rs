@@ -185,6 +185,42 @@ pub mod sql {
         )
     }
 
+    /// Les écoutes locales qui peuvent concerner des pistes d'un service (#7026) :
+    /// celles de ce service sous l'un des `n_ids` identifiants, ou celles d'un
+    /// des `n_artistes` interprètes (nom en minuscules). Groupées par ce qui
+    /// sert au rapprochement — l'appelant tranche, une seule requête pour la
+    /// liste entière. Placeholders : 1 = service, puis les identifiants, puis
+    /// les interprètes.
+    pub fn ecoutes_de_pistes_de_service<D: SqlDialect>(
+        d: &D,
+        n_ids: usize,
+        n_artistes: usize,
+    ) -> String {
+        let liste = |depuis: usize, n: usize| -> Option<String> {
+            (n > 0).then(|| {
+                (depuis..depuis + n)
+                    .map(|i| d.placeholder(i))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+        };
+        let par_id = liste(2, n_ids).map_or_else(
+            || "1 = 0".to_string(),
+            |ids| format!("(source = {} AND source_id IN ({ids}))", d.placeholder(1)),
+        );
+        let par_artiste = liste(2 + n_ids, n_artistes).map_or_else(
+            || "1 = 0".to_string(),
+            |noms| format!("LOWER(artist_name) IN ({noms})"),
+        );
+        format!(
+            "SELECT source, source_id, title, artist_name, duration_ms, \
+             COUNT(*), MAX(listened_at) \
+             FROM listen_history \
+             WHERE source != 'radio' AND ({par_id} OR {par_artiste}) \
+             GROUP BY source, source_id, title, artist_name, duration_ms"
+        )
+    }
+
     /// Non-radio play count for one track, matched by title + artist — the same
     /// grouping `top_tracks` uses (many history rows carry a null track_id).
     pub fn track_plays<D: SqlDialect>(d: &D) -> String {
@@ -241,6 +277,31 @@ pub mod sql {
              GROUP BY 1 ORDER BY 1"
         )
     }
+}
+
+/// Écart de durée sous lequel une écoute locale nommée pareil est celle d'une
+/// piste de service (#7026) — la tolérance du site pour le même rapprochement.
+pub const TOLERANCE_DUREE_ECOUTE_LOCALE_MS: i64 = 3_000;
+
+/// Une piste de service à rapprocher des écoutes locales (#7026).
+#[derive(Debug, Clone, Copy)]
+pub struct PisteDeServiceARapprocher<'a> {
+    pub source_id: &'a str,
+    pub titre: &'a str,
+    pub artiste: &'a str,
+    pub duree_ms: i64,
+}
+
+/// Titre ou interprète comparé : minuscules, lettres et chiffres seulement,
+/// espaces resserrés (« SUMMER CLOTHES! » = « summer clothes »).
+pub fn nom_rapproche(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -474,6 +535,83 @@ impl HistoryRepo {
             map.insert(id, (compte, derniere));
         }
         Ok(map)
+    }
+
+    /// Écoutes locales de pistes d'un service, tous profils (#7026) : pour
+    /// chaque piste, `(nombre, dernière écoute)`, ou `None` jamais écoutée.
+    ///
+    /// Une écoute est celle d'une piste si elle vient de CE service sous son
+    /// identifiant, ou si son titre et son interprète normalisés sont les
+    /// mêmes et que les durées, quand les deux sont connues, diffèrent d'au
+    /// plus [`TOLERANCE_DUREE_ECOUTE_LOCALE_MS`]. `listen_history` n'a pas
+    /// d'ISRC : le rapprochement par ISRC est celui du site.
+    pub fn ecoutes_de_pistes_de_service(
+        &self,
+        service: &str,
+        pistes: &[PisteDeServiceARapprocher<'_>],
+    ) -> Result<Vec<Option<(i64, String)>>, String> {
+        if pistes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ids: Vec<String> = pistes
+            .iter()
+            .map(|p| p.source_id.trim().to_string())
+            .filter(|i| !i.is_empty())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        // SQLite ne passe en minuscules que l'ASCII, PostgreSQL tout : les
+        // deux formes partent.
+        let mut artistes: Vec<String> = pistes
+            .iter()
+            .flat_map(|p| {
+                let a = p.artiste.trim();
+                [a.to_lowercase(), a.to_ascii_lowercase()]
+            })
+            .filter(|a| !a.is_empty())
+            .collect();
+        artistes.sort();
+        artistes.dedup();
+        let sql = self.dialect_sql(
+            |d| sql::ecoutes_de_pistes_de_service(d, ids.len(), artistes.len()),
+            |d| sql::ecoutes_de_pistes_de_service(d, ids.len(), artistes.len()),
+        );
+        let mut params: Vec<&dyn ToSqlValue> = Vec::with_capacity(1 + ids.len() + artistes.len());
+        params.push(&service);
+        params.extend(ids.iter().map(|i| i as &dyn ToSqlValue));
+        params.extend(artistes.iter().map(|a| a as &dyn ToSqlValue));
+        let lignes = self.db.query_many(&sql, &params)?;
+
+        let mut resultat: Vec<Option<(i64, String)>> = vec![None; pistes.len()];
+        for cols in lignes {
+            let texte = |i: usize| cols.get(i).and_then(|v| v.as_string()).unwrap_or_default();
+            let (source, source_id, titre, artiste) = (texte(0), texte(1), texte(2), texte(3));
+            let duree = cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0);
+            let compte = cols.get(5).and_then(|v| v.as_i64()).unwrap_or(0);
+            let Some(derniere) = cols.get(6).and_then(|v| v.as_string()) else {
+                continue;
+            };
+            let (titre_n, artiste_n) = (nom_rapproche(&titre), nom_rapproche(&artiste));
+            for (piste, case) in pistes.iter().zip(resultat.iter_mut()) {
+                let meme_id = source == service
+                    && !source_id.is_empty()
+                    && source_id == piste.source_id.trim();
+                let memes_noms = !titre_n.is_empty()
+                    && titre_n == nom_rapproche(piste.titre)
+                    && artiste_n == nom_rapproche(piste.artiste)
+                    && (duree <= 0
+                        || piste.duree_ms <= 0
+                        || (duree - piste.duree_ms).abs() <= TOLERANCE_DUREE_ECOUTE_LOCALE_MS);
+                if !(meme_id || memes_noms) {
+                    continue;
+                }
+                *case = Some(match case.take() {
+                    None => (compte, derniere.clone()),
+                    Some((n, d)) => (n + compte, d.max(derniere.clone())),
+                });
+            }
+        }
+        Ok(resultat)
     }
 
     pub fn track_plays(&self, title: &str, artist_name: Option<&str>) -> Result<i64, String> {
