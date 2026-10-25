@@ -92,6 +92,8 @@ pub(crate) struct VerdictAlbum {
 /// - `various_artists`: LA règle, appliquée au dossier entier (sans balise),
 ///   dit « compilation » — deux artistes principaux distincts. Un dossier
 ///   d'un seul artiste (plusieurs disques, des invités) n'est pas touché.
+///   [`TrackImporter::begin_batch`] l'écarte encore quand deux albums du
+///   dossier partagent un numéro de piste (#6460, `parutions_distinctes`).
 /// - `use_folder_title`: additionally ≥2 distinct album tags → the per-track
 ///   album tags are unrelated, so the folder name is the real album title. A
 ///   genuine various-artists album with ONE album tag (e.g. "Woodstock") keeps
@@ -152,6 +154,41 @@ pub(crate) struct PreuvesDuDossier {
     /// en `(None, None, None)` : il fait savoir que le dossier existe sans y
     /// apporter d'artiste.
     par_dossier: HashSet<(Option<String>, Option<String>, Option<String>)>,
+    /// #6460 — `(disque, piste)` → le premier titre d'album (en minuscules)
+    /// vu sous ce numéro dans le dossier. Une entrée par numéro, pas par
+    /// fichier.
+    numeros: HashMap<(u32, u32), String>,
+    /// #6460 — deux titres d'album du dossier partagent un numéro de piste :
+    /// ce sont deux parutions distinctes rangées ensemble, pas une
+    /// compilation faite main (dont les numéros ne se répètent pas).
+    parutions_distinctes: bool,
+}
+
+impl PreuvesDuDossier {
+    /// Note le numéro `(disque, piste)` d'une piste de l'album `album`. Rend
+    /// `true` la seule fois où le dossier se révèle fait de parutions
+    /// distinctes. Une piste sans numéro (absent ou 0) ne prouve rien.
+    fn noter_numero(&mut self, album: &str, disque: Option<u32>, piste: Option<u32>) -> bool {
+        let album = album.trim().to_lowercase();
+        let Some(piste) = piste.filter(|n| *n > 0) else {
+            return false;
+        };
+        if self.parutions_distinctes || album.is_empty() {
+            return false;
+        }
+        let cle = (disque.filter(|d| *d > 0).unwrap_or(1), piste);
+        match self.numeros.get(&cle) {
+            Some(deja) if *deja != album => {
+                self.parutions_distinctes = true;
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.numeros.insert(cle, album);
+                false
+            }
+        }
+    }
 }
 
 /// Ce que ce scan PRÉSENTE et ce qu'il ÉCARTE.
@@ -688,6 +725,9 @@ impl TrackImporter {
                 if preuve.compilation { Some(true) } else { None },
                 preuve.artiste.clone(),
             ));
+            if p.noter_numero(&album, preuve.disque, preuve.piste) {
+                tracing::info!(dossier = %dossier, "dossier_de_parutions_distinctes");
+            }
             p.par_dossier
                 .insert((preuve.album_artist, preuve.artiste, Some(album)));
         }
@@ -804,6 +844,9 @@ impl TrackImporter {
                 continue;
             }
             if let Some(album) = meta.album.as_deref() {
+                if p.noter_numero(album, meta.disc_number, meta.track_number) {
+                    tracing::info!(dossier = %dossier(sf), "dossier_de_parutions_distinctes");
+                }
                 p.par_album.insert((
                     album.to_string(),
                     meta.album_artist.clone(),
@@ -842,6 +885,19 @@ impl TrackImporter {
                 )
             })
         }));
+        // 🔴 #6460 (Bertrand, 25/10/2026) — deux albums d'un même dossier qui
+        // ont des numéros de piste en commun sont deux parutions distinctes
+        // (« MoonDial » et un album de Lyle Mays rangés ensemble) : le verdict
+        // du dossier ne s'applique pas, chacun est jugé sur ses seules pistes
+        // et garde son artiste. Une anthologie faite main, numérotée sans
+        // doublon, reste une compilation sous le nom de son dossier.
+        for (dir, p) in &self.preuves {
+            if p.parutions_distinctes
+                && let Some(verdict) = self.folder_comp.get_mut(dir)
+            {
+                *verdict = (false, false);
+            }
+        }
 
         // 2 bis. La graphie de reference des albums ecrits de plusieurs facons.
         let mut graphies: HashMap<(String, String), Vec<&str>> = HashMap::new();
@@ -1726,21 +1782,38 @@ impl TrackImporter {
                 self.album_cache.insert(key.clone(), Arc::clone(&a));
                 Some(a)
             } else {
-                let result = self.album_repo.get_or_create_for_folder_with_track(
-                    &key.0,
-                    &key.1,
-                    key.2,
-                    key.3,
-                    meta.musicbrainz_release_id.as_deref(),
-                    // Le numéro de piste sert UNIQUEMENT à décider si ce
-                    // dossier est l'éclat d'une compilation déjà indexée
-                    // (#1440) : un numéro déjà pris ⇒ homonyme, pas éclat.
-                    meta.track_number.map(|n| n as i32),
-                    // Le numéro de DISQUE sert UNIQUEMENT à rattacher un dossier
-                    // `CD02` au coffret que `CD01` a ouvert (C4) : un numéro
-                    // déjà pris ⇒ seconde extraction, pas second disque.
-                    meta.disc_number.map(|n| n as i32),
-                );
+                // #6460 — un dossier de parutions distinctes : chacune a sa
+                // ligne, désignée par le dossier ET son titre.
+                let parutions_distinctes = self
+                    .preuves
+                    .get(&album_dir)
+                    .is_some_and(|p| p.parutions_distinctes);
+                let result = if parutions_distinctes {
+                    self.album_repo.get_or_create_for_folder_and_title(
+                        &key.0,
+                        &key.1,
+                        key.2,
+                        key.3,
+                        meta.musicbrainz_release_id.as_deref(),
+                    )
+                } else {
+                    self.album_repo.get_or_create_for_folder_with_track(
+                        &key.0,
+                        &key.1,
+                        key.2,
+                        key.3,
+                        meta.musicbrainz_release_id.as_deref(),
+                        // Le numéro de piste sert UNIQUEMENT à décider si ce
+                        // dossier est l'éclat d'une compilation déjà indexée
+                        // (#1440) : un numéro déjà pris ⇒ homonyme, pas éclat.
+                        meta.track_number.map(|n| n as i32),
+                        // Le numéro de DISQUE sert UNIQUEMENT à rattacher un
+                        // dossier `CD02` au coffret que `CD01` a ouvert (C4) :
+                        // un numéro déjà pris ⇒ seconde extraction, pas second
+                        // disque.
+                        meta.disc_number.map(|n| n as i32),
+                    )
+                };
                 if let Err(ref e) = result {
                     tracing::warn!(
                         album = %key.1,

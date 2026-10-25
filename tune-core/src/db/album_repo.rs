@@ -138,6 +138,16 @@ pub mod sql {
         )
     }
 
+    /// #6460 — l'album d'un dossier désigné aussi par son titre.
+    pub fn get_id_by_folder_and_title<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id FROM albums WHERE folder_path = {} AND LOWER(title) = LOWER({}) \
+             ORDER BY id LIMIT 1",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     /// Albums homonymes déjà rattachés à un AUTRE dossier, avec leur dossier
     /// et les numéros de piste qu'ils occupent : de quoi décider si le dossier
     /// courant est l'éclat d'une même compilation (#1440).
@@ -1851,6 +1861,53 @@ impl AlbumRepo {
                 Ok(candidate)
             }
         }
+    }
+
+    /// #6460 — l'album `title` d'un dossier qui range PLUSIEURS parutions
+    /// distinctes (deux albums dont les numéros de piste se recouvrent, voir
+    /// `scan_import::PreuvesDuDossier`). Le dossier seul n'identifie plus la
+    /// parution : sans le titre, [`Self::get_or_create_for_folder_with_track`]
+    /// rendrait au second album la ligne du premier lu, titre et artiste
+    /// compris. Les deux lignes partagent le même `folder_path`.
+    pub fn get_or_create_for_folder_and_title(
+        &self,
+        folder: &str,
+        title: &str,
+        artist_id: i64,
+        year: Option<i32>,
+        mbid: Option<&str>,
+    ) -> Result<Album, TuneError> {
+        if folder.is_empty() {
+            return self.get_or_create_with_mbid(title, artist_id, year, mbid);
+        }
+        let sql = self.dialect_sql(
+            sql::get_id_by_folder_and_title,
+            sql::get_id_by_folder_and_title,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&folder, &title];
+        let deja = self
+            .db
+            .query_one_strong(&sql, &params)?
+            .and_then(|row| row.first()?.as_i64());
+        if let Some(id) = deja {
+            let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+            let params: [&dyn ToSqlValue; 1] = [&id];
+            if let Some(row) = self.db.query_one_strong(&sql, &params)? {
+                let mut album = row_to_album(&row);
+                self.reclaim_unknown_artist(&mut album, artist_id)?;
+                return Ok(album);
+            }
+        }
+        let create_sql = self.dialect_sql(sql::create_with_mbid, sql::create_with_mbid);
+        let params: [&dyn ToSqlValue; 4] = [&title, &artist_id, &year, &mbid];
+        let id = self.db.execute_returning_id(&create_sql, &params)?;
+        self.set_folder_path(id, folder)?;
+        let mut album = Album::new(title.to_string());
+        album.id = Some(id);
+        album.artist_id = Some(artist_id);
+        album.year = year;
+        album.musicbrainz_release_id = mbid.map(String::from);
+        Ok(album)
     }
 
     /// L'album déjà rangé sous le dossier MIROIR de `folder` — le même chemin

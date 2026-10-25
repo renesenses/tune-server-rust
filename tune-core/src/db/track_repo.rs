@@ -1446,8 +1446,13 @@ pub mod sql {
     /// posé son nom de dossier ici — l'import l'avait déjà remplacé par
     /// l'artiste épinglé du dossier. Le faux second artiste de #3232 ne peut
     /// donc pas revenir par cette porte.
+    ///
+    /// `t.disc_number` et `t.track_number` disent si deux albums d'un même
+    /// dossier partagent un numéro de piste, signe de deux parutions
+    /// distinctes (#6460).
     pub fn preuves_de_compilation() -> &'static str {
-        "SELECT t.file_path, t.album_artist, ar.name, al.title, al.is_compilation \
+        "SELECT t.file_path, t.album_artist, ar.name, al.title, al.is_compilation, \
+                t.disc_number, t.track_number \
          FROM tracks t \
          LEFT JOIN artists ar ON ar.id = t.artist_id \
          LEFT JOIN albums al ON al.id = t.album_id \
@@ -1914,6 +1919,10 @@ pub struct PreuveDeCompilation {
     pub album: Option<String>,
     /// `albums.is_compilation` : le verdict déjà rendu sur cette ligne.
     pub compilation: bool,
+    /// `tracks.disc_number`, tel que le scan l'a écrit.
+    pub disque: Option<u32>,
+    /// `tracks.track_number`, tel que le scan l'a écrit (0 : sans numéro).
+    pub piste: Option<u32>,
 }
 
 /// Une colonne texte d'une piste qu'on peut interroger par
@@ -4326,6 +4335,10 @@ impl TrackRepo {
         &self,
     ) -> Result<HashMap<String, PreuveDeCompilation>, TuneError> {
         let rows = self.db.query_many(sql::preuves_de_compilation(), &[])?;
+        let numero = |v: Option<&SqlValue>| {
+            v.and_then(|v| v.as_i64())
+                .and_then(|n| u32::try_from(n).ok())
+        };
         Ok(rows
             .into_iter()
             .filter_map(|cols| {
@@ -4337,6 +4350,8 @@ impl TrackRepo {
                         artiste: cols.get(2).and_then(|v| v.as_string()),
                         album: cols.get(3).and_then(|v| v.as_string()),
                         compilation: crate::db::album_repo::drapeau_compilation(cols.get(4)),
+                        disque: numero(cols.get(5)),
+                        piste: numero(cols.get(6)),
                     },
                 ))
             })
