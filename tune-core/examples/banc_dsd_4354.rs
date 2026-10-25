@@ -9,6 +9,9 @@
 //! - **A — lecture** : `DsfStreamReader` seul (lecture disque + désentrelacement
 //!   des blocs DSF) ;
 //! - **B — lecture + FIR** : A puis `DsdToPcmStreamer::feed()` / `flush()` ;
+//! - **B2 — lecture + FIR direct** : comme B, mais par
+//!   `DsdToPcmStreamer::new_calcul_direct` (une addition par bit, l'ancien
+//!   calcul) — la référence des tables par octet (#4354, rc8) ;
 //! - **C — chaîne complète** : `decode_to_pcm_streaming_seeked(.., Some(taux),
 //!   Some(2), Some(24), .., 32768, ..)` — l'appel du chemin réseau, WAV
 //!   progressif 24 bits —, consommateur qui draine, fenêtres de niveaux drainées.
@@ -23,6 +26,10 @@
 //! cargo run --release -p tune-core --example banc_dsd_4354 -- <fichier.dsf> [passages]
 //! cargo run --release -p tune-core --example banc_dsd_4354 -- --synth <secondes> <taux_dsd> [passages]
 //! ```
+//!
+//! `BANC_ECART=1` ajoute, avant les passages, l'étage **D** : l'écart
+//! échantillon par échantillon entre B (tables) et B2 (direct) sur tout le
+//! fichier — nombre d'échantillons différents et écart maximal en LSB 24 bits.
 //!
 //! `--synth` écrit un DSF stéréo pseudo-aléatoire (LCG déterministe, même
 //! graine à chaque fois : même empreinte d'une machine à l'autre) dans le
@@ -93,11 +100,15 @@ fn etage_lecture(path: &str) -> (u64, f64) {
     (n, t.elapsed().as_secs_f64())
 }
 
-fn etage_fir(path: &str, taux_sortie: u32) -> (u64, f64, String) {
+fn etage_fir(path: &str, taux_sortie: u32, direct: bool) -> (u64, f64, String) {
     let info = parse_dsf(path).expect("parse_dsf");
     let (taux, canaux) = (info.sample_rate, info.channels as usize);
     let mut r = DsfStreamReader::open(path, info).expect("open");
-    let mut st = DsdToPcmStreamer::new(taux, taux_sortie, canaux, true);
+    let mut st = if direct {
+        DsdToPcmStreamer::new_calcul_direct(taux, taux_sortie, canaux, true)
+    } else {
+        DsdToPcmStreamer::new(taux, taux_sortie, canaux, true)
+    };
     let mut h = Sha256::new();
     let mut octets = 0u64;
     let t = Instant::now();
@@ -153,6 +164,38 @@ fn etage_chaine(rt: &tokio::runtime::Runtime, path: &str, taux_sortie: u32) -> (
     })
 }
 
+/// Écart, échantillon par échantillon, entre le calcul par tables (lecture)
+/// et le calcul direct (référence au bit près) sur tout le fichier.
+fn etage_ecart(path: &str, taux_sortie: u32) {
+    let info = parse_dsf(path).expect("parse_dsf");
+    let (taux, canaux) = (info.sample_rate, info.channels as usize);
+    let mut r = DsfStreamReader::open(path, info).expect("open");
+    let mut a = DsdToPcmStreamer::new(taux, taux_sortie, canaux, true);
+    let mut b = DsdToPcmStreamer::new_calcul_direct(taux, taux_sortie, canaux, true);
+    let lire = |p: &[u8]| -> Vec<i32> {
+        p.chunks_exact(3)
+            .map(|o| (o[0] as i32) | ((o[1] as i32) << 8) | ((o[2] as i8 as i32) << 16))
+            .collect()
+    };
+    let (mut total, mut differents, mut max) = (0u64, 0u64, 0i32);
+    let mut comparer = |pa: Vec<u8>, pb: Vec<u8>| {
+        assert_eq!(pa.len(), pb.len(), "même longueur par bloc");
+        for (x, y) in lire(&pa).iter().zip(lire(&pb).iter()) {
+            let e = (x - y).abs();
+            total += 1;
+            differents += u64::from(e != 0);
+            max = max.max(e);
+        }
+    };
+    while let Some(c) = r.next_chunk().expect("lecture") {
+        comparer(a.feed(&c), b.feed(&c));
+    }
+    comparer(a.flush(), b.flush());
+    println!(
+        "D_ecart_tables_direct  echantillons={total} differents={differents} ({:.6} %) ecart_max_lsb24={max}",
+        differents as f64 * 100.0 / total.max(1) as f64
+    );
+}
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (path, passages, _tmp) = if args.first().map(String::as_str) == Some("--synth") {
@@ -191,6 +234,9 @@ fn main() {
         .build()
         .expect("runtime");
 
+    if std::env::var_os("BANC_ECART").is_some() {
+        etage_ecart(&path, taux_sortie);
+    }
     for i in 1..=passages {
         println!("-- passage {i}/{passages}");
         let (octets, mur) = etage_lecture(&path);
@@ -199,8 +245,10 @@ fn main() {
             "A_lecture",
             audio_s / mur
         );
-        let (n, mur, emp) = etage_fir(&path, taux_sortie);
+        let (n, mur, emp) = etage_fir(&path, taux_sortie, false);
         ligne("B_lecture_fir", audio_s, mur, n, &emp);
+        let (n, mur, emp) = etage_fir(&path, taux_sortie, true);
+        ligne("B2_lecture_fir_direct", audio_s, mur, n, &emp);
         let (n, mur, emp) = etage_chaine(&rt, &path, taux_sortie);
         ligne("C_chaine_reseau_24b", audio_s, mur, n, &emp);
     }
