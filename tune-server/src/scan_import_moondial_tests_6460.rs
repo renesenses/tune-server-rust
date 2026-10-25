@@ -8,12 +8,16 @@
 //! les correctifs de #6459 (10c3fe723, fbaa5387a), n'y interviennent pas.
 //!
 //! - les variantes aux balises propres gardent leur artiste : c'est ce que
-//!   vérifie le témoin actif ;
-//! - trois variantes plausibles, mais pas confirmées chez le testeur, passent
-//!   en compilation sous « Various Artists » et y RESTENT après le recalcul.
-//!   Ce sont les règles du 25/09/2026 appliquées telles qu'elles sont écrites,
-//!   pas un défaut de code ; les changer est un arbitrage. Les témoins
-//!   ignorés décrivent le comportement attendu si l'arbitrage les retient.
+//!   vérifie le premier témoin ;
+//! - trois variantes plausibles, mais pas confirmées chez le testeur, passaient
+//!   en compilation sous « Various Artists » et y RESTAIENT après le recalcul.
+//!   Arbitrage de Bertrand, 25/10/2026 :
+//!   - cas 1 PROTÉGÉ : deux albums d'un même dossier qui ont des numéros de
+//!     piste en commun sont deux parutions distinctes, chacun garde son
+//!     artiste ; une anthologie faite main (numéros sans doublon) reste une
+//!     compilation ;
+//!   - cas 2 et cas 3 : rien ne change, leurs témoins restent ignorés avec
+//!     leur raison.
 use super::*;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -67,7 +71,11 @@ fn moondial(
 
 /// Un fichier d'un autre artiste rangé dans le dossier de « MoonDial ».
 fn intrus(racine: &std::path::Path, album: &str, piste: u32) -> ScannedFile {
-    let chemin = racine.join(DOSSIER).join("intrus.flac");
+    intrus_nomme(racine, "intrus.flac", album, piste)
+}
+
+fn intrus_nomme(racine: &std::path::Path, nom: &str, album: &str, piste: u32) -> ScannedFile {
+    let chemin = racine.join(DOSSIER).join(nom);
     fichier(
         &chemin.to_string_lossy(),
         Some("Lyle Mays"),
@@ -180,13 +188,13 @@ fn moondial_aux_balises_propres_garde_son_artiste_6460() {
     }
 }
 
-/// Variante 1 — un fichier d'un AUTRE album et d'un autre artiste dans le
-/// dossier de « MoonDial ». Aujourd'hui : un seul album nommé d'après le
+/// Variante 1 (cas 1, PROTÉGÉ) — un fichier d'un AUTRE album et d'un autre
+/// artiste dans le dossier de « MoonDial », qui porte un numéro de piste que
+/// « MoonDial » a aussi (la piste 2). Avant : un seul album nommé d'après le
 /// dossier, sous « Various Artists », compilation (verdict du dossier,
-/// `decide_compilation_folders`), que le recalcul garde puisque l'album réunit
-/// bien deux artistes.
+/// `decide_compilation_folders`), que le recalcul gardait. Désormais : deux
+/// parutions distinctes, chacune sous son artiste.
 #[test]
-#[ignore = "#6460 : en attente d'arbitrage sur la règle du dossier"]
 fn moondial_et_un_intrus_d_un_autre_album_6460() {
     for (quality_split, rendu) in les_deux_reglages(|r| {
         let mut f = moondial(r, |_| (Some("Pat Metheny"), "Pat Metheny", None));
@@ -201,11 +209,11 @@ fn moondial_et_un_intrus_d_un_autre_album_6460() {
     }
 }
 
-/// Variante 2 — le même intrus, balisé du MÊME titre d'album « MoonDial ».
-/// Aujourd'hui : « MoonDial » sous « Various Artists », compilation (deux
-/// artistes principaux, deux artistes d'album).
+/// Variante 2 (cas 2, INCHANGÉ) — le même intrus, balisé du MÊME titre
+/// d'album « MoonDial ». « MoonDial » reste sous « Various Artists »,
+/// compilation (deux artistes principaux, deux artistes d'album).
 #[test]
-#[ignore = "#6460 : en attente d'arbitrage sur la règle du dossier"]
+#[ignore = "#6460 cas 2 laissé tel quel (Bertrand, 25/10) : il manque les balises des fichiers de Lulu pour savoir si c'est son cas"]
 fn moondial_et_un_intrus_du_meme_titre_6460() {
     for (quality_split, rendu) in les_deux_reglages(|r| {
         let mut f = moondial(r, |_| (Some("Pat Metheny"), "Pat Metheny", None));
@@ -219,12 +227,12 @@ fn moondial_et_un_intrus_du_meme_titre_6460() {
     }
 }
 
-/// Variante 3 — pas d'artiste d'album, et le nom écrit tantôt « Pat
-/// Metheny », tantôt « Metheny, Pat ». Aujourd'hui : la virgule coupe le
+/// Variante 3 (cas 3, INCHANGÉ) — pas d'artiste d'album, et le nom écrit
+/// tantôt « Pat Metheny », tantôt « Metheny, Pat ». La virgule coupe le
 /// crédit en « Metheny » et « Pat », aucun nom ne court sur toutes les
-/// pistes, et l'album passe sous « Various Artists », compilation.
+/// pistes, et l'album reste sous « Various Artists », compilation.
 #[test]
-#[ignore = "#6460 : en attente d'arbitrage sur les noms « Nom, Prénom »"]
+#[ignore = "#6460 cas 3 laissé tel quel (Bertrand, 25/10) : la virgule « Nom, Prénom » est ambiguë avec celle des duos (« Simon, Garfunkel »)"]
 fn moondial_au_nom_ecrit_de_deux_facons_6460() {
     for (quality_split, rendu) in les_deux_reglages(|r| {
         moondial(r, |n| {
@@ -240,6 +248,102 @@ fn moondial_au_nom_ecrit_de_deux_facons_6460() {
             rendu,
             attendu(&[("MoonDial", "Pat Metheny")]),
             "quality_split={quality_split}"
+        );
+    }
+}
+
+/// Le contre-témoin du cas 1 : une anthologie faite main rangée dans le même
+/// dossier — deux titres d'album, deux artistes, numéros SANS doublon
+/// (« MoonDial » 1 à 4, Lyle Mays 5 et 6). Elle reste une compilation sous le
+/// nom de son dossier, comme les témoins de #3232 le veulent.
+#[test]
+fn une_anthologie_numerotee_sans_doublon_reste_une_compilation_6460() {
+    for (quality_split, rendu) in les_deux_reglages(|r| {
+        let mut f = moondial(r, |_| (Some("Pat Metheny"), "Pat Metheny", None));
+        f.push(intrus_nomme(r, "05.flac", "Lyle Mays", 5));
+        f.push(intrus_nomme(r, "06.flac", "Lyle Mays", 6));
+        f
+    }) {
+        assert_eq!(
+            rendu,
+            vec![(DOSSIER.to_string(), "Various Artists".to_string(), true)],
+            "quality_split={quality_split} : sans numéro en double, le dossier reste \
+             une compilation faite main"
+        );
+    }
+}
+
+/// Le cas 1 tient aussi quand un scan suivant ne relit QU'UN fichier du
+/// dossier : les autres sont écartés par le pré-filtre et témoignent depuis la
+/// base (#3528, `amorcer_depuis_la_base`), numéros de piste compris. Sans ces
+/// numéros, le dossier redevenait une compilation à la première retouche.
+#[test]
+fn moondial_et_un_intrus_tiennent_au_scan_partiel_6460() {
+    for quality_split in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fichiers = moondial(tmp.path(), |_| (Some("Pat Metheny"), "Pat Metheny", None));
+        fichiers.push(intrus(tmp.path(), "Lyle Mays", 2));
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let albums = AlbumRepo::with_backend(backend.clone());
+        let artistes = ArtistRepo::with_backend(backend.clone());
+        let pistes = TrackRepo::with_backend(backend.clone());
+
+        // Passe 1 : le scan complet.
+        let mut imp = TrackImporter::new(
+            backend.clone(),
+            quality_split,
+            tmp.path().join("cache-plein"),
+            PorteeDuScan::TOUT,
+        );
+        imp.begin_batch(&fichiers);
+        let lignes: Vec<Track> = fichiers
+            .iter()
+            .map(|f| imp.import(f).expect("import").0)
+            .collect();
+        assert_eq!(pistes.create_batch(&lignes).unwrap(), fichiers.len());
+
+        // Passe 2 : seul « 01.flac » de MoonDial est relu, le reste est écarté.
+        let modifie = fichiers[0].clone();
+        let a_scanner = vec![std::path::PathBuf::from(&modifie.path)];
+        let ecartes: Vec<std::path::PathBuf> = fichiers[1..]
+            .iter()
+            .map(|f| std::path::PathBuf::from(&f.path))
+            .collect();
+        let mut imp = TrackImporter::new(
+            backend.clone(),
+            quality_split,
+            tmp.path().join("cache-partiel"),
+            PorteeDuScan {
+                a_scanner: &a_scanner,
+                ecartes: &ecartes,
+            },
+        );
+        let lot = vec![modifie.clone()];
+        imp.begin_batch(&lot);
+        let connues = pistes.get_all_file_info_by_path().unwrap();
+        let (mut piste, _) = imp.import(&modifie).expect("import");
+        piste.id = Some(connues.get(&modifie.path).expect("piste connue").id);
+        pistes.update(&piste).expect("mise à jour");
+        albums.recalculer_les_compilations().unwrap();
+
+        let id = connues.get(&modifie.path).unwrap().id;
+        let piste = pistes.get(id).unwrap().unwrap();
+        let album = albums
+            .get(piste.album_id.expect("un album"))
+            .unwrap()
+            .unwrap();
+        let nom = artistes
+            .get(album.artist_id.expect("un artiste d'album"))
+            .unwrap()
+            .unwrap()
+            .name;
+        assert_eq!(
+            (album.title.as_str(), nom.as_str(), album.is_compilation),
+            ("MoonDial", "Pat Metheny", false),
+            "quality_split={quality_split} : la piste relue de MoonDial doit rester \
+             sous Pat Metheny, sans badge"
         );
     }
 }
