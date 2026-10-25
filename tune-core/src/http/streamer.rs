@@ -848,6 +848,19 @@ impl StreamSession {
         epoch
     }
 
+    /// #6130 — le SERVEUR congédie la connexion qui tient le canal : l'époque
+    /// avance sans nouveau propriétaire, la boucle du consommateur la voit
+    /// (même mécanisme sans réveil perdu que [`Self::claim_channel_consumer`])
+    /// et termine son corps HTTP sans tirer un morceau de plus. Le renderer
+    /// voit la fin du flux ; `active_consumers` retombe quand le corps tombe.
+    ///
+    /// Sert à quitter une radio sur un renderer qui ne lâche pas sa connexion
+    /// sur `Stop` (Eversolo DMP-A8 : 12 sorties de radio sur 12 au journal du
+    /// .18 du 22 au 25/10, `delai_depasse=true consommateurs_restants=1`).
+    pub fn congedier_les_consommateurs(&self) -> u64 {
+        self.claim_channel_consumer()
+    }
+
     /// True while `epoch` (from `claim_channel_consumer`) is still the current
     /// channel owner. Becomes false once a newer consumer claims the channel.
     pub fn is_current_channel_consumer(&self, epoch: u64) -> bool {

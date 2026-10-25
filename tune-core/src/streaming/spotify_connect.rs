@@ -314,6 +314,27 @@ pub struct LibrespotDaemon {
     pompe: Arc<PompePcm>,
     /// Le dossier du script `--onevent`, propre à ce processus Tune.
     dossier_script: std::sync::Mutex<Option<tempfile::TempDir>>,
+    /// #6933 — la dernière erreur que librespot a écrite sur stderr
+    /// (`could not initialize spirc: … INVALID_CREDENTIALS`, option refusée…),
+    /// remise à zéro à chaque démarrage. C'est elle qui dit POURQUOI
+    /// l'appareil n'apparaît pas, au lieu d'un « reconnecter » par défaut.
+    derniere_erreur: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// #6933 — une ligne de stderr de librespot est-elle une erreur ? Le format
+/// de journal de librespot est `[<date> ERROR librespot] <message>` ; un refus
+/// d'options sort sans préfixe (`Error parsing command line options: …`).
+pub fn ligne_d_erreur_librespot(ligne: &str) -> Option<String> {
+    let l = ligne.trim();
+    if let Some(i) = l.find(" ERROR ") {
+        let reste = &l[i + " ERROR ".len()..];
+        let message = reste.split_once("] ").map_or(reste, |(_, m)| m);
+        return Some(message.trim().to_string());
+    }
+    if l.starts_with("Error parsing command line options") {
+        return Some(l.to_string());
+    }
+    None
 }
 
 impl LibrespotDaemon {
@@ -326,6 +347,7 @@ impl LibrespotDaemon {
             connecte_par_jeton: AtomicBool::new(false),
             pompe: PompePcm::new(),
             dossier_script: std::sync::Mutex::new(None),
+            derniere_erreur: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -333,7 +355,12 @@ impl LibrespotDaemon {
         self.pompe.clone()
     }
 
-    fn binaire(&self) -> String {
+    /// #6933 — la dernière erreur de librespot depuis son dernier démarrage.
+    pub fn derniere_erreur(&self) -> Option<String> {
+        self.derniere_erreur.lock().ok().and_then(|e| e.clone())
+    }
+
+    pub fn binaire(&self) -> String {
         self.binary_path
             .clone()
             .or_else(|| chemin_du_binaire().map(|p| p.to_string_lossy().into_owned()))
@@ -430,8 +457,12 @@ impl LibrespotDaemon {
             self.pompe.lancer(stdout);
         }
 
+        if let Ok(mut e) = self.derniere_erreur.lock() {
+            *e = None;
+        }
         if let Some(stderr) = proc.stderr.take() {
             let pompe = self.pompe.clone();
+            let derniere_erreur = self.derniere_erreur.clone();
             tokio::spawn(async move {
                 let reader = tokio::io::BufReader::new(stderr);
                 let mut lines = reader.lines();
@@ -447,6 +478,11 @@ impl LibrespotDaemon {
                             pompe.signaler_fin(ev.piste.as_deref());
                         }
                         on_event(ev.evenement, ev.piste);
+                    } else if let Some(erreur) = ligne_d_erreur_librespot(&line) {
+                        warn!(erreur = %erreur, "librespot_erreur");
+                        if let Ok(mut e) = derniere_erreur.lock() {
+                            *e = Some(erreur);
+                        }
                     } else if let Some((event, track_id)) = parse_librespot_event(&line) {
                         on_event(event, track_id);
                     } else {
@@ -571,6 +607,16 @@ impl SpotifyConnectManager {
     /// La pompe du PCM de librespot (une seule par récepteur).
     pub fn pompe(&self) -> Arc<PompePcm> {
         self.daemon.pompe()
+    }
+
+    /// #6933 — la dernière erreur écrite par librespot depuis son démarrage.
+    pub fn derniere_erreur_librespot(&self) -> Option<String> {
+        self.daemon.derniere_erreur()
+    }
+
+    /// #6933 — le binaire librespot que Tune lance.
+    pub fn binaire_librespot(&self) -> String {
+        self.daemon.binaire()
     }
 
     /// S'assure que librespot tourne ET qu'il est connecté au compte, pour
@@ -739,6 +785,29 @@ mod tests {
     #[test]
     fn parse_no_event() {
         assert!(parse_librespot_event("some random log line").is_none());
+    }
+
+    /// #6933 — la ligne exacte du journal du testeur (librespot 0.8.0) est
+    /// reconnue comme une erreur, message seul.
+    #[test]
+    fn erreur_6933_ligne_de_librespot_reconnue() {
+        assert_eq!(
+            ligne_d_erreur_librespot(
+                "[2026-10-20T18:02:11Z ERROR librespot] could not initialize spirc: Invalid state { Login request was denied: INVALID_CREDENTIALS }"
+            )
+            .as_deref(),
+            Some("could not initialize spirc: Invalid state { Login request was denied: INVALID_CREDENTIALS }")
+        );
+        assert!(
+            ligne_d_erreur_librespot(
+                "Error parsing command line options: Unrecognized option: 'x'"
+            )
+            .is_some()
+        );
+        assert!(
+            ligne_d_erreur_librespot("[2026-10-20T18:02:11Z INFO  librespot] Using pipe sink")
+                .is_none()
+        );
     }
 
     #[test]

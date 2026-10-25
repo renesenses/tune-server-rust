@@ -281,11 +281,37 @@ pub fn choose_output_rate(dsd_rate: u32) -> u32 {
 /// **par lots de huit** ([`fir_lot`]) : huit accumulateurs indépendants avancent
 /// ensemble, le processeur les entrelace. Chaque accumulateur garde exactement
 /// sa suite d'opérations — mêmes produits `x·c` (exacts : `x = ±1`), même ordre
-/// k croissant —, donc le PCM est **identique au bit près** à l'ancien calcul,
-/// ce que verrouillent `streamer_identique_au_bit_a_la_reference_*` (contre
-/// [`DsdToPcmConverter::process`]) et l'empreinte figée
-/// `streamer_empreinte_figee_dsd128` (calculée par l'ancien code). Retirer un
-/// seul tap les fait tomber toutes les deux.
+/// k croissant —, donc le PCM est **identique au bit près** à l'ancien calcul.
+///
+/// ## Tables par octet (#4354, rc8)
+///
+/// Le calcul direct fait encore une addition f64 par BIT DSD et par sortie :
+/// 256 par échantillon PCM en DSD128 → 352,8 kHz, 180 millions par seconde
+/// d'audio stéréo. Or un bit vaut ±1 : la contribution de huit taps voisins ne
+/// dépend que de l'octet DSD qu'ils lisent, 256 valeurs possibles. Quand toutes
+/// les fenêtres commencent sur une frontière d'octet (décimation multiple de
+/// 16, soit tous les taux que choisit [`choose_output_rate`] et le repli à
+/// 176,4 kHz), le convertisseur précalcule pour chaque groupe `g` de huit taps
+/// la table `T[g][o] = Σ_{i<8} ±c[8g+i]` (somme dans l'ordre i croissant), et
+/// une sortie devient `Σ_g T[g][octet]` : 32 additions au lieu de 256 en
+/// DSD128 → 352,8 kHz. Une 257ᵉ entrée, nulle, tient lieu d'octet de bourrage
+/// (avant le premier bit et après le dernier) : les bords sont traités par la
+/// même boucle.
+///
+/// Ce regroupement change l'ordre des additions f64, donc l'arrondi : le PCM
+/// n'est plus identique au bit près au calcul direct, il en diffère d'au plus
+/// **1 LSB sur 24 bits** sur de rares échantillons (l'écart de la somme f64 est
+/// de l'ordre de 1e-15, il ne change la troncature 24 bits que lorsqu'il la
+/// franchit). Mesuré par `examples/banc_dsd_4354.rs` (`BANC_ECART=1`) sur
+/// 120 s de DSD128 stéréo pseudo-aléatoire : 0 échantillon différent sur
+/// 84 672 000. Ce que verrouillent `streamer_tables_ecart_borne_a_la_reference_*`
+/// (≤ 1 LSB contre [`DsdToPcmConverter::process`]) et l'empreinte figée
+/// `streamer_empreinte_figee_dsd128_par_tables` (la même que celle du calcul
+/// direct). Les autres décimations gardent le calcul direct, au bit près.
+///
+/// Mesuré sur un cœur (`taskset -c 0`) de Shrek (Xeon E5-2630 v4, machine
+/// chargée), DSD128 → 352,8 kHz : FIR 4,3–5,3× → 15,3–16,3× le temps réel,
+/// chaîne réseau 24 bits complète 4,5–4,7× → 13,0–13,9×.
 pub struct DsdToPcmStreamer {
     /// How many DSD bits map to one PCM sample.
     decimation_ratio: usize,
@@ -303,10 +329,17 @@ pub struct DsdToPcmStreamer {
     /// `hist[ch][i]` est la position absolue `hist_base + i`. Les positions
     /// négatives valent 0.0 — le bourrage que voit le filtre avant le début
     /// du flux. Tronqué en tête après chaque bloc à la fenêtre de la
-    /// prochaine sortie.
+    /// prochaine sortie. Vide quand le convertisseur calcule par tables.
     hist: Vec<Vec<f64>>,
-    /// Position absolue de `hist[ch][0]` (négative tant que le bourrage
-    /// initial est encore là).
+    /// Calcul par tables : `Some` quand les fenêtres sont alignées sur
+    /// l'octet (décimation multiple de 16).
+    tables: Option<TablesOctet>,
+    /// Historique par canal en OCTETS (calcul par tables) : `hist_o[ch][i]`
+    /// couvre les bits `hist_base + 8i .. hist_base + 8i + 8`. Valeur 0..=255 :
+    /// l'octet DSD lu ; [`OCTET_DE_BOURRAGE`] : huit bits nuls.
+    hist_o: Vec<Vec<u16>>,
+    /// Position absolue (en bits) de `hist[ch][0]` ou de `hist_o[ch][0]`
+    /// (négative tant que le bourrage initial est encore là).
     hist_base: isize,
     /// Total DSD samples fed so far (across all calls to `feed`), per channel.
     total_dsd_samples: usize,
@@ -345,6 +378,81 @@ fn fir_une(x: &[f64], c: &[f64]) -> f64 {
     s
 }
 
+/// Entrées par groupe de huit taps : les 256 octets, plus le bourrage.
+const ENTREES_TABLE: usize = 257;
+
+/// Valeur d'historique qui tient lieu de huit bits hors du flux (0.0).
+const OCTET_DE_BOURRAGE: u16 = 256;
+
+/// Tables de contribution par octet d'un filtre (voir « Tables par octet »).
+struct TablesOctet {
+    /// `t[g * ENTREES_TABLE + o]` : contribution du groupe de taps `g`
+    /// (taps `8g .. 8g + 8`) quand il lit l'octet `o` ; 0.0 pour le bourrage.
+    t: Vec<f64>,
+    /// Nombre de groupes : longueur du filtre / 8.
+    groupes: usize,
+}
+
+impl TablesOctet {
+    /// Les tables d'un filtre, `None` si sa longueur n'est pas un multiple de 8.
+    fn construire(coeffs: &[f64], lsb_first: bool) -> Option<Self> {
+        if coeffs.is_empty() || !coeffs.len().is_multiple_of(8) {
+            return None;
+        }
+        let groupes = coeffs.len() / 8;
+        let mut t = vec![0.0f64; groupes * ENTREES_TABLE];
+        for g in 0..groupes {
+            let c = &coeffs[8 * g..8 * g + 8];
+            for o in 0..256usize {
+                let mut s = 0.0f64;
+                for (i, &ci) in c.iter().enumerate() {
+                    // Le i-ème bit du flux dans cet octet.
+                    let bit = if lsb_first {
+                        (o >> i) & 1
+                    } else {
+                        (o >> (7 - i)) & 1
+                    };
+                    s += if bit == 1 { ci } else { -ci };
+                }
+                t[g * ENTREES_TABLE + o] = s;
+            }
+            // t[g * ENTREES_TABLE + 256] reste 0.0 : le bourrage.
+        }
+        Some(TablesOctet { t, groupes })
+    }
+}
+
+/// Huit sorties voisines d'un canal par tables. `x` commence au premier octet
+/// de la fenêtre de la première sortie ; la sortie `j` lit
+/// `x[j·pas .. j·pas + groupes]`, `pas` = décimation / 8. Chaque accumulateur
+/// somme ses groupes dans l'ordre g croissant.
+#[inline]
+fn lut_lot(x: &[u16], pas: usize, tables: &TablesOctet) -> [f64; LOT_FIR] {
+    let g_n = tables.groupes;
+    let fenetres: [&[u16]; LOT_FIR] = std::array::from_fn(|j| &x[j * pas..j * pas + g_n]);
+    let mut acc = [0.0f64; LOT_FIR];
+    for (g, tg) in tables.t.chunks_exact(ENTREES_TABLE).enumerate() {
+        for j in 0..LOT_FIR {
+            acc[j] += tg[fenetres[j][g] as usize];
+        }
+    }
+    acc
+}
+
+/// Une sortie par tables (reliquat d'un lot incomplet), même ordre g croissant.
+#[inline]
+fn lut_une(x: &[u16], tables: &TablesOctet) -> f64 {
+    let mut s = 0.0f64;
+    for (tg, &o) in tables
+        .t
+        .chunks_exact(ENTREES_TABLE)
+        .zip(&x[..tables.groupes])
+    {
+        s += tg[o as usize];
+    }
+    s
+}
+
 /// Échantillon filtré → 24 bits LE, échelle SACD et saturation comprises.
 #[inline]
 fn pousser_24(sortie: &mut Vec<u8>, somme: f64) {
@@ -361,6 +469,34 @@ impl DsdToPcmStreamer {
     /// - `channels`: number of audio channels
     /// - `lsb_first`: true for DSF (LSB first), false for DFF (MSB first)
     pub fn new(dsd_rate: u32, target_rate: u32, channels: usize, lsb_first: bool) -> Self {
+        Self::construire(dsd_rate, target_rate, channels, lsb_first, true)
+    }
+
+    /// Le même convertisseur, forcé au calcul DIRECT (une addition par bit,
+    /// PCM identique au bit près à [`DsdToPcmConverter::process`]) même quand
+    /// les tables par octet s'appliqueraient. Sert de référence aux bancs et
+    /// aux tests (#4354) ; la lecture passe par [`Self::new`].
+    pub fn new_calcul_direct(
+        dsd_rate: u32,
+        target_rate: u32,
+        channels: usize,
+        lsb_first: bool,
+    ) -> Self {
+        Self::construire(dsd_rate, target_rate, channels, lsb_first, false)
+    }
+
+    /// Vrai quand ce convertisseur calcule par tables par octet (#4354).
+    pub fn calcule_par_tables(&self) -> bool {
+        self.tables.is_some()
+    }
+
+    fn construire(
+        dsd_rate: u32,
+        target_rate: u32,
+        channels: usize,
+        lsb_first: bool,
+        tables_permises: bool,
+    ) -> Self {
         let decimation_ratio = (dsd_rate / target_rate) as usize;
         assert!(decimation_ratio > 0, "decimation ratio must be > 0");
 
@@ -377,6 +513,28 @@ impl DsdToPcmStreamer {
         // bourrage devant le premier bit.
         let bourrage = (filter_len / 2).saturating_sub(decimation_ratio / 2);
 
+        // Toutes les fenêtres (n·D + D/2 − L/2) tombent sur une frontière
+        // d'octet si et seulement si D/2 − L/2 et D sont multiples de 8 :
+        // D multiple de 16, L multiple de 16 (toujours vrai ici).
+        let alignees = decimation_ratio.is_multiple_of(16) && filter_len.is_multiple_of(16);
+        let tables = if tables_permises && alignees {
+            TablesOctet::construire(&filter_coeffs, lsb_first)
+        } else {
+            None
+        };
+
+        let (hist, hist_o) = if tables.is_some() {
+            (
+                vec![Vec::new(); channels],
+                vec![vec![OCTET_DE_BOURRAGE; bourrage / 8]; channels],
+            )
+        } else {
+            (
+                vec![vec![0.0f64; bourrage]; channels],
+                vec![Vec::new(); channels],
+            )
+        };
+
         DsdToPcmStreamer {
             decimation_ratio,
             filter_coeffs,
@@ -384,10 +542,21 @@ impl DsdToPcmStreamer {
             output_rate: target_rate,
             output_depth: 24,
             lsb_first,
-            hist: vec![vec![0.0f64; bourrage]; channels],
+            hist,
+            tables,
+            hist_o,
             hist_base: -(bourrage as isize),
             total_dsd_samples: 0,
             output_sample_idx: 0,
+        }
+    }
+
+    /// Longueur de l'historique, en bits (positions couvertes).
+    fn hist_bits(&self) -> usize {
+        if self.tables.is_some() {
+            self.hist_o.first().map_or(0, Vec::len) * 8
+        } else {
+            self.hist.first().map_or(0, Vec::len)
         }
     }
 
@@ -421,7 +590,12 @@ impl DsdToPcmStreamer {
         let demi = s.filter_coeffs.len() / 2;
         // Plus petit n tel que n·D + D/2 − L/2 ≥ position.
         let premiere = (position + demi).saturating_sub(d / 2).div_ceil(d);
+        if !position.is_multiple_of(8) {
+            // Historique par octets impossible hors d'une frontière d'octet.
+            s.tables = None;
+        }
         s.hist = vec![Vec::new(); channels];
+        s.hist_o = vec![Vec::new(); channels];
         s.hist_base = position as isize;
         s.total_dsd_samples = position;
         s.output_sample_idx = premiere;
@@ -459,12 +633,25 @@ impl DsdToPcmStreamer {
             let depart = (self.debut_fenetre(n) - self.hist_base) as usize;
             let lot = (nombre - fait).min(LOT_FIR);
             for (ch, somme) in sommes.iter_mut().enumerate() {
-                let x = &self.hist[ch][depart..];
-                if lot == LOT_FIR {
-                    *somme = fir_lot(x, d, coeffs);
+                if let Some(tables) = &self.tables {
+                    // Fenêtres alignées : `depart` et `d` sont multiples de 8.
+                    let x = &self.hist_o[ch][depart / 8..];
+                    let pas = d / 8;
+                    if lot == LOT_FIR {
+                        *somme = lut_lot(x, pas, tables);
+                    } else {
+                        for (j, s) in somme.iter_mut().take(lot).enumerate() {
+                            *s = lut_une(&x[j * pas..], tables);
+                        }
+                    }
                 } else {
-                    for (j, s) in somme.iter_mut().take(lot).enumerate() {
-                        *s = fir_une(&x[j * d..], coeffs);
+                    let x = &self.hist[ch][depart..];
+                    if lot == LOT_FIR {
+                        *somme = fir_lot(x, d, coeffs);
+                    } else {
+                        for (j, s) in somme.iter_mut().take(lot).enumerate() {
+                            *s = fir_une(&x[j * d..], coeffs);
+                        }
                     }
                 }
             }
@@ -480,9 +667,16 @@ impl DsdToPcmStreamer {
         // Rien avant la fenêtre de la prochaine sortie ne servira plus.
         let garder_depuis = self.debut_fenetre(self.output_sample_idx) - self.hist_base;
         if garder_depuis > 0 {
-            let a_jeter = (garder_depuis as usize).min(self.hist.first().map_or(0, Vec::len));
-            for h in &mut self.hist {
-                h.drain(..a_jeter);
+            let a_jeter = (garder_depuis as usize).min(self.hist_bits());
+            if self.tables.is_some() {
+                // Multiple de 8 : fenêtres et longueur de l'historique le sont.
+                for h in &mut self.hist_o {
+                    h.drain(..a_jeter / 8);
+                }
+            } else {
+                for h in &mut self.hist {
+                    h.drain(..a_jeter);
+                }
             }
             self.hist_base += a_jeter as isize;
         }
@@ -508,20 +702,21 @@ impl DsdToPcmStreamer {
             return Vec::new();
         }
 
-        // 1 bit DSD → ±1.0, par canal, dans l'ordre du flux.
-        for (ch, hist) in self.hist.iter_mut().enumerate() {
-            hist.reserve(total_bytes * 8);
-            for byte_idx in 0..total_bytes {
-                let byte = dsd_chunk[byte_idx * channels + ch];
-                for bit in 0..8u8 {
-                    let bit_val = if self.lsb_first {
-                        (byte >> bit) & 1
-                    } else {
-                        (byte >> (7 - bit)) & 1
-                    };
-                    hist.push(if bit_val == 1 { 1.0 } else { -1.0 });
-                }
+        if self.tables.is_some() {
+            // Calcul par tables : l'octet lui-même, par canal.
+            for (ch, hist) in self.hist_o.iter_mut().enumerate() {
+                hist.reserve(total_bytes);
+                hist.extend(
+                    dsd_chunk
+                        .iter()
+                        .skip(ch)
+                        .step_by(channels)
+                        .take(total_bytes)
+                        .map(|&o| o as u16),
+                );
             }
+        } else {
+            self.pousser_bits(dsd_chunk, total_bytes);
         }
         self.total_dsd_samples += total_bytes * 8;
 
@@ -543,6 +738,25 @@ impl DsdToPcmStreamer {
         output
     }
 
+    /// Calcul direct : 1 bit DSD → ±1.0, par canal, dans l'ordre du flux.
+    fn pousser_bits(&mut self, dsd_chunk: &[u8], total_bytes: usize) {
+        let channels = self.channels;
+        for (ch, hist) in self.hist.iter_mut().enumerate() {
+            hist.reserve(total_bytes * 8);
+            for byte_idx in 0..total_bytes {
+                let byte = dsd_chunk[byte_idx * channels + ch];
+                for bit in 0..8u8 {
+                    let bit_val = if self.lsb_first {
+                        (byte >> bit) & 1
+                    } else {
+                        (byte >> (7 - bit)) & 1
+                    };
+                    hist.push(if bit_val == 1 { 1.0 } else { -1.0 });
+                }
+            }
+        }
+    }
+
     /// Flush any remaining samples at the end of the stream.
     /// Produces PCM for any DSD samples that haven't been output yet
     /// (due to the FIR filter needing future samples that don't exist:
@@ -559,12 +773,21 @@ impl DsdToPcmStreamer {
         }
 
         // Bourrage de fin : les taps au-delà du dernier bit lisent 0.0.
-        let fin_reelle = self.hist_base + self.hist[0].len() as isize;
+        // Par tables, l'octet de bourrage lit 0.0 ; les longueurs sont des
+        // multiples de 8 (fenêtres alignées, flux en octets entiers).
+        let par_tables = self.tables.is_some();
+        let fin_reelle = self.hist_base + self.hist_bits() as isize;
         let fin_voulue = self.debut_fenetre(max_outputs - 1) + self.filter_coeffs.len() as isize;
         if fin_voulue > fin_reelle {
             let longueur = (fin_voulue - self.hist_base) as usize;
-            for h in &mut self.hist {
-                h.resize(longueur, 0.0);
+            if par_tables {
+                for h in &mut self.hist_o {
+                    h.resize(longueur.div_ceil(8), OCTET_DE_BOURRAGE);
+                }
+            } else {
+                for h in &mut self.hist {
+                    h.resize(longueur, 0.0);
+                }
             }
         }
 
@@ -573,8 +796,14 @@ impl DsdToPcmStreamer {
 
         // Retirer le bourrage : l'historique ne garde que des bits réels.
         let longueur_reelle = (fin_reelle - self.hist_base).max(0) as usize;
-        for h in &mut self.hist {
-            h.truncate(longueur_reelle);
+        if par_tables {
+            for h in &mut self.hist_o {
+                h.truncate(longueur_reelle / 8);
+            }
+        } else {
+            for h in &mut self.hist {
+                h.truncate(longueur_reelle);
+            }
         }
         output
     }
@@ -1145,22 +1374,22 @@ mod tests {
             .collect()
     }
 
-    fn verifier_identique_a_la_reference(dsd_rate: u32, pcm_rate: u32, channels: usize, lsb: bool) {
-        // Blocs alignés sur la trame : le convertisseur de référence n'a pas
-        // de notion de bloc, un reliquat de trame n'aurait pas de sens ici.
-        let data = dsd_lcg(6000 * channels, 0x5eed_0000 ^ dsd_rate ^ channels as u32);
-        let reference = DsdToPcmConverter::new(dsd_rate, pcm_rate, channels, lsb).process(&data);
+    /// PCM 24 bits LE → entiers signés.
+    fn lire_24(pcm: &[u8]) -> Vec<i32> {
+        pcm.chunks_exact(3)
+            .map(|b| {
+                let v = b[0] as u32 | ((b[1] as u32) << 8) | ((b[2] as u32) << 16);
+                if v & 0x80_0000 != 0 {
+                    (v | 0xFF00_0000) as i32
+                } else {
+                    v as i32
+                }
+            })
+            .collect()
+    }
 
-        let mut d_un_bloc = DsdToPcmStreamer::new(dsd_rate, pcm_rate, channels, lsb);
-        let mut en_une_fois = d_un_bloc.feed(&data);
-        en_une_fois.extend_from_slice(&d_un_bloc.flush());
-        assert_eq!(
-            en_une_fois, reference,
-            "{dsd_rate}->{pcm_rate} {channels} canal(aux) lsb={lsb} : un seul bloc doit rendre la référence au bit près"
-        );
-
-        // Blocs irréguliers, mais chacun aligné sur la trame de `channels` octets.
-        let mut st = DsdToPcmStreamer::new(dsd_rate, pcm_rate, channels, lsb);
+    /// Nourrit `st` de `data` en blocs irréguliers alignés sur la trame.
+    fn par_blocs_irreguliers(mut st: DsdToPcmStreamer, data: &[u8], channels: usize) -> Vec<u8> {
         let mut sortie = Vec::new();
         let tailles = [1usize, 7, 4096, 3, 250, 2, 9000, 5];
         let (mut pos, mut i) = (0usize, 0usize);
@@ -1171,10 +1400,78 @@ mod tests {
             i += 1;
         }
         sortie.extend_from_slice(&st.flush());
+        sortie
+    }
+
+    /// Le calcul DIRECT rend la référence au bit près, en un bloc comme en
+    /// blocs irréguliers.
+    fn verifier_identique_a_la_reference(dsd_rate: u32, pcm_rate: u32, channels: usize, lsb: bool) {
+        // Blocs alignés sur la trame : le convertisseur de référence n'a pas
+        // de notion de bloc, un reliquat de trame n'aurait pas de sens ici.
+        let data = dsd_lcg(6000 * channels, 0x5eed_0000 ^ dsd_rate ^ channels as u32);
+        let reference = DsdToPcmConverter::new(dsd_rate, pcm_rate, channels, lsb).process(&data);
+
+        let mut d_un_bloc = DsdToPcmStreamer::new_calcul_direct(dsd_rate, pcm_rate, channels, lsb);
+        assert!(!d_un_bloc.calcule_par_tables());
+        let mut en_une_fois = d_un_bloc.feed(&data);
+        en_une_fois.extend_from_slice(&d_un_bloc.flush());
         assert_eq!(
-            sortie, reference,
+            en_une_fois, reference,
+            "{dsd_rate}->{pcm_rate} {channels} canal(aux) lsb={lsb} : un seul bloc doit rendre la référence au bit près"
+        );
+
+        let st = DsdToPcmStreamer::new_calcul_direct(dsd_rate, pcm_rate, channels, lsb);
+        assert_eq!(
+            par_blocs_irreguliers(st, &data, channels),
+            reference,
             "{dsd_rate}->{pcm_rate} {channels} canal(aux) lsb={lsb} : le découpage en blocs ne doit rien changer"
         );
+    }
+
+    /// #4354 — le calcul PAR TABLES (celui de [`DsdToPcmStreamer::new`])
+    /// rend la référence à 1 LSB près sur 24 bits, au même nombre
+    /// d'échantillons, et il est insensible au découpage en blocs (au bit près).
+    /// Rend (échantillons différents, échantillons comparés).
+    fn verifier_tables_ecart_borne(
+        dsd_rate: u32,
+        pcm_rate: u32,
+        channels: usize,
+        lsb: bool,
+    ) -> (usize, usize) {
+        let data = dsd_lcg(6000 * channels, 0x5eed_0000 ^ dsd_rate ^ channels as u32);
+        let reference =
+            lire_24(&DsdToPcmConverter::new(dsd_rate, pcm_rate, channels, lsb).process(&data));
+
+        let mut d_un_bloc = DsdToPcmStreamer::new(dsd_rate, pcm_rate, channels, lsb);
+        assert!(
+            d_un_bloc.calcule_par_tables(),
+            "{dsd_rate}->{pcm_rate} : décimation multiple de 16, le calcul doit passer par les tables d'octets (#4354)"
+        );
+        let mut brut = d_un_bloc.feed(&data);
+        brut.extend_from_slice(&d_un_bloc.flush());
+        let tables = lire_24(&brut);
+        assert_eq!(
+            tables.len(),
+            reference.len(),
+            "{dsd_rate}->{pcm_rate} {channels} canal(aux) : même nombre d'échantillons que la référence"
+        );
+        let mut differents = 0usize;
+        for (i, (a, b)) in tables.iter().zip(&reference).enumerate() {
+            let ecart = (a - b).abs();
+            assert!(
+                ecart <= 1,
+                "{dsd_rate}->{pcm_rate} {channels} canal(aux) lsb={lsb} : échantillon {i} à {ecart} LSB de la référence (tables {a}, référence {b}) — l'écart d'arrondi des tables ne dépasse jamais 1 LSB"
+            );
+            differents += usize::from(ecart != 0);
+        }
+
+        let st = DsdToPcmStreamer::new(dsd_rate, pcm_rate, channels, lsb);
+        assert_eq!(
+            par_blocs_irreguliers(st, &data, channels),
+            brut,
+            "{dsd_rate}->{pcm_rate} {channels} canal(aux) lsb={lsb} : par tables, le découpage en blocs ne doit rien changer"
+        );
+        (differents, reference.len())
     }
 
     /// plafond-analyse — un convertisseur REPRIS à une position quelconque
@@ -1231,6 +1528,18 @@ mod tests {
         verifier_identique_a_la_reference(2_822_400, 176_400, 2, true);
         verifier_identique_a_la_reference(2_822_400, 176_400, 1, false);
         verifier_identique_a_la_reference(2_822_400, 88_200, 2, true);
+        // Décimation 8 : pas de tables, calcul direct même par `new`.
+        verifier_identique_a_la_reference(2_822_400, 352_800, 2, true);
+        let mut st = DsdToPcmStreamer::new(2_822_400, 352_800, 2, true);
+        assert!(!st.calcule_par_tables());
+        let data = dsd_lcg(6000 * 2, 0x5eed_0000 ^ 2_822_400 ^ 2);
+        let mut pcm = st.feed(&data);
+        pcm.extend_from_slice(&st.flush());
+        assert_eq!(
+            pcm,
+            DsdToPcmConverter::new(2_822_400, 352_800, 2, true).process(&data),
+            "décimation 8 : `new` reste au bit près"
+        );
     }
 
     #[test]
@@ -1247,17 +1556,57 @@ mod tests {
         verifier_identique_a_la_reference(11_289_600, 44_100, 2, true);
     }
 
-    /// Empreinte SHA-256 du PCM rendu pour une seconde de DSD128 stéréo
-    /// pseudo-aléatoire, calculée par le convertisseur d'AVANT #4354 (v0.9.157,
-    /// calcul sortie par sortie). Toute modification numérique du convertisseur
-    /// — ordre de sommation, fusion multiplication-addition, précision — la
-    /// fait tomber : c'est le contrat « même PCM au bit près ».
     #[test]
-    fn streamer_empreinte_figee_dsd128() {
+    fn streamer_tables_ecart_borne_a_la_reference_dsd64() {
+        verifier_tables_ecart_borne(2_822_400, 176_400, 2, true);
+        verifier_tables_ecart_borne(2_822_400, 176_400, 1, false);
+        verifier_tables_ecart_borne(2_822_400, 88_200, 2, true);
+    }
+
+    #[test]
+    fn streamer_tables_ecart_borne_a_la_reference_dsd128() {
+        let (differents, total) = verifier_tables_ecart_borne(5_644_800, 352_800, 2, true);
+        // Écart d'arrondi : rare. Mesuré à l'écriture : voir la PR.
+        assert!(
+            differents * 1000 <= total,
+            "DSD128 → 352,8 kHz : {differents} échantillons sur {total} diffèrent de 1 LSB, plus d'un pour mille"
+        );
+        verifier_tables_ecart_borne(5_644_800, 176_400, 2, false);
+        verifier_tables_ecart_borne(5_644_800, 352_800, 6, true);
+    }
+
+    #[test]
+    fn streamer_tables_ecart_borne_a_la_reference_dsd256_et_512() {
+        verifier_tables_ecart_borne(11_289_600, 352_800, 2, true);
+        verifier_tables_ecart_borne(22_579_200, 352_800, 2, false);
+        verifier_tables_ecart_borne(11_289_600, 44_100, 2, true);
+    }
+
+    /// #4354 — la lecture DSD128 → 352,8 kHz (le cas du .42) et son repli à
+    /// 176,4 kHz passent par les tables : c'est ce qui divise par huit le
+    /// nombre d'additions du filtre.
+    #[test]
+    fn lecture_dsd_vers_pcm_passe_par_les_tables() {
+        for (dsd, pcm) in [
+            (5_644_800, 352_800),
+            (5_644_800, 176_400),
+            (2_822_400, 176_400),
+            (11_289_600, 352_800),
+        ] {
+            let st = DsdToPcmStreamer::new(dsd, pcm, 2, true);
+            assert!(
+                st.calcule_par_tables(),
+                "DSD {dsd} Hz → PCM {pcm} Hz : le convertisseur de lecture doit calculer par tables d'octets (#4354), pas une addition par bit"
+            );
+        }
+    }
+
+    /// Empreinte SHA-256 du PCM d'une seconde de DSD128 stéréo
+    /// pseudo-aléatoire convertie en 352,8 kHz, en blocs de 8192 octets (un
+    /// super-bloc DSF stéréo, comme en lecture).
+    fn empreinte_dsd128(mut st: DsdToPcmStreamer) -> String {
         use sha2::{Digest, Sha256};
         let data = dsd_lcg(5_644_800 / 8 * 2, 0x1234_5678);
-        let mut st = DsdToPcmStreamer::new(5_644_800, 352_800, 2, true);
-        // Blocs de 8192 octets : un super-bloc DSF stéréo, comme en lecture.
         let mut pcm = Vec::new();
         for bloc in data.chunks(8192) {
             pcm.extend_from_slice(&st.feed(bloc));
@@ -1268,12 +1617,38 @@ mod tests {
             352_800 * 2 * 3,
             "une seconde de 352,8 kHz stéréo 24 bits"
         );
-        let empreinte: String = Sha256::digest(&pcm)
+        Sha256::digest(&pcm)
             .iter()
             .map(|b| format!("{b:02x}"))
-            .collect();
+            .collect()
+    }
+
+    /// Calcul direct : l'empreinte calculée par le convertisseur d'AVANT #4354
+    /// (v0.9.157, sortie par sortie). Toute modification numérique du calcul
+    /// direct — ordre de sommation, fusion multiplication-addition, précision —
+    /// la fait tomber : c'est le contrat « même PCM au bit près ».
+    #[test]
+    fn streamer_empreinte_figee_dsd128() {
         assert_eq!(
-            empreinte,
+            empreinte_dsd128(DsdToPcmStreamer::new_calcul_direct(
+                5_644_800, 352_800, 2, true
+            )),
+            "33c0695ff1067c2d12c41e455de0e2c28d4ae1954055e6e9364672a4510436a0"
+        );
+    }
+
+    /// Calcul par tables (lecture, #4354 rc8) : sur cette seconde, il rend la
+    /// MÊME empreinte que le calcul direct — l'écart d'arrondi des tables n'a
+    /// franchi aucune troncature 24 bits. Ce n'est pas garanti en général
+    /// (voir « Tables par octet ») ; l'écart reste borné à 1 LSB par
+    /// `streamer_tables_ecart_borne_*`. Toute autre modification numérique
+    /// des tables fait tomber cette empreinte.
+    #[test]
+    fn streamer_empreinte_figee_dsd128_par_tables() {
+        let st = DsdToPcmStreamer::new(5_644_800, 352_800, 2, true);
+        assert!(st.calcule_par_tables());
+        assert_eq!(
+            empreinte_dsd128(st),
             "33c0695ff1067c2d12c41e455de0e2c28d4ae1954055e6e9364672a4510436a0"
         );
     }

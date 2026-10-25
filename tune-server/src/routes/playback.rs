@@ -1677,6 +1677,12 @@ pub fn router() -> Router<AppState> {
             "/{id}/browser-playing",
             post(lecture_navigateur::signaler_lecture_navigateur),
         )
+        // #5975 — l'erreur média du lecteur navigateur (code `MediaError`,
+        // refus de `play()`), journalisée à côté de ce qui a été servi.
+        .route(
+            "/{id}/browser-error",
+            post(erreur_media_navigateur::signaler_erreur_media_navigateur),
+        )
         .route("/{id}/seek", post(seek))
         .route("/{id}/volume", post(set_volume))
         .route("/{id}/shuffle", post(toggle_shuffle))
@@ -1802,6 +1808,9 @@ mod sortie_de_pure_recompose_le_trim_6213;
 #[cfg(test)]
 mod aleatoire_dans_la_file_6526;
 
+/// #5975 — le lecteur d'une zone navigateur dit pourquoi il ne joue pas.
+#[path = "playback/erreur_media_navigateur.rs"]
+mod erreur_media_navigateur;
 #[path = "playback/lecture_navigateur.rs"]
 mod lecture_navigateur;
 /// #5395 — la radio artiste à la demande.

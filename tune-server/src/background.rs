@@ -903,6 +903,8 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                                 &state.backend,
                                 &d.id,
                             ))
+                            // #5575 — reconnaître un volume décoratif.
+                            .with_modele(Some(desc.model_name.clone()))
                             // #5793 — plage de volume et canaux lus dans le SCPD.
                             .with_rendering_control_scpd(
                                 desc.scpd_urls().get("renderingcontrol").map(|p| {

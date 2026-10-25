@@ -528,9 +528,16 @@ impl PlaybackOrchestrator {
             .await;
 
         let server_ip = self.server_ip();
+        // #6990 — l'URL et le type annoncés au renderer sont ceux des octets
+        // RÉELLEMENT servis. Un renderer sans FLAC (ou dont le Sink n'a pas
+        // pu être lu) reçoit du WAV : l'annoncer « audio/flac » sous une URL
+        // `.flac` faisait décoder du RIFF/PCM comme du FLAC à un renderer qui
+        // croit l'étiquette (crépitements), et seulement sur les pistes
+        // streaming servies depuis le préchargement — jamais sur un fichier
+        // local, servi tel quel.
         let stream_url = self
             .streamer
-            .get_stream_url(&session_id, &server_ip, "flac");
+            .get_stream_url(&session_id, &server_ip, out_format);
 
         Ok(ResolvedStream {
             url: stream_url,
@@ -540,7 +547,7 @@ impl PlaybackOrchestrator {
             album: None,
             duration_ms: Some(duration_ms as i64),
             source: prefetched.source,
-            mime_type: "audio/flac".into(),
+            mime_type: out_mime.into(),
             sample_rate: Some(sr),
             bit_depth: Some(out_bd as u32),
             channels: Some(ch as u32),
