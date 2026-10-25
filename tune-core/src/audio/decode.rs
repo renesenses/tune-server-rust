@@ -6828,3 +6828,6 @@ mod fenetre_bornee_sans_copie_2156 {
         );
     }
 }
+#[cfg(test)]
+#[path = "canal_aac_signal_6990_tests.rs"]
+mod canal_aac_signal_6990_tests;

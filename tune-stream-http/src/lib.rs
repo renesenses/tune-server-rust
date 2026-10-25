@@ -743,6 +743,45 @@ pub async fn handle_stream(
         }
     }
 
+    // ── #6990 — la reprise `bytes=N-` d'un flux chunké, à l'octet ──
+    //
+    // TIDAL AAC 320 → WAV vers un Wattson Emerson Digital : crépitements,
+    // quand TIDAL FLAC → WAV (un FICHIER, `Range` honoré) joue juste. Le
+    // canal AAC (`produire_le_canal_aac`) n'a pas de durée, donc pas de
+    // `wav_length`, et la reprise depuis la retenue ci-dessus ne le voyait
+    // pas : un renderer qui ferme après N octets puis revient avec
+    // `bytes=N-` recevait la suite du TUYAU — tout ce que la connexion
+    // précédente avait tiré sans que le renderer le lise était sauté, soit un
+    // saut dans le signal à chaque reprise. La retenue est tenue sur ce flux
+    // comme sur l'autre : une reprise qui y tombe est servie à l'octet. Rien
+    // d'autre ne change : pas de longueur annoncée, toujours un 200 chunké.
+    if wav_length.is_none()
+        && retenue_possible
+        && reprise_exacte.is_none()
+        && let Some(n) = reprise_candidate.filter(|n| *n >= seuil_de_reprise)
+    {
+        let (retenue_debut, retenue_fin) = session.etendue_retenue();
+        if n >= retenue_debut && n < retenue_fin {
+            reprise_exacte = Some(n);
+            info!(
+                stream_id,
+                reprise = n,
+                retenue_debut,
+                retenue_fin,
+                "reprise_rejouee_depuis_la_retenue — flux chunké : la reprise tombe dans ce que \
+                 le tuyau a déjà rendu ; servie à l'octet (#6990)"
+            );
+        } else if n < retenue_fin {
+            warn!(
+                stream_id,
+                reprise = n,
+                retenue_debut,
+                retenue_fin,
+                "reprise_hors_retenue — flux chunké : la reprise précède la retenue, la suite \
+                 du tuyau part sous l'offset demandé (#6990)"
+            );
+        }
+    }
     let finite_range_start = range_demande.filter(|s| longueur.is_none_or(|len| *s < len));
     let use_partial = finite_range_start.is_some() && longueur.is_some();
     // ── La borne de fin d'un `Range: bytes=N-M` ──
@@ -7084,3 +7123,6 @@ mod safari_radio_5975_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod reprise_chunkee_aac_6990;
