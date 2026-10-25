@@ -100,15 +100,36 @@ where
     }
 }
 
+/// Incertitude (ms) d'une durée de FILE donnée à la seconde entière.
+///
+/// Une durée de bibliothèque est mesurée à la milliseconde (237 651) : la
+/// queue que `RelTime` cache est connue. Une durée de service (Qobuz, Tidal…)
+/// arrive en secondes entières (307 000) : le fichier dure entre 307 000 et
+/// 307 999 ms, et la dernière note peut tomber jusqu'à une seconde après la
+/// frontière. Conclure 100 ms après, c'est couper cette queue — et jeter le
+/// flux armé que le renderer s'apprêtait à jouer.
+pub(super) const INCERTITUDE_DUREE_A_LA_SECONDE_MS: u64 = 1_000;
+
 /// L'instant où le sondeur peut conclure : la frontière, plus la queue de
 /// piste que l'arrondi cache, plus la marge.
+///
+/// #4382 (rc8) — journal du .18, Eversolo DMP-A8, 15 au 25/10 : sur 22
+/// frontières saisies, les 8 dont la queue connue valait 486 ms ou plus ont
+/// toutes enchaîné sans blanc ; sur les 14 à durée entière (attente 99 ms),
+/// 10 ont fini en `position_pinned_finished_uri_dlna` + `SetAVTransportURI`,
+/// le flux armé presque entièrement tiré (17 à 44 Mo) jeté 100 ms après que
+/// le renderer eut atteint sa durée. Une durée entière n'est pas une queue
+/// nulle : c'est une queue inconnue, bornée par une seconde.
 pub(super) fn instant_de_conclusion(
     frontiere: Instant,
     track_duration_ms: u64,
     reported_duration_ms: u64,
 ) -> Instant {
-    let queue = Duration::from_millis(track_duration_ms.saturating_sub(reported_duration_ms));
-    frontiere + queue + MARGE_APRES_LA_FRONTIERE
+    let mut queue_ms = track_duration_ms.saturating_sub(reported_duration_ms);
+    if track_duration_ms % 1000 == 0 {
+        queue_ms += INCERTITUDE_DUREE_A_LA_SECONDE_MS;
+    }
+    frontiere + Duration::from_millis(queue_ms) + MARGE_APRES_LA_FRONTIERE
 }
 
 /// Une fin précise posée par le guetteur, pour un flux donné.
@@ -320,6 +341,53 @@ mod tests {
             let aujourd_hui = premiere_lecture + Duration::from_secs(1);
             assert!(aujourd_hui - derniere_note >= Duration::from_millis(349));
         }
+    }
+
+    /// #4382 (rc8) — durée de service à la seconde entière (Qobuz,
+    /// « I Can't Go For That », 307 000 dans la file comme au renderer) : le
+    /// fichier réel dure 307 000 + f ms, f inconnu dans [0, 1000). Pour toute
+    /// queue f, la fin ne doit jamais être conclue avant la dernière note —
+    /// sinon la queue est coupée et le flux armé jeté (10 cas sur 14 au .18).
+    #[tokio::test(start_paused = true)]
+    async fn une_duree_a_la_seconde_ne_coupe_jamais_la_queue_de_piste() {
+        const ENTIERE: u64 = 307_000;
+        for queue_ms in (0..1000).step_by(50) {
+            for phase_ms in (0..1000).step_by(250) {
+                let maintenant = Instant::now();
+                let debut = maintenant - Duration::from_millis(306_000 + phase_ms);
+                let position = |t: Instant| {
+                    let ms = t.saturating_duration_since(debut).as_millis() as u64;
+                    (ms / 1000 * 1000).min(ENTIERE)
+                };
+                assert_eq!(position(maintenant), 306_000);
+                let derniere_note = debut + Duration::from_millis(ENTIERE + queue_ms);
+                let frontiere = guetter_la_frontiere(
+                    || async { Some(position(Instant::now())) },
+                    ENTIERE,
+                    PAS_DU_GUET,
+                    PLAFOND_DU_GUET,
+                )
+                .await
+                .expect("la frontière doit être saisie");
+                let conclusion = instant_de_conclusion(frontiere, ENTIERE, ENTIERE);
+                assert!(
+                    conclusion >= derniere_note,
+                    "durée à la seconde, queue réelle {queue_ms} ms : fin conclue {:?} \
+                     AVANT la dernière note — queue de piste coupée et flux armé jeté (#4382)",
+                    derniere_note - conclusion
+                );
+                assert!(
+                    conclusion - derniere_note <= Duration::from_millis(1_250),
+                    "queue {queue_ms} ms : attente bornée"
+                );
+            }
+        }
+        // Une durée mesurée à la milliseconde garde sa queue exacte (A6, 237 651).
+        let t = Instant::now();
+        assert_eq!(
+            instant_de_conclusion(t, 237_651, 237_000) - t,
+            Duration::from_millis(651) + MARGE_APRES_LA_FRONTIERE
+        );
     }
 
     /// Contre-épreuve : un appareil qui enchaîne seul (DMP-A8, absent de la
