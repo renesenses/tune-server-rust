@@ -346,3 +346,101 @@ async fn titre_puis_titre_reste_inchange() {
         "titre → titre ne doit pas attendre ({duree:?})"
     );
 }
+
+/// Un consommateur HTTP de la radio qui suit le protocole du vrai corps
+/// (`tune-stream-http`, boucle radio) : il réclame le canal, sert le direct,
+/// et ne s'arrête QUE si l'époque du canal change — le renderer, lui, ne
+/// ferme jamais. `active_consumers` retombe quand la boucle sort, comme
+/// `RadioConsumerGuard` à la chute du corps.
+fn connexion_radio_tenue(session: Arc<StreamSession>) -> tokio::task::JoinHandle<()> {
+    session.active_consumers.fetch_add(1, Ordering::SeqCst);
+    tokio::spawn(async move {
+        let mon_epoque = session.claim_channel_consumer();
+        loop {
+            let supplante = session.consumer_supersede.notified();
+            tokio::pin!(supplante);
+            supplante.as_mut().enable();
+            if !session.is_current_channel_consumer(mon_epoque) {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = &mut supplante => continue,
+                bloc = session.recv_chunk() => if bloc.is_none() { break },
+            }
+        }
+        session.active_consumers.fetch_sub(1, Ordering::SeqCst);
+    })
+}
+
+/// #6130, journal du .18 (22–25/10, rc7) : 12 sorties de radio sur 12 vers
+/// le DMP-A8 finissent en `delai_depasse=true consommateurs_restants=1` — le
+/// renderer ne lâche pas la radio sur `Stop`, il ne la ferme qu'environ 1 s
+/// APRÈS le `Play` suivant (25/10 09:35:36.026 Play, 09:35:37.108
+/// `radio_stream_client_disconnect`). C'est l'état des deux bruits blancs
+/// (11/10, 12/10). Le serveur doit fermer lui-même le direct : au
+/// `SetAVTransportURI`, plus aucune connexion radio, et sans attendre 2 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_renderer_qui_garde_la_radio_apres_stop_est_deconnecte_par_le_serveur() {
+    // `None` : le renderer simulé ne ferme JAMAIS de lui-même.
+    let mut b = banc(None).await;
+    let (sid, tx, _pret, session) = b
+        .orch
+        .streamer
+        .create_radio_session(
+            StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate: 48_000,
+                bit_depth: 16,
+                channels: 2,
+                ..Default::default()
+            },
+            64,
+        )
+        .await;
+    let connexion = connexion_radio_tenue(session.clone());
+    // La connexion a réclamé le canal avant le geste de l'utilisateur.
+    for _ in 0..100 {
+        if session.consumer_epoch.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    *b.radio.lock().unwrap() = Some(session);
+    b._emetteur_radio = Some(tx);
+    b.orch
+        .playback
+        .play(
+            b.zone_id,
+            NowPlaying {
+                title: "FIP".into(),
+                source: "radio".into(),
+                stream_id: Some(sid),
+                ..Default::default()
+            },
+        )
+        .await;
+
+    b.orch
+        .play(piste(b.zone_id, PISTE_A))
+        .await
+        .expect("le titre doit partir");
+
+    let j = journal(&b);
+    assert_eq!(noms(&j), vec!["stop", "play_media"]);
+    assert_eq!(
+        j[1].consommateurs_radio, 0,
+        "connexion radio encore ouverte au SetAVTransportURI : le serveur n'a pas \
+         fermé le direct d'un renderer qui ne lâche pas la radio sur Stop (#6130)"
+    );
+    let ecart = j[1].quand.duration_since(j[0].quand);
+    assert!(
+        ecart < Duration::from_millis(1_000),
+        "la fermeture par le serveur est immédiate, pas le délai de 2 s ({ecart:?})"
+    );
+    tokio::time::timeout(Duration::from_secs(2), connexion)
+        .await
+        .expect("le corps radio doit être terminé")
+        .unwrap();
+}
