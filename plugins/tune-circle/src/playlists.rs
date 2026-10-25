@@ -66,6 +66,7 @@ use crate::lecture::Lecture;
 use crate::references::{self, Reference};
 use crate::relais::{Issue, Relais};
 use crate::resolution::{Resolveur, Trouvee, ligne};
+use crate::resolution_groupee;
 use crate::routes::{en_reponse, identifiant_valide, introuvable, refus};
 
 /// Une piste désignée pour l'ajout n'existe pas (ni en base, ni chez le
@@ -627,17 +628,26 @@ async fn resolue(e: &Collaboratif, issue: Issue) -> Result<(Value, Vec<Resolu>),
 }
 
 /// Résout CES morceaux chez l'appelant, dans cet ordre.
+///
+/// #7022 : [`resolution_groupee::PARALLELISME_MAX`] à la fois, et par le
+/// cache du résolveur ; le résultat reste dans l'ordre de `items`.
 async fn resoudre_les_morceaux(e: &Collaboratif, items: &[&Value]) -> Vec<Resolu> {
     let services = e.resolveur.services_utilisables().await;
-    let mut resolus = Vec::new();
-    for item in items {
-        let trouvee = e
-            .resolveur
-            .resoudre(&Reference::lire(item), &services)
-            .await;
-        resolus.push((item["item_id"].clone(), trouvee));
-    }
-    resolus
+    let noms: Vec<String> = services.iter().map(|(n, _)| n.clone()).collect();
+    let services = &services;
+    let references = items.iter().map(|item| Reference::lire(item)).collect();
+    let trouvees = resolution_groupee::resoudre_en_ordre(
+        references,
+        &noms,
+        e.resolveur.cache(),
+        |reference| async move { e.resolveur.resoudre(&reference, services).await },
+    )
+    .await;
+    items
+        .iter()
+        .zip(trouvees)
+        .map(|(item, trouvee)| (item["item_id"].clone(), trouvee))
+        .collect()
 }
 
 /// Un `item_id` du cloud sous une forme comparable : il est opaque (nombre
