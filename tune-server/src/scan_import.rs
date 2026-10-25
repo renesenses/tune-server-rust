@@ -3976,3 +3976,7 @@ mod majorite_tests_5454;
 #[cfg(test)]
 #[path = "scan_import_nom_de_tri_tests_6474.rs"]
 mod nom_de_tri_tests_6474;
+
+#[cfg(test)]
+#[path = "scan_import_moondial_tests_6460.rs"]
+mod moondial_tests_6460;
