@@ -360,6 +360,44 @@ pub const SQL_LOT: &str = "SELECT CAST(h.id AS BIGINT), h.listened_at, \
        AND h.listened_at >= ? \
      ORDER BY CAST(h.id AS BIGINT) ASC LIMIT ?";
 
+/// #6996 — les « titres » qui ne nomment aucun morceau : le libellé qu'un
+/// flux venu d'un Logitech Media Server / Lyrion porte (« Streaming from
+/// LMS »), le titre de remplacement d'un renderer (« Unknown »,
+/// « Untitled »…) ou une URL de flux. Comparés après mise en minuscules,
+/// ponctuation et espaces réduits. Ne vaut que SANS artiste : « Untitled »
+/// de Sigur Rós reste une écoute. Même liste que le site
+/// (`App\Support\Listens\GenericStreamTitle`).
+pub const LIBELLES_DE_FLUX: &[&str] = &[
+    "streaming from lms",
+    "unknown",
+    "unknown title",
+    "unknown track",
+    "untitled",
+    "no title",
+    "sans titre",
+    "titre inconnu",
+    "inconnu",
+    "stream",
+    "audio stream",
+    "live stream",
+];
+
+/// Vrai quand `titre` est un libellé de flux ([`LIBELLES_DE_FLUX`]) ou une
+/// URL (`scheme://…`).
+pub fn libelle_de_flux(titre: &str) -> bool {
+    let t = titre.trim();
+    if t.contains("://") {
+        return true;
+    }
+    let normalise = t
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|m| !m.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    LIBELLES_DE_FLUX.contains(&normalise.as_str())
+}
+
 /// Une écoute prête à partir.
 #[derive(Debug, Clone)]
 struct Ligne {
@@ -391,9 +429,14 @@ fn lire_le_lot(
         let duree = r.get(2).and_then(|v| v.as_i64()).filter(|d| *d > 0);
         let profil = r.get(3).and_then(|v| v.as_i64());
         let titre_brut = r.get(4).and_then(|v| v.as_string()).unwrap_or_default();
-        let Some(titre) = borne(Some(titre_brut.clone())) else {
-            // Une écoute sans titre ne se consolide avec rien : elle avance le
-            // curseur sans partir.
+        let artiste = borne(r.get(5).and_then(|v| v.as_string()));
+        let Some(titre) = borne(Some(titre_brut.clone()))
+            // #6996 — un libellé de flux sans artiste n'est pas un morceau.
+            .filter(|t| artiste.is_some() || !libelle_de_flux(t))
+        else {
+            // Une écoute sans titre (ou dont le « titre » n'est qu'un libellé
+            // de flux) ne se consolide avec rien : elle avance le curseur
+            // sans partir.
             lot.push(Ligne {
                 id,
                 json: Value::Null,
@@ -415,7 +458,7 @@ fn lire_le_lot(
                     "release_mbid": borne(r.get(9).and_then(|v| v.as_string())),
                     "artist_mbid": borne(r.get(10).and_then(|v| v.as_string())),
                     "title": titre,
-                    "artist": borne(r.get(5).and_then(|v| v.as_string())),
+                    "artist": artiste,
                     "album": borne(r.get(6).and_then(|v| v.as_string())),
                     "duration_ms": duree,
                 },

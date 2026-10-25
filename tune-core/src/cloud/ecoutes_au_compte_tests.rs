@@ -789,3 +789,72 @@ fn la_reponse_est_datee_et_la_bascule_suit_6840() {
     assert_eq!(Reponse::depuis("fermee"), Some(Reponse::Fermee));
     assert_eq!(Reponse::depuis("oui"), None);
 }
+
+/// #6996 — « Streaming from LMS » (83 écoutes, 1 auditeur, sans artiste)
+/// classé 2ᵉ « piste la plus écoutée » du site : un libellé de flux sans
+/// artiste n'est pas un morceau. Il avance le curseur sans partir ; le même
+/// titre AVEC un artiste, et un vrai titre sans artiste, partent toujours.
+#[tokio::test]
+async fn un_libelle_de_flux_sans_artiste_ne_part_pas() {
+    let (url, site) = faux_site().await;
+    let b = base();
+    let sans_artiste = |id: i64, titre: &str| {
+        b.execute(
+            "INSERT INTO listen_history (id, title, source, duration_ms, listened_at) \
+             VALUES (?, ?, 'upnp', 0, '2026-10-18T20:00:00Z')",
+            &[
+                &id as &dyn ToSqlValue,
+                &titre.to_string() as &dyn ToSqlValue,
+            ],
+        )
+        .unwrap();
+    };
+    sans_artiste(1, "Streaming from LMS");
+    sans_artiste(2, "  unknown ");
+    sans_artiste(3, "http://192.168.1.20:9000/stream.mp3?player=aa:bb");
+    sans_artiste(4, "Blue in Green");
+    ecoute(
+        &b,
+        5,
+        "Untitled",
+        None,
+        "local",
+        "2026-10-18T20:10:00Z",
+        None,
+    );
+    relier(&b, &url);
+    activer(&b);
+
+    let issue = passe(&b, &http(), maintenant()).await;
+    assert!(matches!(issue, Issue::Envoye { .. }), "{issue:?}");
+    assert_eq!(curseur(&b).as_deref(), Some("5"));
+    let site = site.lock().unwrap();
+    let titres: Vec<&str> = site.corps[0]["listens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["track"]["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titres,
+        ["Blue in Green", "Untitled"],
+        "un libellé de flux sans artiste est parti comme une écoute"
+    );
+
+    for t in [
+        "Streaming from LMS",
+        "Unknown Title",
+        "Sans titre",
+        "rtsp://x/y",
+    ] {
+        assert!(libelle_de_flux(t), "« {t} » est un libellé de flux");
+    }
+    for t in [
+        "Streaming",
+        "Unknown Pleasures",
+        "Untitled #23",
+        "Stream of Consciousness",
+    ] {
+        assert!(!libelle_de_flux(t), "« {t} » est un vrai titre");
+    }
+}
