@@ -1227,6 +1227,67 @@ mod tests {
         handle.abort();
     }
 
+    /// #5575 — le Diretta UPnP Renderer de Tades (fil 2071) acquitte
+    /// `SetVolume` et le relit fidèlement, sans jamais l'appliquer
+    /// (`cometdom/DirettaRendererUPnP`, `UPnPDevice::actionSetVolume` ne fait
+    /// que ranger `m_volume`). Le faux renderer ci-dessous acquitte TOUT,
+    /// comme lui : seul Tune peut dire que la consigne restera sans effet.
+    #[tokio::test]
+    async fn un_volume_decoratif_diretta_est_refuse_au_lieu_d_un_curseur_muet_5575() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+        // L'UDN par défaut du projet, celui du journal de Tades.
+        let output = DlnaOutput::new(
+            "C19".into(),
+            "uuid:diretta-renderer-a7366917f9ddf66e".into(),
+            "127.0.0.1".into(),
+            format!("{base}/AVTransport"),
+            format!("{base}/RenderingControl"),
+            None,
+        );
+        let erreur = output.set_volume(0.03).await.expect_err(
+            "volume décoratif : une consigne à 3 % rendue Ok laisse le curseur bouger \
+             sur un son inchangé (#5575)",
+        );
+        assert!(
+            erreur.contains("C19") && erreur.contains("sans"),
+            "message : {erreur}"
+        );
+        assert!(
+            erreur.contains("sur l'appareil"),
+            "le message dit où régler : {erreur}"
+        );
+        assert_eq!(
+            state.volume_count.load(Ordering::Relaxed),
+            0,
+            "rien n'est envoyé"
+        );
+        // Le plein volume est ce que l'appareil restitue : accepté (volume fixe, #2395).
+        output.set_volume(1.0).await.expect("100 % reste accepté");
+        assert_eq!(state.volume_count.load(Ordering::Relaxed), 1);
+
+        // Même appareil sous un UDN choisi (`--uuid`) : reconnu par son modelName.
+        let par_modele = DlnaOutput::new(
+            "C19".into(),
+            "uuid:choisi-a-la-main".into(),
+            "127.0.0.1".into(),
+            format!("{base}/AVTransport"),
+            format!("{base}/RenderingControl"),
+            None,
+        )
+        .with_modele(Some("Diretta UPnP Renderer".into()));
+        assert!(par_modele.set_volume(0.5).await.is_err());
+
+        // Témoin : un renderer ordinaire, même harnais, même consigne → Ok.
+        let ordinaire = make_dlna(&base);
+        ordinaire
+            .set_volume(0.03)
+            .await
+            .expect("renderer ordinaire : Ok");
+        assert_eq!(state.volume_count.load(Ordering::Relaxed), 2);
+        handle.abort();
+    }
+
     /// #1393 — un `SetVolume` REFUSÉ par le renderer doit remonter en erreur.
     ///
     /// Eric (fil forum, Windows 0.9.61) : « le volume ne fait rien » vers un

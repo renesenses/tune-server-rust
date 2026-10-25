@@ -885,6 +885,8 @@ async fn handle_ssdp_discovered(
                 urls_evenements_dlna(&dev.host, dev.port, &evt_urls),
             )
             .with_upnp_silence(crate::config::resolve_upnp_silence(db, &dev.id))
+            // #5575 — reconnaître un volume décoratif.
+            .with_modele(dev.model.clone())
             .with_rendering_control_scpd(scpd_rendering_control(dev))
             .with_av_transport_scpd(scpd_av_transport(dev));
             let mut reg = outputs.lock().await;

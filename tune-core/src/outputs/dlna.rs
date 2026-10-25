@@ -46,6 +46,10 @@ pub mod titre_radio_2991;
 #[path = "dlna_volume_illisible_5662.rs"]
 pub(crate) mod volume_illisible_5662;
 
+/// #5575 — renderer qui acquitte `SetVolume` sans jamais l'appliquer.
+#[path = "dlna_volume_decoratif_5575.rs"]
+pub(crate) mod volume_decoratif_5575;
+
 /// #6008 (rc7, fil 2401) — une hausse de l'appareil corrigée aussi hors de la
 /// fenêtre d'après pose, sur un appareil qui porte la règle.
 #[path = "dlna_volume_hors_fenetre_6008.rs"]
@@ -578,6 +582,8 @@ pub struct DlnaOutput {
     /// #5662 — un épisode de réponses `GetVolume` illisibles est en cours :
     /// la ligne `dlna_volume_illisible` a déjà été écrite.
     volume_illisible: AtomicBool,
+    /// #5575 — `modelName` du descriptif UPnP, quand l'enregistrement le connaît.
+    modele: Option<String>,
     /// Niveau de DIDL appris pour CET appareil (0 = complet, 1 = minimal,
     /// 2 = vide). La pile Platinum de l'Eversolo ne lit qu'un segment TCP de
     /// requête : le DIDL complet déborde et finit en « 500 sans corps », le
@@ -820,6 +826,7 @@ impl DlnaOutput {
             budget_reveil_ms: AtomicU64::new(BUDGET_REVEIL_STANDBY.as_millis() as u64),
             item_id_seq: AtomicU64::new(1),
             volume_illisible: AtomicBool::new(false),
+            modele: None,
             didl_niveau_appris: NiveauDidlAppris::neuf(),
             muted: AtomicBool::new(false),
             micromega_ip,
@@ -848,6 +855,13 @@ impl DlnaOutput {
             contact: std::sync::Mutex::new(super::dlna_contact::JournalDeContact::default()),
             sink_journalise: std::sync::Mutex::new(None),
         }
+    }
+
+    /// #5575 — le `modelName` du descriptif : il reconnaît un renderer dont le
+    /// volume est décoratif ([`volume_decoratif_5575`]).
+    pub fn with_modele(mut self, modele: Option<String>) -> Self {
+        self.modele = modele.filter(|m| !m.trim().is_empty());
+        self
     }
 
     pub fn with_play_delay(self, delay_ms: u64) -> Self {
@@ -3186,6 +3200,20 @@ impl OutputTarget for DlnaOutput {
                 }
             }
             return Ok(());
+        }
+        // #5575 — un renderer qui acquitte sans appliquer : dire non, plutôt
+        // qu'un curseur qui bouge sur un son qui ne change pas.
+        if volume_decoratif_5575::volume_decoratif(&self.device_id, self.modele.as_deref())
+            && volume_decoratif_5575::refuser_la_consigne(volume)
+        {
+            warn!(
+                device = %self.name,
+                device_id = %self.device_id,
+                modele = self.modele.as_deref().unwrap_or("-"),
+                volume,
+                "dlna_volume_decoratif_refuse"
+            );
+            return Err(volume_decoratif_5575::message_de_refus(&self.name));
         }
         let level = (volume * 100.0).round() as u32;
         // #5793 — la plage et le canal sont ceux que l'appareil annonce dans
