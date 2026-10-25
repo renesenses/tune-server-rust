@@ -570,6 +570,83 @@ pub(crate) mod tests {
         );
     }
 
+    /// #6974 (JeanPitre, fil 2248) — « l'égaliseur en mode Expert reste
+    /// inaccessible malgré une licence Premium valide ». L'égaliseur est
+    /// gratuit : ce qui ouvre ses écritures (résolution Expert, bandes de la
+    /// zone), c'est le greffon installé et actif, jamais le palier. Témoin par
+    /// les routes réelles, Free comme Premium : avant l'installation, le refus
+    /// est `plugin_unavailable` (409), jamais `premium_required` (402) ; après,
+    /// les deux routes de l'écran Expert répondent et la barre latérale le
+    /// montre.
+    #[tokio::test]
+    async fn temoin_6974_l_egaliseur_expert_s_ouvre_par_l_installation_quel_que_soit_le_palier() {
+        for premium in [true, false] {
+            dossier_de_donnees_jetable();
+            let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+            let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+            if premium {
+                state
+                    .license
+                    .update_from_server(tune_core::license::Tier::Premium, None)
+                    .await;
+            }
+            assert_eq!(state.license.is_premium().await, premium);
+            let app = crate::routes::router_with_plugins(state.clone(), routers);
+            let palier = if premium { "Premium" } else { "Free" };
+            let resolution = json!({"expert_bands": 31});
+            let bandes = json!({
+                "enabled": true,
+                "bands": [{"freq": 1000.0, "gain": 3.0, "q": 1.0, "type": "peak"}],
+            });
+
+            // Pas encore installé : la porte fermée est celle du greffon.
+            for (chemin, corps) in [
+                ("/api/v1/eq/expert-settings", &resolution),
+                ("/api/v1/zones/1/eq", &bandes),
+            ] {
+                let (status, reponse) = appel_avec_corps(&app, "POST", chemin, corps.clone()).await;
+                assert_eq!(
+                    (status, reponse["error"].as_str()),
+                    (StatusCode::CONFLICT, Some("plugin_unavailable")),
+                    "{palier}, égaliseur non installé : {chemin} doit dire le greffon \
+                     absent, pas une licence manquante — {reponse}"
+                );
+            }
+
+            let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/equalizer/install").await;
+            assert_eq!(status, StatusCode::OK, "{palier} : installation {reponse}");
+            let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/equalizer/enable").await;
+            assert_eq!(status, StatusCode::OK, "{palier} : activation {reponse}");
+
+            // Installé et actif : l'écran Expert écrit, Free comme Premium.
+            let (status, reponse) = appel_avec_corps(
+                &app,
+                "POST",
+                "/api/v1/eq/expert-settings",
+                resolution.clone(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{palier}, égaliseur installé : la résolution Expert refusée — {reponse}"
+            );
+            let (_, relu) = appel(&app, "GET", "/api/v1/eq/expert-settings").await;
+            assert_eq!(relu["expert_bands"], 31, "{palier} : {relu}");
+            let (status, reponse) =
+                appel_avec_corps(&app, "POST", "/api/v1/zones/1/eq", bandes.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{palier}, égaliseur installé : les bandes Expert refusées — {reponse}"
+            );
+            assert!(
+                visible_dans_la_barre(&fiche_du_catalogue(&app, "equalizer").await),
+                "{palier} : égaliseur installé et actif absent de la barre latérale"
+            );
+        }
+    }
+
     /// #4861, témoin de bout en bout : premier démarrage vu comme Free, puis
     /// l'utilisateur retire deux greffons payants par les routes réelles
     /// (désinstallation native, désinstallation du catalogue) et en désactive
