@@ -26,6 +26,12 @@ use tune_core::db::track_repo::TrackRepo;
 
 const DOSSIER: &str = "Pat Metheny - MoonDial";
 
+/// Chaque album en base : `(titre, artiste d'album, compilation)`.
+type Rendu = Vec<(String, String, bool)>;
+
+/// Une variante de balisage : `n` → `(artiste d'album, artiste, compilation)`.
+type Variante = fn(u32) -> (Option<&'static str>, &'static str, Option<bool>);
+
 fn fichier(
     chemin: &str,
     album_artist: Option<&str>,
@@ -131,7 +137,7 @@ fn scanner_puis_recalculer(
 
 fn les_deux_reglages(
     fichiers: impl Fn(&std::path::Path) -> Vec<ScannedFile>,
-) -> Vec<(bool, Vec<(String, String, bool)>)> {
+) -> Vec<(bool, Rendu)> {
     [true, false]
         .into_iter()
         .map(|quality_split| {
@@ -156,10 +162,7 @@ fn attendu(albums: &[(&str, &str)]) -> Vec<(String, String, bool)> {
 /// n'est pas une compilation, balise `COMPILATION=1` ou invité compris.
 #[test]
 fn moondial_aux_balises_propres_garde_son_artiste_6460() {
-    let variantes: [(
-        &str,
-        fn(u32) -> (Option<&'static str>, &'static str, Option<bool>),
-    ); 4] = [
+    let variantes: [(&str, Variante); 4] = [
         ("artiste d'album et de piste", |_| {
             (Some("Pat Metheny"), "Pat Metheny", None)
         }),
