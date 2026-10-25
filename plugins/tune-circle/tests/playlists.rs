@@ -40,6 +40,8 @@ struct FauxService {
     ecritures: Arc<AtomicUsize>,
     /// Identifiants demandés à `get_track`.
     lus: Arc<Mutex<Vec<String>>>,
+    /// #7022 : temps de réponse simulé de `search` et `get_track`.
+    delai_ms: u64,
 }
 
 fn refuse(ecritures: &AtomicUsize) -> TuneError {
@@ -95,6 +97,7 @@ impl StreamingService for FauxService {
         Err(refuse(&self.ecritures))
     }
     async fn search(&self, _query: &str, _limit: usize) -> Result<SearchResults, TuneError> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.delai_ms)).await;
         Ok(SearchResults {
             tracks: self.pistes.clone(),
             albums: vec![],
@@ -103,6 +106,7 @@ impl StreamingService for FauxService {
         })
     }
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.delai_ms)).await;
         self.lus.lock().unwrap().push(track_id.to_string());
         self.pistes
             .iter()
@@ -192,6 +196,14 @@ struct Banc {
 
 /// `services` : (nom, connecté, pistes) de chaque faux service inscrit.
 async fn banc(services: Vec<(&'static str, bool, Vec<StreamTrack>)>) -> Banc {
+    banc_avec_delai(services, 0).await
+}
+
+/// #7022 : le même banc, chaque appel à un service répondant en `delai_ms`.
+async fn banc_avec_delai(
+    services: Vec<(&'static str, bool, Vec<StreamTrack>)>,
+    delai_ms: u64,
+) -> Banc {
     let faux = demarrer().await;
     let backend = base(&faux.base, Some(JETON));
     let ecritures = Arc::new(AtomicUsize::new(0));
@@ -204,6 +216,7 @@ async fn banc(services: Vec<(&'static str, bool, Vec<StreamTrack>)>) -> Banc {
             pistes,
             ecritures: ecritures.clone(),
             lus: lus.clone(),
+            delai_ms,
         }));
     }
     let lecture = Arc::new(FausseLecture::default());
@@ -239,6 +252,7 @@ async fn rebrancher(b: Banc, nom: &'static str) -> Banc {
         )],
         ecritures: b.ecritures.clone(),
         lus: b.lus.clone(),
+        delai_ms: 0,
     }));
     let app = playlists::router(Arc::new(Collaboratif {
         relais: Arc::new(Relais::new(b.backend.clone())),
@@ -549,6 +563,64 @@ async fn un_utilisateur_qobuz_rejoue_par_l_identifiant_qobuz() {
         .collect();
     assert_eq!(ids, vec![json!(51), json!(52), json!(53)]);
     assert_eq!(b.ecritures.load(Ordering::SeqCst), 0);
+}
+
+/// #7022 : les morceaux sont résolus PLUSIEURS À LA FOIS par la route, et
+/// la réouverture ne repasse pas chez le service. Chaque appel au service
+/// prend 300 ms ; les trois morceaux en coûtent un chacun (identifiant
+/// Qobuz, recherche, recherche) : 900 ms un par un, ~300 ms ensemble.
+#[tokio::test]
+async fn resolve_interroge_le_service_en_parallele_puis_lit_son_cache() {
+    let b = banc_avec_delai(
+        vec![(
+            "qobuz",
+            true,
+            vec![
+                piste("q-so-what", "So What", "Miles Davis", 562_000, None),
+                piste("q-bleu", "Blue in Green", "Miles Davis", 337_000, None),
+            ],
+        )],
+        300,
+    )
+    .await;
+    let debut = std::time::Instant::now();
+    let r = appel(&b.app, "POST", "/playlists/5/resolve", None).await;
+    let premier = debut.elapsed();
+    assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
+    let ids: Vec<Value> = r
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["item_id"].clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![json!(51), json!(52), json!(53)],
+        "ordre de la playlist perdu"
+    );
+    assert!(
+        premier < std::time::Duration::from_millis(700),
+        "résolution séquentielle : 3 morceaux à 300 ms ont pris {premier:?} (attendu < 700 ms)"
+    );
+    let lus = b.lus.lock().unwrap().len();
+    let debut = std::time::Instant::now();
+    let r2 = appel(&b.app, "POST", "/playlists/5/resolve", None).await;
+    let second = debut.elapsed();
+    assert_eq!(
+        r2.json(),
+        r.json(),
+        "la réouverture ne rend pas la même résolution"
+    );
+    assert_eq!(
+        b.lus.lock().unwrap().len(),
+        lus,
+        "pas de cache : la réouverture a rappelé le service"
+    );
+    assert!(
+        second < std::time::Duration::from_millis(250),
+        "pas de cache : la réouverture a pris {second:?}"
+    );
 }
 
 /// Un utilisateur Tidal SEUL, pour un morceau qui ne porte que `qobuz_id` et

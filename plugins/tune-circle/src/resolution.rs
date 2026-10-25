@@ -27,8 +27,9 @@
 //!
 //! # Lecture seule
 //!
-//! Aucune écriture chez un service : ni playlist, ni favori. Et rien n'est
-//! gardé — le résultat part au client et s'oublie.
+//! Aucune écriture chez un service : ni playlist, ni favori. Le résultat
+//! n'est gardé qu'en mémoire, un temps borné, pour que la réouverture d'une
+//! playlist soit immédiate (#7022, [`crate::resolution_groupee`]).
 
 use std::sync::Arc;
 
@@ -45,6 +46,7 @@ use tune_core::streaming::matching::{MATCH_ACCEPT_SCORE, apparier_chez_le_servic
 use tune_core::streaming::traits::{StreamTrack, StreamingService};
 
 use crate::references::{Reference, isrc_normalise};
+use crate::resolution_groupee::CacheDeResolution;
 
 type Service = Arc<RwLock<Box<dyn StreamingService>>>;
 
@@ -83,11 +85,22 @@ pub enum Trouvee {
 pub struct Resolveur {
     backend: Arc<dyn DbBackend>,
     services: Arc<Mutex<ServiceRegistry>>,
+    /// #7022 : les dernières résolutions, un temps.
+    cache: CacheDeResolution,
 }
 
 impl Resolveur {
     pub fn new(backend: Arc<dyn DbBackend>, services: Arc<Mutex<ServiceRegistry>>) -> Self {
-        Self { backend, services }
+        Self {
+            backend,
+            services,
+            cache: CacheDeResolution::default(),
+        }
+    }
+
+    /// Le cache des résolutions de ce résolveur (#7022).
+    pub fn cache(&self) -> &CacheDeResolution {
+        &self.cache
     }
 
     pub fn backend(&self) -> &Arc<dyn DbBackend> {
