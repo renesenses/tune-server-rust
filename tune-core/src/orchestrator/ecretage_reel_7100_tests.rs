@@ -165,11 +165,39 @@ async fn i7100_une_source_a_0_dbfs_a_25_pour_cent_n_allume_pas_l_ecretage() {
     assert!(reseau.iter().all(|(_, _, s)| *s));
 }
 
-/// L'égaliseur d'une zone réseau pousse un grave à −0,45 dBFS de +12 dB : le
-/// relais l'écrête au rail. Cette fois l'alerte est due, alors que la source,
-/// elle, n'est jamais à pleine échelle.
+/// Le gain de correction d'une zone réseau (ReplayGain, préampli : facteur ×2,
+/// soit +6 dB) pousse un grave à −0,45 dBFS au-delà du plein : le relais
+/// l'écrête au rail (`apply_gain_pcm`, clamp dur, T9 #2218). Cette fois
+/// l'alerte est due, alors que la source n'est jamais à pleine échelle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn i7100_un_egaliseur_qui_pousse_au_dela_du_plein_allume_l_ecretage() {
+async fn i7100_un_gain_de_correction_qui_pousse_au_dela_du_plein_allume_l_ecretage() {
+    let source = grave_fort();
+    let registre = Arc::new(EcretagesDeTraitement::new());
+    let dsp = super::StreamingDsp {
+        replaygain: Some(2.0),
+        channels: 2,
+        sample_rate: CADENCE,
+        ..Default::default()
+    };
+    traverser_le_relais(dsp, &source, 16, registre.clone()).await;
+    let publies = publier(987_102, &source, 16, None, Some(registre)).await;
+    assert!(
+        publies.iter().any(|(g, d, _)| *g && *d),
+        "le gain de correction écrête la sortie : over_* doit s'allumer, publié {publies:?}"
+    );
+    assert!(
+        publies.iter().all(|(_, _, s)| !s),
+        "la source n'est jamais à pleine échelle : source_over_* doit rester éteint, publié {publies:?}"
+    );
+}
+
+/// L'égaliseur intégré pousse le même grave de +12 dB. En mode « Sûr » (le
+/// défaut), sa réserve automatique (norme L1 de la cascade) garantit qu'il
+/// n'atteint jamais le rail : aucune alerte, et c'est la vérité. Ce banc
+/// garde que le relevé ne confond pas « le signal a changé » et « il a
+/// écrêté ».
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i7100_l_egaliseur_en_mode_sur_ne_declenche_pas_de_fausse_alerte() {
     let source = grave_fort();
     let registre = Arc::new(EcretagesDeTraitement::new());
     let dsp = super::StreamingDsp {
@@ -179,13 +207,9 @@ async fn i7100_un_egaliseur_qui_pousse_au_dela_du_plein_allume_l_ecretage() {
         ..Default::default()
     };
     traverser_le_relais(dsp, &source, 16, registre.clone()).await;
-    let publies = publier(987_102, &source, 16, None, Some(registre)).await;
+    let publies = publier(987_103, &source, 16, None, Some(registre)).await;
     assert!(
-        publies.iter().any(|(g, d, _)| *g && *d),
-        "l'égaliseur écrête la sortie : over_* doit s'allumer sur une fenêtre au moins, publié {publies:?}"
-    );
-    assert!(
-        publies.iter().all(|(_, _, s)| !s),
-        "la source n'est jamais à pleine échelle : source_over_* doit rester éteint, publié {publies:?}"
+        publies.iter().all(|(g, d, _)| !g && !d),
+        "l'égaliseur en mode sûr n'écrête pas : over_* doit rester éteint, publié {publies:?}"
     );
 }

@@ -350,6 +350,7 @@ mod tests {
             attach_levels: false,
             seek_s: 0.0,
             use_http_range: false,
+            ecretages: None,
         }
     }
 
