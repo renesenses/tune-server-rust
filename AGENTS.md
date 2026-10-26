@@ -108,6 +108,13 @@ Règles non négociables :
 La PR indique l'issue, la RC, l'identité de l'agent, les preuves exécutées et
 ce qui n'est pas traité.
 
+## Construire et tester
+
+Durées de compilation, commandes et pièges constatés par les agents :
+`docs/agents/construire-et-tester.md`. Le lire avant la première compilation.
+Une note fausse se corrige dans la PR qui le constate ; ce qu'on apprend et qui
+servira à la suivante s'y ajoute de même.
+
 ## ⛔ Ce dépôt est PUBLIC — aucune revue de sécurité en issue
 
 `renesenses/tune-server-rust` est **public** et compte des forks. Toute analyse
