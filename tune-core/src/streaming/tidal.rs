@@ -301,6 +301,15 @@ impl TidalService {
             .send()
             .await
             .map_err(|e| format!("dash init download: {e}"))?
+            // #7106 — un refus du CDN (403) n'est pas un segment d'init : sans
+            // ce contrôle, son corps d'erreur ouvrait le fichier fMP4.
+            .error_for_status()
+            .map_err(|e| {
+                format!(
+                    "dash init download: HTTP {}",
+                    e.status().map(|s| s.as_u16()).unwrap_or(0)
+                )
+            })?
             .bytes()
             .await
             .map_err(|e| format!("dash init read: {e}"))?;
@@ -3041,6 +3050,34 @@ fn resolve_tidal_url(url: &str) -> String {
     }
 }
 
+/// #7106 — la valeur d'un attribut du MPD, entités XML résolues.
+///
+/// Les URL signées du manifeste v2 (`trackManifests`, #6334) portent leur
+/// signature en paramètres de requête, écrits `&amp;` dans le XML. Lues telles
+/// quelles, elles partaient au CDN avec `amp;Signature=` : l'init et tous les
+/// segments étaient refusés (« all N DASH segments failed »). Une valeur
+/// mal formée reste lue brute, comme avant.
+fn valeur_d_attribut_mpd(attr: &quick_xml::events::attributes::Attribute<'_>) -> String {
+    let brut = String::from_utf8_lossy(&attr.value);
+    match quick_xml::escape::unescape(&brut) {
+        Ok(v) => v.into_owned(),
+        Err(_) => brut.into_owned(),
+    }
+}
+
+/// #7106 — le texte d'une référence (`&amp;`, `&#38;`) rencontrée dans un
+/// élément du MPD ; une référence inconnue est rendue telle qu'écrite.
+fn reference_xml(r: &quick_xml::events::BytesRef<'_>) -> String {
+    if let Ok(Some(c)) = r.resolve_char_ref() {
+        return c.to_string();
+    }
+    let nom = r.decode().unwrap_or_default();
+    match quick_xml::escape::resolve_predefined_entity(&nom) {
+        Some(v) => v.to_string(),
+        None => format!("&{nom};"),
+    }
+}
+
 /// Parse a DASH MPD manifest (XML) to extract stream URL, codec, and MIME type.
 ///
 /// Tidal Hi-Res FLAC streams use DASH manifests. The MPD XML typically contains
@@ -3065,6 +3102,7 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
     let mut segment_template_init: Option<String> = None;
     let mut segment_template_start_number: u32 = 1;
     let mut in_base_url = false;
+    let mut texte_base_url = String::new();
     let mut in_segment_template = false;
     // SegmentTimeline: accumulate total segment count from <S> elements.
     // Each <S d="..." r="N"/> means 1 + N segments (r = repeat count, 0-based).
@@ -3080,12 +3118,13 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                 match tag {
                     "BaseURL" => {
                         in_base_url = true;
+                        texte_base_url.clear();
                     }
                     "AdaptationSet" => {
                         // Pick up mimeType from AdaptationSet if not already set
                         for attr in e.attributes().flatten() {
                             let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            let val = valeur_d_attribut_mpd(&attr);
                             if key == "mimeType" && mime_type.is_none() {
                                 mime_type = Some(val);
                             } else if key == "codecs" && codec.is_none() {
@@ -3097,7 +3136,7 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                         // Representation attributes override AdaptationSet
                         for attr in e.attributes().flatten() {
                             let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            let val = valeur_d_attribut_mpd(&attr);
                             match key.as_str() {
                                 "codecs" => codec = Some(val),
                                 "mimeType" => mime_type = Some(val),
@@ -3109,7 +3148,7 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                         in_segment_template = true;
                         for attr in e.attributes().flatten() {
                             let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            let val = valeur_d_attribut_mpd(&attr);
                             match key.as_str() {
                                 "media" => {
                                     segment_template_media = Some(val);
@@ -3133,7 +3172,7 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                         let mut repeat: u32 = 0;
                         for attr in e.attributes().flatten() {
                             let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            let val = valeur_d_attribut_mpd(&attr);
                             if key == "r" {
                                 repeat = val.parse().unwrap_or(0);
                             }
@@ -3146,18 +3185,29 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
             }
             Ok(Event::Text(ref e)) => {
                 if in_base_url {
-                    let decoded = e.decode().unwrap_or_default();
-                    let url = decoded.trim().to_string();
-                    if !url.is_empty() {
-                        base_url = Some(url);
-                    }
+                    texte_base_url.push_str(&e.decode().unwrap_or_default());
+                }
+            }
+            // #7106 — quick-xml rend `&amp;` d'un texte comme un évènement à
+            // part : sans lui, une BaseURL signée perdait tout ce qui précède
+            // le dernier `&`.
+            Ok(Event::GeneralRef(ref e)) => {
+                if in_base_url {
+                    texte_base_url.push_str(&reference_xml(e));
                 }
             }
             Ok(Event::End(ref e)) => {
                 let local = e.local_name();
                 let tag = std::str::from_utf8(local.as_ref()).unwrap_or("");
                 match tag {
-                    "BaseURL" => in_base_url = false,
+                    "BaseURL" => {
+                        in_base_url = false;
+                        let url = texte_base_url.trim();
+                        if !url.is_empty() {
+                            base_url = Some(url.to_string());
+                        }
+                        texte_base_url.clear();
+                    }
                     "SegmentTemplate" => in_segment_template = false,
                     _ => {}
                 }
@@ -4867,6 +4917,11 @@ mod manifeste_v2;
 #[cfg(test)]
 #[path = "tidal_manifeste_v2_6334_tests.rs"]
 mod manifeste_v2_6334_tests;
+
+// #7106 — URL signées du MPD v2 : entités XML résolues avant le CDN.
+#[cfg(test)]
+#[path = "tidal_dash_entites_7106_tests.rs"]
+mod dash_entites_7106_tests;
 
 /// #5997 — les favoris Tidal sont relus EN ENTIER, et une lecture incomplète
 /// se dit au miroir au lieu de passer pour la liste entière.
