@@ -43,11 +43,6 @@ fn language_directive(lang: &str) -> &'static str {
         "sv" => "Reply to the user in Swedish unless they clearly write in another language.",
         "hu" => "Reply to the user in Hungarian unless they clearly write in another language.",
         "vi" => "Reply to the user in Vietnamese unless they clearly write in another language.",
-        "nb" => {
-            "Reply to the user in Norwegian (Bokmål) unless they clearly write in another language."
-        }
-        "pl" => "Reply to the user in Polish unless they clearly write in another language.",
-        "el" => "Reply to the user in Greek unless they clearly write in another language.",
         _ => "Reply to the user in French unless they clearly write in another language.",
     }
 }
@@ -1136,7 +1131,7 @@ mod language_directive_tests {
     use super::language_directive;
 
     /// Chaque langue de l'interface nomme SA langue à l'assistant. Le suédois,
-    /// puis le hongrois, le vietnamien, le norvégien, le polonais et le grec, tombaient dans le `_` : l'assistant
+    /// puis le hongrois et le vietnamien, tombaient dans le `_` : l'assistant
     /// répondait en français à un utilisateur réglé en suédois.
     ///
     /// Contre-épreuve : retirer le bras `"vi"` fait rougir ce test sur «vi».
@@ -1155,8 +1150,5 @@ mod language_directive_tests {
         }
         assert!(language_directive("hu").contains("Hungarian"));
         assert!(language_directive("vi").contains("Vietnamese"));
-        assert!(language_directive("nb").contains("Norwegian"));
-        assert!(language_directive("pl").contains("Polish"));
-        assert!(language_directive("el").contains("Greek"));
     }
 }

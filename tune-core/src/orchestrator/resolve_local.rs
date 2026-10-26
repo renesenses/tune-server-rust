@@ -3457,7 +3457,11 @@ impl PlaybackOrchestrator {
                                 "zone.playback_error",
                                 serde_json::json!({
                                     "zone_id": zone_id,
-                                    "error": format!("Impossible de décoder la piste : {e}"),
+                                    // #7077 — code stable traduit par le client ;
+                                    // `error` n'en est que le repli anglais.
+                                    "code": "track_decode_failed",
+                                    "error": "The track could not be decoded.",
+                                    "cause": e.to_string(),
                                 }),
                             );
                         }
@@ -3469,7 +3473,9 @@ impl PlaybackOrchestrator {
                                 "zone.playback_error",
                                 serde_json::json!({
                                     "zone_id": zone_id,
-                                    "error": "Le décodage de la piste a échoué (erreur interne).",
+                                    "code": "track_decode_failed",
+                                    "error": "The track could not be decoded (internal error).",
+                                    "cause": "decoder task panicked",
                                 }),
                             );
                         }

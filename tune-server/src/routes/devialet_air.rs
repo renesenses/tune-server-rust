@@ -53,16 +53,12 @@ async fn regler(State(state): State<AppState>, Json(corps): Json<Corps>) -> impl
     let r = SettingsRepo::with_backend(state.backend.clone());
     if let Some(i) = corps.source_index {
         if !(0..=i64::from(reglages::INDICE_SOURCE_MAX)).contains(&i) {
-            return (
+            return crate::message_api::refus(
                 StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!(
-                        "source_index doit être entre 0 et {}",
-                        reglages::INDICE_SOURCE_MAX
-                    )
-                })),
-            )
-                .into_response();
+                "source_index_out_of_range",
+                "api.devialet.sourceIndexRange",
+                &[("max", reglages::INDICE_SOURCE_MAX.to_string())],
+            );
         }
         if let Err(e) = r.set(reglages::CLE_INDICE_SOURCE, &i.to_string()) {
             return erreur(e);
@@ -79,11 +75,13 @@ async fn regler(State(state): State<AppState>, Json(corps): Json<Corps>) -> impl
 }
 
 fn erreur(e: String) -> axum::response::Response {
-    (
+    crate::message_api::refus_avec_cause(
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": format!("réglage non enregistré : {e}")})),
+        "setting_not_saved",
+        "api.settings.notSaved",
+        &[],
+        e,
     )
-        .into_response()
 }
 
 #[cfg(test)]

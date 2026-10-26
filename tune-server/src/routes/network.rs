@@ -264,11 +264,12 @@ async fn oublier_un_partage(
         .ok()
         .flatten();
     let Some(mount_path) = ligne.and_then(|r| r.first().and_then(|v| v.as_string())) else {
-        return (
+        return crate::message_api::refus(
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "partage_inconnu", "message": "Ce partage n'est plus enregistré." })),
-        )
-            .into_response();
+            "partage_inconnu",
+            "api.network.shareUnknown",
+            &[],
+        );
     };
 
     let racines = racines_dependantes(
@@ -278,17 +279,18 @@ async fn oublier_un_partage(
     if !racines.is_empty() && !q.confirmer {
         return (
             StatusCode::CONFLICT,
-            Json(json!({
-                "error": "racines_dependantes",
-                "message": format!(
-                    "{} dossier(s) de la bibliothèque se trouvent sur ce partage.",
-                    racines.len()
-                ),
-                "racines": racines,
-                // Ce que la purge emporterait si l'utilisateur retire aussi
-                // ces dossiers : il doit le voir avant d'accepter.
-                "pistes": crate::routes::system::pistes_qui_partiraient(&state, &racines),
-            })),
+            Json(crate::message_api::avec_message(
+                json!({
+                    "error": "racines_dependantes",
+                    "code": "racines_dependantes",
+                    "racines": racines,
+                    // Ce que la purge emporterait si l'utilisateur retire aussi
+                    // ces dossiers : il doit le voir avant d'accepter.
+                    "pistes": crate::routes::system::pistes_qui_partiraient(&state, &racines),
+                }),
+                "api.network.shareHasLibraryFolders",
+                &[("count", racines.len().to_string())],
+            )),
         )
             .into_response();
     }
@@ -319,20 +321,17 @@ async fn oublier_un_partage(
                 }
             }
             Ok(Err(e)) => Some(e.to_string()),
-            Err(_) => Some("délai dépassé".to_string()),
+            Err(_) => Some("timed out after 15 s".to_string()),
         };
         if let Some(cause) = echec.filter(|_| smb::est_un_point_de_montage(chemin)) {
             warn!(id, path = %mount_path, error = %cause, "smb_oubli_demontage_echoue");
-            return (
+            return crate::message_api::refus_avec_cause(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": "demontage_impossible",
-                    "message": format!(
-                        "Impossible de démonter {mount_path} : {cause}. Le partage est conservé."
-                    ),
-                })),
-            )
-                .into_response();
+                "demontage_impossible",
+                "api.network.unmountFailed",
+                &[("path", mount_path.clone())],
+                cause,
+            );
         }
         demonte = true;
     }
@@ -1157,16 +1156,19 @@ async fn mount_smb_share(
         // l'etape suivante rendait 500 — un voyant vert juste avant l'etape qui
         // echoue est pire qu'aucun voyant, il envoie chercher la panne du cote
         // du reseau, precisement la seule chose qui ait ete verifiee (#1847).
-        return Json(json!({
-            "ok": reachable,
-            "host": body.host,
-            "share_name": body.share_name,
-            "message": if reachable {
-                "Serveur joignable (port 445) — identifiants et partage non vérifiés"
+        return Json(crate::message_api::avec_message(
+            json!({
+                "ok": reachable,
+                "host": body.host,
+                "share_name": body.share_name,
+            }),
+            if reachable {
+                "api.network.smbReachable"
             } else {
-                "Serveur injoignable sur le port 445"
+                "api.network.smbUnreachable"
             },
-        }))
+            &[],
+        ))
         .into_response();
     }
 

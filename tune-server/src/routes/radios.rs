@@ -3670,11 +3670,15 @@ async fn test_alarm(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
             if zones.sonnees.is_empty() && !zones.sautees.is_empty() {
                 return (
                     StatusCode::CONFLICT,
-                    Json(json!({
-                        "error": "zone_en_lecture",
-                        "message": "La zone joue déjà : le test n'a pas été lancé",
-                        "zones": zones.sautees,
-                    })),
+                    Json(crate::message_api::avec_message(
+                        json!({
+                            "error": "zone_en_lecture",
+                            "code": "zone_en_lecture",
+                            "zones": zones.sautees,
+                        }),
+                        "api.alarm.zoneBusy",
+                        &[],
+                    )),
                 )
                     .into_response();
             }

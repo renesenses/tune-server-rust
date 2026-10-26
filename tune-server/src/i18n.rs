@@ -20,12 +20,12 @@ use axum::http::HeaderMap;
 /// `Accept-Language` parse so an unsupported browser locale falls back to
 /// [`FALLBACK`].
 ///
-/// Quinze langues depuis le norvégien bokmål, le polonais et le grec (rc9) — les mêmes que
+/// Douze langues depuis le hongrois et le vietnamien (rc7) — les mêmes que
 /// l'interface web (`tune-web-client/src/lib/locales/`). Chaque clé de
 /// `i18n_server.json` doit porter chacune d'elles : le test
 /// `chaque_cle_porte_chaque_langue` le garde.
 pub const SUPPORTED: &[&str] = &[
-    "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi", "nb", "pl", "el",
+    "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi",
 ];
 
 /// Langue de repli du serveur : l'anglais, comme le client web. Ni un en-tête
@@ -44,25 +44,12 @@ fn table() -> &'static HashMap<String, HashMap<String, String>> {
 /// `en`, `zh-Hant-TW` → `zh`. C'est la forme sous laquelle les langues sont
 /// comparées partout côté serveur (`SUPPORTED`, blocs de notes de version…).
 pub fn base_tag(tag: &str) -> String {
-    alias_langue(
-        tag.trim()
-            .split('-')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_lowercase(),
-    )
-}
-
-/// Le norvégien s'annonce `no` (ou `nn`, nynorsk, faute de mieux) : l'interface
-/// ne parle que le bokmål, `nb`. Point unique de cet alias côté serveur — le
-/// client web fait de même (`langueParDefaut.ts`). `base` est déjà en
-/// minuscules.
-pub fn alias_langue(base: String) -> String {
-    match base.as_str() {
-        "no" | "nn" => "nb".to_string(),
-        _ => base,
-    }
+    tag.trim()
+        .split('-')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase()
 }
 
 /// Langues d'un en-tête `Accept-Language`, dans l'ordre de préférence :
@@ -172,24 +159,6 @@ mod tests {
         assert_eq!(base_tag(""), "");
     }
 
-    /// Un navigateur norvégien envoie `no`, `nb-NO` ou `nn-NO` : tous donnent
-    /// le bokmål. Passe par `base_tag`, donc par `langues_acceptees`,
-    /// `lang_from_header` et chaque appelant, sans les toucher.
-    ///
-    /// Contre-épreuve : retirer le bras `"no" | "nn"` de `alias_langue` fait
-    /// rougir ce test (les en-têtes `no` et `nn` retombent sur `"en"`).
-    #[test]
-    fn no_et_nn_donnent_nb() {
-        assert_eq!(base_tag("no"), "nb");
-        assert_eq!(base_tag("nn-NO"), "nb");
-        assert_eq!(base_tag("NO"), "nb");
-        assert_eq!(base_tag("nb-NO"), "nb");
-        assert_eq!(lang_from_header(&en_tetes("no,en;q=0.5")), "nb");
-        assert_eq!(lang_from_header(&en_tetes("nn-NO,nn;q=0.9,en;q=0.5")), "nb");
-        assert_eq!(langues_acceptees("no-NO,en;q=0.5"), vec!["nb", "en"]);
-        assert_eq!(base_tag("fr"), "fr");
-    }
-
     #[test]
     fn header_garde_sa_lecture() {
         assert_eq!(lang_from_header(&en_tetes("en-GB,en;q=0.9,fr;q=0.8")), "en");
@@ -286,26 +255,6 @@ mod tests {
         // Une langue inconnue de l'interface retombe sur l'anglais.
         assert_eq!(lang_from_header(&en_tetes("pt-BR")), "en");
         assert_eq!(t("pt", "metafield.composer"), t("en", "metafield.composer"));
-    }
-
-    /// Le norvégien bokmål, le polonais et le grec sont des langues de
-    /// l'interface : un `Accept-Language` qui les demande doit les obtenir.
-    ///
-    /// Contre-épreuve : retirer `"nb"`, `"pl"` et `"el"` de `SUPPORTED` fait
-    /// rougir ce test (les trois en-têtes retombent sur `"en"`).
-    #[test]
-    fn le_norvegien_le_polonais_et_le_grec_sont_servis() {
-        assert_eq!(lang_from_header(&en_tetes("nb-NO,nb;q=0.9,en;q=0.8")), "nb");
-        assert_eq!(lang_from_header(&en_tetes("pl-PL,pl;q=0.9,en;q=0.8")), "pl");
-        assert_eq!(lang_from_header(&en_tetes("el-GR,el;q=0.9,en;q=0.8")), "el");
-        assert_eq!(t("nb", "metafield.composer"), "Komponist");
-        assert_eq!(t("pl", "metafield.composer"), "Kompozytor");
-        assert_eq!(t("el", "metafield.composer"), "Συνθέτης");
-        assert_eq!(
-            t("el", "ai.zonesAvailable"),
-            "Διαθέσιμες ζώνες: {zones}",
-            "« zone » se dit « ζώνη », comme dans l'interface web"
-        );
     }
 
     /// Les jetons `{…}` d'un texte : `{title}`, `{n}`…
@@ -408,9 +357,6 @@ mod tests {
             ("sv", "Åtkomst och tokens"),
             ("hu", "Hozzáférés és tokenek"),
             ("vi", "Truy cập và token"),
-            ("nb", "Tilgang og tokener"),
-            ("pl", "Dostęp i tokeny"),
-            ("el", "Πρόσβαση και διακριτικά"),
         ];
         assert_eq!(onglet.len(), super::SUPPORTED.len());
         for (lang, libelle) in onglet {

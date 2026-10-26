@@ -52,11 +52,13 @@ async fn regler_lecture_experimentale(
         tune_core::streaming::spotify_lecture::CLE_REGLAGE,
         if corps.enabled { "true" } else { "false" },
     ) {
-        return (
+        return crate::message_api::refus_avec_cause(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("réglage non enregistré : {e}")})),
-        )
-            .into_response();
+            "setting_not_saved",
+            "api.settings.notSaved",
+            &[],
+            e,
+        );
     }
     info!(enabled = corps.enabled, "spotify_lecture_experimentale");
     Json(statut_complet(&state).await).into_response()

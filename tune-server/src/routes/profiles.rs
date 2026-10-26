@@ -228,15 +228,12 @@ async fn list_profiles(State(state): State<AppState>) -> Response {
         Ok(items) => Json(json!(items)).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "list_profiles: repo.list() failed");
-            (
+            crate::message_api::refus(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": "profils_illisibles",
-                    "code": "profils_illisibles",
-                    "message": "La liste des profils n'a pas pu être lue dans la base.",
-                })),
+                "profils_illisibles",
+                "api.profiles.listUnreadable",
+                &[],
             )
-                .into_response()
         }
     }
 }

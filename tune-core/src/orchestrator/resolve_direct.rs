@@ -1533,7 +1533,11 @@ impl PlaybackOrchestrator {
                             "zone.playback_error",
                             serde_json::json!({
                                 "zone_id": zone_id,
-                                "error": format!("Impossible de décoder la piste DSD : {e}"),
+                                // #7077 — code stable traduit par le client ; `error`
+                                // n'en est que le repli anglais, `cause` le détail.
+                                "code": "track_decode_failed",
+                                "error": "The track could not be decoded.",
+                                "cause": format!("DSD: {e}"),
                             }),
                         );
                     }

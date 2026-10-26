@@ -5165,11 +5165,12 @@ async fn queue_add(
                 tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
             let ids = resoudre_pistes_d_album(&state, &track_repo, album_id, zone_id);
             if ids.is_empty() {
-                return (
+                return crate::message_api::refus(
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!("album {album_id} : aucune piste à enfiler")})),
-                )
-                    .into_response();
+                    "album_no_tracks",
+                    "api.playback.albumNoTracks",
+                    &[("album_id", album_id.to_string())],
+                );
             }
             info!(zone_id, album_id, pistes = ids.len(), "queue_add_album");
             ids
@@ -5769,11 +5770,12 @@ async fn save_queue_as_playlist(
 
     if total == 0 {
         warn!(zone_id, "save_queue_as_playlist_refused_empty");
-        return (
+        return crate::message_api::refus(
             StatusCode::BAD_REQUEST,
-            "La file d'attente est vide : il n'y a rien à enregistrer.",
-        )
-            .into_response();
+            "queue_empty",
+            "api.playback.queueEmptyNothingToSave",
+            &[],
+        );
     }
 
     if locales == 0 {
@@ -5789,16 +5791,12 @@ async fn save_queue_as_playlist(
             zone_id,
             distantes, "save_queue_as_playlist_refused_streaming_only"
         );
-        return (
+        return crate::message_api::refus(
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "Cette file ne contient que des pistes de service ({distantes}), \
-                 qui ne peuvent pas être enregistrées dans une playlist locale. \
-                 Enregistrez-la depuis le service, ou ajoutez d'abord ces titres \
-                 à votre bibliothèque."
-            ),
-        )
-            .into_response();
+            "queue_only_service_tracks",
+            "api.playback.queueOnlyServiceTracks",
+            &[("count", distantes.to_string())],
+        );
     }
 
     let track_ids: Vec<i64> = items.iter().map(|i| i.track_id).collect();
@@ -5812,11 +5810,13 @@ async fn save_queue_as_playlist(
                 // `.ok()` avalait cette erreur : la playlist était créée, vide,
                 // et la réponse annonçait `track_count` pistes.
                 error!(zone_id, playlist_id = id, error = %e, "save_queue_as_playlist_add_tracks_failed");
-                return (
+                return crate::message_api::refus_avec_cause(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Playlist créée mais vide : {e}"),
-                )
-                    .into_response();
+                    "playlist_created_empty",
+                    "api.playback.playlistCreatedEmpty",
+                    &[],
+                    e,
+                );
             }
             info!(
                 zone_id,
@@ -6984,14 +6984,12 @@ async fn save_queue_as_pin(
     // une. Plutôt que d'écrire dans `settings` un pin que `GET` n'affichera
     // jamais pour cette zone, on le dit (#2722, reste à porter).
     if zone_pins_service(&state, zone_id).await.is_some() {
-        return (
+        return crate::message_api::refus(
             StatusCode::NOT_IMPLEMENTED,
-            Json(json!({
-                "error": "openhome_pins_from_queue_non_supporte",
-                "message": "Cette zone porte le service OpenHome Pins : un emplacement de l'appareil demande une adresse qu'il sache ouvrir, ce que la file Tune ne fournit pas encore.",
-            })),
-        )
-            .into_response();
+            "openhome_pins_from_queue_non_supporte",
+            "api.playback.openhomePinsFromQueue",
+            &[],
+        );
     }
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();

@@ -83,8 +83,6 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_audio_embedding(state);
     spawn_radio_logo_refresh(state);
     spawn_rattrapage_vignettes_podcasts(state);
-    // #7064 — les labels déjà en base qui sont des lignes de copyright.
-    spawn_normalisation_des_labels(state);
     spawn_cloud_library_sync(state);
     // Sauvegarde cloud automatique des personnalisations (#5654). Un test de
     // câblage garde la ligne.
@@ -2827,20 +2825,6 @@ const RATTRAPAGE_VIGNETTES_PODCASTS_DELAI_SECS: u64 = 45;
 /// #5214 — au démarrage, met en cache la vignette des abonnements qui n'en ont
 /// pas encore (ceux d'avant le correctif, ou dont le téléchargement a échoué).
 /// Aucun abonnement : aucune requête.
-/// #7064 — une fois au démarrage : les labels déjà en base qui sont des
-/// lignes de copyright (« 2003 EMI Records Ltd. ») perdent l'année et le ℗/©
-/// de tête. La lecture des balises s'en charge pour les fichiers relus ; cette
-/// passe rattrape les autres. Idempotente, et rien d'autre ne bouge.
-fn spawn_normalisation_des_labels(state: &AppState) {
-    let db = state.backend.clone();
-    tokio::task::spawn_blocking(move || {
-        match tune_core::library::noms_de_labels::normaliser_les_labels_en_base(&db) {
-            Ok(lignes) => tracing::info!(lignes, "labels_normalises_au_demarrage"),
-            Err(e) => tracing::warn!(error = %e, "labels_normalises_au_demarrage_echec"),
-        }
-    });
-}
-
 fn spawn_rattrapage_vignettes_podcasts(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -3810,29 +3794,6 @@ mod tests_licence_proprietaire_battement {
                  serveur serait refixe toutes les heures sur le dernier compte lie"
             );
         }
-    }
-
-    /// #7064 — sans cet appel, la normalisation des labels déjà en base serait
-    /// du code mort : « 2003 EMI Records Ltd. » resterait dans l'onglet Labels
-    /// tant qu'aucun scan ne relit le fichier.
-    #[test]
-    fn la_normalisation_des_labels_est_lancee_7064() {
-        let source = include_str!("background.rs");
-        let debut = source
-            .find("pub async fn spawn_background_tasks")
-            .expect("spawn_background_tasks a disparu");
-        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
-        assert!(
-            source[debut..fin].contains("spawn_normalisation_des_labels(state);"),
-            "la normalisation des labels n'est plus lancee au demarrage"
-        );
-        let passe = source
-            .find("fn spawn_normalisation_des_labels")
-            .expect("spawn_normalisation_des_labels a disparu");
-        assert!(
-            source[passe..].contains("noms_de_labels::normaliser_les_labels_en_base(&db)"),
-            "la passe de démarrage n'appelle plus la normalisation en base"
-        );
     }
 
     /// #5654 — sans cet appel, la sauvegarde automatique serait du code mort :

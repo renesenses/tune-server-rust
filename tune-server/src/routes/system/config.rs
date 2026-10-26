@@ -3173,21 +3173,19 @@ pub(crate) fn retirer_un_dossier(
             "music_dir_removed_purge_refusee — la confirmation ne couvre pas l'ampleur \
              constatée. Le dossier est retiré des réglages ; aucune piste n'a été supprimée."
         );
-        return Ok(json!({
-            "dirs": dirs,
-            "orphan_tracks": plan.tracks,
-            "purged": 0,
-            "purge_refused": true,
-            "purge_refused_reason": "confirmation_insuffisante",
-            "confirm_purge_required": plan.tracks,
-            "impact": impact_json(&plan),
-            "message": format!(
-                "Le dossier a bien été retiré des réglages. En revanche la confirmation \
-                 reçue ne couvre pas les {} pistes concernées : aucune n'a été supprimée. \
-                 Confirmez ce nombre exact pour les retirer aussi.",
-                plan.tracks
-            ),
-        }));
+        return Ok(crate::message_api::avec_message(
+            json!({
+                "dirs": dirs,
+                "orphan_tracks": plan.tracks,
+                "purged": 0,
+                "purge_refused": true,
+                "purge_refused_reason": "confirmation_insuffisante",
+                "confirm_purge_required": plan.tracks,
+                "impact": impact_json(&plan),
+            }),
+            "api.library.removeDirPurgeNotConfirmed",
+            &[("count", plan.tracks.to_string())],
+        ));
     }
 
     let r = executer_purge(&state, &orphelines);
@@ -3818,29 +3816,31 @@ pub(super) async fn purge_orphan_tracks(
     let total_local = pistes_locales(&state).len();
 
     if ids.is_empty() {
-        return Ok(Json(json!({
-            "purged": 0,
-            "refused": false,
-            "impact": impact_json(&plan),
-            "message": format!("Aucune piste n'est enregistrée sous {cible}."),
-        }))
+        return Ok(Json(crate::message_api::avec_message(
+            json!({
+                "purged": 0,
+                "refused": false,
+                "impact": impact_json(&plan),
+            }),
+            "api.library.purgeNothingUnder",
+            &[("path", cible.to_string())],
+        ))
         .into_response());
     }
 
     // Essai à blanc : pas de confirmation ⇒ pas de suppression.
     let Some(_) = body.confirm_purge else {
-        return Ok(Json(json!({
-            "purged": 0,
-            "refused": false,
-            "dry_run": true,
-            "confirm_purge_required": plan.tracks,
-            "impact": impact_json(&plan),
-            "message": format!(
-                "{} pistes seraient retirées définitivement. Rappelez cette route avec \
-                 confirm_purge={} pour confirmer.",
-                plan.tracks, plan.tracks
-            ),
-        }))
+        return Ok(Json(crate::message_api::avec_message(
+            json!({
+                "purged": 0,
+                "refused": false,
+                "dry_run": true,
+                "confirm_purge_required": plan.tracks,
+                "impact": impact_json(&plan),
+            }),
+            "api.library.purgeDryRun",
+            &[("count", plan.tracks.to_string())],
+        ))
         .into_response());
     };
 
@@ -3857,18 +3857,17 @@ pub(super) async fn purge_orphan_tracks(
         );
         return Ok((
             StatusCode::CONFLICT,
-            Json(json!({
-                "purged": 0,
-                "refused": true,
-                "reason": "confirmation_insuffisante",
-                "confirm_purge_required": plan.tracks,
-                "impact": impact_json(&plan),
-                "message": format!(
-                    "La confirmation reçue ne couvre pas les {} pistes concernées. Rien n'a \
-                     été retiré. Confirmez ce nombre exact pour poursuivre.",
-                    plan.tracks
-                ),
-            })),
+            Json(crate::message_api::avec_message(
+                json!({
+                    "purged": 0,
+                    "refused": true,
+                    "reason": "confirmation_insuffisante",
+                    "confirm_purge_required": plan.tracks,
+                    "impact": impact_json(&plan),
+                }),
+                "api.library.purgeNotConfirmed",
+                &[("count", plan.tracks.to_string())],
+            )),
         )
             .into_response());
     }
@@ -4350,15 +4349,18 @@ pub(super) async fn set_license(
     let tier = crate::routes::cloud::validate_stored_license(&state).await;
     let premium = tier == tune_core::license::Tier::Premium;
     let ls = state.license.license_state().await;
-    Json(json!({
-        "status": if premium { "ok" } else { "pending" },
-        "tier": ls.tier,
-        "message": if premium {
-            "Licence validée : Premium activé."
+    Json(crate::message_api::avec_message(
+        json!({
+            "status": if premium { "ok" } else { "pending" },
+            "tier": ls.tier,
+        }),
+        if premium {
+            "api.license.activated"
         } else {
-            "Clé enregistrée. Premium s'activera dès qu'elle sera validée en ligne (vérifiez votre connexion et la clé)."
+            "api.license.pending"
         },
-    }))
+        &[],
+    ))
     .into_response()
 }
 

@@ -395,7 +395,7 @@ async fn enregistrer_arl_deezer(
             "valid": false,
             "etat": "refuse",
             "validation_message": tr("svctok.err.generic")
-                .replace("{error}", "Deezer n'a ouvert aucune session"),
+                .replace("{error}", &tr("svctok.err.deezerNoSession")),
         }),
         Err(e) => {
             let raison = e.to_string();
@@ -552,7 +552,7 @@ pub async fn test(
                     Json(json!({ "valid": valid, "validation_message": msg }))
                 }
                 None => Json(
-                    json!({ "valid": false, "validation_message": tr("svctok.err.generic").replace("{error}", "token non configuré") }),
+                    json!({ "valid": false, "validation_message": tr("svctok.err.generic").replace("{error}", &tr("svctok.err.tokenNotConfigured")) }),
                 ),
             }
         }
@@ -610,7 +610,7 @@ pub async fn test(
                 _ => Json(json!({
                     "valid": false,
                     "validation_message": tr("svctok.err.generic")
-                        .replace("{error}", "Deezer non connecté — enregistrez votre ARL"),
+                        .replace("{error}", &tr("svctok.err.deezerNotConnected")),
                 })),
             }
         }

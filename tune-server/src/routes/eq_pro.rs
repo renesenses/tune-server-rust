@@ -423,16 +423,13 @@ async fn activate_preset(
             let Some(zone_id) =
                 resolve_activation_zone(params.get("zone_id").map(|s| s.as_str()), p)
             else {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": "zone_id required",
-                        "detail": "Ce preset n'est lié à aucune zone : préciser \
-                                   ?zone_id=N. Sans zone, l'égaliseur ne saurait \
-                                   pas quelle sortie régler.",
-                    })),
-                )
-                    .into_response();
+                // `error` garde sa valeur historique ; `detail`, que lisaient
+                // les clients d'avant, porte la phrase traduite.
+                let mut corps =
+                    crate::message_api::corps_refus("zone_id required", "api.eq.presetNoZone", &[]);
+                corps["code"] = json!("zone_id_required");
+                corps["detail"] = corps["message"].clone();
+                return (StatusCode::BAD_REQUEST, Json(corps)).into_response();
             };
 
             let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -682,22 +679,24 @@ fn enregistrer_profil_autoeq(
         "reserved_headroom_db": reserved,
         "preamp_applied": false,
         "preamp_covered_by_headroom": couvert,
-        "detail": format!(
-            "Le pré-gain automatique de l'égaliseur réserve {reserved:.1} dB, \
-             soit au moins la marge du Preamp AutoEq ({:.1} dB) : celui-ci \
-             n'est donc pas appliqué en plus. Le préréglage joue plus bas \
-             qu'un lecteur qui suit le Preamp ; rattraper au volume.",
-            profil.preamp_db
+        "detail": crate::message_api::texte(
+            "api.eq.preampCoveredByHeadroom",
+            &[
+                ("reserved", format!("{reserved:.1}")),
+                ("preamp", format!("{:.1}", profil.preamp_db)),
+            ],
         ),
+        "detail_key": "api.eq.preampCoveredByHeadroom",
     });
     if !couvert {
-        corps["warning"] = json!(format!(
-            "Ce fichier demande un Preamp de {:.1} dB alors que la somme de ses \
-             gains positifs n'en justifie que {reserved:.1} : ce n'est pas un \
-             export AutoEq standard. Le préréglage est importé tel quel ; \
-             baissez le volume avant de l'activer.",
-            profil.preamp_db
+        corps["warning"] = json!(crate::message_api::texte(
+            "api.eq.preampNotStandard",
+            &[
+                ("reserved", format!("{reserved:.1}")),
+                ("preamp", format!("{:.1}", profil.preamp_db)),
+            ],
         ));
+        corps["warning_key"] = json!("api.eq.preampNotStandard");
     }
     Ok((StatusCode::CREATED, Json(corps)).into_response())
 }

@@ -39,11 +39,13 @@ pub(super) fn echec_ecriture(
         erreur = %erreur,
         "zone_patch_write_failed"
     );
-    (
+    crate::message_api::refus_avec_cause(
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("écriture impossible du champ « {champ} » : {erreur}"),
+        "zone_field_write_failed",
+        "api.zones.fieldWriteFailed",
+        &[("field", champ.to_string())],
+        erreur,
     )
-        .into_response()
 }
 
 /// La requête elle-même est fautive : **journaliser**, puis 400.
@@ -58,11 +60,13 @@ pub(super) fn refus_de_valeur(
     raison: &str,
 ) -> axum::response::Response {
     warn!(zone_id, champ, valeur, raison, "zone_patch_rejected");
-    (
+    crate::message_api::refus_avec_cause(
         StatusCode::BAD_REQUEST,
-        format!("champ « {champ} » : {raison} (reçu : « {valeur} »)"),
+        "zone_field_invalid",
+        "api.zones.fieldInvalid",
+        &[("field", champ.to_string()), ("value", valeur.to_string())],
+        raison,
     )
-        .into_response()
 }
 
 pub(super) async fn patch_zone(
@@ -1008,16 +1012,18 @@ pub(super) async fn create_zone(
             output_type = ?output_type,
             "create_zone_sans_appareil_refuse"
         );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "detail": format!(
-                    "zone_sans_appareil:La zone « {} » n'aurait aucune sortie : choisissez un appareil découvert avant de la créer.",
-                    body.name
-                )
-            })),
-        )
-            .into_response();
+        // `detail` garde sa forme historique `zone_sans_appareil:<phrase>`,
+        // que lisaient les clients d'avant ; la phrase est désormais traduite.
+        let mut corps = crate::message_api::corps_refus(
+            "zone_sans_appareil",
+            "api.zones.noOutputDevice",
+            &[("name", body.name.clone())],
+        );
+        corps["detail"] = json!(format!(
+            "zone_sans_appareil:{}",
+            corps["message"].as_str().unwrap_or_default()
+        ));
+        return (StatusCode::BAD_REQUEST, Json(corps)).into_response();
     }
 
     // If device already has a zone (visible OR hidden), return it (no premium check needed).
@@ -1399,7 +1405,11 @@ pub(super) async fn fusionner_zones(
     if doublon == cible {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "meme_zone", "message": "une zone ne se fusionne pas dans elle-même"})),
+            Json(crate::message_api::corps_refus(
+                "meme_zone",
+                "api.zones.mergeSelf",
+                &[],
+            )),
         )
             .into_response();
     }
@@ -1418,11 +1428,15 @@ pub(super) async fn fusionner_zones(
     if cle_doublon.is_none() || cle_doublon != cle_cible {
         return (
             StatusCode::CONFLICT,
-            Json(json!({
-                "error": "zones_distinctes",
-                "message": "les deux zones ne désignent pas le même appareil : la fusion est refusée",
-                "cles": [cle_doublon, cle_cible],
-            })),
+            Json(crate::message_api::avec_message(
+                json!({
+                    "error": "zones_distinctes",
+                    "code": "zones_distinctes",
+                    "cles": [cle_doublon, cle_cible],
+                }),
+                "api.zones.mergeDifferentDevices",
+                &[],
+            )),
         )
             .into_response();
     }
