@@ -1257,7 +1257,12 @@ impl PlaybackOrchestrator {
             artist_name: resolved.artist.clone(),
             album_title: habillage.album.clone(),
             cover_path: habillage.cover_path.clone(),
-            duration_ms: resolved.duration_ms.unwrap_or(0),
+            // #6059 — un flux natif relancé à la position : sa DIDL dit ce qui
+            // reste, la piste annoncée aux clients garde toute sa durée.
+            duration_ms: crate::outputs::dlna_depart_natif::duree_de_la_piste(
+                resolved.duration_ms.unwrap_or(0),
+                resolved.stream_id.as_deref(),
+            ),
             source: resolved.source.clone(),
             source_id: req.source_id.clone(),
             stream_id: resolved.stream_id.clone(),

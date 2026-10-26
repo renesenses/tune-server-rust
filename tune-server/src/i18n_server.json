@@ -11,7 +11,10 @@
     "ro": "Acest plugin trebuie să fie instalat și activat.",
     "sv": "Det här tillägget måste vara installerat och aktiverat.",
     "hu": "Ezt a bővítményt telepíteni és engedélyezni kell.",
-    "vi": "Plugin này phải được cài đặt và bật."
+    "vi": "Plugin này phải được cài đặt và bật.",
+    "nb": "Denne pluginen må være installert og aktivert.",
+    "pl": "Ta wtyczka musi być zainstalowana i włączona.",
+    "el": "Αυτό το πρόσθετο πρέπει να είναι εγκατεστημένο και ενεργοποιημένο."
   },
   "plugin.description.equalizer": {
     "fr": "Égaliseur : profil, graphique, paramétrique, presets et AutoEq",
@@ -25,7 +28,10 @@
     "ro": "Egalizator: profil, grafic, parametric, presetări și AutoEq",
     "sv": "Equalizer: profil, grafisk, parametrisk, förinställningar och AutoEq",
     "hu": "Hangszínszabályzó: profil, grafikus, parametrikus, előbeállítások és AutoEq",
-    "vi": "Bộ cân bằng (EQ): hồ sơ, đồ họa, tham số, preset và AutoEq"
+    "vi": "Bộ cân bằng (EQ): hồ sơ, đồ họa, tham số, preset và AutoEq",
+    "nb": "Equalizer: profil, grafisk, parametrisk, forhåndsinnstillinger og AutoEq",
+    "pl": "Korektor: profil, graficzny, parametryczny, presety i AutoEq",
+    "el": "Ισοσταθμιστής: προφίλ, γραφικός, παραμετρικός, προρυθμίσεις και AutoEq"
   },
   "plugin.description.crossfeed": {
     "fr": "Crossfeed casque : intensité, retard et ombre de la tête, à chaud",
@@ -39,7 +45,10 @@
     "ro": "Crossfeed pentru căști: intensitate, întârziere și umbra capului, aplicate din mers",
     "sv": "Crossfeed för hörlurar: intensitet, fördröjning och huvudskugga, direkt",
     "hu": "Fejhallgatós crossfeed: erősség, késleltetés és fejárnyék, menet közben",
-    "vi": "Crossfeed cho tai nghe: cường độ, độ trễ và bóng đầu, áp dụng tức thì"
+    "vi": "Crossfeed cho tai nghe: cường độ, độ trễ và bóng đầu, áp dụng tức thì",
+    "nb": "Crossfeed for hodetelefoner: styrke, forsinkelse og hodeskygge, brukt direkte",
+    "pl": "Crossfeed do słuchawek: siła, opóźnienie i cień głowy, stosowane na żywo",
+    "el": "Crossfeed ακουστικών: ένταση, καθυστέρηση και σκιά κεφαλιού, με άμεση εφαρμογή"
   },
   "plugin.description.converter": {
     "fr": "Convertisseur audio : codecs de l'hôte, métadonnées et exports",
@@ -53,7 +62,10 @@
     "ro": "Convertor audio: codecurile gazdei, metadate și exporturi",
     "sv": "Ljudkonverterare: värdens codecs, metadata och export",
     "hu": "Hangkonverter: a gazdagép kodekjei, metaadatok és exportálás",
-    "vi": "Bộ chuyển đổi âm thanh: codec của máy chủ, siêu dữ liệu và xuất file"
+    "vi": "Bộ chuyển đổi âm thanh: codec của máy chủ, siêu dữ liệu và xuất file",
+    "nb": "Lydkonverterer: kodeker på verten, metadata og eksport",
+    "pl": "Konwerter audio: kodeki hosta, metadane i eksport",
+    "el": "Μετατροπέας ήχου: κωδικοποιητές του υπολογιστή, μεταδεδομένα και εξαγωγές"
   },
   "plugin.description.channel-remap": {
     "fr": "Réaffectation des canaux : matrice en dB par zone et par album (4.0, 5.1…)",
@@ -67,7 +79,10 @@
     "ro": "Reasignarea canalelor: matrice în dB pe zonă și pe album (4.0, 5.1…)",
     "sv": "Kanalomfördelning: dB-matris per zon och per album (4.0, 5.1…)",
     "hu": "Csatorna-átrendezés: dB-mátrix zónánként és albumonként (4.0, 5.1…)",
-    "vi": "Phân bổ lại kênh: ma trận dB theo vùng phát và theo album (4.0, 5.1…)"
+    "vi": "Phân bổ lại kênh: ma trận dB theo vùng phát và theo album (4.0, 5.1…)",
+    "nb": "Kanalomlegging: dB-matrise per sone og per album (4.0, 5.1 …)",
+    "pl": "Przemapowanie kanałów: macierz dB dla strefy i albumu (4.0, 5.1…)",
+    "el": "Αναδρομολόγηση καναλιών: πίνακας dB ανά ζώνη και ανά άλμπουμ (4.0, 5.1…)"
   },
   "plugin.description.declick": {
     "fr": "Dé-ploc : silence en tête/queue et passages par zéro, FLAC/WAV",
@@ -81,7 +96,10 @@
     "ro": "Declick: liniște la început/sfârșit și treceri prin zero, FLAC/WAV",
     "sv": "Declick: tystnad i början/slutet och nollgenomgångar, FLAC/WAV",
     "hu": "Kattanásszűrő: csend az elején/végén és nullátmenetek, FLAC/WAV",
-    "vi": "Khử tiếng lách cách: khoảng lặng đầu/cuối và điểm qua 0, FLAC/WAV"
+    "vi": "Khử tiếng lách cách: khoảng lặng đầu/cuối và điểm qua 0, FLAC/WAV",
+    "nb": "Declick: stillhet først og sist og nullkrysninger, FLAC/WAV",
+    "pl": "Declick: cisza na początku i na końcu oraz przejścia przez zero, FLAC/WAV",
+    "el": "Declick: σιωπή στην αρχή και στο τέλος και διελεύσεις από το μηδέν, FLAC/WAV"
   },
   "plugin.description.cd": {
     "fr": "Lecture directe d'un CD audio vers une zone, et extraction en FLAC ou WAV vers la bibliothèque (Linux, macOS et Windows)",
@@ -95,7 +113,10 @@
     "ro": "Redare directă a unui CD audio într-o zonă și extragere în FLAC sau WAV în bibliotecă (Linux, macOS și Windows)",
     "sv": "Spela en ljud-cd direkt i en zon och rippa den till FLAC eller WAV i biblioteket (Linux, macOS och Windows)",
     "hu": "Audio-CD közvetlen lejátszása egy zónán, és bemásolása FLAC vagy WAV formátumban a gyűjteménybe (Linux, macOS és Windows)",
-    "vi": "Phát trực tiếp CD âm thanh tới một vùng phát, và trích xuất sang FLAC hoặc WAV vào thư viện (Linux, macOS và Windows)"
+    "vi": "Phát trực tiếp CD âm thanh tới một vùng phát, và trích xuất sang FLAC hoặc WAV vào thư viện (Linux, macOS và Windows)",
+    "nb": "Spill en lyd-CD direkte til en sone, og rip den til FLAC eller WAV i biblioteket (Linux, macOS og Windows)",
+    "pl": "Odtwarzaj płytę CD audio bezpośrednio w strefie i zgrywaj ją do FLAC lub WAV do biblioteki (Linux, macOS i Windows)",
+    "el": "Αναπαραγωγή CD ήχου απευθείας σε μια ζώνη και αντιγραφή του σε FLAC ή WAV στη βιβλιοθήκη (Linux, macOS και Windows)"
   },
   "plugin.description.circle": {
     "fr": "Tune Circle — partage entre proches invités. Gratuit ; l'écoute à distance est Premium.",
@@ -109,7 +130,10 @@
     "ro": "Tune Circle — partajare cu apropiații invitați. Gratuit; ascultarea la distanță este Premium.",
     "sv": "Tune Circle — delning med inbjudna nära och kära. Gratis; lyssning på distans är Premium.",
     "hu": "Tune Circle — megosztás meghívott hozzátartozókkal. Ingyenes; a távoli hallgatás Premium.",
-    "vi": "Tune Circle — chia sẻ với người thân được mời. Miễn phí; nghe từ xa là tính năng Premium."
+    "vi": "Tune Circle — chia sẻ với người thân được mời. Miễn phí; nghe từ xa là tính năng Premium.",
+    "nb": "Tune Circle – deling med inviterte venner og familie. Gratis; avstandslytting er Premium.",
+    "pl": "Tune Circle — udostępnianie zaproszonym znajomym i rodzinie. Bezpłatne; słuchanie zdalne jest w Premium.",
+    "el": "Tune Circle — κοινοποίηση σε προσκεκλημένους φίλους και οικογένεια. Δωρεάν· η απομακρυσμένη ακρόαση είναι Premium."
   },
   "plugin.description.assistant-ia": {
     "fr": "Playlists intelligentes décrites en une phrase et suggestions d'enrichissement des albums, avec votre propre clé (Anthropic, compatible OpenAI, Gemini, Ollama)",
@@ -123,7 +147,10 @@
     "ro": "Liste inteligente descrise într-o frază și sugestii de îmbogățire a albumelor, cu propria cheie (Anthropic, compatibil OpenAI, Gemini, Ollama)",
     "sv": "Smarta spellistor beskrivna i en mening och förslag för att berika album, med din egen nyckel (Anthropic, OpenAI-kompatibel, Gemini, Ollama)",
     "hu": "Egy mondatban leírt intelligens lejátszási listák és albumkiegészítési javaslatok, a saját kulcsával (Anthropic, OpenAI-kompatibilis, Gemini, Ollama)",
-    "vi": "Danh sách phát thông minh mô tả bằng một câu và gợi ý làm giàu thông tin album, với khóa của riêng bạn (Anthropic, tương thích OpenAI, Gemini, Ollama)"
+    "vi": "Danh sách phát thông minh mô tả bằng một câu và gợi ý làm giàu thông tin album, với khóa của riêng bạn (Anthropic, tương thích OpenAI, Gemini, Ollama)",
+    "nb": "Smarte spillelister beskrevet i én setning og forslag til albumberikelse, med din egen nøkkel (Anthropic, OpenAI-kompatibel, Gemini, Ollama)",
+    "pl": "Inteligentne playlisty opisane jednym zdaniem i propozycje wzbogacenia albumów, z własnym kluczem (Anthropic, zgodne z OpenAI, Gemini, Ollama)",
+    "el": "Έξυπνες λίστες αναπαραγωγής που περιγράφονται σε μία πρόταση και προτάσεις εμπλουτισμού άλμπουμ, με το δικό σας κλειδί (Anthropic, συμβατό με OpenAI, Gemini, Ollama)"
   },
   "plugin.description.entree-audio": {
     "fr": "Capter une entrée audio (USB, S/PDIF, optique) et la diffuser en direct vers une zone",
@@ -137,7 +164,10 @@
     "ro": "Captarea unei intrări audio (USB, S/PDIF, optică) și difuzarea ei în direct către o zonă",
     "sv": "Fånga en ljudingång (USB, S/PDIF, optisk) och strömma den direkt till en zon",
     "hu": "Hangbemenet (USB, S/PDIF, optikai) rögzítése és élő továbbítása egy zónára",
-    "vi": "Thu một ngõ vào âm thanh (USB, S/PDIF, quang) và phát trực tiếp tới một vùng phát"
+    "vi": "Thu một ngõ vào âm thanh (USB, S/PDIF, quang) và phát trực tiếp tới một vùng phát",
+    "nb": "Fang opp en lydinngang (USB, S/PDIF, optisk) og strøm den direkte til en sone",
+    "pl": "Przechwytuj wejście audio (USB, S/PDIF, optyczne) i przesyłaj je na żywo do strefy",
+    "el": "Καταγραφή εισόδου ήχου (USB, S/PDIF, οπτική) και ζωντανή μετάδοση σε μια ζώνη"
   },
   "plugin.description.pont-roon": {
     "fr": "Pont Roon (Premium) : crédits, images d'artistes et pochettes récoltés sur un Core Roon",
@@ -151,7 +181,10 @@
     "ro": "Punte Roon (Premium): credite, imagini ale artiștilor și coperți preluate de pe un Roon Core",
     "sv": "Roon-brygga (Premium): medverkande, artistbilder och omslag hämtade från en Roon Core",
     "hu": "Roon-híd (Premium): közreműködők, előadóképek és borítók egy Roon Core-ból",
-    "vi": "Cầu nối Roon (Premium): ghi công, ảnh nghệ sĩ và ảnh bìa lấy từ một Roon Core"
+    "vi": "Cầu nối Roon (Premium): ghi công, ảnh nghệ sĩ và ảnh bìa lấy từ một Roon Core",
+    "nb": "Roon-bro (Premium): medvirkende, artistbilder og omslag hentet fra en Roon Core",
+    "pl": "Most Roon (Premium): autorzy, zdjęcia artystów i okładki pobrane z Roon Core",
+    "el": "Γέφυρα Roon (Premium): συντελεστές, εικόνες καλλιτεχνών και εξώφυλλα που συλλέγονται από ένα Roon Core"
   },
   "plugin.description.dj": {
     "fr": "Mode DJ : fondu enchaîné, platines, forme d'onde et analyse du BPM",
@@ -165,7 +198,10 @@
     "ro": "Mod DJ: crossfade, deck-uri, formă de undă și analiză BPM",
     "sv": "DJ-läge: övertoning, decks, vågform och BPM-analys",
     "hu": "DJ mód: áttűnés, lejátszók, hullámforma és BPM-elemzés",
-    "vi": "Chế độ DJ: crossfade, deck, dạng sóng và phân tích BPM"
+    "vi": "Chế độ DJ: crossfade, deck, dạng sóng và phân tích BPM",
+    "nb": "DJ-modus: crossfade, dekk, bølgeform og BPM-analyse",
+    "pl": "Tryb DJ: crossfade, decki, przebieg fali i analiza BPM",
+    "el": "Λειτουργία DJ: crossfade, deck, κυματομορφή και ανάλυση BPM"
   },
   "plugin.description.karaoke": {
     "fr": "Paroles synchronisées façon karaoké (réutilise tune-core::lyrics)",
@@ -179,7 +215,10 @@
     "ro": "Versuri sincronizate în stil karaoke (reutilizează tune-core::lyrics)",
     "sv": "Synkroniserade låttexter i karaokestil (återanvänder tune-core::lyrics)",
     "hu": "Karaoke-stílusú szinkronizált dalszöveg (a tune-core::lyrics modult használja)",
-    "vi": "Lời bài hát đồng bộ kiểu karaoke (dùng lại tune-core::lyrics)"
+    "vi": "Lời bài hát đồng bộ kiểu karaoke (dùng lại tune-core::lyrics)",
+    "nb": "Synkroniserte sangtekster i karaokestil (gjenbruker tune-core::lyrics)",
+    "pl": "Zsynchronizowane teksty w stylu karaoke (używa tune-core::lyrics)",
+    "el": "Συγχρονισμένοι στίχοι τύπου καραόκε (επαναχρησιμοποιεί το tune-core::lyrics)"
   },
   "plugin.description.concerts": {
     "fr": "Concerts (Premium) : les dates à venir des artistes de votre bibliothèque, autour de chez vous",
@@ -193,7 +232,10 @@
     "ro": "Concerte (Premium): datele viitoare ale artiștilor din biblioteca ta, în apropiere",
     "sv": "Konserter (Premium): kommande datum för artisterna i ditt bibliotek, nära dig",
     "hu": "Koncertek (Premium): a gyűjteménye előadóinak közelgő fellépései az Ön közelében",
-    "vi": "Hòa nhạc (Premium): lịch diễn sắp tới của các nghệ sĩ trong thư viện của bạn, gần chỗ bạn"
+    "vi": "Hòa nhạc (Premium): lịch diễn sắp tới của các nghệ sĩ trong thư viện của bạn, gần chỗ bạn",
+    "nb": "Konserter (Premium): kommende datoer for artistene i biblioteket ditt, i nærheten av deg",
+    "pl": "Koncerty (Premium): nadchodzące terminy dla wykonawców z Twojej biblioteki, w Twojej okolicy",
+    "el": "Συναυλίες (Premium): επερχόμενες ημερομηνίες για τους καλλιτέχνες της βιβλιοθήκης σας, κοντά σας"
   },
   "plugin.description.bandcamp": {
     "fr": "Bandcamp : recherche, découverte, tags et lecture (mp3-128)",
@@ -207,7 +249,10 @@
     "ro": "Bandcamp: căutare, descoperire, etichete și redare (mp3-128)",
     "sv": "Bandcamp: sökning, upptäckt, taggar och uppspelning (mp3-128)",
     "hu": "Bandcamp: keresés, felfedezés, címkék és lejátszás (mp3-128)",
-    "vi": "Bandcamp: tìm kiếm, khám phá, thẻ và phát (mp3-128)"
+    "vi": "Bandcamp: tìm kiếm, khám phá, thẻ và phát (mp3-128)",
+    "nb": "Bandcamp: søk, oppdagelse, tagger og avspilling (mp3-128)",
+    "pl": "Bandcamp: wyszukiwanie, odkrywanie, tagi i odtwarzanie (mp3-128)",
+    "el": "Bandcamp: αναζήτηση, ανακάλυψη, ετικέτες και αναπαραγωγή (mp3-128)"
   },
   "plugin.description.xtune": {
     "fr": "Vinyl turntable player — interface platine vinyle immersive",
@@ -221,7 +266,10 @@
     "ro": "Pick-up de vinil — interfață imersivă de pick-up",
     "sv": "Vinylskivspelare — uppslukande skivspelargränssnitt",
     "hu": "Bakelit lemezjátszó — magával ragadó lemezjátszó-felület",
-    "vi": "Máy quay đĩa than — giao diện mâm đĩa sống động"
+    "vi": "Máy quay đĩa than — giao diện mâm đĩa sống động",
+    "nb": "Vinylspiller – oppslukende platespillergrensesnitt",
+    "pl": "Odtwarzacz winylowy — immersyjny interfejs gramofonu",
+    "el": "Αναπαραγωγή βινυλίου — εμβυθιστική διεπαφή πικάπ"
   },
   "premium.required": {
     "fr": "« {feature} » nécessite Tune Premium.",
@@ -235,7 +283,10 @@
     "ro": "„{feature}” necesită Tune Premium.",
     "sv": "”{feature}” kräver Tune Premium.",
     "hu": "„{feature}” használatához Tune Premium szükséges.",
-    "vi": "“{feature}” yêu cầu Tune Premium."
+    "vi": "“{feature}” yêu cầu Tune Premium.",
+    "nb": "{feature} krever Tune Premium.",
+    "pl": "{feature} wymaga Tune Premium.",
+    "el": "Το {feature} απαιτεί Tune Premium."
   },
   "metafield.album_artist": {
     "fr": "Artiste de l'album",
@@ -249,7 +300,10 @@
     "ro": "Artist album",
     "sv": "Albumartist",
     "hu": "Album előadója",
-    "vi": "Nghệ sĩ album"
+    "vi": "Nghệ sĩ album",
+    "nb": "Albumartist",
+    "pl": "Wykonawca albumu",
+    "el": "Καλλιτέχνης άλμπουμ"
   },
   "metafield.sort_artist": {
     "fr": "Tri artiste",
@@ -263,7 +317,10 @@
     "ro": "Sortare artist",
     "sv": "Sorteringsartist",
     "hu": "Előadó rendezése",
-    "vi": "Sắp xếp nghệ sĩ"
+    "vi": "Sắp xếp nghệ sĩ",
+    "nb": "Sorteringsartist",
+    "pl": "Wykonawca do sortowania",
+    "el": "Καλλιτέχνης ταξινόμησης"
   },
   "metafield.sort_album": {
     "fr": "Tri album",
@@ -277,7 +334,10 @@
     "ro": "Sortare album",
     "sv": "Sorteringsalbum",
     "hu": "Album rendezése",
-    "vi": "Sắp xếp album"
+    "vi": "Sắp xếp album",
+    "nb": "Sorteringsalbum",
+    "pl": "Album do sortowania",
+    "el": "Άλμπουμ ταξινόμησης"
   },
   "metafield.disc_number": {
     "fr": "N° disque",
@@ -291,7 +351,10 @@
     "ro": "Nr. disc",
     "sv": "Skivnr",
     "hu": "Lemez sorszáma",
-    "vi": "Số đĩa"
+    "vi": "Số đĩa",
+    "nb": "Platenr.",
+    "pl": "Nr płyty",
+    "el": "Αρ. δίσκου"
   },
   "metafield.disc_subtitle": {
     "fr": "Sous-titre disque",
@@ -305,7 +368,10 @@
     "ro": "Subtitlu disc",
     "sv": "Skivundertitel",
     "hu": "Lemez alcíme",
-    "vi": "Phụ đề đĩa"
+    "vi": "Phụ đề đĩa",
+    "nb": "Platens undertittel",
+    "pl": "Podtytuł płyty",
+    "el": "Υπότιτλος δίσκου"
   },
   "metafield.track_number": {
     "fr": "N° piste",
@@ -319,7 +385,10 @@
     "ro": "Nr. piesă",
     "sv": "Spårnr",
     "hu": "Szám sorszáma",
-    "vi": "Số bài"
+    "vi": "Số bài",
+    "nb": "Spornr.",
+    "pl": "Nr utworu",
+    "el": "Αρ. κομματιού"
   },
   "metafield.genre": {
     "fr": "Genre",
@@ -333,7 +402,10 @@
     "ro": "Gen",
     "sv": "Genre",
     "hu": "Műfaj",
-    "vi": "Thể loại"
+    "vi": "Thể loại",
+    "nb": "Sjanger",
+    "pl": "Gatunek",
+    "el": "Είδος"
   },
   "metafield.genres": {
     "fr": "Genres (multi)",
@@ -347,7 +419,10 @@
     "ro": "Genuri (multiple)",
     "sv": "Genrer (flera)",
     "hu": "Műfajok (több)",
-    "vi": "Thể loại (nhiều)"
+    "vi": "Thể loại (nhiều)",
+    "nb": "Sjangre (flere)",
+    "pl": "Gatunki (wiele)",
+    "el": "Είδη (πολλαπλά)"
   },
   "metafield.year": {
     "fr": "Année",
@@ -361,7 +436,10 @@
     "ro": "An",
     "sv": "År",
     "hu": "Év",
-    "vi": "Năm"
+    "vi": "Năm",
+    "nb": "År",
+    "pl": "Rok",
+    "el": "Έτος"
   },
   "metafield.composer": {
     "fr": "Compositeur",
@@ -375,7 +453,10 @@
     "ro": "Compozitor",
     "sv": "Kompositör",
     "hu": "Szerző",
-    "vi": "Nhà soạn nhạc"
+    "vi": "Nhà soạn nhạc",
+    "nb": "Komponist",
+    "pl": "Kompozytor",
+    "el": "Συνθέτης"
   },
   "metafield.conductor": {
     "fr": "Chef d'orchestre",
@@ -389,7 +470,10 @@
     "ro": "Dirijor",
     "sv": "Dirigent",
     "hu": "Karmester",
-    "vi": "Nhạc trưởng"
+    "vi": "Nhạc trưởng",
+    "nb": "Dirigent",
+    "pl": "Dyrygent",
+    "el": "Αρχιμουσικός"
   },
   "metafield.lyricist": {
     "fr": "Parolier",
@@ -403,7 +487,10 @@
     "ro": "Textier",
     "sv": "Textförfattare",
     "hu": "Szövegíró",
-    "vi": "Người viết lời"
+    "vi": "Người viết lời",
+    "nb": "Tekstforfatter",
+    "pl": "Autor tekstu",
+    "el": "Στιχουργός"
   },
   "metafield.performer": {
     "fr": "Interprète",
@@ -417,7 +504,10 @@
     "ro": "Interpret",
     "sv": "Utövare",
     "hu": "Előadó",
-    "vi": "Người biểu diễn"
+    "vi": "Người biểu diễn",
+    "nb": "Utøver",
+    "pl": "Wykonawca",
+    "el": "Ερμηνευτής"
   },
   "metafield.remixer": {
     "fr": "Remixeur",
@@ -431,7 +521,10 @@
     "ro": "Remixer",
     "sv": "Remixare",
     "hu": "Remixer",
-    "vi": "Người remix"
+    "vi": "Người remix",
+    "nb": "Remikser",
+    "pl": "Autor remiksu",
+    "el": "Ρεμίξερ"
   },
   "metafield.label": {
     "fr": "Label",
@@ -445,7 +538,10 @@
     "ro": "Casă de discuri",
     "sv": "Skivbolag",
     "hu": "Kiadó",
-    "vi": "Hãng đĩa"
+    "vi": "Hãng đĩa",
+    "nb": "Plateselskap",
+    "pl": "Wytwórnia",
+    "el": "Δισκογραφική"
   },
   "metafield.producer": {
     "fr": "Producteur",
@@ -459,7 +555,10 @@
     "ro": "Producător",
     "sv": "Producent",
     "hu": "Producer",
-    "vi": "Nhà sản xuất"
+    "vi": "Nhà sản xuất",
+    "nb": "Produsent",
+    "pl": "Producent",
+    "el": "Παραγωγός"
   },
   "metafield.bpm": {
     "fr": "BPM",
@@ -473,7 +572,10 @@
     "ro": "BPM",
     "sv": "BPM",
     "hu": "BPM",
-    "vi": "BPM"
+    "vi": "BPM",
+    "nb": "BPM",
+    "pl": "BPM",
+    "el": "BPM"
   },
   "metafield.mood": {
     "fr": "Ambiance",
@@ -487,7 +589,10 @@
     "ro": "Atmosferă",
     "sv": "Stämning",
     "hu": "Hangulat",
-    "vi": "Tâm trạng"
+    "vi": "Tâm trạng",
+    "nb": "Stemning",
+    "pl": "Nastrój",
+    "el": "Διάθεση"
   },
   "metafield.grouping": {
     "fr": "Regroupement",
@@ -501,7 +606,10 @@
     "ro": "Grupare",
     "sv": "Gruppering",
     "hu": "Csoportosítás",
-    "vi": "Nhóm"
+    "vi": "Nhóm",
+    "nb": "Gruppering",
+    "pl": "Grupowanie",
+    "el": "Ομαδοποίηση"
   },
   "metafield.compilation": {
     "fr": "Compilation",
@@ -515,7 +623,10 @@
     "ro": "Compilație",
     "sv": "Samlingsalbum",
     "hu": "Válogatás",
-    "vi": "Tuyển tập"
+    "vi": "Tuyển tập",
+    "nb": "Samling",
+    "pl": "Kompilacja",
+    "el": "Συλλογή"
   },
   "metafield.comment": {
     "fr": "Commentaire",
@@ -529,7 +640,10 @@
     "ro": "Comentariu",
     "sv": "Kommentar",
     "hu": "Megjegyzés",
-    "vi": "Ghi chú"
+    "vi": "Ghi chú",
+    "nb": "Kommentar",
+    "pl": "Komentarz",
+    "el": "Σχόλιο"
   },
   "metafield.lyrics": {
     "fr": "Paroles",
@@ -543,7 +657,10 @@
     "ro": "Versuri",
     "sv": "Sångtext",
     "hu": "Dalszöveg",
-    "vi": "Lời bài hát"
+    "vi": "Lời bài hát",
+    "nb": "Sangtekst",
+    "pl": "Tekst utworu",
+    "el": "Στίχοι"
   },
   "metafield.isrc": {
     "fr": "ISRC",
@@ -557,7 +674,10 @@
     "ro": "ISRC",
     "sv": "ISRC",
     "hu": "ISRC",
-    "vi": "ISRC"
+    "vi": "ISRC",
+    "nb": "ISRC",
+    "pl": "ISRC",
+    "el": "ISRC"
   },
   "metafield.barcode": {
     "fr": "Code-barres",
@@ -571,7 +691,10 @@
     "ro": "Cod de bare",
     "sv": "Streckkod",
     "hu": "Vonalkód",
-    "vi": "Mã vạch"
+    "vi": "Mã vạch",
+    "nb": "Strekkode",
+    "pl": "Kod kreskowy",
+    "el": "Γραμμωτός κώδικας"
   },
   "metafield.catalog_number": {
     "fr": "Réf. catalogue",
@@ -585,7 +708,10 @@
     "ro": "Nr. catalog",
     "sv": "Katalognr",
     "hu": "Katalógusszám",
-    "vi": "Số catalog"
+    "vi": "Số catalog",
+    "nb": "Katalognr.",
+    "pl": "Nr katalogowy",
+    "el": "Αρ. καταλόγου"
   },
   "metafield.media_type": {
     "fr": "Support",
@@ -599,7 +725,10 @@
     "ro": "Tip de suport",
     "sv": "Medietyp",
     "hu": "Hordozó típusa",
-    "vi": "Loại phương tiện"
+    "vi": "Loại phương tiện",
+    "nb": "Medietype",
+    "pl": "Typ nośnika",
+    "el": "Τύπος μέσου"
   },
   "metafield.musicbrainz_recording_id": {
     "fr": "MusicBrainz Recording ID",
@@ -613,7 +742,10 @@
     "ro": "MusicBrainz Recording ID",
     "sv": "MusicBrainz Recording ID",
     "hu": "MusicBrainz felvétel-azonosító",
-    "vi": "ID bản thu MusicBrainz"
+    "vi": "ID bản thu MusicBrainz",
+    "nb": "MusicBrainz-opptaks-ID",
+    "pl": "ID nagrania MusicBrainz",
+    "el": "Αναγνωριστικό ηχογράφησης MusicBrainz"
   },
   "metafield.musicbrainz_release_id": {
     "fr": "MusicBrainz Release ID",
@@ -627,7 +759,10 @@
     "ro": "MusicBrainz Release ID",
     "sv": "MusicBrainz Release ID",
     "hu": "MusicBrainz kiadás-azonosító",
-    "vi": "ID phát hành MusicBrainz"
+    "vi": "ID phát hành MusicBrainz",
+    "nb": "MusicBrainz-utgivelses-ID",
+    "pl": "ID wydania MusicBrainz",
+    "el": "Αναγνωριστικό έκδοσης MusicBrainz"
   },
   "metafield.musicbrainz_release_group_id": {
     "fr": "MusicBrainz Release Group ID",
@@ -641,7 +776,10 @@
     "ro": "MusicBrainz Release Group ID",
     "sv": "MusicBrainz Release Group ID",
     "hu": "MusicBrainz kiadáscsoport-azonosító",
-    "vi": "ID nhóm phát hành MusicBrainz"
+    "vi": "ID nhóm phát hành MusicBrainz",
+    "nb": "MusicBrainz-utgivelsesgruppe-ID",
+    "pl": "ID grupy wydań MusicBrainz",
+    "el": "Αναγνωριστικό ομάδας εκδόσεων MusicBrainz"
   },
   "metafield.release_date": {
     "fr": "Date de sortie",
@@ -655,7 +793,10 @@
     "ro": "Dată de lansare",
     "sv": "Utgivningsdatum",
     "hu": "Megjelenés dátuma",
-    "vi": "Ngày phát hành"
+    "vi": "Ngày phát hành",
+    "nb": "Utgivelsesdato",
+    "pl": "Data wydania",
+    "el": "Ημερομηνία έκδοσης"
   },
   "metafield.original_date": {
     "fr": "Date originale",
@@ -669,7 +810,10 @@
     "ro": "Dată originală",
     "sv": "Originaldatum",
     "hu": "Eredeti dátum",
-    "vi": "Ngày gốc"
+    "vi": "Ngày gốc",
+    "nb": "Opprinnelig dato",
+    "pl": "Data oryginalna",
+    "el": "Αρχική ημερομηνία"
   },
   "metafield.original_year": {
     "fr": "Année originale",
@@ -683,7 +827,10 @@
     "ro": "An original",
     "sv": "Originalår",
     "hu": "Eredeti év",
-    "vi": "Năm gốc"
+    "vi": "Năm gốc",
+    "nb": "Opprinnelig år",
+    "pl": "Rok oryginalny",
+    "el": "Αρχικό έτος"
   },
   "metafield.format": {
     "fr": "Format audio",
@@ -697,7 +844,10 @@
     "ro": "Format audio",
     "sv": "Ljudformat",
     "hu": "Hangformátum",
-    "vi": "Định dạng âm thanh"
+    "vi": "Định dạng âm thanh",
+    "nb": "Lydformat",
+    "pl": "Format audio",
+    "el": "Μορφή ήχου"
   },
   "metafield.sample_rate": {
     "fr": "Fréquence d'échantillonnage",
@@ -711,7 +861,10 @@
     "ro": "Frecvență de eșantionare",
     "sv": "Samplingsfrekvens",
     "hu": "Mintavételi frekvencia",
-    "vi": "Tần số lấy mẫu"
+    "vi": "Tần số lấy mẫu",
+    "nb": "Samplingsrate",
+    "pl": "Częstotliwość próbkowania",
+    "el": "Συχνότητα δειγματοληψίας"
   },
   "metafield.bit_depth": {
     "fr": "Profondeur de bits",
@@ -725,7 +878,10 @@
     "ro": "Adâncime de biți",
     "sv": "Bitdjup",
     "hu": "Bitmélység",
-    "vi": "Độ sâu bit"
+    "vi": "Độ sâu bit",
+    "nb": "Bitdybde",
+    "pl": "Głębia bitowa",
+    "el": "Βάθος bit"
   },
   "metafield.channels": {
     "fr": "Canaux",
@@ -739,7 +895,10 @@
     "ro": "Canale",
     "sv": "Kanaler",
     "hu": "Csatornák",
-    "vi": "Kênh"
+    "vi": "Kênh",
+    "nb": "Kanaler",
+    "pl": "Kanały",
+    "el": "Κανάλια"
   },
   "metafield.duration_ms": {
     "fr": "Durée",
@@ -753,7 +912,10 @@
     "ro": "Durată",
     "sv": "Speltid",
     "hu": "Időtartam",
-    "vi": "Thời lượng"
+    "vi": "Thời lượng",
+    "nb": "Varighet",
+    "pl": "Czas trwania",
+    "el": "Διάρκεια"
   },
   "metafield.file_size": {
     "fr": "Taille du fichier",
@@ -767,7 +929,10 @@
     "ro": "Dimensiune fișier",
     "sv": "Filstorlek",
     "hu": "Fájlméret",
-    "vi": "Kích thước file"
+    "vi": "Kích thước file",
+    "nb": "Filstørrelse",
+    "pl": "Rozmiar pliku",
+    "el": "Μέγεθος αρχείου"
   },
   "metafield.file_path": {
     "fr": "Chemin du fichier",
@@ -781,7 +946,10 @@
     "ro": "Cale fișier",
     "sv": "Filsökväg",
     "hu": "Fájl elérési útja",
-    "vi": "Đường dẫn file"
+    "vi": "Đường dẫn file",
+    "nb": "Filbane",
+    "pl": "Ścieżka pliku",
+    "el": "Διαδρομή αρχείου"
   },
   "metafield.encoder": {
     "fr": "Encodeur",
@@ -795,7 +963,10 @@
     "ro": "Codificator",
     "sv": "Kodare",
     "hu": "Kódoló",
-    "vi": "Bộ mã hóa"
+    "vi": "Bộ mã hóa",
+    "nb": "Koder",
+    "pl": "Koder",
+    "el": "Κωδικοποιητής"
   },
   "metafield.encoder_software": {
     "fr": "Logiciel d'encodage",
@@ -809,7 +980,10 @@
     "ro": "Software de codare",
     "sv": "Kodningsprogram",
     "hu": "Kódolószoftver",
-    "vi": "Phần mềm mã hóa"
+    "vi": "Phần mềm mã hóa",
+    "nb": "Kodeprogramvare",
+    "pl": "Oprogramowanie kodujące",
+    "el": "Λογισμικό κωδικοποίησης"
   },
   "metafield.source_media": {
     "fr": "Support source",
@@ -823,7 +997,10 @@
     "ro": "Suport sursă",
     "sv": "Källmedium",
     "hu": "Forráshordozó",
-    "vi": "Phương tiện nguồn"
+    "vi": "Phương tiện nguồn",
+    "nb": "Kildemedium",
+    "pl": "Nośnik źródłowy",
+    "el": "Μέσο προέλευσης"
   },
   "metafield.mb_release_track_id": {
     "fr": "MusicBrainz Release Track ID",
@@ -837,7 +1014,10 @@
     "ro": "MusicBrainz Release Track ID",
     "sv": "MusicBrainz Release Track ID",
     "hu": "MusicBrainz kiadásszám-azonosító",
-    "vi": "ID bài trong phát hành MusicBrainz"
+    "vi": "ID bài trong phát hành MusicBrainz",
+    "nb": "MusicBrainz-utgivelsesspor-ID",
+    "pl": "ID utworu wydania MusicBrainz",
+    "el": "Αναγνωριστικό κομματιού έκδοσης MusicBrainz"
   },
   "metafield.release_country": {
     "fr": "Pays de sortie",
@@ -851,7 +1031,10 @@
     "ro": "Țara de lansare",
     "sv": "Utgivningsland",
     "hu": "Megjelenés országa",
-    "vi": "Quốc gia phát hành"
+    "vi": "Quốc gia phát hành",
+    "nb": "Utgivelsesland",
+    "pl": "Kraj wydania",
+    "el": "Χώρα έκδοσης"
   },
   "metafield.copyright": {
     "fr": "Copyright",
@@ -865,7 +1048,10 @@
     "ro": "Copyright",
     "sv": "Copyright",
     "hu": "Szerzői jog",
-    "vi": "Bản quyền"
+    "vi": "Bản quyền",
+    "nb": "Opphavsrett",
+    "pl": "Prawa autorskie",
+    "el": "Πνευματικά δικαιώματα"
   },
   "metafield.language": {
     "fr": "Langue",
@@ -879,7 +1065,10 @@
     "ro": "Limbă",
     "sv": "Språk",
     "hu": "Nyelv",
-    "vi": "Ngôn ngữ"
+    "vi": "Ngôn ngữ",
+    "nb": "Språk",
+    "pl": "Język",
+    "el": "Γλώσσα"
   },
   "metafield.rg_track_gain": {
     "fr": "ReplayGain piste",
@@ -893,7 +1082,10 @@
     "ro": "ReplayGain piesă",
     "sv": "ReplayGain spår",
     "hu": "ReplayGain (szám)",
-    "vi": "ReplayGain bài hát"
+    "vi": "ReplayGain bài hát",
+    "nb": "ReplayGain spor",
+    "pl": "ReplayGain utworu",
+    "el": "ReplayGain κομματιού"
   },
   "metafield.rg_album_gain": {
     "fr": "ReplayGain album",
@@ -907,7 +1099,10 @@
     "ro": "ReplayGain album",
     "sv": "ReplayGain album",
     "hu": "ReplayGain (album)",
-    "vi": "ReplayGain album"
+    "vi": "ReplayGain album",
+    "nb": "ReplayGain album",
+    "pl": "ReplayGain albumu",
+    "el": "ReplayGain άλμπουμ"
   },
   "metacat.Identification": {
     "fr": "Identification",
@@ -921,7 +1116,10 @@
     "ro": "Identificare",
     "sv": "Identifiering",
     "hu": "Azonosítás",
-    "vi": "Nhận dạng"
+    "vi": "Nhận dạng",
+    "nb": "Identifikasjon",
+    "pl": "Identyfikacja",
+    "el": "Αναγνώριση"
   },
   "metacat.Crédits": {
     "fr": "Crédits",
@@ -935,7 +1133,10 @@
     "ro": "Credite",
     "sv": "Medverkande",
     "hu": "Közreműködők",
-    "vi": "Ghi công"
+    "vi": "Ghi công",
+    "nb": "Medvirkende",
+    "pl": "Autorzy",
+    "el": "Συντελεστές"
   },
   "metacat.Classification": {
     "fr": "Classification",
@@ -949,7 +1150,10 @@
     "ro": "Clasificare",
     "sv": "Klassificering",
     "hu": "Besorolás",
-    "vi": "Phân loại"
+    "vi": "Phân loại",
+    "nb": "Klassifisering",
+    "pl": "Klasyfikacja",
+    "el": "Ταξινόμηση"
   },
   "metacat.Texte": {
     "fr": "Texte",
@@ -963,7 +1167,10 @@
     "ro": "Text",
     "sv": "Text",
     "hu": "Szöveg",
-    "vi": "Văn bản"
+    "vi": "Văn bản",
+    "nb": "Tekst",
+    "pl": "Tekst",
+    "el": "Κείμενο"
   },
   "metacat.Identifiants": {
     "fr": "Identifiants",
@@ -977,7 +1184,10 @@
     "ro": "Identificatori",
     "sv": "Identifierare",
     "hu": "Azonosítók",
-    "vi": "Mã định danh"
+    "vi": "Mã định danh",
+    "nb": "Identifikatorer",
+    "pl": "Identyfikatory",
+    "el": "Αναγνωριστικά"
   },
   "metacat.Dates": {
     "fr": "Dates",
@@ -991,7 +1201,10 @@
     "ro": "Date",
     "sv": "Datum",
     "hu": "Dátumok",
-    "vi": "Ngày tháng"
+    "vi": "Ngày tháng",
+    "nb": "Datoer",
+    "pl": "Daty",
+    "el": "Ημερομηνίες"
   },
   "metacat.Technique": {
     "fr": "Technique",
@@ -1005,7 +1218,10 @@
     "ro": "Tehnic",
     "sv": "Tekniskt",
     "hu": "Műszaki adatok",
-    "vi": "Kỹ thuật"
+    "vi": "Kỹ thuật",
+    "nb": "Teknisk",
+    "pl": "Dane techniczne",
+    "el": "Τεχνικά"
   },
   "metacat.ReplayGain": {
     "fr": "ReplayGain",
@@ -1019,7 +1235,10 @@
     "ro": "ReplayGain",
     "sv": "ReplayGain",
     "hu": "ReplayGain",
-    "vi": "ReplayGain"
+    "vi": "ReplayGain",
+    "nb": "ReplayGain",
+    "pl": "ReplayGain",
+    "el": "ReplayGain"
   },
   "svctok.musicbrainz.purpose": {
     "fr": "Années + crédits + couvertures (ID releases).",
@@ -1033,7 +1252,10 @@
     "ro": "Ani + credite + coperți (ID-uri de lansare).",
     "sv": "År + medverkande + omslag (release-ID:n).",
     "hu": "Évek + közreműködők + borítók (kiadás-azonosítók).",
-    "vi": "Năm + ghi công + ảnh bìa (ID phát hành)."
+    "vi": "Năm + ghi công + ảnh bìa (ID phát hành).",
+    "nb": "År + medvirkende + omslag (utgivelses-ID-er).",
+    "pl": "Lata + autorzy + okładki (ID wydań).",
+    "el": "Έτη + συντελεστές + εξώφυλλα (αναγνωριστικά εκδόσεων)."
   },
   "svctok.musicbrainz.pricing": {
     "fr": "100 % gratuit, base de données ouverte.",
@@ -1047,7 +1269,10 @@
     "ro": "100% gratuit, bază de date deschisă.",
     "sv": "100 % gratis, öppen databas.",
     "hu": "100% ingyenes, nyílt adatbázis.",
-    "vi": "Miễn phí 100%, cơ sở dữ liệu mở."
+    "vi": "Miễn phí 100%, cơ sở dữ liệu mở.",
+    "nb": "100 % gratis, åpen database.",
+    "pl": "W 100% bezpłatna, otwarta baza danych.",
+    "el": "100% δωρεάν, ανοιχτή βάση δεδομένων."
   },
   "svctok.musicbrainz.step1": {
     "fr": "Aucun token requis — MusicBrainz est gratuit et anonyme.",
@@ -1061,7 +1286,10 @@
     "ro": "Niciun token necesar — MusicBrainz este gratuit și anonim.",
     "sv": "Ingen token krävs — MusicBrainz är gratis och anonymt.",
     "hu": "Nem kell token — a MusicBrainz ingyenes és névtelen.",
-    "vi": "Không cần token — MusicBrainz miễn phí và ẩn danh."
+    "vi": "Không cần token — MusicBrainz miễn phí và ẩn danh.",
+    "nb": "Ingen token nødvendig – MusicBrainz er gratis og anonym.",
+    "pl": "Token nie jest potrzebny — MusicBrainz jest bezpłatny i anonimowy.",
+    "el": "Δεν απαιτείται token — το MusicBrainz είναι δωρεάν και ανώνυμο."
   },
   "svctok.discogs.purpose": {
     "fr": "Années + couvertures + crédits pour pressages obscurs.",
@@ -1075,7 +1303,10 @@
     "ro": "Ani + coperți + credite pentru presaje obscure.",
     "sv": "År + omslag + medverkande för ovanliga pressningar.",
     "hu": "Évek + borítók + közreműködők ritka préselésekhez.",
-    "vi": "Năm + ảnh bìa + ghi công cho các bản ép hiếm."
+    "vi": "Năm + ảnh bìa + ghi công cho các bản ép hiếm.",
+    "nb": "År + omslag + medvirkende for obskure utgaver.",
+    "pl": "Lata + okładki + autorzy dla rzadkich tłoczeń.",
+    "el": "Έτη + εξώφυλλα + συντελεστές για σπάνιες εκδόσεις."
   },
   "svctok.discogs.pricing": {
     "fr": "Compte + token personnel gratuits ; API gratuite avec quota (60 req/min).",
@@ -1089,7 +1320,10 @@
     "ro": "Cont + token personal gratuite; API gratuit cu cotă (60 req/min).",
     "sv": "Gratis konto + personlig token; gratis API med kvot (60 req/min).",
     "hu": "Ingyenes fiók + személyes token; ingyenes API kvótával (60 kérés/perc).",
-    "vi": "Tài khoản miễn phí + token cá nhân; API miễn phí có hạn mức (60 yêu cầu/phút)."
+    "vi": "Tài khoản miễn phí + token cá nhân; API miễn phí có hạn mức (60 yêu cầu/phút).",
+    "nb": "Gratis konto + personlig token; gratis API med kvote (60 forespørsler/min).",
+    "pl": "Bezpłatne konto + osobisty token; bezpłatne API z limitem (60 zapytań/min).",
+    "el": "Δωρεάν λογαριασμός + προσωπικό token· δωρεάν API με όριο (60 αιτήματα/λεπτό)."
   },
   "svctok.discogs.step1": {
     "fr": "Connecte-toi sur discogs.com.",
@@ -1103,7 +1337,10 @@
     "ro": "Autentifică-te pe discogs.com.",
     "sv": "Logga in på discogs.com.",
     "hu": "Jelentkezzen be a discogs.com oldalon.",
-    "vi": "Đăng nhập vào discogs.com."
+    "vi": "Đăng nhập vào discogs.com.",
+    "nb": "Logg inn på discogs.com.",
+    "pl": "Zaloguj się na discogs.com.",
+    "el": "Συνδεθείτε στο discogs.com."
   },
   "svctok.discogs.step2": {
     "fr": "Va dans Settings → Developers.",
@@ -1117,7 +1354,10 @@
     "ro": "Mergi la Settings → Developers.",
     "sv": "Gå till Settings → Developers.",
     "hu": "Nyissa meg: Settings → Developers.",
-    "vi": "Vào Settings → Developers."
+    "vi": "Vào Settings → Developers.",
+    "nb": "Gå til Settings → Developers.",
+    "pl": "Przejdź do Settings → Developers.",
+    "el": "Μεταβείτε στο Settings → Developers."
   },
   "svctok.discogs.step3": {
     "fr": "Clique 'Generate new token'.",
@@ -1131,7 +1371,10 @@
     "ro": "Apasă „Generate new token”.",
     "sv": "Klicka på 'Generate new token'.",
     "hu": "Kattintson a „Generate new token” gombra.",
-    "vi": "Nhấn “Generate new token”."
+    "vi": "Nhấn “Generate new token”.",
+    "nb": "Klikk på «Generate new token».",
+    "pl": "Kliknij „Generate new token”.",
+    "el": "Κάντε κλικ στο «Generate new token»."
   },
   "svctok.discogs.step4": {
     "fr": "Colle le token ici.",
@@ -1145,7 +1388,10 @@
     "ro": "Lipește token-ul aici.",
     "sv": "Klistra in token här.",
     "hu": "Illessze be ide a tokent.",
-    "vi": "Dán token vào đây."
+    "vi": "Dán token vào đây.",
+    "nb": "Lim inn tokenet her.",
+    "pl": "Wklej token tutaj.",
+    "el": "Επικολλήστε εδώ το token."
   },
   "svctok.lastfm.purpose": {
     "fr": "Genres + scrobbling.",
@@ -1159,7 +1405,10 @@
     "ro": "Genuri + scrobbling.",
     "sv": "Genrer + scrobbling.",
     "hu": "Műfajok + scrobbling.",
-    "vi": "Thể loại + scrobbling."
+    "vi": "Thể loại + scrobbling.",
+    "nb": "Sjangre + scrobbling.",
+    "pl": "Gatunki + scrobbling.",
+    "el": "Είδη + scrobbling."
   },
   "svctok.lastfm.pricing": {
     "fr": "API gratuite pour usage non commercial.",
@@ -1173,7 +1422,10 @@
     "ro": "API gratuit pentru uz necomercial.",
     "sv": "Gratis API för icke-kommersiellt bruk.",
     "hu": "Ingyenes API nem kereskedelmi használatra.",
-    "vi": "API miễn phí cho mục đích phi thương mại."
+    "vi": "API miễn phí cho mục đích phi thương mại.",
+    "nb": "Gratis API for ikke-kommersiell bruk.",
+    "pl": "Bezpłatne API do użytku niekomercyjnego.",
+    "el": "Δωρεάν API για μη εμπορική χρήση."
   },
   "svctok.lastfm.step1": {
     "fr": "Va sur last.fm/api/account/create",
@@ -1187,7 +1439,10 @@
     "ro": "Mergi la last.fm/api/account/create",
     "sv": "Gå till last.fm/api/account/create",
     "hu": "Nyissa meg: last.fm/api/account/create",
-    "vi": "Truy cập last.fm/api/account/create"
+    "vi": "Truy cập last.fm/api/account/create",
+    "nb": "Gå til last.fm/api/account/create",
+    "pl": "Przejdź do last.fm/api/account/create",
+    "el": "Μεταβείτε στο last.fm/api/account/create"
   },
   "svctok.lastfm.step2": {
     "fr": "Renseigne un nom d'application.",
@@ -1201,7 +1456,10 @@
     "ro": "Introdu un nume de aplicație.",
     "sv": "Ange ett programnamn.",
     "hu": "Adja meg az alkalmazás nevét.",
-    "vi": "Nhập tên ứng dụng."
+    "vi": "Nhập tên ứng dụng.",
+    "nb": "Skriv inn et programnavn.",
+    "pl": "Wpisz nazwę aplikacji.",
+    "el": "Εισαγάγετε ένα όνομα εφαρμογής."
   },
   "svctok.lastfm.step3": {
     "fr": "Récupère 'API key' et 'Shared secret'.",
@@ -1215,7 +1473,10 @@
     "ro": "Obține „API key” și „Shared secret”.",
     "sv": "Hämta din 'API key' och 'Shared secret'.",
     "hu": "Másolja ki az „API key” és a „Shared secret” értékét.",
-    "vi": "Lấy “API key” và “Shared secret”."
+    "vi": "Lấy “API key” và “Shared secret”.",
+    "nb": "Hent «API key» og «Shared secret».",
+    "pl": "Pobierz „API key” i „Shared secret”.",
+    "el": "Αντιγράψτε το «API key» και το «Shared secret»."
   },
   "svctok.lastfm.step4": {
     "fr": "Colle ici puis Enregistrer.",
@@ -1229,7 +1490,10 @@
     "ro": "Lipește aici, apoi Salvează.",
     "sv": "Klistra in här och spara sedan.",
     "hu": "Illessze be ide, majd mentse.",
-    "vi": "Dán vào đây rồi Lưu."
+    "vi": "Dán vào đây rồi Lưu.",
+    "nb": "Lim inn her og trykk Lagre.",
+    "pl": "Wklej tutaj, a następnie kliknij Zapisz.",
+    "el": "Επικολλήστε εδώ και πατήστε Αποθήκευση."
   },
   "svctok.lastfm.fieldApiSecret": {
     "fr": "API Secret (pour scrobbling)",
@@ -1243,7 +1507,10 @@
     "ro": "API Secret (pentru scrobbling)",
     "sv": "API Secret (för scrobbling)",
     "hu": "API Secret (a scrobblinghoz)",
-    "vi": "API Secret (để scrobbling)"
+    "vi": "API Secret (để scrobbling)",
+    "nb": "API-hemmelighet (for scrobbling)",
+    "pl": "Sekret API (do scrobblingu)",
+    "el": "Μυστικό API (για scrobbling)"
   },
   "svctok.genius.purpose": {
     "fr": "Paroles.",
@@ -1257,7 +1524,10 @@
     "ro": "Versuri.",
     "sv": "Sångtexter.",
     "hu": "Dalszövegek.",
-    "vi": "Lời bài hát."
+    "vi": "Lời bài hát.",
+    "nb": "Sangtekster.",
+    "pl": "Teksty utworów.",
+    "el": "Στίχοι."
   },
   "svctok.genius.pricing": {
     "fr": "API gratuite.",
@@ -1271,7 +1541,10 @@
     "ro": "API gratuit.",
     "sv": "Gratis API.",
     "hu": "Ingyenes API.",
-    "vi": "API miễn phí."
+    "vi": "API miễn phí.",
+    "nb": "Gratis API.",
+    "pl": "Bezpłatne API.",
+    "el": "Δωρεάν API."
   },
   "svctok.genius.step1": {
     "fr": "Crée un compte sur genius.com.",
@@ -1285,7 +1558,10 @@
     "ro": "Creează un cont pe genius.com.",
     "sv": "Skapa ett konto på genius.com.",
     "hu": "Hozzon létre fiókot a genius.com oldalon.",
-    "vi": "Tạo tài khoản trên genius.com."
+    "vi": "Tạo tài khoản trên genius.com.",
+    "nb": "Opprett en konto på genius.com.",
+    "pl": "Załóż konto na genius.com.",
+    "el": "Δημιουργήστε λογαριασμό στο genius.com."
   },
   "svctok.genius.step2": {
     "fr": "Va dans API Clients.",
@@ -1299,7 +1575,10 @@
     "ro": "Mergi la API Clients.",
     "sv": "Gå till API Clients.",
     "hu": "Nyissa meg az API Clients oldalt.",
-    "vi": "Vào API Clients."
+    "vi": "Vào API Clients.",
+    "nb": "Gå til API Clients.",
+    "pl": "Przejdź do API Clients.",
+    "el": "Μεταβείτε στο API Clients."
   },
   "svctok.genius.step3": {
     "fr": "Crée une application et copie le token.",
@@ -1313,7 +1592,10 @@
     "ro": "Creează o aplicație și copiază token-ul.",
     "sv": "Skapa ett program och kopiera token.",
     "hu": "Hozzon létre egy alkalmazást, és másolja ki a tokent.",
-    "vi": "Tạo một ứng dụng và sao chép token."
+    "vi": "Tạo một ứng dụng và sao chép token.",
+    "nb": "Opprett et program og kopier tokenet.",
+    "pl": "Utwórz aplikację i skopiuj token.",
+    "el": "Δημιουργήστε μια εφαρμογή και αντιγράψτε το token."
   },
   "svctok.radiofrance.purpose": {
     "fr": "Podcasts et émissions de Radio France.",
@@ -1327,7 +1609,10 @@
     "ro": "Podcasturi și emisiuni Radio France.",
     "sv": "Poddar och program från Radio France.",
     "hu": "Radio France podcastok és műsorok.",
-    "vi": "Podcast và chương trình của Radio France."
+    "vi": "Podcast và chương trình của Radio France.",
+    "nb": "Radio France-podkaster og -programmer.",
+    "pl": "Podcasty i audycje Radio France.",
+    "el": "Podcast και εκπομπές του Radio France."
   },
   "svctok.radiofrance.pricing": {
     "fr": "API gratuite.",
@@ -1341,7 +1626,10 @@
     "ro": "API gratuit.",
     "sv": "Gratis API.",
     "hu": "Ingyenes API.",
-    "vi": "API miễn phí."
+    "vi": "API miễn phí.",
+    "nb": "Gratis API.",
+    "pl": "Bezpłatne API.",
+    "el": "Δωρεάν API."
   },
   "svctok.radiofrance.step1": {
     "fr": "Crée un compte sur developers.radiofrance.fr.",
@@ -1355,7 +1643,10 @@
     "ro": "Creează un cont pe developers.radiofrance.fr.",
     "sv": "Skapa ett konto på developers.radiofrance.fr.",
     "hu": "Hozzon létre fiókot a developers.radiofrance.fr oldalon.",
-    "vi": "Tạo tài khoản trên developers.radiofrance.fr."
+    "vi": "Tạo tài khoản trên developers.radiofrance.fr.",
+    "nb": "Opprett en konto på developers.radiofrance.fr.",
+    "pl": "Załóż konto na developers.radiofrance.fr.",
+    "el": "Δημιουργήστε λογαριασμό στο developers.radiofrance.fr."
   },
   "svctok.radiofrance.step2": {
     "fr": "Demande l'accès à l'API Open Radio France.",
@@ -1369,7 +1660,10 @@
     "ro": "Solicită acces la API-ul Open Radio France.",
     "sv": "Begär åtkomst till Open Radio France-API:et.",
     "hu": "Kérjen hozzáférést az Open Radio France API-hoz.",
-    "vi": "Yêu cầu quyền truy cập Open Radio France API."
+    "vi": "Yêu cầu quyền truy cập Open Radio France API.",
+    "nb": "Be om tilgang til Open Radio France API.",
+    "pl": "Poproś o dostęp do Open Radio France API.",
+    "el": "Ζητήστε πρόσβαση στο Open Radio France API."
   },
   "svctok.radiofrance.step3": {
     "fr": "Copie la clé API et colle-la ici.",
@@ -1383,7 +1677,10 @@
     "ro": "Copiază cheia API și lipește-o aici.",
     "sv": "Kopiera API-nyckeln och klistra in den här.",
     "hu": "Másolja ki az API-kulcsot, és illessze be ide.",
-    "vi": "Sao chép khóa API và dán vào đây."
+    "vi": "Sao chép khóa API và dán vào đây.",
+    "nb": "Kopier API-nøkkelen og lim den inn her.",
+    "pl": "Skopiuj klucz API i wklej go tutaj.",
+    "el": "Αντιγράψτε το κλειδί API και επικολλήστε το εδώ."
   },
   "svctok.tidal.purpose": {
     "fr": "Streaming hi-res + années + couvertures.",
@@ -1397,7 +1694,10 @@
     "ro": "Streaming hi-res + ani + coperți.",
     "sv": "Hi-res-streaming + år + omslag.",
     "hu": "Hi-res streaming + évek + borítók.",
-    "vi": "Streaming hi-res + năm + ảnh bìa."
+    "vi": "Streaming hi-res + năm + ảnh bìa.",
+    "nb": "Hi-res-strømming + år + omslag.",
+    "pl": "Strumieniowanie hi-res + lata + okładki.",
+    "el": "Streaming hi-res + έτη + εξώφυλλα."
   },
   "svctok.tidal.pricing": {
     "fr": "Abonnement Tidal HiFi requis (≈ 11€/mois).",
@@ -1411,7 +1711,10 @@
     "ro": "Este necesar un abonament Tidal HiFi (≈ 11€/lună).",
     "sv": "Tidal HiFi-abonnemang krävs (≈ 11€/månad).",
     "hu": "Tidal HiFi előfizetés szükséges (≈ 11 €/hó).",
-    "vi": "Cần gói Tidal HiFi (≈ 11€/tháng)."
+    "vi": "Cần gói Tidal HiFi (≈ 11€/tháng).",
+    "nb": "Krever Tidal HiFi-abonnement (ca. 11 €/måned).",
+    "pl": "Wymagana subskrypcja Tidal HiFi (ok. 11 €/miesiąc).",
+    "el": "Απαιτείται συνδρομή Tidal HiFi (≈ 11 €/μήνα)."
   },
   "svctok.tidal.step1": {
     "fr": "Tidal utilise OAuth — utilise la page Streaming → Tidal pour te connecter.",
@@ -1425,7 +1728,10 @@
     "ro": "Tidal folosește OAuth — folosește pagina Streaming → Tidal pentru a te conecta.",
     "sv": "Tidal använder OAuth — använd sidan Streaming → Tidal för att ansluta.",
     "hu": "A Tidal OAuth-t használ — a csatlakozáshoz használja a Streaming → Tidal oldalt.",
-    "vi": "Tidal dùng OAuth — hãy dùng trang Streaming → Tidal để kết nối."
+    "vi": "Tidal dùng OAuth — hãy dùng trang Streaming → Tidal để kết nối.",
+    "nb": "Tidal bruker OAuth – bruk siden Strømming → Tidal for å koble til.",
+    "pl": "Tidal używa OAuth — połącz się na stronie Streaming → Tidal.",
+    "el": "Το Tidal χρησιμοποιεί OAuth — χρησιμοποιήστε τη σελίδα Streaming → Tidal για σύνδεση."
   },
   "svctok.qobuz.purpose": {
     "fr": "Streaming hi-res + années + couvertures.",
@@ -1439,7 +1745,10 @@
     "ro": "Streaming hi-res + ani + coperți.",
     "sv": "Hi-res-streaming + år + omslag.",
     "hu": "Hi-res streaming + évek + borítók.",
-    "vi": "Streaming hi-res + năm + ảnh bìa."
+    "vi": "Streaming hi-res + năm + ảnh bìa.",
+    "nb": "Hi-res-strømming + år + omslag.",
+    "pl": "Strumieniowanie hi-res + lata + okładki.",
+    "el": "Streaming hi-res + έτη + εξώφυλλα."
   },
   "svctok.qobuz.pricing": {
     "fr": "Abonnement Qobuz Studio requis (≈ 13€/mois).",
@@ -1453,7 +1762,10 @@
     "ro": "Este necesar un abonament Qobuz Studio (≈ 13€/lună).",
     "sv": "Qobuz Studio-abonnemang krävs (≈ 13€/månad).",
     "hu": "Qobuz Studio előfizetés szükséges (≈ 13 €/hó).",
-    "vi": "Cần gói Qobuz Studio (≈ 13€/tháng)."
+    "vi": "Cần gói Qobuz Studio (≈ 13€/tháng).",
+    "nb": "Krever Qobuz Studio-abonnement (ca. 13 €/måned).",
+    "pl": "Wymagana subskrypcja Qobuz Studio (ok. 13 €/miesiąc).",
+    "el": "Απαιτείται συνδρομή Qobuz Studio (≈ 13 €/μήνα)."
   },
   "svctok.qobuz.step1": {
     "fr": "Qobuz utilise login/password — utilise la page Streaming → Qobuz pour te connecter.",
@@ -1467,7 +1779,10 @@
     "ro": "Qobuz folosește login/parolă — folosește pagina Streaming → Qobuz pentru a te conecta.",
     "sv": "Qobuz använder inloggning/lösenord — använd sidan Streaming → Qobuz för att ansluta.",
     "hu": "A Qobuz felhasználónevet és jelszót használ — a csatlakozáshoz használja a Streaming → Qobuz oldalt.",
-    "vi": "Qobuz dùng tên đăng nhập/mật khẩu — hãy dùng trang Streaming → Qobuz để kết nối."
+    "vi": "Qobuz dùng tên đăng nhập/mật khẩu — hãy dùng trang Streaming → Qobuz để kết nối.",
+    "nb": "Qobuz bruker brukernavn og passord – bruk siden Strømming → Qobuz for å koble til.",
+    "pl": "Qobuz używa loginu i hasła — połącz się na stronie Streaming → Qobuz.",
+    "el": "Το Qobuz χρησιμοποιεί όνομα χρήστη/κωδικό — χρησιμοποιήστε τη σελίδα Streaming → Qobuz για σύνδεση."
   },
   "svctok.spotify.purpose": {
     "fr": "Streaming + connectivité.",
@@ -1481,7 +1796,10 @@
     "ro": "Streaming + conectivitate.",
     "sv": "Streaming + anslutning.",
     "hu": "Streaming + csatlakoztathatóság.",
-    "vi": "Streaming + kết nối."
+    "vi": "Streaming + kết nối.",
+    "nb": "Strømming + tilkobling.",
+    "pl": "Strumieniowanie + łączność.",
+    "el": "Streaming + συνδεσιμότητα."
   },
   "svctok.spotify.pricing": {
     "fr": "Compte Spotify gratuit ou Premium (≈ 11€/mois).",
@@ -1495,7 +1813,10 @@
     "ro": "Cont Spotify gratuit sau Premium (≈ 11€/lună).",
     "sv": "Gratis eller Premium Spotify-konto (≈ 11€/månad).",
     "hu": "Ingyenes vagy Premium Spotify-fiók (≈ 11 €/hó).",
-    "vi": "Tài khoản Spotify miễn phí hoặc Premium (≈ 11€/tháng)."
+    "vi": "Tài khoản Spotify miễn phí hoặc Premium (≈ 11€/tháng).",
+    "nb": "Gratis eller Premium Spotify-konto (ca. 11 €/måned).",
+    "pl": "Bezpłatne lub Premium konto Spotify (ok. 11 €/miesiąc).",
+    "el": "Δωρεάν ή Premium λογαριασμός Spotify (≈ 11 €/μήνα)."
   },
   "svctok.spotify.step1": {
     "fr": "Spotify utilise OAuth — utilise la page Streaming → Spotify pour te connecter.",
@@ -1509,7 +1830,10 @@
     "ro": "Spotify folosește OAuth — folosește pagina Streaming → Spotify pentru a te conecta.",
     "sv": "Spotify använder OAuth — använd sidan Streaming → Spotify för att ansluta.",
     "hu": "A Spotify OAuth-t használ — a csatlakozáshoz használja a Streaming → Spotify oldalt.",
-    "vi": "Spotify dùng OAuth — hãy dùng trang Streaming → Spotify để kết nối."
+    "vi": "Spotify dùng OAuth — hãy dùng trang Streaming → Spotify để kết nối.",
+    "nb": "Spotify bruker OAuth – bruk siden Strømming → Spotify for å koble til.",
+    "pl": "Spotify używa OAuth — połącz się na stronie Streaming → Spotify.",
+    "el": "Το Spotify χρησιμοποιεί OAuth — χρησιμοποιήστε τη σελίδα Streaming → Spotify για σύνδεση."
   },
   "svctok.deezer.purpose": {
     "fr": "Streaming.",
@@ -1523,7 +1847,10 @@
     "ro": "Streaming.",
     "sv": "Streaming.",
     "hu": "Streaming.",
-    "vi": "Streaming."
+    "vi": "Streaming.",
+    "nb": "Strømming.",
+    "pl": "Strumieniowanie.",
+    "el": "Streaming."
   },
   "svctok.deezer.pricing": {
     "fr": "Compte gratuit ou Deezer HiFi (≈ 12€/mois) pour FLAC.",
@@ -1537,7 +1864,10 @@
     "ro": "Cont gratuit sau Deezer HiFi (≈ 12€/lună) pentru FLAC.",
     "sv": "Gratis konto eller Deezer HiFi (≈ 12€/månad) för FLAC.",
     "hu": "Ingyenes fiók vagy Deezer HiFi (≈ 12 €/hó) a FLAC-hoz.",
-    "vi": "Tài khoản miễn phí hoặc Deezer HiFi (≈ 12€/tháng) để nghe FLAC."
+    "vi": "Tài khoản miễn phí hoặc Deezer HiFi (≈ 12€/tháng) để nghe FLAC.",
+    "nb": "Gratis konto eller Deezer HiFi (ca. 12 €/måned) for FLAC.",
+    "pl": "Bezpłatne konto lub Deezer HiFi (ok. 12 €/miesiąc) dla FLAC.",
+    "el": "Δωρεάν λογαριασμός ή Deezer HiFi (≈ 12 €/μήνα) για FLAC."
   },
   "svctok.deezer.step1": {
     "fr": "Connecte-toi sur deezer.com.",
@@ -1551,7 +1881,10 @@
     "ro": "Autentifică-te pe deezer.com.",
     "sv": "Logga in på deezer.com.",
     "hu": "Jelentkezzen be a deezer.com oldalon.",
-    "vi": "Đăng nhập vào deezer.com."
+    "vi": "Đăng nhập vào deezer.com.",
+    "nb": "Logg inn på deezer.com.",
+    "pl": "Zaloguj się na deezer.com.",
+    "el": "Συνδεθείτε στο deezer.com."
   },
   "svctok.deezer.step2": {
     "fr": "DevTools (F12) → Application → Cookies → cherche 'arl'.",
@@ -1565,7 +1898,10 @@
     "ro": "DevTools (F12) → Application → Cookies → caută „arl”.",
     "sv": "DevTools (F12) → Application → Cookies → leta efter 'arl'.",
     "hu": "DevTools (F12) → Application → Cookies → keresse az „arl” sütit.",
-    "vi": "DevTools (F12) → Application → Cookies → tìm “arl”."
+    "vi": "DevTools (F12) → Application → Cookies → tìm “arl”.",
+    "nb": "DevTools (F12) → Application → Cookies → se etter «arl».",
+    "pl": "DevTools (F12) → Application → Cookies → znajdź „arl”.",
+    "el": "DevTools (F12) → Application → Cookies → βρείτε το «arl»."
   },
   "svctok.deezer.step3": {
     "fr": "Colle le token ARL ici.",
@@ -1579,7 +1915,10 @@
     "ro": "Lipește token-ul ARL aici.",
     "sv": "Klistra in ARL-token här.",
     "hu": "Illessze be ide az ARL tokent.",
-    "vi": "Dán token ARL vào đây."
+    "vi": "Dán token ARL vào đây.",
+    "nb": "Lim inn ARL-tokenet her.",
+    "pl": "Wklej tutaj token ARL.",
+    "el": "Επικολλήστε εδώ το token ARL."
   },
   "svctok.deezer.fieldArl": {
     "fr": "ARL token (depuis cookies deezer.com)",
@@ -1593,7 +1932,10 @@
     "ro": "ARL token (din cookie-urile deezer.com)",
     "sv": "ARL token (från deezer.com-cookies)",
     "hu": "ARL token (a deezer.com sütijeiből)",
-    "vi": "Token ARL (từ cookie của deezer.com)"
+    "vi": "Token ARL (từ cookie của deezer.com)",
+    "nb": "ARL-token (fra deezer.com-informasjonskapsler)",
+    "pl": "Token ARL (z ciasteczek deezer.com)",
+    "el": "Token ARL (από τα cookies του deezer.com)"
   },
   "svctok.err.discogsNotConfigured": {
     "fr": "Token Discogs non configuré.",
@@ -1607,7 +1949,10 @@
     "ro": "Token Discogs neconfigurat.",
     "sv": "Discogs-token är inte konfigurerad.",
     "hu": "Nincs beállítva Discogs token.",
-    "vi": "Chưa cấu hình token Discogs."
+    "vi": "Chưa cấu hình token Discogs.",
+    "nb": "Discogs-token er ikke konfigurert.",
+    "pl": "Token Discogs nie jest skonfigurowany.",
+    "el": "Το token του Discogs δεν έχει ρυθμιστεί."
   },
   "svctok.err.lastfmNotConfigured": {
     "fr": "API Key Last.fm non configurée.",
@@ -1621,7 +1966,10 @@
     "ro": "API Key Last.fm neconfigurat.",
     "sv": "Last.fm API Key är inte konfigurerad.",
     "hu": "Nincs beállítva Last.fm API-kulcs.",
-    "vi": "Chưa cấu hình khóa API Last.fm."
+    "vi": "Chưa cấu hình khóa API Last.fm.",
+    "nb": "Last.fm API-nøkkel er ikke konfigurert.",
+    "pl": "Klucz API Last.fm nie jest skonfigurowany.",
+    "el": "Το κλειδί API του Last.fm δεν έχει ρυθμιστεί."
   },
   "svctok.err.tokenConfiguredNoValidation": {
     "fr": "Token configuré (validation non disponible).",
@@ -1635,7 +1983,10 @@
     "ro": "Token configurat (validare indisponibilă).",
     "sv": "Token konfigurerad (validering ej tillgänglig).",
     "hu": "A token be van állítva (ellenőrzés nem érhető el).",
-    "vi": "Đã cấu hình token (không thể kiểm tra)."
+    "vi": "Đã cấu hình token (không thể kiểm tra).",
+    "nb": "Token er konfigurert (validering er ikke tilgjengelig).",
+    "pl": "Token skonfigurowany (weryfikacja niedostępna).",
+    "el": "Το token έχει ρυθμιστεί (η επικύρωση δεν είναι διαθέσιμη)."
   },
   "svctok.err.geniusNotConfigured": {
     "fr": "Token Genius non configuré.",
@@ -1649,7 +2000,10 @@
     "ro": "Token Genius neconfigurat.",
     "sv": "Genius-token är inte konfigurerad.",
     "hu": "Nincs beállítva Genius token.",
-    "vi": "Chưa cấu hình token Genius."
+    "vi": "Chưa cấu hình token Genius.",
+    "nb": "Genius-token er ikke konfigurert.",
+    "pl": "Token Genius nie jest skonfigurowany.",
+    "el": "Το token του Genius δεν έχει ρυθμιστεί."
   },
   "svctok.err.radiofranceNotConfigured": {
     "fr": "Clé API Radio France non configurée.",
@@ -1663,7 +2017,10 @@
     "ro": "Cheia API Radio France neconfigurată.",
     "sv": "Radio France-API-nyckeln är inte konfigurerad.",
     "hu": "Nincs beállítva Radio France API-kulcs.",
-    "vi": "Chưa cấu hình khóa API Radio France."
+    "vi": "Chưa cấu hình khóa API Radio France.",
+    "nb": "Radio France API-nøkkel er ikke konfigurert.",
+    "pl": "Klucz API Radio France nie jest skonfigurowany.",
+    "el": "Το κλειδί API του Radio France δεν έχει ρυθμιστεί."
   },
   "ai.nextTrack": {
     "fr": "Piste suivante : {title}",
@@ -1677,7 +2034,10 @@
     "ro": "Piesa următoare: {title}",
     "sv": "Nästa spår: {title}",
     "hu": "Következő szám: {title}",
-    "vi": "Bài tiếp theo: {title}"
+    "vi": "Bài tiếp theo: {title}",
+    "nb": "Neste spor: {title}",
+    "pl": "Następny utwór: {title}",
+    "el": "Επόμενο κομμάτι: {title}"
   },
   "ai.volumeSet": {
     "fr": "Volume réglé à {value}%.",
@@ -1691,7 +2051,10 @@
     "ro": "Volum setat la {value}%.",
     "sv": "Volym inställd på {value} %.",
     "hu": "Hangerő beállítva: {value}%.",
-    "vi": "Đã đặt âm lượng {value}%."
+    "vi": "Đã đặt âm lượng {value}%.",
+    "nb": "Volumet er satt til {value} %.",
+    "pl": "Ustawiono głośność na {value}%.",
+    "el": "Η ένταση ορίστηκε στο {value}%."
   },
   "ai.volumeRaiseLimited": {
     "fr": "Je ne monte le volume que par petits pas : au plus {value}% pour l'instant. Rien n'a changé.",
@@ -1705,7 +2068,10 @@
     "ro": "Măresc volumul doar în pași mici: cel mult {value}% deocamdată. Nu s-a schimbat nimic.",
     "sv": "Jag höjer bara volymen i små steg: högst {value} % just nu. Inget har ändrats.",
     "hu": "A hangerőt csak kis lépésekben emelem: most legfeljebb {value}%. Semmi sem változott.",
-    "vi": "Tôi chỉ tăng âm lượng từng bước nhỏ: tối đa {value}% lúc này. Không có gì thay đổi."
+    "vi": "Tôi chỉ tăng âm lượng từng bước nhỏ: tối đa {value}% lúc này. Không có gì thay đổi.",
+    "nb": "Jeg øker bare volumet i små trinn: høyst {value} % for nå. Ingenting ble endret.",
+    "pl": "Zwiększam głośność tylko małymi krokami: na razie najwyżej do {value}%. Nic nie zostało zmienione.",
+    "el": "Αυξάνω την ένταση μόνο με μικρά βήματα: το πολύ {value}% προς το παρόν. Δεν άλλαξε τίποτα."
   },
   "ai.volumeRefused": {
     "fr": "Le volume n'a pas pu être réglé. Rien n'a changé.",
@@ -1719,7 +2085,10 @@
     "ro": "Volumul nu a putut fi setat. Nu s-a schimbat nimic.",
     "sv": "Volymen kunde inte ställas in. Inget har ändrats.",
     "hu": "A hangerőt nem sikerült beállítani. Semmi sem változott.",
-    "vi": "Không thể đặt âm lượng. Không có gì thay đổi."
+    "vi": "Không thể đặt âm lượng. Không có gì thay đổi.",
+    "nb": "Volumet kunne ikke settes. Ingenting ble endret.",
+    "pl": "Nie udało się ustawić głośności. Nic nie zostało zmienione.",
+    "el": "Δεν ήταν δυνατή η ρύθμιση της έντασης. Δεν άλλαξε τίποτα."
   },
   "ai.nowPlaying": {
     "fr": "En cours : {track} — {artist}",
@@ -1733,7 +2102,10 @@
     "ro": "Se redă acum: {track} — {artist}",
     "sv": "Spelas nu: {track} — {artist}",
     "hu": "Most szól: {track} — {artist}",
-    "vi": "Đang phát: {track} — {artist}"
+    "vi": "Đang phát: {track} — {artist}",
+    "nb": "Spiller nå: {track} – {artist}",
+    "pl": "Teraz gra: {track} — {artist}",
+    "el": "Παίζει τώρα: {track} — {artist}"
   },
   "ai.nothingPlaying": {
     "fr": "Rien ne joue actuellement.",
@@ -1747,7 +2119,10 @@
     "ro": "Nu se redă nimic în acest moment.",
     "sv": "Inget spelas just nu.",
     "hu": "Jelenleg semmi sem szól.",
-    "vi": "Hiện không có gì đang phát."
+    "vi": "Hiện không có gì đang phát.",
+    "nb": "Ingenting spilles akkurat nå.",
+    "pl": "Nic teraz nie gra.",
+    "el": "Δεν παίζει τίποτα αυτή τη στιγμή."
   },
   "ai.playingCount": {
     "fr": "▶ {title} — {artist} ({count} pistes)",
@@ -1761,7 +2136,10 @@
     "ro": "▶ {title} — {artist} ({count} piese)",
     "sv": "▶ {title} — {artist} ({count} spår)",
     "hu": "▶ {title} — {artist} ({count} szám)",
-    "vi": "▶ {title} — {artist} ({count} bài)"
+    "vi": "▶ {title} — {artist} ({count} bài)",
+    "nb": "▶ {title} – {artist} ({count} spor)",
+    "pl": "▶ {title} — {artist} (liczba utworów: {count})",
+    "el": "▶ {title} — {artist} ({count} κομμάτια)"
   },
   "ai.playing": {
     "fr": "▶ {title} — {artist}",
@@ -1775,7 +2153,10 @@
     "ro": "▶ {title} — {artist}",
     "sv": "▶ {title} — {artist}",
     "hu": "▶ {title} — {artist}",
-    "vi": "▶ {title} — {artist}"
+    "vi": "▶ {title} — {artist}",
+    "nb": "▶ {title} – {artist}",
+    "pl": "▶ {title} — {artist}",
+    "el": "▶ {title} — {artist}"
   },
   "ai.notFoundLibrary": {
     "fr": "Je n'ai rien trouvé pour « {query} » dans la bibliothèque.",
@@ -1789,7 +2170,10 @@
     "ro": "Nu am găsit nimic pentru „{query}” în biblioteca ta.",
     "sv": "Jag hittade inget för ”{query}” i ditt bibliotek.",
     "hu": "Nem találtam semmit erre: „{query}” a gyűjteményében.",
-    "vi": "Tôi không tìm thấy gì cho “{query}” trong thư viện của bạn."
+    "vi": "Tôi không tìm thấy gì cho “{query}” trong thư viện của bạn.",
+    "nb": "Jeg fant ingenting for «{query}» i biblioteket ditt.",
+    "pl": "Nie znalazłem niczego dla „{query}” w Twojej bibliotece.",
+    "el": "Δεν βρήκα τίποτα για «{query}» στη βιβλιοθήκη σας."
   },
   "ai.noResults": {
     "fr": "Aucun résultat pour « {query} ».",
@@ -1803,7 +2187,10 @@
     "ro": "Niciun rezultat pentru „{query}”.",
     "sv": "Inga resultat för ”{query}”.",
     "hu": "Nincs találat erre: „{query}”.",
-    "vi": "Không có kết quả cho “{query}”."
+    "vi": "Không có kết quả cho “{query}”.",
+    "nb": "Ingen treff for «{query}».",
+    "pl": "Brak wyników dla „{query}”.",
+    "el": "Κανένα αποτέλεσμα για «{query}»."
   },
   "ai.nArtists": {
     "fr": "{n} artiste(s)",
@@ -1817,7 +2204,10 @@
     "ro": "{n} artist/artiști",
     "sv": "{n} artist(er)",
     "hu": "{n} előadó",
-    "vi": "{n} nghệ sĩ"
+    "vi": "{n} nghệ sĩ",
+    "nb": "{n} artist(er)",
+    "pl": "Wykonawcy: {n}",
+    "el": "Καλλιτέχνες: {n}"
   },
   "ai.nAlbums": {
     "fr": "{n} album(s)",
@@ -1831,7 +2221,10 @@
     "ro": "{n} album(e)",
     "sv": "{n} album",
     "hu": "{n} album",
-    "vi": "{n} album"
+    "vi": "{n} album",
+    "nb": "{n} album",
+    "pl": "Albumy: {n}",
+    "el": "Άλμπουμ: {n}"
   },
   "ai.nTracks": {
     "fr": "{n} piste(s)",
@@ -1845,7 +2238,10 @@
     "ro": "{n} piesă/piese",
     "sv": "{n} spår",
     "hu": "{n} szám",
-    "vi": "{n} bài"
+    "vi": "{n} bài",
+    "nb": "{n} spor",
+    "pl": "Utwory: {n}",
+    "el": "Κομμάτια: {n}"
   },
   "ai.resultsFor": {
     "fr": "Résultats pour « {query} » : {parts}",
@@ -1859,7 +2255,10 @@
     "ro": "Rezultate pentru „{query}”: {parts}",
     "sv": "Resultat för ”{query}”: {parts}",
     "hu": "Találatok erre: „{query}”: {parts}",
-    "vi": "Kết quả cho “{query}”: {parts}"
+    "vi": "Kết quả cho “{query}”: {parts}",
+    "nb": "Treff for «{query}»: {parts}",
+    "pl": "Wyniki dla „{query}”: {parts}",
+    "el": "Αποτελέσματα για «{query}»: {parts}"
   },
   "ai.zonesAvailable": {
     "fr": "Zones disponibles : {zones}",
@@ -1873,7 +2272,10 @@
     "ro": "Zone disponibile: {zones}",
     "sv": "Tillgängliga zoner: {zones}",
     "hu": "Elérhető zónák: {zones}",
-    "vi": "Các vùng phát khả dụng: {zones}"
+    "vi": "Các vùng phát khả dụng: {zones}",
+    "nb": "Tilgjengelige soner: {zones}",
+    "pl": "Dostępne strefy: {zones}",
+    "el": "Διαθέσιμες ζώνες: {zones}"
   },
   "ai.noZone": {
     "fr": "Aucune zone trouvée.",
@@ -1887,7 +2289,10 @@
     "ro": "Nu s-a găsit nicio zonă.",
     "sv": "Inga zoner hittades.",
     "hu": "Nem található zóna.",
-    "vi": "Không tìm thấy vùng phát nào."
+    "vi": "Không tìm thấy vùng phát nào.",
+    "nb": "Ingen soner funnet.",
+    "pl": "Nie znaleziono żadnych stref.",
+    "el": "Δεν βρέθηκαν ζώνες."
   },
   "ai.notUnderstood": {
     "fr": "Désolé, je n'ai pas compris « {msg} ». Essayez « joue [artiste/album] » ou « cherche [terme] ».",
@@ -1901,7 +2306,10 @@
     "ro": "Îmi pare rău, nu am înțeles „{msg}”. Încearcă „redă [artist/album]” sau „caută [termen]”.",
     "sv": "Tyvärr, jag förstod inte ”{msg}”. Prova ”spela [artist/album]” eller ”sök [term]”.",
     "hu": "Elnézést, nem értettem: „{msg}”. Próbálja így: „play [előadó/album]” vagy „search [kifejezés]”.",
-    "vi": "Xin lỗi, tôi không hiểu “{msg}”. Hãy thử “play [nghệ sĩ/album]” hoặc “search [từ khóa]”."
+    "vi": "Xin lỗi, tôi không hiểu “{msg}”. Hãy thử “play [nghệ sĩ/album]” hoặc “search [từ khóa]”.",
+    "nb": "Beklager, jeg forsto ikke «{msg}». Prøv «spill [artist/album]» eller «søk [ord]».",
+    "pl": "Przepraszam, nie zrozumiałem „{msg}”. Spróbuj „odtwórz [wykonawca/album]” lub „szukaj [fraza]”.",
+    "el": "Λυπάμαι, δεν κατάλαβα το «{msg}». Δοκιμάστε «αναπαραγωγή [καλλιτέχνης/άλμπουμ]» ή «αναζήτηση [όρος]»."
   },
   "svctok.test.musicbrainz": {
     "fr": "MusicBrainz disponible (aucun token requis).",
@@ -1915,7 +2323,10 @@
     "ro": "MusicBrainz disponibil (niciun token necesar).",
     "sv": "MusicBrainz tillgängligt (ingen token krävs).",
     "hu": "MusicBrainz elérhető (nem kell token).",
-    "vi": "MusicBrainz khả dụng (không cần token)."
+    "vi": "MusicBrainz khả dụng (không cần token).",
+    "nb": "MusicBrainz er tilgjengelig (ingen token nødvendig).",
+    "pl": "MusicBrainz jest dostępny (token niepotrzebny).",
+    "el": "Το MusicBrainz είναι διαθέσιμο (δεν απαιτείται token)."
   },
   "svctok.deezer.connected": {
     "fr": "ARL accepté : connecté à Deezer ({user}).",
@@ -1929,7 +2340,10 @@
     "ro": "ARL acceptat: conectat la Deezer ({user}).",
     "sv": "ARL godkänd: ansluten till Deezer ({user}).",
     "hu": "ARL elfogadva: csatlakozva a Deezerhez ({user}).",
-    "vi": "Đã chấp nhận ARL: đã kết nối Deezer ({user})."
+    "vi": "Đã chấp nhận ARL: đã kết nối Deezer ({user}).",
+    "nb": "ARL godkjent: tilkoblet Deezer ({user}).",
+    "pl": "ARL zaakceptowany: połączono z Deezer ({user}).",
+    "el": "Το ARL έγινε δεκτό: συνδεθήκατε στο Deezer ({user})."
   },
   "svctok.spotify.clientIdSaved": {
     "fr": "Client ID Spotify enregistré. Vous pouvez maintenant vous connecter.",
@@ -1943,7 +2357,10 @@
     "ro": "Client ID Spotify salvat. Acum vă puteți conecta.",
     "sv": "Spotify Client ID sparat. Du kan nu logga in.",
     "hu": "Spotify Client ID elmentve. Most már bejelentkezhet.",
-    "vi": "Đã lưu Spotify Client ID. Giờ bạn có thể đăng nhập."
+    "vi": "Đã lưu Spotify Client ID. Giờ bạn có thể đăng nhập.",
+    "nb": "Spotify Client ID er lagret. Du kan nå logge inn.",
+    "pl": "Zapisano Spotify Client ID. Możesz się teraz zalogować.",
+    "el": "Το Spotify Client ID αποθηκεύτηκε. Μπορείτε πλέον να συνδεθείτε."
   },
   "svctok.spotify.clientIdInvalid": {
     "fr": "Ce n’est pas un Client ID Spotify : il se compose de lettres et de chiffres (32 caractères hexadécimaux), à copier depuis votre application sur developer.spotify.com.",
@@ -1957,7 +2374,10 @@
     "ro": "Acesta nu este un Client ID Spotify: este format din litere și cifre (32 de caractere hexazecimale), copiat din aplicația dvs. de pe developer.spotify.com.",
     "sv": "Detta är inget Spotify Client ID: det består av bokstäver och siffror (32 hexadecimala tecken), kopierat från din app på developer.spotify.com.",
     "hu": "Ez nem Spotify Client ID: betűkből és számjegyekből áll (32 hexadecimális karakter), és a developer.spotify.com oldalon lévő alkalmazásából kell kimásolni.",
-    "vi": "Đây không phải Spotify Client ID: mã này gồm chữ và số (32 ký tự thập lục phân), được sao chép từ ứng dụng của bạn trên developer.spotify.com."
+    "vi": "Đây không phải Spotify Client ID: mã này gồm chữ và số (32 ký tự thập lục phân), được sao chép từ ứng dụng của bạn trên developer.spotify.com.",
+    "nb": "Dette er ikke en Spotify Client ID: den består av bokstaver og sifre (32 heksadesimale tegn), kopiert fra appen din på developer.spotify.com.",
+    "pl": "To nie jest Spotify Client ID: składa się z liter i cyfr (32 znaki szesnastkowe) i jest kopiowany z Twojej aplikacji na developer.spotify.com.",
+    "el": "Αυτό δεν είναι Spotify Client ID: αποτελείται από γράμματα και ψηφία (32 δεκαεξαδικοί χαρακτήρες), αντιγραμμένο από την εφαρμογή σας στο developer.spotify.com."
   },
   "svctok.spotify.clientIdEnv": {
     "fr": "La variable TUNE_SPOTIFY_CLIENT_ID est posée sur ce serveur et l’emporte : modifiez-la, puis redémarrez le serveur.",
@@ -1971,7 +2391,10 @@
     "ro": "TUNE_SPOTIFY_CLIENT_ID este setată pe acest server și are prioritate: modificați-o, apoi reporniți serverul.",
     "sv": "TUNE_SPOTIFY_CLIENT_ID är satt på denna server och har företräde: ändra den och starta sedan om servern.",
     "hu": "Ezen a szerveren be van állítva a TUNE_SPOTIFY_CLIENT_ID, és ez élvez elsőbbséget: módosítsa, majd indítsa újra a szervert.",
-    "vi": "TUNE_SPOTIFY_CLIENT_ID đã được đặt trên máy chủ này và được ưu tiên: hãy thay đổi nó rồi khởi động lại máy chủ."
+    "vi": "TUNE_SPOTIFY_CLIENT_ID đã được đặt trên máy chủ này và được ưu tiên: hãy thay đổi nó rồi khởi động lại máy chủ.",
+    "nb": "TUNE_SPOTIFY_CLIENT_ID er satt på denne serveren og har forrang: endre den, og start deretter serveren på nytt.",
+    "pl": "Na tym serwerze ustawiono TUNE_SPOTIFY_CLIENT_ID i ma ona pierwszeństwo: zmień ją, a następnie uruchom serwer ponownie.",
+    "el": "Το TUNE_SPOTIFY_CLIENT_ID είναι ορισμένο σε αυτόν τον διακομιστή και υπερισχύει: αλλάξτε το και κατόπιν επανεκκινήστε τον διακομιστή."
   },
   "svctok.test.validationUnavailable": {
     "fr": "Validation non disponible pour ce service.",
@@ -1985,7 +2408,10 @@
     "ro": "Validare indisponibilă pentru acest serviciu.",
     "sv": "Validering är inte tillgänglig för den här tjänsten.",
     "hu": "Ennél a szolgáltatásnál az ellenőrzés nem érhető el.",
-    "vi": "Không thể kiểm tra với dịch vụ này."
+    "vi": "Không thể kiểm tra với dịch vụ này.",
+    "nb": "Validering er ikke tilgjengelig for denne tjenesten.",
+    "pl": "Weryfikacja jest niedostępna dla tej usługi.",
+    "el": "Η επικύρωση δεν είναι διαθέσιμη για αυτήν την υπηρεσία."
   },
   "svctok.err.generic": {
     "fr": "Erreur : {error}",
@@ -1999,7 +2425,10 @@
     "ro": "Eroare: {error}",
     "sv": "Fel: {error}",
     "hu": "Hiba: {error}",
-    "vi": "Lỗi: {error}"
+    "vi": "Lỗi: {error}",
+    "nb": "Feil: {error}",
+    "pl": "Błąd: {error}",
+    "el": "Σφάλμα: {error}"
   },
   "radio.addedTitle": {
     "fr": "✓ Radio ajoutée",
@@ -2013,7 +2442,10 @@
     "ro": "✓ Radio adăugat",
     "sv": "✓ Radio tillagd",
     "hu": "✓ Rádió hozzáadva",
-    "vi": "✓ Đã thêm đài"
+    "vi": "✓ Đã thêm đài",
+    "nb": "✓ Radio lagt til",
+    "pl": "✓ Dodano radio",
+    "el": "✓ Το ραδιόφωνο προστέθηκε"
   },
   "radio.addedBody": {
     "fr": "{name} a été ajoutée à vos favoris Tune.",
@@ -2027,7 +2459,10 @@
     "ro": "{name} a fost adăugat la favoritele tale Tune.",
     "sv": "{name} har lagts till bland dina Tune-favoriter.",
     "hu": "{name} bekerült a Tune kedvencei közé.",
-    "vi": "{name} đã được thêm vào mục yêu thích Tune của bạn."
+    "vi": "{name} đã được thêm vào mục yêu thích Tune của bạn.",
+    "nb": "{name} er lagt til i Tune-favorittene dine.",
+    "pl": "{name} zostało dodane do ulubionych w Tune.",
+    "el": "Το {name} προστέθηκε στα αγαπημένα σας στο Tune."
   },
   "radio.alreadyThereTitle": {
     "fr": "✓ Radio déjà présente",
@@ -2041,7 +2476,10 @@
     "ro": "✓ Radio deja prezent",
     "sv": "✓ Radion finns redan",
     "hu": "✓ A rádió már szerepel",
-    "vi": "✓ Đài đã có sẵn"
+    "vi": "✓ Đài đã có sẵn",
+    "nb": "✓ Radioen finnes allerede",
+    "pl": "✓ Radio już jest",
+    "el": "✓ Το ραδιόφωνο υπάρχει ήδη"
   },
   "radio.alreadyThereBody": {
     "fr": "{name} est déjà dans votre catalogue Tune. Elle a été remise dans vos favoris — aucun doublon n'a été créé.",
@@ -2055,7 +2493,10 @@
     "ro": "{name} este deja în catalogul tău Tune. A fost pusă din nou la favorite — nu a fost creat niciun duplicat.",
     "sv": "{name} finns redan i din Tune-katalog. Den har lagts tillbaka bland dina favoriter – ingen dubblett skapades.",
     "hu": "{name} már szerepel a Tune katalógusában. Visszakerült a kedvencei közé — nem jött létre másodpéldány.",
-    "vi": "{name} đã có trong danh mục Tune của bạn. Đài đã được đưa lại vào mục yêu thích — không tạo bản trùng lặp."
+    "vi": "{name} đã có trong danh mục Tune của bạn. Đài đã được đưa lại vào mục yêu thích — không tạo bản trùng lặp.",
+    "nb": "{name} finnes allerede i Tune-katalogen din. Den er lagt tilbake i favorittene dine – det ble ikke laget noen duplikat.",
+    "pl": "{name} jest już w Twoim katalogu Tune. Wróciło do ulubionych — nie utworzono duplikatu.",
+    "el": "Το {name} υπάρχει ήδη στον κατάλογό σας στο Tune. Επανήλθε στα αγαπημένα σας — δεν δημιουργήθηκε διπλότυπο."
   },
   "radio.canCloseTab": {
     "fr": "Vous pouvez fermer cet onglet.",
@@ -2069,7 +2510,10 @@
     "ro": "Poți închide această filă.",
     "sv": "Du kan stänga den här fliken.",
     "hu": "Bezárhatja ezt a lapot.",
-    "vi": "Bạn có thể đóng tab này."
+    "vi": "Bạn có thể đóng tab này.",
+    "nb": "Du kan lukke denne fanen.",
+    "pl": "Możesz zamknąć tę kartę.",
+    "el": "Μπορείτε να κλείσετε αυτήν την καρτέλα."
   },
   "radio.errorTitle": {
     "fr": "Erreur",
@@ -2083,7 +2527,10 @@
     "ro": "Eroare",
     "sv": "Fel",
     "hu": "Hiba",
-    "vi": "Lỗi"
+    "vi": "Lỗi",
+    "nb": "Feil",
+    "pl": "Błąd",
+    "el": "Σφάλμα"
   },
   "net.smbAccessDenied": {
     "fr": "Accès refusé (guest). Essayez avec un identifiant/mot de passe. ({error})",
@@ -2097,7 +2544,10 @@
     "ro": "Acces refuzat (guest). Încearcă cu un nume de utilizator/parolă. ({error})",
     "sv": "Åtkomst nekad (guest). Prova med användarnamn/lösenord. ({error})",
     "hu": "Hozzáférés megtagadva (vendég). Próbálja felhasználónévvel és jelszóval. ({error})",
-    "vi": "Truy cập bị từ chối (khách). Hãy thử với tên người dùng/mật khẩu. ({error})"
+    "vi": "Truy cập bị từ chối (khách). Hãy thử với tên người dùng/mật khẩu. ({error})",
+    "nb": "Tilgang nektet (gjest). Prøv med brukernavn og passord. ({error})",
+    "pl": "Odmowa dostępu (gość). Spróbuj z nazwą użytkownika i hasłem. ({error})",
+    "el": "Άρνηση πρόσβασης (επισκέπτης). Δοκιμάστε με όνομα χρήστη/κωδικό. ({error})"
   },
   "net.smbScanFailed": {
     "fr": "Impossible de scanner {host} : {error}",
@@ -2111,7 +2561,10 @@
     "ro": "Imposibil de scanat {host}: {error}",
     "sv": "Det gick inte att skanna {host}: {error}",
     "hu": "Nem sikerült átvizsgálni: {host}: {error}",
-    "vi": "Không thể quét {host}: {error}"
+    "vi": "Không thể quét {host}: {error}",
+    "nb": "Kunne ikke skanne {host}: {error}",
+    "pl": "Nie udało się przeskanować {host}: {error}",
+    "el": "Αδυναμία σάρωσης του {host}: {error}"
   },
   "net.wifiCommandFailed": {
     "fr": "Échec de la commande réseau : {error}",
@@ -2125,7 +2578,10 @@
     "ro": "Comanda de rețea a eșuat: {error}",
     "sv": "Nätverkskommandot misslyckades: {error}",
     "hu": "A hálózati parancs sikertelen: {error}",
-    "vi": "Lệnh mạng thất bại: {error}"
+    "vi": "Lệnh mạng thất bại: {error}",
+    "nb": "Nettverkskommandoen mislyktes: {error}",
+    "pl": "Polecenie sieciowe nie powiodło się: {error}",
+    "el": "Η εντολή δικτύου απέτυχε: {error}"
   },
   "net.wifiUnavailable": {
     "fr": "Gestion WiFi indisponible sur cet appareil ({error})",
@@ -2139,7 +2595,10 @@
     "ro": "Gestionarea WiFi nu este disponibilă pe acest dispozitiv ({error})",
     "sv": "WiFi-hantering är inte tillgänglig på den här enheten ({error})",
     "hu": "A WiFi-kezelés nem érhető el ezen az eszközön ({error})",
-    "vi": "Không thể quản lý WiFi trên thiết bị này ({error})"
+    "vi": "Không thể quản lý WiFi trên thiết bị này ({error})",
+    "nb": "WiFi-administrasjon er ikke tilgjengelig på denne enheten ({error})",
+    "pl": "Zarządzanie WiFi jest niedostępne na tym urządzeniu ({error})",
+    "el": "Η διαχείριση WiFi δεν είναι διαθέσιμη σε αυτήν τη συσκευή ({error})"
   },
   "net.wifiTimeout": {
     "fr": "Délai dépassé lors de l'opération WiFi",
@@ -2153,7 +2612,10 @@
     "ro": "Operațiunea WiFi a expirat",
     "sv": "WiFi-åtgärden tog för lång tid",
     "hu": "A WiFi-művelet túllépte az időkorlátot",
-    "vi": "Thao tác WiFi đã hết thời gian chờ"
+    "vi": "Thao tác WiFi đã hết thời gian chờ",
+    "nb": "WiFi-operasjonen fikk tidsavbrudd",
+    "pl": "Przekroczono czas operacji WiFi",
+    "el": "Η λειτουργία WiFi έληξε λόγω χρονικού ορίου"
   },
   "net.wifiBadPassword": {
     "fr": "Mot de passe WiFi incorrect",
@@ -2167,7 +2629,10 @@
     "ro": "Parolă WiFi incorectă",
     "sv": "Felaktigt WiFi-lösenord",
     "hu": "Hibás WiFi-jelszó",
-    "vi": "Mật khẩu WiFi không đúng"
+    "vi": "Mật khẩu WiFi không đúng",
+    "nb": "Feil WiFi-passord",
+    "pl": "Nieprawidłowe hasło WiFi",
+    "el": "Λάθος κωδικός WiFi"
   },
   "svctok.listenbrainz.purpose": {
     "fr": "Scrobbling libre (MetaBrainz) — seul ou en plus de Last.fm (Premium).",
@@ -2181,7 +2646,10 @@
     "ro": "Scrobbling liber (MetaBrainz) — singur sau alături de Last.fm (Premium).",
     "sv": "Öppen scrobbling (MetaBrainz) — ensam eller vid sidan av Last.fm (Premium).",
     "hu": "Nyílt scrobbling (MetaBrainz) — önmagában vagy a Last.fm mellett (Premium).",
-    "vi": "Scrobbling mở (MetaBrainz) — dùng riêng hoặc cùng Last.fm (Premium)."
+    "vi": "Scrobbling mở (MetaBrainz) — dùng riêng hoặc cùng Last.fm (Premium).",
+    "nb": "Åpen scrobbling (MetaBrainz) – alene eller ved siden av Last.fm (Premium).",
+    "pl": "Otwarty scrobbling (MetaBrainz) — samodzielnie lub obok Last.fm (Premium).",
+    "el": "Ανοιχτό scrobbling (MetaBrainz) — μόνο του ή παράλληλα με το Last.fm (Premium)."
   },
   "svctok.listenbrainz.pricing": {
     "fr": "100 % gratuit et open source (MetaBrainz).",
@@ -2195,7 +2663,10 @@
     "ro": "100% gratuit și open source (MetaBrainz).",
     "sv": "100 % gratis och öppen källkod (MetaBrainz).",
     "hu": "100% ingyenes és nyílt forráskódú (MetaBrainz).",
-    "vi": "Miễn phí 100% và mã nguồn mở (MetaBrainz)."
+    "vi": "Miễn phí 100% và mã nguồn mở (MetaBrainz).",
+    "nb": "100 % gratis og åpen kildekode (MetaBrainz).",
+    "pl": "W 100% bezpłatny i open source (MetaBrainz).",
+    "el": "100% δωρεάν και ανοιχτού κώδικα (MetaBrainz)."
   },
   "svctok.listenbrainz.step1": {
     "fr": "Crée un compte gratuit sur listenbrainz.org.",
@@ -2209,7 +2680,10 @@
     "ro": "Creează un cont gratuit pe listenbrainz.org.",
     "sv": "Skapa ett gratiskonto på listenbrainz.org.",
     "hu": "Hozzon létre ingyenes fiókot a listenbrainz.org oldalon.",
-    "vi": "Tạo tài khoản miễn phí trên listenbrainz.org."
+    "vi": "Tạo tài khoản miễn phí trên listenbrainz.org.",
+    "nb": "Opprett en gratis konto på listenbrainz.org.",
+    "pl": "Załóż bezpłatne konto na listenbrainz.org.",
+    "el": "Δημιουργήστε έναν δωρεάν λογαριασμό στο listenbrainz.org."
   },
   "svctok.listenbrainz.step2": {
     "fr": "Ouvre Settings (icône profil).",
@@ -2223,7 +2697,10 @@
     "ro": "Deschide Settings (pictograma de profil).",
     "sv": "Öppna Inställningar (profilikonen).",
     "hu": "Nyissa meg a Settings menüt (profil ikon).",
-    "vi": "Mở Settings (biểu tượng hồ sơ)."
+    "vi": "Mở Settings (biểu tượng hồ sơ).",
+    "nb": "Åpne Settings (profilikonet).",
+    "pl": "Otwórz Settings (ikona profilu).",
+    "el": "Ανοίξτε τις Settings (εικονίδιο προφίλ)."
   },
   "svctok.listenbrainz.step3": {
     "fr": "Copie le « User token » et colle-le ici.",
@@ -2237,7 +2714,10 @@
     "ro": "Copiază «User token» și lipește-l aici.",
     "sv": "Kopiera ”User token” och klistra in den här.",
     "hu": "Másolja ki a „User token” értékét, és illessze be ide.",
-    "vi": "Sao chép “User token” và dán vào đây."
+    "vi": "Sao chép “User token” và dán vào đây.",
+    "nb": "Kopier «User token» og lim det inn her.",
+    "pl": "Skopiuj „User token” i wklej go tutaj.",
+    "el": "Αντιγράψτε το «User token» και επικολλήστε το εδώ."
   },
   "zonegroup.needsTwoZones": {
     "fr": "Il faut au moins deux zones différentes pour créer un groupe.",
@@ -2251,7 +2731,10 @@
     "ro": "Un grup are nevoie de cel puțin două zone diferite.",
     "sv": "En grupp kräver minst två olika zoner.",
     "hu": "Egy csoporthoz legalább két különböző zóna kell.",
-    "vi": "Một nhóm cần ít nhất hai vùng phát khác nhau."
+    "vi": "Một nhóm cần ít nhất hai vùng phát khác nhau.",
+    "nb": "En gruppe trenger minst to ulike soner.",
+    "pl": "Grupa wymaga co najmniej dwóch różnych stref.",
+    "el": "Μια ομάδα χρειάζεται τουλάχιστον δύο διαφορετικές ζώνες."
   },
   "zonegroup.unknownZone": {
     "fr": "La zone n° {id} n'existe plus. Rafraîchissez la liste des zones.",
@@ -2265,7 +2748,10 @@
     "ro": "Zona nr. {id} nu mai există. Reîmprospătați lista de zone.",
     "sv": "Zon nr {id} finns inte längre. Uppdatera zonlistan.",
     "hu": "A(z) #{id} zóna már nem létezik. Frissítse a zónák listáját.",
-    "vi": "Vùng phát #{id} không còn tồn tại. Hãy làm mới danh sách vùng phát."
+    "vi": "Vùng phát #{id} không còn tồn tại. Hãy làm mới danh sách vùng phát.",
+    "nb": "Sone #{id} finnes ikke lenger. Oppdater sonelisten.",
+    "pl": "Strefa nr {id} już nie istnieje. Odśwież listę stref.",
+    "el": "Η ζώνη #{id} δεν υπάρχει πια. Ανανεώστε τη λίστα ζωνών."
   },
   "zone.freeCapReached": {
     "fr": "Vous utilisez déjà vos {n} zones gratuites. Jouer sur une zone de plus demande Tune Premium — les protocoles (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) sont tous inclus dans la version gratuite.",
@@ -2279,7 +2765,10 @@
     "ro": "Folosiți deja cele {n} zone gratuite. Redarea într-o zonă în plus necesită Tune Premium — protocoalele (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) sunt toate incluse în versiunea gratuită.",
     "sv": "Du använder redan dina {n} gratiszoner. Att spela i ytterligare en zon kräver Tune Premium — protokollen (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) ingår alla i gratisversionen.",
     "hu": "Már mind a(z) {n} ingyenes zónáját használja. Még egy zónán való lejátszáshoz Tune Premium szükséges — a protokollok (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) mind benne vannak az ingyenes változatban.",
-    "vi": "Bạn đang dùng hết {n} vùng phát miễn phí. Phát trên thêm một vùng phát nữa cần Tune Premium — các giao thức (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) đều có trong bản miễn phí."
+    "vi": "Bạn đang dùng hết {n} vùng phát miễn phí. Phát trên thêm một vùng phát nữa cần Tune Premium — các giao thức (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) đều có trong bản miễn phí.",
+    "nb": "Du bruker allerede de {n} gratis sonene dine. Å spille på én sone til krever Tune Premium – protokollene (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) er alle inkludert i gratisversjonen.",
+    "pl": "Wykorzystujesz już limit bezpłatnych stref ({n}). Odtwarzanie w kolejnej strefie wymaga Tune Premium — wszystkie protokoły (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) są w wersji bezpłatnej.",
+    "el": "Χρησιμοποιείτε ήδη τις {n} δωρεάν ζώνες σας. Η αναπαραγωγή σε μία ακόμη ζώνη απαιτεί Tune Premium — όλα τα πρωτόκολλα (DLNA, AirPlay 2, BluOS, Chromecast, OpenHome) περιλαμβάνονται στη δωρεάν έκδοση."
   },
   "zonegroup.sameOutput": {
     "fr": "Les zones « {a} » et « {b} » utilisent la même sortie audio : elles ne peuvent pas être groupées. Supprimez-en une, ou donnez-lui une autre sortie.",
@@ -2293,7 +2782,10 @@
     "ro": "Zonele „{a}” și „{b}” folosesc aceeași ieșire audio: nu pot fi grupate. Ștergeți una dintre ele sau atribuiți-i altă ieșire.",
     "sv": "Zonerna ”{a}” och ”{b}” använder samma ljudutgång: de kan inte grupperas. Ta bort en av dem eller ge den en annan utgång.",
     "hu": "A(z) „{a}” és „{b}” zóna ugyanazt a hangkimenetet használja: nem csoportosíthatók. Törölje az egyiket, vagy adjon neki másik kimenetet.",
-    "vi": "Vùng phát “{a}” và “{b}” dùng cùng một đầu ra âm thanh: không thể nhóm lại. Hãy xóa một vùng phát, hoặc gán cho nó đầu ra khác."
+    "vi": "Vùng phát “{a}” và “{b}” dùng cùng một đầu ra âm thanh: không thể nhóm lại. Hãy xóa một vùng phát, hoặc gán cho nó đầu ra khác.",
+    "nb": "Sonene «{a}» og «{b}» bruker samme lydutgang: de kan ikke grupperes. Slett den ene, eller gi den en annen utgang.",
+    "pl": "Strefy „{a}” i „{b}” używają tego samego wyjścia audio: nie można ich grupować. Usuń jedną z nich lub przypisz jej inne wyjście.",
+    "el": "Οι ζώνες «{a}» και «{b}» χρησιμοποιούν την ίδια έξοδο ήχου: δεν μπορούν να ομαδοποιηθούν. Διαγράψτε τη μία ή δώστε της άλλη έξοδο."
   },
   "browse.hint.windowsMappedDrive": {
     "fr": "« {drive} » est un lecteur réseau mappé : sous Windows, une lettre de lecteur n'appartient qu'à la session qui l'a créée et reste invisible au service Tune. Indiquez le chemin UNC du partage (\\\\serveur\\partage) au lieu de la lettre.",
@@ -2307,7 +2799,10 @@
     "ro": "„{drive}” este o unitate de rețea mapată: în Windows, o literă de unitate aparține doar sesiunii care a creat-o și rămâne invizibilă pentru serviciul Tune. Indicați calea UNC a partajării (\\\\server\\partajare) în loc de literă.",
     "sv": "”{drive}” är en ansluten nätverksenhet: i Windows tillhör en enhetsbokstav endast den session som skapade den och förblir osynlig för Tune-tjänsten. Ange resursens UNC-sökväg (\\\\server\\resurs) i stället för bokstaven.",
     "hu": "„{drive}” egy csatlakoztatott hálózati meghajtó: Windowson a meghajtóbetűjel csak az azt létrehozó munkamenethez tartozik, és a Tune szolgáltatás számára láthatatlan. A betűjel helyett a megosztás UNC-útvonalát használja (\\\\server\\share).",
-    "vi": "“{drive}” là ổ đĩa mạng được ánh xạ: trên Windows, ký tự ổ đĩa chỉ thuộc về phiên đã tạo ra nó và dịch vụ Tune không nhìn thấy được. Hãy dùng đường dẫn UNC của thư mục chia sẻ (\\\\server\\share) thay cho ký tự ổ đĩa."
+    "vi": "“{drive}” là ổ đĩa mạng được ánh xạ: trên Windows, ký tự ổ đĩa chỉ thuộc về phiên đã tạo ra nó và dịch vụ Tune không nhìn thấy được. Hãy dùng đường dẫn UNC của thư mục chia sẻ (\\\\server\\share) thay cho ký tự ổ đĩa.",
+    "nb": "«{drive}» er en tilordnet nettverksstasjon: i Windows tilhører en stasjonsbokstav bare økten som opprettet den, og er usynlig for Tune-tjenesten. Bruk UNC-banen til delingen (\\\\server\\share) i stedet for stasjonsbokstaven.",
+    "pl": "„{drive}” to zmapowany dysk sieciowy: w systemie Windows litera dysku należy tylko do sesji, która ją utworzyła, i pozostaje niewidoczna dla usługi Tune. Zamiast litery użyj ścieżki UNC udziału (\\\\serwer\\udział).",
+    "el": "Το «{drive}» είναι αντιστοιχισμένη μονάδα δικτύου: στα Windows το γράμμα μονάδας ανήκει μόνο στη συνεδρία που το δημιούργησε και παραμένει αόρατο στην υπηρεσία Tune. Χρησιμοποιήστε αντί για το γράμμα τη διαδρομή UNC του κοινόχρηστου φακέλου (\\\\server\\share)."
   },
   "browse.hint.uncUnreachable": {
     "fr": "Ce partage réseau est injoignable. Vérifiez que le serveur est allumé et accessible, et que les identifiants enregistrés sont toujours valides.",
@@ -2321,7 +2816,10 @@
     "ro": "Această partajare de rețea este inaccesibilă. Verificați dacă serverul este pornit și accesibil și dacă datele de autentificare salvate sunt încă valide.",
     "sv": "Den här nätverksresursen går inte att nå. Kontrollera att servern är påslagen och nåbar och att de sparade inloggningsuppgifterna fortfarande är giltiga.",
     "hu": "Ez a hálózati megosztás nem érhető el. Ellenőrizze, hogy a szerver be van-e kapcsolva és elérhető-e, és hogy a tárolt hitelesítő adatok még érvényesek-e.",
-    "vi": "Không thể truy cập thư mục chia sẻ mạng này. Hãy kiểm tra máy chủ đã bật và truy cập được, và thông tin đăng nhập đã lưu vẫn còn hợp lệ."
+    "vi": "Không thể truy cập thư mục chia sẻ mạng này. Hãy kiểm tra máy chủ đã bật và truy cập được, và thông tin đăng nhập đã lưu vẫn còn hợp lệ.",
+    "nb": "Denne nettverksdelingen er utilgjengelig. Kontroller at serveren er slått på og nåbar, og at de lagrede legitimasjonene fortsatt er gyldige.",
+    "pl": "Ten udział sieciowy jest nieosiągalny. Sprawdź, czy serwer jest włączony i dostępny oraz czy zapisane poświadczenia są nadal ważne.",
+    "el": "Αυτός ο κοινόχρηστος φάκελος δικτύου δεν είναι προσβάσιμος. Ελέγξτε ότι ο διακομιστής είναι ενεργοποιημένος και προσβάσιμος και ότι τα αποθηκευμένα διαπιστευτήρια εξακολουθούν να ισχύουν."
   },
   "settings.communityContribution.label": {
     "fr": "Partager mes métadonnées enrichies avec la communauté",
@@ -2335,7 +2833,10 @@
     "ro": "Partajează cu comunitatea metadatele mele îmbogățite",
     "sv": "Dela mina berikade metadata med communityn",
     "hu": "Bővített metaadataim megosztása a közösséggel",
-    "vi": "Chia sẻ siêu dữ liệu đã bổ sung của tôi với cộng đồng"
+    "vi": "Chia sẻ siêu dữ liệu đã bổ sung của tôi với cộng đồng",
+    "nb": "Del mine berikede metadata med fellesskapet",
+    "pl": "Udostępniaj moje wzbogacone metadane społeczności",
+    "el": "Κοινοποίηση των εμπλουτισμένων μεταδεδομένων μου στην κοινότητα"
   },
   "settings.communityContribution.description": {
     "fr": "Quand ce réglage est activé, Tune envoie au cloud communautaire mozaiklabs.fr les biographies d'artistes et d'albums de votre bibliothèque (nom de l'artiste, titre de l'album, identifiant MusicBrainz, texte de la biographie, source, licence et langue) ainsi que les images d'artistes récupérées automatiquement, accompagnées d'un identifiant d'installation anonyme. Ni vos fichiers, ni vos chemins de dossiers, ni votre historique d'écoute ne sont concernés. Désactivé par défaut : tant que vous ne l'activez pas, aucune de ces données ne quitte votre machine.",
@@ -2349,7 +2850,10 @@
     "ro": "Când această setare este activată, Tune trimite în cloudul comunitar mozaiklabs.fr biografiile artiștilor și albumelor din biblioteca ta (numele artistului, titlul albumului, identificatorul MusicBrainz, textul biografiei, sursa, licența și limba), precum și imaginile artiștilor preluate automat, împreună cu un identificator de instalare anonim. Fișierele tale, căile dosarelor și istoricul de ascultare nu sunt implicate. Dezactivată implicit: cât timp nu o activezi, niciuna dintre aceste date nu părăsește calculatorul tău.",
     "sv": "När den här inställningen är på skickar Tune biografierna över artister och album i ditt bibliotek (artistnamn, albumtitel, MusicBrainz-ID, biografitext, källa, licens och språk) samt de artistbilder som hämtats automatiskt till communitymolnet mozaiklabs.fr, tillsammans med en anonym installationsidentifierare. Dina filer, dina mappsökvägar och din lyssningshistorik berörs inte. Av som standard: så länge du inte slår på den lämnar ingen av dessa data din dator.",
     "hu": "Ha ez a beállítás be van kapcsolva, a Tune elküldi a mozaiklabs.fr közösségi felhőbe a gyűjteménye előadóinak és albumainak életrajzait (előadó neve, album címe, MusicBrainz-azonosító, az életrajz szövege, forrása, licence és nyelve), valamint az automatikusan letöltött előadóképeket, egy névtelen telepítésazonosítóval együtt. Az Ön fájljai, mappaútvonalai és hallgatási előzményei nem érintettek. Alapértelmezés szerint ki van kapcsolva: amíg be nem kapcsolja, ezekből az adatokból semmi sem hagyja el a gépét.",
-    "vi": "Khi bật cài đặt này, Tune gửi tiểu sử nghệ sĩ và album trong thư viện của bạn (tên nghệ sĩ, tên album, ID MusicBrainz, nội dung tiểu sử, nguồn, giấy phép và ngôn ngữ) cùng ảnh nghệ sĩ được tải tự động lên đám mây cộng đồng mozaiklabs.fr, kèm một mã cài đặt ẩn danh. File, đường dẫn thư mục và lịch sử nghe của bạn không liên quan. Tắt theo mặc định: khi bạn chưa bật, không dữ liệu nào trong số này rời khỏi máy của bạn."
+    "vi": "Khi bật cài đặt này, Tune gửi tiểu sử nghệ sĩ và album trong thư viện của bạn (tên nghệ sĩ, tên album, ID MusicBrainz, nội dung tiểu sử, nguồn, giấy phép và ngôn ngữ) cùng ảnh nghệ sĩ được tải tự động lên đám mây cộng đồng mozaiklabs.fr, kèm một mã cài đặt ẩn danh. File, đường dẫn thư mục và lịch sử nghe của bạn không liên quan. Tắt theo mặc định: khi bạn chưa bật, không dữ liệu nào trong số này rời khỏi máy của bạn.",
+    "nb": "Når denne innstillingen er på, sender Tune biografiene til artistene og albumene i biblioteket ditt (artistnavn, albumtittel, MusicBrainz-ID, biografitekst, kilde, lisens og språk) samt artistbildene den hentet automatisk, til fellesskapsskyen på mozaiklabs.fr, sammen med en anonym installasjonsidentifikator. Filene dine, mappebanene dine og lyttehistorikken din er ikke involvert. Av som standard: til du slår den på, forlater ingen av disse dataene maskinen din.",
+    "pl": "Gdy to ustawienie jest włączone, Tune wysyła biografie wykonawców i albumów z Twojej biblioteki (nazwa wykonawcy, tytuł albumu, identyfikator MusicBrainz, tekst biografii, źródło, licencja i język) oraz automatycznie pobrane zdjęcia wykonawców do chmury społeczności mozaiklabs.fr, wraz z anonimowym identyfikatorem instalacji. Nie dotyczy to Twoich plików, ścieżek folderów ani historii odsłuchań. Domyślnie wyłączone: dopóki go nie włączysz, żadne z tych danych nie opuszcza Twojego komputera.",
+    "el": "Όταν αυτή η ρύθμιση είναι ενεργή, το Tune στέλνει τα βιογραφικά των καλλιτεχνών και των άλμπουμ της βιβλιοθήκης σας (όνομα καλλιτέχνη, τίτλος άλμπουμ, αναγνωριστικό MusicBrainz, κείμενο βιογραφικού, πηγή, άδεια χρήσης και γλώσσα) καθώς και τις εικόνες καλλιτεχνών που ανέκτησε αυτόματα στο cloud της κοινότητας mozaiklabs.fr, μαζί με ένα ανώνυμο αναγνωριστικό εγκατάστασης. Τα αρχεία σας, οι διαδρομές των φακέλων σας και το ιστορικό ακρόασής σας δεν εμπλέκονται. Απενεργοποιημένο από προεπιλογή: μέχρι να την ενεργοποιήσετε, κανένα από αυτά τα δεδομένα δεν φεύγει από τον υπολογιστή σας."
   },
   "settings.replayGainSource.off": {
     "fr": "Désactivé",
@@ -2363,7 +2867,10 @@
     "ro": "Dezactivat",
     "sv": "Av",
     "hu": "Ki",
-    "vi": "Tắt"
+    "vi": "Tắt",
+    "nb": "Av",
+    "pl": "Wyłączone",
+    "el": "Ανενεργό"
   },
   "settings.replayGainSource.file_tags": {
     "fr": "Tags des fichiers",
@@ -2377,7 +2884,10 @@
     "ro": "Etichetele fișierelor",
     "sv": "Filernas taggar",
     "hu": "Fájlcímkék",
-    "vi": "Thẻ của file"
+    "vi": "Thẻ của file",
+    "nb": "Filtagger",
+    "pl": "Tagi pliku",
+    "el": "Ετικέτες αρχείου"
   },
   "settings.replayGainSource.tags_then_analysis": {
     "fr": "Tags des fichiers, puis analyse",
@@ -2391,7 +2901,10 @@
     "ro": "Etichetele fișierelor, apoi analiză",
     "sv": "Filernas taggar, sedan analys",
     "hu": "Fájlcímkék, majd elemzés",
-    "vi": "Thẻ của file, sau đó phân tích"
+    "vi": "Thẻ của file, sau đó phân tích",
+    "nb": "Filtagger, deretter analyse",
+    "pl": "Tagi pliku, potem analiza",
+    "el": "Ετικέτες αρχείου, μετά ανάλυση"
   },
   "radio.recherche.aucunResultat": {
     "fr": "Aucune station de ce nom dans le catalogue Tune. Vous pouvez l'ajouter par son adresse de flux.",
@@ -2405,7 +2918,10 @@
     "ro": "Niciun post cu acest nume în catalogul Tune. Îl puteți adăuga folosind adresa fluxului său.",
     "sv": "Ingen station med det namnet i Tune-katalogen. Du kan lägga till den med dess strömadress.",
     "hu": "Nincs ilyen nevű állomás a Tune katalógusában. A stream címével hozzáadhatja.",
-    "vi": "Không có đài nào mang tên này trong danh mục Tune. Bạn có thể thêm đài bằng địa chỉ luồng phát."
+    "vi": "Không có đài nào mang tên này trong danh mục Tune. Bạn có thể thêm đài bằng địa chỉ luồng phát.",
+    "nb": "Ingen stasjon med det navnet i Tune-katalogen. Du kan legge den til med strømadressen.",
+    "pl": "Brak stacji o tej nazwie w katalogu Tune. Możesz ją dodać, podając adres strumienia.",
+    "el": "Κανένας σταθμός με αυτό το όνομα στον κατάλογο του Tune. Μπορείτε να τον προσθέσετε χρησιμοποιώντας τη διεύθυνση ροής του."
   },
   "radio.recherche.annuaireSeul": {
     "fr": "Cette station n'est pas encore dans votre catalogue, mais l'annuaire Tune la connaît. Ajoutez-la d'un geste — son adresse de flux est déjà là.",
@@ -2419,7 +2935,10 @@
     "ro": "Acest post nu este încă în catalogul dumneavoastră, dar directorul Tune îl cunoaște. Adăugați-l dintr-un clic — adresa fluxului este deja disponibilă.",
     "sv": "Den här stationen finns ännu inte i din katalog, men Tune-katalogen känner till den. Lägg till den med ett klick — strömadressen finns redan.",
     "hu": "Ez az állomás még nincs a katalógusában, de a Tune címtára ismeri. Adja hozzá egy kattintással — a stream címe már megvan.",
-    "vi": "Đài này chưa có trong danh mục của bạn, nhưng thư mục Tune đã biết đài này. Thêm chỉ với một cú nhấp — địa chỉ luồng phát đã có sẵn."
+    "vi": "Đài này chưa có trong danh mục của bạn, nhưng thư mục Tune đã biết đài này. Thêm chỉ với một cú nhấp — địa chỉ luồng phát đã có sẵn.",
+    "nb": "Denne stasjonen er ikke i katalogen din ennå, men Tune-oversikten kjenner den. Legg den til med ett klikk – strømadressen er allerede fylt ut.",
+    "pl": "Tej stacji nie ma jeszcze w Twoim katalogu, ale zna ją spis Tune. Dodaj ją jednym kliknięciem — adres strumienia jest już wpisany.",
+    "el": "Αυτός ο σταθμός δεν υπάρχει ακόμη στον κατάλογό σας, αλλά το ευρετήριο του Tune τον γνωρίζει. Προσθέστε τον με ένα κλικ — η διεύθυνση ροής του είναι ήδη συμπληρωμένη."
   },
   "radio.recherche.echec": {
     "fr": "La recherche de stations n'a pas pu aboutir : le catalogue n'a pas répondu. Ce n'est pas une station manquante — réessayez, et redémarrez Tune si cela persiste.",
@@ -2433,7 +2952,10 @@
     "ro": "Căutarea posturilor nu a putut fi finalizată: catalogul nu a răspuns. Nu este vorba de un post lipsă — reîncercați și reporniți Tune dacă persistă.",
     "sv": "Stationssökningen kunde inte slutföras: katalogen svarade inte. Det handlar inte om en saknad station — försök igen och starta om Tune om det kvarstår.",
     "hu": "Az állomáskeresés nem fejeződött be: a katalógus nem válaszolt. Ez nem hiányzó állomás — próbálja újra, és ha továbbra is fennáll, indítsa újra a Tune-t.",
-    "vi": "Không thể hoàn tất tìm kiếm đài: danh mục không phản hồi. Đây không phải là đài bị thiếu — hãy thử lại, và khởi động lại Tune nếu lỗi vẫn còn."
+    "vi": "Không thể hoàn tất tìm kiếm đài: danh mục không phản hồi. Đây không phải là đài bị thiếu — hãy thử lại, và khởi động lại Tune nếu lỗi vẫn còn.",
+    "nb": "Stasjonssøket kunne ikke fullføres: katalogen svarte ikke. Det betyr ikke at stasjonen mangler – prøv igjen, og start Tune på nytt hvis det vedvarer.",
+    "pl": "Nie udało się dokończyć wyszukiwania stacji: katalog nie odpowiedział. To nie znaczy, że stacji brakuje — spróbuj ponownie, a jeśli problem się powtarza, uruchom Tune ponownie.",
+    "el": "Η αναζήτηση σταθμού δεν ολοκληρώθηκε: ο κατάλογος δεν απάντησε. Αυτό δεν σημαίνει ότι λείπει ο σταθμός — δοκιμάστε ξανά και, αν επιμένει, επανεκκινήστε το Tune."
   },
   "radio.url.vide": {
     "fr": "L'adresse du flux est vide. Collez l'adresse complète de la station, par exemple https://example.net/stream.mp3",
@@ -2447,7 +2969,10 @@
     "ro": "Adresa fluxului este goală. Lipiți adresa completă a postului, de exemplu https://example.net/stream.mp3",
     "sv": "Strömadressen är tom. Klistra in stationens fullständiga adress, till exempel https://example.net/stream.mp3",
     "hu": "A stream címe üres. Illessze be az állomás teljes címét, például https://example.net/stream.mp3",
-    "vi": "Địa chỉ luồng phát đang trống. Hãy dán địa chỉ đầy đủ của đài, ví dụ https://example.net/stream.mp3"
+    "vi": "Địa chỉ luồng phát đang trống. Hãy dán địa chỉ đầy đủ của đài, ví dụ https://example.net/stream.mp3",
+    "nb": "Strømadressen er tom. Lim inn stasjonens fullstendige adresse, for eksempel https://example.net/stream.mp3",
+    "pl": "Adres strumienia jest pusty. Wklej pełny adres stacji, na przykład https://example.net/stream.mp3",
+    "el": "Η διεύθυνση ροής είναι κενή. Επικολλήστε την πλήρη διεύθυνση του σταθμού, για παράδειγμα https://example.net/stream.mp3"
   },
   "radio.url.separateurFaux": {
     "fr": "L'adresse commence par « {debut} » : après « {schema} » il faut deux-points, pas ce caractère. Écrivez « {schema}:// » et la station se lira.",
@@ -2461,7 +2986,10 @@
     "ro": "Adresa începe cu „{debut}”: după „{schema}” trebuie două puncte, nu acest caracter. Scrieți „{schema}://” și postul se va reda.",
     "sv": "Adressen börjar med ”{debut}”: efter ”{schema}” krävs ett kolon, inte det tecknet. Skriv ”{schema}://” så spelas stationen upp.",
     "hu": "A cím így kezdődik: „{debut}”: a(z) „{schema}” után kettőspont kell, nem ez a karakter. Írja így: „{schema}://”, és az állomás szólni fog.",
-    "vi": "Địa chỉ bắt đầu bằng “{debut}”: sau “{schema}” phải là dấu hai chấm, không phải ký tự này. Hãy viết “{schema}://” và đài sẽ phát được."
+    "vi": "Địa chỉ bắt đầu bằng “{debut}”: sau “{schema}” phải là dấu hai chấm, không phải ký tự này. Hãy viết “{schema}://” và đài sẽ phát được.",
+    "nb": "Adressen begynner med «{debut}»: etter «{schema}» kreves et kolon, ikke det tegnet. Skriv «{schema}://», så spiller stasjonen.",
+    "pl": "Adres zaczyna się od „{debut}”: po „{schema}” wymagany jest dwukropek, a nie ten znak. Wpisz „{schema}://”, a stacja będzie grać.",
+    "el": "Η διεύθυνση αρχίζει με «{debut}»: μετά το «{schema}» απαιτείται άνω και κάτω τελεία, όχι αυτός ο χαρακτήρας. Γράψτε «{schema}://» και ο σταθμός θα παίξει."
   },
   "radio.url.sansSchema": {
     "fr": "L'adresse du flux doit commencer par http:// ou https://, et « {debut} » ne commence par ni l'un ni l'autre. Collez l'adresse complète du flux, pas seulement le nom du site.",
@@ -2475,7 +3003,10 @@
     "ro": "Adresa fluxului trebuie să înceapă cu http:// sau https://, iar „{debut}” nu începe cu niciuna dintre ele. Lipiți adresa completă a fluxului, nu doar numele site-ului.",
     "sv": "Strömadressen måste börja med http:// eller https://, och ”{debut}” börjar med ingetdera. Klistra in strömmens fullständiga adress, inte bara webbplatsens namn.",
     "hu": "A stream címének http:// vagy https:// előtaggal kell kezdődnie, és a(z) „{debut}” egyikkel sem kezdődik. Illessze be a stream teljes címét, ne csak a webhely nevét.",
-    "vi": "Địa chỉ luồng phát phải bắt đầu bằng http:// hoặc https://, còn “{debut}” không bắt đầu bằng cái nào. Hãy dán địa chỉ luồng phát đầy đủ, không chỉ tên trang web."
+    "vi": "Địa chỉ luồng phát phải bắt đầu bằng http:// hoặc https://, còn “{debut}” không bắt đầu bằng cái nào. Hãy dán địa chỉ luồng phát đầy đủ, không chỉ tên trang web.",
+    "nb": "Strømadressen må begynne med http:// eller https://, og «{debut}» begynner med ingen av dem. Lim inn hele strømadressen, ikke bare navnet på nettstedet.",
+    "pl": "Adres strumienia musi zaczynać się od http:// lub https://, a „{debut}” nie zaczyna się od żadnego z nich. Wklej pełny adres strumienia, a nie samą nazwę strony.",
+    "el": "Η διεύθυνση ροής πρέπει να αρχίζει με http:// ή https://, και το «{debut}» δεν αρχίζει με κανένα από τα δύο. Επικολλήστε την πλήρη διεύθυνση ροής, όχι μόνο το όνομα του ιστότοπου."
   },
   "radio.url.schemaNonLisible": {
     "fr": "Tune ne sait ouvrir que les flux http:// et https:// ; « {schema}:// » n'est pas pris en charge.",
@@ -2489,7 +3020,10 @@
     "ro": "Tune poate deschide doar fluxuri http:// și https://; „{schema}://” nu este acceptat.",
     "sv": "Tune kan bara öppna strömmar via http:// och https://; ”{schema}://” stöds inte.",
     "hu": "A Tune csak http:// és https:// streameket tud megnyitni; a(z) „{schema}://” nem támogatott.",
-    "vi": "Tune chỉ mở được luồng http:// và https://; “{schema}://” không được hỗ trợ."
+    "vi": "Tune chỉ mở được luồng http:// và https://; “{schema}://” không được hỗ trợ.",
+    "nb": "Tune kan bare åpne http://- og https://-strømmer; «{schema}://» støttes ikke.",
+    "pl": "Tune otwiera tylko strumienie http:// i https://; „{schema}://” nie jest obsługiwane.",
+    "el": "Το Tune μπορεί να ανοίξει μόνο ροές http:// και https://· το «{schema}://» δεν υποστηρίζεται."
   },
   "radio.url.sansHote": {
     "fr": "L'adresse n'indique aucun serveur après « {schema}:// ». Il manque le nom d'hôte, par exemple {schema}://example.net/stream.mp3",
@@ -2503,7 +3037,10 @@
     "ro": "Adresa nu indică niciun server după „{schema}://”. Lipsește numele gazdei, de exemplu {schema}://example.net/stream.mp3",
     "sv": "Adressen anger ingen server efter ”{schema}://”. Värdnamnet saknas, till exempel {schema}://example.net/stream.mp3",
     "hu": "A cím nem nevez meg szervert a(z) „{schema}://” után. Hiányzik a gépnév, például {schema}://example.net/stream.mp3",
-    "vi": "Địa chỉ không có tên máy chủ sau “{schema}://”. Thiếu tên máy chủ, ví dụ {schema}://example.net/stream.mp3"
+    "vi": "Địa chỉ không có tên máy chủ sau “{schema}://”. Thiếu tên máy chủ, ví dụ {schema}://example.net/stream.mp3",
+    "nb": "Adressen angir ingen server etter «{schema}://». Vertsnavnet mangler, for eksempel {schema}://example.net/stream.mp3",
+    "pl": "Adres nie wskazuje żadnego serwera po „{schema}://”. Brakuje nazwy hosta, na przykład {schema}://example.net/stream.mp3",
+    "el": "Η διεύθυνση δεν ορίζει κανέναν διακομιστή μετά το «{schema}://». Λείπει το όνομα του κεντρικού υπολογιστή, για παράδειγμα {schema}://example.net/stream.mp3"
   },
   "radio.url.pasUnFlux": {
     "fr": "Cette adresse répond bien, mais elle rend « {type} » et non un flux audio : c'est une page web, pas la station. Sur le site de la radio, cherchez le lien « écouter » ou « flux » et copiez CETTE adresse-là.",
@@ -2517,7 +3054,10 @@
     "ro": "Această adresă răspunde, dar returnează „{type}” în loc de un flux audio: este o pagină web, nu postul. Pe site-ul postului, căutați linkul „ascultă” sau „flux” și copiați ACEA adresă.",
     "sv": "Adressen svarar, men den returnerar ”{type}” i stället för en ljudström: det är en webbsida, inte stationen. Leta efter länken ”lyssna” eller ”ström” på stationens webbplats och kopiera DEN adressen.",
     "hu": "Ez a cím válaszol, de hangstream helyett „{type}” típust ad vissza: ez egy weboldal, nem az állomás. Az állomás webhelyén keresse a „listen” vagy „stream” hivatkozást, és AZT a címet másolja ki.",
-    "vi": "Địa chỉ này có phản hồi, nhưng trả về “{type}” thay vì luồng âm thanh: đây là một trang web, không phải đài. Trên trang của đài, hãy tìm liên kết “listen” hoặc “stream” và sao chép CHÍNH địa chỉ đó."
+    "vi": "Địa chỉ này có phản hồi, nhưng trả về “{type}” thay vì luồng âm thanh: đây là một trang web, không phải đài. Trên trang của đài, hãy tìm liên kết “listen” hoặc “stream” và sao chép CHÍNH địa chỉ đó.",
+    "nb": "Den adressen svarer, men returnerer «{type}» i stedet for en lydstrøm: det er en nettside, ikke stasjonen. Se etter «lytt»- eller «stream»-lenken på stasjonens nettsted og kopier DEN adressen.",
+    "pl": "Ten adres odpowiada, ale zwraca „{type}” zamiast strumienia audio: to strona internetowa, a nie stacja. Na stronie stacji poszukaj linku „słuchaj” lub „stream” i skopiuj TEN adres.",
+    "el": "Αυτή η διεύθυνση απαντά, αλλά επιστρέφει «{type}» αντί για ροή ήχου: είναι ιστοσελίδα, όχι ο σταθμός. Στον ιστότοπο του σταθμού, αναζητήστε τον σύνδεσμο «ακούστε» ή «stream» και αντιγράψτε ΕΚΕΙΝΗ τη διεύθυνση."
   },
   "radio.url.espace": {
     "fr": "L'adresse du flux contient un espace, ce qu'une adresse de flux ne comporte jamais. Vérifiez qu'elle n'a pas été coupée au collage.",
@@ -2531,7 +3071,10 @@
     "ro": "Adresa fluxului conține un spațiu, ceea ce nu se întâmplă niciodată la o adresă de flux. Verificați dacă nu a fost tăiată la lipire.",
     "sv": "Strömadressen innehåller ett mellanslag, vilket en strömadress aldrig gör. Kontrollera att den inte klipptes av vid inklistringen.",
     "hu": "A stream címében szóköz van, ami stream címében sosem fordul elő. Ellenőrizze, hogy beillesztéskor nem sérült-e.",
-    "vi": "Địa chỉ luồng phát chứa dấu cách, điều không bao giờ có trong một địa chỉ luồng phát. Hãy kiểm tra xem nó có bị hỏng khi dán không."
+    "vi": "Địa chỉ luồng phát chứa dấu cách, điều không bao giờ có trong một địa chỉ luồng phát. Hãy kiểm tra xem nó có bị hỏng khi dán không.",
+    "nb": "Strømadressen inneholder et mellomrom, noe en strømadresse aldri har. Kontroller at den ikke ble ødelagt ved innliming.",
+    "pl": "Adres strumienia zawiera spację, a adres strumienia nigdy jej nie ma. Sprawdź, czy nie został uszkodzony podczas wklejania.",
+    "el": "Η διεύθυνση ροής περιέχει κενό, κάτι που μια διεύθυνση ροής δεν έχει ποτέ. Ελέγξτε ότι δεν χάλασε κατά την επικόλληση."
   },
   "radio.import.refusees": {
     "fr": "{refusees} station(s) sur {total} n'ont pas été importées : leur adresse de flux ne peut pas être ouverte. Chacune est listée ci-dessous avec l'adresse fautive et ce qu'il faut y corriger.",
@@ -2545,7 +3088,10 @@
     "ro": "{refusees} din {total} posturi nu au fost importate: adresa fluxului lor nu poate fi deschisă. Fiecare este listat mai jos cu adresa greșită și ce trebuie corectat.",
     "sv": "{refusees} av {total} stationer importerades inte: deras strömadress går inte att öppna. Var och en listas nedan med den felaktiga adressen och vad som måste rättas.",
     "hu": "{total} állomásból {refusees} nem lett importálva: a stream címük nem nyitható meg. Alább mindegyik szerepel a hibás címmel és azzal, amit javítani kell benne.",
-    "vi": "{refusees} trên {total} đài không được nhập: không thể mở địa chỉ luồng phát của chúng. Mỗi đài được liệt kê bên dưới cùng địa chỉ bị lỗi và điều cần sửa."
+    "vi": "{refusees} trên {total} đài không được nhập: không thể mở địa chỉ luồng phát của chúng. Mỗi đài được liệt kê bên dưới cùng địa chỉ bị lỗi và điều cần sửa.",
+    "nb": "{refusees} av {total} stasjoner ble ikke importert: strømadressen deres kan ikke åpnes. Hver av dem er oppført nedenfor med den feilaktige adressen og hva som må rettes.",
+    "pl": "Nie zaimportowano stacji: {refusees} z {total} — nie można otworzyć ich adresu strumienia. Każda z nich jest poniżej wypisana z błędnym adresem i tym, co w nim poprawić.",
+    "el": "{refusees} από τους {total} σταθμούς δεν εισήχθησαν: η διεύθυνση ροής τους δεν μπορεί να ανοιχτεί. Καθένας αναφέρεται παρακάτω με τη λανθασμένη διεύθυνση και το τι πρέπει να διορθωθεί."
   },
   "podcasts.radiofrance.cleAbsente": {
     "fr": "La source Radio France nécessite une clé API. Renseignez le réglage « radiofrance_api_key » pour l'activer.",
@@ -2559,7 +3105,10 @@
     "ro": "Sursa Radio France necesită o cheie API. Completați setarea „radiofrance_api_key” pentru a o activa.",
     "sv": "Källan Radio France kräver en API-nyckel. Ange inställningen ”radiofrance_api_key” för att aktivera den.",
     "hu": "A Radio France forráshoz API-kulcs szükséges. Az engedélyezéséhez adja meg a „radiofrance_api_key” beállítást.",
-    "vi": "Nguồn Radio France cần khóa API. Hãy đặt cài đặt “radiofrance_api_key” để bật nguồn này."
+    "vi": "Nguồn Radio France cần khóa API. Hãy đặt cài đặt “radiofrance_api_key” để bật nguồn này.",
+    "nb": "Radio France-kilden krever en API-nøkkel. Sett innstillingen «radiofrance_api_key» for å aktivere den.",
+    "pl": "Źródło Radio France wymaga klucza API. Ustaw „radiofrance_api_key”, aby je włączyć.",
+    "el": "Η πηγή Radio France απαιτεί κλειδί API. Ορίστε τη ρύθμιση «radiofrance_api_key» για να την ενεργοποιήσετε."
   },
   "support.tropDeRequetes": {
     "fr": "Le service de support a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie un peu plus tard.",
@@ -2573,7 +3122,10 @@
     "ro": "Serviciul de asistență a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încercați din nou puțin mai târziu.",
     "sv": "Supporttjänsten har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen lite senare.",
     "hu": "A támogatási szolgáltatás túl sok kérést kapott erről a szerverről, és egyelőre elutasítja a további kéréseket. Próbálja újra kicsit később.",
-    "vi": "Dịch vụ hỗ trợ đã nhận quá nhiều yêu cầu từ máy chủ này và tạm thời từ chối các yêu cầu tiếp theo. Hãy thử lại sau ít phút."
+    "vi": "Dịch vụ hỗ trợ đã nhận quá nhiều yêu cầu từ máy chủ này và tạm thời từ chối các yêu cầu tiếp theo. Hãy thử lại sau ít phút.",
+    "nb": "Supporttjenesten har mottatt for mange forespørsler fra denne serveren og avviser flere for øyeblikket. Prøv igjen litt senere.",
+    "pl": "Usługa wsparcia otrzymała zbyt wiele zapytań z tego serwera i na razie odrzuca kolejne. Spróbuj ponownie nieco później.",
+    "el": "Η υπηρεσία υποστήριξης έλαβε πάρα πολλά αιτήματα από αυτόν τον διακομιστή και προς το παρόν αρνείται τα επόμενα. Δοκιμάστε ξανά λίγο αργότερα."
   },
   "support.tropDeRequetesDelai": {
     "fr": "Le service de support a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie dans {minutes} min.",
@@ -2587,7 +3139,10 @@
     "ro": "Serviciul de asistență a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încercați din nou peste {minutes} min.",
     "sv": "Supporttjänsten har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min.",
     "hu": "A támogatási szolgáltatás túl sok kérést kapott erről a szerverről, és egyelőre elutasítja a további kéréseket. Próbálja újra {minutes} perc múlva.",
-    "vi": "Dịch vụ hỗ trợ đã nhận quá nhiều yêu cầu từ máy chủ này và tạm thời từ chối các yêu cầu tiếp theo. Hãy thử lại sau {minutes} phút."
+    "vi": "Dịch vụ hỗ trợ đã nhận quá nhiều yêu cầu từ máy chủ này và tạm thời từ chối các yêu cầu tiếp theo. Hãy thử lại sau {minutes} phút.",
+    "nb": "Supporttjenesten har mottatt for mange forespørsler fra denne serveren og avviser flere for øyeblikket. Prøv igjen om {minutes} min.",
+    "pl": "Usługa wsparcia otrzymała zbyt wiele zapytań z tego serwera i na razie odrzuca kolejne. Spróbuj ponownie za {minutes} min.",
+    "el": "Η υπηρεσία υποστήριξης έλαβε πάρα πολλά αιτήματα από αυτόν τον διακομιστή και προς το παρόν αρνείται τα επόμενα. Δοκιμάστε ξανά σε {minutes} λεπτά."
   },
   "cloud.tropDeRequetes": {
     "fr": "Le service en ligne Tune a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie un peu plus tard.",
@@ -2601,7 +3156,10 @@
     "ro": "Serviciul online Tune a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încearcă din nou puțin mai târziu.",
     "sv": "Tunes onlinetjänst har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen lite senare.",
     "hu": "A Tune online szolgáltatása túl sok kérést kapott erről a szerverről, és egyelőre elutasítja a további kéréseket. Próbálja újra kicsit később.",
-    "vi": "Dịch vụ trực tuyến của Tune đã nhận quá nhiều yêu cầu từ máy chủ này và tạm thời từ chối các yêu cầu tiếp theo. Hãy thử lại sau ít phút."
+    "vi": "Dịch vụ trực tuyến của Tune đã nhận quá nhiều yêu cầu từ máy chủ này và tạm thời từ chối các yêu cầu tiếp theo. Hãy thử lại sau ít phút.",
+    "nb": "Tune-nettjenesten har mottatt for mange forespørsler fra denne serveren og avviser flere for øyeblikket. Prøv igjen litt senere.",
+    "pl": "Usługa online Tune otrzymała zbyt wiele zapytań z tego serwera i na razie odrzuca kolejne. Spróbuj ponownie nieco później.",
+    "el": "Η διαδικτυακή υπηρεσία του Tune έλαβε πάρα πολλά αιτήματα από αυτόν τον διακομιστή και προς το παρόν αρνείται τα επόμενα. Δοκιμάστε ξανά λίγο αργότερα."
   },
   "cloud.tropDeRequetesDelai": {
     "fr": "Le service en ligne Tune a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie dans {minutes} min.",
@@ -2615,7 +3173,10 @@
     "ro": "Serviciul online Tune a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încearcă din nou peste {minutes} min.",
     "sv": "Tunes onlinetjänst har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min.",
     "hu": "A Tune online szolgáltatása túl sok kérést kapott erről a szerverről, és egyelőre elutasítja a további kéréseket. Próbálja újra {minutes} perc múlva.",
-    "vi": "Dịch vụ trực tuyến của Tune đã nhận quá nhiều yêu cầu từ máy chủ này và tạm thời từ chối các yêu cầu tiếp theo. Hãy thử lại sau {minutes} phút."
+    "vi": "Dịch vụ trực tuyến của Tune đã nhận quá nhiều yêu cầu từ máy chủ này và tạm thời từ chối các yêu cầu tiếp theo. Hãy thử lại sau {minutes} phút.",
+    "nb": "Tune-nettjenesten har mottatt for mange forespørsler fra denne serveren og avviser flere for øyeblikket. Prøv igjen om {minutes} min.",
+    "pl": "Usługa online Tune otrzymała zbyt wiele zapytań z tego serwera i na razie odrzuca kolejne. Spróbuj ponownie za {minutes} min.",
+    "el": "Η διαδικτυακή υπηρεσία του Tune έλαβε πάρα πολλά αιτήματα από αυτόν τον διακομιστή και προς το παρόν αρνείται τα επόμενα. Δοκιμάστε ξανά σε {minutes} λεπτά."
   },
   "cloud.ssoTitre": {
     "fr": "Connexion au compte mozaiklabs impossible pour le moment",
@@ -2629,7 +3190,10 @@
     "ro": "Conectarea la contul mozaiklabs nu este posibilă deocamdată",
     "sv": "Det går inte att logga in på mozaiklabs-kontot just nu",
     "hu": "Egyelőre nem sikerült bejelentkezni a mozaiklabs-fiókjába",
-    "vi": "Hiện chưa thể đăng nhập vào tài khoản mozaiklabs của bạn"
+    "vi": "Hiện chưa thể đăng nhập vào tài khoản mozaiklabs của bạn",
+    "nb": "Kunne ikke logge inn på mozaiklabs-kontoen din akkurat nå",
+    "pl": "Na razie nie można zalogować się na konto mozaiklabs",
+    "el": "Δεν ήταν δυνατή η σύνδεση στον λογαριασμό σας mozaiklabs προς το παρόν"
   },
   "cloud.ssoNonLie": {
     "fr": "Le compte n'a pas été lié à ce serveur. Relance la connexion depuis Tune.",
@@ -2643,7 +3207,10 @@
     "ro": "Contul nu a fost asociat cu acest server. Reia conectarea din Tune.",
     "sv": "Kontot har inte kopplats till den här servern. Logga in igen från Tune.",
     "hu": "A fiók nem lett ehhez a szerverhez kapcsolva. Indítsa újra a bejelentkezést a Tune-ból.",
-    "vi": "Tài khoản chưa được liên kết với máy chủ này. Hãy bắt đầu lại việc đăng nhập từ Tune."
+    "vi": "Tài khoản chưa được liên kết với máy chủ này. Hãy bắt đầu lại việc đăng nhập từ Tune.",
+    "nb": "Kontoen ble ikke koblet til denne serveren. Start innloggingen på nytt fra Tune.",
+    "pl": "Konto nie zostało powiązane z tym serwerem. Rozpocznij logowanie ponownie z poziomu Tune.",
+    "el": "Ο λογαριασμός δεν συνδέθηκε με αυτόν τον διακομιστή. Ξεκινήστε ξανά τη σύνδεση από το Tune."
   },
   "cloud.ssoRetour": {
     "fr": "Retour à Tune",
@@ -2657,7 +3224,10 @@
     "ro": "Înapoi la Tune",
     "sv": "Tillbaka till Tune",
     "hu": "Vissza a Tune-hoz",
-    "vi": "Quay lại Tune"
+    "vi": "Quay lại Tune",
+    "nb": "Tilbake til Tune",
+    "pl": "Powrót do Tune",
+    "el": "Επιστροφή στο Tune"
   },
   "cloud.ssoEchec": {
     "fr": "La connexion n'a pas abouti.",
@@ -2671,7 +3241,10 @@
     "ro": "Conectarea nu s-a finalizat.",
     "sv": "Inloggningen slutfördes inte.",
     "hu": "A bejelentkezés nem fejeződött be.",
-    "vi": "Đăng nhập chưa hoàn tất."
+    "vi": "Đăng nhập chưa hoàn tất.",
+    "nb": "Innloggingen ble ikke fullført.",
+    "pl": "Logowanie nie zostało zakończone.",
+    "el": "Η σύνδεση δεν ολοκληρώθηκε."
   },
   "metadata.enrich.cleLastfmAbsente": {
     "fr": "L'enrichissement des biographies nécessite une clé API Last.fm. Renseignez le réglage « lastfm_api_key » pour l'activer.",
@@ -2685,7 +3258,10 @@
     "ro": "Îmbogățirea biografiilor necesită o cheie API Last.fm. Completați setarea „lastfm_api_key” pentru a o activa.",
     "sv": "Berikning av biografier kräver en API-nyckel för Last.fm. Ange inställningen ”lastfm_api_key” för att aktivera den.",
     "hu": "Az életrajzok bővítéséhez Last.fm API-kulcs szükséges. Az engedélyezéséhez adja meg a „lastfm_api_key” beállítást.",
-    "vi": "Bổ sung tiểu sử cần khóa API Last.fm. Hãy đặt cài đặt “lastfm_api_key” để bật tính năng này."
+    "vi": "Bổ sung tiểu sử cần khóa API Last.fm. Hãy đặt cài đặt “lastfm_api_key” để bật tính năng này.",
+    "nb": "Biografiberikelse krever en Last.fm API-nøkkel. Sett innstillingen «lastfm_api_key» for å aktivere den.",
+    "pl": "Wzbogacanie biografii wymaga klucza API Last.fm. Ustaw „lastfm_api_key”, aby je włączyć.",
+    "el": "Ο εμπλουτισμός βιογραφικών απαιτεί κλειδί API του Last.fm. Ορίστε τη ρύθμιση «lastfm_api_key» για να τον ενεργοποιήσετε."
   },
   "playback.sessionLostAtPosition": {
     "fr": "La lecture de « {title} » ne peut pas reprendre à {position} : sa session de flux n’est plus disponible. Les sessions expirent après {minutes} minutes sans lecture ; un redémarrage du serveur peut aussi les supprimer. Relancez la piste.",
@@ -2699,7 +3275,10 @@
     "ro": "„{title}” nu poate fi reluată de la {position}: sesiunea de redare nu mai este disponibilă. Sesiunile expiră după {minutes} minute fără redare; repornirea serverului le poate elimina și ea. Porniți din nou piesa.",
     "sv": "”{title}” kan inte återupptas vid {position}: uppspelningssessionen är inte längre tillgänglig. Sessioner upphör efter {minutes} minuter utan uppspelning; en omstart av servern kan också ta bort dem. Starta spåret igen.",
     "hu": "A(z) „{title}” nem folytatható innen: {position}: a lejátszási munkamenete már nem érhető el. A munkamenetek {minutes} perc lejátszás nélküli idő után lejárnak; a szerver újraindítása is törölheti őket. Indítsa újra a számot.",
-    "vi": "Không thể tiếp tục “{title}” tại {position}: phiên phát của bài không còn khả dụng. Các phiên hết hạn sau {minutes} phút không phát; khởi động lại máy chủ cũng có thể xóa chúng. Hãy phát lại bài hát."
+    "vi": "Không thể tiếp tục “{title}” tại {position}: phiên phát của bài không còn khả dụng. Các phiên hết hạn sau {minutes} phút không phát; khởi động lại máy chủ cũng có thể xóa chúng. Hãy phát lại bài hát.",
+    "nb": "«{title}» kan ikke gjenopptas ved {position}: avspillingsøkten er ikke lenger tilgjengelig. Økter utløper etter {minutes} minutter uten avspilling; en omstart av serveren kan også fjerne dem. Start sporet på nytt.",
+    "pl": "„{title}” nie może być wznowiony od pozycji {position}: jego sesja odtwarzania nie jest już dostępna. Sesje wygasają po {minutes} min bez odtwarzania; ponowne uruchomienie serwera także może je usunąć. Uruchom utwór od nowa.",
+    "el": "Το «{title}» δεν μπορεί να συνεχιστεί στη θέση {position}: η συνεδρία αναπαραγωγής του δεν είναι πλέον διαθέσιμη. Οι συνεδρίες λήγουν μετά από {minutes} λεπτά χωρίς αναπαραγωγή· η επανεκκίνηση του διακομιστή μπορεί επίσης να τις αφαιρέσει. Ξεκινήστε ξανά το κομμάτι."
   },
   "playback.sessionLostBrowser": {
     "fr": "La lecture de « {title} » ne peut pas reprendre là où elle en était : sa session de flux n’est plus disponible et le serveur ne connaît pas la position de lecture dans le navigateur. Les sessions expirent après {minutes} minutes sans lecture ; un redémarrage du serveur peut aussi les supprimer. Relancez la piste.",
@@ -2713,7 +3292,10 @@
     "ro": "„{title}” nu poate fi reluată din locul unde s-a oprit: sesiunea nu mai este disponibilă, iar serverul nu cunoaște poziția redării în browser. Sesiunile expiră după {minutes} minute fără redare; repornirea serverului le poate elimina și ea. Porniți din nou piesa.",
     "sv": "”{title}” kan inte återupptas där det stoppades: sessionen är inte längre tillgänglig och servern känner inte till uppspelningspositionen i webbläsaren. Sessioner upphör efter {minutes} minuter utan uppspelning; en omstart av servern kan också ta bort dem. Starta spåret igen.",
     "hu": "A(z) „{title}” nem folytatható ott, ahol abbamaradt: a lejátszási munkamenete már nem érhető el, és a szerver nem ismeri a böngészőbeli lejátszási pozíciót. A munkamenetek {minutes} perc lejátszás nélküli idő után lejárnak; a szerver újraindítása is törölheti őket. Indítsa újra a számot.",
-    "vi": "Không thể tiếp tục “{title}” tại chỗ đã dừng: phiên phát của bài không còn khả dụng và máy chủ không biết vị trí phát trong trình duyệt. Các phiên hết hạn sau {minutes} phút không phát; khởi động lại máy chủ cũng có thể xóa chúng. Hãy phát lại bài hát."
+    "vi": "Không thể tiếp tục “{title}” tại chỗ đã dừng: phiên phát của bài không còn khả dụng và máy chủ không biết vị trí phát trong trình duyệt. Các phiên hết hạn sau {minutes} phút không phát; khởi động lại máy chủ cũng có thể xóa chúng. Hãy phát lại bài hát.",
+    "nb": "«{title}» kan ikke gjenopptas der det stoppet: avspillingsøkten er ikke lenger tilgjengelig, og serveren kjenner ikke avspillingsposisjonen i nettleseren. Økter utløper etter {minutes} minutter uten avspilling; en omstart av serveren kan også fjerne dem. Start sporet på nytt.",
+    "pl": "„{title}” nie może być wznowiony tam, gdzie się zatrzymał: jego sesja odtwarzania nie jest już dostępna, a serwer nie zna pozycji odtwarzania w przeglądarce. Sesje wygasają po {minutes} min bez odtwarzania; ponowne uruchomienie serwera także może je usunąć. Uruchom utwór od nowa.",
+    "el": "Το «{title}» δεν μπορεί να συνεχιστεί από το σημείο που σταμάτησε: η συνεδρία αναπαραγωγής του δεν είναι πλέον διαθέσιμη και ο διακομιστής δεν γνωρίζει τη θέση αναπαραγωγής στο πρόγραμμα περιήγησης. Οι συνεδρίες λήγουν μετά από {minutes} λεπτά χωρίς αναπαραγωγή· η επανεκκίνηση του διακομιστή μπορεί επίσης να τις αφαιρέσει. Ξεκινήστε ξανά το κομμάτι."
   },
   "playback.sessionLostCause": {
     "fr": "Cause: {cause}",
@@ -2727,7 +3309,10 @@
     "ro": "Cauză: {cause}",
     "sv": "Orsak: {cause}",
     "hu": "Ok: {cause}",
-    "vi": "Nguyên nhân: {cause}"
+    "vi": "Nguyên nhân: {cause}",
+    "nb": "Årsak: {cause}",
+    "pl": "Przyczyna: {cause}",
+    "el": "Αιτία: {cause}"
   },
   "bitperfect.strict.refused": {
     "fr": "Bit-perfect strict : lecture refusée — la sortie ne lit pas le {requested} kHz sans conversion (elle tourne à {device} kHz). Désactivez « Bit-perfect strict » dans les réglages de la zone pour jouer avec conversion.",
@@ -2741,7 +3326,10 @@
     "ro": "Bit-perfect strict: redare refuzată — ieșirea nu poate reda {requested} kHz fără conversie (funcționează la {device} kHz). Dezactivați „Bit-perfect strict” din setările zonei pentru a reda cu conversie.",
     "sv": "Strikt bitperfekt: uppspelning nekad — utgången kan inte spela {requested} kHz utan konvertering (den körs på {device} kHz). Stäng av ”Strikt bitperfekt” i zonens inställningar för att spela med konvertering.",
     "hu": "Szigorú bit-perfect: a lejátszás elutasítva — a kimenet nem tud {requested} kHz-et konverzió nélkül lejátszani ({device} kHz-en működik). A konverzióval történő lejátszáshoz kapcsolja ki a „Szigorú bit-perfect” beállítást a zóna beállításaiban.",
-    "vi": "Bit-perfect nghiêm ngặt: từ chối phát — đầu ra không thể phát {requested} kHz mà không chuyển đổi (đầu ra đang chạy ở {device} kHz). Hãy tắt “Bit-perfect nghiêm ngặt” trong cài đặt vùng phát để phát có chuyển đổi."
+    "vi": "Bit-perfect nghiêm ngặt: từ chối phát — đầu ra không thể phát {requested} kHz mà không chuyển đổi (đầu ra đang chạy ở {device} kHz). Hãy tắt “Bit-perfect nghiêm ngặt” trong cài đặt vùng phát để phát có chuyển đổi.",
+    "nb": "Streng bit-perfect: avspillingen ble avvist – utgangen kan ikke spille {requested} kHz uten konvertering (den kjører på {device} kHz). Slå av «Streng bit-perfect» i soneinnstillingene for å spille med konvertering.",
+    "pl": "Ścisły bit-perfect: odtwarzanie odrzucone — wyjście nie może odtworzyć {requested} kHz bez konwersji (pracuje z {device} kHz). Wyłącz „Ścisły bit-perfect” w ustawieniach strefy, aby odtwarzać z konwersją.",
+    "el": "Αυστηρό bit-perfect: η αναπαραγωγή απορρίφθηκε — η έξοδος δεν μπορεί να αναπαραγάγει {requested} kHz χωρίς μετατροπή (λειτουργεί στα {device} kHz). Απενεργοποιήστε το «Αυστηρό bit-perfect» στις ρυθμίσεις της ζώνης για αναπαραγωγή με μετατροπή."
   },
   "radio.genre.eclectic": {
     "fr": "Éclectique",
@@ -2755,7 +3343,10 @@
     "ro": "Eclectic",
     "sv": "Eklektiskt",
     "hu": "Eklektikus",
-    "vi": "Đa dạng"
+    "vi": "Đa dạng",
+    "nb": "Eklektisk",
+    "pl": "Eklektyczne",
+    "el": "Εκλεκτικό"
   },
   "radio.genre.frenchSong": {
     "fr": "Chanson française",
@@ -2769,7 +3360,10 @@
     "ro": "Șansonetă franceză",
     "sv": "Fransk chanson",
     "hu": "Francia sanzon",
-    "vi": "Nhạc Pháp (Chanson)"
+    "vi": "Nhạc Pháp (Chanson)",
+    "nb": "Fransk chanson",
+    "pl": "Piosenka francuska",
+    "el": "Γαλλικό τραγούδι"
   },
   "radio.genre.classical": {
     "fr": "Classique",
@@ -2783,7 +3377,10 @@
     "ro": "Clasică",
     "sv": "Klassiskt",
     "hu": "Klasszikus",
-    "vi": "Cổ điển"
+    "vi": "Cổ điển",
+    "nb": "Klassisk",
+    "pl": "Klasyczne",
+    "el": "Κλασική"
   },
   "radio.genre.contemporary": {
     "fr": "Contemporaine",
@@ -2797,7 +3394,10 @@
     "ro": "Contemporană",
     "sv": "Samtida",
     "hu": "Kortárs",
-    "vi": "Đương đại"
+    "vi": "Đương đại",
+    "nb": "Samtidsmusikk",
+    "pl": "Współczesne",
+    "el": "Σύγχρονη"
   },
   "radio.genre.culture": {
     "fr": "Culture",
@@ -2811,7 +3411,10 @@
     "ro": "Cultură",
     "sv": "Kultur",
     "hu": "Kultúra",
-    "vi": "Văn hóa"
+    "vi": "Văn hóa",
+    "nb": "Kultur",
+    "pl": "Kultura",
+    "el": "Πολιτισμός"
   },
   "radio.genre.generalist": {
     "fr": "Généraliste",
@@ -2825,7 +3428,10 @@
     "ro": "Generalist",
     "sv": "Allmänt",
     "hu": "Általános",
-    "vi": "Tổng hợp"
+    "vi": "Tổng hợp",
+    "nb": "Generell",
+    "pl": "Ogólne",
+    "el": "Γενικό"
   },
   "radio.genre.electronic": {
     "fr": "Électronique",
@@ -2839,7 +3445,10 @@
     "ro": "Electronică",
     "sv": "Elektroniskt",
     "hu": "Elektronikus",
-    "vi": "Điện tử"
+    "vi": "Điện tử",
+    "nb": "Elektronisk",
+    "pl": "Elektroniczne",
+    "el": "Ηλεκτρονική"
   },
   "radio.genre.groove": {
     "fr": "Groove",
@@ -2853,7 +3462,10 @@
     "ro": "Groove",
     "sv": "Groove",
     "hu": "Groove",
-    "vi": "Groove"
+    "vi": "Groove",
+    "nb": "Groove",
+    "pl": "Groove",
+    "el": "Groove"
   },
   "radio.genre.hipHop": {
     "fr": "Hip-Hop",
@@ -2867,7 +3479,10 @@
     "ro": "Hip-Hop",
     "sv": "Hiphop",
     "hu": "Hip-hop",
-    "vi": "Hip-Hop"
+    "vi": "Hip-Hop",
+    "nb": "Hip-hop",
+    "pl": "Hip-hop",
+    "el": "Hip-Hop"
   },
   "radio.genre.jazz": {
     "fr": "Jazz",
@@ -2881,7 +3496,10 @@
     "ro": "Jazz",
     "sv": "Jazz",
     "hu": "Jazz",
-    "vi": "Jazz"
+    "vi": "Jazz",
+    "nb": "Jazz",
+    "pl": "Jazz",
+    "el": "Τζαζ"
   },
   "radio.genre.metal": {
     "fr": "Metal",
@@ -2895,7 +3513,10 @@
     "ro": "Metal",
     "sv": "Metal",
     "hu": "Metal",
-    "vi": "Metal"
+    "vi": "Metal",
+    "nb": "Metal",
+    "pl": "Metal",
+    "el": "Metal"
   },
   "radio.genre.world": {
     "fr": "Monde",
@@ -2909,7 +3530,10 @@
     "ro": "Muzica lumii",
     "sv": "Världsmusik",
     "hu": "Világzene",
-    "vi": "World"
+    "vi": "World",
+    "nb": "Verdensmusikk",
+    "pl": "Muzyka świata",
+    "el": "Παγκόσμια μουσική"
   },
   "radio.genre.pop": {
     "fr": "Pop",
@@ -2923,7 +3547,10 @@
     "ro": "Pop",
     "sv": "Pop",
     "hu": "Pop",
-    "vi": "Pop"
+    "vi": "Pop",
+    "nb": "Pop",
+    "pl": "Pop",
+    "el": "Ποπ"
   },
   "radio.genre.reggae": {
     "fr": "Reggae",
@@ -2937,7 +3564,10 @@
     "ro": "Reggae",
     "sv": "Reggae",
     "hu": "Reggae",
-    "vi": "Reggae"
+    "vi": "Reggae",
+    "nb": "Reggae",
+    "pl": "Reggae",
+    "el": "Ρέγκε"
   },
   "radio.genre.rock": {
     "fr": "Rock",
@@ -2951,7 +3581,10 @@
     "ro": "Rock",
     "sv": "Rock",
     "hu": "Rock",
-    "vi": "Rock"
+    "vi": "Rock",
+    "nb": "Rock",
+    "pl": "Rock",
+    "el": "Ροκ"
   },
   "radio.genre.blues": {
     "fr": "Blues",
@@ -2965,7 +3598,10 @@
     "ro": "Blues",
     "sv": "Blues",
     "hu": "Blues",
-    "vi": "Blues"
+    "vi": "Blues",
+    "nb": "Blues",
+    "pl": "Blues",
+    "el": "Μπλουζ"
   },
   "radio.genre.soul": {
     "fr": "Soul",
@@ -2979,7 +3615,10 @@
     "ro": "Soul",
     "sv": "Soul",
     "hu": "Soul",
-    "vi": "Soul"
+    "vi": "Soul",
+    "nb": "Soul",
+    "pl": "Soul",
+    "el": "Σόουλ"
   },
   "radio.genre.funk": {
     "fr": "Funk",
@@ -2993,7 +3632,10 @@
     "ro": "Funk",
     "sv": "Funk",
     "hu": "Funk",
-    "vi": "Funk"
+    "vi": "Funk",
+    "nb": "Funk",
+    "pl": "Funk",
+    "el": "Φανκ"
   },
   "radio.genre.folk": {
     "fr": "Folk",
@@ -3007,7 +3649,10 @@
     "ro": "Folk",
     "sv": "Folkmusik",
     "hu": "Folk",
-    "vi": "Folk"
+    "vi": "Folk",
+    "nb": "Folkemusikk",
+    "pl": "Folk",
+    "el": "Φολκ"
   },
   "radio.genre.ambient": {
     "fr": "Ambient",
@@ -3021,7 +3666,10 @@
     "ro": "Ambient",
     "sv": "Ambient",
     "hu": "Ambient",
-    "vi": "Ambient"
+    "vi": "Ambient",
+    "nb": "Ambient",
+    "pl": "Ambient",
+    "el": "Ambient"
   },
   "spotify.playback.disabled": {
     "fr": "Lecture Spotify non activée : l'option « Lecture Spotify (expérimental) » se trouve dans Réglages › Accès et jetons › Spotify Connect (niveau Avancé).",
@@ -3035,7 +3683,112 @@
     "ro": "Redarea Spotify nu este activată: opțiunea „Redare Spotify (experimental)” se află în Setări › Acces și jetoane › Spotify Connect (nivelul Avansat).",
     "sv": "Spotify-uppspelning är inte aktiverad: alternativet ”Spotify-uppspelning (experimentell)” finns under Inställningar › Åtkomst och tokens › Spotify Connect (nivå Avancerad).",
     "hu": "A Spotify-lejátszás nincs engedélyezve: a „Spotify-lejátszás (kísérleti)” beállítás a Beállítások › Hozzáférés és tokenek › Spotify Connect alatt található (Haladó szint).",
-    "vi": "Chưa bật phát Spotify: tùy chọn “Phát Spotify (thử nghiệm)” nằm trong Cài đặt › Truy cập và token › Spotify Connect (cấp Nâng cao)."
+    "vi": "Chưa bật phát Spotify: tùy chọn “Phát Spotify (thử nghiệm)” nằm trong Cài đặt › Truy cập và token › Spotify Connect (cấp Nâng cao).",
+    "nb": "Spotify-avspilling er ikke aktivert: alternativet «Spotify-avspilling (eksperimentell)» finnes i Innstillinger › Tilgang og tokener › Spotify Connect (avansert nivå).",
+    "pl": "Odtwarzanie Spotify nie jest włączone: opcja „Odtwarzanie Spotify (eksperymentalne)” znajduje się w Ustawienia › Dostęp i tokeny › Spotify Connect (poziom zaawansowany).",
+    "el": "Η αναπαραγωγή Spotify δεν είναι ενεργοποιημένη: η επιλογή «Αναπαραγωγή Spotify (πειραματική)» βρίσκεται στις Ρυθμίσεις › Πρόσβαση και διακριτικά › Spotify Connect (προχωρημένο επίπεδο)."
+  },
+  "plugin.uninstall.bundled_hidden": {
+    "fr": "Ce greffon est fourni avec cette installation et ne peut pas être supprimé. Il a été désactivé et masqué ; l'installer de nouveau le rétablit.",
+    "en": "This plugin ships with this installation and cannot be deleted. It has been disabled and hidden; installing it again brings it back.",
+    "de": "Dieses Plugin wird mit dieser Installation geliefert und kann nicht gelöscht werden. Es wurde deaktiviert und ausgeblendet; eine erneute Installation stellt es wieder her.",
+    "es": "Este plugin se incluye con esta instalación y no se puede eliminar. Se ha desactivado y ocultado; volver a instalarlo lo restablece.",
+    "it": "Questo plugin è incluso in questa installazione e non può essere eliminato. È stato disattivato e nascosto; reinstallarlo lo ripristina.",
+    "zh": "此插件随本安装一同提供，无法删除。它已被停用并隐藏；重新安装即可恢复。",
+    "ja": "このプラグインはこのインストールに同梱されているため、削除できません。無効化して非表示にしました。再インストールすると元に戻ります。",
+    "ko": "이 플러그인은 현재 설치에 포함되어 있어 삭제할 수 없습니다. 비활성화하고 숨겼으며, 다시 설치하면 복원됩니다.",
+    "ro": "Acest plugin este livrat cu această instalare și nu poate fi șters. A fost dezactivat și ascuns; reinstalarea îl readuce.",
+    "sv": "Det här tillägget levereras med installationen och kan inte tas bort. Det har inaktiverats och dolts; installerar du det igen kommer det tillbaka.",
+    "hu": "Ez a bővítmény a telepítés része, ezért nem törölhető. Letiltottuk és elrejtettük; újratelepítéssel visszakerül.",
+    "vi": "Plugin này đi kèm bản cài đặt và không thể xóa. Nó đã được tắt và ẩn; cài đặt lại sẽ khôi phục nó.",
+    "nb": "Dette tillegget følger med denne installasjonen og kan ikke slettes. Det er deaktivert og skjult; installerer du det på nytt, kommer det tilbake.",
+    "pl": "Ta wtyczka jest dostarczana z tą instalacją i nie można jej usunąć. Została wyłączona i ukryta; ponowna instalacja ją przywraca.",
+    "el": "Αυτό το πρόσθετο παρέχεται με την παρούσα εγκατάσταση και δεν μπορεί να διαγραφεί. Έχει απενεργοποιηθεί και αποκρυφθεί· η επανεγκατάστασή του το επαναφέρει."
+  },
+  "plugin.uninstall.permission_denied": {
+    "fr": "Le serveur n'a pas le droit de supprimer ce greffon. Vérifiez que le dossier de données de Tune appartient bien à l'utilisateur du serveur.",
+    "en": "The server is not allowed to delete this plugin. Check that Tune's data folder belongs to the user running the server.",
+    "de": "Der Server darf dieses Plugin nicht löschen. Prüfen Sie, ob der Datenordner von Tune dem Benutzer gehört, unter dem der Server läuft.",
+    "es": "El servidor no tiene permiso para eliminar este plugin. Compruebe que la carpeta de datos de Tune pertenece al usuario que ejecuta el servidor.",
+    "it": "Il server non ha il permesso di eliminare questo plugin. Verifica che la cartella dati di Tune appartenga all'utente che esegue il server.",
+    "zh": "服务器无权删除此插件。请确认 Tune 的数据文件夹属于运行服务器的用户。",
+    "ja": "サーバーにこのプラグインを削除する権限がありません。Tune のデータフォルダーがサーバーを実行しているユーザーのものか確認してください。",
+    "ko": "서버에 이 플러그인을 삭제할 권한이 없습니다. Tune 데이터 폴더가 서버를 실행하는 사용자의 소유인지 확인하세요.",
+    "ro": "Serverul nu are permisiunea de a șterge acest plugin. Verificați că dosarul de date Tune aparține utilizatorului care rulează serverul.",
+    "sv": "Servern får inte ta bort det här tillägget. Kontrollera att Tunes datamapp tillhör användaren som kör servern.",
+    "hu": "A kiszolgálónak nincs joga törölni ezt a bővítményt. Ellenőrizze, hogy a Tune adatmappája a kiszolgálót futtató felhasználóé-e.",
+    "vi": "Máy chủ không có quyền xóa plugin này. Hãy kiểm tra thư mục dữ liệu của Tune có thuộc về người dùng đang chạy máy chủ không.",
+    "nb": "Serveren har ikke tillatelse til å slette dette tillegget. Kontroller at Tunes datamappe tilhører brukeren som kjører serveren.",
+    "pl": "Serwer nie ma uprawnień do usunięcia tej wtyczki. Sprawdź, czy folder danych Tune należy do użytkownika uruchamiającego serwer.",
+    "el": "Ο διακομιστής δεν έχει δικαίωμα να διαγράψει αυτό το πρόσθετο. Ελέγξτε ότι ο φάκελος δεδομένων του Tune ανήκει στον χρήστη που εκτελεί τον διακομιστή."
+  },
+  "plugin.uninstall.read_only": {
+    "fr": "Le dossier des greffons est en lecture seule : ce greffon ne peut pas être supprimé. Il peut être désactivé.",
+    "en": "The plugins folder is read-only, so this plugin cannot be deleted. It can be disabled instead.",
+    "de": "Der Plugin-Ordner ist schreibgeschützt, daher kann dieses Plugin nicht gelöscht werden. Es kann stattdessen deaktiviert werden.",
+    "es": "La carpeta de plugins es de solo lectura, por lo que este plugin no se puede eliminar. Puede desactivarse.",
+    "it": "La cartella dei plugin è in sola lettura, quindi questo plugin non può essere eliminato. Può essere disattivato.",
+    "zh": "插件文件夹为只读，无法删除此插件，但可以将其停用。",
+    "ja": "プラグインフォルダーが読み取り専用のため、このプラグインは削除できません。代わりに無効化できます。",
+    "ko": "플러그인 폴더가 읽기 전용이라 이 플러그인을 삭제할 수 없습니다. 대신 비활성화할 수 있습니다.",
+    "ro": "Dosarul de pluginuri este doar în citire, deci acest plugin nu poate fi șters. Poate fi dezactivat.",
+    "sv": "Tilläggsmappen är skrivskyddad, så det här tillägget kan inte tas bort. Det kan inaktiveras i stället.",
+    "hu": "A bővítmények mappája csak olvasható, ezért ez a bővítmény nem törölhető. Helyette letiltható.",
+    "vi": "Thư mục plugin ở chế độ chỉ đọc nên không thể xóa plugin này. Bạn có thể tắt nó thay thế.",
+    "nb": "Tilleggsmappen er skrivebeskyttet, så dette tillegget kan ikke slettes. Det kan deaktiveres i stedet.",
+    "pl": "Folder wtyczek jest tylko do odczytu, więc tej wtyczki nie można usunąć. Można ją wyłączyć.",
+    "el": "Ο φάκελος προσθέτων είναι μόνο για ανάγνωση, επομένως το πρόσθετο δεν μπορεί να διαγραφεί. Μπορεί να απενεργοποιηθεί."
+  },
+  "plugin.uninstall.unsafe_id": {
+    "fr": "Nom de greffon invalide.",
+    "en": "Invalid plugin name.",
+    "de": "Ungültiger Plugin-Name.",
+    "es": "Nombre de plugin no válido.",
+    "it": "Nome del plugin non valido.",
+    "zh": "插件名称无效。",
+    "ja": "プラグイン名が無効です。",
+    "ko": "플러그인 이름이 올바르지 않습니다.",
+    "ro": "Nume de plugin nevalid.",
+    "sv": "Ogiltigt tilläggsnamn.",
+    "hu": "Érvénytelen bővítménynév.",
+    "vi": "Tên plugin không hợp lệ.",
+    "nb": "Ugyldig tilleggsnavn.",
+    "pl": "Nieprawidłowa nazwa wtyczki.",
+    "el": "Μη έγκυρο όνομα προσθέτου."
+  },
+  "plugin.uninstall.failed": {
+    "fr": "Le greffon n'a pas pu être supprimé. Consultez le journal du serveur pour le détail.",
+    "en": "The plugin could not be deleted. See the server log for details.",
+    "de": "Das Plugin konnte nicht gelöscht werden. Details stehen im Server-Protokoll.",
+    "es": "No se pudo eliminar el plugin. Consulte el registro del servidor para más detalles.",
+    "it": "Impossibile eliminare il plugin. Consulta il registro del server per i dettagli.",
+    "zh": "无法删除此插件。详情请查看服务器日志。",
+    "ja": "プラグインを削除できませんでした。詳細はサーバーのログを確認してください。",
+    "ko": "플러그인을 삭제하지 못했습니다. 자세한 내용은 서버 로그를 확인하세요.",
+    "ro": "Pluginul nu a putut fi șters. Consultați jurnalul serverului pentru detalii.",
+    "sv": "Tillägget kunde inte tas bort. Se serverloggen för detaljer.",
+    "hu": "A bővítményt nem sikerült törölni. A részleteket a kiszolgáló naplója tartalmazza.",
+    "vi": "Không thể xóa plugin. Xem nhật ký máy chủ để biết chi tiết.",
+    "nb": "Tillegget kunne ikke slettes. Se serverloggen for detaljer.",
+    "pl": "Nie udało się usunąć wtyczki. Szczegóły znajdziesz w dzienniku serwera.",
+    "el": "Δεν ήταν δυνατή η διαγραφή του προσθέτου. Δείτε το αρχείο καταγραφής του διακομιστή."
+  },
+  "plugin.install.failed": {
+    "fr": "Le greffon n'a pas pu être installé. Consultez le journal du serveur pour le détail.",
+    "en": "The plugin could not be installed. See the server log for details.",
+    "de": "Das Plugin konnte nicht installiert werden. Details stehen im Server-Protokoll.",
+    "es": "No se pudo instalar el plugin. Consulte el registro del servidor para más detalles.",
+    "it": "Impossibile installare il plugin. Consulta il registro del server per i dettagli.",
+    "zh": "无法安装此插件。详情请查看服务器日志。",
+    "ja": "プラグインをインストールできませんでした。詳細はサーバーのログを確認してください。",
+    "ko": "플러그인을 설치하지 못했습니다. 자세한 내용은 서버 로그를 확인하세요.",
+    "ro": "Pluginul nu a putut fi instalat. Consultați jurnalul serverului pentru detalii.",
+    "sv": "Tillägget kunde inte installeras. Se serverloggen för detaljer.",
+    "hu": "A bővítményt nem sikerült telepíteni. A részleteket a kiszolgáló naplója tartalmazza.",
+    "vi": "Không thể cài đặt plugin. Xem nhật ký máy chủ để biết chi tiết.",
+    "nb": "Tillegget kunne ikke installeres. Se serverloggen for detaljer.",
+    "pl": "Nie udało się zainstalować wtyczki. Szczegóły znajdziesz w dzienniku serwera.",
+    "el": "Δεν ήταν δυνατή η εγκατάσταση του προσθέτου. Δείτε το αρχείο καταγραφής του διακομιστή."
   },
   "api.playback.albumNoTracks": {
     "fr": "L'album {album_id} n'a aucune piste à ajouter à la file.",
@@ -3049,7 +3802,10 @@
     "ro": "Albumul {album_id} nu are nicio piesă de adăugat în coadă.",
     "sv": "Albumet {album_id} har inga spår att lägga till i kön.",
     "hu": "A(z) {album_id} albumnak nincs a sorhoz adható száma.",
-    "vi": "Album {album_id} không có bản nhạc nào để thêm vào hàng đợi."
+    "vi": "Album {album_id} không có bản nhạc nào để thêm vào hàng đợi.",
+    "nb": "Albumet {album_id} har ingen spor å legge til i køen.",
+    "pl": "Album {album_id} nie ma utworów do dodania do kolejki.",
+    "el": "Το άλμπουμ {album_id} δεν έχει κομμάτι για προσθήκη στην ουρά."
   },
   "api.playback.queueEmptyNothingToSave": {
     "fr": "La file d'attente est vide : il n'y a rien à enregistrer.",
@@ -3063,7 +3819,10 @@
     "ro": "Coada este goală: nu există nimic de salvat.",
     "sv": "Kön är tom: det finns inget att spara.",
     "hu": "A sor üres: nincs mit menteni.",
-    "vi": "Hàng đợi trống: không có gì để lưu."
+    "vi": "Hàng đợi trống: không có gì để lưu.",
+    "nb": "Køen er tom: det er ingenting å lagre.",
+    "pl": "Kolejka jest pusta: nie ma nic do zapisania.",
+    "el": "Η ουρά είναι άδεια: δεν υπάρχει τίποτα για αποθήκευση."
   },
   "api.playback.queueOnlyServiceTracks": {
     "fr": "Cette file ne contient que des pistes de service ({count}), qui ne peuvent pas être enregistrées dans une playlist locale. Enregistrez-la depuis le service, ou ajoutez d'abord ces titres à votre bibliothèque.",
@@ -3077,7 +3836,10 @@
     "ro": "Această coadă conține doar piese de la servicii de streaming ({count}), care nu pot fi salvate într-o listă locală. Salvați-o din serviciu sau adăugați mai întâi aceste titluri în bibliotecă.",
     "sv": "Den här kön innehåller bara spår från strömningstjänster ({count}), som inte kan sparas i en lokal spellista. Spara den från tjänsten, eller lägg först till låtarna i ditt bibliotek.",
     "hu": "Ez a sor csak streamingszolgáltatás-számokat tartalmaz ({count}), amelyek nem menthetők helyi lejátszási listába. Mentse a szolgáltatásból, vagy előbb adja hozzá ezeket a címeket a könyvtárához.",
-    "vi": "Hàng đợi này chỉ chứa bản nhạc từ dịch vụ phát trực tuyến ({count}), không thể lưu vào danh sách phát cục bộ. Hãy lưu từ dịch vụ, hoặc thêm các bản này vào thư viện trước."
+    "vi": "Hàng đợi này chỉ chứa bản nhạc từ dịch vụ phát trực tuyến ({count}), không thể lưu vào danh sách phát cục bộ. Hãy lưu từ dịch vụ, hoặc thêm các bản này vào thư viện trước.",
+    "nb": "Denne køen inneholder bare spor fra strømmetjenester ({count}), som ikke kan lagres i en lokal spilleliste. Lagre den fra tjenesten, eller legg først til sporene i biblioteket ditt.",
+    "pl": "Ta kolejka zawiera tylko utwory z serwisów streamingowych ({count}), których nie można zapisać w lokalnej playliście. Zapisz ją w serwisie albo najpierw dodaj te utwory do biblioteki.",
+    "el": "Αυτή η ουρά περιέχει μόνο κομμάτια υπηρεσιών streaming ({count}), που δεν μπορούν να αποθηκευτούν σε τοπική λίστα. Αποθηκεύστε τη από την υπηρεσία ή προσθέστε πρώτα αυτά τα κομμάτια στη βιβλιοθήκη σας."
   },
   "api.playback.playlistCreatedEmpty": {
     "fr": "La playlist a été créée, mais ses pistes n'ont pas pu y être ajoutées.",
@@ -3091,7 +3853,10 @@
     "ro": "Lista a fost creată, dar piesele nu au putut fi adăugate.",
     "sv": "Spellistan skapades, men dess spår kunde inte läggas till.",
     "hu": "A lejátszási lista létrejött, de a számait nem sikerült hozzáadni.",
-    "vi": "Danh sách phát đã được tạo, nhưng không thể thêm các bản nhạc."
+    "vi": "Danh sách phát đã được tạo, nhưng không thể thêm các bản nhạc.",
+    "nb": "Spillelisten ble opprettet, men sporene kunne ikke legges til.",
+    "pl": "Playlista została utworzona, ale nie udało się dodać utworów.",
+    "el": "Η λίστα δημιουργήθηκε, αλλά τα κομμάτια της δεν μπόρεσαν να προστεθούν."
   },
   "api.playback.openhomePinsFromQueue": {
     "fr": "Cette zone utilise le service OpenHome Pins : un emplacement de l'appareil demande une adresse qu'il sache ouvrir, ce que la file Tune ne fournit pas encore.",
@@ -3105,7 +3870,10 @@
     "ro": "Această zonă folosește serviciul OpenHome Pins: un slot al dispozitivului necesită o adresă pe care dispozitivul să o poată deschide, ceea ce coada Tune nu oferă încă.",
     "sv": "Den här zonen använder tjänsten OpenHome Pins: en plats på enheten kräver en adress som enheten kan öppna, vilket Tune-kön ännu inte tillhandahåller.",
     "hu": "Ez a zóna az OpenHome Pins szolgáltatást használja: az eszköz egy helyéhez olyan cím kell, amelyet az eszköz meg tud nyitni, ezt a Tune sora még nem biztosítja.",
-    "vi": "Vùng này dùng dịch vụ OpenHome Pins: một vị trí của thiết bị cần địa chỉ mà thiết bị mở được, điều hàng đợi Tune chưa cung cấp."
+    "vi": "Vùng này dùng dịch vụ OpenHome Pins: một vị trí của thiết bị cần địa chỉ mà thiết bị mở được, điều hàng đợi Tune chưa cung cấp.",
+    "nb": "Denne sonen bruker tjenesten OpenHome Pins: en plass på enheten krever en adresse enheten kan åpne, noe Tune-køen ikke tilbyr ennå.",
+    "pl": "Ta strefa korzysta z usługi OpenHome Pins: miejsce w urządzeniu wymaga adresu, który urządzenie potrafi otworzyć, a kolejka Tune jeszcze go nie zapewnia.",
+    "el": "Αυτή η ζώνη χρησιμοποιεί την υπηρεσία OpenHome Pins: μια θέση της συσκευής χρειάζεται διεύθυνση που η συσκευή μπορεί να ανοίξει, κάτι που η ουρά του Tune δεν παρέχει ακόμη."
   },
   "api.alarm.zoneBusy": {
     "fr": "La zone joue déjà : le test n'a pas été lancé.",
@@ -3119,7 +3887,10 @@
     "ro": "Zona redă deja: testul nu a fost pornit.",
     "sv": "Zonen spelar redan: testet startades inte.",
     "hu": "A zóna már lejátszik: a teszt nem indult el.",
-    "vi": "Vùng đang phát: chưa bắt đầu kiểm tra."
+    "vi": "Vùng đang phát: chưa bắt đầu kiểm tra.",
+    "nb": "Sonen spiller allerede: testen ble ikke startet.",
+    "pl": "Strefa już odtwarza: test nie został uruchomiony.",
+    "el": "Η ζώνη παίζει ήδη: η δοκιμή δεν ξεκίνησε."
   },
   "api.sources.unknown": {
     "fr": "Aucune source « {id} » sur ce serveur.",
@@ -3133,7 +3904,10 @@
     "ro": "Nu există sursa „{id}” pe acest server.",
     "sv": "Ingen källa ”{id}” på den här servern.",
     "hu": "Nincs „{id}” forrás ezen a szerveren.",
-    "vi": "Không có nguồn “{id}” trên máy chủ này."
+    "vi": "Không có nguồn “{id}” trên máy chủ này.",
+    "nb": "Ingen kilde «{id}» på denne serveren.",
+    "pl": "Brak źródła „{id}” na tym serwerze.",
+    "el": "Δεν υπάρχει πηγή «{id}» σε αυτόν τον διακομιστή."
   },
   "api.sources.notPlayable": {
     "fr": "Le greffon « {plugin} » ne sait pas jouer la source « {id} ».",
@@ -3147,7 +3921,10 @@
     "ro": "Pluginul „{plugin}” nu poate reda sursa „{id}”.",
     "sv": "Insticksprogrammet ”{plugin}” kan inte spela källan ”{id}”.",
     "hu": "A(z) „{plugin}” bővítmény nem tudja lejátszani a(z) „{id}” forrást.",
-    "vi": "Plugin “{plugin}” không phát được nguồn “{id}”."
+    "vi": "Plugin “{plugin}” không phát được nguồn “{id}”.",
+    "nb": "Programtillegget «{plugin}» kan ikke spille kilden «{id}».",
+    "pl": "Wtyczka „{plugin}” nie potrafi odtworzyć źródła „{id}”.",
+    "el": "Το πρόσθετο «{plugin}» δεν μπορεί να αναπαράγει την πηγή «{id}»."
   },
   "svctok.err.deezerNoSession": {
     "fr": "Deezer n'a ouvert aucune session",
@@ -3161,7 +3938,10 @@
     "ro": "Deezer nu a deschis nicio sesiune",
     "sv": "Deezer öppnade ingen session",
     "hu": "A Deezer nem nyitott munkamenetet",
-    "vi": "Deezer không mở phiên nào"
+    "vi": "Deezer không mở phiên nào",
+    "nb": "Deezer åpnet ingen økt",
+    "pl": "Deezer nie otworzył sesji",
+    "el": "Το Deezer δεν άνοιξε συνεδρία"
   },
   "svctok.err.tokenNotConfigured": {
     "fr": "jeton non configuré",
@@ -3175,7 +3955,10 @@
     "ro": "token neconfigurat",
     "sv": "token inte konfigurerad",
     "hu": "a token nincs beállítva",
-    "vi": "chưa cấu hình token"
+    "vi": "chưa cấu hình token",
+    "nb": "token ikke konfigurert",
+    "pl": "token nie jest skonfigurowany",
+    "el": "το token δεν έχει ρυθμιστεί"
   },
   "svctok.err.deezerNotConnected": {
     "fr": "Deezer n'est pas connecté — enregistrez votre ARL",
@@ -3189,7 +3972,10 @@
     "ro": "Deezer nu este conectat — salvați ARL-ul",
     "sv": "Deezer är inte anslutet – spara din ARL",
     "hu": "A Deezer nincs csatlakoztatva – mentse az ARL-t",
-    "vi": "Deezer chưa kết nối — hãy lưu ARL của bạn"
+    "vi": "Deezer chưa kết nối — hãy lưu ARL của bạn",
+    "nb": "Deezer er ikke tilkoblet – lagre ARL-en din",
+    "pl": "Deezer nie jest połączony — zapisz swój ARL",
+    "el": "Το Deezer δεν είναι συνδεδεμένο — αποθηκεύστε το ARL σας"
   },
   "api.settings.notSaved": {
     "fr": "Le réglage n'a pas pu être enregistré.",
@@ -3203,7 +3989,10 @@
     "ro": "Setarea nu a putut fi salvată.",
     "sv": "Inställningen kunde inte sparas.",
     "hu": "A beállítást nem sikerült menteni.",
-    "vi": "Không thể lưu cài đặt."
+    "vi": "Không thể lưu cài đặt.",
+    "nb": "Innstillingen kunne ikke lagres.",
+    "pl": "Nie udało się zapisać ustawienia.",
+    "el": "Η ρύθμιση δεν μπόρεσε να αποθηκευτεί."
   },
   "api.devialet.sourceIndexRange": {
     "fr": "source_index doit être compris entre 0 et {max}.",
@@ -3217,7 +4006,10 @@
     "ro": "source_index trebuie să fie între 0 și {max}.",
     "sv": "source_index måste vara mellan 0 och {max}.",
     "hu": "A source_index értéke 0 és {max} között lehet.",
-    "vi": "source_index phải nằm trong khoảng 0 đến {max}."
+    "vi": "source_index phải nằm trong khoảng 0 đến {max}.",
+    "nb": "source_index må være mellom 0 og {max}.",
+    "pl": "source_index musi mieścić się między 0 a {max}.",
+    "el": "Το source_index πρέπει να είναι μεταξύ 0 και {max}."
   },
   "api.playlists.transferPluginNotCompiled": {
     "fr": "Le transfert de playlists passe par le greffon « Playlists converter », et ce serveur a été compilé sans greffons WASM.",
@@ -3231,7 +4023,10 @@
     "ro": "Transferul listelor trece prin pluginul „Playlists converter”, iar acest server a fost compilat fără pluginuri WASM.",
     "sv": "Överföring av spellistor går via insticksprogrammet ”Playlists converter”, och den här servern byggdes utan WASM-insticksprogram.",
     "hu": "A lejátszási listák átvitele a „Playlists converter” bővítményen keresztül történik, ez a szerver pedig WASM-bővítmények nélkül készült.",
-    "vi": "Việc chuyển danh sách phát đi qua plugin “Playlists converter”, và máy chủ này được biên dịch không có plugin WASM."
+    "vi": "Việc chuyển danh sách phát đi qua plugin “Playlists converter”, và máy chủ này được biên dịch không có plugin WASM.",
+    "nb": "Overføring av spillelister går via programtillegget «Playlists converter», og denne serveren ble bygget uten WASM-programtillegg.",
+    "pl": "Przenoszenie playlist odbywa się przez wtyczkę „Playlists converter”, a ten serwer zbudowano bez wtyczek WASM.",
+    "el": "Η μεταφορά λιστών γίνεται μέσω του πρόσθετου «Playlists converter», και αυτός ο διακομιστής δημιουργήθηκε χωρίς πρόσθετα WASM."
   },
   "api.playlists.transferPluginNotLoaded": {
     "fr": "Le transfert de playlists passe par le greffon « Playlists converter », qui n'est pas chargé sur ce serveur (désactivé, ou absent du dossier des greffons).",
@@ -3245,7 +4040,10 @@
     "ro": "Transferul listelor trece prin pluginul „Playlists converter”, care nu este încărcat pe acest server (dezactivat sau absent din dosarul de pluginuri).",
     "sv": "Överföring av spellistor går via insticksprogrammet ”Playlists converter”, som inte är inläst på den här servern (inaktiverat eller saknas i mappen för insticksprogram).",
     "hu": "A lejátszási listák átvitele a „Playlists converter” bővítményen keresztül történik, amely nincs betöltve ezen a szerveren (letiltva, vagy hiányzik a bővítmények mappájából).",
-    "vi": "Việc chuyển danh sách phát đi qua plugin “Playlists converter”, plugin này chưa được nạp trên máy chủ (đã tắt, hoặc không có trong thư mục plugin)."
+    "vi": "Việc chuyển danh sách phát đi qua plugin “Playlists converter”, plugin này chưa được nạp trên máy chủ (đã tắt, hoặc không có trong thư mục plugin).",
+    "nb": "Overføring av spillelister går via programtillegget «Playlists converter», som ikke er lastet på denne serveren (deaktivert eller mangler i mappen for programtillegg).",
+    "pl": "Przenoszenie playlist odbywa się przez wtyczkę „Playlists converter”, która nie jest załadowana na tym serwerze (wyłączona lub brak jej w folderze wtyczek).",
+    "el": "Η μεταφορά λιστών γίνεται μέσω του πρόσθετου «Playlists converter», που δεν έχει φορτωθεί σε αυτόν τον διακομιστή (απενεργοποιημένο ή απόν από τον φάκελο πρόσθετων)."
   },
   "api.library.removeDirPurgeNotConfirmed": {
     "fr": "Le dossier a bien été retiré des réglages. En revanche, la confirmation reçue ne couvre pas les {count} pistes concernées : aucune n'a été supprimée. Confirmez ce nombre exact pour les retirer aussi.",
@@ -3259,7 +4057,10 @@
     "ro": "Dosarul a fost eliminat din setări. Totuși, confirmarea primită nu acoperă cele {count} piese în cauză: niciuna nu a fost ștearsă. Confirmați acest număr exact pentru a le elimina și pe ele.",
     "sv": "Mappen togs bort från inställningarna. Men bekräftelsen som togs emot täcker inte de {count} berörda spåren: inga raderades. Bekräfta exakt detta antal för att ta bort dem också.",
     "hu": "A mappa kikerült a beállításokból. A kapott megerősítés azonban nem fedi le az érintett {count} számot: egyik sem törlődött. Erősítse meg pontosan ezt a számot, hogy azokat is eltávolítsa.",
-    "vi": "Thư mục đã được gỡ khỏi cài đặt. Tuy nhiên, xác nhận nhận được không bao gồm {count} bản nhạc liên quan: không bản nào bị xóa. Hãy xác nhận đúng con số này để gỡ cả chúng."
+    "vi": "Thư mục đã được gỡ khỏi cài đặt. Tuy nhiên, xác nhận nhận được không bao gồm {count} bản nhạc liên quan: không bản nào bị xóa. Hãy xác nhận đúng con số này để gỡ cả chúng.",
+    "nb": "Mappen ble fjernet fra innstillingene. Bekreftelsen som ble mottatt dekker imidlertid ikke de {count} berørte sporene: ingen ble slettet. Bekreft nøyaktig dette tallet for å fjerne dem også.",
+    "pl": "Folder został usunięty z ustawień. Otrzymane potwierdzenie nie obejmuje jednak {count} utworów: żaden nie został usunięty. Potwierdź dokładnie tę liczbę, aby je także usunąć.",
+    "el": "Ο φάκελος αφαιρέθηκε από τις ρυθμίσεις. Ωστόσο η επιβεβαίωση που λήφθηκε δεν καλύπτει τα {count} κομμάτια: κανένα δεν διαγράφηκε. Επιβεβαιώστε αυτόν ακριβώς τον αριθμό για να αφαιρεθούν κι αυτά."
   },
   "api.library.purgeNothingUnder": {
     "fr": "Aucune piste n'est enregistrée sous {path}.",
@@ -3273,7 +4074,10 @@
     "ro": "Nicio piesă nu este înregistrată sub {path}.",
     "sv": "Inga spår är registrerade under {path}.",
     "hu": "A(z) {path} alatt nincs nyilvántartott szám.",
-    "vi": "Không có bản nhạc nào được ghi nhận dưới {path}."
+    "vi": "Không có bản nhạc nào được ghi nhận dưới {path}.",
+    "nb": "Ingen spor er registrert under {path}.",
+    "pl": "Pod {path} nie zarejestrowano żadnego utworu.",
+    "el": "Δεν υπάρχει καταχωρισμένο κομμάτι κάτω από {path}."
   },
   "api.library.purgeDryRun": {
     "fr": "{count} pistes seraient retirées définitivement. Rappelez cette route avec confirm_purge={count} pour confirmer.",
@@ -3287,7 +4091,10 @@
     "ro": "{count} piese ar fi eliminate definitiv. Apelați din nou această rută cu confirm_purge={count} pentru a confirma.",
     "sv": "{count} spår skulle tas bort permanent. Anropa den här vägen igen med confirm_purge={count} för att bekräfta.",
     "hu": "{count} szám véglegesen törlődne. A megerősítéshez hívja újra ezt az útvonalat confirm_purge={count} értékkel.",
-    "vi": "{count} bản nhạc sẽ bị gỡ vĩnh viễn. Gọi lại route này với confirm_purge={count} để xác nhận."
+    "vi": "{count} bản nhạc sẽ bị gỡ vĩnh viễn. Gọi lại route này với confirm_purge={count} để xác nhận.",
+    "nb": "{count} spor ville blitt fjernet permanent. Kall denne ruten igjen med confirm_purge={count} for å bekrefte.",
+    "pl": "{count} utworów zostałoby trwale usuniętych. Wywołaj tę ścieżkę ponownie z confirm_purge={count}, aby potwierdzić.",
+    "el": "{count} κομμάτια θα αφαιρούνταν οριστικά. Καλέστε ξανά αυτή τη διαδρομή με confirm_purge={count} για επιβεβαίωση."
   },
   "api.library.purgeNotConfirmed": {
     "fr": "La confirmation reçue ne couvre pas les {count} pistes concernées. Rien n'a été retiré. Confirmez ce nombre exact pour poursuivre.",
@@ -3301,7 +4108,10 @@
     "ro": "Confirmarea primită nu acoperă cele {count} piese în cauză. Nu a fost eliminat nimic. Confirmați acest număr exact pentru a continua.",
     "sv": "Bekräftelsen som togs emot täcker inte de {count} berörda spåren. Inget togs bort. Bekräfta exakt detta antal för att fortsätta.",
     "hu": "A kapott megerősítés nem fedi le az érintett {count} számot. Semmi sem lett eltávolítva. A folytatáshoz erősítse meg pontosan ezt a számot.",
-    "vi": "Xác nhận nhận được không bao gồm {count} bản nhạc liên quan. Không có gì bị gỡ. Hãy xác nhận đúng con số này để tiếp tục."
+    "vi": "Xác nhận nhận được không bao gồm {count} bản nhạc liên quan. Không có gì bị gỡ. Hãy xác nhận đúng con số này để tiếp tục.",
+    "nb": "Bekreftelsen som ble mottatt dekker ikke de {count} berørte sporene. Ingenting ble fjernet. Bekreft nøyaktig dette tallet for å fortsette.",
+    "pl": "Otrzymane potwierdzenie nie obejmuje {count} utworów. Nic nie zostało usunięte. Potwierdź dokładnie tę liczbę, aby kontynuować.",
+    "el": "Η επιβεβαίωση που λήφθηκε δεν καλύπτει τα {count} κομμάτια. Δεν αφαιρέθηκε τίποτα. Επιβεβαιώστε αυτόν ακριβώς τον αριθμό για να συνεχίσετε."
   },
   "api.license.activated": {
     "fr": "Licence validée : Premium activé.",
@@ -3315,7 +4125,10 @@
     "ro": "Licență validată: Premium activat.",
     "sv": "Licensen är bekräftad: Premium är aktiverat.",
     "hu": "Licenc érvényesítve: a Premium aktív.",
-    "vi": "Giấy phép đã được xác thực: Premium đã kích hoạt."
+    "vi": "Giấy phép đã được xác thực: Premium đã kích hoạt.",
+    "nb": "Lisensen er bekreftet: Premium er aktivert.",
+    "pl": "Licencja zweryfikowana: Premium aktywne.",
+    "el": "Η άδεια επικυρώθηκε: το Premium ενεργοποιήθηκε."
   },
   "api.license.pending": {
     "fr": "Clé enregistrée. Premium s'activera dès qu'elle sera validée en ligne (vérifiez votre connexion et la clé).",
@@ -3329,7 +4142,10 @@
     "ro": "Cheie salvată. Premium se va activa imediat ce va fi validată online (verificați conexiunea și cheia).",
     "sv": "Nyckeln sparades. Premium aktiveras när den har bekräftats online (kontrollera anslutningen och nyckeln).",
     "hu": "Kulcs mentve. A Premium az online érvényesítés után aktiválódik (ellenőrizze a kapcsolatot és a kulcsot).",
-    "vi": "Đã lưu khóa. Premium sẽ kích hoạt khi khóa được xác thực trực tuyến (kiểm tra kết nối và khóa)."
+    "vi": "Đã lưu khóa. Premium sẽ kích hoạt khi khóa được xác thực trực tuyến (kiểm tra kết nối và khóa).",
+    "nb": "Nøkkelen er lagret. Premium aktiveres når den er bekreftet på nett (sjekk tilkoblingen og nøkkelen).",
+    "pl": "Klucz zapisany. Premium włączy się po weryfikacji online (sprawdź połączenie i klucz).",
+    "el": "Το κλειδί αποθηκεύτηκε. Το Premium θα ενεργοποιηθεί μόλις επικυρωθεί online (ελέγξτε τη σύνδεση και το κλειδί)."
   },
   "api.network.shareUnknown": {
     "fr": "Ce partage n'est plus enregistré.",
@@ -3343,7 +4159,10 @@
     "ro": "Această partajare nu mai este înregistrată.",
     "sv": "Den här utdelningen är inte längre registrerad.",
     "hu": "Ez a megosztás már nincs nyilvántartva.",
-    "vi": "Thư mục chia sẻ này không còn được đăng ký."
+    "vi": "Thư mục chia sẻ này không còn được đăng ký.",
+    "nb": "Denne delingen er ikke lenger registrert.",
+    "pl": "Ten udział nie jest już zarejestrowany.",
+    "el": "Αυτός ο κοινόχρηστος φάκελος δεν είναι πλέον καταχωρισμένος."
   },
   "api.network.shareHasLibraryFolders": {
     "fr": "{count} dossier(s) de la bibliothèque se trouvent sur ce partage.",
@@ -3357,7 +4176,10 @@
     "ro": "{count} dosar(e) ale bibliotecii se află pe această partajare.",
     "sv": "{count} biblioteksmapp(ar) finns på den här utdelningen.",
     "hu": "{count} könyvtármappa található ezen a megosztáson.",
-    "vi": "Có {count} thư mục thư viện nằm trên thư mục chia sẻ này."
+    "vi": "Có {count} thư mục thư viện nằm trên thư mục chia sẻ này.",
+    "nb": "{count} biblioteksmappe(r) ligger på denne delingen.",
+    "pl": "Na tym udziale znajduje się folderów biblioteki: {count}.",
+    "el": "{count} φάκελοι της βιβλιοθήκης βρίσκονται σε αυτόν τον κοινόχρηστο φάκελο."
   },
   "api.network.unmountFailed": {
     "fr": "Impossible de démonter {path}. Le partage est conservé.",
@@ -3371,7 +4193,10 @@
     "ro": "{path} nu a putut fi demontat. Partajarea este păstrată.",
     "sv": "Det gick inte att avmontera {path}. Utdelningen behålls.",
     "hu": "A(z) {path} leválasztása nem sikerült. A megosztás megmarad.",
-    "vi": "Không thể gỡ gắn kết {path}. Thư mục chia sẻ được giữ lại."
+    "vi": "Không thể gỡ gắn kết {path}. Thư mục chia sẻ được giữ lại.",
+    "nb": "Kunne ikke avmontere {path}. Delingen beholdes.",
+    "pl": "Nie udało się odmontować {path}. Udział zostaje zachowany.",
+    "el": "Δεν ήταν δυνατή η αποπροσάρτηση του {path}. Ο κοινόχρηστος φάκελος διατηρείται."
   },
   "api.network.smbReachable": {
     "fr": "Serveur joignable (port 445) — identifiants et partage non vérifiés",
@@ -3385,7 +4210,10 @@
     "ro": "Server accesibil (portul 445) — datele de autentificare și partajarea nu au fost verificate",
     "sv": "Servern nås (port 445) – inloggningsuppgifter och utdelning är inte kontrollerade",
     "hu": "A szerver elérhető (445-ös port) – a hitelesítő adatok és a megosztás nincs ellenőrizve",
-    "vi": "Máy chủ truy cập được (cổng 445) — chưa kiểm tra thông tin đăng nhập và thư mục chia sẻ"
+    "vi": "Máy chủ truy cập được (cổng 445) — chưa kiểm tra thông tin đăng nhập và thư mục chia sẻ",
+    "nb": "Serveren kan nås (port 445) – påloggingsdetaljer og deling er ikke kontrollert",
+    "pl": "Serwer osiągalny (port 445) — dane logowania i udział nie zostały sprawdzone",
+    "el": "Ο διακομιστής είναι προσβάσιμος (θύρα 445) — τα διαπιστευτήρια και ο φάκελος δεν ελέγχθηκαν"
   },
   "api.network.smbUnreachable": {
     "fr": "Serveur injoignable sur le port 445",
@@ -3399,7 +4227,10 @@
     "ro": "Server inaccesibil pe portul 445",
     "sv": "Servern kan inte nås på port 445",
     "hu": "A szerver nem érhető el a 445-ös porton",
-    "vi": "Không truy cập được máy chủ qua cổng 445"
+    "vi": "Không truy cập được máy chủ qua cổng 445",
+    "nb": "Serveren kan ikke nås på port 445",
+    "pl": "Serwer nieosiągalny na porcie 445",
+    "el": "Ο διακομιστής δεν είναι προσβάσιμος στη θύρα 445"
   },
   "api.profiles.listUnreadable": {
     "fr": "La liste des profils n'a pas pu être lue dans la base.",
@@ -3413,7 +4244,10 @@
     "ro": "Lista de profiluri nu a putut fi citită din baza de date.",
     "sv": "Profillistan kunde inte läsas från databasen.",
     "hu": "A profilok listáját nem sikerült beolvasni az adatbázisból.",
-    "vi": "Không đọc được danh sách hồ sơ từ cơ sở dữ liệu."
+    "vi": "Không đọc được danh sách hồ sơ từ cơ sở dữ liệu.",
+    "nb": "Profillisten kunne ikke leses fra databasen.",
+    "pl": "Nie udało się odczytać listy profili z bazy danych.",
+    "el": "Η λίστα προφίλ δεν μπόρεσε να διαβαστεί από τη βάση δεδομένων."
   },
   "api.eq.presetNoZone": {
     "fr": "Ce préréglage n'est lié à aucune zone : précisez ?zone_id=N. Sans zone, l'égaliseur ne saurait pas quelle sortie régler.",
@@ -3427,7 +4261,10 @@
     "ro": "Această presetare nu este legată de nicio zonă: precizați ?zone_id=N. Fără zonă, egalizatorul nu ar ști ce ieșire să regleze.",
     "sv": "Den här förinställningen är inte kopplad till någon zon: ange ?zone_id=N. Utan zon vet equalizern inte vilken utgång den ska justera.",
     "hu": "Ez az előbeállítás egyik zónához sincs kötve: adja meg a ?zone_id=N paramétert. Zóna nélkül a hangszínszabályzó nem tudná, melyik kimenetet állítsa.",
-    "vi": "Thiết lập sẵn này không gắn với vùng nào: hãy chỉ định ?zone_id=N. Không có vùng, bộ cân bằng không biết chỉnh đầu ra nào."
+    "vi": "Thiết lập sẵn này không gắn với vùng nào: hãy chỉ định ?zone_id=N. Không có vùng, bộ cân bằng không biết chỉnh đầu ra nào.",
+    "nb": "Denne forhåndsinnstillingen er ikke knyttet til noen sone: angi ?zone_id=N. Uten sone vet ikke equalizeren hvilken utgang den skal justere.",
+    "pl": "To ustawienie nie jest powiązane z żadną strefą: podaj ?zone_id=N. Bez strefy korektor nie wiedziałby, które wyjście regulować.",
+    "el": "Αυτή η προρύθμιση δεν συνδέεται με καμία ζώνη: ορίστε ?zone_id=N. Χωρίς ζώνη, ο ισοσταθμιστής δεν θα ήξερε ποια έξοδο να ρυθμίσει."
   },
   "api.eq.preampCoveredByHeadroom": {
     "fr": "Le pré-gain automatique de l'égaliseur réserve {reserved} dB, soit au moins la marge du Preamp AutoEq ({preamp} dB) : celui-ci n'est donc pas appliqué en plus. Le préréglage joue plus bas qu'un lecteur qui suit le Preamp ; compensez au volume.",
@@ -3441,7 +4278,10 @@
     "ro": "Preamplificarea automată a egalizatorului rezervă {reserved} dB, cel puțin marja Preamp din AutoEq ({preamp} dB), deci acesta nu se aplică în plus. Presetarea sună mai încet decât un player care urmează Preamp; compensați din volum.",
     "sv": "Equalizerns automatiska förförstärkning reserverar {reserved} dB, minst AutoEq-förstärkningens marginal ({preamp} dB), så Preamp tillämpas inte utöver det. Förinställningen spelar lägre än en spelare som följer Preamp; kompensera med volymen.",
     "hu": "A hangszínszabályzó automatikus előerősítése {reserved} dB-t tart fenn, legalább az AutoEq Preamp tartalékát ({preamp} dB), így azt nem alkalmazza külön. Az előbeállítás halkabban szól, mint egy Preampet követő lejátszó; kompenzáljon a hangerővel.",
-    "vi": "Độ lợi trước tự động của bộ cân bằng dành {reserved} dB, ít nhất bằng biên Preamp của AutoEq ({preamp} dB), nên Preamp không được áp dụng thêm. Thiết lập sẵn phát nhỏ hơn trình phát theo Preamp; hãy bù bằng âm lượng."
+    "vi": "Độ lợi trước tự động của bộ cân bằng dành {reserved} dB, ít nhất bằng biên Preamp của AutoEq ({preamp} dB), nên Preamp không được áp dụng thêm. Thiết lập sẵn phát nhỏ hơn trình phát theo Preamp; hãy bù bằng âm lượng.",
+    "nb": "Equalizerens automatiske forforsterkning reserverer {reserved} dB, minst AutoEq-preampens margin ({preamp} dB), så Preamp brukes ikke i tillegg. Forhåndsinnstillingen spiller lavere enn en spiller som følger Preamp; kompenser med volumet.",
+    "pl": "Automatyczne wstępne wzmocnienie korektora rezerwuje {reserved} dB, co najmniej margines Preamp z AutoEq ({preamp} dB), więc Preamp nie jest stosowany dodatkowo. Ustawienie gra ciszej niż odtwarzacz stosujący Preamp; wyrównaj głośnością.",
+    "el": "Η αυτόματη προενίσχυση του ισοσταθμιστή δεσμεύει {reserved} dB, τουλάχιστον το περιθώριο του Preamp του AutoEq ({preamp} dB), οπότε το Preamp δεν εφαρμόζεται επιπλέον. Η προρύθμιση παίζει χαμηλότερα από έναν αναπαραγωγέα που ακολουθεί το Preamp· αντισταθμίστε με την ένταση."
   },
   "api.eq.preampNotStandard": {
     "fr": "Ce fichier demande un Preamp de {preamp} dB alors que la somme de ses gains positifs n'en justifie que {reserved} : ce n'est pas un export AutoEq standard. Le préréglage est importé tel quel ; baissez le volume avant de l'activer.",
@@ -3455,7 +4295,10 @@
     "ro": "Acest fișier cere un Preamp de {preamp} dB, deși suma câștigurilor pozitive justifică doar {reserved}: nu este un export AutoEq standard. Presetarea este importată ca atare; reduceți volumul înainte de a o activa.",
     "sv": "Den här filen begär en Preamp på {preamp} dB, men summan av dess positiva förstärkningar motiverar bara {reserved}: det är ingen standardexport från AutoEq. Förinställningen importeras som den är; sänk volymen innan du aktiverar den.",
     "hu": "Ez a fájl {preamp} dB Preampet kér, pedig pozitív erősítéseinek összege csak {reserved} értéket indokol: ez nem szabványos AutoEq-export. Az előbeállítás változatlanul kerül importálásra; bekapcsolás előtt vegye lejjebb a hangerőt.",
-    "vi": "Tệp này yêu cầu Preamp {preamp} dB trong khi tổng độ lợi dương chỉ cần {reserved}: đây không phải bản xuất AutoEq chuẩn. Thiết lập sẵn được nhập nguyên trạng; hãy giảm âm lượng trước khi bật."
+    "vi": "Tệp này yêu cầu Preamp {preamp} dB trong khi tổng độ lợi dương chỉ cần {reserved}: đây không phải bản xuất AutoEq chuẩn. Thiết lập sẵn được nhập nguyên trạng; hãy giảm âm lượng trước khi bật.",
+    "nb": "Denne filen ber om en Preamp på {preamp} dB, men summen av de positive forsterkningene rettferdiggjør bare {reserved}: dette er ikke en standard AutoEq-eksport. Forhåndsinnstillingen importeres som den er; senk volumet før du aktiverer den.",
+    "pl": "Ten plik żąda Preamp {preamp} dB, choć suma jego dodatnich wzmocnień uzasadnia tylko {reserved}: to nie jest standardowy eksport AutoEq. Ustawienie zostanie zaimportowane bez zmian; przed włączeniem ścisz głośność.",
+    "el": "Αυτό το αρχείο ζητά Preamp {preamp} dB, ενώ το άθροισμα των θετικών ενισχύσεών του δικαιολογεί μόνο {reserved}: δεν είναι τυπική εξαγωγή AutoEq. Η προρύθμιση εισάγεται ως έχει· χαμηλώστε την ένταση πριν την ενεργοποιήσετε."
   },
   "api.zones.fieldWriteFailed": {
     "fr": "Le champ « {field} » de la zone n'a pas pu être enregistré.",
@@ -3469,7 +4312,10 @@
     "ro": "Câmpul „{field}” al zonei nu a putut fi salvat.",
     "sv": "Zonfältet ”{field}” kunde inte sparas.",
     "hu": "A zóna „{field}” mezőjét nem sikerült menteni.",
-    "vi": "Không thể lưu trường “{field}” của vùng."
+    "vi": "Không thể lưu trường “{field}” của vùng.",
+    "nb": "Sonefeltet «{field}» kunne ikke lagres.",
+    "pl": "Nie udało się zapisać pola strefy „{field}”.",
+    "el": "Το πεδίο «{field}» της ζώνης δεν μπόρεσε να αποθηκευτεί."
   },
   "api.zones.fieldInvalid": {
     "fr": "Valeur refusée pour le champ « {field} » (reçu : « {value} »).",
@@ -3483,7 +4329,10 @@
     "ro": "Valoare nevalidă pentru câmpul „{field}” (primit: „{value}”).",
     "sv": "Ogiltigt värde för fältet ”{field}” (mottaget: ”{value}”).",
     "hu": "Érvénytelen érték a(z) „{field}” mezőben (kapott: „{value}”).",
-    "vi": "Giá trị không hợp lệ cho trường “{field}” (nhận được: “{value}”)."
+    "vi": "Giá trị không hợp lệ cho trường “{field}” (nhận được: “{value}”).",
+    "nb": "Ugyldig verdi for feltet «{field}» (mottatt: «{value}»).",
+    "pl": "Nieprawidłowa wartość pola „{field}” (otrzymano: „{value}”).",
+    "el": "Μη έγκυρη τιμή για το πεδίο «{field}» (ελήφθη: «{value}»)."
   },
   "api.zones.noOutputDevice": {
     "fr": "La zone « {name} » n'aurait aucune sortie : choisissez un appareil découvert avant de la créer.",
@@ -3497,7 +4346,10 @@
     "ro": "Zona „{name}” nu ar avea nicio ieșire: alegeți un dispozitiv descoperit înainte de a o crea.",
     "sv": "Zonen ”{name}” skulle inte ha någon utgång: välj en upptäckt enhet innan du skapar den.",
     "hu": "A(z) „{name}” zónának nem lenne kimenete: létrehozás előtt válasszon egy felderített eszközt.",
-    "vi": "Vùng “{name}” sẽ không có đầu ra: hãy chọn một thiết bị đã phát hiện trước khi tạo."
+    "vi": "Vùng “{name}” sẽ không có đầu ra: hãy chọn một thiết bị đã phát hiện trước khi tạo.",
+    "nb": "Sonen «{name}» ville ikke hatt noen utgang: velg en oppdaget enhet før du oppretter den.",
+    "pl": "Strefa „{name}” nie miałaby żadnego wyjścia: przed utworzeniem wybierz wykryte urządzenie.",
+    "el": "Η ζώνη «{name}» δεν θα είχε καμία έξοδο: επιλέξτε μια συσκευή που εντοπίστηκε πριν τη δημιουργήσετε."
   },
   "api.zones.mergeSelf": {
     "fr": "Une zone ne peut pas être fusionnée avec elle-même.",
@@ -3511,7 +4363,10 @@
     "ro": "O zonă nu poate fi combinată cu ea însăși.",
     "sv": "En zon kan inte slås ihop med sig själv.",
     "hu": "Egy zóna nem egyesíthető önmagával.",
-    "vi": "Không thể hợp nhất một vùng với chính nó."
+    "vi": "Không thể hợp nhất một vùng với chính nó.",
+    "nb": "En sone kan ikke slås sammen med seg selv.",
+    "pl": "Strefy nie można scalić z nią samą.",
+    "el": "Μια ζώνη δεν μπορεί να συγχωνευθεί με τον εαυτό της."
   },
   "api.zones.mergeDifferentDevices": {
     "fr": "Les deux zones ne désignent pas le même appareil : la fusion est refusée.",
@@ -3525,6 +4380,9 @@
     "ro": "Cele două zone nu indică același dispozitiv: combinarea este refuzată.",
     "sv": "De två zonerna pekar inte på samma enhet: sammanslagningen nekas.",
     "hu": "A két zóna nem ugyanarra az eszközre mutat: az egyesítés elutasítva.",
-    "vi": "Hai vùng không trỏ đến cùng một thiết bị: từ chối hợp nhất."
+    "vi": "Hai vùng không trỏ đến cùng một thiết bị: từ chối hợp nhất.",
+    "nb": "De to sonene peker ikke på samme enhet: sammenslåingen avvises.",
+    "pl": "Obie strefy nie wskazują tego samego urządzenia: scalenie odrzucone.",
+    "el": "Οι δύο ζώνες δεν δείχνουν την ίδια συσκευή: η συγχώνευση απορρίπτεται."
   }
 }
