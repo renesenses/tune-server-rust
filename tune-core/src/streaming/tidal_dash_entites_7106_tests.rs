@@ -205,7 +205,13 @@ async fn contre_epreuve_l_url_brute_est_refusee_par_le_cdn_7106() {
     let brute = format!(
         "{base}/{CHEMIN}/1.mp4?Policy={POLICY}&amp;Signature={SIGNATURE}&amp;Key-Pair-Id={KEY_PAIR}"
     );
-    let statut = reqwest::get(&brute).await.unwrap().status().as_u16();
+    let statut = crate::http::client::shared()
+        .get(&brute)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
     assert_eq!(statut, 403, "l'URL non désechappée perd sa signature");
 
     // Et un init refusé est une erreur dite comme telle, pas un corps d'erreur
