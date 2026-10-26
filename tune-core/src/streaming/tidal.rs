@@ -4923,6 +4923,11 @@ mod manifeste_v2_6334_tests;
 #[path = "tidal_dash_entites_7106_tests.rs"]
 mod dash_entites_7106_tests;
 
+// #7106 — le MPD v2 RÉEL (relevé le 26/10 sur le .18) : `token` + `info`.
+#[cfg(test)]
+#[path = "tidal_dash_mpd_reel_7106_tests.rs"]
+mod dash_mpd_reel_7106_tests;
+
 /// #5997 — les favoris Tidal sont relus EN ENTIER, et une lecture incomplète
 /// se dit au miroir au lieu de passer pour la liste entière.
 #[cfg(test)]
