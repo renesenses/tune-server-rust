@@ -150,6 +150,9 @@ struct TranscodageEnTache {
     seek_s: f64,
     is_dash_local: bool,
     use_http_range: bool,
+    /// #7100 — l'écrêtage relevé par le relais DSP de cette session, que le
+    /// forwarder de niveaux lit pour allumer `over_*`. `None` sans relais.
+    ecretages: Option<Arc<crate::audio::ecretage_de_traitement::EcretagesDeTraitement>>,
 }
 
 /// Rejoue sur une requête les en-têtes rendus par le résolveur (#4366).
@@ -1059,6 +1062,7 @@ impl PlaybackOrchestrator {
             seek_s,
             is_dash_local,
             use_http_range,
+            ecretages: None,
         }
     }
 
@@ -1085,6 +1089,7 @@ impl PlaybackOrchestrator {
             seek_s,
             is_dash_local,
             use_http_range,
+            ecretages,
         } = tache;
         // Audio-levels channel so the web client VU-meter works for
         // streaming-service content played through local/OAAT outputs.
@@ -1093,12 +1098,13 @@ impl PlaybackOrchestrator {
         let levels_tx = match ev_bus.filter(|_| attach_levels) {
             Some(bus) => {
                 let play_seq = playback.current_play_seq(zone_id).await;
-                spawn_paced_levels_forwarder(
+                spawn_paced_levels_forwarder_avec_ecretages(
                     bus,
                     playback,
                     zone_id,
                     play_seq,
                     (seek_s * 1000.0) as i64,
+                    ecretages,
                 )
             }
             None => tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0,
@@ -2758,8 +2764,19 @@ impl PlaybackOrchestrator {
         };
         self.poser_le_contexte_de_conversion(&session_id, contexte)
             .await;
-        let tx = spawn_streaming_dsp_relay(dsp, bd, true, tx);
-        let tache = self.capturer_pour_le_transcodage(
+        // #7100 — le relais relève où sa chaîne écrête, au référentiel des
+        // fenêtres du forwarder (seek compris).
+        let ecretages =
+            Arc::new(crate::audio::ecretage_de_traitement::EcretagesDeTraitement::new());
+        let releve = crate::audio::ecretage_de_traitement::ReleveDEcretage::new(
+            ecretages.clone(),
+            req.seek_ms.unwrap_or(0) as f64,
+            sr,
+            2,
+            bd,
+        );
+        let tx = spawn_streaming_dsp_relay_releve(dsp, bd, true, tx, Some(releve));
+        let mut tache = self.capturer_pour_le_transcodage(
             req,
             service_name,
             stream_data.url.clone(),
@@ -2769,6 +2786,7 @@ impl PlaybackOrchestrator {
             bd,
             &session_id,
         );
+        tache.ecretages = Some(ecretages);
         tokio::spawn(Self::transcoder_le_flux_en_wav(tache, tx, data_ready));
         let server_ip = self.server_ip();
         let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");

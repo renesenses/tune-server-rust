@@ -3349,6 +3349,9 @@ impl PlaybackOrchestrator {
             };
             self.poser_le_contexte_de_conversion(&session_id, contexte)
                 .await;
+            let ecretages =
+                Arc::new(crate::audio::ecretage_de_traitement::EcretagesDeTraitement::new());
+            let ecretages_du_forwarder = ecretages.clone();
             let tx = if relais || relais_en_vol {
                 if relais {
                     tracing::info!(zone_id = req.zone_id, "local_channel_dsp_relay_inserted");
@@ -3359,7 +3362,16 @@ impl PlaybackOrchestrator {
                     self.noter_eq_en_vol(req.zone_id, &session_id, poste.clone());
                     dsp.en_vol = Some(poste);
                 }
-                spawn_streaming_dsp_relay(dsp, out_bd, true, tx)
+                // #7100 — le relais relève où SA chaîne écrête ; le forwarder
+                // de la même session le lit pour allumer `over_*`.
+                let releve = crate::audio::ecretage_de_traitement::ReleveDEcretage::new(
+                    ecretages.clone(),
+                    req.seek_ms.unwrap_or(0) as f64,
+                    out_sr,
+                    channels,
+                    out_bd,
+                );
+                spawn_streaming_dsp_relay_releve(dsp, out_bd, true, tx, Some(releve))
             } else {
                 tx
             };
@@ -3413,12 +3425,13 @@ impl PlaybackOrchestrator {
                 let levels_tx = match ev_bus.filter(|_| attach_levels) {
                     Some(bus) => {
                         let play_seq = playback.current_play_seq(zone_id).await;
-                        spawn_paced_levels_forwarder(
+                        spawn_paced_levels_forwarder_avec_ecretages(
                             bus,
                             playback,
                             zone_id,
                             play_seq,
                             seek_niveaux_ms,
+                            Some(ecretages_du_forwarder),
                         )
                     }
                     None => {

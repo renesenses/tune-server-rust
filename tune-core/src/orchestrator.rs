@@ -185,6 +185,29 @@ fn spawn_paced_levels_forwarder(
     spawn_paced_levels_forwarder_mesure(bus, playback, zone_id, play_seq, start_position_ms).0
 }
 
+/// #7100 — le même forwarder, qui lit en plus l'écrêtage relevé par le relais
+/// progressif de SA session (`ReleveDEcretage`) : sur une zone réseau, c'est
+/// la seule source qui sache dire que l'égaliseur, le ReplayGain, le
+/// convolveur ou le crossfeed ont poussé un échantillon jusqu'au rail.
+fn spawn_paced_levels_forwarder_avec_ecretages(
+    bus: Arc<EventBus>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    play_seq: u64,
+    start_position_ms: i64,
+    ecretages: Option<Arc<crate::audio::ecretage_de_traitement::EcretagesDeTraitement>>,
+) -> tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow> {
+    spawn_paced_levels_forwarder_complet(
+        bus,
+        playback,
+        zone_id,
+        play_seq,
+        start_position_ms,
+        ecretages,
+    )
+    .0
+}
+
 /// #3818 — le même forwarder, qui rend en plus ce qu'il a CONSOMMÉ de sa
 /// file, en millisecondes de piste : chaque fenêtre reçue, publiée ou sautée,
 /// y ajoute sa durée. C'est l'horloge que le frein du décodage-pour-niveaux
@@ -198,6 +221,20 @@ fn spawn_paced_levels_forwarder_mesure(
     zone_id: i64,
     play_seq: u64,
     start_position_ms: i64,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    Arc<std::sync::atomic::AtomicI64>,
+) {
+    spawn_paced_levels_forwarder_complet(bus, playback, zone_id, play_seq, start_position_ms, None)
+}
+
+fn spawn_paced_levels_forwarder_complet(
+    bus: Arc<EventBus>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    play_seq: u64,
+    start_position_ms: i64,
+    ecretages: Option<Arc<crate::audio::ecretage_de_traitement::EcretagesDeTraitement>>,
 ) -> (
     tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
     Arc<std::sync::atomic::AtomicI64>,
@@ -446,14 +483,31 @@ fn spawn_paced_levels_forwarder_mesure(
             // DSP, déjà dans les échantillons. Bornée à la pleine échelle :
             // c'est tout ce que le DAC peut recevoir.
             let debut_ms = position.as_secs_f64() * 1000.0;
-            if let Some((gauche, droite)) = playback.crete_de_sortie(
-                zone_id,
-                debut_ms,
-                debut_ms + window.as_secs_f64() * 1000.0,
-            ) {
+            let fin_ms = debut_ms + window.as_secs_f64() * 1000.0;
+            // #7100 — l'ÉCRÊTAGE RÉEL après traitement, et lui seul, allume
+            // `over_*`. Avant, `over_*` disait « la source a trois échantillons
+            // à pleine échelle » : sur une zone réseau (gain unité, volume de
+            // l'appareil), un master à 0 dBFS allumait le rouge à 20 % de
+            // volume sans qu'aucun traitement n'ait rien écrêté (Alex, Docker,
+            // Qobuz 44,1/24). Trois sources, du plus exact au plus grossier :
+            //   * sortie locale : la crête relevée APRÈS son DSP, que les
+            //     rappels multiplient par le gain de rendu, dépasse le plein ;
+            //   * relais progressif réseau : un échantillon poussé au rail par
+            //     la chaîne de la session ;
+            //   * sinon : le gain scalaire déclaré dépasse le plein.
+            let mut ecrete_gauche = lvl.depasse_left;
+            let mut ecrete_droite = lvl.depasse_right;
+            if let Some((gauche, droite)) = playback.crete_de_sortie(zone_id, debut_ms, fin_ms) {
                 let rendu = f64::from(playback.gain_de_rendu_units(zone_id)) / 1000.0;
+                ecrete_gauche = gauche * rendu > 1.0;
+                ecrete_droite = droite * rendu > 1.0;
                 lvl.peak_left = (gauche * rendu).min(1.0);
                 lvl.peak_right = (droite * rendu).min(1.0);
+            }
+            if let Some(registre) = ecretages.as_ref() {
+                let (gauche, droite) = registre.ecretage_entre(debut_ms, fin_ms);
+                ecrete_gauche |= gauche;
+                ecrete_droite |= droite;
             }
             let (peak_hold_left_db, peak_hold_right_db) =
                 peak_hold.update(lvl.window, lvl.peak_left, lvl.peak_right);
@@ -503,10 +557,18 @@ fn spawn_paced_levels_forwarder_mesure(
                             } else {
                                 crate::audio::levels::gain_units_en_db(gain_units)
                             },
-                            // Surcharge = échantillons consécutifs à pleine échelle,
-                            // la seule que du PCM entier sache montrer (#4175).
-                            "over_left": lvl.over_left(),
-                            "over_right": lvl.over_right(),
+                            // #7100 — surcharge = écrêtage RÉEL après traitement
+                            // (volume, gain, égaliseur, ReplayGain compris). Ce
+                            // n'est plus la suite à pleine échelle de la source.
+                            "over_left": ecrete_gauche,
+                            "over_right": ecrete_droite,
+                            // #7100 — la SOURCE touche la pleine échelle (#4175 :
+                            // trois échantillons consécutifs, avant tout gain).
+                            // Champ ADDITIF et NEUTRE : la crête du disque, pas
+                            // une alerte. Sa présence dit aussi au client que
+                            // `over_*` a le sens ci-dessus.
+                            "source_over_left": lvl.source_over_left(),
+                            "source_over_right": lvl.source_over_right(),
                             "over_run_left": lvl.over_run_left,
                             "over_run_right": lvl.over_run_right,
                             "rms_left": lvl.rms_left,
@@ -1707,10 +1769,24 @@ pub(crate) use session::*;
 /// `streaming_decode_wav_header_sent`). Le passer dans l'égaliseur reviendrait
 /// à filtrer les lettres « RIFF » — en-tête corrompu, donc bruit ou silence.
 fn spawn_streaming_dsp_relay(
+    dsp: StreamingDsp,
+    bit_depth: u16,
+    skip_header: bool,
+    downstream: tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+    spawn_streaming_dsp_relay_releve(dsp, bit_depth, skip_header, downstream, None)
+}
+
+/// #7100 — le même relais, qui compare chaque bloc avant et après sa chaîne
+/// et relève, dans le registre de sa session, où la chaîne a écrêté. Le
+/// forwarder de niveaux de la même session le lit pour allumer `over_*`.
+/// Sans étage actif, le bloc n'est pas copié : rien ne peut y être écrêté.
+fn spawn_streaming_dsp_relay_releve(
     mut dsp: StreamingDsp,
     bit_depth: u16,
     skip_header: bool,
     downstream: tokio::sync::mpsc::Sender<Vec<u8>>,
+    mut releve: Option<crate::audio::ecretage_de_traitement::ReleveDEcretage>,
 ) -> tokio::sync::mpsc::Sender<Vec<u8>> {
     let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     tokio::spawn(async move {
@@ -1718,6 +1794,13 @@ fn spawn_streaming_dsp_relay(
         while let Some(mut chunk) = up_rx.recv().await {
             if header_pending {
                 header_pending = false;
+            } else if let Some(r) = releve.as_mut() {
+                let avant = (dsp.is_active() || dsp.en_vol.is_some()).then(|| chunk.clone());
+                dsp.process(&mut chunk, bit_depth);
+                match avant {
+                    Some(avant) => r.relever(&avant, &chunk),
+                    None => r.relever(&chunk, &chunk),
+                }
             } else {
                 dsp.process(&mut chunk, bit_depth);
             }
@@ -2134,6 +2217,9 @@ mod qobuz_repli_prechargement_6401_tests;
 /// #4384 — la crête d'une zone locale se lit après son DSP.
 #[cfg(test)]
 mod crete_apres_dsp_4384;
+/// #7100 — `over_*` dit l'écrêtage réel après traitement, pas la source.
+#[cfg(test)]
+mod ecretage_reel_7100_tests;
 /// Fil 1908 — les niveaux d'une sortie locale sortent avec le son, pas avec
 /// l'alimentation de l'anneau.
 #[cfg(test)]

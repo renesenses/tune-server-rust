@@ -59,6 +59,7 @@ mod dsf_http_progressif_tests;
 /// Fil 2062 — la durée d'un flux distant lue dans ses en-têtes.
 pub mod duree_des_entetes;
 pub mod ecretage;
+pub mod ecretage_de_traitement;
 #[cfg(feature = "audio-embedding")]
 pub mod embedding;
 /// READ side of audio embeddings (storage + cosine) — always compiled, no ort.
