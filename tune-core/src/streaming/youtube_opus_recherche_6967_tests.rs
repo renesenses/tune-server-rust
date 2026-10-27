@@ -23,14 +23,17 @@
 //! `SUITE-P2`, `SUITE-P3`, `SUITE-P4`. Le reste est tel que YouTube l'a rendu.
 //!
 //! Restent RECONSTRUITS, et dits comme tels : les `adaptiveFormats` du lecteur
-//! (YouTube refuse `/player` et yt-dlp à la machine d'essai, « Sign in to
-//! confirm you're not a bot »), et la forme récente `continuationItemRenderer`,
-//! que YouTube ne rendait pas le 27/10/2026 mais que le code garde en défense.
+//! (YouTube refuse `/player` sans compte aux clients du chemin natif), la
+//! sortie de yt-dlp (reprise de celle du vrai, le 27/10/2026 :
+//! `251,opus,128.93`, `available_at` quatre secondes après sa sortie), et la
+//! forme récente `continuationItemRenderer`, que YouTube ne rendait pas le
+//! 27/10/2026 mais que le code garde en défense.
 //!
 //! Les épreuves `preuve_reelle_6967_*`, ignorées par défaut, interrogent le
 //! VRAI service :
 //! `cargo test -p tune-core --lib -- --ignored --nocapture preuve_reelle_6967`
-//! (`TUNE_YTDLP=/chemin/yt-dlp` pour la lecture et la version).
+//! (`TUNE_YTDLP=/chemin/yt-dlp` pour la lecture et la version ; yt-dlp a
+//! besoin d'un moteur JavaScript, deno, sur le `PATH`).
 use std::sync::{Arc, Mutex as StdMutex};
 
 use axum::extract::{Query, State};
@@ -748,7 +751,18 @@ async fn preuve_reelle_6967_recherche_paginee() {
     }
 }
 
-/// Trois titres réels : format retenu, puis les 4 premiers kio du flux.
+/// Des titres réels lus de bout en bout par le chemin de Tune
+/// (`get_track_url`, puis le flux) : format retenu, réponse HTTP du flux,
+/// puis le fichier entier (quelques Mo), dont 5 s sont décodées en PCM, sans
+/// son : un extrait tronqué n'est pas un conteneur Matroska complet.
+///
+/// YouTube refuse yt-dlp à la machine d'essai titre par titre (« Sign in to
+/// confirm you're not a bot ») : le 27/10/2026, `dQw4w9WgXcQ` passait à
+/// chaque essai, les titres d'une recherche presque jamais. On essaie
+/// d'abord les titres de `TUNE_PREUVE_TITRES` (séparés par des virgules),
+/// puis ceux d'une vraie recherche, jusqu'à en lire trois, en citant chaque
+/// refus. Tout titre RÉSOLU doit être servi et décodé : un 403 fait échouer
+/// l'épreuve ; un refus de résolution non, il est compté.
 #[tokio::test]
 #[ignore = "réseau : vrai YouTube, et yt-dlp désigné par TUNE_YTDLP"]
 async fn preuve_reelle_6967_lecture() {
@@ -756,22 +770,46 @@ async fn preuve_reelle_6967_lecture() {
         crate::ytdlp::set_binary(chemin.into());
     }
     let yt = YouTubeService::new();
-    let page = yt.search_page("Daft Punk", 5, 0).await.expect("recherche");
+    let mut titres: Vec<(String, String)> = std::env::var("TUNE_PREUVE_TITRES")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| (id.trim().to_string(), "désigné".to_string()))
+        .collect();
+    let page = yt.search_page("Daft Punk", 30, 0).await.expect("recherche");
+    titres.extend(
+        page.results
+            .tracks
+            .iter()
+            .map(|t| (t.id.clone(), t.title.clone())),
+    );
     let client = crate::http::client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap();
-    let mut echecs = Vec::new();
-    for piste in page.results.tracks.iter().take(3) {
-        let flux = match yt.get_track_url(&piste.id, None).await {
+    let dossier = tempfile::tempdir().unwrap();
+    let mut refus = Vec::new();
+    let mut lus = Vec::new();
+    for (id, titre) in &titres {
+        if lus.len() == 3 {
+            break;
+        }
+        let debut = std::time::Instant::now();
+        let flux = match yt.get_track_url(id, None).await {
             Ok(flux) => flux,
             Err(e) => {
-                println!("{} ({}) : {e}", piste.id, piste.title);
-                echecs.push(piste.id.clone());
+                let e = e.to_string();
+                let cause = e.rsplit("ERROR: ").next().unwrap_or(&e);
+                println!(
+                    "{id} ({titre}) : refusé, {}",
+                    cause.chars().take(60).collect::<String>()
+                );
+                refus.push(id.clone());
                 continue;
             }
         };
-        let mut req = client.get(&flux.url).header("Range", "bytes=0-4095");
+        let resolu_en = debut.elapsed();
+        let mut req = client.get(&flux.url).header("Range", "bytes=0-");
         for (nom, valeur) in &flux.headers {
             req = req.header(nom.as_str(), valeur.as_str());
         }
@@ -784,27 +822,56 @@ async fn preuve_reelle_6967_lecture() {
             .unwrap_or("")
             .to_string();
         let octets = reponse.bytes().await.unwrap_or_default();
-        let entete: Vec<String> = octets.iter().take(8).map(|o| format!("{o:02x}")).collect();
+        let entete: Vec<String> = octets.iter().take(4).map(|o| format!("{o:02x}")).collect();
         println!(
-            "{} ({}) : codec {}, {} kbit/s, HTTP {statut}, {type_}, {} octets, début {}",
-            piste.id,
-            piste.title,
+            "{id} ({titre}) : résolu en {:.1} s, codec {}, {} kbit/s, HTTP {statut}, {type_}, {} octets, début {}",
+            resolu_en.as_secs_f64(),
             flux.quality.codec,
             flux.quality.bitrate.unwrap_or(0) / 1000,
             octets.len(),
             entete.join(" "),
         );
-        assert!(matches!(statut, 200 | 206), "{} : HTTP {statut}", piste.id);
-        match flux.quality.codec.as_str() {
-            "opus" => assert!(
-                octets.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]),
-                "WebM attendu"
-            ),
-            "m4a" => assert_eq!(octets.get(4..8), Some(&b"ftyp"[..]), "MP4 attendu"),
-            autre => panic!("{} : codec inattendu {autre}", piste.id),
-        }
+        assert!(matches!(statut, 200 | 206), "{id} : HTTP {statut}");
+        let extension = match flux.quality.codec.as_str() {
+            "opus" => {
+                assert!(
+                    octets.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]),
+                    "WebM attendu"
+                );
+                "webm"
+            }
+            "m4a" => {
+                assert_eq!(octets.get(4..8), Some(&b"ftyp"[..]), "MP4 attendu");
+                "m4a"
+            }
+            autre => panic!("{id} : codec inattendu {autre}"),
+        };
+        // Le décodeur que le codec choisit (libopus pour l'Opus), sur le fichier.
+        let fichier = dossier.path().join(format!("{id}.{extension}"));
+        std::fs::write(&fichier, &octets).unwrap();
+        let pcm =
+            crate::audio::decode::decode_to_pcm(fichier.to_str().unwrap(), None, None, 0.0, 5.0)
+                .unwrap_or_else(|e| panic!("{id} : fichier non décodé : {e}"));
+        println!(
+            "    décodé : {} Hz, {} canaux, {:.2} s, {} échantillons",
+            pcm.sample_rate,
+            pcm.channels,
+            pcm.duration_s,
+            pcm.samples_i32.len()
+        );
+        assert!(
+            pcm.duration_s > 4.0,
+            "{id} : {:.2} s décodées",
+            pcm.duration_s
+        );
+        lus.push(id.clone());
     }
-    assert!(echecs.is_empty(), "titres non résolus : {echecs:?}");
+    println!(
+        "{} titres lus, {} refusés par YouTube : {lus:?}",
+        lus.len(),
+        refus.len()
+    );
+    assert!(!lus.is_empty(), "aucun titre lu ; refusés : {refus:?}");
 }
 
 /// La version installée de yt-dlp, comparée à la dernière publiée.
