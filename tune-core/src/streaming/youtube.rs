@@ -314,6 +314,12 @@ pub(crate) fn analyser_sortie_ytdlp(brut: &str) -> Option<FluxYoutube> {
 /// (`audio/mp4`), le plus haut débit dans chaque famille. Seuls les formats à
 /// URL directe comptent : un format chiffré (`signatureCipher`) n'est pas
 /// jouable sans yt-dlp.
+///
+/// Comme `[protocol=https]` dans [`SELECTEUR_FORMAT_YTDLP`], un flux servi
+/// seulement par segments (`"type": "FORMAT_STREAM_TYPE_OTF"`, que yt-dlp
+/// classe `http_dash_segments`) est écarté : son URL ne rend qu'un segment.
+/// À codec égal, la version sans compression de dynamique (`isDrc`) passe
+/// devant, comme yt-dlp le fait par défaut.
 pub(crate) fn choisir_format_audio(
     formats: &[serde_json::Value],
 ) -> Option<(String, FormatYoutube)> {
@@ -330,7 +336,7 @@ pub(crate) fn choisir_format_audio(
         .iter()
         .filter_map(|fmt| {
             let mime = fmt["mimeType"].as_str()?;
-            if !mime.starts_with("audio/") {
+            if !mime.starts_with("audio/") || fmt["type"] == "FORMAT_STREAM_TYPE_OTF" {
                 return None;
             }
             let url = fmt["url"].as_str()?;
@@ -338,10 +344,11 @@ pub(crate) fn choisir_format_audio(
                 .as_u64()
                 .or_else(|| fmt["bitrate"].as_u64())
                 .unwrap_or(0);
-            Some((rang(mime), bitrate, url, mime, fmt))
+            let sans_drc = fmt["isDrc"].as_bool() != Some(true);
+            Some((rang(mime), sans_drc, bitrate, url, mime, fmt))
         })
-        .max_by_key(|(rang, bitrate, ..)| (*rang, *bitrate))
-        .map(|(_, bitrate, url, mime, fmt)| {
+        .max_by_key(|(rang, sans_drc, bitrate, ..)| (*rang, *sans_drc, *bitrate))
+        .map(|(_, _, bitrate, url, mime, fmt)| {
             let acodec = mime
                 .split("codecs=\"")
                 .nth(1)
@@ -799,7 +806,7 @@ impl YouTubeService {
     /// La recherche sans filtre ne rend qu'un rayon par catégorie, trois ou
     /// quatre titres chacun : c'est le « trop peu de résultats » de Scorpio.
     /// Le filtre `songs` rend une liste d'une vingtaine de titres, plus le
-    /// jeton de la suite (`nextContinuationData`) ; on suit les jetons jusqu'à
+    /// jeton de la suite ([`SuiteDeRecherche`]) ; on suit les jetons jusqu'à
     /// tenir `voulu` titres, sans dépasser [`PAGES_DE_RECHERCHE_MAX`] appels.
     ///
     /// Rend les titres (sans doublon, dans l'ordre de YouTube) et s'il en
@@ -821,21 +828,26 @@ impl YouTubeService {
                     titres.push(piste);
                 }
             }
-            let Some(jeton) = suite else {
+            let Some(suite) = suite else {
                 return Ok((titres, false));
             };
             if titres.len() >= voulu || appel == PAGES_DE_RECHERCHE_MAX {
                 return Ok((titres, true));
             }
-            let jeton = urlencoding::encode(&jeton).into_owned();
-            match self
-                .ytm_post_avec(
-                    "search",
-                    &format!("&ctoken={jeton}&continuation={jeton}&type=next"),
-                    corps.clone(),
-                )
-                .await
-            {
+            // La forme annoncée par la réponse d'abord ; si InnerTube la
+            // refuse, l'autre, une fois, avant d'abandonner la suite.
+            let autre = match &suite {
+                SuiteDeRecherche::DansLUrl(j) => SuiteDeRecherche::DansLeCorps(j.clone()),
+                SuiteDeRecherche::DansLeCorps(j) => SuiteDeRecherche::DansLUrl(j.clone()),
+            };
+            let suivante = match self.demander_la_suite(&suite, &corps).await {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    info!(query, appel, forme = ?suite, error = %e, "youtube_recherche_suite_autre_forme");
+                    self.demander_la_suite(&autre, &corps).await
+                }
+            };
+            match suivante {
                 Ok(suivante) => reponse = suivante,
                 Err(e) => {
                     warn!(query, appel, lus = titres.len(), error = %e, "youtube_recherche_suite_echouee");
@@ -844,6 +856,33 @@ impl YouTubeService {
             }
         }
         Ok((titres, true))
+    }
+
+    /// #6967 — un appel `search` pour la suite d'une recherche, dans la forme
+    /// que dit [`SuiteDeRecherche`].
+    async fn demander_la_suite(
+        &self,
+        suite: &SuiteDeRecherche,
+        corps: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        match suite {
+            SuiteDeRecherche::DansLUrl(jeton) => {
+                let jeton = urlencoding::encode(jeton).into_owned();
+                self.ytm_post_avec(
+                    "search",
+                    &format!("&ctoken={jeton}&continuation={jeton}&type=next"),
+                    corps.clone(),
+                )
+                .await
+            }
+            SuiteDeRecherche::DansLeCorps(jeton) => {
+                self.ytm_post(
+                    "search",
+                    json!({"context": ytm_context(), "continuation": jeton}),
+                )
+                .await
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -3027,17 +3066,42 @@ fn artiste_de_chaine(chaine: &str) -> String {
 /// tenir [`PLAFOND_LIMITE_RECHERCHE`].
 const PAGES_DE_RECHERCHE_MAX: usize = 25;
 
-/// #6967 — les éléments d'une réponse de recherche filtrée, et le jeton de la
-/// suite. Deux formes : la première réponse (`contents` → `musicShelfRenderer`)
-/// et une suite (`continuationContents.musicShelfContinuation`). Le jeton se
-/// lit dans `continuations[].nextContinuationData`, ou dans un dernier élément
-/// `continuationItemRenderer` (forme plus récente d'InnerTube).
+/// #6967 — le jeton de la suite d'une recherche, avec la façon de le rendre.
+///
+/// InnerTube a deux formes, et on n'a pas pu vérifier sur le vrai service
+/// laquelle la recherche filtrée rend aujourd'hui (la machine d'essai
+/// n'atteint pas YouTube) :
+/// - `nextContinuationData` (forme historique) : le jeton se rend dans l'URL,
+///   `&ctoken=…&continuation=…&type=next`, avec le corps de la recherche
+///   (forme de ytmusicapi `get_continuations`) ;
+/// - `continuationItemRenderer` (forme récente) : le jeton se rend dans le
+///   CORPS, `{"context", "continuation"}`, sans la requête (forme de
+///   ytmusicapi `get_continuations_2025`), et la réponse arrive dans
+///   `onResponseReceivedActions[].appendContinuationItemsAction`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SuiteDeRecherche {
+    DansLUrl(String),
+    DansLeCorps(String),
+}
+
+/// #6967 — les éléments d'une réponse de recherche filtrée, et sa suite.
+/// Trois formes de réponse : la première (`contents` → `musicShelfRenderer`),
+/// une suite historique (`continuationContents.musicShelfContinuation`) et
+/// une suite récente (`onResponseReceivedActions` →
+/// `appendContinuationItemsAction.continuationItems`).
 fn elements_et_suite_de_recherche(
     reponse: &serde_json::Value,
-) -> (Vec<serde_json::Value>, Option<String>) {
+) -> (Vec<serde_json::Value>, Option<SuiteDeRecherche>) {
     let suite_du_rayon = &reponse["continuationContents"]["musicShelfContinuation"];
-    let rayons: Vec<&serde_json::Value> = if suite_du_rayon.is_object() {
-        vec![suite_du_rayon]
+    let listes: Vec<(&serde_json::Value, &serde_json::Value)> = if suite_du_rayon.is_object() {
+        vec![(&suite_du_rayon["contents"], suite_du_rayon)]
+    } else if let Some(actions) = reponse["onResponseReceivedActions"].as_array() {
+        actions
+            .iter()
+            .map(|a| &a["appendContinuationItemsAction"])
+            .filter(|a| a.is_object())
+            .map(|a| (&a["continuationItems"], &serde_json::Value::Null))
+            .collect()
     } else {
         reponse["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]
             ["sectionListRenderer"]["contents"]
@@ -3047,28 +3111,29 @@ fn elements_et_suite_de_recherche(
                     .iter()
                     .map(|s| &s["musicShelfRenderer"])
                     .filter(|r| r.is_object())
+                    .map(|r| (&r["contents"], r))
                     .collect()
             })
             .unwrap_or_default()
     };
     let mut elements = Vec::new();
-    let mut jeton = None;
-    for rayon in rayons {
-        for element in rayon["contents"].as_array().into_iter().flatten() {
+    let mut suite = None;
+    for (contenu, rayon) in listes {
+        for element in contenu.as_array().into_iter().flatten() {
             let commande = &element["continuationItemRenderer"]["continuationEndpoint"]["continuationCommand"]
                 ["token"];
             if let Some(j) = commande.as_str() {
-                jeton = Some(j.to_string());
+                suite = Some(SuiteDeRecherche::DansLeCorps(j.to_string()));
             } else {
                 elements.push(element.clone());
             }
         }
         if let Some(j) = rayon["continuations"][0]["nextContinuationData"]["continuation"].as_str()
         {
-            jeton = Some(j.to_string());
+            suite = Some(SuiteDeRecherche::DansLUrl(j.to_string()));
         }
     }
-    (elements, jeton)
+    (elements, suite)
 }
 
 fn resultats_vides() -> SearchResults {

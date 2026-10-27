@@ -6,9 +6,12 @@
 //! remplir plusieurs pages ; l'enveloppe des réponses de recherche (rayon,
 //! jeton de suite) et les `adaptiveFormats` du lecteur sont RECONSTRUITS sur
 //! la forme d'InnerTube, faute d'accès à YouTube depuis la machine d'essai.
+//! Les deux formes de suite connues d'InnerTube sont jouées (`Forme`), faute
+//! de savoir laquelle le vrai service rend aujourd'hui.
 use std::sync::{Arc, Mutex as StdMutex};
 
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
@@ -59,15 +62,36 @@ fn suite(jeton: Option<String>) -> Value {
     }
 }
 
+/// Forme récente : le jeton est le dernier élément de la liste.
+fn titres_et_element_de_suite(debut: usize, fin: usize, jeton: Option<String>) -> Vec<Value> {
+    let mut elements = titres(debut, fin);
+    if let Some(j) = jeton {
+        elements.push(json!({"continuationItemRenderer": {"continuationEndpoint":
+            {"continuationCommand": {"token": j, "request": "CONTINUATION_REQUEST_TYPE_SEARCH"}}}}));
+    }
+    elements
+}
+
 /// Première réponse filtrée `songs` : un rayon sans titre, et sa suite.
-fn premiere_reponse_filtree(total: usize) -> Value {
+fn premiere_reponse_filtree(total: usize, forme: Forme) -> Value {
     let fin = PAR_REPONSE.min(total);
     let jeton = (fin < total).then(|| format!("suite-{fin}"));
+    let rayon = if forme == Forme::Recente {
+        json!({"contents": titres_et_element_de_suite(0, fin, jeton)})
+    } else {
+        json!({"contents": titres(0, fin), "continuations": suite(jeton)})
+    };
     json!({"contents": {"tabbedSearchResultsRenderer": {"tabs": [{"tabRenderer": {"content":
-    {"sectionListRenderer": {"contents": [{"musicShelfRenderer": {
-        "contents": titres(0, fin),
-        "continuations": suite(jeton),
-    }}]}}}}]}}})
+    {"sectionListRenderer": {"contents": [{"musicShelfRenderer": rayon}]}}}}]}}})
+}
+
+/// Suite demandée par le corps : forme `appendContinuationItemsAction`.
+fn reponse_de_suite_recente(debut: usize, total: usize) -> Value {
+    let fin = (debut + PAR_REPONSE).min(total);
+    let jeton = (fin < total).then(|| format!("suite-{fin}"));
+    json!({"onResponseReceivedActions": [{"appendContinuationItemsAction": {
+        "continuationItems": titres_et_element_de_suite(debut, fin, jeton),
+    }}]})
 }
 
 fn reponse_de_suite(debut: usize, total: usize) -> Value {
@@ -117,9 +141,22 @@ fn reponse_lecteur(video_id: &str, aac_seul: bool) -> Value {
     })
 }
 
+/// La forme de suite que joue le faux InnerTube.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Forme {
+    /// `nextContinuationData`, jeton rendu dans l'URL.
+    Historique,
+    /// `continuationItemRenderer`, jeton rendu dans le corps.
+    Recente,
+    /// Annonce `nextContinuationData` mais refuse le jeton dans l'URL (400) :
+    /// seul le corps passe.
+    UrlRefusee,
+}
+
 #[derive(Clone)]
 struct Faux {
     total: usize,
+    forme: Forme,
     /// Chaque appel, lu tel quel : `search:songs`, `search:mixte`,
     /// `search:suite-20`, `player:vid001`…
     appels: Arc<StdMutex<Vec<String>>>,
@@ -129,18 +166,32 @@ async fn faux_search(
     State(f): State<Faux>,
     Query(q): Query<std::collections::HashMap<String, String>>,
     Json(corps): Json<Value>,
-) -> Json<Value> {
+) -> Result<Json<Value>, StatusCode> {
+    let debut = |jeton: &str| -> usize { jeton.trim_start_matches("suite-").parse().unwrap() };
     if let Some(jeton) = q.get("ctoken") {
         f.appels.lock().unwrap().push(format!("search:{jeton}"));
-        let debut: usize = jeton.trim_start_matches("suite-").parse().unwrap();
-        return Json(reponse_de_suite(debut, f.total));
+        if f.forme == Forme::UrlRefusee {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        return Ok(Json(reponse_de_suite(debut(jeton), f.total)));
+    }
+    if let Some(jeton) = corps["continuation"].as_str() {
+        f.appels
+            .lock()
+            .unwrap()
+            .push(format!("search:corps:{jeton}"));
+        assert!(
+            corps["query"].is_null() && corps["context"].is_object(),
+            "suite dans le corps : le contexte et le jeton seuls, {corps}"
+        );
+        return Ok(Json(reponse_de_suite_recente(debut(jeton), f.total)));
     }
     if corps["params"].is_string() {
         f.appels.lock().unwrap().push("search:songs".into());
-        Json(premiere_reponse_filtree(f.total))
+        Ok(Json(premiere_reponse_filtree(f.total, f.forme)))
     } else {
         f.appels.lock().unwrap().push("search:mixte".into());
-        Json(reponse_melangee())
+        Ok(Json(reponse_melangee()))
     }
 }
 
@@ -152,9 +203,17 @@ async fn faux_player(State(f): State<Faux>, Json(corps): Json<Value>) -> Json<Va
 }
 
 async fn service(total: usize) -> (YouTubeService, Arc<StdMutex<Vec<String>>>) {
+    service_en_forme(total, Forme::Historique).await
+}
+
+async fn service_en_forme(
+    total: usize,
+    forme: Forme,
+) -> (YouTubeService, Arc<StdMutex<Vec<String>>>) {
     let appels = Arc::new(StdMutex::new(Vec::new()));
     let faux = Faux {
         total,
+        forme,
         appels: appels.clone(),
     };
     let app = Router::new()
@@ -263,6 +322,30 @@ fn le_lecteur_natif_prend_l_opus_et_se_replie_sur_l_aac() {
     assert!(choisir_format_audio(&chiffre).is_none());
 }
 
+#[test]
+fn le_lecteur_natif_ecarte_l_opus_segmente_et_prefere_sans_drc() {
+    // Opus servi seulement par segments (OTF) : écarté, comme
+    // `[protocol=https]` le fait côté yt-dlp ; l'AAC progressif joue.
+    let segmente = [
+        json!({"itag": 251, "type": "FORMAT_STREAM_TYPE_OTF", "mimeType": "audio/webm; codecs=\"opus\"", "bitrate": 140_000, "url": "https://cdn.invalide/otf-251"}),
+        json!({"itag": 140, "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "bitrate": 130_000, "url": "https://cdn.invalide/140"}),
+    ];
+    let (url, f) = choisir_format_audio(&segmente).expect("le repli AAC");
+    assert_eq!(f.id, "140", "un Opus segmenté ne doit pas passer : {url}");
+
+    // Deux 251, l'un à dynamique compressée (DRC) et de débit plus haut :
+    // le 251 d'origine passe devant.
+    let drc = [
+        json!({"itag": 251, "isDrc": true, "mimeType": "audio/webm; codecs=\"opus\"", "bitrate": 150_000, "url": "https://cdn.invalide/251-drc"}),
+        json!({"itag": 251, "mimeType": "audio/webm; codecs=\"opus\"", "bitrate": 140_000, "url": "https://cdn.invalide/251"}),
+    ];
+    let (url, _) = choisir_format_audio(&drc).expect("un Opus");
+    assert_eq!(
+        url, "https://cdn.invalide/251",
+        "la version DRC a été prise"
+    );
+}
+
 // ── Recherche paginée ──────────────────────────────────────────────────
 
 #[tokio::test]
@@ -313,6 +396,54 @@ async fn la_recherche_rend_plus_d_une_page() {
     assert!(
         appels.contains(&"search:suite-40".to_string()),
         "{appels:?}"
+    );
+}
+
+#[tokio::test]
+async fn la_suite_recente_rend_son_jeton_dans_le_corps() {
+    let (yt, appels) = service_en_forme(55, Forme::Recente).await;
+
+    let p1 = yt.search_page("laufey", 30, 0).await.expect("page 1");
+    assert_eq!(
+        ids(&p1.results.tracks),
+        (0..30).map(|i| format!("vid{i:03}")).collect::<Vec<_>>(),
+        "la suite récente n'a pas été lue"
+    );
+    assert!(p1.has_more);
+    let p2 = yt.search_page("laufey", 30, 30).await.expect("page 2");
+    assert_eq!(p2.results.tracks.len(), 25);
+    assert!(!p2.has_more);
+
+    let appels = appels.lock().unwrap().clone();
+    assert!(
+        appels.contains(&"search:corps:suite-20".to_string())
+            && appels.contains(&"search:corps:suite-40".to_string()),
+        "{appels:?}"
+    );
+    assert!(
+        !appels.iter().any(|a| a == "search:suite-20"),
+        "jeton récent envoyé dans l'URL : {appels:?}"
+    );
+}
+
+#[tokio::test]
+async fn une_suite_refusee_dans_l_url_se_redemande_dans_le_corps() {
+    let (yt, appels) = service_en_forme(55, Forme::UrlRefusee).await;
+
+    let p1 = yt.search_page("laufey", 30, 0).await.expect("page 1");
+    assert_eq!(
+        p1.results.tracks.len(),
+        30,
+        "la suite s'est arrêtée au premier refus"
+    );
+    assert!(p1.has_more);
+
+    let appels = appels.lock().unwrap().clone();
+    let url = appels.iter().position(|a| a == "search:suite-20");
+    let corps = appels.iter().position(|a| a == "search:corps:suite-20");
+    assert!(
+        matches!((url, corps), (Some(u), Some(c)) if u < c),
+        "l'URL d'abord, puis le corps : {appels:?}"
     );
 }
 
