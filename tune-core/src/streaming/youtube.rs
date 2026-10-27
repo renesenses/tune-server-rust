@@ -219,6 +219,54 @@ struct PendingDeviceAuth {
 pub(crate) struct FluxYoutube {
     pub(crate) url: String,
     pub(crate) headers: Vec<(String, String)>,
+    /// #6967 — le format retenu, quand la source le dit (yt-dlp, `/player`).
+    pub(crate) format: Option<FormatYoutube>,
+}
+
+/// #6967 — le format audio retenu : son itag, son codec, son débit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FormatYoutube {
+    /// L'itag YouTube (`251` : Opus ~130 kbit/s, `140` : AAC 128 kbit/s).
+    pub(crate) id: String,
+    /// Le codec tel que YouTube le nomme : `opus`, `mp4a.40.2`…
+    pub(crate) acodec: String,
+    /// Débit moyen, en kbit/s, quand il est connu.
+    pub(crate) kbps: Option<u32>,
+}
+
+impl FormatYoutube {
+    fn est_opus(&self) -> bool {
+        self.acodec.to_ascii_lowercase().starts_with("opus")
+    }
+
+    fn est_aac(&self) -> bool {
+        self.acodec.to_ascii_lowercase().starts_with("mp4a")
+    }
+}
+
+/// #6967 — sélecteur de format de yt-dlp : Opus d'abord, AAC en repli.
+///
+/// Opus (itag 251, WebM) est le meilleur flux audio de YouTube ; Tune le
+/// décode par libopus (`audio::decode::decode_opus_to_pcm`, sonde Matroska
+/// par contenu). `[protocol=https]` écarte un Opus servi seulement en
+/// manifeste DASH, dont l'URL ne couvre que le premier segment. Viennent
+/// ensuite l'AAC (itag 140, `m4a`), puis n'importe quel flux progressif.
+pub(crate) const SELECTEUR_FORMAT_YTDLP: &str = "bestaudio[acodec=opus][protocol=https]/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio";
+
+/// Préfixe de la ligne `--print` qui décrit le format retenu (#6967).
+const PREFIXE_FORMAT_YTDLP: &str = "tune-format=";
+
+/// Lit `tune-format=<itag>,<acodec>,<abr>` (abr en kbit/s, `NA` si inconnu).
+fn analyser_format_ytdlp(ligne: &str) -> Option<FormatYoutube> {
+    let mut champs = ligne.strip_prefix(PREFIXE_FORMAT_YTDLP)?.split(',');
+    let id = champs.next()?.trim().to_string();
+    let acodec = champs.next()?.trim().to_string();
+    let kbps = champs
+        .next()
+        .and_then(|abr| abr.trim().parse::<f64>().ok())
+        .filter(|abr| *abr > 0.0)
+        .map(|abr| abr.round() as u32);
+    (!id.is_empty() && !acodec.is_empty()).then_some(FormatYoutube { id, acodec, kbps })
 }
 
 /// Lit la sortie de `yt-dlp --print "%(urls)s" --print "%(http_headers)j"`.
@@ -229,13 +277,18 @@ pub(crate) struct FluxYoutube {
 /// l'URL. Une ligne qui commence par `{` est lue comme les en-têtes ; la
 /// première ligne restante non vide est l'URL.
 ///
+/// #6967 — une troisième ligne, `tune-format=…`, dit le format retenu.
+///
 /// `None` seulement s'il n'y a aucune URL : c'est le seul cas d'échec, les
 /// en-têtes étant un bonus.
 pub(crate) fn analyser_sortie_ytdlp(brut: &str) -> Option<FluxYoutube> {
     let mut url = None;
     let mut headers = Vec::new();
+    let mut format = None;
     for ligne in brut.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if ligne.starts_with('{') {
+        if ligne.starts_with(PREFIXE_FORMAT_YTDLP) {
+            format = analyser_format_ytdlp(ligne);
+        } else if ligne.starts_with('{') {
             if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(ligne) {
                 headers = map
                     .into_iter()
@@ -249,7 +302,59 @@ pub(crate) fn analyser_sortie_ytdlp(brut: &str) -> Option<FluxYoutube> {
             url = Some(ligne.to_string());
         }
     }
-    url.map(|url| FluxYoutube { url, headers })
+    url.map(|url| FluxYoutube {
+        url,
+        headers,
+        format,
+    })
+}
+
+/// #6967 — parmi les `adaptiveFormats` d'une réponse `/player`, le flux audio
+/// à jouer : Opus d'abord (`audio/webm; codecs="opus"`), AAC en repli
+/// (`audio/mp4`), le plus haut débit dans chaque famille. Seuls les formats à
+/// URL directe comptent : un format chiffré (`signatureCipher`) n'est pas
+/// jouable sans yt-dlp.
+pub(crate) fn choisir_format_audio(
+    formats: &[serde_json::Value],
+) -> Option<(String, FormatYoutube)> {
+    let rang = |mime: &str| {
+        if mime.contains("opus") {
+            2
+        } else if mime.contains("mp4") {
+            1
+        } else {
+            0
+        }
+    };
+    formats
+        .iter()
+        .filter_map(|fmt| {
+            let mime = fmt["mimeType"].as_str()?;
+            if !mime.starts_with("audio/") {
+                return None;
+            }
+            let url = fmt["url"].as_str()?;
+            let bitrate = fmt["averageBitrate"]
+                .as_u64()
+                .or_else(|| fmt["bitrate"].as_u64())
+                .unwrap_or(0);
+            Some((rang(mime), bitrate, url, mime, fmt))
+        })
+        .max_by_key(|(rang, bitrate, ..)| (*rang, *bitrate))
+        .map(|(_, bitrate, url, mime, fmt)| {
+            let acodec = mime
+                .split("codecs=\"")
+                .nth(1)
+                .and_then(|c| c.split('"').next())
+                .unwrap_or(mime)
+                .to_string();
+            let id = fmt["itag"]
+                .as_u64()
+                .map(|i| i.to_string())
+                .unwrap_or_default();
+            let kbps = (bitrate > 0).then(|| ((bitrate as f64) / 1000.0).round() as u32);
+            (url.to_string(), FormatYoutube { id, acodec, kbps })
+        })
 }
 
 struct CachedUrl {
@@ -257,6 +362,9 @@ struct CachedUrl {
     /// #4366 — les en-têtes voyagent AVEC l'URL, sinon un simple succès de
     /// cache les perdrait et le 403 reviendrait une lecture sur deux.
     headers: Vec<(String, String)>,
+    /// #6967 — le format voyage aussi : servie du cache, la piste doit dire
+    /// le même codec qu'à sa première résolution.
+    format: Option<FormatYoutube>,
     created: Instant,
 }
 
@@ -517,13 +625,24 @@ impl YouTubeService {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        self.ytm_post_avec(endpoint, "", body).await
+    }
+
+    /// [`Self::ytm_post`], avec des paramètres d'URL en plus (`&ctoken=…` de la
+    /// page suivante d'une recherche, #6967).
+    async fn ytm_post_avec(
+        &self,
+        endpoint: &str,
+        parametres: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         // Authenticate with the OAuth Bearer token ALONE. Passing both a
         // `?key=` API key and an `Authorization: Bearer` header makes Google
         // reject the call with 400 "Request contains an invalid argument".
         // This only bites once a token exists — it regressed search/browse the
         // moment #381 made YouTube login actually succeed (Jean Marie, Bilou:
         // "erreur 502" on search in v0.8.251).
-        let url = format!("{}/{endpoint}?prettyPrint=false", self.ytm_base);
+        let url = format!("{}/{endpoint}?prettyPrint=false{parametres}", self.ytm_base);
 
         let req = self
             .client
@@ -570,6 +689,12 @@ impl YouTubeService {
         query: &str,
         filter: Option<&str>,
     ) -> Result<serde_json::Value, String> {
+        self.ytm_post("search", Self::corps_de_recherche(query, filter))
+            .await
+    }
+
+    /// Le corps d'une requête `search` : la requête, le contexte, le filtre.
+    fn corps_de_recherche(query: &str, filter: Option<&str>) -> serde_json::Value {
         let mut params = json!({
             "query": query,
             "context": ytm_context(),
@@ -588,8 +713,137 @@ impl YouTubeService {
                 params["params"] = json!(filter_param);
             }
         }
+        params
+    }
 
-        self.ytm_post("search", params).await
+    /// Repli de la recherche sur l'API YouTube Data v3, quand InnerTube ne
+    /// répond pas et qu'une clé d'API est configurée.
+    async fn recherche_data_api(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<SearchResults, TuneError> {
+        // Fallback to YouTube Data API v3 (if API key is configured)
+        if self.api_key.is_some() {
+            let limit_str = limit.min(50).to_string();
+            let data = self
+                .yt_api_get(
+                    "search",
+                    &[
+                        ("part", "snippet"),
+                        ("q", query),
+                        ("maxResults", &limit_str),
+                        ("type", "video,playlist,channel"),
+                    ],
+                )
+                .await?;
+
+            let mut video_ids: Vec<String> = Vec::new();
+            let mut albums = Vec::new();
+            let mut artists = Vec::new();
+
+            for item in data["items"].as_array().unwrap_or(&vec![]) {
+                let kind = item["id"]["kind"].as_str().unwrap_or("");
+                let snippet = &item["snippet"];
+                let cover = Self::best_thumbnail(&snippet["thumbnails"]);
+                let title = snippet["title"].as_str().unwrap_or("Unknown");
+
+                match kind {
+                    "youtube#video" => {
+                        if let Some(vid) = item["id"]["videoId"].as_str() {
+                            video_ids.push(vid.to_string());
+                        }
+                    }
+                    "youtube#playlist" => {
+                        albums.push(StreamAlbum {
+                            ai_generated: None,
+                            release_type: None,
+                            id: item["id"]["playlistId"].as_str().unwrap_or("").into(),
+                            title: title.into(),
+                            artist: snippet["channelTitle"].as_str().unwrap_or("").into(),
+                            artist_id: None,
+                            cover_path: cover,
+                            year: None,
+                            track_count: 0,
+                            quality: None,
+                            released_at: None,
+                        });
+                    }
+                    "youtube#channel" => {
+                        artists.push(StreamArtist {
+                            id: item["id"]["channelId"].as_str().unwrap_or("").into(),
+                            name: title.into(),
+                            image_path: cover,
+                            bio: None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            let tracks = self.fetch_videos_batch(&video_ids).await;
+
+            return Ok(SearchResults {
+                tracks,
+                albums,
+                artists,
+                playlists: vec![],
+            });
+        }
+
+        Err("YouTube search unavailable — no API key and internal API failed".into())
+    }
+
+    /// #6967 — les TITRES d'une recherche, au-delà de la première page.
+    ///
+    /// La recherche sans filtre ne rend qu'un rayon par catégorie, trois ou
+    /// quatre titres chacun : c'est le « trop peu de résultats » de Scorpio.
+    /// Le filtre `songs` rend une liste d'une vingtaine de titres, plus le
+    /// jeton de la suite (`nextContinuationData`) ; on suit les jetons jusqu'à
+    /// tenir `voulu` titres, sans dépasser [`PAGES_DE_RECHERCHE_MAX`] appels.
+    ///
+    /// Rend les titres (sans doublon, dans l'ordre de YouTube) et s'il en
+    /// reste au-delà. Une suite qui échoue arrête la lecture sans perdre ce
+    /// qui est déjà lu.
+    async fn titres_de_recherche(
+        &self,
+        query: &str,
+        voulu: usize,
+    ) -> Result<(Vec<StreamTrack>, bool), String> {
+        let corps = Self::corps_de_recherche(query, Some("songs"));
+        let mut reponse = self.ytm_post("search", corps.clone()).await?;
+        let mut titres: Vec<StreamTrack> = Vec::new();
+        let mut vus = std::collections::HashSet::new();
+        for appel in 1..=PAGES_DE_RECHERCHE_MAX {
+            let (elements, suite) = elements_et_suite_de_recherche(&reponse);
+            for piste in self.parse_search_results(&rayon_de_titres(elements)).tracks {
+                if !piste.id.is_empty() && vus.insert(piste.id.clone()) {
+                    titres.push(piste);
+                }
+            }
+            let Some(jeton) = suite else {
+                return Ok((titres, false));
+            };
+            if titres.len() >= voulu || appel == PAGES_DE_RECHERCHE_MAX {
+                return Ok((titres, true));
+            }
+            let jeton = urlencoding::encode(&jeton).into_owned();
+            match self
+                .ytm_post_avec(
+                    "search",
+                    &format!("&ctoken={jeton}&continuation={jeton}&type=next"),
+                    corps.clone(),
+                )
+                .await
+            {
+                Ok(suivante) => reponse = suivante,
+                Err(e) => {
+                    warn!(query, appel, lus = titres.len(), error = %e, "youtube_recherche_suite_echouee");
+                    return Ok((titres, false));
+                }
+            }
+        }
+        Ok((titres, true))
     }
 
     // ------------------------------------------------------------------
@@ -656,7 +910,10 @@ impl YouTubeService {
     /// token or cipher. When it reports `LOGIN_REQUIRED` ("Please sign in") on a
     /// track, we retry with the TV embedded client, which reaches many
     /// login-gated tracks without credentials (the yt-dlp bypass).
-    async fn extract_audio_url_native(&self, track_id: &str) -> Result<String, String> {
+    async fn extract_audio_url_native(
+        &self,
+        track_id: &str,
+    ) -> Result<(String, FormatYoutube), String> {
         // Fast path: ANDROID_MUSIC, direct URLs, no cipher, no yt-dlp needed.
         match self
             .try_player_client(
@@ -698,7 +955,7 @@ impl YouTubeService {
         context: serde_json::Value,
         user_agent: &str,
         origin: &str,
-    ) -> Result<String, String> {
+    ) -> Result<(String, FormatYoutube), String> {
         let body = json!({
             "videoId": track_id,
             "context": context,
@@ -709,7 +966,8 @@ impl YouTubeService {
             }
         });
 
-        let url = format!("{YTM_API_BASE}/player?prettyPrint=false");
+        // `ytm_base` : `YTM_API_BASE` en production, un serveur local en essai.
+        let url = format!("{}/player?prettyPrint=false", self.ytm_base);
 
         let resp = self
             .client
@@ -760,65 +1018,20 @@ impl YouTubeService {
             .as_array()
             .ok_or_else(|| format!("no streaming data for {track_id}"))?;
 
-        // Find best audio format: prefer AAC (audio/mp4, itag 140) at highest
-        // bitrate. Symphonia — our decode pipeline — can decode AAC but NOT
-        // Opus/WebM (the ffmpeg Opus fallback was removed), so an Opus stream
-        // plays back silent. Only fall back to Opus when no AAC is offered.
-        let mut best_url: Option<&str> = None;
-        let mut best_bitrate: u64 = 0;
-        let mut best_is_aac = false;
-
-        for fmt in formats {
-            let mime = fmt["mimeType"].as_str().unwrap_or("");
-            let is_audio = mime.starts_with("audio/");
-            if !is_audio {
-                continue;
-            }
-
-            let bitrate = fmt["bitrate"].as_u64().unwrap_or(0);
-            // AAC is delivered as audio/mp4 (codec mp4a); Opus as audio/webm.
-            let is_aac = mime.contains("mp4");
-
-            // Prefer AAC (decodable); within same codec family, prefer higher
-            // bitrate. Never replace an AAC pick with Opus.
-            let dominated = if best_is_aac && !is_aac {
-                true // Don't replace AAC with non-AAC (Opus)
-            } else if !best_is_aac && is_aac {
-                false // Always prefer AAC
-            } else {
-                bitrate <= best_bitrate
-            };
-
-            if dominated {
-                continue;
-            }
-
-            // Prefer direct URL (no cipher); skip formats requiring signature
-            if let Some(u) = fmt["url"].as_str() {
-                best_url = Some(u);
-                best_bitrate = bitrate;
-                best_is_aac = is_aac;
-            }
-        }
-
-        let stream_url =
-            best_url.ok_or_else(|| format!("no suitable audio stream found for {track_id}"))?;
-
-        // If the only direct-URL audio the native path offers is Opus, it would
-        // decode to silence — defer to the yt-dlp fallback, which requests m4a.
-        if !best_is_aac {
-            return Err(format!(
-                "native path only offers Opus for {track_id} (undecodable), deferring to yt-dlp"
-            ));
-        }
+        // #6967 — Opus d'abord, AAC en repli (`choisir_format_audio`).
+        // L'ancien choix gardait l'AAC et renvoyait un Opus seul à yt-dlp : il
+        // datait du décodeur Opus retiré, revenu depuis par libopus.
+        let (stream_url, format) = choisir_format_audio(formats)
+            .ok_or_else(|| format!("no suitable audio stream found for {track_id}"))?;
 
         debug!(
             track_id,
-            bitrate = best_bitrate,
-            aac = best_is_aac,
+            itag = %format.id,
+            acodec = %format.acodec,
+            kbps = format.kbps.unwrap_or(0),
             "ytm_native_url_extracted"
         );
-        Ok(stream_url.to_string())
+        Ok((stream_url, format))
     }
 
     /// #4366 — oublie l'URL mise en cache pour `track_id`. Après un 403 et un
@@ -856,20 +1069,17 @@ impl YouTubeService {
             Duration::from_secs(YTDLP_TIMEOUT_SECS),
             tokio::process::Command::new(&ytdlp)
                 .args([
-                    // Prefer m4a/AAC: the native decode pipeline (Symphonia)
-                    // cannot decode Opus/WebM (the ffmpeg fallback for it was
-                    // removed), so plain "bestaudio" — which picks Opus on
-                    // YouTube — plays back silent. m4a (itag 140, AAC) decodes
-                    // natively. Then fall back to a progressive HTTPS stream
-                    // ("bestaudio" alone often picks a DASH format whose URL
-                    // only covers the first segment ~50s), then anything.
+                    // #6967 — Opus d'abord, AAC en repli : voir le sélecteur.
                     "-f",
-                    "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio",
-                    // Deux lignes en sortie : l'URL, puis ses en-têtes en JSON.
+                    SELECTEUR_FORMAT_YTDLP,
+                    // Trois lignes en sortie : l'URL, ses en-têtes en JSON,
+                    // puis le format retenu (itag, codec, débit).
                     "--print",
                     "%(urls)s",
                     "--print",
                     "%(http_headers)j",
+                    "--print",
+                    "tune-format=%(format_id)s,%(acodec)s,%(abr)s",
                     "--no-playlist",
                     "--no-warnings",
                     "-q",
@@ -899,6 +1109,8 @@ impl YouTubeService {
         info!(
             track_id,
             entetes = flux.headers.len(),
+            itag = flux.format.as_ref().map_or("?", |f| f.id.as_str()),
+            acodec = flux.format.as_ref().map_or("?", |f| f.acodec.as_str()),
             "ytdlp_url_et_entetes_resolues"
         );
         Ok(flux)
@@ -929,13 +1141,14 @@ impl YouTubeService {
         ) {
             // Primary: native YTM /player API (no external dependency).
             match self.extract_audio_url_native(track_id).await {
-                Ok(url) => {
+                Ok((url, format)) => {
                     self.native_extraction_circuit.lock().await.record_success();
                     // Chemin natif : l'URL est signée pour NOTRE client, il n'y
                     // a rien à rejouer.
                     return Ok(FluxYoutube {
                         url,
                         headers: Vec::new(),
+                        format: Some(format),
                     });
                 }
                 Err(e) => {
@@ -2809,16 +3022,105 @@ fn artiste_de_chaine(chaine: &str) -> String {
         .to_string()
 }
 
-/// Map a resolved YouTube stream URL to `(mime_type, codec)`. YouTube delivers
-/// either MP4/AAC (itag 140, "m4a") or WebM/Opus. The codec string becomes the
-/// transcode temp-file extension: "m4a" routes to the native Symphonia decoder,
-/// whereas "opus" would route to the removed ffmpeg path and play back silent.
-/// We request m4a in the yt-dlp selector, so this is normally the mp4/m4a branch.
-fn youtube_mime_codec(url: &str) -> (&'static str, &'static str) {
+/// #6967 — appels `search` au plus pour une page de recherche : la première
+/// réponse, puis ses suites. Une vingtaine de titres par réponse, de quoi
+/// tenir [`PLAFOND_LIMITE_RECHERCHE`].
+const PAGES_DE_RECHERCHE_MAX: usize = 25;
+
+/// #6967 — les éléments d'une réponse de recherche filtrée, et le jeton de la
+/// suite. Deux formes : la première réponse (`contents` → `musicShelfRenderer`)
+/// et une suite (`continuationContents.musicShelfContinuation`). Le jeton se
+/// lit dans `continuations[].nextContinuationData`, ou dans un dernier élément
+/// `continuationItemRenderer` (forme plus récente d'InnerTube).
+fn elements_et_suite_de_recherche(
+    reponse: &serde_json::Value,
+) -> (Vec<serde_json::Value>, Option<String>) {
+    let suite_du_rayon = &reponse["continuationContents"]["musicShelfContinuation"];
+    let rayons: Vec<&serde_json::Value> = if suite_du_rayon.is_object() {
+        vec![suite_du_rayon]
+    } else {
+        reponse["contents"]["tabbedSearchResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]
+            ["sectionListRenderer"]["contents"]
+            .as_array()
+            .map(|sections| {
+                sections
+                    .iter()
+                    .map(|s| &s["musicShelfRenderer"])
+                    .filter(|r| r.is_object())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut elements = Vec::new();
+    let mut jeton = None;
+    for rayon in rayons {
+        for element in rayon["contents"].as_array().into_iter().flatten() {
+            let commande = &element["continuationItemRenderer"]["continuationEndpoint"]["continuationCommand"]
+                ["token"];
+            if let Some(j) = commande.as_str() {
+                jeton = Some(j.to_string());
+            } else {
+                elements.push(element.clone());
+            }
+        }
+        if let Some(j) = rayon["continuations"][0]["nextContinuationData"]["continuation"].as_str()
+        {
+            jeton = Some(j.to_string());
+        }
+    }
+    (elements, jeton)
+}
+
+fn resultats_vides() -> SearchResults {
+    SearchResults {
+        tracks: Vec::new(),
+        albums: Vec::new(),
+        artists: Vec::new(),
+        playlists: Vec::new(),
+    }
+}
+
+/// Des éléments de titres remis dans la forme d'une réponse de recherche à un
+/// rayon « Songs » : ils passent ainsi par le MÊME analyseur que la recherche
+/// sans filtre ([`YouTubeService::parse_search_results`]).
+fn rayon_de_titres(elements: Vec<serde_json::Value>) -> serde_json::Value {
+    json!({"contents": {"tabbedSearchResultsRenderer": {"tabs": [{"tabRenderer": {"content":
+    {"sectionListRenderer": {"contents": [{"musicShelfRenderer": {
+        "title": {"runs": [{"text": "Songs"}]},
+        "contents": elements,
+    }}]}}}}]}}})
+}
+
+/// `(mime_type, codec)` du flux YouTube résolu. Le codec est l'extension du
+/// fichier temporaire et le format que le chemin du signal affiche : `opus`
+/// (WebM/Opus, décodé par libopus) ou `m4a` (MP4/AAC, décodé par Symphonia).
+///
+/// #6967 — le format retenu par la source fait foi ; l'URL (`mime=` de
+/// `googlevideo`) n'est que le repli quand la source ne l'a pas dit.
+fn youtube_mime_codec(url: &str, format: Option<&FormatYoutube>) -> (&'static str, &'static str) {
+    match format {
+        Some(f) if f.est_opus() => return ("audio/webm", "opus"),
+        Some(f) if f.est_aac() => return ("audio/mp4", "m4a"),
+        _ => {}
+    }
     if url.contains("mime=audio%2Fmp4") || url.contains("mime=audio/mp4") || url.contains(".m4a") {
         ("audio/mp4", "m4a")
     } else {
         ("audio/webm", "opus")
+    }
+}
+
+/// #6967 — la qualité annoncée du flux, avec le débit du format retenu
+/// (128 kbit/s quand la source ne le dit pas, comme avant). La cadence reste
+/// 48 kHz : celle de l'Opus, et celle qu'annonçait déjà l'AAC.
+fn qualite_youtube(codec: &str, format: Option<&FormatYoutube>) -> StreamQuality {
+    let kbps = format.and_then(|f| f.kbps);
+    StreamQuality {
+        codec: codec.into(),
+        sample_rate: 48000,
+        bit_depth: 16,
+        bitrate: Some(kbps.map_or(128_000, |k| k * 1000)),
+        channels: 2,
     }
 }
 
@@ -2941,98 +3243,92 @@ impl StreamingService for YouTubeService {
     // ------------------------------------------------------------------
 
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
-        // Try YouTube Music internal API first (richer music-specific results)
-        match self.ytm_search(query, None).await {
-            Ok(data) => {
-                let mut results = self.parse_search_results(&data);
-                // Truncate to requested limit
-                results.tracks.truncate(limit);
-                results.albums.truncate(limit);
-                results.artists.truncate(limit);
-                results.playlists.truncate(limit);
-                debug!(
-                    query,
-                    tracks = results.tracks.len(),
-                    albums = results.albums.len(),
-                    artists = results.artists.len(),
-                    "youtube_search_ytm"
-                );
-                return Ok(results);
-            }
-            Err(e) => {
+        Ok(self.search_page(query, limit, 0).await?.results)
+    }
+
+    fn limite_de_page_recherche(&self, limit: usize) -> usize {
+        limite_hors_pagination(limit)
+    }
+
+    /// #6967 — la recherche paginée (« plus de résultats »).
+    ///
+    /// Les TITRES viennent de la recherche filtrée `songs`, page après page
+    /// ([`YouTubeService::titres_de_recherche`]) ; albums, artistes et
+    /// playlists, de la recherche sans filtre, à la première page seulement
+    /// (ils ne paginent pas ici). YouTube n'annonce aucun total : `totals`
+    /// compte ce qui a été lu, `has_more` dit s'il reste des titres à lire.
+    async fn search_page(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SearchPage, TuneError> {
+        let limite = self.limite_de_page_recherche(limit);
+        if offset >= PLAFOND_LIMITE_RECHERCHE {
+            return Ok(SearchPage::au_dela(offset));
+        }
+        // Un titre de plus que la page : c'est lui qui dit qu'il en reste.
+        let voulu = (offset + limite + 1).min(PLAFOND_LIMITE_RECHERCHE);
+        let (titres, melangee) = if offset == 0 {
+            let (titres, melangee) = tokio::join!(
+                self.titres_de_recherche(query, voulu),
+                self.ytm_search(query, None)
+            );
+            (titres, Some(melangee))
+        } else {
+            (self.titres_de_recherche(query, voulu).await, None)
+        };
+
+        let mut results = match melangee {
+            Some(Ok(data)) => self.parse_search_results(&data),
+            Some(Err(e)) if titres.is_err() => {
                 info!(query, error = %e, "ytm_search_failed_trying_data_api");
+                let results = self.recherche_data_api(query, limite).await?;
+                return Ok(SearchPage::page_unique_bornee(results, limite));
             }
-        }
-
-        // Fallback to YouTube Data API v3 (if API key is configured)
-        if self.api_key.is_some() {
-            let limit_str = limit.min(50).to_string();
-            let data = self
-                .yt_api_get(
-                    "search",
-                    &[
-                        ("part", "snippet"),
-                        ("q", query),
-                        ("maxResults", &limit_str),
-                        ("type", "video,playlist,channel"),
-                    ],
-                )
-                .await?;
-
-            let mut video_ids: Vec<String> = Vec::new();
-            let mut albums = Vec::new();
-            let mut artists = Vec::new();
-
-            for item in data["items"].as_array().unwrap_or(&vec![]) {
-                let kind = item["id"]["kind"].as_str().unwrap_or("");
-                let snippet = &item["snippet"];
-                let cover = Self::best_thumbnail(&snippet["thumbnails"]);
-                let title = snippet["title"].as_str().unwrap_or("Unknown");
-
-                match kind {
-                    "youtube#video" => {
-                        if let Some(vid) = item["id"]["videoId"].as_str() {
-                            video_ids.push(vid.to_string());
-                        }
-                    }
-                    "youtube#playlist" => {
-                        albums.push(StreamAlbum {
-                            ai_generated: None,
-                            release_type: None,
-                            id: item["id"]["playlistId"].as_str().unwrap_or("").into(),
-                            title: title.into(),
-                            artist: snippet["channelTitle"].as_str().unwrap_or("").into(),
-                            artist_id: None,
-                            cover_path: cover,
-                            year: None,
-                            track_count: 0,
-                            quality: None,
-                            released_at: None,
-                        });
-                    }
-                    "youtube#channel" => {
-                        artists.push(StreamArtist {
-                            id: item["id"]["channelId"].as_str().unwrap_or("").into(),
-                            name: title.into(),
-                            image_path: cover,
-                            bio: None,
-                        });
-                    }
-                    _ => {}
-                }
+            Some(Err(e)) => {
+                info!(query, error = %e, "ytm_search_melangee_echouee_titres_seuls");
+                resultats_vides()
             }
+            None => resultats_vides(),
+        };
 
-            let tracks = self.fetch_videos_batch(&video_ids).await;
-
-            return Ok(SearchResults {
-                tracks,
-                albums,
-                artists,
-                playlists: vec![],
-            });
-        }
-
-        Err("YouTube search unavailable — no API key and internal API failed".into())
+        let (lus, reste) = match titres {
+            Ok((lus, reste)) if !lus.is_empty() => (lus, reste),
+            Err(e) if offset > 0 => return Err(TuneError::Streaming(e)),
+            _ if offset > 0 => return Ok(SearchPage::au_dela(offset)),
+            // Première page sans titres filtrés : ceux de la recherche sans
+            // filtre, comme avant #6967.
+            _ => (std::mem::take(&mut results.tracks), false),
+        };
+        let fin = (offset + limite).min(lus.len());
+        let debut = offset.min(fin);
+        let has_more = (reste || lus.len() > fin) && fin < PLAFOND_LIMITE_RECHERCHE;
+        let truncated = (reste || lus.len() > fin) && fin >= PLAFOND_LIMITE_RECHERCHE;
+        results.tracks = lus[debut..fin].to_vec();
+        results.albums.truncate(limite);
+        results.artists.truncate(limite);
+        results.playlists.truncate(limite);
+        debug!(
+            query,
+            offset,
+            tracks = results.tracks.len(),
+            lus = lus.len(),
+            has_more,
+            "youtube_search_page"
+        );
+        Ok(SearchPage {
+            totals: SearchTotals {
+                tracks: lus.len(),
+                albums: results.albums.len(),
+                artists: results.artists.len(),
+                playlists: results.playlists.len(),
+            },
+            results,
+            offset,
+            has_more,
+            truncated,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -3093,18 +3389,12 @@ impl StreamingService for YouTubeService {
             let cache = self.url_cache.lock().await;
             if let Some(cached) = cache.get(track_id) {
                 debug!(track_id, "youtube_stream_url_cached");
-                let (mime_type, codec) = youtube_mime_codec(&cached.url);
+                let (mime_type, codec) = youtube_mime_codec(&cached.url, cached.format.as_ref());
                 let entetes = cached.headers.clone();
                 return Ok(StreamUrl {
                     url: cached.url.clone(),
                     mime_type: mime_type.into(),
-                    quality: StreamQuality {
-                        codec: codec.into(),
-                        sample_rate: 48000,
-                        bit_depth: 16,
-                        bitrate: Some(128000),
-                        channels: 2,
-                    },
+                    quality: qualite_youtube(codec, cached.format.as_ref()),
                     expires_at: None,
                     headers: entetes,
                 });
@@ -3112,16 +3402,20 @@ impl StreamingService for YouTubeService {
         }
 
         // Extract via native API (primary) + yt-dlp (fallback)
-        let FluxYoutube { url, headers } = self
+        let FluxYoutube {
+            url,
+            headers,
+            format,
+        } = self
             .extract_audio_url(track_id)
             .await
             .map_err(TuneError::Streaming)?;
 
-        // Determine MIME type + codec from the resolved URL. The codec label
-        // drives the temp-file extension used by the decoder: m4a/AAC routes to
-        // Symphonia, "opus"/webm to the (removed) ffmpeg path. We ask yt-dlp for
-        // m4a first (see the -f selector), so this is normally audio/mp4 + aac.
-        let (mime_type, codec) = youtube_mime_codec(&url);
+        // #6967 — le codec dit le format RETENU : `opus` (préféré) ou `m4a`
+        // (repli). Il nomme le fichier temporaire, donc le décodeur (libopus
+        // ou Symphonia), et c'est lui que le chemin du signal affiche.
+        let (mime_type, codec) = youtube_mime_codec(&url, format.as_ref());
+        let quality = qualite_youtube(codec, format.as_ref());
 
         // Cache the URL
         {
@@ -3131,6 +3425,7 @@ impl StreamingService for YouTubeService {
                 CachedUrl {
                     url: url.clone(),
                     headers: headers.clone(),
+                    format: format.clone(),
                     created: Instant::now(),
                 },
             );
@@ -3140,6 +3435,8 @@ impl StreamingService for YouTubeService {
             track_id,
             mime_type,
             codec,
+            itag = format.as_ref().map_or("?", |f| f.id.as_str()),
+            kbps = format.as_ref().and_then(|f| f.kbps).unwrap_or(0),
             entetes = headers.len(),
             "youtube_stream_url_resolved"
         );
@@ -3147,13 +3444,7 @@ impl StreamingService for YouTubeService {
         Ok(StreamUrl {
             url,
             mime_type: mime_type.into(),
-            quality: StreamQuality {
-                codec: codec.into(),
-                sample_rate: 48000,
-                bit_depth: 16,
-                bitrate: Some(128000),
-                channels: 2,
-            },
+            quality,
             expires_at: None,
             headers,
         })
@@ -4038,6 +4329,7 @@ mod tests {
             "abc".into(),
             CachedUrl {
                 headers: Vec::new(),
+                format: None,
                 url: "https://example.com/stream".into(),
                 created: Instant::now(),
             },
@@ -4053,6 +4345,7 @@ mod tests {
             "abc".into(),
             CachedUrl {
                 headers: Vec::new(),
+                format: None,
                 url: "https://example.com/stream".into(),
                 created: Instant::now() - Duration::from_secs(1),
             },
@@ -4112,3 +4405,7 @@ mod tests {
         assert!(!svc.token_needs_refresh());
     }
 }
+
+#[cfg(test)]
+#[path = "youtube_opus_recherche_6967_tests.rs"]
+mod opus_recherche_6967_tests;
