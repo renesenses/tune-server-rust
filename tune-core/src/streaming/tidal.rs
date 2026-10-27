@@ -882,7 +882,7 @@ impl TidalService {
 
     /// Taille d'une page de `/users/{id}/favorites/{type}`.
     const PAGE_FAVORIS: usize = 100;
-    /// Pages relues au plus : 10 000 favoris d'un type.
+    /// Au plus 100 pages, soit au plus 10 000 favoris d'un type.
     const PAGES_FAVORIS_MAX: usize = 100;
 
     /// #5997 — TOUTES les pages des favoris d'un type, et le motif si la
@@ -901,8 +901,10 @@ impl TidalService {
         let mut items: Vec<serde_json::Value> = Vec::new();
         let mut total: Option<usize> = None;
         let mut derniere_page_pleine = false;
-        for page in 0..Self::PAGES_FAVORIS_MAX {
-            let offset = page * Self::PAGE_FAVORIS;
+        for _ in 0..Self::PAGES_FAVORIS_MAX {
+            // #7250 : le service peut plafonner la page sous la limite demandée.
+            // Avancer du nombre reçu évite de sauter les favoris intermédiaires.
+            let offset = items.len();
             let data = self
                 .api_get(&format!(
                     "/users/{user_id}/favorites/{type_tidal}?limit={}&offset={offset}",
@@ -913,7 +915,12 @@ impl TidalService {
             let recus = lot.len();
             items.extend(lot);
             total = data["totalNumberOfItems"].as_u64().map(|t| t as usize);
-            derniere_page_pleine = recus >= Self::PAGE_FAVORIS;
+            let limite_servie = data["limit"]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(Self::PAGE_FAVORIS);
+            derniere_page_pleine = recus >= limite_servie;
             let fini = match total {
                 Some(t) => items.len() >= t,
                 None => !derniere_page_pleine,
@@ -4938,26 +4945,39 @@ mod favoris_complets_5997 {
     /// Un TIDAL factice : `total` titres favoris annoncés, servis par pages
     /// jusqu'à `servis` au plus.
     async fn faux_tidal(total: usize, servis: usize) -> TidalService {
+        faux_tidal_plafonne(total, servis, 100, true).await
+    }
+
+    async fn faux_tidal_plafonne(
+        total: usize,
+        servis: usize,
+        plafond: usize,
+        annoncer_total: bool,
+    ) -> TidalService {
         use axum::extract::{Query, State};
         use axum::routing::get;
         async fn favoris(
-            State((total, servis)): State<(usize, usize)>,
+            State((total, servis, plafond, annoncer_total)): State<(usize, usize, usize, bool)>,
             Query(q): Query<HashMap<String, String>>,
         ) -> axum::Json<serde_json::Value> {
             let offset: usize = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
             let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(10);
+            let limit = limit.min(plafond);
             let items: Vec<_> = (offset..(offset + limit).min(servis))
                 .map(|i| {
                     json!({"created": "2026-10-01T10:00:00.000+0000",
                         "item": {"id": i + 1, "title": format!("piste {}", i + 1)}})
                 })
                 .collect();
-            axum::Json(json!({"limit": limit, "offset": offset,
-                "totalNumberOfItems": total, "items": items}))
+            let mut reponse = json!({"limit": limit, "offset": offset, "items": items});
+            if annoncer_total {
+                reponse["totalNumberOfItems"] = json!(total);
+            }
+            axum::Json(reponse)
         }
         let app = axum::Router::new()
             .route("/users/7/favorites/tracks", get(favoris))
-            .with_state((total, servis));
+            .with_state((total, servis, plafond, annoncer_total));
         let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("port libre");
@@ -4974,6 +4994,59 @@ mod favoris_complets_5997 {
             token_expires: None,
         });
         svc
+    }
+
+    /// Le fournisseur peut plafonner les pages sous la limite demandée.
+    /// Les trois projections doivent conserver chaque identifiant, sans trous.
+    #[tokio::test]
+    async fn pages_plafonnees_conservent_les_357_favoris_7250() {
+        let svc = faux_tidal_plafonne(357, 357, 50, true).await;
+        let types = svc.get_user_tracks().await.expect("favoris typés");
+        let ids: Vec<_> = types.iter().map(|t| t.id.clone()).collect();
+        let attendus: Vec<_> = (1..=357).map(|id| id.to_string()).collect();
+        assert_eq!(
+            ids, attendus,
+            "#7250 : une page plafonnée ne doit sauter aucun favori"
+        );
+        let dates = svc
+            .get_user_favorites_dated("tracks")
+            .await
+            .expect("projection datée")
+            .expect("lecture datée");
+        assert_eq!(
+            dates.len(),
+            357,
+            "#7250 : tous les favoris destinés à la route HTTP"
+        );
+        let miroir = svc
+            .favoris_dates_complets("tracks")
+            .await
+            .expect("projection miroir")
+            .expect("collection complète pour le miroir");
+        assert_eq!(
+            miroir.len(),
+            357,
+            "#7250 : le miroir reçoit toute la collection"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_plafonnee_sans_total_ne_termine_pas_la_collection_7250() {
+        let svc = faux_tidal_plafonne(357, 357, 50, false).await;
+        let complets = svc
+            .favoris_dates_complets("tracks")
+            .await
+            .expect("lecture miroir")
+            .expect("favoris datés");
+        let ids: Vec<_> = complets
+            .iter()
+            .map(|v| v["source_id"].as_str().unwrap().to_string())
+            .collect();
+        let attendus: Vec<_> = (1..=357).map(|id| id.to_string()).collect();
+        assert_eq!(
+            ids, attendus,
+            "#7250 : une page pleine au plafond annoncé ne termine pas la collection"
+        );
     }
 
     /// 150 favoris : la lecture ne s'arrête plus à la première page de 100.
