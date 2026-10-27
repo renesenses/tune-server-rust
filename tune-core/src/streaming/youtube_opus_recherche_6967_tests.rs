@@ -306,6 +306,96 @@ fn la_sortie_de_yt_dlp_dit_le_format_retenu() {
 }
 
 #[test]
+fn la_sortie_de_yt_dlp_dit_quand_le_flux_est_servi() {
+    let flux = analyser_sortie_ytdlp(
+        "https://cdn.invalide/x\ntune-format=251,opus,128.93\ntune-disponible=1793094690\n",
+    )
+    .expect("une URL");
+    assert_eq!(flux.url, "https://cdn.invalide/x");
+    assert_eq!(flux.disponible_a, Some(1_793_094_690));
+    let sans = analyser_sortie_ytdlp("https://cdn.invalide/x\ntune-disponible=NA\n").unwrap();
+    assert_eq!(sans.disponible_a, None, "`NA` : servie tout de suite");
+
+    let t = |s: u64| std::time::UNIX_EPOCH + Duration::from_secs(s);
+    assert_eq!(
+        attente_avant_le_flux(Some(104), t(100)),
+        Duration::from_secs(4)
+    );
+    assert_eq!(attente_avant_le_flux(Some(90), t(100)), Duration::ZERO);
+    assert_eq!(attente_avant_le_flux(None, t(100)), Duration::ZERO);
+    assert_eq!(
+        attente_avant_le_flux(Some(10_000), t(100)),
+        Duration::from_secs(15),
+        "attente bornée"
+    );
+}
+
+/// Un faux yt-dlp : comme le vrai sans compte (client `TVHTML5`), il rend une
+/// URL que le serveur ne sert qu'à partir de `available_at`, deux secondes
+/// plus tard — s'il lui est demandé de le dire.
+const FAUX_YTDLP: &str = r#"#!/bin/sh
+DISPO=NA
+for a in "$@"; do
+  [ "$a" = 'tune-disponible=%(available_at)s' ] && DISPO=$(( $(date +%s) + 2 ))
+done
+echo "$TUNE_FAUX_FLUX/$DISPO"
+echo '{"User-Agent": "Mozilla/5.0"}'
+echo 'tune-format=251,opus,128.93'
+echo "tune-disponible=$DISPO"
+"#;
+
+/// Le flux du faux googlevideo : 403 avant l'instant inscrit dans l'URL, 206
+/// et le début d'un WebM ensuite (constaté le 27/10/2026 : 403 à la sortie de
+/// yt-dlp, 206 cinq secondes plus tard).
+async fn faux_flux(
+    axum::extract::Path(dispo): axum::extract::Path<String>,
+) -> (StatusCode, Vec<u8>) {
+    let maintenant = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    match dispo.parse::<u64>() {
+        Ok(d) if maintenant < d => (StatusCode::FORBIDDEN, Vec::new()),
+        _ => (StatusCode::PARTIAL_CONTENT, vec![0x1a, 0x45, 0xdf, 0xa3]),
+    }
+}
+
+#[tokio::test]
+async fn le_flux_de_yt_dlp_n_est_demande_qu_une_fois_servi() {
+    use std::os::unix::fs::PermissionsExt;
+    let app = Router::new().route("/flux/{dispo}", axum::routing::get(faux_flux));
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let adresse = ecoute.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(ecoute, app).await });
+
+    let dossier = tempfile::tempdir().unwrap();
+    let binaire = dossier.path().join("yt-dlp");
+    // Le flux du faux serveur, lu par le script : `$TUNE_FAUX_FLUX/<instant>`.
+    let script = FAUX_YTDLP.replace("$TUNE_FAUX_FLUX", &format!("http://{adresse}/flux"));
+    std::fs::write(&binaire, script).unwrap();
+    std::fs::set_permissions(&binaire, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let flux = extraire_par_ytdlp(&binaire, "dQw4w9WgXcQ")
+        .await
+        .expect("yt-dlp rend une URL");
+    assert!(
+        flux.disponible_a.is_some(),
+        "yt-dlp n'a pas été prié de dire quand : {flux:?}"
+    );
+    let mut req = reqwest::Client::new()
+        .get(&flux.url)
+        .header("Range", "bytes=0-4095");
+    for (nom, valeur) in &flux.headers {
+        req = req.header(nom.as_str(), valeur.as_str());
+    }
+    let statut = req.send().await.expect("le flux").status().as_u16();
+    assert_eq!(
+        statut, 206,
+        "le flux a été demandé avant l'instant où YouTube le sert (403)"
+    );
+}
+
+#[test]
 fn le_lecteur_natif_prend_l_opus_et_se_replie_sur_l_aac() {
     let avec_opus = reponse_lecteur("a", false);
     let (url, f) = choisir_format_audio(
@@ -468,6 +558,29 @@ async fn la_page_suivante_continue_le_parcours_sans_repartir_de_zero() {
     assert!(
         p2.results.tracks.iter().all(|t| !vus.contains(&t.id)),
         "la page 2 répète la page 1"
+    );
+}
+
+#[tokio::test]
+async fn une_recherche_refaite_repart_du_debut() {
+    // Revue du 27/10 : la même recherche refaite (première page) dans les
+    // 10 minutes reprenait le parcours de la précédente, et rendait une
+    // première page faite de sa fin. Elle doit repartir de zéro.
+    let (yt, appels) = service(Forme::Reelle).await;
+    let attendus = ids_attendus(&["recherche_titres_p1", "recherche_titres_p2"]);
+    yt.search_page("Daft Punk", 30, 0).await.expect("page 1");
+    yt.search_page("Daft Punk", 30, 30).await.expect("page 2");
+    let refaite = yt.search_page("Daft Punk", 10, 0).await.expect("refaite");
+    let appels = appels.lock().unwrap().clone();
+    assert_eq!(
+        appels.iter().filter(|a| *a == "search:songs").count(),
+        2,
+        "la recherche refaite a repris l'ancien parcours : {appels:?}"
+    );
+    assert_eq!(
+        ids(&refaite.results.tracks),
+        attendus[..10],
+        "la recherche refaite ne rend pas la première page"
     );
 }
 

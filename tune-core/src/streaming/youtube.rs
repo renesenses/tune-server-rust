@@ -221,6 +221,9 @@ pub(crate) struct FluxYoutube {
     pub(crate) headers: Vec<(String, String)>,
     /// #6967 — le format retenu, quand la source le dit (yt-dlp, `/player`).
     pub(crate) format: Option<FormatYoutube>,
+    /// #6967 — l'instant (secondes Unix) à partir duquel YouTube sert l'URL,
+    /// quand yt-dlp le dit (`available_at`). Demandée avant, elle répond 403.
+    pub(crate) disponible_a: Option<u64>,
 }
 
 /// #6967 — le format audio retenu : son itag, son codec, son débit.
@@ -256,6 +259,34 @@ pub(crate) const SELECTEUR_FORMAT_YTDLP: &str = "bestaudio[acodec=opus][protocol
 /// Préfixe de la ligne `--print` qui décrit le format retenu (#6967).
 const PREFIXE_FORMAT_YTDLP: &str = "tune-format=";
 
+/// Préfixe de la ligne `--print` qui dit quand l'URL devient servable (#6967).
+const PREFIXE_DISPONIBLE_YTDLP: &str = "tune-disponible=";
+
+/// #6967 — attente au plus avant la première requête d'un flux de yt-dlp.
+/// YouTube en demande environ 4 s (constaté le 27/10/2026) ; au-delà, on
+/// tente quand même plutôt que de bloquer la lecture.
+const ATTENTE_FLUX_MAX: Duration = Duration::from_secs(15);
+
+/// #6967 — combien attendre avant de demander le flux. yt-dlp donne, pour
+/// les formats de certains clients (`TVHTML5`, celui qu'il retient sans
+/// compte), un `available_at` quelques secondes dans le futur, et attend
+/// lui-même avant de télécharger (« Sleeping 4.00 seconds as required by the
+/// site »). Tune, qui ne prend que l'URL, la demandait aussitôt : HTTP 403
+/// sur le vrai service, puis 206 cinq secondes plus tard.
+pub(crate) fn attente_avant_le_flux(
+    disponible_a: Option<u64>,
+    maintenant: std::time::SystemTime,
+) -> Duration {
+    let Some(secondes) = disponible_a else {
+        return Duration::ZERO;
+    };
+    let instant = std::time::UNIX_EPOCH + Duration::from_secs(secondes);
+    instant
+        .duration_since(maintenant)
+        .unwrap_or(Duration::ZERO)
+        .min(ATTENTE_FLUX_MAX)
+}
+
 /// Lit `tune-format=<itag>,<acodec>,<abr>` (abr en kbit/s, `NA` si inconnu).
 fn analyser_format_ytdlp(ligne: &str) -> Option<FormatYoutube> {
     let mut champs = ligne.strip_prefix(PREFIXE_FORMAT_YTDLP)?.split(',');
@@ -277,7 +308,8 @@ fn analyser_format_ytdlp(ligne: &str) -> Option<FormatYoutube> {
 /// l'URL. Une ligne qui commence par `{` est lue comme les en-têtes ; la
 /// première ligne restante non vide est l'URL.
 ///
-/// #6967 — une troisième ligne, `tune-format=…`, dit le format retenu.
+/// #6967 — une troisième ligne, `tune-format=…`, dit le format retenu ; une
+/// quatrième, `tune-disponible=…`, quand l'URL devient servable (`NA` sinon).
 ///
 /// `None` seulement s'il n'y a aucune URL : c'est le seul cas d'échec, les
 /// en-têtes étant un bonus.
@@ -285,9 +317,17 @@ pub(crate) fn analyser_sortie_ytdlp(brut: &str) -> Option<FluxYoutube> {
     let mut url = None;
     let mut headers = Vec::new();
     let mut format = None;
+    let mut disponible_a = None;
     for ligne in brut.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if ligne.starts_with(PREFIXE_FORMAT_YTDLP) {
             format = analyser_format_ytdlp(ligne);
+        } else if let Some(instant) = ligne.strip_prefix(PREFIXE_DISPONIBLE_YTDLP) {
+            disponible_a = instant
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|t| t.is_finite() && *t > 0.0)
+                .map(|t| t.ceil() as u64);
         } else if ligne.starts_with('{') {
             if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(ligne) {
                 headers = map
@@ -306,6 +346,7 @@ pub(crate) fn analyser_sortie_ytdlp(brut: &str) -> Option<FluxYoutube> {
         url,
         headers,
         format,
+        disponible_a,
     })
 }
 
@@ -821,10 +862,21 @@ impl YouTubeService {
     /// le CONTINUE. YouTube ne rend pas deux fois le même ordre (constaté le
     /// 27/10/2026 sur « Daft Punk ») ; repartir de la première réponse
     /// redonnait en page 2 des titres déjà montrés en page 1.
+    ///
+    /// `depuis_le_debut` (la première page) jette le parcours gardé : une
+    /// recherche refaite repart de zéro, au lieu de rendre une première page
+    /// faite de la fin d'un parcours déjà long.
+    ///
+    /// Le parcours est rangé sous le seul texte de la recherche, et RETIRÉ
+    /// pendant qu'on le lit : deux pages de la même recherche demandées en
+    /// même temps lisent chacune la leur depuis le début, et la dernière
+    /// rangée remplace l'autre. Aucune page n'est fausse pour autant, la
+    /// suivante peut seulement répéter quelques titres.
     async fn titres_de_recherche(
         &self,
         query: &str,
         voulu: usize,
+        depuis_le_debut: bool,
     ) -> Result<(Vec<StreamTrack>, bool), String> {
         let corps = Self::corps_de_recherche(query, Some("songs"));
         let deja_lu = self
@@ -832,7 +884,7 @@ impl YouTubeService {
             .lock()
             .await
             .remove(query)
-            .filter(|p| p.cree.elapsed() < DUREE_PARCOURS_RECHERCHE);
+            .filter(|p| !depuis_le_debut && p.cree.elapsed() < DUREE_PARCOURS_RECHERCHE);
         let mut parcours = match deja_lu {
             Some(p) => p,
             None => {
@@ -1130,57 +1182,7 @@ impl YouTubeService {
              (downloads the yt-dlp helper)"
                 .to_string()
         })?;
-        let video_url = format!("https://www.youtube.com/watch?v={track_id}");
-
-        let output = tokio::time::timeout(
-            Duration::from_secs(YTDLP_TIMEOUT_SECS),
-            tokio::process::Command::new(&ytdlp)
-                .args([
-                    // #6967 — Opus d'abord, AAC en repli : voir le sélecteur.
-                    "-f",
-                    SELECTEUR_FORMAT_YTDLP,
-                    // Trois lignes en sortie : l'URL, ses en-têtes en JSON,
-                    // puis le format retenu (itag, codec, débit).
-                    "--print",
-                    "%(urls)s",
-                    "--print",
-                    "%(http_headers)j",
-                    "--print",
-                    "tune-format=%(format_id)s,%(acodec)s,%(abr)s",
-                    "--no-playlist",
-                    "--no-warnings",
-                    "-q",
-                    &video_url,
-                ])
-                .output(),
-        )
-        .await
-        .map_err(|_| format!("yt-dlp timeout for {track_id}"))?
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "yt-dlp binary missing — re-enable YouTube playback in Settings".to_string()
-            } else {
-                format!("yt-dlp exec error: {e}")
-            }
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!(track_id, stderr = %stderr.chars().take(200).collect::<String>(), "yt_dlp_failed");
-            return Err(format!("yt-dlp failed for {track_id}: {stderr}"));
-        }
-
-        let brut = String::from_utf8_lossy(&output.stdout);
-        let flux = analyser_sortie_ytdlp(&brut)
-            .ok_or_else(|| format!("yt-dlp returned empty URL for {track_id}"))?;
-        info!(
-            track_id,
-            entetes = flux.headers.len(),
-            itag = flux.format.as_ref().map_or("?", |f| f.id.as_str()),
-            acodec = flux.format.as_ref().map_or("?", |f| f.acodec.as_str()),
-            "ytdlp_url_et_entetes_resolues"
-        );
-        Ok(flux)
+        extraire_par_ytdlp(&ytdlp, track_id).await
     }
 
     /// Extract audio stream URL with native API as primary + yt-dlp fallback.
@@ -1216,6 +1218,7 @@ impl YouTubeService {
                         url,
                         headers: Vec::new(),
                         format: Some(format),
+                        disponible_a: None,
                     });
                 }
                 Err(e) => {
@@ -3089,6 +3092,79 @@ fn artiste_de_chaine(chaine: &str) -> String {
         .to_string()
 }
 
+/// #6967 — l'URL du flux par yt-dlp (`ytdlp`, le binaire), servable : on
+/// ne rend la main qu'à l'instant où YouTube la sert.
+async fn extraire_par_ytdlp(
+    ytdlp: &std::path::Path,
+    track_id: &str,
+) -> Result<FluxYoutube, String> {
+    let video_url = format!("https://www.youtube.com/watch?v={track_id}");
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(YTDLP_TIMEOUT_SECS),
+        tokio::process::Command::new(ytdlp)
+            .args([
+                // #6967 — Opus d'abord, AAC en repli : voir le sélecteur.
+                "-f",
+                SELECTEUR_FORMAT_YTDLP,
+                // Quatre lignes en sortie : l'URL, ses en-têtes en JSON,
+                // le format retenu (itag, codec, débit), puis l'instant
+                // où YouTube commence à servir l'URL.
+                "--print",
+                "%(urls)s",
+                "--print",
+                "%(http_headers)j",
+                "--print",
+                "tune-format=%(format_id)s,%(acodec)s,%(abr)s",
+                "--print",
+                "tune-disponible=%(available_at)s",
+                "--no-playlist",
+                "--no-warnings",
+                "-q",
+                &video_url,
+            ])
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("yt-dlp timeout for {track_id}"))?
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "yt-dlp binary missing — re-enable YouTube playback in Settings".to_string()
+        } else {
+            format!("yt-dlp exec error: {e}")
+        }
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(track_id, stderr = %stderr.chars().take(200).collect::<String>(), "yt_dlp_failed");
+        return Err(format!("yt-dlp failed for {track_id}: {stderr}"));
+    }
+
+    let brut = String::from_utf8_lossy(&output.stdout);
+    let flux = analyser_sortie_ytdlp(&brut)
+        .ok_or_else(|| format!("yt-dlp returned empty URL for {track_id}"))?;
+    info!(
+        track_id,
+        entetes = flux.headers.len(),
+        itag = flux.format.as_ref().map_or("?", |f| f.id.as_str()),
+        acodec = flux.format.as_ref().map_or("?", |f| f.acodec.as_str()),
+        "ytdlp_url_et_entetes_resolues"
+    );
+    // #6967 — pas de requête avant l'instant que yt-dlp annonce : avant,
+    // YouTube répond 403 et la lecture échoue.
+    let attente = attente_avant_le_flux(flux.disponible_a, std::time::SystemTime::now());
+    if !attente.is_zero() {
+        info!(
+            track_id,
+            attente_ms = attente.as_millis() as u64,
+            "ytdlp_flux_attente_disponibilite"
+        );
+        tokio::time::sleep(attente).await;
+    }
+    Ok(flux)
+}
+
 /// #6967 — appels `search` au plus pour une page de recherche : la première
 /// réponse, puis ses suites. Une vingtaine de titres par réponse, de quoi
 /// tenir [`PLAFOND_LIMITE_RECHERCHE`].
@@ -3405,12 +3481,12 @@ impl StreamingService for YouTubeService {
         let voulu = (offset + limite + 1).min(PLAFOND_LIMITE_RECHERCHE);
         let (titres, melangee) = if offset == 0 {
             let (titres, melangee) = tokio::join!(
-                self.titres_de_recherche(query, voulu),
+                self.titres_de_recherche(query, voulu, true),
                 self.ytm_search(query, None)
             );
             (titres, Some(melangee))
         } else {
-            (self.titres_de_recherche(query, voulu).await, None)
+            (self.titres_de_recherche(query, voulu, false).await, None)
         };
 
         let mut results = match melangee {
@@ -3540,6 +3616,7 @@ impl StreamingService for YouTubeService {
             url,
             headers,
             format,
+            ..
         } = self
             .extract_audio_url(track_id)
             .await
