@@ -530,6 +530,9 @@ pub struct YouTubeService {
     /// General-purpose browse/home cache (30 min TTL).
     browse_cache: Mutex<HashMap<String, BrowseCacheEntry>>,
     browse_cache_ttl: Duration,
+    /// #6967 — le parcours de chaque recherche récente, que la page suivante
+    /// CONTINUE au lieu de repartir de la première réponse.
+    parcours_de_recherche: Mutex<HashMap<String, ParcoursDeRecherche>>,
     /// Optional YouTube Data API v3 key for higher quota.
     api_key: Option<String>,
     /// Racine de l'API interne de YouTube Music (InnerTube). `YTM_API_BASE`
@@ -580,6 +583,7 @@ impl YouTubeService {
             )),
             browse_cache: Mutex::new(HashMap::new()),
             browse_cache_ttl: Duration::from_secs(1800), // 30 minutes
+            parcours_de_recherche: Mutex::new(HashMap::new()),
             api_key,
             ytm_base: YTM_API_BASE.into(),
             data_api_base: YT_API_BASE.into(),
@@ -812,34 +816,44 @@ impl YouTubeService {
     /// Rend les titres (sans doublon, dans l'ordre de YouTube) et s'il en
     /// reste au-delà. Une suite qui échoue arrête la lecture sans perdre ce
     /// qui est déjà lu.
+    ///
+    /// Le parcours est gardé [`DUREE_PARCOURS_RECHERCHE`] : la page suivante
+    /// le CONTINUE. YouTube ne rend pas deux fois le même ordre (constaté le
+    /// 27/10/2026 sur « Daft Punk ») ; repartir de la première réponse
+    /// redonnait en page 2 des titres déjà montrés en page 1.
     async fn titres_de_recherche(
         &self,
         query: &str,
         voulu: usize,
     ) -> Result<(Vec<StreamTrack>, bool), String> {
         let corps = Self::corps_de_recherche(query, Some("songs"));
-        let mut reponse = self.ytm_post("search", corps.clone()).await?;
-        let mut titres: Vec<StreamTrack> = Vec::new();
-        let mut vus = std::collections::HashSet::new();
-        for appel in 1..=PAGES_DE_RECHERCHE_MAX {
-            let (elements, suite) = elements_et_suite_de_recherche(&reponse);
-            for piste in self.parse_search_results(&rayon_de_titres(elements)).tracks {
-                if !piste.id.is_empty() && vus.insert(piste.id.clone()) {
-                    titres.push(piste);
-                }
+        let deja_lu = self
+            .parcours_de_recherche
+            .lock()
+            .await
+            .remove(query)
+            .filter(|p| p.cree.elapsed() < DUREE_PARCOURS_RECHERCHE);
+        let mut parcours = match deja_lu {
+            Some(p) => p,
+            None => {
+                let reponse = self.ytm_post("search", corps.clone()).await?;
+                let mut p = ParcoursDeRecherche::nouveau();
+                p.ajouter(self, &reponse);
+                p
             }
-            let Some(suite) = suite else {
-                return Ok((titres, false));
+        };
+        let mut echec = false;
+        while parcours.titres.len() < voulu && parcours.appels < PAGES_DE_RECHERCHE_MAX {
+            let Some(suite) = parcours.suite.clone() else {
+                break;
             };
-            if titres.len() >= voulu || appel == PAGES_DE_RECHERCHE_MAX {
-                return Ok((titres, true));
-            }
             // La forme annoncée par la réponse d'abord ; si InnerTube la
             // refuse, l'autre, une fois, avant d'abandonner la suite.
             let autre = match &suite {
                 SuiteDeRecherche::DansLUrl(j) => SuiteDeRecherche::DansLeCorps(j.clone()),
                 SuiteDeRecherche::DansLeCorps(j) => SuiteDeRecherche::DansLUrl(j.clone()),
             };
+            let appel = parcours.appels + 1;
             let suivante = match self.demander_la_suite(&suite, &corps).await {
                 Ok(r) => Ok(r),
                 Err(e) => {
@@ -848,14 +862,28 @@ impl YouTubeService {
                 }
             };
             match suivante {
-                Ok(suivante) => reponse = suivante,
+                Ok(suivante) => parcours.ajouter(self, &suivante),
                 Err(e) => {
-                    warn!(query, appel, lus = titres.len(), error = %e, "youtube_recherche_suite_echouee");
-                    return Ok((titres, false));
+                    warn!(query, appel, lus = parcours.titres.len(), error = %e, "youtube_recherche_suite_echouee");
+                    echec = true;
+                    break;
                 }
             }
         }
-        Ok((titres, true))
+        let reste = !echec && parcours.suite.is_some();
+        let titres = parcours.titres.clone();
+        let mut gardes = self.parcours_de_recherche.lock().await;
+        gardes.retain(|_, p| p.cree.elapsed() < DUREE_PARCOURS_RECHERCHE);
+        if gardes.len() >= PARCOURS_DE_RECHERCHE_MAX
+            && let Some(plus_ancien) = gardes
+                .iter()
+                .min_by_key(|(_, p)| p.cree)
+                .map(|(q, _)| q.clone())
+        {
+            gardes.remove(&plus_ancien);
+        }
+        gardes.insert(query.to_string(), parcours);
+        Ok((titres, reste))
     }
 
     /// #6967 — un appel `search` pour la suite d'une recherche, dans la forme
@@ -3065,6 +3093,47 @@ fn artiste_de_chaine(chaine: &str) -> String {
 /// réponse, puis ses suites. Une vingtaine de titres par réponse, de quoi
 /// tenir [`PLAFOND_LIMITE_RECHERCHE`].
 const PAGES_DE_RECHERCHE_MAX: usize = 25;
+
+/// #6967 — durée pendant laquelle un parcours de recherche est continué par
+/// la page suivante plutôt que recommencé.
+const DUREE_PARCOURS_RECHERCHE: Duration = Duration::from_secs(600);
+
+/// #6967 — recherches gardées au plus ; au-delà, la plus ancienne part.
+const PARCOURS_DE_RECHERCHE_MAX: usize = 32;
+
+/// #6967 — où en est la lecture d'une recherche filtrée : les titres lus
+/// (sans doublon), le jeton de la suite, et les appels `search` déjà faits.
+struct ParcoursDeRecherche {
+    titres: Vec<StreamTrack>,
+    vus: std::collections::HashSet<String>,
+    suite: Option<SuiteDeRecherche>,
+    appels: usize,
+    cree: Instant,
+}
+
+impl ParcoursDeRecherche {
+    fn nouveau() -> Self {
+        Self {
+            titres: Vec::new(),
+            vus: std::collections::HashSet::new(),
+            suite: None,
+            appels: 0,
+            cree: Instant::now(),
+        }
+    }
+
+    /// Ajoute les titres d'une réponse (première ou suite) et retient sa suite.
+    fn ajouter(&mut self, yt: &YouTubeService, reponse: &serde_json::Value) {
+        self.appels += 1;
+        let (elements, suite) = elements_et_suite_de_recherche(reponse);
+        for piste in yt.parse_search_results(&rayon_de_titres(elements)).tracks {
+            if !piste.id.is_empty() && self.vus.insert(piste.id.clone()) {
+                self.titres.push(piste);
+            }
+        }
+        self.suite = suite;
+    }
+}
 
 /// #6967 — le jeton de la suite d'une recherche, avec la façon de le rendre.
 ///
