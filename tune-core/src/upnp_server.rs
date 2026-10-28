@@ -3705,6 +3705,11 @@ fn didl_track_item(track: &Track, parent_id: &str, base_url: &str) -> String {
         .channels(track.channels as u32)
         .artist_opt(track.artist_name.as_deref())
         .album_opt(track.album_title.as_deref())
+        .year_opt(track.year)
+        .genres(crate::db::edition_album::genres_de_piste(
+            track.genre.clone(),
+            track.genres.clone(),
+        ))
         .album_art_opt(cover_url.as_deref())
         .sample_rate_opt(advertised_sr)
         .bit_depth_opt(advertised_bd)
