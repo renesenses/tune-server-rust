@@ -50,6 +50,26 @@ impl PositionPoller {
         // Ne pas laisser l'état de recul survivre à une zone supprimée.
         idle_backoff.retain(|zone_id, _| all_zones.iter().any(|z| z.id == Some(*zone_id)));
 
+        // Métadonnées synchrones : ne prendre aucun verrou d'une sortie
+        // pendant que le registre est tenu.
+        let hotes_airplay_actifs: std::collections::HashSet<String> = {
+            let outputs = self.outputs.lock().await;
+            all_zones
+                .iter()
+                .filter(|zone| {
+                    states.iter().any(|s| {
+                        Some(s.zone_id) == zone.id
+                            && matches!(s.state, PlayState::Playing | PlayState::Paused)
+                    })
+                })
+                .filter_map(|zone| zone.output_device_id.as_deref())
+                .filter(|id| outputs.type_of(id).as_deref() == Some("airplay"))
+                .filter_map(|id| outputs.host_of(id))
+                .filter(|host| !host.is_empty())
+                .map(|host| host.to_ascii_lowercase())
+                .collect()
+        };
+
         for zone in &all_zones {
             let zone_id = zone.id.unwrap_or(0);
             if zone_id == 0 {
@@ -67,6 +87,26 @@ impl PositionPoller {
             if in_states {
                 continue;
             } // already handled below
+
+            // #7259 : le NR1602 coupe AirPlay après les interrogations de
+            // sa seconde entrée DLNA. Tant qu'AirPlay possède cet hôte, ne
+            // sonder que la sortie active. Aucun arrêt/masquage persistant,
+            // et les commandes explicites restent disponibles.
+            let differer_dlna = if !states
+                .iter()
+                .any(|s| s.zone_id == zone_id && s.state != PlayState::Stopped)
+            {
+                let outputs = self.outputs.lock().await;
+                outputs.type_of(&device_id).as_deref() == Some("dlna")
+                    && outputs.host_of(&device_id).is_some_and(|host| {
+                        hotes_airplay_actifs.contains(&host.to_ascii_lowercase())
+                    })
+            } else {
+                false
+            };
+            if differer_dlna {
+                continue;
+            }
 
             // Recul après échec : sans cela un appareil injoignable était sondé
             // chaque seconde sans fin (voir IdlePollBackoff).
