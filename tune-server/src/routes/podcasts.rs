@@ -904,8 +904,7 @@ pub(super) async fn play_episode(
                 return (
                     StatusCode::BAD_GATEWAY,
                     Json(json!({"error": e.to_string(), "code": "podcast_resume_seek_failed"})),
-                )
-                    .into_response();
+                );
             }
         }
         if output_sent {
@@ -929,9 +928,10 @@ pub(super) async fn play_episode(
     let output_error = echec.map(|(_, _, e)| e);
     (
         statut,
-        Json(json!({"zone_id": zone_id, "title": title, "podcast": podcast_name, "audio_url": body.audio_url, "mime_type": mime_type, "output_sent": output_sent, "error": output_error, "code": code, "state": zone_state})),
+        Json(
+            json!({"zone_id": zone_id, "title": title, "podcast": podcast_name, "audio_url": body.audio_url, "mime_type": mime_type, "output_sent": output_sent, "error": output_error, "code": code, "state": zone_state}),
+        ),
     )
-        .into_response()
 }
 // ─── Vignette mise en cache (#5214) ─────────────────────────────────
 
