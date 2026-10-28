@@ -264,6 +264,14 @@ impl PlaybackOrchestrator {
         self.play_par_l_entree(req, true, Entree::Geste).await
     }
 
+    /// Un contexte repris explicitement doit créer sa nouvelle lecture même
+    /// s'il vient d'être joué : ce geste n'est pas un double appui ordinaire.
+    /// Le demandeur conserve la responsabilité du repositionnement de sa sortie.
+    pub async fn play_context_resume(&self, req: PlayRequest) -> Result<PlayResult, String> {
+        self.play_par_l_entree(req, true, Entree::RepriseDeContexte)
+            .await
+    }
+
     /// #6466 (fil 2302 point 15) — le transfert de zone : une lecture
     /// NOUVELLE sur la cible, qui passe par TOUTES les étapes d'entrée de
     /// [`play`](Self::play) (plafond de zones, dédoublonnage du re-tap), mais
