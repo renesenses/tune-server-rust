@@ -157,11 +157,13 @@ async fn podcast_navigateur_7354_recul_10_0_300_et_reprises_explicites_sans_doub
     let b = banc().await;
     let mut sid = lancer(&b).await;
     let settings = SettingsRepo::with_backend(b.state.backend.clone());
+    // Vérifier le bornage avant les reprises avancées : une position 5 s
+    // après un seek à 20 s est volontairement rejetée comme signal tardif.
     for (position, recul, attendu) in [
+        (5000, 10, 0),
         (320000, 10, 310000),
         (320000, 0, 320000),
         (320000, 300, 20000),
-        (5000, 10, 0),
     ] {
         signaler(&b, &sid, position).await;
         let r = listening_resume::recent(&b.state.backend, Some(b.zone), 10)
