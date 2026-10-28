@@ -1094,6 +1094,7 @@ impl OutputTarget for OaatOutput {
                         }
 
                         let mut stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                        let mut fraction_pts = super::horloge::FractionDePresentation::default();
                         let mut start = std::time::Instant::now()
                             - std::time::Duration::from_nanos(
                                 (initial_bits as f64 / cur_sample_rate as f64 * 1e9) as u64,
@@ -1204,6 +1205,7 @@ impl OutputTarget for OaatOutput {
                                                     pts_bits_base = sample_offset;
                                                     stream_start_ns =
                                                         super::helpers::now_ns() + 200_000_000;
+                                                    fraction_pts.reinitialiser();
                                                     info!(
                                                         device = %device_name,
                                                         seek_pos,
@@ -1332,6 +1334,7 @@ impl OutputTarget for OaatOutput {
                                                     pts_bits_base = sample_offset;
                                                     stream_start_ns =
                                                         super::helpers::now_ns() + 200_000_000;
+                                                    fraction_pts.reinitialiser();
                                                 }
                                             }
                                             OaatCommand::PrepareNext { .. } => {}
@@ -1371,10 +1374,15 @@ impl OutputTarget for OaatOutput {
                                 }
                                 let payload: Vec<u8> = pending.drain(..take).collect();
                                 let bits_this = (take / ch_usize) * 8;
-                                let pts_ns = stream_start_ns
-                                    + (sample_offset.saturating_sub(pts_bits_base) as f64
-                                        / cur_sample_rate as f64
-                                        * 1e9) as u64;
+                                let Some(pts_ns) = fraction_pts.pts(
+                                    stream_start_ns,
+                                    sample_offset.saturating_sub(pts_bits_base),
+                                    u64::from(cur_sample_rate),
+                                ) else {
+                                    error!(device = %device_name, "oaat: echeance PTS DSD non representable");
+                                    playing.store(false, Ordering::SeqCst);
+                                    return;
+                                };
                                 let flags = if first {
                                     first = false;
                                     PacketFlags::FIRST_PACKET
@@ -1420,9 +1428,10 @@ impl OutputTarget for OaatOutput {
                                 let expected = std::time::Duration::from_nanos(
                                     (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
                                 );
-                                let elapsed = start.elapsed();
-                                if expected > elapsed {
-                                    tokio::time::sleep(expected - elapsed).await;
+                                if !super::horloge::cadencer(start, expected).await {
+                                    error!(device = %device_name, "oaat: cadence DSD non representable");
+                                    playing.store(false, Ordering::SeqCst);
+                                    return;
                                 }
 
                                 if eof && pending.is_empty() {
@@ -1464,6 +1473,17 @@ impl OutputTarget for OaatOutput {
                                     "oaat: gapless transition (native DSD)"
                                 );
 
+                                if !fraction_pts.enchainer_cadencement(
+                                    &mut stream_start_ns,
+                                    &mut start,
+                                    sample_offset.saturating_sub(pts_bits_base),
+                                    pts_bits_base,
+                                    u64::from(cur_sample_rate),
+                                ) {
+                                    error!(device = %device_name, "oaat: frontiere PTS DSD non representable");
+                                    playing.store(false, Ordering::SeqCst);
+                                    return;
+                                }
                                 reader = next.reader;
                                 sample_offset = 0;
                                 pts_bits_base = 0;
@@ -1471,8 +1491,6 @@ impl OutputTarget for OaatOutput {
                                 first = true;
                                 eof = false;
                                 pause_offset = std::time::Duration::ZERO;
-                                stream_start_ns = super::helpers::now_ns() + 500_000_000;
-                                start = std::time::Instant::now();
                                 // #6497 — l'URI AVANT la position : voir
                                 // l'enchaînement direct ci-dessous.
                                 *current_uri.lock().await = Some(String::new());
@@ -1791,6 +1809,7 @@ impl OutputTarget for OaatOutput {
                     // Absolute PTS anchor: the first emitted frame presents at
                     // now + lead, including after a seek (RFC 6.4).
                     let mut stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                    let mut fraction_pts = super::horloge::FractionDePresentation::default();
                     let mut start = std::time::Instant::now();
                     position_ms.store(
                         sample_offset * 1000 / cur_sample_rate as u64,
@@ -1876,13 +1895,25 @@ impl OutputTarget for OaatOutput {
                                         .await
                                         .ok();
 
+                                    if !fraction_pts.enchainer_cadencement(
+                                        &mut stream_start_ns,
+                                        &mut start,
+                                        direct_pcm_elapsed_samples(
+                                            sample_offset,
+                                            pacing_origin_sample,
+                                        ),
+                                        0,
+                                        u64::from(cur_sample_rate),
+                                    ) {
+                                        error!(device = %device_name, "oaat: frontiere PTS PCM non representable");
+                                        playing.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
                                     pcm_data = next.pcm;
                                     offset = 0;
                                     sample_offset = 0;
                                     pacing_origin_sample = 0;
                                     first_packet_pending = true;
-                                    stream_start_ns = super::helpers::now_ns() + 500_000_000;
-                                    start = std::time::Instant::now();
                                     // #6497 — la piste suivante n'a pas de flux :
                                     // l'URI de la piste finie ne doit plus être
                                     // rapportée, comme aux enchaînements DSD natif
@@ -1978,6 +2009,7 @@ impl OutputTarget for OaatOutput {
                                     pacing_origin_sample = sample_offset;
                                     first_packet_pending = true;
                                     stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                                    fraction_pts.reinitialiser();
                                     start = std::time::Instant::now();
                                     position_ms.store(
                                         sample_offset * 1000 / cur_sample_rate as u64,
@@ -2064,8 +2096,15 @@ impl OutputTarget for OaatOutput {
                         let payload = &pcm_data[offset..offset + chunk_bytes];
                         let elapsed_samples =
                             direct_pcm_elapsed_samples(sample_offset, pacing_origin_sample);
-                        let pts_ns = stream_start_ns
-                            + (elapsed_samples as f64 / cur_sample_rate as f64 * 1e9) as u64;
+                        let Some(pts_ns) = fraction_pts.pts(
+                            stream_start_ns,
+                            elapsed_samples,
+                            u64::from(cur_sample_rate),
+                        ) else {
+                            error!(device = %device_name, "oaat: echeance PTS PCM non representable");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        };
                         let flags = if first_packet_pending {
                             PacketFlags::FIRST_PACKET
                         } else {
@@ -2111,9 +2150,10 @@ impl OutputTarget for OaatOutput {
                                 / cur_sample_rate as f64
                                 * 1e9) as u64,
                         );
-                        let elapsed = start.elapsed();
-                        if expected > elapsed {
-                            tokio::time::sleep(expected - elapsed).await;
+                        if !super::horloge::cadencer(start, expected).await {
+                            error!(device = %device_name, "oaat: cadence PCM non representable");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
                         }
                     }
 
@@ -2437,6 +2477,7 @@ impl OutputTarget for OaatOutput {
             let mut origine_flux: u64 = sample_offset;
             // Absolute PTS anchor: frame 0 presents at now + lead (RFC 6.4).
             let mut stream_start_ns = super::helpers::now_ns() + 500_000_000;
+            let mut fraction_pts = super::horloge::FractionDePresentation::default();
             let mut byte_offset: u64 = 0;
             // Position VRAIE d'un flux FLAC, lue dans ses en-têtes de trames.
             // Le calcul par octets reste JUSTE pour le DSD (débit constant) —
@@ -2897,7 +2938,18 @@ impl OutputTarget for OaatOutput {
                                     let pts_ns = if is_dsd {
                                         stream_start_ns + (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
                                     } else {
-                                        stream_start_ns + (direct_pcm_elapsed_samples(sample_offset, origine_flux) as f64 / cur_sample_rate as f64 * 1e9) as u64
+                                        match fraction_pts.pts(
+                                            stream_start_ns,
+                                            direct_pcm_elapsed_samples(sample_offset, origine_flux),
+                                            u64::from(cur_sample_rate),
+                                        ) {
+                                            Some(pts) => pts,
+                                            None => {
+                                                error!(device = %device_name, "oaat: echeance PTS HTTP non representable");
+                                                playing.store(false, Ordering::SeqCst);
+                                                return;
+                                            }
+                                        }
                                     };
                                     let mut flags = PacketFlags::empty();
                                     if !payload.is_empty() && sample_offset == origine_flux && byte_offset == 0 {
@@ -2925,6 +2977,17 @@ impl OutputTarget for OaatOutput {
                                     // so the swapped-in track needs its own Play —
                                     // see below.
                                     let renegotiated = !next.same_format;
+                                    if !renegotiated && !fraction_pts.enchainer_cadencement(
+                                        &mut stream_start_ns,
+                                        &mut start,
+                                        direct_pcm_elapsed_samples(sample_offset, origine_flux),
+                                        0,
+                                        u64::from(cur_sample_rate),
+                                    ) {
+                                        error!(device = %device_name, "oaat: frontiere PTS HTTP non representable");
+                                        playing.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
                                     let next_source_channels = next.info.channels.min(8) as u8;
                                     let next_source_layout = match disposition_oaat(next_source_channels) {
                                         Ok(layout) => layout,
@@ -3086,8 +3149,11 @@ impl OutputTarget for OaatOutput {
                                     origine_flux = 0;
                                     byte_offset = 0;
                                     position_ms.store(0, Ordering::SeqCst);
-                                    stream_start_ns = super::helpers::now_ns() + 500_000_000;
-                                    start = std::time::Instant::now();
+                                    if renegotiated {
+                                        stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                                        fraction_pts.reinitialiser();
+                                        start = std::time::Instant::now();
+                                    }
                                     buf = next_buf;
                                     stream = next.stream;
                                     continue;
@@ -3116,7 +3182,18 @@ impl OutputTarget for OaatOutput {
                             let pts_ns = if is_dsd {
                                 stream_start_ns + (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
                             } else {
-                                stream_start_ns + (direct_pcm_elapsed_samples(sample_offset, origine_flux) as f64 / cur_sample_rate as f64 * 1e9) as u64
+                                match fraction_pts.pts(
+                                    stream_start_ns,
+                                    direct_pcm_elapsed_samples(sample_offset, origine_flux),
+                                    u64::from(cur_sample_rate),
+                                ) {
+                                    Some(pts) => pts,
+                                    None => {
+                                        error!(device = %device_name, "oaat: echeance PTS HTTP non representable");
+                                        playing.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                }
                             };
                             let flags = if sample_offset == origine_flux && byte_offset == 0 {
                                 PacketFlags::FIRST_PACKET
@@ -3215,8 +3292,9 @@ impl OutputTarget for OaatOutput {
                                     bytes_per_frame,
                                 );
                                 let elapsed = start.elapsed();
-                                // #4567 — on MESURE le retard, on ne corrige
-                                // rien : le sommeil ci-dessous est inchangé.
+                                // #4567 — conserver la mesure du retard. Le
+                                // cadencement utilise une échéance absolue,
+                                // même si la nouvelle piste commence plus tard.
                                 if let Some(retard_ms) = cadence.observer(expected, elapsed) {
                                     warn!(
                                         device = %device_name,
@@ -3226,8 +3304,10 @@ impl OutputTarget for OaatOutput {
                                         "oaat: paquet envoye en retard"
                                     );
                                 }
-                                if expected > elapsed {
-                                    tokio::time::sleep(expected - elapsed).await;
+                                if !super::horloge::cadencer(start, expected).await {
+                                    error!(device = %device_name, "oaat: cadence HTTP non representable");
+                                    playing.store(false, Ordering::SeqCst);
+                                    return;
                                 }
                             }
                         }
