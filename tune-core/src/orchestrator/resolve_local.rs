@@ -1,5 +1,31 @@
 use super::*;
 
+// Durée client des seuls canaux PCM qui commencent déjà à une position.
+// Le flux/DIDL conserve sa durée restante (#6630). Ce registre ne participe
+// ni aux URI ni au Seek des départs natifs : les agents doivent encore recevoir
+// leur offset de position via seek_output_after_replay.
+static DEPARTS_PCM_DECODE: std::sync::LazyLock<std::sync::Mutex<Vec<(String, u64)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+fn noter_depart_pcm_decode(session: &str, depart_ms: u64) {
+    if let Ok(mut sessions) = DEPARTS_PCM_DECODE.lock() {
+        sessions.retain(|(id, _)| id != session);
+        sessions.push((session.to_owned(), depart_ms));
+        let anciennes = sessions.len().saturating_sub(64);
+        sessions.drain(..anciennes);
+    }
+}
+
+pub(super) fn duree_piste_pcm_decodee(duree_servie_ms: i64, session: Option<&str>) -> Option<i64> {
+    if duree_servie_ms <= 0 {
+        return None;
+    }
+    let session = session?;
+    let sessions = DEPARTS_PCM_DECODE.lock().ok()?;
+    let (_, depart) = sessions.iter().find(|(id, _)| id == session)?;
+    Some(duree_servie_ms.saturating_add(i64::try_from(*depart).unwrap_or(i64::MAX)))
+}
+
 /// Ce que `resolve_local_track` a décidé avant de servir : formats, forçages,
 /// transcodage requis, et les données de la piste et de la zone que les deux
 /// armes relisent (REF-2 phase 2, #2219). Les champs portent les noms des
@@ -3324,6 +3350,14 @@ impl PlaybackOrchestrator {
             info.crossfeed = relais && dsp.crossfeed_executable();
             info.compensation_db = dsp.compensation_cuite_db().filter(|_| relais);
             let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
+            // Seule la conversion WAV par canal sert déjà le déplacement.
+            // Un fichier transcodé entier est cherché ensuite et ne passe pas ici.
+            if transcode_file_size.is_some()
+                && matches!(out_mime.as_str(), "audio/wav" | "audio/x-wav")
+                && let Some(depart_ms) = req.seek_ms.filter(|d| *d > 0)
+            {
+                noter_depart_pcm_decode(&session_id, depart_ms);
+            }
 
             // LAT-F1 (phase 0) : la chaîne DSP de la zone AU FIL DE L'EAU.
             // Ce bras servait le PCM décodé tel quel : égaliseur, convolveur
@@ -4051,3 +4085,7 @@ mod tranche_dop_tests_6456 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "duree_convertie_6630_tests.rs"]
+mod duree_convertie_6630_tests;
