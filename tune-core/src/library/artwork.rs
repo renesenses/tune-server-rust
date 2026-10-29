@@ -258,27 +258,36 @@ pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
 /// d'un coffret rangé un dossier par disque la cherche aussi dans le dossier
 /// qui les réunit (#5685, `library::pochette_disque`).
 pub fn image_de_pochette_dans(dossier: &Path) -> Option<PathBuf> {
+    images_de_pochette_dans(dossier).into_iter().next()
+}
+
+/// Candidats classés selon la même règle pour l'affichage et les empreintes.
+pub(crate) fn images_de_pochette_dans(dossier: &Path) -> Vec<PathBuf> {
     // #6077 — on LISTE le dossier et on compare les noms sans casse : la liste
     // fixe de `FOLDER_COVER_NAMES` ne voyait ni `Cover.JPG` sur un volume
     // sensible à la casse, ni `AlbumArt_{…}_Large.jpg`, ni `cover.webp`.
     match std::fs::read_dir(&*extended_path(dossier)) {
-        Ok(entrees) => entrees
-            .flatten()
-            .filter_map(|e| {
-                let nom = e.file_name().into_string().ok()?;
-                let rang = rang_de_pochette(&nom)?;
-                let chemin = dossier.join(&nom);
-                extended_path(&chemin)
-                    .is_file()
-                    .then_some((rang, nom, chemin))
-            })
-            .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
-            .map(|(_, _, chemin)| chemin),
+        Ok(entrees) => {
+            let mut candidats: Vec<_> = entrees
+                .flatten()
+                .filter_map(|e| {
+                    let nom = e.file_name().into_string().ok()?;
+                    let rang = rang_de_pochette(&nom)?;
+                    let chemin = dossier.join(&nom);
+                    extended_path(&chemin)
+                        .is_file()
+                        .then_some((rang, nom, chemin))
+                })
+                .collect();
+            candidats.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            candidats.into_iter().map(|(_, _, chemin)| chemin).collect()
+        }
         // Dossier qu'on ne sait pas lister : l'ancienne sonde par noms fixes.
         Err(_) => FOLDER_COVER_NAMES
             .iter()
             .map(|name| dossier.join(name))
-            .find(|candidate| extended_path(candidate).exists()),
+            .filter(|candidate| extended_path(candidate).exists())
+            .collect(),
     }
 }
 

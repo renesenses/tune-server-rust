@@ -1559,3 +1559,6 @@ mod annonce_du_contrat_de_signal_4559;
 /// et rejoue les deux coupures du journal, plus la contre-garde.
 #[cfg(test)]
 mod arret_dementi_par_la_position_6717;
+
+#[cfg(test)]
+mod fin_upnp_6634_tests;

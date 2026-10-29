@@ -5,9 +5,9 @@
 //! Reuses the existing parse + match engine (`library::importer`): each playlist
 //! file's entries are resolved (relative paths against the playlist's own folder)
 //! and matched against the library by file path first, then a title/artist/album
-//! fuzzy fallback. Only playlists with at least one matched track are created,
-//! and a playlist whose name already exists is skipped so a re-scan never
-//! duplicates it.
+//! fuzzy fallback. Audirvana Qobuz identities are kept as service entries.
+//! Only playlists with at least one local match or service entry are created;
+//! an existing playlist name is skipped so a re-scan never duplicates it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -18,7 +18,7 @@ use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 use crate::db::backend::DbBackend;
-use crate::db::playlist_repo::PlaylistRepo;
+use crate::db::playlist_repo::{EntryContent, PlaylistRepo};
 use crate::db::settings_repo::SettingsRepo;
 use crate::db::track_repo::TrackRepo;
 use crate::library::importer::{ImportedTrack, match_tracks, parse_m3u, parse_pls};
@@ -180,6 +180,25 @@ pub fn import_local_playlists(db: &Arc<dyn DbBackend>, dirs: &[String]) -> Playl
         // Resolve each entry's file_path (relative → absolute key). Entries that
         // are URLs (radio streams) drop their file_path so only the title/artist
         // fuzzy fallback can match them (usually it won't — that's fine).
+        // Les liens Qobuz portent une identité de service : le rapprochement
+        // local ne doit ni les perdre ni leur substituer un titre homonyme.
+        let services: Vec<_> = imported
+            .iter()
+            .map(|it| {
+                let chemin = it.file_path.as_deref().unwrap_or("");
+                let est_qobuz = chemin
+                    .split_once("://")
+                    .is_some_and(|(s, _)| s.eq_ignore_ascii_case("qobuz"));
+                let contenu = super::m3u_parser::entree_qobuz_audirvana(
+                    chemin,
+                    it.title.as_deref(),
+                    it.artist.as_deref(),
+                    None,
+                )
+                .map(EntryContent::Service);
+                (est_qobuz, contenu)
+            })
+            .collect();
         let playlist_dir = pf.parent().unwrap_or_else(|| Path::new(""));
         for it in &mut imported {
             it.file_path = it
@@ -189,31 +208,36 @@ pub fn import_local_playlists(db: &Arc<dyn DbBackend>, dirs: &[String]) -> Playl
         }
 
         let results = match_tracks(&imported, &path_index, &fuzzy_index);
-        // Preserve playlist order, drop unmatched, dedup repeats.
-        let mut seen = HashSet::new();
-        let track_ids: Vec<i64> = results
+        // L'ordre mixte est celui du fichier ; le dépôt dédoublonne les
+        // identités locales et de service dans la même transaction.
+        let entrees: Vec<EntryContent> = results
             .iter()
-            .filter_map(|r| r.tune_track_id)
-            .filter(|id| seen.insert(*id))
+            .zip(services)
+            .filter_map(|(r, (est_qobuz, service))| {
+                service.or_else(|| {
+                    if est_qobuz {
+                        None
+                    } else {
+                        r.tune_track_id.map(EntryContent::Local)
+                    }
+                })
+            })
             .collect();
-        if track_ids.is_empty() {
+        if entrees.is_empty() {
             continue;
         }
-
-        match playlist_repo.create(&name, Some("Importée au scan"), DEFAULT_PROFILE_ID) {
-            Ok(pid) => match playlist_repo.add_tracks_deduped(pid, &track_ids, None) {
-                Ok(added) => {
-                    report.playlists_created += 1;
-                    report.tracks_added += added.len();
-                    info!(
-                        name = %name,
-                        matched = track_ids.len(),
-                        total = imported.len(),
-                        "playlist_scan_imported"
-                    );
-                }
-                Err(e) => warn!(name = %name, error = %e, "playlist_scan_add_tracks_failed"),
-            },
+        match playlist_repo.create_with_entries(
+            &name,
+            Some("Importée au scan"),
+            DEFAULT_PROFILE_ID,
+            &entrees,
+        ) {
+            Ok((_, ajoutees)) => {
+                report.playlists_created += 1;
+                report.tracks_added += ajoutees.len();
+                info!(name = %name, matched = ajoutees.len(), total = imported.len(),
+                    "playlist_scan_imported");
+            }
             Err(e) => warn!(name = %name, error = %e, "playlist_scan_create_failed"),
         }
     }

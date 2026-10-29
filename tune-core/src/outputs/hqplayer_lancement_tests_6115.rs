@@ -298,7 +298,7 @@ async fn la_lecture_et_la_suivante_portent_les_etiquettes_6177() {
                 r#"<PlaylistAdd uri="{AUTRE}" queued="0" clear="1">{etiquettes}</PlaylistAdd>"#
             ),
             format!(
-                r#"<PlaylistAdd uri="{SUIVANTE}" queued="0" clear="0">{etiquettes}</PlaylistAdd>"#
+                r#"<PlaylistAdd uri="{SUIVANTE}" queued="1" clear="0">{etiquettes}</PlaylistAdd>"#
             ),
         ],
         "#6177 : HQPlayer ne reçoit que l'URI et affiche « HTTP stream »"

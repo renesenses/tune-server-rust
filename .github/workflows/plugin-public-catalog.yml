@@ -1,0 +1,50 @@
+name: Public plugin catalogue
+on:
+  pull_request:
+    paths:
+      - 'sdk/**'
+      - 'plugins/**'
+      - 'tune-core/src/plugin_sdk.rs'
+      - 'tune-server/src/premium_audio_plugins.rs'
+      - 'tune-server/src/plugins_host.rs'
+      - 'tune-server/tests/fixtures/plugins/**'
+      - 'scripts/plugin-public-catalog.py'
+      - 'scripts/tests/test_plugin_public_catalog.py'
+      - '.github/workflows/plugin-public-catalog.yml'
+      - 'Cargo.toml'
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check public metadata contracts
+        run: python3 -m unittest discover -s scripts/tests -p test_plugin_public_catalog.py -v
+      - name: Select the actual build version
+        id: version
+        shell: python
+        run: |
+          import os, tomllib
+          from pathlib import Path
+          if os.environ['GITHUB_REF_TYPE'] == 'tag':
+              version = os.environ['GITHUB_REF_NAME'].removeprefix('v')
+          else:
+              version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version'] + '-dev'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('value=' + version + '\n')
+      - name: Export catalogue
+        env:
+          TUNE_CATALOGUE_VERSION: ${{ steps.version.outputs.value }}
+        run: python3 scripts/plugin-public-catalog.py --tune-version "$TUNE_CATALOGUE_VERSION" --output tune-plugin-catalogue.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tune-plugin-catalogue-${{ github.sha }}
+          path: tune-plugin-catalogue.json
+          if-no-files-found: error

@@ -633,18 +633,7 @@ fn enregistrer_profil_autoeq(
         )));
     }
 
-    let bands_json: Vec<Value> = profil
-        .bandes
-        .iter()
-        .map(|b| {
-            json!({
-                "freq": b.freq,
-                "gain": b.gain,
-                "q": b.q,
-                "type": b.band_type,
-            })
-        })
-        .collect();
+    let bands_json = bandes_autoeq_json(&profil);
 
     let mut presets = load_presets(state);
     let id = uuid::Uuid::new_v4().to_string();
@@ -665,6 +654,7 @@ fn enregistrer_profil_autoeq(
     let mut corps = json!({
         "preset": preset,
         "band_count": profil.bandes.len(),
+        "reserved_headroom_db_per_channel": profil.marges_reservees_db(),
         // Écartés, mais NOMMÉS : l'écart entre le fichier et le préréglage
         // s'explique dans la réponse, pas à l'oreille. Le compte reste — un
         // client qui n'affiche qu'un chiffre continue de marcher — et la liste
@@ -818,6 +808,24 @@ async fn get_bands(State(state): State<AppState>) -> Json<Value> {
 
 // --- Advanced EQ routes ---
 
+/// Même sérialisation que la création manuelle, y compris le canal ciblé.
+fn bandes_autoeq_json(profil: &tune_core::audio::autoeq::ProfilAutoEq) -> Vec<Value> {
+    profil
+        .bandes
+        .iter()
+        .map(|b| {
+            EqBand {
+                freq: b.freq,
+                gain: b.gain,
+                q: Some(b.q),
+                band_type: b.band_type.clone(),
+                channel: b.channel,
+            }
+            .to_json()
+        })
+        .collect()
+}
+
 fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -827,7 +835,7 @@ fn epoch_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{EqBand, filtres_ignores_json, resolve_activation_zone};
+    use super::{EqBand, bandes_autoeq_json, filtres_ignores_json, resolve_activation_zone};
     use serde_json::json;
 
     #[test]
@@ -845,6 +853,26 @@ mod tests {
 
         let audio_band: tune_core::audio::eq::EqBandSpec = serde_json::from_value(stored).unwrap();
         assert_eq!(audio_band.channel, Some(1));
+    }
+
+    #[test]
+    fn import_7340_conserve_gauche_droite_et_global_dans_le_stockage() {
+        let profil = tune_core::audio::autoeq::analyser(
+            "Channel: L\nFilter 1: ON PK Fc 100 Hz Gain -3 dB Q 1\nChannel: R\nFilter 1: ON PK Fc 200 Hz Gain -4 dB Q 1\nChannel: all\nFilter 1: ON PK Fc 300 Hz Gain -2 dB Q 1\n"
+        ).unwrap();
+        let stockees = bandes_autoeq_json(&profil);
+        let relues: Vec<tune_core::audio::eq::EqBandSpec> = stockees
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+        assert_eq!(
+            relues.iter().map(|b| b.channel).collect::<Vec<_>>(),
+            vec![Some(0), Some(1), None]
+        );
+        assert_eq!(
+            relues.iter().map(|b| b.freq).collect::<Vec<_>>(),
+            vec![100.0, 200.0, 300.0]
+        );
     }
 
     #[test]
@@ -877,13 +905,7 @@ mod tests {
         )
         .expect("profil AutoEq valide");
 
-        // Exactement la forme que `import_autoeq` persiste.
-        let stocke = json!({
-            "freq": profil.bandes[0].freq,
-            "gain": profil.bandes[0].gain,
-            "q": profil.bandes[0].q,
-            "type": profil.bandes[0].band_type,
-        });
+        let stocke = bandes_autoeq_json(&profil).remove(0);
 
         let relue: tune_core::audio::eq::EqBandSpec =
             serde_json::from_value(stocke).expect("la bande stockee doit se relire");
