@@ -289,3 +289,114 @@ async fn messagerie_6902_ne_journalise_ni_message_carte_commentaire_ni_curseur()
         );
     }
 }
+
+#[tokio::test]
+async fn messagerie_cercle_relaie_adhesion_ouverture_et_consentement() {
+    let (url, e) = demarrer().await;
+    let a = app(base(&url, Some(JETON)));
+    for (method, path, body) in [
+        ("GET", "/general-circles", None),
+        ("POST", "/general-circles/8/membership", None),
+        ("DELETE", "/general-circles/8/membership", None),
+        ("POST", "/general-circles/8/conversation", None),
+        (
+            "POST",
+            "/conversations/12/name-consent",
+            Some(json!({"accepted":true})),
+        ),
+    ] {
+        let r = appel(&a, method, path, body.clone()).await;
+        assert_eq!(
+            r.statut,
+            StatusCode::OK,
+            "route cercle absente : {method} {path}"
+        );
+        assert_eq!(r.entetes[header::CACHE_CONTROL], "no-store");
+        assert_eq!(r.octets, b"{ \"conversations\" : [] }");
+        let c = e.lock().unwrap();
+        let (m, u, b, auth) = c.appels.last().unwrap();
+        assert_eq!(m.as_str(), method);
+        assert_eq!(u, &format!("/api/v1/circle{path}"));
+        assert_eq!(b, &body.unwrap_or(Value::Null));
+        assert_eq!(auth, &format!("Bearer {JETON}"));
+    }
+}
+
+#[tokio::test]
+async fn messagerie_cercle_refus_cloud_et_consentement_invalide() {
+    let (url, e) = demarrer().await;
+    let a = app(base(&url, Some(JETON)));
+    {
+        let mut c = e.lock().unwrap();
+        c.statut = StatusCode::UNPROCESSABLE_ENTITY;
+        c.corps = "{\"error\":\"circle.name_consent_required\"}";
+    }
+    let r = appel(
+        &a,
+        "POST",
+        "/conversations/12/messages",
+        Some(json!({"body":"x"})),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.octets, b"{\"error\":\"circle.name_consent_required\"}");
+    let before = e.lock().unwrap().appels.len();
+    assert_eq!(
+        appel(&a, "POST", "/general-circles/not-an-id/conversation", None)
+            .await
+            .statut,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(e.lock().unwrap().appels.len(), before);
+}
+
+#[tokio::test]
+async fn messagerie_cercle_transmet_les_refus_sans_decider_du_consentement() {
+    let (url, e) = demarrer().await;
+    let a = app(base(&url, Some(JETON)));
+    for (status, corps) in [
+        (StatusCode::NOT_FOUND, "{ \"error\": \"not_found\" }"),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{ \"message\": \"Invalid consent\", \"errors\": {} }",
+        ),
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "{ \"message\": \"Too many requests\" }",
+        ),
+    ] {
+        {
+            let mut c = e.lock().unwrap();
+            c.statut = status;
+            c.corps = corps;
+        }
+        for (method, path, body) in [
+            ("GET", "/general-circles", None),
+            ("POST", "/general-circles/8/membership", None),
+            ("DELETE", "/general-circles/8/membership", None),
+            ("POST", "/general-circles/8/conversation", None),
+            (
+                "POST",
+                "/conversations/12/name-consent",
+                Some(json!({"accepted": false})),
+            ),
+        ] {
+            let r = appel(&a, method, path, body.clone()).await;
+            assert_eq!(
+                r.statut, status,
+                "le refus cloud doit rester intact : {method} {path}"
+            );
+            assert_eq!(r.octets, corps.as_bytes());
+            assert_eq!(r.entetes[header::CACHE_CONTROL], "no-store");
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                assert_eq!(r.entetes[header::RETRY_AFTER], "42");
+            }
+            let c = e.lock().unwrap();
+            assert_eq!(
+                c.appels.last().unwrap().2,
+                body.unwrap_or(Value::Null),
+                "le relais ne doit pas accepter le consentement à la place du cloud"
+            );
+        }
+    }
+}
