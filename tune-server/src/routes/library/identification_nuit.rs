@@ -21,6 +21,8 @@
 //! - **Débit réduit** : [`DELAI_ENTRE_ALBUMS`] entre deux albums, en plus de la
 //!   cadence MusicBrainz du limiteur partagé — environ cinq fois moins de
 //!   requêtes à la minute qu'un lot lancé à la main.
+//! - La fenêtre et le délai sont des réglages (#6845), lus et bornés par
+//!   [`ReglagesDeNuit`] ; les constantes ci-dessus en sont les défauts.
 //! - Même droit que le lot (Premium), même pause (`Tache::Identification`),
 //!   même disjoncteur (douze refus d'affilée : on s'arrête pour la nuit).
 //! - Elle s'efface devant la lecture et devant une passe d'identification
@@ -29,11 +31,14 @@
 //!   23/09) : un album identifié entre-temps à la main sort de la liste.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -61,15 +66,26 @@ const CLE_BILAN: &str = "identification_nuit_bilan";
 /// L'identifiant de la passe au registre des tâches de fond.
 const TACHE_NUIT: &str = "identification_nuit";
 
-/// La fenêtre, en heures locales : de 2 h à 6 h.
+/// La fenêtre par défaut, en heures locales : de 2 h à 6 h.
 pub(super) const HEURE_DEBUT: u8 = 2;
 pub(super) const HEURE_FIN: u8 = 6;
 
-/// Le délai ajouté entre deux albums. Un album coûte ~2,8 s au lot (deux
-/// requêtes au limiteur partagé) ; avec 10 s de plus, la passe envoie environ
-/// cinq fois moins de requêtes à la minute. 718 albums tiennent en ~2 h 30,
-/// dans une seule fenêtre.
+/// Le délai ajouté par défaut entre deux albums. Un album coûte ~2,8 s au lot
+/// (deux requêtes au limiteur partagé) ; avec 10 s de plus, la passe envoie
+/// environ cinq fois moins de requêtes à la minute. 718 albums tiennent en
+/// ~2 h 30, dans une seule fenêtre.
 pub(super) const DELAI_ENTRE_ALBUMS: Duration = Duration::from_secs(10);
+
+/// Les réglages de la fenêtre et du délai (#6845). Absents : les défauts.
+const CLE_HEURE_DEBUT: &str = "identification_nuit_heure_debut";
+const CLE_HEURE_FIN: &str = "identification_nuit_heure_fin";
+const CLE_DELAI: &str = "identification_nuit_delai_s";
+
+/// Les bornes du délai. En dessous de 5 s, la passe ne serait plus « au débit
+/// réduit » (un album coûte ~2,8 s au lot) ; au-delà d'une heure, elle ne
+/// traiterait plus que quelques albums par nuit.
+pub(super) const DELAI_MIN: Duration = Duration::from_secs(5);
+pub(super) const DELAI_MAX: Duration = Duration::from_secs(3_600);
 
 /// Tous les combien la boucle se demande s'il est l'heure.
 const CADENCE_DE_VEILLE: Duration = Duration::from_secs(300);
@@ -79,9 +95,120 @@ const CADENCE_DE_VEILLE: Duration = Duration::from_secs(300);
 /// reprend d'abord par un lot à la main.
 const REFUS_MAX: usize = 20_000;
 
-/// `true` quand `heure` (locale, 0–23) est dans la fenêtre de nuit.
-pub(super) fn dans_la_fenetre(heure: u8) -> bool {
-    (HEURE_DEBUT..HEURE_FIN).contains(&heure)
+/// La fenêtre et le délai de la passe, tels qu'elle les applique.
+///
+/// Bornés à la lecture : une heure de début entre 0 et 23, une heure de fin
+/// entre 1 et 24 (24 = minuit), un délai entre [`DELAI_MIN`] et
+/// [`DELAI_MAX`]. Une fenêtre vide ou à cheval sur minuit (début ≥ fin) est
+/// refusée et remplacée par la fenêtre par défaut : la passe ne part qu'une
+/// fois par DATE locale, une fenêtre de 23 h à 2 h partirait deux fois.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReglagesDeNuit {
+    pub heure_debut: u8,
+    pub heure_fin: u8,
+    pub delai_entre_albums: Duration,
+}
+
+impl Default for ReglagesDeNuit {
+    fn default() -> Self {
+        Self {
+            heure_debut: HEURE_DEBUT,
+            heure_fin: HEURE_FIN,
+            delai_entre_albums: DELAI_ENTRE_ALBUMS,
+        }
+    }
+}
+
+impl ReglagesDeNuit {
+    /// `true` quand `heure` (locale, 0–23) est dans la fenêtre de nuit.
+    pub(super) fn dans_la_fenetre(&self, heure: u8) -> bool {
+        (self.heure_debut..self.heure_fin).contains(&heure)
+    }
+
+    /// Borne des valeurs brutes ; une valeur absente prend son défaut.
+    /// `Err` quand la fenêtre obtenue est vide (début ≥ fin).
+    pub(super) fn bornes(
+        heure_debut: Option<i64>,
+        heure_fin: Option<i64>,
+        delai_s: Option<i64>,
+    ) -> Result<Self, &'static str> {
+        let debut = heure_debut.map_or(HEURE_DEBUT, |h| h.clamp(0, 23) as u8);
+        let fin = heure_fin.map_or(HEURE_FIN, |h| h.clamp(1, 24) as u8);
+        let delai = delai_s.map_or(DELAI_ENTRE_ALBUMS, |s| {
+            Duration::from_secs(
+                s.clamp(DELAI_MIN.as_secs() as i64, DELAI_MAX.as_secs() as i64) as u64,
+            )
+        });
+        if debut >= fin {
+            return Err("fenetre_vide");
+        }
+        Ok(Self {
+            heure_debut: debut,
+            heure_fin: fin,
+            delai_entre_albums: delai,
+        })
+    }
+
+    /// Lit les réglages en base. Illisibles : leur défaut ; fenêtre vide :
+    /// la fenêtre par défaut, le délai lu étant gardé.
+    pub(super) fn lire(backend: &Arc<dyn DbBackend>) -> Self {
+        let reglages = SettingsRepo::with_backend(backend.clone());
+        let entier = |cle: &str| {
+            reglages
+                .get(cle)
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+        };
+        let delai = entier(CLE_DELAI);
+        Self::bornes(entier(CLE_HEURE_DEBUT), entier(CLE_HEURE_FIN), delai).unwrap_or_else(
+            |motif| {
+                warn!(motif, "identification_nuit_fenetre_ignoree");
+                Self::bornes(None, None, delai).unwrap_or_default()
+            },
+        )
+    }
+
+    fn ecrire(&self, backend: &Arc<dyn DbBackend>) {
+        let reglages = SettingsRepo::with_backend(backend.clone());
+        for (cle, valeur) in [
+            (CLE_HEURE_DEBUT, self.heure_debut.to_string()),
+            (CLE_HEURE_FIN, self.heure_fin.to_string()),
+            (CLE_DELAI, self.delai_entre_albums.as_secs().to_string()),
+        ] {
+            if let Err(e) = reglages.set(cle, &valeur) {
+                warn!(cle, error = %e, "identification_nuit_reglage_non_ecrit");
+            }
+        }
+    }
+}
+
+/// Ce dont la passe a besoin du temps : l'heure et la date locales, et
+/// attendre. Injectée (#6845) : un essai fait passer une nuit entière sans
+/// l'attendre, ni dépendre de l'heure à laquelle il tourne.
+#[doc(hidden)]
+pub trait Horloge: Sync {
+    /// L'heure locale, 0–23.
+    fn heure(&self) -> u8;
+    /// La date locale, `AAAA-MM-JJ`.
+    fn date(&self) -> String;
+    /// Laisse passer `duree`.
+    fn attendre(&self, duree: Duration) -> impl Future<Output = ()> + Send;
+}
+
+/// L'horloge de service : l'heure du système, et `tokio::time::sleep`.
+struct HorlogeLocale;
+
+impl Horloge for HorlogeLocale {
+    fn heure(&self) -> u8 {
+        heure_et_date_locales().0
+    }
+    fn date(&self) -> String {
+        heure_et_date_locales().1
+    }
+    fn attendre(&self, duree: Duration) -> impl Future<Output = ()> + Send {
+        tokio::time::sleep(duree)
+    }
 }
 
 /// Ce que la veille voit, à un tour donné.
@@ -89,6 +216,7 @@ pub(super) fn dans_la_fenetre(heure: u8) -> bool {
 pub(super) struct Constat {
     pub active: bool,
     pub heure: u8,
+    pub reglages: ReglagesDeNuit,
     pub deja_partie_cette_nuit: bool,
     pub premium: bool,
     pub en_pause: bool,
@@ -103,7 +231,7 @@ pub(super) fn doit_partir(c: &Constat) -> Result<(), &'static str> {
     if !c.active {
         return Err("eteinte");
     }
-    if !dans_la_fenetre(c.heure) {
+    if !c.reglages.dans_la_fenetre(c.heure) {
         return Err("hors_fenetre");
     }
     if c.deja_partie_cette_nuit {
@@ -212,7 +340,7 @@ pub(crate) fn spawn_passe_de_nuit(state: &AppState) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(CADENCE_DE_VEILLE).await;
-            un_tour_de_veille(&state).await;
+            let _ = un_tour_de_veille_avec(&state, &HorlogeLocale).await;
         }
     });
 }
@@ -228,13 +356,24 @@ fn passe_active(backend: &Arc<dyn DbBackend>) -> bool {
         == Some("true")
 }
 
-async fn un_tour_de_veille(state: &AppState) {
+/// Un tour de la veille, à l'heure que dit `horloge` : la passe part si
+/// [`doit_partir`] le permet, et le tour rend quand sa nuit est finie.
+/// `Err(motif)` quand elle ne part pas.
+///
+/// `pub` pour le témoin d'intégration de #6845 seulement, qui fait passer une
+/// nuit simulée contre un faux MusicBrainz.
+#[doc(hidden)]
+pub async fn un_tour_de_veille_avec(
+    state: &AppState,
+    horloge: &impl Horloge,
+) -> Result<(), &'static str> {
     let reglages = SettingsRepo::with_backend(state.backend.clone());
     let active = passe_active(&state.backend);
     if !active {
-        return;
+        return Err("eteinte");
     }
-    let (heure, date) = heure_et_date_locales();
+    let (heure, date) = (horloge.heure(), horloge.date());
+    let fenetre = ReglagesDeNuit::lire(&state.backend);
     let derniere = reglages.get(CLE_DERNIERE_NUIT).ok().flatten();
     let backend = state.backend.clone();
     let a_reprendre = tokio::task::spawn_blocking(move || albums_a_reprendre(&backend))
@@ -244,12 +383,13 @@ async fn un_tour_de_veille(state: &AppState) {
         Ok(a) => a,
         Err(e) => {
             warn!(error = %e, "identification_nuit_selection_echouee");
-            return;
+            return Err("selection_echouee");
         }
     };
     let constat = Constat {
         active,
         heure,
+        reglages: fenetre,
         deja_partie_cette_nuit: derniere.as_deref() == Some(date.as_str()),
         premium: state.license.check_feature(Feature::AutoEnrichment).await,
         en_pause: est_en_pause(Tache::Identification),
@@ -259,34 +399,29 @@ async fn un_tour_de_veille(state: &AppState) {
     };
     if let Err(motif) = doit_partir(&constat) {
         tracing::debug!(motif, "identification_nuit_ne_part_pas");
-        return;
+        return Err(motif);
     }
     // Inscrite AVANT le départ : une nuit ne part qu'une fois.
     reglages.set(CLE_DERNIERE_NUIT, &date).ok();
-    executer_la_nuit(state, albums).await;
-}
-
-/// La boucle de nuit : celle du lot, au débit réduit, et qui s'efface.
-async fn executer_la_nuit(state: &AppState, albums: Vec<i64>) {
-    executer_la_nuit_avec(
-        state,
-        albums,
-        || heure_et_date_locales().0,
-        |album_id| identifier_album(state, album_id, None, OrigineDeLaRecherche::Lot),
-    )
+    executer_la_nuit_avec(state, albums, fenetre, horloge, |album_id| {
+        identifier_album(state, album_id, None, OrigineDeLaRecherche::Lot)
+    })
     .await;
+    Ok(())
 }
 
-/// [`executer_la_nuit`], l'horloge et l'identification d'un album données
-/// par l'appelant (les essais n'interrogent pas MusicBrainz et ne dépendent
-/// pas de l'heure à laquelle ils tournent).
+/// La boucle de nuit : celle du lot, au débit réduit, et qui s'efface. La
+/// fenêtre, le délai, l'horloge et l'identification d'un album sont donnés
+/// par l'appelant (les essais n'attendent pas la nuit, et certains
+/// n'interrogent pas MusicBrainz).
 async fn executer_la_nuit_avec<H, F, Fut>(
     state: &AppState,
     albums: Vec<i64>,
-    heure: H,
+    reglages: ReglagesDeNuit,
+    horloge: &H,
     mut identifier: F,
 ) where
-    H: Fn() -> u8,
+    H: Horloge,
     F: FnMut(i64) -> Fut,
     Fut: std::future::Future<Output = Result<Identification, EchecIdentification>>,
 {
@@ -302,6 +437,13 @@ async fn executer_la_nuit_avec<H, F, Fut>(
     let mut raison = "terminee";
 
     for (rang, album_id) in albums.into_iter().enumerate() {
+        // L'attente AVANT les gardes (#6845) : après elle, la fenêtre peut
+        // s'être refermée, la lecture avoir commencé. Gardes puis attente
+        // envoyait un album après l'heure de fin.
+        if rang > 0 {
+            horloge.attendre(reglages.delai_entre_albums).await;
+            musicbrainz_release::rate_limit_delay().await;
+        }
         // Éteinte depuis l'écran pendant la nuit : rien de plus ne part.
         if !passe_active(&state.backend) {
             raison = "desactivee";
@@ -311,7 +453,7 @@ async fn executer_la_nuit_avec<H, F, Fut>(
             raison = "pause_utilisateur";
             break;
         }
-        if !dans_la_fenetre(heure()) {
+        if !reglages.dans_la_fenetre(horloge.heure()) {
             raison = "fin_de_fenetre";
             break;
         }
@@ -322,10 +464,6 @@ async fn executer_la_nuit_avec<H, F, Fut>(
         if tune_core::audio::replaygain::playing_zone_name(&state.backend).is_some() {
             raison = "lecture_en_cours";
             break;
-        }
-        if rang > 0 {
-            tokio::time::sleep(DELAI_ENTRE_ALBUMS).await;
-            musicbrainz_release::rate_limit_delay().await;
         }
         traites += 1;
         match identifier(album_id).await {
@@ -374,7 +512,7 @@ async fn executer_la_nuit_avec<H, F, Fut>(
         .set(
             CLE_BILAN,
             &json!({
-                "date": heure_et_date_locales().1,
+                "date": horloge.date(),
                 "total": total,
                 "traites": traites,
                 "identifies": identifies,
@@ -386,8 +524,8 @@ async fn executer_la_nuit_avec<H, F, Fut>(
         .ok();
 }
 
-/// `GET /library/identify-all/nuit` — le réglage, la liste en attente, le
-/// bilan de la dernière nuit.
+/// `GET /library/identify-all/nuit` — le réglage, la fenêtre et le délai
+/// appliqués, la liste en attente, le bilan de la dernière nuit.
 pub(crate) async fn reglage_nuit(State(state): State<AppState>) -> Json<Value> {
     let reglages = SettingsRepo::with_backend(state.backend.clone());
     let active = reglages.get(CLE_ACTIVE).ok().flatten().as_deref() == Some("true");
@@ -396,30 +534,77 @@ pub(crate) async fn reglage_nuit(State(state): State<AppState>) -> Json<Value> {
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let nuit = ReglagesDeNuit::lire(&state.backend);
     Json(json!({
         "active": active,
-        "fenetre": { "debut": HEURE_DEBUT, "fin": HEURE_FIN },
-        "delai_entre_albums_s": DELAI_ENTRE_ALBUMS.as_secs(),
+        "fenetre": { "debut": nuit.heure_debut, "fin": nuit.heure_fin },
+        "delai_entre_albums_s": nuit.delai_entre_albums.as_secs(),
+        "bornes": {
+            "debut": { "min": 0, "max": 23 },
+            "fin": { "min": 1, "max": 24 },
+            "delai_entre_albums_s": { "min": DELAI_MIN.as_secs(), "max": DELAI_MAX.as_secs() },
+        },
         "refus_en_attente": lire_refus(&state.backend).len(),
         "derniere_nuit": bilan,
     }))
 }
 
+/// Le corps de `POST /library/identify-all/nuit` : chaque champ absent garde
+/// sa valeur.
 #[derive(serde::Deserialize)]
 pub(crate) struct ReglageNuit {
-    active: bool,
+    active: Option<bool>,
+    heure_debut: Option<i64>,
+    heure_fin: Option<i64>,
+    delai_entre_albums_s: Option<i64>,
 }
 
-/// `POST /library/identify-all/nuit` `{"active": bool}` — allumer ou éteindre.
+/// `POST /library/identify-all/nuit` `{"active": bool, "heure_debut": h,
+/// "heure_fin": h, "delai_entre_albums_s": s}` — allumer ou éteindre, régler
+/// la fenêtre et le délai. Les valeurs hors bornes sont ramenées aux bornes ;
+/// une fenêtre vide (début ≥ fin) est refusée (`400`), rien n'est écrit.
 pub(crate) async fn regler_nuit(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(corps): Json<ReglageNuit>,
-) -> Json<Value> {
-    SettingsRepo::with_backend(state.backend.clone())
-        .set(CLE_ACTIVE, if corps.active { "true" } else { "false" })
-        .ok();
-    reglage_nuit(State(state)).await
+) -> Response {
+    let actuels = ReglagesDeNuit::lire(&state.backend);
+    let demandes = ReglagesDeNuit::bornes(
+        Some(corps.heure_debut.unwrap_or(actuels.heure_debut.into())),
+        Some(corps.heure_fin.unwrap_or(actuels.heure_fin.into())),
+        Some(
+            corps
+                .delai_entre_albums_s
+                .unwrap_or(actuels.delai_entre_albums.as_secs() as i64),
+        ),
+    );
+    let nuit = match demandes {
+        Ok(n) => n,
+        Err(motif) => {
+            let (debut, fin) = (
+                corps.heure_debut.unwrap_or(actuels.heure_debut.into()),
+                corps.heure_fin.unwrap_or(actuels.heure_fin.into()),
+            );
+            return crate::message_api::refus(
+                StatusCode::BAD_REQUEST,
+                motif,
+                "api.library.nightWindowEmpty",
+                &[
+                    ("start", debut.clamp(0, 23).to_string()),
+                    ("end", fin.clamp(1, 24).to_string()),
+                ],
+            );
+        }
+    };
+    if nuit != actuels {
+        nuit.ecrire(&state.backend);
+    }
+    if let Some(active) = corps.active {
+        SettingsRepo::with_backend(state.backend.clone())
+            .set(CLE_ACTIVE, if active { "true" } else { "false" })
+            .ok();
+    }
+    reglage_nuit(State(state)).await.into_response()
 }
 
 #[cfg(test)]
@@ -514,13 +699,134 @@ mod tests {
             }),
             Err("rien_a_reprendre")
         );
-        assert!(dans_la_fenetre(HEURE_DEBUT) && !dans_la_fenetre(HEURE_DEBUT - 1));
+        let defaut = ReglagesDeNuit::default();
+        assert!(defaut.dans_la_fenetre(HEURE_DEBUT) && !defaut.dans_la_fenetre(HEURE_DEBUT - 1));
     }
 
     #[test]
     fn le_debit_est_reduit() {
         // Au moins trois fois le coût d'un album du lot (2,8 s).
         assert!(DELAI_ENTRE_ALBUMS >= Duration::from_secs(9));
+        // Et le réglage ne descend pas sous le coût d'un album.
+        assert!(DELAI_MIN >= Duration::from_secs(3));
+    }
+
+    /// #6845 — sans réglage, la passe garde la fenêtre de 2 h à 6 h et ses
+    /// 10 s ; un réglage écrit est lu ; hors bornes, il est ramené aux bornes ;
+    /// une fenêtre vide ou illisible retombe sur la fenêtre par défaut.
+    #[test]
+    fn les_reglages_sont_lus_et_bornes() {
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &etat.backend;
+        let reglages = SettingsRepo::with_backend(b.clone());
+        assert_eq!(
+            ReglagesDeNuit::lire(b),
+            ReglagesDeNuit {
+                heure_debut: 2,
+                heure_fin: 6,
+                delai_entre_albums: Duration::from_secs(10),
+            },
+            "les défauts ont changé"
+        );
+
+        reglages.set(CLE_HEURE_DEBUT, "1").unwrap();
+        reglages.set(CLE_HEURE_FIN, "5").unwrap();
+        reglages.set(CLE_DELAI, "30").unwrap();
+        let lus = ReglagesDeNuit::lire(b);
+        assert_eq!((lus.heure_debut, lus.heure_fin), (1, 5));
+        assert_eq!(lus.delai_entre_albums, Duration::from_secs(30));
+        assert!(lus.dans_la_fenetre(1) && lus.dans_la_fenetre(4) && !lus.dans_la_fenetre(5));
+
+        // Hors bornes : ramenés aux bornes.
+        reglages.set(CLE_HEURE_DEBUT, "-3").unwrap();
+        reglages.set(CLE_HEURE_FIN, "99").unwrap();
+        reglages.set(CLE_DELAI, "0").unwrap();
+        let lus = ReglagesDeNuit::lire(b);
+        assert_eq!((lus.heure_debut, lus.heure_fin), (0, 24));
+        assert_eq!(lus.delai_entre_albums, DELAI_MIN);
+        assert!(lus.dans_la_fenetre(23));
+        reglages.set(CLE_DELAI, "86400").unwrap();
+        assert_eq!(ReglagesDeNuit::lire(b).delai_entre_albums, DELAI_MAX);
+
+        // Fenêtre vide (ou à cheval sur minuit) : la fenêtre par défaut, le
+        // délai lu étant gardé.
+        reglages.set(CLE_HEURE_DEBUT, "23").unwrap();
+        reglages.set(CLE_HEURE_FIN, "3").unwrap();
+        reglages.set(CLE_DELAI, "20").unwrap();
+        let lus = ReglagesDeNuit::lire(b);
+        assert_eq!((lus.heure_debut, lus.heure_fin), (HEURE_DEBUT, HEURE_FIN));
+        assert_eq!(lus.delai_entre_albums, Duration::from_secs(20));
+
+        // Illisible : le défaut.
+        reglages.set(CLE_HEURE_DEBUT, "deux heures").unwrap();
+        reglages.set(CLE_HEURE_FIN, "").unwrap();
+        reglages.set(CLE_DELAI, "dix").unwrap();
+        assert_eq!(ReglagesDeNuit::lire(b), ReglagesDeNuit::default());
+    }
+
+    /// #6845 — la route règle la fenêtre et le délai, borne, et refuse une
+    /// fenêtre vide sans rien écrire.
+    #[tokio::test]
+    async fn la_route_regle_la_fenetre_et_le_delai() {
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let corps = |v: Value| Json(serde_json::from_value::<ReglageNuit>(v).unwrap());
+        let lire = |r: Response| async move {
+            let statut = r.status();
+            let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (statut, serde_json::from_slice::<Value>(&octets).unwrap())
+        };
+
+        let (statut, v) = lire(
+            regler_nuit(
+                crate::auth::RequireAdmin,
+                State(etat.clone()),
+                corps(json!({ "heure_debut": 1, "heure_fin": 4, "delai_entre_albums_s": 2 })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{v}");
+        assert_eq!(v["fenetre"], json!({ "debut": 1, "fin": 4 }), "{v}");
+        assert_eq!(v["delai_entre_albums_s"], DELAI_MIN.as_secs(), "{v}");
+        assert_eq!(
+            v["active"], false,
+            "régler la fenêtre n'allume pas la passe"
+        );
+
+        // Seul `active` : la fenêtre réglée reste.
+        let (_, v) = lire(
+            regler_nuit(
+                crate::auth::RequireAdmin,
+                State(etat.clone()),
+                corps(json!({ "active": true })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v["active"], true, "{v}");
+        assert_eq!(v["fenetre"], json!({ "debut": 1, "fin": 4 }), "{v}");
+
+        // Fenêtre vide : refusée, rien d'écrit.
+        let (statut, v) = lire(
+            regler_nuit(
+                crate::auth::RequireAdmin,
+                State(etat.clone()),
+                corps(json!({ "heure_debut": 5 })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(statut, StatusCode::BAD_REQUEST, "{v}");
+        // Un code stable et une phrase traduite, pas du français en dur (#7077).
+        assert_eq!(v["error"], "fenetre_vide", "{v}");
+        assert_eq!(v["message_key"], "api.library.nightWindowEmpty", "{v}");
+        assert_eq!(v["params"], json!({ "start": "5", "end": "4" }), "{v}");
+        let m = v["message"].as_str().unwrap_or_default();
+        assert!(m.starts_with("The start hour (5:00)"), "{v}");
+        let nuit = ReglagesDeNuit::lire(&etat.backend);
+        assert_eq!((nuit.heure_debut, nuit.heure_fin), (1, 4));
     }
 
     fn base() -> crate::state::AppState {
@@ -577,6 +883,21 @@ mod tests {
         assert_eq!(lire_refus(b).into_iter().collect::<Vec<_>>(), vec![1, 3]);
     }
 
+    /// Une horloge arrêtée sur une heure.
+    struct Figee(u8);
+
+    impl Horloge for Figee {
+        fn heure(&self) -> u8 {
+            self.0
+        }
+        fn date(&self) -> String {
+            "2026-10-27".into()
+        }
+        fn attendre(&self, _duree: Duration) -> impl Future<Output = ()> + Send {
+            std::future::ready(())
+        }
+    }
+
     /// Une identification fictive : MusicBrainz n'a rien trouvé, sans refus.
     fn introuvable() -> Identification {
         Identification {
@@ -612,7 +933,8 @@ mod tests {
         executer_la_nuit_avec(
             &etat,
             vec![1, 2, 3],
-            || HEURE_DEBUT,
+            ReglagesDeNuit::default(),
+            &Figee(HEURE_DEBUT),
             |album_id| {
                 appels.lock().unwrap().push(album_id);
                 // L'utilisateur éteint la passe pendant le premier album.

@@ -584,13 +584,26 @@ async fn depart_hors_bannis(
     }
 }
 
+fn persist_play_queue(state: &AppState, zone_id: i64, shuffled: bool) {
+    if shuffled
+        && let Err(error) =
+            tune_core::db::listening_resume::mark_current_shuffled(&state.backend, zone_id)
+    {
+        tracing::warn!(zone_id, %error, "reprise_ordre_client_non_enregistre");
+    }
+    persist_queue_async(state, zone_id);
+}
+
 /// Persist the queue state for a zone to disk (non-blocking).
-fn persist_queue_async(state: &AppState, zone_id: i64) {
+pub(super) fn persist_queue_async(state: &AppState, zone_id: i64) {
     let db = state.backend.clone();
     let db_path = state.config.db_path.clone();
     let playback = state.playback.clone();
     tokio::spawn(async move {
         let zone_state = playback.get_state(zone_id).await;
+        if let Err(e) = tune_core::db::listening_resume::refresh_started(&db, &zone_state) {
+            tracing::warn!(zone_id, error = %e, "reprise_suite_non_actualisee");
+        }
         // #6526 — l'ordre d'avant l'aléatoire voyage avec l'instantané, pour
         // être rétabli même après un redémarrage.
         let ordre_d_origine = playback.ordre_d_origine(zone_id);
@@ -1106,6 +1119,8 @@ fn position_du_titre_dans_l_album(
 
 #[derive(Deserialize, Default)]
 struct PlayRequest {
+    #[serde(default)]
+    context_shuffle: bool,
     track_id: Option<i64>,
     track_ids: Option<Vec<i64>>,
     album_id: Option<i64>,
@@ -1787,6 +1802,14 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
             obj,
             tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(output_type.as_deref()),
         );
+        // #6918 — les dB de l'appareil, pour une sortie à course en dB.
+        tune_core::audio::volume_appareil_db::publier(
+            obj,
+            &state.backend,
+            zone_id,
+            output_type.as_deref(),
+            zone_state.volume,
+        );
     }
     Json(v)
 }
@@ -2247,9 +2270,22 @@ async fn ancrer_position_demandee(
 /// `Seek` de la relecture (#2893). Sans reprise, rien ne change.
 async fn lancer_la_lecture(
     state: &AppState,
-    orch_req: tune_core::orchestrator::PlayRequest,
+    mut orch_req: tune_core::orchestrator::PlayRequest,
     reprise: Option<u64>,
 ) -> Result<tune_core::orchestrator::PlayResult, String> {
+    // Une lecture ou reprise générique doit respecter les mêmes restrictions
+    // que le bouton de lecture de la fiche radio.
+    if orch_req.source.as_deref() == Some("radio")
+        && let Some(url) = orch_req.source_id.as_deref()
+    {
+        let selected = super::radios::geofencing::stream_for_url(state, url)
+            .map_err(|error| error.message())?;
+        tune_core::poller::logo_de_lancement::retenir_le_logo_de_lancement(
+            &selected,
+            orch_req.cover_url.as_deref(),
+        );
+        orch_req.source_id = Some(selected);
+    }
     if reprise.is_some() {
         state
             .orchestrator
@@ -2291,6 +2327,7 @@ async fn play(
     // chaque requete : c'est elle qui decide dans quelle langue un refus se
     // lit (#3672). Relevee une fois, passee a tous les refus de ce handler.
     let lang = crate::i18n::lang_from_header(&headers);
+    let context_shuffle = body.as_ref().is_some_and(|Json(b)| b.context_shuffle);
     // #3966 (jumeau du seek) — `start_index` négatif refusé avant la moindre
     // écriture, y compris le marquage du profil de session juste dessous.
     if let Err(refus) = body
@@ -2394,7 +2431,7 @@ async fn play(
                                  mais la longueur de file n'a pas pu être relue"
                             ),
                         }
-                        persist_queue_async(&state, zone_id);
+                        persist_play_queue(&state, zone_id, context_shuffle);
                         Json(build_zone_json_with_result(&state, zone_id, &result).await)
                             .into_response()
                     }
@@ -2786,7 +2823,7 @@ async fn play(
                     .playback
                     .update_queue_info(zone_id, start as i64, tracks.len() as i64)
                     .await;
-                persist_queue_async(&state, zone_id);
+                persist_play_queue(&state, zone_id, context_shuffle);
                 // DIRE ce qui a ete enjambe. Une piste indisponible passee sous
                 // silence est exactement ce qui fait croire a une panne : Alex
                 // n'a eu ni son ni message. Les deux champs sont ADDITIFS — un
@@ -2952,7 +2989,7 @@ async fn play(
                     .playback
                     .update_queue_info(zone_id, start as i64, tracks.len() as i64)
                     .await;
-                persist_queue_async(&state, zone_id);
+                persist_play_queue(&state, zone_id, context_shuffle);
                 // DIRE ce qui a ete enjambe. Une piste indisponible passee sous
                 // silence est exactement ce qui fait croire a une panne : Alex
                 // n'a eu ni son ni message. Les deux champs sont ADDITIFS — un
@@ -3080,6 +3117,16 @@ async fn play(
             disc_number: None,
             album_ref: album_ref_val.clone(),
         };
+        // #7051 — une radio lancée ici n'est pas forcément dans « Mes radios » :
+        // le sondeur retrouvera son logo par l'adresse du flux.
+        if orch_req.source.as_deref() == Some("radio")
+            && let Some(url) = orch_req.source_id.as_deref()
+        {
+            tune_core::poller::logo_de_lancement::retenir_le_logo_de_lancement(
+                url,
+                orch_req.cover_url.as_deref(),
+            );
+        }
         ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
         return match lancer_la_lecture(&state, orch_req, reprise).await {
             Ok(result) => {
@@ -3117,7 +3164,7 @@ async fn play(
                             .playback
                             .update_queue_info(zone_id, position, longueur)
                             .await;
-                        persist_queue_async(&state, zone_id);
+                        persist_play_queue(&state, zone_id, context_shuffle);
                     }
                     FileDejaChargee::RemplacerParCeTitre => {
                         let (album_ref_ligne, artist_ref_ligne) =
@@ -3155,7 +3202,7 @@ async fn play(
                             "file_de_lecture_ecrite"
                         );
                         state.playback.update_queue_info(zone_id, 0, 1).await;
-                        persist_queue_async(&state, zone_id);
+                        persist_play_queue(&state, zone_id, context_shuffle);
                     }
                     FileDejaChargee::NePasToucher => {
                         // La base n'a pas repondu. On ne sait pas ce que la file
@@ -3311,7 +3358,7 @@ async fn play(
             ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
             return match lancer_la_lecture(&state, orch_req, reprise).await {
                 Ok(result) => {
-                    persist_queue_async(&state, zone_id);
+                    persist_play_queue(&state, zone_id, context_shuffle);
                     Json(build_zone_json_with_result(&state, zone_id, &result).await)
                         .into_response()
                 }
@@ -3337,7 +3384,7 @@ async fn play(
             state.playback.update_queue_info(zone_id, pos, q_len).await;
             return match state.orchestrator.play_from_queue(zone_id, pos).await {
                 Ok(result) => {
-                    persist_queue_async(&state, zone_id);
+                    persist_play_queue(&state, zone_id, context_shuffle);
                     Json(build_zone_json_with_result(&state, zone_id, &result).await)
                         .into_response()
                 }
@@ -3563,7 +3610,7 @@ async fn play(
                 .playback
                 .update_queue_info(zone_id, queue_position, q_len)
                 .await;
-            persist_queue_async(&state, zone_id);
+            persist_play_queue(&state, zone_id, context_shuffle);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
         Err(e) => play_error_response(e, &lang),
@@ -5165,11 +5212,12 @@ async fn queue_add(
                 tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
             let ids = resoudre_pistes_d_album(&state, &track_repo, album_id, zone_id);
             if ids.is_empty() {
-                return (
+                return crate::message_api::refus(
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!("album {album_id} : aucune piste à enfiler")})),
-                )
-                    .into_response();
+                    "album_no_tracks",
+                    "api.playback.albumNoTracks",
+                    &[("album_id", album_id.to_string())],
+                );
             }
             info!(zone_id, album_id, pistes = ids.len(), "queue_add_album");
             ids
@@ -5769,11 +5817,12 @@ async fn save_queue_as_playlist(
 
     if total == 0 {
         warn!(zone_id, "save_queue_as_playlist_refused_empty");
-        return (
+        return crate::message_api::refus(
             StatusCode::BAD_REQUEST,
-            "La file d'attente est vide : il n'y a rien à enregistrer.",
-        )
-            .into_response();
+            "queue_empty",
+            "api.playback.queueEmptyNothingToSave",
+            &[],
+        );
     }
 
     if locales == 0 {
@@ -5789,16 +5838,12 @@ async fn save_queue_as_playlist(
             zone_id,
             distantes, "save_queue_as_playlist_refused_streaming_only"
         );
-        return (
+        return crate::message_api::refus(
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "Cette file ne contient que des pistes de service ({distantes}), \
-                 qui ne peuvent pas être enregistrées dans une playlist locale. \
-                 Enregistrez-la depuis le service, ou ajoutez d'abord ces titres \
-                 à votre bibliothèque."
-            ),
-        )
-            .into_response();
+            "queue_only_service_tracks",
+            "api.playback.queueOnlyServiceTracks",
+            &[("count", distantes.to_string())],
+        );
     }
 
     let track_ids: Vec<i64> = items.iter().map(|i| i.track_id).collect();
@@ -5812,11 +5857,13 @@ async fn save_queue_as_playlist(
                 // `.ok()` avalait cette erreur : la playlist était créée, vide,
                 // et la réponse annonçait `track_count` pistes.
                 error!(zone_id, playlist_id = id, error = %e, "save_queue_as_playlist_add_tracks_failed");
-                return (
+                return crate::message_api::refus_avec_cause(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Playlist créée mais vide : {e}"),
-                )
-                    .into_response();
+                    "playlist_created_empty",
+                    "api.playback.playlistCreatedEmpty",
+                    &[],
+                    e,
+                );
             }
             info!(
                 zone_id,
@@ -6515,7 +6562,16 @@ pub(crate) async fn do_transfer(
             )
             .await
     {
-        return output_command_error_response(error);
+        return match error {
+            tune_core::orchestrator::ErreurDeTransfert::Commande(error) => {
+                output_command_error_response(error)
+            }
+            tune_core::orchestrator::ErreurDeTransfert::Lancement(message) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "transfer_target_play_failed", "message": message})),
+            )
+                .into_response(),
+        };
     }
 
     if stop_source {
@@ -6597,9 +6653,63 @@ struct CreateAlarm {
     time: String,
     days: Option<String>,
     source_type: Option<String>,
-    source_id: Option<i64>,
+    /// Texte (URL d'une radio, identifiant opaque) ou nombre.
+    source_id: Option<Value>,
+    /// Ce qu'envoient `api.setAlarm` (web) et `setAlarm` (Flutter).
+    album_id: Option<i64>,
+    playlist_id: Option<i64>,
     volume: Option<f64>,
     fade_in_seconds: Option<i32>,
+}
+
+/// La source d'un réveil posé depuis l'écran de lecture (#7047).
+///
+/// alec_eiffel (1.0.0-rc7) écoutait FIP et a posé un réveil à 21:31 depuis
+/// l'écran de lecture. Le client envoie `{"time": "21:31"}`, sans source : la
+/// route écrivait la nature `playlist` par défaut et un identifiant vide. Le
+/// réveil a sonné avec `source="playlist:"`, puis `unknown service: playlist`.
+///
+/// Désormais, dans l'ordre :
+/// 1. une source nommée (`source_type` / `source_id`) est contrôlée ;
+/// 2. sinon `album_id` ou `playlist_id` ;
+/// 3. sinon la radio que la zone joue : c'est elle que l'utilisateur
+///    regardait en posant son réveil ;
+/// 4. sinon le réveil est refusé (400) : rien ne dit ce qu'il jouerait.
+///
+/// Rend `(nature, identifiant, nom affiché)`.
+async fn source_du_reveil_de_zone(
+    state: &AppState,
+    zone_id: i64,
+    body: &CreateAlarm,
+) -> Result<(String, String, Option<String>), String> {
+    if body.source_type.is_some() || body.source_id.is_some() {
+        let id = match &body.source_id {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        };
+        let (nature, id) =
+            tune_core::alarms::valider_source(body.source_type.as_deref(), id.as_deref())?;
+        return Ok((nature, id, None));
+    }
+    if let Some(id) = body.album_id {
+        return Ok(("album".into(), id.to_string(), None));
+    }
+    if let Some(id) = body.playlist_id {
+        return Ok(("playlist".into(), id.to_string(), None));
+    }
+    let en_cours = state.playback.get_state(zone_id).await.now_playing;
+    match en_cours.filter(|np| np.source == "radio") {
+        Some(np) => {
+            let (nature, id) =
+                tune_core::alarms::valider_source(Some("radio"), np.source_id.as_deref())?;
+            Ok((nature, id, Some(np.title).filter(|t| !t.trim().is_empty())))
+        }
+        None => Err(
+            "no source: name source_type and source_id, or set the alarm while the zone plays a radio"
+                .into(),
+        ),
+    }
 }
 
 async fn create_alarm(
@@ -6609,18 +6719,31 @@ async fn create_alarm(
     Json(body): Json<CreateAlarm>,
 ) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
+    let (source_type, source_id, source_name) =
+        match source_du_reveil_de_zone(&state, zone_id, &body).await {
+            Ok(s) => s,
+            Err(message) => {
+                info!(zone_id, error = %message, "alarm_source_refused");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_source", "message": message })),
+                )
+                    .into_response();
+            }
+        };
     let days = body.days.unwrap_or_else(|| "1,2,3,4,5,6,7".into());
-    let source_type = body.source_type.unwrap_or_else(|| "playlist".into());
     let volume = body.volume.unwrap_or(0.3);
     let fade_in_seconds = body.fade_in_seconds.unwrap_or(30);
     let profile_id = profile.id();
     match state.backend.execute_returning_id(
-        "INSERT INTO alarms (zone_id, time, days, source_type, source_id, volume, fade_in_seconds, profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        &[&zone_id as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
+        "INSERT INTO alarms (zone_id, time, days, source_type, source_id, source_name, volume, fade_in_seconds, profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[&zone_id as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &source_id as &dyn ToSqlValue, &source_name as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
     ) {
-        Ok(id) => {
-            (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
-        }
+        Ok(id) => (
+            StatusCode::CREATED,
+            Json(json!({ "id": id, "source_type": source_type, "source_id": source_id })),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -6917,14 +7040,12 @@ async fn save_queue_as_pin(
     // une. Plutôt que d'écrire dans `settings` un pin que `GET` n'affichera
     // jamais pour cette zone, on le dit (#2722, reste à porter).
     if zone_pins_service(&state, zone_id).await.is_some() {
-        return (
+        return crate::message_api::refus(
             StatusCode::NOT_IMPLEMENTED,
-            Json(json!({
-                "error": "openhome_pins_from_queue_non_supporte",
-                "message": "Cette zone porte le service OpenHome Pins : un emplacement de l'appareil demande une adresse qu'il sache ouvrir, ce que la file Tune ne fournit pas encore.",
-            })),
-        )
-            .into_response();
+            "openhome_pins_from_queue_non_supporte",
+            "api.playback.openhomePinsFromQueue",
+            &[],
+        );
     }
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
@@ -7655,6 +7776,7 @@ pub async fn shuffle_all(
                 .playback
                 .update_queue_info(zone_id, 0, all_ids.len() as i64)
                 .await;
+            persist_play_queue(&state, zone_id, true);
             let mut resp = reponse_shuffle(zone_id, all_ids.len(), disponibles, result.output_sent);
             if let Some(ref err) = result.error {
                 resp.as_object_mut()
@@ -10345,3 +10467,7 @@ mod lecture_d_une_playlist_a_lignes_introuvables_6179 {
         assert_eq!(sans_les_introuvables(lignes, None).1, None);
     }
 }
+
+#[cfg(test)]
+#[path = "playback/echec_transfert_6155_tests.rs"]
+mod echec_transfert_6155_tests;

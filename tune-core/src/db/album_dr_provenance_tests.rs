@@ -99,7 +99,8 @@ fn verify_4521(db: Arc<dyn DbBackend>) {
     .unwrap();
     db.execute("CREATE TEMP TABLE track_metadata (track_id BIGINT, key TEXT, value TEXT, PRIMARY KEY(track_id,key))", &[]).unwrap();
     // (piste, album, clé, valeur) — `None` : une piste sans aucun DR.
-    let lignes: [(i64, i64, Option<(&str, &str)>); 9] = [
+    type Ligne<'a> = (i64, i64, Option<(&'a str, &'a str)>);
+    let lignes: [Ligne; 9] = [
         // 1 : tag d'album 9, qui PRIME sur le DR de piste 7.
         (1, 1, Some(("dr_album", "9"))),
         (2, 1, Some(("dr_track", "7"))),

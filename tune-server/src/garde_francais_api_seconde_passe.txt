@@ -1,0 +1,81 @@
+# Exceptions de la garde `garde_francais_api` (#7077).
+#
+# Une ligne par chaîne française encore présente dans un champ exposé de l'API :
+#   fichier relatif au dépôt | début de la première ligne du texte | motif
+# La garde rougit sur toute chaîne absente de cette liste ET sur toute ligne qui
+# ne correspond plus à rien : la liste ne peut que diminuer. Corriger une
+# chaîne (code stable + clé de i18n_server.json via crate::message_api), puis
+# retirer sa ligne. N'y AJOUTER une ligne que pour une raison écrite dans le motif.
+
+tune-server/src/boot_status.rs | Tune démarre : {phase} | démarrage : tenu par #7073 (b209alex), ne pas y toucher ici
+tune-server/src/agent_tune/agent.rs | sortie inconnue sur cet agent : {device_id} | seconde passe #7077 : maître/agent (#4626)
+tune-server/src/agent_tune/agent.rs | sortie occupée sur l'agent : une lecture locale ou un autre | seconde passe #7077 : maître/agent (#4626)
+tune-server/src/routes/agent_tune.rs | maître inconnu | seconde passe #7077 : maître/agent (#4626)
+tune-server/src/routes/agent_tune.rs | hôte et code d'appairage requis | seconde passe #7077 : maître/agent (#4626)
+tune-server/src/routes/agent_tune.rs | jeton d'appairage absent ou révoqué | seconde passe #7077 : maître/agent (#4626)
+tune-server/src/routes/diag_qobuz.rs | album_id ou track_id requis | seconde passe #7077 : diagnostics et support
+tune-server/src/routes/diag_qobuz.rs | identifiant invalide (alphanumérique, 64 caractères au plus) | seconde passe #7077 : diagnostics et support
+tune-server/src/routes/export.rs | dir hors des racines musique configurées ({}) | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/export.rs | aucune racine musique configurée | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/indexation_upnp.rs | serveur inconnu | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/indexation_upnp.rs | aucun serveur multimédia enregistré sous « {id} » — | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/metadata.rs | piste inconnue ou non MP3 | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/metadata.rs | fichier illisible ou absent | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/metadata.rs | Artiste « {nom} » impossible à enregistrer : {e} | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/metadata.rs | Album « {titre} » impossible à enregistrer : {e} | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/metadata.rs | Enregistrement de la piste impossible : {e} | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/network.rs | une bascule de cette ampleur est bien plus souvent notre pro | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/network.rs | serveur multimédia {id} inconnu du registre en mémoire — | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/network.rs | {nom_du_serveur} n'a pas répondu au {action} : {e} | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/network.rs | {nom_du_serveur} a répondu HTTP {code} au {action} | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/network.rs | {nom_du_serveur} a répondu sans élément <Result> au {action} | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/network.rs | {nom_du_serveur} a répondu au {action} sans compteur | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/network.rs | {nom_du_serveur} a rendu au {action} un DIDL que Tune ne sai | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/network.rs | {nom_du_serveur} a rendu une page vide au {action} après | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/playlists.rs | Cette demande ne porte que des titres de service incomplets | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/playlists.rs | Il faut désigner la ligne à retirer : `entry_id` (préféré) o | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/playlists.rs | Aucune ligne de cette playlist ne correspond : rien n'a été | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/playlists.rs | Aucune ligne retirée : un rang au moins est hors de la playl | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/playlists.rs | `positions` doit être une permutation exacte des rangs actue | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/retrait_upnp.rs | Une indexation est en cours. Réessayez après sa fin. | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/retrait_upnp.rs | Aucune piste de ce serveur dans la bibliothèque | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/room_correction.rs | canal inconnu « {autre} » — attendu left ou right | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/room_correction.rs | filtre {} enregistre — la correction s'activera au depot du | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/sonos.rs | Le groupage multi-pièces Sonos n'est pas implémenté : | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/squeezebox.rs | LMS ({hote}) répond mais n'annonce aucune platine. Vérifier | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/squeezebox.rs | L'adresse configurée ({hote}) désigne le pont de commande Sq | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/squeezebox.rs | Le lecteur {id} n'est pas (ou plus) annonce par LMS. | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/support.rs | « {file_name} » dépasse la taille maximale de 50 Mo. | seconde passe #7077 : diagnostics et support
+tune-server/src/routes/support.rs | Connecte-toi à ton compte Tune ou active ta licence premium | seconde passe #7077 : diagnostics et support
+tune-server/src/routes/synchronisation_upnp.rs | Une indexation est en cours. Réessayez après sa fin. | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/synchronisation_upnp.rs | serveur inconnu | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/synchronisation_upnp.rs | Le bilan a changé. Relisez le nombre de suppressions avant d | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/synchronisation_upnp.rs | Bilan expiré : relancez la synchronisation. | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/zone_manager.rs | Tune ne synchronise pas les renderers indépendants de ce gro | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/zone_manager.rs | Les positions rapportées par des renderers indépendants ne p | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/zone_manager.rs | Le RTT de commande ne mesure pas la latence de restitution a | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/zone_manager.rs | Ces appareils ne répondent pas comme des points de diffusion | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/zones/compatibilite_renderer.rs | La compatibilité de commande ne concerne que les zones DLNA. | seconde passe #7077 : appareils, groupes et réseau
+tune-server/src/routes/library/albums_manquants_mb.rs | la bibliothèque n'a pas pu être lue : aucune comparaison n'e | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/audit_integrite.rs | Un audit est déjà en cours | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/compositeur_depuis_credits.rs | La passe « compositeur depuis les crédits » tourne déjà. | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/compositeur_depuis_credits.rs | L'enrichissement est suspendu. Reprenez-le avant de lancer l | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/exemplaires.rs | ces chemins ne sont pas des dossiers de musique configurés | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/exemplaires.rs | cette racine n'est pas un dossier de musique configuré | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/identification_lot.rs | L'identification de toute la bibliothèque est une fonction P | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/identification_lot.rs | Identifier un album à la main reste gratuit et sans limite. | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/identification_lot.rs | L'identification est suspendue. Reprenez-la avant de la rela | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/identification_lot.rs | Une identification de la bibliothèque est déjà en cours. | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/lyrics_pass.rs | passe de fond démarrée (fichiers .lrc puis LRCLIB) | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/lyrics_pass.rs | passe de fond démarrée (fichiers .lrc seulement — | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/lyrics_pass.rs | l'écriture dans les fichiers n'est pas autorisée | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/lyrics_pass.rs | écriture démarrée | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/passes_metarust.rs | L'enrichissement est suspendu. Reprenez-le avant de lancer l | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/library/versions_groupes.rs | X-Profile-Id: profil introuvable ou non autorisé | seconde passe #7077 : bibliothèque / indexation
+tune-server/src/routes/system/diagnostics.rs | sortie verrouillée au moment du relevé (elle jouait, ou le s | seconde passe #7077 : diagnostics et support
+tune-server/src/routes/system/diagnostics.rs | deux protocoles de découverte différents sur le même hôte : | seconde passe #7077 : diagnostics et support
+tune-server/src/routes/system/diagnostics.rs | Le balayage ASIO sera retenté une fois au prochain démarrage | seconde passe #7077 : diagnostics et support
+tune-server/src/routes/system/diagnostics.rs | Le balayage ASIO est déjà autorisé au prochain démarrage. | seconde passe #7077 : diagnostics et support
+tune-server/src/routes/system/diagnostics.rs | Retirez TUNE_DISABLE_ASIO_SCAN puis redémarrez Tune ; le réa | seconde passe #7077 : diagnostics et support
+tune-server/src/routes/system/diagnostics.rs | Le préchauffage ASIO ne concerne que Windows. | seconde passe #7077 : diagnostics et support
+tune-server/src/routes/system/diagnostics.rs | Zone {zone_id} : l'appareil annonce toujours la lecture alor | seconde passe #7077 : diagnostics et support

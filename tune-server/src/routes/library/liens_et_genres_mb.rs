@@ -143,7 +143,7 @@ fn lancer_lecture_index(state: &AppState) -> bool {
                 arbre_genres::garder_index(&backend, &index, maintenant());
             }
             Ok(_) => tracing::warn!("genres_musicbrainz_liste_vide_6001"),
-            Err(()) => tracing::warn!("genres_musicbrainz_liste_illisible_6001"),
+            Err(_) => tracing::warn!("genres_musicbrainz_liste_illisible_6001"),
         }
     })
     .is_some()

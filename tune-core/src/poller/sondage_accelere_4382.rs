@@ -126,7 +126,7 @@ pub(super) fn instant_de_conclusion(
     reported_duration_ms: u64,
 ) -> Instant {
     let mut queue_ms = track_duration_ms.saturating_sub(reported_duration_ms);
-    if track_duration_ms % 1000 == 0 {
+    if track_duration_ms.is_multiple_of(1000) {
         queue_ms += INCERTITUDE_DUREE_A_LA_SECONDE_MS;
     }
     frontiere + Duration::from_millis(queue_ms) + MARGE_APRES_LA_FRONTIERE

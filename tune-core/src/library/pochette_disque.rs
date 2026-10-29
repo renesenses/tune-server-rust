@@ -926,8 +926,20 @@ fn suivre(
     }
 
     let lue = lire_pour_l_album(db, album_id, piste, cache_dir, jaquette);
-    let pistes = [piste.to_path_buf()];
-    let du_disque = vient_du_disque(&etat, lue.as_ref(), &pistes);
+    // Une adresse héritée (d'avant #1444) a été dérivée du chemin de la piste
+    // lue LA PREMIÈRE par l'ancien scan — pas forcément de celle-ci. Ne
+    // chercher la preuve que dans le chemin de la piste relue faisait
+    // dépendre le verdict de l'ordre du parcours (`readdir`) : la piste 2
+    // relue avant la piste 1 déclarait l'album « non prouvé », le tranchait,
+    // et la jaquette changée ou retirée n'était jamais suivie (#5034). La
+    // preuve se cherche donc dans TOUTES les pistes de l'album — une requête,
+    // pour les seules lignes de source inconnue que la piste ne prouve pas.
+    let mut du_disque = vient_du_disque(&etat, lue.as_ref(), &[piste.to_path_buf()]);
+    if !du_disque && etat.source.is_none() {
+        let mut pistes = pistes_de_l_album(db, album_id);
+        pistes.retain(|p| p != piste);
+        du_disque = vient_du_disque(&etat, lue.as_ref(), &pistes);
+    }
     // La piste ne porte plus d'image — ou plus la sienne : l'album entier
     // tranche (une autre piste peut encore porter la jaquette).
     let perdue = match &lue {

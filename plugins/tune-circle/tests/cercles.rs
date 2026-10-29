@@ -400,3 +400,34 @@ async fn un_jeton_perime_est_rafraichi_une_fois_sur_les_cercles() {
     assert_eq!(r.statut, StatusCode::OK);
     assert_eq!(r.json()["member_ids"], json!([9, 7]));
 }
+
+// #7124 (site-mozaiklabs#380, décision du 26/10/2026) : l'invité voit les
+// cercles des autres où il est rangé, par la clé additive `member_of`.
+
+#[tokio::test]
+async fn la_cle_member_of_est_relayee_telle_quelle_et_seulement_quand_elle_existe() {
+    let faux = demarrer().await;
+    let app = app(base(&faux.base, Some(JETON)));
+
+    // Contre-épreuve : rangé nulle part, la clé n'existe pas et la forme est inchangée.
+    let v = appel(&app, "GET", "/", None).await.json();
+    assert!(v.get("member_of").is_none(), "{v}");
+
+    faux.etat.lock().unwrap().member_of = vec![
+        json!({ "circle_id": 1, "owner_id": 7, "owner_name": "Alice", "circle_name": "Bêta-testeurs" }),
+        json!({ "circle_id": 2, "owner_id": 9, "owner_name": "Bruno", "circle_name": "Jazz" }),
+    ];
+    let r = appel(&app, "GET", "/", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(
+        r.json()["member_of"],
+        json!([
+            { "circle_id": 1, "owner_id": 7, "owner_name": "Alice", "circle_name": "Bêta-testeurs" },
+            { "circle_id": 2, "owner_id": 9, "owner_name": "Bruno", "circle_name": "Jazz" }
+        ])
+    );
+    // Mes propres cercles restent à part : `member_of` ne s'y mêle pas.
+    assert_eq!(r.json()["circles"], cercle_initial()["circles"]);
+    let attendu = serde_json::to_vec(&faux.etat.lock().unwrap().cercle()).unwrap();
+    assert_eq!(r.octets, attendu, "à l'octet près");
+}

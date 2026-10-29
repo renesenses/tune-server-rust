@@ -286,6 +286,30 @@ fn semer_une_piste_locale(backend: &Arc<dyn DbBackend>) -> i64 {
 }
 
 // 1. Relais ------------------------------------------------------------------
+/// #7124 (site-mozaiklabs#380) : un membre partage une playlist dans le cercle
+/// d'un autre ; ses champs (`circle_name`, `circle_owner_id`, `can_remove`)
+/// sont relayés tels quels, `circle_id` reste nul pour un membre.
+#[tokio::test]
+async fn la_playlist_partagee_par_un_membre_est_relayee_telle_quelle() {
+    let b = banc(vec![]).await;
+    b.faux.etat.lock().unwrap().playlists = vec![json!({
+        "id": 8, "name": "Les trouvailles de Bruno", "circle_id": null,
+        "circle_name": "Bêta-testeurs", "circle_owner_id": 7,
+        "owner": { "user_id": 9, "name": "Bruno" }, "mine": false, "can_remove": false,
+        "version": 1, "items": []
+    })];
+    let r = appel(&b.app, "GET", "/playlists/8", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    let v = r.json();
+    assert_eq!(v["circle_name"], "Bêta-testeurs");
+    assert_eq!(v["circle_owner_id"], 7);
+    assert_eq!(v["owner"]["name"], "Bruno");
+    assert_eq!(v["can_remove"], false);
+    assert!(v["circle_id"].is_null());
+    // Contre-épreuve : une playlist inconnue reste un 404 du cloud.
+    let r = appel(&b.app, "GET", "/playlists/404", None).await;
+    assert_eq!(r.statut, StatusCode::NOT_FOUND);
+}
 
 #[tokio::test]
 async fn les_routes_de_playlist_relaient_statut_et_corps() {

@@ -88,6 +88,48 @@ seulement par OU (`any`). Une requête imbriquée ou niée n'en a pas, car
 l'éditeur n'a qu'un niveau : `rules` et `match_mode` valent `null`, et la
 requête reste exécutable.
 
+## Enregistrer une requête (étape 4)
+
+Une requête **plate** s'enregistre comme aujourd'hui : ses règles d'éditeur,
+dans `rules`, avec son `match_mode`.
+
+Une requête **imbriquée ou niée** s'enregistre en UNE règle, dont la valeur
+est le texte de la requête :
+
+```json
+{"field": "requete", "op": "is", "value": "genre:jazz (annee:1959 ou non credit(instrument: piano))"}
+```
+
+La route `/requete` rend ce qu'il faut enregistrer dans `enregistrement`
+(`{rules, match_mode}`, jamais `null`) : les règles d'éditeur d'une requête
+plate, la règle `requete` (en `all`) d'une imbriquée. L'éditeur le passe tel
+quel à `POST /library/smart-playlists` (ou `PUT /{id}`).
+
+- **Recharger.** `GET /library/smart-playlists/{id}` rend `rules` tel
+  qu'enregistré. Une seule règle de champ `requete` : l'éditeur ouvre
+  « Requête avancée » avec sa valeur.
+- **Évaluer.** Le moteur des playlists traduit la règle `requete` comme la
+  route : les pistes, les albums, l'aperçu et une playlist qui référence
+  celle-ci la lisent de la même façon, sur SQLite comme sur PostgreSQL. Elle
+  peut côtoyer d'autres règles, comme une règle ordinaire.
+- **Refuser.** À l'enregistrement, une requête qui ne se lit pas, ou qui
+  refuse un critère sous une négation, rend `400` avec le corps de la route
+  `/requete` (`requete_invalide`, `message`, `position`). Rien n'est écrit.
+- **Échouer fermé.** Une règle `requete` qui ne se lit plus (un serveur plus
+  ancien, une grammaire changée) ne retient rien et se nomme dans
+  `regles_refusees` (`requete is`), jamais toute la bibliothèque.
+- **Cycles.** Une référence écrite dans le texte (`playlist:"smart:7"`)
+  compte pour la détection des références circulaires.
+
+Pourquoi une règle plutôt qu'une colonne ou un arbre JSON : la colonne
+`rules` est déjà du texte sur les deux bases (aucune migration), tous ses
+lecteurs voient la règle, et l'éditeur relit le texte que l'utilisateur a
+écrit. Code : `tune-smart-http/src/requete_enregistree.rs`.
+
+`docs/contrat-web.json` est régénéré depuis le client web
+(`scripts/web-contract-map.py`) : il citera `enregistrement` quand l'éditeur
+le lira. Jusque-là, c'est cette section qui décrit le contrat.
+
 ## Étapes suivantes
 
 1. **Crédits par piste du chantier artistes multiples** (`track_artists`).
@@ -98,9 +140,8 @@ requête reste exécutable.
 3. **Taille de fichier** (« sans perte au-delà de N Mo »). Ce n'est pas un
    critère du moteur aujourd'hui : il faut une colonne de taille, puis un
    critère dans `criteres.rs`.
-4. **Enregistrer une requête imbriquée** comme playlist intelligente. Le
-   format des règles est plat : il faut un format d'arbre, ou un champ
-   `requete` texte à côté de `rules`.
+4. ~~**Enregistrer une requête imbriquée** comme playlist intelligente.~~
+   Fait : la règle `requete`, voir « Enregistrer une requête (étape 4) ».
 5. **Interface** : un champ « requête avancée » dans l'éditeur, qui affiche
    la position de l'erreur rendue par la route.
 6. Les favoris de service et les pistes de catalogue (règles `source`,

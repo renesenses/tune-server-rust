@@ -1,0 +1,32 @@
+# #7148 — un tour de la sentinelle de streaming. NON INSTALLE : Bertrand
+# valide avant toute pose sur le .18 (voir README de l'issue #7148).
+#
+# Pose (root) :
+#   install -d -m 0700 /etc/tune-sentinelle
+#   install -m 0600 /dev/stdin /etc/tune-sentinelle/github-token   # jeton a grain fin
+#   install -m 0600 /dev/stdin /etc/tune-sentinelle/resend-key     # cle Resend
+#   install -m 0755 sentinelle.sh /opt/tune-sentinelle/sentinelle.sh
+#   cp tune-sentinelle.service tune-sentinelle.timer /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now tune-sentinelle.timer
+[Unit]
+Description=Tune : sentinelle de streaming (resolution et decodage reels, sans son)
+After=network-online.target tune-rust.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=bertrand
+ExecStart=/usr/bin/bash /opt/tune-sentinelle/sentinelle.sh
+Environment=SENTINELLE_API=http://127.0.0.1:8888/api/v1
+StateDirectory=tune-sentinelle
+# Les secrets ne sont lisibles que par ce service, dans $CREDENTIALS_DIRECTORY.
+LoadCredential=github-token:/etc/tune-sentinelle/github-token
+LoadCredential=resend-key:/etc/tune-sentinelle/resend-key
+# Faible priorite : la lecture d'abord.
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=20min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true

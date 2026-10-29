@@ -452,6 +452,9 @@ pub fn renderer_a_l_arret_sans_avoir_joue(peak_position_ms: u64, position_prouve
 /// own an actual realtime stream, startup and seek recovery must be over,
 /// the renderer must already have proven that it reports position, and a
 /// known track end is left to the normal end-of-track machinery.
+// Prédicat pur : une condition nommée par argument, lue telle quelle par ses
+// témoins ; même choix que les deux autres décisions de ce fichier.
+#[allow(clippy::too_many_arguments)]
 pub fn dlna_playing_stall_eligible(
     output_type: &str,
     tune_is_playing: bool,
@@ -2294,7 +2297,7 @@ impl SuiviFamine {
             self.retard = Some(retard);
             annonce.then(|| FamineAnneau::RappelArrete(episode(depuis, courant, cumul)))
         } else {
-            let repris = self.retard.take().and_then(|retard| {
+            self.retard.take().and_then(|retard| {
                 retard.annonce.then(|| {
                     FamineAnneau::RappelRepris(episode(
                         retard.depuis,
@@ -2302,8 +2305,7 @@ impl SuiviFamine {
                         retard.cumul_ms.saturating_add(ecoule_ms),
                     ))
                 })
-            });
-            repris
+            })
         };
         self.dernier = Some(courant);
         self.dernier_intervalle_en_retard = en_retard;
@@ -2352,4 +2354,29 @@ pub fn silence_ms(echantillons_manquants: u64, releve: OutputRingStarvation) -> 
     let ms = u128::from(echantillons_manquants) * u128::from(releve.stream_ms)
         / u128::from(releve.served_samples);
     u64::try_from(ms).unwrap_or(u64::MAX)
+}
+
+/// #7244 — a refused HQPlayer start must never enter generic restart recovery.
+pub fn echec_demarrage_hqplayer(
+    output_type: &str,
+    arret_force: bool,
+    demarrage_fige: bool,
+    position_max_ms: u64,
+) -> bool {
+    output_type == "hqplayer" && position_max_ms == 0 && (arret_force || demarrage_fige)
+}
+
+#[cfg(test)]
+mod hqplayer_demarrage_tests_7244 {
+    use super::*;
+    #[test]
+    fn hqplayer_fige_ou_arrete_a_zero_est_un_refus_sans_relance_7244() {
+        assert!(echec_demarrage_hqplayer("hqplayer", true, false, 0));
+        assert!(echec_demarrage_hqplayer("hqplayer", false, true, 0));
+        assert!(!echec_demarrage_hqplayer("hqplayer", false, false, 0));
+        assert!(!echec_demarrage_hqplayer("hqplayer", true, false, 1_000));
+        for autre in ["dlna", "local", "airplay", ""] {
+            assert!(!echec_demarrage_hqplayer(autre, true, true, 0));
+        }
+    }
 }

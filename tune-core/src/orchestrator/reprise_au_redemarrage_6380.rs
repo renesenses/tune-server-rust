@@ -160,3 +160,167 @@ async fn une_sortie_locale_ne_recoit_aucun_seek() {
         "une sortie locale ne reçoit pas de Seek de rattrapage : {seeks:?}"
     );
 }
+
+/// #7280 / décision du 28/10 à 20 h : le titre seul dans une file restaurée
+/// doit déplacer la sortie, pas seulement sa progression affichée.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reprise_fabien_7280_titre_seul_deplace_la_vraie_sortie_factice() {
+    use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    const APPAREIL: &str = "dlna:uuid-reprise-titre-seul-7280";
+    let (orch, zone_id) = zone_redemarree(APPAREIL, "dlna").await;
+    struct LectureFactice(i64);
+    impl Drop for LectureFactice {
+        fn drop(&mut self) {
+            crate::taches_de_fond::priorite::oublier_la_zone(self.0);
+        }
+    }
+    let _lecture = LectureFactice(zone_id);
+    let q = PlayQueueRepo::with_backend(orch.db.clone());
+    q.append(
+        zone_id,
+        &[QueueInput::Streaming {
+            source: "qobuz".into(),
+            source_id: SOURCE_ID.into(),
+            title: "Titre seul".into(),
+            artist: "Artiste".into(),
+            album: None,
+            cover_url: None,
+            duration_ms: DUREE_MS,
+            track_number: None,
+            disc_number: None,
+            album_ref: None,
+            artist_ref: None,
+        }],
+    )
+    .unwrap();
+    let result = orch
+        .replay_context_from_queue(zone_id, 0, POSITION_RESTAUREE_MS)
+        .await
+        .unwrap();
+    assert!(result.output_sent);
+    let sid = orch
+        .playback
+        .get_state(zone_id)
+        .await
+        .now_playing
+        .unwrap()
+        .stream_id
+        .unwrap();
+    assert!(
+        orch.streamer.is_seekable_session(&sid).await,
+        "prémisse : session proxy qui sert depuis zéro"
+    );
+    let (plays, seeks) = recu_par_la_sortie(&orch, APPAREIL).await;
+    assert_eq!(plays, 1);
+    assert_eq!(
+        seeks,
+        [POSITION_RESTAUREE_MS],
+        "le titre seul doit reprendre physiquement à la position mémorisée"
+    );
+    assert_eq!(
+        orch.playback.get_state(zone_id).await.position_ms,
+        POSITION_RESTAUREE_MS as i64
+    );
+}
+
+/// #7280 / décision du 28/10 à 20 h : le titre seul dans une file restaurée
+/// doit déplacer la sortie, pas seulement sa progression affichée.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reprise_fabien_7280_titre_seul_navigateur_garde_sa_position_sans_fausse_ecoute() {
+    use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    const APPAREIL: &str = "browser:reprise-titre-seul-7280";
+    let (orch, zone_id) = zone_redemarree(APPAREIL, "browser").await;
+    struct LectureFactice(i64);
+    impl Drop for LectureFactice {
+        fn drop(&mut self) {
+            crate::taches_de_fond::priorite::oublier_la_zone(self.0);
+        }
+    }
+    let _lecture = LectureFactice(zone_id);
+    orch.db
+        .execute(
+            "UPDATE zones SET output_device_id = NULL WHERE id = ?",
+            &[&zone_id as &dyn crate::db::backend::ToSqlValue],
+        )
+        .unwrap();
+    let q = PlayQueueRepo::with_backend(orch.db.clone());
+    q.append(
+        zone_id,
+        &[QueueInput::Streaming {
+            source: "qobuz".into(),
+            source_id: SOURCE_ID.into(),
+            title: "Titre seul".into(),
+            artist: "Artiste".into(),
+            album: None,
+            cover_url: None,
+            duration_ms: DUREE_MS,
+            track_number: None,
+            disc_number: None,
+            album_ref: None,
+            artist_ref: None,
+        }],
+    )
+    .unwrap();
+    let result = orch
+        .replay_context_from_queue(zone_id, 0, POSITION_RESTAUREE_MS)
+        .await
+        .unwrap();
+    assert!(!result.output_sent);
+    assert!(result.error.is_none());
+    assert!(result.stream_url.is_some());
+    let state = orch.playback.get_state(zone_id).await;
+    assert_eq!(
+        state.position_ms, POSITION_RESTAUREE_MS as i64,
+        "la reprise navigateur doit porter la position mémorisée avant sa confirmation"
+    );
+    assert!(
+        crate::db::listening_resume::recent(&orch.db, Some(zone_id), 10)
+            .unwrap()
+            .is_empty(),
+        "la position demandée n'est pas une écoute réellement démarrée"
+    );
+    assert_eq!(
+        orch.signaler_lecture_navigateur(
+            zone_id,
+            &state.now_playing.unwrap().stream_id.unwrap(),
+            7500
+        )
+        .await,
+        super::SignalDuLecteur::Confirmee
+    );
+    let sid = orch
+        .playback
+        .get_state(zone_id)
+        .await
+        .now_playing
+        .unwrap()
+        .stream_id
+        .unwrap();
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, &sid, 12500).await,
+        super::SignalDuLecteur::RienEnAttente
+    );
+    assert_eq!(
+        crate::db::listening_resume::recent(&orch.db, Some(zone_id), 10).unwrap()[0].position_ms,
+        12500,
+        "la reprise doit conserver la position mesurée après confirmation, pas la position initiale"
+    );
+    orch.signaler_lecture_navigateur(zone_id, "ancien-flux", 99000)
+        .await;
+    assert_eq!(
+        crate::db::listening_resume::recent(&orch.db, Some(zone_id), 10).unwrap()[0].position_ms,
+        12500,
+        "un ancien flux ne déplace pas la reprise courante"
+    );
+    let count = orch
+        .db
+        .query_one("SELECT COUNT(*) FROM listen_history", &[])
+        .unwrap()
+        .unwrap()[0]
+        .as_i64();
+    assert_eq!(
+        count,
+        Some(1),
+        "les positions suivantes ne créent pas de nouvelles écoutes"
+    );
+}

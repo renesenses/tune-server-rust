@@ -392,6 +392,10 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             obj.insert("current_track".into(), json!(ps.now_playing));
             inject_metadata_anchor(obj, &ps);
             inject_session_context(obj, &ps);
+            obj.insert(
+                "device_volume_observation".into(),
+                json!(ps.device_volume_observation),
+            );
             obj.insert("position_ms".into(), json!(ps.position_ms));
             obj.insert("queue_length".into(), json!(ps.queue_length));
             // #3514 — le refus « radio hors file » (#3342) fait partie de la
@@ -426,13 +430,19 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             // #1274 — `volume` (linéaire, 0..1) et `volume_db` (atténuation en
             // dB, `null` = silence) sortent ensemble du même nombre. Le champ
             // dB est ADDITIF : aucun client déployé ne perd `volume`.
-            tune_core::audio::volume_scale::inserer_volume(
+            let volume_publie = if ps.volume > 0.0 {
+                ps.volume
+            } else {
+                z.volume / 100.0
+            };
+            tune_core::audio::volume_scale::inserer_volume(obj, volume_publie);
+            // #6918 — les dB de l'appareil, pour une sortie à course en dB.
+            tune_core::audio::volume_appareil_db::publier(
                 obj,
-                if ps.volume > 0.0 {
-                    ps.volume
-                } else {
-                    z.volume / 100.0
-                },
+                &state.backend,
+                zone_id,
+                z.output_type.as_deref(),
+                volume_publie,
             );
             // #6787 — la loi du curseur (`volume` reste le gain).
             tune_core::audio::volume_scale::inserer_courbe(
@@ -606,6 +616,10 @@ pub(crate) async fn get_zone(
                 obj.insert("current_track".into(), json!(ps.now_playing));
                 inject_metadata_anchor(obj, &ps);
                 inject_session_context(obj, &ps);
+                obj.insert(
+                    "device_volume_observation".into(),
+                    json!(ps.device_volume_observation),
+                );
                 obj.insert("position_ms".into(), json!(ps.position_ms));
                 obj.insert("queue_length".into(), json!(ps.queue_length));
                 // Expose the queue index too so the client can refresh the
@@ -624,6 +638,14 @@ pub(crate) async fn get_zone(
                 // #1274 — même paire qu'au-dessus, depuis la même source :
                 // ici la colonne `zones.volume`, arrondie au pour-cent.
                 tune_core::audio::volume_scale::inserer_volume(obj, zone.volume / 100.0);
+                // #6918 — même lecture en dB d'appareil, depuis le même nombre.
+                tune_core::audio::volume_appareil_db::publier(
+                    obj,
+                    &state.backend,
+                    id,
+                    zone.output_type.as_deref(),
+                    zone.volume / 100.0,
+                );
                 // #6787 — la loi du curseur (`volume` reste le gain).
                 tune_core::audio::volume_scale::inserer_courbe(
                     obj,

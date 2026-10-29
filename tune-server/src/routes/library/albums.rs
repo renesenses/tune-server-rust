@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::audio::faux_hires_publie;
 use tune_core::cloud::ecoutes_communaute::{self, Genre};
 use tune_core::db::coffrets_auto;
 use tune_core::metadata::coffrets::{Coffret, coffrets, titre_commun};
@@ -73,6 +74,14 @@ pub(super) struct AlbumFilters {
     /// combine aux facettes, au tri et à la pagination ; `total` est alors le
     /// nombre de RÉSULTATS. Absente ou vide : la réponse d'avant, à l'octet.
     q: Option<String>,
+    /// #6285 — `?hires_verdict=verifie|conforme|douteux|non_analyse` : les
+    /// albums dont le verdict hi-res PUBLIÉ (`hires_verdict` de chaque ligne)
+    /// est celui-là. Tant que « douteux » est masqué (réglage
+    /// `faux_hires_douteux_visible`), `douteux` ne rend rien et `non_analyse`
+    /// inclut les albums douteux. Un mot inconnu ne rend rien. Avec ce
+    /// filtre, `total` est le nombre d'albums filtrés. Absent : la réponse
+    /// d'avant.
+    hires_verdict: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -133,7 +142,14 @@ pub(super) async fn list_albums(
 
 /// Le corps de `GET /library/albums`, exécuté HORS de l'exécuteur async.
 fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value {
-    let repo = AlbumRepo::with_backend(backend);
+    // #6285 — le réglage lu UNE fois : la colonne et le filtre en suivent la
+    // même valeur.
+    let douteux_visible = faux_hires_publie::douteux_visible(&backend);
+    let filtre_hires = p
+        .hires_verdict
+        .as_deref()
+        .map(|mot| faux_hires_publie::FiltreHires::depuis_le_mot(mot, douteux_visible));
+    let repo = AlbumRepo::with_backend(backend.clone()).avec_filtre_hires(filtre_hires);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
     let sort = p.sort.as_deref().unwrap_or("added_at");
@@ -150,7 +166,10 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
     // #4146 ne s'évalue plus deux fois. Le total n'est demandé que là où il
     // sera repris (voir plus bas) ; ailleurs le SQL reste celui d'avant.
     let sans_facette = p.format.is_none() && p.quality.is_none() && p.compilation.is_none();
-    let veut_le_total = dr.is_none() && !include_hidden && sans_facette;
+    // #6285 — avec le filtre hi-res, le total est celui de l'ensemble filtré,
+    // comme pour une recherche : un « vérifié » sur une poignée d'albums ne
+    // doit pas paginer sur la bibliothèque entière.
+    let veut_le_total = (dr.is_none() && !include_hidden && sans_facette) || filtre_hires.is_some();
     // Fil 1684 — une recherche : le total est celui de l'ensemble FILTRÉ.
     let recherche =
         p.q.as_deref()
@@ -187,7 +206,16 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
                 (Vec::new(), 0)
             }
         };
-        let mut corps = corps_de_la_page(&repo, items, total, limit, offset, seed);
+        let mut corps = corps_de_la_page(
+            &repo,
+            &backend,
+            douteux_visible,
+            items,
+            total,
+            limit,
+            offset,
+            seed,
+        );
         // La saisie RENVOYÉE : c'est ainsi qu'un client sait que ce serveur
         // a filtré. Un serveur d'avant ignore `q` et rend toute la
         // bibliothèque — le client doit alors filtrer lui-même.
@@ -250,6 +278,28 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
     // Page vide (décalage au-delà de la fin) : pas de total porté, on
     // recompte — le seul cas où le doublon s'évalue deux fois.
     let total = match dr {
+        // #6285 — le total de l'ensemble filtré, porté par la page ; page
+        // vide au-delà de la fin : relu sur la première ligne.
+        _ if filtre_hires.is_some() => match total_de_la_page {
+            Some(total) => total,
+            None if offset > 0 => repo
+                .list_filtered_seeded_avec_total(
+                    1,
+                    0,
+                    sort,
+                    order,
+                    p.format.as_deref(),
+                    p.quality.as_deref(),
+                    p.compilation,
+                    include_hidden,
+                    dr,
+                    seed,
+                )
+                .ok()
+                .and_then(|(_, t)| t)
+                .unwrap_or(0),
+            None => 0,
+        },
         Some(range) => repo.count_in_dr_range(range, include_hidden).unwrap_or(0),
         None if include_hidden => repo.count().unwrap_or(0),
         None => match total_de_la_page {
@@ -257,13 +307,26 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
             None => repo.count_visible().unwrap_or(0),
         },
     };
-    corps_de_la_page(&repo, items, total, limit, offset, seed)
+    corps_de_la_page(
+        &repo,
+        &backend,
+        douteux_visible,
+        items,
+        total,
+        limit,
+        offset,
+        seed,
+    )
 }
 
 /// La réponse de `GET /library/albums` pour une page déjà lue : le DR de
-/// chaque album, sans `bio`, et la graine du tri aléatoire.
+/// chaque album, sans `bio`, son verdict hi-res publié, et la graine du tri
+/// aléatoire.
+#[allow(clippy::too_many_arguments)]
 fn corps_de_la_page(
     repo: &AlbumRepo,
+    backend: &Arc<dyn DbBackend>,
+    douteux_visible: bool,
     items: Vec<Album>,
     total: i64,
     limit: i64,
@@ -280,6 +343,15 @@ fn corps_de_la_page(
         tracing::warn!(error = %e, "dynamic_range_by_ids a échoué — page servie sans DR");
         std::collections::HashMap::new()
     });
+    // #6285 — le verdict hi-res de chaque album de la page, en UNE requête
+    // groupée, par la règle de la fiche (`verdict_d_album`). `non_analyse`
+    // sans mesure, et pour un douteux tant qu'il est masqué. Un échec ne
+    // vide pas la grille : la page part en `non_analyse`, et le journal le dit.
+    let hires_par_id =
+        faux_hires_publie::pistes_mesurees_par_album(backend, &ids).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "hires_par_album a échoué — page servie sans verdict");
+            std::collections::HashMap::new()
+        });
     let items: Vec<Value> = items
         .iter()
         .map(|a| {
@@ -291,6 +363,13 @@ fn corps_de_la_page(
                         .map(|v| Value::String(v.to_string()))
                         .unwrap_or(Value::Null);
                 obj.insert("dynamic_range".into(), dr);
+                let pistes =
+                    a.id.and_then(|id| hires_par_id.get(&id))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                let (verdict, raison) = faux_hires_publie::publier_l_album(pistes, douteux_visible);
+                obj.insert("hires_verdict".into(), json!(verdict));
+                obj.insert("hires_raison".into(), json!(raison));
             }
             j
         })
@@ -1051,6 +1130,7 @@ pub(super) async fn album_bio(
         return Json(json!({
             "album": album.title,
             "bio": bio,
+            "source": prov.as_ref().and_then(|p| p.get("source")).and_then(Value::as_str),
             "bio_provenance": prov,
         }))
         .into_response();
@@ -1120,10 +1200,11 @@ fn repli_sur_la_bio_stockee(
         Some(b) => Json(json!({
             "album": titre,
             "bio": b,
+            "source": prov.as_ref().and_then(|p| p.get("source")).and_then(Value::as_str),
             "bio_provenance": prov,
         }))
         .into_response(),
-        None => Json(json!({"album": titre, "bio": null})).into_response(),
+        None => Json(json!({"album": titre, "bio": null, "source": null})).into_response(),
     }
 }
 
@@ -1136,31 +1217,24 @@ pub(super) async fn album_similar(
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let mbid = if let Some(aid) = album.artist_id {
-        let artist_repo = ArtistRepo::with_backend(state.backend.clone());
-        artist_repo
+    // Le cloud propose les artistes similaires de l'artiste de cet album,
+    // pas des albums voisins. Garder la réponse historique `artists`, en
+    // partageant le client de référence et la résolution exacte (#6555).
+    let artiste = album.artist_id.and_then(|aid| {
+        ArtistRepo::with_backend(state.backend.clone())
             .get(aid)
             .ok()
             .flatten()
-            .and_then(|a| a.musicbrainz_id)
-    } else {
-        None
-    };
-    let Some(mbid) = mbid else {
+    });
+    let Some(artiste) = artiste else {
         return Json(json!({"album": album.title, "artists": []})).into_response();
     };
-    match state
-        .http_client
-        .get(format!("https://mozaiklabs.fr/api/{mbid}/similar"))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            let data: Value = resp.json().await.unwrap_or(json!({}));
-            Json(data).into_response()
-        }
-        _ => Json(json!({"mbid": mbid, "artists": []})).into_response(),
-    }
+    let mut client = super::artists::client_cloud(&state);
+    let Some(mbid) = super::artists::mbid_cloud(&state, &mut client, &artiste).await else {
+        return Json(json!({"album": album.title, "artists": []})).into_response();
+    };
+    let voisins = client.get_similar(&mbid).await;
+    Json(json!({"album": album.title, "mbid": mbid, "artists": voisins})).into_response()
 }
 
 /// `POST /library/albums/{id}/distinct/{other_id}` — « ces deux albums ne sont
@@ -4867,3 +4941,7 @@ mod communaute_tests_6545 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "similaires_album_7090_tests.rs"]
+mod similaires_album_7090_tests;

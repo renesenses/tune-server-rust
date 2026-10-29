@@ -1114,14 +1114,52 @@ async fn aucune_fiche_de_la_liste_ne_sort_sans_compatible() {
         );
     }
 
-    // Et nommément les deux familles du relevé de Querite : l'intégrée
-    // (xtune) et une SDK (bandcamp chez lui, `loads` ici).
-    for attendu in ["xtune", "loads", "optin", "horscatalogue"] {
+    // Et nommément la famille SDK du relevé de Querite (bandcamp chez lui,
+    // `loads` ici). L'intégrée qu'il citait, xTune, n'est plus annoncée
+    // (#4908).
+    for attendu in ["loads", "optin", "horscatalogue"] {
         let fiche = entrees
             .iter()
             .find(|f| f["name"] == attendu)
             .unwrap_or_else(|| panic!("« {attendu} » doit figurer dans la liste"));
         assert_eq!(fiche["compatible"], true, "{fiche}");
+    }
+}
+
+/// #4908 — `GET /plugins` n'annonce plus xTune.
+///
+/// La fiche intégrée « xtune » renvoyait vers `/xtune/`, une route que le
+/// serveur ne sert pas : l'écran Extensions proposait un lien mort. Le besoin
+/// qu'elle portait (commandes d'écran verrouillé sur téléphone) est livré par
+/// le client web. Ce témoin rougit si la fiche, ou n'importe quelle entrée
+/// pointant vers `/xtune`, revient dans la liste.
+///
+/// Contre-épreuve : remettre le bloc `plugins.push(json!({"name": "xtune", …}))`
+/// dans `list_plugins_brut` fait rougir ce test sur «xtune».
+#[tokio::test]
+async fn la_liste_n_annonce_plus_xtune_4908() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Loads)]).await;
+    semer_les_fiches_heritees(&state);
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = body_of(&app, "/api/v1/plugins").await;
+    assert_eq!(status, StatusCode::OK);
+    let liste: Value = serde_json::from_str(&body).unwrap();
+    let entrees = liste.as_array().expect("un tableau");
+    assert!(
+        entrees.iter().any(|f| f["name"] == "loads"),
+        "la liste doit montrer le greffon chargé : {liste}"
+    );
+
+    for fiche in entrees {
+        let nom = fiche["name"].as_str().unwrap_or("<sans nom>");
+        let url = fiche["url"].as_str().unwrap_or("");
+        assert!(
+            !nom.eq_ignore_ascii_case("xtune") && !url.starts_with("/xtune"),
+            "« {nom} » annonce xTune, vers une route que rien ne sert ({fiche})"
+        );
     }
 }
 

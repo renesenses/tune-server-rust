@@ -84,6 +84,8 @@ pub struct PrefetchedTrack {
 /// Thread-safe prefetch engine shared across async tasks.
 pub struct PrefetchEngine {
     buffer: Mutex<Option<PrefetchedTrack>>,
+    /// Le fMP4 DASH est entier avant le décodage du tampon PCM (#7247).
+    dash_complet: Mutex<Option<(String, String, crate::streaming::StreamUrl)>>,
     /// Cancellation token: set to true to abort an in-progress prefetch.
     cancel: Mutex<bool>,
     /// The queue position that was prefetched, so callers can detect
@@ -101,9 +103,28 @@ impl PrefetchEngine {
     pub fn new() -> Self {
         Self {
             buffer: Mutex::new(None),
+            dash_complet: Mutex::new(None),
             cancel: Mutex::new(false),
             prefetched_position: Mutex::new(None),
         }
+    }
+
+    pub(crate) async fn prendre_dash_complet(
+        &self,
+        source: &str,
+        source_id: &str,
+    ) -> Option<crate::streaming::StreamUrl> {
+        let mut garde = self.dash_complet.lock().await;
+        let (service, id, flux) = garde.as_ref()?;
+        if service != source || id != source_id {
+            return None;
+        }
+        let existe = flux
+            .url
+            .strip_prefix("file://")
+            .is_some_and(|p| std::path::Path::new(p).is_file());
+        let (_, _, flux) = garde.take()?;
+        existe.then_some(flux)
     }
 
     /// Read the current prefetch mode from settings.
@@ -238,6 +259,20 @@ impl PrefetchEngine {
                 return;
             }
 
+            // HQPlayer doit recevoir le fichier complet préparé par sa tâche,
+            // pas un deuxième téléchargement réduit à trente secondes de PCM.
+            if source == "tidal"
+                && crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+                    .get(zone_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|z| {
+                        z.output_type.as_deref() == Some("hqplayer") && z.gapless_enabled
+                    })
+            {
+                return;
+            }
+
             let title = item.title.clone();
             let artist = item.artist_name.clone();
             let album = item.album_title.clone();
@@ -311,6 +346,11 @@ impl PrefetchEngine {
                 None => return,
             }
         };
+
+        if source == "tidal" && stream_data.url.starts_with("file://") {
+            *self.dash_complet.lock().await =
+                Some((source.clone(), source_id.clone(), stream_data.clone()));
+        }
 
         // Fetch track metadata if not provided
         let (track_title, track_artist, track_album, track_cover, actual_duration) =
@@ -550,6 +590,7 @@ impl PrefetchEngine {
             info!("prefetch_buffer_cleared");
         }
         *buf = None;
+        *self.dash_complet.lock().await = None;
 
         *self.prefetched_position.lock().await = None;
     }

@@ -146,14 +146,19 @@ async fn artiste_inconnu_panne_et_identifiant_forge_6288() {
         lire_discographie_par(ARTISTE, &inconnu, 1).await,
         Lecture::Inconnu
     );
-    let panne = |_m: String, _o: u32| std::future::ready(Err(()));
+    let panne = |_m: String, _o: u32| std::future::ready(Err(SansReponse));
     assert_eq!(
         lire_discographie_par(ARTISTE, &panne, 1).await,
         Lecture::Indisponible
     );
     // Panne à la deuxième page : rien n'est conclu.
-    let a_moitie =
-        |_m: String, o: u32| std::future::ready(if o == 0 { Ok(Some(page(0))) } else { Err(()) });
+    let a_moitie = |_m: String, o: u32| {
+        std::future::ready(if o == 0 {
+            Ok(Some(page(0)))
+        } else {
+            Err(SansReponse)
+        })
+    };
     assert_eq!(
         lire_discographie_par(ARTISTE, &a_moitie, 1).await,
         Lecture::Indisponible
@@ -216,7 +221,7 @@ async fn la_discographie_est_gardee_puis_relue_a_expiration_6288() {
     assert_eq!(*appels.lock().unwrap(), 6);
     // Une panne n'est pas gardée.
     let (backend, _dir2) = base();
-    let panne = |_m: String, _o: u32| std::future::ready(Err(()));
+    let panne = |_m: String, _o: u32| std::future::ready(Err(SansReponse));
     discographie_par(&backend, ARTISTE, &panne, 1).await;
     assert!(gardee(&backend, ARTISTE, 1).is_none());
 }

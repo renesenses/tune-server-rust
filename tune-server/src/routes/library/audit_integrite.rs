@@ -1,4 +1,12 @@
 //! Passe manuelle, curseur et rapport persistants, sans migration. Refs #6286.
+//!
+//! - Périmètre : celui des analyses (#5593), racines exclues ET dossiers
+//!   inclus, sur le chemin ouvrable.
+//! - `POST /library/integrity?changed_only=true` : seuls les fichiers changés
+//!   depuis l'audit précédent (chemin, taille ou date de modification) sont
+//!   relus ; les autres reprennent son résultat, sans être décodés.
+//! - Rappel périodique : `library_integrity_reminder_days`, éteint par défaut
+//!   (voir `tune_core::audio::audit_integrite::rappel`).
 use crate::state::AppState;
 use axum::{
     Json,
@@ -16,7 +24,10 @@ use std::{
     time::Duration,
 };
 use tune_core::{
-    audio::audit_integrite::{self, Resultat, Verdict},
+    audio::audit_integrite::{
+        self, Resultat, Verdict,
+        rappel::{self, Rappel},
+    },
     db::{
         backend::DbBackend,
         engine::{Engine, PostgresDialect, SqliteDialect},
@@ -49,6 +60,24 @@ pub(super) struct Etat {
     erreur: Option<String>,
     #[serde(default)]
     lecture_prioritaire: bool,
+    /// Audit lancé avec « fichiers changés seulement ».
+    #[serde(default)]
+    modifies_seulement: bool,
+    /// La génération de l'audit précédent, dont les résultats valent pour les
+    /// fichiers inchangés depuis. `None` : tout est relu.
+    #[serde(default)]
+    reference: Option<String>,
+    /// Fichiers inchangés dont le résultat précédent a été repris sans être
+    /// relus. Ils comptent aussi dans `traites` et dans leur verdict.
+    #[serde(default)]
+    reutilises: u64,
+    /// Début de cet audit (RFC 3339).
+    #[serde(default)]
+    debut: Option<String>,
+    /// Fin du dernier audit TERMINÉ (RFC 3339), d'un audit à l'autre : le
+    /// rappel périodique part de là.
+    #[serde(default)]
+    dernier_audit_termine: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Ligne {
@@ -57,6 +86,26 @@ struct Ligne {
     taille: Option<u64>,
     taille_sans_nouvelle_date: bool,
     resultat: Resultat,
+    /// Date de modification du fichier quand il a été lu, en secondes : avec
+    /// la taille, ce qui dit qu'il a changé depuis.
+    #[serde(default)]
+    date: Option<f64>,
+    /// La génération de l'audit qui a réellement décodé le fichier.
+    #[serde(default)]
+    verifie_par: Option<String>,
+}
+
+/// L'état publié par `GET` et `POST /library/integrity` : l'état persistant
+/// et l'échéance du rappel.
+#[derive(Serialize)]
+pub(super) struct Vue {
+    #[serde(flatten)]
+    etat: Etat,
+    rappel: Rappel,
+}
+
+fn cle_ligne(generation: &str, id: i64) -> String {
+    format!("audit_integrite_ligne:{generation}:{id:020}")
 }
 
 fn lire(db: &Arc<dyn DbBackend>) -> Result<Etat, String> {
@@ -80,14 +129,7 @@ fn sauver(db: &Arc<dyn DbBackend>, etat: &Etat, ligne: Option<&Ligne>) -> Result
     let date = chrono::Utc::now().to_rfc3339();
     let json = serde_json::to_string(etat).map_err(|e| e.to_string())?;
     let ligne = ligne
-        .map(|l| {
-            serde_json::to_string(l).map(|v| {
-                (
-                    format!("audit_integrite_ligne:{}:{:020}", etat.generation, l.id),
-                    v,
-                )
-            })
-        })
+        .map(|l| serde_json::to_string(l).map(|v| (cle_ligne(&etat.generation, l.id), v)))
         .transpose()
         .map_err(|e| e.to_string())?;
     // Le curseur et le résultat sont validés ensemble : un redémarrage ne
@@ -100,9 +142,20 @@ fn sauver(db: &Arc<dyn DbBackend>, etat: &Etat, ligne: Option<&Ligne>) -> Result
         Ok(())
     })
 }
-fn candidats(db: &Arc<dyn DbBackend>) -> String {
+/// Le périmètre des analyses (#5593) sur le chemin ouvrable : hors des
+/// racines exclues ET, s'il y en a, sous l'un des dossiers inclus — la même
+/// règle que les passes qui décodent.
+fn perimetre_sql(db: &Arc<dyn DbBackend>) -> String {
     let chemin = tune_core::db::track_repo::sql::CHEMIN_OUVRABLE;
-    let scope = perimetre::clause_hors_racines(chemin, &perimetre::racines_exclues(db));
+    let mut scope = perimetre::clause_hors_racines(chemin, &perimetre::racines_exclues(db));
+    scope.push_str(&perimetre::clause_dans_les_racines(
+        chemin,
+        &perimetre::dossiers_inclus(db),
+    ));
+    scope
+}
+fn candidats(db: &Arc<dyn DbBackend>) -> String {
+    let scope = perimetre_sql(db);
     // file_path est UNIQUE : la branche ordinaire peut avancer par la clé
     // primaire sans regrouper toute la bibliothèque à chaque page. Seules
     // les images CUE sont regroupées, une fois par fichier physique.
@@ -137,15 +190,24 @@ fn erreur(e: String) -> Response {
         .into_response()
 }
 
+fn vue(db: &Arc<dyn DbBackend>, mut etat: Etat) -> Vue {
+    if etat.status == "running" && !ACTIF.load(Ordering::Acquire) {
+        etat.status = "paused".into();
+    }
+    etat.lecture_prioritaire = priorite::lecture_en_cours();
+    let mut rappel = rappel::echeance(
+        rappel::rappel_jours(db),
+        etat.dernier_audit_termine.as_deref(),
+        chrono::Utc::now(),
+    );
+    // Un audit en cours n'a pas à être rappelé.
+    rappel.du &= etat.status != "running";
+    Vue { etat, rappel }
+}
+
 pub(super) async fn status(State(state): State<AppState>) -> Response {
-    match bloquant(move || lire(&state.backend)).await {
-        Ok(mut etat) => {
-            if etat.status == "running" && !ACTIF.load(Ordering::Acquire) {
-                etat.status = "paused".into();
-            }
-            etat.lecture_prioritaire = priorite::lecture_en_cours();
-            Json(etat).into_response()
-        }
+    match bloquant(move || lire(&state.backend).map(|etat| vue(&state.backend, etat))).await {
+        Ok(vue) => Json(vue).into_response(),
         Err(e) => e,
     }
 }
@@ -154,6 +216,62 @@ pub(super) async fn status(State(state): State<AppState>) -> Response {
 pub(super) struct Lancement {
     #[serde(default)]
     resume: bool,
+    /// Ne relire que les fichiers changés depuis l'audit précédent.
+    #[serde(default)]
+    changed_only: bool,
+}
+
+/// Prépare l'état d'un lancement : reprise de l'audit en cours, ou nouvel
+/// audit (complet, ou « fichiers changés seulement » avec l'audit précédent
+/// pour référence). Sans audit précédent, un audit partiel relit tout.
+fn preparer(db: &Arc<dyn DbBackend>, options: &Lancement) -> Result<Etat, String> {
+    let mut etat = lire(db)?;
+    if !options.resume || !matches!(etat.status.as_str(), "running" | "paused" | "error") {
+        let selection = candidats(db);
+        let ligne = db
+            .query_one(
+                &format!("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM ({selection}) candidats"),
+                &[],
+            )?
+            .ok_or("Comptage indisponible")?;
+        let reference =
+            (options.changed_only && !etat.generation.is_empty()).then(|| etat.generation.clone());
+        etat = Etat {
+            generation: uuid::Uuid::new_v4().to_string(),
+            total: ligne[0].as_i64().unwrap_or(0) as u64,
+            dernier_id: ligne[1].as_i64().unwrap_or(0),
+            modifies_seulement: options.changed_only,
+            reference,
+            debut: Some(chrono::Utc::now().to_rfc3339()),
+            dernier_audit_termine: etat.dernier_audit_termine.take(),
+            ..Default::default()
+        };
+    }
+    etat.status = "running".into();
+    etat.erreur = None;
+    taches_de_fond::reprendre(db, Tache::Integrite)?;
+    sauver(db, &etat, None)?;
+    purger(db, &etat)?;
+    Ok(etat)
+}
+
+/// Supprime les rapports des audits précédents. Celui de la référence reste
+/// tant que l'audit partiel n'est pas terminé : ses résultats y sont repris.
+fn purger(db: &Arc<dyn DbBackend>, etat: &Etat) -> Result<(), String> {
+    let courante = format!("audit_integrite_ligne:{}:%", etat.generation);
+    let reference = etat
+        .reference
+        .as_ref()
+        .filter(|_| etat.status != "completed")
+        .map_or_else(
+            || courante.clone(),
+            |r| format!("audit_integrite_ligne:{r}:%"),
+        );
+    db.execute(
+        "DELETE FROM settings WHERE key LIKE 'audit_integrite_ligne:%' AND key NOT LIKE ? AND key NOT LIKE ?",
+        &[&courante, &reference],
+    )?;
+    Ok(())
 }
 
 pub(super) async fn start(
@@ -169,39 +287,15 @@ pub(super) async fn start(
     let garde = Garde;
     let db = state.backend.clone();
     let resultat = bloquant(move || {
-        let mut etat = lire(&db)?;
-        if !options.resume || !matches!(etat.status.as_str(), "running" | "paused" | "error") {
-            let selection = candidats(&db);
-            let ligne = db
-                .query_one(
-                    &format!("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM ({selection}) candidats"),
-                    &[],
-                )?
-                .ok_or("Comptage indisponible")?;
-            etat = Etat {
-                generation: uuid::Uuid::new_v4().to_string(),
-                total: ligne[0].as_i64().unwrap_or(0) as u64,
-                dernier_id: ligne[1].as_i64().unwrap_or(0),
-                ..Default::default()
-            };
-        }
-        etat.status = "running".into();
-        etat.erreur = None;
-        taches_de_fond::reprendre(&db, Tache::Integrite)?;
-        sauver(&db, &etat, None)?;
-        let prefixe = format!("audit_integrite_ligne:{}:%", etat.generation);
-        db.execute(
-            "DELETE FROM settings WHERE key LIKE 'audit_integrite_ligne:%' AND key NOT LIKE ?",
-            &[&prefixe],
-        )?;
-        Ok(etat)
+        let etat = preparer(&db, &options)?;
+        let reponse = vue(&db, etat.clone());
+        Ok((etat, reponse))
     })
     .await;
-    let etat = match resultat {
+    let (etat, reponse) = match resultat {
         Ok(e) => e,
         Err(e) => return e,
     };
-    let reponse = etat.clone();
     let suivi = state.background_tasks.begin(
         "integrity",
         "Audit d’intégrité de la bibliothèque",
@@ -249,15 +343,56 @@ fn taille_changee_sans_date(
     let Some(meta) = meta else {
         return false;
     };
-    let date = meta
-        .modified()
-        .ok()
-        .and_then(|d| d.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs_f64());
+    let date = date_secondes(meta);
     taille_scan.is_some_and(|taille| taille >= 0 && meta.len() != taille as u64)
         && date
             .zip(date_scan)
             .is_some_and(|(a, b)| (a - b).abs() < 0.001)
+}
+
+fn date_secondes(meta: &std::fs::Metadata) -> Option<f64> {
+    meta.modified()
+        .ok()
+        .and_then(|d| d.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+}
+
+/// « Fichiers changés seulement » : le résultat de l'audit de référence pour
+/// ce fichier, s'il est INCHANGÉ depuis — même chemin, même taille, même date
+/// de modification. Un fichier absent, nouveau, modifié pendant l'audit de
+/// référence, ou dont le résultat ne porte pas de date (audit d'avant cette
+/// option) est relu.
+fn resultat_reutilisable(
+    db: &Arc<dyn DbBackend>,
+    etat: &Etat,
+    id: i64,
+    chemin: &str,
+    meta: Option<&std::fs::Metadata>,
+) -> Result<Option<Ligne>, String> {
+    let (true, Some(reference), Some(meta)) =
+        (etat.modifies_seulement, etat.reference.as_deref(), meta)
+    else {
+        return Ok(None);
+    };
+    let Some(brut) = SettingsRepo::with_backend(db.clone()).get(&cle_ligne(reference, id))? else {
+        return Ok(None);
+    };
+    let Ok(avant) = serde_json::from_str::<Ligne>(&brut) else {
+        return Ok(None);
+    };
+    let inchange = avant.chemin == chemin
+        && avant.taille == Some(meta.len())
+        && avant
+            .date
+            .zip(date_secondes(meta))
+            .is_some_and(|(a, b)| (a - b).abs() < 0.001)
+        && avant.resultat.code != "modifie_pendant_audit";
+    // `chemin` et `taille` repris de la référence : égaux aux valeurs du
+    // disque, puisque `inchange` l'exige.
+    Ok(inchange.then(|| Ligne {
+        verifie_par: avant.verifie_par.clone().or(Some(reference.to_string())),
+        ..avant
+    }))
 }
 
 fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
@@ -272,11 +407,18 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
         let lot = db.query_many(&format!("SELECT id, chemin, taille, date FROM ({selection}) candidats WHERE id > ? AND id <= ? ORDER BY id LIMIT 100"), &[&etat.curseur, &etat.dernier_id])?;
         if lot.is_empty() {
             etat.status = "completed".into();
-            return sauver(db, etat, None);
+            etat.dernier_audit_termine = Some(chrono::Utc::now().to_rfc3339());
+            sauver(db, etat, None)?;
+            // La référence n'a plus d'usage. Un échec ne fait que la laisser
+            // en place jusqu'au prochain lancement, qui la supprime.
+            if let Err(e) = purger(db, etat) {
+                tracing::warn!(error = %e, "audit_integrite_purge_differee");
+            }
+            return Ok(());
         }
-        let racines = perimetre::racines_exclues(db);
+        let perimetre = perimetre_sql(db);
         for ligne in lot {
-            if racines != perimetre::racines_exclues(db) {
+            if perimetre != perimetre_sql(db) {
                 break;
             }
             if !continuer() {
@@ -290,6 +432,18 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
             let date = avant.as_ref().and_then(|m| m.modified().ok());
             let taille_sans_nouvelle_date =
                 taille_changee_sans_date(avant.as_ref(), ligne[2].as_i64(), ligne[3].as_f64());
+            if let Some(reprise) = resultat_reutilisable(db, etat, id, &chemin, avant.as_ref())? {
+                enregistrer(
+                    db,
+                    etat,
+                    &Ligne {
+                        taille_sans_nouvelle_date,
+                        ..reprise
+                    },
+                    true,
+                )?;
+                continue;
+            }
             let Some(mut resultat) = audit_integrite::verifier(Path::new(&chemin), continuer)
             else {
                 etat.status = "paused".into();
@@ -317,14 +471,23 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
                     taille,
                     taille_sans_nouvelle_date,
                     resultat,
+                    date: avant.as_ref().and_then(date_secondes),
+                    verifie_par: Some(etat.generation.clone()),
                 },
+                false,
             )?;
         }
     }
 }
 
-fn enregistrer(db: &Arc<dyn DbBackend>, etat: &mut Etat, ligne: &Ligne) -> Result<(), String> {
+fn enregistrer(
+    db: &Arc<dyn DbBackend>,
+    etat: &mut Etat,
+    ligne: &Ligne,
+    reutilise: bool,
+) -> Result<(), String> {
     let mut suivant = etat.clone();
+    suivant.reutilises += u64::from(reutilise);
     match ligne.resultat.verdict {
         Verdict::Sain => suivant.sains += 1,
         Verdict::Corrompu => suivant.corrompus += 1,
@@ -472,6 +635,8 @@ mod tests {
             taille: Some(40),
             taille_sans_nouvelle_date: true,
             resultat: Resultat::defaut("decodage", "tronqué", Some(4096), 4096),
+            date: None,
+            verifie_par: None,
         };
         sauver(&db, &etat, Some(&ligne)).unwrap();
         let relu = lire(&db).unwrap();
@@ -517,8 +682,10 @@ mod tests {
             taille: None,
             taille_sans_nouvelle_date: false,
             resultat: Resultat::defaut("illisible", "absent", None, 0),
+            date: None,
+            verifie_par: None,
         };
-        assert!(enregistrer(&db, &mut etat, &ligne).is_err());
+        assert!(enregistrer(&db, &mut etat, &ligne, false).is_err());
         assert_eq!(
             etat.curseur, 0,
             "le statut d’erreur doit garder le curseur validé"
@@ -588,3 +755,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "audit_integrite_tests_6286.rs"]
+mod tests_6286;

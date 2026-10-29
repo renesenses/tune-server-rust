@@ -346,10 +346,10 @@ impl CrossfeedProcessor {
         // Chaque étage tiers reprend l'historique de SON prédécesseur, trouvé
         // par identifiant : un étage ajouté ou retiré ne décale pas les autres.
         for etage in &mut self.tiers {
-            if let Some(ancien) = previous.tiers.iter().find(|a| a.id == etage.id) {
-                if let Err(error) = etage.stage.inherit(&ancien.stage) {
-                    tracing::debug!(plugin = %etage.id, %error, "native_third_party_history_not_compatible");
-                }
+            if let Some(ancien) = previous.tiers.iter().find(|a| a.id == etage.id)
+                && let Err(error) = etage.stage.inherit(&ancien.stage)
+            {
+                tracing::debug!(plugin = %etage.id, %error, "native_third_party_history_not_compatible");
             }
         }
     }

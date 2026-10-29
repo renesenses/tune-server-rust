@@ -799,7 +799,22 @@ async fn activate_zone_profile(
         };
 
         if let Some(device_id) = zc.get("output_device_id").and_then(|v| v.as_str()) {
-            zone_repo.update_output_device(zone_id, device_id).ok();
+            let ancienne = zone_repo
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|zone| zone.output_device_id);
+            // #7133 — même règle que `PATCH /zones/{id}` : l'appareil quitté
+            // se tait, si la zone l'a bien quitté.
+            if zone_repo.update_output_device(zone_id, device_id).is_ok() {
+                super::zones::couper_l_ancienne_sortie(
+                    &state,
+                    zone_id,
+                    ancienne.as_deref(),
+                    Some(device_id),
+                )
+                .await;
+            }
             // #6774 — même règle que le hot-swap.
             tune_core::audio::reglages_de_volume::aligner_la_lecture(
                 &state.backend,

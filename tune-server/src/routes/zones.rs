@@ -43,6 +43,10 @@ struct UpdateVolume {
     /// `volume`. Ce champ ne connaît PAS l'ambiguïté 0..1 / 0..100 : un dB est
     /// un dB (#1274).
     volume_db: Option<f64>,
+    /// #6918 — dB de l'APPAREIL, sur la course d'une sortie qui règle son
+    /// volume en décibels (Devialet AIR). Exclusif avec `volume` et
+    /// `volume_db` ; hors de la course, refusé.
+    device_volume_db: Option<f64>,
     /// #6721 — l'utilisateur CONFIRME une hausse de plus de 10 dB perçus en
     /// une fois (`audio::garde_de_hausse`). Absent ou `false` : une telle
     /// hausse est plafonnée au seuil. Jamais persisté.
@@ -662,6 +666,12 @@ mod zone_masquee_en_lecture_affichee_5077;
 mod zone_sans_appareil_guard;
 #[cfg(test)]
 mod zone_supprimee_en_pause_disparait_5322;
+
+// #7133 — une zone qui change d'appareil coupe celui qu'elle quitte.
+mod ancienne_sortie_coupee_7133;
+pub(crate) use ancienne_sortie_coupee_7133::couper_l_ancienne_sortie;
+#[cfg(test)]
+mod ancienne_sortie_coupee_7133_tests;
 
 pub async fn create_zone_handler(
     state: State<AppState>,
@@ -1658,6 +1668,9 @@ mod signal_path_conteneur_local_6166_tests;
 // #6334 — un AAC Tidal servi en WAV se dit AAC, sans profondeur de bits.
 #[cfg(test)]
 mod signal_path_aac_tidal_6334_tests;
+// #6946 — un titre Spotify se dit Ogg Vorbis 320 kbit/s, avec la raison.
+#[cfg(test)]
+mod signal_path_spotify_6946_tests;
 // #2029 — un DSD qui part en DoP se dit « over PCM (DoP) ».
 #[cfg(test)]
 mod signal_path_dop_2029_tests;

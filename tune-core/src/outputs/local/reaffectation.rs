@@ -68,11 +68,44 @@ pub(crate) fn rouvrir_pour_les_voies(
 
 /// #6230 (étape 2) — la règle, pure : des voies PILOTÉES par une grille ne
 /// s'ouvrent en exclusif que si la sortie en déclare au moins autant (pour
-/// WASAPI : le format du mixeur de l'endpoint). Un nombre déclaré illisible
-/// ou nul refuse : dans le doute, on rouvre au format de la source.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// WASAPI : le format du mixeur de l'endpoint ; pour ASIO : les sorties du
+/// pilote ; pour CoreAudio : le format physique en place). Un nombre déclaré
+/// illisible ou nul refuse : dans le doute, on rouvre au format de la source.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 pub(crate) fn voies_pilotees_permises(voies: u32, declarees: Option<u32>) -> bool {
     voies > 0 && declarees.is_some_and(|d| d > 0 && voies <= d)
+}
+
+/// #6230 (étape 2) — l'ouverture d'un transport exclusif ASIO ou CoreAudio
+/// quand une grille pilote les voies (6 → 2), sur le modèle du WASAPI
+/// exclusif (#6898) :
+///
+/// - les voies de la grille d'abord, PLAFONNÉES à celles que la sortie
+///   déclare : `ouvrir(voies, true)` ;
+/// - sur refus, `refusees` le dit, puis UNE réouverture au format de la
+///   source, l'ouverture d'avant : `ouvrir(canaux_source, false)` ;
+/// - sans grille qui pilote (ou une grille qui garde le nombre de voies), un
+///   seul appel, celui d'avant.
+///
+/// Rend la sortie et les voies pilotées obtenues (`None` : ouverte au format
+/// de la source). Le refus de la réouverture est celui d'avant.
+#[cfg_attr(
+    not(any(all(target_os = "windows", feature = "asio"), target_os = "macos")),
+    allow(dead_code)
+)]
+pub(crate) fn ouvrir_sur_les_voies_pilotees<T, E>(
+    voies_de_la_grille: Option<u16>,
+    canaux_source: u16,
+    mut ouvrir: impl FnMut(u16, bool) -> Result<T, E>,
+    refusees: impl FnOnce(u16, &E),
+) -> Result<(T, Option<u16>), E> {
+    if let Some(voies) = voies_de_la_grille.filter(|&voies| voies != canaux_source) {
+        match ouvrir(voies, true) {
+            Ok(sortie) => return Ok((sortie, Some(voies))),
+            Err(erreur) => refusees(voies, &erreur),
+        }
+    }
+    ouvrir(canaux_source, false).map(|sortie| (sortie, None))
 }
 
 /// Le créneau vide des étages montés hors d'une `LocalOutput` (témoins).
@@ -667,5 +700,74 @@ mod voies_pilotees_6230 {
         assert!(!voies_pilotees_permises(2, None));
         assert!(!voies_pilotees_permises(2, Some(0)));
         assert!(!voies_pilotees_permises(0, Some(2)));
+    }
+
+    /// Ce que rend [`ouvertures`] : les appels `(voies, plafonnée)` dans
+    /// l'ordre, les refus annoncés, et le résultat.
+    type Ouvertures = (
+        Vec<(u16, bool)>,
+        Vec<(u16, String)>,
+        Result<(u16, Option<u16>), String>,
+    );
+
+    /// #6230 (étape 2, ASIO et CoreAudio) — les ouvertures que fait
+    /// `ouvrir_sur_les_voies_pilotees` pour une sortie qui accepte
+    /// `acceptees` voies.
+    fn ouvertures(grille: Option<u16>, source: u16, acceptees: &[u16]) -> Ouvertures {
+        let mut appels = Vec::new();
+        let mut refus = Vec::new();
+        let rendu = super::ouvrir_sur_les_voies_pilotees(
+            grille,
+            source,
+            |voies, plafonnee| {
+                appels.push((voies, plafonnee));
+                if acceptees.contains(&voies) {
+                    Ok(voies)
+                } else {
+                    Err(format!("{voies} voie(s) refusée(s)"))
+                }
+            },
+            |voies, erreur: &String| refus.push((voies, erreur.clone())),
+        );
+        (appels, refus, rendu)
+    }
+
+    #[test]
+    fn asio_et_coreaudio_ouvrent_d_abord_les_voies_de_la_grille_plafonnees_6230() {
+        // Grille 6 → 2 sur un appareil qui accepte 2 voies : une seule
+        // ouverture, sur 2 voies, plafonnée aux voies déclarées.
+        let (appels, refus, rendu) = ouvertures(Some(2), 6, &[2, 6]);
+        assert_eq!(
+            appels,
+            [(2, true)],
+            "#6230 : la grille 6 → 2 armée doit ouvrir l'exclusif sur 2 voies, \
+             pas au format de la source"
+        );
+        assert!(refus.is_empty());
+        assert_eq!(rendu, Ok((2, Some(2))));
+    }
+
+    #[test]
+    fn un_refus_des_voies_de_la_grille_se_dit_puis_rouvre_au_format_source_6230() {
+        // L'appareil refuse 2 voies (ou en déclare moins) : le refus est
+        // annoncé, puis UNE réouverture au format de la source, non plafonnée.
+        let (appels, refus, rendu) = ouvertures(Some(2), 6, &[6]);
+        assert_eq!(appels, [(2, true), (6, false)]);
+        assert_eq!(refus, [(2, "2 voie(s) refusée(s)".to_string())]);
+        assert_eq!(rendu, Ok((6, None)));
+        // Les deux refusées : c'est le refus de l'ouverture d'avant qui part.
+        let (appels, _, rendu) = ouvertures(Some(2), 6, &[]);
+        assert_eq!(appels, [(2, true), (6, false)]);
+        assert_eq!(rendu, Err("6 voie(s) refusée(s)".to_string()));
+    }
+
+    #[test]
+    fn sans_grille_qui_pilote_l_ouverture_est_celle_d_avant_6230() {
+        for grille in [None, Some(6)] {
+            let (appels, refus, rendu) = ouvertures(grille, 6, &[2, 6]);
+            assert_eq!(appels, [(6, false)], "grille {grille:?}");
+            assert!(refus.is_empty());
+            assert_eq!(rendu, Ok((6, None)));
+        }
     }
 }

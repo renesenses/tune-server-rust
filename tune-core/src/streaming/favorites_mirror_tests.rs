@@ -16,10 +16,137 @@ use crate::streaming::traits::{
     AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamTrack, StreamUrl,
 };
 
+/// #6399 — 7 000 favoris, trois profils : une confirmation ne doit pas
+/// parcourir les 21 000 lignes. Le compteur SQLite mesure le travail réel de
+/// la requête de production, indépendamment de la charge de la machine.
+#[test]
+fn confirmer_un_favori_ne_balaie_pas_tout_le_miroir_6399() {
+    use rusqlite::{StatementStatus, params};
+
+    let db = SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&db).unwrap();
+    db.execute_batch(
+        "WITH RECURSIVE numeros(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM numeros WHERE n < 7000),
+         profils(p) AS (VALUES (1), (2), (3))
+         INSERT INTO streaming_favorites(profile_id, item_type, service, service_id, miroir_etat)
+         SELECT p, 'track', 'qobuz', CAST(n AS TEXT), 'ajout_en_attente' FROM numeros CROSS JOIN profils;
+         INSERT INTO streaming_favorites(profile_id, item_type, service, service_id, miroir_etat)
+         VALUES (1, 'track', 'tidal', '3500', 'ajout_en_attente'),
+                (1, 'album', 'qobuz', '3500', 'ajout_en_attente');",
+    )
+    .unwrap();
+    let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+    let sql = sql_poser_etat(&backend);
+    let conn = db.connection().lock().unwrap();
+    let mut stmt = conn.prepare(&sql).unwrap();
+    assert_eq!(
+        stmt.execute(params![
+            ETAT_SYNCHRO,
+            Option::<String>::None,
+            "qobuz",
+            "track",
+            "3500"
+        ])
+        .unwrap(),
+        3,
+        "la confirmation doit atteindre chaque profil du même favori"
+    );
+    let balayages = stmt.get_status(StatementStatus::FullscanStep);
+    assert_eq!(
+        balayages, 0,
+        "confirmer un favori ne doit pas balayer tout le miroir (#6399)"
+    );
+    assert!(
+        stmt.get_status(StatementStatus::VmStep) < 500,
+        "la confirmation doit rester bornée au favori des trois profils"
+    );
+    let autres: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM streaming_favorites WHERE service_id = '3500' AND miroir_etat = 'ajout_en_attente'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(autres, 2, "autre service et autre type restent intacts");
+    drop(stmt);
+    drop(conn);
+
+    // Une base déjà à la dernière version récupère aussi l'index au démarrage.
+    db.execute_batch("DROP INDEX idx_streaming_favorites_miroir")
+        .unwrap();
+    crate::db::migrations::run_migrations(&db).unwrap();
+    let conn = db.connection().lock().unwrap();
+    let mut stmt = conn.prepare(&sql).unwrap();
+    assert_eq!(
+        stmt.execute(params![
+            ETAT_SYNCHRO,
+            Option::<String>::None,
+            "qobuz",
+            "track",
+            "3501"
+        ])
+        .unwrap(),
+        3
+    );
+    assert_eq!(stmt.get_status(StatementStatus::FullscanStep), 0);
+}
+
+/// #6399 — un vrai déclencheur SQLite observe le fil qui écrit. Aucune
+/// hypothèse sur la vitesse du processeur ni délai d'ordonnancement : une
+/// écriture sur le fil de l'exécuteur est refusée par la base elle-même.
+#[tokio::test(flavor = "current_thread")]
+async fn la_reconciliation_sql_quitte_le_fil_asynchrone_6399() {
+    let dir = tempfile::tempdir().unwrap();
+    let chemin = dir.path().join("miroir.db");
+    let db = SqliteDb::open(chemin.to_str().unwrap()).unwrap();
+    db.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&db).unwrap();
+    let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+    let (arc, compte) = ServiceSimule::nouveau("temoin-fil-6399");
+    poser_chez_le_service(&compte, "tracks", "71");
+
+    let fil_asynchrone = std::thread::current().id();
+    db.connection()
+        .lock()
+        .unwrap()
+        .create_scalar_function(
+            "hors_executeur_6399",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            move |_| Ok(i64::from(std::thread::current().id() != fil_asynchrone)),
+        )
+        .unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER verifier_fil_miroir_6399 BEFORE INSERT ON streaming_favorites
+         BEGIN
+           SELECT CASE WHEN hors_executeur_6399() = 0
+             THEN RAISE(FAIL, 'le miroir ecrit sur le fil asynchrone (#6399)') END;
+         END;",
+    )
+    .unwrap();
+
+    let bilan = rafraichir(&arc, &backend, 1).await;
+    assert_eq!(
+        bilan.echecs, 0,
+        "la reconciliation SQL doit quitter le fil asynchrone : {:?}",
+        bilan.erreur
+    );
+    assert_eq!(bilan.ajoutes, 1, "le favori a réellement été écrit");
+    assert!(
+        StreamingFavoritesRepo::with_backend(backend)
+            .is_favorite(1, "track", "temoin-fil-6399", "71")
+            .unwrap()
+    );
+}
+
+/// Un favori chez le service : (titre, artiste, album, isrc).
+type Favori = (String, String, String, Option<String>);
+
 /// Le compte chez le service : `type pluriel → id → (titre, artiste, album, isrc)`.
 #[derive(Default)]
 struct Compte {
-    favoris: BTreeMap<String, BTreeMap<String, (String, String, String, Option<String>)>>,
+    favoris: BTreeMap<String, BTreeMap<String, Favori>>,
     /// Panne réseau : toute lecture et toute écriture échouent.
     panne: bool,
     /// Journal des écritures reçues : `"add tracks 71"`, `"remove albums 9"`.
@@ -192,7 +319,11 @@ impl StreamingService for ServiceSimule {
                         .take(coupe)
                         .map(|(id, (t, a, al, isrc))| match fav_type {
                             "artists" => json!({"id": id, "name": t}),
-                            "albums" => json!({"source_id": id, "title": t, "artist_name": a}),
+                            // #6482 — l'année et la qualité, comme la
+                            // projection `StreamAlbum` d'un vrai connecteur.
+                            "albums" => json!({"source_id": id, "title": t, "artist_name": a,
+                                               "year": 1959, "quality": {"codec": "FLAC",
+                                               "sample_rate": 192000, "bit_depth": 24}}),
                             _ => json!({"source_id": id, "title": t, "artist_name": a,
                                         "album_title": al, "isrc": isrc}),
                         })
@@ -1128,4 +1259,36 @@ async fn qobuz_favoris_tronques_aucun_favori_synchro_ne_disparait_5997() {
     // L'écran du service, lui, garde la coupe : rien n'y devient une erreur.
     let affichage = arc.read().await.get_user_tracks().await.expect("affichage");
     assert_eq!(affichage.len(), 1);
+}
+
+/// #6482 — le rafraîchissement du miroir (le chemin de Qobuz) range l'année et
+/// la qualité d'un album favori, pour chaque profil : une collection
+/// intelligente les lit pour classer les albums favoris comme les locaux.
+#[tokio::test]
+async fn le_miroir_range_l_annee_et_la_qualite_des_albums_6482() {
+    let (backend, profils, _dir) = base(2);
+    let (arc, compte) = ServiceSimule::nouveau("miroir-6482");
+    poser_chez_le_service(&compte, "albums", "9");
+    rafraichir(&arc, &backend, profils[0]).await;
+    let lignes: Vec<(i64, String, String, String)> = backend
+        .query_many(
+            "SELECT profile_id, year, sample_rate, bit_depth FROM streaming_favorites \
+             WHERE service = 'miroir-6482' AND service_id = '9' ORDER BY profile_id",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let t = |i: usize| r.get(i).and_then(|v| v.as_string()).unwrap_or_default();
+            (r[0].as_i64().unwrap_or(0), t(1), t(2), t(3))
+        })
+        .collect();
+    let attendu: Vec<(i64, String, String, String)> = profils
+        .iter()
+        .map(|&p| (p, "1959".into(), "192000".into(), "24".into()))
+        .collect();
+    assert_eq!(
+        lignes, attendu,
+        "l'année et la qualité de l'album favori doivent être rangées pour chaque profil"
+    );
 }

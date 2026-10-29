@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tokio::sync::oneshot;
 use tracing::warn;
@@ -165,13 +165,12 @@ pub fn reponse_relayee(resp: PendingResponse) -> Response {
 pub fn reponse_relayee_comptee(resp: PendingResponse, comptage: Option<Comptage>) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = Response::builder().status(status);
-
-    for (key, value) in &resp.headers {
-        if let Some(v) = value.as_str() {
-            response = response.header(key.as_str(), v);
-        }
+    if let Some(entetes) = response.headers_mut() {
+        *entetes = entetes_relayes(&resp.headers);
     }
 
+    // Le type d'ORIGINE, pour les compteurs seulement (pochette, format du
+    // flux) : le navigateur, lui, recoit celui de `entetes_relayes`.
     let content_type = resp
         .headers
         .iter()
@@ -233,6 +232,305 @@ pub fn reponse_relayee_comptee(resp: PendingResponse, comptage: Option<Comptage>
     response
         .body(corps)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// En-tetes de la reponse du serveur qui passent jusqu'au navigateur. Tout le
+/// reste est retire. `content-type` passe par [`type_relaye`].
+const ENTETES_RELAYES: [&str; 7] = [
+    "content-length",
+    "content-range",
+    "accept-ranges",
+    "etag",
+    "last-modified",
+    "cache-control",
+    "vary",
+];
+
+/// Types de contenu rendus tels quels, en plus de `audio/*`.
+const TYPES_RELAYES: [&str; 10] = [
+    "application/json",
+    "image/jpeg",
+    "image/bmp",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "image/avif",
+    "application/vnd.apple.mpegurl",
+    // Radios en Ogg (Ogg FLAC, Vorbis, Opus) annoncees sous ce type.
+    "application/ogg",
+    "text/plain",
+];
+
+const TYPE_PAR_DEFAUT: &str = "application/octet-stream";
+
+/// Le type de contenu rendu au navigateur : celui du serveur s'il fait partie
+/// de la liste, `application/octet-stream` sinon (ou s'il manque).
+pub(crate) fn type_relaye(brut: Option<&str>) -> HeaderValue {
+    let par_defaut = HeaderValue::from_static(TYPE_PAR_DEFAUT);
+    let Some(brut) = brut.map(str::trim) else {
+        return par_defaut;
+    };
+    let essence = brut
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let audio = essence.strip_prefix("audio/").is_some_and(|sous_type| {
+        !sous_type.is_empty()
+            && sous_type
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'_'))
+    });
+    if !audio && !TYPES_RELAYES.contains(&essence.as_str()) {
+        return par_defaut;
+    }
+    HeaderValue::from_str(brut).unwrap_or(par_defaut)
+}
+
+/// Les en-tetes d'une reponse relayee : la liste blanche du serveur, le type
+/// de contenu filtre, et les en-tetes de securite du relais.
+pub(crate) fn entetes_relayes(serveur: &serde_json::Map<String, serde_json::Value>) -> HeaderMap {
+    let mut entetes = HeaderMap::new();
+    let mut type_brut = None;
+    for (nom, valeur) in serveur {
+        let Some(valeur) = valeur.as_str() else {
+            continue;
+        };
+        let nom = nom.to_ascii_lowercase();
+        if nom == "content-type" {
+            type_brut = Some(valeur);
+            continue;
+        }
+        if !ENTETES_RELAYES.contains(&nom.as_str()) {
+            continue;
+        }
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(nom.as_bytes()),
+            HeaderValue::from_str(valeur),
+        ) {
+            entetes.insert(n, v);
+        }
+    }
+
+    let type_ = type_relaye(type_brut);
+    let affichable = type_.to_str().is_ok_and(|t| {
+        let t = t.trim_start().to_ascii_lowercase();
+        // La liste de lecture HLS et l'Ogg sont lus par le lecteur comme
+        // l'audio.
+        t.starts_with("image/")
+            || t.starts_with("audio/")
+            || t.starts_with("application/vnd.apple.mpegurl")
+            || t.starts_with("application/ogg")
+    });
+    entetes.insert(header::CONTENT_TYPE, type_);
+    entetes.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    entetes.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox; default-src 'none'"),
+    );
+    if !affichable {
+        entetes.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
+    entetes.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    entetes
+}
+
+#[cfg(test)]
+mod tests_entetes {
+    use super::*;
+
+    fn reponse(status: u16, entetes: &[(&str, &str)]) -> Response {
+        let mut map = serde_json::Map::new();
+        for (n, v) in entetes {
+            map.insert(
+                (*n).to_string(),
+                serde_json::Value::String((*v).to_string()),
+            );
+        }
+        reponse_relayee(PendingResponse {
+            status,
+            headers: map,
+            body: CorpsRelaye::Entier(Some(b"x".to_vec())),
+        })
+    }
+
+    fn entete<'a>(r: &'a Response, nom: &str) -> Option<&'a str> {
+        r.headers().get(nom).and_then(|v| v.to_str().ok())
+    }
+
+    #[test]
+    fn une_page_html_du_serveur_part_en_octets_bruts_et_bac_a_sable() {
+        for type_ in [
+            "text/html; charset=utf-8",
+            "TEXT/HTML",
+            "image/svg+xml",
+            "text/xml",
+            "application/xml",
+            "text/javascript",
+            "application/xhtml+xml",
+            "audio/",
+        ] {
+            let r = reponse(200, &[("Content-Type", type_)]);
+            assert_eq!(entete(&r, "content-type"), Some(TYPE_PAR_DEFAUT), "{type_}");
+            assert_eq!(
+                entete(&r, "x-content-type-options"),
+                Some("nosniff"),
+                "{type_}"
+            );
+            assert_eq!(
+                entete(&r, "content-security-policy"),
+                Some("sandbox; default-src 'none'"),
+                "{type_}"
+            );
+            assert_eq!(
+                entete(&r, "content-disposition"),
+                Some("attachment"),
+                "{type_}"
+            );
+            assert_eq!(
+                entete(&r, "cross-origin-resource-policy"),
+                Some("same-origin"),
+                "{type_}"
+            );
+        }
+        // Sans type du tout : octets bruts aussi.
+        let r = reponse(200, &[]);
+        assert_eq!(entete(&r, "content-type"), Some(TYPE_PAR_DEFAUT));
+    }
+
+    #[test]
+    fn les_entetes_hors_liste_sont_retires() {
+        let r = reponse(
+            302,
+            &[
+                ("Content-Type", "application/json"),
+                ("Set-Cookie", "a=b; Path=/"),
+                ("Location", "https://ailleurs.invalid/"),
+                ("Refresh", "0; url=https://ailleurs.invalid/"),
+                ("Content-Disposition", "inline"),
+                ("Content-Security-Policy", "default-src *"),
+                ("Access-Control-Allow-Origin", "*"),
+                ("Access-Control-Allow-Credentials", "true"),
+                ("X-Content-Type-Options", "sniff"),
+                ("ETag", "\"v1\""),
+                ("Cache-Control", "max-age=60"),
+                ("Vary", "Accept"),
+                ("Last-Modified", "Tue, 27 Oct 2026 08:00:00 GMT"),
+            ],
+        );
+        for retire in [
+            "set-cookie",
+            "location",
+            "refresh",
+            "access-control-allow-origin",
+            "access-control-allow-credentials",
+        ] {
+            assert!(
+                r.headers().get(retire).is_none(),
+                "{retire} doit etre retire"
+            );
+        }
+        assert_eq!(entete(&r, "content-disposition"), Some("attachment"));
+        assert_eq!(
+            entete(&r, "content-security-policy"),
+            Some("sandbox; default-src 'none'")
+        );
+        assert_eq!(entete(&r, "x-content-type-options"), Some("nosniff"));
+        assert_eq!(entete(&r, "content-type"), Some("application/json"));
+        assert_eq!(entete(&r, "etag"), Some("\"v1\""));
+        assert_eq!(entete(&r, "cache-control"), Some("max-age=60"));
+        assert_eq!(entete(&r, "vary"), Some("Accept"));
+        assert_eq!(
+            entete(&r, "last-modified"),
+            Some("Tue, 27 Oct 2026 08:00:00 GMT")
+        );
+    }
+
+    #[test]
+    fn pochettes_et_audio_gardent_type_et_plages() {
+        let r = reponse(
+            200,
+            &[("Content-Type", "image/jpeg"), ("Content-Length", "1")],
+        );
+        assert_eq!(entete(&r, "content-type"), Some("image/jpeg"));
+        assert_eq!(entete(&r, "content-length"), Some("1"));
+        assert!(r.headers().get("content-disposition").is_none());
+        assert_eq!(entete(&r, "x-content-type-options"), Some("nosniff"));
+
+        let r = reponse(
+            206,
+            &[
+                ("content-type", "audio/flac"),
+                ("content-range", "bytes 0-0/1000"),
+                ("accept-ranges", "bytes"),
+                ("content-length", "1"),
+            ],
+        );
+        assert_eq!(r.status(), 206);
+        assert_eq!(entete(&r, "content-type"), Some("audio/flac"));
+        assert_eq!(entete(&r, "content-range"), Some("bytes 0-0/1000"));
+        assert_eq!(entete(&r, "accept-ranges"), Some("bytes"));
+        assert_eq!(entete(&r, "content-length"), Some("1"));
+        assert!(r.headers().get("content-disposition").is_none());
+
+        // Lus par le lecteur ou affiches en <img> : type garde, sans
+        // telechargement force.
+        for type_ in [
+            "image/png",
+            "image/webp",
+            "image/gif",
+            "image/avif",
+            "image/bmp",
+            "audio/mpeg",
+            "audio/x-flac",
+            "audio/ogg",
+            "audio/ogg; codecs=flac",
+            "application/ogg",
+            "application/vnd.apple.mpegurl",
+        ] {
+            let r = reponse(200, &[("Content-Type", type_)]);
+            assert_eq!(entete(&r, "content-type"), Some(type_), "{type_}");
+            assert!(
+                r.headers().get("content-disposition").is_none(),
+                "{type_} ne doit pas etre telecharge"
+            );
+            assert_eq!(
+                entete(&r, "x-content-type-options"),
+                Some("nosniff"),
+                "{type_}"
+            );
+        }
+        // Une radio Ogg en plage garde ses en-tetes de plage.
+        let r = reponse(
+            206,
+            &[
+                ("Content-Type", "application/ogg"),
+                ("Content-Range", "bytes 0-0/1000"),
+                ("Accept-Ranges", "bytes"),
+            ],
+        );
+        assert_eq!(entete(&r, "content-type"), Some("application/ogg"));
+        assert_eq!(entete(&r, "content-range"), Some("bytes 0-0/1000"));
+        assert_eq!(entete(&r, "accept-ranges"), Some("bytes"));
+        // Donnees : type garde, telechargement force hors navigation.
+        for type_ in [
+            "text/plain; charset=utf-8",
+            "application/json; charset=utf-8",
+        ] {
+            let r = reponse(200, &[("Content-Type", type_)]);
+            assert_eq!(entete(&r, "content-type"), Some(type_), "{type_}");
+        }
+    }
 }
 
 #[cfg(test)]

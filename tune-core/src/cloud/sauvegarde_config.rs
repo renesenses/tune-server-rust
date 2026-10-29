@@ -155,6 +155,8 @@ const EXCLUS_EXACTS: &[&str] = &["server_id", "owner_profile_id", "music_dirs"];
 /// - `library_`, `scan_`, `last_` : la bibliothèque et des états ;
 /// - le reste : appairages, sauvegardes de base (chemins locaux), matériel.
 const EXCLUS_PREFIXES: &[&str] = &[
+    // #7286 — réponses HTTP régénérables, pas des personnalisations.
+    "cache:",
     "mozaik_",
     "cloud_",
     "config_backup_",

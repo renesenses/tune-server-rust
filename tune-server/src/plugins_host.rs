@@ -880,7 +880,7 @@ pub(crate) fn plugins_dir() -> PathBuf {
 /// next startup. Returns the manifest id. The manifest inside the archive is
 /// authoritative — the store slug or package name never names the directory.
 pub(crate) fn persist_plugin_archive(data: &[u8]) -> Result<String, String> {
-    persist_plugin_archive_in(&plugins_dir(), data)
+    persist_plugin_archive_in(&install_root(), data)
 }
 
 /// [`persist_plugin_archive`] with an explicit destination root, split out so
@@ -946,24 +946,233 @@ fn persist_plugin_archive_in(root: &Path, data: &[u8]) -> Result<String, String>
     Ok(manifest.id)
 }
 
-/// Remove an installed wasm plugin's directory, if present. Returns whether a
-/// directory was actually removed. The same id sanitation as install applies —
-/// the id comes back from HTTP here, so it must never traverse.
-pub(crate) fn remove_plugin_dir(id: &str) -> Result<bool, String> {
-    if id.is_empty()
-        || !id
+/// Where the wasm plugins *shipped with the installation* live (read-only in
+/// the Docker image, on Tune OS RPi4 images, behind a signed `.app`…), plus
+/// where the ones the user installs go.
+///
+/// - [`plugins_dir`] stays the **shipped** root, the one every existing
+///   deployment already scans.
+/// - [`user_plugins_dir`] is a second root, **under the data folder** (`/data`
+///   in Docker), which the server user owns. Marketplace installs land there
+///   and an uninstall really removes them.
+///
+/// Scan order: user root first, so a user-installed copy shadows a shipped
+/// one with the same id.
+pub(crate) fn plugin_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(user) = user_plugins_dir() {
+        roots.push(user);
+    }
+    let shipped = plugins_dir();
+    if !roots.contains(&shipped) {
+        roots.push(shipped);
+    }
+    roots
+}
+
+/// Where a new marketplace install is written: the user root when there is
+/// one (data folder, always writable by the server), otherwise the single
+/// historical root.
+pub(crate) fn install_root() -> PathBuf {
+    user_plugins_dir().unwrap_or_else(plugins_dir)
+}
+
+/// The writable per-installation plugins root, if any. See
+/// [`resolve_user_plugins_dir`] for the rules.
+pub(crate) fn user_plugins_dir() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    resolve_user_plugins_dir(
+        std::env::var("TUNE_PLUGINS_USER_DIR").ok(),
+        std::env::var("TUNE_PLUGINS_DIR").ok(),
+        std::env::var("TUNE_DATA_DIR").ok(),
+        std::env::var("TUNE_DB_PATH").ok(),
+        &cwd,
+    )
+}
+
+/// Pure resolution behind [`user_plugins_dir`]:
+/// 1. `TUNE_PLUGINS_USER_DIR` when set and non-empty;
+/// 2. none when `TUNE_PLUGINS_DIR` is set: an operator (or a test) that names
+///    the plugins folder gets the single-root behaviour it always had;
+/// 3. `<data folder>/plugins`, the data folder being resolved like the
+///    database's (`TUNE_DATA_DIR`, else the folder of `TUNE_DB_PATH`);
+/// 4. none otherwise (no data folder known, in-memory database).
+fn resolve_user_plugins_dir(
+    user_env: Option<String>,
+    plugins_dir_env: Option<String>,
+    data_dir_env: Option<String>,
+    db_path_env: Option<String>,
+    cwd: &Path,
+) -> Option<PathBuf> {
+    let non_empty = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+    if let Some(dir) = non_empty(user_env) {
+        return Some(PathBuf::from(dir));
+    }
+    if plugins_dir_env.is_some() {
+        return None;
+    }
+    let data_dir = non_empty(data_dir_env);
+    let db_path = non_empty(db_path_env).filter(|p| p != ":memory:");
+    if data_dir.is_none() && db_path.is_none() {
+        return None;
+    }
+    Some(
+        crate::gel_executeur::dossier_de_donnees(
+            data_dir.as_deref(),
+            db_path.as_deref().unwrap_or(""),
+            cwd,
+        )
+        .join("plugins"),
+    )
+}
+
+/// What [`remove_plugin_dir`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Removal {
+    /// No plugin of that id on disk.
+    Absent,
+    /// The plugin's folder was deleted.
+    Removed,
+    /// The folder is **shipped with the installation and read-only** (Docker
+    /// image, locked-down Tune OS, signed bundle…). Nothing was touched: the
+    /// caller must disable and hide the plugin instead, persistently.
+    ReadOnlyShipped,
+}
+
+/// A plugin removal that failed for a reason the user can act on. Carries a
+/// stable `code` (for the API and the i18n key), never a raw path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemovalError {
+    pub code: &'static str,
+    /// Diagnostic for the **log only** (contains the OS error and path).
+    pub detail: String,
+}
+
+impl RemovalError {
+    fn from_io(op: &str, dir: &Path, e: &std::io::Error) -> Self {
+        let code = match e.kind() {
+            std::io::ErrorKind::PermissionDenied => "permission_denied",
+            std::io::ErrorKind::NotFound => "not_found",
+            _ if is_read_only_fs(e) => "read_only",
+            _ => "io",
+        };
+        Self {
+            code,
+            detail: format!("{op} {}: {e}", dir.display()),
+        }
+    }
+}
+
+fn is_read_only_fs(e: &std::io::Error) -> bool {
+    // EROFS = 30 on Linux and macOS; Windows has no equivalent code worth
+    // matching (read-only attributes surface as PermissionDenied).
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(30)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// Can `dir` (a plugin folder) be deleted by this process? Probed by really
+/// creating then removing a file in the folder **and** in its parent: removing
+/// a directory needs write access to both, and `readonly()` mode bits lie on
+/// read-only mounts and for root-owned trees alike.
+fn removable(dir: &Path) -> bool {
+    fn can_write_in(folder: &Path) -> bool {
+        let probe = folder.join(format!(".tune-removal-probe-{}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(file) => {
+                drop(file);
+                let _ = std::fs::remove_file(&probe);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+    can_write_in(dir) && dir.parent().is_none_or(can_write_in)
+}
+
+fn safe_plugin_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(format!("unsafe plugin id: {id:?}"));
+}
+
+/// Remove an installed wasm plugin, wherever it lives. The same id sanitation
+/// as install applies — the id comes back from HTTP here, so it must never
+/// traverse.
+///
+/// Every root is visited, user root first. A folder this process cannot delete
+/// (read-only shipped plugin) is **left alone** and reported as
+/// [`Removal::ReadOnlyShipped`]: the image's code must not become writable by
+/// the server just to honour an uninstall.
+pub(crate) fn remove_plugin_dir(id: &str) -> Result<Removal, RemovalError> {
+    remove_plugin_dir_in(&plugin_roots(), id)
+}
+
+fn remove_plugin_dir_in(roots: &[PathBuf], id: &str) -> Result<Removal, RemovalError> {
+    if !safe_plugin_id(id) {
+        return Err(RemovalError {
+            code: "unsafe_id",
+            detail: format!("unsafe plugin id: {id:?}"),
+        });
     }
-    let dir = plugins_dir().join(id);
-    if !dir.join("manifest.json").exists() {
-        return Ok(false);
+    let mut outcome = Removal::Absent;
+    for root in roots {
+        let dir = root.join(id);
+        if !dir.join("manifest.json").exists() {
+            continue;
+        }
+        if !removable(&dir) {
+            warn!(id = %id, dir = %dir.display(), "plugin_dir_read_only_shipped");
+            outcome = Removal::ReadOnlyShipped;
+            continue;
+        }
+        std::fs::remove_dir_all(&dir).map_err(|e| RemovalError::from_io("remove", &dir, &e))?;
+        info!(id = %id, dir = %dir.display(), "plugin_dir_removed");
+        if outcome == Removal::Absent {
+            outcome = Removal::Removed;
+        }
     }
-    std::fs::remove_dir_all(&dir).map_err(|e| format!("remove {}: {e}", dir.display()))?;
-    info!(id = %id, dir = %dir.display(), "plugin_dir_removed");
-    Ok(true)
+    Ok(outcome)
+}
+
+/// Every wasm plugin found under every root, one entry per id (the first root
+/// wins, i.e. the user's copy shadows a shipped one). A root that cannot be
+/// read is skipped; the call fails only when **all** of them fail.
+pub(crate) async fn scan_all_roots() -> Result<Vec<tune_core::plugins::PluginInfo>, String> {
+    scan_roots(&plugin_roots()).await
+}
+
+async fn scan_roots(roots: &[PathBuf]) -> Result<Vec<tune_core::plugins::PluginInfo>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut all = Vec::new();
+    let mut errors = Vec::new();
+    for root in roots {
+        match PluginManager::new(root.clone()).scan().await {
+            Ok(infos) => {
+                for info in infos {
+                    if seen.insert(info.manifest.id.clone()) {
+                        all.push(info);
+                    }
+                }
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    if all.is_empty() && !errors.is_empty() && errors.len() == roots.len() {
+        return Err(errors.join("; "));
+    }
+    Ok(all)
 }
 
 /// Pure resolution logic behind [`plugins_dir`], split out so it is testable
@@ -1083,13 +1292,11 @@ pub async fn load_wasm_plugins(state: &AppState) {
         return;
     }
 
-    let dir = plugins_dir();
-    let manager = PluginManager::new(dir.clone());
-    let infos = match manager.scan().await {
+    let infos = match scan_all_roots().await {
         Ok(infos) => infos,
         Err(e) => {
             // A missing dir returns Ok(empty); this is a real read error.
-            warn!(dir = %dir.display(), error = %e, "wasm_plugins_scan_failed");
+            warn!(dirs = ?plugin_roots(), error = %e, "wasm_plugins_scan_failed");
             let _ = state.wasm_plugins.set(WasmRegistry {
                 plugins: HashMap::new(),
             });
@@ -1115,8 +1322,10 @@ pub async fn load_wasm_plugins(state: &AppState) {
             .flatten()
             .map(|v| v != "false")
             .unwrap_or(true);
-        if !enabled {
-            debug!(id = %id, "wasm_plugin_skipped_disabled");
+        // Uninstalled while shipped read-only: kept on disk, never loaded.
+        let hidden = crate::plugins::greffon_masque(&settings, &id);
+        if !enabled || hidden {
+            debug!(id = %id, hidden, "wasm_plugin_skipped_disabled");
             continue;
         }
 
@@ -1800,6 +2009,200 @@ mod la_sonde_wasm_ne_bloque_pas_l_executeur_5403 {
             debut.elapsed() < Duration::from_secs(10),
             "le fils devait être tué au délai : {:?}",
             debut.elapsed()
+        );
+    }
+}
+
+/// #7067 — désinstaller un greffon fourni dans un dossier en lecture seule
+/// (image Docker, Tune OS RPi4) : le dossier reste intact et l'issue est
+/// dite, au lieu d'un « Permission denied (os error 13) » brut.
+#[cfg(test)]
+mod retrait_tests {
+    use super::{
+        Removal, RemovalError, remove_plugin_dir_in, resolve_user_plugins_dir, scan_roots,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn greffon(root: &Path, id: &str) -> PathBuf {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::json!({
+                "id": id, "name": id, "version": "0.1.0", "description": "t",
+                "author": "t", "entry_point": "main.wasm", "permissions": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.wasm"), b"\0asm").unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn en_lecture_seule(root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut dossiers = vec![root.to_path_buf()];
+        let mut i = 0;
+        while i < dossiers.len() {
+            for e in std::fs::read_dir(&dossiers[i]).unwrap().flatten() {
+                if e.path().is_dir() {
+                    dossiers.push(e.path());
+                }
+            }
+            i += 1;
+        }
+        for d in dossiers.iter().rev() {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn rendre_inscriptible(root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for d in [root.join("playlists-converter"), root.to_path_buf()] {
+            let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// Vrai si le processus ignore les bits de permission (root) : le cas ne
+    /// peut alors pas être reproduit.
+    #[cfg(unix)]
+    fn permissions_ignorees(root: &Path) -> bool {
+        std::fs::write(root.join("sonde"), b"x").is_ok()
+    }
+
+    /// Le défaut : un dossier fourni en lecture seule n'est ni supprimé ni
+    /// source d'erreur, il est signalé `ReadOnlyShipped`.
+    ///
+    /// Contre-épreuve : retirer la sonde `removable` dans `remove_plugin_dir_in`
+    /// refait lever « Permission denied » (`Err`) et fait rougir ce test.
+    #[cfg(unix)]
+    #[test]
+    fn un_greffon_fourni_en_lecture_seule_est_signale_et_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let racine = tmp.path().join("plugins");
+        let dir = greffon(&racine, "playlists-converter");
+        en_lecture_seule(&racine);
+        if permissions_ignorees(&racine) {
+            rendre_inscriptible(&racine);
+            eprintln!("processus root : cas non reproductible, essai ignoré");
+            return;
+        }
+        let retrait = remove_plugin_dir_in(std::slice::from_ref(&racine), "playlists-converter");
+        rendre_inscriptible(&racine);
+        assert_eq!(
+            retrait,
+            Ok(Removal::ReadOnlyShipped),
+            "un dossier fourni en lecture seule ne doit pas lever d'erreur système"
+        );
+        assert!(
+            dir.join("manifest.json").exists(),
+            "le dossier fourni reste intact"
+        );
+        assert!(dir.join("main.wasm").exists());
+    }
+
+    /// La copie de l'utilisateur est réellement supprimée, la fournie reste.
+    #[cfg(unix)]
+    #[test]
+    fn la_copie_de_l_utilisateur_est_supprimee_la_fournie_est_signalee() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fournis = tmp.path().join("app-plugins");
+        let utilisateur = tmp.path().join("data-plugins");
+        let fourni = greffon(&fournis, "playlists-converter");
+        let perso = greffon(&utilisateur, "playlists-converter");
+        let autre = greffon(&utilisateur, "autre");
+        en_lecture_seule(&fournis);
+        if permissions_ignorees(&fournis) {
+            rendre_inscriptible(&fournis);
+            return;
+        }
+        let retrait = remove_plugin_dir_in(&[utilisateur, fournis.clone()], "playlists-converter");
+        rendre_inscriptible(&fournis);
+        assert_eq!(retrait, Ok(Removal::ReadOnlyShipped));
+        assert!(
+            !perso.exists(),
+            "le greffon installé par l'utilisateur est supprimé"
+        );
+        assert!(autre.exists(), "les autres greffons restent");
+        assert!(fourni.exists());
+    }
+
+    #[test]
+    fn un_greffon_inscriptible_est_supprime_et_l_absent_est_dit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let racine = tmp.path().join("plugins");
+        let dir = greffon(&racine, "party");
+        let racines = std::slice::from_ref(&racine);
+        assert_eq!(remove_plugin_dir_in(racines, "party"), Ok(Removal::Removed));
+        assert!(!dir.exists());
+        assert_eq!(remove_plugin_dir_in(racines, "party"), Ok(Removal::Absent));
+        assert_eq!(
+            remove_plugin_dir_in(racines, "../x").unwrap_err().code,
+            "unsafe_id"
+        );
+    }
+
+    #[test]
+    fn les_erreurs_d_e_s_deviennent_un_code_sans_chemin() {
+        let dir = Path::new("/app/plugins/playlists-converter");
+        let refus = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let e = RemovalError::from_io("remove", dir, &refus);
+        assert_eq!(e.code, "permission_denied");
+        let autre = std::io::Error::other("disque");
+        assert_eq!(RemovalError::from_io("remove", dir, &autre).code, "io");
+        #[cfg(unix)]
+        assert_eq!(
+            RemovalError::from_io("remove", dir, &std::io::Error::from_raw_os_error(30)).code,
+            "read_only"
+        );
+    }
+
+    #[tokio::test]
+    async fn le_balayage_fusionne_les_racines_et_la_copie_utilisateur_prime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let utilisateur = tmp.path().join("u");
+        let fournis = tmp.path().join("f");
+        greffon(&fournis, "a");
+        greffon(&fournis, "b");
+        greffon(&utilisateur, "b");
+        let infos = scan_roots(&[utilisateur.clone(), fournis]).await.unwrap();
+        let mut ids: Vec<_> = infos.iter().map(|i| i.manifest.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, ["a", "b"], "un identifiant, une entrée");
+        let b = infos.iter().find(|i| i.manifest.id == "b").unwrap();
+        assert!(b.path.starts_with(utilisateur.to_str().unwrap()));
+    }
+
+    #[test]
+    fn le_dossier_utilisateur_des_greffons_suit_le_dossier_de_donnees() {
+        let cwd = Path::new("/srv");
+        let s = |v: &str| Some(v.to_string());
+        // Docker : TUNE_DB_PATH=/data/tune.db.
+        assert_eq!(
+            resolve_user_plugins_dir(None, None, None, s("/data/tune.db"), cwd),
+            Some(PathBuf::from("/data/plugins"))
+        );
+        // Tune OS : TUNE_DATA_DIR prime.
+        assert_eq!(
+            resolve_user_plugins_dir(None, None, s("/opt/tune/data"), s("x.db"), cwd),
+            Some(PathBuf::from("/opt/tune/data/plugins"))
+        );
+        // Réglage explicite.
+        assert_eq!(
+            resolve_user_plugins_dir(s("/mnt/p"), s("/app/plugins"), None, None, cwd),
+            Some(PathBuf::from("/mnt/p"))
+        );
+        // Un dossier de greffons imposé, ou aucune donnée : une seule racine.
+        assert_eq!(
+            resolve_user_plugins_dir(None, s("/app/plugins"), s("/data"), None, cwd),
+            None
+        );
+        assert_eq!(resolve_user_plugins_dir(None, None, None, None, cwd), None);
+        assert_eq!(
+            resolve_user_plugins_dir(None, None, None, s(":memory:"), cwd),
+            None
         );
     }
 }

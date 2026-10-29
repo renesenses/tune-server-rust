@@ -237,7 +237,7 @@ pub fn reset_envelope(
 const OBFUSCATION_KEY: &[u8; 32] = b"TuneConfigBackup2026-obfuscate!!";
 
 fn deobfuscate(encoded: &str) -> Result<Vec<u8>, String> {
-    if encoded.len() % 2 != 0 {
+    if !encoded.len().is_multiple_of(2) {
         return Err("odd-length hex string".into());
     }
     let xored: Vec<u8> = (0..encoded.len())
@@ -399,7 +399,7 @@ pub(crate) fn export_zones(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, S
 /// c'est la seconde identité (après `output_device_id`) par laquelle la
 /// restauration retrouve l'appareil. Base antérieure à la colonne : rien
 /// n'est ajouté.
-fn ajouter_les_mac(backend: &Arc<dyn DbBackend>, zones: &mut [Value]) {
+pub(crate) fn ajouter_les_mac(backend: &Arc<dyn DbBackend>, zones: &mut [Value]) {
     let Ok(lignes) = backend.query_many("SELECT id, mac FROM zones", &[]) else {
         return;
     };
@@ -416,9 +416,10 @@ fn ajouter_les_mac(backend: &Arc<dyn DbBackend>, zones: &mut [Value]) {
     }
 }
 
-fn export_settings(
-    backend: &Arc<dyn DbBackend>,
-) -> Result<(Vec<(String, String)>, Vec<Value>, Vec<Value>), String> {
+/// Réglages généraux (clé, valeur), préréglages d'égaliseur et profils de pièce.
+type ReglagesExportes = (Vec<(String, String)>, Vec<Value>, Vec<Value>);
+
+fn export_settings(backend: &Arc<dyn DbBackend>) -> Result<ReglagesExportes, String> {
     let settings = SettingsRepo::with_backend(backend.clone());
     let all = settings.all()?;
 
@@ -817,7 +818,11 @@ fn premier_id(rows: Option<Vec<SqlValue>>) -> Option<i64> {
 
 /// La zone (masquée ou non) dont l'appareil a cette MAC et ce type — une
 /// SEULE, sinon rien (même règle que le ré-ancrage par MAC, #3919).
-fn zone_par_mac(backend: &Arc<dyn DbBackend>, mac: &str, output_type: Option<&str>) -> Option<i64> {
+pub(crate) fn zone_par_mac(
+    backend: &Arc<dyn DbBackend>,
+    mac: &str,
+    output_type: Option<&str>,
+) -> Option<i64> {
     let lignes = backend
         .query_many("SELECT id, mac, output_type FROM zones", &[])
         .ok()?;
@@ -904,16 +909,11 @@ fn import_zones(
             ));
             continue;
         }
-        // #2886 — `as_i64()` rendait None des que le volume
-        // sauvegarde portait une virgule, et la restauration
-        // reposait alors 50 % en travers du reglage de l'utilisateur.
-        //
-        // Le `unwrap_or(50.0)` reste un niveau INVENTE quand le champ manque :
-        // une sauvegarde sans `volume` repose 50 % en travers du reglage, tout
-        // comme la virgule le faisait. Signale, pas corrige ici — le sujet de
-        // ce correctif est le volume fixe, et changer ce defaut demande de
-        // decider ce que vaut une sauvegarde muette sur le volume.
-        let volume = z["volume"].as_f64().unwrap_or(50.0);
+        // #2886 : conserver la précision ; #6774 : ne jamais inventer
+        // un niveau lorsqu'il manque ou n'est pas valide dans l'archive.
+        let volume = z["volume"]
+            .as_f64()
+            .filter(|v| v.is_finite() && (0.0..=100.0).contains(v));
         let muted = z["muted"].as_i64().unwrap_or(0);
         let gapless_enabled = z["gapless_enabled"].as_i64().unwrap_or(1);
         let max_sample_rate = z["max_sample_rate"].as_i64();
@@ -937,7 +937,17 @@ fn import_zones(
         // et la prochaine commande de volume l'enverrait a l'appareil. On ne
         // devine aucun niveau de remplacement : sans memoire, on laisse en
         // place ce qui existe (UPDATE) ou le defaut du schema (INSERT).
-        let restaurer_le_volume = z["fixed_volume"].as_i64().unwrap_or(0) == 0;
+        let identite_sure = existing
+            .map(|(_, sure, _)| sure)
+            .unwrap_or(output_device_id.is_some());
+        let restaurer_le_volume =
+            z["fixed_volume"].as_i64().unwrap_or(0) == 0 && identite_sure && volume.is_some();
+        if identite_sure && volume.is_none() {
+            warn!(zone = %name, "config_import_volume_absent_ou_invalide_conserve");
+            warnings.push(format!(
+                "zone '{name}': missing or invalid volume; current/default level kept"
+            ));
+        }
 
         let arrivee = if let Some((id, sure, garder_l_appareil)) = existing {
             let mut affectations: Vec<&str> = Vec::with_capacity(8);

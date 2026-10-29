@@ -7,8 +7,16 @@
 //!    (`album/get`, servi par le cache d'album de #2190) — à condition que le
 //!    nom du label Qobuz concorde, un album mal étiqueté ne doit pas donner
 //!    son logo à un autre label ;
-//! 2. sinon `label/search`, et seul un résultat dont le nom concorde exactement
-//!    ([`noms_concordent`]) est retenu.
+//! 2. sinon une recherche d'ALBUMS au catalogue (`catalog/search`,
+//!    `type=albums`) sur le nom du label : chaque album rendu porte son label
+//!    (`label.id`, `label.name`), et seul un label dont le nom concorde
+//!    exactement ([`noms_concordent`]) est retenu.
+//!
+//! #7064 — la voie 2 appelait `label/search`, qui N'EXISTE PAS dans l'API
+//! Qobuz. Mesuré sur le .18 le 26/10/2026 : 33 appels, tous refusés en
+//! direct puis par le relais par un 503 `{"message":"no Service found with
+//! those values"}`. Chaque label était inscrit en erreur, sans identifiant
+//! Qobuz, et aucun logo n'a jamais été rapproché.
 //!
 //! Puis `label/get` pour la fiche du label, dont on lit l'image. Au plus trois
 //! appels par label, et un label n'est demandé qu'une fois par délai (voir
@@ -54,14 +62,17 @@ pub(crate) fn image_de_label(fiche: &serde_json::Value) -> Option<String> {
     None
 }
 
-/// Le premier label d'une réponse `label/search` dont le nom concorde.
+/// Combien d'albums la recherche ramène pour y lire les labels.
+const ALBUMS_PAR_RECHERCHE: &str = "50";
+
+/// Le premier label, parmi les albums d'une réponse `catalog/search`
+/// (`type=albums`), dont le nom concorde.
 pub(crate) fn label_concordant(reponse: &serde_json::Value, nom: &str) -> Option<(String, String)> {
-    let items = reponse["labels"]["items"]
-        .as_array()
-        .or_else(|| reponse["items"].as_array())?;
-    items.iter().find_map(|it| {
-        let n = it["name"].as_str()?;
-        noms_concordent(n, nom).then(|| identifiant(&it["id"]).map(|id| (id, n.to_string())))?
+    let items = reponse["albums"]["items"].as_array()?;
+    items.iter().find_map(|album| {
+        let label = &album["label"];
+        let n = label["name"].as_str()?;
+        noms_concordent(n, nom).then(|| identifiant(&label["id"]).map(|id| (id, n.to_string())))?
     })
 }
 
@@ -84,7 +95,14 @@ impl CatalogueDeLabels for QobuzService {
         }
         if candidat.is_none() {
             let reponse = self
-                .api_get("/label/search", &[("query", nom), ("limit", "10")])
+                .api_get(
+                    "/catalog/search",
+                    &[
+                        ("query", nom),
+                        ("type", "albums"),
+                        ("limit", ALBUMS_PAR_RECHERCHE),
+                    ],
+                )
                 .await?;
             candidat = label_concordant(&reponse, nom);
         }
@@ -96,6 +114,7 @@ impl CatalogueDeLabels for QobuzService {
             image_url: image_de_label(&fiche),
             id,
             nom: nom_qobuz,
+            attribution: None,
         }))
     }
 
@@ -156,9 +175,10 @@ mod tests {
 
     #[test]
     fn la_recherche_ne_retient_qu_un_nom_qui_concorde() {
-        let r = json!({"labels": {"items": [
-            {"id": 1, "name": "Warp Records"},
-            {"id": "2", "name": "Warp"}
+        let r = json!({"albums": {"items": [
+            {"id": "a", "title": "Warp 10", "label": {"id": 1, "name": "Warp Records"}},
+            {"id": "b", "title": "Sans label"},
+            {"id": "c", "title": "Selected", "label": {"id": "2", "name": "Warp"}}
         ]}});
         assert_eq!(
             label_concordant(&r, "warp"),
@@ -168,6 +188,9 @@ mod tests {
     }
 
     /// Un Qobuz simulé (aucun appel réseau réel) qui journalise ses routes.
+    /// Une méthode inconnue y reçoit ce que le vrai Qobuz répond (mesuré sur
+    /// le .18 le 26/10/2026 pour `label/search`) : 503, « no Service found
+    /// with those values ».
     async fn qobuz_simule() -> (String, Arc<Mutex<Vec<String>>>) {
         let journal = Arc::new(Mutex::new(Vec::new()));
         let (j1, j2, j3) = (journal.clone(), journal.clone(), journal.clone());
@@ -188,15 +211,18 @@ mod tests {
                 }),
             )
             .route(
-                "/label/search",
+                "/catalog/search",
                 get(move |Query(q): Query<Carte<String, String>>| {
-                    j2.lock()
-                        .unwrap()
-                        .push(format!("label/search {}", q["query"]));
+                    j2.lock().unwrap().push(format!(
+                        "catalog/search {} {}",
+                        q["query"],
+                        q.get("type").map_or("", String::as_str)
+                    ));
                     async move {
-                        Json(json!({"labels": {"total": 2, "items": [
-                            {"id": 5, "name": "ECM Records"},
-                            {"id": 9, "name": "ECM"}
+                        Json(json!({"query": q["query"], "albums": {"total": 3, "items": [
+                            {"id": "e1", "title": "Köln", "label": {"id": 5, "name": "ECM Records"}},
+                            {"id": "e2", "title": "Rarum"},
+                            {"id": "e3", "title": "Arbour Zena", "label": {"id": 9, "name": "ECM"}}
                         ]}}))
                     }
                 }),
@@ -212,7 +238,13 @@ mod tests {
                                     "image": "https://static.qobuz.test/label.jpg"}))
                     }
                 }),
-            );
+            )
+            .fallback(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"message": "no Service found with those values"})),
+                )
+            });
         let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let adresse = ecoute.local_addr().unwrap();
         tokio::spawn(async move {
@@ -237,7 +269,7 @@ mod tests {
         );
         assert_eq!(
             *journal.lock().unwrap(),
-            vec!["label/search ecm", "label/get 9"]
+            vec!["catalog/search ecm albums", "label/get 9"]
         );
     }
 
@@ -270,7 +302,7 @@ mod tests {
         assert_eq!(label.id, "9");
         assert_eq!(
             *journal.lock().unwrap(),
-            vec!["album/get 0602", "label/search ECM", "label/get 9"]
+            vec!["album/get 0602", "catalog/search ECM albums", "label/get 9"]
         );
     }
 }

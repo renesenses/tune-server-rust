@@ -209,6 +209,11 @@ jobs:
       # albums par titre et par artiste, listes de lecture) : le tri se fait en
       # Rust, et doit rendre le même ordre, les mêmes pages et le même saut par
       # lettre que sur SQLite.
+      - name: Étiqueter tout le résultat d'un filtre Oxygen sur PostgreSQL (#7128)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test etiquetage_par_filtre_7128 -- --nocapture --test-threads=1
+
       - name: Ordre alphabetique des listes REST sur PostgreSQL (#4956)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -645,6 +650,14 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test exemplaires_par_repertoire_4907 -- --nocapture --test-threads=1
+
+      # #6917 -- ne dedoublonner que les copies d'une meme racine de musique :
+      # le vrai scan et le nettoyage sur deux racines, option allumee puis
+      # eteinte. Le meme fichier tourne sur SQLite dans `ci.yml`.
+      - name: Dedoublonnage par racine sur PostgreSQL (#6917)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test dedoublonnage_par_racine_6917 -- --nocapture --test-threads=1
 
       # #3569 -- les E2E historiques de `postgres_e2e.rs`, ENFIN executees.
       #

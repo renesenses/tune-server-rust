@@ -320,9 +320,17 @@ async fn install_plugin(
             let plugin_id = match crate::plugins::persist_wasm_archive(&data) {
                 Ok(id) => id,
                 Err(e) => {
+                    // Raw cause (paths, OS error) to the log only.
+                    warn!(slug = %slug, error = %e, "plugin_archive_persist_failed");
+                    let texte = crate::i18n::t(
+                        &crate::i18n::lang_from_header(&headers),
+                        "plugin.install.failed",
+                    );
                     return (
                         StatusCode::BAD_GATEWAY,
-                        Json(json!({ "error": "install_failed", "detail": e })),
+                        Json(
+                            json!({ "error": "install_failed", "detail": texte, "message": texte }),
+                        ),
                     )
                         .into_response();
                 }
@@ -370,6 +378,8 @@ async fn install_plugin(
             if let Err(e) = settings.set(&enabled_key, "true") {
                 return panne_de_stockage("drapeau_actif", e);
             }
+            // A shipped plugin uninstalled earlier comes back.
+            crate::plugins::demasquer_greffon(&settings, &plugin_id);
 
             Json(json!({
                 "status": "installed",
@@ -394,7 +404,9 @@ async fn install_plugin(
 async fn uninstall_plugin(
     Path(slug): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // Retrait et persistance dans la même transaction : le répertoire n'est
@@ -428,11 +440,12 @@ async fn uninstall_plugin(
         plugin_id = match wasm_installed_without_store_record(&installed_slug).await {
             Ok(id) => id,
             Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "uninstall_failed", "detail": e })),
-                )
-                    .into_response();
+                // Raw cause to the log, a translated sentence to the user.
+                warn!(slug = %slug, error = %e, "plugin_uninstall_lookup_failed");
+                return crate::plugins::reponse_retrait_impossible(
+                    &lang,
+                    &crate::plugins::RetraitImpossible { code: "io" },
+                );
             }
         };
     }
@@ -447,16 +460,16 @@ async fn uninstall_plugin(
     // Remove the on-disk wasm plugin, when this install wrote one. The loaded
     // instance (if any) lives until restart — the registry is a OnceLock.
     let mut removed_dir = false;
+    let mut masque = false;
     if let Some(id) = &plugin_id {
         match crate::plugins::remove_wasm_dir(id) {
-            Ok(removed) => removed_dir = removed,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "uninstall_failed", "detail": e })),
-                )
-                    .into_response();
+            Ok(retrait) => {
+                removed_dir = retrait == crate::plugins::Retrait::Supprime;
+                // Shipped read-only (Docker image…): disabled and hidden
+                // below instead of deleted.
+                masque = retrait == crate::plugins::Retrait::FourniEnLectureSeule;
             }
+            Err(e) => return crate::plugins::reponse_retrait_impossible(&lang, &e),
         }
     }
 
@@ -467,15 +480,22 @@ async fn uninstall_plugin(
             .ok();
         settings.delete(&format!("plugin_{key_base}_enabled")).ok();
     }
+    if masque && let Some(id) = &plugin_id {
+        crate::plugins::masquer_greffon(&settings, id);
+    }
 
-    info!(slug = %slug, removed_dir, "marketplace_plugin_uninstalled");
+    info!(slug = %slug, removed_dir, masque, "marketplace_plugin_uninstalled");
 
-    Json(json!({
+    let mut body = json!({
         "status": "uninstalled",
         "slug": slug,
-        "restart_required": removed_dir,
-    }))
-    .into_response()
+        "restart_required": removed_dir || masque,
+    });
+    if masque {
+        body["hidden"] = json!(true);
+        body["message"] = json!(crate::i18n::t(&lang, "plugin.uninstall.bundled_hidden"));
+    }
+    Json(body).into_response()
 }
 
 /// Bundled/manual WASM installs are listed by /plugins but have no store record.
@@ -489,10 +509,10 @@ async fn wasm_installed_without_store_record(id: &str) -> Result<Option<String>,
     {
         return Err(format!("unsafe plugin id: {id:?}"));
     }
-    let Some(root) = crate::plugins::wasm_plugins_dir() else {
+    let Some(dir) = crate::plugins::wasm_plugin_dir(id) else {
         return Ok(None);
     };
-    let bytes = match tokio::fs::read(root.join(id).join("manifest.json")).await {
+    let bytes = match tokio::fs::read(dir.join("manifest.json")).await {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("read plugin manifest: {e}")),
@@ -628,9 +648,17 @@ async fn update_plugin(
             let plugin_id = match crate::plugins::persist_wasm_archive(&data) {
                 Ok(id) => id,
                 Err(e) => {
+                    // Raw cause (paths, OS error) to the log only.
+                    warn!(slug = %slug, error = %e, "plugin_archive_persist_failed");
+                    let texte = crate::i18n::t(
+                        &crate::i18n::lang_from_header(&headers),
+                        "plugin.install.failed",
+                    );
                     return (
                         StatusCode::BAD_GATEWAY,
-                        Json(json!({ "error": "update_failed", "detail": e })),
+                        Json(
+                            json!({ "error": "update_failed", "detail": texte, "message": texte }),
+                        ),
                     )
                         .into_response();
                 }

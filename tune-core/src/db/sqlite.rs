@@ -1102,13 +1102,15 @@ CREATE INDEX IF NOT EXISTS idx_ignored_devices_host ON ignored_devices(host);
 
 -- Dossiers de collections (#4853) — miroir de la migration SQLite 108. Voir
 -- la migration pour la doctrine : `(kind, collection_id)` en clef primaire,
--- une collection dans UN SEUL dossier, `NULL` = racine.
+-- une collection dans UN SEUL dossier, `NULL` = racine. `manual_order`
+-- (migration 134, #6779) : fratrie rangée à la main ; 0 = alphabétique.
 CREATE TABLE IF NOT EXISTS collection_folders (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     parent_id INTEGER,
     position INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    manual_order INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_collection_folders_parent ON collection_folders(parent_id);
 CREATE TABLE IF NOT EXISTS collection_folder_items (

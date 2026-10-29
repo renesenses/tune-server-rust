@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::plugin_sdk::{PluginLoader, PluginRegistrations, TunePlugin};
 
 use crate::state::AppState;
@@ -587,27 +588,131 @@ pub(crate) fn persist_wasm_archive(_data: &[u8]) -> Result<String, String> {
     Err("plugin runtime not built (plugins-wasm feature disabled)".to_string())
 }
 
-/// Remove an installed wasm plugin's directory. `Ok(false)` when nothing was
-/// on disk (including builds without the runtime).
+/// What an uninstall did on disk (see `plugins_host::Removal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Retrait {
+    /// Nothing on disk (including builds without the runtime).
+    Absent,
+    /// The plugin's folder was deleted.
+    Supprime,
+    /// Shipped with the installation, read-only: untouched, to be disabled
+    /// and hidden by the caller ([`masquer_greffon`]).
+    FourniEnLectureSeule,
+}
+
+/// A removal that failed, reduced to a stable code the API can translate. The
+/// OS message and path stay in the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetraitImpossible {
+    pub code: &'static str,
+}
+
+/// Remove an installed wasm plugin, wherever it lives (user root, then the
+/// shipped root). A shipped, read-only folder is not an error: it comes back
+/// as [`Retrait::FourniEnLectureSeule`].
 #[cfg(feature = "plugins-wasm")]
-pub(crate) fn remove_wasm_dir(id: &str) -> Result<bool, String> {
-    crate::plugins_host::remove_plugin_dir(id)
+pub(crate) fn remove_wasm_dir(id: &str) -> Result<Retrait, RetraitImpossible> {
+    use crate::plugins_host::Removal;
+    match crate::plugins_host::remove_plugin_dir(id) {
+        Ok(Removal::Absent) => Ok(Retrait::Absent),
+        Ok(Removal::Removed) => Ok(Retrait::Supprime),
+        Ok(Removal::ReadOnlyShipped) => Ok(Retrait::FourniEnLectureSeule),
+        Err(e) => {
+            tracing::warn!(id = %id, code = e.code, detail = %e.detail, "plugin_uninstall_failed");
+            Err(RetraitImpossible { code: e.code })
+        }
+    }
 }
 
 #[cfg(not(feature = "plugins-wasm"))]
-pub(crate) fn remove_wasm_dir(_id: &str) -> Result<bool, String> {
-    Ok(false)
+pub(crate) fn remove_wasm_dir(_id: &str) -> Result<Retrait, RetraitImpossible> {
+    Ok(Retrait::Absent)
 }
 
-/// The on-disk wasm plugins directory, when the runtime is built.
+/// Every wasm plugin on disk, all roots merged (one entry per id). Empty in a
+/// build without the runtime.
 #[cfg(feature = "plugins-wasm")]
-pub(crate) fn wasm_plugins_dir() -> Option<std::path::PathBuf> {
-    Some(crate::plugins_host::plugins_dir())
+pub(crate) async fn scan_wasm_plugins() -> Result<Vec<tune_core::plugins::PluginInfo>, String> {
+    crate::plugins_host::scan_all_roots().await
 }
 
 #[cfg(not(feature = "plugins-wasm"))]
-pub(crate) fn wasm_plugins_dir() -> Option<std::path::PathBuf> {
+pub(crate) async fn scan_wasm_plugins() -> Result<Vec<tune_core::plugins::PluginInfo>, String> {
+    Ok(Vec::new())
+}
+
+/// The folder holding the manifest of `id`, in the first root that has one.
+#[cfg(feature = "plugins-wasm")]
+pub(crate) fn wasm_plugin_dir(id: &str) -> Option<std::path::PathBuf> {
+    crate::plugins_host::plugin_roots()
+        .into_iter()
+        .map(|root| root.join(id))
+        .find(|dir| dir.join("manifest.json").exists())
+}
+
+#[cfg(not(feature = "plugins-wasm"))]
+pub(crate) fn wasm_plugin_dir(_id: &str) -> Option<std::path::PathBuf> {
     None
+}
+
+/// Message translation key for a [`RetraitImpossible::code`]; a code we do not
+/// know falls to the generic one, never to a raw OS message.
+pub(crate) fn cle_erreur_de_retrait(code: &str) -> &'static str {
+    match code {
+        "permission_denied" => "plugin.uninstall.permission_denied",
+        "read_only" => "plugin.uninstall.read_only",
+        "unsafe_id" => "plugin.uninstall.unsafe_id",
+        _ => "plugin.uninstall.failed",
+    }
+}
+
+/// 4xx/5xx answer for a failed uninstall: stable `code`, and a sentence in the
+/// caller's language (`detail` and `message` carry the same text, for clients
+/// that read either) — no path, no OS error number.
+pub(crate) fn reponse_retrait_impossible(
+    lang: &str,
+    e: &RetraitImpossible,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let texte = crate::i18n::t(lang, cle_erreur_de_retrait(e.code));
+    let statut = if e.code == "unsafe_id" {
+        axum::http::StatusCode::BAD_REQUEST
+    } else {
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (
+        statut,
+        axum::Json(serde_json::json!({
+            "error": "uninstall_failed",
+            "code": e.code,
+            "detail": texte,
+            "message": texte,
+        })),
+    )
+        .into_response()
+}
+
+fn cle_masque(id: &str) -> String {
+    format!("plugin_{id}_hidden")
+}
+
+/// Has this (shipped, undeletable) plugin been uninstalled by the user? The
+/// flag lives in the settings database, i.e. under the data folder.
+pub(crate) fn greffon_masque(settings: &SettingsRepo, id: &str) -> bool {
+    settings.get(&cle_masque(id)).ok().flatten().as_deref() == Some("true")
+}
+
+/// Uninstall of a shipped read-only plugin: persist "hidden" and "disabled" so
+/// it neither shows up nor loads again — and so the generic uninstall cleanup,
+/// which drops the `enabled` key (default: enabled), cannot revive it.
+pub(crate) fn masquer_greffon(settings: &SettingsRepo, id: &str) {
+    settings.set(&cle_masque(id), "true").ok();
+    settings.set(&format!("plugin_{id}_enabled"), "false").ok();
+}
+
+/// Installing a plugin again brings back a hidden shipped one.
+pub(crate) fn demasquer_greffon(settings: &SettingsRepo, id: &str) {
+    settings.delete(&cle_masque(id)).ok();
 }
 
 /// Probe-child dispatch for the wasm runtime (see

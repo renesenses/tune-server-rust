@@ -56,11 +56,16 @@ class ArchiveInstructions(unittest.TestCase):
                     "runner/apd/bin/airplay-daemon": b"daemon fixture\n",
                     "runner/ffbundle/ffmpeg": b"ffmpeg fixture\n",
                     "runner/ffbundle/FFMPEG-LICENSE.txt": b"license fixture\n",
+                    # #6872 : librespot et sa licence MIT, à côté du serveur.
+                    "runner/lrs/bin/librespot": b"librespot fixture\n",
+                    "runner/lrs/LIBRESPOT-LICENSE.txt": b"mit fixture\n",
                 })
                 expected.update({
                     "airplay-daemon": b"daemon fixture\n",
                     "ffmpeg": b"ffmpeg fixture\n",
                     "FFMPEG-LICENSE.txt": b"license fixture\n",
+                    "librespot": b"librespot fixture\n",
+                    "LIBRESPOT-LICENSE.txt": b"mit fixture\n",
                 })
             for name, data in inputs.items():
                 path = root / name

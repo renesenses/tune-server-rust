@@ -285,6 +285,63 @@ impl AsioExclusiveOutput {
         paused: Arc<AtomicBool>,
         canaux_de_carte: Option<&CanauxDeCarte>,
     ) -> Result<Self, String> {
+        Self::ouvrir_le_pilote(
+            device_name,
+            sample_rate,
+            bit_depth,
+            channels,
+            starvation,
+            volume,
+            paused,
+            canaux_de_carte,
+            false,
+        )
+    }
+
+    /// #6230 — ouvrir sur les voies qu'une grille de réaffectation PILOTE
+    /// (6 → 2), et non sur les canaux de la source. Même ouverture que
+    /// [`Self::new`], avec une garde de plus, AVANT toute négociation : si le
+    /// pilote déclare moins de sorties que de voies demandées, ou si leur
+    /// nombre est illisible, l'ouverture est refusée
+    /// ([`super::local::voies_pilotees_permises`]). Jamais plus de voies que
+    /// la sortie n'en déclare ; l'appelant rouvre alors au format de la
+    /// source, comme avant.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_sur_voies_pilotees(
+        device_name: &str,
+        sample_rate: u32,
+        bit_depth: u32,
+        voies: u32,
+        starvation: Arc<RingStarvation>,
+        volume: Arc<AtomicU32>,
+        paused: Arc<AtomicBool>,
+        canaux_de_carte: Option<&CanauxDeCarte>,
+    ) -> Result<Self, String> {
+        Self::ouvrir_le_pilote(
+            device_name,
+            sample_rate,
+            bit_depth,
+            voies,
+            starvation,
+            volume,
+            paused,
+            canaux_de_carte,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ouvrir_le_pilote(
+        device_name: &str,
+        sample_rate: u32,
+        bit_depth: u32,
+        channels: u32,
+        starvation: Arc<RingStarvation>,
+        volume: Arc<AtomicU32>,
+        paused: Arc<AtomicBool>,
+        canaux_de_carte: Option<&CanauxDeCarte>,
+        plafonner_aux_voies_declarees: bool,
+    ) -> Result<Self, String> {
         // Serialize device access process-wide BEFORE touching the driver: if
         // the previous exclusive session is still tearing down, block here
         // until its Drop releases the device (recovering from a poisoned lock
@@ -323,6 +380,29 @@ impl AsioExclusiveOutput {
             .description()
             .map(|d| d.name().to_string())
             .unwrap_or_else(|_| device_name.to_string());
+
+        // #6230 — des voies pilotées par une grille ne dépassent JAMAIS les
+        // sorties que le pilote déclare (`driver.channels().outs`, que cpal
+        // rend comme canaux de la configuration par défaut).
+        if plafonner_aux_voies_declarees {
+            let declarees = device
+                .default_output_config()
+                .ok()
+                .map(|c| u32::from(c.channels()));
+            if !super::local::voies_pilotees_permises(channels, declarees) {
+                info!(
+                    device = %resolved_name,
+                    voies = channels,
+                    voies_declarees = ?declarees,
+                    "asio_exclusive_voies_pilotees_refusees"
+                );
+                return Err(format!(
+                    "{resolved_name} déclare {} sortie(s) : la grille en demande {channels}",
+                    declarees
+                        .map_or_else(|| "un nombre illisible de".to_string(), |n| n.to_string())
+                ));
+            }
+        }
 
         // -- 3. Read the device's current sample rate (if we can) -----------
         let original_sample_rate = device

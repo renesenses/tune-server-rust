@@ -165,6 +165,8 @@ pub struct AirplayOutput {
     stop_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     rtsp_session: Arc<Mutex<Option<RtspSession>>>,
     rtp: Arc<CurseurRtpAirplay>,
+    echec: Arc<std::sync::Mutex<Option<String>>>,
+    generation: Arc<AtomicU64>,
 }
 
 struct RtspSession {
@@ -269,11 +271,50 @@ impl AirplayOutput {
             stop_tx: Arc::new(Mutex::new(None)),
             rtsp_session: Arc::new(Mutex::new(None)),
             rtp: Arc::new(CurseurRtpAirplay::default()),
+            echec: Arc::new(std::sync::Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 }
 
 impl AirplayOutput {
+    // Lecture non consommatrice : aucune commande RTSP supplémentaire, aucune
+    // réponse volée au parseur et aucune attente sur une connexion encore ouverte.
+    fn relever_fermeture_rtsp_7259(&self) {
+        if !self.playing.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(session) = self.rtsp_session.try_lock() else {
+            return;
+        };
+        let Some(session) = session.as_ref() else {
+            return;
+        };
+        let mut octet = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+        let raison = match socket2::SockRef::from(&session.stream).peek(&mut octet) {
+            Ok(0) => Some("AirPlay : le récepteur a fermé la connexion de contrôle.".to_string()),
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Some(format!("AirPlay : connexion de contrôle interrompue : {e}"))
+            }
+            _ => None,
+        };
+        if let Some(raison) = raison {
+            *self.echec.lock().unwrap_or_else(|e| e.into_inner()) = Some(raison);
+            self.playing.store(false, Ordering::SeqCst);
+            self.paused.store(false, Ordering::SeqCst);
+            if let Ok(mut stop) = self.stop_tx.try_lock()
+                && let Some(stop) = stop.take()
+            {
+                let _ = stop.send(());
+            }
+        }
+    }
+
     /// Rend a l'appareil la session ouverte par un ANNOUNCE accepte quand la
     /// suite du dialogue RTSP echoue.
     ///
@@ -692,6 +733,10 @@ impl OutputTarget for AirplayOutput {
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         self.stop().await.ok();
+        let generation_courante = {
+            let _echec = self.echec.lock().unwrap_or_else(|e| e.into_inner());
+            self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        };
         self.rtp.reinitialiser();
 
         // Establish RTSP session
@@ -759,6 +804,7 @@ impl OutputTarget for AirplayOutput {
         *self.current_uri.lock().await = Some(media.url.to_string());
         self.position_ms.store(0, Ordering::SeqCst);
         self.duration_ms.store(0, Ordering::SeqCst);
+        *self.echec.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.playing.store(true, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
 
@@ -771,6 +817,8 @@ impl OutputTarget for AirplayOutput {
         let position_ms = self.position_ms.clone();
         let rtp = self.rtp.clone();
         let name = self.name.clone();
+        let echec = self.echec.clone();
+        let generation = self.generation.clone();
 
         tokio::spawn(async move {
             let result = stream_to_airplay(
@@ -785,10 +833,14 @@ impl OutputTarget for AirplayOutput {
             )
             .await;
 
+            let mut echec = echec.lock().unwrap_or_else(|e| e.into_inner());
+            if generation.load(Ordering::SeqCst) != generation_courante {
+                return;
+            }
             if let Err(e) = result {
                 warn!(device = %name, error = %e, "airplay_stream_error");
+                *echec = Some(e);
             }
-
             playing.store(false, Ordering::SeqCst);
             info!(device = %name, "airplay_stream_ended");
         });
@@ -874,7 +926,13 @@ impl OutputTarget for AirplayOutput {
         Ok(())
     }
 
+    fn take_output_failure(&self) -> Option<String> {
+        self.relever_fermeture_rtsp_7259();
+        self.echec.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
     async fn get_status(&self) -> Result<OutputStatus, String> {
+        self.relever_fermeture_rtsp_7259();
         let state = if self.playing.load(Ordering::Relaxed) {
             if self.paused.load(Ordering::Relaxed) {
                 TransportState::Paused
@@ -952,6 +1010,9 @@ async fn stream_to_airplay(
             "airplay_flux_progressif_premier_paquet"
         );
     }
+    if let Some(echec) = issue.echec {
+        return Err(echec);
+    }
     if flux.octets_rendus() > 0 || issue.interrompu {
         if let Some(e) = flux.echec() {
             warn!(error = %e, "airplay_flux_progressif_interrompu");
@@ -967,7 +1028,7 @@ async fn stream_to_airplay(
     );
     drop(flux);
     let pcm_be = decoder_la_piste_entiere(url).await?;
-    diffuser_pcm(
+    let issue = diffuser_pcm(
         &pcm_be,
         &udp,
         playing,
@@ -979,7 +1040,7 @@ async fn stream_to_airplay(
     )
     .await;
 
-    Ok(())
+    issue.echec.map_or(Ok(()), Err)
 }
 
 /// Le chemin d'avant #6673, gardé en repli : télécharger, décoder TOUTE la
@@ -1070,6 +1131,7 @@ struct IssueDeDiffusion {
     interrompu: bool,
     /// Quand le premier paquet est parti.
     premier_paquet: Option<std::time::Instant>,
+    echec: Option<String>,
 }
 
 impl IssueDeDiffusion {
@@ -1086,7 +1148,7 @@ impl IssueDeDiffusion {
 /// permet ni l'un ni l'autre — un datagramme trop grand y echoue en silence,
 /// journalise en debug, exactement le symptome qu'on veut interdire.
 trait SortieRtp {
-    async fn envoyer(&self, pkt: &[u8]);
+    async fn envoyer(&self, pkt: &[u8]) -> Result<(), String>;
 }
 
 /// Emet le PCM big-endian en paquets RTP, au rythme reel.
@@ -1101,7 +1163,7 @@ async fn diffuser_pcm<S: SortieRtp>(
     stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
     ssrc: u32,
     rtp: &CurseurRtpAirplay,
-) {
+) -> IssueDeDiffusion {
     diffuser_flux(
         &mut PisteEntiere(Some(pcm_be)),
         sortie,
@@ -1112,7 +1174,7 @@ async fn diffuser_pcm<S: SortieRtp>(
         ssrc,
         rtp,
     )
-    .await;
+    .await
 }
 
 /// Au-delà de ce retard sur l'échéance du paquet, la boucle a attendu le
@@ -1222,7 +1284,13 @@ async fn diffuser_flux<F: SourcePcmAirplay, S: SortieRtp>(
             continue 'paquets;
         };
         let pkt = build_rtp_packet(seq, timestamp, ssrc, audio_buf, marqueur);
-        sortie.envoyer(&pkt).await;
+        if let Err(echec) = sortie.envoyer(&pkt).await {
+            return IssueDeDiffusion {
+                interrompu: true,
+                premier_paquet,
+                echec: Some(echec),
+            };
+        }
         premier_paquet.get_or_insert_with(std::time::Instant::now);
 
         total_frames += FRAMES_PER_PACKET as u64;
@@ -1267,7 +1335,13 @@ async fn diffuser_flux<F: SourcePcmAirplay, S: SortieRtp>(
         };
         if let Some((seq, timestamp, marqueur)) = reservation {
             let pkt = build_rtp_packet(seq, timestamp, ssrc, &tampon[offset..fin], marqueur);
-            sortie.envoyer(&pkt).await;
+            if let Err(echec) = sortie.envoyer(&pkt).await {
+                return IssueDeDiffusion {
+                    interrompu: true,
+                    premier_paquet,
+                    echec: Some(echec),
+                };
+            }
             premier_paquet.get_or_insert_with(std::time::Instant::now);
             total_frames += trames as u64;
             position_ms.store(total_frames * 1000 / SAMPLE_RATE as u64, Ordering::Relaxed);
@@ -1277,6 +1351,7 @@ async fn diffuser_flux<F: SourcePcmAirplay, S: SortieRtp>(
     IssueDeDiffusion {
         interrompu: interrompu || !playing.load(Ordering::Relaxed),
         premier_paquet,
+        echec: None,
     }
 }
 
@@ -1608,8 +1683,9 @@ mod tests {
     }
 
     impl SortieRtp for SortieDeTest {
-        async fn envoyer(&self, pkt: &[u8]) {
+        async fn envoyer(&self, pkt: &[u8]) -> Result<(), String> {
             self.0.lock().unwrap().push(pkt.len() - RTP_HEADER_SIZE);
+            Ok(())
         }
     }
 
@@ -1920,3 +1996,7 @@ mod flux_progressif_tests_6673;
 #[cfg(test)]
 #[path = "airplay_identite_tests_6885.rs"]
 mod identite_tests_6885;
+
+#[cfg(test)]
+#[path = "airplay_fermeture_tests_7259.rs"]
+mod fermeture_tests_7259;

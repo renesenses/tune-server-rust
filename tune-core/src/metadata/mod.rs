@@ -405,6 +405,16 @@ impl TrackMetadata {
         sanitize_option("genre", &mut self.genre, &mut corrections);
         sanitize_option("format", &mut self.format, &mut corrections);
         sanitize_option("label", &mut self.label, &mut corrections);
+        // #7064 — une balise LABEL qui porte la ligne ℗/© (« 2003 EMI Records
+        // Ltd. ») garde le seul nom du label. Normalisation prudente : voir
+        // `library::noms_de_labels`.
+        if let Some(propre) = self
+            .label
+            .as_deref()
+            .and_then(crate::library::noms_de_labels::normaliser_si_besoin)
+        {
+            self.label = Some(propre);
+        }
         sanitize_option("catalog_number", &mut self.catalog_number, &mut corrections);
         sanitize_option(
             "musicbrainz_recording_id",

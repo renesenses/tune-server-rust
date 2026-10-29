@@ -42,13 +42,17 @@ jobs:
     timeout-minutes: 5
 
     steps:
+      # Pas de `ref:` : le depot est lu par REFERENCES git (tag cite, dernier
+      # tag publie, lot nomme), jamais par l'arbre de travail. Le checkout sur
+      # `release/v0.9`, figee depuis le 30/08, rendait « introuvable » tout
+      # fichier cree depuis (fausse alerte constatee le 26/10, #7065).
+      #
       # `fetch-depth: 0` : le controle « commit refusant » lit le corps d'un
       # commit quelconque de l'historique. Un clone superficiel ne l'a pas, et
       # le controle repondrait vert sans rien avoir verifie.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: release/v0.9
 
       - name: Contre-épreuve du garde-fou
         run: bash scripts/verifier-fermeture.sh --autotest
@@ -67,6 +71,18 @@ jobs:
           gh api "repos/$DEPOT_NOM/issues/$NUMERO/comments" \
             --jq '.[-1].body // ""' > /tmp/fermeture.txt || echo "" > /tmp/fermeture.txt
           printf 'commentaire relevé : %s octets\n' "$(wc -c < /tmp/fermeture.txt)"
+
+      # Le dernier tag de release publie : la reference de repli quand le
+      # commentaire ne cite aucune version. Echec de l'API = pas de repli,
+      # jamais un arret : le script retombe sur ce qu'il a.
+      - name: Relever la dernière release publiée
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPOT_NOM: ${{ github.repository }}
+        run: |
+          TAG=$(gh api "repos/$DEPOT_NOM/releases/latest" --jq .tag_name 2>/dev/null || true)
+          printf 'REF_RELEASE=%s\n' "$TAG" >> "$GITHUB_ENV"
+          printf 'dernière release publiée : %s\n' "${TAG:-(aucune)}"
 
       - name: Analyser la justification
         id: analyse

@@ -799,7 +799,8 @@ pub mod sql {
     pub fn labels_de_la_bibliotheque<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT TRIM(a.label) AS nom, COUNT(*) AS n, \
-             MAX(CASE WHEN a.source = 'qobuz' THEN a.source_id END) AS qobuz \
+             MAX(CASE WHEN a.source = 'qobuz' THEN a.source_id END) AS qobuz, \
+             MAX(CASE WHEN a.musicbrainz_release_id <> '' THEN a.musicbrainz_release_id END) AS release_mb \
              FROM albums a \
              WHERE a.label IS NOT NULL AND TRIM(a.label) <> '' AND {} AND {} \
              GROUP BY TRIM(a.label) ORDER BY TRIM(a.label)",
@@ -843,6 +844,9 @@ pub struct LabelDeBibliotheque {
     pub album_count: i64,
     /// L'identifiant Qobuz d'un album Qobuz de la bibliothèque qui le porte.
     pub album_qobuz: Option<String>,
+    /// Le MBID de release d'un album de la bibliothèque qui le porte (#7089) :
+    /// sa `label-info` rapproche le label sans ambiguïté.
+    pub release_mb: Option<String>,
 }
 
 /// Une tranche de Dynamic Range, bornes **incluses** (#2144).
@@ -1135,15 +1139,35 @@ pub struct BilanRecalculCompilations {
 
 pub struct AlbumRepo {
     db: Arc<dyn DbBackend>,
+    /// #6285 — le filtre du verdict hi-res de la liste (`?hires_verdict=`),
+    /// posé par [`Self::avec_filtre_hires`]. `None` : le SQL d'avant.
+    filtre_hires: Option<crate::audio::faux_hires_publie::FiltreHires>,
 }
 
 impl AlbumRepo {
     pub fn new(db: SqliteDb) -> Self {
-        Self { db: Arc::new(db) }
+        Self {
+            db: Arc::new(db),
+            filtre_hires: None,
+        }
     }
 
     pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
-        Self { db }
+        Self {
+            db,
+            filtre_hires: None,
+        }
+    }
+
+    /// #6285 — restreint les listages filtrés (`list_filtered*`) aux albums
+    /// dont le verdict hi-res PUBLIÉ est celui du filtre. Un réglage du dépôt
+    /// plutôt qu'un paramètre de plus aux trois listages et à leurs appelants.
+    pub fn avec_filtre_hires(
+        mut self,
+        filtre: Option<crate::audio::faux_hires_publie::FiltreHires>,
+    ) -> Self {
+        self.filtre_hires = filtre;
+        self
     }
 
     fn marque(&self, n: usize) -> String {
@@ -4033,6 +4057,11 @@ impl AlbumRepo {
             Some(false) => wheres.push("COALESCE(a.is_compilation, 0) = 0".to_string()),
             None => {}
         }
+        // #6285 — le verdict hi-res publié : sans valeur liée, le prédicat
+        // n'ajoute aucun marqueur à la séquence.
+        if let Some(filtre) = self.filtre_hires {
+            wheres.push(filtre.predicat("a.id"));
+        }
         // Albums masqués (#1391) : exclus par défaut. Le prédicat passe par
         // `wheres` — jamais par le `replacen` de `base_select` plus bas, qui
         // ne réécrit que la liste de colonnes.
@@ -4733,6 +4762,10 @@ impl AlbumRepo {
                     album_count: r.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
                     album_qobuz: r
                         .get(2)
+                        .and_then(|v| v.as_string())
+                        .filter(|s| !s.trim().is_empty()),
+                    release_mb: r
+                        .get(3)
                         .and_then(|v| v.as_string())
                         .filter(|s| !s.trim().is_empty()),
                 })

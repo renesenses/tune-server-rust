@@ -656,18 +656,24 @@ impl StreamingPcmByteAdapter {
 fn pcm_bytes_to_i32(data: &[u8], bit_depth: u16) -> Result<Vec<i32>, String> {
     let samples = match bit_depth {
         16 => data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
             .collect(),
         24 => data
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|b| {
                 let value = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
                 (value << 8) >> 8
             })
             .collect(),
         32 => data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect(),
         _ => return Err(format!("unsupported PCM bit depth: {bit_depth}")),
@@ -777,11 +783,15 @@ pub fn convert_pcm_bytes(data: &[u8], from_bd: u16, to_bd: u16) -> Vec<u8> {
     }
     let samples: Vec<i32> = match from_bd {
         16 => data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
             .collect(),
         24 => data
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|b| {
                 // sign-extend 24-bit LE into i32
                 let v = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
@@ -789,7 +799,9 @@ pub fn convert_pcm_bytes(data: &[u8], from_bd: u16, to_bd: u16) -> Vec<u8> {
             })
             .collect(),
         32 => data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect(),
         _ => return data.to_vec(),
@@ -1682,9 +1694,7 @@ fn decode_opus_to_pcm(
         None
     };
     let ch: usize = match &track.codec_params {
-        Some(CodecParameters::Audio(p)) => {
-            p.channels.as_ref().map(|c| c.count() as usize).unwrap_or(2)
-        }
+        Some(CodecParameters::Audio(p)) => p.channels.as_ref().map(|c| c.count()).unwrap_or(2),
         _ => 2,
     }
     .clamp(1, 2); // libopus decoder: mono or stereo
@@ -1755,7 +1765,7 @@ fn decode_opus_to_pcm(
                 };
                 let new_ch = match &track.codec_params {
                     Some(CodecParameters::Audio(p)) => {
-                        p.channels.as_ref().map(|c| c.count() as usize).unwrap_or(2)
+                        p.channels.as_ref().map(|c| c.count()).unwrap_or(2)
                     }
                     _ => 2,
                 }
@@ -1908,6 +1918,10 @@ pub fn decode_to_pcm_streaming_with_notify(
     )
 }
 
+// Signature publique du décodeur progressif, appelée par orchestrator/resolve_*.rs
+// (fichiers en chantier dans des PR ouvertes) : la regrouper en structure
+// imposerait de réécrire ces appelants. Même choix que decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_to_pcm_streaming_with_levels(
     file_path: &str,
     target_sample_rate: Option<u32>,
@@ -1932,6 +1946,10 @@ pub fn decode_to_pcm_streaming_with_levels(
     )
 }
 
+// Signature publique du décodeur progressif, appelée par orchestrator/resolve_*.rs
+// (fichiers en chantier dans des PR ouvertes) : la regrouper en structure
+// imposerait de réécrire ces appelants. Même choix que decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_to_pcm_streaming_seeked(
     file_path: &str,
     target_sample_rate: Option<u32>,
@@ -1964,6 +1982,10 @@ pub fn decode_to_pcm_streaming_seeked(
 /// porte l'album entier, la piste n'en est qu'un intervalle. Le début passe par
 /// le même `seek_s` que le seek utilisateur ; la fin, elle, n'existait nulle
 /// part dans ce dépôt — c'est [`borner_la_fin`] qui la pose.
+// Signature publique du décodeur progressif, appelée par orchestrator/resolve_*.rs
+// (fichiers en chantier dans des PR ouvertes) : la regrouper en structure
+// imposerait de réécrire ces appelants. Même choix que decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_to_pcm_streaming_tranche(
     file_path: &str,
     target_sample_rate: Option<u32>,
@@ -2144,6 +2166,10 @@ pub fn echec_avant_le_premier_octet(erreur: &str) -> bool {
 /// Variante HTTP seekable du decodeur progressif. La source a deja prouve le
 /// support de `Range`; Symphonia peut donc lire l'atome `moov` a la fin d'un
 /// M4A puis revenir aux premiers paquets sans telecharger tout le media (#1885).
+// Signature publique du décodeur progressif, appelée par orchestrator/resolve_*.rs
+// (fichiers en chantier dans des PR ouvertes) : la regrouper en structure
+// imposerait de réécrire ces appelants. Même choix que decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_http_range_to_pcm_streaming_seeked(
     source: super::http_range::HttpRangeSource,
     codec_hint: &str,
@@ -2229,6 +2255,9 @@ pub fn decode_source_to_pcm_streaming(
     )
 }
 
+// Cœur commun des variantes publiques ci-dessus, qui lui passent leurs
+// paramètres tels quels ; même choix que decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
 fn decode_to_pcm_streaming_inner(
     file_path: &str,
     target_sample_rate: Option<u32>,
@@ -2293,7 +2322,7 @@ fn decode_to_pcm_streaming_inner(
             (frequence, canaux as u32)
         } else {
             let info = super::dff::parse_dff(file_path)?;
-            (info.sample_rate, info.channels as u32)
+            (info.sample_rate, info.channels)
         };
         let dsd_output_rate =
             target_sample_rate.unwrap_or_else(|| super::dsd_to_pcm::choose_output_rate(dsd_rate));
@@ -2303,7 +2332,7 @@ fn decode_to_pcm_streaming_inner(
         // Send WAV header so LocalOutput can parse stream metadata
         if target_bit_depth.is_some() {
             let wav_hdr = super::wav::build_wav_header(dsd_channels, dsd_output_rate, output_bd);
-            if let Err(_) = rt.block_on(tx.send(wav_hdr.to_vec())) {
+            if rt.block_on(tx.send(wav_hdr.to_vec())).is_err() {
                 return Ok((output_bd, dsd_output_rate));
             }
             if let Some(n) = &data_ready {
@@ -2488,7 +2517,7 @@ fn decode_to_pcm_streaming_inner(
         let sr = decoded.sample_rate;
         if target_bit_depth.is_some() {
             let wav_hdr = super::wav::build_wav_header(ch, sr, output_bd);
-            if let Err(_) = rt.block_on(tx.send(wav_hdr.to_vec())) {
+            if rt.block_on(tx.send(wav_hdr.to_vec())).is_err() {
                 return Ok((output_bd, sr));
             }
             if let Some(ref n) = data_ready {
@@ -2632,7 +2661,7 @@ fn decode_to_pcm_streaming_inner(
         );
     }
     let output_rate = target_sample_rate.unwrap_or(source_rate);
-    let output_channels = target_channels.unwrap_or_else(|| source_channels);
+    let output_channels = target_channels.unwrap_or(source_channels);
     let mut pcm_adapter = StreamingPcmAdapter::new(
         source_bd,
         source_channels,
@@ -2700,7 +2729,7 @@ fn decode_to_pcm_streaming_inner(
     if target_bit_depth.is_some() {
         let channels = checked_channels(output_channels, "stream target")?;
         let wav_hdr = super::wav::build_wav_header(channels, output_rate, output_bd);
-        if let Err(_) = rt.block_on(tx.send(wav_hdr.to_vec())) {
+        if rt.block_on(tx.send(wav_hdr.to_vec())).is_err() {
             return Ok((output_bd, output_rate));
         }
         if let Some(ref n) = data_ready {
@@ -3079,7 +3108,7 @@ fn ape_open_checked(
 /// faire. Le résultat est identique bit à bit.
 fn ape_pcm_to_i32(pcm: &[u8], header: &ApeHeaderInfo, out: &mut Vec<i32>) -> Result<(), String> {
     let bytes_per_sample = (header.bit_depth / 8) as usize;
-    if bytes_per_sample == 0 || pcm.len() % bytes_per_sample != 0 {
+    if bytes_per_sample == 0 || !pcm.len().is_multiple_of(bytes_per_sample) {
         return Err("ape: PCM byte length not aligned to sample size".into());
     }
     out.reserve(pcm.len() / bytes_per_sample);
@@ -3098,19 +3127,19 @@ fn ape_pcm_to_i32(pcm: &[u8], header: &ApeHeaderInfo, out: &mut Vec<i32>) -> Res
             }
         }
         16 => {
-            for b in pcm.chunks_exact(2) {
+            for b in pcm.as_chunks::<2>().0 {
                 out.push(i16::from_le_bytes([b[0], b[1]]) as i32);
             }
         }
         24 => {
-            for b in pcm.chunks_exact(3) {
+            for b in pcm.as_chunks::<3>().0 {
                 let v = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
                 // sign-extend 24-bit -> i32
                 out.push((v << 8) >> 8);
             }
         }
         32 => {
-            for b in pcm.chunks_exact(4) {
+            for b in pcm.as_chunks::<4>().0 {
                 out.push(i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
             }
         }
@@ -3204,11 +3233,8 @@ fn decode_ape_to_pcm(
     let (start_frame, mut skip_interleaved) = ape_start_position(&mut decoder, &header, seek_s)?;
     // `max_duration_s` borne le décodage : on s'arrête dès que la fenêtre est
     // pleine, sans décoder la fin de la piste pour la jeter ensuite.
-    let max_samples: usize = echantillons_de_la_fenetre(
-        max_duration_s,
-        header.sample_rate,
-        u32::from(header.channels),
-    );
+    let max_samples: usize =
+        echantillons_de_la_fenetre(max_duration_s, header.sample_rate, header.channels);
     let start_sample = (start_frame as u64).saturating_mul(u64::from(header.blocks_per_frame));
     let expected_out = (header
         .total_samples
@@ -4394,7 +4420,9 @@ fn decoder_le_dsd_par_blocs(
                 return Ok(false);
             }
             let samples: Vec<i32> = pcm_24
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|c| {
                     let value = (c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16);
                     (value << 8) >> 8
@@ -4444,14 +4472,14 @@ fn decoder_le_dsd_par_blocs(
         }
     }
 
-    drop(process_dsd_chunk);
-
     // Flush remaining samples from the DSD FIR filter through the same channel
     // adapter as the body.
     let tail = streamer.flush();
     if !tail.is_empty() {
         let samples: Vec<i32> = tail
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| {
                 let value = (c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16);
                 (value << 8) >> 8
@@ -4484,10 +4512,8 @@ fn decoder_le_dsd_par_blocs(
                 false
             }
         };
-        if send_ok {
-            if let Some(ltx) = levels_tx {
-                super::tap::send_windowed_pcm(ltx, &pcm_buf, output_bd, output_ch, output_rate);
-            }
+        if send_ok && let Some(ltx) = levels_tx {
+            super::tap::send_windowed_pcm(ltx, &pcm_buf, output_bd, output_ch, output_rate);
         }
     }
 
@@ -4876,7 +4902,7 @@ fn decode_dsd_to_pcm(
     // (a DSD64 album track is hundreds of MB; the old code held both the bytes
     // and the i32 samples, then copied a third time via `to_vec`).
     let append_pcm24 = |dst: &mut Vec<i32>, bytes: &[u8]| {
-        for c in bytes.chunks_exact(3) {
+        for c in bytes.as_chunks::<3>().0 {
             let v = c[0] as u32 | ((c[1] as u32) << 8) | ((c[2] as u32) << 16);
             dst.push(if v & 0x80_0000 != 0 {
                 (v | 0xFF00_0000) as i32
@@ -6066,7 +6092,7 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
             "limited decode should have fewer samples"
         );
         assert!(
-            half.samples_i32.len() > 0,
+            !half.samples_i32.is_empty(),
             "limited decode should still have samples"
         );
     }

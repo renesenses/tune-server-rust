@@ -6,7 +6,16 @@
 //! connecté, lance en arrière-plan une passe bornée sur les labels encore
 //! inconnus. Le logo apparaît donc à une ouverture suivante de l'onglet.
 //! Sans compte Qobuz (service absent, désactivé ou non connecté) : aucune
-//! passe, aucun appel.
+//! passe Qobuz, aucun appel Qobuz.
+//!
+//! #7089 — les logos du web ouvert, sans compte
+//! ([`tune_core::library::logos_web`]) : après un rapprochement MusicBrainz
+//! sûr, Commons (libre), puis Wikipédia, puis le site officiel, puis
+//! Discogs. Chaque serveur les récupère lui-même, pour son usage local
+//! d'identification. Ils ont leur propre index et leur propre passe, bornée
+//! de même, qui ne tourne pas quand la tâche de fond « Enrichissement » est en
+//! pause. Ordre de préférence : ces sources, puis Qobuz. Chaque logo est rendu
+//! avec sa source et sa licence connue (`image_credit`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,8 +32,10 @@ use tune_core::library::artistes_du_label::{
     cles_de_la_bibliotheque, regrouper,
 };
 use tune_core::library::logos_labels::{
-    CacheLogosLabels, CatalogueDeLabels, Demande, LabelDuCatalogue, PASSE_MAX, PAUSE_ENTRE_LABELS,
+    Attribution, CacheLogosLabels, CatalogueDeLabels, Demande, LabelDuCatalogue, PASSE_MAX,
+    PAUSE_ENTRE_LABELS, SourceDuLogo, StatutDeLicence,
 };
+use tune_core::library::logos_web::{CatalogueLogosWeb, FICHIER_INDEX_WEB, transport_du_serveur};
 use tune_core::streaming::StreamingService;
 use tune_core::streaming::qobuz::QobuzService;
 use tune_core::streaming::traits::StreamAlbum;
@@ -43,6 +54,33 @@ pub(crate) fn cache_de(dossier: &Path) -> Arc<CacheLogosLabels> {
         .entry(dossier.to_path_buf())
         .or_insert_with(|| Arc::new(CacheLogosLabels::ouvrir(dossier)))
         .clone()
+}
+
+/// #7089 — l'index des logos du web, à côté de celui de Qobuz.
+pub(crate) fn cache_web_de(dossier: &Path) -> Arc<CacheLogosLabels> {
+    static CACHES: OnceLock<Mutex<HashMap<PathBuf, Arc<CacheLogosLabels>>>> = OnceLock::new();
+    let mut caches = CACHES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    caches
+        .entry(dossier.to_path_buf())
+        .or_insert_with(|| Arc::new(CacheLogosLabels::ouvrir_index(dossier, FICHIER_INDEX_WEB)))
+        .clone()
+}
+
+/// #7089 — le catalogue des logos du web, ou `None` quand la tâche de fond
+/// « Enrichissement » est en pause (ou, dans un banc, sans racine d'essai) —
+/// et alors, aucune passe.
+pub(crate) fn catalogue_web(state: &AppState) -> Option<Arc<dyn CatalogueDeLabels>> {
+    if tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::Enrichissement) {
+        return None;
+    }
+    let transport = transport_du_serveur(state.http_client.clone())?;
+    Some(Arc::new(CatalogueLogosWeb::new(
+        transport,
+        Some(state.backend.clone()),
+    )))
 }
 
 fn maintenant() -> u64 {
@@ -112,12 +150,66 @@ pub(crate) async fn catalogue_qobuz(state: &AppState) -> Option<Arc<dyn Catalogu
     Some(qobuz_connecte(state).await? as Arc<dyn CatalogueDeLabels>)
 }
 
-/// Une entrée de la liste : `image_url` et `qobuz_label_id` sont ABSENTS
-/// quand rien n'est connu (jamais `null`, jamais une adresse qui rend 404).
-pub(crate) fn element(cache: &CacheLogosLabels, label: &LabelDeBibliotheque) -> Value {
+/// L'attribution d'un logo, telle que la liste la rend (#7089).
+pub(crate) fn credit(a: &Attribution) -> Value {
+    let source = match a.source {
+        SourceDuLogo::Commons => "commons",
+        SourceDuLogo::Wikipedia => "wikipedia",
+        SourceDuLogo::SiteOfficiel => "official_site",
+        SourceDuLogo::Discogs => "discogs",
+        SourceDuLogo::Qobuz => "qobuz",
+    };
+    let statut = match a.statut_licence {
+        StatutDeLicence::Libre => "free",
+        StatutDeLicence::NonLibreIdentification => "non_free_identification",
+        StatutDeLicence::Inconnue => "unknown",
+    };
+    let mut o = json!({
+        "source": source,
+        "provider": a.fournisseur,
+        "license_status": statut,
+        "source_url": a.source_url,
+    });
+    for (cle, valeur) in [
+        ("license", &a.licence),
+        ("license_url", &a.licence_url),
+        ("author", &a.auteur),
+        ("file", &a.fichier),
+    ] {
+        if let Some(v) = valeur {
+            o[cle] = json!(v);
+        }
+    }
+    if a.douteux {
+        o["doubtful"] = json!(true);
+    }
+    o
+}
+
+/// L'attribution d'un logo Qobuz : source connue, licence inconnue.
+fn credit_qobuz() -> Value {
+    json!({ "source": "qobuz", "provider": "Qobuz", "license_status": "unknown" })
+}
+
+/// Une entrée de la liste : `image_url`, `image_credit` et `qobuz_label_id`
+/// sont ABSENTS quand rien n'est connu (jamais `null`, jamais une adresse qui
+/// rend 404). Ordre de préférence (#7089) : le logo du web — Commons,
+/// Wikipédia, site officiel, Discogs —, puis Qobuz. Un logo est TOUJOURS rendu
+/// avec son attribution ; un logo du web sans attribution n'est pas rendu.
+pub(crate) fn element(
+    cache: &CacheLogosLabels,
+    web: &CacheLogosLabels,
+    label: &LabelDeBibliotheque,
+) -> Value {
     let mut o = json!({ "name": label.nom, "album_count": label.album_count });
-    if let Some(condensat) = cache.image(&label.nom) {
+    if let Some(condensat) = web.image(&label.nom)
+        && let Some(a) = web.entree(&label.nom).and_then(|e| e.attribution)
+    {
         o["image_url"] = json!(format!("/api/v1/library/artwork/{condensat}"));
+        o["image_credit"] = credit(&a);
+    } else if let Some(condensat) = cache.image(&label.nom) {
+        o["image_url"] = json!(format!("/api/v1/library/artwork/{condensat}"));
+        o["image_credit"] = credit_qobuz();
     }
     if let Some(id) = cache.entree(&label.nom).and_then(|e| e.qobuz_label_id) {
         o["qobuz_label_id"] = json!(id);
@@ -130,16 +222,9 @@ pub(crate) fn element(cache: &CacheLogosLabels, label: &LabelDeBibliotheque) -> 
 pub(crate) fn lancer_passe(
     cache: Arc<CacheLogosLabels>,
     catalogue: Arc<dyn CatalogueDeLabels>,
-    labels: &[LabelDeBibliotheque],
+    demandes: Vec<Demande>,
     pause: Duration,
 ) -> Option<tokio::task::JoinHandle<usize>> {
-    let demandes: Vec<Demande> = labels
-        .iter()
-        .map(|l| Demande {
-            nom: l.nom.clone(),
-            album_du_catalogue: l.album_qobuz.clone(),
-        })
-        .collect();
     let a_faire = cache.a_resoudre(&demandes, maintenant(), PASSE_MAX);
     if a_faire.is_empty() {
         return None;
@@ -154,14 +239,48 @@ pub(crate) fn lancer_passe(
     }))
 }
 
+/// Les demandes de la passe Qobuz : l'album Qobuz de la bibliothèque.
+pub(crate) fn demandes_qobuz(labels: &[LabelDeBibliotheque]) -> Vec<Demande> {
+    labels
+        .iter()
+        .map(|l| Demande {
+            nom: l.nom.clone(),
+            album_du_catalogue: l.album_qobuz.clone(),
+        })
+        .collect()
+}
+
+/// Les demandes de la passe du web (#7089) : le MBID d'une release de la
+/// bibliothèque. Le web passe avant Qobuz : un label qui a déjà un logo
+/// Qobuz est demandé aussi.
+pub(crate) fn demandes_web(labels: &[LabelDeBibliotheque]) -> Vec<Demande> {
+    labels
+        .iter()
+        .map(|l| Demande {
+            nom: l.nom.clone(),
+            album_du_catalogue: l.release_mb.clone(),
+        })
+        .collect()
+}
+
 pub(super) async fn list_labels(State(state): State<AppState>) -> Json<Value> {
     let labels = AlbumRepo::with_backend(state.backend.clone())
         .labels_de_la_bibliotheque()
         .ou_defaut_journalise();
-    let cache = cache_de(&super::artwork_cache_dir());
-    let items: Vec<Value> = labels.iter().map(|l| element(&cache, l)).collect();
+    let dossier = super::artwork_cache_dir();
+    let cache = cache_de(&dossier);
+    let web = cache_web_de(&dossier);
+    let items: Vec<Value> = labels.iter().map(|l| element(&cache, &web, l)).collect();
+    if let Some(catalogue) = catalogue_web(&state) {
+        lancer_passe(web, catalogue, demandes_web(&labels), PAUSE_ENTRE_LABELS);
+    }
     if let Some(catalogue) = catalogue_qobuz(&state).await {
-        lancer_passe(cache, catalogue, &labels, PAUSE_ENTRE_LABELS);
+        lancer_passe(
+            cache,
+            catalogue,
+            demandes_qobuz(&labels),
+            PAUSE_ENTRE_LABELS,
+        );
     }
     Json(Value::Array(items))
 }
@@ -256,6 +375,7 @@ pub(super) async fn artistes_du_label(
                 nom: nom.clone(),
                 album_count: 0,
                 album_qobuz: None,
+                release_mb: None,
             });
         let deja = cles_de_la_bibliotheque(&state.backend).ou_defaut_journalise();
         let logos = cache_de(&super::artwork_cache_dir());
@@ -352,6 +472,8 @@ mod tests {
             EntreeLogo {
                 statut: Statut::Trouve,
                 qobuz_label_id: Some("77".into()),
+                mb_label_id: None,
+                attribution: None,
                 image: Some(condensat.clone()),
                 verifie_le: maintenant(),
             },
@@ -427,6 +549,7 @@ mod tests {
                 id: "1".into(),
                 nom: nom.into(),
                 image_url: Some("http://img.test/l.png".into()),
+                attribution: None,
             }))
         }
         async fn telecharger_image(&self, _: &str) -> Result<Vec<u8>, String> {
@@ -459,10 +582,15 @@ mod tests {
         let cache_dir = tune_core::test_scratch::scratch_dir("labels-6736-passe-cache");
         let cache = Arc::new(CacheLogosLabels::ouvrir(cache_dir.path()));
         let compteur = Arc::new(Compteur(AtomicUsize::new(0)));
-        let trouves = lancer_passe(cache.clone(), compteur.clone(), &liste, Duration::ZERO)
-            .expect("une passe")
-            .await
-            .unwrap();
+        let trouves = lancer_passe(
+            cache.clone(),
+            compteur.clone(),
+            demandes_qobuz(&liste),
+            Duration::ZERO,
+        )
+        .expect("une passe")
+        .await
+        .unwrap();
         assert_eq!(trouves, 1);
         assert_eq!(
             compteur.0.load(Ordering::SeqCst),
@@ -472,24 +600,315 @@ mod tests {
         assert!(cache.image("Lbl 6736 passe 00").is_some());
 
         // La passe suivante ne reprend que les labels jamais vus.
-        lancer_passe(cache.clone(), compteur.clone(), &liste, Duration::ZERO)
-            .unwrap()
-            .await
-            .unwrap();
+        lancer_passe(
+            cache.clone(),
+            compteur.clone(),
+            demandes_qobuz(&liste),
+            Duration::ZERO,
+        )
+        .unwrap()
+        .await
+        .unwrap();
         assert_eq!(compteur.0.load(Ordering::SeqCst), 2 * PASSE_MAX);
-        lancer_passe(cache.clone(), compteur.clone(), &liste, Duration::ZERO)
-            .unwrap()
-            .await
-            .unwrap();
+        lancer_passe(
+            cache.clone(),
+            compteur.clone(),
+            demandes_qobuz(&liste),
+            Duration::ZERO,
+        )
+        .unwrap()
+        .await
+        .unwrap();
         assert_eq!(
             compteur.0.load(Ordering::SeqCst),
             20,
             "chaque label demandé une fois"
         );
         assert!(
-            lancer_passe(cache, compteur.clone(), &liste, Duration::ZERO).is_none(),
+            lancer_passe(
+                cache,
+                compteur.clone(),
+                demandes_qobuz(&liste),
+                Duration::ZERO
+            )
+            .is_none(),
             "tout est connu, absence comprise : plus aucun appel"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #7089 — les logos du web : Commons, Wikipédia, site officiel, Discogs
+    // -----------------------------------------------------------------------
+
+    /// Un faux MusicBrainz / Wikidata / Commons sous une seule racine, au
+    /// format que [`tune_core::library::logos_web::Transport::sous_base`]
+    /// attend. Journalise les chemins demandés.
+    async fn web_simule() -> (String, Arc<Mutex<Vec<String>>>) {
+        use axum::extract::{Path as Chemin, Query};
+        use axum::routing::get;
+        let journal = Arc::new(Mutex::new(Vec::new()));
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let racine = format!("http://{}", ecoute.local_addr().unwrap());
+        let vignette = format!("{racine}/images/bn.png");
+        let (j1, j2, j3, j4) = (
+            journal.clone(),
+            journal.clone(),
+            journal.clone(),
+            journal.clone(),
+        );
+        let app = axum::Router::new()
+            .route(
+                "/mb/release/{id}",
+                get(move |Chemin(id): Chemin<String>| {
+                    j1.lock().unwrap().push(format!("release/{id}"));
+                    async move {
+                        Json(json!({"id": id, "label-info": [
+                            {"label": {"id": "mb-bn-7089", "name": "Blue Note 7089"}}]}))
+                    }
+                }),
+            )
+            .route(
+                "/mb/label/{id}",
+                get(move |Chemin(id): Chemin<String>| {
+                    j2.lock().unwrap().push(format!("label/{id}"));
+                    async move {
+                        Json(json!({"id": id, "relations": [
+                            {"type": "wikidata", "url": {"resource": "https://www.wikidata.org/wiki/Q885833"}}]}))
+                    }
+                }),
+            )
+            .route(
+                "/wikidata",
+                get(|| async {
+                    Json(json!({"entities": {"Q885833": {"claims": {"P154": [
+                        {"rank": "normal", "mainsnak": {"datavalue": {"value": "Blue Note Records.svg"}}}]}}}}))
+                }),
+            )
+            .route(
+                "/commons",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    j3.lock().unwrap().push(format!("commons {}", q["titles"]));
+                    let vignette = vignette.clone();
+                    async move {
+                        Json(json!({"query": {"pages": [{
+                            "title": "File:Blue Note Records.svg",
+                            "categories": [{"title": "Category:PD-self"}],
+                            "imageinfo": [{
+                                "thumburl": vignette,
+                                "descriptionurl": "https://commons.wikimedia.org/wiki/File:Blue_Note_Records.svg",
+                                "extmetadata": {
+                                    "License": {"value": "pd"},
+                                    "LicenseShortName": {"value": "Public domain"},
+                                    "Artist": {"value": "Reid Miles"}}}]}]}}))
+                    }
+                }),
+            )
+            .route(
+                "/images/bn.png",
+                get(move || {
+                    j4.lock().unwrap().push("image".into());
+                    async { PNG.to_vec() }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(ecoute, app).await.unwrap();
+        });
+        (racine, journal)
+    }
+
+    /// De bout en bout, par le VRAI routeur : la première liste lance la
+    /// passe du web (release → label → Wikidata → Commons), la suivante
+    /// rend le logo libre ET son attribution — douteux compris.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn la_liste_rend_le_logo_libre_de_commons_avec_son_attribution_7089() {
+        let (racine, journal) = web_simule().await;
+        tune_core::services_factices::substituer_base(
+            tune_core::library::logos_web::BASE_FACTICE,
+            &racine,
+        );
+        let dossier = tune_core::test_scratch::scratch_dir("labels-7089-route");
+        let chemin = dossier.path().join("tune.db");
+        let (app, state) = demarrer(chemin.to_str().unwrap());
+        state
+            .backend
+            .execute(
+                "INSERT INTO albums (title, artist_id, source, track_count, label, musicbrainz_release_id) \
+                 VALUES ('Blue Train', NULL, 'local', 0, 'Blue Note 7089', 'rel-7089')",
+                &[],
+            )
+            .unwrap();
+
+        let premiere = labels(&app).await;
+        let bn = premiere
+            .iter()
+            .find(|l| l["name"] == "Blue Note 7089")
+            .unwrap();
+        assert!(
+            bn.get("image_url").is_none(),
+            "la liste n'attend jamais la passe"
+        );
+
+        let web = cache_web_de(&crate::routes::library::artwork_cache_dir());
+        let debut = std::time::Instant::now();
+        // Une passe d'un autre banc peut tenir l'index : chaque liste relance
+        // la nôtre dès qu'aucune ne tourne.
+        while web.entree("Blue Note 7089").is_none() {
+            assert!(
+                debut.elapsed() < Duration::from_secs(60),
+                "la passe n'a rien inscrit"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            labels(&app).await;
+        }
+
+        let seconde = labels(&app).await;
+        let bn = seconde
+            .iter()
+            .find(|l| l["name"] == "Blue Note 7089")
+            .unwrap();
+        assert!(
+            bn["image_url"]
+                .as_str()
+                .is_some_and(|u| u.starts_with("/api/v1/library/artwork/")),
+            "{bn}"
+        );
+        assert_eq!(bn["image_credit"]["provider"], "Wikimedia Commons");
+        assert_eq!(bn["image_credit"]["source"], "commons");
+        assert_eq!(bn["image_credit"]["license_status"], "free");
+        assert_eq!(bn["image_credit"]["license"], "Public domain");
+        assert_eq!(bn["image_credit"]["author"], "Reid Miles");
+        assert_eq!(bn["image_credit"]["file"], "Blue Note Records.svg");
+        assert_eq!(
+            bn["image_credit"]["source_url"],
+            "https://commons.wikimedia.org/wiki/File:Blue_Note_Records.svg"
+        );
+        assert_eq!(bn["image_credit"]["doubtful"], true, "PD-self : à vérifier");
+        assert!(
+            bn.get("qobuz_label_id").is_none(),
+            "un MBID n'est pas un identifiant Qobuz"
+        );
+        let j = journal.lock().unwrap().clone();
+        assert_eq!(&j[..2], ["release/rel-7089", "label/mb-bn-7089"], "{j:?}");
+        assert!(j.contains(&"image".to_string()));
+    }
+
+    /// Ordre de préférence : le logo du web prime sur Qobuz ; un logo Qobuz
+    /// seul est rendu avec son attribution « Qobuz, licence inconnue » ; un
+    /// logo du web sans attribution n'est jamais rendu ; et le web est demandé
+    /// même pour un label qui a déjà un logo Qobuz.
+    #[test]
+    fn le_web_prime_sur_qobuz_et_chaque_logo_porte_son_attribution_7089() {
+        let dossier = tune_core::test_scratch::scratch_dir("labels-7089-ordre");
+        let qobuz = CacheLogosLabels::ouvrir(dossier.path());
+        let web = CacheLogosLabels::ouvrir_index(dossier.path(), FICHIER_INDEX_WEB);
+        let condensat =
+            tune_core::library::artwork::cache_fetched_image(PNG, dossier.path(), "png").unwrap();
+        let entree = |attribution: Option<Attribution>| EntreeLogo {
+            statut: Statut::Trouve,
+            qobuz_label_id: None,
+            mb_label_id: None,
+            attribution,
+            image: Some(condensat.clone()),
+            verifie_le: maintenant(),
+        };
+        let wikipedia = Attribution {
+            source: SourceDuLogo::Wikipedia,
+            statut_licence: StatutDeLicence::NonLibreIdentification,
+            fournisseur: "Wikipedia".into(),
+            licence: Some("Fair use".into()),
+            licence_url: None,
+            auteur: None,
+            source_url: "https://en.wikipedia.org/wiki/File:ECM.png".into(),
+            fichier: Some("ECM.png".into()),
+            douteux: false,
+        };
+        let discogs = Attribution {
+            source: SourceDuLogo::Discogs,
+            statut_licence: StatutDeLicence::Inconnue,
+            fournisseur: "Discogs".into(),
+            licence: None,
+            licence_url: None,
+            auteur: None,
+            source_url: "https://www.discogs.com/label/281".into(),
+            fichier: None,
+            douteux: false,
+        };
+        qobuz.inscrire("Les deux", entree(None));
+        qobuz.inscrire("Qobuz seul", entree(None));
+        web.inscrire("Les deux", entree(Some(wikipedia)));
+        web.inscrire("Discogs seul", entree(Some(discogs)));
+        web.inscrire("Sans attribution", entree(None));
+        let label = |nom: &str| LabelDeBibliotheque {
+            nom: nom.into(),
+            album_count: 1,
+            album_qobuz: None,
+            release_mb: Some("rel".into()),
+        };
+
+        let d = element(&qobuz, &web, &label("Les deux"));
+        assert_eq!(
+            d["image_credit"]["source"], "wikipedia",
+            "le web prime : {d}"
+        );
+        assert_eq!(
+            d["image_credit"]["license_status"],
+            "non_free_identification"
+        );
+        assert_eq!(d["image_credit"]["license"], "Fair use");
+        let q = element(&qobuz, &web, &label("Qobuz seul"));
+        assert!(q.get("image_url").is_some());
+        assert_eq!(
+            q["image_credit"],
+            json!({"source": "qobuz", "provider": "Qobuz", "license_status": "unknown"})
+        );
+        let g = element(&qobuz, &web, &label("Discogs seul"));
+        assert_eq!(g["image_credit"]["source"], "discogs");
+        assert_eq!(g["image_credit"]["license_status"], "unknown");
+        assert!(g["image_credit"].get("license").is_none());
+        assert!(g["image_credit"].get("doubtful").is_none());
+        let s = element(&qobuz, &web, &label("Sans attribution"));
+        assert!(
+            s.get("image_url").is_none(),
+            "jamais un logo du web sans attribution : {s}"
+        );
+
+        let demandes = demandes_web(&[label("Les deux"), label("Discogs seul")]);
+        assert_eq!(
+            demandes.iter().map(|d| d.nom.as_str()).collect::<Vec<_>>(),
+            ["Les deux", "Discogs seul"],
+            "le web est demandé même quand Qobuz a un logo"
+        );
+        assert_eq!(demandes[0].album_du_catalogue.as_deref(), Some("rel"));
+    }
+
+    /// La liste des labels porte le MBID d'une release de la bibliothèque.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn la_liste_des_labels_porte_un_mbid_de_release_7089() {
+        let dossier = tune_core::test_scratch::scratch_dir("labels-7089-mbid");
+        let chemin = dossier.path().join("tune.db");
+        let (_app, state) = demarrer(chemin.to_str().unwrap());
+        state
+            .backend
+            .execute_batch(
+                "INSERT INTO albums (title, source, track_count, label, musicbrainz_release_id) VALUES
+                   ('A', 'local', 0, 'Lbl 7089', ''),
+                   ('B', 'local', 0, 'Lbl 7089', 'rel-b'),
+                   ('C', 'local', 0, 'Autre 7089', NULL);",
+            )
+            .unwrap();
+        let liste = AlbumRepo::with_backend(state.backend.clone())
+            .labels_de_la_bibliotheque()
+            .unwrap();
+        let par = |n: &str| {
+            liste
+                .iter()
+                .find(|l| l.nom == n)
+                .unwrap()
+                .release_mb
+                .clone()
+        };
+        assert_eq!(par("Lbl 7089").as_deref(), Some("rel-b"));
+        assert_eq!(par("Autre 7089"), None);
     }
 
     // -----------------------------------------------------------------------
@@ -600,6 +1019,7 @@ mod tests {
                 id: "9".into(),
                 nom: nom.into(),
                 image_url: None,
+                attribution: None,
             }))
         }
         async fn telecharger_image(&self, _: &str) -> Result<Vec<u8>, String> {
@@ -641,6 +1061,7 @@ mod tests {
             nom: "ECM".into(),
             album_count: 3,
             album_qobuz: album_qobuz.map(String::from),
+            release_mb: None,
         }
     }
 
@@ -657,6 +1078,8 @@ mod tests {
             EntreeLogo {
                 statut: Statut::Erreur,
                 qobuz_label_id: Some("9".into()),
+                mb_label_id: None,
+                attribution: None,
                 image: None,
                 verifie_le: maintenant() - tune_core::library::logos_labels::DELAI_ERREUR_S - 1,
             },
@@ -707,6 +1130,7 @@ mod tests {
             nom: "Sans Qobuz 6782".into(),
             album_count: 1,
             album_qobuz: None,
+            release_mb: None,
         };
         for _ in 0..2 {
             assert!(

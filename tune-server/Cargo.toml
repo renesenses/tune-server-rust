@@ -156,6 +156,9 @@ dotenvy = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"
+# Test-only (#6286) : donner aux FLAC témoins de l'audit d'intégrité le MD5
+# STREAMINFO de leur PCM. Déjà dans Cargo.lock par tune-core.
+md-5 = { workspace = true }
 # Test-only (#3326, S2-a) : jouer le ROLE CLIENT du protocole Sendspin contre
 # notre propre point d'acces, sur une vraie connexion WebSocket. `axum` sait
 # accepter une connexion, pas en ouvrir une.
@@ -575,6 +578,13 @@ path = "tests/dossier_cue_4625.rs"
 name = "pg_group_by_strict_historique"
 path = "tests/pg_group_by_strict_historique.rs"
 
+# #7128 — étiqueter tout le résultat d'un filtre d'Oxygen : SQLite dans la
+# suite ordinaire, PostgreSQL sous `TUNE_TEST_PG_URL` (test-postgres.yml).
+# `autotests = false` en tête de ce manifeste : sans cette cible, jamais compilé.
+[[test]]
+name = "etiquetage_par_filtre_7128"
+path = "tests/etiquetage_par_filtre_7128.rs"
+
 # Depuis #3039, la fenetre des ajouts recents est un parametre borne.
 [[test]]
 name = "ajouts_recents_fenetre"
@@ -879,6 +889,12 @@ path = "tests/radio_ajout_web_sans_doublon_3543.rs"
 [[test]]
 name = "radios_recherche_distinction"
 path = "tests/radios_recherche_distinction.rs"
+
+# #7044 — le nom du serveur (page publique des radios). `autotests = false` :
+# sans cette inscription, le fichier ne serait jamais compilé.
+[[test]]
+name = "nom_du_serveur_7044"
+path = "tests/nom_du_serveur_7044.rs"
 
 # #6516 — annuaire radio-metadata.fr : cache local (ETag, hors ligne),
 # rapprochement de « Mes radios », ajout sans doublon. `autotests = false` :
@@ -1200,6 +1216,13 @@ path = "tests/alarm_source_3715.rs"
 name = "alarm_days_5669"
 path = "tests/alarm_days_5669.rs"
 
+# #7047 — le réveil posé sur une radio depuis l'écran de lecture, et le refus
+# en 400 d'une source vide ou mal formée. `autotests = false` en tête de ce
+# manifeste : sans cette cible, jamais compilé.
+[[test]]
+name = "alarm_radio_7047"
+path = "tests/alarm_radio_7047.rs"
+
 [[test]]
 name = "history_context_4036"
 path = "tests/history_context_4036.rs"
@@ -1361,6 +1384,12 @@ path = "tests/pg_pochette_lecture_bornee.rs"
 name = "exemplaires_par_repertoire_4907"
 path = "tests/exemplaires_par_repertoire_4907.rs"
 
+# #6917 — ne dédoublonner que les copies d'une même racine de musique : le
+# vrai scan et le nettoyage, option allumée et éteinte, SQLite et PostgreSQL.
+[[test]]
+name = "dedoublonnage_par_racine_6917"
+path = "tests/dedoublonnage_par_racine_6917.rs"
+
 # « pas de bouton pour supprimer une playlist Tidal ! » — le trait savait le
 # faire (Qobuz seulement) mais AUCUNE route ne l'appelait. `autotests = false`
 # plus haut : sans cette cible, la garde du refus préalable (501 avant tout
@@ -1458,6 +1487,11 @@ path = "tests/labels_par_le_pilote_4836.rs"
 [[test]]
 name = "identification_choix_4805"
 path = "tests/identification_choix_4805.rs"
+# #6845 — une nuit simulée de la passe de nuit, contre un faux MusicBrainz,
+# horloge donnée. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "identification_nuit_6845"
+path = "tests/identification_nuit_6845.rs"
 # #4805 (idée 4) — la passe par empreinte AcoustID, par la route montée, sur
 # des réponses enregistrées et un faux `fpcalc`. `autotests = false` en tête de
 # ce manifeste : sans cette cible, le fichier ne serait jamais compilé.
@@ -1767,6 +1801,13 @@ required-features = ["postgres"]
 name = "pg_requete_textuelle_6287"
 path = "tests/pg_requete_textuelle_6287.rs"
 required-features = ["postgres"]
+
+# #6287 — la même route sur SQLite, et l'enregistrement d'une requête
+# imbriquée (étape 4). Le fichier existait sans cible : `autotests = false` en
+# tête de ce manifeste ne l'avait jamais compilé.
+[[test]]
+name = "requete_textuelle_6287"
+path = "tests/requete_textuelle_6287.rs"
 
 # #6336 — AirPlay 2, SMB, Qobuz, TIDAL et Deezer éprouvés par le vrai routeur
 # contre des faux locaux. Binaire à lui seul : les substitutions de programmes

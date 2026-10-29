@@ -73,7 +73,7 @@ use tracing::{info, warn};
 
 use super::traits::StreamingService;
 use crate::db::backend::DbBackend;
-use crate::db::streaming_favorites_repo::StreamingFavoritesRepo;
+use crate::db::streaming_favorites_repo::{AnneeQualite, StreamingFavoritesRepo};
 
 /// Le compte d'un passage, par type et au total.
 ///
@@ -129,6 +129,20 @@ pub(crate) struct Entree {
     /// L'ISRC d'une piste quand le service le donne (#5997, rapprochement
     /// local #2127). `None` pour les albums et les artistes.
     pub(crate) isrc: Option<String>,
+    /// L'année de sortie et la qualité d'un favori ALBUM, quand le service
+    /// les donne (#6482). Vide pour les pistes, les artistes et les playlists.
+    pub(crate) annee_qualite: AnneeQualite,
+}
+
+/// L'année et la qualité d'un album, lues dans sa projection sérialisée
+/// (`StreamAlbum` : `year`, `quality.sample_rate`, `quality.bit_depth`).
+pub(crate) fn annee_qualite_projetee(v: &serde_json::Value) -> AnneeQualite {
+    let nombre = |x: &serde_json::Value| x.as_u64().and_then(|n| u32::try_from(n).ok());
+    AnneeQualite {
+        year: nombre(&v["year"]),
+        sample_rate: nombre(&v["quality"]["sample_rate"]),
+        bit_depth: nombre(&v["quality"]["bit_depth"]),
+    }
 }
 
 /// Les entrées DATÉES d'un type, par `get_user_favorites_dated` (#3489) —
@@ -204,6 +218,7 @@ async fn entrees_datees(
                 // (`QobuzService::favori_date`).
                 ai_generated: v.get("album_ai_generated").and_then(|x| x.as_bool()),
                 isrc: texte(v, &["isrc"]).filter(|i| !i.trim().is_empty()),
+                annee_qualite: AnneeQualite::default(),
             },
             "album" => Entree {
                 item_type,
@@ -215,6 +230,7 @@ async fn entrees_datees(
                 created_at: texte(v, &["created_at"]),
                 ai_generated: v.get("ai_generated").and_then(|x| x.as_bool()),
                 isrc: None,
+                annee_qualite: annee_qualite_projetee(v),
             },
             _ => Entree {
                 item_type,
@@ -226,6 +242,7 @@ async fn entrees_datees(
                 created_at: texte(v, &["created_at"]),
                 ai_generated: None,
                 isrc: None,
+                annee_qualite: AnneeQualite::default(),
             },
         })
         .collect()))
@@ -258,6 +275,7 @@ pub(crate) async fn lire_les_favoris(
                 created_at: None,
                 ai_generated: None,
                 isrc: t.isrc.filter(|i| !i.trim().is_empty()),
+                annee_qualite: AnneeQualite::default(),
             })
             .collect(),
         "albums" => svc
@@ -278,6 +296,11 @@ pub(crate) async fn lire_les_favoris(
                 created_at: None,
                 ai_generated: a.ai_generated,
                 isrc: None,
+                annee_qualite: AnneeQualite {
+                    year: a.year,
+                    sample_rate: a.quality.as_ref().map(|q| q.sample_rate),
+                    bit_depth: a.quality.as_ref().map(|q| u32::from(q.bit_depth)),
+                },
             })
             .collect(),
         "artists" => svc
@@ -295,6 +318,7 @@ pub(crate) async fn lire_les_favoris(
                 created_at: None,
                 ai_generated: None,
                 isrc: None,
+                annee_qualite: AnneeQualite::default(),
             })
             .collect(),
         autre => return Err(format!("type de favori non relu : {autre}")),
@@ -390,6 +414,7 @@ fn enregistrer(
                     stats.redates += 1;
                 }
                 poser_le_marquage_ia(repo, profile_id, service, &entree);
+                poser_annee_et_qualite(repo, profile_id, service, &entree);
                 continue;
             }
             Ok(false) => {}
@@ -413,6 +438,7 @@ fn enregistrer(
             Ok(()) => {
                 stats.ajoutes += 1;
                 poser_le_marquage_ia(repo, profile_id, service, &entree);
+                poser_annee_et_qualite(repo, profile_id, service, &entree);
             }
             Err(e) => {
                 warn!(service = %service, erreur = %e, "reprise_favoris_ecriture_impossible");
@@ -444,6 +470,27 @@ fn poser_le_marquage_ia(
         ia,
     ) {
         warn!(service = %service, erreur = %e, "reprise_favoris_marquage_ia_impossible");
+    }
+}
+
+/// #6482 — range l'année et la qualité que le service donne avec un favori
+/// album, à l'ajout comme sur un favori déjà présent : une reprise d'avant ce
+/// correctif a laissé ces colonnes vides. Même règle que le marquage IA : une
+/// absence ne touche à rien, un échec est journalisé, jamais compté.
+fn poser_annee_et_qualite(
+    repo: &StreamingFavoritesRepo,
+    profile_id: i64,
+    service: &str,
+    entree: &Entree,
+) {
+    if let Err(e) = repo.poser_annee_et_qualite(
+        profile_id,
+        entree.item_type,
+        service,
+        &entree.service_id,
+        &entree.annee_qualite,
+    ) {
+        warn!(service = %service, erreur = %e, "reprise_favoris_annee_qualite_impossible");
     }
 }
 
@@ -503,6 +550,8 @@ mod tests_dates {
             ],
             "albums" if trois_types => vec![json!({"id": 999, "title": "Time Out",
                 "artist": {"name": "Dave Brubeck", "id": 42}, "tracks_count": 7,
+                "release_date_original": "1959-12-14",
+                "maximum_bit_depth": 24, "maximum_sampling_rate": 192.0,
                 "favorited_at": 1_700_000_000})],
             "artists" if trois_types => vec![json!({"id": 42, "name": "Dave Brubeck",
                 "favorited_at": 1_700_000_000})],
@@ -658,6 +707,7 @@ mod tests_dates {
             created_at: None,
             ai_generated: ia,
             isrc: None,
+            annee_qualite: AnneeQualite::default(),
         };
         enregistrer(
             &repo,
@@ -807,6 +857,63 @@ mod tests_dates {
             dates(&backend).contains(&(s("1"), s("2025-01-01T00:00:00Z"))),
             "la date de Qobuz : {:?}",
             dates(&backend)
+        );
+    }
+
+    /// `(type, id, year, sample_rate, bit_depth)` de chaque favori.
+    fn annees_et_qualites(backend: &Arc<dyn DbBackend>) -> Vec<[String; 5]> {
+        backend
+            .query_many(
+                "SELECT item_type, service_id, year, sample_rate, bit_depth \
+                 FROM streaming_favorites ORDER BY item_type, service_id",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| {
+                std::array::from_fn(|i| r.get(i).and_then(|v| v.as_string()).unwrap_or_default())
+            })
+            .collect()
+    }
+
+    /// #6482 (DidLyon, fil 2320) — l'année de sortie et la qualité d'un album
+    /// favori Qobuz, lues dans ce que Qobuz rend (`release_date_original`,
+    /// `maximum_sampling_rate`, `maximum_bit_depth`), sont RANGÉES avec le
+    /// favori : c'est ce que lisent les règles « Année », « Fréquence » et
+    /// « Résolution » d'une collection intelligente. Le favori existait déjà
+    /// (reprise d'avant ce correctif, colonnes vides) : la reprise suivante
+    /// les remplit. Les pistes et les artistes n'en reçoivent pas.
+    #[tokio::test]
+    async fn la_reprise_range_l_annee_et_la_qualite_des_albums_6482() {
+        let backend = base();
+        StreamingFavoritesRepo::with_backend(backend.clone())
+            .add(
+                1,
+                "album",
+                "qobuz",
+                "999",
+                Some("Time Out"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let qobuz = ServiceDate {
+            service: "qobuz",
+            trois_types: true,
+            redate_epoch: None,
+        };
+        reprendre_les_favoris_du_service(&qobuz, 1, &backend).await;
+        let s = |x: &str| x.to_string();
+        assert_eq!(
+            annees_et_qualites(&backend),
+            vec![
+                [s("album"), s("999"), s("1959"), s("192000"), s("24")],
+                [s("artist"), s("42"), s(""), s(""), s("")],
+                [s("track"), s("1"), s(""), s(""), s("")],
+                [s("track"), s("2"), s(""), s(""), s("")],
+            ],
+            "l'année et la qualité de « Time Out » doivent être rangées avec son favori"
         );
     }
 

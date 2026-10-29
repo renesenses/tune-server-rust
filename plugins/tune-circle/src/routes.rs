@@ -15,6 +15,12 @@
 //! CONTACTS, et les cercles leurs classements privés par le propriétaire.
 //! Purement additif ; `GET /` y gagne la clé `circles`, relayée telle quelle.
 //!
+//! #7124 (décision du 26/10/2026) : `GET /` gagne aussi `member_of` — les cercles
+//! des AUTRES où je suis rangé (`[{ owner_id, owner_name, circle_name }]`, liens
+//! actifs seulement, clé absente si je ne suis rangé nulle part), relayée telle
+//! quelle comme `circles`. Un membre peut aussi partager une playlist dans un
+//! cercle où il est rangé : `POST /playlists` part inchangé, le cloud juge.
+//!
 //! | Tune (`/api/v1/ext/circle`)                  | mozaiklabs (`/api/v1/circle`)          |
 //! |----------------------------------------------|----------------------------------------|
 //! | `POST /invitations` `{ "email", "circle_id"? }` | `POST /invitations`                 |
@@ -47,10 +53,18 @@
 //! `GET /contacts/{user_id}/library/summary`, `GET|PUT|DELETE /me/location`,
 //! `GET /contacts/locations`, relayés à l'identique.
 //!
+//! rc9 (#7122), la carte publique anonyme, dans [`crate::globe`] : `GET
+//! /world/points`, `GET|PUT|DELETE /me/public-map-opt-out`, relayés à
+//! l'identique.
+//!
 //! #6935, inviter sans e-mail, dans [`crate::sans_email`] : `POST
 //! /invitations/by-pseudo`, `GET|POST /invitation-links`, `DELETE
 //! /invitation-links/{id}`, `POST /invitations/{id}/block`, `GET /blocks`,
 //! `DELETE /blocks/{user_id}`, relayés à l'identique.
+//!
+//! rc9 (#7130), les notifications de Tune web, dans [`crate::notifications`] :
+//! `GET /notifications`, `POST /notifications/{id}/read`, `POST
+//! /notifications/read-all`, `GET|PUT /notifications/preferences`.
 //!
 //! T4, l'écoute chez un contact (#5327), Premium : `POST
 //! /contacts/{user_id}/listen`, dans [`crate::ecoute`].
@@ -106,6 +120,9 @@ pub const CODE_REPONSE_ILLISIBLE: &str = "circle.unreadable_response";
 pub const CODE_SERVEUR_NON_LIE: &str = "circle.server_not_linked";
 
 pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
+    // rc9 (#7130) : les notifications de Tune web, dans [`crate::notifications`].
+    let notifications = crate::notifications::router(relais.clone());
+    let messagerie = crate::messagerie::router(relais.clone());
     let etat_de_la_copie = Router::new()
         .route("/library-sync", get(etat_de_la_copie_en_ligne))
         .with_state(Arc::new(EtatDeLaCopie {
@@ -179,8 +196,18 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
                 .delete(crate::globe::retirer_mon_lieu),
         )
         .route("/contacts/locations", get(crate::globe::lieux_des_contacts))
+        // rc9 (#7122) : la carte publique anonyme et son interrupteur.
+        .route("/world/points", get(crate::globe::points_du_monde))
+        .route(
+            "/me/public-map-opt-out",
+            get(crate::globe::mon_retrait_de_la_carte)
+                .put(crate::globe::me_retirer_de_la_carte)
+                .delete(crate::globe::revenir_sur_la_carte),
+        )
         .with_state(relais)
         .merge(etat_de_la_copie)
+        .merge(notifications)
+        .merge(messagerie)
 }
 
 // #6521 — les vignettes des pochettes partagées avec le cercle -----------------
@@ -648,7 +675,11 @@ async fn relire_le_partage(relais: &Relais) {
 /// serveur partagé. Sans `server_id` local, `null` part et le cloud répond 422.
 /// Les 404 du cloud deviennent `circle.server_not_linked` (serveur pas encore
 /// lié au compte) ou `circle.not_found` (cercle d'un autre).
-async fn partager(State(relais): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
+async fn partager(
+    State(relais): State<Arc<Relais>>,
+    Path(id): Path<String>,
+    vignettes: Option<axum::Extension<Arc<crate::vignettes::Vignettes>>>,
+) -> Response {
     if !identifiant_valide(&id) {
         return introuvable();
     }
@@ -663,6 +694,10 @@ async fn partager(State(relais): State<Arc<Relais>>, Path(id): Path<String>) -> 
         .await;
     if reussie(&issue) {
         ecrire_le_partage(&relais, true);
+        // #6733 : ne pas attendre le prochain passage des pochettes.
+        if let Some(axum::Extension(vignettes)) = vignettes {
+            vignettes.reveiller();
+        }
         // Une bibliothèque jamais poussée part entière au prochain cycle —
         // sans quoi les contacts parcourraient un catalogue vide ou troué.
         let jamais_poussee = relais

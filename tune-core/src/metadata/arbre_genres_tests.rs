@@ -82,7 +82,13 @@ async fn la_liste_se_lit_page_par_page_jusqu_au_total_6001() {
 
 #[tokio::test]
 async fn une_page_manquante_ne_donne_pas_une_liste_partielle_6001() {
-    let lire = |offset: u32| std::future::ready(if offset == 0 { Ok(page(0)) } else { Err(()) });
+    let lire = |offset: u32| {
+        std::future::ready(if offset == 0 {
+            Ok(page(0))
+        } else {
+            Err(SansReponse)
+        })
+    };
     assert!(lire_index_par(&lire).await.is_err());
 }
 

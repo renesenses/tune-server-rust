@@ -8,6 +8,13 @@ use super::sqlite::SqliteDb;
 use crate::favorites_sort::{self, CleDeTri, TriFavoris};
 use crate::streaming::favorites_identity::identite_de_favori;
 
+/// #6399 — le miroir retrouve un favori dans TOUS les profils. La clé unique
+/// commence par `profile_id` : sans statistiques permettant un skip-scan,
+/// chaque écriture sans profil peut balayer toute la table, pour chaque favori.
+/// Reposé à chaque démarrage, sur SQLite comme PostgreSQL.
+pub const INDEX_FAVORIS_MIROIR: &str = "CREATE INDEX IF NOT EXISTS idx_streaming_favorites_miroir \
+    ON streaming_favorites(service, item_type, service_id)";
+
 /// A favorited streaming item (Tidal/Qobuz/…). Unlike local `favorites` (keyed
 /// on an INTEGER `item_id`), streaming items use string `service_id`s, so they
 /// live in their own `streaming_favorites` table. Display metadata is stored so
@@ -60,6 +67,27 @@ pub struct StreamingFavorite {
     /// succès.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub miroir_erreur: Option<String>,
+}
+
+/// L'année de sortie et la qualité d'un album de service, telles que le
+/// service les annonce avec le favori (#6482). Rangées dans
+/// `streaming_favorites.year`, `.sample_rate` et `.bit_depth`, elles laissent
+/// une collection intelligente classer les albums favoris d'un service par
+/// année et par qualité, comme les albums locaux. `None` : le service ne dit
+/// rien, et rien n'est inventé.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AnneeQualite {
+    pub year: Option<u32>,
+    pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u32>,
+}
+
+impl AnneeQualite {
+    pub fn est_vide(&self) -> bool {
+        [self.year, self.sample_rate, self.bit_depth]
+            .iter()
+            .all(|v| v.is_none_or(|n| n == 0))
+    }
 }
 
 /// Engine-agnostic SQL builders.
@@ -213,6 +241,23 @@ pub mod sql {
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5),
+        )
+    }
+
+    /// Pose l'année et la qualité d'UN favori album (#6482). `COALESCE` : une
+    /// réponse du service qui ne les répète pas n'efface pas ce qui est connu.
+    pub fn poser_annee_et_qualite<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE streaming_favorites SET year = COALESCE({}, year), \
+               sample_rate = COALESCE({}, sample_rate), bit_depth = COALESCE({}, bit_depth) \
+             WHERE {} AND item_type = {} AND service = {} AND service_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            profil_egal(d, "profile_id", 4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
         )
     }
 
@@ -465,6 +510,43 @@ impl StreamingFavoritesRepo {
         self.db.execute(&sql, &params).map(|_| ())
     }
 
+    /// Pose l'année de sortie et la qualité (fréquence, résolution) d'un
+    /// favori album, telles que le service les annonce (#6482) : ce que lisent
+    /// les règles « Année », « Fréquence » et « Résolution » d'une collection
+    /// intelligente. Un champ absent ne touche à rien. Sans effet si le favori
+    /// n'existe pas, ou si le service ne dit rien.
+    pub fn poser_annee_et_qualite(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        service: &str,
+        service_id: &str,
+        annee_qualite: &AnneeQualite,
+    ) -> Result<(), String> {
+        if annee_qualite.est_vide() {
+            return Ok(());
+        }
+        let sql = self.dialect_sql(sql::poser_annee_et_qualite, sql::poser_annee_et_qualite);
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
+        let texte = |n: Option<u32>| n.filter(|v| *v > 0).map(|v| v.to_string());
+        let (year, sample_rate, bit_depth) = (
+            texte(annee_qualite.year),
+            texte(annee_qualite.sample_rate),
+            texte(annee_qualite.bit_depth),
+        );
+        let params: [&dyn ToSqlValue; 7] = [
+            &year,
+            &sample_rate,
+            &bit_depth,
+            &profile_id,
+            &item_type,
+            &service,
+            &service_id,
+        ];
+        self.db.execute(&sql, &params).map(|_| ())
+    }
+
     /// Pose le marquage IA d'un ALBUM de service sur tous les favoris qui le
     /// désignent, tous profils confondus (#5530) : l'album en favori, et les
     /// pistes favorites dont `album_ref` le nomme. Rend le nombre de lignes
@@ -633,7 +715,10 @@ impl StreamingFavoritesRepo {
             let params: [&dyn ToSqlValue; 1] = [&pid];
             self.db.query_many(&sql, &params)?
         };
-        Ok(rows.iter().map(row_to_streaming_favorite).collect())
+        Ok(rows
+            .iter()
+            .map(|cols| row_to_streaming_favorite(cols))
+            .collect())
     }
 
     /// Les mêmes favoris, rangés selon `tri` (#2001).
@@ -669,7 +754,10 @@ impl StreamingFavoritesRepo {
                 // entre `created_at` et `position` dans SELECT_COLS_POUR_RANG.
                 r.get(14).and_then(|v| v.as_i64())
             });
-            return Ok(rows.iter().map(row_to_streaming_favorite).collect());
+            return Ok(rows
+                .iter()
+                .map(|cols| row_to_streaming_favorite(cols))
+                .collect());
         }
 
         let mut items = self.list(profile_id, item_type)?;
@@ -735,7 +823,7 @@ impl StreamingFavoritesRepo {
     }
 }
 
-fn row_to_streaming_favorite(cols: &Vec<SqlValue>) -> StreamingFavorite {
+fn row_to_streaming_favorite(cols: &[SqlValue]) -> StreamingFavorite {
     StreamingFavorite {
         id: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
         profile_id: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(1),

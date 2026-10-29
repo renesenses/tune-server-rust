@@ -55,3 +55,79 @@ async fn a_l_arret_le_parc_est_bien_sonde_6119() {
          n'apparaîtrait jamais"
     );
 }
+
+/// #7263 : FIP joue sur le réseau, aucune sortie locale ne joue. Le rescan
+/// périodique Linux évite déjà ALSA ; les lectures API du parc doivent aussi
+/// s'en tenir au cache, puis retrouver le hotplug après l'arrêt.
+#[tokio::test]
+async fn une_radio_reseau_suspend_les_sondes_du_parc_sous_linux_7263() {
+    let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+    state
+        .playback
+        .play(
+            10,
+            tune_core::playback::NowPlaying {
+                source: "radio".into(),
+                title: "FIP".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    let attendu = usize::from(!cfg!(target_os = "linux"));
+    assert_eq!(
+        enumerations_pendant(&state).await,
+        attendu,
+        "#7263 : FIP réseau joue ; sous Linux la lecture du parc sonde encore ALSA au lieu de servir le cache"
+    );
+    state.playback.stop(10).await;
+    assert_eq!(
+        enumerations_pendant(&state).await,
+        1,
+        "#7263 : à l'arrêt, le hotplug doit pouvoir reprendre"
+    );
+}
+
+/// Même décision de production, système injecté : la règle Linux reste
+/// vérifiable sur le Mac, sans prétendre y exécuter un pilote ALSA.
+#[tokio::test]
+async fn la_garde_reseau_linux_est_verifiee_sur_tous_les_hotes_7263() {
+    let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+    state
+        .playback
+        .play(
+            10,
+            tune_core::playback::NowPlaying {
+                source: "radio".into(),
+                title: "FIP".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    for (os, attendu) in [("linux", 0), ("windows", 1), ("macos", 1)] {
+        let compteur = Arc::new(AtomicUsize::new(0));
+        let appels = compteur.clone();
+        parc_local_sans_couper_la_lecture_selon_os(&state, os, || async move {
+            appels.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        })
+        .await;
+        assert_eq!(
+            compteur.load(Ordering::SeqCst),
+            attendu,
+            "#7263 : sous {os}, une lecture réseau laisse une sonde ALSA inutile contourner la garde du rescan"
+        );
+    }
+    state.playback.stop(10).await;
+    let compteur = Arc::new(AtomicUsize::new(0));
+    let appels = compteur.clone();
+    parc_local_sans_couper_la_lecture_selon_os(&state, "linux", || async move {
+        appels.fetch_add(1, Ordering::SeqCst);
+        Vec::new()
+    })
+    .await;
+    assert_eq!(
+        compteur.load(Ordering::SeqCst),
+        1,
+        "#7263 : le hotplug reprend à l'arrêt sous Linux"
+    );
+}

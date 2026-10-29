@@ -5064,6 +5064,9 @@ fn descriptions_eq_et_replaygain_suivent_les_douze_langues_6496() {
         ("sv", "EQ aktiv"),
         ("vi", "EQ hoạt động"),
         ("hu", "EQ aktív"),
+        ("nb", "EQ aktiv"),
+        ("pl", "EQ aktywny"),
+        ("el", "EQ ενεργός"),
     ] {
         let sp = build_signal_path_lang(
             lang,

@@ -22,6 +22,7 @@
 //! connexion, tant que la cadence et le nombre de canaux ne changent pas.
 use symphonia::core::codecs::audio::AudioCodecParameters;
 use symphonia::core::codecs::audio::AudioDecoder;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::codecs::audio::well_known::CODEC_ID_OPUS;
 use symphonia::core::packet::Packet;
 
@@ -69,6 +70,23 @@ fn pre_skip_opus(params: &AudioCodecParameters) -> usize {
         })
 }
 
+/// #7046 — les options du décodeur symphonia d'une station. Un flux MPEG
+/// (MP1, MP2, MP3) n'a pas de fin : ce sont des trames mises bout à bout.
+/// Mais quand il s'ouvre sur un FICHIER, la publicité d'ouverture de TSF Jazz
+/// (Infomaniak, mesuré le 26/10/2026 : en-tête LAME « Info », 1 152 trames,
+/// 481 906 octets, soit 30 s, puis le direct sans en-tête), symphonia prend la
+/// longueur de ce fichier pour celle de la station. En mode « gapless », le
+/// décodeur rogne alors à zéro chaque trame qui suit : la boucle radio lit le
+/// direct sans fin et ne sert plus un échantillon, sans erreur ni
+/// reconnexion. Le rognage des retards d'encodeur n'a pas de sens sur un
+/// direct : il est coupé pour le MPEG, et rien ne change pour les autres
+/// codecs (Ogg chaîné, AAC, FLAC).
+fn options_du_decodeur(params: &AudioCodecParameters) -> AudioDecoderOptions {
+    use symphonia::core::codecs::audio::well_known::{CODEC_ID_MP1, CODEC_ID_MP2, CODEC_ID_MP3};
+    let mpeg = matches!(params.codec, CODEC_ID_MP1 | CODEC_ID_MP2 | CODEC_ID_MP3);
+    AudioDecoderOptions::default().gapless(!mpeg)
+}
+
 impl DecodeurRadio {
     /// Le décodeur qui convient aux paramètres de la piste sondée.
     pub(super) fn pour(params: &AudioCodecParameters) -> Result<Self, String> {
@@ -96,7 +114,7 @@ impl DecodeurRadio {
             });
         }
         symphonia::default::get_codecs()
-            .make_audio_decoder(params, &Default::default())
+            .make_audio_decoder(params, &options_du_decodeur(params))
             .map(DecodeurRadio::Symphonia)
             .map_err(|e| format!("radio decoder init failed: {e}"))
     }

@@ -26,6 +26,7 @@ pub mod sso;
 pub mod support;
 pub mod telemetry;
 pub mod tune_tested;
+pub mod tune_tested_auto;
 
 /// Posé par le relais (`relay`) sur CHAQUE requête qu'il rejoue en local,
 /// après les en-têtes venus du distant : un appelant distant peut ajouter des

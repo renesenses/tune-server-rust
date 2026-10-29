@@ -7,7 +7,11 @@
 //!   retenu.
 //! - `GET` / `PUT /zones/{id}/volume-limits` `{"safety"?, "safety_db"?,
 //!   "comfort"?, "comfort_db"?}` : les deux seuils, en fraction 0..1 OU en dB
-//!   (exclusifs par seuil). Le PUT remplace les deux : un seuil absent ou
+//!   (exclusifs par seuil). #6918 : sur une sortie à course en dB (Devialet
+//!   AIR), `safety_device_db` / `comfort_device_db` donnent le seuil en dB
+//!   d'APPAREIL, exclusifs eux aussi ; la réponse publie alors
+//!   `volume_limit_safety_device_db` / `volume_limit_comfort_device_db`.
+//!   Le PUT remplace les deux : un seuil absent ou
 //!   `null` est effacé (pas de limite).
 //!   - Une sécurité ABAISSÉE (ou posée là où il n'y en avait pas) sous ce que
 //!     reçoit l'appareil ramène la zone sur-le-champ, À LA BAISSE seulement.
@@ -53,6 +57,8 @@ pub(super) struct ReglageDesLimites {
     safety_db: Option<f64>,
     comfort: Option<f64>,
     comfort_db: Option<f64>,
+    safety_device_db: Option<f64>,
+    comfort_device_db: Option<f64>,
 }
 
 fn refus(code: &str, message: impl Into<String>) -> Response {
@@ -88,11 +94,55 @@ fn un_seuil(nom: &str, lineaire: Option<f64>, db: Option<f64>) -> Result<Option<
     Ok(Some(valeur))
 }
 
+/// #6918 — un seuil demandé en dB d'APPAREIL, ramené à une fraction ; il
+/// exclut la fraction et le dB de pleine échelle du même seuil.
+fn un_seuil_appareil(
+    nom: &str,
+    lineaire: Option<f64>,
+    db: Option<f64>,
+    device_db: Option<f64>,
+    course: Option<tune_core::outputs::devialet_air::reglages::BornesDb>,
+) -> Result<Option<f64>, String> {
+    match device_db {
+        None => un_seuil(nom, lineaire, db),
+        Some(_) if lineaire.is_some() || db.is_some() => Err(format!(
+            "{nom}_device_db exclut {nom} et {nom}_db — n'en envoyer qu'un"
+        )),
+        Some(d) => {
+            let v = tune_core::audio::volume_appareil_db::demande(course, d)?;
+            un_seuil(nom, Some(v), None)
+        }
+    }
+}
+
 fn corps_des_limites(state: &AppState, zone_id: i64) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("zone_id".into(), json!(zone_id));
     volume_limites::publier(&mut obj, &state.backend, zone_id);
+    publier_en_db_d_appareil(&mut obj, state, zone_id);
     serde_json::Value::Object(obj)
+}
+
+/// #6918 — les limites lues en dB d'appareil (`null` hors sortie à course
+/// en dB).
+fn publier_en_db_d_appareil(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    state: &AppState,
+    zone_id: i64,
+) {
+    let output_type = ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_type);
+    tune_core::audio::volume_appareil_db::inserer_limites(
+        obj,
+        tune_core::audio::volume_appareil_db::course_de_la_sortie(
+            &state.backend,
+            output_type.as_deref(),
+        ),
+        &volume_limites::lire(&state.backend, zone_id),
+    );
 }
 
 pub(super) async fn lire_les_limites(
@@ -119,11 +169,27 @@ pub(super) async fn regler_les_limites(
     let Some(zone) = repo.get(id).ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let securite = match un_seuil("safety", body.safety, body.safety_db) {
+    let course = tune_core::audio::volume_appareil_db::course_de_la_sortie(
+        &state.backend,
+        zone.output_type.as_deref(),
+    );
+    let securite = match un_seuil_appareil(
+        "safety",
+        body.safety,
+        body.safety_db,
+        body.safety_device_db,
+        course,
+    ) {
         Ok(v) => v,
         Err(m) => return refus("invalid_volume_limit", m),
     };
-    let confort = match un_seuil("comfort", body.comfort, body.comfort_db) {
+    let confort = match un_seuil_appareil(
+        "comfort",
+        body.comfort,
+        body.comfort_db,
+        body.comfort_device_db,
+        course,
+    ) {
         Ok(v) => v,
         Err(m) => return refus("invalid_volume_limit", m),
     };
@@ -270,6 +336,14 @@ pub(super) async fn pas_de_volume(
     obj.insert("zone_id".into(), json!(id));
     tune_core::audio::volume_scale::inserer_volume(&mut obj, retenu);
     tune_core::audio::volume_scale::inserer_courbe(&mut obj, echelle);
+    // #6918 — les dB de l'appareil, pour une sortie à course en dB.
+    tune_core::audio::volume_appareil_db::publier(
+        &mut obj,
+        &state.backend,
+        id,
+        zone.output_type.as_deref(),
+        retenu,
+    );
     // `limited` : la sécurité a retenu le pas — le client peut le dire au
     // lieu de laisser croire à un bouton cassé.
     obj.insert("limited".into(), json!(retenu + 1e-9 < cible));
@@ -280,3 +354,7 @@ pub(super) async fn pas_de_volume(
 #[cfg(test)]
 #[path = "limites_de_volume_6541_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "volume_db_appareil_6918_tests.rs"]
+mod volume_db_appareil_6918;

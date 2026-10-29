@@ -164,14 +164,18 @@ pub fn empreinte_avec_compensation(
 pub fn crete_relative(pcm: &[u8], bit_depth: u16) -> f64 {
     match bit_depth {
         16 => {
-            pcm.chunks_exact(2)
+            pcm.as_chunks::<2>()
+                .0
+                .iter()
                 .map(|s| (i16::from_le_bytes([s[0], s[1]]) as i32).unsigned_abs())
                 .max()
                 .unwrap_or(0) as f64
                 / 32_768.0
         }
         24 => {
-            pcm.chunks_exact(3)
+            pcm.as_chunks::<3>()
+                .0
+                .iter()
                 .map(|s| {
                     (((s[2] as i32) << 24 | (s[1] as i32) << 16 | (s[0] as i32) << 8) >> 8)
                         .unsigned_abs()
@@ -181,7 +185,9 @@ pub fn crete_relative(pcm: &[u8], bit_depth: u16) -> f64 {
                 / 8_388_608.0
         }
         32 => {
-            pcm.chunks_exact(4)
+            pcm.as_chunks::<4>()
+                .0
+                .iter()
                 .map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]).unsigned_abs())
                 .max()
                 .unwrap_or(0) as f64
@@ -200,7 +206,9 @@ mod tests {
     }
 
     fn lire16(pcm: &[u8]) -> Vec<i16> {
-        pcm.chunks_exact(2)
+        pcm.as_chunks::<2>()
+            .0
+            .iter()
             .map(|s| i16::from_le_bytes([s[0], s[1]]))
             .collect()
     }

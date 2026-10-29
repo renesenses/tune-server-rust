@@ -9,6 +9,8 @@ pub mod favorites_identity;
 pub mod favorites_import;
 pub mod favorites_mirror;
 pub mod matching;
+pub mod podcast_annuaires;
+pub mod podcast_catalogue;
 pub mod podcasts;
 /// #6480 — le texte de présentation d'un album de service, HTML ramené à du texte.
 pub mod presentation_album;
@@ -26,6 +28,7 @@ pub mod spotify_connect;
 pub mod spotify_lecture;
 pub mod tidal;
 pub mod titres_phares_ecoutes;
+pub mod titres_phares_lastfm;
 pub mod traits;
 /// La vignette d'un podcast mise en cache à l'abonnement (#5214).
 pub mod vignette_podcast;

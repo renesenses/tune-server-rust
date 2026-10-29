@@ -181,7 +181,11 @@ impl RadioRepo {
     pub fn get(&self, id: i64) -> Result<Option<RadioStation>, String> {
         let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_radio))
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(|cols| row_to_radio(cols)))
     }
 
     /// Retrouver une station par l'URL exacte de son flux — c'est ce que le
@@ -189,17 +193,21 @@ impl RadioRepo {
     pub fn get_by_url(&self, url: &str) -> Result<Option<RadioStation>, String> {
         let sql = self.dialect_sql(sql::get_by_url, sql::get_by_url);
         let params: [&dyn ToSqlValue; 1] = [&url];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_radio))
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(|cols| row_to_radio(cols)))
     }
 
     pub fn list(&self) -> Result<Vec<RadioStation>, String> {
         let rows = self.db.query_many(&sql::list_all(), &[])?;
-        Ok(rows.iter().map(row_to_radio).collect())
+        Ok(rows.iter().map(|cols| row_to_radio(cols)).collect())
     }
 
     pub fn favorites(&self) -> Result<Vec<RadioStation>, String> {
         let rows = self.db.query_many(&sql::favorites(), &[])?;
-        Ok(rows.iter().map(row_to_radio).collect())
+        Ok(rows.iter().map(|cols| row_to_radio(cols)).collect())
     }
 
     pub fn create(&self, station: &RadioStation) -> Result<i64, String> {
@@ -216,7 +224,7 @@ impl RadioRepo {
             &station.bitrate,
             &i64::from(station.is_favorite),
         ];
-        Ok(self.db.execute_returning_id(&sql, &params)?)
+        self.db.execute_returning_id(&sql, &params)
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
@@ -263,7 +271,7 @@ impl RadioRepo {
         let sql = self.dialect_sql(sql::search, sql::search);
         let params: [&dyn ToSqlValue; 3] = [&like, &like, &like];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_radio).collect())
+        Ok(rows.iter().map(|cols| row_to_radio(cols)).collect())
     }
 
     pub fn update(&self, station: &RadioStation) -> Result<(), String> {
@@ -378,7 +386,7 @@ fn libelle_du_codec(codec: &str) -> String {
     codec.trim().to_ascii_uppercase()
 }
 
-fn row_to_radio(cols: &Vec<SqlValue>) -> RadioStation {
+fn row_to_radio(cols: &[SqlValue]) -> RadioStation {
     RadioStation {
         id: cols.first().and_then(|v| v.as_i64()),
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
@@ -529,7 +537,7 @@ mod tests {
         assert!(uk.len() >= 2, "should find at least 2 UK stations");
 
         let bbc = repo.search("BBC").unwrap();
-        assert!(bbc.len() >= 1, "should find at least 1 BBC station");
+        assert!(!bbc.is_empty(), "should find at least 1 BBC station");
     }
 
     #[test]

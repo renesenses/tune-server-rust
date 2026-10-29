@@ -74,7 +74,7 @@ use super::favorites_import::{Entree, lire_les_favoris};
 use super::traits::StreamingService;
 use crate::db::backend::{DbBackend, SqlValue};
 use crate::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
-use crate::db::streaming_favorites_repo::StreamingFavoritesRepo;
+use crate::db::streaming_favorites_repo::{AnneeQualite, StreamingFavoritesRepo};
 use crate::streaming::favorites_identity::identite_de_favori;
 
 /// Le service a confirmé ce favori.
@@ -138,6 +138,8 @@ pub struct FavoriMiroir {
     pub isrc: Option<String>,
     /// Date de mise en favori chez le service, quand elle est connue.
     pub created_at: Option<String>,
+    /// Année et qualité d'un favori album, quand le service les donne (#6482).
+    pub annee_qualite: AnneeQualite,
 }
 
 impl From<Entree> for FavoriMiroir {
@@ -152,6 +154,7 @@ impl From<Entree> for FavoriMiroir {
             ai_generated: e.ai_generated,
             isrc: e.isrc,
             created_at: e.created_at,
+            annee_qualite: e.annee_qualite,
         }
     }
 }
@@ -378,6 +381,18 @@ pub fn profils(backend: &Arc<dyn DbBackend>, appelant: i64) -> Vec<i64> {
     ids
 }
 
+fn sql_poser_etat(backend: &Arc<dyn DbBackend>) -> String {
+    format!(
+        "UPDATE streaming_favorites SET miroir_etat = {}, miroir_erreur = {} \
+         WHERE service = {} AND item_type = {} AND service_id = {}",
+        ph(backend, 1),
+        ph(backend, 2),
+        ph(backend, 3),
+        ph(backend, 4),
+        ph(backend, 5)
+    )
+}
+
 /// Pose l'état du miroir d'un favori, TOUS profils confondus.
 fn poser_etat(
     backend: &Arc<dyn DbBackend>,
@@ -387,15 +402,7 @@ fn poser_etat(
     etat: &str,
     erreur: Option<&str>,
 ) -> Result<usize, String> {
-    let sql = format!(
-        "UPDATE streaming_favorites SET miroir_etat = {}, miroir_erreur = {} \
-         WHERE service = {} AND item_type = {} AND service_id = {}",
-        ph(backend, 1),
-        ph(backend, 2),
-        ph(backend, 3),
-        ph(backend, 4),
-        ph(backend, 5)
-    );
+    let sql = sql_poser_etat(backend);
     let cle = identite_de_favori(service_id);
     let id: &str = cle.as_ref();
     backend.execute(&sql, &[&etat, &erreur, &service, &item_type, &id])
@@ -443,6 +450,18 @@ fn ecrire_partout(
         )?;
         if let Some(ia) = fav.ai_generated {
             let _ = repo.poser_ia(pid, &fav.item_type, service, &fav.service_id, ia);
+        }
+        // #6482 — l'année et la qualité d'un album, que les collections
+        // intelligentes lisent. Une absence ne touche à rien ; un échec est
+        // journalisé comme à la reprise, sans faire tomber le favori.
+        if let Err(e) = repo.poser_annee_et_qualite(
+            pid,
+            &fav.item_type,
+            service,
+            &fav.service_id,
+            &fav.annee_qualite,
+        ) {
+            warn!(service = %service, erreur = %e, "favori_miroir_annee_qualite_impossible");
         }
     }
     poser_etat(
@@ -807,6 +826,7 @@ fn trier_les_playlists(
                 created_at: None,
                 ai_generated: None,
                 isrc: None,
+                annee_qualite: AnneeQualite::default(),
             }),
             Some(true) => {
                 reserves
@@ -904,26 +924,49 @@ pub async fn rafraichir(
         }
         (service, lectures)
     };
-    let profils = profils(backend, appelant);
-    for (item_type, lecture) in lectures {
-        match lecture {
-            Ok((entrees, reserves)) => {
-                if let Err(e) = reconcilier(
-                    backend, &profils, &service, item_type, entrees, &reserves, &mut bilan,
-                ) {
-                    warn!(service = %service, item_type, erreur = %e, "favoris_miroir_base_refuse");
+    // #6399 — des milliers d'écritures SQL synchrones ne doivent pas tenir
+    // un fil de l'exécuteur, même si les appels réseau ont déjà rendu la main.
+    // Aucun verrou de service ni transaction globale n'est emporté ici.
+    let base_locale = backend.clone();
+    let nom_local = service.clone();
+    bilan = match tokio::task::spawn_blocking(move || {
+        let backend = base_locale;
+        let service = nom_local;
+        let profils = profils(&backend, appelant);
+        for (item_type, lecture) in lectures {
+            match lecture {
+                Ok((entrees, reserves)) => {
+                    if let Err(e) = reconcilier(
+                        &backend, &profils, &service, item_type, entrees, &reserves, &mut bilan,
+                    ) {
+                        warn!(service = %service, item_type, erreur = %e, "favoris_miroir_base_refuse");
+                        bilan.echecs += 1;
+                        bilan.erreur = Some(e);
+                    }
+                }
+                Err(e) => {
+                    // Lecture ratée : RIEN n'est retiré pour ce type.
+                    warn!(service = %service, item_type, erreur = %e, "favoris_miroir_lecture_impossible");
                     bilan.echecs += 1;
                     bilan.erreur = Some(e);
                 }
             }
-            Err(e) => {
-                // Lecture ratée : RIEN n'est retiré pour ce type.
-                warn!(service = %service, item_type, erreur = %e, "favoris_miroir_lecture_impossible");
-                bilan.echecs += 1;
-                bilan.erreur = Some(e);
-            }
         }
-    }
+        bilan
+    })
+    .await
+    {
+        Ok(bilan) => bilan,
+        Err(e) => {
+            let bilan = BilanMiroir {
+                echecs: 1,
+                erreur: Some(format!("réconciliation interrompue : {e}")),
+                ..Default::default()
+            };
+            noter_rafraichissement(&service, &bilan);
+            return bilan;
+        }
+    };
     if let Err(e) = pousser_en_attente(arc, backend, &service, &mut bilan).await {
         bilan.erreur = Some(e);
     }

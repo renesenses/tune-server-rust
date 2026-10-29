@@ -870,3 +870,40 @@ async fn rien_ne_part_sans_activation_ni_compte() {
         Issue::Rien("account_not_linked")
     );
 }
+
+#[test]
+fn les_caches_http_ne_gonflent_pas_la_sauvegarde_des_personnalisations_7286() {
+    let b = base_neuve();
+    let s = reglages(&b);
+    s.set("audio_backend", "alsa").unwrap();
+    s.set("cache_audio_enabled", "true").unwrap();
+    let avant = construire(&b).unwrap();
+    // Formes réellement utilisées par les routes artistes et albums :
+    // aucun suffixe numérique que le filtre des identifiants locaux écarte.
+    for cle in [
+        "cache:artistbio:Artiste exemple:fr",
+        "cache:albumbio:Album exemple:Artiste exemple:fr",
+        "cache:meta:a74b1b7f-71a5-4011-9441-d0b5e4122711",
+        "cache:meta-nom:artiste exemple",
+    ] {
+        s.set(
+            cle,
+            &json!({"data":{"bio":"contenu régénérable ".repeat(4096)}}).to_string(),
+        )
+        .unwrap();
+    }
+    let apres = construire(&b).unwrap();
+    assert_eq!(
+        apres, avant,
+        "#7286 : les réponses HTTP mises en cache ne doivent pas devenir des réglages à sauvegarder"
+    );
+    assert_eq!(apres["settings"]["audio_backend"], "alsa");
+    assert_eq!(
+        apres["settings"]["cache_audio_enabled"], true,
+        "le choix utilisateur du cache audio reste une personnalisation"
+    );
+    assert!(
+        s.get("cache:meta-nom:artiste exemple").unwrap().is_some(),
+        "exclure de la sauvegarde ne supprime pas le cache local"
+    );
+}

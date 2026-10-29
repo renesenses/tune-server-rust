@@ -37,6 +37,9 @@ use super::*;
 use super::periode::{avec_periode, config_de_flux, garde_de_prechargement};
 use crate::outputs::traits::PuitsNatif;
 
+#[path = "open_retry_7207.rs"]
+mod open_retry_7207;
+
 /// Ce que `play_url` sait au moment d'ouvrir, et rien de plus.
 ///
 /// Les `Arc` sont EMPRUNTÉS : le backend clone ceux que son rappel temps réel
@@ -102,7 +105,10 @@ pub(super) enum RefusDOuverture {
         cause: OpenFailure,
         premiere_erreur: String,
         seconde_erreur: String,
+        last_error: String,
     },
+    /// L'utilisateur a arrêté ou remplacé la lecture pendant la reprise.
+    Cancelled,
     /// Un transport exclusif a refusé l'ouverture (CoreAudio, ASIO, WASAPI).
     /// Aucun repli vers un autre endpoint ni vers le mode partagé. N'existe
     /// que là où un transport exclusif existe — même `cfg` que
@@ -171,11 +177,13 @@ impl RefusDOuverture {
                 cause,
                 premiere_erreur,
                 seconde_erreur,
+                last_error,
             } => {
                 warn!(
                     device = %device_name,
                     first_error = %premiere_erreur,
                     second_error = %seconde_erreur,
+                    last_error = %last_error,
                     hint = %cause.log_hint(),
                     "audio_stream_build_failed_all_formats"
                 );
@@ -190,6 +198,7 @@ impl RefusDOuverture {
                     ));
                 }
             }
+            RefusDOuverture::Cancelled => {}
             #[cfg(any(target_os = "windows", target_os = "macos", test))]
             RefusDOuverture::OuvertureExclusiveRefusee { backend, erreur } => {
                 record_exclusive_open_failure(backend, device_name, erreur, open_failure);
@@ -224,11 +233,13 @@ impl std::fmt::Display for RefusDOuverture {
                 cause,
                 premiere_erreur,
                 seconde_erreur,
+                last_error,
             } => write!(
                 f,
-                "{} ({premiere_erreur} ; {seconde_erreur})",
+                "{} ({premiere_erreur} ; {seconde_erreur} ; {last_error})",
                 cause.log_hint()
             ),
+            RefusDOuverture::Cancelled => f.write_str("opening_cancelled"),
             #[cfg(any(target_os = "windows", target_os = "macos", test))]
             RefusDOuverture::OuvertureExclusiveRefusee { backend, erreur } => {
                 write!(f, "{backend}: {erreur}")
@@ -829,59 +840,97 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                         {
                             candidates.push(source_cfg.clone());
                         }
-                        let mut built: Option<(cpal::Stream, cpal::StreamConfig, Arc<RingBuf>)> =
-                            None;
-                        'int_cascade: for cand in &candidates {
-                            let cap = (cand.sample_rate as usize) * (cand.channels as usize) * 2;
-                            let min_buf_ms =
-                                (cand.sample_rate as usize) * (cand.channels as usize) / 5;
-                            let min_buf = garde_de_prechargement(cand, min_buf_ms);
-                            for is_i32 in [true, false] {
-                                starvation.begin_stream(cand.sample_rate, cand.channels);
-                                let r = Arc::new(RingBuf::new_metered(cap, starvation.clone()));
-                                r.clear();
-                                data_started_shared.store(false, Ordering::SeqCst);
-                                let res = if is_i32 {
-                                    build_int_stream::<i32>(
-                                        &device,
-                                        cand,
-                                        r.clone(),
-                                        volume.clone(),
-                                        paused.clone(),
-                                        silent_cb_outer.clone(),
-                                        data_started_shared.clone(),
-                                        min_buf,
-                                        device_gone.clone(),
-                                        soft_mute.clone(),
-                                    )
-                                } else {
-                                    build_int_stream::<i16>(
-                                        &device,
-                                        cand,
-                                        r.clone(),
-                                        volume.clone(),
-                                        paused.clone(),
-                                        silent_cb_outer.clone(),
-                                        data_started_shared.clone(),
-                                        min_buf,
-                                        device_gone.clone(),
-                                        soft_mute.clone(),
-                                    )
-                                };
-                                if let Ok(s) = res {
-                                    info!(
-                                        format = if is_i32 { "i32" } else { "i16" },
-                                        sample_rate = cand.sample_rate,
-                                        "local_audio_fallback_to_integer_format"
-                                    );
-                                    built = Some((s, cand.clone(), r));
-                                    break 'int_cascade;
+                        // Même endpoint et mêmes configurations pendant toute la reprise :
+                        // ni rééchantillonnage ajouté, ni recherche d'une autre sortie.
+                        let opened_endpoint =
+                            device.id().map(|id| id.to_string()).unwrap_or_default();
+                        let retry_enabled =
+                            open_retry_7207::supports_open_retry(host_id_name, &opened_endpoint);
+                        let built = open_retry_7207::retry_open(
+                            retry_enabled,
+                            || {
+                                let mut last_error = second_err.to_string();
+                                for cand in &candidates {
+                                    let cap =
+                                        (cand.sample_rate as usize) * (cand.channels as usize) * 2;
+                                    let min_buf_ms =
+                                        (cand.sample_rate as usize) * (cand.channels as usize) / 5;
+                                    let min_buf = garde_de_prechargement(cand, min_buf_ms);
+                                    for is_i32 in [true, false] {
+                                        starvation.begin_stream(cand.sample_rate, cand.channels);
+                                        let r =
+                                            Arc::new(RingBuf::new_metered(cap, starvation.clone()));
+                                        r.clear();
+                                        data_started_shared.store(false, Ordering::SeqCst);
+                                        let res = if is_i32 {
+                                            build_int_stream::<i32>(
+                                                &device,
+                                                cand,
+                                                r.clone(),
+                                                volume.clone(),
+                                                paused.clone(),
+                                                silent_cb_outer.clone(),
+                                                data_started_shared.clone(),
+                                                min_buf,
+                                                device_gone.clone(),
+                                                soft_mute.clone(),
+                                            )
+                                        } else {
+                                            build_int_stream::<i16>(
+                                                &device,
+                                                cand,
+                                                r.clone(),
+                                                volume.clone(),
+                                                paused.clone(),
+                                                silent_cb_outer.clone(),
+                                                data_started_shared.clone(),
+                                                min_buf,
+                                                device_gone.clone(),
+                                                soft_mute.clone(),
+                                            )
+                                        };
+                                        match res {
+                                            Ok(s) => {
+                                                info!(
+                                                    format = if is_i32 { "i32" } else { "i16" },
+                                                    sample_rate = cand.sample_rate,
+                                                    "local_audio_fallback_to_integer_format"
+                                                );
+                                                return Ok((s, cand.clone(), r));
+                                            }
+                                            Err(e) => {
+                                                last_error = e.to_string();
+                                                warn!(
+                                                    device = %device_name,
+                                                    format = if is_i32 { "i32" } else { "i16" },
+                                                    sample_rate = cand.sample_rate,
+                                                    error = %e,
+                                                    "local_audio_integer_open_failed"
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                        }
+                                Err(last_error)
+                            },
+                            |delay| {
+                                if force_silent.load(Ordering::SeqCst) {
+                                    return false;
+                                }
+                                if !delay.is_zero() {
+                                    warn!(device = %device_name, delay_ms = delay.as_millis(),
+                                        "local_audio_integer_open_retry");
+                                }
+                                matches!(
+                                    demande.stop_rx.recv_timeout(delay),
+                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                                ) && !force_silent.load(Ordering::SeqCst)
+                            },
+                        );
                         match built {
-                            Some(t) => t,
-                            None => {
+                            Some(Ok(t)) => t,
+                            None => return Err(RefusDOuverture::Cancelled),
+                            Some(Err(last_error)) => {
                                 // Every format was refused, so the fault is
                                 // the device itself, not the encoding. Name
                                 // the likely cause: the raw ALSA string
@@ -892,7 +941,7 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                                 // reach the daemon — typically a server
                                 // started outside the user session, or a
                                 // USB DAC that went away.
-                                let cause = classify_open_failure(&first_err.to_string());
+                                let cause = classify_open_failure(&last_error);
                                 // #3575 — quand cpal a DÉTRUIT le motif,
                                 // aller chercher dans /proc qui tient le
                                 // nœud PCM, au lieu d'attendre un
@@ -906,6 +955,7 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                                     cause,
                                     premiere_erreur: first_err.to_string(),
                                     seconde_erreur: second_err.to_string(),
+                                    last_error,
                                 });
                             }
                         }

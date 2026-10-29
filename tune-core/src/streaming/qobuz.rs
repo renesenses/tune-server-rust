@@ -234,6 +234,21 @@ impl AttemptError {
     }
 }
 
+/// Ce que `POST /streaming/qobuz/auth` rend quand la connexion échoue
+/// (renesenses/tune-server-rust#7068).
+///
+/// Un refus d'identifiants (401 du service) devient [`TuneError::Credentials`] :
+/// la variante, pas le texte, dit au client qu'il s'agit d'un mauvais e-mail ou
+/// mot de passe, et le corps JSON du service ne sort plus dans la réponse (il
+/// reste dans le journal, `qobuz_login_failed`). Toute autre panne — réseau,
+/// 5xx, JSON illisible — garde son texte, c'est une panne et non un refus.
+fn erreur_de_connexion(err: &AttemptError) -> TuneError {
+    match err.statut_http() {
+        Some(401) => TuneError::Credentials("qobuz login: invalid credentials".to_string()),
+        _ => TuneError::Other(format!("qobuz login: {err}")),
+    }
+}
+
 impl std::fmt::Display for AttemptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2302,7 +2317,7 @@ impl QobuzService {
         &mut self,
         username: &str,
         password: &str,
-    ) -> Result<AuthStatus, String> {
+    ) -> Result<AuthStatus, TuneError> {
         self.refresh_credentials().await;
 
         let (primary, fallback) = self.bases_ordonnees();
@@ -2314,12 +2329,12 @@ impl QobuzService {
                     .await
                     .map_err(|e| {
                         info!(error = %e, "qobuz_login_failed");
-                        format!("qobuz login: {e}")
+                        erreur_de_connexion(&e)
                     })?
             }
             Err(err) => {
                 info!(error = %err, "qobuz_login_failed");
-                return Err(format!("qobuz login: {err}"));
+                return Err(erreur_de_connexion(&err));
             }
         };
 
@@ -2699,7 +2714,7 @@ impl StreamingService for QobuzService {
         self.stored_username = Some(username.to_string());
         self.stored_password = Some(password.to_string());
 
-        Ok(self.login_internal(username, password).await?)
+        self.login_internal(username, password).await
     }
 
     async fn auth_status(&self) -> AuthStatus {
@@ -3624,9 +3639,14 @@ impl StreamingService for QobuzService {
     /// n'avait jamais demandé `tracks`, et qui laissait croire que les deux
     /// cas étaient couverts.
     ///
-    /// Aucun tri n'est appliqué : l'ordre est celui que Qobuz rend. Classer
-    /// nous-mêmes sur une popularité que Qobuz ne donne pas reviendrait à
-    /// fabriquer le « best of » au lieu de le relayer.
+    /// Aucun tri n'est appliqué ICI : l'ordre est celui que Qobuz rend, et
+    /// c'est le catalogue dans l'ordre d'un album, pas une popularité
+    /// (Kiwanuka, 26/10/2026 : dix pistes de FUDGE). Nous n'inventons pas de
+    /// « best of » : la route (`tune-streaming-http`,
+    /// `service_artist_top_tracks`, #7107) classe ensuite sur des sources
+    /// réelles — total de la communauté, écoutes de ce serveur, puis
+    /// `artist.getTopTracks` de Last.fm (`titres_phares_lastfm`) — et ne
+    /// retombe sur l'ordre de Qobuz qu'en dernier.
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         match self.pistes_extra_artiste(artist_id, "tracks").await {
             Ok(pistes) if !pistes.is_empty() => return Ok(pistes),
@@ -8076,7 +8096,7 @@ mod tests_livrets_qobuz_6481 {
     }
 }
 
-/// #6736 — le logo d'un label, rapproché par `label/search` ou par l'album.
+/// #6736 — le logo d'un label, rapproché par l'album ou par `catalog/search` (#7064).
 #[path = "qobuz_logos_labels.rs"]
 mod logos_labels;
 
@@ -8085,3 +8105,56 @@ mod logos_labels;
 #[cfg(test)]
 #[path = "qobuz_page_du_label_tests.rs"]
 mod page_du_label_tests;
+
+/// renesenses/tune-server-rust#7068 — un mauvais mot de passe Qobuz sortait en
+/// `qobuz login: 401 {"status":"error","code":401,"message":"Invalid
+/// username\/email and password combination"}` : le JSON du service, recopié
+/// tel quel dans la réponse.
+///
+/// Contre-épreuve : remplacer le bras `Some(401)` de `erreur_de_connexion` par
+/// le formatage brut fait rougir `refus_401_devient_un_code_sans_json_du_service`.
+#[cfg(test)]
+mod tests_erreur_de_connexion_7068 {
+    use super::*;
+
+    #[test]
+    fn refus_401_devient_un_code_sans_json_du_service() {
+        let brut = AttemptError::Http {
+            status: 401,
+            body: r#"{"status":"error","code":401,"message":"Invalid username\/email and password combination"}"#
+                .to_string(),
+        };
+        let e = erreur_de_connexion(&brut);
+        assert!(
+            matches!(e, TuneError::Credentials(_)),
+            "un refus 401 doit être une erreur d'identifiants, pas : {e:?}"
+        );
+        let texte = e.to_string();
+        assert!(
+            !texte.contains('{') && !texte.contains("Invalid username"),
+            "le JSON du service ne doit pas sortir dans la réponse : {texte}"
+        );
+    }
+
+    #[test]
+    fn une_panne_n_est_pas_un_refus_d_identifiants() {
+        for brut in [
+            AttemptError::Http {
+                status: 500,
+                body: "boom".into(),
+            },
+            AttemptError::Http {
+                status: 403,
+                body: "akamai".into(),
+            },
+            AttemptError::Network("timeout".into()),
+            AttemptError::Json("eof".into()),
+        ] {
+            let e = erreur_de_connexion(&brut);
+            assert!(
+                matches!(e, TuneError::Other(_)),
+                "{brut} ne doit pas passer pour un mauvais mot de passe : {e:?}"
+            );
+        }
+    }
+}

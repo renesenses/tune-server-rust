@@ -103,6 +103,11 @@ pub trait RefResolver {
     fn smart_entity(&self, kind: RefKind, id: i64) -> Option<SmartEntity>;
     /// Albums d'une collection classique (blob `collections` des settings).
     fn collection_album_ids(&self, id: i64) -> Option<Vec<i64>>;
+    /// #6285 — le verdict hi-res « douteux » est-il montré ? Masqué par
+    /// défaut : seul le résolveur branché sur la base lit le réglage.
+    fn hires_douteux_visible(&self) -> bool {
+        false
+    }
 }
 
 /// Résolveur vide : aucune entité. Pour les chemins sans résolution
@@ -131,6 +136,9 @@ impl<'a> DbRefResolver<'a> {
 }
 
 impl RefResolver for DbRefResolver<'_> {
+    fn hires_douteux_visible(&self) -> bool {
+        tune_core::audio::faux_hires_publie::douteux_visible(self.backend)
+    }
     fn smart_entity(&self, kind: RefKind, id: i64) -> Option<SmartEntity> {
         let sql = match kind {
             RefKind::SmartCollection => {
@@ -556,6 +564,19 @@ pub(crate) fn track_ref_condition(field: &str, op: &str, value: &str, ctx: &RefC
 /// jeu de règles.
 fn referenced_smart_refs(rules_json: &str) -> Vec<(RefKind, i64)> {
     let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
+    // #6287, étape 4 — une requête imbriquée enregistrée cite ses références
+    // dans son texte : ses feuilles comptent comme des règles.
+    let rules: Vec<Value> = rules
+        .into_iter()
+        .flat_map(|rule| {
+            if rule.get("field").and_then(|v| v.as_str()) == Some(crate::requete_enregistree::CHAMP)
+            {
+                crate::requete_enregistree::feuilles(&rule)
+            } else {
+                vec![rule]
+            }
+        })
+        .collect();
     rules
         .iter()
         .filter_map(|rule| {

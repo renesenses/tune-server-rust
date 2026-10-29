@@ -265,10 +265,12 @@ async fn sans_compte_relie_l_ordre_du_service_est_garde() {
     )
     .await;
 
-    assert_eq!(ordre(&items), ["q-1", "q-2", "q-3", "q-5"]);
+    // Sans total : les écoutes de ce serveur d'abord (#7107 : Could We 2,
+    // Try Me 1), puis l'ordre du service.
+    assert_eq!(ordre(&items), ["q-2", "q-1", "q-3", "q-5"]);
     assert!(items.iter().all(|v| v.get(CHAMP_TOTAL).is_none()));
     assert_eq!(
-        items[1][CHAMP_LOCAL],
+        items[0][CHAMP_LOCAL],
         json!(2),
         "le local se pose quand même"
     );

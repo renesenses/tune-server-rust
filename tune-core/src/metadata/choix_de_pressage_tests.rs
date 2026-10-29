@@ -372,7 +372,7 @@ fn la_release_majoritaire_des_balises() {
         Some(a.as_str())
     );
     // Moins de la moitié des pistes.
-    assert_eq!(release_majoritaire(&[a.clone()], 4), None);
+    assert_eq!(release_majoritaire(std::slice::from_ref(&a), 4), None);
     // Deux releases à parts égales.
     assert_eq!(release_majoritaire(&[a.clone(), b.clone()], 2), None);
     assert_eq!(release_majoritaire(&["n'importe quoi".into()], 1), None);

@@ -263,3 +263,108 @@ async fn pg_3189_le_total_de_la_recherche_sur_postgresql() {
         "le parcours complet doit rendre les {PISTES} correspondances"
     );
 }
+
+/// Enregistre une clé de service par la VRAIE route d'« Accès et jetons ».
+async fn enregistrer_une_cle(
+    state: &AppState,
+    service: &str,
+    champs: serde_json::Value,
+) -> serde_json::Value {
+    let app: Router = tune_server::routes::router(state.clone());
+    let reponse = app
+        .oneshot(
+            Request::post(format!("/api/v1/services/tokens/{service}"))
+                .header("content-type", "application/json")
+                .body(Body::from(champs.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        reponse.status().is_success(),
+        "POST /services/tokens/{service} sur PostgreSQL → {}",
+        reponse.status()
+    );
+    let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&corps).expect("réponse JSON")
+}
+
+/// #7037 — enregistrer une clé ListenBrainz ou Last.fm sur une VRAIE base
+/// PostgreSQL.
+///
+/// L'écriture dans `streaming_auth` est `DELETE … WHERE service = ?1` puis
+/// `INSERT … VALUES (?1, ?2)`. Le dos PostgreSQL traduisait `?1` en `$11` :
+/// la requête était refusée (« could not determine data type of parameter
+/// $2 »), la route répondait `200` avec ce message, et rien n'était gardé.
+/// Le statut seul ne voit donc rien : l'épreuve relit la ligne en base.
+///
+/// Chaque clé est enregistrée DEUX fois, avec deux valeurs : la seconde doit
+/// remplacer la première (c'est le `DELETE` qui le fait), pas s'y ajouter.
+///
+/// La validation en ligne (Last.fm, ListenBrainz) peut échouer — clé fictive,
+/// réseau absent — sans rien changer à l'épreuve : la clé est gardée quel que
+/// soit son verdict, et c'est cette écriture qui est sous test.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_7037_enregistrer_une_cle_listenbrainz_ou_lastfm() {
+    let Some(url) = url_pg() else {
+        eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
+        return;
+    };
+    let state = etat_postgres(&url);
+
+    let cles = [
+        ("listenbrainz", "token", serde_json::json!({})),
+        (
+            "lastfm",
+            "api_key",
+            serde_json::json!({ "api_secret": "secret-7037" }),
+        ),
+    ];
+    for (service, champ, autres) in cles {
+        // Point de départ connu, écrit en `$1` : indépendant du correctif.
+        state
+            .backend
+            .execute("DELETE FROM streaming_auth WHERE service = $1", &[&service])
+            .unwrap_or_else(|e| panic!("vidage de streaming_auth ({service}) : {e}"));
+
+        for valeur in ["premiere-cle-7037", "seconde-cle-7037"] {
+            let mut champs = autres.clone();
+            champs[champ] = serde_json::json!(valeur);
+            let reponse = enregistrer_une_cle(&state, service, champs).await;
+            let message = reponse["validation_message"].as_str().unwrap_or("");
+            assert!(
+                !message.contains("pg execute") && !message.contains("could not determine"),
+                "{service} : l'enregistrement de la clé a échoué sur PostgreSQL (#7037) : {message}"
+            );
+
+            let lignes = state
+                .backend
+                .query_many(
+                    "SELECT token_data FROM streaming_auth WHERE service = $1",
+                    &[&service],
+                )
+                .unwrap_or_else(|e| panic!("relecture de streaming_auth ({service}) : {e}"));
+            assert_eq!(
+                lignes.len(),
+                1,
+                "{service} : la clé « {valeur} » doit être gardée en une seule ligne \
+                 sur PostgreSQL (#7037), réponse : {reponse}"
+            );
+            let donnees: serde_json::Value =
+                serde_json::from_str(lignes[0][0].as_str().expect("token_data en texte"))
+                    .expect("token_data en JSON");
+            assert_eq!(
+                donnees[champ].as_str(),
+                Some(valeur),
+                "{service} : la clé gardée n'est pas celle saisie"
+            );
+        }
+
+        state
+            .backend
+            .execute("DELETE FROM streaming_auth WHERE service = $1", &[&service])
+            .unwrap_or_else(|e| panic!("ménage de streaming_auth ({service}) : {e}"));
+    }
+}

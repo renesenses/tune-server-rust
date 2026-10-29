@@ -190,12 +190,12 @@ impl ProfileRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_profile))
+            .map(|cols| row_to_profile(cols)))
     }
 
     pub fn list(&self) -> Result<Vec<Profile>, String> {
         let rows = self.db.query_many(sql::list_all(), &[])?;
-        Ok(rows.iter().map(row_to_profile).collect())
+        Ok(rows.iter().map(|cols| row_to_profile(cols)).collect())
     }
 
     pub fn create(
@@ -206,7 +206,7 @@ impl ProfileRepo {
     ) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 3] = [&username, &display_name, &avatar_path];
-        Ok(self.db.execute_returning_id(&sql, &params)?)
+        self.db.execute_returning_id(&sql, &params)
     }
 
     pub fn update(
@@ -308,7 +308,7 @@ impl ProfileRepo {
             let params: [&dyn ToSqlValue; 1] = [&pid];
             self.db.query_many(&sql, &params)?
         };
-        Ok(rows.iter().map(row_to_favorite).collect())
+        Ok(rows.iter().map(|cols| row_to_favorite(cols)).collect())
     }
 
     /// Les mêmes favoris, rangés selon `tri` (#2001).
@@ -357,7 +357,7 @@ impl ProfileRepo {
             // d'ajout est conservé plutôt que renvoyer une erreur au client.
             CleDeTri::Album => {}
         }
-        Ok(rows.iter().map(row_to_favorite).collect())
+        Ok(rows.iter().map(|cols| row_to_favorite(cols)).collect())
     }
 
     /// Pose l'ordre manuel d'UN onglet (#2001, piste 2) — le geste que Tades
@@ -430,7 +430,7 @@ impl ProfileRepo {
     }
 }
 
-fn row_to_profile(cols: &Vec<SqlValue>) -> Profile {
+fn row_to_profile(cols: &[SqlValue]) -> Profile {
     Profile {
         id: cols.first().and_then(|v| v.as_i64()),
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
@@ -441,7 +441,7 @@ fn row_to_profile(cols: &Vec<SqlValue>) -> Profile {
     }
 }
 
-fn row_to_favorite(cols: &Vec<SqlValue>) -> Favorite {
+fn row_to_favorite(cols: &[SqlValue]) -> Favorite {
     Favorite {
         id: cols.first().and_then(|v| v.as_i64()),
         profile_id: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(1),

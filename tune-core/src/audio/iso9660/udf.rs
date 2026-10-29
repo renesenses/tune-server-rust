@@ -356,7 +356,7 @@ fn lire_entree(
     match drapeaux & 0x07 {
         // short_ad : même partition que l'entrée elle-même.
         0 => {
-            for c in b[ad..ad + l_ad].chunks_exact(8) {
+            for c in b[ad..ad + l_ad].as_chunks::<8>().0 {
                 let brut = u32_le(c, 0);
                 let (genre, longueur) = (brut >> 30, (brut & 0x3FFF_FFFF) as u64);
                 if longueur == 0 {
@@ -377,7 +377,7 @@ fn lire_entree(
         }
         // long_ad : la partition est nommée par l'adresse.
         1 => {
-            for c in b[ad..ad + l_ad].chunks_exact(16) {
+            for c in b[ad..ad + l_ad].as_chunks::<16>().0 {
                 let brut = u32_le(c, 0);
                 let (genre, longueur) = (brut >> 30, (brut & 0x3FFF_FFFF) as u64);
                 if longueur == 0 {
@@ -462,7 +462,9 @@ fn nom_cs0(b: &[u8]) -> String {
         8 | 254 => reste.iter().map(|&c| c as char).collect(),
         16 | 255 => {
             let unites: Vec<u16> = reste
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                 .collect();
             String::from_utf16_lossy(&unites)

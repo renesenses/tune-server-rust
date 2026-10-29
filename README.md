@@ -79,6 +79,9 @@ VPS): network zones (DLNA, AirPlay, Chromecast...) do not need them. The image
 also keeps the host's own group of `/dev/snd` when it is not `audio` (29), as on
 Fedora (63).
 
+On Synology, also prepare a writable, persistent model cache before enabling
+acoustic analysis: [Synology model-cache setup](docs/INSTALL-SYNOLOGY.md).
+
 ### Podman (Fedora)
 
 Rootless Podman under SELinux needs three more options: `--userns=keep-id` runs

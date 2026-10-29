@@ -327,7 +327,7 @@ pub async fn handle_head(
     } else if let Some(size) = file_size {
         headers.insert(
             "transferMode.dlna.org",
-            HeaderValue::from_static("Interactive"),
+            HeaderValue::from_static(mode_de_transfert_fichier(&req_headers)),
         );
         headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
         headers.insert(
@@ -1926,6 +1926,21 @@ fn reponse_416(taille: u64) -> Response {
     (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response()
 }
 
+/// #6909 — un fichier seekable peut aussi être demandé en Streaming.
+/// Respecter le mode reconnu, comme la route des pistes de bibliothèque ;
+/// sans demande exploitable, conserver le contrat fichier Interactive.
+fn mode_de_transfert_fichier(req_headers: &HeaderMap) -> &'static str {
+    match req_headers
+        .get("transferMode.dlna.org")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+    {
+        Some("Streaming") => "Streaming",
+        Some("Background") => "Background",
+        _ => "Interactive",
+    }
+}
+
 async fn serve_file(
     path: &str,
     info: &StreamInfo,
@@ -2008,7 +2023,7 @@ async fn serve_file(
         headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
         headers.insert(
             "transferMode.dlna.org",
-            HeaderValue::from_static("Interactive"),
+            HeaderValue::from_static(mode_de_transfert_fichier(req_headers)),
         );
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert(
@@ -2052,7 +2067,7 @@ async fn serve_file(
     headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
     headers.insert(
         "transferMode.dlna.org",
-        HeaderValue::from_static("Interactive"),
+        HeaderValue::from_static(mode_de_transfert_fichier(req_headers)),
     );
     headers.insert("Connection", HeaderValue::from_static("keep-alive"));
     headers.insert(
@@ -7126,3 +7141,9 @@ mod safari_radio_5975_tests {
 
 #[cfg(test)]
 mod reprise_chunkee_aac_6990;
+
+#[cfg(test)]
+mod multichannel_7275_tests;
+
+#[cfg(test)]
+mod mode_fichier_nr1602_6909;

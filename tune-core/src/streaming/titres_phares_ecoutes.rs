@@ -15,9 +15,10 @@
 //!   profils ([`HistoryRepo::ecoutes_de_pistes_de_service`]) — le site n'a pas
 //!   de date, et n'en rendra jamais d'individuelle.
 //!
-//! Puis le tri : `play_count` décroissant, les pistes sans total ensuite,
-//! dans l'ordre du service. Sans compte relié, envoi des écoutes coupé, site
-//! en panne ou trop lent : aucun total, donc l'ordre du service, tel quel.
+//! Puis le tri (#7107) : `play_count`, puis `local_play_count`, puis le rang
+//! Last.fm, puis l'ordre du service. Sans compte relié, envoi des écoutes coupé, site
+//! en panne ou trop lent : aucun total, le tri passe aux écoutes de ce
+//! serveur, puis à Last.fm, puis à l'ordre du service.
 
 use std::sync::Arc;
 
@@ -103,11 +104,24 @@ pub fn poser_ecoutes_locales(backend: &Arc<dyn DbBackend>, service: &str, items:
     }
 }
 
-/// `play_count` décroissant ; sans total, après, dans l'ordre reçu (tri
-/// stable : à égalité aussi, l'ordre du service).
+/// Le classement des titres phares, à quatre niveaux (#7107) :
+/// 1. `play_count` décroissant (le total de la communauté) ;
+/// 2. `local_play_count` décroissant (les écoutes de ce serveur, locales et
+///    du service) ;
+/// 3. `lastfm_rank` croissant (la popularité Last.fm, 1 = le plus écouté) ;
+/// 4. l'ordre reçu du service (tri stable : à égalité, il décide).
+///
+/// Un niveau absent classe après tous les présents, et un niveau n'en
+/// départage un autre qu'à égalité du précédent.
 pub fn classer(items: &mut [Value]) {
+    use crate::streaming::titres_phares_lastfm::CHAMP_RANG;
+    let nombre = |v: &Value, c: &str| v.get(c).and_then(Value::as_i64);
     items.sort_by_key(|v| {
-        std::cmp::Reverse(v.get(CHAMP_TOTAL).and_then(Value::as_i64).map_or(-1, |n| n))
+        (
+            std::cmp::Reverse(nombre(v, CHAMP_TOTAL).unwrap_or(-1)),
+            std::cmp::Reverse(nombre(v, CHAMP_LOCAL).unwrap_or(0)),
+            nombre(v, CHAMP_RANG).unwrap_or(i64::MAX),
+        )
     });
 }
 

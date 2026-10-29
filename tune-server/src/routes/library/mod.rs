@@ -35,6 +35,7 @@ mod passes_metarust;
 // #5469 — les passes que `crate::reprise_des_passes` sait relancer.
 pub(crate) use artwork::{demarrer_images_artistes, demarrer_pochettes_albums};
 pub(crate) use enrich::demarrer_enrich_all;
+mod etiquetage_par_filtre;
 /// #4907 — ordre des répertoires et répertoire préféré d'un album.
 mod exemplaires;
 mod facets;
@@ -45,6 +46,10 @@ mod genres;
 // fonction, pour que « Genres » et « Genres écoutés » se comparent.
 pub(crate) use genres::genres_de_l_album;
 pub(crate) mod identification_lot;
+// `pub` pour le témoin d'intégration de #6845 seulement : une nuit simulée,
+// horloge donnée, contre un faux MusicBrainz.
+#[doc(hidden)]
+pub use identification_lot::nuit::{Horloge, un_tour_de_veille_avec};
 mod ingest;
 /// `GET /library/labels` et les logos Qobuz des labels (#6736).
 mod labels;
@@ -358,6 +363,9 @@ pub fn router() -> Router<AppState> {
         )
         .route("/albums/filters", get(albums::album_filters))
         .route("/facets", get(facets::library_facets))
+        // #7128 — étiqueter tout le résultat d'un filtre d'Oxygen en un geste.
+        .route("/tag-by-filter/preview", get(etiquetage_par_filtre::apercu))
+        .route("/tag-by-filter", post(etiquetage_par_filtre::appliquer))
         .route("/albums-detailed", get(albums_detailed::albums_detailed))
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))

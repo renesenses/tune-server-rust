@@ -1,4 +1,4 @@
-//! #4177 — en exclusif Windows (WASAPI exclusif, ASIO), la pause REND le
+//! #4177/#7244 — sous Windows (WASAPI partagé, exclusif, ASIO), la pause REND le
 //! périphérique au lieu de le garder en poussant du silence.
 //!
 //! Le fil de rendu parti, `get_status` doit continuer de dire `Paused` : sans
@@ -8,17 +8,17 @@
 
 use super::*;
 
-/// La règle pure : Windows, exclusif, un flux qui joue — et rien d'autre.
+/// La règle pure : Windows, un flux qui joue, partagé ou exclusif.
 #[test]
-fn la_regle_ne_rend_le_peripherique_qu_en_exclusif_windows_avec_un_flux_4177() {
+fn la_regle_rend_le_peripherique_windows_avec_un_flux_4177() {
     assert!(la_pause_rend_le_peripherique(true, true, true));
     assert!(
         !la_pause_rend_le_peripherique(false, true, true),
         "macOS/Linux : la pause reste un booléen"
     );
     assert!(
-        !la_pause_rend_le_peripherique(true, false, true),
-        "mode partagé : le mixeur Windows n'est pris par personne"
+        la_pause_rend_le_peripherique(true, false, true),
+        "#7244 : une pause WASAPI partagée doit rendre l'endpoint au moteur ASIO"
     );
     assert!(
         !la_pause_rend_le_peripherique(true, true, false),

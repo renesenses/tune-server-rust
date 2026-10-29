@@ -258,7 +258,40 @@ async fn un_titre_cd_demande_en_max_tombe_sur_flac_6334() {
     assert_eq!(flux.quality.bit_depth, 16);
     let j = journal.lock().unwrap();
     assert_eq!(j.v2, ["FLAC_HIRES", "FLAC"]);
-    assert!(j.v1.is_empty());
+    assert_eq!(j.v1, ["HI_RES_LOSSLESS", "HI_RES"]);
+}
+
+/// #7196 — un FLAC CD v2 après refus de FLAC_HIRES ne doit pas masquer le
+/// Hi-Res que le même service rend par v1. Aucun changement de session.
+#[tokio::test]
+async fn le_flac_cd_v2_ne_masque_pas_le_hires_v1_7196() {
+    let v2 = HashMap::from([
+        (
+            "FLAC_HIRES".into(),
+            (403, json!({"errors": [{"code": "CLIENT_NOT_ENTITLED"}]})),
+        ),
+        (
+            "FLAC".into(),
+            (200, document_v2(&["FLAC"], "flac", 44_100, URL_FLAC_V2)),
+        ),
+    ]);
+    let mut hires = v1("HI_RES_LOSSLESS", "audio/flac", "flac", URL_HIRES_V2);
+    hires["bitDepth"] = json!(24);
+    hires["sampleRate"] = json!(88_200);
+    let (svc, journal) = faux_tidal(v2, HashMap::from([("HI_RES_LOSSLESS".into(), hires)])).await;
+    let flux = svc
+        .get_track_url("165842025", Some("HI_RES_LOSSLESS"))
+        .await
+        .unwrap();
+    assert_eq!(
+        (flux.quality.sample_rate, flux.quality.bit_depth),
+        (88_200, 24),
+        "le repli FLAC CD v2 ne doit pas masquer le Hi-Res disponible en v1 (#7196)"
+    );
+    assert_eq!(flux.url, URL_HIRES_V2);
+    let j = journal.lock().unwrap();
+    assert_eq!(j.v2, ["FLAC_HIRES", "FLAC"]);
+    assert_eq!(j.v1, ["HI_RES_LOSSLESS"]);
 }
 
 /// La v2 échoue (500) : la cascade v1 d'avant sert, inchangée.

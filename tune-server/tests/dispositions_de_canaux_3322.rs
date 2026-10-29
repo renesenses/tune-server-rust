@@ -441,6 +441,7 @@ fn amorcer_le_parc_temoin() {
         max_channels,
         sample_rates: vec![44_100, 48_000],
         sample_rates_measured: true,
+        availability: None,
         backend: "auto".to_string(),
         hardware_detail: None,
     };

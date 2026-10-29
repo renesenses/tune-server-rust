@@ -707,7 +707,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // Lignes posées par un importateur que ce lot reprend (#2939).
                 let mut a_adopter: Vec<i64> = Vec::new();
                 let mut exemplaires_du_lot =
-                    crate::routes::system::scan::ExemplairesDuLot::default();
+                    crate::routes::system::scan::ExemplairesDuLot::pour(&*db);
 
                 // #5202 — relues HORS transaction, sous délai : un fichier qui
                 // ne rend pas la main est sauté et journalisé, il ne fige plus
@@ -1579,7 +1579,28 @@ fn scan_de_demarrage_arrete(event_bus: &EventBus, etape: &str) {
 /// demande (`auto_scan`), et aussi, seule exception, quand une mise à jour
 /// forcée a arrêté un scan : il reprend alors en incrémental
 /// (`file_needs_scan` saute les fichiers inchangés).
+///
+/// #7169 — sauf si l'utilisateur a éteint « Analyser la bibliothèque au
+/// démarrage » : son choix explicite prime sur la reprise. Le repère est
+/// alors levé, sans quoi il relancerait le scan à chaque démarrage (seul un
+/// scan allé au bout l'efface).
 pub fn scan_au_demarrage(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
+    if choix_utilisateur_lu(db) == Some(false) {
+        if crate::routes::system::scan::reprise_du_scan_demandee(db) {
+            info!(
+                "auto_scan_reprise_abandonnee — « library_scan_on_startup » vaut false : le scan arrêté par une mise à jour n'est pas repris"
+            );
+            crate::routes::system::scan::effacer_reprise_du_scan(db);
+        }
+        if auto_scan {
+            info!(
+                voulu = false,
+                deploiement = auto_scan,
+                "auto_scan_regle_par_l_utilisateur — le réglage « library_scan_on_startup » prime sur la configuration de déploiement"
+            );
+        }
+        return false;
+    }
     let voulu = scan_au_demarrage_voulu(auto_scan, db);
     if voulu != auto_scan {
         info!(
@@ -1621,11 +1642,16 @@ pub fn choix_utilisateur_scan_au_demarrage(brut: Option<&str>) -> Option<bool> {
 /// Le scan de démarrage voulu, selon l'ordre de précédence de
 /// [`CLE_SCAN_AU_DEMARRAGE`]. `auto_scan` est la valeur de déploiement.
 pub fn scan_au_demarrage_voulu(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
+    choix_utilisateur_lu(db).unwrap_or(auto_scan)
+}
+
+/// Le choix de l'utilisateur tel que rangé dans `settings`.
+fn choix_utilisateur_lu(db: &Arc<dyn DbBackend>) -> Option<bool> {
     let brut = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
         .get(CLE_SCAN_AU_DEMARRAGE)
         .ok()
         .flatten();
-    choix_utilisateur_scan_au_demarrage(brut.as_deref()).unwrap_or(auto_scan)
+    choix_utilisateur_scan_au_demarrage(brut.as_deref())
 }
 
 /// Le scan voulu, ou la reprise d'un scan arrêté par une mise à jour (#5531).
@@ -2347,6 +2373,13 @@ pub(crate) fn reimporter_fichier_surveillant(
             let candidates = track_repo
                 .paths_by_audio_hash_and_album(hash, aid)
                 .unwrap_or_default();
+            // #6917 — la règle du scan : option allumée, une copie d'une
+            // AUTRE racine entre comme sa propre piste.
+            let candidates = tune_core::library::dedoublonnage_par_racine::candidats_repliables(
+                &sf.path,
+                candidates,
+                tune_core::library::dedoublonnage_par_racine::racines_si_active(&**db).as_deref(),
+            );
             if let Some(existing_path) = tune_core::scanner::hasher::find_byte_identical_path(
                 std::path::Path::new(&sf.path),
                 &candidates,
@@ -3894,3 +3927,7 @@ mod scan_au_demarrage_reglage_tests;
 #[cfg(test)]
 #[path = "surveillant_artiste_generique_tests_1881.rs"]
 mod surveillant_artiste_generique_tests_1881;
+
+#[cfg(test)]
+#[path = "scan_artiste_montage_tests_6737.rs"]
+mod scan_artiste_montage_tests_6737;

@@ -431,7 +431,7 @@ fn lut_lot(x: &[u16], pas: usize, tables: &TablesOctet) -> [f64; LOT_FIR] {
     let g_n = tables.groupes;
     let fenetres: [&[u16]; LOT_FIR] = std::array::from_fn(|j| &x[j * pas..j * pas + g_n]);
     let mut acc = [0.0f64; LOT_FIR];
-    for (g, tg) in tables.t.chunks_exact(ENTREES_TABLE).enumerate() {
+    for (g, tg) in tables.t.as_chunks::<ENTREES_TABLE>().0.iter().enumerate() {
         for j in 0..LOT_FIR {
             acc[j] += tg[fenetres[j][g] as usize];
         }
@@ -445,7 +445,9 @@ fn lut_une(x: &[u16], tables: &TablesOctet) -> f64 {
     let mut s = 0.0f64;
     for (tg, &o) in tables
         .t
-        .chunks_exact(ENTREES_TABLE)
+        .as_chunks::<ENTREES_TABLE>()
+        .0
+        .iter()
         .zip(&x[..tables.groupes])
     {
         s += tg[o as usize];
@@ -1376,7 +1378,9 @@ mod tests {
 
     /// PCM 24 bits LE → entiers signés.
     fn lire_24(pcm: &[u8]) -> Vec<i32> {
-        pcm.chunks_exact(3)
+        pcm.as_chunks::<3>()
+            .0
+            .iter()
             .map(|b| {
                 let v = b[0] as u32 | ((b[1] as u32) << 8) | ((b[2] as u32) << 16);
                 if v & 0x80_0000 != 0 {

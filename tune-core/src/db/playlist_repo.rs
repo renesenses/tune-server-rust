@@ -476,7 +476,7 @@ impl PlaylistRepo {
     ) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 3] = [&name, &description, &profile_id];
-        Ok(self.db.execute_returning_id(&sql, &params)?)
+        self.db.execute_returning_id(&sql, &params)
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Playlist>, String> {
@@ -486,7 +486,7 @@ impl PlaylistRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_playlist))
+            .map(|cols| row_to_playlist(cols)))
     }
 
     /// Read a playlist **only if it belongs to `profile_id`**.
@@ -503,7 +503,7 @@ impl PlaylistRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_playlist))
+            .map(|cols| row_to_playlist(cols)))
     }
 
     /// Les listes du profil, dans l'ordre alphabétique du serveur média
@@ -516,7 +516,7 @@ impl PlaylistRepo {
         let sql = self.dialect_sql(sql::list, sql::list);
         let params: [&dyn ToSqlValue; 1] = [&profile_id];
         let rows = self.db.query_many(&sql, &params)?;
-        let mut listes: Vec<Playlist> = rows.iter().map(row_to_playlist).collect();
+        let mut listes: Vec<Playlist> = rows.iter().map(|cols| row_to_playlist(cols)).collect();
         listes.sort_by_cached_key(|l| (crate::upnp_server::cle_alphabetique(&l.name), l.id));
         Ok(super::ordre_alphabetique::tranche(listes, limit, offset))
     }
@@ -729,7 +729,7 @@ impl PlaylistRepo {
             let lignes: Vec<PlaylistEntry> = tx
                 .query_many(&entries_sql, &ep)?
                 .iter()
-                .filter_map(row_to_entry)
+                .filter_map(|cols| row_to_entry(cols))
                 .collect();
             let mut ids = Vec::with_capacity(positions.len());
             for &rang in positions {
@@ -966,7 +966,7 @@ impl PlaylistRepo {
         let sql = self.dialect_sql(sql::get_entries, sql::get_entries);
         let params: [&dyn ToSqlValue; 1] = [&playlist_id];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().filter_map(row_to_entry).collect())
+        Ok(rows.iter().filter_map(|cols| row_to_entry(cols)).collect())
     }
 
     /// La playlist porte-t-elle au moins un titre de service ?
@@ -1169,7 +1169,7 @@ struct SqlDInsertion {
 /// INTROUVABLE de #6179 ; `None` pour une ligne de service à moitié remplie
 /// (le CHECK l'interdit, mais une base passée par un autre chemin ne doit pas
 /// faire tomber toute la liste pour une ligne).
-fn row_to_entry(cols: &Vec<SqlValue>) -> Option<PlaylistEntry> {
+fn row_to_entry(cols: &[SqlValue]) -> Option<PlaylistEntry> {
     let id = cols.first().and_then(|v| v.as_i64())?;
     let position = cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
     let texte = |i: usize| cols.get(i).and_then(|v| v.as_string());
@@ -1205,7 +1205,7 @@ fn row_to_entry(cols: &Vec<SqlValue>) -> Option<PlaylistEntry> {
     })
 }
 
-fn row_to_playlist(cols: &Vec<SqlValue>) -> Playlist {
+fn row_to_playlist(cols: &[SqlValue]) -> Playlist {
     Playlist {
         id: cols.first().and_then(|v| v.as_i64()),
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),

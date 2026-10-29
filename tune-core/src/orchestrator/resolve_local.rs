@@ -881,7 +881,7 @@ impl PlaybackOrchestrator {
         let forcages = self
             .decider_les_forcages_reseau(req, &file_path, source_format, &source, &sorties)
             .await;
-        let transcodage = self
+        let mut transcodage = self
             .decider_le_transcodage_pour_la_sortie(req, source_format, &source, &sorties, &forcages)
             .await;
         let traitement = self
@@ -892,6 +892,17 @@ impl PlaybackOrchestrator {
                 &sorties,
                 &forcages,
                 &transcodage,
+            )
+            .await;
+        transcodage.canaux_reduits = self
+            .resolve_network_channels(
+                req,
+                source_format,
+                &source,
+                &sorties,
+                &forcages,
+                &transcodage,
+                &traitement,
             )
             .await;
         // #4350 — lu UNE fois, et seulement quand il peut changer quelque
@@ -1377,10 +1388,8 @@ impl PlaybackOrchestrator {
             zone_output_type,
             sample_rate,
             zone_max_sample_rate,
-            channels: canaux_source,
             ..
         } = source;
-        let canaux_source = *canaux_source;
         let is_network_output = sorties.is_network_output;
         let ForcagesReseau {
             dsd_passthrough,
@@ -1465,37 +1474,55 @@ impl PlaybackOrchestrator {
         } else {
             false
         };
-        // #4573 — la seconde moitié du dossier : ADAPTER le flux à ce que le
-        // renderer a déclaré, et pas seulement le lire.
-        //
-        // Mesure de Xavier Joly (20/09/2026, Denon AVR-X1600H) : le Sink
-        // annonce du LPCM en `channels=1` et `channels=2`, et `audio/flac:*`
-        // sans aucun `channels=`. Tune servait le FLAC 5.1 TEL QUEL — le
-        // journal du 20/09 le montre, `dlna_set_uri_ok … advertised_mime=
-        // audio/flac` sur un fichier à six voies. L'ampli s'en sort en
-        // repliant lui-même (« Le Denon lit le flac 5.1 en stereo »), avec son
-        // mélange à lui et sans un mot ; un renderer moins conciliant
-        // refuserait la piste.
-        //
-        // 🔴 Trois gardes, et chacune compte :
-        // - `is_network_output` : la sortie LOCALE replie déjà, et le dit
-        //   (`local_audio_stream_config input_ch=6 output_ch=2`) ;
-        // - `!dsd_passthrough` : replier un DSD exigerait de le décoder, donc
-        //   de casser un passthrough que le renderer a lui-même annoncé ;
-        // - `canaux_annonces_du_renderer` rend `None` dès que le Sink est
-        //   muet sur ses canaux. On ne réduit JAMAIS sur une ignorance : ce
-        //   serait faire taire quatre voies sur six chez quelqu'un qui n'a
-        //   rien demandé.
-        //
-        // La sonde SOAP ne part que pour une piste MULTICANALE sur une zone
-        // réseau : une bibliothèque stéréo n'en voit jamais une, et la
-        // réponse est de toute façon mémorisée par renderer.
-        let canaux_renderer = if is_network_output && !dsd_passthrough && canaux_source > 2 {
+        TranscodagePourLaSortie {
+            alac_passthrough,
+            is_chromecast,
+            needs_transcode_for_output,
+            will_be_flac,
+            dlna_needs_wav,
+            canaux_reduits: None,
+        }
+    }
+
+    /// La limite porte sur le format servi, après choix du traitement.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_network_channels(
+        &self,
+        req: &PlayRequest,
+        source_format: Option<AudioFormat>,
+        source: &SourceEtZone,
+        outputs: &Sorties,
+        overrides: &ForcagesReseau,
+        transcode: &TranscodagePourLaSortie,
+        processing: &Traitement,
+    ) -> Option<u16> {
+        let source_channels = source.channels;
+        let is_network_output = outputs.is_network_output;
+        let dsd_passthrough = overrides.dsd_passthrough;
+        let renderer_channels = if is_network_output && !dsd_passthrough && source_channels > 2 {
             let did = identifiant_du_renderer(
                 req.output_device_id.as_deref(),
-                zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
+                source
+                    .zone
+                    .as_ref()
+                    .and_then(|z| z.output_device_id.as_deref()),
             );
-            self.canaux_annonces_du_renderer(did).await
+            let src = source_format.unwrap_or(AudioFormat::Flac);
+            let format = if transcode.dlna_needs_wav
+                || processing.dsp_progressif_wav
+                || processing.flux_wav_reseau
+                || src == AudioFormat::Dsd
+            {
+                AudioFormat::Wav
+            } else if processing.needs_downsample && !transcode.needs_transcode_for_output {
+                AudioFormat::Flac
+            } else if transcode.needs_transcode_for_output || processing.eq_forces_transcode {
+                cible_encodable(src.dlna_transcode_target())
+            } else {
+                src
+            };
+            self.canaux_annonces_du_renderer(did, format.mime_type())
+                .await
         } else {
             None
         };
@@ -1503,44 +1530,40 @@ impl PlaybackOrchestrator {
         // plafond, lu sous les mêmes gardes que la sonde. Elle ne fait que
         // réduire (plancher stéréo) ; le renderer garde le dernier mot quand
         // il annonce moins. Voir `plafond_de_canaux`.
-        let canaux_declares = if is_network_output && !dsd_passthrough && canaux_source > 2 {
+        let declared_channels = if is_network_output && !dsd_passthrough && source_channels > 2 {
             crate::audio::canaux_declares::disposition_declaree(&self.db, req.zone_id)
                 .map(|d| d.channel_count())
         } else {
             None
         };
-        let canaux_reduits = crate::audio::canaux_reseau_4573::canaux_a_servir(
+        let reduced_channels = crate::audio::canaux_reseau_4573::canaux_a_servir(
             is_network_output,
             dsd_passthrough,
-            canaux_source,
-            crate::audio::canaux_reseau_4573::plafond_de_canaux(canaux_renderer, canaux_declares),
+            source_channels,
+            crate::audio::canaux_reseau_4573::plafond_de_canaux(
+                renderer_channels,
+                declared_channels,
+            ),
         );
-        if let Some(cible) = canaux_reduits {
+        if let Some(target) = reduced_channels {
             // #6599 — la ligne dit QUI a fixé la cible : l'annonce du
             // renderer (sondée ou en cache), la disposition déclarée pour la
             // zone, ou les deux. Le rapport de l'A6 n'en disait rien.
             info!(
                 zone_id = req.zone_id,
-                canaux_source,
-                canaux_cible = cible,
-                canaux_renderer = ?canaux_renderer,
-                canaux_declares = ?canaux_declares,
+                canaux_source = source_channels,
+                canaux_cible = target,
+                canaux_renderer = ?renderer_channels,
+                canaux_declares = ?declared_channels,
                 origine = crate::audio::canaux_reseau_4573::origine_du_plafond(
-                    canaux_renderer,
-                    canaux_declares,
-                    cible,
+                    renderer_channels,
+                    declared_channels,
+                    target,
                 ),
                 "reduction_de_canaux_pour_le_renderer"
             );
         }
-        TranscodagePourLaSortie {
-            alac_passthrough,
-            is_chromecast,
-            needs_transcode_for_output,
-            will_be_flac,
-            dlna_needs_wav,
-            canaux_reduits,
-        }
+        reduced_channels
     }
 
     /// Sixième temps : le traitement et ses cibles — le plafond de fréquence,
@@ -1952,13 +1975,32 @@ impl PlaybackOrchestrator {
             // #6630 — la durée annoncée est celle qui reste à SERVIR, pour la
             // session (donc le `Content-Length`) comme pour l'en-tête WAV.
             let duree_ms = duree_servie_du_dop(track.duration_ms as u64, tranche, seek_ms);
+            let ext = std::path::Path::new(&file_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("dsf")
+                .to_lowercase();
+            // #7362 : le DSF commence au bloc précédent, pas exactement à la
+            // milliseconde demandée. Une même taille physique pour HEAD/GET
+            // et l'en-tête, sans changer le lecteur ni les octets DoP.
+            let taille_dop_exacte = if ext == "dsf" {
+                crate::audio::dsf::parse_dsf(&file_path)
+                    .ok()
+                    .and_then(|info| info.taille_wav_dop(tranche))
+            } else if ext == "dff" {
+                crate::audio::dff::parse_dff(&file_path)
+                    .ok()
+                    .and_then(|info| info.taille_wav_dop(tranche))
+            } else {
+                None
+            };
             let wav_info = StreamInfo {
                 format: "wav".into(),
                 mime_type: "audio/wav".into(),
                 sample_rate: dop_rate,
                 bit_depth: 24,
                 channels: dop_channels,
-                file_size: None,
+                file_size: taille_dop_exacte,
                 duration_ms: Some(duree_ms),
                 ..Default::default()
             };
@@ -2013,11 +2055,6 @@ impl PlaybackOrchestrator {
             );
 
             let fp = file_path.clone();
-            let ext = std::path::Path::new(&fp)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("dsf")
-                .to_lowercase();
             tokio::task::spawn_blocking(move || {
                 // Send WAV header first
                 //
@@ -2030,12 +2067,27 @@ impl PlaybackOrchestrator {
                 // même chose qu'avant, sans quoi ce correctif échangerait un
                 // défaut contre un autre — une taille de 2 Gio là où le
                 // `Content-Length` annonce la vraie longueur.
-                let wav_hdr = crate::audio::wav::build_wav_header_with_duration(
-                    dop_channels,
-                    dop_rate,
-                    24,
-                    Some(duree_ms),
-                );
+                let wav_hdr = match taille_dop_exacte.and_then(|taille| taille.checked_sub(44)) {
+                    Some(data) => match u32::try_from(data).ok().filter(|n| *n <= u32::MAX - 36) {
+                        Some(data) => crate::audio::wav::build_wav_header_with_data_size(
+                            dop_channels,
+                            dop_rate,
+                            24,
+                            data,
+                        ),
+                        None => crate::audio::wav::build_wav_header_streaming(
+                            dop_channels,
+                            dop_rate,
+                            24,
+                        ),
+                    },
+                    None => crate::audio::wav::build_wav_header_with_duration(
+                        dop_channels,
+                        dop_rate,
+                        24,
+                        Some(duree_ms),
+                    ),
+                };
                 let rt = tokio::runtime::Handle::current();
                 let _ = rt.block_on(tx.send(wav_hdr.to_vec()));
                 data_ready.notify_one();
@@ -3457,7 +3509,11 @@ impl PlaybackOrchestrator {
                                 "zone.playback_error",
                                 serde_json::json!({
                                     "zone_id": zone_id,
-                                    "error": format!("Impossible de décoder la piste : {e}"),
+                                    // #7077 — code stable traduit par le client ;
+                                    // `error` n'en est que le repli anglais.
+                                    "code": "track_decode_failed",
+                                    "error": "The track could not be decoded.",
+                                    "cause": e.to_string(),
                                 }),
                             );
                         }
@@ -3469,7 +3525,9 @@ impl PlaybackOrchestrator {
                                 "zone.playback_error",
                                 serde_json::json!({
                                     "zone_id": zone_id,
-                                    "error": "Le décodage de la piste a échoué (erreur interne).",
+                                    "code": "track_decode_failed",
+                                    "error": "The track could not be decoded (internal error).",
+                                    "cause": "decoder task panicked",
                                 }),
                             );
                         }
@@ -4022,3 +4080,11 @@ mod tranche_dop_tests_6456 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "dsf_dop_longueur_7362_tests.rs"]
+mod dsf_dop_longueur_7362_tests;
+
+#[cfg(test)]
+#[path = "dff_dop_longueur_7362_tests.rs"]
+mod dff_dop_longueur_7362_tests;

@@ -954,6 +954,22 @@ pub fn build_album_query(
             continue;
         }
 
+        // #6285 — le verdict hi-res PUBLIÉ de l'album, celui de son badge
+        // dans la liste. Un verdict ou un opérateur inconnu rend FAUX.
+        if field == "hires_verdict" {
+            conditions.push(
+                crate::regles_sql::condition_verdict_hires(
+                    "al.id",
+                    true,
+                    op,
+                    &value,
+                    ctx.resolver.hires_douteux_visible(),
+                )
+                .unwrap_or_else(|| crate::regles_sql::FAUX.to_string()),
+            );
+            continue;
+        }
+
         // #5547 — la note de l'ALBUM pour le profil actif (`album_ratings`).
         if field == "rating" {
             if let Some(c) =
@@ -2421,7 +2437,7 @@ mod tests {
                          id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
                          item_type TEXT, service TEXT, service_id TEXT, title TEXT,
                          artist TEXT, album TEXT, cover_url TEXT, created_at TEXT,
-                         position TEXT)",
+                         position TEXT, year TEXT, sample_rate TEXT, bit_depth TEXT)",
                     &[],
                 )
                 .expect("favoris");
@@ -2692,7 +2708,8 @@ mod tests {
                  CREATE TABLE IF NOT EXISTS streaming_favorites (
                      id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
                      item_type TEXT, service TEXT, service_id TEXT, title TEXT,
-                     artist TEXT, album TEXT, cover_url TEXT, created_at TEXT);
+                     artist TEXT, album TEXT, cover_url TEXT, created_at TEXT,
+                     year TEXT, sample_rate TEXT, bit_depth TEXT);
                  INSERT INTO artists (id, name) VALUES (1, 'Miles Davis');
                  INSERT INTO albums (id, title, artist_id, year) VALUES
                      (10, 'Kind of Blue', 1, 1959), (11, 'Bitches Brew', 1, 1970);

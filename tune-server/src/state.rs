@@ -252,6 +252,22 @@ fn dossier_autoeq(db_path: &str) -> Option<std::path::PathBuf> {
     Some(donnees.join("cache").join("autoeq"))
 }
 
+/// #6933 — le dossier où librespot garde SA connexion au compte Spotify
+/// (`<données>/librespot`, résolu comme la base). Aucun pour une base en
+/// mémoire (essais).
+fn dossier_librespot(db_path: &str) -> Option<std::path::PathBuf> {
+    if db_path.is_empty() || db_path == ":memory:" {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let donnees = crate::gel_executeur::dossier_de_donnees(
+        std::env::var("TUNE_DATA_DIR").ok().as_deref(),
+        db_path,
+        &cwd,
+    );
+    Some(donnees.join("librespot"))
+}
+
 impl AppState {
     /// L'horodatage absolu du démarrage du processus, en RFC 3339 (UTC).
     ///
@@ -566,7 +582,10 @@ impl AppState {
         orch.license = Some(license.clone());
         // #6018 — la lecture d'un titre Spotify : le PCM du récepteur
         // librespot entre par la porte des sources PCM, comme un CD.
-        let spotify_connect = Arc::new(SpotifyConnectManager::new("Tune".into(), port));
+        let spotify_connect = Arc::new(
+            SpotifyConnectManager::new("Tune".into(), port)
+                .avec_dossier_identifiants(dossier_librespot(db_path)),
+        );
         orch.sources_pcm().inscrire(
             tune_core::streaming::spotify_lecture::SOURCE,
             Arc::new(

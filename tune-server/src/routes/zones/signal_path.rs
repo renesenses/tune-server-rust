@@ -1100,8 +1100,40 @@ pub fn build_signal_path_lang(
         if !pure && let Some(rg) = replaygain_sans_gain_tague(backend, np.track_id) {
             v["replaygain_untagged"] = rg;
         }
+        // #6946 — Spotify : le format et le débit reçus, et pourquoi pas
+        // mieux, sur l'étape Source et dans `source_quality`. Clé ABSENTE
+        // hors Spotify.
+        if np.source == tune_core::streaming::spotify_lecture::SOURCE {
+            annoter_la_qualite_spotify(lang, &mut v, qualite_spotify(np));
+        }
         v
     })
+}
+
+/// #6946 — pose la raison du plafond de librespot sur l'étape Source et la
+/// qualité reçue dans `source_quality`.
+fn annoter_la_qualite_spotify(
+    lang: &str,
+    chemin: &mut Value,
+    qualite: tune_core::streaming::spotify_connect::QualiteDeLibrespot,
+) {
+    use crate::routes::spotify_connect::CLE_RAISON_DU_PLAFOND;
+    let raison = crate::message_api::texte_en(
+        lang,
+        CLE_RAISON_DU_PLAFOND,
+        &[("bitrate", qualite.bitrate_kbps.to_string())],
+    );
+    if let Some(etape) = chemin["steps"]
+        .as_array_mut()
+        .and_then(|etapes| etapes.iter_mut().find(|e| e["name"] == "Source"))
+    {
+        etape["code"] = json!(qualite.reason_code);
+        etape["detail"] = json!(raison);
+    }
+    let mut publiee = json!(qualite);
+    publiee["reason"] = json!(raison);
+    publiee["reason_key"] = json!(CLE_RAISON_DU_PLAFOND);
+    chemin["source_quality"] = publiee;
 }
 
 /// #4346 — la valeur publiée dans `signal_path.lossless` : le verdict de la
@@ -2803,6 +2835,15 @@ fn libelle_radio_hls(radio: &tune_core::http::streamer::RadioSourceInfo) -> Opti
     })
 }
 
+/// #6946 — ce que librespot reçoit de Spotify pour le titre en cours : le
+/// débit que la lecture annonce, ou celui que Tune demande à librespot.
+fn qualite_spotify(
+    np: &tune_core::playback::NowPlaying,
+) -> tune_core::streaming::spotify_connect::QualiteDeLibrespot {
+    use tune_core::streaming::spotify_connect::{DEFAULT_BITRATE, qualite_de_librespot};
+    qualite_de_librespot(np.bitrate_kbps.unwrap_or(DEFAULT_BITRATE))
+}
+
 /// Lit la piste, le fil et la lecture en cours pour décrire la source.
 fn decrire_la_source<'w>(
     np: &tune_core::playback::NowPlaying,
@@ -2857,6 +2898,33 @@ fn decrire_la_source<'w>(
             canaux_du_fil: None,
             dst_reconstruit_en_dsf: false,
             debit_radio_kbps: radio.bitrate_kbps,
+        };
+    }
+    // #6946 — un titre Spotify est le PCM que librespot a DÉCODÉ d'un Ogg
+    // Vorbis : la source est cet Ogg Vorbis, au plus 320 kbit/s, et non le WAV
+    // 44,1 kHz / 16 bits du fil, qui le faisait passer pour un CD sans perte.
+    if np.source == tune_core::streaming::spotify_lecture::SOURCE {
+        let qualite = qualite_spotify(np);
+        return Source {
+            output_container,
+            wire_sample_rate,
+            wire_bit_depth,
+            source_format: AudioFormat::from_extension(qualite.codec),
+            is_dsd: false,
+            sample_rate: np.sample_rate.or(wire_sample_rate).map_or(0, |v| v as i32),
+            // #6334 — un codec avec perte n'a pas de profondeur de bits : les
+            // 16 bits sont ceux du PCM rendu par librespot.
+            bit_depth: 0,
+            format_name: qualite.format,
+            is_lossless: qualite.lossless,
+            codec_connu: true,
+            flac_ffmpeg_vers_le_reseau: false,
+            conteneur_flac_copie: false,
+            canaux_source: None,
+            canaux_du_fil: wire.map(|w| w.channels).filter(|c| *c > 0),
+            dst_reconstruit_en_dsf: false,
+            debit_source_kbps: Some(qualite.bitrate_kbps),
+            debit_radio_kbps: None,
         };
     }
     // Verbatim proxy radios keep their existing wire/NowPlaying metadata

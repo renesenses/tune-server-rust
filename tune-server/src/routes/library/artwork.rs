@@ -343,7 +343,20 @@ pub(super) async fn proxy_artwork(
         signature_exigee: exemption.is_some(),
         hotes_supplementaires: &supplementaires,
     };
-    let mut resultat = state.relais_pochettes.relayer(&demande).await;
+    let contexte_radio = if q.sig.is_none() && exemption.is_none() {
+        logo_de_pochette_radio_publiee(&state, &q.url).await
+    } else {
+        None
+    };
+    let est_pochette_radio = contexte_radio.is_some();
+    let mut resultat = if let Some(logo) = contexte_radio {
+        state
+            .relais_pochettes
+            .relayer_radio_publiee(&q.url, logo.as_deref(), &secret, &supplementaires)
+            .await
+    } else {
+        state.relais_pochettes.relayer(&demande).await
+    };
 
     // Pochette de serveur UPnP de la bibliothèque (réseau local) : refusée par
     // la garde générale, admise si — et seulement si — c'est l'adresse
@@ -396,7 +409,11 @@ pub(super) async fn proxy_artwork(
             );
             headers.insert(
                 "Cache-Control",
-                HeaderValue::from_static("public, max-age=86400"),
+                HeaderValue::from_static(if est_pochette_radio {
+                    "no-cache"
+                } else {
+                    "public, max-age=86400"
+                }),
             );
             (StatusCode::OK, headers, image.octets).into_response()
         }
@@ -421,6 +438,42 @@ pub(super) async fn proxy_artwork(
         }
     }
 }
+
+/// #7009 — seule l'adresse exacte publiée pour une radio courante est
+/// reconnue. Le logo vient de la station ou de son lancement, jamais du
+/// paramètre de la requête. Si plusieurs radios partagent cette pochette
+/// mais ont des logos différents, aucun logo arbitraire n'est choisi.
+async fn logo_de_pochette_radio_publiee(state: &AppState, url: &str) -> Option<Option<String>> {
+    let radios = tune_core::db::radio_repo::RadioRepo::with_backend(state.backend.clone());
+    let mut logos = std::collections::HashSet::new();
+    for zone in state.playback.all_states().await {
+        let Some(np) = zone.now_playing else { continue };
+        if np.source != "radio" || np.cover_path.as_deref() != Some(url) {
+            continue;
+        }
+        let source = np.source_id.as_deref().unwrap_or("");
+        let station = match source.parse::<i64>() {
+            Ok(id) => radios.get(id).ok().flatten(),
+            Err(_) => radios.get_by_url(source).ok().flatten(),
+        };
+        let flux = station.as_ref().map(|s| s.url.as_str()).unwrap_or(source);
+        logos.insert(tune_core::poller::logo_de_lancement::logo_de_la_station(
+            station.as_ref(),
+            flux,
+        ));
+    }
+    if logos.is_empty() {
+        None
+    } else if logos.len() == 1 {
+        Some(logos.into_iter().next().flatten())
+    } else {
+        Some(None)
+    }
+}
+
+#[cfg(test)]
+#[path = "pochettes_radio_7009_tests.rs"]
+mod pochettes_radio_7009_tests;
 
 /// #4895 — relaie la pochette d'un serveur multimédia du réseau local
 /// découvert par SSDP, ou `None` si l'hôte:port de l'URL n'est pas EXACTEMENT

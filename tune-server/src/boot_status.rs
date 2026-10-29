@@ -121,6 +121,32 @@ pub fn current() -> Option<String> {
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Le CODE stable d'une étape de démarrage (renesenses/tune-server-rust#7073).
+///
+/// `phase` est une phrase française (« configuration », « base de données »…),
+/// affichée telle quelle par la page d'attente HTML. Un client d'API ne peut
+/// ni la traduire ni compter dessus : le client web en tirait un toast d'ERREUR
+/// « Server error: Tune démarre : configuration » dans une interface anglaise,
+/// pour une phase normale du démarrage. Le code ci-dessous est ASCII, ne change
+/// pas avec la langue, et est ce que le client traduit.
+///
+/// Une étape inconnue rend `finishing` : le dernier mot du démarrage.
+pub fn phase_code(phase: &str) -> &'static str {
+    match phase {
+        "démarrage" => "starting",
+        "attente du disque de données" => "waiting_data_disk",
+        "base de données" => "database",
+        "configuration" => "configuration",
+        "partages réseau" => "network_shares",
+        "sorties audio" => "audio_outputs",
+        "greffons" => "plugins",
+        "découverte réseau" => "network_discovery",
+        "Spotify Connect" => "spotify_connect",
+        "routes" => "routes",
+        _ => "finishing",
+    }
+}
+
 /// Ce que fait chaque étape de `bootstrap.rs`, en une phrase.
 ///
 /// #5370 — la page disait « Cela peut prendre quelques minutes sur une grande
@@ -298,6 +324,10 @@ fn json_body(phase: &str, progress: &Option<MigrationProgress>) -> String {
     };
     serde_json::json!({
         "status": "starting",
+        // #7073 — le code structuré, que le client traduit. `phase` et
+        // `message` restent pour les clients d'avant et la page HTML.
+        "code": "server_starting",
+        "phase_code": phase_code(phase),
         "phase": phase,
         "message": match progress {
             Some(p) => p.describe(),
@@ -429,6 +459,40 @@ mod tests {
             Some("/api/v1/zones")
         );
         assert_eq!(request_path(""), None);
+    }
+
+    /// #7073 — chaque étape de `bootstrap.rs` a un code ASCII distinct, et la
+    /// réponse JSON le porte : le client traduit le code, pas la phrase.
+    ///
+    /// Contre-épreuve : retirer `"code"`/`"phase_code"` de `json_body`, ou
+    /// laisser une étape sans arm dans `phase_code`, fait rougir ce test.
+    #[test]
+    fn la_reponse_json_porte_un_code_de_phase_structure() {
+        let etapes = [
+            ("démarrage", "starting"),
+            ("attente du disque de données", "waiting_data_disk"),
+            ("base de données", "database"),
+            ("configuration", "configuration"),
+            ("partages réseau", "network_shares"),
+            ("sorties audio", "audio_outputs"),
+            ("greffons", "plugins"),
+            ("découverte réseau", "network_discovery"),
+            ("Spotify Connect", "spotify_connect"),
+            ("routes", "routes"),
+        ];
+        let mut vus = std::collections::HashSet::new();
+        for (phase, code) in etapes {
+            assert_eq!(phase_code(phase), code, "{phase}");
+            assert!(code.is_ascii(), "{code}");
+            assert!(vus.insert(code), "code en double : {code}");
+            let raw = response("/api/v1/zones", phase, None, None);
+            let body = raw.split("\r\n\r\n").nth(1).expect("corps absent");
+            let v: serde_json::Value = serde_json::from_str(body).expect("JSON invalide");
+            assert_eq!(v["code"], "server_starting", "{phase}");
+            assert_eq!(v["phase_code"], code, "{phase}");
+        }
+        // Une étape inconnue ne casse rien : le dernier mot du démarrage.
+        assert_eq!(phase_code("étape future"), "finishing");
     }
 
     /// Un client d'API doit recevoir du JSON exploitable, pas du HTML.

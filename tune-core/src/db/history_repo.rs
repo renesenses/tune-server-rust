@@ -15,8 +15,6 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
-    const RECORD_COLS: &str = "id, track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, listened_at, zone_id, context_type, context_id, context_position";
-
     /// Les mêmes colonnes, mais avec `track_id` RÉSOLU.
     ///
     /// 🔴 `listen_history.track_id` est **toujours NULL** : le seul site
@@ -418,14 +416,14 @@ impl HistoryRepo {
             &rec.context_cover,
             &rec.album_ref,
         ];
-        Ok(self.db.execute_returning_id(&sql, &params)?)
+        self.db.execute_returning_id(&sql, &params)
     }
 
     pub fn recent(&self, limit: i64) -> Result<Vec<ListenRecord>, String> {
         let sql = self.dialect_sql(sql::recent, sql::recent);
         let params: [&dyn ToSqlValue; 1] = [&limit];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_listen).collect())
+        Ok(rows.iter().map(|cols| row_to_listen(cols)).collect())
     }
 
     pub fn recent_paginated(
@@ -440,7 +438,7 @@ impl HistoryRepo {
         let sql = self.dialect_sql(sql::recent_paginated, sql::recent_paginated);
         let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok((rows.iter().map(row_to_listen).collect(), total))
+        Ok((rows.iter().map(|cols| row_to_listen(cols)).collect(), total))
     }
 
     /// Current names of unambiguous local playlist contexts (#4036).
@@ -1838,7 +1836,7 @@ pub struct DashboardData {
     pub on_this_day: Vec<OnThisDayEntry>,
 }
 
-fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {
+fn row_to_listen(cols: &[SqlValue]) -> ListenRecord {
     ListenRecord {
         id: cols.first().and_then(|v| v.as_i64()),
         track_id: cols.get(1).and_then(|v| v.as_i64()),

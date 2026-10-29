@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::genre_key;
+pub use super::musicbrainz_release::SansReponse;
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 
@@ -93,10 +94,10 @@ pub fn genres_de_la_page(page: &Value) -> (Vec<GenreMb>, Option<u64>) {
 /// La liste complète, page par page, par le transport injecté
 /// `lire_page(offset)`. `Err` dès qu'une page manque : une liste partielle
 /// ferait passer des genres connus pour inconnus.
-pub async fn lire_index_par<F, Fut>(lire_page: &F) -> Result<Vec<GenreMb>, ()>
+pub async fn lire_index_par<F, Fut>(lire_page: &F) -> Result<Vec<GenreMb>, SansReponse>
 where
     F: Fn(u32) -> Fut,
-    Fut: Future<Output = Result<Value, ()>>,
+    Fut: Future<Output = Result<Value, SansReponse>>,
 {
     let mut tous: Vec<GenreMb> = Vec::new();
     for n in 0..PAGES_MAX {
@@ -113,7 +114,7 @@ where
 
 /// Transport de production d'une page de `genre/all`, sous le limiteur
 /// MusicBrainz partagé.
-pub async fn lire_page_de_genres(offset: u32) -> Result<Value, ()> {
+pub async fn lire_page_de_genres(offset: u32) -> Result<Value, SansReponse> {
     super::musicbrainz_release::rate_limit_delay().await;
     super::musicbrainz_release::parcourir_sur_musicbrainz(
         "genre/all",
@@ -123,7 +124,7 @@ pub async fn lire_page_de_genres(offset: u32) -> Result<Value, ()> {
         ],
     )
     .await
-    .map_err(|_| ())
+    .map_err(|_| SansReponse)
 }
 
 // ── Hiérarchie (Wikidata) ───────────────────────────────────────────────────
@@ -195,16 +196,16 @@ pub async fn lire_hierarchie_par<F, Fut>(
     mbids: &[String],
     lire: &F,
     maintenant: i64,
-) -> Result<HashMap<String, Voisins>, ()>
+) -> Result<HashMap<String, Voisins>, SansReponse>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Option<Value>>,
 {
     let mut out: HashMap<String, Voisins> = HashMap::new();
     for lot in mbids.chunks(LOT_SPARQL) {
-        let reponse = lire(url_sparql(lot)).await.ok_or(())?;
+        let reponse = lire(url_sparql(lot)).await.ok_or(SansReponse)?;
         if reponse["results"]["bindings"].as_array().is_none() {
-            return Err(());
+            return Err(SansReponse);
         }
         for m in lot {
             out.entry(m.clone()).or_insert_with(|| Voisins {
@@ -363,7 +364,7 @@ where
     if !a_lire.is_empty() {
         match lire_hierarchie_par(&a_lire, lire, maintenant).await {
             Ok(lus) => garder_voisins(backend, lus),
-            Err(()) => complet = false,
+            Err(SansReponse) => complet = false,
         }
     }
     (hierarchie_gardee(backend).into_iter().collect(), complet)

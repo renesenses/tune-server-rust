@@ -29,7 +29,20 @@
 //!  * artiste, titre, album → les colonnes du même nom ;
 //!  * `favorite` → vrai pour le bon type (ce sont des favoris), faux sinon.
 //!
-//! Toute AUTRE règle (genre, année, fréquence, dossier…) ne peut pas être
+//! Pour un favori ALBUM, l'année de sortie et la qualité que le service
+//! annonce avec le favori sont rangées depuis #6482 (DidLyon, fil 2320 :
+//! « catégoriser les albums au-delà de la catégorie (année de sortie,
+//! qualité…) ») :
+//!
+//!  * `year` → `sf.year` ;
+//!  * `sample_rate`, `bit_depth` → `sf.sample_rate`, `sf.bit_depth`.
+//!
+//! Comparées comme nombres, avec les opérateurs et les graphies de la
+//! bibliothèque (`smart_collections::build_album_query`), pour qu'une même
+//! règle retienne le même album qu'il soit local ou favori. Un favori dont le
+//! service n'a rien dit (colonne vide) n'y satisfait pas.
+//!
+//! Toute AUTRE règle (genre, fréquence d'écoute, dossier…) ne peut pas être
 //! évaluée sur une ligne qui n'a pas la donnée : elle vaut FAUX. En mode « toutes
 //! les règles », la ligne est donc écartée — on ne prétend pas qu'un favori
 //! Qobuz est du jazz sans le savoir. En mode « une des règles », elle ne compte
@@ -157,6 +170,54 @@ pub(crate) fn comparaison_texte(col: &str, op: &str, vals: &[String]) -> String 
     }
 }
 
+/// La colonne numérique d'un favori ALBUM qu'une règle nomme (#6482). Les
+/// trois colonnes sont TEXT, comme le reste de la table : la comparaison passe
+/// par `CAST`.
+fn colonne_nombre(champ: &str, objet: Objet) -> Option<&'static str> {
+    match (champ, objet) {
+        ("year", Objet::Album) => Some("sf.year"),
+        ("sample_rate", Objet::Album) => Some("sf.sample_rate"),
+        ("bit_depth", Objet::Album) => Some("sf.bit_depth"),
+        _ => None,
+    }
+}
+
+/// Une règle numérique sur une colonne de favori — les mêmes opérateurs, les
+/// mêmes graphies et le même repli (`0` pour une valeur illisible) que les
+/// critères numériques d'album de `smart_collections::build_album_query`.
+fn comparaison_nombre(col: &str, rule: &Value, vals: &[String]) -> String {
+    let n = format!("CAST({col} AS INTEGER)");
+    let entier = |s: &str| s.trim().parse::<i64>().unwrap_or(0);
+    let un = || vals.first().map(|v| entier(v)).unwrap_or(0);
+    let op = operateur(rule);
+    match op.as_str() {
+        "=" => format!("{n} = {}", un()),
+        "!=" => format!("{n} != {}", un()),
+        ">=" | "gte" | "greater_than" | "greater_equal" => format!("{n} >= {}", un()),
+        ">" | "gt" => format!("{n} > {}", un()),
+        "<=" | "lte" | "less_than" | "less_equal" => format!("{n} <= {}", un()),
+        "<" | "lt" => format!("{n} < {}", un()),
+        "between" => {
+            let bornes: Vec<String> = match rule.get("value") {
+                Some(Value::Array(_)) => vals.to_vec(),
+                _ => vals
+                    .first()
+                    .map(|v| v.splitn(2, ',').map(str::to_string).collect())
+                    .unwrap_or_default(),
+            };
+            match bornes.as_slice() {
+                [lo, hi, ..] => {
+                    let hi = hi.trim().parse::<i64>().unwrap_or(i64::MAX);
+                    format!("{n} BETWEEN {} AND {hi}", entier(lo))
+                }
+                _ => format!("{n} = {}", un()),
+            }
+        }
+        // `contains`, `starts_with`, `in`, vide / non vide : sur le texte.
+        autre => comparaison_texte(col, autre, vals),
+    }
+}
+
 /// La condition d'UNE règle sur une ligne `streaming_favorites sf`.
 fn condition(rule: &Value, objet: Objet) -> String {
     let champ = rule.get("field").and_then(|v| v.as_str()).unwrap_or("");
@@ -182,6 +243,9 @@ fn condition(rule: &Value, objet: Objet) -> String {
     };
     if let Some(col) = colonne {
         return comparaison_texte(col, &op, &vals);
+    }
+    if let Some(col) = colonne_nombre(champ, objet) {
+        return comparaison_nombre(col, rule, &vals);
     }
     if champ == "ai_generated" {
         // #5530 — le marquage « généré par IA » rangé avec le favori (celui
@@ -209,7 +273,8 @@ fn condition(rule: &Value, objet: Objet) -> String {
 /// La requête des favoris de service qui satisfont les règles, ou `None`
 /// quand aucune règle `source` ne nomme de service.
 ///
-/// Colonnes : service, service_id, title, artist, album, cover_url.
+/// Colonnes : service, service_id, title, artist, album, cover_url, et
+/// `year` pour un album.
 pub(crate) fn requete(
     rules_json: &str,
     match_mode: &str,
@@ -223,20 +288,32 @@ pub(crate) fn requete(
     let tri = if sort_by == "random" {
         "RANDOM()".to_string()
     } else {
-        let col = match (sort_by, objet) {
-            ("artist" | "artist_name", _) => "sf.artist",
-            ("album" | "album_title", Objet::Piste) => "sf.album",
-            ("added_at", _) => "sf.created_at",
-            _ => "sf.title",
+        // #6482 — un nombre se trie comme un nombre : `LOWER()` d'un entier
+        // est refusé par PostgreSQL, et « 1999 » < « 2001 » < « 98 » en texte.
+        let expr = if let Some(col) = colonne_nombre(sort_by, objet) {
+            format!("CAST({col} AS INTEGER)")
+        } else {
+            match (sort_by, objet) {
+                ("artist" | "artist_name", _) => "LOWER(sf.artist)".to_string(),
+                ("album" | "album_title", Objet::Piste) => "LOWER(sf.album)".to_string(),
+                ("added_at", _) => "LOWER(sf.created_at)".to_string(),
+                _ => "LOWER(sf.title)".to_string(),
+            }
         };
         format!(
-            "LOWER({col}) {}",
+            "{expr} {}",
             if sort_order == "desc" { "DESC" } else { "ASC" }
         )
     };
     let limite = limite.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    // L'année n'est lue que pour un album (#6482) : une playlist n'en fait
+    // rien, et sa requête garde sa forme.
+    let annee = match objet {
+        Objet::Album => ", sf.year",
+        Objet::Piste => "",
+    };
     Some(format!(
-        "SELECT sf.service, sf.service_id, sf.title, sf.artist, sf.album, sf.cover_url \
+        "SELECT sf.service, sf.service_id, sf.title, sf.artist, sf.album, sf.cover_url{annee} \
          FROM streaming_favorites sf \
          WHERE {ou} \
          ORDER BY {tri}{limite}"
@@ -336,15 +413,18 @@ pub(crate) fn piste_json(cols: &[tune_core::db::backend::SqlValue]) -> Value {
     })
 }
 
-/// Même chose à la forme d'un ALBUM de collection intelligente.
+/// Même chose à la forme d'un ALBUM de collection intelligente. L'année
+/// (septième colonne, #6482) est rendue quand le service l'a donnée ; une
+/// ligne qui ne la porte pas (albums étiquetés) la laisse nulle.
 pub(crate) fn album_json(cols: &[tune_core::db::backend::SqlValue]) -> Value {
+    let annee = cols.get(6).and_then(|v| v.as_i64()).filter(|a| *a > 0);
     serde_json::json!({
         "id": Value::Null,
         "source": cols.first().and_then(|v| v.as_string()),
         "source_id": cols.get(1).and_then(|v| v.as_string()),
         "title": cols.get(2).and_then(|v| v.as_string()),
         "artist_name": cols.get(3).and_then(|v| v.as_string()),
-        "year": Value::Null,
+        "year": annee,
         "cover_path": cols.get(5).and_then(|v| v.as_string()),
         "genre": Value::Null,
         "track_count": 0,
@@ -528,6 +608,126 @@ mod tests {
             .find(|f| f.service_id == "5099749522428")
             .unwrap();
         assert_eq!(temoin.ai_generated, None);
+    }
+
+    /// #6482 (DidLyon, fil 2320 : « catégoriser les albums au-delà de la
+    /// catégorie (année de sortie, qualité…) ») — de bout en bout sur une base
+    /// MIGRÉE : l'année et la qualité rangées avec trois albums favoris Qobuz
+    /// (`poser_annee_et_qualite`, ce que fait la reprise) sont lues par les
+    /// règles « Année », « Fréquence » et « Résolution » d'une collection,
+    /// avec les opérateurs de la bibliothèque. Avant : ces règles valaient
+    /// FAUX sur tout favori, et la collection n'en rendait aucun.
+    #[test]
+    fn annee_et_qualite_classent_les_albums_favoris_6482() {
+        use std::sync::Arc;
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::streaming_favorites_repo::{AnneeQualite, StreamingFavoritesRepo};
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let b: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = StreamingFavoritesRepo::with_backend(b.clone());
+        let albums = [
+            ("q1", "Time Out", Some(1959), Some(44_100), Some(16)),
+            ("q2", "Promises", Some(2021), Some(96_000), Some(24)),
+            ("q3", "Sans fiche", None, None, None),
+        ];
+        for (id, titre, year, sample_rate, bit_depth) in albums {
+            repo.add(1, "album", "qobuz", id, Some(titre), None, None, None)
+                .unwrap();
+            repo.poser_annee_et_qualite(
+                1,
+                "album",
+                "qobuz",
+                id,
+                &AnneeQualite {
+                    year,
+                    sample_rate,
+                    bit_depth,
+                },
+            )
+            .unwrap();
+        }
+        let titres = |regle: &str, tri: &str, ordre: &str| -> Vec<String> {
+            let regles = format!(r#"[{{"field":"source","op":"eq","value":"qobuz"}},{regle}]"#);
+            let sql = requete(&regles, "all", Objet::Album, 1, tri, ordre, None).unwrap();
+            b.query_many(&sql, &[])
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"))
+                .iter()
+                .map(|r| r[2].as_string().unwrap_or_default())
+                .collect()
+        };
+        let annee = r#"{"field":"year","op":">=","value":"2000"}"#;
+        assert_eq!(
+            titres(annee, "title", "asc"),
+            vec!["Promises"],
+            "« Année ≥ 2000 » doit retenir l'album favori de 2021"
+        );
+        assert_eq!(
+            titres(
+                r#"{"field":"year","op":"between","value":[1950,1969]}"#,
+                "title",
+                "asc"
+            ),
+            vec!["Time Out"]
+        );
+        assert_eq!(
+            titres(
+                r#"{"field":"sample_rate","op":"gt","value":"48000"}"#,
+                "title",
+                "asc"
+            ),
+            vec!["Promises"],
+            "« Fréquence > 48 kHz » doit retenir l'album favori hi-res"
+        );
+        assert_eq!(
+            titres(
+                r#"{"field":"bit_depth","op":"=","value":"16"}"#,
+                "title",
+                "asc"
+            ),
+            vec!["Time Out"]
+        );
+        // Un favori dont le service n'a rien dit ne satisfait pas la règle,
+        // pas même sa négation — comme un album local sans année.
+        assert_eq!(
+            titres(
+                r#"{"field":"year","op":"!=","value":"1959"}"#,
+                "title",
+                "asc"
+            ),
+            vec!["Promises"]
+        );
+        // Le tri par année est numérique, et l'année part avec l'album.
+        assert_eq!(
+            titres(r#"{"field":"year","op":"is_not_empty"}"#, "year", "desc"),
+            vec!["Promises", "Time Out"]
+        );
+        let sql = requete(
+            r#"[{"field":"source","op":"eq","value":"qobuz"},{"field":"year","op":"<","value":"2000"}]"#,
+            "all",
+            Objet::Album,
+            1,
+            "title",
+            "asc",
+            None,
+        )
+        .unwrap();
+        let lignes = b.query_many(&sql, &[]).unwrap();
+        assert_eq!(album_json(&lignes[0])["year"], 1959);
+        // Une playlist (favoris PISTES) n'a pas ces données : la règle y
+        // reste fausse.
+        let sql = requete(
+            &format!(r#"[{{"field":"source","op":"eq","value":"qobuz"}},{annee}]"#),
+            "all",
+            Objet::Piste,
+            1,
+            "title",
+            "asc",
+            None,
+        )
+        .unwrap();
+        assert!(sql.contains("AND 1=0"), "{sql}");
     }
 
     /// #5530 — « Généré par IA : non » écarte le favori Qobuz marqué, et lui

@@ -11,6 +11,7 @@ use tune_core::db::engine::Engine;
 use crate::SmartHttpState;
 use crate::catalogue;
 use crate::regles_sql;
+use crate::requete_enregistree;
 use crate::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
 use crate::source_streaming::{self, Objet};
 use tune_http_types::{ActiveProfile, AppError};
@@ -139,6 +140,11 @@ async fn create_smart_playlist(
 
     // Refuse les références circulaires (A ⊂ B ⊂ A) entre entités smart.
     let resolver = DbRefResolver::new(&state.backend);
+    // #6287, étape 4 — une requête imbriquée fautive est refusée avant d'être
+    // écrite, avec le corps de la route `/requete`.
+    if let Err(refus) = requete_enregistree::valider(&body.rules, &RefCtx::root(&resolver, None)) {
+        return Ok((StatusCode::BAD_REQUEST, Json(refus.corps())).into_response());
+    }
     smart_refs::check_no_cycle(
         &resolver,
         RefKind::SmartPlaylist,
@@ -242,6 +248,10 @@ async fn update_smart_playlist(
             })
             .unwrap_or_else(|| format!("#{id}"));
         let resolver = DbRefResolver::new(&state.backend);
+        // #6287, étape 4 — comme à la création.
+        if let Err(refus) = requete_enregistree::valider(rules, &RefCtx::root(&resolver, None)) {
+            return Ok((StatusCode::BAD_REQUEST, Json(refus.corps())).into_response());
+        }
         smart_refs::check_no_cycle(
             &resolver,
             RefKind::SmartPlaylist,
@@ -437,6 +447,22 @@ pub(crate) fn build_smart_query_rapport(
         let value_txt = regles_sql::texte_de(value_raw);
         let value = value_txt.as_str();
 
+        // #6287, étape 4 — une requête imbriquée enregistrée : sa condition
+        // entière, ou FAUX et nommée si elle ne s'évalue plus.
+        if field == requete_enregistree::CHAMP {
+            match requete_enregistree::condition(rule, ctx) {
+                Ok((c, refus)) => {
+                    refusees.extend(refus);
+                    conditions.push(c);
+                }
+                Err(_) => {
+                    refusees.push(format!("{field} {op}"));
+                    conditions.push(regles_sql::FAUX.to_string());
+                }
+            }
+            continue;
+        }
+
         // --- règles « référence » (collection / playlist / favori) ---
         if smart_refs::is_ref_field(field) {
             conditions.push(smart_refs::track_ref_condition(field, raw_op, value, ctx));
@@ -456,6 +482,21 @@ pub(crate) fn build_smart_query_rapport(
             // réponse est constante (voir `regles_sql`).
             match regles_sql::condition_marquage_ia_bibliotheque(op) {
                 Some(c) => c.to_string(),
+                None => {
+                    refusees.push(format!("{field} {op}"));
+                    regles_sql::FAUX.to_string()
+                }
+            }
+        } else if field == "hires_verdict" {
+            // #6285 — le verdict hi-res PUBLIÉ de la piste.
+            match regles_sql::condition_verdict_hires(
+                "t.id",
+                false,
+                op,
+                value,
+                ctx.resolver.hires_douteux_visible(),
+            ) {
+                Some(c) => c,
                 None => {
                     refusees.push(format!("{field} {op}"));
                     regles_sql::FAUX.to_string()
@@ -1120,7 +1161,9 @@ struct RequeteTextuelle {
 ///
 /// - 200 : `tracks`, `total`, `regles_refusees` (comme l'aperçu), `rules` et
 ///   `match_mode` (ou `null` : requête imbriquée ou niée, sans forme
-///   visuelle) ;
+///   visuelle), et `enregistrement` (`{rules, match_mode}`, jamais `null`) :
+///   ce que `POST /library/smart-playlists` enregistre (étape 4, voir
+///   `crate::requete_enregistree`) ;
 /// - 400 : `{"error": "requete_invalide", "message", "position"}`, la position
 ///   en caractères depuis le début de la requête. La requête est bornée
 ///   (`LONGUEUR_MAX` caractères, `PROFONDEUR_MAX` imbrications). Un critère
@@ -1189,12 +1232,16 @@ async fn requete_textuelle(
         Some((r, m)) => (Value::Array(r), json!(m)),
         None => (Value::Null, Value::Null),
     };
+    // #6287, étape 4 — ce que l'éditeur enregistre tel quel : les règles de
+    // l'éditeur d'une requête plate, ou la règle `requete` d'une imbriquée.
+    let (a_enregistrer, mode_a_enregistrer) = requete_enregistree::enregistrement(&body.q, &arbre);
     Json(json!({
         "tracks": items,
         "total": items.len(),
         "regles_refusees": refusees,
         "rules": rules,
         "match_mode": match_mode,
+        "enregistrement": {"rules": a_enregistrer, "match_mode": mode_a_enregistrer},
     }))
     .into_response()
 }

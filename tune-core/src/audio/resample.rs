@@ -144,7 +144,7 @@ pub fn interpolation_sinc(from_sr: u32, to_sr: u32) -> SincInterpolationType {
         return SincInterpolationType::Linear;
     }
     let denominateur = (to_sr / pgcd(from_sr, to_sr)) as usize;
-    if SUR_ECHANTILLONNAGE % denominateur == 0 {
+    if SUR_ECHANTILLONNAGE.is_multiple_of(denominateur) {
         SincInterpolationType::Linear
     } else {
         SincInterpolationType::Cubic

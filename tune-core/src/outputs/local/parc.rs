@@ -243,9 +243,9 @@ pub fn list_asio_devices() -> Vec<AsioDeviceInfo> {
                                 (max_ch, rates)
                             }
                             Err(_) => {
-                                // ASIO drivers usually enumerate correctly, but fall
-                                // back to conservative defaults if they don't.
-                                (2, vec![44100, 48000, 96000, 192000])
+                                // No measured capabilities: do not invent rates or
+                                // channels for a driver that could not be queried.
+                                (0, Vec::new())
                             }
                         };
 
@@ -263,6 +263,11 @@ pub fn list_asio_devices() -> Vec<AsioDeviceInfo> {
                             max_channels,
                             sample_rates,
                             exclusive: true, // ASIO is always exclusive
+                            availability: if max_channels > 0 {
+                                AudioDeviceAvailability::Available
+                            } else {
+                                AudioDeviceAvailability::UnavailableOrBusy
+                            },
                         });
                     }
                 }
@@ -271,6 +276,7 @@ pub fn list_asio_devices() -> Vec<AsioDeviceInfo> {
                 }
             }
 
+            completer_pilotes_asio(&mut devices, &pilotes_asio_enregistres(&host));
             devices
         };
 
@@ -286,11 +292,15 @@ pub fn list_asio_devices() -> Vec<AsioDeviceInfo> {
                 devices
             }
             None => {
-                let cached = ASIO_DEVICE_CACHE
+                let mut cached = ASIO_DEVICE_CACHE
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone()
                     .unwrap_or_default();
+                crate::outputs::asio_exclusive::ensure_com_initialized();
+                if let Ok(host) = cpal::host_from_id(cpal::HostId::Asio) {
+                    completer_pilotes_asio(&mut cached, &pilotes_asio_enregistres(&host));
+                }
                 debug!(
                     cached_devices = cached.len(),
                     "asio_device_enumeration_skipped_playback_active"
@@ -307,6 +317,61 @@ pub fn list_asio_devices() -> Vec<AsioDeviceInfo> {
     })
 }
 
+/// Whether enumeration could open the driver, without guessing why it failed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioDeviceAvailability {
+    #[default]
+    Available,
+    UnavailableOrBusy,
+}
+
+#[cfg(all(target_os = "windows", feature = "asio"))]
+pub(super) fn pilotes_asio_enregistres(host: &cpal::Host) -> Vec<String> {
+    match host.as_inner() {
+        cpal::platform::HostInner::Asio(asio) => asio.registered_driver_names(),
+        _ => Vec::new(),
+    }
+}
+
+/// Preserve registered drivers omitted by CPAL when loading them fails.
+#[cfg(any(test, all(target_os = "windows", feature = "asio")))]
+fn completer_pilotes_asio(devices: &mut Vec<AsioDeviceInfo>, registered: &[String]) {
+    for name in registered {
+        if devices.iter().any(|d| d.name.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        devices.push(AsioDeviceInfo {
+            name: name.clone(),
+            is_default: false,
+            max_channels: 0,
+            sample_rates: Vec::new(),
+            exclusive: true,
+            availability: AudioDeviceAvailability::UnavailableOrBusy,
+        });
+    }
+}
+
+#[cfg(any(test, all(target_os = "windows", feature = "asio")))]
+fn completer_sorties_asio(devices: &mut Vec<AudioDevice>, registered: &[String]) {
+    let missing: Vec<_> = registered
+        .iter()
+        .filter(|name| !devices.iter().any(|d| d.name.eq_ignore_ascii_case(name)))
+        .map(|name| AudioDevice {
+            name: name.clone(),
+            endpoint_id: String::new(),
+            is_default: false,
+            max_channels: 0,
+            sample_rates: Vec::new(),
+            sample_rates_measured: false,
+            availability: Some(AudioDeviceAvailability::UnavailableOrBusy),
+            backend: "ASIO".into(),
+            hardware_detail: None,
+        })
+        .collect();
+    devices.extend(missing);
+}
+
 /// Information about an ASIO audio device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsioDeviceInfo {
@@ -320,6 +385,8 @@ pub struct AsioDeviceInfo {
     pub sample_rates: Vec<u32>,
     /// ASIO devices are always in exclusive mode.
     pub exclusive: bool,
+    #[serde(default)]
+    pub availability: AudioDeviceAvailability,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,6 +437,9 @@ pub struct AudioDevice {
     /// vécu sur macOS (#3185). L'écran compose ; le serveur ne renomme pas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware_detail: Option<String>,
+    /// Only ASIO distinguishes registered drivers from drivers it could open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<AudioDeviceAvailability>,
 }
 
 pub(super) fn sample_rates_measured_default() -> bool {
@@ -821,11 +891,11 @@ fn lister_sous_le_verrou_de_balayage(
         );
         return parc;
     };
-    if let Some((last_scan, ref cached)) = *guard {
-        if last_scan.elapsed().as_secs() < SCAN_COOLDOWN_SECS {
-            debug!("local_audio_scan_cached");
-            return cached.clone();
-        }
+    if let Some((last_scan, ref cached)) = *guard
+        && last_scan.elapsed().as_secs() < SCAN_COOLDOWN_SECS
+    {
+        debug!("local_audio_scan_cached");
+        return cached.clone();
     }
     let result = enumerer();
     // Publier AVANT de relâcher `SCAN_GUARD` : le parc devient lisible sans
@@ -1062,7 +1132,7 @@ pub(super) fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                 // SUPPOSÉE (`caps_reliable = false`) n'a jamais rien mesuré —
                 // ce drapeau était calculé puis jeté.
                 let rates_evidence =
-                    sample_rate_evidence_for_device(&host_name, &endpoint_id, caps_reliable);
+                    sample_rate_evidence_for_device(host_name, &endpoint_id, caps_reliable);
 
                 // Collapse duplicates. On Linux PipeWire lists the same physical
                 // output repeatedly with varying caps, so collapse by NAME and
@@ -1146,6 +1216,9 @@ pub(super) fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     max_channels,
                     sample_rates,
                     sample_rates_measured: rates_evidence.is_measured(),
+                    availability: host_name
+                        .eq_ignore_ascii_case("asio")
+                        .then_some(AudioDeviceAvailability::Available),
                     backend: host_name.to_string(),
                     hardware_detail,
                 });
@@ -1158,8 +1231,12 @@ pub(super) fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
         }
     }
 
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    if host_name.eq_ignore_ascii_case("asio") {
+        completer_sorties_asio(&mut devices, &pilotes_asio_enregistres(&host));
+    }
     if devices.is_empty() {
-        log_no_devices_diagnostics(&host_name);
+        log_no_devices_diagnostics(host_name);
     } else {
         info!(count = devices.len(), "local_audio_devices_enumerated");
     }
@@ -1372,3 +1449,88 @@ mod balayage_bloque_5612;
 #[cfg(test)]
 #[path = "soupcon_du_balayage_6452.rs"]
 mod soupcon_du_balayage_6452;
+
+#[cfg(test)]
+mod pilotes_asio_occupes_tests_7244 {
+    use super::*;
+
+    #[test]
+    fn cinq_pilotes_enregistres_occupes_restent_visibles_sans_capacites_inventees_7244() {
+        let noms: Vec<_> = (1..=5).map(|n| format!("Pilote ASIO {n}")).collect();
+        let mut pilotes = Vec::new();
+        completer_pilotes_asio(&mut pilotes, &noms);
+        assert_eq!(
+            pilotes.len(),
+            5,
+            "#7244 : les pilotes occupés ne doivent pas disparaître du catalogue ASIO"
+        );
+        assert_eq!(
+            super::super::etat_backend::asio_outcome(Some(noms.len())),
+            ("ASIO", None)
+        );
+        for p in pilotes {
+            assert_eq!(p.availability, AudioDeviceAvailability::UnavailableOrBusy);
+            assert_eq!(p.max_channels, 0);
+            assert!(p.sample_rates.is_empty());
+            assert_eq!(
+                serde_json::to_value(p).unwrap()["availability"],
+                "unavailable_or_busy"
+            );
+        }
+        let mut audio = Vec::new();
+        completer_sorties_asio(&mut audio, &noms);
+        assert_eq!(
+            audio.len(),
+            5,
+            "#7244 : la liste audio générale garde aussi les pilotes occupés"
+        );
+        for d in audio {
+            assert_eq!(d.backend, "ASIO");
+            assert_eq!(
+                d.availability,
+                Some(AudioDeviceAvailability::UnavailableOrBusy)
+            );
+            assert!(d.sample_rates.is_empty());
+            assert!(!d.sample_rates_measured);
+        }
+    }
+
+    #[test]
+    fn un_pilote_ouvert_garde_ses_capacites_et_n_est_pas_duplique_7244() {
+        let mut pilotes = vec![AsioDeviceInfo {
+            name: "Pilote libre".into(),
+            is_default: true,
+            max_channels: 8,
+            sample_rates: vec![96_000],
+            exclusive: true,
+            availability: AudioDeviceAvailability::Available,
+        }];
+        completer_pilotes_asio(
+            &mut pilotes,
+            &["Pilote libre".into(), "Pilote occupé".into()],
+        );
+        assert_eq!(pilotes.len(), 2);
+        assert_eq!(pilotes[0].max_channels, 8);
+        assert_eq!(pilotes[0].sample_rates, vec![96_000]);
+        assert_eq!(pilotes[0].availability, AudioDeviceAvailability::Available);
+        assert_eq!(
+            pilotes[1].availability,
+            AudioDeviceAvailability::UnavailableOrBusy
+        );
+    }
+
+    #[test]
+    fn choisir_asio_ne_charge_pas_les_pilotes_pour_les_compter_7244() {
+        let source = include_str!("etat_backend.rs");
+        let (_, corps) = source.split_once("pub fn select_host(").unwrap();
+        let corps = corps.split_once("static OBSERVED_BACKEND").unwrap().0;
+        assert!(
+            corps.contains("pilotes_asio_enregistres(&host).len()"),
+            "#7244 : sélectionner ASIO doit compter les pilotes enregistrés, pas ceux qui ont pu être chargés"
+        );
+        assert!(
+            !corps.contains("host.output_devices()"),
+            "#7244 : sélectionner le backend ne doit pas essayer d'ouvrir un pilote occupé"
+        );
+    }
+}

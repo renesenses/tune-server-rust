@@ -308,11 +308,7 @@ async fn name_taken_by_another_plugin(state: &AppState, id: &str) -> bool {
     {
         return true;
     }
-    let Some(dir) = crate::plugins::wasm_plugins_dir() else {
-        return false;
-    };
-    tune_core::plugins::PluginManager::new(dir)
-        .scan()
+    crate::plugins::scan_wasm_plugins()
         .await
         .is_ok_and(|infos| infos.iter().any(|i| i.manifest.id == id))
 }

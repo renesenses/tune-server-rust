@@ -2675,6 +2675,33 @@ CREATE INDEX IF NOT EXISTS idx_radio_ecoutes_jour ON radio_ecoutes(jour);
         name: "artists_musicbrainz_id_source",
         up: "",
     },
+    // #6779 (Didier, fil 1907) — l'ORDRE des rayons : alphabétique par
+    // défaut, manuel en option (décision de Bertrand du 19/10/2026).
+    // `collection_folders.manual_order` marque une fratrie de dossiers rangée
+    // à la main ; à 0, elle suit l'ordre naturel des noms.
+    //
+    // Les dossiers existants restent à 0 : leur `position` n'était que leur
+    // ordre de CRÉATION (aucun client n'envoyait de position pour un
+    // dossier), justement ce que Didier signalait. Ils passent donc à
+    // l'alphabétique, sans réécrire aucune position.
+    //
+    // Une colonne plutôt qu'une remise à zéro des positions : une base de
+    // bascule rejoue TOUTES les migrations PG (sentinelle 99), et une remise
+    // à zéro y effacerait l'ordre manuel recopié depuis SQLite. Ajouter une
+    // colonne absente ne touche rien de ce qui est déjà là.
+    //
+    // Numérotée 134 / PG 098 le 27/10 : la 133 / PG 097 (#6463) est la
+    // dernière sur `batch/bugs-rc9-20261025`, et aucune PR ouverte vers le
+    // lot ne touche aux migrations.
+    //
+    // Colonne posée dans le bloc de version et dans la passe finale, PAS
+    // dans `up` : même règle qu'à la 131. Jumelle PG : 098.
+    Migration {
+        version: 134,
+        name: "collection_folders_manual_order",
+        up: "",
+    },
+    Migration { version: 135, name: "listening_resumes", up: include_str!("../../migrations/continue_listening.sql") },
 ];
 
 /// Migration 127 (#6257) : `tags.position`, 0 pour toutes les etiquettes
@@ -2812,6 +2839,22 @@ ON CONFLICT (track_id, key) DO NOTHING;
 /// `ENSURE_TABLES` / `ENSURE_COLUMNS` (postgres.rs) et `PG_FULL_SCHEMA`.
 pub(crate) fn favoris_miroir_colonnes(db: &SqliteDb) {
     for col in ["miroir_etat", "miroir_erreur", "isrc"] {
+        add_column_if_missing(db, "streaming_favorites", col, "TEXT");
+    }
+}
+
+/// L'année de sortie et la qualité d'un album favori de service (#6482) :
+/// `year`, `sample_rate`, `bit_depth`, que lisent les règles de même nom d'une
+/// collection intelligente. TEXT des trois côtés, comme les colonnes du miroir
+/// (voir `pg_sqlite_type_parity`) ; la règle les compare par `CAST`. Sans
+/// numéro de migration, NULL pour l'existant : la prochaine reprise des
+/// favoris les remplit. Jumelles PG : `ENSURE_TABLES` / `ENSURE_COLUMNS`
+/// (postgres.rs) et `PG_FULL_SCHEMA`.
+pub(crate) const COLONNES_ANNEE_ET_QUALITE_DES_FAVORIS: [&str; 3] =
+    ["year", "sample_rate", "bit_depth"];
+
+pub(crate) fn favoris_annee_et_qualite_colonnes(db: &SqliteDb) {
+    for col in COLONNES_ANNEE_ET_QUALITE_DES_FAVORIS {
         add_column_if_missing(db, "streaming_favorites", col, "TEXT");
     }
 }
@@ -3045,15 +3088,6 @@ fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &st
     }
 }
 
-/// La table porte-t-elle cette colonne ?
-///
-/// Meme lecture que `add_column_if_missing`, mais pour GARDER un UPDATE.
-/// Indispensable : une base assez ancienne n'a pas encore toutes les colonnes
-/// que les migrations suivantes ajouteront, et un UPDATE sur une colonne
-/// absente fait echouer le batch — donc TOUT le runner, donc le demarrage
-/// (vecu par le test `une_base_ancienne_gagne_le_drapeau_compilation`, qui
-/// part d'une table `albums` reduite a `title` et `folder_path`).
-
 /// SQL de la migration 80 — voir son entree dans `MIGRATIONS`.
 const SQL_FORMAT_LOWERCASE: &str = "UPDATE albums SET format = LOWER(TRIM(format)) \
              WHERE format IS NOT NULL AND format != LOWER(TRIM(format)); \
@@ -3080,6 +3114,14 @@ const SQL_FORMAT_CONTENEUR: &str = "UPDATE tracks SET format = 'dsf' \
                AND EXISTS (SELECT 1 FROM tracks t \
                            WHERE t.album_id = albums.id AND t.format = 'dff');";
 
+/// La table porte-t-elle cette colonne ?
+///
+/// Meme lecture que `add_column_if_missing`, mais pour GARDER un UPDATE.
+/// Indispensable : une base assez ancienne n'a pas encore toutes les colonnes
+/// que les migrations suivantes ajouteront, et un UPDATE sur une colonne
+/// absente fait echouer le batch — donc TOUT le runner, donc le demarrage
+/// (vecu par le test `une_base_ancienne_gagne_le_drapeau_compilation`, qui
+/// part d'une table `albums` reduite a `title` et `folder_path`).
 fn has_column(db: &SqliteDb, table: &str, column: &str) -> bool {
     let conn = db.connection().lock().unwrap();
     conn.prepare(&format!("PRAGMA table_info({table})"))
@@ -3186,10 +3228,9 @@ fn merge_scattered_compilations(db: &SqliteDb) {
             let mut nums = Vec::new();
             if let Ok(mut ts) = conn.prepare(
                 "SELECT track_number FROM tracks WHERE album_id = ? AND track_number IS NOT NULL",
-            ) {
-                if let Ok(r) = ts.query_map([id], |row| row.get::<_, i64>(0)) {
-                    nums = r.filter_map(Result::ok).map(|n| n as i32).collect();
-                }
+            ) && let Ok(r) = ts.query_map([id], |row| row.get::<_, i64>(0))
+            {
+                nums = r.filter_map(Result::ok).map(|n| n as i32).collect();
             }
             by_title
                 .entry(title.trim().to_lowercase())
@@ -4057,6 +4098,15 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // inconnue.
             add_column_if_missing(db, "artists", "musicbrainz_id_source", "TEXT");
         }
+        if migration.version == 134 {
+            // #6779 — l'ordre des rayons. 0 pour l'existant : alphabétique.
+            add_column_if_missing(
+                db,
+                "collection_folders",
+                "manual_order",
+                "INTEGER NOT NULL DEFAULT 0",
+            );
+        }
         if migration.version == 12 {
             upgrade_fts5_tables(db);
         }
@@ -4662,6 +4712,14 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // La provenance du MBID d'artiste (migration 133, #6463) — posée ICI
     // aussi : le scan, l'enrichissement et la fiche la NOMMENT. PG : 097.
     add_column_if_missing(db, "artists", "musicbrainz_id_source", "TEXT");
+    // L'ordre des rayons (migration 134, #6779) — posé ICI aussi : toute
+    // lecture des dossiers de collections la NOMME. PG : 098.
+    add_column_if_missing(
+        db,
+        "collection_folders",
+        "manual_order",
+        "INTEGER NOT NULL DEFAULT 0",
+    );
     // Index de `listen_history.album_id` (migration 115, fil 2130) — posé ICI
     // aussi : une base arrivée sans lui reste juste, mais « Reprendre
     // l'écoute » y redevient lent. PG : migration 079.
@@ -4680,6 +4738,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // NULL pour l'existant ; le premier rafraîchissement du miroir adopte les
     // lignes d'avant (`tune_core::streaming::favorites_mirror`).
     favoris_miroir_colonnes(db);
+    // Année et qualité des albums favoris de service (#6482) — sans numéro
+    // de migration, même modèle que le miroir juste au-dessus.
+    favoris_annee_et_qualite_colonnes(db);
     // Clé du signal PCM et son témoin (migration 119, #5594) — posés ICI
     // aussi : la passe `taches_de_fond::cle_pcm` les NOMME, et une base
     // arrivée sans eux ne pourrait plus la faire tourner. PG : migration 083.
@@ -4751,6 +4812,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // #5998 — vue Répertoires : même passe — voir la constante.
     if let Err(e) = db.execute_batch(crate::db::track_repo::INDEX_CHEMIN_DOSSIER_SQLITE) {
         warn!(error = %e, "sqlite_tracks_chemin_dossier_index_failed");
+    }
+    // #6399 — réconciliation des favoris tous profils : même passe idempotente.
+    if let Err(e) = db.execute_batch(crate::db::streaming_favorites_repo::INDEX_FAVORIS_MIROIR) {
+        warn!(error = %e, "sqlite_streaming_favorites_miroir_index_failed");
     }
 
     db.execute_batch(include_str!("../../migrations/upnp_library_sync.sql"))?;
@@ -5582,6 +5647,19 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "artists_musicbrainz_id_source",
         include_str!("../../migrations/postgres/097_artists_musicbrainz_id_source.sql"),
     ),
+    // Jumelle de la SQLite 134 (#6779) : `collection_folders.manual_order`,
+    // la fratrie de rayons rangée à la main (0 = alphabétique).
+    (
+        98,
+        "collection_folders_manual_order",
+        include_str!("../../migrations/postgres/098_collection_folders_manual_order.sql"),
+    ),
+    (99, "legacy_bascule_sentinel", "SELECT 1"),
+    (
+        100,
+        "listening_resumes",
+        include_str!("../../migrations/postgres/100_listening_resumes.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -5803,6 +5881,13 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
         .await
     {
         warn!(error = %e, "pg_tracks_chemin_dossier_index_failed");
+    }
+    // #6399 — même index que SQLite, sans conversion du profil en texte.
+    if let Err(e) = sqlx::raw_sql(crate::db::streaming_favorites_repo::INDEX_FAVORIS_MIROIR)
+        .execute(pool)
+        .await
+    {
+        warn!(error = %e, "pg_streaming_favorites_miroir_index_failed");
     }
 
     // #4836 (suite) — même passe que `combler_les_labels_d_album_sqlite`,
@@ -7703,6 +7788,103 @@ mod tests {
         );
     }
 
+    /// #6779 — la migration 134 pose `collection_folders.manual_order` à 0
+    /// pour les rayons EXISTANTS : leur position n'était que l'ordre de
+    /// création, ils passent à l'ordre alphabétique sans qu'aucune position
+    /// soit réécrite ; rejouée, elle ne touche pas un ordre choisi à la main.
+    /// La jumelle PG 098 existe, est enregistrée, marque le bon numéro,
+    /// convertit la colonne TEXT d'une bascule, et le schéma de bascule la
+    /// porte.
+    #[test]
+    fn la_migration_134_range_les_rayons_existants_par_nom_6779() {
+        use crate::db::collection_folder_repo::CollectionFolderRepo;
+        let noms = |db: &SqliteDb| -> Vec<String> {
+            CollectionFolderRepo::new(db.clone())
+                .list_folders()
+                .unwrap()
+                .into_iter()
+                .map(|f| f.name)
+                .collect()
+        };
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        // Une base en 133 : la colonne n'existe pas, trois rayons dans leur
+        // ordre de création, qui n'est pas l'alphabétique.
+        montee
+            .execute_batch(
+                "ALTER TABLE collection_folders DROP COLUMN manual_order;
+                 DELETE FROM _migrations WHERE version >= 134;
+                 INSERT INTO collection_folders (id, name, parent_id, position) VALUES
+                     (1, 'Rock', NULL, 0), (2, 'Blues', NULL, 1), (3, 'Jazz', NULL, 2);",
+            )
+            .unwrap();
+        assert_eq!(current_version(&montee).unwrap(), 133);
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert_eq!(
+            noms(&montee),
+            ["Blues", "Jazz", "Rock"],
+            "les rayons existants doivent passer à l'ordre alphabétique"
+        );
+        let positions: Vec<(i64, i64)> = {
+            let conn = montee.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id, position FROM collection_folders ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            positions,
+            [(1, 0), (2, 1), (3, 2)],
+            "aucune position réécrite"
+        );
+
+        // Un ordre choisi à la main, puis la 134 rejouée : il reste tel quel.
+        montee
+            .execute_batch(
+                "UPDATE collection_folders SET manual_order = 1;
+                 DELETE FROM _migrations WHERE version >= 134;",
+            )
+            .unwrap();
+        run_migrations(&montee).unwrap();
+        assert_eq!(
+            noms(&montee),
+            ["Rock", "Blues", "Jazz"],
+            "rejouer la 134 ne doit pas écraser un ordre choisi"
+        );
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "098_collection_folders_manual_order.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(
+            sql_pg.contains("VALUES (98, 'collection_folders_manual_order')"),
+            "le script PG marque un autre numéro dans schema_version"
+        );
+        assert!(
+            sql_pg.contains("ADD COLUMN IF NOT EXISTS manual_order BIGINT NOT NULL DEFAULT 0")
+                && sql_pg.contains("TYPE BIGINT USING")
+                && !sql_pg.contains("SET position"),
+            "la jumelle PG ne pose pas `manual_order` en BIGINT, ne convertit pas la colonne \
+             TEXT d'une bascule, ou réécrit des positions"
+        );
+        assert!(
+            include_str!("migrations.rs").contains(&format!("postgres/{fichier}")),
+            "{fichier} n'est pas enregistrée"
+        );
+        assert!(
+            include_str!("pg_migrate.rs").contains(
+                "ALTER TABLE collection_folders ADD COLUMN IF NOT EXISTS manual_order TEXT"
+            ),
+            "pg_migrate.rs ne pose pas `collection_folders.manual_order`"
+        );
+    }
+
     /// #6332 — la migration 130 pose `tracks.bitrate_kbps` (le débit moyen du
     /// fichier), sur une base NEUVE comme sur une base MONTÉE en 129 avec une
     /// piste ; NULLABLE, l'existant reste NULL (le rescan le complète) ; la
@@ -9007,7 +9189,19 @@ mod tests {
         // 97 : `artists_musicbrainz_id_source` (#6463), jumelle de la SQLite
         // 133. Pose la provenance du MBID d'artiste, que le scan,
         // l'enrichissement et la fiche NOMMENT.
-        assert_eq!(pg_latest_version(), 97, "latest PG migration must be 97");
+        // 98 : `collection_folders_manual_order` (#6779), jumelle de la
+        // SQLite 134. Pose la marque de la fratrie de rayons rangée à la
+        // main, que toute lecture des dossiers de collections NOMME.
+        // 99 reste réservée à la sentinelle des anciennes bascules : entrée
+        // sans effet pour garder la chaîne contiguë, jamais un changement DDL.
+        // 100 : listening_resumes (#7280), jumelle de la SQLite 135.
+        assert_eq!(pg_latest_version(), 100, "latest PG migration must be 100");
+        assert!(
+            PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
+                && name == "legacy_bascule_sentinel"
+                && sql == "SELECT 1"),
+            "la version 99 doit rester sans effet pour les anciennes bascules"
+        );
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

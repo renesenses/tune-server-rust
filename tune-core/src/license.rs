@@ -771,10 +771,10 @@ impl LicenseManager {
     /// makes it stable across restarts and reinstalls: computed once, reused
     /// forever after.
     fn persistent_fingerprint(settings: &SettingsRepo) -> String {
-        if let Some(fp) = settings.get("hardware_fingerprint").ok().flatten() {
-            if fp.len() == 64 {
-                return fp;
-            }
+        if let Some(fp) = settings.get("hardware_fingerprint").ok().flatten()
+            && fp.len() == 64
+        {
+            return fp;
         }
         let fp = Self::hardware_fingerprint();
         let _ = settings.set("hardware_fingerprint", &fp);
@@ -911,10 +911,10 @@ fn account_premium_active(state: &LicenseState) -> bool {
         return false;
     }
     // Subscription end (if known): past expiry → not active.
-    if let Some(ref exp) = state.account_premium_expires {
-        if is_expired(exp, 0) {
-            return false;
-        }
+    if let Some(ref exp) = state.account_premium_expires
+        && is_expired(exp, 0)
+    {
+        return false;
     }
     // Offline grace: must have been confirmed from the server recently.
     match state.account_premium_checked {
@@ -935,10 +935,10 @@ fn key_premium_active(state: &LicenseState) -> bool {
         return false;
     }
     // Key expiry (if known): past expiry → not active.
-    if let Some(ref exp) = state.expires_at {
-        if is_expired(exp, 0) {
-            return false;
-        }
+    if let Some(ref exp) = state.expires_at
+        && is_expired(exp, 0)
+    {
+        return false;
     }
     // Offline grace: must have been validated (or set) within the window.
     match state.last_validated {

@@ -63,6 +63,7 @@ fn un_peripherique(nom: &str) -> AudioDevice {
         max_channels: 2,
         sample_rates: vec![44_100, 48_000],
         sample_rates_measured: false,
+        availability: None,
         backend: "wasapi".to_string(),
         hardware_detail: None,
     }

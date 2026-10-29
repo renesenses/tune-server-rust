@@ -234,6 +234,17 @@ impl RelayClient {
         Ok(fin)
     }
 
+    /// Le nom du serveur annoncé au relais (#7044).
+    fn nom_annonce(&self) -> String {
+        let configure = self.reglages.as_ref().and_then(|b| {
+            SettingsRepo::with_backend(b.clone())
+                .get("server_name")
+                .ok()
+                .flatten()
+        });
+        choisir_le_nom(configure.as_deref(), hostname())
+    }
+
     /// `relay.register`, puis l'accusé du relais.
     ///
     /// Le serveur annonce sa clé publique (`server_pk`, #6603). Le relais lui
@@ -260,7 +271,7 @@ impl RelayClient {
         let register = serde_json::json!({
             "type": "relay.register",
             "server_id": self.server_id,
-            "server_name": hostname(),
+            "server_name": self.nom_annonce(),
             "version": crate::version(),
             "bridge_token": bridge_token,
             "server_pk": self.cle.as_ref().map(|c| c.cle_publique()),
@@ -1136,6 +1147,17 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     result
+}
+
+/// #7044 — le nom annoncé au relais : celui que l'utilisateur a donné à son
+/// serveur (réglage `server_name`), sinon le nom d'hôte. Un nom vide ne vaut pas
+/// un nom.
+fn choisir_le_nom(configure: Option<&str>, hote: String) -> String {
+    configure
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(hote)
 }
 
 fn hostname() -> String {
@@ -2390,5 +2412,31 @@ mod poignee_de_main_6603_tests {
             .await
             .unwrap_err();
         assert!(e.contains("cle du serveur requise"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod nom_annonce_7044_tests {
+    use super::choisir_le_nom;
+
+    #[test]
+    fn le_nom_donne_par_l_utilisateur_prime_sur_le_nom_d_hote() {
+        assert_eq!(
+            choisir_le_nom(Some("Alec-server"), "MacBook-Pro".into()),
+            "Alec-server"
+        );
+        assert_eq!(
+            choisir_le_nom(Some("  Salon  "), "MacBook-Pro".into()),
+            "Salon"
+        );
+    }
+
+    #[test]
+    fn sans_nom_ou_nom_vide_le_nom_d_hote_reprend_sa_place() {
+        assert_eq!(choisir_le_nom(None, "MacBook-Pro".into()), "MacBook-Pro");
+        assert_eq!(
+            choisir_le_nom(Some("   "), "MacBook-Pro".into()),
+            "MacBook-Pro"
+        );
     }
 }

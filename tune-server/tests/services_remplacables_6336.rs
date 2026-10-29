@@ -460,7 +460,21 @@ async fn un_mot_de_passe_qobuz_refuse_rend_400_et_ne_connecte_pas_6336() {
     )
     .await;
     assert_eq!(statut, StatusCode::BAD_REQUEST, "{corps}");
-    assert!(corps.to_string().contains("401"), "{corps}");
+    // #7068 : le 401 du service est désormais un refus structuré ; le
+    // contrat #6336 reste HTTP400 et aucune session ouverte, sans imposer
+    // que le texte brut du service soit encore recopié dans la réponse.
+    assert_eq!(
+        corps["code"], "invalid_credentials",
+        "#7068/#6336 : le refus d'identifiants doit porter son code structuré : {corps}"
+    );
+    assert_eq!(corps["service"], "qobuz", "{corps}");
+    let message = corps["error"]
+        .as_str()
+        .expect("une phrase d'erreur lisible");
+    assert!(
+        !message.trim().is_empty() && !message.contains('{') && !message.contains('}'),
+        "#7068 : le refus doit rester une phrase sans JSON du service : {corps}"
+    );
     let (_, etat_auth) = appeler(&app, "GET", "/api/v1/streaming/qobuz/auth/status", None).await;
     assert_eq!(etat_auth["authenticated"], false, "{etat_auth}");
 }
@@ -718,4 +732,98 @@ fn la_feature_des_services_factices_n_atteint_aucun_binaire_publie_6336() {
             "{dockerfile} nomme `services-factices`"
         );
     }
+}
+
+/// #7250 — le vrai connecteur, la route et son cache gardent les 357 favoris.
+#[tokio::test]
+async fn favoris_tidal_plafonnes_route_et_cache_7250() {
+    use axum::extract::Query;
+    use std::collections::HashMap;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tune_core::streaming::traits::StreamingService;
+    let appels = Arc::new(AtomicUsize::new(0));
+    let compteur = appels.clone();
+    let faux = axum::Router::new().route("/users/7/favorites/tracks", axum::routing::get(
+        move |Query(q): Query<HashMap<String, String>>| {
+            let compteur = compteur.clone();
+            async move {
+                compteur.fetch_add(1, Ordering::SeqCst);
+                let offset = q["offset"].parse::<usize>().unwrap();
+                let items: Vec<_> = (offset..(offset + 50).min(357)).map(|i| json!({
+                    "created": "2026-10-01T10:00:00.000+0000",
+                    "item": {"id": i + 1, "title": format!("Piste {}", i + 1)}
+                })).collect();
+                axum::Json(json!({"limit": 50, "offset": offset, "totalNumberOfItems": 357, "items": items}))
+            }
+        }
+    ))
+    .route("/users/7/favorites/albums", axum::routing::get(|| async { axum::Json(json!({"totalNumberOfItems": 0, "items": []})) }))
+    .route("/users/7/favorites/artists", axum::routing::get(|| async { axum::Json(json!({"totalNumberOfItems": 0, "items": []})) }));
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", ecoute.local_addr().unwrap());
+    let serveur = tokio::spawn(async move {
+        axum::serve(ecoute, faux).await.unwrap();
+    });
+    let mut svc = tune_core::streaming::tidal::TidalService::avec_bases_de_test(base.clone(), base);
+    assert!(svc.restore_tokens(&json!({"access_token": "jeton-factice-7250", "refresh_token": "renouvellement-factice-7250", "user_id": 7, "country_code": "BE"})));
+    let dossier = tune_core::test_scratch::scratch_dir("tune-7250-favoris");
+    let etat = etat(&dossier);
+    etat.services.lock().await.register(Box::new(svc));
+    let backend = etat.backend.clone();
+    let service = etat.services.lock().await.get("tidal").unwrap();
+    let app = tune_server::routes::router(etat);
+    let attendus: Vec<_> = (1..=357).map(|id| id.to_string()).collect();
+    for passage in 0..2 {
+        let (statut, corps) = appeler(
+            &app,
+            "GET",
+            "/api/v1/streaming/tidal/favorites/tracks",
+            None,
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{corps}");
+        let ids: Vec<_> = corps["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["source_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ids, attendus,
+            "#7250 : la route et son cache doivent conserver chaque favori (passage {passage})"
+        );
+        assert_eq!(
+            appels.load(Ordering::SeqCst),
+            8,
+            "#7250 : huit pages puis une réponse en cache sans nouvelle lecture"
+        );
+    }
+    let bilan = tune_core::streaming::favorites_mirror::rafraichir(&service, &backend, 1).await;
+    assert_eq!(bilan.echecs, 0, "#7250 : miroir complet : {bilan:?}");
+    assert_eq!(
+        bilan.ajoutes, 357,
+        "#7250 : tous les favoris doivent être importés : {bilan:?}"
+    );
+    let repo = tune_core::db::streaming_favorites_repo::StreamingFavoritesRepo::with_backend(
+        backend.clone(),
+    );
+    let ranges = repo.list(1, Some("track")).unwrap();
+    assert_eq!(ranges.len(), 357, "#7250 : 357 lignes réellement rangées");
+    for id in &attendus {
+        assert!(
+            repo.is_favorite(1, "track", "tidal", id).unwrap(),
+            "#7250 : favori {id} absent du miroir"
+        );
+    }
+    let bis = tune_core::streaming::favorites_mirror::rafraichir(&service, &backend, 1).await;
+    assert_eq!(bis.echecs, 0, "{bis:?}");
+    assert_eq!(
+        bis.retires, 0,
+        "#7250 : la relecture ne doit retirer aucun favori : {bis:?}"
+    );
+    assert_eq!(repo.list(1, Some("track")).unwrap().len(), 357);
+    serveur.abort();
 }

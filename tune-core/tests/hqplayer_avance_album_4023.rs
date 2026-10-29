@@ -65,10 +65,9 @@
 //! décision « ce point d'appel intéresse-t-il quelqu'un ? » est mise en cache.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tune_core::outputs::hqplayer::HqplayerOutput;
 use tune_core::outputs::traits::{OutputTarget, PlayMedia};
 
@@ -101,21 +100,10 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
     }
 }
 
-/// Lit tout ce que le client écrit, jusqu'à ce qu'il ferme (ou 10 s de garde).
-async fn octets_recus(mut socket: TcpStream) -> String {
-    let mut vus: Vec<u8> = Vec::new();
-    let mut tampon = [0u8; 4096];
-    let garde = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match tokio::time::timeout_at(garde, socket.read(&mut tampon)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => vus.extend_from_slice(&tampon[..n]),
-            Ok(Err(_)) => break,
-            Err(_) => break,
-        }
-    }
-    String::from_utf8_lossy(&vus).into_owned()
-}
+/// Enregistre le flux et répond aux commandes sans produire de son.
+#[path = "support/hqplayer_acquitte_7244.rs"]
+mod hqplayer_acquitte_7244;
+use hqplayer_acquitte_7244::octets_recus;
 
 fn media(url: &str) -> PlayMedia<'_> {
     PlayMedia {
@@ -174,19 +162,24 @@ async fn un_album_qui_avance_pose_quatre_commandes_lisibles_sur_une_connexion() 
 
     // Les deux pistes, dans l'ordre, chacune précédée de son `PlaylistClear`
     // (#6115 : `clear="1"` ignoré par le moteur 6.0.4) et suivie de son Play.
-    let attendu = format!(
-        "<PlaylistClear />\n\
-         <PlaylistAdd uri=\"{PISTE_1}\" queued=\"0\" clear=\"1\"></PlaylistAdd>\n\
-         <Play />\n\
-         <PlaylistClear />\n\
-         <PlaylistAdd uri=\"{PISTE_2}\" queued=\"0\" clear=\"1\"></PlaylistAdd>\n\
-         <Play />\n"
-    );
-    assert!(
-        sur_le_fil.ends_with(&attendu),
-        "l'avance d'album doit poser PlaylistAdd/Play pour la piste 1 PUIS \
-         pour la piste 2, sur la même connexion.\nAttendu en fin de \
-         fil :\n{attendu}\nReçu :\n{sur_le_fil}"
+    let commandes: Vec<_> = sur_le_fil
+        .lines()
+        .filter(|l| !l.starts_with("<?xml") && !l.starts_with("<Status") && !l.trim().is_empty())
+        .collect();
+    let ajout_1 = format!(r#"<PlaylistAdd uri="{PISTE_1}" queued="0" clear="1"></PlaylistAdd>"#);
+    let ajout_2 = format!(r#"<PlaylistAdd uri="{PISTE_2}" queued="0" clear="1"></PlaylistAdd>"#);
+    assert_eq!(
+        commandes,
+        vec![
+            "<PlaylistClear />",
+            ajout_1.as_str(),
+            "<Play />",
+            "<Stop />",
+            "<PlaylistClear />",
+            ajout_2.as_str(),
+            "<Play />"
+        ],
+        "#4023/#7244 : les deux pistes gardent leur chargement ordonné et le remplacement attend Stop : {sur_le_fil}"
     );
 
     // ── Temps 2 : une réponse `Status` non reconnue est DITE, une fois ───
@@ -200,16 +193,27 @@ async fn un_album_qui_avance_pose_quatre_commandes_lisibles_sur_une_connexion() 
     let port2 = ecoute2.local_addr().expect("adresse locale 2").port();
     tokio::spawn(async move {
         loop {
-            let Ok((mut socket, _)) = ecoute2.accept().await else {
+            let Ok((socket, _)) = ecoute2.accept().await else {
                 return;
             };
             tokio::spawn(async move {
-                let mut tampon = [0u8; 4096];
+                let mut socket = BufReader::new(socket);
+                let mut ligne = String::new();
                 // Valeur hors enum Signalyst (0..=3) : le diagnostic
                 // des états réellement inconnus doit rester présent.
-                while socket.read(&mut tampon).await.unwrap_or(0) > 0 {
+                while socket.read_line(&mut ligne).await.unwrap_or(0) > 0 {
+                    if !ligne.trim_start().starts_with("<Status") {
+                        ligne.clear();
+                        continue;
+                    }
+                    ligne.clear();
                     let reponse = r#"<Status state="99" position="12.5" duration="300.0"/>"#;
-                    if socket.write_all(reponse.as_bytes()).await.is_err() {
+                    if socket
+                        .get_mut()
+                        .write_all(reponse.as_bytes())
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }

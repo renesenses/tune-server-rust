@@ -753,9 +753,13 @@ impl RaisonAmbigu {
 #[derive(Debug, Clone)]
 pub enum IssueDuChoix {
     /// Un pressage sûr, sa liste de pistes, et ce qu'en dit la garde.
+    ///
+    /// #7154 : `pressage` et `detail` sont en `Box` — à eux deux près de
+    /// 600 octets, que portaient aussi les variantes de quelques mots
+    /// (`clippy::large_enum_variant`). Les champs se lisent de même.
     Retenu {
-        pressage: MBReleaseMatch,
-        detail: MBReleaseDetail,
+        pressage: Box<MBReleaseMatch>,
+        detail: Box<MBReleaseDetail>,
         source: SourceDuPressage,
         completude: Completude,
     },
@@ -797,9 +801,9 @@ where
         Ok(Some(data)) => match parse_release_detail(&data) {
             None => IssueDuChoix::Introuvable,
             Some(detail) => IssueDuChoix::Retenu {
-                pressage: pressage_du_detail(&data, &detail),
+                pressage: Box::new(pressage_du_detail(&data, &detail)),
                 completude: completude(pistes, &detail.tracks),
-                detail,
+                detail: Box::new(detail),
                 source: SourceDuPressage::ChoixUtilisateur,
             },
         },
@@ -870,8 +874,8 @@ fn conclure(
         return Err(RaisonAmbigu::PistesIncompatibles);
     }
     Ok(IssueDuChoix::Retenu {
-        pressage,
-        detail,
+        pressage: Box::new(pressage),
+        detail: Box::new(detail),
         source,
         completude,
     })

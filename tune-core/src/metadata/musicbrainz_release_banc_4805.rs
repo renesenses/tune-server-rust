@@ -330,13 +330,13 @@ where
         .await
         .ok()?;
     let mut trouves = parse_search_results(&data, titre, artiste);
-    if trouves.is_empty() {
-        if let Some(nettoye) = titre_de_requete(titre) {
-            let data = interroger(requete_lucene(&nettoye, artiste), FETCH)
-                .await
-                .ok()?;
-            trouves = parse_search_results(&data, titre, artiste);
-        }
+    if trouves.is_empty()
+        && let Some(nettoye) = titre_de_requete(titre)
+    {
+        let data = interroger(requete_lucene(&nettoye, artiste), FETCH)
+            .await
+            .ok()?;
+        trouves = parse_search_results(&data, titre, artiste);
     }
     Some(!trouves.is_empty())
 }

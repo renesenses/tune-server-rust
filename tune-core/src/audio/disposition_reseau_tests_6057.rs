@@ -57,7 +57,7 @@ fn fichier(octets: &[u8]) -> tempfile::NamedTempFile {
 /// nulle part.
 fn verifier_le_repli(stereo: &[i32]) {
     assert!(!stereo.is_empty(), "aucune trame décodée");
-    for (t, trame) in stereo.chunks_exact(2).enumerate() {
+    for (t, trame) in stereo.as_chunks::<2>().0.iter().enumerate() {
         assert_eq!(
             trame[0], trame[1],
             "trame {t} : la centrale déclarée doit arriver à parts égales sur \
@@ -99,7 +99,9 @@ async fn le_repli_reseau_en_continu_route_par_la_disposition_declaree_6057() {
         tout.drain(..44);
     }
     let stereo: Vec<i32> = tout
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|o| i32::from(i16::from_le_bytes([o[0], o[1]])))
         .collect();
     verifier_le_repli(&stereo);
@@ -113,8 +115,8 @@ fn a_nombre_de_canaux_egal_le_decodage_ne_reordonne_rien_6057() {
     let chemin = f.path().to_string_lossy().to_string();
     let decode = super::decode_to_pcm_routee(&chemin, None, Some(4), 0.0, 0.0).unwrap();
     assert_eq!(decode.channels, 4);
-    for trame in decode.samples_i32.chunks_exact(4) {
-        assert_eq!(trame, [0, 0, 8_000, 4_000]);
+    for trame in decode.samples_i32.as_chunks::<4>().0 {
+        assert_eq!(trame, &[0, 0, 8_000, 4_000]);
     }
 }
 
@@ -183,7 +185,7 @@ async fn le_repli_reseau_d_un_dsf_de_type_5_route_par_ses_positions_6057() {
         .collect();
     assert!(!mots.is_empty(), "aucune trame décodée");
     let mut centrale_entendue = false;
-    for (t, trame) in mots.chunks_exact(2).enumerate() {
+    for (t, trame) in mots.as_chunks::<2>().0.iter().enumerate() {
         assert_eq!(
             trame[0], trame[1],
             "trame {t} : centrale à parts égales et LFE nulle part attendus — \

@@ -381,23 +381,9 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut plugins: Vec<Value> = fiches_locales_honorables(&state).await;
 
-    // Built-in plugins
-    let xtune_dir = std::env::var("TUNE_XTUNE_DIR").unwrap_or_else(|_| "xtune-web".into());
-    let xtune_installed = std::path::Path::new(&xtune_dir).exists();
-    plugins.push(serde_json::json!({
-        "name": "xtune",
-        "display_name": "xTune",
-        "description": "Vinyl turntable player — interface platine vinyle immersive",
-        "version": "1.0.0",
-        "author": "MozAIk Labs",
-        "type": "built-in",
-        "installed": xtune_installed,
-        "enabled": xtune_installed,
-        "url": "/xtune/",
-        "icon": "vinyl",
-        // Livré AVEC ce serveur : il n'y a pas de version à confronter.
-        "compatible": true,
-    }));
+    // #4908 — plus de fiche « xTune » : elle annonçait `/xtune/`, une route
+    // que ce serveur ne sert pas. Le besoin (commandes d'écran verrouillé sur
+    // téléphone) est porté par le client web.
 
     // Plugins actually loaded through the SDK. These are the only entries
     // backed by running code — everything above is settings bookkeeping.
@@ -510,11 +496,15 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
     // disabled plugin — or one installed since the last restart — still shows
     // up and can be toggled. `loaded` distinguishes running from
     // pending-restart.
-    if let Some(dir) = crate::plugins::wasm_plugins_dir() {
-        let manager = tune_core::plugins::PluginManager::new(dir);
-        if let Ok(infos) = manager.scan().await {
+    {
+        if let Ok(infos) = crate::plugins::scan_wasm_plugins().await {
             for info in infos {
                 let id = info.manifest.id.clone();
+                // Shipped read-only plugin the user uninstalled: gone from
+                // the list until it is installed again.
+                if crate::plugins::greffon_masque(&settings, &id) {
+                    continue;
+                }
                 let enabled = settings
                     .get(&format!("plugin_{id}_enabled"))
                     .ok()
@@ -721,11 +711,7 @@ fn plugin_available_snapshot(state: &AppState) -> &[tune_core::plugin_sdk::Avail
 /// Pour un greffon enregistre sans manifeste, il n'y a pas de version a
 /// confronter : true.
 async fn compatible_selon_le_disque(name: &str) -> bool {
-    let Some(dir) = crate::plugins::wasm_plugins_dir() else {
-        return true;
-    };
-    let manager = tune_core::plugins::PluginManager::new(dir);
-    let Ok(infos) = manager.scan().await else {
+    let Ok(infos) = crate::plugins::scan_wasm_plugins().await else {
         return true;
     };
     infos
@@ -741,11 +727,7 @@ async fn compatible_selon_le_disque(name: &str) -> bool {
 /// disque comme [`compatible_selon_le_disque`] : un greffon installé depuis le
 /// dernier démarrage répond déjà juste.
 async fn premium_selon_le_disque(name: &str) -> bool {
-    let Some(dir) = crate::plugins::wasm_plugins_dir() else {
-        return false;
-    };
-    let manager = tune_core::plugins::PluginManager::new(dir);
-    let Ok(infos) = manager.scan().await else {
+    let Ok(infos) = crate::plugins::scan_wasm_plugins().await else {
         return false;
     };
     infos
@@ -943,6 +925,7 @@ async fn enable_plugin(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "true").ok();
+    crate::plugins::demasquer_greffon(&settings, &name);
     let restart_required = !greffon_charge(&state, &name);
     Json(json!({ "name": name, "enabled": true, "restart_required": restart_required }))
         .into_response()
@@ -1008,11 +991,9 @@ async fn noms_chargeables(state: &AppState) -> std::collections::HashSet<String>
         .map(|v| v.iter().cloned().collect())
         .unwrap_or_default();
 
-    let Some(dir) = crate::plugins::wasm_plugins_dir() else {
-        return noms;
-    };
-    let manager = tune_core::plugins::PluginManager::new(dir);
-    if let Ok(infos) = manager.scan().await {
+    // Hidden (uninstalled, shipped) plugins stay loadable names: installing
+    // one again must not be refused as unknown.
+    if let Ok(infos) = crate::plugins::scan_wasm_plugins().await {
         noms.extend(infos.into_iter().map(|i| i.manifest.id));
     }
     noms
@@ -1063,6 +1044,8 @@ async fn install_plugin(
     settings.set(&key, "true").ok();
     let enabled_key = format!("plugin_{name}_enabled");
     settings.set(&enabled_key, "true").ok();
+    // A shipped plugin uninstalled earlier comes back.
+    crate::plugins::demasquer_greffon(&settings, &name);
     Json(json!({ "name": name, "status": "installed", "restart_required": true })).into_response()
 }
 
@@ -1090,19 +1073,20 @@ async fn update_plugin(
 async fn delete_plugin(
     Path(name): Path<String>,
     State(state): State<AppState>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let lang = crate::i18n::lang_from_header(&headers);
     // A wasm plugin lives on disk: uninstalling means removing its directory
-    // (the flags alone would leave it re-loaded at every startup).
-    let removed_dir = match crate::plugins::remove_wasm_dir(&name) {
-        Ok(removed) => removed,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "uninstall_failed", "detail": e })),
-            )
-                .into_response();
-        }
+    // (the flags alone would leave it re-loaded at every startup). One shipped
+    // with the installation (Docker image, locked-down Tune OS…) is read-only
+    // by design and is NOT made writable: it is disabled and hidden instead,
+    // persistently, and installing it again brings it back.
+    let retrait = match crate::plugins::remove_wasm_dir(&name) {
+        Ok(retrait) => retrait,
+        Err(e) => return crate::plugins::reponse_retrait_impossible(&lang, &e),
     };
+    let removed_dir = retrait == crate::plugins::Retrait::Supprime;
+    let masque = retrait == crate::plugins::Retrait::FourniEnLectureSeule;
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     // A compiled-in plugin (DJ/Karaoke) has no dir to remove, but if it was
@@ -1114,14 +1098,23 @@ async fn delete_plugin(
     settings.delete(&key).ok();
     let enabled_key = format!("plugin_{name}_enabled");
     settings.delete(&enabled_key).ok();
+    if masque {
+        // After the cleanup above: it drops the `enabled` key, whose absence
+        // means "enabled", and this must stay disabled.
+        crate::plugins::masquer_greffon(&settings, &name);
+    }
     // 200 + JSON rather than 204: the web client's fetchJSON treats an empty
     // body as an error, and it needs restart_required for its banner.
-    Json(json!({
+    let mut body = json!({
         "status": "uninstalled",
         "name": name,
-        "restart_required": removed_dir || was_installed,
-    }))
-    .into_response()
+        "restart_required": removed_dir || was_installed || masque,
+    });
+    if masque {
+        body["hidden"] = json!(true);
+        body["message"] = json!(crate::i18n::t(&lang, "plugin.uninstall.bundled_hidden"));
+    }
+    Json(body).into_response()
 }
 
 async fn plugin_docs() -> Json<Value> {

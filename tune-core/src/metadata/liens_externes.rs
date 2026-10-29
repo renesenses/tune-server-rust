@@ -30,6 +30,8 @@ use std::future::Future;
 use serde::Serialize;
 use serde_json::Value;
 
+pub use super::musicbrainz_release::SansReponse;
+
 /// L'objet de la bibliothèque dont on cherche les liens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entite {
@@ -142,7 +144,7 @@ pub enum Issue {
 pub async fn liens_par<F, Fut>(entite: Entite, mbid: &str, lire: &F) -> Issue
 where
     F: Fn(String, &'static str) -> Fut,
-    Fut: Future<Output = Result<Option<Value>, ()>>,
+    Fut: Future<Output = Result<Option<Value>, SansReponse>>,
 {
     let mbid = mbid.trim();
     if !mbid_plausible(mbid) {
@@ -151,7 +153,7 @@ where
     match lire(format!("{}/{mbid}", entite.chemin()), "url-rels").await {
         Ok(Some(v)) => Issue::Liens(liens_depuis_relations(&v)),
         Ok(None) => Issue::Inconnu,
-        Err(()) => Issue::Indisponible,
+        Err(SansReponse) => Issue::Indisponible,
     }
 }
 
@@ -160,11 +162,11 @@ where
 pub async fn lire_sur_musicbrainz_avec_creneau(
     chemin: String,
     inc: &'static str,
-) -> Result<Option<Value>, ()> {
+) -> Result<Option<Value>, SansReponse> {
     super::musicbrainz_release::rate_limit_delay().await;
     super::musicbrainz_release::lire_sur_musicbrainz(chemin, inc)
         .await
-        .map_err(|_| ())
+        .map_err(|_| SansReponse)
 }
 
 #[cfg(test)]
@@ -235,7 +237,7 @@ mod tests {
             let r = if chemin.starts_with("artist/") {
                 Ok(Some(reponse_artiste()))
             } else if chemin.ends_with("0000") {
-                Err(())
+                Err(SansReponse)
             } else {
                 Ok(None)
             };

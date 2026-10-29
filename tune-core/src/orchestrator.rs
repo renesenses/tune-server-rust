@@ -1200,6 +1200,7 @@ pub struct PlaybackOrchestrator {
     /// `gapless_sessions`, dont vit l'épreuve de #3442.
     qualites_pre_armees: Mutex<HashMap<i64, QualitePreArmee>>,
     pub prefetch: Arc<PrefetchEngine>,
+    preparations_fichiers: std::sync::Mutex<HashMap<i64, preparation_fichier_7247::Preparation>>,
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
     /// Cache of MIME types that each DLNA renderer does NOT support.
     /// Key: device_id, Value: set of unsupported MIME types (e.g. "audio/flac").
@@ -1210,20 +1211,20 @@ pub struct PlaybackOrchestrator {
     /// `device_id|profondeur`. Les sondes inconcluantes n'y entrent pas.
     dlna_lpcm_accepte: Mutex<HashMap<String, bool>>,
     /// #4573 — ce que le Sink du renderer ANNONCE en nombre de canaux, par
-    /// `device_id`. `Some(None)` veut dire « le Sink a été lu, il ne porte
+    /// `(device_id, mime)`. `Some(None)` veut dire « le Sink a été lu, il ne porte
     /// aucun `channels=` » : une ignorance MESURÉE, qui ne fait rien réduire
     /// mais qu'il est inutile de re-sonder à chaque piste. Une sonde
     /// INCONCLUANTE (SOAP en échec, Sink vide) n'entre jamais dans cette
     /// table — même règle que `dlna_lpcm_accepte` : un renderer endormi au
     /// démarrage ne doit pas se voir coller un verdict pour la session.
-    dlna_canaux_max: Mutex<HashMap<String, Option<u16>>>,
+    dlna_canaux_max: Mutex<HashMap<(String, String), Option<u16>>>,
     /// Zones dont une résolution gapless est en cours : les sessions créées
     /// pendant cette fenêtre pré-chargent la piste SUIVANTE — leur attacher
     /// un forwarder de niveaux daterait les fenêtres avec l'horloge de la
     /// piste courante (stamps d'une piste sur la position d'une autre). Les
     /// niveaux de la piste suivante démarrent à l'avance gapless, voir
     /// [`Self::advance_queue_metadata`]. Verrou std : accès courts.
-    levels_prewarm: std::sync::Mutex<std::collections::HashSet<i64>>,
+    levels_prewarm: std::sync::Mutex<std::collections::HashMap<i64, usize>>,
     /// #5050 (fil 2236) — zones posées en pause par un transfert, sans que
     /// rien n'ait été envoyé à leur appareil : leur reprise rétablit la piste
     /// à la position (voir `transfert_en_pause_5050`). Verrou std : accès
@@ -1381,16 +1382,19 @@ struct AnnonceNavigateurDifferee {
 
 /// Portée RAII de la résolution gapless d'une zone (voir `levels_prewarm`).
 struct LevelsPrewarmScope<'a> {
-    set: &'a std::sync::Mutex<std::collections::HashSet<i64>>,
+    set: &'a std::sync::Mutex<std::collections::HashMap<i64, usize>>,
     zone_id: i64,
 }
 
 impl Drop for LevelsPrewarmScope<'_> {
     fn drop(&mut self) {
-        self.set
-            .lock()
-            .expect("levels_prewarm lock")
-            .remove(&self.zone_id);
+        let mut comptes = self.set.lock().expect("levels_prewarm lock");
+        if let Some(nombre) = comptes.get_mut(&self.zone_id) {
+            *nombre -= 1;
+            if *nombre == 0 {
+                comptes.remove(&self.zone_id);
+            }
+        }
     }
 }
 
@@ -1458,6 +1462,7 @@ impl PlayResult {
     }
 }
 
+#[derive(Clone)]
 pub struct ResolvedStream {
     pub url: String,
     pub mime_type: String,
@@ -1750,11 +1755,12 @@ impl PlaybackOrchestrator {
             gapless_sessions: Mutex::new(HashMap::new()),
             qualites_pre_armees: Mutex::new(HashMap::new()),
             prefetch: Arc::new(PrefetchEngine::new()),
+            preparations_fichiers: Default::default(),
             dsd_capabilities: Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
             dlna_canaux_max: Mutex::new(HashMap::new()),
-            levels_prewarm: std::sync::Mutex::new(std::collections::HashSet::new()),
+            levels_prewarm: std::sync::Mutex::new(std::collections::HashMap::new()),
             transferts_en_pause: std::sync::Mutex::new(std::collections::HashSet::new()),
             reprises_sur_place: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1844,6 +1850,8 @@ mod transport;
 mod repli_de_peripherique;
 
 mod resolve_stream;
+// #7148 — la sentinelle de streaming : résolution et décodage réels, sans son.
+pub mod sentinelle_streaming;
 // #6130 — quitter une radio sur une sortie DLNA : Stop, puis attendre le renderer.
 mod sortie_de_radio_dlna_6130;
 // #6130 — le contexte d'un flux de conversion, pour son journal.
@@ -2303,6 +2311,7 @@ mod historique_conteneurs_tests_6466;
 #[cfg(test)]
 mod sortie_de_radio_dlna_6130_tests;
 mod transfert_en_pause_5050;
+pub use transfert_en_pause_5050::ErreurDeTransfert;
 
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).
@@ -2363,3 +2372,8 @@ mod refus_asio_bloque_4556;
 /// ont ete rejoues sur la requete qui l'a pris.
 #[cfg(test)]
 mod refus_amont_4366;
+
+mod preparation_fichier_7247;
+
+#[cfg(test)]
+mod deplacement_qobuz_6982_tests;

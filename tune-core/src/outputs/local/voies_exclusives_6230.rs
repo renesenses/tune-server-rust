@@ -19,7 +19,10 @@
 //!   de la grille, sinon celles de la source — sans grille, rien ne change.
 //!
 //! L'ouverture des bras eux-mêmes (WASAPI, ASIO, CoreAudio, compilés sous
-//! Windows ou macOS seulement) n'est PAS branchée dans cette étape.
+//! Windows ou macOS seulement) n'est PAS branchée dans cette étape. L'étape 2
+//! l'a branchée : WASAPI par #6898, ASIO et CoreAudio ensuite ; leur
+//! branchement, que Linux ne compile pas, est gardé par texte en fin de
+//! fichier.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -506,4 +509,211 @@ fn le_reliquat_24_bits_suit_les_voies_pilotees_6230() {
     let reliquat = etage.vider(&mut puits).expect("reliquat");
     assert_eq!(reliquat.trames, 10);
     assert_eq!(puits.mots.len(), 10 * 2, "10 trames de 2 voies");
+}
+
+/// Le code d'un fichier source, sans ses lignes de commentaire : une garde ne
+/// doit pas être satisfaite par la phrase qui décrit ce qu'elle garde.
+fn sans_commentaires(source: &str) -> String {
+    source
+        .lines()
+        .filter(|ligne| !ligne.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// #6230 (étape 2) — les bras ASIO et CoreAudio, que Linux ne compile pas,
+/// ouvrent sur les voies de la grille comme le WASAPI exclusif (#6898) : la
+/// demande porte les voies que la grille pilote (et non plus `None`), le
+/// backend les essaie d'abord, plafonnées aux voies que la sortie déclare,
+/// et l'ouverture est constatée pour le chemin du signal. La règle elle-même
+/// (`ouvrir_sur_les_voies_pilotees`, `voies_pilotees_permises`) est jugée
+/// dans `reaffectation.rs`.
+#[test]
+fn asio_et_coreaudio_ouvrent_sur_les_voies_de_la_grille_6230() {
+    for (bras, source) in [
+        ("bras_asio.rs", include_str!("bras_asio.rs")),
+        ("bras_coreaudio.rs", include_str!("bras_coreaudio.rs")),
+    ] {
+        let code = sans_commentaires(source);
+        assert!(
+            !code.contains("voies_de_la_matrice: None"),
+            "#6230 : {bras} ouvre encore au format de la source, la grille armée est ignorée"
+        );
+        for attendu in [
+            "voies_a_ouvrir_en_exclusif(",
+            "ouvrir_sur_les_voies_pilotees(",
+            "new_sur_voies_pilotees(",
+            "constater_l_ouverture(",
+        ] {
+            assert!(
+                code.contains(attendu),
+                "#6230 : {bras} n'appelle plus `{attendu}` — la grille qui pilote les voies \
+                 n'est plus demandée, plafonnée ou constatée à l'ouverture"
+            );
+        }
+    }
+    for (sortie, source) in [
+        ("asio_exclusive.rs", include_str!("../asio_exclusive.rs")),
+        (
+            "coreaudio_exclusive.rs",
+            include_str!("../coreaudio_exclusive.rs"),
+        ),
+    ] {
+        let production = sans_commentaires(source.split("#[cfg(test)]").next().unwrap_or(source));
+        assert!(
+            production.contains("super::local::voies_pilotees_permises("),
+            "#6230 : {sortie} n'ouvre plus les voies pilotées sous le plafond des voies déclarées"
+        );
+    }
+    // ASIO : l'étage et le puits de la route native, et l'étage de la route
+    // traitée, portent les voies OUVERTES quand la grille pilote.
+    let asio = sans_commentaires(include_str!("bras_asio.rs"));
+    for attendu in [
+        "spec_du_puits_natif_vers(self.spec, self.voies_de_l_etage())",
+        "FormatOuvert::new(backend.format_ouvert().cadence, voies_de_l_etage)",
+        "sortie: FormatOuvert::new(sample_rate, voies_de_l_etage)",
+    ] {
+        assert!(
+            asio.contains(attendu),
+            "#6230 : bras_asio.rs ne monte plus l'étage sur les voies ouvertes (`{attendu}`)"
+        );
+    }
+}
+
+#[test]
+fn le_natif_publie_les_voies_reellement_ouvertes_et_la_grille_7093() {
+    let zone = Zone::au_repos();
+    let regle = creneau_6_vers_2();
+    for voies in [6, 2] {
+        let creneau = std::sync::Mutex::new(None);
+        let mut etage = zone
+            .etage_natif(cinq_un(ProfondeurPcm::Entier16), voies, &regle)
+            .avec_publication(&creneau);
+        let mesure = creneau.lock().unwrap().expect("publication à l'ouverture");
+        assert_eq!(mesure.ouvert().canaux, voies);
+        assert_eq!(mesure.entree().canaux(), 6);
+        assert_eq!(
+            mesure.dsp_actif(),
+            voies == 2,
+            "grille refusée sur six voies"
+        );
+        assert!(!mesure.reechantillonnage());
+        // La transition conserve le format ouvert et doit reposer la mesure.
+        *creneau.lock().unwrap() = None;
+        etage
+            .enchainer_la_piste(cinq_un(ProfondeurPcm::Entier16), &pcm_5_1_16_bits(2))
+            .unwrap();
+        assert_eq!(*creneau.lock().unwrap(), Some(mesure));
+        let mut puits = Puits {
+            spec: spec_du_puits_natif_vers(cinq_un(ProfondeurPcm::Entier16), voies),
+            mots: vec![],
+        };
+        let _ = etage.decoder_et_pousser(&pcm_5_1_16_bits(2), &mut puits);
+        assert_eq!(*creneau.lock().unwrap(), Some(mesure));
+        assert_eq!(puits.mots.len(), 2 * usize::from(voies));
+    }
+}
+
+#[test]
+fn le_flottant_publie_les_voies_reelles_et_les_changements_de_dsp_7093() {
+    use super::etage_exclusif_observe_7093::EtageObserve;
+    use crate::outputs::traits::CaptureOutput;
+    let zone = Zone::au_repos();
+    let regle = creneau_6_vers_2();
+    for voies in [6, 2] {
+        let creneau = std::sync::Mutex::new(None);
+        let mut etage = EtageObserve::nouveau(
+            zone.etage_coreaudio(
+                cinq_un(ProfondeurPcm::Entier16),
+                voies,
+                &regle,
+                &SANS_DISPOSITION,
+            ),
+            &creneau,
+        );
+        let mesure = creneau.lock().unwrap().expect("publication à l'ouverture");
+        assert_eq!(mesure.ouvert().canaux, voies);
+        assert_eq!(mesure.dsp_actif(), voies == 2);
+        assert!(!mesure.reechantillonnage());
+        *creneau.lock().unwrap() = None;
+        etage
+            .enchainer_a_format_egal(cinq_un(ProfondeurPcm::Entier16), &pcm_5_1_16_bits(2))
+            .unwrap();
+        assert_eq!(*creneau.lock().unwrap(), Some(mesure));
+        // Une règle contournée à chaud ne doit pas laisser le DSP annoncé actif.
+        zone.pure_bypass.store(true, Ordering::Relaxed);
+        etage.recevoir(&pcm_5_1_16_bits(2));
+        let mut puits = CaptureOutput::ouvert(FormatOuvert::new(48_000, voies));
+        let _ = etage.pousser(&mut puits, &mut |_, _, _| false, &mut |_| {});
+        assert!(!creneau.lock().unwrap().unwrap().dsp_actif());
+        zone.pure_bypass.store(false, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn les_trois_bras_exclusifs_branchent_la_publication_reelle_7093() {
+    let lancement = include_str!("../local.rs");
+    for (entrees, source) in [
+        ("EntreesWasapi", include_str!("bras_wasapi.rs")),
+        ("EntreesAsio", include_str!("bras_asio.rs")),
+        ("EntreesCoreAudio", include_str!("bras_coreaudio.rs")),
+    ] {
+        let appel = lancement
+            .split(&format!("::{entrees} {{"))
+            .nth(1)
+            .expect("bras lancé")
+            .split("});")
+            .next()
+            .unwrap();
+        assert!(
+            appel.contains("transformations_reelles,"),
+            "{entrees} : créneau non transmis"
+        );
+        assert!(
+            source.contains("pub(super) transformations_reelles:"),
+            "{entrees} : créneau non reçu"
+        );
+        let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("avec_publication(&transformations_reelles)")
+                || compact.contains("EtageObserve::nouveau(etage,&transformations_reelles)"),
+            "{entrees} : mesure non branchée"
+        );
+    }
+}
+
+#[test]
+fn le_natif_mesure_le_dsp_sur_stereo_et_le_contourne_sur_dop_7093() {
+    let zone = Zone::au_repos();
+    zone.mono_downmix.store(true, Ordering::Relaxed);
+    let regle = CreneauReaffectation::vide();
+    for canaux in [2, 6] {
+        let creneau = std::sync::Mutex::new(None);
+        let source = AudioSpec::nouvelle(176_400, ProfondeurPcm::Entier24, canaux).unwrap();
+        let mut etage = zone
+            .etage_natif(source, canaux, &regle)
+            .avec_publication(&creneau);
+        assert_eq!(creneau.lock().unwrap().unwrap().dsp_actif(), canaux == 2);
+        let dop: Vec<u8> = (0..40)
+            .flat_map(|trame| {
+                (0..canaux)
+                    .flat_map(move |_| [0x69, 0x96, if trame % 2 == 0 { 0x05 } else { 0xfa }])
+            })
+            .collect();
+        let mut puits = Puits {
+            spec: spec_du_puits_natif_vers(source, canaux),
+            mots: vec![],
+        };
+        let _ = etage.decoder_et_pousser(&dop, &mut puits);
+        assert!(
+            etage.dop_verrouille(),
+            "le vrai décodeur reconnaît le porteur"
+        );
+        let mesure = creneau.lock().unwrap().unwrap();
+        assert!(!mesure.dsp_actif(), "DoP porté : pas de repli mono annoncé");
+        assert!(!mesure.reechantillonnage());
+        // Nouvelle piste PCM : le DoP précédent ne doit pas masquer son DSP.
+        etage.enchainer_la_piste(source, &[]).unwrap();
+        assert_eq!(creneau.lock().unwrap().unwrap().dsp_actif(), canaux == 2);
+    }
 }
