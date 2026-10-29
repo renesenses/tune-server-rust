@@ -505,39 +505,17 @@ jobs:
             echo "::warning::airplay-daemon failed to build for ${{ matrix.target }} — this artifact will fall back to AirPlay 1"
           fi
 
-      # #6872 — librespot (MIT, Spotify Connect) livré À CÔTÉ de tune-server,
-      # là où Tune le cherche en premier (`spotify_connect::trouver_le_binaire`,
-      # #6933) : un librespot posé ailleurs par l'utilisateur ne passe plus
-      # avant le sien. Version épinglée, construite ici depuis crates.io.
-      #
-      # Best-effort, comme airplay-daemon : le vrai binaire ou RIEN — jamais un
-      # fichier vide (Tune le prendrait pour librespot). Linux x86_64 natif
-      # seulement pour l'instant : macOS exige signature et notarisation de ce
-      # binaire de plus, Windows n'a aucun binaire amont, les cibles ARM sont
-      # croisées. Fonctionnalités : TLS rustls (aucune dépendance à OpenSSL
-      # sur la machine cible), Zeroconf intégré (libmdns, pour que
-      # l'application Spotify puisse relier librespot), aucun backend audio
-      # (Tune lit le PCM par `--backend pipe`, toujours compilé).
-      - name: Build librespot (Linux x86_64)
-        if: "runner.os == 'Linux' && !matrix.cross"
+      # #6872: same pinned source, features and notices on every shipped target.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
+      - name: Build librespot (all targets)
         shell: bash
         run: |
-          LRS_VERSION=0.8.0
-          if timeout 1200 cargo install librespot --version "$LRS_VERSION" --locked \
-               --no-default-features --features "rustls-tls-webpki-roots,with-libmdns" \
-               --target ${{ matrix.target }} --root "$RUNNER_TEMP/lrs"; then
-            "$RUNNER_TEMP/lrs/bin/librespot" --version
-            LIC="$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/librespot-"$LRS_VERSION" | head -n 1)/LICENSE"
-            if [ -f "$LIC" ]; then
-              cp "$LIC" "$RUNNER_TEMP/lrs/LIBRESPOT-LICENSE.txt"
-            else
-              echo "::warning::licence MIT de librespot introuvable ($LIC) — librespot n'est pas livré sans elle"
-              rm -rf "$RUNNER_TEMP/lrs"
-            fi
-          else
-            echo "::warning::librespot n'a pas pu être construit pour ${{ matrix.target }} — cette archive sera livrée sans lui (lecture Spotify indisponible)"
-            rm -rf "$RUNNER_TEMP/lrs"
-          fi
+          CROSS=()
+          if [ "${{ matrix.cross }}" = "true" ]; then CROSS=(--cross); fi
+          python scripts/build-librespot.py --target ${{ matrix.target }} \
+            --output "$RUNNER_TEMP/lrs" --work "$RUNNER_TEMP/lrs-source" "${CROSS[@]}"
 
       - name: Import signing certificate
         if: runner.os == 'macOS'
@@ -585,8 +563,8 @@ jobs:
           if [ -f "$RUNNER_TEMP/lrs/bin/librespot" ] && [ -f "$RUNNER_TEMP/lrs/LIBRESPOT-LICENSE.txt" ]; then
             cp "$RUNNER_TEMP/lrs/bin/librespot" package/
             chmod 755 package/librespot
-            cp "$RUNNER_TEMP/lrs/LIBRESPOT-LICENSE.txt" package/
-            LIBRESPOT="librespot LIBRESPOT-LICENSE.txt"
+            cp "$RUNNER_TEMP/lrs/"LIBRESPOT-*.txt package/
+            LIBRESPOT="librespot LIBRESPOT-LICENSE.txt LIBRESPOT-THIRD-PARTY.txt"
           fi
           # ffmpeg minimal (#1524) : à côté de tune-server, là où resolve_tool()
           # regarde en premier. Sa licence LGPL voyage avec lui.
@@ -657,6 +635,8 @@ jobs:
               echo "::error::codesign --timestamp a echoue 5 fois sur $cible — serveur d'horodatage Apple injoignable"
               return 1
             }
+            sign_horodate package/librespot fr.mozaiklabs.librespot ""
+            codesign --verify --strict --verbose=2 package/librespot
             sign_horodate package/tune-server fr.mozaiklabs.tune-server "$DROITS"
             if [ -n "$DAEMON" ]; then
               sign_horodate "package/$DAEMON" fr.mozaiklabs.airplay-daemon ""
@@ -755,6 +735,7 @@ jobs:
             $targets += "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe"
           }
 
+          $targets += "$env:RUNNER_TEMP\lrs\bin\librespot.exe"
           foreach ($t in $targets) {
             # /tr = horodatage : c'est lui qui fait qu'une signature reste
             # valide APRÈS l'expiration du certificat. Sans lui, tout ce qui a
@@ -772,6 +753,8 @@ jobs:
         shell: pwsh
         run: |
           mkdir package\web
+          copy "$env:RUNNER_TEMP\lrs\bin\librespot.exe" package\
+          copy "$env:RUNNER_TEMP\lrs\LIBRESPOT-*.txt" package\
           copy target\${{ matrix.target }}\release\tune-server.exe package\
           # Bundle airplay-daemon.exe next to tune-server.exe if it built.
           if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
@@ -795,6 +778,7 @@ jobs:
           copy tune-server\tests\fixtures\plugins\playlists-converter\manifest.json package\plugins\playlists-converter\
           cd package
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\ plugins\
+          7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} librespot.exe LIBRESPOT-LICENSE.txt LIBRESPOT-THIRD-PARTY.txt
           if (Test-Path "airplay-daemon.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} airplay-daemon.exe }
           if (Test-Path "ffmpeg.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} ffmpeg.exe FFMPEG-LICENSE.txt }
           cd ..
@@ -862,6 +846,9 @@ jobs:
             SetOverwrite on
             SetOutPath "`$INSTDIR"
             File "target\${{ matrix.target }}\release\tune-server.exe"
+            File "package\librespot.exe"
+            File "package\LIBRESPOT-LICENSE.txt"
+            File "package\LIBRESPOT-THIRD-PARTY.txt"
             $daemonFile
             $ffmpegFile
             SetOutPath "`$INSTDIR\web"
@@ -985,6 +972,8 @@ jobs:
               cp "$RUNNER_TEMP/ffbundle/FFMPEG-LICENSE.txt" "$APP/Contents/Resources/"
             fi
           fi
+          cp package/librespot "$APP/Contents/Resources/"
+          cp package/LIBRESPOT-*.txt "$APP/Contents/Resources/"
           cp -r web/* "$APP/Contents/Resources/web/"
           # Bundle the Party (WASM) plugin beside tune-server inside the .app so
           # the plugins-wasm runtime discovers it (plugins/ resolves exe-relative,
@@ -1174,6 +1163,8 @@ jobs:
                 exit 1
               fi
             }
+            codesign --verify --strict --verbose=2 "$APP/Contents/Resources/librespot"
+            verifie_identifiant "$APP/Contents/Resources/librespot" fr.mozaiklabs.librespot
             verifie_identifiant "$APP/Contents/Resources/tune-server" fr.mozaiklabs.tune-server
             verifie_identifiant "$APP" fr.mozaiklabs.tune-server
             if [ -f "$APP/Contents/Resources/airplay-daemon" ]; then
