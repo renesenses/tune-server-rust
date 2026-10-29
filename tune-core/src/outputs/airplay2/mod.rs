@@ -92,11 +92,9 @@ impl Airplay2Output {
         endpoint_id: String,
         ap_device_id: String,
     ) -> Self {
-        let device_id = if endpoint_id.starts_with("airplay2:") {
-            endpoint_id
-        } else {
-            format!("airplay2:{endpoint_id}")
-        };
+        // La zone et les routes de jumelage recherchent l'identifiant mDNS.
+        // Changer de protocole ne doit pas changer cette cle du registre (#6788).
+        let device_id = endpoint_id;
         Self {
             name,
             device_id,
@@ -864,6 +862,48 @@ pub fn daemon_available() -> bool {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn la_zone_mdns_retrouve_sa_sortie_airplay2_pour_le_jumelage_6788() {
+        use crate::discovery::{device::OutputType, mdns::device_id_for};
+        use crate::outputs::registry::OutputRegistry;
+
+        for stable_id in [Some("00:11:22:33:44:55"), None] {
+            let endpoint = device_id_for(OutputType::Airplay, stable_id, "127.0.0.1", 7000);
+            let output = Airplay2Output::new(
+                "MacBook".into(),
+                "127.0.0.1".into(),
+                7000,
+                endpoint.clone(),
+                "00:11:22:33:44:55".into(),
+            );
+            let charges = daemon_qui_note_les_charges(&output).await;
+            let mut registry = OutputRegistry::new();
+            registry.register(Box::new(output));
+            let registered = registry.get(&endpoint).expect(
+                "la zone mDNS ne retrouve pas sa sortie AirPlay 2 pour le jumelage ou la lecture",
+            );
+            let guard = registered.lock().await;
+            let ap2 = guard.as_any().downcast_ref::<Airplay2Output>().unwrap();
+            ap2.start_pin_pairing().await.unwrap();
+            ap2.submit_pin("1234").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if charges.lock().await.len() == 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("le jumelage doit atteindre le daemon de la sortie de zone");
+            let recorded = charges.lock().await;
+            assert_eq!(recorded[0]["cmd"], "pair_pin_start");
+            assert_eq!(recorded[1]["cmd"], "connect");
+            assert_eq!(recorded[1]["device_id"], "00:11:22:33:44:55");
+            assert_eq!(recorded[1]["pin"], "1234");
+        }
+    }
 
     fn output_for_test() -> Airplay2Output {
         Airplay2Output::new(
