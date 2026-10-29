@@ -65,6 +65,7 @@ use crate::outputs::traits::PuitsNatif;
 /// #3386). REF-8 ajoute `spec`, le format source typé (R5) que `play_url`
 /// avait déjà construit et que le bras redérivait de trois nombres nus.
 pub(super) struct EntreesAsio {
+    pub(super) transformations_reelles: Arc<std::sync::Mutex<Option<TransformationsReelles>>>,
     pub(super) device_name: String,
     pub(super) url: String,
     pub(super) sample_rate: u32,
@@ -423,7 +424,7 @@ enum Route<'a> {
         puits: Box<dyn PuitsNatif + 'a>,
     },
     Flottante {
-        etage: EtageDeConversion<'a>,
+        etage: etage_exclusif_observe_7093::EtageObserve<'a>,
         puits: Box<dyn PuitsDEchantillons + 'a>,
         contrat: ContratDuSignal<'a>,
     },
@@ -639,6 +640,7 @@ impl Read for SourcePompee<'_> {
 /// plus rien à faire.
 pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
     let EntreesAsio {
+        transformations_reelles,
         device_name,
         url,
         sample_rate,
@@ -813,7 +815,8 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
                     &pure_bypass,
                     &mono_downmix,
                 )
-                .avec_l_adaptation_des_canaux(&reaffectation, &disposition),
+                .avec_l_adaptation_des_canaux(&reaffectation, &disposition)
+                .avec_publication(&transformations_reelles),
                 recu: Vec::new(),
                 contrat: contrat(),
                 reliquat_force_brut: None,
@@ -828,28 +831,31 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
             // négocié (`channels.min(…)` ne changeait pas l'entrelacement).
             // #6230 — sauf quand la grille pilote l'ouverture : `sortie` porte
             // alors ses voies, et l'étage y applique la matrice.
-            etage: EtageDeConversion {
-                pcm: LocalPcmProcessor {
-                    eq: &eq,
-                    convolver: &convolver,
-                    crossfeed: &crossfeed,
-                    pure_bypass: &pure_bypass,
-                    mono_downmix: &mono_downmix,
-                    reaffectation: &reaffectation,
-                    disposition: &disposition,
-                    dop_active: &dop_active,
-                    volume: &volume,
-                    user_volume: &user_volume_ref,
-                    rg_factor: &rg_factor_ref,
+            etage: etage_exclusif_observe_7093::EtageObserve::nouveau(
+                EtageDeConversion {
+                    pcm: LocalPcmProcessor {
+                        eq: &eq,
+                        convolver: &convolver,
+                        crossfeed: &crossfeed,
+                        pure_bypass: &pure_bypass,
+                        mono_downmix: &mono_downmix,
+                        reaffectation: &reaffectation,
+                        disposition: &disposition,
+                        dop_active: &dop_active,
+                        volume: &volume,
+                        user_volume: &user_volume_ref,
+                        rg_factor: &rg_factor_ref,
+                    },
+                    en_attente: Vec::new(),
+                    resampler: None,
+                    resample_leftover: Vec::new(),
+                    pcm_kind: LocalPcmKind::for_bit_depth(bit_depth),
+                    spec,
+                    sortie: FormatOuvert::new(sample_rate, voies_de_l_etage),
+                    needs_resample: false,
                 },
-                en_attente: Vec::new(),
-                resampler: None,
-                resample_leftover: Vec::new(),
-                pcm_kind: LocalPcmKind::for_bit_depth(bit_depth),
-                spec,
-                sortie: FormatOuvert::new(sample_rate, voies_de_l_etage),
-                needs_resample: false,
-            },
+                &transformations_reelles,
+            ),
             puits,
             contrat: contrat(),
         },
@@ -967,7 +973,7 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
     }
     let quarantaine_ouverte = match &route {
         Route::Native { etage, .. } => etage.etage.quarantaine_24_bits_ouverte(),
-        Route::Flottante { etage, .. } => etage.pcm_kind.is_awaiting_probe(),
+        Route::Flottante { etage, .. } => etage.etage.pcm_kind.is_awaiting_probe(),
     };
     if !quarantaine_ouverte && dop_active.swap(false, Ordering::SeqCst) {
         info!(dop = false, "local_audio_dop_stream_state_changed");
@@ -1114,8 +1120,8 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
             Route::Flottante { etage, .. } => {
                 if let Err(error) = finish_windows_exclusive_probe(
                     bit_depth,
-                    etage.pcm_kind.is_awaiting_probe(),
-                    etage.en_attente.len(),
+                    etage.etage.pcm_kind.is_awaiting_probe(),
+                    etage.etage.en_attente.len(),
                 ) {
                     pcm_refusal = Some(error);
                 }

@@ -8,6 +8,31 @@ impl PositionPoller {
         startup_at: &Instant,
     ) {
         let states = self.playback.all_states().await;
+        for s in &states {
+            if s.state == PlayState::Playing && s.position_ms > 0 {
+                if let Err(e) = crate::db::listening_resume::track_position(&self.db, s) {
+                    tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_titre_non_enregistree");
+                }
+                if let Some(np) = s.now_playing.as_ref().filter(|np| np.source == "podcast") {
+                    if let Err(e) = crate::db::listening_resume::podcast_started_in_context(
+                        &self.db,
+                        s.zone_id,
+                        np,
+                        s.position_ms,
+                        s.session_context_id.as_deref(),
+                    ) {
+                        tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_podcast_non_enregistree");
+                    }
+                }
+            }
+        }
+
+        self.orchestrator
+            .nettoyer_preparations_absentes(&states)
+            .await;
+        for etat in &states {
+            self.orchestrator.maintenir_preparation_fichier(etat).await;
+        }
 
         poll_states.retain(|zone_id, _| {
             states
@@ -800,6 +825,9 @@ impl PositionPoller {
                     };
                     (output.take_output_failure(), output.take_paused_by_device())
                 };
+                if failure.is_some() {
+                    self.noter_tune_tested(zone_state, &device_id, false).await;
+                }
                 // Fil 1915 — une piste dont le flux s'est COUPÉ loin de sa
                 // fin n'est pas une panne de sortie : on passe à la suivante
                 // (ou on termine la file), en le disant — message non fatal
@@ -2084,6 +2112,7 @@ impl PositionPoller {
                         .gapless_sent_at
                         .map(|t| t.elapsed().as_millis() as u64)
                         .unwrap_or(0);
+                    let pic = ps.peak_position_ms;
                     info!(
                         zone_id,
                         prev_pos = prev_position_ms,
@@ -2139,6 +2168,8 @@ impl PositionPoller {
                                 &status,
                                 track_duration_ms,
                             )
+                            .await;
+                        self.noter_fin_tune_tested(zone_state, &device_id, pic)
                             .await;
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
                         let avance = self
@@ -2232,7 +2263,10 @@ impl PositionPoller {
                     // its full 45s and a rip crawled at ~46s per track.
                     let in_track_load_grace = status.realtime
                         && ps.track_loaded_at.elapsed().as_secs() < TRACK_LOAD_GRACE_SECS
-                        && ps.peak_position_ms < 5_000;
+                        && ps.peak_position_ms < 5_000
+                        // #7097 — une piste de 3,7 s a pu finir sans jamais
+                        // atteindre 5 s : examiner alors sa fin normale.
+                        && !played_enough;
                     // A DSD track on a DLNA renderer whose peak reached the end.
                     // Gapless is intentionally not armed for a DSD next on DLNA
                     // (prepare_gapless / #402) and DLNA never reports
@@ -3085,6 +3119,8 @@ impl PositionPoller {
                                     track_duration_ms,
                                 )
                                 .await;
+                            self.noter_fin_tune_tested(zone_state, &device_id, ps.peak_position_ms)
+                                .await;
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
                             let avance = self
                                 .orchestrator
@@ -3179,6 +3215,7 @@ impl PositionPoller {
                             .gapless_sent_at
                             .map(|t| t.elapsed().as_millis() as u64)
                             .unwrap_or(0);
+                        let pic = ps.peak_position_ms;
                         info!(
                             zone_id,
                             renderer_dur = status.duration_ms,
@@ -3210,6 +3247,8 @@ impl PositionPoller {
                             .position_a_avancer(zone_id, zone_state, arme_avant)
                             .await
                         {
+                            self.noter_fin_tune_tested(zone_state, &device_id, pic)
+                                .await;
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
                                 .orchestrator
@@ -3234,10 +3273,12 @@ impl PositionPoller {
                         // flux a expire cote serveur. On la jette pour que la
                         // condition ci-dessous rearme proprement, plutot que de
                         // laisser le renderer chercher une adresse morte.
-                        if decisions::gapless_stage_expired(
-                            ps.gapless_sent,
-                            ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
-                        ) {
+                        if !self.orchestrator.fichier_suivant_en_preparation(zone_id)
+                            && decisions::gapless_stage_expired(
+                                ps.gapless_sent,
+                                ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
+                            )
+                        {
                             info!(
                                 zone_id,
                                 age_secs = ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
@@ -3299,12 +3340,14 @@ impl PositionPoller {
                                 ps.transition(fsm::Transition::Desarmement);
                             }
                         }
-                        decisions::should_arm_gapless(
-                            ps.gapless_sent,
-                            status.duration_ms,
-                            track_duration_ms,
-                            status.position_ms,
-                        )
+                        (!ps.gapless_sent
+                            && self.orchestrator.fichier_suivant_en_preparation(zone_id))
+                            || decisions::should_arm_gapless(
+                                ps.gapless_sent,
+                                status.duration_ms,
+                                track_duration_ms,
+                                status.position_ms,
+                            )
                     } {
                         // #5970 — la fin estimée de la piste en cours, prise
                         // AVANT les lectures de la base qui suivent : c'est
@@ -3999,6 +4042,7 @@ impl PositionPoller {
                 self.agir_sur_un_demarrage_fige(zone_id, zone_state, demarrage_fige)
                     .await;
             } else if force_stop {
+                self.noter_tune_tested(zone_state, &device_id, false).await;
                 poll_states.remove(&zone_id);
                 let device_id_ref = self.get_zone_device_id(zone_id);
                 let relance = force_stop_demarrage_mort && {
@@ -4175,6 +4219,16 @@ impl PositionPoller {
                         .await;
                 }
             } else if track_ended {
+                // Une fin avec progression réellement observée, pas un play
+                // acquitté ni une prédiction de fin depuis la durée seule.
+                if let Some(np) = zone_state.now_playing.as_ref()
+                    && np.duration_ms > 0
+                    && poll_states.get(&zone_id).is_some_and(|ps| {
+                        ps.peak_position_ms >= (np.duration_ms as u64).saturating_sub(1000).max(1)
+                    })
+                {
+                    self.noter_tune_tested(zone_state, &device_id, true).await;
+                }
                 // #2488 — la moitié invisible du blanc entre deux pistes.
                 //
                 // `playback_timing` (orchestrator) démarre à `play_inner`,

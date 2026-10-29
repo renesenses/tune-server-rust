@@ -292,6 +292,10 @@ pub(super) async fn get_config(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let all = settings.all().unwrap_or_default();
     let mut config = serde_json::Map::new();
+    config.insert(
+        tune_core::db::listening_resume::REWIND_KEY.into(),
+        json!(tune_core::db::listening_resume::DEFAULT_REWIND),
+    );
     for (k, v) in all {
         // 🔴 Les préférences des AUTRES profils ne sortent pas d'ici.
         //
@@ -331,6 +335,11 @@ pub(super) async fn get_config(
         ("tidal_enabled", json!(true)),
         ("qobuz_enabled", json!(true)),
         ("youtube_enabled", json!(true)),
+        // Pays déclaré pour les restrictions des radios ; vide = inconnu.
+        (
+            crate::routes::radios::geofencing::COUNTRY_SETTING,
+            json!(""),
+        ),
         // #7152 — pays de la recherche de podcasts ; vide = automatique.
         (crate::routes::podcasts::CLE_PAYS_PODCASTS, json!("")),
         // #5247 — pays des tendances YouTube Music ; vide = automatique.
@@ -1730,6 +1739,13 @@ pub(super) async fn update_config(
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut values = body.0;
+    if let Some(value) = values.get(tune_core::db::listening_resume::REWIND_KEY) {
+        if value.as_u64().is_none_or(|n| n > 300) {
+            return Err(AppError::bad_request(
+                "continue_listening_rewind_seconds : entier de 0 à 300 attendu",
+            ));
+        }
+    }
     // #2265 — refuser d'inscrire le nom du backend ACTIF comme s'il était un
     // réglage. Aucun repli, aucune réinterprétation vers `local_audio_backend` :
     // les deux informations sont différentes, et deviner laquelle est demandée
@@ -1771,6 +1787,7 @@ pub(super) async fn update_config(
     normaliser_plafond_aleatoire(&mut values)?;
     normaliser_pays_tendances_youtube(&mut values)?;
     normaliser_pays_podcasts(&mut values)?;
+    crate::routes::radios::geofencing::normalize_setting(&mut values)?;
     normaliser_vitesse_des_analyses(&mut values)?;
     normaliser_nom_du_serveur(&mut values)?;
     normaliser_levee_du_bridage(&mut values)?;
@@ -3112,6 +3129,18 @@ pub(super) struct AddMusicDir {
     path: String,
 }
 
+// #6175 : une préférence absente est un premier réglage valide. Une lecture
+// en échec ou une valeur existante illisible ne doit jamais devenir une liste
+// vide que l'ajout ou le retrait réécrirait en perdant les autres racines.
+fn lire_racines_avant_modification(settings: &SettingsRepo) -> Result<Vec<String>, AppError> {
+    match settings.get("music_dirs")? {
+        None => Ok(Vec::new()),
+        Some(value) => serde_json::from_str(&value).map_err(|_| {
+            AppError::internal("music_dirs est illisible ; les dossiers déclarés ont été conservés")
+        }),
+    }
+}
+
 pub(super) async fn add_music_dir(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
@@ -3150,21 +3179,14 @@ pub(super) async fn add_music_dir(
     }
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut dirs: Vec<String> = settings
-        .get("music_dirs")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut dirs = lire_racines_avant_modification(&settings)?;
 
     let newly_added = !dirs.contains(&normalized);
     if newly_added {
         dirs.push(normalized);
     }
 
-    settings
-        .set("music_dirs", &serde_json::to_string(&dirs)?)
-        .ok();
+    settings.set("music_dirs", &serde_json::to_string(&dirs)?)?;
 
     // Scan right away so the new folder's tracks appear without an app restart.
     // Previously add_music_dir only saved the path: the startup scan and the
@@ -3246,21 +3268,14 @@ pub(crate) fn retirer_un_dossier(
 ) -> Result<Value, AppError> {
     let normalized = tune_core::scanner::walker::normalize_path(path);
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut dirs: Vec<String> = settings
-        .get("music_dirs")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut dirs = lire_racines_avant_modification(&settings)?;
 
     dirs.retain(|d| {
         let norm_d = tune_core::scanner::walker::normalize_path(d);
         norm_d != normalized
     });
 
-    settings
-        .set("music_dirs", &serde_json::to_string(&dirs)?)
-        .ok();
+    settings.set("music_dirs", &serde_json::to_string(&dirs)?)?;
 
     // Les pistes DEVENUES orphelines : sous le dossier retiré, et sous aucune
     // des racines qui RESTENT. Le compte se mesurait auparavant sur le seul
@@ -6613,3 +6628,7 @@ mod perimetre_des_analyses_5593_tests {
         assert!(vide.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "racines_preservees_6175_tests.rs"]
+mod racines_preservees_6175_tests;

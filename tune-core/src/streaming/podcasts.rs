@@ -21,6 +21,27 @@ const DELAI_DES_RESOLUTIONS: Duration = Duration::from_secs(12);
 /// Cache TTL for top podcasts (1 hour).
 const TOP_CACHE_TTL: Duration = Duration::from_secs(3600);
 
+/// Un même flux public n'apparaît qu'une fois, au meilleur rang Apple.
+/// Les fiches sans flux restent distinctes par leur identifiant de catalogue.
+fn dedoublonner_le_palmares(podcasts: &mut Vec<Podcast>) {
+    let mut flux = std::collections::HashSet::new();
+    let mut identifiants = std::collections::HashSet::new();
+    podcasts.retain(|p| {
+        if (!p.feed_url.is_empty() && flux.contains(&p.feed_url))
+            || (!p.source_id.is_empty() && identifiants.contains(&p.source_id))
+        {
+            return false;
+        }
+        if !p.feed_url.is_empty() {
+            flux.insert(p.feed_url.clone());
+        }
+        if !p.source_id.is_empty() {
+            identifiants.insert(p.source_id.clone());
+        }
+        true
+    });
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Podcast {
     pub name: String,
@@ -1077,6 +1098,11 @@ impl PodcastService {
         debug!(count = podcasts.len(), "apple_top_podcasts_parsed");
         let mut podcasts = podcasts;
         self.completer_les_flux(&mut podcasts, &cc).await;
+        // #7225 — deux fiches Apple peuvent pointer vers le même RSS.
+        // Le web clé ses cartes par flux : garder les deux fait échouer tout
+        // l'écran (each_key_duplicate). Garder le meilleur rang, après la
+        // résolution des flux, avant de remplir le cache.
+        dedoublonner_le_palmares(&mut podcasts);
 
         // Update cache.
         {
@@ -1569,6 +1595,86 @@ mod tests {
         assert!(
             premiere.contains("id=333&") && premiere.contains("country=zz"),
             "sans pays du client, le pays retenu du palmarès doit partir : {premiere}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod palmares_doublons_7225 {
+    use super::*;
+
+    #[tokio::test]
+    async fn deux_identifiants_apple_un_seul_flux_ne_cassent_pas_le_palmares_7225() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let serveur = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0; 8192];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let body = if request.contains("/podcasts/top/") {
+                    // Même forme que le vrai palmarès FR relevé le 28/10 :
+                    // deux identifiants UNBX, un seul flux (voir mesure).
+                    r#"{"feed":{"results":[
+                      {"id":"6813632977","name":"UNBX","artistName":"A"},
+                      {"id":"6813632603","name":"UNBX","artistName":"A"},
+                      {"id":"3","name":"Autre podcast","artistName":"B"}]}}"#
+                } else {
+                    r#"{"results":[
+                      {"collectionId":6813632977,"feedUrl":"https://flux.example.test/unbx.xml"},
+                      {"collectionId":6813632603,"feedUrl":"https://flux.example.test/unbx.xml"},
+                      {"collectionId":3,"feedUrl":"https://flux.example.test/autre.xml"}]}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let service = PodcastService::with_apple_bases(
+            crate::http::client::shared().clone(),
+            &base,
+            &format!("{base}/lookup"),
+        );
+        for _ in 0..2 {
+            let podcasts = service.top_podcasts(Some(7225), "xq").await.unwrap();
+            assert_eq!(
+                podcasts.len(),
+                2,
+                "#7225 : le palmarès expose deux cartes avec la même clé RSS, ce qui fait échouer tout l'écran Svelte"
+            );
+            assert_eq!(
+                podcasts[0].source_id, "apple-6813632977",
+                "le premier rang doit être conservé"
+            );
+            assert_eq!(podcasts[1].source_id, "apple-3");
+        }
+        serveur.abort();
+    }
+
+    #[test]
+    fn sans_flux_les_podcasts_distincts_restent_visibles_7225() {
+        let podcast = |id: &str| Podcast {
+            name: "Homonyme".into(),
+            artist: "Auteur".into(),
+            feed_url: String::new(),
+            cover_url: String::new(),
+            description: String::new(),
+            episode_count: 0,
+            source_id: id.into(),
+            category: None,
+        };
+        let mut podcasts = vec![podcast("apple-1"), podcast("apple-2"), podcast("apple-1")];
+        dedoublonner_le_palmares(&mut podcasts);
+        assert_eq!(
+            podcasts
+                .iter()
+                .map(|p| p.source_id.as_str())
+                .collect::<Vec<_>>(),
+            ["apple-1", "apple-2"]
         );
     }
 }

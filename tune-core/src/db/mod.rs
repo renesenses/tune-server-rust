@@ -32,6 +32,7 @@ pub mod home_queries;
 pub mod ignored_device_repo;
 /// Lectures SQLite en cours, pour le relevé d'un gel de l'exécuteur (#5677).
 pub mod lectures_en_cours;
+pub mod listening_resume;
 /// Registre DURABLE des serveurs multimédia (#2219, phase 1) — sur le modèle
 /// de `network_mounts` : l'intention d'un côté, le constat de l'autre.
 pub mod media_server_repo;

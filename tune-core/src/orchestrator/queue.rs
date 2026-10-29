@@ -116,6 +116,9 @@ impl PlaybackOrchestrator {
         // #3365 — la qualité rangée avec ce flux part avec lui.
         self.ranger_la_qualite_pre_armee(zone_id, None).await;
         if let Some(ref sid) = old_sid {
+            if self.session_fichier_retenue(zone_id).as_ref() == Some(sid) {
+                return;
+            }
             self.streamer.remove_session(sid).await;
             debug!(zone_id, stream_id = %sid, "gapless_session_cleaned_up");
         }
@@ -655,8 +658,54 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
-        self.play_from_queue_inner(zone_id, position, true, Entree::Geste)
+        self.play_from_queue_inner(zone_id, position, true, Entree::Geste, None)
             .await
+    }
+
+    /// Reprendre un contexte à sa position explicite (#7280).
+    /// Ce geste explicite ne doit pas être absorbé comme un double appui.
+    pub async fn replay_context_from_queue(
+        &self,
+        zone_id: i64,
+        position: i64,
+        seek_ms: u64,
+    ) -> Result<PlayResult, String> {
+        self.playback.oublier_le_deplacement(zone_id).await;
+        let result = self
+            .play_from_queue_inner(
+                zone_id,
+                position,
+                true,
+                Entree::RepriseDeContexte,
+                Some(seek_ms),
+            )
+            .await?;
+        let zone = ZoneRepo::with_backend(self.db.clone()).get(zone_id)?;
+        let browser_ready = zone
+            .as_ref()
+            .is_some_and(|z| z.output_type.as_deref() == Some("browser"))
+            && result.error.is_none()
+            && result.stream_url.is_some();
+        if seek_ms > 0 && (result.output_sent || browser_ready) {
+            // Le navigateur reçoit la position par l'état de zone ; sa
+            // confirmation d'écoute reste différée jusqu'au signal du lecteur.
+            self.playback.seek(zone_id, seek_ms as i64).await;
+            if result.output_sent {
+                // Le décodeur part déjà à l'offset ; une session fichier/proxy
+                // sur renderer réseau exige le rattrapage éprouvé de #2893.
+                if let Some(zone) = zone {
+                    self.seek_output_after_replay(
+                        zone_id,
+                        zone.output_device_id.as_deref(),
+                        zone.output_type.as_deref(),
+                        seek_ms,
+                    )
+                    .await;
+                }
+                self.persist_position(zone_id).await;
+            }
+        }
+        Ok(result)
     }
 
     /// #6735 — `play_from_queue` pour l'enchaînement du sondeur à la fin
@@ -668,7 +717,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         position: i64,
     ) -> Result<PlayResult, String> {
-        self.play_from_queue_inner(zone_id, position, true, Entree::FinDePiste)
+        self.play_from_queue_inner(zone_id, position, true, Entree::FinDePiste, None)
             .await
     }
 
@@ -687,7 +736,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         position: i64,
     ) -> Result<PlayResult, String> {
-        self.play_from_queue_inner(zone_id, position, false, Entree::Geste)
+        self.play_from_queue_inner(zone_id, position, false, Entree::Geste, None)
             .await
     }
 
@@ -697,6 +746,7 @@ impl PlaybackOrchestrator {
         position: i64,
         historique: bool,
         entree: Entree,
+        seek_ms: Option<u64>,
     ) -> Result<PlayResult, String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
@@ -730,7 +780,7 @@ impl PlaybackOrchestrator {
                 album_title: entry.album_title.clone(),
                 cover_url: entry.cover_path.clone(),
                 duration_ms: entry.duration_ms,
-                seek_ms: None,
+                seek_ms,
                 temp_file_path: None,
                 sample_rate: None,
                 bit_depth: None,
@@ -807,7 +857,7 @@ impl PlaybackOrchestrator {
                 album_title: album,
                 cover_url: cover,
                 duration_ms,
-                seek_ms: None,
+                seek_ms,
                 temp_file_path: None,
                 sample_rate: None,
                 bit_depth: None,

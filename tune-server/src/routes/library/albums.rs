@@ -1217,31 +1217,24 @@ pub(super) async fn album_similar(
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let mbid = if let Some(aid) = album.artist_id {
-        let artist_repo = ArtistRepo::with_backend(state.backend.clone());
-        artist_repo
+    // Le cloud propose les artistes similaires de l'artiste de cet album,
+    // pas des albums voisins. Garder la réponse historique `artists`, en
+    // partageant le client de référence et la résolution exacte (#6555).
+    let artiste = album.artist_id.and_then(|aid| {
+        ArtistRepo::with_backend(state.backend.clone())
             .get(aid)
             .ok()
             .flatten()
-            .and_then(|a| a.musicbrainz_id)
-    } else {
-        None
-    };
-    let Some(mbid) = mbid else {
+    });
+    let Some(artiste) = artiste else {
         return Json(json!({"album": album.title, "artists": []})).into_response();
     };
-    match state
-        .http_client
-        .get(format!("https://mozaiklabs.fr/api/{mbid}/similar"))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            let data: Value = resp.json().await.unwrap_or(json!({}));
-            Json(data).into_response()
-        }
-        _ => Json(json!({"mbid": mbid, "artists": []})).into_response(),
-    }
+    let mut client = super::artists::client_cloud(&state);
+    let Some(mbid) = super::artists::mbid_cloud(&state, &mut client, &artiste).await else {
+        return Json(json!({"album": album.title, "artists": []})).into_response();
+    };
+    let voisins = client.get_similar(&mbid).await;
+    Json(json!({"album": album.title, "mbid": mbid, "artists": voisins})).into_response()
 }
 
 /// `POST /library/albums/{id}/distinct/{other_id}` — « ces deux albums ne sont
@@ -4948,3 +4941,7 @@ mod communaute_tests_6545 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "similaires_album_7090_tests.rs"]
+mod similaires_album_7090_tests;

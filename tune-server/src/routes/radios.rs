@@ -699,12 +699,17 @@ pub struct StationAnnuaire {
     /// rendue par l'API.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub flux: Vec<FluxAnnuaire>,
+    /// Une liste v2 vide ne doit pas réactiver les adresses historiques v1.
+    #[serde(skip)]
+    pub streams_declared: bool,
 }
 
 /// #7177 — un flux publié d'une fiche de l'annuaire, tel que l'API le rend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct FluxAnnuaire {
     pub url: String,
+    /// Pays autorisés (ISO alpha-2). Vide : aucune restriction publiée.
+    pub restricted_to_countries: Vec<String>,
     /// `AAC`, `MP3`, `FLAC`… tel que l'annuaire l'écrit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec: Option<String>,
@@ -717,6 +722,9 @@ pub struct FluxAnnuaire {
     /// Le flux principal de la fiche (son `stream_url`).
     pub primary: bool,
 }
+
+#[path = "radios_geofencing_7199.rs"]
+pub(crate) mod geofencing;
 
 impl StationAnnuaire {
     /// #7215 — les genres de la fiche : `genres`, sinon le seul `genre` (une
@@ -746,6 +754,9 @@ impl StationAnnuaire {
                 let detail = self.flux.iter().find(|f| f.url == url);
                 FluxAnnuaire {
                     url: url.to_string(),
+                    restricted_to_countries: detail
+                        .map(|f| f.restricted_to_countries.clone())
+                        .unwrap_or_default(),
                     codec: detail.and_then(|f| f.codec.clone()),
                     bitrate: detail.and_then(|f| f.bitrate),
                     sample_rate: detail.and_then(|f| f.sample_rate),
@@ -871,11 +882,14 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                 .filter_map(|s| {
                     Some(FluxAnnuaire {
                         url: texte(s, "url")?,
+                        restricted_to_countries: geofencing::restrictions(
+                            s.get("restricted_to_countries"),
+                        ),
                         codec: texte(s, "format"),
                         bitrate: entier(s.get("bitrate")),
                         sample_rate: entier(s.get("sample_rate")),
                         hls: s.get("is_hls").and_then(Value::as_bool) == Some(true),
-                        primary: false,
+                        primary: texte(s, "url").as_deref() == Some(stream_url.as_str()),
                     })
                 })
                 .collect();
@@ -910,6 +924,7 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                 stream_urls,
                 stream_url,
                 flux,
+                streams_declared: item.get("streams").is_some_and(Value::is_array),
             })
         })
         .collect()
@@ -1540,12 +1555,16 @@ async fn media_server_radio_audio(
 
     // Le Browse et le HEAD sont sans effet. Seul un renderer qui demande
     // réellement le corps compte comme une tentative d'écoute.
+    let url = match geofencing::stream_for_saved(&state, &radio) {
+        Ok(url) => url,
+        Err(response) => return response.into_response(),
+    };
     if let Err(error) = repo.record_play(id) {
         tracing::warn!(radio_id = id, error = %error, "media_server_radio_play_not_recorded");
     }
     let stream_id = state
         .orchestrator
-        .create_media_server_radio_session(radio.url.clone())
+        .create_media_server_radio_session(url.clone())
         .await;
     // `amont` : l'URL du diffuseur que Tune va chercher pour le compte du
     // renderer. C'est la trace que #1800 réclame — station, URL amont, statut —
@@ -1555,7 +1574,7 @@ async fn media_server_radio_audio(
     tracing::info!(
         radio_id = id,
         radio = %radio.name,
-        amont = %radio.url,
+        amont = %url,
         stream_id = %stream_id,
         "media_server_radio_stream_started"
     );
@@ -1569,7 +1588,7 @@ async fn media_server_radio_audio(
     tracing::info!(
         radio_id = id,
         radio = %radio.name,
-        amont = %radio.url,
+        amont = %url,
         statut = response.status().as_u16(),
         "media_server_radio_stream_reponse"
     );
@@ -1858,14 +1877,11 @@ async fn play_radio(
     let Some(radio) = repo.get(id).ok().flatten() else {
         return (StatusCode::NOT_FOUND, "radio not found").into_response();
     };
-    let corps = jouer_un_flux(
-        &state,
-        zone_id,
-        &radio.name,
-        &radio.url,
-        radio.logo_url.clone(),
-    )
-    .await;
+    let url = match geofencing::stream_for_saved(&state, &radio) {
+        Ok(url) => url,
+        Err(response) => return response.into_response(),
+    };
+    let corps = jouer_un_flux(&state, zone_id, &radio.name, &url, radio.logo_url.clone()).await;
     repo.record_play(id).ok();
     Json(corps).into_response()
 }

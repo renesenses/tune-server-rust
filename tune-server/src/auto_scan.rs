@@ -3927,3 +3927,7 @@ mod scan_au_demarrage_reglage_tests;
 #[cfg(test)]
 #[path = "surveillant_artiste_generique_tests_1881.rs"]
 mod surveillant_artiste_generique_tests_1881;
+
+#[cfg(test)]
+#[path = "scan_artiste_montage_tests_6737.rs"]
+mod scan_artiste_montage_tests_6737;

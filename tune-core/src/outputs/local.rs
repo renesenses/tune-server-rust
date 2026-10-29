@@ -6552,6 +6552,7 @@ impl OutputTarget for LocalOutput {
                 // R6 bis (#2219) : le bras vit dans `local/bras_coreaudio.rs`.
                 // Tout ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
                 bras_coreaudio::jouer_via_coreaudio(bras_coreaudio::EntreesCoreAudio {
+                    transformations_reelles,
                     device_name,
                     url,
                     sample_rate,
@@ -6604,6 +6605,7 @@ impl OutputTarget for LocalOutput {
                 // R6 bis (#2219) : le bras vit dans `local/bras_asio.rs`. Tout
                 // ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
                 bras_asio::jouer_via_asio(bras_asio::EntreesAsio {
+                    transformations_reelles,
                     device_name,
                     url,
                     sample_rate,
@@ -6660,6 +6662,7 @@ impl OutputTarget for LocalOutput {
                 // R6 bis (#2219) : le bras vit dans `local/bras_wasapi.rs`.
                 // Tout ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
                 bras_wasapi::jouer_via_wasapi(bras_wasapi::EntreesWasapi {
+                    transformations_reelles,
                     device_name,
                     endpoint_id,
                     audio_backend,
@@ -8621,3 +8624,11 @@ mod transformations_reelles_de_l_etage_ref6b;
 mod disposition_declaree_tests;
 #[cfg(test)]
 mod voies_exclusives_6230;
+
+// #7093 — publication du format réel des sorties exclusives flottantes.
+#[cfg(any(
+    all(target_os = "windows", feature = "asio"),
+    target_os = "macos",
+    test
+))]
+mod etage_exclusif_observe_7093;

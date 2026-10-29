@@ -1,7 +1,7 @@
 //! #7107 — titres phares : popularité Last.fm, tri à quatre niveaux, repli.
 //! Last.fm est un faux serveur local (axum), le service un faux « chercher »,
-//! l'historique une base en mémoire. Chaque test a SON faux Last.fm, donc son
-//! URL de base : le cache global ne passe jamais d'un test à l'autre.
+//! l'historique une base en mémoire. Chaque faux Last.fm a une URL unique,
+//! même si le système réutilise un port : les caches globaux restent isolés.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,6 +28,15 @@ fn base() -> Arc<dyn DbBackend> {
 
 /// Un faux Last.fm : rend `corps` (statut `statut`) et compte les appels.
 async fn faux_lastfm(statut: u16, corps: Value) -> (String, Arc<AtomicUsize>) {
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    faux_lastfm_sur(ecoute, statut, corps).await
+}
+
+async fn faux_lastfm_sur(
+    ecoute: tokio::net::TcpListener,
+    statut: u16,
+    corps: Value,
+) -> (String, Arc<AtomicUsize>) {
     use axum::Router;
     use axum::extract::State;
     use axum::http::StatusCode;
@@ -39,15 +48,57 @@ async fn faux_lastfm(statut: u16, corps: Value) -> (String, Arc<AtomicUsize>) {
         (StatusCode::from_u16(statut).unwrap(), axum::Json(corps))
     }
     let appels = Arc::new(AtomicUsize::new(0));
-    let app = Router::new()
-        .route("/", get(repondre))
-        .with_state((appels.clone(), statut, corps));
-    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // Un port éphémère peut être réattribué après la fin d'un test, alors que
+    // TOPS et RESOLUS conservent encore les entrées de son URL de base.
+    static NEXT_FAKE: AtomicUsize = AtomicUsize::new(1);
+    let chemin = format!("/lastfm-{}", NEXT_FAKE.fetch_add(1, Ordering::Relaxed));
+    let app =
+        Router::new()
+            .route(&chemin, get(repondre))
+            .with_state((appels.clone(), statut, corps));
     let adresse = ecoute.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(ecoute, app).await.ok();
     });
-    (format!("http://{adresse}/"), appels)
+    (format!("http://{adresse}{chemin}"), appels)
+}
+
+#[test]
+fn deux_faux_lastfm_sur_le_meme_port_ne_partagent_pas_un_echec() {
+    // Garder le port réservé force sa réutilisation, sans dépendre du choix
+    // aléatoire du système. Chaque exécution détruit son serveur et ses sockets,
+    // comme deux tests Tokio successifs, mais les caches globaux restent vivants.
+    let ecoute = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    ecoute.set_nonblocking(true).unwrap();
+    for passage in 1..=2 {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let ecoute = tokio::net::TcpListener::from_std(ecoute.try_clone().unwrap()).unwrap();
+            let (url, appels) = faux_lastfm_sur(ecoute, 500, json!({})).await;
+            let client = crate::http::client::builder().no_proxy().build().unwrap();
+            let mut items = fudge();
+            let avant = items.clone();
+            for _ in 0..2 {
+                completer(
+                    &client,
+                    &cfg(&url, "cle", 8),
+                    "qobuz",
+                    &mut items,
+                    catalogue(vec![], Arc::default()),
+                )
+                .await;
+                assert_eq!(items, avant);
+            }
+            assert_eq!(
+                appels.load(Ordering::SeqCst),
+                1,
+                "passage {passage} : le faux serveur doit recevoir son premier appel malgré le port réutilisé, puis mémoriser son propre échec"
+            );
+        });
+    }
 }
 
 fn top(titres: &[&str]) -> Value {

@@ -67,6 +67,7 @@ use crate::outputs::coreaudio_exclusive::ExclusiveOutput;
 /// structure, jamais empruntées : le bras est terminal, `play_url` n'en a
 /// plus besoin après l'appel, et rien ne peut rendre E0521 (leçon de #3386).
 pub(super) struct EntreesCoreAudio {
+    pub(super) transformations_reelles: Arc<std::sync::Mutex<Option<TransformationsReelles>>>,
     pub(super) device_name: String,
     pub(super) url: String,
     pub(super) sample_rate: u32,
@@ -388,6 +389,7 @@ impl<'a> BackendLocal<'a> for BackendCoreAudio<'a> {
 /// le fil de lecture n'a plus rien à faire.
 pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
     let EntreesCoreAudio {
+        transformations_reelles,
         device_name,
         url,
         sample_rate,
@@ -543,7 +545,7 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
     // l'ouverture : `sortie` porte alors ses voies, et l'étage y applique la
     // matrice, comme sur le chemin partagé. Le DoP n'est pas refusé sur ce
     // bras : il traverse en f32 jusqu'à l'AudioUnit, comme avant (D1).
-    let mut etage = EtageDeConversion {
+    let etage = EtageDeConversion {
         pcm: LocalPcmProcessor {
             eq: &eq,
             convolver: &convolver,
@@ -565,6 +567,8 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         sortie: backend.format_ouvert(),
         needs_resample: false,
     };
+    let mut etage =
+        etage_exclusif_observe_7093::EtageObserve::nouveau(etage, &transformations_reelles);
     let mut puits = match backend.puits() {
         Puits::Flottant(puits) => puits,
         Puits::Natif(_) => unreachable!("BackendCoreAudio ne fournit qu'un puits flottant (D1)"),

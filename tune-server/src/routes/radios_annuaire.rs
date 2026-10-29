@@ -586,6 +586,7 @@ fn repli(s: &str) -> String {
 
 /// La fiche répond-elle à la recherche ? Nom, genre, catégories, pays,
 /// description et mots-clés (le diffuseur, #6964), sans accents ni casse.
+/// Tous les mots doivent figurer dans un même champ, dans n'importe quel ordre.
 fn correspond(f: &StationAnnuaire, motif: &str) -> bool {
     if motif.is_empty() {
         return true;
@@ -597,7 +598,10 @@ fn correspond(f: &StationAnnuaire, motif: &str) -> bool {
         .chain(f.description.as_deref())
         .chain(f.categories.iter().map(String::as_str))
         .chain(f.keywords.iter().map(String::as_str))
-        .any(|champ| repli(champ).contains(motif))
+        .any(|champ| {
+            let champ = repli(champ);
+            motif.split_whitespace().all(|mot| champ.contains(mot))
+        })
 }
 
 fn meme_pays(f: &StationAnnuaire, pays: Option<&str>) -> bool {
@@ -884,16 +888,27 @@ async fn ajouter(
 
     let (id, statut) = match existante {
         Some(st) => (st.id, StatusCode::OK),
-        None => match repo.create(&station_depuis_fiche(&fiche)) {
-            Ok(id) => {
-                state.event_bus.emit(
-                    "library.radios_changed",
-                    json!({"action": "created", "id": id, "external_id": external_id}),
-                );
-                (Some(id), StatusCode::CREATED)
+        None => {
+            let mut station = station_depuis_fiche(&fiche);
+            // Une fiche peut rester en favori même si aucun flux n'est
+            // accessible aujourd'hui ; c'est sa lecture qui sera refusée.
+            if let Ok(flux) = super::radios::geofencing::stream_for_directory(&state, &fiche, None)
+            {
+                station.url = flux.url;
+                station.codec = flux.codec.map(|c| c.to_ascii_lowercase());
+                station.bitrate = flux.bitrate;
             }
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        },
+            match repo.create(&station) {
+                Ok(id) => {
+                    state.event_bus.emit(
+                        "library.radios_changed",
+                        json!({"action": "created", "id": id, "external_id": external_id}),
+                    );
+                    (Some(id), StatusCode::CREATED)
+                }
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            }
+        }
     };
     let Some(id) = id else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -926,9 +941,9 @@ async fn ajouter(
 }
 
 /// `POST /radios/directory/update-stream/{radio_id}` — « Mettre à jour
-/// l'adresse du flux » : la station liée à sa fiche prend l'adresse que
-/// l'annuaire publie désormais. Seul ce geste de l'utilisateur la change :
-/// le rapprochement, lui, ne réécrit jamais une adresse.
+/// l'adresse du flux » : si son ancien flux a été retiré, la station liée
+/// prend l'adresse principale et ses métadonnées. Un flux secondaire encore
+/// publié reste choisi, comme lors du rattrapage de fond (#7043).
 async fn mettre_a_jour_le_flux(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -955,7 +970,11 @@ async fn mettre_a_jour_le_flux(
             .into_response();
     };
     if !flux_de_la_fiche(&fiche, &station.url) {
-        station.url = fiche.stream_url.clone();
+        // #6973 : les métadonnées de l'ancienne adresse ne décrivent pas
+        // le nouveau flux. Un format inconnu reste inconnu.
+        station.codec = None;
+        station.bitrate = None;
+        poser_le_flux_prefere(&fiche, &mut station, &fiche.stream_url);
         if let Err(e) = repo.update(&station) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
@@ -1083,12 +1102,16 @@ async fn jouer(
         )
             .into_response();
     };
+    let flux = match super::radios::geofencing::stream_for_directory(&state, &fiche, None) {
+        Ok(flux) => flux,
+        Err(response) => return response.into_response(),
+    };
     Json(
         super::radios::jouer_un_flux(
             &state,
             zone_id,
             &fiche.name,
-            &fiche.stream_url,
+            &flux.url,
             fiche.logo_url.clone(),
         )
         .await,
@@ -1099,3 +1122,11 @@ async fn jouer(
 #[cfg(test)]
 #[path = "radios_annuaire_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "radios_annuaire_recherche_7198_tests.rs"]
+mod tests_recherche_7198;
+
+#[cfg(test)]
+#[path = "radios_format_mis_a_jour_6973_tests.rs"]
+mod format_mis_a_jour_6973;

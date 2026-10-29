@@ -245,6 +245,9 @@ pub(super) enum Entree {
     /// de la même piste (Répéter la piste, Répéter tout sur une file d'une
     /// piste) est voulue, quelle que soit la durée du morceau.
     FinDePiste,
+    /// Reprise explicite d'un contexte : le dernier titre doit être rejoué
+    /// depuis zéro, même s'il est déjà en lecture.
+    RepriseDeContexte,
 }
 
 /// Ce que la demande impose par-dessus le flux résolu : pochette et album
@@ -320,7 +323,7 @@ impl PlaybackOrchestrator {
         //     encore `Playing`, moins de 8 s après son départ. Les trois
         //     conditions de la garde étaient réunies et la relance était avalée
         //     une fois sur deux (fil 2358, test RME de 3,8 s).
-        if entree == Entree::FinDePiste {
+        if matches!(entree, Entree::FinDePiste | Entree::RepriseDeContexte) {
             // La garde réseau de `play_inner` (`DUPLICATE_NET_PLAY_WINDOW`,
             // 12 s) avalerait la même relance sur un renderer réseau : la
             // piste qui vient de finir y est inscrite comme « déjà envoyée ».
@@ -3495,6 +3498,7 @@ impl PlaybackOrchestrator {
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(zone_id, "stopped")
             .ok();
+        self.annuler_preparation_fichier(zone_id).await;
         self.cleanup_gapless_session(zone_id).await;
         self.prefetch.clear().await;
         // Forget the last network-play record so a stop→replay of the SAME track

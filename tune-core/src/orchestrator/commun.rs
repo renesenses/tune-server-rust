@@ -172,6 +172,16 @@ impl PlaybackOrchestrator {
     }
 
     pub(super) async fn resolve_stream(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
+        if let Some(resolu) = self.reprendre_preparation_fichier(req).await {
+            return resolu;
+        }
+        self.resolve_stream_frais(req).await
+    }
+
+    pub(super) async fn resolve_stream_frais(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<ResolvedStream, String> {
         // #4407 — le traitement lu AVANT la résolution : si un réglage change
         // pendant qu'elle tourne, l'empreinte notée est l'ancienne, et le
         // prochain changement relancera. Jamais l'inverse.
@@ -672,6 +682,12 @@ impl PlaybackOrchestrator {
         })
         .ok();
 
+        if let Err(e) = crate::db::listening_resume::started(
+            &self.db, zone_id, &contexte, source, source_id, title, album, cover_url,
+        ) {
+            tracing::warn!(zone_id, error = %e, "reprise_non_enregistree");
+        }
+
         // NOTE: scrobbling is intentionally NOT dispatched here. It used to fire
         // at play-start, which (a) scrobbled a track the instant it began — so
         // skipping after a few seconds still scrobbled it, ignoring Last.fm's
@@ -843,15 +859,56 @@ impl PlaybackOrchestrator {
             confirmations.noter(zone_id, stream_id, joue && en_attente);
         }
         if !en_attente {
+            if joue {
+                self.memoriser_position_du_lecteur(zone_id, stream_id, position_ms)
+                    .await;
+            }
             return SignalDuLecteur::RienEnAttente;
         }
         if !joue {
             return SignalDuLecteur::PasEncoreDeLecture;
         }
         if self.confirmer_lecture_navigateur(zone_id, stream_id).await {
+            self.memoriser_position_du_lecteur(zone_id, stream_id, position_ms)
+                .await;
             SignalDuLecteur::Confirmee
         } else {
             SignalDuLecteur::RienEnAttente
+        }
+    }
+
+    /// Position MESURÉE par le lecteur du flux courant, jamais une horloge estimée.
+    async fn memoriser_position_du_lecteur(&self, zone_id: i64, stream_id: &str, position_ms: i64) {
+        let state = self.playback.get_state(zone_id).await;
+        if position_ms <= 0
+            || state.state != PlayState::Playing
+            || !state
+                .now_playing
+                .as_ref()
+                .is_some_and(|np| np.stream_id.as_deref() == Some(stream_id))
+            || ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .is_none_or(|zone| zone.output_type.as_deref() != Some("browser"))
+        {
+            return;
+        }
+        self.playback.update_position(zone_id, position_ms).await;
+        let state = self.playback.get_state(zone_id).await;
+        let _ = crate::db::listening_resume::track_position(&self.db, &state);
+        if let Some(np) = state
+            .now_playing
+            .as_ref()
+            .filter(|np| np.source == "podcast")
+            && let Some(url) = np.source_id.as_deref()
+        {
+            let _ = crate::db::listening_resume::podcast_position(
+                &self.db,
+                zone_id,
+                url,
+                state.position_ms,
+            );
         }
     }
 
@@ -949,7 +1006,18 @@ impl PlaybackOrchestrator {
 
     pub(super) async fn persist_position(&self, zone_id: i64) {
         let state = self.playback.get_state(zone_id).await;
+        let _ = crate::db::listening_resume::track_position(&self.db, &state);
         if let Some(ref np) = state.now_playing {
+            if np.source == "podcast" {
+                if let Some(url) = np.source_id.as_deref() {
+                    let _ = crate::db::listening_resume::podcast_position(
+                        &self.db,
+                        zone_id,
+                        url,
+                        state.position_ms,
+                    );
+                }
+            }
             ZoneRepo::with_backend(self.db.clone())
                 .save_playback_position(
                     zone_id,

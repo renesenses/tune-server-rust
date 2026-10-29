@@ -524,7 +524,7 @@ impl QueueEntry {
 // `Box` les réécrirait tous. Une valeur ne vit que le temps d'un ajout à la
 // file, jamais en masse : la taille de l'enum ne coûte rien de mesurable.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueueInput {
     Local {
         track_id: i64,

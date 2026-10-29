@@ -549,7 +549,7 @@ fn repli_sur_la_bio_stockee(
 /// la discographie, mais une fiche ouverte ne doit pas attendre une minute.
 const DELAI_CLOUD_FICHE_SECS: u64 = 10;
 
-fn client_cloud(
+pub(super) fn client_cloud(
     state: &AppState,
 ) -> tune_core::metadata::artist_enrichment::ArtistEnrichmentClient {
     let base = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
@@ -565,7 +565,7 @@ fn client_cloud(
 /// Le MBID sous lequel le cloud connaît l'artiste : le sien, ou celui que la
 /// recherche EXACTE par le nom rend. La résolution est gardée 24 h, un échec
 /// aussi : une fiche ouverte dix fois ne coûte qu'une recherche.
-async fn mbid_cloud(
+pub(super) async fn mbid_cloud(
     state: &AppState,
     client: &mut tune_core::metadata::artist_enrichment::ArtistEnrichmentClient,
     artiste: &tune_core::db::models::Artist,

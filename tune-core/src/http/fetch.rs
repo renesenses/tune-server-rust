@@ -30,11 +30,11 @@ struct EtatCle {
     intervalle: Duration,
 }
 
-/// A minimum-interval limiter keyed by an arbitrary string (typically a host or
-/// service name). Each `acquire(key)` reserves the next free time slot for that
-/// key and sleeps until it, so N concurrent callers are serialised to one
-/// request per interval — with no busy-waiting and no per-call-site magic
-/// numbers.
+/// Limiteur à intervalle minimal par clé (nom d'hôte ou de service).
+/// Chaque autorisation repousse la suivante depuis son instant réel : un
+/// réveil tardif ne permet jamais de rattraper les créneaux manqués en rafale.
+/// Les tâches concurrentes relisent l'état au réveil, y compris les refus
+/// reçus pendant leur attente ; les autres clés restent indépendantes.
 ///
 /// # Intervalle adaptatif (#4805, idée 4 bis — d'après MetaRust)
 ///
@@ -78,24 +78,24 @@ impl RateLimiter {
         }
     }
 
-    /// Block until a request for `key` may proceed, reserving that slot so
-    /// concurrent callers queue behind it one interval apart.
+    /// Attend l'autorisation pour `key`, puis espace la suivante depuis
+    /// cet instant. Aucun verrou n'est conservé pendant le sommeil.
     pub async fn acquire(&self, key: &str) {
-        // Reserve a slot while holding the lock, then release the lock BEFORE
-        // sleeping so other keys aren't blocked and same-key callers each get a
-        // distinct, monotonically spaced slot.
-        let slot = {
-            let mut etats = self.etats();
-            let now = Instant::now();
-            let neuf = self.etat_neuf(now);
-            let etat = etats.entry(key.to_string()).or_insert(neuf);
-            let slot = etat.prochain.max(now);
-            etat.prochain = slot + etat.intervalle;
-            slot
-        };
-        let now = Instant::now();
-        if slot > now {
-            tokio::time::sleep(slot - now).await;
+        loop {
+            let wait = {
+                let mut etats = self.etats();
+                let now = Instant::now();
+                let neuf = self.etat_neuf(now);
+                let etat = etats.entry(key.to_string()).or_insert(neuf);
+                if now >= etat.prochain {
+                    etat.prochain = now + etat.intervalle;
+                    return;
+                }
+                etat.prochain - now
+            };
+            // Le sommeil peut finir en retard ou un autre appel peut avoir
+            // repoussé l'échéance : seule la relecture accorde le passage.
+            tokio::time::sleep(wait).await;
         }
     }
 
@@ -322,6 +322,76 @@ mod tests {
         );
     }
 
+    /// Un réveil tardif ne doit pas être rattrapé par une rafale AcoustID.
+    #[tokio::test]
+    async fn acoustid_delayed_wakeup_keeps_three_requests_per_second() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let rl = RateLimiter::per_second(3.0);
+        rl.acquire(CLE_ACOUSTID).await;
+        let pending = rl.acquire(CLE_ACOUSTID);
+        tokio::pin!(pending);
+        poll_fn(|cx| {
+            assert!(pending.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        // Bloquer volontairement cet exécuteur : le créneau de 333 ms est
+        // dépassé avant que la tâche puisse reprendre, comme sur une CI chargée.
+        std::thread::sleep(Duration::from_millis(500));
+        pending.await;
+        let first = Instant::now();
+        for _ in 0..3 {
+            rl.acquire(CLE_ACOUSTID).await;
+        }
+        let elapsed = first.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(999),
+            "4 requêtes AcoustID après un réveil tardif en {elapsed:?} : plus de 3/s"
+        );
+    }
+
+    /// Des tâches déjà en attente relisent aussi un refus reçu entre-temps.
+    #[tokio::test]
+    async fn rate_limiter_pending_callers_respect_backoff() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let rl = RateLimiter::with_interval(Duration::from_millis(50));
+        rl.acquire("k").await;
+        let a = rl.acquire("k");
+        let b = rl.acquire("k");
+        tokio::pin!(a, b);
+        poll_fn(|cx| {
+            assert!(a.as_mut().poll(cx).is_pending());
+            assert!(b.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        rl.constater("k", 503, None);
+        let refusal = Instant::now();
+        let (first, second) = tokio::join!(
+            async {
+                a.await;
+                Instant::now()
+            },
+            async {
+                b.await;
+                Instant::now()
+            },
+        );
+        let (first, second) = (first.min(second), first.max(second));
+        assert!(
+            first.duration_since(refusal) >= Duration::from_millis(99),
+            "une attente en cours a ignoré le refus"
+        );
+        assert!(
+            second.duration_since(first) >= Duration::from_millis(99),
+            "les attentes concurrentes doivent rester espacées après un refus"
+        );
+    }
+
     /// #4805 (4 bis) — un 503 double l'intervalle, jusqu'à 5 s, et un succès
     /// le ramène à la base.
     #[test]
@@ -350,11 +420,8 @@ mod tests {
     /// l'intervalle doublé, pas l'ancien ; après un succès, les créneaux
     /// suivants reviennent à l'intervalle de base.
     ///
-    /// Le retour à la base se lit dans les créneaux RÉSERVÉS, pas à
-    /// l'horloge : mesurer l'attente de la 4e requête dépendait de l'heure de
-    /// réveil de la 3e, et un réveil tardif de tokio sur une machine chargée
-    /// la raccourcissait sous 90 ms (77 ms mesurés en CI, 76 ms reproduits
-    /// sur Shrek en épinglant le test sur un cœur occupé).
+    /// Les bornes portent sur l'autorisation effective, pas sur le créneau
+    /// prévu : un réveil tardif doit repousser aussi la requête suivante.
     #[tokio::test]
     async fn apres_un_refus_la_requete_suivante_attend_l_intervalle_double() {
         let rl = RateLimiter::with_interval(Duration::from_millis(100));
@@ -374,14 +441,15 @@ mod tests {
             "attendu ~200 ms après un 503, mesuré {:?}",
             avant_refus.elapsed()
         );
-        // Ce créneau-là a été réservé avec l'intervalle doublé.
-        assert_eq!(prochain(&rl), creneau + Duration::from_millis(200));
+        // L'autorisation réelle conserve l'intervalle doublé, même en retard.
+        assert!(prochain(&rl) >= creneau + Duration::from_millis(200));
+        assert!(prochain(&rl) <= Instant::now() + Duration::from_millis(200));
         rl.constater("k", 200, None);
         let avant = prochain(&rl);
         rl.acquire("k").await;
-        assert_eq!(
-            prochain(&rl),
-            avant + Duration::from_millis(100),
+        assert!(prochain(&rl) >= avant + Duration::from_millis(100));
+        assert!(
+            prochain(&rl) <= Instant::now() + Duration::from_millis(100),
             "après un succès, l'intervalle doit revenir à 100 ms"
         );
     }

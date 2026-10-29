@@ -34,6 +34,7 @@ pub mod ecoute;
 pub mod ensembles;
 pub mod globe;
 pub mod lecture;
+pub mod messagerie;
 pub mod notifications;
 pub mod playlists;
 pub mod rayons;
@@ -185,6 +186,7 @@ impl TunePlugin for CirclePlugin {
         let suivi = Arc::new(suivi::Suivi::new(relais.clone(), ctx.event_bus.clone()));
         ctx.register_router(
             routes::router(relais.clone(), self.services.license.clone())
+                .layer(axum::Extension(vignettes.clone()))
                 .merge(routes::router_des_vignettes(relais, vignettes.clone()))
                 .merge(rayons::router(pousseur.clone()))
                 .merge(playlists::router(collaboratif))

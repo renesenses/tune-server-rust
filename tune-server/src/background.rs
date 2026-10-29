@@ -3140,7 +3140,27 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Vec<tune_core::outputs::local::AudioDevice>>,
 {
-    if any_local_output_playing(state).await {
+    parc_local_sans_couper_la_lecture_selon_os(state, std::env::consts::OS, enumerer).await
+}
+
+/// Le système est explicite pour vérifier la règle Linux sans sonder de
+/// matériel, y compris quand les tests ciblés tournent sur le Mac (#7263).
+#[cfg(feature = "local-audio")]
+async fn parc_local_sans_couper_la_lecture_selon_os<F, Fut>(
+    state: &AppState,
+    os: &str,
+    enumerer: F,
+) -> Vec<tune_core::outputs::local::AudioDevice>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Vec<tune_core::outputs::local::AudioDevice>>,
+{
+    // #7263 — les routes de lecture du parc doivent respecter la même
+    // garde Linux que le rescan périodique : FIP sur un renderer réseau ne
+    // justifie pas de rouvrir les greffons ALSA à chaque lecture de la fiche.
+    let lecture_locale = any_local_output_playing(state).await;
+    let lecture_reseau_sous_linux = os == "linux" && any_zone_playing(state).await;
+    if lecture_locale || lecture_reseau_sous_linux {
         tune_core::outputs::local::cached_audio_devices()
     } else {
         enumerer().await
@@ -3161,7 +3181,7 @@ mod sortie_locale_disparue_6551_tests;
 /// re-probing PipeWire while music plays for hours drives runaway pipewire
 /// memory growth (JeromeQ, #1257). Network renderers don't use PipeWire, but a
 /// long radio session to one is exactly when the useless re-probing piles up.
-#[cfg(all(feature = "local-audio", target_os = "linux"))]
+#[cfg(feature = "local-audio")]
 async fn any_zone_playing(state: &AppState) -> bool {
     state
         .playback

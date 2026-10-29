@@ -584,13 +584,26 @@ async fn depart_hors_bannis(
     }
 }
 
+fn persist_play_queue(state: &AppState, zone_id: i64, shuffled: bool) {
+    if shuffled
+        && let Err(error) =
+            tune_core::db::listening_resume::mark_current_shuffled(&state.backend, zone_id)
+    {
+        tracing::warn!(zone_id, %error, "reprise_ordre_client_non_enregistre");
+    }
+    persist_queue_async(state, zone_id);
+}
+
 /// Persist the queue state for a zone to disk (non-blocking).
-fn persist_queue_async(state: &AppState, zone_id: i64) {
+pub(super) fn persist_queue_async(state: &AppState, zone_id: i64) {
     let db = state.backend.clone();
     let db_path = state.config.db_path.clone();
     let playback = state.playback.clone();
     tokio::spawn(async move {
         let zone_state = playback.get_state(zone_id).await;
+        if let Err(e) = tune_core::db::listening_resume::refresh_started(&db, &zone_state) {
+            tracing::warn!(zone_id, error = %e, "reprise_suite_non_actualisee");
+        }
         // #6526 — l'ordre d'avant l'aléatoire voyage avec l'instantané, pour
         // être rétabli même après un redémarrage.
         let ordre_d_origine = playback.ordre_d_origine(zone_id);
@@ -1106,6 +1119,8 @@ fn position_du_titre_dans_l_album(
 
 #[derive(Deserialize, Default)]
 struct PlayRequest {
+    #[serde(default)]
+    context_shuffle: bool,
     track_id: Option<i64>,
     track_ids: Option<Vec<i64>>,
     album_id: Option<i64>,
@@ -2255,9 +2270,22 @@ async fn ancrer_position_demandee(
 /// `Seek` de la relecture (#2893). Sans reprise, rien ne change.
 async fn lancer_la_lecture(
     state: &AppState,
-    orch_req: tune_core::orchestrator::PlayRequest,
+    mut orch_req: tune_core::orchestrator::PlayRequest,
     reprise: Option<u64>,
 ) -> Result<tune_core::orchestrator::PlayResult, String> {
+    // Une lecture ou reprise générique doit respecter les mêmes restrictions
+    // que le bouton de lecture de la fiche radio.
+    if orch_req.source.as_deref() == Some("radio")
+        && let Some(url) = orch_req.source_id.as_deref()
+    {
+        let selected = super::radios::geofencing::stream_for_url(state, url)
+            .map_err(|error| error.message())?;
+        tune_core::poller::logo_de_lancement::retenir_le_logo_de_lancement(
+            &selected,
+            orch_req.cover_url.as_deref(),
+        );
+        orch_req.source_id = Some(selected);
+    }
     if reprise.is_some() {
         state
             .orchestrator
@@ -2299,6 +2327,7 @@ async fn play(
     // chaque requete : c'est elle qui decide dans quelle langue un refus se
     // lit (#3672). Relevee une fois, passee a tous les refus de ce handler.
     let lang = crate::i18n::lang_from_header(&headers);
+    let context_shuffle = body.as_ref().is_some_and(|Json(b)| b.context_shuffle);
     // #3966 (jumeau du seek) — `start_index` négatif refusé avant la moindre
     // écriture, y compris le marquage du profil de session juste dessous.
     if let Err(refus) = body
@@ -2402,7 +2431,7 @@ async fn play(
                                  mais la longueur de file n'a pas pu être relue"
                             ),
                         }
-                        persist_queue_async(&state, zone_id);
+                        persist_play_queue(&state, zone_id, context_shuffle);
                         Json(build_zone_json_with_result(&state, zone_id, &result).await)
                             .into_response()
                     }
@@ -2794,7 +2823,7 @@ async fn play(
                     .playback
                     .update_queue_info(zone_id, start as i64, tracks.len() as i64)
                     .await;
-                persist_queue_async(&state, zone_id);
+                persist_play_queue(&state, zone_id, context_shuffle);
                 // DIRE ce qui a ete enjambe. Une piste indisponible passee sous
                 // silence est exactement ce qui fait croire a une panne : Alex
                 // n'a eu ni son ni message. Les deux champs sont ADDITIFS — un
@@ -2960,7 +2989,7 @@ async fn play(
                     .playback
                     .update_queue_info(zone_id, start as i64, tracks.len() as i64)
                     .await;
-                persist_queue_async(&state, zone_id);
+                persist_play_queue(&state, zone_id, context_shuffle);
                 // DIRE ce qui a ete enjambe. Une piste indisponible passee sous
                 // silence est exactement ce qui fait croire a une panne : Alex
                 // n'a eu ni son ni message. Les deux champs sont ADDITIFS — un
@@ -3135,7 +3164,7 @@ async fn play(
                             .playback
                             .update_queue_info(zone_id, position, longueur)
                             .await;
-                        persist_queue_async(&state, zone_id);
+                        persist_play_queue(&state, zone_id, context_shuffle);
                     }
                     FileDejaChargee::RemplacerParCeTitre => {
                         let (album_ref_ligne, artist_ref_ligne) =
@@ -3173,7 +3202,7 @@ async fn play(
                             "file_de_lecture_ecrite"
                         );
                         state.playback.update_queue_info(zone_id, 0, 1).await;
-                        persist_queue_async(&state, zone_id);
+                        persist_play_queue(&state, zone_id, context_shuffle);
                     }
                     FileDejaChargee::NePasToucher => {
                         // La base n'a pas repondu. On ne sait pas ce que la file
@@ -3329,7 +3358,7 @@ async fn play(
             ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
             return match lancer_la_lecture(&state, orch_req, reprise).await {
                 Ok(result) => {
-                    persist_queue_async(&state, zone_id);
+                    persist_play_queue(&state, zone_id, context_shuffle);
                     Json(build_zone_json_with_result(&state, zone_id, &result).await)
                         .into_response()
                 }
@@ -3355,7 +3384,7 @@ async fn play(
             state.playback.update_queue_info(zone_id, pos, q_len).await;
             return match state.orchestrator.play_from_queue(zone_id, pos).await {
                 Ok(result) => {
-                    persist_queue_async(&state, zone_id);
+                    persist_play_queue(&state, zone_id, context_shuffle);
                     Json(build_zone_json_with_result(&state, zone_id, &result).await)
                         .into_response()
                 }
@@ -3581,7 +3610,7 @@ async fn play(
                 .playback
                 .update_queue_info(zone_id, queue_position, q_len)
                 .await;
-            persist_queue_async(&state, zone_id);
+            persist_play_queue(&state, zone_id, context_shuffle);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
         Err(e) => play_error_response(e, &lang),
@@ -6533,7 +6562,16 @@ pub(crate) async fn do_transfer(
             )
             .await
     {
-        return output_command_error_response(error);
+        return match error {
+            tune_core::orchestrator::ErreurDeTransfert::Commande(error) => {
+                output_command_error_response(error)
+            }
+            tune_core::orchestrator::ErreurDeTransfert::Lancement(message) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "transfer_target_play_failed", "message": message})),
+            )
+                .into_response(),
+        };
     }
 
     if stop_source {
@@ -7738,6 +7776,7 @@ pub async fn shuffle_all(
                 .playback
                 .update_queue_info(zone_id, 0, all_ids.len() as i64)
                 .await;
+            persist_play_queue(&state, zone_id, true);
             let mut resp = reponse_shuffle(zone_id, all_ids.len(), disponibles, result.output_sent);
             if let Some(ref err) = result.error {
                 resp.as_object_mut()
@@ -10428,3 +10467,7 @@ mod lecture_d_une_playlist_a_lignes_introuvables_6179 {
         assert_eq!(sans_les_introuvables(lignes, None).1, None);
     }
 }
+
+#[cfg(test)]
+#[path = "playback/echec_transfert_6155_tests.rs"]
+mod echec_transfert_6155_tests;

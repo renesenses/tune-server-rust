@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use tune_core::cloud::plugins::PluginMarketplace;
 use tune_core::cloud::rate_limit::{self, CloudScope};
-use tune_core::cloud::sso::{MozaikAuth, PkceSession, ProfilCloud};
+use tune_core::cloud::sso::{MozaikAuth, PageConnexion, PkceSession, ProfilCloud};
 use tune_core::cloud::telemetry::TelemetryReporter;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -179,7 +179,28 @@ fn page_echec_compte(
     page_connexion_compte(headers, statut, &message, None)
 }
 
-async fn sso_authorize(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+/// Langue et thème de l'interface que le client web transmet (`ui_locales`,
+/// `theme`), ou rien. Lus à la main dans la requête : une valeur répétée ou
+/// illisible ne doit JAMAIS faire refuser la connexion, elle est ignorée.
+pub(crate) fn page_connexion_demandee(requete: &[(String, String)]) -> PageConnexion {
+    let premiere = |cle: &str| {
+        requete
+            .iter()
+            .find(|(k, _)| k == cle)
+            .map(|(_, v)| v.as_str())
+    };
+    PageConnexion::valider(
+        premiere("ui_locales"),
+        premiere("theme"),
+        crate::i18n::SUPPORTED,
+    )
+}
+
+async fn sso_authorize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(requete): Query<Vec<(String, String)>>,
+) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
         // sso_authorize is a full browser navigation, so degrade to a friendly
@@ -223,7 +244,8 @@ async fn sso_authorize(State(state): State<AppState>, headers: HeaderMap) -> imp
     // Persist the exact redirect_uri: OAuth requires the token exchange in the
     // callback to present an identical value.
     settings.set("mozaik_redirect_uri_pending", &uri).ok();
-    let url = auth.authorize_url(&uri, &pkce.challenge, &pkce.state);
+    let page = page_connexion_demandee(&requete);
+    let url = auth.authorize_url_avec_page(&uri, &pkce.challenge, &pkce.state, &page);
     Redirect::temporary(&url).into_response()
 }
 
@@ -2497,5 +2519,52 @@ mod reconcile_tests {
             Mode::Appliquer,
             "seule une demande EXPLICITE doit mettre en file"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_page_connexion_b209sso {
+    use super::page_connexion_demandee;
+
+    fn q(paires: &[(&str, &str)]) -> Vec<(String, String)> {
+        paires
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn valeur_valide_prise_telle_quelle() {
+        let p = page_connexion_demandee(&q(&[("ui_locales", "de"), ("theme", "clear-grey")]));
+        assert_eq!(p.langue.as_deref(), Some("de"));
+        assert_eq!(p.theme.as_deref(), Some("clear-grey"));
+    }
+
+    #[test]
+    fn valeur_absente_donne_rien() {
+        let p = page_connexion_demandee(&q(&[("autre", "x")]));
+        assert_eq!((p.langue, p.theme), (None, None));
+    }
+
+    #[test]
+    fn injection_ignoree_sans_erreur() {
+        let p = page_connexion_demandee(&q(&[
+            ("ui_locales", "fr&redirect_uri=https://evil.example"),
+            ("theme", "brown&state=x"),
+        ]));
+        assert_eq!((p.langue, p.theme), (None, None));
+    }
+
+    #[test]
+    fn langue_hors_du_serveur_ignoree() {
+        // « pt » n'est pas une langue du serveur (le polonais l'est depuis la rc9).
+        let p = page_connexion_demandee(&q(&[("ui_locales", "pt")]));
+        assert_eq!(p.langue, None);
+    }
+
+    #[test]
+    fn valeur_repetee_premiere_retenue() {
+        let p = page_connexion_demandee(&q(&[("theme", "brown"), ("theme", "evil")]));
+        assert_eq!(p.theme.as_deref(), Some("brown"));
     }
 }
