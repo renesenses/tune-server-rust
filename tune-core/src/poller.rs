@@ -506,6 +506,7 @@ pub mod fsm;
 pub const ECHECS_SONDAGE_DETAILLES: u32 = 5;
 
 mod etat;
+mod tune_tested_auto;
 use etat::*;
 
 pub mod logo_de_lancement;
@@ -558,6 +559,7 @@ pub(crate) fn vignette_du_pas_radio(
 }
 
 pub struct PositionPoller {
+    observateur_tune_tested: std::sync::Mutex<crate::cloud::tune_tested_auto::Observateur>,
     orchestrator: Arc<PlaybackOrchestrator>,
     playback: Arc<PlaybackManager>,
     outputs: Arc<Mutex<OutputRegistry>>,
@@ -634,6 +636,7 @@ impl PositionPoller {
         shared_metrics: PollerMetricsMap,
     ) -> Self {
         Self {
+            observateur_tune_tested: std::sync::Mutex::default(),
             orchestrator,
             playback,
             outputs,
@@ -1556,3 +1559,6 @@ mod annonce_du_contrat_de_signal_4559;
 /// et rejoue les deux coupures du journal, plus la contre-garde.
 #[cfg(test)]
 mod arret_dementi_par_la_position_6717;
+
+#[cfg(test)]
+mod fin_upnp_6634_tests;

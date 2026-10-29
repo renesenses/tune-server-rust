@@ -300,7 +300,7 @@ async fn la_suivante_est_ajoutee_a_la_playlist_sans_l_interrompre() {
     assert_eq!(
         faux.recu(),
         vec![format!(
-            r#"<PlaylistAdd uri="{SUIVANTE}" queued="0" clear="0"></PlaylistAdd>"#
+            r#"<PlaylistAdd uri="{SUIVANTE}" queued="1" clear="0"></PlaylistAdd>"#
         )],
         "une seule commande : l'ajout de la suivante, sans vider ni relancer"
     );

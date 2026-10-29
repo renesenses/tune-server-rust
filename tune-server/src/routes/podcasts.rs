@@ -221,12 +221,15 @@ fn echec_de_resolution(e: &EchecResolution) -> AppError {
     }
 }
 #[derive(Deserialize)]
-struct PlayEpisodeRequest {
-    audio_url: String,
-    title: Option<String>,
-    podcast_name: Option<String>,
-    cover_url: Option<String>,
-    duration_ms: Option<u64>,
+pub(super) struct PlayEpisodeRequest {
+    pub(super) audio_url: String,
+    pub(super) title: Option<String>,
+    pub(super) podcast_name: Option<String>,
+    pub(super) podcast_id: Option<String>,
+    pub(super) cover_url: Option<String>,
+    pub(super) duration_ms: Option<u64>,
+    #[serde(default)]
+    pub(super) seek_ms: Option<u64>,
 }
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -699,7 +702,7 @@ async fn podcast_episodes(
         ),
     }
 }
-async fn play_episode(
+pub(super) async fn play_episode(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Json(body): Json<PlayEpisodeRequest>,
@@ -773,7 +776,19 @@ async fn play_episode(
         ..Default::default()
     };
     // #6465 — un épisode n'appartient à aucun album ni playlist joué avant.
-    state.playback.effacer_contexte_de_session(zone_id).await;
+    state
+        .playback
+        .set_session_context(
+            zone_id,
+            Some("podcast".into()),
+            body.podcast_id
+                .clone()
+                .or_else(|| body.podcast_name.clone()),
+            Some("podcast".into()),
+            body.podcast_name.clone(),
+            np.cover_path.clone(),
+        )
+        .await;
     state.playback.play(zone_id, np).await;
     // #6468 — un échec n'est plus un `200` : la réponse porte un vrai code
     // HTTP et un `code` stable, que le client peut afficher.
@@ -820,6 +835,36 @@ async fn play_episode(
         output_sent,
         "podcast_episode_play"
     );
+    if echec.is_none() {
+        if let Some(seek_ms) = body.seek_ms.filter(|v| *v > 0) {
+            if let Err(e) = state
+                .orchestrator
+                .seek(zone_id, seek_ms, device_id.as_deref())
+                .await
+            {
+                state.playback.stop(zone_id).await;
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": e.to_string(), "code": "podcast_resume_seek_failed"})),
+                )
+                    .into_response();
+            }
+        }
+        if output_sent {
+            let s = state.playback.get_state(zone_id).await;
+            if let Some(np) = s.now_playing.as_ref() {
+                if let Err(e) = tune_core::db::listening_resume::podcast_started_in_context(
+                    &state.backend,
+                    zone_id,
+                    np,
+                    s.position_ms,
+                    body.podcast_id.as_deref(),
+                ) {
+                    warn!(zone_id, error = %e, "reprise_podcast_non_enregistree");
+                }
+            }
+        }
+    }
     let zone_state = state.playback.get_state(zone_id).await;
     let statut = echec.as_ref().map_or(StatusCode::OK, |(s, _, _)| *s);
     let code = echec.as_ref().map(|(_, c, _)| *c);

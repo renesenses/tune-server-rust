@@ -48,6 +48,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # Refuser les traductions absentes avant toute compilation du train.
+      - name: Vérifier les notes multilingues du tag (#6856)
+        run: python3 scripts/assembler-notes-release.py --tag "$GITHUB_REF_NAME" --output "$RUNNER_TEMP/RELEASE_NOTES.md"
+
       - name: Verify generated plugin lists
         run: python scripts/plugin-catalog.py --check
       # Symetrique de « Verify web-client version matches release tag », plus
@@ -1518,6 +1522,9 @@ jobs:
           sparse-checkout: |
             scripts/creer-alias-actifs-release.sh
             scripts/canal-de-release.sh
+            scripts/assembler-notes-release.py
+            .github/scripts/forme-des-notes.awk
+            tune-server/src/i18n.rs
             .release/
           sparse-checkout-cone-mode: false
 
@@ -1528,6 +1535,9 @@ jobs:
       # par un tag n'a pas d'entree ; c'est donc le MANIFESTE du train, fige
       # sur le commit tague et revu en PR, qui porte le choix :
       # `"prerelease": false`. Sans ce champ, la regle d'avant s'applique.
+      - name: Assembler les notes relues dans toutes les langues (#6856)
+        run: python3 scripts/assembler-notes-release.py --tag "$GITHUB_REF_NAME" --output RELEASE_NOTES.md
+
       - name: Pre-version ou Latest (manifeste du train)
         id: canal
         shell: bash
@@ -1666,7 +1676,8 @@ jobs:
             artifacts/**/*.dmg
             artifacts/**/*.exe
             SHA256SUMS*
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: false
           # Tranche par `scripts/canal-de-release.sh` (etape « canal » plus
           # haut) : le champ `prerelease` du manifeste s'il existe, sinon un
           # `-` dans le tag. Une pre-version reste hors du creneau Latest, pour

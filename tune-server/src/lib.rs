@@ -87,6 +87,9 @@ pub mod windows_migrate;
 mod pauses_de_fond_tests;
 
 #[cfg(test)]
+mod scan_cue_heritage_6459_tests;
+
+#[cfg(test)]
 mod aleatoire_selection_5526_tests;
 // #5512 : compilé partout, actif seulement en build de test (lib ET
 // intégration) — voir `isolement_disque_tests_5467::actif`.

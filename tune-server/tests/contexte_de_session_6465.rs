@@ -87,15 +87,28 @@ async fn un_podcast_joue_apres_un_album_n_en_herite_pas_le_contexte() {
     let status = poster(
         &app,
         "/api/v1/podcasts/play/1",
-        json!({"audio_url": "http://127.0.0.1:9/episode.mp3", "title": "Épisode"}),
+        json!({"audio_url": "http://127.0.0.1:9/episode.mp3", "title": "Épisode", "podcast_id": "podcast-sans-album", "podcast_name": "Podcast"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         contexte(&state).await,
-        (None, None),
+        (Some("podcast".into()), Some("podcast-sans-album".into())),
         "le podcast a gardé le contexte de l'album 101 : l'Historique le range dans l'album"
     );
+    // Ancien client sans identifiant : aucun album ni podcast précédent ne fuit.
+    assert_eq!(
+        poster(
+            &app,
+            "/api/v1/podcasts/play/1",
+            json!({
+                "audio_url": "http://127.0.0.1:9/autre-episode.mp3", "title": "Autre épisode"
+            })
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(contexte(&state).await, (Some("podcast".into()), None));
 }
 
 #[tokio::test]
