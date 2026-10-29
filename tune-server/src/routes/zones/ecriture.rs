@@ -1611,3 +1611,62 @@ pub(super) async fn rename_zone(
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
+
+#[cfg(test)]
+mod teac_7371 {
+    use super::*;
+
+    #[tokio::test]
+    async fn la_zone_demandee_en_dlna_reste_attachee_a_la_sortie_dlna() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let airplay = repo
+            .create("TEAC NT-505X", Some("airplay"), Some("airplay-teac"))
+            .unwrap();
+        repo.set_host(airplay, "192.0.2.50").unwrap();
+        let dlna = tune_core::outputs::dlna::DlnaOutput::new(
+            "TEAC NT-505X".into(),
+            "uuid:teac-dlna".into(),
+            "192.0.2.50".into(),
+            "http://192.0.2.50/av".into(),
+            "http://192.0.2.50/rc".into(),
+            None,
+        );
+        state.outputs.lock().await.register(Box::new(dlna));
+        let response = create_zone(
+            State(state.clone()),
+            Json(CreateZone {
+                name: "TEAC DLNA".into(),
+                output_type: Some("dlna".into()),
+                output_device_id: Some("uuid:teac-dlna".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert!(response.status().is_success());
+        let zone = repo
+            .get_by_device_id("uuid:teac-dlna")
+            .unwrap()
+            .expect("la zone DLNA demandée doit exister");
+        assert_ne!(zone.id, Some(airplay));
+        assert_eq!(zone.output_type.as_deref(), Some("dlna"));
+        assert_eq!(
+            state
+                .outputs
+                .lock()
+                .await
+                .type_of(zone.output_device_id.as_deref().unwrap())
+                .as_deref(),
+            Some("dlna"),
+            "le routage de cette zone doit résoudre la sortie DLNA"
+        );
+        assert_eq!(
+            repo.get(airplay)
+                .unwrap()
+                .unwrap()
+                .output_device_id
+                .as_deref(),
+            Some("airplay-teac")
+        );
+    }
+}

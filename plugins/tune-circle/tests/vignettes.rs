@@ -34,6 +34,7 @@ struct Faux {
     /// album_id → (sha256, source, octets)
     tenues: HashMap<i64, (String, Option<String>, Vec<u8>)>,
     manifestes: usize,
+    envoi_recu: Arc<tokio::sync::Notify>,
     /// Chaque POST reçu : ses éléments, tels quels.
     envois: Vec<Vec<Value>>,
     effacements: usize,
@@ -77,6 +78,7 @@ async fn recevoir(
     noter_jetons(&mut f, &h);
     let items = c["thumbnails"].as_array().cloned().unwrap_or_default();
     f.envois.push(items.clone());
+    f.envoi_recu.notify_one();
     let (mut acceptes, mut refus) = (vec![], vec![]);
     for i in items {
         let id = i["album_id"].as_i64().unwrap();
@@ -162,6 +164,10 @@ struct Banc {
 async fn demarrer() -> Banc {
     let etat: Partage = Arc::new(Mutex::new(Faux::default()));
     let app = Router::new()
+        .route(
+            "/api/v1/circle/circles/{id}/sharing/library",
+            axum::routing::put(|| async { axum::Json(json!({ "ok": true })) }),
+        )
         .route(
             "/api/v1/cloud-library/{server}/thumbnails",
             get(manifeste).post(recevoir).delete(effacer),
@@ -609,4 +615,53 @@ async fn des_pochettes_illisibles_ne_bloquent_pas_le_passage_6733() {
     // Et le passage suivant ne les relit pas.
     let b = v.passage().await;
     assert!(b.rien, "{b:?}");
+}
+
+/// Le réveil conservé avant le lancement doit provoquer un véritable envoi.
+#[tokio::test]
+async fn activation_interrompt_le_delai_initial_6733() {
+    let banc = demarrer().await;
+    let dossier = dossier_de_pochettes();
+    let backend = bibliotheque(&banc, &dossier, 1);
+    let v = Arc::new(vignettes_de(&banc, &backend, &dossier));
+    let recu = banc.etat.lock().unwrap().envoi_recu.clone();
+    let tache = tokio::spawn(v.clone().tourner());
+    // Sur ce runtime mono-thread, la boucle atteint son attente initiale.
+    tokio::task::yield_now().await;
+    assert_eq!(banc.etat.lock().unwrap().envois.len(), 0);
+    assert!(v.regler(true).await);
+    let resultat = tokio::time::timeout(std::time::Duration::from_secs(5), recu.notified()).await;
+    tache.abort();
+    let _ = tache.await;
+    assert!(
+        resultat.is_ok(),
+        "#6733 : activation ignorée pendant les 180 secondes du délai initial"
+    );
+    assert_eq!(banc.etat.lock().unwrap().tenues.len(), 1);
+}
+
+/// Activer le partage de bibliothèque réveille aussi les vignettes.
+#[tokio::test]
+async fn activer_le_partage_reveille_les_vignettes_6733() {
+    let banc = demarrer().await;
+    let dossier = dossier_de_pochettes();
+    let backend = bibliotheque(&banc, &dossier, 1);
+    SettingsRepo::with_backend(backend.clone())
+        .set(CLE_PARTAGE_DE_CERCLE, "false")
+        .unwrap();
+    let v = Arc::new(vignettes_de(&banc, &backend, &dossier));
+    let app = commun::app(backend).layer(axum::Extension(v.clone()));
+    let recu = banc.etat.lock().unwrap().envoi_recu.clone();
+    let tache = tokio::spawn(v.tourner());
+    tokio::task::yield_now().await;
+    let r = appel(&app, "PUT", "/circles/1/sharing/library", None).await;
+    let resultat = tokio::time::timeout(std::time::Duration::from_secs(5), recu.notified()).await;
+    tache.abort();
+    let _ = tache.await;
+    assert_eq!(r.statut, StatusCode::OK);
+    assert!(
+        resultat.is_ok(),
+        "#6733 : activer le partage ne réveille pas les vignettes"
+    );
+    assert_eq!(banc.etat.lock().unwrap().tenues.len(), 1);
 }

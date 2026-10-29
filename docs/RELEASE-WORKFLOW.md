@@ -301,8 +301,34 @@ publication du corps de la release, qui assemble `fr` + blocs `<!-- lang:xx -->`
 dans un seul fichier passé à `gh release edit`. Les langues attendues sont
 celles de `tune-server/src/i18n.rs::SUPPORTED`. Une langue manquante n'est pas
 une panne : la route la replie sur le français en le disant. Ce document décrit
-le contrat ; le branchement dans `release.yml` et le choix du traducteur sont
-instruits dans #3089.
+le contrat. Le §5.7 branche l’assemblage des traductions relues dans
+`release.yml` ; aucun fournisseur externe de traduction n’est ajouté.
+
+### 5.7 Notes relues obligatoires dans le train (#6856)
+
+Avant de poser le tag, préparer et relire un fichier UTF-8 par langue :
+`.release/notes/vX.Y.Z[-prerelease]/fr.md`, `en.md`, etc. La liste exacte est
+lue dans `tune-server/src/i18n.rs::SUPPORTED`, sans seconde liste figée.
+Chaque fichier contient des rubriques et des puces lisibles par le panneau
+(§5.5), sans marqueur `lang:` : l'assembleur ajoute ces marqueurs.
+
+```sh
+python3 scripts/assembler-notes-release.py --tag vX.Y.Z-prerelease --output /tmp/RELEASE_NOTES.md
+```
+
+Ce script assemble les traductions déjà rédigées ; il ne traduit pas le texte,
+ne vérifie pas sa qualité linguistique et n'appelle aucun fournisseur externe.
+Les traductions et leur relecture font partie de la préparation du train.
+Une fixture ou quinze copies du même texte ne sont pas des notes traduites.
+Ne pas remplir les fichiers avec du contenu supposé pour franchir le contrôle.
+
+La release vérifie tous ces fichiers avant les compilations, puis reconstruit
+le même corps sur le commit tagué avant la création du brouillon GitHub.
+Une langue absente, vide ou sans item affichable refuse la création ; les
+notes automatiques GitHub ne remplacent plus les traductions manquantes.
+Ce refus s'applique aux prochains tags : leurs quinze traductions doivent
+être présentes dans le commit du tag. Les corps déjà publiés restent inchangés.
+Le script ne publie rien ; les portes de publication existantes restent en place.
 
 ## Coordination des agents
 

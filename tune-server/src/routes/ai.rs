@@ -1160,3 +1160,7 @@ mod language_directive_tests {
         assert!(language_directive("el").contains("Greek"));
     }
 }
+
+#[cfg(all(test, not(feature = "assistant-ia")))]
+#[path = "ai/query_volume_6836_tests.rs"]
+mod query_volume_6836_tests;

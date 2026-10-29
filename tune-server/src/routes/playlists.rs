@@ -983,7 +983,7 @@ async fn import_m3u_file(
     tracing::info!(name = %name, bytes = file_content.len(), "m3u_import_file_received");
 
     // Parse M3U and match tracks
-    let mut track_ids: Vec<i64> = Vec::new();
+    let mut entrees: Vec<EntryContent> = Vec::new();
     let mut total_entries = 0u32;
     let mut matched = 0u32;
     // Keep only a small SAMPLE of not-found paths for the response; count the
@@ -1036,17 +1036,33 @@ async fn import_m3u_file(
     // lookup_errors always holds.
     let mut lookup_errors = 0u32;
 
-    for line in file_content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    for entree in tune_core::library::m3u_parser::parse_m3u_content(file_content.as_bytes(), true) {
+        let line = entree.path.as_str();
+        total_entries += 1;
+        if let Some(qobuz) = tune_core::library::m3u_parser::entree_qobuz_audirvana(
+            line,
+            entree.title.as_deref(),
+            entree.artist.as_deref(),
+            (entree.duration_s >= 0).then_some(i64::from(entree.duration_s) * 1000),
+        ) {
+            entrees.push(EntryContent::Service(qobuz));
+            matched += 1;
+            continue;
+        }
+        if line
+            .split_once("://")
+            .is_some_and(|(s, _)| s.eq_ignore_ascii_case("qobuz"))
+        {
+            not_found_count += 1;
+            if not_found_paths.len() < MAX_NOT_FOUND_SAMPLE {
+                not_found_paths.push(line.to_string());
+            }
             continue;
         }
 
-        total_entries += 1;
-
         // Exact path match (O(1) map lookup).
         if let Some(info) = path_to_id.get(line) {
-            track_ids.push(info.id);
+            entrees.push(EntryContent::Local(info.id));
             matched += 1;
             continue;
         }
@@ -1063,7 +1079,7 @@ async fn import_m3u_file(
                     if let Some(track) = results.first()
                         && let Some(id) = track.id
                     {
-                        track_ids.push(id);
+                        entrees.push(EntryContent::Local(id));
                         matched += 1;
                         continue;
                     }
@@ -1100,9 +1116,9 @@ async fn import_m3u_file(
     // track insert dropped with `.ok()`, so a failed insert left an empty
     // playlist behind AND answered 201 (#2798).
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.create_with_tracks(&name, None, profile.id(), &track_ids) {
+    match repo.create_with_entries(&name, None, profile.id(), &entrees) {
         Ok((playlist_id, imported)) => {
-            let duplicates_skipped = track_ids.len() - imported.len();
+            let duplicates_skipped = entrees.len() - imported.len();
             tracing::info!(
                 playlist_id,
                 name = %name,
@@ -2483,3 +2499,7 @@ mod badge_de_cercle_6688 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "playlists/import_audirvana_6998_tests.rs"]
+mod import_audirvana_6998_tests;
