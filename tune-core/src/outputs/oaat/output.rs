@@ -9,6 +9,10 @@ use crate::outputs::traits::{
     OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState,
 };
 
+#[cfg(all(test, feature = "oaat"))]
+#[path = "volume_7333_tests.rs"]
+mod volume_7333_tests;
+
 #[cfg(feature = "oaat")]
 use super::helpers::{
     BaseDeTempsOaat, StreamInfo, detect_and_parse, dsd_rate_from_sample_rate, duree_audio_envoyee,
@@ -177,6 +181,7 @@ pub struct OaatOutput {
     /// 16:34:40), then restarted the track from cold.
     chain_exhausted: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
+    volume_annonce: Arc<std::sync::Mutex<super::volume::VolumeOaat>>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
     /// Start position (ms) for the next play_media call. Set by the
@@ -378,6 +383,7 @@ impl OaatOutput {
             // multiroom et l'endpoint : on stocke la meme echelle. L'ancien
             // 800, divise par 255 a la lecture, rapportait un volume de 314 %.
             volume: Arc::new(AtomicU32::new(100)),
+            volume_annonce: Arc::new(std::sync::Mutex::new(Default::default())),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
             pending_start_ms: Arc::new(AtomicU64::new(0)),
@@ -390,6 +396,22 @@ impl OaatOutput {
             play_task: Mutex::new(None),
             diag: Arc::new(OaatDiagnostics::default()),
         }
+    }
+
+    /// Le TXT ne contient que le type ; hello_ack précisera plage et pas.
+    pub fn avec_volume_annonce(self, annonce: Option<&str>) -> Self {
+        self.actualiser_volume_annonce(annonce);
+        self
+    }
+
+    pub fn actualiser_volume_annonce(&self, annonce: Option<&str>) {
+        if let Ok(mut volume) = self.volume_annonce.lock() {
+            volume.annoncer_mdns(annonce);
+        }
+    }
+
+    pub fn a_la_meme_adresse(&self, host: &str, port: u16) -> bool {
+        self.host == host && self.port == port
     }
 
     /// Arm a start position for the next play_media (orchestrator seek path).
@@ -480,6 +502,40 @@ impl OaatOutput {
     }
 }
 
+fn normaliser_volume(
+    etat: &std::sync::Mutex<super::volume::VolumeOaat>,
+    niveau: u8,
+) -> Result<u8, String> {
+    etat.lock()
+        .map_err(|_| "OAAT : contrat de volume indisponible".to_string())?
+        .normaliser(niveau)
+}
+fn volume_pilotable(etat: &std::sync::Mutex<super::volume::VolumeOaat>) -> bool {
+    etat.lock().map(|v| v.pilotable()).unwrap_or(false)
+}
+#[cfg(feature = "oaat")]
+fn annoncer_volume(
+    etat: &std::sync::Mutex<super::volume::VolumeOaat>,
+    endpoint: &oaat_controller::ConnectedEndpoint,
+) {
+    if let Ok(mut volume) = etat.lock() {
+        volume.annoncer_hello(endpoint.info.capabilities.volume.as_ref());
+    }
+}
+#[cfg(feature = "oaat")]
+async fn transmettre_volume(
+    endpoint: &mut oaat_controller::ConnectedEndpoint,
+    annonce: &std::sync::Mutex<super::volume::VolumeOaat>,
+    courant: &AtomicU32,
+    niveau: u8,
+) {
+    if let Ok(niveau) = normaliser_volume(annonce, niveau)
+        && endpoint.send_volume(niveau).await.is_ok()
+    {
+        courant.store(u32::from(niveau), Ordering::SeqCst);
+    }
+}
+
 #[cfg(feature = "oaat")]
 const FLAC_CHUNK_SIZE: usize = 4096;
 #[cfg(feature = "oaat")]
@@ -511,6 +567,7 @@ async fn connect_and_setup(
     stream_id: &str,
     stream_info: &StreamInfo,
     refus_negociation: &Arc<std::sync::Mutex<Option<String>>>,
+    volume_annonce: &Arc<std::sync::Mutex<super::volume::VolumeOaat>>,
 ) -> Option<oaat_controller::ConnectedEndpoint> {
     let mut endpoint = match oaat_controller::ConnectedEndpoint::connect(config, endpoint_addr)
         .await
@@ -524,6 +581,8 @@ async fn connect_and_setup(
             return None;
         }
     };
+
+    annoncer_volume(volume_annonce, &endpoint);
 
     // Quick clock sync (2 exchanges instead of full 10)
     match tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -608,15 +667,19 @@ impl OutputTarget for OaatOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(
-            true,
-            true,
-            true,
-            true,
-            true,
-            self.supports_internal_gapless(),
-        )
-        .with_percent_volume()
+        self.volume_annonce
+            .lock()
+            .map(|v| v.capacites(self.supports_internal_gapless()))
+            .unwrap_or_else(|_| {
+                OutputCapabilities::v1(
+                    true,
+                    true,
+                    true,
+                    false,
+                    false,
+                    self.supports_internal_gapless(),
+                )
+            })
     }
 
     /// OAAT genuinely chains tracks internally in BOTH modes, so it always
@@ -690,6 +753,8 @@ impl OutputTarget for OaatOutput {
 
         let endpoint_addr = self.endpoint_addr();
         let playing = self.playing.clone();
+        let volume_annonce = self.volume_annonce.clone();
+        let niveau_volume = self.volume.clone();
         let paused = self.paused.clone();
         let native_dsd_active = self.native_dsd_active.clone();
         let direct_pcm_active = self.direct_pcm_active.clone();
@@ -820,6 +885,7 @@ impl OutputTarget for OaatOutput {
                         if let Ok(mut place) = diag.derniere_cause_de_connexion.lock() {
                             *place = None;
                         }
+                        annoncer_volume(&volume_annonce, &ep);
                         endpoint = Some(ep);
                         break;
                     }
@@ -1131,10 +1197,18 @@ impl OutputTarget for OaatOutput {
                                 while let Ok(cmd) = command_rx.try_recv() {
                                     match cmd {
                                         OaatCommand::SetVolume(level) => {
-                                            endpoint.send_volume(level).await.ok();
+                                            transmettre_volume(
+                                                &mut endpoint,
+                                                &volume_annonce,
+                                                &niveau_volume,
+                                                level,
+                                            )
+                                            .await;
                                         }
                                         OaatCommand::Mute(muted) => {
-                                            endpoint.send_mute(muted).await.ok();
+                                            if volume_pilotable(&volume_annonce) {
+                                                endpoint.send_mute(muted).await.ok();
+                                            }
                                         }
                                         OaatCommand::Pause => {
                                             paused.store(true, Ordering::SeqCst);
@@ -1293,10 +1367,18 @@ impl OutputTarget for OaatOutput {
                                             }
                                             OaatCommand::Pause => {}
                                             OaatCommand::SetVolume(level) => {
-                                                endpoint.send_volume(level).await.ok();
+                                                transmettre_volume(
+                                                    &mut endpoint,
+                                                    &volume_annonce,
+                                                    &niveau_volume,
+                                                    level,
+                                                )
+                                                .await;
                                             }
                                             OaatCommand::Mute(muted) => {
-                                                endpoint.send_mute(muted).await.ok();
+                                                if volume_pilotable(&volume_annonce) {
+                                                    endpoint.send_mute(muted).await.ok();
+                                                }
                                             }
                                             OaatCommand::Seek {
                                                 position_ms: seek_pos,
@@ -1930,10 +2012,18 @@ impl OutputTarget for OaatOutput {
                         while let Ok(cmd) = command_rx.try_recv() {
                             match cmd {
                                 OaatCommand::SetVolume(level) => {
-                                    endpoint.send_volume(level).await.ok();
+                                    transmettre_volume(
+                                        &mut endpoint,
+                                        &volume_annonce,
+                                        &niveau_volume,
+                                        level,
+                                    )
+                                    .await;
                                 }
                                 OaatCommand::Mute(muted) => {
-                                    endpoint.send_mute(muted).await.ok();
+                                    if volume_pilotable(&volume_annonce) {
+                                        endpoint.send_mute(muted).await.ok();
+                                    }
                                 }
                                 OaatCommand::Pause => paused.store(true, Ordering::SeqCst),
                                 OaatCommand::Resume => {
@@ -2289,6 +2379,7 @@ impl OutputTarget for OaatOutput {
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 match ConnectedEndpoint::connect(&config, endpoint_addr).await {
                     Ok(ep) => {
+                        annoncer_volume(&volume_annonce, &ep);
                         endpoint = ep;
                         surveiller_liberation(
                             &mut endpoint,
@@ -2510,6 +2601,7 @@ impl OutputTarget for OaatOutput {
                                     &stream_id,
                                     &cur_stream_info,
                                     &refus_negociation,
+                                    &volume_annonce,
                                 ).await {
                                     Some(new_ep) => {
                                         endpoint = new_ep;
@@ -2568,8 +2660,8 @@ impl OutputTarget for OaatOutput {
                                     }
                                 }
                             }
-                            OaatCommand::SetVolume(level) => { endpoint.send_volume(level).await.ok(); }
-                            OaatCommand::Mute(muted) => { endpoint.send_mute(muted).await.ok(); }
+                            OaatCommand::SetVolume(level) => { transmettre_volume(&mut endpoint, &volume_annonce, &niveau_volume, level).await; }
+                            OaatCommand::Mute(muted) => { if volume_pilotable(&volume_annonce) { endpoint.send_mute(muted).await.ok(); } }
                             OaatCommand::Seek { position_ms: seek_pos } => {
                                 // Tell endpoint about seek
                                 endpoint.send_message(&oaat_core::Message::Seek(oaat_core::message::Seek {
@@ -3159,6 +3251,7 @@ impl OutputTarget for OaatOutput {
                                         &stream_id,
                                         &cur_stream_info,
                                         &refus_negociation,
+                                    &volume_annonce,
                                     ).await {
                                         Some(new_ep) => {
                                             endpoint = new_ep;
@@ -3352,11 +3445,15 @@ impl OutputTarget for OaatOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
+        if !volume.is_finite() {
+            return Err("OAAT : volume non fini".into());
+        }
         // 0–100, l'echelle du protocole (identique a multiroom.rs). Le *255
         // precedent saturait l'endpoint des ~40 % dans l'interface : le RPi
         // plafonne a 100 (amixer), donc tout ce qui depassait sortait a fond,
         // et une zone OAAT seule jouait bien plus fort qu'une sortie locale.
         let level = (volume.clamp(0.0, 1.0) * 100.0).round() as u8;
+        let level = normaliser_volume(&self.volume_annonce, level)?;
         self.volume.store(level as u32, Ordering::SeqCst);
         #[cfg(feature = "oaat")]
         if let Some(tx) = self.command_tx.lock().await.as_ref() {
@@ -3366,6 +3463,9 @@ impl OutputTarget for OaatOutput {
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
+        if !volume_pilotable(&self.volume_annonce) {
+            return Err("OAAT : volume distant non pilotable".into());
+        }
         if muted {
             self.volume.store(0, Ordering::SeqCst);
         }

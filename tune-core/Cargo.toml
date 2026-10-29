@@ -32,7 +32,7 @@ socket2 = { workspace = true }
 if-addrs = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
-image = { workspace = true }
+image = { workspace = true, features = ["webp"] }
 zip = { workspace = true }
 realfft = "3"
 rayon = { workspace = true }
@@ -806,3 +806,8 @@ path = "tests/wav24_chaine_progressive_b209bf.rs"
 [[test]]
 name = "scripts_image_dossier_de_travail_4770"
 path = "tests/scripts_image_dossier_de_travail_4770.rs"
+
+# #6077 : autotests=false, ce banc doit être déclaré pour être exécuté.
+[[test]]
+name = "pochettes_compilations_6077"
+path = "tests/pochettes_compilations_6077.rs"
