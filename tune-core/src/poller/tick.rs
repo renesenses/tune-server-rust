@@ -1597,7 +1597,20 @@ impl PositionPoller {
                         status.position_ms,
                     )
                 });
-            if (!in_seek_grace || posterieur_au_deplacement) && !echantillon_perime {
+            // #6718 : Time/Seconds=0 à l'arrêt ne décrit pas un nouveau
+            // départ. Le publier ici fait céder la monotonie au cinquième
+            // tour, juste avant que handle_track_end attende la résolution
+            // suivante avec l'ancien titre encore affiché. Les décisions de
+            // fin gardent le relevé brut ; seule sa publication est filtrée.
+            let zero_d_arret_openhome = status.state == TransportState::Stopped
+                && status.position_ms == 0
+                && all_zones.iter().any(|zone| {
+                    zone.id == Some(zone_id) && zone.output_type.as_deref() == Some("openhome")
+                });
+            if (!in_seek_grace || posterieur_au_deplacement)
+                && !echantillon_perime
+                && !zero_d_arret_openhome
+            {
                 // Clamp the reported position to the track duration so the UI
                 // progress bar doesn't briefly overshoot past the end. The
                 // output can report a position a few seconds past the duration
