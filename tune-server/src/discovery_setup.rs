@@ -5296,3 +5296,7 @@ mod volume_7333_mdns_tests {
         .expect("la mise à jour reste publiée aux clients");
     }
 }
+
+#[cfg(test)]
+#[path = "discovery_setup/decouverte_volume_6774_tests.rs"]
+mod decouverte_volume_6774_tests;

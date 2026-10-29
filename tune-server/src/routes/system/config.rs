@@ -6630,3 +6630,7 @@ mod perimetre_des_analyses_5593_tests {
         assert!(vide.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "config/volume_6774_tests.rs"]
+mod volume_6774_tests;
