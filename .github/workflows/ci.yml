@@ -969,6 +969,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about@0.9.3
+      - name: Ensure the cargo-about CLI (#6872)
+        shell: bash
+        run: |
+          # install-action has no prebuilt cargo-about 0.9.3 for Intel macOS;
+          # its cargo-binstall fallback then compiles it without the `cli`
+          # feature and `cargo about` does not exist.
+          if ! cargo about --version >/dev/null 2>&1; then
+            cargo install cargo-about --version 0.9.3 --locked --features cli
+          fi
+          cargo about --version
       - uses: taiki-e/install-action@cross
         if: matrix.cross
       - name: Build the helper and dependency notices
