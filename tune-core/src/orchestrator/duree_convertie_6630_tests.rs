@@ -28,7 +28,9 @@ fn orchestrateur() -> PlaybackOrchestrator {
     )
 }
 
-async fn montage(zone_id: i64) -> (PlaybackOrchestrator, i64, String, tempfile::TempDir) {
+pub(super) async fn montage(
+    zone_id: i64,
+) -> (PlaybackOrchestrator, i64, String, tempfile::TempDir) {
     let orch = orchestrateur();
     let dir = tempfile::tempdir().unwrap();
     let piste = dir.path().join("1-02 Is It Like Today.flac");
@@ -82,7 +84,7 @@ async fn montage(zone_id: i64) -> (PlaybackOrchestrator, i64, String, tempfile::
     (orch, zone_id, appareil, dir)
 }
 
-async fn constater(
+pub(super) async fn constater(
     orch: &PlaybackOrchestrator,
     zone_id: i64,
 ) -> (

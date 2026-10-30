@@ -1433,7 +1433,12 @@ impl PlaybackOrchestrator {
                 artist: resolved.artist.as_deref(),
                 album: habillage.album.as_deref(),
                 cover_url: resolved_cover_url.as_deref(),
-                duration_ms: resolved.duration_ms.map(|d| d as u64),
+                // #7551 (JeanPitre, fil 2566) — une sortie locale rapporte une
+                // position ABSOLUE après une relance (`LocalOutput::seek` pose le
+                // décalage) : sa durée doit être celle de la PISTE, pas le temps
+                // restant que sert le flux décodé (#6630). Sinon la position
+                // dépasse la « durée » et le sondeur passe au suivant trop tôt.
+                duration_ms: duree_annoncee_a_la_sortie(resolved, is_local),
                 file_size: resolved.file_size,
                 file_path: local_file_path.as_deref(),
                 sample_rate: resolved.sample_rate,
@@ -4064,6 +4069,28 @@ impl PlaybackOrchestrator {
     pub async fn stream_session_alive(&self, stream_id: &str) -> bool {
         self.streamer.session_alive(stream_id).await
     }
+}
+
+/// #7551 — la durée que `play_media` annonce à la sortie.
+///
+/// Une sortie réseau reçoit la durée du flux SERVI : après une relance décodée
+/// à une position, son renderer compte depuis le début du flux neuf, et sa
+/// DIDL doit dire ce qui reste (#6630). Une sortie locale, elle, compte en
+/// position absolue (décalage du déplacement + trames) : elle reçoit la durée
+/// de la piste entière, la même que celle du `NowPlaying` (#7360). Sans départ
+/// connu, les deux sont la durée résolue, à l'identique d'avant.
+pub(super) fn duree_annoncee_a_la_sortie(
+    resolved: &ResolvedStream,
+    position_absolue: bool,
+) -> Option<u64> {
+    let servie = resolved.duration_ms?;
+    let duree = if position_absolue {
+        super::resolve_local::duree_piste_pcm_decodee(servie, resolved.stream_id.as_deref())
+            .unwrap_or(servie)
+    } else {
+        servie
+    };
+    Some(duree as u64)
 }
 
 /// #6062 — la traduction, fournie par l'appelant, du message d'une session

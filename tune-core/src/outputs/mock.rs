@@ -14,6 +14,8 @@ pub struct PlayCall {
     pub title: Option<String>,
     /// La profondeur annoncée à la sortie (`PlayMedia::bit_depth`), #6334.
     pub bit_depth: Option<u32>,
+    /// La durée annoncée à la sortie (`PlayMedia::duration_ms`), #7551.
+    pub duration_ms: Option<u64>,
 }
 
 /// A mock OutputTarget for testing playback flows.
@@ -276,6 +278,15 @@ impl MockOutput {
             .and_then(|c| c.bit_depth)
     }
 
+    /// La durée du dernier `play_media` (#7551).
+    pub async fn last_play_duration_ms(&self) -> Option<u64> {
+        self.play_calls
+            .lock()
+            .await
+            .last()
+            .and_then(|c| c.duration_ms)
+    }
+
     /// Les titres passes a `set_next_media`, DANS L'ORDRE (#3026).
     ///
     /// Le COMPTE d'appels ne dit pas *quelle* piste a ete armee, et l'URL d'un
@@ -429,6 +440,7 @@ impl OutputTarget for MockOutput {
                 url: media.url.to_string(),
                 title: media.title.map(String::from),
                 bit_depth: media.bit_depth,
+                duration_ms: media.duration_ms,
             });
             return Err(motif);
         }
@@ -444,6 +456,7 @@ impl OutputTarget for MockOutput {
             url: media.url.to_string(),
             title: media.title.map(String::from),
             bit_depth: media.bit_depth,
+            duration_ms: media.duration_ms,
         });
         Ok(())
     }
@@ -544,6 +557,7 @@ impl OutputTarget for MockOutput {
             url: media.url.to_string(),
             title: media.title.map(String::from),
             bit_depth: media.bit_depth,
+            duration_ms: media.duration_ms,
         });
         let refus = self.refus_de_set_next.lock().unwrap().clone();
         if let Some(motif) = refus {

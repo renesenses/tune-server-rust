@@ -4126,3 +4126,7 @@ mod dff_dop_longueur_7362_tests;
 #[cfg(test)]
 #[path = "duree_convertie_6630_tests.rs"]
 mod duree_convertie_6630_tests;
+
+#[cfg(test)]
+#[path = "fin_apres_relance_7551_tests.rs"]
+mod fin_apres_relance_7551_tests;
