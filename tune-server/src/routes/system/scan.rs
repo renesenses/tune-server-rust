@@ -492,17 +492,62 @@ mod scan_gate_tests {
         drop(jeton);
 
         // Plus aucun détenteur : l'annonce est tombée avec le droit, et le
-        // « scanning » qui reste au réglage est dit résiduel.
-        let r = super::scan_status(axum::extract::State(state.clone())).await;
-        assert_eq!(
-            r.0["current"]["stale"], true,
-            "#6729 : l'annonce du scan a survécu à son droit : {}",
-            r.0
-        );
+        // « scanning » qui reste au réglage est dit résiduel (diagnostic).
         assert!(super::ligne_du_scan_en_cours("scanning").contains("résiduel"));
+        // #7305 : `scan/status` ne le publie plus, il le remet au repos.
+        let r = super::scan_status(axum::extract::State(state.clone())).await;
+        assert!(r.0["current"].is_null(), "{}", r.0);
         reglages.set("scan_status", "idle").unwrap();
         let r = super::scan_status(axum::extract::State(state)).await;
         assert!(r.0["current"].is_null(), "{}", r.0);
+    }
+
+    /// #7305 (Tades, fil 2504) — LE DÉFAUT : le réglage dit « scanning »,
+    /// aucun scan ne tient le droit (processus tué en plein scan). Le rapport
+    /// le disait « résiduel », et `scan/status` le publiait quand même comme
+    /// un scan en cours : l'écran restait sur « scan en cours » et il fallait
+    /// trouver « Arrêter ». Le serveur le remet au repos tout seul, et le dit
+    /// sur le bus pour faire tomber le bandeau.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn un_statut_residuel_est_remis_au_repos_par_scan_status_7305() {
+        let _serialise = serialiser();
+        super::attendre_que_le_droit_de_scanner_soit_libre().await;
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let reglages =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        reglages.set("scan_status", "scanning").unwrap();
+        let mut bus = state.event_bus.subscribe();
+
+        let r = super::scan_status(axum::extract::State(state.clone())).await;
+        assert_eq!(
+            r.0["status"], "idle",
+            "#7305 : un « scanning » qu'aucun scan ne tient est publié comme un scan en cours : {}",
+            r.0
+        );
+        assert_eq!(r.0["scanning"], false);
+        assert!(r.0["current"].is_null(), "{}", r.0);
+        assert_eq!(
+            reglages.get("scan_status").unwrap().as_deref(),
+            Some("idle"),
+            "#7305 : le reste doit être effacé du réglage, pas seulement masqué"
+        );
+        let evt = bus.try_recv().expect("library.scan.completed attendu");
+        assert_eq!(evt.event_type, "library.scan.completed");
+        assert_eq!(evt.data["stale"], true);
+
+        // Le droit est rendu : un vrai scan peut repartir aussitôt.
+        let jeton = super::try_begin_scan().expect("le droit de scanner doit être rendu");
+        // Et un scan VIVANT n'est jamais remis au repos par la lecture.
+        reglages.set("scan_status", "scanning").unwrap();
+        let r = super::scan_status(axum::extract::State(state.clone())).await;
+        assert_eq!(r.0["status"], "scanning", "{}", r.0);
+        assert_eq!(
+            reglages.get("scan_status").unwrap().as_deref(),
+            Some("scanning")
+        );
+        drop(jeton);
+        reglages.set("scan_status", "idle").unwrap();
     }
 
     /// Le verrou COMMUN aux épreuves de scan réel
@@ -3732,6 +3777,45 @@ fn statut_publie(stocke: String, droit_tenu: bool) -> String {
     }
 }
 
+/// #7305 — remet au repos un `scan_status = "scanning"` qu'AUCUN scan ne
+/// tient : le même effet que « Arrêter » sur un reste (`scan_cancel`, branche
+/// sans détenteur), sans demander le geste à l'utilisateur.
+///
+/// Le droit de scanner est PRIS le temps de la remise au repos. C'est ce qui
+/// rend l'écriture sûre : tout scan prend ce droit AVANT d'écrire
+/// « scanning » (`marquer_scan_en_cours`), et l'écrit au repos AVANT de le
+/// rendre. Tant que ce jeton est tenu, aucun scan ne peut donc démarrer entre
+/// la relecture du réglage et l'écriture de `idle` — sans lui, un scan parti
+/// dans cet intervalle se verrait déclaré au repos en pleine lecture.
+///
+/// `true` : le réglage est (désormais) au repos. `false` : un scan tient le
+/// droit (le statut n'est pas un reste), ou l'écriture a échoué.
+fn remettre_au_repos_un_statut_residuel(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    event_bus: &tune_core::event_bus::EventBus,
+) -> bool {
+    let Some(_jeton) = try_begin_scan() else {
+        return false;
+    };
+    let settings = SettingsRepo::with_backend(backend.clone());
+    if settings.get("scan_status").ok().flatten().as_deref() != Some("scanning") {
+        // Remis au repos entre-temps (fin de scan, « Arrêter ») : rien à dire.
+        return true;
+    }
+    if let Err(e) = settings.set("scan_status", "idle") {
+        tracing::warn!(error = %e, "scan_status_residuel_reset_failed");
+        return false;
+    }
+    tracing::info!("scan_status_residuel_remis_au_repos");
+    // Fait tomber le bandeau d'un client qui l'affiche encore, comme
+    // « Arrêter » sur un reste.
+    event_bus.emit(
+        "library.scan.completed",
+        json!({ "cancelled": true, "stale": true }),
+    );
+    true
+}
+
 pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     // #5086 — lu par le pool, pas par l'écrivain : un statut PUBLIÉ n'a pas à
     // attendre la fin d'une écriture, et c'est `SCAN_GATE`, plus bas, qui fait
@@ -3748,6 +3832,19 @@ pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     // `trigger_scan` refuse aussitôt en 409 `already_scanning` — vu trois fois
     // le 24/09/2026 dans `pg_scan_converge_4602`, et atteignable par un
     // utilisateur. Tant que le droit est tenu, le statut est donc « scanning ».
+    // #7305 (Tades, fil 2504) : un « scanning » qu'aucun scan ne tient est un
+    // reste (processus tué en plein scan). Le publier tel quel laissait
+    // l'écran sur « scan en cours » et demandait à l'utilisateur un geste
+    // (« Arrêter ») qu'il ne trouvait pas. Le serveur le sait faux : il le
+    // remet au repos lui-même, ici, à la première lecture du statut.
+    let status = if status == "scanning"
+        && !SCAN_GATE.is_active()
+        && remettre_au_repos_un_statut_residuel(&state.backend, &state.event_bus)
+    {
+        "idle".to_string()
+    } else {
+        status
+    };
     let status = statut_publie(status, SCAN_GATE.is_active());
     let scanning = status == "scanning";
     let result = settings
