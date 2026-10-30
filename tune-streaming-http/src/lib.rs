@@ -827,6 +827,13 @@ async fn service_artist_top_tracks(
         },
     )
     .await;
+    // #7416 — les titres de l'artiste les plus écoutés ici, toutes sources,
+    // rejoignent la liste du service avant le classement.
+    tune_core::streaming::titres_phares_ecoutes::ajouter_mes_plus_ecoutes(
+        &state.backend,
+        &service,
+        &mut items,
+    );
     tune_core::streaming::titres_phares_ecoutes::enrichir_et_classer(
         &state.backend,
         &state.http,
