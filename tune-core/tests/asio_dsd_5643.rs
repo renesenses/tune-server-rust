@@ -232,3 +232,76 @@ fn la_reponse_de_kasio_can_do_io_format_est_lue_sans_contresens() {
         assert_eq!(io_format::can_do_from_code(code), None, "code {code}");
     }
 }
+
+#[test]
+fn asio_7372_un_pilote_occupe_ne_declare_pas_une_absence_de_dsd() {
+    let rates = dsd::probe_dsd_rates(
+        true,
+        || panic!("ne pas interroger un pilote occupé"),
+        || panic!("ne pas préparer un pilote occupé"),
+        |_| panic!("ne pas sonder un pilote occupé"),
+        || panic!("ne pas basculer un pilote occupé"),
+    );
+    assert_eq!(
+        rates, None,
+        "un pilote occupé est mémorisé comme sans cadence DSD"
+    );
+}
+
+#[test]
+fn asio_7372_les_erreurs_de_sondage_restent_reessayables() {
+    use std::cell::Cell;
+    for etape in ["format", "preparation", "cadence", "restauration"] {
+        let restaurations = Cell::new(0);
+        let rates = dsd::probe_dsd_rates(
+            false,
+            || (etape != "format").then_some(true),
+            || (etape != "preparation").then_some(()),
+            |_| (etape != "cadence").then_some(true),
+            || {
+                restaurations.set(restaurations.get() + 1);
+                (etape != "restauration").then_some(())
+            },
+        );
+        assert_eq!(
+            rates, None,
+            "l'erreur de {etape} devient une absence définitive de DSD"
+        );
+        assert_eq!(restaurations.get(), if etape == "format" { 0 } else { 1 });
+    }
+    assert_eq!(
+        dsd::probe_dsd_rates(
+            false,
+            || Some(true),
+            || Some(()),
+            |rate| Some(rate == 2_822_400),
+            || Some(())
+        ),
+        Some(vec![2_822_400]),
+        "un essai ultérieur doit encore pouvoir annoncer le DSD natif"
+    );
+}
+
+#[test]
+fn asio_7372_un_refus_explicite_reste_une_capacite_connue() {
+    assert_eq!(
+        dsd::probe_dsd_rates(
+            false,
+            || Some(false),
+            || panic!("format explicitement refusé"),
+            |_| panic!("format explicitement refusé"),
+            || panic!("aucune bascule effectuée")
+        ),
+        Some(vec![])
+    );
+    assert_eq!(
+        dsd::probe_dsd_rates(
+            false,
+            || Some(true),
+            || Some(()),
+            |_| Some(false),
+            || Some(())
+        ),
+        Some(vec![])
+    );
+}
