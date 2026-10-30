@@ -158,7 +158,8 @@ pub(super) fn stream_for_saved(
     let fiches = state.annuaire_radios.read().ok();
     let fiche = fiches.as_ref().and_then(|fiches| {
         fiches.iter().find(|f| match link {
-            Some(id) => f.external_id.as_ref() == Some(id),
+            // #7500 — ou l'ancienne clé `mozaiklabs:ID` d'une fiche numérotée depuis.
+            Some(id) => f.porte_la_cle(id),
             None => super::super::radios_annuaire::flux_de_la_fiche(f, &radio.url),
         })
     });
