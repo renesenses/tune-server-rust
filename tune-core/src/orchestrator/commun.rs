@@ -901,13 +901,15 @@ impl PlaybackOrchestrator {
             .now_playing
             .as_ref()
             .filter(|np| np.source == "podcast")
-            && let Some(url) = np.source_id.as_deref()
         {
-            let _ = crate::db::listening_resume::podcast_position(
+            // La première position prouve aussi le premier démarrage de cet
+            // épisode navigateur : il n'existe pas encore forcément de reprise.
+            let _ = crate::db::listening_resume::podcast_started_in_context(
                 &self.db,
                 zone_id,
-                url,
+                np,
                 state.position_ms,
+                state.session_context_id.as_deref(),
             );
         }
     }

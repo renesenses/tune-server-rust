@@ -709,11 +709,14 @@ pub(super) async fn play_episode(
 ) -> impl IntoResponse {
     let title = body.title.as_deref().unwrap_or("Podcast Episode");
     let podcast_name = body.podcast_name.as_deref().unwrap_or("Podcast");
-    let device_id = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(zone_id)
         .ok()
-        .flatten()
-        .and_then(|z| z.output_device_id);
+        .flatten();
+    let navigateur = zone
+        .as_ref()
+        .is_some_and(|z| z.output_type.as_deref() == Some("browser"));
+    let device_id = zone.and_then(|z| z.output_device_id);
     let mime_type = guess_audio_mime(&body.audio_url);
     // #5214 — la pochette « en cours », que Lecture en cours et l'Historique
     // du client reprennent : la vignette en cache quand elle existe. La sortie
@@ -789,6 +792,61 @@ pub(super) async fn play_episode(
             np.cover_path.clone(),
         )
         .await;
+    if navigateur {
+        // Le chemin commun fournit une session Tune et attend la parole du
+        // lecteur avant l'historique et la reprise. playback.play seul ne
+        // créait ni flux confirmable, ni annonce de démarrage navigateur.
+        let demande = tune_core::orchestrator::PlayRequest {
+            zone_id,
+            source: Some("podcast".into()),
+            source_id: Some(body.audio_url.clone()),
+            title: Some(title.into()),
+            artist_name: Some(podcast_name.into()),
+            album_title: Some(podcast_name.into()),
+            cover_url: np.cover_path.clone(),
+            duration_ms: Some(body.duration_ms.unwrap_or(0) as i64),
+            ..Default::default()
+        };
+        let resultat = if body.seek_ms.is_some() {
+            state.orchestrator.play_context_resume(demande).await
+        } else {
+            state.orchestrator.play(demande).await
+        };
+        let resultat = match resultat {
+            Ok(r) if r.sortie_refusee().is_none() => r,
+            Ok(r) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error":r.error,"code":"podcast_sortie_refuse"})),
+                );
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error":e,"code":"podcast_preparation_refusee"})),
+                );
+            }
+        };
+        if resultat.stream_url.is_some() {
+            if let Some(ms) = body.seek_ms {
+                // L'élément du navigateur applique cet offset au média complet.
+                state
+                    .playback
+                    .seek(zone_id, ms.min(i64::MAX as u64) as i64)
+                    .await;
+            }
+        }
+        let zone_state = state.playback.get_state(zone_id).await;
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "zone_id":zone_id,"title":title,"podcast":podcast_name,
+                "audio_url":resultat.stream_url.clone().unwrap_or(body.audio_url.clone()),
+                "stream_url":resultat.stream_url,"mime_type":mime_type,
+                "output_sent":false,"error":null,"code":null,"state":zone_state
+            })),
+        );
+    }
     state.playback.play(zone_id, np).await;
     // #6468 — un échec n'est plus un `200` : la réponse porte un vrai code
     // HTTP et un `code` stable, que le client peut afficher.
@@ -846,8 +904,7 @@ pub(super) async fn play_episode(
                 return (
                     StatusCode::BAD_GATEWAY,
                     Json(json!({"error": e.to_string(), "code": "podcast_resume_seek_failed"})),
-                )
-                    .into_response();
+                );
             }
         }
         if output_sent {
@@ -871,9 +928,10 @@ pub(super) async fn play_episode(
     let output_error = echec.map(|(_, _, e)| e);
     (
         statut,
-        Json(json!({"zone_id": zone_id, "title": title, "podcast": podcast_name, "audio_url": body.audio_url, "mime_type": mime_type, "output_sent": output_sent, "error": output_error, "code": code, "state": zone_state})),
+        Json(
+            json!({"zone_id": zone_id, "title": title, "podcast": podcast_name, "audio_url": body.audio_url, "mime_type": mime_type, "output_sent": output_sent, "error": output_error, "code": code, "state": zone_state}),
+        ),
     )
-        .into_response()
 }
 // ─── Vignette mise en cache (#5214) ─────────────────────────────────
 
@@ -1257,3 +1315,7 @@ mod tests {
         assert_eq!(PodcastService::CURATED_COUNTRY, "fr");
     }
 }
+
+#[cfg(test)]
+#[path = "podcasts/reprise_navigateur_7354_tests.rs"]
+mod reprise_navigateur_7354_tests;
