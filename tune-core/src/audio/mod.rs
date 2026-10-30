@@ -37,6 +37,8 @@ pub mod disposition_canaux;
 /// Dither TPDF — UNE implémentation, partagée par tous les étages qui
 /// repassent du flottant à l'entier (#4075, #4076).
 pub mod dither;
+/// #7265 — un DSD que la sortie WASAPI ne peut pas porter en DoP part en PCM.
+pub mod dop_ecarte_7265;
 #[cfg(test)]
 mod dop_porteur_bout_en_bout;
 /// #5643 — le flux « DSD brut » (DsdU8, MSB-first) de la sortie ASIO native.
