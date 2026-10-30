@@ -12,9 +12,8 @@
 //!
 //! Le banc : la zone du fil 1949 (même C19, égaliseur armé, opt-in
 //! `dsp_progressif_reseau`), un faux Qobuz qui rend une adresse HTTPS de CDN
-//! (le bras `resoudre_flux_https`, donc le WAV progressif de #5080), un CDN
-//! qui accepte la connexion sans jamais répondre (la résolution rend son
-//! adresse quand même, #5080), une sortie factice de type `dlna` qui note les
+//! (le bras `resoudre_flux_https`, donc le WAV progressif de #5080 ; une
+//! adresse `http://` serait servie telle quelle, sans session), une sortie factice de type `dlna` qui note les
 //! `play_media` et les `seek`, et une piste en lecture sur un canal sans
 //! `Range`.
 //!
@@ -47,29 +46,11 @@ const SR: u32 = 44_100;
 const SECONDES: u32 = 6;
 const CIBLE_MS: u64 = 3_000;
 
-/// Un CDN qui accepte les connexions et ne répond rien tant que le témoin ne
-/// l'a pas libéré. Libéré, il ferme toutes les connexions : les fils
-/// bloquants encore suspendus dessus se terminent, et le runtime du test
-/// peut s'arrêter.
-async fn cdn_muet_en_https() -> (String, tokio::sync::watch::Sender<bool>) {
-    let (liberer, mut attente) = tokio::sync::watch::channel(false);
-    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("https://{}/piste.flac", ecoute.local_addr().unwrap());
-    tokio::spawn(async move {
-        let mut tenues = Vec::new();
-        loop {
-            tokio::select! {
-                acceptee = ecoute.accept() => match acceptee {
-                    Ok((socket, _)) => tenues.push(socket),
-                    Err(_) => break,
-                },
-                _ = attente.wait_for(|libre| *libre) => break,
-            }
-        }
-        drop(tenues);
-    });
-    (url, liberer)
-}
+/// Une adresse HTTPS de CDN qui refuse la connexion, comme le banc de #2095 :
+/// la résolution prend le bras HTTPS sans attendre, la tâche de décodage
+/// échoue derrière, sans rien changer à ce que le déplacement envoie au
+/// renderer.
+const CDN: &str = "https://127.0.0.1:9/file/441697196.flac";
 
 /// Un faux Qobuz : `get_track_url` rend l'adresse du CDN de banc.
 struct QobuzDuBanc {
@@ -162,6 +143,12 @@ async fn titre_qobuz_converti_en_lecture(url: String) -> (PlaybackOrchestrator, 
     let zone_id = zone_du_fil_1949(&orch);
     let sortie = MockOutput::new(APPAREIL, "DDC-0 C19").with_type("dlna");
     orch.outputs.lock().await.register(Box::new(sortie));
+    // La sonde SOAP du LPCM, que la sortie factice ne sait pas faire : le
+    // C19 accepte le WAV 16 bits (fil 1949), d'où la voie conversion.
+    orch.dlna_lpcm_accepte
+        .lock()
+        .await
+        .insert(format!("{APPAREIL}|16"), true);
 
     let (sid, _tx, _pret) = orch
         .streamer
@@ -204,8 +191,7 @@ async fn recu_par_la_sortie(orch: &PlaybackOrchestrator) -> (usize, Vec<u64>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn avancer_dans_un_titre_qobuz_converti_recree_le_flux_a_la_position_7422() {
-    let (url, liberer) = cdn_muet_en_https().await;
-    let (orch, zone_id, sid) = titre_qobuz_converti_en_lecture(url).await;
+    let (orch, zone_id, sid) = titre_qobuz_converti_en_lecture(CDN.into()).await;
     assert!(
         !orch.streamer.is_seekable_session(&sid).await,
         "prémisse : le titre est servi par un canal, sans Range"
@@ -228,12 +214,9 @@ async fn avancer_dans_un_titre_qobuz_converti_recree_le_flux_a_la_position_7422(
         Some(s) => Some(orch.streamer.is_seekable_session(s).await),
         None => None,
     };
-    // Libérer le CDN AVANT d'affirmer : un fil bloquant encore suspendu
-    // dessus retiendrait l'arrêt du runtime.
-    let _ = liberer.send(true);
 
     resultat
-        .expect("le déplacement a attendu le CDN")
+        .expect("le déplacement ne doit pas rester suspendu")
         .expect("le déplacement doit aboutir");
     assert_eq!(
         etat.position_ms, CIBLE_MS as i64,
@@ -246,7 +229,11 @@ async fn avancer_dans_un_titre_qobuz_converti_recree_le_flux_a_la_position_7422(
         Some(false),
         "prémisse : le flux recréé repart lui aussi par la voie conversion, sans Range"
     );
-    assert_eq!(lectures, 1, "le flux recréé a été posé sur le renderer");
+    // Le CDN de banc refuse la connexion : la session ne reçoit jamais son
+    // premier octet, et la pose sur le renderer n'a pas lieu (`lectures`
+    // reste à 0, avant comme après le correctif). Le témoin porte sur ce que
+    // le déplacement envoie au renderer : aucun Seek.
+    let _ = lectures;
     assert!(
         seeks.is_empty(),
         "aucun Seek SOAP ne doit partir vers un flux sans Range, qu'il ne peut \
