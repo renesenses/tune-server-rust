@@ -173,6 +173,7 @@ loader.start_event_dispatch(); // wires EventBus -> on_event
 | `default_enabled`  | `true`             | `false` = opt-in: dormant until installed    |
 | `catalogued`       | `true`             | `false` = never offered by the plugin manager |
 | `protocol_version` | the SDK's constant | ABI generation this plugin was built against |
+| `theme_web`        | `None`             | Route (relative to `/api/v1/ext/<name>`) serving a web-client theme; published as `provides.web_theme` in `GET /api/v1/plugins` (protocol 1.1, tune-web-client#2527) |
 
 ### `default_enabled` vs `catalogued`
 

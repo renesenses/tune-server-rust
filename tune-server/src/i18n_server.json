@@ -152,6 +152,23 @@
     "pl": "Inteligentne playlisty opisane jednym zdaniem i propozycje wzbogacenia albumów, z własnym kluczem (Anthropic, zgodne z OpenAI, Gemini, Ollama)",
     "el": "Έξυπνες λίστες αναπαραγωγής που περιγράφονται σε μία πρόταση και προτάσεις εμπλουτισμού άλμπουμ, με το δικό σας κλειδί (Anthropic, συμβατό με OpenAI, Gemini, Ollama)"
   },
+  "plugin.description.mon-theme": {
+    "fr": "Choisir toutes les couleurs de l'interface, contraste WCAG AA vérifié en direct ; rangé par profil, partageable en fichier",
+    "en": "Choose every colour of the interface, with a live WCAG AA contrast check; saved per profile, shareable as a file",
+    "de": "Alle Farben der Oberfläche selbst wählen, mit Live-Prüfung des WCAG-AA-Kontrasts; pro Profil gespeichert, als Datei teilbar",
+    "es": "Elegir todos los colores de la interfaz, con el contraste WCAG AA comprobado en directo; guardado por perfil, compartible como archivo",
+    "it": "Scegliere tutti i colori dell'interfaccia, con il contrasto WCAG AA verificato in tempo reale; salvato per profilo, condivisibile come file",
+    "zh": "自选界面的所有颜色，实时检查 WCAG AA 对比度；按用户档案保存，可作为文件分享",
+    "ja": "インターフェースのすべての色を選択、WCAG AA のコントラストをリアルタイムで確認。プロファイルごとに保存し、ファイルで共有可能",
+    "ko": "인터페이스의 모든 색상을 직접 선택하고 WCAG AA 대비를 실시간으로 확인; 프로필별로 저장되며 파일로 공유 가능",
+    "ro": "Alegeți toate culorile interfeței, cu verificarea în direct a contrastului WCAG AA; salvat pe profil, partajabil ca fișier",
+    "sv": "Välj alla gränssnittets färger, med kontroll av WCAG AA-kontrast i realtid; sparas per profil, kan delas som fil",
+    "hu": "A felület összes színének kiválasztása, a WCAG AA kontraszt élő ellenőrzésével; profilonként mentve, fájlként megosztható",
+    "vi": "Tự chọn mọi màu của giao diện, kiểm tra độ tương phản WCAG AA trực tiếp; lưu theo hồ sơ, chia sẻ được dưới dạng tệp",
+    "nb": "Velg alle fargene i grensesnittet, med kontroll av WCAG AA-kontrast i sanntid; lagret per profil, kan deles som fil",
+    "pl": "Wybierz wszystkie kolory interfejsu, z kontrolą kontrastu WCAG AA na żywo; zapisywane dla profilu, do udostępnienia jako plik",
+    "el": "Επιλέξτε όλα τα χρώματα της διεπαφής, με ζωντανό έλεγχο αντίθεσης WCAG AA· αποθηκεύεται ανά προφίλ, κοινοποιείται ως αρχείο"
+  },
   "plugin.description.entree-audio": {
     "fr": "Capter une entrée audio (USB, S/PDIF, optique) et la diffuser en direct vers une zone",
     "en": "Capture an audio input (USB, S/PDIF, optical) and stream it live to a zone",
