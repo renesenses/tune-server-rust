@@ -3171,6 +3171,60 @@ where
 #[path = "parc_local_pendant_la_lecture_6119_tests.rs"]
 mod parc_local_pendant_la_lecture_6119_tests;
 
+/// #7263 — combien de temps la fiche de diagnostic se contente du parc déjà
+/// publié avant de rebalayer le matériel.
+///
+/// L'écran « État du serveur » du client web interroge `GET
+/// /system/diagnostics` toutes les 5 s, et le cache du balayage
+/// (`SCAN_COOLDOWN_SECS`) ne dure que 5 s : la fiche relançait donc un
+/// inventaire ALSA complet toutes les 5 à 10 s (31 dans un extrait du journal
+/// de JeromeQ), soit environ 500 ouvertures du greffon `jack` par heure, sans
+/// la moindre lecture en cours. La fiche n'a besoin que des NOMS : le parc
+/// publié par le rescan périodique ou par `GET /devices/audio` suffit tant
+/// qu'il a moins de cinq minutes.
+#[cfg(feature = "local-audio")]
+pub const DUREE_DU_PARC_POUR_LE_DIAGNOSTIC: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+/// #7263 — le parc local de la fiche de diagnostic : le parc publié s'il est
+/// assez récent, sinon la même règle que [`parc_local_sans_couper_la_lecture`].
+#[cfg(feature = "local-audio")]
+pub async fn parc_local_pour_le_diagnostic<F, Fut>(
+    state: &AppState,
+    enumerer: F,
+) -> Vec<tune_core::outputs::local::AudioDevice>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Vec<tune_core::outputs::local::AudioDevice>>,
+{
+    parc_local_pour_le_diagnostic_selon(
+        state,
+        std::env::consts::OS,
+        tune_core::outputs::local::age_du_parc_publie(),
+        enumerer,
+    )
+    .await
+}
+
+/// L'âge du parc est explicite pour juger la règle sans dépendre du dépôt
+/// global que les autres témoins remplissent en parallèle.
+#[cfg(feature = "local-audio")]
+async fn parc_local_pour_le_diagnostic_selon<F, Fut>(
+    state: &AppState,
+    os: &str,
+    age_du_parc: Option<std::time::Duration>,
+    enumerer: F,
+) -> Vec<tune_core::outputs::local::AudioDevice>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Vec<tune_core::outputs::local::AudioDevice>>,
+{
+    if age_du_parc.is_some_and(|age| age < DUREE_DU_PARC_POUR_LE_DIAGNOSTIC) {
+        return tune_core::outputs::local::cached_audio_devices();
+    }
+    parc_local_sans_couper_la_lecture_selon_os(state, os, enumerer).await
+}
+
 #[cfg(all(test, feature = "local-audio"))]
 #[path = "sortie_locale_disparue_6551_tests.rs"]
 mod sortie_locale_disparue_6551_tests;
