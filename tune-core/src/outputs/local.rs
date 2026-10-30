@@ -443,6 +443,11 @@ mod bras_alsa_natif;
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 mod etage_natif;
 
+// #7264 — le volume logiciel du WASAPI exclusif appliqué au RENDU, après
+// l'anneau natif, et non plus dans le producteur deux secondes en amont.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+pub(crate) mod gain_au_rendu_7264;
+
 // #5204 — l'enchaînement sans blanc en mode exclusif : quel bras enchaîne, la
 // règle de la frontière à format égal, et la lecture de l'en-tête suivant
 // (partagée avec le chemin cpal). Pur, compilé partout.
@@ -2129,7 +2134,22 @@ pub(crate) struct NativePcmRing {
     /// Même compteur de famine que `RingBuf` (#3205) : les backends exclusifs
     /// Windows drainent cet anneau-ci.
     starvation: Arc<RingStarvation>,
+    /// #7264 — les débuts et fins de passages intacts (DoP, reliquat brut)
+    /// posés par le producteur, à la position d'écriture : `position << 1 |
+    /// intact`. File SPSC bornée, lue par le rendu au gain
+    /// ([`Self::pop_pcm_bytes_au_gain`]).
+    marques: [AtomicU64; MARQUES_DE_PASSAGE],
+    marques_ecrites: AtomicU64,
+    marques_lues: AtomicU64,
+    /// Le dernier état marqué — lu et écrit par le seul producteur.
+    dernier_passage_intact: AtomicBool,
 }
+
+/// #7264 — places de la file des marques de passage. Une marque par
+/// changement DoP ↔ PCM dans le même flux (une frontière de piste) : 64 dans
+/// les deux secondes de l'anneau supposeraient des pistes de 30 ms.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+const MARQUES_DE_PASSAGE: usize = 64;
 
 // SAFETY: same strict SPSC contract and Acquire/Release cursor discipline as
 // `RingBuf`; the only difference is the `i32` cell payload.
@@ -2155,6 +2175,10 @@ impl NativePcmRing {
             write: AtomicU64::new(0),
             read: AtomicU64::new(0),
             starvation,
+            marques: std::array::from_fn(|_| AtomicU64::new(0)),
+            marques_ecrites: AtomicU64::new(0),
+            marques_lues: AtomicU64::new(0),
+            dernier_passage_intact: AtomicBool::new(false),
         }
     }
 
@@ -2176,6 +2200,58 @@ impl NativePcmRing {
             // freshly-created ring.
             unsafe { *cell.get() = 0 };
         }
+        self.marques_ecrites.store(0, Ordering::SeqCst);
+        self.marques_lues.store(0, Ordering::SeqCst);
+        self.dernier_passage_intact.store(false, Ordering::SeqCst);
+    }
+
+    /// #7264 — **le producteur** dit si les mots qu'il va pousser forment un
+    /// passage intact (DoP, reliquat forcé brut) que le rendu au gain ne doit
+    /// jamais pondérer. La marque prend la position d'écriture courante : elle
+    /// vaut pour tout ce qui sera poussé ensuite, jusqu'à la marque suivante.
+    /// Sans changement d'état, rien n'est écrit.
+    ///
+    /// File pleine (64 changements en attente, impossible à une frontière de
+    /// piste par marque) : le producteur attend que le rendu en consomme, au
+    /// plus trois secondes — l'anneau entier en dure deux. Passé ce délai, le
+    /// rendu est mort ; la marque est abandonnée et l'étage s'arrêtera sur sa
+    /// propre famine (#6842).
+    pub(crate) fn marquer_passage_intact(&self, intact: bool) {
+        if self.dernier_passage_intact.load(Ordering::Relaxed) == intact {
+            return;
+        }
+        let ecrites = self.marques_ecrites.load(Ordering::Relaxed);
+        let debut = std::time::Instant::now();
+        while ecrites.wrapping_sub(self.marques_lues.load(Ordering::Acquire))
+            >= MARQUES_DE_PASSAGE as u64
+        {
+            if debut.elapsed() > std::time::Duration::from_secs(3) {
+                warn!("native_ring_marque_de_passage_abandonnee (#7264)");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let position = self.write.load(Ordering::Acquire);
+        self.marques[(ecrites % MARQUES_DE_PASSAGE as u64) as usize]
+            .store(position << 1 | u64::from(intact), Ordering::Relaxed);
+        self.marques_ecrites.store(ecrites + 1, Ordering::Release);
+        self.dernier_passage_intact.store(intact, Ordering::Relaxed);
+    }
+
+    /// La prochaine marque non lue, `(position, intact)`.
+    fn prochaine_marque(&self) -> Option<(u64, bool)> {
+        let lues = self.marques_lues.load(Ordering::Relaxed);
+        if lues == self.marques_ecrites.load(Ordering::Acquire) {
+            return None;
+        }
+        let marque =
+            self.marques[(lues % MARQUES_DE_PASSAGE as u64) as usize].load(Ordering::Relaxed);
+        Some((marque >> 1, marque & 1 == 1))
+    }
+
+    fn consommer_la_marque(&self) {
+        let lues = self.marques_lues.load(Ordering::Relaxed);
+        self.marques_lues.store(lues + 1, Ordering::Release);
     }
 
     pub(crate) fn push(&self, samples: &[i32]) -> usize {
@@ -2249,6 +2325,66 @@ impl NativePcmRing {
         // chiffre doit se comparer d'un backend à l'autre (#3205).
         self.starvation.record(out.len() / bytes_per_sample, count);
         // Fil 1908 — ce qui reste pour le pilote, en échantillons.
+        self.starvation.noter_en_attente(available - count);
+        count * bytes_per_sample
+    }
+
+    /// #7264 — [`Self::pop_pcm_bytes`] avec le volume logiciel appliqué ICI,
+    /// au rendu, et non dans le producteur deux secondes plus tôt. Même
+    /// sérialisation par les octets hauts, mêmes compteurs ; un mot n'est
+    /// pondéré que hors passage intact et quand le gain n'est pas l'unité —
+    /// à 100 %, rampe au repos, la sortie est celle de `pop_pcm_bytes` au
+    /// bit près. Aucune allocation : le fil de rendu l'appelle à chaque
+    /// période.
+    pub(crate) fn pop_pcm_bytes_au_gain(
+        &self,
+        out: &mut [u8],
+        bit_depth: u16,
+        gain: &mut gain_au_rendu_7264::GainAuRendu,
+    ) -> usize {
+        let bytes_per_sample = usize::from(bit_depth / 8);
+        if !matches!(bit_depth, 16 | 24 | 32) {
+            return 0;
+        }
+        gain.relire_la_consigne();
+
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        let available = w.wrapping_sub(r) as usize;
+        let count = available.min(out.len() / bytes_per_sample);
+        let cap = self.capacity();
+        // Les marques déjà dépassées, puis la position de la suivante (un
+        // seul test par mot tant qu'elle n'est pas atteinte).
+        let mut prochaine = u64::MAX;
+        while let Some((position, intact)) = self.prochaine_marque() {
+            if position > r {
+                prochaine = position;
+                break;
+            }
+            gain.entrer_dans_le_passage(intact);
+            self.consommer_la_marque();
+        }
+        for i in 0..count {
+            let position = r + i as u64;
+            while position >= prochaine {
+                if let Some((_, intact)) = self.prochaine_marque() {
+                    gain.entrer_dans_le_passage(intact);
+                    self.consommer_la_marque();
+                }
+                prochaine = match self.prochaine_marque() {
+                    Some((suivante, _)) => suivante,
+                    None => u64::MAX,
+                };
+            }
+            let idx = (r as usize + i) % cap;
+            // SAFETY: same SPSC publication contract as `pop_mapped`.
+            let mot = unsafe { *self.buf[idx].get() };
+            let native = gain.rendre(mot, bit_depth, position).to_le_bytes();
+            let offset = i * bytes_per_sample;
+            out[offset..offset + bytes_per_sample].copy_from_slice(&native[4 - bytes_per_sample..]);
+        }
+        self.read.store(r + count as u64, Ordering::Release);
+        self.starvation.record(out.len() / bytes_per_sample, count);
         self.starvation.noter_en_attente(available - count);
         count * bytes_per_sample
     }
