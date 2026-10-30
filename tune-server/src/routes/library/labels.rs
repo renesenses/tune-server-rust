@@ -33,7 +33,7 @@ use tune_core::library::artistes_du_label::{
 };
 use tune_core::library::logos_labels::{
     Attribution, CacheLogosLabels, CatalogueDeLabels, Demande, LabelDuCatalogue, PASSE_MAX,
-    PAUSE_ENTRE_LABELS, SourceDuLogo, StatutDeLicence,
+    PAUSE_ENTRE_LABELS, SourceDuLogo, Statut, StatutDeLicence,
 };
 use tune_core::library::logos_web::{CatalogueLogosWeb, FICHIER_INDEX_WEB, transport_du_serveur};
 use tune_core::streaming::StreamingService;
@@ -217,15 +217,25 @@ pub(crate) fn element(
     o
 }
 
-/// Lance, si besoin et si aucune ne tourne, une passe bornée sur les labels
-/// encore inconnus. Rend la tâche, pour les essais.
+/// Lance, si besoin et si aucune ne tourne, une passe sur les labels encore
+/// inconnus. Rend la tâche, pour les essais.
+///
+/// #7414 — la passe ne s'arrête plus après [`PASSE_MAX`] labels : avec 338
+/// labels sur le .18, il fallait une quarantaine d'ouvertures de l'onglet
+/// pour tous les demander. Elle les prend TOUS, en arrière-plan, un label
+/// après l'autre (`pause` entre deux, et les limiteurs de chaque source) ;
+/// [`PASSE_MAX`] n'est plus que la taille d'une tranche, entre deux
+/// tranches de laquelle `continuer` est relu — la pause de l'Enrichissement
+/// arrête ainsi la passe du web en cours de route. Chaque label reste
+/// demandé une seule fois par passe et inscrit dès qu'il est résolu.
 pub(crate) fn lancer_passe(
     cache: Arc<CacheLogosLabels>,
     catalogue: Arc<dyn CatalogueDeLabels>,
     demandes: Vec<Demande>,
     pause: Duration,
+    continuer: fn() -> bool,
 ) -> Option<tokio::task::JoinHandle<usize>> {
-    let a_faire = cache.a_resoudre(&demandes, maintenant(), PASSE_MAX);
+    let a_faire = cache.a_resoudre(&demandes, maintenant(), usize::MAX);
     if a_faire.is_empty() {
         return None;
     }
@@ -233,10 +243,41 @@ pub(crate) fn lancer_passe(
         let Some(_passe) = cache.reserver_passe() else {
             return 0;
         };
-        cache
-            .resoudre(&*catalogue, a_faire, maintenant, pause)
-            .await
+        let mut trouves = 0;
+        for (i, tranche) in a_faire.chunks(PASSE_MAX).enumerate() {
+            if !continuer() {
+                break;
+            }
+            if i > 0 && !pause.is_zero() {
+                tokio::time::sleep(pause).await;
+            }
+            trouves += cache
+                .resoudre(&*catalogue, tranche.to_vec(), maintenant, pause)
+                .await;
+            // Une tranche entièrement en erreur (compte déconnecté, service
+            // en panne) arrête la passe : le reste sera demandé plus tard,
+            // au lieu d'être inscrit en erreur pour un jour.
+            if tranche.iter().all(|d| {
+                cache
+                    .entree(&d.nom)
+                    .is_some_and(|e| e.statut == Statut::Erreur)
+            }) {
+                break;
+            }
+        }
+        trouves
     }))
+}
+
+/// La passe du web continue tant que l'Enrichissement n'est pas en pause.
+fn enrichissement_actif() -> bool {
+    !tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::Enrichissement)
+}
+
+/// La passe Qobuz n'a pas d'interrupteur : un compte déconnecté se voit à
+/// chaque appel, et une tranche tout en erreur arrête la passe.
+fn toujours() -> bool {
+    true
 }
 
 /// Les demandes de la passe Qobuz : l'album Qobuz de la bibliothèque.
@@ -272,7 +313,13 @@ pub(super) async fn list_labels(State(state): State<AppState>) -> Json<Value> {
     let web = cache_web_de(&dossier);
     let items: Vec<Value> = labels.iter().map(|l| element(&cache, &web, l)).collect();
     if let Some(catalogue) = catalogue_web(&state) {
-        lancer_passe(web, catalogue, demandes_web(&labels), PAUSE_ENTRE_LABELS);
+        lancer_passe(
+            web,
+            catalogue,
+            demandes_web(&labels),
+            PAUSE_ENTRE_LABELS,
+            enrichissement_actif,
+        );
     }
     if let Some(catalogue) = catalogue_qobuz(&state).await {
         lancer_passe(
@@ -280,6 +327,7 @@ pub(super) async fn list_labels(State(state): State<AppState>) -> Json<Value> {
             catalogue,
             demandes_qobuz(&labels),
             PAUSE_ENTRE_LABELS,
+            toujours,
         );
     }
     Json(Value::Array(items))
@@ -397,7 +445,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
     use tune_core::db::backend::ToSqlValue;
-    use tune_core::library::logos_labels::{EntreeLogo, Statut};
+    use tune_core::library::logos_labels::EntreeLogo;
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n-logo-6736-";
 
@@ -557,10 +605,12 @@ mod tests {
         }
     }
 
-    /// La passe lancée par la liste : bornée à `PASSE_MAX`, l'album Qobuz de
-    /// la bibliothèque transmis, et une seconde liste ne redemande rien.
+    /// #7414 — UNE ouverture de la liste lance une passe qui demande TOUS les
+    /// labels encore inconnus (pas seulement `PASSE_MAX`), chacun une seule
+    /// fois, l'album Qobuz de la bibliothèque transmis ; une seconde liste ne
+    /// redemande rien.
     #[tokio::test(flavor = "multi_thread")]
-    async fn la_passe_est_bornee_et_ne_redemande_pas_ce_qu_elle_sait() {
+    async fn une_passe_demande_tous_les_labels_inconnus_une_fois_7414() {
         let dossier = tune_core::test_scratch::scratch_dir("labels-6736-passe");
         let chemin = dossier.path().join("tune.db");
         let (_app, state) = demarrer(chemin.to_str().unwrap());
@@ -578,6 +628,7 @@ mod tests {
             .labels_de_la_bibliotheque()
             .unwrap();
         assert_eq!(liste[0].album_qobuz.as_deref(), Some("q-1"));
+        assert!(liste.len() > PASSE_MAX, "l'essai dépasse une tranche");
 
         let cache_dir = tune_core::test_scratch::scratch_dir("labels-6736-passe-cache");
         let cache = Arc::new(CacheLogosLabels::ouvrir(cache_dir.path()));
@@ -587,6 +638,7 @@ mod tests {
             compteur.clone(),
             demandes_qobuz(&liste),
             Duration::ZERO,
+            toujours,
         )
         .expect("une passe")
         .await
@@ -594,46 +646,93 @@ mod tests {
         assert_eq!(trouves, 1);
         assert_eq!(
             compteur.0.load(Ordering::SeqCst),
-            PASSE_MAX,
-            "pas de rafale"
+            20,
+            "#7414 : une seule ouverture doit demander les 20 labels, pas \
+             seulement les PASSE_MAX premiers"
         );
         assert!(cache.image("Lbl 6736 passe 00").is_some());
-
-        // La passe suivante ne reprend que les labels jamais vus.
-        lancer_passe(
-            cache.clone(),
-            compteur.clone(),
-            demandes_qobuz(&liste),
-            Duration::ZERO,
-        )
-        .unwrap()
-        .await
-        .unwrap();
-        assert_eq!(compteur.0.load(Ordering::SeqCst), 2 * PASSE_MAX);
-        lancer_passe(
-            cache.clone(),
-            compteur.clone(),
-            demandes_qobuz(&liste),
-            Duration::ZERO,
-        )
-        .unwrap()
-        .await
-        .unwrap();
-        assert_eq!(
-            compteur.0.load(Ordering::SeqCst),
-            20,
-            "chaque label demandé une fois"
-        );
         assert!(
             lancer_passe(
                 cache,
                 compteur.clone(),
                 demandes_qobuz(&liste),
-                Duration::ZERO
+                Duration::ZERO,
+                toujours,
             )
             .is_none(),
             "tout est connu, absence comprise : plus aucun appel"
         );
+        assert_eq!(compteur.0.load(Ordering::SeqCst), 20);
+    }
+
+    /// #7414 — la passe s'arrête quand on le lui dit (Enrichissement mis en
+    /// pause) : aucun label n'est demandé, et ils restent à demander.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn la_passe_s_arrete_quand_continuer_dit_non_7414() {
+        fn jamais() -> bool {
+            false
+        }
+        let cache_dir = tune_core::test_scratch::scratch_dir("labels-7414-arret");
+        let cache = Arc::new(CacheLogosLabels::ouvrir(cache_dir.path()));
+        let compteur = Arc::new(Compteur(AtomicUsize::new(0)));
+        let demandes: Vec<Demande> = (0..12)
+            .map(|i| Demande {
+                nom: format!("Lbl 7414 arret {i:02}"),
+                album_du_catalogue: None,
+            })
+            .collect();
+        lancer_passe(
+            cache.clone(),
+            compteur.clone(),
+            demandes.clone(),
+            Duration::ZERO,
+            jamais,
+        )
+        .expect("des labels à demander")
+        .await
+        .unwrap();
+        assert_eq!(compteur.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cache.a_resoudre(&demandes, maintenant(), usize::MAX).len(),
+            12
+        );
+    }
+
+    struct EnPanne(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl CatalogueDeLabels for EnPanne {
+        async fn trouver_label(
+            &self,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<Option<LabelDuCatalogue>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err("compte déconnecté".into())
+        }
+        async fn telecharger_image(&self, _: &str) -> Result<Vec<u8>, String> {
+            Err("compte déconnecté".into())
+        }
+    }
+
+    /// #7414 — une source en panne n'est pas sollicitée pour tous les labels :
+    /// une tranche entièrement en erreur arrête la passe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn une_tranche_tout_en_erreur_arrete_la_passe_7414() {
+        let cache_dir = tune_core::test_scratch::scratch_dir("labels-7414-panne");
+        let cache = Arc::new(CacheLogosLabels::ouvrir(cache_dir.path()));
+        let panne = Arc::new(EnPanne(AtomicUsize::new(0)));
+        let demandes: Vec<Demande> = (0..3 * PASSE_MAX)
+            .map(|i| Demande {
+                nom: format!("Lbl 7414 panne {i:02}"),
+                album_du_catalogue: None,
+            })
+            .collect();
+        lancer_passe(cache, panne.clone(), demandes, Duration::ZERO, toujours)
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(panne.0.load(Ordering::SeqCst), PASSE_MAX);
     }
 
     // -----------------------------------------------------------------------
