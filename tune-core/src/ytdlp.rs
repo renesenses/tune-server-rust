@@ -43,8 +43,46 @@ pub fn tools_dir() -> PathBuf {
         crate::chemins_de_travail::uid_courant(),
     );
     let dir = base.join("tools");
-    std::fs::create_dir_all(&dir).ok();
-    dir
+    // #7420 : sur Tune OS (`ProtectHome=yes`) le dossier de l'utilisateur est
+    // inaccessible et `yt-dlp: write: Permission denied (os error 13)` arrêtait
+    // l'activation de YouTube. Repli : `TUNE_DATA_DIR/tools`, inscriptible.
+    let repli = std::env::var("TUNE_DATA_DIR")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .map(|d| PathBuf::from(d).join("tools"));
+    choisir_dossier_outils(dir, repli.as_deref())
+}
+
+/// Le dossier d'outils retenu : le dossier par défaut s'il est inscriptible
+/// (ou s'il porte déjà `yt-dlp`, pour ne pas perdre un binaire installé), sinon
+/// le repli quand lui l'est. Aucun des deux : le dossier par défaut, comme avant
+/// (l'écriture dira alors son refus).
+fn choisir_dossier_outils(defaut: PathBuf, repli: Option<&Path>) -> PathBuf {
+    if defaut.join(binary_filename()).exists() || dossier_inscriptible(&defaut) {
+        return defaut;
+    }
+    match repli {
+        Some(r) if dossier_inscriptible(r) => {
+            warn!(
+                defaut = %defaut.display(),
+                repli = %r.display(),
+                "ytdlp_tools_dir_non_inscriptible_repli"
+            );
+            r.to_path_buf()
+        }
+        _ => defaut,
+    }
+}
+
+/// Crée le dossier si besoin puis y écrit et retire un fichier sonde.
+fn dossier_inscriptible(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let sonde = dir.join(".sonde-ecriture");
+    let ok = std::fs::write(&sonde, b"").is_ok();
+    let _ = std::fs::remove_file(&sonde);
+    ok
 }
 
 /// La base du dossier d'outils, variables d'environnement et repli **passés**.
@@ -600,6 +638,37 @@ mod tests {
         } else {
             assert_eq!(binary_filename(), "yt-dlp");
         }
+    }
+
+    /// #7420 : un dossier d'outils refusé (ici : un fichier à la place d'un
+    /// dossier parent, refus garanti même en root) se replie sur le dossier
+    /// inscriptible au lieu de laisser échouer l'écriture de `yt-dlp`.
+    ///
+    /// Contre-épreuve : faire rendre `defaut` à `choisir_dossier_outils` dans
+    /// tous les cas — le premier assert rougit.
+    #[test]
+    fn dossier_d_outils_refuse_se_replie_sur_le_dossier_de_donnees() {
+        let racine = crate::test_scratch::scratch_dir("tune-ytdlp-repli-7420");
+        let fichier = racine.path().join("home");
+        std::fs::write(&fichier, b"pas un dossier").unwrap();
+        let defaut = fichier.join(".cache/tune/tools");
+        let repli = racine.path().join("data/tools");
+
+        let choisi = choisir_dossier_outils(defaut.clone(), Some(&repli));
+        assert_eq!(choisi, repli, "le repli n'est pas pris");
+        std::fs::write(choisi.join("yt-dlp"), b"#!").expect("le repli doit accepter l'écriture");
+
+        // Sans repli, ou avec un repli refusé aussi : le dossier par défaut.
+        assert_eq!(choisir_dossier_outils(defaut.clone(), None), defaut);
+        let refuse = fichier.join("autre");
+        assert_eq!(
+            choisir_dossier_outils(defaut.clone(), Some(&refuse)),
+            defaut
+        );
+
+        // Un dossier par défaut inscriptible reste prioritaire.
+        let bon = racine.path().join("bon/tools");
+        assert_eq!(choisir_dossier_outils(bon.clone(), Some(&repli)), bon);
     }
 
     #[test]
