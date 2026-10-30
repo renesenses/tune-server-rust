@@ -1398,7 +1398,107 @@ async fn reregister_known_renderers_avec(state: &AppState, recours: RecoursUnica
         save_known_renderers(&state.backend, &renderers);
     }
     info!(count = renderers.len(), "reregistering_known_renderers");
+    let recovered = rattacher_les_renderers_connus(state, renderers, recours, true).await;
+    info!(recovered, "known_renderers_reregister_complete");
+}
 
+/// #6961 — échéancier de la réévaluation des zones DLNA/OpenHome hors ligne :
+/// rapprochée juste après le démarrage (le réseau de la machine peut ne pas
+/// être prêt quand la resonde unique de démarrage part), puis lente.
+const REEVALUATION_HORS_LIGNE_PREMIERS_DELAIS_S: [u64; 4] = [15, 30, 60, 120];
+const REEVALUATION_HORS_LIGNE_PERIODE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// #6961 — un renderer allumé AVANT le serveur ne doit pas rester hors ligne.
+///
+/// Au démarrage, `reset_zones_offline` met toutes les zones hors ligne ; seule
+/// une découverte les remet en ligne. Or un renderer déjà allumé n'émet pas de
+/// `NOTIFY` tant qu'il ne change pas d'état, et ceux qui ne répondent pas au
+/// `M-SEARCH` multicast (#1126) n'avaient qu'une chance : la resonde UNIQUE de
+/// [`reregister_known_renderers`], lancée dans les premières secondes. Si elle
+/// échouait — réseau de la machine pas encore prêt, appareil occupé, réponse
+/// perdue —, plus rien ne réévaluait la zone : elle restait hors ligne
+/// jusqu'au redémarrage de l'appareil, seul geste qui lui fait émettre un
+/// `NOTIFY` (Silviu, NanoPlayer, rc7).
+///
+/// Cette tâche reprend, à intervalles, la même sonde pour les seules zones
+/// DLNA/OpenHome encore hors ligne dont l'appareil est au magasin des
+/// renderers connus. Une zone en ligne n'est jamais sondée.
+pub fn spawn_reevaluation_des_zones_hors_ligne(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut delais = REEVALUATION_HORS_LIGNE_PREMIERS_DELAIS_S
+            .into_iter()
+            .map(std::time::Duration::from_secs);
+        loop {
+            let delai = delais.next().unwrap_or(REEVALUATION_HORS_LIGNE_PERIODE);
+            tokio::time::sleep(delai).await;
+            reevaluer_les_zones_hors_ligne_avec(&state, RecoursUnicast::PRODUCTION).await;
+        }
+    });
+}
+
+/// Les renderers connus dont la zone DLNA/OpenHome est hors ligne (et non
+/// masquée). Fonction sans réseau : c'est elle qui décide qui est sondé.
+fn renderers_des_zones_hors_ligne(state: &AppState) -> Vec<KnownRenderer> {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let hors_ligne: std::collections::HashSet<String> = zone_repo
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|z| !z.online)
+        .filter(|z| matches!(z.output_type.as_deref(), Some("dlna") | Some("openhome")))
+        .filter_map(|z| z.output_device_id)
+        .filter(|id| !id.is_empty() && !zone_repo.is_device_hidden(id))
+        .collect();
+    if hors_ligne.is_empty() {
+        return Vec::new();
+    }
+    let a_nous = nos_adresses(state.config.advertised_ip.as_deref());
+    let port_api = state.config.port;
+    dedup_renderers_by_location(
+        load_known_renderers(&state.backend)
+            .into_iter()
+            .filter(|kr| hors_ligne.contains(&kr.device_id))
+            .filter(|kr| !est_notre_propre_renderer(&kr.location, port_api, port_api, &a_nous))
+            .collect(),
+    )
+}
+
+/// Un passage de la réévaluation. Rend le nombre de zones rattachées.
+async fn reevaluer_les_zones_hors_ligne_avec(state: &AppState, recours: RecoursUnicast) -> usize {
+    let renderers = renderers_des_zones_hors_ligne(state);
+    if renderers.is_empty() {
+        return 0;
+    }
+    let sondes = renderers.len();
+    let rattaches = rattacher_les_renderers_connus(state, renderers, recours, false).await;
+    if rattaches > 0 {
+        info!(
+            sondes,
+            rattaches, "zones_hors_ligne_reevaluees_renderer_retrouve"
+        );
+    } else {
+        debug!(
+            sondes,
+            "zones_hors_ligne_reevaluees_aucun_renderer_retrouve"
+        );
+    }
+    rattaches
+}
+
+/// Sonde les renderers connus donnés et rattache ceux qui répondent, par le
+/// MÊME chemin qu'une découverte vivante. Rend le nombre de rattachés.
+///
+/// Partagé par la resonde de démarrage et par la réévaluation des zones hors
+/// ligne (#6961) : `au_demarrage` ne règle que le niveau de la ligne d'échec,
+/// pour qu'un appareil éteint ne remplisse pas le journal toutes les cinq
+/// minutes.
+async fn rattacher_les_renderers_connus(
+    state: &AppState,
+    renderers: Vec<KnownRenderer>,
+    recours: RecoursUnicast,
+    au_demarrage: bool,
+) -> usize {
     // LE récepteur du processus, pas un second.
     //
     // Ce chemin s'en passait : celui du gestionnaire SSDP n'était pas
@@ -1511,16 +1611,23 @@ async fn reregister_known_renderers_avec(state: &AppState, recours: RecoursUnica
                     }
                 }
             }
-            None => {
+            None if au_demarrage => {
                 warn!(
                     id = %kr.device_id,
                     location = %kr.location,
                     "known_renderer_probe_failed"
                 );
             }
+            None => {
+                debug!(
+                    id = %kr.device_id,
+                    location = %kr.location,
+                    "zone_hors_ligne_renderer_toujours_injoignable"
+                );
+            }
         }
     }
-    info!(recovered, "known_renderers_reregister_complete");
+    recovered
 }
 
 /// Spawn the mDNS handler that registers Chromecast/AirPlay/BluOS/OAAT/Squeezebox outputs.
