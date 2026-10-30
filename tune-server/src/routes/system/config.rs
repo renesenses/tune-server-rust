@@ -6750,5 +6750,9 @@ mod instantane_reglages_7343_tests {
 }
 
 #[cfg(test)]
+#[path = "config/volume_6774_tests.rs"]
+mod volume_6774_tests;
+
+#[cfg(test)]
 #[path = "racines_preservees_6175_tests.rs"]
 mod racines_preservees_6175_tests;

@@ -29,6 +29,9 @@ async-trait = { workspace = true }
 # Laissez-passer d'ecoute a distance (#6603) : la meme regle de verification
 # que le serveur, sans dependre de tune-core.
 tune-laissez-passer = { path = "../tune-laissez-passer" }
+# Empreintes des scripts en ligne du client web, dans sa politique de contenu.
+sha2 = { workspace = true }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
@@ -38,4 +41,3 @@ tune-laissez-passer = { path = "../tune-laissez-passer", features = ["fabrique"]
 # base64, dans les tests de bout en bout du pont. #6603 : aussi un vrai
 # client WebSocket pour verifier la fermeture d'une session coupee.
 tokio-tungstenite = "0.26"
-base64 = "0.22"
