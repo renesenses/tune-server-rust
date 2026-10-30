@@ -43,6 +43,11 @@ use super::etage_natif::{EcritureNative, EtageNatif, PuitsAnneauNatif, spec_du_p
 use super::*;
 use crate::outputs::wasapi_exclusive::WasapiExclusiveOutput;
 
+/// #7264 — le volume que reçoit l'étage : l'unité. Le volume logiciel est
+/// appliqué par le fil de rendu, après l'anneau (`pop_pcm_bytes_au_gain`) ;
+/// appliqué aussi dans l'étage, il le serait deux fois.
+const VOLUME_A_L_UNITE: u32 = 1000;
+
 /// Ce que le bras lisait du contexte de `play_url` — toutes déjà possédées
 /// par le fil de lecture. Elles sont DÉPLACÉES, jamais empruntées (leçon de
 /// #3386). Seul bras à lire `endpoint_id` : WASAPI ouvre l'`IMMDevice` exact
@@ -114,8 +119,10 @@ pub(super) struct EntreesWasapi {
 /// Il possède l'anneau entier (D2) — `cadence × canaux × 2`, deux secondes,
 /// comme les autres bras — et l'objet pilote. Le fil de rendu de
 /// `WasapiExclusiveOutput` tient l'autre bout de l'anneau par `Arc` et ne
-/// fait que sérialiser des mots déjà résolus (D3 : volume et DSP dans le
-/// producteur, jamais ici).
+/// faisait que sérialiser des mots déjà résolus (volume et DSP dans le
+/// producteur). #7264 : le volume pondéré dans le producteur attendait les
+/// deux secondes de l'anneau avant de s'entendre ; il est désormais appliqué
+/// par le fil de rendu, après l'anneau — le DSP reste dans le producteur.
 pub(super) struct BackendWasapi<'a> {
     wasapi: WasapiExclusiveOutput,
     anneau: Arc<NativePcmRing>,
@@ -144,6 +151,12 @@ impl BackendWasapi<'_> {
 
     fn format_info(&self) -> String {
         self.wasapi.format_info()
+    }
+
+    /// #7264 — l'anneau que le rendu lit, pour que l'étage y marque ses
+    /// passages intacts.
+    fn anneau(&self) -> Arc<NativePcmRing> {
+        self.anneau.clone()
     }
 }
 
@@ -229,7 +242,10 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
         };
 
         match ouverture {
-            Ok((wasapi, ring)) => {
+            Ok((mut wasapi, ring)) => {
+                // #7264 — le fil de rendu pondère par le volume de la zone,
+                // relu à chaque période.
+                wasapi.regler_le_volume_au_rendu(demande.volume.clone());
                 let sortie =
                     FormatOuvert::new(wasapi.opened_sample_rate(), wasapi.opened_channels() as u16);
                 Ok(BackendWasapi {
@@ -550,10 +566,14 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         &device_name,
     );
 
+    // #7264 — l'étage à l'UNITÉ : le volume est appliqué au rendu, après
+    // l'anneau de deux secondes. L'étage marque ses passages intacts (DoP)
+    // dans l'anneau pour que le rendu ne les pondère jamais.
+    let volume_de_l_etage = AtomicU32::new(VOLUME_A_L_UNITE);
     let mut etage = EtageNatif::monter(
         spec,
         backend.format_ouvert(),
-        &volume,
+        &volume_de_l_etage,
         &eq,
         &convolver,
         &crossfeed,
@@ -561,7 +581,8 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         &mono_downmix,
     )
     .avec_l_adaptation_des_canaux(&reaffectation, &disposition)
-    .avec_publication(&transformations_reelles);
+    .avec_publication(&transformations_reelles)
+    .avec_le_gain_au_rendu(backend.anneau());
     let mut puits = match backend.puits() {
         Puits::Natif(puits) => puits,
         Puits::Flottant(_) => unreachable!("BackendWasapi ne fournit qu'un puits natif"),
@@ -570,12 +591,16 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
     // Ce que le bras faisait après chaque poussée, en deux copies (amorce,
     // boucle) : l'état DoP de la zone, le volume qui le suit, le verdict du
     // chemin de signal, et sa journalisation au changement.
-    let mut publier_le_verdict = |dop: bool, bit_perfect: bool| {
+    let mut publier_le_verdict = |dop: bool, etage_intact: bool| {
         if dop_active.swap(dop, Ordering::SeqCst) != dop {
             info!(dop, "local_audio_dop_stream_state_changed");
             sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, dop);
         }
         let volume_units = volume.load(Ordering::SeqCst);
+        // #7264 — l'étage, à l'unité, ne voit plus le volume : le mot reste
+        // intact au DAC si l'étage l'a laissé intact ET que le rendu ne le
+        // pondère pas (DoP, ou volume à 100 %). Même règle que le natif S32.
+        let bit_perfect = etage_intact && (dop || volume_units == VOLUME_A_L_UNITE);
         let runtime = publish_windows_signal_path_status(
             &signal_path_status,
             bit_perfect,
