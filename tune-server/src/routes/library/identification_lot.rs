@@ -385,10 +385,12 @@ pub(super) fn refus_premium() -> Value {
         "error": "premium_required",
         "premium": false,
         "feature": "auto_enrichment",
-        "message": "L'identification de toute la bibliothèque est une fonction Premium.",
+        "message": crate::message_api::texte("api.library.identificationPremium", &[]),
+        "message_key": "api.library.identificationPremium",
         "gratuit": {
             "route": "POST /library/albums/{id}/reidentify",
-            "message": "Identifier un album à la main reste gratuit et sans limite.",
+            "message": crate::message_api::texte("api.library.manualIdentificationFree", &[]),
+            "message_key": "api.library.manualIdentificationFree",
         },
         "upgrade": "Premium unlocks unlimited auto enrichment",
     })
@@ -571,7 +573,8 @@ pub(super) async fn identification_lot_start(
             Json(json!({
                 "code": "identification_en_pause",
                 "error": "identification_en_pause",
-                "message": "L'identification est suspendue. Reprenez-la avant de la relancer.",
+                "message": crate::message_api::texte("api.library.identificationPaused", &[]),
+                "message_key": "api.library.identificationPaused",
                 "reprendre": "POST /system/taches-de-fond/identification/reprendre",
             })),
         );
@@ -595,7 +598,8 @@ pub(super) async fn identification_lot_start(
             Json(json!({
                 "code": "identification_deja_en_cours",
                 "error": "identification_deja_en_cours",
-                "message": "Une identification de la bibliothèque est déjà en cours.",
+                "message": crate::message_api::texte("api.library.identificationRunning", &[]),
+                "message_key": "api.library.identificationRunning",
                 "etat": deja,
             })),
         );
