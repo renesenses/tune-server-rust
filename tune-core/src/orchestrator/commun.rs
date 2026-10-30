@@ -172,6 +172,16 @@ impl PlaybackOrchestrator {
     }
 
     pub(super) async fn resolve_stream(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
+        if let Some(resolu) = self.reprendre_preparation_fichier(req).await {
+            return resolu;
+        }
+        self.resolve_stream_frais(req).await
+    }
+
+    pub(super) async fn resolve_stream_frais(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<ResolvedStream, String> {
         // #4407 — le traitement lu AVANT la résolution : si un réglage change
         // pendant qu'elle tourne, l'empreinte notée est l'ancienne, et le
         // prochain changement relancera. Jamais l'inverse.

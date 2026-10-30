@@ -139,6 +139,15 @@ fn register_discovered_output(
     annonce: AnnonceAppareil,
 ) {
     registry.register(output);
+    annoncer_sortie_mdns(event_bus, dev, device_type, annonce);
+}
+
+fn annoncer_sortie_mdns(
+    event_bus: &EventBus,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+    device_type: &str,
+    annonce: AnnonceAppareil,
+) {
     let charge = serde_json::json!({
         "device_id": &dev.id,
         "name": &dev.name,
@@ -1681,6 +1690,11 @@ pub fn spawn_mdns_handler(
                                 dev.host.clone(),
                                 dev.port,
                                 dev.id.clone(),
+                            )
+                            .avec_volume_annonce(
+                                dev.capabilities
+                                    .get("oaat_volume_type")
+                                    .and_then(|v| v.as_str()),
                             );
                             (Some(Box::new(oaat)), "oaat")
                         }
@@ -1815,8 +1829,50 @@ async fn enregistrer_la_sortie_mdns_et_sa_zone(
     annonce: AnnonceAppareil,
 ) {
     use tune_core::discovery::device::OutputType;
+    // Le TXT de volume peut changer sans nouvelle connexion. Actualiser la
+    // sortie OAAT existante conserve sa tâche et ses commandes en vol.
+    #[cfg(feature = "oaat")]
+    let conservee = if dev.device_type == OutputType::Oaat {
+        let existante = { outputs.lock().await.get(&dev.id) };
+        if let Some(ref sortie) = existante {
+            let sortie = sortie.lock().await;
+            if let Some(oaat) = sortie
+                .as_any()
+                .downcast_ref::<tune_core::outputs::oaat::OaatOutput>()
+            {
+                if oaat.a_la_meme_adresse(&dev.host, dev.port) && sortie.name() == dev.name {
+                    oaat.actualiser_volume_annonce(
+                        dev.capabilities
+                            .get("oaat_volume_type")
+                            .and_then(|v| v.as_str()),
+                    );
+                    drop(sortie);
+                    existante.clone()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut reg = outputs.lock().await;
-    register_discovered_output(&mut reg, output, event_bus, dev, output_type_str, annonce);
+    #[cfg(feature = "oaat")]
+    let conserver = conservee.as_ref().is_some_and(|ancienne| {
+        reg.get(&dev.id)
+            .is_some_and(|actuelle| Arc::ptr_eq(ancienne, &actuelle))
+    });
+    #[cfg(not(feature = "oaat"))]
+    let conserver = false;
+    if conserver {
+        annoncer_sortie_mdns(event_bus, dev, output_type_str, annonce);
+    } else {
+        register_discovered_output(&mut reg, output, event_bus, dev, output_type_str, annonce);
+    }
     info!(name = %dev.name, host = %dev.host, port = dev.port, r#type = output_type_str, "mdns_output_registered");
 
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
@@ -2399,7 +2455,11 @@ fn retrogradation_par_meme_nom(
     ancienne_enregistree: bool,
     nouvelle: tune_core::discovery::device::OutputType,
 ) -> bool {
-    ancienne_enregistree && priorite_du_type_de_zone(type_zone) > nouvelle.priority()
+    // #7371 — au redémarrage, mDNS peut précéder SSDP : l'absence
+    // temporaire du renderer dans le registre n'autorise pas AirPlay à
+    // reprendre une zone choisie en DLNA (entrée NET du TEAC).
+    (type_zone == Some("dlna") && nouvelle == tune_core::discovery::device::OutputType::Airplay)
+        || (ancienne_enregistree && priorite_du_type_de_zone(type_zone) > nouvelle.priority())
 }
 
 /// #6947 — un endpoint OAAT et un récepteur AirPlay sont deux sorties, même
@@ -3277,6 +3337,18 @@ mod reancrage_4520 {
 
 #[cfg(test)]
 mod retrogradation_meme_nom_6947 {
+
+    #[test]
+    fn teac_7371_une_zone_dlna_garde_son_protocole_avant_le_retour_ssdp() {
+        assert!(
+            super::retrogradation_par_meme_nom(
+                Some("dlna"),
+                false,
+                tune_core::discovery::device::OutputType::Airplay
+            ),
+            "l'annonce AirPlay reprend la zone DLNA quand SSDP n'a pas encore enregistré la sortie"
+        );
+    }
     use super::retrogradation_par_meme_nom;
     use tune_core::discovery::device::OutputType;
 
@@ -5179,3 +5251,68 @@ mod reancrage_par_mac {
         );
     }
 }
+
+#[cfg(all(test, feature = "oaat"))]
+mod volume_7333_mdns_tests {
+    use super::*;
+    use tune_core::outputs::{OutputTarget, oaat::OaatOutput};
+
+    #[tokio::test]
+    async fn une_mise_a_jour_mdns_de_volume_conserve_la_sortie_et_publie_le_refus_7333() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let mut dev = tune_core::discovery::device::DiscoveredDevice::new(
+            "oaat:7333-fictif".into(),
+            "Banc 7333".into(),
+            tune_core::discovery::device::OutputType::Oaat,
+            "127.0.0.1".into(),
+            9,
+        );
+        let sortie = OaatOutput::new(dev.name.clone(), dev.host.clone(), dev.port, dev.id.clone())
+            .avec_volume_annonce(Some("hw"));
+        assert!(sortie.capabilities().can_set_volume);
+        state.outputs.lock().await.register(Box::new(sortie));
+        let avant = state.outputs.lock().await.get(&dev.id).unwrap();
+        dev.capabilities
+            .insert("oaat_volume_type".into(), serde_json::json!("fixed"));
+        let nouvelle =
+            OaatOutput::new(dev.name.clone(), dev.host.clone(), dev.port, dev.id.clone())
+                .avec_volume_annonce(Some("fixed"));
+        let mut events = state.event_bus.subscribe();
+        enregistrer_la_sortie_mdns_et_sa_zone(
+            &state.outputs,
+            &state.backend,
+            &state.event_bus,
+            &state.playback,
+            &dev,
+            Box::new(nouvelle),
+            "oaat",
+            false,
+            AnnonceAppareil::MiseAJour,
+        )
+        .await;
+        let apres = state.outputs.lock().await.get(&dev.id).unwrap();
+        assert!(
+            Arc::ptr_eq(&avant, &apres),
+            "#7333 : la mise à jour du volume remplace la sortie et perd la connexion active"
+        );
+        let caps = crate::routes::zones::output_capabilities(&state, Some(&dev.id))
+            .await
+            .unwrap();
+        assert!(!caps.can_set_volume);
+        assert!(!caps.can_mute);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let ev = events.recv().await.unwrap();
+                if ev.event_type == EventType::DeviceUpdated.as_str() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("la mise à jour reste publiée aux clients");
+    }
+}
+
+#[cfg(test)]
+#[path = "discovery_setup/decouverte_volume_6774_tests.rs"]
+mod decouverte_volume_6774_tests;

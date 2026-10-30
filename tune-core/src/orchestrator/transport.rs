@@ -3506,6 +3506,7 @@ impl PlaybackOrchestrator {
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(zone_id, "stopped")
             .ok();
+        self.annuler_preparation_fichier(zone_id).await;
         self.cleanup_gapless_session(zone_id).await;
         self.prefetch.clear().await;
         // Forget the last network-play record so a stop→replay of the SAME track

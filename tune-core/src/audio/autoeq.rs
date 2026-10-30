@@ -161,18 +161,27 @@ impl std::fmt::Display for RaisonIgnore {
 }
 
 impl ProfilAutoEq {
-    /// La marge que Tune réservera pour ces bandes, en dB (négative ou nulle).
-    ///
-    /// C'est exactement ce que le chemin audio appliquera :
-    /// [`super::eq::EqProfile::automatic_headroom_db`] sur le même jeu de
-    /// bandes. Les bandes importées ne visant aucun canal en particulier, la
-    /// valeur est la même à gauche et à droite.
-    pub fn marge_reservee_db(&self) -> f64 {
+    /// Marges stéréo réellement réservées, gauche puis droite. Les directives
+    /// Channel de l'import stéréo ne doivent pas faire annoncer celle de gauche
+    /// comme si elle valait aussi à droite.
+    pub fn marges_reservees_db(&self) -> [f64; 2] {
         let profil = super::eq::EqProfile {
             bands: self.bandes.clone(),
             ..Default::default()
         };
-        profil.automatic_headroom_db(0)
+        [
+            profil.automatic_headroom_db(0),
+            profil.automatic_headroom_db(1),
+        ]
+    }
+
+    /// Atténuation minimale garantie sur les deux canaux (valeur la moins
+    /// négative). Inchangée pour les anciens profils globaux ; le détail par
+    /// canal est disponible dans marges_reservees_db.
+    pub fn marge_reservee_db(&self) -> f64 {
+        self.marges_reservees_db()
+            .into_iter()
+            .fold(f64::NEG_INFINITY, f64::max)
     }
 
     /// La marge de Tune est-elle au moins aussi protectrice que le `Preamp` ?
@@ -198,6 +207,10 @@ impl ProfilAutoEq {
 pub enum ErreurAutoEq {
     /// Aucune ligne `Filter … ON` exploitable.
     AucuneBande,
+    /// Une sélection stéréo inconnue ou vide.
+    CanauxInvalides { ligne: usize, valeur: String },
+    /// Le préampli par canal ne peut pas être représenté par ce profil.
+    PreampParCanal { ligne: usize },
     /// Une ligne qui n'est ni un `Preamp`, ni un `Filter`, ni un commentaire.
     LigneIncomprise { ligne: usize },
     /// `Filter n:` sans le `ON`/`OFF` qui doit suivre.
@@ -229,9 +242,17 @@ impl std::fmt::Display for ErreurAutoEq {
                 f,
                 "aucun filtre actif : ce texte n'est pas un profil AutoEq au format ParametricEQ"
             ),
+            Self::CanauxInvalides { ligne, valeur } => write!(
+                f,
+                "ligne {ligne} : Channel « {valeur} » non pris en charge (attendu L, R, 1, 2 ou all, séparés par des espaces)"
+            ),
+            Self::PreampParCanal { ligne } => write!(
+                f,
+                "ligne {ligne} : Preamp par canal non pris en charge ; aucun profil n'a été importé"
+            ),
             Self::LigneIncomprise { ligne } => write!(
                 f,
-                "ligne {ligne} : attendu « Preamp: … » ou « Filter n: … »"
+                "ligne {ligne} : attendu « Preamp: … », « Channel: … » ou « Filter n: … »"
             ),
             Self::EtatManquant { ligne } => {
                 write!(
@@ -284,11 +305,13 @@ const FREQ_MAX_HZ: f64 = 192_000.0;
 /// Analyse un profil AutoEq au format ParametricEQ.
 ///
 /// Accepte les fins de ligne `\n` et `\r\n`, les lignes vides, et les
-/// commentaires `#`. Tout le reste doit être une ligne `Preamp` ou `Filter`.
+/// commentaires `#`, Preamp, Filter et les sélections stéréo Channel L/R/all.
+/// Les autres configurations APO restent refusées, jamais ignorées.
 pub fn analyser(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
     let mut preamp_db = 0.0;
     let mut bandes = Vec::new();
     let mut ignores: Vec<FiltreIgnore> = Vec::new();
+    let mut canaux: Option<Vec<u16>> = None;
 
     for (index, brute) in texte.lines().enumerate() {
         let ligne = index + 1;
@@ -298,11 +321,28 @@ pub fn analyser(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
         }
 
         let minuscules = contenu.to_ascii_lowercase();
-        if minuscules.starts_with("preamp") {
+        if let Some((commande, valeur)) = contenu.split_once(':')
+            && commande.trim().eq_ignore_ascii_case("channel")
+        {
+            canaux = analyser_canaux(valeur, ligne)?;
+        } else if minuscules.starts_with("preamp") {
+            if canaux.is_some() {
+                return Err(ErreurAutoEq::PreampParCanal { ligne });
+            }
             preamp_db = analyser_preamp(contenu, ligne)?;
         } else if minuscules.starts_with("filter") {
             match analyser_filtre(contenu, ligne)? {
-                Ok(bande) => bandes.push(bande),
+                Ok(bande) => {
+                    if let Some(canaux) = &canaux {
+                        for &canal in canaux {
+                            let mut ciblee = bande.clone();
+                            ciblee.channel = Some(canal);
+                            bandes.push(ciblee);
+                        }
+                    } else {
+                        bandes.push(bande);
+                    }
+                }
                 // Écarté, mais NOMMÉ : voir `ProfilAutoEq::ignores`.
                 Err(ignore) => ignores.push(ignore),
             }
@@ -320,6 +360,38 @@ pub fn analyser(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
         bandes,
         ignores,
     })
+}
+
+/// APO utilise des positions à partir de 1 ; EqBandSpec utilise des indices
+/// à partir de 0. Seuls les identifiants stéréo non ambigus sont acceptés ici.
+fn analyser_canaux(valeur: &str, ligne: usize) -> Result<Option<Vec<u16>>, ErreurAutoEq> {
+    let valeur = valeur.split('#').next().unwrap_or("").trim();
+    if valeur.eq_ignore_ascii_case("all") {
+        return Ok(None);
+    }
+    let mut canaux = Vec::new();
+    for mot in valeur.split_whitespace() {
+        let canal = match mot.to_ascii_uppercase().as_str() {
+            "L" | "1" => 0,
+            "R" | "2" => 1,
+            _ => {
+                return Err(ErreurAutoEq::CanauxInvalides {
+                    ligne,
+                    valeur: valeur.into(),
+                });
+            }
+        };
+        if !canaux.contains(&canal) {
+            canaux.push(canal);
+        }
+    }
+    if canaux.is_empty() {
+        return Err(ErreurAutoEq::CanauxInvalides {
+            ligne,
+            valeur: valeur.into(),
+        });
+    }
+    Ok(Some(canaux))
 }
 
 /// `Preamp: -6.1 dB` → `-6.1`.

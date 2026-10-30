@@ -116,6 +116,9 @@ impl PlaybackOrchestrator {
         // #3365 — la qualité rangée avec ce flux part avec lui.
         self.ranger_la_qualite_pre_armee(zone_id, None).await;
         if let Some(ref sid) = old_sid {
+            if self.session_fichier_retenue(zone_id).as_ref() == Some(sid) {
+                return;
+            }
             self.streamer.remove_session(sid).await;
             debug!(zone_id, stream_id = %sid, "gapless_session_cleaned_up");
         }

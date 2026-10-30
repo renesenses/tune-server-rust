@@ -952,8 +952,9 @@ fn playlist_add_xml(media: &PlayMedia<'_>, clear: bool) -> String {
         format!("<metadata{etiquettes} />")
     };
     format!(
-        r#"<PlaylistAdd uri="{}" queued="0" clear="{}">{metadonnees}</PlaylistAdd>"#,
+        r#"<PlaylistAdd uri="{}" queued="{}" clear="{}">{metadonnees}</PlaylistAdd>"#,
         escape_xml(media.url),
+        if clear { 0 } else { 1 },
         if clear { 1 } else { 0 }
     )
 }
@@ -1068,7 +1069,7 @@ mod tests {
         };
         assert_eq!(
             playlist_add_xml(&media, false),
-            r#"<PlaylistAdd uri="http://h/s.flac" queued="0" clear="0"></PlaylistAdd>"#
+            r#"<PlaylistAdd uri="http://h/s.flac" queued="1" clear="0"></PlaylistAdd>"#
         );
     }
 
