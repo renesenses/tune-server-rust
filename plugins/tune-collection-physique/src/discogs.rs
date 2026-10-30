@@ -69,7 +69,7 @@ fn famille_du_format(nom: &str) -> Option<Famille> {
     let n = nom.trim().to_ascii_lowercase();
     match n.as_str() {
         "box set" | "all media" => None,
-        "vinyl" | "lathe cut" | "acetate" | "flexi-disc" | "shellac" => Some(Famille::Vinyle),
+        "vinyl" | "acetate" | "flexi-disc" | "shellac" => Some(Famille::Vinyle),
         "sacd" => Some(Famille::Sacd),
         "cd" | "cdr" | "cdv" | "minidisc" | "hdcd" | "blu-spec cd" | "shm-cd" => Some(Famille::Cd),
         "cassette" | "microcassette" | "dcc" | "8-track cartridge" => Some(Famille::Cassette),
