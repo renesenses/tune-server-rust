@@ -913,6 +913,37 @@ jobs:
 
             WriteUninstaller "`$INSTDIR\uninstall.exe"
 
+            ; #7371 - regle de pare-feu ENTRANTE "Tune" pour tune-server.exe,
+            ; profil PRIVE seulement (decision de Bertrand du 30/10/2026).
+            ; L'installeur reste par utilisateur, sans droits administrateur :
+            ; seule cette etape est elevee (UAC, une fois). Une regle par
+            ; programme couvre TCP et UDP sur tous les ports que Tune ouvre :
+            ; HTTP 8888 (interface, flux servis aux renderers DLNA), SSDP 1900
+            ; (reponses aux M-SEARCH, NOTIFY), mDNS 5353, SlimProto 3483 et CLI
+            ; 9090, canaux AirPlay, OAAT... Sans elle, Windows filtre les
+            ; reponses SSDP au-dela de 3 s et un renderer DLNA n'est jamais vu.
+            ; Deja presente (mise a jour) : rien a demander. Refusee ou en echec :
+            ; Tune s'installe quand meme, et le dit.
+            nsExec::ExecToStack '"`$SYSDIR\netsh.exe" advfirewall firewall show rule name="Tune"'
+            Pop `$0
+            Pop `$1
+            StrCmp `$0 "0" pf_regle_presente
+            ClearErrors
+            ExecShellWait "runas" "`$SYSDIR\netsh.exe" 'advfirewall firewall add rule name="Tune" dir=in action=allow program="`$INSTDIR\tune-server.exe" enable=yes profile=private' SW_HIDE
+            nsExec::ExecToStack '"`$SYSDIR\netsh.exe" advfirewall firewall show rule name="Tune"'
+            Pop `$0
+            Pop `$1
+            StrCmp `$0 "0" pf_regle_creee
+            DetailPrint "Pare-feu : regle Tune non creee (autorisation refusee ou echec)."
+            MessageBox MB_OK|MB_ICONINFORMATION "Tune est installe, mais la regle du pare-feu Windows n'a pas ete creee.$\r$\n$\r$\nSans elle, certains lecteurs reseau (DLNA/UPnP, AirPlay) peuvent rester invisibles ou muets. Au premier lancement, autorisez tune-server.exe sur les reseaux prives, ou relancez cet installeur." /SD IDOK
+            Goto pf_fin
+          pf_regle_creee:
+            DetailPrint "Pare-feu : regle entrante Tune creee (reseaux prives)."
+            Goto pf_fin
+          pf_regle_presente:
+            DetailPrint "Pare-feu : regle entrante Tune deja presente."
+          pf_fin:
+
             ; Registry for Add/Remove Programs
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "DisplayName" "Tune Server"
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "DisplayVersion" "${version}"
@@ -928,6 +959,14 @@ jobs:
             Delete "`$DESKTOP\Tune Server.lnk"
             RMDir /r "`$SMPROGRAMS\Tune Server"
             DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer"
+            ; #7371 - retirer la regle de pare-feu "Tune" posee a l'installation
+            ; (elevation demandee seulement si elle existe).
+            nsExec::ExecToStack '"`$SYSDIR\netsh.exe" advfirewall firewall show rule name="Tune"'
+            Pop `$0
+            Pop `$1
+            StrCmp `$0 "0" 0 pf_desinstallation_fin
+            ExecShellWait "runas" "`$SYSDIR\netsh.exe" 'advfirewall firewall delete rule name="Tune"' SW_HIDE
+          pf_desinstallation_fin:
           SectionEnd
           "@ | Out-File -Encoding ASCII installer.nsi
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" installer.nsi

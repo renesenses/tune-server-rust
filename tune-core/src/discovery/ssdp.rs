@@ -13,6 +13,21 @@ use super::xml_parser::{DeviceDescription, fetch_device_description};
 const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
+/// #7371 — délai de réponse (`MX`) demandé aux appareils dans le M-SEARCH.
+///
+/// Un appareil répond à un instant aléatoire entre 0 et `MX` secondes
+/// (UPnP Device Architecture 1.1 §1.3.3). Or le pare-feu de Windows, réglage
+/// par défaut « Autoriser la réponse en monodiffusion », n'accepte les réponses
+/// unicast à un envoi multicast que pendant TROIS secondes : au-delà, il les
+/// jette tant que `tune-server.exe` n'a pas de règle entrante — le cas d'un
+/// installeur sans droits administrateur dont l'invite du pare-feu a été
+/// refusée, ou d'un réseau classé « Public ». Avec `MX: 5`, deux réponses sur
+/// cinq d'un renderer DLNA tombaient hors de cette fenêtre ; un appareil qui
+/// répond toujours tard (TEAC NT-505X, VNAV) n'était jamais découvert en DLNA
+/// alors que son annonce mDNS AirPlay passait. `MX: 2` garde toutes les
+/// réponses conformes sous les trois secondes, marge réseau comprise.
+/// L'écoute ([`SEARCH_TIMEOUT`]) reste plus longue, pour les retardataires.
+const MSEARCH_MX_S: u64 = 2;
 const SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(120);
 const PERIODIC_RESCAN_INTERVAL: Duration = Duration::from_secs(300);
@@ -929,14 +944,7 @@ async fn send_msearch_from(
     let socket = UdpSocket::from_std(std::net::UdpSocket::from(sock2))
         .map_err(|e| format!("from_std: {e}"))?;
 
-    let msg = format!(
-        "M-SEARCH * HTTP/1.1\r\n\
-         HOST: 239.255.255.250:1900\r\n\
-         MAN: \"ssdp:discover\"\r\n\
-         MX: 5\r\n\
-         ST: {target}\r\n\
-         \r\n"
-    );
+    let msg = requete_msearch(target);
 
     let dest = SocketAddr::from((SSDP_MULTICAST_ADDR, SSDP_PORT));
     socket
@@ -978,6 +986,18 @@ async fn send_msearch_from(
     debug!(bind = %bind_ip, target, recv_count, parsed, "ssdp_search_done");
 
     Ok(parsed)
+}
+
+/// Le M-SEARCH multicast envoyé sur chaque interface (voir [`MSEARCH_MX_S`]).
+fn requete_msearch(target: &str) -> String {
+    format!(
+        "M-SEARCH * HTTP/1.1\r\n\
+         HOST: 239.255.255.250:1900\r\n\
+         MAN: \"ssdp:discover\"\r\n\
+         MX: {MSEARCH_MX_S}\r\n\
+         ST: {target}\r\n\
+         \r\n"
+    )
 }
 
 pub(crate) fn parse_ssdp_response(data: &[u8]) -> Option<SsdpResponse> {
@@ -3979,3 +3999,7 @@ mod classement_des_composites {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ssdp_mx_pare_feu_windows_7371_tests.rs"]
+mod mx_pare_feu_windows_7371_tests;
