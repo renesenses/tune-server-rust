@@ -158,6 +158,10 @@ pub struct AirplayOutput {
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
     volume: Arc<Mutex<f64>>,
+    /// Fil 2553 — une consigne reçue hors session RTSP (zone arrêtée, entre
+    /// deux pistes) : AirPlay 1 n'a aucun canal pour la porter, elle part
+    /// au début de la session suivante, une fois, puis s'efface.
+    volume_en_attente: Arc<Mutex<Option<f64>>>,
     muted: Arc<AtomicBool>,
     current_title: Arc<Mutex<Option<String>>>,
     current_artist: Arc<Mutex<Option<String>>>,
@@ -264,6 +268,7 @@ impl AirplayOutput {
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
             volume: Arc::new(Mutex::new(1.0)),
+            volume_en_attente: Arc::new(Mutex::new(None)),
             muted: Arc::new(AtomicBool::new(false)),
             current_title: Arc::new(Mutex::new(None)),
             current_artist: Arc::new(Mutex::new(None)),
@@ -614,6 +619,30 @@ fn setup_failure_message(code: u32) -> String {
     format!("AirPlay SETUP failed: {code}")
 }
 
+impl AirplayOutput {
+    /// Fil 2553 — envoie, juste après RECORD, la consigne restée sans
+    /// session. Un refus ne fait pas échouer la lecture : il est dit, et la
+    /// consigne est rendue à l'attente pour le prochain geste ou la
+    /// prochaine session.
+    async fn appliquer_le_volume_en_attente(&self, session: &mut RtspSession) {
+        let Some(volume) = self.volume_en_attente.lock().await.take() else {
+            return;
+        };
+        let db = if self.muted.load(Ordering::SeqCst) {
+            -144.0
+        } else {
+            linear_to_airplay_db(volume)
+        };
+        match session.set_volume_rtsp(db).await {
+            Ok(()) => info!(device = %self.name, volume, db, "airplay_volume_en_attente_applique"),
+            Err(error) => {
+                warn!(device = %self.name, volume, error = %error, "airplay_volume_en_attente_refuse");
+                self.volume_en_attente.lock().await.get_or_insert(volume);
+            }
+        }
+    }
+}
+
 fn linear_to_airplay_db(volume: f64) -> f64 {
     if volume <= 0.0 {
         -144.0
@@ -780,6 +809,8 @@ impl OutputTarget for AirplayOutput {
             return Err(raison);
         }
 
+        self.appliquer_le_volume_en_attente(&mut session).await;
+
         let server_port = session.server_port;
         let target_addr = format!("{}:{}", self.host, server_port);
         udp.connect(&target_addr)
@@ -898,12 +929,22 @@ impl OutputTarget for AirplayOutput {
         let volume = volume.clamp(0.0, 1.0);
         let db = linear_to_airplay_db(volume);
         let mut session = self.rtsp_session.lock().await;
-        session
-            .as_mut()
-            .ok_or("AirPlay volume requires an active RTSP session")?
-            .set_volume_rtsp(db)
-            .await?;
-        drop(session);
+        let Some(session) = session.as_mut() else {
+            // Fil 2553 (Zeppelin Air, rc9) : la consigne donnée zone arrêtée
+            // était refusée (« requires an active RTSP session ») et PERDUE.
+            // La lecture suivante partait au niveau propre de l'enceinte
+            // pendant que Tune affichait la consigne. Elle attend désormais
+            // la session suivante, qui l'envoie après RECORD. Seule une
+            // consigne explicite attend : rien n'est réaffirmé à chaque
+            // piste (#2395).
+            *self.volume_en_attente.lock().await = Some(volume);
+            *self.volume.lock().await = volume;
+            self.muted.store(false, Ordering::SeqCst);
+            info!(device = %self.name, volume, "airplay_volume_en_attente_de_session");
+            return Ok(());
+        };
+        session.set_volume_rtsp(db).await?;
+        *self.volume_en_attente.lock().await = None;
         *self.volume.lock().await = volume;
         self.muted.store(false, Ordering::SeqCst);
         Ok(())
@@ -2000,3 +2041,7 @@ mod identite_tests_6885;
 #[cfg(test)]
 #[path = "airplay_fermeture_tests_7259.rs"]
 mod fermeture_tests_7259;
+
+#[cfg(test)]
+#[path = "airplay_volume_hors_session_tests_2553.rs"]
+mod volume_hors_session_tests_2553;

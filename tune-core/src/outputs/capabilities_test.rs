@@ -304,18 +304,12 @@ async fn oaat_multiroom_ne_promet_ni_seek_ni_gapless() {
 
 #[tokio::test]
 async fn un_echec_backend_ne_change_pas_le_statut_confirme() {
+    // Fil 2553 : AirPlay 1 sans session RTSP ne refuse plus la consigne, il
+    // la garde pour la session suivante. Son refus par un récepteur EN
+    // session est couvert par `airplay_volume_hors_session_tests_2553`.
     let airplay = AirplayOutput::new("AirPlay".into(), "airplay-1".into(), "127.0.0.1".into(), 9);
-    let error = airplay.checked_set_volume(0.25).await.unwrap_err();
-    assert!(matches!(
-        error,
-        OutputCommandError::Failed {
-            command: OutputCommand::SetVolume,
-            ..
-        }
-    ));
-    let status = airplay.get_status().await.unwrap();
-    assert_eq!(status.volume, 1.0);
-    assert!(!status.muted);
+    airplay.checked_set_volume(0.25).await.unwrap();
+    assert_eq!(airplay.get_status().await.unwrap().volume, 0.25);
 
     let airplay2 = Airplay2Output::new(
         "AirPlay 2".into(),
