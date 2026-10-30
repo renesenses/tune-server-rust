@@ -515,3 +515,41 @@ async fn sur_une_sortie_locale_volume_reste_le_gain_et_le_curseur_est_db60_6787(
     assert_eq!(lin["volume_curve"], "linear", "{lin}");
     assert!(proche(lin["volume"].as_f64().unwrap(), 0.5), "{lin}");
 }
+
+/// #7517 — un confort au-dessus de la sécurité est refusé à l'enregistrement,
+/// en fraction, en dB et en dB d'appareil ; égal ou en dessous est accepté, et
+/// un refus n'écrit rien.
+#[tokio::test]
+async fn un_confort_au_dessus_de_la_securite_est_refuse_7517() {
+    let (app, _state, id) = serveur().await;
+    regler(&app, id, json!({ "safety": 0.5, "comfort": 0.3 })).await;
+    for corps in [
+        json!({ "safety": 0.3, "comfort": 0.5 }),
+        json!({ "safety_db": -10.0, "comfort_db": -3.0 }),
+        json!({ "safety": 0.3, "comfort_db": -3.0 }),
+    ] {
+        let (statut, rendu) = appeler(
+            &app,
+            "PUT",
+            &format!("/api/v1/zones/{id}/volume-limits"),
+            corps.clone(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::BAD_REQUEST, "{corps}");
+        assert_eq!(rendu["error"], "comfort_above_safety", "{rendu}");
+    }
+    // Contre-épreuve : rien n'a été écrit par les refus.
+    let (_, lu) = appeler(
+        &app,
+        "GET",
+        &format!("/api/v1/zones/{id}/volume-limits"),
+        Value::Null,
+    )
+    .await;
+    assert!(proche(lu["volume_limit_safety"].as_f64().unwrap(), 0.5), "{lu}");
+    assert!(proche(lu["volume_limit_comfort"].as_f64().unwrap(), 0.3), "{lu}");
+    // Égaux, ou confort seul, ou sécurité seule : acceptés.
+    regler(&app, id, json!({ "safety": 0.4, "comfort": 0.4 })).await;
+    regler(&app, id, json!({ "comfort": 0.9 })).await;
+    regler(&app, id, json!({ "safety": 0.2 })).await;
+}
