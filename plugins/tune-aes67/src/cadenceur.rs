@@ -235,7 +235,7 @@ fn boucle(
             // Un envoi refusé (réseau absent) ne doit pas arrêter la lecture :
             // le compteur le dit, le journal une fois sur mille.
             let n = stats.erreurs_d_envoi.fetch_add(1, Ordering::Relaxed);
-            if n % 1000 == 0 {
+            if n.is_multiple_of(1000) {
                 warn!(error = %e, erreurs = n + 1, "aes67_envoi_refuse");
             }
         }

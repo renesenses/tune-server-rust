@@ -27,7 +27,9 @@ pub fn ecrire_l24(echantillons: &[i32], dst: &mut Vec<u8>) {
 /// Relit du L24 gros-boutiste en valeurs 24 bits signées (étendues sur 32).
 /// Un reste de moins de 3 octets est ignoré.
 pub fn lire_l24(src: &[u8]) -> Vec<i32> {
-    src.chunks_exact(OCTETS_PAR_ECHANTILLON)
+    src.as_chunks::<OCTETS_PAR_ECHANTILLON>()
+        .0
+        .iter()
         .map(|o| (i32::from_be_bytes([o[0], o[1], o[2], 0])) >> 8)
         .collect()
 }

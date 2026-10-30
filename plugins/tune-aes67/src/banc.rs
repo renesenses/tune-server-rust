@@ -235,7 +235,9 @@ fn ipv4_udp(source: SocketAddrV4, destination: SocketAddrV4, charge: &[u8]) -> V
     p.extend_from_slice(&source.ip().octets());
     p.extend_from_slice(&destination.ip().octets());
     let mut somme: u32 = p
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|m| u32::from(u16::from_be_bytes([m[0], m[1]])))
         .sum();
     while somme > 0xffff {
@@ -356,7 +358,9 @@ mod tests {
         );
         assert_eq!(p.len(), 20 + 8 + 3);
         let mut somme: u32 = p[..20]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|m| u32::from(u16::from_be_bytes([m[0], m[1]])))
             .sum();
         while somme > 0xffff {

@@ -167,6 +167,9 @@ pub fn decoder(
     }
 }
 
+/// La tâche du décodeur : `(profondeur, cadence)` rendues, ou l'erreur.
+pub type TacheDuDecodeur = tokio::task::JoinHandle<Result<(u16, u32), String>>;
+
 /// Lance le décodeur sur un fil BLOQUANT du runtime tokio, comme AirPlay
 /// (`spawn_blocking`) : certaines branches du décodeur (DSD, Opus…) passent
 /// par `Handle::block_on` et exigent un runtime. Rend le canal du PCM et la
@@ -176,10 +179,7 @@ pub fn lancer_le_decodeur(
     source: SourceAudio,
     cadence: u32,
     canaux: u16,
-) -> (
-    mpsc::Receiver<Vec<u8>>,
-    tokio::task::JoinHandle<Result<(u16, u32), String>>,
-) {
+) -> (mpsc::Receiver<Vec<u8>>, TacheDuDecodeur) {
     let (tx, rx) = mpsc::channel(CAPACITE_DU_CANAL);
     let tache = runtime.spawn_blocking(move || decoder(&source, cadence, canaux, tx));
     (rx, tache)
@@ -189,7 +189,7 @@ pub fn lancer_le_decodeur(
 /// asynchrone : `block_on` y paniquerait).
 pub fn attendre_le_decodeur(
     runtime: &tokio::runtime::Handle,
-    tache: tokio::task::JoinHandle<Result<(u16, u32), String>>,
+    tache: TacheDuDecodeur,
 ) -> Result<(u16, u32), String> {
     runtime
         .block_on(tache)
@@ -257,7 +257,9 @@ impl LecteurPcm {
                 continue;
             }
             let e: Vec<i32> = self.reste[..complets]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|o| i32::from_le_bytes([o[0], o[1], o[2], o[3]]))
                 .collect();
             self.reste.drain(..complets);
@@ -315,10 +317,11 @@ pub fn lancer(
                 }
             }
             lecteur.fermer();
-            if !interrompu && erreur.is_none() {
-                if let Some(dernier) = paquetiseur.vider() {
-                    let _ = tx.send(Message::Charge(dernier));
-                }
+            if !interrompu
+                && erreur.is_none()
+                && let Some(dernier) = paquetiseur.vider()
+            {
+                let _ = tx.send(Message::Charge(dernier));
             }
             let _ = tx.send(Message::Fin);
             // L'erreur du décodeur prime : « flux sans en-tête » n'en est
