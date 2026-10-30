@@ -2503,6 +2503,9 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                     }));
                 } else {
                     let album = extract_xml_tag(element, "upnp:album");
+                    let year = extract_xml_tag(element, "dc:date").and_then(|v| annee_didl(&v));
+                    let genres = genres_didl(element);
+
                     // A server may announce SEVERAL <res> per item — Lyrion/LMS
                     // lists the original file (download.flc, with duration) plus
                     // on-the-fly transcodes (download.pcm headerless raw PCM with
@@ -2548,6 +2551,9 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                         "title": title,
                         "artist": artist,
                         "album": album,
+                        "year": year,
+                        "genre": genres.first(),
+                        "genres": genres,
                         "res_url": res_url,
                         "album_art_uri": album_art_uri,
                         "duration_ms": duration_ms,
@@ -2771,6 +2777,52 @@ fn numero_didl(brut: &str) -> Option<u32> {
         .take_while(char::is_ascii_digit)
         .collect();
     chiffres.parse::<u32>().ok().filter(|n| *n > 0)
+}
+
+/// Ne pas tirer une année d'un préfixe numérique arbitraire.
+fn annee_didl(date: &str) -> Option<i32> {
+    let date = date.trim();
+    let year = date.get(..4)?;
+    if !year.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i32 = year.parse().ok().filter(|y| (1..=9999).contains(y))?;
+    let valide = match date.len() {
+        4 => true,
+        7 => {
+            date.as_bytes()[4] == b'-'
+                && date[5..]
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(|mois| chrono::NaiveDate::from_ymd_opt(year, mois, 1))
+                    .is_some()
+        }
+        10 => chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok(),
+        _ => {
+            chrono::DateTime::parse_from_rfc3339(date).is_ok()
+                || chrono::NaiveDateTime::parse_from_str(date, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
+        }
+    };
+    valide.then_some(year)
+}
+
+fn genres_didl(mut element: &str) -> Vec<String> {
+    let mut genres = Vec::new();
+    while let Some(start) = balise_ouvrante(element, 0, "upnp:genre", true) {
+        let rest = &element[start..];
+        let Some(end) = rest.find("</upnp:genre>") else {
+            break;
+        };
+        if let Some(genre) = extract_xml_tag(&rest[..end + "</upnp:genre>".len()], "upnp:genre") {
+            let genre = genre.trim().to_string();
+            if !genre.is_empty() && !genre.eq_ignore_ascii_case("null") && !genres.contains(&genre)
+            {
+                genres.push(genre);
+            }
+        }
+        element = &rest[end + "</upnp:genre>".len()..];
+    }
+    genres
 }
 
 fn extract_xml_tag(element: &str, tag: &str) -> Option<String> {

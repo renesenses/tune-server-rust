@@ -281,6 +281,8 @@ mod tests {
             protocol_info: Some("http-get:*:audio/flac:*".into()),
             numero_de_piste: None,
             numero_de_disque: None,
+            annee: None,
+            genres: Vec::new(),
         }
     }
 
