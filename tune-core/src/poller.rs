@@ -1561,4 +1561,7 @@ mod annonce_du_contrat_de_signal_4559;
 mod arret_dementi_par_la_position_6717;
 
 #[cfg(test)]
+mod cohabitation_airplay_tests_7259;
+
+#[cfg(test)]
 mod fin_upnp_6634_tests;
