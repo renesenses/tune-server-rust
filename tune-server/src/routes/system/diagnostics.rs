@@ -208,7 +208,7 @@ fn couper_le_rapport(complet: &str, max: usize) -> String {
     };
     let fixe = avant.chars().count()
         + suite.chars().count()
-        + phrase(lignes.len(), &[]).chars().count()
+        + phrase(lignes.len(), &lignes).chars().count()
         + 5;
     let Some(budget) = max.checked_sub(fixe) else {
         return repli();
@@ -3984,7 +3984,7 @@ mod log_tail_tests {
             !coupe.contains("ligne-0000"),
             "la plus ancienne doit partir"
         );
-        assert!(coupe.contains("plus anciennes ont été retirées"));
+        assert!(coupe.contains("lignes de journal les plus anciennes"));
         assert!(coupe.contains("période conservée"));
         assert!(!coupe.contains("report truncated"));
         assert!(coupe.trim_end().ends_with("```"));
