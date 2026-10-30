@@ -1686,6 +1686,14 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/stop", post(stop))
         .route("/{id}/next", post(next))
         .route("/{id}/previous", post(previous))
+        .route(
+            "/{id}/browser-next",
+            post(suivante_navigateur_5975::preparer),
+        )
+        .route(
+            "/{id}/browser-next/playing",
+            post(suivante_navigateur_5975::adopter),
+        )
         // #6066 — le lecteur d'une zone navigateur dit qu'il joue : c'est la
         // seule preuve d'écoute qui ne soit pas une sonde de plage.
         .route(
@@ -1831,6 +1839,12 @@ mod sortie_de_pure_recompose_le_trim_6213;
 #[cfg(test)]
 mod aleatoire_dans_la_file_6526;
 
+/// #7378 — « Ce téléphone » (zone navigateur) : « Suivant » après l'aléatoire
+/// joue la file relue, pas l'ordre d'origine.
+#[cfg(test)]
+#[path = "playback/aleatoire_zone_navigateur_7378_tests.rs"]
+mod aleatoire_zone_navigateur_7378_tests;
+
 /// #5975 — le lecteur d'une zone navigateur dit pourquoi il ne joue pas.
 #[path = "playback/erreur_media_navigateur.rs"]
 mod erreur_media_navigateur;
@@ -1838,6 +1852,7 @@ mod erreur_media_navigateur;
 mod lecture_navigateur;
 /// #5395 — la radio artiste à la demande.
 mod radio_artiste;
+mod suivante_navigateur_5975;
 
 /// Replace a zone's queue after taking the SQLite user-write lane.
 ///

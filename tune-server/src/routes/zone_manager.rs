@@ -511,7 +511,8 @@ fn audio_calibration_unavailable_payload(group_id: i64) -> Value {
         "error": "audio_calibration_unavailable",
         "group_id": group_id,
         "synchronization": generic_group_synchronization_contract(),
-        "message": "Tune ne synchronise pas les renderers indépendants de ce groupe. Le RTT de commande ne mesure pas leur latence audio. Pour une lecture planifiée par timestamps de présentation, utilisez des points de diffusion Tune/OAAT.",
+        "message": crate::message_api::texte("api.groups.audioCalibrationUnavailable", &[]),
+        "message_key": "api.groups.audioCalibrationUnavailable",
     })
 }
 
@@ -914,7 +915,8 @@ async fn sync_stats(State(state): State<AppState>) -> Json<Value> {
         "max_drift_ms": max_drift_ms,
         "measurement": "reported_playback_position",
         "synchronization_guarantee": false,
-        "warning": "Les positions rapportées par des renderers indépendants ne prouvent pas une restitution audio synchronisée.",
+        "warning": crate::message_api::texte("api.groups.reportedPositionsNotSync", &[]),
+        "warning_key": "api.groups.reportedPositionsNotSync",
     }))
 }
 
@@ -994,7 +996,8 @@ async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
         "measurement": "control_rtt",
         "audio_latency_available": false,
         "synchronization_scope": "oaat_only",
-        "warning": "Le RTT de commande ne mesure pas la latence de restitution audio. Tune ne promet une planification synchronisée que pour ses points de diffusion OAAT.",
+        "warning": crate::message_api::texte("api.groups.controlRttNotAudioLatency", &[]),
+        "warning_key": "api.groups.controlRttNotAudioLatency",
         "measured_at": now_iso(),
     }))
 }
@@ -1099,13 +1102,13 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
             "oaat_multiroom_group_refused_unreachable_endpoints"
         );
         return Json(json!({
-            "error": format!(
-                "Ces appareils ne répondent pas comme des points de diffusion Tune : {}. \
-                 Le multiroom synchronisé relie des points de diffusion Tune entre eux ; \
-                 un lecteur DLNA ou AirPlay ne peut pas en faire partie. \
-                 Le groupe n'a pas été créé.",
-                unreachable.join(", ")
+            "error": "oaat_endpoints_unreachable",
+            "code": "oaat_endpoints_unreachable",
+            "message": crate::message_api::texte(
+                "api.groups.unreachableEndpoints",
+                &[("endpoints", unreachable.join(", "))],
             ),
+            "message_key": "api.groups.unreachableEndpoints",
             "unreachable_endpoints": unreachable,
         }));
     }

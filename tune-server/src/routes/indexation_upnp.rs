@@ -554,11 +554,10 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
     let Some(ms) = serveurs.get(id).cloned() else {
         return Json(json!({
             "indexe": false,
-            "raison": "serveur inconnu",
-            "detail": format!(
-                "aucun serveur multimédia enregistré sous « {id} » — \
-                 la liste vit dans GET /api/v1/network/media-servers"
-            ),
+            "code": "unknown_server",
+            "raison": crate::message_api::texte("api.upnp.unknownServer", &[]),
+            "detail": crate::message_api::texte("api.upnp.unknownServerDetail", &[("id", id.to_string())]),
+            "message_key": "api.upnp.unknownServerDetail",
         }));
     };
     drop(serveurs);

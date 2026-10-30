@@ -424,6 +424,15 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
             "activation_error": tune_plugin_native::failure(&info.name),
             "compatible": true,
         });
+        // tune-web-client#2527 — ce que le greffon CHARGÉ fournit au client
+        // web. Seul `web_theme` existe : le chemin complet de son thème, que
+        // le client applique sans connaître le nom du greffon. Jamais sur une
+        // fiche dormante (plus bas) : ses routes ne sont pas montées.
+        if let Some(route) = info.web_theme.as_deref() {
+            card["provides"] = json!({
+                "web_theme": format!("/api/v1/ext/{}{}", info.name, route),
+            });
+        }
         // Greffons audio premium : `installed`, `install_proposed`,
         // `existing_configuration` à la racine, lus en base à chaque appel.
         crate::premium_audio_plugins::annotate(&settings, &info.name, &mut card);

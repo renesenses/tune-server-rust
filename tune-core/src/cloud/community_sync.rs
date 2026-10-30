@@ -227,15 +227,37 @@ pub(crate) const PAUSE_ENTRE_LOTS: std::time::Duration = std::time::Duration::fr
 /// sens d'avant à l'identique (même casse, mêmes espaces). Sans le filtre plié,
 /// chaque `UPDATE` balayait toute la table `tracks` : 1000 balayages de plus de
 /// 100 000 lignes sur le .18, de 23 à 52 s d'écriture d'affilée.
-pub(crate) const SQL_APPLIQUER_ENRICHISSEMENT: &str = "UPDATE tracks SET \
-     genre = COALESCE(genre, ?), \
+///
+/// #7538 — le genre passe par
+/// [`crate::metadata::enrichment::GENRE_COMBLE_PAR_L_ENRICHISSEMENT`] : ni le
+/// tableau `genres` d'une piste, ni le genre de son album ne sont remplacés
+/// par celui du nuage. Et la requête jouée reçoit la clause des dossiers
+/// exclus de l'enrichissement ([`sql_appliquer_enrichissement`]).
+pub(crate) const SQL_APPLIQUER_ENRICHISSEMENT: &str = concat!(
+    "UPDATE tracks SET genre = ",
+    crate::metadata::enrichment::genre_comble_par_l_enrichissement!(),
+    ", \
      year = COALESCE(year, ?), \
      composer = COALESCE(composer, ?), \
      label = COALESCE(label, ?), \
      isrc = COALESCE(isrc, ?) \
      WHERE LOWER(TRIM(musicbrainz_recording_id)) = LOWER(TRIM(?)) \
      AND musicbrainz_recording_id = ? \
-     AND (genre IS NULL OR year IS NULL OR composer IS NULL)";
+     AND (genre IS NULL OR year IS NULL OR composer IS NULL)"
+);
+
+/// #7538 — [`SQL_APPLIQUER_ENRICHISSEMENT`] et la clause des dossiers exclus
+/// de l'enrichissement, lue une fois par lot. Rien de réglé : la requête
+/// constante, au caractère près.
+pub(crate) fn sql_appliquer_enrichissement(backend: &Arc<dyn DbBackend>) -> String {
+    format!(
+        "{SQL_APPLIQUER_ENRICHISSEMENT}{}",
+        crate::taches_de_fond::perimetre::clause_hors_enrichissement(
+            backend,
+            crate::taches_de_fond::perimetre::CHEMIN_OUVRABLE_DE_TRACKS,
+        )
+    )
+}
 
 fn parametres(e: &Enrichissement) -> [&dyn ToSqlValue; 7] {
     [
@@ -262,10 +284,11 @@ pub(crate) fn appliquer_un_lot(backend: &Arc<dyn DbBackend>, lot: &[Enrichisseme
     // les écrivains de premier plan qui attendent (sondeur, file, historique).
     let _fond = crate::taches_de_fond::priorite::politique::marquer_le_fil_de_fond();
     let mut appliques = 0usize;
+    let sql = sql_appliquer_enrichissement(backend);
     let en_transaction = backend.write_tx(&mut |tx| {
         appliques = 0;
         for e in lot {
-            tx.execute(SQL_APPLIQUER_ENRICHISSEMENT, &parametres(e))?;
+            tx.execute(&sql, &parametres(e))?;
             appliques += 1;
         }
         Ok(())
@@ -274,11 +297,7 @@ pub(crate) fn appliquer_un_lot(backend: &Arc<dyn DbBackend>, lot: &[Enrichisseme
         return appliques;
     }
     lot.iter()
-        .filter(|e| {
-            backend
-                .execute(SQL_APPLIQUER_ENRICHISSEMENT, &parametres(e))
-                .is_ok()
-        })
+        .filter(|e| backend.execute(&sql, &parametres(e)).is_ok())
         .count()
 }
 
@@ -339,9 +358,12 @@ pub async fn resolve_missing_mbids(
     let cutoff = now_epoch_secs()
         .saturating_sub(RESOLVE_RETRY_SECS)
         .to_string();
+    // #7538 — une piste d'un dossier exclu de l'enrichissement n'est pas
+    // candidate : ni MBID, ni genre venus du nuage.
     let rows = backend
         .query_many(
-            "SELECT t.id, ar.name, al.title, t.title \
+            &format!(
+                "SELECT t.id, ar.name, al.title, t.title \
              FROM tracks t \
              LEFT JOIN artists ar ON t.artist_id = ar.id \
              LEFT JOIN albums al ON t.album_id = al.id \
@@ -351,8 +373,13 @@ pub async fn resolve_missing_mbids(
                AND NOT EXISTS ( \
                  SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'mb_resolve_tried' AND m.value >= ? \
-               ) \
+               ){} \
              LIMIT 100",
+                crate::taches_de_fond::perimetre::clause_hors_enrichissement(
+                    backend,
+                    crate::db::track_repo::sql::CHEMIN_OUVRABLE,
+                )
+            ),
             &[&cutoff as &dyn ToSqlValue],
         )
         .map_err(|e| format!("query: {e}"))?;
@@ -415,10 +442,13 @@ pub async fn resolve_missing_mbids(
             let track_id = ids[idx];
 
             let result = backend.execute(
-                "UPDATE tracks SET \
-                 musicbrainz_recording_id = ?, \
-                 genre = COALESCE(genre, ?) \
-                 WHERE id = ? AND (musicbrainz_recording_id IS NULL OR musicbrainz_recording_id = '')",
+                concat!(
+                    "UPDATE tracks SET \
+                     musicbrainz_recording_id = ?, \
+                     genre = ",
+                    crate::metadata::enrichment::genre_comble_par_l_enrichissement!(),
+                    " WHERE id = ? AND (musicbrainz_recording_id IS NULL OR musicbrainz_recording_id = '')"
+                ),
                 &[
                     &mbid as &dyn ToSqlValue,
                     &genre as &dyn ToSqlValue,
@@ -468,16 +498,23 @@ pub async fn pull_community_extra(
     let cutoff = now_epoch_secs()
         .saturating_sub(EXTRA_RESWEEP_SECS)
         .to_string();
+    // #7538 — ni les métadonnées étendues du nuage sur un dossier exclu.
     let rows = backend
         .query_many(
-            "SELECT t.id, t.musicbrainz_recording_id \
+            &format!(
+                "SELECT t.id, t.musicbrainz_recording_id \
              FROM tracks t \
              WHERE t.musicbrainz_recording_id IS NOT NULL AND t.musicbrainz_recording_id != '' \
                AND NOT EXISTS ( \
                  SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'mb_extra_synced' AND m.value >= ? \
-               ) \
+               ){} \
              LIMIT 100",
+                crate::taches_de_fond::perimetre::clause_hors_enrichissement(
+                    backend,
+                    crate::db::track_repo::sql::CHEMIN_OUVRABLE,
+                )
+            ),
             &[&cutoff as &dyn ToSqlValue],
         )
         .map_err(|e| format!("query: {e}"))?;

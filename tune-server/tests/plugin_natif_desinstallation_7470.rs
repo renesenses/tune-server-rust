@@ -55,6 +55,7 @@ fn info(nom: &str, opt_in: bool) -> PluginInfo {
         config_schema: serde_json::json!({}),
         required_feature: None,
         opt_in,
+        web_theme: None,
     }
 }
 
