@@ -1975,13 +1975,32 @@ impl PlaybackOrchestrator {
             // #6630 — la durée annoncée est celle qui reste à SERVIR, pour la
             // session (donc le `Content-Length`) comme pour l'en-tête WAV.
             let duree_ms = duree_servie_du_dop(track.duration_ms as u64, tranche, seek_ms);
+            let ext = std::path::Path::new(&file_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("dsf")
+                .to_lowercase();
+            // #7362 : le DSF commence au bloc précédent, pas exactement à la
+            // milliseconde demandée. Une même taille physique pour HEAD/GET
+            // et l'en-tête, sans changer le lecteur ni les octets DoP.
+            let taille_dop_exacte = if ext == "dsf" {
+                crate::audio::dsf::parse_dsf(&file_path)
+                    .ok()
+                    .and_then(|info| info.taille_wav_dop(tranche))
+            } else if ext == "dff" {
+                crate::audio::dff::parse_dff(&file_path)
+                    .ok()
+                    .and_then(|info| info.taille_wav_dop(tranche))
+            } else {
+                None
+            };
             let wav_info = StreamInfo {
                 format: "wav".into(),
                 mime_type: "audio/wav".into(),
                 sample_rate: dop_rate,
                 bit_depth: 24,
                 channels: dop_channels,
-                file_size: None,
+                file_size: taille_dop_exacte,
                 duration_ms: Some(duree_ms),
                 ..Default::default()
             };
@@ -2036,11 +2055,6 @@ impl PlaybackOrchestrator {
             );
 
             let fp = file_path.clone();
-            let ext = std::path::Path::new(&fp)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("dsf")
-                .to_lowercase();
             tokio::task::spawn_blocking(move || {
                 // Send WAV header first
                 //
@@ -2053,12 +2067,27 @@ impl PlaybackOrchestrator {
                 // même chose qu'avant, sans quoi ce correctif échangerait un
                 // défaut contre un autre — une taille de 2 Gio là où le
                 // `Content-Length` annonce la vraie longueur.
-                let wav_hdr = crate::audio::wav::build_wav_header_with_duration(
-                    dop_channels,
-                    dop_rate,
-                    24,
-                    Some(duree_ms),
-                );
+                let wav_hdr = match taille_dop_exacte.and_then(|taille| taille.checked_sub(44)) {
+                    Some(data) => match u32::try_from(data).ok().filter(|n| *n <= u32::MAX - 36) {
+                        Some(data) => crate::audio::wav::build_wav_header_with_data_size(
+                            dop_channels,
+                            dop_rate,
+                            24,
+                            data,
+                        ),
+                        None => crate::audio::wav::build_wav_header_streaming(
+                            dop_channels,
+                            dop_rate,
+                            24,
+                        ),
+                    },
+                    None => crate::audio::wav::build_wav_header_with_duration(
+                        dop_channels,
+                        dop_rate,
+                        24,
+                        Some(duree_ms),
+                    ),
+                };
                 let rt = tokio::runtime::Handle::current();
                 let _ = rt.block_on(tx.send(wav_hdr.to_vec()));
                 data_ready.notify_one();
@@ -4051,3 +4080,11 @@ mod tranche_dop_tests_6456 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "dsf_dop_longueur_7362_tests.rs"]
+mod dsf_dop_longueur_7362_tests;
+
+#[cfg(test)]
+#[path = "dff_dop_longueur_7362_tests.rs"]
+mod dff_dop_longueur_7362_tests;
