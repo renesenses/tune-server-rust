@@ -19,6 +19,10 @@ use crate::outputs::traits::{
 
 const DAEMON_BINARY: &str = "airplay-daemon";
 const TRANSPORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// #7441 — `play` n'est confirme qu'apres la connexion eventuellement en file
+/// dans le daemon (qui traite ses commandes une a une), le `setup` RTSP et le
+/// depart du flux. Le delai couvre ces trois etapes.
+const PLAY_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Airplay2Output {
     name: String,
@@ -51,6 +55,10 @@ pub struct Airplay2Output {
 #[derive(Clone, Debug, PartialEq)]
 enum PairingPhase {
     Idle,
+    /// A `connect` has been sent and its verdict (`connected` or an error) is
+    /// not in yet. The daemon handles commands one at a time, so a `play` sent
+    /// now is queued behind it (#7441).
+    Connecting,
     /// The receiver is displaying a PIN; waiting for the user to submit it.
     PinRequested,
     /// Connected/paired successfully.
@@ -185,11 +193,22 @@ impl Airplay2Output {
                             "error" => {
                                 let msg = ev["message"].as_str().unwrap_or("unknown").to_string();
                                 let pending = pending_transport.lock().await.take();
+                                let attendue = pending.is_some();
                                 if let Some(pending) = pending {
                                     let _ = pending.response.send(Err(msg.clone()));
-                                } else {
-                                    *pairing.lock().await = PairingPhase::Failed(msg.clone());
                                 }
+                                // #7441 — une erreur qui dit « pas de connexion »
+                                // fait TOUJOURS tomber l'etat, meme quand une
+                                // commande l'attendait : sinon la sortie se croit
+                                // connectee et la piste suivante repart vers un
+                                // daemon sans liaison.
+                                let mut phase = pairing.lock().await;
+                                if daemon_sans_connexion(&msg)
+                                    || (!attendue && *phase != PairingPhase::Connected)
+                                {
+                                    *phase = PairingPhase::Failed(msg.clone());
+                                }
+                                drop(phase);
                                 warn!(device = %device_name, error = %msg, "airplay2: daemon error");
                                 None
                             }
@@ -271,33 +290,70 @@ impl Airplay2Output {
     /// lock), so it never blocks on the 30s human-paced pairing flow.
     pub async fn pairing_status(&self) -> String {
         match self.pairing.lock().await.clone() {
-            PairingPhase::Idle => "idle".to_string(),
+            // `connecting` n'est pas expose : le client attend `connected`
+            // ou `failed:*` et traite le reste comme « en cours ».
+            PairingPhase::Idle | PairingPhase::Connecting => "idle".to_string(),
             PairingPhase::PinRequested => "pin_requested".to_string(),
             PairingPhase::Connected => "connected".to_string(),
             PairingPhase::Failed(e) => format!("failed:{e}"),
         }
     }
 
+    /// Make sure the daemon runs AND holds a connection to the receiver.
+    ///
+    /// #7441 — a running daemon is not a connected one. A PIN pairing refused
+    /// by the receiver (`pair-pin-start: HTTP 403`, a MacBook) or a failed
+    /// `connect` leaves the process alive without any connection: every `play`
+    /// then gets « not connected ». The phase decides, not the process.
     async fn ensure_connected(&self) -> Result<(), String> {
         let mut proc = self.process.lock().await;
         if proc.is_some() {
-            return Ok(());
+            let phase = self.pairing.lock().await.clone();
+            match phase {
+                PairingPhase::Connected | PairingPhase::Connecting => return Ok(()),
+                PairingPhase::PinRequested => {
+                    return Err(
+                        "airplay2: pairing in progress — enter the PIN shown on the \
+                                receiver first"
+                            .into(),
+                    );
+                }
+                PairingPhase::Idle | PairingPhase::Failed(_) => {
+                    info!(
+                        device = %self.name,
+                        phase = ?phase,
+                        "airplay2: daemon running without a connection, reconnecting"
+                    );
+                }
+            }
         }
-        *self.pairing.lock().await = PairingPhase::Idle;
-        let mut daemon = self.spawn_daemon().await?;
+        let connect = serde_json::json!({
+            "cmd": "connect",
+            "ip": self.host,
+            "port": self.port,
+            "device_id": self.ap_device_id,
+            "pin": "3939",
+        });
+        *self.pairing.lock().await = PairingPhase::Connecting;
         // Transient pairing (hard-coded PIN 3939) — works for HomePod-class and
         // already-paired receivers. PIN-only receivers need start_pin_pairing().
-        daemon
-            .send_cmd(&serde_json::json!({
-                "cmd": "connect",
-                "ip": self.host,
-                "port": self.port,
-                "device_id": self.ap_device_id,
-                "pin": "3939",
-            }))
-            .await?;
-        *proc = Some(daemon);
-        info!(device = %self.name, "airplay2: daemon connected");
+        let envoye = match proc.as_mut() {
+            Some(daemon) => daemon.send_cmd(&connect).await,
+            None => Err("daemon not running".into()),
+        };
+        if envoye.is_err() {
+            // Absent, ou sorti (tube ferme) : on repart d'un daemon neuf.
+            if let Some(mut ancien) = proc.take()
+                && let Some(child) = ancien.child.as_mut()
+            {
+                child.kill().await.ok();
+            }
+            let mut daemon = self.spawn_daemon().await?;
+            *self.pairing.lock().await = PairingPhase::Connecting;
+            daemon.send_cmd(&connect).await?;
+            *proc = Some(daemon);
+        }
+        info!(device = %self.name, "airplay2: connect sent to the daemon");
         Ok(())
     }
 
@@ -330,7 +386,7 @@ impl Airplay2Output {
         let daemon = proc
             .as_mut()
             .ok_or("airplay2: no pairing in progress — call start_pin_pairing first")?;
-        *self.pairing.lock().await = PairingPhase::Idle;
+        *self.pairing.lock().await = PairingPhase::Connecting;
         daemon
             .send_cmd(&serde_json::json!({
                 "cmd": "connect",
@@ -356,16 +412,34 @@ impl Airplay2Output {
         command: &'static str,
         expected: TransportConfirmation,
     ) -> Result<(), String> {
+        self.send_confirmed(
+            &serde_json::json!({"cmd": command}),
+            command,
+            expected,
+            TRANSPORT_COMMAND_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Send `cmd` and wait for the daemon's verdict: the `expected` event, or
+    /// its `error` event, within `timeout`.
+    async fn send_confirmed(
+        &self,
+        cmd: &serde_json::Value,
+        command: &'static str,
+        expected: TransportConfirmation,
+        timeout: Duration,
+    ) -> Result<(), String> {
         let _command_guard = self.transport_command.lock().await;
         let (response, receiver) = oneshot::channel();
         *self.pending_transport.lock().await = Some(PendingTransport { expected, response });
 
-        if let Err(error) = self.send(&serde_json::json!({"cmd": command})).await {
+        if let Err(error) = self.send(cmd).await {
             self.pending_transport.lock().await.take();
             return Err(error);
         }
 
-        match tokio::time::timeout(TRANSPORT_COMMAND_TIMEOUT, receiver).await {
+        match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(format!(
                 "airplay2: daemon response channel closed after {command}"
@@ -374,7 +448,7 @@ impl Airplay2Output {
                 self.pending_transport.lock().await.take();
                 Err(format!(
                     "airplay2: daemon did not confirm {command} within {} ms",
-                    TRANSPORT_COMMAND_TIMEOUT.as_millis()
+                    timeout.as_millis()
                 ))
             }
         }
@@ -463,16 +537,29 @@ impl OutputTarget for Airplay2Output {
         // Tidal. Le flux est donc d'abord recopie dans un fichier local, et
         // c'est ce fichier que le daemon ouvre : le traitement serveur de
         // #1216 est conserve, puisque c'est bien le flux servi qui est copie.
+        //
+        // #7441 — et `play` attend le verdict du daemon. Rendre la main sitot
+        // la ligne ecrite faisait passer « not connected » pour une lecture :
+        // la zone se disait en lecture, la barre avancait sur l'horloge murale
+        // puis retombait a zero, sans un son ni une erreur pour l'utilisateur.
         let path = lisible.chemin.to_string_lossy().into_owned();
         if let Err(error) = self
-            .send(&serde_json::json!({
-                "cmd": "play",
-                "path": path,
-            }))
+            .send_confirmed(
+                &serde_json::json!({
+                    "cmd": "play",
+                    "path": path,
+                }),
+                "play",
+                TransportConfirmation::Playing,
+                PLAY_CONFIRMATION_TIMEOUT,
+            )
             .await
         {
             lisible.oublier().await;
-            return Err(error);
+            return Err(format!(
+                "airplay2: {}",
+                error.trim_start_matches("airplay2: ")
+            ));
         }
         let precedente = std::mem::replace(
             &mut *self.copie_du_flux.lock().await,
@@ -590,6 +677,13 @@ impl OutputTarget for Airplay2Output {
             .await
             .is_ok()
     }
+}
+
+/// #7441 — erreurs du daemon qui signifient qu'il n'a AUCUNE connexion au
+/// recepteur (`airplay-daemon/src/main.rs` : `connect failed: …`, et
+/// `not connected` sur `play`, `pause`, `resume`, `volume`…).
+fn daemon_sans_connexion(message: &str) -> bool {
+    message == "not connected" || message.starts_with("connect failed")
 }
 
 /// Taille au-dela de laquelle la copie locale du flux est abandonnee.
@@ -926,6 +1020,8 @@ mod transport_tests {
             child: None,
             stdin: Box::new(server_stdin),
         });
+        // Un daemon de banc deja relie au recepteur.
+        *output.pairing.lock().await = PairingPhase::Connected;
         output.start_event_reader(BufReader::new(server_stdout));
 
         let commands = Arc::new(Mutex::new(Vec::new()));
@@ -981,6 +1077,8 @@ mod transport_tests {
             child: None,
             stdin: Box::new(server_stdin),
         });
+        // Un daemon de banc deja relie au recepteur.
+        *output.pairing.lock().await = PairingPhase::Connected;
         output.start_event_reader(BufReader::new(server_stdout));
 
         let charges = Arc::new(Mutex::new(Vec::new()));
@@ -1017,9 +1115,8 @@ mod transport_tests {
     async fn commande_play(
         charges: &Arc<Mutex<Vec<serde_json::Value>>>,
     ) -> Option<serde_json::Value> {
-        // `play_media` n'attend AUCUNE confirmation : il ecrit sur le tube et
-        // rend la main aussitot. On laisse au faux daemon le temps de noter
-        // la ligne, sans dormir plus qu'il ne faut.
+        // `play_media` attend la confirmation du daemon (#7441) ; on laisse
+        // malgre tout au faux daemon le temps de noter la ligne.
         for _ in 0..200 {
             let play = charges
                 .lock()
@@ -1184,6 +1281,120 @@ mod transport_tests {
         );
         assert!(est_une_adresse_http("HTTP://h/x"));
         assert!(!est_une_adresse_http("/srv/musique/x.flac"));
+    }
+
+    /// Faux daemon a etat, fidele a `airplay-daemon/src/main.rs` (rev
+    /// a7d7ad66) : une commande a la fois, `play` sans connexion rend
+    /// « not connected ». `connect_ok` dit si le recepteur accepte la
+    /// connexion transitoire ; `pair_pin_start` est refuse en 403, comme le
+    /// MacBook du rapport de #7441.
+    async fn daemon_7441(
+        output: &Airplay2Output,
+        connect_ok: bool,
+    ) -> Arc<Mutex<Vec<serde_json::Value>>> {
+        let (server_stdin, daemon_stdin) = tokio::io::duplex(4096);
+        let (mut daemon_stdout, server_stdout) = tokio::io::duplex(4096);
+        *output.process.lock().await = Some(DaemonProcess {
+            child: None,
+            stdin: Box::new(server_stdin),
+        });
+        output.start_event_reader(BufReader::new(server_stdout));
+
+        let charges = Arc::new(Mutex::new(Vec::new()));
+        let notees = charges.clone();
+        tokio::spawn(async move {
+            let mut connecte = false;
+            let mut lines = BufReader::new(daemon_stdin).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                notees.lock().await.push(command.clone());
+                let erreur = |m: &str| serde_json::json!({"event": "error", "message": m});
+                let event = match command["cmd"].as_str().unwrap() {
+                    "pair_pin_start" => erreur("pair-pin-start: HTTP 403 Forbidden"),
+                    "connect" if connect_ok => {
+                        connecte = true;
+                        serde_json::json!({"event": "connected", "device": "MacBook"})
+                    }
+                    "connect" => erreur("connect failed: pair-setup refused"),
+                    "play" if connecte => serde_json::json!({"event": "playing"}),
+                    _ => erreur("not connected"),
+                };
+                let line = format!("{}\n", serde_json::to_string(&event).unwrap());
+                daemon_stdout.write_all(line.as_bytes()).await.unwrap();
+            }
+        });
+        charges
+    }
+
+    async fn attendre_l_echec_du_jumelage(output: &Airplay2Output) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !output.pairing_status().await.starts_with("failed:") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("le refus du jumelage PIN doit arriver");
+    }
+
+    /// 🔴 #7441 — jumelage PIN refuse (403), puis lecture : le daemon tourne
+    /// toujours mais n'est relie a rien. La lecture doit d'abord lui demander
+    /// une connexion, et non lui envoyer `play` a vide.
+    #[tokio::test]
+    async fn apres_un_jumelage_refuse_la_lecture_reconnecte_le_daemon_7441() {
+        let flux = serveur_de_flux(b"piste-cd").await;
+        let output = output_for_test();
+        let charges = daemon_7441(&output, true).await;
+
+        output.start_pin_pairing().await.unwrap();
+        attendre_l_echec_du_jumelage(&output).await;
+
+        output
+            .play_media(&PlayMedia {
+                url: &flux,
+                mime_type: "audio/flac",
+                ..Default::default()
+            })
+            .await
+            .expect("la lecture doit reconnecter le daemon puis partir");
+
+        let cmds: Vec<String> = charges
+            .lock()
+            .await
+            .iter()
+            .map(|c| c["cmd"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cmds, vec!["pair_pin_start", "connect", "play"]);
+        assert_eq!(output.pairing_status().await, "connected");
+        output.stop().await.unwrap();
+    }
+
+    /// 🔴 #7441 — un recepteur qui refuse la connexion : `play_media` doit
+    /// ECHOUER, avec la raison du daemon, au lieu de publier une lecture
+    /// fantome dont la barre avance puis retombe a zero.
+    #[tokio::test]
+    async fn une_lecture_sans_connexion_echoue_au_lieu_de_faire_semblant_7441() {
+        let flux = serveur_de_flux(b"piste-cd").await;
+        let output = output_for_test();
+        let charges = daemon_7441(&output, false).await;
+
+        output.start_pin_pairing().await.unwrap();
+        attendre_l_echec_du_jumelage(&output).await;
+
+        let erreur = output
+            .play_media(&PlayMedia {
+                url: &flux,
+                mime_type: "audio/flac",
+                ..Default::default()
+            })
+            .await
+            .expect_err("une lecture sans connexion ne doit pas reussir");
+        assert!(erreur.contains("connect"), "{erreur}");
+        assert_eq!(
+            output.get_status().await.unwrap().state,
+            TransportState::Stopped,
+            "la sortie ne doit pas se dire en lecture"
+        );
+        assert!(charges.lock().await.iter().any(|c| c["cmd"] == "connect"));
     }
 
     #[tokio::test]
