@@ -9,6 +9,8 @@
 //! third-party ASIO driver.
 
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -508,6 +510,11 @@ pub struct WasapiExclusiveOutput {
     channels: u32,
     ring: Arc<NativePcmRing>,
     paused: Arc<AtomicBool>,
+    /// #7264 — le volume effectif de la zone, appliqué par le fil de rendu
+    /// aux mots tirés de l'anneau (`pop_pcm_bytes_au_gain`). `None` : rendu
+    /// à l'unité, identique au bit près à la sérialisation seule.
+    #[cfg(target_os = "windows")]
+    volume_au_rendu: Option<Arc<AtomicU32>>,
     #[cfg(target_os = "windows")]
     audio_client: *mut std::ffi::c_void,
     #[cfg(target_os = "windows")]
@@ -955,6 +962,7 @@ impl WasapiExclusiveOutput {
                 channels,
                 ring,
                 paused,
+                volume_au_rendu: None,
                 audio_client,
                 render_client,
                 event_handle: event,
@@ -974,11 +982,28 @@ impl WasapiExclusiveOutput {
         }
     }
 
+    /// #7264 — le volume que le fil de rendu applique, relu à chaque
+    /// période. À poser avant [`Self::start`].
+    #[cfg(target_os = "windows")]
+    pub(crate) fn regler_le_volume_au_rendu(&mut self, volume: Arc<AtomicU32>) {
+        self.volume_au_rendu = Some(volume);
+    }
+
     /// Start the render thread that feeds audio from the ring buffer
     /// to the WASAPI exclusive output.
     #[cfg(target_os = "windows")]
     pub fn start(&mut self) -> Result<(), String> {
         use ffi::*;
+
+        // #7264 — le gain du rendu, au repos à la consigne courante : ni
+        // fondu d'ouverture, ni mot pondéré à 100 %.
+        let mut gain = super::local::gain_au_rendu_7264::GainAuRendu::nouveau(
+            self.volume_au_rendu
+                .clone()
+                .unwrap_or_else(|| Arc::new(AtomicU32::new(1000))),
+            self.sample_rate,
+            self.channels,
+        );
 
         // Exclusive event-driven rendering uses two endpoint buffers. Prime
         // the first one completely before Start so the driver never begins on
@@ -1004,7 +1029,8 @@ impl WasapiExclusiveOutput {
             let written = if self.paused.load(Ordering::Relaxed) {
                 0
             } else {
-                self.ring.pop_pcm_bytes(out, self.bit_depth as u16)
+                self.ring
+                    .pop_pcm_bytes_au_gain(out, self.bit_depth as u16, &mut gain)
             };
             out[written..].fill(0);
 
@@ -1189,15 +1215,17 @@ impl WasapiExclusiveOutput {
                         continue;
                     }
 
-                    // Native words are already left-aligned and volume/DSP
-                    // have already been resolved by the producer. The
-                    // callback performs serialization only: no float, scale,
-                    // rounding or truncation can alter a bit-perfect word.
+                    // Native words are already left-aligned and DSP has been
+                    // resolved by the producer. #7264: the software volume is
+                    // applied HERE, after the 2 s ring, so a gesture is heard
+                    // on the next period (plus a 20 ms ramp). At unity, ramp
+                    // at rest, or inside a DoP passage, words are serialized
+                    // untouched: bit-perfect is preserved.
                     let out_slice = std::slice::from_raw_parts_mut(
                         buf,
                         (buffer_frame_count * frame_bytes) as usize,
                     );
-                    let written = ring.pop_pcm_bytes(out_slice, bit_depth);
+                    let written = ring.pop_pcm_bytes_au_gain(out_slice, bit_depth, &mut gain);
                     if written < out_slice.len() {
                         underruns.fetch_add(1, Ordering::Relaxed);
                     }
