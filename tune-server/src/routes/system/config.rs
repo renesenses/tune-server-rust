@@ -517,6 +517,13 @@ pub(super) async fn get_config(
             tune_core::taches_de_fond::perimetre::CLE_DOSSIERS_INCLUS,
             json!([]),
         ),
+        // #7538 — les dossiers que l'enrichissement des métadonnées ne touche
+        // pas (communautaire, MusicBrainz, réparations de genre). Vide par
+        // défaut : rien d'exclu.
+        (
+            tune_core::taches_de_fond::perimetre::CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT,
+            json!([]),
+        ),
         // #6198 — les genres de la passe CLAP : retenus (vide : tous) et
         // écartés (vide : aucun). Ils ne touchent que le CLAP.
         (
@@ -1471,11 +1478,19 @@ fn normaliser_perimetre_des_analyses(
 /// que les racines exclues (tableau de chaînes, rognées, sans vide ni
 /// doublon, `null` = vide), refusée en 400 sinon. Ils ne touchent pas
 /// ReplayGain : aucune campagne à refermer.
+///
+/// #7538 — les dossiers exclus de l'enrichissement suivent la même forme et
+/// ne touchent pas davantage ReplayGain.
 fn normaliser_genres_du_clap(values: &mut serde_json::Map<String, Value>) -> Result<(), AppError> {
     use tune_core::taches_de_fond::perimetre::{
-        CLE_GENRES_CLAP_EXCLUS, CLE_GENRES_CLAP_INCLUS, normaliser,
+        CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT, CLE_GENRES_CLAP_EXCLUS, CLE_GENRES_CLAP_INCLUS,
+        normaliser,
     };
-    for cle in [CLE_GENRES_CLAP_INCLUS, CLE_GENRES_CLAP_EXCLUS] {
+    for cle in [
+        CLE_GENRES_CLAP_INCLUS,
+        CLE_GENRES_CLAP_EXCLUS,
+        CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT,
+    ] {
         let Some(brut) = values.get(cle) else {
             continue;
         };
@@ -6756,3 +6771,70 @@ mod volume_6774_tests;
 #[cfg(test)]
 #[path = "racines_preservees_6175_tests.rs"]
 mod racines_preservees_6175_tests;
+
+/// #7538 — les dossiers exclus de l'enrichissement : publiés vides,
+/// normalisés comme les autres listes du périmètre, refusés sous une autre
+/// forme, et relus par le moteur tels qu'écrits.
+#[cfg(test)]
+mod dossiers_exclus_de_l_enrichissement_7538_tests {
+    use super::{get_config, normaliser_genres_du_clap};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::taches_de_fond::perimetre::{
+        CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT, dossiers_exclus_de_l_enrichissement,
+    };
+
+    async fn config(state: &AppState) -> Value {
+        get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
+        .0
+    }
+
+    #[tokio::test]
+    async fn publies_vides_normalises_puis_relus_7538() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        assert_eq!(
+            config(&state).await[CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT],
+            json!([])
+        );
+        let mut v: serde_json::Map<String, Value> =
+            json!({ CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT: [" /music/Jazz ", "", "/music/Jazz"] })
+                .as_object()
+                .unwrap()
+                .clone();
+        assert!(normaliser_genres_du_clap(&mut v).is_ok());
+        assert_eq!(
+            v[CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT],
+            json!(["/music/Jazz"])
+        );
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        for (k, val) in v {
+            settings.set(&k, &val.to_string()).unwrap();
+        }
+        assert_eq!(
+            config(&state).await[CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT],
+            json!(["/music/Jazz"])
+        );
+        assert_eq!(
+            dossiers_exclus_de_l_enrichissement(&state.backend),
+            vec!["/music/Jazz"]
+        );
+        for mauvais in [json!("/music/Jazz"), json!(4), json!([1]), json!({})] {
+            let mut m: serde_json::Map<String, Value> =
+                json!({ CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT: mauvais.clone() })
+                    .as_object()
+                    .unwrap()
+                    .clone();
+            assert!(normaliser_genres_du_clap(&mut m).is_err(), "{mauvais}");
+        }
+    }
+}
