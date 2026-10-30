@@ -219,6 +219,32 @@ pub mod sql {
         )
     }
 
+    /// Les écoutes d'un interprète, toutes sources (#7416) : une ligne par
+    /// enregistrement écouté (source, identifiant, titre, durée), avec son
+    /// nombre d'écoutes, la dernière, et — pour un fichier — l'identifiant de
+    /// la piste de la bibliothèque, résolu comme ailleurs dans ce fichier
+    /// (titre + album, à défaut titre + interprète : `track_id` est toujours
+    /// NULL). `COUNT(DISTINCT h.id)` : les jointures ne doivent pas multiplier
+    /// les écoutes. Placeholders : les `n_artistes` noms en minuscules.
+    pub fn ecoutes_d_un_interprete<D: SqlDialect>(d: &D, n_artistes: usize) -> String {
+        let noms = (1..=n_artistes)
+            .map(|i| d.placeholder(i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT h.source, h.source_id, h.title, h.artist_name, h.duration_ms, \
+             COUNT(DISTINCT h.id), MAX(h.listened_at), MAX(h.album_title), \
+             MAX(h.cover_url), COALESCE(MAX(t.id), MAX(t2.id)) \
+             FROM listen_history h \
+             LEFT JOIN tracks t ON h.source = 'local' AND t.title = h.title \
+                  AND t.album_id = h.album_id \
+             LEFT JOIN artists a ON h.source = 'local' AND a.name = h.artist_name \
+             LEFT JOIN tracks t2 ON t2.artist_id = a.id AND t2.title = h.title \
+             WHERE h.source != 'radio' AND LOWER(h.artist_name) IN ({noms}) \
+             GROUP BY h.source, h.source_id, h.title, h.artist_name, h.duration_ms"
+        )
+    }
+
     /// Non-radio play count for one track, matched by title + artist — the same
     /// grouping `top_tracks` uses (many history rows carry a null track_id).
     pub fn track_plays<D: SqlDialect>(d: &D) -> String {
@@ -300,6 +326,25 @@ pub fn nom_rapproche(s: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Un enregistrement écouté d'un interprète, toutes sources (#7416) : voir
+/// [`HistoryRepo::ecoutes_d_un_interprete`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EcouteDInterprete {
+    pub source: String,
+    /// Vide pour un fichier : il se désigne par `track_id`.
+    pub source_id: String,
+    pub titre: String,
+    pub artiste: String,
+    pub album: Option<String>,
+    pub duree_ms: i64,
+    pub compte: i64,
+    pub derniere: String,
+    pub pochette: Option<String>,
+    /// La piste de la bibliothèque d'une écoute de fichier, si elle se
+    /// retrouve encore.
+    pub track_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -608,6 +653,51 @@ impl HistoryRepo {
                     Some((n, d)) => (n + compte, d.max(derniere.clone())),
                 });
             }
+        }
+        Ok(resultat)
+    }
+
+    /// Les écoutes d'un interprète, toutes sources et tous profils (#7416) :
+    /// une entrée par enregistrement écouté, l'interprète comparé normalisé
+    /// ([`nom_rapproche`]). Radio exclue, comme partout ici.
+    pub fn ecoutes_d_un_interprete(&self, artiste: &str) -> Result<Vec<EcouteDInterprete>, String> {
+        let cible = nom_rapproche(artiste);
+        if cible.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SQLite ne passe en minuscules que l'ASCII, PostgreSQL tout : les
+        // deux formes partent (comme `ecoutes_de_pistes_de_service`).
+        let a = artiste.trim();
+        let mut noms = vec![a.to_lowercase(), a.to_ascii_lowercase()];
+        noms.dedup();
+        let sql = self.dialect_sql(
+            |d| sql::ecoutes_d_un_interprete(d, noms.len()),
+            |d| sql::ecoutes_d_un_interprete(d, noms.len()),
+        );
+        let params: Vec<&dyn ToSqlValue> = noms.iter().map(|n| n as &dyn ToSqlValue).collect();
+        let lignes = self.db.query_many(&sql, &params)?;
+        let mut resultat = Vec::with_capacity(lignes.len());
+        for cols in lignes {
+            let texte = |i: usize| cols.get(i).and_then(|v| v.as_string());
+            let artiste_ligne = texte(3).unwrap_or_default();
+            if nom_rapproche(&artiste_ligne) != cible {
+                continue;
+            }
+            let Some(derniere) = texte(6) else {
+                continue;
+            };
+            resultat.push(EcouteDInterprete {
+                source: texte(0).unwrap_or_default(),
+                source_id: texte(1).unwrap_or_default().trim().to_string(),
+                titre: texte(2).unwrap_or_default(),
+                artiste: artiste_ligne,
+                album: texte(7).filter(|s| !s.is_empty()),
+                duree_ms: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                compte: cols.get(5).and_then(|v| v.as_i64()).unwrap_or(0),
+                derniere,
+                pochette: texte(8).filter(|s| !s.is_empty()),
+                track_id: cols.get(9).and_then(|v| v.as_i64()),
+            });
         }
         Ok(resultat)
     }

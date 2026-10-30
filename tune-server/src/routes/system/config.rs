@@ -287,10 +287,14 @@ pub(super) async fn get_config(
     headers: axum::http::HeaderMap,
     profile: ActiveProfile,
     State(state): State<AppState>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let lang = crate::i18n::lang_from_header(&headers);
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let all = settings.all().unwrap_or_default();
+    // A failed snapshot is not an empty settings table: serving defaults here
+    // made persisted choices look reset, despite a successful earlier write.
+    let all = settings.all().map_err(|_| {
+        AppError::service_unavailable("Server settings are temporarily unavailable")
+    })?;
     let mut config = serde_json::Map::new();
     config.insert(
         tune_core::db::listening_resume::REWIND_KEY.into(),
@@ -983,7 +987,7 @@ pub(super) async fn get_config(
     // vit désormais dans `tune_core::secrets`, qui classe sur le NOM et couvre
     // donc aussi le réglage ajouté demain.
     tune_core::secrets::caviarder_carte(&mut config);
-    Json(Value::Object(config))
+    Ok(Json(Value::Object(config)))
 }
 
 /// Les trois plafonds de l'indexation UPnP tels que la PROCHAINE passe les
@@ -5577,6 +5581,7 @@ mod replaygain_source_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0
     }
 
@@ -5638,6 +5643,7 @@ mod replaygain_source_tests {
 
         let c = get_config(h, ActiveProfile(DEFAULT_PROFILE_ID), State(state.clone()))
             .await
+            .unwrap_or_else(|_| panic!("configuration illisible"))
             .0;
         assert_eq!(c["replaygain_source"]["mode"], "tags_then_analysis");
         assert_eq!(c["replaygain_source"]["label"], "File tags, then analysis");
@@ -5895,6 +5901,7 @@ mod ui_preferences_par_profil_tests {
     async fn lire(state: &AppState, pid: i64) -> Option<String> {
         get_config(HeaderMap::new(), ActiveProfile(pid), State(state.clone()))
             .await
+            .unwrap_or_else(|_| panic!("configuration illisible"))
             .0
             .get(UI_PREFERENCES)
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -5999,6 +6006,7 @@ mod ui_preferences_par_profil_tests {
 
         let vu = get_config(HeaderMap::new(), ActiveProfile(FILS), State(state.clone()))
             .await
+            .unwrap_or_else(|_| panic!("configuration illisible"))
             .0;
         let brut = serde_json::to_string(&vu).unwrap();
         assert!(
@@ -6104,6 +6112,7 @@ mod vitesse_des_analyses_5519_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_REGLAGE], "normal", "{c}");
         let largeurs = &c["background_analysis_speed_widths"];
@@ -6166,6 +6175,7 @@ mod levee_du_bridage_6713_tests {
                     State(state),
                 )
                 .await
+                .unwrap_or_else(|_| panic!("configuration illisible"))
                 .0
             }
         };
@@ -6241,6 +6251,7 @@ mod rappel_audit_integrite_6286_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_RAPPEL_JOURS], json!(0), "{c}");
         assert_eq!(rappel_jours(&state.backend), 0);
@@ -6311,6 +6322,7 @@ mod mesures_communautaires_5594_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_RECEPTION], false, "{c}");
         assert_eq!(c[CLE_CONTRIBUTION], false, "{c}");
@@ -6361,6 +6373,7 @@ mod politique_de_lecture_4681_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_REGLAGE]["enabled"], true, "{c}");
 
@@ -6399,6 +6412,7 @@ mod politique_de_lecture_4681_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_REGLAGE]["scan_width"], 3, "{c}");
         politique::regler(DEFAUT);
@@ -6455,6 +6469,7 @@ mod genres_du_clap_6198_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_GENRES_CLAP_INCLUS], json!([]), "{c}");
         assert_eq!(c[CLE_GENRES_CLAP_EXCLUS], json!([]), "{c}");
@@ -6477,6 +6492,7 @@ mod genres_du_clap_6198_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(
             c[CLE_GENRES_CLAP_INCLUS],
@@ -6525,6 +6541,7 @@ mod perimetre_des_analyses_5593_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0
     }
 
@@ -6626,6 +6643,109 @@ mod perimetre_des_analyses_5593_tests {
             Ok(false)
         ));
         assert!(vide.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod instantane_reglages_7343_tests {
+    use super::*;
+    use axum::response::Response;
+
+    async fn lire(state: &AppState) -> Response {
+        get_config(
+            axum::http::HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .into_response()
+    }
+
+    async fn corps(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn une_lecture_impossible_ne_renvoie_pas_les_defauts_en_succes() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings
+            .set(tune_core::metadata::ecriture_fichiers::CLE, "true")
+            .unwrap();
+        settings
+            .set(
+                tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED,
+                "true",
+            )
+            .unwrap();
+        // Deterministic read failure, confined to this test's temporary database.
+        state
+            .sqlite()
+            .unwrap()
+            .execute_batch("DROP TABLE settings")
+            .unwrap();
+        let response = lire(&state).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "une base illisible ne doit pas passer pour des réglages absents"
+        );
+        let value = corps(response).await;
+        assert_eq!(value["code"], "service_unavailable");
+        assert!(
+            value
+                .get(tune_core::metadata::ecriture_fichiers::CLE)
+                .is_none()
+        );
+        assert!(
+            value
+                .get(tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn une_base_lisible_sans_preferences_garde_les_defauts() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let response = lire(&state).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = corps(response).await;
+        assert_eq!(value[tune_core::metadata::ecriture_fichiers::CLE], false);
+        assert_eq!(
+            value[tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn des_choix_persistes_restent_lus_apres_reouverture_de_la_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.sqlite");
+        {
+            let state = AppState::new(path.to_str().unwrap(), 0, Default::default()).unwrap();
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            settings
+                .set(tune_core::metadata::ecriture_fichiers::CLE, "true")
+                .unwrap();
+            settings
+                .set(
+                    tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED,
+                    "true",
+                )
+                .unwrap();
+        }
+        let reopened = AppState::new(path.to_str().unwrap(), 0, Default::default()).unwrap();
+        let response = lire(&reopened).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = corps(response).await;
+        assert_eq!(value[tune_core::metadata::ecriture_fichiers::CLE], true);
+        assert_eq!(
+            value[tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED],
+            true
+        );
     }
 }
 
