@@ -1561,6 +1561,9 @@ mod annonce_du_contrat_de_signal_4559;
 mod arret_dementi_par_la_position_6717;
 
 #[cfg(test)]
+mod position_en_fin_openhome_6718;
+
+#[cfg(test)]
 mod cohabitation_airplay_tests_7259;
 
 #[cfg(test)]
