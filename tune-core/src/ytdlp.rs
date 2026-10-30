@@ -455,6 +455,128 @@ pub async fn rafraichir(raison: RaisonRafraichissement) -> Rafraichissement {
     .await
 }
 
+// ---------------------------------------------------------------------------
+// #6967 — la version installée, comparée à la dernière publiée
+// ---------------------------------------------------------------------------
+//
+// Scorpio (VNAV, 24/10/2026) demandait à quelle fréquence yt-dlp est tenu à
+// jour. `/system/youtube/status` disait la version installée, jamais si elle
+// était la dernière. La dernière publiée est le `tag_name` de la publication
+// GitHub, la même source que [`download`] ; elle est gardée six heures, pour
+// qu'un écran de réglages ouvert souvent n'interroge pas GitHub à chaque fois.
+
+/// La publication la plus récente de yt-dlp, côté GitHub.
+pub const URL_DERNIERE_PUBLICATION: &str =
+    "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
+
+/// Durée pendant laquelle la dernière version lue reste valable.
+pub const DUREE_DERNIERE_VERSION: Duration = Duration::from_secs(6 * 3600);
+
+/// Après un échec de lecture, on ne réessaie pas avant ce délai.
+const DUREE_ECHEC_DERNIERE_VERSION: Duration = Duration::from_secs(15 * 60);
+
+/// Compare deux versions de yt-dlp (`2026.08.19`, nightly `2026.08.19.232611`)
+/// partie par partie, en nombres. `None` si l'une n'est pas lisible : on ne
+/// conclut pas alors qu'elle est à jour, ni qu'elle ne l'est pas.
+pub fn comparer_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    fn parties(v: &str) -> Option<Vec<u64>> {
+        let v = v.trim().trim_start_matches(['v', 'V']);
+        let parties: Option<Vec<u64>> = v.split('.').map(|p| p.parse().ok()).collect();
+        parties.filter(|p| !p.is_empty())
+    }
+    let (a, b) = (parties(a)?, parties(b)?);
+    // Une version nightly a une partie de plus : 2026.08.19.232611 vient
+    // après 2026.08.19, ce que la comparaison de listes donne d'elle-même.
+    Some(a.cmp(&b))
+}
+
+/// Ce que `/system/youtube/status` dit de la version (#6967).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EtatDeVersion {
+    /// La version installée, `None` sans yt-dlp.
+    pub installee: Option<String>,
+    /// La dernière version publiée, `None` si GitHub n'a pas répondu.
+    pub publiee: Option<String>,
+    /// `Some(true)` : la version installée est la dernière (ou plus récente,
+    /// une nightly). `None` : on ne sait pas — l'une des deux manque ou
+    /// n'est pas lisible.
+    pub a_jour: Option<bool>,
+    /// Pourquoi la dernière version n'est pas connue.
+    pub erreur: Option<String>,
+}
+
+/// La décision, sans réseau : à jour si l'installée n'est pas plus ancienne.
+pub fn etat_de_version(installee: Option<&str>, publiee: Result<&str, &str>) -> EtatDeVersion {
+    let a_jour = match (installee, publiee) {
+        (Some(i), Ok(p)) => comparer_versions(i, p).map(|o| o != std::cmp::Ordering::Less),
+        _ => None,
+    };
+    EtatDeVersion {
+        installee: installee.map(str::to_string),
+        publiee: publiee.ok().map(str::to_string),
+        a_jour,
+        erreur: publiee.err().map(str::to_string),
+    }
+}
+
+/// Lit le `tag_name` de la publication à `url` (sans cache).
+pub async fn lire_derniere_version(url: &str) -> Result<String, String> {
+    let client = crate::http::client::builder()
+        .user_agent("tune-server")
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("yt-dlp: http client: {e}"))?;
+    let mut req = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN")
+        && !token.is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let release: serde_json::Value = req
+        .send()
+        .await
+        .map_err(|e| format!("yt-dlp: fetch release: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("yt-dlp: release status: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("yt-dlp: parse release: {e}"))?;
+    release
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "yt-dlp: release without tag_name".to_string())
+}
+
+type DerniereLue = (std::time::Instant, Result<String, String>);
+
+static DERNIERE_VERSION: tokio::sync::Mutex<Option<DerniereLue>> =
+    tokio::sync::Mutex::const_new(None);
+
+/// La dernière version publiée de yt-dlp, gardée [`DUREE_DERNIERE_VERSION`]
+/// (un échec, [`DUREE_ECHEC_DERNIERE_VERSION`]).
+pub async fn derniere_version_publiee() -> Result<String, String> {
+    let mut garde = DERNIERE_VERSION.lock().await;
+    if let Some((quand, lue)) = garde.as_ref() {
+        let validite = if lue.is_ok() {
+            DUREE_DERNIERE_VERSION
+        } else {
+            DUREE_ECHEC_DERNIERE_VERSION
+        };
+        if quand.elapsed() < validite {
+            return lue.clone();
+        }
+    }
+    let lue = lire_derniere_version(URL_DERNIERE_PUBLICATION).await;
+    if let Err(e) = &lue {
+        warn!(error = %e, "ytdlp_derniere_version_inconnue");
+    }
+    *garde = Some((std::time::Instant::now(), lue.clone()));
+    lue
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,5 +832,59 @@ mod tests {
         .await;
         assert_eq!((r, n), (fait(), 1), "14 jours : rafraîchir");
         assert_eq!(std::fs::read(&gere).unwrap(), b"neuf");
+    }
+
+    // ── #6967 — version installée et dernière publiée ──────────────────
+
+    #[test]
+    fn versions_comparees_en_nombres_6967() {
+        use std::cmp::Ordering::*;
+        assert_eq!(comparer_versions("2026.08.19", "2026.08.19"), Some(Equal));
+        assert_eq!(comparer_versions("2026.07.04", "2026.08.19"), Some(Less));
+        // 2026.10.2 vient après 2026.9.30 : pas un ordre de texte.
+        assert_eq!(comparer_versions("2026.10.2", "2026.9.30"), Some(Greater));
+        // Une nightly du même jour est plus récente que la publication.
+        assert_eq!(
+            comparer_versions("2026.08.19.232611", "2026.08.19"),
+            Some(Greater)
+        );
+        assert_eq!(comparer_versions("inconnue", "2026.08.19"), None);
+    }
+
+    #[test]
+    fn etat_de_version_dit_a_jour_en_retard_ou_inconnu_6967() {
+        let en_retard = etat_de_version(Some("2026.07.04"), Ok("2026.08.19"));
+        assert_eq!(en_retard.a_jour, Some(false));
+        assert_eq!(en_retard.publiee.as_deref(), Some("2026.08.19"));
+        assert_eq!(
+            etat_de_version(Some("2026.08.19"), Ok("2026.08.19")).a_jour,
+            Some(true)
+        );
+        let sans_github = etat_de_version(Some("2026.08.19"), Err("timeout"));
+        assert_eq!(sans_github.a_jour, None, "sans la dernière, on ne sait pas");
+        assert_eq!(sans_github.erreur.as_deref(), Some("timeout"));
+        assert_eq!(etat_de_version(None, Ok("2026.08.19")).a_jour, None);
+    }
+
+    /// La dernière version se lit dans `tag_name`, comme pour le
+    /// téléchargement ; contre un serveur local, sans réseau.
+    #[tokio::test]
+    async fn derniere_version_lue_dans_tag_name_6967() {
+        use axum::{Json, Router, routing::get};
+        let app = Router::new().route(
+            "/releases/latest",
+            get(|| async { Json(serde_json::json!({"tag_name": "2026.10.22", "assets": []})) }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = ecoute.local_addr().unwrap();
+        let serveur = tokio::spawn(async move { axum::serve(ecoute, app).await });
+        let lue = lire_derniere_version(&format!("http://{adresse}/releases/latest")).await;
+        assert_eq!(lue.as_deref(), Ok("2026.10.22"));
+        let absente = lire_derniere_version(&format!("http://{adresse}/absente")).await;
+        assert!(
+            absente.is_err(),
+            "un 404 n'est pas une version : {absente:?}"
+        );
+        serveur.abort();
     }
 }
