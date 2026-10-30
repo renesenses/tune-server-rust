@@ -1839,6 +1839,12 @@ mod sortie_de_pure_recompose_le_trim_6213;
 #[cfg(test)]
 mod aleatoire_dans_la_file_6526;
 
+/// #7378 — « Ce téléphone » (zone navigateur) : « Suivant » après l'aléatoire
+/// joue la file relue, pas l'ordre d'origine.
+#[cfg(test)]
+#[path = "playback/aleatoire_zone_navigateur_7378_tests.rs"]
+mod aleatoire_zone_navigateur_7378_tests;
+
 /// #5975 — le lecteur d'une zone navigateur dit pourquoi il ne joue pas.
 #[path = "playback/erreur_media_navigateur.rs"]
 mod erreur_media_navigateur;
