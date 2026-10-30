@@ -30,7 +30,7 @@ fn relie(b: &Arc<dyn DbBackend>) {
 
 #[derive(Default)]
 struct FauxSite {
-    recus: Mutex<Vec<(String, String, CorpsInscription)>>,
+    recus: Mutex<Vec<(String, String, String, CorpsInscription)>>,
     refuse: bool,
 }
 
@@ -40,11 +40,13 @@ impl InscriptionDeCle for FauxSite {
         &self,
         server_id: &str,
         jeton_du_compte: &str,
+        jeton_de_liaison: &str,
         corps: &CorpsInscription,
     ) -> Result<(), String> {
         self.recus.lock().unwrap().push((
             server_id.to_string(),
             jeton_du_compte.to_string(),
+            jeton_de_liaison.to_string(),
             corps.clone(),
         ));
         if self.refuse {
@@ -91,8 +93,9 @@ async fn la_cle_s_inscrit_sur_le_compte_avec_la_preuve_de_sa_possession_une_seul
     {
         let recus = site.recus.lock().unwrap();
         assert_eq!(recus.len(), 1);
-        let (sid, jeton, corps) = &recus[0];
+        let (sid, jeton, liaison, corps) = &recus[0];
         assert_eq!((sid.as_str(), jeton.as_str()), ("srv-1", "jeton-du-compte"));
+        assert_eq!(liaison, "liaison");
         assert_eq!(corps.public_key, cle.cle_publique());
         assert_eq!(corps.alg, "Ed25519");
         assert_eq!(
@@ -159,4 +162,75 @@ async fn tant_que_le_relais_n_annonce_pas_le_laissez_passer_rien_n_est_inscrit()
         site.recus.lock().unwrap().is_empty(),
         "une inscription est partie vers un site qui ne l'attend pas"
     );
+}
+
+#[tokio::test]
+async fn inscription_http_presente_la_liaison_du_serveur_7282() {
+    use axum::{
+        Json, Router,
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        routing::post,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    async fn recevoir(
+        State(recus): State<Arc<AtomicUsize>>,
+        Path(sid): Path<String>,
+        entetes: HeaderMap,
+        Json(corps): Json<serde_json::Value>,
+    ) -> StatusCode {
+        recus.fetch_add(1, Ordering::SeqCst);
+        if entetes.get("authorization").and_then(|h| h.to_str().ok())
+            != Some("Bearer jeton-du-compte")
+            || entetes
+                .get("x-tune-server-token")
+                .and_then(|h| h.to_str().ok())
+                != Some("liaison")
+        {
+            return StatusCode::FORBIDDEN;
+        }
+        let preuve_valide = tune_laissez_passer::verifier_inscription_serveur(
+            corps["public_key"].as_str().unwrap_or_default(),
+            &sid,
+            corps["preuve"].as_str().unwrap_or_default(),
+        )
+        .is_ok();
+        if preuve_valide {
+            StatusCode::OK
+        } else {
+            StatusCode::FORBIDDEN
+        }
+    }
+    let recus = Arc::new(AtomicUsize::new(0));
+    let ecoute = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let adresse = ecoute.local_addr().unwrap();
+    let app = Router::new()
+        .route("/api/v1/remote/servers/{sid}/key", post(recevoir))
+        .with_state(recus.clone());
+    let serveur = tokio::spawn(async move {
+        axum::serve(ecoute, app).await.unwrap();
+    });
+    let b = base();
+    relie(&b);
+    cle_du_serveur(&b).unwrap();
+    let site = InscriptionHttp {
+        client: crate::http::client::shared().clone(),
+        base: format!("http://{adresse}"),
+    };
+    let resultat = inscrire_si_besoin(&b, &site).await;
+    assert_eq!(
+        resultat,
+        Ok(true),
+        "la requête réelle doit présenter la liaison attendue, sinon le site refuse 403"
+    );
+    assert!(reglages(&b).get(CLE_INSCRITE).unwrap().is_some());
+    assert_eq!(inscrire_si_besoin(&b, &site).await, Ok(false));
+    assert_eq!(
+        recus.load(Ordering::SeqCst),
+        1,
+        "une inscription réussie ne doit pas repartir au battement suivant"
+    );
+    serveur.abort();
 }

@@ -470,6 +470,81 @@ impl AlarmScheduler {
         self.sonner(alarm, true).await
     }
 
+    /// #7058 — un contenu de bibliothèque devient une file ordonnée ; son
+    /// type n'est jamais le nom d'un service de streaming.
+    fn contenu_du_reveil(
+        &self,
+        source: &str,
+        id: &str,
+        profil: Option<i64>,
+    ) -> Result<Option<Vec<crate::db::play_queue_repo::QueueInput>>, String> {
+        use crate::db::play_queue_repo::QueueInput;
+        use crate::db::playlist_repo::{EntryContent, PlaylistRepo};
+        if !matches!(source, "album" | "playlist") {
+            return Ok(None);
+        }
+        let id = id
+            .parse::<i64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or("identifiant de contenu du réveil invalide")?;
+        let pistes: Vec<QueueInput> = if source == "album" {
+            crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
+                .list_by_album(id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter_map(|t| t.id.map(|track_id| QueueInput::Local { track_id }))
+                .collect()
+        } else {
+            let repo = PlaylistRepo::with_backend(self.db.clone());
+            let profil = profil.ok_or("profil du réveil absent")?;
+            repo.get_for_profile(id, profil)?
+                .ok_or("playlist du réveil introuvable")?;
+            repo.get_entries(id)?
+                .into_iter()
+                .filter_map(|e| match e.content {
+                    EntryContent::Local(track_id) => Some(QueueInput::Local { track_id }),
+                    EntryContent::Missing(_) => None,
+                    EntryContent::Service(t) => Some(QueueInput::Streaming {
+                        source: t.source,
+                        source_id: t.source_id,
+                        title: t.title,
+                        artist: t.artist.unwrap_or_default(),
+                        album: t.album,
+                        cover_url: t.cover_url,
+                        duration_ms: t.duration_ms.unwrap_or(0),
+                        track_number: None,
+                        disc_number: None,
+                        album_ref: t.album_source_id,
+                        artist_ref: None,
+                    }),
+                })
+                .collect()
+        };
+        if pistes.is_empty() {
+            return Err("contenu du réveil sans piste jouable".into());
+        }
+        Ok(Some(pistes))
+    }
+
+    async fn jouer_le_contenu_du_reveil(
+        &self,
+        zone: i64,
+        pistes: &[crate::db::play_queue_repo::QueueInput],
+    ) -> Result<crate::orchestrator::PlayResult, String> {
+        let file = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
+        file.clear(zone)?;
+        if let Err(e) = file.append(zone, pistes) {
+            let _ = file.clear(zone);
+            return Err(e);
+        }
+        if file.count_all(zone)? == 0 {
+            return Err("contenu du réveil sans piste jouable".into());
+        }
+        self.orchestrator.clear_prefetch().await;
+        self.orchestrator.play_from_queue(zone, 0).await
+    }
+
     /// `essai` : `true` pour le bouton d'essai, `false` pour le planificateur.
     ///
     /// Décision de Bertrand du 05/10 (#5669) : quand un réveil sonne sur une
@@ -495,6 +570,13 @@ impl AlarmScheduler {
                 .unwrap_or_default()
         } else {
             source_id.to_string()
+        };
+        let contenu = match self.contenu_du_reveil(source_type, &source_id_str, alarm_profile_id) {
+            Ok(contenu) => contenu,
+            Err(e) => {
+                warn!(alarm_id, error = %e, "alarm_source_error");
+                return ZonesDuReveil::default();
+            }
         };
         let volume = alarm["volume"].as_f64().unwrap_or(0.5);
         let volume = if volume > 1.0 { volume / 100.0 } else { volume };
@@ -583,7 +665,11 @@ impl AlarmScheduler {
                 .playback
                 .set_session_profile(target_zone, alarm_profile_id)
                 .await;
-            if let Err(e) = self.orchestrator.play(req).await {
+            let lecture = match &contenu {
+                Some(pistes) => self.jouer_le_contenu_du_reveil(target_zone, pistes).await,
+                None => self.orchestrator.play(req).await,
+            };
+            if let Err(e) = lecture {
                 // Rien ne joue la source du réveil : pas de fondu sur la zone.
                 warn!(alarm_id, zone_id = target_zone, error = %e, "alarm_play_error");
                 continue;
@@ -874,3 +960,6 @@ mod tests {
 
 #[cfg(test)]
 mod reprise_en_main_5669;
+
+#[cfg(test)]
+mod contenus_album_playlist_7058;

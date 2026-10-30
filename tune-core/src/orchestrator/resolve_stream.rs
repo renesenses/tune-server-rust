@@ -390,7 +390,7 @@ impl PlaybackOrchestrator {
     }
 
     /// La qualité demandée pour cette zone. Voir [`preference_de_qualite`].
-    fn streaming_quality_preference(&self, zone_id: i64) -> StreamingQualityPreference {
+    pub(super) fn streaming_quality_preference(&self, zone_id: i64) -> StreamingQualityPreference {
         preference_de_qualite(&self.db, zone_id)
     }
 
@@ -445,6 +445,7 @@ impl PlaybackOrchestrator {
             } else {
                 0
             };
+
             let is_truncated = prefetch_buffer_truncated(buffered_ms, prefetched.duration_ms);
 
             // Skip a truncated prefetch buffer for EVERY output, not just DLNA.
@@ -481,6 +482,8 @@ impl PlaybackOrchestrator {
         let svc = registry
             .get(service_name)
             .ok_or_else(|| format!("unknown service: {service_name}"))?;
+        // La tâche longue ne réserve pas le registre des AUTRES services.
+        drop(registry);
         // Un service désactivé dans les Réglages n'est plus interrogé, même
         // pour une piste déjà dans la file (`ServiceRegistry::get_actif`).
         if !svc.read().await.enabled() {
@@ -509,8 +512,27 @@ impl PlaybackOrchestrator {
         //
         // Ask for the zone preference on the primary request and on the auth
         // retry. Passing `None` means the provider's highest/default quality.
-        let mut stream_data =
-            request_stream_at_quality(&mut **svc, source_id, provider_quality).await?;
+        // Relu après acquisition du service : l'assemblage DASH en cours
+        // sous ce verrou a alors publié le téléchargement complet (#7247).
+        let deja_telecharge = if quality_preference == StreamingQualityPreference::Max
+            && !req.seek_ms.is_some_and(|ms| ms > 0)
+        {
+            self.prefetch
+                .prendre_dash_complet(service_name, source_id)
+                .await
+        } else {
+            None
+        };
+        let mut stream_data = match deja_telecharge {
+            Some(flux) => {
+                info!(
+                    service = service_name,
+                    source_id, "streaming_dash_prefetch_reutilise_7247"
+                );
+                flux
+            }
+            None => request_stream_at_quality(&mut **svc, source_id, provider_quality).await?,
+        };
         // #6401 — un flux Qobuz haute résolution qui échoue au démarrage
         // (erreur HTTP, flux coupé avant le premier octet) est redemandé UNE
         // fois au format 6, pour cette piste seulement. Toute re-résolution
@@ -722,6 +744,15 @@ impl PlaybackOrchestrator {
             duration_ms = Some(track.duration_ms as i64);
         }
 
+        // #6982 — la DIDL décrit le FLAC restant ; NowPlaying et la sortie
+        // DLNA rétablissent l'horloge de piste grâce au départ inscrit.
+        if let Some(depart) = sid
+            .as_deref()
+            .and_then(crate::outputs::dlna_depart_natif::depart_de_session)
+        {
+            duration_ms = duration_ms.map(|d| d.saturating_sub(depart as i64).max(0));
+        }
+
         // Same contract as the radio branch: every path above may have replaced
         // the service's signed CDN URL with one of our own proxy or transcode
         // endpoints. Keep the upstream so an output that wants the bytes as the
@@ -861,6 +892,58 @@ impl PlaybackOrchestrator {
             (url, Some(session_id), "audio/wav".to_string(), None)
         };
         Ok(flux)
+    }
+
+    async fn servir_qobuz_natif_a_la_position(
+        &self,
+        req: &PlayRequest,
+        flux: &crate::streaming::StreamUrl,
+        position_ms: u64,
+    ) -> Result<FluxHttps, String> {
+        // tmp-autorise: UUID propre à la session ; préfixe nettoyé par remove_session.
+        let chemin = std::env::temp_dir()
+            .join(format!("tune-transcode-{}.flac", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let cible = chemin.clone();
+        let url = flux.url.clone();
+        let entetes = flux.headers.clone();
+        let preparation = tokio::task::spawn_blocking(move || {
+            telecharger_amont(&url, &entetes, &cible)?;
+            crate::audio::depart_natif::preparer(std::path::Path::new(&cible), position_ms)
+                .ok_or_else(|| "Qobuz : départ FLAC natif introuvable".to_string())
+        })
+        .await
+        .map_err(|e| format!("préparation FLAC Qobuz interrompue : {e}"))
+        .and_then(|r| r);
+        let depart = match preparation {
+            Ok(depart) => depart,
+            Err(e) => {
+                let _ = std::fs::remove_file(&chemin);
+                return Err(e);
+            }
+        };
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            sample_rate: flux.quality.sample_rate,
+            bit_depth: flux.quality.bit_depth,
+            channels: flux.quality.channels,
+            file_size: Some(depart.carte.total),
+            duration_ms: req
+                .duration_ms
+                .map(|d| d.saturating_sub(depart.depart_ms as i64).max(0) as u64),
+            ..Default::default()
+        };
+        let taille = depart.carte.total;
+        let sid = self.streamer.create_file_session(info, chemin, true).await;
+        self.streamer.set_faststart(&sid, depart.carte).await;
+        crate::outputs::dlna_depart_natif::inscrire_session(&sid, depart.depart_ms);
+        let url = self
+            .streamer
+            .get_stream_url(&sid, &self.server_ip(), "flac");
+        let url = crate::outputs::dlna_depart_natif::url_avec_depart(&url, depart.depart_ms);
+        Ok((url, Some(sid), "audio/flac".into(), Some(taille)))
     }
 
     /// Premier temps : le WAV que la sortie recevra — cadence plafonnée au
@@ -2342,12 +2425,42 @@ impl PlaybackOrchestrator {
                 .compensation_cuite_db()
                 .filter(|_| https_dsp_active);
 
+            let depart_qobuz = if service_name == "qobuz"
+                && codec_lower == "flac"
+                && is_dlna
+                && req.seek_ms.is_some_and(|ms| ms > 0)
+                && self
+                    .deplacement_hi_res_par_nouveau_flux(
+                        req.zone_id,
+                        device_id,
+                        Some(u32::from(stream_data.quality.bit_depth)),
+                    )
+                    .await
+            {
+                req.seek_ms.unwrap_or(0)
+            } else {
+                0
+            };
+
+            // Sans traitement ni rééchantillonnage, garder les trames FLAC
+            // natives (#6059), sans décoder et ré-encoder tout le reste du titre.
+            if depart_qobuz > 0
+                && renderer_supports_mime
+                && !https_dsp_active
+                && cadence_plafonnee.is_none()
+            {
+                return self
+                    .servir_qobuz_natif_a_la_position(req, stream_data, depart_qobuz)
+                    .await;
+            }
+
             // #5080 — traitement actif vers une zone réseau : WAV progressif,
             // le traitement au fil de l'eau, quand la bibliothèque y aurait
             // droit. Sans cela, le bras ci-dessous attend la piste ENTIÈRE —
             // téléchargée, décodée, traitée, ré-encodée — avant de rendre une
             // adresse : plus d'une minute de silence sur un Hi-Res long.
-            if https_dsp_active
+            if depart_qobuz == 0
+                && https_dsp_active
                 && let Some(bd_servie) = self
                     .profondeur_du_wav_progressif_de_service(
                         service_name,
@@ -2373,11 +2486,13 @@ impl PlaybackOrchestrator {
                     .await);
             }
 
-            if streaming_needs_pretranscode(
-                renderer_supports_mime,
-                https_dsp_active,
-                cadence_plafonnee.is_some(),
-            ) {
+            if depart_qobuz > 0
+                || streaming_needs_pretranscode(
+                    renderer_supports_mime,
+                    https_dsp_active,
+                    cadence_plafonnee.is_some(),
+                )
+            {
                 // Deux raisons d'arriver ici : le renderer ne sait pas lire
                 // le FLAC (→ WAV/LPCM), ou un traitement doit entrer dans le
                 // signal (→ FLAC pleine profondeur, le renderer sait le
@@ -2427,7 +2542,9 @@ impl PlaybackOrchestrator {
                 let tmp_wav_clone = tmp_wav.clone();
                 // VU-mètres : même ajout que les autres pré-transcodes —
                 // le PCM décodé alimente le forwarder de niveaux.
-                let wav_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
+                let wav_levels_tx = self
+                    .levels_forwarder_if_allowed(req.zone_id, depart_qobuz as i64)
+                    .await;
                 let transcode_result = tokio::task::spawn_blocking(move || {
                     // 1. Download — #4366 : même chemin, même ligne de journal.
                     telecharger_amont(&upstream_url, &upstream_headers, &tmp_dl_clone)?;
@@ -2437,7 +2554,7 @@ impl PlaybackOrchestrator {
                         &tmp_dl_clone,
                         Some(sr),
                         Some(2),
-                        0.0,
+                        depart_qobuz as f64 / 1000.0,
                         0.0,
                     )?;
                     let mut pcm_bytes = decoded.pcm_bytes();
@@ -2546,6 +2663,15 @@ impl PlaybackOrchestrator {
                         let url = self
                             .streamer
                             .get_stream_url(&session_id, &server_ip, enc_format);
+                        let url = if depart_qobuz > 0 {
+                            crate::outputs::dlna_depart_natif::inscrire_session(
+                                &session_id,
+                                depart_qobuz,
+                            );
+                            crate::outputs::dlna_depart_natif::url_avec_depart(&url, depart_qobuz)
+                        } else {
+                            url
+                        };
                         (url, Some(session_id), enc_mime.to_string(), Some(file_size))
                     }
                     Ok(Err(e)) => {

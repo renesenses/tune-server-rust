@@ -381,23 +381,9 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut plugins: Vec<Value> = fiches_locales_honorables(&state).await;
 
-    // Built-in plugins
-    let xtune_dir = std::env::var("TUNE_XTUNE_DIR").unwrap_or_else(|_| "xtune-web".into());
-    let xtune_installed = std::path::Path::new(&xtune_dir).exists();
-    plugins.push(serde_json::json!({
-        "name": "xtune",
-        "display_name": "xTune",
-        "description": "Vinyl turntable player — interface platine vinyle immersive",
-        "version": "1.0.0",
-        "author": "MozAIk Labs",
-        "type": "built-in",
-        "installed": xtune_installed,
-        "enabled": xtune_installed,
-        "url": "/xtune/",
-        "icon": "vinyl",
-        // Livré AVEC ce serveur : il n'y a pas de version à confronter.
-        "compatible": true,
-    }));
+    // #4908 — plus de fiche « xTune » : elle annonçait `/xtune/`, une route
+    // que ce serveur ne sert pas. Le besoin (commandes d'écran verrouillé sur
+    // téléphone) est porté par le client web.
 
     // Plugins actually loaded through the SDK. These are the only entries
     // backed by running code — everything above is settings bookkeeping.

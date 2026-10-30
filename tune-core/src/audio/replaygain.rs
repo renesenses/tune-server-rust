@@ -5659,7 +5659,7 @@ mod tests {
             .unwrap();
         let largeur = crate::taches_de_fond::vitesse::largeur_courante(&interne);
         assert!(
-            largeur >= 2 && largeur < 6,
+            (2..6).contains(&largeur),
             "le test parle de plusieurs fichiers en vol sur un lot plus large : largeur={largeur}"
         );
         // La garde qui suit les `largeur` premiers lancements est la première

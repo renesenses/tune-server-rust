@@ -4814,6 +4814,7 @@ mod bascule_asio_a_chaud_5353_tests {
             max_channels: 2,
             sample_rates: vec![44100, 96000],
             sample_rates_measured: true,
+            availability: None,
             backend: "ASIO".into(),
             hardware_detail: None,
         }

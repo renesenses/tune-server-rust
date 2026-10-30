@@ -287,3 +287,124 @@ async fn un_refus_bitperfect_strict_part_avec_son_code_et_ses_frequences_3973() 
         "la phrase de repli doit nommer les deux fréquences : {texte}"
     );
 }
+
+#[tokio::test]
+async fn tune_tested_auto_sondeur_compte_la_panne_reelle_une_fois_et_respecte_le_refus() {
+    for consentement in [false, true] {
+        let banc = Banc::monter(Some("échec de sortie synthétique")).await;
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(banc.poller.db.clone());
+        settings
+            .set(
+                "telemetry_enabled",
+                if consentement { "true" } else { "false" },
+            )
+            .unwrap();
+        settings
+            .set(&format!("zone_{}_brand", banc.zone_id), "Test Audio")
+            .unwrap();
+        settings
+            .set(&format!("zone_{}_model", banc.zone_id), "DAC 7291")
+            .unwrap();
+        banc.un_tick().await;
+        if consentement {
+            let contribution = crate::cloud::tune_tested_auto::contribution(&settings).unwrap();
+            assert_eq!(contribution.devices.len(), 1);
+            assert_eq!(contribution.devices[0].successful_plays, 0);
+            assert_eq!(contribution.devices[0].failed_plays, 1);
+            assert!(contribution.devices[0].best_format.is_none());
+            banc.un_tick().await;
+            assert_eq!(
+                crate::cloud::tune_tested_auto::contribution(&settings)
+                    .unwrap()
+                    .devices[0]
+                    .failed_plays,
+                1
+            );
+        } else {
+            assert!(settings.get("telemetry_tune_tested_v1").unwrap().is_none());
+            assert!(crate::cloud::tune_tested_auto::contribution(&settings).is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn tune_tested_auto_fin_observee_et_repetition_gapless_sans_compter_un_simple_demarrage() {
+    let banc = Banc::monter(None).await;
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(banc.poller.db.clone());
+    settings.set("telemetry_enabled", "true").unwrap();
+    settings
+        .set(&format!("zone_{}_brand", banc.zone_id), "Test Audio")
+        .unwrap();
+    settings
+        .set(&format!("zone_{}_model", banc.zone_id), "DAC 7291")
+        .unwrap();
+    let etat = banc.playback.get_state(banc.zone_id).await;
+    banc.poller
+        .noter_fin_tune_tested(&etat, DEVICE_ID, 2_000)
+        .await;
+    assert!(settings.get("telemetry_tune_tested_v1").unwrap().is_none());
+    for _ in 0..3 {
+        banc.poller
+            .noter_fin_tune_tested(&etat, DEVICE_ID, 240_000)
+            .await;
+        banc.poller
+            .noter_fin_tune_tested(&etat, DEVICE_ID, 240_000)
+            .await;
+        // Même invalidation faite par advance_queue_metadata, sans changement
+        // de track_generation, y compris si la même piste est répétée.
+        banc.playback.bump_levels_gen(banc.zone_id);
+    }
+    let appareil = &crate::cloud::tune_tested_auto::contribution(&settings)
+        .unwrap()
+        .devices[0];
+    assert_eq!(appareil.successful_plays, 3);
+    assert_eq!(appareil.failed_plays, 0);
+    assert!(
+        appareil.best_format.is_none(),
+        "la sortie locale sans format mesuré ne prouve pas le format source"
+    );
+}
+
+#[tokio::test]
+async fn tune_tested_auto_identite_decouverte_sans_adresse_ni_nom_convivial() {
+    let banc = Banc::monter(None).await;
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(banc.poller.db.clone());
+    settings.set("telemetry_enabled", "true").unwrap();
+    settings
+        .set(
+            crate::device_catalog::KNOWN_RENDERERS_KEY,
+            &serde_json::json!([{
+                "device_id": DEVICE_ID,
+                "manufacturer": "Test Audio",
+                "model": "DAC 7291",
+                "location": "http://192.0.2.7/private.xml",
+                "mac": "00:11:22:33:44:55",
+                "name": "PRIVATE kitchen",
+                "serial": "PRIVATE SERIAL"
+            }])
+            .to_string(),
+        )
+        .unwrap();
+    let etat = banc.playback.get_state(banc.zone_id).await;
+    banc.poller
+        .noter_fin_tune_tested(&etat, DEVICE_ID, 240_000)
+        .await;
+    let contribution = crate::cloud::tune_tested_auto::contribution(&settings).unwrap();
+    assert_eq!(contribution.devices[0].manufacturer, "Test Audio");
+    assert_eq!(contribution.devices[0].model, "DAC 7291");
+    let json = serde_json::to_string(&contribution).unwrap();
+    for interdit in [
+        "192.0.2.7",
+        "00:11:22",
+        "PRIVATE",
+        DEVICE_ID,
+        "device_id",
+        "location",
+        "serial",
+    ] {
+        assert!(
+            !json.contains(interdit),
+            "champ interdit présent : {interdit}"
+        );
+    }
+}

@@ -221,12 +221,15 @@ fn echec_de_resolution(e: &EchecResolution) -> AppError {
     }
 }
 #[derive(Deserialize)]
-struct PlayEpisodeRequest {
-    audio_url: String,
-    title: Option<String>,
-    podcast_name: Option<String>,
-    cover_url: Option<String>,
-    duration_ms: Option<u64>,
+pub(super) struct PlayEpisodeRequest {
+    pub(super) audio_url: String,
+    pub(super) title: Option<String>,
+    pub(super) podcast_name: Option<String>,
+    pub(super) podcast_id: Option<String>,
+    pub(super) cover_url: Option<String>,
+    pub(super) duration_ms: Option<u64>,
+    #[serde(default)]
+    pub(super) seek_ms: Option<u64>,
 }
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -240,6 +243,8 @@ pub fn router() -> Router<AppState> {
         .route("/discover", get(discover_podcasts))
         .route("/top", get(top_podcasts))
         .route("/genres", get(list_genres))
+        // #7194 (web#2450) — le catalogue de la carte des podcasts.
+        .route("/catalogue", get(catalogue_podcasts))
         .route("/episodes/{podcast_id}", get(podcast_episodes))
         .route("/episodes", get(episodes_by_feed_url))
         .route("/play/{zone_id}", post(play_episode))
@@ -501,6 +506,100 @@ async fn top_podcasts(
         }
     }
 }
+/// #7194 (web#2450) — `?countries=fr,us,…` ; absent : les dix-huit boutiques
+/// de [`tune_core::streaming::podcast_catalogue::PAYS_PAR_DEFAUT`].
+#[derive(Deserialize, Default)]
+struct CatalogueQuery {
+    countries: Option<String>,
+}
+
+/// Au plus tant de palmarès lus à la fois : chacun coûte un appel Apple, une
+/// ou deux recherches groupées et ses résolutions de flux.
+const PALMARES_EN_PARALLELE: usize = 4;
+
+/// La réponse n'attend pas plus longtemps. Un palmarès plus lent n'est PAS
+/// abandonné : sa tâche continue et remplit le cache d'une heure de
+/// `top_podcasts`, si bien que l'appel suivant l'obtient tout de suite. La
+/// réponse le dit (`pending_countries`) au lieu de le taire.
+const DELAI_DU_CATALOGUE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `GET /podcasts/catalogue` — les palmarès de plusieurs pays et la sélection
+/// éditoriale réunis, sans doublon, pour la carte des podcasts (web#2450).
+///
+/// Chaque émission porte son rang par pays (`charts`), son pays principal,
+/// sa catégorie (`category`, `category_id`) et `readable` : Tune connaît son
+/// flux. Aucun fournisseur nouveau : ce sont les palmarès de l'onglet
+/// « Populaires », lus pour plusieurs pays.
+async fn catalogue_podcasts(
+    State(state): State<AppState>,
+    Query(q): Query<CatalogueQuery>,
+) -> Result<Json<Value>, AppError> {
+    use tune_core::streaming::podcast_catalogue::{fusionner, pays_demandes};
+    let pays = pays_demandes(q.countries.as_deref()).map_err(|message| AppError {
+        status: StatusCode::BAD_REQUEST,
+        message,
+        code: Some("podcast_catalogue_pays_invalide".into()),
+    })?;
+    let relais = RelaisPodcastIndex::du_compte(&state.backend);
+    let permis = std::sync::Arc::new(tokio::sync::Semaphore::new(PALMARES_EN_PARALLELE));
+    let taches: Vec<_> = pays
+        .iter()
+        .map(|cc| {
+            let svc = PodcastService::with_client(state.http_client.clone())
+                .avec_relais_podcast_index(relais.clone());
+            let permis = permis.clone();
+            let cc = cc.clone();
+            let tache = tokio::spawn({
+                let cc = cc.clone();
+                async move {
+                    let _permis = permis.acquire_owned().await.ok();
+                    svc.top_podcasts(None, &cc).await
+                }
+            });
+            (cc, tache)
+        })
+        .collect();
+    let limite = tokio::time::Instant::now() + DELAI_DU_CATALOGUE;
+    let mut palmares = Vec::new();
+    let mut en_attente: Vec<String> = Vec::new();
+    let mut en_echec: Vec<String> = Vec::new();
+    for (cc, mut tache) in taches {
+        match tokio::time::timeout_at(limite, &mut tache).await {
+            Ok(Ok(Ok(liste))) => palmares.push((cc, liste)),
+            Ok(Ok(Err(e))) => {
+                warn!(country = %cc, error = %e, "podcast_catalogue_palmares_en_echec");
+                en_echec.push(cc);
+            }
+            Ok(Err(e)) => {
+                warn!(country = %cc, error = %e, "podcast_catalogue_tache_interrompue");
+                en_echec.push(cc);
+            }
+            // La tâche continue seule (un JoinHandle lâché ne l'annule pas).
+            Err(_) => en_attente.push(cc),
+        }
+    }
+    let selection: Vec<(String, Vec<_>)> = if pays
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(PodcastService::CURATED_COUNTRY))
+    {
+        vec![(
+            PodcastService::CURATED_COUNTRY.to_string(),
+            PodcastService::curated_french_podcasts(),
+        )]
+    } else {
+        Vec::new()
+    };
+    let items = fusionner(&palmares, &selection);
+    Ok(Json(json!({
+        "countries": pays,
+        "pending_countries": en_attente,
+        "failed_countries": en_echec,
+        "complete": en_attente.is_empty() && en_echec.is_empty(),
+        "count": items.len(),
+        "items": items,
+        "genres": PodcastService::available_genres(),
+    })))
+}
 /// GET /genres — list all available genre filters for the top endpoint.
 async fn list_genres() -> Json<Value> {
     Json(json!(PodcastService::available_genres()))
@@ -603,7 +702,7 @@ async fn podcast_episodes(
         ),
     }
 }
-async fn play_episode(
+pub(super) async fn play_episode(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Json(body): Json<PlayEpisodeRequest>,
@@ -677,7 +776,19 @@ async fn play_episode(
         ..Default::default()
     };
     // #6465 — un épisode n'appartient à aucun album ni playlist joué avant.
-    state.playback.effacer_contexte_de_session(zone_id).await;
+    state
+        .playback
+        .set_session_context(
+            zone_id,
+            Some("podcast".into()),
+            body.podcast_id
+                .clone()
+                .or_else(|| body.podcast_name.clone()),
+            Some("podcast".into()),
+            body.podcast_name.clone(),
+            np.cover_path.clone(),
+        )
+        .await;
     state.playback.play(zone_id, np).await;
     // #6468 — un échec n'est plus un `200` : la réponse porte un vrai code
     // HTTP et un `code` stable, que le client peut afficher.
@@ -724,6 +835,36 @@ async fn play_episode(
         output_sent,
         "podcast_episode_play"
     );
+    if echec.is_none() {
+        if let Some(seek_ms) = body.seek_ms.filter(|v| *v > 0) {
+            if let Err(e) = state
+                .orchestrator
+                .seek(zone_id, seek_ms, device_id.as_deref())
+                .await
+            {
+                state.playback.stop(zone_id).await;
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": e.to_string(), "code": "podcast_resume_seek_failed"})),
+                )
+                    .into_response();
+            }
+        }
+        if output_sent {
+            let s = state.playback.get_state(zone_id).await;
+            if let Some(np) = s.now_playing.as_ref() {
+                if let Err(e) = tune_core::db::listening_resume::podcast_started_in_context(
+                    &state.backend,
+                    zone_id,
+                    np,
+                    s.position_ms,
+                    body.podcast_id.as_deref(),
+                ) {
+                    warn!(zone_id, error = %e, "reprise_podcast_non_enregistree");
+                }
+            }
+        }
+    }
     let zone_state = state.playback.get_state(zone_id).await;
     let statut = echec.as_ref().map_or(StatusCode::OK, |(s, _, _)| *s);
     let code = echec.as_ref().map(|(_, c, _)| *c);

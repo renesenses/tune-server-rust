@@ -112,6 +112,17 @@ pub(super) async fn patch_zone(
     {
         return reponse;
     }
+    // #7133 — la zone a changé d'appareil : celui qu'elle quitte se tait,
+    // sans quoi il continue de jouer à côté du nouveau.
+    if let Some(ref nouvelle) = body.output_device_id {
+        couper_l_ancienne_sortie(
+            &state,
+            id,
+            zone_before.output_device_id.as_deref(),
+            Some(nouvelle),
+        )
+        .await;
+    }
 
     if body.brand.is_some() || body.model.is_some() {
         push_device_correction(&state, id).await;
@@ -1480,19 +1491,44 @@ pub(super) async fn update_volume(
     // #1274 — l'arbitrage `volume` / `volume_db` et la conversion des dB
     // vivent dans `volume_scale`, pas ici. Cette route ne fait que ramener sa
     // convention historique sur 0..1 avant de la lui passer.
-    let volume_f = match tune_core::audio::volume_scale::demande_lineaire(lineaire, body.volume_db)
-    {
-        Ok(v) => v,
-        Err(motif) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid_volume", "message": motif })),
-            )
-                .into_response();
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let zone = repo.get(id).ok().flatten();
+    // #6918 — la course en dB de la sortie, si elle en a une.
+    let course = tune_core::audio::volume_appareil_db::course_de_la_sortie(
+        &state.backend,
+        zone.as_ref().and_then(|z| z.output_type.as_deref()),
+    );
+    let volume_f = if let Some(device_db) = body.device_volume_db {
+        // #6918 — des dB d'appareil ramenés à la fraction, qui suit ensuite
+        // le chemin de toute consigne : limites #6541, garde #6721, trim.
+        match tune_core::audio::volume_appareil_db::demande_de_la_requete(
+            course,
+            lineaire,
+            body.volume_db,
+            device_db,
+        ) {
+            Ok(v) => v,
+            Err(motif) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_device_volume_db", "message": motif })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match tune_core::audio::volume_scale::demande_lineaire(lineaire, body.volume_db) {
+            Ok(v) => v,
+            Err(motif) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_volume", "message": motif })),
+                )
+                    .into_response();
+            }
         }
     };
-    let repo = ZoneRepo::with_backend(state.backend.clone());
-    let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
+    let device_id = zone.and_then(|z| z.output_device_id);
     // #1274 — la consigne en dB doit avoir un endroit où arriver. Si la
     // sortie de la zone ne parle au périphérique qu'en entiers, un dB sous son
     // premier pas ne baisse pas le son : il l'éteint. On le refuse en le
@@ -1533,6 +1569,7 @@ pub(super) async fn update_volume(
                     tune_core::audio::volume_scale::echelle_de_la_zone(&state.backend, id).code()
                 ),
             );
+            tune_core::audio::volume_appareil_db::inserer(&mut corps, course, retenu.retenu);
             (StatusCode::OK, Json(serde_json::Value::Object(corps))).into_response()
         }
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -1572,5 +1609,64 @@ pub(super) async fn rename_zone(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod teac_7371 {
+    use super::*;
+
+    #[tokio::test]
+    async fn la_zone_demandee_en_dlna_reste_attachee_a_la_sortie_dlna() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let airplay = repo
+            .create("TEAC NT-505X", Some("airplay"), Some("airplay-teac"))
+            .unwrap();
+        repo.set_host(airplay, "192.0.2.50").unwrap();
+        let dlna = tune_core::outputs::dlna::DlnaOutput::new(
+            "TEAC NT-505X".into(),
+            "uuid:teac-dlna".into(),
+            "192.0.2.50".into(),
+            "http://192.0.2.50/av".into(),
+            "http://192.0.2.50/rc".into(),
+            None,
+        );
+        state.outputs.lock().await.register(Box::new(dlna));
+        let response = create_zone(
+            State(state.clone()),
+            Json(CreateZone {
+                name: "TEAC DLNA".into(),
+                output_type: Some("dlna".into()),
+                output_device_id: Some("uuid:teac-dlna".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert!(response.status().is_success());
+        let zone = repo
+            .get_by_device_id("uuid:teac-dlna")
+            .unwrap()
+            .expect("la zone DLNA demandée doit exister");
+        assert_ne!(zone.id, Some(airplay));
+        assert_eq!(zone.output_type.as_deref(), Some("dlna"));
+        assert_eq!(
+            state
+                .outputs
+                .lock()
+                .await
+                .type_of(zone.output_device_id.as_deref().unwrap())
+                .as_deref(),
+            Some("dlna"),
+            "le routage de cette zone doit résoudre la sortie DLNA"
+        );
+        assert_eq!(
+            repo.get(airplay)
+                .unwrap()
+                .unwrap()
+                .output_device_id
+                .as_deref(),
+            Some("airplay-teac")
+        );
     }
 }

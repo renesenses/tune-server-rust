@@ -156,6 +156,9 @@ impl PlaybackOrchestrator {
         annonce: Option<bool>,
         mime_type: &str,
     ) -> String {
+        if erreur.starts_with("hqplayer_output_start_failed:") {
+            return crate::outputs::hqplayer::MESSAGE_ECHEC_DE_SORTIE.into();
+        }
         if dsd_mode == "native" && annonce == Some(false) && est_dsd_brut(mime_type) {
             return format!(
                 "Output device error: le mode DSD de cette zone est réglé sur « natif » \
@@ -169,6 +172,16 @@ impl PlaybackOrchestrator {
     }
 
     pub(super) async fn resolve_stream(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
+        if let Some(resolu) = self.reprendre_preparation_fichier(req).await {
+            return resolu;
+        }
+        self.resolve_stream_frais(req).await
+    }
+
+    pub(super) async fn resolve_stream_frais(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<ResolvedStream, String> {
         // #4407 — le traitement lu AVANT la résolution : si un réglage change
         // pendant qu'elle tourne, l'empreinte notée est l'ancienne, et le
         // prochain changement relancera. Jamais l'inverse.
@@ -669,6 +682,12 @@ impl PlaybackOrchestrator {
         })
         .ok();
 
+        if let Err(e) = crate::db::listening_resume::started(
+            &self.db, zone_id, &contexte, source, source_id, title, album, cover_url,
+        ) {
+            tracing::warn!(zone_id, error = %e, "reprise_non_enregistree");
+        }
+
         // NOTE: scrobbling is intentionally NOT dispatched here. It used to fire
         // at play-start, which (a) scrobbled a track the instant it began — so
         // skipping after a few seconds still scrobbled it, ignoring Last.fm's
@@ -840,15 +859,56 @@ impl PlaybackOrchestrator {
             confirmations.noter(zone_id, stream_id, joue && en_attente);
         }
         if !en_attente {
+            if joue {
+                self.memoriser_position_du_lecteur(zone_id, stream_id, position_ms)
+                    .await;
+            }
             return SignalDuLecteur::RienEnAttente;
         }
         if !joue {
             return SignalDuLecteur::PasEncoreDeLecture;
         }
         if self.confirmer_lecture_navigateur(zone_id, stream_id).await {
+            self.memoriser_position_du_lecteur(zone_id, stream_id, position_ms)
+                .await;
             SignalDuLecteur::Confirmee
         } else {
             SignalDuLecteur::RienEnAttente
+        }
+    }
+
+    /// Position MESURÉE par le lecteur du flux courant, jamais une horloge estimée.
+    async fn memoriser_position_du_lecteur(&self, zone_id: i64, stream_id: &str, position_ms: i64) {
+        let state = self.playback.get_state(zone_id).await;
+        if position_ms <= 0
+            || state.state != PlayState::Playing
+            || !state
+                .now_playing
+                .as_ref()
+                .is_some_and(|np| np.stream_id.as_deref() == Some(stream_id))
+            || ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .is_none_or(|zone| zone.output_type.as_deref() != Some("browser"))
+        {
+            return;
+        }
+        self.playback.update_position(zone_id, position_ms).await;
+        let state = self.playback.get_state(zone_id).await;
+        let _ = crate::db::listening_resume::track_position(&self.db, &state);
+        if let Some(np) = state
+            .now_playing
+            .as_ref()
+            .filter(|np| np.source == "podcast")
+            && let Some(url) = np.source_id.as_deref()
+        {
+            let _ = crate::db::listening_resume::podcast_position(
+                &self.db,
+                zone_id,
+                url,
+                state.position_ms,
+            );
         }
     }
 
@@ -873,6 +933,22 @@ impl PlaybackOrchestrator {
         muted: bool,
         device_id: Option<&str>,
     ) -> OutputCommandResult<()> {
+        let zone_air = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .filter(|z| {
+                z.output_type.as_deref() == Some(crate::outputs::devialet_air::TYPE_DE_SORTIE)
+            });
+        let file_air = zone_air
+            .as_ref()
+            .and_then(|z| z.output_device_id.as_deref())
+            .map(|did| self.volume_coalesceur.file(did, zone_id));
+        if let Some(ref zone) = zone_air {
+            self.playback
+                .marquer_geste_air(zone_id, zone.volume / 100.0, zone.muted)
+                .await;
+        }
         if let Some(did) = device_id {
             let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
                 OutputCommandError::failed(
@@ -881,6 +957,16 @@ impl PlaybackOrchestrator {
                 )
             })?;
             output.lock().await.checked_set_mute(muted).await?;
+        }
+        let _tenue_air = if let Some(ref file) = file_air {
+            Some(file.etat.lock().await)
+        } else {
+            None
+        };
+        if let Some(ref zone) = zone_air {
+            self.playback
+                .marquer_geste_air(zone_id, zone.volume / 100.0, zone.muted)
+                .await;
         }
         self.playback.set_mute(zone_id, muted).await;
         ZoneRepo::with_backend(self.db.clone())
@@ -920,7 +1006,18 @@ impl PlaybackOrchestrator {
 
     pub(super) async fn persist_position(&self, zone_id: i64) {
         let state = self.playback.get_state(zone_id).await;
+        let _ = crate::db::listening_resume::track_position(&self.db, &state);
         if let Some(ref np) = state.now_playing {
+            if np.source == "podcast" {
+                if let Some(url) = np.source_id.as_deref() {
+                    let _ = crate::db::listening_resume::podcast_position(
+                        &self.db,
+                        zone_id,
+                        url,
+                        state.position_ms,
+                    );
+                }
+            }
             ZoneRepo::with_backend(self.db.clone())
                 .save_playback_position(
                     zone_id,

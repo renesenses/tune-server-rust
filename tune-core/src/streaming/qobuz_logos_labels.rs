@@ -114,6 +114,7 @@ impl CatalogueDeLabels for QobuzService {
             image_url: image_de_label(&fiche),
             id,
             nom: nom_qobuz,
+            attribution: None,
         }))
     }
 

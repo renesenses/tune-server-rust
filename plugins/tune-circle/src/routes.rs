@@ -122,6 +122,7 @@ pub const CODE_SERVEUR_NON_LIE: &str = "circle.server_not_linked";
 pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
     // rc9 (#7130) : les notifications de Tune web, dans [`crate::notifications`].
     let notifications = crate::notifications::router(relais.clone());
+    let messagerie = crate::messagerie::router(relais.clone());
     let etat_de_la_copie = Router::new()
         .route("/library-sync", get(etat_de_la_copie_en_ligne))
         .with_state(Arc::new(EtatDeLaCopie {
@@ -206,6 +207,7 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
         .with_state(relais)
         .merge(etat_de_la_copie)
         .merge(notifications)
+        .merge(messagerie)
 }
 
 // #6521 — les vignettes des pochettes partagées avec le cercle -----------------
@@ -673,7 +675,11 @@ async fn relire_le_partage(relais: &Relais) {
 /// serveur partagé. Sans `server_id` local, `null` part et le cloud répond 422.
 /// Les 404 du cloud deviennent `circle.server_not_linked` (serveur pas encore
 /// lié au compte) ou `circle.not_found` (cercle d'un autre).
-async fn partager(State(relais): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
+async fn partager(
+    State(relais): State<Arc<Relais>>,
+    Path(id): Path<String>,
+    vignettes: Option<axum::Extension<Arc<crate::vignettes::Vignettes>>>,
+) -> Response {
     if !identifiant_valide(&id) {
         return introuvable();
     }
@@ -688,6 +694,10 @@ async fn partager(State(relais): State<Arc<Relais>>, Path(id): Path<String>) -> 
         .await;
     if reussie(&issue) {
         ecrire_le_partage(&relais, true);
+        // #6733 : ne pas attendre le prochain passage des pochettes.
+        if let Some(axum::Extension(vignettes)) = vignettes {
+            vignettes.reveiller();
+        }
         // Une bibliothèque jamais poussée part entière au prochain cycle —
         // sans quoi les contacts parcourraient un catalogue vide ou troué.
         let jamais_poussee = relais

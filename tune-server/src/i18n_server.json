@@ -3688,6 +3688,23 @@
     "pl": "Odtwarzanie Spotify nie jest włączone: opcja „Odtwarzanie Spotify (eksperymentalne)” znajduje się w Ustawienia › Dostęp i tokeny › Spotify Connect (poziom zaawansowany).",
     "el": "Η αναπαραγωγή Spotify δεν είναι ενεργοποιημένη: η επιλογή «Αναπαραγωγή Spotify (πειραματική)» βρίσκεται στις Ρυθμίσεις › Πρόσβαση και διακριτικά › Spotify Connect (προχωρημένο επίπεδο)."
   },
+  "spotify.quality.librespotCeiling": {
+    "fr": "Spotify ne livre à librespot, le lecteur Spotify Connect de Tune, que de l'Ogg Vorbis, {bitrate} kbit/s au plus : librespot ne sait pas lire le sans-perte de Spotify, quel que soit votre abonnement.",
+    "en": "Spotify only delivers Ogg Vorbis, at most {bitrate} kbit/s, to librespot, Tune's Spotify Connect player: librespot cannot play Spotify's lossless streams, whatever your subscription.",
+    "de": "Spotify liefert an librespot, den Spotify-Connect-Player von Tune, nur Ogg Vorbis mit höchstens {bitrate} kbit/s: librespot kann die verlustfreien Streams von Spotify nicht abspielen, unabhängig von Ihrem Abo.",
+    "es": "Spotify solo entrega a librespot, el reproductor Spotify Connect de Tune, Ogg Vorbis a {bitrate} kbit/s como máximo: librespot no puede reproducir el audio sin pérdida de Spotify, sea cual sea su suscripción.",
+    "it": "Spotify fornisce a librespot, il lettore Spotify Connect di Tune, solo Ogg Vorbis a {bitrate} kbit/s al massimo: librespot non sa riprodurre i flussi lossless di Spotify, qualunque sia il tuo abbonamento.",
+    "zh": "Spotify 只向 librespot（Tune 的 Spotify Connect 播放器）提供 Ogg Vorbis，最高 {bitrate} kbit/s：无论您的订阅如何，librespot 都无法播放 Spotify 的无损音频。",
+    "ja": "Spotify が librespot（Tune の Spotify Connect プレーヤー）に配信するのは最大 {bitrate} kbit/s の Ogg Vorbis のみです。ご契約内容にかかわらず、librespot は Spotify のロスレス音源を再生できません。",
+    "ko": "Spotify는 librespot(Tune의 Spotify Connect 플레이어)에 최대 {bitrate} kbit/s의 Ogg Vorbis만 제공합니다. 구독 종류와 관계없이 librespot은 Spotify의 무손실 음원을 재생할 수 없습니다.",
+    "ro": "Spotify îi livrează lui librespot, playerul Spotify Connect al Tune, doar Ogg Vorbis de cel mult {bitrate} kbit/s: librespot nu poate reda fluxurile fără pierderi ale Spotify, indiferent de abonament.",
+    "sv": "Spotify levererar bara Ogg Vorbis, högst {bitrate} kbit/s, till librespot, Tunes Spotify Connect-spelare: librespot kan inte spela Spotifys förlustfria strömmar, oavsett abonnemang.",
+    "hu": "A Spotify a librespotnak, a Tune Spotify Connect-lejátszójának, csak legfeljebb {bitrate} kbit/s-os Ogg Vorbist küld: a librespot nem tudja lejátszani a Spotify veszteségmentes adatfolyamait, előfizetéstől függetlenül.",
+    "vi": "Spotify chỉ cung cấp cho librespot, trình phát Spotify Connect của Tune, định dạng Ogg Vorbis tối đa {bitrate} kbit/s: librespot không phát được luồng lossless của Spotify, dù bạn dùng gói nào.",
+    "nb": "Spotify leverer bare Ogg Vorbis, høyst {bitrate} kbit/s, til librespot, Tunes Spotify Connect-spiller: librespot kan ikke spille Spotifys tapsfrie strømmer, uansett abonnement.",
+    "pl": "Spotify dostarcza do librespot, odtwarzacza Spotify Connect w Tune, wyłącznie Ogg Vorbis o przepływności najwyżej {bitrate} kbit/s: librespot nie potrafi odtwarzać bezstratnych strumieni Spotify, niezależnie od subskrypcji.",
+    "el": "Το Spotify παραδίδει στο librespot, τη συσκευή αναπαραγωγής Spotify Connect του Tune, μόνο Ogg Vorbis έως {bitrate} kbit/s: το librespot δεν μπορεί να αναπαράγει τις ροές χωρίς απώλειες του Spotify, ανεξάρτητα από τη συνδρομή σας."
+  },
   "plugin.uninstall.bundled_hidden": {
     "fr": "Ce greffon est fourni avec cette installation et ne peut pas être supprimé. Il a été désactivé et masqué ; l'installer de nouveau le rétablit.",
     "en": "This plugin ships with this installation and cannot be deleted. It has been disabled and hidden; installing it again brings it back.",
@@ -4011,6 +4028,40 @@
     "pl": "source_index musi mieścić się między 0 a {max}.",
     "el": "Το source_index πρέπει να είναι μεταξύ 0 και {max}."
   },
+  "api.devialet.volumeRangeBelowLimit": {
+    "fr": "Cette course placerait son bas au-dessus d'une limite de volume d'une zone Devialet. Abaissez d'abord la borne basse ou relevez la limite.",
+    "en": "This range would put its low bound above a Devialet zone's volume limit. Lower the low bound or raise the limit first.",
+    "de": "Dieser Bereich würde seine untere Grenze über die Lautstärkegrenze einer Devialet-Zone legen. Senken Sie zuerst die untere Grenze oder erhöhen Sie die Grenze.",
+    "es": "Este rango pondría su límite inferior por encima del límite de volumen de una zona Devialet. Baje primero el límite inferior o suba el límite.",
+    "it": "Questo intervallo porterebbe il limite inferiore sopra il limite di volume di una zona Devialet. Abbassa prima il limite inferiore o alza il limite.",
+    "zh": "此范围的下限将高于某个 Devialet 区域的音量限制。请先降低下限或提高该限制。",
+    "ja": "この範囲では下限が Devialet ゾーンの音量制限を上回ります。先に下限を下げるか、制限を上げてください。",
+    "ko": "이 범위는 하한이 Devialet 영역의 볼륨 제한보다 높아집니다. 먼저 하한을 낮추거나 제한을 올리세요.",
+    "ro": "Acest interval și-ar pune limita inferioară deasupra unei limite de volum a unei zone Devialet. Coborâți mai întâi limita inferioară sau ridicați limita.",
+    "sv": "Det här intervallet skulle lägga sin nedre gräns över en Devialet-zons volymgräns. Sänk först den nedre gränsen eller höj gränsen.",
+    "hu": "Ez a tartomány az alsó határát egy Devialet zóna hangerőkorlátja fölé tenné. Előbb csökkentse az alsó határt, vagy emelje a korlátot.",
+    "vi": "Dải này sẽ đặt giới hạn dưới cao hơn giới hạn âm lượng của một vùng Devialet. Hãy hạ giới hạn dưới hoặc nâng giới hạn trước.",
+    "nb": "Dette området ville lagt den nedre grensen over volumgrensen til en Devialet-sone. Senk den nedre grensen eller hev grensen først.",
+    "pl": "Ten zakres umieściłby dolną granicę powyżej limitu głośności strefy Devialet. Najpierw obniż dolną granicę lub podnieś limit.",
+    "el": "Αυτό το εύρος θα έθετε το κάτω όριο πάνω από ένα όριο έντασης μιας ζώνης Devialet. Χαμηλώστε πρώτα το κάτω όριο ή αυξήστε το όριο."
+  },
+  "api.devialet.volumeRangeInvalid": {
+    "fr": "La course de volume doit tenir entre {floor} et {ceiling} dB, avec au moins {gap} dB entre la borne basse et la borne haute.",
+    "en": "The volume range must lie between {floor} and {ceiling} dB, with at least {gap} dB between the low and high bounds.",
+    "de": "Der Lautstärkebereich muss zwischen {floor} und {ceiling} dB liegen, mit mindestens {gap} dB zwischen unterer und oberer Grenze.",
+    "es": "El rango de volumen debe estar entre {floor} y {ceiling} dB, con al menos {gap} dB entre el límite inferior y el superior.",
+    "it": "L'intervallo del volume deve essere compreso tra {floor} e {ceiling} dB, con almeno {gap} dB tra il limite inferiore e quello superiore.",
+    "zh": "音量范围必须在 {floor} 到 {ceiling} dB 之间，且下限与上限至少相差 {gap} dB。",
+    "ja": "音量範囲は {floor}〜{ceiling} dB の間で、下限と上限の差を {gap} dB 以上にしてください。",
+    "ko": "볼륨 범위는 {floor}~{ceiling} dB 사이여야 하며, 하한과 상한의 차이는 {gap} dB 이상이어야 합니다.",
+    "ro": "Intervalul volumului trebuie să fie între {floor} și {ceiling} dB, cu cel puțin {gap} dB între limita inferioară și cea superioară.",
+    "sv": "Volymintervallet måste ligga mellan {floor} och {ceiling} dB, med minst {gap} dB mellan nedre och övre gräns.",
+    "hu": "A hangerőtartománynak {floor} és {ceiling} dB között kell lennie, az alsó és a felső határ között legalább {gap} dB-lel.",
+    "vi": "Dải âm lượng phải nằm trong khoảng {floor} đến {ceiling} dB, với giới hạn dưới và trên cách nhau ít nhất {gap} dB.",
+    "nb": "Volumområdet må ligge mellom {floor} og {ceiling} dB, med minst {gap} dB mellom nedre og øvre grense.",
+    "pl": "Zakres głośności musi mieścić się między {floor} a {ceiling} dB, z co najmniej {gap} dB między dolną a górną granicą.",
+    "el": "Το εύρος έντασης πρέπει να βρίσκεται μεταξύ {floor} και {ceiling} dB, με τουλάχιστον {gap} dB μεταξύ κάτω και άνω ορίου."
+  },
   "api.playlists.transferPluginNotCompiled": {
     "fr": "Le transfert de playlists passe par le greffon « Playlists converter », et ce serveur a été compilé sans greffons WASM.",
     "en": "Playlist transfer goes through the “Playlists converter” plugin, and this server was built without WASM plugins.",
@@ -4112,6 +4163,23 @@
     "nb": "Bekreftelsen som ble mottatt dekker ikke de {count} berørte sporene. Ingenting ble fjernet. Bekreft nøyaktig dette tallet for å fortsette.",
     "pl": "Otrzymane potwierdzenie nie obejmuje {count} utworów. Nic nie zostało usunięte. Potwierdź dokładnie tę liczbę, aby kontynuować.",
     "el": "Η επιβεβαίωση που λήφθηκε δεν καλύπτει τα {count} κομμάτια. Δεν αφαιρέθηκε τίποτα. Επιβεβαιώστε αυτόν ακριβώς τον αριθμό για να συνεχίσετε."
+  },
+  "api.library.nightWindowEmpty": {
+    "fr": "L'heure de début ({start} h) doit précéder l'heure de fin ({end} h). Rien n'a été enregistré.",
+    "en": "The start hour ({start}:00) must come before the end hour ({end}:00). Nothing was saved.",
+    "de": "Die Startstunde ({start}:00) muss vor der Endstunde ({end}:00) liegen. Es wurde nichts gespeichert.",
+    "es": "La hora de inicio ({start}:00) debe ser anterior a la hora de fin ({end}:00). No se ha guardado nada.",
+    "it": "L'ora di inizio ({start}:00) deve precedere l'ora di fine ({end}:00). Non è stato salvato nulla.",
+    "zh": "开始时间（{start}:00）必须早于结束时间（{end}:00）。未保存任何内容。",
+    "ja": "開始時刻（{start}:00）は終了時刻（{end}:00）より前である必要があります。何も保存されていません。",
+    "ko": "시작 시각({start}:00)은 종료 시각({end}:00)보다 앞서야 합니다. 아무것도 저장되지 않았습니다.",
+    "ro": "Ora de început ({start}:00) trebuie să fie înaintea orei de sfârșit ({end}:00). Nu s-a salvat nimic.",
+    "sv": "Starttimmen ({start}:00) måste komma före sluttimmen ({end}:00). Inget sparades.",
+    "hu": "A kezdő órának ({start}:00) a záró óra ({end}:00) előtt kell lennie. Semmi sem lett mentve.",
+    "vi": "Giờ bắt đầu ({start}:00) phải trước giờ kết thúc ({end}:00). Chưa có gì được lưu.",
+    "nb": "Starttimen ({start}:00) må komme før slutttimen ({end}:00). Ingenting ble lagret.",
+    "pl": "Godzina rozpoczęcia ({start}:00) musi poprzedzać godzinę zakończenia ({end}:00). Nic nie zostało zapisane.",
+    "el": "Η ώρα έναρξης ({start}:00) πρέπει να προηγείται της ώρας λήξης ({end}:00). Δεν αποθηκεύτηκε τίποτα."
   },
   "api.license.activated": {
     "fr": "Licence validée : Premium activé.",

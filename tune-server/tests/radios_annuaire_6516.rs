@@ -20,6 +20,157 @@ use tune_server::routes::radios_annuaire::{self, Releve};
 const EXTRAIT: &str = include_str!("fixtures/annuaire_v2_extrait_20261019.json");
 const ETAG: &str = "W/\"annuaire-6516\"";
 
+// Forme de la fiche Radio Bonheur lue dans le cache RÉEL du .18 le
+// 27/10/2026 (relevé 06:24:55Z). Nom, adresses, logo et identifiants locaux
+// anonymisés ; external_id=null, source, statut et forme des flux conservés.
+const FICHE_PORTAIL_7011: &str = include_str!("fixtures/annuaire_portail_7011_anonymise.json");
+
+#[tokio::test]
+async fn une_fiche_portail_sans_id_externe_reste_adressable_et_s_ajoute_sans_doublon_7011() {
+    let brut: Value = serde_json::from_str(FICHE_PORTAIL_7011).unwrap();
+    let fiches = tune_server::routes::radios::annuaire_depuis_json(&[brut.clone()]);
+    assert_eq!(fiches.len(), 1);
+    assert_eq!(
+        fiches[0].external_id.as_deref(),
+        Some("mozaiklabs:7011001"),
+        "une fiche publiée du portail sans id radio-metadata doit garder une clé de lecture"
+    );
+    assert!(fiches[0].radio_metadata_key.is_none());
+    let state = etat();
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    let avant = repo.list().unwrap().len();
+    let page = radios_annuaire::corps_annuaire(
+        &fiches,
+        &repo.list().unwrap(),
+        &Default::default(),
+        &Default::default(),
+    );
+    assert_eq!(page["items"][0]["external_id"], "mozaiklabs:7011001");
+    // La fiche n'a pas de relais de titres. Ce témoin n'a pas à remplacer
+    // le registre global que les autres tests d'annuaire emploient.
+    *state.annuaire_radios.write().unwrap() = fiches;
+    let app = tune_server::routes::router(state.clone());
+    let chemin = "/api/v1/radios/directory/mozaiklabs%3A7011001/add";
+    let (status, ajoutee) = requete(&app, "POST", chemin, None).await;
+    assert_eq!(status, StatusCode::CREATED, "{ajoutee}");
+    let id = ajoutee["id"].as_i64().unwrap();
+    let (status, seconde) = requete(&app, "POST", chemin, None).await;
+    assert_eq!(status, StatusCode::OK, "{seconde}");
+    assert_eq!(seconde["id"], id);
+    assert_eq!(repo.list().unwrap().len(), avant + 1);
+    assert_eq!(repo.liens_annuaire().unwrap()[&id], "mozaiklabs:7011001");
+
+    // Le lien n'est ni le nom ni le flux : une correction de la fiche ne
+    // crée pas une deuxième radio lors du prochain ajout.
+    let mut modifiee = brut;
+    modifiee["name"] = json!("Nouveau nom anonymisé");
+    modifiee["stream_url"] = json!("https://station-7011.example/nouveau.mp3");
+    *state.annuaire_radios.write().unwrap() =
+        tune_server::routes::radios::annuaire_depuis_json(&[modifiee]);
+    let (status, retrouvee) = requete(&app, "POST", chemin, None).await;
+    assert_eq!(status, StatusCode::OK, "{retrouvee}");
+    assert_eq!(retrouvee["id"], id);
+    assert_eq!(repo.list().unwrap().len(), avant + 1);
+}
+
+#[test]
+fn le_repli_7011_ne_remplace_pas_un_id_externe_et_n_invente_pas_un_id_absent() {
+    let mut brut: Value = serde_json::from_str(FICHE_PORTAIL_7011).unwrap();
+    brut["external_id"] = json!(" S007011 ");
+    let f = tune_server::routes::radios::annuaire_depuis_json(&[brut.clone()]);
+    assert_eq!(f[0].external_id.as_deref(), Some("S007011"));
+    for invalide in [Value::Null, json!(0), json!(-1), json!("7011001")] {
+        brut["external_id"] = Value::Null;
+        brut["id"] = invalide;
+        let f = tune_server::routes::radios::annuaire_depuis_json(&[brut.clone()]);
+        assert!(f[0].external_id.is_none());
+    }
+}
+
+// #7200 — Café del Mar (fil forum 2476), validée par l'administrateur radio
+// sur le portail : une fiche du portail, comme Radio Bonheur (#7011). Forme
+// de la fiche réelle du portail relevée pour #7011 (external_id=null, source,
+// statut, forme des flux) ; nom, flux, format et débit sont ceux de la
+// station. L'`id` du portail est inventé pour l'essai : la fiche réelle n'a
+// pas pu être relue.
+const FICHE_CAFE_DEL_MAR_7200: &str =
+    include_str!("fixtures/annuaire_portail_7200_cafe_del_mar.json");
+const FLUX_CAFE_DEL_MAR: &str = "https://streams.radio.co/se1a320b47/listen";
+
+/// Une station locale qui sert un MP3 192 kbit/s : la vraie n'est jamais
+/// contactée par un essai.
+async fn station_locale_mp3() -> String {
+    let corps: &'static [u8] = include_bytes!("../../tune-core/tests/fixtures/test.mp3");
+    let app = axum::Router::new().route(
+        "/se1a320b47/listen",
+        axum::routing::get(move || async move { ([("content-type", "audio/mpeg")], corps) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    format!("http://127.0.0.1:{port}/se1a320b47/listen")
+}
+
+/// #7200 — le geste du testeur : l'annuaire montre Café del Mar, le client
+/// lit sa clé dans `items[].external_id` et appelle
+/// `/radios/directory/{clé}/play/{zone}`. En rc8.1, une fiche du portail
+/// rendait `external_id: null` : le client appelait `/directory/null/play/…`,
+/// le serveur répondait 404 avant toute tentative de lecture, et l'écran
+/// restait muet, sans message. Le témoin exige que ce clic atteigne la
+/// lecture.
+#[tokio::test]
+async fn cafe_del_mar_du_portail_se_joue_depuis_l_annuaire_7200() {
+    let brut: Value = serde_json::from_str(FICHE_CAFE_DEL_MAR_7200).unwrap();
+    let reelle = tune_server::routes::radios::annuaire_depuis_json(std::slice::from_ref(&brut));
+    assert_eq!(reelle.len(), 1, "la fiche publiée est retenue");
+    assert_eq!(reelle[0].stream_url, FLUX_CAFE_DEL_MAR);
+    assert_eq!(reelle[0].codec.as_deref(), Some("MP3"));
+    assert_eq!(reelle[0].bitrate, Some(192));
+
+    // Même fiche, flux servi en local.
+    let local = station_locale_mp3().await;
+    let texte = FICHE_CAFE_DEL_MAR_7200.replace(FLUX_CAFE_DEL_MAR, &local);
+    let fiches = tune_server::routes::radios::annuaire_depuis_json(&[
+        serde_json::from_str::<Value>(&texte).unwrap(),
+    ]);
+    let state = etat();
+    *state.annuaire_radios.write().unwrap() = fiches;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, page) = requete(&app, "GET", "/api/v1/radios/directory?q=cafe", None).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let item = &page["items"][0];
+    assert_eq!(item["name"], "Café del Mar", "{page}");
+    // Ce que fait le client : la clé telle quelle, `null` devenant « null ».
+    let cle = match &item["external_id"] {
+        Value::String(s) => s.replace(':', "%3A"),
+        autre => autre.to_string(),
+    };
+
+    let (status, zone) = requete(
+        &app,
+        "POST",
+        "/api/v1/zones",
+        Some(json!({"name": "Onglet 7200", "output_type": "browser"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{zone}");
+    let zone_id = zone["id"].as_i64().unwrap();
+
+    let chemin = format!("/api/v1/radios/directory/{cle}/play/{zone_id}");
+    let (status, lecture) = requete(&app, "POST", &chemin, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Café del Mar, fiche du portail : le clic « Écouter » de l'annuaire doit \
+         atteindre la lecture, pas un {status} sur {chemin} ({lecture})"
+    );
+    assert_eq!(lecture["radio"], "Café del Mar", "{lecture}");
+    assert_eq!(lecture["zone_id"], zone_id, "{lecture}");
+}
+
 fn etat() -> tune_server::state::AppState {
     tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap()
 }
@@ -541,4 +692,120 @@ async fn l_ouverture_relit_l_annuaire_quand_l_heure_est_passee() {
         t.await.unwrap();
         assert_eq!(total.load(Ordering::SeqCst), attendu);
     }
+}
+
+// ── #7177 (web#2443) — la fiche « Voir » : flux disponibles, flux préféré ───
+
+const FIP_MIDFI: &str = "https://icecast.radiofrance.fr/fip-midfi.mp3?id=radiofrance";
+
+#[tokio::test]
+async fn l_annuaire_et_mes_radios_rendent_les_flux_de_la_fiche_et_ses_categories() {
+    let (_state, app, _d) = etat_avec_annuaire().await;
+    let (_, ann) = requete(&app, "GET", "/api/v1/radios/directory?q=fip", None).await;
+    let item = ann["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["external_id"] == "S000973")
+        .unwrap();
+    let flux = item["streams"].as_array().expect("streams");
+    assert_eq!(flux.len(), 4, "{item}");
+    assert_eq!(flux[0]["url"], item["stream_url"]);
+    assert_eq!(flux[0]["primary"], true);
+    assert!(
+        flux.iter()
+            .any(|f| f["url"] == FIP_MIDFI && f["codec"] == "MP3" && f["bitrate"] == 128),
+        "{item}"
+    );
+
+    let (s, fip) = requete(&app, "POST", "/api/v1/radios/directory/S000973/add", None).await;
+    assert!(s.is_success(), "{fip}");
+    assert_eq!(fip["annuaire"]["streams"].as_array().unwrap().len(), 4);
+    assert_eq!(fip["annuaire"]["categories"], json!(["eclectic"]));
+    assert_eq!(fip["annuaire"]["radio_metadata_key"], "fip");
+}
+
+#[tokio::test]
+async fn le_flux_prefere_se_choisit_parmi_ceux_de_la_fiche_et_tient() {
+    let (state, app, _d) = etat_avec_annuaire().await;
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    let (_, fip) = requete(&app, "POST", "/api/v1/radios/directory/S000973/add", None).await;
+    let id = fip["id"].as_i64().unwrap();
+
+    let (s, maj) = requete(
+        &app,
+        "POST",
+        &format!("/api/v1/radios/directory/preferred-stream/{id}"),
+        Some(json!({"stream_url": FIP_MIDFI})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{maj}");
+    assert_eq!(maj["stream_url"], FIP_MIDFI);
+    assert_eq!(maj["codec"], "mp3");
+    assert_eq!(maj["bitrate"], 128);
+    // Un flux secondaire de la fiche n'est pas un flux périmé.
+    assert_eq!(maj["annuaire"]["flux_change"], false);
+    assert_eq!(repo.get(id).unwrap().unwrap().url, FIP_MIDFI);
+    // La liste de « Mes radios » le rend tel quel, toujours liée à sa fiche.
+    let (_, radios) = requete(&app, "GET", "/api/v1/radios", None).await;
+    let st = radios
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == id)
+        .unwrap();
+    assert_eq!(st["stream_url"], FIP_MIDFI);
+    assert_eq!(st["annuaire"]["rapproche_par"], "id");
+    assert_eq!(st["annuaire"]["flux_change"], false);
+}
+
+#[tokio::test]
+async fn contre_epreuve_flux_hors_fiche_refuse_et_station_sans_fiche_refusee() {
+    let (state, app, _d) = etat_avec_annuaire().await;
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    let (_, fip) = requete(&app, "POST", "/api/v1/radios/directory/S000973/add", None).await;
+    let id = fip["id"].as_i64().unwrap();
+    let avant = repo.get(id).unwrap().unwrap().url;
+
+    let (s, r) = requete(
+        &app,
+        "POST",
+        &format!("/api/v1/radios/directory/preferred-stream/{id}"),
+        Some(json!({"stream_url": "https://ailleurs.example/fip.mp3"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{r}");
+    assert_eq!(r["error"], "flux_hors_fiche");
+    assert_eq!(repo.get(id).unwrap().unwrap().url, avant);
+
+    // Une station saisie à la main n'a pas de fiche : elle garde « Modifier ».
+    let main = repo
+        .create(&RadioStation {
+            id: None,
+            name: "Ma radio".into(),
+            url: "https://perso.example/flux.mp3".into(),
+            homepage: None,
+            logo_url: None,
+            country: None,
+            language: None,
+            genre: None,
+            codec: None,
+            bitrate: None,
+            is_favorite: false,
+            last_played: None,
+            play_count: 0,
+        })
+        .unwrap();
+    let (s, r) = requete(
+        &app,
+        "POST",
+        &format!("/api/v1/radios/directory/preferred-stream/{main}"),
+        Some(json!({"stream_url": FIP_MIDFI})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{r}");
+    assert_eq!(
+        repo.get(main).unwrap().unwrap().url,
+        "https://perso.example/flux.mp3"
+    );
 }

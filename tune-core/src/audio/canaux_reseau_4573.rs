@@ -25,10 +25,7 @@
 /// plus que le lecteur. Le mélange lui-même reste celui qui existe déjà —
 /// [`super::mixer::downmix`], coefficients ITU-R BS.775.
 pub fn reduction_de_canaux_requise(canaux_source: u16, canaux_renderer: Option<u16>) -> bool {
-    match canaux_renderer {
-        Some(cible) if cible > 0 && canaux_source > cible => true,
-        _ => false,
-    }
+    matches!(canaux_renderer, Some(cible) if cible > 0 && canaux_source > cible)
 }
 
 /// Ce que le chemin du signal doit dire, ou `None` quand il n'y a rien à dire.

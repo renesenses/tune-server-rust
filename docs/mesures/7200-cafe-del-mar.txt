@@ -1,0 +1,103 @@
+https://github.com/renesenses/tune-server-rust/issues/7200 — Café del Mar : une radio tout juste validée ne joue rien (fil 2476)
+
+Mozaik labs / plateforme agentic / case-742ce28c (agent Développeur)
+Base batch/bugs-rc9-20261025 : 493a55d519b47d3135d00a38264e52aa5bf2dca6.
+
+Signalement
+alec_eiffel, rc8.1 macOS : Café del Mar, validée par l'administrateur radio
+sur le portail, paraît dans l'annuaire après redémarrage mais ne joue rien,
+sans message. Fait nouveau du même fil : AUCUNE radio ajoutée par la console
+d'administration ne joue (Radio Bonheur, Café del Mar, « Rémi API »).
+Flux : https://streams.radio.co/se1a320b47/listen, sain le 27/10 (HTTP 200,
+audio/mpeg, icy-br 192, icy-name « Café del Mar Radio »).
+
+Cause probable (à confirmer sur la fiche réelle, https://github.com/renesenses/tune-server-rust/issues/7218)
+La même que https://github.com/renesenses/tune-server-rust/issues/7011 (Radio Bonheur). Une fiche créée sur le portail a
+external_id=null : external_id est réservé à l'identifiant radio-metadata
+importé (mesure du .18, docs/mesures/7011-radio-bonheur.txt). Le parseur de
+la rc8.1 perdait l'id du portail : l'annuaire rendait external_id=null, le
+client appelait /radios/directory/null/play/ZONE, le serveur répondait
+404 radio_annuaire_inconnue avant toute tentative de lecture, et l'écran
+restait muet. Toutes les radios du portail sont touchées, quel que soit
+leur flux : c'est ce que décrit le fait nouveau du fil.
+- rc/v1.0.0-rc8.1 (5ffec6f4d) : `external_id: texte(item, "external_id")`,
+  sans repli (tune-server/src/routes/radios.rs, ligne 751).
+- Le correctif d48ba3dd9 (https://github.com/renesenses/tune-server-rust/issues/7011, repli `mozaiklabs:ID`) est dans
+  batch/bugs-rc9-20261025, pas dans rc/v1.0.0-rc8.1 :
+  `git merge-base --is-ancestor d48ba3dd9 origin/rc/v1.0.0-rc8.1` → non ;
+  idem pour l'étiquette v1.0.0-rc8.1 (3394e47b4).
+- La version exacte utilisée par Rémi le 27/10 n'est pas confirmée dans
+  les éléments disponibles. Demander la version affichée et, pour une
+  construction locale, le commit. Si elle contient déjà d48ba3dd9, le
+  défaut de clé ne suffit pas à expliquer ce signalement : reprendre le
+  diagnostic à partir de la fiche réelle, de la sortie et des journaux.
+  Ce point fait partie de la preuve reportée dans
+  https://github.com/renesenses/tune-server-rust/issues/7218.
+
+Hypothèses écartées côté serveur (lecture du code ; témoin quand il est dit)
+- Adresse sans extension (/listen) : la sonde suppose MP3 par défaut, et
+  Symphonia reconnaît le flux (orchestrator/radio.rs, sonder_la_station).
+  Témoin 1.
+- Redirection : le client HTTP bloquant suit les redirections (politique
+  par défaut de reqwest, http/client.rs, blocking_builder). Témoin 1.
+- En-têtes ICY doublés : `icy-br` est lu sur sa première valeur
+  (debit_icy, https://github.com/renesenses/tune-server-rust/issues/6821) ; `icy-name` n'est pas lu sur le chemin de lecture.
+  Un « é » en octet brut dans un en-tête ne gêne pas la connexion.
+  Témoin 1.
+- Zone et sortie : écartée par LECTURE DU CODE SEULEMENT. Après la
+  résolution de la clé, le chemin est celui de toutes les radios, et Radio
+  Bonheur (même forme de fiche) a été décodée sur le .18 avec le correctif
+  https://github.com/renesenses/tune-server-rust/issues/7011. Le témoin 2 ne joue que sur une zone navigateur ; la sortie locale
+  du Mac, probablement celle du testeur, n'est couverte par aucun témoin.
+
+Témoins (aucune vraie station contactée)
+1. tune-core, radio_7200_cafe_del_mar_se_decode_avec_ses_en_tetes_reels :
+   une station locale rejoue les en-têtes cités dans la demande (chemin
+   /se1a320b47/listen
+   sans extension, audio/mpeg, icy-br 192 répété, icy-name non ASCII,
+   corps MP3 192 kbit/s 44,1 kHz), directement puis derrière une 302. Le
+   VRAI décodeur (decode_radio_stream_to_pcm) écrit trois secondes de PCM
+   vers une sortie factice (un canal, aucun périphérique audio), publie
+   mp3 / 44100 / 192 kbit/s, puis s'arrête quand la sortie raccroche.
+   cargo test -p tune-core --lib radio_7200 → 1 passed.
+2. tune-server, cafe_del_mar_du_portail_se_joue_depuis_l_annuaire_7200 :
+   la fiche Café del Mar sous la forme d'une fiche du portail (forme réelle
+   relevée pour https://github.com/renesenses/tune-server-rust/issues/7011 ; id du portail inventé, la fiche réelle n'a pas pu
+   être relue), annuaire monté, clé lue dans items[].external_id comme le
+   fait le client, zone navigateur, POST /radios/directory/{clé}/play/{zone}.
+   cargo test -p tune-server --no-default-features --test radios_annuaire_6516
+   → 17 passed.
+
+Contre-épreuves (le correctif retiré, le test inchangé, tout compile)
+1. Redirections coupées dans sonder_la_station
+   (`.redirect(reqwest::redirect::Policy::none())`) :
+   radio_7200_cafe_del_mar_se_decode_avec_ses_en_tetes_reels rougit :
+   « Café del Mar (redirection : true) : le décodeur a échoué »
+   left: Err("radio HTTP error: 302 Found").
+2. Repli https://github.com/renesenses/tune-server-rust/issues/7011 neutralisé (`.filter(|_| false)` au lieu de `*id > 0`) :
+   cafe_del_mar_du_portail_se_joue_depuis_l_annuaire_7200 rougit :
+   « le clic « Écouter » de l'annuaire doit atteindre la lecture, pas un
+   404 Not Found sur /api/v1/radios/directory/null/play/1
+   ({"error":"radio_annuaire_inconnue"}) » — le symptôme de la rc8.1.
+Restauration par copie, puis retour au vert des deux témoins.
+
+Limites (reste à faire : https://github.com/renesenses/tune-server-rust/issues/7218)
+Le vrai flux n'a PAS été joint depuis le .18 : l'environnement de cette
+tentative n'a accès ni au .18 ni à streams.radio.co (mandataire : CONNECT
+403), ni à l'annuaire de mozaiklabs.fr. La fiche réelle de Café del Mar
+n'a donc pas été relue ; que ce soit une fiche du portail (external_id=null)
+est déduit du signalement (validée par l'administrateur radio, comme toutes
+les radios citées). Les en-têtes rejoués sont ceux relevés le 27/10 et
+cités dans la demande, pas une capture complète. Aucun son audible.
+La relecture de la fiche réelle, les en-têtes et le décodage sans son sur
+le vrai flux depuis le .18, avant et après, avec les journaux, sont
+reportés dans https://github.com/renesenses/tune-server-rust/issues/7218.
+
+À demander au testeur
+Relever d’abord la version exacte du signalement de Rémi (voir ci-dessus).
+Réessayer Café del Mar avec la version qui portera le lot rc9. Si elle
+reste muette : l'extrait du journal pris juste après le clic « Écouter »
+(lignes orchestrator_play, radio_local_decode_stream_connected, ou une
+erreur), et la sortie choisie (sortie du Mac, navigateur, autre). En
+attendant, sur la rc8.1, une station ajoutée à « Mes radios » par
+l'adresse de son flux ne passe pas par la clé de l'annuaire.

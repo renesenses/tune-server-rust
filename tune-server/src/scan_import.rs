@@ -1621,6 +1621,13 @@ impl TrackImporter {
             .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME)
             .to_string();
 
+        // #3179 — ARTIST désigne la piste, ALBUMARTIST l'album. Un nom
+        // déduit du chemin n'est pas une balise et ne crée pas un invité.
+        let artiste_de_piste_tague =
+            !meta.artist_from_path && meta.artist.as_deref().is_some_and(|a| !a.trim().is_empty());
+        let meme_artiste = tune_core::db::artist_repo::cle_artiste(&album_artist_name)
+            == tune_core::db::artist_repo::cle_artiste(&track_artist_name);
+
         // L'artiste d'album neutre ne prend pas l'identifiant MusicBrainz de
         // l'artiste de la piste (fil 1881) : ce n'est pas lui.
         let album_artist_mbid = if is_compilation || artiste_d_album_neutre {
@@ -1628,7 +1635,12 @@ impl TrackImporter {
         } else {
             meta.musicbrainz_album_artist_id
                 .as_deref()
-                .or(meta.musicbrainz_artist_id.as_deref())
+                // Le MBID de l'invité ne devient pas celui de l'artiste
+                // d'album : le dépôt rapproche d'abord par MBID (#3179).
+                .or(meta
+                    .musicbrainz_artist_id
+                    .as_deref()
+                    .filter(|_| meme_artiste))
         };
         let album_artist_entry = if let Some(cached) = self.artist_cache.get(&album_artist_name) {
             Some(Arc::clone(cached))
@@ -1657,7 +1669,7 @@ impl TrackImporter {
         };
         let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
 
-        let track_artist = if (is_compilation || artiste_d_album_neutre)
+        let track_artist = if (is_compilation || artiste_d_album_neutre || artiste_de_piste_tague)
             && track_artist_name != album_artist_name
         {
             if let Some(cached) = self.artist_cache.get(&track_artist_name) {
@@ -3530,8 +3542,8 @@ mod tests {
             );
         }
 
-        // TÉMOIN — un VRAI artiste d'album et `COMPILATION=0` : inchangé,
-        // l'artiste d'album fait l'album et ses pistes.
+        // #3179 — un VRAI artiste d'album et `COMPILATION=0` :
+        // ALBUMARTIST garde l'album, chaque ARTIST garde sa piste.
         let rendu = importer_avec_artiste_de_piste(
             &trois("Coffret Reiner", "Fritz Reiner", Some(false)),
             &racine.join("cache-reiner"),
@@ -3539,7 +3551,7 @@ mod tests {
         for (chemin, (aa, compilation, artiste, _)) in &rendu {
             assert_eq!(
                 (aa.as_str(), *compilation, artiste.as_str()),
-                ("Fritz Reiner", false, "Fritz Reiner"),
+                ("Fritz Reiner", false, artiste_attendu(chemin)),
                 "témoin artiste d'album réel ({chemin})"
             );
         }
@@ -4053,3 +4065,7 @@ mod nom_de_tri_tests_6474;
 #[cfg(test)]
 #[path = "scan_import_moondial_tests_6460.rs"]
 mod moondial_tests_6460;
+
+#[cfg(test)]
+#[path = "scan_import_artistes_piste_tests_3179.rs"]
+mod artistes_piste_tests_3179;

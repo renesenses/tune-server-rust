@@ -224,6 +224,8 @@ const MIGRATION_TABLES: &[&str] = &[
 /// donc pas encore au moment de la premiere passe (#5389). Les colonnes sont
 /// alors deja typees (BIGINT, BYTEA…) : `column_casts` lit ces types.
 const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
+    // Reprises (#7280), créées par le script 100 : conserver leur file et position.
+    "listening_resumes",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",
@@ -816,6 +818,10 @@ ALTER TABLE item_tags ADD COLUMN IF NOT EXISTS created_at TEXT;
 -- TEXT pour la copie ; la 091, rejouee juste apres, la convertit en BIGINT et
 -- garde l'ordre copie. En ALTER pour la meme raison qu'au-dessus.
 ALTER TABLE tags ADD COLUMN IF NOT EXISTS position TEXT;
+-- Fratrie de rayons rangée à la main (#6779, PG 098 / SQLite 134). TEXT pour
+-- la copie ; la 098, rejouée juste après, la convertit en BIGINT et garde
+-- l'ordre copié. En ALTER pour la même raison qu'au-dessus.
+ALTER TABLE collection_folders ADD COLUMN IF NOT EXISTS manual_order TEXT;
 -- Marque « déjà tenté, rien trouvé » de l'identification en lot (#4991,
 -- PG 080 / SQLite 116). En ALTER pour la même raison qu'au-dessus.
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS identification_tentee_le TEXT;
@@ -1786,6 +1792,7 @@ fn conflict_clause(table: &str) -> &'static str {
     // (settings), we need to handle ON CONFLICT differently.
     match table {
         "settings" => "ON CONFLICT (key) DO NOTHING",
+        "listening_resumes" => "ON CONFLICT (zone_id, context_type, context_id, source) DO NOTHING",
         "track_metadata" => "ON CONFLICT (track_id, key) DO NOTHING",
         "album_metadata" => "ON CONFLICT (album_id, key) DO NOTHING",
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",
@@ -2354,6 +2361,93 @@ mod tests {
             "clause ON CONFLICT sans clef correspondante — la bascule perdrait ces tables :\n{}",
             ecarts.join("\n")
         );
+    }
+
+    /// La vraie bascule conserve clé, ordre de service et position, même
+    /// rejouée ; la sentinelle historique 99 est dépassée par la 100.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_reprise_7280_conserve_la_file_et_sa_clef() {
+        use crate::db::listening_resume::Resume;
+        use crate::db::play_queue_repo::QueueInput;
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_reprise_bascule_r8m2";
+        let cible = base_jetable(&url, BASE).await;
+        let sqlite = sqlite_de_depart();
+        let item = |source: &str, id: &str| QueueInput::Streaming {
+            source: source.into(),
+            source_id: id.into(),
+            title: id.into(),
+            artist: "Artiste".into(),
+            album: None,
+            cover_url: None,
+            duration_ms: 100000,
+            track_number: None,
+            disc_number: None,
+            album_ref: None,
+            artist_ref: None,
+        };
+        let reprise = Resume {
+            resume_key: "cle-reprise".into(),
+            context_type: "playlist".into(),
+            context_id: "mixte".into(),
+            source: "qobuz".into(),
+            title: "Ma playlist".into(),
+            last_track_title: "Deuxième".into(),
+            cover_path: None,
+            album_id: None,
+            position: 1,
+            shuffled: true,
+            queue_row_ids: vec![42, 41],
+            position_ms: 56789,
+            updated_at: "2026-10-28T10:00:00Z".into(),
+            items: vec![
+                item("qobuz", "non-numerique-a"),
+                item("tidal", "non-numerique-b"),
+            ],
+        };
+        let payload = serde_json::to_value(&reprise).unwrap();
+        sqlite.connection().lock().unwrap().execute(
+            "INSERT INTO listening_resumes (resume_key, zone_id, context_type, context_id, source, payload, updated_at) VALUES ('cle-reprise', 1, 'playlist', 'mixte', 'qobuz', ?1, '2026-10-28T10:00:00Z')",
+            rusqlite::params![payload.to_string()],
+        ).unwrap();
+        for _ in 0..2 {
+            let result = migrate_sqlite_to_pg(&sqlite, &cible).await.unwrap();
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .all(|e| !e.starts_with("listening_resumes:")),
+                "{:?}",
+                result.errors
+            );
+            let mut c = PgConnection::connect(&cible).await.unwrap();
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT resume_key, payload FROM listening_resumes")
+                    .fetch_all(&mut c)
+                    .await
+                    .unwrap();
+            assert_eq!(rows.len(), 1, "la bascule ne perd ni ne double la reprise");
+            assert_eq!(rows[0].0, "cle-reprise");
+            let relue: Resume = serde_json::from_str(&rows[0].1).unwrap();
+            assert_eq!(
+                serde_json::to_value(relue).unwrap(),
+                payload,
+                "l'ordre, les identifiants de service et la position doivent survivre"
+            );
+            let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            assert_eq!(
+                version, 100,
+                "la bascule ne doit pas rester sur la sentinelle 99"
+            );
+            c.close().await.ok();
+        }
+        supprimer_base(&url, BASE).await;
     }
 
     /// #5389 : la date d'ajout (`file_first_seen`) passe la bascule, a

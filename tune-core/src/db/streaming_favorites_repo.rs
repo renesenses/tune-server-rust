@@ -8,6 +8,13 @@ use super::sqlite::SqliteDb;
 use crate::favorites_sort::{self, CleDeTri, TriFavoris};
 use crate::streaming::favorites_identity::identite_de_favori;
 
+/// #6399 — le miroir retrouve un favori dans TOUS les profils. La clé unique
+/// commence par `profile_id` : sans statistiques permettant un skip-scan,
+/// chaque écriture sans profil peut balayer toute la table, pour chaque favori.
+/// Reposé à chaque démarrage, sur SQLite comme PostgreSQL.
+pub const INDEX_FAVORIS_MIROIR: &str = "CREATE INDEX IF NOT EXISTS idx_streaming_favorites_miroir \
+    ON streaming_favorites(service, item_type, service_id)";
+
 /// A favorited streaming item (Tidal/Qobuz/…). Unlike local `favorites` (keyed
 /// on an INTEGER `item_id`), streaming items use string `service_id`s, so they
 /// live in their own `streaming_favorites` table. Display metadata is stored so
@@ -708,7 +715,10 @@ impl StreamingFavoritesRepo {
             let params: [&dyn ToSqlValue; 1] = [&pid];
             self.db.query_many(&sql, &params)?
         };
-        Ok(rows.iter().map(row_to_streaming_favorite).collect())
+        Ok(rows
+            .iter()
+            .map(|cols| row_to_streaming_favorite(cols))
+            .collect())
     }
 
     /// Les mêmes favoris, rangés selon `tri` (#2001).
@@ -744,7 +754,10 @@ impl StreamingFavoritesRepo {
                 // entre `created_at` et `position` dans SELECT_COLS_POUR_RANG.
                 r.get(14).and_then(|v| v.as_i64())
             });
-            return Ok(rows.iter().map(row_to_streaming_favorite).collect());
+            return Ok(rows
+                .iter()
+                .map(|cols| row_to_streaming_favorite(cols))
+                .collect());
         }
 
         let mut items = self.list(profile_id, item_type)?;
@@ -810,7 +823,7 @@ impl StreamingFavoritesRepo {
     }
 }
 
-fn row_to_streaming_favorite(cols: &Vec<SqlValue>) -> StreamingFavorite {
+fn row_to_streaming_favorite(cols: &[SqlValue]) -> StreamingFavorite {
     StreamingFavorite {
         id: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
         profile_id: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(1),

@@ -2343,10 +2343,10 @@ impl RingBuf {
         let r = self.read.load(Ordering::Acquire);
         let free = cap - (w.wrapping_sub(r)) as usize;
         let n = samples.len().min(free);
-        for i in 0..n {
+        for (i, &sample) in samples[..n].iter().enumerate() {
             let idx = (w as usize + i) % cap;
             // SAFETY: producteur unique, case libre (i < free), index borné.
-            unsafe { *self.buf[idx].get() = samples[i] };
+            unsafe { *self.buf[idx].get() = sample };
         }
         self.write.store(w + n as u64, Ordering::Release);
         // Fil 1908 — ce qui attend le pilote, pour la position audible.
@@ -2369,11 +2369,11 @@ impl RingBuf {
         let avail = (w.wrapping_sub(r)) as usize;
         let n = out.len().min(avail);
         let cap = self.capacity();
-        for i in 0..n {
+        for (i, slot) in out[..n].iter_mut().enumerate() {
             let idx = (r as usize + i) % cap;
             // SAFETY: consommateur unique, case publiée par le Release de
             // `push` que le Acquire ci-dessus a observé.
-            out[i] = map(unsafe { *self.buf[idx].get() });
+            *slot = map(unsafe { *self.buf[idx].get() });
         }
         self.read.store(r + n as u64, Ordering::Release);
         // #3205 : `n < out.len()` ICI, c'est exactement le `read < data.len()`
@@ -2670,17 +2670,14 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
                 WAVE_FORMAT_IEEE_FLOAT => {
                     // Signal to pcm_bytes_to_f32 that the data is already
                     // IEEE float.  We use 0 as a sentinel value.
-                    if channels > 0 {
-                        let container_bytes = block_align / channels;
-                        // 32-bit float -> sentinel 0; 64-bit float -> unsupported
-                        if container_bytes == 4 {
-                            bit_depth = 0; // sentinel: IEEE float 32-bit
-                        } else {
-                            // 64-bit float — cannot handle, fall through to
-                            // compressed decode path
-                            return None;
-                        }
+                    // Zéro canal : pas de conteneur lisible.
+                    let container_bytes = block_align.checked_div(channels)?;
+                    // 32-bit float -> sentinel 0; 64-bit float -> unsupported
+                    if container_bytes == 4 {
+                        bit_depth = 0; // sentinel: IEEE float 32-bit
                     } else {
+                        // 64-bit float — cannot handle, fall through to
+                        // compressed decode path
                         return None;
                     }
                 }
@@ -3140,6 +3137,10 @@ fn periode_muette<T: Copy>(ring: &RingBuf, output: &mut [T], zero: T) {
 /// `cpal::Device::build_output_stream`. Les réunir ici est ce qui rend le
 /// témoin de #3814 possible, et évite qu'un correctif ne soit posé que dans
 /// une des deux.
+// Le rappel temps réel du pilote : chaque argument est un état partagé
+// distinct que les fermetures `cpal` capturent une à une (six appelants). Les
+// regrouper imposerait de remanier ces fermetures sur le chemin temps réel.
+#[allow(clippy::too_many_arguments)]
 fn render_local_shared_f32_callback(
     ring: &RingBuf,
     volume: &AtomicU32,
@@ -3253,6 +3254,9 @@ where
 /// as orchestrator.rs already does). Only used as a fallback after both
 /// f32 attempts fail, so the f32 happy path is untouched (Pascal, XMOS
 /// USB Audio 2.0 → Totaldac).
+// Même raison que `render_local_shared_f32_callback` : les états partagés
+// passent tels quels dans la fermeture du flux entier, par format (9 appels).
+#[allow(clippy::too_many_arguments)]
 fn build_int_stream<T>(
     device: &cpal::Device,
     cfg: &cpal::StreamConfig,
@@ -3377,6 +3381,7 @@ impl FormatDeSortie {
 ///
 /// La cadence source n'est ajoutée que si elle diffère : inutile de tenter
 /// deux fois exactement la même ouverture.
+#[cfg(test)]
 pub(crate) fn cascade_de_formats(
     principal: &cpal::StreamConfig,
     source: &cpal::StreamConfig,
@@ -3701,6 +3706,9 @@ fn flush_local_dsp(
     queue
 }
 
+// Un argument par étage de traitement (EQ, convolution, crossfeed…), chacun
+// sous son propre verrou ; 41 appels, dont les témoins de chaque étage.
+#[allow(clippy::too_many_arguments)]
 fn apply_local_dsp(
     samples: &mut [f32],
     eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
@@ -3714,29 +3722,28 @@ fn apply_local_dsp(
     if dop || pure_bypass.load(Ordering::Relaxed) {
         return;
     }
-    if let Ok(mut e) = eq.lock() {
-        if let Some(ref mut p) = *e {
-            p.process_interleaved(samples);
-            // #5215 — l'égaliseur coupé a fini son fondu et ne garde aucun
-            // préampli : on le retire, la chaîne redevient celle d'un EQ absent.
-            if p.est_neutre_au_repos() {
-                *e = None;
-            }
+    if let Ok(mut e) = eq.lock()
+        && let Some(ref mut p) = *e
+    {
+        p.process_interleaved(samples);
+        // #5215 — l'égaliseur coupé a fini son fondu et ne garde aucun
+        // préampli : on le retire, la chaîne redevient celle d'un EQ absent.
+        if p.est_neutre_au_repos() {
+            *e = None;
         }
     }
-    if let Ok(mut conv) = convolver.lock() {
-        if let Some(ref mut c) = *conv {
-            c.process_interleaved(samples);
-        }
+    if let Ok(mut conv) = convolver.lock()
+        && let Some(ref mut c) = *conv
+    {
+        c.process_interleaved(samples);
     }
     // Crossfeed is a headphone (local DAC) effect and only makes sense on a
     // stereo stream — the difference-based algorithm needs L/R pairs.
-    if channels == 2 {
-        if let Ok(mut cf) = crossfeed.lock() {
-            if let Some(ref mut c) = *cf {
-                c.process_interleaved(samples);
-            }
-        }
+    if channels == 2
+        && let Ok(mut cf) = crossfeed.lock()
+        && let Some(ref mut c) = *cf
+    {
+        c.process_interleaved(samples);
     }
     // Repli mono EN DERNIER (#2362) : les trois traitements ci-dessus ont tous
     // besoin de leur contexte stéréo — le crossfeed travaille sur la
@@ -3760,19 +3767,25 @@ fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
         0 => {
             // IEEE Float 32-bit — reinterpret bytes as f32 directly
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
         16 => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| {
                 let sample = i16::from_le_bytes([c[0], c[1]]);
                 sample as f32 / 32768.0
             })
             .collect(),
         24 => bytes
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| {
                 let sample =
                     ((c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16)) << 8 >> 8; // sign-extend
@@ -3780,7 +3793,9 @@ fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
             })
             .collect(),
         32 => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let sample = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                 sample as f32 / 2147483648.0
@@ -3789,7 +3804,9 @@ fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
         _ => {
             // Fall back to 16-bit
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| {
                     let sample = i16::from_le_bytes([c[0], c[1]]);
                     sample as f32 / 32768.0
@@ -3806,18 +3823,24 @@ fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
 pub(crate) fn pcm_bytes_to_native_i32(bytes: &[u8], bit_depth: u16) -> Vec<i32> {
     match bit_depth {
         16 => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])) << 16)
             .collect(),
         24 => bytes
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| {
                 let word = ((c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16)) << 8 >> 8;
                 word << 8
             })
             .collect(),
         32 => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         _ => Vec::new(),
@@ -5279,16 +5302,15 @@ pub(crate) fn ouverture_encore_voulue(force_silent: bool, stop_recu: bool) -> bo
 
 /// #4177 — la pause doit-elle RENDRE le périphérique ?
 ///
-/// Règle pure : sous Windows, en mode exclusif (WASAPI exclusif comme ASIO,
-/// les deux tiennent le point de sortie pour eux seuls), et seulement quand un
-/// flux joue. Le chemin partagé (mixeur Windows), macOS et Linux ne changent
-/// pas : leur pause reste un booléen, et une pause sans flux n'a rien à rendre.
+/// Sous Windows, tout flux actif rend son endpoint en pause : même une session
+/// WASAPI partagée peut empêcher un moteur ASIO de changer de cadence (#7244).
+/// macOS/Linux restent inchangés ; sans flux, il n'y a rien à rendre.
 pub(crate) fn la_pause_rend_le_peripherique(
     windows: bool,
-    exclusive_mode: bool,
+    _exclusive_mode: bool,
     playing: bool,
 ) -> bool {
-    windows && exclusive_mode && playing
+    windows && playing
 }
 
 #[async_trait::async_trait]
@@ -6530,6 +6552,7 @@ impl OutputTarget for LocalOutput {
                 // R6 bis (#2219) : le bras vit dans `local/bras_coreaudio.rs`.
                 // Tout ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
                 bras_coreaudio::jouer_via_coreaudio(bras_coreaudio::EntreesCoreAudio {
+                    transformations_reelles,
                     device_name,
                     url,
                     sample_rate,
@@ -6582,6 +6605,7 @@ impl OutputTarget for LocalOutput {
                 // R6 bis (#2219) : le bras vit dans `local/bras_asio.rs`. Tout
                 // ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
                 bras_asio::jouer_via_asio(bras_asio::EntreesAsio {
+                    transformations_reelles,
                     device_name,
                     url,
                     sample_rate,
@@ -6638,6 +6662,7 @@ impl OutputTarget for LocalOutput {
                 // R6 bis (#2219) : le bras vit dans `local/bras_wasapi.rs`.
                 // Tout ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
                 bras_wasapi::jouer_via_wasapi(bras_wasapi::EntreesWasapi {
+                    transformations_reelles,
                     device_name,
                     endpoint_id,
                     audio_backend,
@@ -7114,11 +7139,6 @@ impl OutputTarget for LocalOutput {
                 );
             }
 
-            // Tracks whether the HTTP read loop exited because the source
-            // reached EOF (true) vs. a stop signal or read error (false).
-            // Only when http_eof=true do we signal track_ended_naturally.
-            let mut http_eof = false;
-
             // ── La boucle producteur, une seule pour les deux pistes ───────
             //
             // Elle ne sait rien de cpal : elle lit un `Read`, décode par
@@ -7182,8 +7202,10 @@ impl OutputTarget for LocalOutput {
             );
             total_bytes_read = compteurs.total_bytes_read;
             total_frames_fed = compteurs.total_frames_fed;
-            match fin {
-                FinDeBoucle::FinDeFlux => http_eof = true,
+            // Only a clean EOF reaches the continuation below; every other
+            // producer outcome returns before signalling a natural end.
+            let mut http_eof = match fin {
+                FinDeBoucle::FinDeFlux => true,
                 FinDeBoucle::Interrompue => {
                     // Un Stop / puits mort n'est pas une piste courte a
                     // demarrer une derniere fois, ni un flux vide (#4220).
@@ -7204,7 +7226,7 @@ impl OutputTarget for LocalOutput {
                     return;
                 }
                 FinDeBoucle::Abandon => return,
-            }
+            };
 
             if http_eof {
                 report_incomplete_local_pcm_probe(etage.pcm_kind, etage.en_attente.len());
@@ -7607,17 +7629,17 @@ impl OutputTarget for LocalOutput {
             // Hand the poller something to say when the device disappeared
             // mid-playback (#1626) — same channel as the open-failure path, so
             // the zone shows a clear message instead of silently stopping.
-            if device_gone.load(Ordering::Relaxed) {
-                if let Ok(mut slot) = open_failure.lock() {
-                    // Ne pas écraser un constat déjà posé : le blocage de
-                    // l'anneau (#3108) dit la même panne AVEC la position où
-                    // l'écran s'est figé, et il est arrivé le premier.
-                    if slot.is_none() {
-                        *slot = Some(format!(
-                            "Sortie « {device_name} » : {}.",
-                            OpenFailure::DeviceGone.user_message()
-                        ));
-                    }
+            if device_gone.load(Ordering::Relaxed)
+                && let Ok(mut slot) = open_failure.lock()
+            {
+                // Ne pas écraser un constat déjà posé : le blocage de
+                // l'anneau (#3108) dit la même panne AVEC la position où
+                // l'écran s'est figé, et il est arrivé le premier.
+                if slot.is_none() {
+                    *slot = Some(format!(
+                        "Sortie « {device_name} » : {}.",
+                        OpenFailure::DeviceGone.user_message()
+                    ));
                 }
             }
 
@@ -7642,7 +7664,7 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn pause(&self) -> Result<(), String> {
-        // #4177 — en exclusif Windows (WASAPI exclusif ou ASIO), la pause ne
+        // #4177/#7244 — sous Windows (partagé, exclusif ou ASIO), la pause ne
         // posait qu'un booléen : le fil de rendu poussait du silence et le
         // périphérique restait PRIS — plus un son d'aucune autre application
         // sur ce point de sortie tant que Tune était en pause (Jean Valjean,
@@ -7661,7 +7683,7 @@ impl OutputTarget for LocalOutput {
                 device = %self.device_name,
                 backend = %self.audio_backend,
                 position_ms,
-                "local_audio_exclusive_device_released_on_pause"
+                "local_audio_device_released_on_pause"
             );
             self.stop().await?;
             // `stop()` remet la position à zéro ; une pause, elle, la garde :
@@ -8199,7 +8221,7 @@ fn feed_ring_abortable_with_stall_timeout(
         if stop_rx.try_recv().is_ok() {
             return true;
         }
-        if abort.map_or(false, |a| a.load(Ordering::Relaxed)) {
+        if abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
             return true;
         }
         // If paused, wait without feeding
@@ -8207,7 +8229,7 @@ fn feed_ring_abortable_with_stall_timeout(
             if stop_rx.try_recv().is_ok() {
                 return true;
             }
-            if abort.map_or(false, |a| a.load(Ordering::Relaxed)) {
+            if abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -8602,3 +8624,11 @@ mod transformations_reelles_de_l_etage_ref6b;
 mod disposition_declaree_tests;
 #[cfg(test)]
 mod voies_exclusives_6230;
+
+// #7093 — publication du format réel des sorties exclusives flottantes.
+#[cfg(any(
+    all(target_os = "windows", feature = "asio"),
+    target_os = "macos",
+    test
+))]
+mod etage_exclusif_observe_7093;

@@ -53,6 +53,7 @@ use crate::outputs::wasapi_exclusive::WasapiExclusiveOutput;
 /// `audio_backend` et `soft_mute` entrent parce que [`DemandeDOuverture`] les
 /// porte — WASAPI n'en fait rien, le trait ne le sait pas.
 pub(super) struct EntreesWasapi {
+    pub(super) transformations_reelles: Arc<std::sync::Mutex<Option<TransformationsReelles>>>,
     pub(super) device_name: String,
     pub(super) endpoint_id: Option<String>,
     pub(super) audio_backend: String,
@@ -402,6 +403,7 @@ impl<F: FnMut(bool, bool)> HoteDeChaineNative for HoteWasapi<'_, F> {
 /// pré-remplissage n'existe pas sur ce chemin.
 pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
     let EntreesWasapi {
+        transformations_reelles,
         device_name,
         endpoint_id,
         audio_backend,
@@ -558,7 +560,8 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         &pure_bypass,
         &mono_downmix,
     )
-    .avec_l_adaptation_des_canaux(&reaffectation, &disposition);
+    .avec_l_adaptation_des_canaux(&reaffectation, &disposition)
+    .avec_publication(&transformations_reelles);
     let mut puits = match backend.puits() {
         Puits::Natif(puits) => puits,
         Puits::Flottant(_) => unreachable!("BackendWasapi ne fournit qu'un puits natif"),

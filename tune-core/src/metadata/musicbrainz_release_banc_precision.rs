@@ -482,7 +482,7 @@ where
                             .get(&format!("release/{}", pressage.release_id))
                             .cloned()
                             .expect("détail du pressage retenu");
-                        Some((pressage, d))
+                        Some((*pressage, d))
                     }
                     IssueDuChoix::Ambigu { .. } => {
                         *bilan.albums.entry(VerdictAlbum::Ambigu).or_default() += 1;

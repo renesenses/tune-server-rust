@@ -169,7 +169,7 @@ impl Demux {
         }
     }
 
-    fn section<'a>(debut: bool, charge_utile: &'a [u8], table: u8) -> Option<&'a [u8]> {
+    fn section(debut: bool, charge_utile: &[u8], table: u8) -> Option<&[u8]> {
         if !debut {
             // Une section sur plusieurs paquets : PAT et PMT d'une radio
             // tiennent toujours dans un seul ; on attend le prochain.
@@ -191,7 +191,7 @@ impl Demux {
         };
         // 5 octets d'en-tête de section étendue, puis des entrées de 4.
         let Some(entrees) = s.get(5..) else { return };
-        for e in entrees.chunks_exact(4) {
+        for e in entrees.as_chunks::<4>().0 {
             let programme = u16::from_be_bytes([e[0], e[1]]);
             let pid = (u16::from(e[2] & 0x1F) << 8) | u16::from(e[3]);
             if programme != 0 {
@@ -278,7 +278,9 @@ fn texte_id3(donnees: &[u8]) -> Option<String> {
         3 => String::from_utf8_lossy(texte).into_owned(),
         1 | 2 => {
             let mut unites: Vec<u16> = texte
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                 .collect();
             let petit_boutiste = encodage == 1 && unites.first() == Some(&0xFFFE);

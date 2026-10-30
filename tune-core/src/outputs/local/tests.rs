@@ -229,7 +229,7 @@ fn la_sortie_expose_les_compteurs_du_vrai_processeur_eq() {
 /// Fait traverser la chaîne DSP locale RÉELLE à un tampon, sans égaliseur,
 /// sans convolveur, sans crossfeed : seul le repli mono peut donc en
 /// changer le contenu.
-fn chaine_locale_nue(mono: bool, pure: bool, dop: bool, pcm: &mut Vec<f32>) {
+fn chaine_locale_nue(mono: bool, pure: bool, dop: bool, pcm: &mut [f32]) {
     let sortie = LocalOutput::new("DAC test".to_string());
     sortie.set_mono_downmix(mono);
     sortie.set_pure_bypass(pure);
@@ -990,6 +990,7 @@ fn linux_duplicate_keeps_the_rich_variant_identity_with_its_capabilities() {
         max_channels: 2,
         sample_rates: vec![44_100, 48_000],
         sample_rates_measured: true,
+        availability: None,
         backend: "ALSA".into(),
         hardware_detail: None,
     };
@@ -1202,6 +1203,7 @@ fn alsa_le_materiel_retenu_emporte_ses_capacites_et_sa_preuve() {
         max_channels: 32,
         sample_rates: cadences_du_greffon(),
         sample_rates_measured: false,
+        availability: None,
         backend: "Alsa".into(),
         hardware_detail: None,
     };
@@ -1232,6 +1234,7 @@ fn alsa_le_materiel_retenu_emporte_ses_capacites_et_sa_preuve() {
         max_channels: 2,
         sample_rates: cadences_du_materiel(),
         sample_rates_measured: true,
+        availability: None,
         backend: "Alsa".into(),
         hardware_detail: None,
     };
@@ -1426,6 +1429,7 @@ fn la_charge_utile_dit_si_les_cadences_ont_ete_mesurees() {
         max_channels: 2,
         sample_rates: cadences.clone(),
         sample_rates_measured: sample_rate_evidence("Wasapi").is_measured(),
+        availability: None,
         backend: "Wasapi".into(),
         hardware_detail: None,
     };
@@ -1448,6 +1452,7 @@ fn la_charge_utile_dit_si_les_cadences_ont_ete_mesurees() {
     let linux = AudioDevice {
         backend: "Alsa".into(),
         sample_rates_measured: sample_rate_evidence("Alsa").is_measured(),
+        availability: None,
         ..windows.clone()
     };
     assert_eq!(
@@ -2645,7 +2650,12 @@ fn native_windows_ring_preserves_every_dop_marker_and_payload_byte() {
     observed[written..].fill(0);
     assert_eq!(&observed[..source.len()], source);
     assert!(observed[source.len()..].iter().all(|octet| *octet == 0));
-    for (frame, pair) in observed[..source.len()].chunks_exact(6).enumerate() {
+    for (frame, pair) in observed[..source.len()]
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let marker = if frame % 2 == 0 { 0x05 } else { 0xFA };
         assert_eq!(pair[2], marker);
         assert_eq!(pair[5], marker);

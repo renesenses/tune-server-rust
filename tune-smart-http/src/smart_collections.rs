@@ -954,6 +954,22 @@ pub fn build_album_query(
             continue;
         }
 
+        // #6285 — le verdict hi-res PUBLIÉ de l'album, celui de son badge
+        // dans la liste. Un verdict ou un opérateur inconnu rend FAUX.
+        if field == "hires_verdict" {
+            conditions.push(
+                crate::regles_sql::condition_verdict_hires(
+                    "al.id",
+                    true,
+                    op,
+                    &value,
+                    ctx.resolver.hires_douteux_visible(),
+                )
+                .unwrap_or_else(|| crate::regles_sql::FAUX.to_string()),
+            );
+            continue;
+        }
+
         // #5547 — la note de l'ALBUM pour le profil actif (`album_ratings`).
         if field == "rating" {
             if let Some(c) =

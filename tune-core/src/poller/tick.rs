@@ -8,6 +8,31 @@ impl PositionPoller {
         startup_at: &Instant,
     ) {
         let states = self.playback.all_states().await;
+        for s in &states {
+            if s.state == PlayState::Playing && s.position_ms > 0 {
+                if let Err(e) = crate::db::listening_resume::track_position(&self.db, s) {
+                    tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_titre_non_enregistree");
+                }
+                if let Some(np) = s.now_playing.as_ref().filter(|np| np.source == "podcast") {
+                    if let Err(e) = crate::db::listening_resume::podcast_started_in_context(
+                        &self.db,
+                        s.zone_id,
+                        np,
+                        s.position_ms,
+                        s.session_context_id.as_deref(),
+                    ) {
+                        tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_podcast_non_enregistree");
+                    }
+                }
+            }
+        }
+
+        self.orchestrator
+            .nettoyer_preparations_absentes(&states)
+            .await;
+        for etat in &states {
+            self.orchestrator.maintenir_preparation_fichier(etat).await;
+        }
 
         poll_states.retain(|zone_id, _| {
             states
@@ -50,11 +75,32 @@ impl PositionPoller {
         // Ne pas laisser l'état de recul survivre à une zone supprimée.
         idle_backoff.retain(|zone_id, _| all_zones.iter().any(|z| z.id == Some(*zone_id)));
 
+        // Métadonnées synchrones : ne prendre aucun verrou d'une sortie
+        // pendant que le registre est tenu.
+        let hotes_airplay_actifs: std::collections::HashSet<String> = {
+            let outputs = self.outputs.lock().await;
+            all_zones
+                .iter()
+                .filter(|zone| {
+                    states.iter().any(|s| {
+                        Some(s.zone_id) == zone.id
+                            && matches!(s.state, PlayState::Playing | PlayState::Paused)
+                    })
+                })
+                .filter_map(|zone| zone.output_device_id.as_deref())
+                .filter(|id| outputs.type_of(id).as_deref() == Some("airplay"))
+                .filter_map(|id| outputs.host_of(id))
+                .filter(|host| !host.is_empty())
+                .map(|host| host.to_ascii_lowercase())
+                .collect()
+        };
+
         for zone in &all_zones {
             let zone_id = zone.id.unwrap_or(0);
             if zone_id == 0 {
                 continue;
             }
+            self.relever_controles_air(zone, startup_at).await;
             let device_id = match zone.output_device_id.as_deref() {
                 Some(id) if !id.is_empty() => id.to_string(),
                 _ => continue,
@@ -66,6 +112,26 @@ impl PositionPoller {
             if in_states {
                 continue;
             } // already handled below
+
+            // #7259 : le NR1602 coupe AirPlay après les interrogations de
+            // sa seconde entrée DLNA. Tant qu'AirPlay possède cet hôte, ne
+            // sonder que la sortie active. Aucun arrêt/masquage persistant,
+            // et les commandes explicites restent disponibles.
+            let differer_dlna = if !states
+                .iter()
+                .any(|s| s.zone_id == zone_id && s.state != PlayState::Stopped)
+            {
+                let outputs = self.outputs.lock().await;
+                outputs.type_of(&device_id).as_deref() == Some("dlna")
+                    && outputs.host_of(&device_id).is_some_and(|host| {
+                        hotes_airplay_actifs.contains(&host.to_ascii_lowercase())
+                    })
+            } else {
+                false
+            };
+            if differer_dlna {
+                continue;
+            }
 
             // Recul après échec : sans cela un appareil injoignable était sondé
             // chaque seconde sans fin (voir IdlePollBackoff).
@@ -759,6 +825,9 @@ impl PositionPoller {
                     };
                     (output.take_output_failure(), output.take_paused_by_device())
                 };
+                if failure.is_some() {
+                    self.noter_tune_tested(zone_state, &device_id, false).await;
+                }
                 // Fil 1915 — une piste dont le flux s'est COUPÉ loin de sa
                 // fin n'est pas une panne de sortie : on passe à la suivante
                 // (ou on termine la file), en le disant — message non fatal
@@ -2043,6 +2112,7 @@ impl PositionPoller {
                         .gapless_sent_at
                         .map(|t| t.elapsed().as_millis() as u64)
                         .unwrap_or(0);
+                    let pic = ps.peak_position_ms;
                     info!(
                         zone_id,
                         prev_pos = prev_position_ms,
@@ -2098,6 +2168,8 @@ impl PositionPoller {
                                 &status,
                                 track_duration_ms,
                             )
+                            .await;
+                        self.noter_fin_tune_tested(zone_state, &device_id, pic)
                             .await;
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
                         let avance = self
@@ -2191,7 +2263,10 @@ impl PositionPoller {
                     // its full 45s and a rip crawled at ~46s per track.
                     let in_track_load_grace = status.realtime
                         && ps.track_loaded_at.elapsed().as_secs() < TRACK_LOAD_GRACE_SECS
-                        && ps.peak_position_ms < 5_000;
+                        && ps.peak_position_ms < 5_000
+                        // #7097 — une piste de 3,7 s a pu finir sans jamais
+                        // atteindre 5 s : examiner alors sa fin normale.
+                        && !played_enough;
                     // A DSD track on a DLNA renderer whose peak reached the end.
                     // Gapless is intentionally not armed for a DSD next on DLNA
                     // (prepare_gapless / #402) and DLNA never reports
@@ -3044,6 +3119,8 @@ impl PositionPoller {
                                     track_duration_ms,
                                 )
                                 .await;
+                            self.noter_fin_tune_tested(zone_state, &device_id, ps.peak_position_ms)
+                                .await;
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
                             let avance = self
                                 .orchestrator
@@ -3138,6 +3215,7 @@ impl PositionPoller {
                             .gapless_sent_at
                             .map(|t| t.elapsed().as_millis() as u64)
                             .unwrap_or(0);
+                        let pic = ps.peak_position_ms;
                         info!(
                             zone_id,
                             renderer_dur = status.duration_ms,
@@ -3169,6 +3247,8 @@ impl PositionPoller {
                             .position_a_avancer(zone_id, zone_state, arme_avant)
                             .await
                         {
+                            self.noter_fin_tune_tested(zone_state, &device_id, pic)
+                                .await;
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
                                 .orchestrator
@@ -3193,10 +3273,12 @@ impl PositionPoller {
                         // flux a expire cote serveur. On la jette pour que la
                         // condition ci-dessous rearme proprement, plutot que de
                         // laisser le renderer chercher une adresse morte.
-                        if decisions::gapless_stage_expired(
-                            ps.gapless_sent,
-                            ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
-                        ) {
+                        if !self.orchestrator.fichier_suivant_en_preparation(zone_id)
+                            && decisions::gapless_stage_expired(
+                                ps.gapless_sent,
+                                ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
+                            )
+                        {
                             info!(
                                 zone_id,
                                 age_secs = ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
@@ -3258,12 +3340,14 @@ impl PositionPoller {
                                 ps.transition(fsm::Transition::Desarmement);
                             }
                         }
-                        decisions::should_arm_gapless(
-                            ps.gapless_sent,
-                            status.duration_ms,
-                            track_duration_ms,
-                            status.position_ms,
-                        )
+                        (!ps.gapless_sent
+                            && self.orchestrator.fichier_suivant_en_preparation(zone_id))
+                            || decisions::should_arm_gapless(
+                                ps.gapless_sent,
+                                status.duration_ms,
+                                track_duration_ms,
+                                status.position_ms,
+                            )
                     } {
                         // #5970 — la fin estimée de la piste en cours, prise
                         // AVANT les lectures de la base qui suivent : c'est
@@ -3424,11 +3508,16 @@ impl PositionPoller {
                     } else {
                         track_duration_ms
                     };
-                    let past_end = decisions::past_end_reached(
-                        effective_end_duration_ms,
-                        played_enough,
-                        status.position_ms,
-                    );
+                    // #6994 — une position périmée pendant la recréation du
+                    // flux ne prouve pas une fin de piste. Même grâce que les
+                    // autres détecteurs ci-dessous, avec remise à zéro du
+                    // compteur par leur branche commune.
+                    let past_end = !in_seek_grace
+                        && decisions::past_end_reached(
+                            effective_end_duration_ms,
+                            played_enough,
+                            status.position_ms,
+                        );
                     // Exclusive local outputs (ASIO / WASAPI exclusive) cap the
                     // reported position at exactly the track duration and keep
                     // reporting Playing — their blocking HTTP read never sees a
@@ -3918,11 +4007,42 @@ impl PositionPoller {
                 },
             );
 
+            let output_type = all_zones
+                .iter()
+                .find(|z| z.id == Some(zone_id))
+                .and_then(|z| z.output_type.as_deref())
+                .unwrap_or("");
+            if decisions::echec_demarrage_hqplayer(
+                output_type,
+                force_stop,
+                demarrage_fige != demarrage_fige_5522::Verdict::Attendre,
+                ps.peak_position_ms,
+            ) {
+                // HQPlayer's ASIO engine refused to start. Replaying the same
+                // command cannot free the DAC, and must not restart the loop.
+                poll_states.remove(&zone_id);
+                let appareil = self.get_zone_device_id(zone_id);
+                self.orchestrator.stop(zone_id, appareil.as_deref()).await;
+                if let Some(ref bus) = self.event_bus {
+                    bus.emit(
+                        "zone.playback_error",
+                        serde_json::json!({
+                            "zone_id": zone_id,
+                            "error": crate::outputs::hqplayer::MESSAGE_ECHEC_DE_SORTIE,
+                            "code": crate::outputs::hqplayer::CODE_ECHEC_DE_SORTIE,
+                            "fatal": true,
+                        }),
+                    );
+                }
+                continue;
+            }
+
             if demarrage_fige != demarrage_fige_5522::Verdict::Attendre {
                 poll_states.remove(&zone_id);
                 self.agir_sur_un_demarrage_fige(zone_id, zone_state, demarrage_fige)
                     .await;
             } else if force_stop {
+                self.noter_tune_tested(zone_state, &device_id, false).await;
                 poll_states.remove(&zone_id);
                 let device_id_ref = self.get_zone_device_id(zone_id);
                 let relance = force_stop_demarrage_mort && {
@@ -4099,6 +4219,16 @@ impl PositionPoller {
                         .await;
                 }
             } else if track_ended {
+                // Une fin avec progression réellement observée, pas un play
+                // acquitté ni une prédiction de fin depuis la durée seule.
+                if let Some(np) = zone_state.now_playing.as_ref()
+                    && np.duration_ms > 0
+                    && poll_states.get(&zone_id).is_some_and(|ps| {
+                        ps.peak_position_ms >= (np.duration_ms as u64).saturating_sub(1000).max(1)
+                    })
+                {
+                    self.noter_tune_tested(zone_state, &device_id, true).await;
+                }
                 // #2488 — la moitié invisible du blanc entre deux pistes.
                 //
                 // `playback_timing` (orchestrator) démarre à `play_inner`,

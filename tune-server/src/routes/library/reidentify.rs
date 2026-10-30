@@ -364,7 +364,7 @@ async fn poser_le_pressage(
             detail,
             source,
             ..
-        } => (pressage, detail, source),
+        } => (*pressage, *detail, source),
         IssueDuChoix::Ambigu {
             raison,
             source,

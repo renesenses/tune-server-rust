@@ -192,7 +192,9 @@ impl FluxPcmAirplay {
                 continue;
             }
             let echantillons: Vec<i32> = self.reste[..complets]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|o| i32::from_le_bytes([o[0], o[1], o[2], o[3]]))
                 .collect();
             self.reste.drain(..complets);

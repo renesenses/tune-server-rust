@@ -345,15 +345,14 @@ struct Depart {
     t0: i64,
 }
 
-/// Le décodeur progressif d'un fichier, à partir de `depuis_s`, dans `format`.
-fn ouvrir_decodeur(
-    chemin: &str,
-    format: &FormatAudio,
-    depuis_s: f64,
-) -> (
+/// Les octets PCM du décodeur, et la tâche qui les produit (profondeur, débit).
+type DecodeurOuvert = (
     tokio::sync::mpsc::Receiver<Vec<u8>>,
     tokio::task::JoinHandle<Result<(u16, u32), String>>,
-) {
+);
+
+/// Le décodeur progressif d'un fichier, à partir de `depuis_s`, dans `format`.
+fn ouvrir_decodeur(chemin: &str, format: &FormatAudio, depuis_s: f64) -> DecodeurOuvert {
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let (niveaux, niveaux_rx) = tokio::sync::mpsc::unbounded_channel();
     // Personne ne lit les niveaux de cette sortie : un récepteur fermé fait

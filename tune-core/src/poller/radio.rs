@@ -28,26 +28,27 @@ impl PositionPoller {
             // une chronique, un jingle — hériterait de la pochette du
             // précédent au lieu de revenir au logo.
             let radio_repo = crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
-            let mut logo_station: Option<String> = None;
             // #6516 — le lien de la station avec sa fiche d'annuaire : le
             // relais la retrouve d'abord par lui.
             let mut lien_annuaire: Option<String> = None;
-            let (station_name, stream_url) =
-                if let Some(station) = station_du_now_playing(&radio_repo, source_id) {
-                    logo_station = station.logo_url.clone();
-                    lien_annuaire = station
-                        .id
-                        .and_then(|id| radio_repo.lien_annuaire(id).ok().flatten());
-                    (station.name.clone(), station.url.clone())
-                } else {
-                    // Station introuvable en base : on retombe sur
-                    // `album_title`, qui porte le nom de la station et
-                    // survit aux mises a jour (`np.title`, lui, prend
-                    // le titre du morceau des le premier
-                    // rafraichissement).
-                    let name = np.album_title.clone().unwrap_or_else(|| np.title.clone());
-                    (name, source_id.clone())
-                };
+            let station = station_du_now_playing(&radio_repo, source_id);
+            let (station_name, stream_url) = if let Some(station) = station.as_ref() {
+                lien_annuaire = station
+                    .id
+                    .and_then(|id| radio_repo.lien_annuaire(id).ok().flatten());
+                (station.name.clone(), station.url.clone())
+            } else {
+                // Station introuvable en base : on retombe sur
+                // `album_title`, qui porte le nom de la station et
+                // survit aux mises a jour (`np.title`, lui, prend
+                // le titre du morceau des le premier
+                // rafraichissement).
+                let name = np.album_title.clone().unwrap_or_else(|| np.title.clone());
+                (name, source_id.clone())
+            };
+            // #7051 — hors de « Mes radios » (écoute depuis l'annuaire), le
+            // logo est celui avec lequel la station a été lancée.
+            let logo_station = logo_de_lancement::logo_de_la_station(station.as_ref(), &stream_url);
 
             // #6516 — une station suivie par radio-metadata.fr se lit d'abord
             // sur le relais ; la zone passe alors à la cadence du relais

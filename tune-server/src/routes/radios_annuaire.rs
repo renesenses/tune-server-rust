@@ -468,6 +468,10 @@ fn rattachement(f: &StationAnnuaire, lien: Lien, url_locale: &str) -> Value {
         "rapproche_par": lien.as_str(),
         "flux_change": flux_change,
         "stream_url_annuaire": if flux_change { Some(f.stream_url.clone()) } else { None },
+        // #7177 (web#2443) — de quoi remplir la fiche « Voir » : catégories,
+        // et les flux publiés parmi lesquels choisir son flux préféré.
+        "categories": f.categories,
+        "streams": f.flux_proposes(),
     })
 }
 
@@ -558,6 +562,10 @@ pub fn router() -> Router<AppState> {
             "/directory/update-stream/{radio_id}",
             post(mettre_a_jour_le_flux),
         )
+        .route(
+            "/directory/preferred-stream/{radio_id}",
+            post(choisir_le_flux),
+        )
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -578,17 +586,22 @@ fn repli(s: &str) -> String {
 
 /// La fiche répond-elle à la recherche ? Nom, genre, catégories, pays,
 /// description et mots-clés (le diffuseur, #6964), sans accents ni casse.
+/// Tous les mots doivent figurer dans un même champ, dans n'importe quel ordre.
 fn correspond(f: &StationAnnuaire, motif: &str) -> bool {
     if motif.is_empty() {
         return true;
     }
     std::iter::once(f.name.as_str())
         .chain(f.genre.as_deref())
+        .chain(f.genres.iter().map(String::as_str))
         .chain(f.country.as_deref())
         .chain(f.description.as_deref())
         .chain(f.categories.iter().map(String::as_str))
         .chain(f.keywords.iter().map(String::as_str))
-        .any(|champ| repli(champ).contains(motif))
+        .any(|champ| {
+            let champ = repli(champ);
+            motif.split_whitespace().all(|mot| champ.contains(mot))
+        })
 }
 
 fn meme_pays(f: &StationAnnuaire, pays: Option<&str>) -> bool {
@@ -599,11 +612,13 @@ fn meme_pays(f: &StationAnnuaire, pays: Option<&str>) -> bool {
     })
 }
 
+/// #7215 — vrai si le genre demandé est L'UN des genres de la fiche
+/// (`genres`, sinon `genre`) : « OuiFM Blues & Rock » sort sous blues ET rock.
 fn meme_genre(f: &StationAnnuaire, genre: Option<&str>) -> bool {
     genre.is_none_or(|g| {
-        f.genre
-            .as_deref()
-            .is_some_and(|x| x.eq_ignore_ascii_case(g))
+        f.genres_ou_genre()
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case(g))
     })
 }
 
@@ -663,10 +678,16 @@ pub fn corps_annuaire_avec_liens(
         {
             *pays_comptes.entry(c.to_ascii_uppercase()).or_default() += 1;
         }
-        if meme_pays(f, pays)
-            && let Some(g) = f.genre.as_deref()
-        {
-            *genres_comptes.entry(g.to_ascii_lowercase()).or_default() += 1;
+        // #7215 — une fiche compte dans CHACUN de ses genres (une fois chacun).
+        if meme_pays(f, pays) {
+            let mut vus: Vec<String> = Vec::new();
+            for g in f.genres_ou_genre() {
+                let cle = g.to_ascii_lowercase();
+                if !vus.contains(&cle) {
+                    *genres_comptes.entry(cle.clone()).or_default() += 1;
+                    vus.push(cle);
+                }
+            }
         }
     }
     let retenues: Vec<(usize, &StationAnnuaire)> = qui_cherchent
@@ -693,12 +714,19 @@ pub fn corps_annuaire_avec_liens(
                 "logo_url": f.logo_url,
                 "country_code": f.country.as_deref().map(str::to_ascii_uppercase),
                 "genre": f.genre,
+                // #7215 — tous les genres de la fiche (repli : `[genre]`).
+                "genres": f.genres_ou_genre(),
                 "categories": f.categories,
+                // #7194 (web#2400) — les mots-clés de la fiche : le diffuseur
+                // (NPR, BBC, Radio France…), dont la carte fait ses réseaux.
+                "keywords": f.keywords,
                 "quality": f.quality,
                 "codec": f.codec,
                 "bitrate": f.bitrate,
                 "website_url": f.website_url,
                 "stream_url": f.stream_url,
+                // #7177 (web#2443) — tous les flux publiés de la fiche.
+                "streams": f.flux_proposes(),
                 "radio_metadata_key": f.radio_metadata_key,
                 "now_playing": f.radio_metadata_key.is_some(),
                 "my_radio_id": locale.and_then(|s| s.id),
@@ -860,16 +888,27 @@ async fn ajouter(
 
     let (id, statut) = match existante {
         Some(st) => (st.id, StatusCode::OK),
-        None => match repo.create(&station_depuis_fiche(&fiche)) {
-            Ok(id) => {
-                state.event_bus.emit(
-                    "library.radios_changed",
-                    json!({"action": "created", "id": id, "external_id": external_id}),
-                );
-                (Some(id), StatusCode::CREATED)
+        None => {
+            let mut station = station_depuis_fiche(&fiche);
+            // Une fiche peut rester en favori même si aucun flux n'est
+            // accessible aujourd'hui ; c'est sa lecture qui sera refusée.
+            if let Ok(flux) = super::radios::geofencing::stream_for_directory(&state, &fiche, None)
+            {
+                station.url = flux.url;
+                station.codec = flux.codec.map(|c| c.to_ascii_lowercase());
+                station.bitrate = flux.bitrate;
             }
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        },
+            match repo.create(&station) {
+                Ok(id) => {
+                    state.event_bus.emit(
+                        "library.radios_changed",
+                        json!({"action": "created", "id": id, "external_id": external_id}),
+                    );
+                    (Some(id), StatusCode::CREATED)
+                }
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            }
+        }
     };
     let Some(id) = id else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -902,9 +941,9 @@ async fn ajouter(
 }
 
 /// `POST /radios/directory/update-stream/{radio_id}` — « Mettre à jour
-/// l'adresse du flux » : la station liée à sa fiche prend l'adresse que
-/// l'annuaire publie désormais. Seul ce geste de l'utilisateur la change :
-/// le rapprochement, lui, ne réécrit jamais une adresse.
+/// l'adresse du flux » : si son ancien flux a été retiré, la station liée
+/// prend l'adresse principale et ses métadonnées. Un flux secondaire encore
+/// publié reste choisi, comme lors du rattrapage de fond (#7043).
 async fn mettre_a_jour_le_flux(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -931,7 +970,106 @@ async fn mettre_a_jour_le_flux(
             .into_response();
     };
     if !flux_de_la_fiche(&fiche, &station.url) {
-        station.url = fiche.stream_url.clone();
+        // #6973 : les métadonnées de l'ancienne adresse ne décrivent pas
+        // le nouveau flux. Un format inconnu reste inconnu.
+        station.codec = None;
+        station.bitrate = None;
+        poser_le_flux_prefere(&fiche, &mut station, &fiche.stream_url);
+        if let Err(e) = repo.update(&station) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        state.event_bus.emit(
+            "library.radios_changed",
+            json!({"action": "updated", "id": radio_id}),
+        );
+    }
+    let mut sortie = json!(station);
+    super::radios_libelles::enrichir(&mut sortie, &crate::i18n::lang_from_header(&headers));
+    if let Some(o) = sortie.as_object_mut() {
+        o.insert(
+            "annuaire".into(),
+            rattachement(&fiche, Lien::Id, &station.url),
+        );
+    }
+    Json(sortie).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CorpsFluxPrefere {
+    pub stream_url: String,
+}
+
+/// #7177 (web#2443) — pose `url` comme flux de `station`, s'il est l'un des
+/// flux publiés de `fiche`, avec son format et son débit. `false` : ce flux
+/// n'est pas de la fiche, rien ne change.
+///
+/// Le flux préféré EST l'adresse de la station : aucune colonne de plus. Le
+/// rattrapage de fond (#7043, [`super::radios::flux_a_poser`]) garde une
+/// adresse tant que la fiche la publie, même secondaire ; il ne revient au
+/// flux principal que si la fiche retire celle-ci.
+pub fn poser_le_flux_prefere(
+    fiche: &StationAnnuaire,
+    station: &mut RadioStation,
+    url: &str,
+) -> bool {
+    let voulu = flux_normalise(url);
+    let Some(flux) = fiche
+        .flux_proposes()
+        .into_iter()
+        .find(|f| flux_normalise(&f.url) == voulu)
+    else {
+        return false;
+    };
+    station.url = flux.url;
+    if let Some(c) = flux.codec.as_deref() {
+        station.codec = Some(c.to_ascii_lowercase());
+    }
+    if let Some(b) = flux.bitrate {
+        station.bitrate = Some(b);
+    }
+    true
+}
+
+/// `POST /radios/directory/preferred-stream/{radio_id}` `{"stream_url": …}`
+/// — la station de « Mes radios » liée à sa fiche écoute désormais ce flux,
+/// choisi parmi ceux que la fiche publie (#7177, web#2443). Une adresse qui
+/// n'est pas de la fiche est refusée (422) : pour une autre adresse, il y a la
+/// saisie manuelle.
+async fn choisir_le_flux(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(radio_id): Path<i64>,
+    Json(corps): Json<CorpsFluxPrefere>,
+) -> Response {
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    let Some(mut station) = repo.get(radio_id).ok().flatten() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "radio_inconnue"})),
+        )
+            .into_response();
+    };
+    let lien = repo
+        .liens_annuaire()
+        .unwrap_or_default()
+        .get(&radio_id)
+        .cloned();
+    let Some(fiche) = lien.as_deref().and_then(|ext| fiche_par_id(&state, ext)) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "radio_sans_fiche_liee"})),
+        )
+            .into_response();
+    };
+    let avant = (station.url.clone(), station.codec.clone(), station.bitrate);
+    if !poser_le_flux_prefere(&fiche, &mut station, &corps.stream_url) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "flux_hors_fiche"})),
+        )
+            .into_response();
+    }
+    if (station.url.clone(), station.codec.clone(), station.bitrate) != avant {
         if let Err(e) = repo.update(&station) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
@@ -964,12 +1102,16 @@ async fn jouer(
         )
             .into_response();
     };
+    let flux = match super::radios::geofencing::stream_for_directory(&state, &fiche, None) {
+        Ok(flux) => flux,
+        Err(response) => return response.into_response(),
+    };
     Json(
         super::radios::jouer_un_flux(
             &state,
             zone_id,
             &fiche.name,
-            &fiche.stream_url,
+            &flux.url,
             fiche.logo_url.clone(),
         )
         .await,
@@ -980,3 +1122,11 @@ async fn jouer(
 #[cfg(test)]
 #[path = "radios_annuaire_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "radios_annuaire_recherche_7198_tests.rs"]
+mod tests_recherche_7198;
+
+#[cfg(test)]
+#[path = "radios_format_mis_a_jour_6973_tests.rs"]
+mod format_mis_a_jour_6973;

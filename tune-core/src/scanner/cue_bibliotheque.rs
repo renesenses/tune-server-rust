@@ -2089,8 +2089,11 @@ mod tests {
         let (dossier, _) = album_simple(d.path());
         let db = base();
 
-        let (_, premier, _) =
-            inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        let (_, premier, _) = inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         let (_, second, _) = inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
 
         assert_eq!(premier.pistes_creees, 2);
@@ -2108,7 +2111,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base();
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         assert_eq!(TrackRepo::with_backend(db.clone()).count().unwrap(), 2);
 
         fs::remove_file(&image).unwrap();
@@ -2136,7 +2143,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, _) = album_simple(d.path());
         let db = base();
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         let repo = TrackRepo::with_backend(db.clone());
         assert_eq!(repo.count().unwrap(), 2);
 
@@ -2165,7 +2176,7 @@ mod tests {
         let (dossier, _) = album_simple(&racine);
         let db = base();
         let rac = vec![racine.to_string_lossy().into_owned()];
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &rac);
+        inventorier_et_ecrire(db.clone(), std::slice::from_ref(&dossier), &rac);
         let repo = TrackRepo::with_backend(db.clone());
         assert_eq!(repo.count().unwrap(), 2);
 
@@ -2191,7 +2202,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base();
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         let repo = TrackRepo::with_backend(db.clone());
         assert_eq!(repo.count().unwrap(), 2);
 
@@ -2250,7 +2265,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base_fichier(d.path());
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         assert_eq!(debuts(&db, &image), vec![0, 1_000], "montage");
 
         fs::write(
@@ -2261,7 +2280,7 @@ mod tests {
         let vus = vec![image.clone()];
         let (_, refuse, _) = inventorier_ecrire_et_confronter(
             db.clone(),
-            &[dossier.clone()],
+            std::slice::from_ref(&dossier),
             &racines(d.path()),
             &ConfrontationDuScan {
                 fichiers_vus: &vus,
@@ -2297,7 +2316,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base_fichier(d.path());
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         fs::remove_file(dossier.join("album.cue")).unwrap();
 
         let rien: Vec<PathBuf> = Vec::new();

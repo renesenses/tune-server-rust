@@ -1,0 +1,80 @@
+name: Image Docker (vérification)
+
+# Construit l'image d'exécution SANS rien pousser : pas de secret, pas de
+# connexion à un registre. docker.yml (release) construit et pousse les images
+# publiques ; celui-ci ne sert qu'à vérifier, en PR, que les Dockerfiles
+# se construisent et que fpcalc s'exécute dans l'image, sur amd64 et arm64.
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - Dockerfile.dist
+      - .github/workflows/docker-verif.yml
+
+permissions:
+  contents: read
+
+jobs:
+  verif:
+    name: Image ${{ matrix.platform }} (sans push)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      # Dockerfile.dist attend des binaires précompilés (dist/<arch>/…) et web/,
+      # absents en PR. Des fichiers factices suffisent : seule la couche
+      # d'exécution (apt, fpcalc, yt-dlp) est vérifiée ici, pas le serveur.
+      - name: Binaires factices pour Dockerfile.dist
+        run: |
+          for a in amd64 arm64; do
+            mkdir -p "dist/$a"
+            for b in tune-server librespot airplay-daemon; do
+              printf '#!/bin/sh\nexit 0\n' > "dist/$a/$b"
+            done
+          done
+          mkdir -p dist/plugins web
+          touch dist/plugins/.keep
+          echo '<!doctype html>' > web/index.html
+
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.arch == 'arm64'
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Construire Dockerfile.dist (${{ matrix.platform }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dist
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          tags: tune-verif:${{ matrix.arch }}
+
+      - name: fpcalc -version
+        run: docker run --rm --platform ${{ matrix.platform }} --entrypoint fpcalc tune-verif:${{ matrix.arch }} -version
+
+      # Dockerfile (source) compile tout le serveur Rust : trop long pour une
+      # PR. On construit seulement l'étage fpcalc, identique à celui de
+      # Dockerfile.dist, et on l'exécute.
+      - name: Dockerfile, étage fpcalc (${{ matrix.platform }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: fpcalc
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          tags: tune-verif-fpcalc:${{ matrix.arch }}
+
+      - name: fpcalc -version (étage du Dockerfile)
+        run: docker run --rm --platform ${{ matrix.platform }} --entrypoint fpcalc tune-verif-fpcalc:${{ matrix.arch }} -version

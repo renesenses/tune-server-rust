@@ -274,8 +274,9 @@ async fn des_blocs_irreguliers_donnent_les_memes_paquets() {
     #[derive(Default)]
     struct Sortie(std::sync::Mutex<Vec<usize>>);
     impl SortieRtp for Sortie {
-        async fn envoyer(&self, pkt: &[u8]) {
+        async fn envoyer(&self, pkt: &[u8]) -> Result<(), String> {
             self.0.lock().unwrap().push(pkt.len() - RTP_HEADER_SIZE);
+            Ok(())
         }
     }
     let sortie = Sortie::default();

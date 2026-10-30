@@ -26,6 +26,11 @@ impl PositionPoller {
         rapporte: f64,
         consigne: f64,
     ) -> Option<f64> {
+        // #6912 — AIR est suivi par son annonce fraîche, même arrêté.
+        // Le repli get_status sur volume_voulu n'est pas une observation.
+        if appareil.starts_with("devialet-air:") {
+            return None;
+        }
         // Le trim ne se lit en base que quand l'appareil a bougé.
         if !precedent.is_some_and(|p| (rapporte - p).abs() > 1e-9) {
             return None;

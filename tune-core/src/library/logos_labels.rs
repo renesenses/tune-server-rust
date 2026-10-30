@@ -30,8 +30,18 @@
 //! [`DELAI_ABSENT_S`] ; une erreur (réseau, refus) pas avant
 //! [`DELAI_ERREUR_S`].
 //!
-//! Sans compte Qobuz, l'appelant ne fournit aucun catalogue : aucune passe,
-//! aucun appel (voir `tune-server`, `routes::library::labels`).
+//! Sans compte Qobuz, l'appelant ne fournit aucun catalogue Qobuz : aucune
+//! passe Qobuz, aucun appel (voir `tune-server`, `routes::library::labels`).
+//!
+//! # #7089 — les logos du web ouvert
+//!
+//! [`super::logos_web`] est un autre [`CatalogueDeLabels`], sans compte :
+//! après un rapprochement MusicBrainz sûr, Commons (libre), puis Wikipédia,
+//! puis le site officiel, puis Discogs. Il a SON index
+//! ([`super::logos_web::FICHIER_INDEX_WEB`], même dossier, même forme) : un
+//! « absent » chez Qobuz ne bloque pas le web, et inversement. Ses entrées
+//! gardent le MBID du label (`mb_label_id`) et l'[`Attribution`] du logo
+//! (source, licence connue), que la liste des labels expose.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -60,6 +70,58 @@ pub const TAILLE_MAX_IMAGE: usize = 5 * 1024 * 1024;
 /// La pause entre deux labels d'une même passe, en production.
 pub const PAUSE_ENTRE_LABELS: Duration = Duration::from_millis(750);
 
+/// D'où vient un logo (#7089).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceDuLogo {
+    Commons,
+    Wikipedia,
+    SiteOfficiel,
+    Discogs,
+    Qobuz,
+}
+
+/// Ce qu'on sait de la licence d'un logo (#7089).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatutDeLicence {
+    /// Domaine public, CC0, CC BY, CC BY-SA, lu sur la page du fichier.
+    Libre,
+    /// Non libre (« fair use » de Wikipédia) : usage d'identification du
+    /// label, dans le cache local du serveur, sans redistribution.
+    NonLibreIdentification,
+    /// Site officiel, Discogs, Qobuz : licence non déclarée.
+    Inconnue,
+}
+
+/// L'attribution d'un logo (#7089) : sa source, ce qu'on sait de sa
+/// licence, de qui, et la page d'où il vient.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attribution {
+    pub source: SourceDuLogo,
+    pub statut_licence: StatutDeLicence,
+    /// Le nom affiché : « Wikimedia Commons », « Wikipedia », le domaine
+    /// du site officiel, « Discogs ».
+    pub fournisseur: String,
+    /// Le nom court de la licence (« Public domain », « CC BY-SA 4.0 »,
+    /// « Fair use »…), quand elle est déclarée.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licence_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auteur: Option<String>,
+    /// La page d'où vient le logo : page du fichier, site, fiche Discogs.
+    pub source_url: String,
+    /// Le nom du fichier chez Commons ou Wikipédia.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fichier: Option<String>,
+    /// Un logo de marque déclaré « œuvre personnelle » par qui l'a versé
+    /// (`PD-self`, `Self-published work`) : la licence est à vérifier.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub douteux: bool,
+}
+
 /// Un label du catalogue, tel que le service l'a rapproché d'un nom local.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelDuCatalogue {
@@ -67,6 +129,9 @@ pub struct LabelDuCatalogue {
     pub nom: String,
     /// L'adresse de son image chez le service, s'il en a une.
     pub image_url: Option<String>,
+    /// L'attribution de cette image, pour une source qui en exige une
+    /// (#7089). `None` pour Qobuz.
+    pub attribution: Option<Attribution>,
 }
 
 /// Ce qu'un service de streaming doit savoir faire pour donner un logo.
@@ -104,6 +169,12 @@ pub struct EntreeLogo {
     /// L'identifiant Qobuz du label rapproché (#6782), même sans image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qobuz_label_id: Option<String>,
+    /// Le MBID du label rapproché par les sources du web (#7089).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mb_label_id: Option<String>,
+    /// L'attribution du logo en cache (#7089).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<Attribution>,
     /// Le condensat du logo dans le cache des pochettes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -146,6 +217,8 @@ pub struct Demande {
 /// L'index des logos de labels, adossé au cache des pochettes.
 pub struct CacheLogosLabels {
     dossier: PathBuf,
+    /// Le nom de l'index dans `dossier`.
+    fichier: &'static str,
     entrees: Mutex<BTreeMap<String, EntreeLogo>>,
     passe_en_cours: AtomicBool,
 }
@@ -163,14 +236,53 @@ impl CacheLogosLabels {
     /// L'index du dossier `dossier` (le cache des pochettes), relu sur disque.
     /// Un index absent ou illisible est un index vide.
     pub fn ouvrir(dossier: &Path) -> Self {
-        let entrees = std::fs::read(dossier.join(FICHIER_INDEX))
+        Self::ouvrir_index(dossier, FICHIER_INDEX)
+    }
+
+    /// L'index `fichier` du dossier `dossier`. [`FICHIER_INDEX`] est celui de
+    /// Qobuz : ses identifiants sont des `qobuz_label_id` ; tout autre index
+    /// (le web, #7089) garde des MBID (`mb_label_id`).
+    pub fn ouvrir_index(dossier: &Path, fichier: &'static str) -> Self {
+        let entrees = std::fs::read(dossier.join(fichier))
             .ok()
             .and_then(|o| serde_json::from_slice(&o).ok())
             .unwrap_or_default();
         Self {
             dossier: dossier.to_path_buf(),
+            fichier,
             entrees: Mutex::new(entrees),
             passe_en_cours: AtomicBool::new(false),
+        }
+    }
+
+    /// Une entrée sans identifiant ni attribution, que [`Self::avec_id`]
+    /// complète.
+    fn entree_nue(statut: Statut, image: Option<String>, verifie_le: u64) -> EntreeLogo {
+        EntreeLogo {
+            statut,
+            qobuz_label_id: None,
+            mb_label_id: None,
+            attribution: None,
+            image,
+            verifie_le,
+        }
+    }
+
+    /// Range l'identifiant du label dans le champ de la source de cet index.
+    fn avec_id(&self, mut entree: EntreeLogo, id: Option<String>) -> EntreeLogo {
+        if self.fichier == FICHIER_INDEX {
+            entree.qobuz_label_id = id;
+        } else {
+            entree.mb_label_id = id;
+        }
+        entree
+    }
+
+    fn id_de(&self, entree: &EntreeLogo) -> Option<String> {
+        if self.fichier == FICHIER_INDEX {
+            entree.qobuz_label_id.clone()
+        } else {
+            entree.mb_label_id.clone()
         }
     }
 
@@ -249,9 +361,9 @@ impl CacheLogosLabels {
         if std::fs::create_dir_all(&self.dossier).is_err() {
             return;
         }
-        let provisoire = self.dossier.join(format!("{FICHIER_INDEX}.part"));
+        let provisoire = self.dossier.join(format!("{}.part", self.fichier));
         if std::fs::write(&provisoire, octets).is_ok()
-            && std::fs::rename(&provisoire, self.dossier.join(FICHIER_INDEX)).is_err()
+            && std::fs::rename(&provisoire, self.dossier.join(self.fichier)).is_err()
         {
             let _ = std::fs::remove_file(&provisoire);
         }
@@ -279,48 +391,32 @@ impl CacheLogosLabels {
             {
                 Err(e) => {
                     tracing::debug!(label = %demande.nom, erreur = %e, "logo_label_erreur");
-                    EntreeLogo {
-                        statut: Statut::Erreur,
-                        qobuz_label_id: precedent.and_then(|p| p.qobuz_label_id),
-                        image: None,
-                        verifie_le: maintenant(),
-                    }
+                    let id = precedent.as_ref().and_then(|p| self.id_de(p));
+                    self.avec_id(Self::entree_nue(Statut::Erreur, None, maintenant()), id)
                 }
-                Ok(None) => EntreeLogo {
-                    statut: Statut::Absent,
-                    qobuz_label_id: None,
-                    image: None,
-                    verifie_le: maintenant(),
-                },
+                Ok(None) => Self::entree_nue(Statut::Absent, None, maintenant()),
                 Ok(Some(label)) => {
                     let image = match label.image_url.as_deref() {
                         None => Ok(None),
                         Some(url) => self.mettre_en_cache(catalogue, url).await.map(Some),
                     };
+                    let id = Some(label.id);
                     match image {
                         Ok(Some(condensat)) => {
                             trouves += 1;
-                            EntreeLogo {
-                                statut: Statut::Trouve,
-                                qobuz_label_id: Some(label.id),
-                                image: Some(condensat),
-                                verifie_le: maintenant(),
-                            }
+                            let mut e = self.avec_id(
+                                Self::entree_nue(Statut::Trouve, Some(condensat), maintenant()),
+                                id,
+                            );
+                            e.attribution = label.attribution;
+                            e
                         }
-                        Ok(None) => EntreeLogo {
-                            statut: Statut::Absent,
-                            qobuz_label_id: Some(label.id),
-                            image: None,
-                            verifie_le: maintenant(),
-                        },
+                        Ok(None) => {
+                            self.avec_id(Self::entree_nue(Statut::Absent, None, maintenant()), id)
+                        }
                         Err(e) => {
                             tracing::debug!(label = %demande.nom, erreur = %e, "logo_label_image_erreur");
-                            EntreeLogo {
-                                statut: Statut::Erreur,
-                                qobuz_label_id: Some(label.id),
-                                image: None,
-                                verifie_le: maintenant(),
-                            }
+                            self.avec_id(Self::entree_nue(Statut::Erreur, None, maintenant()), id)
                         }
                     }
                 }
@@ -383,12 +479,14 @@ mod tests {
                     id: "7".into(),
                     nom: "Verve".into(),
                     image_url: Some("http://img.test/verve.png".into()),
+                    attribution: None,
                 })
             } else if noms_concordent(nom, "ECM") {
                 Some(LabelDuCatalogue {
                     id: "9".into(),
                     nom: "ECM".into(),
                     image_url: None,
+                    attribution: None,
                 })
             } else {
                 None
@@ -599,6 +697,7 @@ mod tests {
                     id: "1".into(),
                     nom: "X".into(),
                     image_url: Some("http://img.test/x".into()),
+                    attribution: None,
                 }))
             }
             async fn telecharger_image(&self, _: &str) -> Result<Vec<u8>, String> {

@@ -651,6 +651,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test exemplaires_par_repertoire_4907 -- --nocapture --test-threads=1
 
+      # #6917 -- ne dedoublonner que les copies d'une meme racine de musique :
+      # le vrai scan et le nettoyage sur deux racines, option allumee puis
+      # eteinte. Le meme fichier tourne sur SQLite dans `ci.yml`.
+      - name: Dedoublonnage par racine sur PostgreSQL (#6917)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test dedoublonnage_par_racine_6917 -- --nocapture --test-threads=1
+
       # #3569 -- les E2E historiques de `postgres_e2e.rs`, ENFIN executees.
       #
       # Quinze epreuves sur dix-neuf n'avaient jamais tourne sur AUCUNE porte.

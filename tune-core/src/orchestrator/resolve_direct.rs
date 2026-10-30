@@ -93,19 +93,10 @@ impl PlaybackOrchestrator {
         accepte
     }
 
-    /// #4573 — combien de canaux ce renderer ANNONCE-t-il, au plus ?
-    ///
-    /// `None` veut toujours dire « on ne sait pas », et jamais « deux » :
-    /// sortie absente du registre, sortie qui n'est pas un `DlnaOutput` donc
-    /// sans Sink à lire, sonde inconcluante, ou Sink lu mais sans aucun
-    /// `channels=` — le cas du Denon AVR-X1600H de Xavier pour `audio/flac:*`.
-    /// C'est la règle de [`crate::audio::canaux_reseau_4573`] : on ne réduit
-    /// une piste multicanale que sur une déclaration.
-    ///
-    /// Les réponses CONCLUANTES sont mémorisées par renderer — une sonde SOAP
-    /// par session, pas par morceau. Une sonde inconcluante ne l'est pas : la
-    /// lecture suivante re-sonde, comme pour `dlna_accepte_lpcm`.
-    pub async fn canaux_annonces_du_renderer(&self, device_id: &str) -> Option<u16> {
+    /// Canaux annoncés pour le MIME servi. L'absence de limite explicite
+    /// reste inconnue ; une limite LPCM ne s'applique jamais au FLAC.
+    /// Les réponses concluantes sont mémorisées par appareil ET format.
+    pub async fn canaux_annonces_du_renderer(&self, device_id: &str, mime: &str) -> Option<u16> {
         if device_id.is_empty() {
             return None;
         }
@@ -114,10 +105,12 @@ impl PlaybackOrchestrator {
         // sans AUCUNE ligne de sonde pour l'A6 : la réponse venait du cache,
         // muet, d'une sonde faite avant la fenêtre du rapport. On ne pouvait
         // plus dire d'où venait le 2.
-        let en_cache = self.dlna_canaux_max.lock().await.get(device_id).copied();
+        let cache_key = (device_id.to_string(), mime.to_string());
+        let en_cache = self.dlna_canaux_max.lock().await.get(&cache_key).copied();
         if let Some(connu) = en_cache {
             tracing::info!(
                 device_id,
+                mime,
                 canaux_max = ?connu,
                 origine = "cache",
                 "dlna_canaux_annonces_en_cache"
@@ -151,17 +144,15 @@ impl PlaybackOrchestrator {
             );
             return None;
         }
-        let canaux = caps.canaux_max;
+        let canaux = crate::outputs::dlna::advertised_channels_for_mime(&caps.sink, mime);
         tracing::info!(
             device_id,
+            mime,
             canaux_max = ?canaux,
             origine = "sonde",
             "dlna_canaux_annonces_sondes"
         );
-        self.dlna_canaux_max
-            .lock()
-            .await
-            .insert(device_id.to_string(), canaux);
+        self.dlna_canaux_max.lock().await.insert(cache_key, canaux);
         canaux
     }
 }

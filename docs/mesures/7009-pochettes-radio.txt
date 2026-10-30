@@ -1,0 +1,39 @@
+#7009 — pochettes radio annoncées par le diffuseur et logo de repli
+
+La route de relais reconnaît maintenant l'adresse EXACTE de pochette déjà
+publiée dans l'état d'une zone radio. Elle utilise le relais public existant,
+avec ses contrôles d'adresse, de redirection, de type et de taille. La liste
+d'hôtes n'est pas étendue. Les autres sources et URL gardent leur parcours.
+
+Quand la pochette échoue, le logo provient de la station enregistrée ou du
+logo retenu au lancement depuis l'annuaire (#7051). Si plusieurs zones
+partagent la même URL mais ont des logos différents, aucun logo arbitraire
+n'est choisi. Les réponses radio demandent une revalidation du cache, afin
+qu'un logo de repli ne soit pas conservé un jour comme une pochette valide.
+
+Les favicons Google sont calculées par radios.rs::favicon_from_url lors
+d'un ajout sans logo. logo_a_la_creation et le rattrapage #7051 préfèrent
+déjà le logo de la fiche d'annuaire quand il existe. Aucun accès global à
+Google n'est ajouté : une favicon de liste qui n'est pas la pochette d'une
+radio courante reste soumise au parcours habituel.
+
+Shrek : 7 tests du vrai routeur HTTP (pochette, logo, cache et refus),
+9 contrôles du relais, 7 contrôles des logos de lancement, garde temporaires
+3/3, rustfmt et diff-check réussis. Contre-épreuve compilable : désactiver
+uniquement le rattachement aux radios, garder les tests : 2 rouges nommés
+#7009 (403 au lieu de 200), 5 contrôles verts. Restauration par copie, puis
+retour au vert. Le logo ambigu n'est jamais celui d'une autre station.
+
+Vrai BluesWave depuis .18, 27/10/2026 15:11:18 UTC : annuaire réel S000488,
+clé blueswave, métadonnées lues par le relais réel. Leur pochette est bien
+blueswave.radio/bwrdj/cover.jpg?v=... ; le relais candidat reçoit le JPEG
+200x200 de 14 879 octets, décodé comme image, là où la demande ordinaire
+est refusée en 403. Une vraie 404 contrôlée sur un fichier public absent
+est suivie du logo de station réel (PNG, 42 400 octets, octets identiques à
+ceux du logo demandé directement). Le flux FlacBlues réel se décode 3 s
+vers la sortie nulle, code 0, aucun son.
+
+Le banc réel exerce le Relais candidat et les sources réelles ; le routeur
+HTTP complet est éprouvé sur Shrek. Le binaire/service de production n'a
+pas été remplacé ni redémarré ; aucune lecture lancée sur une sortie réelle.
+Le banc .18 est retiré. Aucune recette visuelle Chrome n'est revendiquée.

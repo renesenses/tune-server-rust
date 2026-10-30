@@ -10,6 +10,7 @@ pub mod favorites_import;
 pub mod favorites_mirror;
 pub mod matching;
 pub mod podcast_annuaires;
+pub mod podcast_catalogue;
 pub mod podcasts;
 /// #6480 — le texte de présentation d'un album de service, HTML ramené à du texte.
 pub mod presentation_album;

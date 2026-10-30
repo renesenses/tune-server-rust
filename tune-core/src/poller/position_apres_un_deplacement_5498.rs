@@ -247,3 +247,76 @@ fn la_fenetre_encadre_la_cible_et_le_temps_ecoule() {
     );
     assert!(ok(500, 0, 0), "cible proche de 0 : pas de débordement");
 }
+
+async fn banc_local_6994() -> Banc {
+    let mut banc = Banc::monter().await;
+    banc.poller
+        .db
+        .execute(
+            "UPDATE zones SET output_type = 'local' WHERE id = ?",
+            &[&banc.zone_id],
+        )
+        .unwrap();
+    banc.outputs.lock().await.register(Box::new(
+        MockOutput::new(APPAREIL, "Sortie locale factice").with_type("local"),
+    ));
+    let mut piste = Banc::piste();
+    piste.source = "local".into();
+    banc.playback.play(banc.zone_id, piste).await;
+    let generation = banc.playback.get_state(banc.zone_id).await.track_generation;
+    let ps = banc
+        .poll_states
+        .entry(banc.zone_id)
+        .or_insert_with(|| ZonePollState::new(generation));
+    ps.track_started_at = Some(Instant::now() - Duration::from_millis(DUREE_MS));
+    banc.tour(DUREE_MS - 1_000).await;
+    let ps = banc.poll_states.get_mut(&banc.zone_id).unwrap();
+    assert!(
+        ps.peak_position_ms >= DUREE_MS - 1_000,
+        "le banc doit avoir réellement sondé la sortie"
+    );
+    ps.track_started_at = Some(Instant::now() - Duration::from_millis(DUREE_MS));
+    banc
+}
+
+#[tokio::test]
+async fn une_position_perimee_ne_termine_pas_le_titre_pendant_la_grace_locale_6994() {
+    let mut banc = banc_local_6994().await;
+    // Recul près de la fin : le relevé périmé dépasse la durée mais reste
+    // à moins de 15 s de la cible, donc n'est pas un fantôme de démarrage.
+    banc.playback
+        .seek(banc.zone_id, (DUREE_MS - 8_000) as i64)
+        .await;
+    for _ in 0..POSITION_PAST_END_TICKS + 1 {
+        banc.tour(DUREE_MS + 4_000).await;
+        let etat = banc.playback.get_state(banc.zone_id).await;
+        assert!(
+            etat.last_seek_at
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(SEEK_GRACE_SECS)),
+            "le témoin doit rester dans la grâce locale"
+        );
+        assert_eq!(
+            etat.state,
+            PlayState::Playing,
+            "#6994 : une position périmée vient de terminer le titre pendant la grâce du déplacement"
+        );
+        assert_eq!(
+            banc.poll_states.get(&banc.zone_id).unwrap().past_end_ticks,
+            0,
+            "#6994 : aucun vote de fin ne doit être retenu pendant la grâce"
+        );
+    }
+}
+
+#[tokio::test]
+async fn une_position_de_fin_sans_deplacement_termine_encore_la_piste_locale_6994() {
+    let mut banc = banc_local_6994().await;
+    for _ in 0..POSITION_PAST_END_TICKS {
+        banc.tour(DUREE_MS + 4_000).await;
+    }
+    assert_eq!(
+        banc.playback.get_state(banc.zone_id).await.state,
+        PlayState::Stopped,
+        "une vraie fin sans seek doit encore arrêter la file vide"
+    );
+}

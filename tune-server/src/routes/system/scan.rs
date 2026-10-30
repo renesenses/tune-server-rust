@@ -1339,9 +1339,20 @@ pub(crate) struct ExemplairesDuLot {
     /// son original peuvent tomber dans le même lot, avant que l'index des
     /// hachages connus ne les voie.
     chemins_du_lot: std::collections::HashMap<(String, i64), Vec<String>>,
+    /// #6917 — les racines qui bornent le repli, quand l'option « même
+    /// racine seulement » est allumée ; `None` : le comportement d'avant.
+    racines: Option<Vec<String>>,
 }
 
 impl ExemplairesDuLot {
+    /// Le lot, avec la borne de racine que le réglage pose (#6917).
+    pub(crate) fn pour(db: &dyn tune_core::db::backend::DbBackend) -> Self {
+        Self {
+            racines: tune_core::library::dedoublonnage_par_racine::racines_si_active(db),
+            ..Self::default()
+        }
+    }
+
     /// La piste que l'importateur vient de lire est-elle la copie exacte
     /// d'une piste déjà connue (base ou lot) du même album ? Si oui, elle est
     /// notée comme exemplaire et le chemin du propriétaire est rendu ; sinon
@@ -1362,6 +1373,13 @@ impl ExemplairesDuLot {
         let key = (hash.clone(), aid);
         let mut candidates = connus.get(&key).cloned().unwrap_or_default();
         candidates.extend(self.chemins_du_lot.get(&key).cloned().unwrap_or_default());
+        // #6917 — option allumée, une copie d'une AUTRE racine n'est pas un
+        // exemplaire : elle entre comme sa propre piste.
+        let candidates = tune_core::library::dedoublonnage_par_racine::candidats_repliables(
+            chemin,
+            candidates,
+            self.racines.as_deref(),
+        );
         if let Some(existant) = tune_core::scanner::hasher::find_byte_identical_path(
             std::path::Path::new(chemin),
             &candidates,
@@ -2440,7 +2458,7 @@ async fn spawn_library_scan_avec_lecteur_par(
                 // Lignes de ce lot qui existaient sous une source d'importation
                 // et que le scan reprend à son compte (#2939).
                 let mut a_adopter: Vec<i64> = Vec::new();
-                let mut exemplaires_du_lot = ExemplairesDuLot::default();
+                let mut exemplaires_du_lot = ExemplairesDuLot::pour(&*db);
 
                 // Collect extended metadata for tracks in this batch.
                 //

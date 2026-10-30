@@ -8,7 +8,7 @@ use super::*;
 ///
 /// - `"asio"`: use the ASIO host (requires `asio` cargo feature; Windows only).
 ///   Falls back to WASAPI, with a warning, if the host cannot be opened or
-///   exposes no output device.
+///   has no registered ASIO driver.
 /// - `"wasapi"`: use the default host (WASAPI on Windows)
 /// - `"auto"` (default): use WASAPI directly. **`auto` never probes ASIO.**
 /// - anything else: treated like `"wasapi"`.
@@ -32,7 +32,9 @@ pub fn select_host(backend: &str) -> cpal::Host {
         match backend_lower.as_str() {
             "asio" => match cpal::host_from_id(cpal::HostId::Asio) {
                 Ok(host) => {
-                    let device_count = host.output_devices().map(|d| d.count()).unwrap_or(0);
+                    // Loading a busy driver can fail although it is installed.
+                    // Backend selection must use the registry, without opening it.
+                    let device_count = super::parc::pilotes_asio_enregistres(&host).len();
                     let (active, fallback) = asio_outcome(Some(device_count));
                     if fallback.is_none() {
                         info!(
@@ -45,7 +47,7 @@ pub fn select_host(backend: &str) -> cpal::Host {
                     }
                     warn!(
                         fallback_reason = LocalBackendFallback::AsioNoDevices.code(),
-                        "local_audio_asio_no_devices — ASIO host OK but no output devices found, falling back to WASAPI"
+                        "local_audio_asio_no_devices — ASIO host OK but no registered drivers found, falling back to WASAPI"
                     );
                     note_observed_backend(active, fallback);
                     return cpal::default_host();
@@ -680,7 +682,8 @@ pub fn sans_noter_le_backend_observe<T>(f: impl FnOnce() -> T) -> T {
 /// Issue d'une demande `asio` sur une cible qui embarque ASIO.
 ///
 /// `asio_devices` : `None` = l'hôte ASIO ne s'ouvre pas ; `Some(0)` = il
-/// s'ouvre mais n'expose aucune sortie ; `Some(n > 0)` = ASIO joue.
+/// s'ouvre sans pilote enregistré ; `Some(n > 0)` = ASIO reste sélectionné,
+/// même si un autre processus tient tous ses pilotes.
 ///
 /// Isolée de cpal exprès : la branche appelante vit sous
 /// `#[cfg(all(target_os = "windows", feature = "asio"))]` et ne peut être

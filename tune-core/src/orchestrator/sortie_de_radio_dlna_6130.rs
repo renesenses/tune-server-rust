@@ -136,11 +136,14 @@ impl PlaybackOrchestrator {
         // `delai_depasse=true`). L'attente seule ne garantissait donc jamais
         // ce qu'elle devait garantir. Le serveur ferme lui-même le direct :
         // la connexion radio ne peut plus être ouverte au `SetAVTransportURI`.
-        let congedies = sessions
+        let mut congedies = 0usize;
+        for s in sessions
             .iter()
             .filter(|s| s.is_radio && s.active_consumers.load(Ordering::Relaxed) > 0)
-            .map(|s| s.congedier_les_consommateurs())
-            .count();
+        {
+            s.congedier_les_consommateurs();
+            congedies += 1;
+        }
         let (attente, delai_depasse) =
             attendre_le_depart_des_consommateurs(&sessions, DELAI_FERMETURE_RADIO).await;
         let bilan = BilanSortieDeRadio {

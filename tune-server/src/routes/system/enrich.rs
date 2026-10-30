@@ -1159,6 +1159,9 @@ pub(super) async fn cleanup(
         "orphan_albums_deleted": orphan_albums,
         "orphan_artists_deleted": orphan_artists,
         "duplicate_tracks_removed": tracks,
+        // #6917 — la règle que le dédoublonnage des pistes vient d'appliquer :
+        // vrai, les copies d'une autre racine de musique sont restées.
+        "dedup_same_root_only": tune_core::library::dedoublonnage_par_racine::active(&*state.backend),
         "orphan_artwork_deleted": orphan_artwork,
         "db_optimized": db_optimized,
     })))

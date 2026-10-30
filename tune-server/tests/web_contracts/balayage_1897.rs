@@ -100,9 +100,39 @@ async fn faux_youtube() -> String {
     format!("http://{adresse}")
 }
 
+/// #7261 — le repli sans bio ne doit pas dépendre du site réel. Ce proxy
+/// refuse les connexions HTTP/TLS : seule la route locale produit la réponse.
+async fn client_du_site_indisponible() -> reqwest::Client {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("proxy local");
+    let adresse = ecoute.local_addr().expect("adresse du proxy");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = ecoute.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut entete = [0u8; 1024];
+                if socket.read(&mut entete).await.unwrap_or(0) > 0 {
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ).await;
+                }
+            });
+        }
+    });
+    tune_core::http::client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{adresse}")).expect("proxy valide"))
+        .build()
+        .expect("client HTTP partagé pour le témoin")
+}
+
 async fn amorcer() -> (axum::Router, Temoins) {
-    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+    let mut etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
         .expect("etat serveur isole");
+    etat.http_client = client_du_site_indisponible().await;
     let faux = faux_youtube().await;
     etat.services.lock().await.register(Box::new(
         tune_core::streaming::youtube::YouTubeService::avec_bases(

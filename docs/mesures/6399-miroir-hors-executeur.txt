@@ -1,0 +1,95 @@
+#6399 — réconciliation des favoris hors de l'exécuteur
+Bertrand Clech / OpenAI Codex / bertrand-20261027-6399-r8f2
+Base : batch/bugs-rc9-20261025 @ 68338eb18d11d7538e96c75bff91ee29571706b8
+
+Périmètre
+Le gonflement de la file était déjà traité par #6819. Ce correctif vise le
+travail SQL synchrone de la réconciliation locale, appelé depuis la route
+asynchrone des favoris. Il ne modifie ni la file ni les connecteurs.
+
+Mécanismes
+1. rafraichir attend les lectures réseau, puis appelait reconcilier pour tous
+   les favoris directement sur le fil Tokio. tokio::spawn dans la route ne
+   transforme pas ce travail synchrone en travail bloquant déporté.
+   La réconciliation complète est maintenant dans spawn_blocking. Le verrou
+   du service est libéré avant. Il n'y a pas de transaction globale ajoutée.
+2. poser_etat (et les autres écritures tous profils) filtre par service, type
+   et identifiant, sans profil. Les index existants commencent par le profil.
+   Sans statistiques adaptées, chaque confirmation balaie toute la table.
+   Un index (service, item_type, service_id) est posé au démarrage SQLite et
+   PostgreSQL, y compris sur une base déjà à la dernière version. Comme les
+   index voisins, un refus est journalisé sans empêcher le serveur de démarrer.
+
+Limite importante de la mesure réelle
+Le .18 porte 329 lignes et 166 clés de favoris au relevé du 27/10. Les plans inspectés
+avec SQLite 3.45.1 (Python) disposent DEJA de statistiques permettant un
+skip-scan de la clé unique. Il ne reproduit
+pas le gel de 5,8 s du rapport du testeur, ni ses 6 763 favoris Qobuz.
+Sur une copie EN MEMOIRE des seules lignes de favoris du .18, sans modifier la
+production, cinq passes de confirmations donnent :
+- sans statistiques : SCAN, environ 1 302 700 opérations SQLite ; médiane 7,38 ms ;
+- avec l'index, sans statistiques (premier relevé) : SEARCH, environ 59 300
+  opérations ; médiane 1,31 ms ;
+- statistiques réelles du .18 restaurées : skip-scan avant ET après création
+  de l'index ; environ 75 100 opérations ; médianes 1,524 / 1,461 ms.
+Les opérations sont arrondies par le progress_handler à 100 instructions.
+Ces temps ne mesurent ni le réseau ni toute la réconciliation. Il serait faux
+d'annoncer une accélération de la production du .18 sur cette seule base.
+
+Témoins exécutés sur Shrek
+- 7 000 favoris dans trois profils : compteur FullscanStep de la requête de
+  confirmation réelle, bornage VmStep, trois lignes modifiées ; autres type
+  et service préservés ; index récupéré après suppression et nouveau démarrage.
+- déclencheur SQLite refusant les insertions faites sur le fil de l'exécuteur :
+  rafraichir doit réellement poser le favori depuis un autre fil. Pas de délai
+  arbitraire ni d'hypothèse sur la vitesse de la machine.
+
+Résultats Shrek
+- cargo test -p tune-core --lib --no-default-features
+  streaming::favorites_mirror::tests -- --test-threads=4 : 20/20.
+- Même commande, filtre db::streaming_favorites_repo::tests : 14/14.
+- cargo test -p tune-core --test integration_contracts
+  aucune_fuite_de_temporaires : 3/3 (features par défaut, local-audio).
+- rustfmt ciblé sur les quatre sources et git diff --check : propres.
+
+Contre-épreuve compilable, tests laissés intacts
+Commande : cargo test -p tune-core --lib --no-default-features _6399.
+L'appel d'installation SQLite de l'index est remplacé par SELECT 1, et la
+closure de réconciliation est exécutée directement au lieu de spawn_blocking.
+Les deux témoins rougissent après compilation réussie :
+- confirmer_un_favori_ne_balaie_pas_tout_le_miroir_6399 :
+  « confirmer un favori ne doit pas balayer tout le miroir (#6399) »,
+  left: 21001, right: 0 ;
+- la_reconciliation_sql_quitte_le_fil_asynchrone_6399 :
+  « la reconciliation SQL doit quitter le fil asynchrone »,
+  erreur SQLite « le miroir ecrit sur le fil asynchrone (#6399) ».
+Restauration des deux sources par copie, puis retour aux 20/20 et 14/14.
+
+Preuve sur le vrai service, .18, 27/10/2026 11:04:18 UTC
+Banc Rust compilé sur Shrek avec le code corrigé, exécuté sur le .18 :
+- lecture seule de la session Qobuz du serveur, conservée en mémoire du .18 ;
+- vrai QobuzService, vraie lecture réseau et vraie fonction rafraichir ;
+- base miroir temporaire vide, aucun favori en attente à propager ;
+- même déclencheur SQLite refusant toute insertion sur le fil asynchrone ;
+- SQLite embarqué du banc : 3.51.3 ; aucune sortie audio initialisée.
+Passage 1 : lus=77, ajoutes=77, deja_presents=0, echecs=0,
+            pousses=0, en_attente=0, elapsed_ms=1491.
+Passage 2 : lus=77, ajoutes=0, deja_presents=77, echecs=0,
+            pousses=0, en_attente=0, elapsed_ms=1107.
+Ces temps comprennent le réseau et ne sont PAS une comparaison avant/après.
+La preuve établit le fonctionnement sur le vrai compte et l'exécution des
+insertions hors du fil asynchrone. Aucun serveur factice utilisé pour elle.
+La base temporaire est supprimée par TempDir ; le banc envoyé au .18 est retiré.
+Service et binaire de production inchangés ; aucun son, aucune fusion.
+
+Non établi
+Le gel historique exact du testeur, sa grande collection, le temps de réponse
+de son interface, la charge prolongée, Windows et PostgreSQL à l'exécution.
+Les lectures partielles, retraits en attente et profils restent couverts par
+les tests existants SQLite. La CI complète reste à lire séparément.
+L'issue #6399 reste ouverte : ce correctif ne prétend pas mesurer toute la
+lenteur du rapport initial.
+
+Preuves brutes privées de cette session : coordination/preuves-6399-r8f2
+(journaux Rust, banc de lecture Qobuz, mesures SQLite anonymes, scripts).
+Aucune donnée d'authentification ni liste nominative de favoris n'y est copiée.

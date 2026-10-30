@@ -1200,7 +1200,7 @@ impl ZoneRepo {
         // autre fil le tient : une PATCH validée y est visible, et la
         // préparation d'une lecture ne fait plus la queue derrière un scan.
         let rows = self.db.query_many_frais(&sql, &params)?;
-        Ok(rows.first().map(row_to_zone))
+        Ok(rows.first().map(|cols| row_to_zone(cols)))
     }
 
     /// Look up a zone by its output device id.
@@ -1213,7 +1213,7 @@ impl ZoneRepo {
         }
         // Strong read to see the writer's own pending commits (WAL lag).
         let rows = self.db.query_many_strong(&sql, &params)?;
-        Ok(rows.first().map(row_to_zone))
+        Ok(rows.first().map(|cols| row_to_zone(cols)))
     }
 
     pub fn list(&self) -> Result<Vec<Zone>, String> {
@@ -1229,12 +1229,12 @@ impl ZoneRepo {
             sql::select_base()
         );
         match self.db.query_many_strong(&filtered, &[]) {
-            Ok(rows) => Ok(rows.iter().map(row_to_zone).collect()),
+            Ok(rows) => Ok(rows.iter().map(|cols| row_to_zone(cols)).collect()),
             Err(_) => {
                 // is_hidden column doesn't exist (pre-migration DB) — fall back
                 // to the unfiltered query, still via the strong read.
                 let strong = self.db.query_many_strong(&sql::list_all(), &[])?;
-                Ok(strong.iter().map(row_to_zone).collect())
+                Ok(strong.iter().map(|cols| row_to_zone(cols)).collect())
             }
         }
     }
@@ -1320,7 +1320,7 @@ impl ZoneRepo {
         // the rowid we read reflects the INSERT we just did.
         let create_sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 3] = [&name, &output_type, &output_device_id];
-        Ok(self.db.execute_returning_id(&create_sql, &params)?)
+        self.db.execute_returning_id(&create_sql, &params)
     }
 
     /// Atomically get an existing zone by output_device_id, or create a new one.
@@ -1339,17 +1339,17 @@ impl ZoneRepo {
         output_device_id: &str,
     ) -> Result<(i64, bool), String> {
         // Check if a zone with this device_id already exists (including hidden).
-        if let Some(existing) = self.get_by_device_id(output_device_id)? {
-            if let Some(id) = existing.id {
-                if self.is_device_hidden(output_device_id) {
-                    tracing::debug!(
-                        zone_id = id,
-                        device_id = output_device_id,
-                        "zone_hidden_skipping_auto_unhide"
-                    );
-                }
-                return Ok((id, false));
+        if let Some(existing) = self.get_by_device_id(output_device_id)?
+            && let Some(id) = existing.id
+        {
+            if self.is_device_hidden(output_device_id) {
+                tracing::debug!(
+                    zone_id = id,
+                    device_id = output_device_id,
+                    "zone_hidden_skipping_auto_unhide"
+                );
             }
+            return Ok((id, false));
         }
         // No existing zone — try to create one.
         match self.create_ou_occupante(name, output_type, output_device_id)? {
@@ -2121,6 +2121,48 @@ impl ZoneRepo {
         let params: [&dyn ToSqlValue; 2] = [&volume, &id];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// #6912 — une observation ne remonte jamais le volume enregistré et ne
+    /// remplace ni un nouvel appareil ni une consigne modifiée depuis sa lecture.
+    pub(crate) fn adopter_controles_air_attendus(
+        &self,
+        zone: &Zone,
+        volume: f64,
+        muted: bool,
+    ) -> Result<bool, String> {
+        if !volume.is_finite() || volume < 0.0 || volume > zone.volume {
+            return Ok(false);
+        }
+        let Some(id) = zone.id else {
+            return Ok(false);
+        };
+        let Some(did) = zone.output_device_id.as_deref() else {
+            return Ok(false);
+        };
+        let d: &dyn SqlDialect = match self.db.engine() {
+            Engine::Sqlite => &SqliteDialect,
+            Engine::Postgres => &PostgresDialect,
+        };
+        let p: Vec<_> = (1..=8).map(|i| d.placeholder(i)).collect();
+        let sql = format!(
+            "UPDATE zones SET volume = {}, muted = {} WHERE id = {} AND output_type = 'devialet_air' AND output_device_id = {} AND volume = {} AND muted = {} AND fixed_volume = {} AND volume >= {}",
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]
+        );
+        let ancien_mute = i64::from(zone.muted);
+        let nouveau_mute = i64::from(muted);
+        let fixe = i64::from(zone.fixed_volume);
+        let params: [&dyn ToSqlValue; 8] = [
+            &volume,
+            &nouveau_mute,
+            &id,
+            &did,
+            &zone.volume,
+            &ancien_mute,
+            &fixe,
+            &volume,
+        ];
+        Ok(self.db.execute(&sql, &params)? == 1)
     }
 
     pub fn update_muted(&self, id: i64, muted: bool) -> Result<(), String> {
@@ -3285,7 +3327,7 @@ impl ZoneRepo {
     }
 }
 
-fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
+fn row_to_zone(cols: &[SqlValue]) -> Zone {
     Zone {
         id: cols.first().and_then(|v| v.as_i64()),
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),

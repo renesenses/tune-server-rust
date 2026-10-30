@@ -262,6 +262,134 @@ async fn une_page_web_a_la_reconnexion_est_dite_sans_attendre() {
         .expect("le drain se termine quand le canal se ferme");
 }
 
+/// La longueur d'une trame MPEG-1 couche III à 44,1 kHz, d'après son
+/// en-tête : la seule forme que porte la fixture `test.mp3`.
+fn longueur_de_trame_mp3(entete: &[u8]) -> usize {
+    assert_eq!(entete[0], 0xFF, "synchro de trame attendue");
+    assert_eq!(entete[1] & 0xFE, 0xFA, "MPEG-1 couche III attendu");
+    assert_eq!((entete[2] >> 2) & 3, 0, "44,1 kHz attendu");
+    let kbps = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ][usize::from(entete[2] >> 4)];
+    144 * kbps * 1000 / 44_100 + usize::from((entete[2] >> 1) & 1)
+}
+
+/// Une station qui sert `corps` à sa première connexion puis la GARDE
+/// ouverte, comme un direct qui ne finit pas, jusqu'au signal du test (ou
+/// 30 s). Rend l'URL et l'émetteur du signal.
+fn station_en_direct(corps: Vec<u8>) -> (String, std::sync::mpsc::Sender<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (fermer, signal) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let Some(mut s) = listener.incoming().flatten().next() else {
+            return;
+        };
+        let mut buf = [0u8; 2048];
+        let _ = s.read(&mut buf);
+        let _ = write!(
+            s,
+            "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nicy-br: 128, 128\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let _ = s.write_all(&corps);
+        let _ = s.flush();
+        let _ = signal.recv_timeout(Duration::from_secs(30));
+    });
+    (format!("http://{addr}/tsfjazz-high.mp3"), fermer)
+}
+
+/// #7046 — TSF Jazz s'arrêtait après la publicité et ne repartait pas.
+///
+/// Forme mesurée le 26/10/2026 sur le vrai flux
+/// (`tsfjazz.ice.infomaniak.ch/tsfjazz-high.mp3`, IcecastSC 1.5.7) : le corps
+/// s'OUVRE sur un fichier MP3 complet, la publicité d'ouverture — première
+/// trame porteuse d'un en-tête LAME « Info » (1 152 trames, 481 906 octets,
+/// 30 s) — et le direct suit aussitôt, en trames nues, sur la même
+/// connexion, sans fin. symphonia prenait les 30 s de la publicité pour la
+/// durée de la station et rognait à zéro chaque trame du direct : la
+/// publicité jouait, puis plus un échantillon, sans erreur ni reconnexion.
+///
+/// La fixture reproduit cette forme, anonymisée : `test.mp3` (lui aussi un
+/// fichier LAME à en-tête « Info », ~1 s) tient le rôle de la publicité,
+/// puis ses trames audio, sans en-tête, répétées dix fois tiennent celui du
+/// direct (~10 s). La connexion reste ouverte. Le direct doit être décodé
+/// sur cette même connexion, au-delà de la publicité.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_direct_qui_suit_la_publicite_d_ouverture_est_decode_7046() {
+    // `test.mp3` : étiquette ID3v2 (10 octets + taille « syncsafe »), puis la
+    // trame « Info », puis les trames audio.
+    let id3 = 10
+        + MP3[6..10]
+            .iter()
+            .fold(0usize, |n, b| (n << 7) | usize::from(*b & 0x7F));
+    let publicite = &MP3[id3..];
+    let trame_info = longueur_de_trame_mp3(publicite);
+    assert_eq!(
+        &publicite[36..40],
+        b"Info",
+        "la fixture doit s'ouvrir, comme TSF Jazz, sur un en-tête « Info »"
+    );
+    let trames_audio = &publicite[trame_info..];
+    let mut corps = publicite.to_vec();
+    for _ in 0..10 {
+        corps.extend_from_slice(trames_audio);
+    }
+    // Ce que pèse en PCM 16 bits stéréo la publicité seule, et la station
+    // entière (1 152 échantillons par trame).
+    let mut trames = 0usize;
+    let mut i = 0usize;
+    while i < trames_audio.len() {
+        i += longueur_de_trame_mp3(&trames_audio[i..]);
+        trames += 1;
+    }
+    let pcm_de_la_publicite = trames * 1152 * 4;
+    let pcm_attendu = 11 * pcm_de_la_publicite;
+
+    let (url, fermer) = station_en_direct(corps);
+    let session = session_radio().await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let data_ready = Arc::new(tokio::sync::Notify::new());
+    let session_pour_le_decodeur = session.clone();
+    let decodeur = tokio::task::spawn_blocking(move || {
+        decode_radio_stream_to_pcm(
+            url,
+            tx,
+            data_ready,
+            session_pour_le_decodeur,
+            None,
+            None,
+            false,
+            None,
+        )
+    });
+
+    // Tout le corps est servi d'un coup : au-delà de 3 s sans morceau, le
+    // décodeur ne rendra plus rien.
+    let voulu = pcm_attendu * 3 / 4;
+    let mut octets = 0usize;
+    while octets < voulu {
+        match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+            Ok(Some(m)) => octets += m.len(),
+            Ok(None) => panic!("le décodeur a fermé le canal après {octets} octets de PCM"),
+            Err(_) => panic!(
+                "après la publicité d'ouverture, le direct n'est plus décodé : {octets} octets \
+                 de PCM servis, la publicité seule en vaut {pcm_de_la_publicite}, la station \
+                 {pcm_attendu} (au moins {voulu} attendus) — l'en-tête « Info » de la publicité \
+                 a été pris pour la fin de la station"
+            ),
+        }
+    }
+    drop(rx);
+    let _ = fermer.send(());
+    let verdict = tokio::time::timeout(Duration::from_secs(15), decodeur)
+        .await
+        .expect("le décodeur doit rendre la main après le départ du consommateur")
+        .expect("la tâche de décodage ne doit pas paniquer");
+    assert_eq!(verdict, Ok(()));
+}
+
 /// Décode la station jusqu'à `n` morceaux, en déposant `profil` dans le poste
 /// de relève après le `apres`-ième (jamais si `None`). Rend les morceaux et le
 /// nombre de relèves faites par le décodeur.
@@ -630,7 +758,9 @@ async fn une_station_hls_he_aac_est_decodee_jusqu_au_pcm_a_48_khz() {
         octets.extend(morceau);
     }
     let gauche: Vec<f32> = octets
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|t| f32::from(i16::from_le_bytes([t[0], t[1]])) / 32768.0)
         .collect();
     let part = part_au_dessus_de_12_khz(&gauche[8192..], 48_000);

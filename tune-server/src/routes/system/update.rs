@@ -287,12 +287,15 @@ async fn zones_en_lecture_vivante(
             continue;
         }
         if tune_core::playback::zone_figee(&z, silence_max) {
+            // #7149 — même constat que le détecteur de fond : pas de
+            // `immobile_secs=0` pour une zone que personne n'a observée.
+            let constat = tune_core::playback::constat_de_zone_figee(&z);
             warn!(
                 zone_id = z.zone_id,
-                immobile_secs = z
-                    .derniere_avance_de_position
-                    .map(|t| t.elapsed().as_secs())
-                    .unwrap_or_default(),
+                motif = constat.motif,
+                immobile_secs = constat.immobile_secs,
+                fenetre_ouverte_secs = constat.fenetre_ouverte_secs,
+                duree_piste_secs = constat.duree_piste_secs,
                 seuil_secs = silence_max.as_secs(),
                 "update_zone_figee_ignoree"
             );

@@ -68,6 +68,9 @@ pub struct ContexteAir {
     pub activee: Arc<dyn Fn() -> bool + Send + Sync>,
     /// L'indice de la source AIR de l'ampli.
     pub indice_source: Arc<dyn Fn() -> u8 + Send + Sync>,
+    /// #6918 — la course du curseur en dB. Relue à chaque consigne : une
+    /// course changée vaut pour le geste suivant et n'envoie rien.
+    pub bornes_db: Arc<dyn Fn() -> reglages::BornesDb + Send + Sync>,
     pub ports: Ports,
     pub cadence: Cadence,
 }
@@ -78,9 +81,11 @@ impl ContexteAir {
     #[must_use]
     pub fn depuis_la_base(db: Arc<dyn crate::db::backend::DbBackend>) -> Self {
         let db2 = db.clone();
+        let db3 = db.clone();
         Self {
             activee: Arc::new(move || reglages::activee(&db)),
             indice_source: Arc::new(move || reglages::indice_source(&db2)),
+            bornes_db: Arc::new(move || reglages::BornesDb::lues(&db3)),
             ports: Ports::AIR,
             cadence: Cadence::AIR,
         }
@@ -203,6 +208,21 @@ impl DevialetAirOutput {
 
     fn ampli(&self) -> Option<AmpliVu> {
         self.ecoute.ampli(&self.mac)
+    }
+
+    /// #6912 — seulement une annonce encore présente, jamais volume_voulu.
+    pub(crate) fn observation_volume(&self) -> Option<crate::playback::ObservationVolumeAppareil> {
+        if !(self.contexte.activee)() {
+            return None;
+        }
+        let ampli = self.ampli()?;
+        let volume_db = ampli.annonce.volume_db();
+        Some(crate::playback::ObservationVolumeAppareil {
+            device_id: self.device_id.clone(),
+            volume: (self.contexte.bornes_db)().db_vers_volume(volume_db),
+            volume_db,
+            muted: ampli.annonce.sourdine,
+        })
     }
 
     fn adresse_ampli(&self, a: &AmpliVu) -> SocketAddr {
@@ -537,14 +557,13 @@ struct SourceOuverte {
     cadence_envoyee: u32,
 }
 
-fn ouvrir_decodeur(
-    chemin: &str,
-    cadence: Option<u32>,
-    depuis_s: f64,
-) -> (
+/// Les octets PCM du décodeur, et la tâche qui les produit (profondeur, débit).
+type DecodeurOuvert = (
     mpsc::Receiver<Vec<u8>>,
     JoinHandle<Result<(u16, u32), String>>,
-) {
+);
+
+fn ouvrir_decodeur(chemin: &str, cadence: Option<u32>, depuis_s: f64) -> DecodeurOuvert {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
     let (niveaux, niveaux_rx) = mpsc::unbounded_channel();
     drop(niveaux_rx);
@@ -616,7 +635,9 @@ async fn ouvrir_la_source(
             reste.extend_from_slice(&bloc);
             let complets = reste.len() / 6 * 6;
             let lot: Vec<[i32; 2]> = reste[..complets]
-                .chunks_exact(6)
+                .as_chunks::<6>()
+                .0
+                .iter()
                 .map(|t| [lire_24_le(&t[0..3]), lire_24_le(&t[3..6])])
                 .collect();
             reste.drain(..complets);
@@ -740,12 +761,15 @@ impl OutputTarget for DevialetAirOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        let db = reglages::volume_vers_db(volume);
+        let bornes = (self.contexte.bornes_db)();
+        // #6918 — la course réglée, puis le plafond en dernier mot : aucune
+        // consigne au-dessus de −10 dB ne part, quelle que soit la course.
+        let db = bornes.volume_vers_db(volume).min(reglages::PLAFOND_DB);
         self.commander(opcode::VOLUME, db as f32).await?;
         *self
             .volume_voulu
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = reglages::db_vers_volume(db);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = bornes.db_vers_volume(db);
         Ok(())
     }
 
@@ -791,7 +815,7 @@ impl OutputTarget for DevialetAirOutput {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
             },
-            |a| reglages::db_vers_volume(a.annonce.volume_db()),
+            |a| (self.contexte.bornes_db)().db_vers_volume(a.annonce.volume_db()),
         );
         Ok(OutputStatus {
             state,
@@ -847,6 +871,7 @@ impl OutputTarget for DevialetAirOutput {
             "source_choisie": ampli.as_ref().map(|a| a.annonce.source_choisie),
             "source_air": (self.contexte.indice_source)(),
             "volume_db": ampli.as_ref().map(|a| a.annonce.volume_db()),
+            "volume_range_db": (self.contexte.bornes_db)().json(),
             "sourdine": ampli.as_ref().map(|a| a.annonce.sourdine),
             "graves_db": ampli.as_ref().map(|a| f64::from(a.annonce.graves_demi_db) / 2.0),
             "aigus_db": ampli.as_ref().map(|a| f64::from(a.annonce.aigus_demi_db) / 2.0),

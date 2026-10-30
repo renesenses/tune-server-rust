@@ -2198,3 +2198,56 @@ fn cross_transmet_tune_version_aux_deux_cibles_arm() {
         );
     }
 }
+
+/// #7148 — le controleur ne pose AUCUN tag sans le vert de la sentinelle de
+/// streaming du .18 sur le SHA serveur candidat.
+///
+/// 26/10/2026 : la rc8.1 a ete taguee avec un correctif TIDAL prouve contre un
+/// faux CDN ; sur le .18, 403 sur toutes les URL de segments. La porte lit le
+/// statut de commit `sentinelle/streaming` ; son autotest est joue ici (onze
+/// cas, dont : aucun statut, dernier rouge, vert trop vieux, auteur inconnu,
+/// API en panne, arbre different).
+#[test]
+fn le_controleur_exige_le_vert_de_la_sentinelle_avant_les_tags() {
+    autotest("porte-sentinelle-streaming.sh", 11);
+    autotest("sentinelle-streaming/sentinelle.sh", 7);
+
+    let controleur = workflow("release-controller.yml");
+    let porte = controleur
+        .find("- name: Exiger le vert de la sentinelle de streaming")
+        .expect("l'etape de la sentinelle a disparu du controleur");
+    let tags = controleur
+        .find("- name: Creer les quatre tags")
+        .expect("l'etape des tags a disparu");
+    assert!(
+        porte < tags,
+        "la porte de la sentinelle doit preceder la pose des tags"
+    );
+    // L'etape seule : jusqu'a la suivante, pas jusqu'aux tags.
+    let fin = controleur[porte + 1..]
+        .find("\n      - name: ")
+        .map(|i| porte + 1 + i)
+        .unwrap_or(tags);
+    let etape = &controleur[porte..fin];
+    assert!(
+        etape.contains(
+            r#"bash scripts/porte-sentinelle-streaming.sh renesenses/tune-server-rust "$GITHUB_SHA" "$SENTINELLE_SHA""#
+        ),
+        "la porte ne verifie plus le SHA candidat"
+    );
+    assert!(
+        etape.contains("bash scripts/porte-sentinelle-streaming.sh --autotest"),
+        "l'autotest de la porte n'est plus joue avant elle"
+    );
+    // Le contournement reste reserve, motive et trace.
+    assert!(etape.contains(r#"[ "$ACTEUR" != renesenses ]"#));
+    assert!(etape.contains(r#"[ "${#MOTIF}" -lt 10 ]"#));
+    assert!(etape.contains("SENTINELLE CONTOURNEE"));
+    assert!(etape.contains(".sentinelle = {contournee: true"));
+    // Ni `continue-on-error`, ni `if:` qui sauterait l'etape.
+    assert!(!etape.contains("continue-on-error"));
+    assert!(
+        !etape.lines().any(|l| l.trim_start().starts_with("if:")),
+        "l'etape de la sentinelle ne doit pas pouvoir etre sautee"
+    );
+}

@@ -907,6 +907,7 @@ impl DlnaOutput {
     /// répondeur SSDP sans privilège sur le port 1900. Aucun appelant de
     /// production : les défauts sont [`redecouverte::PORT_SSDP`] et
     /// [`redecouverte::BUDGET_REPONSE`].
+    #[cfg(test)]
     pub(crate) fn with_redecouverte(self, port_ssdp: u16, budget: std::time::Duration) -> Self {
         self.redecouverte
             .port_ssdp
@@ -2755,20 +2756,20 @@ impl OutputTarget for DlnaOutput {
                 // then audio/L16) if we have not tried it yet.
                 if !tried_fallback {
                     tried_fallback = true;
-                    if let Some(fb) = fallback_mime_from_sink(&sink) {
-                        if !fb.eq_ignore_ascii_case(&attempt_mime) {
-                            warn!(
-                                device = %self.name,
-                                advertised_mime = %attempt_mime,
-                                fallback_mime = %fb,
-                                sink = ?sink,
-                                "dlna_set_uri_714_pcm_fallback_retry"
-                            );
-                            attempt_mime = fb;
-                            mime_est_un_alias = false;
-                            replis += 1;
-                            continue;
-                        }
+                    if let Some(fb) = fallback_mime_from_sink(&sink)
+                        && !fb.eq_ignore_ascii_case(&attempt_mime)
+                    {
+                        warn!(
+                            device = %self.name,
+                            advertised_mime = %attempt_mime,
+                            fallback_mime = %fb,
+                            sink = ?sink,
+                            "dlna_set_uri_714_pcm_fallback_retry"
+                        );
+                        attempt_mime = fb;
+                        mime_est_un_alias = false;
+                        replis += 1;
+                        continue;
                     }
                 }
             }
@@ -4010,17 +4011,9 @@ pub struct RendererCapabilities {
     pub aac: bool,
     pub mp3: bool,
     pub dsd: bool,
-    /// #4573 — le nombre de canaux le plus élevé que le Sink ANNONCE, tous
-    /// formats confondus (`audio/L16;rate=…;channels=2`).
-    ///
-    /// `None` quand aucune entrée ne porte `channels=` : c'est « on ne sait
-    /// pas », et surtout pas « deux ». La différence commande tout : on ne
-    /// réduit une piste multicanale que sur une déclaration, jamais sur une
-    /// ignorance.
-    ///
-    /// Mesuré par Xavier Joly le 20/09/2026 sur un Denon AVR-X1600H : LPCM
-    /// annoncé en `channels=1` et `channels=2` seulement, `audio/flac:*` sans
-    /// `channels=` — un FLAC 5.1 n'y passera jamais tel quel.
+    /// Maximum des valeurs explicites, tous formats confondus, pour le
+    /// diagnostic uniquement. Ce résumé ne limite pas un format : la lecture
+    /// utilise `advertised_channels_for_mime` sur les entrées du Sink.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canaux_max: Option<u16>,
     /// Raw Sink entries, for an advanced/debug view.
@@ -4060,6 +4053,38 @@ pub fn canaux_annonces_par_le_sink(sink: &[String]) -> Option<u16> {
         }
     }
     max
+}
+
+/// Limite annoncée pour le format servi, sans emprunter celle d'un autre
+/// codec. Un FLAC sans `channels=` reste inconnu même si le LPCM est stéréo.
+pub fn advertised_channels_for_mime(sink: &[String], mime: &str) -> Option<u16> {
+    let normalize = |mime: &str| {
+        mime.trim()
+            .to_ascii_lowercase()
+            .replace("audio/x-", "audio/")
+    };
+    let mime = normalize(mime);
+    sink.iter()
+        .filter_map(|entry| {
+            let fields: Vec<_> = entry.splitn(4, ':').collect();
+            if fields.len() != 4 || !fields[0].eq_ignore_ascii_case("http-get") {
+                return None;
+            }
+            let mut parameters = fields[2].split(';');
+            if normalize(parameters.next()?) != mime {
+                return None;
+            }
+            parameters
+                .filter_map(|parameter| {
+                    let (name, value) = parameter.trim().split_once('=')?;
+                    if !name.trim().eq_ignore_ascii_case("channels") {
+                        return None;
+                    }
+                    value.trim().parse::<u16>().ok().filter(|n| *n > 0)
+                })
+                .max()
+        })
+        .max()
 }
 
 /// Pure Sink → capabilities mapping (unit-tested; `probe_capabilities` wraps it
@@ -4131,7 +4156,12 @@ fn protocol_sink_supports_mime(mime: &str, protocols: &[String]) -> bool {
     for proto in protocols {
         let fields: Vec<&str> = proto.split(':').collect();
         if fields.len() >= 3 {
-            let proto_mime = fields[2].trim().to_lowercase();
+            let proto_mime = fields[2]
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
             if proto_mime == mime_lower || proto_mime == mime_alt || proto_mime == "*" {
                 return true;
             }
@@ -6117,7 +6147,7 @@ mod canaux_annonces_4573 {
     /// Le Sink relevé par Xavier Joly sur le Denon AVR-X1600H (20/09/2026) :
     /// LPCM en 1 et 2 canaux, FLAC sans `channels=`.
     #[test]
-    fn le_denon_de_xavier_annonce_deux_canaux_au_plus() {
+    fn sink_summary_reports_highest_explicit_count() {
         let sink = v(&[
             "http-get:*:audio/L16;rate=44100;channels=1:*",
             "http-get:*:audio/L16;rate=44100;channels=2:*",
@@ -6128,7 +6158,10 @@ mod canaux_annonces_4573 {
         assert_eq!(canaux_annonces_par_le_sink(&sink), Some(2));
         let caps = renderer_caps_from_sink(sink);
         assert_eq!(caps.canaux_max, Some(2));
-        assert!(caps.flac, "le FLAC reste annoncé — mais en deux canaux");
+        assert!(
+            caps.flac,
+            "le FLAC est annoncé, sans précision sur ses canaux"
+        );
     }
 
     /// 🔴 Aucune entrée ne porte `channels=` : c'est « on ne sait pas », et la
@@ -6167,5 +6200,36 @@ mod canaux_annonces_4573 {
     fn la_casse_et_les_espaces_ne_trompent_pas_la_lecture() {
         let sink = v(&["HTTP-GET:*:AUDIO/L16;RATE=44100; CHANNELS=6 :*"]);
         assert_eq!(canaux_annonces_par_le_sink(&sink), Some(6));
+    }
+}
+
+#[cfg(test)]
+mod multichannel_7275 {
+    use super::advertised_channels_for_mime;
+
+    #[test]
+    fn lpcm_limit_does_not_cap_flac() {
+        let sink = [
+            "http-get:*:audio/L16;rate=48000;channels=2:*".into(),
+            "http-get:*:audio/flac:*".into(),
+            "http-get:*:audio/mp4:DLNA.ORG_PN=AAC_MULT5_ISO".into(),
+        ];
+        assert_eq!(advertised_channels_for_mime(&sink, "audio/flac"), None);
+        assert_eq!(advertised_channels_for_mime(&sink, "audio/L16"), Some(2));
+    }
+
+    #[test]
+    fn each_codec_keeps_its_channels_and_aliases() {
+        let sink = [
+            "http-get:*:audio/L24;channels=8:*".into(),
+            "http-get:*:audio/x-flac; channels = 2 :*".into(),
+            "http-get:*:AUDIO/FLAC;CHANNELS=6:*".into(),
+            "http-get:*:audio/flac:profil;channels=16".into(),
+            "http-get:*:video/flac;channels=32:*".into(),
+            "rtsp-rtp-udp:*:audio/flac;channels=64:*".into(),
+        ];
+        assert_eq!(advertised_channels_for_mime(&sink, "audio/flac"), Some(6));
+        assert_eq!(advertised_channels_for_mime(&sink, "audio/L24"), Some(8));
+        assert_eq!(advertised_channels_for_mime(&sink, "audio/wav"), None);
     }
 }

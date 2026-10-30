@@ -55,7 +55,7 @@ fn nom_83(nom: &str, dossier: bool) -> String {
 
 fn enregistrement(nom: &[u8], extent: u32, longueur: u32, dossier: bool, su: &[u8]) -> Vec<u8> {
     let mut base = 33 + nom.len();
-    if nom.len() % 2 == 0 {
+    if nom.len().is_multiple_of(2) {
         base += 1;
     }
     let mut total = base + su.len();

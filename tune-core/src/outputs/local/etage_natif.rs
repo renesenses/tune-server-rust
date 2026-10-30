@@ -110,6 +110,7 @@ pub(super) struct EtageNatif<'a> {
     /// ([`EtageNatif::avec_l_adaptation_des_canaux`]). `None` : aucun
     /// déplacement de voie, comme avant.
     adaptation: Option<AdaptationNative<'a>>,
+    publication: Option<&'a std::sync::Mutex<Option<TransformationsReelles>>>,
 }
 
 impl<'a> EtageNatif<'a> {
@@ -140,6 +141,27 @@ impl<'a> EtageNatif<'a> {
             pure_bypass,
             mono_downmix,
             adaptation: None,
+            publication: None,
+        }
+    }
+
+    /// #7093 — le format réellement ouvert, puis le verdict PCM/DoP de
+    /// chaque bloc, sont publiés vers la zone sans changer les mots rendus.
+    #[cfg(any(target_os = "windows", test))]
+    pub(super) fn avec_publication(
+        mut self,
+        creneau: &'a std::sync::Mutex<Option<TransformationsReelles>>,
+    ) -> Self {
+        self.publication = Some(creneau);
+        self.publier();
+        self
+    }
+
+    fn publier(&self) {
+        if let Some(creneau) = self.publication
+            && let Ok(mut slot) = creneau.lock()
+        {
+            *slot = Some(self.transformations());
         }
     }
 
@@ -252,6 +274,7 @@ impl<'a> EtageNatif<'a> {
 
         self.must_classify_24_bit = false;
         self.dop_latched = prepared.dop;
+        self.publier();
         let vivant = self.pousser_les_mots(&prepared.samples, puits);
         self.en_attente.drain(..aligned_len);
         let trames_source = (aligned_len / frame_bytes) as u64;
@@ -386,6 +409,7 @@ impl<'a> EtageNatif<'a> {
                 self.en_attente.clear();
                 self.must_classify_24_bit = suivante.profondeur() == ProfondeurPcm::Entier24;
                 self.dop_latched = false;
+                self.publier();
                 Ok(())
             }
         }
@@ -422,14 +446,15 @@ impl<'a> EtageNatif<'a> {
     /// que `local_dsp_runtime_state` le décrit — appliqué, ou contourné par
     /// DoP, par le bypass pur, ou inactif.
     pub(super) fn transformations(&self) -> TransformationsReelles {
-        let dsp_actif = local_dsp_runtime_state(
+        let dsp_actif = dsp_touche_le_signal(
+            self.spec.canaux(),
+            &AtomicBool::new(self.dop_latched),
+            self.pure_bypass,
             self.eq,
             self.convolver,
             self.crossfeed,
-            self.pure_bypass,
             self.mono_downmix,
-            self.dop_latched,
-        ) == OutputDspState::Applied;
+        );
         // #6247 — une matrice de réaffectation appliquée touche le signal,
         // même règle que `EtageDeConversion::dsp_actif`.
         let canaux = self.spec.canaux();
@@ -477,7 +502,9 @@ pub(super) fn spec_du_puits_natif_vers(source: AudioSpec, voies: u16) -> AudioSp
 /// jamais regarder la frontière de trame.
 pub(super) fn mots_natifs_du_bloc(bloc: BlocPcm<'_>) -> Vec<i32> {
     bloc.octets()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|mot| i32::from_le_bytes([mot[0], mot[1], mot[2], mot[3]]))
         .collect()
 }
@@ -813,7 +840,7 @@ mod tests {
         let force_silent = AtomicBool::new(false);
         let mut puits =
             PuitsAnneauNatif::sur(anneau.clone(), spec, &stop_rx, &paused, &force_silent);
-        let mots: Vec<i32> = (0..16).map(|i| (i as i32 - 8) << 8).collect();
+        let mots: Vec<i32> = (0..16).map(|i| (i - 8) << 8).collect();
         let bloc: Vec<u8> = mots.iter().flat_map(|m| m.to_le_bytes()).collect();
         assert!(puits.ecrire(spec.bloc(&bloc)));
         let mut lus = vec![0i32; 16];

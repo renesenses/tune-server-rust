@@ -506,7 +506,10 @@ pub mod fsm;
 pub const ECHECS_SONDAGE_DETAILLES: u32 = 5;
 
 mod etat;
+mod tune_tested_auto;
 use etat::*;
+
+pub mod logo_de_lancement;
 
 /// Retrouver en base la station qui joue, a partir du `source_id` du
 /// now-playing.
@@ -517,10 +520,10 @@ pub(crate) fn station_du_now_playing(
     repo: &crate::db::radio_repo::RadioRepo,
     source_id: &str,
 ) -> Option<crate::db::radio_repo::RadioStation> {
-    if let Ok(id) = source_id.parse::<i64>() {
-        if let Ok(Some(station)) = repo.get(id) {
-            return Some(station);
-        }
+    if let Ok(id) = source_id.parse::<i64>()
+        && let Ok(Some(station)) = repo.get(id)
+    {
+        return Some(station);
     }
     // Et par URL de flux, qui est ce que le chemin de lecture normal écrit :
     // `POST /radios/{id}/play/{zone_id}` pose `source_id: Some(radio.url)`.
@@ -556,6 +559,7 @@ pub(crate) fn vignette_du_pas_radio(
 }
 
 pub struct PositionPoller {
+    observateur_tune_tested: std::sync::Mutex<crate::cloud::tune_tested_auto::Observateur>,
     orchestrator: Arc<PlaybackOrchestrator>,
     playback: Arc<PlaybackManager>,
     outputs: Arc<Mutex<OutputRegistry>>,
@@ -632,6 +636,7 @@ impl PositionPoller {
         shared_metrics: PollerMetricsMap,
     ) -> Self {
         Self {
+            observateur_tune_tested: std::sync::Mutex::default(),
             orchestrator,
             playback,
             outputs,
@@ -1119,6 +1124,9 @@ mod volume_pure_5695_tests;
 
 /// #6233 — radio sur sortie locale : le contrat de signal relu à chaque tour.
 mod contrat_radio_locale_6233;
+mod etat_air_6912;
+#[cfg(test)]
+mod etat_air_6912_tests;
 /// #6739 — un relevé du volume de l'appareil ne remonte jamais la consigne.
 mod releve_ne_monte_pas_6739;
 /// #6739 — ses témoins, sur le vrai sondeur et le vrai orchestrateur.
@@ -1320,6 +1328,11 @@ mod bascule_des_niveaux_tests {
 /// station qui n'expose aucune API de now-playing.
 #[cfg(test)]
 mod repli_logo_station_tests;
+
+/// #7051 — une station jouée depuis l'annuaire, hors de « Mes radios », garde
+/// son logo quand le premier titre du flux arrive (Radio Bergeijk, fil 2443).
+#[cfg(test)]
+mod logo_de_lancement_7051_tests;
 
 /// Garde-fou #1998 : c'est le poller qui LIBÈRE l'annonce d'une zone
 /// navigateur.
@@ -1546,3 +1559,9 @@ mod annonce_du_contrat_de_signal_4559;
 /// et rejoue les deux coupures du journal, plus la contre-garde.
 #[cfg(test)]
 mod arret_dementi_par_la_position_6717;
+
+#[cfg(test)]
+mod cohabitation_airplay_tests_7259;
+
+#[cfg(test)]
+mod fin_upnp_6634_tests;

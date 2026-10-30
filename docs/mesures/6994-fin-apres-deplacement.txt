@@ -1,0 +1,28 @@
+#6994 — un relevé de position périmé après un déplacement local ne vote pas
+pour une fin de piste pendant la grâce de déplacement.
+
+Le détecteur position_past_end comptait encore ses votes pendant cette grâce,
+contrairement aux détecteurs voisins (fin exclusive, horloge, renderer figé).
+Il respecte désormais la même garde ; la branche commune remet son compteur
+à zéro pendant la grâce. Les règles de déplacement audio ne sont pas modifiées.
+
+Témoin du vrai PositionPoller.tick sur sortie locale factice : une piste de
+277 081 ms jouée près de sa fin, recul vers 269 081 ms, relevé périmé à
+281 081 ms. Ce relevé est au-delà de la durée mais reste dans la marge de
+15 secondes du filtre de position fantôme ; il atteint donc le détecteur
+visé. Pendant la grâce locale, aucun vote ne doit être compté et le titre
+reste en lecture. Sans déplacement, les trois sondages de fin arrêtent
+encore la file vide.
+
+Contre-épreuve compilable : retirer uniquement !in_seek_grace au détecteur,
+conserver les tests : témoin rouge « #6994 : aucun vote de fin ne doit être
+retenu pendant la grâce », 1 au lieu de 0 ; contrôle de fin normale vert.
+Restauration par copie : 6 tests de position après déplacement et 4 tests
+de déplacement/enchaînement #4682 verts. Garde des temporaires 3/3, rustfmt et diff-check réussis.
+
+Limite : le journal Linux original n'est pas joint à l'issue ; on ne connaît
+pas ses valeurs de position/durée. Ce banc reproduit un défaut du détecteur
+compatible avec sa chaîne seek_local_output_recreating_stream puis
+position_past_end_advancing/auto_next. Il ne prouve pas la provenance du
+relevé périmé chez ce testeur et ne corrige pas tous les déplacements possibles.
+Aucune sortie audio réelle ni service de streaming sollicités.

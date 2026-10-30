@@ -50,6 +50,9 @@ pub(crate) enum Famille {
     /// Un marquage du SERVICE, oui ou non, sans valeur à saisir — #5530,
     /// « généré par IA » (Qobuz).
     Marquage,
+    /// #6285 — un verdict hi-res choisi dans une liste fermée : `verifie`,
+    /// `conforme`, `douteux`, `non_analyse`.
+    VerdictHiRes,
 }
 
 impl Famille {
@@ -81,6 +84,7 @@ impl Famille {
             // « non » d'abord : c'est la règle demandée (« pas d'IA »), et
             // l'éditeur part sur le premier opérateur.
             Famille::Marquage => &["is_false", "is_true"],
+            Famille::VerdictHiRes => &["=", "!="],
         }
     }
 }
@@ -175,6 +179,9 @@ pub(crate) const CRITERES: &[Critere] = &[
     // la piste. Seuls les contenus de SERVICE le portent : une piste de la
     // bibliothèque n'est jamais marquée.
     deux("ai_generated", Famille::Marquage),
+    // #6285 — « Verdict hi-res » : celui du badge de l'album dans une
+    // collection, celui de la piste dans une playlist (`hires_verifications`).
+    deux("hires_verdict", Famille::VerdictHiRes),
     // --- Propres aux PISTES ---
     Critere {
         collection: None,
@@ -210,6 +217,7 @@ impl Famille {
             Famille::Favori => "favorite",
             Famille::Etiquette => "tag_ref",
             Famille::Marquage => "marquage",
+            Famille::VerdictHiRes => "hires_verdict",
         }
     }
 }
@@ -277,6 +285,7 @@ pub(crate) mod tests {
             (Famille::Favori, _) => json!("track"),
             (Famille::Etiquette, _) => json!("7"),
             (Famille::Marquage, _) => Value::Null,
+            (Famille::VerdictHiRes, _) => json!("verifie"),
             (Famille::Texte | Famille::Vide, _) => json!("x"),
         }
     }
@@ -670,17 +679,18 @@ pub(crate) mod tests {
         );
     }
 
-    /// Le compte du client : trente-quatre définitions, dont trente-deux aux
+    /// Le compte du client : trente-cinq définitions, dont trente-trois aux
     /// collections (#5530 : « Généré par IA » ; #6123 : « Note de la piste » ;
     /// #6121 : « Artiste de l'album » ; #6124 : « Année de sortie originale »
-    /// et « Version » ; #6232 : « Interprète »). Si ce nombre bouge,
+    /// et « Version » ; #6232 : « Interprète » ; #6285 : « Verdict hi-res »,
+    /// que `smartRegles.ts` n'a pas encore). Si ce nombre bouge,
     /// `smartRegles.ts` doit bouger aussi.
     #[test]
     fn le_tableau_a_la_taille_de_celui_du_client() {
-        assert_eq!(CRITERES.len(), 34);
+        assert_eq!(CRITERES.len(), 35);
         assert_eq!(
             CRITERES.iter().filter(|c| c.collection.is_some()).count(),
-            32
+            33
         );
     }
     // ---------------------------------------------------------------------
@@ -1287,3 +1297,7 @@ mod anciennes_regles {
         assert_eq!(vus, 16, "le gel ne porte plus ses seize jeux de règles");
     }
 }
+
+#[cfg(test)]
+#[path = "criteres_hires_6285_tests.rs"]
+mod hires_6285;

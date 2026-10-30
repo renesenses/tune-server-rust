@@ -1274,6 +1274,10 @@ use super::{ArmedNext, ZonePollState};
 /// Ce qui fait passer [`EtatDeLecture`] d'une variante à l'autre. Le numéro
 /// est celui de la ligne dans la table du document ; la ligne `tick.rs:`
 /// est le site où `tick` l'appelle.
+// `TransitionDetectee` répète le nom de l'enum, mais ce nom est écrit tel quel
+// dans le journal (`transition_inattendue … transition={t:?}`) et dans la table
+// de docs/refonte/ref9-etats-du-sondeur.md : le renommer changerait les deux.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Transition {
     /// 1 — génération changée : tout est rabattu (bloc

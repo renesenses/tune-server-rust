@@ -777,3 +777,94 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod portee_repertoires_7283 {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use tune_core::db::backend::ToSqlValue;
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    #[tokio::test]
+    async fn deux_racines_du_meme_album_restent_dans_le_repertoire_selectionne_7283() {
+        let racines = if cfg!(windows) {
+            [
+                r"C:\disque\Musique",
+                r"D:\nas\Musique",
+                r"C:\disque\Musique bis",
+            ]
+        } else {
+            ["/disque/Musique", "/nas/Musique", "/disque/Musique bis"]
+        };
+        let sep = std::path::MAIN_SEPARATOR;
+        let config = crate::config::TuneConfig {
+            music_dirs: racines.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        };
+        let state = crate::state::AppState::new(":memory:", 0, config).unwrap();
+        let backend = &state.backend;
+        backend
+            .execute(
+                "INSERT INTO artists (id, name) VALUES (1, 'Artiste 7283')",
+                &[],
+            )
+            .unwrap();
+        for (indice, racine) in racines.iter().enumerate() {
+            let id = indice as i64 + 1;
+            backend.execute(
+                "INSERT INTO albums (id, title, artist_id, folder_path) VALUES (?1, 'Même album 7283', 1, ?2)",
+                &[&id as &dyn ToSqlValue, &format!("{racine}{sep}Album")],
+            ).unwrap();
+            for numero in 1..=2i64 {
+                backend.execute(
+                    "INSERT INTO tracks (title, album_id, artist_id, album_artist, file_path, source, track_number, disc_number, duration_ms, format, sample_rate, bit_depth) VALUES ('Même piste', ?1, 1, 'Artiste 7283', ?2, 'local', ?3, 1, 1000, 'flac', 44100, 16)",
+                    &[&id as &dyn ToSqlValue, &format!("{racine}{sep}Album{sep}{numero:02}.flac"), &numero],
+                ).unwrap();
+            }
+        }
+        let settings = SettingsRepo::with_backend(backend.clone());
+        for option in ["false", "true"] {
+            settings
+                .set("library_dedup_same_root_only", option)
+                .unwrap();
+            for (indice, folder) in racines.iter().enumerate() {
+                let attendu = indice as i64 + 1;
+                let uri = format!(
+                    "/albums-detailed?folder={}&limit=1&offset=0",
+                    urlencoding::encode(folder)
+                );
+                let response = super::super::router()
+                    .with_state(state.clone())
+                    .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{uri}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let data: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    data["total"], 1,
+                    "#7283 : la sélection de {folder} compte des albums d'une autre racine ; option={option}, réponse={data}"
+                );
+                assert_eq!(
+                    data["items"].as_array().unwrap().len(),
+                    1,
+                    "#7283 : album répété ; {data}"
+                );
+                assert_eq!(
+                    data["items"][0]["album_id"], attendu,
+                    "#7283 : album hors du répertoire sélectionné ; {data}"
+                );
+                assert_eq!(
+                    data["items"][0]["track_count"], 2,
+                    "#7283 : pistes des autres racines agrégées ; {data}"
+                );
+            }
+        }
+        // Aucun filtre : trois entrées distinctes, le témoin ne doit pas
+        // masquer globalement les copies pour faire réussir la portée.
+        let data = super::lire_les_cartes(&state, super::FacetQuery::default());
+        assert_eq!(data["total"], json!(3));
+    }
+}

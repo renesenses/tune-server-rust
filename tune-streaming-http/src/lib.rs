@@ -230,6 +230,7 @@ fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) ->
                 tune_core::TuneError::NotFound(_) => "not_found",
                 tune_core::TuneError::Config(_) => "config",
                 tune_core::TuneError::Unsupported(_) => "unsupported",
+                tune_core::TuneError::Credentials(_) => "credentials",
                 tune_core::TuneError::Other(_) => "other",
             };
             let message = e.to_string();
@@ -1513,8 +1514,35 @@ async fn service_auth(
                     "error": &err_msg,
                 }),
             );
-            (StatusCode::BAD_REQUEST, err_msg).into_response()
+            reponse_echec_auth(&service, &e)
         }
+    }
+}
+
+/// Code rendu par `POST /streaming/{service}/auth` quand le service REFUSE les
+/// identifiants (renesenses/tune-server-rust#7068). Le client le traduit.
+pub const CODE_IDENTIFIANTS_REFUSES: &str = "invalid_credentials";
+
+/// La réponse d'un échec de connexion.
+///
+/// Un refus d'identifiants ([`tune_core::TuneError::Credentials`]) rend un
+/// corps JSON STRUCTURÉ — `{"code":"invalid_credentials","service":…,"error":…}`
+/// — au lieu du texte brut de l'erreur du service (Qobuz recopiait son JSON :
+/// `qobuz login: 401 {"status":"error",…}`). Le statut reste 400, comme avant :
+/// 401 serait lu par le client comme une session perdue. Toute autre erreur
+/// garde le texte brut, comme avant.
+fn reponse_echec_auth(service: &str, e: &tune_core::TuneError) -> Response {
+    match e {
+        tune_core::TuneError::Credentials(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": CODE_IDENTIFIANTS_REFUSES,
+                "service": service,
+                "error": message,
+            })),
+        )
+            .into_response(),
+        autre => (StatusCode::BAD_REQUEST, autre.to_string()).into_response(),
     }
 }
 
@@ -4581,5 +4609,43 @@ mod tests_labels_6934 {
         let (s, _) = service("sans-label-6934", false);
         let (statut, _) = appel(s, "/sans-label-6934/labels/1").await;
         assert_eq!(statut, StatusCode::NOT_IMPLEMENTED);
+    }
+}
+
+/// renesenses/tune-server-rust#7068 — l'échec d'une connexion rend un corps
+/// STRUCTURÉ pour un refus d'identifiants, et garde le texte brut pour le reste.
+///
+/// Contre-épreuve : faire rendre le texte brut au bras `Credentials` de
+/// `reponse_echec_auth` fait rougir `refus_d_identifiants_rend_un_code`.
+#[cfg(test)]
+mod tests_echec_de_connexion_7068 {
+    use super::*;
+
+    async fn corps(r: Response) -> (StatusCode, String) {
+        let statut = r.status();
+        let octets = axum::body::to_bytes(r.into_body(), 64 * 1024)
+            .await
+            .expect("corps lisible");
+        (statut, String::from_utf8_lossy(&octets).into_owned())
+    }
+
+    #[tokio::test]
+    async fn refus_d_identifiants_rend_un_code() {
+        let e = tune_core::TuneError::Credentials("qobuz login: invalid credentials".into());
+        let (statut, texte) = corps(reponse_echec_auth("qobuz", &e)).await;
+        // 400 comme avant : un 401 serait lu par le client comme une session perdue.
+        assert_eq!(statut, StatusCode::BAD_REQUEST);
+        let v: Value = serde_json::from_str(&texte).expect("le corps doit être du JSON structuré");
+        assert_eq!(v["code"], CODE_IDENTIFIANTS_REFUSES);
+        assert_eq!(v["service"], "qobuz");
+        assert!(!texte.contains("Invalid username"), "{texte}");
+    }
+
+    #[tokio::test]
+    async fn les_autres_echecs_gardent_leur_texte() {
+        let e = tune_core::TuneError::Other("qobuz login: 500 boom".into());
+        let (statut, texte) = corps(reponse_echec_auth("qobuz", &e)).await;
+        assert_eq!(statut, StatusCode::BAD_REQUEST);
+        assert_eq!(texte, "qobuz login: 500 boom");
     }
 }

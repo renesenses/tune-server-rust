@@ -46,6 +46,10 @@ mod genres;
 // fonction, pour que « Genres » et « Genres écoutés » se comparent.
 pub(crate) use genres::genres_de_l_album;
 pub(crate) mod identification_lot;
+// `pub` pour le témoin d'intégration de #6845 seulement : une nuit simulée,
+// horloge donnée, contre un faux MusicBrainz.
+#[doc(hidden)]
+pub use identification_lot::nuit::{Horloge, un_tour_de_veille_avec};
 mod ingest;
 /// `GET /library/labels` et les logos Qobuz des labels (#6736).
 mod labels;

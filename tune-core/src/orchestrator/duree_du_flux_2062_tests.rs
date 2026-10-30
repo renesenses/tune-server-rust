@@ -165,7 +165,9 @@ fn flac(secondes: u32) -> Vec<u8> {
 fn m4a(secondes: u32) -> Vec<u8> {
     let pcm = pcm_16_bits(8_000, 1, secondes);
     let echantillons: Vec<i32> = pcm
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])))
         .collect();
     let m4a = crate::audio::alac_encoder::encode_alac_m4a(&echantillons, 16, 1, 8_000).unwrap();

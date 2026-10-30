@@ -1,5 +1,6 @@
 //! Audit complet et strict, sans conversion ni décodeur externe. Refs #6286.
 mod priorite;
+pub mod rappel;
 use serde::{Deserialize, Serialize};
 use std::{fs::File, path::Path};
 use symphonia::core::{

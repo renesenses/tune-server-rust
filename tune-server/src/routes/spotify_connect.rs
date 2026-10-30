@@ -33,8 +33,27 @@ async fn statut_complet(state: &AppState) -> Value {
             )),
         );
     }
+    // #6946 — la raison du plafond, dans la langue de l'interface.
+    if let Some(qualite) = statut.get_mut("quality").and_then(Value::as_object_mut) {
+        let debit = qualite
+            .get("bitrate_kbps")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            .to_string();
+        qualite.insert(
+            "reason".into(),
+            json!(crate::message_api::texte(
+                CLE_RAISON_DU_PLAFOND,
+                &[("bitrate", debit)]
+            )),
+        );
+        qualite.insert("reason_key".into(), json!(CLE_RAISON_DU_PLAFOND));
+    }
     statut
 }
+
+/// #6946 — la phrase qui dit pourquoi Spotify plafonne à l'Ogg Vorbis.
+pub(crate) const CLE_RAISON_DU_PLAFOND: &str = "spotify.quality.librespotCeiling";
 
 #[derive(Deserialize)]
 struct CorpsLectureExperimentale {
@@ -294,5 +313,41 @@ mod tests {
         .await;
         assert_eq!(corps["lecture_experimentale"], false);
         assert!(!tune_core::streaming::spotify_lecture::lecture_activee(&db));
+    }
+
+    /// #6946 — Réglages › Spotify lit ici la qualité réellement reçue, et sa
+    /// raison dans la langue de l'interface, au lieu d'un réglage qui laissait
+    /// croire au sans-perte.
+    #[tokio::test]
+    async fn spotify_6946_le_statut_dit_la_qualite_recue_et_pourquoi() {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let app = crate::routes::router_with_plugins(state, Vec::new());
+        let (statut, corps) =
+            appel(&app, "GET", "/api/v1/spotify-connect/status?lang=fr", None).await;
+        assert_eq!(statut, StatusCode::OK);
+        let q = &corps["quality"];
+        assert_eq!(q["format"], "Ogg Vorbis", "{corps}");
+        assert_eq!(q["bitrate_kbps"], 320, "{corps}");
+        assert_eq!(q["lossless"], false, "{corps}");
+        assert_eq!(q["ceiling"], true, "{corps}");
+        assert_eq!(q["reason_code"], "librespot_no_lossless", "{corps}");
+        assert_eq!(q["reason_key"], super::CLE_RAISON_DU_PLAFOND, "{corps}");
+        let raison = q["reason"].as_str().unwrap_or_default();
+        assert!(
+            raison.contains("Ogg Vorbis") && raison.contains("320 kbit/s"),
+            "la raison nomme le format et le débit : {raison}"
+        );
+        assert!(
+            raison.contains("librespot"),
+            "la raison nomme librespot : {raison}"
+        );
+
+        let (_, corps) = appel(&app, "GET", "/api/v1/spotify-connect/status?lang=en", None).await;
+        assert!(
+            corps["quality"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("Spotify only delivers Ogg Vorbis")),
+            "en anglais pour une interface anglaise : {corps}"
+        );
     }
 }

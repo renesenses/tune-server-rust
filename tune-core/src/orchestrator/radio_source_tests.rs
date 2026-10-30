@@ -325,3 +325,172 @@ fn radio_6821_lecture_de_l_entete_icy_br() {
         assert_eq!(debit_icy(illisible), None, "« {illisible} »");
     }
 }
+
+// ---------------------------------------------------------------------------
+// #7200 — Café del Mar (fil forum 2476, rc8.1 macOS)
+// ---------------------------------------------------------------------------
+//
+// Le vrai flux, `https://streams.radio.co/se1a320b47/listen`, vérifié le
+// 27/10/2026 : HTTP 200, `audio/mpeg`, `icy-br: 192`, `icy-name: Café del Mar
+// Radio`. Ces en-têtes sont REJOUÉS ici par une station locale ; la vraie
+// n'est jamais contactée. S'y ajoutent les deux formes soupçonnées d'arrêter
+// la lecture : une redirection avant le flux (l'adresse publique de radio.co
+// est un point d'entrée) et l'en-tête `icy-br` répété. Le corps est un MP3
+// 192 kbit/s, 44,1 kHz, comme celui de la station.
+
+/// Le chemin public du flux, sans extension, comme sur radio.co.
+const CAFE_DEL_MAR_CHEMIN: &str = "/se1a320b47/listen";
+
+/// Quatre secondes de MP3 192 kbit/s : la fixture (MPEG-1 couche III,
+/// en-tête `FFFBB000` : 192 kbit/s, 44,1 kHz), puis ses trames répétées sans
+/// leur étiquette ID3. Construit une seule fois pour tout le témoin.
+fn mp3_192_en_boucle() -> &'static [u8] {
+    static CORPS: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    CORPS.get_or_init(|| {
+        let fixture: &[u8] = include_bytes!("../../tests/fixtures/test.mp3");
+        let premiere_trame = fixture
+            .windows(2)
+            .position(|w| w == [0xFF, 0xFB])
+            .expect("la fixture MP3 a une trame");
+        assert_eq!(
+            &fixture[premiere_trame..premiere_trame + 3],
+            &[0xFF, 0xFB, 0xB0],
+            "la fixture doit rester un MP3 192 kbit/s à 44,1 kHz, comme le flux"
+        );
+        let mut corps = fixture.to_vec();
+        for _ in 0..3 {
+            corps.extend_from_slice(&fixture[premiere_trame..]);
+        }
+        corps
+    })
+}
+
+/// La station rejouée : `CAFE_DEL_MAR_CHEMIN` répond par une redirection
+/// quand `redirige`, sinon directement par le flux, avec les en-têtes réels.
+async fn station_cafe_del_mar(redirige: bool) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    let corps = mp3_192_en_boucle();
+    let flux = move || async move {
+        let mut h = HeaderMap::new();
+        h.insert("content-type", HeaderValue::from_static("audio/mpeg"));
+        // `icy-br` répété : deux lignes, comme le renvoient certains relais.
+        h.append("icy-br", HeaderValue::from_static("192"));
+        h.append("icy-br", HeaderValue::from_static("192"));
+        // Le nom porte un « é » : un octet hors ASCII dans un en-tête.
+        h.insert(
+            "icy-name",
+            HeaderValue::from_bytes("Café del Mar Radio".as_bytes()).unwrap(),
+        );
+        h.insert("icy-pub", HeaderValue::from_static("1"));
+        (h, corps)
+    };
+    let mut app = axum::Router::new().route("/relais/se1a320b47/listen", axum::routing::get(flux));
+    app = if redirige {
+        app.route(
+            CAFE_DEL_MAR_CHEMIN,
+            axum::routing::get(|| async {
+                (
+                    StatusCode::FOUND,
+                    [("location", "/relais/se1a320b47/listen")],
+                )
+            }),
+        )
+    } else {
+        app.route(CAFE_DEL_MAR_CHEMIN, axum::routing::get(flux))
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}{CAFE_DEL_MAR_CHEMIN}",
+        listener.local_addr().unwrap()
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, server)
+}
+
+/// Décode la station rejouée vers une sortie factice — un canal que le test
+/// vide, aucun périphérique audio — jusqu'à `secondes` de PCM 16 bits
+/// stéréo à 44,1 kHz, puis raccroche. Rend les octets reçus, l'issue du
+/// décodeur et la source publiée sur la session.
+async fn decoder_cafe_del_mar(
+    redirige: bool,
+    secondes: usize,
+) -> (usize, Result<(), String>, Option<RadioSourceInfo>) {
+    let (url, server) = station_cafe_del_mar(redirige).await;
+    let streamer = AudioStreamer::new(8080);
+    let (id, _tx_de_la_session, data_ready, session) = streamer
+        .create_radio_session(
+            StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate: 44_100,
+                bit_depth: 16,
+                channels: 2,
+                ..Default::default()
+            },
+            8,
+        )
+        .await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let decodeur = tokio::task::spawn_blocking(move || {
+        decode_radio_stream_to_pcm(url, tx, data_ready, session, None, None, false, None)
+    });
+    let voulu = secondes * 44_100 * 2 * 2;
+    let mut recu = 0usize;
+    let lecture = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while recu < voulu {
+            match rx.recv().await {
+                Some(bloc) => recu += bloc.len(),
+                None => break,
+            }
+        }
+    })
+    .await;
+    // La sortie factice raccroche : le décodeur doit s'arrêter de lui-même.
+    drop(rx);
+    let issue = tokio::time::timeout(std::time::Duration::from_secs(10), decodeur)
+        .await
+        .expect("le décodeur s'arrête quand la sortie raccroche")
+        .unwrap();
+    assert!(
+        lecture.is_ok(),
+        "décodage trop lent : {recu} octets en 30 s"
+    );
+    let source = streamer
+        .stream_output_wire(&id)
+        .await
+        .and_then(|w| w.radio_source);
+    server.abort();
+    streamer.remove_session(&id).await;
+    (recu, issue, source)
+}
+
+/// #7200 — les en-têtes réels de Café del Mar, avec ou sans redirection
+/// devant le flux, donnent trois secondes de PCM décodé, le format MP3 et le
+/// débit annoncé de 192 kbit/s. Témoin : si l'un de ces en-têtes ou la
+/// redirection arrêtait la lecture côté serveur, `recu` resterait à zéro et
+/// l'issue du décodeur nommerait l'étape fautive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn radio_7200_cafe_del_mar_se_decode_avec_ses_en_tetes_reels() {
+    for redirige in [false, true] {
+        let (recu, issue, source) = decoder_cafe_del_mar(redirige, 3).await;
+        assert_eq!(
+            issue,
+            Ok(()),
+            "Café del Mar (redirection : {redirige}) : le décodeur a échoué"
+        );
+        assert!(
+            recu >= 3 * 44_100 * 4,
+            "Café del Mar (redirection : {redirige}) : {recu} octets de PCM, \
+             moins de trois secondes — la station resterait muette"
+        );
+        let source = source.expect("la source de la station est publiée");
+        assert_eq!(source.format, Some("mp3"), "redirection : {redirige}");
+        assert_eq!(source.sample_rate, Some(44_100), "redirection : {redirige}");
+        assert_eq!(
+            source.bitrate_kbps,
+            Some(192),
+            "Café del Mar (redirection : {redirige}) : `icy-br: 192` répété doit \
+             donner 192 kbit/s"
+        );
+    }
+}

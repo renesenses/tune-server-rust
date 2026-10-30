@@ -190,6 +190,10 @@ pub fn plage_du_dossier(engine: Engine, expr: &str, p_bas: &str, p_haut: &str) -
 /// Le repli de clé n'est pas cosmétique : il est ce qui rend le résultat
 /// **identique** à la boucle de `COUNT(*) … LIKE` qu'il remplace, moteur par
 /// moteur. Voir la note « La casse » de [`compter_pistes_par_sous_dossier`].
+/// `(file_path, album_artist, artiste de la piste)` d'une piste voisine
+/// (voir [`TrackRepo::siblings_album_artists`]).
+pub type ArtistesDeVoisin = (String, Option<String>, Option<String>);
+
 #[derive(Debug, Default, Clone)]
 pub struct ComptesParSousDossier {
     comptes: HashMap<String, i64>,
@@ -2082,11 +2086,13 @@ fn maintenant_epoch() -> f64 {
 ///
 /// #4546 tient : la ligne n'est écrite QU'UNE fois (`INSERT OR IGNORE` /
 /// `ON CONFLICT DO NOTHING`), une retouche ultérieure ne la change plus.
+// Seuls les témoins la lisent seule ; la production passe par `dates_du_fichier`.
+#[cfg(test)]
 fn premiere_vue_du_fichier(chemin: &str, mtime_du_scan: Option<f64>, maintenant: f64) -> f64 {
     dates_du_fichier(chemin, mtime_du_scan, maintenant).0
 }
 
-/// La première vue ([`premiere_vue_du_fichier`]) et la date de CRÉATION d'un
+/// La première vue (`premiere_vue_du_fichier`) et la date de CRÉATION d'un
 /// fichier, d'une seule lecture du disque (#5402).
 ///
 /// La création est le btime tel quel, borné à `maintenant` ; `None` quand le
@@ -2174,17 +2180,21 @@ impl TrackRepo {
             .query_one(&sql, &params)
             .map_err(TuneError::Db)?
             .as_ref()
-            .map(row_to_track))
+            .map(|cols| row_to_track(cols)))
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Track>, TuneError> {
-        self.get_inner(id).map_err(TuneError::from)
+        self.get_inner(id)
     }
 
     pub fn get_by_path(&self, file_path: &str) -> Result<Option<Track>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_path, sql::get_by_path);
         let params: [&dyn ToSqlValue; 1] = [&file_path];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(|cols| row_to_track(cols)))
     }
 
     /// Le dossier `dossier` contient-il au moins une piste, à n'importe quelle
@@ -2365,7 +2375,7 @@ impl TrackRepo {
         );
         let params: [&dyn ToSqlValue; 3] = [&d.motif, &d.separateur, &d.prefixe];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     fn marqueurs2(&self) -> (&'static str, &'static str) {
@@ -2403,7 +2413,11 @@ impl TrackRepo {
     ) -> Result<Option<Track>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_cue_identity, sql::get_by_cue_identity);
         let params: [&dyn ToSqlValue; 2] = [&cue_media_path, &cue_start_ms];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(|cols| row_to_track(cols)))
     }
 
     /// Les fichiers image que les pistes CUE de la base référencent.
@@ -2508,7 +2522,7 @@ impl TrackRepo {
     }
 
     pub fn create(&self, track: &Track) -> Result<i64, TuneError> {
-        self.create_inner(track).map_err(TuneError::from)
+        self.create_inner(track)
     }
 
     fn update_inner(&self, track: &Track) -> Result<(), TuneError> {
@@ -2570,7 +2584,7 @@ impl TrackRepo {
     }
 
     pub fn update(&self, track: &Track) -> Result<(), TuneError> {
-        self.update_inner(track).map_err(TuneError::from)
+        self.update_inner(track)
     }
 
     /// [`Self::update`] d'une piste DISTANTE (b209) : les numéros de disque et
@@ -2719,7 +2733,7 @@ impl TrackRepo {
         );
         let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     /// Chemin NON facetté de `GET /library/tracks` : mêmes lignes et même
@@ -2733,7 +2747,7 @@ impl TrackRepo {
         let sql = self.sql_list_visible(&sql::select_track());
         let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     /// #5138 — [`Self::list_visible`] ET son total, le `WHERE` évalué UNE fois.
@@ -2784,7 +2798,7 @@ impl TrackRepo {
         )?;
         let mut par_id: HashMap<i64, Track> = hydratees
             .iter()
-            .map(row_to_track)
+            .map(|cols| row_to_track(cols))
             .filter_map(|t| t.id.map(|id| (id, t)))
             .collect();
         Ok(ids.iter().filter_map(|id| par_id.remove(id)).collect())
@@ -3161,7 +3175,7 @@ impl TrackRepo {
         let all_refs: Vec<&dyn ToSqlValue> =
             all_params.iter().map(|v| v as &dyn ToSqlValue).collect();
         let rows = self.db.query_many(&data_sql, &all_refs)?;
-        Ok((rows.iter().map(row_to_track).collect(), total))
+        Ok((rows.iter().map(|cols| row_to_track(cols)).collect(), total))
     }
 
     pub fn update_mtime_and_size(
@@ -3209,7 +3223,7 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::list_by_album, sql::list_by_album);
         let params: [&dyn ToSqlValue; 1] = [&album_id];
         let rows = self.db.query_many_strong(&sql, &params)?;
-        let mut pistes: Vec<Track> = rows.iter().map(row_to_track).collect();
+        let mut pistes: Vec<Track> = rows.iter().map(|cols| row_to_track(cols)).collect();
         ordonner_pistes_d_un_album(&mut pistes);
         Ok(pistes)
     }
@@ -3261,7 +3275,7 @@ impl TrackRepo {
             .join(",");
         let sql = format!("{} WHERE t.id IN ({id_list})", sql::select_track());
         let rows = self.db.query_many_strong(&sql, &[])?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     /// Les identifiants de TOUTES les pistes, croissants — l'ensemble exact
@@ -3392,7 +3406,7 @@ impl TrackRepo {
         let sql = base.replacen(" ORDER BY", &format!("{extra} ORDER BY"), 1);
         let params: [&dyn ToSqlValue; 1] = [&album_id];
         let rows = self.db.query_many_strong(&sql, &params)?;
-        let mut pistes: Vec<Track> = rows.iter().map(row_to_track).collect();
+        let mut pistes: Vec<Track> = rows.iter().map(|cols| row_to_track(cols)).collect();
         // #6222 — la décision se prend sur l'album ENTIER : la fiche filtrée
         // est une sous-suite de la fiche, dans le même ordre.
         if pistes.len() > 1 && self.album_entier_en_ordre_de_fichiers(album_id)? {
@@ -3405,7 +3419,7 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
         let params: [&dyn ToSqlValue; 1] = [&artist_id];
         let rows = self.db.query_many_strong(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Track>, TuneError> {
@@ -3451,7 +3465,7 @@ impl TrackRepo {
             &offset,
         ];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     /// Le nombre de pistes que [`Self::search_page`] parcourrait, borné à
@@ -3481,7 +3495,11 @@ impl TrackRepo {
     pub fn find_by_path(&self, path: &str) -> Result<Option<Track>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_path, sql::get_by_path);
         let params: [&dyn ToSqlValue; 1] = [&path];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(|cols| row_to_track(cols)))
     }
 
     /// `(file_path, album_artist, artiste de la piste)` of every track whose
@@ -3493,7 +3511,7 @@ impl TrackRepo {
     pub fn siblings_album_artists(
         &self,
         dir_prefix: &str,
-    ) -> Result<Vec<(String, Option<String>, Option<String>)>, TuneError> {
+    ) -> Result<Vec<ArtistesDeVoisin>, TuneError> {
         let ph = match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(1),
             Engine::Postgres => PostgresDialect.placeholder(1),
@@ -3547,7 +3565,7 @@ impl TrackRepo {
         );
         let params: [&dyn ToSqlValue; 2] = [&like, &limit];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     pub fn exists_by_audio_hash_and_album(
@@ -3761,7 +3779,7 @@ impl TrackRepo {
         );
         let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     /// Hydrate tracks for `ids`, **in the caller's order**, duplicates kept.
@@ -4245,7 +4263,7 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::list_unidentified, sql::list_unidentified);
         let params: [&dyn ToSqlValue; 1] = [&limit];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     pub fn get_waveform(&self, track_id: i64) -> Result<Option<String>, TuneError> {
@@ -4414,7 +4432,7 @@ impl TrackRepo {
             sql::select_track()
         );
         let rows = self.db.query_many(&sql, &[])?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     /// #6168 — la sélection à part qu'annonçait le commentaire ci-dessus :
@@ -4563,7 +4581,13 @@ impl TrackRepo {
     /// clefant sur `(condensat, Option<cue_start_ms>)` (#3998). Cette
     /// fonction-ci n'a pas cette clef ; tant qu'elle ne l'a pas, elle ne doit
     /// pas voir les pistes CUE.
+    ///
+    /// #6917 — option `library_dedup_same_root_only` allumée, une copie ne se
+    /// replie que sur une copie de la MÊME racine de musique
+    /// ([`crate::library::dedoublonnage_par_racine`]) : le disque et le NAS
+    /// gardent chacun leur entrée. Éteinte, rien ne change.
     pub fn deduplicate(&self) -> Result<i64, TuneError> {
+        let racines = crate::library::dedoublonnage_par_racine::racines_si_active(&*self.db);
         let rows = self.db.query_many(
             "SELECT id, audio_hash, file_path FROM tracks \
              WHERE source = 'local' AND audio_hash IS NOT NULL AND file_path IS NOT NULL \
@@ -4589,7 +4613,11 @@ impl TrackRepo {
             let mut representatives: Vec<(i64, String)> = Vec::new();
             for candidate in group {
                 let is_exact_duplicate = representatives.iter().any(|(_, representative)| {
-                    crate::scanner::hasher::files_are_byte_identical(
+                    crate::library::dedoublonnage_par_racine::repliable(
+                        &candidate.1,
+                        representative,
+                        racines.as_deref(),
+                    ) && crate::scanner::hasher::files_are_byte_identical(
                         std::path::Path::new(&candidate.1),
                         std::path::Path::new(representative),
                     )
@@ -4621,7 +4649,7 @@ impl TrackRepo {
     }
 }
 
-fn row_to_track(cols: &Vec<SqlValue>) -> Track {
+fn row_to_track(cols: &[SqlValue]) -> Track {
     Track {
         id: cols.first().and_then(|v| v.as_i64()),
         title: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
@@ -7182,9 +7210,12 @@ pub(crate) mod tests_b209_ordre_dans_l_album {
     use crate::db::sqlite::SqliteDb;
     use crate::db::track_repo::TrackRepo;
 
+    /// `(id, titre, disque, numéro, source)`.
+    pub(crate) type Piste = (i64, &'static str, Option<i64>, Option<i64>, &'static str);
+
     /// `(id, titre, disque, numéro, source)` — un album où disque et numéro
     /// sont tantôt dits, tantôt NULL, tantôt 0.
-    pub(crate) const PISTES: [(i64, &str, Option<i64>, Option<i64>, &str); 6] = [
+    pub(crate) const PISTES: [Piste; 6] = [
         (1, "Alive", Some(1), Some(3), "upnp"),
         (2, "Believer", Some(1), Some(1), "upnp"),
         (3, "Aaa sans numéro", None, None, "upnp"),

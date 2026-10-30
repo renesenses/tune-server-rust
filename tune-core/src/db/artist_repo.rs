@@ -680,7 +680,7 @@ impl ArtistRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_artist))
+            .map(|cols| row_to_artist(cols)))
     }
 
     pub fn get_by_name(&self, name: &str) -> Result<Option<Artist>, TuneError> {
@@ -690,7 +690,7 @@ impl ArtistRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_artist))
+            .map(|cols| row_to_artist(cols)))
     }
 
     pub fn get_by_musicbrainz_id(&self, mbid: &str) -> Result<Option<Artist>, TuneError> {
@@ -703,7 +703,7 @@ impl ArtistRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_artist))
+            .map(|cols| row_to_artist(cols)))
     }
 
     pub fn create(&self, artist: &Artist) -> Result<i64, TuneError> {
@@ -850,7 +850,7 @@ impl ArtistRepo {
         let lignes = self.db.query_many_strong(&sql, &params)?;
         Ok(lignes
             .iter()
-            .map(row_to_artist)
+            .map(|cols| row_to_artist(cols))
             .find(|a| cle_artiste(&a.name) == cle))
     }
 
@@ -1634,7 +1634,7 @@ impl ArtistRepo {
         let sql = self.dialect_sql(sql::search, sql::search);
         let params: [&dyn ToSqlValue; 4] = [&fts_query, &like, &limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_artist).collect())
+        Ok(rows.iter().map(|cols| row_to_artist(cols)).collect())
     }
 
     /// Le nombre d'artistes correspondants, borné à `plafond` — indépendant
@@ -1652,7 +1652,7 @@ impl ArtistRepo {
     }
 }
 
-fn row_to_artist(cols: &Vec<SqlValue>) -> Artist {
+fn row_to_artist(cols: &[SqlValue]) -> Artist {
     Artist {
         id: cols.first().and_then(|v| v.as_i64()),
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),

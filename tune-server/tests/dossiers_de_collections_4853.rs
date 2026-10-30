@@ -154,7 +154,8 @@ async fn creer_renommer_imbriquer_et_lire_l_arbre() {
         .iter()
         .map(|f| f["name"].as_str().unwrap())
         .collect();
-    assert_eq!(noms, ["Rock", "Jazz & Blues"]);
+    // #6779 : par nom tant que rien n'est rangé à la main, pas par création.
+    assert_eq!(noms, ["Jazz & Blues", "Rock"]);
     let h = trouver(&t["folders"], hard).unwrap();
     assert_eq!(h["depth"], 2);
     assert_eq!(h["parent_id"], rock);
@@ -421,4 +422,102 @@ async fn reordonner_et_retirer() {
         .map(|x| x["id"].as_i64().unwrap())
         .collect();
     assert_eq!(ids, [g, f]);
+}
+
+/// Les noms des dossiers d'un niveau de l'arbre servi, avec leur `position`.
+fn niveau(dossiers: &Value) -> Vec<(String, i64)> {
+    dossiers
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["name"].as_str().unwrap().to_string(),
+                d["position"].as_i64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// #6779 (Didier, fil 1907) — au niveau des RAYONS aussi : l'alphabétique
+/// par défaut, et un rayon (« Artistes Rock ») qui descend ou remonte par
+/// `POST …/{id}/move`, au rang lu dans l'arbre plus ou moins un. L'arbre dit
+/// l'ordre de chaque niveau (`folders_order`).
+#[tokio::test]
+async fn un_rayon_descend_et_l_alphabetique_reste_le_defaut_6779() {
+    let app = make_app();
+    let musique = dossier(&app, "Musique", None).await;
+    let rock = dossier(&app, "Artistes Rock", Some(musique)).await;
+    dossier(&app, "Classique", Some(musique)).await;
+    dossier(&app, "Baroque", Some(musique)).await;
+    dossier(&app, "Électro", None).await;
+
+    let t = arbre(&app).await;
+    assert_eq!(t["folders_order"], "alphabetical", "{t}");
+    assert_eq!(
+        niveau(&t["folders"]),
+        [("Électro".to_string(), 0), ("Musique".to_string(), 1)],
+        "la racine doit sortir par nom, sans casse ni accents"
+    );
+    let m = trouver(&t["folders"], musique).unwrap();
+    assert_eq!(m["folders_order"], "alphabetical");
+    assert_eq!(
+        niveau(&m["folders"]),
+        [
+            ("Artistes Rock".to_string(), 0),
+            ("Baroque".to_string(), 1),
+            ("Classique".to_string(), 2),
+        ]
+    );
+
+    // Descendre « Artistes Rock » d'un cran : son rang + 1.
+    let rang = trouver(&t["folders"], rock).unwrap()["position"]
+        .as_i64()
+        .unwrap();
+    let (st, body) = with_json(
+        &app,
+        "POST",
+        &format!("{BASE}/{rock}/move"),
+        json!({"parent_id": musique, "position": rang + 1}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["position"], 1, "{body}");
+    let t = arbre(&app).await;
+    let m = trouver(&t["folders"], musique).unwrap();
+    assert_eq!(m["folders_order"], "manual", "{m}");
+    assert_eq!(
+        niveau(&m["folders"]),
+        [
+            ("Baroque".to_string(), 0),
+            ("Artistes Rock".to_string(), 1),
+            ("Classique".to_string(), 2),
+        ],
+        "« Artistes Rock » doit être descendu d'un cran"
+    );
+    assert_eq!(
+        t["folders_order"], "alphabetical",
+        "ranger un niveau ne touche pas les autres"
+    );
+
+    // Un rayon créé ensuite dans ce niveau rangé à la main va à la fin.
+    dossier(&app, "Ambient", Some(musique)).await;
+    let t = arbre(&app).await;
+    let m = trouver(&t["folders"], musique).unwrap();
+    let noms: Vec<String> = niveau(&m["folders"]).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(noms, ["Baroque", "Artistes Rock", "Classique", "Ambient"]);
+
+    // Et le remonter : rang - 1.
+    let (st, body) = with_json(
+        &app,
+        "POST",
+        &format!("{BASE}/{rock}/move"),
+        json!({"parent_id": musique, "position": 0}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let t = arbre(&app).await;
+    let m = trouver(&t["folders"], musique).unwrap();
+    let noms: Vec<String> = niveau(&m["folders"]).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(noms, ["Artistes Rock", "Baroque", "Classique", "Ambient"]);
 }

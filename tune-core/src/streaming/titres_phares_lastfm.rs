@@ -183,11 +183,11 @@ fn decouper_version(titre: &str) -> (String, bool) {
             base.push(c);
         }
     }
-    if let Some(i) = base.find(" - ") {
-        if a_un_marqueur(&base[i..]) {
-            alt = true;
-            base.truncate(i);
-        }
+    if let Some(i) = base.find(" - ")
+        && a_un_marqueur(&base[i..])
+    {
+        alt = true;
+        base.truncate(i);
     }
     (base, alt)
 }

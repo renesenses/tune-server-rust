@@ -713,6 +713,15 @@ impl Drop for Banc {
 /// qui recopie l'annonce du simulateur toutes les 20 ms, comme le ferait
 /// le broadcast.
 async fn banc(annonce: super::protocole::Annonce, activee: bool) -> Banc {
+    banc_avec_bornes(annonce, activee, reglages::BornesDb::PAR_DEFAUT).await
+}
+
+/// #6918 — le même banc, avec une course du curseur réglée.
+async fn banc_avec_bornes(
+    annonce: super::protocole::Annonce,
+    activee: bool,
+    bornes: reglages::BornesDb,
+) -> Banc {
     let sim = Simulateur::demarrer(annonce, None).await;
     let ecoute = Ecoute::nouvelle();
     let drapeau = Arc::new(AtomicBool::new(activee));
@@ -723,6 +732,7 @@ async fn banc(annonce: super::protocole::Annonce, activee: bool) -> Banc {
             Arc::new(move || d.load(Ordering::SeqCst))
         },
         indice_source: Arc::new(move || indice.load(Ordering::SeqCst)),
+        bornes_db: Arc::new(move || bornes),
         ports: Ports {
             annonces: 0,
             ampli: sim.adresse.port(),
@@ -1028,6 +1038,7 @@ async fn air_le_fournisseur_n_ecoute_rien_tant_que_l_option_est_desactivee() {
             Arc::new(move || d.load(Ordering::SeqCst))
         },
         indice_source: Arc::new(|| 9),
+        bornes_db: Arc::new(|| reglages::BornesDb::PAR_DEFAUT),
         ports: Ports {
             annonces: port,
             ..Ports::AIR
@@ -1058,3 +1069,6 @@ async fn air_le_fournisseur_n_ecoute_rien_tant_que_l_option_est_desactivee() {
     assert!(!f.ecoute().en_ecoute(), "option désactivée : écoute fermée");
     drop(sim);
 }
+
+#[path = "volume_db_6918_tests.rs"]
+mod volume_db_6918;

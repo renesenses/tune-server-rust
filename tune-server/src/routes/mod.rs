@@ -85,6 +85,8 @@ pub mod sacd_rip;
 pub mod scrobbler;
 pub mod search;
 pub mod sendspin;
+// #7148 — la sentinelle de streaming (résolution et décodage réels, sans son).
+pub mod sentinelle_streaming;
 pub mod service_tokens;
 pub mod setlistfm;
 pub mod shazam;
@@ -451,6 +453,7 @@ pub fn router_with_plugins(
         )
         .nest("/alarms", radios::alarms_router())
         .nest("/search", search::router())
+        .nest("/sentinelle", sentinelle_streaming::router())
         .nest("/devices", devices::router())
         // #5530 — sonde de diagnostic, réservée à l'administrateur : l'arbre
         // des clés de `album/get` / `track/get`, sans leurs valeurs.

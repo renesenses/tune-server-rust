@@ -131,12 +131,14 @@ fn le_budget_reste_court_devant_l_attente_deja_consentie_par_stop() {
     // `stop()` accepte 2 000 ms avant de détacher. Le budget d'ici s'y AJOUTE :
     // au-delà d'une seconde et demie, l'auditeur qui vient d'appuyer sur
     // Lecture croit que Tune ne répond plus.
-    assert!(
-        BUDGET_RELACHE_PERIPHERIQUE_MS <= 2_000,
-        "budget trop long : {BUDGET_RELACHE_PERIPHERIQUE_MS} ms s'ajoutent aux \
-         2 000 ms de `stop()`"
-    );
-    assert!(BUDGET_RELACHE_PERIPHERIQUE_MS >= PALIER_RELACHE_PERIPHERIQUE_MS);
+    // Deux constantes : vérifié à la compilation (#7154).
+    const {
+        assert!(
+            BUDGET_RELACHE_PERIPHERIQUE_MS <= 2_000,
+            "budget trop long : il s'ajoute aux 2 000 ms de `stop()`"
+        );
+        assert!(BUDGET_RELACHE_PERIPHERIQUE_MS >= PALIER_RELACHE_PERIPHERIQUE_MS);
+    }
 }
 
 // ---------------------------------------------------------------------------

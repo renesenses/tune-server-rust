@@ -44,6 +44,8 @@ pub(crate) struct EtatFaux {
     pub(crate) status_avant_arret: u32,
     /// #6115 — `Stop` ne mène jamais à l'état 0 (borne d'attente).
     pub(crate) n_arrete_jamais: bool,
+    /// #7244 — Play is acknowledged, but the ASIO engine stays stopped.
+    pub(crate) refuse_la_sortie: bool,
     restant_avant_arret: u32,
 }
 
@@ -143,7 +145,7 @@ fn repondre(etat: &mut EtatFaux, ligne: &str) -> String {
         return r#"<GetInfo name="HQPlayer Embedded" product="HQPlayer" version="5" />"#.into();
     }
     if ligne.starts_with("<Play ") || ligne.starts_with("<Play/") {
-        etat.etat = 2;
+        etat.etat = if etat.refuse_la_sortie { 0 } else { 2 };
     } else if ligne.starts_with("<Stop") {
         if etat.n_arrete_jamais || etat.status_avant_arret > 0 {
             etat.etat = 3;
@@ -298,7 +300,7 @@ async fn la_suivante_est_ajoutee_a_la_playlist_sans_l_interrompre() {
     assert_eq!(
         faux.recu(),
         vec![format!(
-            r#"<PlaylistAdd uri="{SUIVANTE}" queued="0" clear="0"></PlaylistAdd>"#
+            r#"<PlaylistAdd uri="{SUIVANTE}" queued="1" clear="0"></PlaylistAdd>"#
         )],
         "une seule commande : l'ajout de la suivante, sans vider ni relancer"
     );

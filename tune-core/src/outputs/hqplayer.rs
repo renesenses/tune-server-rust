@@ -30,6 +30,7 @@ const XML_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
 struct Control {
     stream: TcpStream,
     header_sent: bool,
+    pending: Vec<u8>,
 }
 
 /// Frame one command for the wire.
@@ -74,7 +75,12 @@ pub struct HqplayerOutput {
     /// avant de vider sa playlist. Un HQPlayer jamais sondé vaut `None`, et
     /// l'enchaînement d'avant le correctif reste celui-là.
     dernier_etat: Arc<std::sync::Mutex<Option<TransportState>>>,
+    /// Un acquittement a réellement été reçu : attendre ensuite sa réponse complète.
+    actions_acquittees: AtomicBool,
 }
+
+pub(crate) const CODE_ECHEC_DE_SORTIE: &str = "hqplayer_output_start_failed";
+pub(crate) const MESSAGE_ECHEC_DE_SORTIE: &str = "HQPlayer n'a pas pu ouvrir sa sortie. Vérifiez que le DAC n'est pas utilisé par une autre application.";
 
 /// #6115 — la borne d'attente de l'arrêt avant de lancer un autre titre.
 const ATTENTE_ARRET: std::time::Duration = std::time::Duration::from_secs(2);
@@ -167,6 +173,7 @@ impl HqplayerOutput {
             etat_inconnu_dit: Arc::new(AtomicBool::new(false)),
             enchainement: Arc::new(std::sync::Mutex::new(Enchainement::default())),
             dernier_etat: Arc::new(std::sync::Mutex::new(None)),
+            actions_acquittees: AtomicBool::new(false),
         }
     }
 
@@ -185,8 +192,8 @@ impl HqplayerOutput {
     /// La source de HQPlayer Control 6.0.1 montre que `Stop` est une commande
     /// à part, acquittée (`stopComplete`), et que l'état `3` (STOPREQ) précède
     /// l'arrêt effectif (`0`) : d'où l'attente sur `Status`, pas seulement
-    /// l'envoi. La borne dépassée n'est pas une erreur : le lancement suit,
-    /// et le journal le dit.
+    /// l'envoi. Une borne dépassée refuse le lancement suivant : continuer
+    /// réutiliserait un moteur dont l'arrêt n'a jamais été confirmé (#7244).
     async fn arreter_et_attendre(&self) -> Result<(), String> {
         self.action("<Stop />").await?;
         let debut = tokio::time::Instant::now();
@@ -210,7 +217,7 @@ impl HqplayerOutput {
                 }
                 Ok(Err(e)) => {
                     warn!(device = %self.name, error = %e, "hqplayer_arret_status_illisible");
-                    return Ok(());
+                    return Err(e);
                 }
                 Err(_) => {
                     // Réponse coupée en plein vol : la connexion ne doit pas
@@ -227,9 +234,12 @@ impl HqplayerOutput {
         warn!(
             device = %self.name,
             borne_ms = ATTENTE_ARRET.as_millis() as u64,
-            "hqplayer_arret_non_confirme — lancement sans arret rapporte par Status"
+            "hqplayer_arret_non_confirme — lancement refuse sans arret rapporte par Status"
         );
-        Ok(())
+        Err(
+            "hqplayer_stop_not_confirmed: HQPlayer did not stop before loading the next track"
+                .into(),
+        )
     }
 
     fn enchainement(&self) -> std::sync::MutexGuard<'_, Enchainement> {
@@ -305,90 +315,51 @@ impl HqplayerOutput {
         ports
     }
 
-    /// Get or establish a TCP connection to HQPlayer.
-    async fn get_connection(&self) -> Result<(), String> {
+    /// One request owns the socket through its complete XML reply. A timeout
+    /// abandons that connection, including partial or late replies (#7244).
+    async fn send_inner(&self, xml_body: &str, mode: PostWrite) -> Result<String, String> {
+        let expected = xml_root(xml_body).ok_or("hqplayer: invalid command XML")?;
         let mut conn = self.connection.lock().await;
-        if conn.is_some() {
-            return Ok(());
-        }
-        let addr = format!("{}:{}", self.host, self.port);
-        let stream =
-            tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr))
+        for attempt in 0..2 {
+            if conn.is_none() {
+                let addr = format!("{}:{}", self.host, self.port);
+                let stream = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    TcpStream::connect(&addr),
+                )
                 .await
                 .map_err(|_| format!("hqplayer connect timeout: {addr}"))?
                 .map_err(|e| format!("hqplayer connect failed {addr}: {e}"))?;
-        // Brand new stream: its XML declaration has not been written yet.
-        *conn = Some(Control {
-            stream,
-            header_sent: false,
-        });
-        Ok(())
-    }
-
-    /// Write an XML command over the persistent connection (reconnecting once on a
-    /// broken pipe), then apply `mode` to decide what happens after the write.
-    ///
-    /// This is the single place that owns the connection + one-reconnect logic, so
-    /// both the blocking QUERY path (`send_command`) and the fire-and-forget ACTION
-    /// path (`send_action`) share it — they differ only in `PostWrite`.
-    async fn send_inner(&self, xml_body: &str, mode: PostWrite) -> Result<String, String> {
-        let mut conn = self.connection.lock().await;
-
-        // Try to use existing connection, reconnect if needed
-        let control = match conn.as_mut() {
-            Some(c) => c,
-            None => {
-                drop(conn);
-                self.get_connection().await?;
-                conn = self.connection.lock().await;
-                conn.as_mut()
-                    .ok_or_else(|| "hqplayer: no connection after reconnect".to_string())?
+                *conn = Some(Control {
+                    stream,
+                    header_sent: false,
+                    pending: Vec::new(),
+                });
             }
-        };
-
-        // Framing depends on the connection we actually got: the declaration
-        // heads a fresh stream and is never repeated on an established one.
-        let message = frame_message(xml_body, control.header_sent);
-
-        // Raw protocol logging: exact bytes we put on the wire. Cheap, debug-level.
-        // Lets us learn v6 behavior from the field (v6 stays silent on actions).
-        debug!(
-            device = %self.name,
-            bytes = message.len(),
-            raw = %message.replace('\n', "\\n"),
-            "hqplayer_send"
-        );
-
-        // Send the command
-        if let Err(e) = control.stream.write_all(message.as_bytes()).await {
-            // Connection broken, drop it and retry once
-            *conn = None;
-            drop(conn);
-            self.get_connection().await?;
-            let mut conn2 = self.connection.lock().await;
-            let control2 = conn2
-                .as_mut()
-                .ok_or_else(|| "hqplayer: no connection after retry".to_string())?;
-            // Fresh stream after the reconnect: it needs the declaration again,
-            // so re-frame instead of replaying the bytes built for the old one.
-            let retry = frame_message(xml_body, control2.header_sent);
-            debug!(
-                device = %self.name,
-                bytes = retry.len(),
-                raw = %retry.replace('\n', "\\n"),
-                "hqplayer_send_retry"
-            );
-            control2
-                .stream
-                .write_all(retry.as_bytes())
-                .await
-                .map_err(|e2| format!("hqplayer write retry failed: {e}, then {e2}"))?;
-            control2.header_sent = true;
-            return post_write(&mut control2.stream, mode).await;
+            let control = conn.as_mut().expect("connected");
+            if !control.pending.iter().all(u8::is_ascii_whitespace) {
+                *conn = None;
+                return Err("hqplayer_control_unsolicited_response: reconnect required".into());
+            }
+            let message = frame_message(xml_body, control.header_sent);
+            debug!(device = %self.name, raw = %message.replace('\n', "\\n"), "hqplayer_send");
+            if let Err(e) = control.stream.write_all(message.as_bytes()).await {
+                *conn = None;
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(format!("hqplayer write failed: {e}"));
+            }
+            control.header_sent = true;
+            let result = post_write(control, mode, &expected).await;
+            // Silence is compatible with v6 actions, but retaining this socket
+            // would let a delayed v5 ack become the NEXT request's response.
+            if !result.as_ref().is_ok_and(|reply| !reply.is_empty()) {
+                *conn = None;
+            }
+            return result;
         }
-
-        control.header_sent = true;
-        post_write(&mut control.stream, mode).await
+        unreachable!("two write attempts")
     }
 
     /// Send an XML QUERY command and receive the (complete-XML) response.
@@ -397,30 +368,53 @@ impl HqplayerOutput {
         self.send_inner(xml_body, PostWrite::ReadResponse).await
     }
 
-    /// Fire-and-forget send for ACTION/transport commands.
-    ///
-    /// HQPlayer v4/v5 acknowledge transport commands (PlaylistAdd/Play/Pause/Stop/
-    /// Seek/Volume) with an XML reply; HQPlayer **6** accepts and executes them but
-    /// stays SILENT. So we must NOT block on a full response — doing so hits the 5s
-    /// `read_response` timeout on v6 and fails the whole play ("hqplayer read
-    /// timeout"). Instead we write the command and do a very short, non-fatal drain:
-    /// a v4/v5 ack is consumed (so it can't pollute the next `<Status/>` read), while
-    /// v6 silence simply times out — which we treat as SUCCESS.
+    /// Wait for the matching complete acknowledgement, never drain arbitrary
+    /// bytes. v6 silence remains supported by abandoning its silent socket.
     async fn send_action(&self, xml_body: &str) -> Result<(), String> {
-        let drained = self.send_inner(xml_body, PostWrite::DrainBrief).await?;
-        // Field telemetry: did v4/v5 ack, or is this a silent v6?
-        if drained.trim().is_empty() {
-            debug!(device = %self.name, cmd = %xml_body, "hqplayer_action_sent no_reply");
+        let wait = if self.actions_acquittees.load(Ordering::Relaxed) {
+            std::time::Duration::from_secs(5)
+        } else if xml_root(xml_body).as_deref() == Some("Stop") {
+            std::time::Duration::from_secs(2)
         } else {
-            debug!(
-                device = %self.name,
-                cmd = %xml_body,
-                bytes_back = drained.len(),
-                reply = %drained.trim(),
-                "hqplayer_action_sent"
-            );
+            std::time::Duration::from_millis(400)
+        };
+        let reply = self.send_inner(xml_body, PostWrite::Action(wait)).await?;
+        if reply.is_empty() {
+            debug!(device = %self.name, cmd = xml_body, "hqplayer_action_sent no_reply connection_abandoned");
+        } else {
+            self.actions_acquittees.store(true, Ordering::Relaxed);
+            if let Some(result) = extract_xml_attr(&reply, "result")
+                && !result.eq_ignore_ascii_case("OK")
+            {
+                return Err(format!("hqplayer_action_refused: {reply}"));
+            }
+            debug!(device = %self.name, cmd = xml_body, reply = %reply, "hqplayer_action_sent");
         }
         Ok(())
+    }
+
+    async fn attendre_le_demarrage(&self) -> Result<(), String> {
+        let limite = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let status = tokio::time::timeout_at(limite, self.get_status()).await;
+            match status {
+                Ok(Ok(status)) if status.state == TransportState::Playing => return Ok(()),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => break,
+                _ => {}
+            }
+            let reste = limite.saturating_duration_since(tokio::time::Instant::now());
+            if reste.is_zero() {
+                break;
+            }
+            tokio::time::sleep(SONDE_ARRET.min(reste)).await;
+        }
+        // A cancelled Status can still have its response in flight. Stop must
+        // use a fresh socket rather than consume that response as its own ack.
+        *self.connection.lock().await = None;
+        let _ = self.action("<Stop />").await;
+        *self.dernier_etat() = Some(TransportState::Stopped);
+        Err(format!("{CODE_ECHEC_DE_SORTIE}: {MESSAGE_ECHEC_DE_SORTIE}"))
     }
 
     /// Send a QUERY command, dropping connection on error (for next retry).
@@ -451,154 +445,112 @@ impl HqplayerOutput {
     }
 }
 
-/// What to do on the connection after an XML command has been written.
+/// Queries require a reply; silent actions are supported only on a socket
+/// which will be discarded before the next request.
 #[derive(Clone, Copy)]
 enum PostWrite {
-    /// Block until a complete XML document arrives (QUERY commands answer).
     ReadResponse,
-    /// Fire-and-forget: briefly drain + discard any ack; timeout == success
-    /// (ACTION/transport commands; v6 stays silent).
-    DrainBrief,
+    Action(std::time::Duration),
 }
 
-/// Apply the post-write behavior selected by `mode` to an established stream.
-async fn post_write(stream: &mut TcpStream, mode: PostWrite) -> Result<String, String> {
-    match mode {
-        PostWrite::ReadResponse => read_response(stream).await,
-        PostWrite::DrainBrief => drain_brief(stream).await,
-    }
-}
-
-/// Fire-and-forget drain for ACTION/transport commands (see `send_action`).
-///
-/// Waits a short window for a *possible* v4/v5 ack and discards it; a v6 renderer
-/// stays silent, so the first read simply times out and we return success with no
-/// bytes. When an ack does arrive we keep draining with tiny follow-up reads so a
-/// partial ack can never pollute the next `read_response` (e.g. a later
-/// `<Status/>`). Returns whatever bytes were drained, for logging only.
-async fn drain_brief(stream: &mut TcpStream) -> Result<String, String> {
-    let mut buf = vec![0u8; 8192];
-    let window = std::time::Duration::from_millis(400);
-
-    // First peek: wait up to `window` for a v4/v5 ack. v6 silence -> timeout -> OK.
-    let mut drained = match tokio::time::timeout(window, stream.read(&mut buf)).await {
-        Ok(Ok(0)) => return Err("hqplayer: connection closed".to_string()),
-        Ok(Ok(n)) => String::from_utf8_lossy(&buf[..n]).into_owned(),
-        Ok(Err(e)) => return Err(format!("hqplayer read error: {e}")),
-        Err(_) => return Ok(String::new()), // timeout == v6 silence == success
+async fn post_write(
+    control: &mut Control,
+    mode: PostWrite,
+    expected: &str,
+) -> Result<String, String> {
+    let wait = match mode {
+        PostWrite::ReadResponse => std::time::Duration::from_secs(5),
+        PostWrite::Action(wait) => wait,
     };
+    let reply = match tokio::time::timeout(
+        wait,
+        read_xml_frame(&mut control.stream, &mut control.pending),
+    )
+    .await
+    {
+        Ok(reply) => reply?,
+        Err(_) if matches!(mode, PostWrite::Action(_)) => return Ok(String::new()),
+        Err(_) => return Err("hqplayer read timeout".into()),
+    };
+    if xml_root(&reply).as_deref() != Some(expected) {
+        return Err(format!(
+            "hqplayer_control_reply_mismatch: expected {expected}, received {reply}"
+        ));
+    }
+    Ok(reply)
+}
 
-    // An ack arrived (v4/v5): drain any remaining bytes with tiny non-blocking
-    // follow-up reads so nothing is left in the socket for the next query.
-    let mop = std::time::Duration::from_millis(50);
+/// Locate ONE complete XML document, preserving following frames and UTF-8
+/// byte fragments. No inter-read timeout extension for a slow partial reply.
+fn xml_boundary(bytes: &[u8]) -> Option<usize> {
+    use quick_xml::{Reader, events::Event};
+    let mut reader = Reader::from_reader(bytes);
+    let mut depth = 0usize;
     loop {
-        match tokio::time::timeout(mop, stream.read(&mut buf)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => drained.push_str(&String::from_utf8_lossy(&buf[..n])),
-            Ok(Err(_)) => break,
-            Err(_) => break, // no more data queued
+        match reader.read_event().ok()? {
+            Event::Start(_) => depth += 1,
+            Event::Empty(_) if depth == 0 => return Some(reader.buffer_position() as usize),
+            Event::End(_) => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(reader.buffer_position() as usize);
+                }
+            }
+            Event::Eof => return None,
+            _ => {}
         }
     }
-    Ok(drained)
 }
 
-/// Read XML response from HQPlayer TCP stream.
-/// HQPlayer sends responses terminated by a closing XML tag.
-/// We read until we get a complete XML document or timeout.
-async fn read_response(stream: &mut TcpStream) -> Result<String, String> {
-    let mut buf = vec![0u8; 8192];
-    let mut response = String::new();
-    let timeout = std::time::Duration::from_secs(5);
-
+fn xml_root(xml: &str) -> Option<String> {
+    use quick_xml::{Reader, events::Event};
+    let mut reader = Reader::from_str(xml);
     loop {
-        let n = tokio::time::timeout(timeout, stream.read(&mut buf))
+        match reader.read_event().ok()? {
+            Event::Start(tag) | Event::Empty(tag) => {
+                return std::str::from_utf8(tag.name().as_ref())
+                    .ok()
+                    .map(str::to_owned);
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
+async fn read_xml_frame(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Result<String, String> {
+    let mut buf = [0u8; 8192];
+    loop {
+        if let Some(end) = xml_boundary(pending) {
+            let frame: Vec<_> = pending.drain(..end).collect();
+            return String::from_utf8(frame).map_err(|e| format!("hqplayer: invalid utf8: {e}"));
+        }
+        if pending.len() >= 1024 * 1024 {
+            return Err("hqplayer: XML response too large".into());
+        }
+        let n = stream
+            .read(&mut buf)
             .await
-            .map_err(|_| "hqplayer read timeout".to_string())?
             .map_err(|e| format!("hqplayer read error: {e}"))?;
-
         if n == 0 {
-            return Err("hqplayer: connection closed".to_string());
+            return Err("hqplayer: connection closed".into());
         }
-
-        response.push_str(
-            std::str::from_utf8(&buf[..n]).map_err(|e| format!("hqplayer: invalid utf8: {e}"))?,
-        );
-
-        // Check if we have a complete response (ends with a closing tag)
-        let trimmed = response.trim();
-        if is_complete_xml(trimmed) {
-            break;
-        }
+        pending.extend_from_slice(&buf[..n]);
     }
-
-    Ok(response)
 }
 
-/// Heuristic: XML response is complete when it ends with a closing tag whose
-/// name matches the first element opened in the document.
-/// Falls back to self-closing tag detection for simple responses.
-fn is_complete_xml(s: &str) -> bool {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
+async fn read_response(stream: &mut TcpStream) -> Result<String, String> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_xml_frame(stream, &mut Vec::new()),
+    )
+    .await
+    .map_err(|_| "hqplayer read timeout".to_string())?
+}
 
-    // Find the first real element (skip <?xml ...?> processing instruction)
-    let search = trimmed;
-    let mut pos = 0;
-    let root_tag: Option<&str> = loop {
-        match search[pos..].find('<') {
-            None => break None,
-            Some(offset) => {
-                let start = pos + offset;
-                if search[start..].starts_with("<?") {
-                    // Processing instruction -- skip past "?>"
-                    if let Some(end) = search[start..].find("?>") {
-                        pos = start + end + 2;
-                        continue;
-                    }
-                    break None;
-                }
-                // Extract tag name (stops at space, /, or >)
-                let after = &search[start + 1..];
-                let end = after
-                    .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
-                    .unwrap_or(after.len());
-                if end > 0 {
-                    break Some(&after[..end]);
-                }
-                break None;
-            }
-        }
-    };
-
-    match root_tag {
-        Some(tag) => {
-            // Check for self-closing root element
-            let open_tag_prefix = format!("<{}", tag);
-            if let Some(open_pos) = trimmed.find(&open_tag_prefix) {
-                let after_open = &trimmed[open_pos + open_tag_prefix.len()..];
-                // Find the end of this opening tag
-                if let Some(gt_pos) = after_open.find('>') {
-                    let before_gt = after_open[..gt_pos].trim_end();
-                    if before_gt.ends_with('/') {
-                        // Self-closing root: <Tag ... />
-                        // Complete only if this is at the end of the document
-                        let tag_end = open_pos + open_tag_prefix.len() + gt_pos + 1;
-                        return trimmed[tag_end..].trim().is_empty();
-                    }
-                }
-            }
-
-            // Check for matching closing tag at end
-            let close = format!("</{}>", tag);
-            trimmed.ends_with(&close)
-        }
-        None => {
-            // No root tag found, check generic self-closing
-            trimmed.ends_with("/>")
-        }
-    }
+#[cfg(test)]
+fn is_complete_xml(xml: &str) -> bool {
+    xml_boundary(xml.as_bytes()).is_some_and(|end| xml[end..].trim().is_empty())
 }
 
 /// Probe whether a given host:port speaks the HQPlayer control protocol.
@@ -772,7 +724,7 @@ impl OutputTarget for HqplayerOutput {
         // et un `Play` sur un moteur qui joue ne change rien (pont LMS, moteur
         // 6.0.4). L'enchaînement sans blanc (#4851) ne passe pas par ici
         // (`set_next_media`, `clear="0"`) et n'est pas touché.
-        let etat = *self.dernier_etat();
+        let etat = Some(self.get_status().await?.state);
         if matches!(
             etat,
             Some(TransportState::Playing | TransportState::Paused | TransportState::Transitioning)
@@ -783,8 +735,9 @@ impl OutputTarget for HqplayerOutput {
             })?;
         }
 
-        // ACTION commands go through the fire-and-forget path: HQPlayer 6 executes
-        // transport commands but sends NO reply, so blocking on a response would
+        // Match complete action acknowledgements when present. HQPlayer 6 can
+        // execute an action silently; that socket is then abandoned so a late
+        // acknowledgement cannot answer the next command. Waiting indefinitely would
         // hit the 5s read timeout and fail the play. `action` writes and only
         // briefly drains any v4/v5 ack. See `send_action` for the full rationale.
         //
@@ -820,7 +773,7 @@ impl OutputTarget for HqplayerOutput {
             e
         })?;
 
-        Ok(())
+        self.attendre_le_demarrage().await
     }
 
     async fn pause(&self) -> Result<(), String> {
@@ -830,8 +783,11 @@ impl OutputTarget for HqplayerOutput {
     }
 
     async fn resume(&self) -> Result<(), String> {
+        if self.get_status().await?.state == TransportState::Playing {
+            return Ok(());
+        }
         self.action("<Play />").await?;
-        Ok(())
+        self.attendre_le_demarrage().await
     }
 
     async fn stop(&self) -> Result<(), String> {
@@ -996,8 +952,9 @@ fn playlist_add_xml(media: &PlayMedia<'_>, clear: bool) -> String {
         format!("<metadata{etiquettes} />")
     };
     format!(
-        r#"<PlaylistAdd uri="{}" queued="0" clear="{}">{metadonnees}</PlaylistAdd>"#,
+        r#"<PlaylistAdd uri="{}" queued="{}" clear="{}">{metadonnees}</PlaylistAdd>"#,
         escape_xml(media.url),
+        if clear { 0 } else { 1 },
         if clear { 1 } else { 0 }
     )
 }
@@ -1112,7 +1069,7 @@ mod tests {
         };
         assert_eq!(
             playlist_add_xml(&media, false),
-            r#"<PlaylistAdd uri="http://h/s.flac" queued="0" clear="0"></PlaylistAdd>"#
+            r#"<PlaylistAdd uri="http://h/s.flac" queued="1" clear="0"></PlaylistAdd>"#
         );
     }
 
@@ -1157,3 +1114,7 @@ pub(crate) mod enchainement_tests_4851;
 #[cfg(test)]
 #[path = "hqplayer_lancement_tests_6115.rs"]
 mod lancement_tests_6115;
+
+#[cfg(test)]
+#[path = "hqplayer_controle_tests_7244.rs"]
+mod controle_tests_7244;

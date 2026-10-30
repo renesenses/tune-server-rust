@@ -1372,7 +1372,6 @@ pub(crate) mod fabrique {
         for (i, s) in secteurs.iter().enumerate() {
             ecrire_a(LSN_AUDIO + i as u32, s);
         }
-        drop(ecrire_a);
         // Un secteur de bourrage en fin d'image, comme la zone de sortie
         // d'un disque : la dernière trame ne touche pas la fin du fichier.
         let fin = u64::from(audio.1 + 2) * TAILLE_SECTEUR as u64;

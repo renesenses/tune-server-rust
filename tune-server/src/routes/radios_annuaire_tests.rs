@@ -250,3 +250,249 @@ fn une_fiche_rapprochee_par_le_nom_seul_ne_prete_pas_son_logo() {
     // Lié à une fiche sortie de l'annuaire : aucun repli par l'adresse.
     assert_eq!(index.lien(Some("S999001"), "FIP", &fip.stream_url), None);
 }
+
+// ── #7177 (web#2443) — les flux d'une fiche, et le flux préféré ─────────────
+
+const FIP_MIDFI: &str = "https://icecast.radiofrance.fr/fip-midfi.mp3?id=radiofrance";
+
+#[test]
+fn les_flux_proposes_d_une_fiche_v2_portent_format_et_debit_le_principal_d_abord() {
+    let f = fiches();
+    let fip = f.iter().find(|s| s.name == "FIP").unwrap();
+    let flux = fip.flux_proposes();
+    assert_eq!(flux.len(), 4, "{flux:?}");
+    assert_eq!(flux[0].url, fip.stream_url);
+    assert!(flux[0].primary);
+    assert_eq!(flux.iter().filter(|x| x.primary).count(), 1);
+    let mp3 = flux.iter().find(|x| x.url == FIP_MIDFI).unwrap();
+    assert_eq!(
+        (mp3.codec.as_deref(), mp3.bitrate, mp3.sample_rate, mp3.hls),
+        (Some("MP3"), Some(128), Some(48000), false)
+    );
+}
+
+#[test]
+fn une_entree_v1_propose_son_seul_flux_sans_format() {
+    let v1 = serde_json::json!([{"name": "X", "stream_url": "https://x.example/s"}]);
+    let f = annuaire_depuis_json(v1.as_array().unwrap());
+    let flux = f[0].flux_proposes();
+    assert_eq!(flux.len(), 1);
+    assert_eq!(flux[0].url, "https://x.example/s");
+    assert!(flux[0].primary);
+    assert_eq!((flux[0].codec.as_deref(), flux[0].bitrate), (None, None));
+}
+
+#[test]
+fn le_flux_prefere_se_choisit_parmi_ceux_de_la_fiche_avec_son_format() {
+    let f = fiches();
+    let fip = f.iter().find(|s| s.name == "FIP").unwrap();
+    let mut st = station(1, "FIP", &fip.stream_url);
+    assert!(poser_le_flux_prefere(fip, &mut st, FIP_MIDFI));
+    assert_eq!(st.url, FIP_MIDFI);
+    assert_eq!((st.codec.as_deref(), st.bitrate), (Some("mp3"), Some(128)));
+    // Le rattrapage de fond (#7043) le garde : la fiche le publie toujours.
+    assert!(!crate::routes::radios::flux_a_poser(
+        &f,
+        &mut st,
+        Some("S000973")
+    ));
+    assert_eq!(st.url, FIP_MIDFI);
+}
+
+#[test]
+fn contre_epreuve_une_adresse_qui_n_est_pas_de_la_fiche_ne_change_rien() {
+    let f = fiches();
+    let fip = f.iter().find(|s| s.name == "FIP").unwrap();
+    let mut st = station(1, "FIP", &fip.stream_url);
+    assert!(!poser_le_flux_prefere(
+        fip,
+        &mut st,
+        "https://ailleurs.example/fip.mp3"
+    ));
+    assert_eq!(st.url, fip.stream_url);
+    assert_eq!((st.codec.as_deref(), st.bitrate), (None, None));
+}
+
+/// #7194 (web#2400) — la carte des radios fait ses réseaux des mots-clés de
+/// la fiche (le diffuseur) : `/radios/directory` doit les rendre.
+#[test]
+fn l_annuaire_rend_les_mots_cles_de_chaque_fiche_pour_les_reseaux_de_la_carte() {
+    let f = fiches();
+    let etat = EtatAnnuaire::default();
+    let corps = corps_annuaire(&f, &[], &FiltresAnnuaire::default(), &etat);
+    let items = corps["items"].as_array().unwrap();
+    let fip = items
+        .iter()
+        .find(|i| i["external_id"] == "S000973")
+        .unwrap();
+    assert_eq!(
+        fip["keywords"],
+        serde_json::json!(["Radio France"]),
+        "le diffuseur de FIP doit être servi : {fip}"
+    );
+    let paradise = items
+        .iter()
+        .find(|i| i["name"] == "Radio Paradise: Main Mix")
+        .unwrap();
+    assert_eq!(
+        paradise["keywords"],
+        serde_json::json!([]),
+        "aucun mot-clé : liste vide"
+    );
+}
+
+/// #7215 — trois fiches au format du site du 27/10/2026 (`genres`) et une
+/// fiche d'un site plus ancien (`genre` seul).
+fn fiches_genres_7215() -> Vec<StationAnnuaire> {
+    let brut = serde_json::json!([
+        {"external_id": "S100001", "name": "OuiFM Blues & Rock", "stream_url": "https://ouifm.example/bluesrock",
+         "country": "FR", "genre": "blues", "genres": ["blues", "rock"]},
+        {"external_id": "S100002", "name": "FIP Metal", "stream_url": "https://fip.example/metal",
+         "country": "FR", "genre": "rock", "genres": ["rock", "metal", "Rock", " "]},
+        {"external_id": "S100003", "name": "Radio Tout", "stream_url": "https://tout.example/live",
+         "country": "BE", "genre": "eclectic", "genres": ["eclectic"]},
+        {"external_id": "S100004", "name": "Vieux Jazz", "stream_url": "https://jazz.example/live",
+         "country": "FR", "genre": "jazz"}
+    ]);
+    annuaire_depuis_json(brut.as_array().unwrap())
+}
+
+fn ids_du_genre_7215(f: &[StationAnnuaire], genre: &str) -> Vec<String> {
+    let corps = corps_annuaire(
+        f,
+        &[],
+        &FiltresAnnuaire {
+            genre: Some(genre.into()),
+            ..Default::default()
+        },
+        &EtatAnnuaire::default(),
+    );
+    corps["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["external_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn temoin_7215_ouifm_blues_et_rock_sort_sous_chacun_de_ses_genres() {
+    let f = fiches_genres_7215();
+    assert_eq!(
+        ids_du_genre_7215(&f, "blues"),
+        vec!["S100001"],
+        "OuiFM Blues & Rock doit sortir sous blues"
+    );
+    assert_eq!(
+        ids_du_genre_7215(&f, "rock"),
+        vec!["S100001", "S100002"],
+        "OuiFM Blues & Rock doit AUSSI sortir sous rock (son 2e genre), FIP Metal sous rock"
+    );
+    assert_eq!(ids_du_genre_7215(&f, "METAL"), vec!["S100002"]);
+}
+
+#[test]
+fn les_genres_7215_sont_lus_sans_doublon_et_rendus_par_l_annuaire() {
+    let f = fiches_genres_7215();
+    let metal = f.iter().find(|s| s.name == "FIP Metal").unwrap();
+    assert_eq!(metal.genre.as_deref(), Some("rock"));
+    assert_eq!(metal.genres, vec!["rock".to_string(), "metal".to_string()]);
+
+    let corps = corps_annuaire(
+        &f,
+        &[],
+        &FiltresAnnuaire::default(),
+        &EtatAnnuaire::default(),
+    );
+    let ouifm = corps["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["external_id"] == "S100001")
+        .unwrap();
+    assert_eq!(ouifm["genre"], "blues", "le genre v1 reste le premier");
+    assert_eq!(ouifm["genres"], serde_json::json!(["blues", "rock"]));
+}
+
+#[test]
+fn les_compteurs_7215_comptent_une_fiche_dans_chacun_de_ses_genres() {
+    let f = fiches_genres_7215();
+    let corps = corps_annuaire(
+        &f,
+        &[],
+        &FiltresAnnuaire::default(),
+        &EtatAnnuaire::default(),
+    );
+    let comptes: std::collections::BTreeMap<String, u64> = corps["genres"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| {
+            (
+                g["key"].as_str().unwrap().to_string(),
+                g["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let attendu: std::collections::BTreeMap<String, u64> = [
+        ("rock", 2),
+        ("blues", 1),
+        ("metal", 1),
+        ("eclectic", 1),
+        ("jazz", 1),
+    ]
+    .into_iter()
+    .map(|(k, n)| (k.to_string(), n))
+    .collect();
+    assert_eq!(comptes, attendu, "{}", corps["genres"]);
+
+    // Les genres proposés suivent le pays choisi.
+    let be = corps_annuaire(
+        &f,
+        &[],
+        &FiltresAnnuaire {
+            country: Some("BE".into()),
+            ..Default::default()
+        },
+        &EtatAnnuaire::default(),
+    );
+    assert_eq!(
+        be["genres"],
+        serde_json::json!([{"key": "eclectic", "count": 1}])
+    );
+}
+
+#[test]
+fn ancien_format_7215_sans_genres_se_replie_sur_genre() {
+    let f = fiches_genres_7215();
+    let vieux = f.iter().find(|s| s.name == "Vieux Jazz").unwrap();
+    assert_eq!(vieux.genres, vec!["jazz".to_string()]);
+    assert_eq!(ids_du_genre_7215(&f, "jazz"), vec!["S100004"]);
+
+    // Une fiche construite sans `genres` (aucun site) : repli sur `genre`.
+    let construite = StationAnnuaire {
+        name: "Construite".into(),
+        stream_url: "https://c.example/s".into(),
+        external_id: Some("C000001".into()),
+        genre: Some("folk".into()),
+        ..Default::default()
+    };
+    assert_eq!(construite.genres_ou_genre(), vec!["folk"]);
+    assert_eq!(ids_du_genre_7215(&[construite], "folk"), vec!["C000001"]);
+}
+
+#[test]
+fn contre_epreuve_7215_un_genre_que_la_fiche_n_a_pas_ne_la_trouve_pas() {
+    let f = fiches_genres_7215();
+    assert!(
+        ids_du_genre_7215(&f, "metal")
+            .iter()
+            .all(|id| id != "S100001")
+    );
+    assert!(
+        ids_du_genre_7215(&f, "jazz")
+            .iter()
+            .all(|id| id != "S100001")
+    );
+    assert!(ids_du_genre_7215(&f, "funk").is_empty());
+}

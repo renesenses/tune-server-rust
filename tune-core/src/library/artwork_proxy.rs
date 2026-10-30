@@ -119,10 +119,10 @@ const REDIRECTIONS_MAX: usize = 5;
 /// change invalide toutes les URL que les points de contrôle ont mémorisées.
 pub fn secret(backend: &Arc<dyn DbBackend>) -> String {
     let settings = SettingsRepo::with_backend(backend.clone());
-    if let Ok(Some(s)) = settings.get(CLE_SECRET) {
-        if !s.trim().is_empty() {
-            return s;
-        }
+    if let Ok(Some(s)) = settings.get(CLE_SECRET)
+        && !s.trim().is_empty()
+    {
+        return s;
     }
     let mut octets = [0u8; 32];
     getrandom::getrandom(&mut octets).expect("OS RNG unavailable");
@@ -716,6 +716,47 @@ impl Relais {
             return Err(Refus::HoteRefuse(hote));
         }
         Ok(hote)
+    }
+
+    /// Pochette et logo déjà rattachés par le serveur à une radio publiée.
+    /// L'appelant vérifie cette provenance ; les contrôles d'adresse et de
+    /// réponse restent ceux du relais de production.
+    pub async fn relayer_radio_publiee(
+        &self,
+        pochette: &str,
+        logo: Option<&str>,
+        secret: &str,
+        supplementaires: &[String],
+    ) -> Result<Relaye, Echec> {
+        let sig = signature(secret, pochette);
+        let resultat = self
+            .relayer(&Demande {
+                url: pochette,
+                sig: Some(&sig),
+                secret,
+                signature_exigee: false,
+                hotes_supplementaires: supplementaires,
+            })
+            .await;
+        if resultat.is_err()
+            && let Some(logo) = logo.filter(|l| !l.trim().is_empty() && *l != pochette)
+        {
+            let sig = signature(secret, logo);
+            if let Ok(image) = self
+                .relayer(&Demande {
+                    url: logo,
+                    sig: Some(&sig),
+                    secret,
+                    signature_exigee: false,
+                    hotes_supplementaires: supplementaires,
+                })
+                .await
+            {
+                tracing::debug!("radio_pochette_repli_logo_7009");
+                return Ok(image);
+            }
+        }
+        resultat
     }
 
     /// Relaie `demande.url` — ou dit pourquoi non.

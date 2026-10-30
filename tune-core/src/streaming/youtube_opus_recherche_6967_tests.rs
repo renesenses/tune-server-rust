@@ -385,7 +385,7 @@ async fn le_flux_de_yt_dlp_n_est_demande_qu_une_fois_servi() {
         flux.disponible_a.is_some(),
         "yt-dlp n'a pas été prié de dire quand : {flux:?}"
     );
-    let mut req = reqwest::Client::new()
+    let mut req = crate::http::client::shared()
         .get(&flux.url)
         .header("Range", "bytes=0-4095");
     for (nom, valeur) in &flux.headers {

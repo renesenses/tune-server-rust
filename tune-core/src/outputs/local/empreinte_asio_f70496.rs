@@ -305,7 +305,7 @@ fn route_native_porte_le_dop_intact_meme_a_volume_reduit() {
     // Et les octets sont bien ceux de la source, marqueurs compris : le mot
     // natif d'un échantillon 24 bits est son octet haut en bits 31..24.
     let mots = pcm_bytes_to_native_i32(&octets, 24);
-    for (trame, paire) in mots.chunks_exact(2).enumerate() {
+    for (trame, paire) in mots.as_chunks::<2>().0.iter().enumerate() {
         let marqueur = if trame % 2 == 0 { 0x05 } else { 0xFA };
         assert_eq!((paire[0] >> 24) as u8, marqueur);
         assert_eq!((paire[1] >> 24) as u8, marqueur);

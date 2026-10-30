@@ -27,7 +27,8 @@ use tracing::{debug, info, warn};
 const PCM_SAMPLE_RATE: u32 = 44100;
 const PCM_CHANNELS: u16 = 2;
 const PCM_BITS_PER_SAMPLE: u16 = 16;
-const DEFAULT_BITRATE: u32 = 320;
+/// Le `--bitrate` passé à librespot : le plus haut qu'il accepte.
+pub const DEFAULT_BITRATE: u32 = 320;
 
 /// Octets d'une trame stéréo 16 bits.
 pub const OCTETS_PAR_TRAME: usize = 4;
@@ -40,6 +41,55 @@ const CANAL: usize = 8;
 /// Après `end_of_track`, la pompe vide le tuyau puis ferme le flux dès que
 /// librespot s'est tu pendant ce délai.
 const SILENCE_DE_FIN: Duration = Duration::from_millis(300);
+
+/// #6946 — le code stable de la raison du plafond : librespot ne lit aucun
+/// format sans perte de Spotify.
+pub const CODE_PLAFOND_LIBRESPOT: &str = "librespot_no_lossless";
+
+/// #6946 — ce que Spotify livre RÉELLEMENT à librespot, et pourquoi.
+///
+/// Constat dans les sources de librespot 0.8.0 (crates.io, la version que
+/// `cargo install librespot` installe dans les images) :
+///
+/// * `--bitrate` n'accepte que `96`, `160` et `320`
+///   (`librespot-playback/src/config.rs`, `enum Bitrate`, lignes 7-12 ;
+///   `src/main.rs`, ligne 1580) ;
+/// * `load_remote_track` choisit le fichier dans une liste qui ne contient
+///   que de l'Ogg Vorbis et du MP3, 320 kbit/s en tête pour `--bitrate 320`
+///   (`librespot-playback/src/player.rs`, lignes 1010-1038). `FLAC_FLAC` et
+///   `FLAC_FLAC_24BIT` existent dans `librespot-metadata/src/audio/file.rs`
+///   (lignes 29 et 33), mais aucune liste ne les demande.
+///
+/// Le débit est donc un PLAFOND : un titre absent en 320 kbit/s (la plupart
+/// des podcasts) descend à la variante suivante de la liste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct QualiteDeLibrespot {
+    /// Le codec reçu, en minuscules, tel que `AudioFormat::from_extension`
+    /// le reconnaît.
+    pub codec: &'static str,
+    /// Son nom à l'écran.
+    pub format: &'static str,
+    /// Le débit demandé à Spotify, en kbit/s : le plus haut que librespot
+    /// sache lire.
+    pub bitrate_kbps: u32,
+    /// `true` : `bitrate_kbps` est un plafond, pas une mesure.
+    pub ceiling: bool,
+    pub lossless: bool,
+    /// [`CODE_PLAFOND_LIBRESPOT`].
+    pub reason_code: &'static str,
+}
+
+/// La qualité reçue pour le `--bitrate` passé à librespot.
+pub fn qualite_de_librespot(bitrate: u32) -> QualiteDeLibrespot {
+    QualiteDeLibrespot {
+        codec: "ogg",
+        format: "Ogg Vorbis",
+        bitrate_kbps: bitrate,
+        ceiling: true,
+        lossless: false,
+        reason_code: CODE_PLAFOND_LIBRESPOT,
+    }
+}
 
 /// Préfixe des lignes écrites sur stderr par le script `--onevent`.
 pub const PREFIXE_EVENEMENT: &str = "TUNE_EVENT\t";
@@ -248,10 +298,65 @@ impl PompePcm {
     }
 }
 
-/// Cherche librespot : `TUNE_LIBRESPOT`, puis le `PATH`, puis les dossiers
-/// d'installation usuels. Un serveur lancé par launchd n'a pas
-/// `/opt/homebrew/bin` dans son `PATH` (#6018, point 3).
+/// #6933 / #6872 — d'où vient le librespot que Tune lance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrigineLibrespot {
+    /// `TUNE_LIBRESPOT` : l'exploitant l'a désigné (les images Docker aussi).
+    Explicite,
+    /// À côté du binaire `tune-server` : celui que Tune livre.
+    Fourni,
+    /// Trouvé dans le `PATH` ou un dossier usuel : PAS celui de Tune. Le
+    /// testeur du fil 2419 y avait posé son propre script.
+    Systeme,
+}
+
+impl OrigineLibrespot {
+    /// Ce que l'origine dit à l'utilisateur, dans un message d'échec.
+    pub fn libelle(self) -> &'static str {
+        match self {
+            Self::Explicite => "désigné par TUNE_LIBRESPOT",
+            Self::Fourni => "fourni avec Tune",
+            Self::Systeme => "trouvé dans le système, ce n'est pas celui fourni avec Tune",
+        }
+    }
+}
+
+/// Le librespot retenu, et pourquoi.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaireLibrespot {
+    pub chemin: PathBuf,
+    pub origine: OrigineLibrespot,
+}
+
+/// Le nom du binaire sur ce système.
+pub fn nom_du_binaire() -> &'static str {
+    if cfg!(windows) {
+        "librespot.exe"
+    } else {
+        "librespot"
+    }
+}
+
+/// Le dossier du binaire `tune-server` en cours, liens résolus : c'est là
+/// que les paquets de Tune posent librespot (comme `airplay-daemon` et
+/// `ffmpeg`).
+pub fn dossier_de_tune() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    exe.parent().map(Path::to_path_buf)
+}
+
+/// Cherche librespot, dans cet ordre (#6933) : `TUNE_LIBRESPOT`, puis le
+/// librespot FOURNI à côté de `tune-server`, et seulement ensuite le `PATH`
+/// et les dossiers d'installation usuels. Un serveur lancé par launchd n'a
+/// pas `/opt/homebrew/bin` dans son `PATH` (#6018, point 3).
 pub fn chemin_du_binaire() -> Option<PathBuf> {
+    trouver_le_binaire().map(|b| b.chemin)
+}
+
+/// [`chemin_du_binaire`], avec l'origine du binaire retenu.
+pub fn trouver_le_binaire() -> Option<BinaireLibrespot> {
     let explicite = std::env::var_os("TUNE_LIBRESPOT").map(PathBuf::from);
     let mut candidats = vec![
         PathBuf::from("/opt/homebrew/bin"),
@@ -263,46 +368,142 @@ pub fn chemin_du_binaire() -> Option<PathBuf> {
     }
     chercher_librespot(
         explicite.as_deref(),
+        dossier_de_tune().as_deref(),
         std::env::var_os("PATH").as_deref(),
         &candidats,
     )
 }
 
-/// Le cœur pur de [`chemin_du_binaire`].
+/// Le cœur pur de [`trouver_le_binaire`].
 pub fn chercher_librespot(
     explicite: Option<&Path>,
+    dossier_de_tune: Option<&Path>,
     path: Option<&std::ffi::OsStr>,
     dossiers_usuels: &[PathBuf],
-) -> Option<PathBuf> {
-    let nom = if cfg!(windows) {
-        "librespot.exe"
-    } else {
-        "librespot"
-    };
-    if let Some(e) = explicite.filter(|e| est_executable(e)) {
-        return Some(e.to_path_buf());
+) -> Option<BinaireLibrespot> {
+    let nom = nom_du_binaire();
+    if let Some(e) = explicite {
+        if est_executable(e) {
+            return Some(BinaireLibrespot {
+                chemin: e.to_path_buf(),
+                origine: OrigineLibrespot::Explicite,
+            });
+        }
+        warn!(chemin = %e.display(), "librespot_tune_librespot_inutilisable");
+    }
+    if let Some(fourni) = dossier_de_tune.map(|d| d.join(nom))
+        && est_executable(&fourni)
+    {
+        return Some(BinaireLibrespot {
+            chemin: fourni,
+            origine: OrigineLibrespot::Fourni,
+        });
     }
     path.into_iter()
         .flat_map(std::env::split_paths)
         .chain(dossiers_usuels.iter().cloned())
         .map(|d| d.join(nom))
         .find(|c| est_executable(c))
+        .map(|chemin| BinaireLibrespot {
+            chemin,
+            origine: OrigineLibrespot::Systeme,
+        })
 }
 
+/// Un fichier VIDE n'est pas un librespot : les images Docker arm64 posent
+/// un fichier vide à sa place, que `spawn` refusait ensuite avec un
+/// « Exec format error » incompréhensible.
 fn est_executable(p: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(p) else {
         return false;
     };
+    if !meta.is_file() || meta.len() == 0 {
+        return false;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+        meta.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     {
-        meta.is_file()
+        true
     }
 }
+
+/// #6933 — le binaire est-il un script (`#!`) ? Le librespot du testeur du
+/// fil 2419 était un script maison qui en appelait un autre.
+pub fn est_un_script(p: &Path) -> bool {
+    use std::io::Read;
+    let mut debut = [0u8; 2];
+    std::fs::File::open(p)
+        .and_then(|mut f| f.read_exact(&mut debut))
+        .map(|()| &debut == b"#!")
+        .unwrap_or(false)
+}
+
+/// #6933 — la version annoncée par `librespot --version` (première ligne).
+/// Un script n'est PAS exécuté pour cela : il peut faire n'importe quoi de
+/// ses arguments.
+pub async fn version_de_librespot(p: &Path) -> Option<String> {
+    if est_un_script(p) {
+        return None;
+    }
+    let sortie = tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new(p)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let texte = if sortie.stdout.is_empty() {
+        sortie.stderr
+    } else {
+        sortie.stdout
+    };
+    String::from_utf8_lossy(&texte)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_owned)
+}
+
+/// #6933 — ce que Tune sait du librespot qu'il vient de lancer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibrespotLance {
+    pub chemin: String,
+    pub origine: Option<OrigineLibrespot>,
+    pub version: Option<String>,
+    pub script: bool,
+}
+
+impl LibrespotLance {
+    /// Une phrase pour les messages : chemin, origine, version.
+    pub fn decrire(&self) -> String {
+        let mut d = self.chemin.clone();
+        let mut details = Vec::new();
+        if let Some(o) = self.origine {
+            details.push(o.libelle().to_string());
+        }
+        if self.script {
+            details.push("c'est un script, pas le programme librespot".into());
+        }
+        if let Some(v) = &self.version {
+            details.push(v.clone());
+        }
+        if !details.is_empty() {
+            d.push_str(&format!(" ({})", details.join(", ")));
+        }
+        d
+    }
+}
+
+/// #6933 — le fichier où librespot garde la connexion qu'il a obtenue.
+pub const FICHIER_IDENTIFIANTS: &str = "credentials.json";
 
 pub struct LibrespotDaemon {
     device_name: String,
@@ -319,6 +520,11 @@ pub struct LibrespotDaemon {
     /// remise à zéro à chaque démarrage. C'est elle qui dit POURQUOI
     /// l'appareil n'apparaît pas, au lieu d'un « reconnecter » par défaut.
     derniere_erreur: Arc<std::sync::Mutex<Option<String>>>,
+    /// #6933 — le dossier où librespot garde SA connexion au compte
+    /// (`--system-cache`, fichier [`FICHIER_IDENTIFIANTS`]). `None` : aucun.
+    dossier_identifiants: Option<PathBuf>,
+    /// #6933 — le binaire lancé en dernier : chemin, origine, version.
+    dernier_lance: std::sync::Mutex<Option<LibrespotLance>>,
 }
 
 /// #6933 — une ligne de stderr de librespot est-elle une erreur ? Le format
@@ -348,11 +554,42 @@ impl LibrespotDaemon {
             pompe: PompePcm::new(),
             dossier_script: std::sync::Mutex::new(None),
             derniere_erreur: Arc::new(std::sync::Mutex::new(None)),
+            dossier_identifiants: None,
+            dernier_lance: std::sync::Mutex::new(None),
         }
+    }
+
+    /// #6933 — librespot garde sa connexion au compte dans `dossier`.
+    pub fn avec_dossier_identifiants(mut self, dossier: Option<PathBuf>) -> Self {
+        self.dossier_identifiants = dossier;
+        self
+    }
+
+    /// #6933 — le dossier où librespot garde sa connexion.
+    pub fn dossier_identifiants(&self) -> Option<&Path> {
+        self.dossier_identifiants.as_deref()
+    }
+
+    /// #6933 — librespot a-t-il une connexion au compte à lui, obtenue en
+    /// Spotify Connect (application Spotify) ou par `--enable-oauth` ?
+    pub fn identifiants_en_cache(&self) -> bool {
+        self.dossier_identifiants
+            .as_ref()
+            .is_some_and(|d| d.join(FICHIER_IDENTIFIANTS).is_file())
+    }
+
+    /// #6933 — le binaire lancé en dernier.
+    pub fn dernier_lance(&self) -> Option<LibrespotLance> {
+        self.dernier_lance.lock().ok().and_then(|l| l.clone())
     }
 
     pub fn pompe(&self) -> Arc<PompePcm> {
         self.pompe.clone()
+    }
+
+    /// #6946 — ce que Spotify livre à ce librespot.
+    pub fn qualite_recue(&self) -> QualiteDeLibrespot {
+        qualite_de_librespot(self.bitrate)
     }
 
     /// #6933 — la dernière erreur de librespot depuis son dernier démarrage.
@@ -361,10 +598,19 @@ impl LibrespotDaemon {
     }
 
     pub fn binaire(&self) -> String {
-        self.binary_path
-            .clone()
-            .or_else(|| chemin_du_binaire().map(|p| p.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "librespot".into())
+        self.binaire_retenu().0
+    }
+
+    /// Le binaire à lancer et son origine (`None` : imposé par le code, ou
+    /// introuvable — `spawn` dira alors qu'il manque).
+    fn binaire_retenu(&self) -> (String, Option<OrigineLibrespot>) {
+        if let Some(b) = &self.binary_path {
+            return (b.clone(), None);
+        }
+        match trouver_le_binaire() {
+            Some(b) => (b.chemin.to_string_lossy().into_owned(), Some(b.origine)),
+            None => (nom_du_binaire().into(), None),
+        }
     }
 
     /// Écrit le script `--onevent` (Unix). Le chemin ne doit contenir aucun
@@ -428,7 +674,53 @@ impl LibrespotDaemon {
         if let Some(script) = self.preparer_le_script() {
             args.extend(["--onevent".into(), script]);
         }
-        let binaire = self.binaire();
+        // #6933 — la connexion que librespot a obtenue LUI-MÊME passe avant
+        // le jeton de Tune. librespot 0.8 donne la priorité au jeton sur son
+        // cache (`src/main.rs`, l. 1197-1206), puis ouvre la session Connect
+        // par login5 au nom de SON client (`login5.rs`, `auth_token`) : un
+        // jeton émis pour le Client ID de Tune y est refusé
+        // (`INVALID_CREDENTIALS`), et l'écrase en plus dans le cache. Le
+        // testeur du fil 2419 l'a vu : son cache, valide, était « ignoré ».
+        let par_cache = self.identifiants_en_cache();
+        let jeton = if par_cache { None } else { jeton };
+        // Le cache n'est donné qu'aux lancements SANS jeton : librespot y
+        // garde alors la connexion reçue de l'application Spotify. Avec le
+        // jeton de Tune, il y écrirait une connexion inutilisable.
+        if jeton.is_none()
+            && let Some(dossier) = &self.dossier_identifiants
+        {
+            if let Err(e) = creer_le_dossier_prive(dossier) {
+                warn!(dossier = %dossier.display(), erreur = %e, "librespot_dossier_identifiants_impossible");
+            } else {
+                args.extend([
+                    "--system-cache".into(),
+                    dossier.to_string_lossy().into_owned(),
+                ]);
+            }
+        }
+        let (binaire, origine) = self.binaire_retenu();
+        let chemin = Path::new(&binaire);
+        let script = est_un_script(chemin);
+        let version = version_de_librespot(chemin).await;
+        info!(
+            chemin = %binaire,
+            origine = ?origine,
+            version = ?version,
+            script,
+            connexion = if par_cache { "cache_de_librespot" } else if jeton.is_some() { "jeton_de_tune" } else { "spotify_connect" },
+            "librespot_lance"
+        );
+        if origine == Some(OrigineLibrespot::Systeme) {
+            warn!(chemin = %binaire, "librespot_tiers: ce librespot n'est pas celui fourni avec Tune");
+        }
+        if let Ok(mut l) = self.dernier_lance.lock() {
+            *l = Some(LibrespotLance {
+                chemin: binaire.clone(),
+                origine,
+                version,
+                script,
+            });
+        }
         let mut commande = Command::new(&binaire);
         // Le jeton OAuth ne passe JAMAIS par les arguments, que `ps` montre à
         // tous les comptes de la machine : librespot lit chaque option aussi
@@ -446,7 +738,7 @@ impl LibrespotDaemon {
             .spawn()
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    consigne_librespot_introuvable(std::env::consts::OS).to_string()
+                    consigne_librespot_introuvable(std::env::consts::OS)
                 } else {
                     format!("librespot start ({binaire}): {e}")
                 }
@@ -492,7 +784,7 @@ impl LibrespotDaemon {
             });
         }
         self.connecte_par_jeton
-            .store(jeton.is_some(), Ordering::SeqCst);
+            .store(jeton.is_some() || par_cache, Ordering::SeqCst);
 
         info!(device = %self.device_name, "librespot_started");
         *self.process.lock().await = Some(proc);
@@ -516,9 +808,12 @@ impl LibrespotDaemon {
         }
     }
 
-    /// librespot tourne-t-il, connecté au compte par un jeton ?
+    /// librespot tourne-t-il, connecté au compte (jeton, ou connexion à
+    /// lui — gardée en cache, ou reçue de l'application Spotify depuis son
+    /// lancement) ?
     pub async fn connecte_au_compte(&self) -> bool {
-        self.connecte_par_jeton.load(Ordering::SeqCst) && self.is_running().await
+        (self.connecte_par_jeton.load(Ordering::SeqCst) || self.identifiants_en_cache())
+            && self.is_running().await
     }
 
     pub fn pcm_spec() -> (u32, u16, u16) {
@@ -609,6 +904,11 @@ impl SpotifyConnectManager {
         self.daemon.pompe()
     }
 
+    /// #6946 — ce que Spotify livre réellement au récepteur.
+    pub fn qualite_recue(&self) -> QualiteDeLibrespot {
+        self.daemon.qualite_recue()
+    }
+
     /// #6933 — la dernière erreur écrite par librespot depuis son démarrage.
     pub fn derniere_erreur_librespot(&self) -> Option<String> {
         self.daemon.derniere_erreur()
@@ -617,6 +917,48 @@ impl SpotifyConnectManager {
     /// #6933 — le binaire librespot que Tune lance.
     pub fn binaire_librespot(&self) -> String {
         self.daemon.binaire()
+    }
+
+    /// #6933 — le librespot lancé en dernier (chemin, origine, version).
+    pub fn librespot_lance(&self) -> Option<LibrespotLance> {
+        self.daemon.dernier_lance()
+    }
+
+    /// #6933 — librespot garde sa connexion au compte dans `dossier`. À
+    /// appeler à la construction, avant tout lancement.
+    pub fn avec_dossier_identifiants(mut self, dossier: Option<PathBuf>) -> Self {
+        if let Some(d) = Arc::get_mut(&mut self.daemon) {
+            d.dossier_identifiants = dossier;
+        }
+        self
+    }
+
+    /// #6933 — librespot a-t-il une connexion au compte à lui ?
+    pub fn librespot_a_sa_connexion(&self) -> bool {
+        self.daemon.identifiants_en_cache()
+    }
+
+    /// #6933 — le dossier où librespot garde sa connexion.
+    pub fn dossier_identifiants_librespot(&self) -> Option<PathBuf> {
+        self.daemon.dossier_identifiants().map(Path::to_path_buf)
+    }
+
+    /// #6933 — Spotify a refusé le jeton de Tune : librespot est relancé
+    /// SANS jeton, en Spotify Connect, pour que l'application Spotify puisse
+    /// lui donner une connexion à lui, qu'il garde.
+    pub async fn relancer_pour_la_liaison(&self) {
+        self.daemon.stop().await;
+        if let Err(e) = self
+            .daemon
+            .start(|event, track_id| {
+                info!(event = %event, track_id = ?track_id, "spotify_connect_event");
+            })
+            .await
+        {
+            warn!(erreur = %e, "librespot_relance_pour_la_liaison_impossible");
+        } else {
+            info!("librespot_relance_pour_la_liaison");
+        }
     }
 
     /// S'assure que librespot tourne ET qu'il est connecté au compte, pour
@@ -672,18 +1014,39 @@ impl SpotifyConnectManager {
         let enabled = *self.enabled.lock().await;
         let zone_id = *self.zone_id.lock().await;
         let running = self.daemon.is_running().await;
+        let binaire = trouver_le_binaire();
         serde_json::json!({
             "enabled": enabled,
             "device_name": &self.device_name,
             "zone_id": zone_id,
             "active": running,
             "binary_available": binary_available(),
+            // #6933 — quel librespot, et d'où : « systeme » n'est pas celui
+            // de Tune.
+            "binary_path": binaire.as_ref().map(|b| b.chemin.to_string_lossy().into_owned()),
+            "binary_origin": binaire.as_ref().map(|b| b.origine),
+            "librespot_linked": self.daemon.identifiants_en_cache(),
+            // #6946 — la qualité réellement reçue, que Réglages › Spotify
+            // affiche au lieu de laisser croire à un réglage sans perte.
+            "quality": self.qualite_recue(),
         })
     }
 }
 
 pub fn binary_available() -> bool {
     chemin_du_binaire().is_some()
+}
+
+/// Le dossier des identifiants de librespot ne doit être lisible que par le
+/// compte de Tune : il garde une connexion au compte Spotify.
+fn creer_le_dossier_prive(dossier: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dossier)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dossier, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 pub fn build_wav_header() -> Vec<u8> {
@@ -706,29 +1069,38 @@ pub fn build_wav_header() -> Vec<u8> {
     header
 }
 
-/// #6396 — la consigne quand `librespot` manque, pour le système où tourne
-/// le serveur. Tune ne livre ce binaire nulle part hors des images Docker :
-/// le message ne parlait que de macOS (`brew`), et un utilisateur Windows
-/// n'apprenait ni qu'il fallait un `librespot.exe`, ni où le déclarer.
-pub(crate) fn consigne_librespot_introuvable(os: &str) -> &'static str {
+/// #6396 / #6933 — la consigne quand `librespot` manque, pour le système où
+/// tourne le serveur. Elle dit honnêtement où Tune le livre, et où il ne le
+/// livre pas.
+pub(crate) fn consigne_librespot_introuvable(os: &str) -> String {
+    let dossier = dossier_de_tune()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|| "le dossier de tune-server".into());
+    consigne_librespot_introuvable_dans(os, &dossier)
+}
+
+/// Le cœur pur de [`consigne_librespot_introuvable`].
+pub(crate) fn consigne_librespot_introuvable_dans(os: &str, dossier: &str) -> String {
     match os {
-        "macos" => {
-            "librespot est introuvable : Tune ne le livre pas. L'installer \
-             (brew install librespot) ou indiquer son chemin dans la variable \
+        "macos" => format!(
+            "librespot est introuvable : Tune ne le livre pas encore sous macOS. L'installer \
+             (brew install librespot) ou indiquer son chemin dans la variable TUNE_LIBRESPOT, \
+             puis redémarrer Tune. Spotify Premium est exigé. (Dossier de Tune : {dossier})"
+        ),
+        "windows" => format!(
+            "librespot.exe est introuvable : Tune ne le livre pas sous Windows, et le projet \
+             librespot ne publie aucun binaire Windows. La lecture Spotify n'est donc pas \
+             disponible sous Windows, sauf avec un librespot.exe compilé soi-même \
+             (cargo install librespot) et déclaré dans la variable TUNE_LIBRESPOT (ou posé dans \
+             {dossier}), puis redémarrer Tune. Spotify Premium est exigé."
+        ),
+        _ => format!(
+            "librespot est introuvable : il n'est pas dans le dossier de Tune ({dossier}). Les \
+             paquets Linux x86_64 de Tune (archive, .deb, Tune OS) et l'image Docker le livrent ; \
+             les autres installations (Linux ARM notamment) ne l'ont pas encore. Réinstaller le \
+             paquet de Tune, ou indiquer le chemin d'un librespot dans la variable \
              TUNE_LIBRESPOT, puis redémarrer Tune. Spotify Premium est exigé."
-        }
-        "windows" => {
-            "librespot.exe est introuvable : Tune ne le livre pas sous Windows. \
-             Placer librespot.exe dans un dossier du PATH, ou indiquer son chemin \
-             complet dans la variable d'environnement TUNE_LIBRESPOT, puis \
-             redémarrer Tune. Spotify Premium est exigé."
-        }
-        _ => {
-            "librespot est introuvable : Tune ne le livre pas hors des images \
-             Docker. L'installer (paquet de la distribution ou cargo install \
-             librespot) ou indiquer son chemin dans la variable TUNE_LIBRESPOT, \
-             puis redémarrer Tune. Spotify Premium est exigé."
-        }
+        ),
     }
 }
 
@@ -736,26 +1108,30 @@ pub(crate) fn consigne_librespot_introuvable(os: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    /// #6396 — un utilisateur Windows apprend qu'il lui faut un
-    /// `librespot.exe` et où le déclarer ; la consigne macOS reste à macOS.
+    /// #6396 / #6933 — chaque système reçoit SA consigne, et elle dit
+    /// honnêtement où Tune livre librespot.
     #[test]
     fn librespot_introuvable_la_consigne_suit_le_systeme_6396() {
-        let windows = consigne_librespot_introuvable("windows");
+        let windows = consigne_librespot_introuvable_dans("windows", "C:\\Tune");
         assert!(windows.contains("librespot.exe"), "{windows}");
-        assert!(windows.contains("PATH"), "{windows}");
         assert!(windows.contains("TUNE_LIBRESPOT"), "{windows}");
         assert!(
-            !windows.contains("brew"),
-            "pas de consigne macOS sous Windows : {windows}"
+            windows.contains("ne publie aucun binaire Windows"),
+            "Windows : dire pourquoi il n'y en a pas : {windows}"
         );
-        let linux = consigne_librespot_introuvable("linux");
+        assert!(!windows.contains("brew"), "{windows}");
+        let linux = consigne_librespot_introuvable_dans("linux", "/opt/tune");
         assert!(!linux.contains("brew"), "{linux}");
         assert!(linux.contains("TUNE_LIBRESPOT"), "{linux}");
-        let macos = consigne_librespot_introuvable("macos");
+        assert!(
+            linux.contains("/opt/tune"),
+            "le dossier attendu est nommé : {linux}"
+        );
+        let macos = consigne_librespot_introuvable_dans("macos", "/x");
         assert!(macos.contains("brew install librespot"), "{macos}");
         for m in [windows, linux, macos] {
-            assert!(m.contains("Tune ne le livre pas"), "{m}");
             assert!(m.contains("Spotify Premium"), "{m}");
+            assert!(!m.to_lowercase().contains("reconnect"), "{m}");
         }
     }
 
@@ -816,6 +1192,22 @@ mod tests {
         assert_eq!(sr, 44100);
         assert_eq!(ch, 2);
         assert_eq!(bd, 16);
+    }
+
+    /// #6946 — le statut du récepteur (Réglages › Spotify) dit ce que
+    /// librespot reçoit : de l'Ogg Vorbis, 320 kbit/s au plus, jamais du sans
+    /// perte, et le code de la raison.
+    #[tokio::test]
+    async fn qualite_6946_le_statut_dit_ogg_vorbis_320_plafond_de_librespot() {
+        let recepteur = SpotifyConnectManager::new("Tune".into(), 0);
+        let statut = recepteur.status().await;
+        let q = &statut["quality"];
+        assert_eq!(q["codec"], "ogg", "{statut}");
+        assert_eq!(q["format"], "Ogg Vorbis", "{statut}");
+        assert_eq!(q["bitrate_kbps"], 320, "{statut}");
+        assert_eq!(q["ceiling"], true, "un plafond, pas une mesure : {statut}");
+        assert_eq!(q["lossless"], false, "{statut}");
+        assert_eq!(q["reason_code"], CODE_PLAFOND_LIBRESPOT, "{statut}");
     }
 
     /// #6018 — le défaut du ticket : sans lecteur de stdout, librespot se
@@ -933,34 +1325,133 @@ mod tests {
         assert!(lire_evenement_tune("librespot: autre chose").is_none());
     }
 
+    #[cfg(unix)]
+    fn poser(dossier: &Path, texte: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dossier.join("librespot");
+        std::fs::write(&bin, texte).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
     /// #6018, point 3 — sous launchd, `/opt/homebrew/bin` n'est pas dans le
     /// `PATH` : le binaire doit être trouvé quand même.
     #[cfg(unix)]
     #[test]
     fn binaire_6018_trouve_hors_du_path() {
-        use std::os::unix::fs::PermissionsExt;
         let vide = tempfile::tempdir().unwrap();
         let brew = tempfile::tempdir().unwrap();
-        let bin = brew.path().join("librespot");
-        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = poser(brew.path(), "#!/bin/sh\n");
         let path = std::ffi::OsString::from(vide.path());
+        let systeme = |chemin: &PathBuf| {
+            Some(BinaireLibrespot {
+                chemin: chemin.clone(),
+                origine: OrigineLibrespot::Systeme,
+            })
+        };
         assert_eq!(
-            chercher_librespot(None, Some(&path), &[brew.path().to_path_buf()]),
-            Some(bin.clone()),
+            chercher_librespot(None, None, Some(&path), &[brew.path().to_path_buf()]),
+            systeme(&bin),
             "dossier usuel"
         );
         let path_brew = std::ffi::OsString::from(brew.path());
         assert_eq!(
-            chercher_librespot(None, Some(&path_brew), &[]),
-            Some(bin.clone()),
+            chercher_librespot(None, None, Some(&path_brew), &[]),
+            systeme(&bin),
             "PATH"
         );
         assert_eq!(
-            chercher_librespot(Some(&bin), None, &[]),
-            Some(bin.clone()),
+            chercher_librespot(Some(&bin), None, None, &[]).map(|b| b.origine),
+            Some(OrigineLibrespot::Explicite),
             "TUNE_LIBRESPOT"
         );
-        assert_eq!(chercher_librespot(None, Some(&path), &[]), None);
+        assert_eq!(chercher_librespot(None, None, Some(&path), &[]), None);
+    }
+
+    /// #6933 — le fil 2419 : un script `librespot` posé par l'utilisateur
+    /// dans `/usr/local/bin` (avec des identifiants d'exemple) était lancé à
+    /// la place de tout autre. Le librespot FOURNI à côté de `tune-server`
+    /// passe avant le `PATH` et les dossiers usuels, et un binaire tiers est
+    /// reconnu comme tel.
+    #[cfg(unix)]
+    #[test]
+    fn binaire_6933_le_librespot_fourni_passe_avant_un_tiers_du_path() {
+        let tune = tempfile::tempdir().unwrap();
+        let usr_local = tempfile::tempdir().unwrap();
+        let fourni = poser(tune.path(), "\x7fELF faux binaire fourni");
+        let tiers = poser(
+            usr_local.path(),
+            "#!/bin/sh\nexec librespot-real --username \"VOTRE_EMAIL_SPOTIFY\" \"$@\"\n",
+        );
+        let path = std::ffi::OsString::from(usr_local.path());
+        let retenu = chercher_librespot(
+            None,
+            Some(tune.path()),
+            Some(&path),
+            &[usr_local.path().to_path_buf()],
+        )
+        .expect("un librespot doit être trouvé");
+        assert_eq!(
+            retenu,
+            BinaireLibrespot {
+                chemin: fourni.clone(),
+                origine: OrigineLibrespot::Fourni,
+            },
+            "le librespot du PATH ({}) a été pris à la place de celui de Tune",
+            tiers.display()
+        );
+        // Sans librespot fourni, le tiers sert encore, mais il est NOMMÉ.
+        let vide = tempfile::tempdir().unwrap();
+        let seul = chercher_librespot(None, Some(vide.path()), Some(&path), &[]).unwrap();
+        assert_eq!(seul.origine, OrigineLibrespot::Systeme);
+        assert!(
+            est_un_script(&seul.chemin),
+            "le script du testeur est reconnu"
+        );
+        assert!(!est_un_script(&fourni));
+        let lance = LibrespotLance {
+            chemin: seul.chemin.to_string_lossy().into_owned(),
+            origine: Some(seul.origine),
+            version: None,
+            script: true,
+        };
+        let d = lance.decrire();
+        assert!(
+            d.contains("ce n'est pas celui fourni avec Tune") && d.contains("script"),
+            "le message doit dire que ce librespot n'est pas celui de Tune : {d}"
+        );
+    }
+
+    /// #6933 / #6872 — librespot absent, ou remplacé par un fichier vide
+    /// (images Docker arm64) : rien n'est retenu, et la consigne le dit.
+    #[cfg(unix)]
+    #[test]
+    fn binaire_6933_absent_ou_vide_rien_n_est_retenu() {
+        let tune = tempfile::tempdir().unwrap();
+        let vide = tempfile::tempdir().unwrap();
+        let path = std::ffi::OsString::from(vide.path());
+        assert_eq!(
+            chercher_librespot(None, Some(tune.path()), Some(&path), &[]),
+            None,
+            "aucun librespot : rien"
+        );
+        let place = poser(tune.path(), "");
+        assert_eq!(
+            chercher_librespot(Some(&place), Some(tune.path()), Some(&path), &[]),
+            None,
+            "un fichier vide n'est pas un librespot"
+        );
+    }
+
+    /// #6933 — la version est lue d'un vrai binaire, jamais d'un script.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binaire_6933_version_lue_sans_executer_un_script() {
+        let d = tempfile::tempdir().unwrap();
+        let script = poser(d.path(), "#!/bin/sh\necho librespot 9.9.9\n");
+        assert_eq!(version_de_librespot(&script).await, None);
+        // `/bin/echo` n'est pas un script : sa première ligne est relue
+        // (« --version » en BSD, la version de coreutils en GNU).
+        assert!(version_de_librespot(Path::new("/bin/echo")).await.is_some());
     }
 }

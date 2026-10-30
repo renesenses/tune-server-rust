@@ -6,11 +6,10 @@
 //! appelant hors de ses propres témoins » (commentaire de clôture sur
 //! l'issue). Ce fichier est la garde de l'autre moitié.
 //!
-//! Le renderer est un VRAI serveur SOAP sur `127.0.0.1`, qui répond le Sink
-//! relevé par Xavier Joly sur son Denon AVR-X1600H le 20/09/2026 — LPCM en
-//! `channels=1` et `channels=2`, `audio/flac:*` sans aucun `channels=`. Rien
-//! n'est simulé côté orchestrateur : la zone, la file, la piste et la sonde
-//! sont les vraies.
+//! Le renderer est un serveur SOAP sur `127.0.0.1`. Le relevé Denon est
+//! conservé tel quel : son LPCM stéréo ne prouve rien sur le FLAC. Une annonce
+//! synthétique FLAC stéréo protège séparément le repli. La zone, la file,
+//! la piste et la sonde sont les vraies.
 
 use std::sync::Arc;
 
@@ -48,16 +47,13 @@ async fn canaux_servis(canaux_source: i32, sink: &'static str) -> Option<u32> {
     r.channels
 }
 
-/// 🔴 LE témoin du lot. Rouge avant : la règle existait depuis la .159 mais
-/// personne ne l'appelait — `DecisionLocale.channels` valait `track.channels`,
-/// donc 6, et le FLAC 5.1 partait tel quel (`dlna_set_uri_ok …
-/// advertised_mime=audio/flac`, journal de Xavier du 20/09).
+/// Une annonce FLAC stéréo explicite doit toujours faire replier le 5.1.
 #[tokio::test]
 async fn un_51_vers_un_renderer_qui_annonce_deux_canaux_part_en_stereo() {
     assert_eq!(
-        canaux_servis(6, SINK_DENON).await,
+        canaux_servis(6, SINK_FLAC_STEREO).await,
         Some(2),
-        "le Denon annonce deux canaux au plus : le 5.1 doit être replié avant \
+        "le lecteur annonce le FLAC en deux canaux au plus : le 5.1 doit être replié avant \
          de partir, pas laissé à la charge de l'ampli"
     );
 }
@@ -82,15 +78,14 @@ async fn une_stereo_vers_le_meme_denon_ne_change_rien() {
     assert_eq!(canaux_servis(2, SINK_DENON).await, Some(2));
 }
 
-/// Un 7.1 vers ce Denon tombe aussi à deux : la matrice BS.775 étendue
-/// existe, et la déclaration est la même.
+/// Le même plafond FLAC explicite vaut aussi pour une source 7.1.
 #[tokio::test]
-async fn un_71_vers_le_meme_denon_part_aussi_en_stereo() {
-    assert_eq!(canaux_servis(8, SINK_DENON).await, Some(2));
+async fn seven_one_flac_is_reduced_for_explicit_stereo_renderer() {
+    assert_eq!(canaux_servis(8, SINK_FLAC_STEREO).await, Some(2));
 }
 
 /// Garde de l'appareillage lui-même : le faux Denon répond bien, et ce que
-/// Tune lit de son Sink est bien « deux canaux au plus ». Sans elle, un
+/// son résumé relève bien deux canaux explicites en LPCM. Sans elle, un
 /// témoin vert ne prouverait rien — il pourrait l'être parce que la sonde
 /// échoue et que personne ne réduit jamais.
 #[tokio::test]
@@ -108,4 +103,11 @@ async fn le_faux_denon_est_bien_lu_par_la_sonde() {
     assert!(caps.probed, "la sonde doit aboutir : {caps:?}");
     assert_eq!(caps.canaux_max, Some(2), "Sink lu : {:?}", caps.sink);
     handle.abort();
+}
+
+/// Le relevé réel reste inchangé : la limite LPCM ne plafonne pas le FLAC.
+#[tokio::test]
+async fn denon_lpcm_limit_does_not_limit_flac() {
+    assert_eq!(canaux_servis(6, SINK_DENON).await, Some(6));
+    assert_eq!(canaux_servis(8, SINK_DENON).await, Some(8));
 }

@@ -496,10 +496,6 @@ impl HiddenRepo {
             .collect())
     }
 
-    /// Re-rattache les marqueurs orphelins aux albums vivants retrouvés par
-    /// identité — le pendant de `FavoritesReconciler::run`, appelé aux mêmes
-    /// endroits (démarrage, post-scan, purge de bibliothèque).
-    ///
     // --- Titres bannis (#4806) ------------------------------------------
 
     /// Identité vivante (titre, interprète) de la piste, ou `None` si elle
@@ -781,6 +777,10 @@ impl HiddenRepo {
             .collect())
     }
 
+    /// Re-rattache les marqueurs orphelins aux albums vivants retrouvés par
+    /// identité — le pendant de `FavoritesReconciler::run`, appelé aux mêmes
+    /// endroits (démarrage, post-scan, purge de bibliothèque).
+    ///
     /// `delete_unresolved` ne doit être vrai qu'après un scan COMPLET et sain
     /// (même règle que les favoris, #1943) : c'est la seule situation où
     /// « introuvable » veut dire « n'existe vraiment plus ». Au démarrage ou
