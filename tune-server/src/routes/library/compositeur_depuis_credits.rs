@@ -686,7 +686,8 @@ pub(crate) async fn lancer(
             Json(json!({
                 "code": "compositeur_deja_en_cours",
                 "error": "compositeur_deja_en_cours",
-                "message": "La passe « compositeur depuis les crédits » tourne déjà.",
+                "message": crate::message_api::texte("api.library.composerPassRunning", &[]),
+                "message_key": "api.library.composerPassRunning",
             })),
         );
     }
@@ -700,7 +701,8 @@ pub(crate) async fn lancer(
             Json(json!({
                 "code": "enrichissement_en_pause",
                 "error": "enrichissement_en_pause",
-                "message": "L'enrichissement est suspendu. Reprenez-le avant de lancer la passe.",
+                "message": crate::message_api::texte("api.library.enrichmentPaused", &[]),
+                "message_key": "api.library.enrichmentPaused",
                 "reprendre": "POST /system/taches-de-fond/enrichment/reprendre",
             })),
         );

@@ -348,7 +348,8 @@ fn ligne_famine(output_id: &str, etat: EtatDuReleve<'_>) -> Option<Value> {
         EtatDuReleve::Occupee => Some(json!({
             "output_id": output_id,
             "mesure": "indisponible",
-            "raison": "sortie verrouillée au moment du relevé (elle jouait, ou le sondeur la lisait)",
+            "raison": crate::message_api::texte("api.diagnostics.outputLocked", &[]),
+            "raison_key": "api.diagnostics.outputLocked",
         })),
         EtatDuReleve::Mesure { nom, famine } => Some(json!({
             "output_id": output_id,
@@ -790,12 +791,8 @@ fn groupe_json(motif: &str, cle: &str, zones: &[&ZoneVue]) -> Value {
         "cle": cle,
         "en_ligne": en_ligne,
         "fusionnable": fusionnable,
-        "fusion_refusee_motif": (!fusionnable).then_some(
-            "deux protocoles de découverte différents sur le même hôte : \
-             SSDP/DLNA et mDNS/AirPlay n'ont aucun identifiant commun, et la \
-             fusion serait refusée (409 zones_distinctes). Supprimez la zone \
-             dont vous ne voulez pas ; ses réglages ne sont pas reportés.",
-        ),
+        "fusion_refusee_motif": (!fusionnable)
+            .then(|| crate::message_api::texte("api.diagnostics.mergeRefusedDifferentProtocols", &[])),
         "zones": zones.iter().map(|z| json!({
             "id": z.id,
             "name": z.name,
@@ -3545,7 +3542,8 @@ pub(super) async fn rearm_asio_warm_scan(
             Json(json!({
                 "status": "rearmed",
                 "retry": "next_restart",
-                "message": "Le balayage ASIO sera retenté une fois au prochain démarrage de Tune.",
+                "message": crate::message_api::texte("api.asio.rearmed", &[]),
+                "message_key": "api.asio.rearmed",
                 "asio_warm_scan": crate::startup::asio_warm_status(),
             })),
         ),
@@ -3554,7 +3552,8 @@ pub(super) async fn rearm_asio_warm_scan(
             Json(json!({
                 "status": "already_ready",
                 "retry": "next_restart",
-                "message": "Le balayage ASIO est déjà autorisé au prochain démarrage.",
+                "message": crate::message_api::texte("api.asio.alreadyReady", &[]),
+                "message_key": "api.asio.alreadyReady",
                 "asio_warm_scan": crate::startup::asio_warm_status(),
             })),
         ),
@@ -3562,7 +3561,8 @@ pub(super) async fn rearm_asio_warm_scan(
             StatusCode::CONFLICT,
             Json(json!({
                 "error": "asio_warm_scan_disabled_by_env",
-                "message": "Retirez TUNE_DISABLE_ASIO_SCAN puis redémarrez Tune ; le réarmement ne contourne pas ce coupe-circuit.",
+                "message": crate::message_api::texte("api.asio.disabledByEnv", &[]),
+                "message_key": "api.asio.disabledByEnv",
                 "asio_warm_scan": crate::startup::asio_warm_status(),
             })),
         ),
@@ -3570,7 +3570,8 @@ pub(super) async fn rearm_asio_warm_scan(
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({
                 "error": "asio_not_supported",
-                "message": "Le préchauffage ASIO ne concerne que Windows.",
+                "message": crate::message_api::texte("api.asio.windowsOnly", &[]),
+                "message_key": "api.asio.windowsOnly",
                 "asio_warm_scan": crate::startup::asio_warm_status(),
             })),
         ),
@@ -3716,12 +3717,11 @@ pub(super) async fn api_insights(State(state): State<AppState>) -> Json<Value> {
                 "severity": "warning",
                 "type": "zone_playback_beyond_duration",
                 "zone_id": zone_id,
-                "message": format!(
-                    "Zone {zone_id} : l'appareil annonce toujours la lecture alors que la \
-                     position a atteint la fin de la piste. Soit la lecture est bloquee, soit \
-                     la duree connue est fausse — voir lecture_annoncee_au_dela_de_la_duree \
-                     dans le journal."
+                "message": crate::message_api::texte(
+                    "api.diagnostics.playbackBeyondDuration",
+                    &[("zone_id", zone_id.to_string())],
                 ),
+                "message_key": "api.diagnostics.playbackBeyondDuration",
             }));
         }
     }

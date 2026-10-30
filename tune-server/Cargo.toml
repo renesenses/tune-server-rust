@@ -1867,3 +1867,10 @@ path = "tests/ecoutes_communaute_6738.rs"
 [[test]]
 name = "groupe_dlna_joue_sur_les_deux_6155"
 path = "tests/groupe_dlna_joue_sur_les_deux_6155.rs"
+
+# #7077, seconde passe — un refus jadis composé en français suit la langue de
+# l'interface (code stable + phrase traduite). `autotests = false` plus haut :
+# sans cette cible, le témoin ne serait JAMAIS compilé.
+[[test]]
+name = "messages_seconde_passe_7077"
+path = "tests/messages_seconde_passe_7077.rs"

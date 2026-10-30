@@ -471,7 +471,11 @@ async fn repair_mp3(
 
     for id in demande.track_ids {
         let Some((chemin, ancienne)) = connues.get(&id).cloned() else {
-            echecs.push(json!({"track_id": id, "error": "piste inconnue ou non MP3"}));
+            echecs.push(crate::message_api::avec_message(
+                json!({"track_id": id, "error": "track_unknown_or_not_mp3", "code": "track_unknown_or_not_mp3"}),
+                "api.metadata.trackUnknownOrNotMp3",
+                &[],
+            ));
             continue;
         };
 
@@ -484,7 +488,11 @@ async fn repair_mp3(
         .flatten();
 
         let Some(reelle) = reelle else {
-            echecs.push(json!({"track_id": id, "error": "fichier illisible ou absent"}));
+            echecs.push(crate::message_api::avec_message(
+                json!({"track_id": id, "error": "file_unreadable", "code": "file_unreadable"}),
+                "api.metadata.fileUnreadable",
+                &[],
+            ));
             continue;
         };
 
@@ -604,11 +612,13 @@ pub(crate) async fn edit_track(
             }
             Err(e) => {
                 tracing::warn!(track_id = id, error = %e, "edit_track_artiste_par_nom");
-                return (
+                return crate::message_api::refus_avec_cause(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Artiste « {nom} » impossible à enregistrer : {e}"),
-                )
-                    .into_response();
+                    "artist_save_failed",
+                    "api.metadata.artistSaveFailed",
+                    &[("name", nom.to_string())],
+                    e,
+                );
             }
         }
     }
@@ -661,11 +671,13 @@ pub(crate) async fn edit_track(
             }
             Err(e) => {
                 tracing::warn!(track_id = id, error = %e, "edit_track_album_par_titre");
-                return (
+                return crate::message_api::refus_avec_cause(
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("Album « {titre} » impossible à enregistrer : {e}"),
-                )
-                    .into_response();
+                    "album_save_failed",
+                    "api.metadata.albumSaveFailed",
+                    &[("title", titre.to_string())],
+                    e,
+                );
             }
         }
     }
@@ -694,11 +706,13 @@ pub(crate) async fn edit_track(
     // ci-dessus, à l'autre bout de la route.
     if let Err(e) = repo.update(&track) {
         tracing::warn!(track_id = id, error = %e, "edit_track_update_failed");
-        return (
+        return crate::message_api::refus_avec_cause(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Enregistrement de la piste impossible : {e}"),
-        )
-            .into_response();
+            "track_save_failed",
+            "api.metadata.trackSaveFailed",
+            &[],
+            e,
+        );
     }
 
     // Les champs corrigés à la main sont TENUS : une analyse complète, qui
