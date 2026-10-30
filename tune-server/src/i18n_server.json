@@ -3739,6 +3739,23 @@
     "pl": "Ta wtyczka jest dostarczana z tą instalacją i nie można jej usunąć. Została wyłączona i ukryta; ponowna instalacja ją przywraca.",
     "el": "Αυτό το πρόσθετο παρέχεται με την παρούσα εγκατάσταση και δεν μπορεί να διαγραφεί. Έχει απενεργοποιηθεί και αποκρυφθεί· η επανεγκατάστασή του το επαναφέρει."
   },
+  "plugin.uninstall.native_disabled": {
+    "fr": "Ce greffon est intégré à Tune : il n'y a aucun fichier à supprimer. Il a été désactivé ; il disparaît après le redémarrage et « Installer » le réactive.",
+    "en": "This plugin is built into Tune, so there is no file to delete. It has been disabled; it goes away after the restart and \"Install\" turns it back on.",
+    "de": "Dieses Plugin ist fester Bestandteil von Tune, es gibt keine Datei zu löschen. Es wurde deaktiviert; nach dem Neustart ist es weg, und „Installieren“ aktiviert es wieder.",
+    "es": "Este plugin está integrado en Tune, así que no hay ningún archivo que eliminar. Se ha desactivado; desaparece tras el reinicio y «Instalar» lo vuelve a activar.",
+    "it": "Questo plugin è integrato in Tune, quindi non c'è alcun file da eliminare. È stato disattivato; scompare dopo il riavvio e «Installa» lo riattiva.",
+    "zh": "此插件已内置于 Tune，没有可删除的文件。它已被停用，重启后将不再运行；点击“安装”即可重新启用。",
+    "ja": "このプラグインは Tune に組み込まれているため、削除するファイルはありません。無効化しました。再起動後に停止し、「インストール」で再び有効になります。",
+    "ko": "이 플러그인은 Tune에 내장되어 있어 삭제할 파일이 없습니다. 비활성화했으며, 재시작 후 사라지고 '설치'를 누르면 다시 켜집니다.",
+    "ro": "Acest plugin este integrat în Tune, deci nu există niciun fișier de șters. A fost dezactivat; dispare după repornire, iar „Instalează” îl reactivează.",
+    "sv": "Det här tillägget är inbyggt i Tune, så det finns ingen fil att ta bort. Det har inaktiverats; det försvinner efter omstarten och ”Installera” slår på det igen.",
+    "hu": "Ez a bővítmény a Tune része, ezért nincs törölhető fájl. Letiltottuk; az újraindítás után eltűnik, a „Telepítés” pedig újra bekapcsolja.",
+    "vi": "Plugin này được tích hợp sẵn trong Tune nên không có tệp nào để xóa. Nó đã được tắt; sau khi khởi động lại nó sẽ biến mất và “Cài đặt” sẽ bật lại.",
+    "nb": "Dette tillegget er innebygd i Tune, så det finnes ingen fil å slette. Det er deaktivert; det forsvinner etter omstarten, og «Installer» slår det på igjen.",
+    "pl": "Ta wtyczka jest wbudowana w Tune, więc nie ma pliku do usunięcia. Została wyłączona; znika po ponownym uruchomieniu, a „Zainstaluj” włącza ją z powrotem.",
+    "el": "Αυτό το πρόσθετο είναι ενσωματωμένο στο Tune, επομένως δεν υπάρχει αρχείο προς διαγραφή. Έχει απενεργοποιηθεί· εξαφανίζεται μετά την επανεκκίνηση και το «Εγκατάσταση» το ενεργοποιεί ξανά."
+  },
   "plugin.uninstall.permission_denied": {
     "fr": "Le serveur n'a pas le droit de supprimer ce greffon. Vérifiez que le dossier de données de Tune appartient bien à l'utilisateur du serveur.",
     "en": "The server is not allowed to delete this plugin. Check that Tune's data folder belongs to the user running the server.",
