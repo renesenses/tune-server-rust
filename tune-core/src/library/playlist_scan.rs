@@ -30,6 +30,14 @@ const DEFAULT_PROFILE_ID: i64 = 1;
 pub struct PlaylistScanReport {
     pub playlists_created: usize,
     pub tracks_added: usize,
+    /// #7503 — ce que le journal dit de chaque sortie, tenu aussi ici pour
+    /// que les essais le vérifient : fichiers de playlist trouvés sous les
+    /// racines…
+    pub files_found: usize,
+    /// … ceux écartés parce qu'une playlist du même nom existe déjà…
+    pub skipped_name_taken: Vec<String>,
+    /// … et ceux dont aucune ligne ne s'est rapprochée de la bibliothèque.
+    pub no_match: Vec<String>,
 }
 
 /// Canonical comparison key for a file path: forward slashes + NFC. Both the
@@ -123,17 +131,38 @@ pub fn import_local_playlists(db: &Arc<dyn DbBackend>, dirs: &[String]) -> Playl
     // quand tous portaient déjà une playlist du même nom : c'était le pic de
     // mémoire de la fin du scan (Shrek, 121 000 pistes : de 330 à 885 Mo).
     // Même filtre qu'avant, sur le même `existing` lu une fois.
-    let a_importer: Vec<(PathBuf, String)> = find_playlist_files(dirs)
-        .into_iter()
-        .filter_map(|pf| {
-            let name = pf
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())?;
-            (!existing.contains(&name)).then_some((pf, name))
-        })
-        .collect();
+    //
+    // #7503 — chaque fichier écarté l'est À VOIX HAUTE. Un `.m3u` posé dans le
+    // dossier de musique, un scan qui finit, et aucune ligne `playlist_scan_*`
+    // au journal : l'utilisateur ne pouvait pas savoir si le fichier n'avait
+    // pas été vu, ou s'il avait été ignoré parce qu'une playlist du même nom
+    // existait déjà — dans le profil 1, qu'il ne regarde peut-être pas.
+    let fichiers = find_playlist_files(dirs);
+    report.files_found = fichiers.len();
+    info!(
+        found = fichiers.len(),
+        dirs = ?dirs,
+        profile_id = DEFAULT_PROFILE_ID,
+        "playlist_scan_files_found"
+    );
+    let mut a_importer: Vec<(PathBuf, String)> = Vec::new();
+    for pf in fichiers {
+        let Some(name) = nom_de_playlist(&pf) else {
+            warn!(path = %pf.display(), "playlist_scan_skipped_unreadable_name");
+            continue;
+        };
+        if existing.contains(&name) {
+            info!(
+                name = %name,
+                path = %pf.display(),
+                profile_id = DEFAULT_PROFILE_ID,
+                "playlist_scan_skipped_name_taken — une playlist de ce nom existe déjà dans ce profil ; renommer le fichier ou supprimer la playlist pour le réimporter"
+            );
+            report.skipped_name_taken.push(name);
+            continue;
+        }
+        a_importer.push((pf, name));
+    }
     if a_importer.is_empty() {
         return report;
     }
@@ -166,7 +195,11 @@ pub fn import_local_playlists(db: &Arc<dyn DbBackend>, dirs: &[String]) -> Playl
                 continue;
             }
         };
-        let text = String::from_utf8_lossy(&raw);
+        // #7503 — le décodage de l'import manuel : BOM retiré, repli Latin-1.
+        // `from_utf8_lossy` seul changeait chaque accent d'un .m3u en
+        // Windows-1252 en U+FFFD (aucun chemin accentué ne se rapprochait), et
+        // laissait le BOM collé à la première ligne.
+        let text = super::m3u_parser::decode(&raw, false);
         let is_pls = pf
             .extension()
             .and_then(|e| e.to_str())
@@ -208,6 +241,25 @@ pub fn import_local_playlists(db: &Arc<dyn DbBackend>, dirs: &[String]) -> Playl
         }
 
         let results = match_tracks(&imported, &path_index, &fuzzy_index);
+        // #7503 — les lignes sans correspondance, et la première d'entre elles
+        // telle qu'elle a été cherchée : c'est ce qui permet de voir d'un coup
+        // d'œil un chemin qui ne ressemble pas à celui de la bibliothèque.
+        let mut non_rapprochees = 0usize;
+        let mut exemple: Option<String> = None;
+        for ((r, it), (est_qobuz, service)) in results.iter().zip(&imported).zip(&services) {
+            let trouvee = service.is_some() || (!*est_qobuz && r.tune_track_id.is_some());
+            if !trouvee {
+                non_rapprochees += 1;
+                if exemple.is_none() {
+                    exemple = Some(
+                        it.file_path
+                            .clone()
+                            .unwrap_or_else(|| r.imported_title.clone()),
+                    );
+                }
+            }
+        }
+        let exemple = exemple.unwrap_or_default();
         // L'ordre mixte est celui du fichier ; le dépôt dédoublonne les
         // identités locales et de service dans la même transaction.
         let entrees: Vec<EntryContent> = results
@@ -224,6 +276,15 @@ pub fn import_local_playlists(db: &Arc<dyn DbBackend>, dirs: &[String]) -> Playl
             })
             .collect();
         if entrees.is_empty() {
+            warn!(
+                name = %name,
+                path = %pf.display(),
+                total = imported.len(),
+                unmatched = non_rapprochees,
+                exemple = %exemple,
+                "playlist_scan_no_match — aucune ligne du fichier ne correspond à une piste de la bibliothèque ; playlist non créée"
+            );
+            report.no_match.push(name);
             continue;
         }
         match playlist_repo.create_with_entries(
@@ -236,7 +297,8 @@ pub fn import_local_playlists(db: &Arc<dyn DbBackend>, dirs: &[String]) -> Playl
                 report.playlists_created += 1;
                 report.tracks_added += ajoutees.len();
                 info!(name = %name, matched = ajoutees.len(), total = imported.len(),
-                    "playlist_scan_imported");
+                    unmatched = non_rapprochees, exemple = %exemple,
+                    profile_id = DEFAULT_PROFILE_ID, "playlist_scan_imported");
             }
             Err(e) => warn!(name = %name, error = %e, "playlist_scan_create_failed"),
         }
@@ -256,10 +318,23 @@ pub fn import_local_playlists(db: &Arc<dyn DbBackend>, dirs: &[String]) -> Playl
 fn find_playlist_files(dirs: &[String]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in dirs {
+        // #7503 — une erreur de parcours (droits, lien cassé, boucle) jetait
+        // en silence tout ce qu'il y avait dessous : on la compte et on cite
+        // la première.
+        let mut erreurs = 0usize;
+        let mut premiere: Option<String> = None;
         for entry in WalkDir::new(dir)
             .follow_links(true)
             .into_iter()
-            .filter_map(Result::ok)
+            .filter_map(|r| {
+                r.map_err(|e| {
+                    erreurs += 1;
+                    if premiere.is_none() {
+                        premiere = Some(e.to_string());
+                    }
+                })
+                .ok()
+            })
         {
             if !entry.file_type().is_file() {
                 continue;
@@ -273,8 +348,25 @@ fn find_playlist_files(dirs: &[String]) -> Vec<PathBuf> {
                 out.push(path.to_path_buf());
             }
         }
+        if erreurs > 0 {
+            warn!(
+                dir = %dir,
+                errors = erreurs,
+                premiere = %premiere.unwrap_or_default(),
+                "playlist_scan_walk_errors"
+            );
+        }
     }
     out
+}
+
+/// Nom de la playlist créée pour un fichier : son nom sans extension, rogné.
+/// `None` pour un nom vide ou qui n'est pas de l'UTF-8.
+fn nom_de_playlist(pf: &Path) -> Option<String> {
+    pf.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -331,6 +423,121 @@ mod tests {
         let report = import_local_playlists(&db, &["/nexiste/pas".to_string()]);
         assert_eq!(report.playlists_created, 0);
         assert_eq!(report.tracks_added, 0);
+    }
+
+    /// Une piste en base, au chemin donné (titre neutre : le rapprochement
+    /// testé ici est celui du CHEMIN, pas le repli titre/artiste).
+    fn piste(db: &Arc<dyn DbBackend>, id: i64, chemin: &str) {
+        use crate::db::backend::ToSqlValue;
+        let titre = format!("Piste {id}");
+        let params: [&dyn ToSqlValue; 3] = [&id, &titre, &chemin];
+        db.execute(
+            "INSERT INTO tracks (id, title, file_path) VALUES (?, ?, ?)",
+            &params,
+        )
+        .unwrap();
+    }
+
+    fn racine(dir: &tempfile::TempDir) -> Vec<String> {
+        vec![dir.path().to_string_lossy().into_owned()]
+    }
+
+    /// #7503 — un fichier ignoré parce que son nom est déjà pris l'est À
+    /// VOIX HAUTE : le rapport (et le journal) le nomme. Avant, rien ne
+    /// distinguait ce cas d'un fichier jamais vu.
+    #[test]
+    fn nom_deja_pris_est_rapporte_7503() {
+        let db = mem_db();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Mix.m3u"), "#EXTM3U\n/x/a.flac\n").unwrap();
+        PlaylistRepo::with_backend(db.clone())
+            .create("Mix", None, DEFAULT_PROFILE_ID)
+            .unwrap();
+
+        let r = import_local_playlists(&db, &racine(&dir));
+        assert_eq!(r.files_found, 1);
+        assert_eq!(r.skipped_name_taken, vec!["Mix".to_string()]);
+        assert_eq!(r.playlists_created, 0);
+    }
+
+    /// #7503 — zéro ligne rapprochée : la playlist n'est pas créée, mais le
+    /// rapport le dit (et le journal cite un chemin introuvable).
+    #[test]
+    fn zero_rapprochement_est_rapporte_7503() {
+        let db = mem_db();
+        piste(&db, 1, "/ailleurs/autre.flac");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Vide.m3u"), "#EXTM3U\n/nulle/part.flac\n").unwrap();
+
+        let r = import_local_playlists(&db, &racine(&dir));
+        assert_eq!(r.files_found, 1);
+        assert_eq!(r.no_match, vec!["Vide".to_string()]);
+        assert_eq!(r.playlists_created, 0);
+    }
+
+    /// #7503 — la forme exacte du fichier du fil 2550 : `#EXTINF:-1, - Titre`,
+    /// chemins ABSOLUS avec apostrophes, `&`, parenthèses, `_`, espaces ; ici
+    /// en plus un BOM et des fins de ligne CRLF. Tout se rapproche par le
+    /// chemin.
+    #[test]
+    fn chemins_du_fil_2550_se_rapprochent_7503() {
+        let db = mem_db();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_string_lossy().into_owned();
+        let chemins = [
+            format!("{base}/Pop Rock/The '59 Sound/1-02 The '59 Sound.flac"),
+            format!("{base}/Pop Rock/Agents of Fortune/1-03 (Don't Fear) The Reaper.flac"),
+            format!("{base}/Pop Rock/Boys Don't Cry/1-03 10_15 Saturday Night.flac"),
+            format!(
+                "{base}/Pop Rock/Abacab (embossed RBYG _ red_blue_yellow_grey cover)/1-01 Abacab.flac"
+            ),
+            format!("{base}/Pop Rock/Northern Lights - Southern Cross/004 A & B.flac"),
+        ];
+        let mut m3u = String::from("\u{feff}#EXTM3U\r\n");
+        for (i, c) in chemins.iter().enumerate() {
+            piste(&db, i as i64 + 1, c);
+            m3u.push_str(&format!("#EXTINF:-1, - Titre {i}\r\n{c}\r\n"));
+        }
+        std::fs::write(dir.path().join("Ma liste.m3u"), m3u).unwrap();
+
+        let r = import_local_playlists(&db, &racine(&dir));
+        assert_eq!(r.playlists_created, 1, "{r:?}");
+        assert_eq!(r.tracks_added, chemins.len());
+        assert!(r.no_match.is_empty());
+    }
+
+    /// #7503 — un .m3u en Latin-1 (Windows-1252) : ses accents se lisent comme
+    /// à l'import manuel. Contre-épreuve : avec `String::from_utf8_lossy`, `é`
+    /// (0xE9) devenait U+FFFD et le chemin ne se rapprochait plus.
+    #[test]
+    fn m3u_latin1_se_rapproche_7503() {
+        let db = mem_db();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_string_lossy().into_owned();
+        let chemin = format!("{base}/Caf\u{e9}/01 \u{c9}t\u{e9}.flac");
+        piste(&db, 1, &chemin);
+        let mut octets = b"#EXTM3U\n".to_vec();
+        octets.extend(chemin.chars().map(|c| u8::try_from(u32::from(c)).unwrap()));
+        octets.push(b'\n');
+        assert!(
+            std::str::from_utf8(&octets).is_err(),
+            "le fichier doit être du Latin-1"
+        );
+        std::fs::write(dir.path().join("Latin.m3u"), octets).unwrap();
+
+        let r = import_local_playlists(&db, &racine(&dir));
+        assert_eq!(r.playlists_created, 1, "{r:?}");
+        assert_eq!(r.tracks_added, 1);
+    }
+
+    /// #7503 — le BOM UTF-8 ne devient plus une « entrée » de chemin.
+    #[test]
+    fn bom_ne_devient_pas_une_entree_7503() {
+        let octets = "\u{feff}#EXTM3U\r\n/a/b.flac\r\n".as_bytes();
+        let texte = crate::library::m3u_parser::decode(octets, false);
+        let lignes = parse_m3u(&texte, None);
+        assert_eq!(lignes.len(), 1);
+        assert_eq!(lignes[0].file_path.as_deref(), Some("/a/b.flac"));
     }
 
     #[test]

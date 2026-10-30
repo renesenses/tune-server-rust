@@ -6,7 +6,7 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "collection-physique"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "collection-physique", "mon-theme"]
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
 local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture"]
@@ -89,6 +89,11 @@ assistant-ia = ["dep:tune-assistant-ia"]
 # opt-in à l'exécution (`default_enabled = false`), au catalogue, gratuit.
 # Inscrit à `sdk/plugins.json`.
 collection-physique = ["dep:tune-collection-physique"]
+# « Mon thème » (tune-web-client#2527, rc10) : toutes les couleurs de
+# l'interface au choix, rangées par profil. Dans `default` comme `cd` : opt-in
+# à l'exécution (`default_enabled = false`), au catalogue, gratuit. Inscrit à
+# `sdk/plugins.json`.
+mon-theme = ["dep:tune-mon-theme"]
 
 [dependencies]
 tune-plugin-native = { path = "../sdk/tune-plugin-native" }
@@ -117,6 +122,8 @@ tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tune-pont-roon = { path = "../plugins/tune-pont-roon", optional = true }
 tune-assistant-ia = { path = "../plugins/tune-assistant-ia", optional = true }
 tune-collection-physique = { path = "../plugins/tune-collection-physique", optional = true }
+
+tune-mon-theme = { path = "../plugins/tune-mon-theme", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
@@ -1043,6 +1050,11 @@ path = "tests/podcast_sortie_reseau_6468.rs"
 [[test]]
 name = "historique_conteneurs_6466"
 path = "tests/historique_conteneurs_6466.rs"
+# #6465 — `album-en-cours` lit le conteneur de la ligne jouée avant la session.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "album_en_cours_ligne_jouee_6465"
+path = "tests/album_en_cours_ligne_jouee_6465.rs"
 # #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
 # que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
 # une variable d'environnement que plus aucune etape ne pose. `autotests =
@@ -1728,6 +1740,12 @@ path = "tests/sso_deconnexion_efface_la_liaison_5326.rs"
 name = "sso_modules_du_compte"
 path = "tests/sso_modules_du_compte.rs"
 
+# #7419 — sur une nouvelle machine, la connexion au compte suffit : le statut
+# de licence dit que le Premium vient du compte (`premium_source`).
+[[test]]
+name = "licence_par_le_compte_7419"
+path = "tests/licence_par_le_compte_7419.rs"
+
 # #5682 — les gardes du montage SMB (#1834, #1916) et l'ordre « remonter les
 # partages, PUIS scanner » de `bootstrap.rs`. Le fichier existait sans cible :
 # `autotests = false` ne l'avait jamais compilé (relevé pendant #5682).
@@ -1867,3 +1885,10 @@ path = "tests/ecoutes_communaute_6738.rs"
 [[test]]
 name = "groupe_dlna_joue_sur_les_deux_6155"
 path = "tests/groupe_dlna_joue_sur_les_deux_6155.rs"
+
+# #7077, seconde passe — un refus jadis composé en français suit la langue de
+# l'interface (code stable + phrase traduite). `autotests = false` plus haut :
+# sans cette cible, le témoin ne serait JAMAIS compilé.
+[[test]]
+name = "messages_seconde_passe_7077"
+path = "tests/messages_seconde_passe_7077.rs"

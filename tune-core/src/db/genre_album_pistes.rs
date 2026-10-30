@@ -194,6 +194,68 @@ pub fn recopier(db: &Arc<dyn DbBackend>, album_id: i64, forcer: bool) -> Result<
     Ok(sortie)
 }
 
+/// #7538 — la descente d'une RÉPARATION de genre (Last.fm / Discogs, par
+/// artiste, par famille) : le genre de l'album ne COMBLE que les pistes qui
+/// n'en portent aucun — ni colonne `genre`, ni tableau `genres`.
+///
+/// « Un genre "Jazz" devient "Latin Jazz" » (Jean-François Paquet, 30/10) :
+/// une réparation ne vise que les albums SANS genre, mais [`recopier`]
+/// réécrivait TOUTES leurs pistes, y compris celles qui avaient le leur
+/// (« Jazz »), avec le genre trouvé — souvent un style Discogs ou le genre
+/// le plus fin de la famille (« Latin Jazz ») —, puis posait le marqueur que
+/// chaque scan repose par-dessus les balises. Une réparation comble ; elle
+/// n'écrase pas, et ne laisse donc pas de marqueur : une piste comblée garde
+/// son genre au scan (la mise à jour d'une piste ne remplace pas un genre
+/// par une balise vide), une piste qui avait le sien le garde.
+///
+/// Les pistes d'un dossier exclu de l'enrichissement ne sont pas touchées.
+/// Rend le nombre de pistes comblées.
+pub fn combler_les_pistes(db: &Arc<dyn DbBackend>, album_id: i64) -> Result<usize, String> {
+    let engine = db.engine();
+    let p1 = marque(engine, 1);
+    let p2 = marque(engine, 2);
+    let p3 = marque(engine, 3);
+    let id: &dyn ToSqlValue = &album_id;
+    let Some(ligne) = db.query_one(&format!("SELECT genre FROM albums WHERE id = {p1}"), &[id])?
+    else {
+        return Ok(0);
+    };
+    let genre = ligne
+        .first()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+    let Some((premier, json)) = colonnes_de_piste(&genre) else {
+        return Ok(0);
+    };
+    db.execute(
+        &format!(
+            "UPDATE albums SET genres = {p1} WHERE id = {p2} \
+             AND COALESCE(genres, '') IN ('', '[]')"
+        ),
+        &[&json as &dyn ToSqlValue, id],
+    )?;
+    let exclus = crate::taches_de_fond::perimetre::clause_hors_enrichissement(
+        db,
+        crate::taches_de_fond::perimetre::CHEMIN_OUVRABLE_DE_TRACKS,
+    );
+    let n = db.execute(
+        &format!(
+            "UPDATE tracks SET genre = {p1}, genres = {p2} WHERE album_id = {p3} \
+             AND COALESCE(genre, '') = '' AND COALESCE(genres, '') IN ('', '[]'){exclus}"
+        ),
+        &[&premier as &dyn ToSqlValue, &json as &dyn ToSqlValue, id],
+    )?;
+    tracing::debug!(album_id, comblees = n, "genre_album_comble_les_pistes");
+    Ok(n)
+}
+
+/// [`combler_les_pistes`], l'échec au journal (l'album est déjà écrit).
+pub fn combler_ou_journaliser(db: &Arc<dyn DbBackend>, album_id: i64) {
+    if let Err(e) = combler_les_pistes(db, album_id) {
+        tracing::warn!(album_id, error = %e, "genre_album_comblement_echoue");
+    }
+}
+
 /// Pour les appelants qui ne doivent PAS échouer sur la recopie (l'écriture
 /// de l'album a déjà réussi) : l'échec se lit au journal.
 pub fn recopier_ou_journaliser(db: &Arc<dyn DbBackend>, album_id: i64, forcer: bool) {

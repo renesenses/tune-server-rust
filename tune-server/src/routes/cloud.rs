@@ -418,7 +418,12 @@ async fn sso_callback(
         )
         .ok()
         .flatten()
-        .and_then(|row| row.first().and_then(|v| v.as_i64()));
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+        // #7082 : installation a un seul profil sans courriel -> la liaison s'y
+        // rattache au lieu de basculer la session sur un profil vierge.
+        .or_else(|| {
+            tune_core::cloud::proprietaire::rattacher_au_profil_unique(&state.backend, &user.email)
+        });
 
     let profile_id = if let Some(id) = existing_id {
         // Update display name from the cloud profile — but NOT avatar_path.
@@ -1301,8 +1306,15 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
     // question ne se pose pas (Free, ou abonnement réellement échu).
     let offline_grace = tune_core::license::offline_grace(&ls);
 
+    // #7419 — D'OÙ vient le Premium : « key » (clé de licence) ou « account »
+    // (compte Mozaiklabs lié, sans clé). `null` hors Premium. Sans ce champ,
+    // un serveur neuf devenu Premium par la seule connexion au compte montrait
+    // un champ de clé vide, et l'auditeur allait recopier une clé inutile.
+    let premium_source = state.license.source_du_premium().await;
+
     Json(json!({
         "tier": ls.tier,
+        "premium_source": premium_source,
         "license_key": ls.license_key,
         "expires_at": ls.expires_at,
         "last_validated": ls.last_validated,
@@ -1848,6 +1860,18 @@ mod tests_licence_proprietaire {
             adoption < ecrasement,
             "l'adoption lit `mozaik_user` APRES sa reecriture : elle adopterait \
              le compte qui vient de se connecter au lieu de celui deja en place"
+        );
+    }
+
+    /// #7082 : le rattachement au profil unique doit etre CABLE dans le callback.
+    #[test]
+    fn la_liaison_se_rattache_au_profil_unique() {
+        let source = include_str!("cloud.rs");
+        assert!(
+            source
+                .contains("proprietaire::rattacher_au_profil_unique(&state.backend, &user.email)"),
+            "le callback SSO ne rattache plus au profil unique : la session \
+             rebascule sur un profil vierge (photo et theme perdus, #7082)"
         );
     }
 

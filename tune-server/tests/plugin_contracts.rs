@@ -120,3 +120,7 @@ mod audio_offer_contract;
 // suivent la langue de la requête.
 #[path = "descriptions_greffons_langue_6458.rs"]
 mod descriptions_greffons_langue_6458;
+// tune-web-client#2527 — « Mon thème » au catalogue, son thème rangé par profil.
+#[cfg(feature = "mon-theme")]
+#[path = "mon_theme_catalogue_2527.rs"]
+mod mon_theme_catalogue_2527;

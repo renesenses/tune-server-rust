@@ -358,9 +358,11 @@ async fn upload_ir_handler(
         Some(autre) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("canal inconnu « {autre} » — attendu left ou right")
-                })),
+                Json(crate::message_api::corps_refus(
+                    "unknown_channel",
+                    "api.roomCorrection.unknownChannel",
+                    &[("channel", autre.to_string())],
+                )),
             )
                 .into_response();
         }
@@ -381,6 +383,11 @@ async fn upload_ir_handler(
         let droite = ir_dir.join(format!("zone_{zone_id}_R.wav"));
         if !gauche.exists() || !droite.exists() {
             let manquant = if gauche.exists() { "right" } else { "left" };
+            let cle_attente = if cote == "L" {
+                "api.roomCorrection.leftSavedAwaitingRight"
+            } else {
+                "api.roomCorrection.rightSavedAwaitingLeft"
+            };
             return Json(json!({
                 "ok": true,
                 "zone_id": zone_id,
@@ -388,10 +395,8 @@ async fn upload_ir_handler(
                 "awaiting_channel": manquant,
                 "active": false,
                 "size_bytes": body.len(),
-                "message": format!(
-                    "filtre {} enregistre — la correction s'activera au depot du canal {manquant}",
-                    if cote == "L" { "gauche" } else { "droit" }
-                ),
+                "message": crate::message_api::texte(cle_attente, &[]),
+                "message_key": cle_attente,
             }))
             .into_response();
         }

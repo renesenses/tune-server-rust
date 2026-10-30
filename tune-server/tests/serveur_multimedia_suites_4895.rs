@@ -229,7 +229,7 @@ async fn search_une_premiere_page_vide_sur_douze_annonces_est_un_echec_dit() {
         .or(corps["message"].as_str())
         .unwrap_or("");
     assert!(
-        message.contains("NAS du banc") && message.contains("0 des 12"),
+        message.contains("NAS du banc") && message.contains("0 of the 12"),
         "le message doit nommer le serveur et dire « 0 des 12 ».\n{corps}"
     );
 }
@@ -248,7 +248,7 @@ async fn search_une_page_vide_au_milieu_n_est_pas_une_fin_de_liste() {
     );
     let raison = corps["incomplet"].as_str().unwrap_or("");
     assert!(
-        raison.contains("8 des 13"),
+        raison.contains("8 of the 13"),
         "`incomplet` doit dire où la recherche s'est arrêtée.\n{corps}"
     );
 }
