@@ -133,6 +133,15 @@ dotenvy = "0.15"
 opt-level = 0
 debug = 0
 
+# `statime` 0.4.0 (Sortie AES67, #7336) porte un `debug_assert!` faux pour une
+# instance esclave seulement : quand le maître disparaît, son BMCA recommande
+# M2 et l'assertion tue le fil PTP, alors que le port, lui, repasse bien en
+# écoute (`set_recommended_port_state`). Les versions release ne l'évaluent
+# pas ; on l'éteint aussi en dev pour que tests et banc voient le vrai
+# comportement. Rien d'autre n'est touché.
+[profile.dev.package.statime]
+debug-assertions = false
+
 [profile.release]
 opt-level = 2
 lto = "thin"

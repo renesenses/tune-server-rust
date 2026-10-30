@@ -1,12 +1,12 @@
 //! La source d'horloge des horodatages RTP.
 //!
 //! AES67 lie l'horodatage RTP à une horloge de référence commune (PTPv2,
-//! RFC 7273) : `horodatage = temps × cadence mod 2³²`. L'étape E1 n'a pas de
-//! PTP : elle horodate sur l'horloge du système. L'étape E2 branchera un
-//! suiveur PTP (`statime`, décision de Bertrand du 30/10/2026) derrière ce
-//! même trait, sans toucher à l'émetteur : le cadenceur ne lit le temps que
-//! par [`SourceHorloge::maintenant_ns`], et le SDP ne décrit l'horloge que par
-//! [`SourceHorloge::reference`].
+//! RFC 7273) : `horodatage = temps × cadence + décalage mod 2³²`. Deux
+//! sources : [`HorlogeSysteme`] (étape E1, sans PTP) et le suiveur PTP
+//! [`crate::ptp::SuiveurPtp`] (étape E2, `statime`, décision de Bertrand du
+//! 30/10/2026). Le cadenceur ne lit le temps que par
+//! [`SourceHorloge::maintenant_ns`] et [`SourceHorloge::generation`], et le
+//! SDP ne décrit l'horloge que par [`SourceHorloge::reference`].
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -43,9 +43,18 @@ impl ReferenceHorloge {
 /// Une horloge de référence pour l'émetteur.
 pub trait SourceHorloge: Send + Sync {
     /// Le temps de référence, en nanosecondes depuis l'époque de l'horloge.
-    /// Doit être monotone : l'émetteur en déduit à la fois l'horodatage et
-    /// l'instant d'envoi de chaque paquet.
+    /// Doit être monotone À GÉNÉRATION ÉGALE : l'émetteur en déduit à la fois
+    /// l'horodatage et l'instant d'envoi de chaque paquet. Un saut (calage sur
+    /// un maître PTP, changement de maître) change la génération.
     fn maintenant_ns(&self) -> u64;
+
+    /// Change à chaque discontinuité de l'échelle de temps ou de la
+    /// référence annoncée (saut d'horloge, calage, repli, autre maître).
+    /// Le cadenceur repart alors d'une nouvelle origine, bit M posé, et le
+    /// SDP est réannoncé. Toujours 0 pour l'horloge système.
+    fn generation(&self) -> u64 {
+        0
+    }
 
     /// La référence à annoncer dans le SDP.
     fn reference(&self) -> ReferenceHorloge;
@@ -101,6 +110,12 @@ pub fn horodatage_rtp(temps_ns: u64, cadence: u32) -> u32 {
     trames as u32
 }
 
+/// L'horodatage RTP avec le décalage annoncé par `a=mediaclk:direct=<décalage>`
+/// (RFC 7273 § 5.2) : `temps × cadence + décalage`, modulo 2³².
+pub fn horodatage_rtp_decale(temps_ns: u64, cadence: u32, decalage: u32) -> u32 {
+    horodatage_rtp(temps_ns, cadence).wrapping_add(decalage)
+}
+
 /// L'instant (en ns de la même horloge) où commence la trame numéro
 /// `trames` comptée depuis `origine_ns`.
 pub fn instant_de_la_trame(origine_ns: u64, trames: u64, cadence: u32) -> u64 {
@@ -127,6 +142,14 @@ mod tests {
     }
 
     #[test]
+    fn le_decalage_media_s_ajoute_modulo_2_puissance_32() {
+        assert_eq!(horodatage_rtp_decale(1_000_000, 48_000, 0), 48);
+        assert_eq!(horodatage_rtp_decale(1_000_000, 48_000, 2), 50);
+        assert_eq!(horodatage_rtp_decale(0, 48_000, u32::MAX), u32::MAX);
+        assert_eq!(horodatage_rtp_decale(1_000_000, 48_000, u32::MAX), 47);
+    }
+
+    #[test]
     fn l_instant_d_une_trame_est_exact_a_la_nanoseconde() {
         assert_eq!(instant_de_la_trame(10, 48, 48_000), 10 + 1_000_000);
         assert_eq!(instant_de_la_trame(0, 48_000, 48_000), 1_000_000_000);
@@ -141,6 +164,7 @@ mod tests {
         assert!(b >= a + 2_000_000);
         assert_eq!(h.reference(), ReferenceHorloge::Locale);
         assert!(h.calee());
+        assert_eq!(h.generation(), 0);
     }
 
     #[test]

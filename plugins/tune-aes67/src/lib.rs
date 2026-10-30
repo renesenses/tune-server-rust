@@ -5,9 +5,12 @@
 //! déclaré par l'utilisateur devient une sortie (et donc une zone) par
 //! `register_output_provider`.
 //!
-//! Étape E1 de l'étude (coordination/etude-aes67-7336.md) :
-//! - horodatage sur l'HORLOGE SYSTÈME, sans PTP. Le suiveur PTP (`statime`,
-//!   étape E2) se branchera derrière [`horloge::SourceHorloge`] ;
+//! Étapes E1 et E2 de l'étude (coordination/etude-aes67-7336.md) :
+//! - horodatage sur l'horloge PTP du réseau : suiveur PTPv2 `statime`
+//!   ([`ptp::SuiveurPtp`], esclave seulement, domaine 0, horodatage
+//!   logiciel) derrière [`horloge::SourceHorloge`], avec REPLI EXPLICITE sur
+//!   l'horloge locale tant qu'aucun maître n'est suivi (journal
+//!   `aes67_ptp_repli_horloge_locale`, état dans `GET /`) ;
 //! - lecture, pause, reprise, arrêt ; ni saut ni enchaînement sans blanc
 //!   (étape E3) ;
 //! - volume logiciel facultatif, éteint par défaut ;
@@ -15,7 +18,8 @@
 //!   tant que le client web ne le consomme pas.
 //!
 //! Routes, sous `/api/v1/ext/aes67` :
-//! - `GET  /`     → droit Premium, étape, flux déclarés ;
+//! - `GET  /`     → droit Premium, étape, horloge (PTP calé ou repli),
+//!   flux déclarés ;
 //! - `PUT  /flux` → remplace la liste des flux (402 sans Premium).
 
 pub mod banc;
@@ -27,6 +31,7 @@ pub mod horloge;
 pub mod l24;
 pub mod paquetisation;
 pub mod producteur;
+pub mod ptp;
 pub mod reseau;
 pub mod rtp;
 pub mod sap;
@@ -52,6 +57,7 @@ use crate::config::FluxAes67;
 use crate::droit::{DroitDeLaLicence, DroitPremium};
 use crate::fournisseur::FournisseurAes67;
 use crate::horloge::{HorlogeSysteme, SourceHorloge};
+use crate::ptp::{ConfigPtp, SuiveurPtp};
 use crate::sortie::ReglagesEmission;
 
 /// Le nom du greffon, donc le préfixe de ses réglages (`plugin_aes67_*`) et
@@ -59,14 +65,28 @@ use crate::sortie::ReglagesEmission;
 pub const NOM: &str = "aes67";
 /// Réglage où la liste des flux est gardée (JSON), via `PluginContext`.
 pub const CLE_DES_FLUX: &str = "flux";
+/// Réglage : `false` coupe le suiveur PTP (horloge locale seule).
+pub const CLE_PTP_ACTIF: &str = "ptp_actif";
+/// Réglage : l'interface IPv4 où écouter le PTP (sinon celle du système).
+pub const CLE_PTP_INTERFACE: &str = "ptp_interface";
 const URL_OFFRE: &str = "https://mozaiklabs.fr/pricing";
 
-pub struct Aes67Plugin;
+pub struct Aes67Plugin {
+    suiveur: Option<Arc<SuiveurPtp>>,
+}
 
 impl Aes67Plugin {
     pub fn new() -> Self {
-        Self
+        Self { suiveur: None }
     }
+}
+
+/// Le suiveur PTP est-il demandé ? Oui sauf `false`/`0`/`non` explicite.
+pub fn ptp_demande(valeur: Option<&str>) -> bool {
+    !matches!(
+        valeur.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("false" | "0" | "non" | "off")
+    )
 }
 
 impl Default for Aes67Plugin {
@@ -114,22 +134,40 @@ impl TunePlugin for Aes67Plugin {
             ctx.get_config(CLE_DES_FLUX).as_deref(),
         )));
         let droit: Arc<dyn DroitPremium> = Arc::new(DroitDeLaLicence(ctx.license.clone()));
-        let horloge: Arc<dyn SourceHorloge> = Arc::new(HorlogeSysteme::new());
+        let suiveur = if ptp_demande(ctx.get_config(CLE_PTP_ACTIF).as_deref()) {
+            let interface = ctx
+                .get_config(CLE_PTP_INTERFACE)
+                .and_then(|i| i.trim().parse().ok());
+            Some(SuiveurPtp::demarrer(ConfigPtp::aes67(interface)))
+        } else {
+            tracing::info!("aes67_ptp_desactive: horloge locale seule");
+            None
+        };
+        let horloge: Arc<dyn SourceHorloge> = match &suiveur {
+            Some(s) => s.clone(),
+            None => Arc::new(HorlogeSysteme::new()),
+        };
+        self.suiveur = suiveur.clone();
         ctx.register_output_provider(Arc::new(FournisseurAes67::new(
             flux.clone(),
             droit.clone(),
-            horloge,
+            horloge.clone(),
             ReglagesEmission::default(),
         )));
         ctx.register_router(router(Etat {
             flux,
             droit,
             db: ctx.db(),
+            horloge,
+            suiveur,
         }));
         Ok(())
     }
 
     async fn teardown(&mut self) -> Result<(), String> {
+        if let Some(s) = self.suiveur.take() {
+            let _ = tokio::task::spawn_blocking(move || s.arreter()).await;
+        }
         Ok(())
     }
 
@@ -141,6 +179,8 @@ struct Etat {
     flux: Arc<RwLock<Vec<FluxAes67>>>,
     droit: Arc<dyn DroitPremium>,
     db: Option<Arc<dyn DbBackend>>,
+    horloge: Arc<dyn SourceHorloge>,
+    suiveur: Option<Arc<SuiveurPtp>>,
 }
 
 fn router(etat: Etat) -> Router<()> {
@@ -166,11 +206,22 @@ fn refus_premium() -> Response {
 
 async fn etat_du_greffon(State(etat): State<Etat>) -> Response {
     let flux = etat.flux.read().unwrap_or_else(|p| p.into_inner()).clone();
+    let ptp = match &etat.suiveur {
+        Some(s) => serde_json::to_value(s.etat()).unwrap_or_default(),
+        None => json!({
+            "actif": false,
+            "etat_port": "desactive",
+            "calee": false,
+            "repli_horloge_locale": true,
+            "raison_du_repli": "PTP désactivé par le réglage ptp_actif",
+        }),
+    };
     Json(json!({
         "premium": etat.droit.autorise().await,
-        "etape": "E1",
-        "reference_horloge": "local",
-        "ptp": false,
+        "etape": "E2",
+        "reference_horloge": etat.horloge.reference().attribut_sdp(),
+        "horloge_calee": etat.horloge.calee(),
+        "ptp": ptp,
         "flux": flux,
     }))
     .into_response()
@@ -237,6 +288,8 @@ mod tests {
             flux: Arc::new(RwLock::new(Vec::new())),
             droit: Arc::new(DroitDeLaLicence(Some(licence))),
             db: Some(backend.clone()),
+            horloge: Arc::new(HorlogeSysteme::new()),
+            suiveur: None,
         }
     }
 
@@ -315,6 +368,53 @@ mod tests {
         assert_eq!(relus.len(), 1);
         assert_eq!(relus[0].device_id(), "aes67:salon");
         assert_eq!(relus[0].port, 5004);
+    }
+
+    #[test]
+    fn le_ptp_est_demande_sauf_refus_explicite() {
+        assert!(ptp_demande(None));
+        assert!(ptp_demande(Some("true")));
+        assert!(!ptp_demande(Some("false")));
+        assert!(!ptp_demande(Some(" Non ")));
+        assert!(!ptp_demande(Some("0")));
+    }
+
+    #[tokio::test]
+    async fn l_etat_expose_le_repli_sur_l_horloge_locale_et_l_etat_du_suiveur() {
+        let b = base();
+        let mut e = etat(&b, Arc::new(LicenseManager::new(b.clone())));
+        // Sans suiveur (réglage ptp_actif = false).
+        let rep = router(e.clone())
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let j = json_de(rep).await;
+        assert_eq!(j["etape"], "E2");
+        assert_eq!(j["reference_horloge"], "local");
+        assert_eq!(j["ptp"]["repli_horloge_locale"], true);
+        assert_eq!(j["ptp"]["etat_port"], "desactive");
+        // Avec un suiveur qui n'entend aucun maître.
+        let rien = "127.0.0.1:9".parse().unwrap();
+        let mut cfg = ConfigPtp::aes67(None);
+        cfg.reseau =
+            ptp::transport::ConfigReseauPtp::unicast(std::net::Ipv4Addr::LOCALHOST, rien, rien);
+        let s = SuiveurPtp::demarrer(cfg);
+        e.horloge = s.clone();
+        e.suiveur = Some(s.clone());
+        let rep = router(e)
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let j = json_de(rep).await;
+        assert_eq!(j["reference_horloge"], "local");
+        assert_eq!(j["horloge_calee"], false);
+        assert_eq!(j["ptp"]["actif"], true);
+        assert_eq!(j["ptp"]["calee"], false);
+        assert_eq!(j["ptp"]["repli_horloge_locale"], true);
+        assert_eq!(j["ptp"]["raison_du_repli"], "aucun maître vu");
+        assert_eq!(j["ptp"]["domaine"], 0);
+        assert_eq!(j["ptp"]["horodatage"], "logiciel");
+        s.arreter();
     }
 
     #[test]

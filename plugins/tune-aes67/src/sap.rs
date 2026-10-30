@@ -114,8 +114,17 @@ pub fn lire(paquet: &[u8]) -> Result<SapLu, String> {
     })
 }
 
+/// Ce que l'annonceur relit avant chaque envoi : le SDP courant.
+pub type SdpCourant = Arc<dyn Fn() -> String + Send + Sync>;
+
 /// L'annonceur d'un flux : un fil qui répète l'annonce et envoie le retrait
 /// quand on l'arrête (ou qu'on le lâche).
+///
+/// Le SDP peut changer pendant la vie du flux (étape E2 : calage sur un
+/// maître PTP, repli sur l'horloge locale, autre maître). L'annonceur le
+/// relit toutes les 50 ms ; s'il a changé, il RETIRE l'ancien (son hachage
+/// n'est plus valable) et annonce le nouveau aussitôt, sans attendre
+/// l'intervalle.
 pub struct AnnonceurSap {
     arret: Arc<AtomicBool>,
     fil: Option<JoinHandle<()>>,
@@ -130,32 +139,54 @@ impl AnnonceurSap {
         sdp: String,
         intervalle: Duration,
     ) -> Self {
+        Self::demarrer_dynamique(
+            socket,
+            destination,
+            source,
+            Arc::new(move || sdp.clone()),
+            intervalle,
+        )
+    }
+
+    /// Comme [`Self::demarrer`], avec un SDP relu à chaque pas.
+    pub fn demarrer_dynamique(
+        socket: UdpSocket,
+        destination: SocketAddrV4,
+        source: Ipv4Addr,
+        sdp: SdpCourant,
+        intervalle: Duration,
+    ) -> Self {
         let arret = Arc::new(AtomicBool::new(false));
         let drapeau = arret.clone();
+        let envoyer = move |type_sap: TypeSap, texte: &str| {
+            let p = paquet(type_sap, hachage_du_message(texte), source, texte);
+            match socket.send_to(&p, destination) {
+                Err(e) => warn!(error = %e, %destination, "aes67_sap_envoi_refuse"),
+                Ok(_) => debug!(%destination, ?type_sap, "aes67_sap"),
+            }
+        };
         let fil = std::thread::Builder::new()
             .name("aes67-sap".into())
             .spawn(move || {
-                let hachage = hachage_du_message(&sdp);
-                let annonce = paquet(TypeSap::Annonce, hachage, source, &sdp);
                 let pas = Duration::from_millis(50);
-                'annonces: loop {
-                    if let Err(e) = socket.send_to(&annonce, destination) {
-                        warn!(error = %e, %destination, "aes67_sap_envoi_refuse");
-                    } else {
-                        debug!(%destination, "aes67_sap_annonce");
-                    }
-                    let mut attendu = Duration::ZERO;
-                    while attendu < intervalle {
-                        if drapeau.load(Ordering::Acquire) {
-                            break 'annonces;
-                        }
-                        std::thread::sleep(pas);
-                        attendu += pas;
+                let mut annonce = sdp();
+                envoyer(TypeSap::Annonce, &annonce);
+                let mut attendu = Duration::ZERO;
+                while !drapeau.load(Ordering::Acquire) {
+                    std::thread::sleep(pas);
+                    attendu += pas;
+                    let courant = sdp();
+                    if courant != annonce {
+                        envoyer(TypeSap::Retrait, &annonce);
+                        annonce = courant;
+                        envoyer(TypeSap::Annonce, &annonce);
+                        attendu = Duration::ZERO;
+                    } else if attendu >= intervalle {
+                        envoyer(TypeSap::Annonce, &annonce);
+                        attendu = Duration::ZERO;
                     }
                 }
-                let retrait = paquet(TypeSap::Retrait, hachage, source, &sdp);
-                let _ = socket.send_to(&retrait, destination);
-                debug!(%destination, "aes67_sap_retrait");
+                envoyer(TypeSap::Retrait, &annonce);
             })
             .ok();
         Self { arret, fil }
@@ -214,6 +245,52 @@ mod tests {
         assert_ne!(a, 0);
         assert_ne!(a, b);
         assert_eq!(a, hachage_du_message(SDP), "stable");
+    }
+
+    #[test]
+    fn un_sdp_qui_change_retire_l_ancien_et_annonce_le_nouveau_aussitot() {
+        let ecoute = UdpSocket::bind("127.0.0.1:0").unwrap();
+        ecoute
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let std::net::SocketAddr::V4(destination) = ecoute.local_addr().unwrap() else {
+            panic!("IPv4 attendu");
+        };
+        let courant = Arc::new(std::sync::Mutex::new(String::from(SDP)));
+        let lu = courant.clone();
+        let mut annonceur = AnnonceurSap::demarrer_dynamique(
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            destination,
+            Ipv4Addr::LOCALHOST,
+            Arc::new(move || lu.lock().unwrap().clone()),
+            Duration::from_secs(3600),
+        );
+        let mut t = [0u8; 2048];
+        let n = ecoute.recv(&mut t).unwrap();
+        let premier = lire(&t[..n]).unwrap();
+        assert_eq!(
+            (premier.type_sap, premier.sdp.as_str()),
+            (TypeSap::Annonce, SDP)
+        );
+        let nouveau = SDP.replace("Salon", "Bureau");
+        *courant.lock().unwrap() = nouveau.clone();
+        let debut = std::time::Instant::now();
+        let n = ecoute.recv(&mut t).unwrap();
+        let retrait = lire(&t[..n]).unwrap();
+        assert_eq!(
+            (retrait.type_sap, retrait.sdp.as_str()),
+            (TypeSap::Retrait, SDP)
+        );
+        let n = ecoute.recv(&mut t).unwrap();
+        let annonce = lire(&t[..n]).unwrap();
+        assert_eq!(annonce.type_sap, TypeSap::Annonce);
+        assert_eq!(annonce.sdp, nouveau);
+        assert_ne!(annonce.hachage, premier.hachage);
+        assert!(
+            debut.elapsed() < Duration::from_secs(1),
+            "sans attendre l'intervalle"
+        );
+        annonceur.arreter();
     }
 
     #[test]

@@ -2,8 +2,14 @@
 //!
 //! Le cadenceur ne connaît le temps que par la [`SourceHorloge`] : l'instant
 //! d'envoi du paquet `k` est `origine + k × durée`, l'horodatage RTP est
-//! `horodatage(origine + avance) + k × trames`. Brancher une horloge PTP à
-//! l'étape E2 ne change donc rien ici.
+//! `horodatage(origine + avance) + décalage + k × trames`. Avec le suiveur PTP
+//! (étape E2), l'instant d'envoi ET l'horodatage sont en temps PTP : le flux
+//! suit la cadence du maître, pas celle du quartz local.
+//!
+//! Quand la [`SourceHorloge::generation`] change (calage sur un maître,
+//! saut d'horloge, changement de maître, repli sur l'horloge locale), le fil
+//! repart d'une nouvelle origine, bit M posé : un horodatage ne mélange
+//! jamais deux échelles de temps.
 //!
 //! Ce que le fil fait quand le PCM manque (décodeur en retard, pause) : il
 //! n'émet RIEN — le récepteur se tait — et repart sur une nouvelle origine,
@@ -23,7 +29,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
-use crate::horloge::{SourceHorloge, horodatage_rtp, instant_de_la_trame};
+use crate::horloge::{SourceHorloge, horodatage_rtp_decale, instant_de_la_trame};
 use crate::rtp::EnteteRtp;
 
 /// Au-delà de ce retard sur l'échéance, on repart d'une nouvelle origine.
@@ -91,6 +97,8 @@ pub struct ParametresCadence {
     /// Avance de l'horodatage sur l'instant d'envoi. Zéro à l'étape E1 ;
     /// réglable pour l'étape E2, où il faudra la mesurer face à un récepteur.
     pub avance: Duration,
+    /// `a=mediaclk:direct=<décalage>` : ajouté à chaque horodatage.
+    pub decalage_media: u32,
     /// Paquets à tenir prêts avant de poser une origine (départ, reprise).
     pub pretampon_paquets: usize,
     /// Demander l'ordonnancement temps réel pour le fil (SCHED_FIFO sous
@@ -118,10 +126,18 @@ pub fn lancer(
         })
 }
 
-fn attendre_jusqu_a(horloge: &dyn SourceHorloge, echeance_ns: u64, commandes: &Commandes) {
+fn attendre_jusqu_a(
+    horloge: &dyn SourceHorloge,
+    echeance_ns: u64,
+    generation: u64,
+    commandes: &Commandes,
+) {
     loop {
         let maintenant = horloge.maintenant_ns();
-        if maintenant >= echeance_ns || commandes.arret.load(Ordering::Acquire) {
+        if maintenant >= echeance_ns
+            || commandes.arret.load(Ordering::Acquire)
+            || horloge.generation() != generation
+        {
             return;
         }
         let reste = Duration::from_nanos(echeance_ns - maintenant);
@@ -138,8 +154,9 @@ fn boucle(
     stats: &Statistiques,
 ) {
     let mut sequence: u16 = (p.ssrc >> 16) as u16;
-    // (origine en ns, horodatage RTP de l'origine), et le rang du paquet.
-    let mut origine: Option<(u64, u32)> = None;
+    // (origine en ns, horodatage RTP de l'origine, génération de l'horloge),
+    // et le rang du paquet.
+    let mut origine: Option<(u64, u32, u64)> = None;
     let mut rang: u64 = 0;
     // Les charges déjà tirées du canal. Au départ (et à chaque reprise), on
     // attend d'en avoir `pretampon_paquets` — ou la fin du flux — avant de
@@ -193,9 +210,20 @@ fn boucle(
             break;
         };
 
+        if let Some((_, _, g)) = origine
+            && g != horloge.generation()
+        {
+            info!(
+                avant = g,
+                apres = horloge.generation(),
+                "aes67_horloge_changee_nouvelle_origine"
+            );
+            origine = None;
+        }
+        let generation = horloge.generation();
         let maintenant = horloge.maintenant_ns();
         let marqueur = origine.is_none();
-        let (origine_ns, origine_ts) = *origine.get_or_insert_with(|| {
+        let (origine_ns, origine_ts, _) = *origine.get_or_insert_with(|| {
             rang = 0;
             if premiere_origine {
                 premiere_origine = false;
@@ -204,7 +232,12 @@ fn boucle(
             }
             (
                 maintenant,
-                horodatage_rtp(maintenant.saturating_add(avance_ns), p.cadence),
+                horodatage_rtp_decale(
+                    maintenant.saturating_add(avance_ns),
+                    p.cadence,
+                    p.decalage_media,
+                ),
+                generation,
             )
         });
         let trames_avant = rang * u64::from(p.trames_par_paquet);
@@ -218,9 +251,15 @@ fn boucle(
             tampon.push_front(charge);
             continue;
         }
-        attendre_jusqu_a(horloge, echeance, commandes);
+        attendre_jusqu_a(horloge, echeance, generation, commandes);
         if commandes.arret.load(Ordering::Acquire) {
             break;
+        }
+        if horloge.generation() != generation {
+            // L'échelle a changé pendant l'attente : ce paquet repartira sur
+            // la nouvelle origine.
+            tampon.push_front(charge);
+            continue;
         }
         let entete = EnteteRtp {
             marqueur,
@@ -262,6 +301,7 @@ mod tests {
             type_charge: 98,
             ssrc: 0x1234_5678,
             avance: Duration::ZERO,
+            decalage_media: 0,
             pretampon_paquets: 1,
             temps_reel: false,
         }
@@ -371,6 +411,98 @@ mod tests {
         let r = stats.releve();
         assert_eq!(r.sous_alimentations, 1);
         assert_eq!(r.resynchronisations, 1);
+    }
+
+    /// Une horloge système qu'on peut faire sauter, génération à l'appui,
+    /// comme le suiveur PTP quand il se cale sur un maître.
+    struct HorlogeQuiSaute {
+        base: HorlogeSysteme,
+        saut_ns: AtomicU64,
+        generation: AtomicU64,
+    }
+
+    impl SourceHorloge for HorlogeQuiSaute {
+        fn maintenant_ns(&self) -> u64 {
+            self.base.maintenant_ns() + self.saut_ns.load(Ordering::Acquire)
+        }
+        fn reference(&self) -> crate::horloge::ReferenceHorloge {
+            crate::horloge::ReferenceHorloge::Locale
+        }
+        fn generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+    }
+
+    #[test]
+    fn un_changement_de_generation_repart_d_une_origine_marquee_sur_la_nouvelle_echelle() {
+        let ecoute = UdpSocket::bind("127.0.0.1:0").unwrap();
+        ecoute
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.connect(ecoute.local_addr().unwrap()).unwrap();
+        let (tx, rx) = sync_channel(400);
+        for _ in 0..200 {
+            tx.send(Message::Charge(vec![0; 288])).unwrap();
+        }
+        tx.send(Message::Fin).unwrap();
+        let horloge = Arc::new(HorlogeQuiSaute {
+            base: HorlogeSysteme::new(),
+            saut_ns: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+        });
+        let stats = Arc::new(Statistiques::default());
+        let mut p = parametres();
+        p.decalage_media = 1000;
+        let fil = lancer(
+            s,
+            rx,
+            horloge.clone(),
+            p,
+            Arc::new(Commandes::default()),
+            stats.clone(),
+        )
+        .unwrap();
+        let mut t = [0u8; 2048];
+        let mut entetes = Vec::new();
+        for _ in 0..50 {
+            let n = ecoute.recv(&mut t).unwrap();
+            entetes.push(EnteteRtp::lire(&t[..n]).unwrap().0);
+        }
+        // Saut d'une heure, comme un calage PTP : nouvelle génération.
+        const HEURE_NS: u64 = 3_600_000_000_000;
+        horloge.saut_ns.store(HEURE_NS, Ordering::Release);
+        horloge.generation.store(1, Ordering::Release);
+        let apres_saut = horloge.maintenant_ns();
+        for _ in 50..200 {
+            let n = ecoute.recv(&mut t).unwrap();
+            entetes.push(EnteteRtp::lire(&t[..n]).unwrap().0);
+        }
+        fil.join().unwrap();
+        // Le temps et la génération sont lus séparément : selon l'ordre vu
+        // par le fil, la rupture peut passer par la garde de retard puis par
+        // la génération (deux origines coup sur coup). C'est la DERNIÈRE
+        // origine marquée qui porte la nouvelle échelle.
+        let marques: Vec<usize> = entetes
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, e)| e.marqueur)
+            .map(|(i, _)| i)
+            .collect();
+        let rupture = *marques.last().expect("un paquet marqué après le saut");
+        assert!(marques[0] >= 50, "rupture au paquet {}", marques[0]);
+        assert!(marques.len() <= 2, "{marques:?}");
+        // Après la rupture, l'horodatage suit la nouvelle échelle (+1 h, soit
+        // 172 800 000 trames de plus, modulo 2³²) avec le décalage annoncé.
+        let attendu = horodatage_rtp_decale(apres_saut, 48_000, 1000);
+        let ecart = entetes[rupture].horodatage.wrapping_sub(attendu) as i32;
+        assert!(ecart.abs() < 48 * 20, "écart {ecart} trames");
+        for paire in entetes[rupture..].windows(2) {
+            assert_eq!(paire[1].horodatage, paire[0].horodatage.wrapping_add(48));
+        }
+        let r = stats.releve().resynchronisations;
+        assert!((1..=2).contains(&r), "{r}");
     }
 
     #[test]

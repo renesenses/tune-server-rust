@@ -61,6 +61,7 @@ async fn main() {
             intervalle_sap: Duration::from_secs(1),
             temps_reel: true,
             avance: Duration::ZERO,
+            decalage_media: 0,
         },
     )
     .expect("sortie");

@@ -72,6 +72,7 @@ async fn un_fichier_44_1_khz_arrive_intact_en_l24_48_khz_annonce_par_sap() {
             intervalle_sap: Duration::from_millis(500),
             temps_reel: false,
             avance: Duration::ZERO,
+            decalage_media: 0,
         },
     )
     .unwrap();
@@ -239,6 +240,7 @@ async fn pause_reprise_et_volume_logiciel() {
             intervalle_sap: Duration::from_secs(3600),
             temps_reel: false,
             avance: Duration::ZERO,
+            decalage_media: 0,
         },
     )
     .unwrap();

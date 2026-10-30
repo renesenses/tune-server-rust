@@ -8,6 +8,10 @@
 //! Le flux est annoncé en SAP dès que la sortie existe, lecture ou non : un
 //! utilisateur doit pouvoir abonner son récepteur avant d'appuyer sur
 //! lecture. Le retrait SAP part quand la sortie est lâchée.
+//!
+//! Étape E2 : le SDP suit l'horloge. Quand la référence change (calage sur
+//! un maître PTP, repli sur l'horloge locale, autre maître), la version de
+//! `o=` avance et l'annonceur SAP réannonce aussitôt.
 
 use std::net::SocketAddrV4;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,9 +29,9 @@ use tune_core::outputs::traits::{
 use crate::cadenceur::{self, Commandes, ParametresCadence, Statistiques};
 use crate::config::{DUREE_PAQUET_US, FluxAes67, TYPE_DE_SORTIE};
 use crate::droit::DroitPremium;
-use crate::horloge::SourceHorloge;
+use crate::horloge::{ReferenceHorloge, SourceHorloge};
 use crate::producteur::{self, Gain, SourceAudio};
-use crate::sap::{AnnonceurSap, DESTINATION_SAP, INTERVALLE_SAP};
+use crate::sap::{AnnonceurSap, DESTINATION_SAP, INTERVALLE_SAP, SdpCourant};
 use crate::sdp::DescriptionSession;
 use crate::{paquetisation, reseau};
 
@@ -43,6 +47,9 @@ pub struct ReglagesEmission {
     pub intervalle_sap: Duration,
     pub temps_reel: bool,
     pub avance: Duration,
+    /// `a=mediaclk:direct=<décalage>` (RFC 7273) ; 0 par défaut, comme la
+    /// plupart des émetteurs AES67.
+    pub decalage_media: u32,
 }
 
 impl Default for ReglagesEmission {
@@ -52,7 +59,43 @@ impl Default for ReglagesEmission {
             intervalle_sap: INTERVALLE_SAP,
             temps_reel: true,
             avance: Duration::ZERO,
+            decalage_media: 0,
         }
+    }
+}
+
+/// Le SDP d'un flux, réécrit quand la référence d'horloge change.
+pub struct SdpDuFlux {
+    horloge: Arc<dyn SourceHorloge>,
+    courant: Mutex<(DescriptionSession, String)>,
+}
+
+impl SdpDuFlux {
+    fn new(mut description: DescriptionSession, horloge: Arc<dyn SourceHorloge>) -> Self {
+        description.reference = horloge.reference();
+        let texte = description.ecrire();
+        Self {
+            horloge,
+            courant: Mutex::new((description, texte)),
+        }
+    }
+
+    /// Le SDP d'aujourd'hui ; `o=` change de version si la référence a
+    /// changé depuis la dernière lecture.
+    pub fn courant(&self) -> String {
+        let reference: ReferenceHorloge = self.horloge.reference();
+        let mut garde = self.courant.lock().unwrap_or_else(|p| p.into_inner());
+        if garde.0.reference != reference {
+            garde.0.reference = reference;
+            garde.0.version += 1;
+            garde.1 = garde.0.ecrire();
+            info!(
+                version = garde.0.version,
+                ts_refclk = %reference.attribut_sdp(),
+                "aes67_sdp_reference_changee"
+            );
+        }
+        garde.1.clone()
     }
 }
 
@@ -85,7 +128,7 @@ pub struct SortieAes67 {
     droit: Arc<dyn DroitPremium>,
     reglages: ReglagesEmission,
     destination: SocketAddrV4,
-    sdp: String,
+    sdp: Arc<SdpDuFlux>,
     trames_par_paquet: usize,
     ssrc: u32,
     annonceur: Mutex<Option<AnnonceurSap>>,
@@ -127,7 +170,7 @@ impl SortieAes67 {
         let destination = SocketAddrV4::new(flux.adresse, flux.port);
         let origine = reseau::adresse_d_origine(destination, flux.interface);
         let (id_session, ssrc) = identifiants(&flux, horloge.maintenant_ns());
-        let sdp = DescriptionSession {
+        let description = DescriptionSession {
             id_session,
             version: 1,
             origine,
@@ -140,8 +183,9 @@ impl SortieAes67 {
             canaux: flux.canaux,
             duree_paquet_us: DUREE_PAQUET_US,
             reference: horloge.reference(),
-        }
-        .ecrire();
+            decalage_media: reglages.decalage_media,
+        };
+        let sdp = Arc::new(SdpDuFlux::new(description, horloge.clone()));
         let socket_sap = reseau::ouvrir_socket(
             reglages.destination_sap,
             flux.interface,
@@ -150,11 +194,13 @@ impl SortieAes67 {
             false,
         )
         .map_err(|e| format!("socket SAP : {e}"))?;
-        let annonceur = AnnonceurSap::demarrer(
+        let lecteur = sdp.clone();
+        let sdp_courant: SdpCourant = Arc::new(move || lecteur.courant());
+        let annonceur = AnnonceurSap::demarrer_dynamique(
             socket_sap,
             reglages.destination_sap,
             origine,
-            sdp.clone(),
+            sdp_courant,
             reglages.intervalle_sap,
         );
         info!(
@@ -182,9 +228,9 @@ impl SortieAes67 {
         })
     }
 
-    /// Le SDP annoncé.
-    pub fn sdp(&self) -> &str {
-        &self.sdp
+    /// Le SDP annoncé (celui de l'horloge d'aujourd'hui).
+    pub fn sdp(&self) -> String {
+        self.sdp.courant()
     }
 
     pub fn flux(&self) -> &FluxAes67 {
@@ -344,6 +390,7 @@ impl OutputTarget for SortieAes67 {
                 type_charge: self.flux.type_charge,
                 ssrc: self.ssrc,
                 avance: self.reglages.avance,
+                decalage_media: self.reglages.decalage_media,
                 pretampon_paquets: PRETAMPON,
                 temps_reel: self.reglages.temps_reel,
             },
@@ -444,8 +491,9 @@ impl OutputTarget for SortieAes67 {
             "destination": self.destination.to_string(),
             "reference_horloge": self.horloge.reference().attribut_sdp(),
             "horloge_calee": self.horloge.calee(),
+            "generation_horloge": self.horloge.generation(),
             "volume_logiciel": self.flux.volume_logiciel,
-            "sdp": self.sdp,
+            "sdp": self.sdp.courant(),
             "emission": stats,
         }))
     }

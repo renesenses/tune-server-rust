@@ -132,6 +132,7 @@ mod tests {
             intervalle_sap: Duration::from_secs(3600),
             temps_reel: false,
             avance: Duration::ZERO,
+            decalage_media: 0,
         }
     }
 

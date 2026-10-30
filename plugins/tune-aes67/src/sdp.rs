@@ -30,6 +30,9 @@ pub struct DescriptionSession {
     /// Durée de paquet, en microsecondes (1000 = 1 ms).
     pub duree_paquet_us: u32,
     pub reference: ReferenceHorloge,
+    /// `a=mediaclk:direct=<décalage>` (RFC 7273 § 5.2) : l'horodatage RTP
+    /// vaut `temps de référence × cadence + décalage`, modulo 2³².
+    pub decalage_media: u32,
 }
 
 /// Retire ce qui casserait une ligne SDP (fin de ligne, caractères de
@@ -78,7 +81,7 @@ impl DescriptionSession {
             ),
             format!("a=ptime:{}", ptime(self.duree_paquet_us)),
             format!("a=ts-refclk:{}", self.reference.attribut_sdp()),
-            "a=mediaclk:direct=0".to_string(),
+            format!("a=mediaclk:direct={}", self.decalage_media),
             "a=recvonly".to_string(),
         ];
         let mut sdp = lignes.join("\r\n");
@@ -178,6 +181,7 @@ mod tests {
             canaux: 2,
             duree_paquet_us: 1000,
             reference: ReferenceHorloge::Locale,
+            decalage_media: 0,
         }
     }
 
@@ -210,6 +214,14 @@ mod tests {
             d.ecrire()
                 .contains("a=ts-refclk:ptp=IEEE1588-2008:00-01-02-03-04-05-06-07:0\r\n")
         );
+    }
+
+    #[test]
+    fn le_decalage_media_est_annonce_dans_mediaclk() {
+        let mut d = salon();
+        d.decalage_media = 1_234_567;
+        assert!(d.ecrire().contains("a=mediaclk:direct=1234567\r\n"));
+        assert_eq!(lire(&d.ecrire()).unwrap().mediaclk, "direct=1234567");
     }
 
     #[test]
