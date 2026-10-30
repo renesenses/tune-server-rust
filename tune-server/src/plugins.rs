@@ -229,6 +229,16 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
         )))
         .await;
 
+    // Sortie AES67 (#7336) — Premium, Linux seul (Bertrand, 30/10/2026). Le
+    // greffon ne reçoit rien à la construction : la licence lui arrive par le
+    // contexte (`PluginContext::license`), la base aussi ; ses flux deviennent
+    // des sorties par `register_output_provider`, avec le cycle de vie de
+    // zone des sorties découvertes.
+    #[cfg(all(feature = "aes67", target_os = "linux"))]
+    loader
+        .register(Box::new(tune_aes67::Aes67Plugin::new()))
+        .await;
+
     // Pont Roon (#3914) — Premium. La licence est passée pour que le greffon
     // refuse lui-même (402) ; le cache d'illustrations, pour y ranger les
     // images de l'archive sous le même condensat que tout le reste.

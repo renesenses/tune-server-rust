@@ -6452,6 +6452,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tune-aes67"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2 0.5.10",
+ "symphonia",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "tune-core",
+]
+
+[[package]]
 name = "tune-assistant-ia"
 version = "1.0.0"
 dependencies = [
@@ -6935,6 +6954,7 @@ dependencies = [
  "tower-service",
  "tracing",
  "tracing-subscriber",
+ "tune-aes67",
  "tune-assistant-ia",
  "tune-bandcamp",
  "tune-cd",

@@ -84,6 +84,13 @@ entree-audio = ["dep:tune-entree-audio"]
 # fournisseur n'est réglé. Inscrit à `sdk/plugins.json`, d'où les lignes de
 # build et de test des workflows sont générées.
 assistant-ia = ["dep:tune-assistant-ia"]
+# Sortie AES67 (#7336) — Premium (`Feature::Aes67`), étape E1 (sans PTP).
+# HORS `default` et HORS `sdk/plugins.json` : aucune ligne de build publiée ne
+# la compile encore. Première version Linux seule (Bertrand, 30/10/2026) : la
+# dépendance n'est déclarée que pour `target_os = "linux"` (plus bas), et
+# l'enregistrement est sous `cfg(all(feature = "aes67", target_os = "linux"))`.
+# Allumée ailleurs, la feature ne compile rien et ne casse rien.
+aes67 = ["dep:tune-aes67"]
 
 [dependencies]
 tune-plugin-native = { path = "../sdk/tune-plugin-native" }
@@ -153,6 +160,11 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }
 dotenvy = { workspace = true }
+
+# Sortie AES67 (#7336) : Linux seul pour la première version. Voir la feature
+# `aes67` plus haut.
+[target.'cfg(target_os = "linux")'.dependencies]
+tune-aes67 = { path = "../plugins/tune-aes67", optional = true }
 
 [dev-dependencies]
 tower = "0.5"
