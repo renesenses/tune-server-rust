@@ -3184,7 +3184,7 @@ mod parc_local_pendant_la_lecture_6119_tests;
 /// qu'il a moins de cinq minutes.
 #[cfg(feature = "local-audio")]
 pub const DUREE_DU_PARC_POUR_LE_DIAGNOSTIC: std::time::Duration =
-    std::time::Duration::from_secs(300);
+    std::time::Duration::from_secs(5 * 60);
 
 /// #7263 — le parc local de la fiche de diagnostic : le parc publié s'il est
 /// assez récent, sinon la même règle que [`parc_local_sans_couper_la_lecture`].
