@@ -1194,6 +1194,7 @@ pub struct PlaybackOrchestrator {
     /// left None in tests → no gating). Enforced at zone activation in `play`.
     pub license: Option<Arc<crate::license::LicenseManager>>,
     gapless_sessions: Mutex<HashMap<i64, String>>,
+    browser_next: navigateur_suivante_5975::PreparationsNavigateur,
     /// #3365 — la qualité annoncée de la piste pré-armée, rangée à côté de
     /// `gapless_sessions` et reprise par `advance_queue_metadata` quand la
     /// zone adopte ce flux. Carte annexe plutôt qu'un changement de forme de
@@ -1505,6 +1506,7 @@ pub struct ResolvedStream {
     pub format_source: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ResolvedQueueItem {
     pub url: String,
     pub mime_type: String,
@@ -1753,6 +1755,7 @@ impl PlaybackOrchestrator {
             event_bus: None,
             license: None,
             gapless_sessions: Mutex::new(HashMap::new()),
+            browser_next: Mutex::new(HashMap::new()),
             qualites_pre_armees: Mutex::new(HashMap::new()),
             prefetch: Arc::new(PrefetchEngine::new()),
             preparations_fichiers: Default::default(),
@@ -1960,6 +1963,7 @@ mod serveur_source_absent_4362;
 /// `resolve_direct`, pour que les deux ne puissent pas diverger.
 pub mod verdict_upnp;
 
+mod navigateur_suivante_5975;
 mod queue;
 pub use queue::{Enjambee, lignes_bannies_a_enjamber};
 
