@@ -964,7 +964,15 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
 
 async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &PlayResult) -> Value {
     let mut zone = build_zone_json(state, zone_id).await;
-    if let Some(ref err) = result.error {
+    // #7247 : un Play remplacé par un choix plus récent n'est pas un refus ;
+    // ce marqueur interne ne s'affiche pas à l'auditeur (« Cannot play:
+    // superseded by a newer play »). Les vrais refus et les avertissements
+    // d'une sortie qui a accepté Play restent publiés.
+    if let Some(err) = result
+        .error
+        .as_deref()
+        .filter(|err| *err != tune_core::orchestrator::PLAY_SUPERSEDED)
+    {
         zone.as_object_mut()
             .unwrap()
             .insert("error".into(), json!(err));
@@ -10486,3 +10494,7 @@ mod lecture_d_une_playlist_a_lignes_introuvables_6179 {
 #[cfg(test)]
 #[path = "playback/echec_transfert_6155_tests.rs"]
 mod echec_transfert_6155_tests;
+
+#[cfg(test)]
+#[path = "playback/remplacement_volontaire_7247_tests.rs"]
+mod remplacement_volontaire_7247_tests;
