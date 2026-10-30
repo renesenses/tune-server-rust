@@ -1686,6 +1686,14 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/stop", post(stop))
         .route("/{id}/next", post(next))
         .route("/{id}/previous", post(previous))
+        .route(
+            "/{id}/browser-next",
+            post(suivante_navigateur_5975::preparer),
+        )
+        .route(
+            "/{id}/browser-next/playing",
+            post(suivante_navigateur_5975::adopter),
+        )
         // #6066 — le lecteur d'une zone navigateur dit qu'il joue : c'est la
         // seule preuve d'écoute qui ne soit pas une sonde de plage.
         .route(
@@ -1838,6 +1846,7 @@ mod erreur_media_navigateur;
 mod lecture_navigateur;
 /// #5395 — la radio artiste à la demande.
 mod radio_artiste;
+mod suivante_navigateur_5975;
 
 /// Replace a zone's queue after taking the SQLite user-write lane.
 ///

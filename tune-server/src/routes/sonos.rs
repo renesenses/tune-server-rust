@@ -228,12 +228,10 @@ async fn group_rooms(Path(id): Path<String>, Json(_body): Json<GroupBody>) -> im
     warn!(coordinator = %id, "sonos_group_non_implemente");
     (
         StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "sonos_grouping_not_implemented",
-            "message": "Le groupage multi-pièces Sonos n'est pas implémenté : \
-                        ce serveur n'interroge pas le service ZoneGroupTopology \
-                        et n'envoie aucun x-rincon: aux enceintes. Aucun groupe \
-                        n'a été formé.",
-        })),
+        Json(crate::message_api::corps_refus(
+            "sonos_grouping_not_implemented",
+            "api.sonos.groupingNotImplemented",
+            &[],
+        )),
     )
 }

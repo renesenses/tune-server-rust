@@ -282,7 +282,12 @@ pub(super) async fn start(
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return (StatusCode::CONFLICT, "Un audit est déjà en cours").into_response();
+        return crate::message_api::refus(
+            StatusCode::CONFLICT,
+            "audit_in_progress",
+            "api.library.auditInProgress",
+            &[],
+        );
     }
     let garde = Garde;
     let db = state.backend.clone();
