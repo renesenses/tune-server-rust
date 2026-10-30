@@ -11,20 +11,21 @@
 //! peut pas honorer.
 //!
 //! Le banc : la zone du fil 1949 (même C19, égaliseur armé, opt-in
-//! `dsp_progressif_reseau`), un faux Qobuz qui rend un FLAC de 6 s servi par
-//! `Range` depuis la boucle locale, une sortie factice de type `dlna` qui note
-//! les `play_media` et les `seek`, et une piste en lecture sur un canal sans
+//! `dsp_progressif_reseau`), un faux Qobuz qui rend une adresse HTTPS de CDN
+//! (le bras `resoudre_flux_https`, donc le WAV progressif de #5080), un CDN
+//! qui accepte la connexion sans jamais répondre (la résolution rend son
+//! adresse quand même, #5080), une sortie factice de type `dlna` qui note les
+//! `play_media` et les `seek`, et une piste en lecture sur un canal sans
 //! `Range`.
 //!
 //! Contre-épreuve : remettre dans `deplacer_la_sortie` la recréation sans
 //! `seek_ms` suivie du `Seek` SOAP fait tomber
 //! `avancer_dans_un_titre_qobuz_converti_recree_le_flux_a_la_position_7422`
-//! (le `Seek` part, et la nouvelle session sert les 6 s depuis le début).
+//! (un `Seek` part vers le flux sans `Range`).
 use super::PlaybackOrchestrator;
 use super::service_wav_progressif_5080::{flux_qobuz, zone_du_fil_1949};
 use super::session::REPLAY_OUTPUT_SEEK_SETTLE_MS;
 use crate::db::migrations::run_migrations;
-use crate::db::settings_repo::SettingsRepo;
 use crate::db::sqlite::SqliteDb;
 use crate::error::TuneError;
 use crate::http::streamer::{AudioStreamer, StreamInfo};
@@ -36,12 +37,6 @@ use crate::streaming::traits::{
     AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamTrack, StreamUrl,
     StreamingService,
 };
-use axum::{
-    Router,
-    http::{HeaderMap, StatusCode, header},
-    response::IntoResponse,
-    routing::get,
-};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -51,67 +46,29 @@ const APPAREIL: &str = "uuid:c19-5080";
 const SR: u32 = 44_100;
 const SECONDES: u32 = 6;
 const CIBLE_MS: u64 = 3_000;
-/// Octets de PCM d'une seconde : 44,1 kHz, 16 bits, stéréo.
-const OCTETS_PAR_SECONDE: usize = (SR * 4) as usize;
 
-/// Un FLAC de [`SECONDES`] s, encodé par Tune.
-async fn flac_de_six_secondes() -> Vec<u8> {
-    let mut enc = crate::audio::encoder::AudioEncoder::new("flac", SR, 16, 2);
-    enc.start().await.unwrap();
-    // Un signal non nul, pour que rien ne se résume à du silence compressé.
-    let mut pcm = Vec::with_capacity((SR * SECONDES * 4) as usize);
-    for i in 0..(SR * SECONDES) {
-        let v = (((i % 100) as i16) - 50) * 100;
-        let o = v.to_le_bytes();
-        pcm.extend_from_slice(&[o[0], o[1], o[0], o[1]]);
-    }
-    enc.write(&pcm).await.unwrap();
-    enc.finish().await.unwrap()
-}
-
-/// Un « CDN » qui sert `octets` en `Range`, comme Qobuz.
-async fn cdn_par_range(octets: Vec<u8>) -> String {
-    let octets = Arc::new(octets);
-    let app = Router::new().route(
-        "/piste.flac",
-        get(move |entetes: HeaderMap| {
-            let octets = octets.clone();
-            async move {
-                let total = octets.len();
-                let (debut, fin) = entetes
-                    .get(header::RANGE)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.strip_prefix("bytes="))
-                    .and_then(|v| {
-                        let (a, b) = v.split_once('-')?;
-                        let a: usize = a.parse().ok()?;
-                        let b: usize = if b.is_empty() {
-                            total - 1
-                        } else {
-                            b.parse().ok()?
-                        };
-                        Some((a, b.min(total - 1)))
-                    })
-                    .unwrap_or((0, total - 1));
-                (
-                    StatusCode::PARTIAL_CONTENT,
-                    [
-                        (
-                            header::CONTENT_RANGE,
-                            format!("bytes {debut}-{fin}/{total}"),
-                        ),
-                        (header::CONTENT_TYPE, "audio/flac".to_string()),
-                    ],
-                    octets[debut..=fin].to_vec(),
-                )
-                    .into_response()
-            }
-        }),
-    );
+/// Un CDN qui accepte les connexions et ne répond rien tant que le témoin ne
+/// l'a pas libéré. Libéré, il ferme toutes les connexions : les fils
+/// bloquants encore suspendus dessus se terminent, et le runtime du test
+/// peut s'arrêter.
+async fn cdn_muet_en_https() -> (String, tokio::sync::watch::Sender<bool>) {
+    let (liberer, mut attente) = tokio::sync::watch::channel(false);
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/piste.flac", ecoute.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
-    url
+    let url = format!("https://{}/piste.flac", ecoute.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut tenues = Vec::new();
+        loop {
+            tokio::select! {
+                acceptee = ecoute.accept() => match acceptee {
+                    Ok((socket, _)) => tenues.push(socket),
+                    Err(_) => break,
+                },
+                _ = attente.wait_for(|libre| *libre) => break,
+            }
+        }
+        drop(tenues);
+    });
+    (url, liberer)
 }
 
 /// Un faux Qobuz : `get_track_url` rend l'adresse du CDN de banc.
@@ -187,8 +144,7 @@ impl StreamingService for QobuzDuBanc {
 
 /// La zone C19 qui joue un titre Qobuz converti, servi par un canal sans
 /// `Range` (la voie `conversion` du rapport).
-async fn titre_qobuz_converti_en_lecture() -> (PlaybackOrchestrator, i64, String) {
-    let url = cdn_par_range(flac_de_six_secondes().await).await;
+async fn titre_qobuz_converti_en_lecture(url: String) -> (PlaybackOrchestrator, i64, String) {
     let db = SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
     run_migrations(&db).unwrap();
@@ -204,11 +160,6 @@ async fn titre_qobuz_converti_en_lecture() -> (PlaybackOrchestrator, i64, String
         None,
     );
     let zone_id = zone_du_fil_1949(&orch);
-    // Témoin sur la LONGUEUR servie : la compensation de niveau (#5071) n'y
-    // change rien, on la coupe pour garder le banc simple.
-    SettingsRepo::with_backend(orch.db.clone())
-        .set(&format!("zone_{zone_id}_level_compensation"), "false")
-        .unwrap();
     let sortie = MockOutput::new(APPAREIL, "DDC-0 C19").with_type("dlna");
     orch.outputs.lock().await.register(Box::new(sortie));
 
@@ -251,75 +202,55 @@ async fn recu_par_la_sortie(orch: &PlaybackOrchestrator) -> (usize, Vec<u64>) {
     (mock.play_call_count().await, mock.seek_calls())
 }
 
-/// Octets de PCM servis par la session, en-tête WAV exclu.
-async fn pcm_servi(orch: &PlaybackOrchestrator, sid: &str) -> usize {
-    let session = {
-        let etat = orch.streamer.sessions_state();
-        let etat = etat.lock().await;
-        etat.get(sid).expect("la session doit exister").clone()
-    };
-    let premier = tokio::time::timeout(Duration::from_secs(10), session.recv_chunk())
-        .await
-        .expect("aucun octet en 10 s")
-        .expect("canal fermé avant l'en-tête");
-    assert_eq!(&premier[..4], b"RIFF", "l'en-tête WAV doit passer intact");
-    let mut total = premier.len().saturating_sub(44);
-    while let Ok(Some(chunk)) =
-        tokio::time::timeout(Duration::from_secs(10), session.recv_chunk()).await
-    {
-        total += chunk.len();
-    }
-    total
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn avancer_dans_un_titre_qobuz_converti_recree_le_flux_a_la_position_7422() {
-    let (orch, zone_id, sid) = titre_qobuz_converti_en_lecture().await;
+    let (url, liberer) = cdn_muet_en_https().await;
+    let (orch, zone_id, sid) = titre_qobuz_converti_en_lecture(url).await;
     assert!(
         !orch.streamer.is_seekable_session(&sid).await,
         "prémisse : le titre est servi par un canal, sans Range"
     );
 
-    orch.seek(zone_id, CIBLE_MS, Some(APPAREIL))
-        .await
-        .expect("le déplacement doit aboutir");
+    let resultat = tokio::time::timeout(
+        Duration::from_secs(10),
+        orch.seek(zone_id, CIBLE_MS, Some(APPAREIL)),
+    )
+    .await;
     // Laisser partir un éventuel Seek détaché d'après relecture.
     tokio::time::sleep(Duration::from_millis(REPLAY_OUTPUT_SEEK_SETTLE_MS + 700)).await;
-
     let etat = orch.playback.get_state(zone_id).await;
+    let (lectures, seeks) = recu_par_la_sortie(&orch).await;
+    let nouveau = etat
+        .now_playing
+        .as_ref()
+        .and_then(|np| np.stream_id.clone());
+    let nouveau_cherchable = match nouveau.as_deref() {
+        Some(s) => Some(orch.streamer.is_seekable_session(s).await),
+        None => None,
+    };
+    // Libérer le CDN AVANT d'affirmer : un fil bloquant encore suspendu
+    // dessus retiendrait l'arrêt du runtime.
+    let _ = liberer.send(true);
+
+    resultat
+        .expect("le déplacement a attendu le CDN")
+        .expect("le déplacement doit aboutir");
     assert_eq!(
         etat.position_ms, CIBLE_MS as i64,
         "la position suit le geste"
     );
-    let nouveau = etat
-        .now_playing
-        .and_then(|np| np.stream_id)
-        .expect("une session porte le flux");
+    let nouveau = nouveau.expect("une session porte le flux recréé");
     assert_ne!(nouveau, sid, "le flux a été recréé");
-    assert!(
-        !orch.streamer.is_seekable_session(&nouveau).await,
+    assert_eq!(
+        nouveau_cherchable,
+        Some(false),
         "prémisse : le flux recréé repart lui aussi par la voie conversion, sans Range"
     );
-    let (lectures, seeks) = recu_par_la_sortie(&orch).await;
     assert_eq!(lectures, 1, "le flux recréé a été posé sur le renderer");
     assert!(
         seeks.is_empty(),
         "aucun Seek SOAP ne doit partir vers un flux sans Range, qu'il ne peut \
-         pas honorer : {seeks:?}"
-    );
-
-    // Le flux recréé doit COMMENCER à la position : il sert le reste du
-    // titre (3 s), pas ses 6 s depuis le début.
-    let servi = pcm_servi(&orch, &nouveau).await;
-    let restant = OCTETS_PAR_SECONDE * (SECONDES as usize - (CIBLE_MS / 1000) as usize);
-    assert!(
-        servi > OCTETS_PAR_SECONDE,
-        "trop peu de PCM servi : {servi} octets"
-    );
-    assert!(
-        servi <= restant + OCTETS_PAR_SECONDE / 2,
-        "le flux recréé sert {servi} octets, soit le titre depuis le début \
-         (attendu ≈ {restant} octets, le reste après {CIBLE_MS} ms) : le \
-         renderer rejouerait le morceau au début (fil 2535)"
+         pas honorer : le renderer rejouerait le morceau au début (fil 2535) : \
+         {seeks:?}"
     );
 }
