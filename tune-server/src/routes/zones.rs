@@ -854,6 +854,9 @@ pub(crate) fn inject_session_context(obj: &mut serde_json::Map<String, Value>, p
 ///
 /// # L'ordre de résolution, et pourquoi celui-là
 ///
+/// 0. **la ligne jouée** (`queue_items.context_*`, #6466) quand elle porte son
+///    propre conteneur : un album ajouté à la file s'ouvre lui-même, pas
+///    l'album de la session (#6465) ;
 /// 1. **le geste** (`session_context_type == "album"`). Il survit aux avances
 ///    automatiques : la deuxième piste d'un album reste une écoute d'album, là
 ///    où `current_track` change à chaque piste. C'est ce qui fait un « retour à
@@ -912,8 +915,33 @@ pub(super) async fn album_en_cours(
 
     let ps = state.playback.get_state(id).await;
 
-    // 1. Le geste.
-    if ps.session_context_type.as_deref() == Some("album")
+    // 0. Le conteneur de la LIGNE qui joue (#6466), avant celui de la session.
+    // FabienM (#6465, fil 2379 point 5) : un album lu, puis un second album
+    // ajouté à la file ; sur une piste du second, la vignette ouvrait le
+    // premier, parce que le contexte de SESSION (le dernier « Lire ») était lu
+    // d'abord. Une ligne qui porte son propre conteneur l'emporte : un album →
+    // cet album ; autre chose (titre seul, playlist, artiste) → le geste de
+    // session ne la concerne pas, on passe à la piste elle-même (étape 2).
+    let ligne = ps.now_playing.as_ref().and_then(|np| {
+        tune_core::db::contexte_de_file::contexte_de_la_piste_jouee(
+            &state.backend,
+            id,
+            ps.queue_position,
+            np.track_id,
+            np.source_id.as_deref(),
+        )
+    });
+    if let Some(c) = ligne.as_ref()
+        && c.nature == "album"
+        && let Some(album) = c.id.as_deref().filter(|s| !s.trim().is_empty())
+    {
+        let service = c.service.as_deref().unwrap_or("local");
+        return Json(reponse(id, service, album, None, "queue_context")).into_response();
+    }
+
+    // 1. Le geste — seulement pour une ligne sans conteneur propre.
+    if ligne.is_none()
+        && ps.session_context_type.as_deref() == Some("album")
         && let Some(album) = ps
             .session_context_id
             .as_deref()
