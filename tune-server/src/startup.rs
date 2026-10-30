@@ -659,6 +659,11 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
         // #4626 — les sorties prêtées par les agents Tune appairés.
         crate::agent_tune::maitre::reinscrire_les_agents(&state_clone).await;
     });
+    // #6961 — la resonde ci-dessus ne part qu'UNE fois. Une zone DLNA/OpenHome
+    // restée hors ligne (appareil injoignable à cet instant précis, réseau de
+    // la machine pas encore prêt) est réévaluée ensuite, à intervalles, au
+    // lieu d'attendre un `NOTIFY` qu'un renderer déjà allumé n'émet pas.
+    crate::discovery_setup::spawn_reevaluation_des_zones_hors_ligne(state);
 
     // Re-probe auto-discovered DLNA renderers from their persisted LOCATION,
     // so one with a lazy SSDP responder (Cyrus Stream X2) comes back online
