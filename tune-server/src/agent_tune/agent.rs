@@ -324,7 +324,10 @@ pub async fn executer(
 ) -> Result<(), Refus> {
     let sortie = sortie_locale(state, device_id).await.ok_or((
         StatusCode::NOT_FOUND,
-        format!("sortie inconnue sur cet agent : {device_id}"),
+        crate::message_api::texte(
+            "api.agent.unknownOutput",
+            &[("device_id", device_id.to_string())],
+        ),
     ))?;
     let sortie = sortie.lock().await;
     let statut = sortie
@@ -337,8 +340,7 @@ pub async fn executer(
     let pas_tenue = || {
         (
             StatusCode::CONFLICT,
-            "sortie occupée sur l'agent : une lecture locale ou un autre maître la tient"
-                .to_string(),
+            crate::message_api::texte("api.agent.outputBusy", &[]),
         )
     };
     match commande {
@@ -436,7 +438,10 @@ pub async fn etat(
 ) -> Result<EtatSortieDistante, Refus> {
     let sortie = sortie_locale(state, device_id).await.ok_or((
         StatusCode::NOT_FOUND,
-        format!("sortie inconnue sur cet agent : {device_id}"),
+        crate::message_api::texte(
+            "api.agent.unknownOutput",
+            &[("device_id", device_id.to_string())],
+        ),
     ))?;
     let sortie = sortie.lock().await;
     let mut statut = sortie

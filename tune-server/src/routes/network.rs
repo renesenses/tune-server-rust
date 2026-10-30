@@ -607,9 +607,8 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
             "part_max": PART_MAX_ABSENCE_SIMULTANEE,
             "plancher": PLANCHER_PLAFOND_ABSENCE,
             "confirmation_apres_secs": refus.confirmation_apres_secs,
-            "motif": "une bascule de cette ampleur est bien plus souvent notre propre lien réseau \
-                      qui tombe qu'une extinction simultanée. Les serveurs restent proposés ; \
-                      si le silence dure une seconde fenêtre, l'absence sera actée.",
+            "motif": crate::message_api::texte("api.network.massSwitchRefused", &[]),
+            "motif_key": "api.network.massSwitchRefused",
         });
     }
     Json(sortie)
@@ -1812,52 +1811,87 @@ impl EchecParcours {
         match self {
             EchecParcours::ServeurInconnu(id) => (
                 StatusCode::NOT_FOUND,
-                format!(
-                    "serveur multimédia {id} inconnu du registre en mémoire — \
-                     pas encore découvert, ou oublié"
+                crate::message_api::texte(
+                    "api.network.mediaServerUnknown",
+                    &[("id", id.to_string())],
                 ),
             ),
             EchecParcours::Transport(e) => (
                 StatusCode::GATEWAY_TIMEOUT,
-                format!("{nom_du_serveur} n'a pas répondu au {action} : {e}"),
+                crate::message_api::texte(
+                    "api.network.serverNoReply",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                        ("error", e.to_string()),
+                    ],
+                ),
             ),
             EchecParcours::Statut(code) => (
                 StatusCode::BAD_GATEWAY,
-                format!("{nom_du_serveur} a répondu HTTP {code} au {action}"),
+                crate::message_api::texte(
+                    "api.network.serverHttpStatus",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                        ("code", code.to_string()),
+                    ],
+                ),
             ),
             EchecParcours::SansResultat => (
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "{nom_du_serveur} a répondu sans élément <Result> au {action} \
-                     (SOAP Fault ?)"
+                crate::message_api::texte(
+                    "api.network.serverNoResult",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                    ],
                 ),
             ),
             EchecParcours::SansCompteur => (
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "{nom_du_serveur} a répondu au {action} sans compteur \
-                     NumberReturned lisible"
+                crate::message_api::texte(
+                    "api.network.serverNoCounter",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                        ("counter", "NumberReturned".to_string()),
+                    ],
                 ),
             ),
             EchecParcours::SansTotal => (
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "{nom_du_serveur} a répondu au {action} sans compteur \
-                     TotalMatches lisible"
+                crate::message_api::texte(
+                    "api.network.serverNoCounter",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                        ("counter", "TotalMatches".to_string()),
+                    ],
                 ),
             ),
             EchecParcours::DidlIllisible { lus, annonces } => (
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "{nom_du_serveur} a rendu au {action} un DIDL que Tune ne sait \
-                     pas lire : {lus} des {annonces} éléments annoncés lus"
+                crate::message_api::texte(
+                    "api.network.serverDidlUnreadable",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                        ("read", lus.to_string()),
+                        ("announced", annonces.to_string()),
+                    ],
                 ),
             ),
             EchecParcours::PaginationInterrompue { lus, total } => (
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "{nom_du_serveur} a rendu une page vide au {action} après \
-                     {lus} des {total} éléments annoncés"
+                crate::message_api::texte(
+                    "api.network.serverEmptyPage",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                        ("read", lus.to_string()),
+                        ("total", total.to_string()),
+                    ],
                 ),
             ),
         }
