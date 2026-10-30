@@ -913,8 +913,11 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
             // dans le greffon ALSA de PipeWire ne doit pas figer le serveur.
             // #6119 — jamais pendant qu'une sortie locale joue : la page Zones
             // charge cette fiche, et sonder ASIO y coupait la lecture WASAPI.
+            // #7263 — et pas un inventaire complet par appel : l'écran « État du
+            // serveur » interroge cette fiche toutes les 5 s ; le parc publié de
+            // moins de 5 min suffit pour en donner les noms.
             let devs: Vec<String> =
-                crate::background::parc_local_sans_couper_la_lecture(&state, || {
+                crate::background::parc_local_pour_le_diagnostic(&state, || {
                     tune_core::outputs::local::list_audio_devices_with_backend_bounded(
                         audio_backend_pref,
                     )

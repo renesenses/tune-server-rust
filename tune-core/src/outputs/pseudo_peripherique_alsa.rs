@@ -124,6 +124,63 @@ fn description_de_puits(description: &str) -> bool {
     description.contains("Discard all samples") || description.contains("Dummy")
 }
 
+/// #7263 — les greffons d'`alsa-plugins` qui n'ont AUCUN matériel propre :
+/// serveur de son tiers (`jack`, `oss`), convertisseurs de cadence et de
+/// canaux, encodeurs. Noms exacts.
+const GREFFONS_LOGICIELS: &[&str] = &["jack", "oss", "speex", "upmix", "vdownmix", "a52", "dca"];
+
+/// #7263 — les familles de convertisseurs de cadence, déclinées en variantes
+/// (`speexrate_medium`, `samplerate_best`, `lavrate_high`…). Préfixes.
+const FAMILLES_DE_CONVERTISSEURS: &[&str] = &["speexrate", "samplerate", "lavrate", "lavcrate"];
+
+/// #7263 — ce PCM ALSA est-il un greffon LOGICIEL sans matériel propre, qu'il
+/// ne faut pas OUVRIR pour dresser l'inventaire ?
+///
+/// JeromeQ (fils 2491, 2517, 2525 ; Linux, rc8.1) : le serveur meurt sans
+/// panique Rust, chaque fois pendant l'inventaire des sorties, juste après
+/// `local_audio_device_found … endpoint_id=alsa:speexrate`. Le PCM suivant de
+/// toutes les énumérations complètes du même journal est `alsa:jack`. Sonder
+/// ses capacités (`supported_output_configs`, puis `default_output_config`)
+/// passe par `snd_pcm_open`, qui charge `libasound_module_pcm_jack.so`, donc
+/// libjack (ou pipewire-jack) DANS le processus de Tune. Un plantage natif là
+/// ne laisse aucune trace Rust. Et l'inventaire tournait toutes les 5 s tant
+/// que l'écran « État du serveur » était ouvert.
+///
+/// Aucun de ces PCM n'est une sortie utile à Tune : ils passent tous par un
+/// convertisseur ou par un autre serveur de son. Ils RESTENT dans la liste
+/// (personne ne perd une zone déjà créée), mais avec des capacités
+/// supposées, sans ouverture.
+///
+/// **Conservés et sondés comme avant** : `hw:`, `plughw:`, `default`,
+/// `sysdefault:`, `dmix:`, `front:`, `iec958:`, `pulse`, `pipewire` — ce sont
+/// les chemins vers les cartes et les DAC USB.
+pub fn greffon_logiciel_sans_materiel(endpoint_id: &str) -> bool {
+    let greffon = greffon_alsa(pcm_alsa(endpoint_id)).to_ascii_lowercase();
+    GREFFONS_LOGICIELS.contains(&greffon.as_str())
+        || FAMILLES_DE_CONVERTISSEURS
+            .iter()
+            .any(|famille| greffon.starts_with(famille))
+}
+
+/// #7263 — les capacités d'un point de sortie à l'inventaire : `sonder` ouvre
+/// le PCM, `supposer` ne touche à rien. Un greffon logiciel sans matériel
+/// ([`greffon_logiciel_sans_materiel`]) n'est JAMAIS sondé.
+///
+/// Générique pour être jugée sans carte son ni feature `local-audio` : la
+/// porte `test` de la CI la joue, et c'est l'unique chemin par lequel
+/// l'énumération (`outputs::local::parc`) obtient les capacités.
+pub fn capacites_a_l_inventaire<T>(
+    endpoint_id: &str,
+    sonder: impl FnOnce() -> T,
+    supposer: impl FnOnce() -> T,
+) -> T {
+    if greffon_logiciel_sans_materiel(endpoint_id) {
+        supposer()
+    } else {
+        sonder()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +314,68 @@ mod tests {
         assert_eq!(greffon_alsa("null"), "null");
         assert_eq!(carte_alsa("hw:CARD=Dummy,DEV=0"), Some("Dummy"));
         assert_eq!(carte_alsa("null"), None);
+    }
+
+    /// Ouvre-t-on ce PCM à l'inventaire ? Compte les sondes réellement faites.
+    fn sondes_pour(endpoint_id: &str) -> usize {
+        let mut sondes = 0;
+        capacites_a_l_inventaire(endpoint_id, || sondes += 1, || ());
+        sondes
+    }
+
+    #[test]
+    fn les_greffons_logiciels_ne_sont_jamais_ouverts_a_l_inventaire_7263() {
+        // L'ordre du journal de JeromeQ : speexrate, puis jack — le processus
+        // meurt pendant la sonde de jack.
+        for endpoint in [
+            "alsa:speexrate",
+            "alsa:jack",
+            "Alsa:jack",
+            "alsa:oss",
+            "alsa:speexrate_medium",
+            "alsa:speexrate_best",
+            "alsa:samplerate",
+            "alsa:samplerate_best",
+            "alsa:lavrate",
+            "alsa:lavrate_high",
+            "alsa:speex",
+            "alsa:upmix",
+            "alsa:vdownmix",
+            "alsa:a52:CARD=PCH",
+            "jack",
+        ] {
+            assert_eq!(
+                sondes_pour(endpoint),
+                0,
+                "{endpoint} : greffon logiciel, l'ouvrir charge une bibliothèque tierce dans \
+                 le processus (#7263)"
+            );
+        }
+    }
+
+    #[test]
+    fn les_vraies_sorties_sont_toujours_sondees_7263() {
+        // Le piège : une garde trop large ferait perdre les capacités mesurées
+        // des cartes et des DAC USB.
+        for endpoint in [
+            "alsa:hw:CARD=0,DEV=0",
+            "alsa:plughw:CARD=0,DEV=0",
+            "alsa:hw:CARD=A6,DEV=0",
+            "alsa:default",
+            "alsa:sysdefault:CARD=PCH",
+            "alsa:front:CARD=PCH,DEV=0",
+            "alsa:dmix:CARD=PCH,DEV=0",
+            "alsa:iec958:CARD=PCH,DEV=0",
+            "alsa:pipewire",
+            "alsa:pulse",
+            "Wasapi:{0.0.0.00000000}.{a1b2}",
+            "CoreAudio:jack",
+        ] {
+            assert_eq!(
+                sondes_pour(endpoint),
+                1,
+                "{endpoint} mène à du matériel (ou n'est pas ALSA) : il doit être sondé"
+            );
+        }
     }
 }
