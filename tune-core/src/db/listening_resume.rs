@@ -564,6 +564,40 @@ pub fn refresh_started(
     track_position(db, s)
 }
 
+/// #7415 — la file de la zone s'est achevée : la dernière piste jouée est allée
+/// à son terme et rien ne la suit. Les contextes (album, playlist, titre seul)
+/// qui contiennent cette dernière ligne sont TERMINÉS : leur reprise est
+/// retirée, « Reprendre l'écoute » n'a plus rien à reprendre.
+///
+/// Un contexte interrompu plus tôt, dont la ligne finale n'est pas celle qui
+/// vient de s'achever, reste en place. Rend le nombre de reprises retirées.
+pub fn terminee(db: &Arc<dyn DbBackend>, zone_id: i64) -> Result<usize, String> {
+    let queue = PlayQueueRepo::with_backend(db.clone()).get_ordered(zone_id)?;
+    let Some(derniere) = queue.iter().find(|e| e.is_current).or_else(|| queue.last()) else {
+        return Ok(0);
+    };
+    let rows = db.query_many(
+        "SELECT payload, resume_key FROM listening_resumes WHERE zone_id = ?",
+        &[&zone_id as &dyn ToSqlValue],
+    )?;
+    let mut retirees = 0;
+    for row in &rows {
+        let r = decode(row)?;
+        if r.queue_row_ids.contains(&derniere.id) {
+            db.execute(
+                "DELETE FROM listening_resumes WHERE resume_key = ?",
+                &[&r.resume_key as &dyn ToSqlValue],
+            )?;
+            retirees += 1;
+        }
+    }
+    Ok(retirees)
+}
+
+#[cfg(test)]
+#[path = "listening_resume_7415_tests.rs"]
+mod reprise_terminee_7415;
+
 #[cfg(test)]
 #[path = "listening_resume_7352_tests.rs"]
 mod reprise_services_7352;
