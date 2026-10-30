@@ -390,7 +390,7 @@ impl PlaybackOrchestrator {
     }
 
     /// La qualité demandée pour cette zone. Voir [`preference_de_qualite`].
-    fn streaming_quality_preference(&self, zone_id: i64) -> StreamingQualityPreference {
+    pub(super) fn streaming_quality_preference(&self, zone_id: i64) -> StreamingQualityPreference {
         preference_de_qualite(&self.db, zone_id)
     }
 
@@ -482,6 +482,8 @@ impl PlaybackOrchestrator {
         let svc = registry
             .get(service_name)
             .ok_or_else(|| format!("unknown service: {service_name}"))?;
+        // La tâche longue ne réserve pas le registre des AUTRES services.
+        drop(registry);
         // Un service désactivé dans les Réglages n'est plus interrogé, même
         // pour une piste déjà dans la file (`ServiceRegistry::get_actif`).
         if !svc.read().await.enabled() {
@@ -510,8 +512,27 @@ impl PlaybackOrchestrator {
         //
         // Ask for the zone preference on the primary request and on the auth
         // retry. Passing `None` means the provider's highest/default quality.
-        let mut stream_data =
-            request_stream_at_quality(&mut **svc, source_id, provider_quality).await?;
+        // Relu après acquisition du service : l'assemblage DASH en cours
+        // sous ce verrou a alors publié le téléchargement complet (#7247).
+        let deja_telecharge = if quality_preference == StreamingQualityPreference::Max
+            && !req.seek_ms.is_some_and(|ms| ms > 0)
+        {
+            self.prefetch
+                .prendre_dash_complet(service_name, source_id)
+                .await
+        } else {
+            None
+        };
+        let mut stream_data = match deja_telecharge {
+            Some(flux) => {
+                info!(
+                    service = service_name,
+                    source_id, "streaming_dash_prefetch_reutilise_7247"
+                );
+                flux
+            }
+            None => request_stream_at_quality(&mut **svc, source_id, provider_quality).await?,
+        };
         // #6401 — un flux Qobuz haute résolution qui échoue au démarrage
         // (erreur HTTP, flux coupé avant le premier octet) est redemandé UNE
         // fois au format 6, pour cette piste seulement. Toute re-résolution

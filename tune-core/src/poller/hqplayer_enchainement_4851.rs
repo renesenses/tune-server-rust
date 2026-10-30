@@ -308,6 +308,8 @@ async fn lire_ensuite_dans_la_fenetre_remplace_la_suivante_chez_hqplayer() {
     assert!(banc.relances().is_empty(), "{:?}", banc.relances());
 }
 
+#[path = "hqplayer_preparation_7247.rs"]
+mod preparation_7247;
 #[tokio::test]
 async fn hqplayer_fige_ne_recoit_aucune_relance_et_affiche_son_refus_7244() {
     let mut banc = Banc::monter().await;

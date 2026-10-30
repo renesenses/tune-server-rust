@@ -42,6 +42,21 @@ enum OaatCommand {
     },
 }
 
+/// Repli pour les endpoints sans contrat de latence au DAC.
+/// La préparation est achevée avant de dater le premier paquet. Deux RTT et
+/// quatre écarts de gigue gardent une marge réseau, sans inventer une latence
+/// matérielle à partir de la capacité du tampon.
+#[cfg(feature = "oaat")]
+fn avance_demarrage_7331(horloge: Option<(u64, u64)>) -> u64 {
+    let reseau = horloge.map_or(0, |(rtt, gigue)| {
+        rtt.saturating_mul(2)
+            .saturating_add(gigue.saturating_mul(4))
+    });
+    // Les endpoints existants n'arment que les PTS à moins de cinq secondes.
+    // Une mesure dégradée ne doit pas sortir de cette fenêtre.
+    reseau.clamp(500_000_000, 4_000_000_000)
+}
+
 /// Horloge locale de la pause pour le chemin HTTP OAAT.
 ///
 /// L'atome `paused` expose l'etat au reste du serveur, mais il est modifie par
@@ -731,7 +746,6 @@ impl OutputTarget for OaatOutput {
         use oaat_core::wire::PacketFlags;
 
         self.stop().await.ok();
-        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
         let url = media.url.to_owned();
         let file_path = media.file_path.map(|s| s.to_owned());
@@ -970,6 +984,14 @@ impl OutputTarget for OaatOutput {
                 Err(_) => info!(device = %device_name, "oaat: clock sync timed out, continuing"),
             }
 
+            // HelloAck ne négocie pas encore de latence matérielle :
+            // buffer_size_ms est une capacité, jamais une latence au DAC.
+            // Conserver le repli compatible, élargi selon la mesure réseau.
+            // Chaque ancre est prise APRÈS préparation et négociation.
+            let mesure = endpoint.clock_measurement().await;
+            let avance_pts_ns =
+                avance_demarrage_7331(mesure.as_ref().map(|m| (m.rtt_ns, m.jitter_ns)));
+
             let http_client = crate::http::client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -1159,7 +1181,8 @@ impl OutputTarget for OaatOutput {
                             }
                         }
 
-                        let mut stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                        let mut stream_start_ns =
+                            super::helpers::now_ns().saturating_add(avance_pts_ns);
                         let mut start = std::time::Instant::now()
                             - std::time::Duration::from_nanos(
                                 (initial_bits as f64 / cur_sample_rate as f64 * 1e9) as u64,
@@ -1553,7 +1576,8 @@ impl OutputTarget for OaatOutput {
                                 first = true;
                                 eof = false;
                                 pause_offset = std::time::Duration::ZERO;
-                                stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                                stream_start_ns =
+                                    super::helpers::now_ns().saturating_add(avance_pts_ns);
                                 start = std::time::Instant::now();
                                 // #6497 — l'URI AVANT la position : voir
                                 // l'enchaînement direct ci-dessous.
@@ -1872,7 +1896,8 @@ impl OutputTarget for OaatOutput {
                     let mut first_packet_pending = true;
                     // Absolute PTS anchor: the first emitted frame presents at
                     // now + lead, including after a seek (RFC 6.4).
-                    let mut stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                    let mut stream_start_ns =
+                        super::helpers::now_ns().saturating_add(avance_pts_ns);
                     let mut start = std::time::Instant::now();
                     position_ms.store(
                         sample_offset * 1000 / cur_sample_rate as u64,
@@ -1963,7 +1988,8 @@ impl OutputTarget for OaatOutput {
                                     sample_offset = 0;
                                     pacing_origin_sample = 0;
                                     first_packet_pending = true;
-                                    stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                                    stream_start_ns =
+                                        super::helpers::now_ns().saturating_add(avance_pts_ns);
                                     start = std::time::Instant::now();
                                     // #6497 — la piste suivante n'a pas de flux :
                                     // l'URI de la piste finie ne doit plus être
@@ -2067,7 +2093,8 @@ impl OutputTarget for OaatOutput {
                                     sample_offset = cursor.sample_offset;
                                     pacing_origin_sample = sample_offset;
                                     first_packet_pending = true;
-                                    stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                                    stream_start_ns =
+                                        super::helpers::now_ns().saturating_add(avance_pts_ns);
                                     start = std::time::Instant::now();
                                     position_ms.store(
                                         sample_offset * 1000 / cur_sample_rate as u64,
@@ -2527,7 +2554,7 @@ impl OutputTarget for OaatOutput {
                 start_position_ms.saturating_mul(cur_sample_rate as u64) / 1000;
             let mut origine_flux: u64 = sample_offset;
             // Absolute PTS anchor: frame 0 presents at now + lead (RFC 6.4).
-            let mut stream_start_ns = super::helpers::now_ns() + 500_000_000;
+            let mut stream_start_ns = super::helpers::now_ns().saturating_add(avance_pts_ns);
             let mut byte_offset: u64 = 0;
             // Position VRAIE d'un flux FLAC, lue dans ses en-têtes de trames.
             // Le calcul par octets reste JUSTE pour le DSD (débit constant) —
@@ -3178,7 +3205,7 @@ impl OutputTarget for OaatOutput {
                                     origine_flux = 0;
                                     byte_offset = 0;
                                     position_ms.store(0, Ordering::SeqCst);
-                                    stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                                    stream_start_ns = super::helpers::now_ns().saturating_add(avance_pts_ns);
                                     start = std::time::Instant::now();
                                     buf = next_buf;
                                     stream = next.stream;
@@ -3416,6 +3443,8 @@ impl OutputTarget for OaatOutput {
             && !task.is_finished()
         {
             task.abort();
+            // Attendre la destruction des ressources de la boucle précédente.
+            let _ = task.await;
         }
         #[cfg(feature = "oaat")]
         {
@@ -4598,3 +4627,69 @@ mod tests_horloge_pause_http_oaat {
 #[cfg(all(test, feature = "oaat"))]
 #[path = "course_position_uri_6497_tests.rs"]
 mod course_position_uri_6497_tests;
+
+#[cfg(all(test, feature = "oaat"))]
+mod demarrage_7331_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn demarrage_7331_sans_plancher_et_annulable() {
+        let output = OaatOutput::new("test".into(), "127.0.0.1".into(), 9, "test-7331".into());
+        let debut = tokio::time::Instant::now();
+        output
+            .play_media(&PlayMedia {
+                url: "http://127.0.0.1:9/absent",
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            debut.elapsed(),
+            Duration::ZERO,
+            "le démarrage impose encore une attente fixe avant la connexion"
+        );
+        output.stop().await.unwrap();
+        assert!(output.play_task.lock().await.is_none());
+        assert!(!output.playing.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn demarrage_7331_attend_la_destruction_de_la_tache() {
+        struct Ressource(Arc<AtomicBool>);
+        impl Drop for Ressource {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let output = OaatOutput::new("test".into(), "127.0.0.1".into(), 9, "test-7331".into());
+        let detruite = Arc::new(AtomicBool::new(false));
+        let ressource = Ressource(detruite.clone());
+        let (pret, recu) = tokio::sync::oneshot::channel();
+        *output.play_task.lock().await = Some(tokio::spawn(async move {
+            let _ressource = ressource;
+            pret.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        recu.await.unwrap();
+        output.stop().await.unwrap();
+        assert!(
+            detruite.load(Ordering::SeqCst),
+            "stop est revenu avant la libération des ressources de la lecture précédente"
+        );
+    }
+
+    #[test]
+    fn demarrage_7331_horloge_et_repli_ancien_endpoint() {
+        assert_eq!(avance_demarrage_7331(None), 500_000_000);
+        assert_eq!(
+            avance_demarrage_7331(Some((1_000_000, 100_000))),
+            500_000_000
+        );
+        assert_eq!(
+            avance_demarrage_7331(Some((300_000_000, 50_000_000))),
+            800_000_000
+        );
+        assert_eq!(avance_demarrage_7331(Some((u64::MAX, 1))), 4_000_000_000);
+    }
+}

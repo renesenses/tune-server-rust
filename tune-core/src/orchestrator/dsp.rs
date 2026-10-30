@@ -188,10 +188,12 @@ pub(crate) fn famille_de_sortie(device_id: &str, output_type: Option<&str>) -> &
 impl PlaybackOrchestrator {
     /// Marque la zone en résolution gapless jusqu'au drop du garde.
     pub(super) fn begin_levels_prewarm(&self, zone_id: i64) -> LevelsPrewarmScope<'_> {
-        self.levels_prewarm
+        *self
+            .levels_prewarm
             .lock()
             .expect("levels_prewarm lock")
-            .insert(zone_id);
+            .entry(zone_id)
+            .or_default() += 1;
         LevelsPrewarmScope {
             set: &self.levels_prewarm,
             zone_id,
@@ -206,7 +208,7 @@ impl PlaybackOrchestrator {
             .levels_prewarm
             .lock()
             .expect("levels_prewarm lock")
-            .contains(&zone_id)
+            .contains_key(&zone_id)
     }
 
     /// Forwarder de niveaux pour la zone, si elle y a droit (bus présent et
