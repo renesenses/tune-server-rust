@@ -1,0 +1,14 @@
+librespot 0.8.0 — third-party notices
+Built separately from Tune. Source: https://github.com/librespot-org/librespot/tree/v0.8.0
+
+{{#each licenses}}
+===============================================================================
+{{name}}
+Used by:
+{{#each used_by}}
+  {{crate.name}} {{crate.version}} {{crate.repository}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

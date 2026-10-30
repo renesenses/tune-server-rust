@@ -132,6 +132,7 @@ jobs:
         run: |
           bash scripts/verifier-fermeture.sh --autotest
           bash scripts/verifier-refs-issues.sh --autotest
+          python3 scripts/test-librespot-6872.py
           python3 scripts/test-assembler-notes-release.py
           python3 scripts/preflight-check.py --self-test
           python3 scripts/measure-compile.py --self-test
@@ -938,6 +939,64 @@ jobs:
         env:
           RUSTFLAGS: ""
 
+  # #6872: compile the standalone helper on its actual release runners,
+  # including cross's ring C/ASM build. No signing or publication in PR CI.
+  librespot:
+    name: librespot (${{ matrix.target }})
+    needs: impact
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, cross: false}
+          - {target: aarch64-unknown-linux-gnu, os: ubuntu-22.04, cross: true}
+          - {target: aarch64-unknown-linux-musl, os: ubuntu-22.04, cross: true}
+          - {target: x86_64-apple-darwin, os: macos-15-intel, cross: false}
+          - {target: aarch64-apple-darwin, os: macos-latest, cross: false}
+          - {target: x86_64-pc-windows-msvc, os: windows-latest, cross: false}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          rustflags: ""
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
+      - name: Ensure the cargo-about CLI (#6872)
+        shell: bash
+        run: |
+          # install-action has no prebuilt cargo-about 0.9.3 for Intel macOS;
+          # its cargo-binstall fallback then compiles it without the `cli`
+          # feature and `cargo about` does not exist.
+          if ! cargo about --version >/dev/null 2>&1; then
+            cargo install cargo-about --version 0.9.3 --locked --features cli
+          fi
+          cargo about --version
+      - uses: taiki-e/install-action@cross
+        if: matrix.cross
+      - name: Build the helper and dependency notices
+        shell: bash
+        run: |
+          CROSS=()
+          if [ "${{ matrix.cross }}" = "true" ]; then CROSS=(--cross); fi
+          python scripts/build-librespot.py --target ${{ matrix.target }} \
+            --output "$RUNNER_TEMP/lrs" --work "$RUNNER_TEMP/lrs-source" "${CROSS[@]}"
+
+      - name: Smoke test on native runners (no audio)
+        if: matrix.cross == false
+        shell: bash
+        run: |
+          BIN=librespot
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=librespot.exe; fi
+          "$RUNNER_TEMP/lrs/bin/$BIN" --version
+
   # Check unique exige sur main. Les PR unitaires vers rc/* gardent le profil
   # rapide ; seule une RC peut atteindre main et elle doit rendre toute la
   # batterie complete ci-dessus en succes. PostgreSQL reste un required check
@@ -956,6 +1015,7 @@ jobs:
       - clippy
       - audit
       - ffi
+      - librespot
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -976,6 +1036,7 @@ jobs:
           needs.macos-pr.result != 'success' ||
           needs.clippy.result != 'success' ||
           needs.audit.result != 'success' ||
+          needs.librespot.result != 'success' ||
           needs.ffi.result != 'success'
         run: |
           echo "::error::la batterie complete n'est pas entierement verte"

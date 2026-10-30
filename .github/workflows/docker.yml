@@ -233,26 +233,20 @@ jobs:
             fi
           done
 
-      # librespot (Spotify Connect): real binary on amd64, empty placeholder on
-      # arm64 (best-effort). Tune treats an empty file as « absent » (#6933).
-      #
-      # #6872 — version ÉPINGLÉE et mêmes fonctionnalités que l'archive Linux
-      # (release.yml). L'ancienne ligne, `cargo install librespot
-      # --no-default-features --features alsa-backend`, sans version, ne
-      # compile plus depuis librespot 0.8.0 : sans fonctionnalité TLS,
-      # librespot-oauth s'arrête sur un `compile_error!` (mesuré sur Shrek le
-      # 27/10/2026), et le `else` posait un fichier VIDE dans l'image.
-      - name: Build librespot (amd64)
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
+      - name: Build librespot (amd64 and arm64)
+        shell: bash
         run: |
-          if cargo install librespot --version 0.8.0 --locked --no-default-features \
-               --features "rustls-tls-webpki-roots,with-libmdns" --root /tmp/lr; then
-            cp /tmp/lr/bin/librespot dist/amd64/librespot
-            /tmp/lr/bin/librespot --version
-          else
-            echo "::warning::librespot n'a pas pu être construit — image amd64 sans lecture Spotify"
-            touch dist/amd64/librespot
-          fi
-          touch dist/arm64/librespot
+          CARGO_TARGET_DIR="$PWD/target-lrs-amd64" python scripts/build-librespot.py \
+            --target x86_64-unknown-linux-gnu --output "$RUNNER_TEMP/lrs-amd64" --work "$RUNNER_TEMP/lrs-src-amd64"
+          CARGO_TARGET_DIR="$PWD/target-lrs-arm64" python scripts/build-librespot.py \
+            --target aarch64-unknown-linux-gnu --cross --output "$RUNNER_TEMP/lrs-arm64" --work "$RUNNER_TEMP/lrs-src-arm64"
+          for arch in amd64 arm64; do
+            cp "$RUNNER_TEMP/lrs-$arch/bin/librespot" "dist/$arch/librespot"
+            cp "$RUNNER_TEMP/lrs-$arch/"LIBRESPOT-*.txt "dist/$arch/"
+          done
 
       # airplay-daemon (AirPlay 2 sender): real binary on amd64, empty placeholder
       # on arm64 for now (AirPlay 2 falls back to legacy AirPlay 1 there). Fixes
