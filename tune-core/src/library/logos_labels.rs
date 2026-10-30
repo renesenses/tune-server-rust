@@ -24,8 +24,9 @@
 //!
 //! La résolution est **paresseuse et bornée** : la liste des labels n'attend
 //! jamais Qobuz ; elle rend ce que l'index sait déjà, et lance au plus UNE
-//! passe à la fois ([`CacheLogosLabels::reserver_passe`]), d'au plus
-//! [`PASSE_MAX`] labels, un label après l'autre, avec une pause entre deux.
+//! passe à la fois ([`CacheLogosLabels::reserver_passe`]), un label après
+//! l'autre, avec une pause entre deux, par tranches de [`PASSE_MAX`] (#7414 :
+//! la passe prend tous les labels à demander, en arrière-plan).
 //! Un label sans correspondance n'est pas redemandé avant
 //! [`DELAI_ABSENT_S`] ; une erreur (réseau, refus) pas avant
 //! [`DELAI_ERREUR_S`].
@@ -54,7 +55,9 @@ use serde::{Deserialize, Serialize};
 /// Le nom de l'index, dans le dossier du cache des pochettes.
 pub const FICHIER_INDEX: &str = "logos_labels.json";
 
-/// Au plus tant de labels résolus par passe.
+/// La taille d'une tranche de passe. Depuis #7414, une passe prend tous les
+/// labels à demander, tranche par tranche (voir `tune-server`,
+/// `routes::library::labels::lancer_passe`).
 pub const PASSE_MAX: usize = 8;
 
 /// Un label sans correspondance (ou sans image) n'est pas redemandé avant
