@@ -1306,8 +1306,15 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
     // question ne se pose pas (Free, ou abonnement réellement échu).
     let offline_grace = tune_core::license::offline_grace(&ls);
 
+    // #7419 — D'OÙ vient le Premium : « key » (clé de licence) ou « account »
+    // (compte Mozaiklabs lié, sans clé). `null` hors Premium. Sans ce champ,
+    // un serveur neuf devenu Premium par la seule connexion au compte montrait
+    // un champ de clé vide, et l'auditeur allait recopier une clé inutile.
+    let premium_source = state.license.source_du_premium().await;
+
     Json(json!({
         "tier": ls.tier,
+        "premium_source": premium_source,
         "license_key": ls.license_key,
         "expires_at": ls.expires_at,
         "last_validated": ls.last_validated,
