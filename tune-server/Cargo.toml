@@ -445,6 +445,12 @@ path = "tests/radios_upnp_hors_des_pistes_6500.rs"
 name = "plugin_contracts"
 path = "tests/plugin_contracts.rs"
 
+# #7470 — désinstaller un greffon natif actif d'office. `autotests = false`
+# plus haut : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "plugin_natif_desinstallation_7470"
+path = "tests/plugin_natif_desinstallation_7470.rs"
+
 [[test]]
 name = "plugin_wasm_contracts"
 path = "tests/plugin_wasm_contracts.rs"

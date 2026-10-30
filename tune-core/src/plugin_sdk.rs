@@ -100,10 +100,19 @@ pub struct PluginInfo {
     /// [`TunePlugin::required_feature`]. Absent pour un greffon libre.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_feature: Option<String>,
+<<<<<<< HEAD
     /// La route du thème que ce greffon fournit au client web, relative à son
     /// préfixe — voir [`TunePlugin::theme_web`]. Absente le plus souvent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_theme: Option<String>,
+=======
+    /// Greffon qui reste dormant tant que l'utilisateur ne l'a pas installé
+    /// (`default_enabled() == false`, DJ, Karaoke). Faux pour un greffon actif
+    /// d'office comme l'Assistant IA : il n'y a rien à « installer », donc
+    /// « désinstaller » veut dire le désactiver et le retirer de la vue (#7470).
+    #[serde(default)]
+    pub opt_in: bool,
+>>>>>>> 36cb1fedd67f5b9a63ab879a4b8d4975b6a9d151
 }
 
 /// A compiled-in plugin that `setup_all` did not load — either an opt-in
@@ -1206,7 +1215,11 @@ fn plugin_info_of(p: &dyn TunePlugin) -> PluginInfo {
         enabled: true,
         config_schema: p.config_schema(),
         required_feature: p.required_feature().map(|f| f.display_name().to_string()),
+<<<<<<< HEAD
         web_theme: p.theme_web().map(str::to_string),
+=======
+        opt_in: !p.default_enabled(),
+>>>>>>> 36cb1fedd67f5b9a63ab879a4b8d4975b6a9d151
     }
 }
 
