@@ -1037,6 +1037,11 @@ path = "tests/podcast_sortie_reseau_6468.rs"
 [[test]]
 name = "historique_conteneurs_6466"
 path = "tests/historique_conteneurs_6466.rs"
+# #6465 — `album-en-cours` lit le conteneur de la ligne jouée avant la session.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "album_en_cours_ligne_jouee_6465"
+path = "tests/album_en_cours_ligne_jouee_6465.rs"
 # #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
 # que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
 # une variable d'environnement que plus aucune etape ne pose. `autotests =
