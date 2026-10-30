@@ -65,6 +65,13 @@ impl PositionPoller {
         device_id: Option<&str>,
     ) {
         use crate::db::zone_repo::{AutoplayMode, ZoneRepo};
+        // #7415 — la dernière piste de la file vient d'aller à son terme : les
+        // contextes qui la contiennent sont finis et quittent « Reprendre
+        // l'écoute ». Fait AVANT l'autoplay, qui prolonge la file mais ne
+        // rouvre pas l'album terminé.
+        if let Err(e) = crate::db::listening_resume::terminee(&self.db, zone_id) {
+            warn!(zone_id, error = %e, "reprise_terminee_non_retiree");
+        }
         // #6634 — le contrôleur UPnP décide de la suite. Sa dernière piste
         // ne doit pas amorcer la radio ou un album de la bibliothèque locale.
         // Les pistes indexées d’un serveur média gardent leur autoplay Tune.
