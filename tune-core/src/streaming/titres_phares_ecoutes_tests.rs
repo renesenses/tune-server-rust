@@ -275,3 +275,160 @@ async fn sans_compte_relie_l_ordre_du_service_est_garde() {
         "le local se pose quand même"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #7416 — les titres de l'artiste les plus écoutés ici rejoignent la liste.
+// ---------------------------------------------------------------------------
+
+const KIWANUKA: &str = "Michael Kiwanuka";
+
+fn piste_kiwanuka(id: &str, titre: &str, duree: u64) -> Value {
+    json!({
+        "source_id": id, "title": titre, "artist_name": KIWANUKA,
+        "album_title": "Love & Hate", "duration_ms": duree,
+    })
+}
+
+/// Le top Qobuz de la fiche bibliothèque de Kiwanuka (mesure du .18, 30/10) :
+/// rien de l'album « Love & Hate ».
+fn top_qobuz_kiwanuka() -> Vec<Value> {
+    vec![
+        piste_kiwanuka("q-10", "Summer Clothes", 265_000),
+        piste_kiwanuka("q-11", "California", 238_000),
+        piste_kiwanuka("q-12", "Stars", 201_000),
+    ]
+}
+
+/// L'historique : « Love & Hate » cinq fois en TIDAL et deux fois en fichier
+/// (même durée à 1 s près) ; « Summer Clothes » une fois en Qobuz (déjà dans
+/// la liste) ; « Home Again » trois fois en fichier, piste retrouvée dans la
+/// bibliothèque ; « Rule The World » quatre fois d'un fichier qui n'existe
+/// plus (indésignable) ; un homonyme d'un autre interprète et une radio qui ne
+/// comptent pas.
+fn historique_kiwanuka(b: &Arc<dyn DbBackend>) -> i64 {
+    for _ in 0..5 {
+        ecouter(b, "tidal", Some("t-1"), "Love & Hate", KIWANUKA, 426_000);
+    }
+    for _ in 0..2 {
+        ecouter(b, "local", None, "LOVE & HATE", KIWANUKA, 427_000);
+    }
+    ecouter(
+        b,
+        "qobuz",
+        Some("q-10"),
+        "Summer Clothes",
+        KIWANUKA,
+        265_000,
+    );
+    b.execute("INSERT INTO artists (name) VALUES (?1)", &[&KIWANUKA])
+        .unwrap();
+    b.execute(
+        "INSERT INTO tracks (title, artist_id, duration_ms) \
+         VALUES ('Home Again', (SELECT id FROM artists WHERE name = ?1), 230000)",
+        &[&KIWANUKA],
+    )
+    .unwrap();
+    let home_again = b
+        .query_one("SELECT id FROM tracks WHERE title = 'Home Again'", &[])
+        .unwrap()
+        .unwrap()[0]
+        .as_i64()
+        .unwrap();
+    for _ in 0..3 {
+        ecouter(b, "local", None, "Home Again", KIWANUKA, 230_000);
+    }
+    for _ in 0..4 {
+        ecouter(b, "local", None, "Rule The World", KIWANUKA, 300_000);
+    }
+    for _ in 0..50 {
+        ecouter(
+            b,
+            "qobuz",
+            Some("x-1"),
+            "Love & Hate",
+            "Quelqu'un d'autre",
+            200_000,
+        );
+    }
+    for _ in 0..10 {
+        ecouter(b, "radio", None, "Cold Little Heart", KIWANUKA, 0);
+    }
+    home_again
+}
+
+fn titres(items: &[Value]) -> Vec<&str> {
+    items.iter().map(|v| v["title"].as_str().unwrap()).collect()
+}
+
+#[tokio::test]
+async fn un_titre_tres_ecoute_absent_du_service_rejoint_les_titres_phares() {
+    let b = base();
+    let home_again = historique_kiwanuka(&b);
+    let mut items = top_qobuz_kiwanuka();
+    ajouter_mes_plus_ecoutes(&b, "qobuz", &mut items);
+    enrichir_et_classer(
+        &b,
+        &crate::http::client::shared().clone(),
+        "qobuz",
+        &mut items,
+    )
+    .await;
+
+    assert_eq!(
+        titres(&items),
+        [
+            "Love & Hate",
+            "Home Again",
+            "Summer Clothes",
+            "California",
+            "Stars"
+        ],
+        "classés par mes écoutes, toutes sources ; Summer Clothes une seule fois"
+    );
+    let love = &items[0];
+    assert_eq!(love["source"], json!("tidal"), "désigné par son service");
+    assert_eq!(love["source_id"], json!("t-1"));
+    assert_eq!(
+        love[CHAMP_LOCAL],
+        json!(7),
+        "5 écoutes TIDAL + 2 du fichier, pas l'homonyme"
+    );
+    let home = &items[1];
+    assert_eq!(home["source"], json!("local"));
+    assert_eq!(
+        home["id"],
+        json!(home_again),
+        "le fichier se désigne par sa piste"
+    );
+    assert_eq!(home[CHAMP_LOCAL], json!(3));
+    assert!(
+        !titres(&items).contains(&"Rule The World"),
+        "un fichier disparu ne se désigne plus : pas ajouté"
+    );
+    assert!(
+        !titres(&items).contains(&"Cold Little Heart"),
+        "la radio ne compte pas"
+    );
+}
+
+#[test]
+fn un_enregistrement_du_service_designe_le_titre_ajoute_avant_les_autres() {
+    let b = base();
+    ecouter(&b, "tidal", Some("t-1"), "Love & Hate", KIWANUKA, 426_000);
+    ecouter(&b, "tidal", Some("t-1"), "Love & Hate", KIWANUKA, 426_000);
+    ecouter(&b, "qobuz", Some("q-99"), "Love & Hate", KIWANUKA, 426_500);
+    let mut items = top_qobuz_kiwanuka();
+    ajouter_mes_plus_ecoutes(&b, "qobuz", &mut items);
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[3]["source"], json!("qobuz"));
+    assert_eq!(items[3]["source_id"], json!("q-99"));
+}
+
+#[test]
+fn sans_titre_du_service_rien_n_est_ajoute() {
+    let b = base();
+    historique_kiwanuka(&b);
+    let mut items: Vec<Value> = Vec::new();
+    ajouter_mes_plus_ecoutes(&b, "qobuz", &mut items);
+    assert!(items.is_empty(), "l'artiste n'est nommé par aucun titre");
+}
