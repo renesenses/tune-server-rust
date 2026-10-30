@@ -27,6 +27,13 @@ impl PositionPoller {
             }
         }
 
+        self.orchestrator
+            .nettoyer_preparations_absentes(&states)
+            .await;
+        for etat in &states {
+            self.orchestrator.maintenir_preparation_fichier(etat).await;
+        }
+
         poll_states.retain(|zone_id, _| {
             states
                 .iter()
@@ -68,6 +75,26 @@ impl PositionPoller {
         // Ne pas laisser l'état de recul survivre à une zone supprimée.
         idle_backoff.retain(|zone_id, _| all_zones.iter().any(|z| z.id == Some(*zone_id)));
 
+        // Métadonnées synchrones : ne prendre aucun verrou d'une sortie
+        // pendant que le registre est tenu.
+        let hotes_airplay_actifs: std::collections::HashSet<String> = {
+            let outputs = self.outputs.lock().await;
+            all_zones
+                .iter()
+                .filter(|zone| {
+                    states.iter().any(|s| {
+                        Some(s.zone_id) == zone.id
+                            && matches!(s.state, PlayState::Playing | PlayState::Paused)
+                    })
+                })
+                .filter_map(|zone| zone.output_device_id.as_deref())
+                .filter(|id| outputs.type_of(id).as_deref() == Some("airplay"))
+                .filter_map(|id| outputs.host_of(id))
+                .filter(|host| !host.is_empty())
+                .map(|host| host.to_ascii_lowercase())
+                .collect()
+        };
+
         for zone in &all_zones {
             let zone_id = zone.id.unwrap_or(0);
             if zone_id == 0 {
@@ -85,6 +112,26 @@ impl PositionPoller {
             if in_states {
                 continue;
             } // already handled below
+
+            // #7259 : le NR1602 coupe AirPlay après les interrogations de
+            // sa seconde entrée DLNA. Tant qu'AirPlay possède cet hôte, ne
+            // sonder que la sortie active. Aucun arrêt/masquage persistant,
+            // et les commandes explicites restent disponibles.
+            let differer_dlna = if !states
+                .iter()
+                .any(|s| s.zone_id == zone_id && s.state != PlayState::Stopped)
+            {
+                let outputs = self.outputs.lock().await;
+                outputs.type_of(&device_id).as_deref() == Some("dlna")
+                    && outputs.host_of(&device_id).is_some_and(|host| {
+                        hotes_airplay_actifs.contains(&host.to_ascii_lowercase())
+                    })
+            } else {
+                false
+            };
+            if differer_dlna {
+                continue;
+            }
 
             // Recul après échec : sans cela un appareil injoignable était sondé
             // chaque seconde sans fin (voir IdlePollBackoff).
@@ -3226,10 +3273,12 @@ impl PositionPoller {
                         // flux a expire cote serveur. On la jette pour que la
                         // condition ci-dessous rearme proprement, plutot que de
                         // laisser le renderer chercher une adresse morte.
-                        if decisions::gapless_stage_expired(
-                            ps.gapless_sent,
-                            ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
-                        ) {
+                        if !self.orchestrator.fichier_suivant_en_preparation(zone_id)
+                            && decisions::gapless_stage_expired(
+                                ps.gapless_sent,
+                                ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
+                            )
+                        {
                             info!(
                                 zone_id,
                                 age_secs = ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
@@ -3291,12 +3340,14 @@ impl PositionPoller {
                                 ps.transition(fsm::Transition::Desarmement);
                             }
                         }
-                        decisions::should_arm_gapless(
-                            ps.gapless_sent,
-                            status.duration_ms,
-                            track_duration_ms,
-                            status.position_ms,
-                        )
+                        (!ps.gapless_sent
+                            && self.orchestrator.fichier_suivant_en_preparation(zone_id))
+                            || decisions::should_arm_gapless(
+                                ps.gapless_sent,
+                                status.duration_ms,
+                                track_duration_ms,
+                                status.position_ms,
+                            )
                     } {
                         // #5970 — la fin estimée de la piste en cours, prise
                         // AVANT les lectures de la base qui suivent : c'est

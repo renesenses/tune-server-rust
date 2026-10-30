@@ -143,11 +143,30 @@ pub fn started(
     let current_explicit = contexts
         .get(&current.id)
         .is_some_and(|x| x[1].as_string().is_some());
+    // Une tête lancée par /play hérite de la session ; sa suite ajoutée
+    // par le client peut porter le même contexte explicitement. La tête
+    // déjà prouvée dans CET instantané reste membre du conteneur lorsque
+    // la lecture arrive sur une ligne explicite. Ne pas admettre les lignes
+    // héritées d'un autre contexte (playlist ajoutée pendant un album).
+    let inherited_rows = if current_explicit {
+        db.query_one(
+            "SELECT payload, resume_key FROM listening_resumes WHERE zone_id = ? AND context_type = ? AND context_id = ? AND source = ?",
+            &[&zone_id as &dyn ToSqlValue, &nature, &id, &service],
+        )?
+        .map(|row| decode(&row))
+        .transpose()?
+        .map(|r| r.queue_row_ids.into_iter().collect::<std::collections::HashSet<_>>())
+        .unwrap_or_default()
+    } else {
+        std::collections::HashSet::new()
+    };
     for e in &queue {
         let explicit = contexts.get(&e.id);
         let belongs = explicit.is_none_or(|x| {
-            x[1].as_string().map_or(!current_explicit, |n| n == nature)
-                && x[2].as_string().is_none_or(|v| v == id)
+            x[1].as_string().map_or_else(
+                || !current_explicit || inherited_rows.contains(&e.id),
+                |n| n == nature,
+            ) && x[2].as_string().is_none_or(|v| v == id)
                 && x[3].as_string().is_none_or(|v| v == service)
         });
         if !belongs || (nature == "track" && e.id != current.id) {
@@ -234,7 +253,13 @@ pub fn started(
 /// Ne crée jamais de contexte qui n'a pas réellement démarré.
 pub fn mark_current_shuffled(db: &Arc<dyn DbBackend>, zone_id: i64) -> Result<(), String> {
     let queue = PlayQueueRepo::with_backend(db.clone()).get_ordered(zone_id)?;
-    let Some(current) = queue.iter().find(|e| e.is_current) else {
+    // Le mélange fourni par le client démarre à sa tête. Les branches
+    // de service historiques n'ont pas toujours posé is_current à ce stade.
+    let Some(current) = queue
+        .iter()
+        .find(|e| e.is_current)
+        .or_else(|| queue.first())
+    else {
         return Ok(());
     };
     if let Some(mut r) = recent(db, Some(zone_id), 200)?
@@ -268,7 +293,29 @@ pub fn track_position(
         return Ok(());
     };
     let queue = PlayQueueRepo::with_backend(db.clone()).get_ordered(state.zone_id)?;
-    let Some(current) = queue.iter().find(|e| e.is_current) else {
+    let correspond = |e: &&QueueEntry| match e.track_id {
+        Some(id) => np.source == "local" && np.track_id == Some(id),
+        None => {
+            e.source.as_deref() == Some(np.source.as_str())
+                && e.source_id
+                    .as_deref()
+                    .is_some_and(|id| np.source_id.as_deref() == Some(id))
+        }
+    };
+    // Les anciennes branches de lancement de service ne posent pas toutes
+    // is_current. Leur curseur public reste valable, à condition de vérifier
+    // l'identité de la piste : ne jamais déplacer une autre reprise.
+    let current = queue
+        .iter()
+        .filter(|e| e.is_current)
+        .find(correspond)
+        .or_else(|| {
+            usize::try_from(state.queue_position)
+                .ok()
+                .and_then(|position| queue.get(position))
+                .filter(correspond)
+        });
+    let Some(current) = current else {
         return Ok(());
     };
     // Les instantanés album/playlist peuvent contenir une très grande file :
@@ -491,3 +538,7 @@ pub fn refresh_started(
     )?;
     track_position(db, s)
 }
+
+#[cfg(test)]
+#[path = "listening_resume_7352_tests.rs"]
+mod reprise_services_7352;

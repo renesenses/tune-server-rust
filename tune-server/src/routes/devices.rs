@@ -2780,6 +2780,52 @@ mod list_devices_dedup_tests {
     }
 
     #[test]
+    fn teac_7371_l_identite_dlna_ne_publie_pas_les_capacites_airplay() {
+        let host = "192.0.2.50";
+        let discovered = vec![
+            DiscoveredDevice::new(
+                "airplay-teac".into(),
+                "TEAC NT-505X".into(),
+                OutputType::Airplay,
+                host.into(),
+                7000,
+            ),
+            DiscoveredDevice::new(
+                "uuid:teac-dlna".into(),
+                "TEAC NT-505X".into(),
+                OutputType::Dlna,
+                host.into(),
+                1400,
+            ),
+        ];
+        let registered = ["airplay-teac".to_string()].into_iter().collect();
+        let infos = vec![json!({
+            "device_id": "airplay-teac", "type": "airplay", "host": host,
+            "output_capabilities": {"protocol_sentinel": "airplay-only"}
+        })];
+        let items = build_device_list(discovered, &registered, &infos);
+        assert_eq!(
+            items.len(),
+            2,
+            "les choix AirPlay et DLNA du TEAC sont fusionnés"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|d| d["id"] == "airplay-teac" && d["type"] == "airplay")
+        );
+        let dlna = items
+            .iter()
+            .find(|d| d["id"] == "uuid:teac-dlna")
+            .expect("l'annonce DLNA doit rester sélectionnable");
+        assert_eq!(dlna["type"], "dlna");
+        assert!(
+            dlna.get("output_capabilities").is_none(),
+            "l'identité DLNA publie les capacités de la sortie AirPlay secondaire : {dlna}"
+        );
+    }
+
+    #[test]
     fn backfill_ne_ressuscite_pas_une_identite_secondaire_enregistree() {
         // Si l'identité secondaire est enregistrée comme sortie, la boucle de
         // rattrapage (outputs enregistrés absents de la découverte) ne doit

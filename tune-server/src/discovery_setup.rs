@@ -2455,7 +2455,11 @@ fn retrogradation_par_meme_nom(
     ancienne_enregistree: bool,
     nouvelle: tune_core::discovery::device::OutputType,
 ) -> bool {
-    ancienne_enregistree && priorite_du_type_de_zone(type_zone) > nouvelle.priority()
+    // #7371 — au redémarrage, mDNS peut précéder SSDP : l'absence
+    // temporaire du renderer dans le registre n'autorise pas AirPlay à
+    // reprendre une zone choisie en DLNA (entrée NET du TEAC).
+    (type_zone == Some("dlna") && nouvelle == tune_core::discovery::device::OutputType::Airplay)
+        || (ancienne_enregistree && priorite_du_type_de_zone(type_zone) > nouvelle.priority())
 }
 
 /// #6947 — un endpoint OAAT et un récepteur AirPlay sont deux sorties, même
@@ -3333,6 +3337,18 @@ mod reancrage_4520 {
 
 #[cfg(test)]
 mod retrogradation_meme_nom_6947 {
+
+    #[test]
+    fn teac_7371_une_zone_dlna_garde_son_protocole_avant_le_retour_ssdp() {
+        assert!(
+            super::retrogradation_par_meme_nom(
+                Some("dlna"),
+                false,
+                tune_core::discovery::device::OutputType::Airplay
+            ),
+            "l'annonce AirPlay reprend la zone DLNA quand SSDP n'a pas encore enregistré la sortie"
+        );
+    }
     use super::retrogradation_par_meme_nom;
     use tune_core::discovery::device::OutputType;
 
@@ -5296,3 +5312,7 @@ mod volume_7333_mdns_tests {
         .expect("la mise à jour reste publiée aux clients");
     }
 }
+
+#[cfg(test)]
+#[path = "discovery_setup/decouverte_volume_6774_tests.rs"]
+mod decouverte_volume_6774_tests;

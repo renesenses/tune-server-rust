@@ -132,6 +132,7 @@ jobs:
         run: |
           bash scripts/verifier-fermeture.sh --autotest
           bash scripts/verifier-refs-issues.sh --autotest
+          python3 scripts/test-assembler-notes-release.py
           python3 scripts/preflight-check.py --self-test
           python3 scripts/measure-compile.py --self-test
           python3 scripts/verser-message-forum.py --self-test
