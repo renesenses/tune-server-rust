@@ -3052,9 +3052,14 @@ impl TrackRepo {
             }
         }
 
-        // Favoris du profil 1 : la piste elle-même, ou son album. Vocabulaire
+        // Favoris du profil de la requête (#7569) : la piste elle-même, ou son album. Vocabulaire
         // FERMÉ — le SQL est un littéral, jamais l'entrée de la requête.
-        if let Some((c, _)) = combiner(ph, &f.favorites, f.est_en_et("favorite"), bloc_favoris) {
+        if let Some((c, _)) = combiner(
+            ph,
+            &f.favorites,
+            f.est_en_et("favorite"),
+            bloc_favoris(f.profile_id),
+        ) {
             conditions.push(c);
         }
 
@@ -7480,6 +7485,59 @@ mod tests_facettes_en_et_2108 {
             }),
             ["Deux"]
         );
+    }
+}
+
+/// #7569 — le filtre « favoris » de la liste lit les favoris du profil de la
+/// REQUÊTE, pas toujours ceux du profil 1.
+#[cfg(test)]
+mod tests_favoris_du_profil_7569 {
+    use crate::db::facet_filter::TrackFilter;
+    use crate::db::models::Track;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    #[test]
+    fn le_filtre_favoris_lit_les_favoris_du_profil_demande() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        // La table `favorites` vit dans les migrations, pas dans le schéma initial.
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let repo = TrackRepo::new(db.clone());
+        let mut ids = Vec::new();
+        for titre in ["Alpha", "Beta", "Gamma"] {
+            let mut t = Track::new(titre.into());
+            t.file_path = Some(format!("/m/{titre}.flac"));
+            ids.push(repo.create(&t).unwrap());
+        }
+        // Profil 1 : Alpha. Profil 2 : Beta. Gamma n'est à personne.
+        db.execute_batch(&format!(
+            "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'track', {a}); \
+             INSERT INTO favorites (profile_id, item_type, item_id) VALUES (2, 'track', {b});",
+            a = ids[0],
+            b = ids[1]
+        ))
+        .unwrap();
+
+        let titres = |profil: i64| -> Vec<String> {
+            let f = TrackFilter {
+                favorites: vec!["track".into()],
+                profile_id: profil,
+                ..Default::default()
+            };
+            let (pistes, total) = repo.list_filtered(&f, 50, 0).unwrap();
+            let t: Vec<String> = pistes.into_iter().map(|p| p.title).collect();
+            assert_eq!(total as usize, t.len(), "le total suit la liste");
+            t
+        };
+        assert_eq!(titres(1), ["Alpha"]);
+        assert_eq!(titres(2), ["Beta"], "le profil 2 ne voit que les siens");
+        assert_eq!(
+            titres(0),
+            ["Alpha"],
+            "sans profil : le profil 1, comme avant"
+        );
+        assert!(titres(3).is_empty(), "un profil sans favori ne voit rien");
     }
 }
 
