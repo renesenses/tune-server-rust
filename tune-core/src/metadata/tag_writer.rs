@@ -48,6 +48,10 @@ pub struct TagUpdate {
     pub bpm: Option<i32>,
     pub label: Option<String>,
     pub lyrics: Option<String>,
+    /// Artiste d'album (`ALBUMARTIST`, `TPE2`, `aART`) — la modification en
+    /// masse d'Oxygen (#7539). `None` : ne pas toucher.
+    #[serde(default)]
+    pub album_artist: Option<String>,
 }
 
 impl TagUpdate {
@@ -85,6 +89,7 @@ impl TagUpdate {
         clean("composer", &mut update.composer, &mut corrections);
         clean("isrc", &mut update.isrc, &mut corrections);
         clean("label", &mut update.label, &mut corrections);
+        clean("album_artist", &mut update.album_artist, &mut corrections);
         for (field, value) in [
             ("comment", &mut update.comment),
             ("lyrics", &mut update.lyrics),
@@ -403,6 +408,7 @@ fn appliquer_update(tag: &mut lofty::tag::Tag, update: &TagUpdate) -> usize {
         (ItemKey::Isrc, update.isrc.clone()),
         (ItemKey::Bpm, update.bpm.map(|b| b.to_string())),
         (ItemKey::Lyrics, update.lyrics.clone()),
+        (ItemKey::AlbumArtist, update.album_artist.clone()),
     ] {
         if let Some(v) = valeur {
             tag.insert(lofty::tag::TagItem::new(

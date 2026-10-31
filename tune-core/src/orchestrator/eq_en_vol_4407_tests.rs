@@ -238,3 +238,65 @@ async fn egaliseur_change_sur_une_radio_dlna_sans_nouvelle_session_upnp_4407() {
         "la lecture n'a pas été refaite"
     );
 }
+
+/// #7556 — LE défaut du .18 (zone 10, Eversolo, 31/10) : une radio DLNA est
+/// ARRÊTÉE, puis on sort du mode PURE. `stop` garde `now_playing` (la
+/// station reste affichée) ; la bascule le prenait pour « quelque chose
+/// joue », journalisait `pure_bascule_change_le_signal_flux_refabrique`, et
+/// la relance recréait une session radio puis envoyait `play_media` au
+/// renderer : la radio repartait sans geste de lecture. Après : portée
+/// `RienNeJoue`, aucune relance armée, aucun `play_media`, zone arrêtée.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bascule_pure_sur_une_radio_arretee_ne_la_relance_pas_7556() {
+    let device_id = "dlna:uuid-7556-radio-arretee";
+    let (orch, zone_id) = zone_dlna_qui_joue_une_radio(device_id).await;
+    ecrire_profil(&orch, zone_id, &profil_audible(8.0));
+    // La zone était en PURE pendant l'écoute.
+    SettingsRepo::with_backend(orch.db.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+    orch.stop(zone_id, None).await;
+    let avant = orch.playback.get_state(zone_id).await;
+    assert_eq!(
+        avant.state,
+        crate::playback::PlayState::Stopped,
+        "prémisse : zone arrêtée"
+    );
+    assert!(
+        avant.now_playing.is_some(),
+        "prémisse du défaut : la station reste dans `now_playing` après l'arrêt"
+    );
+    let (lectures_avant, _) = commandes(&orch, device_id).await;
+
+    // Sortie du mode PURE depuis l'interface.
+    SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &format!("zone_{zone_id}_audiophile"),
+            r#"{"enabled":false}"#,
+        )
+        .unwrap();
+    assert_eq!(
+        orch.apply_audiophile_change_portee(zone_id).await,
+        PorteeDuReglage::RienNeJoue,
+        "zone arrêtée : la bascule s'applique à la prochaine lecture"
+    );
+    assert_eq!(
+        relances_programmees(&orch, zone_id),
+        0,
+        "aucune relance armée"
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    let apres = orch.playback.get_state(zone_id).await;
+    assert_eq!(
+        apres.state,
+        crate::playback::PlayState::Stopped,
+        "la radio ne doit pas être repartie"
+    );
+    assert_eq!(apres.track_generation, avant.track_generation);
+    assert_eq!(
+        commandes(&orch, device_id).await.0,
+        lectures_avant,
+        "aucun `play_media` ne doit partir vers le renderer"
+    );
+}
