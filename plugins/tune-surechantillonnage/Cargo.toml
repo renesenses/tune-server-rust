@@ -1,0 +1,27 @@
+[package]
+name = "tune-surechantillonnage"
+version = "0.0.1"
+edition = "2024"
+license = "BUSL-1.1"
+publish = false
+description = "Étude #7614 : prototype de suréchantillonnage haute qualité (filtres polyphases, dither et mise en forme du bruit, test de la machine, banc de mesure). Hors du serveur : rien n'est branché dans la chaîne."
+
+# Crate AUTONOME, hors de l'espace de travail racine : l'étude ne doit pas
+# entrer dans la compilation du serveur ni dans un lot. Aucune dépendance
+# tierce : FFT, fenêtres, PRNG et écriture SVG sont dans la crate.
+[workspace]
+
+[dependencies]
+
+[[bin]]
+name = "banc"
+path = "src/bin/banc.rs"
+
+[profile.release]
+opt-level = 3
+debug = false
+codegen-units = 1
+lto = "thin"
+
+[profile.test]
+opt-level = 2
