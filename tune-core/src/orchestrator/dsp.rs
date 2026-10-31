@@ -2126,8 +2126,9 @@ impl PlaybackOrchestrator {
     /// mêmes bornes. `None` sur la case décochée, une clé absente ou illisible,
     /// ou un `amount` nul (identité).
     ///
-    /// `None` aussi quand un greffon natif tiers de la famille du crossfeed
-    /// traite la zone (`audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed`) :
+    /// `None` aussi quand un greffon natif tiers de la famille du crossfeed,
+    /// ou `crosstalk` (#7616, étage casque exclusif), traite la zone
+    /// (`audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed`) :
     /// le crossfeed intégré est alors éteint, et ni l'empreinte du flux, ni la
     /// clé du cache, ni la compensation ne le comptent.
     pub(super) fn crossfeed_configure(&self, zone_id: i64) -> Option<(f32, f32)> {

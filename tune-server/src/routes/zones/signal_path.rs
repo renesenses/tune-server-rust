@@ -225,6 +225,10 @@ pub(super) fn annoter_l_ombre_du_crossfeed_lang(
 /// le crossfeed intégré est alors éteint, l'appeler « Crossfeed » désignerait
 /// l'autre. Le `code` reste `crossfeed` pour les clients qui le lisent ;
 /// `plugin` porte l'identifiant du greffon. Sans greffon, rien ne change.
+///
+/// #7616 — l'étage `crosstalk` (enceintes) remplace lui aussi le crossfeed :
+/// l'étape porte alors son nom et une description qui ne parle pas de
+/// crossfeed.
 pub(super) fn nommer_le_crossfeed_du_greffon_lang(
     lang: &str,
     steps: &mut [Value],
@@ -234,9 +238,14 @@ pub(super) fn nommer_le_crossfeed_du_greffon_lang(
         return;
     };
     let nom = tune_core::audio::natifs_tiers::nom_affichable(id);
+    let texte = if id == tune_core::audio::crossfeed::ID_CROSSTALK {
+        "plugin_crosstalk"
+    } else {
+        "plugin_crossfeed"
+    };
     for etape in steps.iter_mut().filter(|e| e["code"] == "crossfeed") {
         etape["name"] = json!(nom);
-        etape["description"] = json!(fs(lang, "plugin_crossfeed", &[&nom]));
+        etape["description"] = json!(fs(lang, texte, &[&nom]));
         etape["plugin"] = json!(id);
     }
 }
@@ -1024,8 +1033,8 @@ pub fn build_signal_path_lang(
         runtime_signal_path,
         analyse,
     );
-    // Un greffon natif tiers de la famille du crossfeed remplace le crossfeed
-    // intégré : l'étape porte SON nom, et l'ombre de la tête du crossfeed
+    // Un greffon natif tiers de la famille du crossfeed, ou `crosstalk`
+    // (#7616), remplace le crossfeed intégré : l'étape porte SON nom, et l'ombre de la tête du crossfeed
     // intégré, éteint, n'a rien à y annoncer.
     let greffon_de_crossfeed = tune_core::audio::natifs_tiers::greffon_de_crossfeed_de_la_zone(
         &tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone()),

@@ -6,7 +6,7 @@
 //! La bibliothèque est un greffon DSP de test (un gain), celui que génère
 //! `cargo tune-plugin new <id> --template dsp`, étendu aux encodages entiers
 //! que l'adaptateur `Stage` de l'hôte prépare tous. #6522 : le banc la
-//! CONSTRUIT lui-même ([`construire_la_bibliotheque_de_test`]) — sources
+//! CONSTRUIT lui-même ([`construire_les_bibliotheques_de_test`]) — sources
 //! écrites dans un dossier temporaire, `cargo build` hors ligne contre le SDK
 //! du dépôt —, si bien que le test tourne partout où tourne `cargo test`, au
 //! lieu de dormir en `#[ignore]` faute de bibliothèque fournie à la main.
@@ -14,7 +14,7 @@ use super::PlaybackOrchestrator;
 use crate::db::settings_repo::SettingsRepo;
 use std::sync::Arc;
 
-fn orchestrateur() -> PlaybackOrchestrator {
+pub(super) fn orchestrateur() -> PlaybackOrchestrator {
     let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
     crate::db::migrations::run_migrations(&db).unwrap();
@@ -117,93 +117,124 @@ impl Processor for Gain {
 tune_plugin_abi::export_dsp!(crate::Plugin, include_str!("../manifest.json"));
 "#;
 
-/// Construit la bibliothèque native du greffon de test dans `dossier` et rend
-/// son chemin.
+/// Construit, dans `dossier`, une bibliothèque native du greffon de test (le
+/// même gain) par identifiant de `ids`, et rend leurs chemins dans le même
+/// ordre. #7616 : l'identifiant est le seul paramètre, pour poser sur une zone
+/// des étages de familles différentes (`crossfeed-…`, `crosstalk`, autre).
 ///
 /// Les sources sont écrites à la volée ; elles ne dépendent que du SDK du
 /// dépôt (`sdk/tune-plugin-sdk`, `sdk/tune-plugin-abi`). Le `Cargo.lock` de la
 /// racine est repris pour que `--offline` trouve les mêmes versions de serde
-/// que la construction de `tune-core`, déjà dans le cache de Cargo. Aucune
-/// variable d'environnement n'est requise ; un échec de construction fait
-/// échouer le test avec la sortie de Cargo.
-fn construire_la_bibliotheque_de_test(dossier: &std::path::Path) -> std::path::PathBuf {
+/// que la construction de `tune-core`, déjà dans le cache de Cargo. Les
+/// constructions partagent un même dossier cible : les dépendances ne sont
+/// compilées qu'une fois. Aucune variable d'environnement n'est requise ; un
+/// échec de construction fait échouer le test avec la sortie de Cargo.
+pub(super) fn construire_les_bibliotheques_de_test(
+    dossier: &std::path::Path,
+    ids: &[&str],
+) -> Vec<std::path::PathBuf> {
     let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("racine du dépôt")
         .to_path_buf();
     let sdk = racine.join("sdk");
-    let caisse = dossier.join("greffon");
-    std::fs::create_dir_all(caisse.join("src")).unwrap();
-    let chemin_toml = |p: std::path::PathBuf| format!("{:?}", p.to_string_lossy());
-    std::fs::write(
-        caisse.join("Cargo.toml"),
-        format!(
-            "[workspace]\n\n[package]\nname = \"tune-plugin-gain-essai\"\nversion = \"0.1.0\"\n\
-             edition = \"2024\"\npublish = false\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n\
-             [dependencies]\ntune-plugin-sdk = {{ path = {} }}\ntune-plugin-abi = {{ path = {} }}\n\
-             serde_json = \"1\"\n",
-            chemin_toml(sdk.join("tune-plugin-sdk")),
-            chemin_toml(sdk.join("tune-plugin-abi")),
-        ),
-    )
-    .unwrap();
-    std::fs::write(
-        caisse.join("manifest.json"),
-        serde_json::json!({
-            "id": ID_DU_GREFFON_DE_TEST,
-            "sdk": {"major": 0, "minor": 1},
-            "kind": "dsp",
-            "config_version": 1,
-            "entitlement": format!("plugin.{ID_DU_GREFFON_DE_TEST}"),
-            "distribution": "source",
-            "capabilities": [
-                {"id": "audio-process", "version": {"major": 0, "minor": 1}, "required": true}
-            ]
-        })
-        .to_string(),
-    )
-    .unwrap();
-    std::fs::write(caisse.join("src/lib.rs"), SOURCE_DU_GREFFON_DE_TEST).unwrap();
-    std::fs::copy(racine.join("Cargo.lock"), caisse.join("Cargo.lock")).unwrap();
-
     let cible = dossier.join("target");
-    let sortie = std::process::Command::new(env!("CARGO"))
-        .args(["build", "--offline", "--quiet", "--manifest-path"])
-        .arg(caisse.join("Cargo.toml"))
-        .env("CARGO_TARGET_DIR", &cible)
-        // La construction de test peut viser une autre cible (CI croisée) :
-        // la bibliothèque, elle, se charge dans CE processus.
-        .env_remove("CARGO_BUILD_TARGET")
-        .output()
-        .expect("cargo introuvable");
-    assert!(
-        sortie.status.success(),
-        "construction du greffon natif de test impossible :\n{}",
-        String::from_utf8_lossy(&sortie.stderr)
-    );
-    cible.join("debug").join(format!(
-        "{}tune_plugin_gain_essai{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    ))
+    let chemin_toml = |p: std::path::PathBuf| format!("{:?}", p.to_string_lossy());
+    ids.iter()
+        .map(|id| {
+            // Un nom de caisse et de fichier PROPRE à l'identifiant : deux
+            // bibliothèques chargées dans le même processus ne se confondent
+            // pas, et le dossier cible partagé ne les écrase pas.
+            let paquet = format!("tune-plugin-essai-{id}");
+            let caisse = dossier.join(&paquet);
+            std::fs::create_dir_all(caisse.join("src")).unwrap();
+            std::fs::write(
+                caisse.join("Cargo.toml"),
+                format!(
+                    "[workspace]\n\n[package]\nname = \"{paquet}\"\nversion = \"0.1.0\"\n\
+                     edition = \"2024\"\npublish = false\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n\
+                     [dependencies]\ntune-plugin-sdk = {{ path = {} }}\ntune-plugin-abi = {{ path = {} }}\n\
+                     serde_json = \"1\"\n",
+                    chemin_toml(sdk.join("tune-plugin-sdk")),
+                    chemin_toml(sdk.join("tune-plugin-abi")),
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                caisse.join("manifest.json"),
+                serde_json::json!({
+                    "id": id,
+                    "sdk": {"major": 0, "minor": 1},
+                    "kind": "dsp",
+                    "config_version": 1,
+                    "entitlement": format!("plugin.{id}"),
+                    "distribution": "source",
+                    "capabilities": [
+                        {"id": "audio-process", "version": {"major": 0, "minor": 1}, "required": true}
+                    ]
+                })
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(caisse.join("src/lib.rs"), SOURCE_DU_GREFFON_DE_TEST).unwrap();
+            std::fs::copy(racine.join("Cargo.lock"), caisse.join("Cargo.lock")).unwrap();
+
+            let sortie = std::process::Command::new(env!("CARGO"))
+                .args(["build", "--offline", "--quiet", "--manifest-path"])
+                .arg(caisse.join("Cargo.toml"))
+                .env("CARGO_TARGET_DIR", &cible)
+                // La construction de test peut viser une autre cible (CI
+                // croisée) : la bibliothèque, elle, se charge dans CE processus.
+                .env_remove("CARGO_BUILD_TARGET")
+                .output()
+                .expect("cargo introuvable");
+            assert!(
+                sortie.status.success(),
+                "construction du greffon natif de test {id} impossible :\n{}",
+                String::from_utf8_lossy(&sortie.stderr)
+            );
+            cible.join("debug").join(format!(
+                "{}{}{}",
+                std::env::consts::DLL_PREFIX,
+                paquet.replace('-', "_"),
+                std::env::consts::DLL_SUFFIX
+            ))
+        })
+        .collect()
 }
 
 /// Construit, charge et enregistre la bibliothèque de test ; rend son
 /// identifiant. Le dossier rendu doit vivre jusqu'à la fin du test.
 fn enregistrer_la_bibliotheque_de_test() -> (String, crate::test_scratch::ScratchDir) {
+    let (mut ids, dossier) = enregistrer_les_bibliotheques_de_test(&[ID_DU_GREFFON_DE_TEST]);
+    (ids.remove(0), dossier)
+}
+
+/// Construit, charge et enregistre une bibliothèque de test par identifiant
+/// de `ids` ; rend les identifiants enregistrés. Le dossier rendu doit vivre
+/// jusqu'à la fin du test.
+pub(super) fn enregistrer_les_bibliotheques_de_test(
+    ids: &[&str],
+) -> (Vec<String>, crate::test_scratch::ScratchDir) {
     let dossier = crate::test_scratch::scratch_dir("tune-greffon-natif-6522");
-    let chemin = construire_la_bibliotheque_de_test(&dossier);
-    // Safety : bibliothèque de test construite par le banc lui-même.
-    let bibliotheque = unsafe { tune_plugin_native::Library::load_trusted(&chemin) }
-        .expect("bibliothèque de test illisible");
-    let id = bibliotheque.manifest.id.clone();
-    assert_eq!(id, ID_DU_GREFFON_DE_TEST);
-    assert!(
-        crate::audio::natifs_tiers::identifiant_admissible(&id),
-        "le greffon de test doit porter un identifiant tiers, pas {id}"
-    );
-    tune_plugin_native::register(bibliotheque).unwrap();
-    (id, dossier)
+    let enregistres = construire_les_bibliotheques_de_test(&dossier, ids)
+        .into_iter()
+        .zip(ids)
+        .map(|(chemin, attendu)| {
+            // Safety : bibliothèque de test construite par le banc lui-même.
+            let bibliotheque = unsafe { tune_plugin_native::Library::load_trusted(&chemin) }
+                .expect("bibliothèque de test illisible");
+            let id = bibliotheque.manifest.id.clone();
+            assert_eq!(&id, attendu);
+            assert!(
+                crate::audio::natifs_tiers::identifiant_admissible(&id),
+                "le greffon de test doit porter un identifiant tiers, pas {id}"
+            );
+            tune_plugin_native::register(bibliotheque).unwrap();
+            id
+        })
+        .collect();
+    (enregistres, dossier)
 }
 
 #[tokio::test]
@@ -290,6 +321,87 @@ async fn greffon_natif_tiers_porte_par_l_etage_casque_en_premium_seulement() {
         licence.set_account_premium(true, None).await;
         pure_contourne_le_greffon_sur_la_sortie_locale(&orch, &id).await;
     }
+}
+
+/// #7616 — étage casque EXCLUSIF, avec de VRAIES bibliothèques : une zone
+/// qui a coché le crossfeed intégré, un greffon `crossfeed-…` ET `crosstalk`
+/// n'a qu'un étage en service, `crosstalk`. Les deux greffons de test sont le
+/// même gain ×0,5 : deux étages en série rendraient ×0,25, et le crossfeed
+/// intégré ferait fuir la voie gauche dans la droite.
+#[tokio::test]
+async fn greffon_natif_tiers_crosstalk_eteint_tout_crossfeed_7616() {
+    const FAMILLE: &str = "crossfeed-essai-7616";
+    let (_ids, _dossier) = enregistrer_les_bibliotheques_de_test(&[FAMILLE, "crosstalk"]);
+    let orch = orchestrateur();
+    let s = SettingsRepo::with_backend(orch.db.clone());
+    s.set(crate::audio::premium_plugins::MIGRATION, "complete")
+        .unwrap();
+    s.set("plugin_crossfeed_installed", "true").unwrap();
+    s.set("plugin_crossfeed_enabled", "true").unwrap();
+    s.set(
+        "zone_1_crossfeed",
+        r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+    )
+    .unwrap();
+    for id in [FAMILLE, "crosstalk"] {
+        s.set(&format!("plugin_{id}_installed"), "true").unwrap();
+        s.set(&format!("plugin_{id}_enabled"), "true").unwrap();
+        s.set(
+            &crate::audio::natifs_tiers::cle_de_zone(1, id),
+            r#"{"enabled":true,"gain":0.5}"#,
+        )
+        .unwrap();
+    }
+
+    let mut etage = orch
+        .load_crossfeed_processor(1, 48_000)
+        .expect("l'étage casque porte crosstalk");
+    assert_eq!(
+        etage.decrire(),
+        vec!["tiers:crosstalk@48000".to_string()],
+        "crosstalk seul en service : ni crossfeed intégré, ni {FAMILLE}"
+    );
+    assert_eq!(etage.amount(), 0.0);
+    let mut f: Vec<f32> = std::iter::repeat_n([0.8_f32, 0.0], 256).flatten().collect();
+    etage.process_interleaved(&mut f);
+    assert!(
+        f.chunks_exact(2)
+            .all(|lr| (lr[0] - 0.4).abs() < 1e-6 && lr[1] == 0.0),
+        "un seul gain, aucune voie croisée : {:?}",
+        &f[..4]
+    );
+    assert_eq!(orch.crossfeed_configure(1), None);
+    assert_eq!(
+        crate::audio::natifs_tiers::greffon_de_crossfeed_de_la_zone(&s, 1).as_deref(),
+        Some("crosstalk"),
+        "le chemin du signal doit nommer crosstalk"
+    );
+    let empreinte = orch.empreinte_des_etages_tiers(1);
+    assert!(
+        empreinte.contains("crosstalk=") && !empreinte.contains(FAMILLE),
+        "l'empreinte (cache, relance du flux) compte un étage écarté : {empreinte}"
+    );
+
+    // Témoin : crosstalk décoché, la famille du crossfeed reprend la main.
+    s.set(
+        &crate::audio::natifs_tiers::cle_de_zone(1, "crosstalk"),
+        r#"{"enabled":false,"gain":0.5}"#,
+    )
+    .unwrap();
+    let etage = orch.load_crossfeed_processor(1, 48_000).unwrap();
+    assert_eq!(etage.decrire(), vec![format!("tiers:{FAMILLE}@48000")]);
+    // Puis sans greffon : le crossfeed intégré revient.
+    s.set(
+        &crate::audio::natifs_tiers::cle_de_zone(1, FAMILLE),
+        r#"{"enabled":false,"gain":0.5}"#,
+    )
+    .unwrap();
+    let etage = orch.load_crossfeed_processor(1, 48_000).unwrap();
+    assert!(
+        etage.decrire().iter().all(|e| e.starts_with("crossfeed:")),
+        "{:?}",
+        etage.decrire()
+    );
 }
 
 /// #6522 (fil 2333) — greffon natif tiers armé sur une zone LOCALE, piste

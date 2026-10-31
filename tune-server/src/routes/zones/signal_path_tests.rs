@@ -5390,3 +5390,36 @@ fn radio_6821_source_porte_le_debit_annonce() {
         }
     }
 }
+
+/// #7616 — étage casque exclusif : une zone qui demande `crossfeed-…` ET
+/// `crosstalk` n'a qu'un étage en service, `crosstalk`, et l'étape du chemin
+/// du signal porte SON nom. Ni le nom ni la description ne parlent de
+/// crossfeed ; le `code` reste `crossfeed` pour les clients qui le lisent.
+#[test]
+fn l_etape_se_nomme_crosstalk_quand_crosstalk_est_en_service_7616() {
+    let demandes = vec![
+        ("crossfeed-essai".to_string(), json!({"enabled": true})),
+        ("crosstalk".to_string(), json!({"enabled": true})),
+    ];
+    let en_service = tune_core::audio::crossfeed::etages_tiers_en_service(demandes);
+    let greffon = tune_core::audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed(&en_service);
+    assert_eq!(greffon, Some("crosstalk"));
+    for lang in ["fr", "en", "de", "ja"] {
+        let mut steps = vec![json!({
+            "name": "Crossfeed",
+            "code": "crossfeed",
+            "description": "Crossfeed casque dans le flux",
+            "bit_perfect": false,
+        })];
+        nommer_le_crossfeed_du_greffon_lang(lang, &mut steps, greffon);
+        assert_eq!(steps[0]["name"], "Crosstalk", "{lang}");
+        assert_eq!(steps[0]["plugin"], "crosstalk", "{lang}");
+        assert_eq!(steps[0]["code"], "crossfeed", "{lang}");
+        let description = steps[0]["description"].as_str().unwrap_or_default();
+        assert!(description.contains("Crosstalk"), "{lang} : {description}");
+        assert!(
+            !description.to_lowercase().contains("crossfe"),
+            "{lang} : la description parle encore de crossfeed : {description}"
+        );
+    }
+}
