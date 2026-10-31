@@ -211,6 +211,7 @@ async fn lire_etat(State(etat): State<Etat>) -> Response {
         "liste_lue_le": if a_jour { m.liste_lue_le } else { None },
         "derniere_synchro": if a_jour { m.derniere_synchro } else { None },
         "derniere_erreur": m.derniere_erreur,
+        "musicbrainz_manquants": if a_jour { m.musicbrainz_manquants } else { 0 },
     }))
     .into_response()
 }
@@ -396,6 +397,7 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
         "tronquee": m.tronquee,
         "liste_lue_le": m.liste_lue_le,
         "derniere_synchro": m.derniere_synchro,
+        "musicbrainz_manquants": m.musicbrainz_manquants,
         "compteurs": {
             "total": m.disques.len(),
             "par_etat": par_etat,

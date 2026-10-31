@@ -86,6 +86,11 @@ pub struct Memoire {
     pub derniere_synchro: Option<i64>,
     /// Le code de la dernière erreur, effacé par une synchronisation réussie.
     pub derniere_erreur: Option<String>,
+    /// Les disques restés SANS RÉPONSE de MusicBrainz à la dernière
+    /// synchronisation (refus, panne) : revus à la suivante. `0` : rien en
+    /// suspens. `serde(default)` : une mémoire d'avant ce champ se relit.
+    #[serde(default)]
+    pub musicbrainz_manquants: usize,
 }
 
 impl Memoire {
@@ -129,6 +134,7 @@ impl Memoire {
             self.liste_lue_le = None;
             self.derniere_synchro = None;
             self.derniere_erreur = None;
+            self.musicbrainz_manquants = 0;
         }
     }
 

@@ -53,6 +53,9 @@ struct HoteEssai {
     /// Les pages de collection portent-elles `thumb` ? (Les fixtures ont
     /// des vignettes vides ; l'API réelle en donne une par disque.)
     vignettes: Mutex<bool>,
+    /// MusicBrainz : `None` répond ; `Some(true)` refuse (503 → `Limite`) ;
+    /// `Some(false)` ne répond pas (panne de transport).
+    mb_refuse: Mutex<Option<bool>>,
 }
 
 impl HoteEssai {
@@ -77,6 +80,7 @@ impl HoteEssai {
             recherches,
             limites_a_rendre: Mutex::new(0),
             vignettes: Mutex::new(false),
+            mb_refuse: Mutex::new(None),
         }
     }
 
@@ -190,6 +194,11 @@ impl Hote for HoteEssai {
             .lock()
             .unwrap()
             .push(format!("mb {chemin} {resource}"));
+        match *self.mb_refuse.lock().unwrap() {
+            Some(true) => return Ok(Reponse::Limite),
+            Some(false) => return Err(Panne),
+            None => {}
+        }
         Ok(match resource.as_str() {
             "https://www.discogs.com/release/249504" => {
                 Reponse::Json(fixture("mb_url_release_249504.json"))
@@ -656,4 +665,66 @@ async fn une_synchronisation_d_avant_les_vignettes_les_recoit_a_la_suivante() {
         services,
         "aucun service réinterrogé"
     );
+}
+
+/// Essai réel du 31/10/2026 (908 disques) : la synchronisation s'arrêtait
+/// sur `musicbrainz_indisponible` et Qobuz / TIDAL n'étaient jamais
+/// interrogés. MusicBrainz qui refuse (503) ne doit plus rien arrêter.
+async fn musicbrainz_en_panne_n_arrete_rien(refus: bool) {
+    let hote = HoteEssai::new();
+    *hote.mb_refuse.lock().unwrap() = Some(refus);
+    let b = banc_avec(hote);
+    suivre(&b, "exemple").await;
+    let r = b.moteur.synchroniser_maintenant("exemple").await;
+    assert_eq!(r, Ok(()), "MusicBrainz est un plus, pas une condition");
+
+    let (_, e) = appel(&b.app, "GET", "/etat", None).await;
+    assert_eq!(e["derniere_erreur"], Value::Null, "{e}");
+    assert!(e["derniere_synchro"].is_i64(), "{e}");
+    assert_eq!(
+        e["musicbrainz_manquants"], 5,
+        "les 5 disques restent à revoir : {e}"
+    );
+
+    // Le disjoncteur : 3 disques de suite sans réponse, chacun essayé
+    // `essais_limite + 1` fois ; les 2 autres ne sont pas même demandés.
+    assert_eq!(
+        b.hote.appels("mb "),
+        3 * 4,
+        "{:?}",
+        b.hote.appels.lock().unwrap()
+    );
+
+    // L'étape des services a tourné : les disques absents de la
+    // bibliothèque (sans MBID, Rick n'y est plus) ont été cherchés.
+    assert!(b.hote.appels("service ") > 0, "Qobuz / TIDAL interrogés");
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    assert_eq!(c["musicbrainz_manquants"], 5, "{c}");
+    // Le code-barre suffit toujours au CD 1050.
+    let cd = disque(&c, "Montreal Mix Sessions Vol. 4");
+    assert_eq!(cd["bibliotheque"]["par"], "code_barre", "{cd}");
+    let gm = disque(&c, "Giving My Love / Brazil");
+    assert_eq!(gm["etat"], "streaming", "{gm}");
+
+    // La relance reprend : MusicBrainz revenu, les liens se lisent, aucune
+    // fiche Discogs n'est relue, et plus rien n'est en suspens.
+    let fiches = b.hote.appels("discogs /releases/");
+    *b.hote.mb_refuse.lock().unwrap() = None;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    assert_eq!(b.hote.appels("discogs /releases/"), fiches);
+    let (_, e) = appel(&b.app, "GET", "/etat", None).await;
+    assert_eq!(e["musicbrainz_manquants"], 0, "{e}");
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let rick = disque(&c, "Never Gonna Give You Up");
+    assert_eq!(rick["bibliotheque"]["par"], "musicbrainz_album", "{rick}");
+}
+
+#[tokio::test]
+async fn musicbrainz_qui_refuse_n_arrete_pas_la_synchronisation() {
+    musicbrainz_en_panne_n_arrete_rien(true).await;
+}
+
+#[tokio::test]
+async fn musicbrainz_qui_ne_repond_pas_n_arrete_pas_la_synchronisation() {
+    musicbrainz_en_panne_n_arrete_rien(false).await;
 }

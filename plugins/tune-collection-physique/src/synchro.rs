@@ -48,6 +48,13 @@ use crate::memoire::{Fiche, Liens, Memoire, Streaming, SurUnService};
 
 pub const ECRIRE_TOUS_LES: usize = 10;
 
+/// Après autant de disques DE SUITE sans réponse de MusicBrainz, l'étape
+/// s'arrête pour cette synchronisation : les disques restants sont comptés
+/// « sans identifiant » et revus à la suivante. Sans ce disjoncteur, un
+/// MusicBrainz tombé coûterait `essais × attente` par disque (908 disques
+/// sur le .18 : des heures), et l'étape des services n'arriverait jamais.
+pub const MUSICBRAINZ_ECHECS_DE_SUITE_MAX: usize = 3;
+
 /// Les services de streaming interrogés, dans cet ordre (cadrage de #7195).
 pub const SERVICES: [&str; 2] = ["qobuz", "tidal"];
 
@@ -325,10 +332,14 @@ impl Moteur {
         chemin: &str,
         params: &[(&str, String)],
     ) -> Result<Reponse, &'static str> {
+        // Un refus (429 / 503) comme une panne de transport se réessaient :
+        // le limiteur partagé de l'hôte espace déjà chaque appel, et ralentit
+        // pour tout le serveur après un refus (essai réel du 31/10/2026 :
+        // l'enrichissement interrogeait MusicBrainz en même temps).
         let mut essais = 0;
         loop {
             match self.hote.musicbrainz(chemin, params).await {
-                Ok(Reponse::Limite) => {
+                Ok(Reponse::Limite) | Err(Panne) => {
                     essais += 1;
                     if essais > self.cadence.essais_limite {
                         return Err(code::MUSICBRAINZ_INDISPONIBLE);
@@ -336,7 +347,6 @@ impl Moteur {
                     attendre(self.cadence.attente_limite).await;
                 }
                 Ok(r) => return Ok(r),
-                Err(Panne) => return Err(code::MUSICBRAINZ_INDISPONIBLE),
             }
         }
     }
@@ -476,6 +486,16 @@ impl Moteur {
         }
     }
 
+    /// Les identifiants MusicBrainz de chaque disque qu'on ne connaît pas.
+    ///
+    /// Ils sont un PLUS (la correspondance retombe sur le code-barre, puis
+    /// sur artiste + titre) : MusicBrainz qui refuse ou ne répond pas
+    /// n'arrête JAMAIS la synchronisation (essai réel du 31/10/2026 : 908
+    /// disques, synchronisation arrêtée sur `musicbrainz_indisponible`, les
+    /// services jamais interrogés). Un disque sans réponse n'est pas noté :
+    /// il est revu à la synchronisation suivante, et ce qui a été appris est
+    /// gardé. Le nombre de disques restés sans réponse est retenu
+    /// (`Memoire::musicbrainz_manquants`) et l'écran le dit.
     async fn lire_les_liens_musicbrainz(&self) -> Result<(), &'static str> {
         let t = maintenant();
         let a_lire: Vec<Disque> = {
@@ -486,59 +506,81 @@ impl Moteur {
                 .collect()
         };
         self.etape(Etape::Musicbrainz, a_lire.len());
+        let total = a_lire.len();
         let mut groupes_du_master: HashMap<u64, Vec<String>> = HashMap::new();
+        let mut manquants = 0usize;
+        let mut echecs_de_suite = 0usize;
         for (n, d) in a_lire.into_iter().enumerate() {
-            let releases = match self
-                .relies(
-                    format!("https://www.discogs.com/release/{}", d.release_id),
-                    "release-rels",
-                    "release",
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(c) => {
-                    let _ = self.ecrire();
-                    return Err(c);
+            if echecs_de_suite >= MUSICBRAINZ_ECHECS_DE_SUITE_MAX {
+                // Disjoncté : le reste attendra la synchronisation suivante.
+                manquants += total - n;
+                tracing::info!(
+                    target: "plugin",
+                    restants = total - n,
+                    "collection_physique_musicbrainz_disjoncte"
+                );
+                break;
+            }
+            match self.liens_du_disque(&d, &mut groupes_du_master).await {
+                Ok(liens) => {
+                    echecs_de_suite = 0;
+                    verrou(&self.memoire).liens_mb.insert(
+                        d.release_id,
+                        Liens {
+                            liens,
+                            lus_le: maintenant(),
+                        },
+                    );
                 }
-            };
-            let groupes = match d.master_id {
-                Some(m) => match groupes_du_master.get(&m) {
-                    Some(g) => g.clone(),
-                    None => {
-                        let g = match self
-                            .relies(
-                                format!("https://www.discogs.com/master/{m}"),
-                                "release-group-rels",
-                                "release_group",
-                            )
-                            .await
-                        {
-                            Ok(g) => g,
-                            Err(c) => {
-                                let _ = self.ecrire();
-                                return Err(c);
-                            }
-                        };
-                        groupes_du_master.insert(m, g.clone());
-                        g
-                    }
-                },
-                None => Vec::new(),
-            };
-            verrou(&self.memoire).liens_mb.insert(
-                d.release_id,
-                Liens {
-                    liens: LiensMusicBrainz { releases, groupes },
-                    lus_le: maintenant(),
-                },
-            );
+                Err(_) => {
+                    echecs_de_suite += 1;
+                    manquants += 1;
+                }
+            }
             self.un_de_plus();
             if (n + 1) % ECRIRE_TOUS_LES == 0 {
                 self.ecrire()?;
             }
         }
+        if manquants > 0 {
+            tracing::info!(target: "plugin", manquants, "collection_physique_musicbrainz_partiel");
+        }
+        verrou(&self.memoire).musicbrainz_manquants = manquants;
         self.ecrire()
+    }
+
+    /// Les liens d'un disque : sa release, puis son master (une fois par
+    /// master et par synchronisation).
+    async fn liens_du_disque(
+        &self,
+        d: &Disque,
+        groupes_du_master: &mut HashMap<u64, Vec<String>>,
+    ) -> Result<LiensMusicBrainz, &'static str> {
+        let releases = self
+            .relies(
+                format!("https://www.discogs.com/release/{}", d.release_id),
+                "release-rels",
+                "release",
+            )
+            .await?;
+        let groupes = match d.master_id {
+            Some(m) => match groupes_du_master.get(&m) {
+                Some(g) => g.clone(),
+                None => {
+                    let g = self
+                        .relies(
+                            format!("https://www.discogs.com/master/{m}"),
+                            "release-group-rels",
+                            "release_group",
+                        )
+                        .await?;
+                    groupes_du_master.insert(m, g.clone());
+                    g
+                }
+            },
+            None => Vec::new(),
+        };
+        Ok(LiensMusicBrainz { releases, groupes })
     }
 
     async fn chercher_en_streaming(&self) -> Result<(), &'static str> {
