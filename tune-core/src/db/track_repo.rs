@@ -3075,7 +3075,18 @@ impl TrackRepo {
         // La règle de lecture est celle de la grille d'albums, mot pour mot —
         // voir `facet_filter::dr_album_in`. Le JUMEAU de ce prédicat est dans
         // `facets::build_facet_conditions`.
-        if let Some(c) = ph.in_list(
+        //
+        // #7580 — posé en liste d'albums résolue (carte DR gardée sous le jeton
+        // des données) : la sous-requête relisait tous les tags DR à chaque
+        // page. Même ensemble ; si la carte ne se lit pas, la sous-requête.
+        let dr_resolu = if f.dynamic_ranges.is_empty() {
+            None
+        } else {
+            crate::db::facet_filter::condition_dr_par_albums(self.db.as_ref(), &f.dynamic_ranges)
+        };
+        if let Some(c) = dr_resolu {
+            conditions.push(c);
+        } else if let Some(c) = ph.in_list(
             crate::db::facet_filter::DR_ALBUM_VALUE,
             f.dynamic_ranges.len(),
         ) {
