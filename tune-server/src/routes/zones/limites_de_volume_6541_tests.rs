@@ -546,8 +546,14 @@ async fn un_confort_au_dessus_de_la_securite_est_refuse_7517() {
         Value::Null,
     )
     .await;
-    assert!(proche(lu["volume_limit_safety"].as_f64().unwrap(), 0.5), "{lu}");
-    assert!(proche(lu["volume_limit_comfort"].as_f64().unwrap(), 0.3), "{lu}");
+    assert!(
+        proche(lu["volume_limit_safety"].as_f64().unwrap(), 0.5),
+        "{lu}"
+    );
+    assert!(
+        proche(lu["volume_limit_comfort"].as_f64().unwrap(), 0.3),
+        "{lu}"
+    );
     // Égaux, ou confort seul, ou sécurité seule : acceptés.
     regler(&app, id, json!({ "safety": 0.4, "comfort": 0.4 })).await;
     regler(&app, id, json!({ "comfort": 0.9 })).await;
