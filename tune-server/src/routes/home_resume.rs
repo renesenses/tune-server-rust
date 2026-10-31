@@ -865,10 +865,12 @@ mod replay_tests {
             saved.position_ms, 42000,
             "la position du titre seul doit être persistée"
         );
+        // #7401 — les voisins sans contexte explicite viennent du même
+        // geste (/play puis sa suite) : la reprise les garde.
         assert_eq!(
             saved.items.len(),
-            1,
-            "le titre seul ne reprend pas les voisins"
+            2,
+            "un titre joué dans sa file garde la file de son geste (#7401)"
         );
         state.playback.seek(zone, 17000).await;
         let response = resume_listening(
@@ -890,11 +892,11 @@ mod replay_tests {
             Some("deux"),
             "la reprise doit rejouer le dernier titre démarré, pas la tête de la file"
         );
-        assert_eq!(s.queue_position, 0);
+        assert_eq!(s.queue_position, 1);
         assert_eq!(
             q.get_ordered(zone).unwrap().len(),
-            1,
-            "la reprise du titre seul exclut les titres voisins"
+            2,
+            "la reprise ne s'arrête pas après le titre : la file du geste suit (#7401)"
         );
     }
 }

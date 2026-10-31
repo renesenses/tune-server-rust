@@ -169,7 +169,27 @@ pub fn started(
             ) && x[2].as_string().is_none_or(|v| v == id)
                 && x[3].as_string().is_none_or(|v| v == service)
         });
-        if !belongs || (nature == "track" && e.id != current.id) {
+        // #7401 — un « titre » n'est pas forcément joué seul. Une tête de
+        // liste lancée par /play (titre d'une playlist de service, « Tout
+        // lire » de favoris, titre joué dans son album, #5372) laisse sa
+        // suite en lignes SANS contexte explicite : elles suivent la session,
+        // donc ce titre. Les garder, sinon la reprise rejoue le titre à sa
+        // position puis s'arrête. Une ligne explicite n'entre que si elle
+        // nomme CE titre (file déjà restaurée) : un titre ajouté seul
+        // (`titre_seul`, sans identifiant) reste un autre geste.
+        let belongs = if nature == "track" && e.id != current.id {
+            explicit.is_some_and(|x| match x[1].as_string() {
+                Some(n) => {
+                    n == "track"
+                        && x[2].as_string().as_deref() == Some(id)
+                        && x[3].as_string().is_none_or(|v| v == service)
+                }
+                None => !current_explicit || inherited_rows.contains(&e.id),
+            })
+        } else {
+            belongs
+        };
+        if !belongs {
             continue;
         }
         if e.id == current.id {
@@ -329,7 +349,12 @@ pub fn track_position(
         if r.context_type != "track" || !r.queue_row_ids.contains(&current.id) {
             continue;
         }
-        let matches = r.items.first().is_some_and(|i| match i {
+        // #7401 — un titre suivi de sa suite : c'est le titre au rang
+        // mémorisé qui joue, pas forcément le premier de l'instantané.
+        if r.queue_row_ids.get(r.position) != Some(&current.id) {
+            continue;
+        }
+        let matches = r.items.get(r.position).is_some_and(|i| match i {
             QueueInput::Local { track_id } => {
                 np.source == "local" && np.track_id == Some(*track_id)
             }

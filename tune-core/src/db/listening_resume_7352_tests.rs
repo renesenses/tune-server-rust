@@ -250,3 +250,124 @@ fn intention_de_melange_de_service_sans_marqueur_courant_7352() {
         );
     }
 }
+
+/// #7401 — un titre de playlist de service lancé par /play (contexte de
+/// session « track »), dont le client enfile lui-même la suite sans la
+/// nommer : la reprise doit garder la suite, pas un seul titre qui s'arrête.
+#[test]
+fn titre_lance_par_play_garde_la_suite_enfilee_7401() {
+    for source in ["qobuz", "tidal"] {
+        let (db, zone) = base();
+        let q = PlayQueueRepo::with_backend(db.clone());
+        // La tête, posée par /play : aucune ligne de contexte explicite.
+        q.append(zone, &[piste(source, "un")]).unwrap();
+        q.set_current_pos(zone, 0).unwrap();
+        let titre = contexte("track", source, "un");
+        started(&db, zone, &titre, source, Some("un"), "un", None, None).unwrap();
+        // La suite, enfilée par queue/add sans contexte (plusieurs titres :
+        // aucun `titre_seul`), puis l'actualisation qui suit l'ajout.
+        q.append(zone, &[piste(source, "deux"), piste(source, "trois")])
+            .unwrap();
+        started(&db, zone, &titre, source, Some("un"), "un", None, None).unwrap();
+        // Le titre suivant démarre : même geste, même reprise.
+        q.set_current_pos(zone, 1).unwrap();
+        started(&db, zone, &titre, source, Some("deux"), "deux", None, None).unwrap();
+        let r = recent(&db, Some(zone), 10).unwrap().remove(0);
+        assert_eq!(r.context_type, "track");
+        assert_eq!(
+            r.items.len(),
+            3,
+            "{source} : la reprise d'un titre joué avec sa suite ne doit pas \
+             se réduire à ce titre seul (#7401 : reprise puis arrêt)"
+        );
+        assert_eq!(r.position, 1, "{source} : le titre en cours, pas la tête");
+        let state = ZoneState {
+            zone_id: zone,
+            state: PlayState::Playing,
+            queue_position: 1,
+            position_ms: 42000,
+            now_playing: Some(NowPlaying {
+                source: source.into(),
+                source_id: Some("deux".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        track_position(&db, &state).unwrap();
+        let r = recent(&db, Some(zone), 10).unwrap().remove(0);
+        assert_eq!(
+            r.position_ms, 42000,
+            "{source} : la position du titre en cours doit être relevée"
+        );
+        restore(&db, zone, &r).unwrap();
+        let rows = q.get_ordered(zone).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|e| e.source_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["un", "deux", "trois"],
+            "{source} : la file restaurée porte toute la suite"
+        );
+        assert!(rows[1].is_current);
+        // Après la reprise, la file restaurée nomme ce titre : elle reste
+        // entière au démarrage suivant.
+        started(&db, zone, &titre, source, Some("deux"), "deux", None, None).unwrap();
+        assert_eq!(recent(&db, Some(zone), 10).unwrap()[0].items.len(), 3);
+    }
+}
+
+/// #7401 — la garde inverse : un titre ajouté SEUL (`titre_seul`) n'entre pas
+/// dans la reprise d'un autre titre, et sa propre reprise reste d'un titre.
+#[test]
+fn titre_ajoute_seul_reste_hors_de_la_suite_7401() {
+    let (db, zone) = base();
+    let q = PlayQueueRepo::with_backend(db.clone());
+    q.append(zone, &[piste("qobuz", "tete"), piste("qobuz", "suite")])
+        .unwrap();
+    let avant = contexte_de_file::dernier_identifiant(&db, zone);
+    q.append(zone, &[piste("qobuz", "isole")]).unwrap();
+    contexte_de_file::poser_apres(&db, zone, avant, &ContexteDeFile::titre_seul()).unwrap();
+    q.set_current_pos(zone, 0).unwrap();
+    started(
+        &db,
+        zone,
+        &contexte("track", "qobuz", "tete"),
+        "qobuz",
+        Some("tete"),
+        "tete",
+        None,
+        None,
+    )
+    .unwrap();
+    let r = recent(&db, Some(zone), 10).unwrap().remove(0);
+    assert_eq!(
+        r.items.len(),
+        2,
+        "la suite du geste, sans le titre ajouté seul"
+    );
+    q.set_current_pos(zone, 2).unwrap();
+    started(
+        &db,
+        zone,
+        &ContexteEcoute {
+            nature: Some("track"),
+            id: None,
+            rang: Some(2),
+            service: None,
+            titre: None,
+            pochette: None,
+        },
+        "qobuz",
+        Some("isole"),
+        "isole",
+        None,
+        None,
+    )
+    .unwrap();
+    let seul = recent(&db, Some(zone), 10)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.context_id == "isole")
+        .expect("le titre ajouté seul a sa reprise");
+    assert_eq!(seul.items.len(), 1, "un titre ajouté seul reste seul");
+}
