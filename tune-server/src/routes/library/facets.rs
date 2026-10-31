@@ -492,14 +492,14 @@ fn build_facet_conditions(
             tune_core::db::track_repo::folder_like_pattern(fld),
         ));
     }
-    // Album rating (profile 1). Tracks inherit their album's rating via a join
+    // Album rating (profil de la requête, #7594). Tracks inherit their album's rating via a join
     // to `album_ratings`; EXISTS keeps it self-contained on alias `t`.
     if exclude != "rating"
         && let Some(c) = ph.in_list("arr.rating", sel.ratings.len())
     {
-        conds.push(format!(
-            "EXISTS (SELECT 1 FROM album_ratings arr \
-                 WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND {c})"
+        conds.push(tune_core::db::facet_filter::rating_condition(
+            &c,
+            sel.profile_id,
         ));
         for v in &sel.ratings {
             params.push(SqlValue::Int(*v));
@@ -732,7 +732,7 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 "country" => kv_facet(state, "release_country", limit, conds, params),
                 "mood" => kv_facet(state, "mood", limit, conds, params),
                 "source" => kv_facet(state, "source_media", limit, conds, params),
-                "rating" => rating_facet(state, limit, conds, params),
+                "rating" => rating_facet(state, q.sel.profile_id, limit, conds, params),
                 "collection" => collection_facet(state, &q, engine, socle),
                 "original_year" => original_year_facet(state, limit, conds, params),
                 // Dynamic Range (#2144). Absente du jeu par DÉFAUT : sur une
@@ -1363,11 +1363,12 @@ fn fusionner_les_casses(brut: Vec<(String, i64)>) -> Vec<(String, i64)> {
     sortie
 }
 
-/// Count tracks by their album's rating (profile 1). Tracks inherit the rating
+/// Count tracks by their album's rating (profil de la requête, #7594). Tracks inherit the rating
 /// via a join to `album_ratings`; unrated tracks are naturally excluded. The
 /// `conds` reference alias `t`, so the join is additive.
 fn rating_facet(
     state: &AppState,
+    profil: i64,
     limit: Option<i64>,
     conds: &[String],
     params: &[SqlValue],
@@ -1378,9 +1379,10 @@ fn rating_facet(
         format!(" WHERE {}", conds.join(" AND "))
     };
     let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let profil = if profil > 0 { profil } else { 1 };
     let sql = format!(
         "SELECT arr.rating, COUNT(*) AS n FROM tracks t \
-         JOIN album_ratings arr ON t.album_id = arr.album_id AND arr.profile_id = 1{where_clause} \
+         JOIN album_ratings arr ON t.album_id = arr.album_id AND arr.profile_id = {profil}{where_clause} \
          GROUP BY arr.rating ORDER BY arr.rating DESC{limit_clause}"
     );
     let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
@@ -1983,6 +1985,19 @@ mod tests {
             Ok(q) => q,
             Err(_) => panic!("requête acceptable : {raw}"),
         }
+    }
+
+    /// #7594 — le filtre de notes lit les notes du profil de la requête.
+    #[test]
+    fn le_filtre_de_notes_suit_le_profil_de_la_requete() {
+        let mut q = depuis("rating=4");
+        q.sel.profile_id = 2;
+        let (conds, _) = build_facet_conditions(&q, Engine::Postgres, "", None);
+        assert!(
+            conds.iter().any(|c| c.contains("arr.profile_id = 2")),
+            "{conds:?}"
+        );
+        assert!(!conds.iter().any(|c| c.contains("arr.profile_id = 1")));
     }
 
     fn texte(v: &SqlValue) -> String {
