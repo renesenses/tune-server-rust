@@ -245,7 +245,7 @@ async fn pause_reprise_et_volume_logiciel() {
     )
     .unwrap();
     assert!(sortie.capabilities().can_set_volume);
-    assert!(!sortie.capabilities().can_seek);
+    assert!(sortie.capabilities().can_seek);
     // Volume 50 % : −30 dB sur la loi perceptive de Tune, avant le départ.
     sortie.set_volume(0.5).await.unwrap();
     sortie

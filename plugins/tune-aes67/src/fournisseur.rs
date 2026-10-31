@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use async_trait::async_trait;
 use tracing::{info, warn};
@@ -20,9 +20,32 @@ use tune_core::outputs::traits::{OutputProvider, OutputTarget, ProviderContext};
 use crate::config::FluxAes67;
 use crate::droit::DroitPremium;
 use crate::horloge::SourceHorloge;
-use crate::sortie::{ReglagesEmission, SortieAes67};
+use crate::sortie::{ReglagesEmission, SortieAes67, Vitrine};
 
 pub const NOM_DU_FOURNISSEUR: &str = "aes67";
+
+/// Les sorties construites, vues par l'écran de l'état sans les retenir :
+/// une sortie que l'hôte a lâchée disparaît de la liste.
+#[derive(Clone, Default)]
+pub struct Registre(Arc<Mutex<Vec<Weak<Vitrine>>>>);
+
+impl Registre {
+    pub fn inscrire(&self, v: &Arc<Vitrine>) {
+        let mut l = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        l.retain(|w| w.strong_count() > 0);
+        l.push(Arc::downgrade(v));
+    }
+
+    /// Les sorties vivantes, dans l'ordre de construction.
+    pub fn vivantes(&self) -> Vec<Arc<Vitrine>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
+}
 
 pub struct FournisseurAes67 {
     flux: Arc<RwLock<Vec<FluxAes67>>>,
@@ -31,6 +54,7 @@ pub struct FournisseurAes67 {
     reglages: ReglagesEmission,
     deja_construits: Mutex<HashSet<String>>,
     refus_dit: AtomicBool,
+    registre: Registre,
 }
 
 impl FournisseurAes67 {
@@ -47,7 +71,13 @@ impl FournisseurAes67 {
             reglages,
             deja_construits: Mutex::new(HashSet::new()),
             refus_dit: AtomicBool::new(false),
+            registre: Registre::default(),
         }
+    }
+
+    /// Les sorties construites, pour l'écran de l'état.
+    pub fn registre(&self) -> Registre {
+        self.registre.clone()
     }
 }
 
@@ -87,6 +117,7 @@ impl OutputProvider for FournisseurAes67 {
             ) {
                 Ok(s) => {
                     deja.insert(f.id.clone());
+                    self.registre.inscrire(&s.vitrine());
                     sorties.push(Box::new(s));
                 }
                 Err(e) => warn!(id = %f.id, error = %e, "aes67_sortie_non_construite"),

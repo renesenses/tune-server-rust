@@ -258,9 +258,10 @@ fn emettre_et_recevoir(
         tx.send(Message::Charge(vec![0; 288])).unwrap();
     }
     tx.send(Message::Fin).unwrap();
+    let commandes = Arc::new(Commandes::default());
     let fil = cadenceur::lancer(
         socket,
-        rx,
+        Some(rx),
         horloge,
         ParametresCadence {
             cadence: 48_000,
@@ -272,7 +273,7 @@ fn emettre_et_recevoir(
             pretampon_paquets: 1,
             temps_reel: false,
         },
-        Arc::new(Commandes::default()),
+        commandes.clone(),
         Arc::new(Statistiques::default()),
     )
     .unwrap();
@@ -283,6 +284,10 @@ fn emettre_et_recevoir(
         let arrivee = maitre.maintenant_ns();
         recus.push((EnteteRtp::lire(&t[..k]).unwrap().0, arrivee));
     }
+    // Depuis l'étape E3, le fil survit à la fin d'un flux : l'arrêter.
+    commandes
+        .arret
+        .store(true, std::sync::atomic::Ordering::Release);
     fil.join().unwrap();
     recus
 }

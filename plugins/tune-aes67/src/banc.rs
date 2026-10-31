@@ -117,6 +117,13 @@ pub struct Analyse {
     /// Paquets dont l'horodatage n'avance pas d'exactement une durée de
     /// paquet (hors paquets marqués, qui ouvrent une nouvelle origine).
     pub sauts_d_horodatage: u64,
+    /// Étape E3 : paquets (marqués compris) dont l'horodatage commence avant
+    /// la trame qui suit le paquet précédent — recul ou chevauchement de
+    /// l'horloge média. Doit rester à zéro à travers saut, pause, reprise,
+    /// enchaînement et nouvelle lecture.
+    pub reculs_d_horodatage: u64,
+    /// Le plus petit pas d'horodatage d'un paquet au suivant (en trames).
+    pub pas_d_horodatage_min: Option<i64>,
     pub marqueurs: usize,
     pub octets_pcm: usize,
     pub sha256_pcm: String,
@@ -153,6 +160,8 @@ impl Capture {
             pertes: 0,
             desordres: 0,
             sauts_d_horodatage: 0,
+            reculs_d_horodatage: 0,
+            pas_d_horodatage_min: None,
             marqueurs: 0,
             octets_pcm: 0,
             sha256_pcm: hex(&Sha256::digest(self.pcm())),
@@ -182,6 +191,11 @@ impl Capture {
             if !e.marqueur && e.horodatage.wrapping_sub(ep.horodatage) != trames_par_paquet {
                 a.sauts_d_horodatage += 1;
             }
+            let pas = i64::from(e.horodatage.wrapping_sub(ep.horodatage) as i32);
+            if pas < i64::from(trames_par_paquet) {
+                a.reculs_d_horodatage += 1;
+            }
+            a.pas_d_horodatage_min = Some(a.pas_d_horodatage_min.map_or(pas, |m| m.min(pas)));
             if !e.marqueur {
                 let intervalle_us = d.arrivee.duration_since(dp.arrivee).as_secs_f64() * 1e6;
                 somme_us += intervalle_us;
@@ -329,6 +343,84 @@ pub fn ecrire_wav_sinus(
         }
     }
     f.flush()
+}
+
+/// Écrit un WAV PCM 24 bits stéréo dont chaque trame porte son numéro :
+/// gauche `depart + n`, droite `-(depart + n)`. Un PCM reçu bit à bit dit
+/// alors exactement quelle trame du fichier il transporte : un saut, un
+/// enchaînement ou une reprise se vérifient à l'échantillon près.
+pub fn ecrire_wav_compteur(
+    chemin: &std::path::Path,
+    cadence: u32,
+    trames: u32,
+    depart: i32,
+) -> io::Result<()> {
+    let octets = trames * 2 * 3;
+    let mut f = io::BufWriter::new(std::fs::File::create(chemin)?);
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + octets).to_le_bytes())?;
+    f.write_all(b"WAVEfmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&2u16.to_le_bytes())?;
+    f.write_all(&cadence.to_le_bytes())?;
+    f.write_all(&(cadence * 6).to_le_bytes())?;
+    f.write_all(&6u16.to_le_bytes())?;
+    f.write_all(&24u16.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&octets.to_le_bytes())?;
+    for n in 0..trames as i32 {
+        let v = depart + n;
+        f.write_all(&v.to_le_bytes()[..3])?;
+        f.write_all(&(-v).to_le_bytes()[..3])?;
+    }
+    f.flush()
+}
+
+/// Le PCM L24 qu'un flux de ces fichiers ENCHAÎNÉS sans blanc doit
+/// transporter : chaque fichier décodé et rééchantillonné par son propre
+/// décodeur, comme en lecture, mis bout à bout dans UN paquetiseur (le
+/// dernier paquet d'une piste porte le début de la suivante), un seul
+/// paquet final complété de silence.
+pub fn pcm_attendu_enchaine(
+    chemins: &[&str],
+    cadence: u32,
+    canaux: u16,
+    trames_par_paquet: usize,
+) -> Result<(Vec<u8>, Vec<u64>), String> {
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| "pcm_attendu_enchaine demande un runtime tokio".to_string())?;
+    let chemins: Vec<String> = chemins.iter().map(|c| c.to_string()).collect();
+    std::thread::spawn(move || {
+        let mut p = Paquetiseur::new(usize::from(canaux), trames_par_paquet);
+        let mut pcm = Vec::new();
+        let mut trames_par_piste = Vec::new();
+        for chemin in chemins {
+            let source = SourceAudio::Fichier(chemin);
+            let (rx, tache) = producteur::lancer_le_decodeur(&runtime, source, cadence, canaux);
+            let mut lecteur = LecteurPcm::new(rx, cadence, canaux);
+            let mut echantillons = 0u64;
+            let lu = (|| -> Result<(), String> {
+                while let Some(bloc) = lecteur.suivant()? {
+                    echantillons += bloc.len() as u64;
+                    for c in p.pousser(&bloc) {
+                        pcm.extend_from_slice(&c);
+                    }
+                }
+                Ok(())
+            })();
+            lecteur.fermer();
+            producteur::attendre_le_decodeur(&runtime, tache)?;
+            lu?;
+            trames_par_piste.push(echantillons / u64::from(canaux));
+        }
+        if let Some(c) = p.vider() {
+            pcm.extend_from_slice(&c);
+        }
+        Ok((pcm, trames_par_piste))
+    })
+    .join()
+    .map_err(|_| "le fil de lecture a paniqué".to_string())?
 }
 
 /// Puissance relative d'une fréquence dans un canal (Goertzel), pour vérifier

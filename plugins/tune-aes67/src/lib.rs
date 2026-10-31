@@ -11,15 +11,18 @@
 //!   logiciel) derrière [`horloge::SourceHorloge`], avec REPLI EXPLICITE sur
 //!   l'horloge locale tant qu'aucun maître n'est suivi (journal
 //!   `aes67_ptp_repli_horloge_locale`, état dans `GET /`) ;
-//! - lecture, pause, reprise, arrêt ; ni saut ni enchaînement sans blanc
-//!   (étape E3) ;
+//! - lecture, pause, reprise, arrêt, saut dans la piste et enchaînement
+//!   sans blanc, rééchantillonnage vers 48 kHz propre à chaque piste
+//!   (étape E3, voir [`sortie`]) ;
 //! - volume logiciel facultatif, éteint par défaut ;
-//! - aucun écran : le greffon est HORS CATALOGUE (`catalogued() == false`)
-//!   tant que le client web ne le consomme pas.
+//! - écran de l'état dans le client web (PR séparée, étape E3) ; le greffon
+//!   reste HORS CATALOGUE (`catalogued() == false`) jusqu'à sa fusion.
 //!
 //! Routes, sous `/api/v1/ext/aes67` :
 //! - `GET  /`     → droit Premium, étape, horloge (PTP calé ou repli),
-//!   flux déclarés ;
+//!   flux déclarés, et pour chaque sortie construite : annonce SAP, SDP
+//!   annoncé et sa version, transport, statistiques d'émission (écran de
+//!   l'état du client web) ;
 //! - `PUT  /flux` → remplace la liste des flux (402 sans Premium).
 
 pub mod banc;
@@ -55,7 +58,7 @@ use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 
 use crate::config::FluxAes67;
 use crate::droit::{DroitDeLaLicence, DroitPremium};
-use crate::fournisseur::FournisseurAes67;
+use crate::fournisseur::{FournisseurAes67, Registre};
 use crate::horloge::{HorlogeSysteme, SourceHorloge};
 use crate::ptp::{ConfigPtp, SuiveurPtp};
 use crate::sortie::ReglagesEmission;
@@ -121,7 +124,8 @@ impl TunePlugin for Aes67Plugin {
     fn default_enabled(&self) -> bool {
         false
     }
-    /// Aucun écran ne le consomme encore (étape E3).
+    /// Hors catalogue tant que l'écran de l'état (PR du client web, étape
+    /// E3) n'est pas fusionné ; l'étape E4 le rend visible.
     fn catalogued(&self) -> bool {
         false
     }
@@ -148,18 +152,21 @@ impl TunePlugin for Aes67Plugin {
             None => Arc::new(HorlogeSysteme::new()),
         };
         self.suiveur = suiveur.clone();
-        ctx.register_output_provider(Arc::new(FournisseurAes67::new(
+        let fournisseur = Arc::new(FournisseurAes67::new(
             flux.clone(),
             droit.clone(),
             horloge.clone(),
             ReglagesEmission::default(),
-        )));
+        ));
+        let sorties = fournisseur.registre();
+        ctx.register_output_provider(fournisseur);
         ctx.register_router(router(Etat {
             flux,
             droit,
             db: ctx.db(),
             horloge,
             suiveur,
+            sorties,
         }));
         Ok(())
     }
@@ -181,6 +188,7 @@ struct Etat {
     db: Option<Arc<dyn DbBackend>>,
     horloge: Arc<dyn SourceHorloge>,
     suiveur: Option<Arc<SuiveurPtp>>,
+    sorties: Registre,
 }
 
 fn router(etat: Etat) -> Router<()> {
@@ -218,11 +226,17 @@ async fn etat_du_greffon(State(etat): State<Etat>) -> Response {
     };
     Json(json!({
         "premium": etat.droit.autorise().await,
-        "etape": "E2",
+        "etape": "E3",
         "reference_horloge": etat.horloge.reference().attribut_sdp(),
         "horloge_calee": etat.horloge.calee(),
         "ptp": ptp,
         "flux": flux,
+        "sorties": etat
+            .sorties
+            .vivantes()
+            .iter()
+            .map(|v| v.releve())
+            .collect::<Vec<_>>(),
     }))
     .into_response()
 }
@@ -290,6 +304,7 @@ mod tests {
             db: Some(backend.clone()),
             horloge: Arc::new(HorlogeSysteme::new()),
             suiveur: None,
+            sorties: Registre::default(),
         }
     }
 
@@ -389,7 +404,8 @@ mod tests {
             .await
             .unwrap();
         let j = json_de(rep).await;
-        assert_eq!(j["etape"], "E2");
+        assert_eq!(j["etape"], "E3");
+        assert_eq!(j["sorties"], json!([]));
         assert_eq!(j["reference_horloge"], "local");
         assert_eq!(j["ptp"]["repli_horloge_locale"], true);
         assert_eq!(j["ptp"]["etat_port"], "desactive");
