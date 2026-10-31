@@ -14,14 +14,16 @@
 //! * `la_liste_filtree_par_dr_rend_ce_que_rendait_la_sous_requete_7580` :
 //!   mêmes pistes, même ordre, même total, mêmes comptes par provenance que
 //!   le prédicat d'avant, sous plusieurs combinaisons de filtres ;
-//! * `la_liste_filtree_par_dr_ne_relit_plus_les_tags_7580` : le temps (rougit
-//!   sans le correctif) ;
+//! * `la_liste_filtree_par_dr_ne_relit_plus_les_tags_7580` : une sonde sur la
+//!   base compte les relectures des tags DR — aucune d'une page à l'autre
+//!   (rougit sans le correctif ; aucun chronomètre) ;
 //! * `banc_liste_dr_7580` (ignoré) : la mesure à 100 000 pistes.
 
 use std::time::{Duration, Instant};
 
 use super::facettes_lentes_2144_tests::{Profil, remplir};
 use crate::state::AppState;
+use tune_core::db::backend::{DbBackend, DbTxHandle, SqlValue, ToSqlValue};
 use tune_core::db::engine::Engine;
 use tune_core::db::facet_filter as ff;
 use tune_core::db::track_repo::{ColonneDeTri, DemandeDePistes, TrackFilter, TrackRepo};
@@ -231,41 +233,125 @@ fn meilleur<F: FnMut()>(mut f: F) -> Duration {
     m
 }
 
-/// Le témoin de temps : la page d'un DR RARE (quelques albums) coûtait au
-/// moins la sous-requête — la relecture de tous les tags DR de la base ;
-/// elle ne coûte plus que ses pistes. Borne : le tiers de cette relecture,
-/// mesurée seule sur la même base.
+/// Une sonde autour de la base : compte les lectures qui relisent les tags DR
+/// de toute la bibliothèque — la sous-requête `dr_album_in` comme la table
+/// dérivée `dr_album_source` portent toutes deux ce `GROUP BY` sur
+/// `track_metadata`. Tout le reste est délégué tel quel.
+struct Sonde {
+    base: std::sync::Arc<dyn DbBackend>,
+    relectures: std::sync::atomic::AtomicUsize,
+}
+
+impl Sonde {
+    fn compter(&self, sql: &str) {
+        if sql.contains("FROM track_metadata tm") && sql.contains("GROUP BY tdr.album_id") {
+            self.relectures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn relectures(&self) -> usize {
+        self.relectures.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl DbBackend for Sonde {
+    fn engine(&self) -> Engine {
+        self.base.engine()
+    }
+    fn jeton_des_donnees(&self) -> Option<(u64, i64)> {
+        self.base.jeton_des_donnees()
+    }
+    fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String> {
+        self.base.execute(sql, params)
+    }
+    fn last_insert_rowid(&self) -> i64 {
+        self.base.last_insert_rowid()
+    }
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        self.compter(sql);
+        self.base.query_one(sql, params)
+    }
+    fn query_many(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.compter(sql);
+        self.base.query_many(sql, params)
+    }
+    fn write_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.base.write_tx(f)
+    }
+    fn execute_batch(&self, sql: &str) -> Result<(), String> {
+        self.base.execute_batch(sql)
+    }
+}
+
+/// Le témoin, sans chronomètre : une fois la carte DR lue (première page),
+/// les pages suivantes — `page_de_pistes`, avec et sans comptes, et
+/// `list_filtered` — ne relisent PLUS AUCUNE FOIS les tags DR de la
+/// bibliothèque, tant que rien n'est écrit. Avant #7580, chacune rejouait
+/// `dr_album_in` (deux fois pour `list_filtered` et pour la page avec
+/// comptes). Après une écriture, la carte est relue UNE fois, puis plus.
 #[test]
 fn la_liste_filtree_par_dr_ne_relit_plus_les_tags_7580() {
     let (_d, state) = base(
         "temoin",
         &Profil {
-            albums: 3_000,
-            pistes: 10,
-            copie_tous: 40,
+            albums: 200,
+            pistes: 4,
+            copie_tous: 9,
             cles_de_remplissage: false,
         },
     );
-    let repo = TrackRepo::with_backend(state.backend.clone());
-    let rare = *dr_presents(&state).last().unwrap();
-    let sous_requete = format!(
-        "SELECT COUNT(*) FROM ({}) dr",
-        ff::dr_album_source(Engine::Sqlite)
-    );
-    let relecture = meilleur(|| {
-        let _ = state.backend.query_many(&sous_requete, &[]).unwrap();
+    let sonde = std::sync::Arc::new(Sonde {
+        base: state.backend.clone(),
+        relectures: Default::default(),
     });
-    let mut d = demande(&[rare]);
-    (d.limit, d.avec_comptes) = (2_000, false);
-    let page = meilleur(|| {
-        let _ = repo.page_de_pistes(&d).unwrap();
-    });
-    let borne = relecture / 3;
-    eprintln!("#7580 page DR{rare} : {page:?} ; relecture des tags : {relecture:?}");
     assert!(
-        page <= borne,
-        "la page du DR {rare} prend {page:?}, au-delà de {borne:?} (le tiers de la relecture \
-         de tous les tags DR, {relecture:?}) : elle relit encore les tags à chaque page"
+        sonde.jeton_des_donnees().is_some(),
+        "base de fichier : le jeton des données doit exister"
+    );
+    let repo = TrackRepo::with_backend(sonde.clone());
+    let drs = dr_presents(&state);
+    let mut d = demande(&[drs[0], drs[1]]);
+    (d.limit, d.avec_comptes) = (50, false);
+    let premiere = repo.page_de_pistes(&d).unwrap();
+    assert!(premiere.total > 0, "le banc doit rendre des pistes");
+    let apres_premiere = sonde.relectures();
+    for offset in [0, 50, 100] {
+        d.offset = offset;
+        d.avec_comptes = offset == 50;
+        let _ = repo.page_de_pistes(&d).unwrap();
+        let _ = repo.list_filtered(&d.filtre, 50, offset).unwrap();
+    }
+    assert_eq!(
+        sonde.relectures() - apres_premiere,
+        0,
+        "six lectures de la liste filtrée par DR ont relu les tags DR de toute la \
+         bibliothèque ({} fois) : le filtre rejoue encore la sous-requête `dr_album_in`",
+        sonde.relectures() - apres_premiere
+    );
+    // Une écriture périme la carte : relue une fois, puis plus.
+    state
+        .backend
+        .execute_batch("CREATE TABLE IF NOT EXISTS temoin_7580 (x INTEGER); INSERT INTO temoin_7580 VALUES (1);")
+        .unwrap();
+    let avant = sonde.relectures();
+    d.offset = 0;
+    let _ = repo.page_de_pistes(&d).unwrap();
+    let _ = repo.page_de_pistes(&d).unwrap();
+    assert_eq!(
+        sonde.relectures() - avant,
+        1,
+        "après une écriture : une relecture"
     );
 }
 
