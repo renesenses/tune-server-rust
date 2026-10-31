@@ -561,11 +561,33 @@ impl PlaybackOrchestrator {
         }
         // Pas de chemin local vivant. Le redémarrage n'a de sens que si quelque
         // chose joue : sinon la prochaine lecture appliquera l'état toute seule.
-        let Some(np) = self.playback.get_state(zone_id).await.now_playing else {
+        //
+        // 🔴 #7556 — « quelque chose joue » se lit dans `state`, PAS dans
+        // `now_playing`. `PlaybackManager::stop` garde `now_playing` pour que
+        // l'interface montre où la lecture s'est arrêtée : sur une zone
+        // ARRÊTÉE après une radio, la bascule voyait encore la station,
+        // refabriquait le flux et la relance (`replay_zone_at_position` →
+        // `play`) remettait la radio en route sans geste de lecture (.18,
+        // zone 10, 31/10). Une bascule de réglage ne lance JAMAIS de lecture.
+        let etat = self.playback.get_state(zone_id).await;
+        let Some(np) = etat.now_playing else {
             return PorteeDuReglage::RienNeJoue;
         };
+        if etat.state == crate::playback::PlayState::Stopped {
+            info!(zone_id, "pure_bascule_zone_arretee_rien_n_est_lance");
+            return PorteeDuReglage::RienNeJoue;
+        }
         let pure = self.zone_audiophile(zone_id);
         match self.traitement_que_pure_gouverne(zone_id, np.track_id) {
+            // #7556 — zone EN PAUSE : la relance la remettrait en lecture. On
+            // garde le flux ; la bascule portera sur la piste suivante.
+            Some(traitement) if etat.state != crate::playback::PlayState::Playing => {
+                info!(
+                    zone_id,
+                    pure, traitement, "pure_bascule_zone_en_pause_flux_conserve"
+                );
+                PorteeDuReglage::PisteSuivante
+            }
             Some(traitement) => {
                 info!(
                     zone_id,
