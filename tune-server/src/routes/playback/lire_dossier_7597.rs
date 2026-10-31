@@ -12,7 +12,7 @@
 //! affiche (les pistes du dossier ouvert, ou une liste tronquée à son
 //! `LOAD_LIMIT` dans Oxygène), jamais le sous-arbre entier.
 //!
-//! Trois refus, chacun nommé, et aucune lecture partielle :
+//! Quatre refus, chacun nommé, et aucune lecture partielle :
 //! * `folder_invalid` — chemin relatif, ou qui contient `.`/`..` ;
 //! * `folder_outside_library` — chemin hors des dossiers musicaux ;
 //! * `folder_too_large` — plus de [`PLAFOND_DOSSIER`] pistes : on refuse en
@@ -67,16 +67,17 @@ fn racines(state: &AppState) -> Vec<String> {
 /// compare composant par composant et prendrait `/musique/../etc` pour un
 /// chemin sous `/musique`.
 pub(super) fn dossier_valide(state: &AppState, brut: &str) -> Result<String, RefusDossier> {
-    use std::path::{Component, Path};
+    use std::path::Path;
     let norme: String = tune_core::scanner::walker::normalize_path(brut)
         .nfc()
         .collect();
     let chemin = Path::new(&norme);
+    // Sur le TEXTE et non sur `Path::components` : celui-ci efface en silence
+    // un `.` intermédiaire (`/a/./b` → `a`, `b`), et le motif `LIKE`, lui, le
+    // garderait tel quel.
     if norme.is_empty()
         || !chemin.is_absolute()
-        || chemin
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        || norme.split(['/', '\\']).any(|s| s == "." || s == "..")
     {
         return Err(RefusDossier::Invalide);
     }
