@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod server;
+mod volume;
 
 use serde::Serialize;
 use tauri::{
@@ -117,7 +118,8 @@ async fn set_volume(state: State<'_, AppState>, volume: i32) -> Result<(), Strin
     state
         .http
         .put(format!("{url}/api/v1/zones/{zone_id}/volume"))
-        .json(&serde_json::json!({"volume": volume}))
+        // Une fraction, jamais un pourcentage : voir `volume.rs`.
+        .json(&volume::corps_lineaire(volume))
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -136,7 +138,7 @@ async fn search(state: State<'_, AppState>, query: String) -> Result<serde_json:
     let resp = state
         .http
         .get(format!(
-            "{url}/api/v1/search?q={}&limit=8",
+            "{url}/api/v1/search?q={}&limit=8&sources=local",
             urlencoding::encode(&query)
         ))
         .send()
@@ -158,7 +160,14 @@ async fn set_server_url(state: State<'_, AppState>, url: String) -> Result<Strin
         let cfg_dir = dir.join("tune-widget");
         std::fs::create_dir_all(&cfg_dir).ok();
         let cfg_file = cfg_dir.join("config.json");
-        let cfg = serde_json::json!({"server_url": &clean});
+        // Fusionner, pas écraser : `full_mode` (remember_mode) vit dans le
+        // même fichier.
+        let mut cfg: serde_json::Value = std::fs::read_to_string(&cfg_file)
+            .ok()
+            .and_then(|d| serde_json::from_str(&d).ok())
+            .filter(|v: &serde_json::Value| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        cfg["server_url"] = serde_json::json!(&clean);
         std::fs::write(&cfg_file, cfg.to_string()).ok();
     }
     Ok(clean)
@@ -310,26 +319,29 @@ async fn run_shortcut_action(app: tauri::AppHandle, action: ShortcutAction) {
                 .await;
         }
         ShortcutAction::VolUp | ShortcutAction::VolDown => {
-            if let Some(data) = fetch_widget_data(&http, &url, zone_id).await {
-                // widget/data reports volume as 0..1 or 0..100 depending on zone.
-                let vol = data["volume"].as_f64().unwrap_or(0.5);
-                let current = if vol > 1.0 {
-                    vol as i32
-                } else {
-                    (vol * 100.0) as i32
-                };
-                let delta = if matches!(action, ShortcutAction::VolUp) {
-                    5
-                } else {
-                    -5
-                };
-                let next = (current + delta).clamp(0, 100);
-                let _ = http
-                    .put(format!("{url}/api/v1/zones/{zone_id}/volume"))
-                    .json(&serde_json::json!({ "volume": next }))
-                    .send()
-                    .await;
-            }
+            // Le gain et la courbe de la zone sont dans `GET /zones`, pas à la
+            // racine de `/widget/data` (voir `volume::zone_dans`). Sans eux,
+            // on ne touche à rien plutôt que de repartir d'une valeur inventée.
+            let zones = match http.get(format!("{url}/api/v1/zones")).send().await {
+                Ok(r) => r.json::<serde_json::Value>().await.ok(),
+                Err(_) => None,
+            };
+            let Some((gain, courbe)) = zones.as_ref().and_then(|z| volume::zone_dans(z, zone_id))
+            else {
+                tracing::info!(zone_id, "shortcut_volume_zone_unknown");
+                return;
+            };
+            let delta = if matches!(action, ShortcutAction::VolUp) {
+                5
+            } else {
+                -5
+            };
+            let next = volume::apres_un_pas(gain, courbe, delta);
+            let _ = http
+                .put(format!("{url}/api/v1/zones/{zone_id}/volume"))
+                .json(&serde_json::json!({ "volume": next }))
+                .send()
+                .await;
         }
     }
 }
