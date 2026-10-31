@@ -218,7 +218,8 @@ impl Feature {
             // Features licensed by Premium but NOT yet available/functional
             // (product decision — Bertrand). These show a red cross in the UI.
             // Note: Dé-ploc IS available, so it is deliberately NOT listed here.
-            // AES67 (#7336) : étape E1 seulement, sans PTP ni écran.
+            // AES67 (#7336) : expérimentale dans la rc10, désactivée par défaut,
+            // jamais essayée sur un vrai récepteur Dante/Ravenna.
             Feature::SocialSharing | Feature::WeeklyDigest | Feature::Aes67 => false,
             _ => true,
         }

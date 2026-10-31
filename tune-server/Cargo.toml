@@ -6,7 +6,7 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "aes67"]
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
 local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture"]
@@ -84,12 +84,16 @@ entree-audio = ["dep:tune-entree-audio"]
 # fournisseur n'est réglé. Inscrit à `sdk/plugins.json`, d'où les lignes de
 # build et de test des workflows sont générées.
 assistant-ia = ["dep:tune-assistant-ia"]
-# Sortie AES67 (#7336) — Premium (`Feature::Aes67`), étape E1 (sans PTP).
-# HORS `default` et HORS `sdk/plugins.json` : aucune ligne de build publiée ne
-# la compile encore. Première version Linux seule (Bertrand, 30/10/2026) : la
-# dépendance n'est déclarée que pour `target_os = "linux"` (plus bas), et
-# l'enregistrement est sous `cfg(all(feature = "aes67", target_os = "linux"))`.
-# Allumée ailleurs, la feature ne compile rien et ne casse rien.
+# Sortie AES67 (#7336) — Premium (`Feature::Aes67`), EXPÉRIMENTALE dans la
+# rc10 (Bertrand, 31/10/2026). Dans `default` et dans `sdk/plugins.json`, donc
+# compilée dans les binaires publiés, mais DÉSACTIVÉE par défaut à
+# l'exécution : greffon opt-in (`default_enabled = false`) et hors catalogue,
+# il ne s'éveille que par le réglage « Expérimental › Sortie AES67
+# (Dante/Ravenna) » du client web (`plugin_aes67_installed`). Désactivé, son
+# `setup` n'est jamais appelé : aucun socket PTP/SAP/RTP, aucune zone
+# (`plugins/tune-aes67/tests/garde_experimentale.rs`). Linux seul (Bertrand,
+# 30/10/2026) : la dépendance n'est déclarée que pour `target_os = "linux"`
+# (plus bas) ; allumée ailleurs, la feature ne compile rien.
 aes67 = ["dep:tune-aes67"]
 
 [dependencies]

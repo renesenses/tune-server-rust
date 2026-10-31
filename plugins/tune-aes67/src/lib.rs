@@ -18,6 +18,12 @@
 //! - écran de l'état dans le client web (PR séparée, étape E3) ; le greffon
 //!   reste HORS CATALOGUE (`catalogued() == false`) jusqu'à sa fusion.
 //!
+//! EXPÉRIMENTALE dans la rc10, DÉSACTIVÉE par défaut (Bertrand, 31/10/2026) :
+//! le greffon est opt-in et hors catalogue ; seul le réglage « Expérimental ›
+//! Sortie AES67 (Dante/Ravenna) » du client web le réveille (au redémarrage
+//! suivant). Désactivé, `setup` n'est jamais appelé : aucun socket, aucun fil,
+//! aucune zone (`tests/garde_experimentale.rs`).
+//!
 //! Routes, sous `/api/v1/ext/aes67` :
 //! - `GET  /`     → droit Premium, étape, horloge (PTP calé ou repli),
 //!   flux déclarés, et pour chaque sortie construite : annonce SAP, SDP
