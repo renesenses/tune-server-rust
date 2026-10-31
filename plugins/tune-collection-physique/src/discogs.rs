@@ -103,6 +103,17 @@ pub struct Disque {
     pub famille: Famille,
     /// `date_added` de Discogs, telle quelle.
     pub ajoute_le: Option<String>,
+    /// La vignette de la pochette (`thumb`, sinon `cover_image`), telle que
+    /// la PAGE DE COLLECTION la donne : aucun appel de plus par disque.
+    /// Seulement une adresse `https://i.discogs.com/…` (voir
+    /// [`vignette_discogs`]) : l'écran la charge directement.
+    ///
+    /// `serde(default)` : une mémoire écrite avant ce champ (31/10/2026) se
+    /// relit telle quelle, sans vignette ; la relecture de la liste, à la
+    /// synchronisation suivante, les remplit — sans refaire les fiches ni
+    /// les liens MusicBrainz.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vignette: Option<String>,
 }
 
 impl Disque {
@@ -131,6 +142,31 @@ fn texte(v: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// Les hôtes d'images de Discogs. Toute autre adresse est ignorée : l'écran
+/// charge la vignette telle quelle, il ne doit rien charger d'autre.
+const HOTES_IMAGES: [&str; 2] = ["i.discogs.com", "img.discogs.com"];
+
+/// Une adresse de vignette Discogs utilisable, ou `None` : vide, pas en
+/// `https`, hors des hôtes d'images de Discogs, ou l'image vide
+/// (`spacer.gif`) que Discogs met à la place d'une pochette absente.
+pub fn vignette_discogs(brut: &str) -> Option<String> {
+    let u = brut.trim();
+    let reste = u.strip_prefix("https://")?;
+    let hote = reste.split(['/', '?', '#']).next().unwrap_or("");
+    if !HOTES_IMAGES.contains(&hote.to_ascii_lowercase().as_str()) {
+        return None;
+    }
+    if u.chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '<' || c == '>')
+    {
+        return None;
+    }
+    if u.to_ascii_lowercase().contains("spacer.gif") {
+        return None;
+    }
+    Some(u.to_string())
 }
 
 /// Un exemplaire de la liste, ou `None` s'il lui manque l'essentiel
@@ -216,6 +252,10 @@ pub fn disque_de_l_entree(e: &Value) -> Option<Disque> {
         precisions,
         famille: famille.unwrap_or(Famille::Autre),
         ajoute_le: texte(&e["date_added"]),
+        vignette: b["thumb"]
+            .as_str()
+            .and_then(vignette_discogs)
+            .or_else(|| b["cover_image"].as_str().and_then(vignette_discogs)),
     })
 }
 
@@ -336,6 +376,70 @@ mod tests {
         );
         assert_eq!(code_barre_normalise("LC 0316"), None);
         assert_eq!(code_barre_normalise(""), None);
+    }
+
+    /// Essai réel du 31/10/2026 : aucune pochette. La page de collection
+    /// porte `thumb` et `cover_image` ; le disque les garde.
+    #[test]
+    fn la_vignette_vient_de_la_page_de_collection() {
+        let thumb = "https://i.discogs.com/abc/rs:fit/g:sm/q:40/h:150/w:150/czM6Ly9kaXNj.jpeg";
+        let grande = "https://i.discogs.com/def/rs:fit/g:sm/q:90/h:600/w:600/czM6Ly9kaXNj.jpeg";
+        let e = json!({"id": 5, "instance_id": 6, "basic_information": {
+            "id": 5, "title": "T", "thumb": thumb, "cover_image": grande,
+            "artists": [{"name": "A", "join": ""}], "labels": [], "formats": [{"name": "Vinyl"}]
+        }});
+        assert_eq!(
+            disque_de_l_entree(&e).unwrap().vignette.as_deref(),
+            Some(thumb)
+        );
+        // Sans `thumb`, la grande image.
+        let e = json!({"id": 5, "instance_id": 6, "basic_information": {
+            "id": 5, "title": "T", "thumb": "", "cover_image": grande,
+            "artists": [], "labels": [], "formats": []
+        }});
+        assert_eq!(
+            disque_de_l_entree(&e).unwrap().vignette.as_deref(),
+            Some(grande)
+        );
+        // Ni l'une ni l'autre : aucune.
+        let e = json!({"id": 5, "instance_id": 6, "basic_information": {
+            "id": 5, "title": "T", "thumb": "", "cover_image": "",
+            "artists": [], "labels": [], "formats": []
+        }});
+        assert_eq!(disque_de_l_entree(&e).unwrap().vignette, None);
+    }
+
+    #[test]
+    fn seules_les_images_de_discogs_en_https_sont_gardees() {
+        assert!(vignette_discogs("https://i.discogs.com/x.jpeg").is_some());
+        assert!(vignette_discogs("https://img.discogs.com/x.jpg").is_some());
+        assert_eq!(vignette_discogs("http://i.discogs.com/x.jpeg"), None);
+        assert_eq!(
+            vignette_discogs("https://i.discogs.com.evil.example/x.jpeg"),
+            None
+        );
+        assert_eq!(
+            vignette_discogs("https://evil.example/i.discogs.com/x"),
+            None
+        );
+        assert_eq!(vignette_discogs("javascript:alert(1)"), None);
+        assert_eq!(
+            vignette_discogs("https://s.discogs.com/images/spacer.gif"),
+            None
+        );
+        assert_eq!(vignette_discogs("https://i.discogs.com/spacer.gif"), None);
+        assert_eq!(vignette_discogs(""), None);
+    }
+
+    /// Une mémoire écrite avant le champ se relit, sans vignette.
+    #[test]
+    fn un_disque_d_avant_la_vignette_se_relit() {
+        let ancien = json!({"instance_id": 1, "release_id": 2, "master_id": null,
+            "artistes": [], "artiste": "", "titre": "T", "annee": null, "labels": [],
+            "numeros_catalogue": [], "formats": [], "precisions": [], "famille": "cd",
+            "ajoute_le": null});
+        let d: Disque = serde_json::from_value(ancien).unwrap();
+        assert_eq!(d.vignette, None);
     }
 
     #[test]

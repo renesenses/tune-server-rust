@@ -285,23 +285,11 @@ pub async fn save(
         return Json(enregistrer_client_id_spotify(&state, &lang, &body, env.as_deref()).await);
     }
 
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-
-    // Also write fields to settings table for backward compat (lastfm_auth_token etc.)
-    if let Some(obj) = body.as_object() {
-        for (key, value) in obj {
-            let skey = format!("{}_{}", id, key);
-            let sval = value.as_str().unwrap_or("");
-            if !sval.is_empty()
-                && let Err(e) = settings.set(&skey, sval)
-            {
-                error!(key = %skey, error = %e, "service_token_save_failed");
-                return Json(json!({
-                    "valid": false,
-                    "validation_message": format!("Erreur sauvegarde: {e}")
-                }));
-            }
-        }
+    if let Err(e) = ranger_les_champs(&state, &id, &body) {
+        return Json(json!({
+            "valid": false,
+            "validation_message": format!("Erreur sauvegarde: {e}")
+        }));
     }
 
     // Validate and store in streaming_auth via services_manager (for fix-genres, list status)
@@ -340,6 +328,55 @@ pub async fn save(
             }))
         }
     }
+}
+
+/// Range les champs saisis, AVANT la validation par le service :
+///
+/// * chacun dans `settings` sous `{id}_{champ}` (compatibilité :
+///   `lastfm_auth_token`, `discogs_token`…) ;
+/// * le jeton Discogs, EN PLUS, scellé comme jeton PERSONNEL dans le coffre
+///   des Clés d'API (`tune_core::cles_api`) : c'est la réserve unique que
+///   lisent l'enrichissement, l'écran des Clés d'API et « Ma collection
+///   physique » (#7195). Avant le 31/10/2026 il n'était vu que comme une
+///   clé « intégrée » : le greffon disait « sans jeton personnel ».
+///
+/// Aucune valeur ne passe dans le journal : seule la clé du réglage y va.
+pub(crate) fn ranger_les_champs(
+    state: &AppState,
+    id: &str,
+    body: &serde_json::Value,
+) -> Result<(), String> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Some(obj) = body.as_object() {
+        for (key, value) in obj {
+            let skey = format!("{}_{}", id, key);
+            let sval = value.as_str().unwrap_or("");
+            if !sval.is_empty()
+                && let Err(e) = settings.set(&skey, sval)
+            {
+                error!(key = %skey, error = %e, "service_token_save_failed");
+                return Err(e.to_string());
+            }
+        }
+    }
+    let (service, champ) = crate::routes::system::cles_api::JETON_DE_SERVICE_DISCOGS;
+    if id == service
+        && let Some(jeton) = body
+            .get(champ)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+    {
+        crate::routes::system::cles_api::ranger_le_jeton_discogs_des_jetons_de_service(
+            state, jeton,
+        )
+        .map_err(|e| {
+            // `e` décrit le coffre, la base ou la forme (`empty_key`…),
+            // jamais la valeur.
+            error!(error = %e, "service_token_discogs_non_scelle");
+            e
+        })?;
+    }
+    Ok(())
 }
 
 /// #5427 — l'ARL saisi dans « Accès et jetons » est remis au service de

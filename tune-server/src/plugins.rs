@@ -482,6 +482,7 @@ impl tune_collection_physique::Hote for HoteDeLaCollection {
                     format: a.format,
                     sample_rate: a.sample_rate,
                     bit_depth: a.bit_depth,
+                    pochette: a.cover_path,
                 });
             }
             if n < PAGE {
@@ -1065,3 +1066,7 @@ fn membres_de_collection(
     }
     m
 }
+
+#[cfg(all(test, feature = "collection-physique"))]
+#[path = "plugins_tests_jeton_discogs_7195.rs"]
+mod tests_jeton_discogs_7195;

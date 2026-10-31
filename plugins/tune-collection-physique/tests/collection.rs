@@ -34,6 +34,11 @@ fn fixture(nom: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(&chemin).unwrap()).unwrap()
 }
 
+/// La forme d'une vignette de la page de collection Discogs.
+fn vignette_essai(release: u64) -> String {
+    format!("https://i.discogs.com/essai/rs:fit/g:sm/q:40/h:150/w:150/{release}.jpeg")
+}
+
 const RICK_RELEASE_MB: &str = "dc919562-19c7-42c8-961c-7ed5520f00bb";
 const RICK_GROUPE_MB: &str = "19a8b6e5-f753-36c6-a3c6-189390d09935";
 
@@ -45,6 +50,9 @@ struct HoteEssai {
     recherches: HashMap<(String, String), Vec<AlbumDeService>>,
     /// Combien de 429 rendre avant de répondre.
     limites_a_rendre: Mutex<u32>,
+    /// Les pages de collection portent-elles `thumb` ? (Les fixtures ont
+    /// des vignettes vides ; l'API réelle en donne une par disque.)
+    vignettes: Mutex<bool>,
 }
 
 impl HoteEssai {
@@ -68,7 +76,20 @@ impl HoteEssai {
             albums: Mutex::new(bibliotheque()),
             recherches,
             limites_a_rendre: Mutex::new(0),
+            vignettes: Mutex::new(false),
         }
+    }
+
+    /// Une page de collection, avec une vignette par disque si demandé.
+    fn page(&self, nom: &str) -> Value {
+        let mut p = fixture(nom);
+        if *self.vignettes.lock().unwrap() {
+            for r in p["releases"].as_array_mut().unwrap() {
+                let id = r["id"].as_u64().unwrap();
+                r["basic_information"]["thumb"] = json!(vignette_essai(id));
+            }
+        }
+        p
     }
 
     fn appels(&self, prefixe: &str) -> usize {
@@ -93,6 +114,7 @@ fn bibliotheque() -> Vec<AlbumLocal> {
             mb_groupe: Some(RICK_GROUPE_MB.into()),
             qualite: Some("cd".into()),
             format: Some("flac".into()),
+            pochette: Some("a1b2c3.jpg".into()),
             ..Default::default()
         },
         AlbumLocal {
@@ -140,10 +162,10 @@ impl Hote for HoteEssai {
         }
         Ok(match (chemin, page) {
             ("/users/exemple/collection/folders/0/releases", "1") => {
-                Reponse::Json(fixture("collection_page_1.json"))
+                Reponse::Json(self.page("collection_page_1.json"))
             }
             ("/users/exemple/collection/folders/0/releases", "2") => {
-                Reponse::Json(fixture("collection_page_2.json"))
+                Reponse::Json(self.page("collection_page_2.json"))
             }
             ("/users/prive/collection/folders/0/releases", _) => Reponse::Refusee,
             ("/users/panne/collection/folders/0/releases", _) => return Err(Panne),
@@ -563,4 +585,75 @@ async fn sans_service_connecte_un_disque_absent_est_nulle_part() {
     assert_eq!(c["compteurs"]["par_etat"]["nulle_part"], 2, "{c}");
     assert_eq!(c["compteurs"]["par_etat"]["a_verifier"], 0, "{c}");
     assert_eq!(b.hote.appels("service "), 0);
+}
+
+/// Essai réel du 31/10/2026 : aucune pochette à l'écran. Chaque disque porte
+/// désormais la vignette de la PAGE DE COLLECTION (aucun appel de plus), et
+/// un disque de la bibliothèque, la pochette de l'album local.
+#[tokio::test]
+async fn chaque_disque_porte_sa_vignette_et_l_album_local_sa_pochette() {
+    let hote = HoteEssai::new();
+    *hote.vignettes.lock().unwrap() = true;
+    let b = banc_avec(hote);
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+
+    let h = disque(&c, "The Haçienda - Play By 01/96");
+    assert_eq!(h["vignette"], vignette_essai(7024), "{h}");
+    let rick = disque(&c, "Never Gonna Give You Up");
+    assert_eq!(rick["bibliotheque"]["cover_path"], "a1b2c3.jpg", "{rick}");
+    assert_eq!(rick["vignette"], vignette_essai(249504));
+    // Un album local sans pochette : `null`, l'écran prend la vignette.
+    let sm = disque(&c, "Silent Mirrors");
+    assert_eq!(sm["bibliotheque"]["cover_path"], Value::Null, "{sm}");
+    // Rien de plus qu'avant : une fiche par disque, deux pages de liste.
+    assert_eq!(b.hote.appels("discogs /releases/"), 5);
+    assert_eq!(b.hote.appels("discogs /users/"), 2);
+}
+
+/// Une collection synchronisée AVANT les vignettes les reçoit à la relecture
+/// suivante de la liste, sans que rien d'autre ne soit refait.
+#[tokio::test]
+async fn une_synchronisation_d_avant_les_vignettes_les_recoit_a_la_suivante() {
+    let b = banc_avec(HoteEssai::new());
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    assert!(
+        c["disques"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["vignette"].is_null()),
+        "{c}"
+    );
+    let fiches = b.hote.appels("discogs /releases/");
+    let mb = b.hote.appels("mb ");
+    let services = b.hote.appels("service ");
+
+    *b.hote.vignettes.lock().unwrap() = true;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    assert!(
+        c["disques"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["vignette"]
+                .as_str()
+                .is_some_and(|v| v.starts_with("https://i.discogs.com/"))),
+        "{c}"
+    );
+    assert_eq!(
+        b.hote.appels("discogs /releases/"),
+        fiches,
+        "aucune fiche relue"
+    );
+    assert_eq!(b.hote.appels("mb "), mb, "aucun lien MusicBrainz relu");
+    assert_eq!(
+        b.hote.appels("service "),
+        services,
+        "aucun service réinterrogé"
+    );
 }

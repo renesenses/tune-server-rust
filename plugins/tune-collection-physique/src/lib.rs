@@ -274,6 +274,7 @@ fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Valu
             "format": a.format,
             "sample_rate": a.sample_rate,
             "bit_depth": a.bit_depth,
+            "cover_path": a.pochette,
             "par": par,
         })
     });
@@ -292,6 +293,7 @@ fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Valu
         "codes_barres": codes,
         "ajoute_le": d.ajoute_le,
         "lien_discogs": d.lien_discogs(),
+        "vignette": d.vignette,
         "bibliotheque": bibliotheque,
         "streaming": trouves,
         "etat": etat.code(),

@@ -47,6 +47,9 @@ pub struct AlbumLocal {
     pub format: Option<String>,
     pub sample_rate: Option<i32>,
     pub bit_depth: Option<i32>,
+    /// La pochette de l'album (`albums.cover_path`), telle que les routes de
+    /// la bibliothèque la rendent : l'écran la sert par `/library/artwork`.
+    pub pochette: Option<String>,
 }
 
 /// Les identifiants MusicBrainz reliés à un disque Discogs.
@@ -223,6 +226,7 @@ mod tests {
             precisions: vec![],
             famille: Famille::Vinyle,
             ajoute_le: None,
+            vignette: None,
         }
     }
 
