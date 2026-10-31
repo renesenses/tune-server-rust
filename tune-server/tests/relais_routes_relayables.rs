@@ -75,8 +75,16 @@ async fn sans_authentification_le_relais_ne_sert_que_l_ecoute() {
 
     let refusees: [(Method, &str, Option<&str>); 6] = [
         (Method::GET, "/api/v1/system/config", None),
-        (Method::PATCH, "/api/v1/system/config", Some(r#"{"server_name":"relaye"}"#)),
-        (Method::GET, "/api/v1/system/config/export?include_secrets=true", None),
+        (
+            Method::PATCH,
+            "/api/v1/system/config",
+            Some(r#"{"server_name":"relaye"}"#),
+        ),
+        (
+            Method::GET,
+            "/api/v1/system/config/export?include_secrets=true",
+            None,
+        ),
         (Method::GET, "/api/v1/cloud/bridge/status", None),
         (Method::GET, "/api/v1/auth/config", None),
         (Method::GET, "/api/v1/system/logs", None),
@@ -112,7 +120,7 @@ async fn sans_authentification_le_relais_ne_sert_que_l_ecoute() {
         "/api/v1/library/albums",
         "/api/v1/library/artists",
         "/api/v1/zones/",
-        "/api/v1/playlists/",
+        "/api/v1/playlists",
         "/api/v1/system/health",
     ] {
         let (st, corps) = appel(&app, Method::GET, chemin, true, None).await;
@@ -137,7 +145,11 @@ async fn avec_authentification_le_relais_n_est_pas_local() {
         Some(r#"{"username":"default","password":"pris-par-le-relais"}"#),
     )
     .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED, "default revendiqué par le relais : {corps}");
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "default revendiqué par le relais : {corps}"
+    );
 
     // Force brute : 9 échecs de plus (10 au total), puis 429.
     for _ in 0..9 {
@@ -188,7 +200,15 @@ async fn l_exemption_didl_ne_s_applique_pas_au_relais() {
     let chemin = "/api/v1/library/tracks/424242/audio";
 
     let (local, _) = appel(&app, Method::GET, chemin, false, None).await;
-    assert_ne!(local, StatusCode::UNAUTHORIZED, "témoin : exemption DIDL en local");
+    assert_ne!(
+        local,
+        StatusCode::UNAUTHORIZED,
+        "témoin : exemption DIDL en local"
+    );
     let (relaye, _) = appel(&app, Method::GET, chemin, true, None).await;
-    assert_eq!(relaye, StatusCode::UNAUTHORIZED, "exemption DIDL ouverte au relais");
+    assert_eq!(
+        relaye,
+        StatusCode::UNAUTHORIZED,
+        "exemption DIDL ouverte au relais"
+    );
 }

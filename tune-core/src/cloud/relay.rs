@@ -376,7 +376,8 @@ impl RelayClient {
                         "content-type".to_string(),
                         serde_json::Value::String("application/json".into()),
                     );
-                    let refus = reponse_dapi(&id, 403, hdrs, br#"{"error":"not_available_remotely"}"#);
+                    let refus =
+                        reponse_dapi(&id, 403, hdrs, br#"{"error":"not_available_remotely"}"#);
                     emettre_vers_le_relais(&self.ws_tx, refus.to_string()).await;
                     return;
                 };
@@ -1704,7 +1705,7 @@ mod reponse_dapi_tests {
         for chemin in [
             "/api/v1/../system/config",
             "/api/v1/%2e%2e/agent-tune/pair",
-            "/stream/../api/v1/x",
+            "/api/v1/../../stream/x",
             "@exemple.invalid/api/v1/library",
             "//exemple.invalid/api/v1/library",
             "/ws/bridge",
@@ -1712,7 +1713,11 @@ mod reponse_dapi_tests {
             let r = reponse_a(port, chemin).await;
             assert_eq!(r["status"], 403, "{chemin} : {r}");
         }
-        assert!(journal.lock().unwrap().is_empty(), "{:?}", journal.lock().unwrap());
+        assert!(
+            journal.lock().unwrap().is_empty(),
+            "{:?}",
+            journal.lock().unwrap()
+        );
     }
 }
 
@@ -1723,7 +1728,9 @@ mod chemins_du_relais_tests {
     #[test]
     fn url_locale_d_api_normalise_puis_juge() {
         assert_eq!(
-            url_locale_d_api(8888, "/api/v1/library/albums?x=1").unwrap().as_str(),
+            url_locale_d_api(8888, "/api/v1/library/albums?x=1")
+                .unwrap()
+                .as_str(),
             "http://127.0.0.1:8888/api/v1/library/albums?x=1"
         );
         for refuse in [

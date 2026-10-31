@@ -40,8 +40,9 @@ pub fn requete_relayee(entetes: &HeaderMap) -> bool {
 /// tentatives de connexion. Le relais masque l'adresse réelle : toutes les
 /// requêtes relayées partagent ce compteur, et il n'est jamais en boucle
 /// locale (préfixe IPv6 « à jeter », RFC 6666).
-pub const ADRESSE_DES_REQUETES_RELAYEES: std::net::IpAddr =
-    std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0x7475, 0x6e65));
+pub const ADRESSE_DES_REQUETES_RELAYEES: std::net::IpAddr = std::net::IpAddr::V6(
+    std::net::Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0x7475, 0x6e65),
+);
 
 /// L'adresse à prendre en compte pour l'appelant : celle de la socket, sauf
 /// pour une requête relayée.
@@ -110,12 +111,12 @@ fn route_d_api_relayable(m: &Method, api: &str, auth_active: bool) -> bool {
             return true;
         }
         let segments: Vec<&str> = api.split('/').filter(|s| !s.is_empty()).collect();
-        return match segments.as_slice() {
-            ["profiles", "switch" | "deactivate"] => true,
-            ["profiles", _, "activate" | "settings"] => true,
-            ["profiles", _, "favorites", ..] => true,
-            _ => false,
-        };
+        return matches!(
+            segments.as_slice(),
+            ["profiles", "switch" | "deactivate"]
+                | ["profiles", _, "activate" | "settings"]
+                | ["profiles", _, "favorites", ..]
+        );
     }
     // Bibliothèque : en lecture ; en écriture, seulement les gestes d'écoute.
     if sous(api, "/library") {
@@ -211,7 +212,11 @@ fn auth_active(state: &AppState) -> bool {
 
 /// Couche posée sur tout le routeur : une requête relayée hors de
 /// [`chemin_relayable`] reçoit 403, sans atteindre aucun gestionnaire.
-pub async fn garde_du_relais(State(state): State<AppState>, request: Request, next: Next) -> Response {
+pub async fn garde_du_relais(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
     if !requete_relayee(request.headers()) {
         return next.run(request).await;
     }
@@ -318,13 +323,25 @@ mod tests {
 
     #[test]
     fn connexion_seulement_si_l_auth_est_active() {
-        assert!(!chemin_relayable(&Method::POST, "/api/v1/auth/login", false));
+        assert!(!chemin_relayable(
+            &Method::POST,
+            "/api/v1/auth/login",
+            false
+        ));
         assert!(chemin_relayable(&Method::POST, "/api/v1/auth/login", true));
         assert!(chemin_relayable(&Method::GET, "/api/v1/auth/me", true));
         // Même authentifié, l'administration reste locale.
         assert!(!chemin_relayable(&Method::POST, "/api/v1/auth/token", true));
-        assert!(!chemin_relayable(&Method::GET, "/api/v1/system/config", true));
-        assert!(!chemin_relayable(&Method::POST, "/api/v1/auth/register", true));
+        assert!(!chemin_relayable(
+            &Method::GET,
+            "/api/v1/system/config",
+            true
+        ));
+        assert!(!chemin_relayable(
+            &Method::POST,
+            "/api/v1/auth/register",
+            true
+        ));
     }
 
     #[test]
