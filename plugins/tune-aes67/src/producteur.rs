@@ -25,7 +25,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -429,6 +429,28 @@ pub fn lancer(
         .spawn(move || produire(&runtime, premiere, &p, &tx))
 }
 
+/// Envoie au cadenceur sans jamais rester bloqué après un ordre d'arrêt.
+///
+/// Un `send` bloquant attendait de la place dans le canal ; en PAUSE, le
+/// cadenceur ne tire plus rien, le canal reste plein, et un saut demandé en
+/// pause (qui arrête ce producteur et attend sa fin) ne revenait jamais.
+/// Rend `false` si l'arrêt est demandé ou si le cadenceur a lâché le canal.
+fn envoyer(tx: &SyncSender<Message>, arret: &AtomicBool, mut m: Message) -> bool {
+    loop {
+        if arret.load(Ordering::Acquire) {
+            return false;
+        }
+        match tx.try_send(m) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(rendu)) => {
+                m = rendu;
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+        }
+    }
+}
+
 fn produire(
     runtime: &tokio::runtime::Handle,
     premiere: PisteLancee,
@@ -458,12 +480,7 @@ fn produire(
                     appliquer_le_gain(&mut bloc, p.gain.lire());
                     echantillons_pousses += bloc.len() as u64;
                     for charge in paquetiseur.pousser(&bloc) {
-                        // Un bloc fait ~85 paquets et le canal se vide à un
-                        // paquet par ms : sans ce test, un saut attendrait
-                        // la fin du bloc.
-                        if p.arret.load(Ordering::Acquire)
-                            || tx.send(Message::Charge(charge)).is_err()
-                        {
+                        if !envoyer(tx, &p.arret, Message::Charge(charge)) {
                             interrompu = true;
                             break 'lecture;
                         }
@@ -517,9 +534,9 @@ fn produire(
         && erreur.is_none()
         && let Some(dernier) = paquetiseur.vider()
     {
-        let _ = tx.send(Message::Charge(dernier));
+        let _ = envoyer(tx, &p.arret, Message::Charge(dernier));
     }
-    let _ = tx.send(Message::Fin);
+    let _ = envoyer(tx, &p.arret, Message::Fin);
     if let Some(e) = erreur {
         *p.echec.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
     }

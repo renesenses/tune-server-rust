@@ -281,8 +281,13 @@ fn boucle(
             std::thread::sleep(ATTENTE_DU_PCM);
             continue;
         };
-        // Tirer, sans attendre, tout ce qui est prêt.
-        while !fin_vue {
+        // Tirer, sans attendre, ce qui est prêt, jusqu'au prétampon
+        // seulement : le canal borné doit rester la contre-pression du
+        // producteur. Tirer TOUT faisait du tampon une file sans fond où le
+        // producteur déversait chaque piste à la vitesse du décodeur ; une
+        // suivante préparée pendant la lecture (`set_next_media`) arrivait
+        // alors après la fin du décodage et n'était jamais enchaînée.
+        while !fin_vue && tampon.len() < pretampon {
             match canal.try_recv() {
                 Ok(Message::Charge(c)) => tampon.push_back(c),
                 Ok(Message::Fin) | Err(TryRecvError::Disconnected) => fin_vue = true,

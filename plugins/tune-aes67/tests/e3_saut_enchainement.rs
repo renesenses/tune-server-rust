@@ -445,3 +445,41 @@ async fn pause_saut_en_pause_et_reprise_sans_perte_ni_recul() {
     let fin_utile = trames.iter().rposition(|&v| v != 0).unwrap();
     assert_eq!(trames[fin_utile], 95_999);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn une_suivante_preparee_en_cours_de_lecture_est_encore_enchainee() {
+    // Comme le fait l'hôte : la suivante arrive PENDANT la lecture, ici
+    // 600 ms avant la fin de A. Avant la correction, l'émetteur tirait tout
+    // le PCM disponible dans une file sans fond : A était décodée en
+    // quelques millisecondes, le producteur avait fini, la suivante n'était
+    // jamais prise (vu au banc release : la 96 kHz n'a pas joué).
+    let b = Banc::new();
+    let a = b.compteur("a.wav", 48_000, 57_600, 0);
+    let bb = b.compteur("b.wav", 48_000, 9_600, 1_000_000);
+    b.sortie.play_media(&media(&a, "file:///a")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    b.sortie
+        .set_next_media(&media(&bb, "file:///b"))
+        .await
+        .unwrap();
+    let vus = attendre_la_fin(&b.sortie, Duration::from_secs(10)).await;
+    let c = b.terminer();
+    let p = paquets(&c);
+    exiger_la_continuite(&p);
+    let trames: Vec<i32> = p.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+    let ruptures = ruptures_du_compteur(&trames);
+    println!(
+        "suivante tardive : {} paquets ; ruptures {ruptures:?} ; dernière URI {:?}",
+        p.len(),
+        vus.last().unwrap().current_uri
+    );
+    assert_eq!(
+        ruptures,
+        vec![(57_600, 57_599, 1_000_000)],
+        "B enchaînée juste après A"
+    );
+    assert_eq!(
+        vus.last().unwrap().current_uri.as_deref(),
+        Some("file:///b")
+    );
+}
