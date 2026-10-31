@@ -1021,6 +1021,11 @@ impl PlaybackOrchestrator {
             .await;
     }
 
+    /// #6932 — voir [`AudioStreamer::stream_servi_jusqu_au_bout`].
+    pub async fn streamer_servi_jusqu_au_bout(&self, stream_id: &str) -> bool {
+        self.streamer.stream_servi_jusqu_au_bout(stream_id).await
+    }
+
     /// Taille totale du flux (voir [`AudioStreamer::stream_total_bytes`]).
     pub async fn streamer_total_bytes(&self, stream_id: &str) -> Option<u64> {
         self.streamer.stream_total_bytes(stream_id).await
