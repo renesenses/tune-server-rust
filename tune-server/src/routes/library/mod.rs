@@ -942,5 +942,9 @@ mod banc_rail_5993;
 mod facettes_lentes_2144_tests;
 
 #[cfg(test)]
+#[path = "liste_dr_7580_tests.rs"]
+mod liste_dr_7580_tests;
+
+#[cfg(test)]
 #[path = "banc_repertoires_5998.rs"]
 mod banc_repertoires_5998;
