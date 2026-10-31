@@ -2962,6 +2962,23 @@ pub(crate) enum IssueMontage {
 /// Un essai de montage d'UN partage, son issue écrite sur sa ligne.
 async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMontage {
     let (host, share, path, id) = (p.host.clone(), p.share.clone(), p.path.clone(), p.id);
+    // Une ligne ne remonte que sous une racine du serveur, avec un hôte, un
+    // partage et des identifiants acceptables : les mêmes règles que le
+    // montage interactif (`routes/network.rs`). Sinon, rien n'est lancé.
+    let racines = crate::routes::network::racines_des_montages(state);
+    let refus = if !crate::smb::est_confine(std::path::Path::new(&path), &racines) {
+        Some("mount point outside the server's mount directory")
+    } else {
+        crate::smb::verifier_hote(&host)
+            .and_then(|_| crate::smb::verifier_partage(&share))
+            .and_then(|_| crate::smb::verifier_identifiants(&p.user, &p.pass))
+            .err()
+    };
+    if let Some(motif) = refus {
+        warn!(host = %host, share = %share, path = %path, motif, "network_share_remount_refused");
+        noter_montage(state, id, "failed", Some(motif), None).await;
+        return IssueMontage::Definitif;
+    }
     // Deja monte (redemarrage du seul service, systeme reste debout) :
     // ne pas empiler un second montage sur le meme point.
     //
@@ -3023,7 +3040,7 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
             // l'echelle et part au journal avec la cause.
             let res = tokio::time::timeout(
                 crate::smb::ESSAI_TIMEOUT,
-                crate::smb::commande_de_montage(
+                crate::smb::lancer_un_essai(
                     crate::privilege::euid(),
                     &crate::privilege::sudo(),
                     &unc,
@@ -3031,8 +3048,7 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
                     u,
                     &pass,
                     dialecte,
-                )
-                .lancer(),
+                ),
             )
             .await;
             let arreter = match &res {
