@@ -112,31 +112,47 @@ fn la_liste_filtree_par_dr_rend_ce_que_rendait_la_sous_requete_7580() {
     assert!(drs.len() >= 6, "trop peu de DR au banc : {drs:?}");
     let (courant, rare) = (drs[0], *drs.last().unwrap());
 
-    let mut cas: Vec<(&str, DemandeDePistes)> = Vec::new();
-    cas.push(("un DR", demande(&[courant])));
-    cas.push(("deux DR", demande(&[courant, drs[2]])));
-    cas.push(("DR rare", demande(&[rare])));
-    cas.push(("DR absent", demande(&[99])));
-    cas.push(("DR absent et présent", demande(&[99, drs[1]])));
-    let mut d = demande(&[courant, rare]);
-    d.filtre.genres = vec!["Jazz".into()];
-    cas.push(("DR + genre", d));
-    let mut d = demande(&[drs[1]]);
-    d.filtre.original_years = vec![1990, 1991, 1992, 1993];
-    cas.push(("DR + année d'origine", d));
-    let mut d = demande(&[courant]);
-    d.recherche = Some("Piste 1".into());
-    cas.push(("DR + recherche", d));
-    let mut d = demande(&[courant, drs[1]]);
-    d.provenance = Some("local".into());
-    cas.push(("DR + provenance", d));
-    let mut d = demande(&[courant, drs[3]]);
-    d.tri = Some(ColonneDeTri::Format);
-    d.descendant = true;
-    cas.push(("DR + tri par format, décroissant", d));
-    let mut d = demande(&[courant, drs[3]]);
-    d.tri = Some(ColonneDeTri::Annee);
-    cas.push(("DR + tri par année", d));
+    let avec = |drs: &[i64], f: &dyn Fn(&mut DemandeDePistes)| {
+        let mut d = demande(drs);
+        f(&mut d);
+        d
+    };
+    let cas: Vec<(&str, DemandeDePistes)> = vec![
+        ("un DR", demande(&[courant])),
+        ("deux DR", demande(&[courant, drs[2]])),
+        ("DR rare", demande(&[rare])),
+        ("DR absent", demande(&[99])),
+        ("DR absent et présent", demande(&[99, drs[1]])),
+        (
+            "DR + genre",
+            avec(&[courant, rare], &|d| d.filtre.genres = vec!["Jazz".into()]),
+        ),
+        (
+            "DR + année d'origine",
+            avec(&[drs[1]], &|d| {
+                d.filtre.original_years = vec![1990, 1991, 1992, 1993]
+            }),
+        ),
+        (
+            "DR + recherche",
+            avec(&[courant], &|d| d.recherche = Some("Piste 1".into())),
+        ),
+        (
+            "DR + provenance",
+            avec(&[courant, drs[1]], &|d| d.provenance = Some("local".into())),
+        ),
+        (
+            "DR + tri par format, décroissant",
+            avec(&[courant, drs[3]], &|d| {
+                d.tri = Some(ColonneDeTri::Format);
+                d.descendant = true;
+            }),
+        ),
+        (
+            "DR + tri par année",
+            avec(&[courant, drs[3]], &|d| d.tri = Some(ColonneDeTri::Annee)),
+        ),
+    ];
 
     let mut non_vides = 0;
     for (nom, d) in &cas {
