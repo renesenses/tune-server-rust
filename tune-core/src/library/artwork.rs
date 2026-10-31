@@ -116,9 +116,36 @@ pub(crate) fn extended_path(path: &Path) -> std::borrow::Cow<'_, Path> {
     Cow::Owned(std::path::PathBuf::from(prefixed))
 }
 
-pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
+/// #6077 — la jaquette intégrée à retenir parmi TOUTES les balises du fichier.
+///
+/// Avant, seule la balise principale était lue (`primary_tag`), et sa première
+/// image prise telle quelle. Deux pochettes qu'Audirvana affiche échappaient
+/// donc à Tune :
+/// - un FLAC précédé d'un en-tête ID3v2 qui porte l'image (APIC), sa balise
+///   Vorbis n'en portant aucune : la balise principale d'un FLAC est la
+///   Vorbis, l'ID3v2 n'était jamais regardé ;
+/// - plusieurs images intégrées dont la première n'est pas la face avant
+///   (dos, livret, disque) : c'est elle qui devenait la pochette.
+///
+/// Ordre : la face avant (`CoverFront`) d'abord, où qu'elle soit ; sinon la
+/// première image, balise principale en tête.
+fn jaquette_a_retenir(tagged: &lofty::file::TaggedFile) -> Option<&lofty::picture::Picture> {
     use lofty::file::TaggedFileExt;
+    use lofty::picture::PictureType;
+    let principale = tagged.primary_tag_type();
+    let mut balises: Vec<&lofty::tag::Tag> = tagged.tags().iter().collect();
+    // Tri stable : la balise principale passe devant, les autres gardent leur ordre.
+    balises.sort_by_key(|t| t.tag_type() != principale);
+    let images: Vec<&lofty::picture::Picture> =
+        balises.iter().flat_map(|t| t.pictures().iter()).collect();
+    images
+        .iter()
+        .find(|p| p.pic_type() == PictureType::CoverFront)
+        .or_else(|| images.first())
+        .copied()
+}
 
+pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     // #5299 — une piste rangée dans une image ISO se lit par son lecteur
     // interne ; tout autre chemin garde `read_from_path`.
     let lu = match crate::audio::iso9660::ouvrir_si_virtuel(audio_path) {
@@ -133,9 +160,7 @@ pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     };
     match lu {
         Ok(tagged) => {
-            if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag())
-                && let Some(pic) = tag.pictures().first()
-            {
+            if let Some(pic) = jaquette_a_retenir(&tagged) {
                 let mime = match pic.mime_type() {
                     Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
                     Some(lofty::picture::MimeType::Png) => "image/png",
@@ -2712,6 +2737,10 @@ pub fn backfill_embedded_covers(
 #[cfg(test)]
 #[path = "noms_de_pochette_tests_6077.rs"]
 mod noms_de_pochette_tests_6077;
+
+#[cfg(test)]
+#[path = "jaquette_toutes_balises_tests_6077.rs"]
+mod jaquette_toutes_balises_tests_6077;
 
 #[cfg(test)]
 #[path = "image_rejetee_tests_4837.rs"]

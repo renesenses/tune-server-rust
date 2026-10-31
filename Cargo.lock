@@ -6815,6 +6815,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-mon-theme"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tune-core",
+]
+
+[[package]]
 name = "tune-output-api"
 version = "1.0.0"
 dependencies = [
@@ -6999,6 +7013,7 @@ dependencies = [
  "tune-entree-audio",
  "tune-http-types",
  "tune-karaoke",
+ "tune-mon-theme",
  "tune-plugin-converter",
  "tune-plugin-declick",
  "tune-plugin-native",

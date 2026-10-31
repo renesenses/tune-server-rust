@@ -179,15 +179,20 @@ pub fn bloc_listes(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat
 }
 
 /// Favoris du profil 1 — vocabulaire FERMÉ, aucun marqueur.
-pub fn bloc_favoris(_ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
-    any_of(
-        valeurs
-            .iter()
-            .filter_map(|k| favorite_condition(k))
-            .map(str::to_string)
-            .collect(),
-    )
-    .map(|c| (c, Vec::new()))
+///
+/// #7569 — `profil` est le profil de la REQUÊTE (`X-Profile-Id`), pas un 1
+/// gravé : c'est ce qui fait que le filtre « favoris » d'une liste lit les
+/// mêmes favoris que la vue Favoris du même profil.
+pub fn bloc_favoris(profil: i64) -> impl Fn(&mut Placeholders, &[String]) -> Option<Predicat> {
+    move |_ph, valeurs| {
+        any_of(
+            valeurs
+                .iter()
+                .filter_map(|k| favorite_condition(k, profil))
+                .collect(),
+        )
+        .map(|c| (c, Vec::new()))
+    }
 }
 
 /// Étiquette manquante — vocabulaire FERMÉ, aucun marqueur.
@@ -543,23 +548,27 @@ pub fn normalize_ints(values: &[i64]) -> Vec<i64> {
     out
 }
 
-/// Prédicat « cette piste est en favori » pour le profil 1. Vocabulaire FERMÉ :
+/// Prédicat « cette piste est en favori » pour le profil `profil` (un profil
+/// non positif — filtre construit sans requête — retombe sur le profil 1, le
+/// profil par défaut). Le numéro est un entier, jamais du texte : il s'écrit
+/// dans le SQL sans ouvrir de porte à l'injection. Vocabulaire FERMÉ :
 /// toute autre valeur ne filtre RIEN plutôt que de tout exclure.
 ///
 /// Vit ici, et non dans chacun des deux constructeurs de prédicats, parce que
 /// c'est exactement le genre de littéral qu'on recopie une fois de trop : une
 /// facette qui compterait autrement que la liste qu'elle filtre serait pire
 /// qu'une facette absente.
-pub fn favorite_condition(kind: &str) -> Option<&'static str> {
+pub fn favorite_condition(kind: &str, profil: i64) -> Option<String> {
+    let profil = if profil > 0 { profil } else { 1 };
     match kind {
-        "album" => Some(
-            "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-             AND f.item_type = 'album' AND f.item_id = t.album_id)",
-        ),
-        "track" => Some(
-            "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-             AND f.item_type = 'track' AND f.item_id = t.id)",
-        ),
+        "album" => Some(format!(
+            "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = {profil} \
+             AND f.item_type = 'album' AND f.item_id = t.album_id)"
+        )),
+        "track" => Some(format!(
+            "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = {profil} \
+             AND f.item_type = 'track' AND f.item_id = t.id)"
+        )),
         _ => None,
     }
 }
@@ -1100,8 +1109,11 @@ pub struct TrackFilter {
     /// modèle n'ont jamais été relevées, et un découpage inventé ici
     /// survivrait dans le contrat HTTP à la mesure qui le contredirait.
     pub dynamic_ranges: Vec<i64>,
-    /// `track` et/ou `album` (profil 1).
+    /// `track` et/ou `album`, pour le profil [`TrackFilter::profile_id`].
     pub favorites: Vec<String>,
+    /// Le profil de la requête (#7569) : celui dont `favorites` lit les
+    /// favoris. `0` (le défaut) = profil 1.
+    pub profile_id: i64,
     pub playlists: Vec<String>,
     /// `genre`, `year`, `artist`, `album` ou `cover`.
     pub untagged: Vec<String>,
@@ -1181,7 +1193,7 @@ impl TrackFilter {
             || !self.dynamic_ranges.is_empty()
             // Vocabulaires FERMÉS : une valeur inconnue ne produit aucun
             // prédicat, donc elle ne doit pas non plus activer le chemin filtré.
-            || self.favorites.iter().any(|k| favorite_condition(k).is_some())
+            || self.favorites.iter().any(|k| favorite_condition(k, 1).is_some())
             || !self.playlists.is_empty()
             || self.untagged.iter().any(|k| untagged_condition(k).is_some())
             || self.folder.as_deref().is_some_and(|s| !s.is_empty())
@@ -1401,14 +1413,14 @@ mod tests {
     #[test]
     fn les_vocabulaires_fermes_refusent_tout_le_reste() {
         for k in ["track", "album"] {
-            assert!(favorite_condition(k).is_some(), "{k}");
+            assert!(favorite_condition(k, 1).is_some(), "{k}");
         }
         for f in ["artist", "album", "genre", "year", "cover"] {
             assert!(untagged_condition(f).is_some(), "{f}");
         }
         for hostile in ["", "id", "t.genre", "1=1", "genre; DROP TABLE tracks--"] {
             assert!(untagged_condition(hostile).is_none(), "{hostile:?}");
-            assert!(favorite_condition(hostile).is_none(), "{hostile:?}");
+            assert!(favorite_condition(hostile, 1).is_none(), "{hostile:?}");
         }
     }
 

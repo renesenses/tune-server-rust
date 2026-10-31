@@ -6,7 +6,7 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "aes67"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "mon-theme", "aes67"]
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
 local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture"]
@@ -84,6 +84,11 @@ entree-audio = ["dep:tune-entree-audio"]
 # fournisseur n'est réglé. Inscrit à `sdk/plugins.json`, d'où les lignes de
 # build et de test des workflows sont générées.
 assistant-ia = ["dep:tune-assistant-ia"]
+# « Mon thème » (tune-web-client#2527, rc10) : toutes les couleurs de
+# l'interface au choix, rangées par profil. Dans `default` comme `cd` : opt-in
+# à l'exécution (`default_enabled = false`), au catalogue, gratuit. Inscrit à
+# `sdk/plugins.json`.
+mon-theme = ["dep:tune-mon-theme"]
 # Sortie AES67 (#7336) — Premium (`Feature::Aes67`), EXPÉRIMENTALE dans la
 # rc10 (Bertrand, 31/10/2026). Dans `default` et dans `sdk/plugins.json`, donc
 # compilée dans les binaires publiés, mais DÉSACTIVÉE par défaut à
@@ -122,6 +127,7 @@ tune-entree-audio = { path = "../plugins/tune-entree-audio", optional = true }
 tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tune-pont-roon = { path = "../plugins/tune-pont-roon", optional = true }
 tune-assistant-ia = { path = "../plugins/tune-assistant-ia", optional = true }
+tune-mon-theme = { path = "../plugins/tune-mon-theme", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
@@ -454,6 +460,12 @@ path = "tests/radios_upnp_hors_des_pistes_6500.rs"
 [[test]]
 name = "plugin_contracts"
 path = "tests/plugin_contracts.rs"
+
+# #7470 — désinstaller un greffon natif actif d'office. `autotests = false`
+# plus haut : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "plugin_natif_desinstallation_7470"
+path = "tests/plugin_natif_desinstallation_7470.rs"
 
 [[test]]
 name = "plugin_wasm_contracts"
@@ -1742,6 +1754,12 @@ path = "tests/sso_deconnexion_efface_la_liaison_5326.rs"
 [[test]]
 name = "sso_modules_du_compte"
 path = "tests/sso_modules_du_compte.rs"
+
+# #7419 — sur une nouvelle machine, la connexion au compte suffit : le statut
+# de licence dit que le Premium vient du compte (`premium_source`).
+[[test]]
+name = "licence_par_le_compte_7419"
+path = "tests/licence_par_le_compte_7419.rs"
 
 # #5682 — les gardes du montage SMB (#1834, #1916) et l'ordre « remonter les
 # partages, PUIS scanner » de `bootstrap.rs`. Le fichier existait sans cible :

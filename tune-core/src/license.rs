@@ -520,6 +520,30 @@ impl LicenseManager {
         snapshot
     }
 
+    /// D'où vient le Premium EFFECTIF de ce serveur (#7419) : `Some("key")`
+    /// quand la clé de licence le porte, `Some("account")` quand c'est le
+    /// compte Mozaiklabs lié (SSO) seul, `None` hors Premium.
+    ///
+    /// Sur une nouvelle machine, la connexion au compte suffit : le site déduit
+    /// le Premium de la licence liée au courriel du compte, et aucune clé n'est
+    /// à saisir. Le panneau Licence ne le disait pas — il montrait un champ de
+    /// clé vide et invitait à « activer une licence », si bien que l'auditeur
+    /// allait recopier sa clé depuis son espace personnel (alec_eiffel,
+    /// fil 2530), alors que son serveur était déjà Premium par le compte.
+    /// Même règle que [`effective_tier`], dont elle ne fait que nommer la
+    /// branche retenue.
+    pub async fn source_du_premium(&self) -> Option<&'static str> {
+        let state = self.state.read().await;
+        if effective_tier(&state) != Tier::Premium {
+            return None;
+        }
+        if key_premium_active(&state) {
+            Some("key")
+        } else {
+            Some("account")
+        }
+    }
+
     /// Store a license key **without** granting Premium.
     ///
     /// The tier is only promoted to Premium once the licensing server confirms
@@ -1762,6 +1786,42 @@ mod tests {
         for f in Feature::all_premium() {
             assert!(!f.display_name().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn la_source_du_premium_nomme_le_compte_ou_la_cle_7419() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let mgr = LicenseManager::new_with_limit(backend, 3);
+        assert_eq!(
+            mgr.source_du_premium().await,
+            None,
+            "palier gratuit : aucune source"
+        );
+
+        // Nouvelle machine, aucune clé : la connexion au compte suffit.
+        mgr.set_account_premium(true, None).await;
+        let ls = mgr.license_state().await;
+        assert_eq!(ls.tier, Tier::Premium);
+        assert!(ls.license_key.is_none());
+        assert_eq!(mgr.source_du_premium().await, Some("account"));
+
+        // Une clé confirmée en ligne prend le pas : c'est elle qui est affichée.
+        mgr.set_license_key("TUNE-TEST-7419").await.unwrap();
+        assert_eq!(
+            mgr.source_du_premium().await,
+            Some("account"),
+            "une clé encore en attente de validation ne porte pas le Premium"
+        );
+        mgr.update_from_server(Tier::Premium, None).await;
+        assert_eq!(mgr.source_du_premium().await, Some("key"));
+
+        // Compte redevenu gratuit, sans clé : plus de source.
+        mgr.clear_license().await;
+        mgr.set_account_premium(false, None).await;
+        assert_eq!(mgr.source_du_premium().await, None);
     }
 
     #[tokio::test]

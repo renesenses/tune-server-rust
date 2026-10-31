@@ -449,6 +449,13 @@ async fn uninstall_plugin(
             }
         };
     }
+    if !registered
+        && plugin_id.is_none()
+        && crate::routes::plugins::natif_actif_par_defaut(&state, &slug)
+    {
+        // #7470 — greffon compilé et actif d'office : on le désactive.
+        return crate::routes::plugins::desinstaller_natif(&state, &slug, &lang);
+    }
     if !registered && plugin_id.is_none() {
         return (
             StatusCode::NOT_FOUND,

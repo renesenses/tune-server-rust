@@ -28,6 +28,12 @@ mod lire_artiste_6467;
 #[cfg(test)]
 #[path = "playback/lire_artiste_6467_tests.rs"]
 mod lire_artiste_6467_tests;
+// #7597 — lire ou enfiler un dossier avec tout son sous-arbre, dans l'ordre.
+#[path = "playback/lire_dossier_7597.rs"]
+mod lire_dossier_7597;
+#[cfg(test)]
+#[path = "playback/lire_dossier_7597_tests.rs"]
+mod lire_dossier_7597_tests;
 #[cfg(test)]
 #[path = "playback/tete_de_liste_6399_tests.rs"]
 mod tete_de_liste_6399_tests;
@@ -1171,6 +1177,9 @@ struct PlayRequest {
     /// #6467 — moins que 50 titres pour `artist_id`, si le client le veut.
     /// Jamais plus : la borne est celle du fil 2302.
     artist_limit: Option<usize>,
+    /// #7597 — « Tout lire » un DOSSIER (chemin absolu de la vue Répertoires)
+    /// avec tous ses sous-dossiers, dans l'ordre. Voir `lire_dossier_7597`.
+    folder: Option<String>,
     /// Web#1923, web#1924 : la page de l'album d'un titre Bandcamp lancé SEUL
     /// (`source` + `source_id`), quand le client la connaît (recherche, page
     /// d'artiste, genres). Rangée avec la ligne de file si elle est sûre
@@ -1546,6 +1555,9 @@ struct QueueAddRequest {
     /// requêtes, c'est qu'il ignore le rattrapage de la ligne sœur — l'album
     /// s'ajoutait donc VIDE là où « lire » fonctionne.
     album_id: Option<i64>,
+    /// #7597 — enfiler un DOSSIER et tout son sous-arbre, dans l'ordre (chemin
+    /// absolu de la vue Répertoires). Voir `lire_dossier_7597`.
+    folder: Option<String>,
     position: Option<i64>,
     // Streaming track fields (single)
     source: Option<String>,
@@ -1838,6 +1850,12 @@ mod sortie_de_pure_recompose_le_trim_6213;
 /// #6526 — l'aléatoire mélange réellement la file.
 #[cfg(test)]
 mod aleatoire_dans_la_file_6526;
+
+/// #7378 — « Ce téléphone » (zone navigateur) : « Suivant » après l'aléatoire
+/// joue la file relue, pas l'ordre d'origine.
+#[cfg(test)]
+#[path = "playback/aleatoire_zone_navigateur_7378_tests.rs"]
+mod aleatoire_zone_navigateur_7378_tests;
 
 /// #5975 — le lecteur d'une zone navigateur dit pourquoi il ne joue pas.
 #[path = "playback/erreur_media_navigateur.rs"]
@@ -3241,6 +3259,7 @@ async fn play(
     // ci-dessous consomme `body`.
     let demande_nue = body.album_id.is_none()
         && body.artist_id.is_none()
+        && body.folder.is_none()
         && body.playlist_id.is_none()
         && body.track_ids.is_none()
         && body.start_index.is_none();
@@ -3325,6 +3344,12 @@ async fn play(
             profile.id(),
             body.artist_limit,
         )
+    } else if let Some(dossier) = body.folder.as_deref() {
+        // #7597 — le sous-arbre entier, dans l'ordre, ou un refus nommé.
+        match lire_dossier_7597::pistes_du_dossier(&state, dossier, profile.id()) {
+            Ok(ids) => ids,
+            Err(refus) => return lire_dossier_7597::reponse(refus, zone_id),
+        }
     } else if let Some(ids) = body.track_ids {
         ids
     } else if let Some(id) = body.track_id {
@@ -5194,6 +5219,7 @@ fn resoudre_pistes_d_album(
 
 async fn queue_add(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(zone_id): Path<i64>,
     Json(body): Json<QueueAddRequest>,
 ) -> impl IntoResponse {
@@ -5230,6 +5256,20 @@ async fn queue_add(
             }
             info!(zone_id, album_id, pistes = ids.len(), "queue_add_album");
             ids
+        }
+        None => Vec::new(),
+    };
+    // #7597 — un dossier entier, dans l'ordre, ou un refus nommé : jamais une
+    // partie du dossier en silence.
+    let pistes_dossier: Vec<i64> = match body.folder.as_deref() {
+        Some(dossier) => {
+            match lire_dossier_7597::pistes_du_dossier(&state, dossier, profile.id()) {
+                Ok(ids) => {
+                    info!(zone_id, pistes = ids.len(), "queue_add_dossier");
+                    ids
+                }
+                Err(refus) => return lire_dossier_7597::reponse(refus, zone_id),
+            }
         }
         None => Vec::new(),
     };
@@ -5344,6 +5384,7 @@ async fn queue_add(
 
     // Local tracks.
     let mut local_ids = pistes_album;
+    local_ids.extend(pistes_dossier);
     local_ids.extend_from_slice(&body.track_ids);
     if let Some(single) = body.track_id {
         local_ids.push(single);

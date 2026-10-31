@@ -101,6 +101,9 @@ impl AutoFixEngine {
         let enricher = MetadataEnricher::new(self.db.clone());
 
         let defective = find_defective_tracks(&repo);
+        let backend: Arc<dyn crate::db::backend::DbBackend> = Arc::new(self.db.clone());
+        let exclus =
+            crate::taches_de_fond::perimetre::dossiers_exclus_de_l_enrichissement(&backend);
         let total = defective.len();
 
         {
@@ -122,6 +125,21 @@ impl AutoFixEngine {
 
             self.progress.lock().await.current = i + 1;
 
+            // #7538 — un dossier exclu de l'enrichissement n'est même pas
+            // interrogé : aucun appel MusicBrainz, aucune proposition.
+            if !exclus.is_empty()
+                && let Ok(Some(t)) = repo.get(*track_id)
+                && t.file_path
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .or(t.cue_media_path.as_deref())
+                    .is_some_and(|p| {
+                        crate::taches_de_fond::perimetre::exclu_de_l_enrichissement(p, &exclus)
+                    })
+            {
+                continue;
+            }
+
             match enricher.enrich_track(*track_id).await {
                 Ok(Some(result)) => {
                     let track = match repo.get(*track_id) {
@@ -129,8 +147,11 @@ impl AutoFixEngine {
                         _ => continue,
                     };
 
+                    // #7538 — un genre déjà là, dans le tableau multivaleur
+                    // de la piste ou sur son album, n'est pas un trou.
                     if let Some(ref genre) = result.genre
                         && (track.genre.is_none() || track.genre.as_deref() == Some(""))
+                        && !genre_deja_porte(&backend, &track)
                     {
                         self.handle_candidate(
                             *track_id,
@@ -277,6 +298,34 @@ impl AutoFixEngine {
         info!(track_id, field, value, "auto_fix_applied");
         Ok(())
     }
+}
+
+/// #7538 — la piste porte-t-elle déjà un genre ailleurs que dans la colonne
+/// `genre` : son tableau `genres`, ou le genre de son album ? Même règle que
+/// [`super::enrichment::GENRE_COMBLE_PAR_L_ENRICHISSEMENT`], pour la passe qui
+/// écrit par `TrackRepo::update` au lieu d'une requête.
+fn genre_deja_porte(
+    db: &Arc<dyn crate::db::backend::DbBackend>,
+    track: &crate::db::models::Track,
+) -> bool {
+    let tableau = track
+        .genres
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|g| !g.is_empty() && g != "[]");
+    if tableau {
+        return true;
+    }
+    let Some(album_id) = track.album_id else {
+        return false;
+    };
+    db.query_one(
+        "SELECT 1 FROM albums WHERE id = ? AND genre IS NOT NULL AND genre <> ''",
+        &[&album_id as &dyn crate::db::backend::ToSqlValue],
+    )
+    .ok()
+    .flatten()
+    .is_some()
 }
 
 /// ⚠️ Le `t.file_path IS NOT NULL` de cette requête n'est PAS un filtre global.

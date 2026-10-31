@@ -256,6 +256,41 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
             },
         )))
         .await;
+
+    // « Mon thème » (tune-web-client#2527, rc10) : le thème de chaque profil,
+    // rangé dans `settings`. Le profil d'une requête est jugé par l'hôte,
+    // avec l'extracteur de toutes les routes.
+    #[cfg(feature = "mon-theme")]
+    loader
+        .register(Box::new(tune_mon_theme::MonThemePlugin::new(
+            tune_mon_theme::HostServices {
+                backend: state.backend.clone(),
+                hote: std::sync::Arc::new(HoteDuTheme {
+                    state: state.clone(),
+                }),
+            },
+        )))
+        .await;
+}
+
+/// L'hôte de « Mon thème » (#2527) : le profil d'une requête, jugé comme
+/// partout (`X-Profile-Id` permis seulement à son titulaire quand
+/// l'authentification est active, puis l'appelant, puis le profil global).
+#[cfg(feature = "mon-theme")]
+struct HoteDuTheme {
+    state: AppState,
+}
+
+#[cfg(feature = "mon-theme")]
+#[async_trait::async_trait]
+impl tune_mon_theme::Hote for HoteDuTheme {
+    async fn profil_actif(&self, parts: &mut axum::http::request::Parts) -> i64 {
+        use axum::extract::FromRequestParts;
+        match tune_http_types::ActiveProfile::from_request_parts(parts, &self.state).await {
+            Ok(p) => p.id(),
+            Err(never) => match never {},
+        }
+    }
 }
 
 #[cfg(feature = "assistant-ia")]

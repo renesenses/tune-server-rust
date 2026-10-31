@@ -559,6 +559,15 @@ impl PositionPoller {
                     // lecture » pour toujours, barre de progression comprise,
                     // alors que le démarrage avait déjà renoncé à envoyer quoi
                     // que ce soit (`output_sent=false`, #2630).
+                    // #6932 — la piste est finie, servie jusqu'au bout, et
+                    // le lecteur n'a pas demandé la suite (signal `ended` /
+                    // `completed` perdu ou jamais branché) : on enchaîne ici,
+                    // comme pour toute sortie à la fin d'une piste.
+                    if self.enchainer_la_zone_navigateur_finie(zone_state).await {
+                        poll_states.remove(&zone_id);
+                        continue;
+                    }
+
                     if self.abandonner_lecture_sans_destination(zone_state).await {
                         poll_states.remove(&zone_id);
                     }

@@ -10,7 +10,8 @@
     {"id": "circle", "crate": "../plugins/tune-circle", "feature": "circle", "fast_test": true},
     {"id": "entree-audio", "crate": "../plugins/tune-entree-audio", "feature": "entree-audio", "fast_test": true},
     {"id": "assistant-ia", "crate": "../plugins/tune-assistant-ia", "feature": "assistant-ia", "fast_test": true},
-    {"id": "aes67", "crate": "../plugins/tune-aes67", "feature": "aes67", "fast_test": false}
+    {"id": "aes67", "crate": "../plugins/tune-aes67", "feature": "aes67", "fast_test": false},
+    {"id": "mon-theme", "crate": "../plugins/tune-mon-theme", "feature": "mon-theme", "fast_test": true}
   ],
   "native": [
     {"id": "equalizer", "crate": "tune-plugin-equalizer", "bundled_in": "tune-core"},
