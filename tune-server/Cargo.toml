@@ -1891,3 +1891,10 @@ path = "tests/groupe_dlna_joue_sur_les_deux_6155.rs"
 [[test]]
 name = "messages_seconde_passe_7077"
 path = "tests/messages_seconde_passe_7077.rs"
+
+# Durcissement de la configuration : écritures génériques de `settings` et
+# contrôle d'origine, par le vrai routeur. `autotests = false` plus haut : sans
+# cette cible, le banc ne serait JAMAIS compilé.
+[[test]]
+name = "durcissement_configuration"
+path = "tests/durcissement_configuration.rs"
