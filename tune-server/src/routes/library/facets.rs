@@ -1780,6 +1780,7 @@ mod tests {
                 .find_map(|kv| kv.strip_prefix("fields="))
                 .map(str::to_string);
             let Json(v) = library_facets(
+                crate::routes::active_profile::ActiveProfile(1),
                 Query(FacetQuery {
                     fields,
                     ..Default::default()
@@ -1857,6 +1858,7 @@ mod tests {
                 .find_map(|kv| kv.strip_prefix("fields="))
                 .map(str::to_string);
             let Json(v) = library_facets(
+                crate::routes::active_profile::ActiveProfile(1),
                 Query(FacetQuery {
                     fields,
                     ..Default::default()

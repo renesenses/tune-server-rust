@@ -3740,6 +3740,7 @@ mod tests_termes_de_chemin_5192 {
 
         // Le rail compte la MÊME sélection que la liste.
         let Json(f) = super::super::facets::library_facets(
+            crate::routes::active_profile::ActiveProfile(1),
             Query(Default::default()),
             RawQuery(Some("fields=label&q=mahler%20kondrashin".into())),
             State(state.clone()),
