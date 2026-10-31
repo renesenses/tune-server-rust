@@ -44,39 +44,230 @@
     return `${serveur}/api/v1/library/artwork/${encodeURIComponent(fichier)}`;
   }
 
+  // ── Recherche (#7595) ────────────────────────────────────────────────────
+  //
+  // `GET /api/v1/search` (`tune-server/src/routes/search.rs`,
+  // `federated_search`) rend, quel que soit `sources` :
+  //
+  //   { local: { artists: [Artist], albums: [Album], tracks: [Track],
+  //              totals: {artists, albums, tracks, tracks_via_metadata},
+  //              totals_capped: {…}, has_more: {artists, albums, tracks},
+  //              limit, offset },
+  //     radios: [...], radios_annuaire: {...},
+  //     services: { <nom>: { tracks, albums, artists, playlists } } }
+  //
+  // * `local.*` sont les modèles de `tune_core::db::models` : `id` entier,
+  //   `artists[].name` + `image_path`, `albums[].title` + `artist_name` +
+  //   `cover_path`, `tracks[].title` + `artist_name` + `album_title` +
+  //   `cover_path` (celle de la piste, sinon celle de l'album).
+  // * `services.<nom>` est un `SearchResults` (`tune_core::streaming::traits`) :
+  //   pistes et albums sont identifiés par `source_id` (CHAÎNE), jamais par
+  //   `id` ; `cover_path` y est une URL distante (Qobuz, TIDAL). Le nom du
+  //   service n'est que la CLÉ du bloc : rien dans l'élément ne le répète.
+  // * `sources` est une liste blanche (#3226) : `local` → la bibliothèque et
+  //   aucun service ; `qobuz` → ce service seul, `local` présent mais vide.
+  //   Un service non connecté (ou désactivé, #5103) n'a simplement pas de bloc.
+  // * `limit` vaut pour CHACUNE des trois listes locales et pour chaque
+  //   catégorie d'un service (plafonné à 50 côté serveur).
+
+  /** Ce que la fenêtre montre d'abord, et ce qu'ajoute chaque « Voir plus ». */
+  const PAR_CATEGORIE = { artists: 4, albums: 6, tracks: 6 };
+  /** Ordre et intitulés des catégories. */
+  const CATEGORIES = ['artists', 'albums', 'tracks'];
+  const NOMS_DE_CATEGORIE = { artists: 'Artistes', albums: 'Albums', tracks: 'Titres' };
+  /** Première demande : deux pages de chaque catégorie, pour un « Voir plus » immédiat. */
+  const LIMITE_INITIALE = 12;
+  /** Le plafond par catégorie que la route applique aux services. */
+  const PLAFOND_DE_LIMITE = 50;
   /**
-   * Recherche : la bibliothèque LOCALE seulement. Les résultats des services
-   * de streaming n'ont pas d'identifiant numérique, le widget ne saurait pas
-   * les lire, et les attendre ralentissait chaque frappe.
+   * Les services interrogés, dans l'ordre d'affichage, après la bibliothèque.
+   * Une requête PAR service : chacun s'affiche dès qu'il répond, sans attendre
+   * le plus lent.
    */
-  function urlDeRecherche(serveur, requete, limite = 8) {
-    return `${serveur}/api/v1/search?q=${encodeURIComponent(requete)}&limit=${limite}&sources=local`;
+  const SERVICES_DE_RECHERCHE = [
+    { cle: 'qobuz', nom: 'Qobuz' },
+    { cle: 'tidal', nom: 'TIDAL' },
+  ];
+
+  function urlAvecSources(serveur, requete, sources, limite) {
+    return `${serveur}/api/v1/search?q=${encodeURIComponent(requete)}&limit=${limite}&sources=${encodeURIComponent(sources)}`;
+  }
+
+  /** La bibliothèque seule : la réponse la plus rapide, affichée d'abord. */
+  function urlDeRecherche(serveur, requete, limite = LIMITE_INITIALE) {
+    return urlAvecSources(serveur, requete, 'local', limite);
+  }
+
+  /** Un service seul (`qobuz`, `tidal`) : le bloc `local` revient vide. */
+  function urlDeRechercheDeService(serveur, requete, service, limite = LIMITE_INITIALE) {
+    return urlAvecSources(serveur, requete, service, limite);
+  }
+
+  const tableau = (x) => (Array.isArray(x) ? x : []);
+  const texte = (x) => (typeof x === 'string' ? x : '');
+  const entierOuNull = (x) => (Number.isInteger(x) && x >= 0 ? x : null);
+
+  function categorie(items, total, aSuite) {
+    return { items, total, aSuite: !!aSuite };
   }
 
   /**
-   * Les pistes et albums d'une réponse de `GET /search`. Le serveur les range
-   * sous `local` (#3189) ; la racine reste lue pour un serveur très ancien.
+   * Le bloc `local` d'une réponse, rangé par catégorie. Seuls les éléments à
+   * `id` entier sont gardés : c'est lui que `POST /zones/{id}/play` attend.
+   * La racine est encore lue pour un serveur d'avant #3189.
    */
-  function resultatsDeRecherche(reponse, parType = 4) {
+  function resultatsLocaux(reponse) {
     const r = reponse && typeof reponse === 'object' ? reponse : {};
     const bloc = r.local && typeof r.local === 'object' ? r.local : r;
-    const pistes = Array.isArray(bloc.tracks) ? bloc.tracks : [];
-    const albums = Array.isArray(bloc.albums) ? bloc.albums : [];
-    const items = [];
-    pistes
-      .filter((t) => Number.isInteger(t && t.id))
-      .slice(0, parType)
-      .forEach((t) => items.push({ type: 'track', id: t.id, title: t.title || '', artist: t.artist_name || '' }));
-    albums
-      .filter((a) => Number.isInteger(a && a.id))
-      .slice(0, parType)
-      .forEach((a) => items.push({ type: 'album', id: a.id, title: a.title || '', artist: a.artist_name || '' }));
-    return items;
+    const totaux = bloc.totals && typeof bloc.totals === 'object' ? bloc.totals : {};
+    const suites = bloc.has_more && typeof bloc.has_more === 'object' ? bloc.has_more : {};
+    const avecId = (x) => x && Number.isInteger(x.id);
+    const artists = tableau(bloc.artists).filter(avecId).map((a) => ({
+      source: 'local', type: 'artist', id: a.id,
+      title: texte(a.name), subtitle: '', cover: a.image_path || null,
+    }));
+    const albums = tableau(bloc.albums).filter(avecId).map((a) => ({
+      source: 'local', type: 'album', id: a.id,
+      title: texte(a.title), subtitle: texte(a.artist_name), cover: a.cover_path || null,
+    }));
+    const tracks = tableau(bloc.tracks).filter(avecId).map((t) => ({
+      source: 'local', type: 'track', id: t.id,
+      title: texte(t.title),
+      subtitle: [texte(t.artist_name), texte(t.album_title)].filter(Boolean).join(' — '),
+      cover: t.cover_path || null,
+    }));
+    return {
+      artists: categorie(artists, entierOuNull(totaux.artists), suites.artists),
+      albums: categorie(albums, entierOuNull(totaux.albums), suites.albums),
+      tracks: categorie(tracks, entierOuNull(totaux.tracks), suites.tracks),
+    };
   }
 
-  /** Corps de `POST /zones/{id}/play` pour un résultat de recherche. */
+  /**
+   * Le bloc `services.<service>` d'une réponse, rangé par catégorie, ou `null`
+   * quand le service n'a pas répondu (non connecté, désactivé, en échec).
+   *
+   * Les artistes d'un service ne sont PAS proposés : `POST /zones/{id}/play`
+   * n'a pas de champ pour en lire un (seulement `artist_id`, de la
+   * bibliothèque). Une piste marquée `disponible: false` non plus : le
+   * service a dit qu'il ne la servirait pas.
+   *
+   * Sans pagination demandée, le serveur ne dit pas s'il reste des résultats :
+   * une catégorie PLEINE (autant d'éléments que `limite`) peut en avoir.
+   */
+  function resultatsDeService(reponse, service, limite = LIMITE_INITIALE) {
+    const services = reponse && typeof reponse === 'object' && reponse.services;
+    const bloc = services && typeof services === 'object' ? services[service] : null;
+    if (!bloc || typeof bloc !== 'object') return null;
+    const avecSourceId = (x) => x && (typeof x.source_id === 'string' || Number.isFinite(x.source_id)) && String(x.source_id) !== '';
+    const pistesBrutes = tableau(bloc.tracks);
+    const albumsBruts = tableau(bloc.albums);
+    const tracks = pistesBrutes
+      .filter((t) => avecSourceId(t) && t.disponible !== false)
+      .map((t) => ({
+        source: service, type: 'track', id: String(t.source_id),
+        title: texte(t.title),
+        subtitle: [texte(t.artist_name), texte(t.album_title)].filter(Boolean).join(' — '),
+        cover: t.cover_path || null,
+        // Ce que la lecture d'une piste distante transmet pour se décrire
+        // (même corps que `lirePiste` du client web, SearchV2.svelte).
+        artist_name: t.artist_name ?? null,
+        album_title: t.album_title ?? null,
+        duration_ms: Number.isFinite(t.duration_ms) ? t.duration_ms : undefined,
+      }));
+    const albums = albumsBruts.filter(avecSourceId).map((a) => ({
+      source: service, type: 'album', id: String(a.source_id),
+      title: texte(a.title), subtitle: texte(a.artist_name), cover: a.cover_path || null,
+    }));
+    return {
+      artists: categorie([], 0, false),
+      albums: categorie(albums, null, albumsBruts.length >= limite),
+      tracks: categorie(tracks, null, pistesBrutes.length >= limite),
+    };
+  }
+
+  /**
+   * « Voir plus » sur une catégorie qui montre `visibles` éléments.
+   *
+   * Rend le nouveau nombre à montrer et, s'il dépasse ce qui est déjà reçu
+   * alors que le serveur a une suite, la limite à redemander pour cette
+   * source (`null` sinon : tout est déjà là).
+   */
+  function voirPlus(cat, visibles, pas, limiteActuelle) {
+    const recus = cat && Array.isArray(cat.items) ? cat.items.length : 0;
+    const voulus = visibles + pas;
+    let limite = null;
+    if (voulus > recus && cat && cat.aSuite && limiteActuelle < PLAFOND_DE_LIMITE) {
+      limite = Math.min(PLAFOND_DE_LIMITE, Math.max(voulus, limiteActuelle * 2));
+    }
+    return { visibles: voulus, limite };
+  }
+
+  /** Reste-t-il quelque chose à montrer derrière un « Voir plus » ? */
+  function aEncore(cat, visibles, limiteActuelle) {
+    if (!cat || !Array.isArray(cat.items)) return false;
+    if (cat.items.length > visibles) return true;
+    return !!cat.aSuite && limiteActuelle < PLAFOND_DE_LIMITE;
+  }
+
+  /**
+   * Corps de `POST /zones/{id}/play` pour un résultat, mêmes corps que le
+   * client web (`SearchV2.svelte` : `playTrack`, `lirePiste`, `lireDistant` ;
+   * `lib/lireArtiste`) :
+   *
+   * * piste locale → `{ track_id }` ; album local → `{ album_id }` ;
+   * * artiste local → `{ artist_id }` : le serveur tire jusqu'à 50 de ses
+   *   titres au hasard (#6467, `lire_artiste_6467`), contexte `artist` ;
+   * * piste de service → `{ source, source_id, title, artist_name,
+   *   album_title, cover_path, duration_ms }` : sans ligne en bibliothèque,
+   *   c'est par ces champs que la piste dit qui elle est ;
+   * * album de service → `{ source, streaming_album_id }` — la PAIRE : un
+   *   identifiant seul fait retomber le serveur sur « reprendre la lecture ».
+   */
   function corpsDeLecture(item) {
-    return item.type === 'album' ? { album_id: item.id } : { track_id: item.id };
+    const local = !item.source || item.source === 'local';
+    if (local) {
+      if (item.type === 'album') return { album_id: item.id };
+      if (item.type === 'artist') return { artist_id: item.id };
+      return { track_id: item.id };
+    }
+    if (item.type === 'album') return { source: item.source, streaming_album_id: String(item.id) };
+    const corps = {
+      source: item.source,
+      source_id: String(item.id),
+      title: item.title || null,
+      artist_name: item.artist_name ?? null,
+      album_title: item.album_title ?? null,
+      cover_path: item.cover || null,
+    };
+    if (Number.isFinite(item.duration_ms)) corps.duration_ms = item.duration_ms;
+    return corps;
+  }
+
+  /**
+   * Vignette d'un résultat (≈ 36 px affichés, 80 demandés pour l'écran Retina),
+   * par les routes de pochette existantes :
+   *
+   * * une pochette du cache local → `/api/v1/library/artwork/{condensat}?size=80`
+   *   (cases `THUMB_SIZES` de `tune_core::library::artwork`) ;
+   * * une pochette distante (Qobuz, TIDAL) → `/api/v1/library/artwork/proxy?url=`,
+   *   comme `artworkUrl` du client web — le relais du serveur admet ces hôtes
+   *   (`artwork_proxy::HOTES_AUTORISES`) ;
+   * * une adresse déjà sous `/api/` est servie telle quelle.
+   */
+  function urlDeVignette(serveur, chemin, taille = 80) {
+    if (!chemin) return null;
+    const c = String(chemin);
+    if (/^https?:\/\//i.test(c)) {
+      if (serveur && c.startsWith(`${serveur}/`)) return c;
+      return `${serveur}/api/v1/library/artwork/proxy?url=${encodeURIComponent(c)}`;
+    }
+    if (c.startsWith('/api/')) {
+      return /^\/api\/v1\/library\/artwork\/(?!proxy(?:[/?]|$))[^/?#]+$/.test(c) ? `${serveur}${c}?size=${taille}` : `${serveur}${c}`;
+    }
+    const fichier = c.split('/').pop();
+    if (!fichier) return null;
+    return `${serveur}/api/v1/library/artwork/${encodeURIComponent(fichier)}?size=${taille}`;
   }
 
   /** `GET /zones` rend un tableau ; on accepte aussi `{ zones: [...] }`. */
@@ -174,9 +365,20 @@
     SERVEUR_PAR_DEFAUT,
     normaliserServeur,
     urlDePochette,
+    PAR_CATEGORIE,
+    CATEGORIES,
+    NOMS_DE_CATEGORIE,
+    LIMITE_INITIALE,
+    PLAFOND_DE_LIMITE,
+    SERVICES_DE_RECHERCHE,
     urlDeRecherche,
-    resultatsDeRecherche,
+    urlDeRechercheDeService,
+    resultatsLocaux,
+    resultatsDeService,
+    voirPlus,
+    aEncore,
     corpsDeLecture,
+    urlDeVignette,
     listeDeZones,
     gainPerceptif,
     positionPerceptive,

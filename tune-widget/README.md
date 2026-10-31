@@ -63,8 +63,16 @@ Rules worth knowing before touching it:
   A zone whose `GET /zones` entry says `volume_curve: "db60"` (software
   outputs) has a dB slider: same formulas as `tune_core::audio::volume_scale`
   (also ported to `src-tauri/src/volume.rs` for the global shortcuts).
-- `GET /search` returns library hits under `local`; the widget asks for
-  `sources=local` only, since it cannot play streaming results.
+- `GET /search` returns library hits under `local` and each streaming
+  service under `services.<name>` (items keyed by `source_id`, a string).
+  The widget sends one request for the library (`sources=local`, shown as
+  soon as it answers) and one per service (`sources=qobuz`, `sources=tidal`)
+  in parallel, debounced and aborted when the query changes. Play bodies are
+  the web client's: `{track_id}`, `{album_id}`, `{artist_id}` (up to 50 random
+  tracks, #6467), `{source, source_id, title, …}` for a service track and
+  `{source, streaming_album_id}` for a service album. Service artists are not
+  listed: `POST /zones/{id}/play` has no field to play one. Thumbnails go
+  through `/library/artwork/{hash}?size=80` or `/library/artwork/proxy?url=`.
 - WebSocket messages are matched on their exact `type` and on
   `data.zone_id`.
 - No authentication: the widget works against a server with

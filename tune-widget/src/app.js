@@ -189,51 +189,252 @@ $('zone-select').onchange = () => {
   init(parseInt($('zone-select').value, 10));
 };
 
-// Search
+// ── Recherche (#7595) ──────────────────────────────────────────────────────
+//
+// La bibliothèque d'abord, affichée dès qu'elle répond ; Qobuz et TIDAL en
+// même temps, chacun par sa propre requête, rangés DESSOUS dans l'ordre fixe
+// de `SERVICES_DE_RECHERCHE` quel que soit celui qui répond le premier.
+// Un délai entre les frappes, et toute requête d'une saisie dépassée est
+// annulée (AbortController) : sa réponse ne peut plus repeindre la liste.
+//
+// Toutes les formes du serveur passent par `contrat.js`.
+
+const DELAI_DE_FRAPPE_MS = 250;
+let recherche = null; // { q, ctrl, sources: [{ cle, nom, limite, etat, cats, visibles }], actif }
+
+const SOURCES_DE_RECHERCHE = [{ cle: 'local', nom: 'Bibliothèque' }, ...C.SERVICES_DE_RECHERCHE];
+
+function cleDElement(i) { return `${i.source}:${i.type}:${i.id}`; }
+
+function ouvrirPanneauDeRecherche(ouvert) {
+  $('app').classList.toggle('en-recherche', ouvert);
+  $('search-results').className = ouvert ? 'visible' : '';
+}
+
+function fermerRecherche() {
+  clearTimeout(searchTimeout);
+  if (recherche && recherche.ctrl) recherche.ctrl.abort();
+  recherche = null;
+  $('search-results').replaceChildren();
+  ouvrirPanneauDeRecherche(false);
+}
+
+async function chargerSource(r, src) {
+  const url = src.cle === 'local'
+    ? C.urlDeRecherche(SERVER, r.q, src.limite)
+    : C.urlDeRechercheDeService(SERVER, r.q, src.cle, src.limite);
+  try {
+    const rep = await fetch(url, { signal: r.ctrl.signal });
+    if (!rep.ok) throw new Error(rep.status);
+    const json = await rep.json();
+    if (recherche !== r) return; // saisie dépassée
+    src.cats = src.cle === 'local' ? C.resultatsLocaux(json) : C.resultatsDeService(json, src.cle, src.limite);
+    src.etat = 'pret';
+  } catch (e) {
+    if (recherche !== r || (e && e.name === 'AbortError')) return;
+    src.etat = 'echec';
+  }
+  dessinerRecherche();
+}
+
+function lancerRecherche(q) {
+  if (recherche && recherche.ctrl) recherche.ctrl.abort();
+  const r = {
+    q,
+    ctrl: new AbortController(),
+    actif: recherche ? recherche.actif : null,
+    sources: SOURCES_DE_RECHERCHE.map(s => ({
+      cle: s.cle, nom: s.nom, limite: C.LIMITE_INITIALE, etat: 'attente', cats: null,
+      visibles: { ...C.PAR_CATEGORIE },
+    })),
+  };
+  recherche = r;
+  ouvrirPanneauDeRecherche(true);
+  dessinerRecherche();
+  // La bibliothèque part la première ; les services aussitôt derrière, en
+  // parallèle, sans attendre sa réponse.
+  r.sources.forEach(src => { chargerSource(r, src); });
+}
+
+function vignette(item) {
+  const url = C.urlDeVignette(SERVER, item.cover);
+  const repli = () => {
+    const s = document.createElement('span');
+    s.className = 'vignette vignette-repli' + (item.type === 'artist' ? ' ronde' : '');
+    s.textContent = item.type === 'artist' ? ((item.title || '?').trim().charAt(0).toUpperCase() || '?') : '♪';
+    return s;
+  };
+  if (!url) return repli();
+  const img = document.createElement('img');
+  img.className = 'vignette' + (item.type === 'artist' ? ' ronde' : '');
+  img.alt = '';
+  img.loading = 'lazy';
+  img.decoding = 'async';
+  img.onerror = () => img.replaceWith(repli());
+  img.src = url;
+  return img;
+}
+
+function ligneDeResultat(item) {
+  const row = document.createElement('div');
+  row.className = 'search-item nav';
+  row.setAttribute('role', 'option');
+  row.dataset.cle = cleDElement(item);
+  const info = document.createElement('div');
+  info.className = 'search-item-info';
+  // Construit nœud par nœud : un titre ou un nom d'artiste est du texte,
+  // jamais du HTML.
+  const t = document.createElement('div');
+  t.className = 'search-item-title';
+  t.textContent = item.title || '?';
+  info.append(t);
+  if (item.subtitle) {
+    const a = document.createElement('div');
+    a.className = 'search-item-artist';
+    a.textContent = item.subtitle;
+    info.append(a);
+  }
+  const play = document.createElement('span');
+  play.className = 'search-item-play';
+  play.textContent = '▶';
+  row.append(vignette(item), info, play);
+  row.onclick = () => lireResultat(item);
+  row.onmouseenter = () => activer(row.dataset.cle, false);
+  return row;
+}
+
+function boutonVoirPlus(r, src, cat) {
+  const b = document.createElement('div');
+  b.className = 'search-more nav';
+  b.setAttribute('role', 'option');
+  b.dataset.cle = `plus:${src.cle}:${cat}`;
+  b.textContent = 'Voir plus';
+  b.onclick = async () => {
+    const { visibles, limite } = C.voirPlus(src.cats[cat], src.visibles[cat], C.PAR_CATEGORIE[cat], src.limite);
+    src.visibles[cat] = visibles;
+    if (limite) {
+      src.limite = limite;
+      src.etat = 'attente';
+      dessinerRecherche();
+      await chargerSource(r, src);
+    } else {
+      dessinerRecherche();
+    }
+  };
+  b.onmouseenter = () => activer(b.dataset.cle, false);
+  return b;
+}
+
+function dessinerRecherche() {
+  const r = recherche;
+  const box = $('search-results');
+  if (!r) return;
+  const noeuds = [];
+  let toutPret = true;
+  let rien = true;
+  r.sources.forEach(src => {
+    if (src.etat === 'attente') toutPret = false;
+    const cats = src.cats;
+    const nonVides = cats ? C.CATEGORIES.filter(c => cats[c].items.length) : [];
+    if (!nonVides.length) {
+      // La bibliothèque annonce qu'elle cherche ; un service muet ne prend pas de place.
+      if (src.cle === 'local' && src.etat === 'attente') {
+        noeuds.push(enTete('search-source', src.nom), etatDeRecherche('Recherche…'));
+      }
+      return;
+    }
+    rien = false;
+    noeuds.push(enTete('search-source', src.nom + (src.etat === 'attente' ? ' …' : '')));
+    nonVides.forEach(c => {
+      const cat = cats[c];
+      const total = Number.isInteger(cat.total) && cat.total > 0 ? ` · ${cat.total}` : '';
+      noeuds.push(enTete('search-category', C.NOMS_DE_CATEGORIE[c] + total));
+      cat.items.slice(0, src.visibles[c]).forEach(i => noeuds.push(ligneDeResultat(i)));
+      if (C.aEncore(cat, src.visibles[c], src.limite)) noeuds.push(boutonVoirPlus(r, src, c));
+    });
+  });
+  if (rien && toutPret) noeuds.push(etatDeRecherche('Aucun résultat'));
+  box.replaceChildren(...noeuds);
+  activer(r.actif, false);
+}
+
+function enTete(classe, texte) {
+  const h = document.createElement('div');
+  h.className = classe;
+  h.textContent = texte;
+  return h;
+}
+
+function etatDeRecherche(texte) {
+  const d = document.createElement('div');
+  d.className = 'search-empty';
+  d.textContent = texte;
+  return d;
+}
+
+function navigables() { return Array.from($('search-results').querySelectorAll('.nav')); }
+
+function activer(cle, defiler) {
+  if (!recherche) return;
+  recherche.actif = cle;
+  let choisi = null;
+  navigables().forEach(el => {
+    const oui = cle != null && el.dataset.cle === cle;
+    el.classList.toggle('actif', oui);
+    el.setAttribute('aria-selected', oui ? 'true' : 'false');
+    if (oui) choisi = el;
+  });
+  if (choisi && defiler) choisi.scrollIntoView({ block: 'nearest' });
+}
+
+function deplacer(delta) {
+  const els = navigables();
+  if (!els.length || !recherche) return;
+  const i = els.findIndex(el => el.dataset.cle === recherche.actif);
+  const j = i < 0 ? (delta > 0 ? 0 : els.length - 1) : Math.max(0, Math.min(els.length - 1, i + delta));
+  activer(els[j].dataset.cle, true);
+}
+
+async function lireResultat(item) {
+  fermerRecherche();
+  $('search-input').value = '';
+  try {
+    const r = await fetch(`${SERVER}/api/v1/zones/${state.zone_id}/play`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(C.corpsDeLecture(item)),
+    });
+    if (!r.ok) console.error('play', r.status, await r.text().catch(() => ''));
+  } catch (e) {
+    console.error('play', e);
+  }
+}
+
 $('search-input').oninput = () => {
   clearTimeout(searchTimeout);
   const q = $('search-input').value.trim();
-  if (!q) { $('search-results').className = ''; return; }
-  searchTimeout = setTimeout(async () => {
-    try {
-      const r = await fetch(C.urlDeRecherche(SERVER, q));
-      if (!r.ok) throw new Error(r.status);
-      const items = C.resultatsDeRecherche(await r.json());
-      const box = $('search-results');
-      if (!items.length) { box.className = ''; return; }
-      // Construit nœud par nœud : un titre ou un nom d'artiste est du texte,
-      // jamais du HTML.
-      box.replaceChildren(...items.map(i => {
-        const row = document.createElement('div');
-        row.className = 'search-item';
-        const info = document.createElement('div');
-        info.className = 'search-item-info';
-        const t = document.createElement('div');
-        t.className = 'search-item-title';
-        t.textContent = i.title || '?';
-        const a = document.createElement('div');
-        a.className = 'search-item-artist';
-        a.textContent = i.artist || '';
-        info.append(t, a);
-        const play = document.createElement('span');
-        play.className = 'search-item-play';
-        play.textContent = '▶';
-        row.append(info, play);
-        row.onclick = () => {
-          fetch(`${SERVER}/api/v1/zones/${state.zone_id}/play`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(C.corpsDeLecture(i)) });
-          $('search-input').value = '';
-          box.className = '';
-        };
-        return row;
-      }));
-      box.className = 'visible';
-    } catch {}
-  }, 300);
+  if (!q) { fermerRecherche(); return; }
+  searchTimeout = setTimeout(() => lancerRecherche(q), DELAI_DE_FRAPPE_MS);
 };
+
+$('search-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    $('search-input').value = '';
+    fermerRecherche();
+  } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    deplacer(e.key === 'ArrowDown' ? 1 : -1);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const els = navigables();
+    const el = els.find(x => recherche && x.dataset.cle === recherche.actif)
+      || els.find(x => x.classList.contains('search-item'));
+    if (el) el.click();
+  }
+});
 
 // Settings
 const mainEls = ['cover-container', 'track-info', 'progress-container', 'controls', 'volume-container', 'search-container'];
-$('btn-settings').onclick = () => { mainEls.forEach(id => $(id).style.display = 'none'); $('settings-panel').style.display = 'block'; $('server-url').value = SERVER.replace(/^https?:\/\//, ''); };
+$('btn-settings').onclick = () => { $('search-input').value = ''; fermerRecherche(); mainEls.forEach(id => $(id).style.display = 'none'); $('settings-panel').style.display = 'block'; $('server-url').value = SERVER.replace(/^https?:\/\//, ''); };
 $('btn-settings-back').onclick = () => { $('settings-panel').style.display = 'none'; mainEls.forEach(id => $(id).style.display = ''); };
 $('btn-connect').onclick = () => {
   const v = $('server-url').value.trim();
