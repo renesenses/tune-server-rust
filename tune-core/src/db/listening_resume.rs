@@ -621,6 +621,59 @@ pub fn terminee(db: &Arc<dyn DbBackend>, zone_id: i64) -> Result<usize, String> 
     Ok(retirees)
 }
 
+/// #7415 — la dernière piste d'un album ou d'une playlist vient de se terminer
+/// (fin naturelle, `naturel`, ou position dans les 30 dernières secondes / au-delà
+/// de 95 % de la piste) : la reprise de CE contexte est retirée, que la file
+/// continue après lui (suite automatique, radio, file plus longue), qu'une
+/// répétition la rejoue ou que la ligne finale manque à `queue_row_ids`
+/// (album lancé depuis une sélection). Un contexte interrompu avant sa dernière
+/// piste reste en place. Rend le nombre de reprises retirées.
+pub fn contexte_fini(
+    db: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    np: &crate::playback::NowPlaying,
+    position_ms: i64,
+    naturel: bool,
+) -> Result<usize, String> {
+    if !naturel && !episode_fini(position_ms, np.duration_ms) {
+        return Ok(0);
+    }
+    let ligne = PlayQueueRepo::with_backend(db.clone())
+        .get_ordered(zone_id)?
+        .iter()
+        .find(|e| e.is_current)
+        .map(|e| e.id);
+    let rows = db.query_many(
+        "SELECT payload, resume_key FROM listening_resumes WHERE zone_id = ? AND context_type IN ('album', 'playlist')",
+        &[&zone_id as &dyn ToSqlValue],
+    )?;
+    let mut retirees = 0;
+    for row in &rows {
+        let r = decode(row)?;
+        let derniere_ligne = ligne.is_some() && r.queue_row_ids.last().copied() == ligne;
+        let derniere_piste = r.items.last().is_some_and(|i| match i {
+            QueueInput::Local { track_id } => {
+                np.source == "local" && np.track_id == Some(*track_id)
+            }
+            QueueInput::Streaming {
+                source, source_id, ..
+            } => np.source == *source && np.source_id.as_deref() == Some(source_id.as_str()),
+        });
+        if derniere_ligne || derniere_piste {
+            db.execute(
+                "DELETE FROM listening_resumes WHERE resume_key = ?",
+                &[&r.resume_key as &dyn ToSqlValue],
+            )?;
+            retirees += 1;
+        }
+    }
+    Ok(retirees)
+}
+
+#[cfg(test)]
+#[path = "listening_resume_album_fin_tests.rs"]
+mod reprise_album_termine_7415;
+
 #[cfg(test)]
 #[path = "listening_resume_podcast_fin_tests.rs"]
 mod reprise_podcast_terminee_7415;

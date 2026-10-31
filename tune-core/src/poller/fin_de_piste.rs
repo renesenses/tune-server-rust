@@ -20,6 +20,24 @@ impl PositionPoller {
 
         let device_id = self.get_zone_device_id(zone_id);
 
+        // #7415 : la piste qui s'achève était peut-être la dernière de son
+        // album / de sa playlist ; la file peut pourtant continuer (suite
+        // automatique, radio, répétition). Sa reprise s'en va dans tous les cas.
+        if let Some(np) = zone_state
+            .now_playing
+            .as_ref()
+            .filter(|np| np.source != "podcast")
+            && let Err(e) = crate::db::listening_resume::contexte_fini(
+                &self.db,
+                zone_id,
+                np,
+                zone_state.position_ms,
+                true,
+            )
+        {
+            warn!(zone_id, error = %e, "reprise_contexte_non_retiree");
+        }
+
         let Some(next_pos) = Self::next_position(zone_state) else {
             self.terminer_la_file(zone_id, zone_state, device_id.as_deref())
                 .await;
