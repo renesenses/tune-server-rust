@@ -443,6 +443,22 @@ impl SpotifyService {
             self.note_token_rejected();
             return Err("token expired".into());
         }
+        // #6825 — un refus de l'API Web (403, 404, 429…) est une ERREUR,
+        // journalisée avec son statut. Avant, son corps était lu comme une
+        // réponse : `data["albums"]["items"]` y manquait, et la méthode
+        // rendait `Ok(vec![])`. L'onglet Éditorial restait vide sans un mot,
+        // et cette liste vide partait dans le cache éditorial (30 min).
+        let statut = resp.status();
+        if !statut.is_success() {
+            let corps = resp.text().await.unwrap_or_default();
+            let motif = motif_du_refus(&corps);
+            let route = path.split('?').next().unwrap_or(path);
+            warn!(route, statut = statut.as_u16(), motif = %motif, "spotify_api_refus");
+            return Err(format!(
+                "spotify GET {route}: {} — {motif}",
+                statut.as_u16()
+            ));
+        }
         resp.json().await.map_err(|e| format!("spotify json: {e}"))
     }
 
@@ -1319,6 +1335,18 @@ fn motif_refus_403(detail: &str) -> String {
     }
 }
 
+/// #6825 — le motif d'un refus de l'API Web, borné : `error.message` du
+/// corps JSON de Spotify (`{"error": {"status", "message"}}`), sinon le début
+/// du texte brut. Jamais plus de 200 caractères dans le journal.
+fn motif_du_refus(corps: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(corps).unwrap_or_default();
+    let message = v["error"]["message"]
+        .as_str()
+        .or_else(|| v["error_description"].as_str())
+        .unwrap_or(corps)
+        .trim();
+    message.chars().take(200).collect()
+}
 fn base64url_encode(data: &[u8]) -> String {
     let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut output = String::new();
@@ -2242,6 +2270,76 @@ mod tests {
             vu[0].1,
             json!({"uris": ["spotify:track:4uLU6hMCjMI75M1A2tKUQC"], "position_ms": 5000})
         );
+    }
+
+    /// #6825 — un refus de l'API Web sur une rubrique éditoriale est une
+    /// erreur, avec son statut et le motif de Spotify, et non une liste vide.
+    /// Une réponse 200 garde son contenu.
+    #[tokio::test]
+    async fn spotify_6825_un_refus_editorial_est_une_erreur_et_non_une_liste_vide() {
+        let app = axum::Router::new()
+            .route(
+                "/v1/browse/featured-playlists",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(json!({"error": {"status": 404, "message": "Not Found"}})),
+                    )
+                }),
+            )
+            .route(
+                "/v1/browse/new-releases",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::FORBIDDEN,
+                        axum::Json(json!({"error": {"status": 403, "message": "Forbidden"}})),
+                    )
+                }),
+            )
+            .route(
+                "/v1/browse/categories",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"categories": {"items": [
+                        {"id": "jazz", "name": "Jazz", "icons": []}
+                    ]}}))
+                }),
+            );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", ecoute.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
+        let mut svc =
+            SpotifyService::with_config(Some("client-essai"), None, 8888).avec_doublure(&base);
+        svc.access_token = Some("jeton".into());
+
+        let err = svc
+            .get_new_releases()
+            .await
+            .expect_err("#6825 : un 403 de /browse/new-releases rendait une liste vide")
+            .to_string();
+        assert!(err.contains("403") && err.contains("Forbidden"), "{err}");
+        assert!(!err.contains("jeton"), "le jeton ne sort jamais : {err}");
+        let err = svc
+            .get_featured()
+            .await
+            .expect_err("#6825 : un 404 de /browse/featured-playlists rendait une liste vide")
+            .to_string();
+        assert!(err.contains("404"), "{err}");
+        let genres = svc.get_genres(None).await.expect("200");
+        assert_eq!(genres.len(), 1);
+    }
+
+    #[test]
+    fn spotify_6825_motif_du_refus_borne() {
+        assert_eq!(
+            motif_du_refus(r#"{"error": {"status": 403, "message": "Forbidden"}}"#),
+            "Forbidden"
+        );
+        assert_eq!(
+            motif_du_refus("  <html>bad gateway</html> "),
+            "<html>bad gateway</html>"
+        );
+        assert_eq!(motif_du_refus(&"x".repeat(500)).chars().count(), 200);
+        assert_eq!(motif_du_refus(""), "");
     }
 
     /// Sans Premium, Spotify répond 403 : Tune le dit en clair.
