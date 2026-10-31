@@ -444,6 +444,10 @@ pub async fn run_with(opts: RunOptions) {
     // préchauffage ASIO, et avant les sorties audio.
     crate::startup::appliquer_le_temoin_de_demarrage(&state, demarrage_precedent_inacheve).await;
 
+    // #7307 — ce que valent les deux consentements en base, AVANT les
+    // écritures de `init_state`.
+    crate::startup::journaliser_les_consentements(&state);
+
     // Restore zone volumes, persist music_dirs/discogs_token to DB
     crate::startup::init_state(&state, &config).await;
 
