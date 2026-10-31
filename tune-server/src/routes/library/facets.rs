@@ -739,7 +739,7 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 // bibliothèque non taguée elle est vide, et une facette morte dans
                 // le rail coûte une requête pour ne rien montrer. Un client la
                 // demande explicitement (`fields=…,dr`).
-                "dr" => dr_facet(state, engine, limit, conds, params),
+                "dr" => dr_facet(state, limit, conds, params),
                 // Instrument (CRD-6) : vient de `track_credits`, remplie par la passe
                 // automatique (CRD-5). Comme `dr`, absente du jeu par défaut : vide
                 // tant que les crédits ne sont pas là, un client la demande
@@ -1005,55 +1005,12 @@ fn cumuler_par_valeur(
         .collect()
 }
 
-/// #2144 (rc10) — le DR de chaque album, sous le jeton de la base qui l'a
-/// rendu, comme [`SocleResolu`] : il ne dépend d'aucune facette cochée, et le
-/// rail compté par soustraction le demande deux fois par appel.
-type DrEnCache = Option<(
-    (u64, i64),
-    std::sync::Arc<std::collections::HashMap<i64, i64>>,
-)>;
-static DR_PAR_ALBUM_EN_CACHE: std::sync::Mutex<DrEnCache> = std::sync::Mutex::new(None);
-
-/// Le DR de chaque album porteur d'un tag DR : la table dérivée
-/// [`tune_core::db::facet_filter::dr_album_source`], la MÊME règle que la
-/// grille, la liste et la fiche — lue seule, une ligne par album.
-fn dr_par_album(
-    state: &AppState,
-    engine: Engine,
-) -> std::sync::Arc<std::collections::HashMap<i64, i64>> {
-    // Le jeton est lu AVANT la lecture : voir `SocleResolu::resoudre`.
-    let jeton = state.backend.jeton_des_donnees();
-    if let Some(j) = jeton
-        && let Ok(cache) = DR_PAR_ALBUM_EN_CACHE.lock()
-        && let Some((garde, carte)) = cache.as_ref()
-        && *garde == j
-    {
-        return carte.clone();
-    }
-    let sql = format!(
-        "SELECT dr.album_id, dr.dr FROM ({}) dr",
-        tune_core::db::facet_filter::dr_album_source(engine)
-    );
-    let resultat = state.backend.query_many(&sql, &[]);
-    let lu = resultat.is_ok();
-    let carte: std::sync::Arc<std::collections::HashMap<i64, i64>> = std::sync::Arc::new(
-        resultat
-            .ou_defaut_journalise()
-            .into_iter()
-            .filter_map(|row| {
-                let mut it = row.into_iter();
-                Some((it.next()?.as_i64()?, it.next()?.as_i64()?))
-            })
-            .collect(),
-    );
-    // Une lecture en échec ne se garde pas : la suivante réessaiera.
-    if lu
-        && let Some(j) = jeton
-        && let Ok(mut cache) = DR_PAR_ALBUM_EN_CACHE.lock()
-    {
-        *cache = Some((j, carte.clone()));
-    }
-    carte
+/// Le DR de chaque album porteur d'un tag DR :
+/// [`tune_core::db::facet_filter::dr_par_album`], la MÊME règle que la
+/// grille, la liste et la fiche, gardée sous le jeton des données — et
+/// partagée avec la liste filtrée par DR (#7580), qui la relit à chaque page.
+fn dr_par_album(state: &AppState) -> std::sync::Arc<std::collections::HashMap<i64, i64>> {
+    tune_core::db::facet_filter::dr_par_album(state.backend.as_ref()).ou_defaut_journalise()
 }
 
 /// Les Dynamic Range présents, du plus dynamique au plus compressé (#2144).
@@ -1082,14 +1039,13 @@ fn dr_par_album(
 /// repliées pour chaque album tagué : 208 à 224 s sur le .18.
 fn dr_facet(
     state: &AppState,
-    engine: Engine,
     limit: Option<i64>,
     conds: &[String],
     params: &[SqlValue],
 ) -> Vec<(String, i64)> {
     // Décroissant, comme `year` : l'auditeur qui ouvre cette facette cherche
     // ses disques les plus dynamiques, pas les plus écrasés.
-    let dr_de = dr_par_album(state, engine);
+    let dr_de = dr_par_album(state);
     cumuler_par_valeur(effectifs_par_album(state, conds, params), &dr_de, limit)
 }
 
