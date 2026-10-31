@@ -891,27 +891,57 @@ const UNTAGGED_FIELDS: [&str; 5] = ["artist", "album", "genre", "year", "cover"]
 /// Années d'enregistrement présentes, la plus récente d'abord — comme `year`,
 /// dont le tri chronologique descendant avait été demandé (« pas facile de
 /// trouver 2026 ! »).
+///
+/// #2144 (rc10) — comptée en DEUX temps, comme [`dr_facet`] : les pistes par
+/// album ([`effectifs_par_album`]), puis l'année de chaque album, cumulées
+/// ici. Voir [`effectifs_par_album`] pour la jointure qu'on ne pose plus.
 fn original_year_facet(
     state: &AppState,
     limit: Option<i64>,
     conds: &[String],
     params: &[SqlValue],
 ) -> Vec<(String, i64)> {
-    let where_clause = if conds.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", conds.join(" AND "))
-    };
-    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
     // `> 0` écarte les années nulles ET les `0` que certains taggeurs écrivent
     // quand le champ est vide : « 0 » en tête de liste ne désigne aucun disque.
-    let sql = format!(
-        "SELECT alo.original_year, COUNT(*) AS n FROM tracks t \
-         JOIN albums alo ON alo.id = t.album_id{where_clause} \
-         {and_or_where} alo.original_year IS NOT NULL AND alo.original_year > 0 \
-         GROUP BY alo.original_year ORDER BY alo.original_year DESC{limit_clause}",
-        and_or_where = if conds.is_empty() { "WHERE" } else { "AND" }
-    );
+    let annee_de: std::collections::HashMap<i64, i64> = state
+        .backend
+        .query_many(
+            "SELECT alo.id, alo.original_year FROM albums alo \
+             WHERE alo.original_year IS NOT NULL AND alo.original_year > 0",
+            &[],
+        )
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            Some((it.next()?.as_i64()?, it.next()?.as_i64()?))
+        })
+        .collect();
+    cumuler_par_valeur(effectifs_par_album(state, conds, params), &annee_de, limit)
+}
+
+/// #2144 (rc10, .18 : 96 500 pistes, 9 336 albums) — combien de pistes
+/// retenues par `conds` dans chaque album : `(album_id, effectif)`.
+///
+/// # Pourquoi plus de jointure
+///
+/// Les facettes DR et année d'origine joignaient `tracks t` à une table par
+/// album (`albums alo`, ou la table dérivée des DR). Dans le rail compté par
+/// soustraction (#5993), la requête des seules pistes repliées pose en plus
+/// `t.id IN (…)` — quelques milliers d'identifiants. SQLite prend alors les
+/// albums en boucle EXTERNE et cherche `t` par `idx_tracks_id_album (id=?
+/// AND album_id=?)` : il rejoue la liste ENTIÈRE pour chaque album. Albums ×
+/// pistes repliées : 7 214 × 3 500 au banc, 7,8 s ; 208 à 224 s sur le .18.
+/// La facette année tombe dans le même piège dès qu'un DR est coché (le
+/// filtre DR rend une liste d'albums) : 11 à 14 s sur le .18.
+///
+/// Une requête sur la SEULE table `tracks` n'a pas d'ordre de jointure à
+/// rater : elle lit l'index de l'album, ou la liste par clé primaire. La
+/// valeur de chaque album (DR, année) est lue à part, une ligne par album, et
+/// le cumul se fait en Rust : `COUNT(*)` est additif sur des albums
+/// disjoints, les effectifs sont donc EXACTEMENT ceux de la jointure.
+fn effectifs_par_album(state: &AppState, conds: &[String], params: &[SqlValue]) -> Vec<(i64, i64)> {
+    let sql = sql_effectifs_par_album(conds);
     let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
         .iter()
         .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
@@ -923,11 +953,98 @@ fn original_year_facet(
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
-            let y = it.next()?.as_i64()?;
-            let count = it.next()?.as_i64().unwrap_or(0);
-            Some((y.to_string(), count))
+            // Une piste sans album n'a ni DR ni année d'album : la jointure
+            // d'avant l'écartait, le `NULL` ne trouve rien ici non plus.
+            let album = it.next()?.as_i64()?;
+            Some((album, it.next()?.as_i64().unwrap_or(0)))
         })
         .collect()
+}
+
+/// Le SQL de [`effectifs_par_album`] : la seule table `tracks`, filtrée par
+/// les mêmes `conds` que toute autre facette.
+fn sql_effectifs_par_album(conds: &[String]) -> String {
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    format!("SELECT t.album_id, COUNT(*) AS n FROM tracks t{where_clause} GROUP BY t.album_id")
+}
+
+/// Le cumul des effectifs par album sous la valeur de chaque album, par
+/// valeur DÉCROISSANTE (l'`ORDER BY … DESC` d'avant), tronqué à `limit`. Un
+/// album sans valeur ne compte pas : c'était le `JOIN` (et non `LEFT JOIN`).
+fn cumuler_par_valeur(
+    par_album: Vec<(i64, i64)>,
+    valeur_de: &std::collections::HashMap<i64, i64>,
+    limit: Option<i64>,
+) -> Vec<(String, i64)> {
+    let mut par_valeur: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    for (album, n) in par_album {
+        if let Some(v) = valeur_de.get(&album) {
+            *par_valeur.entry(*v).or_insert(0) += n;
+        }
+    }
+    let max = limit.map(|n| n.max(0) as usize).unwrap_or(usize::MAX);
+    par_valeur
+        .into_iter()
+        .rev()
+        .filter(|(_, n)| *n > 0)
+        .take(max)
+        .map(|(v, n)| (v.to_string(), n))
+        .collect()
+}
+
+/// #2144 (rc10) — le DR de chaque album, sous le jeton de la base qui l'a
+/// rendu, comme [`SocleResolu`] : il ne dépend d'aucune facette cochée, et le
+/// rail compté par soustraction le demande deux fois par appel.
+type DrEnCache = Option<(
+    (u64, i64),
+    std::sync::Arc<std::collections::HashMap<i64, i64>>,
+)>;
+static DR_PAR_ALBUM_EN_CACHE: std::sync::Mutex<DrEnCache> = std::sync::Mutex::new(None);
+
+/// Le DR de chaque album porteur d'un tag DR : la table dérivée
+/// [`tune_core::db::facet_filter::dr_album_source`], la MÊME règle que la
+/// grille, la liste et la fiche — lue seule, une ligne par album.
+fn dr_par_album(
+    state: &AppState,
+    engine: Engine,
+) -> std::sync::Arc<std::collections::HashMap<i64, i64>> {
+    // Le jeton est lu AVANT la lecture : voir `SocleResolu::resoudre`.
+    let jeton = state.backend.jeton_des_donnees();
+    if let Some(j) = jeton
+        && let Ok(cache) = DR_PAR_ALBUM_EN_CACHE.lock()
+        && let Some((garde, carte)) = cache.as_ref()
+        && *garde == j
+    {
+        return carte.clone();
+    }
+    let sql = format!(
+        "SELECT dr.album_id, dr.dr FROM ({}) dr",
+        tune_core::db::facet_filter::dr_album_source(engine)
+    );
+    let resultat = state.backend.query_many(&sql, &[]);
+    let lu = resultat.is_ok();
+    let carte: std::sync::Arc<std::collections::HashMap<i64, i64>> = std::sync::Arc::new(
+        resultat
+            .ou_defaut_journalise()
+            .into_iter()
+            .filter_map(|row| {
+                let mut it = row.into_iter();
+                Some((it.next()?.as_i64()?, it.next()?.as_i64()?))
+            })
+            .collect(),
+    );
+    // Une lecture en échec ne se garde pas : la suivante réessaiera.
+    if lu
+        && let Some(j) = jeton
+        && let Ok(mut cache) = DR_PAR_ALBUM_EN_CACHE.lock()
+    {
+        *cache = Some((j, carte.clone()));
+    }
+    carte
 }
 
 /// Les Dynamic Range présents, du plus dynamique au plus compressé (#2144).
@@ -950,6 +1067,10 @@ fn original_year_facet(
 /// facette. Un effectif nul ne remonte donc jamais, et une bibliothèque
 /// entièrement non taguée rend un tableau vide — l'écran n'affiche alors pas
 /// de facette plutôt qu'une facette morte.
+///
+/// #2144 (rc10) — comptée en deux temps : [`effectifs_par_album`], puis
+/// [`dr_par_album`]. La jointure d'avant rejouait la liste des pistes
+/// repliées pour chaque album tagué : 208 à 224 s sur le .18.
 fn dr_facet(
     state: &AppState,
     engine: Engine,
@@ -957,36 +1078,10 @@ fn dr_facet(
     conds: &[String],
     params: &[SqlValue],
 ) -> Vec<(String, i64)> {
-    let where_clause = if conds.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", conds.join(" AND "))
-    };
-    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
     // Décroissant, comme `year` : l'auditeur qui ouvre cette facette cherche
     // ses disques les plus dynamiques, pas les plus écrasés.
-    let sql = format!(
-        "SELECT dr.dr, COUNT(*) AS n FROM tracks t \
-         JOIN ({source}) dr ON dr.album_id = t.album_id{where_clause} \
-         GROUP BY dr.dr ORDER BY dr.dr DESC{limit_clause}",
-        source = tune_core::db::facet_filter::dr_album_source(engine)
-    );
-    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
-        .iter()
-        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
-        .collect();
-    state
-        .backend
-        .query_many(&sql, &bound)
-        .ou_defaut_journalise()
-        .into_iter()
-        .filter_map(|row| {
-            let mut it = row.into_iter();
-            let dr = it.next()?.as_i64()?;
-            let count = it.next()?.as_i64().unwrap_or(0);
-            Some((dr.to_string(), count))
-        })
-        .collect()
+    let dr_de = dr_par_album(state, engine);
+    cumuler_par_valeur(effectifs_par_album(state, conds, params), &dr_de, limit)
 }
 
 /// Favoris du profil 1, comptés par type. Deux valeurs au plus (`track`,

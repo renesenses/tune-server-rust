@@ -938,5 +938,9 @@ mod routage_tests {
 mod banc_rail_5993;
 
 #[cfg(test)]
+#[path = "facettes_lentes_2144_tests.rs"]
+mod facettes_lentes_2144_tests;
+
+#[cfg(test)]
 #[path = "banc_repertoires_5998.rs"]
 mod banc_repertoires_5998;
