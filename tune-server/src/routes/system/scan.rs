@@ -3706,6 +3706,20 @@ async fn spawn_library_scan_avec_lecteur_par(
                 motif = suite_du_scan.motif().unwrap_or("none"),
                 "auto_enrichment_after_scan_skipped (needs Premium + enrich_on_scan)"
             );
+            // #6077 — sans recherche en ligne, le dernier recours vient
+            // tout de suite : la plus grande image des dossiers des albums
+            // restés sans pochette. Avec elle, c'est `batch_enrich_artwork`
+            // qui l'applique, après la recherche.
+            if !scan_cancel_requested() {
+                let dernier_recours_db = db.clone();
+                let dernier_recours_cache = cache_dir.clone();
+                handle.spawn_blocking(move || {
+                    tune_core::library::pochette_disque::pochettes_de_dernier_recours(
+                        &dernier_recours_db,
+                        &dernier_recours_cache,
+                    );
+                });
+            }
         }
         }).await;
         if let Err(e) = result {

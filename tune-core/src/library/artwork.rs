@@ -291,6 +291,77 @@ pub(crate) fn images_de_pochette_dans(dossier: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// #6077 — côté minimal, en pixels, d'une image retenue en DERNIER recours
+/// (voir [`plus_grande_image_des_dossiers`]) : en dessous, c'est une vignette,
+/// une icône ou un logo, pas une pochette.
+pub(crate) const COTE_MINIMAL_DERNIER_RECOURS: u32 = 200;
+
+/// #6077 — décision de Bertrand du 30/10/2026 : en DERNIER recours (ni
+/// pochette intégrée, ni image de dossier reconnue par son nom, ni pochette en
+/// ligne), la plus GRANDE image des dossiers de l'album devient sa pochette,
+/// comme le font Audirvana et Roon.
+///
+/// Formats de [`EXTENSIONS_DE_POCHETTE`] (tous servables par le cache), noms
+/// comparés sans casse. Écartés : les fichiers cachés (dont les `._cover.jpg`
+/// AppleDouble de macOS), la photo d'artiste (`artist.*`), et toute image dont
+/// un côté fait moins de [`COTE_MINIMAL_DERNIER_RECOURS`] pixels. Seuls les
+/// en-têtes sont lus (`into_dimensions`), jamais l'image entière.
+///
+/// « Plus grande » = plus de pixels ; à égalité, le plus gros fichier, puis
+/// le nom (ordre stable d'un scan à l'autre).
+pub(crate) fn plus_grande_image_des_dossiers(dossiers: &[&Path]) -> Option<PathBuf> {
+    let mut retenue: Option<(u64, u64, String, PathBuf)> = None;
+    for dossier in dossiers {
+        let Ok(entrees) = std::fs::read_dir(&*extended_path(dossier)) else {
+            continue;
+        };
+        for entree in entrees.flatten() {
+            let Ok(nom) = entree.file_name().into_string() else {
+                continue;
+            };
+            if nom.starts_with('.') {
+                continue;
+            }
+            let bas = nom.to_ascii_lowercase();
+            let Some((radical, ext)) = bas.rsplit_once('.') else {
+                continue;
+            };
+            if radical == "artist" || !EXTENSIONS_DE_POCHETTE.contains(&ext) {
+                continue;
+            }
+            let chemin = dossier.join(&nom);
+            let Some((largeur, hauteur)) = dimensions_de_l_image(&chemin) else {
+                continue;
+            };
+            if largeur.min(hauteur) < COTE_MINIMAL_DERNIER_RECOURS {
+                continue;
+            }
+            let pixels = u64::from(largeur) * u64::from(hauteur);
+            let octets = entree.metadata().map(|m| m.len()).unwrap_or(0);
+            let meilleure = match &retenue {
+                None => true,
+                Some((p, o, n, _)) => {
+                    (pixels, octets) > (*p, *o) || ((pixels, octets) == (*p, *o) && nom < *n)
+                }
+            };
+            if meilleure {
+                retenue = Some((pixels, octets, nom, chemin));
+            }
+        }
+    }
+    retenue.map(|(_, _, _, chemin)| chemin)
+}
+
+/// Largeur et hauteur d'une image, lues dans son seul en-tête.
+fn dimensions_de_l_image(chemin: &Path) -> Option<(u32, u32)> {
+    let fichier = std::fs::File::open(&*extended_path(chemin)).ok()?;
+    image::ImageReader::new(std::io::BufReader::new(fichier))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
 /// Extensions d'image acceptées pour une pochette de dossier, dans l'ordre de
 /// préférence (#6077). Toutes sont servables par le cache
 /// ([`FORMATS_IMAGE_SERVABLES`]) : `jpeg` y est écrit `jpg`.
@@ -966,6 +1037,7 @@ pub async fn batch_enrich_artwork_scoped(
     let mut enriched = 0u32;
     let mut searched = 0u32;
     let mut failed = 0u32;
+    let mut dernier_recours = 0u32;
 
     for (album_id, title, artist_name, mbid) in &albums {
         // Même traitement, même carte à l'écran que les images d'artistes :
@@ -1057,15 +1129,24 @@ pub async fn batch_enrich_artwork_scoped(
                 }
             }
             None => {
-                failed += 1;
-                debug!(album_id, album = %title, artist = %artist, "batch_artwork_not_found");
+                // #6077 — dernier recours, APRÈS la recherche en ligne : la
+                // plus grande image des dossiers de l'album.
+                if crate::library::pochette_disque::poser_pochette_de_dernier_recours(
+                    &db, *album_id, &cache_dir,
+                ) {
+                    dernier_recours += 1;
+                    enriched += 1;
+                } else {
+                    failed += 1;
+                    debug!(album_id, album = %title, artist = %artist, "batch_artwork_not_found");
+                }
             }
         }
     }
 
     info!(
         total = albums.len(),
-        enriched, searched, failed, "batch_artwork_enrichment_complete"
+        enriched, searched, failed, dernier_recours, "batch_artwork_enrichment_complete"
     );
 
     // Store result in settings for status reporting
