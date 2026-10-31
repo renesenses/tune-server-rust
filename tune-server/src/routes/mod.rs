@@ -731,6 +731,13 @@ pub fn router_with_plugins(
         }),
     )
     .fallback_service(service_statique_spa(std::path::Path::new(&web_dir)))
+    // Une requête rejouée par le relais ou l'écoute directe n'atteint que les
+    // routes d'écoute : voir `garde_du_relais`. Sur TOUT le routeur, `/stream`
+    // et `/ws` compris, avant tout gestionnaire.
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::garde_du_relais::garde_du_relais,
+    ))
     .layer(axum::middleware::from_fn(zones::textes_signal::avec_langue))
     .layer(axum::middleware::from_fn(cache_control_middleware))
     .layer(axum::Extension(contexte_sendspin))

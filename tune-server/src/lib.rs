@@ -42,6 +42,7 @@ pub mod fils_de_travail;
 #[cfg(test)]
 mod garde_francais_api;
 /// Détecteur de gel de l'exécuteur et relevé automatique (#4924).
+pub mod garde_du_relais;
 pub mod gel_executeur;
 mod instance_existante;
 /// #6253 — `--sans-console` : relance sans fenêtre de terminal (Windows).
