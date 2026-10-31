@@ -1109,6 +1109,9 @@ pub async fn batch_enrich_artwork_scoped(
         .ok();
 }
 
+/// Le site communautaire (images approuvées, dépôts).
+const COMMUNITY_BASE_URL: &str = "https://mozaiklabs.fr";
+
 /// Fetch an artist image from multiple sources (best-effort cascade).
 ///
 /// Order: mozaiklabs community → Fanart.tv → TheAudioDB → MusicBrainz
@@ -1128,6 +1131,57 @@ pub async fn fetch_artist_image(
     lastfm_key: &str,
     refusees: &[String],
 ) -> Option<Vec<u8>> {
+    fetch_artist_image_avec_source(mbid, artist_name, discogs_token, lastfm_key, refusees)
+        .await
+        .map(|(octets, _)| octets)
+}
+
+/// D'où vient une image d'artiste trouvée par la cascade : envoyé au site
+/// avec l'image (champ `source`), qui approuve d'office les sources
+/// publiques fiables et laisse les autres en validation manuelle (31/10/2026).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceImageArtiste {
+    /// Le site lui-même (par MBID ou par nom) : jamais renvoyée au site.
+    Mozaiklabs,
+    Fanart,
+    TheAudioDb,
+    /// Relation d'image MusicBrainz ou Wikidata → Wikimedia Commons.
+    MusicBrainz,
+    Discogs,
+    LastFm,
+    Deezer,
+}
+
+impl SourceImageArtiste {
+    /// L'étiquette envoyée au site, dans le champ `source`.
+    pub fn etiquette(self) -> &'static str {
+        match self {
+            Self::Mozaiklabs => "mozaiklabs",
+            Self::Fanart => "fanart",
+            Self::TheAudioDb => "theaudiodb",
+            Self::MusicBrainz => "musicbrainz",
+            Self::Discogs => "discogs",
+            Self::LastFm => "lastfm",
+            Self::Deezer => "deezer",
+        }
+    }
+
+    /// Faut-il proposer cette image au site ? Pas celle qu'il vient de
+    /// servir : la renvoyer ne ferait qu'un doublon en attente.
+    pub fn a_partager(self) -> bool {
+        self != Self::Mozaiklabs
+    }
+}
+
+/// [`fetch_artist_image`], en disant de quelle source vient l'image.
+pub async fn fetch_artist_image_avec_source(
+    mbid: &str,
+    artist_name: &str,
+    discogs_token: Option<&str>,
+    lastfm_key: &str,
+    refusees: &[String],
+) -> Option<(Vec<u8>, SourceImageArtiste)> {
+    use SourceImageArtiste as S;
     let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
@@ -1140,7 +1194,7 @@ pub async fn fetch_artist_image(
             .await
             .and_then(|b| image_retenue(b, refusees))
     {
-        return Some(bytes);
+        return Some((bytes, S::Mozaiklabs));
     }
 
     // 1b. Mozaiklabs community by NAME — keeps mozaiklabs the top priority even
@@ -1151,7 +1205,7 @@ pub async fn fetch_artist_image(
             .await
             .and_then(|b| image_retenue(b, refusees))
     {
-        return Some(bytes);
+        return Some((bytes, S::Mozaiklabs));
     }
 
     // Sources 2–5 are keyed by MBID; skip them entirely for artists without one
@@ -1163,7 +1217,7 @@ pub async fn fetch_artist_image(
             .await
             .and_then(|b| image_retenue(b, refusees))
         {
-            return Some(bytes);
+            return Some((bytes, S::Fanart));
         }
 
         // 3. TheAudioDB (free API, good coverage)
@@ -1171,7 +1225,7 @@ pub async fn fetch_artist_image(
             .await
             .and_then(|b| image_retenue(b, refusees))
         {
-            return Some(bytes);
+            return Some((bytes, S::TheAudioDb));
         }
 
         // 4+5. MusicBrainz: try direct image relation, then Wikidata→Wikimedia
@@ -1180,7 +1234,7 @@ pub async fn fetch_artist_image(
             .await
             .and_then(|b| image_retenue(b, refusees))
         {
-            return Some(bytes);
+            return Some((bytes, S::MusicBrainz));
         }
     }
 
@@ -1191,7 +1245,7 @@ pub async fn fetch_artist_image(
             .await
             .and_then(|b| image_retenue(b, refusees))
         {
-            return Some(bytes);
+            return Some((bytes, S::Discogs));
         }
     }
 
@@ -1202,7 +1256,7 @@ pub async fn fetch_artist_image(
             .await
             .and_then(|b| image_retenue(b, refusees))
         {
-            return Some(bytes);
+            return Some((bytes, S::LastFm));
         }
     }
 
@@ -1216,7 +1270,7 @@ pub async fn fetch_artist_image(
             .await
             .and_then(|b| image_retenue(b, refusees))
         {
-            return Some(bytes);
+            return Some((bytes, S::Deezer));
         }
     }
 
@@ -1235,7 +1289,7 @@ async fn image_depuis_un_membre(
     discogs_token: Option<&str>,
     lastfm_key: &str,
     refusees: &[String],
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, SourceImageArtiste)> {
     let membres = crate::metadata::artist_split::membres_pour_portrait(credit, allowlist);
     if membres.is_empty() {
         return None;
@@ -1243,15 +1297,16 @@ async fn image_depuis_un_membre(
     for membre in membres {
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         let mbid = search_musicbrainz_artist(&membre).await.unwrap_or_default();
-        if let Some(bytes) =
-            fetch_artist_image(&mbid, &membre, discogs_token, lastfm_key, refusees).await
+        if let Some(trouvee) =
+            fetch_artist_image_avec_source(&mbid, &membre, discogs_token, lastfm_key, refusees)
+                .await
         {
             info!(
                 credit,
                 membre = %membre,
                 "artist_image_from_credit_member"
             );
-            return Some(bytes);
+            return Some(trouvee);
         }
     }
     None
@@ -1899,8 +1954,11 @@ async fn batch_enrich_artist_artwork_inner(
 
     // --- Phase 1: Bulk-apply community-approved artist images ---
     let mut community_applied = 0u32;
+    // La liste se lit PAR PAGES (curseur `next` du site) : elle peut compter
+    // des dizaines de milliers d'images depuis l'approbation d'office des
+    // sources publiques fiables (31/10/2026).
     if let Ok(approved) =
-        crate::cloud::community::fetch_approved_artist_images("https://mozaiklabs.fr", None).await
+        crate::cloud::community::fetch_approved_artist_images(COMMUNITY_BASE_URL).await
     {
         for img in &approved {
             // Check if this artist is in our DB and still needs an image.
@@ -1938,9 +1996,15 @@ async fn batch_enrich_artist_artwork_inner(
                 // pour cet artiste n'est plus reposée à chaque passe.
                 let refusees = empreintes_rejetees(&db, artist_id, &img.mbid);
                 if let Ok(client) = client
-                    && let Some(data) = download_image(&client, &img.image_url)
-                        .await
-                        .and_then(|d| image_retenue(d, &refusees))
+                    && let Some(data) = download_image(
+                        &client,
+                        &crate::cloud::community::url_image_communautaire(
+                            COMMUNITY_BASE_URL,
+                            &img.image_url,
+                        ),
+                    )
+                    .await
+                    .and_then(|d| image_retenue(d, &refusees))
                 {
                     // Adressage par le CONTENU (#1444) : sous
                     // `artwork_hash("artist-mbid-{mbid}")`, le mode `force`
@@ -2193,7 +2257,7 @@ async fn batch_enrich_artist_artwork_inner(
         // #4837 : une image rejetée par l'utilisateur ne revient pas, de
         // quelque source qu'elle vienne.
         let refusees = empreintes_rejetees(&db, *artist_id, &mbid);
-        let mut image = fetch_artist_image(
+        let mut image = fetch_artist_image_avec_source(
             &mbid,
             name,
             discogs_token.as_deref(),
@@ -2215,7 +2279,7 @@ async fn batch_enrich_artist_artwork_inner(
             .await;
         }
         match image {
-            Some(data) => {
+            Some((data, source)) => {
                 // Adressage par le CONTENU (#1444), plus par l'identité de
                 // l'artiste. L'ancienne clé était `artist-mbid-{mbid}`, sinon
                 // `artist-name-{nom}` — et sa forme précédente, un
@@ -2243,7 +2307,13 @@ async fn batch_enrich_artist_artwork_inner(
                     // Seulement si l'utilisateur l'a explicitement autorise, et
                     // seulement quand on a un MBID — le depot communautaire est
                     // indexe par MBID, y poster avec un MBID vide n'a aucun sens.
-                    if contribution_consentie && !instance_id.is_empty() && !mbid.is_empty() {
+                    // Ni l'image que le site vient lui-même de servir : la
+                    // renvoyer ne ferait qu'un doublon en attente.
+                    if contribution_consentie
+                        && !instance_id.is_empty()
+                        && !mbid.is_empty()
+                        && source.a_partager()
+                    {
                         let mbid = mbid.clone();
                         let name = name.clone();
                         let instance_id = instance_id.clone();
@@ -2254,6 +2324,7 @@ async fn batch_enrich_artist_artwork_inner(
                                 &mbid,
                                 &name,
                                 &instance_id,
+                                source.etiquette(),
                                 &image_data,
                             )
                             .await
@@ -4444,5 +4515,48 @@ mod tests_deezer_artiste {
             }]
         });
         assert!(deezer_pick_image_url(&vide, "Rachel Podger").is_none());
+    }
+}
+
+/// Les étiquettes de source envoyées au site (31/10/2026).
+#[cfg(test)]
+mod tests_source_image_artiste {
+    use super::SourceImageArtiste as S;
+
+    /// Le site approuve d'office `fanart`, `theaudiodb`, `musicbrainz`,
+    /// `wikimedia`, `discogs` et `deezer` (`ArtistImageAutoApproval`) : une
+    /// étiquette mal écrite laisserait toutes ces images en attente.
+    #[test]
+    fn les_etiquettes_sont_celles_que_le_site_connait() {
+        let fiables = [
+            "fanart",
+            "theaudiodb",
+            "musicbrainz",
+            "wikimedia",
+            "discogs",
+            "deezer",
+        ];
+        for s in [
+            S::Fanart,
+            S::TheAudioDb,
+            S::MusicBrainz,
+            S::Discogs,
+            S::Deezer,
+        ] {
+            assert!(
+                fiables.contains(&s.etiquette()),
+                "{s:?} → {}",
+                s.etiquette()
+            );
+            assert!(s.a_partager());
+        }
+        // Last.fm n'est pas dans la liste fiable : partagée, mais modérée.
+        assert_eq!(S::LastFm.etiquette(), "lastfm");
+        assert!(S::LastFm.a_partager());
+    }
+
+    #[test]
+    fn une_image_venue_du_site_ne_lui_est_pas_renvoyee() {
+        assert!(!S::Mozaiklabs.a_partager());
     }
 }
