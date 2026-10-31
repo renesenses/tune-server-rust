@@ -93,7 +93,8 @@ pub struct NewTicket {
 /// #5124 — `system` (la fiche : noms des serveurs multimédia, répertoires…) et
 /// `logs` (le rapport et son journal) sont nettoyés ICI, à la porte de sortie,
 /// quel que soit le client qui les a composés : le miroir republie le ticket.
-/// Le sujet et le corps sont les mots du testeur, laissés tels quels.
+/// Le sujet et le corps sont les mots du testeur : seuls les identifiants
+/// d'accès distant en sont retirés ([`crate::confidentialite::masquer_acces_distant`]).
 fn ticket_payload(ticket: &NewTicket) -> Value {
     let system = ticket.system.clone().map(|mut fiche| {
         crate::confidentialite::anonymiser_json(&mut fiche);
@@ -104,8 +105,8 @@ fn ticket_payload(ticket: &NewTicket) -> Value {
         .as_deref()
         .map(crate::confidentialite::anonymiser);
     json!({
-        "subject": ticket.subject,
-        "body": ticket.body,
+        "subject": crate::confidentialite::masquer_acces_distant(&ticket.subject),
+        "body": crate::confidentialite::masquer_acces_distant(&ticket.body),
         "category": ticket.category,
         "zone": ticket.zone,
         "system": system,
@@ -193,9 +194,32 @@ fn champs_de_diagnostic_nettoyes(fields: Vec<(String, String)>) -> Vec<(String, 
                 let propre = crate::confidentialite::anonymiser_champ(&valeur);
                 (nom, propre)
             }
-            _ => (nom, valeur),
+            _ => {
+                let propre = crate::confidentialite::masquer_acces_distant(&valeur);
+                (nom, propre)
+            }
         })
         .collect()
+}
+
+/// Extensions d'une pièce jointe lue comme du texte, et nettoyée comme un
+/// journal avant de partir.
+const PIECES_TEXTE: &[&str] = &["log", "txt", "md", "json", "csv", "xml"];
+
+/// Une pièce jointe texte (journal, fiche exportée) passe par le même
+/// nettoyage que le champ `logs` ; une image ou une archive part telle quelle.
+fn piece_nettoyee(mut file: AttachmentUpload) -> AttachmentUpload {
+    let ext = file
+        .file_name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if PIECES_TEXTE.contains(&ext.as_str()) {
+        if let Ok(texte) = std::str::from_utf8(&file.bytes) {
+            file.bytes = crate::confidentialite::anonymiser_champ(texte).into_bytes();
+        }
+    }
+    file
 }
 
 /// Complète un formulaire sortant : les champs texte tels quels, puis chaque
@@ -214,7 +238,7 @@ fn multipart_form(
         form = form.text(name, value);
     }
 
-    for file in files {
+    for file in files.into_iter().map(piece_nettoyee) {
         let part = reqwest::multipart::Part::bytes(file.bytes)
             .file_name(file.file_name)
             .mime_str(&file.content_type)
@@ -273,7 +297,7 @@ pub async fn reply(
 ) -> SupportResult {
     let resp = auth
         .apply(http_client.post(reply_url(base_url, id)))
-        .json(&json!({ "body": body }))
+        .json(&json!({ "body": crate::confidentialite::masquer_acces_distant(body) }))
         .timeout(TIMEOUT)
         .send()
         .await
@@ -303,7 +327,11 @@ pub async fn reply_multipart(
     files: Vec<AttachmentUpload>,
     base_url: Option<&str>,
 ) -> SupportResult {
-    let form = multipart_form(reqwest::multipart::Form::new(), fields, files)?;
+    let form = multipart_form(
+        reqwest::multipart::Form::new(),
+        champs_de_diagnostic_nettoyes(fields),
+        files,
+    )?;
 
     let resp = auth
         .apply(http_client.post(reply_url(base_url, id)))
@@ -768,5 +796,50 @@ mod tests {
         assert!(payload["system"].is_null());
         assert!(payload["category"].is_null());
         assert!(payload["zone"].is_null());
+    }
+
+    /// Les identifiants d'accès distant partent de TOUS les champs d'un
+    /// ticket, mots du testeur compris ; le reste de ses mots reste.
+    #[test]
+    fn le_ticket_ne_porte_aucun_acces_distant() {
+        let sid = "3b9e1c4a-7f2d-4e8b-9a61-5c0d2e7f8a14";
+        let jeton = "c81f0e27-4d5a-4b9c-8e13-2f6a7b9d0c55";
+        let lien = format!("https://bridge.mozaiklabs.fr/{sid}/#token={jeton}");
+        let ticket = NewTicket {
+            subject: format!("Lien {lien} KO"),
+            body: format!("Mon lien : {lien}, écrire à moi@exemple.fr"),
+            system: Some(json!({ "cloud": { "server_id": sid } })),
+            logs: Some(format!("INFO bridge enabled server_id={sid}")),
+            ..Default::default()
+        };
+        let sortie = ticket_payload(&ticket).to_string();
+        for fuite in [sid, jeton] {
+            assert!(!sortie.contains(fuite), "« {fuite} » sort encore : {sortie}");
+        }
+        assert!(sortie.contains("moi@exemple.fr"), "{sortie}");
+        assert!(sortie.contains("bridge enabled"), "{sortie}");
+
+        let champs = champs_de_diagnostic_nettoyes(vec![
+            ("subject".into(), format!("voir {lien}")),
+            ("body".into(), format!("server_id={sid}")),
+        ]);
+        for (nom, valeur) in &champs {
+            assert!(!valeur.contains(sid), "{nom} : {valeur}");
+            assert!(!valeur.contains(jeton), "{nom} : {valeur}");
+        }
+
+        let piece = piece_nettoyee(AttachmentUpload {
+            file_name: "tune.LOG".into(),
+            content_type: "text/plain".into(),
+            bytes: format!("WARN relay server_id={sid} {lien}").into_bytes(),
+        });
+        let texte = String::from_utf8(piece.bytes).unwrap();
+        assert!(!texte.contains(sid) && !texte.contains(jeton), "{texte}");
+        let image = piece_nettoyee(AttachmentUpload {
+            file_name: "capture.png".into(),
+            content_type: "image/png".into(),
+            bytes: sid.as_bytes().to_vec(),
+        });
+        assert_eq!(image.bytes, sid.as_bytes(), "une image ne se réécrit pas");
     }
 }

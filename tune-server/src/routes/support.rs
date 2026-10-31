@@ -95,6 +95,10 @@ async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
 /// (sans pièce jointe, chemin historique) ou `multipart/form-data` (avec
 /// `attachments[]`). Le format est choisi d'après le `Content-Type` entrant.
 async fn create(State(state): State<AppState>, req: Request) -> Response {
+    // Les identifiants de ce serveur ne partent dans aucun champ du ticket.
+    tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
+        state.backend.clone(),
+    ));
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,
@@ -376,6 +380,10 @@ async fn detail(
 /// **forum**. Le miroir (`MirrorTicketToForum`) n'est branché qu'à la création
 /// du ticket, côté Laravel ; aucune ligne d'ici ne peut l'y brancher.
 async fn reply(State(state): State<AppState>, Path(id): Path<i64>, req: Request) -> Response {
+    // Les identifiants de ce serveur ne partent dans aucun champ du ticket.
+    tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
+        state.backend.clone(),
+    ));
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,
