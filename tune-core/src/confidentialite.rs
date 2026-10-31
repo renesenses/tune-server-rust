@@ -149,7 +149,9 @@ static RE_PARAMETRE_URL: LazyLock<Regex> = LazyLock::new(|| {
 /// Adresse du pont : `bridge.mozaiklabs.fr/<identifiant>/…`. Le chemin désigne
 /// un serveur précis ; seul l'hôte reste.
 static RE_URL_PONT: LazyLock<Regex> = LazyLock::new(|| {
-    re(r#"(?i)\b((?:[a-z0-9-]+\.)*(?:bridge|relay)[a-z0-9-]*\.mozaiklabs\.fr)(/[^\s"'<>()\[\]{},;]*)"#)
+    re(
+        r#"(?i)\b((?:[a-z0-9-]+\.)*(?:bridge|relay)[a-z0-9-]*\.mozaiklabs\.fr)(/[^\s"'<>()\[\]{},;]*)"#,
+    )
 });
 
 /// Chemins du pont qui ne désignent aucun serveur : gardés pour le diagnostic.
@@ -169,10 +171,10 @@ pub fn retenir_identifiant_prive(id: &str) {
     if id.chars().count() < 8 {
         return;
     }
-    if let Ok(mut liste) = IDENTIFIANTS_PRIVES.write() {
-        if !liste.iter().any(|x| x.eq_ignore_ascii_case(id)) {
-            liste.push(id.to_string());
-        }
+    if let Ok(mut liste) = IDENTIFIANTS_PRIVES.write()
+        && !liste.iter().any(|x| x.eq_ignore_ascii_case(id))
+    {
+        liste.push(id.to_string());
     }
 }
 
@@ -852,7 +854,13 @@ mod tests {
     #[test]
     fn acces_distant_masque_dans_un_journal() {
         let sortie = nettoyer(&journal_d_acces_distant(), None, &[]);
-        for fuite in [SID, JETON, INSTANCE, "k1b2c3d4e5f6", "dXNlcjpwYXNzd29yZDEyMw"] {
+        for fuite in [
+            SID,
+            JETON,
+            INSTANCE,
+            "k1b2c3d4e5f6",
+            "dXNlcjpwYXNzd29yZDEyMw",
+        ] {
             assert!(
                 !sortie.contains(fuite),
                 "« {fuite} » sort encore :\n{sortie}"
@@ -912,7 +920,10 @@ mod tests {
         for fuite in [SID, JETON, INSTANCE] {
             assert!(!texte.contains(fuite), "« {fuite} » sort encore : {texte}");
         }
-        assert_eq!(fiche["cloud"]["relay_url"], "wss://bridge.mozaiklabs.fr/ws/server");
+        assert_eq!(
+            fiche["cloud"]["relay_url"],
+            "wss://bridge.mozaiklabs.fr/ws/server"
+        );
         assert_eq!(fiche["telemetry"]["enabled"], true);
     }
 
@@ -925,7 +936,12 @@ mod tests {
         );
         let sortie = acces_distant(&texte, &[]);
         assert!(!sortie.contains(SID) && !sortie.contains(JETON), "{sortie}");
-        for garde in ["Depuis le travail", "ne répond plus", "moi@exemple.fr", "/home/moi/Musique"] {
+        for garde in [
+            "Depuis le travail",
+            "ne répond plus",
+            "moi@exemple.fr",
+            "/home/moi/Musique",
+        ] {
             assert!(sortie.contains(garde), "« {garde} » a disparu : {sortie}");
         }
     }

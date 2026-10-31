@@ -214,10 +214,10 @@ fn piece_nettoyee(mut file: AttachmentUpload) -> AttachmentUpload {
         .rsplit_once('.')
         .map(|(_, e)| e.to_ascii_lowercase())
         .unwrap_or_default();
-    if PIECES_TEXTE.contains(&ext.as_str()) {
-        if let Ok(texte) = std::str::from_utf8(&file.bytes) {
-            file.bytes = crate::confidentialite::anonymiser_champ(texte).into_bytes();
-        }
+    if PIECES_TEXTE.contains(&ext.as_str())
+        && let Ok(texte) = std::str::from_utf8(&file.bytes)
+    {
+        file.bytes = crate::confidentialite::anonymiser_champ(texte).into_bytes();
     }
     file
 }
@@ -814,7 +814,10 @@ mod tests {
         };
         let sortie = ticket_payload(&ticket).to_string();
         for fuite in [sid, jeton] {
-            assert!(!sortie.contains(fuite), "« {fuite} » sort encore : {sortie}");
+            assert!(
+                !sortie.contains(fuite),
+                "« {fuite} » sort encore : {sortie}"
+            );
         }
         assert!(sortie.contains("moi@exemple.fr"), "{sortie}");
         assert!(sortie.contains("bridge enabled"), "{sortie}");
