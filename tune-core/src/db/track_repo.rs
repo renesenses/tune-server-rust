@@ -622,6 +622,39 @@ pub fn derive_common_root(backend: &dyn DbBackend) -> Option<String> {
     (!root.is_empty()).then(|| root.to_string())
 }
 
+/// #7597 — l'ordre de lecture d'un dossier lu en entier : `(chemin, disque,
+/// piste)` de deux pistes. Le dossier parent d'abord, composant par composant
+/// en tri naturel (celui de la vue Répertoires), puis le disque, la piste, et
+/// le nom de fichier en tri naturel. Les deux séparateurs sont reconnus : le
+/// chemin est celui qu'a écrit l'hôte qui a scanné.
+pub fn ordre_de_lecture_du_dossier(
+    a: (&str, Option<i64>, Option<i64>),
+    b: (&str, Option<i64>, Option<i64>),
+) -> std::cmp::Ordering {
+    fn decouper(chemin: &str) -> (Vec<&str>, &str) {
+        let mut morceaux: Vec<&str> = chemin
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty())
+            .collect();
+        let fichier = morceaux.pop().unwrap_or("");
+        (morceaux, fichier)
+    }
+    let (dossier_a, fichier_a) = decouper(a.0);
+    let (dossier_b, fichier_b) = decouper(b.0);
+    let mut ordre = std::cmp::Ordering::Equal;
+    for (x, y) in dossier_a.iter().zip(dossier_b.iter()) {
+        ordre = crate::upnp_server::comparer_naturel(x, y);
+        if ordre.is_ne() {
+            break;
+        }
+    }
+    ordre
+        .then_with(|| dossier_a.len().cmp(&dossier_b.len()))
+        .then_with(|| a.1.cmp(&b.1))
+        .then_with(|| a.2.cmp(&b.2))
+        .then_with(|| crate::upnp_server::comparer_naturel(fichier_a, fichier_b))
+}
+
 /// Longest common (char-boundary-safe) prefix of two strings.
 pub(crate) fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
     let mut end = 0;
@@ -3063,9 +3096,14 @@ impl TrackRepo {
             }
         }
 
-        // Favoris du profil 1 : la piste elle-même, ou son album. Vocabulaire
+        // Favoris du profil de la requête (#7569) : la piste elle-même, ou son album. Vocabulaire
         // FERMÉ — le SQL est un littéral, jamais l'entrée de la requête.
-        if let Some((c, _)) = combiner(ph, &f.favorites, f.est_en_et("favorite"), bloc_favoris) {
+        if let Some((c, _)) = combiner(
+            ph,
+            &f.favorites,
+            f.est_en_et("favorite"),
+            bloc_favoris(f.profile_id),
+        ) {
             conditions.push(c);
         }
 
@@ -3739,6 +3777,87 @@ impl TrackRepo {
             .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
             .collect();
         Ok((ids, total))
+    }
+
+    /// #7597 — TOUTES les pistes d'un répertoire et de ses sous-dossiers, dans
+    /// l'ordre de lecture, pour « Tout lire » et « Ajouter à la file » d'un
+    /// dossier : `(ids, total)`.
+    ///
+    /// Ordre : le dossier de la piste (composant par composant, tri naturel,
+    /// celui de la vue Répertoires — un dossier passe donc avant ses
+    /// sous-dossiers, et « CD2 » avant « CD10 »), puis le numéro de disque, le
+    /// numéro de piste, et le nom de fichier. Un numéro absent passe avant un
+    /// numéro présent.
+    ///
+    /// Le sous-arbre est celui de la vue Répertoires : le chemin de la piste
+    /// est [`CHEMIN_DE_LA_PISTE`], pour que les tranches d'une feuille CUE
+    /// (`file_path` NULL, #4625) — que Répertoires affiche — soient lues aussi.
+    /// Le motif est le [`folder_like_pattern`] de `/library/tracks?folder=` et de
+    /// la lecture aléatoire par répertoire, derrière la plage indexée de #5998.
+    ///
+    /// Exclusions : les albums masqués (#1391) et les titres bannis par ce
+    /// profil (#4806), comme le tirage par répertoire.
+    ///
+    /// **Jamais de troncature** : `total` est compté d'abord ; au-delà de
+    /// `plafond`, `ids` est VIDE et c'est à l'appelant de refuser en disant le
+    /// total. Une liste partielle ne sort jamais d'ici.
+    pub fn pistes_du_dossier_dans_l_ordre(
+        &self,
+        profile_id: i64,
+        folder: &str,
+        plafond: i64,
+    ) -> Result<(Vec<i64>, i64), TuneError> {
+        let engine = self.db.engine();
+        let mut ph = Placeholders::new(engine);
+        let chemin = "COALESCE(t.file_path, t.cue_media_path)";
+        let (bas, haut) = bornes_du_dossier(folder);
+        let (p_bas, p_haut) = (ph.take(), ph.take());
+        let p_motif = ph.take();
+        let where_clause = format!(
+            " WHERE {plage} AND {chemin} LIKE {p_motif}{esc} AND {masques} AND {bannis}",
+            plage = plage_du_dossier(engine, chemin, &p_bas, &p_haut),
+            esc = like_escape_clause(),
+            masques = hidden_tracks_excluded(),
+            bannis = banned_tracks_excluded(profile_id),
+        );
+        let params: Vec<SqlValue> = vec![
+            SqlValue::Text(bas),
+            SqlValue::Text(haut),
+            SqlValue::Text(folder_like_pattern(folder)),
+        ];
+        let refs: Vec<&dyn ToSqlValue> = params.iter().map(|v| v as &dyn ToSqlValue).collect();
+        let total = self
+            .db
+            .query_one(
+                &format!("SELECT COUNT(*) FROM tracks t{where_clause}"),
+                &refs,
+            )?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        if total > plafond || total == 0 {
+            return Ok((Vec::new(), total));
+        }
+        let rows = self.db.query_many(
+            &format!(
+                "SELECT t.id, {chemin}, CAST(t.disc_number AS INTEGER), \
+                 CAST(t.track_number AS INTEGER) FROM tracks t{where_clause}"
+            ),
+            &refs,
+        )?;
+        let mut pistes: Vec<(i64, String, Option<i64>, Option<i64>)> = rows
+            .into_iter()
+            .filter_map(|cols| {
+                Some((
+                    cols.first()?.as_i64()?,
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_i64()),
+                    cols.get(3).and_then(|v| v.as_i64()),
+                ))
+            })
+            .collect();
+        pistes.sort_by(|a, b| ordre_de_lecture_du_dossier((&a.1, a.2, a.3), (&b.1, b.2, b.3)));
+        Ok((pistes.into_iter().map(|p| p.0).collect(), total))
     }
 
     /// Le PRÉDICAT « cette piste est douteuse », partagé par le compte et la
@@ -7491,6 +7610,59 @@ mod tests_facettes_en_et_2108 {
             }),
             ["Deux"]
         );
+    }
+}
+
+/// #7569 — le filtre « favoris » de la liste lit les favoris du profil de la
+/// REQUÊTE, pas toujours ceux du profil 1.
+#[cfg(test)]
+mod tests_favoris_du_profil_7569 {
+    use crate::db::facet_filter::TrackFilter;
+    use crate::db::models::Track;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    #[test]
+    fn le_filtre_favoris_lit_les_favoris_du_profil_demande() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        // La table `favorites` vit dans les migrations, pas dans le schéma initial.
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let repo = TrackRepo::new(db.clone());
+        let mut ids = Vec::new();
+        for titre in ["Alpha", "Beta", "Gamma"] {
+            let mut t = Track::new(titre.into());
+            t.file_path = Some(format!("/m/{titre}.flac"));
+            ids.push(repo.create(&t).unwrap());
+        }
+        // Profil 1 : Alpha. Profil 2 : Beta. Gamma n'est à personne.
+        db.execute_batch(&format!(
+            "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'track', {a}); \
+             INSERT INTO favorites (profile_id, item_type, item_id) VALUES (2, 'track', {b});",
+            a = ids[0],
+            b = ids[1]
+        ))
+        .unwrap();
+
+        let titres = |profil: i64| -> Vec<String> {
+            let f = TrackFilter {
+                favorites: vec!["track".into()],
+                profile_id: profil,
+                ..Default::default()
+            };
+            let (pistes, total) = repo.list_filtered(&f, 50, 0).unwrap();
+            let t: Vec<String> = pistes.into_iter().map(|p| p.title).collect();
+            assert_eq!(total as usize, t.len(), "le total suit la liste");
+            t
+        };
+        assert_eq!(titres(1), ["Alpha"]);
+        assert_eq!(titres(2), ["Beta"], "le profil 2 ne voit que les siens");
+        assert_eq!(
+            titres(0),
+            ["Alpha"],
+            "sans profil : le profil 1, comme avant"
+        );
+        assert!(titres(3).is_empty(), "un profil sans favori ne voit rien");
     }
 }
 
