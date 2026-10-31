@@ -346,6 +346,36 @@ pub fn track_position(
     Ok(())
 }
 
+/// Fin d'un épisode (#7415) : les 30 dernières secondes, ou 95 % de sa durée.
+/// Durée inconnue ou nulle (flux sans durée annoncée) : rien ne se conclut.
+pub const FIN_EPISODE_RESTE_MS: i64 = 30_000;
+pub const FIN_EPISODE_POURCENT: i64 = 95;
+
+pub fn episode_fini(position_ms: i64, duree_ms: i64) -> bool {
+    duree_ms > 0
+        && position_ms > 0
+        && (duree_ms.saturating_sub(position_ms) <= FIN_EPISODE_RESTE_MS
+            || position_ms.saturating_mul(100) >= duree_ms.saturating_mul(FIN_EPISODE_POURCENT))
+}
+
+/// Retire la reprise de l'épisode `url` sur cette zone (épisode écouté).
+pub fn podcast_termine(db: &Arc<dyn DbBackend>, zone_id: i64, url: &str) -> Result<usize, String> {
+    let mut retirees = 0;
+    for r in recent(db, Some(zone_id), 80)?.into_iter().filter(|r| {
+        r.context_type == "podcast"
+            && r.items.first().is_some_and(
+                |i| matches!(i, QueueInput::Streaming { source_id, .. } if source_id == url),
+            )
+    }) {
+        db.execute(
+            "DELETE FROM listening_resumes WHERE resume_key = ?",
+            &[&r.resume_key as &dyn ToSqlValue],
+        )?;
+        retirees += 1;
+    }
+    Ok(retirees)
+}
+
 /// Podcast : ne met à jour que l'épisode qui est encore celui de la zone.
 pub fn podcast_position(
     db: &Arc<dyn DbBackend>,
@@ -353,6 +383,22 @@ pub fn podcast_position(
     url: &str,
     position_ms: i64,
 ) -> Result<(), String> {
+    podcast_position_avec_duree(db, zone_id, url, position_ms, 0)
+}
+
+/// Comme [`podcast_position`], et un épisode arrivé à sa fin quitte
+/// « Reprendre l'écoute » au lieu d'y garder sa dernière position (#7415).
+pub fn podcast_position_avec_duree(
+    db: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    url: &str,
+    position_ms: i64,
+    duree_ms: i64,
+) -> Result<(), String> {
+    if episode_fini(position_ms, duree_ms) {
+        podcast_termine(db, zone_id, url)?;
+        return Ok(());
+    }
     let rows = recent(db, Some(zone_id), 80)?;
     if let Some(mut r) = rows.into_iter().find(|r| {
         r.context_type == "podcast"
@@ -387,6 +433,12 @@ pub fn podcast_started_in_context(
     let Some(url) = np.source_id.as_deref().filter(|_| np.source == "podcast") else {
         return Ok(());
     };
+    // #7415 : un épisode arrivé à sa fin ne se réinscrit pas à chaque tic du
+    // sondeur ; relu depuis le début, il revient comme une nouvelle reprise.
+    if episode_fini(position_ms, np.duration_ms) {
+        podcast_termine(db, zone_id, url)?;
+        return Ok(());
+    }
     let r = Resume {
         resume_key: uuid::Uuid::new_v4().to_string(),
         context_type: "podcast".into(),
@@ -568,6 +620,10 @@ pub fn terminee(db: &Arc<dyn DbBackend>, zone_id: i64) -> Result<usize, String> 
     }
     Ok(retirees)
 }
+
+#[cfg(test)]
+#[path = "listening_resume_podcast_fin_tests.rs"]
+mod reprise_podcast_terminee_7415;
 
 #[cfg(test)]
 #[path = "listening_resume_7415_tests.rs"]

@@ -72,6 +72,17 @@ impl PositionPoller {
         if let Err(e) = crate::db::listening_resume::terminee(&self.db, zone_id) {
             warn!(zone_id, error = %e, "reprise_terminee_non_retiree");
         }
+        // #7415 : un épisode de podcast n'a pas de ligne de file dans sa
+        // reprise ; sa file qui s'achève le retire par son adresse.
+        if let Some(np) = zone_state
+            .now_playing
+            .as_ref()
+            .filter(|np| np.source == "podcast")
+            && let Some(url) = np.source_id.as_deref()
+            && let Err(e) = crate::db::listening_resume::podcast_termine(&self.db, zone_id, url)
+        {
+            warn!(zone_id, error = %e, "reprise_podcast_terminee_non_retiree");
+        }
         // #6634 — le contrôleur UPnP décide de la suite. Sa dernière piste
         // ne doit pas amorcer la radio ou un album de la bibliothèque locale.
         // Les pistes indexées d’un serveur média gardent leur autoplay Tune.
