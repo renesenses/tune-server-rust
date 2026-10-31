@@ -51,6 +51,14 @@ impl FacetQuery {
         self.sel = track_filter_from_raw(raw)?;
         Ok(self)
     }
+
+    /// Le profil de la requête (#7569) : celui dont le filtre « favoris »
+    /// lit les favoris. À appeler après [`FacetQuery::hydrate`], qui remplace
+    /// `sel` en entier.
+    pub(super) fn pour_profil(mut self, profil: i64) -> Self {
+        self.sel.profile_id = profil;
+        self
+    }
 }
 
 /// Build the WHERE conditions (over alias `t` = tracks) for the active filters,
@@ -568,7 +576,7 @@ fn build_facet_conditions(
             &mut ph,
             &sel.favorites,
             sel.est_en_et("favorite"),
-            bloc_favoris,
+            bloc_favoris(sel.profile_id),
         ) {
             conds.push(c);
         }
@@ -648,6 +656,7 @@ pub(super) fn collection_album_ids(state: &AppState, name: &str) -> Vec<i64> {
 /// courant — elle est vide, et une facette morte coûterait une requête à
 /// chaque ouverture du rail pour ne rien montrer.
 pub(super) async fn library_facets(
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(q): Query<FacetQuery>,
     RawQuery(raw): RawQuery,
     State(state): State<AppState>,
@@ -655,7 +664,7 @@ pub(super) async fn library_facets(
     // Les facettes à plusieurs valeurs se lisent dans la chaîne BRUTE : voir
     // `FacetQuery::hydrate`. Sans cet appel, `sel` reste vide et plus rien ne
     // filtre.
-    let q = q.hydrate(raw.as_deref())?;
+    let q = q.hydrate(raw.as_deref())?.pour_profil(profile.id());
     // #5438 — la résolution de la collection et les requêtes de chaque
     // facette sont synchrones : hors de l'exécuteur.
     hors_executeur("library_facets", move || compter_les_facettes(&state, q))
@@ -736,7 +745,7 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 // tant que les crédits ne sont pas là, un client la demande
                 // explicitement (`fields=…,instrument`).
                 "instrument" => instrument_facet(state, engine, limit, conds, params),
-                "favorite" => favorite_facet(state, conds, params),
+                "favorite" => favorite_facet(state, q.sel.profile_id, conds, params),
                 "playlist" => playlist_facet(state, limit, conds, params),
                 "untagged" => untagged_facet(state, conds, params),
                 _ => return None,
@@ -989,27 +998,26 @@ fn dr_facet(
         .collect()
 }
 
-/// Favoris du profil 1, comptés par type. Deux valeurs au plus (`track`,
+/// Favoris du profil de la requête (#7569), comptés par type. Deux valeurs au plus (`track`,
 /// `album`) : pas de LIMIT à appliquer.
-fn favorite_facet(state: &AppState, conds: &[String], params: &[SqlValue]) -> Vec<(String, i64)> {
+fn favorite_facet(
+    state: &AppState,
+    profil: i64,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
     let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
         .iter()
         .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
         .collect();
     let mut out = Vec::new();
     for kind in ["track", "album"] {
-        let own = match kind {
-            "album" => {
-                "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-                        AND f.item_type = 'album' AND f.item_id = t.album_id)"
-            }
-            _ => {
-                "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-                  AND f.item_type = 'track' AND f.item_id = t.id)"
-            }
+        // Le même prédicat que la liste (`facet_filter`), pas une copie.
+        let Some(own) = tune_core::db::facet_filter::favorite_condition(kind, profil) else {
+            continue;
         };
         let mut all: Vec<String> = conds.to_vec();
-        all.push(own.to_string());
+        all.push(own);
         let sql = format!("SELECT COUNT(*) FROM tracks t WHERE {}", all.join(" AND "));
         let n = state
             .backend

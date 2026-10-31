@@ -429,7 +429,8 @@ pub(super) async fn list_tracks(
     // Facettes à plusieurs valeurs : la clé répétée (`?format=aiff&format=flac`)
     // se lit dans la chaîne BRUTE, que `serde_urlencoded` ne sait pas agréger —
     // et qu'il refuse même en double.
-    let filter = track_filter_from_raw(raw.as_deref())?;
+    let mut filter = track_filter_from_raw(raw.as_deref())?;
+    filter.profile_id = profile.id();
     let page_triee = PageTriee::depuis(&p)?;
     // #5138 — TOUTES les lectures de cette route sont synchrones (rusqlite).
     // Posées sur un fil de l'exécuteur, les 7 à 9,7 s de la liste et du
