@@ -327,8 +327,17 @@ pub async fn batch_match_artist_mbids_scoped(
 
     for (i, (artist_id, name)) in artists.iter().enumerate() {
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        if let Some(mbid) = lookup_artist(name).await {
-            repo.update_mbid(*artist_id, &mbid).ok();
+        // #7535 — un MBID déjà porté par une autre fiche n'est pas posé
+        // (`poser_mbid` le journalise) et ne compte pas comme trouvé.
+        if let Some(mbid) = lookup_artist(name).await
+            && repo
+                .poser_mbid(
+                    *artist_id,
+                    &mbid,
+                    crate::db::artist_repo::ProvenanceMbid::Nom,
+                )
+                .unwrap_or(false)
+        {
             matched += 1;
             tracing::debug!(artist_id, name = %name, mbid = %mbid, "artist_mbid_matched");
         }

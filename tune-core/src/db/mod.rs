@@ -102,6 +102,9 @@ mod filtre_dr_190_tests;
 mod lenteur_albums_4800_tests;
 #[cfg(test)]
 mod lenteur_pistes_5138_tests;
+/// #7535 — un MBID trouvé par le nom n'est plus posé s'il est déjà porté.
+#[cfg(test)]
+mod mbid_deja_porte_7535_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
 #[cfg(test)]
