@@ -685,6 +685,8 @@ mod like_escape_tests {
     }
 }
 
+/// Modifier un champ sur tout le résultat d'un filtre d'Oxygen (#7539).
+mod edition_par_filtre;
 /// Poser ou retirer une étiquette sur tout le résultat d'un filtre d'Oxygen
 /// (#7128).
 mod etiquetage_par_filtre;
@@ -697,6 +699,10 @@ mod etiquetage_par_filtre;
 /// La liste des pistes paginée côté serveur, triée et comptée par
 /// provenance (tune-web-client#1716).
 mod page_de_pistes;
+pub use edition_par_filtre::{
+    ChampDeMasse, Exemple, FichierAEcrire, PLAFOND_EDITION_PAR_FILTRE, PlanEdition, RefusEdition,
+    ValeurDeMasse, valider_valeur,
+};
 pub use etiquetage_par_filtre::{
     BilanEtiquetage, CibleDuFiltre, PLAFOND_ETIQUETAGE_PAR_FILTRE, RefusEtiquetage,
 };

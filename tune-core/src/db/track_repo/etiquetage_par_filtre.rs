@@ -92,7 +92,7 @@ pub struct BilanEtiquetage {
 impl TrackRepo {
     /// Le `SELECT DISTINCT <colonne> FROM tracks t … WHERE …` qui désigne
     /// l'ensemble, ses marqueurs tirés de `ph` APRÈS ceux déjà pris.
-    fn sous_requete_du_filtre(
+    pub(super) fn sous_requete_du_filtre(
         &self,
         f: &TrackFilter,
         cible: CibleDuFiltre,
