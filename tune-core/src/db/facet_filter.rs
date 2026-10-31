@@ -548,6 +548,18 @@ pub fn normalize_ints(values: &[i64]) -> Vec<i64> {
     out
 }
 
+/// Prédicat « la note de l'album est parmi `c` » pour le profil `profil`
+/// (#7594). `c` est le fragment `arr.rating IN (...)` déjà construit avec ses
+/// marqueurs ; le numéro de profil est un entier, jamais du texte. Un profil
+/// non positif retombe sur le profil 1, comme [`favorite_condition`].
+pub fn rating_condition(c: &str, profil: i64) -> String {
+    let profil = if profil > 0 { profil } else { 1 };
+    format!(
+        "EXISTS (SELECT 1 FROM album_ratings arr \
+         WHERE arr.album_id = t.album_id AND arr.profile_id = {profil} AND {c})"
+    )
+}
+
 /// Prédicat « cette piste est en favori » pour le profil `profil` (un profil
 /// non positif — filtre construit sans requête — retombe sur le profil 1, le
 /// profil par défaut). Le numéro est un entier, jamais du texte : il s'écrit
