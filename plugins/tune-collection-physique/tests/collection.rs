@@ -56,6 +56,10 @@ struct HoteEssai {
     /// MusicBrainz : `None` répond ; `Some(true)` refuse (503 → `Limite`) ;
     /// `Some(false)` ne répond pas (panne de transport).
     mb_refuse: Mutex<Option<bool>>,
+    /// MusicBrainz répond à autant d'appels, puis se tait (`None` : sans fin).
+    mb_avant_panne: Mutex<Option<usize>>,
+    /// Les services qui ne répondent pas (panne de transport).
+    services_muets: Mutex<Vec<String>>,
 }
 
 impl HoteEssai {
@@ -81,6 +85,8 @@ impl HoteEssai {
             limites_a_rendre: Mutex::new(0),
             vignettes: Mutex::new(false),
             mb_refuse: Mutex::new(None),
+            mb_avant_panne: Mutex::new(None),
+            services_muets: Mutex::new(Vec::new()),
         }
     }
 
@@ -199,6 +205,12 @@ impl Hote for HoteEssai {
             Some(false) => return Err(Panne),
             None => {}
         }
+        if let Some(n) = self.mb_avant_panne.lock().unwrap().as_mut() {
+            if *n == 0 {
+                return Err(Panne);
+            }
+            *n -= 1;
+        }
         Ok(match resource.as_str() {
             "https://www.discogs.com/release/249504" => {
                 Reponse::Json(fixture("mb_url_release_249504.json"))
@@ -223,6 +235,15 @@ impl Hote for HoteEssai {
             .lock()
             .unwrap()
             .push(format!("service {service} {requete}"));
+        if self
+            .services_muets
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m == service)
+        {
+            return Err(Panne);
+        }
         Ok(self
             .recherches
             .get(&(service.to_string(), requete.to_string()))
@@ -250,12 +271,26 @@ struct Banc {
 }
 
 fn banc_avec(hote: HoteEssai) -> Banc {
+    banc_avec_cadence(hote, Cadence::immediate())
+}
+
+/// Le recul de l'affinage MusicBrainz, court mais non nul : la tâche
+/// d'affinage ne tourne pas à vide pendant que MusicBrainz se tait.
+fn cadence_recul_court() -> Cadence {
+    Cadence {
+        attente_limite: std::time::Duration::from_millis(2),
+        attente_max: std::time::Duration::from_millis(10),
+        ..Cadence::immediate()
+    }
+}
+
+fn banc_avec_cadence(hote: HoteEssai, cadence: Cadence) -> Banc {
     let dossier = tempfile::tempdir().unwrap();
     let hote = Arc::new(hote);
     let moteur = Arc::new(Moteur::new(
         hote.clone(),
         dossier.path().to_path_buf(),
-        Cadence::immediate(),
+        cadence,
     ));
     let app = router(base(), moteur.clone());
     Banc {
@@ -301,6 +336,23 @@ async fn suivre(b: &Banc, nom: &str) {
     assert_eq!(code, StatusCode::OK, "{r}");
 }
 
+/// La synchronisation, puis l'affinage MusicBrainz, attendus jusqu'au bout.
+async fn synchro_complete(b: &Banc, nom: &str) {
+    b.moteur.synchroniser_maintenant(nom).await.unwrap();
+    b.moteur.affiner_maintenant().await;
+}
+
+/// Attend (2 s au plus) que `cond` soit vraie.
+async fn attendre_que(mut cond: impl FnMut() -> bool, quoi: &str) {
+    for _ in 0..400 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("jamais arrivé : {quoi}");
+}
+
 fn disque<'a>(c: &'a Value, titre: &str) -> &'a Value {
     c["disques"]
         .as_array()
@@ -314,7 +366,7 @@ fn disque<'a>(c: &'a Value, titre: &str) -> &'a Value {
 async fn la_collection_se_compare_a_la_bibliotheque_et_aux_services() {
     let b = banc_avec(HoteEssai::new());
     suivre(&b, "exemple").await;
-    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    synchro_complete(&b, "exemple").await;
 
     let (code, c) = appel(&b.app, "GET", "/collection", None).await;
     assert_eq!(code, StatusCode::OK, "{c}");
@@ -400,7 +452,7 @@ async fn la_collection_se_compare_a_la_bibliotheque_et_aux_services() {
 async fn la_deuxieme_synchronisation_ne_relit_que_la_liste() {
     let b = banc_avec(HoteEssai::new());
     suivre(&b, "exemple").await;
-    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    synchro_complete(&b, "exemple").await;
     assert_eq!(
         b.hote.appels("discogs /releases/"),
         5,
@@ -412,7 +464,7 @@ async fn la_deuxieme_synchronisation_ne_relit_que_la_liste() {
         5 + 3,
         "une release par disque, puis un appel par master distinct (Rick, 1050 et 7024 en ont un) — {mb}"
     );
-    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    synchro_complete(&b, "exemple").await;
     assert_eq!(
         b.hote.appels("discogs /releases/"),
         5,
@@ -667,64 +719,264 @@ async fn une_synchronisation_d_avant_les_vignettes_les_recoit_a_la_suivante() {
     );
 }
 
-/// Essai réel du 31/10/2026 (908 disques) : la synchronisation s'arrêtait
-/// sur `musicbrainz_indisponible` et Qobuz / TIDAL n'étaient jamais
-/// interrogés. MusicBrainz qui refuse (503) ne doit plus rien arrêter.
-async fn musicbrainz_en_panne_n_arrete_rien(refus: bool) {
+/// Essai réel du 31/10/2026 sur le .18 (908 disques, 680 à rapprocher) :
+/// MusicBrainz passait AVANT les services, 6 disques en 10 minutes, et 531
+/// disques restaient « à vérifier » pendant des heures. Désormais la
+/// synchronisation ne l'attend plus du tout : « En streaming » se remplit
+/// MusicBrainz en panne, et aucun message d'erreur ne reste.
+async fn musicbrainz_en_panne_le_streaming_se_remplit_quand_meme(refus: bool) {
     let hote = HoteEssai::new();
     *hote.mb_refuse.lock().unwrap() = Some(refus);
-    let b = banc_avec(hote);
+    let b = banc_avec_cadence(hote, cadence_recul_court());
     suivre(&b, "exemple").await;
     let r = b.moteur.synchroniser_maintenant("exemple").await;
     assert_eq!(r, Ok(()), "MusicBrainz est un plus, pas une condition");
+    assert_eq!(
+        b.hote.appels("mb "),
+        0,
+        "la synchronisation n'attend pas MusicBrainz"
+    );
+    assert!(b.hote.appels("service ") > 0, "Qobuz / TIDAL interrogés");
 
     let (_, e) = appel(&b.app, "GET", "/etat", None).await;
     assert_eq!(e["derniere_erreur"], Value::Null, "{e}");
     assert!(e["derniere_synchro"].is_i64(), "{e}");
     assert_eq!(
-        e["musicbrainz_manquants"], 5,
-        "les 5 disques restent à revoir : {e}"
+        e["affinage_musicbrainz"],
+        json!({"en_cours": false, "restants": 5}),
+        "{e}"
     );
-
-    // Le disjoncteur : 3 disques de suite sans réponse, chacun essayé
-    // `essais_limite + 1` fois ; les 2 autres ne sont pas même demandés.
-    assert_eq!(
-        b.hote.appels("mb "),
-        3 * 4,
-        "{:?}",
-        b.hote.appels.lock().unwrap()
-    );
-
-    // L'étape des services a tourné : les disques absents de la
-    // bibliothèque (sans MBID, Rick n'y est plus) ont été cherchés.
-    assert!(b.hote.appels("service ") > 0, "Qobuz / TIDAL interrogés");
     let (_, c) = appel(&b.app, "GET", "/collection", None).await;
-    assert_eq!(c["musicbrainz_manquants"], 5, "{c}");
-    // Le code-barre suffit toujours au CD 1050.
-    let cd = disque(&c, "Montreal Mix Sessions Vol. 4");
-    assert_eq!(cd["bibliotheque"]["par"], "code_barre", "{cd}");
     let gm = disque(&c, "Giving My Love / Brazil");
     assert_eq!(gm["etat"], "streaming", "{gm}");
+    // Le code-barre et l'artiste + titre suffisent à la bibliothèque.
+    let cd = disque(&c, "Montreal Mix Sessions Vol. 4");
+    assert_eq!(cd["bibliotheque"]["par"], "code_barre", "{cd}");
+    let rick = disque(&c, "Never Gonna Give You Up");
+    assert_eq!(rick["bibliotheque"]["par"], "artiste_titre", "{rick}");
 
-    // La relance reprend : MusicBrainz revenu, les liens se lisent, aucune
-    // fiche Discogs n'est relue, et plus rien n'est en suspens.
+    // L'affinage en tâche de fond : MusicBrainz muet, il recule sans erreur.
+    assert!(b.moteur.lancer_affinage());
+    attendre_que(|| b.hote.appels("mb ") >= 3, "trois essais MusicBrainz").await;
+    let (_, e) = appel(&b.app, "GET", "/etat", None).await;
+    assert_eq!(e["affinage_musicbrainz"]["en_cours"], true, "{e}");
+    assert_eq!(e["affinage_musicbrainz"]["restants"], 5, "{e}");
+    assert_eq!(e["derniere_erreur"], Value::Null, "{e}");
+
+    // MusicBrainz revient : l'affinage finit seul, Rick est reconnu par son
+    // groupe MusicBrainz, et aucune fiche Discogs n'est relue.
     let fiches = b.hote.appels("discogs /releases/");
     *b.hote.mb_refuse.lock().unwrap() = None;
-    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    attendre_que(
+        || b.moteur.affinage().restants == 0 && !b.moteur.affinage().en_cours,
+        "affinage fini",
+    )
+    .await;
     assert_eq!(b.hote.appels("discogs /releases/"), fiches);
-    let (_, e) = appel(&b.app, "GET", "/etat", None).await;
-    assert_eq!(e["musicbrainz_manquants"], 0, "{e}");
     let (_, c) = appel(&b.app, "GET", "/collection", None).await;
     let rick = disque(&c, "Never Gonna Give You Up");
     assert_eq!(rick["bibliotheque"]["par"], "musicbrainz_album", "{rick}");
+    assert_eq!(c["affinage_musicbrainz"]["restants"], 0, "{c}");
 }
 
 #[tokio::test]
-async fn musicbrainz_qui_refuse_n_arrete_pas_la_synchronisation() {
-    musicbrainz_en_panne_n_arrete_rien(true).await;
+async fn musicbrainz_qui_refuse_n_empeche_pas_le_streaming() {
+    musicbrainz_en_panne_le_streaming_se_remplit_quand_meme(true).await;
 }
 
 #[tokio::test]
-async fn musicbrainz_qui_ne_repond_pas_n_arrete_pas_la_synchronisation() {
-    musicbrainz_en_panne_n_arrete_rien(false).await;
+async fn musicbrainz_qui_ne_repond_pas_n_empeche_pas_le_streaming() {
+    musicbrainz_en_panne_le_streaming_se_remplit_quand_meme(false).await;
+}
+
+/// Contre-épreuve : « En streaming » vient bien des services. Sans service
+/// connecté, la même synchronisation (MusicBrainz en panne) n'en trouve
+/// aucun.
+#[tokio::test]
+async fn contre_epreuve_sans_service_rien_en_streaming() {
+    let mut hote = HoteEssai::new();
+    hote.services = vec![];
+    *hote.mb_refuse.lock().unwrap() = Some(true);
+    let b = banc_avec(hote);
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    assert_eq!(c["compteurs"]["par_etat"]["streaming"], 0, "{c}");
+    assert_eq!(disque(&c, "Giving My Love / Brazil")["etat"], "nulle_part");
+}
+
+/// Une mémoire d'avant le correctif, arrêtée sur `musicbrainz_indisponible`,
+/// ne garde pas ce message rouge.
+#[tokio::test]
+async fn l_ancien_message_musicbrainz_indisponible_s_efface() {
+    let dossier = tempfile::tempdir().unwrap();
+    let m = tune_collection_physique::memoire::Memoire {
+        derniere_erreur: Some("musicbrainz_indisponible".into()),
+        ..Default::default()
+    };
+    m.ecrire(dossier.path()).unwrap();
+    let moteur = Moteur::new(
+        Arc::new(HoteEssai::new()),
+        dossier.path().to_path_buf(),
+        Cadence::immediate(),
+    );
+    assert_eq!(moteur.memoire().derniere_erreur, None);
+    // Contre-épreuve : une vraie erreur de Discogs, elle, reste dite.
+    let m = tune_collection_physique::memoire::Memoire {
+        derniere_erreur: Some("discogs_limite".into()),
+        ..Default::default()
+    };
+    m.ecrire(dossier.path()).unwrap();
+    let moteur = Moteur::new(
+        Arc::new(HoteEssai::new()),
+        dossier.path().to_path_buf(),
+        Cadence::immediate(),
+    );
+    assert_eq!(
+        moteur.memoire().derniere_erreur.as_deref(),
+        Some("discogs_limite")
+    );
+}
+
+/// Les recherches d'un disque chez un service, dans l'ordre.
+fn recherches(hote: &HoteEssai, service: &str) -> Vec<String> {
+    let prefixe = format!("service {service} ");
+    hote.appels
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a.strip_prefix(&prefixe).map(str::to_string))
+        .collect()
+}
+
+/// Par code-barre (UPC / EAN de la fiche Discogs) d'abord, puis par
+/// artiste + titre. Le CD 1050, retiré de la bibliothèque : Qobuz le trouve
+/// par son code-barre (aucune recherche de plus), TIDAL ne le trouve pas
+/// par code-barre et est alors interrogé par artiste + titre.
+#[tokio::test]
+async fn le_code_barre_d_abord_puis_artiste_et_titre() {
+    let mut hote = HoteEssai::new();
+    hote.albums.lock().unwrap().retain(|a| a.id != 2);
+    hote.recherches.insert(
+        ("qobuz".into(), "671665000928".into()),
+        vec![AlbumDeService {
+            id: "Q-1050".into(),
+            titre: "Montreal Mix Sessions Vol. 4".into(),
+            artiste: "Laflèche".into(),
+        }],
+    );
+    let b = banc_avec(hote);
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let cd = disque(&c, "Montreal Mix Sessions Vol. 4");
+    assert_eq!(cd["etat"], "streaming", "{cd}");
+    assert_eq!(cd["streaming"][0]["service"], "qobuz", "{cd}");
+    assert_eq!(cd["streaming"][0]["par"], "code_barre", "{cd}");
+
+    let qobuz = recherches(&b.hote, "qobuz");
+    let tidal = recherches(&b.hote, "tidal");
+    let i = qobuz.iter().position(|r| r == "671665000928").unwrap();
+    assert!(
+        !qobuz[i + 1..]
+            .first()
+            .is_some_and(|r| r.ends_with("Montreal Mix Sessions Vol. 4")),
+        "trouvé par code-barre : pas de recherche par artiste + titre — {qobuz:?}"
+    );
+    let j = tidal.iter().position(|r| r == "671665000928").unwrap();
+    assert!(
+        tidal[j + 1].ends_with("Montreal Mix Sessions Vol. 4"),
+        "TIDAL : le code-barre, PUIS artiste + titre — {tidal:?}"
+    );
+
+    // Contre-épreuve : un disque SANS code-barre (la fiche de « The
+    // Haçienda » n'en donne pas) est cherché d'emblée par artiste + titre.
+    let h: Vec<&String> = qobuz.iter().filter(|r| r.contains("Haçienda")).collect();
+    assert_eq!(h.len(), 1, "{qobuz:?}");
+    assert!(h[0].starts_with("Various "), "{h:?}");
+}
+
+/// « Nulle part » seulement quand TOUS les services connectés ont répondu.
+#[tokio::test]
+async fn nulle_part_seulement_apres_la_reponse_de_tous_les_services() {
+    let hote = HoteEssai::new();
+    *hote.services_muets.lock().unwrap() = vec!["tidal".into()];
+    let b = banc_avec(hote);
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let h = disque(&c, "The Haçienda - Play By 01/96");
+    assert_eq!(h["etat"], "a_verifier", "Qobuz a répondu, TIDAL non : {h}");
+    assert_eq!(c["compteurs"]["par_etat"]["nulle_part"], 0, "{c}");
+
+    // Contre-épreuve : TIDAL répond à la synchronisation suivante, qui
+    // reprend le disque (et lui seul côté services) : « nulle part ».
+    b.hote.services_muets.lock().unwrap().clear();
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let h = disque(&c, "The Haçienda - Play By 01/96");
+    assert_eq!(h["etat"], "nulle_part", "{h}");
+    let gm = disque(&c, "Giving My Love / Brazil");
+    assert_eq!(gm["etat"], "streaming", "{gm}");
+}
+
+/// L'affinage MusicBrainz reprend après un redémarrage là où il s'était
+/// arrêté : les disques déjà lus ne sont pas redemandés, Discogs n'est pas
+/// rappelé.
+#[tokio::test]
+async fn l_affinage_reprend_apres_un_redemarrage() {
+    let dossier = tempfile::tempdir().unwrap();
+    let h1 = HoteEssai::new();
+    *h1.mb_avant_panne.lock().unwrap() = Some(3);
+    let h1 = Arc::new(h1);
+    let m1 = Arc::new(Moteur::new(
+        h1.clone(),
+        dossier.path().to_path_buf(),
+        cadence_recul_court(),
+    ));
+    m1.synchroniser_maintenant("exemple").await.unwrap();
+    assert!(m1.lancer_affinage());
+    // MusicBrainz se tait après trois réponses : l'affinage recule, et a
+    // rangé ce qu'il a appris avant de reculer.
+    attendre_que(|| h1.appels("mb ") >= 5, "l'affinage recule").await;
+    let lus: Vec<u64> = tune_collection_physique::memoire::Memoire::lire(dossier.path())
+        .liens_mb
+        .keys()
+        .copied()
+        .collect();
+    assert!(!lus.is_empty() && lus.len() < 5, "{lus:?}");
+    m1.arreter();
+    assert!(!m1.affinage().en_cours);
+    drop(m1);
+
+    // Le « redémarrage » : un nouveau moteur sur le même dossier.
+    let h2 = Arc::new(HoteEssai::new());
+    let m2 = Arc::new(Moteur::new(
+        h2.clone(),
+        dossier.path().to_path_buf(),
+        Cadence::immediate(),
+    ));
+    assert_eq!(m2.affinage().restants, 5 - lus.len());
+    m2.affiner_maintenant().await;
+    assert_eq!(m2.affinage().restants, 0);
+    assert_eq!(h2.appels("discogs "), 0, "rien de relu chez Discogs");
+    for r in &lus {
+        assert_eq!(
+            h2.appels(&format!("mb url https://www.discogs.com/release/{r}")),
+            0,
+            "{r} déjà lu avant le redémarrage"
+        );
+    }
+    assert_eq!(
+        h2.appels("mb url https://www.discogs.com/release/"),
+        5 - lus.len()
+    );
+
+    // Contre-épreuve : sans la mémoire, les 5 disques sont redemandés.
+    let vide = tempfile::tempdir().unwrap();
+    let h3 = Arc::new(HoteEssai::new());
+    let m3 = Moteur::new(h3.clone(), vide.path().to_path_buf(), Cadence::immediate());
+    m3.synchroniser_maintenant("exemple").await.unwrap();
+    m3.affiner_maintenant().await;
+    assert_eq!(h3.appels("mb url https://www.discogs.com/release/"), 5);
 }

@@ -13,9 +13,12 @@
 //!   c'est ainsi qu'un disque vendu sort de la liste ;
 //! * le CODE-BARRE d'une fiche : pour toujours (un pressage ne change pas) ;
 //! * les liens MUSICBRAINZ : trouvés, pour toujours ; « aucun lien »,
-//!   [`REVOIR_APRES_JOURS`] jours (quelqu'un a pu les ajouter depuis) ;
+//!   [`REVOIR_APRES_JOURS`] jours (quelqu'un a pu les ajouter depuis). Un
+//!   disque sans entrée ici est un disque que l'affinage n'a pas encore lu :
+//!   c'est ainsi qu'il reprend après un redémarrage ;
 //! * le STREAMING : [`REVOIR_APRES_JOURS`] jours, ou dès que la liste des
-//!   services connectés change.
+//!   services connectés change. N'y sont notés que les services qui ont
+//!   RÉPONDU : un service muet laisse le disque à revoir.
 //!
 //! L'écriture passe par un fichier temporaire renommé : un arrêt brutal
 //! laisse l'ancienne mémoire, jamais une moitié.
@@ -62,8 +65,9 @@ pub struct SurUnService {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Streaming {
     pub trouves: Vec<SurUnService>,
-    /// Les services interrogés : si la liste des services connectés change,
-    /// la réponse est à refaire.
+    /// Les services qui ont RÉPONDU : si ce n'est pas la liste des services
+    /// connectés (l'un s'est tu, ou la liste a changé), la réponse est à
+    /// refaire, et le disque n'est pas « nulle part ».
     pub services: Vec<String>,
     pub lu_le: i64,
 }
@@ -85,12 +89,8 @@ pub struct Memoire {
     /// Fin de la dernière synchronisation complète.
     pub derniere_synchro: Option<i64>,
     /// Le code de la dernière erreur, effacé par une synchronisation réussie.
+    /// Jamais MusicBrainz : son affinage ne fait pas d'erreur.
     pub derniere_erreur: Option<String>,
-    /// Les disques restés SANS RÉPONSE de MusicBrainz à la dernière
-    /// synchronisation (refus, panne) : revus à la suivante. `0` : rien en
-    /// suspens. `serde(default)` : une mémoire d'avant ce champ se relit.
-    #[serde(default)]
-    pub musicbrainz_manquants: usize,
 }
 
 impl Memoire {
@@ -134,7 +134,6 @@ impl Memoire {
             self.liste_lue_le = None;
             self.derniere_synchro = None;
             self.derniere_erreur = None;
-            self.musicbrainz_manquants = 0;
         }
     }
 

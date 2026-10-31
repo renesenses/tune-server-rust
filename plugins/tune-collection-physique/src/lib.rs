@@ -26,7 +26,7 @@
 //! | `PUT /reglages` | `{nom_utilisateur}` (`null` : oublier le compte) |
 //! | `POST /reglages/identite` | le nom du compte du jeton personnel, retenu |
 //! | `POST /synchroniser` | lance la synchronisation (202) |
-//! | `GET /etat` | l'avancement, la dernière synchronisation, la dernière erreur |
+//! | `GET /etat` | l'avancement (liste, streaming, bibliothèque), l'affinage MusicBrainz `{en_cours, restants}`, la dernière synchronisation, la dernière erreur |
 //! | `GET /collection[?format=&etat=]` | les disques, leur état, les compteurs |
 //! | `GET /cd?mb_release=&code_barre=` | un CD inséré est-il dans la collection, et copié ? |
 //!
@@ -199,6 +199,15 @@ async fn synchroniser(State(etat): State<Etat>) -> Response {
         .into_response()
 }
 
+/// L'affinage MusicBrainz pour l'écran : `{en_cours, restants}`.
+fn affinage(etat: &Etat, a_jour: bool) -> Value {
+    let a = etat.moteur.affinage();
+    json!({
+        "en_cours": a.en_cours,
+        "restants": if a_jour { a.restants } else { 0 },
+    })
+}
+
 async fn lire_etat(State(etat): State<Etat>) -> Response {
     let m = etat.moteur.memoire();
     let nom = nom_suivi(&etat.backend);
@@ -211,7 +220,7 @@ async fn lire_etat(State(etat): State<Etat>) -> Response {
         "liste_lue_le": if a_jour { m.liste_lue_le } else { None },
         "derniere_synchro": if a_jour { m.derniere_synchro } else { None },
         "derniere_erreur": m.derniere_erreur,
-        "musicbrainz_manquants": if a_jour { m.musicbrainz_manquants } else { 0 },
+        "affinage_musicbrainz": affinage(&etat, a_jour),
     }))
     .into_response()
 }
@@ -222,8 +231,8 @@ enum EtatDisque {
     Bibliotheque,
     Streaming,
     NullePart,
-    /// Pas dans la bibliothèque, et les services n'ont pas encore été
-    /// interrogés pour lui : on ne dit pas « nulle part » trop tôt.
+    /// Pas dans la bibliothèque, et les services connectés n'ont pas encore
+    /// TOUS répondu pour lui : on ne dit pas « nulle part » trop tôt.
     AVerifier,
 }
 
@@ -397,7 +406,7 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
         "tronquee": m.tronquee,
         "liste_lue_le": m.liste_lue_le,
         "derniere_synchro": m.derniere_synchro,
-        "musicbrainz_manquants": m.musicbrainz_manquants,
+        "affinage_musicbrainz": affinage(&etat, true),
         "compteurs": {
             "total": m.disques.len(),
             "par_etat": par_etat,
@@ -497,6 +506,7 @@ pub struct CollectionPhysiquePlugin {
     services: HostServices,
     cadence: Cadence,
     tache: Option<tokio::task::JoinHandle<()>>,
+    moteur: Option<Arc<Moteur>>,
 }
 
 impl CollectionPhysiquePlugin {
@@ -505,6 +515,7 @@ impl CollectionPhysiquePlugin {
             services,
             cadence: Cadence::default(),
             tache: None,
+            moteur: None,
         }
     }
 }
@@ -543,7 +554,11 @@ impl TunePlugin for CollectionPhysiquePlugin {
         ));
         ctx.register_router(router(self.services.backend.clone(), moteur.clone()));
         let backend = self.services.backend.clone();
+        self.moteur = Some(moteur.clone());
         self.tache = Some(tokio::spawn(async move {
+            // L'affinage MusicBrainz reprend tout de suite où il s'était
+            // arrêté ; la synchronisation, elle, attend un peu.
+            moteur.lancer_affinage();
             tokio::time::sleep(PREMIERE_SYNCHRO).await;
             loop {
                 if let Some(nom) = nom_suivi(&backend) {
@@ -558,6 +573,9 @@ impl TunePlugin for CollectionPhysiquePlugin {
     async fn teardown(&mut self) -> Result<(), String> {
         if let Some(t) = self.tache.take() {
             t.abort();
+        }
+        if let Some(m) = self.moteur.take() {
+            m.arreter();
         }
         Ok(())
     }
