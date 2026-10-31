@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use tune_core::streaming::StreamingService;
 use tune_core::streaming::qobuz::{QobuzService, RessourceBrute};
 use tune_core::streaming::qobuz_cles_brutes::{
-    FRAGMENTS_NOTABLES, FRAGMENTS_SENSIBLES, arbre_des_cles, chemins_notables,
+    FRAGMENTS_NOTABLES, FRAGMENTS_SENSIBLES, arbre_des_cles, arbre_des_types, chemins_notables,
 };
 
 use crate::auth::RequireAdmin;
@@ -29,6 +29,10 @@ use crate::state::AppState;
 pub struct ParametresClesBrutes {
     pub album_id: Option<String>,
     pub track_id: Option<String>,
+    /// Fiche de label (`label/get`, #7414).
+    pub label_id: Option<String>,
+    /// `albums` : ajoute `extra=albums` à l'appel `label/get`.
+    pub extra: Option<String>,
 }
 
 /// Un identifiant Qobuz plausible : alphanumérique, borné. Refuser le reste
@@ -52,6 +56,18 @@ fn rendre(resultat: Result<Value, Option<u16>>) -> Value {
     }
 }
 
+/// Comme [`rendre`], mais types seulement : aucune valeur, pas même un
+/// booléen (#7414).
+fn rendre_types_seuls(resultat: Result<Value, Option<u16>>) -> Value {
+    match resultat {
+        Ok(document) => json!({
+            "statut": "ok",
+            "arbre": arbre_des_types(&document),
+        }),
+        Err(http) => json!({ "statut": "erreur", "http": http }),
+    }
+}
+
 pub async fn cles_brutes(
     _admin: RequireAdmin,
     State(state): State<AppState>,
@@ -59,7 +75,9 @@ pub async fn cles_brutes(
 ) -> Response {
     let album_id = p.album_id.as_deref().filter(|s| !s.is_empty());
     let track_id = p.track_id.as_deref().filter(|s| !s.is_empty());
-    if album_id.is_none() && track_id.is_none() {
+    let label_id = p.label_id.as_deref().filter(|s| !s.is_empty());
+    let avec_albums = p.extra.as_deref() == Some("albums");
+    if album_id.is_none() && track_id.is_none() && label_id.is_none() {
         return crate::message_api::refus(
             StatusCode::BAD_REQUEST,
             "album_or_track_id_required",
@@ -69,6 +87,10 @@ pub async fn cles_brutes(
     }
     if album_id.is_some_and(|id| !identifiant_valide(id))
         || track_id.is_some_and(|id| !identifiant_valide(id))
+        || label_id.is_some_and(|id| !identifiant_valide(id))
+        || p.extra
+            .as_deref()
+            .is_some_and(|e| !e.is_empty() && e != "albums")
     {
         return crate::message_api::refus(
             StatusCode::BAD_REQUEST,
@@ -105,11 +127,21 @@ pub async fn cles_brutes(
         None => None,
     };
 
+    let label = match label_id {
+        Some(id) => Some(rendre_types_seuls(
+            qobuz
+                .reponse_brute_de_diagnostic(RessourceBrute::Label { id, avec_albums })
+                .await,
+        )),
+        None => None,
+    };
+
     Json(json!({
         "service": "qobuz",
         "session_qobuz_active": session_active,
         "album_id": album_id,
         "track_id": track_id,
+        "label_id": label_id,
         "regle": {
             "valeurs_rendues": "booléens, et clés (ou sous-clés) dont le nom contient un fragment notable",
             "fragments_notables": FRAGMENTS_NOTABLES,
@@ -117,6 +149,7 @@ pub async fn cles_brutes(
         },
         "album": album,
         "track": track,
+        "label": label,
     }))
     .into_response()
 }
@@ -187,6 +220,53 @@ mod tests {
         );
         assert_eq!(
             statut(&app, &format!("{ROUTE}?track_id=../x"), None).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn la_sonde_label_appelle_label_get_avec_les_bons_parametres() {
+        let (chemin, p) = RessourceBrute::Label {
+            id: "9300",
+            avec_albums: false,
+        }
+        .requete();
+        assert_eq!(chemin, "/label/get");
+        assert_eq!(p, vec![("label_id", "9300")]);
+        let (_, p) = RessourceBrute::Label {
+            id: "9300",
+            avec_albums: true,
+        }
+        .requete();
+        assert_eq!(p, vec![("label_id", "9300"), ("extra", "albums")]);
+    }
+
+    #[test]
+    fn la_sortie_label_ne_porte_aucune_valeur() {
+        let doc = json!({ "id": 9300, "name": "FUITE", "ok": true,
+                          "image": { "large": "https://x/FUITE.jpg" } });
+        let sortie = rendre_types_seuls(Ok(doc)).to_string();
+        for interdit in ["FUITE", "9300", "http", "true", "valeurs", "cles_notables"] {
+            assert!(!sortie.contains(interdit), "{interdit} dans {sortie}");
+        }
+        assert!(sortie.contains("\"large\""));
+        // Échec : seul le code HTTP.
+        assert_eq!(
+            rendre_types_seuls(Err(Some(404))),
+            json!({ "statut": "erreur", "http": 404 })
+        );
+    }
+
+    #[tokio::test]
+    async fn la_route_valide_label_id_et_extra() {
+        let app = application(false);
+        let get = |q: &str| format!("{ROUTE}?{q}");
+        assert_eq!(
+            statut(&app, &get("label_id=a%26b"), None).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            statut(&app, &get("label_id=9300&extra=tracks"), None).await,
             StatusCode::BAD_REQUEST
         );
     }
