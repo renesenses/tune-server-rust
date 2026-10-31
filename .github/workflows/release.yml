@@ -501,7 +501,7 @@ jobs:
               || echo "::warning::apt indisponible — airplay-daemon sera absent de cet artefact"
           fi
           if cargo install --git https://github.com/renesenses/airplay2-rs \
-               --rev a7d7ad6637507eaedd61de7461574adfb7b0a987 \
+               --rev 83a7def6ab39d3709fa47a40eb90993b64afe9b4 \
                airplay-daemon --target ${{ matrix.target }} \
                --root "$RUNNER_TEMP/apd" --locked; then
             echo "airplay-daemon built for ${{ matrix.target }}"
