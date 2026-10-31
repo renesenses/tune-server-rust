@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::connect_info::MockConnectInfo;
+use axum::extract::ConnectInfo;
 use axum::http::{Method, Request, StatusCode, header};
 use tower::ServiceExt;
 
@@ -30,9 +30,11 @@ fn enable_auth(state: &AppState) {
     s.set("jwt_secret", "test-jwt-secret").unwrap();
 }
 
-fn app(state: &AppState, pair: &str) -> Router {
-    let pair: SocketAddr = pair.parse().unwrap();
-    tune_server::routes::router(state.clone()).layer(MockConnectInfo(pair))
+/// L'adresse de l'appelant est posée en `ConnectInfo` sur chaque requête,
+/// comme le fait `into_make_service_with_connect_info` : l'exemption DIDL la
+/// lit dans les extensions, pas par l'extracteur.
+fn app(state: &AppState, _pair: &str) -> Router {
+    tune_server::routes::router(state.clone())
 }
 
 async fn appel(
@@ -53,7 +55,10 @@ async fn appel(
         }
         None => Body::empty(),
     };
-    let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+    let mut requete = req.body(body).unwrap();
+    let pair: SocketAddr = LOCAL.parse().unwrap();
+    requete.extensions_mut().insert(ConnectInfo(pair));
+    let resp = app.clone().oneshot(requete).await.unwrap();
     let status = resp.status();
     let octets = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
@@ -68,21 +73,16 @@ async fn sans_authentification_le_relais_ne_sert_que_l_ecoute() {
     let state = new_state();
     let app = app(&state, LOCAL);
 
-    for (m, chemin, corps) in [
+    let refusees: [(Method, &str, Option<&str>); 6] = [
         (Method::GET, "/api/v1/system/config", None),
-        (Method::PATCH, "/api/v1/system/config", Some(r#"{"server_name":"x"}"#)),
+        (Method::PATCH, "/api/v1/system/config", Some(r#"{"server_name":"relaye"}"#)),
         (Method::GET, "/api/v1/system/config/export?include_secrets=true", None),
         (Method::GET, "/api/v1/cloud/bridge/status", None),
         (Method::GET, "/api/v1/auth/config", None),
         (Method::GET, "/api/v1/system/logs", None),
-    ] {
-        let (local, _) = appel(&app, m.clone(), chemin, false, corps).await;
-        assert_ne!(
-            local,
-            StatusCode::FORBIDDEN,
-            "{m} {chemin} sans relais devait répondre (témoin)"
-        );
-        let (relaye, corps_rep) = appel(&app, m.clone(), chemin, true, corps).await;
+    ];
+    for (m, chemin, corps) in &refusees {
+        let (relaye, corps_rep) = appel(&app, m.clone(), chemin, true, *corps).await;
         assert_eq!(
             relaye,
             StatusCode::FORBIDDEN,
@@ -95,7 +95,18 @@ async fn sans_authentification_le_relais_ne_sert_que_l_ecoute() {
     let nom = SettingsRepo::with_backend(state.backend.clone())
         .get("server_name")
         .unwrap();
-    assert_ne!(nom.as_deref(), Some("x"), "le PATCH relayé a écrit");
+    assert_ne!(nom.as_deref(), Some("relaye"), "le PATCH relayé a écrit");
+
+    // Témoins : sans l'en-tête, depuis 127.0.0.1, les mêmes routes répondent.
+    for (m, chemin, corps) in &refusees {
+        let corps = corps.map(|_| r#"{"server_name":"local"}"#);
+        let (local, _) = appel(&app, m.clone(), chemin, false, corps).await;
+        assert_ne!(
+            local,
+            StatusCode::FORBIDDEN,
+            "{m} {chemin} sans relais devait répondre (témoin)"
+        );
+    }
 
     for chemin in [
         "/api/v1/library/albums",
