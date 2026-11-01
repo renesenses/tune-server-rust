@@ -742,3 +742,8 @@ mod preparation_bornee_5970;
 /// le `SetNext` : la règle s'apprend, et la piste suivante part sans `SetNext`.
 #[cfg(test)]
 mod set_next_coupe_la_piste_6477;
+
+/// #6910 (fil 2412) — le suivant DSD armé sur le renderer DLNA qui annonce le
+/// DSD et `SetNext` ; la garde de #402 gardée pour les autres.
+#[cfg(test)]
+mod dsd_suivant_dlna_6910;

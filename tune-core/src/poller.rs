@@ -571,6 +571,11 @@ pub struct PositionPoller {
     /// piste relance aussitôt. Vit le temps du processus, HORS de
     /// ZonePollState, que chaque relance recrée.
     appareils_qui_ignorent_next: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// #6910 — zones dont le dernier suivant armé est un DSD sur un renderer
+    /// DLNA (zone → appareil). Si ce suivant n'est pas suivi
+    /// (`StuckForceEnd`), l'appareil est retenu par l'orchestrateur et la
+    /// garde de #402 lui est rendue.
+    dsd_suivant_arme: std::sync::Mutex<std::collections::HashMap<i64, String>>,
     /// #4382 — fins de piste établies par le guet de la dernière seconde
     /// (`sondage_accelere_4382`), par zone. Partagée avec les guetteurs.
     fins_precises: sondage_accelere_4382::FinsPrecises,
@@ -644,6 +649,7 @@ impl PositionPoller {
             shared_metrics,
             event_bus: None,
             appareils_qui_ignorent_next: std::sync::Mutex::new(std::collections::HashSet::new()),
+            dsd_suivant_arme: std::sync::Mutex::new(std::collections::HashMap::new()),
             fins_precises: Default::default(),
             relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
             reprises_renderer_cale: Mutex::new(std::collections::HashMap::new()),

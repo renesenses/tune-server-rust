@@ -4300,6 +4300,15 @@ impl PositionPoller {
                         .unwrap_or(""),
                     "track_end_gap"
                 );
+                // #6910 — la fin de piste arrive ici alors qu'une suivante
+                // était armée (ou que son avance s'est bloquée) : le renderer
+                // n'y est pas passé de lui-même. Si c'était un suivant DSD sur
+                // DLNA, il retrouve la garde de #402.
+                if etat.is_some_and(|p| p.gapless_sent)
+                    || motif_fin_de_piste == decisions::motif_fin::AVANCE_GAPLESS_BLOQUEE
+                {
+                    self.constater_le_suivant_non_suivi(zone_id);
+                }
                 poll_states.remove(&zone_id);
                 self.handle_track_end(zone_id, zone_state).await;
             }
