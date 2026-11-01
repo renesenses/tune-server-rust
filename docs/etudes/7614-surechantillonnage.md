@@ -1,6 +1,6 @@
 # Étude #7614 — greffon de suréchantillonnage haute qualité (rc11)
 
-Claude - Mozaiklabs, 31 octobre – 1er novembre 2026. Branche
+Claude - Mozaiklabs, 31 octobre – 1er novembre 2026. **État : livraison anticipée, § 6 (mesures) à compléter.** Branche
 `etude/7614-surechantillonnage-b209` (base `batch/bugs-rc10-20261030`).
 Prototype : `plugins/tune-surechantillonnage/` (crate autonome, hors serveur).
 Mesures reproductibles : `cargo run --release --bin banc` dans la crate ;
@@ -202,11 +202,35 @@ relancera le test (changement de machine, de gouverneur CPU).
 
 ## 6. Mesures
 
-Les mesures ci-dessous sont celles du banc exécuté sur Shrek ; voir
-`banc/resume.md` et les CSV/SVG produits. Elles sont reportées ici au moment
-de la rédaction et resteront à rejouer sur la machine cible.
+**À compléter.** Au moment de cette livraison (1er novembre, demandée
+avant l'échéance), le banc n'a pas encore tourné : la compilation de la crate
+sur Shrek attend l'admission du garde de stockage (48 Gio de RAM disponible
+requis ; 28 puis 36 Gio constatés). Aucun chiffre mesuré n'est donc reporté
+ici ; les valeurs des § 3 et 4 sont les valeurs **de conception** (modèle
+gaussien, formules de Kaiser, intégrales des NTF), que les gabarits de
+`tests/gabarits.rs` verrouillent et que le banc doit confirmer.
 
-{{MESURES}}
+Ce qui sera produit par `cargo run --release --bin banc` et reporté ici :
+
+- par conception et pour 44,1 → 352,8, 48 → 384 et 44,1 → 384 : −0,1 / −3 /
+  −6 dB, ondulation ≤ 20 kHz, atténuation à Nyquist, au-delà de Nyquist et
+  au-delà de 1,5 Nyquist, rejet des images par balayage 20 Hz–20 kHz, THD+N
+  (20 Hz–20 kHz et jusqu'à vers/2), latence théorique, au pic et à mi-énergie,
+  MAC par trame, mémoire des phases (`resume.md`, `reponse_*.csv/svg`,
+  `impulsion_*.csv/svg`, `balayage_*.csv`, `reponses_comparees_441_3528.svg`,
+  `transition_comparee_441_3528.svg`) ;
+- par formeur, à 44,1 et 352,8 kHz, 16 bits : gain total théorique, bruit
+  total, bruit 20 Hz–20 kHz, bruit pondéré Terhardt (`ntf_*.csv/svg`,
+  `bruit_*.csv/svg`) ;
+- le test de la machine sur Shrek (Xeon E5-2630 v4, AVX2+FMA) pour les six
+  couples (`machine.csv`).
+
+Attendus de conception à confirmer : polyvalent −0,1 dB ≈ 20,0 kHz et
+≥ 120 dB à Nyquist ; précision ≥ 145 dB au-delà de Nyquist, ondulation
+< 10⁻³ dB ; résolution −6 dB à Nyquist, −3 dB ≈ 21,2 kHz, ≥ 100 dB au-delà de
+33 kHz ; TPDF 16 bits à −96,3 dBFS ; `wannamaker9f` ≥ 10 dB de gain pondéré à
+44,1 kHz ; binomiaux d'ordre 2 et 4 ≈ 25 et 45 dB de gain 20 Hz–20 kHz à
+352,8 kHz ; THD+N 24 bits TPDF ≈ −150 dB.
 
 ## 7. Intégration proposée
 
