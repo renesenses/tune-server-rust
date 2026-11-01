@@ -238,7 +238,7 @@ async fn demo_library(
 ///
 /// Le JSON de la Bibliothèque, lui, reste compressé : c'est l'essentiel du
 /// poids d'une page d'albums.
-pub(crate) fn predicat_de_compression() -> impl tower_http::compression::Predicate + Clone {
+pub(crate) fn predicat_de_compression() -> impl tower_http::compression::Predicate {
     use tower_http::compression::Predicate;
     use tower_http::compression::predicate::{DefaultPredicate, NotForContentType};
     DefaultPredicate::new()
