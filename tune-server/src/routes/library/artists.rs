@@ -42,39 +42,71 @@ pub(crate) struct ArtisteVue {
 /// l'écran de fusion (C3). Rien n'est fusionné : les homonymes existent, et
 /// deux fiches aux MBID différents sont peut-être deux artistes — le rapport
 /// le dit (`mbid_distincts`). Le plus ancien d'abord dans chaque groupe.
+///
+/// #7535 — s'y ajoutent les fiches qui portent le MÊME MBID sous deux noms
+/// de clés différentes (« Phil Selway » / « Philip Selway », un MBID trouvé
+/// par le nom avant que [`ArtistRepo::poser_mbid`] ne le refuse) : groupe de
+/// clé `mbid:<MBID>`, `motif` `mbid`. Un MBID partagé par des fiches d'une
+/// seule clé est déjà dans le groupe de graphie (`motif` `graphie`). Rien
+/// n'est fusionné : l'utilisateur tranche par la même route d'absorption.
 pub(crate) fn grouper_les_artistes_homographes(artistes: &[ArtisteVue]) -> Vec<Value> {
     use std::collections::{BTreeMap, BTreeSet};
+    use tune_core::db::artist_repo::cle_artiste;
+    fn groupe(cle: String, motif: &str, mut v: Vec<&ArtisteVue>) -> Value {
+        v.sort_by_key(|a| a.id);
+        let mbids: BTreeSet<String> = v
+            .iter()
+            .filter_map(|a| a.musicbrainz_id.as_deref())
+            .map(|m| m.trim().to_lowercase())
+            .filter(|m| !m.is_empty())
+            .collect();
+        json!({
+            "cle": cle,
+            "motif": motif,
+            "mbid_distincts": mbids.len() > 1,
+            "albums": v.iter().map(|a| a.albums).sum::<i64>(),
+            "artistes": v.iter().map(|a| json!({
+                "id": a.id,
+                "name": a.name,
+                "musicbrainz_id": a.musicbrainz_id,
+                "albums": a.albums,
+            })).collect::<Vec<_>>(),
+        })
+    }
     let mut par_cle: BTreeMap<String, Vec<&ArtisteVue>> = BTreeMap::new();
+    let mut par_mbid: BTreeMap<String, Vec<&ArtisteVue>> = BTreeMap::new();
     for a in artistes {
-        let cle = tune_core::db::artist_repo::cle_artiste(&a.name);
+        let cle = cle_artiste(&a.name);
         if cle.is_empty() {
             continue;
         }
         par_cle.entry(cle).or_default().push(a);
+        if let Some(m) = a
+            .musicbrainz_id
+            .as_deref()
+            .map(|m| m.trim().to_lowercase())
+            .filter(|m| !m.is_empty())
+        {
+            par_mbid.entry(m).or_default().push(a);
+        }
     }
     let mut groupes: Vec<Value> = par_cle
         .into_iter()
         .filter(|(_, v)| v.len() >= 2)
-        .map(|(cle, mut v)| {
-            v.sort_by_key(|a| a.id);
-            let mbids: BTreeSet<&str> = v
-                .iter()
-                .filter_map(|a| a.musicbrainz_id.as_deref())
-                .filter(|m| !m.trim().is_empty())
-                .collect();
-            json!({
-                "cle": cle,
-                "mbid_distincts": mbids.len() > 1,
-                "albums": v.iter().map(|a| a.albums).sum::<i64>(),
-                "artistes": v.iter().map(|a| json!({
-                    "id": a.id,
-                    "name": a.name,
-                    "musicbrainz_id": a.musicbrainz_id,
-                    "albums": a.albums,
-                })).collect::<Vec<_>>(),
-            })
-        })
+        .map(|(cle, v)| groupe(cle, "graphie", v))
         .collect();
+    groupes.extend(
+        par_mbid
+            .into_iter()
+            .filter(|(_, v)| {
+                v.iter()
+                    .map(|a| cle_artiste(&a.name))
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    >= 2
+            })
+            .map(|(mbid, v)| groupe(format!("mbid:{mbid}"), "mbid", v)),
+    );
     // Les plus sûrs d'abord (MBID non contradictoires), puis les plus fournis.
     groupes.sort_by(|x, y| {
         let sx = (
@@ -95,7 +127,7 @@ pub(crate) fn grouper_les_artistes_homographes(artistes: &[ArtisteVue]) -> Vec<V
 ///
 /// La phase 0 (`GET /library/artists/doublons`) nomme les groupes de même
 /// clé (`cle_artiste`). Ici l'utilisateur tranche, un couple à la fois, et le
-/// serveur vérifie : même clé, pas deux MBID différents (le drapeau
+/// serveur vérifie : même clé (ou, #7535, même MBID), pas deux MBID différents (le drapeau
 /// `mbid_distincts` de la phase 0), aucun des deux n'est l'artiste inconnu.
 /// Le survivant est celui que l'URL nomme `cible` — l'écran propose le plus
 /// ancien, comme la liste de la phase 0. Rien n'est automatique.
@@ -132,7 +164,22 @@ pub(super) async fn absorber_artiste(
                 .to_string(),
         );
     }
-    if cle_artiste(&artiste_cible.name) != cle_artiste(&artiste_doublon.name) {
+    // #7535 — deux noms de clés différentes passent s'ils portent le MÊME
+    // MBID (le groupe `mbid:` de la liste) : l'utilisateur l'a vu et tranche.
+    let meme_mbid = |a: &Option<String>, b: &Option<String>| {
+        let n = |m: &Option<String>| {
+            m.as_deref()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+        };
+        n(a).is_some() && n(a) == n(b)
+    };
+    if cle_artiste(&artiste_cible.name) != cle_artiste(&artiste_doublon.name)
+        && !meme_mbid(
+            &artiste_cible.musicbrainz_id,
+            &artiste_doublon.musicbrainz_id,
+        )
+    {
         return super::refus(
             StatusCode::CONFLICT,
             "cles_differentes",
@@ -1786,6 +1833,34 @@ mod tests_artistes_homographes {
             })
             .collect();
         assert!(!ids.contains(&60) && !ids.contains(&70));
+        assert!(g.iter().all(|x| x["motif"] == "graphie"));
+    }
+
+    /// #7535 : deux noms de clés différentes qui portent le même MBID
+    /// (casse et blancs à part) forment un groupe `mbid:`, proposé à la
+    /// fusion. Contre-épreuves : deux MBID différents ne groupent rien, et
+    /// un MBID partagé sous UNE clé reste dans son seul groupe de graphie.
+    #[test]
+    fn deux_noms_d_un_meme_mbid_sont_proposes_7535() {
+        let artistes = vec![
+            a(7, "Philip Selway", Some("mb-selway"), 16),
+            a(90, "Phil Selway", Some(" MB-SELWAY "), 1),
+            a(20, "Thom Yorke", Some("mb-yorke"), 5),
+            a(21, "Thomas Yorke", Some("mb-autre"), 1),
+            a(30, "Ayo", Some("mb-ayo"), 2),
+            a(31, "Ayọ", Some("mb-ayo"), 1),
+        ];
+        let g = grouper_les_artistes_homographes(&artistes);
+        assert_eq!(g.len(), 2, "{g:#?}");
+        let selway: Vec<&serde_json::Value> = g.iter().filter(|x| x["motif"] == "mbid").collect();
+        assert_eq!(selway.len(), 1, "{g:#?}");
+        assert_eq!(selway[0]["cle"], "mbid:mb-selway");
+        assert_eq!(selway[0]["mbid_distincts"], false);
+        assert_eq!(selway[0]["artistes"][0]["id"], 7, "le plus ancien d'abord");
+        assert_eq!(selway[0]["artistes"][1]["id"], 90);
+        let ayo: Vec<&serde_json::Value> = g.iter().filter(|x| x["cle"] == "ayo").collect();
+        assert_eq!(ayo.len(), 1);
+        assert_eq!(ayo[0]["motif"], "graphie");
     }
 }
 
