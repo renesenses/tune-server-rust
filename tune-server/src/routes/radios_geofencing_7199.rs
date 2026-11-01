@@ -89,21 +89,31 @@ pub(super) fn select_stream(
     } else {
         fiche.flux.clone()
     };
+    let choisi = |f: &FluxAnnuaire| {
+        preferred.is_some_and(|p| super::flux_normalise(p) == super::flux_normalise(&f.url))
+    };
     streams
         .into_iter()
         .rev()
         .filter(|f| {
             f.restricted_to_countries.is_empty()
-                || country.as_deref().is_some_and(|c| {
-                    f.restricted_to_countries
+                || match country.as_deref() {
+                    Some(c) => f
+                        .restricted_to_countries
                         .iter()
-                        .any(|allowed| allowed.eq_ignore_ascii_case(c))
-                })
+                        .any(|allowed| allowed.eq_ignore_ascii_case(c)),
+                    // #7658/#7660 : pays d'écoute non renseigné. Le flux que
+                    // l'auditeur a choisi lui-même reste le sien : on ne le
+                    // remplace pas en silence par le seul flux sans
+                    // restriction (BBC : « nonuk » HE-AAC 96 kbit/s au lieu
+                    // du 320 kbit/s choisi). S'il est vraiment bloqué chez
+                    // lui, la lecture échoue et il en choisit un autre.
+                    None => choisi(f) && !f.restricted_to_countries.iter().any(|c| c == "invalid"),
+                }
         })
         .max_by_key(|f| {
             (
-                preferred
-                    .is_some_and(|p| super::flux_normalise(p) == super::flux_normalise(&f.url)),
+                choisi(f),
                 f.primary,
                 f.codec.as_deref().is_some_and(|c| {
                     c.eq_ignore_ascii_case("flac") || c.eq_ignore_ascii_case("alac")
