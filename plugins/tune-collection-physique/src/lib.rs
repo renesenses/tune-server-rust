@@ -553,7 +553,7 @@ async fn pochette(
         ),
         (
             header::ETAG,
-            HeaderValue::from_str(&tag).unwrap_or(HeaderValue::from_static("\"0\"")),
+            HeaderValue::from_str(&tag).unwrap_or_else(|_| HeaderValue::from_static("\"0\"")),
         ),
     ];
     let deja = entetes

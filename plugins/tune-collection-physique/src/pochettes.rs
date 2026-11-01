@@ -181,14 +181,14 @@ impl Moteur {
             let url = self.source_de_la_pochette(release)?;
             self.telecharger(release, &url).await.ok()?;
         }
-        match taille {
-            Taille::Vignette => Some(self.pochettes.chemin_vignette(release)),
+        let chemin = match taille {
+            Taille::Vignette => self.pochettes.chemin_vignette(release),
             Taille::Originale => self
                 .pochettes
                 .chemin_originale(release)
-                .or_else(|| Some(self.pochettes.chemin_vignette(release))),
-        }
-        .filter(|p| p.is_file())
+                .unwrap_or_else(|| self.pochettes.chemin_vignette(release)),
+        };
+        chemin.is_file().then_some(chemin)
     }
 
     /// Télécharge et range UNE pochette, par la file, avec le recul d'un

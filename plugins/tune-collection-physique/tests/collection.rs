@@ -1297,7 +1297,7 @@ async fn les_pochettes_reprennent_apres_un_redemarrage() {
             .iter()
             .filter(|a| **a == format!("image {}", pochette_essai(r)))
             .count();
-        assert!(n >= 1 && n <= 2, "{r} : {n}");
+        assert!((1..=2).contains(&n), "{r} : {n}");
     }
     // Contre-épreuve : la même reprise sur un dossier VIDE retélécharge tout.
     let vide = tempfile::tempdir().unwrap();
