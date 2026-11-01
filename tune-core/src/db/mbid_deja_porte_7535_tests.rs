@@ -16,6 +16,7 @@ use super::artist_repo::{ArtistRepo, ProvenanceMbid};
 use super::backend::DbBackend;
 
 const PHILIP: &str = "a2d6f6d8-6a3c-4ec7-9b8d-3c6a0e9f7535";
+const LIBRE: &str = "0b0b0b0b-1111-2222-3333-444444447535";
 
 fn mbid(repo: &ArtistRepo, id: i64) -> Option<String> {
     repo.get(id).unwrap().and_then(|a| a.musicbrainz_id)
@@ -66,9 +67,8 @@ fn scenario(repo: &ArtistRepo) {
             .unwrap()
     );
     assert_eq!(repo.autre_fiche_du_mbid(philip, PHILIP).unwrap(), None);
-    let libre = "0b0b0b0b-1111-2222-3333-444444447535";
-    assert!(repo.poser_mbid(phil, libre, ProvenanceMbid::Nom).unwrap());
-    assert_eq!(mbid(repo, phil).as_deref(), Some(libre));
+    assert!(repo.poser_mbid(phil, LIBRE, ProvenanceMbid::Nom).unwrap());
+    assert_eq!(mbid(repo, phil).as_deref(), Some(LIBRE));
     // Un MBID vide reste une absence, il ne « rencontre » personne.
     let gong = repo.get_or_create("Gong", None, None).unwrap().id.unwrap();
     repo.update_mbid(gong, "   ").unwrap();
@@ -84,58 +84,39 @@ fn un_mbid_trouve_par_le_nom_deja_porte_n_est_pas_pose_sqlite() {
     scenario(&ArtistRepo::with_backend(b));
 }
 
-/// La même garde sur PostgreSQL (`TUNE_TEST_PG_URL`) : `$4`/`$5` et le
-/// `CAST(... AS TEXT)` de la garde. Dans un schéma à lui : le banc
-/// PostgreSQL est partagé. SAUT sans URL.
+/// La même garde sur PostgreSQL (`TUNE_TEST_PG_URL`, schéma des scripts
+/// numérotés, comme `pg_6463`) : `$4`/`$5` et le `CAST(... AS TEXT)` de la
+/// garde. Le banc est partagé : seules les fiches et les MBID du scénario
+/// sont effacés avant. SAUT sans URL.
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_un_mbid_trouve_par_le_nom_deja_porte_n_est_pas_pose() {
+    use super::backend::ToSqlValue;
     let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
         eprintln!("SAUT : TUNE_TEST_PG_URL non posée");
         return;
     };
-    const SCHEMA: &str = "mbid_deja_porte_7535";
-    let maintenance = sqlx::PgPool::connect(&url)
+    let pool = sqlx::PgPool::connect(&url)
         .await
         .unwrap_or_else(|e| panic!("TUNE_TEST_PG_URL posée ({url}) mais injoignable : {e}"));
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "DROP SCHEMA IF EXISTS {SCHEMA} CASCADE; CREATE SCHEMA {SCHEMA}"
-    )))
-    .execute(&maintenance)
-    .await
-    .unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .after_connect(|c, _| {
-            Box::pin(async move {
-                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET search_path TO {SCHEMA}")))
-                    .execute(c)
-                    .await
-                    .map(|_| ())
-            })
-        })
-        .connect(&url)
-        .await
-        .unwrap();
-    sqlx::raw_sql(include_str!(
-        "../../migrations/postgres/001_initial_schema.sql"
-    ))
-    .execute(&pool)
-    .await
-    .unwrap();
-    let b: Arc<dyn DbBackend> = Arc::new(super::backend::PostgresBackend::new(pool.clone()));
+    let b: Arc<dyn DbBackend> = Arc::new(super::backend::PostgresBackend::new(pool));
     for sql in super::postgres::ENSURE_TABLES
         .iter()
         .chain(super::postgres::ENSURE_COLUMNS.iter())
     {
         let _ = b.execute(sql, &[]);
     }
-    scenario(&ArtistRepo::with_backend(b));
-    pool.close().await;
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"
-    )))
-    .execute(&maintenance)
-    .await
+    for nom in ["Philip Selway", "Phil Selway", "Gong"] {
+        b.execute(
+            "DELETE FROM artists WHERE name = $1",
+            &[&nom as &dyn ToSqlValue],
+        )
+        .unwrap();
+    }
+    b.execute(
+        "DELETE FROM artists WHERE LOWER(musicbrainz_id) IN ($1, $2)",
+        &[&PHILIP as &dyn ToSqlValue, &LIBRE],
+    )
     .unwrap();
+    scenario(&ArtistRepo::with_backend(b));
 }
