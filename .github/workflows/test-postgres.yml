@@ -259,6 +259,13 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_6463 -- --nocapture --test-threads=1
 
+      # #7535 : un MBID trouvé par le nom n'est plus posé s'il est déjà porté
+      # par une autre fiche (garde NOT EXISTS de poser_mbid, $4/$5).
+      - name: MBID déjà porté refusé sur PostgreSQL (#7535)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_un_mbid_trouve_par_le_nom_deja_porte -- --nocapture --test-threads=1
+
       - name: Provenance du DR album sur PostgreSQL (#3924)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
