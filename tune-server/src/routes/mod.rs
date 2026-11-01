@@ -130,7 +130,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::state::AppState;
@@ -773,7 +772,11 @@ pub fn router_with_plugins(
     .layer(axum::middleware::from_fn(cache_control_middleware))
     .layer(axum::Extension(contexte_sendspin))
     .layer(CompressionLayer::new().compress_when(predicat_de_compression()))
-    .layer(CorsLayer::permissive())
+    // Contrôle d'origine (`crate::garde_origine`) : une page d'un autre site
+    // ne peut ni changer l'état du serveur, ni lire ses réponses. La couche
+    // CORS est la plus externe : elle répond seule aux préflights.
+    .layer(axum::middleware::from_fn(crate::garde_origine::garde))
+    .layer(crate::garde_origine::couche_cors())
 }
 
 #[cfg(test)]
