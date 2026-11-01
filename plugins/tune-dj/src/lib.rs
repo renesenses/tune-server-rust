@@ -73,12 +73,16 @@ impl TunePlugin for DjPlugin {
         false
     }
 
-    // Catalogué (rc11, décision de Bertrand du 01/11/2026). #2090 l'avait retiré
-    // du gestionnaire faute d'écran pour l'atteindre ; il y revient avec sa case
-    // dans Réglages › Extensions (`POST /plugins/dj/install`, `DELETE
-    // /plugins/dj`, même mécanisme que les autres opt-in). Dormant tant que
-    // `plugin_dj_installed` n'est pas posé ; le redémarrage est annoncé par
-    // `restart_required`.
+    // Hors catalogue (#2090), rétabli le 01/11/2026 sur décision de Bertrand :
+    // DJ reste en brouillon tant qu'il ne fait pas vraiment quelque chose.
+    // Sur les 13 routes, 11 sont inopérantes (elles renvoient l'argument reçu,
+    // ou `dj_enabled_{zone}` que personne d'autre ne lit) ; seules `waveform`
+    // et `analyze` travaillent. Le greffon reste compilé, testé et chargeable
+    // en posant `plugin_dj_installed=true` à la main, mais le gestionnaire ne
+    // le propose pas. À rebasculer à `true` quand les platines existent.
+    fn catalogued(&self) -> bool {
+        false
+    }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
         ctx.register_router(router(self.backend.clone()));

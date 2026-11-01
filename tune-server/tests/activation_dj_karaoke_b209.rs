@@ -1,4 +1,4 @@
-//! rc11 (Bertrand, 01/11/2026) — DJ et Karaoké s'activent depuis Réglages ›
+//! rc11 (Bertrand, 01/11/2026) — Karaoké s'active depuis Réglages ›
 //! Extensions, par les routes ordinaires des greffons (`POST
 //! /plugins/{id}/install`, `DELETE /plugins/{id}`), exactement comme les autres
 //! opt-in. Avant, ils étaient hors catalogue (#2090) : la liste ne les
@@ -16,7 +16,7 @@ use tune_server::state::AppState;
 
 use crate::use_scratch_plugin_data_dir;
 
-const IDS: [&str; 2] = ["dj", "karaoke"];
+const IDS: [&str; 1] = ["karaoke"];
 
 fn new_state() -> AppState {
     use_scratch_plugin_data_dir();
@@ -60,7 +60,7 @@ async fn fiche(app: &axum::Router, id: &str) -> Option<Value> {
 }
 
 #[tokio::test]
-async fn dj_et_karaoke_sont_proposes_non_installes() {
+async fn karaoke_est_propose_non_installe() {
     let state = new_state();
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
     let app = tune_server::routes::router(state.clone());
@@ -157,4 +157,32 @@ async fn l_installation_decide_du_chargement_avec_contre_epreuve() {
             "décoché : plus chargé"
         );
     }
+}
+
+/// DJ reste en brouillon (décision du 01/11/2026) : 11 routes sur 13 sont
+/// inopérantes. Il n'est pas proposé, mais l'installation à la main le charge
+/// encore (#2090). Contre-épreuve : Karaoké, lui, est bien proposé.
+#[tokio::test]
+async fn dj_n_est_pas_propose_mais_se_charge_a_la_main() {
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+    let app = tune_server::routes::router(state.clone());
+    assert!(
+        fiche(&app, "dj").await.is_none(),
+        "DJ ne doit pas figurer au catalogue"
+    );
+    assert!(
+        fiche(&app, "karaoke").await.is_some(),
+        "contre-épreuve : Karaoké est proposé"
+    );
+
+    let main = new_state();
+    SettingsRepo::with_backend(main.backend.clone())
+        .set("plugin_dj_installed", "true")
+        .unwrap();
+    let routeurs = tune_server::plugins::init(&main, "http://127.0.0.1:0", vec![]).await;
+    assert!(
+        routeurs.iter().any(|(n, _)| n == "dj"),
+        "chargé si posé à la main"
+    );
 }
