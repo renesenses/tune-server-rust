@@ -72,7 +72,7 @@ pub const PLAFOND_COMBLEMENT_EN_LIGNE: i64 = 5_000;
 
 /// Un rafraîchissement COMPLET des clés (renommages) au plus une fois par
 /// cet intervalle, et seulement si la base a changé.
-pub const INTERVALLE_RAFRAICHISSEMENT_COMPLET: Duration = Duration::from_secs(120);
+pub const INTERVALLE_RAFRAICHISSEMENT_COMPLET: Duration = Duration::from_secs(300);
 
 /// Les écritures se font par lots : une transaction courte laisse passer
 /// les autres écrivains (le scan, la file) entre deux lots.
@@ -185,16 +185,30 @@ impl TrackRepo {
         if a_ecrire.is_empty() {
             return Ok(0);
         }
-        let mut ph = Placeholders::new(self.db.engine());
-        let maj = format!(
-            "UPDATE tracks SET cle_tri = {} WHERE id = {}",
-            ph.take(),
-            ph.take()
-        );
+        // 500 clés par instruction : `UPDATE … FROM (VALUES …)`, même texte
+        // sur les deux moteurs (les colonnes d'un VALUES s'y nomment
+        // `column1`, `column2`). Une instruction par piste coûtait 28 s pour
+        // les 96 496 pistes du .18 au premier démarrage.
+        const PAR_INSTRUCTION: usize = 500;
+        let engine = self.db.engine();
         for lot in a_ecrire.chunks(LOT_D_ECRITURE) {
             self.db.write_tx(&mut |tx| {
-                for (id, cle) in lot {
-                    tx.execute(&maj, &[cle as &dyn ToSqlValue, id])?;
+                for paquet in lot.chunks(PAR_INSTRUCTION) {
+                    let mut ph = Placeholders::new(engine);
+                    let lignes: Vec<String> = paquet
+                        .iter()
+                        .map(|_| format!("({}, {})", ph.take(), ph.take()))
+                        .collect();
+                    let sql = format!(
+                        "UPDATE tracks SET cle_tri = v.column2 FROM (VALUES {}) AS v \
+                         WHERE tracks.id = v.column1",
+                        lignes.join(", ")
+                    );
+                    let params: Vec<&dyn ToSqlValue> = paquet
+                        .iter()
+                        .flat_map(|(id, cle)| [id as &dyn ToSqlValue, cle as &dyn ToSqlValue])
+                        .collect();
+                    tx.execute(&sql, &params)?;
                 }
                 Ok(())
             })?;
