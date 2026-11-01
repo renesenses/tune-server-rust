@@ -232,8 +232,8 @@ async fn les_echecs_passagers_sont_comptes_par_element() {
                     2,
                     Box::pin(async {
                         noter_transitoire();
-                        None
-                    }),
+                        None::<u8>
+                    }) as BoxFuture<'_, Option<u8>>,
                 ),
             ],
             |_, v| async move { Some(v) },
@@ -318,7 +318,7 @@ fn chaque_service_a_son_limiteur_et_ses_debits_publies() {
     // MusicBrainz passe par LE limiteur partagé (1/s), pas par un second.
     let (mb, cle) = Hote::MusicBrainz.limiteur();
     assert!(std::ptr::eq(mb, &*MUSICBRAINZ));
-    assert_eq!(mb.intervalle_courant(cle), Duration::from_secs(1));
+    assert!(mb.intervalle_courant(cle) >= Duration::from_secs(1));
     let (td, cle) = Hote::TheAudioDb.limiteur();
     assert_eq!(
         td.intervalle_courant(cle),

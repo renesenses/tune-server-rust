@@ -109,7 +109,7 @@ static PORTES_PAR_HOTE: LazyLock<Vec<Semaphore>> = LazyLock::new(|| {
         .map(|_| Semaphore::new(REQUETES_PAR_HOTE))
         .collect()
 });
-static PORTE_GLOBALE: Semaphore = Semaphore::const_new(PLAFOND_GLOBAL);
+static PORTE_GLOBALE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(PLAFOND_GLOBAL));
 
 /// Échecs passagers (réseau, `429`, `5xx`) depuis le démarrage.
 pub static ECHECS_TRANSITOIRES: AtomicU64 = AtomicU64::new(0);
