@@ -17,7 +17,7 @@ use super::facettes_lentes_2144_tests::{Profil, remplir};
 use crate::state::AppState;
 
 async fn get(state: &AppState, chemin: &str) -> (u16, Value) {
-    let r = super::super::router()
+    let r = super::router()
         .with_state(state.clone())
         .oneshot(Request::get(chemin).body(Body::empty()).unwrap())
         .await
