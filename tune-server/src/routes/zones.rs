@@ -1684,6 +1684,9 @@ mod signal_path_reaffectation_6044_tests;
 // #5633 — PURE ignore le ReplayGain, et le chemin du signal le dit.
 #[cfg(test)]
 mod signal_path_pure_replaygain_5633_tests;
+// #7632 — l'étape « Correction de pièce » dit si la RI de la zone est appliquée.
+#[cfg(test)]
+mod signal_path_correction_piece_7632_tests;
 
 // #4384 — ReplayGain sans gain tagué, et où le gain s'applique.
 #[cfg(test)]
