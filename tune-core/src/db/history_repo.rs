@@ -116,19 +116,33 @@ pub mod sql {
             // (« column "t.id" must appear in the GROUP BY clause ») et la
             // liste revenait vide sur toute base PG (chasse PG du 25/09/2026,
             // `tune-server/tests/pg_group_by_strict_historique.rs`).
-            "SELECT h.title, h.artist_name, COUNT(*) as plays, \
-             COALESCE(MAX(t.id), MAX(t3.id), MAX(h.track_id)) as track_id, \
-             COALESCE(MAX(al.cover_path), MAX(al2.cover_path), MAX(h.cover_url)) as cover_path, \
-             COALESCE(MAX(al.title), MAX(h.album_title)) as album_title, \
-             MAX(h.source) \
-             FROM listen_history h \
-             LEFT JOIN tracks t ON h.track_id = t.id \
-             LEFT JOIN tracks t3 ON t3.title = h.title \
-             LEFT JOIN albums al ON t.album_id = al.id \
-             LEFT JOIN albums al2 ON al2.title = h.album_title AND al2.cover_path IS NOT NULL \
-             WHERE h.source != 'radio' \
-             GROUP BY h.title, h.artist_name \
-             ORDER BY plays DESC LIMIT {}",
+            // #7619 / #7634 : le compte se fait sur `listen_history` SEUL, une
+            // écoute = une ligne. L'ancienne requête comptait `COUNT(*)` APRÈS
+            // `LEFT JOIN tracks t3 ON t3.title = h.title` (autant de lignes
+            // que de pistes homonymes) et `LEFT JOIN albums al2 ON al2.title =
+            // h.album_title` (autant que d'albums homonymes) : chaque écoute
+            // était multipliée. Les rapprochements (piste, pochette, album)
+            // se font maintenant APRÈS le regroupement, en sous-requêtes
+            // scalaires (`MAX`), qui rendent au plus une valeur par groupe.
+            "WITH g AS (SELECT h.title AS title, h.artist_name AS artist_name, \
+                    COUNT(*) AS plays, MAX(h.track_id) AS tid, \
+                    MAX(h.album_title) AS alb, MAX(h.cover_url) AS cu, MAX(h.source) AS src \
+                    FROM listen_history h WHERE h.source != 'radio' \
+                    GROUP BY h.title, h.artist_name) \
+             SELECT g.title, g.artist_name, g.plays, \
+             COALESCE((SELECT MAX(t.id) FROM tracks t WHERE t.id = g.tid), \
+                      (SELECT MAX(t3.id) FROM tracks t3 WHERE t3.title = g.title), g.tid) AS track_id, \
+             COALESCE((SELECT MAX(al.cover_path) FROM albums al \
+                          JOIN tracks t ON t.album_id = al.id WHERE t.id = g.tid), \
+                      (SELECT MAX(al2.cover_path) FROM albums al2 \
+                          WHERE al2.title = g.alb AND al2.cover_path IS NOT NULL), \
+                      g.cu) AS cover_path, \
+             COALESCE((SELECT MAX(al.title) FROM albums al \
+                          JOIN tracks t ON t.album_id = al.id WHERE t.id = g.tid), \
+                      g.alb) AS album_title, \
+             g.src \
+             FROM g \
+             ORDER BY g.plays DESC LIMIT {}",
             d.placeholder(1)
         )
     }

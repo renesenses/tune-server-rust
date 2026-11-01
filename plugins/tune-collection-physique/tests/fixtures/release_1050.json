@@ -1,0 +1,63 @@
+{
+ "id": 1050,
+ "status": "Accepted",
+ "year": 2000,
+ "uri": "https://www.discogs.com/release/1050-Laflèche-Montreal-Mix-Sessions-Vol-4",
+ "artists": [
+  {
+   "name": "Lafleche",
+   "anv": "Laflèche",
+   "join": "",
+   "role": "",
+   "tracks": "",
+   "id": 1495,
+   "resource_url": "https://api.discogs.com/artists/1495",
+   "thumbnail_url": "https://i.discogs.com/hTf7IyKYtTuNPCgy66f9CV6TUDfo8jhKAq-yfLp9wC8/rs:fit/g:sm/q:90/h:255/w:258/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9BLTE0OTUt/MDAxLmpwZw.jpeg"
+  }
+ ],
+ "labels": [
+  {
+   "name": "Turbo",
+   "catno": "MARCD-009",
+   "entity_type": "1",
+   "entity_type_name": "Label",
+   "id": 242,
+   "resource_url": "https://api.discogs.com/labels/242",
+   "thumbnail_url": "https://i.discogs.com/uZpMNm2d1WXchozUYMhXfJVGszHCwEHIIsFBBp2RlJg/rs:fit/g:sm/q:90/h:400/w:400/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9MLTI0Mi0x/MjQ3MjUyNDMwLmpw/ZWc.jpeg"
+  },
+  {
+   "name": "Turbo",
+   "catno": "MARCD00092",
+   "entity_type": "1",
+   "entity_type_name": "Label",
+   "id": 242,
+   "resource_url": "https://api.discogs.com/labels/242",
+   "thumbnail_url": "https://i.discogs.com/uZpMNm2d1WXchozUYMhXfJVGszHCwEHIIsFBBp2RlJg/rs:fit/g:sm/q:90/h:400/w:400/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9MLTI0Mi0x/MjQ3MjUyNDMwLmpw/ZWc.jpeg"
+  }
+ ],
+ "formats": [
+  {
+   "name": "CD",
+   "qty": "1",
+   "descriptions": [
+    "Mixed"
+   ]
+  }
+ ],
+ "title": "Montreal Mix Sessions Vol. 4",
+ "country": "Canada",
+ "released": "2000",
+ "identifiers": [
+  {
+   "type": "Barcode",
+   "value": "6 71665 00092 8",
+   "description": "Printed"
+  },
+  {
+   "type": "Barcode",
+   "value": "0671665000928",
+   "description": "Scanned"
+  }
+ ],
+ "master_id": 458546
+}
