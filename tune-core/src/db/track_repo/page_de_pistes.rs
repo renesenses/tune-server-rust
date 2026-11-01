@@ -569,6 +569,21 @@ impl TrackRepo {
                 }
             }
         }
+        // Ordre par défaut : l'index de la clé est lu dans l'ordre, et les
+        // pistes que le socle écarte (doublons distants, copies de moindre
+        // qualité) sont retirées EN MÉMOIRE, d'après leur ensemble gardé sous
+        // le jeton des données. La sous-requête ensembliste se rejouait
+        // sinon à CHAQUE page (≈ 100 ms sur la copie du .18).
+        if vide_et_valeur.is_none()
+            && let Some(ecartees) = super::cle_de_tri::pistes_ecartees_gardees(self.db.as_ref())
+        {
+            let en_sql =
+                crate::db::facet_filter::socle_ensembliste_de_la_vue_des_pistes(engine)[1].clone();
+            let base: Vec<String> = conditions.into_iter().filter(|c| *c != en_sql).collect();
+            return self.page_par_l_index(
+                d, &base, &valeurs, &ecartees, apres, jointure, total, comptes,
+            );
+        }
         let decalage = if apres.is_some() { 0 } else { d.offset.max(0) };
         let (limite, offset_ph) = (ph.take(), ph.take());
         page_valeurs.push(SqlValue::Int(d.limit));
@@ -605,6 +620,101 @@ impl TrackRepo {
             ),
             _ => None,
         };
+        Ok(PageDePistes {
+            pistes: self.hydrater_dans_l_ordre(&ids)?,
+            total,
+            comptes,
+            curseur_suivant,
+        })
+    }
+
+    /// #7619 — la page de l'ordre par défaut, par lots lus dans l'ordre de
+    /// `idx_tracks_cle_tri`, les pistes écartées par le socle retirées en
+    /// mémoire. `offset` compte des pistes VISIBLES, comme avant.
+    #[allow(clippy::too_many_arguments)]
+    fn page_par_l_index(
+        &self,
+        d: &DemandeDePistes,
+        base: &[String],
+        valeurs: &[SqlValue],
+        ecartees: &std::collections::HashSet<i64>,
+        apres: Option<&Curseur>,
+        jointure: &str,
+        total: i64,
+        comptes: Option<ComptesParProvenance>,
+    ) -> Result<PageDePistes, TuneError> {
+        let engine = self.db.engine();
+        let limite = d.limit.max(0);
+        let mut a_sauter = if apres.is_some() { 0 } else { d.offset.max(0) };
+        let lot = (limite * 2).clamp(512, 20_000);
+        let mut depart: Option<(String, i64)> = apres.map(|c| (c.k.clone(), c.i));
+        let mut retenues: Vec<(i64, String)> = Vec::new();
+        while (retenues.len() as i64) < limite {
+            let mut ph = Placeholders::resuming_at(engine, valeurs.len() + 1);
+            let mut conds = base.to_vec();
+            let mut vals = valeurs.to_vec();
+            if let Some((k, i)) = &depart {
+                conds.push(format!(
+                    "(t.cle_tri, t.id) > ({}, {})",
+                    ph.take(),
+                    ph.take()
+                ));
+                vals.push(SqlValue::Text(k.clone()));
+                vals.push(SqlValue::Int(*i));
+            }
+            let lim = ph.take();
+            vals.push(SqlValue::Int(lot));
+            let where_ = if conds.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", conds.join(" AND "))
+            };
+            let lignes = self.db.query_many(
+                &format!(
+                    "SELECT t.id, t.cle_tri{}{jointure}{where_} ORDER BY t.cle_tri, t.id LIMIT {lim}",
+                    sql::track_from()
+                ),
+                &refs(&vals),
+            )?;
+            let n = lignes.len() as i64;
+            for l in &lignes {
+                let id = l.first().and_then(SqlValue::as_i64).unwrap_or(0);
+                let cle = l.get(1).and_then(SqlValue::as_string).unwrap_or_default();
+                depart = Some((cle.clone(), id));
+                if ecartees.contains(&id) {
+                    continue;
+                }
+                if a_sauter > 0 {
+                    a_sauter -= 1;
+                    continue;
+                }
+                retenues.push((id, cle));
+                if retenues.len() as i64 >= limite {
+                    break;
+                }
+            }
+            if n < lot {
+                break;
+            }
+        }
+        let rang_depart = apres.map_or(d.offset.max(0), |c| c.o);
+        let curseur_suivant = match retenues.last() {
+            Some((id, cle)) if limite > 0 && retenues.len() as i64 >= limite => Some(
+                Curseur {
+                    v: 1,
+                    s: String::new(),
+                    d: d.descendant,
+                    e: None,
+                    x: None,
+                    k: cle.clone(),
+                    i: *id,
+                    o: rang_depart + retenues.len() as i64,
+                }
+                .encoder(),
+            ),
+            _ => None,
+        };
+        let ids: Vec<i64> = retenues.into_iter().map(|(id, _)| id).collect();
         Ok(PageDePistes {
             pistes: self.hydrater_dans_l_ordre(&ids)?,
             total,

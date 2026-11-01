@@ -48,7 +48,6 @@ fn banc(dossier: &tempfile::TempDir, locaux: i64) -> (std::sync::Arc<SqliteDb>, 
 fn par_curseur(repo: &TrackRepo, base: &DemandeDePistes) -> (Vec<i64>, i64) {
     let mut ids = Vec::new();
     let mut apres: Option<Curseur> = None;
-    let mut total = -1;
     for _ in 0..10_000 {
         let page = repo
             .page_de_pistes(&DemandeDePistes {
@@ -56,11 +55,10 @@ fn par_curseur(repo: &TrackRepo, base: &DemandeDePistes) -> (Vec<i64>, i64) {
                 ..base.clone()
             })
             .unwrap();
-        total = page.total;
         ids.extend(page.pistes.iter().filter_map(|t| t.id));
         match page.curseur_suivant {
             Some(c) => apres = Some(Curseur::decoder(&c).unwrap()),
-            None => return (ids, total),
+            None => return (ids, page.total),
         }
     }
     panic!("le parcours ne s'arrête pas");

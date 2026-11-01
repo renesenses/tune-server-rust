@@ -366,6 +366,47 @@ pub(super) fn valeur_json(v: &SqlValue) -> serde_json::Value {
     }
 }
 
+/// Les pistes que les deux replis coûteux du socle écartent (doublon
+/// distant, copie de moindre qualité —
+/// [`crate::db::facet_filter::sql_pistes_ecartees_par_le_socle`], exact par
+/// construction), gardées sous le jeton des données : résolues UNE fois entre
+/// deux écritures, et non à chaque page. Sans jeton (PostgreSQL), résolues à
+/// chaque appel. `None` : la lecture a échoué, l'appelant pose le socle en SQL.
+pub fn pistes_ecartees_gardees(
+    db: &dyn crate::db::backend::DbBackend,
+) -> Option<std::sync::Arc<std::collections::HashSet<i64>>> {
+    type Garde = Option<((u64, i64), std::sync::Arc<std::collections::HashSet<i64>>)>;
+    static GARDE: Mutex<Garde> = Mutex::new(None);
+    // Jeton lu AVANT la lecture : une écriture entre les deux le périme.
+    let jeton = db.jeton_des_donnees();
+    if let Some(j) = jeton
+        && let Ok(g) = GARDE.lock()
+        && let Some((jj, ids)) = g.as_ref()
+        && *jj == j
+    {
+        return Some(ids.clone());
+    }
+    let sql = crate::db::facet_filter::sql_pistes_ecartees_par_le_socle(db.engine());
+    let ids: std::sync::Arc<std::collections::HashSet<i64>> = match db.query_many(&sql, &[]) {
+        Ok(lignes) => std::sync::Arc::new(
+            lignes
+                .iter()
+                .filter_map(|l| l.first().and_then(SqlValue::as_i64))
+                .collect(),
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "pistes_ecartees_non_resolues");
+            return None;
+        }
+    };
+    if let Some(j) = jeton
+        && let Ok(mut g) = GARDE.lock()
+    {
+        *g = Some((j, ids.clone()));
+    }
+    Some(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
