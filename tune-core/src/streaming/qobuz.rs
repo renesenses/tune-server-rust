@@ -22,6 +22,30 @@ const QOBUZ_TAILLE_DE_PAGE: &str = "50";
 pub enum RessourceBrute<'a> {
     Album(&'a str),
     Piste(&'a str),
+    /// La fiche d'un label (`label/get`, #7414) ; `avec_albums` ajoute
+    /// `extra=albums`.
+    Label {
+        id: &'a str,
+        avec_albums: bool,
+    },
+}
+
+impl RessourceBrute<'_> {
+    /// Le chemin Qobuz et les paramètres de la ressource. Chemins fixés ici :
+    /// la sonde ne relaie jamais un chemin arbitraire.
+    pub fn requete(&self) -> (&'static str, Vec<(&'static str, &str)>) {
+        match *self {
+            RessourceBrute::Album(id) => ("/album/get", vec![("album_id", id), ("limit", "100")]),
+            RessourceBrute::Piste(id) => ("/track/get", vec![("track_id", id)]),
+            RessourceBrute::Label { id, avec_albums } => {
+                let mut p = vec![("label_id", id)];
+                if avec_albums {
+                    p.push(("extra", "albums"));
+                }
+                ("/label/get", p)
+            }
+        }
+    }
 }
 
 pub struct QobuzService {
@@ -1131,10 +1155,10 @@ impl QobuzService {
         }
     }
 
-    /// La réponse BRUTE de `/album/get` ou `/track/get`, pour la sonde de
+    /// La réponse BRUTE de `/album/get`, `/track/get` ou `/label/get` (#7414), pour la sonde de
     /// diagnostic `GET /streaming/qobuz/debug/raw-keys` (#5530).
     ///
-    /// Deux ressources seulement, fixées ici : la route ne peut pas servir de
+    /// Trois ressources seulement, fixées ici : la route ne peut pas servir de
     /// relais vers un chemin Qobuz arbitraire. Pas de cache — on veut ce que
     /// Qobuz rend maintenant — et l'album est borné à 100 pistes, ce qui suffit
     /// à voir l'union de leurs clés.
@@ -1146,16 +1170,8 @@ impl QobuzService {
         &self,
         ressource: RessourceBrute<'_>,
     ) -> Result<serde_json::Value, Option<u16>> {
-        let resultat = match ressource {
-            RessourceBrute::Album(id) => {
-                self.api_get_avec_statut("/album/get", &[("album_id", id), ("limit", "100")])
-                    .await
-            }
-            RessourceBrute::Piste(id) => {
-                self.api_get_avec_statut("/track/get", &[("track_id", id)])
-                    .await
-            }
-        };
+        let (chemin, params) = ressource.requete();
+        let resultat = self.api_get_avec_statut(chemin, &params).await;
         resultat.map_err(|(statut, _message)| statut)
     }
 
