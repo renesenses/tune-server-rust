@@ -52,7 +52,11 @@
     "channel_copy": " — recopie des canaux, sans calcul",
     "channel_mix": " — mélange des canaux",
     "network_selected": "{0} → {1} canaux (disposition choisie)",
-    "network_advertised": "{0} → {1} canaux (annoncés par le lecteur)"
+    "network_advertised": "{0} → {1} canaux (annoncés par le lecteur)",
+    "correction_piece_active": "Correction de pièce : réponse impulsionnelle de {0} taps à {1} Hz, latence {2} ms",
+    "correction_piece_pure": "Correction de pièce contournée par PURE",
+    "correction_piece_cadence": "Correction de pièce IGNORÉE : réponse impulsionnelle à {0} Hz, flux à {1} Hz (pas de rééchantillonnage, #5190)",
+    "correction_piece_illisible": "Correction de pièce IGNORÉE : réponse impulsionnelle illisible ({0})"
   },
   "en": {
     "pregain": "auto pre-gain {0} dB",
@@ -107,7 +111,11 @@
     "channel_copy": " — channel copy, no computation",
     "channel_mix": " — channel mixing",
     "network_selected": "{0} → {1} channels (selected layout)",
-    "network_advertised": "{0} → {1} channels (reported by the player)"
+    "network_advertised": "{0} → {1} channels (reported by the player)",
+    "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
+    "correction_piece_pure": "Room correction bypassed by PURE",
+    "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
   },
   "de": {
     "pregain": "automatische Vorverstärkung {0} dB",
@@ -162,7 +170,11 @@
     "channel_copy": " — Kanäle kopiert, ohne Berechnung",
     "channel_mix": " — Kanäle gemischt",
     "network_selected": "{0} → {1} Kanäle (gewählte Anordnung)",
-    "network_advertised": "{0} → {1} Kanäle (vom Player gemeldet)"
+    "network_advertised": "{0} → {1} Kanäle (vom Player gemeldet)",
+    "correction_piece_active": "Raumkorrektur: Impulsantwort mit {0} Taps bei {1} Hz, {2} ms Latenz",
+    "correction_piece_pure": "Raumkorrektur durch PURE umgangen",
+    "correction_piece_cadence": "Raumkorrektur ÜBERSPRUNGEN: Impulsantwort bei {0} Hz, Stream bei {1} Hz (kein Resampling, #5190)",
+    "correction_piece_illisible": "Raumkorrektur ÜBERSPRUNGEN: Impulsantwort nicht lesbar ({0})"
   },
   "es": {
     "pregain": "preganancia automática {0} dB",
@@ -217,7 +229,11 @@
     "channel_copy": " — copia de canales, sin cálculo",
     "channel_mix": " — mezcla de canales",
     "network_selected": "{0} → {1} canales (disposición elegida)",
-    "network_advertised": "{0} → {1} canales (indicados por el reproductor)"
+    "network_advertised": "{0} → {1} canales (indicados por el reproductor)",
+    "correction_piece_active": "Corrección de sala: respuesta impulsiva de {0} taps a {1} Hz, latencia {2} ms",
+    "correction_piece_pure": "Corrección de sala omitida por PURE",
+    "correction_piece_cadence": "Corrección de sala IGNORADA: respuesta impulsiva a {0} Hz, flujo a {1} Hz (sin remuestreo, #5190)",
+    "correction_piece_illisible": "Corrección de sala IGNORADA: respuesta impulsiva ilegible ({0})"
   },
   "it": {
     "pregain": "pre-guadagno automatico {0} dB",
@@ -272,7 +288,11 @@
     "channel_copy": " — copia dei canali, senza calcolo",
     "channel_mix": " — miscelazione dei canali",
     "network_selected": "{0} → {1} canali (disposizione scelta)",
-    "network_advertised": "{0} → {1} canali (dichiarati dal lettore)"
+    "network_advertised": "{0} → {1} canali (dichiarati dal lettore)",
+    "correction_piece_active": "Correzione ambientale: risposta all'impulso di {0} tap a {1} Hz, latenza {2} ms",
+    "correction_piece_pure": "Correzione ambientale bypassata da PURE",
+    "correction_piece_cadence": "Correzione ambientale IGNORATA: risposta all'impulso a {0} Hz, flusso a {1} Hz (nessun ricampionamento, #5190)",
+    "correction_piece_illisible": "Correzione ambientale IGNORATA: risposta all'impulso illeggibile ({0})"
   },
   "zh": {
     "pregain": "自动预增益 {0} dB",
@@ -327,7 +347,11 @@
     "channel_copy": " — 复制声道，无计算",
     "channel_mix": " — 混合声道",
     "network_selected": "{0} → {1} 声道（所选布局）",
-    "network_advertised": "{0} → {1} 声道（播放器报告）"
+    "network_advertised": "{0} → {1} 声道（播放器报告）",
+    "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
+    "correction_piece_pure": "Room correction bypassed by PURE",
+    "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
   },
   "ja": {
     "pregain": "自動プリアンプ {0} dB",
@@ -382,7 +406,11 @@
     "channel_copy": " — チャンネルをコピー、計算なし",
     "channel_mix": " — チャンネルをミックス",
     "network_selected": "{0} → {1} チャンネル（選択した配置）",
-    "network_advertised": "{0} → {1} チャンネル（プレーヤーの報告）"
+    "network_advertised": "{0} → {1} チャンネル（プレーヤーの報告）",
+    "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
+    "correction_piece_pure": "Room correction bypassed by PURE",
+    "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
   },
   "ko": {
     "pregain": "자동 프리게인 {0} dB",
@@ -437,7 +465,11 @@
     "channel_copy": " — 채널 복사, 연산 없음",
     "channel_mix": " — 채널 혼합",
     "network_selected": "{0} → {1} 채널 (선택한 배치)",
-    "network_advertised": "{0} → {1} 채널 (플레이어가 보고함)"
+    "network_advertised": "{0} → {1} 채널 (플레이어가 보고함)",
+    "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
+    "correction_piece_pure": "Room correction bypassed by PURE",
+    "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
   },
   "ro": {
     "pregain": "pre-amplificare automată {0} dB",
@@ -492,7 +524,11 @@
     "channel_copy": " — copierea canalelor, fără calcul",
     "channel_mix": " — amestecarea canalelor",
     "network_selected": "{0} → {1} canale (configurație aleasă)",
-    "network_advertised": "{0} → {1} canale (anunțate de player)"
+    "network_advertised": "{0} → {1} canale (anunțate de player)",
+    "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
+    "correction_piece_pure": "Room correction bypassed by PURE",
+    "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
   },
   "sv": {
     "pregain": "automatisk förförstärkning {0} dB",
@@ -547,7 +583,11 @@
     "channel_copy": " — kanalkopiering, utan beräkning",
     "channel_mix": " — kanalblandning",
     "network_selected": "{0} → {1} kanaler (vald layout)",
-    "network_advertised": "{0} → {1} kanaler (rapporterade av spelaren)"
+    "network_advertised": "{0} → {1} kanaler (rapporterade av spelaren)",
+    "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
+    "correction_piece_pure": "Room correction bypassed by PURE",
+    "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
   },
   "vi": {
     "pregain": "tiền khuếch đại tự động {0} dB",
@@ -602,7 +642,11 @@
     "channel_copy": " — sao chép kênh, không tính toán",
     "channel_mix": " — trộn kênh",
     "network_selected": "{0} → {1} kênh (bố trí đã chọn)",
-    "network_advertised": "{0} → {1} kênh (trình phát báo cáo)"
+    "network_advertised": "{0} → {1} kênh (trình phát báo cáo)",
+    "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
+    "correction_piece_pure": "Room correction bypassed by PURE",
+    "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
   },
   "hu": {
     "pregain": "automatikus előerősítés {0} dB",
@@ -657,7 +701,11 @@
     "channel_copy": " — csatornamásolás, számítás nélkül",
     "channel_mix": " — csatornakeverés",
     "network_selected": "{0} → {1} csatorna (választott elrendezés)",
-    "network_advertised": "{0} → {1} csatorna (a lejátszó szerint)"
+    "network_advertised": "{0} → {1} csatorna (a lejátszó szerint)",
+    "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
+    "correction_piece_pure": "Room correction bypassed by PURE",
+    "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
   },
   "nb": {
     "pregain": "automatisk forsterkning før behandling {0} dB",
@@ -712,7 +760,11 @@
     "channel_copy": " – kanalkopiering, ingen beregning",
     "channel_mix": " – kanalblanding",
     "network_selected": "{0} → {1} kanaler (valgt oppsett)",
-    "network_advertised": "{0} → {1} kanaler (oppgitt av spilleren)"
+    "network_advertised": "{0} → {1} kanaler (oppgitt av spilleren)",
+    "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
+    "correction_piece_pure": "Room correction bypassed by PURE",
+    "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
   },
   "pl": {
     "pregain": "automatyczne wzmocnienie wstępne {0} dB",
@@ -767,7 +819,11 @@
     "channel_copy": " — kopiowanie kanałów, bez obliczeń",
     "channel_mix": " — miksowanie kanałów",
     "network_selected": "{0} → {1} kanałów (wybrany układ)",
-    "network_advertised": "{0} → {1} kanałów (zgłoszone przez odtwarzacz)"
+    "network_advertised": "{0} → {1} kanałów (zgłoszone przez odtwarzacz)",
+    "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
+    "correction_piece_pure": "Room correction bypassed by PURE",
+    "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
   },
   "el": {
     "pregain": "αυτόματη προ-ενίσχυση {0} dB",
@@ -822,6 +878,10 @@
     "channel_copy": " — αντιγραφή καναλιών, χωρίς υπολογισμό",
     "channel_mix": " — ανάμειξη καναλιών",
     "network_selected": "{0} → {1} κανάλια (επιλεγμένη διάταξη)",
-    "network_advertised": "{0} → {1} κανάλια (αναφέρεται από τον αναπαραγωγέα)"
+    "network_advertised": "{0} → {1} κανάλια (αναφέρεται από τον αναπαραγωγέα)",
+    "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
+    "correction_piece_pure": "Room correction bypassed by PURE",
+    "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
   }
 }
