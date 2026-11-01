@@ -1561,24 +1561,12 @@ pub mod sql {
              WHERE CAST(dico_al.year AS TEXT) = {})",
             d.placeholder(n + 1)
         );
-        // SQLite : la branche plein texte est un pur `t.id IN (SELECT rowid
-        // …)` (son filtre de colonnes voyage dans la chaîne du `MATCH`). Les
-        // deux branches deviennent alors UNE liste d'identifiants, réunie par
-        // `UNION` : le moteur lit chaque branche par son index puis la piste
-        // par sa clé, quel que soit le choix de son planificateur — qui, sur
-        // une petite base analysée, préférait parcourir la table.
-        if let Some(fts) = plein_texte
-            .strip_prefix("t.id IN (")
-            .and_then(|r| r.strip_suffix(')'))
-            .filter(|_| d.engine() == crate::db::engine::Engine::Sqlite)
-        {
-            return format!(
-                "t.id IN ({fts} \
-                 UNION SELECT dico_t.id FROM tracks dico_t WHERE dico_t.{annee})"
-            );
-        }
-        // PostgreSQL : la branche plein texte porte une restriction sur la
-        // ligne jointe (#4367) ; le OU reste, chaque branche sur un index.
+        // Deux branches, chacune servie par un index : le plein texte (sous
+        // SQLite un `t.id IN (SELECT rowid …)`, sous PostgreSQL l'index GIN et
+        // la restriction #4367 sur la ligne jointe), et l'année par la clé des
+        // albums. Avec les cinq branches d'avant, SQLite ne lisait la piste
+        // par sa clé que si elles étaient réunies par `UNION` ; avec deux, le
+        // OU suffit — le témoin de plan le vérifie.
         format!("({plein_texte} OR t.{annee})")
     }
 
