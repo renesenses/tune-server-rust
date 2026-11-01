@@ -30,6 +30,10 @@ struct Journal {
     recherches: Vec<String>,
     creations: Vec<String>,
     ajouts: Vec<Vec<String>>,
+    /// Qobuz refuse la création (`/playlist/create` en 401).
+    refuser_creation: bool,
+    /// Qobuz crée la playlist puis refuse l'ajout des titres.
+    refuser_ajout: bool,
 }
 
 struct QobuzSimule {
@@ -144,8 +148,26 @@ impl StreamingService for QobuzSimule {
             Err("playlist inconnue".into())
         }
     }
+    /// « Mes playlists » : celles que ce simulé a créées.
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
-        Ok(vec![])
+        Ok(self
+            .journal
+            .lock()
+            .unwrap()
+            .creations
+            .iter()
+            .enumerate()
+            .map(|(i, nom)| StreamPlaylist {
+                id: format!("pl-essai-{}", i + 1),
+                name: nom.clone(),
+                description: None,
+                cover_path: None,
+                track_count: 0,
+                owner: None,
+                editable: Some(true),
+                covers: Vec::new(),
+            })
+            .collect())
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         Ok(vec![])
@@ -157,15 +179,19 @@ impl StreamingService for QobuzSimule {
         self.ecriture
     }
     async fn create_playlist(&self, name: &str, _d: Option<&str>) -> Result<String, TuneError> {
-        self.journal
-            .lock()
-            .unwrap()
-            .creations
-            .push(name.to_string());
-        Ok("pl-essai-1".into())
+        let mut j = self.journal.lock().unwrap();
+        if j.refuser_creation {
+            return Err("qobuz /playlist/create: 401 {\"code\":401}".into());
+        }
+        j.creations.push(name.to_string());
+        Ok(format!("pl-essai-{}", j.creations.len()))
     }
     async fn add_tracks_to_playlist(&self, _p: &str, ids: &[String]) -> Result<usize, TuneError> {
-        self.journal.lock().unwrap().ajouts.push(ids.to_vec());
+        let mut j = self.journal.lock().unwrap();
+        if j.refuser_ajout {
+            return Err("qobuz /playlist/addTracks: 400 {\"code\":400}".into());
+        }
+        j.ajouts.push(ids.to_vec());
         Ok(ids.len())
     }
 }
@@ -416,4 +442,161 @@ async fn la_creation_en_un_geste_marche_toujours() {
     assert_eq!(j.creations, vec!["Un geste".to_string()]);
     let ajoutes = j.ajouts.concat();
     assert!(ajoutes.contains(&"q-heroes".to_string()), "{ajoutes:?}");
+}
+
+async fn lire(app: &axum::Router, path: &str) -> (StatusCode, Value) {
+    let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(json!(null)),
+    )
+}
+
+/// Radio → Qobuz, 01/11/2026 — la playlist existait chez Qobuz mais pas dans
+/// « Mes playlists » de Tune. La modale lit la liste À L'OUVERTURE (choix de
+/// la cible), ce qui la met en cache 120 s juste AVANT la création. Après la
+/// création, la liste relue doit la contenir.
+///
+/// Contre-épreuve (faite à la main, retirer la purge de
+/// `creer_playlist_depuis_titres_retenus`) : la seconde lecture rend la
+/// liste mémorisée, vide, et ce témoin échoue.
+#[tokio::test(flavor = "multi_thread")]
+async fn la_playlist_creee_apparait_aussitot_dans_mes_playlists() {
+    let (app, journal, _dir) = banc(true, true).await;
+    // Ce que fait la modale à l'ouverture.
+    let (st, avant) = lire(&app, "/api/v1/streaming/qobuz/playlists").await;
+    assert_eq!(st, StatusCode::OK, "{avant}");
+    assert!(
+        !avant.to_string().contains("Favoris radio — 01/11/2026"),
+        "{avant}"
+    );
+
+    let (st, body) = appel(
+        &app,
+        "/api/v1/radio-favorites/create-playlist",
+        json!({
+            "service": "qobuz",
+            "playlist_name": "Favoris radio — 01/11/2026",
+            "track_ids": ["q-heroes"],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    assert_eq!(body["added"], 1, "{body}");
+    assert_eq!(journal.lock().unwrap().creations.len(), 1);
+
+    let (st, apres) = lire(&app, "/api/v1/streaming/qobuz/playlists").await;
+    assert_eq!(st, StatusCode::OK, "{apres}");
+    let noms: Vec<&str> = apres
+        .as_array()
+        .expect("liste de playlists")
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    assert!(
+        noms.contains(&"Favoris radio — 01/11/2026"),
+        "la playlist créée doit figurer dans « Mes playlists » : {noms:?}"
+    );
+    let p = apres
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "Favoris radio — 01/11/2026")
+        .unwrap();
+    assert_eq!(
+        p["editable"], true,
+        "c'est SA playlist, pas un abonnement : {p}"
+    );
+}
+
+/// Un refus de Qobuz à la création n'est JAMAIS un succès : 502, rien de
+/// créé, et une phrase à montrer (`message`) en plus du code.
+#[tokio::test(flavor = "multi_thread")]
+async fn un_refus_de_creation_remonte_au_client_avec_un_message() {
+    let (app, journal, _dir) = banc(true, true).await;
+    journal.lock().unwrap().refuser_creation = true;
+    let (st, body) = appel(
+        &app,
+        "/api/v1/radio-favorites/create-playlist",
+        json!({ "service": "qobuz", "playlist_name": "x", "track_ids": ["q-heroes"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body["playlist_id"].is_null(), "{body}");
+    assert_eq!(body["code"], "creation_playlist_refusee", "{body}");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("Qobuz a refusé la création"), "{body}");
+    assert!(
+        message.contains("401"),
+        "le motif du service est rendu : {body}"
+    );
+
+    // Contre-épreuve : la même demande, Qobuz d'accord → 201.
+    journal.lock().unwrap().refuser_creation = false;
+    let (st, body) = appel(
+        &app,
+        "/api/v1/radio-favorites/create-playlist",
+        json!({ "service": "qobuz", "playlist_name": "x", "track_ids": ["q-heroes"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    assert!(body["message"].is_null(), "{body}");
+}
+
+/// La liste vide est expliquée : code stable ET phrase lisible.
+#[tokio::test(flavor = "multi_thread")]
+async fn une_selection_vide_est_expliquee() {
+    let (app, journal, _dir) = banc(true, true).await;
+    let (st, body) = appel(
+        &app,
+        "/api/v1/radio-favorites/create-playlist",
+        json!({ "service": "qobuz", "playlist_name": "x", "track_ids": ["", "  "] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "aucun_titre_retenu");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("aucune playlist n’a été créée"),
+        "{body}"
+    );
+    assert!(journal.lock().unwrap().creations.is_empty());
+}
+
+/// En un geste : un ajout refusé APRÈS la création était journalisé puis
+/// avalé (la réponse annonçait les titres). Il est rendu dans `add_error`.
+/// Contre-épreuve : ajout accepté → `add_error` nul.
+#[tokio::test(flavor = "multi_thread")]
+async fn en_un_geste_l_ajout_refuse_n_est_plus_avale() {
+    let (app, journal, _dir) = banc(true, true).await;
+    journal.lock().unwrap().refuser_ajout = true;
+    let (st, body) = appel(
+        &app,
+        "/api/v1/radio-favorites/create-playlist",
+        json!({ "service": "qobuz", "playlist_name": "Un geste", "limit": 10 }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    assert!(
+        body["add_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("addTracks"),
+        "{body}"
+    );
+    journal.lock().unwrap().refuser_ajout = false;
+    let (_, body) = appel(
+        &app,
+        "/api/v1/radio-favorites/create-playlist",
+        json!({ "service": "qobuz", "playlist_name": "Un geste 2", "limit": 10 }),
+    )
+    .await;
+    assert!(body["add_error"].is_null(), "{body}");
 }
