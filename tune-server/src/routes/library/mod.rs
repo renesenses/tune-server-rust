@@ -946,6 +946,9 @@ mod routage_tests {
 }
 
 #[cfg(test)]
+#[path = "banc_l3l4_7619.rs"]
+mod banc_l3l4_7619;
+#[cfg(test)]
 #[path = "banc_rail_5993.rs"]
 mod banc_rail_5993;
 

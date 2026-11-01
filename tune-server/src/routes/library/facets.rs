@@ -665,11 +665,66 @@ pub(super) async fn library_facets(
     // `FacetQuery::hydrate`. Sans cet appel, `sel` reste vide et plus rien ne
     // filtre.
     let q = q.hydrate(raw.as_deref())?.pour_profil(profile.id());
+    let cle = (profile.id(), raw.unwrap_or_default());
     // #5438 — la résolution de la collection et les requêtes de chaque
     // facette sont synchrones : hors de l'exécuteur.
-    hors_executeur("library_facets", move || compter_les_facettes(&state, q))
-        .await
-        .map(Json)
+    hors_executeur("library_facets", move || {
+        compter_les_facettes_en_cache(&state, q, cle)
+    })
+    .await
+    .map(Json)
+}
+
+/// #7619 (L4) — les compteurs déjà calculés, par combinaison de filtres :
+/// `(profil, chaîne de requête brute)` → le corps rendu, sous la révision de
+/// la bibliothèque qui l'a produit ([`tune_core::db::library_revision`]).
+///
+/// Le corps ne dépend que de la requête, du profil (favoris, notes) et du
+/// contenu des tables suivies par la révision : tant que la base lit la même
+/// révision, il est exactement celui qu'elle rendrait. La révision est lue
+/// AVANT le calcul — une écriture pendant le calcul change la révision
+/// suivante, et l'entrée gardée ici n'est plus jamais servie.
+///
+/// Rouvrir Oxygen, revenir à la Bibliothèque, décocher puis recocher une
+/// valeur : autant de rails déjà comptés (≈ 2 s chacun sur le .18). Le
+/// premier rail après un scan, lui, se recalcule.
+///
+/// Borné à [`ENTREES_DU_CACHE_DES_FACETTES`] combinaisons ; au-delà, le cache
+/// est vidé (les combinaisons d'une révision périmée ne servent plus jamais).
+type CacheDesFacettes =
+    std::collections::HashMap<(i64, String), ((i64, i64), std::sync::Arc<Value>)>;
+static CACHE_DES_FACETTES: std::sync::LazyLock<std::sync::Mutex<CacheDesFacettes>> =
+    std::sync::LazyLock::new(Default::default);
+const ENTREES_DU_CACHE_DES_FACETTES: usize = 256;
+
+/// [`compter_les_facettes`] derrière le cache des compteurs (L4). Sans
+/// révision lisible (compteur absent), rien n'est gardé ni servi.
+pub(super) fn compter_les_facettes_en_cache(
+    state: &AppState,
+    q: FacetQuery,
+    cle: (i64, String),
+) -> Value {
+    let revision = tune_core::db::library_revision::lire(state.backend.as_ref());
+    if let Some(r) = revision
+        && let Ok(cache) = CACHE_DES_FACETTES.lock()
+        && let Some((r_garde, corps)) = cache.get(&cle)
+        && *r_garde == r
+    {
+        return (**corps).clone();
+    }
+    let corps = compter_les_facettes(state, q);
+    if let Some(r) = revision
+        && let Ok(mut cache) = CACHE_DES_FACETTES.lock()
+    {
+        if cache.len() >= ENTREES_DU_CACHE_DES_FACETTES {
+            cache.retain(|_, (r_garde, _)| *r_garde == r);
+            if cache.len() >= ENTREES_DU_CACHE_DES_FACETTES {
+                cache.clear();
+            }
+        }
+        cache.insert(cle, (r, std::sync::Arc::new(corps.clone())));
+    }
+    corps
 }
 
 /// Le corps de `GET /library/facets`, exécuté HORS de l'exécuteur async.

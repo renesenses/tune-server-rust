@@ -4845,6 +4845,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(TRACKS_GENRE_COMPOSER_INDEX) {
         warn!(error = %e, "sqlite_tracks_genre_composer_index_failed");
     }
+    // #7619 (L4/L5) — la révision de la bibliothèque : table, déclencheurs et
+    // ligne en une transaction ; un échec la laisse absente (caches muets).
+    if let Err(e) = db.execute_batch(&super::library_revision::sql_sqlite()) {
+        db.execute_batch("ROLLBACK").ok();
+        warn!(error = %e, "sqlite_library_revision_failed");
+    }
     // #2149 — collections à règle de genre : même passe — voir la constante.
     if let Err(e) = db.execute_batch(TRACKS_ALBUM_GENRE_INDEX) {
         warn!(error = %e, "sqlite_tracks_album_genre_index_failed");
@@ -5923,6 +5929,13 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // finale SQLite.
     if let Err(e) = sqlx::raw_sql(TRACKS_TITLE_INDEX).execute(pool).await {
         warn!(error = %e, "pg_tracks_title_index_failed");
+    }
+    // #7619 (L4/L5) — la révision de la bibliothèque, un bloc `DO`.
+    if let Err(e) = sqlx::raw_sql(&super::library_revision::sql_postgres())
+        .execute(pool)
+        .await
+    {
+        warn!(error = %e, "pg_library_revision_failed");
     }
     // #7619 (L3) — même index, même texte que la passe finale SQLite.
     if let Err(e) = sqlx::raw_sql(TRACKS_GENRE_COMPOSER_INDEX)
