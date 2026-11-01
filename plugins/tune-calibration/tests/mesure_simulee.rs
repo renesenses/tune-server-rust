@@ -24,32 +24,7 @@ struct Banc {
     controleur: Arc<Controleur>,
     hote: Arc<HoteSimule>,
     fournisseur: Arc<FournisseurBalayage>,
-    _dossier: tempdir::Dossier,
-}
-
-mod tempdir {
-    use std::path::PathBuf;
-
-    pub struct Dossier(pub PathBuf);
-    impl Dossier {
-        pub fn neuf(nom: &str) -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "tune-calibration-{nom}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
-            std::fs::create_dir_all(&p).unwrap();
-            Self(p)
-        }
-    }
-    impl Drop for Dossier {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    _dossier: tune_core::test_scratch::ScratchDir,
 }
 
 fn banc(sim: &RoomSim, gain_micro: f64, volume: Option<f64>, nom: &str) -> Banc {
@@ -62,8 +37,13 @@ fn banc(sim: &RoomSim, gain_micro: f64, volume: Option<f64>, nom: &str) -> Banc 
         boucle,
         demarrages: Default::default(),
     });
-    let dossier = tempdir::Dossier::neuf(nom);
-    let controleur = Controleur::new(micro, hote.clone(), fournisseur.clone(), dossier.0.clone());
+    let dossier = tune_core::test_scratch::scratch_dir(&format!("tune-calibration-{nom}"));
+    let controleur = Controleur::new(
+        micro,
+        hote.clone(),
+        fournisseur.clone(),
+        dossier.path().to_path_buf(),
+    );
     Banc {
         controleur,
         hote,
@@ -299,8 +279,13 @@ fn une_zone_en_volume_fixe_est_refusee() {
         boucle,
         demarrages: Default::default(),
     });
-    let dossier = tempdir::Dossier::neuf("volume-fixe");
-    let c = Controleur::new(micro, hote.clone(), fournisseur.clone(), dossier.0.clone());
+    let dossier = tune_core::test_scratch::scratch_dir("tune-calibration-volume-fixe");
+    let c = Controleur::new(
+        micro,
+        hote.clone(),
+        fournisseur.clone(),
+        dossier.path().to_path_buf(),
+    );
     let e = c.lancer(demande(2)).unwrap_err();
     assert!(e.contains("volume fixe"), "{e}");
     assert!(hote.journal().joues.is_empty());
@@ -419,8 +404,13 @@ fn une_entree_a_la_mauvaise_cadence_est_refusee() {
         boucle,
         demarrages: Default::default(),
     });
-    let dossier = tempdir::Dossier::neuf("cadence");
-    let c = Controleur::new(micro, hote.clone(), fournisseur, dossier.0.clone());
+    let dossier = tune_core::test_scratch::scratch_dir("tune-calibration-cadence");
+    let c = Controleur::new(
+        micro,
+        hote.clone(),
+        fournisseur,
+        dossier.path().to_path_buf(),
+    );
     let e = c.lancer(demande(2)).unwrap_err();
     assert!(e.contains("44100"), "{e}");
     assert!(hote.journal().volumes.is_empty());
