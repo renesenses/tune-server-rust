@@ -2304,6 +2304,10 @@ mod seek_de_reprise_caduc_5476;
 /// renderer qui n'est pas à la position de la pause.
 #[cfg(test)]
 mod seek_de_reprise_conditionnel_5050;
+/// #7422 — fil 2535 : avancer dans un titre Qobuz converti (canal sans
+/// `Range`) sur une zone DLNA recrée le flux à la position.
+#[cfg(test)]
+mod seek_service_sans_range_7422;
 // #5050 (fil 2236) — transfert depuis une zone en pause : la cible est posée
 // en pause sans rien recevoir.
 /// #6466 — l'historique par conteneurs : le conteneur de chaque élément de

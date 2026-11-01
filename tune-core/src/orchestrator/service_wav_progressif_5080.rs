@@ -59,7 +59,7 @@ fn orchestrateur() -> PlaybackOrchestrator {
 /// La zone du fil 1949 : un renderer DLNA (absent du registre, donc présumé
 /// capable — comme dans les témoins de LAT-F1), un égaliseur installé et
 /// armé, l'opt-in `dsp_progressif_reseau` coché.
-fn zone_du_fil_1949(orch: &PlaybackOrchestrator) -> i64 {
+pub(super) fn zone_du_fil_1949(orch: &PlaybackOrchestrator) -> i64 {
     let zone_id = ZoneRepo::with_backend(orch.db.clone())
         .create("DDC-0 C19", Some("dlna"), Some("uuid:c19-5080"))
         .unwrap();
