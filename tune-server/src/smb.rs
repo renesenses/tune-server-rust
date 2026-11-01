@@ -466,7 +466,10 @@ mod commande_de_montage_tests {
         let racine = d.join("montages");
         std::fs::create_dir_all(&racine).unwrap();
         std::os::unix::fs::symlink("/etc", racine.join("nas_m")).unwrap();
-        assert!(!est_confine(&racine.join("nas_m"), &[racine.clone()]));
+        assert!(!est_confine(
+            &racine.join("nas_m"),
+            std::slice::from_ref(&racine)
+        ));
         std::fs::create_dir_all(racine.join("nas_n")).unwrap();
         assert!(est_confine(&racine.join("nas_n"), &[racine]));
     }
