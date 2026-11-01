@@ -305,17 +305,30 @@ async fn obtenir(state: &AppState, chemin: &str, sources: Option<&str>) -> Value
         url.push(if url.contains('?') { '&' } else { '?' });
         url.push_str(&format!("sources={s}"));
     }
-    let reponse = app
-        .oneshot(Request::get(&url).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let statut = reponse.status();
-    let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let corps: Value = serde_json::from_slice(&octets).unwrap_or(Value::Null);
-    assert_eq!(statut, StatusCode::OK, "GET {url} — corps : {corps}");
-    corps
+    // `/home/other-versions` ne bloque plus sur les services : tant qu'il
+    // prepare la moitie streaming, il repond 202 + `X-En-Preparation` avec ce
+    // que la bibliotheque a rendu. Ces temoins mesurent la reponse COMPLETE :
+    // ils redemandent jusqu'a ce qu'elle le soit.
+    for essai in 0..200 {
+        let reponse = app
+            .clone()
+            .oneshot(Request::get(&url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let statut = reponse.status();
+        let en_preparation = reponse.headers().contains_key("x-en-preparation");
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let corps: Value = serde_json::from_slice(&octets).unwrap_or(Value::Null);
+        if statut == StatusCode::ACCEPTED && en_preparation && essai < 199 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue;
+        }
+        assert_eq!(statut, StatusCode::OK, "GET {url} — corps : {corps}");
+        return corps;
+    }
+    unreachable!()
 }
 
 /// Le tableau a ce chemin, ou un echec qui montre le corps entier.

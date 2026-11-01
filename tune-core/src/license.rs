@@ -75,6 +75,11 @@ pub enum Feature {
     /// GREFFON, pas d'un chemin d'URL, et la décision (complet / refusé,
     /// bientôt réduit pour les comptes gratuits) tient chez lui.
     Concerts,
+    /// « Sortie AES67 » (#7336) : diffuser une zone en flux RTP multicast
+    /// vers des récepteurs AES67. Premium (Bertrand, 30/10/2026). Déclarée
+    /// par le greffon `tune-aes67` (`TunePlugin::required_feature`), qui
+    /// refuse lui-même ses routes et ses sorties sans ce droit.
+    Aes67,
 }
 
 impl Feature {
@@ -110,6 +115,7 @@ impl Feature {
             Feature::AcousticAnalysis,
             Feature::PontRoon,
             Feature::Concerts,
+            Feature::Aes67,
         ]
     }
 
@@ -135,6 +141,7 @@ impl Feature {
             Feature::AcousticAnalysis => "Acoustic Analysis",
             Feature::PontRoon => "Roon Bridge",
             Feature::Concerts => "Concerts",
+            Feature::Aes67 => "AES67 Output",
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
@@ -177,6 +184,7 @@ impl Feature {
             Feature::AcousticAnalysis => "acoustic_analysis",
             Feature::PontRoon => "pont_roon",
             Feature::Concerts => "concerts",
+            Feature::Aes67 => "aes67_output",
             Feature::PlaylistTransfer => "playlist_transfer",
             Feature::AdvancedAlarms => "advanced_alarms",
             Feature::MultiProfiles => "multi_profiles",
@@ -210,7 +218,9 @@ impl Feature {
             // Features licensed by Premium but NOT yet available/functional
             // (product decision — Bertrand). These show a red cross in the UI.
             // Note: Dé-ploc IS available, so it is deliberately NOT listed here.
-            Feature::SocialSharing | Feature::WeeklyDigest => false,
+            // AES67 (#7336) : expérimentale dans la rc10, désactivée par défaut,
+            // jamais essayée sur un vrai récepteur Dante/Ravenna.
+            Feature::SocialSharing | Feature::WeeklyDigest | Feature::Aes67 => false,
             _ => true,
         }
     }
@@ -1442,15 +1452,16 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentyseven_features() {
+    fn all_premium_has_twentyeight_features() {
         // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
         // premium doit être un acte conscient, pas un effet de bord. Passé de
         // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
         // rien et tournait sur des installations gratuites ; puis à 26 avec
         // `PontRoon` (16/09/2026, décision de Bertrand) ; puis à 27 avec
         // `Concerts` (#2363) — sa propre tuile, incluse dans Premium (Bertrand,
-        // 30/08 et 25/09/2026).
-        assert_eq!(Feature::all_premium().len(), 27);
+        // 30/08 et 25/09/2026) ; puis à 28 avec `Aes67` (#7336, Bertrand,
+        // 30/10/2026).
+        assert_eq!(Feature::all_premium().len(), 28);
     }
 
     #[test]

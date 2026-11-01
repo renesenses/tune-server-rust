@@ -32,8 +32,9 @@ use tune_core::library::artistes_du_label::{
     cles_de_la_bibliotheque, regrouper,
 };
 use tune_core::library::logos_labels::{
-    Attribution, CacheLogosLabels, CatalogueDeLabels, Demande, LabelDuCatalogue, PASSE_MAX,
-    PAUSE_ENTRE_LABELS, SourceDuLogo, Statut, StatutDeLicence,
+    Attribution, CacheLogosLabels, CatalogueDeLabels, Demande, LabelAConsulter, LabelDuCatalogue,
+    LogosPartages, PASSE_MAX, PAUSE_ENTRE_LABELS, PROPOSITIONS_PAR_PASSE, ProposeAuPartage,
+    PropositionDeLogo, SourceDuLogo, Statut, StatutDeLicence, cle_de_label,
 };
 use tune_core::library::logos_web::{CatalogueLogosWeb, FICHIER_INDEX_WEB, transport_du_serveur};
 use tune_core::streaming::StreamingService;
@@ -82,6 +83,20 @@ pub(crate) fn catalogue_web(state: &AppState) -> Option<Arc<dyn CatalogueDeLabel
         Some(state.backend.clone()),
     )))
 }
+
+/// #7414 — le partage communautaire des logos (mozaiklabs.fr), ou `None`
+/// quand la télémétrie est refusée (et, dans un banc, sans racine d'essai).
+pub(crate) fn partage_de(state: &AppState) -> Option<Arc<dyn LogosPartages>> {
+    tune_core::cloud::logos_labels_partages::PartageHttp::depuis_reglages(
+        &state.backend,
+        state.http_client.clone(),
+    )
+    .map(|p| Arc::new(p) as Arc<dyn LogosPartages>)
+}
+
+/// La pause entre deux téléchargements du partage : ses images sont en cache
+/// chez le site, un quart de seconde suffit à ne pas faire de rafale.
+const PAUSE_PARTAGE: Duration = Duration::from_millis(250);
 
 fn maintenant() -> u64 {
     std::time::SystemTime::now()
@@ -207,6 +222,10 @@ pub(crate) fn element(
     {
         o["image_url"] = json!(format!("/api/v1/library/artwork/{condensat}"));
         o["image_credit"] = credit(&a);
+        // #7414 — reçu du partage communautaire (mozaiklabs.fr).
+        if web.entree(&label.nom).is_some_and(|e| e.communaute) {
+            o["image_credit"]["via"] = json!("community");
+        }
     } else if let Some(condensat) = cache.image(&label.nom) {
         o["image_url"] = json!(format!("/api/v1/library/artwork/{condensat}"));
         o["image_credit"] = credit_qobuz();
@@ -243,30 +262,143 @@ pub(crate) fn lancer_passe(
         let Some(_passe) = cache.reserver_passe() else {
             return 0;
         };
+        parcourir(&cache, &*catalogue, &a_faire, pause, continuer).await
+    }))
+}
+
+/// Le corps d'une passe : `a_faire`, tranche par tranche (#7414).
+async fn parcourir(
+    cache: &CacheLogosLabels,
+    catalogue: &dyn CatalogueDeLabels,
+    a_faire: &[Demande],
+    pause: Duration,
+    continuer: fn() -> bool,
+) -> usize {
+    let mut trouves = 0;
+    for (i, tranche) in a_faire.chunks(PASSE_MAX).enumerate() {
+        if !continuer() {
+            break;
+        }
+        if i > 0 && !pause.is_zero() {
+            tokio::time::sleep(pause).await;
+        }
+        trouves += cache
+            .resoudre(catalogue, tranche.to_vec(), maintenant, pause)
+            .await;
+        // Une tranche entièrement en erreur (compte déconnecté, service
+        // en panne) arrête la passe : le reste sera demandé plus tard,
+        // au lieu d'être inscrit en erreur pour un jour.
+        if tranche.iter().all(|d| {
+            cache
+                .entree(&d.nom)
+                .is_some_and(|e| e.statut == Statut::Erreur)
+        }) {
+            break;
+        }
+    }
+    trouves
+}
+
+/// #7414 — la passe du web, avec le partage communautaire :
+///
+/// 1. AVANT toute recherche sur le web, les labels à demander sont demandés
+///    au partage, en UN appel ; chaque logo rendu est inscrit aussitôt, et
+///    ce label n'est pas cherché sur le web. Un partage muet ne coûte qu'un
+///    délai court : la passe continue sur le web.
+/// 2. La passe du web, comme [`lancer_passe`], sur ce qui reste.
+/// 3. Si l'utilisateur a donné son consentement communautaire, les logos
+///    trouvés ici (avec leur attribution, jamais ceux reçus du partage) sont
+///    proposés, [`PROPOSITIONS_PAR_PASSE`] au plus, `pause` entre deux ; un
+///    site qui ne répond pas arrête les propositions jusqu'à la passe
+///    suivante.
+///
+/// Sans partage (`None`), c'est exactement [`lancer_passe`]. Rend la tâche et
+/// le nombre de logos inscrits (partage compris), pour les essais.
+pub(crate) fn lancer_passe_web(
+    web: Arc<CacheLogosLabels>,
+    qobuz: Arc<CacheLogosLabels>,
+    catalogue: Arc<dyn CatalogueDeLabels>,
+    partage: Option<Arc<dyn LogosPartages>>,
+    demandes: Vec<Demande>,
+    pause: Duration,
+    continuer: fn() -> bool,
+) -> Option<tokio::task::JoinHandle<usize>> {
+    let a_faire = web.a_resoudre(&demandes, maintenant(), usize::MAX);
+    let proposer = partage
+        .as_ref()
+        .is_some_and(|p| p.peut_proposer() && !web.a_proposer(1).is_empty());
+    if a_faire.is_empty() && !proposer {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let Some(_passe) = web.reserver_passe() else {
+            return 0;
+        };
+        let mut a_faire = a_faire;
         let mut trouves = 0;
-        for (i, tranche) in a_faire.chunks(PASSE_MAX).enumerate() {
-            if !continuer() {
-                break;
-            }
-            if i > 0 && !pause.is_zero() {
-                tokio::time::sleep(pause).await;
-            }
-            trouves += cache
-                .resoudre(&*catalogue, tranche.to_vec(), maintenant, pause)
+        if let Some(partage) = partage.as_deref()
+            && !a_faire.is_empty()
+        {
+            let labels: Vec<LabelAConsulter> = a_faire
+                .iter()
+                .map(|d| LabelAConsulter {
+                    nom: d.nom.clone(),
+                    mb_label_id: web.entree(&d.nom).and_then(|e| e.mb_label_id),
+                    qobuz_label_id: qobuz.entree(&d.nom).and_then(|e| e.qobuz_label_id),
+                })
+                .collect();
+            let combles = web
+                .combler_depuis_le_partage(partage, &labels, maintenant, PAUSE_PARTAGE.min(pause))
                 .await;
-            // Une tranche entièrement en erreur (compte déconnecté, service
-            // en panne) arrête la passe : le reste sera demandé plus tard,
-            // au lieu d'être inscrit en erreur pour un jour.
-            if tranche.iter().all(|d| {
-                cache
-                    .entree(&d.nom)
-                    .is_some_and(|e| e.statut == Statut::Erreur)
-            }) {
-                break;
-            }
+            trouves += combles.len();
+            a_faire.retain(|d| !combles.contains(&cle_de_label(&d.nom)));
+        }
+        trouves += parcourir(&web, &*catalogue, &a_faire, pause, continuer).await;
+        if let Some(partage) = partage.as_deref()
+            && partage.peut_proposer()
+            && continuer()
+        {
+            proposer_au_partage(&web, &qobuz, partage, &demandes, pause).await;
         }
         trouves
     }))
+}
+
+/// #7414 — propose au partage les logos trouvés ici. Seuls les labels encore
+/// dans la bibliothèque (`demandes`) partent, sous leur nom affiché.
+async fn proposer_au_partage(
+    web: &CacheLogosLabels,
+    qobuz: &CacheLogosLabels,
+    partage: &dyn LogosPartages,
+    demandes: &[Demande],
+    pause: Duration,
+) {
+    let noms: HashMap<String, &str> = demandes
+        .iter()
+        .map(|d| (cle_de_label(&d.nom), d.nom.as_str()))
+        .collect();
+    let mut envoyees = 0usize;
+    for (cle, entree, octets, ext) in web.a_proposer(PROPOSITIONS_PAR_PASSE) {
+        let (Some(nom), Some(attribution)) = (noms.get(&cle), entree.attribution) else {
+            continue;
+        };
+        if envoyees > 0 && !pause.is_zero() {
+            tokio::time::sleep(pause).await;
+        }
+        envoyees += 1;
+        let proposition = PropositionDeLogo {
+            nom: (*nom).to_string(),
+            mb_label_id: entree.mb_label_id,
+            qobuz_label_id: qobuz.entree(nom).and_then(|e| e.qobuz_label_id),
+            attribution,
+            octets,
+            ext,
+        };
+        match partage.proposer(&proposition).await {
+            ProposeAuPartage::Traitee => web.marquer_partage(nom),
+            ProposeAuPartage::Plus => break,
+        }
+    }
 }
 
 /// La passe du web continue tant que l'Enrichissement n'est pas en pause.
@@ -313,9 +445,11 @@ pub(super) async fn list_labels(State(state): State<AppState>) -> Json<Value> {
     let web = cache_web_de(&dossier);
     let items: Vec<Value> = labels.iter().map(|l| element(&cache, &web, l)).collect();
     if let Some(catalogue) = catalogue_web(&state) {
-        lancer_passe(
+        lancer_passe_web(
             web,
+            cache.clone(),
             catalogue,
+            partage_de(&state),
             demandes_web(&labels),
             PAUSE_ENTRE_LABELS,
             enrichissement_actif,
@@ -524,6 +658,8 @@ mod tests {
                 attribution: None,
                 image: Some(condensat.clone()),
                 verifie_le: maintenant(),
+                communaute: false,
+                partage: false,
             },
         );
 
@@ -909,6 +1045,8 @@ mod tests {
             attribution,
             image: Some(condensat.clone()),
             verifie_le: maintenant(),
+            communaute: false,
+            partage: false,
         };
         let wikipedia = Attribution {
             source: SourceDuLogo::Wikipedia,
@@ -1181,6 +1319,8 @@ mod tests {
                 attribution: None,
                 image: None,
                 verifie_le: maintenant() - tune_core::library::logos_labels::DELAI_ERREUR_S - 1,
+                communaute: false,
+                partage: false,
             },
         );
         let decouverte = CacheDecouverte::default();
@@ -1252,5 +1392,271 @@ mod tests {
                 .is_none()
         );
         assert_eq!(faux.rapprochements.load(Ordering::SeqCst), 2);
+    }
+
+    // ── #7414 : le partage communautaire dans la passe du web ──────────────
+
+    fn attribution_web() -> Attribution {
+        Attribution {
+            source: SourceDuLogo::Commons,
+            statut_licence: StatutDeLicence::Libre,
+            fournisseur: "Wikimedia Commons".into(),
+            licence: Some("CC0".into()),
+            licence_url: None,
+            auteur: None,
+            source_url: "https://commons.wikimedia.org/wiki/File:Verve.png".into(),
+            fichier: None,
+            douteux: false,
+        }
+    }
+
+    /// Le web : il connaît tout label, avec un logo attribué, et compte les
+    /// noms demandés.
+    #[derive(Default)]
+    struct WebAttribue(Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl CatalogueDeLabels for WebAttribue {
+        async fn trouver_label(
+            &self,
+            nom: &str,
+            _: Option<&str>,
+        ) -> Result<Option<LabelDuCatalogue>, String> {
+            self.0.lock().unwrap().push(nom.to_string());
+            Ok(Some(LabelDuCatalogue {
+                id: "mb-1".into(),
+                nom: nom.into(),
+                image_url: Some("https://upload.test/l.png".into()),
+                attribution: Some(attribution_web()),
+            }))
+        }
+        async fn telecharger_image(&self, _: &str) -> Result<Vec<u8>, String> {
+            Ok(PNG.to_vec())
+        }
+    }
+
+    /// Le partage : il connaît « ECM Records », peut être muet, accepte ou
+    /// non les propositions, et garde tout ce qu'on lui envoie.
+    #[derive(Default)]
+    struct FauxPartage {
+        consultations: Mutex<Vec<Vec<String>>>,
+        propositions: Mutex<Vec<PropositionDeLogo>>,
+        muet: bool,
+        consentement: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LogosPartages for FauxPartage {
+        async fn consulter(
+            &self,
+            labels: &[LabelAConsulter],
+        ) -> Result<Vec<tune_core::library::logos_labels::LogoPartage>, String> {
+            self.consultations
+                .lock()
+                .unwrap()
+                .push(labels.iter().map(|l| l.nom.clone()).collect());
+            if self.muet {
+                return Err("délai dépassé".into());
+            }
+            Ok(labels
+                .iter()
+                .filter(|l| l.nom == "ECM Records")
+                .map(|l| tune_core::library::logos_labels::LogoPartage {
+                    nom: l.nom.clone(),
+                    image_url: "https://mozaiklabs.fr/api/v1/community/label-logos/1/ab".into(),
+                    mb_label_id: None,
+                    attribution: attribution_web(),
+                })
+                .collect())
+        }
+        async fn telecharger(&self, _: &str) -> Result<Vec<u8>, String> {
+            Ok(PNG.to_vec())
+        }
+        fn peut_proposer(&self) -> bool {
+            self.consentement
+        }
+        async fn proposer(&self, p: &PropositionDeLogo) -> ProposeAuPartage {
+            self.propositions.lock().unwrap().push(p.clone());
+            ProposeAuPartage::Traitee
+        }
+    }
+
+    fn demandes_de(noms: &[&str]) -> Vec<Demande> {
+        noms.iter()
+            .map(|n| Demande {
+                nom: (*n).into(),
+                album_du_catalogue: None,
+            })
+            .collect()
+    }
+
+    /// Le partage est demandé AVANT le web, en UN appel pour tous les labels
+    /// inconnus ; ce qu'il rend n'est pas cherché sur le web, et n'est
+    /// jamais reproposé ; ce que le web trouve est proposé, sous son nom
+    /// affiché, une seule fois.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn le_partage_passe_avant_le_web_et_recoit_ce_que_le_web_trouve_7414() {
+        let dossier = tune_core::test_scratch::scratch_dir("labels-7414-partage");
+        let web = Arc::new(CacheLogosLabels::ouvrir_index(
+            dossier.path(),
+            FICHIER_INDEX_WEB,
+        ));
+        let qobuz = Arc::new(CacheLogosLabels::ouvrir(dossier.path()));
+        qobuz.inscrire(
+            "Verve",
+            EntreeLogo {
+                statut: Statut::Absent,
+                qobuz_label_id: Some("q-7".into()),
+                mb_label_id: None,
+                attribution: None,
+                image: None,
+                verifie_le: maintenant(),
+                communaute: false,
+                partage: false,
+            },
+        );
+        let catalogue = Arc::new(WebAttribue::default());
+        let partage = Arc::new(FauxPartage {
+            consentement: true,
+            ..Default::default()
+        });
+
+        let trouves = lancer_passe_web(
+            web.clone(),
+            qobuz.clone(),
+            catalogue.clone(),
+            Some(partage.clone()),
+            demandes_de(&["ECM Records", "Verve", "Warp"]),
+            Duration::ZERO,
+            toujours,
+        )
+        .expect("une passe")
+        .await
+        .unwrap();
+
+        assert_eq!(trouves, 3);
+        assert_eq!(
+            *partage.consultations.lock().unwrap(),
+            vec![vec![
+                "ECM Records".to_string(),
+                "Verve".into(),
+                "Warp".into()
+            ]],
+            "UN appel au partage, avant le web, pour tous les labels inconnus"
+        );
+        assert_eq!(
+            *catalogue.0.lock().unwrap(),
+            vec!["Verve".to_string(), "Warp".into()],
+            "le label rendu par le partage n'est pas cherché sur le web"
+        );
+        assert!(web.entree("ECM Records").unwrap().communaute);
+
+        let propositions = partage.propositions.lock().unwrap().clone();
+        let noms: Vec<&str> = propositions.iter().map(|p| p.nom.as_str()).collect();
+        assert_eq!(
+            noms,
+            vec!["Verve", "Warp"],
+            "jamais le logo reçu du partage"
+        );
+        assert_eq!(propositions[0].qobuz_label_id.as_deref(), Some("q-7"));
+        assert_eq!(propositions[0].mb_label_id.as_deref(), Some("mb-1"));
+        assert_eq!(propositions[0].octets, PNG);
+        assert!(web.entree("Verve").unwrap().partage);
+
+        // Une seconde ouverture : rien à demander, rien à reproposer.
+        assert!(
+            lancer_passe_web(
+                web.clone(),
+                qobuz,
+                catalogue,
+                Some(partage.clone()),
+                demandes_de(&["ECM Records", "Verve", "Warp"]),
+                Duration::ZERO,
+                toujours,
+            )
+            .is_none()
+        );
+        assert_eq!(partage.propositions.lock().unwrap().len(), 2);
+
+        // Et la liste dit d'où vient le logo.
+        let label = |nom: &str| LabelDeBibliotheque {
+            nom: nom.into(),
+            album_count: 1,
+            album_qobuz: None,
+            release_mb: None,
+        };
+        let qobuz_vide = CacheLogosLabels::ouvrir(dossier.path());
+        assert_eq!(
+            element(&qobuz_vide, &web, &label("ECM Records"))["image_credit"]["via"],
+            "community"
+        );
+        assert!(
+            element(&qobuz_vide, &web, &label("Verve"))["image_credit"]
+                .get("via")
+                .is_none()
+        );
+    }
+
+    /// Sans consentement communautaire, rien n'est proposé ; la lecture du
+    /// partage, elle, a lieu.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sans_consentement_rien_n_est_propose_7414() {
+        let dossier = tune_core::test_scratch::scratch_dir("labels-7414-sans-consentement");
+        let web = Arc::new(CacheLogosLabels::ouvrir_index(
+            dossier.path(),
+            FICHIER_INDEX_WEB,
+        ));
+        let qobuz = Arc::new(CacheLogosLabels::ouvrir(dossier.path()));
+        let partage = Arc::new(FauxPartage::default());
+
+        lancer_passe_web(
+            web.clone(),
+            qobuz,
+            Arc::new(WebAttribue::default()),
+            Some(partage.clone()),
+            demandes_de(&["Verve"]),
+            Duration::ZERO,
+            toujours,
+        )
+        .expect("une passe")
+        .await
+        .unwrap();
+
+        assert_eq!(partage.consultations.lock().unwrap().len(), 1);
+        assert!(partage.propositions.lock().unwrap().is_empty());
+        assert!(!web.entree("Verve").unwrap().partage);
+    }
+
+    /// Un partage muet ne bloque rien : le web prend tous les labels.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn un_partage_muet_laisse_tout_au_web_7414() {
+        let dossier = tune_core::test_scratch::scratch_dir("labels-7414-muet");
+        let web = Arc::new(CacheLogosLabels::ouvrir_index(
+            dossier.path(),
+            FICHIER_INDEX_WEB,
+        ));
+        let qobuz = Arc::new(CacheLogosLabels::ouvrir(dossier.path()));
+        let catalogue = Arc::new(WebAttribue::default());
+        let partage = Arc::new(FauxPartage {
+            muet: true,
+            ..Default::default()
+        });
+
+        let trouves = lancer_passe_web(
+            web.clone(),
+            qobuz,
+            catalogue.clone(),
+            Some(partage),
+            demandes_de(&["ECM Records", "Verve"]),
+            Duration::ZERO,
+            toujours,
+        )
+        .expect("une passe")
+        .await
+        .unwrap();
+
+        assert_eq!(trouves, 2);
+        assert_eq!(catalogue.0.lock().unwrap().len(), 2);
+        assert!(!web.entree("ECM Records").unwrap().communaute);
     }
 }

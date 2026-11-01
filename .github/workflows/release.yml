@@ -177,7 +177,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding","dst"]}
-            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,mon-theme
+            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,aes67,mon-theme
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -188,7 +188,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding","dst"]}
-            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,mon-theme
+            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,aes67,mon-theme
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -380,7 +380,7 @@ jobs:
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding","dst"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,mon-theme
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,aes67,mon-theme
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
@@ -394,12 +394,12 @@ jobs:
       - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","asio","postgres","plugins-wasm","audio-embedding","dst"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,mon-theme
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,aes67,mon-theme
 
       - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
         # plugin-catalog: {"features":"all","base":["postgres","plugins-wasm","audio-embedding","dst"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,mon-theme
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,aes67,mon-theme
 
       # Garde-fou #3355 : le relais cloud doit etre DANS chaque binaire livre,
       # pas seulement dans la ligne `--features` qui l'a construit.
@@ -1509,12 +1509,39 @@ jobs:
   # ANNULÉ ne crée donc rien non plus. Les deux égalités suffiraient à elles
   # seules ; elles sont écrites en clair pour que la porte se lise sans
   # connaître cette règle.
+  # ─── Le mini-lecteur de bureau (tune-widget) ──────────────────────────
+  #
+  # Go de Bertrand du 31/10/2026 : le mini-lecteur part avec la release. Il
+  # n'est PAS dans la matrice `build` : c'est un workspace Tauri isole
+  # (`tune-widget/`, exclu du workspace racine), avec sa propre recette
+  # signee et notarisee, `widget.yml`, qu'on appelle telle quelle plutot que
+  # de la recopier ici — deux recettes divergeraient au premier correctif.
+  #
+  # Ses artefacts (`tune-widget-<tag>-macos-*.dmg`,
+  # `tune-widget-<tag>-windows-x86_64-setup.exe`) sont ramasses par le job
+  # `release` avec les autres `*.dmg` / `*.exe`, et entrent donc dans
+  # SHA256SUMS et sa signature minisign. Leur prefixe les tient hors de la
+  # liste blanche `tune-server-` du client de mise a jour
+  # (`find_archive_asset`) et de la page /download.
+  #
+  # Il est dans les `needs` de `release` : une release qui annonce le
+  # mini-lecteur ne part pas sans lui. Le plafond de duree vit dans
+  # widget.yml (GitHub refuse `timeout-minutes` sur un job `uses:`).
+  widget:
+    name: Build desktop mini-player
+    needs: preflight
+    uses: ./.github/workflows/widget.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+    secrets: inherit
+
   release:
     name: Create Release
-    needs: [preflight, build]
+    needs: [preflight, build, widget]
     if: >-
       needs.preflight.result == 'success'
       && needs.build.result == 'success'
+      && needs.widget.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # Create Release — 1 min ; marge pour les 3 essais minisign (10 min 40 au pire)
     steps:
