@@ -421,7 +421,16 @@ async fn dashboard(State(state): State<AppState>, Query(p): Query<DashboardParam
     let period = p.period.as_deref().unwrap_or("30d");
     let top_n = p.top_n.unwrap_or(10);
     let repo = HistoryRepo::with_backend(state.backend.clone());
-    match repo.full_dashboard(period, p.zone_id, p.profile_id, top_n) {
+    // #7634 — une quinzaine d'agrégats synchrones sur l'historique : hors de
+    // l'exécuteur async, pour ne pas immobiliser un fil de travail pendant
+    // tout le calcul (les autres requêtes de la page attendaient derrière).
+    let (periode, zone_id, profile_id) = (period.to_string(), p.zone_id, p.profile_id);
+    let calcul = tokio::task::spawn_blocking(move || {
+        repo.full_dashboard(&periode, zone_id, profile_id, top_n)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("full_dashboard interrompu : {e}")));
+    match calcul {
         Ok(data) => Json(json!(data)),
         Err(e) => {
             tracing::error!(error = %e, period, "full_dashboard_failed");
