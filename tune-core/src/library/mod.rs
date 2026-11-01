@@ -47,8 +47,6 @@ pub mod quality;
 pub mod regle_compilation;
 /// Où vit la règle de choix des versions : par profil, puis globale (#2264).
 pub mod regle_de_version;
-/// La révision de la bibliothèque, pour le cache du client (#7619, L5).
-pub mod revision;
 pub mod smart_collections;
 pub mod track_matcher;
 /// Les exemplaires d'un enregistrement qui sont en base (#2264).

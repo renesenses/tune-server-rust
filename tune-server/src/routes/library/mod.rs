@@ -62,8 +62,8 @@ mod query_multi;
 mod ratings;
 mod reidentify;
 mod reports;
-/// #7619 (L5) — la révision de la bibliothèque pour le cache du client.
-pub(crate) mod revision;
+/// #7619 (L5) — la révision de la bibliothèque, lue par le cache du client.
+mod revision;
 // tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
 // fichiers de CETTE machine.
 pub(crate) mod reveler;
@@ -862,11 +862,6 @@ pub fn router() -> Router<AppState> {
             "/collection-folders/items/{kind}/{id}",
             post(collection_folders::place_item).delete(collection_folders::remove_item),
         )
-        // #7619 (L5) — en dernier : la couche enveloppe TOUTES les routes
-        // ci-dessus. Une route ajoutée après cette ligne lui échapperait.
-        .layer(axum::middleware::from_fn(
-            revision::suivre_les_modifications,
-        ))
 }
 
 #[cfg(test)]

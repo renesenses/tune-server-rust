@@ -49,12 +49,6 @@ impl EventBus {
 
     /// Emit an event to all current subscribers.
     pub fn emit(&self, event_type: &str, data: Value) {
-        // #7619 (L5) — tout événement de la bibliothèque avance sa révision,
-        // AVANT l'envoi : un client qui relit la révision en recevant
-        // l'événement voit déjà la nouvelle.
-        if crate::library::revision::evenement_de_bibliotheque(event_type) {
-            crate::library::revision::avancer();
-        }
         let _ = self.tx.send(TuneEvent {
             event_type: event_type.into(),
             data,
@@ -103,14 +97,6 @@ mod tests {
         let e1 = rx1.recv().await.unwrap();
         let e2 = rx2.recv().await.unwrap();
         assert_eq!(e1.event_type, e2.event_type);
-    }
-
-    #[test]
-    fn un_evenement_de_bibliotheque_avance_la_revision() {
-        let bus = EventBus::new();
-        let avant = crate::library::revision::courante();
-        bus.emit("library.updated", json!({}));
-        assert_ne!(avant, crate::library::revision::courante());
     }
 
     #[tokio::test]
