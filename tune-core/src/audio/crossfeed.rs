@@ -89,12 +89,49 @@ pub const PREFIXE_FAMILLE_CROSSFEED: &str = "crossfeed-";
 ///
 /// Sans dépendance hors de ce fichier : il est aussi compilé SEUL par l'oracle
 /// de parité DSP (`sdk/scripts/verify_dsp_parity.py`).
+///
+/// #7616 — l'étage `crosstalk` ([`ID_CROSSTALK`]) éteint lui aussi le
+/// crossfeed intégré, et c'est lui que cette fonction rend dès qu'il est
+/// demandé : il l'emporte sur toute la famille du crossfeed
+/// ([`etages_tiers_en_service`]).
 pub fn etage_tiers_qui_remplace_le_crossfeed(
     tiers: &[(String, serde_json::Value)],
 ) -> Option<&str> {
-    tiers.iter().map(|(id, _)| id.as_str()).find(|id| {
-        id.len() > PREFIXE_FAMILLE_CROSSFEED.len() && id.starts_with(PREFIXE_FAMILLE_CROSSFEED)
-    })
+    let ids = || tiers.iter().map(|(id, _)| id.as_str());
+    ids()
+        .find(|id| *id == ID_CROSSTALK)
+        .or_else(|| ids().find(|id| est_de_la_famille_du_crossfeed(id)))
+}
+
+/// L'identifiant appartient-il à la famille du crossfeed (`crossfeed-…`) ?
+pub fn est_de_la_famille_du_crossfeed(id: &str) -> bool {
+    id.len() > PREFIXE_FAMILLE_CROSSFEED.len() && id.starts_with(PREFIXE_FAMILLE_CROSSFEED)
+}
+
+/// #7616 — identifiant du greffon natif tiers `crosstalk`, un traitement pour
+/// ENCEINTES. Un crossfeed (casque) et lui travaillent en sens contraires sur
+/// la même paire de voies : une zone ne les cumule JAMAIS.
+pub const ID_CROSSTALK: &str = "crosstalk";
+
+/// #7616 — étage casque EXCLUSIF : les étages tiers demandés par la zone qui
+/// restent en service. Quand `crosstalk` en fait partie, tout étage de la
+/// famille du crossfeed est écarté (et le crossfeed intégré se tait, voir
+/// [`etage_tiers_qui_remplace_le_crossfeed`]). Sans `crosstalk`, la liste est
+/// rendue telle quelle.
+///
+/// Règle de priorité : `crosstalk` l'emporte TOUJOURS. Les réglages ne
+/// gardent aucun ordre de pose entre deux greffons (une ligne par greffon,
+/// sans date), donc « le dernier coché » ne serait pas décidable sans
+/// migration ; une priorité fixe donne le même résultat sur chaque chemin
+/// (sortie locale, bras streaming, relais réseau, ré-encodage, chemin du
+/// signal, empreinte du cache).
+pub fn etages_tiers_en_service(
+    mut tiers: Vec<(String, serde_json::Value)>,
+) -> Vec<(String, serde_json::Value)> {
+    if tiers.iter().any(|(id, _)| id == ID_CROSSTALK) {
+        tiers.retain(|(id, _)| !est_de_la_famille_du_crossfeed(id));
+    }
+    tiers
 }
 
 pub struct CrossfeedProcessor {
@@ -148,8 +185,9 @@ impl CrossfeedProcessor {
         ombre: Option<tune_plugin_crossfeed::OmbreDeTete>,
         tiers: &[(String, serde_json::Value)],
     ) -> Self {
-        // Un greffon tiers de la famille du crossfeed demandé par la zone
-        // éteint le crossfeed intégré : jamais les deux en série.
+        // Un greffon tiers de la famille du crossfeed, ou `crosstalk` (#7616),
+        // demandé par la zone éteint le crossfeed intégré : jamais les deux
+        // en série.
         let reglage = reglage.filter(|_| etage_tiers_qui_remplace_le_crossfeed(tiers).is_none());
         let mut processeur = match reglage {
             Some((amount, delay_ms)) => Self::avec_ombre(sample_rate, amount, delay_ms, ombre),
@@ -163,7 +201,13 @@ impl CrossfeedProcessor {
                 sample_rate,
             },
         };
+        // #7616 — `crosstalk` demandé : aucun étage de la famille du
+        // crossfeed n'est préparé à côté de lui.
+        let crosstalk = tiers.iter().any(|(id, _)| id == ID_CROSSTALK);
         for (id, reglage) in tiers {
+            if crosstalk && est_de_la_famille_du_crossfeed(id) {
+                continue;
+            }
             // Directement au registre natif, sans passer par
             // `super::natifs_tiers` : ce fichier est aussi compilé SEUL par
             // l'oracle de parité DSP (`sdk/scripts/verify_dsp_parity.py`). Les
@@ -1453,6 +1497,56 @@ mod famille_du_crossfeed_tests {
         assert!(
             p.amount() > 0.0,
             "un étage tiers d'une autre famille s'ajoute, il ne remplace rien"
+        );
+    }
+
+    /// #7616 — étage casque exclusif : `crosstalk` demandé, ni le crossfeed
+    /// intégré ni aucun étage `crossfeed-…` ne restent en service. Les autres
+    /// familles d'étages tiers ne sont pas touchées.
+    #[test]
+    fn crosstalk_ecarte_toute_la_famille_du_crossfeed_7616() {
+        let demandes = vec![
+            etage("crossfeed-essai"),
+            etage("crosstalk"),
+            etage("greffon-gain"),
+        ];
+        let ids = |v: &[(String, serde_json::Value)]| {
+            v.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&etages_tiers_en_service(demandes.clone())),
+            vec!["crosstalk", "greffon-gain"],
+            "jamais crossfeed et crosstalk ensemble"
+        );
+        assert_eq!(
+            etage_tiers_qui_remplace_le_crossfeed(&demandes),
+            Some("crosstalk"),
+            "crosstalk l'emporte, même trié après un crossfeed-…"
+        );
+        // Sans crosstalk, rien ne change.
+        let sans = vec![etage("crossfeed-essai"), etage("greffon-gain")];
+        assert_eq!(ids(&etages_tiers_en_service(sans.clone())), ids(&sans));
+        assert_eq!(
+            etage_tiers_qui_remplace_le_crossfeed(&sans),
+            Some("crossfeed-essai")
+        );
+        // Un voisin au nom proche n'est pas crosstalk.
+        for voisin in ["crosstalk-pro", "xcrosstalk", "crosstal"] {
+            let v = vec![etage("crossfeed-essai"), etage(voisin)];
+            assert_eq!(
+                ids(&etages_tiers_en_service(v.clone())),
+                ids(&v),
+                "{voisin}"
+            );
+        }
+        // Le crossfeed intégré se tait devant crosstalk seul.
+        let p = CrossfeedProcessor::composer(48_000, Some((0.3, 0.3)), &[etage("crosstalk")]);
+        assert_eq!(p.amount(), 0.0, "crossfeed intégré et crosstalk en série");
+        assert_eq!(p.gain_moyen_db(), 0.0);
+        assert!(
+            !p.decrire().iter().any(|e| e.starts_with("crossfeed:")),
+            "{:?}",
+            p.decrire()
         );
     }
 }
