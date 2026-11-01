@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use futures_util::StreamExt;
 use tracing::{debug, info, warn};
 
 /// Best-effort diagnostic counter of artwork downloads rejected with a
@@ -790,26 +791,16 @@ pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
     // Prefer the 1200px rendition for a crisp full-screen display (Now Playing
     // on Retina). Fall back to 500px if the larger size isn't available for
     // this release.
+    // Cover Art Archive a sa propre porte (`images_rapides`, 4/s) : ce n'est
+    // pas l'API MusicBrainz, et la faire attendre derrière le 1/s de
+    // MusicBrainz doublait le temps d'une pochette.
     for size in ["front-1200", "front-500"] {
         let url = format!("https://coverartarchive.org/release/{mbid}/{size}");
-        crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
-        let Ok(resp) = client
-            .get(&url)
-            .send()
-            .await
-            .inspect(crate::metadata::musicbrainz_release::constater_reponse_musicbrainz)
-        else {
-            continue;
-        };
-        if resp.status().is_success() {
-            let Ok(bytes) = resp.bytes().await else {
-                continue;
-            };
-            // Reject tiny responses (likely error pages)
-            if bytes.len() < 1000 {
-                continue;
-            }
-            return Some(bytes.to_vec());
+        // Reject tiny responses (likely error pages): `octets` exige 1000 octets.
+        if let crate::http::fetch::FetchOutcome::Success(bytes) =
+            crate::library::images_rapides::octets(&client, &url, 1000).await
+        {
+            return Some(bytes);
         }
     }
     None
@@ -832,17 +823,9 @@ pub async fn search_musicbrainz_release(artist: &str, title: &str) -> Option<Str
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
-    crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .inspect(crate::metadata::musicbrainz_release::constater_reponse_musicbrainz)
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = resp.json().await.ok()?;
+    // Porte MusicBrainz (`images_rapides`) : le limiteur partagé à 1/s,
+    // `Retry-After` honoré, échec passager compté.
+    let data = crate::library::images_rapides::json(client.get(&url), &url).await?;
     let releases = data.get("releases")?.as_array()?;
     let first = releases.first()?;
     first.get("id")?.as_str().map(|s| s.to_string())
@@ -871,17 +854,9 @@ pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
-    crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .inspect(crate::metadata::musicbrainz_release::constater_reponse_musicbrainz)
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = resp.json().await.ok()?;
+    // Porte MusicBrainz (`images_rapides`) : le limiteur partagé à 1/s,
+    // `Retry-After` honoré, échec passager compté.
+    let data = crate::library::images_rapides::json(client.get(&url), &url).await?;
     // #6463 — un score élevé ne dit pas l'identité : « Christophe » rendait
     // d'abord Christophe Beck. Seul un nom identique, et unique, est retenu.
     crate::metadata::mb_choisir_artiste(&data, trimmed)
@@ -921,11 +896,8 @@ async fn fetch_itunes_cover(artist: &str, title: &str) -> Option<Vec<u8>> {
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = resp.json().await.ok()?;
+    // iTunes Search : environ 20 requêtes par minute (porte `images_rapides`).
+    let data = crate::library::images_rapides::json(client.get(&url), &url).await?;
     let art100 = data
         .get("results")?
         .as_array()?
@@ -933,11 +905,9 @@ async fn fetch_itunes_cover(artist: &str, title: &str) -> Option<Vec<u8>> {
         .get("artworkUrl100")?
         .as_str()?;
     async fn dl(client: &reqwest::Client, u: &str) -> Option<Vec<u8>> {
-        let r = client.get(u).send().await.ok()?;
-        if !r.status().is_success() {
-            return None;
-        }
-        r.bytes().await.ok().map(|b| b.to_vec())
+        crate::library::images_rapides::octets(client, u, 1)
+            .await
+            .into_bytes()
     }
     if let Some(hi) = itunes_hires_url(art100)
         && let Some(bytes) = dl(&client, &hi).await
@@ -981,6 +951,24 @@ pub async fn batch_enrich_artwork_scoped(
         );
     }
 
+    // Cache négatif (01/11/2026) : un album qu'aucune source ne connaissait
+    // n'est retenté qu'après `images_rapides::DELAI_ABSENT_S`, sauf passe à
+    // portée (un dossier, un album).
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
+    let mut absents = crate::library::images_rapides::CacheNegatif::charger(
+        &settings,
+        crate::library::images_rapides::CLE_ABSENTS_ALBUMS,
+    );
+    if scope.is_none() {
+        let avant = albums.len();
+        let t = crate::library::images_rapides::maintenant();
+        albums.retain(|(id, ..)| absents.a_retenter(*id, t));
+        let ecartes = avant - albums.len();
+        if ecartes > 0 {
+            info!(ecartes, "batch_artwork_absents_ecartes");
+        }
+    }
+
     if albums.is_empty() {
         info!("batch_artwork_skip_all_have_covers");
         return;
@@ -991,65 +979,84 @@ pub async fn batch_enrich_artwork_scoped(
     let mut enriched = 0u32;
     let mut searched = 0u32;
     let mut failed = 0u32;
+    let mut traites = 0usize;
 
-    for (album_id, title, artist_name, mbid) in &albums {
-        // Même traitement, même carte à l'écran que les images d'artistes :
-        // « Pochettes d'artistes » couvre les deux passes de `library::artwork`.
-        crate::taches_de_fond::attendre_son_tour(crate::taches_de_fond::Tache::ImagesArtistes)
-            .await;
-        let artist = artist_name.as_deref().unwrap_or("Unknown Artist");
+    // Plusieurs albums à la fois (`images_rapides::ELEMENTS_EN_PARALLELE`),
+    // chaque requête par la porte de son service : MusicBrainz 1/s, Cover Art
+    // Archive 4/s, iTunes 20/min. L'admission reste un album à la fois.
+    let chercher = |(album_id, title, artist_name, mbid): &(
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+    )| {
+        let album_id = *album_id;
+        let title = title.clone();
+        let artist = artist_name
+            .clone()
+            .unwrap_or_else(|| "Unknown Artist".to_string());
+        let mbid = mbid.clone().filter(|m| !m.is_empty());
+        let db = &db;
+        crate::library::images_rapides::en_comptant_les_transitoires(async move {
+            // Step 1: Determine MBID — use existing or search MusicBrainz
+            let mut cherche = false;
+            let mbid_to_use = match mbid {
+                Some(id) => Some(id),
+                None => {
+                    cherche = true;
+                    let found = search_musicbrainz_release(&artist, &title).await;
+                    if let Some(ref id) = found {
+                        // Store the discovered MBID on the album for future use
+                        db.execute(
+                            "UPDATE albums SET musicbrainz_release_id = ? WHERE id = ? AND (musicbrainz_release_id IS NULL OR musicbrainz_release_id = '')",
+                            &[&id.as_str() as &dyn crate::db::backend::ToSqlValue, &album_id],
+                        ).ok();
+                        debug!(album_id, mbid = %id, album = %title, "batch_artwork_mbid_found");
+                    }
+                    found
+                }
+            };
 
-        // Step 1: Determine MBID — use existing or search MusicBrainz
-        let resolved_mbid = if let Some(id) = mbid {
-            if !id.is_empty() {
-                Some(id.clone())
+            // Step 2: Cover Art Archive first (needs an MBID); fall back to
+            // Apple/iTunes artwork, which needs no MBID and has a far denser
+            // catalog for mainstream music. Without this fallback, albums with
+            // no MB match or no CAA image never got a cover (Fabien: 0/22).
+            let mut fetched: Option<Vec<u8>> = None;
+            if let Some(ref mbid_val) = mbid_to_use {
+                fetched = fetch_cover_art(mbid_val).await;
+                if fetched.is_none() {
+                    debug!(album_id, album = %title, mbid = %mbid_val, "batch_artwork_caa_not_found");
+                }
             } else {
-                None
+                debug!(album_id, album = %title, artist = %artist, "batch_artwork_no_mbid");
             }
-        } else {
-            None
-        };
+            if fetched.is_none() && artist != "Unknown Artist" {
+                fetched = fetch_itunes_cover(&artist, &title).await;
+                if fetched.is_some() {
+                    debug!(album_id, album = %title, "batch_artwork_itunes_found");
+                }
+            }
+            (album_id, title, artist, cherche, fetched)
+        })
+    };
+    let mut resultats = std::pin::pin!(crate::library::images_rapides::en_parallele_borne(
+        albums.iter(),
+        crate::library::images_rapides::ELEMENTS_EN_PARALLELE,
+        || {
+            // Même traitement, même carte à l'écran que les images d'artistes :
+            // « Pochettes d'artistes » couvre les deux passes de `library::artwork`.
+            crate::taches_de_fond::attendre_son_tour(crate::taches_de_fond::Tache::ImagesArtistes)
+        },
+        chercher,
+    ));
 
-        let mbid_to_use = if let Some(id) = resolved_mbid {
-            Some(id)
-        } else {
-            // Search MusicBrainz for the release (the shared MB rate limiter
-            // inside `search_musicbrainz_release` enforces the ~1 req/s spacing).
+    while let Some(((album_id, title, artist, cherche, fetched), transitoires)) =
+        resultats.next().await
+    {
+        traites += 1;
+        if cherche {
             searched += 1;
-            let found = search_musicbrainz_release(artist, title).await;
-            if let Some(ref id) = found {
-                // Store the discovered MBID on the album for future use
-                db.execute(
-                    "UPDATE albums SET musicbrainz_release_id = ? WHERE id = ? AND (musicbrainz_release_id IS NULL OR musicbrainz_release_id = '')",
-                    &[&id.as_str() as &dyn crate::db::backend::ToSqlValue, album_id],
-                ).ok();
-                debug!(album_id, mbid = %id, album = %title, "batch_artwork_mbid_found");
-            }
-            found
-        };
-
-        // Step 2: Cover Art Archive first (needs an MBID; the shared MB rate
-        // limiter inside `fetch_cover_art` enforces the ~1 req/s spacing);
-        // fall back to Apple/iTunes artwork, which needs no MBID and has a far
-        // denser catalog for mainstream music. Without this fallback, albums
-        // with no MB match or no CAA image never got a cover (Fabien: 0/22).
-        let mut fetched: Option<Vec<u8>> = None;
-        if let Some(ref mbid_val) = mbid_to_use {
-            fetched = fetch_cover_art(mbid_val).await;
-            if fetched.is_none() {
-                debug!(album_id, album = %title, mbid = %mbid_val, "batch_artwork_caa_not_found");
-            }
-        } else {
-            debug!(album_id, album = %title, artist = %artist, "batch_artwork_no_mbid");
         }
-        if fetched.is_none() && artist != "Unknown Artist" {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            fetched = fetch_itunes_cover(artist, title).await;
-            if fetched.is_some() {
-                debug!(album_id, album = %title, "batch_artwork_itunes_found");
-            }
-        }
-
         match fetched {
             Some(data) => {
                 // Adressage par le CONTENU (#1444). L'ancienne clé était
@@ -1062,11 +1069,12 @@ pub async fn batch_enrich_artwork_scoped(
                 if let Some(hash) = cache_fetched_image(&data, &cache_dir, "jpg") {
                     album_repo
                         .update_cover_path(
-                            *album_id,
+                            album_id,
                             &hash,
                             crate::db::models::SourcePochette::Fournisseur,
                         )
                         .ok();
+                    absents.oublier(album_id);
                     enriched += 1;
                     info!(
                         album_id,
@@ -1083,10 +1091,19 @@ pub async fn batch_enrich_artwork_scoped(
             }
             None => {
                 failed += 1;
-                debug!(album_id, album = %title, artist = %artist, "batch_artwork_not_found");
+                // « Absent partout » seulement sans échec passager.
+                if transitoires == 0 {
+                    absents.noter_absent(album_id, crate::library::images_rapides::maintenant());
+                }
+                debug!(album_id, album = %title, artist = %artist, transitoires, "batch_artwork_not_found");
             }
         }
+        if traites % 100 == 0 {
+            absents.enregistrer(&settings, crate::library::images_rapides::maintenant());
+        }
     }
+    drop(resultats);
+    absents.enregistrer(&settings, crate::library::images_rapides::maintenant());
 
     info!(
         total = albums.len(),
@@ -1094,7 +1111,6 @@ pub async fn batch_enrich_artwork_scoped(
     );
 
     // Store result in settings for status reporting
-    let settings = crate::db::settings_repo::SettingsRepo::with_backend(db);
     settings
         .set(
             "artwork_enrich_result",
@@ -1181,100 +1197,74 @@ pub async fn fetch_artist_image_avec_source(
     lastfm_key: &str,
     refusees: &[String],
 ) -> Option<(Vec<u8>, SourceImageArtiste)> {
+    use crate::library::images_rapides::premiere_retenue;
     use SourceImageArtiste as S;
+    use futures_util::FutureExt;
     let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
-
-    // 1. Mozaiklabs community by MBID (fastest, no rate limit) — highest priority
-    if !mbid.is_empty()
-        && let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid)
+    let client = &client;
+    // Ne télécharger que la gagnante, et passer à la suivante si son image
+    // est refusée (empreinte rejetée, téléchargement raté).
+    let retenir = |_: S, url: String| async move {
+        download_image(client, &url)
             .await
             .and_then(|b| image_retenue(b, refusees))
-    {
-        return Some((bytes, S::Mozaiklabs));
-    }
+    };
 
-    // 1b. Mozaiklabs community by NAME — keeps mozaiklabs the top priority even
-    // for artists without an MBID (which never reach the by-MBID lookup above),
-    // BEFORE falling back to any external source.
-    if !artist_name.is_empty()
-        && let Some(bytes) = fetch_artist_image_mozaiklabs_by_name(&client, artist_name)
-            .await
-            .and_then(|b| image_retenue(b, refusees))
-    {
-        return Some((bytes, S::Mozaiklabs));
-    }
-
-    // Sources 2–5 are keyed by MBID; skip them entirely for artists without one
-    // (avoids pointless requests + their rate-limit sleeps during a force pass).
+    // 1. Le site d'abord (par MBID, puis par NOM pour un artiste sans MBID),
+    // AVANT toute source externe : rien n'est demandé dehors pour un artiste
+    // que le site connaît. Les deux recherches partent ensemble.
+    let mut cloud: Vec<(S, futures_util::future::BoxFuture<'_, Option<String>>)> = Vec::new();
     if !mbid.is_empty() {
-        // 2. Fanart.tv
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if let Some(bytes) = fetch_artist_image_fanart(&client, mbid)
-            .await
-            .and_then(|b| image_retenue(b, refusees))
-        {
-            return Some((bytes, S::Fanart));
-        }
-
-        // 3. TheAudioDB (free API, good coverage)
-        if let Some(bytes) = fetch_artist_image_theaudiodb(&client, mbid)
-            .await
-            .and_then(|b| image_retenue(b, refusees))
-        {
-            return Some((bytes, S::TheAudioDb));
-        }
-
-        // 4+5. MusicBrainz: try direct image relation, then Wikidata→Wikimedia
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if let Some(bytes) = fetch_artist_image_musicbrainz_full(&client, mbid)
-            .await
-            .and_then(|b| image_retenue(b, refusees))
-        {
-            return Some((bytes, S::MusicBrainz));
-        }
+        cloud.push((S::Mozaiklabs, url_artiste_mozaiklabs(client, mbid).boxed()));
     }
-
-    // 6. Discogs (if token configured, search by artist name)
     if !artist_name.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if let Some(bytes) = fetch_artist_image_discogs(&client, artist_name, discogs_token)
-            .await
-            .and_then(|b| image_retenue(b, refusees))
-        {
-            return Some((bytes, S::Discogs));
-        }
+        cloud.push((
+            S::Mozaiklabs,
+            url_artiste_mozaiklabs_par_nom(client, artist_name).boxed(),
+        ));
+    }
+    if let Some((octets, source)) = premiere_retenue(cloud, retenir).await {
+        return Some((octets, source));
     }
 
-    // 7. Last.fm (artist.getinfo → image array, "extralarge" or "mega")
-    if !artist_name.is_empty() && !lastfm_key.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Some(bytes) = fetch_artist_image_lastfm(&client, artist_name, lastfm_key)
-            .await
-            .and_then(|b| image_retenue(b, refusees))
-        {
-            return Some((bytes, S::LastFm));
-        }
+    // 2. Les sources externes, interrogées EN PARALLÈLE, la meilleure gardée
+    // dans l'ordre historique de la cascade : Fanart.tv, TheAudioDB,
+    // MusicBrainz (relation d'image, puis Wikidata), Discogs, Last.fm,
+    // Deezer. Chaque requête passe par la porte de son service
+    // (`images_rapides::passer`) : débit et simultanéité bornés par service,
+    // plus aucun délai fixe entre deux marches. Les sources par MBID sont
+    // sautées pour un artiste qui n'en a pas.
+    let mut externes: Vec<(S, futures_util::future::BoxFuture<'_, Option<String>>)> = Vec::new();
+    if !mbid.is_empty() {
+        externes.push((S::Fanart, url_artiste_fanart(client, mbid).boxed()));
+        externes.push((S::TheAudioDb, url_artiste_theaudiodb(client, mbid).boxed()));
+        externes.push((
+            S::MusicBrainz,
+            url_artiste_musicbrainz(client, mbid).boxed(),
+        ));
     }
-
-    // 8. Deezer. Pas de clé, et c'est souvent la seule photo d'un soliste ou
-    // d'un petit ensemble classique (Rachel Podger, Jacques Loussier Trio)
-    // quand Wikidata n'a pas de P18. Même garde que Discogs : nom exact, un
-    // seul homonyme, pas l'image vide de Deezer.
     if !artist_name.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Some(bytes) = fetch_artist_image_deezer(&client, artist_name)
-            .await
-            .and_then(|b| image_retenue(b, refusees))
-        {
-            return Some((bytes, S::Deezer));
+        externes.push((
+            S::Discogs,
+            url_artiste_discogs(client, artist_name, discogs_token).boxed(),
+        ));
+        if !lastfm_key.is_empty() {
+            externes.push((
+                S::LastFm,
+                url_artiste_lastfm(client, artist_name, lastfm_key).boxed(),
+            ));
         }
+        // Deezer. Pas de clé, et c'est souvent la seule photo d'un soliste
+        // ou d'un petit ensemble classique (Rachel Podger, Jacques Loussier
+        // Trio) quand Wikidata n'a pas de P18. Même garde que Discogs : nom
+        // exact, un seul homonyme, pas l'image vide de Deezer.
+        externes.push((S::Deezer, url_artiste_deezer(client, artist_name).boxed()));
     }
-
-    None
+    premiere_retenue(externes, retenir).await
 }
 
 /// Portrait d'un crédit collé, emprunté à l'un de ses membres.
@@ -1295,7 +1285,8 @@ async fn image_depuis_un_membre(
         return None;
     }
     for membre in membres {
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        // Plus de seconde fixe ici : la recherche passe par le limiteur
+        // MusicBrainz partagé, qui tient déjà 1 requête par seconde.
         let mbid = search_musicbrainz_artist(&membre).await.unwrap_or_default();
         if let Some(trouvee) =
             fetch_artist_image_avec_source(&mbid, &membre, discogs_token, lastfm_key, refusees)
@@ -1312,63 +1303,56 @@ async fn image_depuis_un_membre(
     None
 }
 
-/// Fetch an artist thumbnail from Fanart.tv using a MusicBrainz artist ID.
-async fn fetch_artist_image_fanart(client: &reqwest::Client, mbid: &str) -> Option<Vec<u8>> {
+/// L'adresse de la vignette Fanart.tv d'un artiste, par son MBID.
+async fn url_artiste_fanart(client: &reqwest::Client, mbid: &str) -> Option<String> {
     let api_key = std::env::var("FANART_TV_API_KEY").ok()?;
     if api_key.is_empty() {
         return None;
     }
     let url = format!("http://webservice.fanart.tv/v3/music/{mbid}?api_key={api_key}");
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = resp.json().await.ok()?;
-    let thumb_url = data
-        .get("artistthumb")
+    let data = crate::library::images_rapides::json(client.get(&url), &url).await?;
+    data.get("artistthumb")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
         .and_then(|obj| obj.get("url"))
-        .and_then(|v| v.as_str())?;
-    download_image(client, thumb_url).await
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
-async fn fetch_artist_image_mozaiklabs(client: &reqwest::Client, mbid: &str) -> Option<Vec<u8>> {
-    let resp = client
-        .get(format!("https://mozaiklabs.fr/api/v1/artists/{mbid}"))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
+/// Une adresse d'image du site, rendue absolue.
+fn url_absolue_mozaiklabs(image_url: &str) -> Option<String> {
+    if image_url.is_empty() {
         return None;
     }
-    let data: serde_json::Value = resp.json().await.ok()?;
+    Some(if image_url.starts_with('/') {
+        format!("https://mozaiklabs.fr{image_url}")
+    } else {
+        image_url.to_string()
+    })
+}
+
+/// L'adresse de l'image d'un artiste sur le site, par son MBID.
+async fn url_artiste_mozaiklabs(client: &reqwest::Client, mbid: &str) -> Option<String> {
+    let url = format!("https://mozaiklabs.fr/api/v1/artists/{mbid}");
+    let data = crate::library::images_rapides::json(client.get(&url), &url).await?;
     let image_url = data
         .pointer("/data/image_url")
         .or_else(|| data.get("image_url"))
         .and_then(|v| v.as_str())?;
-    if image_url.is_empty() {
-        return None;
-    }
-    let full_url = if image_url.starts_with('/') {
-        format!("https://mozaiklabs.fr{image_url}")
-    } else {
-        image_url.to_string()
-    };
-    download_image(client, &full_url).await
+    url_absolue_mozaiklabs(image_url)
 }
 
-/// Fetch an artist image from mozaiklabs.fr by **name** (community metadata),
+/// The image of an artist on mozaiklabs.fr by **name** (community metadata),
 /// via `GET /api/v1/artists/search?q=<name>`. Used as a fallback for artists
 /// without an MBID so mozaiklabs stays the priority source for them too.
 ///
 /// Requires an exact (case-insensitive) name match on a result that actually
 /// has a non-empty `image_url`, to avoid grabbing the wrong artist from the
 /// substring (`ilike %q%`) search.
-async fn fetch_artist_image_mozaiklabs_by_name(
+async fn url_artiste_mozaiklabs_par_nom(
     client: &reqwest::Client,
     artist_name: &str,
-) -> Option<Vec<u8>> {
+) -> Option<String> {
     let q = artist_name.trim();
     if q.len() < 2 {
         return None;
@@ -1377,11 +1361,7 @@ async fn fetch_artist_image_mozaiklabs_by_name(
         "https://mozaiklabs.fr/api/v1/artists/search?q={}",
         urlencoding::encode(q)
     );
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = resp.json().await.ok()?;
+    let data = crate::library::images_rapides::json(client.get(&url), &url).await?;
     let results = data.get("data")?.as_array()?;
     let image_url = results
         .iter()
@@ -1395,55 +1375,29 @@ async fn fetch_artist_image_mozaiklabs_by_name(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
         })?;
-    let full_url = if image_url.starts_with('/') {
-        format!("https://mozaiklabs.fr{image_url}")
-    } else {
-        image_url.to_string()
-    };
-    download_image(client, &full_url).await
+    url_absolue_mozaiklabs(image_url)
 }
 
-/// Fetch artist image from TheAudioDB (free API key "2").
-async fn fetch_artist_image_theaudiodb(client: &reqwest::Client, mbid: &str) -> Option<Vec<u8>> {
+/// TheAudioDB (free API key "2").
+async fn url_artiste_theaudiodb(client: &reqwest::Client, mbid: &str) -> Option<String> {
     let url = format!("https://theaudiodb.com/api/v1/json/2/artist-mb.php?i={mbid}");
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = resp.json().await.ok()?;
+    let data = crate::library::images_rapides::json(client.get(&url), &url).await?;
     let artist = data["artists"].as_array()?.first()?;
-    let thumb_url = artist["strArtistThumb"]
+    artist["strArtistThumb"]
         .as_str()
         .filter(|s| !s.is_empty())
         .or_else(|| artist["strArtistFanart"].as_str().filter(|s| !s.is_empty()))
-        .or_else(|| artist["strArtistCutout"].as_str().filter(|s| !s.is_empty()))?;
-    download_image(client, thumb_url).await
+        .or_else(|| artist["strArtistCutout"].as_str().filter(|s| !s.is_empty()))
+        .map(str::to_string)
 }
 
-/// Fetch artist image from MusicBrainz: tries direct Wikimedia image relation
-/// first, then falls back to Wikidata → P18 image property.
-async fn fetch_artist_image_musicbrainz_full(
-    client: &reqwest::Client,
-    mbid: &str,
-) -> Option<Vec<u8>> {
+/// MusicBrainz : la relation d'image directe (Wikimedia Commons) si elle
+/// existe, sinon Wikidata → propriété P18 → Commons.
+async fn url_artiste_musicbrainz(client: &reqwest::Client, mbid: &str) -> Option<String> {
     let url = format!("https://musicbrainz.org/ws/2/artist/{mbid}?inc=url-rels&fmt=json");
-    crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .inspect(crate::metadata::musicbrainz_release::constater_reponse_musicbrainz)
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = resp.json().await.ok()?;
-    let relations = match data["relations"].as_array() {
-        Some(r) => r,
-        None => return None,
-    };
+    let data = crate::library::images_rapides::json(client.get(&url), &url).await?;
+    let relations = data["relations"].as_array()?;
 
-    // Try direct Wikimedia Commons image relation
     if let Some(commons_page) = relations.iter().find_map(|r| {
         if r["type"].as_str() == Some("image") {
             r["url"]["resource"].as_str().map(|s| s.to_string())
@@ -1452,17 +1406,12 @@ async fn fetch_artist_image_musicbrainz_full(
         }
     }) && let Some(filename) = commons_page.rsplit("File:").next()
     {
-        let direct_url = format!(
+        return Some(format!(
             "https://commons.wikimedia.org/wiki/Special:Redirect/file/{}?width=500",
             filename.replace(' ', "_")
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if let Some(bytes) = download_image(client, &direct_url).await {
-            return Some(bytes);
-        }
+        ));
     }
 
-    // Fallback: Wikidata relation → P18 image → Wikimedia Commons
     let wikidata_url = relations.iter().find_map(|r| {
         if r["type"].as_str() == Some("wikidata") {
             r["url"]["resource"].as_str().map(|s| s.to_string())
@@ -1474,29 +1423,23 @@ async fn fetch_artist_image_musicbrainz_full(
     if !qid.starts_with('Q') {
         return None;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    fetch_image_from_wikidata(client, qid).await
+    url_image_wikidata(client, qid).await
 }
 
-/// Resolve a Wikidata entity QID to an image via the P18 property.
-async fn fetch_image_from_wikidata(client: &reqwest::Client, qid: &str) -> Option<Vec<u8>> {
+/// L'image P18 d'une entité Wikidata, en adresse Commons.
+async fn url_image_wikidata(client: &reqwest::Client, qid: &str) -> Option<String> {
     let url = format!("https://www.wikidata.org/wiki/Special:EntityData/{qid}.json");
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = resp.json().await.ok()?;
+    let data = crate::library::images_rapides::json(client.get(&url), &url).await?;
     let image_filename = data
         .pointer(&format!("/entities/{qid}/claims/P18"))
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
         .and_then(|claim| claim.pointer("/mainsnak/datavalue/value"))
         .and_then(|v| v.as_str())?;
-    let direct_url = format!(
+    Some(format!(
         "https://commons.wikimedia.org/wiki/Special:Redirect/file/{}?width=500",
         image_filename.replace(' ', "_")
-    );
-    download_image(client, &direct_url).await
+    ))
 }
 
 /// Deux noms d'artiste désignent-ils la MÊME entrée ? À la casse et aux
@@ -1594,6 +1537,16 @@ async fn fetch_artist_image_discogs(
     artist_name: &str,
     token: Option<&str>,
 ) -> Option<Vec<u8>> {
+    let url = url_artiste_discogs(client, artist_name, token).await?;
+    download_image(client, &url).await
+}
+
+/// L'adresse de l'image Discogs d'un artiste, par son nom.
+async fn url_artiste_discogs(
+    client: &reqwest::Client,
+    artist_name: &str,
+    token: Option<&str>,
+) -> Option<String> {
     // Prefer the token passed by the caller (resolved from DB settings — where
     // the UI stores it), falling back to the environment. Previously this read
     // env only, so a Discogs token configured in the app never applied and no
@@ -1606,20 +1559,15 @@ async fn fetch_artist_image_discogs(
     if token.is_empty() {
         return None;
     }
-    let resp = client
-        .get("https://api.discogs.com/database/search")
+    const RECHERCHE: &str = "https://api.discogs.com/database/search";
+    let requete = client
+        .get(RECHERCHE)
         // Dix résultats, pas un seul : avec `per_page=1` on ne PEUT pas voir
         // qu'un homonyme existe, et on repart avec l'entrée la plus populaire.
         .query(&[("type", "artist"), ("per_page", "10"), ("q", artist_name)])
         .header("Authorization", format!("Discogs token={token}"))
-        .header("User-Agent", "TuneServer/1.0")
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = resp.json().await.ok()?;
+        .header("User-Agent", "TuneServer/1.0");
+    let data = crate::library::images_rapides::json(requete, RECHERCHE).await?;
     let Some(cover_url) = discogs_pick_cover_image(&data, artist_name) else {
         debug!(
             artist = artist_name,
@@ -1627,7 +1575,7 @@ async fn fetch_artist_image_discogs(
         );
         return None;
     };
-    download_image(client, cover_url).await
+    Some(cover_url.to_string())
 }
 
 /// Fetch artist image from Last.fm using the `artist.getinfo` endpoint.
@@ -1643,32 +1591,35 @@ async fn fetch_artist_image_lastfm(
     artist_name: &str,
     api_key: &str,
 ) -> Option<Vec<u8>> {
+    let url = url_artiste_lastfm(client, artist_name, api_key).await?;
+    download_image(client, &url).await
+}
+
+/// L'adresse de l'image Last.fm d'un artiste, par son nom exact.
+async fn url_artiste_lastfm(
+    client: &reqwest::Client,
+    artist_name: &str,
+    api_key: &str,
+) -> Option<String> {
     if api_key.is_empty() {
         return None;
     }
-    let resp = client
-        .get("https://ws.audioscrobbler.com/2.0/")
+    const API: &str = "https://ws.audioscrobbler.com/2.0/";
+    let requete = client
+        .get(API)
         .query(&[
             ("method", "artist.getinfo"),
             ("artist", artist_name),
             ("api_key", api_key),
             ("format", "json"),
         ])
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = resp.json().await.ok()?;
+        .timeout(std::time::Duration::from_secs(10));
+    let data = crate::library::images_rapides::json(requete, API).await?;
     let Some(image_url) = lastfm_pick_image_url(&data, artist_name) else {
         debug!(artist = artist_name, "artist_image_lastfm_no_exact_match");
         return None;
     };
-    let image_url = image_url.to_string();
-
-    download_image(client, &image_url).await
+    Some(image_url.to_string())
 }
 
 /// URL Deezer d'un artiste dont le nom rendu est exactement celui demandé.
@@ -1694,18 +1645,13 @@ fn deezer_pick_image_url<'a>(data: &'a serde_json::Value, artist_name: &str) -> 
         .filter(|url| !url.is_empty() && !url.contains("/images/artist//"))
 }
 
-async fn fetch_artist_image_deezer(client: &reqwest::Client, artist_name: &str) -> Option<Vec<u8>> {
+async fn url_artiste_deezer(client: &reqwest::Client, artist_name: &str) -> Option<String> {
     let url = format!(
         "https://api.deezer.com/search/artist?q={}",
         urlencoding::encode(artist_name)
     );
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = resp.json().await.ok()?;
-    let image_url = deezer_pick_image_url(&data, artist_name)?.to_string();
-    download_image(client, &image_url).await
+    let data = crate::library::images_rapides::json(client.get(&url), &url).await?;
+    deezer_pick_image_url(&data, artist_name).map(str::to_string)
 }
 
 async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
@@ -1714,7 +1660,9 @@ async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> 
     // nothing" can be diagnosed — rate-limit vs genuinely absent vs network —
     // instead of every failure being an indistinguishable `None` (#1096).
     // Behaviour is unchanged: all failure cases still return `None`.
-    match crate::http::fetch::fetch_bytes(client, url, 1000).await {
+    // Depuis le 01/11/2026, le téléchargement passe par la porte de son hôte
+    // (`images_rapides::octets`) : débit et simultanéité bornés par service.
+    match crate::library::images_rapides::octets(client, url, 1000).await {
         crate::http::fetch::FetchOutcome::Success(bytes) => Some(bytes),
         crate::http::fetch::FetchOutcome::RateLimited => {
             // Counter read per-run by the enrichment batch to report throttling.
@@ -2126,6 +2074,25 @@ async fn batch_enrich_artist_artwork_inner(
         );
     }
 
+    // Cache négatif (01/11/2026) : un artiste qu'AUCUNE source ne connaissait
+    // n'est retenté qu'après `images_rapides::DELAI_ABSENT_S`. Sur le .18, les
+    // 265 mêmes échecs coûtaient 36 min à chaque passe, pour deux images.
+    // Une passe forcée ou à portée (un artiste, un dossier) les redemande.
+    let mut absents = crate::library::images_rapides::CacheNegatif::charger(
+        &crate::db::settings_repo::SettingsRepo::with_backend(db.clone()),
+        crate::library::images_rapides::CLE_ABSENTS_ARTISTES,
+    );
+    let ecarter_les_absents = !force && scope.is_none();
+    if ecarter_les_absents {
+        let avant = artists.len();
+        let t = crate::library::images_rapides::maintenant();
+        artists.retain(|(id, ..)| absents.a_retenter(*id, t));
+        let ecartes = avant - artists.len();
+        if ecartes > 0 {
+            info!(ecartes, "batch_artist_artwork_absents_ecartes");
+        }
+    }
+
     if artists.is_empty() {
         info!("batch_artist_artwork_skip_all_have_images");
         // Store result even when nothing to fetch
@@ -2213,71 +2180,87 @@ async fn batch_enrich_artist_artwork_inner(
     let mut enriched = 0u32;
     let mut failed = 0u32;
     let total_images = artists.len();
+    let mut traites = 0usize;
 
-    for (i, (artist_id, name, mbid)) in artists.iter().enumerate() {
-        // Pause demandée par l'utilisateur : on GARE la passe entre deux
-        // artistes. La liste est calculée à l'ouverture et n'existe qu'en
-        // mémoire ; en sortir terminerait la tâche au lieu de la suspendre.
-        // L'artiste précédent a son image écrite et son avancement publié —
-        // la frontière est propre, et la reprise repart au même `i`.
-        crate::taches_de_fond::attendre_son_tour(crate::taches_de_fond::Tache::ImagesArtistes)
-            .await;
-        // Rate limit: short delay between community lookups (no rate limit),
-        // longer delay only when hitting external APIs (MusicBrainz etc.)
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Resolve a MusicBrainz ID from the artist name when the files carried
-        // no MB tag. Without it the rich image sources (Fanart/TheAudioDB/
-        // MusicBrainz) and community matching can't find this artist — the whole
-        // reason untagged libraries end up with almost no artist images. Persist
-        // it so future runs and community lookups reuse it. MB asks for ~1 req/s,
-        // so only pay that extra delay for artists we actually have to look up.
-        //
-        // #6463 — jamais pour un artiste dont l'utilisateur a détaché
-        // l'identité (« Détacher l'identité ») : la recherche par le nom lui
-        // redonnerait le MBID qu'il vient de retirer. Le MBID trouvé ne sert
-        // à chercher l'image que s'il a été écrit (provenance `nom`).
-        let mut mbid = mbid.clone();
-        if mbid.is_empty() && !artist_repo.identite_detachee(*artist_id).unwrap_or(true) {
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-            if let Some(found) = search_musicbrainz_artist(name).await
-                && artist_repo
-                    .poser_mbid(
-                        *artist_id,
-                        &found,
-                        crate::db::artist_repo::ProvenanceMbid::Nom,
-                    )
-                    .unwrap_or(false)
-            {
-                info!(artist_id, artist = %name, mbid = %found, "batch_artist_artwork_mbid_resolved");
-                mbid = found;
+    // Plusieurs artistes à la fois (`images_rapides::ELEMENTS_EN_PARALLELE`).
+    // Chaque requête passe par la porte de son service : MusicBrainz reste à
+    // 1/s pour tout le serveur, Discogs à 0,9/s, etc. L'ADMISSION reste un
+    // artiste à la fois : c'est là que la passe se gare quand l'utilisateur
+    // la suspend, et cède à la lecture (5 s entre deux artistes pendant
+    // qu'une zone joue, comme avant — la largeur ne la multiplie pas).
+    let chercher = |(artist_id, name, mbid): &(i64, String, String)| {
+        let artist_id = *artist_id;
+        let name = name.clone();
+        let mbid = mbid.clone();
+        let db = &db;
+        let artist_repo = &artist_repo;
+        let discogs_token = discogs_token.as_deref();
+        let lastfm_key = lastfm_key.as_str();
+        let liste_blanche = &liste_blanche;
+        crate::library::images_rapides::en_comptant_les_transitoires(async move {
+            // Resolve a MusicBrainz ID from the artist name when the files
+            // carried no MB tag. Without it the rich image sources (Fanart/
+            // TheAudioDB/MusicBrainz) and community matching can't find this
+            // artist. Persist it so future runs reuse it. Le limiteur
+            // MusicBrainz partagé tient déjà 1 requête par seconde : plus de
+            // seconde fixe avant la recherche.
+            //
+            // #6463 — jamais pour un artiste dont l'utilisateur a détaché
+            // l'identité (« Détacher l'identité ») : la recherche par le nom lui
+            // redonnerait le MBID qu'il vient de retirer. Le MBID trouvé ne sert
+            // à chercher l'image que s'il a été écrit (provenance `nom`).
+            let mut mbid = mbid;
+            if mbid.is_empty() && !artist_repo.identite_detachee(artist_id).unwrap_or(true) {
+                if let Some(found) = search_musicbrainz_artist(&name).await
+                    && artist_repo
+                        .poser_mbid(
+                            artist_id,
+                            &found,
+                            crate::db::artist_repo::ProvenanceMbid::Nom,
+                        )
+                        .unwrap_or(false)
+                {
+                    info!(artist_id, artist = %name, mbid = %found, "batch_artist_artwork_mbid_resolved");
+                    mbid = found;
+                }
             }
-        }
 
-        // #4837 : une image rejetée par l'utilisateur ne revient pas, de
-        // quelque source qu'elle vienne.
-        let refusees = empreintes_rejetees(&db, *artist_id, &mbid);
-        let mut image = fetch_artist_image_avec_source(
-            &mbid,
-            name,
-            discogs_token.as_deref(),
-            &lastfm_key,
-            &refusees,
-        )
-        .await;
-        // Crédit collé (« Vivaldi; Janine Jansen ») : la cascade sur la chaîne
-        // entière ne trouve rien. On emprunte le portrait d'un membre, sans
-        // recopier son MBID sur cette fiche.
-        if image.is_none() {
-            image = image_depuis_un_membre(
-                name,
-                &liste_blanche,
-                discogs_token.as_deref(),
-                &lastfm_key,
-                &refusees,
-            )
-            .await;
-        }
+            // #4837 : une image rejetée par l'utilisateur ne revient pas, de
+            // quelque source qu'elle vienne.
+            let refusees = empreintes_rejetees(db, artist_id, &mbid);
+            let mut image =
+                fetch_artist_image_avec_source(&mbid, &name, discogs_token, lastfm_key, &refusees)
+                    .await;
+            // Crédit collé (« Vivaldi; Janine Jansen ») : la cascade sur la chaîne
+            // entière ne trouve rien. On emprunte le portrait d'un membre, sans
+            // recopier son MBID sur cette fiche.
+            if image.is_none() {
+                image = image_depuis_un_membre(
+                    &name,
+                    liste_blanche,
+                    discogs_token,
+                    lastfm_key,
+                    &refusees,
+                )
+                .await;
+            }
+            (artist_id, name, mbid, image)
+        })
+    };
+    let mut resultats = std::pin::pin!(crate::library::images_rapides::en_parallele_borne(
+        artists.iter(),
+        crate::library::images_rapides::ELEMENTS_EN_PARALLELE,
+        || {
+            // Pause demandée par l'utilisateur : on GARE la passe entre deux
+            // artistes ; la liste n'existe qu'en mémoire, en sortir terminerait
+            // la tâche au lieu de la suspendre.
+            crate::taches_de_fond::attendre_son_tour(crate::taches_de_fond::Tache::ImagesArtistes)
+        },
+        chercher,
+    ));
+
+    while let Some(((artist_id, name, mbid, image), transitoires)) = resultats.next().await {
+        traites += 1;
         match image {
             Some((data, source)) => {
                 // Adressage par le CONTENU (#1444), plus par l'identité de
@@ -2293,13 +2276,15 @@ async fn batch_enrich_artist_artwork_inner(
                 // condensat des octets ferme les deux.
                 std::fs::create_dir_all(&cache_dir).ok();
                 if let Some(hash) = cache_fetched_image(&data, &cache_dir, "jpg") {
-                    artist_repo.update_image(*artist_id, &hash, "auto").ok();
+                    artist_repo.update_image(artist_id, &hash, "auto").ok();
+                    absents.oublier(artist_id);
                     enriched += 1;
                     info!(
                         artist_id,
                         artist = %name,
                         hash = %hash,
                         size = data.len(),
+                        source = source.etiquette(),
                         "batch_artist_artwork_enriched"
                     );
 
@@ -2317,7 +2302,7 @@ async fn batch_enrich_artist_artwork_inner(
                         let mbid = mbid.clone();
                         let name = name.clone();
                         let instance_id = instance_id.clone();
-                        let image_data = data.clone();
+                        let image_data = data;
                         tokio::spawn(async move {
                             if let Err(e) = crate::cloud::community::submit_artist_image(
                                 "https://mozaiklabs.fr",
@@ -2340,19 +2325,25 @@ async fn batch_enrich_artist_artwork_inner(
             }
             None => {
                 failed += 1;
-                debug!(artist_id, artist = %name, mbid = %mbid, "batch_artist_artwork_not_found");
+                // « Absent partout » seulement si aucune requête n'a échoué en
+                // passant (réseau, 429, 5xx) : sinon l'artiste revient à la
+                // passe suivante.
+                if transitoires == 0 {
+                    absents.noter_absent(artist_id, crate::library::images_rapides::maintenant());
+                }
+                debug!(artist_id, artist = %name, mbid = %mbid, transitoires, "batch_artist_artwork_not_found");
             }
         }
 
         // Publish live progress for the UI (Fabien: enrichment looked frozen).
-        if doit_publier_avancement(i + 1, total_images) {
+        if doit_publier_avancement(traites, total_images) {
             settings
                 .set(
                     "artist_artwork_enrich_result",
                     &serde_json::json!({
                         "status": "running",
                         "phase": "images",
-                        "processed": i + 1,
+                        "processed": traites,
                         "total": total_images,
                         "enriched": enriched,
                         "failed": failed,
@@ -2366,7 +2357,13 @@ async fn batch_enrich_artist_artwork_inner(
                 )
                 .ok();
         }
+        // Le cache négatif survit à un redémarrage en cours de passe.
+        if traites % 100 == 0 {
+            absents.enregistrer(&settings, crate::library::images_rapides::maintenant());
+        }
     }
+    drop(resultats);
+    absents.enregistrer(&settings, crate::library::images_rapides::maintenant());
 
     info!(
         total = artists.len(),
@@ -2397,6 +2394,12 @@ async fn batch_enrich_artist_artwork_inner(
         if let Some(scope) = &scope {
             no_mbid_artists.retain(|(id, _)| scope.contient_artiste(*id));
         }
+        // Ceux que la phase 2 vient de chercher partout (Discogs et Last.fm
+        // compris) sans rien trouver ne sont pas redemandés ici.
+        if ecarter_les_absents {
+            let t = crate::library::images_rapides::maintenant();
+            no_mbid_artists.retain(|(id, _)| absents.a_retenter(*id, t));
+        }
 
         if !no_mbid_artists.is_empty() {
             info!(
@@ -2422,7 +2425,8 @@ async fn batch_enrich_artist_artwork_inner(
                 // #4837 : ni Discogs ni Last.fm ne reposent une image rejetée.
                 let refusees = empreintes_rejetees(&db, artist_id, "");
                 async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    // Plus de délai fixe : Discogs et Last.fm passent par la
+                    // porte de leur service (`images_rapides`).
 
                     // Try Discogs first
                     if discogs_available
@@ -2443,7 +2447,6 @@ async fn batch_enrich_artist_artwork_inner(
 
                     // Fallback to Last.fm
                     if lastfm_available {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         if let Some(data) =
                             fetch_artist_image_lastfm(client, &name, lastfm_key)
                                 .await
