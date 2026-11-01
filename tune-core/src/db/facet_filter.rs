@@ -691,6 +691,107 @@ pub fn dr_album_in(engine: Engine, having: &str) -> String {
     )
 }
 
+/// #2144 (rc10) — le DR de chaque album porteur d'un tag DR, sous le jeton de
+/// la base qui l'a rendu ([`super::backend::DbBackend::jeton_des_donnees`]).
+/// Une seule entrée : une base par serveur ; l'instance fait partie du jeton.
+type DrEnCache = Option<(
+    (u64, i64),
+    std::sync::Arc<std::collections::HashMap<i64, i64>>,
+)>;
+static DR_PAR_ALBUM_EN_CACHE: std::sync::Mutex<DrEnCache> = std::sync::Mutex::new(None);
+
+/// Le DR de chaque album porteur d'un tag DR : la table dérivée
+/// [`dr_album_source`], la MÊME règle que la grille, la liste et la fiche —
+/// lue seule, une ligne par album, et gardée en mémoire tant que le jeton des
+/// données ne change pas (il change à CHAQUE écriture validée). Le rail
+/// (`facets::dr_facet`) et la liste filtrée ([`condition_dr_par_albums`])
+/// partagent cette lecture.
+///
+/// `Err` : la lecture a échoué, rien n'est gardé, la suivante réessaiera.
+pub fn dr_par_album(
+    db: &dyn super::backend::DbBackend,
+) -> Result<std::sync::Arc<std::collections::HashMap<i64, i64>>, String> {
+    // Le jeton est lu AVANT la lecture : une écriture validée entre les deux
+    // change le jeton suivant, et la carte gardée ici n'est alors plus jamais
+    // servie. L'ordre inverse pourrait garder une carte ancienne sous un
+    // jeton neuf.
+    let jeton = db.jeton_des_donnees();
+    if let Some(j) = jeton
+        && let Ok(cache) = DR_PAR_ALBUM_EN_CACHE.lock()
+        && let Some((garde, carte)) = cache.as_ref()
+        && *garde == j
+    {
+        return Ok(carte.clone());
+    }
+    let sql = format!(
+        "SELECT dr.album_id, dr.dr FROM ({}) dr",
+        dr_album_source(db.engine())
+    );
+    let carte: std::sync::Arc<std::collections::HashMap<i64, i64>> = std::sync::Arc::new(
+        db.query_many(&sql, &[])?
+            .into_iter()
+            .filter_map(|row| {
+                let mut it = row.into_iter();
+                Some((it.next()?.as_i64()?, it.next()?.as_i64()?))
+            })
+            .collect(),
+    );
+    if let Some(j) = jeton
+        && let Ok(mut cache) = DR_PAR_ALBUM_EN_CACHE.lock()
+    {
+        *cache = Some((j, carte.clone()));
+    }
+    Ok(carte)
+}
+
+/// Prédicat « l'album de CETTE piste porte l'un des DR `drs` » — alias `t`,
+/// le même ensemble que [`dr_album_in`] sur `DR_ALBUM_VALUE IN (drs)`, mais
+/// posé en liste d'albums déjà résolue (#7580).
+///
+/// # Pourquoi
+///
+/// [`dr_album_in`] est une sous-requête NON corrélée : SQLite l'évalue une
+/// fois par requête — mais elle relit À CHAQUE FOIS toutes les lignes DR de
+/// `track_metadata`, les regroupe par album et calcule leur DR (75 ms au banc
+/// de 103 500 pistes, la moitié de la page). La vue Oxygen la payait à
+/// chaque page de la liste, et deux fois par page sur le chemin
+/// `list_filtered` (le compte, puis la page). La carte de [`dr_par_album`]
+/// est gardée sous le jeton des données : la sous-requête n'est plus jouée
+/// qu'une fois entre deux écritures, et la liste cherche ses pistes par
+/// l'index de l'album.
+///
+/// Mêmes pistes rendues : un album est dans la liste si et seulement si la
+/// sous-requête l'aurait rendu (même table dérivée, même valeur ; un album
+/// NUL n'y est dans aucun des deux cas). Aucun album ne porte ces DR : `1 = 0`.
+///
+/// `None` : la carte n'a pas pu être lue ; l'appelant pose [`dr_album_in`],
+/// plus lent, jamais faux.
+pub fn condition_dr_par_albums(db: &dyn super::backend::DbBackend, drs: &[i64]) -> Option<String> {
+    let carte = match dr_par_album(db) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "filtre_dr_carte_non_lue");
+            return None;
+        }
+    };
+    let mut albums: Vec<i64> = carte
+        .iter()
+        .filter(|(_, dr)| drs.contains(dr))
+        .map(|(album, _)| *album)
+        .collect();
+    if albums.is_empty() {
+        return Some("1 = 0".to_string());
+    }
+    // Trié : le même texte pour la même sélection, d'une requête à l'autre.
+    albums.sort_unstable();
+    let liste = albums
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("t.album_id IN ({liste})"))
+}
+
 /// Prédicat « cet album n'est PAS masqué » (#1391), pour les requêtes
 /// d'ALBUMS — alias `a`, celui de `AlbumRepo::sql::select_album()`.
 ///

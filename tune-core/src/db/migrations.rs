@@ -3811,6 +3811,24 @@ pub(crate) const UPNP_NUMEROS_ZERO_A_NULL: &str = "UPDATE tracks SET track_numbe
      WHERE source = 'upnp' AND track_number = 0;
      UPDATE tracks SET disc_number = NULL WHERE source = 'upnp' AND disc_number = 0;";
 
+/// Audit des performances de la base (31/10/2026, .18 : 96 496 pistes) — le
+/// rayon « Les plus écoutés » de l'accueil, `/library/history/top-tracks`,
+/// le tableau de bord et le widget passent tous par
+/// [`super::history_repo::sql::top_tracks`], qui résout l'identifiant d'une
+/// écoute par son TITRE (`LEFT JOIN tracks t3 ON t3.title = h.title`).
+///
+/// Aucun index ne portait `tracks.title` seul (`idx_tracks_artist_title` le
+/// porte derrière l'artiste, en `NOCASE`) : SQLite construisait à CHAQUE
+/// requête un index automatique sur toute la table des pistes (« AUTOMATIC
+/// COVERING INDEX (title=?) » au plan). Sur la copie de la base du .18 :
+/// 226 ms → 30 ms, mêmes lignes ; en production, sous charge, `slow_query`
+/// la voyait chaque heure entre 3,8 et 5,4 s.
+///
+/// Même texte sur les deux moteurs. Rejoué à chaque démarrage, sans numéro
+/// de migration — même raison que [`TRACKS_SOURCE_ID_INDEX`].
+pub(crate) const TRACKS_TITLE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(title)";
+
 pub(crate) const DR_ALBUM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_track_metadata_dr \
      ON track_metadata(key, track_id, value) WHERE key IN ('dr_album', 'dr_track');
      CREATE INDEX IF NOT EXISTS idx_tracks_id_album ON tracks(id, album_id);";
@@ -4800,6 +4818,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // Table « un album, son DR » (ticket 190) : même passe — voir la constante.
     if let Err(e) = db.execute_batch(DR_ALBUM_INDEX) {
         warn!(error = %e, "sqlite_dr_album_index_failed");
+    }
+    // Audit de la base du 31/10 — « Les plus écoutés » : même passe — voir
+    // la constante.
+    if let Err(e) = db.execute_batch(TRACKS_TITLE_INDEX) {
+        warn!(error = %e, "sqlite_tracks_title_index_failed");
     }
     // #2149 — collections à règle de genre : même passe — voir la constante.
     if let Err(e) = db.execute_batch(TRACKS_ALBUM_GENRE_INDEX) {
@@ -5874,6 +5897,11 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // b209 — même passe que la passe finale SQLite.
     if let Err(e) = sqlx::raw_sql(UPNP_NUMEROS_ZERO_A_NULL).execute(pool).await {
         warn!(error = %e, "pg_upnp_numeros_zero_a_null_failed");
+    }
+    // Audit de la base du 31/10 — même index, même texte que la passe
+    // finale SQLite.
+    if let Err(e) = sqlx::raw_sql(TRACKS_TITLE_INDEX).execute(pool).await {
+        warn!(error = %e, "pg_tracks_title_index_failed");
     }
     // #5998 — même passe que la passe finale SQLite, même raison.
     if let Err(e) = sqlx::raw_sql(crate::db::track_repo::INDEX_CHEMIN_DOSSIER_PG)
