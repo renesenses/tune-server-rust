@@ -918,6 +918,11 @@ path = "tests/radio_ajout_web_sans_doublon_3543.rs"
 name = "radios_recherche_distinction"
 path = "tests/radios_recherche_distinction.rs"
 
+# #7466 — recherche de radios par critères (`/radios/search`, `/radios/directory`).
+[[test]]
+name = "radios_criteres_7466"
+path = "tests/radios_criteres_7466.rs"
+
 # #7044 — le nom du serveur (page publique des radios). `autotests = false` :
 # sans cette inscription, le fichier ne serait jamais compilé.
 [[test]]
