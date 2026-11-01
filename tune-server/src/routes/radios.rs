@@ -730,6 +730,14 @@ pub struct StationAnnuaire {
     /// Une liste v2 vide ne doit pas réactiver les adresses historiques v1.
     #[serde(skip)]
     pub streams_declared: bool,
+    /// #7500 — l'ancienne clé `mozaiklabs:ID` (id interne de la v2), gardée
+    /// même quand la fiche porte un `external_id`. Une station du portail qui
+    /// reçoit un numéro radio-metadata (`S…`, site du 30/10/2026) change de
+    /// clé : « Mes radios » l'a enregistrée sous `mozaiklabs:ID`, et c'est par
+    /// cette clé qu'elle retrouve sa fiche, puis que son lien est réécrit
+    /// ([`super::radios_annuaire::lier_les_stations`]).
+    #[serde(skip)]
+    pub cle_locale: Option<String>,
     /// #7466 — la note moyenne de la fiche sur radio-metadata.fr
     /// (`avg_rating`, de 0 à 5), en CENTIÈMES pour garder `Eq` : 4,7 → 470.
     /// `None` tant que personne n'a noté la station (`rating_count` à 0).
@@ -763,6 +771,12 @@ pub struct FluxAnnuaire {
 pub(crate) mod geofencing;
 
 impl StationAnnuaire {
+    /// #7500 — la fiche porte-t-elle cette clé : son `external_id`, ou son
+    /// ancienne clé `mozaiklabs:ID` ([`StationAnnuaire::cle_locale`]) ?
+    pub fn porte_la_cle(&self, cle: &str) -> bool {
+        self.external_id.as_deref() == Some(cle) || self.cle_locale.as_deref() == Some(cle)
+    }
+
     /// #7215 — les genres de la fiche : `genres`, sinon le seul `genre` (une
     /// fiche construite sans `genres`, ou relevée sur un site plus ancien).
     pub fn genres_ou_genre(&self) -> Vec<&str> {
@@ -909,6 +923,13 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                         .collect()
                 })
                 .unwrap_or_default();
+            // #7500 — l'id interne de la v2 : la clé `mozaiklabs:ID`, gardée
+            // même quand un `external_id` la remplace.
+            let cle_locale = item
+                .get("id")
+                .and_then(Value::as_u64)
+                .filter(|id| *id > 0)
+                .map(|id| format!("mozaiklabs:{id}"));
             let entier = |v: Option<&Value>| {
                 v.and_then(Value::as_i64)
                     .and_then(|b| i32::try_from(b).ok())
@@ -942,12 +963,7 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                 // son nom ou son flux change. Sans ce repli, l'annuaire rend
                 // null et les gestes du client visent /directory/null/…,
                 // rejeté avant même une tentative de lecture.
-                external_id: texte(item, "external_id").or_else(|| {
-                    item.get("id")
-                        .and_then(Value::as_u64)
-                        .filter(|id| *id > 0)
-                        .map(|id| format!("mozaiklabs:{id}"))
-                }),
+                external_id: texte(item, "external_id").or_else(|| cle_locale.clone()),
                 radio_metadata_key: texte(item, "radio_metadata_key"),
                 description: texte(item, "description"),
                 categories,
@@ -961,6 +977,7 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                 stream_url,
                 flux,
                 streams_declared: item.get("streams").is_some_and(Value::is_array),
+                cle_locale,
                 note_centiemes: super::radios_criteres_7466::note_centiemes(item),
                 nombre_de_notes: item
                     .get("rating_count")

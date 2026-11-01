@@ -374,6 +374,11 @@ impl<'a> IndexAnnuaire<'a> {
             if let Some(id) = f.external_id.as_deref() {
                 par_id.entry(id.to_string()).or_insert(i);
             }
+            // #7500 — l'ancienne clé `mozaiklabs:ID` d'une fiche qui a reçu
+            // un numéro : un lien enregistré avant retrouve encore sa fiche.
+            if let Some(cle) = f.cle_locale.as_deref() {
+                par_id.entry(cle.to_string()).or_insert(i);
+            }
             for u in std::iter::once(&f.stream_url).chain(f.stream_urls.iter()) {
                 par_flux.entry(flux_normalise(u)).or_insert(i);
             }
@@ -516,8 +521,10 @@ pub fn rattacher_a_l_annuaire(state: &AppState, corps: &mut Value) {
 
 /// Le rapprochement de départ : chaque station SANS lien dont l'adresse de
 /// flux est, à la normalisation près, celle d'une fiche reçoit son
-/// `external_id`. Idempotent : un lien déjà posé n'est jamais réécrit.
-/// Rend le nombre de liens posés.
+/// `external_id`. Idempotent : un lien déjà posé n'est jamais réécrit, sauf
+/// (#7500) un lien vers l'ancienne clé `mozaiklabs:ID` d'une fiche qui porte
+/// désormais un numéro : il devient ce numéro, la fiche reste la même.
+/// Rend le nombre de liens posés ou réécrits.
 ///
 /// ⛔ Jamais par le NOM seul (revue de #6538). `refresh_radio_logos` lie AVANT
 /// de choisir les logos, et `logo_a_poser` fait confiance au lien : un lien
@@ -532,7 +539,15 @@ pub fn lier_les_stations(repo: &RadioRepo, fiches: &[StationAnnuaire]) -> usize 
     let mut poses = 0;
     for st in repo.list().unwrap_or_default() {
         let Some(id) = st.id else { continue };
-        if liens.contains_key(&id) {
+        if let Some(ancien) = liens.get(&id) {
+            if let Some((i, Lien::Id)) = index.lien(Some(ancien), &st.name, &st.url)
+                && let Some(nouveau) = index.fiche(i).and_then(|f| f.external_id.as_deref())
+                && nouveau != ancien.trim()
+                && repo.lier_a_l_annuaire(id, Some(nouveau)).is_ok()
+            {
+                tracing::info!(id, ancien = %ancien, nouveau, "radio_annuaire_lien_reecrit");
+                poses += 1;
+            }
             continue;
         }
         if let Some((i, Lien::Flux)) = index.lien(None, &st.name, &st.url)
@@ -830,12 +845,12 @@ async fn forcer_le_releve(State(state): State<AppState>) -> Json<Value> {
 }
 
 fn fiche_par_id(state: &AppState, external_id: &str) -> Option<StationAnnuaire> {
-    state
-        .annuaire_radios
-        .read()
-        .ok()?
+    let fiches = state.annuaire_radios.read().ok()?;
+    fiches
         .iter()
         .find(|f| f.external_id.as_deref() == Some(external_id))
+        // #7500 — l'ancienne clé `mozaiklabs:ID` d'une fiche numérotée depuis.
+        .or_else(|| fiches.iter().find(|f| f.porte_la_cle(external_id)))
         .cloned()
 }
 
@@ -895,7 +910,11 @@ async fn ajouter(
     let index = IndexAnnuaire::new(&unique);
     let existante = mes_radios
         .iter()
-        .find(|st| st.id.and_then(|id| liens.get(&id)) == Some(&external_id))
+        .find(|st| {
+            st.id
+                .and_then(|id| liens.get(&id))
+                .is_some_and(|lien| *lien == external_id || fiche.porte_la_cle(lien))
+        })
         .or_else(|| {
             mes_radios.iter().find(|st| {
                 st.id.is_some_and(|id| !liens.contains_key(&id))
@@ -937,6 +956,14 @@ async fn ajouter(
         && let Err(e) = repo.lier_a_l_annuaire(id, Some(&external_id))
     {
         tracing::warn!(erreur = %e, id, "radio_annuaire_lien_non_pose");
+    }
+    // #7500 — un lien vers l'ancienne clé `mozaiklabs:ID` prend le numéro de la fiche.
+    if let (Some(ancien), Some(nouveau)) = (liens.get(&id), fiche.external_id.as_deref())
+        && ancien != nouveau
+        && fiche.porte_la_cle(ancien)
+        && let Err(e) = repo.lier_a_l_annuaire(id, Some(nouveau))
+    {
+        tracing::warn!(erreur = %e, id, "radio_annuaire_lien_non_reecrit");
     }
     if favori && repo.set_favorite(id, true).is_ok() {
         state.event_bus.emit(
@@ -1148,3 +1175,7 @@ mod tests_recherche_7198;
 #[cfg(test)]
 #[path = "radios_format_mis_a_jour_6973_tests.rs"]
 mod format_mis_a_jour_6973;
+
+#[cfg(test)]
+#[path = "radios_cle_mozaiklabs_7500_tests.rs"]
+mod cle_mozaiklabs_7500;
