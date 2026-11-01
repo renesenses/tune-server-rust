@@ -113,8 +113,11 @@ impl Plan {
         }
     }
 
+    /// Trames budgétées pour un segment : le signal, sa garde, et deux
+    /// secondes de silence pendant lesquelles l'analyseur décide de la suite
+    /// (le générateur joue du silence en attendant la consigne suivante).
     fn trames(spec: &SweepSpec, garde_s: f64) -> u64 {
-        spec.len_samples() as u64 + (garde_s * spec.sample_rate as f64).round() as u64
+        spec.len_samples() as u64 + ((garde_s + 2.0) * spec.sample_rate as f64).round() as u64
     }
 
     /// Longueur maximale du flux, en trames : silence d'amorce, toutes les

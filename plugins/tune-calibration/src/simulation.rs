@@ -115,7 +115,9 @@ pub struct Boucle {
     pub vitesse: f64,
 }
 
-const FILE_MAX: usize = 48_000;
+/// Avance maximale de la zone sur le micro : 10 ms, comme un tampon de
+/// sortie court. C'est la « latence de sortie » que la mesure voit.
+const FILE_MAX: usize = 480;
 
 impl Boucle {
     pub fn new(piece: PieceEnDirect, vitesse: f64) -> Arc<Self> {
