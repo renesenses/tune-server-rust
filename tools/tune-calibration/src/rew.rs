@@ -3,7 +3,7 @@
 //!   `fréquence SPL phase` précédées de commentaires `*` ;
 //! - réponse impulsionnelle en WAV flottant 32 bits mono (« Export impulse
 //!   response as WAV »), relue par le convolueur de Tune (`read_wav_ir`) ;
-//! - filtres au format « Filter Settings file » (export avec C2).
+//! - filtres au format « Filter Settings file » (voir `eq::to_rew_filters`).
 //!
 //! Le lecteur WAV minimal ci-dessous évite une dépendance supplémentaire ;
 //! la version serveur réutilisera `convolver::read_wav_ir`.
