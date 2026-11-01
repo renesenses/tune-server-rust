@@ -312,7 +312,7 @@ impl Controleur {
 
     pub fn mesures(&self) -> Vec<Arc<Mesure>> {
         let mut v: Vec<_> = self.verrou().values().cloned().collect();
-        v.sort_by(|a, b| a.debut.cmp(&b.debut));
+        v.sort_by_key(|m| m.debut);
         v
     }
 
@@ -491,10 +491,7 @@ impl Controleur {
             volume_initial,
             d.volume_mesure_pct,
         )
-        .map_err(|e| {
-            capture.arreter();
-            e
-        })?;
+        .inspect_err(|_| capture.arreter())?;
         let r = self.jouer_et_mesurer(mesure, &capture, &zone, etalonnage.as_ref(), &traitements);
         // Restauration dans tous les cas : arrêt de la zone, volume initial,
         // capture close.

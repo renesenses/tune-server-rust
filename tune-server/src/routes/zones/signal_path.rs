@@ -178,21 +178,21 @@ pub(super) fn zone_correction_piece_lang(
             taps,
         });
     }
-    if let (Some(fil), Some(ir)) = (wire_sample_rate, ir_sr) {
-        if fil != ir {
-            return Some(CorrectionPiece {
-                status: "rate_mismatch",
-                applied: false,
-                description: fs(
-                    lang,
-                    "correction_piece_cadence",
-                    &[&ir.to_string(), &fil.to_string()],
-                ),
-                reason: Some(format!("ir_sample_rate {ir} != stream_sample_rate {fil}")),
-                ir_sample_rate: ir_sr,
-                taps,
-            });
-        }
+    if let (Some(fil), Some(ir)) = (wire_sample_rate, ir_sr)
+        && fil != ir
+    {
+        return Some(CorrectionPiece {
+            status: "rate_mismatch",
+            applied: false,
+            description: fs(
+                lang,
+                "correction_piece_cadence",
+                &[&ir.to_string(), &fil.to_string()],
+            ),
+            reason: Some(format!("ir_sample_rate {ir} != stream_sample_rate {fil}")),
+            ir_sample_rate: ir_sr,
+            taps,
+        });
     }
     let cadence = wire_sample_rate.or(ir_sr).unwrap_or(48_000);
     Some(CorrectionPiece {
@@ -1881,20 +1881,20 @@ fn assembler_les_etapes_lang(
     // la contourne ; dans les deux cas l'auditeur a un réglage armé et
     // n'entend rien — c'est l'étape qui le lui dit, comme pour le DSP sur DSD.
     let correction_piece_resume = correction_piece.as_ref().map(CorrectionPiece::resume);
-    if let Some(cp) = correction_piece {
-        if !dsp_contourne_par_le_dsd {
-            steps.push(json!({
-                "name": "Correction de pièce",
-                "code": "room_correction",
-                "status": cp.status,
-                "description": cp.description,
-                "bit_perfect": !cp.applied,
-                "applied": cp.applied,
-                "reason": cp.reason,
-                "ir_sample_rate": cp.ir_sample_rate,
-                "taps": cp.taps,
-            }));
-        }
+    if let Some(cp) = correction_piece
+        && !dsp_contourne_par_le_dsd
+    {
+        steps.push(json!({
+            "name": "Correction de pièce",
+            "code": "room_correction",
+            "status": cp.status,
+            "description": cp.description,
+            "bit_perfect": !cp.applied,
+            "applied": cp.applied,
+            "reason": cp.reason,
+            "ir_sample_rate": cp.ir_sample_rate,
+            "taps": cp.taps,
+        }));
     }
 
     // Étape « Crossfeed » (#5114) — le crossfeed que le flux RÉSEAU porte
@@ -2896,7 +2896,7 @@ fn relever_les_traitements_lang(
         volume_full,
         correction_piece: zone_correction_piece_lang(
             lang,
-            &backend,
+            backend,
             zid,
             wire.map(|w| w.sample_rate).filter(|v| *v > 0),
         ),
