@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn sans_mesure_armee_rien_ne_s_ouvre() {
         let f = FournisseurBalayage::new();
-        let e = f.ouvrir("m-1", 0).unwrap_err();
+        let e = f.ouvrir("m-1", 0).err().expect("refus");
         assert!(e.contains("aucune mesure"), "{e}");
     }
 
