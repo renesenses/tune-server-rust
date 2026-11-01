@@ -3253,14 +3253,26 @@ async fn create_streaming_playlist_from_favorites(
     );
 
     let mut remote_playlist_id: Option<String> = None;
+    let mut add_error: Option<String> = None;
     if !matched_ids.is_empty() {
-        match svc
+        let creation = svc
             .create_playlist(name, Some("Created by Tune from radio favorites"))
-            .await
-        {
+            .await;
+        // Voir `creer_playlist_depuis_titres_retenus` : sans purge, « Mes
+        // playlists » sert la liste mémorisée pendant 120 s.
+        tune_streaming_http::purge_contenu_utilisateur(service);
+        match creation {
             Ok(pid) => {
-                if let Err(e) = svc.add_tracks_to_playlist(&pid, &matched_ids).await {
-                    tracing::warn!(error = %e, "radio_fav_add_tracks_failed");
+                // L'échec de l'ajout était journalisé puis AVALÉ : la réponse
+                // annonçait `matched_tracks` titres dans une playlist vide.
+                match svc.add_tracks_to_playlist(&pid, &matched_ids).await {
+                    Ok(n) => {
+                        tracing::info!(service = %service, playlist_id = %pid, ajoutes = n, "radio_fav_playlist_created")
+                    }
+                    Err(e) => {
+                        tracing::warn!(service = %service, playlist_id = %pid, error = %e, "radio_fav_add_tracks_failed");
+                        add_error = Some(e.to_string());
+                    }
                 }
                 remote_playlist_id = Some(pid);
             }
@@ -3305,6 +3317,16 @@ async fn create_streaming_playlist_from_favorites(
             "approximate": nb_approx,
             "not_found": nb_not_found,
             "remote_playlist_id": remote_playlist_id.clone(),
+            "add_error": add_error,
+            // Aucune correspondance : rien n'a été créé, et on le DIT.
+            "message": if remote_playlist_id.is_none() {
+                Value::from(format!(
+                    "Aucun favori trouvé sur {} : aucune playlist n’a été créée.",
+                    nom_du_service(service)
+                ))
+            } else {
+                Value::Null
+            },
             "playlist_id": remote_playlist_id,
             "details": details.clone(),
             "results": details,
@@ -3506,6 +3528,15 @@ async fn apercu_appariement_favoris(
         .into_response())
 }
 
+/// « Qobuz », « Tidal »… pour les phrases montrées à l'utilisateur.
+fn nom_du_service(service: &str) -> String {
+    let mut c = service.chars();
+    match c.next() {
+        Some(p) => p.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 /// `create-playlist` avec `track_ids` : la playlist reçoit EXACTEMENT les
 /// titres validés à l'aperçu, sans nouvel appariement — une nouvelle
 /// playlist, ou `target_playlist_id` (une playlist existante du compte, sans
@@ -3521,18 +3552,34 @@ async fn creer_playlist_depuis_titres_retenus(
         .map(str::trim)
         .filter(|id| !id.is_empty());
     let service = service.unwrap_or("qobuz");
-    let erreur =
-        |code: StatusCode, err: &str| Ok((code, Json(json!({ "error": err }))).into_response());
+    // `error` : le code stable que le client teste ; `message` : la phrase
+    // à montrer — jamais un code brut à l'écran.
+    let erreur = |code: StatusCode, err: &str, message: &str| {
+        tracing::warn!(service = %service, erreur = err, "radio_fav_create_playlist_refusee");
+        Ok((code, Json(json!({ "error": err, "message": message }))).into_response())
+    };
     if service == "local" {
         // Les identifiants rendus par l'aperçu sont ceux d'un SERVICE : la
         // bibliothèque locale garde la création « en un geste ».
-        return erreur(StatusCode::BAD_REQUEST, "track_ids_service_seulement");
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "track_ids_service_seulement",
+            "Ces titres viennent d’un service de streaming : ils ne vont pas dans une playlist locale.",
+        );
     }
     if cible.is_none() && name.trim().is_empty() {
-        return erreur(StatusCode::BAD_REQUEST, "nom_vide");
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "nom_vide",
+            "Donnez un nom à la playlist.",
+        );
     }
     if dedoublonner_titres(track_ids).is_empty() {
-        return erreur(StatusCode::BAD_REQUEST, "aucun_titre_retenu");
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "aucun_titre_retenu",
+            "Aucun titre retenu : aucune playlist n’a été créée. Cochez au moins une correspondance trouvée.",
+        );
     }
     let arc = match service_pour_playlist(state, service).await {
         Ok(a) => a,
@@ -3543,10 +3590,20 @@ async fn creer_playlist_depuis_titres_retenus(
         Some(id) => ajouter_a_playlist_existante(&**svc, id, track_ids).await,
         None => creer_playlist_avec_titres(&**svc, name.trim(), track_ids).await,
     };
+    drop(svc);
+    // Radio → Qobuz, 01/11/2026 : la playlist existait chez Qobuz mais « Mes
+    // playlists » ne la montrait pas. La modale lit `GET /streaming/qobuz/
+    // playlists` À L'OUVERTURE (choix de la cible), ce qui remplit le cache
+    // du contenu utilisateur (120 s) juste AVANT la création ; rien ne le
+    // purgeait ensuite. Même motif que la fusion de playlists (21/09). Purge
+    // sans condition : un échec côté HTTP peut avoir abouti chez le service.
+    tune_streaming_http::purge_contenu_utilisateur(service);
     match verse {
         Ok(p) => {
             tracing::info!(
                 service = %service,
+                playlist_id = %p.playlist_id,
+                nom = %name.trim(),
                 retenus = track_ids.len(),
                 ajoutes = p.ajoutes,
                 doublons = p.doublons,
@@ -3573,13 +3630,20 @@ async fn creer_playlist_depuis_titres_retenus(
                 .into_response())
         }
         Err(e) => {
-            tracing::warn!(service = %service, error = %e, "radio_fav_create_playlist_failed");
+            tracing::warn!(service = %service, error = %e, existante = cible.is_some(), "radio_fav_create_playlist_failed");
             Ok((
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
                     "error": match cible {
                         Some(id) => format!("could not add to playlist '{id}' on '{service}': {e}"),
                         None => format!("could not create playlist on '{service}': {e}"),
+                    },
+                    // Code stable : le client le traduit (jamais le texte brut
+                    // de Qobuz à l'écran, il part dans le détail replié).
+                    "code": if cible.is_some() { "ajout_playlist_refuse" } else { "creation_playlist_refusee" },
+                    "message": match cible {
+                        Some(_) => format!("{} a refusé l’ajout à la playlist : {e}", nom_du_service(service)),
+                        None => format!("{} a refusé la création de la playlist : {e}", nom_du_service(service)),
                     },
                 })),
             )
