@@ -6626,6 +6626,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-collection-physique"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "tune-core",
+ "urlencoding",
+]
+
+[[package]]
 name = "tune-concerts"
 version = "1.0.0"
 dependencies = [
@@ -7007,6 +7023,7 @@ dependencies = [
  "tune-bandcamp",
  "tune-cd",
  "tune-circle",
+ "tune-collection-physique",
  "tune-concerts",
  "tune-core",
  "tune-dj",
