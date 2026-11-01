@@ -1542,6 +1542,15 @@ pub mod sql {
         }
     }
 
+    /// La rédaction des critères : celle d'avant #7619 n'est gardée que pour
+    /// les témoins, qui comparent les deux chemins.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Redaction {
+        Dictionnaires,
+        #[cfg(test)]
+        Avant7619,
+    }
+
     /// Le OU des critères, la branche plein texte `plein_texte` en tête, puis
     /// trois `LIKE` et l'année sur les emplacements `n + 1` à `n + 4`.
     ///
@@ -1564,20 +1573,7 @@ pub mod sql {
     /// Le dictionnaire est MATÉRIALISÉ : sans cela, SQLite pousse le `LIKE`
     /// dans le `SELECT DISTINCT` et le rejoue sur chaque piste, ce qu'il
     /// s'agit justement d'éviter.
-    fn criteres<D: SqlDialect>(d: &D, plein_texte: String, n: usize) -> String {
-        criteres_selon(d, plein_texte, n, Redaction::Dictionnaires)
-    }
-
-    /// La rédaction des critères : celle d'avant #7619 n'est gardée que pour
-    /// les témoins, qui comparent les deux chemins.
-    #[derive(Clone, Copy, PartialEq)]
-    enum Redaction {
-        Dictionnaires,
-        #[cfg(test)]
-        Avant7619,
-    }
-
-    fn criteres_selon<D: SqlDialect>(
+    fn criteres<D: SqlDialect>(
         d: &D,
         plein_texte: String,
         n: usize,
@@ -1666,7 +1662,7 @@ pub mod sql {
     fn search_where_selon<D: SqlDialect>(d: &D, r: Redaction) -> String {
         format!(
             "{} AND {} AND {}",
-            criteres_selon(d, plein_texte_piste_ou_chemin(d, 1), 1, r),
+            criteres(d, plein_texte_piste_ou_chemin(d, 1), 1, r),
             crate::db::facet_filter::hidden_tracks_excluded(),
             crate::db::facet_filter::pistes_album_distant_double_exclu(d.engine()),
         )
@@ -1686,7 +1682,7 @@ pub mod sql {
     fn search_rang_selon<D: SqlDialect>(d: &D, r: Redaction) -> String {
         format!(
             "CASE WHEN {} THEN 0 ELSE 1 END",
-            criteres_selon(d, plein_texte_de_la_piste(d, 6), 6, r)
+            criteres(d, plein_texte_de_la_piste(d, 6), 6, r)
         )
     }
 

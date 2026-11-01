@@ -105,7 +105,8 @@ async fn banc_l3l4_7619() {
         let requete = || {
             let q: FacetQuery =
                 serde_json::from_value(serde_json::json!({ "fields": champs })).unwrap();
-            q.hydrate(None).unwrap()
+            q.hydrate(None)
+                .unwrap_or_else(|_| panic!("requête de facettes"))
         };
         let mut d: Vec<Duration> = Vec::new();
         for _ in 0..3 {
