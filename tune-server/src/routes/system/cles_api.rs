@@ -68,6 +68,89 @@ pub(crate) fn cle(state: &AppState, service: Service) -> Option<CleResolue> {
     )
 }
 
+// ── Une seule réserve pour le jeton Discogs personnel ─────────────────────────
+//
+// Le même jeton se saisit à DEUX endroits : Réglages ▸ Clés d'API (ici,
+// scellé dans le coffre) et Réglages ▸ « Jetons de service »
+// (`routes::service_tokens`, ligne `streaming_auth` « discogs » plus le
+// réglage historique `discogs_token`). Avant le 31/10/2026, le second était
+// lu comme une clé INTÉGRÉE : l'enrichissement s'en servait, mais
+// « Ma collection physique » (#7195) n'y voyait pas de jeton personnel et
+// `GET /system/api-keys` disait `personnelle: false`.
+//
+// Désormais le coffre est la seule réserve du jeton PERSONNEL : « Jetons de
+// service » y range ce qu'on lui confie ([`ranger_le_jeton_discogs_des_jetons_de_service`]),
+// une installation existante l'y adopte au démarrage
+// ([`adopter_le_jeton_discogs_des_jetons_de_service`]), et tout le monde le
+// lit par [`cle`] → [`cles_api::resoudre`].
+
+/// Le service et le champ du jeton Discogs dans « Jetons de service ».
+pub(crate) const JETON_DE_SERVICE_DISCOGS: (&str, &str) = ("discogs", "token");
+
+/// Range, SCELLÉ, comme jeton personnel, le jeton Discogs saisi dans
+/// « Jetons de service ». La valeur ne passe dans aucun journal.
+pub(crate) fn ranger_le_jeton_discogs_des_jetons_de_service(
+    state: &AppState,
+    valeur: &str,
+) -> Result<(), String> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    cles_api::poser(&settings, &coffre(state), Service::Discogs, valeur)
+}
+
+/// Au démarrage : une installation dont le jeton Discogs n'a été saisi que
+/// dans « Jetons de service » (avant l'unification) l'adopte comme jeton
+/// personnel, scellé. Rien si un jeton personnel est déjà enregistré (même
+/// illisible : c'est à l'utilisateur de le ressaisir). Rend `true` s'il a
+/// été adopté.
+pub(crate) fn adopter_le_jeton_discogs_des_jetons_de_service(state: &AppState) -> bool {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let deja = settings
+        .get(Service::Discogs.reglage_scelle())
+        .ok()
+        .flatten()
+        .is_some_and(|s| !s.trim().is_empty());
+    if deja {
+        return false;
+    }
+    let (service, champ) = JETON_DE_SERVICE_DISCOGS;
+    let Some(jeton) =
+        tune_core::services_manager::ServicesManager::with_backend(state.backend.clone())
+            .get_credential(service, champ)
+            .filter(|j| cles_api::valider(j).is_ok())
+    else {
+        return false;
+    };
+    match cles_api::poser(&settings, &coffre(state), Service::Discogs, &jeton) {
+        Ok(()) => {
+            tracing::info!("discogs_jeton_de_service_adopte_comme_personnel");
+            true
+        }
+        Err(motif) => {
+            // Le motif décrit le coffre ou la base, jamais la valeur.
+            tracing::warn!(motif = %motif, "discogs_jeton_de_service_non_adopte");
+            false
+        }
+    }
+}
+
+/// Retirer le jeton Discogs personnel le retire AUSSI de « Jetons de
+/// service » (sinon le démarrage suivant le réadopterait) et efface le
+/// réglage historique `discogs_token` s'il porte la même valeur — un jeton
+/// différent (celui du serveur) reste.
+fn retirer_le_jeton_discogs_des_jetons_de_service(state: &AppState, retire: Option<&str>) {
+    let (service, champ) = JETON_DE_SERVICE_DISCOGS;
+    let svc = tune_core::services_manager::ServicesManager::with_backend(state.backend.clone());
+    let du_service = svc.get_credential(service, champ);
+    if retire.is_some() && du_service.as_deref().map(str::trim) == retire.map(str::trim) {
+        svc.delete_token(service).ok();
+    }
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let historique = settings.get(REGLAGE_DISCOGS_INTEGRE).ok().flatten();
+    if retire.is_some() && historique.as_deref().map(str::trim) == retire.map(str::trim) {
+        settings.delete(REGLAGE_DISCOGS_INTEGRE).ok();
+    }
+}
+
 fn etat_json(state: &AppState, service: Service) -> Value {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     json!(cles_api::etat(
@@ -152,7 +235,15 @@ pub(crate) async fn retirer(State(state): State<AppState>, Path(code): Path<Stri
     let st = state.clone();
     let fait = tokio::task::spawn_blocking(move || {
         let settings = SettingsRepo::with_backend(st.backend.clone());
-        cles_api::retirer(&settings, service).map(|_| etat_json(&st, service))
+        let retire = (service == Service::Discogs)
+            .then(|| cles_api::lire_personnelle(&settings, &coffre(&st), service).ok())
+            .flatten()
+            .flatten();
+        cles_api::retirer(&settings, service)?;
+        if service == Service::Discogs {
+            retirer_le_jeton_discogs_des_jetons_de_service(&st, retire.as_deref());
+        }
+        Ok::<_, String>(etat_json(&st, service))
     })
     .await;
     match fait {
