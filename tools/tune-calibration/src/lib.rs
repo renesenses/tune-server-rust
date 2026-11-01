@@ -3,9 +3,9 @@
 //! Chaîne de mesure : [`sweep`] (balayage de Farina et filtre inverse) →
 //! [`deconv`] (réponse impulsionnelle, retard, repère de synchronisation) →
 //! [`analysis`] (fenêtrage, réponse en fréquence, lissage, RT60, cascade,
-//! moyenne spatiale) → [`mic_cal`] (étalonnage du micro) ; [`eq`] porte les
-//! biquads et le format de bande natif (l'ajustement automatique vient avec
-//! C2) ; [`fir`] esquisse C3 (FIR phase mixte et coût du convolueur) ;
+//! moyenne spatiale) → [`mic_cal`] (étalonnage du micro) → [`target`] et
+//! [`eq`] (cible, égaliseur paramétrique automatique au format natif) →
+//! [`fir`] (esquisse C3 : FIR phase mixte et coût du convolueur) →
 //! [`rew`] (import/export REW). [`level`] porte les garde-fous de niveau et
 //! [`sim`] les pièces simulées des essais.
 //!
@@ -21,9 +21,12 @@ pub mod mic_cal;
 pub mod rew;
 pub mod sim;
 pub mod sweep;
+pub mod target;
 
 use analysis::{BandRt60, LogResponse};
 use deconv::ImpulseResponse;
+use eq::{AutoEqConfig, AutoEqResult};
+use target::TargetCurve;
 
 /// Paramètres d'une mesure complète en un point.
 #[derive(Debug, Clone)]
@@ -82,4 +85,10 @@ pub fn analyse_capture(
     }
     let rt60 = analysis::rt60_by_band(&ir, &analysis::OCTAVE_CENTERS, 1.0);
     Measurement { ir, response, rt60 }
+}
+
+/// Étape C2 : égaliseur paramétrique vers une cible, à partir d'une réponse
+/// (un point ou moyenne spatiale).
+pub fn design_eq(response: &LogResponse, target: &TargetCurve, cfg: &AutoEqConfig) -> AutoEqResult {
+    eq::fit(response, target, cfg)
 }
