@@ -35,6 +35,7 @@ mod passes_metarust;
 // #5469 — les passes que `crate::reprise_des_passes` sait relancer.
 pub(crate) use artwork::{demarrer_images_artistes, demarrer_pochettes_albums};
 pub(crate) use enrich::demarrer_enrich_all;
+mod edition_par_filtre;
 mod etiquetage_par_filtre;
 /// #4907 — ordre des répertoires et répertoire préféré d'un album.
 mod exemplaires;
@@ -366,6 +367,17 @@ pub fn router() -> Router<AppState> {
         // #7128 — étiqueter tout le résultat d'un filtre d'Oxygen en un geste.
         .route("/tag-by-filter/preview", get(etiquetage_par_filtre::apercu))
         .route("/tag-by-filter", post(etiquetage_par_filtre::appliquer))
+        // #7539 — modifier un champ sur tout le résultat filtré d'Oxygen.
+        .route("/edit-by-filter/preview", get(edition_par_filtre::apercu))
+        .route("/edit-by-filter", post(edition_par_filtre::appliquer))
+        .route(
+            "/edit-by-filter/files/status",
+            get(edition_par_filtre::statut_fichiers),
+        )
+        .route(
+            "/edit-by-filter/files/cancel",
+            post(edition_par_filtre::annuler_fichiers),
+        )
         .route("/albums-detailed", get(albums_detailed::albums_detailed))
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
@@ -936,6 +948,14 @@ mod routage_tests {
 #[cfg(test)]
 #[path = "banc_rail_5993.rs"]
 mod banc_rail_5993;
+
+#[cfg(test)]
+#[path = "facettes_lentes_2144_tests.rs"]
+mod facettes_lentes_2144_tests;
+
+#[cfg(test)]
+#[path = "liste_dr_7580_tests.rs"]
+mod liste_dr_7580_tests;
 
 #[cfg(test)]
 #[path = "banc_repertoires_5998.rs"]

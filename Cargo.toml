@@ -10,7 +10,7 @@
 # lit cette liste — dont la garde `cargo test`, qui restait verte pendant que
 # ses SEPT essais n'etaient executes par aucune porte. Le rendre explicite ne
 # change rien pour cargo ; ca rend l'inventaire vrai.
-members = ["tune-core", "tune-http-types", "tune-output-api", "tune-server", "tune-smart-http", "tune-stream-http", "tune-streaming-http", "tune-cli", "tune-ffi", "tune-bridge", "tune-laissez-passer", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp", "plugins/tune-concerts", "plugins/tune-pont-roon", "plugins/tune-cd", "plugins/tune-entree-audio", "plugins/tune-playlists-converter", "plugins/tune-circle", "plugins/tune-assistant-ia", "plugins/tune-collection-physique", "plugins/tune-mon-theme"]
+members = ["tune-core", "tune-http-types", "tune-output-api", "tune-server", "tune-smart-http", "tune-stream-http", "tune-streaming-http", "tune-cli", "tune-ffi", "tune-bridge", "tune-laissez-passer", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp", "plugins/tune-concerts", "plugins/tune-pont-roon", "plugins/tune-cd", "plugins/tune-entree-audio", "plugins/tune-playlists-converter", "plugins/tune-circle", "plugins/tune-assistant-ia", "plugins/tune-collection-physique", "plugins/tune-mon-theme", "plugins/tune-aes67"]
 # tune-desktop and tune-widget are Tauri apps, each with its own workspace and
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI
@@ -132,6 +132,15 @@ dotenvy = "0.15"
 [profile.dev]
 opt-level = 0
 debug = 0
+
+# `statime` 0.4.0 (Sortie AES67, #7336) porte un `debug_assert!` faux pour une
+# instance esclave seulement : quand le maître disparaît, son BMCA recommande
+# M2 et l'assertion tue le fil PTP, alors que le port, lui, repasse bien en
+# écoute (`set_recommended_port_state`). Les versions release ne l'évaluent
+# pas ; on l'éteint aussi en dev pour que tests et banc voient le vrai
+# comportement. Rien d'autre n'est touché.
+[profile.dev.package.statime]
+debug-assertions = false
 
 [profile.release]
 opt-level = 2

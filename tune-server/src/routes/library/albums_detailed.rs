@@ -58,13 +58,14 @@ const ARTISTE_DE_CARTE: &str = "COALESCE(CASE WHEN COALESCE(al.is_compilation, 0
      THEN ar_al.name END, t.album_artist, ar.name)";
 
 pub(super) async fn albums_detailed(
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(q): Query<FacetQuery>,
     RawQuery(raw): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
     // Même lecture des facettes multi-valeurs que le rail (#2168) : les cartes
     // doivent compter exactement ce que le rail annonce.
-    let q = q.hydrate(raw.as_deref())?;
+    let q = q.hydrate(raw.as_deref())?.pour_profil(profile.id());
     // #5438 — la résolution de la collection, le total et la page sont des
     // lectures synchrones : hors de l'exécuteur, comme le rail.
     hors_executeur("albums_detailed", move || lire_les_cartes(&state, q))

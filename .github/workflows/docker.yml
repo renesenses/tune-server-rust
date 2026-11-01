@@ -130,7 +130,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y libasound2-dev
           # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding","dst"]}
-          cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,mon-theme
+          cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,aes67,mon-theme
           mkdir -p dist/amd64 && cp target-amd64/release/tune-server dist/amd64/tune-server
 
       # Party (WASM) plugin — arch-independent, staged once and COPYied into the
@@ -149,7 +149,7 @@ jobs:
       - name: Build tune-server (arm64, cross)
         run: |
           # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding","dst"]}
-          cross build --release --package tune-server --target aarch64-unknown-linux-gnu --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,mon-theme
+          cross build --release --package tune-server --target aarch64-unknown-linux-gnu --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,aes67,mon-theme
           mkdir -p dist/arm64 && cp target/aarch64-unknown-linux-gnu/release/tune-server dist/arm64/tune-server
 
       # Garde-fou #3355, moitie Docker : les deux binaires qui entrent dans
