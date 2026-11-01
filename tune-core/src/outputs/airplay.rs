@@ -167,6 +167,10 @@ pub struct AirplayOutput {
     rtp: Arc<CurseurRtpAirplay>,
     echec: Arc<std::sync::Mutex<Option<String>>>,
     generation: Arc<AtomicU64>,
+    /// L'appareil s'annonce AirPlay 2 ou exige un appairage (bits `features`
+    /// / `sf` du mDNS) alors qu'il est servi par ce chemin AirPlay 1 (RAOP),
+    /// qui ne fait aucun appairage. Sert à dire la vraie cause d'un 403.
+    appairage_airplay2_requis: bool,
 }
 
 struct RtspSession {
@@ -273,7 +277,16 @@ impl AirplayOutput {
             rtp: Arc::new(CurseurRtpAirplay::default()),
             echec: Arc::new(std::sync::Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
+            appairage_airplay2_requis: false,
         }
+    }
+
+    /// Déclare que l'appareil exige l'appairage AirPlay 2 (HomeKit, « pair-setup
+    /// transitoire ») que ce chemin AirPlay 1 ne fait pas. Un 403 au ANNOUNCE ou
+    /// au SETUP est alors expliqué par ce manque, pas par « un autre émetteur ».
+    pub fn avec_appairage_airplay2_requis(mut self, requis: bool) -> Self {
+        self.appairage_airplay2_requis = requis;
+        self
     }
 }
 
@@ -459,7 +472,7 @@ impl RtspSession {
         Ok((status_code, resp_headers, body_str))
     }
 
-    async fn announce(&mut self) -> Result<(), String> {
+    async fn announce(&mut self, appairage_requis: bool) -> Result<(), String> {
         let sdp = self.identite.sdp_announce();
         let uri = self.identite.uri();
 
@@ -472,13 +485,21 @@ impl RtspSession {
             )
             .await?;
 
+        if code == 403 && appairage_requis {
+            return Err(pairing_required_message("ANNOUNCE"));
+        }
         if code != 200 {
             return Err(announce_failure_message(code));
         }
         Ok(())
     }
 
-    async fn setup(&mut self, control_port: u16, timing_port: u16) -> Result<(), String> {
+    async fn setup(
+        &mut self,
+        control_port: u16,
+        timing_port: u16,
+        appairage_requis: bool,
+    ) -> Result<(), String> {
         let transport = format!(
             "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port={};timing_port={}",
             control_port, timing_port
@@ -489,6 +510,9 @@ impl RtspSession {
             .send_request("SETUP", &uri, &[("Transport", &transport)], None)
             .await?;
 
+        if code == 403 && appairage_requis {
+            return Err(pairing_required_message("SETUP"));
+        }
         if code != 200 {
             return Err(setup_failure_message(code));
         }
@@ -602,6 +626,22 @@ fn announce_failure_message(code: u32) -> String {
         );
     }
     format!("AirPlay ANNOUNCE failed: {code}")
+}
+
+/// Code stable : l'appareil exige l'appairage AirPlay 2 que Tune ne fait pas
+/// sur le chemin AirPlay 1 (RAOP).
+pub const CODE_AIRPLAY2_PAIRING_REQUIRED: &str = "airplay2_pairing_required";
+
+/// 403 d'un appareil qui s'annonce AirPlay 2 / exige l'appairage, servi par le
+/// chemin AirPlay 1 : la cause est l'appairage absent, pas un autre émetteur.
+fn pairing_required_message(etape: &str) -> String {
+    format!(
+        "{CODE_AIRPLAY2_PAIRING_REQUIRED}: AirPlay connection refused by the device at {etape} (403): \
+         this speaker is an AirPlay 2 device that requires AirPlay 2 pairing (HomeKit transient \
+         pair-setup), which Tune does not perform on its AirPlay 1 (RAOP) output. Tune uses its \
+         AirPlay 2 helper (airplay-daemon) for such speakers, but it is missing or unavailable in \
+         this installation; install a Tune build that includes airplay-daemon"
+    )
 }
 
 fn setup_failure_message(code: u32) -> String {
@@ -752,7 +792,7 @@ impl OutputTarget for AirplayOutput {
         let (control_port, timing_port) = auxiliary.ports();
         session.auxiliary_udp = Some(auxiliary);
 
-        if let Err(reason) = session.announce().await {
+        if let Err(reason) = session.announce(self.appairage_airplay2_requis).await {
             if let Some(auxiliary) = session.auxiliary_udp.take() {
                 auxiliary.close().await;
             }
@@ -768,7 +808,10 @@ impl OutputTarget for AirplayOutput {
         // session parce que le canal de controle se ferme (RFC 2326, l'etat
         // de session est independant de la connexion) : c'est donc NOUS qui
         // fabriquions l'« appareil occupe » de la tentative suivante (#2217).
-        if let Err(raison) = session.setup(control_port, timing_port).await {
+        if let Err(raison) = session
+            .setup(control_port, timing_port, self.appairage_airplay2_requis)
+            .await
+        {
             self.rendre_session_annoncee(&mut session, "SETUP", &raison)
                 .await;
             return Err(raison);
@@ -1376,6 +1419,19 @@ mod tests {
         assert!(message.contains("retry"));
     }
 
+    /// Xiaomi Sound 2 Max sous Windows (sans airplay-daemon) : un 403 au
+    /// SETUP d'un appareil AirPlay 2 dit l'appairage manquant, pas « un autre
+    /// émetteur ».
+    #[test]
+    fn pairing_required_403_names_missing_airplay2_pairing() {
+        let message = pairing_required_message("SETUP");
+        assert!(message.starts_with(CODE_AIRPLAY2_PAIRING_REQUIRED));
+        assert!(message.contains("SETUP (403)"));
+        assert!(message.contains("AirPlay 2 pairing"));
+        assert!(message.contains("airplay-daemon"));
+        assert!(!message.contains("another sender"));
+    }
+
     #[test]
     fn setup_other_status_keeps_the_rtsp_code() {
         assert_eq!(setup_failure_message(453), "AirPlay SETUP failed: 453");
@@ -1505,13 +1561,21 @@ mod tests {
     }
 
     async fn dialogue_airplay(refus: Vec<(&'static str, &'static str)>) -> (String, Vec<String>) {
+        dialogue_airplay_appairage(refus, false).await
+    }
+
+    async fn dialogue_airplay_appairage(
+        refus: Vec<(&'static str, &'static str)>,
+        appairage_requis: bool,
+    ) -> (String, Vec<String>) {
         let (port, recepteur) = faux_recepteur(refus).await;
         let sortie = AirplayOutput::new(
             "Faux recepteur".into(),
             format!("airplay-127.0.0.1-{port}"),
             "127.0.0.1".into(),
             port,
-        );
+        )
+        .avec_appairage_airplay2_requis(appairage_requis);
         let erreur = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             sortie.play_media(&PlayMedia {
@@ -1537,6 +1601,43 @@ mod tests {
     /// la `RtspSession` : le socket TCP se ferme, et rien n'a jamais rendu la
     /// session. C'est le sender qui fabrique l'« appareil occupe » de la
     /// tentative suivante.
+    /// Rapport du 01/11 (Xiaomi Sound 2 Max, Windows sans airplay-daemon) :
+    /// l'enceinte AirPlay 2 accepte l'ANNOUNCE, refuse le SETUP par 403, puis
+    /// refuse aussi le TEARDOWN de rattrapage. Annoncée AirPlay 2, elle doit
+    /// recevoir le diagnostic « appairage AirPlay 2 manquant ». La contre-
+    /// épreuve (même dialogue, appareil non marqué) est le témoin suivant,
+    /// qui garde le message « autre émetteur ».
+    #[tokio::test]
+    async fn un_setup_refuse_par_une_enceinte_airplay2_dit_l_appairage_manquant() {
+        let (erreur, methodes) = dialogue_airplay_appairage(
+            vec![("SETUP", "403 Forbidden"), ("TEARDOWN", "403 Forbidden")],
+            true,
+        )
+        .await;
+
+        assert!(
+            erreur.starts_with(CODE_AIRPLAY2_PAIRING_REQUIRED),
+            "obtenu : {erreur}"
+        );
+        assert!(erreur.contains("SETUP (403)"), "obtenu : {erreur}");
+        assert!(erreur.contains("airplay-daemon"), "obtenu : {erreur}");
+        assert!(!erreur.contains("another sender"), "obtenu : {erreur}");
+        assert_eq!(methodes, vec!["ANNOUNCE", "SETUP", "TEARDOWN"]);
+    }
+
+    #[tokio::test]
+    async fn un_announce_refuse_par_une_enceinte_airplay2_dit_l_appairage_manquant() {
+        let (erreur, methodes) =
+            dialogue_airplay_appairage(vec![("ANNOUNCE", "403 Forbidden")], true).await;
+
+        assert!(
+            erreur.starts_with(CODE_AIRPLAY2_PAIRING_REQUIRED),
+            "obtenu : {erreur}"
+        );
+        assert!(erreur.contains("ANNOUNCE (403)"), "obtenu : {erreur}");
+        assert_eq!(methodes, vec!["ANNOUNCE"]);
+    }
+
     #[tokio::test]
     async fn un_setup_refuse_rend_la_session_ouverte_par_l_announce() {
         let (erreur, methodes) = dialogue_airplay(vec![("SETUP", "403 Forbidden")]).await;
