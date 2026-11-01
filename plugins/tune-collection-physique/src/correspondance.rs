@@ -227,6 +227,7 @@ mod tests {
             famille: Famille::Vinyle,
             ajoute_le: None,
             vignette: None,
+            pochette: None,
         }
     }
 

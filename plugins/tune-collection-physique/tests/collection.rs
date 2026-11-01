@@ -25,7 +25,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use tune_collection_physique::correspondance::{AlbumDeService, AlbumLocal};
-use tune_collection_physique::{Cadence, Hote, Jeton, Moteur, Panne, Reponse, router};
+use tune_collection_physique::{Cadence, Hote, Image, Jeton, Moteur, Panne, Reponse, router};
 use tune_core::db::backend::DbBackend;
 use tune_core::db::sqlite::SqliteDb;
 
@@ -37,6 +37,21 @@ fn fixture(nom: &str) -> Value {
 /// La forme d'une vignette de la page de collection Discogs.
 fn vignette_essai(release: u64) -> String {
     format!("https://i.discogs.com/essai/rs:fit/g:sm/q:40/h:150/w:150/{release}.jpeg")
+}
+
+/// La forme de la grande image (`cover_image`) de la page de collection.
+fn pochette_essai(release: u64) -> String {
+    format!("https://i.discogs.com/essai/rs:fit/g:sm/q:90/h:600/w:600/{release}.jpeg")
+}
+
+/// Une image JPEG carrée de `cote` px : ce que le CDN de Discogs rendrait.
+fn jpeg(cote: u32) -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(cote, cote, image::Rgb([20, 120, 200]));
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+        .encode_image(&img)
+        .unwrap();
+    out
 }
 
 const RICK_RELEASE_MB: &str = "dc919562-19c7-42c8-961c-7ed5520f00bb";
@@ -60,6 +75,12 @@ struct HoteEssai {
     mb_avant_panne: Mutex<Option<usize>>,
     /// Les services qui ne répondent pas (panne de transport).
     services_muets: Mutex<Vec<String>>,
+    /// Combien de 429 le CDN d'images rend avant de répondre.
+    images_limites: Mutex<u32>,
+    /// Le CDN d'images répond à autant d'appels, puis se tait.
+    images_avant_panne: Mutex<Option<usize>>,
+    /// Le dernier disque de la page 2 a été retiré de la collection.
+    disque_retire: Mutex<bool>,
 }
 
 impl HoteEssai {
@@ -87,6 +108,9 @@ impl HoteEssai {
             mb_refuse: Mutex::new(None),
             mb_avant_panne: Mutex::new(None),
             services_muets: Mutex::new(Vec::new()),
+            images_limites: Mutex::new(0),
+            images_avant_panne: Mutex::new(None),
+            disque_retire: Mutex::new(false),
         }
     }
 
@@ -97,6 +121,13 @@ impl HoteEssai {
             for r in p["releases"].as_array_mut().unwrap() {
                 let id = r["id"].as_u64().unwrap();
                 r["basic_information"]["thumb"] = json!(vignette_essai(id));
+                r["basic_information"]["cover_image"] = json!(pochette_essai(id));
+            }
+        }
+        if *self.disque_retire.lock().unwrap() {
+            p["pagination"]["items"] = json!(4);
+            if nom == "collection_page_2.json" {
+                p["releases"].as_array_mut().unwrap().pop();
             }
         }
         p
@@ -254,6 +285,24 @@ impl Hote for HoteEssai {
     async fn albums_locaux(&self) -> Result<Vec<AlbumLocal>, String> {
         Ok(self.albums.lock().unwrap().clone())
     }
+
+    async fn image_discogs(&self, url: &str) -> Result<Image, Panne> {
+        self.appels.lock().unwrap().push(format!("image {url}"));
+        {
+            let mut l = self.images_limites.lock().unwrap();
+            if *l > 0 {
+                *l -= 1;
+                return Ok(Image::Limite);
+            }
+        }
+        if let Some(n) = self.images_avant_panne.lock().unwrap().as_mut() {
+            if *n == 0 {
+                return Err(Panne);
+            }
+            *n -= 1;
+        }
+        Ok(Image::Octets(jpeg(600)))
+    }
 }
 
 fn base() -> Arc<dyn DbBackend> {
@@ -267,6 +316,7 @@ struct Banc {
     hote: Arc<HoteEssai>,
     moteur: Arc<Moteur>,
     app: axum::Router,
+    backend: Arc<dyn DbBackend>,
     _dossier: tempfile::TempDir,
 }
 
@@ -292,11 +342,13 @@ fn banc_avec_cadence(hote: HoteEssai, cadence: Cadence) -> Banc {
         dossier.path().to_path_buf(),
         cadence,
     ));
-    let app = router(base(), moteur.clone());
+    let backend = base();
+    let app = router(backend.clone(), moteur.clone());
     Banc {
         hote,
         moteur,
         app,
+        backend,
         _dossier: dossier,
     }
 }
@@ -472,8 +524,8 @@ async fn la_deuxieme_synchronisation_ne_relit_que_la_liste() {
     );
     assert_eq!(
         b.hote.appels("discogs /users/"),
-        4,
-        "la liste, elle, est relue (2 pages × 2)"
+        3,
+        "la liste est relue PAR LE HAUT : sa première page touche la liste connue, la seconde n'est pas redemandée"
     );
     assert_eq!(
         b.hote.appels("service "),
@@ -661,10 +713,13 @@ async fn chaque_disque_porte_sa_vignette_et_l_album_local_sa_pochette() {
     let (_, c) = appel(&b.app, "GET", "/collection", None).await;
 
     let h = disque(&c, "The Haçienda - Play By 01/96");
-    assert_eq!(h["vignette"], vignette_essai(7024), "{h}");
+    assert_eq!(h["pochette"], true, "{h}");
     let rick = disque(&c, "Never Gonna Give You Up");
     assert_eq!(rick["bibliotheque"]["cover_path"], "a1b2c3.jpg", "{rick}");
-    assert_eq!(rick["vignette"], vignette_essai(249504));
+    assert_eq!(rick["pochette"], true);
+    // Cache du 01/11/2026 : aucune adresse du CDN de Discogs ne sort vers
+    // l'écran, qui demande la pochette au greffon.
+    assert!(!c.to_string().contains("i.discogs.com"), "{c}");
     // Un album local sans pochette : `null`, l'écran prend la vignette.
     let sm = disque(&c, "Silent Mirrors");
     assert_eq!(sm["bibliotheque"]["cover_path"], Value::Null, "{sm}");
@@ -673,8 +728,9 @@ async fn chaque_disque_porte_sa_vignette_et_l_album_local_sa_pochette() {
     assert_eq!(b.hote.appels("discogs /users/"), 2);
 }
 
-/// Une collection synchronisée AVANT les vignettes les reçoit à la relecture
-/// suivante de la liste, sans que rien d'autre ne soit refait.
+/// Une collection synchronisée AVANT les pochettes (mémoire d'une forme de
+/// liste plus ancienne) les reçoit à la relecture suivante — relue EN
+/// ENTIER, pas par le haut —, sans que rien d'autre ne soit refait.
 #[tokio::test]
 async fn une_synchronisation_d_avant_les_vignettes_les_recoit_a_la_suivante() {
     let b = banc_avec(HoteEssai::new());
@@ -686,25 +742,43 @@ async fn une_synchronisation_d_avant_les_vignettes_les_recoit_a_la_suivante() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|d| d["vignette"].is_null()),
+            .all(|d| d["pochette"] == false),
         "{c}"
     );
     let fiches = b.hote.appels("discogs /releases/");
     let mb = b.hote.appels("mb ");
     let services = b.hote.appels("service ");
+    let pages = b.hote.appels("discogs /users/");
+
+    // La mémoire telle qu'une version d'avant l'a écrite : sans
+    // `version_liste`, sans `liste_complete_le`.
+    let fichier = b._dossier.path().join("collection.json");
+    let mut brut: Value = serde_json::from_slice(&std::fs::read(&fichier).unwrap()).unwrap();
+    brut.as_object_mut().unwrap().remove("version_liste");
+    brut.as_object_mut().unwrap().remove("liste_complete_le");
+    std::fs::write(&fichier, brut.to_string()).unwrap();
+    let moteur = Arc::new(Moteur::new(
+        b.hote.clone(),
+        b._dossier.path().to_path_buf(),
+        Cadence::immediate(),
+    ));
+    let app = router(b.backend.clone(), moteur.clone());
 
     *b.hote.vignettes.lock().unwrap() = true;
-    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
-    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&app, "GET", "/collection", None).await;
     assert!(
         c["disques"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|d| d["vignette"]
-                .as_str()
-                .is_some_and(|v| v.starts_with("https://i.discogs.com/"))),
+            .all(|d| d["pochette"] == true),
         "{c}"
+    );
+    assert_eq!(
+        b.hote.appels("discogs /users/"),
+        pages + 2,
+        "une liste d'une forme ancienne se relit en entier"
     );
     assert_eq!(
         b.hote.appels("discogs /releases/"),
@@ -979,4 +1053,322 @@ async fn l_affinage_reprend_apres_un_redemarrage() {
     m3.synchroniser_maintenant("exemple").await.unwrap();
     m3.affiner_maintenant().await;
     assert_eq!(h3.appels("mb url https://www.discogs.com/release/"), 5);
+}
+
+// ─── Le cache (demande de Bertrand du 01/11/2026) ──────────────────────────
+
+/// Une requête brute sur le routeur : statut, en-têtes, octets.
+async fn brut(
+    app: &axum::Router,
+    methode: &str,
+    chemin: &str,
+    entetes: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut req = Request::builder().method(methode).uri(chemin);
+    for (k, v) in entetes {
+        req = req.header(*k, *v);
+    }
+    let rep = app
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let code = rep.status();
+    let h = rep.headers().clone();
+    let octets = axum::body::to_bytes(rep.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (code, h, octets)
+}
+
+fn banc_avec_pochettes() -> Banc {
+    let hote = HoteEssai::new();
+    *hote.vignettes.lock().unwrap() = true;
+    banc_avec(hote)
+}
+
+fn tous_les_appels(h: &HoteEssai) -> usize {
+    h.appels.lock().unwrap().len()
+}
+
+/// Deuxième ouverture de l'écran, après un redémarrage : la liste, les
+/// états et les pochettes viennent du cache. AUCUN appel à Discogs (ni API
+/// ni CDN), ni à MusicBrainz, ni aux services.
+#[tokio::test]
+async fn la_deuxieme_ouverture_n_appelle_pas_discogs() {
+    let b = banc_avec_pochettes();
+    suivre(&b, "exemple").await;
+    synchro_complete(&b, "exemple").await;
+    assert_eq!(b.moteur.ranger_les_pochettes().await, 5);
+    let (_, avant) = appel(&b.app, "GET", "/collection", None).await;
+    let appels = tous_les_appels(&b.hote);
+    assert!(b.hote.appels("image ") == 5, "une image par disque");
+
+    // Redémarrage : un nouveau moteur sur le même dossier.
+    let moteur = Arc::new(Moteur::new(
+        b.hote.clone(),
+        b._dossier.path().to_path_buf(),
+        Cadence::immediate(),
+    ));
+    let app = router(b.backend.clone(), moteur.clone());
+    let (_, c) = appel(&app, "GET", "/collection", None).await;
+    assert_eq!(c["statut"], "ok", "{c}");
+    assert_eq!(c["compteurs"], avant["compteurs"], "{c}");
+    let (_, e) = appel(&app, "GET", "/etat", None).await;
+    assert_eq!(e["pochettes"]["en_cache"], 5, "{e}");
+    assert_eq!(e["pochettes"]["restantes"], 0, "{e}");
+    for d in c["disques"].as_array().unwrap() {
+        let r = d["release_id"].as_u64().unwrap();
+        let (code, _, _) = brut(&app, "GET", &format!("/pochettes/{r}"), &[]).await;
+        assert_eq!(code, StatusCode::OK, "pochette {r}");
+    }
+    assert!(!moteur.lancer_pochettes(), "rien à préremplir");
+    assert_eq!(
+        tous_les_appels(&b.hote),
+        appels,
+        "aucun appel de plus : {:?}",
+        &b.hote.appels.lock().unwrap()[appels..]
+    );
+}
+
+/// La pochette est servie depuis le disque : vignette de 300 px en JPEG,
+/// originale à part, `Cache-Control`, `ETag`, et 304 sur `If-None-Match`.
+#[tokio::test]
+async fn la_pochette_est_servie_en_local_avec_etag_et_304() {
+    let b = banc_avec_pochettes();
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    assert_eq!(b.moteur.ranger_les_pochettes().await, 5);
+    assert_eq!(b.hote.appels("image "), 5);
+    assert_eq!(
+        b.hote.appels(&format!("image {}", pochette_essai(249504))),
+        1,
+        "la GRANDE image est celle qu'on télécharge"
+    );
+
+    let (code, h, octets) = brut(&b.app, "GET", "/pochettes/249504", &[]).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(h["content-type"], "image/jpeg");
+    assert!(
+        h["cache-control"].to_str().unwrap().contains("max-age="),
+        "{h:?}"
+    );
+    let tag = h["etag"].to_str().unwrap().to_string();
+    let v = image::load_from_memory(&octets).unwrap();
+    assert_eq!((v.width(), v.height()), (300, 300), "vignette de 300 px");
+
+    let (code, h2, octets) = brut(
+        &b.app,
+        "GET",
+        "/pochettes/249504",
+        &[("if-none-match", tag.as_str())],
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_MODIFIED);
+    assert!(octets.is_empty());
+    assert_eq!(h2["etag"].to_str().unwrap(), tag);
+
+    // Contre-épreuve : un autre ETag rend l'image.
+    let (code, _, _) = brut(
+        &b.app,
+        "GET",
+        "/pochettes/249504",
+        &[("if-none-match", "\"autre\"")],
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+
+    let (code, _, octets) = brut(&b.app, "GET", "/pochettes/249504?taille=originale", &[]).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(image::load_from_memory(&octets).unwrap().width(), 600);
+
+    // Contre-épreuve : une release hors de la collection n'est pas servie,
+    // et ne fait aucun appel.
+    let (code, _, _) = brut(&b.app, "GET", "/pochettes/424242", &[]).await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    assert_eq!(b.hote.appels("image "), 5, "rien de retéléchargé");
+}
+
+/// Une pochette demandée par l'écran avant le préremplissage passe par la
+/// file : téléchargée une fois, servie en local ensuite.
+#[tokio::test]
+async fn une_pochette_demandee_avant_son_tour_se_telecharge_une_fois() {
+    let b = banc_avec_pochettes();
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    assert_eq!(
+        b.hote.appels("image "),
+        0,
+        "la synchronisation seule ne télécharge rien"
+    );
+    for _ in 0..3 {
+        let (code, _, _) = brut(&b.app, "GET", "/pochettes/1050", &[]).await;
+        assert_eq!(code, StatusCode::OK);
+    }
+    assert_eq!(b.hote.appels("image "), 1);
+    assert_eq!(
+        b.moteur.ranger_les_pochettes().await,
+        4,
+        "les quatre autres"
+    );
+}
+
+/// Un 429 du CDN : recul (doublé à chaque refus), puis la pochette arrive.
+#[tokio::test]
+async fn un_429_sur_une_pochette_fait_reculer_puis_reussit() {
+    let hote = HoteEssai::new();
+    *hote.vignettes.lock().unwrap() = true;
+    let b = banc_avec_cadence(
+        hote,
+        Cadence {
+            attente_limite: std::time::Duration::from_millis(40),
+            attente_max: std::time::Duration::from_secs(1),
+            ..Cadence::immediate()
+        },
+    );
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    *b.hote.images_limites.lock().unwrap() = 2;
+    let debut = std::time::Instant::now();
+    let (code, _, _) = brut(&b.app, "GET", "/pochettes/1050", &[]).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(b.hote.appels("image "), 3, "deux refus, puis l'image");
+    assert!(
+        debut.elapsed() >= std::time::Duration::from_millis(40 + 80),
+        "recul de 40 ms puis 80 ms : {:?}",
+        debut.elapsed()
+    );
+
+    // Contre-épreuve : un CDN qui refuse toujours. Au plus `essais_limite`
+    // nouveaux essais, puis rien n'est rangé, et l'écran reçoit un 404.
+    *b.hote.images_limites.lock().unwrap() = 100;
+    let (code, _, _) = brut(&b.app, "GET", "/pochettes/249504", &[]).await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    assert_eq!(
+        b.hote.appels("image "),
+        3 + 4,
+        "1 + 3 essais, pas un de plus"
+    );
+    assert!(
+        !b._dossier.path().join("pochettes/249504.jpg").exists(),
+        "rien de rangé"
+    );
+}
+
+/// Le préremplissage s'arrête sur une panne et reprend, après un
+/// redémarrage, aux seules pochettes qui manquent.
+#[tokio::test]
+async fn les_pochettes_reprennent_apres_un_redemarrage() {
+    let b = banc_avec_pochettes();
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    *b.hote.images_avant_panne.lock().unwrap() = Some(2);
+    assert_eq!(
+        b.moteur.ranger_les_pochettes().await,
+        2,
+        "deux, puis la panne"
+    );
+    assert_eq!(b.hote.appels("image "), 3);
+    let (_, e) = appel(&b.app, "GET", "/etat", None).await;
+    assert_eq!(e["pochettes"]["en_cache"], 2, "{e}");
+    assert_eq!(e["pochettes"]["restantes"], 3, "{e}");
+
+    *b.hote.images_avant_panne.lock().unwrap() = None;
+    let moteur = Arc::new(Moteur::new(
+        b.hote.clone(),
+        b._dossier.path().to_path_buf(),
+        Cadence::immediate(),
+    ));
+    assert!(moteur.lancer_pochettes(), "la passe reprend au démarrage");
+    attendre_que(
+        || moteur.etat_pochettes().en_cache == 5 && !moteur.etat_pochettes().en_cours,
+        "les cinq pochettes rangées",
+    )
+    .await;
+    assert_eq!(
+        b.hote.appels("image "),
+        3 + 3,
+        "seules les trois qui manquaient sont téléchargées"
+    );
+    let appels = b.hote.appels.lock().unwrap().clone();
+    for r in [249504u64, 1050, 7024, 33597366, 38821545] {
+        let n = appels
+            .iter()
+            .filter(|a| **a == format!("image {}", pochette_essai(r)))
+            .count();
+        assert!(n >= 1 && n <= 2, "{r} : {n}");
+    }
+    // Contre-épreuve : la même reprise sur un dossier VIDE retélécharge tout.
+    let vide = tempfile::tempdir().unwrap();
+    let neuf = Moteur::new(
+        b.hote.clone(),
+        vide.path().to_path_buf(),
+        Cadence::immediate(),
+    );
+    assert_eq!(
+        neuf.ranger_les_pochettes().await,
+        0,
+        "dossier vide : pas de liste, rien à ranger"
+    );
+}
+
+/// Relecture partielle de la liste, puis complète dès qu'un disque est
+/// sorti de la collection (le compte ne tombe plus juste).
+#[tokio::test]
+async fn un_disque_retire_fait_relire_toute_la_liste() {
+    let b = banc_avec(HoteEssai::new());
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    assert_eq!(b.hote.appels("discogs /users/"), 3, "2 pages, puis 1");
+
+    *b.hote.disque_retire.lock().unwrap() = true;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    assert_eq!(
+        b.hote.appels("discogs /users/"),
+        5,
+        "le compte annoncé (4) ne tombe plus juste : les deux pages"
+    );
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    assert_eq!(
+        c["compteurs"]["total"], 4,
+        "le disque vendu est sorti : {c}"
+    );
+}
+
+/// « Effacer le cache » : les pochettes seules, puis tout.
+#[tokio::test]
+async fn effacer_le_cache_efface_les_pochettes_puis_la_memoire() {
+    let b = banc_avec_pochettes();
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    assert_eq!(b.moteur.ranger_les_pochettes().await, 5);
+    let dossier = b._dossier.path().join("pochettes");
+    assert!(dossier.join("1050.jpg").is_file());
+
+    let (code, r) = appel(&b.app, "DELETE", "/cache?quoi=pochettes", None).await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert!(!dossier.join("1050.jpg").exists());
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    assert_eq!(c["statut"], "ok", "la liste reste : {c}");
+    let (_, e) = appel(&b.app, "GET", "/etat", None).await;
+    assert_eq!(e["pochettes"]["en_cache"], 0, "{e}");
+    assert_eq!(e["pochettes"]["restantes"], 5, "{e}");
+
+    let (code, _) = appel(&b.app, "DELETE", "/cache", None).await;
+    assert_eq!(code, StatusCode::OK);
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    assert_eq!(c["statut"], "a_synchroniser", "{c}");
+    let (_, r) = appel(&b.app, "GET", "/reglages", None).await;
+    assert_eq!(r["nom_utilisateur"], "exemple", "le compte suivi reste");
+    // Et la mémoire effacée l'est aussi sur le disque (redémarrage).
+    let m = Moteur::new(
+        b.hote.clone(),
+        b._dossier.path().to_path_buf(),
+        Cadence::immediate(),
+    );
+    assert!(m.memoire().disques.is_empty());
+    let (code, _) = appel(&b.app, "DELETE", "/cache?quoi=autre", None).await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
 }

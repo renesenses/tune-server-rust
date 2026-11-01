@@ -114,6 +114,12 @@ pub struct Disque {
     /// les liens MusicBrainz.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vignette: Option<String>,
+    /// La grande image de la page de collection (`cover_image`, ~600 px),
+    /// même filtre que [`Self::vignette`]. C'est elle que le cache de
+    /// pochettes (`crate::pochettes`) télécharge, UNE fois, pour en tirer
+    /// sa vignette de 300 px ; l'écran ne la charge jamais lui-même.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pochette: Option<String>,
 }
 
 impl Disque {
@@ -256,7 +262,16 @@ pub fn disque_de_l_entree(e: &Value) -> Option<Disque> {
             .as_str()
             .and_then(vignette_discogs)
             .or_else(|| b["cover_image"].as_str().and_then(vignette_discogs)),
+        pochette: b["cover_image"].as_str().and_then(vignette_discogs),
     })
+}
+
+/// Le nombre d'exemplaires de toute la collection (`pagination.items`) :
+/// c'est lui qui dit si une relecture partielle de la liste suffit.
+pub fn exemplaires_annonces(page: &Value) -> Option<usize> {
+    page.pointer("/pagination/items")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
 }
 
 /// Une page de la collection : ses disques, et le nombre de pages annoncé.

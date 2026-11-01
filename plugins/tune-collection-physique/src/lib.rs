@@ -29,6 +29,16 @@
 //! | `GET /etat` | l'avancement (liste, streaming, bibliothèque), l'affinage MusicBrainz `{en_cours, restants}`, la dernière synchronisation, la dernière erreur |
 //! | `GET /collection[?format=&etat=]` | les disques, leur état, les compteurs |
 //! | `GET /cd?mb_release=&code_barre=` | un CD inséré est-il dans la collection, et copié ? |
+//! | `GET /pochettes/{release}[?taille=originale]` | la pochette, servie depuis le cache local (`ETag`, 304) |
+//! | `DELETE /cache[?quoi=pochettes]` | efface le cache : pochettes et mémoire, ou les pochettes seules |
+//!
+//! # Le cache (01/11/2026)
+//!
+//! Rien de ce que l'écran affiche ne vient de Discogs au moment où il
+//! l'affiche : la liste, les fiches et les liens sont dans la mémoire
+//! (`collection.json`, relue au démarrage), les pochettes dans `pochettes/`
+//! ([`pochettes`]). Une synchronisation ne relit que le haut de la liste
+//! quand le reste n'a pas bougé (`instance_id`, `date_added`).
 //!
 //! Refus : `{"error": "collection_physique.<code>"}`. Un code, jamais une
 //! phrase : l'écran traduit. Chaque réponse de collection porte
@@ -40,6 +50,7 @@
 pub mod correspondance;
 pub mod discogs;
 pub mod memoire;
+pub mod pochettes;
 pub mod synchro;
 
 use std::path::PathBuf;
@@ -49,11 +60,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -65,7 +76,7 @@ use crate::correspondance::{AlbumLocal, Index};
 use crate::discogs::{Disque, Famille, code_barre_normalise, nom_utilisateur_valide};
 use crate::memoire::Memoire;
 use crate::synchro::code;
-pub use crate::synchro::{Cadence, Hote, Jeton, Moteur, Panne, Reponse};
+pub use crate::synchro::{Cadence, Hote, Image, Jeton, Moteur, Panne, Reponse};
 
 /// Le nom du greffon, et donc son préfixe `/api/v1/ext/collection-physique`.
 pub const NOM: &str = "collection-physique";
@@ -221,6 +232,7 @@ async fn lire_etat(State(etat): State<Etat>) -> Response {
         "derniere_synchro": if a_jour { m.derniere_synchro } else { None },
         "derniere_erreur": m.derniere_erreur,
         "affinage_musicbrainz": affinage(&etat, a_jour),
+        "pochettes": etat.moteur.etat_pochettes(),
     }))
     .into_response()
 }
@@ -303,7 +315,9 @@ fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Valu
         "codes_barres": codes,
         "ajoute_le": d.ajoute_le,
         "lien_discogs": d.lien_discogs(),
-        "vignette": d.vignette,
+        // La pochette est servie par `GET /pochettes/{release_id}`, depuis
+        // le cache local : l'adresse Discogs ne sort plus vers l'écran.
+        "pochette": d.pochette.is_some() || d.vignette.is_some(),
         "bibliotheque": bibliotheque,
         "streaming": trouves,
         "etat": etat.code(),
@@ -481,10 +495,112 @@ async fn cd(State(etat): State<Etat>, Query(q): Query<QuestionCd>) -> Response {
     .into_response()
 }
 
+/// `no-store` partout, sauf là où la route a posé sa propre politique
+/// (les pochettes).
 async fn sans_cache(mut r: Response) -> Response {
-    r.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if !r.headers().contains_key(header::CACHE_CONTROL) {
+        r.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     r
+}
+
+/// Une pochette se garde un jour sans revalider, puis se revalide par son
+/// `ETag` (304, aucun octet).
+pub const CACHE_POCHETTE: &str = "private, max-age=86400";
+
+#[derive(Deserialize)]
+struct QuestionPochette {
+    taille: Option<String>,
+}
+
+/// L'`ETag` d'un fichier rangé : sa taille et sa date d'écriture. Une
+/// pochette réécrite (cache effacé puis rangé de nouveau) change d'`ETag`.
+fn etag(meta: &std::fs::Metadata) -> String {
+    let date = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("\"{:x}-{:x}\"", meta.len(), date)
+}
+
+/// `GET /pochettes/{release}` : la pochette depuis le cache local,
+/// téléchargée d'abord (par la file) si elle n'y est pas encore.
+async fn pochette(
+    State(etat): State<Etat>,
+    Path(release): Path<u64>,
+    Query(q): Query<QuestionPochette>,
+    entetes: axum::http::HeaderMap,
+) -> Response {
+    let taille = match q.taille.as_deref() {
+        None | Some("") | Some("vignette") => pochettes::Taille::Vignette,
+        Some("originale") => pochettes::Taille::Originale,
+        Some(_) => return refus(StatusCode::UNPROCESSABLE_ENTITY, "taille_inconnue"),
+    };
+    let Some(chemin) = etat.moteur.pochette(release, taille).await else {
+        return refus(StatusCode::NOT_FOUND, "pochette_absente");
+    };
+    let Ok(meta) = tokio::fs::metadata(&chemin).await else {
+        return refus(StatusCode::NOT_FOUND, "pochette_absente");
+    };
+    let tag = etag(&meta);
+    let communs = [
+        (
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(CACHE_POCHETTE),
+        ),
+        (
+            header::ETAG,
+            HeaderValue::from_str(&tag).unwrap_or(HeaderValue::from_static("\"0\"")),
+        ),
+    ];
+    let deja = entetes
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|v| v.trim() == tag || v.trim() == "*");
+    if deja {
+        return (StatusCode::NOT_MODIFIED, communs).into_response();
+    }
+    let Ok(octets) = tokio::fs::read(&chemin).await else {
+        return refus(StatusCode::NOT_FOUND, "pochette_absente");
+    };
+    let type_mime = match chemin.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        _ => "image/jpeg",
+    };
+    (
+        StatusCode::OK,
+        communs,
+        [(header::CONTENT_TYPE, HeaderValue::from_static(type_mime))],
+        octets,
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct QuoiEffacer {
+    quoi: Option<String>,
+}
+
+/// `DELETE /cache` : « Effacer le cache » des réglages du greffon.
+/// `?quoi=pochettes` n'efface que les pochettes ; sans paramètre, la
+/// mémoire aussi (la synchronisation suivante relit tout chez Discogs).
+async fn effacer_cache(State(etat): State<Etat>, Query(q): Query<QuoiEffacer>) -> Response {
+    let tout = match q.quoi.as_deref() {
+        None | Some("") | Some("tout") => true,
+        Some("pochettes") => false,
+        Some(_) => return refus(StatusCode::UNPROCESSABLE_ENTITY, "quoi_inconnu"),
+    };
+    if let Err(e) = etat.moteur.effacer_le_cache(tout) {
+        tracing::warn!(target: "plugin", erreur = %e, "collection_physique_cache_non_efface");
+        return refus(StatusCode::INTERNAL_SERVER_ERROR, code::ECRITURE);
+    }
+    Json(json!({"efface": if tout { "tout" } else { "pochettes" }})).into_response()
 }
 
 /// Le routeur du greffon, prêt à être monté sous
@@ -498,6 +614,8 @@ pub fn router(backend: Arc<dyn DbBackend>, moteur: Arc<Moteur>) -> Router<()> {
         .route("/etat", get(lire_etat))
         .route("/collection", get(collection))
         .route("/cd", get(cd))
+        .route("/pochettes/{release}", get(pochette))
+        .route("/cache", delete(effacer_cache))
         .layer(middleware::map_response(sans_cache))
         .with_state(etat)
 }
@@ -559,6 +677,9 @@ impl TunePlugin for CollectionPhysiquePlugin {
             // L'affinage MusicBrainz reprend tout de suite où il s'était
             // arrêté ; la synchronisation, elle, attend un peu.
             moteur.lancer_affinage();
+            // Les pochettes qui manquent encore se rangent (reprise après
+            // un redémarrage).
+            moteur.lancer_pochettes();
             tokio::time::sleep(PREMIERE_SYNCHRO).await;
             loop {
                 if let Some(nom) = nom_suivi(&backend) {

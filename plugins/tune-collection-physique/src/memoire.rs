@@ -34,6 +34,16 @@ use crate::discogs::Disque;
 pub const FICHIER: &str = "collection.json";
 pub const VERSION: u32 = 1;
 pub const REVOIR_APRES_JOURS: i64 = 30;
+/// La forme des disques de la liste. 2 : avec la grande image
+/// (`Disque::pochette`, cache de pochettes du 01/11/2026). Une liste d'une
+/// forme plus ancienne se relit en ENTIER à la synchronisation suivante
+/// (sans rien refaire d'autre) ; une liste à jour se relit par le haut
+/// seulement (`crate::synchro`, relecture partielle).
+pub const VERSION_LISTE: u32 = 2;
+/// La liste se relit en entier au moins tous les tant de jours, même quand
+/// la relecture partielle suffit : c'est ainsi qu'une fiche corrigée chez
+/// Discogs (titre, label) finit par arriver.
+pub const RELIRE_TOUTE_LA_LISTE_JOURS: i64 = 7;
 
 /// Ce que la fiche Discogs d'un disque a appris.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +101,13 @@ pub struct Memoire {
     /// Le code de la dernière erreur, effacé par une synchronisation réussie.
     /// Jamais MusicBrainz : son affinage ne fait pas d'erreur.
     pub derniere_erreur: Option<String>,
+    /// La dernière relecture COMPLÈTE de la liste (toutes les pages).
+    /// `serde(default)` : une mémoire d'avant le 01/11/2026 se relit.
+    #[serde(default)]
+    pub liste_complete_le: Option<i64>,
+    /// [`VERSION_LISTE`] de la liste rangée ; 0 pour une mémoire d'avant.
+    #[serde(default)]
+    pub version_liste: u32,
 }
 
 impl Memoire {
@@ -134,7 +151,21 @@ impl Memoire {
             self.liste_lue_le = None;
             self.derniere_synchro = None;
             self.derniere_erreur = None;
+            self.liste_complete_le = None;
+            self.version_liste = 0;
         }
+    }
+
+    /// La liste rangée peut-elle être complétée par le haut (relecture
+    /// partielle) plutôt que relue en entier ?
+    pub fn liste_partielle_possible(&self, nom: &str, maintenant: i64) -> bool {
+        self.nom_utilisateur.as_deref() == Some(nom)
+            && self.version_liste == VERSION_LISTE
+            && !self.tronquee
+            && !self.disques.is_empty()
+            && self
+                .liste_complete_le
+                .is_some_and(|t| maintenant - t < RELIRE_TOUTE_LA_LISTE_JOURS * 86_400)
     }
 
     pub fn liens_a_revoir(&self, release: u64, maintenant: i64) -> bool {

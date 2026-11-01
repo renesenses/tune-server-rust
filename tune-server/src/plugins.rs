@@ -505,6 +505,66 @@ impl tune_collection_physique::Hote for HoteDeLaCollection {
             offset += PAGE;
         }
     }
+
+    /// Une pochette du CDN de Discogs, pour le cache du greffon (01/11/2026).
+    /// L'adresse est revérifiée ici (`https`, hôte d'images de Discogs) : le
+    /// serveur ne va chercher rien d'autre. User-Agent du serveur, aucun
+    /// jeton (il ne sort pas vers le CDN), aucune redirection suivie hors de
+    /// ces hôtes, et 8 Mo au plus.
+    async fn image_discogs(
+        &self,
+        url: &str,
+    ) -> Result<tune_collection_physique::Image, tune_collection_physique::Panne> {
+        use tune_collection_physique::{Image, Panne};
+        const IMAGE_MAX: usize = 8 * 1024 * 1024;
+        if tune_collection_physique::discogs::vignette_discogs(url).as_deref() != Some(url) {
+            return Ok(Image::Introuvable);
+        }
+        let r = self
+            .state
+            .http_client
+            .get(url)
+            .header(
+                reqwest::header::USER_AGENT,
+                tune_core::metadata::musicbrainz_release::MB_UA,
+            )
+            .header(
+                reqwest::header::ACCEPT,
+                "image/jpeg,image/png,image/webp;q=0.8",
+            )
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::debug!(
+                    target: "plugin",
+                    erreur = %tune_core::http::client::decrire_erreur_http(&e),
+                    "collection_physique_pochette_sans_reponse"
+                );
+                Panne
+            })?;
+        let final_ok =
+            tune_collection_physique::discogs::vignette_discogs(r.url().as_str()).is_some();
+        match r.status().as_u16() {
+            200..=299 if final_ok => {
+                if r.content_length().is_some_and(|n| n as usize > IMAGE_MAX) {
+                    return Ok(Image::Introuvable);
+                }
+                let octets = r.bytes().await.map_err(|_| Panne)?;
+                if octets.len() > IMAGE_MAX {
+                    return Ok(Image::Introuvable);
+                }
+                Ok(Image::Octets(octets.to_vec()))
+            }
+            200..=299 => Ok(Image::Introuvable),
+            404 | 403 | 410 => Ok(Image::Introuvable),
+            429 | 503 => Ok(Image::Limite),
+            statut => {
+                tracing::debug!(target: "plugin", statut, "collection_physique_pochette_statut");
+                Err(Panne)
+            }
+        }
+    }
 }
 
 #[cfg(feature = "assistant-ia")]

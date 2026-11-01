@@ -76,6 +76,17 @@ pub enum Reponse {
     Limite,
 }
 
+/// Une image de Discogs, telle que l'hôte la rend (cache de pochettes).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Image {
+    /// Les octets de l'image (bornés par l'hôte).
+    Octets(Vec<u8>),
+    /// 404 / 403 / 410 : l'image n'existe plus ; ne pas la redemander.
+    Introuvable,
+    /// 429 / 503 : trop d'appels ; reculer.
+    Limite,
+}
+
 /// Le service n'a pas répondu (transport, délai, statut inattendu).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Panne;
@@ -116,6 +127,11 @@ pub trait Hote: Send + Sync {
     ) -> Result<Vec<AlbumDeService>, Panne>;
     /// Les albums LOCAUX de la bibliothèque, masqués exclus.
     async fn albums_locaux(&self) -> Result<Vec<AlbumLocal>, String>;
+    /// `GET` d'une image de Discogs (`url` déjà passée par
+    /// [`discogs::vignette_discogs`] : `https`, hôte d'images de Discogs),
+    /// avec le User-Agent du serveur et SANS le jeton (le CDN n'en veut
+    /// pas ; il ne sort pas vers un autre hôte que l'API).
+    async fn image_discogs(&self, url: &str) -> Result<Image, Panne>;
 }
 
 /// L'espacement des appels du greffon.
@@ -133,6 +149,8 @@ pub struct Cadence {
     /// Le plus long recul de l'affinage MusicBrainz.
     pub attente_max: Duration,
     pub essais_limite: u32,
+    /// L'espacement des téléchargements de pochettes (cache de pochettes).
+    pub image: Duration,
 }
 
 impl Default for Cadence {
@@ -148,6 +166,9 @@ impl Default for Cadence {
             attente_limite: Duration::from_secs(60),
             attente_max: Duration::from_secs(30 * 60),
             essais_limite: 3,
+            // Une pochette par seconde : 908 disques en un quart d'heure,
+            // sans jamais solliciter le CDN de Discogs en rafale.
+            image: Duration::from_secs(1),
         }
     }
 }
@@ -163,6 +184,7 @@ impl Cadence {
             attente_limite: Duration::ZERO,
             attente_max: Duration::ZERO,
             essais_limite: 3,
+            image: Duration::ZERO,
         }
     }
 }
@@ -218,7 +240,7 @@ pub fn maintenant() -> i64 {
         .unwrap_or(0)
 }
 
-async fn attendre(d: Duration) {
+pub(crate) async fn attendre(d: Duration) {
     if !d.is_zero() {
         tokio::time::sleep(d).await;
     }
@@ -226,16 +248,17 @@ async fn attendre(d: Duration) {
 
 pub struct Moteur {
     pub(crate) hote: Arc<dyn Hote>,
-    dossier: PathBuf,
+    pub(crate) dossier: PathBuf,
     pub(crate) memoire: Mutex<Memoire>,
     avancement: Mutex<Avancement>,
     en_cours: AtomicBool,
     affinage_en_cours: AtomicBool,
     taches: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    cadence: Cadence,
+    pub(crate) cadence: Cadence,
+    pub(crate) pochettes: crate::pochettes::Pochettes,
 }
 
-fn verrou<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn verrou<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -256,6 +279,7 @@ impl Moteur {
         if memoire.derniere_erreur.as_deref() == Some(code::MUSICBRAINZ_INDISPONIBLE) {
             memoire.derniere_erreur = None;
         }
+        let pochettes = crate::pochettes::Pochettes::new(&dossier);
         Self {
             hote,
             dossier,
@@ -264,6 +288,7 @@ impl Moteur {
             en_cours: AtomicBool::new(false),
             affinage_en_cours: AtomicBool::new(false),
             taches: Mutex::new(Vec::new()),
+            pochettes,
             cadence,
         }
     }
@@ -303,9 +328,10 @@ impl Moteur {
         }
         self.en_cours.store(false, Ordering::SeqCst);
         self.affinage_en_cours.store(false, Ordering::SeqCst);
+        self.pochettes.arretee();
     }
 
-    fn garder(&self, t: tokio::task::JoinHandle<()>) {
+    pub(crate) fn garder(&self, t: tokio::task::JoinHandle<()>) {
         let mut taches = verrou(&self.taches);
         taches.retain(|t| !t.is_finished());
         taches.push(t);
@@ -347,8 +373,10 @@ impl Moteur {
         let moteur = self.clone();
         self.garder(tokio::spawn(async move {
             let _ = moteur.synchroniser_maintenant(&nom).await;
-            // Même après une panne de Discogs : la liste déjà lue s'affine.
+            // Même après une panne de Discogs : la liste déjà lue s'affine,
+            // et ses pochettes se rangent.
             moteur.lancer_affinage();
+            moteur.lancer_pochettes();
         }));
         true
     }
@@ -459,13 +487,32 @@ impl Moteur {
         Ok(())
     }
 
+    /// Étape 1 : la liste, triée par date d'ajout, la plus récente d'abord.
+    ///
+    /// **Relecture partielle** (cache du 01/11/2026) : quand la liste rangée
+    /// est du même compte, de la forme courante et relue en entier il y a
+    /// moins de [`crate::memoire::RELIRE_TOUTE_LA_LISTE_JOURS`] jours, la
+    /// lecture s'arrête à la première page qui contient un exemplaire déjà
+    /// connu (même `instance_id`, même `date_added`) : ce qui est au-dessus
+    /// est nouveau, ce qui est en dessous est déjà rangé. La fusion n'est
+    /// retenue que si elle compte EXACTEMENT les exemplaires que Discogs
+    /// annonce (`pagination.items`) ; sinon un disque est sorti de la
+    /// collection (vendu, retiré), et la lecture continue jusqu'au bout.
+    /// Pour 908 disques : une page au lieu de dix.
     async fn lire_la_liste(&self, nom: &str) -> Result<(), &'static str> {
         self.etape(Etape::Liste, 0);
         let chemin = format!(
             "/users/{}/collection/folders/0/releases",
             urlencoding::encode(nom)
         );
+        let debut = maintenant();
+        let mut connus: Option<Vec<Disque>> = {
+            let m = verrou(&self.memoire);
+            m.liste_partielle_possible(nom, debut)
+                .then(|| m.disques.clone())
+        };
         let mut disques: Vec<Disque> = Vec::new();
+        let mut fusion: Option<Vec<Disque>> = None;
         let mut tronquee = false;
         let mut page = 1u32;
         loop {
@@ -483,11 +530,36 @@ impl Moteur {
             };
             let (lus, pages) = discogs::page_de_collection(&corps);
             let vide = lus.is_empty();
+            let touche = connus.as_ref().is_some_and(|c| {
+                lus.iter().any(|d| {
+                    c.iter()
+                        .any(|k| k.instance_id == d.instance_id && k.ajoute_le == d.ajoute_le)
+                })
+            });
             disques.extend(lus);
             {
                 let mut a = verrou(&self.avancement);
                 a.fait = page as usize;
                 a.total = pages.unwrap_or(page) as usize;
+            }
+            if touche
+                && let Some(c) = connus.take()
+                && let Some(annonces) = discogs::exemplaires_annonces(&corps)
+            {
+                let lus: std::collections::HashSet<u64> =
+                    disques.iter().map(|d| d.instance_id).collect();
+                let mut f = disques.clone();
+                f.extend(c.into_iter().filter(|d| !lus.contains(&d.instance_id)));
+                if f.len() == annonces {
+                    fusion = Some(f);
+                    break;
+                }
+                tracing::info!(
+                    target: "plugin",
+                    annonces,
+                    fusion = f.len(),
+                    "collection_physique_liste_relue_en_entier"
+                );
             }
             let pages = pages.unwrap_or(page);
             if vide || page >= pages {
@@ -499,18 +571,27 @@ impl Moteur {
             }
             page += 1;
         }
+        let partielle = fusion.is_some();
+        tracing::info!(target: "plugin", partielle, pages = page, "collection_physique_liste_lue");
         {
             let mut m = verrou(&self.memoire);
             m.changer_de_compte(Some(nom.to_string()));
-            m.disques = disques;
-            m.tronquee = tronquee;
+            match fusion {
+                Some(f) => m.disques = f,
+                None => {
+                    m.disques = disques;
+                    m.tronquee = tronquee;
+                    m.liste_complete_le = Some(debut);
+                }
+            }
+            m.version_liste = crate::memoire::VERSION_LISTE;
             m.liste_lue_le = Some(maintenant());
         }
         self.ecrire()
     }
 
     /// Les releases de la liste, sans doublon, dans l'ordre de la liste.
-    fn releases(m: &Memoire) -> Vec<Disque> {
+    pub(crate) fn releases(m: &Memoire) -> Vec<Disque> {
         let mut vus = std::collections::HashSet::new();
         m.disques
             .iter()
