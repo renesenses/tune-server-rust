@@ -56,27 +56,17 @@ pub(super) fn remplir_banc(db: &SqliteDb, pistes: i64, ecoutes: i64) {
     db.execute_batch(&sql).expect("banc #7634");
 }
 
-/// Mesure à la demande : `TUNE_BANC_7634=/chemin/base.db cargo test -p
-/// tune-core --lib banc_7634 -- --ignored --nocapture`. La base est créée et
-/// remplie si le fichier n'existe pas (500 000 écoutes, 100 000 pistes), puis
-/// gardée : les mesures avant et après portent sur la MÊME base.
+/// Mesure à la demande : `cargo test -p tune-core --lib banc_7634 --
+/// --ignored --nocapture`. Base de fichier neuve de 500 000 écoutes sur
+/// 100 000 pistes, remplie par le même générateur à chaque fois (le banc est
+/// déterministe, à l'heure de la mesure près) : avant et après se comparent.
 #[test]
 #[ignore = "banc de mesure #7634 : base de 500 000 écoutes, à la demande"]
 fn banc_7634_mesure_le_tableau_de_bord() {
-    let Ok(chemin) = std::env::var("TUNE_BANC_7634") else {
-        eprintln!("TUNE_BANC_7634 absent : rien à mesurer");
-        return;
-    };
-    let neuve = !std::path::Path::new(&chemin).exists();
-    let db = SqliteDb::open(&chemin).expect("base du banc");
-    db.init_schema().unwrap();
-    crate::db::migrations::run_migrations(&db).unwrap();
-    if neuve {
-        let t = Instant::now();
-        remplir_banc(&db, 100_000, 500_000);
-        eprintln!("banc rempli en {:?}", t.elapsed());
-    }
-    let repo = HistoryRepo::new(db);
+    let t = Instant::now();
+    let b = banc("mesure", 100_000, 500_000);
+    eprintln!("banc rempli en {:?}", t.elapsed());
+    let repo = HistoryRepo::with_backend(b.db.clone());
     for periode in ["7d", "30d", "today", "all"] {
         for essai in 1..=3 {
             let t = Instant::now();
