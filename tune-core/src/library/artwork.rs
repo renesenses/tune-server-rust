@@ -1098,11 +1098,10 @@ pub async fn batch_enrich_artwork_scoped(
                 debug!(album_id, album = %title, artist = %artist, transitoires, "batch_artwork_not_found");
             }
         }
-        if traites % 100 == 0 {
+        if traites.is_multiple_of(100) {
             absents.enregistrer(&settings, crate::library::images_rapides::maintenant());
         }
     }
-    drop(resultats);
     absents.enregistrer(&settings, crate::library::images_rapides::maintenant());
 
     info!(
@@ -2210,19 +2209,19 @@ async fn batch_enrich_artist_artwork_inner(
             // redonnerait le MBID qu'il vient de retirer. Le MBID trouvé ne sert
             // à chercher l'image que s'il a été écrit (provenance `nom`).
             let mut mbid = mbid;
-            if mbid.is_empty() && !artist_repo.identite_detachee(artist_id).unwrap_or(true) {
-                if let Some(found) = search_musicbrainz_artist(&name).await
-                    && artist_repo
-                        .poser_mbid(
-                            artist_id,
-                            &found,
-                            crate::db::artist_repo::ProvenanceMbid::Nom,
-                        )
-                        .unwrap_or(false)
-                {
-                    info!(artist_id, artist = %name, mbid = %found, "batch_artist_artwork_mbid_resolved");
-                    mbid = found;
-                }
+            if mbid.is_empty()
+                && !artist_repo.identite_detachee(artist_id).unwrap_or(true)
+                && let Some(found) = search_musicbrainz_artist(&name).await
+                && artist_repo
+                    .poser_mbid(
+                        artist_id,
+                        &found,
+                        crate::db::artist_repo::ProvenanceMbid::Nom,
+                    )
+                    .unwrap_or(false)
+            {
+                info!(artist_id, artist = %name, mbid = %found, "batch_artist_artwork_mbid_resolved");
+                mbid = found;
             }
 
             // #4837 : une image rejetée par l'utilisateur ne revient pas, de
@@ -2358,11 +2357,10 @@ async fn batch_enrich_artist_artwork_inner(
                 .ok();
         }
         // Le cache négatif survit à un redémarrage en cours de passe.
-        if traites % 100 == 0 {
+        if traites.is_multiple_of(100) {
             absents.enregistrer(&settings, crate::library::images_rapides::maintenant());
         }
     }
-    drop(resultats);
     absents.enregistrer(&settings, crate::library::images_rapides::maintenant());
 
     info!(
@@ -2446,20 +2444,19 @@ async fn batch_enrich_artist_artwork_inner(
                         }
 
                     // Fallback to Last.fm
-                    if lastfm_available {
-                        if let Some(data) =
+                    if lastfm_available
+                        && let Some(data) =
                             fetch_artist_image_lastfm(client, &name, lastfm_key)
                                 .await
                                 .and_then(|d| image_retenue(d, &refusees))
-                        {
-                            // Adressage par le CONTENU (#1444), même raison
-                            // qu'au passage Discogs juste au-dessus.
-                            std::fs::create_dir_all(cache_dir).ok();
-                            if let Some(hash) = cache_fetched_image(&data, cache_dir, "jpg") {
-                                artist_repo.update_image(artist_id, &hash, "lastfm").ok();
-                                info!(artist_id, artist = %name, "batch_artist_artwork_lastfm_enriched");
-                                return Some(SourceParNom::Lastfm);
-                            }
+                    {
+                        // Adressage par le CONTENU (#1444), même raison
+                        // qu'au passage Discogs juste au-dessus.
+                        std::fs::create_dir_all(cache_dir).ok();
+                        if let Some(hash) = cache_fetched_image(&data, cache_dir, "jpg") {
+                            artist_repo.update_image(artist_id, &hash, "lastfm").ok();
+                            info!(artist_id, artist = %name, "batch_artist_artwork_lastfm_enriched");
+                            return Some(SourceParNom::Lastfm);
                         }
                     }
                     None
