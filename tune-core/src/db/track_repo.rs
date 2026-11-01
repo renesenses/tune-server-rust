@@ -3017,12 +3017,10 @@ impl TrackRepo {
             owned_params.push(SqlValue::Text(folder_like_pattern(fld)));
         }
 
-        // Album rating (profile 1): tracks inherit their album's rating.
+        // Note d'album du profil de la requête (#7594) : les pistes héritent
+        // de la note de leur album.
         if let Some(c) = ph.in_list("arr.rating", f.ratings.len()) {
-            conditions.push(format!(
-                "EXISTS (SELECT 1 FROM album_ratings arr \
-                 WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND {c})"
-            ));
+            conditions.push(crate::db::facet_filter::rating_condition(&c, f.profile_id));
             for v in &f.ratings {
                 owned_params.push(SqlValue::Int(*v));
             }
@@ -7652,6 +7650,54 @@ mod tests_favoris_du_profil_7569 {
             "sans profil : le profil 1, comme avant"
         );
         assert!(titres(3).is_empty(), "un profil sans favori ne voit rien");
+    }
+}
+
+/// #7594 — le filtre de notes d'album lit les notes du profil de la REQUÊTE,
+/// pas toujours celles du profil 1.
+#[cfg(test)]
+mod tests_notes_du_profil_7594 {
+    use crate::db::facet_filter::TrackFilter;
+    use crate::db::models::Track;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    #[test]
+    fn le_filtre_de_notes_lit_les_notes_du_profil_demande() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch("INSERT INTO albums (id, title) VALUES (101, 'A'), (102, 'B');")
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+        for (titre, album) in [("Alpha", 101), ("Beta", 102)] {
+            let mut t = Track::new(titre.into());
+            t.file_path = Some(format!("/m/{titre}.flac"));
+            t.album_id = Some(album);
+            repo.create(&t).unwrap();
+        }
+        // Profil 1 : A=5, B=2. Profil 2 : A=2, B=5.
+        db.execute_batch(
+            "INSERT INTO album_ratings (album_id, profile_id, rating) VALUES \
+             (101, 1, 5), (102, 1, 2), (101, 2, 2), (102, 2, 5);",
+        )
+        .unwrap();
+
+        let titres = |profil: i64| -> Vec<String> {
+            let f = TrackFilter {
+                ratings: vec![5],
+                profile_id: profil,
+                ..Default::default()
+            };
+            let (pistes, total) = repo.list_filtered(&f, 50, 0).unwrap();
+            let t: Vec<String> = pistes.into_iter().map(|p| p.title).collect();
+            assert_eq!(total as usize, t.len(), "le total suit la liste");
+            t
+        };
+        assert_eq!(titres(1), ["Alpha"]);
+        assert_eq!(titres(2), ["Beta"], "le profil 2 ne voit que ses notes");
+        assert_eq!(titres(0), ["Alpha"], "sans profil : le profil 1");
+        assert!(titres(3).is_empty(), "un profil sans note ne voit rien");
     }
 }
 
