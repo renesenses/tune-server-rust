@@ -129,7 +129,7 @@ async fn la_porte_d_un_hote_borne_ses_requetes_simultanees() {
             let _p = passer(Hote::Mozaiklabs, "").await.unwrap();
             let n = en_vol.fetch_add(1, Ordering::SeqCst) + 1;
             pic.fetch_max(n, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_millis(1_000)).await;
             en_vol.fetch_sub(1, Ordering::SeqCst);
         }));
     }

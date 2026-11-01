@@ -376,7 +376,7 @@ where
             }
         })
         .map(travail)
-        .buffer_unordered(largeur.max(1))
+        .buffer_unordered(1)
 }
 
 /// Les éléments qu'aucune source ne connaissait, et quand on l'a constaté
