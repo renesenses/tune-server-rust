@@ -925,11 +925,12 @@ impl PlaybackOrchestrator {
             .filter(|np| np.source == "podcast")
             && let Some(url) = np.source_id.as_deref()
         {
-            let _ = crate::db::listening_resume::podcast_position(
+            let _ = crate::db::listening_resume::podcast_position_avec_duree(
                 &self.db,
                 zone_id,
                 url,
                 state.position_ms,
+                np.duration_ms,
             );
         }
     }
@@ -1037,11 +1038,12 @@ impl PlaybackOrchestrator {
         if let Some(ref np) = state.now_playing {
             if np.source == "podcast" {
                 if let Some(url) = np.source_id.as_deref() {
-                    let _ = crate::db::listening_resume::podcast_position(
+                    let _ = crate::db::listening_resume::podcast_position_avec_duree(
                         &self.db,
                         zone_id,
                         url,
                         state.position_ms,
+                        np.duration_ms,
                     );
                 }
             }

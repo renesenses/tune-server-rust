@@ -21,17 +21,63 @@ cd tune-widget/src-tauri
 cargo tauri build                          # → target/release/bundle/{macos,dmg}
 ```
 
-Point it at a server with `TUNE_SERVER_URL=http://<host>:8888` (default
-`http://localhost:8888`).
+Point it at a server from the ⚙ panel (`host:8888`); the address is kept in
+`<config dir>/tune-widget/config.json` (`server_url`) and shared with the
+native side (global shortcuts, full window). Default: `http://localhost:8888`.
 
 ## Release (signed + notarized)
 
-Ships on its own cadence via [`.github/workflows/widget.yml`](../.github/workflows/widget.yml),
-**not** with the server's `v*` tags. Trigger it with a `widget-v*` tag or
-run it manually (`workflow_dispatch`). The workflow builds arm64 + Intel,
-signs with the Developer ID certificate, and — because the notarization
-secrets are set — notarizes and staples the DMG automatically, then publishes
-it as a GitHub release asset.
+Recipe: [`.github/workflows/widget.yml`](../.github/workflows/widget.yml) —
+macOS arm64 + Intel (signed with the Developer ID certificate, notarized and
+stapled) and Windows x64 (NSIS installer, **not signed** until the
+Authenticode certificate exists; the signing step is already in place and
+stays inert while `WIN_SIGN_CERT_BASE64` is empty).
+
+Three ways in:
+
+- **With every server release (since rc10).** `release.yml` calls
+  `widget.yml` (`workflow_call`, input `release_tag`). The files are named
+  after the server tag — `tune-widget-<tag>-macos-aarch64.dmg`,
+  `tune-widget-<tag>-macos-x86_64.dmg`,
+  `tune-widget-<tag>-windows-x86_64-setup.exe` — and land in the same draft
+  release, inside `SHA256SUMS`. The `tune-widget-` prefix keeps them out of the
+  self-updater (`tune-server-` archives only) and of the /download page.
+- **Manually** (`workflow_dispatch`): with `release_tag` set, the run produces
+  exactly the files a release would carry, without any tag — the way to check
+  the chain before a train. Without it, Tauri's own file names.
+- **On its own cadence** with a `widget-v*` tag, which must match
+  `tauri.conf.json`'s version and publishes a separate `widget-v*` release.
+
+Bump the widget version (`tauri.conf.json`, `Cargo.toml`, `Cargo.lock`)
+whenever its interface changes: the web-cache purge below keys on it.
+
+## Server contract
+
+`src/contrat.js` holds everything the interface reads from or sends to the
+server, away from the DOM, and `tests/contrat.test.js` pins it
+(`node --test tune-widget/tests/*.test.js`, also run by `widget-ci.yml`).
+Rules worth knowing before touching it:
+
+- `volume` is always a linear gain `0..1`, both ways. The server reads any
+  number `> 1` as a percentage — sending the slider's `1` used to mean 100 %.
+  A zone whose `GET /zones` entry says `volume_curve: "db60"` (software
+  outputs) has a dB slider: same formulas as `tune_core::audio::volume_scale`
+  (also ported to `src-tauri/src/volume.rs` for the global shortcuts).
+- `GET /search` returns library hits under `local` and each streaming
+  service under `services.<name>` (items keyed by `source_id`, a string).
+  The widget sends one request for the library (`sources=local`, shown as
+  soon as it answers) and one per service (`sources=qobuz`, `sources=tidal`)
+  in parallel, debounced and aborted when the query changes. Play bodies are
+  the web client's: `{track_id}`, `{album_id}`, `{artist_id}` (up to 50 random
+  tracks, #6467), `{source, source_id, title, …}` for a service track and
+  `{source, streaming_album_id}` for a service album. Service artists are not
+  listed: `POST /zones/{id}/play` has no field to play one. Thumbnails go
+  through `/library/artwork/{hash}?size=80` or `/library/artwork/proxy?url=`.
+- WebSocket messages are matched on their exact `type` and on
+  `data.zone_id`.
+- No authentication: the widget works against a server with
+  `auth_enabled = false` (the default). With authentication on, the mini
+  player gets `401`s; the full window (the server's own web UI) still works.
 
 ## Stale web cache (#1704)
 

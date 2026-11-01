@@ -3282,6 +3282,103 @@ async fn noter_montage(
     }
 }
 
+/// #7307 — ce qu'un consentement vaut en base au démarrage. Même règle que
+/// le serveur : seule la chaîne `"true"` active ; toute autre valeur éteint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EtatConsentement {
+    /// Clé absente de la table : défaut (désactivé).
+    Absent,
+    Active,
+    Desactive,
+    /// La lecture a échoué : on ne sait pas.
+    Illisible,
+}
+
+/// Les deux choix que #7307 voit « revenir au défaut » après un redémarrage
+/// ou une mise à jour : écriture dans les fichiers, paroles en ligne.
+pub(crate) const CONSENTEMENTS_SUIVIS: [&str; 2] = [
+    tune_core::metadata::ecriture_fichiers::CLE,
+    tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED,
+];
+
+/// Fonction pure : l'état de chaque consentement suivi, lu par `lire`.
+pub(crate) fn consentements_au_demarrage<E>(
+    lire: impl Fn(&str) -> Result<Option<String>, E>,
+) -> [(&'static str, EtatConsentement); 2] {
+    CONSENTEMENTS_SUIVIS.map(|cle| {
+        let etat = match lire(cle) {
+            Err(_) => EtatConsentement::Illisible,
+            Ok(None) => EtatConsentement::Absent,
+            Ok(Some(v)) if v == "true" => EtatConsentement::Active,
+            Ok(Some(_)) => EtatConsentement::Desactive,
+        };
+        (cle, etat)
+    })
+}
+
+/// #7307 — une ligne au démarrage, AVANT toute écriture de l'amorçage, qui dit
+/// ce que valent les deux consentements en base. Le rapport suivant une mise
+/// à jour tranche alors « valeur effacée » contre « valeur là, mal affichée ».
+/// Des booléens de consentement seulement, aucun secret.
+pub(crate) fn journaliser_les_consentements(state: &AppState) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let [(_, ecriture), (_, paroles)] = consentements_au_demarrage(|k| settings.get(k));
+    info!(
+        ecriture_fichiers = ?ecriture,
+        paroles_en_ligne = ?paroles,
+        "reglages_consentis_au_demarrage"
+    );
+}
+
+#[cfg(test)]
+mod consentements_au_demarrage_tests {
+    use super::*;
+
+    /// #7307 — chaque choix suivi est lu et rendu avec son état exact :
+    /// absent, activé, désactivé, illisible.
+    #[test]
+    fn chaque_consentement_est_rendu_avec_son_etat() {
+        let ecriture = tune_core::metadata::ecriture_fichiers::CLE;
+        let paroles = tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED;
+
+        let rien = consentements_au_demarrage(|_| Ok::<_, String>(None));
+        assert_eq!(
+            rien,
+            [
+                (ecriture, EtatConsentement::Absent),
+                (paroles, EtatConsentement::Absent)
+            ]
+        );
+
+        let poses = consentements_au_demarrage(|k| {
+            Ok::<_, String>(Some(if k == ecriture { "true" } else { "false" }.into()))
+        });
+        assert_eq!(
+            poses,
+            [
+                (ecriture, EtatConsentement::Active),
+                (paroles, EtatConsentement::Desactive)
+            ],
+            "la ligne de démarrage doit dire la valeur EN BASE de chaque choix (#7307)"
+        );
+
+        let illisible = consentements_au_demarrage(|k| {
+            if k == paroles {
+                Err("database is locked".to_string())
+            } else {
+                Ok(Some("true".into()))
+            }
+        });
+        assert_eq!(
+            illisible,
+            [
+                (ecriture, EtatConsentement::Active),
+                (paroles, EtatConsentement::Illisible)
+            ]
+        );
+    }
+}
+
 #[cfg(test)]
 mod semis_des_dossiers_de_bibliotheque_tests {
     use super::*;

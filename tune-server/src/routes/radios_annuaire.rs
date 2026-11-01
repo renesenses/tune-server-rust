@@ -572,13 +572,40 @@ pub fn router() -> Router<AppState> {
 pub struct FiltresAnnuaire {
     pub q: Option<String>,
     pub country: Option<String>,
+    /// #7466 — un genre, ou plusieurs séparés par des virgules (en OU).
     pub genre: Option<String>,
     pub offset: Option<usize>,
     pub limit: Option<usize>,
+    /// #7466 — les critères de [`super::radios_criteres_7466::Criteres`].
+    pub codec: Option<String>,
+    pub bitrate_min: Option<i32>,
+    pub lossless: Option<bool>,
+    pub hires: Option<bool>,
+    pub favorites_only: Option<bool>,
+    pub rated_min: Option<f64>,
+    pub metadata_plus: Option<bool>,
+}
+
+impl FiltresAnnuaire {
+    pub fn criteres(&self) -> super::radios_criteres_7466::Criteres {
+        super::radios_criteres_7466::Criteres::depuis(
+            self.genre.as_deref(),
+            self.country.as_deref(),
+            self.codec.as_deref(),
+            self.bitrate_min,
+            self.lossless,
+            self.hires,
+            self.favorites_only,
+            self.rated_min,
+            self.metadata_plus,
+        )
+    }
 }
 
 const LIMITE_PAR_DEFAUT: usize = 120;
 const LIMITE_MAX: usize = 1000;
+
+use super::radios_criteres_7466::Criteres;
 
 fn repli(s: &str) -> String {
     tune_core::db::engine::fold_diacritics(s).to_lowercase()
@@ -604,22 +631,15 @@ fn correspond(f: &StationAnnuaire, motif: &str) -> bool {
         })
 }
 
-fn meme_pays(f: &StationAnnuaire, pays: Option<&str>) -> bool {
-    pays.is_none_or(|p| {
-        f.country
-            .as_deref()
-            .is_some_and(|c| c.eq_ignore_ascii_case(p))
-    })
+fn meme_pays(f: &StationAnnuaire, criteres: &Criteres) -> bool {
+    criteres.pays_ok(f.country.as_deref())
 }
 
 /// #7215 — vrai si le genre demandé est L'UN des genres de la fiche
 /// (`genres`, sinon `genre`) : « OuiFM Blues & Rock » sort sous blues ET rock.
-fn meme_genre(f: &StationAnnuaire, genre: Option<&str>) -> bool {
-    genre.is_none_or(|g| {
-        f.genres_ou_genre()
-            .iter()
-            .any(|x| x.eq_ignore_ascii_case(g))
-    })
+/// #7466 — plusieurs genres demandés : l'un d'eux suffit.
+fn meme_genre(f: &StationAnnuaire, criteres: &Criteres) -> bool {
+    criteres.genre_ok(&f.genres_ou_genre())
 }
 
 /// Le corps de `GET /radios/directory`, calculé hors de toute requête réseau.
@@ -642,16 +662,7 @@ pub fn corps_annuaire_avec_liens(
     etat: &EtatAnnuaire,
 ) -> Value {
     let motif = repli(filtres.q.as_deref().unwrap_or("").trim());
-    let pays = filtres
-        .country
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let genre = filtres
-        .genre
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let criteres = filtres.criteres();
 
     // L'inverse du rapprochement : pour chaque fiche, la station locale.
     let index = IndexAnnuaire::new(fiches);
@@ -663,23 +674,27 @@ pub fn corps_annuaire_avec_liens(
         }
     }
 
+    // #7466 — les critères sans facette (format, débit, favoris…) bornent la
+    // recherche ELLE-MÊME : les facettes de pays et de genre se comptent
+    // dessus, et le compteur dit ce que l'écran montrera.
     let qui_cherchent: Vec<(usize, &StationAnnuaire)> = fiches
         .iter()
         .enumerate()
         .filter(|(_, f)| correspond(f, &motif))
+        .filter(|(i, f)| criteres.autres_ok_pour_la_fiche(f, locales.get(i).map(|s| s.is_favorite)))
         .collect();
     // Les facettes se comptent sur la recherche ET l'autre filtre : choisir un
     // pays montre les genres de ce pays, et réciproquement.
     let mut pays_comptes: BTreeMap<String, usize> = BTreeMap::new();
     let mut genres_comptes: BTreeMap<String, usize> = BTreeMap::new();
     for (_, f) in &qui_cherchent {
-        if meme_genre(f, genre)
+        if meme_genre(f, &criteres)
             && let Some(c) = f.country.as_deref()
         {
             *pays_comptes.entry(c.to_ascii_uppercase()).or_default() += 1;
         }
         // #7215 — une fiche compte dans CHACUN de ses genres (une fois chacun).
-        if meme_pays(f, pays) {
+        if meme_pays(f, &criteres) {
             let mut vus: Vec<String> = Vec::new();
             for g in f.genres_ou_genre() {
                 let cle = g.to_ascii_lowercase();
@@ -692,7 +707,7 @@ pub fn corps_annuaire_avec_liens(
     }
     let retenues: Vec<(usize, &StationAnnuaire)> = qui_cherchent
         .into_iter()
-        .filter(|(_, f)| meme_pays(f, pays) && meme_genre(f, genre))
+        .filter(|(_, f)| meme_pays(f, &criteres) && meme_genre(f, &criteres))
         .collect();
 
     let total = retenues.len();
@@ -731,6 +746,9 @@ pub fn corps_annuaire_avec_liens(
                 "now_playing": f.radio_metadata_key.is_some(),
                 "my_radio_id": locale.and_then(|s| s.id),
                 "my_radio_favorite": locale.map(|s| s.is_favorite),
+                // #7466 — la note radio-metadata.fr, quand la fiche en a une.
+                "avg_rating": f.note_centiemes.map(|n| f64::from(n) / 100.0),
+                "rating_count": f.nombre_de_notes,
             })
         })
         .collect();

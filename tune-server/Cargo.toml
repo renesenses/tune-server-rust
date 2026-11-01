@@ -6,7 +6,7 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "mon-theme"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "mon-theme", "aes67"]
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
 local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture"]
@@ -89,6 +89,17 @@ assistant-ia = ["dep:tune-assistant-ia"]
 # à l'exécution (`default_enabled = false`), au catalogue, gratuit. Inscrit à
 # `sdk/plugins.json`.
 mon-theme = ["dep:tune-mon-theme"]
+# Sortie AES67 (#7336) — Premium (`Feature::Aes67`), EXPÉRIMENTALE dans la
+# rc10 (Bertrand, 31/10/2026). Dans `default` et dans `sdk/plugins.json`, donc
+# compilée dans les binaires publiés, mais DÉSACTIVÉE par défaut à
+# l'exécution : greffon opt-in (`default_enabled = false`) et hors catalogue,
+# il ne s'éveille que par le réglage « Expérimental › Sortie AES67
+# (Dante/Ravenna) » du client web (`plugin_aes67_installed`). Désactivé, son
+# `setup` n'est jamais appelé : aucun socket PTP/SAP/RTP, aucune zone
+# (`plugins/tune-aes67/tests/garde_experimentale.rs`). Linux seul (Bertrand,
+# 30/10/2026) : la dépendance n'est déclarée que pour `target_os = "linux"`
+# (plus bas) ; allumée ailleurs, la feature ne compile rien.
+aes67 = ["dep:tune-aes67"]
 
 [dependencies]
 tune-plugin-native = { path = "../sdk/tune-plugin-native" }
@@ -159,6 +170,11 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }
 dotenvy = { workspace = true }
+
+# Sortie AES67 (#7336) : Linux seul pour la première version. Voir la feature
+# `aes67` plus haut.
+[target.'cfg(target_os = "linux")'.dependencies]
+tune-aes67 = { path = "../plugins/tune-aes67", optional = true }
 
 [dev-dependencies]
 tower = "0.5"
@@ -901,6 +917,11 @@ path = "tests/radio_ajout_web_sans_doublon_3543.rs"
 [[test]]
 name = "radios_recherche_distinction"
 path = "tests/radios_recherche_distinction.rs"
+
+# #7466 — recherche de radios par critères (`/radios/search`, `/radios/directory`).
+[[test]]
+name = "radios_criteres_7466"
+path = "tests/radios_criteres_7466.rs"
 
 # #7044 — le nom du serveur (page publique des radios). `autotests = false` :
 # sans cette inscription, le fichier ne serait jamais compilé.
