@@ -16,6 +16,10 @@
 //!   [`super::crossfeed::PREFIXE_FAMILLE_CROSSFEED`]) REMPLACE le crossfeed
 //!   intégré au lieu de s'y ajouter : demandé par la zone, il éteint le
 //!   crossfeed intégré, et le chemin du signal nomme l'étape d'après lui ;
+//! - #7616, étage casque EXCLUSIF : l'étage `crosstalk`
+//!   ([`super::crossfeed::ID_CROSSTALK`], traitement pour enceintes) éteint le
+//!   crossfeed intégré ET écarte tout étage `crossfeed-…` de la zone
+//!   ([`super::crossfeed::etages_tiers_en_service`]) : jamais les deux ;
 //! - drapeaux d'installation : les mêmes clés que les quatre emplacements,
 //!   `plugin_{id}_installed` et `plugin_{id}_enabled`, sans fenêtre legacy ni
 //!   migration ;
@@ -122,8 +126,9 @@ pub fn nom_affichable(id: &str) -> String {
         .join(" ")
 }
 
-/// Le greffon natif tiers de la famille du crossfeed que la zone demande, s'il
-/// y en a un (voir `super::crossfeed::etage_tiers_qui_remplace_le_crossfeed`).
+/// Le greffon natif tiers qui remplace le crossfeed intégré sur la zone, s'il
+/// y en a un : un étage de la famille du crossfeed, ou `crosstalk` (#7616),
+/// qui l'emporte (voir `super::crossfeed::etage_tiers_qui_remplace_le_crossfeed`).
 pub fn greffon_de_crossfeed_de_la_zone(settings: &SettingsRepo, zone_id: i64) -> Option<String> {
     super::crossfeed::etage_tiers_qui_remplace_le_crossfeed(&etages_configures(settings, zone_id))
         .map(str::to_string)
@@ -165,15 +170,23 @@ pub fn reglage_de_zone(settings: &SettingsRepo, zone_id: i64, id: &str) -> Optio
 /// Les étages tiers que la zone demande, dans l'ordre des identifiants :
 /// `(identifiant, réglages)`. Le droit Premium n'est PAS jugé ici, ni le mode
 /// PURE : c'est l'orchestrateur qui les juge, comme pour le crossfeed.
+///
+/// #7616 — l'exclusion de l'étage casque est appliquée ici, à la source :
+/// `crosstalk` demandé, les étages `crossfeed-…` ne sont pas rendus. Chaque
+/// lecteur (chaîne, empreinte du flux, clé du cache, chemin du signal) voit
+/// donc les mêmes étages.
 pub fn etages_configures(settings: &SettingsRepo, zone_id: i64) -> Vec<(String, Value)> {
-    identifiants_charges()
-        .into_iter()
-        .filter(|id| demande(settings, id))
-        .filter_map(|id| {
-            let reglage = reglage_de_zone(settings, zone_id, &id)?;
-            (reglage.get("enabled").and_then(Value::as_bool) == Some(true)).then_some((id, reglage))
-        })
-        .collect()
+    super::crossfeed::etages_tiers_en_service(
+        identifiants_charges()
+            .into_iter()
+            .filter(|id| demande(settings, id))
+            .filter_map(|id| {
+                let reglage = reglage_de_zone(settings, zone_id, &id)?;
+                (reglage.get("enabled").and_then(Value::as_bool) == Some(true))
+                    .then_some((id, reglage))
+            })
+            .collect(),
+    )
 }
 
 /// Empreinte stable des étages : elle entre dans la clé du cache de

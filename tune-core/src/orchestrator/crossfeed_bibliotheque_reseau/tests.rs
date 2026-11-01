@@ -14,11 +14,11 @@ use crate::outputs::mock::MockOutput;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const SR: u32 = 44_100;
+pub(in crate::orchestrator) const SR: u32 = 44_100;
 const SECONDES: u32 = 20;
 const AMOUNT: f32 = 0.3;
 const DELAY_MS: f32 = 0.3;
-const DEVICE: &str = "uuid:diretta-renderer-2742";
+pub(in crate::orchestrator) const DEVICE: &str = "uuid:diretta-renderer-2742";
 
 fn orchestrateur() -> PlaybackOrchestrator {
     let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
@@ -40,7 +40,7 @@ fn orchestrateur() -> PlaybackOrchestrator {
 }
 
 /// PCM 16 bits entrelacé : sinus 1 kHz à gauche, silence à droite.
-fn pcm_source() -> Vec<u8> {
+pub(in crate::orchestrator) fn pcm_source() -> Vec<u8> {
     let n = (SR * SECONDES) as usize;
     let mut pcm = Vec::with_capacity(n * 4);
     for i in 0..n {
@@ -54,6 +54,20 @@ fn pcm_source() -> Vec<u8> {
 
 /// Diaphonie D/G en dB d'un PCM entrelacé stéréo.
 fn diaphonie_pcm(pcm: &[u8], bit_depth: u16) -> f64 {
+    let (el, er) = energies_pcm(pcm, bit_depth);
+    10.0 * (er.max(1e-30) / el.max(1e-30)).log10()
+}
+
+/// #7616 — niveau RMS de la voie gauche d'un PCM entrelacé stéréo, en dB
+/// pleine échelle.
+pub(in crate::orchestrator) fn niveau_gauche_db_pcm(pcm: &[u8], bit_depth: u16) -> f64 {
+    let (el, _) = energies_pcm(pcm, bit_depth);
+    let trames = (pcm.len() / (bit_depth as usize / 8 * 2)).max(1) as f64;
+    10.0 * (el / trames).max(1e-30).log10()
+}
+
+/// Énergies (gauche, droite) d'un PCM entrelacé stéréo.
+fn energies_pcm(pcm: &[u8], bit_depth: u16) -> (f64, f64) {
     let o = bit_depth as usize / 8;
     let lire = |b: &[u8]| -> f64 {
         match o {
@@ -68,13 +82,18 @@ fn diaphonie_pcm(pcm: &[u8], bit_depth: u16) -> f64 {
         el += l * l;
         er += r * r;
     }
-    10.0 * (er.max(1e-30) / el.max(1e-30)).log10()
+    (el, er)
 }
 
-fn diaphonie_fichier(chemin: &str) -> f64 {
+/// (diaphonie, niveau de la voie gauche) d'un fichier servi, décodé une fois.
+fn mesure_fichier(chemin: &str) -> (f64, f64) {
     let d = crate::audio::decode::decode_to_pcm(chemin, None, None, 0.0, 0.0).unwrap();
     assert_eq!(d.channels, 2);
-    diaphonie_pcm(&d.pcm_bytes(), d.bit_depth)
+    let pcm = d.pcm_bytes();
+    (
+        diaphonie_pcm(&pcm, d.bit_depth),
+        niveau_gauche_db_pcm(&pcm, d.bit_depth),
+    )
 }
 
 /// La diaphonie d'UNE passe de crossfeed, et celle de DEUX, sur le même
@@ -90,15 +109,15 @@ fn etalons() -> (f64, f64) {
     (diaphonie_pcm(&une, 16), diaphonie_pcm(&deux, 16))
 }
 
-struct Montage {
-    orch: PlaybackOrchestrator,
-    zone_id: i64,
+pub(in crate::orchestrator) struct Montage {
+    pub(in crate::orchestrator) orch: PlaybackOrchestrator,
+    pub(in crate::orchestrator) zone_id: i64,
     source: String,
     _dir: tempfile::TempDir,
 }
 
 #[derive(Clone, Copy)]
-enum Renderer {
+pub(in crate::orchestrator) enum Renderer {
     /// Absent du registre : présumé capable (règle de `dlna_accepte_lpcm`,
     /// comme `dlna_supports_mime`) — il ANNONCE le LPCM.
     AnnonceLeLpcm,
@@ -106,7 +125,10 @@ enum Renderer {
     SansLpcm,
 }
 
-async fn monter(renderer: Renderer, sortie: Option<(&str, &str)>) -> Montage {
+pub(in crate::orchestrator) async fn monter(
+    renderer: Renderer,
+    sortie: Option<(&str, &str)>,
+) -> Montage {
     let orch = orchestrateur();
     let dir = tempfile::tempdir().unwrap();
     let piste = dir.path().join("piste.flac");
@@ -172,7 +194,7 @@ async fn monter(renderer: Renderer, sortie: Option<(&str, &str)>) -> Montage {
     }
 }
 
-fn armer_l_egaliseur(m: &Montage) {
+pub(in crate::orchestrator) fn armer_l_egaliseur(m: &Montage) {
     let s = SettingsRepo::with_backend(m.orch.db.clone());
     s.set("plugin_equalizer_installed", "true").unwrap();
     let p = crate::audio::eq::EqProfile {
@@ -195,13 +217,16 @@ fn armer_l_egaliseur(m: &Montage) {
 }
 
 /// Ce que le renderer reçoit.
-struct Servi {
-    mime: String,
+pub(in crate::orchestrator) struct Servi {
+    pub(in crate::orchestrator) mime: String,
     /// Les octets servis sont-ils EXACTEMENT ceux de la source ?
-    tel_quel: bool,
+    pub(in crate::orchestrator) tel_quel: bool,
     /// Session progressive (canal) plutôt que fichier.
-    progressif: bool,
-    diaphonie_db: f64,
+    pub(in crate::orchestrator) progressif: bool,
+    pub(in crate::orchestrator) diaphonie_db: f64,
+    /// #7616 — niveau RMS de la voie GAUCHE, en dB pleine échelle : ce qu'un
+    /// étage de gain fait aux octets servis.
+    pub(in crate::orchestrator) niveau_gauche_db: f64,
     premier_octet: Duration,
     /// #5114 — ce que le flux ANNONCE porter (`StreamInfo::crossfeed`, lu par
     /// `stream_output_wire`, l'accesseur du chemin du signal). Confronté à la
@@ -213,7 +238,7 @@ struct Servi {
     annonce_compensation: Option<f64>,
 }
 
-async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
+pub(in crate::orchestrator) async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
     let req = PlayRequest {
         zone_id: m.zone_id,
         output_device_id: output_device_id.map(str::to_string),
@@ -244,11 +269,13 @@ async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
     if let Some(chemin) = fichier {
         let premier_octet = t0.elapsed();
         let tel_quel = std::fs::read(&chemin).unwrap() == std::fs::read(&m.source).unwrap();
+        let (diaphonie_db, niveau_gauche_db) = mesure_fichier(&chemin);
         return Servi {
             mime: r.mime_type,
             tel_quel,
             progressif: false,
-            diaphonie_db: diaphonie_fichier(&chemin),
+            diaphonie_db,
+            niveau_gauche_db,
             premier_octet,
             annonce_crossfeed,
             annonce_compensation,
@@ -269,18 +296,20 @@ async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
     let dir = tempfile::tempdir().unwrap();
     let wav = dir.path().join("servi.wav");
     std::fs::write(&wav, &octets).unwrap();
+    let (diaphonie_db, niveau_gauche_db) = mesure_fichier(&wav.to_string_lossy());
     Servi {
         mime: r.mime_type,
         tel_quel: false,
         progressif: true,
-        diaphonie_db: diaphonie_fichier(&wav.to_string_lossy()),
+        diaphonie_db,
+        niveau_gauche_db,
         premier_octet: premier_octet.expect("aucun octet servi"),
         annonce_crossfeed,
         annonce_compensation,
     }
 }
 
-fn journal(cas: &str, s: &Servi) {
+pub(in crate::orchestrator) fn journal(cas: &str, s: &Servi) {
     println!(
         "#2742 {cas} : mime={} tel_quel={} progressif={} diaphonie={:.1} dB premier_octet={} ms \
          annonce_crossfeed={} annonce_compensation={:?}",
@@ -457,6 +486,7 @@ async fn le_chemin_des_services_garde_une_seule_passe_2742() {
         tel_quel: false,
         progressif: false,
         diaphonie_db: diaphonie_pcm(&pcm, 16),
+        niveau_gauche_db: niveau_gauche_db_pcm(&pcm, 16),
         premier_octet: Duration::ZERO,
         // Le fait que les bras des services posent sur leur session.
         annonce_crossfeed: chaine.is_active() && chaine.crossfeed_executable(),

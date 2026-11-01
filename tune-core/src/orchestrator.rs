@@ -1925,6 +1925,10 @@ mod eq_en_vol_4407_tests;
 // bibliothèque native de test.
 #[cfg(test)]
 mod greffon_natif_tiers_tests;
+// #7616 — un étage tiers sur zone RÉSEAU : relais `StreamingDsp` et
+// ré-encodage des pistes de la bibliothèque (#2742, cas 1 à 3).
+#[cfg(test)]
+mod greffon_natif_tiers_reseau_7616_tests;
 // #6780 — PURE contourne aussi la réaffectation des canaux armée de la zone.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_6780_tests;
