@@ -379,6 +379,22 @@ fn pays_inconnu_le_flux_choisi_est_respecte_7658() {
     );
 }
 
+#[test]
+fn pays_inconnu_sans_flux_libre_le_repli_enregistre_reste_refuse_7199_7658() {
+    // Contrat de #7199 : sans flux libre, l'adresse enregistrée est le repli
+    // de l'ajout, pas un choix ; pays inconnu, la lecture reste refusée.
+    let mut value = document();
+    value["streams"].as_array_mut().unwrap().truncate(1);
+    let f = fiche(value);
+    assert!(select_stream(&f, None, Some("https://radio.example/gb.m3u8")).is_none());
+    assert_eq!(
+        select_stream(&f, Some("GB"), Some("https://radio.example/gb.m3u8"))
+            .unwrap()
+            .url,
+        "https://radio.example/gb.m3u8"
+    );
+}
+
 #[tokio::test]
 async fn pays_inconnu_deux_chemins_de_lecture_gardent_le_choix_7658() {
     let state = state(document_bbc_7658());

@@ -92,6 +92,12 @@ pub(super) fn select_stream(
     let choisi = |f: &FluxAnnuaire| {
         preferred.is_some_and(|p| super::flux_normalise(p) == super::flux_normalise(&f.url))
     };
+    // #7199 : sans flux libre, l'adresse enregistrée n'est pas un choix de
+    // l'auditeur mais le repli posé à l'ajout (« c'est sa lecture qui sera
+    // refusée ») ; pays inconnu, on refuse et on demande le pays. Avec un
+    // flux libre, l'ajout aurait enregistré celui-ci : une adresse restreinte
+    // ne peut venir que d'un choix explicite (#7177), que #7658 respecte.
+    let flux_libre = streams.iter().any(|f| f.restricted_to_countries.is_empty());
     streams
         .into_iter()
         .rev()
@@ -108,7 +114,11 @@ pub(super) fn select_stream(
                     // restriction (BBC : « nonuk » HE-AAC 96 kbit/s au lieu
                     // du 320 kbit/s choisi). S'il est vraiment bloqué chez
                     // lui, la lecture échoue et il en choisit un autre.
-                    None => choisi(f) && !f.restricted_to_countries.iter().any(|c| c == "invalid"),
+                    None => {
+                        flux_libre
+                            && choisi(f)
+                            && !f.restricted_to_countries.iter().any(|c| c == "invalid")
+                    }
                 }
         })
         .max_by_key(|f| {
