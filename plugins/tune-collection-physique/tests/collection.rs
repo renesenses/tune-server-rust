@@ -81,6 +81,9 @@ struct HoteEssai {
     images_avant_panne: Mutex<Option<usize>>,
     /// Le dernier disque de la page 2 a été retiré de la collection.
     disque_retire: Mutex<bool>,
+    /// L'instant de chaque appel au CDN d'images (le recul se mesure entre
+    /// deux appels, pas sur la durée totale, que le décodage allonge).
+    instants_images: Mutex<Vec<std::time::Instant>>,
 }
 
 impl HoteEssai {
@@ -111,6 +114,7 @@ impl HoteEssai {
             images_limites: Mutex::new(0),
             images_avant_panne: Mutex::new(None),
             disque_retire: Mutex::new(false),
+            instants_images: Mutex::new(Vec::new()),
         }
     }
 
@@ -288,6 +292,10 @@ impl Hote for HoteEssai {
 
     async fn image_discogs(&self, url: &str) -> Result<Image, Panne> {
         self.appels.lock().unwrap().push(format!("image {url}"));
+        self.instants_images
+            .lock()
+            .unwrap()
+            .push(std::time::Instant::now());
         {
             let mut l = self.images_limites.lock().unwrap();
             if *l > 0 {
@@ -1230,14 +1238,14 @@ async fn un_429_sur_une_pochette_fait_reculer_puis_reussit() {
     suivre(&b, "exemple").await;
     b.moteur.synchroniser_maintenant("exemple").await.unwrap();
     *b.hote.images_limites.lock().unwrap() = 2;
-    let debut = std::time::Instant::now();
     let (code, _, _) = brut(&b.app, "GET", "/pochettes/1050", &[]).await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(b.hote.appels("image "), 3, "deux refus, puis l'image");
+    let t = b.hote.instants_images.lock().unwrap().clone();
+    let (e1, e2) = (t[1] - t[0], t[2] - t[1]);
     assert!(
-        debut.elapsed() >= std::time::Duration::from_millis(40 + 80),
-        "recul de 40 ms puis 80 ms : {:?}",
-        debut.elapsed()
+        e1 >= std::time::Duration::from_millis(40) && e2 >= std::time::Duration::from_millis(80),
+        "recul de 40 ms puis 80 ms (doublé) entre les appels : {e1:?}, {e2:?}"
     );
 
     // Contre-épreuve : un CDN qui refuse toujours. Au plus `essais_limite`
