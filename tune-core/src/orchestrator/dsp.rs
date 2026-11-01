@@ -1775,6 +1775,7 @@ impl PlaybackOrchestrator {
             compensation: None,
             sample_rate,
             en_vol: None,
+            convolveur_reste_a_jeter: None,
         };
         // #5071 — la compensation lit les étages RÉELLEMENT exécutés : un
         // crossfeed n'agit qu'en stéréo (`StreamingDsp::process`).
