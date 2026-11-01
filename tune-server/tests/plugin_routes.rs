@@ -696,25 +696,25 @@ async fn la_fiche_d_un_greffon_installe_non_charge_annonce_le_redemarrage() {
         .find(|p| p["name"] == "optin")
         .expect("le greffon dormant reste listé");
     assert_eq!(entry["installed"], true);
-    assert_eq!(entry["enabled"], false);
+    // rc11 : voulu actif (case cochée), pas encore monté.
+    assert_eq!(entry["enabled"], true);
+    assert_eq!(entry["loaded"], false);
     assert_eq!(
         entry["restart_required"], true,
         "installé et pas chargé : la fiche doit l'annoncer comme la fiche wasm — {entry}"
     );
 }
 
-/// `dj` et `karaoke` sont compilés dans TOUS les binaires publiés — les six
-/// lignes de build de `release.yml` les listent avec `bandcamp`. Ils ne
-/// doivent pourtant plus figurer dans le gestionnaire : aucun écran du client
-/// ne sait les atteindre, et proposer « Installer » sur une fonction que rien
-/// n'expose ne rend rien à l'utilisateur (#2090).
+/// `dj` est compilé dans TOUS les binaires publiés mais ne doit pas figurer
+/// dans le gestionnaire : 11 routes sur 13 sont inopérantes, et proposer
+/// « Installer » sur une fonction qui ne fait rien ne rend rien à l'utilisateur
+/// (#2090). Décision de Bertrand du 01/11/2026 : DJ reste en brouillon.
+/// (Karaoké, lui, est proposé depuis la rc11 : `activation_dj_karaoke_b209.rs`.)
 ///
-/// Le test s'exécute sous le jeu de fonctionnalités livré. Sans `--features
-/// dj,karaoke` les deux greffons ne sont pas enregistrés du tout, et le test
-/// passerait sans rien prouver : on l'annonce dans le message d'échec plutôt
-/// que de laisser croire à une preuve.
+/// Sans `--features dj` le greffon n'est pas enregistré et le test ne prouve
+/// rien : `activation_dj_karaoke_b209` porte le témoin gardé par la feature.
 #[tokio::test]
-async fn dj_and_karaoke_are_not_offered_in_the_plugin_manager() {
+async fn dj_is_not_offered_in_the_plugin_manager() {
     use_scratch_plugin_data_dir();
 
     let state = new_state();
@@ -730,21 +730,12 @@ async fn dj_and_karaoke_are_not_offered_in_the_plugin_manager() {
         .iter()
         .filter_map(|p| p["name"].as_str())
         .collect();
-
-    for hidden in ["dj", "karaoke"] {
-        assert!(
-            !names.contains(&hidden),
-            "« {hidden} » ne doit plus être proposé par le gestionnaire (listés : {names:?})"
-        );
-    }
-
-    // Contre-épreuve dans le même souffle : le filtre retire les greffons hors
-    // catalogue, pas les greffons dormants en général. Un opt-in ordinaire,
-    // dormant pour exactement la même raison, reste proposé.
     assert!(
-        names.contains(&"optin"),
-        "un opt-in catalogué doit rester proposé (listés : {names:?})"
+        !names.contains(&"dj"),
+        "« dj » ne doit pas être proposé par le gestionnaire (listés : {names:?})"
     );
+    // Contre-épreuve : un opt-in ordinaire, dormant pour la même raison, reste proposé.
+    assert!(names.contains(&"optin"), "listés : {names:?}");
 }
 
 /// Retiré du catalogue n'est pas retiré du binaire : DJ se charge encore si on
