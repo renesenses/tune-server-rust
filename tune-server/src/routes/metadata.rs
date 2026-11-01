@@ -180,6 +180,10 @@ pub fn router() -> Router<AppState> {
         .route("/batch/rename-artist", post(batch_rename_artist))
         // #1199 — affecter un artiste à des pistes, en lot.
         .route("/batch/artist", post(batch_set_artist))
+        // #7619 (L5) — une édition de métadonnées change la bibliothèque.
+        .layer(axum::middleware::from_fn(
+            super::library::revision::suivre_les_modifications,
+        ))
 }
 
 /// Extract a plausible release year (1900–2099) from a file/folder path — e.g.
