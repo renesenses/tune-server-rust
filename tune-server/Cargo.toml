@@ -229,6 +229,11 @@ tune-core = { path = "../tune-core", default-features = false, features = [
     "services-factices",
 ] }
 
+# #7642 — un profil de correction de pièce appliqué atteint le DSP de la zone.
+[[test]]
+name = "correction_de_piece_appliquee_7642"
+path = "tests/correction_de_piece_appliquee_7642.rs"
+
 # Purge à froid de la mémoire libre gardée par la glibc : binaire à part, le
 # RSS mesure tout le processus.
 [[test]]

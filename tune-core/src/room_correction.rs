@@ -59,6 +59,55 @@ pub struct RoomProfile {
 }
 
 // ---------------------------------------------------------------------------
+// Profil d'égaliseur de zone (#7642)
+// ---------------------------------------------------------------------------
+
+/// Le profil d'égaliseur COMPLET qu'une correction de pièce ou une calibration
+/// de DAC écrit sous `zone_{id}_eq_profile` (#7642).
+///
+/// Les deux routes `apply` écrivaient un JSON à la main, sans les champs
+/// obligatoires d'[`crate::audio::eq::EqProfile`] (`listening`, `room_size`,
+/// `speaker_placement`, `bass/mid/treble_gain_db`). La chaîne de lecture
+/// (`eq_profile_configure_with`) le désérialisait par `.ok()?` : échec
+/// silencieux, aucun égaliseur, alors que la réponse disait `applied: true`.
+///
+/// Ce profil est typé, donc lisible par construction. Ses valeurs par défaut
+/// sont celles d'[`EqProfile::default`](crate::audio::eq::EqProfile), posées
+/// explicitement : les bandes, non vides, REMPLACENT la cascade à trois
+/// pentes — l'environnement et les curseurs n'y ont donc aucune part.
+pub fn profil_eq_de_correction(filters: &[CorrectionFilter]) -> crate::audio::eq::EqProfile {
+    use crate::audio::eq::{
+        EqBandSpec, EqProfile, HeadroomMode, ListeningMode, RoomSize, SpeakerPlacement,
+    };
+    EqProfile {
+        enabled: true,
+        listening: ListeningMode::Speakers,
+        room_size: RoomSize::Medium,
+        speaker_placement: SpeakerPlacement::FreeStanding,
+        bass_gain_db: 0.0,
+        mid_gain_db: 0.0,
+        treble_gain_db: 0.0,
+        bands: filters
+            .iter()
+            .map(|f| EqBandSpec {
+                freq: f.frequency_hz,
+                gain: f.gain_db,
+                q: f.q_factor,
+                band_type: match f.filter_type {
+                    FilterType::Peaking => "peak",
+                    FilterType::LowShelf => "low_shelf",
+                    FilterType::HighShelf => "high_shelf",
+                    FilterType::Notch => "notch",
+                }
+                .to_string(),
+                channel: None,
+            })
+            .collect(),
+        headroom_mode: HeadroomMode::Safe,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Settings key helpers
 // ---------------------------------------------------------------------------
 
