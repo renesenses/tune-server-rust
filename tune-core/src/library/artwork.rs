@@ -932,6 +932,23 @@ pub async fn batch_enrich_artwork_scoped(
     cache_dir: PathBuf,
     scope: Option<crate::metadata::enrich_scope::EnrichScope>,
 ) {
+    batch_enrich_artwork_suivi(db, cache_dir, scope, None).await
+}
+
+/// Rappel d'avancement de la passe des pochettes : `(traités, total)`.
+pub type AvancementPochettes = std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// La passe des pochettes d'albums, avec un rappel d'avancement appelé avant
+/// chaque album puis une fois à la fin (écran « État du serveur »,
+/// 01/11/2026 : la carte des pochettes montre `traités / total`). Le bilan
+/// écrit dans `artwork_enrich_result` porte `status: "done"` et
+/// `finished_at` (secondes Unix).
+pub async fn batch_enrich_artwork_suivi(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    cache_dir: PathBuf,
+    scope: Option<crate::metadata::enrich_scope::EnrichScope>,
+    avancement: Option<AvancementPochettes>,
+) {
     let album_repo = crate::db::album_repo::AlbumRepo::with_backend(db.clone());
     let mut albums = match album_repo.list_without_cover() {
         Ok(a) => a,
@@ -981,6 +998,7 @@ pub async fn batch_enrich_artwork_scoped(
     let mut failed = 0u32;
     let mut traites = 0usize;
 
+    let total = albums.len() as u64;
     // Plusieurs albums à la fois (`images_rapides::ELEMENTS_EN_PARALLELE`),
     // chaque requête par la porte de son service : MusicBrainz 1/s, Cover Art
     // Archive 4/s, iTunes 20/min. L'admission reste un album à la fois.
@@ -1054,6 +1072,9 @@ pub async fn batch_enrich_artwork_scoped(
         resultats.next().await
     {
         traites += 1;
+        if let Some(a) = &avancement {
+            a(traites as u64, total);
+        }
         if cherche {
             searched += 1;
         }
@@ -1108,6 +1129,13 @@ pub async fn batch_enrich_artwork_scoped(
         total = albums.len(),
         enriched, searched, failed, "batch_artwork_enrichment_complete"
     );
+    if let Some(a) = &avancement {
+        a(total, total);
+    }
+    let finished_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     // Store result in settings for status reporting
     settings
@@ -1118,6 +1146,8 @@ pub async fn batch_enrich_artwork_scoped(
                 "enriched": enriched,
                 "searched": searched,
                 "failed": failed,
+                "status": "done",
+                "finished_at": finished_at,
             })
             .to_string(),
         )

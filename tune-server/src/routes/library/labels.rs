@@ -444,27 +444,278 @@ pub(super) async fn list_labels(State(state): State<AppState>) -> Json<Value> {
     let cache = cache_de(&dossier);
     let web = cache_web_de(&dossier);
     let items: Vec<Value> = labels.iter().map(|l| element(&cache, &web, l)).collect();
-    if let Some(catalogue) = catalogue_web(&state) {
-        lancer_passe_web(
-            web,
+    // L'ouverture de l'onglet lance toujours la passe (#6736, #7414), mais
+    // par le même chemin que `POST /library/labels/logos/enrich` : inscrite
+    // au registre sous `label_logos`, une seule à la fois.
+    let sources = SourcesDeLogos::du_serveur(&state).await;
+    lancer_passes_logos(&state, labels, sources);
+    Json(Value::Array(items))
+}
+
+// ---------------------------------------------------------------------------
+// Écran « État du serveur » (01/11/2026) — la passe des logos, lancée et
+// suivie explicitement
+// ---------------------------------------------------------------------------
+
+/// L'identifiant de la passe des logos de labels au registre
+/// `background_tasks`.
+pub(crate) const TACHE_LOGOS_LABELS: &str = "label_logos";
+
+/// La clé `settings` du bilan de la dernière passe.
+const CLE_DERNIERE_PASSE_LOGOS: &str = "label_logos_last_run";
+
+/// Toutes les combien l'avancement de la passe est relu dans les index.
+const PERIODE_AVANCEMENT: Duration = Duration::from_secs(1);
+
+/// Les sources d'une passe de logos. `None` : cette source ne tourne pas.
+pub(crate) struct SourcesDeLogos {
+    pub(crate) web: Option<Arc<dyn CatalogueDeLabels>>,
+    pub(crate) qobuz: Option<Arc<dyn CatalogueDeLabels>>,
+    pub(crate) partage: Option<Arc<dyn LogosPartages>>,
+    pub(crate) pause: Duration,
+}
+
+impl SourcesDeLogos {
+    /// Celles du serveur : le web (sauf Enrichissement en pause), Qobuz
+    /// (seulement avec un compte connecté), le partage communautaire.
+    pub(crate) async fn du_serveur(state: &AppState) -> Self {
+        Self {
+            web: catalogue_web(state),
+            qobuz: catalogue_qobuz(state).await,
+            partage: partage_de(state),
+            pause: PAUSE_ENTRE_LABELS,
+        }
+    }
+}
+
+/// Ce qu'une demande de passe a produit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LancementLogos {
+    /// La passe est partie ; tant de labels à demander.
+    Lancee { a_traiter: usize },
+    /// Une passe tourne déjà : rien de plus n'est lancé.
+    DejaEnCours,
+    /// Aucun label à demander (et rien à proposer au partage).
+    RienAFaire,
+    /// Aucune source : pas de compte Qobuz et la passe du web suspendue.
+    SansSource,
+}
+
+/// Le nombre de labels qui ONT un logo affichable, selon la même règle que
+/// [`element`] (un logo du web n'est rendu qu'avec son attribution).
+pub(crate) fn compter_logos(
+    cache: &CacheLogosLabels,
+    web: &CacheLogosLabels,
+    labels: &[LabelDeBibliotheque],
+) -> usize {
+    labels
+        .iter()
+        .filter(|l| {
+            (web.image(&l.nom).is_some()
+                && web.entree(&l.nom).is_some_and(|e| e.attribution.is_some()))
+                || cache.image(&l.nom).is_some()
+        })
+        .count()
+}
+
+/// Lance la passe des logos (web puis Qobuz, comme à l'ouverture de
+/// l'onglet), inscrite au registre sous [`TACHE_LOGOS_LABELS`] avec son
+/// avancement, et range son bilan dans `label_logos_last_run` à la fin.
+///
+/// Une seule passe à la fois : l'inscription au registre (`try_begin`) est
+/// le verrou, prise AVANT tout le reste.
+pub(crate) fn lancer_passes_logos(
+    state: &AppState,
+    labels: Vec<LabelDeBibliotheque>,
+    sources: SourcesDeLogos,
+) -> LancementLogos {
+    let Some(garde) = state.background_tasks.try_begin(
+        TACHE_LOGOS_LABELS,
+        "Recherche des logos de labels…",
+        "enrichment",
+    ) else {
+        return LancementLogos::DejaEnCours;
+    };
+    if sources.web.is_none() && sources.qobuz.is_none() {
+        return LancementLogos::SansSource;
+    }
+    let dossier = super::artwork_cache_dir();
+    let cache = cache_de(&dossier);
+    let web = cache_web_de(&dossier);
+    let debut = maintenant();
+    let (demandes_w, demandes_q) = (demandes_web(&labels), demandes_qobuz(&labels));
+    // Ce que chaque passe va demander : c'est le total de l'avancement.
+    let suivis_web: Vec<String> = if sources.web.is_some() {
+        web.a_resoudre(&demandes_w, debut, usize::MAX)
+            .into_iter()
+            .map(|d| d.nom)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let suivis_qobuz: Vec<String> = if sources.qobuz.is_some() {
+        cache
+            .a_resoudre(&demandes_q, debut, usize::MAX)
+            .into_iter()
+            .map(|d| d.nom)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut passes = Vec::new();
+    if let Some(catalogue) = sources.web {
+        passes.extend(lancer_passe_web(
+            web.clone(),
             cache.clone(),
             catalogue,
-            partage_de(&state),
-            demandes_web(&labels),
-            PAUSE_ENTRE_LABELS,
+            sources.partage,
+            demandes_w,
+            sources.pause,
             enrichissement_actif,
-        );
+        ));
     }
-    if let Some(catalogue) = catalogue_qobuz(&state).await {
-        lancer_passe(
-            cache,
+    if let Some(catalogue) = sources.qobuz {
+        passes.extend(lancer_passe(
+            cache.clone(),
             catalogue,
-            demandes_qobuz(&labels),
-            PAUSE_ENTRE_LABELS,
+            demandes_q,
+            sources.pause,
             toujours,
-        );
+        ));
     }
-    Json(Value::Array(items))
+    if passes.is_empty() {
+        return LancementLogos::RienAFaire;
+    }
+    let total = (suivis_web.len() + suivis_qobuz.len()) as u64;
+    let a_traiter = suivis_web.len() + suivis_qobuz.len();
+    let taches = state.background_tasks.clone();
+    let backend = state.backend.clone();
+    // Un label est traité quand son entrée a été réécrite depuis le début.
+    let traites = {
+        let (cache, web) = (cache.clone(), web.clone());
+        move || -> u64 {
+            let n = suivis_web
+                .iter()
+                .filter(|n| web.entree(n).is_some_and(|e| e.verifie_le >= debut))
+                .count()
+                + suivis_qobuz
+                    .iter()
+                    .filter(|n| cache.entree(n).is_some_and(|e| e.verifie_le >= debut))
+                    .count();
+            (n as u64).min(total)
+        }
+    };
+    taches.update_progress(TACHE_LOGOS_LABELS, 0, total, "labels");
+    tokio::spawn(async move {
+        let _garde = garde;
+        let mut toutes = Box::pin(futures_util::future::join_all(passes));
+        let trouves: usize = loop {
+            tokio::select! {
+                fins = &mut toutes => break fins.into_iter().map(|r| r.unwrap_or(0)).sum(),
+                _ = tokio::time::sleep(PERIODE_AVANCEMENT) => {
+                    taches.update_progress(TACHE_LOGOS_LABELS, traites(), total, "labels");
+                }
+            }
+        };
+        let traites = traites();
+        taches.update_progress(TACHE_LOGOS_LABELS, traites, total, "labels");
+        let bilan = json!({
+            "started_at": debut,
+            "finished_at": maintenant(),
+            "to_process": total,
+            "processed": traites,
+            "found": trouves,
+            "labels_total": labels.len(),
+            "with_logo": compter_logos(&cache, &web, &labels),
+        });
+        if let Err(e) = tune_core::db::settings_repo::SettingsRepo::with_backend(backend)
+            .set(CLE_DERNIERE_PASSE_LOGOS, &bilan.to_string())
+        {
+            tracing::warn!(erreur = %e, "logos_labels_bilan_non_ecrit");
+        }
+        tracing::info!(%bilan, "logos_labels_passe_terminee");
+    });
+    LancementLogos::Lancee { a_traiter }
+}
+
+/// `POST /library/labels/logos/enrich` — lance la passe des logos.
+///
+/// - 202 `{"status": "accepted", "labels_to_process": N}` ;
+/// - 409 `{"status": "already_running"}` : une passe tourne, rien de plus ;
+/// - 200 `{"status": "skipped", "reason": "nothing_to_do" | "paused" |
+///   "no_source"}`.
+pub(super) async fn lancer_logos(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let labels = AlbumRepo::with_backend(state.backend.clone())
+        .labels_de_la_bibliotheque()
+        .ou_defaut_journalise();
+    let sources = SourcesDeLogos::du_serveur(&state).await;
+    match lancer_passes_logos(&state, labels, sources) {
+        LancementLogos::Lancee { a_traiter } => (
+            StatusCode::ACCEPTED,
+            Json(json!({"status": "accepted", "labels_to_process": a_traiter})),
+        )
+            .into_response(),
+        LancementLogos::DejaEnCours => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "already_running",
+                "message": "label logo pass already running",
+            })),
+        )
+            .into_response(),
+        LancementLogos::RienAFaire => {
+            Json(json!({"status": "skipped", "reason": "nothing_to_do"})).into_response()
+        }
+        LancementLogos::SansSource => {
+            let raison = if enrichissement_actif() {
+                "no_source"
+            } else {
+                "paused"
+            };
+            Json(json!({"status": "skipped", "reason": raison})).into_response()
+        }
+    }
+}
+
+/// `GET /library/labels/logos/status` — combien de labels ont un logo, la
+/// passe en cours et la dernière passe.
+///
+/// ```json
+/// { "labels_total": 338, "with_logo": 133, "without_logo": 205,
+///   "running": true, "progress": {"processed": 40, "total": 205},
+///   "last_run": {"started_at": …, "finished_at": …, "to_process": 205,
+///                "processed": 205, "found": 12, "labels_total": 338,
+///                "with_logo": 145} }
+/// ```
+///
+/// Une lecture SQL (les labels regroupés) et les deux index en mémoire :
+/// aucun appel réseau, aucune passe lancée. `progress` n'est là que pendant
+/// la passe, `last_run` est `null` avant la première.
+pub(super) async fn statut_logos(State(state): State<AppState>) -> Json<Value> {
+    let labels = AlbumRepo::with_backend(state.backend.clone())
+        .labels_de_la_bibliotheque()
+        .ou_defaut_journalise();
+    let dossier = super::artwork_cache_dir();
+    let avec = compter_logos(&cache_de(&dossier), &cache_web_de(&dossier), &labels);
+    let tache = state.background_tasks.get(TACHE_LOGOS_LABELS);
+    let derniere = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get(CLE_DERNIERE_PASSE_LOGOS)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let mut corps = json!({
+        "labels_total": labels.len(),
+        "with_logo": avec,
+        "without_logo": labels.len().saturating_sub(avec),
+        "running": tache.is_some(),
+        "last_run": derniere,
+    });
+    if let Some(p) = tache.and_then(|t| t.progress) {
+        corps["progress"] = json!({ "processed": p.processed, "total": p.total });
+    }
+    Json(corps)
 }
 
 // ---------------------------------------------------------------------------
@@ -1658,5 +1909,264 @@ mod tests {
         assert_eq!(trouves, 2);
         assert_eq!(catalogue.0.lock().unwrap().len(), 2);
         assert!(!web.entree("ECM Records").unwrap().communaute);
+    }
+}
+
+/// Écran « État du serveur » (01/11/2026) — la passe des logos lancée par
+/// `POST /library/labels/logos/enrich`, suivie par
+/// `GET /library/labels/logos/status` et au registre `background_tasks`.
+#[cfg(test)]
+mod passe_explicite_des_logos {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tokio::sync::Semaphore;
+    use tower::ServiceExt;
+    use tune_core::db::backend::ToSqlValue;
+    use tune_core::library::logos_labels::LabelDuCatalogue;
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n-logo-etat-du-serveur-";
+
+    fn demarrer(chemin: &str) -> (axum::Router, AppState) {
+        let state = AppState::new(chemin, 0, Default::default()).expect("démarrage");
+        (crate::routes::router(state.clone()), state)
+    }
+
+    /// Un nom de label unique : l'index des logos est global au processus.
+    fn nom(base: &str) -> String {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{base} {n}")
+    }
+
+    fn album(state: &AppState, titre: &str, label: &str) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO albums (title, artist_id, source, track_count, year, label) \
+                 VALUES (?, NULL, 'local', 0, 1970, ?)",
+                &[&titre as &dyn ToSqlValue, &label],
+            )
+            .unwrap();
+    }
+
+    fn labels_de(state: &AppState) -> Vec<LabelDeBibliotheque> {
+        AlbumRepo::with_backend(state.backend.clone())
+            .labels_de_la_bibliotheque()
+            .unwrap()
+    }
+
+    /// Un catalogue du web qui ne répond qu'un label par jeton : la passe
+    /// reste en cours tant que l'essai ne la laisse pas avancer.
+    struct Retenu(Semaphore);
+
+    #[async_trait::async_trait]
+    impl CatalogueDeLabels for Retenu {
+        async fn trouver_label(
+            &self,
+            nom: &str,
+            _: Option<&str>,
+        ) -> Result<Option<LabelDuCatalogue>, String> {
+            self.0.acquire().await.map_err(|e| e.to_string())?.forget();
+            Ok(Some(LabelDuCatalogue {
+                id: "mb-etat".into(),
+                nom: nom.into(),
+                image_url: Some("https://upload.test/etat.png".into()),
+                attribution: Some(Attribution {
+                    source: SourceDuLogo::Commons,
+                    fournisseur: "Wikimedia Commons".into(),
+                    statut_licence: StatutDeLicence::Libre,
+                    licence: Some("CC0".into()),
+                    licence_url: None,
+                    auteur: None,
+                    source_url: "https://commons.test/etat".into(),
+                    fichier: None,
+                    douteux: false,
+                }),
+            }))
+        }
+        async fn telecharger_image(&self, _: &str) -> Result<Vec<u8>, String> {
+            Ok(PNG.to_vec())
+        }
+    }
+
+    fn sources(web: Arc<Retenu>) -> SourcesDeLogos {
+        SourcesDeLogos {
+            web: Some(web as Arc<dyn CatalogueDeLabels>),
+            qobuz: None,
+            partage: None,
+            pause: Duration::ZERO,
+        }
+    }
+
+    async fn requete(app: &axum::Router, methode: &str, chemin: &str) -> (StatusCode, Value) {
+        let reponse = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(methode)
+                    .uri(chemin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let statut = reponse.status();
+        let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            statut,
+            serde_json::from_slice(&corps).unwrap_or(Value::Null),
+        )
+    }
+
+    async fn statut(app: &axum::Router) -> Value {
+        let (code, corps) = requete(app, "GET", "/api/v1/library/labels/logos/status").await;
+        assert_eq!(code, StatusCode::OK, "{corps}");
+        corps
+    }
+
+    /// Attend (10 s au plus) que `condition` tienne sur le statut.
+    async fn attendre(app: &axum::Router, condition: impl Fn(&Value) -> bool) -> Value {
+        for _ in 0..200 {
+            let s = statut(app).await;
+            if condition(&s) {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("condition jamais atteinte : {}", statut(app).await);
+    }
+
+    /// LE contrat de l'écran : la passe s'inscrit sous `label_logos` avec son
+    /// total, avance label par label, refuse un second lancement (409 par
+    /// la route, `DejaEnCours` par la fonction) sans rien relancer, puis
+    /// range son bilan ; le statut compte les labels avec et sans logo.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn la_passe_s_inscrit_avance_refuse_un_doublon_et_range_son_bilan() {
+        let dossier = tune_core::test_scratch::scratch_dir("labels-etat-passe");
+        let chemin = dossier.path().join("tune.db");
+        let (app, state) = demarrer(chemin.to_str().unwrap());
+        for i in 0..3 {
+            album(&state, &format!("A{i}"), &nom(&format!("Etat {i}")));
+        }
+
+        let avant = statut(&app).await;
+        assert_eq!(avant["labels_total"], 3, "{avant}");
+        assert_eq!(avant["with_logo"], 0, "{avant}");
+        assert_eq!(avant["without_logo"], 3, "{avant}");
+        assert_eq!(avant["running"], false, "{avant}");
+        assert!(avant["last_run"].is_null(), "{avant}");
+        assert!(avant.get("progress").is_none(), "{avant}");
+
+        let web = Arc::new(Retenu(Semaphore::new(0)));
+        assert_eq!(
+            lancer_passes_logos(&state, labels_de(&state), sources(web.clone())),
+            LancementLogos::Lancee { a_traiter: 3 }
+        );
+        let tache = state
+            .background_tasks
+            .get(TACHE_LOGOS_LABELS)
+            .expect("la passe est inscrite au registre sous `label_logos`");
+        assert_eq!(tache.progress.as_ref().map(|p| p.total), Some(3));
+
+        // Un second lancement pendant la passe : rien de plus.
+        assert_eq!(
+            lancer_passes_logos(&state, labels_de(&state), sources(web.clone())),
+            LancementLogos::DejaEnCours
+        );
+        let (code, corps) = requete(&app, "POST", "/api/v1/library/labels/logos/enrich").await;
+        assert_eq!(code, StatusCode::CONFLICT, "{corps}");
+        assert_eq!(corps["status"], "already_running", "{corps}");
+
+        let en_cours = statut(&app).await;
+        assert_eq!(en_cours["running"], true, "{en_cours}");
+        assert_eq!(en_cours["progress"]["total"], 3, "{en_cours}");
+
+        // Un label résolu : l'avancement le dit.
+        web.0.add_permits(1);
+        let un = attendre(&app, |s| s["progress"]["processed"].as_u64() >= Some(1)).await;
+        assert_eq!(un["running"], true, "{un}");
+        assert_eq!(un["with_logo"], 1, "{un}");
+
+        web.0.add_permits(2);
+        let fin = attendre(&app, |s| s["running"] == false).await;
+        assert!(fin.get("progress").is_none(), "{fin}");
+        assert_eq!(fin["with_logo"], 3, "{fin}");
+        assert_eq!(fin["without_logo"], 0, "{fin}");
+        let bilan = &fin["last_run"];
+        assert_eq!(bilan["to_process"], 3, "{fin}");
+        assert_eq!(bilan["processed"], 3, "{fin}");
+        assert_eq!(bilan["found"], 3, "{fin}");
+        assert_eq!(bilan["with_logo"], 3, "{fin}");
+        assert!(
+            bilan["finished_at"].as_u64() >= bilan["started_at"].as_u64(),
+            "{fin}"
+        );
+        assert!(state.background_tasks.get(TACHE_LOGOS_LABELS).is_none());
+    }
+
+    /// Rien à demander : rien n'est lancé, et le verrou est rendu (un
+    /// lancement suivant n'est pas refusé « déjà en cours »).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rien_a_faire_ne_lance_rien_et_rend_le_verrou() {
+        let dossier = tune_core::test_scratch::scratch_dir("labels-etat-rien");
+        let chemin = dossier.path().join("tune.db");
+        let (_app, state) = demarrer(chemin.to_str().unwrap());
+        let web = Arc::new(Retenu(Semaphore::new(0)));
+        for _ in 0..2 {
+            assert_eq!(
+                lancer_passes_logos(&state, Vec::new(), sources(web.clone())),
+                LancementLogos::RienAFaire
+            );
+            assert!(state.background_tasks.get(TACHE_LOGOS_LABELS).is_none());
+        }
+        let sans = SourcesDeLogos {
+            web: None,
+            qobuz: None,
+            partage: None,
+            pause: Duration::ZERO,
+        };
+        assert_eq!(
+            lancer_passes_logos(&state, labels_de(&state), sans),
+            LancementLogos::SansSource
+        );
+        assert!(state.background_tasks.get(TACHE_LOGOS_LABELS).is_none());
+    }
+
+    /// Le refus « déjà en cours » de la ROUTE ne dépend d'aucune source : une
+    /// passe inscrite suffit (celle d'une ouverture de l'onglet, par exemple).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn la_route_refuse_un_second_lancement_en_409() {
+        let dossier = tune_core::test_scratch::scratch_dir("labels-etat-409");
+        let chemin = dossier.path().join("tune.db");
+        let (app, state) = demarrer(chemin.to_str().unwrap());
+        album(&state, "A", &nom("Etat 409"));
+        let _passe = state
+            .background_tasks
+            .try_begin(TACHE_LOGOS_LABELS, "…", "enrichment")
+            .unwrap();
+        let (code, corps) = requete(&app, "POST", "/api/v1/library/labels/logos/enrich").await;
+        assert_eq!(code, StatusCode::CONFLICT, "{corps}");
+        assert_eq!(corps["status"], "already_running", "{corps}");
+        // Et la liste des labels ne lance rien de plus non plus.
+        let (code, _) = requete(&app, "GET", "/api/v1/library/labels").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(state.background_tasks.get(TACHE_LOGOS_LABELS).is_some());
+    }
+
+    /// Les nouvelles routes ne masquent pas la page d'un label nommé
+    /// « logos » (`/labels/{nom}/artists`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn un_label_nomme_logos_garde_sa_page() {
+        let dossier = tune_core::test_scratch::scratch_dir("labels-etat-nom-logos");
+        let chemin = dossier.path().join("tune.db");
+        let (app, _state) = demarrer(chemin.to_str().unwrap());
+        let (code, corps) = requete(&app, "GET", "/api/v1/library/labels/logos/artists").await;
+        assert_eq!(code, StatusCode::OK, "{corps}");
+        assert_eq!(corps["name"], "logos", "{corps}");
     }
 }
