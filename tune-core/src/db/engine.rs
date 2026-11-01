@@ -71,6 +71,12 @@ impl fmt::Display for Engine {
 /// the identical SQL `LOWER(unaccent(col)) LIKE LOWER(unaccent(?))`.
 pub fn fold_diacritics(s: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
+    // #7619 — un texte ASCII n'a ni lettre décomposable ni marque combinante :
+    // sa forme NFD est lui-même. La recherche appelle cette fonction sur des
+    // dizaines de milliers de titres par requête, ASCII pour la plupart.
+    if s.is_ascii() {
+        return s.to_string();
+    }
     s.nfd()
         .filter(|c| !matches!(*c, '\u{0300}'..='\u{036F}'))
         .collect()

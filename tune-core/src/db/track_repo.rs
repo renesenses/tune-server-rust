@@ -1542,6 +1542,15 @@ pub mod sql {
         }
     }
 
+    /// La rédaction des critères : celle d'avant #7619 n'est gardée que pour
+    /// les témoins, qui comparent les deux chemins.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Redaction {
+        Dictionnaires,
+        #[cfg(test)]
+        Avant7619,
+    }
+
     /// Le OU des critères, la branche plein texte `plein_texte` en tête, puis
     /// trois `LIKE` et l'année sur les emplacements `n + 1` à `n + 4`.
     ///
@@ -1564,27 +1573,66 @@ pub mod sql {
     /// Le dictionnaire est MATÉRIALISÉ : sans cela, SQLite pousse le `LIKE`
     /// dans le `SELECT DISTINCT` et le rejoue sur chaque piste, ce qu'il
     /// s'agit justement d'éviter.
-    fn criteres<D: SqlDialect>(d: &D, plein_texte: String, n: usize) -> String {
-        format!(
-            "({plein_texte} \
-             OR t.artist_id IN (SELECT dico_ar.id FROM artists dico_ar \
-             WHERE LOWER(unaccent(dico_ar.name)) LIKE LOWER(unaccent({}))) \
-             OR {} OR {} \
-             OR t.album_id IN (SELECT dico_al.id FROM albums dico_al \
-             WHERE CAST(dico_al.year AS TEXT) = {}))",
-            d.placeholder(n + 1),
-            valeur_du_dictionnaire("genre", &d.placeholder(n + 2)),
-            valeur_du_dictionnaire("composer", &d.placeholder(n + 3)),
-            d.placeholder(n + 4),
-        )
+    fn criteres<D: SqlDialect>(
+        d: &D,
+        plein_texte: String,
+        n: usize,
+        redaction: Redaction,
+    ) -> String {
+        #[cfg(test)]
+        if redaction == Redaction::Avant7619 {
+            return format!(
+                "({plein_texte} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {})",
+                d.placeholder(n + 1),
+                d.placeholder(n + 2),
+                d.placeholder(n + 3),
+                d.placeholder(n + 4),
+            );
+        }
+        let _ = redaction;
+        let artiste = format!(
+            "artist_id IN (SELECT dico_ar.id FROM artists dico_ar \
+             WHERE LOWER(unaccent(dico_ar.name)) LIKE LOWER(unaccent({})))",
+            d.placeholder(n + 1)
+        );
+        let genre = valeur_du_dictionnaire("genre", &d.placeholder(n + 2));
+        let compositeur = valeur_du_dictionnaire("composer", &d.placeholder(n + 3));
+        let annee = format!(
+            "album_id IN (SELECT dico_al.id FROM albums dico_al \
+             WHERE CAST(dico_al.year AS TEXT) = {})",
+            d.placeholder(n + 4)
+        );
+        // SQLite : la branche plein texte est un pur `t.id IN (SELECT rowid
+        // …)` (son filtre de colonnes voyage dans la chaîne du `MATCH`). Les
+        // cinq branches deviennent alors UNE liste d'identifiants, réunie par
+        // `UNION` : le moteur lit chaque branche par son index puis la piste
+        // par sa clé, quel que soit le choix de son planificateur — qui, sur
+        // une petite base analysée, préférait parcourir la table.
+        if let Some(fts) = plein_texte
+            .strip_prefix("t.id IN (")
+            .and_then(|r| r.strip_suffix(')'))
+            .filter(|_| d.engine() == crate::db::engine::Engine::Sqlite)
+        {
+            return format!(
+                "t.id IN ({fts} \
+                 UNION SELECT dico_t.id FROM tracks dico_t WHERE dico_t.{artiste} \
+                 UNION SELECT dico_t.id FROM tracks dico_t WHERE dico_t.{genre} \
+                 UNION SELECT dico_t.id FROM tracks dico_t WHERE dico_t.{compositeur} \
+                 UNION SELECT dico_t.id FROM tracks dico_t WHERE dico_t.{annee})"
+            );
+        }
+        // PostgreSQL : la branche plein texte porte une restriction sur la
+        // ligne jointe (#4367) ; le OU reste, chaque branche sur un index.
+        format!("({plein_texte} OR t.{artiste} OR t.{genre} OR t.{compositeur} OR t.{annee})")
     }
 
     /// `t.{colonne}` vaut l'une des valeurs DISTINCTES de la colonne qui
     /// contiennent le motif `motif`, sans accents ni casse — voir
     /// [`criteres`]. `colonne` est un nom écrit par le code, jamais une saisie.
+    /// Sans préfixe d'alias : l'appelant pose `t.` ou `dico_t.` devant.
     fn valeur_du_dictionnaire(colonne: &str, motif: &str) -> String {
         format!(
-            "t.{colonne} IN (WITH dico AS MATERIALIZED \
+            "{colonne} IN (WITH dico AS MATERIALIZED \
              (SELECT DISTINCT {colonne} AS v FROM tracks WHERE {colonne} IS NOT NULL) \
              SELECT dico.v FROM dico WHERE LOWER(unaccent(dico.v)) LIKE LOWER(unaccent({motif})))"
         )
@@ -1608,9 +1656,13 @@ pub mod sql {
     /// ([`crate::db::engine::format_fts_query_piste_ou_chemin`]), puis trois
     /// `LIKE`, puis l'année.
     pub fn search_where<D: SqlDialect>(d: &D) -> String {
+        search_where_selon(d, Redaction::Dictionnaires)
+    }
+
+    fn search_where_selon<D: SqlDialect>(d: &D, r: Redaction) -> String {
         format!(
             "{} AND {} AND {}",
-            criteres(d, plein_texte_piste_ou_chemin(d, 1), 1),
+            criteres(d, plein_texte_piste_ou_chemin(d, 1), 1, r),
             crate::db::facet_filter::hidden_tracks_excluded(),
             crate::db::facet_filter::pistes_album_distant_double_exclu(d.engine()),
         )
@@ -1624,9 +1676,38 @@ pub mod sql {
     /// Emplacements 6..=10 : requête FTS d'identité
     /// ([`crate::db::engine::format_fts_query_piste`]), trois `LIKE`, l'année.
     pub fn search_rang<D: SqlDialect>(d: &D) -> String {
+        search_rang_selon(d, Redaction::Dictionnaires)
+    }
+
+    fn search_rang_selon<D: SqlDialect>(d: &D, r: Redaction) -> String {
         format!(
             "CASE WHEN {} THEN 0 ELSE 1 END",
-            criteres(d, plein_texte_de_la_piste(d, 6), 6)
+            criteres(d, plein_texte_de_la_piste(d, 6), 6, r)
+        )
+    }
+
+    /// Témoins de #7619 : [`search`] et [`search_count`] dans leur rédaction
+    /// d'AVANT (les `LIKE` posés sur chaque piste), pour comparer les deux
+    /// chemins sur les mêmes données.
+    #[cfg(test)]
+    pub(crate) fn search_avant_7619<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE {} ORDER BY {}, t.id LIMIT {} OFFSET {}",
+            select_track(),
+            search_where_selon(d, Redaction::Avant7619),
+            search_rang_selon(d, Redaction::Avant7619),
+            d.placeholder(11),
+            d.placeholder(12),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_count_avant_7619<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM (SELECT t.id{} WHERE {} LIMIT {}) AS borne",
+            track_from(),
+            search_where_selon(d, Redaction::Avant7619),
+            d.placeholder(6),
         )
     }
 
@@ -1660,11 +1741,12 @@ pub mod sql {
     /// lue telle quelle par `row_to_track`. Mêmes emplacements que [`search`].
     pub fn search_avec_total<D: SqlDialect>(d: &D) -> String {
         let select = select_track();
-        let (projection, from) = select
-            .split_once(track_from())
+        let projection = select
+            .strip_suffix(track_from())
             .expect("select_track() se termine par track_from()");
         format!(
-            "{projection}, COUNT(*) OVER (){from} WHERE {} ORDER BY {}, t.id LIMIT {} OFFSET {}",
+            "{projection}, COUNT(*) OVER (){} WHERE {} ORDER BY {}, t.id LIMIT {} OFFSET {}",
+            track_from(),
             search_where(d),
             search_rang(d),
             d.placeholder(11),

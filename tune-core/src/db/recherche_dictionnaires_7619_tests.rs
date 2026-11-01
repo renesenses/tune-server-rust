@@ -3,13 +3,13 @@
 //! distincts) au lieu de chaque piste, et la page lue avec son total en une
 //! seule requête.
 //!
-//! Témoin de RÉSULTAT : l'ancien prédicat (reconstitué depuis le nouveau par
-//! [`ancien`], fragment par fragment) et le nouveau rendent les mêmes pistes,
+//! Témoin de RÉSULTAT : l'ancien prédicat (`sql::search_avant_7619`, la
+//! rédaction d'avant gardée pour les témoins) et le nouveau rendent les mêmes pistes,
 //! dans le même ordre, et le même total — accents, casse, `NULL`, artiste
 //! absent, album masqué, année compris.
 //!
 //! Témoin de PLAN : la recherche ne parcourt plus la table des pistes ; chaque
-//! branche du OU passe par un index (« MULTI-INDEX OR »).
+//! branche passe par son index, et la piste par sa clé.
 
 use std::sync::Arc;
 
@@ -17,46 +17,6 @@ use super::backend::DbBackend;
 use super::engine::SqliteDialect;
 use super::sqlite::SqliteDb;
 use super::track_repo::{TrackRepo, sql};
-
-/// Les fragments du nouveau prédicat, et ce qu'ils remplacent : l'ancien
-/// `criteres` (avant #7619), où chaque `LIKE` portait sur la ligne jointe.
-const FRAGMENTS: [(&str, &str); 4] = [
-    (
-        "t.artist_id IN (SELECT dico_ar.id FROM artists dico_ar \
-         WHERE LOWER(unaccent(dico_ar.name)) LIKE LOWER(unaccent(?)))",
-        "LOWER(unaccent(ar.name)) LIKE LOWER(unaccent(?))",
-    ),
-    (
-        "t.genre IN (WITH dico AS MATERIALIZED \
-         (SELECT DISTINCT genre AS v FROM tracks WHERE genre IS NOT NULL) \
-         SELECT dico.v FROM dico WHERE LOWER(unaccent(dico.v)) LIKE LOWER(unaccent(?)))",
-        "LOWER(unaccent(t.genre)) LIKE LOWER(unaccent(?))",
-    ),
-    (
-        "t.composer IN (WITH dico AS MATERIALIZED \
-         (SELECT DISTINCT composer AS v FROM tracks WHERE composer IS NOT NULL) \
-         SELECT dico.v FROM dico WHERE LOWER(unaccent(dico.v)) LIKE LOWER(unaccent(?)))",
-        "LOWER(unaccent(t.composer)) LIKE LOWER(unaccent(?))",
-    ),
-    (
-        "t.album_id IN (SELECT dico_al.id FROM albums dico_al \
-         WHERE CAST(dico_al.year AS TEXT) = ?)",
-        "CAST(al.year AS TEXT) = ?",
-    ),
-];
-
-/// L'ancien SQL : chaque fragment du nouveau, remplacé par celui d'avant. Le
-/// remplacement doit avoir lieu — sinon le témoin comparerait le nouveau
-/// chemin à lui-même.
-pub(crate) fn ancien(nouveau: &str) -> String {
-    let mut sql = nouveau.to_string();
-    for (neuf, vieux) in FRAGMENTS {
-        assert!(sql.contains(neuf), "fragment introuvable : {neuf}\n{sql}");
-        sql = sql.replace(neuf, vieux);
-    }
-    assert!(!sql.contains("dico"), "{sql}");
-    sql
-}
 
 fn base() -> (Arc<SqliteDb>, TrackRepo) {
     let db = SqliteDb::open_in_memory().unwrap();
@@ -79,7 +39,7 @@ fn base() -> (Arc<SqliteDb>, TrackRepo) {
            (5, 'Saman', 4, 4, 'Électronique', 'Ólafur', '/m/5.flac'),
            (6, 'So What', 5, 5, 'JAZZ', 'Davis', '/m/6.flac'),
            (7, 'Beat It', 6, 6, NULL, 'Dvořák', '/m/7.flac'),
-           (8, 'Orpheline', NULL, 99, 'electro', NULL, '/m/8.flac'),
+           (8, 'Orpheline', NULL, NULL, 'electro', NULL, '/m/8.flac'),
            (9, 'Cachée', 7, 1, 'Rock', 'Lennon', '/m/9.flac'),
            (10, 'Sans rien', NULL, NULL, NULL, NULL, '/m/10.flac');",
     )
@@ -89,7 +49,10 @@ fn base() -> (Arc<SqliteDb>, TrackRepo) {
     (db, repo)
 }
 
-const REQUETES: [&str; 16] = [
+const REQUETES: [&str; 18] = [
+    // Au milieu d'un mot, accents dans la donnée : seul le `LIKE` les trouve.
+    "orak",
+    "ectroniq",
     "beat",
     "BEAT",
     "beyonce",
@@ -114,8 +77,8 @@ const REQUETES: [&str; 16] = [
 #[test]
 fn memes_pistes_meme_ordre_meme_total_que_l_ancien_chemin() {
     let (db, repo) = base();
-    let page_ancienne = ancien(&sql::search(&SqliteDialect));
-    let compte_ancien = ancien(&sql::search_count(&SqliteDialect));
+    let page_ancienne = sql::search_avant_7619(&SqliteDialect);
+    let compte_ancien = sql::search_count_avant_7619(&SqliteDialect);
     let mut non_vides = 0;
     for q in REQUETES {
         let fts = crate::db::engine::format_fts_query_piste_ou_chemin(
@@ -200,22 +163,42 @@ fn memes_pistes_meme_ordre_meme_total_que_l_ancien_chemin() {
     assert!(ids("beyonce").contains(&3), "accents de l'artiste");
     assert!(ids("ELECTRO").contains(&5), "accents et casse du genre");
     assert!(ids("dvorak").contains(&7), "accents du compositeur");
+    assert!(
+        ids("orak").contains(&7),
+        "milieu de mot, accents du compositeur"
+    );
+    assert!(
+        ids("ectroniq").contains(&5),
+        "milieu de mot, accents du genre"
+    );
+    assert!(
+        ids("eat").contains(&7),
+        "milieu de mot de l'artiste (abeat)"
+    );
     assert!(ids("1975").contains(&7), "année de l'album");
     assert!(!ids("1975").contains(&9), "album masqué exclu");
 }
 
-/// Le plan : plus aucun parcours de la table des pistes ; le OU passe par les
-/// index (plein texte, artiste, genre, compositeur, album).
+/// Le plan : plus aucun parcours de la table des pistes ; chaque branche passe
+/// par son index (plein texte, artiste, genre, compositeur, album).
 #[test]
 fn la_recherche_ne_parcourt_plus_la_table_des_pistes() {
     let (db, _repo) = base();
+    // Une bibliothèque à l'échelle : 300 artistes et 300 albums de 10 pistes,
+    // 40 genres, 300 compositeurs.
     let mut sql = String::from("BEGIN;");
-    for i in 100..3000 {
+    for a in 100..400 {
+        sql.push_str(&format!(
+            "INSERT INTO artists (id, name) VALUES ({a}, 'Artiste {a}');\
+             INSERT INTO albums (id, title, artist_id, year) VALUES ({a}, 'Album {a}', {a}, {});",
+            1950 + a % 70
+        ));
+    }
+    for i in 100..3100 {
+        let al = 100 + (i - 100) / 10;
         sql.push_str(&format!(
             "INSERT INTO tracks (id, title, album_id, artist_id, genre, composer, file_path) \
-             VALUES ({i}, 'Titre {i}', {}, {}, 'Genre {}', 'Compositeur {}', '/m/{i}.flac');",
-            i % 6 + 1,
-            i % 6 + 1,
+             VALUES ({i}, 'Titre {i}', {al}, {al}, 'Genre {}', 'Compositeur {}', '/m/{i}.flac');",
             i % 40,
             i % 300
         ));
@@ -236,8 +219,8 @@ fn la_recherche_ne_parcourt_plus_la_table_des_pistes() {
         .collect();
     let plan = plan.join("\n");
     assert!(
-        plan.contains("MULTI-INDEX OR"),
-        "le OU n'est pas indexé :\n{plan}"
+        plan.contains("SEARCH t USING INTEGER PRIMARY KEY"),
+        "la piste n'est pas lue par sa clé :\n{plan}"
     );
     assert!(
         !plan.lines().any(|l| l.trim() == "SCAN t"),
@@ -271,8 +254,8 @@ fn banc_recherche_7619_sur_copie() {
     crate::db::migrations::run_migrations(&db).unwrap();
     let db = Arc::new(db);
     let repo = TrackRepo::with_backend(db.clone());
-    let page_ancienne = ancien(&sql::search(&SqliteDialect));
-    let compte_ancien = ancien(&sql::search_count(&SqliteDialect));
+    let page_ancienne = sql::search_avant_7619(&SqliteDialect);
+    let compte_ancien = sql::search_count_avant_7619(&SqliteDialect);
     let requetes = std::env::var("TUNE_BANC_REQUETES")
         .unwrap_or_else(|_| "beat,bach,miles davis,jazz,1975,beyonce,mozart,é,zzqx".into());
     let mediane = |f: &mut dyn FnMut()| {
