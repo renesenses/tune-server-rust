@@ -1,0 +1,46 @@
+[package]
+name = "tune-aes67"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# « Sortie AES67 » (#7336) — greffon natif, PREMIUM (`Feature::Aes67`).
+#
+# Étape E1 de l'étude : un émetteur RTP L24, 48 kHz, paquets de 1 ms, en
+# multicast 239.x, annoncé par SAP/SDP, horodaté sur une SOURCE D'HORLOGE
+# interchangeable (`horloge::SourceHorloge`) : depuis l'étape E2, un suiveur
+# PTPv2 (`statime`, esclave seulement, horodatage logiciel), avec repli
+# explicite sur l'horloge locale quand aucun maître n'est vu.
+#
+# Première version : Linux seul (décision de Bertrand, 30/10/2026). La crate
+# elle-même reste portable (std + socket2) pour que `cargo test --workspace`
+# passe partout ; c'est `tune-server` qui ne la lie et ne l'enregistre que
+# sous `target_os = "linux"`, derrière la feature `aes67`.
+#
+# Le décodage progressif et le rééchantillonnage (rubato) sont ceux du cœur :
+# `tune_core::audio::decode::decode_vers_pcm_en_continu`, comme AirPlay 1.
+
+[dependencies]
+tune-core = { path = "../../tune-core", default-features = false, features = ["plugin-http"] }
+axum = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+socket2 = { workspace = true }
+sha2 = { workspace = true }
+symphonia = { workspace = true }
+reqwest = { workspace = true }
+# Étape E2 : suiveur PTPv2 (IEEE 1588). `statime` 0.4.0 (Trifecta Tech
+# Foundation), MIT OR Apache-2.0, `no_std` avec plateforme fournie par
+# l'appelant : on lui donne une horloge VIRTUELLE (OverlayClock sur l'horloge
+# monotone, aucun droit sur l'horloge système) et des sockets UDP ordinaires
+# horodatés en espace utilisateur. Version figée : l'API bouge entre les 0.x.
+statime = { version = "=0.4.0", default-features = false, features = ["std"] }
+# Le générateur que `statime` 0.4 attend (trait `rand` 0.8, déjà au Cargo.lock).
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
