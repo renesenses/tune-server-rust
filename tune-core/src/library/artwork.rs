@@ -962,6 +962,23 @@ pub async fn batch_enrich_artwork_scoped(
     cache_dir: PathBuf,
     scope: Option<crate::metadata::enrich_scope::EnrichScope>,
 ) {
+    batch_enrich_artwork_suivi(db, cache_dir, scope, None).await
+}
+
+/// Rappel d'avancement de la passe des pochettes : `(traités, total)`.
+pub type AvancementPochettes = std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// La passe des pochettes d'albums, avec un rappel d'avancement appelé avant
+/// chaque album puis une fois à la fin (écran « État du serveur »,
+/// 01/11/2026 : la carte des pochettes montre `traités / total`). Le bilan
+/// écrit dans `artwork_enrich_result` porte `status: "done"` et
+/// `finished_at` (secondes Unix).
+pub async fn batch_enrich_artwork_suivi(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    cache_dir: PathBuf,
+    scope: Option<crate::metadata::enrich_scope::EnrichScope>,
+    avancement: Option<AvancementPochettes>,
+) {
     let album_repo = crate::db::album_repo::AlbumRepo::with_backend(db.clone());
     let mut albums = match album_repo.list_without_cover() {
         Ok(a) => a,
@@ -992,7 +1009,11 @@ pub async fn batch_enrich_artwork_scoped(
     let mut searched = 0u32;
     let mut failed = 0u32;
 
-    for (album_id, title, artist_name, mbid) in &albums {
+    let total = albums.len() as u64;
+    for (rang, (album_id, title, artist_name, mbid)) in albums.iter().enumerate() {
+        if let Some(a) = &avancement {
+            a(rang as u64, total);
+        }
         // Même traitement, même carte à l'écran que les images d'artistes :
         // « Pochettes d'artistes » couvre les deux passes de `library::artwork`.
         crate::taches_de_fond::attendre_son_tour(crate::taches_de_fond::Tache::ImagesArtistes)
@@ -1092,6 +1113,13 @@ pub async fn batch_enrich_artwork_scoped(
         total = albums.len(),
         enriched, searched, failed, "batch_artwork_enrichment_complete"
     );
+    if let Some(a) = &avancement {
+        a(total, total);
+    }
+    let finished_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     // Store result in settings for status reporting
     let settings = crate::db::settings_repo::SettingsRepo::with_backend(db);
@@ -1103,6 +1131,8 @@ pub async fn batch_enrich_artwork_scoped(
                 "enriched": enriched,
                 "searched": searched,
                 "failed": failed,
+                "status": "done",
+                "finished_at": finished_at,
             })
             .to_string(),
         )

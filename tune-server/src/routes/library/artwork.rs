@@ -777,9 +777,30 @@ pub(crate) async fn demarrer_pochettes_albums(
         .into_response();
     }
 
+    // Écran « État du serveur » (01/11/2026) — UNE passe à la fois : un
+    // second lancement pendant qu'elle tourne ne lance rien et le dit (409
+    // `already_running`). L'inscription au registre EST le verrou
+    // (`try_begin` vérifie et inscrit sous le même verrou).
+    let Some(task_guard) = state.background_tasks.try_begin(
+        TACHE_POCHETTES_ALBUMS,
+        "Récupération des pochettes d'albums…",
+        "enrichment",
+    ) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "already_running",
+                "message": "album artwork enrichment already running",
+            })),
+        )
+            .into_response();
+    };
+
     // #2507 — jumelle « pochettes » de `enrich-artists` : c'est la moitié
     // pochettes de `POST /system/enrich`, qui est gardé. Même garde, après le
-    // raccourci « rien à faire ». #5469 : une reprise n'est pas un geste.
+    // raccourci « rien à faire » et le refus « déjà en cours » (qui ne
+    // consomme donc aucun quota ; la garde, elle, rend l'inscription en
+    // retombant). #5469 : une reprise n'est pas un geste.
     if declencheur.garde_le_quota()
         && let Err(refus) = crate::routes::system::gate_enrichment(state).await
     {
@@ -792,15 +813,15 @@ pub(crate) async fn demarrer_pochettes_albums(
     settings
         .set(
             "artwork_enrich_result",
-            &json!({"total": missing.len(), "enriched": 0, "status": "running"}).to_string(),
+            &json!({
+                "total": missing.len(),
+                "enriched": 0,
+                "status": "running",
+                "started_at": secondes_unix(),
+            })
+            .to_string(),
         )
         .ok();
-
-    let task_guard = state.background_tasks.begin(
-        "artwork",
-        "Récupération des pochettes d'albums…",
-        "enrichment",
-    );
     // #5469 — repère de reprise : effacé à la fin normale, et seulement là.
     let jeton_de_reprise = crate::reprise_des_passes::noter_ouverture(
         &state.backend,
@@ -808,9 +829,23 @@ pub(crate) async fn demarrer_pochettes_albums(
         None,
         declencheur,
     );
+    let taches = state.background_tasks.clone();
     tokio::spawn(async move {
         let _task_guard = task_guard; // ends the task when this future completes
-        tune_core::library::artwork::batch_enrich_artwork(db.clone(), cache_dir).await;
+        let avancement: tune_core::library::artwork::AvancementPochettes =
+            std::sync::Arc::new(move |fait, total| {
+                taches.update_progress(TACHE_POCHETTES_ALBUMS, fait, total, "albums");
+            });
+        tune_core::library::artwork::batch_enrich_artwork_suivi(
+            db.clone(),
+            cache_dir,
+            None,
+            Some(avancement),
+        )
+        .await;
+        tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .set("artwork_enrich_status", "done")
+            .ok();
         crate::reprise_des_passes::noter_fin(
             &db,
             crate::reprise_des_passes::Passe::PochettesAlbums,
@@ -829,6 +864,33 @@ pub(crate) async fn demarrer_pochettes_albums(
         .into_response()
 }
 
+/// L'identifiant de la passe des pochettes d'albums au registre
+/// `background_tasks` (`artwork` jusqu'au 01/11/2026).
+pub(crate) const TACHE_POCHETTES_ALBUMS: &str = "album_artwork";
+
+fn secondes_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `GET /library/artwork/enrich/status`.
+///
+/// ```json
+/// { "result": {"total": 53, "enriched": 4, "failed": 49, "searched": 52,
+///              "status": "done", "finished_at": 1793525105},
+///   "albums_without_cover": 49,
+///   "albums_total": 3844, "albums_with_cover": 3795,
+///   "running": false }
+/// ```
+///
+/// Écran « État du serveur » (01/11/2026) : `albums_total` (albums locaux)
+/// et `albums_with_cover` sortent de la même lecture que
+/// `albums_without_cover` (un seul `COUNT`, plus la liste entière) ;
+/// `running` dit si la passe est inscrite au registre — c'est la vérité,
+/// `result.status` peut rester `running` après un arrêt brutal — et
+/// `progress` (`processed`, `total`) n'est là que pendant la passe.
 pub(super) async fn batch_enrich_artwork_status(State(state): State<AppState>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let result = settings
@@ -838,12 +900,23 @@ pub(super) async fn batch_enrich_artwork_status(State(state): State<AppState>) -
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
 
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
-    let still_missing = album_repo.list_without_cover().unwrap_or_default().len();
+    let (total, sans) = album_repo.compter_pochettes_locales().unwrap_or_else(|e| {
+        tracing::warn!(erreur = %e, "pochettes_compte_impossible");
+        (0, 0)
+    });
+    let tache = state.background_tasks.get(TACHE_POCHETTES_ALBUMS);
 
-    Json(json!({
+    let mut corps = json!({
         "result": result,
-        "albums_without_cover": still_missing,
-    }))
+        "albums_without_cover": sans,
+        "albums_total": total,
+        "albums_with_cover": (total - sans).max(0),
+        "running": tache.is_some(),
+    });
+    if let Some(p) = tache.and_then(|t| t.progress) {
+        corps["progress"] = json!({ "processed": p.processed, "total": p.total });
+    }
+    Json(corps)
 }
 
 /// La NATURE d'un portrait manquant — quatre, et le geste de réparation n'est
@@ -3478,5 +3551,141 @@ mod amelioration_pochette_4805 {
             "aucune comparaison pour une pochette téléversée"
         );
         assert_eq!(avant, apres);
+    }
+}
+
+/// Écran « État du serveur » (01/11/2026) — la passe des pochettes d'albums :
+/// une seule à la fois, visible sous `album_artwork`, comptes exposés.
+#[cfg(test)]
+mod pochettes_albums_etat_du_serveur {
+    use super::TACHE_POCHETTES_ALBUMS;
+    use crate::routes::system::enrich::QuotaDuJour;
+    use crate::state::AppState;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("état en mémoire")
+    }
+
+    fn album(etat: &AppState, titre: &str, source: &str, pochette: Option<&str>) {
+        etat.backend
+            .execute(
+                "INSERT INTO albums (title, source, cover_path) VALUES (?, ?, ?)",
+                &[
+                    &titre as &dyn tune_core::db::backend::ToSqlValue,
+                    &source,
+                    &pochette.map(String::from),
+                ],
+            )
+            .expect("insertion de l'album");
+    }
+
+    async fn appel(etat: &AppState, methode: &str, chemin: &str) -> (StatusCode, Value) {
+        let reponse = super::super::router()
+            .with_state(etat.clone())
+            .oneshot(
+                Request::builder()
+                    .method(methode)
+                    .uri(chemin)
+                    .body(Body::empty())
+                    .expect("requête"),
+            )
+            .await
+            .expect("réponse");
+        let statut = reponse.status();
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .expect("corps");
+        (
+            statut,
+            serde_json::from_slice(&octets).unwrap_or(json!(null)),
+        )
+    }
+
+    fn quota(etat: &AppState) -> i64 {
+        QuotaDuJour::lire(&SettingsRepo::with_backend(etat.backend.clone())).used
+    }
+
+    /// Un second lancement pendant une passe : 409 `already_running`, aucune
+    /// seconde inscription, et AUCUN quota consommé.
+    #[tokio::test]
+    async fn un_second_lancement_est_refuse_en_409_sans_consommer_de_quota() {
+        let etat = etat();
+        album(&etat, "Sans pochette", "local", None);
+        let _passe = etat
+            .background_tasks
+            .try_begin(TACHE_POCHETTES_ALBUMS, "…", "enrichment")
+            .expect("première inscription");
+        let avant = quota(&etat);
+
+        let (statut, corps) = appel(&etat, "POST", "/artwork/enrich").await;
+
+        assert_eq!(statut, StatusCode::CONFLICT, "{corps}");
+        assert_eq!(corps["status"], "already_running", "{corps}");
+        assert_eq!(
+            quota(&etat),
+            avant,
+            "un refus « déjà en cours » ne coûte rien"
+        );
+        let n = etat
+            .background_tasks
+            .snapshot()
+            .iter()
+            .filter(|t| t.id == TACHE_POCHETTES_ALBUMS)
+            .count();
+        assert_eq!(n, 1);
+    }
+
+    /// Le statut compte les albums LOCAUX avec et sans pochette, dit si la
+    /// passe tourne et, pendant, son avancement.
+    #[tokio::test]
+    async fn le_statut_compte_et_suit_la_passe() {
+        let etat = etat();
+        album(&etat, "Sans", "local", None);
+        album(&etat, "Vide", "local", Some(""));
+        album(&etat, "Avec", "local", Some("abc123"));
+        album(&etat, "Distant", "upnp", None);
+
+        let (_, repos) = appel(&etat, "GET", "/artwork/enrich/status").await;
+        assert_eq!(repos["albums_total"], 3, "{repos}");
+        assert_eq!(repos["albums_with_cover"], 1, "{repos}");
+        assert_eq!(repos["albums_without_cover"], 2, "{repos}");
+        assert_eq!(repos["running"], false, "{repos}");
+        assert!(repos.get("progress").is_none(), "{repos}");
+
+        let passe = etat
+            .background_tasks
+            .try_begin(TACHE_POCHETTES_ALBUMS, "…", "enrichment")
+            .unwrap();
+        etat.background_tasks
+            .update_progress(TACHE_POCHETTES_ALBUMS, 1, 2, "albums");
+        let (_, en_cours) = appel(&etat, "GET", "/artwork/enrich/status").await;
+        assert_eq!(en_cours["running"], true, "{en_cours}");
+        assert_eq!(en_cours["progress"], json!({"processed": 1, "total": 2}));
+
+        drop(passe);
+        let (_, apres) = appel(&etat, "GET", "/artwork/enrich/status").await;
+        assert_eq!(apres["running"], false, "{apres}");
+        assert!(apres.get("progress").is_none(), "{apres}");
+    }
+
+    /// `try_begin` : une inscription à la fois par identifiant, rendue
+    /// quand la garde tombe.
+    #[test]
+    fn try_begin_n_inscrit_qu_une_fois() {
+        let etat = etat();
+        let t = &etat.background_tasks;
+        let g = t.try_begin("x", "x", "k").expect("libre");
+        assert!(t.try_begin("x", "x", "k").is_none(), "déjà inscrite");
+        assert!(t.try_begin("y", "y", "k").is_some(), "un autre identifiant");
+        drop(g);
+        assert!(
+            t.try_begin("x", "x", "k").is_some(),
+            "rendue à la chute de la garde"
+        );
     }
 }
