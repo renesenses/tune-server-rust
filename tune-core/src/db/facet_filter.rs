@@ -1079,6 +1079,26 @@ pub fn socle_de_la_vue_des_pistes(engine: Engine) -> [String; 3] {
     ]
 }
 
+/// #7619 (L1) — le MÊME socle que [`socle_de_la_vue_des_pistes`], écrit en
+/// ensembles NON corrélés : le moteur les évalue une fois par requête au lieu
+/// de trois sous-requêtes par piste.
+///
+/// - albums masqués : `NOT IN` sur `hidden_items`. Une piste sans album reste
+///   visible (`t.album_id IS NULL OR …`), exactement comme le `NOT EXISTS`
+///   d'origine ; `item_id IS NOT NULL` garde le `NOT IN` d'un NULL qui le
+///   rendrait faux partout ;
+/// - doublon distant et copie de moindre qualité :
+///   [`sql_pistes_ecartees_par_le_socle`], bâti sur les mêmes fragments et
+///   exact par construction (#5977).
+pub fn socle_ensembliste_de_la_vue_des_pistes(engine: Engine) -> [String; 2] {
+    [
+        "(t.album_id IS NULL OR t.album_id NOT IN (SELECT h.item_id FROM hidden_items h \
+         WHERE h.item_type = 'album' AND h.item_id IS NOT NULL))"
+            .to_string(),
+        format!("t.id NOT IN ({})", sql_pistes_ecartees_par_le_socle(engine)),
+    ]
+}
+
 /// Les identifiants des pistes que les deux replis COÛTEUX du socle écartent
 /// — double distant (#4146) et copie de moindre qualité (#4101) —, alias `t`,
 /// bâtis sur les MÊMES fragments que [`socle_de_la_vue_des_pistes`] : une
