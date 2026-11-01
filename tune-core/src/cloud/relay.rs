@@ -366,13 +366,27 @@ impl RelayClient {
                     .map(|s| s.to_string());
                 let headers = v.get("headers").and_then(|h| h.as_object()).cloned();
 
-                let url = format!("http://127.0.0.1:{}{}", self.local_port, path);
+                // Le chemin est normalisé, PUIS jugé : il doit rester une
+                // route de l'API de CE serveur. Le serveur applique ensuite
+                // sa propre liste des routes relayables (`garde_du_relais`).
+                let Some(url) = url_locale_d_api(self.local_port, path) else {
+                    warn!(id = %id, "relay_request_chemin_refuse");
+                    let mut hdrs = serde_json::Map::new();
+                    hdrs.insert(
+                        "content-type".to_string(),
+                        serde_json::Value::String("application/json".into()),
+                    );
+                    let refus =
+                        reponse_dapi(&id, 403, hdrs, br#"{"error":"not_available_remotely"}"#);
+                    emettre_vers_le_relais(&self.ws_tx, refus.to_string()).await;
+                    return;
+                };
                 let mut req = match method {
-                    "POST" => self.http_client.post(&url),
-                    "PUT" => self.http_client.put(&url),
-                    "DELETE" => self.http_client.delete(&url),
-                    "PATCH" => self.http_client.patch(&url),
-                    _ => self.http_client.get(&url),
+                    "POST" => self.http_client.post(url),
+                    "PUT" => self.http_client.put(url),
+                    "DELETE" => self.http_client.delete(url),
+                    "PATCH" => self.http_client.patch(url),
+                    _ => self.http_client.get(url),
                 };
 
                 if let Some(hdrs) = headers {
@@ -438,6 +452,19 @@ impl RelayClient {
                     .and_then(|r| r.as_str())
                     .map(|s| s.to_string());
 
+                // Un identifiant de flux est UN segment : ni `/`, ni `..`, ni
+                // encodage. Sinon, rien n'est appelé en local.
+                if !identifiant_de_flux_valide(&stream_id) {
+                    warn!(id = %id, "relay_stream_id_refuse");
+                    let refus = serde_json::json!({
+                        "type": "relay.stream_start",
+                        "id": id,
+                        "status": 404,
+                        "headers": {},
+                    });
+                    emettre_vers_le_relais(&self.ws_tx, refus.to_string()).await;
+                    return;
+                }
                 let url = format!("http://127.0.0.1:{}/stream/{}", self.local_port, stream_id);
                 let ws_tx = self.ws_tx.clone();
                 let http = self.http_flux.clone();
@@ -452,6 +479,35 @@ impl RelayClient {
             _ => {}
         }
     }
+}
+
+/// L'URL locale d'un `relay.request`, si le chemin désigne bien une route de
+/// l'API de ce serveur. Normalisé d'abord (points, `%2e`), jugé ensuite : un
+/// chemin qui ne commence pas par `/`, qui change d'hôte (`@`, `//`) ou qui
+/// sort de `/api/v1/` après normalisation est refusé.
+pub(crate) fn url_locale_d_api(port: u16, chemin: &str) -> Option<reqwest::Url> {
+    if !chemin.starts_with('/') || chemin.starts_with("//") || chemin.contains('\\') {
+        return None;
+    }
+    let url = reqwest::Url::parse(&format!("http://127.0.0.1:{port}{chemin}")).ok()?;
+    if url.host_str() != Some("127.0.0.1") || url.port() != Some(port) {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    url.path().starts_with("/api/v1/").then_some(url)
+}
+
+/// Un identifiant de flux reçu du pont : un seul segment de chemin.
+pub(crate) fn identifiant_de_flux_valide(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 200
+        && !id.starts_with('.')
+        && !id.contains("..")
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
 /// Message du pont : un contact écoute une piste de CE serveur (Tune Circle
@@ -1639,6 +1695,76 @@ mod reponse_dapi_tests {
                 Some("3".to_string())
             )]
         );
+    }
+
+    /// Un chemin qui sort de l'API de ce serveur, ou qui change d'hôte, n'est
+    /// jamais appelé en local : 403 au pont, journal local vide.
+    #[tokio::test]
+    async fn un_chemin_hors_de_l_api_n_atteint_rien() {
+        let (port, journal) = serveur_local().await;
+        for chemin in [
+            "/api/v1/../system/config",
+            "/api/v1/%2e%2e/agent-tune/pair",
+            "/api/v1/../../stream/x",
+            "@exemple.invalid/api/v1/library",
+            "//exemple.invalid/api/v1/library",
+            "/ws/bridge",
+        ] {
+            let r = reponse_a(port, chemin).await;
+            assert_eq!(r["status"], 403, "{chemin} : {r}");
+        }
+        assert!(
+            journal.lock().unwrap().is_empty(),
+            "{:?}",
+            journal.lock().unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod chemins_du_relais_tests {
+    use super::{identifiant_de_flux_valide, url_locale_d_api};
+
+    #[test]
+    fn url_locale_d_api_normalise_puis_juge() {
+        assert_eq!(
+            url_locale_d_api(8888, "/api/v1/library/albums?x=1")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:8888/api/v1/library/albums?x=1"
+        );
+        for refuse in [
+            "/api/v1/../system/config",
+            "/api/v1/%2E%2E/%2e%2e/stream/x",
+            "api/v1/library",
+            "@h.invalid/api/v1/library",
+            ":1@h.invalid/api/v1/x",
+            "//h.invalid/api/v1/x",
+            "/\\h.invalid/api/v1/x",
+            "/upnp/renderer/x",
+        ] {
+            assert!(url_locale_d_api(8888, refuse).is_none(), "{refuse}");
+        }
+    }
+
+    #[test]
+    fn identifiant_de_flux_un_seul_segment() {
+        for bon in ["abc", "2338763c.flac", "radio.flac", "a_b-c.wav"] {
+            assert!(identifiant_de_flux_valide(bon), "{bon}");
+        }
+        for mauvais in [
+            "",
+            "..",
+            "../api/v1/system/config",
+            "a/b",
+            "%2e%2e",
+            ".cache",
+            "a?b",
+            "a#b",
+            "a\\b",
+        ] {
+            assert!(!identifiant_de_flux_valide(mauvais), "{mauvais}");
+        }
     }
 }
 

@@ -130,7 +130,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::state::AppState;
@@ -769,11 +768,22 @@ pub fn router_with_plugins(
         }),
     )
     .fallback_service(service_statique_spa(std::path::Path::new(&web_dir)))
+    // Une requête rejouée par le relais ou l'écoute directe n'atteint que les
+    // routes d'écoute : voir `garde_du_relais`. Sur TOUT le routeur, `/stream`
+    // et `/ws` compris, avant tout gestionnaire.
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::garde_du_relais::garde_du_relais,
+    ))
     .layer(axum::middleware::from_fn(zones::textes_signal::avec_langue))
     .layer(axum::middleware::from_fn(cache_control_middleware))
     .layer(axum::Extension(contexte_sendspin))
     .layer(CompressionLayer::new().compress_when(predicat_de_compression()))
-    .layer(CorsLayer::permissive())
+    // Contrôle d'origine (`crate::garde_origine`) : une page d'un autre site
+    // ne peut ni changer l'état du serveur, ni lire ses réponses. La couche
+    // CORS est la plus externe : elle répond seule aux préflights.
+    .layer(axum::middleware::from_fn(crate::garde_origine::garde))
+    .layer(crate::garde_origine::couche_cors())
 }
 
 #[cfg(test)]

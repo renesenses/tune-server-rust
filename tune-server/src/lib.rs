@@ -38,10 +38,13 @@ pub mod discovery_setup;
 pub mod dossiers_inscriptibles;
 /// Plancher de fils de travail du moteur tokio (fil 2124, #5677).
 pub mod fils_de_travail;
+/// Ce qu'une requête rejouée par le relais ou l'écoute directe peut atteindre.
+pub mod garde_du_relais;
 /// #7077 — garde : aucune phrase française dans les champs exposés de l'API.
 #[cfg(test)]
 mod garde_francais_api;
 /// Détecteur de gel de l'exécuteur et relevé automatique (#4924).
+pub mod garde_origine;
 pub mod gel_executeur;
 mod instance_existante;
 /// #6253 — `--sans-console` : relance sans fenêtre de terminal (Windows).
