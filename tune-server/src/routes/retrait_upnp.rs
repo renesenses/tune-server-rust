@@ -305,16 +305,24 @@ pub async fn retrait_de_la_bibliotheque(
     Query(confirmation): Query<Confirmation>,
 ) -> ApiResult {
     let _garde = state.upnp_index_lock.try_lock().map_err(|_| {
-        erreur(
+        (
             StatusCode::CONFLICT,
-            "Une indexation est en cours. Réessayez après sa fin.",
+            Json(crate::message_api::corps_refus(
+                "upnp_indexing_in_progress",
+                "api.upnp.indexingInProgress",
+                &[],
+            )),
         )
     })?;
     let vu = apercu(&state, &udn).map_err(interne)?;
     if vu.pistes == 0 && vu.albums == 0 && vu.sources == 0 {
-        return Err(erreur(
+        return Err((
             StatusCode::NOT_FOUND,
-            "Aucune piste de ce serveur dans la bibliothèque",
+            Json(crate::message_api::corps_refus(
+                "upnp_no_tracks_from_server",
+                "api.upnp.noTracksFromServer",
+                &[],
+            )),
         ));
     }
     match retirer(&state, &udn, confirmation.pistes) {

@@ -1754,6 +1754,9 @@ pub fn spawn_heartbeat(state: &AppState) {
         // connait.
         let server_id =
             tune_core::cloud::telemetry::TelemetryReporter::get_or_create_server_id(&settings);
+        // Ces identifiants ne sortent jamais dans un rapport ou un journal
+        // exporté : retenus dès qu'ils existent.
+        tune_core::confidentialite::retenir_identifiants_du_serveur(&settings);
 
         let hostname = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))

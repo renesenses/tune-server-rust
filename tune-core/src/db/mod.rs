@@ -102,6 +102,9 @@ mod filtre_dr_190_tests;
 mod lenteur_albums_4800_tests;
 #[cfg(test)]
 mod lenteur_pistes_5138_tests;
+/// #7535 — un MBID trouvé par le nom n'est plus posé s'il est déjà porté.
+#[cfg(test)]
+mod mbid_deja_porte_7535_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
 #[cfg(test)]
@@ -110,6 +113,10 @@ mod replieur_wal_tests;
 /// `listen_history.album_id`, preuves d'équivalence et de migration.
 #[cfg(test)]
 mod reprendre_l_ecoute_2130_tests;
+#[cfg(test)]
+mod tableau_de_bord_7634_tests;
+#[cfg(test)]
+mod top_titres_index_tests;
 pub mod upnp_revision;
 /// #5974 — un vidage qui échoue ne s'annonce plus réussi.
 #[cfg(test)]

@@ -28,7 +28,13 @@
 //!   le dernier groupe des identifiants UPnP (UDN `uuid:…`, USN, `udn:…`), où la
 //!   convention UPnP range la MAC de l'appareil (voir [`RE_IDENTIFIANT`]) ;
 //! - le nom de l'utilisateur local du système, là où il apparaît en toutes
-//!   lettres (nom de machine « MacBook-de-<nom> », nom de serveur…).
+//!   lettres (nom de machine « MacBook-de-<nom> », nom de serveur…) ;
+//! - les identifiants d'accès distant : `server_id`, `instance_id`,
+//!   identifiants de pont et de relais (par nom de clé), les adresses du pont
+//!   `bridge.mozaiklabs.fr/<…>` (chemin masqué), les paramètres `token=` en
+//!   requête comme en fragment, et partout où ils apparaissent en toutes
+//!   lettres les identifiants propres à CE serveur, retenus par
+//!   [`retenir_identifiants_du_serveur`].
 //!
 //! Ce qui reste, parce que c'est le diagnostic : versions, OS, modèles, type de
 //! serveur, adresses IP du réseau local, ports, compteurs.
@@ -36,7 +42,7 @@
 //! La fonction est idempotente : nettoyer deux fois ne change rien, ce qui
 //! permet de l'appliquer à chaque porte de sortie sans se soucier de l'ordre.
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, RwLock};
 
 use regex::{Captures, Regex};
 use serde_json::Value;
@@ -64,6 +70,32 @@ const FRAGMENTS_PERSONNELS: &[&str] = &[
     "signature",
 ];
 
+/// Clés dont la valeur ouvre ou désigne l'accès distant à un serveur :
+/// l'identifiant du serveur sur le pont et le site, et les en-têtes
+/// d'authentification. Masquées PARTOUT, mots du testeur compris.
+const FRAGMENTS_ACCES_DISTANT: &[&str] = &[
+    "server_id",
+    "serverid",
+    "server_uuid",
+    "instance_id",
+    "instanceid",
+    "bridge_id",
+    "relay_id",
+    "authorization",
+    "cookie",
+    "api-key",
+    "x-auth",
+];
+
+/// Cette clé ouvre-t-elle, ou désigne-t-elle, l'accès distant au serveur ?
+pub fn est_acces_distant(cle: &str) -> bool {
+    if crate::secrets::est_secret(cle) {
+        return true;
+    }
+    let cle = cle.to_ascii_lowercase();
+    FRAGMENTS_ACCES_DISTANT.iter().any(|f| cle.contains(f))
+}
+
 /// Noms exacts, trop courts pour être cherchés comme fragments.
 const NOMS_PERSONNELS: &[&str] = &[
     "sig",
@@ -81,7 +113,9 @@ pub fn est_personnel(cle: &str) -> bool {
         return true;
     }
     let cle = cle.to_ascii_lowercase();
-    NOMS_PERSONNELS.contains(&cle.as_str()) || FRAGMENTS_PERSONNELS.iter().any(|f| cle.contains(f))
+    est_acces_distant(&cle)
+        || NOMS_PERSONNELS.contains(&cle.as_str())
+        || FRAGMENTS_PERSONNELS.iter().any(|f| cle.contains(f))
 }
 
 fn re(motif: &str) -> Regex {
@@ -104,12 +138,63 @@ static RE_JWT: LazyLock<Regex> =
 static RE_PORTEUR: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{6,})"));
 
-/// Paramètres d'URL sensibles, quel que soit leur nom de clé ailleurs.
+/// Paramètres d'URL sensibles, quel que soit leur nom de clé ailleurs — en
+/// requête (`?`, `&`) comme en fragment (`#token=…`).
 static RE_PARAMETRE_URL: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"(?i)([?&](?:code|state|key|token|sig|hmac|auth|access_token|refresh_token|user_auth_token|app_secret|request_sig|password|session|identity)=)[^&\s#]+",
+        r"(?i)([?&#](?:code|state|key|token|sig|hmac|auth|access_token|refresh_token|user_auth_token|app_secret|request_sig|password|session|identity)=)[^&\s#]+",
     )
 });
+
+/// Adresse du pont : `bridge.mozaiklabs.fr/<identifiant>/…`. Le chemin désigne
+/// un serveur précis ; seul l'hôte reste.
+static RE_URL_PONT: LazyLock<Regex> = LazyLock::new(|| {
+    re(
+        r#"(?i)\b((?:[a-z0-9-]+\.)*(?:bridge|relay)[a-z0-9-]*\.mozaiklabs\.fr)(/[^\s"'<>()\[\]{},;]*)"#,
+    )
+});
+
+/// Chemins du pont qui ne désignent aucun serveur : gardés pour le diagnostic.
+const CHEMINS_PONT_PUBLICS: &[&str] = &["/", "/ws/server", "/ws/server/"];
+
+/// Réglages dont la valeur désigne CE serveur auprès du pont ou du site.
+pub const REGLAGES_IDENTIFIANTS_PRIVES: &[&str] = &["server_id", "instance_id", "bridge_token"];
+
+/// Identifiants propres à ce serveur, masqués partout où ils apparaissent.
+static IDENTIFIANTS_PRIVES: LazyLock<RwLock<Vec<String>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// Retient un identifiant à masquer dans tout ce qui sort. Une valeur de moins
+/// de huit caractères est ignorée : elle effacerait des mots du diagnostic.
+pub fn retenir_identifiant_prive(id: &str) {
+    let id = id.trim();
+    if id.chars().count() < 8 {
+        return;
+    }
+    if let Ok(mut liste) = IDENTIFIANTS_PRIVES.write()
+        && !liste.iter().any(|x| x.eq_ignore_ascii_case(id))
+    {
+        liste.push(id.to_string());
+    }
+}
+
+/// Retient les identifiants de ce serveur lus dans ses réglages
+/// ([`REGLAGES_IDENTIFIANTS_PRIVES`]). Appelé par chaque porte de sortie juste
+/// avant de nettoyer : un identifiant créé après le démarrage est couvert.
+pub fn retenir_identifiants_du_serveur(settings: &crate::db::settings_repo::SettingsRepo) {
+    for cle in REGLAGES_IDENTIFIANTS_PRIVES {
+        if let Ok(Some(valeur)) = settings.get(cle) {
+            retenir_identifiant_prive(&valeur);
+        }
+    }
+}
+
+fn identifiants_prives() -> Vec<String> {
+    IDENTIFIANTS_PRIVES
+        .read()
+        .map(|l| l.clone())
+        .unwrap_or_default()
+}
 
 /// `clé=valeur`, `clé: valeur`, `"clé":"valeur"`, `clé=Some("valeur")`. La
 /// clé est jugée par [`est_personnel`] dans la fermeture : une seule liste.
@@ -327,7 +412,38 @@ pub fn anonymiser(texte: &str) -> String {
 /// [`anonymiser`], le nom d'utilisateur local donné explicitement — pour les
 /// épreuves, qui ne doivent pas dépendre du compte qui les exécute.
 pub fn anonymiser_avec(texte: &str, utilisateur: Option<&str>) -> String {
-    let t = RE_URL_IDENTIFIANTS.replace_all(texte, format!("${{1}}{MASQUE}@"));
+    nettoyer(texte, utilisateur, &identifiants_prives())
+}
+
+/// Masque ce qui ouvre ou désigne l'accès distant à ce serveur, et RIEN
+/// d'autre : identifiants retenus de ce serveur, adresses du pont, jetons
+/// (paramètres d'URL, `Bearer`/`Basic`, JWT) et valeurs des clés
+/// [`est_acces_distant`].
+///
+/// C'est la porte commune de tout ce qui part vers le site : les mots du
+/// testeur (titre, description, sujet et corps d'un ticket) y passent seuls,
+/// le diagnostic y passe par [`anonymiser`], qui commence par elle.
+pub fn masquer_acces_distant(texte: &str) -> String {
+    acces_distant(texte, &identifiants_prives())
+}
+
+fn acces_distant(texte: &str, prives: &[String]) -> String {
+    // Les identifiants de ce serveur d'abord, en entier : une expression
+    // plus loin pourrait n'en masquer qu'une partie.
+    let mut texte = texte.to_string();
+    for id in prives {
+        if let Ok(re_id) = Regex::new(&format!("(?i){}", regex::escape(id))) {
+            texte = re_id.replace_all(&texte, MASQUE).into_owned();
+        }
+    }
+    let t = RE_URL_PONT.replace_all(&texte, |c: &Captures| {
+        if CHEMINS_PONT_PUBLICS.contains(&&c[2]) {
+            c[0].to_string()
+        } else {
+            format!("{}/{MASQUE}", &c[1])
+        }
+    });
+    let t = RE_URL_IDENTIFIANTS.replace_all(&t, format!("${{1}}{MASQUE}@"));
     let t = RE_JWT.replace_all(&t, MASQUE);
     let t = RE_PORTEUR.replace_all(&t, |c: &Captures| {
         let jeton = &c[2];
@@ -338,6 +454,20 @@ pub fn anonymiser_avec(texte: &str, utilisateur: Option<&str>) -> String {
         }
     });
     let t = RE_PARAMETRE_URL.replace_all(&t, format!("${{1}}{MASQUE}"));
+    RE_CLE_VALEUR
+        .replace_all(&t, |c: &Captures| {
+            if est_acces_distant(&c[1]) {
+                format!("{}{}{MASQUE}", &c[1], &c[2])
+            } else {
+                c[0].to_string()
+            }
+        })
+        .into_owned()
+}
+
+/// Le nettoyage complet, les identifiants de ce serveur donnés explicitement.
+fn nettoyer(texte: &str, utilisateur: Option<&str>, prives: &[String]) -> String {
+    let t = acces_distant(texte, prives);
     let t = RE_CLE_VALEUR.replace_all(&t, |c: &Captures| {
         if est_personnel(&c[1]) {
             format!("{}{}{MASQUE}", &c[1], &c[2])
@@ -696,5 +826,123 @@ mod tests {
             "{sortie}"
         );
         assert_eq!(anonymiser_champ("hors JSON a@b.fr"), "hors JSON <email>");
+    }
+
+    // Identifiants fabriqués pour l'épreuve, de la forme de ceux de Tune
+    // (UUID v4) : un UUID v4 quelconque reste intact, ceux-ci doivent partir.
+    const SID: &str = "3b9e1c4a-7f2d-4e8b-9a61-5c0d2e7f8a14";
+    const JETON: &str = "c81f0e27-4d5a-4b9c-8e13-2f6a7b9d0c55";
+    const INSTANCE: &str = "9d2a6f13-0b7e-4c48-a5f1-e3c8b2d4a690";
+
+    /// Un journal de la forme de ceux qui partent sur le forum : chaque ligne
+    /// est reprise d'un format réellement écrit par Tune.
+    fn journal_d_acces_distant() -> String {
+        [
+            format!("2026-10-30T14:02:11.123456Z  INFO tune_server::routes::cloud: bridge enabled server_id={SID}"),
+            format!("2026-10-30T14:02:12.004211Z  INFO tune_core::cloud::relay: relay_registered server_id=\"{SID}\" url=wss://bridge.mozaiklabs.fr/ws/server"),
+            format!("2026-10-30T14:02:13.551002Z DEBUG tune_server::background: heartbeat_sent instance_id={INSTANCE} tracks=1200 uptime_s=86400"),
+            format!(r#"{{"timestamp":"2026-10-30T14:02:14Z","level":"INFO","fields":{{"message":"relay.registered","server_id":"{SID}","bridge_token":"{JETON}"}}}}"#),
+            format!("Lien copié : https://bridge.mozaiklabs.fr/{SID}/#token={JETON}"),
+            format!("WARN multi_server_zones_proxy_failed url=https://bridge.mozaiklabs.fr/api/relay/{SID}/zones error=timeout"),
+            format!("GET /api/v1/stream/42?token={JETON} 200"),
+            "request headers: {\"x-api-key\": \"k1b2c3d4e5f6\", \"accept\": \"*/*\"}".to_string(),
+            "Proxy-Authorization: Basic dXNlcjpwYXNzd29yZDEyMw==".to_string(),
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn acces_distant_masque_dans_un_journal() {
+        let sortie = nettoyer(&journal_d_acces_distant(), None, &[]);
+        for fuite in [
+            SID,
+            JETON,
+            INSTANCE,
+            "k1b2c3d4e5f6",
+            "dXNlcjpwYXNzd29yZDEyMw",
+        ] {
+            assert!(
+                !sortie.contains(fuite),
+                "« {fuite} » sort encore :\n{sortie}"
+            );
+        }
+        for garde in [
+            "bridge enabled",
+            "relay_registered",
+            "wss://bridge.mozaiklabs.fr/ws/server",
+            "https://bridge.mozaiklabs.fr/",
+            "tracks=1200",
+            "multi_server_zones_proxy_failed",
+            "GET /api/v1/stream/42?token=",
+            "\"accept\": \"*/*\"",
+        ] {
+            assert!(sortie.contains(garde), "« {garde} » a disparu :\n{sortie}");
+        }
+        assert_eq!(nettoyer(&sortie, None, &[]), sortie, "non idempotent");
+    }
+
+    /// L'identifiant de CE serveur, retenu, part même écrit sans clé ; un
+    /// autre UUID aléatoire (une zone) reste lisible.
+    #[test]
+    fn identifiants_du_serveur_masques_partout() {
+        let zone = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let texte = format!(
+            "Serveur {} — zone {zone}\nlien {}",
+            SID.to_uppercase(),
+            JETON
+        );
+        let sortie = nettoyer(&texte, None, &[SID.to_string(), JETON.to_string()]);
+        assert!(!sortie.to_lowercase().contains(SID), "{sortie}");
+        assert!(!sortie.contains(JETON), "{sortie}");
+        assert!(sortie.contains(zone), "la zone a disparu : {sortie}");
+        // Sans l'identifiant retenu, un UUID v4 nu reste : c'est le registre
+        // qui le masque, pas une expression.
+        let sans = nettoyer(&texte, None, &[]);
+        assert!(sans.to_lowercase().contains(SID), "{sans}");
+    }
+
+    #[test]
+    fn identifiant_trop_court_ignore() {
+        retenir_identifiant_prive("abc");
+        assert!(!identifiants_prives().iter().any(|x| x == "abc"));
+    }
+
+    #[test]
+    fn acces_distant_masque_dans_une_fiche_json() {
+        let mut fiche = json!({
+            "cloud": { "server_id": SID, "relay_url": "wss://bridge.mozaiklabs.fr/ws/server",
+                       "access_url": format!("https://bridge.mozaiklabs.fr/{SID}/") },
+            "telemetry": { "instance_id": INSTANCE, "enabled": true },
+            "bridge_token": JETON,
+        });
+        anonymiser_json_avec(&mut fiche, None);
+        let texte = fiche.to_string();
+        for fuite in [SID, JETON, INSTANCE] {
+            assert!(!texte.contains(fuite), "« {fuite} » sort encore : {texte}");
+        }
+        assert_eq!(
+            fiche["cloud"]["relay_url"],
+            "wss://bridge.mozaiklabs.fr/ws/server"
+        );
+        assert_eq!(fiche["telemetry"]["enabled"], true);
+    }
+
+    /// Les mots du testeur : l'accès distant part, le reste de ses mots reste.
+    #[test]
+    fn mots_du_testeur_sans_acces_distant() {
+        let texte = format!(
+            "Depuis le travail, https://bridge.mozaiklabs.fr/{SID}/#token={JETON} ne répond plus. \
+             Mon adresse : moi@exemple.fr, musique dans /home/moi/Musique."
+        );
+        let sortie = acces_distant(&texte, &[]);
+        assert!(!sortie.contains(SID) && !sortie.contains(JETON), "{sortie}");
+        for garde in [
+            "Depuis le travail",
+            "ne répond plus",
+            "moi@exemple.fr",
+            "/home/moi/Musique",
+        ] {
+            assert!(sortie.contains(garde), "« {garde} » a disparu : {sortie}");
+        }
     }
 }

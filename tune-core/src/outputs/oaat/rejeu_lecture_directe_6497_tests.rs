@@ -67,6 +67,30 @@ pub(super) async fn faux_endpoint() -> u16 {
 /// Le même, qui annonce aussi le DSD natif (`DsdU8`, jusqu'au DSD512) quand
 /// `dsd` est vrai.
 pub(super) async fn faux_endpoint_avec(dsd: bool) -> u16 {
+    faux_endpoint_interne(dsd, None, vec![]).await
+}
+
+pub(super) type PaquetCapture = (oaat_core::wire::AudioPacketHeader, Vec<u8>);
+
+pub(super) async fn faux_endpoint_capturant(
+    dsd: bool,
+) -> (u16, tokio::sync::mpsc::UnboundedReceiver<PaquetCapture>) {
+    faux_endpoint_capturant_avec_preparation(dsd, vec![]).await
+}
+
+pub(super) async fn faux_endpoint_capturant_avec_preparation(
+    dsd: bool,
+    preparation: Vec<std::sync::Arc<tokio::sync::Notify>>,
+) -> (u16, tokio::sync::mpsc::UnboundedReceiver<PaquetCapture>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (faux_endpoint_interne(dsd, Some(tx), preparation).await, rx)
+}
+
+async fn faux_endpoint_interne(
+    dsd: bool,
+    capture: Option<tokio::sync::mpsc::UnboundedSender<PaquetCapture>>,
+    preparation: Vec<std::sync::Arc<tokio::sync::Notify>>,
+) -> u16 {
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let control_port = tcp.local_addr().unwrap().port();
     let audio_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -76,7 +100,17 @@ pub(super) async fn faux_endpoint_avec(dsd: bool) -> u16 {
 
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
-        while audio_udp.recv(&mut buf).await.is_ok() {}
+        while let Ok(n) = audio_udp.recv(&mut buf).await {
+            if let Some(tx) = &capture {
+                const TAILLE: usize = oaat_core::wire::AUDIO_HEADER_SIZE;
+                if n >= TAILLE {
+                    let raw: [u8; TAILLE] = buf[..TAILLE].try_into().unwrap();
+                    if let Ok(header) = oaat_core::wire::AudioPacketHeader::decode(&raw) {
+                        let _ = tx.send((header, buf[TAILLE..n].to_vec()));
+                    }
+                }
+            }
+        }
     });
     tokio::spawn(async move {
         let mut buf = [0u8; 64];
@@ -88,6 +122,7 @@ pub(super) async fn faux_endpoint_avec(dsd: bool) -> u16 {
     });
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = tcp.accept().await {
+            let preparation = preparation.clone();
             tokio::spawn(async move {
                 let mut codec = FrameCodec::new();
                 let mut lu = [0u8; 16384];
@@ -98,6 +133,7 @@ pub(super) async fn faux_endpoint_avec(dsd: bool) -> u16 {
                     };
                     codec.feed(&lu[..n]);
                     while let Ok(Some(msg)) = codec.decode_next() {
+                        let preparee = matches!(&msg, Message::NextTrackPrepare(_));
                         let reponse = match msg {
                             Message::Hello(_) => Some(Message::HelloAck(HelloAck {
                                 protocol_version: oaat_core::PROTOCOL_VERSION,
@@ -134,10 +170,20 @@ pub(super) async fn faux_endpoint_avec(dsd: bool) -> u16 {
                                     stream_id: fp.stream_id,
                                 }))
                             }
+                            Message::NextTrackPrepare(next) => {
+                                Some(Message::NextTrackReady(NextTrackReady {
+                                    stream_id: next.stream_id,
+                                }))
+                            }
                             _ => None,
                         };
                         if let Some(r) = reponse {
                             let _ = stream.write_all(&FrameCodec::encode(&r)).await;
+                            if preparee {
+                                for signal in &preparation {
+                                    signal.notify_one();
+                                }
+                            }
                         }
                     }
                 }

@@ -47,7 +47,11 @@ pub fn parse_m3u_content(raw: &[u8], force_utf8: bool) -> Vec<M3UEntry> {
     parse_text(&text)
 }
 
-fn decode(raw: &[u8], force_utf8: bool) -> String {
+/// Décodage d'un fichier de playlist : BOM UTF-8 retiré, repli Latin-1 si
+/// les octets ne sont pas de l'UTF-8 (sauf `force_utf8`). Partagé avec
+/// l'import au scan (`playlist_scan`, #7503) pour que les deux chemins lisent
+/// un même fichier de la même façon.
+pub(crate) fn decode(raw: &[u8], force_utf8: bool) -> String {
     if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return String::from_utf8_lossy(&raw[3..]).into_owned();
     }

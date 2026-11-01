@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PUBLIC = {
     "bandcamp", "concerts", "pont-roon", "cd", "circle", "entree-audio",
     "assistant-ia", "equalizer", "crossfeed", "converter", "declick",
-    "channel-remap", "party", "playlists-converter",
+    "channel-remap", "party", "playlists-converter", "collection-physique", "mon-theme",
 }
 
 

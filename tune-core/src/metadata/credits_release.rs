@@ -1025,14 +1025,23 @@ mod tests {
             debut.elapsed()
         );
 
-        // Et par les sources : les pochettes utilisent CETTE clé, et cette
-        // passe n'a ni `sleep` ni limiteur à elle.
+        // Et les pochettes : depuis #7667, leurs requêtes MusicBrainz passent
+        // par la porte `images_rapides` (plus d'`acquire` en ligne dans
+        // `artwork.rs`). Le contrat déménage avec elles : la porte de
+        // l'hôte MusicBrainz est CE limiteur sous CETTE clé, et `artwork.rs`
+        // n'interroge MusicBrainz que par elle.
+        let (limiteur, cle) = crate::library::images_rapides::Hote::MusicBrainz.limiteur();
+        assert!(
+            std::ptr::eq(limiteur, &*crate::http::fetch::MUSICBRAINZ)
+                && cle == CLE_LIMITEUR_MUSICBRAINZ,
+            "les pochettes ont changé de limiteur ou de clé : la passe des crédits ne partage plus leur créneau"
+        );
         let pochettes = include_str!("../library/artwork.rs");
         assert!(
-            pochettes.contains(&format!(
-                "MUSICBRAINZ.acquire(\"{CLE_LIMITEUR_MUSICBRAINZ}\")"
-            )),
-            "les pochettes ont changé de clé : la passe des crédits ne partage plus leur créneau"
+            pochettes.contains("images_rapides::json(")
+                && !pochettes.contains("MUSICBRAINZ.acquire(")
+                && !pochettes.contains("RateLimiter::"),
+            "les pochettes interrogent MusicBrainz hors de la porte partagée"
         );
         let ici = include_str!("credits_release.rs");
         let corps = &ici[..ici.find("#[cfg(test)]").unwrap()];

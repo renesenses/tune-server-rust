@@ -287,10 +287,17 @@ pub(super) async fn get_config(
     headers: axum::http::HeaderMap,
     profile: ActiveProfile,
     State(state): State<AppState>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let lang = crate::i18n::lang_from_header(&headers);
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let all = settings.all().unwrap_or_default();
+    // A failed snapshot is not an empty settings table: serving defaults here
+    // made persisted choices look reset, despite a successful earlier write.
+    // #7307 — l'erreur était jetée sans trace : le rapport d'un testeur dont
+    // les choix « reviennent au défaut » ne pouvait pas en porter la cause.
+    let all = settings.all().map_err(|e| {
+        tracing::error!(erreur = %e, "reglages_illisibles");
+        AppError::service_unavailable("Server settings are temporarily unavailable")
+    })?;
     let mut config = serde_json::Map::new();
     config.insert(
         tune_core::db::listening_resume::REWIND_KEY.into(),
@@ -511,6 +518,13 @@ pub(super) async fn get_config(
         // limitent. Vide par défaut : toute la bibliothèque.
         (
             tune_core::taches_de_fond::perimetre::CLE_DOSSIERS_INCLUS,
+            json!([]),
+        ),
+        // #7538 — les dossiers que l'enrichissement des métadonnées ne touche
+        // pas (communautaire, MusicBrainz, réparations de genre). Vide par
+        // défaut : rien d'exclu.
+        (
+            tune_core::taches_de_fond::perimetre::CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT,
             json!([]),
         ),
         // #6198 — les genres de la passe CLAP : retenus (vide : tous) et
@@ -983,7 +997,7 @@ pub(super) async fn get_config(
     // vit désormais dans `tune_core::secrets`, qui classe sur le NOM et couvre
     // donc aussi le réglage ajouté demain.
     tune_core::secrets::caviarder_carte(&mut config);
-    Json(Value::Object(config))
+    Ok(Json(Value::Object(config)))
 }
 
 /// Les trois plafonds de l'indexation UPnP tels que la PROCHAINE passe les
@@ -1467,11 +1481,19 @@ fn normaliser_perimetre_des_analyses(
 /// que les racines exclues (tableau de chaînes, rognées, sans vide ni
 /// doublon, `null` = vide), refusée en 400 sinon. Ils ne touchent pas
 /// ReplayGain : aucune campagne à refermer.
+///
+/// #7538 — les dossiers exclus de l'enrichissement suivent la même forme et
+/// ne touchent pas davantage ReplayGain.
 fn normaliser_genres_du_clap(values: &mut serde_json::Map<String, Value>) -> Result<(), AppError> {
     use tune_core::taches_de_fond::perimetre::{
-        CLE_GENRES_CLAP_EXCLUS, CLE_GENRES_CLAP_INCLUS, normaliser,
+        CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT, CLE_GENRES_CLAP_EXCLUS, CLE_GENRES_CLAP_INCLUS,
+        normaliser,
     };
-    for cle in [CLE_GENRES_CLAP_INCLUS, CLE_GENRES_CLAP_EXCLUS] {
+    for cle in [
+        CLE_GENRES_CLAP_INCLUS,
+        CLE_GENRES_CLAP_EXCLUS,
+        CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT,
+    ] {
         let Some(brut) = values.get(cle) else {
             continue;
         };
@@ -1728,6 +1750,70 @@ fn prendre_reponse_ecoutes(
     }
 }
 
+/// L'authentification est-elle ACTIVE ? Seul ce cas rend `RequireAdmin`
+/// effectif (un jeton admin valide a été exigé) ; désactivée, la garde laisse
+/// passer tout appelant.
+pub(super) fn authentification_admin_effective(state: &AppState) -> bool {
+    SettingsRepo::with_backend(state.backend.clone())
+        .get("auth_enabled")
+        .ok()
+        .flatten()
+        .is_some_and(|v| v == "true")
+}
+
+/// `403` qui nomme les clés protégées d'une écriture générique, ou `None`
+/// quand l'écriture peut avoir lieu (aucune clé protégée, ou admin effectif).
+pub(super) fn refus_des_cles_protegees<'a>(
+    state: &AppState,
+    cles: impl IntoIterator<Item = &'a str>,
+) -> Option<axum::response::Response> {
+    let refusees = tune_core::reglages_proteges::cles_protegees(cles);
+    if refusees.is_empty() || authentification_admin_effective(state) {
+        return None;
+    }
+    tracing::warn!(cles = %refusees.join(","), "reglages_proteges_refuses");
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "protected_settings",
+                "message": "These settings can only be changed by an authenticated administrator.",
+                "refused_keys": refusees,
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// Retire d'un import les clés protégées quand l'admin n'est pas effectif, et
+/// rend les avertissements à joindre à la réponse.
+pub(super) fn ecarter_les_cles_protegees<T>(
+    state: &AppState,
+    reglages: &mut Vec<(String, T)>,
+) -> Vec<String> {
+    if authentification_admin_effective(state) {
+        return Vec::new();
+    }
+    let mut avertissements = Vec::new();
+    reglages.retain(|(cle, _)| {
+        if tune_core::reglages_proteges::est_protege(cle) {
+            avertissements.push(format!(
+                "setting '{cle}' is protected (authenticated administrator required); skipped"
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    if !avertissements.is_empty() {
+        tracing::warn!(
+            nombre = avertissements.len(),
+            "import_reglages_proteges_ecartes"
+        );
+    }
+    avertissements
+}
+
 fn touche_le_replaygain(cles_posees: &[String]) -> bool {
     cles_posees.iter().any(|c| c.starts_with("replaygain_"))
 }
@@ -1739,6 +1825,14 @@ pub(super) async fn update_config(
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut values = body.0;
+    // Les clés qui changent qui contrôle le serveur, ce qu'il exécute ou à
+    // qui il parle (`tune_core::reglages_proteges`) ne passent par cette route
+    // qu'avec une authentification admin EFFECTIVE. Authentification
+    // désactivée, `RequireAdmin` laisse passer tout appelant : ces clés-là sont
+    // alors refusées, en bloc, avant toute écriture.
+    if let Some(refus) = refus_des_cles_protegees(&state, values.keys().map(String::as_str)) {
+        return Ok(refus);
+    }
     if let Some(value) = values.get(tune_core::db::listening_resume::REWIND_KEY) {
         if value.as_u64().is_none_or(|n| n > 300) {
             return Err(AppError::bad_request(
@@ -2795,8 +2889,12 @@ pub(super) async fn import_config(
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
     use tune_core::config_export as ce;
-    let fichier = ce::lire(body).map_err(AppError::bad_request)?;
-    let plan = ce::planifier(&state.backend, &fichier).map_err(AppError::internal)?;
+    let mut fichier = ce::lire(body).map_err(AppError::bad_request)?;
+    // Mêmes clés protégées que `PATCH /system/config` : sans admin effectif,
+    // elles sont écartées de l'import et nommées dans `warnings`.
+    let ecartees = ecarter_les_cles_protegees(&state, &mut fichier.settings);
+    let mut plan = ce::planifier(&state.backend, &fichier).map_err(AppError::internal)?;
+    plan.avertissements.extend(ecartees.iter().cloned());
     let mut reponse = ce::rapport(&plan);
     if q.dry_run {
         reponse["dry_run"] = json!(true);
@@ -2819,7 +2917,13 @@ pub(super) async fn import_config(
     reponse["imported"] = json!(bilan.reglages_ecrits);
     reponse["zones_added"] = json!(bilan.zones_creees.len());
     reponse["zones_modified"] = json!(bilan.zones_modifiees.len());
-    reponse["warnings"] = json!(bilan.avertissements);
+    let mut avertissements = bilan.avertissements.clone();
+    for a in ecartees {
+        if !avertissements.contains(&a) {
+            avertissements.push(a);
+        }
+    }
+    reponse["warnings"] = json!(avertissements);
     Ok(Json(reponse))
 }
 
@@ -5577,6 +5681,7 @@ mod replaygain_source_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0
     }
 
@@ -5638,6 +5743,7 @@ mod replaygain_source_tests {
 
         let c = get_config(h, ActiveProfile(DEFAULT_PROFILE_ID), State(state.clone()))
             .await
+            .unwrap_or_else(|_| panic!("configuration illisible"))
             .0;
         assert_eq!(c["replaygain_source"]["mode"], "tags_then_analysis");
         assert_eq!(c["replaygain_source"]["label"], "File tags, then analysis");
@@ -5895,6 +6001,7 @@ mod ui_preferences_par_profil_tests {
     async fn lire(state: &AppState, pid: i64) -> Option<String> {
         get_config(HeaderMap::new(), ActiveProfile(pid), State(state.clone()))
             .await
+            .unwrap_or_else(|_| panic!("configuration illisible"))
             .0
             .get(UI_PREFERENCES)
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -5999,6 +6106,7 @@ mod ui_preferences_par_profil_tests {
 
         let vu = get_config(HeaderMap::new(), ActiveProfile(FILS), State(state.clone()))
             .await
+            .unwrap_or_else(|_| panic!("configuration illisible"))
             .0;
         let brut = serde_json::to_string(&vu).unwrap();
         assert!(
@@ -6104,6 +6212,7 @@ mod vitesse_des_analyses_5519_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_REGLAGE], "normal", "{c}");
         let largeurs = &c["background_analysis_speed_widths"];
@@ -6166,6 +6275,7 @@ mod levee_du_bridage_6713_tests {
                     State(state),
                 )
                 .await
+                .unwrap_or_else(|_| panic!("configuration illisible"))
                 .0
             }
         };
@@ -6241,6 +6351,7 @@ mod rappel_audit_integrite_6286_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_RAPPEL_JOURS], json!(0), "{c}");
         assert_eq!(rappel_jours(&state.backend), 0);
@@ -6311,6 +6422,7 @@ mod mesures_communautaires_5594_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_RECEPTION], false, "{c}");
         assert_eq!(c[CLE_CONTRIBUTION], false, "{c}");
@@ -6361,6 +6473,7 @@ mod politique_de_lecture_4681_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_REGLAGE]["enabled"], true, "{c}");
 
@@ -6399,6 +6512,7 @@ mod politique_de_lecture_4681_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_REGLAGE]["scan_width"], 3, "{c}");
         politique::regler(DEFAUT);
@@ -6455,6 +6569,7 @@ mod genres_du_clap_6198_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_GENRES_CLAP_INCLUS], json!([]), "{c}");
         assert_eq!(c[CLE_GENRES_CLAP_EXCLUS], json!([]), "{c}");
@@ -6477,6 +6592,7 @@ mod genres_du_clap_6198_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(
             c[CLE_GENRES_CLAP_INCLUS],
@@ -6525,6 +6641,7 @@ mod perimetre_des_analyses_5593_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0
     }
 
@@ -6630,9 +6747,238 @@ mod perimetre_des_analyses_5593_tests {
 }
 
 #[cfg(test)]
+mod instantane_reglages_7343_tests {
+    use super::*;
+    use axum::response::Response;
+
+    async fn lire(state: &AppState) -> Response {
+        get_config(
+            axum::http::HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .into_response()
+    }
+
+    async fn corps(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn une_lecture_impossible_ne_renvoie_pas_les_defauts_en_succes() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings
+            .set(tune_core::metadata::ecriture_fichiers::CLE, "true")
+            .unwrap();
+        settings
+            .set(
+                tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED,
+                "true",
+            )
+            .unwrap();
+        // Deterministic read failure, confined to this test's temporary database.
+        state
+            .sqlite()
+            .unwrap()
+            .execute_batch("DROP TABLE settings")
+            .unwrap();
+        let response = lire(&state).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "une base illisible ne doit pas passer pour des réglages absents"
+        );
+        let value = corps(response).await;
+        assert_eq!(value["code"], "service_unavailable");
+        assert!(
+            value
+                .get(tune_core::metadata::ecriture_fichiers::CLE)
+                .is_none()
+        );
+        assert!(
+            value
+                .get(tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED)
+                .is_none()
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Journal {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #7307 — le 503 de #7343 sans trace laissait le rapport muet sur la
+    /// cause : l'erreur de lecture doit être journalisée, avec son message.
+    #[tokio::test]
+    async fn une_lecture_impossible_laisse_sa_cause_au_journal() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .sqlite()
+            .unwrap()
+            .execute_batch("DROP TABLE settings")
+            .unwrap();
+        let journal = Journal::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(journal.clone())
+            .finish();
+        let response = {
+            let _garde = tracing::subscriber::set_default(subscriber);
+            lire(&state).await
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let journal = String::from_utf8(journal.0.lock().unwrap().clone()).unwrap();
+        let ligne = journal
+            .lines()
+            .find(|l| l.contains("reglages_illisibles"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "un échec de lecture des réglages doit laisser `reglages_illisibles` \
+                     au journal (#7307) ; journal : {journal:?}"
+                )
+            });
+        assert!(
+            ligne.contains("settings"),
+            "la ligne doit porter l'erreur SQLite : {ligne:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn une_base_lisible_sans_preferences_garde_les_defauts() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let response = lire(&state).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = corps(response).await;
+        assert_eq!(value[tune_core::metadata::ecriture_fichiers::CLE], false);
+        assert_eq!(
+            value[tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn des_choix_persistes_restent_lus_apres_reouverture_de_la_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.sqlite");
+        {
+            let state = AppState::new(path.to_str().unwrap(), 0, Default::default()).unwrap();
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            settings
+                .set(tune_core::metadata::ecriture_fichiers::CLE, "true")
+                .unwrap();
+            settings
+                .set(
+                    tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED,
+                    "true",
+                )
+                .unwrap();
+        }
+        let reopened = AppState::new(path.to_str().unwrap(), 0, Default::default()).unwrap();
+        let response = lire(&reopened).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = corps(response).await;
+        assert_eq!(value[tune_core::metadata::ecriture_fichiers::CLE], true);
+        assert_eq!(
+            value[tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED],
+            true
+        );
+    }
+}
+
+#[cfg(test)]
 #[path = "config/volume_6774_tests.rs"]
 mod volume_6774_tests;
 
 #[cfg(test)]
 #[path = "racines_preservees_6175_tests.rs"]
 mod racines_preservees_6175_tests;
+
+/// #7538 — les dossiers exclus de l'enrichissement : publiés vides,
+/// normalisés comme les autres listes du périmètre, refusés sous une autre
+/// forme, et relus par le moteur tels qu'écrits.
+#[cfg(test)]
+mod dossiers_exclus_de_l_enrichissement_7538_tests {
+    use super::{get_config, normaliser_genres_du_clap};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::taches_de_fond::perimetre::{
+        CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT, dossiers_exclus_de_l_enrichissement,
+    };
+
+    async fn config(state: &AppState) -> Value {
+        get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
+        .0
+    }
+
+    #[tokio::test]
+    async fn publies_vides_normalises_puis_relus_7538() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        assert_eq!(
+            config(&state).await[CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT],
+            json!([])
+        );
+        let mut v: serde_json::Map<String, Value> =
+            json!({ CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT: [" /music/Jazz ", "", "/music/Jazz"] })
+                .as_object()
+                .unwrap()
+                .clone();
+        assert!(normaliser_genres_du_clap(&mut v).is_ok());
+        assert_eq!(
+            v[CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT],
+            json!(["/music/Jazz"])
+        );
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        for (k, val) in v {
+            settings.set(&k, &val.to_string()).unwrap();
+        }
+        assert_eq!(
+            config(&state).await[CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT],
+            json!(["/music/Jazz"])
+        );
+        assert_eq!(
+            dossiers_exclus_de_l_enrichissement(&state.backend),
+            vec!["/music/Jazz"]
+        );
+        for mauvais in [json!("/music/Jazz"), json!(4), json!([1]), json!({})] {
+            let mut m: serde_json::Map<String, Value> =
+                json!({ CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT: mauvais.clone() })
+                    .as_object()
+                    .unwrap()
+                    .clone();
+            assert!(normaliser_genres_du_clap(&mut m).is_err(), "{mauvais}");
+        }
+    }
+}

@@ -59,10 +59,15 @@ pub enum CloudScope {
     CommunityMeasuresWrite,
     /// `GET /api/v1/community/measures` : lecture d'un seau (#5594).
     CommunityMeasuresRead,
+    /// `POST /api/v1/community/label-logos/lookup` : les logos de labels
+    /// partagés, en lot (#7414).
+    CommunityLabelLogosRead,
+    /// `POST /api/v1/community/label-logos` : la proposition d'un logo (#7414).
+    CommunityLabelLogosWrite,
 }
 
 impl CloudScope {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 23] = [
         Self::Telemetry,
         Self::InstanceHeartbeat,
         Self::BiosWrite,
@@ -84,6 +89,8 @@ impl CloudScope {
         Self::CommunityListenCountsRead,
         Self::CommunityMeasuresWrite,
         Self::CommunityMeasuresRead,
+        Self::CommunityLabelLogosRead,
+        Self::CommunityLabelLogosWrite,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -109,6 +116,8 @@ impl CloudScope {
             Self::CommunityListenCountsRead => "community_listen_counts_read",
             Self::CommunityMeasuresWrite => "community_measures_write",
             Self::CommunityMeasuresRead => "community_measures_read",
+            Self::CommunityLabelLogosRead => "community_label_logos_read",
+            Self::CommunityLabelLogosWrite => "community_label_logos_write",
         }
     }
 

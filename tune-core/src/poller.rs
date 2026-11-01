@@ -1095,6 +1095,8 @@ mod radio;
 mod titre_radio_didl_2991;
 
 mod fin_de_piste;
+// #6932 — la zone navigateur dont la piste est finie enchaîne sans son lecteur.
+mod fin_navigateur_6932;
 /// #4382 — un `Next` acquitté que le transport déclare ignoré.
 mod next_ignore_4382;
 pub(crate) mod refus_de_piste;
@@ -1559,6 +1561,9 @@ mod annonce_du_contrat_de_signal_4559;
 /// et rejoue les deux coupures du journal, plus la contre-garde.
 #[cfg(test)]
 mod arret_dementi_par_la_position_6717;
+
+#[cfg(test)]
+mod position_en_fin_openhome_6718;
 
 #[cfg(test)]
 mod cohabitation_airplay_tests_7259;

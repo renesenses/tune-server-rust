@@ -50,7 +50,8 @@
 //! Wikimedia partagé, une clé par site. Discogs sans jeton :
 //! [`LIMITEUR_DISCOGS_SANS_JETON`], une requête toutes les 2,5 s. Sites
 //! officiels : [`LIMITEUR_SITES`], une par seconde et par hôte. La passe reste
-//! celle de l'index : paresseuse, bornée à `PASSE_MAX` labels.
+//! celle de l'index : paresseuse, un label après l'autre, par tranches de
+//! `PASSE_MAX` labels (#7414).
 //!
 //! # Garde réseau
 //!
@@ -256,7 +257,7 @@ pub struct Transport {
 }
 
 /// Sous quel limiteur part une requête.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Limite<'a> {
     MusicBrainz,
     Wikimedia(&'static str),
@@ -497,7 +498,7 @@ pub fn fichier_commons(url: &str) -> Option<String> {
         chemin
             .strip_prefix("wiki/File:")
             .or_else(|| chemin.strip_prefix("wiki/Fichier:"))?
-    } else if hote == "upload.wikimedia.org" && chemin.starts_with("wikipedia/commons/") {
+    } else if hote_wikimedia(hote) && chemin.starts_with("wikipedia/commons/") {
         // Une vignette : `…/thumb/a/ab/X.svg/250px-X.svg.png` → `X.svg`.
         let parties: Vec<&str> = chemin.split('/').collect();
         if parties.get(2) == Some(&"thumb") {
@@ -665,6 +666,54 @@ pub fn licence_libre(identifiant: &str, nom_court: &str) -> bool {
         || (id.is_empty() && (court == "public domain" || court == "cc0"))
 }
 
+/// Les hôtes d'images de Wikimedia : les originaux (`upload.`) et, depuis
+/// l'automne 2026, les vignettes redimensionnées (`thumb.`) — celles de tous
+/// les logos SVG (#7414).
+pub fn hote_wikimedia(hote: &str) -> bool {
+    hote == "upload.wikimedia.org" || hote == "thumb.wikimedia.org"
+}
+
+/// Une adresse d'image Wikimedia acceptée, rendue stable : en `https`, sur
+/// [`hote_wikimedia`], sous `/wikipedia/`, sans les paramètres de suivi
+/// `utm_*` que l'API ajoute. Toute autre adresse : `None`.
+pub fn adresse_wikimedia(url: &str) -> Option<String> {
+    let mut u = reqwest::Url::parse(url).ok()?;
+    if u.scheme() != "https"
+        || !u.host_str().is_some_and(hote_wikimedia)
+        || u.port().is_some()
+        || !u.username().is_empty()
+        || u.password().is_some()
+        || !u.path().starts_with("/wikipedia/")
+    {
+        return None;
+    }
+    let gardes: Vec<(String, String)> = u
+        .query_pairs()
+        .filter(|(k, _)| !k.starts_with("utm_"))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if gardes.is_empty() {
+        u.set_query(None);
+    } else {
+        u.query_pairs_mut().clear().extend_pairs(gardes);
+    }
+    u.set_fragment(None);
+    Some(u.to_string())
+}
+
+/// Le limiteur du téléchargement d'une image, d'après son hôte : les deux
+/// hôtes d'images de Wikimedia partagent le limiteur de Commons (et le
+/// client partagé), pas celui des sites.
+fn limite_de_l_image(hote: &str) -> Limite<'_> {
+    if hote_wikimedia(hote) {
+        Limite::Wikimedia(CLE_COMMONS)
+    } else if hote.ends_with("discogs.com") {
+        Limite::Discogs
+    } else {
+        Limite::Site(hote)
+    }
+}
+
 /// Une vignette que le cache des pochettes sait servir (pas de GIF ni de
 /// SVG brut).
 fn vignette_servable(url: &str) -> bool {
@@ -703,14 +752,15 @@ pub fn attribution_du_fichier(
     if exiger_libre && !libre {
         return None;
     }
-    let vignette = info["thumburl"]
-        .as_str()
-        .filter(|u| {
-            u.starts_with("https://upload.wikimedia.org/")
-                || prefixe_essai.iter().any(|p| u.starts_with(p))
-        })
-        .filter(|u| vignette_servable(u))?
-        .to_string();
+    let brute = info["thumburl"].as_str()?;
+    let vignette = if prefixe_essai.iter().any(|p| brute.starts_with(p)) {
+        brute.to_string()
+    } else {
+        adresse_wikimedia(brute)?
+    };
+    if !vignette_servable(&vignette) {
+        return None;
+    }
     let fichier = page["title"]
         .as_str()?
         .trim_start_matches("File:")
@@ -1260,13 +1310,7 @@ impl CatalogueDeLabels for CatalogueLogosWeb {
             .ok()
             .and_then(|u| u.host_str().map(String::from))
             .unwrap_or_default();
-        let limite = if hote == "upload.wikimedia.org" {
-            Limite::Wikimedia(CLE_COMMONS)
-        } else if hote.ends_with("discogs.com") {
-            Limite::Discogs
-        } else {
-            Limite::Site(&hote)
-        };
+        let limite = limite_de_l_image(&hote);
         let client = match limite {
             Limite::Site(_) => self
                 .transport
@@ -1628,6 +1672,90 @@ mod tests {
         );
         assert!(
             commons(&json!({"query": {"pages": [{"title": "File:X", "missing": true}]}})).is_none()
+        );
+    }
+
+    /// Réponse `imageinfo` RÉELLE de Commons (01/11/2026) pour
+    /// `File:Blue Note Records.svg`, demandée avec les paramètres de
+    /// `imageinfo` : la vignette est en `thumb.wikimedia.org`, avec `utm_*`.
+    const IMAGEINFO_BLUE_NOTE: &str =
+        include_str!("../../tests/fixtures/wikimedia/imageinfo_blue_note_records_svg_7414.json");
+
+    #[test]
+    fn un_logo_svg_servi_par_thumb_wikimedia_est_retenu_7414() {
+        let reponse: Value = serde_json::from_str(IMAGEINFO_BLUE_NOTE).expect("fixture JSON");
+        let brute = reponse["query"]["pages"][0]["imageinfo"][0]["thumburl"]
+            .as_str()
+            .unwrap();
+        assert!(
+            brute.starts_with("https://thumb.wikimedia.org/") && brute.contains("utm_source="),
+            "la fixture est bien celle du défaut : {brute}"
+        );
+        let attendue = "https://thumb.wikimedia.org/wikipedia/commons/thumb/a/a5/\
+                        Blue_Note_Records.svg/250px-Blue_Note_Records.svg.png";
+        let (vignette, a) = commons(&reponse).expect("Commons retient le logo SVG de Blue Note");
+        assert_eq!(vignette, attendue, "adresse stable, sans utm_*");
+        assert_eq!(a.statut_licence, StatutDeLicence::Libre);
+        assert_eq!(a.fichier.as_deref(), Some("Blue Note Records.svg"));
+        assert_eq!(
+            a.source_url,
+            "https://commons.wikimedia.org/wiki/File:Blue_Note_Records.svg"
+        );
+        // La même image par l'article de Wikipédia.
+        let (vignette_wp, _) =
+            attribution_du_fichier(&reponse, SourceDuLogo::Wikipedia, false, ESSAI)
+                .expect("Wikipédia retient aussi le logo");
+        assert_eq!(vignette_wp, attendue);
+        // Et le nom du fichier Commons se lit aussi sur cet hôte.
+        assert_eq!(
+            fichier_commons(brute).as_deref(),
+            Some("Blue Note Records.svg")
+        );
+    }
+
+    #[test]
+    fn seules_les_adresses_d_images_wikimedia_sont_acceptees_et_stabilisees_7414() {
+        assert_eq!(
+            adresse_wikimedia(
+                "https://upload.wikimedia.org/wikipedia/commons/4/4b/Logo.png?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=thumbnail_unscaled"
+            )
+            .as_deref(),
+            Some("https://upload.wikimedia.org/wikipedia/commons/4/4b/Logo.png")
+        );
+        assert_eq!(
+            adresse_wikimedia("https://thumb.wikimedia.org/wikipedia/en/thumb/e/ec/E.svg/250px-E.svg.png?a=1&utm_x=2")
+                .as_deref(),
+            Some("https://thumb.wikimedia.org/wikipedia/en/thumb/e/ec/E.svg/250px-E.svg.png?a=1"),
+            "un paramètre autre que utm_* est gardé"
+        );
+        for refusee in [
+            "http://thumb.wikimedia.org/wikipedia/commons/a/b/X.png",
+            "https://thumb.wikimedia.org.exemple.org/wikipedia/commons/a/b/X.png",
+            "https://thumb.wikimedia.org:8443/wikipedia/commons/a/b/X.png",
+            "https://u@thumb.wikimedia.org/wikipedia/commons/a/b/X.png",
+            "https://thumb.wikimedia.org/autre/X.png",
+            "https://maps.wikimedia.org/wikipedia/commons/a/b/X.png",
+            "https://exemple.org/wikipedia/commons/a/b/X.png",
+            "pas une adresse",
+        ] {
+            assert_eq!(adresse_wikimedia(refusee), None, "{refusee}");
+        }
+    }
+
+    #[test]
+    fn les_images_wikimedia_passent_par_le_limiteur_de_commons_7414() {
+        assert_eq!(
+            limite_de_l_image("thumb.wikimedia.org"),
+            Limite::Wikimedia(CLE_COMMONS)
+        );
+        assert_eq!(
+            limite_de_l_image("upload.wikimedia.org"),
+            Limite::Wikimedia(CLE_COMMONS)
+        );
+        assert_eq!(limite_de_l_image("img.discogs.com"), Limite::Discogs);
+        assert_eq!(
+            limite_de_l_image("www.bluenote.com"),
+            Limite::Site("www.bluenote.com")
         );
     }
 

@@ -29,10 +29,11 @@ fn appareil_de_la_zone(state: &AppState, id: i64) -> Result<String, axum::respon
     if zone.output_type.as_deref() != Some("dlna") {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "not_a_dlna_renderer",
-                "message": "La compatibilité de commande ne concerne que les zones DLNA.",
-            })),
+            Json(crate::message_api::corps_refus(
+                "not_a_dlna_renderer",
+                "api.zones.compatibilityDlnaOnly",
+                &[],
+            )),
         )
             .into_response());
     }

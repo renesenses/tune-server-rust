@@ -366,10 +366,12 @@ async fn lms_joignable_sans_platine_explique_le_refus_de_decouverte() {
     assert_eq!(body["discovered"], 0);
     let message = body["error"].as_str().unwrap();
     assert!(
-        message.contains("répond")
-            && message.contains("aucune platine")
-            && message.contains("HQPlayer")
+        message.contains("answers")
+            && message.contains("no player")
+            && message.contains("HQPlayer"),
+        "#7077 : phrase traduite (anglais sans Accept-Language) : {body}"
     );
+    assert_eq!(body["diagnostic"]["message_key"], "api.squeezebox.noPlayer");
 }
 
 #[tokio::test]

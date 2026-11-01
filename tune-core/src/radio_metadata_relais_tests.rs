@@ -165,6 +165,72 @@ async fn le_relais_rend_le_titre_et_un_relais_inactif_se_met_en_pause() {
     assert!(!relais_en_pause(&base));
 }
 
+/// Relais qui répond 500 aux `echecs` premières lectures, puis le titre.
+async fn relais_qui_echoue_puis_repond(echecs: usize) -> String {
+    let compte = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        "/now-playing",
+        axum::routing::get(move || {
+            let compte = compte.clone();
+            async move {
+                let n = compte.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < echecs {
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({})))
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({"active": true, "items": {"fip": {"mode": "song", "title": "T", "artist": "A"}}})),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("port local");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    format!("http://127.0.0.1:{port}/now-playing")
+}
+
+/// #7010 : une lecture isolée en échec ne suspend pas le relais dix minutes ;
+/// la suivante est tentée tout de suite et redonne le titre.
+#[tokio::test]
+async fn une_lecture_isolee_en_echec_ne_met_pas_le_relais_en_pause() {
+    let base = relais_qui_echoue_puis_repond(1).await;
+    assert!(titre_par_le_relais(&base, "fip").await.is_none());
+    assert!(
+        !relais_en_pause(&base),
+        "un échec isolé ne doit pas suspendre le relais"
+    );
+    let m = titre_par_le_relais(&base, "fip")
+        .await
+        .expect("la lecture suivante doit être tentée et réussir");
+    assert_eq!(m.title.as_str(), "T");
+}
+
+/// Des échecs de suite restent une vraie panne : la pause est posée, et un
+/// succès intercalé remet le compte à zéro.
+#[tokio::test]
+async fn des_echecs_de_suite_mettent_le_relais_en_pause() {
+    let base = relais_qui_echoue_puis_repond(ECHECS_AVANT_PAUSE as usize).await;
+    for _ in 0..ECHECS_AVANT_PAUSE {
+        assert!(!relais_en_pause(&base));
+        assert!(titre_par_le_relais(&base, "fip").await.is_none());
+    }
+    assert!(relais_en_pause(&base), "le relais doit être en pause");
+
+    let base2 = relais_qui_echoue_puis_repond(0).await;
+    assert!(titre_par_le_relais(&base2, "fip").await.is_some());
+    noter_panne(&base2, true, false);
+    noter_panne(&base2, true, false);
+    noter_panne(&base2, false, false);
+    noter_panne(&base2, true, false);
+    assert!(!relais_en_pause(&base2), "un succès remet le compte à zéro");
+}
+
 #[test]
 fn seule_une_zone_servie_par_le_relais_passe_a_sa_cadence() {
     let zone = 6_516_001;

@@ -24,8 +24,9 @@
 //!
 //! La résolution est **paresseuse et bornée** : la liste des labels n'attend
 //! jamais Qobuz ; elle rend ce que l'index sait déjà, et lance au plus UNE
-//! passe à la fois ([`CacheLogosLabels::reserver_passe`]), d'au plus
-//! [`PASSE_MAX`] labels, un label après l'autre, avec une pause entre deux.
+//! passe à la fois ([`CacheLogosLabels::reserver_passe`]), un label après
+//! l'autre, avec une pause entre deux, par tranches de [`PASSE_MAX`] (#7414 :
+//! la passe prend tous les labels à demander, en arrière-plan).
 //! Un label sans correspondance n'est pas redemandé avant
 //! [`DELAI_ABSENT_S`] ; une erreur (réseau, refus) pas avant
 //! [`DELAI_ERREUR_S`].
@@ -42,6 +43,19 @@
 //! « absent » chez Qobuz ne bloque pas le web, et inversement. Ses entrées
 //! gardent le MBID du label (`mb_label_id`) et l'[`Attribution`] du logo
 //! (source, licence connue), que la liste des labels expose.
+//!
+//! # #7414 — le partage communautaire
+//!
+//! Avant toute recherche sur le web, la passe demande d'abord au site
+//! (mozaiklabs.fr), en UN appel pour tous les labels à demander, les logos
+//! que d'autres serveurs ont déjà trouvés ([`LogosPartages`],
+//! [`CacheLogosLabels::combler_depuis_le_partage`]) : un logo rendu est
+//! inscrit aussitôt, marqué [`EntreeLogo::communaute`], et le web n'est pas
+//! interrogé pour ce label. Un site muet ou en panne ne bloque rien : la
+//! passe continue sur le web. Dans l'autre sens, un logo trouvé ici (web,
+//! avec son attribution) est proposé au site si l'utilisateur a donné son
+//! consentement communautaire ([`CacheLogosLabels::a_proposer`]) ; un logo
+//! reçu du partage n'y repart jamais.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -54,7 +68,9 @@ use serde::{Deserialize, Serialize};
 /// Le nom de l'index, dans le dossier du cache des pochettes.
 pub const FICHIER_INDEX: &str = "logos_labels.json";
 
-/// Au plus tant de labels résolus par passe.
+/// La taille d'une tranche de passe. Depuis #7414, une passe prend tous les
+/// labels à demander, tranche par tranche (voir `tune-server`,
+/// `routes::library::labels::lancer_passe`).
 pub const PASSE_MAX: usize = 8;
 
 /// Un label sans correspondance (ou sans image) n'est pas redemandé avant
@@ -151,6 +167,70 @@ pub trait CatalogueDeLabels: Send + Sync {
     async fn telecharger_image(&self, url: &str) -> Result<Vec<u8>, String>;
 }
 
+/// #7414 — un label demandé au partage communautaire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelAConsulter {
+    pub nom: String,
+    pub mb_label_id: Option<String>,
+    pub qobuz_label_id: Option<String>,
+}
+
+/// #7414 — un logo que le partage communautaire connaît.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogoPartage {
+    /// Le nom DEMANDÉ, tel qu'envoyé.
+    pub nom: String,
+    pub image_url: String,
+    pub mb_label_id: Option<String>,
+    pub attribution: Attribution,
+}
+
+/// #7414 — un logo trouvé ici, à proposer au partage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropositionDeLogo {
+    pub nom: String,
+    pub mb_label_id: Option<String>,
+    pub qobuz_label_id: Option<String>,
+    pub attribution: Attribution,
+    pub octets: Vec<u8>,
+    pub ext: &'static str,
+}
+
+/// Le verdict d'une proposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposeAuPartage {
+    /// Reçue, ou refusée pour de bon (image refusée, champ invalide) : ne
+    /// pas la reproposer.
+    Traitee,
+    /// Le site n'a pas répondu, ou demande d'attendre : la reproposer plus
+    /// tard, et arrêter les propositions de cette passe.
+    Plus,
+}
+
+/// #7414 — le partage communautaire des logos de labels (mozaiklabs.fr).
+/// Les essais le remplacent par un faux.
+#[async_trait::async_trait]
+pub trait LogosPartages: Send + Sync {
+    /// Les logos connus parmi `labels`, en UN appel. `Err` : le site n'a pas
+    /// répondu ; la passe continue sans lui.
+    async fn consulter(&self, labels: &[LabelAConsulter]) -> Result<Vec<LogoPartage>, String>;
+
+    /// Les octets d'une image du partage.
+    async fn telecharger(&self, url: &str) -> Result<Vec<u8>, String>;
+
+    /// L'utilisateur a-t-il consenti au partage communautaire ?
+    fn peut_proposer(&self) -> bool;
+
+    /// Propose un logo trouvé ici.
+    async fn proposer(&self, proposition: &PropositionDeLogo) -> ProposeAuPartage;
+}
+
+/// Au plus tant de labels par appel au partage (le site en accepte 500).
+pub const PARTAGE_LOT_MAX: usize = 500;
+
+/// Au plus tant de propositions par passe (le site en accepte 60 par heure).
+pub const PROPOSITIONS_PAR_PASSE: usize = 20;
+
 /// Ce que l'index sait d'un label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -180,6 +260,14 @@ pub struct EntreeLogo {
     pub image: Option<String>,
     /// Secondes depuis l'époque Unix.
     pub verifie_le: u64,
+    /// #7414 — ce logo vient du partage communautaire (mozaiklabs.fr) : il
+    /// n'y repart jamais.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub communaute: bool,
+    /// #7414 — ce logo a déjà été proposé au partage (accepté ou refusé pour
+    /// de bon) : il n'est pas reproposé.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partage: bool,
 }
 
 /// La clé d'index d'un nom de label : espaces resserrés, minuscules. Deux
@@ -265,6 +353,8 @@ impl CacheLogosLabels {
             attribution: None,
             image,
             verifie_le,
+            communaute: false,
+            partage: false,
         }
     }
 
@@ -390,7 +480,11 @@ impl CacheLogosLabels {
                 .await
             {
                 Err(e) => {
-                    tracing::debug!(label = %demande.nom, erreur = %e, "logo_label_erreur");
+                    // En `info` : la cause (code HTTP, panne réseau) doit se
+                    // lire dans le journal ; la requête des adresses est
+                    // masquée, elle peut porter un jeton (#7414).
+                    let cause = crate::orchestrator::sentinelle_streaming::masquer_les_requetes(&e);
+                    tracing::info!(label = %demande.nom, cause = %cause, "logo_label_erreur");
                     let id = precedent.as_ref().and_then(|p| self.id_de(p));
                     self.avec_id(Self::entree_nue(Statut::Erreur, None, maintenant()), id)
                 }
@@ -426,19 +520,118 @@ impl CacheLogosLabels {
         trouves
     }
 
+    /// #7414 — demande au partage, en UN appel par tranche de
+    /// [`PARTAGE_LOT_MAX`], les logos de `labels`, et inscrit aussitôt chaque
+    /// logo rendu (marqué [`EntreeLogo::communaute`]), avec `pause` entre
+    /// deux téléchargements. Rend les clés des labels comblés. Un site muet
+    /// ou une image refusée ne coûtent rien : le label reste à demander au
+    /// web, et rien n'est inscrit en erreur.
+    pub async fn combler_depuis_le_partage(
+        &self,
+        partage: &dyn LogosPartages,
+        labels: &[LabelAConsulter],
+        maintenant: impl Fn() -> u64,
+        pause: Duration,
+    ) -> std::collections::HashSet<String> {
+        let mut combles = std::collections::HashSet::new();
+        let mut telecharges = 0usize;
+        for lot in labels.chunks(PARTAGE_LOT_MAX) {
+            let rendus = match partage.consulter(lot).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(erreur = %e, "logo_label_partage_muet");
+                    break;
+                }
+            };
+            for logo in rendus {
+                let cle = cle_de_label(&logo.nom);
+                if cle.is_empty()
+                    || combles.contains(&cle)
+                    || !lot.iter().any(|l| cle_de_label(&l.nom) == cle)
+                {
+                    continue;
+                }
+                if telecharges > 0 && !pause.is_zero() {
+                    tokio::time::sleep(pause).await;
+                }
+                telecharges += 1;
+                let condensat = match partage.telecharger(&logo.image_url).await {
+                    Ok(octets) => self.mettre_octets_en_cache(&octets),
+                    Err(e) => Err(e),
+                };
+                let condensat = match condensat {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(label = %logo.nom, erreur = %e, "logo_label_partage_image_refusee");
+                        continue;
+                    }
+                };
+                let mut entree = self.avec_id(
+                    Self::entree_nue(Statut::Trouve, Some(condensat), maintenant()),
+                    logo.mb_label_id.clone(),
+                );
+                entree.attribution = Some(logo.attribution.clone());
+                entree.communaute = true;
+                self.inscrire(&logo.nom, entree);
+                combles.insert(cle);
+            }
+        }
+        combles
+    }
+
+    /// #7414 — les logos de cet index à proposer au partage, au plus `max` :
+    /// trouvés ici (pas reçus du partage), avec leur attribution, pas encore
+    /// proposés, et dont le fichier est encore en cache. Rend le nom de
+    /// l'index (sa clé), l'entrée, les octets et l'extension.
+    pub fn a_proposer(&self, max: usize) -> Vec<(String, EntreeLogo, Vec<u8>, &'static str)> {
+        let candidats: Vec<(String, EntreeLogo)> = self
+            .entrees()
+            .iter()
+            .filter(|(_, e)| {
+                e.statut == Statut::Trouve && e.attribution.is_some() && !e.communaute && !e.partage
+            })
+            .map(|(k, e)| (k.clone(), e.clone()))
+            .collect();
+        candidats
+            .into_iter()
+            .filter_map(|(cle, e)| {
+                // `find_cached` rend le type MIME servi, pas l'extension :
+                // l'extension se relit sur les octets.
+                let (chemin, _mime) =
+                    crate::library::artwork::find_cached(&self.dossier, e.image.as_deref()?)?;
+                let octets = std::fs::read(chemin).ok()?;
+                let ext = crate::library::artwork::sniff_image_ext(&octets)?;
+                (octets.len() <= TAILLE_MAX_IMAGE).then_some((cle, e, octets, ext))
+            })
+            .take(max)
+            .collect()
+    }
+
+    /// #7414 — note qu'un logo a été proposé au partage.
+    pub fn marquer_partage(&self, nom: &str) {
+        if let Some(mut e) = self.entree(nom) {
+            e.partage = true;
+            self.inscrire(nom, e);
+        }
+    }
+
+    fn mettre_octets_en_cache(&self, octets: &[u8]) -> Result<String, String> {
+        if octets.len() > TAILLE_MAX_IMAGE {
+            return Err(format!("image trop lourde ({} octets)", octets.len()));
+        }
+        let ext = crate::library::artwork::sniff_image_ext(octets)
+            .ok_or_else(|| String::from("ce n'est pas une image servable"))?;
+        crate::library::artwork::cache_fetched_image(octets, &self.dossier, ext)
+            .ok_or_else(|| String::from("écriture du cache impossible"))
+    }
+
     async fn mettre_en_cache(
         &self,
         catalogue: &dyn CatalogueDeLabels,
         url: &str,
     ) -> Result<String, String> {
         let octets = catalogue.telecharger_image(url).await?;
-        if octets.len() > TAILLE_MAX_IMAGE {
-            return Err(format!("image trop lourde ({} octets)", octets.len()));
-        }
-        let ext = crate::library::artwork::sniff_image_ext(&octets)
-            .ok_or_else(|| String::from("ce n'est pas une image servable"))?;
-        crate::library::artwork::cache_fetched_image(&octets, &self.dossier, ext)
-            .ok_or_else(|| String::from("écriture du cache impossible"))
+        self.mettre_octets_en_cache(&octets)
     }
 }
 
@@ -711,5 +904,196 @@ mod tests {
             .await;
         assert_eq!(cache.entree("X").unwrap().statut, Statut::Erreur);
         assert_eq!(cache.image("X"), None);
+    }
+
+    // ── #7414 : le partage communautaire ───────────────────────────────
+
+    fn attribution_commons() -> Attribution {
+        Attribution {
+            source: SourceDuLogo::Commons,
+            statut_licence: StatutDeLicence::Libre,
+            fournisseur: "Wikimedia Commons".into(),
+            licence: Some("Public domain".into()),
+            licence_url: None,
+            auteur: None,
+            source_url: "https://commons.wikimedia.org/wiki/File:ECM.png".into(),
+            fichier: None,
+            douteux: false,
+        }
+    }
+
+    /// Un faux partage : il connaît « ECM Records », compte ses appels, et
+    /// peut être muet.
+    #[derive(Default)]
+    struct FauxPartage {
+        consultations: Mutex<Vec<usize>>,
+        telechargements: AtomicUsize,
+        muet: AtomicBool,
+        image: Mutex<Option<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LogosPartages for FauxPartage {
+        async fn consulter(&self, labels: &[LabelAConsulter]) -> Result<Vec<LogoPartage>, String> {
+            self.consultations.lock().unwrap().push(labels.len());
+            if self.muet.load(Ordering::SeqCst) {
+                return Err("délai dépassé".into());
+            }
+            Ok(labels
+                .iter()
+                .filter(|l| noms_concordent(&l.nom, "ECM Records"))
+                .map(|l| LogoPartage {
+                    nom: l.nom.clone(),
+                    image_url: "https://mozaiklabs.fr/api/v1/community/label-logos/1/ab".into(),
+                    mb_label_id: Some("5a584032".into()),
+                    attribution: attribution_commons(),
+                })
+                .collect())
+        }
+        async fn telecharger(&self, _url: &str) -> Result<Vec<u8>, String> {
+            self.telechargements.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .image
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| PNG.to_vec()))
+        }
+        fn peut_proposer(&self) -> bool {
+            true
+        }
+        async fn proposer(&self, _p: &PropositionDeLogo) -> ProposeAuPartage {
+            ProposeAuPartage::Traitee
+        }
+    }
+
+    fn a_consulter(nom: &str) -> LabelAConsulter {
+        LabelAConsulter {
+            nom: nom.into(),
+            mb_label_id: None,
+            qobuz_label_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn le_partage_comble_en_un_appel_et_inscrit_aussitot() {
+        let dossier = crate::test_scratch::scratch_dir("logos-labels-partage");
+        let cache = CacheLogosLabels::ouvrir_index(dossier.path(), "logos_labels_web.json");
+        let partage = FauxPartage::default();
+        let labels: Vec<LabelAConsulter> = ["ECM Records", "Warp", "Verve"]
+            .into_iter()
+            .map(a_consulter)
+            .collect();
+
+        let combles = cache
+            .combler_depuis_le_partage(&partage, &labels, || 1_000, Duration::ZERO)
+            .await;
+
+        assert_eq!(*partage.consultations.lock().unwrap(), vec![3], "UN appel");
+        assert_eq!(combles.len(), 1);
+        assert!(combles.contains("ecm records"));
+        let entree = cache.entree("ecm records").expect("inscrit");
+        assert_eq!(entree.statut, Statut::Trouve);
+        assert!(entree.communaute, "marqué reçu du partage");
+        assert_eq!(entree.mb_label_id.as_deref(), Some("5a584032"));
+        assert_eq!(entree.attribution, Some(attribution_commons()));
+        assert!(
+            cache.image("ECM Records").is_some(),
+            "servable tout de suite"
+        );
+        // Les autres restent à demander au web.
+        let restants = cache.a_resoudre(
+            &[
+                Demande {
+                    nom: "Warp".into(),
+                    album_du_catalogue: None,
+                },
+                Demande {
+                    nom: "ECM Records".into(),
+                    album_du_catalogue: None,
+                },
+            ],
+            1_001,
+            PASSE_MAX,
+        );
+        assert_eq!(restants.len(), 1);
+        assert_eq!(restants[0].nom, "Warp");
+        // Un logo reçu du partage n'y repart jamais.
+        assert!(cache.a_proposer(PROPOSITIONS_PAR_PASSE).is_empty());
+    }
+
+    #[tokio::test]
+    async fn un_partage_muet_n_inscrit_rien_et_ne_bloque_pas() {
+        let dossier = crate::test_scratch::scratch_dir("logos-labels-partage-muet");
+        let cache = CacheLogosLabels::ouvrir_index(dossier.path(), "logos_labels_web.json");
+        let partage = FauxPartage::default();
+        partage.muet.store(true, Ordering::SeqCst);
+
+        let combles = cache
+            .combler_depuis_le_partage(
+                &partage,
+                &[a_consulter("ECM Records")],
+                || 1,
+                Duration::ZERO,
+            )
+            .await;
+
+        assert!(combles.is_empty());
+        assert_eq!(
+            cache.entree("ECM Records"),
+            None,
+            "ni absent ni erreur : le web le demandera"
+        );
+    }
+
+    #[tokio::test]
+    async fn une_image_du_partage_qui_n_en_est_pas_une_est_ignoree() {
+        let dossier = crate::test_scratch::scratch_dir("logos-labels-partage-menteur");
+        let cache = CacheLogosLabels::ouvrir_index(dossier.path(), "logos_labels_web.json");
+        let partage = FauxPartage::default();
+        *partage.image.lock().unwrap() = Some(b"<html>non</html>".to_vec());
+
+        let combles = cache
+            .combler_depuis_le_partage(
+                &partage,
+                &[a_consulter("ECM Records")],
+                || 1,
+                Duration::ZERO,
+            )
+            .await;
+
+        assert!(combles.is_empty());
+        assert_eq!(cache.entree("ECM Records"), None);
+    }
+
+    #[test]
+    fn les_logos_trouves_ici_sont_a_proposer_une_seule_fois() {
+        let dossier = crate::test_scratch::scratch_dir("logos-labels-a-proposer");
+        let cache = CacheLogosLabels::ouvrir_index(dossier.path(), "logos_labels_web.json");
+        let condensat =
+            crate::library::artwork::cache_fetched_image(PNG, dossier.path(), "png").unwrap();
+        let mut trouve = CacheLogosLabels::entree_nue(Statut::Trouve, Some(condensat.clone()), 1);
+        trouve.attribution = Some(attribution_commons());
+        cache.inscrire("ECM Records", trouve.clone());
+        // Sans attribution (Qobuz) ou reçu du partage : jamais proposé.
+        cache.inscrire(
+            "Sans attribution",
+            CacheLogosLabels::entree_nue(Statut::Trouve, Some(condensat.clone()), 1),
+        );
+        let mut recu = trouve.clone();
+        recu.communaute = true;
+        cache.inscrire("Reçu", recu);
+
+        let a = cache.a_proposer(PROPOSITIONS_PAR_PASSE);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].0, "ecm records");
+        assert_eq!(a[0].2, PNG);
+        assert_eq!(a[0].3, "png");
+
+        cache.marquer_partage("ECM Records");
+        assert!(cache.a_proposer(PROPOSITIONS_PAR_PASSE).is_empty());
+        // Et la marque survit à un redémarrage.
+        let relu = CacheLogosLabels::ouvrir_index(dossier.path(), "logos_labels_web.json");
+        assert!(relu.a_proposer(PROPOSITIONS_PAR_PASSE).is_empty());
     }
 }
