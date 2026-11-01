@@ -65,7 +65,10 @@ impl LogResponse {
                 acc / cnt.max(1) as f64
             })
             .collect();
-        LogResponse { freqs: self.freqs.clone(), magnitude_db: mags }
+        LogResponse {
+            freqs: self.freqs.clone(),
+            magnitude_db: mags,
+        }
     }
 
     /// Valeur moyenne (dB) entre deux fréquences.
@@ -142,7 +145,12 @@ pub fn frequency_response(segment: &[f64], sample_rate: u32, nfft: usize) -> Fre
     let freqs: Vec<f64> = (0..spec.len()).map(|i| i as f64 * df).collect();
     let magnitude_db: Vec<f64> = spec.iter().map(|c| fft::to_db(c.norm())).collect();
     let phase_rad: Vec<f64> = spec.iter().map(|c| c.arg()).collect();
-    FrequencyResponse { freqs, magnitude_db, phase_rad, complex: spec }
+    FrequencyResponse {
+        freqs,
+        magnitude_db,
+        phase_rad,
+        complex: spec,
+    }
 }
 
 /// Lissage en fraction d'octave (1/N) : moyenne des dB sur [f·2^(−1/2N), f·2^(1/2N)].
@@ -179,8 +187,14 @@ pub fn smooth_fractional_octave(fr: &FrequencyResponse, n: usize) -> Vec<f64> {
 
 /// Rééchantillonne une réponse lissée (grille linéaire) sur une grille log.
 pub fn to_log_grid(freqs: &[f64], magnitude_db: &[f64], grid: &[f64]) -> LogResponse {
-    let mags = grid.iter().map(|f| interp_log(freqs, magnitude_db, *f)).collect();
-    LogResponse { freqs: grid.to_vec(), magnitude_db: mags }
+    let mags = grid
+        .iter()
+        .map(|f| interp_log(freqs, magnitude_db, *f))
+        .collect();
+    LogResponse {
+        freqs: grid.to_vec(),
+        magnitude_db: mags,
+    }
 }
 
 /// Enchaîne fenêtrage → FFT → lissage 1/N → grille log. Fenêtre gauche de
@@ -206,7 +220,12 @@ pub fn difference_db(left: &LogResponse, right: &LogResponse) -> LogResponse {
     assert_eq!(left.freqs.len(), right.freqs.len());
     LogResponse {
         freqs: left.freqs.clone(),
-        magnitude_db: left.magnitude_db.iter().zip(&right.magnitude_db).map(|(a, b)| a - b).collect(),
+        magnitude_db: left
+            .magnitude_db
+            .iter()
+            .zip(&right.magnitude_db)
+            .map(|(a, b)| a - b)
+            .collect(),
     }
 }
 
@@ -226,7 +245,10 @@ pub fn spatial_average(responses: &[LogResponse], weights: &[f64], power: bool) 
         acc /= wsum;
         out[i] = if power { 10.0 * acc.log10() } else { acc };
     }
-    LogResponse { freqs: responses[0].freqs.clone(), magnitude_db: out }
+    LogResponse {
+        freqs: responses[0].freqs.clone(),
+        magnitude_db: out,
+    }
 }
 
 /// Résultat du temps de réverbération d'une bande.
@@ -284,7 +306,9 @@ pub fn schroeder_decay_db(h: &[f64]) -> Vec<f64> {
         e[i] = acc;
     }
     let e0 = e[0].max(1e-30);
-    e.iter().map(|v| 10.0 * (v / e0).max(1e-30).log10()).collect()
+    e.iter()
+        .map(|v| 10.0 * (v / e0).max(1e-30).log10())
+        .collect()
 }
 
 /// Régression linéaire de la courbe `decay_db` entre deux niveaux (dB,
@@ -292,7 +316,9 @@ pub fn schroeder_decay_db(h: &[f64]) -> Vec<f64> {
 fn decay_time(decay_db: &[f64], sample_rate: u32, from_db: f64, to_db: f64) -> f64 {
     let i0 = decay_db.iter().position(|v| *v <= from_db);
     let i1 = decay_db.iter().position(|v| *v <= to_db);
-    let (Some(i0), Some(i1)) = (i0, i1) else { return f64::NAN };
+    let (Some(i0), Some(i1)) = (i0, i1) else {
+        return f64::NAN;
+    };
     if i1 <= i0 + 2 {
         return f64::NAN;
     }
@@ -316,7 +342,11 @@ fn decay_time(decay_db: &[f64], sample_rate: u32, from_db: f64, to_db: f64) -> f
 
 /// RT60 (EDT, T20, T30) par bande d'octave ou de tiers d'octave.
 /// `centers` : fréquences centrales ; `bandwidth_octaves` : 1.0 ou 1/3.
-pub fn rt60_by_band(ir: &ImpulseResponse, centers: &[f64], bandwidth_octaves: f64) -> Vec<BandRt60> {
+pub fn rt60_by_band(
+    ir: &ImpulseResponse,
+    centers: &[f64],
+    bandwidth_octaves: f64,
+) -> Vec<BandRt60> {
     // On part un peu avant l'arrivée directe pour inclure le pré-écho du filtrage.
     let fs = ir.sample_rate as f64;
     let start = ir.peak_index.saturating_sub((0.005 * fs) as usize);
@@ -327,7 +357,11 @@ pub fn rt60_by_band(ir: &ImpulseResponse, centers: &[f64], bandwidth_octaves: f6
         .map(|&fc| {
             let band = bandpass_zero_phase(h, ir.sample_rate, fc / half, fc * half);
             let decay = schroeder_decay_db(&band);
-            let dynamic = -decay.iter().cloned().fold(0.0f64, |m, v| if v.is_finite() { m.min(v) } else { m });
+            let dynamic =
+                -decay
+                    .iter()
+                    .cloned()
+                    .fold(0.0f64, |m, v| if v.is_finite() { m.min(v) } else { m });
             BandRt60 {
                 center_hz: fc,
                 edt_s: decay_time(&decay, ir.sample_rate, 0.0, -10.0),
@@ -340,8 +374,9 @@ pub fn rt60_by_band(ir: &ImpulseResponse, centers: &[f64], bandwidth_octaves: f6
 }
 
 /// Fréquences centrales d'octave normalisées (CEI 61260) de 31,5 Hz à 16 kHz.
-pub const OCTAVE_CENTERS: [f64; 10] =
-    [31.5, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
+pub const OCTAVE_CENTERS: [f64; 10] = [
+    31.5, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+];
 
 /// Cascade (CSD / « waterfall ») : spectres successifs de fenêtres glissantes
 /// de durée `window_ms` dont le début avance de `step_ms`, sur `slices` tranches.
@@ -386,12 +421,20 @@ pub fn waterfall(
         let sm = smooth_fractional_octave(&fr, 6);
         let lr = to_log_grid(&fr.freqs, &sm, grid);
         if s == 0 {
-            reference = lr.magnitude_db.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            reference = lr
+                .magnitude_db
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
         }
         times.push(s as f64 * step_ms);
         mags.push(lr.magnitude_db.iter().map(|m| m - reference).collect());
     }
-    Waterfall { times_ms: times, freqs: grid.to_vec(), magnitudes_db: mags }
+    Waterfall {
+        times_ms: times,
+        freqs: grid.to_vec(),
+        magnitudes_db: mags,
+    }
 }
 
 #[cfg(test)]

@@ -11,7 +11,12 @@
 use crate::analysis::LogResponse;
 
 /// Export d'une réponse (grille quelconque) au format texte REW.
-pub fn export_measurement_txt(name: &str, freqs: &[f64], spl_db: &[f64], phase_deg: Option<&[f64]>) -> String {
+pub fn export_measurement_txt(
+    name: &str,
+    freqs: &[f64],
+    spl_db: &[f64],
+    phase_deg: Option<&[f64]>,
+) -> String {
     let mut s = format!("* Measurement data measured by Tune calibration (#7632)\n* Name: {name}\n* Freq(Hz) SPL(dB) Phase(degrees)\n");
     for (i, (f, m)) in freqs.iter().zip(spl_db).enumerate() {
         let ph = phase_deg.map(|p| p[i]).unwrap_or(0.0);
@@ -42,7 +47,10 @@ pub fn import_measurement_txt(text: &str) -> Option<LogResponse> {
     if freqs.len() < 2 {
         return None;
     }
-    Some(LogResponse { freqs, magnitude_db: mags })
+    Some(LogResponse {
+        freqs,
+        magnitude_db: mags,
+    })
 }
 
 /// Écrit un WAV RIFF flottant 32 bits, `channels` canaux entrelacés.
@@ -101,7 +109,10 @@ pub fn wav_read(bytes: &[u8]) -> Result<(u32, u16, Vec<f64>), String> {
     }
     let data = data.ok_or("bloc data absent")?;
     let samples: Vec<f64> = match (fmt_tag, bits) {
-        (1, 16) => data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0).collect(),
+        (1, 16) => data
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0)
+            .collect(),
         (1, 24) => data
             .chunks_exact(3)
             .map(|c| (i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8) as f64 / 8_388_608.0)
@@ -110,8 +121,14 @@ pub fn wav_read(bytes: &[u8]) -> Result<(u32, u16, Vec<f64>), String> {
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as f64 / 2_147_483_648.0)
             .collect(),
-        (3, 32) => data.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap()) as f64).collect(),
-        (3, 64) => data.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect(),
+        (3, 32) => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as f64)
+            .collect(),
+        (3, 64) => data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect(),
         _ => return Err(format!("format WAV non géré : tag {fmt_tag}, {bits} bits")),
     };
     Ok((rate, channels, samples))

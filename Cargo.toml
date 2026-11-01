@@ -10,12 +10,12 @@
 # lit cette liste — dont la garde `cargo test`, qui restait verte pendant que
 # ses SEPT essais n'etaient executes par aucune porte. Le rendre explicite ne
 # change rien pour cargo ; ca rend l'inventaire vrai.
-members = ["tune-core", "tune-http-types", "tune-output-api", "tune-server", "tune-smart-http", "tune-stream-http", "tune-streaming-http", "tune-cli", "tune-ffi", "tune-bridge", "tune-laissez-passer", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp", "plugins/tune-concerts", "plugins/tune-pont-roon", "plugins/tune-cd", "plugins/tune-entree-audio", "plugins/tune-playlists-converter", "plugins/tune-circle", "plugins/tune-assistant-ia", "plugins/tune-mon-theme", "plugins/tune-aes67"]
+members = ["tune-core", "tune-http-types", "tune-output-api", "tune-server", "tune-smart-http", "tune-stream-http", "tune-streaming-http", "tune-cli", "tune-ffi", "tune-bridge", "tune-laissez-passer", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp", "plugins/tune-concerts", "plugins/tune-pont-roon", "plugins/tune-cd", "plugins/tune-entree-audio", "plugins/tune-playlists-converter", "plugins/tune-circle", "plugins/tune-assistant-ia", "plugins/tune-mon-theme", "plugins/tune-aes67", "tune-calibration", "plugins/tune-calibration"]
 # tune-desktop and tune-widget are Tauri apps, each with its own workspace and
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI
 # (cargo fmt --all, tests, clippy) or its build matrix.
-exclude = ["tune-desktop", "tune-widget", "vendor/rust_cast", "vendor/rubato", "vendor/ape-decoder", "vendor/cpal", "vendor/asio-sys", "tools/moissonneur-roon", "tools/p2p-mesure", "tools/tune-calibration", "sdk"]
+exclude = ["tune-desktop", "tune-widget", "vendor/rust_cast", "vendor/rubato", "vendor/ape-decoder", "vendor/cpal", "vendor/asio-sys", "tools/moissonneur-roon", "tools/p2p-mesure", "sdk"]
 resolver = "2"
 
 [workspace.package]

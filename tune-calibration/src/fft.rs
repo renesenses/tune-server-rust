@@ -33,7 +33,11 @@ pub fn irfft(spectrum: &[Complex<f64>], nfft: usize) -> Vec<f64> {
     let mut planner = RealFftPlanner::<f64>::new();
     let c2r = planner.plan_fft_inverse(nfft);
     let mut input = spectrum.to_vec();
-    assert_eq!(input.len(), nfft / 2 + 1, "irfft : nombre de bins incohérent");
+    assert_eq!(
+        input.len(),
+        nfft / 2 + 1,
+        "irfft : nombre de bins incohérent"
+    );
     // Les parties imaginaires de DC et de Nyquist n'ont pas de sens pour un
     // signal réel ; on les force à zéro avant la transformée.
     input[0].im = 0.0;
@@ -129,7 +133,9 @@ mod tests {
 
     #[test]
     fn intercorrelation_retrouve_un_retard() {
-        let marker: Vec<f64> = (0..200).map(|i| ((i * 37 % 11) as f64 - 5.0) / 5.0).collect();
+        let marker: Vec<f64> = (0..200)
+            .map(|i| ((i * 37 % 11) as f64 - 5.0) / 5.0)
+            .collect();
         let delay = 1234;
         let mut x = vec![0.0; 5000];
         x[delay..delay + marker.len()].copy_from_slice(&marker);

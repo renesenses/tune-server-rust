@@ -64,35 +64,53 @@ impl LevelPolicy {
         let clipped = probe.captured_peak_dbfs >= -0.1;
         if clipped {
             return LevelDecision::Refuse {
-                reason: "écrêtage à la capture : baisser le gain du micro ou éloigner le micro".into(),
+                reason: "écrêtage à la capture : baisser le gain du micro ou éloigner le micro"
+                    .into(),
                 best_play_dbfs: probe.played_dbfs - self.step_db,
             };
         }
         if probe.snr_db >= self.target_snr_db {
-            return LevelDecision::Accept { play_dbfs: probe.played_dbfs };
+            return LevelDecision::Accept {
+                play_dbfs: probe.played_dbfs,
+            };
         }
         let next = probe.played_dbfs + self.step_db;
         let gain_room_capture = self.max_capture_dbfs - probe.captured_peak_dbfs;
-        let gain_room_spl = probe.spl_db.map(|s| self.max_spl_db - s).unwrap_or(f64::INFINITY);
+        let gain_room_spl = probe
+            .spl_db
+            .map(|s| self.max_spl_db - s)
+            .unwrap_or(f64::INFINITY);
         if next > self.max_play_dbfs + 1e-9 {
             return LevelDecision::Refuse {
-                reason: format!("niveau joué plafonné à {:.0} dBFS, RSB {:.0} dB insuffisant", self.max_play_dbfs, probe.snr_db),
+                reason: format!(
+                    "niveau joué plafonné à {:.0} dBFS, RSB {:.0} dB insuffisant",
+                    self.max_play_dbfs, probe.snr_db
+                ),
                 best_play_dbfs: probe.played_dbfs,
             };
         }
         if self.step_db > gain_room_capture {
             return LevelDecision::Refuse {
-                reason: format!("crête captée {:.1} dBFS trop proche du plafond", probe.captured_peak_dbfs),
+                reason: format!(
+                    "crête captée {:.1} dBFS trop proche du plafond",
+                    probe.captured_peak_dbfs
+                ),
                 best_play_dbfs: probe.played_dbfs,
             };
         }
         if self.step_db > gain_room_spl {
             return LevelDecision::Refuse {
-                reason: format!("pression acoustique {:.0} dB SPL proche du plafond {:.0}", probe.spl_db.unwrap_or(0.0), self.max_spl_db),
+                reason: format!(
+                    "pression acoustique {:.0} dB SPL proche du plafond {:.0}",
+                    probe.spl_db.unwrap_or(0.0),
+                    self.max_spl_db
+                ),
                 best_play_dbfs: probe.played_dbfs,
             };
         }
-        LevelDecision::StepUp { next_play_dbfs: next }
+        LevelDecision::StepUp {
+            next_play_dbfs: next,
+        }
     }
 }
 
@@ -121,23 +139,48 @@ mod tests {
     #[test]
     fn monte_puis_accepte() {
         let p = LevelPolicy::default();
-        let d = p.decide(&ProbeResult { played_dbfs: -30.0, captured_peak_dbfs: -40.0, snr_db: 30.0, spl_db: None });
-        assert_eq!(d, LevelDecision::StepUp { next_play_dbfs: -24.0 });
-        let d = p.decide(&ProbeResult { played_dbfs: -24.0, captured_peak_dbfs: -34.0, snr_db: 55.0, spl_db: None });
+        let d = p.decide(&ProbeResult {
+            played_dbfs: -30.0,
+            captured_peak_dbfs: -40.0,
+            snr_db: 30.0,
+            spl_db: None,
+        });
+        assert_eq!(
+            d,
+            LevelDecision::StepUp {
+                next_play_dbfs: -24.0
+            }
+        );
+        let d = p.decide(&ProbeResult {
+            played_dbfs: -24.0,
+            captured_peak_dbfs: -34.0,
+            snr_db: 55.0,
+            spl_db: None,
+        });
         assert_eq!(d, LevelDecision::Accept { play_dbfs: -24.0 });
     }
 
     #[test]
     fn refuse_au_plafond_spl() {
         let p = LevelPolicy::default();
-        let d = p.decide(&ProbeResult { played_dbfs: -24.0, captured_peak_dbfs: -30.0, snr_db: 20.0, spl_db: Some(88.0) });
+        let d = p.decide(&ProbeResult {
+            played_dbfs: -24.0,
+            captured_peak_dbfs: -30.0,
+            snr_db: 20.0,
+            spl_db: Some(88.0),
+        });
         assert!(matches!(d, LevelDecision::Refuse { .. }), "{d:?}");
     }
 
     #[test]
     fn refuse_au_plafond_joue() {
         let p = LevelPolicy::default();
-        let d = p.decide(&ProbeResult { played_dbfs: -6.0, captured_peak_dbfs: -40.0, snr_db: 20.0, spl_db: None });
+        let d = p.decide(&ProbeResult {
+            played_dbfs: -6.0,
+            captured_peak_dbfs: -40.0,
+            snr_db: 20.0,
+            spl_db: None,
+        });
         assert!(matches!(d, LevelDecision::Refuse { .. }));
     }
 

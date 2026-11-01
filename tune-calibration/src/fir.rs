@@ -19,16 +19,25 @@ use realfft::num_complex::Complex;
 
 /// Réponse impulsionnelle à phase minimale de longueur `nfft` dont le module
 /// vaut `magnitude_db(f)` (fonction continue de la fréquence en Hz).
-pub fn minimum_phase_from_magnitude(sample_rate: u32, nfft: usize, magnitude_db: impl Fn(f64) -> f64) -> Vec<f64> {
+pub fn minimum_phase_from_magnitude(
+    sample_rate: u32,
+    nfft: usize,
+    magnitude_db: impl Fn(f64) -> f64,
+) -> Vec<f64> {
     let nfft = fft::next_pow2(nfft);
     let bins = nfft / 2 + 1;
     let df = sample_rate as f64 / nfft as f64;
     // log|H| sur le spectre complet (symétrie hermitienne implicite via rfft/irfft).
     let log_mag: Vec<Complex<f64>> = (0..bins)
-        .map(|i| Complex::new(fft::from_db(magnitude_db(i as f64 * df)).max(1e-9).ln(), 0.0))
+        .map(|i| {
+            Complex::new(
+                fft::from_db(magnitude_db(i as f64 * df)).max(1e-9).ln(),
+                0.0,
+            )
+        })
         .collect();
     let cep = fft::irfft(&log_mag, nfft); // cepstre réel
-    // Repliement : c[0], 2c[n] pour 0<n<N/2, c[N/2], 0 ensuite.
+                                          // Repliement : c[0], 2c[n] pour 0<n<N/2, c[N/2], 0 ensuite.
     let mut folded = vec![0.0; nfft];
     folded[0] = cep[0];
     for n in 1..nfft / 2 {
@@ -44,7 +53,12 @@ pub fn minimum_phase_from_magnitude(sample_rate: u32, nfft: usize, magnitude_db:
 /// `correction_db(f)` est la réponse souhaitée (par exemple celle de
 /// l'égaliseur automatique, `eq::bands_response_db`). Au-dessus de
 /// `split_hz` la correction est fondue vers 0 dB sur une demi-octave.
-pub fn mixed_phase_design(sample_rate: u32, taps: usize, split_hz: f64, correction_db: impl Fn(f64) -> f64) -> Vec<f32> {
+pub fn mixed_phase_design(
+    sample_rate: u32,
+    taps: usize,
+    split_hz: f64,
+    correction_db: impl Fn(f64) -> f64,
+) -> Vec<f32> {
     let nfft = fft::next_pow2(taps * 4);
     let hi = split_hz * 2f64.sqrt();
     let mag = |f: f64| -> f64 {
@@ -126,7 +140,13 @@ mod tests {
     #[test]
     fn phase_minimale_restitue_la_magnitude() {
         let fs = 48_000;
-        let bands = [Band { freq: 50.0, gain: -8.0, q: 4.0, kind: BandType::Peak, channel: None }];
+        let bands = [Band {
+            freq: 50.0,
+            gain: -8.0,
+            q: 4.0,
+            kind: BandType::Peak,
+            channel: None,
+        }];
         let corr = |f: f64| bands_response_db(fs as f64, &bands, &[f])[0];
         let h = minimum_phase_from_magnitude(fs, 65_536, corr);
         let hf: Vec<f32> = h.iter().map(|v| *v as f32).collect();
@@ -144,8 +164,20 @@ mod tests {
     fn fir_mixte_colle_a_l_egaliseur_sous_la_coupure() {
         let fs = 48_000;
         let bands = [
-            Band { freq: 42.0, gain: -9.0, q: 6.0, kind: BandType::Peak, channel: None },
-            Band { freq: 115.0, gain: -5.0, q: 7.0, kind: BandType::Peak, channel: None },
+            Band {
+                freq: 42.0,
+                gain: -9.0,
+                q: 6.0,
+                kind: BandType::Peak,
+                channel: None,
+            },
+            Band {
+                freq: 115.0,
+                gain: -5.0,
+                q: 7.0,
+                kind: BandType::Peak,
+                channel: None,
+            },
         ];
         let corr = |f: f64| bands_response_db(fs as f64, &bands, &[f])[0];
         let h = mixed_phase_design(fs, 16_384, 300.0, corr);

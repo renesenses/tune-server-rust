@@ -1,5 +1,0 @@
-# Porte de licences du prototype : permissives seulement, aucune GPL/LGPL.
-[licenses]
-version = 2
-confidence-threshold = 0.9
-allow = ["BUSL-1.1", "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "Unlicense", "0BSD", "MIT-0"]

@@ -133,7 +133,10 @@ impl Biquad {
 /// Réponse cumulée (dB) d'une liste de bandes sur une grille.
 pub fn bands_response_db(fs: f64, bands: &[Band], freqs: &[f64]) -> Vec<f64> {
     let biquads: Vec<Biquad> = bands.iter().map(|b| Biquad::from_band(fs, b)).collect();
-    freqs.iter().map(|f| biquads.iter().map(|b| b.magnitude_db(fs, *f)).sum()).collect()
+    freqs
+        .iter()
+        .map(|f| biquads.iter().map(|b| b.magnitude_db(fs, *f)).sum())
+        .collect()
 }
 
 /// Garde-fous et bornes de l'ajustement.
@@ -196,7 +199,12 @@ impl AutoEqConfig {
     }
 
     pub fn spatial_average(sample_rate: f64) -> Self {
-        Self { f_hi: 500.0, align_hi: 500.0, max_bands: 10, ..Self::single_position(sample_rate) }
+        Self {
+            f_hi: 500.0,
+            align_hi: 500.0,
+            max_bands: 10,
+            ..Self::single_position(sample_rate)
+        }
     }
 }
 
@@ -226,7 +234,11 @@ pub struct AutoEqResult {
 impl AutoEqResult {
     /// Corps prêt pour `POST /zones/{id}/eq`.
     pub fn to_eq_settings(&self) -> EqSettings {
-        EqSettings { enabled: true, bands: self.bands.clone(), headroom_mode: "safe".into() }
+        EqSettings {
+            enabled: true,
+            bands: self.bands.clone(),
+            headroom_mode: "safe".into(),
+        }
     }
 }
 
@@ -265,7 +277,8 @@ fn smooth_on_grid(freqs: &[f64], values: &[f64], n: usize) -> Vec<f64> {
 
 impl Problem<'_> {
     fn overshoot_rms(residual: &[f64]) -> f64 {
-        (residual.iter().map(|r| r.max(0.0).powi(2)).sum::<f64>() / residual.len().max(1) as f64).sqrt()
+        (residual.iter().map(|r| r.max(0.0).powi(2)).sum::<f64>() / residual.len().max(1) as f64)
+            .sqrt()
     }
 
     /// Coût : dépassement résiduel au-dessus de la cible, plus la seule
@@ -298,7 +311,8 @@ impl Problem<'_> {
     /// bandes empilées ne contournent pas le plafond d'une seule.
     fn feasible(&self, bands: &[Band]) -> bool {
         let corr = bands_response_db(self.cfg.sample_rate, bands, &self.freqs);
-        corr.iter().all(|c| *c >= -self.cfg.max_cut_db - 1e-9 && *c <= self.cfg.max_boost_db + 1e-9)
+        corr.iter()
+            .all(|c| *c >= -self.cfg.max_cut_db - 1e-9 && *c <= self.cfg.max_boost_db + 1e-9)
     }
 
     /// Coût d'un candidat : erreur pondérée, ou +∞ s'il viole le plafond cumulé.
@@ -377,7 +391,8 @@ pub fn fit(measured: &LogResponse, target: &TargetCurve, cfg: &AutoEqConfig) -> 
     } else {
         measured
     };
-    let offset = target.align_offset_percentile(measured, cfg.align_lo, cfg.align_hi, cfg.align_percentile);
+    let offset =
+        target.align_offset_percentile(measured, cfg.align_lo, cfg.align_hi, cfg.align_percentile);
     let mut freqs = Vec::new();
     let mut error = Vec::new();
     for (f, m) in measured.freqs.iter().zip(&measured.magnitude_db) {
@@ -392,13 +407,18 @@ pub fn fit(measured: &LogResponse, target: &TargetCurve, cfg: &AutoEqConfig) -> 
     }
     let problem = Problem { cfg, freqs, error };
     let rms_before = problem.weighted_rms(&problem.error);
-    let max_before = problem.error.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let max_before = problem
+        .error
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
 
     let mut bands: Vec<Band> = Vec::new();
     // Candidats déjà essayés sans gain : exclus à ±1/12 d'octave, pour passer
     // au pic suivant au lieu d'abandonner (réponses hachées).
     let mut excluded: Vec<f64> = Vec::new();
-    let is_excluded = |f: f64, excluded: &[f64]| excluded.iter().any(|x| (f / x).log2().abs() < 1.0 / 12.0);
+    let is_excluded =
+        |f: f64, excluded: &[f64]| excluded.iter().any(|x| (f / x).log2().abs() < 1.0 / 12.0);
     let mut attempts = 0usize;
     while bands.len() < cfg.max_bands && attempts < cfg.max_bands * 3 {
         attempts += 1;
@@ -409,7 +429,13 @@ pub fn fit(measured: &LogResponse, target: &TargetCurve, cfg: &AutoEqConfig) -> 
             .cloned()
             .enumerate()
             .filter(|(i, _)| !is_excluded(problem.freqs[*i], &excluded))
-            .fold((0usize, f64::NEG_INFINITY), |m, (i, v)| if v > m.1 { (i, v) } else { m });
+            .fold((0usize, f64::NEG_INFINITY), |m, (i, v)| {
+                if v > m.1 {
+                    (i, v)
+                } else {
+                    m
+                }
+            });
         let mut wants_boost = false;
         let (i_sel, e_sel) = if e_peak >= cfg.threshold_db {
             (i_peak, e_peak)
@@ -420,7 +446,10 @@ pub fn fit(measured: &LogResponse, target: &TargetCurve, cfg: &AutoEqConfig) -> 
                 .cloned()
                 .enumerate()
                 .filter(|(i, _)| !is_excluded(problem.freqs[*i], &excluded))
-                .fold((0usize, f64::INFINITY), |m, (i, v)| if v < m.1 { (i, v) } else { m });
+                .fold(
+                    (0usize, f64::INFINITY),
+                    |m, (i, v)| if v < m.1 { (i, v) } else { m },
+                );
             if -e_dip < cfg.threshold_db {
                 break;
             }
@@ -442,7 +471,13 @@ pub fn fit(measured: &LogResponse, target: &TargetCurve, cfg: &AutoEqConfig) -> 
         }
         let f0 = problem.freqs[i_sel];
         let bw = (problem.freqs[hi] - problem.freqs[lo]).max(f0 * 0.05);
-        let mut band = Band { freq: f0, gain: -e_sel, q: f0 / bw, kind: BandType::Peak, channel: None };
+        let mut band = Band {
+            freq: f0,
+            gain: -e_sel,
+            q: f0 / bw,
+            kind: BandType::Peak,
+            channel: None,
+        };
         problem.clamp(&mut band);
         let before = problem.weighted_rms(&residual);
         bands.push(band);
@@ -485,12 +520,20 @@ pub fn fit(measured: &LogResponse, target: &TargetCurve, cfg: &AutoEqConfig) -> 
     let wide = LogResponse::grid(10.0, cfg.sample_rate * 0.45, 24);
     let total = bands_response_db(cfg.sample_rate, &bands, &wide);
     let max_total = total.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let preamp = if max_total > 0.0 { -(max_total + cfg.clipping_margin_db) } else { 0.0 };
+    let preamp = if max_total > 0.0 {
+        -(max_total + cfg.clipping_margin_db)
+    } else {
+        0.0
+    };
     if max_total > cfg.max_boost_db + 1e-6 {
-        warnings.push(format!("gain cumulé {max_total:.2} dB au-delà de la relance autorisée"));
+        warnings.push(format!(
+            "gain cumulé {max_total:.2} dB au-delà de la relance autorisée"
+        ));
     }
     if max_after > cfg.threshold_db + 1.0 {
-        warnings.push(format!("pic résiduel de {max_after:.1} dB : plus de bandes ou coupe plus forte nécessaires"));
+        warnings.push(format!(
+            "pic résiduel de {max_after:.1} dB : plus de bandes ou coupe plus forte nécessaires"
+        ));
     }
 
     AutoEqResult {
@@ -543,10 +586,23 @@ mod tests {
 
     #[test]
     fn serialisation_au_format_natif() {
-        let b = Band { freq: 55.5, gain: -4.25, q: 3.0, kind: BandType::Peak, channel: None };
+        let b = Band {
+            freq: 55.5,
+            gain: -4.25,
+            q: 3.0,
+            kind: BandType::Peak,
+            channel: None,
+        };
         let j = serde_json::to_value(&b).unwrap();
-        assert_eq!(j, serde_json::json!({"freq": 55.5, "gain": -4.25, "q": 3.0, "type": "peak"}));
-        let s = EqSettings { enabled: true, bands: vec![b], headroom_mode: "safe".into() };
+        assert_eq!(
+            j,
+            serde_json::json!({"freq": 55.5, "gain": -4.25, "q": 3.0, "type": "peak"})
+        );
+        let s = EqSettings {
+            enabled: true,
+            bands: vec![b],
+            headroom_mode: "safe".into(),
+        };
         let j = serde_json::to_string(&s).unwrap();
         assert!(j.contains("\"headroom_mode\":\"safe\""));
     }
@@ -555,10 +611,23 @@ mod tests {
     fn retrouve_un_pic_unique() {
         let fs = 48_000.0;
         let grid = LogResponse::grid(20.0, 1000.0, 24);
-        let src = Band { freq: 60.0, gain: 8.0, q: 4.0, kind: BandType::Peak, channel: None };
+        let src = Band {
+            freq: 60.0,
+            gain: 8.0,
+            q: 4.0,
+            kind: BandType::Peak,
+            channel: None,
+        };
         let mags = bands_response_db(fs, &[src], &grid);
-        let measured = LogResponse { freqs: grid, magnitude_db: mags.iter().map(|m| m + 75.0).collect() };
-        let r = fit(&measured, &TargetCurve::flat(), &AutoEqConfig::single_position(fs));
+        let measured = LogResponse {
+            freqs: grid,
+            magnitude_db: mags.iter().map(|m| m + 75.0).collect(),
+        };
+        let r = fit(
+            &measured,
+            &TargetCurve::flat(),
+            &AutoEqConfig::single_position(fs),
+        );
         assert_eq!(r.bands.len(), 1, "{:?}", r.bands);
         let b = &r.bands[0];
         assert!((b.freq / 60.0).log2().abs() < 0.08, "f {}", b.freq);
@@ -571,10 +640,23 @@ mod tests {
     fn ne_remonte_jamais_un_creux() {
         let fs = 48_000.0;
         let grid = LogResponse::grid(20.0, 1000.0, 24);
-        let dip = Band { freq: 80.0, gain: -10.0, q: 3.0, kind: BandType::Peak, channel: None };
+        let dip = Band {
+            freq: 80.0,
+            gain: -10.0,
+            q: 3.0,
+            kind: BandType::Peak,
+            channel: None,
+        };
         let mags = bands_response_db(fs, &[dip], &grid);
-        let measured = LogResponse { freqs: grid, magnitude_db: mags };
-        let r = fit(&measured, &TargetCurve::flat(), &AutoEqConfig::single_position(fs));
+        let measured = LogResponse {
+            freqs: grid,
+            magnitude_db: mags,
+        };
+        let r = fit(
+            &measured,
+            &TargetCurve::flat(),
+            &AutoEqConfig::single_position(fs),
+        );
         assert!(r.bands.iter().all(|b| b.gain <= 0.0), "{:?}", r.bands);
         assert!(r.max_total_gain_db <= 1e-9);
     }
@@ -583,12 +665,32 @@ mod tests {
     fn coupe_bornee_au_maximum() {
         let fs = 48_000.0;
         let grid = LogResponse::grid(20.0, 1000.0, 24);
-        let src = Band { freq: 45.0, gain: 20.0, q: 6.0, kind: BandType::Peak, channel: None };
+        let src = Band {
+            freq: 45.0,
+            gain: 20.0,
+            q: 6.0,
+            kind: BandType::Peak,
+            channel: None,
+        };
         let mags = bands_response_db(fs, &[src], &grid);
-        let measured = LogResponse { freqs: grid, magnitude_db: mags };
-        let cfg = AutoEqConfig { max_cut_db: 10.0, ..AutoEqConfig::single_position(fs) };
+        let measured = LogResponse {
+            freqs: grid,
+            magnitude_db: mags,
+        };
+        let cfg = AutoEqConfig {
+            max_cut_db: 10.0,
+            ..AutoEqConfig::single_position(fs)
+        };
         let r = fit(&measured, &TargetCurve::flat(), &cfg);
-        assert!(r.bands.iter().all(|b| b.gain >= -10.0 - 1e-9), "{:?}", r.bands);
-        assert!(r.warnings.iter().any(|w| w.contains("pic résiduel")), "{:?}", r.warnings);
+        assert!(
+            r.bands.iter().all(|b| b.gain >= -10.0 - 1e-9),
+            "{:?}",
+            r.bands
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("pic résiduel")),
+            "{:?}",
+            r.warnings
+        );
     }
 }

@@ -1,0 +1,43 @@
+[package]
+name = "tune-calibration-greffon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Greffon natif « calibration » (#7632, C1 — mesure). Il branche la caisse
+# pure `tune-calibration` (balayage de Farina, déconvolution, réponse, RT60,
+# étalonnage micro, garde-fous de niveau) sur le serveur :
+#
+# * un `FournisseurPcm` FINI « calibration » inscrit auprès de l'orchestrateur
+#   joue le balayage vers la zone, par le chemin de lecture existant ;
+# * la capture passe par `tune-entree-audio` (cpal) et son consommateur
+#   « vers tampon » (`tampon.rs`), à côté du lecteur qui sert une entrée en
+#   direct ;
+# * des routes REST sous `/api/v1/ext/calibration/`.
+#
+# NATIF comme `entree-audio` : il ouvre un périphérique d'entrée. Opt-in,
+# dormant tant qu'on ne l'installe pas : sans lui, aucun fournisseur
+# « calibration » n'existe, donc aucun balayage ne peut partir.
+
+[features]
+default = []
+# La capture réelle (cpal) suit `local-audio` du serveur, comme entree-audio.
+capture = ["tune-entree-audio/capture"]
+
+[dependencies]
+tune-core = { path = "../../tune-core", default-features = false, features = ["plugin-http"] }
+tune-calibration = { path = "../../tune-calibration" }
+tune-entree-audio = { path = "../tune-entree-audio" }
+axum = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[[test]]
+name = "mesure_simulee"
+path = "tests/mesure_simulee.rs"

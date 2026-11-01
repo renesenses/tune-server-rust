@@ -6569,6 +6569,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-calibration"
+version = "1.0.0"
+dependencies = [
+ "realfft",
+ "rustfft",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "tune-calibration-greffon"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tune-calibration",
+ "tune-core",
+ "tune-entree-audio",
+]
+
+[[package]]
 name = "tune-cd"
 version = "1.0.0"
 dependencies = [
@@ -7005,6 +7031,7 @@ dependencies = [
  "tune-aes67",
  "tune-assistant-ia",
  "tune-bandcamp",
+ "tune-calibration-greffon",
  "tune-cd",
  "tune-circle",
  "tune-concerts",

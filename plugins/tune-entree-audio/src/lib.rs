@@ -49,6 +49,7 @@ pub mod simule;
 pub mod source;
 #[cfg(feature = "capture")]
 pub mod systeme;
+pub mod tampon;
 
 use std::sync::Arc;
 

@@ -89,7 +89,10 @@ impl Sweep {
 
 /// Génère le balayage et son filtre inverse.
 pub fn generate(spec: &SweepSpec) -> Sweep {
-    assert!(spec.f_start > 0.0 && spec.f_end > spec.f_start, "bornes du balayage invalides");
+    assert!(
+        spec.f_start > 0.0 && spec.f_end > spec.f_start,
+        "bornes du balayage invalides"
+    );
     assert!(spec.duration_s > 0.0 && spec.sample_rate > 0);
     let fs = spec.sample_rate as f64;
     let n = spec.len_samples();
@@ -143,10 +146,19 @@ pub fn generate(spec: &SweepSpec) -> Sweep {
             cnt += 1;
         }
     }
-    let gain = if cnt > 0 { acc / cnt as f64 } else { auto[n - 1].abs() }.max(1e-30);
+    let gain = if cnt > 0 {
+        acc / cnt as f64
+    } else {
+        auto[n - 1].abs()
+    }
+    .max(1e-30);
     inverse.iter_mut().for_each(|v| *v /= gain);
 
-    Sweep { spec: spec.clone(), signal, inverse }
+    Sweep {
+        spec: spec.clone(),
+        signal,
+        inverse,
+    }
 }
 
 #[cfg(test)]
@@ -155,7 +167,10 @@ mod tests {
 
     #[test]
     fn amplitude_crete_respectee() {
-        let spec = SweepSpec { amplitude: 0.25, ..SweepSpec::room_default(48_000) };
+        let spec = SweepSpec {
+            amplitude: 0.25,
+            ..SweepSpec::room_default(48_000)
+        };
         let s = generate(&spec);
         let peak = s.signal.iter().fold(0.0f64, |m, v| m.max(v.abs()));
         assert!(peak <= 0.25 + 1e-12 && peak > 0.24, "crête {peak}");
@@ -163,19 +178,36 @@ mod tests {
 
     #[test]
     fn auto_deconvolution_est_une_impulsion() {
-        let spec = SweepSpec { duration_s: 2.0, ..SweepSpec::room_default(48_000) };
+        let spec = SweepSpec {
+            duration_s: 2.0,
+            ..SweepSpec::room_default(48_000)
+        };
         let s = generate(&spec);
         let auto = fft::convolve(&s.signal, &s.inverse);
         let z = s.zero_lag_index();
         // Crête = gain en bande (1) × fraction de bande occupée (≈ 21,6/24).
         let fraction = (s.spec.f_end - s.spec.f_start) / 24_000.0;
-        assert!((auto[z] - fraction).abs() < 0.03, "crête {} ≠ {fraction}", auto[z]);
+        assert!(
+            (auto[z] - fraction).abs() < 0.03,
+            "crête {} ≠ {fraction}",
+            auto[z]
+        );
         // Gain en bande : magnitude spectrale de l'auto-déconvolution ≈ 0 dB.
         let sp = fft::rfft(&auto, fft::next_pow2(auto.len()));
         let df = 48_000.0 / fft::next_pow2(auto.len()) as f64;
-        for (f, tol) in [(50.0, 0.3), (200.0, 0.1), (1000.0, 0.1), (5000.0, 0.1), (15_000.0, 0.1)] {
+        for (f, tol) in [
+            (50.0, 0.3),
+            (200.0, 0.1),
+            (1000.0, 0.1),
+            (5000.0, 0.1),
+            (15_000.0, 0.1),
+        ] {
             let i = (f / df).round() as usize;
-            assert!(fft::to_db(sp[i].norm()).abs() < tol, "{f} Hz : {} dB", fft::to_db(sp[i].norm()));
+            assert!(
+                fft::to_db(sp[i].norm()).abs() < tol,
+                "{f} Hz : {} dB",
+                fft::to_db(sp[i].norm())
+            );
         }
         // Hors de ±2 ms autour de l'impulsion, le résidu reste sous −40 dB.
         let guard = 96;
@@ -184,7 +216,11 @@ mod tests {
             .enumerate()
             .filter(|(i, _)| (*i as isize - z as isize).unsigned_abs() > guard)
             .fold(0.0f64, |m, (_, v)| m.max(v.abs()));
-        assert!(fft::to_db(residual) < -40.0, "résidu {} dB", fft::to_db(residual));
+        assert!(
+            fft::to_db(residual) < -40.0,
+            "résidu {} dB",
+            fft::to_db(residual)
+        );
     }
 
     #[test]

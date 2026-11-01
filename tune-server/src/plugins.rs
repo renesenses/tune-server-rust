@@ -212,6 +212,21 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
         )))
         .await;
 
+    // Calibration de la pièce (#7632, C1). Comme `entree-audio` : l'orchestrateur
+    // pour y inscrire la source PCM FINIE « calibration » (le balayage de
+    // mesure), régler le volume et lancer la zone ; le gestionnaire de lecture
+    // pour la file. Opt-in : rien ne joue tant qu'il n'est pas installé.
+    #[cfg(feature = "calibration")]
+    loader
+        .register(Box::new(tune_calibration_greffon::CalibrationPlugin::new(
+            tune_calibration_greffon::HostServices {
+                backend: state.backend.clone(),
+                orchestrator: state.orchestrator.clone(),
+                playback: state.playback.clone(),
+            },
+        )))
+        .await;
+
     // Assistant IA, étape 1 (chantier assistant-ia). Toujours compilé, gratuit.
     // La base ; le DOSSIER de la base, où vit la clé maîtresse qui scelle la
     // clé d'API de l'utilisateur (hors de la base elle-même) ; et les critères
