@@ -265,6 +265,14 @@ path = "tests/sendspin_mode_transition.rs"
 name = "agent_tune_4626"
 path = "tests/agent_tune_4626.rs"
 
+# #7335 — les écritures des dossiers de collections refusées par la base ne
+# répondent plus 201/200. Cible propre (pas un `mod` de `server_contracts`) :
+# `autotests = false` plus haut, sans cette entrée le fichier n'est jamais
+# compilé.
+[[test]]
+name = "collections_ecriture_7335"
+path = "tests/collections_ecriture_7335.rs"
+
 [[test]]
 name = "server_contracts"
 path = "tests/server_contracts.rs"
