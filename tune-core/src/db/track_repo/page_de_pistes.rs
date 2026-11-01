@@ -28,6 +28,7 @@
 //! le `WHERE` est celui de `list_filtered`, partagé
 //! ([`TrackRepo::conditions_du_filtre`]), socle de la vue compris.
 
+use super::cle_de_tri::{Curseur, valeur_json, valeur_sql};
 use super::{Placeholders, SqlValue, ToSqlValue, Track, TrackFilter, TrackRepo, sql};
 use crate::TuneError;
 use crate::db::engine::Engine;
@@ -276,6 +277,9 @@ pub struct DemandeDePistes {
     /// Rendre aussi les comptes par provenance (sous la recherche et les
     /// facettes, SANS la provenance : ce sont les choix du menu Source).
     pub avec_comptes: bool,
+    /// #7619 (L1) — reprendre APRÈS ce curseur (`after`), au lieu de
+    /// `offset`. Il doit avoir été rendu pour le même tri.
+    pub apres: Option<Curseur>,
 }
 
 /// Les comptes par provenance que rend une page qui les demande.
@@ -296,6 +300,8 @@ pub struct PageDePistes {
     /// Effectif de l'ensemble filtré, avant LIMIT/OFFSET.
     pub total: i64,
     pub comptes: Option<ComptesParProvenance>,
+    /// #7619 (L1) — le curseur de la page suivante ; `None` en fin de liste.
+    pub curseur_suivant: Option<String>,
 }
 
 /// La recherche de l'onglet Titres : sous-chaîne du titre ou du nom de
@@ -343,6 +349,24 @@ impl TrackRepo {
     /// de la page avec `COUNT(*) OVER ()` (le tri ne porte que des lignes
     /// étroites), puis les pistes de ces identifiants dans cet ordre.
     pub fn page_de_pistes(&self, d: &DemandeDePistes) -> Result<PageDePistes, TuneError> {
+        // #7619 (L1) — la page par la clé de tri indexée, quand les clés sont
+        // prêtes ; sinon le chemin d'avant (un curseur y vaut son rang).
+        if self.assurer_les_cles_de_tri() {
+            return self.page_par_la_cle_de_tri(d);
+        }
+        let mut repli = d.clone();
+        if let Some(c) = repli.apres.take() {
+            repli.offset = c.o;
+        }
+        self.page_de_pistes_par_decalage(&repli)
+    }
+
+    /// Le chemin d'avant #7619 : tri complet, `OFFSET`, `COUNT(*) OVER ()`.
+    /// Sert tant que les clés de tri ne sont pas prêtes.
+    pub fn page_de_pistes_par_decalage(
+        &self,
+        d: &DemandeDePistes,
+    ) -> Result<PageDePistes, TuneError> {
         let engine = self.db.engine();
         let mut ph = Placeholders::new(engine);
         let (mut conditions, mut valeurs) = self.conditions_du_filtre(&d.filtre, &mut ph);
@@ -431,7 +455,194 @@ impl TrackRepo {
             pistes: self.hydrater_dans_l_ordre(&ids)?,
             total,
             comptes,
+            curseur_suivant: None,
         })
+    }
+
+    /// #7619 (L1) — la page lue dans l'ordre de `idx_tracks_cle_tri`.
+    ///
+    /// - ordre par défaut : `ORDER BY t.cle_tri, t.id`, que l'index rend sans
+    ///   tri ; la page s'arrête à `limit` lignes VISIBLES ;
+    /// - tri par colonne : `vide, valeur, cle_tri, id` — le tri reste complet
+    ///   (aucun index par colonne), mais l'ordre est total et le curseur exact ;
+    /// - le socle est ensembliste (non corrélé, évalué une fois) ;
+    /// - le total est compté à part, sans `COUNT(*) OVER ()` qui forcerait
+    ///   l'évaluation de toute la liste, et gardé sous le jeton des données.
+    fn page_par_la_cle_de_tri(&self, d: &DemandeDePistes) -> Result<PageDePistes, TuneError> {
+        let engine = self.db.engine();
+        let mut ph = Placeholders::new(engine);
+        let (mut conditions, mut valeurs) =
+            self.conditions_du_filtre_ensemblistes(&d.filtre, &mut ph);
+        if let Some(saisie) = d
+            .recherche
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let (c, v) = condition_titre_ou_artiste(&mut ph, saisie);
+            conditions.push(c);
+            valeurs.extend(v);
+        }
+        let comptes = if d.avec_comptes {
+            Some(self.comptes_par_provenance(&conditions, &valeurs)?)
+        } else {
+            None
+        };
+        if let Some(cle) = d
+            .provenance
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let (c, v) = condition_provenance(&mut ph, engine, cle);
+            conditions.push(c);
+            valeurs.extend(v);
+        }
+        let jointure = d.tri.map_or("", ColonneDeTri::jointure);
+        let where_total = conditions.join(" AND ");
+        let total = self.total_garde(
+            &format!(
+                "SELECT COUNT(*){}{jointure} WHERE {where_total}",
+                sql::track_from()
+            ),
+            &valeurs,
+        )?;
+
+        // L'ordre, et ce que la page relit pour fabriquer le curseur.
+        let sens = if d.descendant { "DESC" } else { "ASC" };
+        let (projection, ordre, vide_et_valeur) = match d.tri {
+            None => (String::new(), "t.cle_tri, t.id".to_string(), None),
+            Some(col) => {
+                let (expr, vide) = col.expression(engine);
+                let test_vide = match vide {
+                    Vide::Texte => format!("NULLIF(TRIM({expr}), '') IS NULL"),
+                    Vide::Nul => format!("{expr} IS NULL"),
+                    Vide::NulOuZero => format!("({expr} IS NULL OR {expr} = 0)"),
+                };
+                let v = format!("(CASE WHEN {test_vide} THEN 1 ELSE 0 END)");
+                let e = format!("(CASE WHEN {test_vide} THEN NULL ELSE {expr} END)");
+                (
+                    format!(", {v}, {e}"),
+                    format!("{v}, {e} {sens}, t.cle_tri, t.id"),
+                    Some((v, e)),
+                )
+            }
+        };
+
+        // Reprise après le curseur. Un curseur d'un autre tri désignerait une
+        // position qui n'existe pas dans cet ordre : refusé plus haut (route),
+        // ignoré ici par prudence (première page).
+        let cle_du_tri = d.tri.map_or("", ColonneDeTri::cle);
+        let apres = d
+            .apres
+            .as_ref()
+            .filter(|c| c.s == cle_du_tri && (d.tri.is_none() || c.d == d.descendant));
+        let mut page_conditions = conditions.clone();
+        let mut page_valeurs = valeurs.clone();
+        if let Some(c) = apres {
+            let suite_par_cle = |ph: &mut Placeholders, vals: &mut Vec<SqlValue>| {
+                let (k, i) = (ph.take(), ph.take());
+                vals.push(SqlValue::Text(c.k.clone()));
+                vals.push(SqlValue::Int(c.i));
+                format!("(t.cle_tri, t.id) > ({k}, {i})")
+            };
+            match &vide_et_valeur {
+                None => {
+                    let cond = suite_par_cle(&mut ph, &mut page_valeurs);
+                    page_conditions.push(cond);
+                }
+                Some((v, e)) => {
+                    if c.e == Some(1) {
+                        let cond = suite_par_cle(&mut ph, &mut page_valeurs);
+                        page_conditions.push(format!("({v} = 1 AND {cond})"));
+                    } else {
+                        let op = if d.descendant { "<" } else { ">" };
+                        let x = c.x.as_ref().map(valeur_sql).unwrap_or(SqlValue::Null);
+                        let (x1, x2) = (ph.take(), ph.take());
+                        page_valeurs.push(x.clone());
+                        page_valeurs.push(x);
+                        let cond = suite_par_cle(&mut ph, &mut page_valeurs);
+                        page_conditions.push(format!(
+                            "({v} = 1 OR ({v} = 0 AND ({e} {op} {x1} OR ({e} = {x2} AND {cond}))))"
+                        ));
+                    }
+                }
+            }
+        }
+        let decalage = if apres.is_some() { 0 } else { d.offset.max(0) };
+        let (limite, offset_ph) = (ph.take(), ph.take());
+        page_valeurs.push(SqlValue::Int(d.limit));
+        page_valeurs.push(SqlValue::Int(decalage));
+        let sql_page = format!(
+            "SELECT t.id, t.cle_tri{projection}{}{jointure} WHERE {} ORDER BY {ordre} \
+             LIMIT {limite} OFFSET {offset_ph}",
+            sql::track_from(),
+            page_conditions.join(" AND ")
+        );
+        let lignes = self.db.query_many(&sql_page, &refs(&page_valeurs))?;
+        let ids: Vec<i64> = lignes
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect();
+        let rang_depart = apres.map_or(decalage, |c| c.o);
+        let curseur_suivant = match lignes.last() {
+            Some(der) if (lignes.len() as i64) >= d.limit && d.limit > 0 => Some(
+                Curseur {
+                    v: 1,
+                    s: cle_du_tri.to_string(),
+                    d: d.descendant,
+                    e: vide_et_valeur
+                        .as_ref()
+                        .and_then(|_| der.get(2).and_then(SqlValue::as_i64)),
+                    x: vide_et_valeur
+                        .as_ref()
+                        .map(|_| der.get(3).map(valeur_json).unwrap_or_default()),
+                    k: der.get(1).and_then(SqlValue::as_string).unwrap_or_default(),
+                    i: der.first().and_then(SqlValue::as_i64).unwrap_or(0),
+                    o: rang_depart + lignes.len() as i64,
+                }
+                .encoder(),
+            ),
+            _ => None,
+        };
+        Ok(PageDePistes {
+            pistes: self.hydrater_dans_l_ordre(&ids)?,
+            total,
+            comptes,
+            curseur_suivant,
+        })
+    }
+
+    /// Le total d'une liste, gardé sous le jeton des données : tant que rien
+    /// n'est écrit, les pages suivantes d'une même requête ne recomptent pas.
+    fn total_garde(&self, sql_total: &str, valeurs: &[SqlValue]) -> Result<i64, TuneError> {
+        type Entree = ((u64, i64), String, i64);
+        static TOTAUX: std::sync::Mutex<Vec<Entree>> = std::sync::Mutex::new(Vec::new());
+        const ENTREES: usize = 8;
+        let jeton = self.db.jeton_des_donnees();
+        let cle = format!("{sql_total}\u{0}{valeurs:?}");
+        if let Some(j) = jeton
+            && let Ok(t) = TOTAUX.lock()
+            && let Some((_, _, n)) = t.iter().find(|(jj, c, _)| *jj == j && *c == cle)
+        {
+            return Ok(*n);
+        }
+        let n = self
+            .db
+            .query_one(sql_total, &refs(valeurs))?
+            .as_ref()
+            .and_then(|c| c.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        if let Some(j) = jeton
+            && let Ok(mut t) = TOTAUX.lock()
+        {
+            t.retain(|(jj, _, _)| *jj == j);
+            if t.len() >= ENTREES {
+                t.remove(0);
+            }
+            t.push((j, cle, n));
+        }
+        Ok(n)
     }
 
     fn comptes_par_provenance(

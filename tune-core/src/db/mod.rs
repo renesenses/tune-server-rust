@@ -102,6 +102,8 @@ mod filtre_dr_190_tests;
 mod lenteur_albums_4800_tests;
 #[cfg(test)]
 mod lenteur_pistes_5138_tests;
+#[cfg(test)]
+mod liste_par_curseur_7619_tests;
 /// #7535 — un MBID trouvé par le nom n'est plus posé s'il est déjà porté.
 #[cfg(test)]
 mod mbid_deja_porte_7535_tests;
