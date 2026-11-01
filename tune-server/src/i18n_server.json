@@ -5914,5 +5914,22 @@
     "nb": "{service} avviste å legge sporene til i spillelisten.",
     "pl": "{service} odmówił dodania utworów do playlisty.",
     "el": "Το {service} αρνήθηκε την προσθήκη στη λίστα αναπαραγωγής."
+  },
+  "api.relay.localNetworkOnly": {
+    "fr": "Cette fonction n'est disponible que sur le réseau local.",
+    "en": "This feature is only available on the local network.",
+    "de": "Diese Funktion ist nur im lokalen Netzwerk verfügbar.",
+    "es": "Esta función solo está disponible en la red local.",
+    "it": "Questa funzione è disponibile solo sulla rete locale.",
+    "zh": "此功能仅在本地网络中可用。",
+    "ja": "この機能はローカルネットワークでのみ利用できます。",
+    "ko": "이 기능은 로컬 네트워크에서만 사용할 수 있습니다.",
+    "ro": "Această funcție este disponibilă doar în rețeaua locală.",
+    "sv": "Den här funktionen är endast tillgänglig i det lokala nätverket.",
+    "hu": "Ez a funkció csak a helyi hálózaton érhető el.",
+    "vi": "Tính năng này chỉ khả dụng trong mạng cục bộ.",
+    "nb": "Denne funksjonen er bare tilgjengelig på det lokale nettverket.",
+    "pl": "Ta funkcja jest dostępna tylko w sieci lokalnej.",
+    "el": "Αυτή η λειτουργία είναι διαθέσιμη μόνο στο τοπικό δίκτυο."
   }
 }

@@ -35,7 +35,9 @@
 //! `CorsLayer::permissive()` autorisait toute origine à LIRE toute réponse. La
 //! couche n'autorise plus que : les origines natives, la même origine, et, pour
 //! les autres origines, la seule lecture (`GET`/`HEAD`) du catalogue
-//! `/api/v1/library/` dont a besoin le parcours d'un autre serveur Tune.
+//! `/api/v1/library/` dont a besoin le parcours d'un autre serveur Tune, et
+//! la seule lecture de la sonde publique `/api/v1/system/health` par la page
+//! des radios du site ([`ORIGINE_DU_SITE`]).
 //!
 //! `TUNE_ALLOWED_ORIGINS` (liste séparée par des virgules, réglée par
 //! l'exploitant, jamais par HTTP) ajoute des origines de confiance, par
@@ -62,6 +64,16 @@ pub const VARIABLE_ORIGINES: &str = "TUNE_ALLOWED_ORIGINS";
 
 /// Préfixe du catalogue lisible depuis une autre origine (`GET`/`HEAD`).
 pub const CATALOGUE_PUBLIC: &str = "/api/v1/library/";
+
+/// La page publique des radios du site (#370, #7044) lit, depuis le
+/// navigateur, la sonde publique du serveur local pour afficher « Connecté à
+/// <nom> ». Seule cette origine, seule cette route, en lecture seule : la
+/// route ne demande aucun jeton, la couche n'ouvre que la LECTURE de sa
+/// réponse à ce site-là.
+pub const ORIGINE_DU_SITE: &str = "https://mozaiklabs.fr";
+
+/// La sonde publique que lit [`ORIGINE_DU_SITE`] (chemin exact).
+pub const SONDE_PUBLIQUE: &str = "/api/v1/system/health";
 
 const SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
@@ -232,9 +244,20 @@ pub fn cors_autorise(origine: &HeaderValue, parts: &Parts) -> bool {
     if est_origine_de_confiance(origine) || est_meme_origine(origine, &parts.headers) {
         return true;
     }
+    let lecture = methode_demandee(parts).is_some_and(|m| m == Method::GET || m == Method::HEAD);
+    if !lecture {
+        return false;
+    }
     // Le catalogue, en lecture seule, pour le parcours d'un autre serveur.
-    parts.uri.path().starts_with(CATALOGUE_PUBLIC)
-        && methode_demandee(parts).is_some_and(|m| m == Method::GET || m == Method::HEAD)
+    if parts.uri.path().starts_with(CATALOGUE_PUBLIC) {
+        return true;
+    }
+    // La sonde publique, pour la page des radios du site, et pour lui seul.
+    parts.uri.path() == SONDE_PUBLIQUE
+        && origine
+            .trim()
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(ORIGINE_DU_SITE)
 }
 
 /// La couche CORS du serveur, à la place de `CorsLayer::permissive()`.
@@ -301,6 +324,54 @@ mod tests {
             ("sec-fetch-site", "same-site"),
         ]);
         assert_eq!(juger(&Method::POST, &h), Verdict::InterSites);
+    }
+
+    fn parts(methode: Method, chemin: &str, paires: &[(&str, &str)]) -> Parts {
+        let mut r = axum::http::Request::builder().method(methode).uri(chemin);
+        for (k, v) in paires {
+            r = r.header(*k, *v);
+        }
+        r.body(()).unwrap().into_parts().0
+    }
+
+    #[test]
+    fn le_site_ne_lit_que_la_sonde_publique() {
+        let site = HeaderValue::from_static(ORIGINE_DU_SITE);
+        let autre = HeaderValue::from_static("https://exemple.invalid");
+        let hote = [("host", "192.168.1.18:8888")];
+        assert!(cors_autorise(
+            &site,
+            &parts(Method::GET, SONDE_PUBLIQUE, &hote)
+        ));
+        assert!(cors_autorise(
+            &site,
+            &parts(Method::GET, "/api/v1/system/health?x=1", &hote)
+        ));
+        // Une autre origine ne lit pas la sonde.
+        assert!(!cors_autorise(
+            &autre,
+            &parts(Method::GET, SONDE_PUBLIQUE, &hote)
+        ));
+        // Le site ne lit rien d'autre, et n'écrit pas.
+        for chemin in [
+            "/api/v1/system/config",
+            "/api/v1/system/health/monitor",
+            "/api/v1/system/logs",
+        ] {
+            assert!(
+                !cors_autorise(&site, &parts(Method::GET, chemin, &hote)),
+                "{chemin}"
+            );
+        }
+        let preflight = parts(
+            Method::OPTIONS,
+            SONDE_PUBLIQUE,
+            &[
+                ("host", "192.168.1.18:8888"),
+                ("access-control-request-method", "POST"),
+            ],
+        );
+        assert!(!cors_autorise(&site, &preflight));
     }
 
     #[test]

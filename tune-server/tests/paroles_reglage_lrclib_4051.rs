@@ -248,11 +248,17 @@ async fn le_reglage_lrclib_se_lit_et_son_refus_se_dit() {
     //
     // L'écriture est désormais journalisée ; la table `settings` porte des
     // secrets. Cette garde est le prix de la précédente.
+    //
+    // Le secret écrit est un identifiant de service tiers (`discogs_token`),
+    // que la porte générique accepte encore : les secrets du serveur lui-même
+    // (`jwt_secret`…) n'y passent plus sans authentification active
+    // (`tune_core::reglages_proteges`), et un refus ne prouverait rien sur le
+    // journal des écritures.
     const SECRET: &str = "valeur-parfaitement-reconnaissable-4051";
     let (st, _) = patch(
         &app,
         "/api/v1/system/config",
-        json!({ "jwt_secret": SECRET }),
+        json!({ "discogs_token": SECRET }),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -268,7 +274,7 @@ async fn le_reglage_lrclib_se_lit_et_son_refus_se_dit() {
         "chaque PATCH qui pose une clé laisse sa ligne.\nJournal :\n{texte}"
     );
     assert!(
-        texte.contains("jwt_secret"),
+        texte.contains("discogs_token"),
         "le NOM du réglage écrit est journalisé.\nJournal :\n{texte}"
     );
     assert!(
