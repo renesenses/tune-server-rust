@@ -1,0 +1,131 @@
+{
+ "pagination": {
+  "page": 2,
+  "pages": 2,
+  "per_page": 3,
+  "items": 5,
+  "urls": {
+   "first": "https://api.discogs.com/users/exemple/collection/folders/0/releases?page=1&per_page=3&sort=added&sort_order=desc",
+   "prev": "https://api.discogs.com/users/exemple/collection/folders/0/releases?page=1&per_page=3&sort=added&sort_order=desc"
+  }
+ },
+ "releases": [
+  {
+   "id": 33597366,
+   "instance_id": 900004,
+   "date_added": "2026-07-01T10:00:00-07:00",
+   "rating": 0,
+   "basic_information": {
+    "id": 33597366,
+    "master_id": 0,
+    "master_url": null,
+    "resource_url": "https://api.discogs.com/releases/33597366",
+    "thumb": "",
+    "cover_image": "",
+    "title": "Giving My Love / Brazil",
+    "year": 2025,
+    "formats": [
+     {
+      "name": "Vinyl",
+      "qty": "1",
+      "descriptions": [
+       "7\"",
+       "45 RPM",
+       "Promo"
+      ]
+     }
+    ],
+    "labels": [
+     {
+      "name": "Most Excellent Unlimited",
+      "catno": "MXMRK-2069",
+      "entity_type": "1",
+      "entity_type_name": "Label",
+      "id": 668335,
+      "resource_url": "https://api.discogs.com/labels/668335"
+     }
+    ],
+    "artists": [
+     {
+      "name": "Janice McClain",
+      "anv": "",
+      "join": "/",
+      "role": "",
+      "tracks": "",
+      "id": 17968,
+      "resource_url": "https://api.discogs.com/artists/17968"
+     },
+     {
+      "name": "The Ritchie Family",
+      "anv": "",
+      "join": "",
+      "role": "",
+      "tracks": "",
+      "id": 35289,
+      "resource_url": "https://api.discogs.com/artists/35289"
+     }
+    ],
+    "genres": [
+     "Funk / Soul"
+    ],
+    "styles": [
+     "Disco"
+    ]
+   }
+  },
+  {
+   "id": 38821545,
+   "instance_id": 900005,
+   "date_added": "2026-06-01T10:00:00-07:00",
+   "rating": 0,
+   "basic_information": {
+    "id": 38821545,
+    "master_id": 0,
+    "master_url": null,
+    "resource_url": "https://api.discogs.com/releases/38821545",
+    "thumb": "",
+    "cover_image": "",
+    "title": "Silent Mirrors",
+    "year": 2026,
+    "formats": [
+     {
+      "name": "Vinyl",
+      "qty": "1",
+      "descriptions": [
+       "12\"",
+       "EP"
+      ]
+     }
+    ],
+    "labels": [
+     {
+      "name": "Earthbound Recordings (2)",
+      "catno": "EBR003",
+      "entity_type": "1",
+      "entity_type_name": "Label",
+      "id": 4265560,
+      "resource_url": "https://api.discogs.com/labels/4265560"
+     }
+    ],
+    "artists": [
+     {
+      "name": "Mihail P",
+      "anv": "",
+      "join": "",
+      "role": "",
+      "tracks": "",
+      "id": 5232588,
+      "resource_url": "https://api.discogs.com/artists/5232588"
+     }
+    ],
+    "genres": [
+     "Electronic"
+    ],
+    "styles": [
+     "Deep House",
+     "Breaks"
+    ]
+   }
+  }
+ ]
+}

@@ -6,7 +6,7 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "mon-theme", "aes67"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "collection-physique", "mon-theme", "aes67"]
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
 local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture"]
@@ -84,6 +84,11 @@ entree-audio = ["dep:tune-entree-audio"]
 # fournisseur n'est réglé. Inscrit à `sdk/plugins.json`, d'où les lignes de
 # build et de test des workflows sont générées.
 assistant-ia = ["dep:tune-assistant-ia"]
+# « Ma collection physique » (#7195) : la collection Discogs de l'utilisateur
+# comparée à la bibliothèque et à Qobuz / TIDAL. Dans `default` comme `cd` :
+# opt-in à l'exécution (`default_enabled = false`), au catalogue, gratuit.
+# Inscrit à `sdk/plugins.json`.
+collection-physique = ["dep:tune-collection-physique"]
 # « Mon thème » (tune-web-client#2527, rc10) : toutes les couleurs de
 # l'interface au choix, rangées par profil. Dans `default` comme `cd` : opt-in
 # à l'exécution (`default_enabled = false`), au catalogue, gratuit. Inscrit à
@@ -127,6 +132,8 @@ tune-entree-audio = { path = "../plugins/tune-entree-audio", optional = true }
 tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tune-pont-roon = { path = "../plugins/tune-pont-roon", optional = true }
 tune-assistant-ia = { path = "../plugins/tune-assistant-ia", optional = true }
+tune-collection-physique = { path = "../plugins/tune-collection-physique", optional = true }
+
 tune-mon-theme = { path = "../plugins/tune-mon-theme", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }

@@ -587,6 +587,10 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
             .as_deref(),
     ));
     ouvrir_le_registre_des_executions(state);
+    // #7195 — le jeton Discogs saisi dans « Jetons de service » avant
+    // l'unification devient le jeton PERSONNEL (coffre des Clés d'API) :
+    // « Ma collection physique » le voit, sans ressaisie.
+    crate::routes::system::cles_api::adopter_le_jeton_discogs_des_jetons_de_service(state);
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
     // #3688 — les zones qui sont notre PROPRE facade MediaRenderer revenue
