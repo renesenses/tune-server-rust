@@ -1094,6 +1094,13 @@ fn poser_les_directives(filtre: EnvFilter, niveau: &str) -> EnvFilter {
         .add_directive("h2=info".parse().unwrap())
         .add_directive("rustls=info".parse().unwrap())
         .add_directive("mio=info".parse().unwrap())
+        // #6212 : la passe « Graver les DR » réécrit des milliers de FLAC ;
+        // `lofty` avertit pour chacun (« File is missing a PADDING block.
+        // Adding one »), 51 lignes en 8 s dans le rapport de Tades, et l'export
+        // plafonné à 1 000 lignes perdait la fin de sa fenêtre — l'instant de
+        // l'arrêt. L'échec réel d'une écriture reste dit par Tune
+        // (`dr_gravure_echouee`, `dr_grave_*`) ; lofty ne garde que ses erreurs.
+        .add_directive("lofty=error".parse().unwrap())
 }
 #[cfg(test)]
 mod tests {
@@ -1181,6 +1188,8 @@ mod tests {
             tracing::info!(target: "tune_core::poller::tick", "temoin_sondeur_info");
             tracing::debug!(target: "tune_core::poller::tick", "temoin_sondeur_debug");
             tracing::info!(target: "sqlx::query", "temoin_sqlx_info");
+            tracing::warn!(target: "lofty::flac::write", "temoin_lofty_padding_6212");
+            tracing::error!(target: "lofty::flac::write", "temoin_lofty_erreur_6212");
         });
         let ecrit = journal.texte();
         for attendu in [
@@ -1198,5 +1207,9 @@ mod tests {
         // plafond `sqlx=warn` tient.
         assert!(!ecrit.contains("temoin_sondeur_debug"), "{ecrit}");
         assert!(!ecrit.contains("temoin_sqlx_info"), "{ecrit}");
+        // #6212 : l'avertissement de lofty ne noie plus le rapport, son erreur
+        // reste écrite.
+        assert!(!ecrit.contains("temoin_lofty_padding_6212"), "{ecrit}");
+        assert!(ecrit.contains("temoin_lofty_erreur_6212"), "{ecrit}");
     }
 }
