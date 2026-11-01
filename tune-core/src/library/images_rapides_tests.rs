@@ -362,7 +362,7 @@ async fn un_429_avec_retry_after_retarde_la_requete_suivante() {
         axum::serve(ecoute, app).await.unwrap();
     });
     let url = format!("http://{adresse}/x");
-    let client = reqwest::Client::new();
+    let client = crate::http::client::shared();
     let (premier, n) = en_comptant_les_transitoires(json(client.get(&url), &url)).await;
     assert!(premier.is_none());
     assert_eq!(
