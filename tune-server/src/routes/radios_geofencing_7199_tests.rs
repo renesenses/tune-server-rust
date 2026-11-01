@@ -337,3 +337,70 @@ async fn unavailable_radio_can_still_be_saved_as_favorite_7199() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }
+
+/// La fiche BBC Radio 3 de l'annuaire, réduite à ses trois flux : le
+/// principal 320 kbit/s « ww » (autorisé partout sauf au Royaume-Uni), le
+/// « nonuk » 96 kbit/s sans restriction, le « uk » 320 kbit/s.
+fn document_bbc_7658() -> Value {
+    json!({
+        "external_id": "S7658", "name": "Station BBC témoin", "country": "GB",
+        "stream_url": "https://radio.example/ww/audio=320000.m3u8",
+        "streams": [
+            {"url": "https://radio.example/ww/audio=320000.m3u8", "format": "AAC", "bitrate": 320,
+             "is_hls": true, "is_primary": true, "is_published": true,
+             "restricted_to_countries": ["FR", "BE", "US", "DE"]},
+            {"url": "https://radio.example/nonuk/master.m3u8", "format": "AAC", "bitrate": 96,
+             "is_hls": true, "is_published": true, "restricted_to_countries": null},
+            {"url": "https://radio.example/uk/master.m3u8", "format": "AAC", "bitrate": 320,
+             "is_hls": true, "is_published": true, "restricted_to_countries": ["GB", "GG", "IM", "JE"]}
+        ]
+    })
+}
+
+#[test]
+fn pays_inconnu_le_flux_choisi_est_respecte_7658() {
+    let f = fiche(document_bbc_7658());
+    let principal = "https://radio.example/ww/audio=320000.m3u8";
+    assert_eq!(
+        select_stream(&f, None, Some(principal)).unwrap().url,
+        principal,
+        "le flux choisi par l'auditeur ne doit pas céder au 96 kbit/s"
+    );
+    // Contre-épreuve : sans choix explicite et sans pays, la règle de #7199
+    // reste entière (seul le flux sans restriction est proposé).
+    assert_eq!(
+        select_stream(&f, None, None).unwrap().url,
+        "https://radio.example/nonuk/master.m3u8"
+    );
+    // Un pays connu qui interdit le flux choisi l'écarte toujours.
+    assert_eq!(
+        select_stream(&f, Some("GB"), Some(principal)).unwrap().url,
+        "https://radio.example/uk/master.m3u8"
+    );
+}
+
+#[tokio::test]
+async fn pays_inconnu_deux_chemins_de_lecture_gardent_le_choix_7658() {
+    let state = state(document_bbc_7658());
+    let principal = "https://radio.example/ww/audio=320000.m3u8";
+    // Chemin 1 : « Mes radios » (lecture d'une radio enregistrée, liée à sa fiche).
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    let f = state.annuaire_radios.read().unwrap()[0].clone();
+    let mut radio = station_depuis_fiche(&f);
+    radio.url = principal.into();
+    radio.id = Some(repo.create(&radio).unwrap());
+    repo.lier_a_l_annuaire(radio.id.unwrap(), Some("S7658"))
+        .unwrap();
+    assert_eq!(stream_for_saved(&state, &radio).unwrap(), principal);
+    // Chemin 2 : commande générique de zone (favori, historique, widget) qui porte l'URL.
+    assert_eq!(stream_for_url(&state, principal).unwrap(), principal);
+    // Contre-épreuve : le flux 96 kbit/s choisi reste lui aussi respecté.
+    let nonuk = "https://radio.example/nonuk/master.m3u8";
+    assert_eq!(stream_for_url(&state, nonuk).unwrap(), nonuk);
+    // Et un pays renseigné qui l'interdit reprend la main.
+    set_country(&state, "GB");
+    assert_eq!(
+        stream_for_url(&state, principal).unwrap(),
+        "https://radio.example/uk/master.m3u8"
+    );
+}
