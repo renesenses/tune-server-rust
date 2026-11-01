@@ -480,7 +480,11 @@ impl CacheLogosLabels {
                 .await
             {
                 Err(e) => {
-                    tracing::debug!(label = %demande.nom, erreur = %e, "logo_label_erreur");
+                    // En `info` : la cause (code HTTP, panne réseau) doit se
+                    // lire dans le journal ; la requête des adresses est
+                    // masquée, elle peut porter un jeton (#7414).
+                    let cause = crate::orchestrator::sentinelle_streaming::masquer_les_requetes(&e);
+                    tracing::info!(label = %demande.nom, cause = %cause, "logo_label_erreur");
                     let id = precedent.as_ref().and_then(|p| self.id_de(p));
                     self.avec_id(Self::entree_nue(Statut::Erreur, None, maintenant()), id)
                 }
