@@ -500,13 +500,10 @@ impl TrackRepo {
         }
         let jointure = d.tri.map_or("", ColonneDeTri::jointure);
         let where_total = conditions.join(" AND ");
-        let total = self.total_garde(
-            &format!(
-                "SELECT COUNT(*){}{jointure} WHERE {where_total}",
-                sql::track_from()
-            ),
-            &valeurs,
-        )?;
+        let sql_total = format!(
+            "SELECT COUNT(*){}{jointure} WHERE {where_total}",
+            sql::track_from()
+        );
 
         // L'ordre, et ce que la page relit pour fabriquer le curseur.
         let sens = if d.descendant { "DESC" } else { "ASC" };
@@ -580,10 +577,38 @@ impl TrackRepo {
             let en_sql =
                 crate::db::facet_filter::socle_ensembliste_de_la_vue_des_pistes(engine)[1].clone();
             let base: Vec<String> = conditions.into_iter().filter(|c| *c != en_sql).collect();
+            // Le total sans rejouer le socle en SQL : les identifiants de la
+            // base (lus par l'index), moins ceux de l'ensemble écarté.
+            let sql_ids = format!(
+                "SELECT t.id{}{jointure}{}",
+                sql::track_from(),
+                if base.is_empty() {
+                    String::new()
+                } else {
+                    format!(" WHERE {}", base.join(" AND "))
+                }
+            );
+            let total = self.total_garde(&sql_ids, &valeurs, &|| {
+                Ok(self
+                    .db
+                    .query_many(&sql_ids, &refs(&valeurs))?
+                    .iter()
+                    .filter_map(|l| l.first().and_then(SqlValue::as_i64))
+                    .filter(|id| !ecartees.contains(id))
+                    .count() as i64)
+            })?;
             return self.page_par_l_index(
                 d, &base, &valeurs, &ecartees, apres, jointure, total, comptes,
             );
         }
+        let total = self.total_garde(&sql_total, &valeurs, &|| {
+            Ok(self
+                .db
+                .query_one(&sql_total, &refs(&valeurs))?
+                .as_ref()
+                .and_then(|c| c.first().and_then(|v| v.as_i64()))
+                .unwrap_or(0))
+        })?;
         let decalage = if apres.is_some() { 0 } else { d.offset.max(0) };
         let (limite, offset_ph) = (ph.take(), ph.take());
         page_valeurs.push(SqlValue::Int(d.limit));
@@ -725,7 +750,12 @@ impl TrackRepo {
 
     /// Le total d'une liste, gardé sous le jeton des données : tant que rien
     /// n'est écrit, les pages suivantes d'une même requête ne recomptent pas.
-    fn total_garde(&self, sql_total: &str, valeurs: &[SqlValue]) -> Result<i64, TuneError> {
+    fn total_garde(
+        &self,
+        sql_total: &str,
+        valeurs: &[SqlValue],
+        compter: &dyn Fn() -> Result<i64, TuneError>,
+    ) -> Result<i64, TuneError> {
         type Entree = ((u64, i64), String, i64);
         static TOTAUX: std::sync::Mutex<Vec<Entree>> = std::sync::Mutex::new(Vec::new());
         const ENTREES: usize = 8;
@@ -737,12 +767,7 @@ impl TrackRepo {
         {
             return Ok(*n);
         }
-        let n = self
-            .db
-            .query_one(sql_total, &refs(valeurs))?
-            .as_ref()
-            .and_then(|c| c.first().and_then(|v| v.as_i64()))
-            .unwrap_or(0);
+        let n = compter()?;
         if let Some(j) = jeton
             && let Ok(mut t) = TOTAUX.lock()
         {
