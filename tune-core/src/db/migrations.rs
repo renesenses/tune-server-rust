@@ -3829,6 +3829,22 @@ pub(crate) const UPNP_NUMEROS_ZERO_A_NULL: &str = "UPDATE tracks SET track_numbe
 pub(crate) const TRACKS_TITLE_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(title)";
 
+/// #7619 (volet L3, rc11) — la recherche de pistes trouve aussi une piste par
+/// son GENRE ou son COMPOSITEUR, en sous-chaîne sans accents ni casse
+/// (`LOWER(unaccent(…)) LIKE`). Ce motif ne peut servir d'aucun index : il
+/// était donc évalué, fonction Rust comprise, sur CHACUNE des 96 496 pistes du
+/// .18, deux fois par recherche (page et compte). La recherche le pose
+/// désormais sur le DICTIONNAIRE des valeurs distinctes (quelques centaines de
+/// genres, deux mille compositeurs), puis retrouve les pistes par égalité —
+/// ce que ces deux index servent, comme ils servent la lecture du dictionnaire
+/// (index couvrant, sans lire la table).
+///
+/// Même texte sur les deux moteurs. Rejoué à chaque démarrage, sans numéro
+/// de migration — même raison que [`TRACKS_SOURCE_ID_INDEX`].
+pub(crate) const TRACKS_GENRE_COMPOSER_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tracks_genre ON tracks(genre);
+     CREATE INDEX IF NOT EXISTS idx_tracks_composer ON tracks(composer);";
+
 pub(crate) const DR_ALBUM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_track_metadata_dr \
      ON track_metadata(key, track_id, value) WHERE key IN ('dr_album', 'dr_track');
      CREATE INDEX IF NOT EXISTS idx_tracks_id_album ON tracks(id, album_id);";
@@ -4823,6 +4839,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // la constante.
     if let Err(e) = db.execute_batch(TRACKS_TITLE_INDEX) {
         warn!(error = %e, "sqlite_tracks_title_index_failed");
+    }
+    // #7619 (L3) — recherche par genre et compositeur : même passe — voir la
+    // constante.
+    if let Err(e) = db.execute_batch(TRACKS_GENRE_COMPOSER_INDEX) {
+        warn!(error = %e, "sqlite_tracks_genre_composer_index_failed");
     }
     // #2149 — collections à règle de genre : même passe — voir la constante.
     if let Err(e) = db.execute_batch(TRACKS_ALBUM_GENRE_INDEX) {
@@ -5902,6 +5923,13 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // finale SQLite.
     if let Err(e) = sqlx::raw_sql(TRACKS_TITLE_INDEX).execute(pool).await {
         warn!(error = %e, "pg_tracks_title_index_failed");
+    }
+    // #7619 (L3) — même index, même texte que la passe finale SQLite.
+    if let Err(e) = sqlx::raw_sql(TRACKS_GENRE_COMPOSER_INDEX)
+        .execute(pool)
+        .await
+    {
+        warn!(error = %e, "pg_tracks_genre_composer_index_failed");
     }
     // #5998 — même passe que la passe finale SQLite, même raison.
     if let Err(e) = sqlx::raw_sql(crate::db::track_repo::INDEX_CHEMIN_DOSSIER_PG)

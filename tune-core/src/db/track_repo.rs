@@ -1544,13 +1544,49 @@ pub mod sql {
 
     /// Le OU des critères, la branche plein texte `plein_texte` en tête, puis
     /// trois `LIKE` et l'année sur les emplacements `n + 1` à `n + 4`.
+    ///
+    /// #7619 (L3) — chaque `LIKE` est posé sur un DICTIONNAIRE, jamais sur la
+    /// piste. Écrit `LOWER(unaccent(ar.name)) LIKE …` sur la ligne jointe, il
+    /// était évalué — `unaccent` est une fonction Rust sous SQLite — sur
+    /// CHACUNE des pistes de la bibliothèque, puisqu'aucun index ne sert un
+    /// motif `%…%` : ≈ 320 ms par passe sur les 96 496 pistes du .18, et la
+    /// recherche en fait deux (page et compte). Le même `LIKE` ne porte plus
+    /// que sur les 2 626 artistes, les genres et les compositeurs DISTINCTS ;
+    /// la piste est retrouvée par égalité, qu'un index sert. Chaque branche du
+    /// OU porte alors sur une colonne indexée de `t`, et SQLite les réunit
+    /// (« MULTI-INDEX OR ») au lieu de parcourir la table.
+    ///
+    /// Le résultat est le même, ligne pour ligne : `ar` est la jointure
+    /// `t.artist_id = ar.id` (un artiste absent rend `NULL`, que ni le `LIKE`
+    /// ni le `IN` ne retiennent) ; un genre `NULL` n'est ni `LIKE` ni `IN` ;
+    /// `al` est la jointure `t.album_id = al.id`.
+    ///
+    /// Le dictionnaire est MATÉRIALISÉ : sans cela, SQLite pousse le `LIKE`
+    /// dans le `SELECT DISTINCT` et le rejoue sur chaque piste, ce qu'il
+    /// s'agit justement d'éviter.
     fn criteres<D: SqlDialect>(d: &D, plein_texte: String, n: usize) -> String {
         format!(
-            "({plein_texte} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {})",
+            "({plein_texte} \
+             OR t.artist_id IN (SELECT dico_ar.id FROM artists dico_ar \
+             WHERE LOWER(unaccent(dico_ar.name)) LIKE LOWER(unaccent({}))) \
+             OR {} OR {} \
+             OR t.album_id IN (SELECT dico_al.id FROM albums dico_al \
+             WHERE CAST(dico_al.year AS TEXT) = {}))",
             d.placeholder(n + 1),
-            d.placeholder(n + 2),
-            d.placeholder(n + 3),
+            valeur_du_dictionnaire("genre", &d.placeholder(n + 2)),
+            valeur_du_dictionnaire("composer", &d.placeholder(n + 3)),
             d.placeholder(n + 4),
+        )
+    }
+
+    /// `t.{colonne}` vaut l'une des valeurs DISTINCTES de la colonne qui
+    /// contiennent le motif `motif`, sans accents ni casse — voir
+    /// [`criteres`]. `colonne` est un nom écrit par le code, jamais une saisie.
+    fn valeur_du_dictionnaire(colonne: &str, motif: &str) -> String {
+        format!(
+            "t.{colonne} IN (WITH dico AS MATERIALIZED \
+             (SELECT DISTINCT {colonne} AS v FROM tracks WHERE {colonne} IS NOT NULL) \
+             SELECT dico.v FROM dico WHERE LOWER(unaccent(dico.v)) LIKE LOWER(unaccent({motif})))"
         )
     }
 
@@ -1607,6 +1643,28 @@ pub mod sql {
         format!(
             "{} WHERE {} ORDER BY {}, t.id LIMIT {} OFFSET {}",
             select_track(),
+            search_where(d),
+            search_rang(d),
+            d.placeholder(11),
+            d.placeholder(12),
+        )
+    }
+
+    /// #7619 (L3) — [`search`] et le NOMBRE de pistes correspondantes en UNE
+    /// requête : `COUNT(*) OVER ()` en dernière colonne, calculé sur tout le
+    /// prédicat avant `LIMIT`/`OFFSET`. La page doit de toute façon lire
+    /// toutes les correspondances pour les ordonner ; le compte séparé
+    /// ([`search_count`]) rejouait ce même prédicat une seconde fois.
+    ///
+    /// La colonne vient APRÈS la projection de [`select_track`], qui reste
+    /// lue telle quelle par `row_to_track`. Mêmes emplacements que [`search`].
+    pub fn search_avec_total<D: SqlDialect>(d: &D) -> String {
+        let select = select_track();
+        let (projection, from) = select
+            .split_once(track_from())
+            .expect("select_track() se termine par track_from()");
+        format!(
+            "{projection}, COUNT(*) OVER (){from} WHERE {} ORDER BY {}, t.id LIMIT {} OFFSET {}",
             search_where(d),
             search_rang(d),
             d.placeholder(11),
@@ -3521,6 +3579,55 @@ impl TrackRepo {
         Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
+    /// #7619 (L3) — [`Self::search_page`] ET [`Self::search_count`] en une
+    /// seule requête : la page, et le nombre de pistes correspondantes borné à
+    /// `plafond` (le rendre signifie « au moins `plafond` », comme
+    /// `search_count`).
+    ///
+    /// Une page VIDE ne porte aucune ligne, donc aucun compte : au-delà de la
+    /// dernière page, le compte est relu par [`Self::search_count`] ; sur la
+    /// première, il vaut 0.
+    pub fn search_page_et_total(
+        &self,
+        query: &str,
+        limit: i64,
+        offset: i64,
+        plafond: i64,
+    ) -> Result<(Vec<Track>, i64), TuneError> {
+        let fts_query =
+            crate::db::engine::format_fts_query_piste_ou_chemin(self.db.engine(), query);
+        let fts_identite = crate::db::engine::format_fts_query_piste(self.db.engine(), query);
+        let like = crate::db::engine::motif_like(query);
+        let trimmed = query.trim();
+        let offset = offset.max(0);
+        let sql = self.dialect_sql(sql::search_avec_total, sql::search_avec_total);
+        let params: [&dyn ToSqlValue; 12] = [
+            &fts_query,
+            &like,
+            &like,
+            &like,
+            &trimmed,
+            &fts_identite,
+            &like,
+            &like,
+            &like,
+            &trimmed,
+            &limit,
+            &offset,
+        ];
+        let rows = self.db.query_many(&sql, &params)?;
+        let total = rows
+            .first()
+            .and_then(|cols| cols.get(COLONNE_DU_TOTAL).and_then(|v| v.as_i64()));
+        let pistes = rows.iter().map(|cols| row_to_track(cols)).collect();
+        let total = match total {
+            Some(n) => n.min(plafond),
+            None if offset > 0 => self.search_count(query, plafond)?,
+            None => 0,
+        };
+        Ok((pistes, total))
+    }
+
     /// Le nombre de pistes que [`Self::search_page`] parcourrait, borné à
     /// `plafond`.
     ///
@@ -4782,6 +4889,11 @@ impl TrackRepo {
         Ok(delete_ids.len() as i64)
     }
 }
+
+/// #7619 (L3) — le rang de `COUNT(*) OVER ()` dans
+/// [`sql::search_avec_total`] : juste après les 36 colonnes de
+/// [`sql::select_track`] (0 à 35).
+const COLONNE_DU_TOTAL: usize = 36;
 
 fn row_to_track(cols: &[SqlValue]) -> Track {
     Track {
