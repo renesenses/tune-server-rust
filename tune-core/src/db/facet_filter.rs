@@ -245,21 +245,46 @@ pub const CHAMPS_DU_TEXTE_LIBRE: [&str; 10] = [
     "album_conductor",
 ];
 
-/// Les mots du texte libre (#4319) : la saisie, doubles guillemets ôtés
-/// (`motif_like`), découpée aux blancs. Une saisie sans mot n'en rend aucun.
+/// Les mots du texte libre (#4319) : la saisie découpée à tout ce qui n'est
+/// ni lettre ni chiffre (blancs, ponctuation, guillemets), comme l'index plein
+/// texte découpe les siens. Une saisie sans mot n'en rend aucun.
+///
+/// #7619 (L3), décision de Bertrand du 01/11/2026 : le texte libre trouve par
+/// DÉBUT DE MOT, comme `/search`. « ac/dc » cherche donc « ac » et « dc »,
+/// chacun au début d'un mot.
 pub fn mots_du_texte_libre(query: &str) -> Vec<String> {
     query
-        .replace('"', "")
-        .split_whitespace()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|m| !m.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// La ponctuation qui sépare deux mots dans un champ comparé par le texte
+/// libre (#7619) : remplacée par une espace avant le `LIKE '% mot%'`, pour que
+/// « (Valerie June) », « Saint-Saëns » ou « AC/DC » commencent bien un mot
+/// après chacun de ces signes.
+const SEPARATEURS_DE_MOTS: [&str; 12] =
+    ["(", ")", "[", "]", "-", "/", ".", ",", "'", "’", "&", ":"];
+
+/// `expr` réduit pour une comparaison en DÉBUT DE MOT (#7619) : sans accents
+/// ni casse, la ponctuation de [`SEPARATEURS_DE_MOTS`] changée en espace, et
+/// une espace en tête. Le motif `% mot%` y trouve alors le début du champ ou
+/// le début de n'importe lequel de ses mots — jamais le milieu d'un mot.
+fn en_debut_de_mot(expr: &str) -> String {
+    let mut sql = format!("LOWER(unaccent({expr}))");
+    for sep in SEPARATEURS_DE_MOTS {
+        sql = format!("REPLACE({sql}, '{}', ' ')", sep.replace('\'', "''"));
+    }
+    format!("(' ' || {sql})")
 }
 
 /// Le prédicat du texte libre d'Oxygen et de la Bibliothèque, pour la piste
 /// d'alias `t`.
 ///
-/// 🔴 #4319 — CHAQUE MOT de la saisie doit se trouver, en sous-chaîne
-/// insensible à la casse et aux accents, dans AU MOINS UN des
+/// 🔴 #4319 — CHAQUE MOT de la saisie doit se trouver, au DÉBUT d'un mot
+/// (#7619, décision du 01/11/2026 ; en sous-chaîne avant), insensible à la
+/// casse et aux accents, dans AU MOINS UN des
 /// [`CHAMPS_DU_TEXTE_LIBRE`] : ET entre les mots, OU entre les champs. Avant,
 /// la saisie entière était cherchée d'un seul tenant, dans un seul champ :
 /// « mahler mehta » ne trouvait que l'album dont UN champ contenait les deux
@@ -275,8 +300,7 @@ pub fn mots_du_texte_libre(query: &str) -> Vec<String> {
 /// passent par sous-requête NON corrélée : le compteur du rail n'a aucune
 /// jointure, et chaque sous-requête n'est évaluée qu'une fois.
 ///
-/// Chaque mot est LITTÉRAL : ses `%` et `_` sont échappés, comme le
-/// navigateur qui fait un `includes`. Rend le prédicat et les valeurs à lier,
+/// Chaque mot est LITTÉRAL : ses `%` et `_` sont échappés. Rend le prédicat et les valeurs à lier,
 /// dans l'ordre des marqueurs : `CHAMPS_DU_TEXTE_LIBRE.len()` par mot.
 pub fn condition_texte_libre(
     ph: &mut Placeholders,
@@ -324,29 +348,39 @@ pub fn condition_texte_libre(
         let chef = like(ph);
         let chef_credit = like(ph);
         let chef_album = like(ph);
+        let champ = en_debut_de_mot;
         clauses.push(format!(
-            "(LOWER(unaccent(t.title)) {titre} \
-             OR t.artist_id IN (SELECT id FROM artists WHERE LOWER(unaccent(name)) {artiste}) \
-             OR t.album_id IN (SELECT id FROM albums WHERE LOWER(unaccent(title)) {titre_album}) \
+            "({} {titre} \
+             OR t.artist_id IN (SELECT id FROM artists WHERE {} {artiste}) \
+             OR t.album_id IN (SELECT id FROM albums WHERE {} {titre_album}) \
              OR {} \
-             OR LOWER(unaccent({termes})) {chemin} \
+             OR {} {chemin} \
              OR {} \
              OR t.album_id IN (SELECT al.id FROM albums al JOIN artists ar ON ar.id = al.artist_id \
-                WHERE LOWER(unaccent(ar.name)) {artiste_album}) \
+                WHERE {} {artiste_album}) \
              OR {piste} IN (SELECT {magasin_piste} FROM track_metadata \
-                WHERE key = 'conductor' AND LOWER(unaccent(value)) {chef}) \
+                WHERE key = 'conductor' AND {} {chef}) \
              OR {piste} IN (SELECT {magasin_piste} FROM track_credits \
-                WHERE LOWER(role) = 'conductor' AND LOWER(unaccent(artist_name)) {chef_credit}) \
+                WHERE LOWER(role) = 'conductor' AND {} {chef_credit}) \
              OR {album} IN (SELECT {magasin_album} FROM album_metadata \
-                WHERE key = 'conductor' AND LOWER(unaccent(value)) {chef_album}))",
+                WHERE key = 'conductor' AND {} {chef_album}))",
+            champ("t.title"),
+            champ("name"),
+            champ("title"),
             // #7619 (L3) — label et compositeur : le `LIKE` sur les valeurs
             // DISTINCTES, la piste par égalité. Même ensemble (une valeur NULL
             // n'est ni `LIKE` ni `IN`), sans la fonction `unaccent` rejouée
-            // sur chaque piste. Voir `TrackRepo::sql::criteres`.
+            // sur chaque piste.
             valeur_distincte_like("label", &label),
+            champ(&termes),
             valeur_distincte_like("composer", &compositeur),
+            champ("ar.name"),
+            champ("value"),
+            champ("artist_name"),
+            champ("value"),
         ));
-        let motif = format!("%{}%", super::track_repo::echapper_jokers_like(mot));
+        // #7619 : début de mot — le champ réduit commence par une espace.
+        let motif = format!("% {}%", super::track_repo::echapper_jokers_like(mot));
         valeurs.extend(
             (0..CHAMPS_DU_TEXTE_LIBRE.len()).map(|_| super::backend::SqlValue::Text(motif.clone())),
         );
@@ -355,7 +389,7 @@ pub fn condition_texte_libre(
 }
 
 /// `t.{colonne}` vaut l'une des valeurs DISTINCTES de la colonne dont
-/// `LOWER(unaccent(valeur))` satisfait `motif` (`LIKE …`, échappement
+/// la forme [`en_debut_de_mot`] satisfait `motif` (`LIKE …`, échappement
 /// compris) — #7619 (L3). Le dictionnaire est MATÉRIALISÉ : sans cela, SQLite
 /// pousse le filtre dans le `SELECT DISTINCT` et rejoue `unaccent` sur chaque
 /// piste. `colonne` est un nom écrit par le code, jamais une saisie.
@@ -363,7 +397,8 @@ fn valeur_distincte_like(colonne: &str, motif: &str) -> String {
     format!(
         "t.{colonne} IN (WITH dico AS MATERIALIZED \
          (SELECT DISTINCT {colonne} AS v FROM tracks WHERE {colonne} IS NOT NULL) \
-         SELECT dico.v FROM dico WHERE LOWER(unaccent(dico.v)) {motif})"
+         SELECT dico.v FROM dico WHERE {} {motif})",
+        en_debut_de_mot("dico.v")
     )
 }
 
@@ -1689,14 +1724,16 @@ mod tests {
                 sql.contains(&format!(
                     "OR t.composer IN (WITH dico AS MATERIALIZED \
                      (SELECT DISTINCT composer AS v FROM tracks WHERE composer IS NOT NULL) \
-                     SELECT dico.v FROM dico WHERE LOWER(unaccent(dico.v)) \
-                     LIKE LOWER(unaccent({sixieme})){esc}) OR"
+                     SELECT dico.v FROM dico WHERE {} \
+                     LIKE LOWER(unaccent({sixieme})){esc}) OR",
+                    super::en_debut_de_mot("dico.v")
                 )),
                 "{engine:?} : le compositeur, sixième : {sql}"
             );
+            // #7619 : début de mot ; « % » sépare deux mots, comme l'index.
             let motif = format!(
-                "%{}%",
-                super::super::track_repo::echapper_jokers_like("Ravél50%")
+                "% {}%",
+                super::super::track_repo::echapper_jokers_like("Ravél50")
             );
             for v in &valeurs {
                 assert!(

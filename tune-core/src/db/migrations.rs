@@ -3829,15 +3829,17 @@ pub(crate) const UPNP_NUMEROS_ZERO_A_NULL: &str = "UPDATE tracks SET track_numbe
 pub(crate) const TRACKS_TITLE_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(title)";
 
-/// #7619 (volet L3, rc11) — la recherche de pistes trouve aussi une piste par
-/// son GENRE ou son COMPOSITEUR, en sous-chaîne sans accents ni casse
-/// (`LOWER(unaccent(…)) LIKE`). Ce motif ne peut servir d'aucun index : il
-/// était donc évalué, fonction Rust comprise, sur CHACUNE des 96 496 pistes du
-/// .18, deux fois par recherche (page et compte). La recherche le pose
-/// désormais sur le DICTIONNAIRE des valeurs distinctes (quelques centaines de
-/// genres, deux mille compositeurs), puis retrouve les pistes par égalité —
-/// ce que ces deux index servent, comme ils servent la lecture du dictionnaire
-/// (index couvrant, sans lire la table).
+/// #7619 (volet L3, rc11) — deux index d'égalité sur les pistes.
+///
+/// `idx_tracks_composer` sert le texte libre d'Oxygen (`/library/tracks?q=`) :
+/// son `LIKE` sur le compositeur est posé sur le DICTIONNAIRE des valeurs
+/// distinctes (lu par l'index, sans la table), puis les pistes sont retrouvées
+/// par égalité — au lieu de rejouer `unaccent`, fonction Rust sous SQLite, sur
+/// chacune des 96 496 pistes du .18. `idx_tracks_genre` sert les égalités
+/// `t.genre = ?` de la radio d'artiste et des recommandations.
+///
+/// La recherche `/search`, elle, ne s'en sert plus : depuis la décision du
+/// 01/11/2026 (début de mot), elle passe tout entière par l'index plein texte.
 ///
 /// Même texte sur les deux moteurs. Rejoué à chaque démarrage, sans numéro
 /// de migration — même raison que [`TRACKS_SOURCE_ID_INDEX`].
@@ -4840,8 +4842,8 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(TRACKS_TITLE_INDEX) {
         warn!(error = %e, "sqlite_tracks_title_index_failed");
     }
-    // #7619 (L3) — recherche par genre et compositeur : même passe — voir la
-    // constante.
+    // #7619 (L3) — index d'égalité du genre et du compositeur : même passe —
+    // voir la constante.
     if let Err(e) = db.execute_batch(TRACKS_GENRE_COMPOSER_INDEX) {
         warn!(error = %e, "sqlite_tracks_genre_composer_index_failed");
     }
@@ -5931,7 +5933,9 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
         warn!(error = %e, "pg_tracks_title_index_failed");
     }
     // #7619 (L4/L5) — la révision de la bibliothèque, un bloc `DO`.
-    if let Err(e) = sqlx::raw_sql(&super::library_revision::sql_postgres())
+    // Texte bâti par le code, sur les seuls noms de `TABLES_SUIVIES` (des
+    // constantes) : aucune saisie n'y entre.
+    if let Err(e) = sqlx::raw_sql(sqlx::AssertSqlSafe(super::library_revision::sql_postgres()))
         .execute(pool)
         .await
     {

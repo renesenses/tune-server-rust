@@ -3665,3 +3665,59 @@ async fn pg_b209_ordre_dans_l_album_et_rattrapage_des_zeros_upnp() {
         ids[&3],
     );
 }
+
+/// #7619 (L3) — la recherche en DÉBUT DE MOT (décision du 01/11/2026) sur le
+/// VRAI moteur : `to_tsquery` avec `:*` sur chaque mot, `unaccent`, la
+/// restriction d'identité (#4367), le titre de piste pour les albums, les
+/// labels et le texte libre d'Oxygen. Mêmes scénarios que les témoins SQLite.
+fn preparer_7619(db: &Arc<dyn DbBackend>) {
+    reset_schema(db);
+    db.execute("DELETE FROM hidden_items", &[]).unwrap();
+    crate::db::recherche_debut_de_mot_7619_tests::peupler(db.as_ref());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_7619_pistes_par_debut_de_mot() {
+    let db = pg_or_skip!();
+    preparer_7619(&db);
+    crate::db::recherche_debut_de_mot_7619_tests::scenario_pistes_7619(db);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_7619_albums_artistes_labels_par_debut_de_mot() {
+    let db = pg_or_skip!();
+    preparer_7619(&db);
+    crate::db::recherche_debut_de_mot_7619_tests::scenario_albums_artistes_labels_7619(db);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_7619_texte_libre_par_debut_de_mot() {
+    let db = pg_or_skip!();
+    preparer_7619(&db);
+    crate::db::recherche_debut_de_mot_7619_tests::scenario_texte_libre_7619(db);
+}
+
+/// #7619 (L4) — la révision de la bibliothèque sur le VRAI moteur : le bloc
+/// `DO` de la passe de démarrage se pose, se rejoue sans rien casser, et une
+/// écriture dans une table suivie change la révision, l'historique non.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_7619_revision_de_la_bibliotheque() {
+    use crate::db::library_revision::{lire, sql_postgres};
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    db.execute(&sql_postgres(), &[]).unwrap();
+    db.execute(&sql_postgres(), &[]).unwrap();
+    let (instance, avant) = lire(db.as_ref()).expect("révision posée");
+    db.execute("INSERT INTO artists (id, name) VALUES (1, 'Révision')", &[])
+        .unwrap();
+    let (instance2, apres) = lire(db.as_ref()).unwrap();
+    assert_eq!(instance, instance2, "même base, même instance");
+    assert!(apres > avant, "une écriture d'artistes change la révision");
+    db.execute("INSERT INTO listen_history (title) VALUES ('Écoute')", &[])
+        .unwrap();
+    assert_eq!(
+        lire(db.as_ref()).unwrap().1,
+        apres,
+        "l'historique ne la change pas"
+    );
+}

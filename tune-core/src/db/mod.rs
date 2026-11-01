@@ -110,7 +110,7 @@ mod mbid_deja_porte_7535_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
 #[cfg(test)]
-mod recherche_dictionnaires_7619_tests;
+mod recherche_debut_de_mot_7619_tests;
 #[cfg(test)]
 mod replieur_wal_tests;
 /// Fil 2130 — « Reprendre l'écoute » : jointure en UNION ALL et index de

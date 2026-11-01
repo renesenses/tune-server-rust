@@ -100,8 +100,8 @@ pub fn fold_diacritics(s: &str) -> String {
 /// bucket, hence the OR rather than a straight swap.
 ///
 /// Per engine:
-/// - SQLite FTS5: `term1 term2*`, or `(a b*) OR (ab*)`
-/// - Postgres tsquery: `term1 & term2:*`, or `(a & b:*) | (ab:*)`
+/// - SQLite FTS5: `term1* term2*`, or `(a* b*) OR (ab*)`
+/// - Postgres tsquery: `term1:* & term2:*`, or `(a:* & b:*) | (ab:*)`
 ///
 /// Returns an empty string if the input has no usable tokens, so the
 /// caller can short-circuit to a LIKE-only path.
@@ -256,6 +256,21 @@ pub fn format_fts_query_piste(engine: Engine, raw: &str) -> String {
     }
 }
 
+/// #7619 (L3) — la requête plein texte qui trouve un ALBUM par le TITRE de
+/// l'une de ses pistes, en début de mot (décision du 01/11/2026).
+///
+/// Sous SQLite, le filtre de colonnes FTS5 `{title} : (expr)` restreint la
+/// correspondance au titre de la piste dans `tracks_fts`. Postgres reçoit la
+/// requête nue : `search_tsv` sélectionne par son index GIN, et
+/// [`SqlDialect::fts_titre_de_piste`] restreint au titre.
+pub fn format_fts_query_titre_de_piste(engine: Engine, raw: &str) -> String {
+    let base = format_fts_query(engine, raw);
+    match engine {
+        Engine::Sqlite if !base.is_empty() => format!("{{title}} : ({base})"),
+        _ => base,
+    }
+}
+
 /// La requête plein texte qui SÉLECTIONNE les pistes d'une recherche : la
 /// piste par elle-même, OU par les termes de son chemin (#5192) — nom du
 /// dernier dossier et nom du fichier, voir
@@ -304,31 +319,29 @@ fn pg_vecteur_identite_piste(alias_piste: &str, alias_artiste: &str) -> String {
     )
 }
 
-/// AND the tokens together in `engine`'s dialect, prefix-marking the last.
+/// AND the tokens together in `engine`'s dialect, EVERY token prefix-marked.
+///
+/// #7619 (L3), décision de Bertrand du 01/11/2026 : la recherche trouve par
+/// DÉBUT DE MOT. Chaque mot saisi est le début d'un mot indexé, pas seulement
+/// le dernier : « mil dav » trouve « Miles Davis ». Avant, seul le dernier
+/// mot était un préfixe, les autres devaient être des mots entiers.
 fn join_fts_tokens(engine: Engine, tokens: &[String]) -> String {
-    let Some((last, head)) = tokens.split_last() else {
+    if tokens.is_empty() {
         return String::new();
-    };
+    }
     match engine {
-        Engine::Sqlite => {
-            // FTS5 accepts space-separated tokens with implicit AND.
-            let prefix = if head.is_empty() {
-                String::new()
-            } else {
-                format!("{} ", head.join(" "))
-            };
-            format!("{prefix}{last}*")
-        }
-        Engine::Postgres => {
-            // tsquery requires explicit operators between tokens; the
-            // prefix marker `:*` only goes on the last token.
-            let prefix = if head.is_empty() {
-                String::new()
-            } else {
-                format!("{} & ", head.join(" & "))
-            };
-            format!("{prefix}{last}:*")
-        }
+        // FTS5 accepts space-separated tokens with implicit AND.
+        Engine::Sqlite => tokens
+            .iter()
+            .map(|t| format!("{t}*"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        // tsquery requires explicit operators between tokens.
+        Engine::Postgres => tokens
+            .iter()
+            .map(|t| format!("{t}:*"))
+            .collect::<Vec<_>>()
+            .join(" & "),
     }
 }
 
@@ -407,6 +420,13 @@ pub trait SqlDialect {
         alias_album: &str,
         query_placeholder: &str,
     ) -> String;
+
+    /// #7619 (L3) — les ALBUMS dont une piste porte, dans son TITRE, chaque
+    /// mot de la requête en début de mot (requête de
+    /// [`format_fts_query_titre_de_piste`]). Rend un prédicat
+    /// `{alias_album}.id IN (…)` : l'index plein texte choisit les pistes, la
+    /// clé des albums fait le reste — aucun `LIKE` sur chaque piste.
+    fn fts_titre_de_piste(&self, alias_album: &str, query_placeholder: &str) -> String;
 
     /// JSON path extraction (returns text).
     /// SQLite: `json_extract(<column>, '<path>')`
@@ -527,6 +547,14 @@ impl SqlDialect for SqliteDialect {
         String::new()
     }
 
+    fn fts_titre_de_piste(&self, alias_album: &str, query_placeholder: &str) -> String {
+        // Le filtre `{title}` voyage dans la chaîne du `MATCH`.
+        format!(
+            "{alias_album}.id IN (SELECT ttp.album_id FROM tracks ttp WHERE ttp.id IN \
+             (SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH {query_placeholder}))"
+        )
+    }
+
     fn json_extract_text(&self, column: &str, path: &str) -> String {
         // Caller is responsible for passing a path that is already
         // single-quote-safe (we don't allow user input here in practice;
@@ -638,6 +666,18 @@ impl SqlDialect for PostgresDialect {
         format!(
             "({identite} @@ {requete} OR \
              (({identite} || {chemin}) @@ {requete} AND NOT ({album} @@ {requete})))"
+        )
+    }
+
+    fn fts_titre_de_piste(&self, alias_album: &str, query_placeholder: &str) -> String {
+        // `search_tsv` (index GIN) choisit les pistes ; le titre seul, recalculé
+        // à la volée, ne fait que les filtrer — même règle que
+        // `fts_piste_hors_album`.
+        let requete = format!("to_tsquery('simple', unaccent({query_placeholder}))");
+        format!(
+            "{alias_album}.id IN (SELECT ttp.album_id FROM tracks ttp \
+             WHERE ttp.search_tsv @@ {requete} \
+             AND to_tsvector('simple', unaccent(COALESCE(ttp.title, ''))) @@ {requete})"
         )
     }
 
@@ -797,10 +837,10 @@ mod tests {
         assert_eq!(format_fts_query(Engine::Sqlite, "\"kind of"), "\"kind of\"");
         // Rien d'utilisable entre les guillemets : rien.
         assert_eq!(format_fts_query(Engine::Sqlite, "\"  !! \""), "");
-        // Sans guillemets, rien ne change.
+        // Sans guillemets : chaque mot est un début de mot (#7619).
         assert_eq!(
             format_fts_query(Engine::Sqlite, "kind of blue"),
-            "kind of blue*"
+            "kind* of* blue*"
         );
         assert_eq!(motif_like("\"kind of blue\""), "%kind of blue%");
     }
@@ -811,17 +851,28 @@ mod tests {
         assert_eq!(format_fts_query(Engine::Postgres, "miles"), "miles:*");
     }
 
+    /// #7619 (L3) — décision du 01/11/2026 : CHAQUE mot saisi est un début
+    /// de mot, pas seulement le dernier.
+    #[test]
+    fn chaque_mot_est_un_debut_de_mot_7619() {
+        assert_eq!(format_fts_query(Engine::Sqlite, "mil dav"), "mil* dav*");
+        assert_eq!(
+            format_fts_query(Engine::Postgres, "mil dav"),
+            "mil:* & dav:*"
+        );
+    }
+
     #[test]
     fn format_fts_query_multi_word() {
         // Multi-word inputs are AND-joined per engine syntax. This is
         // the bug that crashed tsquery in the v0.8.28 PG smoke test.
         assert_eq!(
             format_fts_query(Engine::Sqlite, "miles davis"),
-            "miles davis*"
+            "miles* davis*"
         );
         assert_eq!(
             format_fts_query(Engine::Postgres, "miles davis"),
-            "miles & davis:*"
+            "miles:* & davis:*"
         );
     }
 
@@ -829,7 +880,7 @@ mod tests {
     fn format_fts_query_strips_punctuation() {
         assert_eq!(
             format_fts_query(Engine::Postgres, "rock & roll!"),
-            "rock & roll:*"
+            "rock:* & roll:*"
         );
         // The user's `&` is stripped along with other non-alphanumerics
         // before we re-introduce it as the tsquery AND operator.
@@ -857,11 +908,11 @@ mod tests {
         // data that does not.
         assert_eq!(
             format_fts_query(Engine::Sqlite, "AC/DC"),
-            "(AC DC*) OR (ACDC*)"
+            "(AC* DC*) OR (ACDC*)"
         );
         assert_eq!(
             format_fts_query(Engine::Postgres, "AC/DC"),
-            "(AC & DC:*) | (ACDC:*)"
+            "(AC:* & DC:*) | (ACDC:*)"
         );
     }
 
@@ -872,11 +923,11 @@ mod tests {
         // `Saint-Saens` returned nothing at all.
         assert_eq!(
             format_fts_query(Engine::Sqlite, "B.B. King"),
-            "(B B King*) OR (BB King*)"
+            "(B* B* King*) OR (BB* King*)"
         );
         assert_eq!(
             format_fts_query(Engine::Sqlite, "Saint-Saens"),
-            "(Saint Saens*) OR (SaintSaens*)"
+            "(Saint* Saens*) OR (SaintSaens*)"
         );
     }
 
@@ -885,11 +936,11 @@ mod tests {
         // The common case must not pay for a second branch.
         assert_eq!(
             format_fts_query(Engine::Sqlite, "miles davis"),
-            "miles davis*"
+            "miles* davis*"
         );
         assert_eq!(
             format_fts_query(Engine::Postgres, "miles davis"),
-            "miles & davis:*"
+            "miles:* & davis:*"
         );
     }
 

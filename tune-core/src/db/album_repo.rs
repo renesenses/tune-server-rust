@@ -740,16 +740,23 @@ pub mod sql {
     /// Le prédicat est celui de la grille, pris à `facet_filter`, jamais
     /// recopié — il vaut pour la page ET pour son total.
     ///
-    /// Emplacements 1..=6.
+    /// #7619 (L3), décision de Bertrand du 01/11/2026 : l'album est trouvé
+    /// par DÉBUT DE MOT, jamais en sous-chaîne. Les `LIKE '%…%'` sur le
+    /// titre, l'artiste et le genre de l'album sont retirés : `albums_fts`
+    /// (`search_tsv` sous PostgreSQL) porte ces trois colonnes, chaque mot
+    /// saisi y est un préfixe. Le titre d'une PISTE passe par l'index plein
+    /// texte des pistes ([`SqlDialect::fts_titre_de_piste`]) : le `LIKE`
+    /// rejoué sur chaque piste de la bibliothèque, page puis compte, était le
+    /// gros du temps de `/search` restant après le volet pistes.
+    ///
+    /// Emplacements 1 (requête FTS des albums), 2 (MBID) et 3 (requête FTS
+    /// du titre de piste, [`crate::db::engine::format_fts_query_titre_de_piste`]).
     pub fn search_where<D: SqlDialect>(d: &D) -> String {
         format!(
-            "(({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})))) AND {} AND {}",
+            "(({}) OR a.musicbrainz_release_id = {} OR {}) AND {} AND {}",
             d.fts_where("albums", "a", &d.placeholder(1)),
             d.placeholder(2),
-            d.placeholder(3),
-            d.placeholder(4),
-            d.placeholder(5),
-            d.placeholder(6),
+            d.fts_titre_de_piste("a", &d.placeholder(3)),
             crate::db::facet_filter::hidden_albums_excluded(),
             crate::db::facet_filter::album_distant_double_exclu(d.engine(), "a"),
         )
@@ -771,7 +778,10 @@ pub mod sql {
     ///   2. le nom de l'artiste de l'album la contient ;
     ///   3. le reste : FTS, genre, MBID, titre d'une piste.
     ///
-    /// Emplacements 7 (motif de préfixe), 8 et 9 (motif `%…%`), puis 10 et 11 :
+    /// Le rang ne SÉLECTIONNE rien : il n'ordonne que les albums déjà trouvés
+    /// en début de mot (#7619), ses `LIKE` ne portent donc que sur eux.
+    ///
+    /// Emplacements 4 (motif de préfixe), 5 et 6 (motif `%…%`), puis 7 et 8 :
     /// `LIMIT` et `OFFSET`. SQLite lit des `?` positionnels : un motif utilisé
     /// deux fois se passe deux fois.
     pub fn search<D: SqlDialect>(d: &D) -> String {
@@ -783,11 +793,11 @@ pub mod sql {
              ELSE 3 END, a.id LIMIT {} OFFSET {}",
             select_album(),
             search_where(d),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
             d.placeholder(7),
-            d.placeholder(8),
-            d.placeholder(9),
-            d.placeholder(10),
-            d.placeholder(11)
+            d.placeholder(8)
         )
     }
 
@@ -809,30 +819,38 @@ pub mod sql {
         )
     }
 
-    /// Les LABELS dont le nom contient la recherche, avec leur nombre
+    /// Les LABELS dont le nom porte la recherche, avec leur nombre
     /// d'albums visibles (point 8, Yves Corbat, 17/09/2026). Un label n'a pas
     /// d'identité en base : c'est la chaîne `albums.label`, comme dans
-    /// l'onglet Labels de la bibliothèque. Emplacements 1 (motif) et 2 (limite).
+    /// l'onglet Labels de la bibliothèque.
+    ///
+    /// #7619 (L3), décision du 01/11/2026 : en DÉBUT DE MOT — le nom commence
+    /// par la saisie (emplacement 1, `saisie%`), ou l'un de ses mots après une
+    /// espace (emplacement 2, `% saisie%`). « col » trouve « Columbia » et
+    /// « Sony Columbia », plus « Decca Collection »… mais pas « Nicolas ».
+    /// Emplacement 3 : la limite.
     pub fn search_labels<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT a.label, COUNT(*) AS n FROM albums a \
              WHERE a.label IS NOT NULL AND TRIM(a.label) <> '' \
-             AND LOWER(unaccent(a.label)) LIKE LOWER(unaccent({})) AND {} AND {} \
+             AND (LOWER(unaccent(a.label)) LIKE LOWER(unaccent({})) \
+                  OR LOWER(unaccent(a.label)) LIKE LOWER(unaccent({}))) AND {} AND {} \
              GROUP BY a.label ORDER BY n DESC, a.label LIMIT {}",
             d.placeholder(1),
+            d.placeholder(2),
             crate::db::facet_filter::hidden_albums_excluded(),
             crate::db::facet_filter::album_distant_double_exclu(d.engine(), "a"),
-            d.placeholder(2)
+            d.placeholder(3)
         )
     }
 
-    /// Le NOMBRE d'albums correspondants, borné (emplacement 7). La borne est
+    /// Le NOMBRE d'albums correspondants, borné (emplacement 4). La borne est
     /// DANS la sous-requête : autour du `COUNT`, elle ne bornerait rien.
     pub fn search_count<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT COUNT(*) FROM (SELECT a.id FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE {} LIMIT {}) AS borne",
             search_where(d),
-            d.placeholder(7)
+            d.placeholder(4)
         )
     }
 }
@@ -4732,15 +4750,19 @@ impl AlbumRepo {
         offset: i64,
     ) -> Result<Vec<Album>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
+        // #7619 : début de mot seulement — sans mot utilisable, rien à chercher.
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fts_titre = crate::db::engine::format_fts_query_titre_de_piste(self.db.engine(), query);
         let like = crate::db::engine::motif_like(query);
         // #4665 — le motif du rang 0 : le titre COMMENCE par la saisie.
         let prefixe = format!("{}%", query.replace('"', "").trim());
         let trimmed = query.trim();
         let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
-        let params: [&dyn ToSqlValue; 11] = [
-            &fts_query, &like, &like, &like, &trimmed, &like, &prefixe, &like, &like, &limit,
-            &offset,
+        let params: [&dyn ToSqlValue; 8] = [
+            &fts_query, &trimmed, &fts_titre, &prefixe, &like, &like, &limit, &offset,
         ];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
@@ -4776,9 +4798,16 @@ impl AlbumRepo {
     /// Labels correspondant à la recherche : `(nom, nombre d'albums)`, les
     /// plus fournis d'abord.
     pub fn search_labels(&self, query: &str, limit: i64) -> Result<Vec<(String, i64)>, TuneError> {
-        let like = crate::db::engine::motif_like(query);
+        let saisie = query.replace('"', "");
+        let saisie = saisie.trim();
+        if saisie.is_empty() {
+            return Ok(Vec::new());
+        }
+        // #7619 : début du nom, ou début d'un mot après une espace.
+        let debut = format!("{saisie}%");
+        let mot = format!("% {saisie}%");
         let sql = self.dialect_sql(sql::search_labels, sql::search_labels);
-        let params: [&dyn ToSqlValue; 2] = [&like, &limit];
+        let params: [&dyn ToSqlValue; 3] = [&debut, &mot, &limit];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows
             .iter()
@@ -4795,11 +4824,13 @@ impl AlbumRepo {
     /// « au moins `plafond` ».
     pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = crate::db::engine::motif_like(query);
+        if fts_query.is_empty() {
+            return Ok(0);
+        }
+        let fts_titre = crate::db::engine::format_fts_query_titre_de_piste(self.db.engine(), query);
         let trimmed = query.trim();
         let sql = self.dialect_sql(sql::search_count, sql::search_count);
-        let params: [&dyn ToSqlValue; 7] =
-            [&fts_query, &like, &like, &like, &trimmed, &like, &plafond];
+        let params: [&dyn ToSqlValue; 4] = [&fts_query, &trimmed, &fts_titre, &plafond];
         Ok(self
             .db
             .query_one(&sql, &params)?
