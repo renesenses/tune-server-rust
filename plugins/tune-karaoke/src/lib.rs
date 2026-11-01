@@ -92,35 +92,12 @@ impl TunePlugin for KaraokePlugin {
         false
     }
 
-    // Hors catalogue (#2090) — pour la raison inverse de DJ. Ce greffon-ci
-    // FONCTIONNE : ses trois routes travaillent vraiment. Mais il fait double
-    // emploi avec une fonction déjà livrée et déjà atteignable.
-    //
-    // Le client web sert le karaoké depuis le cœur, sans greffon : le panneau
-    // des paroles affiche un bouton « Karaoké » dès que la piste a des paroles
-    // synchronisées, et surligne la ligne courante en calculant lui-même son
-    // index à partir de la position de lecture — la dernière ligne dont
-    // `time <= position`, exactement l'algorithme de `current_line_index` ici.
-    // Ces paroles viennent de `/lyrics/{id}`, que ce greffon RÉUTILISE
-    // (`tune_core::lyrics::get_lyrics`) au lieu de les produire autrement.
-    //
-    // Le proposer à l'installation offrirait donc une seconde porte — payée
-    // d'une installation et d'un redémarrage — vers ce que l'utilisateur a
-    // déjà. Deux karaokés valent moins qu'un.
-    //
-    // Et cette seconde porte serait la plus étroite : `/now/{zone_id}` abandonne
-    // dès que la piste courante n'a pas d'`id` de bibliothèque (« current track
-    // is not in the library », plus bas), là où le client sait retomber sur
-    // `/lyrics/by-meta` et fait donc marcher le karaoké sur du streaming.
-    //
-    // Le greffon reste compilé, testé (`tests/karaoke_plugin.rs`) et chargeable
-    // en posant `plugin_karaoke_installed=true` : `/now/{zone_id}` garde son
-    // intérêt propre pour un client qui n'a pas de boucle de position à lui
-    // (une façade embarquée, par exemple). À rebasculer à `true` le jour où un
-    // tel client existe.
-    fn catalogued(&self) -> bool {
-        false
-    }
+    // Catalogué (rc11, décision de Bertrand du 01/11/2026). #2090 l'avait retiré
+    // du gestionnaire faute d'écran pour l'atteindre ; il y revient avec sa case
+    // dans Réglages › Extensions (`POST /plugins/karaoke/install`, `DELETE
+    // /plugins/karaoke`, même mécanisme que les autres opt-in). Dormant tant que
+    // `plugin_karaoke_installed` n'est pas posé ; le redémarrage est annoncé par
+    // `restart_required`.
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
         ctx.register_router(router(

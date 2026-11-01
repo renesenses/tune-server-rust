@@ -73,35 +73,12 @@ impl TunePlugin for DjPlugin {
         false
     }
 
-    // Hors catalogue (#2090). Le gestionnaire ne doit pas proposer d'installer
-    // DJ, parce que DJ ne fait pas ce que sa description annonce.
-    //
-    // « crossfade, decks » : le greffon ne reçoit QUE la base
-    // (`HostServices { backend }`) — ni `PlaybackManager`, ni registre de
-    // sorties. Il n'a aucun accès au chemin audio, donc aucun moyen de faire
-    // jouer, de fondre ou de charger une platine, quel que soit le contenu des
-    // handlers. Et de fait, sur les 13 routes déclarées plus bas, 11 ne
-    // changent rien :
-    //
-    //   * 7 renvoient l'argument reçu sans rien écrire — `play`, `pause`,
-    //     `crossfade`, `crossfader`, `auto-crossfade`, `load`, `volume` ;
-    //   * `sync-tempo` répond littéralement « tempo sync not yet implemented » ;
-    //   * `enable`, `disable` et `status` n'écrivent et ne relisent que
-    //     `dj_enabled_{zone}`, un réglage dont ces trois handlers sont les
-    //     SEULS lecteurs du dépôt. `status` renvoie par-dessus des platines
-    //     toujours `loaded: false` et un `crossfader: 0.5` en dur — il contredit
-    //     donc `load` et `crossfader` juste après leur succès annoncé.
-    //
-    // Restent 2 routes qui travaillent vraiment : `waveform` et `analyze`
-    // (décodage PCM natif).
-    // Elles restent servies : le greffon est toujours compilé, toujours testé
-    // (`tests/dj_plugin.rs`), et se charge encore si l'on pose
-    // `plugin_dj_installed=true` à la main. Ce qui cesse, c'est la promesse.
-    //
-    // À rebasculer à `true` le jour où les platines existent pour de bon.
-    fn catalogued(&self) -> bool {
-        false
-    }
+    // Catalogué (rc11, décision de Bertrand du 01/11/2026). #2090 l'avait retiré
+    // du gestionnaire faute d'écran pour l'atteindre ; il y revient avec sa case
+    // dans Réglages › Extensions (`POST /plugins/dj/install`, `DELETE
+    // /plugins/dj`, même mécanisme que les autres opt-in). Dormant tant que
+    // `plugin_dj_installed` n'est pas posé ; le redémarrage est annoncé par
+    // `restart_required`.
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
         ctx.register_router(router(self.backend.clone()));

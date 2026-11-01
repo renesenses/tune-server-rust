@@ -464,7 +464,11 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
             "version": info.version,
             "type": "sdk",
             "installed": installed,
-            "enabled": false,
+            // Un opt-in installé mais pas encore chargé est VOULU actif : la
+            // case de Réglages › Extensions reste cochée et `restart_required`
+            // dit que le serveur ne l'a pas encore monté. Un greffon actif
+            // d'office qu'on a désactivé reste `false`.
+            "enabled": installed && info.opt_in && enabled_voulu(&settings, &info.name),
             "loaded": false,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
@@ -548,7 +552,9 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
                     "installed": true,
                     "enabled": enabled,
                     "loaded": loaded,
-                    "restart_required": enabled && !loaded,
+                    // Activé et pas chargé : à monter ; désactivé et encore chargé :
+                    // à décharger (le registre wasm ne bouge qu'au démarrage).
+                    "restart_required": enabled != loaded,
                     "url": format!("/api/v1/plugins/{id}/"),
                     "compatible": compatible,
                     "min_server_version": info.manifest.min_server_version,
@@ -561,6 +567,17 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
     }
 
     plugins
+}
+
+/// `plugin_{name}_enabled` n'est pas explicitement `false` (l'absence vaut
+/// « activé », comme à la porte de `setup_all`).
+fn enabled_voulu(settings: &SettingsRepo, name: &str) -> bool {
+    settings
+        .get(&format!("plugin_{name}_enabled"))
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("false")
 }
 
 /// Les `setup()` en erreur et les greffons chargés par un nouvel essai

@@ -696,56 +696,18 @@ async fn la_fiche_d_un_greffon_installe_non_charge_annonce_le_redemarrage() {
         .find(|p| p["name"] == "optin")
         .expect("le greffon dormant reste listé");
     assert_eq!(entry["installed"], true);
-    assert_eq!(entry["enabled"], false);
+    // rc11 : voulu actif (case cochée), pas encore monté.
+    assert_eq!(entry["enabled"], true);
+    assert_eq!(entry["loaded"], false);
     assert_eq!(
         entry["restart_required"], true,
         "installé et pas chargé : la fiche doit l'annoncer comme la fiche wasm — {entry}"
     );
 }
 
-/// `dj` et `karaoke` sont compilés dans TOUS les binaires publiés — les six
-/// lignes de build de `release.yml` les listent avec `bandcamp`. Ils ne
-/// doivent pourtant plus figurer dans le gestionnaire : aucun écran du client
-/// ne sait les atteindre, et proposer « Installer » sur une fonction que rien
-/// n'expose ne rend rien à l'utilisateur (#2090).
-///
-/// Le test s'exécute sous le jeu de fonctionnalités livré. Sans `--features
-/// dj,karaoke` les deux greffons ne sont pas enregistrés du tout, et le test
-/// passerait sans rien prouver : on l'annonce dans le message d'échec plutôt
-/// que de laisser croire à une preuve.
-#[tokio::test]
-async fn dj_and_karaoke_are_not_offered_in_the_plugin_manager() {
-    use_scratch_plugin_data_dir();
-
-    let state = new_state();
-    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
-
-    let app = tune_server::routes::router(state.clone());
-    let (status, body) = body_of(&app, "/api/v1/plugins").await;
-    assert_eq!(status, StatusCode::OK);
-    let list: Value = serde_json::from_str(&body).unwrap();
-    let names: Vec<&str> = list
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|p| p["name"].as_str())
-        .collect();
-
-    for hidden in ["dj", "karaoke"] {
-        assert!(
-            !names.contains(&hidden),
-            "« {hidden} » ne doit plus être proposé par le gestionnaire (listés : {names:?})"
-        );
-    }
-
-    // Contre-épreuve dans le même souffle : le filtre retire les greffons hors
-    // catalogue, pas les greffons dormants en général. Un opt-in ordinaire,
-    // dormant pour exactement la même raison, reste proposé.
-    assert!(
-        names.contains(&"optin"),
-        "un opt-in catalogué doit rester proposé (listés : {names:?})"
-    );
-}
+// rc11 : DJ et Karaoké sont de nouveau proposés (cases de Réglages ›
+// Extensions) — voir `activation_dj_karaoke_b209.rs`, qui remplace le témoin
+// « ne sont pas proposés » de #2090.
 
 /// Retiré du catalogue n'est pas retiré du binaire : DJ se charge encore si on
 /// pose son réglage d'installation à la main, et son routeur est monté comme
