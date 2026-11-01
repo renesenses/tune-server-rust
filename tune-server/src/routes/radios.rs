@@ -3302,9 +3302,7 @@ async fn create_streaming_playlist_from_favorites(
 
     let (nb_matched, nb_approx, nb_not_found) = compter_par_statut(&details);
 
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({
+    let corps = json!({
             "service": service,
             "name": name,
             "favorites_count": favorites.len(),
@@ -3318,21 +3316,23 @@ async fn create_streaming_playlist_from_favorites(
             "not_found": nb_not_found,
             "remote_playlist_id": remote_playlist_id.clone(),
             "add_error": add_error,
-            // Aucune correspondance : rien n'a été créé, et on le DIT.
-            "message": if remote_playlist_id.is_none() {
-                Value::from(format!(
-                    "Aucun favori trouvé sur {} : aucune playlist n’a été créée.",
-                    nom_du_service(service)
-                ))
-            } else {
-                Value::Null
-            },
-            "playlist_id": remote_playlist_id,
+            "message": Value::Null,
+            "playlist_id": remote_playlist_id.clone(),
             "details": details.clone(),
             "results": details,
-        })),
-    )
-        .into_response())
+    });
+    // Aucune correspondance : rien n'a été créé, et on le DIT — phrase
+    // traduite par clé (#7077), jamais du français en dur.
+    let corps = if remote_playlist_id.is_none() {
+        crate::message_api::avec_message(
+            corps,
+            "api.radioFavorites.noFavoriteFound",
+            &[("service", nom_du_service(service))],
+        )
+    } else {
+        corps
+    };
+    Ok((StatusCode::CREATED, Json(corps)).into_response())
 }
 
 /// Le service visé, s'il peut recevoir une playlist : inscrit, connecté, et
@@ -3552,11 +3552,12 @@ async fn creer_playlist_depuis_titres_retenus(
         .map(str::trim)
         .filter(|id| !id.is_empty());
     let service = service.unwrap_or("qobuz");
-    // `error` : le code stable que le client teste ; `message` : la phrase
-    // à montrer — jamais un code brut à l'écran.
-    let erreur = |code: StatusCode, err: &str, message: &str| {
+    // `error` = `code` : le code stable que le client teste ; `message` : la
+    // phrase à montrer, traduite depuis `i18n_server.json` (#7077) — jamais
+    // un code brut à l'écran.
+    let erreur = |code: StatusCode, err: &str, cle: &str| {
         tracing::warn!(service = %service, erreur = err, "radio_fav_create_playlist_refusee");
-        Ok((code, Json(json!({ "error": err, "message": message }))).into_response())
+        Ok(crate::message_api::refus(code, err, cle, &[]))
     };
     if service == "local" {
         // Les identifiants rendus par l'aperçu sont ceux d'un SERVICE : la
@@ -3564,21 +3565,21 @@ async fn creer_playlist_depuis_titres_retenus(
         return erreur(
             StatusCode::BAD_REQUEST,
             "track_ids_service_seulement",
-            "Ces titres viennent d’un service de streaming : ils ne vont pas dans une playlist locale.",
+            "api.radioFavorites.tracksAreServiceOnly",
         );
     }
     if cible.is_none() && name.trim().is_empty() {
         return erreur(
             StatusCode::BAD_REQUEST,
             "nom_vide",
-            "Donnez un nom à la playlist.",
+            "api.radioFavorites.playlistNameRequired",
         );
     }
     if dedoublonner_titres(track_ids).is_empty() {
         return erreur(
             StatusCode::BAD_REQUEST,
             "aucun_titre_retenu",
-            "Aucun titre retenu : aucune playlist n’a été créée. Cochez au moins une correspondance trouvée.",
+            "api.radioFavorites.noTrackSelected",
         );
     }
     let arc = match service_pour_playlist(state, service).await {
@@ -3631,23 +3632,25 @@ async fn creer_playlist_depuis_titres_retenus(
         }
         Err(e) => {
             tracing::warn!(service = %service, error = %e, existante = cible.is_some(), "radio_fav_create_playlist_failed");
-            Ok((
-                StatusCode::BAD_GATEWAY,
-                Json(json!({
+            // Code stable + phrase traduite (#7077) ; le texte brut du service
+            // part dans `cause`, le détail replié, jamais dans `message`.
+            let mut corps = crate::message_api::avec_message(
+                json!({
                     "error": match cible {
                         Some(id) => format!("could not add to playlist '{id}' on '{service}': {e}"),
                         None => format!("could not create playlist on '{service}': {e}"),
                     },
-                    // Code stable : le client le traduit (jamais le texte brut
-                    // de Qobuz à l'écran, il part dans le détail replié).
                     "code": if cible.is_some() { "ajout_playlist_refuse" } else { "creation_playlist_refusee" },
-                    "message": match cible {
-                        Some(_) => format!("{} a refusé l’ajout à la playlist : {e}", nom_du_service(service)),
-                        None => format!("{} a refusé la création de la playlist : {e}", nom_du_service(service)),
-                    },
-                })),
-            )
-                .into_response())
+                }),
+                if cible.is_some() {
+                    "api.radioFavorites.addToPlaylistRefused"
+                } else {
+                    "api.radioFavorites.createPlaylistRefused"
+                },
+                &[("service", nom_du_service(service))],
+            );
+            corps["cause"] = json!(e.to_string());
+            Ok((StatusCode::BAD_GATEWAY, Json(corps)).into_response())
         }
     }
 }

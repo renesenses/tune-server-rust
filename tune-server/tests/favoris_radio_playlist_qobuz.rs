@@ -515,7 +515,9 @@ async fn la_playlist_creee_apparait_aussitot_dans_mes_playlists() {
 }
 
 /// Un refus de Qobuz à la création n'est JAMAIS un succès : 502, rien de
-/// créé, et une phrase à montrer (`message`) en plus du code.
+/// créé, et une phrase traduite à montrer (`message` + `message_key`, #7077)
+/// en plus du code ; le motif brut du service va dans `cause`. Sans langue
+/// dans la requête, la phrase est en anglais (repli du serveur).
 #[tokio::test(flavor = "multi_thread")]
 async fn un_refus_de_creation_remonte_au_client_avec_un_message() {
     let (app, journal, _dir) = banc(true, true).await;
@@ -529,10 +531,14 @@ async fn un_refus_de_creation_remonte_au_client_avec_un_message() {
     assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
     assert!(body["playlist_id"].is_null(), "{body}");
     assert_eq!(body["code"], "creation_playlist_refusee", "{body}");
+    assert_eq!(
+        body["message_key"], "api.radioFavorites.createPlaylistRefused",
+        "{body}"
+    );
     let message = body["message"].as_str().unwrap_or_default();
-    assert!(message.starts_with("Qobuz a refusé la création"), "{body}");
+    assert!(message.starts_with("Qobuz refused to create"), "{body}");
     assert!(
-        message.contains("401"),
+        body["cause"].as_str().unwrap_or_default().contains("401"),
         "le motif du service est rendu : {body}"
     );
 
@@ -560,11 +566,12 @@ async fn une_selection_vide_est_expliquee() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "aucun_titre_retenu");
+    assert_eq!(body["message_key"], "api.radioFavorites.noTrackSelected");
     assert!(
         body["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("aucune playlist n’a été créée"),
+            .contains("no playlist was created"),
         "{body}"
     );
     assert!(journal.lock().unwrap().creations.is_empty());
