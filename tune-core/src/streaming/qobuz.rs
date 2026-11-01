@@ -266,10 +266,77 @@ impl AttemptError {
 /// mot de passe, et le corps JSON du service ne sort plus dans la réponse (il
 /// reste dans le journal, `qobuz_login_failed`). Toute autre panne — réseau,
 /// 5xx, JSON illisible — garde son texte, c'est une panne et non un refus.
+///
+/// ## Un 401 ne veut pas toujours dire « mauvais mot de passe » (01/11/2026)
+///
+/// Qobuz répond 401 dans deux cas que l'utilisateur doit pouvoir distinguer :
+///
+/// * `Invalid username/email and password combination` : les identifiants
+///   sont refusés, l'utilisateur doit les ressaisir ([`TuneError::Credentials`]) ;
+/// * `User authentication is required` : c'est la réponse de Qobuz à un appel
+///   ANONYME. Reçue sur `user/login` — l'appel qui authentifie —, elle dit que
+///   Qobuz n'accepte pas la connexion par mot de passe pour cet `app_id` :
+///   l'APPLICATION est refusée ([`TuneError::AppRefused`]). Mesuré le
+///   01/11/2026 : le fichier de configuration distant servait un autre
+///   `app_id` depuis le matin, et deux testeurs lisaient « mot de passe
+///   incorrect » avec un mot de passe juste.
+///
+/// Un 400 qui nomme `app_id` (« Invalid or missing app_id parameter ») est le
+/// même refus de l'application. Tout autre 401 reste un refus d'identifiants,
+/// comme avant : on ne requalifie que les messages reconnus.
 fn erreur_de_connexion(err: &AttemptError) -> TuneError {
+    if application_refusee(err) {
+        return TuneError::AppRefused(MOTIF_APPLICATION_REFUSEE.to_string());
+    }
     match err.statut_http() {
         Some(401) => TuneError::Credentials("qobuz login: invalid credentials".to_string()),
         _ => TuneError::Other(format!("qobuz login: {err}")),
+    }
+}
+
+/// Le texte de [`TuneError::AppRefused`] pour Qobuz : il dit que le mot de
+/// passe n'est pas en cause.
+const MOTIF_APPLICATION_REFUSEE: &str = "qobuz login: Qobuz refuses Tune's application credentials (app_id); \
+     your password is not the cause";
+
+/// La réponse de `user/login` dit-elle que Qobuz refuse l'APPLICATION ?
+///
+/// Lue sur le `message` du JSON de Qobuz, et seulement pour les deux formes
+/// reconnues — voir [`erreur_de_connexion`].
+fn application_refusee(err: &AttemptError) -> bool {
+    let AttemptError::Http { status, body } = err else {
+        return false;
+    };
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["message"].as_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    match status {
+        401 => message.contains("user authentication is required"),
+        400 => message.contains("app_id"),
+        _ => false,
+    }
+}
+
+/// La nature d'un échec de connexion, pour le journal (`qobuz_login_failed`).
+fn nature_echec_connexion(err: &AttemptError) -> &'static str {
+    if application_refusee(err) {
+        "application_refusee"
+    } else if err.statut_http() == Some(401) {
+        "identifiants_refuses"
+    } else {
+        "panne"
+    }
+}
+
+/// Les six premiers caractères d'un `app_id`, pour le journal : assez pour
+/// reconnaître l'application, rien de plus.
+fn prefixe_app_id(app_id: &str) -> String {
+    let debut: String = app_id.chars().take(6).collect();
+    if app_id.chars().count() > 6 {
+        format!("{debut}…")
+    } else {
+        debut
     }
 }
 
@@ -843,6 +910,16 @@ impl QobuzService {
                         (qobuz["app_id"].as_str(), qobuz["app_secret"].as_str())
                     {
                         info!(old_id = %&self.app_id, new_id = %id, "qobuz_credentials_refreshed");
+                        // 01/11/2026 : un changement d'app_id distant fait
+                        // tomber les sessions et refuser les connexions ; il
+                        // doit se voir au premier coup d'œil dans le journal.
+                        if !self.app_id.is_empty() && self.app_id != id {
+                            warn!(
+                                ancien = %prefixe_app_id(&self.app_id),
+                                nouveau = %prefixe_app_id(id),
+                                "qobuz_app_id_distant_change"
+                            );
+                        }
                         self.app_id = id.to_string();
                         self.app_secret = secret.to_string();
                     }
@@ -2344,12 +2421,12 @@ impl QobuzService {
                 self.login_at(fallback, username, password)
                     .await
                     .map_err(|e| {
-                        info!(error = %e, "qobuz_login_failed");
+                        self.journaliser_echec_connexion(&e);
                         erreur_de_connexion(&e)
                     })?
             }
             Err(err) => {
-                info!(error = %err, "qobuz_login_failed");
+                self.journaliser_echec_connexion(&err);
                 return Err(erreur_de_connexion(&err));
             }
         };
@@ -2363,6 +2440,25 @@ impl QobuzService {
 
         info!(username = ?self.username, "qobuz_authenticated");
         Ok(self.auth_status_internal())
+    }
+
+    /// Une ligne qui dit, sans relire le corps de Qobuz, si c'est le compte ou
+    /// l'application qui est refusé, et avec quel `app_id` (six caractères).
+    fn journaliser_echec_connexion(&self, err: &AttemptError) {
+        let nature = nature_echec_connexion(err);
+        let app_id = prefixe_app_id(&self.app_id);
+        if nature == "application_refusee" {
+            warn!(
+                nature,
+                app_id = %app_id,
+                error = %err,
+                conseil = "Qobuz refuse l'application (app_id), pas le mot de passe : \
+                           vérifier la configuration distante streaming-config.json",
+                "qobuz_login_failed"
+            );
+        } else {
+            info!(nature, app_id = %app_id, error = %err, "qobuz_login_failed");
+        }
     }
 
     fn auth_status_internal(&self) -> AuthStatus {
@@ -3840,7 +3936,7 @@ impl StreamingService for QobuzService {
         // tests for a *missing* token) never ran, and playback failed with a
         // raw `qobuz /track/getFileUrl: 401`. Clearing it makes every one of
         // those report the truth.
-        warn!("qobuz_session_expired_token_cleared");
+        warn!(app_id = %prefixe_app_id(&self.app_id), "qobuz_session_expired_token_cleared");
         self.user_auth_token = None;
         self.subscription = None;
         self.session_expired = true;
@@ -8150,6 +8246,63 @@ mod tests_erreur_de_connexion_7068 {
             !texte.contains('{') && !texte.contains("Invalid username"),
             "le JSON du service ne doit pas sortir dans la réponse : {texte}"
         );
+    }
+
+    /// 01/11/2026 — le corps EXACT mesuré par le coordinateur sur `user/login`
+    /// avec l'`app_id` servi ce matin-là. Contre-épreuve : retirer le
+    /// `return TuneError::AppRefused` de `erreur_de_connexion` fait rougir ce
+    /// test (le 401 retombe en `Credentials`, « mot de passe incorrect »).
+    #[test]
+    fn app_id_refuse_n_est_pas_un_mauvais_mot_de_passe() {
+        let brut = AttemptError::Http {
+            status: 401,
+            body: r#"{"status":"error","code":401,"message":"User authentication is required"}"#
+                .to_string(),
+        };
+        let e = erreur_de_connexion(&brut);
+        assert!(
+            matches!(e, TuneError::AppRefused(_)),
+            "Qobuz refuse l'application, pas le mot de passe — attendu AppRefused, obtenu : {e:?}"
+        );
+        assert!(!e.to_string().contains('{'), "{e}");
+        assert_eq!(nature_echec_connexion(&brut), "application_refusee");
+    }
+
+    #[test]
+    fn app_id_invalide_en_400_est_un_refus_de_l_application() {
+        let brut = AttemptError::Http {
+            status: 400,
+            body:
+                r#"{"status":"error","code":400,"message":"Invalid or missing app_id parameter"}"#
+                    .to_string(),
+        };
+        assert!(matches!(
+            erreur_de_connexion(&brut),
+            TuneError::AppRefused(_)
+        ));
+    }
+
+    /// Un 401 au corps inconnu reste un refus d'identifiants, comme avant.
+    #[test]
+    fn un_401_inconnu_reste_un_refus_d_identifiants() {
+        for body in ["", "akamai", r#"{"message":"something else"}"#] {
+            let brut = AttemptError::Http {
+                status: 401,
+                body: body.into(),
+            };
+            assert!(
+                matches!(erreur_de_connexion(&brut), TuneError::Credentials(_)),
+                "{body}"
+            );
+            assert_eq!(nature_echec_connexion(&brut), "identifiants_refuses");
+        }
+    }
+
+    #[test]
+    fn le_journal_ne_montre_que_six_caracteres_de_l_app_id() {
+        assert_eq!(prefixe_app_id("123456789"), "123456…");
+        assert_eq!(prefixe_app_id("app"), "app");
+        assert_eq!(prefixe_app_id(""), "");
     }
 
     #[test]
