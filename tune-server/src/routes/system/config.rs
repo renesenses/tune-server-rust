@@ -292,7 +292,10 @@ pub(super) async fn get_config(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     // A failed snapshot is not an empty settings table: serving defaults here
     // made persisted choices look reset, despite a successful earlier write.
-    let all = settings.all().map_err(|_| {
+    // #7307 — l'erreur était jetée sans trace : le rapport d'un testeur dont
+    // les choix « reviennent au défaut » ne pouvait pas en porter la cause.
+    let all = settings.all().map_err(|e| {
+        tracing::error!(erreur = %e, "reglages_illisibles");
         AppError::service_unavailable("Server settings are temporarily unavailable")
     })?;
     let mut config = serde_json::Map::new();
@@ -6801,6 +6804,65 @@ mod instantane_reglages_7343_tests {
             value
                 .get(tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED)
                 .is_none()
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Journal {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #7307 — le 503 de #7343 sans trace laissait le rapport muet sur la
+    /// cause : l'erreur de lecture doit être journalisée, avec son message.
+    #[tokio::test]
+    async fn une_lecture_impossible_laisse_sa_cause_au_journal() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .sqlite()
+            .unwrap()
+            .execute_batch("DROP TABLE settings")
+            .unwrap();
+        let journal = Journal::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(journal.clone())
+            .finish();
+        let response = {
+            let _garde = tracing::subscriber::set_default(subscriber);
+            lire(&state).await
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let journal = String::from_utf8(journal.0.lock().unwrap().clone()).unwrap();
+        let ligne = journal
+            .lines()
+            .find(|l| l.contains("reglages_illisibles"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "un échec de lecture des réglages doit laisser `reglages_illisibles` \
+                     au journal (#7307) ; journal : {journal:?}"
+                )
+            });
+        assert!(
+            ligne.contains("settings"),
+            "la ligne doit porter l'erreur SQLite : {ligne:?}"
         );
     }
 

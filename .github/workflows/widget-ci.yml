@@ -36,3 +36,8 @@ jobs:
         working-directory: tune-widget/src-tauri
       - run: cargo test --no-fail-fast
         working-directory: tune-widget/src-tauri
+      # Le contrat de l'interface avec le serveur (`src/contrat.js`) : les
+      # formes de reponse de /search, /zones et du WebSocket, et le volume
+      # toujours en fraction. Node est present sur l'image macOS du runner.
+      - name: Contrat de l'interface (node --test)
+        run: node --test tune-widget/tests/*.test.js

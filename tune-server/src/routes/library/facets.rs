@@ -51,6 +51,14 @@ impl FacetQuery {
         self.sel = track_filter_from_raw(raw)?;
         Ok(self)
     }
+
+    /// Le profil de la requête (#7569) : celui dont le filtre « favoris »
+    /// lit les favoris. À appeler après [`FacetQuery::hydrate`], qui remplace
+    /// `sel` en entier.
+    pub(super) fn pour_profil(mut self, profil: i64) -> Self {
+        self.sel.profile_id = profil;
+        self
+    }
 }
 
 /// Build the WHERE conditions (over alias `t` = tracks) for the active filters,
@@ -484,14 +492,14 @@ fn build_facet_conditions(
             tune_core::db::track_repo::folder_like_pattern(fld),
         ));
     }
-    // Album rating (profile 1). Tracks inherit their album's rating via a join
+    // Album rating (profil de la requête, #7594). Tracks inherit their album's rating via a join
     // to `album_ratings`; EXISTS keeps it self-contained on alias `t`.
     if exclude != "rating"
         && let Some(c) = ph.in_list("arr.rating", sel.ratings.len())
     {
-        conds.push(format!(
-            "EXISTS (SELECT 1 FROM album_ratings arr \
-                 WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND {c})"
+        conds.push(tune_core::db::facet_filter::rating_condition(
+            &c,
+            sel.profile_id,
         ));
         for v in &sel.ratings {
             params.push(SqlValue::Int(*v));
@@ -568,7 +576,7 @@ fn build_facet_conditions(
             &mut ph,
             &sel.favorites,
             sel.est_en_et("favorite"),
-            bloc_favoris,
+            bloc_favoris(sel.profile_id),
         ) {
             conds.push(c);
         }
@@ -648,6 +656,7 @@ pub(super) fn collection_album_ids(state: &AppState, name: &str) -> Vec<i64> {
 /// courant — elle est vide, et une facette morte coûterait une requête à
 /// chaque ouverture du rail pour ne rien montrer.
 pub(super) async fn library_facets(
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(q): Query<FacetQuery>,
     RawQuery(raw): RawQuery,
     State(state): State<AppState>,
@@ -655,7 +664,7 @@ pub(super) async fn library_facets(
     // Les facettes à plusieurs valeurs se lisent dans la chaîne BRUTE : voir
     // `FacetQuery::hydrate`. Sans cet appel, `sel` reste vide et plus rien ne
     // filtre.
-    let q = q.hydrate(raw.as_deref())?;
+    let q = q.hydrate(raw.as_deref())?.pour_profil(profile.id());
     // #5438 — la résolution de la collection et les requêtes de chaque
     // facette sont synchrones : hors de l'exécuteur.
     hors_executeur("library_facets", move || compter_les_facettes(&state, q))
@@ -723,7 +732,7 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 "country" => kv_facet(state, "release_country", limit, conds, params),
                 "mood" => kv_facet(state, "mood", limit, conds, params),
                 "source" => kv_facet(state, "source_media", limit, conds, params),
-                "rating" => rating_facet(state, limit, conds, params),
+                "rating" => rating_facet(state, q.sel.profile_id, limit, conds, params),
                 "collection" => collection_facet(state, &q, engine, socle),
                 "original_year" => original_year_facet(state, limit, conds, params),
                 // Dynamic Range (#2144). Absente du jeu par DÉFAUT : sur une
@@ -736,7 +745,7 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 // tant que les crédits ne sont pas là, un client la demande
                 // explicitement (`fields=…,instrument`).
                 "instrument" => instrument_facet(state, engine, limit, conds, params),
-                "favorite" => favorite_facet(state, conds, params),
+                "favorite" => favorite_facet(state, q.sel.profile_id, conds, params),
                 "playlist" => playlist_facet(state, limit, conds, params),
                 "untagged" => untagged_facet(state, conds, params),
                 _ => return None,
@@ -1084,27 +1093,26 @@ fn dr_facet(
     cumuler_par_valeur(effectifs_par_album(state, conds, params), &dr_de, limit)
 }
 
-/// Favoris du profil 1, comptés par type. Deux valeurs au plus (`track`,
+/// Favoris du profil de la requête (#7569), comptés par type. Deux valeurs au plus (`track`,
 /// `album`) : pas de LIMIT à appliquer.
-fn favorite_facet(state: &AppState, conds: &[String], params: &[SqlValue]) -> Vec<(String, i64)> {
+fn favorite_facet(
+    state: &AppState,
+    profil: i64,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
     let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
         .iter()
         .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
         .collect();
     let mut out = Vec::new();
     for kind in ["track", "album"] {
-        let own = match kind {
-            "album" => {
-                "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-                        AND f.item_type = 'album' AND f.item_id = t.album_id)"
-            }
-            _ => {
-                "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-                  AND f.item_type = 'track' AND f.item_id = t.id)"
-            }
+        // Le même prédicat que la liste (`facet_filter`), pas une copie.
+        let Some(own) = tune_core::db::facet_filter::favorite_condition(kind, profil) else {
+            continue;
         };
         let mut all: Vec<String> = conds.to_vec();
-        all.push(own.to_string());
+        all.push(own);
         let sql = format!("SELECT COUNT(*) FROM tracks t WHERE {}", all.join(" AND "));
         let n = state
             .backend
@@ -1355,11 +1363,12 @@ fn fusionner_les_casses(brut: Vec<(String, i64)>) -> Vec<(String, i64)> {
     sortie
 }
 
-/// Count tracks by their album's rating (profile 1). Tracks inherit the rating
+/// Count tracks by their album's rating (profil de la requête, #7594). Tracks inherit the rating
 /// via a join to `album_ratings`; unrated tracks are naturally excluded. The
 /// `conds` reference alias `t`, so the join is additive.
 fn rating_facet(
     state: &AppState,
+    profil: i64,
     limit: Option<i64>,
     conds: &[String],
     params: &[SqlValue],
@@ -1370,9 +1379,10 @@ fn rating_facet(
         format!(" WHERE {}", conds.join(" AND "))
     };
     let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let profil = if profil > 0 { profil } else { 1 };
     let sql = format!(
         "SELECT arr.rating, COUNT(*) AS n FROM tracks t \
-         JOIN album_ratings arr ON t.album_id = arr.album_id AND arr.profile_id = 1{where_clause} \
+         JOIN album_ratings arr ON t.album_id = arr.album_id AND arr.profile_id = {profil}{where_clause} \
          GROUP BY arr.rating ORDER BY arr.rating DESC{limit_clause}"
     );
     let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
@@ -1772,6 +1782,7 @@ mod tests {
                 .find_map(|kv| kv.strip_prefix("fields="))
                 .map(str::to_string);
             let Json(v) = library_facets(
+                crate::routes::active_profile::ActiveProfile(1),
                 Query(FacetQuery {
                     fields,
                     ..Default::default()
@@ -1849,6 +1860,7 @@ mod tests {
                 .find_map(|kv| kv.strip_prefix("fields="))
                 .map(str::to_string);
             let Json(v) = library_facets(
+                crate::routes::active_profile::ActiveProfile(1),
                 Query(FacetQuery {
                     fields,
                     ..Default::default()
@@ -1973,6 +1985,19 @@ mod tests {
             Ok(q) => q,
             Err(_) => panic!("requête acceptable : {raw}"),
         }
+    }
+
+    /// #7594 — le filtre de notes lit les notes du profil de la requête.
+    #[test]
+    fn le_filtre_de_notes_suit_le_profil_de_la_requete() {
+        let mut q = depuis("rating=4");
+        q.sel.profile_id = 2;
+        let (conds, _) = build_facet_conditions(&q, Engine::Postgres, "", None);
+        assert!(
+            conds.iter().any(|c| c.contains("arr.profile_id = 2")),
+            "{conds:?}"
+        );
+        assert!(!conds.iter().any(|c| c.contains("arr.profile_id = 1")));
     }
 
     fn texte(v: &SqlValue) -> String {

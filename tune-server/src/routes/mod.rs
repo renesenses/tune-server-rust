@@ -77,6 +77,7 @@ pub mod profil_par_appareil;
 pub mod profiles;
 pub mod radios;
 pub mod radios_annuaire;
+pub mod radios_criteres_7466;
 pub mod radios_libelles;
 pub mod room_calibration;
 pub mod room_correction;

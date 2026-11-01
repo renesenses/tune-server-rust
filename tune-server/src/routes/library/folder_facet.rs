@@ -42,6 +42,7 @@ pub(super) struct FolderPathQuery {
 /// library root down to the current folder (each clickable). Selecting a child
 /// means filtering `/library/tracks?folder=<child.path>` (recursive subtree).
 pub(super) async fn folder_facet(
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(filters): Query<FacetQuery>,
     Query(p): Query<FolderPathQuery>,
     RawQuery(raw): RawQuery,
@@ -49,7 +50,7 @@ pub(super) async fn folder_facet(
 ) -> Result<Json<Value>, AppError> {
     // Facettes multi-valeurs (#2168) : elles narrowent aussi les effectifs des
     // dossiers enfants.
-    let filters = filters.hydrate(raw.as_deref())?;
+    let filters = filters.hydrate(raw.as_deref())?.pour_profil(profile.id());
     // #5438 — la résolution de la collection et les comptes par dossier sont
     // des lectures synchrones : hors de l'exécuteur, comme le rail.
     hors_executeur("folder_facet", move || {
