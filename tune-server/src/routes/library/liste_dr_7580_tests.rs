@@ -355,6 +355,41 @@ fn la_liste_filtree_par_dr_ne_relit_plus_les_tags_7580() {
     );
 }
 
+/// #7675 — la carte DR est gardée PAR BASE : une seconde base qui lit la
+/// sienne (un autre test, en parallèle dans le même processus) ne fait plus
+/// relire les tags DR à la première. Avant, l'entrée unique du cache était
+/// évincée et le témoin ci-dessus rougissait selon l'ordre des tests.
+#[test]
+fn une_autre_base_n_evince_pas_la_carte_dr_7675() {
+    let p = Profil {
+        albums: 40,
+        pistes: 3,
+        copie_tous: 9,
+        cles_de_remplissage: false,
+    };
+    let (_d1, premiere) = base("premiere", &p);
+    let (_d2, seconde) = base("seconde", &p);
+    let sonde = std::sync::Arc::new(Sonde {
+        base: premiere.backend.clone(),
+        relectures: Default::default(),
+    });
+    let repo = TrackRepo::with_backend(sonde.clone());
+    let drs = dr_presents(&premiere);
+    let mut d = demande(&[drs[0]]);
+    (d.limit, d.avec_comptes) = (50, false);
+    let _ = repo.page_de_pistes(&d).unwrap();
+    let apres_premiere = sonde.relectures();
+    // L'autre base lit SA carte entre deux pages de la première.
+    let _ = ff::dr_par_album(seconde.backend.as_ref()).unwrap();
+    let _ = repo.page_de_pistes(&d).unwrap();
+    let _ = repo.list_filtered(&d.filtre, 50, 0).unwrap();
+    assert_eq!(
+        sonde.relectures() - apres_premiere,
+        0,
+        "la carte DR d'une autre base a évincé celle-ci : les tags DR ont été relus"
+    );
+}
+
 /// Banc : `BANC_ALBUMS=10000 cargo test --release -p tune-server --lib
 /// banc_liste_dr_7580 -- --ignored --nocapture` (le générateur de #2144).
 #[test]

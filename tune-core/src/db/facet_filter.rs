@@ -693,12 +693,19 @@ pub fn dr_album_in(engine: Engine, having: &str) -> String {
 
 /// #2144 (rc10) — le DR de chaque album porteur d'un tag DR, sous le jeton de
 /// la base qui l'a rendu ([`super::backend::DbBackend::jeton_des_donnees`]).
-/// Une seule entrée : une base par serveur ; l'instance fait partie du jeton.
-type DrEnCache = Option<(
+/// Une entrée PAR INSTANCE de base (l'instance est la première moitié du
+/// jeton) : un serveur n'ouvre qu'une base, donc une entrée — mais deux bases
+/// ouvertes dans le même processus (les tests, qui tournent en parallèle) ne
+/// s'évincent plus l'une l'autre. Avant, l'entrée unique faisait relire les
+/// tags DR à la première base dès qu'une seconde lisait sa carte (#7675 : le
+/// témoin de #7580 rougissait selon l'ordre des tests). Borné à
+/// [`DR_EN_CACHE_MAX`] entrées : les bases refermées ne s'accumulent pas.
+type DrEnCache = Vec<(
     (u64, i64),
     std::sync::Arc<std::collections::HashMap<i64, i64>>,
 )>;
-static DR_PAR_ALBUM_EN_CACHE: std::sync::Mutex<DrEnCache> = std::sync::Mutex::new(None);
+static DR_PAR_ALBUM_EN_CACHE: std::sync::Mutex<DrEnCache> = std::sync::Mutex::new(Vec::new());
+const DR_EN_CACHE_MAX: usize = 64;
 
 /// Le DR de chaque album porteur d'un tag DR : la table dérivée
 /// [`dr_album_source`], la MÊME règle que la grille, la liste et la fiche —
@@ -718,8 +725,7 @@ pub fn dr_par_album(
     let jeton = db.jeton_des_donnees();
     if let Some(j) = jeton
         && let Ok(cache) = DR_PAR_ALBUM_EN_CACHE.lock()
-        && let Some((garde, carte)) = cache.as_ref()
-        && *garde == j
+        && let Some((_, carte)) = cache.iter().find(|(garde, _)| *garde == j)
     {
         return Ok(carte.clone());
     }
@@ -739,7 +745,13 @@ pub fn dr_par_album(
     if let Some(j) = jeton
         && let Ok(mut cache) = DR_PAR_ALBUM_EN_CACHE.lock()
     {
-        *cache = Some((j, carte.clone()));
+        // La carte précédente de CETTE base est périmée ; celles des autres
+        // bases restent servables sous leur propre jeton.
+        cache.retain(|(garde, _)| garde.0 != j.0);
+        if cache.len() >= DR_EN_CACHE_MAX {
+            cache.remove(0);
+        }
+        cache.push((j, carte.clone()));
     }
     Ok(carte)
 }
