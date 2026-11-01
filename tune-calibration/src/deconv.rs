@@ -38,7 +38,9 @@ impl ImpulseResponse {
         if noise_end < 16 {
             return f64::INFINITY;
         }
-        let noise_rms = (self.samples[..noise_end].iter().map(|v| v * v).sum::<f64>() / noise_end as f64).sqrt();
+        let noise_rms = (self.samples[..noise_end].iter().map(|v| v * v).sum::<f64>()
+            / noise_end as f64)
+            .sqrt();
         20.0 * (self.peak_amplitude() / noise_rms.max(1e-30)).log10()
     }
 }
@@ -56,7 +58,10 @@ pub struct ExtractSpec {
 
 impl Default for ExtractSpec {
     fn default() -> Self {
-        Self { pre_s: 0.15, post_s: 1.5 }
+        Self {
+            pre_s: 0.15,
+            post_s: 1.5,
+        }
     }
 }
 
@@ -129,7 +134,10 @@ mod tests {
 
     #[test]
     fn retard_pur_retrouve_au_sample_pres() {
-        let spec = SweepSpec { duration_s: 2.0, ..SweepSpec::room_default(48_000) };
+        let spec = SweepSpec {
+            duration_s: 2.0,
+            ..SweepSpec::room_default(48_000)
+        };
         let s = generate(&spec);
         let delay = 777;
         let mut captured = vec![0.0; delay];
@@ -139,7 +147,11 @@ mod tests {
         assert_eq!(ir.delay_samples, delay);
         // Crête = gain (0,5) × fraction de bande occupée par le balayage.
         let fraction = (spec.f_end - spec.f_start) / 24_000.0;
-        assert!((ir.peak_amplitude() - 0.5 * fraction).abs() < 0.02, "crête {}", ir.peak_amplitude());
+        assert!(
+            (ir.peak_amplitude() - 0.5 * fraction).abs() < 0.02,
+            "crête {}",
+            ir.peak_amplitude()
+        );
     }
 
     #[test]

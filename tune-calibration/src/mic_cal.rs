@@ -101,8 +101,18 @@ impl MicCalibration {
         if freqs.is_empty() {
             return Err(CalError::NoData);
         }
-        let phase = if phase.len() == freqs.len() { Some(phase) } else { None };
-        Ok(Self { freqs, deviation_db: dev, phase_deg: phase, sens_factor_db: sens, serial })
+        let phase = if phase.len() == freqs.len() {
+            Some(phase)
+        } else {
+            None
+        };
+        Ok(Self {
+            freqs,
+            deviation_db: dev,
+            phase_deg: phase,
+            sens_factor_db: sens,
+            serial,
+        })
     }
 
     /// Écart du micro (dB) à la fréquence `f`, interpolé en log(f), borné hors plage.
@@ -112,7 +122,11 @@ impl MicCalibration {
 
     /// Applique la correction à une réponse mesurée (dB) donnée sur `freqs`.
     pub fn correct(&self, freqs: &[f64], measured_db: &[f64]) -> Vec<f64> {
-        freqs.iter().zip(measured_db).map(|(f, m)| m - self.deviation_at(*f)).collect()
+        freqs
+            .iter()
+            .zip(measured_db)
+            .map(|(f, m)| m - self.deviation_at(*f))
+            .collect()
     }
 
     /// Niveau SPL (dB) estimé pour un niveau crête ou efficace `dbfs`, si le
@@ -152,7 +166,11 @@ mod tests {
         assert_eq!(c.serial.as_deref(), Some("7001234"));
         assert!((c.deviation_at(1000.0)).abs() < 1e-12);
         // Interpolation en log(f) : t = ln(100/20)/ln(1000/20) = 0,4114 → −1 + 0,4114.
-        assert!((c.deviation_at(100.0) + 0.5886).abs() < 1e-3, "interp log 20→1000 à 100 Hz : {}", c.deviation_at(100.0));
+        assert!(
+            (c.deviation_at(100.0) + 0.5886).abs() < 1e-3,
+            "interp log 20→1000 à 100 Hz : {}",
+            c.deviation_at(100.0)
+        );
         assert_eq!(c.deviation_at(5.0), -5.2);
     }
 
@@ -169,6 +187,9 @@ mod tests {
     #[test]
     fn refuse_le_vide_et_le_non_monotone() {
         assert_eq!(MicCalibration::parse("# rien\n"), Err(CalError::NoData));
-        assert_eq!(MicCalibration::parse("100 0\n50 1\n"), Err(CalError::NotMonotonic(2)));
+        assert_eq!(
+            MicCalibration::parse("100 0\n50 1\n"),
+            Err(CalError::NotMonotonic(2))
+        );
     }
 }

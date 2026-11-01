@@ -19,7 +19,10 @@ pub enum TargetCurve {
 
 impl TargetCurve {
     pub fn flat() -> Self {
-        Self::Tilt { db_per_octave: 0.0, pivot_hz: 1000.0 }
+        Self::Tilt {
+            db_per_octave: 0.0,
+            pivot_hz: 1000.0,
+        }
     }
 
     /// Approximation de la cible Harman pour enceintes en pièce (Olive 2013) :
@@ -42,7 +45,10 @@ impl TargetCurve {
     /// Niveau cible (dB, relatif) à la fréquence `f`.
     pub fn level_db(&self, f: f64) -> f64 {
         match self {
-            TargetCurve::Tilt { db_per_octave, pivot_hz } => db_per_octave * (f / pivot_hz).log2(),
+            TargetCurve::Tilt {
+                db_per_octave,
+                pivot_hz,
+            } => db_per_octave * (f / pivot_hz).log2(),
             TargetCurve::Points(pts) => {
                 let (fr, va): (Vec<f64>, Vec<f64>) = pts.iter().cloned().unzip();
                 interp_log(&fr, &va, f)
@@ -54,7 +60,10 @@ impl TargetCurve {
     pub fn on_grid(&self, freqs: &[f64], offset_db: f64) -> LogResponse {
         LogResponse {
             freqs: freqs.to_vec(),
-            magnitude_db: freqs.iter().map(|f| self.level_db(*f) + offset_db).collect(),
+            magnitude_db: freqs
+                .iter()
+                .map(|f| self.level_db(*f) + offset_db)
+                .collect(),
         }
     }
 
@@ -73,7 +82,13 @@ impl TargetCurve {
     /// entre les modes : les coupes sont alors plus profondes et plus larges,
     /// proches des modes eux-mêmes, ce qui raccourcit leur résonance au lieu
     /// de n'en raser que le sommet ; en contrepartie le niveau global baisse.
-    pub fn align_offset_percentile(&self, measured: &LogResponse, f_lo: f64, f_hi: f64, p: f64) -> f64 {
+    pub fn align_offset_percentile(
+        &self,
+        measured: &LogResponse,
+        f_lo: f64,
+        f_hi: f64,
+        p: f64,
+    ) -> f64 {
         let mut d: Vec<f64> = measured
             .freqs
             .iter()
@@ -96,7 +111,10 @@ mod tests {
 
     #[test]
     fn pente_par_octave() {
-        let t = TargetCurve::Tilt { db_per_octave: -1.0, pivot_hz: 1000.0 };
+        let t = TargetCurve::Tilt {
+            db_per_octave: -1.0,
+            pivot_hz: 1000.0,
+        };
         assert!((t.level_db(1000.0)).abs() < 1e-12);
         assert!((t.level_db(4000.0) + 2.0).abs() < 1e-12);
         assert!((t.level_db(250.0) - 2.0).abs() < 1e-12);
@@ -104,7 +122,10 @@ mod tests {
 
     #[test]
     fn alignement_sur_la_mesure() {
-        let m = LogResponse { freqs: vec![100.0, 200.0, 400.0, 800.0], magnitude_db: vec![70.0, 72.0, 71.0, 90.0] };
+        let m = LogResponse {
+            freqs: vec![100.0, 200.0, 400.0, 800.0],
+            magnitude_db: vec![70.0, 72.0, 71.0, 90.0],
+        };
         let off = TargetCurve::flat().align_offset(&m, 50.0, 1000.0);
         // Médiane (arrondie à l'élément supérieur) de {70, 71, 72, 90} = 72 : le pic à 90 dB ne tire pas la cible.
         assert!((off - 72.0).abs() < 1e-12, "{off}");

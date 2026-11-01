@@ -25,7 +25,12 @@ fn spec_rapide() -> MeasurementSpec {
 /// synthétique elle-même (sans balayage ni capture).
 fn reponse_vraie(room: &RoomSim, spec: &MeasurementSpec) -> LogResponse {
     let h = room.impulse_response();
-    let ir = deconv::ImpulseResponse { sample_rate: FS, samples: h, peak_index: 0, delay_samples: 0 };
+    let ir = deconv::ImpulseResponse {
+        sample_rate: FS,
+        samples: h,
+        peak_index: 0,
+        delay_samples: 0,
+    };
     analysis::measured_response(&ir, spec.window_post_ms, spec.smoothing_n, &spec.grid())
 }
 
@@ -40,7 +45,11 @@ fn maxima_locaux(r: &LogResponse, f_lo: f64, f_hi: f64, prominence_db: f64) -> V
         if m[i] > m[i - 1] && m[i] >= m[i + 1] {
             // Proéminence grossière : par rapport au minimum dans ±1/3 d'octave.
             let lo = r.freqs.iter().position(|x| *x >= f / 1.26).unwrap_or(0);
-            let hi = r.freqs.iter().position(|x| *x > f * 1.26).unwrap_or(m.len());
+            let hi = r
+                .freqs
+                .iter()
+                .position(|x| *x > f * 1.26)
+                .unwrap_or(m.len());
             let floor = m[lo..hi].iter().cloned().fold(f64::INFINITY, f64::min);
             if m[i] - floor >= prominence_db {
                 out.push(f);
@@ -60,7 +69,11 @@ fn la_mesure_retrouve_le_retard_la_reponse_et_les_modes() {
 
     // Retard : 12 ms = 576 échantillons, à l'échantillon près.
     assert_eq!(m.ir.delay_samples, 576, "retard {} ms", m.ir.delay_ms());
-    assert!(m.ir.snr_db() > 40.0, "RSB crête/bruit {:.1} dB", m.ir.snr_db());
+    assert!(
+        m.ir.snr_db() > 40.0,
+        "RSB crête/bruit {:.1} dB",
+        m.ir.snr_db()
+    );
 
     // Réponse : écart à la vraie réponse < 0,3 dB de 30 Hz à 10 kHz.
     let vraie = reponse_vraie(&room, &spec);
@@ -73,11 +86,19 @@ fn la_mesure_retrouve_le_retard_la_reponse_et_les_modes() {
             }
         }
     }
-    let detail: Vec<String> = [30.0, 40.0, 60.0, 100.0, 300.0, 1000.0, 3000.0, 8000.0, 10_000.0]
-        .iter()
-        .map(|f| format!("{f:.0} Hz {:+.2}", m.response.at(*f) - vraie.at(*f)))
-        .collect();
-    assert!(worst.0 < 0.3, "écart max {:.3} dB à {:.1} Hz ; {}", worst.0, worst.1, detail.join(", "));
+    let detail: Vec<String> = [
+        30.0, 40.0, 60.0, 100.0, 300.0, 1000.0, 3000.0, 8000.0, 10_000.0,
+    ]
+    .iter()
+    .map(|f| format!("{f:.0} Hz {:+.2}", m.response.at(*f) - vraie.at(*f)))
+    .collect();
+    assert!(
+        worst.0 < 0.3,
+        "écart max {:.3} dB à {:.1} Hz ; {}",
+        worst.0,
+        worst.1,
+        detail.join(", ")
+    );
 
     // Les trois modes ressortent comme maxima locaux à ±4 %.
     let pics = maxima_locaux(&m.response, 25.0, 300.0, 2.0);
@@ -100,8 +121,16 @@ fn l_egaliseur_corrige_les_modes_sans_remonter_les_creux() {
 
     let cfg = AutoEqConfig::single_position(FS as f64);
     let r = design_eq(&m.response, &TargetCurve::flat(), &cfg);
-    assert!(!r.bands.is_empty() && r.bands.len() <= cfg.max_bands, "{:?}", r.bands);
-    assert!(r.bands.iter().all(|b| b.gain <= 0.0), "relance interdite : {:?}", r.bands);
+    assert!(
+        !r.bands.is_empty() && r.bands.len() <= cfg.max_bands,
+        "{:?}",
+        r.bands
+    );
+    assert!(
+        r.bands.iter().all(|b| b.gain <= 0.0),
+        "relance interdite : {:?}",
+        r.bands
+    );
     assert_eq!(r.preamp_db, 0.0);
     assert!(
         r.max_peak_after_db < 1.5,
@@ -122,14 +151,27 @@ fn l_egaliseur_corrige_les_modes_sans_remonter_les_creux() {
         r.rms_after_db
     );
     for mode in &room.modes {
-        let proche = r.bands.iter().find(|b| (b.freq / mode.freq).log2().abs() < 0.15);
-        assert!(proche.is_some(), "aucune bande près du mode {} Hz : {:?}", mode.freq, r.bands);
+        let proche = r
+            .bands
+            .iter()
+            .find(|b| (b.freq / mode.freq).log2().abs() < 0.15);
+        assert!(
+            proche.is_some(),
+            "aucune bande près du mode {} Hz : {:?}",
+            mode.freq,
+            r.bands
+        );
     }
 
     // Mesure de vérification : on rejoue le balayage à travers l'égaliseur.
     let corrige = sim::apply_bands(FS, &r.bands, &sw.signal);
     let m2 = analyse_capture(&room.capture(&corrige, 1.0), &sw, &spec, None);
-    let offset = TargetCurve::flat().align_offset_percentile(&m2.response, cfg.align_lo, cfg.align_hi, cfg.align_percentile);
+    let offset = TargetCurve::flat().align_offset_percentile(
+        &m2.response,
+        cfg.align_lo,
+        cfg.align_hi,
+        cfg.align_percentile,
+    );
     let pic_apres = m2
         .response
         .freqs
@@ -138,7 +180,10 @@ fn l_egaliseur_corrige_les_modes_sans_remonter_les_creux() {
         .filter(|(f, _)| **f >= cfg.f_lo && **f <= cfg.f_hi)
         .map(|(_, v)| v - offset)
         .fold(f64::NEG_INFINITY, f64::max);
-    assert!(pic_apres < 2.0, "après correction, pic de {pic_apres:.2} dB au-dessus de la cible");
+    assert!(
+        pic_apres < 2.0,
+        "après correction, pic de {pic_apres:.2} dB au-dessus de la cible"
+    );
 }
 
 #[test]
@@ -155,7 +200,11 @@ fn l_egaliseur_travaille_aussi_dans_une_piece_reverberante() {
     // Les deux modes les plus forts (42 et 68 Hz) sont coupés d'au moins 3 dB.
     for f in [42.0, 68.0] {
         let c = eq::bands_response_db(FS as f64, &r.bands, &[f])[0];
-        assert!(c < -3.0, "{f} Hz : correction {c:.2} dB, bandes {:?}", r.bands);
+        assert!(
+            c < -3.0,
+            "{f} Hz : correction {c:.2} dB, bandes {:?}",
+            r.bands
+        );
     }
     // Le dépassement résiduel est fait d'ondulations aléatoires de la queue
     // diffuse (propres à la position) : on exige seulement qu'il baisse d'un tiers.
@@ -174,26 +223,61 @@ fn les_garde_fous_de_l_egaliseur_tiennent() {
     let grid = LogResponse::grid(20.0, 1000.0, 48);
     // Un pic énorme (+18 dB) et un creux profond (−12 dB).
     let src = [
-        Band { freq: 45.0, gain: 18.0, q: 6.0, kind: BandType::Peak, channel: None },
-        Band { freq: 90.0, gain: -12.0, q: 3.0, kind: BandType::Peak, channel: None },
+        Band {
+            freq: 45.0,
+            gain: 18.0,
+            q: 6.0,
+            kind: BandType::Peak,
+            channel: None,
+        },
+        Band {
+            freq: 90.0,
+            gain: -12.0,
+            q: 3.0,
+            kind: BandType::Peak,
+            channel: None,
+        },
     ];
-    let measured = LogResponse { freqs: grid.clone(), magnitude_db: eq::bands_response_db(fs, &src, &grid) };
-    let cfg = AutoEqConfig { max_cut_db: 8.0, max_bands: 6, ..AutoEqConfig::single_position(fs) };
+    let measured = LogResponse {
+        freqs: grid.clone(),
+        magnitude_db: eq::bands_response_db(fs, &src, &grid),
+    };
+    let cfg = AutoEqConfig {
+        max_cut_db: 8.0,
+        max_bands: 6,
+        ..AutoEqConfig::single_position(fs)
+    };
     let r = design_eq(&measured, &TargetCurve::flat(), &cfg);
 
     // Jamais de relance, jamais plus de 8 dB de coupe cumulée, pas de préampli.
-    assert!(r.bands.iter().all(|b| b.gain <= 0.0 && b.gain >= -8.0 - 1e-9), "{:?}", r.bands);
+    assert!(
+        r.bands
+            .iter()
+            .all(|b| b.gain <= 0.0 && b.gain >= -8.0 - 1e-9),
+        "{:?}",
+        r.bands
+    );
     let total = eq::bands_response_db(fs, &r.bands, &grid);
     let plus_profond = total.iter().cloned().fold(f64::INFINITY, f64::min);
-    assert!(plus_profond >= -8.0 - 1e-6, "coupe cumulée {plus_profond:.2} dB");
+    assert!(
+        plus_profond >= -8.0 - 1e-6,
+        "coupe cumulée {plus_profond:.2} dB"
+    );
     assert!(total.iter().all(|v| *v <= 1e-6));
     assert_eq!(r.preamp_db, 0.0);
-    assert!(r.bands.iter().all(|b| b.freq >= cfg.f_lo && b.freq <= cfg.f_hi && b.q >= cfg.q_min && b.q <= cfg.q_max));
+    assert!(r
+        .bands
+        .iter()
+        .all(|b| b.freq >= cfg.f_lo && b.freq <= cfg.f_hi && b.q >= cfg.q_min && b.q <= cfg.q_max));
     // Le creux à 90 Hz n'a pas été rempli : la correction y reste ≥ −1 dB… et ≤ 0.
     let at90 = eq::bands_response_db(fs, &r.bands, &[90.0])[0];
     assert!(at90 <= 0.0);
     // Le pic de 18 dB ne peut pas être ramené sous le seuil avec 8 dB : avertissement.
-    assert!(r.warnings.iter().any(|w| w.contains("pic résiduel")), "{:?}", r.warnings);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("pic résiduel")),
+        "{:?}",
+        r.warnings
+    );
 }
 
 #[test]
@@ -204,8 +288,16 @@ fn le_rt60_par_bande_est_retrouve() {
     let sw = sweep::generate(&spec.sweep);
     let m = analyse_capture(&room.capture(&sw.signal, 2.0), &sw, &spec, None);
     for band in &room.tail {
-        let got = m.rt60.iter().find(|b| (b.center_hz - band.center_hz).abs() < 1.0).unwrap();
-        let t = if got.t30_s.is_finite() { got.t30_s } else { got.t20_s };
+        let got = m
+            .rt60
+            .iter()
+            .find(|b| (b.center_hz - band.center_hz).abs() < 1.0)
+            .unwrap();
+        let t = if got.t30_s.is_finite() {
+            got.t30_s
+        } else {
+            got.t20_s
+        };
         let tol = if band.center_hz < 100.0 { 0.35 } else { 0.25 };
         assert!(
             (t - band.rt60_s).abs() / band.rt60_s < tol,
@@ -233,19 +325,45 @@ fn l_etalonnage_du_micro_annule_sa_coloration() {
     let room = RoomSim::dry_living_room(FS);
     let sw = sweep::generate(&spec.sweep);
     let coloration = [
-        Band { freq: 150.0, gain: -3.0, q: 1.5, kind: BandType::Peak, channel: None },
-        Band { freq: 6000.0, gain: 4.0, q: 0.7, kind: BandType::HighShelf, channel: None },
+        Band {
+            freq: 150.0,
+            gain: -3.0,
+            q: 1.5,
+            kind: BandType::Peak,
+            channel: None,
+        },
+        Band {
+            freq: 6000.0,
+            gain: 4.0,
+            q: 0.7,
+            kind: BandType::HighShelf,
+            channel: None,
+        },
     ];
     // Fichier d'étalonnage « constructeur » : l'écart du micro sur 60 points.
     let mut cal = String::from("\"Sens Factor =-0.5dB, SERNO: 7000042\"\n");
     for f in LogResponse::grid(10.0, 20_000.0, 6) {
-        cal.push_str(&format!("{:.3}\t{:.3}\n", f, eq::bands_response_db(FS as f64, &coloration, &[f])[0]));
+        cal.push_str(&format!(
+            "{:.3}\t{:.3}\n",
+            f,
+            eq::bands_response_db(FS as f64, &coloration, &[f])[0]
+        ));
     }
     let mic = MicCalibration::parse(&cal).unwrap();
 
     let sans_micro = analyse_capture(&room.capture(&sw.signal, 1.0), &sw, &spec, None);
-    let brut = analyse_capture(&room.capture_with_mic(&sw.signal, 1.0, &coloration), &sw, &spec, None);
-    let corrige = analyse_capture(&room.capture_with_mic(&sw.signal, 1.0, &coloration), &sw, &spec, Some(&mic));
+    let brut = analyse_capture(
+        &room.capture_with_mic(&sw.signal, 1.0, &coloration),
+        &sw,
+        &spec,
+        None,
+    );
+    let corrige = analyse_capture(
+        &room.capture_with_mic(&sw.signal, 1.0, &coloration),
+        &sw,
+        &spec,
+        Some(&mic),
+    );
 
     let ecart = |a: &LogResponse, b: &LogResponse| {
         a.freqs
@@ -255,7 +373,10 @@ fn l_etalonnage_du_micro_annule_sa_coloration() {
             .map(|(i, _)| (a.magnitude_db[i] - b.magnitude_db[i]).abs())
             .fold(0.0f64, f64::max)
     };
-    assert!(ecart(&brut.response, &sans_micro.response) > 2.5, "la coloration doit se voir sans étalonnage");
+    assert!(
+        ecart(&brut.response, &sans_micro.response) > 2.5,
+        "la coloration doit se voir sans étalonnage"
+    );
     let residu = ecart(&corrige.response, &sans_micro.response);
     assert!(residu < 0.25, "résidu après étalonnage {residu:.3} dB");
     assert!((mic.spl_from_dbfs(-18.0).unwrap() - 94.5).abs() < 1e-9);
@@ -285,7 +406,11 @@ fn le_repere_de_synchronisation_retrouve_l_origine_sans_horloge_commune() {
     // acoustique est déjà dans t0, commun au repère et au balayage).
     let start = t0 + marker.len() + gap;
     let ir = deconv::deconvolve(&captured[start..], &sw, &deconv::ExtractSpec::default());
-    assert!(ir.delay_samples <= 1, "retard résiduel {} éch.", ir.delay_samples);
+    assert!(
+        ir.delay_samples <= 1,
+        "retard résiduel {} éch.",
+        ir.delay_samples
+    );
 }
 
 #[test]
@@ -300,12 +425,25 @@ fn la_moyenne_spatiale_lisse_les_differences_entre_positions() {
     p1.direct_delay_s = 0.011;
     let m1 = analyse_capture(&p1.capture(&sw.signal, 1.0), &sw, &spec, None);
     let m2 = analyse_capture(&p2.capture(&sw.signal, 1.0), &sw, &spec, None);
-    let avg = analysis::spatial_average(&[m1.response.clone(), m2.response.clone()], &[1.0, 1.0], true);
-    let r = design_eq(&avg, &TargetCurve::flat(), &AutoEqConfig::spatial_average(FS as f64));
+    let avg = analysis::spatial_average(
+        &[m1.response.clone(), m2.response.clone()],
+        &[1.0, 1.0],
+        true,
+    );
+    let r = design_eq(
+        &avg,
+        &TargetCurve::flat(),
+        &AutoEqConfig::spatial_average(FS as f64),
+    );
     assert!(r.bands.iter().all(|b| b.gain <= 0.0));
     // Le mode commun (42 Hz) est coupé plus que le mode discordant (68 Hz).
     let coupe = |f: f64| eq::bands_response_db(FS as f64, &r.bands, &[f])[0];
-    assert!(coupe(42.0) < coupe(68.0) - 2.0, "42 Hz : {:.1} dB, 68 Hz : {:.1} dB", coupe(42.0), coupe(68.0));
+    assert!(
+        coupe(42.0) < coupe(68.0) - 2.0,
+        "42 Hz : {:.1} dB, 68 Hz : {:.1} dB",
+        coupe(42.0),
+        coupe(68.0)
+    );
     let lr = analysis::difference_db(&m1.response, &m2.response);
     assert!(lr.magnitude_db.iter().any(|d| d.abs() > 6.0));
 }
@@ -314,9 +452,22 @@ fn la_moyenne_spatiale_lisse_les_differences_entre_positions() {
 fn export_au_format_natif_et_rew() {
     let fs = FS as f64;
     let grid = LogResponse::grid(20.0, 1000.0, 48);
-    let src = [Band { freq: 55.0, gain: 7.0, q: 5.0, kind: BandType::Peak, channel: None }];
-    let measured = LogResponse { freqs: grid.clone(), magnitude_db: eq::bands_response_db(fs, &src, &grid) };
-    let r = design_eq(&measured, &TargetCurve::flat(), &AutoEqConfig::single_position(fs));
+    let src = [Band {
+        freq: 55.0,
+        gain: 7.0,
+        q: 5.0,
+        kind: BandType::Peak,
+        channel: None,
+    }];
+    let measured = LogResponse {
+        freqs: grid.clone(),
+        magnitude_db: eq::bands_response_db(fs, &src, &grid),
+    };
+    let r = design_eq(
+        &measured,
+        &TargetCurve::flat(),
+        &AutoEqConfig::single_position(fs),
+    );
     let body = serde_json::to_value(r.to_eq_settings()).unwrap();
     assert_eq!(body["enabled"], true);
     assert_eq!(body["headroom_mode"], "safe");
@@ -324,5 +475,10 @@ fn export_au_format_natif_et_rew() {
     assert!(body["bands"][0]["gain"].as_f64().unwrap() < 0.0);
     let txt = eq::to_rew_filters(&r.bands, r.preamp_db);
     assert!(txt.starts_with("Filter Settings file"));
-    assert_eq!(txt.lines().filter(|l| l.starts_with("Filter") && l.contains(": ON")).count(), r.bands.len());
+    assert_eq!(
+        txt.lines()
+            .filter(|l| l.starts_with("Filter") && l.contains(": ON"))
+            .count(),
+        r.bands.len()
+    );
 }

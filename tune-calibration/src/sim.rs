@@ -50,9 +50,21 @@ impl RoomSim {
             direct_delay_s: 0.012,
             direct_gain: 0.3,
             modes: vec![
-                RoomMode { freq: 42.0, gain_db: 9.0, q: 6.0 },
-                RoomMode { freq: 68.0, gain_db: 6.0, q: 5.0 },
-                RoomMode { freq: 115.0, gain_db: 5.0, q: 7.0 },
+                RoomMode {
+                    freq: 42.0,
+                    gain_db: 9.0,
+                    q: 6.0,
+                },
+                RoomMode {
+                    freq: 68.0,
+                    gain_db: 6.0,
+                    q: 5.0,
+                },
+                RoomMode {
+                    freq: 115.0,
+                    gain_db: 5.0,
+                    q: 7.0,
+                },
             ],
             reflections: vec![(0.0035, -0.12)],
             tail: Vec::new(),
@@ -69,12 +81,30 @@ impl RoomSim {
     pub fn reverberant_living_room(sample_rate: u32) -> Self {
         Self {
             tail: vec![
-                TailBand { center_hz: 125.0, rt60_s: 0.7 },
-                TailBand { center_hz: 250.0, rt60_s: 0.55 },
-                TailBand { center_hz: 500.0, rt60_s: 0.45 },
-                TailBand { center_hz: 1000.0, rt60_s: 0.40 },
-                TailBand { center_hz: 2000.0, rt60_s: 0.35 },
-                TailBand { center_hz: 4000.0, rt60_s: 0.30 },
+                TailBand {
+                    center_hz: 125.0,
+                    rt60_s: 0.7,
+                },
+                TailBand {
+                    center_hz: 250.0,
+                    rt60_s: 0.55,
+                },
+                TailBand {
+                    center_hz: 500.0,
+                    rt60_s: 0.45,
+                },
+                TailBand {
+                    center_hz: 1000.0,
+                    rt60_s: 0.40,
+                },
+                TailBand {
+                    center_hz: 2000.0,
+                    rt60_s: 0.35,
+                },
+                TailBand {
+                    center_hz: 4000.0,
+                    rt60_s: 0.30,
+                },
             ],
             // −30 dB crête à t = 0 : avec une décroissance de 0,7 s, le niveau
             // stationnaire de la queue dépasse le son direct d'environ 4 dB
@@ -132,7 +162,10 @@ impl RoomSim {
             }
             // Normalise la queue à `level` crête près de t = 0, puis l'ajoute
             // à partir de 1 ms après le son direct.
-            let peak = tail[..(0.02 * fs) as usize].iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1e-12);
+            let peak = tail[..(0.02 * fs) as usize]
+                .iter()
+                .fold(0.0f64, |m, v| m.max(v.abs()))
+                .max(1e-12);
             let start = (0.001 * fs) as usize;
             for i in start..n {
                 h[i] += tail[i - start] / peak * level;
@@ -167,7 +200,12 @@ impl RoomSim {
 
     /// Capture à travers un micro dont la réponse dévie (bandes de coloration),
     /// pour tester l'étalonnage : la correction doit annuler `mic_coloration`.
-    pub fn capture_with_mic(&self, played: &[f64], guard_s: f64, mic_coloration: &[Band]) -> Vec<f64> {
+    pub fn capture_with_mic(
+        &self,
+        played: &[f64],
+        guard_s: f64,
+        mic_coloration: &[Band],
+    ) -> Vec<f64> {
         let fs = self.sample_rate as f64;
         let mut y = self.capture(played, guard_s);
         for b in mic_coloration {
@@ -185,7 +223,13 @@ impl RoomSim {
     pub fn modes_as_bands(&self) -> Vec<Band> {
         self.modes
             .iter()
-            .map(|m| Band { freq: m.freq, gain: m.gain_db, q: m.q, kind: BandType::Peak, channel: None })
+            .map(|m| Band {
+                freq: m.freq,
+                gain: m.gain_db,
+                q: m.q,
+                kind: BandType::Peak,
+                channel: None,
+            })
             .collect()
     }
 }
@@ -230,7 +274,13 @@ mod tests {
 
     #[test]
     fn filtre_biquad_identite() {
-        let b = Biquad { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 };
+        let b = Biquad {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+        };
         let x = [1.0, -2.0, 3.0];
         assert_eq!(filter_biquad(&b, &x), x.to_vec());
     }

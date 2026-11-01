@@ -1,6 +1,6 @@
 # Étude #7632 — Calibration de la pièce d'écoute
 
-*Note de conception, 01/11/2026 → 04/11/2026. Fable 5.1 pour Bertrand. Cible : rc11 ou rc12. Branche `etude/7632-calibration-b209`, prototype `tools/tune-calibration/` (hors workspace, aucun son joué ni capté).*
+*Note de conception, 01/11/2026 → 04/11/2026. Fable 5.1 pour Bertrand. Cible : rc11 ou rc12. Branche `etude/7632-calibration-b209`, prototype `tune-calibration/` (ex-`tools/tune-calibration/`) (hors workspace, aucun son joué ni capté).*
 
 Décisions de Bertrand du 01/11 : micro USB étalonné sur le serveur **et/ou** micro du téléphone (appli Android ou iOS, étalonnage par modèle) ; correction d'abord par **égaliseur paramétrique automatique**, puis **FIR en phase mixte** avec le convolueur existant ; découpage C1 (mesure) → C2 (cible + EQ) → C3 (FIR) → C4 (positions multiples, vérification, A/B, profils, REW).
 
@@ -113,7 +113,7 @@ Sortie : `EqSettings { enabled: true, bands, headroom_mode: "safe" }` sérialis�
 
 ## 3. Prototype : résultats sur pièces simulées (résumé ; tableaux en [annexe B](7632-calibration-annexe-b-resultats.md))
 
-Crate `tools/tune-calibration/` (Rust 2021, `realfft`, `rustfft`, `serde`, `serde_json`, toutes MIT/Apache-2.0, `cargo deny check licenses` vert) ; 33 essais unitaires + 9 essais d'intégration, verts sur Shrek. Pièces simulées : son direct retardé de 12 ms, réflexion de sol, trois modes (42 Hz +9 dB Q6, 68 Hz +6 dB Q5, 115 Hz +5 dB Q7), bruit −80 dBFS ; variante avec queue diffuse par octave à partir de 125 Hz. **Aucun son n'est joué ni capté.**
+Crate `tune-calibration/` (ex-`tools/tune-calibration/`) (Rust 2021, `realfft`, `rustfft`, `serde`, `serde_json`, toutes MIT/Apache-2.0, `cargo deny check licenses` vert) ; 33 essais unitaires + 9 essais d'intégration, verts sur Shrek. Pièces simulées : son direct retardé de 12 ms, réflexion de sol, trois modes (42 Hz +9 dB Q6, 68 Hz +6 dB Q5, 115 Hz +5 dB Q7), bruit −80 dBFS ; variante avec queue diffuse par octave à partir de 125 Hz. **Aucun son n'est joué ni capté.**
 
 - **Mesure** : retard retrouvé au sample près (576 éch.), crête/bruit 72 dB, réponse à < 0,3 dB de la réponse vraie de 30 Hz à 10 kHz, les trois modes retrouvés comme maxima ; RT60 T30 à ±10 % de 500 Hz à 4 kHz (±13 % à 125–250 Hz, flancs des filtres d'octave) ; étalonnage micro annulé à 0,25 dB ; origine retrouvée exactement par repère de synchronisation ; analyse complète en 0,4–0,5 s.
 - **Égaliseur** (pièce sèche) : 3 bandes à 42,1 / 68,3 / 114,8 Hz (fréquences à 0,3 %), −8,1 / −5,5 / −5,0 dB ; mesure de vérification après correction : +7,07 → −0,01 dB à 42 Hz, +4,98 → −0,03 à 68 Hz, +4,61 → +0,21 à 115 Hz, creux inchangés, aucune relance, préampli 0. Pièce réverbérante : les modes à 42 et 68 Hz corrigés, un pic de champ diffus pris pour cible à 102 Hz et un résidu de 5 dB à 115 Hz signalé par avertissement : c'est l'argument pour la moyenne spatiale (C4).

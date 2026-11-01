@@ -58,7 +58,11 @@ impl MeasurementSpec {
     }
 
     pub fn grid(&self) -> Vec<f64> {
-        LogResponse::grid(self.grid_lo, self.grid_hi.min(self.sweep.sample_rate as f64 * 0.45), self.points_per_octave)
+        LogResponse::grid(
+            self.grid_lo,
+            self.grid_hi.min(self.sweep.sample_rate as f64 * 0.45),
+            self.points_per_octave,
+        )
     }
 }
 
@@ -79,7 +83,8 @@ pub fn analyse_capture(
 ) -> Measurement {
     let ir = deconv::deconvolve(captured, sweep, &spec.extract);
     let grid = spec.grid();
-    let mut response = analysis::measured_response(&ir, spec.window_post_ms, spec.smoothing_n, &grid);
+    let mut response =
+        analysis::measured_response(&ir, spec.window_post_ms, spec.smoothing_n, &grid);
     if let Some(m) = mic {
         response.magnitude_db = m.correct(&response.freqs, &response.magnitude_db);
     }
