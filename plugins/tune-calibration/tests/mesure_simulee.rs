@@ -15,7 +15,10 @@ use tune_calibration_greffon::simulation::{Boucle, HoteSimule, MicroSimule, Piec
 use tune_entree_audio::peripheriques::Peripheriques;
 
 const MICRO: &str = "UMIK-1 simulé";
-const VITESSE: f64 = 25.0;
+/// 8× le temps réel : la déconvolution de chaque salve (quelques centaines
+/// de ms en debug) compte dans le budget de silence du générateur, multiplié
+/// par la vitesse ; au-delà, six salves ne tiennent plus dans le flux promis.
+const VITESSE: f64 = 8.0;
 
 struct Banc {
     controleur: Arc<Controleur>,
@@ -219,7 +222,7 @@ fn le_plafond_joue_arrete_la_montee_sur_une_piece_trop_sourde() {
     sim.noise_floor_dbfs = -60.0;
     let b = banc(&sim, 1.0, Some(50.0), "trop-sourde");
     let id = b.controleur.lancer(demande(3)).unwrap();
-    let etat = attendre_fin(&b.controleur, &id, Duration::from_secs(90));
+    let etat = attendre_fin(&b.controleur, &id, Duration::from_secs(180));
     match &etat {
         Etat::Refusee { motif } => assert!(motif.contains("plafonné"), "{motif}"),
         autre => panic!("attendu un refus, obtenu {autre:?}"),

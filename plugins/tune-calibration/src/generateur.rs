@@ -113,11 +113,14 @@ impl Plan {
         }
     }
 
-    /// Trames budgétées pour un segment : le signal, sa garde, et deux
-    /// secondes de silence pendant lesquelles l'analyseur décide de la suite
-    /// (le générateur joue du silence en attendant la consigne suivante).
+    /// Trames budgétées pour un segment : le signal, sa garde, et dix
+    /// secondes de silence pendant lesquelles l'analyseur capte la suite et
+    /// décide (déconvolution comprise ; le générateur joue du silence en
+    /// attendant la consigne suivante). Large à dessein : un budget trop
+    /// court fait finir le flux avant la dernière salve, et la mesure meurt en
+    /// « la zone a cessé de tirer le flux » au lieu d'un refus motivé.
     fn trames(spec: &SweepSpec, garde_s: f64) -> u64 {
-        spec.len_samples() as u64 + ((garde_s + 2.0) * spec.sample_rate as f64).round() as u64
+        spec.len_samples() as u64 + ((garde_s + 10.0) * spec.sample_rate as f64).round() as u64
     }
 
     /// Longueur maximale du flux, en trames : silence d'amorce, toutes les
