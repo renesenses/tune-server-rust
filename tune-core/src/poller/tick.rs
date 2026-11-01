@@ -13,6 +13,19 @@ impl PositionPoller {
                 if let Err(e) = crate::db::listening_resume::track_position(&self.db, s) {
                     tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_titre_non_enregistree");
                 }
+                // #7415 : la dernière piste d'un album / d'une playlist arrive à
+                // sa fin (30 dernières secondes ou 95 %) : sa reprise s'en va.
+                if let Some(np) = s.now_playing.as_ref().filter(|np| np.source != "podcast")
+                    && let Err(e) = crate::db::listening_resume::contexte_fini(
+                        &self.db,
+                        s.zone_id,
+                        np,
+                        s.position_ms,
+                        false,
+                    )
+                {
+                    tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_contexte_non_retiree");
+                }
                 if let Some(np) = s.now_playing.as_ref().filter(|np| np.source == "podcast") {
                     if let Err(e) = crate::db::listening_resume::podcast_started_in_context(
                         &self.db,
