@@ -1073,6 +1073,15 @@ impl DlnaOutput {
         self
     }
 
+    /// #6910 — ce que le SCPD a dit de `SetNextAVTransportURI`, s'il a déjà
+    /// été lu, SANS jamais aller sur le réseau ; `Inconnue` sinon.
+    pub fn annonce_suivante_retenue(&self) -> AnnonceSuivante {
+        self.annonce_suivante
+            .get()
+            .copied()
+            .unwrap_or(AnnonceSuivante::Inconnue)
+    }
+
     /// #3967 — ce que le SCPD d'`AVTransport` dit de `SetNextAVTransportURI`,
     /// lu au premier armement puis retenu. Un SCPD injoignable ou illisible
     /// rend `Inconnue` SANS le retenir.
