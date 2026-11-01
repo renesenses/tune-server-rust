@@ -532,9 +532,37 @@ pub(crate) fn logo_a_la_creation(
     de_la_fiche.or(saisi).or_else(favicon)
 }
 
-#[derive(Deserialize)]
+/// `GET /radios/search`. `q` reste la recherche par nom ; les critères de
+/// #7466 s'y ajoutent, tous facultatifs et combinables. Sans aucun critère,
+/// rien ne change : `q` reste exigé et la réponse est celle d'avant.
+#[derive(Deserialize, Default)]
 struct SearchQuery {
-    q: String,
+    q: Option<String>,
+    genre: Option<String>,
+    country: Option<String>,
+    codec: Option<String>,
+    bitrate_min: Option<i32>,
+    lossless: Option<bool>,
+    hires: Option<bool>,
+    favorites_only: Option<bool>,
+    rated_min: Option<f64>,
+    metadata_plus: Option<bool>,
+}
+
+impl SearchQuery {
+    fn criteres(&self) -> super::radios_criteres_7466::Criteres {
+        super::radios_criteres_7466::Criteres::depuis(
+            self.genre.as_deref(),
+            self.country.as_deref(),
+            self.codec.as_deref(),
+            self.bitrate_min,
+            self.lossless,
+            self.hires,
+            self.favorites_only,
+            self.rated_min,
+            self.metadata_plus,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -710,6 +738,14 @@ pub struct StationAnnuaire {
     /// ([`super::radios_annuaire::lier_les_stations`]).
     #[serde(skip)]
     pub cle_locale: Option<String>,
+    /// #7466 — la note moyenne de la fiche sur radio-metadata.fr
+    /// (`avg_rating`, de 0 à 5), en CENTIÈMES pour garder `Eq` : 4,7 → 470.
+    /// `None` tant que personne n'a noté la station (`rating_count` à 0).
+    #[serde(skip)]
+    pub note_centiemes: Option<i32>,
+    /// #7466 — le nombre de notes (`rating_count`).
+    #[serde(skip)]
+    pub nombre_de_notes: i64,
 }
 
 /// #7177 — un flux publié d'une fiche de l'annuaire, tel que l'API le rend.
@@ -942,6 +978,12 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                 flux,
                 streams_declared: item.get("streams").is_some_and(Value::is_array),
                 cle_locale,
+                note_centiemes: super::radios_criteres_7466::note_centiemes(item),
+                nombre_de_notes: item
+                    .get("rating_count")
+                    .and_then(super::radios_criteres_7466::nombre)
+                    .map(|n| n as i64)
+                    .unwrap_or(0),
             })
         })
         .collect()
@@ -1031,13 +1073,23 @@ pub(crate) fn stations_annuaire_absentes(
     requete: &str,
     catalogue: &[RadioStation],
 ) -> Vec<StationAnnuaire> {
+    hors_du_catalogue(
+        annuaire.iter().filter(|s| annuaire_correspond(s, requete)),
+        catalogue,
+    )
+}
+
+/// Les fiches de `fiches` que le catalogue local n'a pas (même adresse de flux
+/// ou même nom) — l'exclusion de [`stations_annuaire_absentes`], sans requête.
+pub(crate) fn hors_du_catalogue<'a>(
+    fiches: impl Iterator<Item = &'a StationAnnuaire>,
+    catalogue: &[RadioStation],
+) -> Vec<StationAnnuaire> {
     let urls: std::collections::HashSet<String> =
         catalogue.iter().map(|s| flux_normalise(&s.url)).collect();
     let noms: std::collections::HashSet<String> =
         catalogue.iter().map(|s| repli(&s.name)).collect();
-    annuaire
-        .iter()
-        .filter(|s| annuaire_correspond(s, requete))
+    fiches
         .filter(|s| {
             !std::iter::once(&s.stream_url)
                 .chain(s.stream_urls.iter())
@@ -1981,15 +2033,35 @@ async fn search_radios(
     Query(q): Query<SearchQuery>,
 ) -> Response {
     let lang = crate::i18n::lang_from_header(&headers);
+    let criteres = q.criteres();
+    // #7466 — sans critère, `q` reste exigé, comme avant (400).
+    let Some(texte) =
+        q.q.clone()
+            .or_else(|| (!criteres.est_vide()).then(String::new))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Failed to deserialize query string: missing field `q`",
+        )
+            .into_response();
+    };
+    // #7466 — des critères sans texte : on parcourt TOUT le catalogue local
+    // (la recherche par nom plafonne à 50) et l'annuaire entier.
+    let par_criteres_seuls = texte.trim().is_empty() && !criteres.est_vide();
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let (issue, mut items) = match repo.search(&q.q) {
+    let lecture = if par_criteres_seuls {
+        repo.list()
+    } else {
+        repo.search(&texte)
+    };
+    let (issue, mut items) = match lecture {
         Ok(items) if items.is_empty() => (IssueRecherche::Aucune, items),
         Ok(items) => (IssueRecherche::Resultats, items),
         Err(erreur) => {
             // Tracé, parce qu'une recherche qui échoue en silence est
             // exactement ce que ce correctif supprime côté client : elle ne
             // doit pas non plus disparaître côté serveur.
-            tracing::warn!(query = %q.q, erreur = %erreur, "radio_search_failed");
+            tracing::warn!(query = %texte, erreur = %erreur, "radio_search_failed");
             (IssueRecherche::Echec(erreur), Vec::new())
         }
     };
@@ -2028,13 +2100,33 @@ async fn search_radios(
         // #6964 — « ARD » trouve aussi le WDR 2 déjà dans « Mes radios » :
         // le diffuseur est un mot-clé de sa fiche, pas de la station en base.
         let liens = repo.liens_annuaire().unwrap_or_default();
-        let par_mot_cle =
-            stations_locales_par_mot_cle(&annuaire_releve, &q.q, &catalogue, &liens, &items);
-        items.extend(par_mot_cle);
-        (
-            PorteeRecherche::CatalogueEtAnnuaire,
-            stations_annuaire_absentes(&annuaire_releve, &q.q, &catalogue),
-        )
+        let mut suggestions = if par_criteres_seuls {
+            hors_du_catalogue(annuaire_releve.iter(), &catalogue)
+        } else {
+            let par_mot_cle =
+                stations_locales_par_mot_cle(&annuaire_releve, &texte, &catalogue, &liens, &items);
+            items.extend(par_mot_cle);
+            stations_annuaire_absentes(&annuaire_releve, &texte, &catalogue)
+        };
+        if !criteres.est_vide() {
+            // #7466 — les critères s'appliquent aux deux volets : les stations
+            // de « Mes radios » ET les suggestions de l'annuaire.
+            suggestions.retain(|f| criteres.retient_la_fiche(f, None));
+            if par_criteres_seuls {
+                suggestions.truncate(super::radios_criteres_7466::SUGGESTIONS_MAX);
+            }
+        }
+        (PorteeRecherche::CatalogueEtAnnuaire, suggestions)
+    };
+    if !criteres.est_vide() {
+        let liens = repo.liens_annuaire().unwrap_or_default();
+        items = criteres.filtrer_les_stations(items, &annuaire_releve, &liens);
+    }
+    // Des résultats que les critères ont tous écartés ne sont plus des
+    // résultats : la réponse le dit comme pour une recherche vide.
+    let issue = match issue {
+        IssueRecherche::Resultats if items.is_empty() => IssueRecherche::Aucune,
+        autre => autre,
     };
 
     // « Rien chez vous, mais l'annuaire connaît » n'est pas « rien nulle

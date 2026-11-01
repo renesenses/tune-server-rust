@@ -68,9 +68,15 @@ const COL_FILE_PATH: usize = 4;
 /// est lié puis ignoré) : rien n'est décodé, rien n'est écrit dans le fichier
 /// de l'utilisateur. Le `mb_id` obtenu est celui du TITRE de la tranche, donc
 /// propre à elle : aucune identité ne conflue.
-fn sql_candidats_enrichissement() -> String {
+///
+/// #7538 — une piste sous un dossier exclu de l'enrichissement n'est jamais
+/// candidate (clause vide si rien n'est réglé).
+fn sql_candidats_enrichissement(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> String {
     let chemin = tune_core::db::track_repo::sql::CHEMIN_OUVRABLE;
     let a_un_fichier = tune_core::db::track_repo::sql::A_UN_FICHIER;
+    let exclus = tune_core::taches_de_fond::perimetre::clause_hors_enrichissement(backend, chemin);
     format!(
         // artist_name / album_title are NOT columns of `tracks` — they are
         // only derived via joins (artists.name / albums.title). Selecting
@@ -97,7 +103,7 @@ fn sql_candidats_enrichissement() -> String {
            OR t.label IS NULL OR t.label = '' \
            OR t.composer IS NULL OR t.composer = '' \
            OR (t.artist_id IS NOT NULL AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')) \
-         )"
+         ){exclus}"
     )
 }
 
@@ -208,7 +214,7 @@ pub(crate) async fn demarrer_enrich_all(
     // si cette sélection échoue. Aucun appel MusicBrainz n'a lieu ici.
     let backend_selection = state.backend.clone();
     let selection = tokio::task::spawn_blocking(move || {
-        backend_selection.query_many(&sql_candidats_enrichissement(), &[])
+        backend_selection.query_many(&sql_candidats_enrichissement(&backend_selection), &[])
     })
     .await;
     let track_rows = match selection {
@@ -1139,7 +1145,7 @@ mod tests_candidats_cue {
 
     fn candidats(backend: &Arc<dyn DbBackend>) -> Vec<Vec<tune_core::db::backend::SqlValue>> {
         backend
-            .query_many(&sql_candidats_enrichissement(), &[])
+            .query_many(&sql_candidats_enrichissement(backend), &[])
             .expect("la requête de candidats doit s'exécuter sur les deux moteurs")
     }
 
@@ -1183,6 +1189,24 @@ mod tests_candidats_cue {
             vec![20, 21],
             "les deux tranches vivent sous le répertoire de leur image ; la piste ordinaire non"
         );
+    }
+
+    /// #7538 — un dossier exclu de l'enrichissement ne donne aucun candidat,
+    /// tranches CUE comprises (situées par leur image) ; le reste reste.
+    #[test]
+    fn un_dossier_exclu_ne_donne_aucun_candidat_7538() {
+        let backend = base();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set(
+                tune_core::taches_de_fond::perimetre::CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT,
+                r#"["/music/Jazz/Live 1975"]"#,
+            )
+            .unwrap();
+        let ids: Vec<i64> = candidats(&backend)
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect();
+        assert_eq!(ids, vec![10], "les deux tranches de l'image exclue sortent");
     }
 }
 

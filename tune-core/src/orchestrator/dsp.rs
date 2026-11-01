@@ -880,7 +880,16 @@ impl PlaybackOrchestrator {
             // Pas de chemin local vivant. Reste le redémarrage — mais uniquement si
             // quelque chose joue : sinon la prochaine lecture rebâtira l'EQ toute
             // seule, et redémarrer un flux inexistant n'a aucun sens.
-            let np = self.playback.get_state(zone_id).await.now_playing;
+            //
+            // 🔴 #7556 — « joue » se lit dans `state` : une zone ARRÊTÉE garde
+            // son `now_playing` (affichage), et la relance la remettait en
+            // lecture sans geste de lecture. Une zone EN PAUSE garde son flux
+            // et ne doit pas repartir non plus.
+            let etat = self.playback.get_state(zone_id).await;
+            let en_lecture = etat.state == crate::playback::PlayState::Playing;
+            let np = etat
+                .now_playing
+                .filter(|_| etat.state != crate::playback::PlayState::Stopped);
             chemin = if np.is_none() {
                 "rien_ne_joue"
             } else if np
@@ -902,7 +911,11 @@ impl PlaybackOrchestrator {
                 // refabriquer…) : la relance reste le seul chemin, et le
                 // journal dit pourquoi.
                 en_vol_impossible = Some(raison);
-                if self.schedule_eq_replay(zone_id) {
+                if !en_lecture {
+                    // #7556 — zone en pause : la relance la remettrait en
+                    // lecture. Le réglage portera sur la piste suivante.
+                    "relance_evitee_zone_en_pause"
+                } else if self.schedule_eq_replay(zone_id) {
                     "replay_programme"
                 } else {
                     // `schedule_eq_replay` a déjà dit POURQUOI (#2595) ; ici on
@@ -1355,7 +1368,15 @@ impl PlaybackOrchestrator {
                     return;
                 }
             }
-            let position_ms = moi.playback.get_state(zone_id).await.position_ms.max(0) as u64;
+            // #7556 — la zone a pu être arrêtée ou mise en pause pendant
+            // l'anti-rebond : la relance la remettrait en lecture sans geste
+            // de lecture. Un réglage ne lance JAMAIS de lecture.
+            let etat = moi.playback.get_state(zone_id).await;
+            if etat.state != crate::playback::PlayState::Playing {
+                info!(zone_id, etat = ?etat.state, "eq_replay_skipped_zone_pas_en_lecture");
+                return;
+            }
+            let position_ms = etat.position_ms.max(0) as u64;
             match moi
                 .replay_zone_at_position(zone_id, position_ms, "eq_change")
                 .await
@@ -1754,6 +1775,7 @@ impl PlaybackOrchestrator {
             compensation: None,
             sample_rate,
             en_vol: None,
+            convolveur_reste_a_jeter: None,
         };
         // #5071 — la compensation lit les étages RÉELLEMENT exécutés : un
         // crossfeed n'agit qu'en stéréo (`StreamingDsp::process`).
@@ -2734,7 +2756,15 @@ impl PlaybackOrchestrator {
     /// relâché par l'appelant.
     #[cfg(feature = "local-audio")]
     pub(super) async fn rouvrir_pour_les_voies(&self, zone_id: i64) {
-        let position_ms = self.playback.get_state(zone_id).await.position_ms.max(0) as u64;
+        // #7556 — rouvrir = rejouer : sur une zone en pause ou arrêtée, ce
+        // serait relancer la lecture sans geste de lecture. La prochaine
+        // lecture ouvrira la sortie sur les bonnes voies.
+        let etat = self.playback.get_state(zone_id).await;
+        if etat.state != crate::playback::PlayState::Playing {
+            info!(zone_id, etat = ?etat.state, "reaffectation_voies_reouverture_reportee_zone_pas_en_lecture");
+            return;
+        }
+        let position_ms = etat.position_ms.max(0) as u64;
         match self
             .replay_zone_at_position(zone_id, position_ms, "reaffectation_voies")
             .await

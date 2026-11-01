@@ -75,6 +75,11 @@ pub enum Feature {
     /// GREFFON, pas d'un chemin d'URL, et la décision (complet / refusé,
     /// bientôt réduit pour les comptes gratuits) tient chez lui.
     Concerts,
+    /// « Sortie AES67 » (#7336) : diffuser une zone en flux RTP multicast
+    /// vers des récepteurs AES67. Premium (Bertrand, 30/10/2026). Déclarée
+    /// par le greffon `tune-aes67` (`TunePlugin::required_feature`), qui
+    /// refuse lui-même ses routes et ses sorties sans ce droit.
+    Aes67,
 }
 
 impl Feature {
@@ -110,6 +115,7 @@ impl Feature {
             Feature::AcousticAnalysis,
             Feature::PontRoon,
             Feature::Concerts,
+            Feature::Aes67,
         ]
     }
 
@@ -135,6 +141,7 @@ impl Feature {
             Feature::AcousticAnalysis => "Acoustic Analysis",
             Feature::PontRoon => "Roon Bridge",
             Feature::Concerts => "Concerts",
+            Feature::Aes67 => "AES67 Output",
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
@@ -177,6 +184,7 @@ impl Feature {
             Feature::AcousticAnalysis => "acoustic_analysis",
             Feature::PontRoon => "pont_roon",
             Feature::Concerts => "concerts",
+            Feature::Aes67 => "aes67_output",
             Feature::PlaylistTransfer => "playlist_transfer",
             Feature::AdvancedAlarms => "advanced_alarms",
             Feature::MultiProfiles => "multi_profiles",
@@ -210,7 +218,9 @@ impl Feature {
             // Features licensed by Premium but NOT yet available/functional
             // (product decision — Bertrand). These show a red cross in the UI.
             // Note: Dé-ploc IS available, so it is deliberately NOT listed here.
-            Feature::SocialSharing | Feature::WeeklyDigest => false,
+            // AES67 (#7336) : expérimentale dans la rc10, désactivée par défaut,
+            // jamais essayée sur un vrai récepteur Dante/Ravenna.
+            Feature::SocialSharing | Feature::WeeklyDigest | Feature::Aes67 => false,
             _ => true,
         }
     }
@@ -508,6 +518,30 @@ impl LicenseManager {
         let mut snapshot = self.state.read().await.clone();
         snapshot.tier = effective_tier(&snapshot);
         snapshot
+    }
+
+    /// D'où vient le Premium EFFECTIF de ce serveur (#7419) : `Some("key")`
+    /// quand la clé de licence le porte, `Some("account")` quand c'est le
+    /// compte Mozaiklabs lié (SSO) seul, `None` hors Premium.
+    ///
+    /// Sur une nouvelle machine, la connexion au compte suffit : le site déduit
+    /// le Premium de la licence liée au courriel du compte, et aucune clé n'est
+    /// à saisir. Le panneau Licence ne le disait pas — il montrait un champ de
+    /// clé vide et invitait à « activer une licence », si bien que l'auditeur
+    /// allait recopier sa clé depuis son espace personnel (alec_eiffel,
+    /// fil 2530), alors que son serveur était déjà Premium par le compte.
+    /// Même règle que [`effective_tier`], dont elle ne fait que nommer la
+    /// branche retenue.
+    pub async fn source_du_premium(&self) -> Option<&'static str> {
+        let state = self.state.read().await;
+        if effective_tier(&state) != Tier::Premium {
+            return None;
+        }
+        if key_premium_active(&state) {
+            Some("key")
+        } else {
+            Some("account")
+        }
     }
 
     /// Store a license key **without** granting Premium.
@@ -1418,15 +1452,16 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentyseven_features() {
+    fn all_premium_has_twentyeight_features() {
         // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
         // premium doit être un acte conscient, pas un effet de bord. Passé de
         // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
         // rien et tournait sur des installations gratuites ; puis à 26 avec
         // `PontRoon` (16/09/2026, décision de Bertrand) ; puis à 27 avec
         // `Concerts` (#2363) — sa propre tuile, incluse dans Premium (Bertrand,
-        // 30/08 et 25/09/2026).
-        assert_eq!(Feature::all_premium().len(), 27);
+        // 30/08 et 25/09/2026) ; puis à 28 avec `Aes67` (#7336, Bertrand,
+        // 30/10/2026).
+        assert_eq!(Feature::all_premium().len(), 28);
     }
 
     #[test]
@@ -1751,6 +1786,42 @@ mod tests {
         for f in Feature::all_premium() {
             assert!(!f.display_name().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn la_source_du_premium_nomme_le_compte_ou_la_cle_7419() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let mgr = LicenseManager::new_with_limit(backend, 3);
+        assert_eq!(
+            mgr.source_du_premium().await,
+            None,
+            "palier gratuit : aucune source"
+        );
+
+        // Nouvelle machine, aucune clé : la connexion au compte suffit.
+        mgr.set_account_premium(true, None).await;
+        let ls = mgr.license_state().await;
+        assert_eq!(ls.tier, Tier::Premium);
+        assert!(ls.license_key.is_none());
+        assert_eq!(mgr.source_du_premium().await, Some("account"));
+
+        // Une clé confirmée en ligne prend le pas : c'est elle qui est affichée.
+        mgr.set_license_key("TUNE-TEST-7419").await.unwrap();
+        assert_eq!(
+            mgr.source_du_premium().await,
+            Some("account"),
+            "une clé encore en attente de validation ne porte pas le Premium"
+        );
+        mgr.update_from_server(Tier::Premium, None).await;
+        assert_eq!(mgr.source_du_premium().await, Some("key"));
+
+        // Compte redevenu gratuit, sans clé : plus de source.
+        mgr.clear_license().await;
+        mgr.set_account_premium(false, None).await;
+        assert_eq!(mgr.source_du_premium().await, None);
     }
 
     #[tokio::test]

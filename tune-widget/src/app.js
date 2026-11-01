@@ -1,6 +1,15 @@
 // Config
-let SERVER = localStorage.getItem('tune-server') || 'http://192.168.1.15:8888';
+const C = window.TuneContrat;
+const invoke = (cmd, args) => window.__TAURI__?.core?.invoke(cmd, args);
+
+// L'adresse du serveur : celle que l'utilisateur a tapée ici (localStorage),
+// sinon celle du côté natif (config.json), sinon la machine
+// elle-même. L'ancien défaut était une adresse du réseau de développement.
+let SERVER = C.normaliserServeur(localStorage.getItem('tune-server')) || C.SERVEUR_PAR_DEFAUT;
 let state = { playing: false, zone_id: 0, duration_ms: 0, position_ms: 0 };
+// Loi du curseur de chaque zone (`volume_curve` de GET /zones, #6787).
+const courbes = new Map();
+const courbe = () => courbes.get(state.zone_id) || 'linear';
 let searchTimeout = null;
 
 const $ = (id) => document.getElementById(id);
@@ -12,10 +21,7 @@ function formatTime(ms) {
 }
 
 function coverUrl(path) {
-  if (!path) return null;
-  if (path.startsWith('http')) return path;
-  if (/^[0-9a-f]{32,64}$/i.test(path)) return `${SERVER}/api/v1/library/artwork/${path}`;
-  return null;
+  return C.urlDePochette(SERVER, path);
 }
 
 function updateNowPlaying(data) {
@@ -49,9 +55,11 @@ function updatePosition(ms) {
 
 let volumeLocalUntil = 0;
 
+// `vol` est le gain linéaire 0..1 que publie le serveur ; le curseur affiche
+// sa position selon la loi de la zone.
 function updateVolume(vol) {
   if (Date.now() < volumeLocalUntil) return;
-  const v = vol > 1 ? Math.round(vol) : Math.round(vol * 100);
+  const v = C.positionDuCurseur(vol, courbe());
   $('volume-slider').value = v;
   $('volume-value').textContent = v;
 }
@@ -84,7 +92,7 @@ function applyZoneData(data) {
     }
     updateState(zone.state === 'playing');
     updatePosition(zone.position_ms || 0);
-    updateVolume(zone.volume ?? 0.5);
+    if (typeof zone.volume === 'number') updateVolume(zone.volume);
   }
   setConnected(true);
 }
@@ -98,7 +106,10 @@ async function refresh() {
   }
 }
 
-async function init() {
+// `zoneChoisie` : la zone que l'utilisateur vient de choisir dans le menu.
+// Sans elle, init() reprenait la zone qui joue et le menu revenait aussitôt
+// en arrière.
+async function init(zoneChoisie) {
   try {
     const data = await apiGet('/api/v1/widget/data');
     // First load: pick the best zone
@@ -109,13 +120,17 @@ async function init() {
       if (!np.track_id && (!np.title || np.title === 'Recovering...')) return false;
       return true;
     });
-    if (playing) {
+    if (Number.isInteger(zoneChoisie)) {
+      state.zone_id = zoneChoisie;
+    } else if (playing) {
       state.zone_id = playing.zone_id;
     } else {
       // Pick first paused zone, or first zone
       const paused = (data.zones || []).find(z => z.state === 'paused');
       state.zone_id = paused ? paused.zone_id : ((data.zones && data.zones[0]) ? data.zones[0].zone_id : 1);
     }
+    // Les raccourcis globaux (côté natif) visent la zone affichée ici.
+    invoke('select_zone', { zoneId: state.zone_id })?.catch?.(() => {});
     applyZoneData(data);
   } catch (e) {
     console.error('init:', e);
@@ -123,10 +138,12 @@ async function init() {
   }
 
   try {
-    const zones = await apiGet('/api/v1/zones');
+    const zones = C.listeDeZones(await apiGet('/api/v1/zones'));
     const sel = $('zone-select');
     sel.innerHTML = '';
-    (Array.isArray(zones) ? zones : []).forEach(z => {
+    zones.forEach(z => {
+      courbes.set(z.id, z.volume_curve === 'db60' ? 'db60' : 'linear');
+      if (z.id === state.zone_id && typeof z.volume === 'number') updateVolume(z.volume);
       const o = document.createElement('option');
       o.value = z.id;
       o.textContent = z.name;
@@ -163,56 +180,270 @@ $('volume-slider').oninput = () => {
   const v = parseInt($('volume-slider').value);
   $('volume-value').textContent = v;
   volumeLocalUntil = Date.now() + 3000;
-  apiPut(`/api/v1/zones/${state.zone_id}/volume`, { volume: v });
+  // Une fraction 0..1, jamais un pourcentage : le serveur lit tout nombre
+  // <= 1 comme une fraction, et `{volume: 1}` valait donc le plein volume.
+  apiPut(`/api/v1/zones/${state.zone_id}/volume`, C.corpsDeVolume(v, courbe()));
 };
 
 $('zone-select').onchange = () => {
-  state.zone_id = parseInt($('zone-select').value);
-  init();
+  init(parseInt($('zone-select').value, 10));
 };
 
-// Search
+// ── Recherche (#7595) ──────────────────────────────────────────────────────
+//
+// La bibliothèque d'abord, affichée dès qu'elle répond ; Qobuz et TIDAL en
+// même temps, chacun par sa propre requête, rangés DESSOUS dans l'ordre fixe
+// de `SERVICES_DE_RECHERCHE` quel que soit celui qui répond le premier.
+// Un délai entre les frappes, et toute requête d'une saisie dépassée est
+// annulée (AbortController) : sa réponse ne peut plus repeindre la liste.
+//
+// Toutes les formes du serveur passent par `contrat.js`.
+
+const DELAI_DE_FRAPPE_MS = 250;
+let recherche = null; // { q, ctrl, sources: [{ cle, nom, limite, etat, cats, visibles }], actif }
+
+const SOURCES_DE_RECHERCHE = [{ cle: 'local', nom: 'Bibliothèque' }, ...C.SERVICES_DE_RECHERCHE];
+
+function cleDElement(i) { return `${i.source}:${i.type}:${i.id}`; }
+
+function ouvrirPanneauDeRecherche(ouvert) {
+  $('app').classList.toggle('en-recherche', ouvert);
+  $('search-results').className = ouvert ? 'visible' : '';
+}
+
+function fermerRecherche() {
+  clearTimeout(searchTimeout);
+  if (recherche && recherche.ctrl) recherche.ctrl.abort();
+  recherche = null;
+  $('search-results').replaceChildren();
+  ouvrirPanneauDeRecherche(false);
+}
+
+async function chargerSource(r, src) {
+  const url = src.cle === 'local'
+    ? C.urlDeRecherche(SERVER, r.q, src.limite)
+    : C.urlDeRechercheDeService(SERVER, r.q, src.cle, src.limite);
+  try {
+    const rep = await fetch(url, { signal: r.ctrl.signal });
+    if (!rep.ok) throw new Error(rep.status);
+    const json = await rep.json();
+    if (recherche !== r) return; // saisie dépassée
+    src.cats = src.cle === 'local' ? C.resultatsLocaux(json) : C.resultatsDeService(json, src.cle, src.limite);
+    src.etat = 'pret';
+  } catch (e) {
+    if (recherche !== r || (e && e.name === 'AbortError')) return;
+    src.etat = 'echec';
+  }
+  dessinerRecherche();
+}
+
+function lancerRecherche(q) {
+  if (recherche && recherche.ctrl) recherche.ctrl.abort();
+  const r = {
+    q,
+    ctrl: new AbortController(),
+    actif: recherche ? recherche.actif : null,
+    sources: SOURCES_DE_RECHERCHE.map(s => ({
+      cle: s.cle, nom: s.nom, limite: C.LIMITE_INITIALE, etat: 'attente', cats: null,
+      visibles: { ...C.PAR_CATEGORIE },
+    })),
+  };
+  recherche = r;
+  ouvrirPanneauDeRecherche(true);
+  dessinerRecherche();
+  // La bibliothèque part la première ; les services aussitôt derrière, en
+  // parallèle, sans attendre sa réponse.
+  r.sources.forEach(src => { chargerSource(r, src); });
+}
+
+function vignette(item) {
+  const url = C.urlDeVignette(SERVER, item.cover);
+  const repli = () => {
+    const s = document.createElement('span');
+    s.className = 'vignette vignette-repli' + (item.type === 'artist' ? ' ronde' : '');
+    s.textContent = item.type === 'artist' ? ((item.title || '?').trim().charAt(0).toUpperCase() || '?') : '♪';
+    return s;
+  };
+  if (!url) return repli();
+  const img = document.createElement('img');
+  img.className = 'vignette' + (item.type === 'artist' ? ' ronde' : '');
+  img.alt = '';
+  img.loading = 'lazy';
+  img.decoding = 'async';
+  img.onerror = () => img.replaceWith(repli());
+  img.src = url;
+  return img;
+}
+
+function ligneDeResultat(item) {
+  const row = document.createElement('div');
+  row.className = 'search-item nav';
+  row.setAttribute('role', 'option');
+  row.dataset.cle = cleDElement(item);
+  const info = document.createElement('div');
+  info.className = 'search-item-info';
+  // Construit nœud par nœud : un titre ou un nom d'artiste est du texte,
+  // jamais du HTML.
+  const t = document.createElement('div');
+  t.className = 'search-item-title';
+  t.textContent = item.title || '?';
+  info.append(t);
+  if (item.subtitle) {
+    const a = document.createElement('div');
+    a.className = 'search-item-artist';
+    a.textContent = item.subtitle;
+    info.append(a);
+  }
+  const play = document.createElement('span');
+  play.className = 'search-item-play';
+  play.textContent = '▶';
+  row.append(vignette(item), info, play);
+  row.onclick = () => lireResultat(item);
+  row.onmouseenter = () => activer(row.dataset.cle, false);
+  return row;
+}
+
+function boutonVoirPlus(r, src, cat) {
+  const b = document.createElement('div');
+  b.className = 'search-more nav';
+  b.setAttribute('role', 'option');
+  b.dataset.cle = `plus:${src.cle}:${cat}`;
+  b.textContent = 'Voir plus';
+  b.onclick = async () => {
+    const { visibles, limite } = C.voirPlus(src.cats[cat], src.visibles[cat], C.PAR_CATEGORIE[cat], src.limite);
+    src.visibles[cat] = visibles;
+    if (limite) {
+      src.limite = limite;
+      src.etat = 'attente';
+      dessinerRecherche();
+      await chargerSource(r, src);
+    } else {
+      dessinerRecherche();
+    }
+  };
+  b.onmouseenter = () => activer(b.dataset.cle, false);
+  return b;
+}
+
+function dessinerRecherche() {
+  const r = recherche;
+  const box = $('search-results');
+  if (!r) return;
+  const noeuds = [];
+  let toutPret = true;
+  let rien = true;
+  r.sources.forEach(src => {
+    if (src.etat === 'attente') toutPret = false;
+    const cats = src.cats;
+    const nonVides = cats ? C.CATEGORIES.filter(c => cats[c].items.length) : [];
+    if (!nonVides.length) {
+      // La bibliothèque annonce qu'elle cherche ; un service muet ne prend pas de place.
+      if (src.cle === 'local' && src.etat === 'attente') {
+        noeuds.push(enTete('search-source', src.nom), etatDeRecherche('Recherche…'));
+      }
+      return;
+    }
+    rien = false;
+    noeuds.push(enTete('search-source', src.nom + (src.etat === 'attente' ? ' …' : '')));
+    nonVides.forEach(c => {
+      const cat = cats[c];
+      const total = Number.isInteger(cat.total) && cat.total > 0 ? ` · ${cat.total}` : '';
+      noeuds.push(enTete('search-category', C.NOMS_DE_CATEGORIE[c] + total));
+      cat.items.slice(0, src.visibles[c]).forEach(i => noeuds.push(ligneDeResultat(i)));
+      if (C.aEncore(cat, src.visibles[c], src.limite)) noeuds.push(boutonVoirPlus(r, src, c));
+    });
+  });
+  if (rien && toutPret) noeuds.push(etatDeRecherche('Aucun résultat'));
+  box.replaceChildren(...noeuds);
+  activer(r.actif, false);
+}
+
+function enTete(classe, texte) {
+  const h = document.createElement('div');
+  h.className = classe;
+  h.textContent = texte;
+  return h;
+}
+
+function etatDeRecherche(texte) {
+  const d = document.createElement('div');
+  d.className = 'search-empty';
+  d.textContent = texte;
+  return d;
+}
+
+function navigables() { return Array.from($('search-results').querySelectorAll('.nav')); }
+
+function activer(cle, defiler) {
+  if (!recherche) return;
+  recherche.actif = cle;
+  let choisi = null;
+  navigables().forEach(el => {
+    const oui = cle != null && el.dataset.cle === cle;
+    el.classList.toggle('actif', oui);
+    el.setAttribute('aria-selected', oui ? 'true' : 'false');
+    if (oui) choisi = el;
+  });
+  if (choisi && defiler) choisi.scrollIntoView({ block: 'nearest' });
+}
+
+function deplacer(delta) {
+  const els = navigables();
+  if (!els.length || !recherche) return;
+  const i = els.findIndex(el => el.dataset.cle === recherche.actif);
+  const j = i < 0 ? (delta > 0 ? 0 : els.length - 1) : Math.max(0, Math.min(els.length - 1, i + delta));
+  activer(els[j].dataset.cle, true);
+}
+
+async function lireResultat(item) {
+  fermerRecherche();
+  $('search-input').value = '';
+  try {
+    const r = await fetch(`${SERVER}/api/v1/zones/${state.zone_id}/play`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(C.corpsDeLecture(item)),
+    });
+    if (!r.ok) console.error('play', r.status, await r.text().catch(() => ''));
+  } catch (e) {
+    console.error('play', e);
+  }
+}
+
 $('search-input').oninput = () => {
   clearTimeout(searchTimeout);
   const q = $('search-input').value.trim();
-  if (!q) { $('search-results').className = ''; return; }
-  searchTimeout = setTimeout(async () => {
-    try {
-      const data = await apiGet(`/api/v1/search?q=${encodeURIComponent(q)}&limit=8`);
-      const items = [];
-      (data.tracks || []).slice(0, 4).forEach(t => items.push({ title: t.title, artist: t.artist_name, type: 'track', id: t.id }));
-      (data.albums || []).slice(0, 4).forEach(a => items.push({ title: a.title, artist: a.artist_name, type: 'album', id: a.id }));
-      if (!items.length) { $('search-results').className = ''; return; }
-      $('search-results').innerHTML = items.map(i => `
-        <div class="search-item" data-type="${i.type}" data-id="${i.id}">
-          <div class="search-item-info">
-            <div class="search-item-title">${i.title || '?'}</div>
-            <div class="search-item-artist">${i.artist || ''}</div>
-          </div>
-          <span class="search-item-play">▶</span>
-        </div>`).join('');
-      $('search-results').className = 'visible';
-      $('search-results').querySelectorAll('.search-item').forEach(el => {
-        el.onclick = () => {
-          const body = el.dataset.type === 'album' ? { album_id: parseInt(el.dataset.id) } : { track_id: parseInt(el.dataset.id) };
-          fetch(`${SERVER}/api/v1/zones/${state.zone_id}/play`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-          $('search-input').value = '';
-          $('search-results').className = '';
-        };
-      });
-    } catch {}
-  }, 300);
+  if (!q) { fermerRecherche(); return; }
+  searchTimeout = setTimeout(() => lancerRecherche(q), DELAI_DE_FRAPPE_MS);
 };
+
+$('search-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    $('search-input').value = '';
+    fermerRecherche();
+  } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    deplacer(e.key === 'ArrowDown' ? 1 : -1);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const els = navigables();
+    const el = els.find(x => recherche && x.dataset.cle === recherche.actif)
+      || els.find(x => x.classList.contains('search-item'));
+    if (el) el.click();
+  }
+});
 
 // Settings
 const mainEls = ['cover-container', 'track-info', 'progress-container', 'controls', 'volume-container', 'search-container'];
-$('btn-settings').onclick = () => { mainEls.forEach(id => $(id).style.display = 'none'); $('settings-panel').style.display = 'block'; $('server-url').value = SERVER.replace(/^https?:\/\//, ''); };
+$('btn-settings').onclick = () => { $('search-input').value = ''; fermerRecherche(); mainEls.forEach(id => $(id).style.display = 'none'); $('settings-panel').style.display = 'block'; $('server-url').value = SERVER.replace(/^https?:\/\//, ''); };
 $('btn-settings-back').onclick = () => { $('settings-panel').style.display = 'none'; mainEls.forEach(id => $(id).style.display = ''); };
 $('btn-connect').onclick = () => {
   const v = $('server-url').value.trim();
   if (!v) return;
-  SERVER = v.startsWith('http') ? v : `http://${v}`;
+  SERVER = C.normaliserServeur(v);
   localStorage.setItem('tune-server', SERVER);
+  // Le côté natif (raccourcis, fenêtre complète) suit la même adresse.
+  invoke('set_server_url', { url: SERVER })?.catch?.(() => {});
+  if (ws) ws.close();
   $('settings-panel').style.display = 'none';
   mainEls.forEach(id => $(id).style.display = '');
   init();
@@ -242,27 +473,19 @@ function connectWS() {
   };
 
   ws.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      const type = msg.type || '';
-      const data = msg.data || msg;
-      if (data.zone_id && data.zone_id !== state.zone_id) return;
-
-      if (type.includes('track_changed') || type.includes('started')) {
-        updateNowPlaying(data);
-        updateState(true);
-      } else if (type.includes('paused')) {
-        updateState(false);
-      } else if (type.includes('resumed')) {
-        updateState(true);
-      } else if (type.includes('stopped')) {
-        updateState(false);
-      } else if (type.includes('position')) {
-        updatePosition(data.position_ms || 0);
-      } else if (type.includes('volume')) {
-        updateVolume(data.volume ?? 0);
-      }
-    } catch {}
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    const ev = C.lireEvenement(msg, state.zone_id);
+    if (!ev) return;
+    const data = ev.data;
+    switch (ev.genre) {
+      case 'piste': updateNowPlaying(data); updateState(true); break;
+      case 'pause': updateState(false); break;
+      case 'reprise': updateState(true); break;
+      case 'arret': updateState(false); break;
+      case 'position': updatePosition(data.position_ms || 0); break;
+      case 'volume': updateVolume(data.volume); break;
+    }
   };
 
   ws.onclose = () => {
@@ -275,6 +498,15 @@ function connectWS() {
 // Fallback polling every 10s (in case WS fails)
 setInterval(refresh, 10000);
 
-// Start
-init();
-connectWS();
+// Start : l'adresse retenue par le côté natif l'emporte sur le défaut, pas
+// sur celle que l'utilisateur a tapée dans ce panneau.
+(async () => {
+  if (!localStorage.getItem('tune-server')) {
+    try {
+      const natif = C.normaliserServeur(await invoke('get_server_url'));
+      if (natif) SERVER = natif;
+    } catch {}
+  }
+  init();
+  connectWS();
+})();

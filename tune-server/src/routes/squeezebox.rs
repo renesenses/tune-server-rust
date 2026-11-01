@@ -79,7 +79,8 @@ fn statut_json(enabled: bool, lms_host: &str, lms_discovered: bool, players: Vec
 fn diagnostic_sans_platine(hote: &str) -> Value {
     json!({
         "code": "lms_sans_platine",
-        "message": format!("LMS ({hote}) répond mais n'annonce aucune platine. Vérifier les lecteurs et leur connexion à ce LMS. Pour HQPlayer, vérifier le pont qui doit le présenter comme platine à LMS."),
+        "message": crate::message_api::texte("api.squeezebox.noPlayer", &[("host", hote.to_string())]),
+        "message_key": "api.squeezebox.noPlayer",
     })
 }
 
@@ -131,7 +132,8 @@ fn diagnostic_recensement_vide(hote: &str, reponse_serverstatus: &str) -> Value 
     if reponse_identifie_tune_lui_meme(reponse_serverstatus) {
         return json!({
             "code": "lms_est_tune_lui_meme",
-            "message": format!("L'adresse configurée ({hote}) désigne le pont de commande Squeezebox de Tune, pas un serveur Lyrion/LMS : Tune s'interroge lui-même, et le recensement des platines restera vide quoi que fasse Lyrion. Saisir l'adresse de votre serveur Lyrion dans Réglages → Squeezebox (port CLI 9090 par défaut)."),
+            "message": crate::message_api::texte("api.squeezebox.addressIsTune", &[("host", hote.to_string())]),
+            "message_key": "api.squeezebox.addressIsTune",
         });
     }
     diagnostic_sans_platine(hote)
@@ -547,9 +549,11 @@ async fn create_zone_for_player(
             tracing::warn!(id = %device_id, "squeezebox_create_zone: player unknown to LMS");
             (
                 StatusCode::NOT_FOUND,
-                Json(json!({
-                    "error": format!("Le lecteur {id} n'est pas (ou plus) annonce par LMS.")
-                })),
+                Json(crate::message_api::corps_refus(
+                    "lms_player_unknown",
+                    "api.squeezebox.playerNotAnnounced",
+                    &[("id", id.to_string())],
+                )),
             )
                 .into_response()
         }

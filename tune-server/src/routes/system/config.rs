@@ -292,7 +292,10 @@ pub(super) async fn get_config(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     // A failed snapshot is not an empty settings table: serving defaults here
     // made persisted choices look reset, despite a successful earlier write.
-    let all = settings.all().map_err(|_| {
+    // #7307 — l'erreur était jetée sans trace : le rapport d'un testeur dont
+    // les choix « reviennent au défaut » ne pouvait pas en porter la cause.
+    let all = settings.all().map_err(|e| {
+        tracing::error!(erreur = %e, "reglages_illisibles");
         AppError::service_unavailable("Server settings are temporarily unavailable")
     })?;
     let mut config = serde_json::Map::new();
@@ -515,6 +518,13 @@ pub(super) async fn get_config(
         // limitent. Vide par défaut : toute la bibliothèque.
         (
             tune_core::taches_de_fond::perimetre::CLE_DOSSIERS_INCLUS,
+            json!([]),
+        ),
+        // #7538 — les dossiers que l'enrichissement des métadonnées ne touche
+        // pas (communautaire, MusicBrainz, réparations de genre). Vide par
+        // défaut : rien d'exclu.
+        (
+            tune_core::taches_de_fond::perimetre::CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT,
             json!([]),
         ),
         // #6198 — les genres de la passe CLAP : retenus (vide : tous) et
@@ -1471,11 +1481,19 @@ fn normaliser_perimetre_des_analyses(
 /// que les racines exclues (tableau de chaînes, rognées, sans vide ni
 /// doublon, `null` = vide), refusée en 400 sinon. Ils ne touchent pas
 /// ReplayGain : aucune campagne à refermer.
+///
+/// #7538 — les dossiers exclus de l'enrichissement suivent la même forme et
+/// ne touchent pas davantage ReplayGain.
 fn normaliser_genres_du_clap(values: &mut serde_json::Map<String, Value>) -> Result<(), AppError> {
     use tune_core::taches_de_fond::perimetre::{
-        CLE_GENRES_CLAP_EXCLUS, CLE_GENRES_CLAP_INCLUS, normaliser,
+        CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT, CLE_GENRES_CLAP_EXCLUS, CLE_GENRES_CLAP_INCLUS,
+        normaliser,
     };
-    for cle in [CLE_GENRES_CLAP_INCLUS, CLE_GENRES_CLAP_EXCLUS] {
+    for cle in [
+        CLE_GENRES_CLAP_INCLUS,
+        CLE_GENRES_CLAP_EXCLUS,
+        CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT,
+    ] {
         let Some(brut) = values.get(cle) else {
             continue;
         };
@@ -6707,6 +6725,65 @@ mod instantane_reglages_7343_tests {
         );
     }
 
+    #[derive(Clone, Default)]
+    struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Journal {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #7307 — le 503 de #7343 sans trace laissait le rapport muet sur la
+    /// cause : l'erreur de lecture doit être journalisée, avec son message.
+    #[tokio::test]
+    async fn une_lecture_impossible_laisse_sa_cause_au_journal() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .sqlite()
+            .unwrap()
+            .execute_batch("DROP TABLE settings")
+            .unwrap();
+        let journal = Journal::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(journal.clone())
+            .finish();
+        let response = {
+            let _garde = tracing::subscriber::set_default(subscriber);
+            lire(&state).await
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let journal = String::from_utf8(journal.0.lock().unwrap().clone()).unwrap();
+        let ligne = journal
+            .lines()
+            .find(|l| l.contains("reglages_illisibles"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "un échec de lecture des réglages doit laisser `reglages_illisibles` \
+                     au journal (#7307) ; journal : {journal:?}"
+                )
+            });
+        assert!(
+            ligne.contains("settings"),
+            "la ligne doit porter l'erreur SQLite : {ligne:?}"
+        );
+    }
+
     #[tokio::test]
     async fn une_base_lisible_sans_preferences_garde_les_defauts() {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
@@ -6756,3 +6833,70 @@ mod volume_6774_tests;
 #[cfg(test)]
 #[path = "racines_preservees_6175_tests.rs"]
 mod racines_preservees_6175_tests;
+
+/// #7538 — les dossiers exclus de l'enrichissement : publiés vides,
+/// normalisés comme les autres listes du périmètre, refusés sous une autre
+/// forme, et relus par le moteur tels qu'écrits.
+#[cfg(test)]
+mod dossiers_exclus_de_l_enrichissement_7538_tests {
+    use super::{get_config, normaliser_genres_du_clap};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::taches_de_fond::perimetre::{
+        CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT, dossiers_exclus_de_l_enrichissement,
+    };
+
+    async fn config(state: &AppState) -> Value {
+        get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
+        .0
+    }
+
+    #[tokio::test]
+    async fn publies_vides_normalises_puis_relus_7538() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        assert_eq!(
+            config(&state).await[CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT],
+            json!([])
+        );
+        let mut v: serde_json::Map<String, Value> =
+            json!({ CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT: [" /music/Jazz ", "", "/music/Jazz"] })
+                .as_object()
+                .unwrap()
+                .clone();
+        assert!(normaliser_genres_du_clap(&mut v).is_ok());
+        assert_eq!(
+            v[CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT],
+            json!(["/music/Jazz"])
+        );
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        for (k, val) in v {
+            settings.set(&k, &val.to_string()).unwrap();
+        }
+        assert_eq!(
+            config(&state).await[CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT],
+            json!(["/music/Jazz"])
+        );
+        assert_eq!(
+            dossiers_exclus_de_l_enrichissement(&state.backend),
+            vec!["/music/Jazz"]
+        );
+        for mauvais in [json!("/music/Jazz"), json!(4), json!([1]), json!({})] {
+            let mut m: serde_json::Map<String, Value> =
+                json!({ CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT: mauvais.clone() })
+                    .as_object()
+                    .unwrap()
+                    .clone();
+            assert!(normaliser_genres_du_clap(&mut m).is_err(), "{mauvais}");
+        }
+    }
+}

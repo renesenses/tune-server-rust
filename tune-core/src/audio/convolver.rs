@@ -600,13 +600,85 @@ impl Convolver {
     /// ajouter du bruit détruirait précisément l'identité qu'on vient de lui
     /// rendre. Voir « Où ce dither ne doit PAS aller » dans [`crate::audio::dither`].
     pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16) {
+        let Some(mut buf) = self.pcm_vers_f32(pcm, bit_depth) else {
+            return;
+        };
+        self.process_offline(&mut buf);
+        f32_vers_pcm(&buf, pcm, bit_depth);
+    }
+
+    /// Convolution d'un FLUX découpé en tampons successifs (#7642).
+    ///
+    /// [`Self::process_pcm`] traite chaque appel comme une piste entière : il
+    /// complète le tampon de zéros jusqu'au bloc, pousse `latency_frames()`
+    /// trames de silence pour compenser la latence, puis les jette. Appelé
+    /// tampon après tampon sur la MÊME instance, ces zéros entrent dans la
+    /// ligne à retard comme s'ils étaient du signal : la queue de l'IR qui
+    /// déborde d'un tampon ne rejoint jamais le suivant, et le suivant voit un
+    /// passé décalé. Une IR de correction de pièce (des milliers de taps)
+    /// était ainsi coupée à chaque frontière de tampon du bras progressif.
+    ///
+    /// Ici, l'état est conservé d'un appel à l'autre ([`Self::process_interleaved`],
+    /// indépendant du découpage), et la latence est compensée sur le flux
+    /// entier : les `latency_frames()` premières trames de sortie — l'amorce
+    /// de silence — sont retirées du début (`reste_a_jeter`, tenu par
+    /// l'appelant et initialisé à `latency_frames()`), et
+    /// [`Self::terminer_pcm_en_flux`] rend en fin de flux ce que le moteur
+    /// retient encore. Somme des longueurs rendues = somme des longueurs
+    /// reçues, et le résultat est celui de [`Self::process_pcm`] sur la piste
+    /// entière. Le tampon peut donc RACCOURCIR (jamais en dessous de zéro) au
+    /// début du flux ; il reste aligné sur la trame.
+    pub fn process_pcm_en_flux(
+        &mut self,
+        pcm: &mut Vec<u8>,
+        bit_depth: u16,
+        reste_a_jeter: &mut usize,
+    ) {
+        let Some(mut buf) = self.pcm_vers_f32(pcm, bit_depth) else {
+            return;
+        };
+        self.process_interleaved(&mut buf);
+        let ch = self.channels;
+        let jetees = (*reste_a_jeter).min(buf.len() / ch);
+        *reste_a_jeter -= jetees;
+        let garde = &buf[jetees * ch..];
+        let bps = (bit_depth / 8) as usize;
+        pcm.truncate(garde.len() * bps);
+        f32_vers_pcm(garde, pcm, bit_depth);
+    }
+
+    /// Fin du flux de [`Self::process_pcm_en_flux`] : rend, en octets PCM, les
+    /// trames que la latence retenait encore, puis remet le moteur à zéro
+    /// (`reste_a_jeter` est réarmé pour un flux suivant).
+    pub fn terminer_pcm_en_flux(&mut self, bit_depth: u16, reste_a_jeter: &mut usize) -> Vec<u8> {
+        let ch = self.channels;
+        let bps = (bit_depth / 8) as usize;
+        if ch == 0 || bps == 0 || !matches!(bit_depth, 16 | 24 | 32) {
+            return Vec::new();
+        }
+        let latence = self.latency_frames();
+        let mut queue = vec![0.0f32; latence * ch];
+        self.process_interleaved(&mut queue);
+        let jetees = (*reste_a_jeter).min(latence);
+        let garde = &queue[jetees * ch..];
+        let mut pcm = vec![0u8; garde.len() * bps];
+        f32_vers_pcm(garde, &mut pcm, bit_depth);
+        self.reset();
+        *reste_a_jeter = self.latency_frames();
+        pcm
+    }
+
+    /// Décodage du PCM entier entrelacé en `f32`, à l'échelle 2^(n−1) (voir
+    /// [`Self::process_pcm`]). `None` : rien à faire (aucun canal, tampon vide,
+    /// profondeur non gérée).
+    fn pcm_vers_f32(&self, pcm: &[u8], bit_depth: u16) -> Option<Vec<f32>> {
         let ch = self.channels;
         if ch == 0 || pcm.is_empty() {
-            return;
+            return None;
         }
         let bps = (bit_depth / 8) as usize;
         if bps == 0 {
-            return;
+            return None;
         }
         let total = pcm.len() / bps;
         let mut buf: Vec<f32> = Vec::with_capacity(total);
@@ -629,41 +701,50 @@ impl Convolver {
                     let v = i32::from_le_bytes([pcm[o], pcm[o + 1], pcm[o + 2], pcm[o + 3]]);
                     v as f32 / 2147483648.0
                 }
-                _ => return,
+                _ => return None,
             };
             buf.push(s);
         }
-        self.process_offline(&mut buf);
-        for i in 0..total {
-            let o = i * bps;
-            let s = buf.get(i).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
-            match bit_depth {
-                // Même échelle qu'au décodage (2^(n−1)), arrondi au plus
-                // proche, saturation au rail EN DERNIER — par la porte
-                // partagée, avec un bruit nul : le convolveur ne dithère pas.
-                16 => {
-                    let v = quantifier_avec(f64::from(s) * 32_768.0, 0.0, -32_768.0, 32_767.0);
-                    pcm[o..o + 2].copy_from_slice(&(v as i16).to_le_bytes());
-                }
-                24 => {
-                    let v =
-                        quantifier_avec(f64::from(s) * 8_388_608.0, 0.0, -8_388_608.0, 8_388_607.0);
-                    let b = (v as i32).to_le_bytes();
-                    pcm[o] = b[0];
-                    pcm[o + 1] = b[1];
-                    pcm[o + 2] = b[2];
-                }
-                32 => {
-                    let v = quantifier_avec(
-                        f64::from(s) * 2_147_483_648.0,
-                        0.0,
-                        f64::from(i32::MIN),
-                        f64::from(i32::MAX),
-                    );
-                    pcm[o..o + 4].copy_from_slice(&(v as i32).to_le_bytes());
-                }
-                _ => {}
+        Some(buf)
+    }
+}
+
+/// Réencodage des échantillons `f32` dans `pcm` (autant d'échantillons que
+/// `pcm` en contient), à la même échelle qu'au décodage.
+fn f32_vers_pcm(buf: &[f32], pcm: &mut [u8], bit_depth: u16) {
+    let bps = (bit_depth / 8) as usize;
+    if bps == 0 {
+        return;
+    }
+    let total = pcm.len() / bps;
+    for i in 0..total {
+        let o = i * bps;
+        let s = buf.get(i).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+        match bit_depth {
+            // Même échelle qu'au décodage (2^(n−1)), arrondi au plus
+            // proche, saturation au rail EN DERNIER — par la porte
+            // partagée, avec un bruit nul : le convolveur ne dithère pas.
+            16 => {
+                let v = quantifier_avec(f64::from(s) * 32_768.0, 0.0, -32_768.0, 32_767.0);
+                pcm[o..o + 2].copy_from_slice(&(v as i16).to_le_bytes());
             }
+            24 => {
+                let v = quantifier_avec(f64::from(s) * 8_388_608.0, 0.0, -8_388_608.0, 8_388_607.0);
+                let b = (v as i32).to_le_bytes();
+                pcm[o] = b[0];
+                pcm[o + 1] = b[1];
+                pcm[o + 2] = b[2];
+            }
+            32 => {
+                let v = quantifier_avec(
+                    f64::from(s) * 2_147_483_648.0,
+                    0.0,
+                    f64::from(i32::MIN),
+                    f64::from(i32::MAX),
+                );
+                pcm[o..o + 4].copy_from_slice(&(v as i32).to_le_bytes());
+            }
+            _ => {}
         }
     }
 }
