@@ -328,9 +328,9 @@ pub fn condition_texte_libre(
             "(LOWER(unaccent(t.title)) {titre} \
              OR t.artist_id IN (SELECT id FROM artists WHERE LOWER(unaccent(name)) {artiste}) \
              OR t.album_id IN (SELECT id FROM albums WHERE LOWER(unaccent(title)) {titre_album}) \
-             OR LOWER(unaccent(t.label)) {label} \
+             OR {} \
              OR LOWER(unaccent({termes})) {chemin} \
-             OR LOWER(unaccent(t.composer)) {compositeur} \
+             OR {} \
              OR t.album_id IN (SELECT al.id FROM albums al JOIN artists ar ON ar.id = al.artist_id \
                 WHERE LOWER(unaccent(ar.name)) {artiste_album}) \
              OR {piste} IN (SELECT {magasin_piste} FROM track_metadata \
@@ -338,7 +338,13 @@ pub fn condition_texte_libre(
              OR {piste} IN (SELECT {magasin_piste} FROM track_credits \
                 WHERE LOWER(role) = 'conductor' AND LOWER(unaccent(artist_name)) {chef_credit}) \
              OR {album} IN (SELECT {magasin_album} FROM album_metadata \
-                WHERE key = 'conductor' AND LOWER(unaccent(value)) {chef_album}))"
+                WHERE key = 'conductor' AND LOWER(unaccent(value)) {chef_album}))",
+            // #7619 (L3) — label et compositeur : le `LIKE` sur les valeurs
+            // DISTINCTES, la piste par égalité. Même ensemble (une valeur NULL
+            // n'est ni `LIKE` ni `IN`), sans la fonction `unaccent` rejouée
+            // sur chaque piste. Voir `TrackRepo::sql::criteres`.
+            valeur_distincte_like("label", &label),
+            valeur_distincte_like("composer", &compositeur),
         ));
         let motif = format!("%{}%", super::track_repo::echapper_jokers_like(mot));
         valeurs.extend(
@@ -346,6 +352,19 @@ pub fn condition_texte_libre(
         );
     }
     (format!("({})", clauses.join(" AND ")), valeurs)
+}
+
+/// `t.{colonne}` vaut l'une des valeurs DISTINCTES de la colonne dont
+/// `LOWER(unaccent(valeur))` satisfait `motif` (`LIKE …`, échappement
+/// compris) — #7619 (L3). Le dictionnaire est MATÉRIALISÉ : sans cela, SQLite
+/// pousse le filtre dans le `SELECT DISTINCT` et rejoue `unaccent` sur chaque
+/// piste. `colonne` est un nom écrit par le code, jamais une saisie.
+fn valeur_distincte_like(colonne: &str, motif: &str) -> String {
+    format!(
+        "t.{colonne} IN (WITH dico AS MATERIALIZED \
+         (SELECT DISTINCT {colonne} AS v FROM tracks WHERE {colonne} IS NOT NULL) \
+         SELECT dico.v FROM dico WHERE LOWER(unaccent(dico.v)) {motif})"
+    )
 }
 
 /// Générateur de marqueurs positionnels, partagé par les DEUX constructeurs de
@@ -1666,8 +1685,12 @@ mod tests {
                 Engine::Postgres => "$8",
             };
             assert!(
+                // #7619 (L3) : sur le dictionnaire des compositeurs distincts.
                 sql.contains(&format!(
-                    "OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({sixieme})){esc} OR"
+                    "OR t.composer IN (WITH dico AS MATERIALIZED \
+                     (SELECT DISTINCT composer AS v FROM tracks WHERE composer IS NOT NULL) \
+                     SELECT dico.v FROM dico WHERE LOWER(unaccent(dico.v)) \
+                     LIKE LOWER(unaccent({sixieme})){esc}) OR"
                 )),
                 "{engine:?} : le compositeur, sixième : {sql}"
             );

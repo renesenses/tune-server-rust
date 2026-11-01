@@ -335,3 +335,69 @@ fn banc_recherche_7619_sur_copie() {
         assert_eq!(ancien_res, neuf_res, "« {q} » : résultats différents");
     }
 }
+
+/// Le texte libre d'Oxygen (`/library/tracks?q=`) : label et compositeur sur
+/// leurs dictionnaires — mêmes pistes que l'ancien prédicat, où le `LIKE`
+/// portait sur chaque piste.
+#[test]
+fn texte_libre_memes_pistes_que_l_ancien_predicat() {
+    use crate::db::facet_filter::{Placeholders, condition_texte_libre};
+    let (db, _repo) = base();
+    db.execute_batch(
+        "UPDATE tracks SET label = 'Parlophone' WHERE id IN (1, 2);
+         UPDATE tracks SET label = 'ÉCM Records' WHERE id = 4;
+         UPDATE tracks SET label = 'columbia' WHERE id = 6;",
+    )
+    .unwrap();
+    let esc = crate::db::track_repo::like_escape_clause();
+    let mut non_vides = 0;
+    for q in [
+        "parlo",
+        "ecm",
+        "ÉCM",
+        "COLUMB",
+        "dvorak",
+        "lennon",
+        "beat",
+        "e",
+        "50%",
+        "zzqx",
+        "come together",
+    ] {
+        let mut ph = Placeholders::resuming_at(crate::db::engine::Engine::Sqlite, 1);
+        let (cond, valeurs) = condition_texte_libre(&mut ph, q);
+        let mut vieux = cond.clone();
+        for col in ["label", "composer"] {
+            let neuf = format!(
+                "t.{col} IN (WITH dico AS MATERIALIZED \
+                 (SELECT DISTINCT {col} AS v FROM tracks WHERE {col} IS NOT NULL) \
+                 SELECT dico.v FROM dico WHERE LOWER(unaccent(dico.v)) LIKE LOWER(unaccent(?)){esc})"
+            );
+            assert!(vieux.contains(&neuf), "« {q} » : {col} absent : {vieux}");
+            vieux = vieux.replace(
+                &neuf,
+                &format!("LOWER(unaccent(t.{col})) LIKE LOWER(unaccent(?)){esc}"),
+            );
+        }
+        let refs: Vec<&dyn super::backend::ToSqlValue> = valeurs
+            .iter()
+            .map(|v| v as &dyn super::backend::ToSqlValue)
+            .collect();
+        let ids = |c: &str| -> Vec<i64> {
+            db.query_many(
+                &format!("SELECT t.id FROM tracks t WHERE {c} ORDER BY t.id"),
+                &refs,
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r[0].as_i64().unwrap())
+            .collect()
+        };
+        let (a, n) = (ids(&vieux), ids(&cond));
+        assert_eq!(n, a, "« {q} » : texte libre différent");
+        if !a.is_empty() {
+            non_vides += 1;
+        }
+    }
+    assert!(non_vides >= 7, "{non_vides}");
+}
