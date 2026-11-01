@@ -869,3 +869,147 @@ mod portee_repertoires_7283 {
         assert_eq!(data["total"], json!(3));
     }
 }
+
+/// #7597 (Bertrand, 01/11/2026 sur le .18) — le filtre « Répertoire » de la
+/// Bibliothèque. La liste d'albums de la Bibliothèque est `albums-detailed`
+/// (et non `/library/albums`) : elle doit retenir un album dès qu'UNE de ses
+/// pistes est sous le dossier, sous-dossiers compris, avec la même règle de
+/// préfixe que `/library/tracks` (`folder_like_pattern`) — `/m/A` ne retient
+/// pas `/m/AB`. Le `total` doit être juste.
+#[cfg(test)]
+mod portee_sous_dossiers_7597 {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde_json::Value;
+    use tower::ServiceExt;
+    use tune_core::db::backend::ToSqlValue;
+
+    fn chemin(parties: &[&str]) -> String {
+        let sep = std::path::MAIN_SEPARATOR.to_string();
+        let racine = if cfg!(windows) { r"C:\m" } else { "/m" };
+        std::iter::once(racine)
+            .chain(parties.iter().copied())
+            .collect::<Vec<_>>()
+            .join(&sep)
+    }
+
+    async fn lire(state: &crate::state::AppState, folder: Option<&str>) -> (i64, Vec<i64>) {
+        let uri = match folder {
+            Some(f) => format!(
+                "/albums-detailed?folder={}&limit=50&offset=0",
+                urlencoding::encode(f)
+            ),
+            None => "/albums-detailed?limit=50&offset=0".to_string(),
+        };
+        let response = super::super::router()
+            .with_state(state.clone())
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let data: Value = serde_json::from_slice(&body).unwrap();
+        let mut ids: Vec<i64> = data["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["album_id"].as_i64().unwrap())
+            .collect();
+        ids.sort();
+        (data["total"].as_i64().unwrap(), ids)
+    }
+
+    #[tokio::test]
+    async fn le_dossier_retient_ses_sous_dossiers_et_pas_son_voisin_de_prefixe_7597() {
+        let state =
+            crate::state::AppState::new(":memory:", 0, crate::config::TuneConfig::default())
+                .unwrap();
+        let backend = &state.backend;
+        backend
+            .execute(
+                "INSERT INTO artists (id, name) VALUES (1, 'Artiste 7597')",
+                &[],
+            )
+            .unwrap();
+        // 1 : directement sous /m/A ; 2 : sous /m/AB (voisin de PRÉFIXE) ;
+        // 3 : sous /m/A/sous/fond (sous-dossier profond) ; 4 : une piste sous
+        // /m/A/mixte, l'autre sous /m/Z.
+        let albums: [(i64, &str, Vec<String>); 4] = [
+            (
+                1,
+                "Direct",
+                vec![
+                    chemin(&["A", "Direct", "01.flac"]),
+                    chemin(&["A", "Direct", "02.flac"]),
+                ],
+            ),
+            (2, "Voisin", vec![chemin(&["AB", "Voisin", "01.flac"])]),
+            (
+                3,
+                "Profond",
+                vec![chemin(&["A", "sous", "fond", "01.flac"])],
+            ),
+            (
+                4,
+                "Mixte",
+                vec![
+                    chemin(&["A", "mixte", "01.flac"]),
+                    chemin(&["Z", "mixte", "02.flac"]),
+                ],
+            ),
+        ];
+        for (id, titre, pistes) in &albums {
+            backend
+                .execute(
+                    "INSERT INTO albums (id, title, artist_id) VALUES (?1, ?2, 1)",
+                    &[id as &dyn ToSqlValue, titre],
+                )
+                .unwrap();
+            for (n, p) in pistes.iter().enumerate() {
+                let numero = n as i64 + 1;
+                backend.execute(
+                    "INSERT INTO tracks (title, album_id, artist_id, album_artist, file_path, source, track_number, disc_number, duration_ms, format, sample_rate, bit_depth) VALUES ('Piste', ?1, 1, 'Artiste 7597', ?2, 'local', ?3, 1, 1000, 'flac', 44100, 16)",
+                    &[id as &dyn ToSqlValue, p, &numero],
+                ).unwrap();
+            }
+        }
+
+        // Contre-épreuve : sans filtre, les quatre albums.
+        assert_eq!(lire(&state, None).await, (4, vec![1, 2, 3, 4]));
+        // Le dossier, ses sous-dossiers à toute profondeur, et l'album dont
+        // UNE piste seulement y est — mais pas le voisin de préfixe /m/AB.
+        assert_eq!(
+            lire(&state, Some(&chemin(&["A"]))).await,
+            (3, vec![1, 3, 4]),
+            "#7597 : /m/A"
+        );
+        // Un séparateur final ne change rien.
+        let avec_sep = format!("{}{}", chemin(&["A"]), std::path::MAIN_SEPARATOR);
+        assert_eq!(
+            lire(&state, Some(&avec_sep)).await,
+            (3, vec![1, 3, 4]),
+            "#7597 : /m/A/"
+        );
+        assert_eq!(
+            lire(&state, Some(&chemin(&["AB"]))).await,
+            (1, vec![2]),
+            "#7597 : /m/AB"
+        );
+        assert_eq!(
+            lire(&state, Some(&chemin(&["A", "sous"]))).await,
+            (1, vec![3]),
+            "#7597 : sous-dossier"
+        );
+        assert_eq!(
+            lire(&state, Some(&chemin(&["Z"]))).await,
+            (1, vec![4]),
+            "#7597 : l'autre moitié de l'album mixte"
+        );
+        // Un dossier sans piste : rien, et un total à zéro.
+        assert_eq!(
+            lire(&state, Some(&chemin(&["Rien"]))).await,
+            (0, vec![]),
+            "#7597 : dossier vide"
+        );
+    }
+}
