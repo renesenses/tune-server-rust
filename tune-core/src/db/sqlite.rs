@@ -215,7 +215,15 @@ fn register_functions(conn: &Connection) -> Result<(), String> {
             // `LOWER(unaccent(col)) LIKE …` skip rows with a NULL genre/
             // composer instead of erroring). Only TEXT columns are wrapped.
             let s: Option<String> = ctx.get(0)?;
-            Ok(s.map(|v| crate::db::engine::fold_diacritics(&v)))
+            // #7619 — l'ASCII rendu tel quel, sans seconde allocation (voir
+            // `fold_diacritics`) : appelée sur chaque titre par la recherche.
+            Ok(s.map(|v| {
+                if v.is_ascii() {
+                    v
+                } else {
+                    crate::db::engine::fold_diacritics(&v)
+                }
+            }))
         },
     )
     .map_err(|e| format!("register unaccent: {e}"))?;

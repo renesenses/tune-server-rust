@@ -946,8 +946,14 @@ mod routage_tests {
 }
 
 #[cfg(test)]
+#[path = "banc_l3l4_7619.rs"]
+mod banc_l3l4_7619;
+#[cfg(test)]
 #[path = "banc_rail_5993.rs"]
 mod banc_rail_5993;
+#[cfg(test)]
+#[path = "facets_cache_7619_tests.rs"]
+mod facets_cache_7619_tests;
 
 #[cfg(test)]
 #[path = "facettes_lentes_2144_tests.rs"]

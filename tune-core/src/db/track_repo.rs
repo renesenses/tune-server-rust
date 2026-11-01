@@ -1542,16 +1542,32 @@ pub mod sql {
         }
     }
 
-    /// Le OU des critères, la branche plein texte `plein_texte` en tête, puis
-    /// trois `LIKE` et l'année sur les emplacements `n + 1` à `n + 4`.
+    /// Le OU des critères : la branche plein texte `plein_texte` en tête, puis
+    /// l'année sur l'emplacement `n + 1`.
+    ///
+    /// #7619 (L3), décision de Bertrand du 01/11/2026 : la recherche trouve
+    /// par DÉBUT DE MOT, pas en sous-chaîne. Les trois `LIKE '%…%'` d'avant
+    /// (artiste, genre, compositeur) sont donc RETIRÉS : l'index plein texte
+    /// porte déjà ces trois colonnes (`COLONNES_IDENTITE_PISTE`), et chaque
+    /// mot saisi y est un préfixe ([`crate::db::engine::format_fts_query`]).
+    /// « beat » trouve « The Beatles », « eat » ne le trouve plus. Aucun
+    /// motif sans index ne reste : ni `unaccent` rejoué sur chaque piste, ni
+    /// parcours d'un dictionnaire.
+    ///
+    /// L'année reste une égalité, servie par la clé des albums.
     fn criteres<D: SqlDialect>(d: &D, plein_texte: String, n: usize) -> String {
-        format!(
-            "({plein_texte} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {})",
-            d.placeholder(n + 1),
-            d.placeholder(n + 2),
-            d.placeholder(n + 3),
-            d.placeholder(n + 4),
-        )
+        let annee = format!(
+            "album_id IN (SELECT dico_al.id FROM albums dico_al \
+             WHERE CAST(dico_al.year AS TEXT) = {})",
+            d.placeholder(n + 1)
+        );
+        // Deux branches, chacune servie par un index : le plein texte (sous
+        // SQLite un `t.id IN (SELECT rowid …)`, sous PostgreSQL l'index GIN et
+        // la restriction #4367 sur la ligne jointe), et l'année par la clé des
+        // albums. Avec les cinq branches d'avant, SQLite ne lisait la piste
+        // par sa clé que si elles étaient réunies par `UNION` ; avec deux, le
+        // OU suffit — le témoin de plan le vérifie.
+        format!("({plein_texte} OR t.{annee})")
     }
 
     /// Le PRÉDICAT de la recherche de pistes, sans projection ni bornes.
@@ -1568,9 +1584,9 @@ pub mod sql {
     /// (#4146) : le prédicat est celui de `GET /library/tracks`, pris à
     /// `facet_filter` — une seconde rédaction divergerait au premier correctif.
     ///
-    /// Emplacements 1..=5 : requête FTS « piste ou chemin »
-    /// ([`crate::db::engine::format_fts_query_piste_ou_chemin`]), puis trois
-    /// `LIKE`, puis l'année.
+    /// Emplacements 1 et 2 : requête FTS « piste ou chemin »
+    /// ([`crate::db::engine::format_fts_query_piste_ou_chemin`]), puis
+    /// l'année.
     pub fn search_where<D: SqlDialect>(d: &D) -> String {
         format!(
             "{} AND {} AND {}",
@@ -1585,12 +1601,12 @@ pub mod sql {
     /// de son chemin la font venir (#5192). Même OU que [`search_where`], la
     /// branche plein texte restreinte à l'identité (#4367).
     ///
-    /// Emplacements 6..=10 : requête FTS d'identité
-    /// ([`crate::db::engine::format_fts_query_piste`]), trois `LIKE`, l'année.
+    /// Emplacements 3 et 4 : requête FTS d'identité
+    /// ([`crate::db::engine::format_fts_query_piste`]), l'année.
     pub fn search_rang<D: SqlDialect>(d: &D) -> String {
         format!(
             "CASE WHEN {} THEN 0 ELSE 1 END",
-            criteres(d, plein_texte_de_la_piste(d, 6), 6)
+            criteres(d, plein_texte_de_la_piste(d, 3), 3)
         )
     }
 
@@ -1602,15 +1618,38 @@ pub mod sql {
     /// stable d'un appel à l'autre : une même ligne pourrait revenir page 2
     /// après être passée page 1, et une autre ne jamais paraître (#3189).
     ///
-    /// Emplacements 11 et 12 : `LIMIT` et `OFFSET`.
+    /// Emplacements 5 et 6 : `LIMIT` et `OFFSET`.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
             "{} WHERE {} ORDER BY {}, t.id LIMIT {} OFFSET {}",
             select_track(),
             search_where(d),
             search_rang(d),
-            d.placeholder(11),
-            d.placeholder(12),
+            d.placeholder(5),
+            d.placeholder(6),
+        )
+    }
+
+    /// #7619 (L3) — [`search`] et le NOMBRE de pistes correspondantes en UNE
+    /// requête : `COUNT(*) OVER ()` en dernière colonne, calculé sur tout le
+    /// prédicat avant `LIMIT`/`OFFSET`. La page doit de toute façon lire
+    /// toutes les correspondances pour les ordonner ; le compte séparé
+    /// ([`search_count`]) rejouait ce même prédicat une seconde fois.
+    ///
+    /// La colonne vient APRÈS la projection de [`select_track`], qui reste
+    /// lue telle quelle par `row_to_track`. Mêmes emplacements que [`search`].
+    pub fn search_avec_total<D: SqlDialect>(d: &D) -> String {
+        let select = select_track();
+        let projection = select
+            .strip_suffix(track_from())
+            .expect("select_track() se termine par track_from()");
+        format!(
+            "{projection}, COUNT(*) OVER (){} WHERE {} ORDER BY {}, t.id LIMIT {} OFFSET {}",
+            track_from(),
+            search_where(d),
+            search_rang(d),
+            d.placeholder(5),
+            d.placeholder(6),
         )
     }
 
@@ -1621,13 +1660,13 @@ pub mod sql {
     /// résultat, ce qui ne borne rien. Ici le moteur cesse de lire dès la
     /// n-ième ligne trouvée, et le total rendu vaut alors « au moins n ».
     ///
-    /// Emplacement 6 : le plafond.
+    /// Emplacement 3 : le plafond.
     pub fn search_count<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT COUNT(*) FROM (SELECT t.id{} WHERE {} LIMIT {}) AS borne",
             track_from(),
             search_where(d),
-            d.placeholder(6),
+            d.placeholder(3),
         )
     }
 }
@@ -3497,28 +3536,69 @@ impl TrackRepo {
             crate::db::engine::format_fts_query_piste_ou_chemin(self.db.engine(), query);
         // #5192 : la requête d'IDENTITÉ ne sélectionne plus, elle classe.
         let fts_identite = crate::db::engine::format_fts_query_piste(self.db.engine(), query);
-        // Les guillemets doivent disparaître du motif LIKE : `%"kind of
-        // blue"%` ne correspondrait à aucun titre.
-        let like = crate::db::engine::motif_like(query);
+        // #7619 : début de mot seulement — sans mot utilisable, rien à
+        // chercher (et un `MATCH ''` serait une erreur de syntaxe FTS5).
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
         let trimmed = query.trim();
         let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
-        let params: [&dyn ToSqlValue; 12] = [
+        let params: [&dyn ToSqlValue; 6] = [
             &fts_query,
-            &like,
-            &like,
-            &like,
             &trimmed,
             &fts_identite,
-            &like,
-            &like,
-            &like,
             &trimmed,
             &limit,
             &offset,
         ];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
+    }
+
+    /// #7619 (L3) — [`Self::search_page`] ET [`Self::search_count`] en une
+    /// seule requête : la page, et le nombre de pistes correspondantes borné à
+    /// `plafond` (le rendre signifie « au moins `plafond` », comme
+    /// `search_count`).
+    ///
+    /// Une page VIDE ne porte aucune ligne, donc aucun compte : au-delà de la
+    /// dernière page, le compte est relu par [`Self::search_count`] ; sur la
+    /// première, il vaut 0.
+    pub fn search_page_et_total(
+        &self,
+        query: &str,
+        limit: i64,
+        offset: i64,
+        plafond: i64,
+    ) -> Result<(Vec<Track>, i64), TuneError> {
+        let fts_query =
+            crate::db::engine::format_fts_query_piste_ou_chemin(self.db.engine(), query);
+        let fts_identite = crate::db::engine::format_fts_query_piste(self.db.engine(), query);
+        if fts_query.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let trimmed = query.trim();
+        let offset = offset.max(0);
+        let sql = self.dialect_sql(sql::search_avec_total, sql::search_avec_total);
+        let params: [&dyn ToSqlValue; 6] = [
+            &fts_query,
+            &trimmed,
+            &fts_identite,
+            &trimmed,
+            &limit,
+            &offset,
+        ];
+        let rows = self.db.query_many(&sql, &params)?;
+        let total = rows
+            .first()
+            .and_then(|cols| cols.get(COLONNE_DU_TOTAL).and_then(|v| v.as_i64()));
+        let pistes = rows.iter().map(|cols| row_to_track(cols)).collect();
+        let total = match total {
+            Some(n) => n.min(plafond),
+            None if offset > 0 => self.search_count(query, plafond)?,
+            None => 0,
+        };
+        Ok((pistes, total))
     }
 
     /// Le nombre de pistes que [`Self::search_page`] parcourrait, borné à
@@ -3532,12 +3612,12 @@ impl TrackRepo {
         // piste OU termes de son chemin, jamais le seul titre de l'album.
         let fts_query =
             crate::db::engine::format_fts_query_piste_ou_chemin(self.db.engine(), query);
-        // Les guillemets doivent disparaître du motif LIKE : `%"kind of
-        // blue"%` ne correspondrait à aucun titre.
-        let like = crate::db::engine::motif_like(query);
+        if fts_query.is_empty() {
+            return Ok(0);
+        }
         let trimmed = query.trim();
         let sql = self.dialect_sql(sql::search_count, sql::search_count);
-        let params: [&dyn ToSqlValue; 6] = [&fts_query, &like, &like, &like, &trimmed, &plafond];
+        let params: [&dyn ToSqlValue; 3] = [&fts_query, &trimmed, &plafond];
         Ok(self
             .db
             .query_one(&sql, &params)?
@@ -4783,6 +4863,11 @@ impl TrackRepo {
     }
 }
 
+/// #7619 (L3) — le rang de `COUNT(*) OVER ()` dans
+/// [`sql::search_avec_total`] : juste après les 36 colonnes de
+/// [`sql::select_track`] (0 à 35).
+const COLONNE_DU_TOTAL: usize = 36;
+
 fn row_to_track(cols: &[SqlValue]) -> Track {
     Track {
         id: cols.first().and_then(|v| v.as_i64()),
@@ -5060,8 +5145,10 @@ mod tests {
         );
         assert_eq!(liste("Langsam"), (vec![par_dossier], 1), "nom du fichier");
         assert_eq!(liste("wish you were"), (vec![cigare], 1), "titre d'album");
-        // Saisie littérale : `_` n'est pas un joker.
-        assert_eq!(liste("mahler_kondrashin").1, 0);
+        // #7619 (décision du 01/11/2026) : début de mot ; `_` sépare deux
+        // mots, comme dans l'index, et n'est jamais un joker.
+        assert_eq!(liste("mahler_kondrashin").1, 2);
+        assert_eq!(liste("ahler").1, 0, "milieu de mot");
 
         let (tires, total) = repo
             .random_ids_in_folder(1, "/music/Classique", Some("kondrashin"), 10)
@@ -5116,14 +5203,14 @@ mod tests {
         );
         assert_eq!(
             format_fts_query_piste(Engine::Sqlite, "Wish You Were Here"),
-            "{title artist_name genre composer} : (Wish You Were Here*)"
+            "{title artist_name genre composer} : (Wish* You* Were* Here*)"
         );
         assert_eq!(format_fts_query_piste(Engine::Sqlite, ""), "");
 
         // Postgres : la chaîne reste une tsquery nue…
         assert_eq!(
             format_fts_query_piste(Engine::Postgres, "Wish You Were Here"),
-            "Wish & You & Were & Here:*"
+            "Wish:* & You:* & Were:* & Here:*"
         );
         // … et c'est le SQL qui restreint.
         let pg = sql::search_where(&PostgresDialect);
@@ -5151,12 +5238,15 @@ mod tests {
         );
         // L'ANNÉE ne passe par aucun vecteur : sa branche doit rester hors de
         // la restriction, sinon elle s'éteint sous Postgres.
-        let (avant_le_ou, _) = pg.split_once(" OR LOWER(unaccent(ar.name))").unwrap();
+        // #7619 : après le plein texte, la seule autre branche est l'année.
+        let (avant_le_ou, _) = pg
+            .split_once(" OR t.album_id IN (SELECT dico_al.id")
+            .unwrap_or_else(|| panic!("branche de l'année absente : {pg}"));
         assert!(
             avant_le_ou.contains("to_tsvector"),
             "la restriction doit être DANS la branche plein texte : {pg}"
         );
-        assert!(pg.contains("CAST(al.year AS TEXT) = $5"));
+        assert!(pg.contains("CAST(dico_al.year AS TEXT) = $2"), "{pg}");
     }
 
     /// #1391 — les pistes d'un album masqué sortent de la vue pistes (les
@@ -5749,7 +5839,7 @@ mod tests {
         // La borne est DANS la sous-requête : autour du COUNT, elle ne
         // bornerait rien du tout.
         assert!(
-            sql::search_count(&PostgresDialect).ends_with("LIMIT $6) AS borne"),
+            sql::search_count(&PostgresDialect).ends_with("LIMIT $3) AS borne"),
             "{}",
             sql::search_count(&PostgresDialect)
         );

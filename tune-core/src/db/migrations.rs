@@ -3829,6 +3829,24 @@ pub(crate) const UPNP_NUMEROS_ZERO_A_NULL: &str = "UPDATE tracks SET track_numbe
 pub(crate) const TRACKS_TITLE_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(title)";
 
+/// #7619 (volet L3, rc11) — deux index d'égalité sur les pistes.
+///
+/// `idx_tracks_composer` sert le texte libre d'Oxygen (`/library/tracks?q=`) :
+/// son `LIKE` sur le compositeur est posé sur le DICTIONNAIRE des valeurs
+/// distinctes (lu par l'index, sans la table), puis les pistes sont retrouvées
+/// par égalité — au lieu de rejouer `unaccent`, fonction Rust sous SQLite, sur
+/// chacune des 96 496 pistes du .18. `idx_tracks_genre` sert les égalités
+/// `t.genre = ?` de la radio d'artiste et des recommandations.
+///
+/// La recherche `/search`, elle, ne s'en sert plus : depuis la décision du
+/// 01/11/2026 (début de mot), elle passe tout entière par l'index plein texte.
+///
+/// Même texte sur les deux moteurs. Rejoué à chaque démarrage, sans numéro
+/// de migration — même raison que [`TRACKS_SOURCE_ID_INDEX`].
+pub(crate) const TRACKS_GENRE_COMPOSER_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tracks_genre ON tracks(genre);
+     CREATE INDEX IF NOT EXISTS idx_tracks_composer ON tracks(composer);";
+
 pub(crate) const DR_ALBUM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_track_metadata_dr \
      ON track_metadata(key, track_id, value) WHERE key IN ('dr_album', 'dr_track');
      CREATE INDEX IF NOT EXISTS idx_tracks_id_album ON tracks(id, album_id);";
@@ -4823,6 +4841,17 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // la constante.
     if let Err(e) = db.execute_batch(TRACKS_TITLE_INDEX) {
         warn!(error = %e, "sqlite_tracks_title_index_failed");
+    }
+    // #7619 (L3) — index d'égalité du genre et du compositeur : même passe —
+    // voir la constante.
+    if let Err(e) = db.execute_batch(TRACKS_GENRE_COMPOSER_INDEX) {
+        warn!(error = %e, "sqlite_tracks_genre_composer_index_failed");
+    }
+    // #7619 (L4/L5) — la révision de la bibliothèque : table, déclencheurs et
+    // ligne en une transaction ; un échec la laisse absente (caches muets).
+    if let Err(e) = db.execute_batch(&super::library_revision::sql_sqlite()) {
+        db.execute_batch("ROLLBACK").ok();
+        warn!(error = %e, "sqlite_library_revision_failed");
     }
     // #2149 — collections à règle de genre : même passe — voir la constante.
     if let Err(e) = db.execute_batch(TRACKS_ALBUM_GENRE_INDEX) {
@@ -5902,6 +5931,22 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // finale SQLite.
     if let Err(e) = sqlx::raw_sql(TRACKS_TITLE_INDEX).execute(pool).await {
         warn!(error = %e, "pg_tracks_title_index_failed");
+    }
+    // #7619 (L4/L5) — la révision de la bibliothèque, un bloc `DO`.
+    // Texte bâti par le code, sur les seuls noms de `TABLES_SUIVIES` (des
+    // constantes) : aucune saisie n'y entre.
+    if let Err(e) = sqlx::raw_sql(sqlx::AssertSqlSafe(super::library_revision::sql_postgres()))
+        .execute(pool)
+        .await
+    {
+        warn!(error = %e, "pg_library_revision_failed");
+    }
+    // #7619 (L3) — même index, même texte que la passe finale SQLite.
+    if let Err(e) = sqlx::raw_sql(TRACKS_GENRE_COMPOSER_INDEX)
+        .execute(pool)
+        .await
+    {
+        warn!(error = %e, "pg_tracks_genre_composer_index_failed");
     }
     // #5998 — même passe que la passe finale SQLite, même raison.
     if let Err(e) = sqlx::raw_sql(crate::db::track_repo::INDEX_CHEMIN_DOSSIER_PG)

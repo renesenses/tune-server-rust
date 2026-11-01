@@ -141,14 +141,17 @@ fn chercher_en_bibliotheque(state: &AppState, profile_id: i64, q: SearchQuery) -
             .map(|(name, album_count)| json!({ "name": name, "album_count": album_count }))
             .collect()
     };
-    let tracks = track_repo
-        .search_page(&q.q, limit, offset)
-        .unwrap_or_default();
+    // #7619 (L3) — la page et son total en une seule requête.
+    let plafond = crate::routes::search::PLAFOND_DE_COMPTAGE;
+    let (tracks, total_tracks_lu) =
+        match track_repo.search_page_et_total(&q.q, limit, offset, plafond) {
+            Ok((pistes, total)) => (pistes, Some(total)),
+            Err(_) => (Vec::new(), None),
+        };
 
     // #4663 — les totaux, sur le MÊME prédicat que les pages. Un `COUNT` qui
     // échoue ne doit pas annoncer 0 sous une liste non vide : le repli est
     // « au moins ce qu'on rend ».
-    let plafond = crate::routes::search::PLAFOND_DE_COMPTAGE;
     let plancher = |rendus: usize| offset.saturating_add(rendus as i64);
     let total_artists = artist_repo
         .search_count(&q.q, plafond)
@@ -156,9 +159,7 @@ fn chercher_en_bibliotheque(state: &AppState, profile_id: i64, q: SearchQuery) -
     let total_albums = album_repo
         .search_count(&q.q, plafond)
         .unwrap_or_else(|_| plancher(n_albums));
-    let total_tracks = track_repo
-        .search_count(&q.q, plafond)
-        .unwrap_or_else(|_| plancher(tracks.len()));
+    let total_tracks = total_tracks_lu.unwrap_or_else(|| plancher(tracks.len()));
     let n_artists = artists.len();
     let n_tracks = tracks.len();
     // Même règle que `/search` : sous le plafond le total tranche ; au

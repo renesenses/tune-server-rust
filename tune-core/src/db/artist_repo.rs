@@ -546,36 +546,36 @@ pub mod sql {
         )
     }
 
-    /// Le PRÉDICAT de la recherche d'artistes (emplacements 1 et 2), extrait
-    /// pour que la liste rendue et le total annoncé portent le même filtre
+    /// Le PRÉDICAT de la recherche d'artistes (emplacement 1), extrait pour
+    /// que la liste rendue et le total annoncé portent le même filtre
     /// (#3189).
+    ///
+    /// #7619 (L3), décision de Bertrand du 01/11/2026 : en DÉBUT DE MOT, par
+    /// l'index plein texte seul (`name`, `sort_name`). Le `LIKE '%…%'` en OU,
+    /// qui trouvait aussi le milieu d'un mot, est retiré.
     pub fn search_where<D: SqlDialect>(d: &D) -> String {
-        format!(
-            "{} OR LOWER(unaccent(a.name)) LIKE LOWER(unaccent({}))",
-            d.fts_where("artists", "a", &d.placeholder(1)),
-            d.placeholder(2)
-        )
+        d.fts_where("artists", "a", &d.placeholder(1))
     }
 
     /// Engine-agnostic full-text search, PAGINÉE. `ORDER BY a.id` est un
     /// ordre total : sans lui, deux pages successives peuvent se recouvrir.
-    /// Emplacements 3 et 4 : `LIMIT` et `OFFSET`.
+    /// Emplacements 2 et 3 : `LIMIT` et `OFFSET`.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT {COLS} FROM artists a WHERE {} ORDER BY a.id LIMIT {} OFFSET {}",
             search_where(d),
-            d.placeholder(3),
-            d.placeholder(4)
+            d.placeholder(2),
+            d.placeholder(3)
         )
     }
 
-    /// Le NOMBRE d'artistes correspondants, borné (emplacement 3). La borne
+    /// Le NOMBRE d'artistes correspondants, borné (emplacement 2). La borne
     /// est DANS la sous-requête, sinon elle ne borne rien.
     pub fn search_count<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT COUNT(*) FROM (SELECT a.id FROM artists a WHERE {} LIMIT {}) AS borne",
             search_where(d),
-            d.placeholder(3)
+            d.placeholder(2)
         )
     }
 }
@@ -1693,10 +1693,13 @@ impl ArtistRepo {
         offset: i64,
     ) -> Result<Vec<Artist>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = crate::db::engine::motif_like(query);
+        // #7619 : début de mot seulement — sans mot utilisable, rien à chercher.
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
         let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
-        let params: [&dyn ToSqlValue; 4] = [&fts_query, &like, &limit, &offset];
+        let params: [&dyn ToSqlValue; 3] = [&fts_query, &limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(|cols| row_to_artist(cols)).collect())
     }
@@ -1705,9 +1708,11 @@ impl ArtistRepo {
     /// de `limit`. Rendre `plafond` signifie « au moins `plafond` ».
     pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = crate::db::engine::motif_like(query);
+        if fts_query.is_empty() {
+            return Ok(0);
+        }
         let sql = self.dialect_sql(sql::search_count, sql::search_count);
-        let params: [&dyn ToSqlValue; 3] = [&fts_query, &like, &plafond];
+        let params: [&dyn ToSqlValue; 2] = [&fts_query, &plafond];
         Ok(self
             .db
             .query_one(&sql, &params)?
@@ -2309,8 +2314,9 @@ mod tests {
         );
         let p_sql = sql::search(&PostgresDialect);
         assert!(p_sql.contains("a.search_tsv @@ to_tsquery('simple', unaccent($1))"));
-        assert!(s_sql.contains("LOWER(unaccent(a.name)) LIKE LOWER(unaccent(?))"));
-        assert!(p_sql.contains("LOWER(unaccent(a.name)) LIKE LOWER(unaccent($2))"));
+        // #7619 — début de mot : plus aucun `LIKE` en sous-chaîne.
+        assert!(!s_sql.contains("LIKE"), "{s_sql}");
+        assert!(!p_sql.contains("LIKE"), "{p_sql}");
         // #3189 — ordre TOTAL et pagination, plus le prédicat partagé avec le
         // compte. Garde de texte : sur SQLite, l'ordre des rowid masque la
         // disparition d'un `ORDER BY`.
