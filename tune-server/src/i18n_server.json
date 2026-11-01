@@ -152,6 +152,23 @@
     "pl": "Inteligentne playlisty opisane jednym zdaniem i propozycje wzbogacenia albumów, z własnym kluczem (Anthropic, zgodne z OpenAI, Gemini, Ollama)",
     "el": "Έξυπνες λίστες αναπαραγωγής που περιγράφονται σε μία πρόταση και προτάσεις εμπλουτισμού άλμπουμ, με το δικό σας κλειδί (Anthropic, συμβατό με OpenAI, Gemini, Ollama)"
   },
+  "plugin.description.collection-physique": {
+    "fr": "Votre collection Discogs (vinyles, CD, cassettes) comparée à votre bibliothèque et à Qobuz et TIDAL",
+    "en": "Your Discogs collection (vinyl, CDs, cassettes) compared with your library and with Qobuz and TIDAL",
+    "de": "Ihre Discogs-Sammlung (Vinyl, CDs, Kassetten) im Vergleich mit Ihrer Bibliothek sowie mit Qobuz und TIDAL",
+    "es": "Su colección de Discogs (vinilos, CD, casetes) comparada con su biblioteca y con Qobuz y TIDAL",
+    "it": "La tua collezione Discogs (vinili, CD, cassette) confrontata con la tua libreria e con Qobuz e TIDAL",
+    "zh": "将您的 Discogs 收藏（黑胶、CD、磁带）与您的音乐库以及 Qobuz 和 TIDAL 进行比对",
+    "ja": "Discogs のコレクション（レコード、CD、カセット）をライブラリおよび Qobuz・TIDAL と照合",
+    "ko": "Discogs 컬렉션(바이닐, CD, 카세트)을 라이브러리 및 Qobuz, TIDAL과 비교",
+    "ro": "Colecția dvs. Discogs (viniluri, CD-uri, casete) comparată cu biblioteca dvs. și cu Qobuz și TIDAL",
+    "sv": "Din Discogs-samling (vinyl, cd-skivor, kassetter) jämförd med ditt bibliotek och med Qobuz och TIDAL",
+    "hu": "Discogs-gyűjteménye (bakelit, CD, kazetta) összevetve a könyvtárával, valamint a Qobuzzal és a TIDAL-lal",
+    "vi": "Bộ sưu tập Discogs của bạn (đĩa than, CD, băng cassette) được đối chiếu với thư viện của bạn và với Qobuz, TIDAL",
+    "nb": "Discogs-samlingen din (vinyl, CD-er, kassetter) sammenlignet med biblioteket ditt og med Qobuz og TIDAL",
+    "pl": "Twoja kolekcja Discogs (winyle, płyty CD, kasety) porównana z Twoją biblioteką oraz z Qobuz i TIDAL",
+    "el": "Η συλλογή σας στο Discogs (βινύλια, CD, κασέτες) σε σύγκριση με τη βιβλιοθήκη σας και με το Qobuz και το TIDAL"
+  },
   "plugin.description.mon-theme": {
     "fr": "Choisir toutes les couleurs de l'interface, contraste WCAG AA vérifié en direct ; rangé par profil, partageable en fichier",
     "en": "Choose every colour of the interface, with a live WCAG AA contrast check; saved per profile, shareable as a file",
