@@ -335,7 +335,9 @@ mod tests {
     #[test]
     fn une_entree_inconnue_est_refusee() {
         let p: Arc<dyn Peripheriques> = Simulees::avec("Micro USB", 48_000);
-        let e = CaptureVersTampon::demarrer(&p, "Fantôme", 5.0).unwrap_err();
+        let e = CaptureVersTampon::demarrer(&p, "Fantôme", 5.0)
+            .err()
+            .expect("refus");
         assert!(e.contains("Fantôme"), "{e}");
     }
 }
