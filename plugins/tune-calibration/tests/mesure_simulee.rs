@@ -149,8 +149,8 @@ fn une_piece_simulee_est_mesuree_de_bout_en_bout() {
     // Réponse impulsionnelle : le retard de 12 ms, au dixième de ms.
     assert!(
         // Vol acoustique (12 ms) PLUS la latence de la sortie : ici l'avance
-        // de la zone simulée sur le micro, 10 ms au plus, par blocs de 10 ms.
-        (12.0..=12.0 + 25.0).contains(&r.ri.retard_ms),
+        // de la zone simulée sur le micro, 50 ms au plus, par blocs de 10 ms.
+        (12.0..=12.0 + 70.0).contains(&r.ri.retard_ms),
         "retard {} ms",
         r.ri.retard_ms
     );

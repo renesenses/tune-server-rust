@@ -115,9 +115,9 @@ pub struct Boucle {
     pub vitesse: f64,
 }
 
-/// Avance maximale de la zone sur le micro : 10 ms, comme un tampon de
+/// Avance maximale de la zone sur le micro : 50 ms, comme un tampon de
 /// sortie court. C'est la « latence de sortie » que la mesure voit.
-const FILE_MAX: usize = 480;
+const FILE_MAX: usize = 2_400;
 
 impl Boucle {
     pub fn new(piece: PieceEnDirect, vitesse: f64) -> Arc<Self> {
@@ -128,22 +128,21 @@ impl Boucle {
         })
     }
 
-    /// Dépose ce que la zone joue ; bloque si le micro n'a pas suivi.
+    /// Dépose ce que la zone joue, par paquets ; bloque si le micro n'a pas suivi.
     pub fn deposer(&self, echantillons: &[f64], vivant: &AtomicBool) {
-        for x in echantillons {
-            loop {
-                {
-                    let mut j = self.joue.lock().unwrap();
-                    if j.len() < FILE_MAX {
-                        j.push_back(*x);
-                        break;
-                    }
-                }
-                if !vivant.load(Ordering::SeqCst) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_micros(200));
+        let mut reste = echantillons;
+        while !reste.is_empty() {
+            {
+                let mut j = self.joue.lock().unwrap();
+                let place = FILE_MAX.saturating_sub(j.len());
+                let n = place.min(reste.len());
+                j.extend(reste[..n].iter().copied());
+                reste = &reste[n..];
             }
+            if reste.is_empty() || !vivant.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_micros(50));
         }
     }
 
