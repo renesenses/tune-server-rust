@@ -716,8 +716,11 @@ impl Controleur {
     }
 
     fn garde_trames(&self) -> u64 {
-        // La garde du plan : queue de la pièce + latence de la sortie.
-        (2.5 * FREQUENCE_MESURE as f64) as u64
+        // La garde du plan (queue de la pièce) plus une seconde : la latence
+        // de la sortie décale l'arrivée dans la fenêtre captée, et
+        // l'extraction veut 1,5 s APRÈS l'arrivée directe. Capter plus ne
+        // coûte que de l'attente : la zone joue du silence après le segment.
+        (3.5 * FREQUENCE_MESURE as f64) as u64
     }
 }
 
