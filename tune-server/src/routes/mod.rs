@@ -25,6 +25,8 @@ mod premium_audio_host;
 /// #6044 — le greffon « Réaffectation des canaux » (`/channel-remap`).
 pub mod reaffectation_canaux;
 pub use tune_streaming_http::deezer_proxy_handler;
+#[cfg(test)]
+mod compression_tests_7619;
 pub mod developer_api;
 pub mod devialet_air;
 pub mod devices;
@@ -222,6 +224,41 @@ async fn demo_library(
         "albums": albums,
     }))
     .into_response()
+}
+
+/// Ce que la couche de compression gzip a le droit de compresser — #7619, L5.
+///
+/// Le prédicat par défaut de `tower-http` écarte déjà les images, le SSE, le
+/// gRPC et les corps de moins de 32 octets. Il laissait passer **l'audio** :
+/// `/library/tracks/{id}/audio` (et tout flux servi par ce routeur) était
+/// gzippé dès que le client envoyait `Accept-Encoding: gzip`, ce que fait tout
+/// `fetch()` de navigateur. Compresser du FLAC ou du MP3 coûte du processeur
+/// pour un gain nul, et une réponse partielle (`206`, `Content-Range`) dont on
+/// compresse les octets n'a plus les bornes qu'elle annonce.
+///
+/// Le JSON de la Bibliothèque, lui, reste compressé : c'est l'essentiel du
+/// poids d'une page d'albums.
+pub(crate) fn predicat_de_compression() -> impl tower_http::compression::Predicate {
+    use tower_http::compression::Predicate;
+    use tower_http::compression::predicate::{DefaultPredicate, NotForContentType};
+    DefaultPredicate::new()
+        .and(NotForContentType::const_new("audio/"))
+        .and(NotForContentType::const_new("video/"))
+        .and(NotForContentType::const_new("application/octet-stream"))
+        .and(NotForContentType::const_new("application/ogg"))
+        .and(NotForContentType::const_new(
+            "application/vnd.apple.mpegurl",
+        ))
+        .and(NotForContentType::const_new("application/x-mpegurl"))
+        .and(
+            |status: StatusCode,
+             _: axum::http::Version,
+             headers: &axum::http::HeaderMap,
+             _: &axum::http::Extensions| {
+                status != StatusCode::PARTIAL_CONTENT
+                    && !headers.contains_key(axum::http::header::CONTENT_RANGE)
+            },
+        )
 }
 
 async fn cache_control_middleware(
@@ -735,7 +772,7 @@ pub fn router_with_plugins(
     .layer(axum::middleware::from_fn(zones::textes_signal::avec_langue))
     .layer(axum::middleware::from_fn(cache_control_middleware))
     .layer(axum::Extension(contexte_sendspin))
-    .layer(CompressionLayer::new())
+    .layer(CompressionLayer::new().compress_when(predicat_de_compression()))
     .layer(CorsLayer::permissive())
 }
 
