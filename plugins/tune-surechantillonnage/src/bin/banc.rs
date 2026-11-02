@@ -72,7 +72,7 @@ fn filtres(dossier: &Path, rapide: bool, md: &mut String) {
                 // Zoom ±3 ms autour du pic pour la lecture.
                 let pic = imp
                     .iter()
-                    .fold((0.0, 0.0), |a, &(t, v)| if v.abs() > a.1.abs() { (t, v) } else { a })
+                    .fold((0.0_f64, 0.0_f64), |a, &(t, v)| if v.abs() > a.1.abs() { (t, v) } else { a })
                     .0;
                 let zoom: Vec<(f64, f64)> = imp
                     .iter()
