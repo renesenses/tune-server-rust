@@ -3904,7 +3904,16 @@ fn f32_to_native_i32(samples: &[f32], bit_depth: u16) -> Vec<i32> {
         _ => return Vec::new(),
     };
     let min = -scale;
-    let mut dither = (bit_depth < 32)
+    // « Pas de requantification, pas de dither » (règle de `audio::dither`) :
+    // un bloc dont chaque échantillon tombe déjà sur un mot exact — gain
+    // unité, matrice qui choisit ou coupe des voies, reliquat porté tel quel —
+    // sort à l'identité, sans bruit. Décidé par BLOC, pas par échantillon :
+    // dans un bloc réellement requantifié, tous les échantillons reçoivent le
+    // même bruit, et sa puissance ne dépend pas du signal.
+    let exact = samples
+        .iter()
+        .all(|s| (f64::from(*s) * scale).fract() == 0.0);
+    let mut dither = (bit_depth < 32 && !exact)
         .then(|| crate::audio::dither::Dither::depuis_graine(graine_du_bloc_flottant(samples)));
     samples
         .iter()

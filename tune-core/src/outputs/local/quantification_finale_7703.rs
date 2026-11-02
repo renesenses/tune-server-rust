@@ -115,3 +115,15 @@ fn le_dither_est_deterministe() {
     let s: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.01).sin() * 0.001).collect();
     assert_eq!(f32_to_native_i32(&s, 16), f32_to_native_i32(&s, 16));
 }
+
+/// Un bloc déjà exact (gain unité, matrice qui choisit ou coupe des voies)
+/// sort à l'identité : pas de requantification, pas de dither.
+#[test]
+fn un_bloc_exact_sort_sans_bruit() {
+    let s: Vec<f32> = [0i32, 1000, -2000, 0, 32_767, -32_768]
+        .iter()
+        .map(|&m| m as f32 / 32_768.0)
+        .collect();
+    let mots: Vec<i32> = f32_to_native_i32(&s, 16).iter().map(|w| w >> 16).collect();
+    assert_eq!(mots, vec![0, 1000, -2000, 0, 32_767, -32_768]);
+}
