@@ -53,6 +53,8 @@ pub mod pg_migrate;
 mod pg_schema_parity;
 #[cfg(all(test, feature = "postgres"))]
 mod pg_sqlite_type_parity;
+/// #7695 — les photos et vidéos indexées comme pistes par l'UPnP, retirées.
+pub mod photos_indexees_upnp_7695;
 pub mod play_queue_repo;
 pub mod playlist_repo;
 pub mod playlists_reconcile;
@@ -60,8 +62,6 @@ pub mod playlists_reconcile;
 pub mod postgres;
 #[cfg(all(test, feature = "postgres"))]
 mod postgres_e2e;
-/// #7695 — les photos et vidéos indexées comme pistes par l'UPnP, retirées.
-pub mod photos_indexees_upnp_7695;
 pub mod profile_repo;
 /// #6682 — le temps d'écoute radio par station (« Mon écoute »).
 pub mod radio_ecoute;
