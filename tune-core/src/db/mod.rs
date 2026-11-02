@@ -60,6 +60,8 @@ pub mod playlists_reconcile;
 pub mod postgres;
 #[cfg(all(test, feature = "postgres"))]
 mod postgres_e2e;
+/// #7695 — les photos et vidéos indexées comme pistes par l'UPnP, retirées.
+pub mod photos_indexees_upnp_7695;
 pub mod profile_repo;
 /// #6682 — le temps d'écoute radio par station (« Mon écoute »).
 pub mod radio_ecoute;
