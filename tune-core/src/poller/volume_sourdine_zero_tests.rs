@@ -123,7 +123,7 @@ fn la_regle_ne_garde_que_le_silence() {
     // (#7379 : plus haut est suivi sous le plafond de suivi, pas au-dessus.)
     assert!(should_adopt_device_volume(Some(0.5), 0.2, 0.3));
     assert!(should_adopt_device_volume(Some(0.5), 0.62, 0.3));
-    assert!(!should_adopt_device_volume(Some(0.5), 0.85, 0.3));
+    assert!(!should_adopt_device_volume(Some(0.5), 0.95, 0.3));
     // Une BAISSE vers le silence reste adoptable (rien ne monte).
     assert!(!silence_rouvert_par_l_appareil(0.0, 0.0));
 }

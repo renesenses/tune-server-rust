@@ -71,7 +71,7 @@ async fn un_trim_negatif_reste_applique_sur_le_renderer_6739() {
 
 /// (b) Le cliquet, sous la règle du 02/11 (#7379) : l'appareil relu à 96
 /// alors que la consigne est 36, zone SANS limite de sécurité réglée. Le
-/// relevé dépasse le plafond de suivi par défaut (70 %) : la consigne passe
+/// relevé dépasse le plafond de suivi par défaut (85 %) : la consigne passe
 /// AU plafond, l'appareil y est ramené, et le geste suivant (« volume − »
 /// depuis la consigne affichée) descend. Jamais 96, jamais de cliquet.
 #[tokio::test]
@@ -90,29 +90,29 @@ async fn un_releve_a_96_est_ramene_au_plafond_sans_cliquet_6739() {
         banc.tic().await;
     }
     assert!(
-        (banc.volume_en_base() - 70.0).abs() < 1e-6,
+        (banc.volume_en_base() - 85.0).abs() < 1e-6,
         "#6739/#7379 : le relevé de l'appareil (96 %) doit faire passer la consigne AU \
-         plafond de suivi par défaut (70 %), pas {} %",
+         plafond de suivi par défaut (85 %), pas {} %",
         banc.volume_en_base()
     );
     let affiche = banc.volume_en_memoire().await;
     assert!(
-        (affiche - 0.70).abs() < 1e-9,
+        (affiche - 0.85).abs() < 1e-9,
         "#7379 : le curseur doit afficher le plafond, pas {affiche}"
     );
     let ramene = banc.commandes_depuis(deja).await;
     assert_eq!(
         ramene.iter().map(|v| en_pour_cent(*v)).collect::<Vec<_>>(),
-        vec![70],
-        "#7379 : l'appareil à 96 % doit être ramené une fois au plafond (70) : {ramene:?}"
+        vec![85],
+        "#7379 : l'appareil à 96 % doit être ramené une fois au plafond (85) : {ramene:?}"
     );
     // Le geste suivant : « volume − » d'un pas depuis ce que la zone affiche.
-    let deja = banc.appareil_a(0.70).await;
+    let deja = banc.appareil_a(0.85).await;
     banc.tic().await;
     banc.consigne(affiche - 0.05).await;
     let recus = banc.commandes_depuis(deja).await;
     assert!(
-        !recus.is_empty() && recus.iter().all(|v| en_pour_cent(*v) <= 65),
+        !recus.is_empty() && recus.iter().all(|v| en_pour_cent(*v) <= 80),
         "#6739 : après un relevé à 96, un pas de « volume − » a envoyé {recus:?} — la \
          consigne suivante a MONTÉ"
     );
@@ -187,7 +187,7 @@ fn la_regle_du_releve_suit_sous_le_plafond_6739_7379() {
         JugementDuReleve::RamenerAuPlafond(0.5)
     );
     // Jamais au-delà du plafond, même à la tolérance près.
-    match juger_le_releve_de_volume(Some(0.3), 0.705, 0.3, 0.0, DEFAUT) {
+    match juger_le_releve_de_volume(Some(0.3), 0.855, 0.3, 0.0, DEFAUT) {
         JugementDuReleve::Adopter(v) => assert!(v <= DEFAUT + 1e-12, "{v}"),
         autre => panic!("{autre:?}"),
     }
@@ -231,18 +231,18 @@ fn la_regle_du_releve_suit_sous_le_plafond_6739_7379() {
 }
 
 /// #7379 — sans limite de sécurité réglée, le plafond de suivi est le
-/// plafond PAR DÉFAUT (70 %), jamais « illimité » ; il ne rabote pas une
+/// plafond PAR DÉFAUT (85 %), jamais « illimité » ; il ne rabote pas une
 /// consigne que Tune a posée plus haut ; une limite réglée le remplace.
 #[test]
 fn sans_limite_reglee_le_plafond_de_suivi_est_le_defaut_7379() {
     use crate::audio::volume_limites::{LimitesDeVolume, PLAFOND_DE_SUIVI_PAR_DEFAUT};
     let sans = LimitesDeVolume::default();
-    assert_eq!(PLAFOND_DE_SUIVI_PAR_DEFAUT, 0.70);
-    assert_eq!(sans.plafond_de_suivi(0.3), 0.70);
-    assert_eq!(sans.plafond_de_suivi(0.0), 0.70);
-    assert_eq!(sans.plafond_de_suivi(f64::NAN), 0.70);
+    assert_eq!(PLAFOND_DE_SUIVI_PAR_DEFAUT, 0.85);
+    assert_eq!(sans.plafond_de_suivi(0.3), 0.85);
+    assert_eq!(sans.plafond_de_suivi(0.0), 0.85);
+    assert_eq!(sans.plafond_de_suivi(f64::NAN), 0.85);
     assert!(sans.plafond_de_suivi(0.3) < 1.0, "jamais illimité");
-    assert_eq!(sans.plafond_de_suivi(0.85), 0.85);
+    assert_eq!(sans.plafond_de_suivi(0.9), 0.9);
     let avec = LimitesDeVolume {
         securite: Some(0.5),
         confort: None,

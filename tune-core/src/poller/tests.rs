@@ -265,10 +265,10 @@ fn volume_adopted_on_real_device_change() {
     // the saved volume (0.30) — adopt it.
     assert!(decisions::should_adopt_device_volume(Some(0.5), 0.2, 0.3));
     // #7379 — décision du 02/11 : un relevé plus HAUT que la consigne est
-    // suivi sous le plafond de suivi (0.50 -> 0.62, plafond par défaut 0.70),
-    // pas au-dessus (0.50 -> 0.85 : ramené au plafond, pas adopté tel quel).
+    // suivi sous le plafond de suivi (0.50 -> 0.62, plafond par défaut 0.85),
+    // pas au-dessus (0.50 -> 0.95 : ramené au plafond, pas adopté tel quel).
     assert!(decisions::should_adopt_device_volume(Some(0.5), 0.62, 0.3));
-    assert!(!decisions::should_adopt_device_volume(Some(0.5), 0.85, 0.3));
+    assert!(!decisions::should_adopt_device_volume(Some(0.5), 0.95, 0.3));
 }
 
 #[test]

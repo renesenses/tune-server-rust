@@ -1,7 +1,7 @@
 //! #7379 — décision de Bertrand du 02/11 : quand l'appareil joue PLUS FORT
 //! que la consigne de Tune (bouton de l'ampli, autre application), Tune le
 //! SUIT tant qu'il reste sous le plafond de suivi (la limite de sécurité de la
-//! zone, sinon 70 % par défaut) : la consigne et le curseur s'alignent. Au-
+//! zone, sinon 85 % par défaut) : la consigne et le curseur s'alignent. Au-
 //! dessus, Tune le ramène AU plafond. Rien au-dessus du plafond ne part
 //! jamais vers l'appareil.
 //!
@@ -64,7 +64,7 @@ async fn un_geste_au_bouton_sous_le_plafond_est_suivi_7379() {
 }
 
 /// Geste au bouton vers 95 % sans limite réglée : au-dessus du plafond par
-/// défaut (70 %). Tune ramène l'appareil AU plafond, une fois, et la consigne
+/// défaut (85 %). Tune ramène l'appareil AU plafond, une fois, et la consigne
 /// et le curseur s'y alignent. Jamais « illimité ».
 #[tokio::test]
 async fn sans_limite_au_dessus_du_plafond_par_defaut_l_appareil_est_ramene_7379() {
@@ -77,17 +77,17 @@ async fn sans_limite_au_dessus_du_plafond_par_defaut_l_appareil_est_ramene_7379(
     let recus = banc.commandes_depuis(deja).await;
     assert_eq!(
         recus,
-        vec![0.7],
-        "#7379 : l'appareil à 95 % doit être ramené au plafond par défaut (70 %), une fois"
+        vec![0.85],
+        "#7379 : l'appareil à 95 % doit être ramené au plafond par défaut (85 %), une fois"
     );
-    assert!((banc.volume_en_base() - 70.0).abs() < 1e-6);
+    assert!((banc.volume_en_base() - 85.0).abs() < 1e-6);
     let publies = volumes_publies(&mut recu, banc.zone_id);
     assert_eq!(
         publies.last().copied(),
-        Some(0.7),
+        Some(0.85),
         "le curseur doit afficher le plafond : {publies:?}"
     );
-    assert!(publies.iter().all(|v| *v <= 0.7 + 1e-12), "{publies:?}");
+    assert!(publies.iter().all(|v| *v <= 0.85 + 1e-12), "{publies:?}");
 }
 
 /// Sous une limite de sécurité réglée à 50 % : suivi jusqu'à 45 %, puis le
@@ -107,20 +107,20 @@ async fn sous_une_limite_reglee_suivi_puis_retour_a_la_limite_7379() {
     assert!((banc.volume_en_base() - 50.0).abs() < 1e-6);
 }
 
-/// Une consigne que l'auditeur a posée lui-même à 85 % dans Tune, sans
+/// Une consigne que l'auditeur a posée lui-même à 90 % dans Tune, sans
 /// limite : le plafond par défaut ne la rabote pas. Un geste au bouton vers
-/// 95 % est ramené à 85 (la consigne), pas à 70.
+/// 98 % est ramené à 90 (la consigne), pas à 85.
 #[tokio::test]
 async fn le_plafond_par_defaut_ne_rabote_pas_une_consigne_de_tune_7379() {
     let mut banc = banc_a_30(None).await;
-    banc.consigne(0.85).await;
+    banc.consigne(0.9).await;
     banc.tic().await;
-    let deja = banc.appareil_a(0.95).await;
+    let deja = banc.appareil_a(0.98).await;
     for _ in 0..3 {
         banc.tic().await;
     }
-    assert_eq!(banc.commandes_depuis(deja).await, vec![0.85]);
-    assert!((banc.volume_en_base() - 85.0).abs() < 1e-6);
+    assert_eq!(banc.commandes_depuis(deja).await, vec![0.9]);
+    assert!((banc.volume_en_base() - 90.0).abs() < 1e-6);
 }
 
 /// La garde contre les montées brusques (#6919, #6721) tient toujours pour
@@ -139,4 +139,26 @@ async fn la_garde_de_hausse_tient_apres_un_suivi_7379() {
         recus.len() == 1 && recus[0] > 0.55 && recus[0] < 0.99,
         "#6919 : un saut de 55 à 100 % depuis Tune doit être plafonné : {recus:?}"
     );
+}
+
+/// #6008 sous la décision du 02/11 : l'Abyss qui remonte d'elle-même de 22 à
+/// 80 %, sans limite réglée, est SUIVIE (80 % est sous le plafond par défaut
+/// de 85 %) : consigne et curseur à 80, aucune commande. Une limite de
+/// sécurité réglée sur la zone reste la protection.
+#[tokio::test]
+async fn l_abyss_a_80_est_suivie_sous_le_plafond_par_defaut_7379() {
+    let mut banc = Banc::monter(false).await;
+    banc.zone_a(22.0).await;
+    banc.appareil_a(0.22).await;
+    banc.tic().await;
+    let mut recu = banc.evenements_de_lecture();
+    let deja = banc.appareil_a(0.80).await;
+    banc.tic().await;
+    assert!(
+        (banc.volume_en_base() - 80.0).abs() < 1e-6,
+        "#7379 : 80 % est sous le plafond par défaut, la zone suit ({} %)",
+        banc.volume_en_base()
+    );
+    assert_eq!(volumes_publies(&mut recu, banc.zone_id), vec![0.8]);
+    assert!(banc.commandes_depuis(deja).await.is_empty());
 }

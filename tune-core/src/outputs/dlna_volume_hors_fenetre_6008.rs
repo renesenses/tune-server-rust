@@ -38,7 +38,7 @@
 //! l'appareil sous le plafond de suivi de la zone et le ramène au plafond
 //! au-dessus (`poller::releve_ne_monte_pas_6739`). L'Abyss qui remonte seule
 //! à 80 % n'est donc plus tenue à la consigne : sans limite de sécurité réglée,
-//! elle est ramenée au plafond par défaut (70 %). La correction DANS la
+//! elle est SUIVIE (80 % est sous le plafond par défaut de 85 %). La correction DANS la
 //! fenêtre d'après pose (#6207, l'appareil qui remonte à chaque URI) reste.
 use std::time::Duration;
 
