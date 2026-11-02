@@ -95,6 +95,10 @@ async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
 /// (sans pièce jointe, chemin historique) ou `multipart/form-data` (avec
 /// `attachments[]`). Le format est choisi d'après le `Content-Type` entrant.
 async fn create(State(state): State<AppState>, req: Request) -> Response {
+    // Les identifiants de ce serveur ne partent dans aucun champ du ticket.
+    tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
+        state.backend.clone(),
+    ));
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,
@@ -309,10 +313,11 @@ fn client_error(code: &str, message: &str) -> Response {
 fn payload_too_large(file_name: &str) -> Response {
     (
         StatusCode::PAYLOAD_TOO_LARGE,
-        Json(json!({
-            "error": "attachment_too_large",
-            "message": format!("« {file_name} » dépasse la taille maximale de 50 Mo."),
-        })),
+        Json(crate::message_api::corps_refus(
+            "attachment_too_large",
+            "api.support.attachmentTooLarge",
+            &[("file_name", file_name.to_string())],
+        )),
     )
         .into_response()
 }
@@ -375,6 +380,10 @@ async fn detail(
 /// **forum**. Le miroir (`MirrorTicketToForum`) n'est branché qu'à la création
 /// du ticket, côté Laravel ; aucune ligne d'ici ne peut l'y brancher.
 async fn reply(State(state): State<AppState>, Path(id): Path<i64>, req: Request) -> Response {
+    // Les identifiants de ce serveur ne partent dans aucun champ du ticket.
+    tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
+        state.backend.clone(),
+    ));
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,
@@ -536,10 +545,11 @@ fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
 
     Err((
         StatusCode::PRECONDITION_FAILED,
-        Json(json!({
-            "error": "not_connected",
-            "message": "Connecte-toi à ton compte Tune ou active ta licence premium pour utiliser le support.",
-        })),
+        Json(crate::message_api::corps_refus(
+            "not_connected",
+            "api.support.notConnected",
+            &[],
+        )),
     )
         .into_response())
 }

@@ -201,14 +201,14 @@ fn exige_un_echec_dit(statut: StatusCode, corps: &Value, forme: &str, attendu: &
 async fn une_premiere_page_vide_sur_douze_annonces_est_un_echec_dit() {
     let app = banc().await;
     let (statut, corps) = parcourir(&app, "musiques-vide").await;
-    exige_un_echec_dit(statut, &corps, "0 rendu sur 12 annoncés", "0 des 12");
+    exige_un_echec_dit(statut, &corps, "0 rendu sur 12 annoncés", "0 of the 12");
 }
 
 #[tokio::test]
 async fn un_didl_illisible_est_un_echec_dit() {
     let app = banc().await;
     let (statut, corps) = parcourir(&app, "didl-illisible").await;
-    exige_un_echec_dit(statut, &corps, "DIDL illisible", "0 des 3");
+    exige_un_echec_dit(statut, &corps, "DIDL illisible", "0 of the 3");
 }
 
 #[tokio::test]

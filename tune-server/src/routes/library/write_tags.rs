@@ -75,7 +75,7 @@ impl Refus {
 /// fichier réécrit, comme après la gravure du DR (fil 2134) : la base porte
 /// déjà les valeurs écrites, et le surveillant ne relit pas le fichier pour
 /// rien. La date du fichier, elle, avance : le fichier a changé.
-fn remettre_la_ligne_en_phase(
+pub(super) fn remettre_la_ligne_en_phase(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     chemin: &str,
 ) {
@@ -359,6 +359,7 @@ pub(crate) async fn write_tags_to_files(
                         None
                     },
                     label: None, // label/isrc/bpm/lyrics handled by extended writer
+                    album_artist: None,
                     isrc: None,
                     bpm: None,
                     lyrics: None,
@@ -418,6 +419,7 @@ pub(crate) async fn write_tags_to_files(
                     year,
                     comment,
                     label: None,
+                    album_artist: None,
                     isrc: None,
                     bpm: None,
                     lyrics: None,

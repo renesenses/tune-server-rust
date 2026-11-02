@@ -51,6 +51,14 @@ impl FacetQuery {
         self.sel = track_filter_from_raw(raw)?;
         Ok(self)
     }
+
+    /// Le profil de la requête (#7569) : celui dont le filtre « favoris »
+    /// lit les favoris. À appeler après [`FacetQuery::hydrate`], qui remplace
+    /// `sel` en entier.
+    pub(super) fn pour_profil(mut self, profil: i64) -> Self {
+        self.sel.profile_id = profil;
+        self
+    }
 }
 
 /// Build the WHERE conditions (over alias `t` = tracks) for the active filters,
@@ -484,14 +492,14 @@ fn build_facet_conditions(
             tune_core::db::track_repo::folder_like_pattern(fld),
         ));
     }
-    // Album rating (profile 1). Tracks inherit their album's rating via a join
+    // Album rating (profil de la requête, #7594). Tracks inherit their album's rating via a join
     // to `album_ratings`; EXISTS keeps it self-contained on alias `t`.
     if exclude != "rating"
         && let Some(c) = ph.in_list("arr.rating", sel.ratings.len())
     {
-        conds.push(format!(
-            "EXISTS (SELECT 1 FROM album_ratings arr \
-                 WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND {c})"
+        conds.push(tune_core::db::facet_filter::rating_condition(
+            &c,
+            sel.profile_id,
         ));
         for v in &sel.ratings {
             params.push(SqlValue::Int(*v));
@@ -568,7 +576,7 @@ fn build_facet_conditions(
             &mut ph,
             &sel.favorites,
             sel.est_en_et("favorite"),
-            bloc_favoris,
+            bloc_favoris(sel.profile_id),
         ) {
             conds.push(c);
         }
@@ -648,6 +656,7 @@ pub(super) fn collection_album_ids(state: &AppState, name: &str) -> Vec<i64> {
 /// courant — elle est vide, et une facette morte coûterait une requête à
 /// chaque ouverture du rail pour ne rien montrer.
 pub(super) async fn library_facets(
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(q): Query<FacetQuery>,
     RawQuery(raw): RawQuery,
     State(state): State<AppState>,
@@ -655,7 +664,7 @@ pub(super) async fn library_facets(
     // Les facettes à plusieurs valeurs se lisent dans la chaîne BRUTE : voir
     // `FacetQuery::hydrate`. Sans cet appel, `sel` reste vide et plus rien ne
     // filtre.
-    let q = q.hydrate(raw.as_deref())?;
+    let q = q.hydrate(raw.as_deref())?.pour_profil(profile.id());
     // #5438 — la résolution de la collection et les requêtes de chaque
     // facette sont synchrones : hors de l'exécuteur.
     hors_executeur("library_facets", move || compter_les_facettes(&state, q))
@@ -723,20 +732,20 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 "country" => kv_facet(state, "release_country", limit, conds, params),
                 "mood" => kv_facet(state, "mood", limit, conds, params),
                 "source" => kv_facet(state, "source_media", limit, conds, params),
-                "rating" => rating_facet(state, limit, conds, params),
+                "rating" => rating_facet(state, q.sel.profile_id, limit, conds, params),
                 "collection" => collection_facet(state, &q, engine, socle),
                 "original_year" => original_year_facet(state, limit, conds, params),
                 // Dynamic Range (#2144). Absente du jeu par DÉFAUT : sur une
                 // bibliothèque non taguée elle est vide, et une facette morte dans
                 // le rail coûte une requête pour ne rien montrer. Un client la
                 // demande explicitement (`fields=…,dr`).
-                "dr" => dr_facet(state, engine, limit, conds, params),
+                "dr" => dr_facet(state, limit, conds, params),
                 // Instrument (CRD-6) : vient de `track_credits`, remplie par la passe
                 // automatique (CRD-5). Comme `dr`, absente du jeu par défaut : vide
                 // tant que les crédits ne sont pas là, un client la demande
                 // explicitement (`fields=…,instrument`).
                 "instrument" => instrument_facet(state, engine, limit, conds, params),
-                "favorite" => favorite_facet(state, conds, params),
+                "favorite" => favorite_facet(state, q.sel.profile_id, conds, params),
                 "playlist" => playlist_facet(state, limit, conds, params),
                 "untagged" => untagged_facet(state, conds, params),
                 _ => return None,
@@ -891,27 +900,57 @@ const UNTAGGED_FIELDS: [&str; 5] = ["artist", "album", "genre", "year", "cover"]
 /// Années d'enregistrement présentes, la plus récente d'abord — comme `year`,
 /// dont le tri chronologique descendant avait été demandé (« pas facile de
 /// trouver 2026 ! »).
+///
+/// #2144 (rc10) — comptée en DEUX temps, comme [`dr_facet`] : les pistes par
+/// album ([`effectifs_par_album`]), puis l'année de chaque album, cumulées
+/// ici. Voir [`effectifs_par_album`] pour la jointure qu'on ne pose plus.
 fn original_year_facet(
     state: &AppState,
     limit: Option<i64>,
     conds: &[String],
     params: &[SqlValue],
 ) -> Vec<(String, i64)> {
-    let where_clause = if conds.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", conds.join(" AND "))
-    };
-    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
     // `> 0` écarte les années nulles ET les `0` que certains taggeurs écrivent
     // quand le champ est vide : « 0 » en tête de liste ne désigne aucun disque.
-    let sql = format!(
-        "SELECT alo.original_year, COUNT(*) AS n FROM tracks t \
-         JOIN albums alo ON alo.id = t.album_id{where_clause} \
-         {and_or_where} alo.original_year IS NOT NULL AND alo.original_year > 0 \
-         GROUP BY alo.original_year ORDER BY alo.original_year DESC{limit_clause}",
-        and_or_where = if conds.is_empty() { "WHERE" } else { "AND" }
-    );
+    let annee_de: std::collections::HashMap<i64, i64> = state
+        .backend
+        .query_many(
+            "SELECT alo.id, alo.original_year FROM albums alo \
+             WHERE alo.original_year IS NOT NULL AND alo.original_year > 0",
+            &[],
+        )
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            Some((it.next()?.as_i64()?, it.next()?.as_i64()?))
+        })
+        .collect();
+    cumuler_par_valeur(effectifs_par_album(state, conds, params), &annee_de, limit)
+}
+
+/// #2144 (rc10, .18 : 96 500 pistes, 9 336 albums) — combien de pistes
+/// retenues par `conds` dans chaque album : `(album_id, effectif)`.
+///
+/// # Pourquoi plus de jointure
+///
+/// Les facettes DR et année d'origine joignaient `tracks t` à une table par
+/// album (`albums alo`, ou la table dérivée des DR). Dans le rail compté par
+/// soustraction (#5993), la requête des seules pistes repliées pose en plus
+/// `t.id IN (…)` — quelques milliers d'identifiants. SQLite prend alors les
+/// albums en boucle EXTERNE et cherche `t` par `idx_tracks_id_album (id=?
+/// AND album_id=?)` : il rejoue la liste ENTIÈRE pour chaque album. Albums ×
+/// pistes repliées : 7 214 × 3 500 au banc, 7,8 s ; 208 à 224 s sur le .18.
+/// La facette année tombe dans le même piège dès qu'un DR est coché (le
+/// filtre DR rend une liste d'albums) : 11 à 14 s sur le .18.
+///
+/// Une requête sur la SEULE table `tracks` n'a pas d'ordre de jointure à
+/// rater : elle lit l'index de l'album, ou la liste par clé primaire. La
+/// valeur de chaque album (DR, année) est lue à part, une ligne par album, et
+/// le cumul se fait en Rust : `COUNT(*)` est additif sur des albums
+/// disjoints, les effectifs sont donc EXACTEMENT ceux de la jointure.
+fn effectifs_par_album(state: &AppState, conds: &[String], params: &[SqlValue]) -> Vec<(i64, i64)> {
+    let sql = sql_effectifs_par_album(conds);
     let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
         .iter()
         .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
@@ -923,11 +962,55 @@ fn original_year_facet(
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
-            let y = it.next()?.as_i64()?;
-            let count = it.next()?.as_i64().unwrap_or(0);
-            Some((y.to_string(), count))
+            // Une piste sans album n'a ni DR ni année d'album : la jointure
+            // d'avant l'écartait, le `NULL` ne trouve rien ici non plus.
+            let album = it.next()?.as_i64()?;
+            Some((album, it.next()?.as_i64().unwrap_or(0)))
         })
         .collect()
+}
+
+/// Le SQL de [`effectifs_par_album`] : la seule table `tracks`, filtrée par
+/// les mêmes `conds` que toute autre facette.
+fn sql_effectifs_par_album(conds: &[String]) -> String {
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    format!("SELECT t.album_id, COUNT(*) AS n FROM tracks t{where_clause} GROUP BY t.album_id")
+}
+
+/// Le cumul des effectifs par album sous la valeur de chaque album, par
+/// valeur DÉCROISSANTE (l'`ORDER BY … DESC` d'avant), tronqué à `limit`. Un
+/// album sans valeur ne compte pas : c'était le `JOIN` (et non `LEFT JOIN`).
+fn cumuler_par_valeur(
+    par_album: Vec<(i64, i64)>,
+    valeur_de: &std::collections::HashMap<i64, i64>,
+    limit: Option<i64>,
+) -> Vec<(String, i64)> {
+    let mut par_valeur: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    for (album, n) in par_album {
+        if let Some(v) = valeur_de.get(&album) {
+            *par_valeur.entry(*v).or_insert(0) += n;
+        }
+    }
+    let max = limit.map(|n| n.max(0) as usize).unwrap_or(usize::MAX);
+    par_valeur
+        .into_iter()
+        .rev()
+        .filter(|(_, n)| *n > 0)
+        .take(max)
+        .map(|(v, n)| (v.to_string(), n))
+        .collect()
+}
+
+/// Le DR de chaque album porteur d'un tag DR :
+/// [`tune_core::db::facet_filter::dr_par_album`], la MÊME règle que la
+/// grille, la liste et la fiche, gardée sous le jeton des données — et
+/// partagée avec la liste filtrée par DR (#7580), qui la relit à chaque page.
+fn dr_par_album(state: &AppState) -> std::sync::Arc<std::collections::HashMap<i64, i64>> {
+    tune_core::db::facet_filter::dr_par_album(state.backend.as_ref()).ou_defaut_journalise()
 }
 
 /// Les Dynamic Range présents, du plus dynamique au plus compressé (#2144).
@@ -950,66 +1033,42 @@ fn original_year_facet(
 /// facette. Un effectif nul ne remonte donc jamais, et une bibliothèque
 /// entièrement non taguée rend un tableau vide — l'écran n'affiche alors pas
 /// de facette plutôt qu'une facette morte.
+///
+/// #2144 (rc10) — comptée en deux temps : [`effectifs_par_album`], puis
+/// [`dr_par_album`]. La jointure d'avant rejouait la liste des pistes
+/// repliées pour chaque album tagué : 208 à 224 s sur le .18.
 fn dr_facet(
     state: &AppState,
-    engine: Engine,
     limit: Option<i64>,
     conds: &[String],
     params: &[SqlValue],
 ) -> Vec<(String, i64)> {
-    let where_clause = if conds.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", conds.join(" AND "))
-    };
-    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
     // Décroissant, comme `year` : l'auditeur qui ouvre cette facette cherche
     // ses disques les plus dynamiques, pas les plus écrasés.
-    let sql = format!(
-        "SELECT dr.dr, COUNT(*) AS n FROM tracks t \
-         JOIN ({source}) dr ON dr.album_id = t.album_id{where_clause} \
-         GROUP BY dr.dr ORDER BY dr.dr DESC{limit_clause}",
-        source = tune_core::db::facet_filter::dr_album_source(engine)
-    );
-    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
-        .iter()
-        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
-        .collect();
-    state
-        .backend
-        .query_many(&sql, &bound)
-        .ou_defaut_journalise()
-        .into_iter()
-        .filter_map(|row| {
-            let mut it = row.into_iter();
-            let dr = it.next()?.as_i64()?;
-            let count = it.next()?.as_i64().unwrap_or(0);
-            Some((dr.to_string(), count))
-        })
-        .collect()
+    let dr_de = dr_par_album(state);
+    cumuler_par_valeur(effectifs_par_album(state, conds, params), &dr_de, limit)
 }
 
-/// Favoris du profil 1, comptés par type. Deux valeurs au plus (`track`,
+/// Favoris du profil de la requête (#7569), comptés par type. Deux valeurs au plus (`track`,
 /// `album`) : pas de LIMIT à appliquer.
-fn favorite_facet(state: &AppState, conds: &[String], params: &[SqlValue]) -> Vec<(String, i64)> {
+fn favorite_facet(
+    state: &AppState,
+    profil: i64,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
     let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
         .iter()
         .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
         .collect();
     let mut out = Vec::new();
     for kind in ["track", "album"] {
-        let own = match kind {
-            "album" => {
-                "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-                        AND f.item_type = 'album' AND f.item_id = t.album_id)"
-            }
-            _ => {
-                "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-                  AND f.item_type = 'track' AND f.item_id = t.id)"
-            }
+        // Le même prédicat que la liste (`facet_filter`), pas une copie.
+        let Some(own) = tune_core::db::facet_filter::favorite_condition(kind, profil) else {
+            continue;
         };
         let mut all: Vec<String> = conds.to_vec();
-        all.push(own.to_string());
+        all.push(own);
         let sql = format!("SELECT COUNT(*) FROM tracks t WHERE {}", all.join(" AND "));
         let n = state
             .backend
@@ -1260,11 +1319,12 @@ fn fusionner_les_casses(brut: Vec<(String, i64)>) -> Vec<(String, i64)> {
     sortie
 }
 
-/// Count tracks by their album's rating (profile 1). Tracks inherit the rating
+/// Count tracks by their album's rating (profil de la requête, #7594). Tracks inherit the rating
 /// via a join to `album_ratings`; unrated tracks are naturally excluded. The
 /// `conds` reference alias `t`, so the join is additive.
 fn rating_facet(
     state: &AppState,
+    profil: i64,
     limit: Option<i64>,
     conds: &[String],
     params: &[SqlValue],
@@ -1275,9 +1335,10 @@ fn rating_facet(
         format!(" WHERE {}", conds.join(" AND "))
     };
     let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let profil = if profil > 0 { profil } else { 1 };
     let sql = format!(
         "SELECT arr.rating, COUNT(*) AS n FROM tracks t \
-         JOIN album_ratings arr ON t.album_id = arr.album_id AND arr.profile_id = 1{where_clause} \
+         JOIN album_ratings arr ON t.album_id = arr.album_id AND arr.profile_id = {profil}{where_clause} \
          GROUP BY arr.rating ORDER BY arr.rating DESC{limit_clause}"
     );
     let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
@@ -1677,6 +1738,7 @@ mod tests {
                 .find_map(|kv| kv.strip_prefix("fields="))
                 .map(str::to_string);
             let Json(v) = library_facets(
+                crate::routes::active_profile::ActiveProfile(1),
                 Query(FacetQuery {
                     fields,
                     ..Default::default()
@@ -1754,6 +1816,7 @@ mod tests {
                 .find_map(|kv| kv.strip_prefix("fields="))
                 .map(str::to_string);
             let Json(v) = library_facets(
+                crate::routes::active_profile::ActiveProfile(1),
                 Query(FacetQuery {
                     fields,
                     ..Default::default()
@@ -1878,6 +1941,19 @@ mod tests {
             Ok(q) => q,
             Err(_) => panic!("requête acceptable : {raw}"),
         }
+    }
+
+    /// #7594 — le filtre de notes lit les notes du profil de la requête.
+    #[test]
+    fn le_filtre_de_notes_suit_le_profil_de_la_requete() {
+        let mut q = depuis("rating=4");
+        q.sel.profile_id = 2;
+        let (conds, _) = build_facet_conditions(&q, Engine::Postgres, "", None);
+        assert!(
+            conds.iter().any(|c| c.contains("arr.profile_id = 2")),
+            "{conds:?}"
+        );
+        assert!(!conds.iter().any(|c| c.contains("arr.profile_id = 1")));
     }
 
     fn texte(v: &SqlValue) -> String {

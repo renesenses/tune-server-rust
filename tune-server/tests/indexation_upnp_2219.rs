@@ -511,7 +511,15 @@ async fn un_serveur_inconnu_se_refuse_en_le_disant() {
     let (statut, corps) = poster(&app, "/api/v1/network/media-servers/uuid:fantome/indexer").await;
     assert_eq!(statut, StatusCode::OK);
     assert_eq!(corps["indexe"], json!(false), "corps : {corps}");
-    assert_eq!(corps["raison"], json!("serveur inconnu"), "corps : {corps}");
+    // #7077 : le refus porte un code stable et une phrase traduite (anglais
+    // sans langue demandée), plus de phrase française codée en dur.
+    assert_eq!(corps["code"], json!("unknown_server"), "corps : {corps}");
+    assert_eq!(corps["raison"], json!("Unknown server."), "corps : {corps}");
+    assert_eq!(
+        corps["message_key"],
+        json!("api.upnp.unknownServerDetail"),
+        "corps : {corps}"
+    );
 }
 
 /// A complete catalogue, a partial HTTP failure, and guarded removal through
@@ -954,4 +962,213 @@ async fn identites_upnp_la_synchronisation_conserve_liens_et_appartenances_apres
         3
     );
     remote.abort();
+}
+
+/// #7341 : deux instances isolées, le vrai producteur ContentDirectory HTTP,
+/// le vrai lecteur SOAP et la vraie route d'indexation. Aucun flux audio lu.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadonnees_7341_local_vers_upnp_et_reindexation_sans_doublon() {
+    let source = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let repo_source = TrackRepo::with_backend(source.backend.clone());
+    let mut originale = Track::new("The Sea".into());
+    originale.file_path = Some("/banc-7341/the-sea.flac".into());
+    originale.format = Some("flac".into());
+    originale.duration_ms = 347_000;
+    originale.file_size = Some(12_345);
+    originale.sample_rate = Some(44_100);
+    originale.bit_depth = Some(16);
+    originale.year = Some(1998);
+    originale.genre = Some("Trip Hop".into());
+    originale.genres = Some(r#"["Trip Hop","Funk & Soul"]"#.into());
+    let source_id = repo_source.create(&originale).unwrap();
+    originale.id = Some(source_id);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let media = tune_core::upnp_server::UpnpState::new(
+        source.backend.clone(),
+        port,
+        Some("127.0.0.1".into()),
+    );
+    let router = tune_server::routes::upnp_media_server::standalone_router(media);
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let destination = AppState::new(":memory:", 0, Default::default()).unwrap();
+    inscrire_le_serveur(
+        &destination,
+        &format!("http://127.0.0.1:{port}/ContentDirectory/control"),
+    )
+    .await;
+    let app = tune_server::routes::router(destination.clone());
+    let chemin = format!("/api/v1/network/media-servers/{UDN}/indexer");
+    let repo = TrackRepo::with_backend(destination.backend.clone());
+    let mut identite = None;
+    for (annee, genres) in [
+        (Some(1998), vec!["Trip Hop", "Funk & Soul"]),
+        (Some(1999), vec!["Trip Hop", "Funk"]),
+        (None, vec![]),
+    ] {
+        originale.year = annee;
+        originale.genre = genres.first().map(|s| s.to_string());
+        originale.genres = (!genres.is_empty()).then(|| serde_json::to_string(&genres).unwrap());
+        // Suppression explicite dans la base source : update préserve les NULL.
+        source
+            .backend
+            .execute(
+                "UPDATE tracks SET year = NULL, genre = NULL, genres = NULL WHERE id = ?1",
+                &[&source_id],
+            )
+            .unwrap();
+        repo_source.update(&originale).unwrap();
+        let (status, bilan) = poster(&app, &chemin).await;
+        assert_eq!(status, StatusCode::OK, "{bilan}");
+        assert_eq!(bilan["indexe"], true, "{bilan}");
+        assert_eq!(
+            compte(&destination, "SELECT COUNT(*) FROM tracks"),
+            1,
+            "pas de doublon lors du rafraîchissement des tags"
+        );
+        let id = compte(&destination, "SELECT id FROM tracks");
+        if let Some(ancien) = identite {
+            assert_eq!(id, ancien, "identité conservée");
+        }
+        identite = Some(id);
+        let piste = repo.get(id).unwrap().unwrap();
+        let attendu = if annee == Some(1998) { 1998 } else { 1999 };
+        assert_eq!(
+            piste.year,
+            Some(attendu),
+            "7341 : année perdue entre Local, DIDL et piste indexée"
+        );
+        let genres_attendus = if annee == Some(1998) {
+            vec!["Trip Hop", "Funk & Soul"]
+        } else {
+            vec!["Trip Hop", "Funk"]
+        };
+        assert_eq!(
+            piste.genre.as_deref(),
+            Some("Trip Hop"),
+            "7341 : genre principal perdu"
+        );
+        let lus: Vec<String> =
+            serde_json::from_str(piste.genres.as_deref().unwrap_or("[]")).unwrap();
+        assert_eq!(
+            lus, genres_attendus,
+            "7341 : genres multiples perdus ou entités XML non décodées"
+        );
+        assert_eq!(piste.to_json()["year"], attendu);
+        assert_eq!(piste.sample_rate, Some(44_100));
+        assert_eq!(piste.bit_depth, Some(16));
+    }
+    assert_eq!(
+        repo_source.get(source_id).unwrap().unwrap().source,
+        "local",
+        "la source native n'est pas convertie en UPnP"
+    );
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadonnees_7341_serveur_sans_tags_ne_fabrique_ni_annee_ni_genre() {
+    let etat = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let control = lever_le_serveur_du_banc().await;
+    inscrire_le_serveur(&etat, &control).await;
+    let app = tune_server::routes::router(etat.clone());
+    let (_, bilan) = poster(
+        &app,
+        &format!("/api/v1/network/media-servers/{UDN}/indexer"),
+    )
+    .await;
+    assert_eq!(bilan["indexe"], true, "{bilan}");
+    assert_eq!(compte(&etat, "SELECT COUNT(*) FROM tracks"), 3);
+    assert_eq!(
+        compte(
+            &etat,
+            "SELECT COUNT(*) FROM tracks WHERE year IS NOT NULL OR genre IS NOT NULL OR genres IS NOT NULL"
+        ),
+        0,
+        "aucun tag inventé pour une source muette"
+    );
+}
+
+#[test]
+fn metadonnees_7341_didl_optionnel_et_genres_xml_sains() {
+    use tune_core::outputs::didl::DidlBuilder;
+    let absent = DidlBuilder::new("Titre", "http://localhost/audio", "audio/flac").build();
+    assert!(!absent.contains("<dc:date>"));
+    assert!(!absent.contains("<upnp:genre>"));
+    let present = DidlBuilder::new("Titre", "http://localhost/audio", "audio/flac")
+        .year_opt(Some(1998))
+        .genres(vec!["Funk & Soul".into(), "Trip\0Hop".into()])
+        .build();
+    assert!(
+        present.contains("<dc:date>1998</dc:date>"),
+        "année publiée sans jour inventé"
+    );
+    assert!(present.contains("<upnp:genre>Funk &amp; Soul</upnp:genre>"));
+    assert!(present.contains("<upnp:genre>Trip Hop</upnp:genre>"));
+    assert!(
+        !DidlBuilder::new("T", "http://localhost/audio", "audio/flac")
+            .year_opt(Some(0))
+            .build()
+            .contains("<dc:date>")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadonnees_7341_dates_distantes_et_genres_repetes() {
+    let date = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let date_http = date.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = Router::new().route("/control", post(move |body: String| {
+        let date = date_http.lock().unwrap().clone();
+        async move {
+            if body.contains("<StartingIndex>0</StartingIndex>") {
+                enveloppe_soap(&format!(
+                    "<item id=\"t\" parentID=\"0\"><dc:title>Source externe</dc:title>\
+                    <dc:date>{}</dc:date><upnp:genre xml:lang=\"en\">Trip Hop</upnp:genre>\
+                    <upnp:genre>Funk &amp; Soul</upnp:genre><upnp:genre>Trip Hop</upnp:genre>\
+                    <upnp:genre></upnp:genre><upnp:genreExtra>Faux genre</upnp:genreExtra>\
+                    <upnp:class>object.item.audioItem.musicTrack</upnp:class>\
+                    <res size=\"12345\" duration=\"0:01:00\" protocolInfo=\"http-get:*:audio/flac:*\">\
+                    http://127.0.0.1/audio.flac</res></item>", echapper(&date)), 1)
+            } else { enveloppe_soap("", 0) }
+        }
+    }));
+    let task = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+    for (valeur, annee) in [
+        ("1998", Some(1998)),
+        ("1998-04", Some(1998)),
+        ("1998-04-20", Some(1998)),
+        ("1998-04-20T12:30:05+02:00", Some(1998)),
+        ("1998-04-20T12:30:05", Some(1998)),
+        ("1998oops", None),
+        ("1998-13", None),
+        ("1998-02-30", None),
+        ("0000", None),
+    ] {
+        *date.lock().unwrap() = valeur.into();
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        inscrire_le_serveur(&state, &format!("http://{address}/control")).await;
+        let app = tune_server::routes::router(state.clone());
+        let (_, bilan) = poster(
+            &app,
+            &format!("/api/v1/network/media-servers/{UDN}/indexer"),
+        )
+        .await;
+        assert_eq!(bilan["indexe"], true, "{bilan}");
+        let id = compte(&state, "SELECT id FROM tracks");
+        let piste = TrackRepo::with_backend(state.backend.clone())
+            .get(id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(piste.year, annee, "année pour dc:date={valeur}");
+        let genres: Vec<String> =
+            serde_json::from_str(piste.genres.as_deref().unwrap_or("[]")).unwrap();
+        assert_eq!(
+            genres,
+            ["Trip Hop", "Funk & Soul"],
+            "genres répétés, attribués, échappés et sans doublons"
+        );
+    }
+    task.abort();
 }

@@ -84,6 +84,9 @@ pub(super) fn track_filter_from_raw(raw: Option<&str>) -> Result<TrackFilter, Ap
     let one = |key: &str| normalize(&values_of(raw, key)).into_iter().next();
 
     Ok(TrackFilter {
+        // Le profil n'est pas dans la chaîne de requête : chaque route le pose
+        // ensuite depuis `ActiveProfile` (0 = « pas encore posé », lu comme 1).
+        profile_id: 0,
         genres: texts("genre"),
         years: ints(raw, "year")?,
         formats: texts("format"),

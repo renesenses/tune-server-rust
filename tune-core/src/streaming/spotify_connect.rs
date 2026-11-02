@@ -1083,22 +1083,20 @@ pub(crate) fn consigne_librespot_introuvable(os: &str) -> String {
 pub(crate) fn consigne_librespot_introuvable_dans(os: &str, dossier: &str) -> String {
     match os {
         "macos" => format!(
-            "librespot est introuvable : Tune ne le livre pas encore sous macOS. L'installer \
+            "librespot est introuvable : le paquet de Tune sous macOS doit le fournir. Réinstaller Tune, installer librespot \
              (brew install librespot) ou indiquer son chemin dans la variable TUNE_LIBRESPOT, \
              puis redémarrer Tune. Spotify Premium est exigé. (Dossier de Tune : {dossier})"
         ),
         "windows" => format!(
-            "librespot.exe est introuvable : Tune ne le livre pas sous Windows, et le projet \
-             librespot ne publie aucun binaire Windows. La lecture Spotify n'est donc pas \
-             disponible sous Windows, sauf avec un librespot.exe compilé soi-même \
-             (cargo install librespot) et déclaré dans la variable TUNE_LIBRESPOT (ou posé dans \
-             {dossier}), puis redémarrer Tune. Spotify Premium est exigé."
+            "librespot.exe est introuvable : le paquet de Tune sous Windows doit le fournir. \
+             Réinstaller Tune, ou indiquer un autre librespot.exe dans la variable \
+             TUNE_LIBRESPOT (ou le poser dans {dossier}), puis redémarrer Tune. \
+             Spotify Premium est exigé."
         ),
         _ => format!(
             "librespot est introuvable : il n'est pas dans le dossier de Tune ({dossier}). Les \
-             paquets Linux x86_64 de Tune (archive, .deb, Tune OS) et l'image Docker le livrent ; \
-             les autres installations (Linux ARM notamment) ne l'ont pas encore. Réinstaller le \
-             paquet de Tune, ou indiquer le chemin d'un librespot dans la variable \
+             paquets Linux de Tune (x86_64 et ARM64, archive, .deb, Tune OS) et l'image Docker le livrent. \
+             Réinstaller le paquet de Tune, ou indiquer le chemin d'un librespot dans la variable \
              TUNE_LIBRESPOT, puis redémarrer Tune. Spotify Premium est exigé."
         ),
     }
@@ -1116,8 +1114,8 @@ mod tests {
         assert!(windows.contains("librespot.exe"), "{windows}");
         assert!(windows.contains("TUNE_LIBRESPOT"), "{windows}");
         assert!(
-            windows.contains("ne publie aucun binaire Windows"),
-            "Windows : dire pourquoi il n'y en a pas : {windows}"
+            windows.contains("le paquet de Tune sous Windows doit le fournir"),
+            "Windows : orienter vers le binaire fourni par Tune : {windows}"
         );
         assert!(!windows.contains("brew"), "{windows}");
         let linux = consigne_librespot_introuvable_dans("linux", "/opt/tune");

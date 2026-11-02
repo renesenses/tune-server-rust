@@ -419,6 +419,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "az"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be5eb007b7cacc6c660343e96f650fedf4b5a77512399eb952ca6642cf8d13f7"
+
+[[package]]
 name = "backon"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1739,6 +1745,18 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "fixed"
+version = "1.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9af2cbf772fa6d1c11358f92ef554cb6b386201210bcf0e91fb7fba8a907fb40"
+dependencies = [
+ "az",
+ "bytemuck",
+ "half",
+ "typenum",
+]
 
 [[package]]
 name = "flate2"
@@ -5631,6 +5649,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "statime"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4b8f200cc0ef7de878f11c2d606248d76af7168e9723c09be995d796393a491"
+dependencies = [
+ "arrayvec",
+ "az",
+ "fixed",
+ "libm",
+ "log",
+ "rand 0.8.7",
+]
+
+[[package]]
 name = "strength_reduce"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6452,6 +6484,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tune-aes67"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "rand 0.8.7",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2 0.5.10",
+ "statime",
+ "symphonia",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "tune-core",
+]
+
+[[package]]
 name = "tune-assistant-ia"
 version = "1.0.0"
 dependencies = [
@@ -6569,6 +6622,23 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "urlencoding",
+]
+
+[[package]]
+name = "tune-collection-physique"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "image",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "tune-core",
  "urlencoding",
 ]
 
@@ -6762,6 +6832,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-mon-theme"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tune-core",
+]
+
+[[package]]
 name = "tune-output-api"
 version = "1.0.0"
 dependencies = [
@@ -6935,16 +7019,19 @@ dependencies = [
  "tower-service",
  "tracing",
  "tracing-subscriber",
+ "tune-aes67",
  "tune-assistant-ia",
  "tune-bandcamp",
  "tune-cd",
  "tune-circle",
+ "tune-collection-physique",
  "tune-concerts",
  "tune-core",
  "tune-dj",
  "tune-entree-audio",
  "tune-http-types",
  "tune-karaoke",
+ "tune-mon-theme",
  "tune-plugin-converter",
  "tune-plugin-declick",
  "tune-plugin-native",

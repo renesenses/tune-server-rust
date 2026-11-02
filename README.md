@@ -10,8 +10,12 @@ room by room (multiroom):
 
 - **DLNA / UPnP AV** renderers, with native DSD where the renderer accepts it — Tune is also a UPnP media server;
 - **OpenHome**, **AirPlay**, **Chromecast**, **Squeezebox / Squeezelite** (built-in SlimProto server), **HQPlayer**;
+- **Lyrion Music Server (LMS)**: Tune can drive the players of an existing Lyrion server and offers an LMS-compatible command bridge, so it can run alongside Lyrion ([LMS, SlimProto and ports](docs/LMS-SLIMPROTO.md));
 - **OAAT**, an open network audio protocol (Apache 2.0), with the Tune Bridge receiver;
 - local outputs to a USB DAC: ALSA, CoreAudio (exclusive), WASAPI (exclusive), ASIO.
+
+Coming from Roon, JRiver, Audirvana or Lyrion (LMS)? Your Squeezebox and Squeezelite players join Tune as they are, and Tune can live next to an
+existing Lyrion while you try it.
 
 It is controlled from any web browser (the server serves the web client) or
 from the Tune Remote apps for iOS and Android (beta). Version 1.0.0 is at the
