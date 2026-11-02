@@ -652,6 +652,13 @@ pub mod sql {
         "SELECT a.id, a.title, ar.name FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.bio IS NULL OR a.bio = '') AND a.source = 'local' ORDER BY a.id"
     }
 
+    /// Écran « État du serveur » (01/11/2026) : les albums LOCAUX et ceux
+    /// d'entre eux sans pochette, en une lecture. Même filtre que
+    /// [`list_without_cover`] : les deux nombres ne divergent pas.
+    pub fn compter_pochettes_locales() -> &'static str {
+        "SELECT COUNT(*), COUNT(CASE WHEN a.cover_path IS NULL OR a.cover_path = '' THEN 1 END) FROM albums a WHERE a.source = 'local'"
+    }
+
     pub fn count_with_bio() -> &'static str {
         "SELECT COUNT(*) FROM albums WHERE bio IS NOT NULL AND bio != ''"
     }
@@ -2980,6 +2987,18 @@ impl AlbumRepo {
         {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
+    }
+
+    /// `(albums locaux, albums locaux sans pochette)` — voir
+    /// [`sql::compter_pochettes_locales`].
+    pub fn compter_pochettes_locales(&self) -> Result<(i64, i64), TuneError> {
+        match self.db.query_one(sql::compter_pochettes_locales(), &[])? {
+            None => Ok((0, 0)),
+            Some(cols) => Ok((
+                cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+            )),
         }
     }
 

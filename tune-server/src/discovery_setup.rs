@@ -1665,12 +1665,32 @@ pub fn spawn_mdns_handler(
                                     // v2 zone if daemon absent").
                                     airplay_v2_fallback = true;
                                 }
+                                // Un appareil AirPlay 2, ou dont le mDNS (bits
+                                // `features`/`sf`) exige l'appairage, servi par le
+                                // chemin AirPlay 1 qui n'en fait aucun : son 403
+                                // dira l'appairage manquant, pas « un autre
+                                // émetteur » (Xiaomi Sound 2 Max sous Windows).
+                                let appairage_requis = is_v2
+                                    || dev
+                                        .capabilities
+                                        .get("airplay_requires_pairing")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                if appairage_requis {
+                                    warn!(
+                                        name = %dev.name,
+                                        airplay_version = dev.airplay_version.as_deref().unwrap_or("?"),
+                                        daemon = tune_core::outputs::airplay2::daemon_available(),
+                                        "airplay_appairage_requis_servi_en_airplay1"
+                                    );
+                                }
                                 let ap = tune_core::outputs::airplay::AirplayOutput::new(
                                     dev.name.clone(),
                                     dev.id.clone(),
                                     dev.host.clone(),
                                     dev.port,
-                                );
+                                )
+                                .avec_appairage_airplay2_requis(appairage_requis);
                                 (Some(Box::new(ap)), "airplay")
                             }
                         }

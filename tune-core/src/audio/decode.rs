@@ -2215,6 +2215,36 @@ pub fn decode_vers_pcm_en_continu(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
 ) -> Result<(u16, u32), String> {
+    decode_vers_pcm_en_continu_depuis(
+        chemin,
+        source,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        0.0,
+    )
+}
+
+/// #7336 — [`decode_vers_pcm_en_continu`] à partir de `seek_s` secondes du
+/// fichier source (saut dans la piste d'une sortie qui consomme le flux
+/// elle-même : Sortie AES67). Même saut à l'échantillon près que les autres
+/// variantes ; une source qui ne sait pas sauter (corps HTTP lu en continu)
+/// repart du début, à l'appelant d'écarter les trames en trop.
+// Même signature que la variante sans saut, plus `seek_s` ; même choix que
+// decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_vers_pcm_en_continu_depuis(
+    chemin: &str,
+    source: Option<Box<dyn MediaSource>>,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    seek_s: f64,
+) -> Result<(u16, u32), String> {
     decode_to_pcm_streaming_inner(
         chemin,
         target_sample_rate,
@@ -2224,7 +2254,7 @@ pub fn decode_vers_pcm_en_continu(
         chunk_size,
         None,
         None,
-        0.0,
+        seek_s.max(0.0),
         source,
     )
 }

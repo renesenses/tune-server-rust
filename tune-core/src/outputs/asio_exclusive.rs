@@ -1145,7 +1145,7 @@ pub fn sonder_cadences_dsd(device_name: &str) -> Option<Vec<u32>> {
         let host = cpal::host_from_id(cpal::HostId::Asio).ok()?;
         let device = resoudre_peripherique_asio(&host, device_name).ok()?;
         match device.as_inner() {
-            cpal::platform::DeviceInner::Asio(asio) => Some(asio.dsd_output_rates()),
+            cpal::platform::DeviceInner::Asio(asio) => asio.try_dsd_output_rates(),
             #[allow(unreachable_patterns)]
             _ => Some(Vec::new()),
         }

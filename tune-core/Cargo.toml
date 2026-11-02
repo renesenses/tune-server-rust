@@ -772,6 +772,14 @@ path = "tests/sonde_lpcm_hors_dlna_4894.rs"
 name = "sonde_lpcm_openhome_6718"
 path = "tests/sonde_lpcm_openhome_6718.rs"
 
+# #6753 — une pause (ou un arrêt) sur un renderer OpenHome retire de sa liste
+# la suivante armée par Tune : sinon le Linn l'enchaîne après les pistes de
+# Kazoo. `autotests = false` : sans cette cible, ce fichier ne serait jamais
+# compilé.
+[[test]]
+name = "pause_retire_suivante_openhome_6753"
+path = "tests/pause_retire_suivante_openhome_6753.rs"
+
 # Édition d'album, tranche 4 — « Écrire dans les fichiers » : un vrai fichier
 # par format courant, relu par le lecteur du scan, audio prouvé intact
 # (empreinte ET PCM décodé). `autotests = false` en tête de ce manifeste : sans

@@ -20,6 +20,24 @@ impl PositionPoller {
 
         let device_id = self.get_zone_device_id(zone_id);
 
+        // #7415 : la piste qui s'achève était peut-être la dernière de son
+        // album / de sa playlist ; la file peut pourtant continuer (suite
+        // automatique, radio, répétition). Sa reprise s'en va dans tous les cas.
+        if let Some(np) = zone_state
+            .now_playing
+            .as_ref()
+            .filter(|np| np.source != "podcast")
+            && let Err(e) = crate::db::listening_resume::contexte_fini(
+                &self.db,
+                zone_id,
+                np,
+                zone_state.position_ms,
+                true,
+            )
+        {
+            warn!(zone_id, error = %e, "reprise_contexte_non_retiree");
+        }
+
         let Some(next_pos) = Self::next_position(zone_state) else {
             self.terminer_la_file(zone_id, zone_state, device_id.as_deref())
                 .await;
@@ -65,6 +83,24 @@ impl PositionPoller {
         device_id: Option<&str>,
     ) {
         use crate::db::zone_repo::{AutoplayMode, ZoneRepo};
+        // #7415 — la dernière piste de la file vient d'aller à son terme : les
+        // contextes qui la contiennent sont finis et quittent « Reprendre
+        // l'écoute ». Fait AVANT l'autoplay, qui prolonge la file mais ne
+        // rouvre pas l'album terminé.
+        if let Err(e) = crate::db::listening_resume::terminee(&self.db, zone_id) {
+            warn!(zone_id, error = %e, "reprise_terminee_non_retiree");
+        }
+        // #7415 : un épisode de podcast n'a pas de ligne de file dans sa
+        // reprise ; sa file qui s'achève le retire par son adresse.
+        if let Some(np) = zone_state
+            .now_playing
+            .as_ref()
+            .filter(|np| np.source == "podcast")
+            && let Some(url) = np.source_id.as_deref()
+            && let Err(e) = crate::db::listening_resume::podcast_termine(&self.db, zone_id, url)
+        {
+            warn!(zone_id, error = %e, "reprise_podcast_terminee_non_retiree");
+        }
         // #6634 — le contrôleur UPnP décide de la suite. Sa dernière piste
         // ne doit pas amorcer la radio ou un album de la bibliothèque locale.
         // Les pistes indexées d’un serveur média gardent leur autoplay Tune.

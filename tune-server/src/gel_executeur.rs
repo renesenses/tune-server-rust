@@ -175,6 +175,9 @@ pub fn elaguer_les_releves(dossier: &Path, garder: usize) {
 pub struct Veille {
     origine: Instant,
     battement_ms: AtomicU64,
+    /// #7506 — instant (depuis `origine`) de la dernière reprise après une
+    /// suspension du processus : l'âge du battement ne compte pas avant.
+    reprise_ms: AtomicU64,
     seuil: Duration,
     dossier: PathBuf,
     handle: tokio::runtime::Handle,
@@ -193,6 +196,7 @@ impl Veille {
         let veille = Arc::new(Veille {
             origine: Instant::now(),
             battement_ms: AtomicU64::new(0),
+            reprise_ms: AtomicU64::new(0),
             seuil,
             dossier,
             handle: handle.clone(),
@@ -216,12 +220,17 @@ impl Veille {
             .spawn(move || {
                 let mut episode: Option<Episode> = None;
                 let mut releves = 0usize;
+                // Mesuré APRÈS le tour : le temps d'écrire un relevé (fenêtre
+                // de mesure comprise) n'est pas un retard du sommeil.
+                let mut fin_du_tour = Instant::now();
                 loop {
                     std::thread::sleep(periode_veille);
+                    let retard = fin_du_tour.elapsed().saturating_sub(periode_veille);
                     let Some(v) = pour_la_veille.upgrade() else {
                         return;
                     };
-                    v.tour(&mut episode, &mut releves);
+                    v.tour(&mut episode, &mut releves, retard);
+                    fin_du_tour = Instant::now();
                 }
             });
         veille
@@ -233,11 +242,35 @@ impl Veille {
     }
 
     fn age_du_battement(&self) -> Duration {
-        let dernier = Duration::from_millis(self.battement_ms.load(Ordering::Relaxed));
+        let battement = self.battement_ms.load(Ordering::Relaxed);
+        let reprise = self.reprise_ms.load(Ordering::Relaxed);
+        let dernier = Duration::from_millis(battement.max(reprise));
         self.origine.elapsed().saturating_sub(dernier)
     }
 
-    fn tour(&self, episode: &mut Option<Episode>, releves: &mut usize) {
+    /// `retard` : ce que le tour de veille a pris en plus de sa propre
+    /// cadence.
+    ///
+    /// #7506 (fil 2553, Surface sous Windows) : un tour en retard d'au moins
+    /// le seuil, c'est le PROCESSUS entier qui n'a pas tourné, pas
+    /// l'exécuteur — un gel de tokio laisse ce `std::thread` tourner à sa
+    /// cadence. C'est la mise en veille de la machine : sous Windows,
+    /// `Instant` (QueryPerformanceCounter) compte le temps de veille, et le
+    /// premier tour après le réveil lisait « battement vieux de 2643726 ms »
+    /// avec 0 fil au travail. Ce tour est écarté, et l'âge repart de la
+    /// reprise : un vrai gel qui suivrait est relevé `seuil` plus tard.
+    fn tour(&self, episode: &mut Option<Episode>, releves: &mut usize, retard: Duration) {
+        if retard >= self.seuil {
+            self.reprise_ms
+                .store(self.origine.elapsed().as_millis() as u64, Ordering::Relaxed);
+            tracing::info!(
+                suspension_ms = retard.as_millis() as u64,
+                episode_en_cours = episode.is_some(),
+                "gel_executeur_suspension_du_processus_ecartee"
+            );
+            *episode = None;
+            return;
+        }
         let age = self.age_du_battement();
         if age < self.seuil {
             if let Some(e) = episode.take() {
@@ -805,6 +838,63 @@ mod tests {
         assert!(md.contains("… (coupé)"), "{md}");
         assert!(md.len() < 2 * PLAFOND_RELEVE_JOINT, "{}", md.len());
         assert!(section_du_rapport(None, 2).contains("veille non démarrée"));
+    }
+
+    fn veille_sans_fils(rt: &tokio::runtime::Runtime, dossier: &Path, depuis: Duration) -> Veille {
+        Veille {
+            // Le battement date de `depuis` : l'exécuteur n'a pas battu depuis.
+            origine: Instant::now().checked_sub(depuis).unwrap(),
+            battement_ms: AtomicU64::new(0),
+            reprise_ms: AtomicU64::new(0),
+            seuil: Duration::from_secs(5),
+            dossier: dossier.to_path_buf(),
+            handle: rt.handle().clone(),
+            fenetre: Duration::ZERO,
+        }
+    }
+
+    /// #7506 — le premier tour après une veille de la machine arrive avec le
+    /// retard de la veille : aucun relevé, et l'âge repart de la reprise.
+    #[test]
+    fn un_tour_de_veille_en_retard_est_une_suspension_pas_un_gel_7506() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let veille = veille_sans_fils(&rt, dir.path(), Duration::from_secs(2644));
+        let (mut episode, mut releves) = (None, 0usize);
+        veille.tour(&mut episode, &mut releves, Duration::from_secs(2643));
+        assert!(
+            fichiers(dir.path()).is_empty(),
+            "relevé écrit pour une veille"
+        );
+        assert!(episode.is_none());
+        assert!(veille.age_du_battement() < veille.seuil);
+        // Le tour suivant, à l'heure, ne voit toujours rien.
+        veille.tour(&mut episode, &mut releves, Duration::ZERO);
+        assert!(fichiers(dir.path()).is_empty());
+        assert_eq!(releves, 0);
+        rt.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// Contre-épreuve : le même battement vieux, lu par un tour À L'HEURE
+    /// (l'exécuteur seul est pris), reste un gel relevé.
+    #[test]
+    fn un_battement_vieux_lu_par_un_tour_a_l_heure_reste_un_gel_7506() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let veille = veille_sans_fils(&rt, dir.path(), Duration::from_secs(60));
+        let (mut episode, mut releves) = (None, 0usize);
+        veille.tour(&mut episode, &mut releves, Duration::from_millis(3));
+        assert_eq!(releves, 1, "un vrai gel doit rester relevé");
+        assert_eq!(fichiers(dir.path()).len(), 1);
+        rt.shutdown_timeout(Duration::from_secs(5));
     }
 
     /// Un exécuteur qui tourne : aucun relevé.

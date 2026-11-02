@@ -32,8 +32,12 @@ def inventory(root):
     members = {str((root / p).resolve()): read_toml(root / p / "Cargo.toml")["package"]["name"]
                for p in workspace["members"]}
     server = read_toml(root / "tune-server/Cargo.toml")
+    # A plugin may be declared for one platform only (`[target.'cfg(...)'.dependencies]`,
+    # e.g. the Linux-only AES67 output, #7336): its feature then compiles
+    # nothing elsewhere, but it still belongs to the inventory.
+    tables = [server["dependencies"]] + [t.get("dependencies", {}) for t in server.get("target", {}).values()]
     actual = {str((root / "tune-server" / dep["path"]).resolve()): name
-              for name, dep in server["dependencies"].items()
+              for table in tables for name, dep in table.items()
               if isinstance(dep, dict) and dep.get("path", "").startswith("../plugins/")}
     declared = set()
     ids = set()
