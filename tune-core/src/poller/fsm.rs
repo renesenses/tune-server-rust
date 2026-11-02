@@ -661,15 +661,21 @@ mod tests {
     #[test]
     fn volume_adopted_on_real_device_change() {
         // The knob moved DOWN on the device (0.50 -> 0.20) and now differs
-        // from the saved volume — adopt it. #6739 : jamais à la hausse.
+        // from the saved volume — adopt it. #7379 : à la hausse, sous le
+        // plafond de suivi seulement (0,70 par défaut).
         assert!(super::super::decisions::should_adopt_device_volume(
             Some(0.5),
             0.2,
             0.3
         ));
-        assert!(!super::super::decisions::should_adopt_device_volume(
+        assert!(super::super::decisions::should_adopt_device_volume(
             Some(0.5),
             0.62,
+            0.3
+        ));
+        assert!(!super::super::decisions::should_adopt_device_volume(
+            Some(0.5),
+            0.85,
             0.3
         ));
     }

@@ -58,6 +58,15 @@ pub const PAS_PAR_DEFAUT: f64 = 0.02;
 /// égal à la limite : la plupart parlent en entiers 0..100.
 pub const TOLERANCE_RENDERER: f64 = 0.01;
 
+/// #7379 (décision de Bertrand du 02/11) — le plafond sous lequel Tune SUIT
+/// un appareil monté hors de Tune (bouton de l'ampli, autre application),
+/// quand la zone n'a PAS de limite de sécurité réglée : 70 % de l'échelle de
+/// l'appareil, la valeur de sécurité du fil 2335 qui a fondé #6541. Sans
+/// limite réglée, le suivi n'est donc jamais « illimité ». Il ne borne aucune
+/// consigne de Tune : seulement ce que le sondeur adopte d'un relevé (voir
+/// [`LimitesDeVolume::plafond_de_suivi`]).
+pub const PLAFOND_DE_SUIVI_PAR_DEFAUT: f64 = 0.70;
+
 /// Plancher d'une limite : en dessous de 1 %, une « limite » couperait le son
 /// sans le dire. Une valeur plus basse est refusée par la route.
 pub const LIMITE_MINIMALE: f64 = 0.01;
@@ -217,6 +226,22 @@ impl LimitesDeVolume {
             _ => cible,
         };
         self.borner_appareil(cible)
+    }
+
+    /// #7379 — le plus haut niveau d'APPAREIL (échelle de l'appareil, trim
+    /// compris) que le sondeur adopte d'un relevé plus haut que la consigne.
+    /// La limite de sécurité quand elle est réglée ; sinon
+    /// [`PLAFOND_DE_SUIVI_PAR_DEFAUT`], jamais sous le niveau que Tune
+    /// commande lui-même (`consigne_appareil`) : sans limite réglée, une
+    /// consigne posée par l'auditeur au-dessus de 70 % n'est pas rabotée.
+    pub fn plafond_de_suivi(&self, consigne_appareil: f64) -> f64 {
+        match self.securite {
+            Some(s) => s,
+            None if consigne_appareil.is_finite() => {
+                PLAFOND_DE_SUIVI_PAR_DEFAUT.max(consigne_appareil.clamp(0.0, 1.0))
+            }
+            None => PLAFOND_DE_SUIVI_PAR_DEFAUT,
+        }
     }
 
     /// Le renderer rapporte-t-il un volume au-dessus de la sécurité ?

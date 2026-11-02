@@ -1114,7 +1114,7 @@ mod demarrage_fige_5522;
 mod demarrage_fige_5522_tests;
 
 /// #6541 — au-dessus de la limite de sécurité, le volume du renderer n'est
-/// pas adopté : il est ramené sous la limite.
+/// pas adopté : il est ramené à la limite (#7379).
 mod volume_plafond_6541;
 #[cfg(test)]
 mod volume_plafond_6541_tests;
@@ -1129,7 +1129,8 @@ mod contrat_radio_locale_6233;
 mod etat_air_6912;
 #[cfg(test)]
 mod etat_air_6912_tests;
-/// #6739 — un relevé du volume de l'appareil ne remonte jamais la consigne.
+/// #6739 — un relevé du volume de l'appareil ne fait jamais grimper la
+/// consigne par cliquet ; #7379 — il est suivi sous le plafond de suivi.
 mod releve_ne_monte_pas_6739;
 /// #6739 — ses témoins, sur le vrai sondeur et le vrai orchestrateur.
 #[cfg(test)]
@@ -1144,6 +1145,10 @@ mod volume_adopte_6008;
 /// #6008 — son banc, sur le vrai sondeur.
 #[cfg(test)]
 mod volume_adopte_6008_tests;
+/// #7379 — témoins du suivi de l'appareil sous le plafond, sur le vrai
+/// sondeur et le vrai orchestrateur (sortie factice, aucun son).
+#[cfg(test)]
+mod volume_suivi_7379_tests;
 
 #[cfg(test)]
 mod tests;

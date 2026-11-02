@@ -212,6 +212,14 @@ impl Banc {
             .await;
     }
 
+    /// #7379 — les évènements de lecture, tels que le serveur les relaie aux
+    /// clients (`volume` : le curseur).
+    pub(super) fn evenements_de_lecture(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::playback::PlaybackEvent> {
+        self.poller.playback.subscribe()
+    }
+
     /// Pose un réglage clé/valeur (#6541 : les limites de volume).
     pub(super) fn poser_reglage(&self, cle: &str, valeur: &str) {
         SettingsRepo::with_backend(self.db.clone())

@@ -29,12 +29,23 @@
 //! Prix assumé : sur cet appareil, une hausse faite hors de Tune (télécommande,
 //! application Cabasse) pendant que Tune lit est ramenée à la consigne de
 //! Tune. Une hausse faite depuis Tune passe : elle EST la consigne.
+//!
+//! ## Fin de la règle stricte (#7379, décision de Bertrand du 02/11)
+//!
+//! Le prix ci-dessus n'est plus payé : une règle commune à tous les appareils
+//! remplace celle-ci. Hors de la fenêtre d'après pose, la sortie DLNA ne
+//! corrige plus rien : elle rend le relevé tel quel au sondeur, qui SUIT
+//! l'appareil sous le plafond de suivi de la zone et le ramène au plafond
+//! au-dessus (`poller::releve_ne_monte_pas_6739`). L'Abyss qui remonte seule
+//! à 80 % n'est donc plus tenue à la consigne : sans limite de sécurité réglée,
+//! elle est ramenée au plafond par défaut (70 %). La correction DANS la
+//! fenêtre d'après pose (#6207, l'appareil qui remonte à chaque URI) reste.
 use std::time::Duration;
 
-use tracing::info;
+use tracing::debug;
 
 use super::DlnaOutput;
-use crate::outputs::traits::{OutputTarget, TransportState};
+use crate::outputs::traits::TransportState;
 
 /// Délai, après une demande de volume de Tune, pendant lequel une lecture de
 /// l'appareil hors fenêtre n'est pas jugée.
@@ -96,9 +107,11 @@ impl DlnaOutput {
         meme_origine(piste, &pose.url)
     }
 
-    /// Hors de la fenêtre d'après pose : corrige une hausse sur un appareil
-    /// qui porte la règle, sinon rend la lecture telle quelle (#6472 : elle ne
-    /// devient jamais la consigne).
+    /// Hors de la fenêtre d'après pose : la lecture passe telle quelle au
+    /// sondeur (#7379), et elle ne devient la consigne que par sa règle
+    /// commune (`poller::releve_ne_monte_pas_6739`). Une hausse sur un
+    /// appareil qui porte la règle « volume remonté à l'URI » se dit au
+    /// journal de débogage, sans commande.
     pub(super) async fn volume_hors_fenetre(
         &self,
         lu: f64,
@@ -119,29 +132,16 @@ impl DlnaOutput {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some_and(|t| t.elapsed() < GRACE_APRES_DEMANDE);
-        if en_grace {
-            return lu;
+        if !en_grace {
+            debug!(
+                device = %self.name,
+                device_id = %self.device_id,
+                lu_pct = (lu * 100.0).round() as u64,
+                volume_pct = (connu * 100.0).round() as u64,
+                "dlna_volume_hausse_hors_fenetre_laissee_au_sondeur"
+            );
         }
-        match self.set_volume(connu).await {
-            Ok(()) => {
-                info!(
-                    device = %self.name,
-                    device_id = %self.device_id,
-                    lu_pct = (lu * 100.0).round() as u64,
-                    volume_pct = (connu * 100.0).round() as u64,
-                    "dlna_volume_reimpose_hors_fenetre"
-                );
-                connu
-            }
-            Err(e) => {
-                tracing::warn!(
-                    device = %self.name,
-                    error = %e,
-                    "dlna_volume_reimpose_hors_fenetre_echoue"
-                );
-                lu
-            }
-        }
+        lu
     }
 }
 
