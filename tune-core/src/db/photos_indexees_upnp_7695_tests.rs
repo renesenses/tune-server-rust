@@ -4,7 +4,9 @@
 //! Le banc : des photos DNG et JPEG d'un partage Windows (par le format, ou
 //! par la seule extension de l'URL), une vraie piste UPnP en FLAC, une piste
 //! UPnP `.mp4` en `audio/mp4`, une piste UPnP sans format ni extension, une
-//! piste locale, et une photo qu'un favori référence.
+//! piste locale, et une photo qu'un favori référence. Et le revers : des
+//! pistes Matroska audio (`audio/x-matroska` → `matroska`, URL `.mkv`), une
+//! piste FLAC dont l'URL finit par une extension vidéo — elles restent.
 
 use std::sync::Arc;
 
@@ -118,6 +120,26 @@ fn i7695_la_passe_retire_les_photos_et_rien_d_autre() {
         Some("http://192.0.2.7:10243/res/3"),
         None,
     );
+    // Matroska audio : `audio/x-matroska` est rangé `matroska`, servi en `.mkv`.
+    let matroska = ligne(
+        &db,
+        "Piste Matroska",
+        "upnp",
+        None,
+        Some("matroska"),
+        Some("http://192.0.2.9:8888/res/4.mkv"),
+        Some(disque),
+    );
+    // Un format audio rangé l'emporte sur une extension vidéo de l'URL.
+    let flac_avi = ligne(
+        &db,
+        "Piste FLAC en .avi",
+        "upnp",
+        None,
+        Some("flac"),
+        Some("http://192.0.2.9:8888/res/5.avi"),
+        Some(disque),
+    );
     let locale = ligne(
         &db,
         "Locale",
@@ -145,21 +167,20 @@ fn i7695_la_passe_retire_les_photos_et_rien_d_autre() {
 
     let bilan = retirer_les_photos_indexees(&db).unwrap();
 
-    assert_eq!(
-        bilan,
-        Bilan {
-            retirees: 2,
-            gardees_liees: vec![favorite],
-            albums_vides_retires: 1,
-        },
-        "deux photos retirées, la photo favorite laissée, l'album « Pellicule » vidé"
-    );
     assert!(!existe(&db, "tracks", dng), "la photo DNG reste une piste");
     assert!(!existe(&db, "tracks", jpeg), "la photo JPG reste une piste");
     assert!(existe(&db, "tracks", flac), "une piste FLAC a été retirée");
     assert!(
         existe(&db, "tracks", mp4),
         "une piste audio .mp4 a été retirée"
+    );
+    assert!(
+        existe(&db, "tracks", matroska),
+        "une piste audio Matroska (format matroska, URL .mkv) a été retirée"
+    );
+    assert!(
+        existe(&db, "tracks", flac_avi),
+        "une piste au format flac a été retirée pour l'extension de son URL"
     );
     assert!(
         existe(&db, "tracks", muette),
@@ -182,6 +203,17 @@ fn i7695_la_passe_retire_les_photos_et_rien_d_autre() {
         "un album qui garde ses pistes a été retiré"
     );
 
+    // Le bilan, une fois chaque ligne vérifiée : un échec nomme la ligne.
+    assert_eq!(
+        bilan,
+        Bilan {
+            retirees: 2,
+            gardees_liees: vec![favorite],
+            albums_vides_retires: 1,
+        },
+        "deux photos retirées, la photo favorite laissée, l'album « Pellicule » vidé"
+    );
+
     // Idempotente : la seconde passe ne retire rien de plus.
     let encore = retirer_les_photos_indexees(&db).unwrap();
     assert_eq!(
@@ -189,6 +221,7 @@ fn i7695_la_passe_retire_les_photos_et_rien_d_autre() {
         "la seconde passe retire encore quelque chose"
     );
     assert!(existe(&db, "tracks", flac) && existe(&db, "tracks", mp4));
+    assert!(existe(&db, "tracks", matroska) && existe(&db, "tracks", flac_avi));
 }
 
 #[test]

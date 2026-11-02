@@ -22,12 +22,17 @@
 //! 2. `file_path IS NULL` (jamais une piste locale adoptée) ;
 //! 3. et son format est celui d'une image ou d'une vidéo
 //!    (`FORMATS_NON_AUDIO` — le format rangé est le sous-type du MIME,
-//!    `image/x-adobe-dng` → `adobe-dng`), **ou** son URL de lecture se termine
-//!    par une extension de photo ou de vidéo (`EXTENSIONS_NON_AUDIO`).
+//!    `image/x-adobe-dng` → `adobe-dng`), **ou**, faute de format rangé, son
+//!    URL de lecture se termine par une extension de photo ou de vidéo
+//!    (`EXTENSIONS_NON_AUDIO`).
 //!
-//! Les sous-types ambigus (`mpeg`, `mp4`, `webm`, `3gpp`, qui existent aussi en
-//! `audio/…`) ne sont PAS des critères, ni l'extension `.mp4` : un vrai
-//! fichier audio ne doit pas partir.
+//! Comme à la récolte, un format rangé autre (donc un MIME audio) l'emporte
+//! sur l'extension : une piste `flac` dont l'URL finit en `.avi` reste.
+//!
+//! Les sous-types ambigus (`mpeg`, `mp4`, `webm`, `3gpp`, `matroska`, `raw`,
+//! qui existent aussi en `audio/…` — `audio/x-matroska` est servi par Tune
+//! lui-même) ne sont PAS des critères, ni les extensions `.mp4`, `.mkv`,
+//! `.3gp` : un vrai fichier audio ne doit pas partir.
 //!
 //! Une ligne qu'un favori (`item_type = 'track'`) ou une playlist référence est
 //! **laissée** et comptée : la passe ne supprime jamais ce que l'utilisateur a
@@ -56,7 +61,6 @@ const FORMATS_NON_AUDIO: &[&str] = &[
     "dng",
     "adobe-dng",
     "dcraw",
-    "raw",
     "canon-cr2",
     "canon-cr3",
     "nikon-nef",
@@ -67,21 +71,22 @@ const FORMATS_NON_AUDIO: &[&str] = &[
     "samsung-srw",
     "pentax-pef",
     "msvideo",
-    "matroska",
     "quicktime",
     "ms-wmv",
     "m4v",
 ];
 
 /// Les extensions d'URL qui ne sont jamais du son. Même liste que la récolte
-/// (`EXTENSIONS_NON_AUDIO`, `routes/indexation_upnp.rs`) ; `.mp4` n'y est pas.
+/// (`EXTENSIONS_NON_AUDIO`, `routes/indexation_upnp.rs`) ; `.mp4`, `.mkv` et
+/// `.3gp` n'y sont pas.
 const EXTENSIONS_NON_AUDIO: &[&str] = &[
     "dng", "jpg", "jpeg", "jpe", "png", "gif", "bmp", "tif", "tiff", "heic", "heif", "webp", "raw",
-    "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf", "srw", "pef", "avi", "mkv", "mov", "wmv",
-    "m4v", "mpg", "mpeg", "3gp", "mts", "m2ts",
+    "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf", "srw", "pef", "avi", "mov", "wmv", "m4v",
+    "mpg", "mpeg", "mts", "m2ts",
 ];
 
-/// Les candidates : les trois conditions de l'en-tête. Les listes sont des
+/// Les candidates : les trois conditions de l'en-tête — l'extension ne compte
+/// que faute de format rangé. Les listes sont des
 /// constantes du module, jamais une saisie : les inscrire dans le texte SQL
 /// n'ouvre rien.
 fn candidates() -> String {
@@ -99,9 +104,10 @@ fn candidates() -> String {
         "SELECT t.id, t.album_id FROM tracks t \
          WHERE t.source = 'upnp' AND t.file_path IS NULL \
            AND (LOWER(COALESCE(t.format, '')) IN ({formats}) \
-                OR EXISTS (SELECT 1 FROM track_metadata m \
-                            WHERE m.track_id = t.id AND m.key = 'upnp_res_url' \
-                              AND ({extensions})))"
+                OR (COALESCE(t.format, '') = '' \
+                    AND EXISTS (SELECT 1 FROM track_metadata m \
+                                 WHERE m.track_id = t.id AND m.key = 'upnp_res_url' \
+                                   AND ({extensions}))))"
     )
 }
 

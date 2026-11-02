@@ -419,12 +419,13 @@ pub(crate) fn est_une_station_de_radio(item: &Value) -> bool {
 }
 
 /// Les extensions qui ne désignent jamais du son : photos (dont les RAW des
-/// appareils, le DNG du #7695) et vidéos. `.mp4` n'y est PAS : un `.mp4`
-/// peut être de l'audio (AAC/ALAC), tout comme `.m4a`.
+/// appareils, le DNG du #7695) et vidéos. `.mp4`, `.mkv` et `.3gp` n'y sont
+/// PAS : ils peuvent contenir de l'audio (AAC/ALAC, Matroska audio, que Tune
+/// sert en `audio/x-matroska`, `audio/3gpp`), tout comme `.m4a` et `.mka`.
 const EXTENSIONS_NON_AUDIO: &[&str] = &[
     "dng", "jpg", "jpeg", "jpe", "png", "gif", "bmp", "tif", "tiff", "heic", "heif", "webp", "raw",
-    "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf", "srw", "pef", "avi", "mkv", "mov", "wmv",
-    "m4v", "mpg", "mpeg", "3gp", "mts", "m2ts",
+    "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf", "srw", "pef", "avi", "mov", "wmv", "m4v",
+    "mpg", "mpeg", "mts", "m2ts",
 ];
 
 /// **Cet item DIDL n'est-il certainement pas du son ?** (#7695)
@@ -1501,6 +1502,9 @@ mod tests {
             ),
             // Un MIME audio l'emporte sur une extension trompeuse.
             item_didl(None, Some("http-get:*:audio/wav:*"), "http://h/a/7.jpg"),
+            // `.mkv` et `.3gp` peuvent être du son : sans autre signe, gardés.
+            item_didl(Some("object.item"), None, "http://h/a/8.mkv"),
+            item_didl(None, None, "http://h/a/9.3gp"),
         ] {
             assert!(
                 !est_un_objet_non_audio(&item),
