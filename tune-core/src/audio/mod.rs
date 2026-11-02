@@ -37,6 +37,8 @@ pub mod disposition_canaux;
 /// Dither TPDF — UNE implémentation, partagée par tous les étages qui
 /// repassent du flottant à l'entier (#4075, #4076).
 pub mod dither;
+/// #7704 — continuité du porteur DoP dans les rappels de rendu.
+pub mod dop_continu;
 #[cfg(test)]
 mod dop_porteur_bout_en_bout;
 /// #5643 — le flux « DSD brut » (DsdU8, MSB-first) de la sortie ASIO native.

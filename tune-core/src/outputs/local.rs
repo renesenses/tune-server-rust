@@ -2115,6 +2115,17 @@ impl NativePcmRing {
         self.pop_mapped(out, |sample| sample)
     }
 
+    /// #7704 — le prochain mot à tirer, SANS le consommer (consommateur seul).
+    pub(crate) fn premier_en_attente(&self) -> Option<i32> {
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        (w != r).then(|| {
+            let idx = r as usize % self.capacity();
+            // SAFETY: même contrat SPSC que `pop_mapped` : case publiée.
+            unsafe { *self.buf[idx].get() }
+        })
+    }
+
     /// Drain directly into a backend-owned callback buffer while converting
     /// each native word in place.  Keeping the mapping inside the ring avoids
     /// the temporary `Vec` that ASIO used to allocate on every audio period.
@@ -2360,6 +2371,18 @@ impl RingBuf {
         self.pop_mapped(out, |sample| sample)
     }
 
+    /// #7704 — le prochain échantillon à tirer, SANS le consommer
+    /// (consommateur seul).
+    pub(crate) fn premier_en_attente(&self) -> Option<f32> {
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        (w != r).then(|| {
+            let idx = r as usize % self.capacity();
+            // SAFETY: consommateur unique, case publiée par le Release de `push`.
+            unsafe { *self.buf[idx].get() }
+        })
+    }
+
     /// Drain and transform directly into the device callback's native slice.
     /// This is deliberately generic and allocation-free so integer ASIO
     /// callbacks do not need a floating-point scratch `Vec` per period.
@@ -2395,6 +2418,10 @@ mod ringbuf_tests;
 // juger le résultat par le `SuiviFamine` du sondeur.
 #[cfg(test)]
 mod horloge_du_pilote_muet_3814;
+
+// #7704 — le rappel partagé garde le porteur DoP continu.
+#[cfg(test)]
+mod dop_continu_7704;
 
 /// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
 ///
@@ -3156,10 +3183,14 @@ fn render_local_shared_f32_callback(
     // à zéro, le gain glisse sur quelques dizaines de millisecondes. `arm(0)`
     // — DoP, PURE, sortie exclusive — rend exactement la coupure franche
     // d'avant.
+    use crate::audio::dop_continu::{haut_f32, repos_f32};
     ramp.arm(armed_ms);
     let silence = paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed);
+    // #7704 — sur un porteur DoP, chaque période muette est faite de trames
+    // de repos (0x69, marqueurs alternés), jamais de zéros.
     if ramp.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-        periode_muette(ring, output, 0.0);
+        ramp.dop.combler(output, 0.0, repos_f32);
+        ring.starvation().record_silent_period(output.len());
         return 0;
     }
     // Wait for a minimum amount of data before starting to read from the ring
@@ -3167,16 +3198,27 @@ fn render_local_shared_f32_callback(
     // samples during track transitions.
     if !data_started.load(Ordering::Acquire) {
         if ring.available() < min_buffer_samples {
-            periode_muette(ring, output, 0.0);
+            ramp.dop.combler(output, 0.0, repos_f32);
+            ring.starvation().record_silent_period(output.len());
             return 0;
         }
         data_started.store(true, Ordering::Release);
     }
-    let read = ring.pop(output);
+    // #7704 — à la reprise, une trame de repos si la première trame réelle
+    // répéterait le dernier marqueur émis.
+    let debut = ramp
+        .dop
+        .raccorder(ring.premier_en_attente(), output, haut_f32, repos_f32);
+    if debut > 0 {
+        ring.starvation().record_silent_period(debut);
+    }
+    let read = ring.pop(&mut output[debut..]);
+    let fin = debut + read;
+    ramp.dop.observer(&output[debut..fin], haut_f32);
     let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
-    ramp.apply(&mut output[..read], v);
-    if read < output.len() {
-        output[read..].fill(0.0);
+    ramp.apply(&mut output[debut..fin], v);
+    if fin < output.len() {
+        ramp.dop.combler(&mut output[fin..], 0.0, repos_f32);
     }
     read
 }
