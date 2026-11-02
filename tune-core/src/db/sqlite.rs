@@ -227,6 +227,18 @@ fn register_functions(conn: &Connection) -> Result<(), String> {
         },
     )
     .map_err(|e| format!("register unaccent: {e}"))?;
+    // #7619 — le texte libre d'Oxygen en début de mot : voir
+    // `engine::mots_pour_debut_de_mot`. NULL rend NULL, comme `unaccent`.
+    conn.create_scalar_function(
+        "tune_mots_debut",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let s: Option<String> = ctx.get(0)?;
+            Ok(s.map(|v| crate::db::engine::mots_pour_debut_de_mot(&v)))
+        },
+    )
+    .map_err(|e| format!("register tune_mots_debut: {e}"))?;
     // #5192 — les termes de chemin, en Rust, pour les passes EN MASSE
     // (reconstruction de `tracks_fts`, texte libre d'Oxygen). Les
     // déclencheurs, eux, gardent l'expression SQL pure : une base éditée au

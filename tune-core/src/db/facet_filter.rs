@@ -260,25 +260,6 @@ pub fn mots_du_texte_libre(query: &str) -> Vec<String> {
         .collect()
 }
 
-/// La ponctuation qui sépare deux mots dans un champ comparé par le texte
-/// libre (#7619) : remplacée par une espace avant le `LIKE '% mot%'`, pour que
-/// « (Valerie June) », « Saint-Saëns » ou « AC/DC » commencent bien un mot
-/// après chacun de ces signes.
-const SEPARATEURS_DE_MOTS: [&str; 12] =
-    ["(", ")", "[", "]", "-", "/", ".", ",", "'", "’", "&", ":"];
-
-/// `expr` réduit pour une comparaison en DÉBUT DE MOT (#7619) : sans accents
-/// ni casse, la ponctuation de [`SEPARATEURS_DE_MOTS`] changée en espace, et
-/// une espace en tête. Le motif `% mot%` y trouve alors le début du champ ou
-/// le début de n'importe lequel de ses mots — jamais le milieu d'un mot.
-fn en_debut_de_mot(expr: &str) -> String {
-    let mut sql = format!("LOWER(unaccent({expr}))");
-    for sep in SEPARATEURS_DE_MOTS {
-        sql = format!("REPLACE({sql}, '{}', ' ')", sep.replace('\'', "''"));
-    }
-    format!("(' ' || {sql})")
-}
-
 /// Le prédicat du texte libre d'Oxygen et de la Bibliothèque, pour la piste
 /// d'alias `t`.
 ///
@@ -348,7 +329,8 @@ pub fn condition_texte_libre(
         let chef = like(ph);
         let chef_credit = like(ph);
         let chef_album = like(ph);
-        let champ = en_debut_de_mot;
+        let engine = ph.engine();
+        let champ = |expr: &str| super::engine::expr_mots_debut(engine, expr);
         clauses.push(format!(
             "({} {titre} \
              OR t.artist_id IN (SELECT id FROM artists WHERE {} {artiste}) \
@@ -371,9 +353,9 @@ pub fn condition_texte_libre(
             // DISTINCTES, la piste par égalité. Même ensemble (une valeur NULL
             // n'est ni `LIKE` ni `IN`), sans la fonction `unaccent` rejouée
             // sur chaque piste.
-            valeur_distincte_like("label", &label),
+            valeur_distincte_like(engine, "label", &label),
             champ(&termes),
-            valeur_distincte_like("composer", &compositeur),
+            valeur_distincte_like(engine, "composer", &compositeur),
             champ("ar.name"),
             champ("value"),
             champ("artist_name"),
@@ -389,16 +371,16 @@ pub fn condition_texte_libre(
 }
 
 /// `t.{colonne}` vaut l'une des valeurs DISTINCTES de la colonne dont
-/// la forme [`en_debut_de_mot`] satisfait `motif` (`LIKE …`, échappement
+/// la forme [`super::engine::expr_mots_debut`] satisfait `motif` (`LIKE …`, échappement
 /// compris) — #7619 (L3). Le dictionnaire est MATÉRIALISÉ : sans cela, SQLite
 /// pousse le filtre dans le `SELECT DISTINCT` et rejoue `unaccent` sur chaque
 /// piste. `colonne` est un nom écrit par le code, jamais une saisie.
-fn valeur_distincte_like(colonne: &str, motif: &str) -> String {
+fn valeur_distincte_like(engine: Engine, colonne: &str, motif: &str) -> String {
     format!(
         "t.{colonne} IN (WITH dico AS MATERIALIZED \
          (SELECT DISTINCT {colonne} AS v FROM tracks WHERE {colonne} IS NOT NULL) \
          SELECT dico.v FROM dico WHERE {} {motif})",
-        en_debut_de_mot("dico.v")
+        super::engine::expr_mots_debut(engine, "dico.v")
     )
 }
 
@@ -1726,7 +1708,7 @@ mod tests {
                      (SELECT DISTINCT composer AS v FROM tracks WHERE composer IS NOT NULL) \
                      SELECT dico.v FROM dico WHERE {} \
                      LIKE LOWER(unaccent({sixieme})){esc}) OR",
-                    super::en_debut_de_mot("dico.v")
+                    crate::db::engine::expr_mots_debut(engine, "dico.v")
                 )),
                 "{engine:?} : le compositeur, sixième : {sql}"
             );

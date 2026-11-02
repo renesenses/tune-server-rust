@@ -82,6 +82,39 @@ pub fn fold_diacritics(s: &str) -> String {
         .collect()
 }
 
+/// #7619 (L3) — un champ réduit pour la comparaison en DÉBUT DE MOT du texte
+/// libre : accents ôtés ([`fold_diacritics`]), casse repliée comme le
+/// `LOWER()` de SQLite (ASCII), tout ce qui n'est ni lettre ni chiffre changé
+/// en espace, et une espace en tête. Le motif `% mot%` y trouve le début du
+/// champ ou celui de n'importe lequel de ses mots, jamais le milieu d'un mot.
+///
+/// Fonction SQLite `tune_mots_debut(texte)` (une seule passe en Rust par champ
+/// et par piste, au lieu de `LOWER(unaccent(…))` et d'une chaîne de
+/// `REPLACE`). PostgreSQL a son équivalent en SQL natif, voir
+/// [`expr_mots_debut`].
+pub fn mots_pour_debut_de_mot(s: &str) -> String {
+    let mut sortie = String::with_capacity(s.len() + 1);
+    sortie.push(' ');
+    for c in fold_diacritics(s).chars() {
+        if c.is_alphanumeric() {
+            sortie.push(c.to_ascii_lowercase());
+        } else {
+            sortie.push(' ');
+        }
+    }
+    sortie
+}
+
+/// L'expression SQL de [`mots_pour_debut_de_mot`] appliquée à `expr`.
+pub fn expr_mots_debut(engine: Engine, expr: &str) -> String {
+    match engine {
+        Engine::Sqlite => format!("tune_mots_debut({expr})"),
+        Engine::Postgres => {
+            format!("(' ' || regexp_replace(LOWER(unaccent({expr})), '[^[:alnum:]]+', ' ', 'g'))")
+        }
+    }
+}
+
 /// Format a user-supplied search query for the engine's FTS dialect.
 ///
 /// Punctuation is a **separator**, matching how the index was tokenised:
@@ -849,6 +882,19 @@ mod tests {
     fn format_fts_query_single_word() {
         assert_eq!(format_fts_query(Engine::Sqlite, "miles"), "miles*");
         assert_eq!(format_fts_query(Engine::Postgres, "miles"), "miles:*");
+    }
+
+    /// #7619 — le champ réduit du texte libre : accents, casse ASCII, toute
+    /// ponctuation en espace, une espace en tête.
+    #[test]
+    fn mots_pour_debut_de_mot_7619() {
+        assert_eq!(mots_pour_debut_de_mot("Re:member"), " re member");
+        assert_eq!(
+            mots_pour_debut_de_mot("Saint-Saëns (AC/DC)"),
+            " saint saens  ac dc "
+        );
+        assert_eq!(mots_pour_debut_de_mot("Dvořák"), " dvorak");
+        assert_eq!(mots_pour_debut_de_mot(""), " ");
     }
 
     /// #7619 (L3) — décision du 01/11/2026 : CHAQUE mot saisi est un début
