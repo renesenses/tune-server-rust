@@ -36,8 +36,8 @@
 //! couche n'autorise plus que : les origines natives, la même origine, et, pour
 //! les autres origines, la seule lecture (`GET`/`HEAD`) du catalogue
 //! `/api/v1/library/` dont a besoin le parcours d'un autre serveur Tune, et
-//! la seule lecture de la sonde publique `/api/v1/system/health` par la page
-//! des radios du site ([`ORIGINE_DU_SITE`]).
+//! la seule lecture, par la page des radios du site ([`ORIGINE_DU_SITE`]), des
+//! deux chemins exacts qu'elle interroge ([`LECTURES_DU_SITE`]).
 //!
 //! `TUNE_ALLOWED_ORIGINS` (liste séparée par des virgules, réglée par
 //! l'exploitant, jamais par HTTP) ajoute des origines de confiance, par
@@ -65,15 +65,25 @@ pub const VARIABLE_ORIGINES: &str = "TUNE_ALLOWED_ORIGINS";
 /// Préfixe du catalogue lisible depuis une autre origine (`GET`/`HEAD`).
 pub const CATALOGUE_PUBLIC: &str = "/api/v1/library/";
 
-/// La page publique des radios du site (#370, #7044) lit, depuis le
-/// navigateur, la sonde publique du serveur local pour afficher « Connecté à
-/// <nom> ». Seule cette origine, seule cette route, en lecture seule : la
-/// route ne demande aucun jeton, la couche n'ouvre que la LECTURE de sa
-/// réponse à ce site-là.
+/// La page publique des radios du site (#370, #7044) interroge, depuis le
+/// navigateur, le serveur local : la sonde publique, pour afficher « Connecté
+/// à <nom> », et la liste « Mes radios », pour marquer les stations déjà
+/// présentes ou favorites. Seule cette origine, seuls ces chemins exacts, en
+/// lecture seule : la couche n'ouvre que la LECTURE de leur réponse à ce
+/// site-là.
 pub const ORIGINE_DU_SITE: &str = "https://mozaiklabs.fr";
 
 /// La sonde publique que lit [`ORIGINE_DU_SITE`] (chemin exact).
 pub const SONDE_PUBLIQUE: &str = "/api/v1/system/health";
+
+/// La liste « Mes radios » que lit [`ORIGINE_DU_SITE`] (chemin exact).
+pub const MES_RADIOS: &str = "/api/v1/radios";
+
+/// Les chemins exacts que [`ORIGINE_DU_SITE`] peut lire
+/// (`site-mozaiklabs/resources/js/lib/tuneServer.ts`). L'ajout d'une station
+/// depuis le site est une navigation (`/api/v1/radios/add`), pas une lecture :
+/// il n'a pas besoin de CORS et n'est pas ici.
+pub const LECTURES_DU_SITE: &[&str] = &[SONDE_PUBLIQUE, MES_RADIOS];
 
 const SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
@@ -252,8 +262,9 @@ pub fn cors_autorise(origine: &HeaderValue, parts: &Parts) -> bool {
     if parts.uri.path().starts_with(CATALOGUE_PUBLIC) {
         return true;
     }
-    // La sonde publique, pour la page des radios du site, et pour lui seul.
-    parts.uri.path() == SONDE_PUBLIQUE
+    // La sonde et « Mes radios », pour la page des radios du site, et pour
+    // lui seul.
+    LECTURES_DU_SITE.contains(&parts.uri.path())
         && origine
             .trim()
             .trim_end_matches('/')
@@ -335,43 +346,55 @@ mod tests {
     }
 
     #[test]
-    fn le_site_ne_lit_que_la_sonde_publique() {
+    fn le_site_ne_lit_que_la_sonde_et_mes_radios() {
         let site = HeaderValue::from_static(ORIGINE_DU_SITE);
         let autre = HeaderValue::from_static("https://exemple.invalid");
         let hote = [("host", "192.168.1.18:8888")];
-        assert!(cors_autorise(
-            &site,
-            &parts(Method::GET, SONDE_PUBLIQUE, &hote)
-        ));
-        assert!(cors_autorise(
-            &site,
-            &parts(Method::GET, "/api/v1/system/health?x=1", &hote)
-        ));
-        // Une autre origine ne lit pas la sonde.
-        assert!(!cors_autorise(
-            &autre,
-            &parts(Method::GET, SONDE_PUBLIQUE, &hote)
-        ));
-        // Le site ne lit rien d'autre, et n'écrit pas.
+        for chemin in [SONDE_PUBLIQUE, MES_RADIOS, "/api/v1/system/health?x=1"] {
+            for m in [Method::GET, Method::HEAD] {
+                assert!(
+                    cors_autorise(&site, &parts(m.clone(), chemin, &hote)),
+                    "{m} {chemin}"
+                );
+                // Une autre origine ne les lit pas.
+                assert!(
+                    !cors_autorise(&autre, &parts(m.clone(), chemin, &hote)),
+                    "{m} {chemin}"
+                );
+            }
+        }
+        // Le site ne lit rien d'autre.
         for chemin in [
             "/api/v1/system/config",
             "/api/v1/system/health/monitor",
             "/api/v1/system/logs",
+            "/api/v1/radios/favorites",
+            "/api/v1/radios/1",
+            "/api/v1/radios/add",
         ] {
             assert!(
                 !cors_autorise(&site, &parts(Method::GET, chemin, &hote)),
                 "{chemin}"
             );
         }
-        let preflight = parts(
-            Method::OPTIONS,
-            SONDE_PUBLIQUE,
-            &[
-                ("host", "192.168.1.18:8888"),
-                ("access-control-request-method", "POST"),
-            ],
-        );
-        assert!(!cors_autorise(&site, &preflight));
+        // Et n'écrit nulle part, ni directement ni par préflight.
+        for chemin in [SONDE_PUBLIQUE, MES_RADIOS] {
+            for m in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+                assert!(
+                    !cors_autorise(&site, &parts(m.clone(), chemin, &hote)),
+                    "{m} {chemin}"
+                );
+                let preflight = parts(
+                    Method::OPTIONS,
+                    chemin,
+                    &[
+                        ("host", "192.168.1.18:8888"),
+                        ("access-control-request-method", m.as_str()),
+                    ],
+                );
+                assert!(!cors_autorise(&site, &preflight), "préflight {m} {chemin}");
+            }
+        }
     }
 
     #[test]
