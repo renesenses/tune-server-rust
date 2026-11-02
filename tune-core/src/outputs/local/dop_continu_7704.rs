@@ -35,6 +35,7 @@ struct Banc {
     data_started: AtomicBool,
     ramp: crate::audio::soft_mute::SoftMuteRamp,
     au_dac: Vec<f32>,
+    periode: usize,
 }
 
 impl Banc {
@@ -47,12 +48,13 @@ impl Banc {
             data_started: AtomicBool::new(false),
             ramp: crate::audio::soft_mute::SoftMuteRamp::new(TAUX, CANAUX),
             au_dac: Vec::new(),
+            periode: PERIODE,
         }
     }
 
     fn periodes(&mut self, n: usize) {
         for _ in 0..n {
-            let mut tampon = vec![0.123f32; PERIODE];
+            let mut tampon = vec![0.123f32; self.periode];
             render_local_shared_f32_callback(
                 &self.ring,
                 &self.volume,
@@ -61,7 +63,7 @@ impl Banc {
                 &self.data_started,
                 &mut self.ramp,
                 0, // DoP : rampe désarmée (`soft_mute::armed_ms`)
-                PERIODE,
+                self.periode,
                 &mut tampon,
             );
             self.au_dac.extend_from_slice(&tampon);
@@ -167,4 +169,20 @@ fn un_flux_pcm_garde_son_silence_de_zeros() {
     b.periodes(2);
     assert!(b.au_dac[PERIODE * 4..].iter().all(|&s| s == 0.0));
     assert_eq!(&b.au_dac[..PERIODE * 4], &pcm[..]);
+}
+
+/// Période d'un nombre IMPAIR de trames (255) : une pause d'une période finit
+/// sur le marqueur que la première trame réelle porterait à la reprise. Sans
+/// le raccord, deux marqueurs identiques se suivraient au DAC.
+#[test]
+fn une_pause_de_longueur_impaire_est_raccordee() {
+    let mut b = Banc::monter();
+    b.periode = 255 * CANAUX as usize;
+    b.ring.push(&dop_f32(4_000, 0xC3));
+    b.periodes(2);
+    b.paused.store(true, Ordering::Relaxed);
+    b.periodes(1);
+    b.paused.store(false, Ordering::Relaxed);
+    b.periodes(3);
+    b.juger();
 }
