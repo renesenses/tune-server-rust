@@ -6,7 +6,7 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "collection-physique", "mon-theme", "aes67"]
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
 local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture"]
@@ -84,6 +84,27 @@ entree-audio = ["dep:tune-entree-audio"]
 # fournisseur n'est réglé. Inscrit à `sdk/plugins.json`, d'où les lignes de
 # build et de test des workflows sont générées.
 assistant-ia = ["dep:tune-assistant-ia"]
+# « Ma collection physique » (#7195) : la collection Discogs de l'utilisateur
+# comparée à la bibliothèque et à Qobuz / TIDAL. Dans `default` comme `cd` :
+# opt-in à l'exécution (`default_enabled = false`), au catalogue, gratuit.
+# Inscrit à `sdk/plugins.json`.
+collection-physique = ["dep:tune-collection-physique"]
+# « Mon thème » (tune-web-client#2527, rc10) : toutes les couleurs de
+# l'interface au choix, rangées par profil. Dans `default` comme `cd` : opt-in
+# à l'exécution (`default_enabled = false`), au catalogue, gratuit. Inscrit à
+# `sdk/plugins.json`.
+mon-theme = ["dep:tune-mon-theme"]
+# Sortie AES67 (#7336) — Premium (`Feature::Aes67`), EXPÉRIMENTALE dans la
+# rc10 (Bertrand, 31/10/2026). Dans `default` et dans `sdk/plugins.json`, donc
+# compilée dans les binaires publiés, mais DÉSACTIVÉE par défaut à
+# l'exécution : greffon opt-in (`default_enabled = false`) et hors catalogue,
+# il ne s'éveille que par le réglage « Expérimental › Sortie AES67
+# (Dante/Ravenna) » du client web (`plugin_aes67_installed`). Désactivé, son
+# `setup` n'est jamais appelé : aucun socket PTP/SAP/RTP, aucune zone
+# (`plugins/tune-aes67/tests/garde_experimentale.rs`). Linux seul (Bertrand,
+# 30/10/2026) : la dépendance n'est déclarée que pour `target_os = "linux"`
+# (plus bas) ; allumée ailleurs, la feature ne compile rien.
+aes67 = ["dep:tune-aes67"]
 
 [dependencies]
 tune-plugin-native = { path = "../sdk/tune-plugin-native" }
@@ -111,6 +132,9 @@ tune-entree-audio = { path = "../plugins/tune-entree-audio", optional = true }
 tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tune-pont-roon = { path = "../plugins/tune-pont-roon", optional = true }
 tune-assistant-ia = { path = "../plugins/tune-assistant-ia", optional = true }
+tune-collection-physique = { path = "../plugins/tune-collection-physique", optional = true }
+
+tune-mon-theme = { path = "../plugins/tune-mon-theme", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
@@ -153,6 +177,11 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }
 dotenvy = { workspace = true }
+
+# Sortie AES67 (#7336) : Linux seul pour la première version. Voir la feature
+# `aes67` plus haut.
+[target.'cfg(target_os = "linux")'.dependencies]
+tune-aes67 = { path = "../plugins/tune-aes67", optional = true }
 
 [dev-dependencies]
 tower = "0.5"
@@ -207,6 +236,11 @@ tune-core = { path = "../tune-core", default-features = false, features = [
     "services-factices",
 ] }
 
+# #7642 — un profil de correction de pièce appliqué atteint le DSP de la zone.
+[[test]]
+name = "correction_de_piece_appliquee_7642"
+path = "tests/correction_de_piece_appliquee_7642.rs"
+
 # Purge à froid de la mémoire libre gardée par la glibc : binaire à part, le
 # RSS mesure tout le processus.
 [[test]]
@@ -231,6 +265,12 @@ path = "tests/pont_lien_d_acces.rs"
 name = "pont_administration"
 path = "tests/pont_administration.rs"
 
+# Une requête relayée n'est pas locale et n'atteint que les routes d'écoute.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "relais_routes_relayables"
+path = "tests/relais_routes_relayables.rs"
+
 # #3326 — le mode de transition (un `client/hello` en clair). `autotests =
 # false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
 # la contre-épreuve qui garde le chemin chiffré ne serait exécutée par personne.
@@ -242,6 +282,14 @@ path = "tests/sendspin_mode_transition.rs"
 [[test]]
 name = "agent_tune_4626"
 path = "tests/agent_tune_4626.rs"
+
+# #7335 — les écritures des dossiers de collections refusées par la base ne
+# répondent plus 201/200. Cible propre (pas un `mod` de `server_contracts`) :
+# `autotests = false` plus haut, sans cette entrée le fichier n'est jamais
+# compilé.
+[[test]]
+name = "collections_ecriture_7335"
+path = "tests/collections_ecriture_7335.rs"
 
 [[test]]
 name = "server_contracts"
@@ -438,6 +486,12 @@ path = "tests/radios_upnp_hors_des_pistes_6500.rs"
 [[test]]
 name = "plugin_contracts"
 path = "tests/plugin_contracts.rs"
+
+# #7470 — désinstaller un greffon natif actif d'office. `autotests = false`
+# plus haut : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "plugin_natif_desinstallation_7470"
+path = "tests/plugin_natif_desinstallation_7470.rs"
 
 [[test]]
 name = "plugin_wasm_contracts"
@@ -890,6 +944,11 @@ path = "tests/radio_ajout_web_sans_doublon_3543.rs"
 name = "radios_recherche_distinction"
 path = "tests/radios_recherche_distinction.rs"
 
+# #7466 — recherche de radios par critères (`/radios/search`, `/radios/directory`).
+[[test]]
+name = "radios_criteres_7466"
+path = "tests/radios_criteres_7466.rs"
+
 # #7044 — le nom du serveur (page publique des radios). `autotests = false` :
 # sans cette inscription, le fichier ne serait jamais compilé.
 [[test]]
@@ -1037,6 +1096,11 @@ path = "tests/podcast_sortie_reseau_6468.rs"
 [[test]]
 name = "historique_conteneurs_6466"
 path = "tests/historique_conteneurs_6466.rs"
+# #6465 — `album-en-cours` lit le conteneur de la ligne jouée avant la session.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "album_en_cours_ligne_jouee_6465"
+path = "tests/album_en_cours_ligne_jouee_6465.rs"
 # #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
 # que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
 # une variable d'environnement que plus aucune etape ne pose. `autotests =
@@ -1722,6 +1786,12 @@ path = "tests/sso_deconnexion_efface_la_liaison_5326.rs"
 name = "sso_modules_du_compte"
 path = "tests/sso_modules_du_compte.rs"
 
+# #7419 — sur une nouvelle machine, la connexion au compte suffit : le statut
+# de licence dit que le Premium vient du compte (`premium_source`).
+[[test]]
+name = "licence_par_le_compte_7419"
+path = "tests/licence_par_le_compte_7419.rs"
+
 # #5682 — les gardes du montage SMB (#1834, #1916) et l'ordre « remonter les
 # partages, PUIS scanner » de `bootstrap.rs`. Le fichier existait sans cible :
 # `autotests = false` ne l'avait jamais compilé (relevé pendant #5682).
@@ -1861,3 +1931,17 @@ path = "tests/ecoutes_communaute_6738.rs"
 [[test]]
 name = "groupe_dlna_joue_sur_les_deux_6155"
 path = "tests/groupe_dlna_joue_sur_les_deux_6155.rs"
+
+# #7077, seconde passe — un refus jadis composé en français suit la langue de
+# l'interface (code stable + phrase traduite). `autotests = false` plus haut :
+# sans cette cible, le témoin ne serait JAMAIS compilé.
+[[test]]
+name = "messages_seconde_passe_7077"
+path = "tests/messages_seconde_passe_7077.rs"
+
+# Durcissement de la configuration : écritures génériques de `settings` et
+# contrôle d'origine, par le vrai routeur. `autotests = false` plus haut : sans
+# cette cible, le banc ne serait JAMAIS compilé.
+[[test]]
+name = "durcissement_configuration"
+path = "tests/durcissement_configuration.rs"

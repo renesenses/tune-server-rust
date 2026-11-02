@@ -374,6 +374,11 @@ impl<'a> IndexAnnuaire<'a> {
             if let Some(id) = f.external_id.as_deref() {
                 par_id.entry(id.to_string()).or_insert(i);
             }
+            // #7500 — l'ancienne clé `mozaiklabs:ID` d'une fiche qui a reçu
+            // un numéro : un lien enregistré avant retrouve encore sa fiche.
+            if let Some(cle) = f.cle_locale.as_deref() {
+                par_id.entry(cle.to_string()).or_insert(i);
+            }
             for u in std::iter::once(&f.stream_url).chain(f.stream_urls.iter()) {
                 par_flux.entry(flux_normalise(u)).or_insert(i);
             }
@@ -516,8 +521,10 @@ pub fn rattacher_a_l_annuaire(state: &AppState, corps: &mut Value) {
 
 /// Le rapprochement de départ : chaque station SANS lien dont l'adresse de
 /// flux est, à la normalisation près, celle d'une fiche reçoit son
-/// `external_id`. Idempotent : un lien déjà posé n'est jamais réécrit.
-/// Rend le nombre de liens posés.
+/// `external_id`. Idempotent : un lien déjà posé n'est jamais réécrit, sauf
+/// (#7500) un lien vers l'ancienne clé `mozaiklabs:ID` d'une fiche qui porte
+/// désormais un numéro : il devient ce numéro, la fiche reste la même.
+/// Rend le nombre de liens posés ou réécrits.
 ///
 /// ⛔ Jamais par le NOM seul (revue de #6538). `refresh_radio_logos` lie AVANT
 /// de choisir les logos, et `logo_a_poser` fait confiance au lien : un lien
@@ -532,7 +539,15 @@ pub fn lier_les_stations(repo: &RadioRepo, fiches: &[StationAnnuaire]) -> usize 
     let mut poses = 0;
     for st in repo.list().unwrap_or_default() {
         let Some(id) = st.id else { continue };
-        if liens.contains_key(&id) {
+        if let Some(ancien) = liens.get(&id) {
+            if let Some((i, Lien::Id)) = index.lien(Some(ancien), &st.name, &st.url)
+                && let Some(nouveau) = index.fiche(i).and_then(|f| f.external_id.as_deref())
+                && nouveau != ancien.trim()
+                && repo.lier_a_l_annuaire(id, Some(nouveau)).is_ok()
+            {
+                tracing::info!(id, ancien = %ancien, nouveau, "radio_annuaire_lien_reecrit");
+                poses += 1;
+            }
             continue;
         }
         if let Some((i, Lien::Flux)) = index.lien(None, &st.name, &st.url)
@@ -572,13 +587,40 @@ pub fn router() -> Router<AppState> {
 pub struct FiltresAnnuaire {
     pub q: Option<String>,
     pub country: Option<String>,
+    /// #7466 — un genre, ou plusieurs séparés par des virgules (en OU).
     pub genre: Option<String>,
     pub offset: Option<usize>,
     pub limit: Option<usize>,
+    /// #7466 — les critères de [`super::radios_criteres_7466::Criteres`].
+    pub codec: Option<String>,
+    pub bitrate_min: Option<i32>,
+    pub lossless: Option<bool>,
+    pub hires: Option<bool>,
+    pub favorites_only: Option<bool>,
+    pub rated_min: Option<f64>,
+    pub metadata_plus: Option<bool>,
+}
+
+impl FiltresAnnuaire {
+    pub fn criteres(&self) -> super::radios_criteres_7466::Criteres {
+        super::radios_criteres_7466::Criteres::depuis(
+            self.genre.as_deref(),
+            self.country.as_deref(),
+            self.codec.as_deref(),
+            self.bitrate_min,
+            self.lossless,
+            self.hires,
+            self.favorites_only,
+            self.rated_min,
+            self.metadata_plus,
+        )
+    }
 }
 
 const LIMITE_PAR_DEFAUT: usize = 120;
 const LIMITE_MAX: usize = 1000;
+
+use super::radios_criteres_7466::Criteres;
 
 fn repli(s: &str) -> String {
     tune_core::db::engine::fold_diacritics(s).to_lowercase()
@@ -604,22 +646,15 @@ fn correspond(f: &StationAnnuaire, motif: &str) -> bool {
         })
 }
 
-fn meme_pays(f: &StationAnnuaire, pays: Option<&str>) -> bool {
-    pays.is_none_or(|p| {
-        f.country
-            .as_deref()
-            .is_some_and(|c| c.eq_ignore_ascii_case(p))
-    })
+fn meme_pays(f: &StationAnnuaire, criteres: &Criteres) -> bool {
+    criteres.pays_ok(f.country.as_deref())
 }
 
 /// #7215 — vrai si le genre demandé est L'UN des genres de la fiche
 /// (`genres`, sinon `genre`) : « OuiFM Blues & Rock » sort sous blues ET rock.
-fn meme_genre(f: &StationAnnuaire, genre: Option<&str>) -> bool {
-    genre.is_none_or(|g| {
-        f.genres_ou_genre()
-            .iter()
-            .any(|x| x.eq_ignore_ascii_case(g))
-    })
+/// #7466 — plusieurs genres demandés : l'un d'eux suffit.
+fn meme_genre(f: &StationAnnuaire, criteres: &Criteres) -> bool {
+    criteres.genre_ok(&f.genres_ou_genre())
 }
 
 /// Le corps de `GET /radios/directory`, calculé hors de toute requête réseau.
@@ -642,16 +677,7 @@ pub fn corps_annuaire_avec_liens(
     etat: &EtatAnnuaire,
 ) -> Value {
     let motif = repli(filtres.q.as_deref().unwrap_or("").trim());
-    let pays = filtres
-        .country
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let genre = filtres
-        .genre
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let criteres = filtres.criteres();
 
     // L'inverse du rapprochement : pour chaque fiche, la station locale.
     let index = IndexAnnuaire::new(fiches);
@@ -663,23 +689,27 @@ pub fn corps_annuaire_avec_liens(
         }
     }
 
+    // #7466 — les critères sans facette (format, débit, favoris…) bornent la
+    // recherche ELLE-MÊME : les facettes de pays et de genre se comptent
+    // dessus, et le compteur dit ce que l'écran montrera.
     let qui_cherchent: Vec<(usize, &StationAnnuaire)> = fiches
         .iter()
         .enumerate()
         .filter(|(_, f)| correspond(f, &motif))
+        .filter(|(i, f)| criteres.autres_ok_pour_la_fiche(f, locales.get(i).map(|s| s.is_favorite)))
         .collect();
     // Les facettes se comptent sur la recherche ET l'autre filtre : choisir un
     // pays montre les genres de ce pays, et réciproquement.
     let mut pays_comptes: BTreeMap<String, usize> = BTreeMap::new();
     let mut genres_comptes: BTreeMap<String, usize> = BTreeMap::new();
     for (_, f) in &qui_cherchent {
-        if meme_genre(f, genre)
+        if meme_genre(f, &criteres)
             && let Some(c) = f.country.as_deref()
         {
             *pays_comptes.entry(c.to_ascii_uppercase()).or_default() += 1;
         }
         // #7215 — une fiche compte dans CHACUN de ses genres (une fois chacun).
-        if meme_pays(f, pays) {
+        if meme_pays(f, &criteres) {
             let mut vus: Vec<String> = Vec::new();
             for g in f.genres_ou_genre() {
                 let cle = g.to_ascii_lowercase();
@@ -692,7 +722,7 @@ pub fn corps_annuaire_avec_liens(
     }
     let retenues: Vec<(usize, &StationAnnuaire)> = qui_cherchent
         .into_iter()
-        .filter(|(_, f)| meme_pays(f, pays) && meme_genre(f, genre))
+        .filter(|(_, f)| meme_pays(f, &criteres) && meme_genre(f, &criteres))
         .collect();
 
     let total = retenues.len();
@@ -731,6 +761,9 @@ pub fn corps_annuaire_avec_liens(
                 "now_playing": f.radio_metadata_key.is_some(),
                 "my_radio_id": locale.and_then(|s| s.id),
                 "my_radio_favorite": locale.map(|s| s.is_favorite),
+                // #7466 — la note radio-metadata.fr, quand la fiche en a une.
+                "avg_rating": f.note_centiemes.map(|n| f64::from(n) / 100.0),
+                "rating_count": f.nombre_de_notes,
             })
         })
         .collect();
@@ -812,12 +845,12 @@ async fn forcer_le_releve(State(state): State<AppState>) -> Json<Value> {
 }
 
 fn fiche_par_id(state: &AppState, external_id: &str) -> Option<StationAnnuaire> {
-    state
-        .annuaire_radios
-        .read()
-        .ok()?
+    let fiches = state.annuaire_radios.read().ok()?;
+    fiches
         .iter()
         .find(|f| f.external_id.as_deref() == Some(external_id))
+        // #7500 — l'ancienne clé `mozaiklabs:ID` d'une fiche numérotée depuis.
+        .or_else(|| fiches.iter().find(|f| f.porte_la_cle(external_id)))
         .cloned()
 }
 
@@ -877,7 +910,11 @@ async fn ajouter(
     let index = IndexAnnuaire::new(&unique);
     let existante = mes_radios
         .iter()
-        .find(|st| st.id.and_then(|id| liens.get(&id)) == Some(&external_id))
+        .find(|st| {
+            st.id
+                .and_then(|id| liens.get(&id))
+                .is_some_and(|lien| *lien == external_id || fiche.porte_la_cle(lien))
+        })
         .or_else(|| {
             mes_radios.iter().find(|st| {
                 st.id.is_some_and(|id| !liens.contains_key(&id))
@@ -919,6 +956,14 @@ async fn ajouter(
         && let Err(e) = repo.lier_a_l_annuaire(id, Some(&external_id))
     {
         tracing::warn!(erreur = %e, id, "radio_annuaire_lien_non_pose");
+    }
+    // #7500 — un lien vers l'ancienne clé `mozaiklabs:ID` prend le numéro de la fiche.
+    if let (Some(ancien), Some(nouveau)) = (liens.get(&id), fiche.external_id.as_deref())
+        && ancien != nouveau
+        && fiche.porte_la_cle(ancien)
+        && let Err(e) = repo.lier_a_l_annuaire(id, Some(nouveau))
+    {
+        tracing::warn!(erreur = %e, id, "radio_annuaire_lien_non_reecrit");
     }
     if favori && repo.set_favorite(id, true).is_ok() {
         state.event_bus.emit(
@@ -1130,3 +1175,7 @@ mod tests_recherche_7198;
 #[cfg(test)]
 #[path = "radios_format_mis_a_jour_6973_tests.rs"]
 mod format_mis_a_jour_6973;
+
+#[cfg(test)]
+#[path = "radios_cle_mozaiklabs_7500_tests.rs"]
+mod cle_mozaiklabs_7500;

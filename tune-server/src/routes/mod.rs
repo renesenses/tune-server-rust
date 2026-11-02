@@ -13,6 +13,8 @@ pub mod canaux_de_carte;
 pub mod cd_rip;
 pub mod cloud;
 pub mod cloud_error;
+#[cfg(test)]
+mod compression_tests_7619;
 pub mod connect;
 pub(crate) mod convert_destination;
 pub mod converter;
@@ -77,6 +79,7 @@ pub mod profil_par_appareil;
 pub mod profiles;
 pub mod radios;
 pub mod radios_annuaire;
+pub mod radios_criteres_7466;
 pub mod radios_libelles;
 pub mod room_calibration;
 pub mod room_correction;
@@ -127,7 +130,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::state::AppState;
@@ -221,6 +223,41 @@ async fn demo_library(
         "albums": albums,
     }))
     .into_response()
+}
+
+/// Ce que la couche de compression gzip a le droit de compresser — #7619, L5.
+///
+/// Le prédicat par défaut de `tower-http` écarte déjà les images, le SSE, le
+/// gRPC et les corps de moins de 32 octets. Il laissait passer **l'audio** :
+/// `/library/tracks/{id}/audio` (et tout flux servi par ce routeur) était
+/// gzippé dès que le client envoyait `Accept-Encoding: gzip`, ce que fait tout
+/// `fetch()` de navigateur. Compresser du FLAC ou du MP3 coûte du processeur
+/// pour un gain nul, et une réponse partielle (`206`, `Content-Range`) dont on
+/// compresse les octets n'a plus les bornes qu'elle annonce.
+///
+/// Le JSON de la Bibliothèque, lui, reste compressé : c'est l'essentiel du
+/// poids d'une page d'albums.
+pub(crate) fn predicat_de_compression() -> impl tower_http::compression::Predicate {
+    use tower_http::compression::Predicate;
+    use tower_http::compression::predicate::{DefaultPredicate, NotForContentType};
+    DefaultPredicate::new()
+        .and(NotForContentType::const_new("audio/"))
+        .and(NotForContentType::const_new("video/"))
+        .and(NotForContentType::const_new("application/octet-stream"))
+        .and(NotForContentType::const_new("application/ogg"))
+        .and(NotForContentType::const_new(
+            "application/vnd.apple.mpegurl",
+        ))
+        .and(NotForContentType::const_new("application/x-mpegurl"))
+        .and(
+            |status: StatusCode,
+             _: axum::http::Version,
+             headers: &axum::http::HeaderMap,
+             _: &axum::http::Extensions| {
+                status != StatusCode::PARTIAL_CONTENT
+                    && !headers.contains_key(axum::http::header::CONTENT_RANGE)
+            },
+        )
 }
 
 async fn cache_control_middleware(
@@ -731,11 +768,22 @@ pub fn router_with_plugins(
         }),
     )
     .fallback_service(service_statique_spa(std::path::Path::new(&web_dir)))
+    // Une requête rejouée par le relais ou l'écoute directe n'atteint que les
+    // routes d'écoute : voir `garde_du_relais`. Sur TOUT le routeur, `/stream`
+    // et `/ws` compris, avant tout gestionnaire.
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::garde_du_relais::garde_du_relais,
+    ))
     .layer(axum::middleware::from_fn(zones::textes_signal::avec_langue))
     .layer(axum::middleware::from_fn(cache_control_middleware))
     .layer(axum::Extension(contexte_sendspin))
-    .layer(CompressionLayer::new())
-    .layer(CorsLayer::permissive())
+    .layer(CompressionLayer::new().compress_when(predicat_de_compression()))
+    // Contrôle d'origine (`crate::garde_origine`) : une page d'un autre site
+    // ne peut ni changer l'état du serveur, ni lire ses réponses. La couche
+    // CORS est la plus externe : elle répond seule aux préflights.
+    .layer(axum::middleware::from_fn(crate::garde_origine::garde))
+    .layer(crate::garde_origine::couche_cors())
 }
 
 #[cfg(test)]

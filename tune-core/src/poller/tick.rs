@@ -13,6 +13,19 @@ impl PositionPoller {
                 if let Err(e) = crate::db::listening_resume::track_position(&self.db, s) {
                     tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_titre_non_enregistree");
                 }
+                // #7415 : la dernière piste d'un album / d'une playlist arrive à
+                // sa fin (30 dernières secondes ou 95 %) : sa reprise s'en va.
+                if let Some(np) = s.now_playing.as_ref().filter(|np| np.source != "podcast")
+                    && let Err(e) = crate::db::listening_resume::contexte_fini(
+                        &self.db,
+                        s.zone_id,
+                        np,
+                        s.position_ms,
+                        false,
+                    )
+                {
+                    tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_contexte_non_retiree");
+                }
                 if let Some(np) = s.now_playing.as_ref().filter(|np| np.source == "podcast") {
                     if let Err(e) = crate::db::listening_resume::podcast_started_in_context(
                         &self.db,
@@ -559,6 +572,15 @@ impl PositionPoller {
                     // lecture » pour toujours, barre de progression comprise,
                     // alors que le démarrage avait déjà renoncé à envoyer quoi
                     // que ce soit (`output_sent=false`, #2630).
+                    // #6932 — la piste est finie, servie jusqu'au bout, et
+                    // le lecteur n'a pas demandé la suite (signal `ended` /
+                    // `completed` perdu ou jamais branché) : on enchaîne ici,
+                    // comme pour toute sortie à la fin d'une piste.
+                    if self.enchainer_la_zone_navigateur_finie(zone_state).await {
+                        poll_states.remove(&zone_id);
+                        continue;
+                    }
+
                     if self.abandonner_lecture_sans_destination(zone_state).await {
                         poll_states.remove(&zone_id);
                     }
@@ -1644,7 +1666,20 @@ impl PositionPoller {
                         status.position_ms,
                     )
                 });
-            if (!in_seek_grace || posterieur_au_deplacement) && !echantillon_perime {
+            // #6718 : Time/Seconds=0 à l'arrêt ne décrit pas un nouveau
+            // départ. Le publier ici fait céder la monotonie au cinquième
+            // tour, juste avant que handle_track_end attende la résolution
+            // suivante avec l'ancien titre encore affiché. Les décisions de
+            // fin gardent le relevé brut ; seule sa publication est filtrée.
+            let zero_d_arret_openhome = status.state == TransportState::Stopped
+                && status.position_ms == 0
+                && all_zones.iter().any(|zone| {
+                    zone.id == Some(zone_id) && zone.output_type.as_deref() == Some("openhome")
+                });
+            if (!in_seek_grace || posterieur_au_deplacement)
+                && !echantillon_perime
+                && !zero_d_arret_openhome
+            {
                 // Clamp the reported position to the track duration so the UI
                 // progress bar doesn't briefly overshoot past the end. The
                 // output can report a position a few seconds past the duration

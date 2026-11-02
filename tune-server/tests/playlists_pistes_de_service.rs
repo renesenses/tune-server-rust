@@ -206,10 +206,16 @@ async fn un_titre_de_service_incomplet_est_refuse_en_le_disant() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{corps}");
-    let texte = corps.as_str().unwrap_or_default();
+    // #7077 : refus JSON, code stable + phrase traduite (anglais sans
+    // Accept-Language), au lieu d'un corps texte en français.
+    assert_eq!(
+        corps["code"], "playlist_incomplete_service_tracks",
+        "{corps}"
+    );
+    let texte = corps["message"].as_str().unwrap_or_default();
     assert!(
-        texte.contains("incomplets") && texte.contains("titre"),
-        "{texte}"
+        texte.contains("incomplete") && texte.contains("title"),
+        "{corps}"
     );
     assert!(pistes(&app, pl).await.is_empty(), "rien ne doit être écrit");
 }

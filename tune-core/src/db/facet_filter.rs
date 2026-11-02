@@ -179,15 +179,20 @@ pub fn bloc_listes(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat
 }
 
 /// Favoris du profil 1 — vocabulaire FERMÉ, aucun marqueur.
-pub fn bloc_favoris(_ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
-    any_of(
-        valeurs
-            .iter()
-            .filter_map(|k| favorite_condition(k))
-            .map(str::to_string)
-            .collect(),
-    )
-    .map(|c| (c, Vec::new()))
+///
+/// #7569 — `profil` est le profil de la REQUÊTE (`X-Profile-Id`), pas un 1
+/// gravé : c'est ce qui fait que le filtre « favoris » d'une liste lit les
+/// mêmes favoris que la vue Favoris du même profil.
+pub fn bloc_favoris(profil: i64) -> impl Fn(&mut Placeholders, &[String]) -> Option<Predicat> {
+    move |_ph, valeurs| {
+        any_of(
+            valeurs
+                .iter()
+                .filter_map(|k| favorite_condition(k, profil))
+                .collect(),
+        )
+        .map(|c| (c, Vec::new()))
+    }
 }
 
 /// Étiquette manquante — vocabulaire FERMÉ, aucun marqueur.
@@ -543,23 +548,39 @@ pub fn normalize_ints(values: &[i64]) -> Vec<i64> {
     out
 }
 
-/// Prédicat « cette piste est en favori » pour le profil 1. Vocabulaire FERMÉ :
+/// Prédicat « la note de l'album est parmi `c` » pour le profil `profil`
+/// (#7594). `c` est le fragment `arr.rating IN (...)` déjà construit avec ses
+/// marqueurs ; le numéro de profil est un entier, jamais du texte. Un profil
+/// non positif retombe sur le profil 1, comme [`favorite_condition`].
+pub fn rating_condition(c: &str, profil: i64) -> String {
+    let profil = if profil > 0 { profil } else { 1 };
+    format!(
+        "EXISTS (SELECT 1 FROM album_ratings arr \
+         WHERE arr.album_id = t.album_id AND arr.profile_id = {profil} AND {c})"
+    )
+}
+
+/// Prédicat « cette piste est en favori » pour le profil `profil` (un profil
+/// non positif — filtre construit sans requête — retombe sur le profil 1, le
+/// profil par défaut). Le numéro est un entier, jamais du texte : il s'écrit
+/// dans le SQL sans ouvrir de porte à l'injection. Vocabulaire FERMÉ :
 /// toute autre valeur ne filtre RIEN plutôt que de tout exclure.
 ///
 /// Vit ici, et non dans chacun des deux constructeurs de prédicats, parce que
 /// c'est exactement le genre de littéral qu'on recopie une fois de trop : une
 /// facette qui compterait autrement que la liste qu'elle filtre serait pire
 /// qu'une facette absente.
-pub fn favorite_condition(kind: &str) -> Option<&'static str> {
+pub fn favorite_condition(kind: &str, profil: i64) -> Option<String> {
+    let profil = if profil > 0 { profil } else { 1 };
     match kind {
-        "album" => Some(
-            "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-             AND f.item_type = 'album' AND f.item_id = t.album_id)",
-        ),
-        "track" => Some(
-            "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-             AND f.item_type = 'track' AND f.item_id = t.id)",
-        ),
+        "album" => Some(format!(
+            "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = {profil} \
+             AND f.item_type = 'album' AND f.item_id = t.album_id)"
+        )),
+        "track" => Some(format!(
+            "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = {profil} \
+             AND f.item_type = 'track' AND f.item_id = t.id)"
+        )),
         _ => None,
     }
 }
@@ -668,6 +689,119 @@ pub fn dr_album_in(engine: Engine, having: &str) -> String {
           WHERE {} GROUP BY tdr.album_id HAVING {having})",
         dr_tag_where(engine)
     )
+}
+
+/// #2144 (rc10) — le DR de chaque album porteur d'un tag DR, sous le jeton de
+/// la base qui l'a rendu ([`super::backend::DbBackend::jeton_des_donnees`]).
+/// Une entrée PAR INSTANCE de base (l'instance est la première moitié du
+/// jeton) : un serveur n'ouvre qu'une base, donc une entrée — mais deux bases
+/// ouvertes dans le même processus (les tests, qui tournent en parallèle) ne
+/// s'évincent plus l'une l'autre. Avant, l'entrée unique faisait relire les
+/// tags DR à la première base dès qu'une seconde lisait sa carte (#7675 : le
+/// témoin de #7580 rougissait selon l'ordre des tests). Borné à
+/// [`DR_EN_CACHE_MAX`] entrées : les bases refermées ne s'accumulent pas.
+type DrEnCache = Vec<(
+    (u64, i64),
+    std::sync::Arc<std::collections::HashMap<i64, i64>>,
+)>;
+static DR_PAR_ALBUM_EN_CACHE: std::sync::Mutex<DrEnCache> = std::sync::Mutex::new(Vec::new());
+const DR_EN_CACHE_MAX: usize = 64;
+
+/// Le DR de chaque album porteur d'un tag DR : la table dérivée
+/// [`dr_album_source`], la MÊME règle que la grille, la liste et la fiche —
+/// lue seule, une ligne par album, et gardée en mémoire tant que le jeton des
+/// données ne change pas (il change à CHAQUE écriture validée). Le rail
+/// (`facets::dr_facet`) et la liste filtrée ([`condition_dr_par_albums`])
+/// partagent cette lecture.
+///
+/// `Err` : la lecture a échoué, rien n'est gardé, la suivante réessaiera.
+pub fn dr_par_album(
+    db: &dyn super::backend::DbBackend,
+) -> Result<std::sync::Arc<std::collections::HashMap<i64, i64>>, String> {
+    // Le jeton est lu AVANT la lecture : une écriture validée entre les deux
+    // change le jeton suivant, et la carte gardée ici n'est alors plus jamais
+    // servie. L'ordre inverse pourrait garder une carte ancienne sous un
+    // jeton neuf.
+    let jeton = db.jeton_des_donnees();
+    if let Some(j) = jeton
+        && let Ok(cache) = DR_PAR_ALBUM_EN_CACHE.lock()
+        && let Some((_, carte)) = cache.iter().find(|(garde, _)| *garde == j)
+    {
+        return Ok(carte.clone());
+    }
+    let sql = format!(
+        "SELECT dr.album_id, dr.dr FROM ({}) dr",
+        dr_album_source(db.engine())
+    );
+    let carte: std::sync::Arc<std::collections::HashMap<i64, i64>> = std::sync::Arc::new(
+        db.query_many(&sql, &[])?
+            .into_iter()
+            .filter_map(|row| {
+                let mut it = row.into_iter();
+                Some((it.next()?.as_i64()?, it.next()?.as_i64()?))
+            })
+            .collect(),
+    );
+    if let Some(j) = jeton
+        && let Ok(mut cache) = DR_PAR_ALBUM_EN_CACHE.lock()
+    {
+        // La carte précédente de CETTE base est périmée ; celles des autres
+        // bases restent servables sous leur propre jeton.
+        cache.retain(|(garde, _)| garde.0 != j.0);
+        if cache.len() >= DR_EN_CACHE_MAX {
+            cache.remove(0);
+        }
+        cache.push((j, carte.clone()));
+    }
+    Ok(carte)
+}
+
+/// Prédicat « l'album de CETTE piste porte l'un des DR `drs` » — alias `t`,
+/// le même ensemble que [`dr_album_in`] sur `DR_ALBUM_VALUE IN (drs)`, mais
+/// posé en liste d'albums déjà résolue (#7580).
+///
+/// # Pourquoi
+///
+/// [`dr_album_in`] est une sous-requête NON corrélée : SQLite l'évalue une
+/// fois par requête — mais elle relit À CHAQUE FOIS toutes les lignes DR de
+/// `track_metadata`, les regroupe par album et calcule leur DR (75 ms au banc
+/// de 103 500 pistes, la moitié de la page). La vue Oxygen la payait à
+/// chaque page de la liste, et deux fois par page sur le chemin
+/// `list_filtered` (le compte, puis la page). La carte de [`dr_par_album`]
+/// est gardée sous le jeton des données : la sous-requête n'est plus jouée
+/// qu'une fois entre deux écritures, et la liste cherche ses pistes par
+/// l'index de l'album.
+///
+/// Mêmes pistes rendues : un album est dans la liste si et seulement si la
+/// sous-requête l'aurait rendu (même table dérivée, même valeur ; un album
+/// NUL n'y est dans aucun des deux cas). Aucun album ne porte ces DR : `1 = 0`.
+///
+/// `None` : la carte n'a pas pu être lue ; l'appelant pose [`dr_album_in`],
+/// plus lent, jamais faux.
+pub fn condition_dr_par_albums(db: &dyn super::backend::DbBackend, drs: &[i64]) -> Option<String> {
+    let carte = match dr_par_album(db) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "filtre_dr_carte_non_lue");
+            return None;
+        }
+    };
+    let mut albums: Vec<i64> = carte
+        .iter()
+        .filter(|(_, dr)| drs.contains(dr))
+        .map(|(album, _)| *album)
+        .collect();
+    if albums.is_empty() {
+        return Some("1 = 0".to_string());
+    }
+    // Trié : le même texte pour la même sélection, d'une requête à l'autre.
+    albums.sort_unstable();
+    let liste = albums
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("t.album_id IN ({liste})"))
 }
 
 /// Prédicat « cet album n'est PAS masqué » (#1391), pour les requêtes
@@ -1100,8 +1234,11 @@ pub struct TrackFilter {
     /// modèle n'ont jamais été relevées, et un découpage inventé ici
     /// survivrait dans le contrat HTTP à la mesure qui le contredirait.
     pub dynamic_ranges: Vec<i64>,
-    /// `track` et/ou `album` (profil 1).
+    /// `track` et/ou `album`, pour le profil [`TrackFilter::profile_id`].
     pub favorites: Vec<String>,
+    /// Le profil de la requête (#7569) : celui dont `favorites` lit les
+    /// favoris. `0` (le défaut) = profil 1.
+    pub profile_id: i64,
     pub playlists: Vec<String>,
     /// `genre`, `year`, `artist`, `album` ou `cover`.
     pub untagged: Vec<String>,
@@ -1181,7 +1318,7 @@ impl TrackFilter {
             || !self.dynamic_ranges.is_empty()
             // Vocabulaires FERMÉS : une valeur inconnue ne produit aucun
             // prédicat, donc elle ne doit pas non plus activer le chemin filtré.
-            || self.favorites.iter().any(|k| favorite_condition(k).is_some())
+            || self.favorites.iter().any(|k| favorite_condition(k, 1).is_some())
             || !self.playlists.is_empty()
             || self.untagged.iter().any(|k| untagged_condition(k).is_some())
             || self.folder.as_deref().is_some_and(|s| !s.is_empty())
@@ -1401,14 +1538,14 @@ mod tests {
     #[test]
     fn les_vocabulaires_fermes_refusent_tout_le_reste() {
         for k in ["track", "album"] {
-            assert!(favorite_condition(k).is_some(), "{k}");
+            assert!(favorite_condition(k, 1).is_some(), "{k}");
         }
         for f in ["artist", "album", "genre", "year", "cover"] {
             assert!(untagged_condition(f).is_some(), "{f}");
         }
         for hostile in ["", "id", "t.genre", "1=1", "genre; DROP TABLE tracks--"] {
             assert!(untagged_condition(hostile).is_none(), "{hostile:?}");
-            assert!(favorite_condition(hostile).is_none(), "{hostile:?}");
+            assert!(favorite_condition(hostile, 1).is_none(), "{hostile:?}");
         }
     }
 
