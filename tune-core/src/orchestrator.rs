@@ -1203,6 +1203,10 @@ pub struct PlaybackOrchestrator {
     pub prefetch: Arc<PrefetchEngine>,
     preparations_fichiers: std::sync::Mutex<HashMap<i64, preparation_fichier_7247::Preparation>>,
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
+    /// #6910 — renderers DLNA qui ont lâché un suivant DSD armé (acquitté,
+    /// jamais suivi : HiFi Rose RS130, #402). La garde DSD leur est rendue
+    /// pour la vie du processus.
+    appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Cache of MIME types that each DLNA renderer does NOT support.
     /// Key: device_id, Value: set of unsupported MIME types (e.g. "audio/flac").
     /// Only negative results are cached — if a MIME is not in the set, it's
@@ -1760,6 +1764,9 @@ impl PlaybackOrchestrator {
             prefetch: Arc::new(PrefetchEngine::new()),
             preparations_fichiers: Default::default(),
             dsd_capabilities: Mutex::new(HashMap::new()),
+            appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            ),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
             dlna_canaux_max: Mutex::new(HashMap::new()),

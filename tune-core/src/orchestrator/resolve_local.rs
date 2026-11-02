@@ -473,6 +473,57 @@ impl PlaybackOrchestrator {
         (mode, annonce)
     }
 
+    /// #6910 — le renderer DLNA `device_id` tient-il un suivant en DSD brut ?
+    /// Voir [`crate::playback::gapless::dsd_suivant_tenu_sur_dlna`].
+    ///
+    /// Lit le cache de [`Self::sonder_dsd`] SANS resonder le réseau : appelée
+    /// depuis le sondeur et depuis la file, elle ne doit jamais attendre un
+    /// renderer. Un cache vide vaut « je ne sais pas », donc la garde.
+    pub async fn dsd_suivant_tenu_sur_dlna(
+        &self,
+        device_id: &str,
+        annonce_suivante: crate::outputs::traits::AnnonceSuivante,
+    ) -> bool {
+        let annonce_dsd = self
+            .dsd_capabilities
+            .lock()
+            .await
+            .get(device_id)
+            .map(|cap| cap.supports_dsf || cap.supports_dff);
+        let deja_lache = self
+            .appareils_qui_lachent_le_dsd_suivant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(device_id);
+        crate::playback::gapless::dsd_suivant_tenu_sur_dlna(
+            annonce_dsd,
+            annonce_suivante,
+            deja_lache,
+        )
+    }
+
+    /// #6910 — `device_id` a lâché un suivant DSD armé : la garde de #402 lui
+    /// est rendue jusqu'au redémarrage. Vrai à la première fois seulement.
+    pub fn retenir_dsd_suivant_lache(&self, device_id: &str) -> bool {
+        self.appareils_qui_lachent_le_dsd_suivant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(device_id.to_string())
+    }
+
+    /// Banc : ce que le `GetProtocolInfo` du renderer aurait dit du DSD.
+    #[cfg(test)]
+    pub(crate) async fn retenir_annonce_dsd_pour_banc(
+        &self,
+        device_id: &str,
+        cap: crate::outputs::dlna::DsdCapability,
+    ) {
+        self.dsd_capabilities
+            .lock()
+            .await
+            .insert(device_id.to_string(), cap);
+    }
+
     /// Ce que la zone veut faire d'une piste DSD sur une sortie RÉSEAU —
     /// UNE décision, lue par les deux chemins qui servent un renderer.
     ///

@@ -4830,6 +4830,29 @@ async fn get_queue(
         output_device_id.as_deref(),
     )
     .await;
+    // #6910 — le sondeur arme un suivant DSD sur le renderer DLNA qui annonce
+    // le DSD et `SetNext` : la file le promet alors, sur la même règle. Rien
+    // n'est lu sur le réseau ici : seulement ce que le SCPD a déjà dit.
+    let dsd_suivant_tenu = match output_device_id.as_deref() {
+        Some(device_id) if output_type == "dlna" => {
+            let sortie = { state.outputs.lock().await.get(device_id) };
+            let annonce_suivante = match sortie {
+                Some(arc) => arc
+                    .lock()
+                    .await
+                    .as_any()
+                    .downcast_ref::<tune_core::outputs::dlna::DlnaOutput>()
+                    .map(|d| d.annonce_suivante_retenue())
+                    .unwrap_or(tune_core::outputs::traits::AnnonceSuivante::Inconnue),
+                None => tune_core::outputs::traits::AnnonceSuivante::Inconnue,
+            };
+            state
+                .orchestrator
+                .dsd_suivant_tenu_sur_dlna(device_id, annonce_suivante)
+                .await
+        }
+        _ => false,
+    };
     // L'ordre RÉELLEMENT joué se lit sur la file telle qu'elle est MAINTENANT,
     // pas sur la longueur que l'état de zone traînait.
     let mut zs = ps.clone();
@@ -4898,6 +4921,7 @@ async fn get_queue(
                     ),
                     successeur_format: suivant.and_then(|s| s.format.as_deref()),
                     successeur_est_fichier_local: suivant.is_some_and(|s| s.file_path.is_some()),
+                    dsd_suivant_tenu,
                 },
             );
             if let Some(obj) = v.as_object_mut() {
