@@ -4,6 +4,21 @@
 use super::*;
 use serde_json::json;
 
+/// La racine d'un relais monté par un essai, UNIQUE dans le processus.
+///
+/// L'état du relais (pause, échecs) est tenu par racine, dans des tables
+/// globales. Un essai fini libère son port, que le noyau peut redonner à un
+/// relais monté ensuite (`bind` sur le port 0, `SO_REUSEADDR`) : la racine
+/// `http://127.0.0.1:<port>/now-playing` d'un relais neuf héritait alors de
+/// la pause de dix minutes posée par un essai précédent, et sa première
+/// lecture rendait `None` sans rien demander. Le paramètre `essai`, ignoré
+/// par le faux relais, sépare les racines.
+fn racine_unique(port: u16) -> String {
+    static NUMERO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NUMERO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("http://127.0.0.1:{port}/now-playing?essai={n}")
+}
+
 async fn faux_relais(statut: u16, corps: Value) -> String {
     let app = axum::Router::new().route(
         "/now-playing",
@@ -24,7 +39,7 @@ async fn faux_relais(statut: u16, corps: Value) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    format!("http://127.0.0.1:{port}/now-playing")
+    racine_unique(port)
 }
 
 #[test]
@@ -192,7 +207,7 @@ async fn relais_qui_echoue_puis_repond(echecs: usize) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    format!("http://127.0.0.1:{port}/now-playing")
+    racine_unique(port)
 }
 
 /// #7010 : une lecture isolée en échec ne suspend pas le relais dix minutes ;

@@ -24,8 +24,7 @@
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
-use serde_json::json;
+use axum::response::Response;
 use tune_core::cloud::ENTETE_RELAIS;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -225,14 +224,12 @@ pub async fn garde_du_relais(
         return next.run(request).await;
     }
     tracing::info!(methode = %request.method(), "requete_relayee_refusee");
-    (
+    crate::message_api::refus(
         StatusCode::FORBIDDEN,
-        axum::Json(json!({
-            "error": "not_available_remotely",
-            "message": "Cette fonction n'est disponible que sur le réseau local.",
-        })),
+        "not_available_remotely",
+        "api.relay.localNetworkOnly",
+        &[],
     )
-        .into_response()
 }
 
 #[cfg(test)]
