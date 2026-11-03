@@ -203,9 +203,19 @@ impl Airplay2Output {
                                 // connectee et la piste suivante repart vers un
                                 // daemon sans liaison.
                                 let mut phase = pairing.lock().await;
-                                if daemon_sans_connexion(&msg)
-                                    || (!attendue && *phase != PairingPhase::Connected)
-                                {
+                                if daemon_sans_connexion(&msg) {
+                                    *phase = PairingPhase::Failed(msg.clone());
+                                } else if pair_pin_start_non_supporte(&msg) {
+                                    // #6788 — un récepteur macOS ou Apple TV n'a pas
+                                    // de endpoint /pair-pin-start et répond HTTP 403 (ou 404).
+                                    // On bascule en PinRequested pour afficher la
+                                    // saisie du code PIN / mot de passe.
+                                    info!(
+                                        device = %device_name,
+                                        "airplay2: pair-pin-start non supporté (macOS / Apple TV, #6788), passage en attente de code PIN / mot de passe"
+                                    );
+                                    *phase = PairingPhase::PinRequested;
+                                } else if !attendue && *phase != PairingPhase::Connected {
                                     *phase = PairingPhase::Failed(msg.clone());
                                 }
                                 drop(phase);
@@ -683,7 +693,19 @@ impl OutputTarget for Airplay2Output {
 /// recepteur (`airplay-daemon/src/main.rs` : `connect failed: …`, et
 /// `not connected` sur `play`, `pause`, `resume`, `volume`…).
 fn daemon_sans_connexion(message: &str) -> bool {
-    message == "not connected" || message.starts_with("connect failed")
+    message == "not connected"
+        || message.starts_with("connect failed")
+        || message.starts_with("pair-pin-start failed")
+}
+
+/// #6788 — Sur un récepteur macOS (Monterey+) ou Apple TV, le endpoint propriétaire
+/// `/pair-pin-start` (spécifique aux téléviseurs comme Samsung ou LG) n'existe pas
+/// et le récepteur renvoie un code HTTP (typiquement 403 Forbidden ou 404 Not Found).
+/// Le démon signale alors `pair-pin-start: HTTP ...`.
+/// L'appareil est joignable sur le réseau et prêt pour le jumelage HomeKit Normal,
+/// qui s'effectue directement par la saisie du code PIN / mot de passe dans l'interface Tune.
+fn pair_pin_start_non_supporte(message: &str) -> bool {
+    message.starts_with("pair-pin-start: HTTP")
 }
 
 /// Taille au-dela de laquelle la copie locale du flux est abandonnee.
@@ -1286,8 +1308,11 @@ mod transport_tests {
     /// Faux daemon a etat, fidele a `airplay-daemon/src/main.rs` (rev
     /// a7d7ad66) : une commande a la fois, `play` sans connexion rend
     /// « not connected ». `connect_ok` dit si le recepteur accepte la
-    /// connexion transitoire ; `pair_pin_start` est refuse en 403, comme le
-    /// MacBook du rapport de #7441.
+    /// connexion transitoire ; `pair_pin_start` echoue (reseau refuse),
+    /// laissant le daemon vivant mais non connecte (#7441).
+    ///
+    /// (Note : un 403 HTTP sur pair-pin-start signale un recepteur macOS
+    /// qui attend la saisie du code PIN, traite par #6788 ci-dessous).
     async fn daemon_7441(
         output: &Airplay2Output,
         connect_ok: bool,
@@ -1310,7 +1335,7 @@ mod transport_tests {
                 notees.lock().await.push(command.clone());
                 let erreur = |m: &str| serde_json::json!({"event": "error", "message": m});
                 let event = match command["cmd"].as_str().unwrap() {
-                    "pair_pin_start" => erreur("pair-pin-start: HTTP 403 Forbidden"),
+                    "pair_pin_start" => erreur("pair-pin-start failed: connection refused"),
                     "connect" if connect_ok => {
                         connecte = true;
                         serde_json::json!({"event": "connected", "device": "MacBook"})
@@ -1435,6 +1460,172 @@ mod transport_tests {
             TransportState::Paused
         );
         assert_eq!(*commands.lock().await, vec!["play", "pause", "resume"]);
+    }
+
+    #[tokio::test]
+    async fn airplay2_pair_pin_start_403_sur_recepteur_macos_bascule_en_pin_requested_6788() {
+        let output = Airplay2Output::new(
+            "MacBook Pro".into(),
+            "127.0.0.1".into(),
+            7000,
+            "airplay-macbook-7000".into(),
+            "00:11:22:33:44:55".into(),
+        );
+
+        let (server_stdin, daemon_stdin) = tokio::io::duplex(4096);
+        let (mut daemon_stdout, server_stdout) = tokio::io::duplex(4096);
+
+        *output.process.lock().await = Some(DaemonProcess {
+            child: None,
+            stdin: Box::new(server_stdin),
+        });
+        output.start_event_reader(BufReader::new(server_stdout));
+
+        let charges = Arc::new(Mutex::new(Vec::new()));
+        let notees = charges.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(daemon_stdin).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                notees.lock().await.push(command.clone());
+                let event = if command["cmd"] == "pair_pin_start" {
+                    // Simule le rejet HTTP 403 sur /pair-pin-start par le récepteur macOS (#6788)
+                    serde_json::json!({
+                        "event": "error",
+                        "message": "pair-pin-start: HTTP 403 Forbidden"
+                    })
+                } else {
+                    serde_json::json!({"event": "connected"})
+                };
+                let line = format!("{}\n", serde_json::to_string(&event).unwrap());
+                daemon_stdout.write_all(line.as_bytes()).await.unwrap();
+            }
+        });
+
+        output.start_pin_pairing().await.unwrap();
+
+        // Le 403 sur pair-pin-start doit être transformé en pin_requested pour débloquer
+        // la saisie du code PIN / mot de passe dans l'interface (#6788).
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if output.pairing_status().await == "pin_requested" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("un refus 403 sur pair-pin-start doit passer en pin_requested pour macOS (#6788)");
+
+        // Saisie du code PIN ou mot de passe récepteur
+        output.submit_pin("5678").await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if output.pairing_status().await == "connected" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("la soumission du code PIN doit aboutir à l'état connected (#6788)");
+
+        let recorded = charges.lock().await;
+        assert_eq!(recorded[0]["cmd"], "pair_pin_start");
+        assert_eq!(recorded[1]["cmd"], "connect");
+        assert_eq!(recorded[1]["pin"], "5678");
+        assert_eq!(recorded[1]["device_id"], "00:11:22:33:44:55");
+    }
+
+    /// #6788 — Après réception d'un 403 sur pair-pin-start (macOS), l'utilisateur saisit
+    /// le code affiché à l'écran du Mac, la connexion aboutit et la lecture d'une piste
+    /// locale démarre réellement sans faire semblant.
+    #[tokio::test]
+    async fn apres_un_pair_pin_start_403_la_soumission_du_pin_permet_la_lecture_6788() {
+        let flux = serveur_de_flux(b"piste-locale-macos").await;
+        let output = Airplay2Output::new(
+            "MacBook Pro".into(),
+            "127.0.0.1".into(),
+            7000,
+            "airplay-macbook-7000".into(),
+            "00:11:22:33:44:55".into(),
+        );
+
+        let (server_stdin, daemon_stdin) = tokio::io::duplex(4096);
+        let (mut daemon_stdout, server_stdout) = tokio::io::duplex(4096);
+
+        *output.process.lock().await = Some(DaemonProcess {
+            child: None,
+            stdin: Box::new(server_stdin),
+        });
+        output.start_event_reader(BufReader::new(server_stdout));
+
+        let charges = Arc::new(Mutex::new(Vec::new()));
+        let notees = charges.clone();
+        tokio::spawn(async move {
+            let mut connecte = false;
+            let mut lines = BufReader::new(daemon_stdin).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                notees.lock().await.push(command.clone());
+                let erreur = |m: &str| serde_json::json!({"event": "error", "message": m});
+                let event = match command["cmd"].as_str().unwrap() {
+                    "pair_pin_start" => erreur("pair-pin-start: HTTP 403 Forbidden"),
+                    "connect" => {
+                        connecte = true;
+                        serde_json::json!({"event": "connected", "device": "MacBook Pro"})
+                    }
+                    "play" if connecte => serde_json::json!({"event": "playing"}),
+                    _ => erreur("not connected"),
+                };
+                let line = format!("{}\n", serde_json::to_string(&event).unwrap());
+                daemon_stdout.write_all(line.as_bytes()).await.unwrap();
+            }
+        });
+
+        // 1. Démarrage de l'appairage par PIN
+        output.start_pin_pairing().await.unwrap();
+
+        // 2. Passage en pin_requested suite au 403 sur /pair-pin-start
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while output.pairing_status().await != "pin_requested" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("doit être en pin_requested");
+
+        // 3. Soumission du PIN par l'utilisateur
+        output.submit_pin("1234").await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while output.pairing_status().await != "connected" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("doit être connecté après PIN valide");
+
+        // 4. Lancement de la lecture : doit jouer réellement
+        output
+            .play_media(&PlayMedia {
+                url: &flux,
+                mime_type: "audio/flac",
+                ..Default::default()
+            })
+            .await
+            .expect("la lecture doit partir après jumelage réussi");
+
+        let cmds: Vec<String> = charges
+            .lock()
+            .await
+            .iter()
+            .map(|c| c["cmd"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cmds, vec!["pair_pin_start", "connect", "play"]);
+        assert_eq!(output.pairing_status().await, "connected");
+        output.stop().await.unwrap();
     }
 }
 
