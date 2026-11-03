@@ -50,9 +50,52 @@ pub(super) struct ArtworkQuery {
 pub(super) async fn serve_artwork(
     Path(hash): Path<String>,
     Query(query): Query<ArtworkQuery>,
+    entetes: HeaderMap,
 ) -> impl IntoResponse {
     let taille = query.size.as_deref().and_then(|s| s.parse::<u32>().ok());
-    serve_artwork_from(&artwork_cache_dir(), &hash, taille).await
+    revalider(
+        &entetes,
+        serve_artwork_from(&artwork_cache_dir(), &hash, taille).await,
+    )
+}
+
+/// #7619 (L2) — `If-None-Match` qui nomme l'ETag de la réponse : `304`, sans
+/// corps.
+///
+/// La route posait un ETag sans jamais le lire : un client qui revalidait
+/// (rechargement, cache intermédiaire, `max-age` d'un relais) recevait à
+/// chaque fois les octets entiers. Le `304` garde l'ETag et le
+/// `Cache-Control`, comme le demande la RFC 9110 (§ 15.4.5).
+///
+/// Comparaison FAIBLE (§ 13.1.2) : `W/"x"` vaut `"x"`, et `*` vaut tout.
+pub(super) fn revalider(
+    requete: &HeaderMap,
+    reponse: axum::response::Response,
+) -> axum::response::Response {
+    if reponse.status() != StatusCode::OK {
+        return reponse;
+    }
+    let Some(etag) = reponse.headers().get("ETag").and_then(|v| v.to_str().ok()) else {
+        return reponse;
+    };
+    let nu = |e: &str| e.trim().trim_start_matches("W/").to_string();
+    let voulu = nu(etag);
+    let concorde = requete
+        .get_all("If-None-Match")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|e| e.trim() == "*" || nu(e) == voulu);
+    if !concorde {
+        return reponse;
+    }
+    let mut entetes = HeaderMap::new();
+    for nom in ["ETag", "Cache-Control"] {
+        if let Some(v) = reponse.headers().get(nom) {
+            entetes.insert(nom, v.clone());
+        }
+    }
+    (StatusCode::NOT_MODIFIED, entetes).into_response()
 }
 
 /// Sert une entrée du cache de pochettes, répertoire donné.
@@ -3478,5 +3521,86 @@ mod amelioration_pochette_4805 {
             "aucune comparaison pour une pochette téléversée"
         );
         assert_eq!(avant, apres);
+    }
+}
+
+#[cfg(test)]
+mod revalidation_tests_7619 {
+    use super::*;
+
+    fn requete(inm: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(v) = inm {
+            h.insert("If-None-Match", HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    async fn pochette_en_cache() -> (tempfile::TempDir, String) {
+        let cache = tempfile::tempdir().unwrap();
+        let hash = "0123456789abcdef0123456789abcdef".to_string();
+        // Un PNG d'un pixel suffit : la route sert les octets tels quels.
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15, 0xC4, 0x89, 0, 0, 0, 0x0A, 0x49,
+            0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0, 1, 0, 0, 5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0,
+            0, 0, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(cache.path().join(format!("{hash}.png")), png).unwrap();
+        (cache, hash)
+    }
+
+    /// Témoin : l'ETag renvoyé par le client donne un 304 sans corps.
+    #[tokio::test]
+    async fn l_etag_connu_donne_304() {
+        let (cache, hash) = pochette_en_cache().await;
+        let premiere = serve_artwork_from(cache.path(), &hash, None).await;
+        assert_eq!(premiere.status(), StatusCode::OK);
+        let etag = premiere.headers()["ETag"].to_str().unwrap().to_string();
+
+        let seconde = revalider(
+            &requete(Some(&etag)),
+            serve_artwork_from(cache.path(), &hash, None).await,
+        );
+        assert_eq!(
+            seconde.status(),
+            StatusCode::NOT_MODIFIED,
+            "If-None-Match égal à l'ETag doit rendre 304"
+        );
+        assert_eq!(seconde.headers()["ETag"].to_str().unwrap(), etag);
+        assert!(seconde.headers().contains_key("Cache-Control"));
+        let corps = axum::body::to_bytes(seconde.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(corps.is_empty());
+
+        // Forme faible et liste : même verdict.
+        let faible = revalider(
+            &requete(Some(&format!("\"autre\", W/{etag}"))),
+            serve_artwork_from(cache.path(), &hash, None).await,
+        );
+        assert_eq!(faible.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn un_autre_etag_rend_l_image() {
+        let (cache, hash) = pochette_en_cache().await;
+        for inm in [None, Some("\"perime\"")] {
+            let r = revalider(
+                &requete(inm),
+                serve_artwork_from(cache.path(), &hash, None).await,
+            );
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn un_404_reste_un_404() {
+        let cache = tempfile::tempdir().unwrap();
+        let r = revalider(
+            &requete(Some("*")),
+            serve_artwork_from(cache.path(), "ffffffffffffffffffffffffffffffff", None).await,
+        );
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
 }
