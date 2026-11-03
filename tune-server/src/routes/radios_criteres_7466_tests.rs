@@ -289,3 +289,179 @@ fn l_annuaire_filtre_et_compte_selon_les_criteres() {
     );
     assert!(noms(&corps_annuaire(&fiches, &[], &f, &EtatAnnuaire::default())).is_empty());
 }
+
+// --- #7718 — le niveau de qualité minimal, sans distinction de format -------
+
+/// Une fiche classique dont le seul flux sans perte ne publie ni débit ni
+/// fréquence (le cas fréquent des flux FLAC de l'annuaire).
+fn fiche_flac_muette() -> StationAnnuaire {
+    StationAnnuaire {
+        name: "Classique Muette".into(),
+        stream_url: "https://exemple.invalid/classique.flac".into(),
+        genre: Some("classical".into()),
+        codec: Some("FLAC".into()),
+        flux: vec![FluxAnnuaire {
+            url: "https://exemple.invalid/classique.flac".into(),
+            codec: Some("FLAC".into()),
+            ..Default::default()
+        }],
+        external_id: Some("S3".into()),
+        ..Default::default()
+    }
+}
+
+/// Une fiche classique à deux flux avec perte : AAC 64 et MP3 192.
+fn fiche_classique_192() -> StationAnnuaire {
+    StationAnnuaire {
+        name: "Classique 192".into(),
+        stream_url: "https://exemple.invalid/classique-64.aac".into(),
+        genre: Some("classical".into()),
+        codec: Some("AAC".into()),
+        bitrate: Some(64),
+        flux: vec![
+            flux(
+                "https://exemple.invalid/classique-64.aac",
+                "AAC",
+                64,
+                44_100,
+            ),
+            flux(
+                "https://exemple.invalid/classique-192.mp3",
+                "MP3",
+                192,
+                44_100,
+            ),
+        ],
+        external_id: Some("S4".into()),
+        ..Default::default()
+    }
+}
+
+fn retenues_parmi_quatre(requete: &str) -> Vec<String> {
+    let c = criteres(requete);
+    [
+        fiche_flac(),
+        fiche_mp3(),
+        fiche_flac_muette(),
+        fiche_classique_192(),
+    ]
+    .into_iter()
+    .filter(|f| c.retient_la_fiche(f, None))
+    .map(|f| f.name)
+    .collect()
+}
+
+#[test]
+fn qualite_min_lit_les_niveaux_et_ignore_l_inconnu() {
+    assert_eq!(
+        NiveauQualite::depuis("128"),
+        Some(NiveauQualite::Debit(128))
+    );
+    assert_eq!(
+        NiveauQualite::depuis("FLAC_24_96"),
+        Some(NiveauQualite::SansPerte(96_000))
+    );
+    assert_eq!(
+        NiveauQualite::depuis("flac_16_44"),
+        Some(NiveauQualite::SansPerte(44_100))
+    );
+    for rien in ["", "unknown", "0", "-5", "mp3"] {
+        assert_eq!(NiveauQualite::depuis(rien), None, "{rien:?}");
+    }
+    assert!(criteres("quality_min=unknown").est_vide());
+    assert!(!criteres("quality_min=48").est_vide());
+}
+
+#[test]
+fn un_flux_sans_perte_sans_debit_passe_tout_niveau_avec_perte() {
+    for requete in ["quality_min=320", "quality_min=48", "bitrate_min=320"] {
+        assert!(
+            retenues_parmi_quatre(requete).contains(&"Classique Muette".to_string()),
+            "{requete:?} : un flux FLAC sans débit publié est au moins aussi bon \
+             que 320 kbit/s, il ne doit pas être écarté"
+        );
+    }
+    assert!(criteres("quality_min=flac_16_44").retient_la_fiche(&fiche_flac_muette(), None));
+    // Sans fréquence publiée, rien ne dit que c'est de la haute résolution.
+    assert!(!criteres("quality_min=flac_24_48").retient_la_fiche(&fiche_flac_muette(), None));
+}
+
+#[test]
+fn qualite_min_garde_les_stations_dont_un_flux_atteint_le_niveau() {
+    for (requete, attendu) in [
+        (
+            "quality_min=128",
+            vec![
+                "Jazz Sans Perte",
+                "News Compresse",
+                "Classique Muette",
+                "Classique 192",
+            ],
+        ),
+        (
+            "quality_min=192",
+            vec!["Jazz Sans Perte", "Classique Muette", "Classique 192"],
+        ),
+        (
+            "quality_min=256",
+            vec!["Jazz Sans Perte", "Classique Muette"],
+        ),
+        (
+            "quality_min=flac_16_44",
+            vec!["Jazz Sans Perte", "Classique Muette"],
+        ),
+        ("quality_min=flac_24_96", vec!["Jazz Sans Perte"]),
+        ("quality_min=flac_24_192", vec![]),
+    ] {
+        assert_eq!(
+            retenues_parmi_quatre(requete),
+            attendu,
+            "critère {requete:?}"
+        );
+    }
+}
+
+#[test]
+fn qualite_min_se_combine_avec_le_genre() {
+    // L'exemple du forum : « Classique » et « au moins 128 ».
+    assert_eq!(
+        retenues_parmi_quatre("genre=classical&quality_min=128"),
+        ["Classique Muette", "Classique 192"]
+    );
+    assert_eq!(
+        retenues_parmi_quatre("genre=classical&quality_min=flac_16_44"),
+        ["Classique Muette"]
+    );
+    assert!(retenues_parmi_quatre("genre=news&quality_min=256").is_empty());
+}
+
+#[test]
+fn qualite_min_flac_exige_la_frequence_sur_le_meme_flux_sans_perte() {
+    // Un flux FLAC à 44,1 kHz et un flux AAC à 96 kHz : aucun flux n'est
+    // à la fois sans perte et à 96 kHz.
+    let mut f = fiche_flac();
+    f.flux = vec![
+        flux("https://exemple.invalid/a.flac", "FLAC", 1411, 44_100),
+        flux("https://exemple.invalid/b.aac", "AAC", 320, 96_000),
+    ];
+    assert!(!criteres("quality_min=flac_24_96").retient_la_fiche(&f, None));
+    assert!(criteres("quality_min=flac_16_44").retient_la_fiche(&f, None));
+}
+
+#[test]
+fn mes_radios_qualite_min_par_le_flux_ecoute() {
+    assert_eq!(locales("quality_min=320"), ["Ma Jazz"]);
+    assert_eq!(locales("quality_min=128"), ["Ma Jazz", "Mon Rock"]);
+    assert_eq!(locales("quality_min=flac_24_96"), ["Ma Jazz"]);
+    assert!(locales("quality_min=flac_24_192").is_empty());
+}
+
+#[test]
+fn l_annuaire_compte_ses_facettes_sous_la_qualite_min() {
+    let fiches = [fiche_flac(), fiche_mp3(), fiche_classique_192()];
+    let f = filtres("quality_min=192");
+    let corps = corps_annuaire(&fiches, &[], &f, &EtatAnnuaire::default());
+    assert_eq!(noms(&corps), ["Jazz Sans Perte", "Classique 192"]);
+    assert_eq!(corps["total"], 2);
+    assert_eq!(corps["countries"], json!([{"code": "FR", "count": 1}]));
+}
