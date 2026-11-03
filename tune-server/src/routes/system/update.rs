@@ -417,6 +417,67 @@ async fn defer_restart_until_quiet(
     }
 }
 
+/// Attend que la relance soit libre : fin d'un scan arrêté (borné), puis fin
+/// de la lecture en cours (bornée par `max`).
+async fn liberer_la_relance(
+    playback: &tune_core::playback::PlaybackManager,
+    max: Duration,
+    poll: Duration,
+    set_phase: &(dyn Fn(&str) + Sync),
+) {
+    // #5531 — un scan qu'une mise à jour forcée a arrêté et qui n'avait
+    // pas encore rendu la main : lui laisser finir ses lectures en vol
+    // plutôt que de le couper par l'échange d'image. Borné ; le repère de
+    // reprise est posé de toute façon.
+    if super::scan::droit_de_scanner_tenu()
+        && let Err(attente) = attendre_la_fin_du_scan(ARRET_DU_SCAN_MAX, ARRET_DU_SCAN_POLL).await
+    {
+        warn!(
+            attente_ms = attente.as_millis() as u64,
+            "update_restart_scan_toujours_actif"
+        );
+    }
+    if playback_in_progress(playback).await {
+        set_phase("restart_pending_playback");
+    }
+    match defer_restart_until_quiet(playback, max, poll).await {
+        RestartRelease::Idle => {}
+        RestartRelease::PlaybackEnded(waited) => {
+            info!(
+                waited_secs = waited.as_secs(),
+                "update_restart_window_clear"
+            );
+        }
+        RestartRelease::WindowExpired(waited) => {
+            let zones = playing_zone_ids(playback).await;
+            warn!(
+                waited_secs = waited.as_secs(),
+                zones = ?zones,
+                "update_restart_deferral_expired"
+            );
+        }
+    }
+}
+
+/// #7750 — libère la relance, PUIS seulement lance la bascule.
+///
+/// Sous Windows, `lancer` démarre `tune-update.bat`, qui n'attend la sortie du
+/// serveur que 60 s avant de passer outre. Lancé avant l'attente de fin de
+/// lecture (jusqu'à 2 h), il trouvait le binaire encore verrouillé, relançait
+/// l'ancien en doublon et se terminait ; le serveur sortait ensuite seul et
+/// restait arrêté, toujours dans l'ancienne version. Une erreur de `lancer`
+/// remonte telle quelle : l'appelant ne sort pas, le serveur reste en marche.
+async fn lancer_la_bascule_une_fois_libre(
+    playback: &tune_core::playback::PlaybackManager,
+    max: Duration,
+    poll: Duration,
+    set_phase: &(dyn Fn(&str) + Sync),
+    lancer: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    liberer_la_relance(playback, max, poll, set_phase).await;
+    lancer()
+}
+
 /// Can we actually create a file in `dir`? Permission *bits* are not the
 /// answer: a read-only mount, an ACL, or a SELinux label all deny the write
 /// while the mode still reads 0755. The only honest test is to create a file
@@ -2861,6 +2922,9 @@ pub(super) async fn update_install(
         // relu après : sous Linux, `current_exe()` suit le renommage du binaire
         // en cours et rendait `<exe>.old` — la relance ré-exécutait l'ancien.
         let chemin_a_relancer: Option<std::path::PathBuf>;
+        // #7750 — le script de bascule Windows, préparé à l'installation et
+        // lancé seulement quand la relance est libérée.
+        let mut bascule_windows: Option<BasculeWindows> = None;
         'installation: {
             // --- Paquet macOS complet (#5141) ---
             if let Some(app) = paquet_cible.clone() {
@@ -3031,17 +3095,22 @@ pub(super) async fn update_install(
                     let current_exe = std::env::current_exe()
                         .map_err(|e| format!("Cannot determine current exe: {e}"))?;
                     info!(exe = %current_exe.display(), "update_install_starting");
-                    install_windows(&current_exe, &new_binary, &tmp_dir).map(|()| current_exe)
+                    install_windows(&current_exe, &new_binary, &tmp_dir)
+                        .map(|bascule| (current_exe, Some(bascule)))
                 } else {
                     installer_unix_et_designer_la_relance(
                         &std::env::current_exe,
                         &new_binary,
                         &tmp_dir,
                     )
+                    .map(|relance| (relance, None))
                 }
             }));
             match install_outcome {
-                Ok(Ok(relance)) => chemin_a_relancer = Some(relance),
+                Ok(Ok((relance, bascule))) => {
+                    chemin_a_relancer = Some(relance);
+                    bascule_windows = bascule;
+                }
                 Ok(Err(e)) => {
                     let _ = std::fs::remove_dir_all(&tmp_dir);
                     set_phase(&format!("failed: Install failed: {e}"));
@@ -3090,44 +3159,35 @@ pub(super) async fn update_install(
         // l'état de lecture d'il y a un téléchargement. Borné par
         // `RESTART_DEFERRAL_MAX` pour qu'une zone oubliée en lecture ne bloque
         // pas les mises à jour à vie.
-        // #5531 — un scan qu'une mise à jour forcée a arrêté et qui n'avait
-        // pas encore rendu la main : lui laisser finir ses lectures en vol
-        // plutôt que de le couper par l'échange d'image. Borné ; le repère de
-        // reprise est posé de toute façon.
-        if super::scan::droit_de_scanner_tenu()
-            && let Err(attente) =
-                attendre_la_fin_du_scan(ARRET_DU_SCAN_MAX, ARRET_DU_SCAN_POLL).await
-        {
-            warn!(
-                attente_ms = attente.as_millis() as u64,
-                "update_restart_scan_toujours_actif"
-            );
-        }
-        if playback_in_progress(&state.playback).await {
-            set_phase("restart_pending_playback");
-        }
-        match defer_restart_until_quiet(
+        // #7750 — sous Windows, le script de bascule n'est lancé qu'ICI, une
+        // fois la relance libérée : lancé dès l'installation, il n'attendait
+        // le serveur que 60 s puis passait outre pendant que la lecture
+        // retenait la sortie, échouait sur le binaire verrouillé, et le
+        // serveur sortait ensuite sans plus personne pour le relancer.
+        let lancement = lancer_la_bascule_une_fois_libre(
             &state.playback,
             RESTART_DEFERRAL_MAX,
             RESTART_DEFERRAL_POLL,
+            &set_phase,
+            || {
+                bascule_windows
+                    .as_ref()
+                    .map_or(Ok(()), BasculeWindows::lancer)
+            },
         )
-        .await
-        {
-            RestartRelease::Idle => {}
-            RestartRelease::PlaybackEnded(waited) => {
-                info!(
-                    waited_secs = waited.as_secs(),
-                    "update_restart_window_clear"
-                );
+        .await;
+        if let Err(e) = lancement {
+            // Rien n'a été remplacé : le serveur reste en marche dans sa
+            // version d'origine, et l'écran dit pourquoi au lieu de le perdre.
+            if let Some(bascule) = &bascule_windows {
+                bascule.abandonner();
             }
-            RestartRelease::WindowExpired(waited) => {
-                let zones = playing_zone_ids(&state.playback).await;
-                warn!(
-                    waited_secs = waited.as_secs(),
-                    zones = ?zones,
-                    "update_restart_deferral_expired"
-                );
-            }
+            error!(error = %e, "update_win_bat_launch_failed");
+            set_phase(&format!(
+                "failed: Could not start the update script ({e}). Tune keeps running version {} — retry the update, or install it with the setup file.",
+                tune_core::version()
+            ));
+            return;
         }
 
         set_phase("restarting");
@@ -3157,7 +3217,8 @@ pub(super) async fn update_install(
         // spawn()+exit(0) so a supervised deployment still recovers.
         //
         // WINDOWS: we must NOT spawn or exec here. The binary is swapped by
-        // tune-update.bat, which first waits for THIS process to exit (matched by
+        // tune-update.bat, launched just above once the restart was released
+        // (#7750), which first waits for THIS process to exit (matched by
         // PID, with a 60s timeout backstop). Starting another process from the
         // still-old binary here would race the swap and could re-lock the .exe, so
         // we just exit; the .bat swaps the binary and starts the new one.
@@ -3697,7 +3758,9 @@ fn windows_update_bat(
          if errorlevel 1 goto do_swap\r\n\
          set /a TRIES+=1\r\n\
          if !TRIES! GEQ 60 (\r\n\
-           echo Timed out after 60s waiting for old process, proceeding anyway...\r\n\
+           echo Timed out after 60s waiting for old process, stopping it...\r\n\
+           taskkill /F /PID {pid} >nul 2>&1\r\n\
+           timeout /t 2 /nobreak >nul\r\n\
            goto do_swap\r\n\
          )\r\n\
          timeout /t 1 /nobreak >nul\r\n\
@@ -3728,11 +3791,38 @@ fn windows_update_bat(
     )
 }
 
+/// La bascule Windows préparée : binaire posé à côté, script écrit, rien de
+/// lancé. Le lancement attend que la relance soit libre (#7750).
+struct BasculeWindows {
+    bat: std::path::PathBuf,
+    binaire_pose: std::path::PathBuf,
+}
+
+impl BasculeWindows {
+    /// Démarre `tune-update.bat`. À n'appeler qu'au moment de sortir : dès
+    /// son lancement, le script ne laisse que 60 s au serveur pour s'arrêter,
+    /// après quoi il l'arrête de force.
+    fn lancer(&self) -> Result<(), String> {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "/min", "", &self.bat.to_string_lossy()])
+            .spawn()
+            .map_err(|e| format!("launch update.bat: {e}"))?;
+        info!("update_win_bat_launched — process will now exit for the swap");
+        Ok(())
+    }
+
+    /// Le script n'a pas pu partir : on retire le binaire posé, pour qu'aucun
+    /// reste ne passe pour une mise à jour en attente.
+    fn abandonner(&self) {
+        let _ = std::fs::remove_file(&self.binaire_pose);
+    }
+}
+
 fn install_windows(
     current_exe: &std::path::Path,
     new_binary: &std::path::Path,
     tmp_dir: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<BasculeWindows, String> {
     let exe_dir = current_exe
         .parent()
         .ok_or_else(|| "Cannot determine binary directory".to_string())?;
@@ -3750,7 +3840,10 @@ fn install_windows(
     // the binary is never swapped, and the OLD version comes back — an
     // intermittent "update did nothing" that reproduces only sometimes
     // (Christophe/Bilou/Yves). A PID filter is immune to that. A 60s timeout is
-    // the backstop so the swap is never blocked indefinitely.
+    // the backstop so the swap is never blocked indefinitely: the script is
+    // only launched when the server is about to exit (#7750), so a PID still
+    // alive after 60s is a hung exit, and the script stops it (taskkill on
+    // that PID only) instead of swapping against a locked binary.
     let pid = std::process::id();
     let err_file = exe_dir.join("tune-update-failed.txt");
 
@@ -3807,13 +3900,11 @@ fn install_windows(
     std::fs::write(&bat_path, bat_content).map_err(|e| format!("write update.bat: {e}"))?;
     info!(bat = %bat_path.display(), "update_win_bat_written");
 
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "/min", "", &bat_path.to_string_lossy()])
-        .spawn()
-        .map_err(|e| format!("launch update.bat: {e}"))?;
-    info!("update_win_bat_launched — process will now exit for the swap");
-
-    Ok(())
+    // #7750 — pas de lancement ici : voir `lancer_la_bascule_une_fois_libre`.
+    Ok(BasculeWindows {
+        bat: bat_path,
+        binaire_pose: new_staging,
+    })
 }
 
 /// Search a file for a byte pattern without loading it all into memory.
@@ -5657,9 +5748,22 @@ mod restart_deferral_tests {
     /// correctif juste qui n'est appelé nulle part ne coupe rien.
     #[test]
     fn the_install_task_defers_the_restart_before_re_execing() {
-        let corps = corps_de_update_install(include_str!("update.rs"));
+        let source = include_str!("update.rs");
+        // #7750 — le report passe par `liberer_la_relance`, appelée par
+        // `lancer_la_bascule_une_fois_libre` : on suit la chaîne.
+        let liberer = source
+            .find("async fn liberer_la_relance(")
+            .expect("`liberer_la_relance` introuvable");
+        let fin_liberer = source[liberer..]
+            .find("\n}\n")
+            .expect("fin de `liberer_la_relance` introuvable");
+        assert!(
+            source[liberer..liberer + fin_liberer].contains("defer_restart_until_quiet(playback"),
+            "`liberer_la_relance` n'appelle plus le report de relance (#2954)"
+        );
+        let corps = corps_de_update_install(source);
         let defer = corps
-            .find("defer_restart_until_quiet(")
+            .find("lancer_la_bascule_une_fois_libre(")
             .expect("la tâche d'installation n'appelle plus le report de relance (#2954)");
         let restart = corps
             .find("set_phase(\"restarting\")")
@@ -6074,6 +6178,132 @@ mod windows_update_bat_tests {
         );
         assert!(s.contains("tune-server.new.exe"));
         assert!(s.contains("tune-update-failed.txt"));
+    }
+
+    /// #7750 — à l'échéance, le script ne remplace plus le binaire contre un
+    /// serveur encore vivant : il arrête CE pid d'abord. Passer outre faisait
+    /// échouer `del`, relancer l'ancien en doublon, et laissait le serveur
+    /// arrêté une fois sorti.
+    #[test]
+    fn a_l_echeance_le_script_arrete_le_serveur_avant_de_basculer_7750() {
+        let s = script();
+        let echeance = s.find("GEQ 60").expect("pas d'échéance");
+        let suite = &s[echeance..];
+        let bascule = suite.find("goto do_swap").expect("pas de bascule");
+        let arret = suite.find("taskkill /F /PID 4242").unwrap_or(usize::MAX);
+        assert!(
+            arret < bascule,
+            "à l'échéance, le script bascule sans arrêter le serveur encore \
+             vivant (#7750) : {suite}"
+        );
+    }
+}
+
+/// #7750 — sous Windows, la mise à jour arrêtait le serveur sans l'installer
+/// ni le relancer : le script de bascule partait dès l'installation et
+/// n'attendait que 60 s, alors que le serveur retenait sa sortie jusqu'à la
+/// fin de la lecture.
+#[cfg(test)]
+mod bascule_windows_7750_tests {
+    use super::{install_windows, lancer_la_bascule_une_fois_libre};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tune_core::playback::{NowPlaying, PlaybackManager};
+
+    const MAX: Duration = Duration::from_secs(2 * 3600);
+    const POLL: Duration = Duration::from_secs(5);
+    /// Ce que `tune-update.bat` laisse au serveur pour sortir.
+    const MARGE_DU_SCRIPT: Duration = Duration::from_secs(60);
+
+    /// Le scénario de l'issue : une zone joue encore dix minutes après
+    /// l'installation, bien au-delà de la marge du script. Le script ne doit
+    /// partir qu'une fois la lecture finie, et la phase doit l'avoir dit.
+    #[tokio::test(start_paused = true)]
+    async fn le_script_ne_part_qu_apres_la_fin_de_la_lecture_7750() {
+        let pm = Arc::new(PlaybackManager::new());
+        pm.play(12, NowPlaying::default()).await;
+        let lecture = Duration::from_secs(10 * 60);
+        let arret = {
+            let pm = pm.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(lecture).await;
+                pm.stop(12).await;
+            })
+        };
+
+        let phases = Mutex::new(Vec::<String>::new());
+        let set_phase = |p: &str| phases.lock().unwrap().push(p.to_string());
+        let debut = tokio::time::Instant::now();
+        let mut lance_apres = None;
+        let resultat = lancer_la_bascule_une_fois_libre(&pm, MAX, POLL, &set_phase, || {
+            lance_apres = Some(debut.elapsed());
+            Ok(())
+        })
+        .await;
+        arret.await.unwrap();
+
+        assert_eq!(resultat, Ok(()));
+        let lance_apres = lance_apres.expect("le script n'a jamais été lancé");
+        assert!(
+            lance_apres >= lecture,
+            "le script de bascule est parti {}s après l'installation, pendant \
+             une lecture de {}s : il n'attend le serveur que {}s, échoue sur le \
+             binaire verrouillé et le serveur reste arrêté en ancienne version \
+             (#7750)",
+            lance_apres.as_secs(),
+            lecture.as_secs(),
+            MARGE_DU_SCRIPT.as_secs()
+        );
+        assert!(lance_apres < lecture + MARGE_DU_SCRIPT);
+        assert_eq!(
+            phases.lock().unwrap().as_slice(),
+            ["restart_pending_playback"]
+        );
+    }
+
+    /// Le lancement échoue (antivirus, `cmd` introuvable) : l'erreur remonte
+    /// et rien d'autre ne se passe. L'appelant passe alors en `failed` sans
+    /// sortir : le serveur reste en marche dans sa version d'origine.
+    #[tokio::test(start_paused = true)]
+    async fn un_lancement_impossible_remonte_sans_relance_7750() {
+        let pm = PlaybackManager::new();
+        let set_phase = |_: &str| {};
+        let resultat = lancer_la_bascule_une_fois_libre(&pm, MAX, POLL, &set_phase, || {
+            Err("launch update.bat: access denied".to_string())
+        })
+        .await;
+        assert_eq!(
+            resultat,
+            Err("launch update.bat: access denied".to_string())
+        );
+    }
+
+    /// L'installation prépare la bascule SANS la lancer : binaire posé à côté,
+    /// script écrit, et c'est tout. Remettre le lancement ici rétablirait le
+    /// défaut (et, hors Windows, fait échouer la préparation : pas de `cmd`).
+    #[test]
+    fn l_installation_prepare_sans_rien_lancer_7750() {
+        let dossier = tempfile::tempdir().unwrap();
+        let exe = dossier.path().join("tune-server.exe");
+        std::fs::write(&exe, b"ancienne").unwrap();
+        let archive = dossier.path().join("extrait");
+        std::fs::create_dir(&archive).unwrap();
+        let nouveau = archive.join("tune-server.exe");
+        std::fs::write(&nouveau, b"nouvelle").unwrap();
+
+        let bascule = install_windows(&exe, &nouveau, &archive)
+            .expect("la préparation de la bascule doit réussir sans rien lancer");
+
+        assert!(bascule.bat.ends_with("tune-update.bat"));
+        assert!(bascule.bat.exists(), "script non écrit");
+        assert_eq!(std::fs::read(&bascule.binaire_pose).unwrap(), b"nouvelle");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"ancienne");
+
+        bascule.abandonner();
+        assert!(
+            !bascule.binaire_pose.exists(),
+            "un lancement abandonné ne doit pas laisser le binaire posé"
+        );
     }
 }
 
