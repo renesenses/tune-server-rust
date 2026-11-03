@@ -121,3 +121,6 @@ pub mod upnp_revision;
 /// #5974 — un vidage qui échoue ne s'annonce plus réussi.
 #[cfg(test)]
 mod vidage_5974_tests;
+/// #7694 — la règle des dossiers miroirs ne fond pas deux qualités.
+#[cfg(test)]
+mod miroirs_de_qualite_7694_tests;
