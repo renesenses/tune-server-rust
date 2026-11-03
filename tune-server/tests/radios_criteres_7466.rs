@@ -174,6 +174,10 @@ async fn chaque_critere_sur_mes_radios_avec_sa_contre_epreuve() {
         ("country=FR", vec!["Critx Jazz"]),
         ("country=GB", vec!["Critx Rock"]),
         ("bitrate_min=320", vec!["Critx Jazz"]),
+        // #7718 — le niveau de qualité, sans distinction de format.
+        ("quality_min=320", vec!["Critx Jazz"]),
+        ("quality_min=128", vec!["Critx Jazz", "Critx Rock"]),
+        ("genre=rock&quality_min=320", vec![]),
         ("lossless=true", vec!["Critx Jazz"]),
         ("favorites_only=true", vec!["Critx Jazz"]),
         ("country=FR&codec=mp3", vec![]),
