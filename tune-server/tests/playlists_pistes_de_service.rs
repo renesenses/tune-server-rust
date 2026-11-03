@@ -518,3 +518,227 @@ async fn temoin_lire_une_playlist_locale_garde_le_chemin_d_avant() {
         vec![Some(t1), Some(t2)]
     );
 }
+
+#[tokio::test]
+async fn le_m3u_mixte_retrouve_les_metadonnees_qobuz_7738() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let appels = Arc::new(AtomicUsize::new(0));
+    let compteur = appels.clone();
+    let api = axum::Router::new().route(
+        "/track/get",
+        axum::routing::get(move || {
+            compteur.fetch_add(1, Ordering::SeqCst);
+            async {
+                axum::Json(json!({
+                    "id": 7738, "title": "Titre catalogue", "duration": 120,
+                    "performer": {"id": 42, "name": "Interprète"},
+                    "composer": {"name": "Compositeur"},
+                    "maximum_sampling_rate": 96, "maximum_bit_depth": 24,
+                    "album": {"id": "album7738", "title": "Album catalogue",
+                        "image": {"large": "https://example.invalid/7738.jpg"}}
+                }))
+            }
+        }),
+    );
+    let api = api.route(
+        "/track/getFileUrl",
+        axum::routing::get(|| async {
+            axum::Json(json!({
+                "track_id": 7738, "duration": 120, "url": "https://127.0.0.1:9/7738.flac",
+                "mime_type": "audio/flac", "sampling_rate": 44.1, "bit_depth": 16
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let serveur = tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+    let state = etat();
+    let mut qobuz = tune_core::streaming::qobuz::QobuzService::avec_bases_de_test(
+        "app-factice".into(),
+        "secret-factice".into(),
+        tune_core::streaming::qobuz::BasesQobuz {
+            api: base.clone(),
+            proxy: base.clone(),
+            config_distante: base,
+        },
+    );
+    use tune_core::streaming::traits::StreamingService;
+    assert!(qobuz.restore_tokens(&json!({"user_auth_token":"factice"})));
+    state.services.lock().await.register(Box::new(qobuz));
+    let sortie = "dlna:temoin-7738";
+    let zid = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .create("Témoin muet", Some("dlna"), Some(sortie))
+        .unwrap();
+    state.outputs.lock().await.register(Box::new(
+        tune_core::outputs::mock::MockOutput::new(sortie, "Témoin muet").with_type("dlna"),
+    ));
+    let local = piste(&state, "Titre local", "/musique/temoin.flac");
+    let app = appli(&state);
+    let contenu = "#EXTM3U\n/musique/temoin.flac\n#EXTINF:120,Titre importé\nqobuz://track/7738\n";
+    let corps = format!(
+        "--borne\r\nContent-Disposition: form-data; name=\"file\"; filename=\"temoin.m3u\"\r\nContent-Type: audio/x-mpegurl\r\n\r\n{contenu}\r\n--borne--\r\n"
+    );
+    let (status, cree) = reponse(
+        &app,
+        Request::post("/api/v1/playlists/import/m3u")
+            .header("content-type", "multipart/form-data; boundary=borne")
+            .body(Body::from(corps))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{cree}");
+    let id = cree["id"].as_i64().unwrap();
+    let lignes = pistes(&app, id).await;
+    assert_eq!(lignes.len(), 2);
+    assert_eq!(lignes[0]["id"], local, "le rang local ne change pas");
+    let q = &lignes[1];
+    assert_eq!(
+        q["artist_name"], "Interprète",
+        "le M3U Qobuz reste sans artiste"
+    );
+    assert_eq!(
+        q["album_title"], "Album catalogue",
+        "le M3U Qobuz reste sans album"
+    );
+    assert_eq!(
+        q["cover_path"], "https://example.invalid/7738.jpg",
+        "le M3U Qobuz reste sans pochette"
+    );
+    assert_eq!(q["composer"], "Compositeur");
+    assert_eq!(q["quality"]["sample_rate"], 96000);
+    assert_eq!(q["quality"]["bit_depth"], 24);
+    assert_eq!(
+        q["format"], "FLAC",
+        "le badge de playlist lit le format à plat"
+    );
+    assert_eq!(q["sample_rate"], 96000);
+    assert_eq!(q["bit_depth"], 24);
+    assert!(
+        q["id"].is_null(),
+        "un identifiant Qobuz n'est pas un tracks.id"
+    );
+    assert!(q["entry_id"].is_i64());
+    assert_eq!(pistes(&app, id).await, lignes);
+    assert_eq!(
+        appels.load(Ordering::SeqCst),
+        1,
+        "la relecture réinterroge le service"
+    );
+    let (code, lecture) = poste(
+        &app,
+        &format!("/api/v1/zones/{zid}/play"),
+        json!({"playlist_id":id,"start_index":1}),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::OK,
+        "lecture sur sortie factice : {lecture}"
+    );
+    for champ in ["artist_name", "album_title", "cover_path"] {
+        assert_eq!(
+            lecture["current_track"][champ], lignes[1][champ],
+            "le titre M3U masque {champ} en lecture"
+        );
+    }
+    let _ = poste(&app, &format!("/api/v1/zones/{zid}/stop"), json!({})).await;
+    let avant_desactivation = appels.load(Ordering::SeqCst);
+    state
+        .services
+        .lock()
+        .await
+        .get("qobuz")
+        .unwrap()
+        .write()
+        .await
+        .set_enabled(false);
+    let hors_ligne = pistes(&app, id).await;
+    assert_eq!(hors_ligne.len(), 2);
+    assert_eq!(hors_ligne[1]["title"], "Titre importé");
+    assert_eq!(
+        appels.load(Ordering::SeqCst),
+        avant_desactivation,
+        "service désactivé interrogé"
+    );
+    serveur.abort();
+}
+
+/// Recette volontaire sur le vrai service, base source ouverte en lecture seule.
+/// La playlist et la zone vivent uniquement dans la base mémoire du banc.
+#[tokio::test]
+#[ignore = "requiert TUNE_QOBUZ_PROOF_DB et une session réelle, sortie factice muette"]
+async fn preuve_reelle_m3u_qobuz_7738() {
+    use tune_core::streaming::traits::StreamingService;
+    let source = std::env::var("TUNE_QOBUZ_PROOF_DB").expect("base source explicite");
+    let db =
+        rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let tokens: String = db
+        .query_row(
+            "SELECT value FROM settings WHERE key='auth_tokens_qobuz'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(db);
+    let mut qobuz = tune_core::streaming::qobuz::QobuzService::new(String::new(), String::new());
+    assert!(qobuz.restore_tokens(&serde_json::from_str(&tokens).unwrap()));
+    drop(tokens);
+    let state = etat();
+    state.services.lock().await.register(Box::new(qobuz));
+    let sortie = "dlna:preuve-muette-7738";
+    let zid = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .create("Preuve muette", Some("dlna"), Some(sortie))
+        .unwrap();
+    state.outputs.lock().await.register(Box::new(
+        tune_core::outputs::mock::MockOutput::new(sortie, "Preuve muette").with_type("dlna"),
+    ));
+    let app = appli(&state);
+    let corps = "--borne\r\nContent-Disposition: form-data; name=\"file\"; filename=\"temoin.m3u\"\r\nContent-Type: audio/x-mpegurl\r\n\r\n#EXTM3U\n#EXTINF:597,Titre importe\nqobuz://track/32597024\n\r\n--borne--\r\n";
+    let (status, cree) = reponse(
+        &app,
+        Request::post("/api/v1/playlists/import/m3u")
+            .header("content-type", "multipart/form-data; boundary=borne")
+            .body(Body::from(corps))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = cree["id"].as_i64().unwrap();
+    let lignes = pistes(&app, id).await;
+    for champ in ["artist_name", "album_title", "cover_path", "quality"] {
+        assert!(!lignes[0][champ].is_null(), "fiche réelle sans {champ}");
+    }
+    let (status, lecture) = poste(
+        &app,
+        &format!("/api/v1/zones/{zid}/play"),
+        json!({"playlist_id": id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "la vraie résolution doit aboutir");
+    let (_, etat) = lis(&app, &format!("/api/v1/zones/{zid}")).await;
+    // Ne jamais imprimer les URL de transport ou les identifiants de la base source.
+    println!(
+        "fiche_reelle: artiste={} album={} pochette={} qualite={}",
+        !lignes[0]["artist_name"].is_null(),
+        !lignes[0]["album_title"].is_null(),
+        !lignes[0]["cover_path"].is_null(),
+        !lignes[0]["quality"].is_null()
+    );
+    let now = etat
+        .get("current_track")
+        .or_else(|| lecture.get("current_track"))
+        .expect("état de lecture");
+    for champ in ["artist_name", "album_title", "cover_path"] {
+        assert!(
+            now[champ].as_str().is_some_and(|s| !s.is_empty()),
+            "état de lecture réel sans {champ}"
+        );
+    }
+    println!("lecture_reelle: artiste=true album=true pochette=true sortie_factice=true");
+    let (status, _) = poste(&app, &format!("/api/v1/zones/{zid}/stop"), json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+}
