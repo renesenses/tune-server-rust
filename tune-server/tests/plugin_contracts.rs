@@ -100,6 +100,12 @@ mod sources_physiques_5065;
 #[cfg(feature = "entree-audio")]
 #[path = "entree_audio_catalogue_5296.rs"]
 mod entree_audio_catalogue_5296;
+// #7195 — « Ma collection physique » au catalogue (feature
+// `collection-physique`, dans `default`) : proposé, installé, actif, et le
+// jeton Discogs ne sort par aucune de ses routes.
+#[cfg(feature = "collection-physique")]
+#[path = "collection_physique_catalogue_7195.rs"]
+mod collection_physique_catalogue_7195;
 // Garde de la couture des FOURNISSEURS de sorties declares par un plugin.
 // Rattachee ici plutot qu en cible propre : `autotests = false` sur ce paquet,
 // donc un fichier non declare n est JAMAIS compile — vert contre rien. Et une
