@@ -907,3 +907,52 @@ fn les_caches_http_ne_gonflent_pas_la_sauvegarde_des_personnalisations_7286() {
         "exclure de la sauvegarde ne supprime pas le cache local"
     );
 }
+
+// #7286 : exercer le véritable dépôt HTTP, y compris un refus de proxy HTML.
+async fn depot_refuse_413(corps: &'static str) -> String {
+    use axum::{Router, http::StatusCode, routing::post};
+    let app = Router::new().route(
+        "/api/v1/config-backups",
+        post(move || async move { (StatusCode::PAYLOAD_TOO_LARGE, corps) }),
+    );
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let adresse = ecoute.local_addr().unwrap();
+    let serveur = tokio::spawn(async move {
+        axum::serve(ecoute, app).await.unwrap();
+    });
+    let b = base_neuve();
+    relier(&b, &format!("http://{adresse}"), "serveur-test");
+    // 6 octets UTF-8, mais seulement 4 caractères.
+    let erreur = deposer(&reglages(&b), &reqwest::Client::new(), "cle", "été!", None)
+        .await
+        .unwrap_err()
+        .to_string();
+    serveur.abort();
+    erreur
+}
+
+#[tokio::test]
+async fn refus_413_donne_taille_et_limite_du_site() {
+    let message = depot_refuse_413(r#"{"error":"payload_too_large","max_bytes":4}"#).await;
+    assert!(
+        message.contains("6 octets"),
+        "taille du blob absente : {message}"
+    );
+    assert!(
+        message.contains("limite : 4 octets"),
+        "limite du site perdue : {message}"
+    );
+}
+
+#[tokio::test]
+async fn refus_413_proxy_donne_taille_sans_inventer_la_limite() {
+    let message = depot_refuse_413("<html>413 Request Entity Too Large</html>").await;
+    assert!(
+        message.contains("6 octets"),
+        "taille du blob absente : {message}"
+    );
+    assert!(
+        message.contains("limite non communiquée"),
+        "limite inconnue non explicitée : {message}"
+    );
+}
