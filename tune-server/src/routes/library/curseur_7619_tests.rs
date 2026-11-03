@@ -1,7 +1,7 @@
 //! #7619 (L1) — `GET /library/tracks` par CURSEUR, de bout en bout.
 //!
-//! * la page triée (`order=asc`) et la vue par défaut (sans paramètre) rendent
-//!   `next_cursor` ; le suivre parcourt la vue entière, sans doublon ni trou,
+//! * la page explicitement demandée par `order=asc` rend `next_cursor` ;
+//!   le suivre parcourt la vue entière, sans doublon ni trou,
 //!   avec le même total, et les mêmes pistes que l'ancien chemin ;
 //! * `after` illisible, ou rendu pour un autre tri : 400, jamais ignoré.
 
@@ -79,16 +79,16 @@ async fn le_curseur_parcourt_la_vue_entiere_7619() {
         .iter()
         .filter_map(|t| t.id)
         .collect();
-    for premiere in ["/tracks?limit=37&order=asc", "/tracks?limit=37"] {
-        let (ids, total) = parcourir(&state, premiere).await;
-        let uniques: HashSet<i64> = ids.iter().copied().collect();
-        assert_eq!(uniques.len(), ids.len(), "{premiere} : doublon");
-        assert_eq!(
-            uniques, avant,
-            "{premiere} : pas les pistes de l'ancien chemin"
-        );
-        assert_eq!(total as usize, avant.len(), "{premiere} : total");
-    }
+    // Le chemin sans paramètre conserve le contrat historique (#1716).
+    let premiere = "/tracks?limit=37&order=asc";
+    let (ids, total) = parcourir(&state, premiere).await;
+    let uniques: HashSet<i64> = ids.iter().copied().collect();
+    assert_eq!(uniques.len(), ids.len(), "{premiere} : doublon");
+    assert_eq!(
+        uniques, avant,
+        "{premiere} : pas les pistes de l'ancien chemin"
+    );
+    assert_eq!(total as usize, avant.len(), "{premiere} : total");
 }
 
 #[tokio::test]

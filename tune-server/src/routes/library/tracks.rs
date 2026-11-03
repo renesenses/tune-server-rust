@@ -550,24 +550,9 @@ fn lire_la_page_de_pistes(
         // #5138 — la page et son total en UNE requête : le `WHERE` n'est plus
         // évalué deux fois par page. Seule une page vide (décalage au-delà de
         // la fin) ou une erreur recompte.
-        //
-        // #7619 (L1) — la vue par défaut passe par la clé de tri indexée :
-        // une page lit l'index dans l'ordre et s'arrête à `limit` (Oxygen,
-        // `getAllTracks` des clients en service). Mêmes champs qu'avant ; le
-        // curseur de la page suivante s'y ajoute.
-        let demande = tune_core::db::track_repo::DemandeDePistes {
-            filtre: filter,
-            limit,
-            offset,
-            ..Default::default()
-        };
-        if repo.assurer_les_cles_de_tri()
-            && let Ok(page) = repo.page_de_pistes(&demande)
-        {
-            let items = joindre_dr_par_piste(state, profile_id, page.pistes);
-            return json!({"items": items, "total": page.total, "limit": limit,
-                          "offset": offset, "next_cursor": page.curseur_suivant});
-        }
+        // Le curseur exige un paramètre de page triée (par exemple
+        // `order=asc`). Sans lui, conserver aussi l'ordre historique et
+        // les quatre champs attendus par les clients existants.
         let (items, total) = match repo.list_visible_avec_total(limit, offset) {
             Ok((tracks, Some(total))) => (tracks, total),
             Ok((tracks, None)) => (tracks, repo.count_visible().unwrap_or(0)),
