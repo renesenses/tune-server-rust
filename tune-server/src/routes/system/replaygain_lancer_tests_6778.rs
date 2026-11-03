@@ -17,7 +17,7 @@ use tune_core::db::settings_repo::SettingsRepo;
 
 /// La campagne et le rang au travail sont globaux au processus : les témoins
 /// montés de ce fichier les prennent tour à tour.
-static ETAT_GLOBAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ETAT_GLOBAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn etat() -> EtatDuLancement {
     EtatDuLancement {
@@ -126,7 +126,7 @@ async fn lancer(state: &AppState) -> (StatusCode, Value) {
 #[tokio::test]
 async fn la_route_montee_lance_la_passe_et_reveille_la_boucle_6778() {
     use tune_core::audio::replaygain as rg;
-    let _garde = ETAT_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _garde = ETAT_GLOBAL.lock().await;
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
 
     // Installation neuve : `replaygain_mode` absent vaut « off ».
@@ -197,7 +197,7 @@ async fn progression(state: &AppState) -> Value {
 async fn une_campagne_ouverte_sans_personne_au_travail_n_est_pas_en_cours_7724() {
     use tune_core::audio::replaygain as rg;
     use tune_core::taches_de_fond::ordre::{Rang, noter_rang_au_travail};
-    let _garde = ETAT_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _garde = ETAT_GLOBAL.lock().await;
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     SettingsRepo::with_backend(state.backend.clone())
         .set(rg::MODE_KEY, "track")
