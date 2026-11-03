@@ -375,13 +375,25 @@ impl RelayClient {
                     _ => self.http_client.get(&url),
                 };
 
+                let mut encodages = None;
                 if let Some(hdrs) = headers {
                     for (k, val) in &hdrs {
                         if let Some(v) = val.as_str() {
+                            if k.eq_ignore_ascii_case(ENTETE_ENCODAGES_ACCEPTES) {
+                                encodages = Some(v.to_string());
+                                continue;
+                            }
+                            if k.eq_ignore_ascii_case("accept-encoding") {
+                                continue;
+                            }
                             req = req.header(k.as_str(), v);
                         }
                     }
                 }
+                req = req.header(
+                    "accept-encoding",
+                    encodages.as_deref().unwrap_or("identity"),
+                );
                 // APRÈS les en-têtes du distant : voir `ENTETE_RELAIS`.
                 req = req.header(ENTETE_RELAIS, "1");
                 if let Some(b) = body {
@@ -782,6 +794,16 @@ pub(crate) type CanalVersLeRelais = Arc<tokio::sync::Mutex<Option<mpsc::Sender<T
 /// Même chaîne que `tune-bridge/src/protocol.rs`.
 pub(crate) const CAPACITE_MORCEAUX_BINAIRES: &str = "binary_stream_chunks_v1";
 
+/// Les compressions qu'accepte le navigateur distant, que le pont relaie sous
+/// ce nom (#7602). Même chaîne que `tune-bridge/src/api_proxy.rs`.
+///
+/// Le serveur le pose en `accept-encoding` sur sa requête locale : la route
+/// compresse alors comme pour un navigateur du réseau local, et
+/// `content-encoding` revient au pont avec la réponse. Sans lui, la requête
+/// locale part en `identity` : un pont antérieur ne rend pas
+/// `content-encoding`, une réponse compressée serait illisible au bout.
+pub(crate) const ENTETE_ENCODAGES_ACCEPTES: &str = "x-tune-accept-encoding";
+
 /// Premier octet d'une trame binaire de morceau : la version du format. Un
 /// pont qui reçoit une autre valeur jette la trame au lieu de la deviner.
 pub(crate) const VERSION_MORCEAU_BINAIRE: u8 = 1;
@@ -1001,6 +1023,11 @@ mod emission_vers_le_relais_tests {
 /// export (`content-disposition`) et les validateurs de cache d'une pochette
 /// (`cache-control`, `etag`, `last-modified`). Pas `content-length` : le pont
 /// le recalcule sur le corps qu'il rend.
+///
+/// Et `content-encoding` avec `vary` (#7602) : une réponse compressée parce
+/// que le pont a relayé [`ENTETE_ENCODAGES_ACCEPTES`]. Son corps, binaire,
+/// part en `body_base64` ; sans cet en-tête, le navigateur ne saurait pas
+/// qu'il doit le décompresser.
 pub(crate) fn entetes_de_reponse_dapi(
     entetes: &reqwest::header::HeaderMap,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -1018,6 +1045,8 @@ pub(crate) fn entetes_de_reponse_dapi(
         "cache-control",
         "etag",
         "last-modified",
+        "content-encoding",
+        "vary",
     ] {
         if let Some(valeur) = entetes.get(nom).and_then(|v| v.to_str().ok()) {
             sortie.insert(
@@ -1233,6 +1262,10 @@ pub fn spawn_relay_client(
 #[cfg(test)]
 #[path = "relay_renouvellement_tests.rs"]
 mod renouvellement_tests;
+
+#[cfg(test)]
+#[path = "relay_compression_7602_tests.rs"]
+mod compression_7602_tests;
 
 /// Tune Circle T4 (#5327) : `relay.circle_stream_request`, contre un faux
 /// serveur local qui note chaque chemin demandé.
