@@ -195,7 +195,7 @@ jobs:
     needs: impact
     if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45  # test — 4 min observe
+    timeout-minutes: 75  # test — 37 à 45 min observées début novembre (45 dépassé, PR #7711 et #7727)
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
