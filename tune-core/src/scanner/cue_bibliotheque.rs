@@ -3308,8 +3308,11 @@ mod tests {
 
         let db = base();
         for passe in 1..=2 {
-            let (_, bilan, _) =
-                inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+            let (_, bilan, _) = inventorier_et_ecrire(
+                db.clone(),
+                std::slice::from_ref(&dossier),
+                &racines(d.path()),
+            );
             assert_eq!(bilan.echecs, 0, "passe {passe} : {bilan:?}");
             let lignes = tranches_7751(&db, &images);
             assert_eq!(lignes.len(), 6, "passe {passe} : {lignes:?}");
