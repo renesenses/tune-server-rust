@@ -3265,8 +3265,17 @@ impl AlbumRepo {
     /// partagent l'expression AU CARACTÈRE PRÈS (#3397). Recopiée, elle
     /// dériverait, et le tri « Ajout récent » cesserait de correspondre à la
     /// date rendue.
+    ///
+    /// #7722 — la date mesurée est celle d'« Ajouts récents › Date de
+    /// création » ([`super::home_queries::DATE_DE_CREATION`]) : le btime du
+    /// fichier, sinon la première vue, sinon le mtime. La première vue seule
+    /// vaut le mtime d'origine d'un fichier recopié (#2138) : 3 000 pistes
+    /// déposées la veille se rangeaient parmi les vieux albums. Le texte de
+    /// la constante doit contenir `MAX(DATE_DE_CREATION)` au caractère près,
+    /// ce que garde un test.
     pub(crate) const ADDED_AT_SOURCE: &'static str = "SELECT t.album_id, \
-                MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION))) AS added_at \
+                MAX(COALESCE(ffs.created_at, COALESCE(ffs.first_seen_at, \
+     CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION)))) AS added_at \
            FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path";
 
     /// La date d'ajout des albums de la PAGE, en une requête groupée (#3397).
@@ -8427,6 +8436,72 @@ pub(crate) mod tests {
         let asc = arepo.list_sorted(100, 0, "added_at", "asc").unwrap();
         assert_eq!(asc[0].title, "C");
         assert_eq!(asc[2].title, "A");
+    }
+
+    /// #7722 — un album ajouté après les autres passe en tête de « Derniers
+    /// ajouts », même si ses fichiers ont gardé un mtime ancien.
+    ///
+    /// Le scan date la première vue par le mtime (#2138) ; une copie qui le
+    /// conserve range donc l'album parmi les vieux. Sa date de création, elle,
+    /// dit le jour du dépôt, comme « Ajouts récents › Date de création ».
+    #[test]
+    fn derniers_ajouts_suit_la_date_de_creation_7722() {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let ancien = arepo.create(&Album::new("Ancien".into())).unwrap();
+        let nouveau = arepo.create(&Album::new("Nouveau".into())).unwrap();
+        for (album_id, path) in [(ancien, "/ancien.flac"), (nouveau, "/nouveau.flac")] {
+            let mut t = Track::new("t".into());
+            t.album_id = Some(album_id);
+            t.file_path = Some(path.into());
+            t.file_mtime = Some(500.0);
+            trepo.create(&t).unwrap();
+        }
+        // « Ancien » : vu et créé il y a longtemps. « Nouveau » : déposé
+        // après, mais la première vue a repris son mtime d'origine (500).
+        for (path, seen, created) in [
+            ("/ancien.flac", 1000.0f64, 1000.0f64),
+            ("/nouveau.flac", 500.0, 3000.0),
+        ] {
+            db.execute_batch(&format!(
+                "UPDATE file_first_seen SET first_seen_at = {seen}, created_at = {created} \
+                 WHERE file_path = '{path}';"
+            ))
+            .unwrap();
+        }
+
+        for tri in ["added_at", "added_date", "added"] {
+            let desc = arepo.list_sorted(100, 0, tri, "desc").unwrap();
+            assert_eq!(
+                desc.iter().map(|a| a.title.as_str()).collect::<Vec<_>>(),
+                vec!["Nouveau", "Ancien"],
+                "tri {tri} : l'album ajouté le dernier doit être en tête (#7722)"
+            );
+            assert_eq!(
+                desc[0].added_at,
+                Some(3000.0),
+                "tri {tri} : la date rendue doit être la date de création"
+            );
+        }
+    }
+
+    /// #7722 — « Derniers ajouts » des albums et « Ajouts récents › Date de
+    /// création » lisent la même expression : recopiée, elle dériverait.
+    #[test]
+    fn derniers_ajouts_partage_l_expression_de_creation_7722() {
+        let attendu = format!(
+            "MAX({}) AS added_at",
+            crate::db::home_queries::DATE_DE_CREATION
+        );
+        assert!(
+            AlbumRepo::ADDED_AT_SOURCE.contains(&attendu),
+            "ADDED_AT_SOURCE doit mesurer MAX(DATE_DE_CREATION) : {}",
+            AlbumRepo::ADDED_AT_SOURCE
+        );
     }
 
     /// #3397 — la date d'ajout ne dépend PAS du tri demandé.
