@@ -42,6 +42,7 @@ pub struct AppState {
     pub streamer: Arc<AudioStreamer>,
     pub playback: Arc<PlaybackManager>,
     pub services: Arc<Mutex<ServiceRegistry>>,
+    pub(crate) metadonnees_playlists: Arc<crate::routes::playlists::metadonnees_7738::Cache>,
     pub outputs: Arc<Mutex<OutputRegistry>>,
     pub orchestrator: Arc<PlaybackOrchestrator>,
     /// Scanner SSDP partagé SANS mutex englobant : `rescan()` ne prend que
@@ -652,6 +653,7 @@ impl AppState {
             streamer,
             playback,
             services,
+            metadonnees_playlists: Arc::new(Default::default()),
             outputs,
             orchestrator,
             scanner,

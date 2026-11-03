@@ -1923,3 +1923,11 @@ path = "tests/groupe_dlna_joue_sur_les_deux_6155.rs"
 [[test]]
 name = "messages_seconde_passe_7077"
 path = "tests/messages_seconde_passe_7077.rs"
+
+# #7637 — l'entrée principale du menu Démarrer et le raccourci du Bureau
+# lancent le serveur sans console (relu dans le script NSIS de release.yml).
+# `autotests = false` plus haut : sans cette cible, le témoin ne serait
+# JAMAIS compilé.
+[[test]]
+name = "raccourcis_windows_sans_console_7637"
+path = "tests/raccourcis_windows_sans_console_7637.rs"
