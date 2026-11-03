@@ -903,13 +903,20 @@ jobs:
             FileClose `$0
 
             ; Start menu
+            ; #7637 - l'entree principale « Tune Server » et le raccourci du
+            ; Bureau lancent le serveur SANS fenetre de terminal (l'interface
+            ; se pilote par le navigateur). La console reste disponible, pour
+            ; le depannage, par une entree distincte.
             CreateDirectory "`$SMPROGRAMS\Tune Server"
-            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server.lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server.lnk" "`$INSTDIR\start-tune-server-sans-console.bat" "" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server (avec console, depannage).lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
             CreateShortcut "`$SMPROGRAMS\Tune Server\Uninstall.lnk" "`$INSTDIR\uninstall.exe"
-            ; #6253 - console reduite le temps du detachement, puis fermee.
-            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server (sans console).lnk" "`$INSTDIR\start-tune-server-sans-console.bat" "" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
             CreateShortcut "`$SMPROGRAMS\Tune Server\Quitter Tune Server.lnk" "`$SYSDIR\taskkill.exe" "/F /IM tune-server.exe" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
-            CreateShortcut "`$DESKTOP\Tune Server.lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
+            ; Journal du serveur (pas de console a rouvrir une fois cache).
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Journal de Tune Server.lnk" "`$WINDIR\notepad.exe" '"`$LOCALAPPDATA\TuneServer\tune-server.log"'
+            ; Ancien raccourci de la rc7 a la rc9, devenu l'entree principale.
+            Delete "`$SMPROGRAMS\Tune Server\Tune Server (sans console).lnk"
+            CreateShortcut "`$DESKTOP\Tune Server.lnk" "`$INSTDIR\start-tune-server-sans-console.bat" "" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
 
             WriteUninstaller "`$INSTDIR\uninstall.exe"
 
