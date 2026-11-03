@@ -923,10 +923,16 @@ async fn depot_refuse_413(corps: &'static str) -> String {
     let b = base_neuve();
     relier(&b, &format!("http://{adresse}"), "serveur-test");
     // 6 octets UTF-8, mais seulement 4 caractères.
-    let erreur = deposer(&reglages(&b), &reqwest::Client::new(), "cle", "été!", None)
-        .await
-        .unwrap_err()
-        .to_string();
+    let erreur = deposer(
+        &reglages(&b),
+        crate::http::client::shared(),
+        "cle",
+        "été!",
+        None,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     serveur.abort();
     erreur
 }
