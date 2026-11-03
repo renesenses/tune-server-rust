@@ -156,15 +156,105 @@ pub(super) fn stream_for_saved(
         .unwrap_or_default();
     let link = radio.id.and_then(|id| links.get(&id));
     let fiches = state.annuaire_radios.read().ok();
-    let fiche = fiches.as_ref().and_then(|fiches| {
-        fiches.iter().find(|f| match link {
-            Some(id) => f.external_id.as_ref() == Some(id),
-            None => super::super::radios_annuaire::flux_de_la_fiche(f, &radio.url),
-        })
-    });
+    let fiche = fiches
+        .as_ref()
+        .and_then(|fiches| fiche_suivie(fiches, link, &radio.url));
     match fiche {
         Some(f) => stream_for_directory(state, f, Some(&radio.url)).map(|s| s.url),
         None => Ok(radio.url.clone()),
+    }
+}
+
+/// La fiche que suit la lecture d'une station enregistrée : par son lien
+/// stable, sinon par son adresse exacte.
+fn fiche_suivie<'a>(
+    fiches: &'a [StationAnnuaire],
+    link: Option<&String>,
+    url: &str,
+) -> Option<&'a StationAnnuaire> {
+    fiches.iter().find(|f| match link {
+        Some(id) => f.external_id.as_ref() == Some(id),
+        None => super::super::radios_annuaire::flux_de_la_fiche(f, url),
+    })
+}
+
+/// #7721 — le débit affiché d'une station enregistrée est celui du flux que
+/// [`stream_for_saved`] jouera, pas celui de l'adresse enregistrée.
+///
+/// Une station peut garder l'adresse d'un flux réservé à d'autres pays (flux
+/// choisi dans la fiche, ou enregistré avant que l'annuaire publie ses
+/// restrictions). La lecture l'écarte et prend un autre flux, souvent moins
+/// haut ; l'écran annonçait pourtant toujours le débit enregistré : « 320 »
+/// pour un flux reçu à 96. Quand le flux joué n'est pas celui enregistré,
+/// `bitrate` et `codec` deviennent les siens, l'ancien débit reste sous
+/// `bitrate_enregistre`, et `flux_ecoute` dit lequel et pourquoi. Rien n'est
+/// écrit en base.
+///
+/// `corps` : une station sérialisée, ou un tableau de stations.
+pub(crate) fn annoncer_le_debit_ecoute(state: &AppState, corps: &mut Value) {
+    let Ok(fiches) = state.annuaire_radios.read() else {
+        return;
+    };
+    if fiches.is_empty() {
+        return;
+    }
+    let links = RadioRepo::with_backend(state.backend.clone())
+        .liens_annuaire()
+        .unwrap_or_default();
+    let country = listener_country(state);
+    let stations: Vec<&mut Value> = match corps {
+        Value::Array(stations) => stations.iter_mut().collect(),
+        station => vec![station],
+    };
+    for station in stations {
+        let Some(o) = station.as_object_mut() else {
+            continue;
+        };
+        let Some(url) = o
+            .get("stream_url")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let link = o
+            .get("id")
+            .and_then(Value::as_i64)
+            .and_then(|id| links.get(&id));
+        let Some(fiche) = fiche_suivie(&fiches, link, &url) else {
+            continue;
+        };
+        let Some(flux) = select_stream(fiche, country.as_deref(), Some(&url)) else {
+            continue;
+        };
+        if super::flux_normalise(&flux.url) == super::flux_normalise(&url) {
+            continue;
+        }
+        let enregistre = fiche
+            .flux_proposes()
+            .into_iter()
+            .find(|f| super::flux_normalise(&f.url) == super::flux_normalise(&url));
+        let raison = match enregistre {
+            // L'adresse enregistrée est de la fiche mais pas pour ce pays.
+            Some(f) if !f.restricted_to_countries.is_empty() => "restreint_au_pays",
+            // La fiche ne publie plus cette adresse : la lecture suit le lien.
+            _ => "hors_fiche",
+        };
+        let codec = flux.codec.as_deref().map(str::to_ascii_lowercase);
+        let ancien = o.get("bitrate").cloned().unwrap_or(Value::Null);
+        o.insert("bitrate_enregistre".into(), ancien);
+        o.insert("bitrate".into(), json!(flux.bitrate));
+        o.insert("codec".into(), json!(codec));
+        o.insert(
+            "flux_ecoute".into(),
+            json!({
+                "url": flux.url,
+                "bitrate": flux.bitrate,
+                "codec": codec,
+                "raison": raison,
+                "pays": country,
+            }),
+        );
     }
 }
 
@@ -186,3 +276,7 @@ pub(crate) fn stream_for_url(state: &AppState, url: &str) -> Result<String, Coun
 #[cfg(test)]
 #[path = "radios_geofencing_7199_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "radios_debit_ecoute_7721_tests.rs"]
+mod debit_ecoute_tests;

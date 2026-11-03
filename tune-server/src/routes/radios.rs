@@ -1691,6 +1691,8 @@ async fn list_radios(
     // d'annuaire la porte sous `annuaire` (logo, clé radio-metadata…). Rien
     // n'est écrit en base, et une station absente de l'annuaire reste là.
     super::radios_annuaire::rattacher_a_l_annuaire(&state, &mut corps);
+    // #7721 — le débit annoncé est celui du flux que la lecture prendra.
+    geofencing::annoncer_le_debit_ecoute(&state, &mut corps);
     Json(corps)
 }
 
@@ -1701,7 +1703,11 @@ async fn get_radio(
 ) -> impl IntoResponse {
     let repo = RadioRepo::with_backend(state.backend.clone());
     match repo.get(id) {
-        Ok(Some(r)) => Json(station_localisee(&r, &headers)).into_response(),
+        Ok(Some(r)) => {
+            let mut corps = station_localisee(&r, &headers);
+            geofencing::annoncer_le_debit_ecoute(&state, &mut corps);
+            Json(corps).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -2140,6 +2146,8 @@ async fn list_favorites(headers: HeaderMap, State(state): State<AppState>) -> Js
     // d'annuaire la porte sous `annuaire` (logo, clé radio-metadata…). Rien
     // n'est écrit en base, et une station absente de l'annuaire reste là.
     super::radios_annuaire::rattacher_a_l_annuaire(&state, &mut corps);
+    // #7721 — le débit annoncé est celui du flux que la lecture prendra.
+    geofencing::annoncer_le_debit_ecoute(&state, &mut corps);
     Json(corps)
 }
 

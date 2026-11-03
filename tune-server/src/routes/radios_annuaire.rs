@@ -958,6 +958,7 @@ async fn ajouter(
             rattachement(&fiche, Lien::Id, &station.url),
         );
     }
+    super::radios::geofencing::annoncer_le_debit_ecoute(&state, &mut sortie);
     (statut, Json(sortie)).into_response()
 }
 
@@ -1012,6 +1013,7 @@ async fn mettre_a_jour_le_flux(
             rattachement(&fiche, Lien::Id, &station.url),
         );
     }
+    super::radios::geofencing::annoncer_le_debit_ecoute(&state, &mut sortie);
     Json(sortie).into_response()
 }
 
@@ -1107,6 +1109,7 @@ async fn choisir_le_flux(
             rattachement(&fiche, Lien::Id, &station.url),
         );
     }
+    super::radios::geofencing::annoncer_le_debit_ecoute(&state, &mut sortie);
     Json(sortie).into_response()
 }
 
