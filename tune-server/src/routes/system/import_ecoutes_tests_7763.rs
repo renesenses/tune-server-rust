@@ -286,7 +286,10 @@ async fn l_import_m3u_ajoute_n_ecoutes_a_chaque_piste_trouvee_7763() {
     assert_eq!(apercu["total_rows"], 5);
     assert_eq!(apercu["matched"], 3);
     assert_eq!(apercu["unmatched"], 2);
-    assert_eq!(apercu["duplicates_skipped"], 1);
+    assert_eq!(
+        apercu["duplicates_skipped"], 1,
+        "une piste citée deux fois ne reçoit ses écoutes qu'une fois : {apercu}"
+    );
     assert_eq!(apercu["play_counts_updated"], 2);
     assert_eq!(apercu["plays_added"], 6);
     assert_eq!(
