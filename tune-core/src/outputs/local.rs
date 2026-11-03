@@ -1700,6 +1700,42 @@ impl LocalOutput {
             == enchainement_exclusif::BrasDeLecture::AsioExclusif
     }
 
+    /// #7265 — de quoi demander à cette sortie si elle peut porter un DoP,
+    /// relevé sous le verrou de la sortie ; la sonde elle-même
+    /// ([`SondeDuDop::sonder`]) se fait ensuite SANS lui, car elle parle au
+    /// pilote (COM) et un pilote bloqué ne doit pas geler la zone.
+    ///
+    /// La question ne vaut que pour WASAPI — partagé (format du mixeur) ou
+    /// exclusif (`IsFormatSupported`) : ASIO, CoreAudio, ALSA et un backend
+    /// « asio » rendent `None`, donc le comportement d'avant.
+    pub fn sonde_du_dop(&self) -> Option<SondeDuDop> {
+        #[cfg(target_os = "windows")]
+        {
+            let exclusif = match enchainement_exclusif::bras_de_cette_plateforme(
+                self.exclusive_mode,
+                &self.audio_backend,
+            ) {
+                enchainement_exclusif::BrasDeLecture::WasapiExclusif => true,
+                // Le partagé ne passe par le mixeur de Windows qu'hors ASIO.
+                enchainement_exclusif::BrasDeLecture::CpalPartage
+                    if !self.audio_backend.eq_ignore_ascii_case("asio") =>
+                {
+                    false
+                }
+                _ => return None,
+            };
+            Some(SondeDuDop {
+                device_name: self.device_name.clone(),
+                endpoint_id: self.endpoint_id.clone(),
+                exclusif,
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    }
+
     /// #5643 — le nom du périphérique, tel que la sortie l'ouvrira (la clé de
     /// la capacité DSD sondée, `outputs::capacite_dsd_natif`).
     pub fn nom_du_peripherique(&self) -> &str {
@@ -2026,6 +2062,56 @@ pub struct RingBuf {
     /// donc les six d'un seul geste, sans toucher à la signature d'un seul
     /// backend, et rend impossible l'oubli d'un site futur.
     starvation: Arc<RingStarvation>,
+}
+
+/// #7265 — une question « ce DoP passe-t-il ? » prête à poser à une sortie
+/// WASAPI, détachée de la sortie (voir [`LocalOutput::sonde_du_dop`]).
+#[derive(Debug, Clone)]
+pub struct SondeDuDop {
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    device_name: String,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    endpoint_id: Option<String>,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    exclusif: bool,
+}
+
+impl SondeDuDop {
+    /// Bloquant, borné à deux secondes : au-delà, `Inconnu` (le DoP est tenté
+    /// comme avant). En exclusif, une réponse concluante est retenue par
+    /// périphérique et par format (`dop_ecarte_7265`).
+    pub fn sonder(
+        &self,
+        cadence_dop: u32,
+        voies: u16,
+    ) -> crate::audio::dop_ecarte_7265::AccueilDuDop {
+        #[cfg(target_os = "windows")]
+        {
+            use crate::audio::dop_ecarte_7265 as ecart;
+            if self.exclusif
+                && let Some(connu) =
+                    ecart::accueil_exclusif_connu(&self.device_name, cadence_dop, voies)
+            {
+                return connu;
+            }
+            let accueil = super::wasapi_exclusive::sonder_l_accueil_du_dop(
+                &self.device_name,
+                self.endpoint_id.as_deref(),
+                cadence_dop,
+                voies,
+                self.exclusif,
+            );
+            if self.exclusif {
+                ecart::retenir_accueil_exclusif(&self.device_name, cadence_dop, voies, &accueil);
+            }
+            accueil
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (cadence_dop, voies);
+            crate::audio::dop_ecarte_7265::AccueilDuDop::Inconnu
+        }
+    }
 }
 
 /// Integer SPSC ring used by Windows exclusive backends when the source must
