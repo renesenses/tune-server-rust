@@ -1,3 +1,6 @@
+#[path = "playlists_metadonnees_7738.rs"]
+pub(crate) mod metadonnees_7738;
+
 use std::collections::HashSet;
 
 use axum::extract::{Multipart, Path, Query, State};
@@ -414,6 +417,7 @@ async fn get_tracks(
             v
         })
         .collect();
+    metadonnees_7738::completer(&state, &mut items).await;
     // #4806 — un titre banni reste DANS la playlist, grisé : `banned` le dit.
     // Une ligne de service (`id` nul) n'est jamais bannie : le bannissement
     // désigne un `tracks.id`.

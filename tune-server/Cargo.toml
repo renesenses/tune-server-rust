@@ -710,6 +710,14 @@ required-features = ["assistant-ia"]
 name = "portee_audit_repertoire_3101"
 path = "tests/portee_audit_repertoire_3101.rs"
 
+# #7671 : le catalogue imprimable de la bibliothèque (`GET
+# /export/catalogue.html`) — filtres, tri, pochette intégrée et AUCUN chemin
+# de fichier dans le document. Voisine de l'autre route d'export ci-dessus ;
+# sans cette cible (`autotests = false`), le témoin ne serait jamais compilé.
+[[test]]
+name = "catalogue_imprimable_7671"
+path = "tests/catalogue_imprimable_7671.rs"
+
 # #4101 : la vue Oxygen listait chaque piste de Led Zeppelin IV deux fois. Le
 # repli des copies de moindre qualite (#1362) etait pose sur la fiche d'album,
 # sur la file et sur `albums.track_count`, mais PAS sur `GET /library/tracks` —
@@ -1923,3 +1931,18 @@ path = "tests/groupe_dlna_joue_sur_les_deux_6155.rs"
 [[test]]
 name = "messages_seconde_passe_7077"
 path = "tests/messages_seconde_passe_7077.rs"
+
+# #7637 — l'entrée principale du menu Démarrer et le raccourci du Bureau
+# lancent le serveur sans console (relu dans le script NSIS de release.yml).
+# `autotests = false` plus haut : sans cette cible, le témoin ne serait
+# JAMAIS compilé.
+[[test]]
+name = "raccourcis_windows_sans_console_7637"
+path = "tests/raccourcis_windows_sans_console_7637.rs"
+
+# #7726 — retirer la licence libère la machine auprès du site de licences
+# (faux site local), et efface la clé même quand le site ne répond pas.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "licence_retrait_libere_la_machine_7726"
+path = "tests/licence_retrait_libere_la_machine_7726.rs"
