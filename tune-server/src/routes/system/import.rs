@@ -1156,13 +1156,21 @@ pub(super) struct OptionsEcoutesM3u {
 ///   (`db::ecoutes_importees`) ; la liste ne porte pas de date, la dernière
 ///   écoute ne change donc pas. Aucune liste de lecture n'est créée.
 /// * `?preview=true` rend le même rapport sans rien écrire.
+/// * Une ligne trouvée par la recherche par nom de fichier, et non par son
+///   chemin exact, reçoit ses écoutes comme les autres, mais le rapport la
+///   compte à part (`fuzzy_matched`, échantillon `fuzzy_matched_paths`) : la
+///   recherche prend le premier résultat, qui peut être une autre piste.
+///   L'aperçu permet de le voir avant d'écrire.
 ///
-/// Réponse `200` : `total_rows` (lignes), `matched`, `unmatched`,
+/// Réponse `200` : `total_rows` (lignes), `matched`, `fuzzy_matched`,
+/// `unmatched`,
 /// `lookup_errors`, `duplicates_skipped`, `play_counts_updated` (pistes),
 /// `plays_added` (écoutes), `plays_per_track`, `ratings_updated` (toujours 0),
 /// `preview`, et un échantillon borné des lignes non trouvées
-/// (`not_found_paths`, `not_found_truncated`). Refus nommés : `400
-/// plays_hors_bornes`, `400 preview_illisible`, `400 fichier_absent`, `415
+/// (`not_found_paths`, `not_found_truncated`) et des lignes trouvées par
+/// recherche (`fuzzy_matched_paths`, `fuzzy_matched_truncated`). Refus
+/// nommés : `400 plays_hors_bornes`, `400 requete_illisible`, `400
+/// fichier_absent`, `415
 /// televersement_attendu`, `500 index_bibliotheque_illisible`.
 pub(super) async fn import_m3u_plays(State(state): State<AppState>, req: Request) -> Response {
     let options = match Query::<OptionsEcoutesM3u>::try_from_uri(req.uri()) {
@@ -1170,7 +1178,7 @@ pub(super) async fn import_m3u_plays(State(state): State<AppState>, req: Request
         Err(e) => {
             return refus_dimport(
                 StatusCode::BAD_REQUEST,
-                "preview_illisible",
+                "requete_illisible",
                 format!(
                     "`?plays=` attend un entier et `?preview=` `true` ou `false` ; \
                      rien n'a été importé. Détail : {e}"
@@ -1221,6 +1229,7 @@ fn ecoutes_depuis_m3u(
     apercu: bool,
 ) -> Result<Value, String> {
     const ECHANTILLON_NON_TROUVEES: usize = 100;
+    const ECHANTILLON_PAR_RECHERCHE: usize = 100;
     let track_repo = TrackRepo::with_backend(backend.clone());
     let mut locales = crate::routes::playlists::RapprochementLocalM3u::nouveau(&track_repo)?;
 
@@ -1229,6 +1238,7 @@ fn ecoutes_depuis_m3u(
     let mut non_trouvees = 0usize;
     let mut erreurs = 0usize;
     let mut echantillon: Vec<String> = Vec::new();
+    let mut par_recherche: Vec<String> = Vec::new();
     let mut pistes: Vec<i64> = Vec::new();
     let mut vues = std::collections::HashSet::new();
 
@@ -1238,11 +1248,16 @@ fn ecoutes_depuis_m3u(
         let est_un_service = ligne
             .split_once("://")
             .is_some_and(|(sch, _)| !sch.eq_ignore_ascii_case("file"));
+        let avant = locales.trouvees_par_recherche;
         let resultat = if est_un_service {
             crate::routes::playlists::LigneM3u::Absente
         } else {
             locales.piste(ligne)
         };
+        if locales.trouvees_par_recherche > avant && par_recherche.len() < ECHANTILLON_PAR_RECHERCHE
+        {
+            par_recherche.push(ligne.to_string());
+        }
         match resultat {
             crate::routes::playlists::LigneM3u::Trouvee(id) => {
                 trouvees += 1;
@@ -1285,6 +1300,7 @@ fn ecoutes_depuis_m3u(
         n,
         apercu,
         recherche_plafonnee = locales.recherche_plafonnee,
+        par_recherche = locales.trouvees_par_recherche,
         "import_m3u_plays_termine"
     );
     Ok(json!({
@@ -1292,6 +1308,7 @@ fn ecoutes_depuis_m3u(
         "preview": apercu,
         "total_rows": total,
         "matched": trouvees,
+        "fuzzy_matched": locales.trouvees_par_recherche,
         "unmatched": non_trouvees,
         "lookup_errors": erreurs,
         "duplicates_skipped": trouvees - pistes.len(),
@@ -1302,6 +1319,8 @@ fn ecoutes_depuis_m3u(
         "history_entries_added": 0,
         "not_found_paths": echantillon,
         "not_found_truncated": non_trouvees > echantillon.len(),
+        "fuzzy_matched_paths": par_recherche,
+        "fuzzy_matched_truncated": locales.trouvees_par_recherche as usize > par_recherche.len(),
     }))
 }
 

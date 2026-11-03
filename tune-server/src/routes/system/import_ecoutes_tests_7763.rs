@@ -285,6 +285,10 @@ async fn l_import_m3u_ajoute_n_ecoutes_a_chaque_piste_trouvee_7763() {
     assert_eq!(apercu["preview"], true);
     assert_eq!(apercu["total_rows"], 5);
     assert_eq!(apercu["matched"], 3);
+    assert_eq!(
+        apercu["fuzzy_matched"], 0,
+        "toutes les lignes trouvées l'ont été par leur chemin exact : {apercu}"
+    );
     assert_eq!(apercu["unmatched"], 2);
     assert_eq!(
         apercu["duplicates_skipped"], 1,
@@ -333,6 +337,73 @@ async fn l_import_m3u_ajoute_n_ecoutes_a_chaque_piste_trouvee_7763() {
         compter(db, "SELECT COUNT(*) FROM playlists"),
         0,
         "l'import d'écoutes ne crée pas de liste de lecture"
+    );
+}
+
+/// Une ligne dont le chemin n'est plus celui de la bibliothèque (disque
+/// renommé) n'est trouvée que par la recherche sur son nom de fichier, qui
+/// prend le premier résultat. Elle reçoit ses écoutes, mais le rapport la
+/// compte à part, aperçu compris, pour qu'on puisse la vérifier avant
+/// d'écrire.
+#[tokio::test]
+async fn l_import_m3u_signale_les_pistes_trouvees_par_recherche_7763() {
+    let state = etat();
+    let db = &state.backend;
+    let a = piste(db, "Alpha", "/music/a.flac");
+    let g = piste(db, "Gamma", "/music/gamma.flac");
+    let liste = "#EXTM3U\n/music/a.flac\n/ancien-disque/Gamma.flac\n";
+
+    let (statut, apercu) = televerser(
+        &state,
+        "/api/v1/system/import/m3u-plays?plays=2&preview=true",
+        "liste.m3u",
+        liste,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{apercu}");
+    assert_eq!(apercu["matched"], 2, "{apercu}");
+    assert_eq!(
+        apercu["fuzzy_matched"], 1,
+        "la ligne trouvée par son nom de fichier, et non par son chemin, doit \
+         être comptée à part : {apercu}"
+    );
+    assert_eq!(
+        apercu["fuzzy_matched_paths"],
+        json!(["/ancien-disque/Gamma.flac"])
+    );
+    assert_eq!(apercu["fuzzy_matched_truncated"], false);
+    assert_eq!(compter(db, "SELECT COUNT(*) FROM imported_plays"), 0);
+
+    let (statut, rapport) = televerser(
+        &state,
+        "/api/v1/system/import/m3u-plays?plays=2",
+        "liste.m3u",
+        liste,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{rapport}");
+    assert_eq!(rapport["fuzzy_matched"], 1, "{rapport}");
+    assert_eq!(ecoutes(db, a).0, 2);
+    assert_eq!(ecoutes(db, g).0, 2);
+}
+
+/// Un `?plays=` qui n'est pas un entier : refus nommé, rien d'écrit.
+#[tokio::test]
+async fn l_import_m3u_refuse_une_requete_illisible_7763() {
+    let state = etat();
+    piste(&state.backend, "Alpha", "/music/a.flac");
+    let (statut, v) = televerser(
+        &state,
+        "/api/v1/system/import/m3u-plays?plays=abc",
+        "liste.m3u",
+        M3U,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "requete_illisible", "{v}");
+    assert_eq!(
+        compter(&state.backend, "SELECT COUNT(*) FROM imported_plays"),
+        0
     );
 }
 

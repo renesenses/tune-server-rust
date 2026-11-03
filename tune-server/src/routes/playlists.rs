@@ -959,6 +959,10 @@ pub(crate) struct RapprochementLocalM3u<'a> {
     recherches: u32,
     /// Vrai dès qu'une ligne n'a pas été cherchée faute de budget.
     pub(crate) recherche_plafonnee: bool,
+    /// Lignes trouvées par la recherche par nom de fichier, et non par leur
+    /// chemin exact : le premier résultat, qui peut être une autre piste.
+    /// L'import d'écoutes les compte à part (#7763).
+    pub(crate) trouvees_par_recherche: u32,
 }
 
 impl<'a> RapprochementLocalM3u<'a> {
@@ -976,6 +980,7 @@ impl<'a> RapprochementLocalM3u<'a> {
             path_to_id,
             recherches: 0,
             recherche_plafonnee: false,
+            trouvees_par_recherche: 0,
         })
     }
 
@@ -994,7 +999,10 @@ impl<'a> RapprochementLocalM3u<'a> {
             .unwrap_or(line);
         match self.track_repo.search(filename, 1) {
             Ok(results) => match results.first().and_then(|t| t.id) {
-                Some(id) => LigneM3u::Trouvee(id),
+                Some(id) => {
+                    self.trouvees_par_recherche += 1;
+                    LigneM3u::Trouvee(id)
+                }
                 None => LigneM3u::Absente,
             },
             Err(e) => LigneM3u::ErreurDeRecherche(e.to_string()),
