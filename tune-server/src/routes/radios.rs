@@ -542,6 +542,8 @@ struct SearchQuery {
     country: Option<String>,
     codec: Option<String>,
     bitrate_min: Option<i32>,
+    /// #7718 — le niveau de qualité minimal d'au moins un flux.
+    quality_min: Option<String>,
     lossless: Option<bool>,
     hires: Option<bool>,
     favorites_only: Option<bool>,
@@ -562,6 +564,7 @@ impl SearchQuery {
             self.rated_min,
             self.metadata_plus,
         )
+        .avec_qualite_min(self.quality_min.as_deref())
     }
 }
 

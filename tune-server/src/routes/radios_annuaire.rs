@@ -579,6 +579,8 @@ pub struct FiltresAnnuaire {
     /// #7466 — les critères de [`super::radios_criteres_7466::Criteres`].
     pub codec: Option<String>,
     pub bitrate_min: Option<i32>,
+    /// #7718 — le niveau de qualité minimal d'au moins un flux.
+    pub quality_min: Option<String>,
     pub lossless: Option<bool>,
     pub hires: Option<bool>,
     pub favorites_only: Option<bool>,
@@ -599,6 +601,7 @@ impl FiltresAnnuaire {
             self.rated_min,
             self.metadata_plus,
         )
+        .avec_qualite_min(self.quality_min.as_deref())
     }
 }
 
