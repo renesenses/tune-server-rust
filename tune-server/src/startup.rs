@@ -642,6 +642,9 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // lecture et rien d'écrit sur une base déjà passée. Avant la boucle de
     // synchronisation, qui ne les ramènera plus.
     tune_core::db::radios_indexees_upnp_6500::passe_journalisee(&state.backend);
+    // #7695 — de même pour les photos et vidéos d'un partage multimédia
+    // (DNG d'un portable Windows), rangées dans `tracks` avant le correctif.
+    tune_core::db::photos_indexees_upnp_7695::passe_journalisee(&state.backend);
     restore_zone_volumes(state).await;
     restaurer_la_lecture(state, config).await;
     restore_oaat_groups(state).await;

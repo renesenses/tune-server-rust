@@ -465,6 +465,10 @@ name = "radios_upnp_hors_des_pistes_6500"
 path = "tests/radios_upnp_hors_des_pistes_6500.rs"
 
 [[test]]
+name = "photos_upnp_hors_des_pistes_7695"
+path = "tests/photos_upnp_hors_des_pistes_7695.rs"
+
+[[test]]
 name = "plugin_contracts"
 path = "tests/plugin_contracts.rs"
 
