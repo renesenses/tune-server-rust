@@ -26,9 +26,12 @@ use crate::state::AppState;
 /// Une station sérialisée, enrichie de ses repères stables dans la langue de
 /// la requête. Toutes les routes qui rendent UNE station passent par ici : un
 /// point de sortie oublié est exactement le défaut corrigé ici.
-fn station_localisee(station: &RadioStation, headers: &HeaderMap) -> Value {
+///
+/// #7721 — le débit annoncé y est aussi celui du flux que la lecture prendra.
+fn station_localisee(state: &AppState, station: &RadioStation, headers: &HeaderMap) -> Value {
     let mut corps = json!(station);
     radios_libelles::enrichir(&mut corps, &crate::i18n::lang_from_header(headers));
+    geofencing::annoncer_le_debit_ecoute(state, &mut corps);
     corps
 }
 
@@ -1703,11 +1706,7 @@ async fn get_radio(
 ) -> impl IntoResponse {
     let repo = RadioRepo::with_backend(state.backend.clone());
     match repo.get(id) {
-        Ok(Some(r)) => {
-            let mut corps = station_localisee(&r, &headers);
-            geofencing::annoncer_le_debit_ecoute(&state, &mut corps);
-            Json(corps).into_response()
-        }
+        Ok(Some(r)) => Json(station_localisee(&state, &r, &headers)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -1789,7 +1788,7 @@ async fn create_radio(
             });
             (
                 StatusCode::CREATED,
-                Json(station_localisee(&created, &headers)),
+                Json(station_localisee(&state, &created, &headers)),
             )
                 .into_response()
         }
@@ -1910,7 +1909,7 @@ async fn update_radio(
                 "library.radios_changed",
                 json!({"action": "updated", "id": id}),
             );
-            Json(station_localisee(&station, &headers)).into_response()
+            Json(station_localisee(&state, &station, &headers)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -2130,11 +2129,11 @@ async fn search_radios(
         autre => autre,
     };
 
-    (
-        issue.statut_http(),
-        Json(corps_recherche(&issue, &items, &suggestions, portee, &lang)),
-    )
-        .into_response()
+    let mut corps = corps_recherche(&issue, &items, &suggestions, portee, &lang);
+    // #7721 — les stations de « Mes radios » trouvées annoncent, comme dans
+    // `GET /radios`, le débit du flux que la lecture prendra.
+    geofencing::annoncer_le_debit_ecoute(&state, &mut corps["items"]);
+    (issue.statut_http(), Json(corps)).into_response()
 }
 
 async fn list_favorites(headers: HeaderMap, State(state): State<AppState>) -> Json<Value> {
@@ -2403,7 +2402,7 @@ async fn set_radio_artwork(
 
     radio.logo_url = Some(hash.clone());
     repo.update(&radio).ok();
-    Json(station_localisee(&radio, &headers)).into_response()
+    Json(station_localisee(&state, &radio, &headers)).into_response()
 }
 
 async fn export_radios_m3u(State(state): State<AppState>) -> impl IntoResponse {

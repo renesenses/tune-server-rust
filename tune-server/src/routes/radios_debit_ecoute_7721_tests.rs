@@ -149,3 +149,115 @@ async fn choisir_le_flux_reserve_annonce_le_debit_reellement_joue_7721() {
     );
     assert_eq!(corps["flux_ecoute"]["url"], FLUX_MONDE, "{corps}");
 }
+
+/// Une requête à corps JSON, qui rend le corps de la réponse.
+async fn envoyer(app: &axum::Router, methode: &str, path: &str, corps: Value) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(methode)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(corps.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{methode} {path}: {}",
+        response.status()
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Revue de la PR 7803 : toutes les routes qui rendent une station de « Mes
+/// radios » passent par `station_localisee`, et la recherche par ses `items`.
+/// Une seule oubliée suffit à réafficher 320 sur l'écran qui la relit.
+#[tokio::test]
+async fn toutes_les_routes_qui_rendent_la_station_annoncent_le_debit_joue_7721() {
+    let (state, radio) = station_sur_le_flux_gb("FR");
+    let id = radio.id.unwrap();
+    RadioRepo::with_backend(state.backend.clone())
+        .set_favorite(id, true)
+        .unwrap();
+    let app = crate::routes::router(state.clone());
+
+    let modifiee = envoyer(
+        &app,
+        "PUT",
+        &format!("/api/v1/radios/{id}"),
+        json!({"name": "Station témoin 7721 renommée"}),
+    )
+    .await;
+    let recherche = get(&app, "/api/v1/radios/search?q=renomm%C3%A9e").await;
+    let trouvee = recherche["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("la recherche rend `items` : {recherche}"))
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap_or_else(|| panic!("la station renommée est trouvée : {recherche}"))
+        .clone();
+    let favoris = get(&app, "/api/v1/radios/favorites").await;
+    let favorite = favoris
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap()
+        .clone();
+    // Créée à la main sur l'adresse du flux réservé, sans lien : la lecture
+    // la retrouve dans la fiche par son adresse, et joue le flux mondial.
+    let creee = envoyer(
+        &app,
+        "POST",
+        "/api/v1/radios",
+        json!({"name": "Station témoin 7721 bis", "url": FLUX_GB, "bitrate": 320}),
+    )
+    .await;
+
+    for (route, corps) in [
+        ("PUT /radios/{id}", modifiee),
+        ("GET /radios/search (items)", trouvee),
+        ("GET /radios/favorites", favorite),
+        ("POST /radios", creee),
+    ] {
+        assert_eq!(
+            corps["bitrate"], 96,
+            "{route} : le débit affiché doit être celui du flux joué ({FLUX_MONDE}), \
+             pas les 320 kbit/s du flux enregistré réservé au Royaume-Uni : {corps}"
+        );
+        assert_eq!(corps["bitrate_enregistre"], 320, "{route}: {corps}");
+        assert_eq!(corps["flux_ecoute"]["url"], FLUX_MONDE, "{route}: {corps}");
+        assert_eq!(
+            corps["flux_ecoute"]["raison"], "restreint_au_pays",
+            "{route}: {corps}"
+        );
+    }
+}
+
+/// La fiche ne publie plus l'adresse enregistrée : la lecture suit le lien
+/// vers un flux de la fiche, et l'annonce dit pourquoi (`hors_fiche`).
+#[tokio::test]
+async fn adresse_disparue_de_la_fiche_annonce_le_flux_suivi_7721() {
+    let (state, mut radio) = station_sur_le_flux_gb("FR");
+    let id = radio.id.unwrap();
+    radio.url = "https://radio.example/ancien_128.mp3".into();
+    radio.bitrate = Some(128);
+    RadioRepo::with_backend(state.backend.clone())
+        .update(&radio)
+        .unwrap();
+    let joue = stream_for_saved(&state, &radio).unwrap();
+    assert_ne!(joue, radio.url, "la lecture suit la fiche liée");
+
+    let app = crate::routes::router(state);
+    let corps = get(&app, &format!("/api/v1/radios/{id}")).await;
+    assert_eq!(corps["flux_ecoute"]["url"], joue, "{corps}");
+    assert_eq!(corps["flux_ecoute"]["raison"], "hors_fiche", "{corps}");
+    assert_eq!(corps["bitrate_enregistre"], 128, "{corps}");
+    assert_eq!(corps["bitrate"], corps["flux_ecoute"]["bitrate"], "{corps}");
+}

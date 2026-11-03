@@ -202,6 +202,16 @@ pub(crate) fn annoncer_le_debit_ecoute(state: &AppState, corps: &mut Value) {
         .liens_annuaire()
         .unwrap_or_default();
     let country = listener_country(state);
+    // Une liste de « Mes radios » peut compter des centaines de stations :
+    // les fiches liées se retrouvent par leur identifiant en une table, faite
+    // une fois par appel, plutôt qu'en parcourant l'annuaire pour chacune.
+    // La première fiche d'un identifiant l'emporte, comme dans `fiche_suivie`.
+    let mut par_id: std::collections::HashMap<&str, &StationAnnuaire> = Default::default();
+    for f in fiches.iter() {
+        if let Some(id) = f.external_id.as_deref() {
+            par_id.entry(id).or_insert(f);
+        }
+    }
     let stations: Vec<&mut Value> = match corps {
         Value::Array(stations) => stations.iter_mut().collect(),
         station => vec![station],
@@ -221,7 +231,12 @@ pub(crate) fn annoncer_le_debit_ecoute(state: &AppState, corps: &mut Value) {
             .get("id")
             .and_then(Value::as_i64)
             .and_then(|id| links.get(&id));
-        let Some(fiche) = fiche_suivie(&fiches, link, &url) else {
+        // Même règle que `fiche_suivie` : le lien, sinon l'adresse exacte.
+        let fiche = match link {
+            Some(id) => par_id.get(id.as_str()).copied(),
+            None => fiche_suivie(&fiches, None, &url),
+        };
+        let Some(fiche) = fiche else {
             continue;
         };
         let Some(flux) = select_stream(fiche, country.as_deref(), Some(&url)) else {
