@@ -2446,8 +2446,16 @@ mod tests {
                 .fetch_one(&mut c)
                 .await
                 .unwrap();
+            // Le dernier script embarqué, et non un numéro en dur : chaque
+            // nouvelle migration PostgreSQL cassait sinon ce témoin (#7763).
+            let derniere = crate::db::migrations::PG_MIGRATIONS
+                .iter()
+                .map(|(v, _, _)| *v)
+                .max()
+                .unwrap();
+            assert!(derniere > 99, "aucun script au-dela de la sentinelle 99");
             assert_eq!(
-                version, 100,
+                version, derniere,
                 "la bascule ne doit pas rester sur la sentinelle 99"
             );
             c.close().await.ok();

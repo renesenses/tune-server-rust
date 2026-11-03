@@ -1162,16 +1162,15 @@ pub(super) struct OptionsEcoutesM3u {
 ///   recherche prend le premier résultat, qui peut être une autre piste.
 ///   L'aperçu permet de le voir avant d'écrire.
 ///
-/// Réponse `200` : `total_rows` (lignes), `matched`, `fuzzy_matched`,
-/// `unmatched`,
-/// `lookup_errors`, `duplicates_skipped`, `play_counts_updated` (pistes),
-/// `plays_added` (écoutes), `plays_per_track`, `ratings_updated` (toujours 0),
-/// `preview`, et un échantillon borné des lignes non trouvées
-/// (`not_found_paths`, `not_found_truncated`) et des lignes trouvées par
-/// recherche (`fuzzy_matched_paths`, `fuzzy_matched_truncated`). Refus
-/// nommés : `400 plays_hors_bornes`, `400 requete_illisible`, `400
-/// fichier_absent`, `415
-/// televersement_attendu`, `500 index_bibliotheque_illisible`.
+/// Réponse `200` : `total_rows`, `matched`, `fuzzy_matched` et `unmatched`
+/// (lignes, doublons compris), `lookup_errors`, `duplicates_skipped`,
+/// `play_counts_updated` (pistes), `plays_added` (écoutes), `plays_per_track`,
+/// `ratings_updated` (toujours 0), `preview`, et un échantillon borné des
+/// lignes non trouvées (`not_found_paths`, `not_found_truncated`) et des
+/// lignes trouvées par recherche (`fuzzy_matched_paths`,
+/// `fuzzy_matched_truncated`). Refus nommés : `400 plays_hors_bornes`,
+/// `400 requete_illisible`, `400 fichier_absent`, `415 televersement_attendu`,
+/// `500 index_bibliotheque_illisible`.
 pub(super) async fn import_m3u_plays(State(state): State<AppState>, req: Request) -> Response {
     let options = match Query::<OptionsEcoutesM3u>::try_from_uri(req.uri()) {
         Ok(Query(o)) => o,

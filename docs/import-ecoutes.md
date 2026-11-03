@@ -78,6 +78,10 @@ lignes au plus, `fuzzy_matched_truncated` s'il en manque). Faites d'abord
 un aperçu pour les vérifier : aucune route ne retire aujourd'hui des écoutes
 importées.
 
+`matched`, `fuzzy_matched` et `unmatched` comptent des **lignes** de la
+liste, doublons compris ; `play_counts_updated` compte des **pistes**, chacune
+une seule fois. Les deux chiffres ne se comparent donc pas directement.
+
 Exemple :
 
 ```sh
