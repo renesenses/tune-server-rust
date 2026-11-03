@@ -31,7 +31,7 @@ jobs:
   # manuel reste toujours complet.
   impact:
     name: Impact et garde-fous légers
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.classer.outputs.rust }}
@@ -180,7 +180,7 @@ jobs:
     name: Format
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15  # fmt — 27 s observe
     steps:
       - uses: actions/checkout@v4
@@ -194,7 +194,7 @@ jobs:
     name: Test
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 75  # test — 37 à 45 min observées début novembre (45 dépassé, PR #7711 et #7727)
     steps:
       - uses: actions/checkout@v4
@@ -290,7 +290,7 @@ jobs:
     name: Test (jeu de fonctionnalites livre)
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45  # test-shipped-features — ~5 min observe
     steps:
       - uses: actions/checkout@v4
@@ -347,7 +347,7 @@ jobs:
     name: Audio embedding feature
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45  # audio-embedding — ~5 min observe
     steps:
       - uses: actions/checkout@v4
@@ -695,7 +695,7 @@ jobs:
     name: Clippy
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45  # clippy — 4 min observe (2 min avant #2865)
     steps:
       - uses: actions/checkout@v4
@@ -795,7 +795,7 @@ jobs:
     name: Security Audit
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15  # audit — 10 s observe
     # Blocking: a security advisory must fail CI, not be swallowed. The wasmtime
     # advisories that forced continue-on-error are fixed (bump to 47.0.3).
@@ -870,7 +870,7 @@ jobs:
     # garde-fou (#1751) a refuse le tag, correctement, mais le signal n'est
     # jamais remonte jusqu'ici.
     #
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -1016,7 +1016,7 @@ jobs:
       - audit
       - ffi
       - librespot
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - name: Refuser une branche autre qu'une RC

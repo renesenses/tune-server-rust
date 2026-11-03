@@ -44,7 +44,7 @@ jobs:
   # Il ne calcule PAS `full` : ce job ne se decide plus sur le profil.
   impact:
     name: Impact (PostgreSQL)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.classer.outputs.rust }}
@@ -104,7 +104,7 @@ jobs:
       || (!startsWith(github.base_ref, 'batch/') && !startsWith(github.base_ref, 'rc/'))
       || contains(github.event.pull_request.labels.*.name, 'ci:full')
       || needs.impact.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 45 et non 30 : le job compile et execute un paquet de plus (#3123). Mesure
     # du 01/09/2026 — le job tenait en 6 min 21 et 6 min 31 sur les deux
     # dernieres executions reelles, et `tune-server` ajoute une compilation

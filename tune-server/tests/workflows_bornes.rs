@@ -1129,7 +1129,7 @@ fn toute_feature_declaree_est_activee_par_une_porte_clippy() {
         (
             "asio",
             "`cpal/asio` ne se compile que sous Windows (SDK Steinberg). Les \
-             runners de la porte clippy sont ubuntu-latest. Couverte par le job \
+             runners de la porte clippy sont ubuntu-24.04. Couverte par le job \
              `windows-pr`, qui la compile en `cargo check`.",
         ),
         (
