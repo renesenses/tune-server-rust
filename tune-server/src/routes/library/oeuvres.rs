@@ -309,7 +309,11 @@ pub(crate) fn regrouper(
     }
 
     let mut oeuvres = Vec::new();
-    for (cle, methode, membres) in groupes {
+    for (cle, methode, mut membres) in groupes {
+        // `separer` est glouton : sans un ordre fixe, la grille (albums triés
+        // par titre) et la fiche (triés par identifiant) formeraient des
+        // sous-groupes et des `work_id` différents pour la même œuvre.
+        membres.sort_by_key(|m| m.id);
         let sous = separer(membres, distinctes);
         let plusieurs = sous.len() > 1;
         for (rang, mut membres) in sous.into_iter().enumerate() {
@@ -462,6 +466,21 @@ fn albums_visibles(state: &AppState) -> Vec<Album> {
         .ou_defaut_journalise()
 }
 
+/// Les albums masqués à la main (#1391), le même ensemble que celui que
+/// `hidden_albums_excluded()` retire de la grille.
+fn albums_masques(state: &AppState) -> Vec<i64> {
+    state
+        .backend
+        .query_many(
+            "SELECT item_id FROM hidden_items WHERE item_type = 'album'",
+            &[],
+        )
+        .ou_defaut_journalise()
+        .iter()
+        .filter_map(|l| l.first().and_then(|x| x.as_i64()))
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct PageOeuvres {
     #[serde(default = "limite_par_defaut")]
@@ -567,6 +586,14 @@ pub(crate) async fn versions_de_l_album(
             if let Some(i) = x.id {
                 albums.entry(i).or_insert(x);
             }
+        }
+    }
+    // `list_by_release_group` rend aussi les albums masqués : la grille ne
+    // les voit pas, la fiche ne doit pas les proposer. L'album demandé reste,
+    // même masqué : c'est lui qu'on ouvre.
+    for masque in albums_masques(&state) {
+        if masque != id {
+            albums.remove(&masque);
         }
     }
     let versions = versions_des_albums(&state);

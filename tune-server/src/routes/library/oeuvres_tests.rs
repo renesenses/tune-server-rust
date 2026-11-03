@@ -580,3 +580,115 @@ async fn route_members_rend_les_seules_oeuvres_de_plusieurs_versions() {
     .await;
     assert_eq!(corps, json!({"enabled": false, "works": []}));
 }
+
+#[tokio::test]
+async fn route_versions_n_offre_pas_un_album_masque_du_meme_groupe() {
+    let b = banc();
+    let floyd = artiste_de(&b, b.dsotm);
+    // Une Hi-Res du même groupe MusicBrainz, masquée : sans le filtre, elle
+    // serait la version par défaut de la fiche.
+    let masque = album(
+        &b.state,
+        "The Dark Side of the Moon (24-bit)",
+        floyd,
+        Some("rg-dsotm"),
+        192_000,
+    );
+    tune_core::db::hidden_repo::HiddenRepo::with_backend(b.state.backend.clone())
+        .hide_album(masque)
+        .unwrap();
+    let (statut, corps) = appeler(
+        &b.state,
+        "GET",
+        &format!("/api/v1/library/albums/{}/versions", b.dsotm),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(
+        ids(&corps),
+        vec![b.dsotm, b.dsotm_sacd],
+        "un album masqué n'est pas une version proposée : {corps}"
+    );
+    assert_eq!(corps["preferred_id"], json!(b.dsotm_sacd), "{corps}");
+
+    // La fiche et la grille annoncent la même version préférée.
+    let (_, membres) = appeler(
+        &b.state,
+        "GET",
+        "/api/v1/library/albums/works/members",
+        None,
+    )
+    .await;
+    let dsotm = membres["works"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["ids"].as_array().unwrap().contains(&json!(b.dsotm)))
+        .unwrap();
+    assert_eq!(dsotm["preferred_id"], corps["preferred_id"]);
+
+    // L'album masqué lui-même s'ouvre encore.
+    let (statut, seul) = appeler(
+        &b.state,
+        "GET",
+        &format!("/api/v1/library/albums/{masque}/versions"),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{seul}");
+    assert!(ids(&seul).contains(&masque), "{seul}");
+}
+
+#[tokio::test]
+async fn paire_distincte_meme_oeuvre_dans_la_grille_et_dans_la_fiche() {
+    let b = banc();
+    let artiste_x = artiste(&b.state, "The Zombies");
+    // Insérés dans cet ordre, les identifiants (mono < nu < remaster)
+    // diffèrent de l'ordre des titres (nu < remaster < mono).
+    let mono = album(&b.state, "Odessey (Mono)", artiste_x, None, 44_100);
+    let nu = album(&b.state, "Odessey", artiste_x, None, 44_100);
+    let remaster = album(&b.state, "Odessey (2018 Remaster)", artiste_x, None, 96_000);
+    AlbumDistinctRepo::with_backend(b.state.backend.clone())
+        .declarer_distincts(mono, nu)
+        .unwrap();
+
+    // La grille : toutes les œuvres, albums triés par titre.
+    let (_, grille) = appeler(
+        &b.state,
+        "GET",
+        "/api/v1/library/albums/works?limit=1000",
+        None,
+    )
+    .await;
+    let dans_la_grille = |album: i64| -> (String, Vec<i64>) {
+        let o = grille["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| ids(o).contains(&album))
+            .unwrap();
+        (o["work_id"].as_str().unwrap().to_string(), ids(o))
+    };
+    // La fiche : les candidats triés par identifiant.
+    for a in [mono, nu, remaster] {
+        let (statut, fiche) = appeler(
+            &b.state,
+            "GET",
+            &format!("/api/v1/library/albums/{a}/versions"),
+            None,
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{fiche}");
+        assert_eq!(
+            (fiche["work_id"].as_str().unwrap().to_string(), ids(&fiche)),
+            dans_la_grille(a),
+            "l'album {a} doit être dans la même œuvre, sous le même work_id, \
+             dans la grille et dans la fiche"
+        );
+    }
+    let (_, avec_mono) = dans_la_grille(mono);
+    assert_eq!(avec_mono, vec![mono, remaster]);
+    let (_, avec_nu) = dans_la_grille(nu);
+    assert_eq!(avec_nu, vec![nu]);
+}
