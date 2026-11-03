@@ -4,6 +4,7 @@
 //! l'agent, porteur du jeton d'appairage. Le flux, lui, ne passe pas par ici :
 //! l'agent va le chercher à l'URL que l'orchestrateur a construite.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tune_core::outputs::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia};
@@ -38,6 +39,11 @@ pub struct SortieAgentTune {
     jeton: String,
     capacites: OutputCapabilities,
     client: reqwest::Client,
+    /// #6370 — la position dans la PISTE où commence le flux que l'agent lit.
+    /// Sa sortie locale compte depuis le début du flux reçu ; un flux relancé
+    /// à 2:00 par un déplacement y commence à 0. Remis à zéro à chaque
+    /// lecture, posé par [`OutputTarget::seek`].
+    depart_ms: AtomicU64,
 }
 
 impl SortieAgentTune {
@@ -57,6 +63,7 @@ impl SortieAgentTune {
             client: tune_core::http::client::builder()
                 .build()
                 .unwrap_or_default(),
+            depart_ms: AtomicU64::new(0),
         }
     }
 
@@ -137,6 +144,9 @@ impl OutputTarget for SortieAgentTune {
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        // Un flux neuf part du début de la piste, sauf si l'orchestrateur dit
+        // ensuite le contraire (`seek`, juste après une relance à la position).
+        self.depart_ms.store(0, Ordering::SeqCst);
         self.envoyer(Commande::Lire {
             url: media.url.to_string(),
             mime_type: media.mime_type.to_string(),
@@ -162,8 +172,18 @@ impl OutputTarget for SortieAgentTune {
         self.envoyer(Commande::Arreter).await
     }
 
+    /// Le contrat de `LocalOutput::seek` : NOTER la position où commence le
+    /// flux relancé, sans rien envoyer.
+    ///
+    /// #6370 — l'agent ne prête que sa sortie locale, qui ne sait pas se
+    /// déplacer dans un flux séquentiel : `Commande::Position` y notait la
+    /// position et le son restait où il était (fil 1867). Le maître relance
+    /// donc le flux à la position (`PlaybackOrchestrator::seek`, comme pour sa
+    /// propre sortie locale) puis appelle ce `seek` ; l'agent, lui, ne reçoit
+    /// qu'un `Lire` ordinaire — aucun agent installé n'a à changer.
     async fn seek(&self, position_ms: u64) -> Result<(), String> {
-        self.envoyer(Commande::Position { position_ms }).await
+        self.depart_ms.store(position_ms, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
@@ -175,7 +195,11 @@ impl OutputTarget for SortieAgentTune {
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
-        self.lire_etat().await.map(|e| e.statut)
+        let mut statut = self.lire_etat().await?.statut;
+        statut.position_ms = statut
+            .position_ms
+            .saturating_add(self.depart_ms.load(Ordering::SeqCst));
+        Ok(statut)
     }
 
     async fn is_available(&self) -> bool {

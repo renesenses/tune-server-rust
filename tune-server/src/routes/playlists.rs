@@ -57,11 +57,24 @@ struct AddTracks {
     streaming_tracks: Option<Vec<Value>>,
 }
 
+/// Deux désignations (#6687) :
+///
+/// * `entry_id` — l'identifiant de LIGNE (`playlist_tracks.id`) que
+///   `GET /playlists/{id}/tracks` rend sur chaque ligne. Préféré : deux
+///   retraits qui se croisent ne visent jamais la ligne d'à côté.
+/// * `position` — gardé pour les clients déployés, interprété comme un RANG
+///   (l'indice de la liste rendue), plus jamais comme la colonne `position`.
+///
+/// Si les deux sont présents, `entry_id` l'emporte.
 #[derive(Deserialize)]
 struct RemoveTrack {
-    position: i64,
+    #[serde(default)]
+    entry_id: Option<i64>,
+    #[serde(default)]
+    position: Option<i64>,
 }
 
+/// `positions` : des RANGS (#6687), lus et effacés dans une seule transaction.
 #[derive(Deserialize)]
 struct RemoveTracksBody {
     positions: Vec<i64>,
@@ -173,7 +186,68 @@ async fn list_playlists(
     let offset = p.offset.unwrap_or(0);
     let items = repo.list(profile.id(), limit, offset).unwrap_or_default();
     let _total = repo.count(profile.id()).unwrap_or(0);
-    Json(json!(items))
+    // #6688 — le badge « Partagée avec un cercle ».
+    let mut cercles = cercles_par_playlist(&state);
+    Json(json!(
+        items
+            .into_iter()
+            .map(|pl| {
+                let liste = pl.id.and_then(|id| cercles.remove(&id)).unwrap_or_default();
+                avec_les_cercles(json!(pl), liste)
+            })
+            .collect::<Vec<_>>()
+    ))
+}
+
+/// Préfixe des liens de suivi que le greffon Tune Circle écrit dans les
+/// réglages (`tune_circle::suivi::PREFIXE_SUIVI`, #6688) : une playlist de
+/// cercle → la playlist locale qu'elle suit. Lu ici sans dépendre du greffon :
+/// sans greffon, aucun lien, et `cercles` est vide.
+const PREFIXE_SUIVI_DE_CERCLE: &str = "circle_suivi:";
+
+/// #6688 — pour chaque playlist locale partagée avec un cercle, les cercles
+/// qui la portent : `{ id, nom, suivi, synchronisee_le }`. `suivi` est faux
+/// après « Ne plus suivre » (le lien est gardé, arrêté) ; `synchronisee_le`
+/// est la date du dernier report (RFC 3339), nulle avant le premier.
+fn cercles_par_playlist(state: &AppState) -> std::collections::HashMap<i64, Vec<Value>> {
+    let mut par_playlist: std::collections::HashMap<i64, Vec<Value>> = Default::default();
+    let reglages = SettingsRepo::with_backend(state.backend.clone())
+        .all()
+        .unwrap_or_default();
+    for (cle, valeur) in reglages {
+        if !cle.starts_with(PREFIXE_SUIVI_DE_CERCLE) {
+            continue;
+        }
+        let Ok(lien) = serde_json::from_str::<Value>(&valeur) else {
+            continue;
+        };
+        let Some(locale) = lien["local_playlist_id"].as_i64() else {
+            continue;
+        };
+        par_playlist.entry(locale).or_default().push(json!({
+            "id": lien["circle_id"],
+            "nom": lien["circle_name"],
+            "suivi": lien["stopped_at"].is_null(),
+            "synchronisee_le": lien["last_sync"],
+        }));
+    }
+    for liste in par_playlist.values_mut() {
+        liste.sort_by(|a, b| {
+            a["nom"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(b["nom"].as_str().unwrap_or_default())
+        });
+    }
+    par_playlist
+}
+
+/// La playlist sérialisée, avec `cercles` (vide si elle n'est pas partagée).
+fn avec_les_cercles(mut playlist: Value, cercles: Vec<Value>) -> Value {
+    if let Some(obj) = playlist.as_object_mut() {
+        obj.insert("cercles".into(), Value::Array(cercles));
+    }
+    playlist
 }
 
 /// #2794 — le cloisonnement par profil ne tenait qu'au listing. Toute route
@@ -198,7 +272,11 @@ async fn get_playlist(
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.get_for_profile(id, profile.id()) {
-        Ok(Some(pl)) => Json(json!(pl)).into_response(),
+        Ok(Some(pl)) => {
+            // #6688 — le badge « Partagée avec un cercle ».
+            let cercles = cercles_par_playlist(&state).remove(&id).unwrap_or_default();
+            Json(avec_les_cercles(json!(pl), cercles)).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -281,6 +359,16 @@ pub(crate) fn lignes_de_la_playlist(
     state: &AppState,
     playlist_id: i64,
 ) -> Result<Vec<Value>, String> {
+    Ok(lignes_et_identifiants(state, playlist_id)?
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect())
+}
+
+/// [`lignes_de_la_playlist`], chaque ligne accompagnée de son identifiant de
+/// ligne (`playlist_tracks.id`). Seule la fiche privée (`GET /tracks`) le
+/// publie, en `entry_id` (#6687) : le partage public n'en a pas l'usage.
+fn lignes_et_identifiants(state: &AppState, playlist_id: i64) -> Result<Vec<(i64, Value)>, String> {
     let entries = PlaylistRepo::with_backend(state.backend.clone()).get_entries(playlist_id)?;
     let locales: Vec<i64> = entries.iter().filter_map(|e| e.track_id()).collect();
     let pistes: std::collections::HashMap<i64, tune_core::db::models::Track> =
@@ -292,10 +380,13 @@ pub(crate) fn lignes_de_la_playlist(
             .collect();
     Ok(entries
         .iter()
-        .filter_map(|e| match &e.content {
-            EntryContent::Local(tid) => pistes.get(tid).map(|t| t.to_json()),
-            EntryContent::Service(s) => Some(s.to_json()),
-            EntryContent::Missing(m) => Some(m.to_json()),
+        .filter_map(|e| {
+            match &e.content {
+                EntryContent::Local(tid) => pistes.get(tid).map(|t| t.to_json()),
+                EntryContent::Service(s) => Some(s.to_json()),
+                EntryContent::Missing(m) => Some(m.to_json()),
+            }
+            .map(|v| (e.id, v))
         })
         .collect())
 }
@@ -311,7 +402,18 @@ async fn get_tracks(
 ) -> Result<Json<Value>, AppError> {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     owned_or_404(&repo, id, profile.id())?;
-    let mut items = lignes_de_la_playlist(&state, id).map_err(AppError::internal)?;
+    // #6687 — chaque ligne (locale, de service, introuvable) porte son
+    // `entry_id` : c'est par lui que `POST /tracks/remove` la désigne.
+    let mut items: Vec<Value> = lignes_et_identifiants(&state, id)
+        .map_err(AppError::internal)?
+        .into_iter()
+        .map(|(entry_id, mut v)| {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("entry_id".into(), json!(entry_id));
+            }
+            v
+        })
+        .collect();
     // #4806 — un titre banni reste DANS la playlist, grisé : `banned` le dit.
     // Une ligne de service (`id` nul) n'est jamais bannie : le bannissement
     // désigne un `tracks.id`.
@@ -356,16 +458,12 @@ async fn add_tracks(
             incomplets,
             "playlist_add_tracks_refused_incomplete_streaming"
         );
-        return (
+        return crate::message_api::refus(
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "Cette demande ne porte que des titres de service incomplets \
-                 ({incomplets}) : il leur faut une source (autre que « local »), \
-                 un identifiant chez le service et un titre pour entrer dans \
-                 une playlist."
-            ),
-        )
-            .into_response();
+            "playlist_incomplete_service_tracks",
+            "api.playlists.incompleteServiceTracks",
+            &[("count", incomplets.to_string())],
+        );
     }
 
     let lignes: Vec<EntryContent> = body
@@ -422,8 +520,28 @@ async fn remove_track(
     if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
         return r;
     }
-    match repo.remove_track(id, body.position) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+    // #6687 — un retrait qui n'a rien retiré répondait `204` : le client
+    // effaçait la ligne à l'écran, et elle « revenait » à la relecture.
+    let retire = match (body.entry_id, body.position) {
+        (Some(entry_id), _) => repo.remove_entry(id, entry_id),
+        (None, Some(rang)) => repo.remove_track(id, rang),
+        (None, None) => {
+            return crate::message_api::refus(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "playlist_entry_required",
+                "api.playlists.entryRequired",
+                &[],
+            );
+        }
+    };
+    match retire {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => crate::message_api::refus(
+            StatusCode::NOT_FOUND,
+            "playlist_entry_not_found",
+            "api.playlists.noMatchingEntry",
+            &[],
+        ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -438,7 +556,20 @@ async fn remove_tracks_batch(
     if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
         return r;
     }
+    // Une liste vide ne désigne aucune ligne : rien à retirer, ce n'est pas
+    // un retrait manqué. Même réponse qu'avant #6687.
+    if body.positions.is_empty() {
+        return Json(json!({"removed": 0})).into_response();
+    }
+    // #6687 — tout ou rien : un rang hors bornes n'efface rien, et un lot
+    // qui n'a rien effacé est un `404`, pas un succès.
     match repo.remove_tracks_at_positions(id, &body.positions) {
+        Ok(0) => crate::message_api::refus(
+            StatusCode::NOT_FOUND,
+            "playlist_position_out_of_range",
+            "api.playlists.positionOutOfRange",
+            &[],
+        ),
         Ok(removed) => Json(json!({"removed": removed})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -460,12 +591,12 @@ async fn reorder_tracks(
             // Une liste qui n'est pas une permutation exacte des rangs actuels
             // (liste périmée côté client) n'écrit RIEN : réécrire quand même
             // perdrait ou dupliquerait des lignes.
-            Ok(false) => (
+            Ok(false) => crate::message_api::refus(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "`positions` doit être une permutation exacte des rangs actuels \
-                 de la playlist (0..n-1) ; rien n'a été modifié.",
-            )
-                .into_response(),
+                "playlist_positions_not_permutation",
+                "api.playlists.positionsNotPermutation",
+                &[],
+            ),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
     }
@@ -851,7 +982,7 @@ async fn import_m3u_file(
     tracing::info!(name = %name, bytes = file_content.len(), "m3u_import_file_received");
 
     // Parse M3U and match tracks
-    let mut track_ids: Vec<i64> = Vec::new();
+    let mut entrees: Vec<EntryContent> = Vec::new();
     let mut total_entries = 0u32;
     let mut matched = 0u32;
     // Keep only a small SAMPLE of not-found paths for the response; count the
@@ -904,17 +1035,33 @@ async fn import_m3u_file(
     // lookup_errors always holds.
     let mut lookup_errors = 0u32;
 
-    for line in file_content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    for entree in tune_core::library::m3u_parser::parse_m3u_content(file_content.as_bytes(), true) {
+        let line = entree.path.as_str();
+        total_entries += 1;
+        if let Some(qobuz) = tune_core::library::m3u_parser::entree_qobuz_audirvana(
+            line,
+            entree.title.as_deref(),
+            entree.artist.as_deref(),
+            (entree.duration_s >= 0).then_some(i64::from(entree.duration_s) * 1000),
+        ) {
+            entrees.push(EntryContent::Service(qobuz));
+            matched += 1;
+            continue;
+        }
+        if line
+            .split_once("://")
+            .is_some_and(|(s, _)| s.eq_ignore_ascii_case("qobuz"))
+        {
+            not_found_count += 1;
+            if not_found_paths.len() < MAX_NOT_FOUND_SAMPLE {
+                not_found_paths.push(line.to_string());
+            }
             continue;
         }
 
-        total_entries += 1;
-
         // Exact path match (O(1) map lookup).
         if let Some(info) = path_to_id.get(line) {
-            track_ids.push(info.id);
+            entrees.push(EntryContent::Local(info.id));
             matched += 1;
             continue;
         }
@@ -931,7 +1078,7 @@ async fn import_m3u_file(
                     if let Some(track) = results.first()
                         && let Some(id) = track.id
                     {
-                        track_ids.push(id);
+                        entrees.push(EntryContent::Local(id));
                         matched += 1;
                         continue;
                     }
@@ -968,9 +1115,9 @@ async fn import_m3u_file(
     // track insert dropped with `.ok()`, so a failed insert left an empty
     // playlist behind AND answered 201 (#2798).
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.create_with_tracks(&name, None, profile.id(), &track_ids) {
+    match repo.create_with_entries(&name, None, profile.id(), &entrees) {
         Ok((playlist_id, imported)) => {
-            let duplicates_skipped = track_ids.len() - imported.len();
+            let duplicates_skipped = entrees.len() - imported.len();
             tracing::info!(
                 playlist_id,
                 name = %name,
@@ -2338,3 +2485,20 @@ mod ssrf_tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "circle"))]
+mod badge_de_cercle_6688 {
+    /// Le préfixe lu ici est celui qu'écrit le greffon : s'ils divergent, le
+    /// badge « Partagée avec un cercle » disparaît sans bruit.
+    #[test]
+    fn le_prefixe_lu_est_celui_du_greffon() {
+        assert_eq!(
+            super::PREFIXE_SUIVI_DE_CERCLE,
+            tune_circle::suivi::PREFIXE_SUIVI
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "playlists/import_audirvana_6998_tests.rs"]
+mod import_audirvana_6998_tests;

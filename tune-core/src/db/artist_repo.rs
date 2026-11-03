@@ -11,7 +11,99 @@ use crate::TuneError;
 /// lisible (typiquement un fichier encore en cours d'écriture au moment où
 /// le watcher le voit). Partagé entre le scanner et les repos pour que la
 /// détection « artiste inconnu » compare toujours la même chaîne.
+mod sources_des_artistes;
+pub use sources_des_artistes::{PresenceDansUneSource, SourcesDesArtistes};
+
 pub const UNKNOWN_ARTIST_NAME: &str = "Unknown Artist";
+
+/// La provenance `artists.sort_name_source` d'un nom de tri tiré du
+/// `sort-name` MusicBrainz (#6474, point 2). NULL : balise, saisie, ou
+/// antérieur à la colonne.
+pub const SOURCE_TRI_MUSICBRAINZ: &str = "musicbrainz";
+
+/// #6773 — la provenance d'un nom de tri « Nom, Prénom » DÉDUIT du nom d'une
+/// personne (`metadata::noms_de_tri::nom_de_tri_deduit`). Il cède à tout :
+/// une balise, MusicBrainz ou une saisie le remplacent.
+pub const SOURCE_TRI_DEDUIT: &str = "deduit";
+
+/// #6463 (décision de Bertrand du 23/10, A) — d'où vient le MBID d'un
+/// artiste : `artists.musicbrainz_id_source`. NULL : inconnue, c'est-à-dire
+/// tout MBID posé avant la migration 133.
+///
+/// Un MBID [`ProvenanceMbid::Manuel`] — saisi dans la fiche, ou retiré par
+/// « Détacher l'identité » — n'est plus jamais retiré, remplacé ni reposé
+/// d'office : toutes les écritures automatiques le gardent dans leur `WHERE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvenanceMbid {
+    /// Lu dans les fichiers au scan (`MUSICBRAINZ_ALBUMARTISTID`,
+    /// `MUSICBRAINZ_ARTISTID`).
+    Balise,
+    /// Trouvé par une recherche MusicBrainz du nom.
+    Nom,
+    /// Tiré des crédits d'un pressage (ou d'un enregistrement) identifié.
+    Pressage,
+    /// Saisi, ou détaché, par l'utilisateur.
+    Manuel,
+}
+
+impl ProvenanceMbid {
+    /// Le mot rangé en base et servi par l'API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProvenanceMbid::Balise => "balise",
+            ProvenanceMbid::Nom => "nom",
+            ProvenanceMbid::Pressage => "pressage",
+            ProvenanceMbid::Manuel => "manuel",
+        }
+    }
+
+    /// Lit le mot rangé en base ; `None` pour NULL ou un mot inconnu.
+    pub fn depuis_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "balise" => Some(ProvenanceMbid::Balise),
+            "nom" => Some(ProvenanceMbid::Nom),
+            "pressage" => Some(ProvenanceMbid::Pressage),
+            "manuel" => Some(ProvenanceMbid::Manuel),
+            _ => None,
+        }
+    }
+}
+
+/// La garde que toute écriture AUTOMATIQUE du MBID porte dans son `WHERE`
+/// (#6463) : une fiche dont l'utilisateur a saisi ou détaché le MBID ne se
+/// touche plus.
+pub const PAS_UN_MBID_MANUEL: &str = "COALESCE(musicbrainz_id_source, '') <> 'manuel'";
+
+/// Les sources d'IMAGE rattachées au MBID : la cascade de la phase 2
+/// (`auto` : Fanart, TheAudioDB, MusicBrainz/Wikidata, par MBID) et le fonds
+/// communautaire (`community`, indexé par MBID). Un MBID retiré emporte ces
+/// images ; une image locale, téléversée, ou trouvée par le nom (Discogs,
+/// Last.fm, Roon) reste (#6463).
+pub const SOURCES_D_IMAGE_DU_MBID: &str = "'auto', 'community'";
+
+/// tune-server-rust#6474 — le nom de tri à donner à l'ARTISTE D'ALBUM lu
+/// dans un fichier : ALBUMARTISTSORT s'il est écrit ; sinon l'ARTISTSORT de
+/// la piste, mais seulement quand la piste est de ce même artiste (même nom,
+/// casse ignorée). Le nom de tri d'un invité ne devient jamais celui de
+/// l'artiste de l'album, ni celui d'un « Various Artists ».
+///
+/// Aucune règle n'est inventée quand les deux balises manquent : pas
+/// d'inversion « Prénom Nom », pas d'article retiré. René (fil 2313) l'écarte
+/// lui-même — Ludwig van Beethoven, noms composés, orchestres et groupes —, et
+/// le tri retombe alors sur le nom affiché, comme avant.
+pub fn nom_de_tri_de_l_artiste_d_album<'a>(
+    album_artist_sort: Option<&'a str>,
+    artist_sort: Option<&'a str>,
+    album_artist_name: &str,
+    track_artist_name: &str,
+) -> Option<&'a str> {
+    let rempli = |s: Option<&'a str>| s.filter(|v| !v.trim().is_empty());
+    rempli(album_artist_sort).or_else(|| {
+        rempli(artist_sort).filter(|_| {
+            album_artist_name.trim().to_lowercase() == track_artist_name.trim().to_lowercase()
+        })
+    })
+}
 
 /// Engine-agnostic SQL builders for artist_repo.
 ///
@@ -56,18 +148,99 @@ pub mod sql {
         )
     }
 
-    pub fn create_minimal<D: SqlDialect>(d: &D) -> String {
+    /// #6474 — pose le nom de tri LU DANS UNE BALISE sur un artiste qui n'en
+    /// a pas, ou dont le nom de tri vient de MusicBrainz : la balise garde la
+    /// priorité. Un nom de tri déjà renseigné par une balise ou saisi dans
+    /// « Modifier l'artiste » n'est jamais remplacé. La provenance repasse à
+    /// NULL (balise).
+    pub fn poser_sort_name_si_vide<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO artists (name, sort_name, musicbrainz_id) VALUES ({}, {}, {})",
+            "UPDATE artists SET sort_name = {}, sort_name_source = NULL WHERE id = {} \
+             AND (sort_name IS NULL OR TRIM(sort_name) = '' \
+                  OR sort_name_source IN ('{source}', '{deduit}'))",
+            d.placeholder(1),
+            d.placeholder(2),
+            source = super::SOURCE_TRI_MUSICBRAINZ,
+            deduit = super::SOURCE_TRI_DEDUIT,
+        )
+    }
+
+    /// #6474, point 2 — pose le nom de tri MusicBrainz (`sort-name`) sur un
+    /// artiste qui n'en a pas, ou dont le nom de tri vient déjà de
+    /// MusicBrainz. Une balise ou une saisie n'est jamais remplacée.
+    pub fn poser_sort_name_musicbrainz<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET sort_name = {}, sort_name_source = '{source}' WHERE id = {} \
+             AND (sort_name IS NULL OR TRIM(sort_name) = '' \
+                  OR sort_name_source IN ('{source}', '{deduit}'))",
+            d.placeholder(1),
+            d.placeholder(2),
+            source = super::SOURCE_TRI_MUSICBRAINZ,
+            deduit = super::SOURCE_TRI_DEDUIT,
+        )
+    }
+
+    /// La provenance du nom de tri d'un artiste (#6474).
+    pub fn provenance_du_sort_name<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT sort_name_source FROM artists WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    /// #6474 — dans une absorption, la provenance du nom de tri voyage AVEC
+    /// lui : posée sur la cible quand la reprise générique va lui donner le
+    /// nom de tri du doublon. Avant cette reprise, donc.
+    pub fn reprendre_la_provenance_du_sort_name<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET sort_name_source = \
+               (SELECT a.sort_name_source FROM artists a WHERE a.id = {}) \
+             WHERE id = {} AND (sort_name IS NULL OR TRIM(sort_name) = '') \
+               AND EXISTS (SELECT 1 FROM artists a WHERE a.id = {} \
+                           AND a.sort_name IS NOT NULL AND TRIM(a.sort_name) <> '')",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3)
         )
     }
 
+    /// #6463 — la provenance du MBID part avec lui (`balise` : seul le scan
+    /// crée une fiche avec un MBID).
+    pub fn create_minimal<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO artists (name, sort_name, musicbrainz_id, musicbrainz_id_source) VALUES ({}, {}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4)
+        )
+    }
+
+    /// #6474 — un nom de tri CHANGÉ par cette écriture (saisie dans
+    /// « Modifier l'artiste ») n'est plus celui de MusicBrainz : sa
+    /// provenance repasse à NULL. Inchangé, il garde la sienne. Le membre
+    /// droit d'un `SET` lit l'ANCIENNE ligne, sur SQLite comme sur
+    /// PostgreSQL.
+    ///
+    /// #6463 — le MBID d'une fiche `manuel` ne bouge pas ici : `update` sert
+    /// au scan (image locale), au renommage et à la fiche, qui réécrivent la
+    /// fiche ENTIÈRE à partir d'une lecture parfois ancienne. Seule
+    /// [`super::ArtistRepo::poser_mbid_manuel`] écrit un MBID saisi. Un MBID
+    /// CHANGÉ par cette écriture perd sa provenance (NULL : inconnue) ;
+    /// inchangé, il la garde.
     pub fn update<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE artists SET name = {}, sort_name = {}, musicbrainz_id = {}, discogs_id = {}, bio = {}, image_path = {}, image_source = {} WHERE id = {}",
+            "UPDATE artists SET name = {}, sort_name = {}, \
+             musicbrainz_id = CASE WHEN COALESCE(musicbrainz_id_source, '') = 'manuel' \
+                                   THEN musicbrainz_id ELSE {} END, \
+             discogs_id = {}, bio = {}, image_path = {}, image_source = {}, \
+             sort_name_source = CASE WHEN COALESCE(sort_name, '') = COALESCE({}, '') \
+                                     THEN sort_name_source ELSE NULL END, \
+             musicbrainz_id_source = CASE WHEN COALESCE(musicbrainz_id_source, '') = 'manuel' \
+                                          THEN musicbrainz_id_source \
+                                          WHEN COALESCE(musicbrainz_id, '') = COALESCE({}, '') \
+                                          THEN musicbrainz_id_source ELSE NULL END \
+             WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -75,7 +248,61 @@ pub mod sql {
             d.placeholder(5),
             d.placeholder(6),
             d.placeholder(7),
-            d.placeholder(8)
+            d.placeholder(8),
+            d.placeholder(9),
+            d.placeholder(10)
+        )
+    }
+
+    /// #6463 — le MBID saisi (ou retiré) par l'utilisateur, marqué `manuel`.
+    pub fn poser_mbid_manuel<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET musicbrainz_id = {}, musicbrainz_id_source = 'manuel' WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    /// #6463 — la provenance du MBID d'un artiste.
+    pub fn provenance_du_mbid<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT musicbrainz_id_source FROM artists WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    /// #6463, B — retire un MBID que la vérification MusicBrainz a jugé
+    /// faux. Gardé dans la requête : la fiche porte TOUJOURS ce MBID (rien
+    /// n'est retiré s'il a changé depuis la lecture), et sa provenance n'est
+    /// ni `manuel` ni `balise` ni `pressage` — seulement inconnue ou `nom`.
+    pub fn retirer_le_mbid_verifie<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET musicbrainz_id = NULL, musicbrainz_id_source = NULL \
+             WHERE id = {} AND LOWER(TRIM(COALESCE(musicbrainz_id, ''))) = LOWER(TRIM({})) \
+               AND (musicbrainz_id_source IS NULL OR musicbrainz_id_source = 'nom')",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    /// #6463 — l'image rattachée au MBID retiré ([`super::SOURCES_D_IMAGE_DU_MBID`]).
+    pub fn oublier_l_image_du_mbid<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET image_path = NULL, image_source = NULL \
+             WHERE id = {} AND image_source IN ({})",
+            d.placeholder(1),
+            super::SOURCES_D_IMAGE_DU_MBID
+        )
+    }
+
+    /// #6463 — la biographie rapportée par l'enrichissement (une provenance
+    /// est rangée avec elle). Une bio saisie, sans provenance, reste.
+    pub fn oublier_la_bio_du_mbid<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET bio = NULL, bio_source = NULL, bio_source_url = NULL, \
+             bio_license = NULL, bio_lang = NULL, bio_fetched_at = NULL \
+             WHERE id = {} AND TRIM(COALESCE(bio_source, '')) <> ''",
+            d.placeholder(1)
         )
     }
 
@@ -154,8 +381,11 @@ pub mod sql {
         "SELECT id, name, COALESCE(musicbrainz_id, '') FROM artists ORDER BY id"
     }
 
+    /// Les artistes sans MBID à chercher par le nom. #6463 : un artiste dont
+    /// l'utilisateur a détaché l'identité (`manuel`) n'y est plus.
     pub fn list_without_mbid() -> &'static str {
-        "SELECT id, name FROM artists WHERE (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
+        "SELECT id, name FROM artists WHERE (musicbrainz_id IS NULL OR musicbrainz_id = '') \
+         AND COALESCE(musicbrainz_id_source, '') <> 'manuel' ORDER BY id"
     }
 
     pub fn list_with_image_no_mbid() -> &'static str {
@@ -272,9 +502,38 @@ pub mod sql {
     /// n'en gardait aucun. D'une passe à l'autre, `artists_without_mbid` ne
     /// bougeait pas et les artistes n'atteignaient jamais les sources d'images
     /// indexées par MBID (Fanart, TheAudioDB, MusicBrainz/Wikidata).
+    ///
+    /// #6463 — la provenance est écrite avec le MBID (emplacement 2), et une
+    /// fiche `manuel` n'est jamais touchée.
+    ///
+    /// #7535 — un MBID déjà porté par une AUTRE fiche n'est pas posé
+    /// (emplacements 4 et 5 : l'identifiant, encore, et la valeur) : une
+    /// recherche par le nom (« Phil Selway ») qui rend le MBID d'une fiche
+    /// existante (« Philip Selway ») faisait deux fiches d'un même MBID. La
+    /// garde est celle de `artistes_du_pressage::poser_les_mbid`. Un MBID
+    /// vide (`NULL`) ne rencontre personne et passe.
     pub fn update_mbid<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE artists SET musicbrainz_id = {} WHERE id = {}",
+            "UPDATE artists SET musicbrainz_id = {}, musicbrainz_id_source = {} WHERE id = {} \
+             AND {} \
+             AND NOT EXISTS (SELECT 1 FROM artists autre WHERE autre.id <> {} \
+                             AND LOWER(TRIM(autre.musicbrainz_id)) = LOWER(TRIM(CAST({} AS TEXT))))",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            super::PAS_UN_MBID_MANUEL,
+            d.placeholder(4),
+            d.placeholder(5)
+        )
+    }
+
+    /// #7535 — la fiche (autre que `id`, emplacement 1) qui porte déjà le
+    /// MBID (emplacement 2), la plus ancienne.
+    pub fn autre_fiche_du_mbid<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, name FROM artists WHERE id <> {} \
+             AND LOWER(TRIM(musicbrainz_id)) = LOWER(TRIM(CAST({} AS TEXT))) \
+             ORDER BY id LIMIT 1",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -444,7 +703,7 @@ impl ArtistRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_artist))
+            .map(|cols| row_to_artist(cols)))
     }
 
     pub fn get_by_name(&self, name: &str) -> Result<Option<Artist>, TuneError> {
@@ -454,7 +713,7 @@ impl ArtistRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_artist))
+            .map(|cols| row_to_artist(cols)))
     }
 
     pub fn get_by_musicbrainz_id(&self, mbid: &str) -> Result<Option<Artist>, TuneError> {
@@ -467,7 +726,7 @@ impl ArtistRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_artist))
+            .map(|cols| row_to_artist(cols)))
     }
 
     pub fn create(&self, artist: &Artist) -> Result<i64, TuneError> {
@@ -501,25 +760,28 @@ impl ArtistRepo {
         sort_name: Option<&str>,
     ) -> Result<Artist, TuneError> {
         let musicbrainz_id = usable_musicbrainz_id(musicbrainz_id);
+        let sort_name = sort_name.filter(|s| !s.trim().is_empty());
         if let Some(mbid) = musicbrainz_id {
             let sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
             let params: [&dyn ToSqlValue; 1] = [&mbid];
             if let Some(row) = self.db.query_one_strong(&sql, &params)? {
-                return Ok(row_to_artist(&row));
+                return self.completer_sort_name(row_to_artist(&row), sort_name);
             }
         }
         {
             let sql = self.dialect_sql(sql::get_by_name, sql::get_by_name);
             let params: [&dyn ToSqlValue; 1] = [&name];
             if let Some(row) = self.db.query_one_strong(&sql, &params)? {
-                return Ok(row_to_artist(&row));
+                return self.completer_sort_name(row_to_artist(&row), sort_name);
             }
         }
         if let Some(existant) = self.meme_artiste_sous_une_autre_graphie(name)? {
-            return Ok(existant);
+            return self.completer_sort_name(existant, sort_name);
         }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
-        let params: [&dyn ToSqlValue; 3] = [&name, &sort_name, &musicbrainz_id];
+        // #6463 — un MBID reçu ici vient des balises du fichier.
+        let provenance = musicbrainz_id.map(|_| ProvenanceMbid::Balise.as_str());
+        let params: [&dyn ToSqlValue; 4] = [&name, &sort_name, &musicbrainz_id, &provenance];
         let id = self.db.execute_returning_id(&create_sql, &params)?;
         Ok(Artist {
             id: Some(id),
@@ -531,6 +793,69 @@ impl ArtistRepo {
             image_path: None,
             image_source: None,
         })
+    }
+
+    /// #6474 — un artiste DÉJÀ en base, retrouvé par le scan, qui n'a pas de
+    /// nom de tri, prend celui que le fichier porte. Avant, seul l'artiste
+    /// CRÉÉ par cette lecture le recevait : une bibliothèque scannée avant
+    /// qu'on ajoute ARTISTSORT à ses fichiers ne l'aurait jamais vu. Un nom de
+    /// tri déjà présent n'est jamais remplacé (`poser_sort_name_si_vide`),
+    /// sauf s'il vient de MusicBrainz : la balise garde la priorité (point 2).
+    fn completer_sort_name(
+        &self,
+        mut artiste: Artist,
+        sort_name: Option<&str>,
+    ) -> Result<Artist, TuneError> {
+        let (Some(id), Some(tri)) = (artiste.id, sort_name) else {
+            return Ok(artiste);
+        };
+        if let Some(actuel) = artiste
+            .sort_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            // Le cas courant d'un scan : la balise dit ce que la fiche dit
+            // déjà. Aucune lecture de plus.
+            if actuel == tri {
+                return Ok(artiste);
+            }
+            let sql = self.dialect_sql(sql::provenance_du_sort_name, sql::provenance_du_sort_name);
+            let params: [&dyn ToSqlValue; 1] = [&id];
+            let provenance = self
+                .db
+                .query_one_strong(&sql, &params)?
+                .and_then(|l| l.first().and_then(|v| v.as_string()));
+            // #6773 — un nom de tri déduit cède à la balise, comme celui de
+            // MusicBrainz.
+            if !matches!(
+                provenance.as_deref(),
+                Some(SOURCE_TRI_MUSICBRAINZ) | Some(SOURCE_TRI_DEDUIT)
+            ) {
+                return Ok(artiste);
+            }
+        }
+        let sql = self.dialect_sql(sql::poser_sort_name_si_vide, sql::poser_sort_name_si_vide);
+        let params: [&dyn ToSqlValue; 2] = [&tri, &id];
+        if self.db.execute(&sql, &params)? > 0 {
+            artiste.sort_name = Some(tri.to_string());
+        }
+        Ok(artiste)
+    }
+
+    /// #6474, point 2 — pose le nom de tri MusicBrainz d'un artiste, s'il
+    /// n'en a pas ou si le sien vient déjà de MusicBrainz. Une balise ou une
+    /// saisie n'est jamais remplacée. Rend `true` si la fiche a changé.
+    pub fn poser_nom_de_tri_musicbrainz(&self, id: i64, tri: &str) -> Result<bool, TuneError> {
+        let tri = tri.trim();
+        if tri.is_empty() {
+            return Ok(false);
+        }
+        let sql = self.dialect_sql(
+            sql::poser_sort_name_musicbrainz,
+            sql::poser_sort_name_musicbrainz,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&tri, &id];
+        Ok(self.db.execute(&sql, &params)? > 0)
     }
 
     /// BIB-C2 : le même artiste existe-t-il déjà sous une autre graphie ?
@@ -548,7 +873,7 @@ impl ArtistRepo {
         let lignes = self.db.query_many_strong(&sql, &params)?;
         Ok(lignes
             .iter()
-            .map(row_to_artist)
+            .map(|cols| row_to_artist(cols))
             .find(|a| cle_artiste(&a.name) == cle))
     }
 
@@ -556,7 +881,7 @@ impl ArtistRepo {
         let id = artist.id.ok_or("artist has no id")?;
         let sql = self.dialect_sql(sql::update, sql::update);
         let musicbrainz_id = usable_musicbrainz_id(artist.musicbrainz_id.as_deref());
-        let params: [&dyn ToSqlValue; 8] = [
+        let params: [&dyn ToSqlValue; 10] = [
             &artist.name,
             &artist.sort_name,
             &musicbrainz_id,
@@ -564,6 +889,8 @@ impl ArtistRepo {
             &artist.bio,
             &artist.image_path,
             &artist.image_source,
+            &artist.sort_name,
+            &musicbrainz_id,
             &id,
         ];
         self.db.execute(&sql, &params)?;
@@ -589,7 +916,10 @@ impl ArtistRepo {
     /// [`Self::get_or_create`] retombe sur la fiche survivante pour toute
     /// graphie de la même clé — un fichier taggé « Ayọ » ne fait pas renaître
     /// « Ayọ ». L'appelant a vérifié la clé, les MBID et l'artiste inconnu ;
-    /// rien n'est automatique.
+    /// rien n'est automatique. #7535 : la route laisse aussi passer deux clés
+    /// différentes qui portent le MÊME MBID (« Phil » / « Philip Selway ») ;
+    /// la graphie perdante, sans MBID dans ses balises, peut alors renaître
+    /// d'un fichier rescanné.
     pub fn absorber(
         &self,
         cible: i64,
@@ -607,6 +937,16 @@ impl ArtistRepo {
             return Err(TuneError::from(format!("artiste {doublon} inconnu")));
         };
         let db: &dyn DbBackend = &*self.db;
+        // #6474 — la provenance du nom de tri voyage avec lui, avant la
+        // reprise générique qui va peut-être le recopier.
+        {
+            let sql = self.dialect_sql(
+                sql::reprendre_la_provenance_du_sort_name,
+                sql::reprendre_la_provenance_du_sort_name,
+            );
+            let params: [&dyn ToSqlValue; 3] = [&doublon, &cible, &doublon];
+            self.db.execute(&sql, &params)?;
+        }
         const CHAMPS: [&str; 11] = [
             "musicbrainz_id",
             "sort_name",
@@ -620,8 +960,32 @@ impl ArtistRepo {
             "bio_lang",
             "bio_fetched_at",
         ];
+        // #6463 — la provenance du MBID voyage AVEC lui, avant la reprise
+        // générique qui va peut-être le recopier. Une cible dont
+        // l'utilisateur a détaché l'identité ne reprend PAS le MBID du
+        // doublon : ce serait le réattacher d'office.
+        let cible_detachee = self.identite_detachee(cible)?;
+        if !cible_detachee {
+            let sql = format!(
+                "UPDATE artists SET musicbrainz_id_source = \
+                   (SELECT a.musicbrainz_id_source FROM artists a WHERE a.id = {}) \
+                 WHERE id = {} AND TRIM(COALESCE(musicbrainz_id, '')) = '' \
+                   AND EXISTS (SELECT 1 FROM artists a WHERE a.id = {} \
+                               AND TRIM(COALESCE(a.musicbrainz_id, '')) <> '')",
+                self.marque(1),
+                self.marque(2),
+                self.marque(3)
+            );
+            let params: [&dyn ToSqlValue; 3] = [&doublon, &cible, &doublon];
+            self.db.execute(&sql, &params)?;
+        }
+        let champs: Vec<&str> = CHAMPS
+            .iter()
+            .copied()
+            .filter(|c| !(cible_detachee && *c == "musicbrainz_id"))
+            .collect();
         let champs_repris =
-            absorption::reprendre_les_champs_vides(db, "artists", &CHAMPS, cible, doublon)?;
+            absorption::reprendre_les_champs_vides(db, "artists", &champs, cible, doublon)?;
         let albums = absorption::repointer(db, "albums", "artist_id", None, cible, doublon)?;
         let pistes = absorption::repointer(db, "tracks", "artist_id", None, cible, doublon)?;
         let credits =
@@ -1151,12 +1515,149 @@ impl ArtistRepo {
         }))
     }
 
+    /// Pose le MBID qu'une recherche MusicBrainz DU NOM a trouvé
+    /// (`metadata/matcher.rs`, `library/artwork.rs`) : provenance `nom`
+    /// (#6463). Une fiche `manuel` n'est jamais touchée.
     pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), TuneError> {
+        self.poser_mbid(id, mbid, ProvenanceMbid::Nom).map(|_| ())
+    }
+
+    /// Pose un MBID avec sa provenance (#6463). Rend `true` si la fiche a
+    /// changé ; `false` pour une fiche `manuel`, que rien d'automatique ne
+    /// touche, et (#7535) pour un MBID qu'une AUTRE fiche porte déjà : il
+    /// n'est pas posé, c'est journalisé (`artist_mbid_deja_porte`). Les deux
+    /// fiches ne se réunissent qu'à la main (onglet Doublons).
+    pub fn poser_mbid(
+        &self,
+        id: i64,
+        mbid: &str,
+        provenance: ProvenanceMbid,
+    ) -> Result<bool, TuneError> {
         let sql = self.dialect_sql(sql::update_mbid, sql::update_mbid);
         let mbid = usable_musicbrainz_id(Some(mbid));
-        // Ordre lié = ordre déclaré : la valeur d'abord, l'identifiant ensuite.
-        self.db.execute(&sql, &[&mbid as &dyn ToSqlValue, &id])?;
+        let source = mbid.map(|_| provenance.as_str());
+        // Ordre lié = ordre déclaré : la valeur, sa provenance,
+        // l'identifiant, puis la garde (l'identifiant, la valeur).
+        let ecrit = self.db.execute(
+            &sql,
+            &[
+                &mbid as &dyn ToSqlValue,
+                &source as &dyn ToSqlValue,
+                &id,
+                &id,
+                &mbid,
+            ],
+        )? > 0;
+        if !ecrit
+            && let Some(m) = mbid
+            && let Some((autre_id, autre_nom)) = self.autre_fiche_du_mbid(id, m)?
+        {
+            tracing::info!(
+                artist_id = id,
+                mbid = %m,
+                provenance = provenance.as_str(),
+                autre_id,
+                autre = %autre_nom,
+                "artist_mbid_deja_porte"
+            );
+        }
+        Ok(ecrit)
+    }
+
+    /// #7535 — la fiche, autre que `id`, qui porte déjà `mbid` (la plus
+    /// ancienne) : son identifiant et son nom.
+    pub fn autre_fiche_du_mbid(
+        &self,
+        id: i64,
+        mbid: &str,
+    ) -> Result<Option<(i64, String)>, TuneError> {
+        let sql = self.dialect_sql(sql::autre_fiche_du_mbid, sql::autre_fiche_du_mbid);
+        Ok(self
+            .db
+            .query_one(&sql, &[&id as &dyn ToSqlValue, &mbid as &dyn ToSqlValue])?
+            .and_then(|l| {
+                Some((
+                    l.first().and_then(|v| v.as_i64())?,
+                    l.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                ))
+            }))
+    }
+
+    /// Le MBID saisi par l'utilisateur, ou son retrait (`None`, « Détacher
+    /// l'identité ») : provenance `manuel` (#6463). Plus rien d'automatique
+    /// ne le remplace ni ne le repose.
+    pub fn poser_mbid_manuel(&self, id: i64, mbid: Option<&str>) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::poser_mbid_manuel, sql::poser_mbid_manuel);
+        let mbid = usable_musicbrainz_id(mbid);
+        self.db
+            .execute(&sql, &[&mbid as &dyn ToSqlValue, &id as &dyn ToSqlValue])?;
         Ok(())
+    }
+
+    /// La provenance du MBID d'un artiste (#6463) ; `None` : inconnue.
+    pub fn provenance_du_mbid(&self, id: i64) -> Result<Option<ProvenanceMbid>, TuneError> {
+        let sql = self.dialect_sql(sql::provenance_du_mbid, sql::provenance_du_mbid);
+        Ok(self
+            .db
+            .query_one_strong(&sql, &[&id as &dyn ToSqlValue])?
+            .and_then(|l| l.first().and_then(|v| v.as_string()))
+            .and_then(|s| ProvenanceMbid::depuis_str(&s)))
+    }
+
+    /// L'utilisateur a-t-il détaché l'identité de cet artiste (#6463) ? Un
+    /// artiste `manuel` SANS MBID : aucune recherche par le nom ne doit lui en
+    /// redonner un.
+    pub fn identite_detachee(&self, id: i64) -> Result<bool, TuneError> {
+        if self.provenance_du_mbid(id)? != Some(ProvenanceMbid::Manuel) {
+            return Ok(false);
+        }
+        Ok(self
+            .get(id)?
+            .is_some_and(|a| usable_musicbrainz_id(a.musicbrainz_id.as_deref()).is_none()))
+    }
+
+    /// #6463, B — retire un MBID que la vérification MusicBrainz a jugé faux,
+    /// s'il est toujours là et de provenance inconnue ou `nom`. Rend `true`
+    /// si la fiche a changé ; l'image et la bio rattachées à ce MBID partent
+    /// avec lui ([`Self::oublier_ce_que_le_mbid_a_apporte`]).
+    pub fn retirer_le_mbid_verifie(&self, id: i64, mbid: &str) -> Result<bool, TuneError> {
+        let sql = self.dialect_sql(sql::retirer_le_mbid_verifie, sql::retirer_le_mbid_verifie);
+        let retire = self
+            .db
+            .execute(&sql, &[&id as &dyn ToSqlValue, &mbid as &dyn ToSqlValue])?
+            > 0;
+        if retire {
+            self.oublier_ce_que_le_mbid_a_apporte(id)?;
+        }
+        Ok(retire)
+    }
+
+    /// #6463 — après le retrait d'un MBID, le portrait et la biographie qu'il
+    /// avait rapportés ne décrivent plus cet artiste (« Ange » gardait la
+    /// photo de la chanteuse) : l'image d'une source rattachée au MBID
+    /// ([`SOURCES_D_IMAGE_DU_MBID`]) et la bio rapportée par l'enrichissement
+    /// (provenance rangée) sont effacées, avec les entrées de cache qui les
+    /// resserviraient. Une image locale, téléversée ou trouvée par le nom, et
+    /// une bio saisie, restent. Rend `(image, bio)` effacées.
+    pub fn oublier_ce_que_le_mbid_a_apporte(&self, id: i64) -> Result<(bool, bool), TuneError> {
+        let p: [&dyn ToSqlValue; 1] = [&id];
+        let sql = self.dialect_sql(sql::oublier_l_image_du_mbid, sql::oublier_l_image_du_mbid);
+        let image = self.db.execute(&sql, &p)? > 0;
+        let sql = self.dialect_sql(sql::oublier_la_bio_du_mbid, sql::oublier_la_bio_du_mbid);
+        let bio = self.db.execute(&sql, &p)? > 0;
+        // La bio du fonds communautaire servie par le NOM est gardée 24 h
+        // sous `cache:artistbio:{nom}:{langue}` : elle resservirait le texte
+        // qu'on vient d'effacer.
+        if let Some(artiste) = self.get(id)? {
+            let settings = super::settings_repo::SettingsRepo::with_backend(self.db.clone());
+            let prefixe = format!("cache:artistbio:{}:", artiste.name);
+            if let Ok(toutes) = settings.all() {
+                for (cle, _) in toutes.iter().filter(|(k, _)| k.starts_with(&prefixe)) {
+                    settings.delete(cle)?;
+                }
+            }
+        }
+        Ok((image, bio))
     }
 
     /// Clear an artist's stored image (path + source) so the next enrichment
@@ -1197,7 +1698,7 @@ impl ArtistRepo {
         let sql = self.dialect_sql(sql::search, sql::search);
         let params: [&dyn ToSqlValue; 4] = [&fts_query, &like, &limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_artist).collect())
+        Ok(rows.iter().map(|cols| row_to_artist(cols)).collect())
     }
 
     /// Le nombre d'artistes correspondants, borné à `plafond` — indépendant
@@ -1215,7 +1716,7 @@ impl ArtistRepo {
     }
 }
 
-fn row_to_artist(cols: &Vec<SqlValue>) -> Artist {
+fn row_to_artist(cols: &[SqlValue]) -> Artist {
     Artist {
         id: cols.first().and_then(|v| v.as_i64()),
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
@@ -1660,6 +2161,89 @@ mod tests {
             .get_or_create("The Beatles", None, Some("Beatles, The"))
             .unwrap();
         assert_eq!(a.sort_name.as_deref(), Some("Beatles, The"));
+    }
+
+    /// #6474 (René, fil 2313) — un artiste déjà en base, sans nom de tri,
+    /// prend celui que le fichier porte au scan suivant ; un nom de tri déjà
+    /// renseigné (balise ou saisie) n'est jamais remplacé.
+    #[test]
+    fn un_artiste_existant_sans_nom_de_tri_prend_celui_du_fichier_6474() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        let avant = repo.get_or_create("Miles Davis", None, None).unwrap();
+        assert_eq!(avant.sort_name, None);
+        let apres = repo
+            .get_or_create("Miles Davis", None, Some("Davis, Miles"))
+            .unwrap();
+        assert_eq!(apres.id, avant.id);
+        assert_eq!(apres.sort_name.as_deref(), Some("Davis, Miles"));
+        assert_eq!(
+            repo.get(avant.id.unwrap())
+                .unwrap()
+                .unwrap()
+                .sort_name
+                .as_deref(),
+            Some("Davis, Miles"),
+            "écrit en base, pas seulement rendu"
+        );
+        // Déjà renseigné : la balise d'un autre fichier ne le remplace pas.
+        let encore = repo
+            .get_or_create("Miles Davis", None, Some("Miles Davis"))
+            .unwrap();
+        assert_eq!(encore.sort_name.as_deref(), Some("Davis, Miles"));
+        assert_eq!(
+            repo.get(avant.id.unwrap())
+                .unwrap()
+                .unwrap()
+                .sort_name
+                .as_deref(),
+            Some("Davis, Miles")
+        );
+        // Une balise vide ne vide rien et ne pose rien.
+        let vide = repo
+            .get_or_create("Joni Mitchell", None, Some("  "))
+            .unwrap();
+        assert_eq!(vide.sort_name, None);
+    }
+
+    #[test]
+    fn le_nom_de_tri_de_l_artiste_d_album_6474() {
+        use super::nom_de_tri_de_l_artiste_d_album as tri;
+        // ALBUMARTISTSORT d'abord.
+        assert_eq!(
+            tri(
+                Some("Davis, Miles"),
+                Some("X"),
+                "Miles Davis",
+                "Miles Davis"
+            ),
+            Some("Davis, Miles")
+        );
+        // À défaut, l'ARTISTSORT d'une piste du même artiste.
+        assert_eq!(
+            tri(None, Some("Davis, Miles"), "Miles Davis", "miles davis"),
+            Some("Davis, Miles")
+        );
+        assert_eq!(
+            tri(
+                Some(" "),
+                Some("Davis, Miles"),
+                "Miles Davis",
+                "Miles Davis"
+            ),
+            Some("Davis, Miles")
+        );
+        // Jamais celui d'un invité, ni d'un « Various Artists ».
+        assert_eq!(
+            tri(None, Some("Evans, Bill"), "Miles Davis", "Bill Evans"),
+            None
+        );
+        assert_eq!(
+            tri(None, Some("Evans, Bill"), "Various Artists", "Bill Evans"),
+            None
+        );
+        // Aucune règle inventée quand les balises manquent.
+        assert_eq!(tri(None, None, "Miles Davis", "Miles Davis"), None);
     }
 
     #[test]

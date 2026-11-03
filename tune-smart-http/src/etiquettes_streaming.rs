@@ -80,7 +80,10 @@ fn condition(rule: &Value, profile_id: i64) -> String {
         "source" => Some("sit.source"),
         // #6121 — la ligne est un ALBUM étiqueté : son artiste est l'artiste
         // de l'album.
-        "artist" | "artist_name" | "album_artist" => Some("sit.artist"),
+        // #6232 — « Interprète » : l'album étiqueté ne connaît que son
+        // artiste, qui est aussi celui de ses pistes (même repli que la
+        // bibliothèque).
+        "artist" | "artist_name" | "album_artist" | "track_artist" => Some("sit.artist"),
         "title" | "album" | "album_title" => Some("sit.title"),
         _ => None,
     };

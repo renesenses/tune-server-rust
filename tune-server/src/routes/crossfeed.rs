@@ -74,7 +74,7 @@ async fn autoriser(state: &AppState, headers: &axum::http::HeaderMap) -> Result<
         headers,
     )
     .await?;
-    crate::premium_audio_plugins::require_installed(state, "crossfeed")
+    crate::premium_audio_plugins::require_installed(state, "crossfeed", headers)
 }
 
 /// `GET /crossfeed/presets`

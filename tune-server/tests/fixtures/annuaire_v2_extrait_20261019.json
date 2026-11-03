@@ -1,0 +1,421 @@
+{
+ "version": 2,
+ "count": 6,
+ "radios": [
+  {
+   "id": 2,
+   "external_id": "S000973",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP",
+   "description": "La radio musicale la plus éclectique. The most eclectic radio out there!",
+   "website_url": "https://www.fip.fr",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/01KV2K6H8392ZH6JA8NNK4904E.png",
+   "radio_metadata_key": "fip",
+   "stream_url": "https://icecast.radiofrance.fr/fip-hifi.aac",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fip-hifi.aac",
+   "quality": "aac192",
+   "genre": "eclectic",
+   "categories": [
+    {
+     "id": 25,
+     "external_id": "C000038",
+     "name": "Eclectic",
+     "slug": "eclectic"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 1,
+     "external_id": null,
+     "url": "https://icecast.radiofrance.fr/fip-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": null,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "mozaiklabs"
+    },
+    {
+     "id": 1775,
+     "external_id": "S000973-01",
+     "url": "http://radio-metadata.fr:8000/fiproon",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 191,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1776,
+     "external_id": "S000973-02",
+     "url": "https://icecast.radiofrance.fr/fip-hifi.aac?id=radiofrance",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1777,
+     "external_id": "S000973-03",
+     "url": "https://icecast.radiofrance.fr/fip-midfi.mp3?id=radiofrance",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "retired_at": null,
+   "updated_at": "2026-10-15T15:58:16+02:00"
+  },
+  {
+   "id": 3,
+   "external_id": "S000978",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Jazz",
+   "description": "D’Avishai Cohen à Herbie Hancock, de Nina Simone à Christian Scott, retrouvez le swing de FIP dans une sélection musicale qui traverse les genres et les époques.",
+   "website_url": "https://www.fip.fr/jazz/webradio",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/01M50SVCDK6B1A2XJMNF8GC42J.jpg",
+   "radio_metadata_key": "fipjazz",
+   "stream_url": "https://icecast.radiofrance.fr/fipjazz-hifi.aac",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fipjazz-hifi.aac",
+   "quality": "aac192",
+   "genre": "jazz",
+   "categories": [
+    {
+     "id": 39,
+     "external_id": "C000065",
+     "name": "Jazz",
+     "slug": "jazz"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 2,
+     "external_id": null,
+     "url": "https://icecast.radiofrance.fr/fipjazz-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": null,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "mozaiklabs"
+    },
+    {
+     "id": 1787,
+     "external_id": "S000978-01",
+     "url": "http://direct.fipradio.fr/live/fip-webradio2.mp3",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1788,
+     "external_id": "S000978-02",
+     "url": "https://icecast.radiofrance.fr/fipjazz-hifi.aac?id=radiofrance",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1789,
+     "external_id": "S000978-03",
+     "url": "https://icecast.radiofrance.fr/fipjazz-midfi.mp3?id=radiofrance",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "retired_at": null,
+   "updated_at": "2026-10-16T00:10:16+02:00"
+  },
+  {
+   "id": 15,
+   "external_id": "S002479",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "Radio Paradise: Main Mix",
+   "description": "DJ-mixed modern and classic rock, electronic, world music, and more\n\nRadio Paradise streams highly curated, eclectic mixes of music with unparalleled audio quality. For over two decades, Radio Paradise has been dedicated to preserving the art of radio DJing and providing a soundtrack you can enjoy all day every day.",
+   "website_url": "https://radioparadise.com",
+   "country": "US",
+   "logo_url": "/storage/radio-logos/01M50T328KGE9HXR8J9RAZ61HD.jpg",
+   "radio_metadata_key": "radioparadise",
+   "stream_url": "http://stream.radioparadise.com/flacm",
+   "v1_stream_url": "http://stream.radioparadise.com/flacm",
+   "quality": "flac",
+   "genre": "eclectic",
+   "categories": [
+    {
+     "id": 25,
+     "external_id": "C000038",
+     "name": "Eclectic",
+     "slug": "eclectic"
+    }
+   ],
+   "keywords": [],
+   "streams": [
+    {
+     "id": 14,
+     "external_id": null,
+     "url": "http://stream.radioparadise.com/flacm",
+     "format": "FLAC",
+     "is_hls": false,
+     "bitrate": null,
+     "sample_rate": null,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "mozaiklabs"
+    },
+    {
+     "id": 2385,
+     "external_id": "S002479-02",
+     "url": "https://stream.radioparadise.com/mp3-192",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 44100,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 2386,
+     "external_id": "S002479-03",
+     "url": "https://stream.radioparadise.com/aac-320",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 320,
+     "sample_rate": 44100,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 2387,
+     "external_id": "S002479-05",
+     "url": "https://stream.radioparadise.com/flacm",
+     "format": "FLAC",
+     "is_hls": false,
+     "bitrate": 1411,
+     "sample_rate": 44100,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 2388,
+     "external_id": "S002479-06",
+     "url": "https://stream.radioparadise.com/mp3-320",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 320,
+     "sample_rate": 44100,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 2389,
+     "external_id": null,
+     "url": "http://stream.radioparadise.com/aac-128",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": null,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "curator"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "retired_at": null,
+   "updated_at": "2026-10-16T00:14:27+02:00"
+  },
+  {
+   "id": 1022,
+   "external_id": "S000981",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Nouveautés",
+   "description": "Faites le plein de nouveautés avec les meilleures sorties musicales sélectionnées par FIP.",
+   "website_url": "https://www.fip.fr/tout-nouveau-tout-fip/webradio",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000981.webp",
+   "radio_metadata_key": "fipnouveaute",
+   "stream_url": "https://icecast.radiofrance.fr/fipnouveautes-hifi.aac?id=radiofrance",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fipnouveautes-hifi.aac?id=radiofrance",
+   "quality": "aac192",
+   "genre": "eclectic",
+   "categories": [
+    {
+     "id": 25,
+     "external_id": "C000038",
+     "name": "Eclectic",
+     "slug": "eclectic"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 1795,
+     "external_id": "S000981-01",
+     "url": "http://direct.fipradio.fr/live/fip-webradio5.mp3",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1796,
+     "external_id": "S000981-02",
+     "url": "https://icecast.radiofrance.fr/fipnouveautes-midfi.mp3?id=radiofrance",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1797,
+     "external_id": "S000981-03",
+     "url": "https://icecast.radiofrance.fr/fipnouveautes-hifi.aac?id=radiofrance",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "retired_at": null,
+   "updated_at": "2026-10-15T15:58:16+02:00"
+  },
+  {
+   "id": 999001,
+   "external_id": "S999001",
+   "source": "radio-metadata",
+   "status": "rejected",
+   "name": "FIP Latino",
+   "description": "La radio musicale la plus éclectique. The most eclectic radio out there!",
+   "website_url": "https://www.fip.fr",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/01KV2K6H8392ZH6JA8NNK4904E.png",
+   "radio_metadata_key": "fiplatino",
+   "stream_url": "https://icecast.radiofrance.fr/fiplatino-hifi.aac",
+   "v1_stream_url": null,
+   "quality": "aac192",
+   "genre": "eclectic",
+   "categories": [
+    {
+     "id": 25,
+     "external_id": "C000038",
+     "name": "Eclectic",
+     "slug": "eclectic"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "retired_at": null,
+   "updated_at": "2026-10-15T15:58:16+02:00"
+  },
+  {
+   "id": 999002,
+   "external_id": "S999002",
+   "source": "radio-metadata",
+   "status": "retired",
+   "name": "FIP Tout nouveau",
+   "description": "La radio musicale la plus éclectique. The most eclectic radio out there!",
+   "website_url": "https://www.fip.fr",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/01KV2K6H8392ZH6JA8NNK4904E.png",
+   "radio_metadata_key": null,
+   "stream_url": "https://icecast.radiofrance.fr/fiptoutnouveau-hifi.aac",
+   "v1_stream_url": null,
+   "quality": "aac192",
+   "genre": "eclectic",
+   "categories": [
+    {
+     "id": 25,
+     "external_id": "C000038",
+     "name": "Eclectic",
+     "slug": "eclectic"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "retired_at": "2026-10-15T12:00:00+02:00",
+   "updated_at": "2026-10-15T15:58:16+02:00"
+  }
+ ]
+}

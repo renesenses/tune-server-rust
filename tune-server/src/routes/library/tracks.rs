@@ -429,7 +429,8 @@ pub(super) async fn list_tracks(
     // Facettes à plusieurs valeurs : la clé répétée (`?format=aiff&format=flac`)
     // se lit dans la chaîne BRUTE, que `serde_urlencoded` ne sait pas agréger —
     // et qu'il refuse même en double.
-    let filter = track_filter_from_raw(raw.as_deref())?;
+    let mut filter = track_filter_from_raw(raw.as_deref())?;
+    filter.profile_id = profile.id();
     let page_triee = PageTriee::depuis(&p)?;
     // #5138 — TOUTES les lectures de cette route sont synchrones (rusqlite).
     // Posées sur un fil de l'exécuteur, les 7 à 9,7 s de la liste et du
@@ -439,12 +440,23 @@ pub(super) async fn list_tracks(
     // bloquants, comme la grille d'albums depuis #4800.
     let (limit, offset) = (p.limit.unwrap_or(50), p.offset.unwrap_or(0));
     let profile_id = profile.id();
+    let (backend, http) = (state.backend.clone(), state.http_client.clone());
     match tokio::task::spawn_blocking(move || {
         lire_la_page_de_pistes(&state, profile_id, p, filter, page_triee)
     })
     .await
     {
-        Ok(corps) => Ok(Json(corps)),
+        Ok(mut corps) => {
+            // #6738 — « So What (128) » : les écoutes de la communauté.
+            tune_core::cloud::ecoutes_communaute::annoter_liste(
+                &backend,
+                &http,
+                tune_core::cloud::ecoutes_communaute::Genre::Piste,
+                corps.get_mut("items"),
+            )
+            .await;
+            Ok(Json(corps))
+        }
         Err(e) => {
             tracing::error!(error = %e, "list_tracks_tache_bloquante_perdue");
             Ok(Json(
@@ -3728,6 +3740,7 @@ mod tests_termes_de_chemin_5192 {
 
         // Le rail compte la MÊME sélection que la liste.
         let Json(f) = super::super::facets::library_facets(
+            crate::routes::active_profile::ActiveProfile(1),
             Query(Default::default()),
             RawQuery(Some("fields=label&q=mahler%20kondrashin".into())),
             State(state.clone()),

@@ -235,7 +235,21 @@ async fn requete(
     chemin: &str,
     corps: Option<&str>,
 ) -> (StatusCode, Value) {
+    requete_du_profil(app, methode, chemin, corps, None).await
+}
+
+/// [`requete`], au nom d'un profil (`X-Profile-Id`, comme le client web).
+async fn requete_du_profil(
+    app: &axum::Router,
+    methode: &str,
+    chemin: &str,
+    corps: Option<&str>,
+    profil: Option<i64>,
+) -> (StatusCode, Value) {
     let mut req = Request::builder().method(methode).uri(chemin);
+    if let Some(p) = profil {
+        req = req.header("X-Profile-Id", p.to_string());
+    }
     if corps.is_some() {
         req = req.header("content-type", "application/json");
     }
@@ -397,6 +411,9 @@ async fn nuage_simule() -> NuageSimule {
     let journal = recues.clone();
 
     let tache = tokio::spawn(async move {
+        let mut localisation = serde_json::json!({
+            "city": "Dijon", "country": "FR", "scope": "radius", "radius_km": 50
+        });
         loop {
             let Ok((mut flux, _)) = ecoute.accept().await else {
                 return;
@@ -434,7 +451,13 @@ async fn nuage_simule() -> NuageSimule {
             }
             journal.lock().unwrap().push((ligne.clone(), corps.clone()));
 
+            if ligne.starts_with("POST /location ") && corps["city"] == "Refus1755" {
+                let _ = flux.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 30\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await;
+                let _ = flux.shutdown().await;
+                continue;
+            }
             let reponse = if ligne.starts_with("POST /location ") {
+                localisation = corps.clone();
                 serde_json::json!({
                     "scope": corps["scope"],
                     "city": corps["city"],
@@ -460,9 +483,9 @@ async fn nuage_simule() -> NuageSimule {
                     }],
                     "total": 187, "limit": limit, "offset": offset,
                     "has_more": offset + 1 < 187,
-                    "scope": "radius", "applied_scope": "radius", "located": true,
-                    "radius_km": 50,
-                    "city": "Dijon", "country": "FR",
+                    "scope": localisation["scope"], "applied_scope": localisation["scope"], "located": true,
+                    "radius_km": localisation["radius_km"],
+                    "city": localisation["city"], "country": localisation["country"],
                 })
             }
             .to_string();
@@ -648,6 +671,224 @@ async fn une_commune_ambigue_est_dite_a_l_ecran() {
     )
     .await;
     assert_eq!(precise["ambiguous"], false, "{precise}");
+}
+
+/// ⭐ tune-web-client#1755 — la localisation PAR PROFIL. Deux profils posent
+/// chacun leur commune ; chacun relit la sienne ; et `upcoming` d'un profil
+/// renvoie d'abord sa commune au nuage quand le nuage applique celle de
+/// l'autre (il n'en garde qu'une par instance), puis la porte en paramètres
+/// de la lecture. Un profil sans choix, ou un en-tête qui ne désigne aucun
+/// profil, retombe sur la clé d'avant : la dernière acceptée par le nuage.
+#[tokio::test]
+async fn i1755_la_localisation_est_rangee_et_rejouee_par_profil() {
+    let state = new_state();
+    state.license.set_account_premium(true, None).await;
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("instance_id", INSTANCE)
+        .unwrap();
+    let profils = tune_core::db::profile_repo::ProfileRepo::with_backend(state.backend.clone());
+    let alice = profils.create("alice-1755", None, None).unwrap();
+    let bruno = profils.create("bruno-1755", None, None).unwrap();
+    let chloe = profils.create("chloe-1755", None, None).unwrap();
+    let nuage = nuage_simule().await;
+    let app = tune_concerts::router_vers(
+        &nuage.racine,
+        state.backend.clone(),
+        Some(state.license.clone()),
+    );
+    let lignes = || -> Vec<String> {
+        nuage
+            .recues
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(l, _)| l.clone())
+            .collect()
+    };
+
+    let (statut, _) = requete_du_profil(
+        &app,
+        "POST",
+        "/location",
+        Some(r#"{"city":"Dijon","postal_code":"21000","country":"FR","scope":"radius","radius_km":50}"#),
+        Some(alice),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK);
+    let (statut, _) = requete_du_profil(
+        &app,
+        "POST",
+        "/location",
+        Some(r#"{"city":"Lyon","country":"FR","scope":"country"}"#),
+        Some(bruno),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK);
+
+    // Chacun relit la sienne.
+    let (_, lue) = requete_du_profil(&app, "GET", "/location", None, Some(alice)).await;
+    assert_eq!(lue["city"], "Dijon", "alice relit SA commune : {lue}");
+    assert_eq!(lue["radius_km"], 50);
+    assert_eq!(lue["postal_code"], "21000");
+    let (_, lue) = requete_du_profil(&app, "GET", "/location", None, Some(bruno)).await;
+    assert_eq!(lue["city"], "Lyon", "{lue}");
+    // Repli : sans profil, profil sans choix, profil inexistant → la dernière
+    // acceptée par le nuage.
+    for profil in [None, Some(chloe), Some(987_654)] {
+        let (_, lue) = requete_du_profil(&app, "GET", "/location", None, profil).await;
+        assert_eq!(lue["city"], "Lyon", "repli pour {profil:?} : {lue}");
+    }
+    assert_eq!(lignes().len(), 2, "lire ne parle pas au nuage");
+
+    // Alice ouvre l'écran : le nuage applique Lyon (bruno) → Dijon est renvoyée
+    // AVANT la lecture, et la lecture la porte.
+    let (statut, a_venir) = requete_du_profil(&app, "GET", "/upcoming", None, Some(alice)).await;
+    assert_eq!(statut, StatusCode::OK, "{a_venir}");
+    let l = lignes();
+    assert_eq!(l.len(), 4, "{l:?}");
+    assert!(
+        l[2].starts_with("POST /location "),
+        "renvoi d'abord : {l:?}"
+    );
+    assert_eq!(
+        nuage.recues.lock().unwrap()[2].1["city"],
+        "Dijon",
+        "c'est la commune d'alice qui est renvoyée"
+    );
+    assert!(
+        l[3].starts_with("GET /upcoming?")
+            && l[3].contains("city=Dijon")
+            && l[3].contains("postal_code=21000")
+            && l[3].contains("scope=radius")
+            && l[3].contains("radius_km=50")
+            && l[3].contains("country=FR"),
+        "la lecture porte le lieu d'alice : {}",
+        l[3]
+    );
+    // Le nuage applique désormais Dijon : la clé d'avant suit.
+    let (_, lue) = requete(&app, "GET", "/location", None).await;
+    assert_eq!(lue["city"], "Dijon", "{lue}");
+
+    // Une seconde lecture d'alice : déjà appliquée, aucun renvoi.
+    requete_du_profil(&app, "GET", "/upcoming", None, Some(alice)).await;
+    let l = lignes();
+    assert_eq!(l.len(), 5, "{l:?}");
+    assert!(l[4].starts_with("GET /upcoming?"), "{l:?}");
+
+    // Chloé n'a rien choisi : aucun renvoi, la lecture porte le lieu appliqué.
+    requete_du_profil(&app, "GET", "/upcoming", None, Some(chloe)).await;
+    let l = lignes();
+    assert_eq!(l.len(), 6, "{l:?}");
+    assert!(
+        l[5].starts_with("GET /upcoming?") && l[5].contains("city=Dijon"),
+        "{l:?}"
+    );
+
+    // Bruno revient : Lyon est renvoyée.
+    requete_du_profil(&app, "GET", "/upcoming", None, Some(bruno)).await;
+    let l = lignes();
+    assert_eq!(l.len(), 8, "{l:?}");
+    assert!(l[6].starts_with("POST /location "), "{l:?}");
+    assert!(
+        l[7].contains("city=Lyon") && l[7].contains("scope=country"),
+        "{l:?}"
+    );
+    assert!(
+        !l[7].contains("radius_km="),
+        "aucun rayon choisi : {}",
+        l[7]
+    );
+}
+
+/// Un refus de réappliquer le lieu ne doit jamais servir celui de l'autre profil.
+#[tokio::test]
+async fn i1755_un_rejeu_refuse_ne_lit_pas_les_concerts_du_profil_precedent() {
+    let state = new_state();
+    state.license.set_account_premium(true, None).await;
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings.set("instance_id", INSTANCE).unwrap();
+    let profils = tune_core::db::profile_repo::ProfileRepo::with_backend(state.backend.clone());
+    let alice = profils.create("alice-refus-1755", None, None).unwrap();
+    settings
+        .set(
+            tune_concerts::CLE_LOCALISATION,
+            r#"{"city":"Lyon","country":"FR","scope":"country"}"#,
+        )
+        .unwrap();
+    settings
+        .set(
+            &tune_concerts::cle_localisation_du_profil(alice),
+            r#"{"city":"Refus1755","country":"FR","scope":"country"}"#,
+        )
+        .unwrap();
+    let nuage = nuage_simule().await;
+    let app = tune_concerts::router_vers(
+        &nuage.racine,
+        state.backend.clone(),
+        Some(state.license.clone()),
+    );
+    let (statut, corps) = requete_du_profil(&app, "GET", "/upcoming", None, Some(alice)).await;
+    assert_eq!(
+        statut,
+        StatusCode::TOO_MANY_REQUESTS,
+        "un lieu refusé ne doit pas rendre les concerts du profil précédent : {corps}"
+    );
+    assert_eq!(corps["code"], "concerts.rate_limited");
+    assert_eq!(corps["retry_after"], 30, "le délai du nuage reste transmis");
+    let recues = nuage.recues.lock().unwrap();
+    assert_eq!(
+        recues.len(),
+        1,
+        "aucun upcoming après le refus du lieu : {recues:?}"
+    );
+    assert!(recues[0].0.starts_with("POST /location "));
+}
+
+/// Deux écrans ouverts en même temps : chaque réponse doit porter SA commune,
+/// y compris avec le nuage historique qui ignore le lieu passé à upcoming.
+#[tokio::test]
+async fn i1755_deux_profils_simultanes_gardent_chacun_leur_lieu() {
+    let state = new_state();
+    state.license.set_account_premium(true, None).await;
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings.set("instance_id", INSTANCE).unwrap();
+    let profils = tune_core::db::profile_repo::ProfileRepo::with_backend(state.backend.clone());
+    let alice = profils.create("alice-simultanee-1755", None, None).unwrap();
+    let bruno = profils.create("bruno-simultane-1755", None, None).unwrap();
+    for (id, ville) in [(alice, "Dijon"), (bruno, "Lyon")] {
+        settings
+            .set(
+                &tune_concerts::cle_localisation_du_profil(id),
+                &serde_json::json!({"city":ville,"country":"FR","scope":"country"}).to_string(),
+            )
+            .unwrap();
+    }
+    let nuage = nuage_simule().await;
+    let app = tune_concerts::router_vers(
+        &nuage.racine,
+        state.backend.clone(),
+        Some(state.license.clone()),
+    );
+    let (a, b) = tokio::join!(
+        requete_du_profil(&app, "GET", "/upcoming", None, Some(alice)),
+        requete_du_profil(&app, "GET", "/upcoming", None, Some(bruno))
+    );
+    assert_eq!(a.0, StatusCode::OK);
+    assert_eq!(b.0, StatusCode::OK);
+    assert_eq!(a.1["city"], "Dijon", "Alice doit recevoir ses concerts");
+    assert_eq!(b.1["city"], "Lyon", "Bruno doit recevoir ses concerts");
+    let recues = nuage.recues.lock().unwrap();
+    assert_eq!(recues.len(), 4);
+    for paire in recues.chunks_exact(2) {
+        assert!(paire[0].0.starts_with("POST /location "), "{recues:?}");
+        assert!(paire[1].0.starts_with("GET /upcoming?"), "{recues:?}");
+        assert!(
+            paire[1]
+                .0
+                .contains(&format!("city={}", paire[0].1["city"].as_str().unwrap())),
+            "le renvoi et la lecture d'un profil ne doivent pas être séparés : {recues:?}"
+        );
+    }
 }
 
 /// Une demande hors des règles du nuage est refusée ICI, en 422 et en nommant

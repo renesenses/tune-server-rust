@@ -1,0 +1,35 @@
+#3179 — ARTIST et ALBUMARTIST à l'import
+
+Règle : ARTIST crédite la piste, ALBUMARTIST crédite l'album, même hors
+compilation. Les invités peuvent donc apparaître dans la grille Artistes.
+Un nom déduit du chemin ne crée pas un invité hors compilation.
+
+Le MBID de piste ne sert de repli au MBID d'artiste d'album que si les deux
+noms désignent le même artiste. Sinon le rapprochement par MBID pouvait
+attribuer l'identité de l'invité à l'artiste d'album.
+
+Les tests passent par TrackImporter, la persistance TrackRepo et la relecture
+SQLite avec jointure des artistes. Ils couvrent les crédits distincts, les
+MBID et noms de tri distincts, le même artiste, ARTIST absent ou issu du
+chemin, ALBUMARTIST absent et la correction d'un ancien rattachement au rescan.
+La contre-épreuve retire les deux corrections en gardant les tests.
+
+Contre-épreuve Shrek : compilation réussie, 4 échecs / 2 réussites.
+Les assertions voient Scott Hamilton à la place de Warren Vaché (et
+inversement sans ALBUMARTIST), ainsi que le MBID de Warren sur Scott.
+La restauration est faite par copie du fichier corrigé.
+
+Retour au vert Shrek : 44 tests scan_import réussis, 2 témoins déjà ignorés.
+L'ancien témoin #1881 pour un artiste d'album réel attend désormais les
+ARTIST distincts des pistes, en conservant Fritz Reiner comme ALBUMARTIST.
+Les contrôles de compilation, regroupement et édition manuelle passent.
+Garde integration_contracts aucune_fuite_de_temporaires : 3/3 réussis.
+rustfmt (édition 2024) et git diff --check réussis sur Shrek.
+
+Limites : les balises du fichier original du signalement ne sont pas fournies.
+Sans ALBUMARTIST, le titre d'artiste d'album n'est pas deviné : la politique
+existante de choix du premier artiste reste en place pour COMPILATION=0.
+Un rescan des métadonnées est nécessaire pour corriger les rattachements de
+pistes existants ; aucune bibliothèque de production n'a été rescannée.
+Les anciennes identités MusicBrainz déjà contaminées ne font pas l'objet
+d'une réécriture globale. L'issue reste ouverte pour validation du cas réel.

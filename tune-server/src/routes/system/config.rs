@@ -287,11 +287,22 @@ pub(super) async fn get_config(
     headers: axum::http::HeaderMap,
     profile: ActiveProfile,
     State(state): State<AppState>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let lang = crate::i18n::lang_from_header(&headers);
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let all = settings.all().unwrap_or_default();
+    // A failed snapshot is not an empty settings table: serving defaults here
+    // made persisted choices look reset, despite a successful earlier write.
+    // #7307 — l'erreur était jetée sans trace : le rapport d'un testeur dont
+    // les choix « reviennent au défaut » ne pouvait pas en porter la cause.
+    let all = settings.all().map_err(|e| {
+        tracing::error!(erreur = %e, "reglages_illisibles");
+        AppError::service_unavailable("Server settings are temporarily unavailable")
+    })?;
     let mut config = serde_json::Map::new();
+    config.insert(
+        tune_core::db::listening_resume::REWIND_KEY.into(),
+        json!(tune_core::db::listening_resume::DEFAULT_REWIND),
+    );
     for (k, v) in all {
         // 🔴 Les préférences des AUTRES profils ne sortent pas d'ici.
         //
@@ -331,6 +342,13 @@ pub(super) async fn get_config(
         ("tidal_enabled", json!(true)),
         ("qobuz_enabled", json!(true)),
         ("youtube_enabled", json!(true)),
+        // Pays déclaré pour les restrictions des radios ; vide = inconnu.
+        (
+            crate::routes::radios::geofencing::COUNTRY_SETTING,
+            json!(""),
+        ),
+        // #7152 — pays de la recherche de podcasts ; vide = automatique.
+        (crate::routes::podcasts::CLE_PAYS_PODCASTS, json!("")),
         // #5247 — pays des tendances YouTube Music ; vide = automatique.
         (
             tune_core::streaming::youtube_decouverte::CLE_PAYS_TENDANCES,
@@ -370,6 +388,20 @@ pub(super) async fn get_config(
         // from the one above, and default ON since it always behaved that way.
         // The web toggle writes "false" to opt out (JP Borderies).
         ("scan_import_playlists", json!(true)),
+        // #6554 (fil 2294) — « Coffrets automatiques », section Bibliothèque.
+        // Publié même absent de la base, pour que l'interface affiche la case
+        // COCHÉE (le comportement d'avant) plutôt que « je ne sais pas ».
+        (
+            tune_core::db::coffrets_auto::CLE_REGLAGE_AUTO,
+            json!(tune_core::db::coffrets_auto::REGLAGE_AUTO_DEFAUT),
+        ),
+        // #6917 (fil 2397) — « Ne dédoublonner que sur un même support »,
+        // section Bibliothèque. Éteint par défaut (arbitrage du 27/10/2026),
+        // publié même absent de la base pour que la case s'affiche DÉCOCHÉE.
+        (
+            tune_core::library::dedoublonnage_par_racine::CLE,
+            json!(tune_core::library::dedoublonnage_par_racine::DEFAUT),
+        ),
         // #4051 — le consentement LRCLIB, publié comme ses deux voisins de la
         // MÊME section « Bibliothèque » (`metadata_readonly`, `enrich_on_scan`).
         //
@@ -405,6 +437,29 @@ pub(super) async fn get_config(
             tune_core::cloud::consent::CONTRIBUTION_SETTING_KEY,
             json!(tune_core::cloud::consent::CONTRIBUTION_DEFAULT),
         ),
+        // #6510 — « Envoyer mes écoutes à mon compte ». Opt-in STRICT, publié
+        // avec son défaut pour que le client distingue « éteint » de « pas lu ».
+        (
+            tune_core::cloud::ecoutes_au_compte::CLE_ACTIVATION,
+            json!(tune_core::cloud::ecoutes_au_compte::ACTIVATION_DEFAUT),
+        ),
+        // #6545 — « Partager mes notes et mes écoutes avec la communauté
+        // (anonymement) ». Opt-in STRICT, distinct de l'envoi des écoutes.
+        (
+            tune_core::cloud::notes_communautaires::CLE_PARTAGE,
+            json!(tune_core::cloud::notes_communautaires::PARTAGE_DEFAUT),
+        ),
+        // #5594 — les résultats d'analyse de la communauté : RECEVOIR et
+        // CONTRIBUER, deux opt-in STRICTS et séparés, publiés avec leur
+        // défaut pour que le client distingue « éteint » de « pas lu ».
+        (
+            tune_core::cloud::mesures_communautaires::CLE_RECEPTION,
+            json!(tune_core::cloud::mesures_communautaires::RECEPTION_DEFAUT),
+        ),
+        (
+            tune_core::cloud::mesures_communautaires::CLE_CONTRIBUTION,
+            json!(tune_core::cloud::mesures_communautaires::CONTRIBUTION_DEFAUT),
+        ),
         ("quality_split", json!(true)),
         // Fil 2148 (#5792) — le délai de la sonde des partages réseau.
         (
@@ -439,11 +494,37 @@ pub(super) async fn get_config(
             tune_core::taches_de_fond::vitesse::CLE_REGLAGE,
             json!(tune_core::taches_de_fond::vitesse::Vitesse::default().id()),
         ),
+        // #6713 — lever le bridage des analyses quand la température est
+        // illisible. Désactivé par défaut, publié avec son défaut pour que le
+        // client distingue « éteint » de « pas lu ».
+        (
+            tune_core::taches_de_fond::vitesse::CLE_LEVER_LE_BRIDAGE,
+            json!(tune_core::taches_de_fond::vitesse::LEVER_LE_BRIDAGE_DEFAUT),
+        ),
+        // #6286 — le rappel périodique de l'audit d'intégrité, en jours.
+        // Éteint (0) par défaut, publié avec son défaut.
+        (
+            tune_core::audio::audit_integrite::rappel::CLE_RAPPEL_JOURS,
+            json!(tune_core::audio::audit_integrite::rappel::RAPPEL_JOURS_DEFAUT),
+        ),
         // #5593 — le périmètre des passes de fond qui décodent : les racines
         // de bibliothèque exclues (ReplayGain, plage dynamique, empreintes,
         // CLAP). Vide par défaut : rien d'exclu, le comportement d'avant.
         (
             tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+            json!([]),
+        ),
+        // Fil 2173 — les dossiers auxquels les passes qui décodent se
+        // limitent. Vide par défaut : toute la bibliothèque.
+        (
+            tune_core::taches_de_fond::perimetre::CLE_DOSSIERS_INCLUS,
+            json!([]),
+        ),
+        // #7538 — les dossiers que l'enrichissement des métadonnées ne touche
+        // pas (communautaire, MusicBrainz, réparations de genre). Vide par
+        // défaut : rien d'exclu.
+        (
+            tune_core::taches_de_fond::perimetre::CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT,
             json!([]),
         ),
         // #6198 — les genres de la passe CLAP : retenus (vide : tous) et
@@ -796,6 +877,30 @@ pub(super) async fn get_config(
             "description": crate::i18n::t(&lang, "settings.communityContribution.description"),
         }),
     );
+    // #6840 — le consentement au partage des écoutes avec le compte. Trois
+    // états (`a_demander`, `accepte`, `refuse`), et `linked` : la question ne
+    // se pose que sur un serveur relié à un compte mozaiklabs.fr. La bascule
+    // `cloud_listens_upload_enabled` est republiée depuis le MÊME état que lit
+    // l'envoi, pour que l'écran ne puisse pas dire « oui » quand rien ne part.
+    {
+        use tune_core::cloud::ecoutes_au_compte as ec;
+        let etat = ec::consentement(&settings);
+        let relie = tune_core::cloud::sauvegarde_config::compte(&settings).is_ok();
+        config.insert(
+            ec::CLE_ACTIVATION.to_string(),
+            json!(etat == ec::Consentement::Accepte),
+        );
+        config.insert(
+            ec::CLE_REPONSE.to_string(),
+            json!({
+                "state": etat.id(),
+                "linked": relie,
+                "answered_at": ec::date_du_consentement(&settings),
+                "dismissals": ec::fermetures_sans_reponse(&settings),
+                "max_dismissals": ec::FERMETURES_MAX,
+            }),
+        );
+    }
     // Derived boolean: web client checks discogs_token_set to display badge.
     // Check both the DB setting and the env/toml fallback so that users
     // who set TUNE_DISCOGS_TOKEN in .env or tune.toml also see it as configured.
@@ -892,7 +997,7 @@ pub(super) async fn get_config(
     // vit désormais dans `tune_core::secrets`, qui classe sur le NOM et couvre
     // donc aussi le réglage ajouté demain.
     tune_core::secrets::caviarder_carte(&mut config);
-    Json(Value::Object(config))
+    Ok(Json(Value::Object(config)))
 }
 
 /// Les trois plafonds de l'indexation UPnP tels que la PROCHAINE passe les
@@ -1207,6 +1312,125 @@ fn normaliser_vitesse_des_analyses(
     Ok(())
 }
 
+/// Longueur maximale du nom du serveur, en caractères (#7044).
+pub(crate) const NOM_DU_SERVEUR_LONGUEUR_MAX: usize = 64;
+
+/// #7044 — le nom que l'utilisateur donne à son serveur (« Alec-server »).
+///
+/// Il est relu tel quel par d'autres programmes : l'interface, les autres
+/// serveurs Tune du réseau et la page publique des radios de mozaiklabs.fr
+/// (« Connecté à … »), qui le lit dans `GET /system/health` → `server_name`.
+/// Un nom qui sort de là doit donc être un texte court et affichable : espaces
+/// de tête et de queue retirés, 64 caractères au plus, aucun caractère de
+/// contrôle (retour à la ligne, tabulation, NUL). Vide ou `null` : on efface le
+/// réglage et le nom d'hôte reprend sa place. Un nom refusé est REFUSÉ (400),
+/// jamais tronqué en silence.
+fn normaliser_nom_du_serveur(values: &mut serde_json::Map<String, Value>) -> Result<(), AppError> {
+    let Some(brut) = values.get("server_name") else {
+        return Ok(());
+    };
+    let nom = match brut {
+        Value::Null => "",
+        Value::String(s) => s.trim(),
+        autre => {
+            return Err(AppError::bad_request(format!(
+                "server_name : un texte est attendu, pas {autre}"
+            )));
+        }
+    };
+    if nom.chars().count() > NOM_DU_SERVEUR_LONGUEUR_MAX {
+        return Err(AppError::bad_request(format!(
+            "server_name : {NOM_DU_SERVEUR_LONGUEUR_MAX} caractères au plus"
+        )));
+    }
+    if nom.chars().any(char::is_control) {
+        return Err(AppError::bad_request(
+            "server_name : aucun caractère de contrôle (retour à la ligne, tabulation…)",
+        ));
+    }
+    let nom = nom.to_string();
+    values.insert("server_name".to_string(), Value::String(nom));
+    Ok(())
+}
+
+/// #6713 — « lever le bridage sans température lisible » : un booléen (ou
+/// `"true"`/`"false"`), sinon 400. Une autre valeur, gardée telle quelle,
+/// se relirait « non » sans un mot.
+fn normaliser_levee_du_bridage(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<(), AppError> {
+    use tune_core::taches_de_fond::vitesse::CLE_LEVER_LE_BRIDAGE;
+    let Some(brut) = values.get(CLE_LEVER_LE_BRIDAGE) else {
+        return Ok(());
+    };
+    let valeur = match brut {
+        Value::Bool(b) => *b,
+        Value::String(s) if s.trim() == "true" => true,
+        Value::String(s) if s.trim() == "false" => false,
+        autre => {
+            return Err(AppError::bad_request(format!(
+                "{CLE_LEVER_LE_BRIDAGE} : un booléen est attendu, reçu {autre}"
+            )));
+        }
+    };
+    if valeur {
+        tracing::warn!(
+            "analyses_bridage_leve_par_reglage — sans température lisible, les analyses de fond \
+             tourneront à la vitesse réglée (choix de l'utilisateur, #6713)"
+        );
+    }
+    values.insert(CLE_LEVER_LE_BRIDAGE.to_string(), json!(valeur));
+    Ok(())
+}
+
+/// #6286 — le rappel de l'audit d'intégrité : un entier de jours de 0 (éteint)
+/// à 365, nu ou en chaîne, écrit nu ; sinon 400 en nommant les bornes.
+fn normaliser_rappel_audit_integrite(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<(), AppError> {
+    use tune_core::audio::audit_integrite::rappel::{CLE_RAPPEL_JOURS, valider};
+    let Some(brut) = values.get(CLE_RAPPEL_JOURS) else {
+        return Ok(());
+    };
+    let texte = match brut {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        autre => autre.to_string(),
+    };
+    let jours = valider(&texte).map_err(AppError::bad_request)?;
+    values.insert(
+        CLE_RAPPEL_JOURS.to_string(),
+        Value::String(jours.to_string()),
+    );
+    Ok(())
+}
+
+/// #5594 — les deux options des mesures communautaires : un booléen (ou
+/// `"true"`/`"false"`), sinon 400. Une autre valeur, gardée telle quelle, se
+/// relirait « non » sans un mot — et un opt-in ne se devine pas.
+fn normaliser_mesures_communautaires(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<(), AppError> {
+    use tune_core::cloud::mesures_communautaires::{CLE_CONTRIBUTION, CLE_RECEPTION};
+    for cle in [CLE_RECEPTION, CLE_CONTRIBUTION] {
+        let Some(brut) = values.get(cle) else {
+            continue;
+        };
+        let valeur = match brut {
+            Value::Bool(b) => *b,
+            Value::String(s) if s.trim() == "true" => true,
+            Value::String(s) if s.trim() == "false" => false,
+            autre => {
+                return Err(AppError::bad_request(format!(
+                    "{cle} : un booléen est attendu, reçu {autre}"
+                )));
+            }
+        };
+        values.insert(cle.to_string(), json!(valeur));
+    }
+    Ok(())
+}
+
 /// #4681 — la politique de cession à la lecture : un objet dont chaque champ
 /// est borné (voir `tune_core::taches_de_fond::priorite::politique`). Un champ
 /// absent prend sa valeur par défaut, `null` remet tout par défaut ; un champ
@@ -1236,25 +1460,40 @@ fn normaliser_politique_de_lecture(
 fn normaliser_perimetre_des_analyses(
     values: &mut serde_json::Map<String, Value>,
 ) -> Result<bool, AppError> {
-    use tune_core::taches_de_fond::perimetre::{CLE_RACINES_EXCLUES, normaliser};
-    let Some(brut) = values.get(CLE_RACINES_EXCLUES) else {
-        return Ok(false);
+    use tune_core::taches_de_fond::perimetre::{
+        CLE_DOSSIERS_INCLUS, CLE_RACINES_EXCLUES, normaliser,
     };
-    let liste = normaliser(brut)
-        .map_err(|e| AppError::bad_request(format!("{CLE_RACINES_EXCLUES} : {e}")))?;
-    values.insert(CLE_RACINES_EXCLUES.to_string(), json!(liste));
-    Ok(true)
+    // Fil 2173 — les dossiers inclus, même forme, même refus, et la même
+    // campagne ReplayGain à refermer : ils changent le périmètre compté.
+    let mut touche = false;
+    for cle in [CLE_RACINES_EXCLUES, CLE_DOSSIERS_INCLUS] {
+        let Some(brut) = values.get(cle) else {
+            continue;
+        };
+        let liste = normaliser(brut).map_err(|e| AppError::bad_request(format!("{cle} : {e}")))?;
+        values.insert(cle.to_string(), json!(liste));
+        touche = true;
+    }
+    Ok(touche)
 }
 
 /// #6198 — les genres de la passe CLAP, retenus et écartés : la même forme
 /// que les racines exclues (tableau de chaînes, rognées, sans vide ni
 /// doublon, `null` = vide), refusée en 400 sinon. Ils ne touchent pas
 /// ReplayGain : aucune campagne à refermer.
+///
+/// #7538 — les dossiers exclus de l'enrichissement suivent la même forme et
+/// ne touchent pas davantage ReplayGain.
 fn normaliser_genres_du_clap(values: &mut serde_json::Map<String, Value>) -> Result<(), AppError> {
     use tune_core::taches_de_fond::perimetre::{
-        CLE_GENRES_CLAP_EXCLUS, CLE_GENRES_CLAP_INCLUS, normaliser,
+        CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT, CLE_GENRES_CLAP_EXCLUS, CLE_GENRES_CLAP_INCLUS,
+        normaliser,
     };
-    for cle in [CLE_GENRES_CLAP_INCLUS, CLE_GENRES_CLAP_EXCLUS] {
+    for cle in [
+        CLE_GENRES_CLAP_INCLUS,
+        CLE_GENRES_CLAP_EXCLUS,
+        CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT,
+    ] {
         let Some(brut) = values.get(cle) else {
             continue;
         };
@@ -1308,6 +1547,31 @@ fn normaliser_pays_tendances_youtube(
                 "{cle} : code pays à deux lettres attendu (FR, DE, ZZ pour le monde) ou vide pour automatique, reçu {texte:?}"
             ))
         })?
+    };
+    values.insert(cle.to_string(), Value::String(normalise));
+    Ok(())
+}
+
+/// #7152 — le pays de la recherche de podcasts : deux lettres, ou vide
+/// (« auto » compris) pour automatique. Refusé sinon, en le disant.
+fn normaliser_pays_podcasts(values: &mut serde_json::Map<String, Value>) -> Result<(), AppError> {
+    let cle = crate::routes::podcasts::CLE_PAYS_PODCASTS;
+    let Some(brut) = values.get(cle) else {
+        return Ok(());
+    };
+    let texte = match brut {
+        Value::Null => String::new(),
+        Value::String(s) => s.trim().to_string(),
+        autre => autre.to_string(),
+    };
+    let normalise = if texte.is_empty() || texte.eq_ignore_ascii_case("auto") {
+        String::new()
+    } else if texte.len() == 2 && texte.bytes().all(|b| b.is_ascii_alphabetic()) {
+        texte.to_ascii_lowercase()
+    } else {
+        return Err(AppError::bad_request(format!(
+            "{cle} : code pays à deux lettres attendu (fr, de…) ou vide pour automatique, reçu {texte:?}"
+        )));
     };
     values.insert(cle.to_string(), Value::String(normalise));
     Ok(())
@@ -1382,6 +1646,31 @@ fn normaliser_scan_au_demarrage(
     Ok(None)
 }
 
+/// #6917 — « Ne dédoublonner que sur un même support » : `true` ou `false`,
+/// sinon 400. Une valeur illisible ne doit pas se lire « éteint » en silence.
+fn normaliser_dedoublonnage_par_racine(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<(), AppError> {
+    let cle = tune_core::library::dedoublonnage_par_racine::CLE;
+    let Some(brut) = values.get(cle) else {
+        return Ok(());
+    };
+    let choix = match brut {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(choix) = choix else {
+        return Err(AppError::bad_request(format!("{cle} attend true ou false")));
+    };
+    values.insert(cle.to_string(), Value::Bool(choix));
+    Ok(())
+}
+
 /// Fil 2148 (#5792) — le délai de la sonde des partages réseau : un nombre de
 /// secondes dans les bornes, ou 400 qui les nomme. Rend la valeur à appliquer
 /// après l'écriture.
@@ -1406,6 +1695,61 @@ fn normaliser_intervalle_reseau(
 /// #4384 — le patch a-t-il touché un réglage dont dépend le facteur
 /// ReplayGain de lecture ? Toutes ces clés partagent le préfixe
 /// `replaygain_` (`audio::replaygain::{MODE_KEY, PREAMP_KEY, …}`).
+/// #6840 — la réponse à la question des écoutes, retirée du patch.
+///
+/// Deux portes, un seul chemin d'écriture
+/// ([`tune_core::cloud::ecoutes_au_compte::enregistrer_reponse`]) :
+/// - `cloud_listens_consent` : `accepte`, `refuse` ou `fermee` (la fenêtre
+///   du démarrage) ; tout autre mot est REFUSÉ ;
+/// - `cloud_listens_upload_enabled` : la bascule des Réglages, vrai vaut
+///   « accepte », faux « refuse ».
+///
+/// Les clés internes (état, date, compteur) ne s'écrivent pas par ce patch
+/// générique : un client ne date pas un consentement à la place du serveur.
+fn prendre_reponse_ecoutes(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<Option<tune_core::cloud::ecoutes_au_compte::Reponse>, AppError> {
+    use tune_core::cloud::ecoutes_au_compte as ec;
+    for interne in [
+        ec::CLE_CONSENTEMENT,
+        ec::CLE_CONSENTEMENT_DATE,
+        ec::CLE_FERMETURES,
+    ] {
+        if values.contains_key(interne) {
+            return Err(AppError::bad_request(format!(
+                "`{interne}` is written by the server; send `{}`: \"accepte\", \"refuse\" or \"fermee\"",
+                ec::CLE_REPONSE
+            )));
+        }
+    }
+    let texte = |v: Value| {
+        v.as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| v.to_string())
+    };
+    let reponse = values.remove(ec::CLE_REPONSE).map(texte);
+    let bascule = values.remove(ec::CLE_ACTIVATION).map(texte);
+    match (reponse, bascule) {
+        (Some(_), Some(_)) => Err(AppError::bad_request(format!(
+            "send either `{}` or `{}`, not both",
+            ec::CLE_REPONSE,
+            ec::CLE_ACTIVATION
+        ))),
+        (Some(mot), None) => ec::Reponse::depuis(&mot).map(Some).ok_or_else(|| {
+            AppError::bad_request(format!(
+                "`{}` must be \"accepte\", \"refuse\" or \"fermee\"",
+                ec::CLE_REPONSE
+            ))
+        }),
+        (None, Some(v)) => Ok(Some(if tune_core::cloud::consent::est_vrai(&v) {
+            ec::Reponse::Oui
+        } else {
+            ec::Reponse::Non
+        })),
+        (None, None) => Ok(None),
+    }
+}
+
 fn touche_le_replaygain(cles_posees: &[String]) -> bool {
     cles_posees.iter().any(|c| c.starts_with("replaygain_"))
 }
@@ -1417,6 +1761,13 @@ pub(super) async fn update_config(
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut values = body.0;
+    if let Some(value) = values.get(tune_core::db::listening_resume::REWIND_KEY) {
+        if value.as_u64().is_none_or(|n| n > 300) {
+            return Err(AppError::bad_request(
+                "continue_listening_rewind_seconds : entier de 0 à 300 attendu",
+            ));
+        }
+    }
     // #2265 — refuser d'inscrire le nom du backend ACTIF comme s'il était un
     // réglage. Aucun repli, aucune réinterprétation vers `local_audio_backend` :
     // les deux informations sont différentes, et deviner laquelle est demandée
@@ -1457,12 +1808,22 @@ pub(super) async fn update_config(
     // lieu d'être acceptée puis ramenée en silence à la lecture.
     normaliser_plafond_aleatoire(&mut values)?;
     normaliser_pays_tendances_youtube(&mut values)?;
+    normaliser_pays_podcasts(&mut values)?;
+    crate::routes::radios::geofencing::normalize_setting(&mut values)?;
     normaliser_vitesse_des_analyses(&mut values)?;
+    normaliser_nom_du_serveur(&mut values)?;
+    normaliser_levee_du_bridage(&mut values)?;
+    normaliser_rappel_audit_integrite(&mut values)?;
+    normaliser_mesures_communautaires(&mut values)?;
     let politique_de_lecture = normaliser_politique_de_lecture(&mut values)?;
     let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
     normaliser_genres_du_clap(&mut values)?;
     let intervalle_reseau_demande = normaliser_intervalle_reseau(&mut values)?;
+    // #6840 — la réponse à la question des écoutes (ou la bascule des
+    // Réglages) : retirée de la boucle générique, écrite plus bas, datée.
+    let reponse_ecoutes = prendre_reponse_ecoutes(&mut values)?;
     let scan_au_demarrage_efface = normaliser_scan_au_demarrage(&mut values)?.is_some();
+    normaliser_dedoublonnage_par_racine(&mut values)?;
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
         tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
@@ -1584,6 +1945,18 @@ pub(super) async fn update_config(
     // « la requête est arrivée » de « la requête n'est jamais partie », qui
     // est la seule question que ce ticket n'a pas su résoudre.
     let mut cles_posees: Vec<String> = Vec::with_capacity(values.len());
+    let mut consentement_ecoutes = None;
+    if let Some(r) = reponse_ecoutes {
+        use tune_core::cloud::ecoutes_au_compte as ec;
+        match ec::enregistrer_reponse(&settings, r, chrono::Utc::now()) {
+            Ok(etat) => consentement_ecoutes = Some(etat),
+            Err(e) => {
+                tracing::error!(reglage = ec::CLE_REPONSE, erreur = %e, "reglage_non_ecrit");
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
+            }
+        }
+        cles_posees.push(ec::CLE_REPONSE.to_string());
+    }
     for (key, value) in values {
         let str_val = if value.is_string() {
             value
@@ -1637,6 +2010,22 @@ pub(super) async fn update_config(
     if let Some(p) = politique_de_lecture {
         tune_core::taches_de_fond::priorite::politique::regler(p);
     }
+    // #6255 — le détecteur de bruit des lecteurs réseau vaut pour les
+    // connexions qui s'ouvrent ensuite, sans redémarrage.
+    if cles_posees
+        .iter()
+        .any(|c| c == tune_core::http::bruit_reseau::CLE_REGLAGE)
+    {
+        let actif = tune_core::http::bruit_reseau::resoudre(
+            settings
+                .get(tune_core::http::bruit_reseau::CLE_REGLAGE)
+                .ok()
+                .flatten()
+                .as_deref(),
+        );
+        tune_core::http::bruit_reseau::regler(actif);
+        tracing::info!(actif, "network_noise_watch_applied");
+    }
     // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
     let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
     // Fil 2148 (#5792) — le délai des partages réseau vaut dès l'attente en
@@ -1647,6 +2036,9 @@ pub(super) async fn update_config(
     }
 
     let mut reponse = json!({"ok": true});
+    if let Some(etat) = consentement_ecoutes {
+        reponse[tune_core::cloud::ecoutes_au_compte::CLE_REPONSE] = json!(etat.id());
+    }
     // Champ ADDITIF : combien de sorties locales ont reçu le nouveau facteur
     // ReplayGain tout de suite. `0` = rien ne jouait en local ; une zone
     // réseau l'entendra à la piste suivante.
@@ -1679,7 +2071,13 @@ pub(super) async fn update_config(
     // lit avec la même fonction, arguments inversés.
     let ajoutees = racines_retirees(&racines_apres, &racines_avant);
     if !ajoutees.is_empty() {
-        super::scan::spawn_library_scan(state.clone(), false, None).await;
+        super::scan::spawn_library_scan_par(
+            state.clone(),
+            false,
+            None,
+            super::scan::ORIGINE_AJOUT_DE_DOSSIER,
+        )
+        .await;
     }
 
     let retirees = racines_retirees(&racines_avant, &racines_apres);
@@ -1784,6 +2182,177 @@ fn appliquer_annonce_slimproto(annonce: bool, port_http: u16) -> bool {
             eteinte
         }
         ActionAnnonce::Rien => false,
+    }
+}
+
+/// #6510 — « Envoyer mes écoutes à mon compte » : publié désactivé, écrit par
+/// `PATCH`, relu par la garde même de l'envoi.
+#[cfg(test)]
+mod envoi_des_ecoutes_tests_6510 {
+    use crate::state::AppState;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use tune_core::cloud::ecoutes_au_compte::{CLE_ACTIVATION, envoi_active};
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    async fn requete(state: &AppState, methode: &str, corps: Option<Value>) -> (StatusCode, Value) {
+        let corps = corps.map(|c| c.to_string()).unwrap_or_default();
+        let response = crate::routes::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(methode)
+                    .uri("/api/v1/system/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(corps))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn la_bascule_est_publiee_desactivee_et_s_ecrit_par_patch() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let reglages = SettingsRepo::with_backend(state.backend.clone());
+        let (status, config) = requete(&state, "GET", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            config[CLE_ACTIVATION],
+            json!(false),
+            "absente ou active par défaut"
+        );
+        assert!(!envoi_active(&reglages));
+
+        let (status, _) = requete(&state, "PATCH", Some(json!({ CLE_ACTIVATION: true }))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[CLE_ACTIVATION], json!(true));
+        assert!(
+            envoi_active(&reglages),
+            "écrit par PATCH mais pas relu par l'envoi"
+        );
+
+        requete(&state, "PATCH", Some(json!({ CLE_ACTIVATION: false }))).await;
+        assert!(!envoi_active(&reglages));
+    }
+
+    /// #6545 — le consentement communautaire : publié désactivé, distinct de
+    /// l'envoi des écoutes, écrit par `PATCH`, relu par la garde du partage.
+    #[tokio::test]
+    async fn le_partage_communautaire_est_publie_desactive_et_independant() {
+        use tune_core::cloud::notes_communautaires::{CLE_PARTAGE, partage_active};
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let reglages = SettingsRepo::with_backend(state.backend.clone());
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[CLE_PARTAGE], json!(false));
+        assert!(!partage_active(&reglages));
+
+        requete(&state, "PATCH", Some(json!({ CLE_ACTIVATION: true }))).await;
+        assert!(
+            !partage_active(&reglages),
+            "l'envoi des écoutes ne vaut pas consentement"
+        );
+
+        let (status, _) = requete(&state, "PATCH", Some(json!({ CLE_PARTAGE: true }))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(partage_active(&reglages));
+    }
+
+    /// #6840 — l'état publié : à demander tant que rien n'est répondu, avec
+    /// `linked` qui dit si la question a lieu d'être.
+    #[tokio::test]
+    async fn le_consentement_est_publie_a_demander_et_relie_6840() {
+        use tune_core::cloud::ecoutes_au_compte::CLE_REPONSE;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let reglages = SettingsRepo::with_backend(state.backend.clone());
+        let (_, config) = requete(&state, "GET", None).await;
+        let c = &config[CLE_REPONSE];
+        assert_eq!(c["state"], json!("a_demander"), "{c}");
+        assert_eq!(c["linked"], json!(false), "non relié publié relié : {c}");
+        assert_eq!(c["answered_at"], Value::Null);
+        assert_eq!(c["dismissals"], json!(0));
+        assert_eq!(c["max_dismissals"], json!(2));
+        assert_eq!(config[CLE_ACTIVATION], json!(false));
+
+        reglages.set("mozaik_access_token", "jeton").unwrap();
+        reglages.set("server_id", "serveur-a").unwrap();
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[CLE_REPONSE]["linked"], json!(true));
+        assert_eq!(config[CLE_REPONSE]["state"], json!("a_demander"));
+    }
+
+    /// #6840 — fermée sans réponse : comptée, redemandée une fois, puis
+    /// refusée ; « Oui » date l'accord et ouvre l'envoi ; un mot inconnu ou
+    /// une clé interne est refusé sans rien écrire.
+    #[tokio::test]
+    async fn la_reponse_s_ecrit_par_patch_et_une_seule_relance_6840() {
+        use tune_core::cloud::ecoutes_au_compte::{
+            CLE_CONSENTEMENT, CLE_CONSENTEMENT_DATE, CLE_REPONSE,
+        };
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let reglages = SettingsRepo::with_backend(state.backend.clone());
+
+        let (status, r) = requete(&state, "PATCH", Some(json!({ CLE_REPONSE: "fermee" }))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(r[CLE_REPONSE], json!("a_demander"));
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[CLE_REPONSE]["dismissals"], json!(1));
+        assert_eq!(config[CLE_REPONSE]["state"], json!("a_demander"));
+        assert!(!envoi_active(&reglages));
+
+        let (_, r) = requete(&state, "PATCH", Some(json!({ CLE_REPONSE: "fermee" }))).await;
+        assert_eq!(
+            r[CLE_REPONSE],
+            json!("refuse"),
+            "redemandée plus d'une fois"
+        );
+        assert!(!envoi_active(&reglages));
+
+        for refus in [
+            json!({ CLE_REPONSE: "oui" }),
+            json!({ CLE_CONSENTEMENT: "accepte" }),
+            json!({ CLE_CONSENTEMENT_DATE: "2020-01-01T00:00:00Z" }),
+            json!({ CLE_REPONSE: "accepte", CLE_ACTIVATION: true }),
+        ] {
+            let (status, _) = requete(&state, "PATCH", Some(refus.clone())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "accepté : {refus}");
+        }
+        assert!(!envoi_active(&reglages), "un patch refusé a ouvert l'envoi");
+
+        let (status, r) = requete(&state, "PATCH", Some(json!({ CLE_REPONSE: "accepte" }))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(r[CLE_REPONSE], json!("accepte"));
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[CLE_REPONSE]["state"], json!("accepte"));
+        assert!(config[CLE_REPONSE]["answered_at"].is_string());
+        assert_eq!(config[CLE_ACTIVATION], json!(true));
+        assert!(envoi_active(&reglages));
+
+        // La bascule des Réglages passe par le même chemin.
+        requete(&state, "PATCH", Some(json!({ CLE_ACTIVATION: false }))).await;
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[CLE_REPONSE]["state"], json!("refuse"));
+    }
+
+    /// #6840 — un serveur qui avait DÉJÀ activé l'envoi avant la rc8 est
+    /// publié « accepté » : pas de re-question.
+    #[tokio::test]
+    async fn deja_active_est_publie_accepte_6840() {
+        use tune_core::cloud::ecoutes_au_compte::CLE_REPONSE;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set(CLE_ACTIVATION, "true")
+            .unwrap();
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[CLE_REPONSE]["state"], json!("accepte"));
+        assert_eq!(config[CLE_ACTIVATION], json!(true));
     }
 }
 
@@ -2145,6 +2714,16 @@ pub(super) async fn get_env(State(state): State<AppState>) -> Json<Value> {
         "spotify_redirect_uri": spotify_redirect_uri,
         "spotify_redirect_uri_refus": spotify_redirect_uri_refus,
         "spotify_client_id_configure": spotify_client_id_configure,
+        // renesenses/tune-server-rust#7074 — Tune tourne-t-il dans un conteneur ?
+        // « Redémarrer » relance le binaire en place (`execv`, PID 1 dans
+        // l'image) ; s'il échoue, le conteneur sort et ne revient que sous une
+        // politique de redémarrage. Le client le dit avant de redémarrer.
+        "container": crate::conteneur::detecter(),
+        "container_id": std::env::var("HOSTNAME")
+            .ok()
+            .as_deref()
+            .and_then(crate::conteneur::identifiant_court)
+            .map(str::to_string),
     }))
 }
 
@@ -2572,6 +3151,18 @@ pub(super) struct AddMusicDir {
     path: String,
 }
 
+// #6175 : une préférence absente est un premier réglage valide. Une lecture
+// en échec ou une valeur existante illisible ne doit jamais devenir une liste
+// vide que l'ajout ou le retrait réécrirait en perdant les autres racines.
+fn lire_racines_avant_modification(settings: &SettingsRepo) -> Result<Vec<String>, AppError> {
+    match settings.get("music_dirs")? {
+        None => Ok(Vec::new()),
+        Some(value) => serde_json::from_str(&value).map_err(|_| {
+            AppError::internal("music_dirs est illisible ; les dossiers déclarés ont été conservés")
+        }),
+    }
+}
+
 pub(super) async fn add_music_dir(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
@@ -2610,21 +3201,14 @@ pub(super) async fn add_music_dir(
     }
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut dirs: Vec<String> = settings
-        .get("music_dirs")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut dirs = lire_racines_avant_modification(&settings)?;
 
     let newly_added = !dirs.contains(&normalized);
     if newly_added {
         dirs.push(normalized);
     }
 
-    settings
-        .set("music_dirs", &serde_json::to_string(&dirs)?)
-        .ok();
+    settings.set("music_dirs", &serde_json::to_string(&dirs)?)?;
 
     // Scan right away so the new folder's tracks appear without an app restart.
     // Previously add_music_dir only saved the path: the startup scan and the
@@ -2632,7 +3216,13 @@ pub(super) async fn add_music_dir(
     // folder added later was neither scanned nor watched — it only showed up
     // after a restart (Jean-Pierre).
     if newly_added {
-        super::scan::spawn_library_scan(state.clone(), false, None).await;
+        super::scan::spawn_library_scan_par(
+            state.clone(),
+            false,
+            None,
+            super::scan::ORIGINE_AJOUT_DE_DOSSIER,
+        )
+        .await;
     }
     Ok(Json(json!({ "dirs": dirs })).into_response())
 }
@@ -2700,21 +3290,14 @@ pub(crate) fn retirer_un_dossier(
 ) -> Result<Value, AppError> {
     let normalized = tune_core::scanner::walker::normalize_path(path);
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut dirs: Vec<String> = settings
-        .get("music_dirs")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut dirs = lire_racines_avant_modification(&settings)?;
 
     dirs.retain(|d| {
         let norm_d = tune_core::scanner::walker::normalize_path(d);
         norm_d != normalized
     });
 
-    settings
-        .set("music_dirs", &serde_json::to_string(&dirs)?)
-        .ok();
+    settings.set("music_dirs", &serde_json::to_string(&dirs)?)?;
 
     // Les pistes DEVENUES orphelines : sous le dossier retiré, et sous aucune
     // des racines qui RESTENT. Le compte se mesurait auparavant sur le seul
@@ -2769,21 +3352,19 @@ pub(crate) fn retirer_un_dossier(
             "music_dir_removed_purge_refusee — la confirmation ne couvre pas l'ampleur \
              constatée. Le dossier est retiré des réglages ; aucune piste n'a été supprimée."
         );
-        return Ok(json!({
-            "dirs": dirs,
-            "orphan_tracks": plan.tracks,
-            "purged": 0,
-            "purge_refused": true,
-            "purge_refused_reason": "confirmation_insuffisante",
-            "confirm_purge_required": plan.tracks,
-            "impact": impact_json(&plan),
-            "message": format!(
-                "Le dossier a bien été retiré des réglages. En revanche la confirmation \
-                 reçue ne couvre pas les {} pistes concernées : aucune n'a été supprimée. \
-                 Confirmez ce nombre exact pour les retirer aussi.",
-                plan.tracks
-            ),
-        }));
+        return Ok(crate::message_api::avec_message(
+            json!({
+                "dirs": dirs,
+                "orphan_tracks": plan.tracks,
+                "purged": 0,
+                "purge_refused": true,
+                "purge_refused_reason": "confirmation_insuffisante",
+                "confirm_purge_required": plan.tracks,
+                "impact": impact_json(&plan),
+            }),
+            "api.library.removeDirPurgeNotConfirmed",
+            &[("count", plan.tracks.to_string())],
+        ));
     }
 
     let r = executer_purge(&state, &orphelines);
@@ -3414,29 +3995,31 @@ pub(super) async fn purge_orphan_tracks(
     let total_local = pistes_locales(&state).len();
 
     if ids.is_empty() {
-        return Ok(Json(json!({
-            "purged": 0,
-            "refused": false,
-            "impact": impact_json(&plan),
-            "message": format!("Aucune piste n'est enregistrée sous {cible}."),
-        }))
+        return Ok(Json(crate::message_api::avec_message(
+            json!({
+                "purged": 0,
+                "refused": false,
+                "impact": impact_json(&plan),
+            }),
+            "api.library.purgeNothingUnder",
+            &[("path", cible.to_string())],
+        ))
         .into_response());
     }
 
     // Essai à blanc : pas de confirmation ⇒ pas de suppression.
     let Some(_) = body.confirm_purge else {
-        return Ok(Json(json!({
-            "purged": 0,
-            "refused": false,
-            "dry_run": true,
-            "confirm_purge_required": plan.tracks,
-            "impact": impact_json(&plan),
-            "message": format!(
-                "{} pistes seraient retirées définitivement. Rappelez cette route avec \
-                 confirm_purge={} pour confirmer.",
-                plan.tracks, plan.tracks
-            ),
-        }))
+        return Ok(Json(crate::message_api::avec_message(
+            json!({
+                "purged": 0,
+                "refused": false,
+                "dry_run": true,
+                "confirm_purge_required": plan.tracks,
+                "impact": impact_json(&plan),
+            }),
+            "api.library.purgeDryRun",
+            &[("count", plan.tracks.to_string())],
+        ))
         .into_response());
     };
 
@@ -3453,18 +4036,17 @@ pub(super) async fn purge_orphan_tracks(
         );
         return Ok((
             StatusCode::CONFLICT,
-            Json(json!({
-                "purged": 0,
-                "refused": true,
-                "reason": "confirmation_insuffisante",
-                "confirm_purge_required": plan.tracks,
-                "impact": impact_json(&plan),
-                "message": format!(
-                    "La confirmation reçue ne couvre pas les {} pistes concernées. Rien n'a \
-                     été retiré. Confirmez ce nombre exact pour poursuivre.",
-                    plan.tracks
-                ),
-            })),
+            Json(crate::message_api::avec_message(
+                json!({
+                    "purged": 0,
+                    "refused": true,
+                    "reason": "confirmation_insuffisante",
+                    "confirm_purge_required": plan.tracks,
+                    "impact": impact_json(&plan),
+                }),
+                "api.library.purgeNotConfirmed",
+                &[("count", plan.tracks.to_string())],
+            )),
         )
             .into_response());
     }
@@ -3521,6 +4103,11 @@ pub(super) async fn stop(_admin: crate::auth::RequireAdmin) -> impl IntoResponse
 }
 
 pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
+    if let Some(moteur) = crate::conteneur::detecter() {
+        // #7074 — dans un conteneur, un `execv` qui échoue arrête le
+        // conteneur : le journal le dit, c'est ce qu'on cherchera.
+        tracing::info!(moteur, "restart_in_container");
+    }
     tokio::spawn(async {
         // Let the HTTP response flush before we swap the process image.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -3946,15 +4533,18 @@ pub(super) async fn set_license(
     let tier = crate::routes::cloud::validate_stored_license(&state).await;
     let premium = tier == tune_core::license::Tier::Premium;
     let ls = state.license.license_state().await;
-    Json(json!({
-        "status": if premium { "ok" } else { "pending" },
-        "tier": ls.tier,
-        "message": if premium {
-            "Licence validée : Premium activé."
+    Json(crate::message_api::avec_message(
+        json!({
+            "status": if premium { "ok" } else { "pending" },
+            "tier": ls.tier,
+        }),
+        if premium {
+            "api.license.activated"
         } else {
-            "Clé enregistrée. Premium s'activera dès qu'elle sera validée en ligne (vérifiez votre connexion et la clé)."
+            "api.license.pending"
         },
-    }))
+        &[],
+    ))
     .into_response()
 }
 
@@ -5009,6 +5599,7 @@ mod replaygain_source_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0
     }
 
@@ -5070,6 +5661,7 @@ mod replaygain_source_tests {
 
         let c = get_config(h, ActiveProfile(DEFAULT_PROFILE_ID), State(state.clone()))
             .await
+            .unwrap_or_else(|_| panic!("configuration illisible"))
             .0;
         assert_eq!(c["replaygain_source"]["mode"], "tags_then_analysis");
         assert_eq!(c["replaygain_source"]["label"], "File tags, then analysis");
@@ -5327,6 +5919,7 @@ mod ui_preferences_par_profil_tests {
     async fn lire(state: &AppState, pid: i64) -> Option<String> {
         get_config(HeaderMap::new(), ActiveProfile(pid), State(state.clone()))
             .await
+            .unwrap_or_else(|_| panic!("configuration illisible"))
             .0
             .get(UI_PREFERENCES)
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -5431,6 +6024,7 @@ mod ui_preferences_par_profil_tests {
 
         let vu = get_config(HeaderMap::new(), ActiveProfile(FILS), State(state.clone()))
             .await
+            .unwrap_or_else(|_| panic!("configuration illisible"))
             .0;
         let brut = serde_json::to_string(&vu).unwrap();
         assert!(
@@ -5536,6 +6130,7 @@ mod vitesse_des_analyses_5519_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_REGLAGE], "normal", "{c}");
         let largeurs = &c["background_analysis_speed_widths"];
@@ -5572,6 +6167,205 @@ mod vitesse_des_analyses_5519_tests {
 }
 
 #[cfg(test)]
+mod levee_du_bridage_6713_tests {
+    use super::{get_config, normaliser_levee_du_bridage, update_config};
+    use crate::auth::RequireAdmin;
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::Json;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use serde_json::{Value, json};
+    use tune_core::taches_de_fond::vitesse::{CLE_LEVER_LE_BRIDAGE, bridage_leve};
+
+    /// #6713 — publié DÉSACTIVÉ par défaut ; le PATCH l'écrit, la passe le
+    /// relit (`bridage_leve`), et `GET /config` le republie.
+    #[tokio::test]
+    async fn desactive_par_defaut_puis_leve_par_le_patch() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let lire = || {
+            let state = state.clone();
+            async move {
+                get_config(
+                    HeaderMap::new(),
+                    ActiveProfile(DEFAULT_PROFILE_ID),
+                    State(state),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("configuration illisible"))
+                .0
+            }
+        };
+        let c = lire().await;
+        assert_eq!(c[CLE_LEVER_LE_BRIDAGE], false, "{c}");
+        assert!(!bridage_leve(&state.backend));
+
+        let mut corps = serde_json::Map::new();
+        corps.insert(CLE_LEVER_LE_BRIDAGE.to_string(), json!(true));
+        update_config(
+            RequireAdmin,
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+            Json(super::ConfigPatch(corps)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("update_config a échoué"))
+        .into_response();
+        assert!(
+            bridage_leve(&state.backend),
+            "le réglage écrit doit lever le bridage"
+        );
+        let c = lire().await;
+        assert_eq!(c[CLE_LEVER_LE_BRIDAGE], true, "{c}");
+    }
+
+    /// Un booléen passe, toute autre forme est REFUSÉE.
+    #[test]
+    fn seul_un_booleen_est_admis() {
+        for (brut, attendu) in [
+            (json!(true), true),
+            (json!(false), false),
+            (json!("true"), true),
+            (json!(" false "), false),
+        ] {
+            let mut v: serde_json::Map<String, Value> = json!({ CLE_LEVER_LE_BRIDAGE: brut })
+                .as_object()
+                .unwrap()
+                .clone();
+            assert!(normaliser_levee_du_bridage(&mut v).is_ok(), "{brut}");
+            assert_eq!(v[CLE_LEVER_LE_BRIDAGE], json!(attendu), "{brut}");
+        }
+        for mauvais in [json!("oui"), json!(1), json!(null), json!({})] {
+            let mut v: serde_json::Map<String, Value> = json!({ CLE_LEVER_LE_BRIDAGE: mauvais })
+                .as_object()
+                .unwrap()
+                .clone();
+            assert!(normaliser_levee_du_bridage(&mut v).is_err(), "{mauvais}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod rappel_audit_integrite_6286_tests {
+    use super::{get_config, normaliser_rappel_audit_integrite, update_config};
+    use crate::auth::RequireAdmin;
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::Json;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use serde_json::{Value, json};
+    use tune_core::audio::audit_integrite::rappel::{CLE_RAPPEL_JOURS, rappel_jours};
+
+    /// Publié ÉTEINT (0) par défaut ; le PATCH l'écrit, l'audit le relit.
+    #[tokio::test]
+    async fn eteint_par_defaut_puis_regle_par_le_patch() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
+        .0;
+        assert_eq!(c[CLE_RAPPEL_JOURS], json!(0), "{c}");
+        assert_eq!(rappel_jours(&state.backend), 0);
+        let mut corps = serde_json::Map::new();
+        corps.insert(CLE_RAPPEL_JOURS.to_string(), json!(30));
+        let _reponse = update_config(
+            RequireAdmin,
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+            Json(super::ConfigPatch(corps)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("update_config a échoué"))
+        .into_response();
+        assert_eq!(
+            rappel_jours(&state.backend),
+            30,
+            "le PATCH doit régler le rappel"
+        );
+    }
+
+    #[test]
+    fn hors_bornes_refuse() {
+        for (brut, attendu) in [(json!(0), "0"), (json!("90"), "90"), (json!(365), "365")] {
+            let mut v: serde_json::Map<String, Value> = json!({ CLE_RAPPEL_JOURS: brut })
+                .as_object()
+                .unwrap()
+                .clone();
+            assert!(normaliser_rappel_audit_integrite(&mut v).is_ok(), "{brut}");
+            assert_eq!(v[CLE_RAPPEL_JOURS], json!(attendu), "{brut}");
+        }
+        for mauvais in [
+            json!(366),
+            json!(-1),
+            json!("souvent"),
+            json!(null),
+            json!(true),
+        ] {
+            let mut v: serde_json::Map<String, Value> = json!({ CLE_RAPPEL_JOURS: mauvais })
+                .as_object()
+                .unwrap()
+                .clone();
+            assert!(
+                normaliser_rappel_audit_integrite(&mut v).is_err(),
+                "{mauvais}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod mesures_communautaires_5594_tests {
+    use super::{get_config, normaliser_mesures_communautaires};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::cloud::mesures_communautaires::{CLE_CONTRIBUTION, CLE_RECEPTION};
+
+    /// #5594 — les deux options sont publiées DÉSACTIVÉES sur une base neuve.
+    #[tokio::test]
+    async fn les_deux_options_sont_publiees_desactivees() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
+        .0;
+        assert_eq!(c[CLE_RECEPTION], false, "{c}");
+        assert_eq!(c[CLE_CONTRIBUTION], false, "{c}");
+    }
+
+    #[test]
+    fn seul_un_booleen_est_admis() {
+        for cle in [CLE_RECEPTION, CLE_CONTRIBUTION] {
+            let mut ok: serde_json::Map<String, Value> =
+                json!({ cle: "true" }).as_object().unwrap().clone();
+            assert!(normaliser_mesures_communautaires(&mut ok).is_ok());
+            assert_eq!(ok[cle], json!(true));
+            for mauvais in [json!("oui"), json!(1), json!(null)] {
+                let mut v: serde_json::Map<String, Value> =
+                    json!({ cle: mauvais }).as_object().unwrap().clone();
+                assert!(
+                    normaliser_mesures_communautaires(&mut v).is_err(),
+                    "{cle} {mauvais}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod politique_de_lecture_4681_tests {
     use super::{get_config, normaliser_politique_de_lecture, update_config};
     use crate::auth::RequireAdmin;
@@ -5589,6 +6383,7 @@ mod politique_de_lecture_4681_tests {
     /// base, et `GET /config` la publie en objet ; le démarrage la relit.
     #[tokio::test]
     async fn la_politique_s_ecrit_s_applique_et_se_relit() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let c = get_config(
             HeaderMap::new(),
@@ -5596,6 +6391,7 @@ mod politique_de_lecture_4681_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_REGLAGE]["enabled"], true, "{c}");
 
@@ -5634,6 +6430,7 @@ mod politique_de_lecture_4681_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_REGLAGE]["scan_width"], 3, "{c}");
         politique::regler(DEFAUT);
@@ -5690,6 +6487,7 @@ mod genres_du_clap_6198_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(c[CLE_GENRES_CLAP_INCLUS], json!([]), "{c}");
         assert_eq!(c[CLE_GENRES_CLAP_EXCLUS], json!([]), "{c}");
@@ -5712,6 +6510,7 @@ mod genres_du_clap_6198_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0;
         assert_eq!(
             c[CLE_GENRES_CLAP_INCLUS],
@@ -5751,7 +6550,7 @@ mod perimetre_des_analyses_5593_tests {
     use axum::http::HeaderMap;
     use serde_json::{Value, json};
     use tune_core::db::settings_repo::SettingsRepo;
-    use tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES;
+    use tune_core::taches_de_fond::perimetre::{CLE_DOSSIERS_INCLUS, CLE_RACINES_EXCLUES};
 
     async fn config(state: &AppState) -> Value {
         get_config(
@@ -5760,6 +6559,7 @@ mod perimetre_des_analyses_5593_tests {
             State(state.clone()),
         )
         .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
         .0
     }
 
@@ -5799,6 +6599,32 @@ mod perimetre_des_analyses_5593_tests {
         );
     }
 
+    /// Fil 2173 — les dossiers inclus : publiés vides, normalisés comme les
+    /// racines exclues, refusés sous une autre forme, et leur écriture
+    /// referme la campagne ReplayGain (`Ok(true)`).
+    #[tokio::test]
+    async fn les_dossiers_inclus_sont_publies_vides_et_normalises_2173() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = config(&state).await;
+        assert_eq!(c[CLE_DOSSIERS_INCLUS], json!([]), "{c}");
+        let mut v: serde_json::Map<String, Value> =
+            json!({ CLE_DOSSIERS_INCLUS: [" /music/Jazz ", "", "/music/Jazz"] })
+                .as_object()
+                .unwrap()
+                .clone();
+        assert!(matches!(
+            normaliser_perimetre_des_analyses(&mut v),
+            Ok(true)
+        ));
+        assert_eq!(v[CLE_DOSSIERS_INCLUS], json!(["/music/Jazz"]));
+        let mut mauvais: serde_json::Map<String, Value> =
+            json!({ CLE_DOSSIERS_INCLUS: "/music/Jazz" })
+                .as_object()
+                .unwrap()
+                .clone();
+        assert!(normaliser_perimetre_des_analyses(&mut mauvais).is_err());
+    }
+
     /// Une forme qui se relirait « rien d'exclu » en silence est REFUSÉE.
     #[test]
     fn une_forme_illisible_est_refusee() {
@@ -5835,5 +6661,242 @@ mod perimetre_des_analyses_5593_tests {
             Ok(false)
         ));
         assert!(vide.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod instantane_reglages_7343_tests {
+    use super::*;
+    use axum::response::Response;
+
+    async fn lire(state: &AppState) -> Response {
+        get_config(
+            axum::http::HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .into_response()
+    }
+
+    async fn corps(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn une_lecture_impossible_ne_renvoie_pas_les_defauts_en_succes() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings
+            .set(tune_core::metadata::ecriture_fichiers::CLE, "true")
+            .unwrap();
+        settings
+            .set(
+                tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED,
+                "true",
+            )
+            .unwrap();
+        // Deterministic read failure, confined to this test's temporary database.
+        state
+            .sqlite()
+            .unwrap()
+            .execute_batch("DROP TABLE settings")
+            .unwrap();
+        let response = lire(&state).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "une base illisible ne doit pas passer pour des réglages absents"
+        );
+        let value = corps(response).await;
+        assert_eq!(value["code"], "service_unavailable");
+        assert!(
+            value
+                .get(tune_core::metadata::ecriture_fichiers::CLE)
+                .is_none()
+        );
+        assert!(
+            value
+                .get(tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED)
+                .is_none()
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Journal {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #7307 — le 503 de #7343 sans trace laissait le rapport muet sur la
+    /// cause : l'erreur de lecture doit être journalisée, avec son message.
+    #[tokio::test]
+    async fn une_lecture_impossible_laisse_sa_cause_au_journal() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .sqlite()
+            .unwrap()
+            .execute_batch("DROP TABLE settings")
+            .unwrap();
+        let journal = Journal::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(journal.clone())
+            .finish();
+        let response = {
+            let _garde = tracing::subscriber::set_default(subscriber);
+            lire(&state).await
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let journal = String::from_utf8(journal.0.lock().unwrap().clone()).unwrap();
+        let ligne = journal
+            .lines()
+            .find(|l| l.contains("reglages_illisibles"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "un échec de lecture des réglages doit laisser `reglages_illisibles` \
+                     au journal (#7307) ; journal : {journal:?}"
+                )
+            });
+        assert!(
+            ligne.contains("settings"),
+            "la ligne doit porter l'erreur SQLite : {ligne:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn une_base_lisible_sans_preferences_garde_les_defauts() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let response = lire(&state).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = corps(response).await;
+        assert_eq!(value[tune_core::metadata::ecriture_fichiers::CLE], false);
+        assert_eq!(
+            value[tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn des_choix_persistes_restent_lus_apres_reouverture_de_la_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.sqlite");
+        {
+            let state = AppState::new(path.to_str().unwrap(), 0, Default::default()).unwrap();
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            settings
+                .set(tune_core::metadata::ecriture_fichiers::CLE, "true")
+                .unwrap();
+            settings
+                .set(
+                    tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED,
+                    "true",
+                )
+                .unwrap();
+        }
+        let reopened = AppState::new(path.to_str().unwrap(), 0, Default::default()).unwrap();
+        let response = lire(&reopened).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = corps(response).await;
+        assert_eq!(value[tune_core::metadata::ecriture_fichiers::CLE], true);
+        assert_eq!(
+            value[tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED],
+            true
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "config/volume_6774_tests.rs"]
+mod volume_6774_tests;
+
+#[cfg(test)]
+#[path = "racines_preservees_6175_tests.rs"]
+mod racines_preservees_6175_tests;
+
+/// #7538 — les dossiers exclus de l'enrichissement : publiés vides,
+/// normalisés comme les autres listes du périmètre, refusés sous une autre
+/// forme, et relus par le moteur tels qu'écrits.
+#[cfg(test)]
+mod dossiers_exclus_de_l_enrichissement_7538_tests {
+    use super::{get_config, normaliser_genres_du_clap};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::taches_de_fond::perimetre::{
+        CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT, dossiers_exclus_de_l_enrichissement,
+    };
+
+    async fn config(state: &AppState) -> Value {
+        get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("configuration illisible"))
+        .0
+    }
+
+    #[tokio::test]
+    async fn publies_vides_normalises_puis_relus_7538() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        assert_eq!(
+            config(&state).await[CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT],
+            json!([])
+        );
+        let mut v: serde_json::Map<String, Value> =
+            json!({ CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT: [" /music/Jazz ", "", "/music/Jazz"] })
+                .as_object()
+                .unwrap()
+                .clone();
+        assert!(normaliser_genres_du_clap(&mut v).is_ok());
+        assert_eq!(
+            v[CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT],
+            json!(["/music/Jazz"])
+        );
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        for (k, val) in v {
+            settings.set(&k, &val.to_string()).unwrap();
+        }
+        assert_eq!(
+            config(&state).await[CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT],
+            json!(["/music/Jazz"])
+        );
+        assert_eq!(
+            dossiers_exclus_de_l_enrichissement(&state.backend),
+            vec!["/music/Jazz"]
+        );
+        for mauvais in [json!("/music/Jazz"), json!(4), json!([1]), json!({})] {
+            let mut m: serde_json::Map<String, Value> =
+                json!({ CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT: mauvais.clone() })
+                    .as_object()
+                    .unwrap()
+                    .clone();
+            assert!(normaliser_genres_du_clap(&mut m).is_err(), "{mauvais}");
+        }
     }
 }

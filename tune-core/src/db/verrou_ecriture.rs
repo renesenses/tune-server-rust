@@ -434,6 +434,12 @@ impl VerrouEcriture {
         true
     }
 
+    /// Observer l'enregistrement d'un écrivain sans supposer un délai de thread.
+    #[cfg(test)]
+    pub(crate) fn ecrivains_du_lot_en_attente_pour_essai(&self) -> usize {
+        self.etat.lot.en_attente()
+    }
+
     /// Raccourcir l'attente maximale d'une transaction étrangère (essais).
     #[cfg(test)]
     pub(crate) fn fixer_attente_max_pour_essai(&self, d: Duration) {
@@ -720,19 +726,23 @@ impl Sentinelle {
 /// Une détention à signaler ? La première fois au seuil, puis toutes les
 /// [`RAPPEL_DETENTION`].
 fn examiner(etat: &Etat) -> Option<Signalement> {
+    examiner_a(etat, Instant::now())
+}
+
+fn examiner_a(etat: &Etat, maintenant: Instant) -> Option<Signalement> {
     let attentes = etat.attentes.lock().map(|a| a.len()).unwrap_or(0);
     let mut d = etat.detention.lock().ok()?;
     let prise = d.as_mut()?;
-    if prise.depuis.elapsed() < etat.seuil {
+    if maintenant.saturating_duration_since(prise.depuis) < etat.seuil {
         return None;
     }
     let du = prise
         .dernier_signalement
-        .is_none_or(|t| t.elapsed() >= RAPPEL_DETENTION);
+        .is_none_or(|t| maintenant.saturating_duration_since(t) >= RAPPEL_DETENTION);
     if !du {
         return None;
     }
-    prise.dernier_signalement = Some(Instant::now());
+    prise.dernier_signalement = Some(maintenant);
     let cliche = prise.cliche();
     drop(d);
     armer_les_piles();

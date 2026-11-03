@@ -281,11 +281,29 @@ pub fn register(library: Arc<Library>) -> Result<(), Error> {
         .insert(library.manifest.id.clone(), library);
     Ok(())
 }
+/// #6256 — retire un fournisseur du registre, pour une désinstallation sans
+/// redémarrage. Les étages déjà construits gardent leur `Arc` : la
+/// bibliothèque reste chargée jusqu'à ce que le dernier soit détruit, puis
+/// elle est déchargée. Rend `true` si un fournisseur était inscrit.
+pub fn unregister(id: &str) -> bool {
+    REGISTRY
+        .get()
+        .and_then(|registry| registry.write().ok().map(|mut r| r.remove(id).is_some()))
+        .unwrap_or(false)
+}
 pub mod stage;
 static FAILURES: OnceLock<RwLock<BTreeMap<String, String>>> = OnceLock::new();
 pub fn record_failure(id: &str, error: String) {
     if let Ok(mut failures) = FAILURES.get_or_init(Default::default).write() {
         failures.insert(id.into(), error);
+    }
+}
+/// #6256 — oublie l'échec de chargement d'un greffon désinstallé.
+pub fn forget_failure(id: &str) {
+    if let Some(failures) = FAILURES.get()
+        && let Ok(mut failures) = failures.write()
+    {
+        failures.remove(id);
     }
 }
 pub fn failure(id: &str) -> Option<String> {

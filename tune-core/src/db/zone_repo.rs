@@ -108,6 +108,22 @@ mod pg_5263_tests {
     }
 }
 
+/// Une ligne de `sql::zones_masquees*` : id, nom, appareil, protocole, hôte,
+/// MAC, motif, date.
+fn ligne_de_zone_masquee(r: &[SqlValue]) -> Option<ZoneMasquee> {
+    let texte = |i: usize| r.get(i).and_then(|v| v.as_string());
+    Some(ZoneMasquee {
+        id: r.first().and_then(|v| v.as_i64())?,
+        name: texte(1).unwrap_or_default(),
+        device_id: texte(2).unwrap_or_default(),
+        protocole: texte(3).unwrap_or_default(),
+        host: texte(4).unwrap_or_default(),
+        mac: texte(5).filter(|m| !m.trim().is_empty()),
+        motif: texte(6),
+        masquee_le: texte(7),
+    })
+}
+
 /// Drapeau, motif et date du masquage d'une zone (#5077). `motif` NUL =
 /// inconnu : masquage d'avant la migration 112, ou zone visible.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -623,6 +639,15 @@ pub mod sql {
         )
     }
 
+    /// TOUTES les zones masquées, quel que soit leur motif — y compris un
+    /// motif NUL (#6378 : le rapport de bogue doit les montrer).
+    pub fn zones_masquees() -> String {
+        "SELECT id, COALESCE(name, ''), COALESCE(output_device_id, ''), \
+         COALESCE(output_type, ''), COALESCE(host, ''), mac, motif_masquage, masquee_le \
+         FROM zones WHERE COALESCE(is_hidden, 0) = 1 ORDER BY id"
+            .to_string()
+    }
+
     /// L'état de masquage d'une zone : drapeau, motif, date (#5077).
     pub fn etat_de_masquage<D: SqlDialect>(d: &D) -> String {
         format!(
@@ -920,6 +945,13 @@ pub fn zone_creee_contrat_client(
             "volume_db".into(),
             json!(crate::audio::volume_scale::linear_to_db(lineaire)),
         );
+        // #6787 — la loi du curseur de la zone (`volume` reste le gain).
+        crate::audio::volume_scale::inserer_courbe(
+            obj,
+            crate::audio::volume_scale::EchelleDeVolume::de_la_sortie(
+                zone.and_then(|z| z.output_type.as_deref()),
+            ),
+        );
     }
     v
 }
@@ -1168,7 +1200,7 @@ impl ZoneRepo {
         // autre fil le tient : une PATCH validée y est visible, et la
         // préparation d'une lecture ne fait plus la queue derrière un scan.
         let rows = self.db.query_many_frais(&sql, &params)?;
-        Ok(rows.first().map(row_to_zone))
+        Ok(rows.first().map(|cols| row_to_zone(cols)))
     }
 
     /// Look up a zone by its output device id.
@@ -1181,7 +1213,7 @@ impl ZoneRepo {
         }
         // Strong read to see the writer's own pending commits (WAL lag).
         let rows = self.db.query_many_strong(&sql, &params)?;
-        Ok(rows.first().map(row_to_zone))
+        Ok(rows.first().map(|cols| row_to_zone(cols)))
     }
 
     pub fn list(&self) -> Result<Vec<Zone>, String> {
@@ -1197,12 +1229,12 @@ impl ZoneRepo {
             sql::select_base()
         );
         match self.db.query_many_strong(&filtered, &[]) {
-            Ok(rows) => Ok(rows.iter().map(row_to_zone).collect()),
+            Ok(rows) => Ok(rows.iter().map(|cols| row_to_zone(cols)).collect()),
             Err(_) => {
                 // is_hidden column doesn't exist (pre-migration DB) — fall back
                 // to the unfiltered query, still via the strong read.
                 let strong = self.db.query_many_strong(&sql::list_all(), &[])?;
-                Ok(strong.iter().map(row_to_zone).collect())
+                Ok(strong.iter().map(|cols| row_to_zone(cols)).collect())
             }
         }
     }
@@ -1288,7 +1320,7 @@ impl ZoneRepo {
         // the rowid we read reflects the INSERT we just did.
         let create_sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 3] = [&name, &output_type, &output_device_id];
-        Ok(self.db.execute_returning_id(&create_sql, &params)?)
+        self.db.execute_returning_id(&create_sql, &params)
     }
 
     /// Atomically get an existing zone by output_device_id, or create a new one.
@@ -1307,17 +1339,17 @@ impl ZoneRepo {
         output_device_id: &str,
     ) -> Result<(i64, bool), String> {
         // Check if a zone with this device_id already exists (including hidden).
-        if let Some(existing) = self.get_by_device_id(output_device_id)? {
-            if let Some(id) = existing.id {
-                if self.is_device_hidden(output_device_id) {
-                    tracing::debug!(
-                        zone_id = id,
-                        device_id = output_device_id,
-                        "zone_hidden_skipping_auto_unhide"
-                    );
-                }
-                return Ok((id, false));
+        if let Some(existing) = self.get_by_device_id(output_device_id)?
+            && let Some(id) = existing.id
+        {
+            if self.is_device_hidden(output_device_id) {
+                tracing::debug!(
+                    zone_id = id,
+                    device_id = output_device_id,
+                    "zone_hidden_skipping_auto_unhide"
+                );
             }
+            return Ok((id, false));
         }
         // No existing zone — try to create one.
         match self.create_ou_occupante(name, output_type, output_device_id)? {
@@ -2061,7 +2093,14 @@ impl ZoneRepo {
                     // `output_device_id` d'abord : c'est LUI l'identite de la
                     // zone, et tout ce qui s'y accroche suit la ligne, pas la
                     // clef. L'identifiant d'endpoint est deja le bon.
-                    self.update_output_device(zone_id, &nouveau_device_id)?;
+                    // #6774 — même endpoint : même périphérique, tout reste.
+                    self.changer_d_appareil(
+                        zone_id,
+                        &nouveau_device_id,
+                        crate::audio::reglages_de_volume::Rattachement::MemePeripherique {
+                            origine: "identite_de_sortie_reassocie",
+                        },
+                    )?;
                     rapport.reassociees.push(Reassociation {
                         zone_id,
                         ancien_device_id,
@@ -2084,6 +2123,48 @@ impl ZoneRepo {
         Ok(())
     }
 
+    /// #6912 — une observation ne remonte jamais le volume enregistré et ne
+    /// remplace ni un nouvel appareil ni une consigne modifiée depuis sa lecture.
+    pub(crate) fn adopter_controles_air_attendus(
+        &self,
+        zone: &Zone,
+        volume: f64,
+        muted: bool,
+    ) -> Result<bool, String> {
+        if !volume.is_finite() || volume < 0.0 || volume > zone.volume {
+            return Ok(false);
+        }
+        let Some(id) = zone.id else {
+            return Ok(false);
+        };
+        let Some(did) = zone.output_device_id.as_deref() else {
+            return Ok(false);
+        };
+        let d: &dyn SqlDialect = match self.db.engine() {
+            Engine::Sqlite => &SqliteDialect,
+            Engine::Postgres => &PostgresDialect,
+        };
+        let p: Vec<_> = (1..=8).map(|i| d.placeholder(i)).collect();
+        let sql = format!(
+            "UPDATE zones SET volume = {}, muted = {} WHERE id = {} AND output_type = 'devialet_air' AND output_device_id = {} AND volume = {} AND muted = {} AND fixed_volume = {} AND volume >= {}",
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]
+        );
+        let ancien_mute = i64::from(zone.muted);
+        let nouveau_mute = i64::from(muted);
+        let fixe = i64::from(zone.fixed_volume);
+        let params: [&dyn ToSqlValue; 8] = [
+            &volume,
+            &nouveau_mute,
+            &id,
+            &did,
+            &zone.volume,
+            &ancien_mute,
+            &fixe,
+            &volume,
+        ];
+        Ok(self.db.execute(&sql, &params)? == 1)
+    }
+
     pub fn update_muted(&self, id: i64, muted: bool) -> Result<(), String> {
         let val: i64 = i64::from(muted);
         let sql = self.update_field_sql("muted");
@@ -2099,11 +2180,93 @@ impl ZoneRepo {
         Ok(())
     }
 
+    /// Change l'appareil d'une zone, SANS preuve que c'est le même (#6774).
+    ///
+    /// Un autre identifiant est traité comme un AUTRE appareil : le trim de
+    /// la zone repart de 0 dB (voir [`Self::changer_d_appareil`]). Un chemin
+    /// qui sait prouver l'identité (même MAC, même endpoint local) appelle
+    /// [`Self::changer_d_appareil`] avec sa preuve.
     pub fn update_output_device(&self, id: i64, device_id: &str) -> Result<(), String> {
+        self.changer_d_appareil(
+            id,
+            device_id,
+            crate::audio::reglages_de_volume::Rattachement::SansPreuve {
+                origine: "update_output_device",
+                mac: None,
+            },
+        )
+    }
+
+    /// #6774 — le seul point d'écriture de `output_device_id` sur une zone
+    /// existante. Les réglages `zone_{id}_*` suivent la LIGNE : quand le nouvel
+    /// identifiant désigne un AUTRE appareil
+    /// ([`crate::audio::reglages_de_volume::meme_appareil`]), PURE verrouillé
+    /// et volume fixe sont désarmés, le volume de la zone ne remonte jamais, un
+    /// trim POSITIF repart de 0 dB et un trim négatif reste
+    /// ([`crate::audio::reglages_de_volume::ajuster_au_changement_d_appareil`],
+    /// décisions de Bertrand du 22/10). Les limites restent. Le même appareil
+    /// (identifiant inchangé, même MAC normalisée, même endpoint local) garde
+    /// tout. L'appelant qui tient l'état de lecture le réaligne ensuite
+    /// ([`crate::audio::reglages_de_volume::aligner_la_lecture`]).
+    pub fn changer_d_appareil(
+        &self,
+        id: i64,
+        device_id: &str,
+        rattachement: crate::audio::reglages_de_volume::Rattachement<'_>,
+    ) -> Result<(), String> {
+        let avant = self.appareil_et_mac(id);
         let sql = self.update_field_sql("output_device_id");
         let params: [&dyn ToSqlValue; 2] = [&device_id, &id];
         self.db.execute(&sql, &params)?;
+        if let Some((ancien, mac)) = avant
+            && !crate::audio::reglages_de_volume::meme_appareil(
+                ancien.as_deref(),
+                mac.as_deref(),
+                device_id,
+                &rattachement,
+            )
+        {
+            crate::audio::reglages_de_volume::ajuster_au_changement_d_appareil(
+                &self.db,
+                id,
+                ancien.as_deref(),
+                device_id,
+                rattachement.origine(),
+            );
+        }
         Ok(())
+    }
+
+    /// `(output_device_id, mac)` de la ligne `id`, masquée ou non ; `None`
+    /// si la ligne n'existe pas. Une base antérieure à la colonne `mac` rend
+    /// une MAC absente plutôt qu'une erreur.
+    fn appareil_et_mac(&self, id: i64) -> Option<(Option<String>, Option<String>)> {
+        let p = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        let texte = |v: Option<&SqlValue>| {
+            v.and_then(|v| v.as_string())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let ligne = self
+            .db
+            .query_one_strong(
+                &format!("SELECT output_device_id FROM zones WHERE id = {p}"),
+                &params,
+            )
+            .ok()
+            .flatten()?;
+        let ancien = texte(ligne.first());
+        let mac = self
+            .db
+            .query_one_strong(&format!("SELECT mac FROM zones WHERE id = {p}"), &params)
+            .ok()
+            .flatten()
+            .and_then(|l| texte(l.first()));
+        Some((ancien, mac))
     }
 
     pub fn update_output_type(&self, id: i64, output_type: &str) -> Result<(), String> {
@@ -2681,10 +2844,18 @@ impl ZoneRepo {
     /// back with a new UPnP UUID: host-based dedup keeps the existing zone (and
     /// its per-zone settings: native FLAC, volume…) instead of spawning a
     /// duplicate, so the device_id is refreshed to the live one.
+    ///
+    /// #6774 — même règle que [`Self::update_output_device`] : sans preuve,
+    /// un autre identifiant est un autre appareil (trim remis à 0 dB).
     pub fn update_device_id(&self, id: i64, device_id: &str) -> Result<(), String> {
-        let sql = self.update_field_sql("output_device_id");
-        let params: [&dyn ToSqlValue; 2] = [&device_id, &id];
-        self.db.execute(&sql, &params).map(|_| ())
+        self.changer_d_appareil(
+            id,
+            device_id,
+            crate::audio::reglages_de_volume::Rattachement::SansPreuve {
+                origine: "update_device_id",
+                mac: None,
+            },
+        )
     }
 
     /// Find an existing (non-hidden) DLNA/OpenHome zone by physical host (IP),
@@ -2994,19 +3165,18 @@ impl ZoneRepo {
         let lignes = self.db.query_many_strong(&sql, &params)?;
         Ok(lignes
             .iter()
-            .filter_map(|r| {
-                let texte = |i: usize| r.get(i).and_then(|v| v.as_string());
-                Some(ZoneMasquee {
-                    id: r.first().and_then(|v| v.as_i64())?,
-                    name: texte(1).unwrap_or_default(),
-                    device_id: texte(2).unwrap_or_default(),
-                    protocole: texte(3).unwrap_or_default(),
-                    host: texte(4).unwrap_or_default(),
-                    mac: texte(5).filter(|m| !m.trim().is_empty()),
-                    motif: texte(6),
-                    masquee_le: texte(7),
-                })
-            })
+            .filter_map(|r| ligne_de_zone_masquee(r))
+            .collect())
+    }
+
+    /// Toutes les zones masquées, motif NUL compris (#6378). `ZoneRepo::count`
+    /// et `list` les ignorent : sans cette lecture, un rapport de bogue écrit
+    /// « Zones (0) » pour un testeur dont la seule zone est masquée.
+    pub fn zones_masquees(&self) -> Result<Vec<ZoneMasquee>, String> {
+        let lignes = self.db.query_many(&sql::zones_masquees(), &[])?;
+        Ok(lignes
+            .iter()
+            .filter_map(|r| ligne_de_zone_masquee(r))
             .collect())
     }
 
@@ -3157,7 +3327,7 @@ impl ZoneRepo {
     }
 }
 
-fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
+fn row_to_zone(cols: &[SqlValue]) -> Zone {
     Zone {
         id: cols.first().and_then(|v| v.as_i64()),
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
@@ -3184,6 +3354,10 @@ fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
 #[cfg(test)]
 #[path = "zone_navigateur_jumelle_3067_tests.rs"]
 mod zone_navigateur_jumelle_3067_tests;
+
+#[cfg(test)]
+#[path = "reglages_suivent_l_appareil_6774_tests.rs"]
+mod reglages_suivent_l_appareil_6774_tests;
 
 #[cfg(test)]
 mod tests {

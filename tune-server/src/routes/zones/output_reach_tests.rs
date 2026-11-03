@@ -250,3 +250,54 @@ fn une_zone_navigateur_ne_cherche_aucun_appareil() {
         "ok"
     );
 }
+
+/// #6066 — par la vraie porte (`output_reach`, streamer compris) : une sonde
+/// de plage (AVPlayer `bytes=0-1`, deux octets) n'est pas un onglet qui joue.
+#[tokio::test]
+async fn une_sonde_de_plage_ne_vaut_pas_un_onglet_qui_joue_6066() {
+    let dossier = tempfile::tempdir().unwrap();
+    let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let id = repo.create("Ce téléphone", Some("browser"), None).unwrap();
+    let zone = repo.get(id).unwrap().unwrap();
+    let fichier = dossier.path().join("piste.flac");
+    std::fs::write(&fichier, b"fake audio").unwrap();
+
+    for (octets, attendu) in [
+        (2, "browser_unattended"),
+        (
+            tune_core::poller::TAILLE_MAXIMALE_D_UNE_SONDE,
+            "browser_unattended",
+        ),
+        (64 * 1024, "ok"),
+    ] {
+        let sid = state
+            .streamer
+            .create_file_session(
+                tune_core::http::streamer::StreamInfo {
+                    format: "flac".into(),
+                    mime_type: "audio/flac".into(),
+                    ..Default::default()
+                },
+                fichier.to_string_lossy().into_owned(),
+                false,
+            )
+            .await;
+        {
+            let sessions = state.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            sessions
+                .get(&sid)
+                .expect("la session vient d'être créée")
+                .bytes_sent
+                .store(octets, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut ps = browser_playing_since(Duration::from_secs(30));
+        ps.now_playing.as_mut().unwrap().stream_id = Some(sid);
+        assert_eq!(
+            output_reach(&state, &zone, &ps).await,
+            attendu,
+            "#6066 : {octets} octets tirés — une sonde ne prouve pas qu'un onglet joue"
+        );
+    }
+}

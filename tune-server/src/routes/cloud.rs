@@ -9,14 +9,14 @@ use tracing::{info, warn};
 
 use tune_core::cloud::plugins::PluginMarketplace;
 use tune_core::cloud::rate_limit::{self, CloudScope};
-use tune_core::cloud::sso::{MozaikAuth, PkceSession, ProfilCloud};
+use tune_core::cloud::sso::{MozaikAuth, PageConnexion, PkceSession, ProfilCloud};
 use tune_core::cloud::telemetry::TelemetryReporter;
 use tune_core::db::settings_repo::SettingsRepo;
 
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new()
+    let r = Router::new()
         .route("/sso/authorize", get(sso_authorize))
         .route("/sso/callback", get(sso_callback))
         .route("/sso/status", get(sso_status))
@@ -34,6 +34,7 @@ pub fn router() -> Router<AppState> {
         .route("/bridge/access-link", get(bridge_access_link))
         .route("/bridge/enable", post(bridge_enable))
         .route("/bridge/disable", post(bridge_disable))
+        .route("/bridge/rotate-token", post(bridge_rotate_token))
         .route("/license/status", get(license_status))
         .route("/license/activate", post(license_activate))
         .route("/license/deactivate", post(license_deactivate))
@@ -41,7 +42,12 @@ pub fn router() -> Router<AppState> {
         .route("/library-sync/status", get(library_sync_status))
         .route("/library-sync/trigger", post(library_sync_trigger))
         .route("/library-sync/full-sync", post(library_sync_full))
-        .route("/library-sync/reconcile", post(library_sync_reconcile))
+        .route("/library-sync/reconcile", post(library_sync_reconcile));
+    // #6785 : la route n'existe que dans les builds qui compilent l'écoute
+    // directe (fonction `ecoute-directe`, hors défaut).
+    #[cfg(feature = "ecoute-directe")]
+    let r = r.route("/direct/status", get(direct_status));
+    r
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +179,28 @@ fn page_echec_compte(
     page_connexion_compte(headers, statut, &message, None)
 }
 
-async fn sso_authorize(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+/// Langue et thème de l'interface que le client web transmet (`ui_locales`,
+/// `theme`), ou rien. Lus à la main dans la requête : une valeur répétée ou
+/// illisible ne doit JAMAIS faire refuser la connexion, elle est ignorée.
+pub(crate) fn page_connexion_demandee(requete: &[(String, String)]) -> PageConnexion {
+    let premiere = |cle: &str| {
+        requete
+            .iter()
+            .find(|(k, _)| k == cle)
+            .map(|(_, v)| v.as_str())
+    };
+    PageConnexion::valider(
+        premiere("ui_locales"),
+        premiere("theme"),
+        crate::i18n::SUPPORTED,
+    )
+}
+
+async fn sso_authorize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(requete): Query<Vec<(String, String)>>,
+) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
         // sso_authorize is a full browser navigation, so degrade to a friendly
@@ -217,7 +244,8 @@ async fn sso_authorize(State(state): State<AppState>, headers: HeaderMap) -> imp
     // Persist the exact redirect_uri: OAuth requires the token exchange in the
     // callback to present an identical value.
     settings.set("mozaik_redirect_uri_pending", &uri).ok();
-    let url = auth.authorize_url(&uri, &pkce.challenge, &pkce.state);
+    let page = page_connexion_demandee(&requete);
+    let url = auth.authorize_url_avec_page(&uri, &pkce.challenge, &pkce.state, &page);
     Redirect::temporary(&url).into_response()
 }
 
@@ -372,6 +400,11 @@ async fn sso_callback(
             tune_core::cloud::library_sync::lier_depuis_les_reglages(&backend, &http_client)
                 .await
                 .ok();
+            // Clé du serveur (#6603) : inscrite sur le compte une fois le
+            // serveur relié, si le pont l'a créée.
+            tune_core::cloud::cle_serveur::inscrire_depuis_les_reglages(&backend, &http_client)
+                .await
+                .ok();
         });
     }
 
@@ -385,7 +418,12 @@ async fn sso_callback(
         )
         .ok()
         .flatten()
-        .and_then(|row| row.first().and_then(|v| v.as_i64()));
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+        // #7082 : installation a un seul profil sans courriel -> la liaison s'y
+        // rattache au lieu de basculer la session sur un profil vierge.
+        .or_else(|| {
+            tune_core::cloud::proprietaire::rattacher_au_profil_unique(&state.backend, &user.email)
+        });
 
     let profile_id = if let Some(id) = existing_id {
         // Update display name from the cloud profile — but NOT avatar_path.
@@ -961,6 +999,22 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 // Bridge (cloud relay)
 // ---------------------------------------------------------------------------
 
+/// #6785 — l'écoute directe : allumée ou non, et, si elle est en service,
+/// de quoi la composer (identité d'endpoint = clé du serveur = `srv_pk`,
+/// adresses directes, relais iroh auto-hébergé). L'app la lit par le relais,
+/// puis tente le direct ; le relais reste son secours.
+#[cfg(feature = "ecoute-directe")]
+async fn direct_status(State(state): State<AppState>) -> Json<Value> {
+    if let Some(en_service) = tune_core::cloud::ecoute_directe::en_service() {
+        return Json(json!({"active": true, "annonce": en_service.annonce()}));
+    }
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    Json(json!({
+        "active": false,
+        "allumee": tune_core::cloud::ecoute_directe::active(&reglages),
+    }))
+}
+
 async fn bridge_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let server_id = TelemetryReporter::get_or_create_server_id(&settings);
@@ -1003,6 +1057,15 @@ async fn bridge_status(State(state): State<AppState>) -> Json<Value> {
         "server_id": server_id,
         "relay_url": bridge_url,
         "has_token": bridge_token.is_some(),
+        // Écoute à distance par compte (#6603) : l'écran « Accès à distance »
+        // explique le parcours ; l'ancien lien est obsolète, et coupé dès que
+        // le relais l'a dit.
+        // Tant que le relais n'ouvre pas de sessions par laissez-passer, rien
+        // ne change : le lien n'est pas obsolète et rien n'est à expliquer.
+        "acces_par_compte": tune_core::cloud::cle_serveur::laissez_passer_actif(&settings)
+            .then_some(MESSAGE_ACCES_PAR_COMPTE),
+        "lien_obsolete": tune_core::cloud::cle_serveur::laissez_passer_actif(&settings),
+        "lien_herite_coupe": tune_core::cloud::cle_serveur::lien_herite_coupe(&settings),
         "access_url": if enabled {
             Some(format!("https://bridge.mozaiklabs.fr/{server_id}/"))
         } else {
@@ -1010,6 +1073,10 @@ async fn bridge_status(State(state): State<AppState>) -> Json<Value> {
         },
     }))
 }
+
+/// Ce que les Réglages disent à la place du lien d'accès (#6603).
+pub const MESSAGE_ACCES_PAR_COMPTE: &str =
+    "Ouvrez Tune Remote et connectez-vous à votre compte mozaiklabs";
 
 /// Lien d'accès à distance, jeton compris, pour le PROPRIÉTAIRE seulement.
 ///
@@ -1024,16 +1091,7 @@ async fn bridge_access_link(
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let enabled = settings
-        .get("bridge_enabled")
-        .ok()
-        .flatten()
-        .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false)
-        || std::env::var("TUNE_BRIDGE_ENABLED")
-            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false);
-    if !enabled {
+    if !pont_active(&settings) {
         return (
             StatusCode::CONFLICT,
             Json(json!({"error": "bridge_disabled"})),
@@ -1052,21 +1110,103 @@ async fn bridge_access_link(
         )
             .into_response();
     };
-    let server_id = TelemetryReporter::get_or_create_server_id(&settings);
+    reponse_lien_d_acces(&settings, &token)
+}
+
+/// Le pont est-il activé (réglage `bridge_enabled`, ou `TUNE_BRIDGE_ENABLED`) ?
+fn pont_active(settings: &SettingsRepo) -> bool {
+    settings
+        .get("bridge_enabled")
+        .ok()
+        .flatten()
+        .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+        || std::env::var("TUNE_BRIDGE_ENABLED")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false)
+}
+
+/// La réponse porteuse du lien d'accès (`…/{server_id}/#token=…`), commune à
+/// `bridge_access_link` et à `bridge_rotate_token`. Jamais mise en cache.
+fn reponse_lien_d_acces(settings: &SettingsRepo, token: &str) -> axum::response::Response {
+    // #6603 — l'écoute à distance passe par le compte mozaiklabs. Pendant la
+    // coexistence, l'ancien lien reste servi, marqué obsolète ; une fois que
+    // le relais a dit qu'il ne l'accepte plus, il n'existe plus : 410.
+    if tune_core::cloud::cle_serveur::lien_herite_coupe(settings) {
+        return (
+            StatusCode::GONE,
+            Json(json!({
+                "error": "lien_obsolete",
+                "message": MESSAGE_ACCES_PAR_COMPTE,
+            })),
+        )
+            .into_response();
+    }
+    let server_id = TelemetryReporter::get_or_create_server_id(settings);
     let access_url = format!("https://bridge.mozaiklabs.fr/{server_id}/");
     let link = format!("{access_url}#token={token}");
+    let obsolete = tune_core::cloud::cle_serveur::laissez_passer_actif(settings);
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(json!({
             "server_id": server_id,
             "access_url": access_url,
             "link": link,
+            "obsolete": obsolete,
+            "message": obsolete.then_some(MESSAGE_ACCES_PAR_COMPTE),
         })),
     )
         .into_response()
 }
 
-async fn bridge_enable(State(state): State<AppState>) -> impl IntoResponse {
+/// Renouvelle le lien d'accès à distance : nouveau jeton de pont, et le
+/// relais oublie l'ancien.
+///
+/// Administrateur seulement dès que l'authentification est active, 409 tant
+/// que le pont est éteint (comme `bridge_access_link`). Le nouveau jeton est
+/// enregistré, puis remis au client du relais s'il tourne : la session
+/// ouverte avec l'ancien se referme et se réinscrit avec le nouveau
+/// (`RelayClient::renouveler_jeton`). Le relais oublie les jetons d'un serveur
+/// dont la connexion se ferme : l'ancien lien, ses QR codes et les apps
+/// appairées avec lui cessent d'ouvrir quoi que ce soit.
+///
+/// Réponse : le nouveau lien, de la forme de `bridge_access_link`.
+async fn bridge_rotate_token(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if !pont_active(&settings) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "bridge_disabled"})),
+        )
+            .into_response();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    if let Err(e) = settings.set("bridge_token", &token) {
+        warn!(error = %e, "bridge token renewal not saved");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "bridge_token_not_saved"})),
+        )
+            .into_response();
+    }
+    #[cfg(feature = "cloud-relay")]
+    if let Some(client) = state.relay_client.get() {
+        client.renouveler_jeton(token.clone());
+    }
+    // Jamais le jeton dans le journal.
+    info!("bridge token renewed");
+    reponse_lien_d_acces(&settings, &token)
+}
+
+/// Active le pont. Administrateur seulement dès que l'authentification est
+/// active : la réponse porte le jeton de pont.
+async fn bridge_enable(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     // Premium gate: Cloud Relay requires Premium
     if let Err(resp) = crate::premium_guard::require_premium(
         &state.license,
@@ -1092,17 +1232,26 @@ async fn bridge_enable(State(state): State<AppState>) -> impl IntoResponse {
     let server_id = TelemetryReporter::get_or_create_server_id(&settings);
     info!(server_id = %server_id, "bridge enabled");
 
-    Json(json!({
+    let mut reponse = json!({
         "enabled": true,
         "server_id": server_id,
-        "bridge_token": token,
         "access_url": format!("https://bridge.mozaiklabs.fr/{server_id}/"),
         "note": "restart server to activate the relay connection"
-    }))
-    .into_response()
+    });
+    // #6603 — le jeton du pont ne sert plus qu'à l'ancien lien. Une fois ce
+    // lien coupé par le relais, il n'a plus à sortir d'ici.
+    if !tune_core::cloud::cle_serveur::lien_herite_coupe(&settings) {
+        reponse["bridge_token"] = json!(token);
+    }
+    Json(reponse).into_response()
 }
 
-async fn bridge_disable(State(state): State<AppState>) -> Json<Value> {
+/// Éteint le pont. Administrateur seulement dès que l'authentification est
+/// active.
+async fn bridge_disable(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let _ = settings.set("bridge_enabled", "false");
     info!("bridge disabled");
@@ -1157,8 +1306,15 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
     // question ne se pose pas (Free, ou abonnement réellement échu).
     let offline_grace = tune_core::license::offline_grace(&ls);
 
+    // #7419 — D'OÙ vient le Premium : « key » (clé de licence) ou « account »
+    // (compte Mozaiklabs lié, sans clé). `null` hors Premium. Sans ce champ,
+    // un serveur neuf devenu Premium par la seule connexion au compte montrait
+    // un champ de clé vide, et l'auditeur allait recopier une clé inutile.
+    let premium_source = state.license.source_du_premium().await;
+
     Json(json!({
         "tier": ls.tier,
+        "premium_source": premium_source,
         "license_key": ls.license_key,
         "expires_at": ls.expires_at,
         "last_validated": ls.last_validated,
@@ -1704,6 +1860,18 @@ mod tests_licence_proprietaire {
             adoption < ecrasement,
             "l'adoption lit `mozaik_user` APRES sa reecriture : elle adopterait \
              le compte qui vient de se connecter au lieu de celui deja en place"
+        );
+    }
+
+    /// #7082 : le rattachement au profil unique doit etre CABLE dans le callback.
+    #[test]
+    fn la_liaison_se_rattache_au_profil_unique() {
+        let source = include_str!("cloud.rs");
+        assert!(
+            source
+                .contains("proprietaire::rattacher_au_profil_unique(&state.backend, &user.email)"),
+            "le callback SSO ne rattache plus au profil unique : la session \
+             rebascule sur un profil vierge (photo et theme perdus, #7082)"
         );
     }
 
@@ -2375,5 +2543,52 @@ mod reconcile_tests {
             Mode::Appliquer,
             "seule une demande EXPLICITE doit mettre en file"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_page_connexion_b209sso {
+    use super::page_connexion_demandee;
+
+    fn q(paires: &[(&str, &str)]) -> Vec<(String, String)> {
+        paires
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn valeur_valide_prise_telle_quelle() {
+        let p = page_connexion_demandee(&q(&[("ui_locales", "de"), ("theme", "clear-grey")]));
+        assert_eq!(p.langue.as_deref(), Some("de"));
+        assert_eq!(p.theme.as_deref(), Some("clear-grey"));
+    }
+
+    #[test]
+    fn valeur_absente_donne_rien() {
+        let p = page_connexion_demandee(&q(&[("autre", "x")]));
+        assert_eq!((p.langue, p.theme), (None, None));
+    }
+
+    #[test]
+    fn injection_ignoree_sans_erreur() {
+        let p = page_connexion_demandee(&q(&[
+            ("ui_locales", "fr&redirect_uri=https://evil.example"),
+            ("theme", "brown&state=x"),
+        ]));
+        assert_eq!((p.langue, p.theme), (None, None));
+    }
+
+    #[test]
+    fn langue_hors_du_serveur_ignoree() {
+        // « pt » n'est pas une langue du serveur (le polonais l'est depuis la rc9).
+        let p = page_connexion_demandee(&q(&[("ui_locales", "pt")]));
+        assert_eq!(p.langue, None);
+    }
+
+    #[test]
+    fn valeur_repetee_premiere_retenue() {
+        let p = page_connexion_demandee(&q(&[("theme", "brown"), ("theme", "evil")]));
+        assert_eq!(p.theme.as_deref(), Some("brown"));
     }
 }

@@ -182,6 +182,8 @@ pub struct DidlBuilder {
     title: String,
     artist: Option<String>,
     album: Option<String>,
+    year: Option<i32>,
+    genres: Vec<String>,
     album_art_uri: Option<String>,
     /// If true, add `dlna:profileID="JPEG_TN"` attribute on albumArtURI
     /// and declare `xmlns:dlna` on the root element.
@@ -229,6 +231,8 @@ impl DidlBuilder {
             title: title.to_string(),
             artist: None,
             album: None,
+            year: None,
+            genres: Vec::new(),
             album_art_uri: None,
             dlna_art_profile: false,
             duration_ms: None,
@@ -317,6 +321,18 @@ impl DidlBuilder {
 
     pub fn album_opt(mut self, album: Option<&str>) -> Self {
         self.album = album.map(|s| s.to_string());
+        self
+    }
+
+    /// Année connue, sans inventer de mois ou de jour (dc:date, précision YYYY).
+    pub fn year_opt(mut self, year: Option<i32>) -> Self {
+        self.year = year.filter(|y| (1..=9999).contains(y));
+        self
+    }
+
+    /// Un élément UPnP par genre ; aucun découpage d'un libellé composé.
+    pub fn genres(mut self, genres: Vec<String>) -> Self {
+        self.genres = genres;
         self
     }
 
@@ -452,6 +468,17 @@ impl DidlBuilder {
             .map(|a| format!("<upnp:album>{}</upnp:album>", escape_sain(a)))
             .unwrap_or_default();
 
+        let year_tag = self
+            .year
+            .map(|y| format!("<dc:date>{y:04}</dc:date>"))
+            .unwrap_or_default();
+        let genre_tags: String = self
+            .genres
+            .iter()
+            .filter(|g| is_valid_meta(Some(g.trim())))
+            .map(|g| format!("<upnp:genre>{}</upnp:genre>", escape_sain(g)))
+            .collect();
+
         // Album art URI
         let art_tag = self
             .album_art_uri
@@ -543,6 +570,7 @@ impl DidlBuilder {
              {artist_tags}\
              <upnp:class>{classe}</upnp:class>\
              {album_tag}\
+             {year_tag}{genre_tags}\
              {art_tag}\
              {track_num_tag}\
              <res protocolInfo=\"{protocol_info}\"{dur_attr}{sr_attr}{bd_attr}{ch_attr}{size_attr}>{escaped_url}</res>\

@@ -482,6 +482,61 @@ mod tests {
         assert!(champs[2].1.contains("00:1A:2B:xx:xx:xx"), "{}", champs[2].1);
     }
 
+    /// Identifiants UPnP fabriqués pour l'épreuve : la MAC est dans le dernier
+    /// groupe de l'UDN, et collée à un identifiant de zone.
+    const UDN_AVEC_MAC: &str = "uuid:4d696e69-444c-164e-9d41-a0b1c2d3e4f5";
+    const FIN_DE_MAC: &str = "d3e4f5";
+
+    /// Chemin JSON : l'UDN d'un lecteur sort masqué, dans le journal comme
+    /// dans la fiche système ; l'identifiant aléatoire d'une zone Tune reste.
+    #[test]
+    fn le_ticket_json_masque_la_mac_des_identifiants_upnp() {
+        let ticket = NewTicket {
+            subject: "Coupure".into(),
+            body: "Mon texte".into(),
+            system: Some(json!({
+                "zones": [{ "output_device_id": UDN_AVEC_MAC, "name": "Salon_a0b1c2d3e4f5" }],
+            })),
+            logs: Some(format!(
+                "INFO ssdp USN: {UDN_AVEC_MAC}::urn:schemas-upnp-org:device:MediaRenderer:1 \
+                 zone=0f8fad5b-d9cb-469f-a165-70867728950e airplay-a0b1c2d3e4f5"
+            )),
+            ..Default::default()
+        };
+        let sortie = ticket_payload(&ticket).to_string();
+        assert!(
+            !sortie.contains(FIN_DE_MAC),
+            "la MAC sort encore : {sortie}"
+        );
+        assert!(sortie.contains("a0b1c2xxxxxx"), "{sortie}");
+        assert!(
+            sortie.contains("0f8fad5b-d9cb-469f-a165-70867728950e"),
+            "l'identifiant de zone doit rester : {sortie}"
+        );
+    }
+
+    /// Chemin multipart : même masquage, fiche sérialisée et journal.
+    #[test]
+    fn le_ticket_multipart_masque_la_mac_des_identifiants_upnp() {
+        let champs = champs_de_diagnostic_nettoyes(vec![
+            (
+                "system".into(),
+                format!(r#"{{"zones":[{{"output_device_id":"{UDN_AVEC_MAC}"}}]}}"#),
+            ),
+            (
+                "logs".into(),
+                format!("WARN dlna renderer {UDN_AVEC_MAC} hote esp-a0b1c2d3e4f5.local"),
+            ),
+        ]);
+        for (nom, valeur) in &champs {
+            assert!(
+                !valeur.contains(FIN_DE_MAC),
+                "{nom} : la MAC sort encore : {valeur}"
+            );
+            assert!(valeur.contains("a0b1c2xxxxxx"), "{nom} : {valeur}");
+        }
+    }
+
     fn err_body(result: SupportResult) -> (u16, Value) {
         result.expect_err("un statut hors 2xx doit rendre une erreur")
     }

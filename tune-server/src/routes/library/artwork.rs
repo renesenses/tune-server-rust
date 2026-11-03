@@ -343,7 +343,20 @@ pub(super) async fn proxy_artwork(
         signature_exigee: exemption.is_some(),
         hotes_supplementaires: &supplementaires,
     };
-    let mut resultat = state.relais_pochettes.relayer(&demande).await;
+    let contexte_radio = if q.sig.is_none() && exemption.is_none() {
+        logo_de_pochette_radio_publiee(&state, &q.url).await
+    } else {
+        None
+    };
+    let est_pochette_radio = contexte_radio.is_some();
+    let mut resultat = if let Some(logo) = contexte_radio {
+        state
+            .relais_pochettes
+            .relayer_radio_publiee(&q.url, logo.as_deref(), &secret, &supplementaires)
+            .await
+    } else {
+        state.relais_pochettes.relayer(&demande).await
+    };
 
     // Pochette de serveur UPnP de la bibliothèque (réseau local) : refusée par
     // la garde générale, admise si — et seulement si — c'est l'adresse
@@ -396,7 +409,11 @@ pub(super) async fn proxy_artwork(
             );
             headers.insert(
                 "Cache-Control",
-                HeaderValue::from_static("public, max-age=86400"),
+                HeaderValue::from_static(if est_pochette_radio {
+                    "no-cache"
+                } else {
+                    "public, max-age=86400"
+                }),
             );
             (StatusCode::OK, headers, image.octets).into_response()
         }
@@ -421,6 +438,42 @@ pub(super) async fn proxy_artwork(
         }
     }
 }
+
+/// #7009 — seule l'adresse exacte publiée pour une radio courante est
+/// reconnue. Le logo vient de la station ou de son lancement, jamais du
+/// paramètre de la requête. Si plusieurs radios partagent cette pochette
+/// mais ont des logos différents, aucun logo arbitraire n'est choisi.
+async fn logo_de_pochette_radio_publiee(state: &AppState, url: &str) -> Option<Option<String>> {
+    let radios = tune_core::db::radio_repo::RadioRepo::with_backend(state.backend.clone());
+    let mut logos = std::collections::HashSet::new();
+    for zone in state.playback.all_states().await {
+        let Some(np) = zone.now_playing else { continue };
+        if np.source != "radio" || np.cover_path.as_deref() != Some(url) {
+            continue;
+        }
+        let source = np.source_id.as_deref().unwrap_or("");
+        let station = match source.parse::<i64>() {
+            Ok(id) => radios.get(id).ok().flatten(),
+            Err(_) => radios.get_by_url(source).ok().flatten(),
+        };
+        let flux = station.as_ref().map(|s| s.url.as_str()).unwrap_or(source);
+        logos.insert(tune_core::poller::logo_de_lancement::logo_de_la_station(
+            station.as_ref(),
+            flux,
+        ));
+    }
+    if logos.is_empty() {
+        None
+    } else if logos.len() == 1 {
+        Some(logos.into_iter().next().flatten())
+    } else {
+        Some(None)
+    }
+}
+
+#[cfg(test)]
+#[path = "pochettes_radio_7009_tests.rs"]
+mod pochettes_radio_7009_tests;
 
 /// #4895 — relaie la pochette d'un serveur multimédia du réseau local
 /// découvert par SSDP, ou `None` si l'hôte:port de l'URL n'est pas EXACTEMENT
@@ -516,6 +569,82 @@ async fn pochette_d_un_serveur_tune_decouvert(state: &AppState, url: &str) -> bo
         .any(|s| s.port == port && s.host.eq_ignore_ascii_case(&hote))
 }
 
+/// #4805 lot 2 (d'après MetaRust, de Xavier Joly) — un album qui a déjà une
+/// pochette ne reçoit celle du Cover Art Archive que si c'est le MÊME visuel
+/// (empreinte dHash, Hamming ≤ 8) et qu'elle a au moins 1,4 fois plus de
+/// pixels. Jamais un autre visuel : la pochette en place peut être l'édition
+/// que l'utilisateur possède.
+///
+/// Seulement pour une pochette de FOURNISSEUR (`cover_source = provider`) :
+/// une pochette du disque suit le fichier (le scan la réévalue), une pochette
+/// téléversée est un choix de l'utilisateur, une pochette importée vient
+/// d'un autre logiciel. Seulement avec un MBID déjà connu : aucune recherche
+/// MusicBrainz, aucune écriture d'identifiant en passant.
+///
+/// `chercher(mbid)` rend les octets du Cover Art Archive (le transport est en
+/// paramètre pour que la règle s'éprouve sans réseau).
+async fn ameliorer_la_pochette<F, Fut>(
+    repo: &AlbumRepo,
+    cache_dir: &std::path::Path,
+    id: i64,
+    en_place: &str,
+    mbid: Option<&str>,
+    chercher: F,
+) -> Json<Value>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    use tune_core::library::pochette_visuelle::{self, Decision};
+    let source = repo.etat_pochette(id).ok().flatten().and_then(|e| e.source);
+    if source != Some(tune_core::db::models::SourcePochette::Fournisseur) {
+        return Json(json!({"enriched": false, "reason": "album already has cover art"}));
+    }
+    let Some(mbid) = mbid.filter(|m| !m.trim().is_empty()) else {
+        return Json(json!({"enriched": false, "reason": "album already has cover art"}));
+    };
+    let Some(data) = chercher(mbid.to_string()).await else {
+        return Json(json!({
+            "enriched": false,
+            "reason": "no cover art found on Cover Art Archive",
+        }));
+    };
+    let existante = pochette_visuelle::octets_en_cache(cache_dir, en_place);
+    let decision = pochette_visuelle::decider(existante.as_deref(), &data);
+    tracing::info!(
+        album_id = id,
+        decision = decision.code(),
+        "pochette_amelioration_decision"
+    );
+    let remplacer = matches!(decision, Decision::PlusNette { .. } | Decision::Poser);
+    if !remplacer {
+        return Json(json!({
+            "enriched": false,
+            "reason": "album already has cover art",
+            "decision": decision.code(),
+        }));
+    }
+    let Some(hash) = tune_core::library::artwork::cache_fetched_image(&data, cache_dir, "jpg")
+    else {
+        return Json(json!({"enriched": false, "reason": "failed to save to cache"}));
+    };
+    if let Err(e) = repo.force_update_cover_path(
+        id,
+        &hash,
+        tune_core::db::models::SourcePochette::Fournisseur,
+    ) {
+        tracing::warn!(album_id = id, erreur = %e, "pochette_amelioration_ecriture_impossible");
+        return Json(json!({"enriched": false, "reason": "failed to save cover"}));
+    }
+    Json(json!({
+        "enriched": true,
+        "hash": hash,
+        "size": data.len(),
+        "mbid": mbid,
+        "decision": decision.code(),
+    }))
+}
+
 pub(super) async fn enrich_album_artwork(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -532,10 +661,20 @@ pub(super) async fn enrich_album_artwork(
         }
     };
 
-    // Skip if album already has a non-empty cover
-    if album.cover_path.as_ref().is_some_and(|p| !p.is_empty()) {
-        return Json(json!({"enriched": false, "reason": "album already has cover art"}))
-            .into_response();
+    // Une pochette en place : rien à faire, sauf l'AMÉLIORATION d'une pochette
+    // de fournisseur par la même, plus nette (#4805 lot 2, empreinte visuelle
+    // d'après MetaRust).
+    if let Some(en_place) = album.cover_path.as_deref().filter(|p| !p.is_empty()) {
+        return ameliorer_la_pochette(
+            &repo,
+            &artwork_cache_dir(),
+            id,
+            en_place,
+            album.musicbrainz_release_id.as_deref(),
+            |mbid| async move { tune_core::library::artwork::fetch_cover_art(&mbid).await },
+        )
+        .await
+        .into_response();
     }
 
     // Step 1: Determine MBID — use existing or search MusicBrainz by artist+title
@@ -3240,5 +3379,104 @@ mod liste_des_artistes_sans_portrait_4692 {
             Some(3),
             "le compteur d'ensemble reste rendu à côté de la sélection : {fantomes}"
         );
+    }
+}
+
+/// #4805 lot 2 — l'amélioration d'une pochette en place par l'empreinte
+/// visuelle (d'après MetaRust) : la même, nettement plus nette, remplace ; un
+/// autre visuel ne remplace jamais ; une pochette téléversée n'est pas touchée.
+#[cfg(test)]
+mod amelioration_pochette_4805 {
+    use super::ameliorer_la_pochette;
+    use std::io::Cursor;
+    use tune_core::db::album_repo::AlbumRepo;
+    use tune_core::db::backend::ToSqlValue;
+    use tune_core::db::models::SourcePochette;
+
+    fn png(cote: u32, inverse: bool) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(cote, cote, |x, y| {
+            let clair = (x < cote / 2) ^ inverse;
+            let t = (y * 60 / cote) as u8;
+            let v = if clair { 200u8 } else { 20u8 };
+            image::Rgb([v + t / 2, v + t / 2, v + t / 2])
+        });
+        let mut out = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    async fn essai(
+        source: SourcePochette,
+        candidate: Vec<u8>,
+    ) -> (serde_json::Value, String, String) {
+        let e = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let en_place =
+            tune_core::library::artwork::cache_fetched_image(&png(300, false), cache.path(), "png")
+                .unwrap();
+        e.backend
+            .execute(
+                "INSERT INTO albums (id, title, musicbrainz_release_id) VALUES (5, 'A', 'rel-5')",
+                &[],
+            )
+            .unwrap();
+        let repo = AlbumRepo::with_backend(e.backend.clone());
+        repo.force_update_cover_path(5, &en_place, source).unwrap();
+        let axum::Json(v) = ameliorer_la_pochette(
+            &repo,
+            cache.path(),
+            5,
+            &en_place,
+            Some("rel-5"),
+            |_| async move { Some(candidate) },
+        )
+        .await;
+        let apres = e
+            .backend
+            .query_one(
+                "SELECT cover_path FROM albums WHERE id = ?",
+                &[&5_i64 as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .unwrap()[0]
+            .as_string()
+            .unwrap();
+        (v, en_place, apres)
+    }
+
+    #[tokio::test]
+    async fn la_meme_pochette_plus_nette_remplace_celle_d_un_fournisseur() {
+        let (v, avant, apres) = essai(SourcePochette::Fournisseur, png(600, false)).await;
+        assert_eq!(v["enriched"], true, "{v}");
+        assert_eq!(v["decision"], "plus_nette");
+        assert_ne!(avant, apres, "la pochette doit avoir été remplacée");
+    }
+
+    #[tokio::test]
+    async fn un_autre_visuel_ne_remplace_jamais() {
+        let (v, avant, apres) = essai(SourcePochette::Fournisseur, png(1200, true)).await;
+        assert_eq!(v["enriched"], false, "{v}");
+        assert_eq!(v["decision"], "visuel_different");
+        assert_eq!(avant, apres);
+    }
+
+    #[tokio::test]
+    async fn la_meme_a_peine_plus_grande_ne_remplace_pas() {
+        let (v, avant, apres) = essai(SourcePochette::Fournisseur, png(340, false)).await;
+        assert_eq!(v["decision"], "meme_visuel", "{v}");
+        assert_eq!(avant, apres);
+    }
+
+    #[tokio::test]
+    async fn une_pochette_televersee_n_est_pas_touchee() {
+        let (v, avant, apres) = essai(SourcePochette::Televersee, png(1200, false)).await;
+        assert_eq!(v["enriched"], false, "{v}");
+        assert!(
+            v.get("decision").is_none(),
+            "aucune comparaison pour une pochette téléversée"
+        );
+        assert_eq!(avant, apres);
     }
 }

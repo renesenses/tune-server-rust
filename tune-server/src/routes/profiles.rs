@@ -218,16 +218,24 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/favorites/check", post(check_favorites))
 }
 
-async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
+async fn list_profiles(State(state): State<AppState>) -> Response {
     let repo = ProfileRepo::with_backend(state.backend.clone());
     // Don't swallow a DB error as an empty list: the web client would then
-    // auto-create "Default" and mask real profiles with no visible error.
-    // Log it so a schema/column drift on an older DB is diagnosable.
-    let items = repo.list().unwrap_or_else(|e| {
-        tracing::error!(error = %e, "list_profiles: repo.list() failed, returning empty");
-        Vec::new()
-    });
-    Json(json!(items))
+    // auto-create "Default" and mask real profiles with no visible error
+    // (#6454). Log it so a schema/column drift on an older DB is
+    // diagnosable, and answer a 500 with a stable code the client can read.
+    match repo.list() {
+        Ok(items) => Json(json!(items)).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "list_profiles: repo.list() failed");
+            crate::message_api::refus(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "profils_illisibles",
+                "api.profiles.listUnreadable",
+                &[],
+            )
+        }
+    }
 }
 
 async fn get_active_profile(State(state): State<AppState>) -> Json<Value> {
@@ -614,21 +622,9 @@ pub(crate) async fn rafraichir_les_miroirs(
 }
 
 /// L'en-tête `X-Tune-Favoris-Miroir` : `aucun`, `echec`, `en_attente` ou `ok`.
+/// La règle vit avec les états (`favorites_mirror::statut_global`, #6369).
 fn statut_des_miroirs(noms: &[String]) -> &'static str {
-    if noms.is_empty() {
-        return "aucun";
-    }
-    let etats: Vec<_> = noms
-        .iter()
-        .map(|n| tune_core::streaming::favorites_mirror::etat(n))
-        .collect();
-    if etats.iter().any(|e| e.statut == "echec") {
-        "echec"
-    } else if etats.iter().any(|e| e.en_attente > 0) {
-        "en_attente"
-    } else {
-        "ok"
-    }
+    tune_core::streaming::favorites_mirror::statut_global(noms)
 }
 
 /// `GET /profiles/{id}/favorites/streaming/miroir` — l'état du miroir de
@@ -680,6 +676,7 @@ async fn add_streaming_favorite(
             ai_generated: body.ai_generated,
             isrc: body.isrc.clone(),
             created_at: None,
+            annee_qualite: Default::default(),
         };
         return match tune_core::streaming::favorites_mirror::ajouter(&arc, &state.backend, id, &fav)
             .await

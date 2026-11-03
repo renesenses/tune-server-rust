@@ -157,6 +157,7 @@ pub fn router() -> Router<AppState> {
 
 async fn start_job(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<StartJobRequest>,
 ) -> Result<axum::response::Response, AppError> {
     // Premium gate FIRST.
@@ -166,7 +167,9 @@ async fn start_job(
     {
         return Ok(resp);
     }
-    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "declick") {
+    if let Err(response) =
+        crate::premium_audio_plugins::require_installed(&state, "declick", &headers)
+    {
         return Ok(response);
     }
 

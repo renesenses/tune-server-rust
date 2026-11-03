@@ -19,6 +19,9 @@ fn lock_environment() -> std::sync::MutexGuard<'static, ()> {
 mod convertisseur_catalogue_4715;
 #[path = "plugin_events.rs"]
 mod plugin_events;
+// #7067 : désinstaller un greffon fourni en lecture seule (Docker).
+#[path = "plugin_fourni_lecture_seule_7067.rs"]
+mod plugin_fourni_lecture_seule_7067;
 #[path = "plugin_party_e2e.rs"]
 mod plugin_party_e2e;
 #[path = "plugin_uninstall_4194.rs"]

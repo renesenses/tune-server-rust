@@ -1,6 +1,7 @@
 use super::{
-    LocalBackendFallback, ObservedBackend, ObservedDevice, asio_available, asio_outcome,
-    backend_status, platform_default_backend_name, unsupported_outcome,
+    LocalBackendFallback, ObservedBackend, ObservedDevice, appliquer_le_repli_de_demarrage,
+    asio_available, asio_outcome, backend_status, platform_default_backend_name,
+    unsupported_outcome,
 };
 
 fn observed(name: &'static str, reason: Option<LocalBackendFallback>) -> Option<ObservedBackend> {
@@ -52,6 +53,13 @@ fn chaque_motif_declare_est_reellement_produit() {
         if let (_, Some(reason)) = unsupported_outcome(requested) {
             produits.push(reason);
         }
+    }
+    // #6452 — le repli du démarrage qui suit un démarrage inachevé.
+    if let Some(reason) =
+        appliquer_le_repli_de_demarrage(backend_status(None, None, "auto"), Some("asio"))
+            .fallback_reason
+    {
+        produits.push(reason);
     }
 
     for motif in LocalBackendFallback::ALL {
@@ -621,4 +629,35 @@ fn note_observed_backend_passe_par_la_regle_du_sondage_4667() {
         corps.contains("noter_dans(&OBSERVED_BACKEND,"),
         "note_observed_backend doit écrire par noter_dans"
     );
+}
+
+/// #6452 — sous le repli de démarrage, le statut nomme ASIO comme DEMANDÉ,
+/// l'hôte par défaut comme actif, et dit pourquoi. C'est ce que lisent le
+/// chemin du signal (`audio_backend_status` de la zone), les réglages audio
+/// (`/audio/devices`) et le rapport de diagnostic.
+#[test]
+fn le_repli_de_demarrage_se_lit_dans_le_statut() {
+    let sans = backend_status(observed("WASAPI", None), None, "auto");
+    assert!(
+        !sans.fell_back,
+        "sans repli, `auto` sur WASAPI n'est pas un écart"
+    );
+
+    let avec = appliquer_le_repli_de_demarrage(sans.clone(), Some("asio"));
+    assert_eq!(avec.active, "WASAPI");
+    assert_eq!(avec.requested, "asio");
+    assert!(avec.fell_back);
+    assert_eq!(
+        avec.fallback_reason,
+        Some(LocalBackendFallback::AsioDemarragePrecedentInacheve)
+    );
+    assert_eq!(
+        avec.fallback_detail,
+        Some("ASIO non utilisé : le démarrage précédent n'a pas abouti")
+    );
+    let json = serde_json::to_value(&avec).unwrap();
+    assert_eq!(json["fallback_reason"], "asio_demarrage_precedent_inacheve");
+
+    // Sans repli armé, rien ne bouge.
+    assert_eq!(appliquer_le_repli_de_demarrage(sans.clone(), None), sans);
 }

@@ -415,7 +415,25 @@ async fn handle_event(
                 match verdict_doublon_airplay(st.devices.values(), &device, nouveau_est_raop) {
                     DoublonAirplay::Nouveau => {}
                     DoublonAirplay::Ignorer => {
+                        let mut enrichi = false;
+                        if let Some(d) = st.devices.values_mut().find(|d| {
+                            d.device_type == OutputType::Airplay
+                                && meme_appareil_airplay(d, &device)
+                        }) {
+                            enrichi = enrichir_appareil_airplay(d, &device);
+                        }
                         debug!(id = %dev_id, name = %device.name, host = %device.host, service = service_type, "mdns_dup_skipped");
+                        if enrichi
+                            && let Some(d) = st.devices.values().find(|d| {
+                                d.device_type == OutputType::Airplay
+                                    && meme_appareil_airplay(d, &device)
+                            })
+                        {
+                            let d_clone = d.clone();
+                            drop(st);
+                            let _ = event_tx.send(MdnsEvent::DeviceUpdated(d_clone)).await;
+                            return;
+                        }
                         drop(st);
                         return;
                     }
@@ -438,6 +456,7 @@ async fn handle_event(
                                 );
                                 d.port = device.port;
                             }
+                            enrichir_appareil_airplay(d, &device);
                             let repris = d.clone();
                             st.service_to_device
                                 .insert(info.get_fullname().to_string(), id_retenu.clone());
@@ -563,7 +582,20 @@ fn service_to_device(
 
     // Extract capabilities from TXT records
     let mut caps = HashMap::new();
-    if let Some(model) = info.get_property_val_str("md") {
+    if output_type == OutputType::Airplay
+        && let Some(identite) =
+            identite_airplay_annoncee(info.get_property_val_str("deviceid"), raop_mac.as_deref())
+    {
+        caps.insert(
+            CLE_IDENTITE_AIRPLAY_ANNONCEE.to_string(),
+            serde_json::Value::String(identite),
+        );
+    }
+    if let Some(model) = info
+        .get_property_val_str("model")
+        .or_else(|| info.get_property_val_str("am"))
+        .or_else(|| info.get_property_val_str("md"))
+    {
         device.model = Some(model.to_string());
         caps.insert(
             "model".to_string(),
@@ -589,8 +621,29 @@ fn service_to_device(
 
     // AirPlay version detection + features/flags parsing.
     if output_type == OutputType::Airplay {
-        let features_raw = info.get_property_val_str("features");
-        let version = if features_raw.is_some() { "2" } else { "1" };
+        // En AirPlay 2, `_airplay._tcp` porte `features` et `flags`.
+        // En RAOP (`_raop._tcp`), les enregistrements TXT utilisent des clés
+        // abrégées sur deux lettres : `ft` pour features et `sf` pour status
+        // flags (bit 9 / 0x200 = PIN requis).
+        //
+        // La simple présence de `ft` ne suffit pas à passer un appareil en
+        // AirPlay 2, car de nombreux récepteurs AirPlay 1 historiques
+        // (shairport-sync en mode classique, AirPort Express) annoncent aussi
+        // `ft`. Sur `_raop._tcp`, on ne passe en AirPlay 2 que si `ft` porte
+        // effectivement le bit AirPlay 2 (bit 40 `SupportsBufferedAudio`, #6788).
+        let features_raw = info
+            .get_property_val_str("features")
+            .or_else(|| info.get_property_val_str("ft"));
+        let parsed_features = features_raw.and_then(parse_airplay_features);
+
+        let is_v2 = if info.get_property_val_str("features").is_some() {
+            true
+        } else if let Some(bits) = parsed_features {
+            airplay_is_v2(bits)
+        } else {
+            false
+        };
+        let version = if is_v2 { "2" } else { "1" };
         device.airplay_version = Some(version.to_string());
         caps.insert("airplay".to_string(), serde_json::Value::Bool(true));
         caps.insert(
@@ -601,9 +654,7 @@ fn service_to_device(
         // Parse the AirPlay `features` bitmask (and `flags`) so callers can tell
         // whether the receiver demands a HomeKit-style pair-setup before it will
         // accept an RTSP session (Apple TV, Samsung/LG TVs, HomePod, ...).
-        if let Some(raw) = features_raw
-            && let Some(bits) = parse_airplay_features(raw)
-        {
+        if let Some(bits) = parsed_features {
             caps.insert(
                 "airplay_features".to_string(),
                 serde_json::Value::String(format!("0x{bits:016X}")),
@@ -614,10 +665,13 @@ fn service_to_device(
                 serde_json::Value::Bool(needs_pairing),
             );
         }
-        // The `flags` TXT independently signals "PIN required" (bit 9 / 0x200)
+        // The `flags` (or RAOP `sf`) TXT independently signals "PIN required" (bit 9 / 0x200)
         // on many receivers even when features are ambiguous.
-        if let Some(flags_raw) = info.get_property_val_str("flags")
-            && let Some(flags) = parse_hex_u64(flags_raw)
+        let flags_raw = info
+            .get_property_val_str("flags")
+            .or_else(|| info.get_property_val_str("sf"));
+        if let Some(flags_str) = flags_raw
+            && let Some(flags) = parse_hex_u64(flags_str)
             && flags & AIRPLAY_FLAG_PIN_REQUIRED != 0
         {
             caps.insert(
@@ -725,6 +779,12 @@ fn service_to_device(
         if let Some(fw) = info.get_property_val_str("fw") {
             caps.insert("firmware".into(), serde_json::Value::String(fw.to_string()));
         }
+        if let Some(volume) = info.get_property_val_str("vol") {
+            caps.insert(
+                "oaat_volume_type".into(),
+                serde_json::Value::String(volume.into()),
+            );
+        }
         caps.insert("oaat".into(), serde_json::Value::Bool(true));
         if let Some(ip) = info.get_property_val_str("ip") {
             device.host = ip.to_string();
@@ -745,6 +805,27 @@ fn service_to_device(
 fn mac_depuis_nom_raop(raw_name: &str) -> Option<String> {
     let pos = raw_name.find('@')?;
     super::mac::normalize_mac(&raw_name[..pos])
+}
+
+/// Capacité qui porte l'identité qu'un récepteur AirPlay ANNONCE lui-même
+/// (#6947) — à distinguer de `mac_address`, que `enrich_identity` complète par
+/// la MAC de l'interface lue dans la table ARP, la même pour tous les
+/// récepteurs d'une même machine.
+pub const CLE_IDENTITE_AIRPLAY_ANNONCEE: &str = "airplay_identite_annoncee";
+
+/// L'identité annoncée par un récepteur AirPlay, normalisée : le TXT
+/// `deviceid` de `_airplay._tcp`, sinon la MAC du nom d'instance de
+/// `_raop._tcp`. `None` si l'annonce n'en porte aucune qui soit une MAC.
+fn identite_airplay_annoncee(deviceid: Option<&str>, raop_mac: Option<&str>) -> Option<String> {
+    deviceid
+        .and_then(super::mac::normalize_mac)
+        .or_else(|| raop_mac.and_then(super::mac::normalize_mac))
+}
+
+fn identite_annoncee_de(d: &DiscoveredDevice) -> Option<&str> {
+    d.capabilities
+        .get(CLE_IDENTITE_AIRPLAY_ANNONCEE)
+        .and_then(|v| v.as_str())
 }
 
 /// Verdict du dédoublonnage AirPlay — voir l'appelant dans `handle_event`.
@@ -779,7 +860,23 @@ enum DoublonAirplay {
 /// l'adresse… ou la MAC : `_raop` la porte dans son nom d'instance,
 /// `_airplay` dans son TXT `deviceid`, et chaque service peut avoir résolu
 /// une adresse différente (IPv4 contre IPv6).
+///
+/// Quand les deux annonces portent chacune leur identité, c'est elle qui
+/// tranche, adresse ou pas : une même machine peut héberger PLUSIEURS
+/// récepteurs AirPlay, un par sortie audio, chacun avec son nom, son port et
+/// son `deviceid`. Comparés à la seule adresse, le second était pris pour un
+/// doublon du premier et n'apparaissait jamais (#6947, Verox sur Raspberry Pi
+/// à deux sorties AirPlay).
+///
+/// Limite connue : deux récepteurs qui annoncent la MÊME identité restent
+/// fusionnés. C'est le cas par défaut de shairport-sync, qui prend la MAC de
+/// l'interface pour `deviceid` ; il faut alors un `airplay_device_id` propre
+/// à chaque instance. Les distinguer aussi par port et nom d'instance est
+/// suivi dans #6960.
 fn meme_appareil_airplay(a: &DiscoveredDevice, b: &DiscoveredDevice) -> bool {
+    if let (Some(x), Some(y)) = (identite_annoncee_de(a), identite_annoncee_de(b)) {
+        return x == y;
+    }
     if a.host == b.host && !a.host.is_empty() {
         return true;
     }
@@ -822,6 +919,38 @@ fn est_ipv4(host: &str) -> bool {
 /// `SETUP` RAOP sur le port de son serveur AirPlay a toutes les raisons de le
 /// REFUSER délibérément (#2217).
 ///
+/// Enrichit l'appareil AirPlay retenu avec les informations (version 2, MAC,
+/// modèle, capacités de jumelage) apportées par une seconde annonce mDNS
+/// (`_raop._tcp` vs `_airplay._tcp`). Évite qu'une annonce RAOP arrivée en
+/// premier sans `features` ne fige l'appareil en AirPlay 1 (#6788).
+fn enrichir_appareil_airplay(d: &mut DiscoveredDevice, nouveau: &DiscoveredDevice) -> bool {
+    let mut modifie = false;
+    if d.airplay_version.as_deref() != Some("2") && nouveau.airplay_version.as_deref() == Some("2")
+    {
+        d.airplay_version = nouveau.airplay_version.clone();
+        modifie = true;
+    }
+    if d.mac_address.is_none() && nouveau.mac_address.is_some() {
+        d.mac_address = nouveau.mac_address.clone();
+        modifie = true;
+    }
+    if d.model.is_none() && nouveau.model.is_some() {
+        d.model = nouveau.model.clone();
+        modifie = true;
+    }
+    if d.manufacturer.is_none() && nouveau.manufacturer.is_some() {
+        d.manufacturer = nouveau.manufacturer.clone();
+        modifie = true;
+    }
+    for (k, v) in &nouveau.capabilities {
+        if !d.capabilities.contains_key(k) {
+            d.capabilities.insert(k.clone(), v.clone());
+            modifie = true;
+        }
+    }
+    modifie
+}
+
 /// `nouveau_est_raop` dit d'où vient l'annonce ; c'est `handle_event` qui le
 /// sait, puisque c'est lui qui porte le `service_type`.
 fn verdict_doublon_airplay<'a>(
@@ -954,10 +1083,12 @@ const AIRPLAY_FLAG_PIN_REQUIRED: u64 = 0x200;
 //
 //   bit 26 — SupportsSystemPairing / PairSetupAndMFi
 //   bit 27 — SupportsUnifiedPairSetupAndMFi
+//   bit 40 — SupportsBufferedAudio (AirPlay 2 / multi-room)
 //   bit 46 — SupportsCoreUtilsPairingAndEncryption
 //   bit 51 — SupportsUnifiedPairVerify (AirPlay 2 access control)
 const FT_BIT_SYSTEM_PAIRING: u64 = 1 << 26;
 const FT_BIT_UNIFIED_PAIR_SETUP: u64 = 1 << 27;
+pub const FT_BIT_AIRPLAY_2: u64 = 1 << 40;
 const FT_BIT_COREUTILS_PAIR_ENC: u64 = 1 << 46;
 const FT_BIT_UNIFIED_PAIR_VERIFY: u64 = 1 << 51;
 
@@ -988,6 +1119,12 @@ pub fn parse_airplay_features(raw: &str) -> Option<u64> {
         }
         None => Some(low),
     }
+}
+
+/// Détermine si un masque de fonctionnalités (`features` ou `ft`) annonce le support d'AirPlay 2.
+/// Le bit 40 (`SupportsBufferedAudio`) est le bit distinctif d'AirPlay 2.
+pub fn airplay_is_v2(features: u64) -> bool {
+    features & FT_BIT_AIRPLAY_2 != 0
 }
 
 /// Whether the parsed `features` mask indicates the receiver mandates a
@@ -1035,6 +1172,28 @@ mod tests {
         let raw = format!("0x000000FF,0x{:X}", 1u64 << 19);
         let bits = parse_airplay_features(&raw).unwrap();
         assert!(airplay_requires_pairing(bits));
+    }
+
+    #[test]
+    fn airplay_is_v2_detection() {
+        // Bit 40 (FT_BIT_AIRPLAY_2, bit 8 du mot haut) actif -> AirPlay 2
+        assert!(airplay_is_v2(FT_BIT_AIRPLAY_2));
+        assert!(airplay_is_v2(FT_BIT_AIRPLAY_2 | 0x5A7F_FFF7));
+
+        // Mot haut sans bit 40 (ex. shairport-sync classique avec 0xE ou 0x1E) -> AirPlay 1
+        assert!(!airplay_is_v2(0x5A7F_FFF7));
+        assert!(!airplay_is_v2((0x1E << 32) | 0x5A7F_FFF7));
+        assert!(!airplay_is_v2((0xE << 32) | 0x5A7F_FFF7));
+        assert!(!airplay_is_v2(0));
+
+        // Via parse_airplay_features de chaînes réelles :
+        // Mac récepteur (bit 40 actif dans 0x38174FDE)
+        let mac_bits = parse_airplay_features("0x4A7FCFD5,0x38174FDE").unwrap();
+        assert!(airplay_is_v2(mac_bits));
+
+        // Shairport-sync classique (sans bit 40)
+        let ap1_bits = parse_airplay_features("0x5A7FFFF7,0x1E").unwrap();
+        assert!(!airplay_is_v2(ap1_bits));
     }
 
     #[test]
@@ -1266,6 +1425,198 @@ mod tests {
         );
     }
 
+    fn recepteur_annonce(
+        id: &str,
+        nom: &str,
+        host: &str,
+        port: u16,
+        identite: &str,
+    ) -> DiscoveredDevice {
+        let mut d = appareil_sur_port(id, host, Some(identite), OutputType::Airplay, port);
+        d.name = nom.into();
+        d.capabilities.insert(
+            CLE_IDENTITE_AIRPLAY_ANNONCEE.to_string(),
+            serde_json::Value::String(identite.into()),
+        );
+        d
+    }
+
+    /// #6947 — une même machine (un Raspberry Pi) héberge deux récepteurs
+    /// AirPlay, un par sortie audio : même adresse, mais chacun son nom, son
+    /// port et son `deviceid`. Le second était pris pour un doublon du premier
+    /// et n'apparaissait jamais dans Tune.
+    #[test]
+    fn deux_recepteurs_airplay_d_une_meme_machine_restent_deux_sorties() {
+        let premier = recepteur_annonce(
+            "airplay-DC:A6:32:00:00:01",
+            "Sortie 1",
+            "192.168.1.60",
+            7000,
+            "DC:A6:32:00:00:01",
+        );
+        let second = recepteur_annonce(
+            "airplay-DC:A6:32:00:00:02",
+            "Sortie 2",
+            "192.168.1.60",
+            7001,
+            "DC:A6:32:00:00:02",
+        );
+        assert_eq!(
+            verdict_doublon_airplay([&premier].into_iter(), &second, ANNONCE_AIRPLAY),
+            DoublonAirplay::Nouveau,
+            "deux identités annoncées différentes à la même adresse sont deux \
+             récepteurs : le second ne doit pas être jeté comme doublon (#6947)"
+        );
+        assert_eq!(
+            verdict_doublon_airplay([&premier].into_iter(), &second, ANNONCE_RAOP),
+            DoublonAirplay::Nouveau,
+            "l'annonce `_raop` du second récepteur ne doit pas non plus déplacer \
+             le port du premier (#6947)"
+        );
+    }
+
+    /// La contre-épreuve : le `_raop` et le `_airplay` d'UN récepteur annoncent
+    /// la même identité (préfixe du nom RAOP = `deviceid`) et restent un seul
+    /// appareil.
+    #[test]
+    fn le_raop_et_l_airplay_d_un_meme_recepteur_restent_un_appareil() {
+        let airplay = recepteur_annonce(
+            "airplay-DC:A6:32:00:00:01",
+            "Sortie 1",
+            "192.168.1.60",
+            7000,
+            "DC:A6:32:00:00:01",
+        );
+        let raop = recepteur_annonce(
+            "airplay-192.168.1.60-7000",
+            "Sortie 1",
+            "192.168.1.60",
+            7000,
+            "DC:A6:32:00:00:01",
+        );
+        assert_eq!(
+            verdict_doublon_airplay([&airplay].into_iter(), &raop, ANNONCE_RAOP),
+            DoublonAirplay::Ignorer
+        );
+    }
+
+    #[test]
+    fn l_identite_annoncee_vient_du_deviceid_sinon_du_nom_raop() {
+        assert_eq!(
+            identite_airplay_annoncee(Some("dc:a6:32:00:00:02"), None).as_deref(),
+            Some("DC:A6:32:00:00:02")
+        );
+        assert_eq!(
+            identite_airplay_annoncee(None, Some("DCA632000001")).as_deref(),
+            Some("DC:A6:32:00:00:01")
+        );
+        // Un identifiant qui n'est pas une MAC n'est pas une identité : la
+        // comparaison retombe alors sur l'adresse, comme avant.
+        assert_eq!(identite_airplay_annoncee(Some("opaque"), None), None);
+        assert_eq!(identite_airplay_annoncee(None, None), None);
+    }
+
+    #[test]
+    fn enrichir_appareil_airplay_promut_version_et_capacites() {
+        let mut d1 = appareil(
+            "airplay-80:0A:80:5D:4D:EE",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+        );
+        d1.airplay_version = Some("1".to_string());
+
+        let mut d2 = appareil(
+            "airplay-192.168.1.50-7000",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+        );
+        d2.airplay_version = Some("2".to_string());
+        d2.model = Some("Mac14,2".to_string());
+        d2.capabilities.insert(
+            "airplay_requires_pairing".to_string(),
+            serde_json::Value::Bool(true),
+        );
+
+        assert!(enrichir_appareil_airplay(&mut d1, &d2));
+        assert_eq!(d1.airplay_version.as_deref(), Some("2"));
+        assert_eq!(d1.model.as_deref(), Some("Mac14,2"));
+        assert_eq!(
+            d1.capabilities.get("airplay_requires_pairing"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        // Ré-enrichissement sans nouvelle information ne modifie rien
+        assert!(!enrichir_appareil_airplay(&mut d1, &d2));
+    }
+
+    #[test]
+    fn appareil_raop_avec_ft_sans_bit_airplay2_reste_en_version_1() {
+        let properties = [
+            ("tp", "UDP"),
+            ("sm", "false"),
+            ("sv", "false"),
+            ("ek", "1"),
+            ("et", "0,1"),
+            ("cn", "0,1"),
+            ("ch", "2"),
+            ("ss", "16"),
+            ("sr", "44100"),
+            ("vn", "3"),
+            ("txtvers", "1"),
+            // ft classique sans bit 40 (par exemple shairport-sync classique ou AirPort Express)
+            ("ft", "0x5A7FFFF7,0x1E"),
+            ("sf", "0x4"),
+            ("am", "AirPort4,107"),
+        ];
+        let svc = ServiceInfo::new(
+            AIRPLAY_SERVICE,
+            "Salon",
+            "salon.local.",
+            "192.168.1.50",
+            5000,
+            &properties[..],
+        )
+        .expect("création ServiceInfo RAOP")
+        .as_resolved_service();
+
+        let device = service_to_device(&svc, OutputType::Airplay, 5000);
+        assert_eq!(device.airplay_version.as_deref(), Some("1"));
+        assert_eq!(device.model.as_deref(), Some("AirPort4,107"));
+    }
+
+    #[test]
+    fn appareil_raop_avec_ft_portant_bit_airplay2_passe_en_version_2() {
+        let properties = [
+            ("tp", "UDP"),
+            ("vn", "65.5"),
+            ("txtvers", "1"),
+            // ft macOS / AirPlay 2 avec bit 40 (0x100 dans le mot haut)
+            ("ft", "0x4A7FCFD5,0x38174FDE"),
+            ("sf", "0x204"),
+            ("model", "Mac14,2"),
+        ];
+        let svc = ServiceInfo::new(
+            AIRPLAY_SERVICE,
+            "MacBook Pro de Test",
+            "macbook.local.",
+            "192.168.1.50",
+            7000,
+            &properties[..],
+        )
+        .expect("création ServiceInfo RAOP AirPlay 2")
+        .as_resolved_service();
+
+        let device = service_to_device(&svc, OutputType::Airplay, 7000);
+        assert_eq!(device.airplay_version.as_deref(), Some("2"));
+        assert_eq!(device.model.as_deref(), Some("Mac14,2"));
+        assert_eq!(
+            device.capabilities.get("airplay_requires_pairing"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
     #[test]
     fn un_appareil_d_un_autre_protocole_ne_compte_pas_comme_doublon() {
         // La zone DLNA « Salon » du même hôte n'est pas un doublon AirPlay.
@@ -1408,5 +1759,42 @@ mod tests {
             legacy_device_id(OutputType::Bluos, "192.168.1.23", 11000),
             format!("{}-192.168.1.23-11000", OutputType::Bluos),
         );
+    }
+}
+
+#[cfg(all(test, feature = "oaat"))]
+mod volume_7333_tests {
+    use super::*;
+    use crate::outputs::{OutputTarget, oaat::OaatOutput};
+
+    #[test]
+    fn le_txt_du_service_oaat_parvient_aux_capacites_de_sortie_7333() {
+        for volume in ["fixed", "none"] {
+            let properties = [
+                ("id", "7333-fictif"),
+                ("name", "Banc 7333"),
+                ("vol", volume),
+            ];
+            let info = ServiceInfo::new(
+                OAAT_SERVICE,
+                "Banc7333",
+                "banc7333.local.",
+                "127.0.0.1",
+                9740,
+                &properties[..],
+            )
+            .unwrap()
+            .as_resolved_service();
+            let dev = service_to_device(&info, OutputType::Oaat, 9740);
+            let output = OaatOutput::new(dev.name, dev.host, dev.port, dev.id).avec_volume_annonce(
+                dev.capabilities
+                    .get("oaat_volume_type")
+                    .and_then(|v| v.as_str()),
+            );
+            assert!(
+                !output.capabilities().can_set_volume,
+                "#7333 : le TXT {volume} s'est perdu pendant la découverte"
+            );
+        }
     }
 }

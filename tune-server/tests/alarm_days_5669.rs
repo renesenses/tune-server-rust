@@ -243,8 +243,11 @@ async fn i5669_tester_un_reveil_sur_une_zone_qui_joue_ne_coupe_rien() {
         "#5669 : l'essai sur une zone qui joue doit être refusé — {v}"
     );
     assert_eq!(v["error"], "zone_en_lecture", "{v}");
+    // #7077 — la phrase suit la langue de l'interface (anglais sans
+    // Accept-Language) et dit d'où elle vient.
+    assert_eq!(v["message_key"], "api.alarm.zoneBusy", "{v}");
     assert_eq!(
-        v["message"], "La zone joue déjà : le test n'a pas été lancé",
+        v["message"], "The zone is already playing: the test was not started.",
         "{v}"
     );
     assert_eq!(v["zones"], json!([zone]), "{v}");

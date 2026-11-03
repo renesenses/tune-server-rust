@@ -35,6 +35,18 @@ pub struct QueueSnapshot {
     pub shuffle: bool,
     /// Playback position in milliseconds within the current track.
     pub position_ms: i64,
+    /// #6526 — vrai quand l'instantané vient d'un serveur dont l'aléatoire
+    /// réordonne la file elle-même : la file en base est alors DÉJÀ l'ordre
+    /// joué. Absent (faux) des instantanés plus anciens, dont l'aléatoire
+    /// était un tirage caché perdu au redémarrage — la restauration mélange
+    /// alors la suite (`melange::restaurer_au_demarrage`).
+    #[serde(default)]
+    pub melange_dans_la_file: bool,
+    /// #6526 — l'ordre de la file d'avant l'aléatoire, en identifiants de
+    /// ligne, pour pouvoir le rétablir après un redémarrage. Vide = rien à
+    /// rétablir.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ordre_d_origine: Vec<i64>,
 }
 
 /// One entry of the ordered unified queue snapshot (local or streaming).
@@ -59,6 +71,49 @@ pub struct QueueSnapshotItem {
     /// antérieurs, d'où le défaut.
     #[serde(default)]
     pub artist_ref: Option<String>,
+    /// Le conteneur de la ligne (#6466, migration 128) : sans lui, une file
+    /// restaurée rangerait ses titres sous le seul contexte de session.
+    /// Absent des instantanés antérieurs, d'où le défaut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contexte: Option<ContexteSauvegarde>,
+}
+
+/// Le conteneur d'une ligne de file dans l'instantané (#6466).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContexteSauvegarde {
+    pub nature: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
+    pub titre: Option<String>,
+    #[serde(default)]
+    pub pochette: Option<String>,
+}
+
+impl From<crate::db::contexte_de_file::ContexteDeFile> for ContexteSauvegarde {
+    fn from(c: crate::db::contexte_de_file::ContexteDeFile) -> Self {
+        Self {
+            nature: c.nature,
+            id: c.id,
+            service: c.service,
+            titre: c.titre,
+            pochette: c.pochette,
+        }
+    }
+}
+
+impl From<ContexteSauvegarde> for crate::db::contexte_de_file::ContexteDeFile {
+    fn from(c: ContexteSauvegarde) -> Self {
+        Self {
+            nature: c.nature,
+            id: c.id,
+            service: c.service,
+            titre: c.titre,
+            pochette: c.pochette,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -109,6 +164,17 @@ fn queue_file_path(db_path: &str, zone_id: i64) -> PathBuf {
 ///   réapparaître au redémarrage une file que l'utilisateur a effacée, le
 ///   défaut symétrique et le plus insidieux des deux.
 pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_state: &ZoneState) {
+    save_queue_avec_ordre_d_origine(db, db_path, zone_id, zone_state, &[]);
+}
+
+/// [`save_queue`], avec l'ordre d'origine retenu par l'aléatoire (#6526).
+pub fn save_queue_avec_ordre_d_origine(
+    db: &Arc<dyn DbBackend>,
+    db_path: &str,
+    zone_id: i64,
+    zone_state: &ZoneState,
+    ordre_d_origine: &[i64],
+) {
     let repo = PlayQueueRepo::with_backend(db.clone());
 
     // Les trois lectures d'abord, AVANT de toucher au disque : un instantané ne
@@ -166,9 +232,23 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
 
     // The authoritative ordered unified list (local + streaming interleaved by
     // position). Preferred on restore. Lue plus haut, avec son erreur.
+    // #6466 — le conteneur de chaque ligne, dans l'ordre de la file. Pris
+    // seulement s'il couvre la file entière : un décalage prêterait à une
+    // ligne le conteneur de sa voisine.
+    let contextes = crate::db::contexte_de_file::contextes_de_la_file(db, zone_id);
+    let contextes: Vec<Option<ContexteSauvegarde>> = if contextes.len() == entries.len() {
+        contextes
+            .into_iter()
+            .map(|(_, _, c)| c.map(Into::into))
+            .collect()
+    } else {
+        vec![None; entries.len()]
+    };
     let items: Vec<QueueSnapshotItem> = entries
         .iter()
-        .map(|e| QueueSnapshotItem {
+        .zip(contextes)
+        .map(|(e, contexte)| QueueSnapshotItem {
+            contexte,
             track_id: e.track_id,
             source: e.source.clone(),
             source_id: e.source_id.clone(),
@@ -203,6 +283,12 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
         repeat_mode: repeat_mode.to_string(),
         shuffle: zone_state.shuffle,
         position_ms: zone_state.position_ms,
+        melange_dans_la_file: true,
+        ordre_d_origine: if zone_state.shuffle {
+            ordre_d_origine.to_vec()
+        } else {
+            Vec::new()
+        },
     };
 
     let path = queue_file_path(db_path, zone_id);
@@ -459,6 +545,28 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) -> BilanRestau
             repo.set_current_pos(zone_id, snapshot.current_position)
                 .ok();
         }
+        // #6466 — chaque ligne retrouve son conteneur.
+        if snapshot.items.iter().any(|it| it.contexte.is_some()) {
+            crate::db::contexte_de_file::poser_par_appariement(
+                db,
+                zone_id,
+                snapshot
+                    .items
+                    .iter()
+                    .map(|it| {
+                        (
+                            it.track_id,
+                            if it.track_id.is_some() {
+                                None
+                            } else {
+                                it.source_id.clone()
+                            },
+                            it.contexte.clone().map(Into::into),
+                        )
+                    })
+                    .collect(),
+            );
+        }
 
         restored += 1;
         let restaurees = outcome.inserted();
@@ -569,6 +677,8 @@ mod tests {
             repeat_mode: "all".into(),
             shuffle: true,
             position_ms: 45_000,
+            melange_dans_la_file: true,
+            ordre_d_origine: vec![3, 1, 2],
         };
 
         let json = serde_json::to_string_pretty(&snapshot).unwrap();
@@ -581,6 +691,22 @@ mod tests {
         assert_eq!(restored.repeat_mode, "all");
         assert!(restored.shuffle);
         assert_eq!(restored.position_ms, 45_000);
+        assert!(restored.melange_dans_la_file);
+        assert_eq!(restored.ordre_d_origine, vec![3, 1, 2]);
+    }
+
+    /// #6526 — un instantané écrit AVANT le mélange dans la file se relit
+    /// toujours, et se reconnaît : `melange_dans_la_file` vaut faux, ce qui
+    /// fait mélanger la suite au démarrage au lieu de jouer dans l'ordre sous
+    /// un bouton « aléatoire » allumé.
+    #[test]
+    fn un_instantane_d_avant_le_melange_dans_la_file_se_reconnait() {
+        let ancien = r#"{"zone_id":4,"local_track_ids":[1,2],"current_position":0,
+            "streaming_tracks":[],"repeat_mode":"off","shuffle":true,"position_ms":0}"#;
+        let s: QueueSnapshot = serde_json::from_str(ancien).unwrap();
+        assert!(s.shuffle);
+        assert!(!s.melange_dans_la_file);
+        assert!(s.ordre_d_origine.is_empty());
     }
 
     #[test]

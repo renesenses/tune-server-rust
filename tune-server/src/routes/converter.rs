@@ -383,6 +383,7 @@ async fn start_job(
     // que lorsque l'appelant demande une destination, c'est-à-dire lorsque
     // `/start` devient une route d'écriture disque (#2944).
     admin: Result<crate::auth::RequireAdmin, (StatusCode, Json<Value>)>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<StartJobRequest>,
 ) -> Result<axum::response::Response, AppError> {
     // Premium gate: batch converter requires Premium
@@ -394,7 +395,9 @@ async fn start_job(
     {
         return Ok(resp);
     }
-    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "converter") {
+    if let Err(response) =
+        crate::premium_audio_plugins::require_installed(&state, "converter", &headers)
+    {
         return Ok(response);
     }
 

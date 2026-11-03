@@ -21,13 +21,39 @@ use tracing::{debug, warn};
 
 const CACHE_KEY: &str = "ambiance_query_translations";
 const CACHE_MAX: usize = 200;
-const PROMPT: &str = "Translate this music-mood search query to English. Reply with ONLY the \
+/// La consigne de traduction, publique pour qu'un autre fournisseur (le
+/// greffon Assistant IA, étape 2) pose exactement la même question.
+pub const PROMPT: &str = "Translate this music-mood search query to English. Reply with ONLY the \
 translation, nothing else. If it is already in English, reply with it unchanged.";
 
 /// Traduit `query` en anglais via la clé API configurée par l'utilisateur.
 /// `None` = pas de clé, échec réseau, ou réponse inutilisable — l'appelant
 /// doit alors employer la requête brute.
+///
+/// Le chemin HISTORIQUE, qui lit une clé en clair dans `settings`. Un serveur
+/// qui porte l'Assistant IA passe par [`translate_query_avec`] et le
+/// fournisseur de l'assistant (coffre, plafond) : ce chemin-ci ne sert plus
+/// qu'aux binaires compilés sans lui.
 pub async fn translate_query(settings: &SettingsRepo, query: &str) -> Option<String> {
+    translate_query_avec(settings, query, |q| async move {
+        call_provider(settings, &q).await
+    })
+    .await
+}
+
+/// [`translate_query`], avec le fournisseur de l'APPELANT : `appeler` reçoit
+/// la requête nettoyée (à poser avec [`PROMPT`]) et rend la traduction brute,
+/// ou `None`. Le glossaire des genres, le cache et le contrôle de la réponse
+/// restent ceux d'ici : seul l'appel change de main.
+pub async fn translate_query_avec<F, Fut>(
+    settings: &SettingsRepo,
+    query: &str,
+    appeler: F,
+) -> Option<String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
     let q = query.trim();
     if q.is_empty() {
         return None;
@@ -44,7 +70,7 @@ pub async fn translate_query(settings: &SettingsRepo, query: &str) -> Option<Str
         return Some(hit);
     }
 
-    let translated = call_provider(settings, q).await?;
+    let translated = appeler(q.to_string()).await?;
     let t = translated.trim().trim_matches('"').trim().to_string();
     if t.is_empty() || t.len() > 300 {
         // Une « traduction » vide ou bavarde (le modèle a répondu autre chose
@@ -57,86 +83,17 @@ pub async fn translate_query(settings: &SettingsRepo, query: &str) -> Option<Str
     Some(t)
 }
 
-/// Noms de genre français (repliés : minuscules, sans accents, espaces
-/// simples, tirets en espaces) → graphie anglaise de la hiérarchie des genres
-/// (`library::genre_tree`). Seuls les noms dont la forme française DIFFÈRE
-/// sont listés ; un nom déjà anglais passe par `genre_tree::nom_canonique`.
+/// Le nom anglais canonique d'une requête qui est EXACTEMENT un nom de genre,
+/// dans une des langues de la table versionnée des genres équivalents
+/// (`library/genres_equivalents.json`, #3836), quelle que soit sa casse.
+/// `None` pour tout le reste.
 ///
 /// Correspondance de la requête ENTIÈRE, jamais d'un fragment : « jazz doux
 /// pour le soir » n'est pas un nom de genre et garde son chemin (clé IA ou
-/// requête brute). Un mot qui est aussi une humeur (« romantique ») n'y est
-/// pas : le remplacer par un genre changerait le sens de la recherche.
-const GENRES_EN_FRANCAIS: &[(&str, &str)] = &[
-    ("rock progressif", "Progressive Rock"),
-    ("rock progressive", "Progressive Rock"),
-    ("rock prog", "Progressive Rock"),
-    ("rock alternatif", "Alternative Rock"),
-    ("rock independant", "Indie Rock"),
-    ("rock inde", "Indie Rock"),
-    ("rock classique", "Classic Rock"),
-    ("rock psychedelique", "Psychedelic Rock"),
-    ("rock garage", "Garage Rock"),
-    ("post rock", "Post-Rock"),
-    ("metal progressif", "Progressive Metal"),
-    ("metal symphonique", "Symphonic Metal"),
-    ("jazz vocal", "Vocal Jazz"),
-    ("jazz latin", "Latin Jazz"),
-    ("jazz manouche", "Gypsy Jazz"),
-    ("musique electronique", "Electronic"),
-    ("electronique", "Electronic"),
-    ("musique classique", "Classical"),
-    ("classique", "Classical"),
-    ("musique baroque", "Baroque"),
-    ("musique contemporaine", "Contemporary Classical"),
-    ("opera", "Opera"),
-    ("musique de chambre", "Chamber Music"),
-    ("musique orchestrale", "Orchestral"),
-    ("musique chorale", "Choral"),
-    ("minimalisme", "Minimalism"),
-    ("musique du monde", "World"),
-    ("musiques du monde", "World"),
-    ("bande originale", "Soundtrack"),
-    ("musique de film", "Film Score"),
-    ("musique de jeu video", "Video Game"),
-    ("comedie musicale", "Musical"),
-    ("chanson francaise", "French Chanson"),
-    ("celtique", "Celtic"),
-    ("folk independant", "Indie Folk"),
-    ("pop independante", "Indie Pop"),
-    ("blues electrique", "Electric Blues"),
-    ("musique arabe", "Arabic"),
-    ("musique classique indienne", "Indian Classical"),
-    ("rai", "Raï"),
-];
-
-/// Replie une saisie pour la comparer au glossaire : minuscules, accents
-/// retirés, tirets et soulignés en espaces, espaces simples.
-fn replier(q: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
-    let sans_accents: String = q
-        .nfkd()
-        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
-        .collect();
-    sans_accents
-        .to_lowercase()
-        .replace(['-', '_'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Le nom anglais canonique d'une requête qui est EXACTEMENT un nom de genre,
-/// français ou anglais, quelle que soit sa casse. `None` pour tout le reste.
+/// requête brute). Un mot qui est aussi une humeur (« romantique ») n'est pas
+/// dans la table : le remplacer par un genre changerait le sens de la recherche.
 pub fn nom_de_genre_en_anglais(q: &str) -> Option<&'static str> {
-    if let Some(nom) = crate::library::genre_tree::nom_canonique(q) {
-        return Some(nom);
-    }
-    let replie = replier(q);
-    GENRES_EN_FRANCAIS
-        .iter()
-        .find(|(fr, _)| *fr == replie)
-        .map(|(_, en)| *en)
-        .or_else(|| crate::library::genre_tree::nom_canonique(&replie))
+    crate::library::genres_equivalents::canonique(q)
 }
 
 /// Les cles API que la traduction sait employer, dans l'ordre de preference :

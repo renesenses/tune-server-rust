@@ -26,17 +26,42 @@
 //! le rétablissement n'aurait rien à rejouer, et le transfert garde
 //! l'ancienne conduite.
 use super::PlaybackOrchestrator;
-use crate::outputs::OutputCommandResult;
+use crate::outputs::OutputCommandError;
 use crate::playback::{NowPlaying, PlayState};
 use tracing::{info, warn};
+
+/// Le lancement de la cible peut échouer avant une commande de transport.
+/// Le distinguer garde les refus Pause/Seek existants sans inventer une
+/// commande « Play » dans le contrat des sorties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErreurDeTransfert {
+    Lancement(String),
+    Commande(OutputCommandError),
+}
+
+impl From<OutputCommandError> for ErreurDeTransfert {
+    fn from(erreur: OutputCommandError) -> Self {
+        Self::Commande(erreur)
+    }
+}
+impl std::fmt::Display for ErreurDeTransfert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lancement(message) => f.write_str(message),
+            Self::Commande(erreur) => std::fmt::Display::fmt(erreur, f),
+        }
+    }
+}
+impl std::error::Error for ErreurDeTransfert {}
 
 impl PlaybackOrchestrator {
     /// Lance un transfert sur l'appareil `did` de la zone cible.
     ///
     /// `queue_position` : l'index de la piste dans la file (déjà copiée).
     /// `source_position_ms` et `source_en_pause` : l'état de la source au
-    /// moment du transfert. Un échec de lancement n'est que journalisé (la
-    /// file est copiée, l'auditeur relance) ; un `Seek` refusé aussi.
+    /// moment du transfert. Un échec de lancement remonte à l'appelant :
+    /// celui-ci ne doit ni annoncer le transfert ni arrêter sa source.
+    /// Un Seek refusé garde la lecture de la cible depuis le début.
     pub async fn transferer_sur_l_appareil(
         &self,
         zone_id: i64,
@@ -45,7 +70,7 @@ impl PlaybackOrchestrator {
         np: &NowPlaying,
         source_position_ms: u64,
         source_en_pause: bool,
-    ) -> OutputCommandResult<()> {
+    ) -> Result<(), ErreurDeTransfert> {
         if source_en_pause
             && self
                 .poser_le_transfert_en_pause(zone_id, did, np, source_position_ms)
@@ -53,14 +78,50 @@ impl PlaybackOrchestrator {
         {
             return Ok(());
         }
-        match self.play_from_queue(zone_id, queue_position).await {
-            Ok(_) => {
+        // #6470 (FabienM, fil 2302 point 16) — une RADIO ou un épisode de
+        // PODCAST ne vit pas dans la file : `play_from_queue` lançait sur la
+        // cible la file qu'elle avait déjà, et la cible jouait (ou affichait)
+        // son dernier morceau au lieu du flux transféré. Le flux est relancé
+        // tel quel sur l'appareil cible.
+        let flux = np.source_id.as_deref().filter(|s| !s.is_empty());
+        let direct = matches!(np.source.as_str(), "radio" | "podcast") && flux.is_some();
+        // #6466 (point 15) — la piste transférée a déjà son écoute, écrite
+        // avec la zone d'origine : la relancer sur la cible ne la réécrit pas.
+        // Les titres suivants, eux, s'écriront avec la zone cible.
+        let lancement = if direct {
+            self.play_transfere_sans_historique(super::PlayRequest {
+                zone_id,
+                output_device_id: Some(did.to_string()),
+                source: Some(np.source.clone()),
+                source_id: flux.map(str::to_string),
+                title: Some(np.title.clone()),
+                artist_name: np.artist_name.clone(),
+                album_title: np.album_title.clone(),
+                cover_url: np.cover_path.clone(),
+                duration_ms: Some(np.duration_ms).filter(|d| *d > 0),
+                ..Default::default()
+            })
+            .await
+        } else {
+            self.play_from_queue_sans_historique(zone_id, queue_position)
+                .await
+        };
+        // `play` peut rendre Ok avec un refus porté par PlayResult : ne pas
+        // le perdre, pas plus qu'un Err (cible absente/ignorée, par exemple).
+        let lancement = lancement.and_then(|resultat| match resultat.sortie_refusee() {
+            Some(message) => Err(message.to_owned()),
+            None => Ok(()),
+        });
+        match lancement {
+            Ok(()) => {
                 // Reprendre à la position de la source. Sous 3 s on repart du
                 // début (même seuil que la route seek) — inutile de chercher
                 // dans un flux qui vient de démarrer.
                 // #4442 — pas un `seek` nu dans la foulée du `Play` : voir
-                // `reprendre_la_position_transferee`.
+                // `reprendre_la_position_transferee`. Une radio en direct n'a
+                // pas de position à reprendre.
                 if source_position_ms > 3000
+                    && np.source != "radio"
                     && let Err(error) = self
                         .reprendre_la_position_transferee(
                             zone_id,
@@ -75,7 +136,7 @@ impl PlaybackOrchestrator {
                     // déjà, depuis le début de la piste. Tout autre échec
                     // remonte.
                     if Self::message_deplacement_refuse(&error).is_none() {
-                        return Err(error);
+                        return Err(error.into());
                     }
                     warn!(
                         target_zone = zone_id,
@@ -93,6 +154,7 @@ impl PlaybackOrchestrator {
             }
             Err(e) => {
                 warn!(target_zone = zone_id, error = %e, "transfer_play_on_target_failed");
+                return Err(ErreurDeTransfert::Lancement(e));
             }
         }
         Ok(())
@@ -284,6 +346,37 @@ mod tests {
             !orch.prendre_le_transfert_en_pause(zone_id),
             "le constat ne sert qu'une fois"
         );
+    }
+
+    /// #6470 (fil 2302 point 16) — une RADIO transférée joue sur la cible,
+    /// et non la file que la cible avait déjà. Avant : « le transfert ne se
+    /// fait pas et Tune affiche juste le dernier morceau joué ».
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn une_radio_transferee_joue_le_flux_et_pas_la_file_de_la_cible_6470() {
+        let (orch, zone_id, _) = banc().await;
+        let radio = NowPlaying {
+            title: "Radio Grenouille".into(),
+            source: "radio".into(),
+            source_id: Some("http://127.0.0.1:9/grenouille.mp3".into()),
+            stream_id: Some("session-de-la-source".into()),
+            ..Default::default()
+        };
+        orch.transferer_sur_l_appareil(zone_id, APPAREIL, 0, &radio, 0, false)
+            .await
+            .expect("le transfert aboutit");
+        let titres = {
+            let arc = { orch.outputs.lock().await.get(APPAREIL) }.unwrap();
+            let guard = arc.lock().await;
+            let mock = guard.as_any().downcast_ref::<MockOutput>().unwrap();
+            mock.play_titles().await
+        };
+        assert_eq!(
+            titres,
+            vec!["Radio Grenouille".to_string()],
+            "la cible a lancé sa propre file au lieu de la radio transférée"
+        );
+        let joue = orch.playback.get_state(zone_id).await.now_playing.unwrap();
+        assert_eq!(joue.source, "radio");
     }
 
     /// Une source qui JOUE garde l'ancienne conduite : la cible est lancée.

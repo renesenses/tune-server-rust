@@ -11,6 +11,9 @@ use tracing::{debug, info, warn};
 
 // #6130 — journal de contexte et détecteur de bruit de la voie conversion.
 mod bruit_suspect_6130;
+// #6255 — le bruit suspect vu depuis un lecteur réseau (reprise hors trame,
+// décodage décalé, en-tête au milieu).
+mod bruit_suspect_reseau;
 
 use tune_core::http::streamer::{
     ICY_METAINT, ReresolveFn, SharedSessions, StreamInfo, StreamSession, build_icy_metadata,
@@ -77,14 +80,45 @@ struct RadioConsumerGuard {
 /// sans exception. Aucun des renderers de #1689 ne le porte, et si un appareil
 /// inconnu s'annonçait ainsi, il retomberait simplement sur le comportement
 /// d'avant #1689 — chunké — et non sur une panne nouvelle.
+///
+/// ## #5975 — sauf les navigateurs qui lisent par CoreMedia
+///
+/// Safari (macOS) et tout navigateur iOS (Safari, Chrome « CriOS », Firefox
+/// « FxiOS »…) confient l'élément `<audio>` à WebKit, donc à CoreMedia. Ils
+/// ouvrent chaque connexion par une sonde `Range: bytes=0-1` et exigent un
+/// 206 : le chunké est refusé, la connexion tombe à `connected_secs=0` et la
+/// radio reste muette (Alex Campbell, Safari 18.6, fils 2178 et 2246). C'est
+/// le rejet d'AVPlayer que #6549 a réglé sur la voie « fichier borné » : ces
+/// agents la prennent aussi. Chrome et Edge disent « Safari » dans leur agent,
+/// mais lisent par leur propre pile et gardent le chunké, comme Firefox.
 fn accepts_chunked_live_stream(user_agent: Option<&str>) -> bool {
     match user_agent {
         Some(ua) if !ua.is_empty() => {
             let ua = ua.to_ascii_lowercase();
+            if lit_par_coremedia(&ua) {
+                return false;
+            }
             ua.contains("lavf") || ua.contains("mozilla")
         }
         _ => true,
     }
+}
+
+/// Un agent de navigateur WebKit dont le média passe par CoreMedia : tout
+/// navigateur iOS / iPadOS, ou Safari sur macOS (sans Chrome, Chromium, Edge
+/// ni Opera dans l'agent). `ua` est déjà en minuscules.
+fn lit_par_coremedia(ua: &str) -> bool {
+    if !ua.contains("applewebkit") {
+        return false;
+    }
+    if ua.contains("iphone") || ua.contains("ipad") || ua.contains("ipod") {
+        return true;
+    }
+    ua.contains("safari")
+        && ua.contains("macintosh")
+        && !["chrome", "chromium", "edg/", "opr/"]
+            .iter()
+            .any(|autre| ua.contains(autre))
 }
 
 /// Entrelacer les blocs de métadonnées ICY dans un morceau du corps.
@@ -293,7 +327,7 @@ pub async fn handle_head(
     } else if let Some(size) = file_size {
         headers.insert(
             "transferMode.dlna.org",
-            HeaderValue::from_static("Interactive"),
+            HeaderValue::from_static(mode_de_transfert_fichier(&req_headers)),
         );
         headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
         headers.insert(
@@ -709,6 +743,45 @@ pub async fn handle_stream(
         }
     }
 
+    // ── #6990 — la reprise `bytes=N-` d'un flux chunké, à l'octet ──
+    //
+    // TIDAL AAC 320 → WAV vers un Wattson Emerson Digital : crépitements,
+    // quand TIDAL FLAC → WAV (un FICHIER, `Range` honoré) joue juste. Le
+    // canal AAC (`produire_le_canal_aac`) n'a pas de durée, donc pas de
+    // `wav_length`, et la reprise depuis la retenue ci-dessus ne le voyait
+    // pas : un renderer qui ferme après N octets puis revient avec
+    // `bytes=N-` recevait la suite du TUYAU — tout ce que la connexion
+    // précédente avait tiré sans que le renderer le lise était sauté, soit un
+    // saut dans le signal à chaque reprise. La retenue est tenue sur ce flux
+    // comme sur l'autre : une reprise qui y tombe est servie à l'octet. Rien
+    // d'autre ne change : pas de longueur annoncée, toujours un 200 chunké.
+    if wav_length.is_none()
+        && retenue_possible
+        && reprise_exacte.is_none()
+        && let Some(n) = reprise_candidate.filter(|n| *n >= seuil_de_reprise)
+    {
+        let (retenue_debut, retenue_fin) = session.etendue_retenue();
+        if n >= retenue_debut && n < retenue_fin {
+            reprise_exacte = Some(n);
+            info!(
+                stream_id,
+                reprise = n,
+                retenue_debut,
+                retenue_fin,
+                "reprise_rejouee_depuis_la_retenue — flux chunké : la reprise tombe dans ce que \
+                 le tuyau a déjà rendu ; servie à l'octet (#6990)"
+            );
+        } else if n < retenue_fin {
+            warn!(
+                stream_id,
+                reprise = n,
+                retenue_debut,
+                retenue_fin,
+                "reprise_hors_retenue — flux chunké : la reprise précède la retenue, la suite \
+                 du tuyau part sous l'offset demandé (#6990)"
+            );
+        }
+    }
     let finite_range_start = range_demande.filter(|s| longueur.is_none_or(|len| *s < len));
     let use_partial = finite_range_start.is_some() && longueur.is_some();
     // ── La borne de fin d'un `Range: bytes=N-M` ──
@@ -768,19 +841,58 @@ pub async fn handle_stream(
     // honore ce Range en n'émettant que la fin de l'en-tête, puis le direct.
     // Une radio n'a pas de position — au-delà de l'en-tête, « reprendre à N »
     // ne peut vouloir dire que « donne-moi le direct maintenant ».
+    //
+    // ── #6453 — la sonde `bytes=0-1` d'AVPlayer ──
+    //
+    // « Ce téléphone » (iPhone, rc6, FIP) : AVPlayer ouvre TOUT média
+    // progressif par `Range: bytes=0-1`. Ce bloc ne lisait que le début de la
+    // plage : à `start == 0`, il répondait 200 + `Content-Length: 2147483647`,
+    // et CoreMedia abandonnait aussitôt (`CoreMediaErrorDomain -12939`) — le
+    // même rejet que #6064 sur la voie mandataire. La borne de fin d'une plage
+    // `bytes=N-M` est donc honorée ici aussi : 206 `bytes N-M/<total>`, M−N+1
+    // octets, puis le corps s'arrête (`borner_le_corps`). Une sonde de deux
+    // octets ne rend que le début de l'en-tête WAV et lâche le corps AVANT
+    // d'avoir réclamé le canal PCM : le direct de la connexion suivante n'en
+    // perd rien. Une plage OUVERTE (`bytes=0-`, `bytes=N-`) et l'absence de
+    // `Range` gardent exactement leur réponse d'avant : seule une plage
+    // FERMÉE (`bytes=N-M`) change.
     let mut bounded_status = StatusCode::OK;
     let mut header_skip: usize = 0;
+    let mut limite_bornee: Option<u64> = None;
+    // Reprise d'une radio bornée AU-DELÀ de l'en-tête : son offset, pour la
+    // phase de trame (voir `remplissage_de_phase`).
+    let mut reprise_bornee: Option<u64> = None;
     if bounded_live {
         let total = tune_core::http::streamer::LIVE_BOUNDED_TOTAL_LEN;
         headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-        let start = req_headers
-            .get("Range")
-            .and_then(|v| v.to_str().ok())
+        let range_brut = req_headers.get("Range").and_then(|v| v.to_str().ok());
+        let start = range_brut
             .and_then(parse_range_start)
             .filter(|s| *s < total);
-        match start {
-            Some(start) if start > 0 => {
+        // Borne de fin d'une plage fermée, ramenée au dernier octet : la
+        // seconde requête d'AVPlayer est `bytes=0-2147483646`, le fichier
+        // entier, et elle attend elle aussi son 206.
+        let fin = range_brut
+            .and_then(parse_range_end)
+            .zip(start)
+            .filter(|(fin, debut)| *fin >= *debut)
+            .map(|(fin, _)| fin.min(total - 1));
+        match (start, fin) {
+            (Some(start), Some(fin)) => {
                 header_skip = start.min(44) as usize;
+                let longueur = fin - start + 1;
+                headers.insert("Content-Length", HeaderValue::from(longueur));
+                headers.insert(
+                    "Content-Range",
+                    HeaderValue::from_str(&format!("bytes {start}-{fin}/{total}")).unwrap(),
+                );
+                bounded_status = StatusCode::PARTIAL_CONTENT;
+                limite_bornee = (fin < total - 1).then_some(longueur);
+                reprise_bornee = (start > 44).then_some(start);
+            }
+            (Some(start), None) if start > 0 => {
+                header_skip = start.min(44) as usize;
+                reprise_bornee = (start > 44).then_some(start);
                 headers.insert("Content-Length", HeaderValue::from(total - start));
                 headers.insert(
                     "Content-Range",
@@ -796,6 +908,7 @@ pub async fn handle_stream(
             stream_id,
             total,
             range_start = ?start,
+            range_fin = ?fin,
             header_skip,
             "radio_bounded_live_response — renderer refuses chunked, serving the file contract"
         );
@@ -912,6 +1025,22 @@ pub async fn handle_stream(
             is_wav && !has_icy,
         )),
     });
+    // #6255 — posée par le corps quand la reprise quitte la retenue.
+    let jonction = bruit_suspect_reseau::Jonction::default();
+    let jonction_du_corps = jonction.clone();
+    let observateur_reseau = (is_wav && wav_header_included && !has_icy)
+        .then(|| {
+            bruit_suspect_reseau::ObservateurReseau::nouveau(
+                &session,
+                "conversion",
+                user_agent.as_deref().unwrap_or("-"),
+                range_hdr,
+                reprise_exacte.unwrap_or_else(|| range_demande.filter(|s| *s >= 44).unwrap_or(0)),
+                bruit_suspect_reseau::EN_TETE_CANONIQUE,
+                Some(jonction),
+            )
+        })
+        .flatten();
     let data_ready = session.data_ready.clone();
     // Les six `yield` de cette branche — en-tete WAV, blocs ICY, morceaux de
     // radio, deux vidages de tampon — sont comptes par `corps_compte`.
@@ -921,6 +1050,16 @@ pub async fn handle_stream(
         // en-tête WAV compris (voir `decoupe_icy`). Le compteur vit ici, et non
         // dans la boucle, pour cette seule raison.
         let mut bytes_since_meta: usize = 0;
+        // ── #6453 — la phase de trame d'une reprise de radio bornée ──
+        //
+        // AVPlayer reprend le « fichier » à l'octet qu'il a reçu, pas à une
+        // frontière de trame (`bytes=16158-…` vu sur CoreMedia : (16158−44)
+        // mod 4 = 2). Le direct, lui, part toujours en tête de trame : servi
+        // tel quel, chaque échantillon serait lu décalé — voies inversées à
+        // deux octets, bruit à un ou trois. On complète d'abord la trame
+        // entamée par des zéros (un échantillon de silence), puis le direct
+        // part en phase. Calculé une fois le format réel connu (en-tête).
+        let mut remplissage_de_phase: usize = 0;
         // Le bloc à insérer : le titre courant s'il a été publié par le poller,
         // sinon celui de la connexion. Relu à CHAQUE insertion — c'est la seule
         // chose que le renderer verra changer sans qu'on relance quoi que ce soit.
@@ -1017,6 +1156,10 @@ pub async fn handle_stream(
                     return;
                 };
                 let real_bd = session.output_bit_depth();
+                if let Some(debut) = reprise_bornee {
+                    remplissage_de_phase =
+                        remplissage_de_phase_radio(debut, real_ch, real_bd);
+                }
                 if bounded_live {
                     build_wav_header_bounded_live(real_ch, real_sr, real_bd)
                 } else {
@@ -1103,7 +1246,13 @@ pub async fn handle_stream(
                             // `radio_stream_concurrent_consumer` (.15). Le
                             // canal ICY ne fait qu'entrelacer des blocs dans
                             // les octets déjà servis.
-                            Some(chunk) => {
+                            Some(mut chunk) => {
+                                if remplissage_de_phase > 0 {
+                                    let mut complet = vec![0u8; remplissage_de_phase];
+                                    complet.extend_from_slice(&chunk);
+                                    chunk = complet;
+                                    remplissage_de_phase = 0;
+                                }
                                 if has_icy {
                                     for part in decoupe_icy(
                                         &chunk,
@@ -1331,6 +1480,7 @@ pub async fn handle_stream(
                                 "reprise_hors_retenue — la fenêtre a glissé pendant la reprise (#5426)"
                             );
                             reprise = None;
+                            jonction_du_corps.signaler();
                             if trame_de_sortie > 1 {
                                 a_remettre_en_phase = Some(position);
                             }
@@ -1507,7 +1657,8 @@ pub async fn handle_stream(
         flux,
         fin_de_tranche
             .zip(finite_range_start)
-            .map(|(fin, debut)| fin - debut + 1),
+            .map(|(fin, debut)| fin - debut + 1)
+            .or(limite_bornee),
     );
     let flux = futures_util::StreamExt::map(flux, move |morceau| {
         if let (Ok(o), Some(b)) = (&morceau, bilan.as_mut()) {
@@ -1518,6 +1669,7 @@ pub async fn handle_stream(
         }
         morceau
     });
+    let flux = bruit_suspect_reseau::sur_le_flux(flux, observateur_reseau);
     let body = corps_compte(flux, compteur);
 
     let status = if use_partial {
@@ -1774,6 +1926,21 @@ fn reponse_416(taille: u64) -> Response {
     (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response()
 }
 
+/// #6909 — un fichier seekable peut aussi être demandé en Streaming.
+/// Respecter le mode reconnu, comme la route des pistes de bibliothèque ;
+/// sans demande exploitable, conserver le contrat fichier Interactive.
+fn mode_de_transfert_fichier(req_headers: &HeaderMap) -> &'static str {
+    match req_headers
+        .get("transferMode.dlna.org")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+    {
+        Some("Streaming") => "Streaming",
+        Some("Background") => "Background",
+        _ => "Interactive",
+    }
+}
+
 async fn serve_file(
     path: &str,
     info: &StreamInfo,
@@ -1816,6 +1983,15 @@ async fn serve_file(
         .unwrap_or(DemandeDeRange::Totalite);
 
     if let DemandeDeRange::Insatisfiable = demande {
+        // #6612 — même trou que le mandataire : un renderer qui demande une
+        // plage au-delà de la fin reçoit un 416 et reste à l'arrêt. La session
+        // le note, pour que la zone reprenne par un nouveau flux. Lavf : rien
+        // ne change.
+        if !agent_lavf(req_headers)
+            && let Some(debut) = plage_au_dela_de_la_fin(range_header.as_deref(), Some(file_size))
+        {
+            signaler_plage_hors_fichier(&session, req_headers, debut, file_size, "fichier");
+        }
         warn!(
             stream_id = %session.id,
             range = range_header.as_deref().unwrap_or("-"),
@@ -1847,7 +2023,7 @@ async fn serve_file(
         headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
         headers.insert(
             "transferMode.dlna.org",
-            HeaderValue::from_static("Interactive"),
+            HeaderValue::from_static(mode_de_transfert_fichier(req_headers)),
         );
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert(
@@ -1876,6 +2052,8 @@ async fn serve_file(
                 ),
             ),
         };
+        let body =
+            bruit_suspect_reseau::sur_le_fichier(body, path, &session, req_headers, start).await;
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -1889,7 +2067,7 @@ async fn serve_file(
     headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
     headers.insert(
         "transferMode.dlna.org",
-        HeaderValue::from_static("Interactive"),
+        HeaderValue::from_static(mode_de_transfert_fichier(req_headers)),
     );
     headers.insert("Connection", HeaderValue::from_static("keep-alive"));
     headers.insert(
@@ -1913,6 +2091,7 @@ async fn serve_file(
             ),
         ),
     };
+    let body = bruit_suspect_reseau::sur_le_fichier(body, path, &session, req_headers, 0).await;
     (StatusCode::OK, headers, body).into_response()
 }
 
@@ -2002,9 +2181,9 @@ fn perte_menace_la_lecture(avance_ms: i64) -> bool {
     avance_ms < AVANCE_SANS_RISQUE_MS
 }
 
-/// Débit nominal d'un flux PCM servi en WAV, en octets par seconde.
+/// Débit nominal d'un flux PCM WAV ou DSD natif DSF/DFF, en octets/s.
 ///
-/// `None` hors WAV, et c'est délibéré : sur un format compressé la
+/// `None` pour les formats compressés : la
 /// correspondance octets ↔ temps n'est pas linéaire, et une avance calculée
 /// dessus mentirait. Mieux vaut ne rien dire que dire un chiffre faux — même
 /// contrat que le `debit_kio_s` sous la milliseconde.
@@ -2014,11 +2193,17 @@ fn debit_nominal_octets_par_seconde(
     bit_depth: u16,
     channels: u16,
 ) -> Option<u32> {
-    if format != "wav" {
-        return None;
-    }
-    let octets_par_trame = u32::from(channels) * u32::from(bit_depth / 8);
-    let debit = sample_rate.checked_mul(octets_par_trame)?;
+    let debit = match format {
+        "wav" => sample_rate.checked_mul(u32::from(channels) * u32::from(bit_depth / 8))?,
+        // DSD : sample_rate est la fréquence des BITS (11 289 600 pour
+        // DSD256), pas une fréquence PCM. Diviser avant de multiplier la
+        // profondeur tronquerait le bit unique à zéro. Le DST compressé
+        // n'est pas servi comme DFF : il est reconstruit en DSF (#6221).
+        "dsf" | "dff" if bit_depth == 1 && sample_rate.is_multiple_of(8) => {
+            (sample_rate / 8).checked_mul(u32::from(channels))?
+        }
+        _ => return None,
+    };
     (debit > 0).then_some(debit)
 }
 
@@ -2468,6 +2653,17 @@ fn build_file_body(
     })
 }
 
+/// #6453 — octets de silence qui complètent la trame PCM entamée à l'offset
+/// `debut` d'un WAV (en-tête de 44 octets), pour que le direct, qui part en
+/// tête de trame, reste en phase avec ce que le lecteur attend.
+fn remplissage_de_phase_radio(debut: u64, canaux: u16, profondeur: u16) -> usize {
+    let trame = u64::from(canaux) * u64::from(profondeur / 8);
+    if trame <= 1 || debut <= 44 {
+        return 0;
+    }
+    ((trame - (debut - 44) % trame) % trame) as usize
+}
+
 /// Borne de fin INCLUSE d'un `Range: bytes=N-M` : `M`. `None` pour
 /// `bytes=N-`, un suffixe `bytes=-N` ou une valeur mal formée. Seule la
 /// première tranche compte, comme pour [`parse_range_start`].
@@ -2517,6 +2713,47 @@ where
             }
         }
     }
+}
+
+/// L'agent est-il un libavformat (`Lavf/…`) ? Voir `proxy_stream`.
+fn agent_lavf(req_headers: &HeaderMap) -> bool {
+    req_headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ua| ua.to_ascii_lowercase().contains("lavf"))
+}
+
+/// #6612 — la plage `bytes=N-…` commence-t-elle au-delà de la fin d'un flux
+/// de longueur connue ? Rend `N`. Un suffixe `bytes=-n`, une longueur
+/// inconnue, ou un `N` qui tombe dans le fichier : `None`.
+fn plage_au_dela_de_la_fin(range: Option<&str>, longueur: Option<u64>) -> Option<u64> {
+    let debut = parse_range_start(range?)?;
+    let total = longueur?;
+    (debut >= total).then_some(debut)
+}
+
+/// #6612 — journalise la plage hors fichier (sans URL : l'amont est signé)
+/// et la note sur la session, que le sondeur relit.
+fn signaler_plage_hors_fichier(
+    session: &StreamSession,
+    req_headers: &HeaderMap,
+    debut: u64,
+    total: u64,
+    voie: &'static str,
+) {
+    let agent = req_headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    warn!(
+        stream_id = %session.id,
+        debut,
+        total,
+        voie,
+        agent,
+        "plage_hors_fichier — 416 sans requête amont ; reprise par un nouveau flux demandée"
+    );
+    session.signaler_plage_hors_fichier();
 }
 
 /// Parse the start byte of an HTTP `Range` header value like `bytes=N-` or
@@ -2946,11 +3183,24 @@ async fn proxy_stream(
     // audio, rejects the stream, and loops re-reading the header (peak_pos=0,
     // stopped after 74s). So keep the 1 MiB threshold ONLY for Lavf; for every
     // other agent honour any non-zero `bytes=N-` by forwarding it (→ 206 from N).
-    let is_lavf = req_headers
-        .get("User-Agent")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ua| ua.to_ascii_lowercase().contains("lavf"));
+    let is_lavf = agent_lavf(req_headers);
     let resume_threshold = if is_lavf { RESUME_RANGE_THRESHOLD } else { 1 };
+    // #6612 — Yamaha R-N2000A (fil 2346) : après une pause, il rouvre avec
+    // `bytes=4294949906-` (2^32 − 17 390) pour un fichier de 75,7 Mo. La plage
+    // partait au CDN, qui disait 416, renvoyé tel quel : le renderer restait à
+    // l'arrêt, sans un son. Une plage qui commence au-delà de la longueur
+    // CONNUE ne désigne aucun octet : elle ne part plus au CDN. Le 416 est
+    // rendu ici, et la session le note : le sondeur fait reprendre la zone
+    // par un NOUVEAU flux, à la position mémorisée. Longueur inconnue, plage
+    // dans le fichier, radio ou Lavf : rien ne change.
+    if !is_radio
+        && !is_lavf
+        && let Some(total) = session.longueur_amont()
+        && let Some(debut) = plage_au_dela_de_la_fin(range_value.as_deref(), Some(total))
+    {
+        signaler_plage_hors_fichier(&session, req_headers, debut, total, "mandataire");
+        return reponse_416(total);
+    }
     // Un suffixe `bytes=-n` se transmet au CDN comme `bytes=(total-n)-` quand
     // une requête précédente de la session a appris la longueur ; sinon
     // l'amont part de 0 et la tranche est atteinte par saut local.
@@ -4294,7 +4544,10 @@ mod tests {
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
         )));
-        assert!(accepts_chunked_live_stream(Some(
+        // #5975 — Safari, lui, lit par CoreMedia et REFUSE le chunké (fil
+        // 2246) : il prend le contrat fichier, comme AVPlayer (#6549). #3513
+        // n'avait été mesuré que sur Firefox.
+        assert!(!accepts_chunked_live_stream(Some(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
              (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
         )));
@@ -4919,6 +5172,82 @@ mod tests {
     /// tire, et c'est le serveur HTTP qui le tire en vrai. Sans ce drainage,
     /// la première connexion resterait garée dans `recv_chunk()` en tenant le
     /// verrou du canal, et l'essai attendrait pour de mauvaises raisons.
+    /// #6130 — le vrai corps radio, servi à l'agent du DMP-A8 : quand le
+    /// serveur congédie le consommateur (`congedier_les_consommateurs`, appelé
+    /// à la sortie de radio DLNA), le corps se TERMINE et `active_consumers`
+    /// retombe à 0, sans que le renderer ait rien fermé. Le direct continue
+    /// d'être semé : seule la décision du serveur peut finir ce corps.
+    #[tokio::test]
+    async fn le_serveur_ferme_le_direct_d_un_renderer_qui_ne_lache_pas_6130() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        use tune_core::http::streamer::SharedSessions;
+
+        let sid = "i6130-conge";
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 48000,
+            bit_depth: 16,
+            channels: 2,
+            ..StreamInfo::default()
+        };
+        let mut session = StreamSession::new(sid.to_string(), info, false, 64);
+        session.is_radio = true;
+        let session = std::sync::Arc::new(session);
+        session.publish_detected_output_format(48000, 2);
+        let tx = session.tx.lock().await.clone().expect("tx");
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [(sid.to_string(), session.clone())].into_iter().collect(),
+        ));
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("User-Agent", "Lavf/58.45.100".parse().unwrap());
+        let reponse =
+            super::handle_stream(Path(format!("{sid}.wav")), State(sessions.clone()), h).await;
+        assert_eq!(reponse.status(), axum::http::StatusCode::OK);
+        let mut corps = reponse.into_body().into_data_stream();
+        // Le direct coule : en-tête puis PCM.
+        tx.send(vec![0x33; 4096]).await.expect("pcm");
+        let mut recu = 0usize;
+        while recu < 44 + 4096 {
+            recu += tokio::time::timeout(std::time::Duration::from_secs(10), corps.next())
+                .await
+                .expect("le direct doit couler")
+                .expect("flux ouvert")
+                .expect("bloc lisible")
+                .len();
+        }
+        assert_eq!(session.active_consumers.load(SeqCst), 1);
+
+        session.congedier_les_consommateurs();
+        // Le direct continue d'arriver : rien d'autre que le congé ne finit le corps.
+        let semeur = tokio::spawn(async move {
+            for _ in 0..200 {
+                if tx.send(vec![0x44; 4096]).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        let fin = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while let Some(Ok(_)) = corps.next().await {}
+        })
+        .await;
+        assert!(
+            fin.is_ok(),
+            "le corps radio reste ouvert après le congé du serveur : un renderer qui \
+             ne lâche pas la radio la garde jusqu'au Play suivant (#6130)"
+        );
+        drop(corps);
+        assert_eq!(
+            session.active_consumers.load(SeqCst),
+            0,
+            "le consommateur doit être compté parti"
+        );
+        semeur.abort();
+    }
+
     #[tokio::test]
     async fn une_reconnexion_par_range_ne_coupe_pas_le_son() {
         use axum::extract::{Path, State};
@@ -5539,6 +5868,9 @@ mod bruit_trois_connexions_b209bruit;
 #[cfg(test)]
 mod bruit_suspect_de_bout_en_bout_6130;
 
+#[cfg(test)]
+mod bruit_suspect_reseau_de_bout_en_bout_6255;
+
 /// #6221 — un fichier virtuel (DSF fabriqué depuis un DST) servi avec le
 /// contrat fichier : Content-Length, Range, 416.
 #[cfg(test)]
@@ -5577,16 +5909,50 @@ mod terrain_perdu_4645 {
         );
     }
 
-    /// Hors WAV, on ne rend RIEN plutôt qu'un chiffre faux : sur un format
+    /// Hors formats non compressés, on ne rend RIEN : sur un format
     /// compressé la correspondance octets ↔ temps n'est pas linéaire.
     #[test]
-    fn hors_wav_aucun_nominal_nest_rendu() {
-        for format in ["flac", "mp3", "aac", "dsf", ""] {
+    fn hors_formats_non_compresses_aucun_nominal_nest_rendu() {
+        for format in ["flac", "mp3", "aac", "dst", ""] {
             assert_eq!(
                 debit_nominal_octets_par_seconde(format, 44_100, 24, 2),
                 None,
                 "{format} : un nominal calculé sur un format compressé mentirait"
             );
+        }
+    }
+
+    #[test]
+    fn dsd256_dsf_et_dff_mesurent_le_retard_du_k17_6478() {
+        for format in ["dsf", "dff"] {
+            let nominal = debit_nominal_octets_par_seconde(format, 11_289_600, 1, 2)
+                .expect("DSD256 natif : la livraison doit avoir un débit nominal");
+            assert_eq!(nominal, 2_822_400, "DSD256 stéréo : bits / 8 × canaux");
+            // Première connexion du journal #6478 : sous le temps réel.
+            assert_eq!(
+                avance_de_livraison_ms(759_103_488, nominal, 274_046),
+                -5_090
+            );
+            assert_eq!(
+                avance_de_livraison_ms(u64::from(nominal), nominal, 1_000),
+                0
+            );
+            assert_eq!(
+                debit_nominal_octets_par_seconde(format, 2_822_400, 1, 6),
+                Some(2_116_800)
+            );
+            for (rate, depth, channels) in [
+                (0, 1, 2),
+                (11_289_600, 1, 0),
+                (11_289_600, 24, 2),
+                (1, 1, 2),
+                (u32::MAX - 7, 1, u16::MAX),
+            ] {
+                assert_eq!(
+                    debit_nominal_octets_par_seconde(format, rate, depth, channels),
+                    None
+                );
+            }
         }
     }
 
@@ -6419,3 +6785,365 @@ mod temoins_du_mandataire_dsf {
         assert_eq!(lire_tout(rep).await, corps[4000..].to_vec());
     }
 }
+
+/// #6453 — la radio sur « Ce téléphone » : AVPlayer ouvre le flux par la sonde
+/// `Range: bytes=0-1`, puis `bytes=0-2147483646`. Les deux attendent un 206.
+#[cfg(test)]
+mod sonde_avplayer_radio_6453_tests {
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use futures_util::StreamExt;
+    use tune_core::http::streamer::{
+        LIVE_BOUNDED_TOTAL_LEN, SharedSessions, StreamInfo, StreamSession,
+    };
+
+    const AVPLAYER: &str =
+        "AppleCoreMedia/1.0.0.24A446 (iPhone; U; CPU OS 27_0_1 like Mac OS X; fr_fr)";
+    const PCM: usize = 3 * 8192;
+
+    /// Une radio WAV dont `PCM` octets de direct attendent déjà en file,
+    /// l'émetteur fermé : le corps d'une connexion qui réclame le canal est fini.
+    async fn sessions_radio(sid: &str) -> SharedSessions {
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            ..StreamInfo::default()
+        };
+        let mut session = StreamSession::new(sid.to_string(), info, false, 64);
+        session.is_radio = true;
+        let session = std::sync::Arc::new(session);
+        session.publish_detected_output_format(48000, 2);
+        let tx = session.tx.lock().await.clone().expect("tx");
+        for _ in 0..PCM / 8192 {
+            tx.send(vec![0xAA; 8192]).await.expect("pcm");
+        }
+        drop(tx);
+        session.close_sender().await;
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            [(sid.to_string(), session)].into_iter().collect(),
+        ))
+    }
+
+    async fn requete(
+        sessions: &SharedSessions,
+        sid: &str,
+        range: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("User-Agent", AVPLAYER.parse().unwrap());
+        if let Some(r) = range {
+            h.insert("Range", r.parse().unwrap());
+        }
+        let rep =
+            super::handle_stream(Path(format!("{sid}.flac")), State(sessions.clone()), h).await;
+        let statut = rep.status();
+        let entetes = rep.headers().clone();
+        let mut corps = rep.into_body().into_data_stream();
+        let mut octets = Vec::new();
+        while let Some(Ok(b)) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), corps.next())
+                .await
+                .expect("le corps doit se terminer")
+        {
+            octets.extend_from_slice(&b);
+        }
+        (statut, entetes, octets)
+    }
+
+    fn entete<'a>(h: &'a axum::http::HeaderMap, nom: &str) -> Option<&'a str> {
+        h.get(nom).and_then(|v| v.to_str().ok())
+    }
+
+    /// LE défaut : la sonde recevait 200 + `Content-Length: 2147483647`, et
+    /// CoreMedia abandonnait (-12939). Elle reçoit désormais ses deux octets.
+    #[tokio::test]
+    async fn la_sonde_bytes_0_1_recoit_un_206_de_deux_octets() {
+        let sid = "radio-6453-sonde";
+        let sessions = sessions_radio(sid).await;
+        let (statut, h, corps) = requete(&sessions, sid, Some("bytes=0-1")).await;
+        assert_eq!(statut, StatusCode::PARTIAL_CONTENT);
+        let attendu = format!("bytes 0-1/{LIVE_BOUNDED_TOTAL_LEN}");
+        assert_eq!(entete(&h, "Content-Range"), Some(attendu.as_str()));
+        assert_eq!(entete(&h, "Content-Length"), Some("2"));
+        assert_eq!(entete(&h, "Accept-Ranges"), Some("bytes"));
+        assert!(entete(&h, "Transfer-Encoding").is_none());
+        assert_eq!(corps, b"RI".to_vec());
+    }
+
+    /// La sonde ne réclame pas le canal PCM : la requête suivante d'AVPlayer,
+    /// le fichier entier en plage FERMÉE, reçoit un 206, l'en-tête complet et
+    /// TOUT le direct en file — rien n'a été perdu dans la sonde.
+    #[tokio::test]
+    async fn apres_la_sonde_le_fichier_entier_part_en_206_sans_perte() {
+        let sid = "radio-6453-suite";
+        let sessions = sessions_radio(sid).await;
+        let _ = requete(&sessions, sid, Some("bytes=0-1")).await;
+        let fin = LIVE_BOUNDED_TOTAL_LEN - 1;
+        let (statut, h, corps) = requete(&sessions, sid, Some(&format!("bytes=0-{fin}"))).await;
+        assert_eq!(statut, StatusCode::PARTIAL_CONTENT);
+        let attendu = format!("bytes 0-{fin}/{LIVE_BOUNDED_TOTAL_LEN}");
+        assert_eq!(entete(&h, "Content-Range"), Some(attendu.as_str()));
+        let longueur = LIVE_BOUNDED_TOTAL_LEN.to_string();
+        assert_eq!(entete(&h, "Content-Length"), Some(longueur.as_str()));
+        assert_eq!(&corps[..4], b"RIFF");
+        assert_eq!(corps.len(), 44 + PCM, "la sonde a consommé du direct");
+        assert!(corps[44..].iter().all(|b| *b == 0xAA));
+    }
+
+    /// Une tranche fermée au-delà de l'en-tête (`bytes=44-M`, la troisième
+    /// requête d'AVPlayer) : 206 `bytes 44-M/<total>`, M−43 octets de PCM.
+    #[tokio::test]
+    async fn une_tranche_fermee_apres_l_entete_est_bornee() {
+        let sid = "radio-6453-tranche";
+        let sessions = sessions_radio(sid).await;
+        let (statut, h, corps) = requete(&sessions, sid, Some("bytes=44-1043")).await;
+        assert_eq!(statut, StatusCode::PARTIAL_CONTENT);
+        let attendu = format!("bytes 44-1043/{LIVE_BOUNDED_TOTAL_LEN}");
+        assert_eq!(entete(&h, "Content-Range"), Some(attendu.as_str()));
+        assert_eq!(entete(&h, "Content-Length"), Some("1000"));
+        assert_eq!(corps, vec![0xAA; 1000]);
+    }
+
+    /// La reprise qu'AVPlayer a faite sur CoreMedia (`bytes=16158-…`) tombe à
+    /// deux octets dans une trame 16 bits stéréo : deux octets de silence
+    /// complètent la trame, puis le direct part en phase.
+    #[tokio::test]
+    async fn une_reprise_hors_trame_est_remise_en_phase() {
+        let sid = "radio-6453-phase";
+        let sessions = sessions_radio(sid).await;
+        let fin = LIVE_BOUNDED_TOTAL_LEN - 1;
+        let (statut, h, corps) = requete(&sessions, sid, Some(&format!("bytes=16158-{fin}"))).await;
+        assert_eq!(statut, StatusCode::PARTIAL_CONTENT);
+        let attendu = format!("bytes 16158-{fin}/{LIVE_BOUNDED_TOTAL_LEN}");
+        assert_eq!(entete(&h, "Content-Range"), Some(attendu.as_str()));
+        assert_eq!(corps.len(), 2 + PCM);
+        assert_eq!(&corps[..2], &[0, 0]);
+        assert!(corps[2..].iter().all(|b| *b == 0xAA));
+    }
+
+    #[test]
+    fn remplissage_de_phase_selon_la_trame() {
+        use super::remplissage_de_phase_radio as r;
+        // 16 bits stéréo : trame de 4 octets.
+        assert_eq!(r(44, 2, 16), 0);
+        assert_eq!(r(48, 2, 16), 0);
+        assert_eq!(r(16158, 2, 16), 2);
+        assert_eq!(r(45, 2, 16), 3);
+        assert_eq!(r(47, 2, 16), 1);
+        // 24 bits stéréo : trame de 6 octets.
+        assert_eq!(r(44 + 6 * 1000 + 4, 2, 24), 2);
+        // Dans l'en-tête : rien à compléter.
+        assert_eq!(r(10, 2, 16), 0);
+    }
+
+    /// Non-régression : une plage OUVERTE et l'absence de `Range` gardent la
+    /// réponse d'avant — 200 + longueur totale pour `bytes=0-` et sans Range
+    /// (darTZeel, #1689), 206 ouvert pour `bytes=44-`.
+    #[tokio::test]
+    async fn les_plages_ouvertes_gardent_leur_reponse() {
+        let total = LIVE_BOUNDED_TOTAL_LEN.to_string();
+        for (range, statut_attendu, longueur) in [
+            (None, StatusCode::OK, LIVE_BOUNDED_TOTAL_LEN),
+            (Some("bytes=0-"), StatusCode::OK, LIVE_BOUNDED_TOTAL_LEN),
+            (
+                Some("bytes=44-"),
+                StatusCode::PARTIAL_CONTENT,
+                LIVE_BOUNDED_TOTAL_LEN - 44,
+            ),
+        ] {
+            let sid = format!("radio-6453-ouverte-{}", range.unwrap_or("aucune"));
+            let sessions = sessions_radio(&sid).await;
+            let (statut, h, corps) = requete(&sessions, &sid, range).await;
+            assert_eq!(statut, statut_attendu, "{range:?}");
+            assert_eq!(
+                entete(&h, "Content-Length"),
+                Some(longueur.to_string().as_str()),
+                "{range:?}"
+            );
+            if range == Some("bytes=44-") {
+                let attendu = format!("bytes 44-{}/{total}", LIVE_BOUNDED_TOTAL_LEN - 1);
+                assert_eq!(entete(&h, "Content-Range"), Some(attendu.as_str()));
+                assert_eq!(corps.len(), PCM);
+            } else {
+                assert!(entete(&h, "Content-Range").is_none(), "{range:?}");
+                assert_eq!(corps.len(), 44 + PCM, "{range:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod safari_radio_5975_tests {
+    //! #5975 (fils 2178 et 2246) — la radio muette dans la zone navigateur de
+    //! Safari 18.6 sous macOS.
+    //!
+    //! Journal du fil 2246 (rc4) : Safari ouvre chaque connexion par une sonde
+    //! `Range: bytes=0-1`, reçoit le contrat chunké (200, sans longueur ni
+    //! `Accept-Ranges`), raccroche aussitôt (`connected_secs=0`), six fois en
+    //! 0,4 s, puis l'élément `<audio>` tombe en erreur. #6549 (rc7) a donné un
+    //! 206 à cette sonde, mais sur la seule voie « fichier borné », celle
+    //! d'AVPlayer (`AppleCoreMedia/…`). Ces témoins jouent la même sonde avec
+    //! l'agent EXACT de Safari relevé dans le journal.
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use futures_util::StreamExt;
+    use tune_core::http::streamer::{
+        LIVE_BOUNDED_TOTAL_LEN, SharedSessions, StreamInfo, StreamSession,
+    };
+
+    /// L'agent de Safari 18.6 (macOS) relevé dans le journal du fil 2246.
+    const SAFARI_MAC: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+        AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15";
+    /// Safari sur iPhone, et Chrome sur iPhone : sous iOS, tout navigateur lit
+    /// le média par WebKit et CoreMedia.
+    const SAFARI_IPHONE: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) \
+        AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1";
+    const CHROME_IPHONE: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) \
+        AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/141.0.7390.41 Mobile/15E148 Safari/604.1";
+    /// Les navigateurs qui lisent le chunké (#3513) : ils doivent le garder.
+    /// Chrome et Edge annoncent AUSSI « Safari » dans leur agent.
+    const CHROME_MAC: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+        AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+    const EDGE_WINDOWS: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+        AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0";
+    const CHROME_ANDROID: &str = "Mozilla/5.0 (Linux; Android 15; Pixel 8) \
+        AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36";
+    const FIREFOX_MAC: &str =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:141.0) Gecko/20100101 Firefox/141.0";
+
+    const PCM: usize = 3 * 8192;
+
+    async fn sessions_radio(sid: &str) -> SharedSessions {
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            ..StreamInfo::default()
+        };
+        let mut session = StreamSession::new(sid.to_string(), info, false, 64);
+        session.is_radio = true;
+        let session = std::sync::Arc::new(session);
+        session.publish_detected_output_format(48000, 2);
+        let tx = session.tx.lock().await.clone().expect("tx");
+        for _ in 0..PCM / 8192 {
+            tx.send(vec![0xAA; 8192]).await.expect("pcm");
+        }
+        drop(tx);
+        session.close_sender().await;
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            [(sid.to_string(), session)].into_iter().collect(),
+        ))
+    }
+
+    async fn requete(
+        sessions: &SharedSessions,
+        sid: &str,
+        agent: &str,
+        range: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("User-Agent", agent.parse().unwrap());
+        if let Some(r) = range {
+            h.insert("Range", r.parse().unwrap());
+        }
+        let rep =
+            super::handle_stream(Path(format!("{sid}.flac")), State(sessions.clone()), h).await;
+        let statut = rep.status();
+        let entetes = rep.headers().clone();
+        let mut corps = rep.into_body().into_data_stream();
+        let mut octets = Vec::new();
+        while let Some(Ok(b)) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), corps.next())
+                .await
+                .expect("le corps doit se terminer")
+        {
+            octets.extend_from_slice(&b);
+        }
+        (statut, entetes, octets)
+    }
+
+    fn entete<'a>(h: &'a axum::http::HeaderMap, nom: &str) -> Option<&'a str> {
+        h.get(nom).and_then(|v| v.to_str().ok())
+    }
+
+    /// LE témoin de #5975 : la sonde `bytes=0-1` de Safari 18.6 reçoit ses
+    /// deux octets en 206, comme celle d'AVPlayer depuis #6549.
+    #[tokio::test]
+    async fn la_sonde_de_safari_recoit_un_206_de_deux_octets_5975() {
+        let sid = "radio-5975-sonde-safari";
+        let sessions = sessions_radio(sid).await;
+        let (statut, h, corps) = requete(&sessions, sid, SAFARI_MAC, Some("bytes=0-1")).await;
+        assert_eq!(
+            statut,
+            StatusCode::PARTIAL_CONTENT,
+            "Safari 18.6 reçoit {statut} et {:?} à sa sonde bytes=0-1 : le contrat chunké, \
+             qu'il refuse (fil 2246) — #6549 ne couvre que l'agent AppleCoreMedia",
+            entete(&h, "Transfer-Encoding")
+        );
+        let attendu = format!("bytes 0-1/{LIVE_BOUNDED_TOTAL_LEN}");
+        assert_eq!(entete(&h, "Content-Range"), Some(attendu.as_str()));
+        assert_eq!(entete(&h, "Content-Length"), Some("2"));
+        assert_eq!(corps, b"RI".to_vec());
+    }
+
+    /// Après la sonde, la requête du fichier entier en plage fermée reçoit
+    /// l'en-tête et TOUT le direct en file : la sonde n'a pas pris le canal.
+    #[tokio::test]
+    async fn apres_la_sonde_safari_recoit_le_direct_sans_perte_5975() {
+        let sid = "radio-5975-suite-safari";
+        let sessions = sessions_radio(sid).await;
+        let _ = requete(&sessions, sid, SAFARI_MAC, Some("bytes=0-1")).await;
+        let fin = LIVE_BOUNDED_TOTAL_LEN - 1;
+        let (statut, _, corps) =
+            requete(&sessions, sid, SAFARI_MAC, Some(&format!("bytes=0-{fin}"))).await;
+        assert_eq!(statut, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&corps[..4], b"RIFF");
+        assert_eq!(corps.len(), 44 + PCM, "la sonde a consommé du direct");
+    }
+
+    /// Les navigateurs iOS lisent par WebKit et CoreMedia : même contrat.
+    #[tokio::test]
+    async fn les_navigateurs_ios_recoivent_aussi_le_206_5975() {
+        for (i, agent) in [SAFARI_IPHONE, CHROME_IPHONE].into_iter().enumerate() {
+            let sid = format!("radio-5975-ios-{i}");
+            let sessions = sessions_radio(&sid).await;
+            let (statut, _, corps) = requete(&sessions, &sid, agent, Some("bytes=0-1")).await;
+            assert_eq!(statut, StatusCode::PARTIAL_CONTENT, "{agent}");
+            assert_eq!(corps, b"RI".to_vec(), "{agent}");
+        }
+    }
+
+    /// Non-régression de #3513 : Firefox, Chrome (même s'il dit « Safari »),
+    /// Edge et Chrome Android gardent le direct chunké, sans longueur ni
+    /// `Accept-Ranges` qui les inviteraient à se reconnecter.
+    #[tokio::test]
+    async fn les_autres_navigateurs_gardent_le_chunke_3513() {
+        for (i, agent) in [FIREFOX_MAC, CHROME_MAC, EDGE_WINDOWS, CHROME_ANDROID]
+            .into_iter()
+            .enumerate()
+        {
+            let sid = format!("radio-5975-chunke-{i}");
+            let sessions = sessions_radio(&sid).await;
+            let (statut, h, corps) = requete(&sessions, &sid, agent, Some("bytes=0-1")).await;
+            assert_eq!(statut, StatusCode::OK, "{agent}");
+            assert!(entete(&h, "Content-Length").is_none(), "{agent}");
+            assert!(entete(&h, "Accept-Ranges").is_none(), "{agent}");
+            assert_eq!(entete(&h, "Transfer-Encoding"), Some("chunked"), "{agent}");
+            assert_eq!(corps.len(), 44 + PCM, "{agent}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod reprise_chunkee_aac_6990;
+
+#[cfg(test)]
+mod multichannel_7275_tests;
+
+#[cfg(test)]
+mod mode_fichier_nr1602_6909;

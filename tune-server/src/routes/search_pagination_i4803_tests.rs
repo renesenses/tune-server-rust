@@ -418,7 +418,11 @@ async fn sans_parametre_la_reponse_est_celle_d_avant() {
     let r = chercher(&b.state, "q=coltrane&limit=3&sources=pagineur,sanspage").await;
 
     let cles_de_tete: Vec<&String> = r.as_object().unwrap().keys().collect();
-    assert_eq!(cles_de_tete, vec!["local", "radios", "services"], "{r}");
+    assert_eq!(
+        cles_de_tete,
+        vec!["local", "radios", "radios_annuaire", "services"],
+        "{r}"
+    );
     for nom in ["pagineur", "sanspage"] {
         let bloc = &r["services"][nom];
         let cles: std::collections::BTreeSet<&str> = bloc

@@ -300,7 +300,7 @@ pub fn ecrire_credits_piste(
 }
 
 /// Pistes locales d'un album, pour l'appariement.
-fn pistes_locales(backend: &Arc<dyn DbBackend>, album_id: i64) -> Vec<PisteLocale> {
+pub(crate) fn pistes_locales(backend: &Arc<dyn DbBackend>, album_id: i64) -> Vec<PisteLocale> {
     backend
         .query_many(
             "SELECT id, disc_number, track_number, title, musicbrainz_recording_id \
@@ -366,6 +366,12 @@ pub fn appliquer_release(
         if ecrire_credits_piste(backend, track_id, lignes) > 0 {
             bilan.pistes_creditees += 1;
         }
+    }
+    // La release est en main : le constat de complétude (lot 1 MetaRust,
+    // #4805) ne coûte aucune requête de plus, et alimente le filtre « albums
+    // incomplets » de la Bibliothèque.
+    if let Some(mbid) = release.get("id").and_then(Value::as_str) {
+        super::completude::constater(backend, album_id, mbid, release);
     }
     marquer_album(backend, album_id);
     bilan

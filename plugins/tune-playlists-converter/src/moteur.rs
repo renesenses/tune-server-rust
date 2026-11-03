@@ -72,6 +72,12 @@ struct PisteSource {
     artiste: String,
     duree_ms: u64,
     isrc: String,
+    /// Le service d'origine de la piste (`qobuz`, `tidal`…), ou `local` / vide
+    /// pour une piste de la bibliothèque (#6499).
+    source: String,
+    /// Son identifiant CHEZ ce service. Avec `source`, c'est ce qui permet de
+    /// reprendre tel quel un titre déjà chez la cible.
+    source_id: String,
 }
 
 /// Le moteur. Ne tient qu'une référence vers l'hôte : tout son état vit dans
@@ -475,12 +481,41 @@ impl<'h, H: Hote + ?Sized> Convertisseur<'h, H> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            source: v
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            source_id: v
+                .get("source_id")
+                .and_then(|id| {
+                    id.as_str()
+                        .map(str::to_string)
+                        .or_else(|| id.as_i64().map(|n| n.to_string()))
+                })
+                .unwrap_or_default(),
         }
     }
 
     /// Apparier une piste chez la cible — service ou bibliothèque — par le
     /// seul chemin d'appariement du greffon ([`appariement::apparier_chez`]).
+    ///
+    /// #6499 — un titre qui est DÉJÀ chez la cible (un titre Qobuz d'une
+    /// playlist locale convertie vers Qobuz) n'est pas apparié : il est repris
+    /// tel quel, sous son identifiant d'origine. Le chercher reviendrait au
+    /// mieux à le retrouver, au pire à lui préférer une autre édition, ou à le
+    /// perdre sur une durée inconnue.
     fn apparier(&self, cible: &str, piste: &PisteSource) -> Result<appariement::Candidat, Raison> {
+        if let Some(c) = appariement::reprise_directe(
+            cible,
+            &piste.source,
+            &piste.source_id,
+            &piste.titre,
+            &piste.artiste,
+            piste.duree_ms,
+        ) {
+            return Ok(c);
+        }
         appariement::apparier_chez(
             self.hote,
             cible,

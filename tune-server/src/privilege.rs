@@ -120,7 +120,11 @@ impl Commande {
 
     /// Lance la commande et attend sa fin (stdout et stderr capturés).
     pub async fn lancer(&self) -> std::io::Result<Output> {
-        let mut cmd = Command::new(&self.programme);
+        // #6336 — un banc d'essai peut substituer un faux programme (montage
+        // SMB) ; dans un binaire publié, `substitut` rend toujours `None`.
+        let programme = tune_core::services_factices::substitut(&self.programme)
+            .unwrap_or_else(|| self.programme.clone());
+        let mut cmd = Command::new(&programme);
         cmd.args(&self.args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

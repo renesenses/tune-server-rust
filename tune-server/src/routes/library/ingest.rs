@@ -689,8 +689,13 @@ async fn run_job(
     // when nothing landed, to avoid kicking off a scan for a no-op job.
     let scanned = if report.files_placed() > 0 {
         if let Some(ref dir) = report.album_dir {
-            crate::routes::system::scan::spawn_library_scan(state.clone(), false, Some(dir.clone()))
-                .await
+            crate::routes::system::scan::spawn_library_scan_par(
+                state.clone(),
+                false,
+                Some(dir.clone()),
+                crate::routes::system::scan::ORIGINE_IMPORT,
+            )
+            .await
         } else {
             false
         }
@@ -852,7 +857,13 @@ pub(super) async fn undo_job(
     // The library still lists tracks at paths that no longer exist; a targeted
     // rescan of the (now empty) album folder prunes them.
     if let Some(dir) = album_dir {
-        crate::routes::system::scan::spawn_library_scan(state.clone(), false, Some(dir)).await;
+        crate::routes::system::scan::spawn_library_scan_par(
+            state.clone(),
+            false,
+            Some(dir),
+            crate::routes::system::scan::ORIGINE_IMPORT,
+        )
+        .await;
     }
 
     let mut updated = job.clone();

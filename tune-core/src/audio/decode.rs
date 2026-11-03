@@ -337,6 +337,7 @@ fn adapt_decoded_audio(
     decoded: DecodedAudio,
     target_sample_rate: Option<u32>,
     target_channels: Option<u32>,
+    disposition: Option<&super::disposition_canaux::Disposition>,
 ) -> Result<DecodedAudio, String> {
     if target_sample_rate == Some(0) {
         return Err("requested PCM sample rate must be greater than zero".into());
@@ -357,11 +358,12 @@ fn adapt_decoded_audio(
         return Err("requested PCM sample rate must be greater than zero".into());
     }
 
-    let mut samples = super::channels::adapt_channels_i32(
+    let mut samples = super::channels::adapt_channels_i32_disposee(
         &decoded.samples_i32,
         source_channels,
         output_channels,
         decoded.bit_depth,
+        disposition,
     )?;
     if decoded.sample_rate != output_rate {
         samples = super::resample::resample_i32(
@@ -412,6 +414,9 @@ struct StreamingPcmAdapter {
     resampler_delay_remaining: usize,
     source_frames_seen: u64,
     output_frames_emitted: u64,
+    /// #6057 — la disposition que le fichier déclare : quand le nombre de
+    /// canaux change, chaque voie est routée par sa position.
+    disposition: Option<super::disposition_canaux::Disposition>,
 }
 
 /// Stateful adapter for progressively received interleaved integer PCM bytes.
@@ -476,15 +481,26 @@ impl StreamingPcmAdapter {
             resampler_delay_remaining,
             source_frames_seen: 0,
             output_frames_emitted: 0,
+            disposition: None,
         })
     }
 
+    /// #6057 — router par la disposition déclarée par le fichier.
+    fn avec_la_disposition(
+        mut self,
+        disposition: Option<super::disposition_canaux::Disposition>,
+    ) -> Self {
+        self.disposition = disposition;
+        self
+    }
+
     fn push(&mut self, samples: &[i32]) -> Result<Vec<i32>, String> {
-        let remixed = super::channels::adapt_channels_i32(
+        let remixed = super::channels::adapt_channels_i32_disposee(
             samples,
             self.source_channels,
             self.output_channels,
             self.bit_depth,
+            self.disposition.as_ref(),
         )?;
         self.source_frames_seen += (remixed.len() / self.output_channels as usize) as u64;
         self.resample(&remixed, false)
@@ -640,18 +656,24 @@ impl StreamingPcmByteAdapter {
 fn pcm_bytes_to_i32(data: &[u8], bit_depth: u16) -> Result<Vec<i32>, String> {
     let samples = match bit_depth {
         16 => data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
             .collect(),
         24 => data
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|b| {
                 let value = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
                 (value << 8) >> 8
             })
             .collect(),
         32 => data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect(),
         _ => return Err(format!("unsupported PCM bit depth: {bit_depth}")),
@@ -761,11 +783,15 @@ pub fn convert_pcm_bytes(data: &[u8], from_bd: u16, to_bd: u16) -> Vec<u8> {
     }
     let samples: Vec<i32> = match from_bd {
         16 => data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
             .collect(),
         24 => data
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|b| {
                 // sign-extend 24-bit LE into i32
                 let v = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
@@ -773,7 +799,9 @@ pub fn convert_pcm_bytes(data: &[u8], from_bd: u16, to_bd: u16) -> Vec<u8> {
             })
             .collect(),
         32 => data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect(),
         _ => return data.to_vec(),
@@ -1375,7 +1403,53 @@ pub fn decode_to_pcm(
         seek_s,
         max_duration_s,
     )?;
-    adapt_decoded_audio(decoded, target_sample_rate, target_channels)
+    adapt_decoded_audio(decoded, target_sample_rate, target_channels, None)
+}
+
+/// #6057 — [`decode_to_pcm`] pour le chemin RÉSEAU : quand le nombre de canaux
+/// change (renderer qui en annonce moins, #4573), chaque voie est routée par la
+/// POSITION que le fichier déclare (masque WAV, tag FLAC, type DSF, `CHNL`
+/// DFF), et non par l'ordre par défaut de son nombre de canaux.
+///
+/// `decode_to_pcm` reste tel quel : l'analyse ReplayGain et l'empreinte
+/// reposent sur l'identité `decode_to_pcm == adapter_pcm(decode_natif)` (#5519).
+pub fn decode_to_pcm_routee(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Result<DecodedAudio, String> {
+    let decoded = decode_natif(
+        file_path,
+        target_sample_rate,
+        target_channels,
+        seek_s,
+        max_duration_s,
+    )?;
+    let disposition = disposition_pour_le_routage(file_path, decoded.channels, target_channels);
+    adapt_decoded_audio(
+        decoded,
+        target_sample_rate,
+        target_channels,
+        disposition.as_ref(),
+    )
+}
+
+/// #6057 — la disposition déclarée par le fichier, lue seulement quand elle
+/// peut servir : le nombre de canaux change. Le fichier n'est pas rouvert
+/// pour une piste dont les canaux passent tels quels.
+fn disposition_pour_le_routage(
+    file_path: &str,
+    source_channels: u32,
+    target_channels: Option<u32>,
+) -> Option<super::disposition_canaux::Disposition> {
+    let cible = target_channels.unwrap_or(source_channels);
+    if cible == source_channels || source_channels < 3 {
+        return None;
+    }
+    super::disposition_canaux::declaree_hors_defaut(Path::new(file_path))
+        .filter(|d| u32::from(d.canaux()) == source_channels)
 }
 
 /// L'adaptation commune de [`decode_to_pcm`] (canaux puis cadence), appliquée
@@ -1390,7 +1464,7 @@ pub(crate) fn adapter_pcm(
     target_sample_rate: Option<u32>,
     target_channels: Option<u32>,
 ) -> Result<DecodedAudio, String> {
-    adapt_decoded_audio(decoded, target_sample_rate, target_channels)
+    adapt_decoded_audio(decoded, target_sample_rate, target_channels, None)
 }
 
 /// Le décodage de [`decode_to_pcm`] AVANT l'adaptation : cadence et canaux du
@@ -1620,9 +1694,7 @@ fn decode_opus_to_pcm(
         None
     };
     let ch: usize = match &track.codec_params {
-        Some(CodecParameters::Audio(p)) => {
-            p.channels.as_ref().map(|c| c.count() as usize).unwrap_or(2)
-        }
+        Some(CodecParameters::Audio(p)) => p.channels.as_ref().map(|c| c.count()).unwrap_or(2),
         _ => 2,
     }
     .clamp(1, 2); // libopus decoder: mono or stereo
@@ -1693,7 +1765,7 @@ fn decode_opus_to_pcm(
                 };
                 let new_ch = match &track.codec_params {
                     Some(CodecParameters::Audio(p)) => {
-                        p.channels.as_ref().map(|c| c.count() as usize).unwrap_or(2)
+                        p.channels.as_ref().map(|c| c.count()).unwrap_or(2)
                     }
                     _ => 2,
                 }
@@ -1846,6 +1918,10 @@ pub fn decode_to_pcm_streaming_with_notify(
     )
 }
 
+// Signature publique du décodeur progressif, appelée par orchestrator/resolve_*.rs
+// (fichiers en chantier dans des PR ouvertes) : la regrouper en structure
+// imposerait de réécrire ces appelants. Même choix que decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_to_pcm_streaming_with_levels(
     file_path: &str,
     target_sample_rate: Option<u32>,
@@ -1870,6 +1946,10 @@ pub fn decode_to_pcm_streaming_with_levels(
     )
 }
 
+// Signature publique du décodeur progressif, appelée par orchestrator/resolve_*.rs
+// (fichiers en chantier dans des PR ouvertes) : la regrouper en structure
+// imposerait de réécrire ces appelants. Même choix que decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_to_pcm_streaming_seeked(
     file_path: &str,
     target_sample_rate: Option<u32>,
@@ -1902,6 +1982,10 @@ pub fn decode_to_pcm_streaming_seeked(
 /// porte l'album entier, la piste n'en est qu'un intervalle. Le début passe par
 /// le même `seek_s` que le seek utilisateur ; la fin, elle, n'existait nulle
 /// part dans ce dépôt — c'est [`borner_la_fin`] qui la pose.
+// Signature publique du décodeur progressif, appelée par orchestrator/resolve_*.rs
+// (fichiers en chantier dans des PR ouvertes) : la regrouper en structure
+// imposerait de réécrire ces appelants. Même choix que decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_to_pcm_streaming_tranche(
     file_path: &str,
     target_sample_rate: Option<u32>,
@@ -2082,6 +2166,10 @@ pub fn echec_avant_le_premier_octet(erreur: &str) -> bool {
 /// Variante HTTP seekable du decodeur progressif. La source a deja prouve le
 /// support de `Range`; Symphonia peut donc lire l'atome `moov` a la fin d'un
 /// M4A puis revenir aux premiers paquets sans telecharger tout le media (#1885).
+// Signature publique du décodeur progressif, appelée par orchestrator/resolve_*.rs
+// (fichiers en chantier dans des PR ouvertes) : la regrouper en structure
+// imposerait de réécrire ces appelants. Même choix que decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_http_range_to_pcm_streaming_seeked(
     source: super::http_range::HttpRangeSource,
     codec_hint: &str,
@@ -2106,6 +2194,68 @@ pub fn decode_http_range_to_pcm_streaming_seeked(
         Some(levels_tx),
         seek_s,
         Some(Box::new(source)),
+    )
+}
+
+/// #6673 — le décodeur progressif à cadence, canaux et profondeur IMPOSÉS,
+/// sur un fichier (`source` absente : `chemin` est son chemin) ou sur une
+/// source quelconque (`chemin` ne sert alors que d'indice de format, comme
+/// `flux-distant.wav`). Sans témoin de données ni niveaux : c'est l'entrée
+/// d'une sortie qui consomme le flux elle-même (AirPlay 1).
+///
+/// Comme toutes les variantes, le premier bloc envoyé est l'en-tête WAV de
+/// 44 octets (dès que `target_bit_depth` est fixé), puis le PCM entrelacé en
+/// petit-boutiste.
+pub fn decode_vers_pcm_en_continu(
+    chemin: &str,
+    source: Option<Box<dyn MediaSource>>,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+) -> Result<(u16, u32), String> {
+    decode_vers_pcm_en_continu_depuis(
+        chemin,
+        source,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        0.0,
+    )
+}
+
+/// #7336 — [`decode_vers_pcm_en_continu`] à partir de `seek_s` secondes du
+/// fichier source (saut dans la piste d'une sortie qui consomme le flux
+/// elle-même : Sortie AES67). Même saut à l'échantillon près que les autres
+/// variantes ; une source qui ne sait pas sauter (corps HTTP lu en continu)
+/// repart du début, à l'appelant d'écarter les trames en trop.
+// Même signature que la variante sans saut, plus `seek_s` ; même choix que
+// decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_vers_pcm_en_continu_depuis(
+    chemin: &str,
+    source: Option<Box<dyn MediaSource>>,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    seek_s: f64,
+) -> Result<(u16, u32), String> {
+    decode_to_pcm_streaming_inner(
+        chemin,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        None,
+        None,
+        seek_s.max(0.0),
+        source,
     )
 }
 
@@ -2135,6 +2285,9 @@ pub fn decode_source_to_pcm_streaming(
     )
 }
 
+// Cœur commun des variantes publiques ci-dessus, qui lui passent leurs
+// paramètres tels quels ; même choix que decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
 fn decode_to_pcm_streaming_inner(
     file_path: &str,
     target_sample_rate: Option<u32>,
@@ -2199,7 +2352,7 @@ fn decode_to_pcm_streaming_inner(
             (frequence, canaux as u32)
         } else {
             let info = super::dff::parse_dff(file_path)?;
-            (info.sample_rate, info.channels as u32)
+            (info.sample_rate, info.channels)
         };
         let dsd_output_rate =
             target_sample_rate.unwrap_or_else(|| super::dsd_to_pcm::choose_output_rate(dsd_rate));
@@ -2209,7 +2362,7 @@ fn decode_to_pcm_streaming_inner(
         // Send WAV header so LocalOutput can parse stream metadata
         if target_bit_depth.is_some() {
             let wav_hdr = super::wav::build_wav_header(dsd_channels, dsd_output_rate, output_bd);
-            if let Err(_) = rt.block_on(tx.send(wav_hdr.to_vec())) {
+            if rt.block_on(tx.send(wav_hdr.to_vec())).is_err() {
                 return Ok((output_bd, dsd_output_rate));
             }
             if let Some(n) = &data_ready {
@@ -2394,7 +2547,7 @@ fn decode_to_pcm_streaming_inner(
         let sr = decoded.sample_rate;
         if target_bit_depth.is_some() {
             let wav_hdr = super::wav::build_wav_header(ch, sr, output_bd);
-            if let Err(_) = rt.block_on(tx.send(wav_hdr.to_vec())) {
+            if rt.block_on(tx.send(wav_hdr.to_vec())).is_err() {
                 return Ok((output_bd, sr));
             }
             if let Some(ref n) = data_ready {
@@ -2538,14 +2691,19 @@ fn decode_to_pcm_streaming_inner(
         );
     }
     let output_rate = target_sample_rate.unwrap_or(source_rate);
-    let output_channels = target_channels.unwrap_or_else(|| source_channels);
+    let output_channels = target_channels.unwrap_or(source_channels);
     let mut pcm_adapter = StreamingPcmAdapter::new(
         source_bd,
         source_channels,
         output_channels,
         source_rate,
         output_rate,
-    )?;
+    )?
+    .avec_la_disposition(disposition_pour_le_routage(
+        file_path,
+        source_channels,
+        Some(output_channels),
+    ));
 
     let rt = tokio::runtime::Handle::try_current()
         .map_err(|_| "no tokio runtime for streaming decode")?;
@@ -2601,7 +2759,7 @@ fn decode_to_pcm_streaming_inner(
     if target_bit_depth.is_some() {
         let channels = checked_channels(output_channels, "stream target")?;
         let wav_hdr = super::wav::build_wav_header(channels, output_rate, output_bd);
-        if let Err(_) = rt.block_on(tx.send(wav_hdr.to_vec())) {
+        if rt.block_on(tx.send(wav_hdr.to_vec())).is_err() {
             return Ok((output_bd, output_rate));
         }
         if let Some(ref n) = data_ready {
@@ -2980,7 +3138,7 @@ fn ape_open_checked(
 /// faire. Le résultat est identique bit à bit.
 fn ape_pcm_to_i32(pcm: &[u8], header: &ApeHeaderInfo, out: &mut Vec<i32>) -> Result<(), String> {
     let bytes_per_sample = (header.bit_depth / 8) as usize;
-    if bytes_per_sample == 0 || pcm.len() % bytes_per_sample != 0 {
+    if bytes_per_sample == 0 || !pcm.len().is_multiple_of(bytes_per_sample) {
         return Err("ape: PCM byte length not aligned to sample size".into());
     }
     out.reserve(pcm.len() / bytes_per_sample);
@@ -2999,19 +3157,19 @@ fn ape_pcm_to_i32(pcm: &[u8], header: &ApeHeaderInfo, out: &mut Vec<i32>) -> Res
             }
         }
         16 => {
-            for b in pcm.chunks_exact(2) {
+            for b in pcm.as_chunks::<2>().0 {
                 out.push(i16::from_le_bytes([b[0], b[1]]) as i32);
             }
         }
         24 => {
-            for b in pcm.chunks_exact(3) {
+            for b in pcm.as_chunks::<3>().0 {
                 let v = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
                 // sign-extend 24-bit -> i32
                 out.push((v << 8) >> 8);
             }
         }
         32 => {
-            for b in pcm.chunks_exact(4) {
+            for b in pcm.as_chunks::<4>().0 {
                 out.push(i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
             }
         }
@@ -3105,11 +3263,8 @@ fn decode_ape_to_pcm(
     let (start_frame, mut skip_interleaved) = ape_start_position(&mut decoder, &header, seek_s)?;
     // `max_duration_s` borne le décodage : on s'arrête dès que la fenêtre est
     // pleine, sans décoder la fin de la piste pour la jeter ensuite.
-    let max_samples: usize = echantillons_de_la_fenetre(
-        max_duration_s,
-        header.sample_rate,
-        u32::from(header.channels),
-    );
+    let max_samples: usize =
+        echantillons_de_la_fenetre(max_duration_s, header.sample_rate, header.channels);
     let start_sample = (start_frame as u64).saturating_mul(u64::from(header.blocks_per_frame));
     let expected_out = (header
         .total_samples
@@ -4265,13 +4420,21 @@ fn decoder_le_dsd_par_blocs(
         target_channels.unwrap_or(channels as u32),
         "DSD stream target",
     )?;
+    // #6057 — un DSF de type 5 (`FL FR C LFE`) replié pour un renderer qui
+    // annonce moins de canaux : routé par ses positions déclarées. Pour une
+    // URL (`source_name` n'est pas un fichier), rien n'est lu.
     let mut pcm_adapter = StreamingPcmAdapter::new(
         24,
         source_ch as u32,
         output_ch as u32,
         output_rate,
         output_rate,
-    )?;
+    )?
+    .avec_la_disposition(disposition_pour_le_routage(
+        source_name,
+        source_ch as u32,
+        Some(output_ch as u32),
+    ));
 
     // Accumulate PCM output and flush in chunk_size batches
     let mut pcm_buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
@@ -4287,7 +4450,9 @@ fn decoder_le_dsd_par_blocs(
                 return Ok(false);
             }
             let samples: Vec<i32> = pcm_24
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|c| {
                     let value = (c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16);
                     (value << 8) >> 8
@@ -4337,14 +4502,14 @@ fn decoder_le_dsd_par_blocs(
         }
     }
 
-    drop(process_dsd_chunk);
-
     // Flush remaining samples from the DSD FIR filter through the same channel
     // adapter as the body.
     let tail = streamer.flush();
     if !tail.is_empty() {
         let samples: Vec<i32> = tail
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| {
                 let value = (c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16);
                 (value << 8) >> 8
@@ -4377,10 +4542,8 @@ fn decoder_le_dsd_par_blocs(
                 false
             }
         };
-        if send_ok {
-            if let Some(ltx) = levels_tx {
-                super::tap::send_windowed_pcm(ltx, &pcm_buf, output_bd, output_ch, output_rate);
-            }
+        if send_ok && let Some(ltx) = levels_tx {
+            super::tap::send_windowed_pcm(ltx, &pcm_buf, output_bd, output_ch, output_rate);
         }
     }
 
@@ -4433,8 +4596,11 @@ pub fn decode_dsd_to_dop_streaming(
 /// sous le nom de sa première piste. Le lecteur SACD part directement de la
 /// trame de `debut_ms` et s'arrête à celle de `fin_ms`.
 ///
-/// Pour un DSF ou un DFF, la tranche n'est pas encore appliquée par ce
-/// chemin (comportement d'avant, inchangé) : seul l'ISO la reçoit.
+/// #6456 — un DSF ou un DFF la reçoit aussi : `debut_ms` est le déplacement
+/// de l'utilisateur (ou le début d'une piste CUE), `fin_ms` la fin de la
+/// tranche. Sans cela, un saut sur une sortie locale DoP relançait la piste
+/// depuis son premier bit pendant que l'horloge de la zone repartait de la
+/// position visée : le son recommençait, et la fin était déclarée trop tôt.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_dsd_to_dop_streaming_tranche(
     file_path: &str,
@@ -4529,7 +4695,18 @@ fn decode_dsd_to_dop_streaming_inner(
     if ext == "dsf" {
         let info = super::dsf::parse_dsf(file_path)?;
         let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
-        while let Some(dsd_chunk) = reader.next_chunk()? {
+        let (debut_ms, fin_ms) = tranche.unwrap_or((0, None));
+        let atteint = if debut_ms > 0 {
+            let cible = super::dsd_brut::octets_par_canal_pour_ms(dsd_rate, debut_ms) as usize;
+            reader.seek_to_bytes_per_channel(cible)? as u64
+        } else {
+            0
+        };
+        let mut borne = BorneDeTranche::new(dsd_rate, channels, atteint, fin_ms);
+        while let Some(mut dsd_chunk) = reader.next_chunk()? {
+            if !borne.couper(&mut dsd_chunk) {
+                break;
+            }
             process_chunk(&dsd_chunk)?;
         }
     } else if ext == "iso" {
@@ -4542,7 +4719,19 @@ fn decode_dsd_to_dop_streaming_inner(
         let info = super::dff::parse_dff(file_path)?;
         let read_chunk = 32768 / channels * channels;
         let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
-        while let Some(dsd_chunk) = reader.next_chunk()? {
+        let (debut_ms, fin_ms) = tranche.unwrap_or((0, None));
+        let atteint = if debut_ms > 0 {
+            let cible =
+                super::dsd_brut::octets_par_canal_pour_ms(dsd_rate, debut_ms) as usize * channels;
+            (reader.seek_to_interleaved_byte(cible, channels)? / channels) as u64
+        } else {
+            0
+        };
+        let mut borne = BorneDeTranche::new(dsd_rate, channels, atteint, fin_ms);
+        while let Some(mut dsd_chunk) = reader.next_chunk()? {
+            if !borne.couper(&mut dsd_chunk) {
+                break;
+            }
             process_chunk(&dsd_chunk)?;
         }
     }
@@ -4556,6 +4745,45 @@ fn decode_dsd_to_dop_streaming_inner(
         dsd_rate, dop_rate, channels, "decoded_dsd_dop_streaming"
     );
     Ok((24, dop_rate))
+}
+
+/// #6456 — la fin d'une tranche DSF/DFF, en octets PAR CANAL comptés depuis
+/// la position atteinte par le déplacement (l'ISO l'applique lui-même, dans
+/// son lecteur). Même règle que `dsd_brut::lire_dsd_brut`.
+struct BorneDeTranche {
+    canaux: usize,
+    reste_par_canal: Option<u64>,
+}
+
+impl BorneDeTranche {
+    fn new(cadence: u32, canaux: usize, atteint_par_canal: u64, fin_ms: Option<u64>) -> Self {
+        Self {
+            canaux: canaux.max(1),
+            reste_par_canal: fin_ms.map(|fin| {
+                super::dsd_brut::octets_par_canal_pour_ms(cadence, fin)
+                    .saturating_sub(atteint_par_canal)
+            }),
+        }
+    }
+
+    /// Tronque `bloc` (entrelacé) à ce qui reste de la tranche. `false` quand
+    /// la tranche était déjà épuisée : la lecture s'arrête là.
+    fn couper(&mut self, bloc: &mut Vec<u8>) -> bool {
+        let Some(reste) = self.reste_par_canal.as_mut() else {
+            return true;
+        };
+        if *reste == 0 {
+            return false;
+        }
+        let max = usize::try_from(*reste)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(self.canaux);
+        if bloc.len() > max {
+            bloc.truncate(max);
+        }
+        *reste = reste.saturating_sub((bloc.len() / self.canaux) as u64);
+        true
+    }
 }
 
 // Every DoP payload block, including a short first/final block, follows the
@@ -4599,6 +4827,14 @@ mod dop_terminal_tests_2369;
 #[cfg(test)]
 #[path = "pause_longue_4917_tests.rs"]
 mod pause_longue_4917_tests;
+
+#[cfg(test)]
+#[path = "dop_deplacement_tests_6456.rs"]
+pub(crate) mod dop_deplacement_tests_6456;
+
+#[cfg(test)]
+#[path = "disposition_reseau_tests_6057.rs"]
+mod disposition_reseau_tests_6057;
 
 /// Decode a DSD file (DSF or DFF) to PCM using streaming converter.
 ///
@@ -4696,7 +4932,7 @@ fn decode_dsd_to_pcm(
     // (a DSD64 album track is hundreds of MB; the old code held both the bytes
     // and the i32 samples, then copied a third time via `to_vec`).
     let append_pcm24 = |dst: &mut Vec<i32>, bytes: &[u8]| {
-        for c in bytes.chunks_exact(3) {
+        for c in bytes.as_chunks::<3>().0 {
             let v = c[0] as u32 | ((c[1] as u32) << 8) | ((c[2] as u32) << 16);
             dst.push(if v & 0x80_0000 != 0 {
                 (v | 0xFF00_0000) as i32
@@ -5886,7 +6122,7 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
             "limited decode should have fewer samples"
         );
         assert!(
-            half.samples_i32.len() > 0,
+            !half.samples_i32.is_empty(),
             "limited decode should still have samples"
         );
     }
@@ -6648,3 +6884,6 @@ mod fenetre_bornee_sans_copie_2156 {
         );
     }
 }
+#[cfg(test)]
+#[path = "canal_aac_signal_6990_tests.rs"]
+mod canal_aac_signal_6990_tests;

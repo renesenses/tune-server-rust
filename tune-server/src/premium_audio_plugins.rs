@@ -31,6 +31,10 @@ impl TunePlugin for PremiumAudio {
     fn version(&self) -> &str {
         "0.1.0"
     }
+    /// Le texte par défaut, en français. Les fiches de `GET /plugins` le
+    /// remplacent par la traduction de `plugin.description.<id>` dans la
+    /// langue de la requête (`routes::plugins::localiser_la_description`,
+    /// #6458) : ce texte-ci ne s'affiche plus tel quel.
     fn description(&self) -> &str {
         match self.id {
             "equalizer" => "Égaliseur : profil, graphique, paramétrique, presets et AutoEq",
@@ -119,10 +123,18 @@ pub fn descriptor(id: &str) -> Value {
         "ui":{"view":view,"zone_scoped":kind=="dsp","endpoints":endpoints,"levels_event":"playback.audio_levels","levels_premium":false},
         "lifecycle":{"disable":"pending_restart","uninstall":"preserve_configuration","running_jobs":"finish_or_explicit_cancel"}})
 }
-/// Les trois champs d'état d'un greffon audio premium, lus en base :
-/// `installed`, `install_proposed`, `existing_configuration`. `None` pour tout
+/// Les champs d'état d'un greffon audio premium, lus en base : `installed`,
+/// `enabled`, `install_proposed`, `existing_configuration`. `None` pour tout
 /// identifiant hors des quatre. C'est le contrat du client web pour la fiche
 /// `GET /api/v1/plugins/{id}` (à la racine) et pour [`descriptor_with_state`].
+///
+/// #6924 — `enabled` est [`premium_plugins::enabled`], le prédicat même qui
+/// ouvre les routes du greffon ([`require_installed`]) : ce qui fait marcher
+/// l'égaliseur, ce sont ses réglages, pas le chargement de son descripteur.
+/// La fiche dormante l'écrivait `false` en dur tant que ce processus ne
+/// l'avait pas chargé : l'interrupteur d'Extensions se décochait et la barre
+/// latérale (`installed && enabled`) effaçait l'entrée d'un égaliseur
+/// installé, actif et dont les routes répondaient.
 pub fn state_fields(settings: &SettingsRepo, id: &str) -> Option<serde_json::Map<String, Value>> {
     if !premium_plugins::contains(id) {
         return None;
@@ -131,6 +143,10 @@ pub fn state_fields(settings: &SettingsRepo, id: &str) -> Option<serde_json::Map
     fields.insert(
         "installed".into(),
         Value::Bool(premium_plugins::installed(settings, id)),
+    );
+    fields.insert(
+        "enabled".into(),
+        Value::Bool(premium_plugins::enabled(settings, id)),
     );
     fields.insert(
         "install_proposed".into(),
@@ -177,7 +193,15 @@ pub async fn register(loader: &PluginLoader, state: &AppState) {
             .await;
     }
 }
-pub fn require_installed(state: &AppState, id: &str) -> Result<(), axum::response::Response> {
+/// Refus 409 `plugin_unavailable` quand le greffon `id` n'est pas installé et
+/// activé. Le `message` suit la langue de la requête (`Accept-Language`, clé
+/// `plugin.unavailable`) : il était écrit en dur en français pour tout le
+/// monde (#6458). Le code `plugin_unavailable` reste le terme stable.
+pub fn require_installed(
+    state: &AppState,
+    id: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), axum::response::Response> {
     use axum::response::IntoResponse;
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let actif = if tune_core::audio::premium_plugins::contains(id) {
@@ -188,7 +212,16 @@ pub fn require_installed(state: &AppState, id: &str) -> Result<(), axum::respons
     if actif {
         Ok(())
     } else {
-        Err((axum::http::StatusCode::CONFLICT,axum::Json(json!({"error":"plugin_unavailable","plugin":id,"message":"Ce plugin doit être installé et activé."}))).into_response())
+        let lang = crate::i18n::lang_from_header(headers);
+        Err((
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(json!({
+                "error": "plugin_unavailable",
+                "plugin": id,
+                "message": crate::i18n::t(&lang, "plugin.unavailable"),
+            })),
+        )
+            .into_response())
     }
 }
 
@@ -441,6 +474,177 @@ pub(crate) mod tests {
             Some(r#"{"enabled":true,"bass_gain_db":4.0}"#),
             "le réglage doit rester intact"
         );
+    }
+
+    /// La fiche d'un greffon dans `GET /api/v1/plugins`.
+    async fn fiche_du_catalogue(app: &axum::Router, id: &str) -> Value {
+        let (status, catalogue) = appel(app, "GET", "/api/v1/plugins").await;
+        assert_eq!(status, StatusCode::OK, "{catalogue}");
+        catalogue
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == id)
+            .unwrap_or_else(|| panic!("{id} absent du catalogue : {catalogue}"))
+            .clone()
+    }
+
+    /// Ce que lit la barre latérale du client web (`entreeStudioVisible`,
+    /// `greffonsStudio.ts`) : l'entrée d'un greffon se montre s'il est
+    /// installé ET actif.
+    fn visible_dans_la_barre(fiche: &Value) -> bool {
+        fiche["installed"] == true && fiche["enabled"] == true
+    }
+
+    /// #6924 (régis, forum-hifi.fr) — l'égaliseur installé puis le serveur
+    /// redémarré : il doit rester actif dans Extensions et visible dans la
+    /// barre latérale, AVANT le redémarrage (ce processus ne l'a pas chargé)
+    /// comme APRÈS (un nouveau processus sur la même base).
+    #[tokio::test]
+    async fn temoin_6924_l_egaliseur_installe_reste_actif_et_visible_au_redemarrage() {
+        dossier_de_donnees_jetable();
+        let dossier = tempfile::tempdir().unwrap();
+        let base = dossier.path().join("tune.db");
+        let base = base.to_string_lossy();
+
+        // Premier processus : démarré sans égaliseur, puis « Installer ».
+        let state = AppState::new(&base, 0, Default::default()).unwrap();
+        let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+        let app = crate::routes::router_with_plugins(state.clone(), routers);
+        let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/equalizer/install").await;
+        assert_eq!(status, StatusCode::OK, "{reponse}");
+        let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/equalizer/enable").await;
+        assert_eq!(status, StatusCode::OK, "{reponse}");
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        assert!(premium_plugins::enabled(&settings, "equalizer"));
+
+        let fiche = fiche_du_catalogue(&app, "equalizer").await;
+        assert!(
+            visible_dans_la_barre(&fiche),
+            "égaliseur installé et actif (ses routes répondent) mais dit désactivé : \
+             l'interrupteur d'Extensions se décoche et la barre latérale l'efface — {fiche}"
+        );
+
+        // Redémarrage : un nouveau processus sur la même base.
+        let state = AppState::new(&base, 0, Default::default()).unwrap();
+        let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+        let app = crate::routes::router_with_plugins(state.clone(), routers);
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        assert!(
+            premium_plugins::enabled(&settings, "equalizer"),
+            "l'activation de l'égaliseur perdue au redémarrage"
+        );
+        let fiche = fiche_du_catalogue(&app, "equalizer").await;
+        assert!(
+            visible_dans_la_barre(&fiche),
+            "égaliseur désactivé ou absent de la barre après le redémarrage — {fiche}"
+        );
+        let (_, detail) = appel(&app, "GET", "/api/v1/plugins/equalizer").await;
+        assert!(visible_dans_la_barre(&detail), "{detail}");
+    }
+
+    /// #6924, l'autre sens : « Désactiver » ferme les routes de l'égaliseur
+    /// sur-le-champ (`require_installed`) ; la fiche le dit aussitôt, sans
+    /// attendre le redémarrage, et l'entrée quitte la barre latérale.
+    #[tokio::test]
+    async fn temoin_6924_l_egaliseur_desactive_quitte_la_barre_sans_attendre() {
+        dossier_de_donnees_jetable();
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings.set("plugin_equalizer_installed", "true").unwrap();
+        settings.set("plugin_equalizer_enabled", "true").unwrap();
+        let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+        let app = crate::routes::router_with_plugins(state.clone(), routers);
+        assert!(visible_dans_la_barre(
+            &fiche_du_catalogue(&app, "equalizer").await
+        ));
+
+        let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/equalizer/disable").await;
+        assert_eq!(status, StatusCode::OK, "{reponse}");
+        assert!(!premium_plugins::enabled(&settings, "equalizer"));
+        let fiche = fiche_du_catalogue(&app, "equalizer").await;
+        assert_eq!(fiche["installed"], true, "{fiche}");
+        assert_eq!(
+            fiche["enabled"], false,
+            "égaliseur désactivé, routes fermées, mais fiche encore active — {fiche}"
+        );
+    }
+
+    /// #6974 (JeanPitre, fil 2248) — « l'égaliseur en mode Expert reste
+    /// inaccessible malgré une licence Premium valide ». L'égaliseur est
+    /// gratuit : ce qui ouvre ses écritures (résolution Expert, bandes de la
+    /// zone), c'est le greffon installé et actif, jamais le palier. Témoin par
+    /// les routes réelles, Free comme Premium : avant l'installation, le refus
+    /// est `plugin_unavailable` (409), jamais `premium_required` (402) ; après,
+    /// les deux routes de l'écran Expert répondent et la barre latérale le
+    /// montre.
+    #[tokio::test]
+    async fn temoin_6974_l_egaliseur_expert_s_ouvre_par_l_installation_quel_que_soit_le_palier() {
+        for premium in [true, false] {
+            dossier_de_donnees_jetable();
+            let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+            let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+            if premium {
+                state
+                    .license
+                    .update_from_server(tune_core::license::Tier::Premium, None)
+                    .await;
+            }
+            assert_eq!(state.license.is_premium().await, premium);
+            let app = crate::routes::router_with_plugins(state.clone(), routers);
+            let palier = if premium { "Premium" } else { "Free" };
+            let resolution = json!({"expert_bands": 31});
+            let bandes = json!({
+                "enabled": true,
+                "bands": [{"freq": 1000.0, "gain": 3.0, "q": 1.0, "type": "peak"}],
+            });
+
+            // Pas encore installé : la porte fermée est celle du greffon.
+            for (chemin, corps) in [
+                ("/api/v1/eq/expert-settings", &resolution),
+                ("/api/v1/zones/1/eq", &bandes),
+            ] {
+                let (status, reponse) = appel_avec_corps(&app, "POST", chemin, corps.clone()).await;
+                assert_eq!(
+                    (status, reponse["error"].as_str()),
+                    (StatusCode::CONFLICT, Some("plugin_unavailable")),
+                    "{palier}, égaliseur non installé : {chemin} doit dire le greffon \
+                     absent, pas une licence manquante — {reponse}"
+                );
+            }
+
+            let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/equalizer/install").await;
+            assert_eq!(status, StatusCode::OK, "{palier} : installation {reponse}");
+            let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/equalizer/enable").await;
+            assert_eq!(status, StatusCode::OK, "{palier} : activation {reponse}");
+
+            // Installé et actif : l'écran Expert écrit, Free comme Premium.
+            let (status, reponse) = appel_avec_corps(
+                &app,
+                "POST",
+                "/api/v1/eq/expert-settings",
+                resolution.clone(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{palier}, égaliseur installé : la résolution Expert refusée — {reponse}"
+            );
+            let (_, relu) = appel(&app, "GET", "/api/v1/eq/expert-settings").await;
+            assert_eq!(relu["expert_bands"], 31, "{palier} : {relu}");
+            let (status, reponse) =
+                appel_avec_corps(&app, "POST", "/api/v1/zones/1/eq", bandes.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{palier}, égaliseur installé : les bandes Expert refusées — {reponse}"
+            );
+            assert!(
+                visible_dans_la_barre(&fiche_du_catalogue(&app, "equalizer").await),
+                "{palier} : égaliseur installé et actif absent de la barre latérale"
+            );
+        }
     }
 
     /// #4861, témoin de bout en bout : premier démarrage vu comme Free, puis

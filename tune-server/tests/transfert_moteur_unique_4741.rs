@@ -559,6 +559,66 @@ async fn l_import_dans_la_bibliotheque_passe_par_le_greffon_4741() {
     assert!(journal(&b.ecritures_cible).is_empty());
 }
 
+/// 🔴 #6499 (Bertrand, rc6) — une playlist de la bibliothèque qui mêle un
+/// titre DÉJÀ chez la cible et une piste locale, transférée vers ce service,
+/// par la route et le VRAI `main.wasm`. Le titre de service est versé sous
+/// son identifiant d'origine, à sa place, sans appariement ; la piste locale
+/// est appariée (la bonne édition, pas le remaster). Avant le correctif, le
+/// titre de service n'atteignait même pas le greffon : 1 titre sur 1 annoncé,
+/// un seul versé.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_titre_deja_chez_la_cible_est_repris_tel_quel_6499() {
+    use tune_core::db::playlist_repo::{EntryContent, ServiceEntry};
+
+    let _verrou = crate::lock_environment();
+    let b = banc(true).await;
+    let repo = PlaylistRepo::with_backend(b.state.backend.clone());
+    let id = repo.create("Mixte", None, 1).unwrap();
+    repo.add_entries_deduped(
+        id,
+        &[
+            EntryContent::Service(ServiceEntry {
+                source: "cible".into(),
+                source_id: "c-deja".into(),
+                title: "Déjà chez la cible".into(),
+                artist: Some("Quelqu'un".into()),
+                album: None,
+                album_source_id: None,
+                duration_ms: Some(180_000),
+                cover_url: None,
+            }),
+            EntryContent::Local(1),
+        ],
+        None,
+    )
+    .unwrap();
+
+    let (st, rendu) = appel(
+        &b.app,
+        "POST",
+        "/api/v1/playlist-manager/transfer",
+        json!({
+            "source_service": "local",
+            "source_playlist_id": id.to_string(),
+            "target_service": "cible",
+            "target_name": "Mixte chez la cible",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rendu}");
+    assert_eq!(rendu["total_tracks"], 2, "{rendu}");
+    assert_eq!(rendu["matched"], 2, "{rendu}");
+    assert_eq!(rendu["not_found"], 0, "{rendu}");
+    assert_eq!(
+        journal(&b.ecritures_cible),
+        vec![
+            "creation:Mixte chez la cible".to_string(),
+            "ajout:pl-creee:c-deja,c-bonne".to_string(),
+        ],
+        "{rendu}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3. Les deux autres moteurs ont disparu
 // ---------------------------------------------------------------------------

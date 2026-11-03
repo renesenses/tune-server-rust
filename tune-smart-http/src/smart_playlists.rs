@@ -11,6 +11,7 @@ use tune_core::db::engine::Engine;
 use crate::SmartHttpState;
 use crate::catalogue;
 use crate::regles_sql;
+use crate::requete_enregistree;
 use crate::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
 use crate::source_streaming::{self, Objet};
 use tune_http_types::{ActiveProfile, AppError};
@@ -23,6 +24,30 @@ struct CreateSmartPlaylist {
     sort_by: Option<String>,
     sort_order: Option<String>,
     max_tracks: Option<i64>,
+    /// #6731 — `"assistant"` quand les règles viennent de l'Assistant IA.
+    /// Absent pour une saisie à la main, où une playlist sans règle reste
+    /// légitime (« Recently Added » : toute la bibliothèque, coupée).
+    #[serde(default)]
+    origine: Option<String>,
+}
+
+/// #6731 — une playlist issue de l'assistant SANS règle rendrait toute la
+/// bibliothèque : on la refuse. La raison du refus, ou `None` si elle passe.
+fn refus_assistant_sans_regle(origine: Option<&str>, rules: &Value) -> Option<&'static str> {
+    if origine != Some("assistant") {
+        return None;
+    }
+    let vide = match rules {
+        Value::Array(a) => a.is_empty(),
+        Value::String(t) => serde_json::from_str::<Value>(t)
+            .ok()
+            .and_then(|v| v.as_array().map(Vec::is_empty))
+            .unwrap_or(true),
+        _ => true,
+    };
+    vide.then_some(
+        "aucune_regle : une playlist proposée par l'assistant doit porter au moins une règle",
+    )
 }
 
 #[derive(Deserialize)]
@@ -63,6 +88,8 @@ where
         .route("/{id}/tracks", get(resolve_tracks))
         .route("/{id}/albums", get(smart_collection_albums))
         .route("/preview", post(preview_smart_collection))
+        // #6287 — la requête TEXTUELLE (`crate::requete_texte`).
+        .route("/requete", post(requete_textuelle))
 }
 
 async fn list_smart_playlists(
@@ -102,6 +129,10 @@ async fn create_smart_playlist(
     State(state): State<SmartHttpState>,
     Json(body): Json<CreateSmartPlaylist>,
 ) -> Result<impl IntoResponse, AppError> {
+    if let Some(raison) = refus_assistant_sans_regle(body.origine.as_deref(), &body.rules) {
+        tracing::warn!(nom = %body.name, "smart_playlist_assistant_sans_regle_refusee");
+        return Err(AppError::bad_request(raison));
+    }
     let rules_json = body.rules.to_string();
     let match_mode = body.match_mode.clone().unwrap_or_else(|| "all".into());
     let sort_by = body.sort_by.clone().unwrap_or_else(|| "title".into());
@@ -109,6 +140,11 @@ async fn create_smart_playlist(
 
     // Refuse les références circulaires (A ⊂ B ⊂ A) entre entités smart.
     let resolver = DbRefResolver::new(&state.backend);
+    // #6287, étape 4 — une requête imbriquée fautive est refusée avant d'être
+    // écrite, avec le corps de la route `/requete`.
+    if let Err(refus) = requete_enregistree::valider(&body.rules, &RefCtx::root(&resolver, None)) {
+        return Ok((StatusCode::BAD_REQUEST, Json(refus.corps())).into_response());
+    }
     smart_refs::check_no_cycle(
         &resolver,
         RefKind::SmartPlaylist,
@@ -212,6 +248,10 @@ async fn update_smart_playlist(
             })
             .unwrap_or_else(|| format!("#{id}"));
         let resolver = DbRefResolver::new(&state.backend);
+        // #6287, étape 4 — comme à la création.
+        if let Err(refus) = requete_enregistree::valider(rules, &RefCtx::root(&resolver, None)) {
+            return Ok((StatusCode::BAD_REQUEST, Json(refus.corps())).into_response());
+        }
         smart_refs::check_no_cycle(
             &resolver,
             RefKind::SmartPlaylist,
@@ -407,6 +447,22 @@ pub(crate) fn build_smart_query_rapport(
         let value_txt = regles_sql::texte_de(value_raw);
         let value = value_txt.as_str();
 
+        // #6287, étape 4 — une requête imbriquée enregistrée : sa condition
+        // entière, ou FAUX et nommée si elle ne s'évalue plus.
+        if field == requete_enregistree::CHAMP {
+            match requete_enregistree::condition(rule, ctx) {
+                Ok((c, refus)) => {
+                    refusees.extend(refus);
+                    conditions.push(c);
+                }
+                Err(_) => {
+                    refusees.push(format!("{field} {op}"));
+                    conditions.push(regles_sql::FAUX.to_string());
+                }
+            }
+            continue;
+        }
+
         // --- règles « référence » (collection / playlist / favori) ---
         if smart_refs::is_ref_field(field) {
             conditions.push(smart_refs::track_ref_condition(field, raw_op, value, ctx));
@@ -426,6 +482,21 @@ pub(crate) fn build_smart_query_rapport(
             // réponse est constante (voir `regles_sql`).
             match regles_sql::condition_marquage_ia_bibliotheque(op) {
                 Some(c) => c.to_string(),
+                None => {
+                    refusees.push(format!("{field} {op}"));
+                    regles_sql::FAUX.to_string()
+                }
+            }
+        } else if field == "hires_verdict" {
+            // #6285 — le verdict hi-res PUBLIÉ de la piste.
+            match regles_sql::condition_verdict_hires(
+                "t.id",
+                false,
+                op,
+                value,
+                ctx.resolver.hires_douteux_visible(),
+            ) {
+                Some(c) => c,
                 None => {
                     refusees.push(format!("{field} {op}"));
                     regles_sql::FAUX.to_string()
@@ -1076,6 +1147,105 @@ async fn preview_smart_collection(
     ))
 }
 
+#[derive(Deserialize)]
+struct RequeteTextuelle {
+    q: String,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
+    max_tracks: Option<i64>,
+}
+
+/// `POST /library/smart-playlists/requete` — #6287 : exécute une requête
+/// écrite dans le langage de `crate::requete_texte`, et rend aussi sa forme
+/// d'éditeur quand elle en a une.
+///
+/// - 200 : `tracks`, `total`, `regles_refusees` (comme l'aperçu), `rules` et
+///   `match_mode` (ou `null` : requête imbriquée ou niée, sans forme
+///   visuelle), et `enregistrement` (`{rules, match_mode}`, jamais `null`) :
+///   ce que `POST /library/smart-playlists` enregistre (étape 4, voir
+///   `crate::requete_enregistree`) ;
+/// - 400 : `{"error": "requete_invalide", "message", "position"}`, la position
+///   en caractères depuis le début de la requête. La requête est bornée
+///   (`LONGUEUR_MAX` caractères, `PROFONDEUR_MAX` imbrications). Un critère
+///   que le moteur refuse sous une négation refuse toute la requête, avec
+///   `position: null`.
+///
+/// Les favoris de SERVICE et les pistes de catalogue qu'ajoute l'aperçu
+/// (règles `source`, `catalogue:`) ne sont pas ajoutés ici : la requête porte
+/// sur la bibliothèque (étape 1, voir la PR).
+async fn requete_textuelle(
+    State(state): State<SmartHttpState>,
+    profile: ActiveProfile,
+    Json(body): Json<RequeteTextuelle>,
+) -> axum::response::Response {
+    let arbre = match crate::requete_texte::analyser(&body.q) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "requete_invalide",
+                    "message": e.message,
+                    "position": e.position,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let sort_by = body.sort_by.as_deref().unwrap_or("title");
+    let sort_order = body.sort_order.as_deref().unwrap_or("asc");
+    let (items, refusees) = {
+        let resolver = DbRefResolver::new(&state.backend);
+        let ctx = RefCtx::root(&resolver, Some(profile.id()));
+        let compilee = crate::requete_texte::compiler(&arbre, &ctx);
+        // Sous NON, un critère refusé (FAUX) deviendrait VRAI et rendrait
+        // toute la bibliothèque : la requête entière est refusée.
+        if !compilee.refusees_sous_non.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "requete_invalide",
+                    "message": format!(
+                        "critère refusé sous une négation (il rendrait toute la bibliothèque) : {}",
+                        compilee.refusees_sous_non.join(", ")
+                    ),
+                    "position": null,
+                })),
+            )
+                .into_response();
+        }
+        // L'ordre et la borne : ceux du moteur, sans règle.
+        let (_w, order, limit_clause, _r) =
+            build_smart_query_rapport("[]", "all", sort_by, sort_order, body.max_tracks, &ctx);
+        match execute_smart_track_query(
+            &state,
+            profile.id(),
+            &format!("WHERE {}", compilee.condition),
+            &order,
+            &limit_clause,
+        ) {
+            Ok(items) => (items, compilee.refusees),
+            Err(e) => return e.into_response(),
+        }
+    };
+    let (rules, match_mode) = match crate::requete_texte::regles_editeur(&arbre) {
+        Some((r, m)) => (Value::Array(r), json!(m)),
+        None => (Value::Null, Value::Null),
+    };
+    // #6287, étape 4 — ce que l'éditeur enregistre tel quel : les règles de
+    // l'éditeur d'une requête plate, ou la règle `requete` d'une imbriquée.
+    let (a_enregistrer, mode_a_enregistrer) = requete_enregistree::enregistrement(&body.q, &arbre);
+    Json(json!({
+        "tracks": items,
+        "total": items.len(),
+        "regles_refusees": refusees,
+        "rules": rules,
+        "match_mode": match_mode,
+        "enregistrement": {"rules": a_enregistrer, "match_mode": mode_a_enregistrer},
+    }))
+    .into_response()
+}
+
 pub(crate) fn strip_accents(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -1159,7 +1329,27 @@ pub(crate) fn strip_accents(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_smart_query, build_smart_query_rapport};
+    use super::{build_smart_query, build_smart_query_rapport, refus_assistant_sans_regle};
+
+    /// #6731 — l'assistant ne crée jamais une playlist vide de règles ; une
+    /// saisie à la main le peut toujours.
+    #[test]
+    fn une_playlist_de_l_assistant_sans_regle_est_refusee_6731() {
+        use serde_json::json;
+        let a = Some("assistant");
+        assert!(refus_assistant_sans_regle(a, &json!([])).is_some());
+        assert!(refus_assistant_sans_regle(a, &json!("[]")).is_some());
+        assert!(refus_assistant_sans_regle(a, &json!(null)).is_some());
+        assert!(
+            refus_assistant_sans_regle(
+                a,
+                &json!([{"field": "genre", "op": "contains", "value": "Jazz"}])
+            )
+            .is_none()
+        );
+        // La contre-épreuve : sans origine, `[]` reste permis.
+        assert!(refus_assistant_sans_regle(None, &json!([])).is_none());
+    }
     use crate::smart_refs::{EmptyResolver, RefCtx};
 
     fn where_of(rules: &str) -> String {

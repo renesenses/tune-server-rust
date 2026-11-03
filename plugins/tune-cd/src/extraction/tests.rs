@@ -795,3 +795,80 @@ async fn les_routes_d_extraction_exigent_un_administrateur() {
     assert!(verdict_admin(false, None).is_ok());
     assert!(verdict_admin(true, admin().as_ref()).is_ok());
 }
+
+#[tokio::test]
+async fn le_cd_arrete_s_extrait_sans_detour_et_la_pause_le_reserve_encore_7104() {
+    use crate::hote::HoteOrchestrateur;
+    use tune_core::http::streamer::AudioStreamer;
+    use tune_core::orchestrator::PlaybackOrchestrator;
+    use tune_core::outputs::registry::OutputRegistry;
+    use tune_core::playback::{NowPlaying, PlayState, PlaybackManager};
+    use tune_core::streaming::registry::ServiceRegistry;
+
+    let lecteur = Arc::new(LecteurSimule::new(petite_toc()));
+    let mut banc = Banc::new(lecteur, Arc::new(SansReseau));
+    let playback = Arc::new(PlaybackManager::new());
+    let orch = Arc::new(PlaybackOrchestrator::new(
+        banc.backend.clone(),
+        playback.clone(),
+        Arc::new(AudioStreamer::new(0)),
+        Arc::new(tokio::sync::Mutex::new(ServiceRegistry::new())),
+        Arc::new(tokio::sync::Mutex::new(OutputRegistry::new())),
+        None,
+    ));
+    banc.routes.hote = Arc::new(HoteOrchestrateur {
+        backend: banc.backend.clone(),
+        orchestrator: orch,
+        playback: playback.clone(),
+    });
+    let zone = 7104;
+    banc.routes.zones.lock().await.insert(zone);
+    // Le vrai gestionnaire conserve ce CD dans now_playing après Stop.
+    // Aucune sortie n'est ouverte : seule l'extraction du lecteur simulé
+    // écrit des octets dans la bibliothèque temporaire du banc.
+    playback
+        .play(
+            zone,
+            NowPlaying {
+                source: SOURCE.into(),
+                source_id: Some("disque-7104/1".into()),
+                title: "CD arrêté".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    let demande = json!({"format":"wav", "pistes":[1]});
+    for pause in [false, true] {
+        if pause {
+            playback.pause(zone).await;
+        }
+        let (code, refus) = banc
+            .appel("POST", "/extractions", Some(demande.clone()))
+            .await;
+        assert_eq!(
+            code,
+            StatusCode::CONFLICT,
+            "le CD actif ou en pause doit rester réservé : {refus}"
+        );
+        assert_eq!(refus["error"], "lecture_en_cours");
+        assert!(banc.ex.liste().is_empty());
+    }
+    playback.stop(zone).await;
+    let arrete = playback.get_state(zone).await;
+    assert_eq!(arrete.state, PlayState::Stopped);
+    assert_eq!(
+        arrete.now_playing.unwrap().source,
+        SOURCE,
+        "la reprise garde bien le morceau après Stop"
+    );
+    let (code, extraction) = banc.appel("POST", "/extractions", Some(demande)).await;
+    assert_eq!(
+        code,
+        StatusCode::ACCEPTED,
+        "#7104 : après Stop, le CD conservé pour la reprise ne doit plus bloquer l'extraction : {extraction}"
+    );
+    let fin = banc.attendre(extraction["id"].as_str().unwrap()).await;
+    assert_eq!(fin["statut"], "terminee", "{fin}");
+    assert_eq!(fin["pistes"][0]["statut"], "terminee");
+    assert!(Path::new(fin["pistes"][0]["fichier"].as_str().unwrap()).is_file());
+}

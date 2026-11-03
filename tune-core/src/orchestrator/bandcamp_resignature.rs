@@ -88,6 +88,55 @@ pub(super) fn url_resignee(pistes: &[StreamTrack], ancienne: &str) -> Option<Str
         .map(|p| p.id.clone())
 }
 
+/// #6471 — `url` est-elle la PAGE d'une piste Bandcamp (`…/track/<titre>`),
+/// et non une URL de flux (`…/stream/…`) ?
+///
+/// La recherche de pistes Bandcamp (`tune_bandcamp::rechercher_pistes`, celle
+/// des « Autres versions ») rend l'adresse de la page, `item_url_path` : c'est
+/// tout ce que l'API de recherche connaît. Jouée telle quelle, cette adresse
+/// partait vers la sortie comme un flux audio — le Chromecast de FabienM
+/// recevait du HTML et répondait « Failed to load media ».
+pub(super) fn est_une_page_de_piste_bandcamp(url: &str) -> bool {
+    let Some(reste) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let chemin = reste.split(['?', '#']).next().unwrap_or(reste);
+    chemin
+        .find('/')
+        .is_some_and(|debut| chemin[debut..].starts_with("/track/"))
+}
+
+/// #6471 — l'URL de flux du jour de la piste qu'une page `/track/` présente.
+///
+/// La page se lit comme celle d'un album (`get_album_tracks`) : Bandcamp y
+/// publie le même bloc `data-tralbum`, avec UNE piste. Plus d'une piste, ou
+/// aucune, est un refus : on ne devine pas laquelle jouer.
+pub(super) async fn flux_de_la_page_de_piste(
+    services: &Arc<Mutex<ServiceRegistry>>,
+    page: &str,
+) -> Result<String, String> {
+    let registre = services.lock().await;
+    let svc = registre
+        .get(SERVICE_BANDCAMP)
+        .ok_or_else(|| "service bandcamp absent du registre".to_string())?;
+    let svc = svc.read().await;
+    let pistes = svc
+        .get_album_tracks(page)
+        .await
+        .map_err(|e| format!("lecture de la page Bandcamp {page} : {e}"))?;
+    match pistes.as_slice() {
+        [piste] => Ok(piste.id.clone()),
+        [] => Err(format!("aucune piste jouable sur la page Bandcamp {page}")),
+        _ => Err(format!(
+            "la page Bandcamp {page} présente {} pistes, une seule était attendue",
+            pistes.len()
+        )),
+    }
+}
+
 /// Le mécanisme de nouvelle résolution d'une piste Bandcamp : relire `page`
 /// auprès du service Bandcamp du registre, et rendre l'URL fraîche de la piste
 /// dont `ancienne` est une signature périmée.

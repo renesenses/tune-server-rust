@@ -65,8 +65,11 @@ impl RefusProfondeur {
             "requested_bits": self.demandee_bits,
             "device_bits": self.sortie_bits,
             "fatal": true,
+            // #7077 — le client traduit `code` + bits ; ceci n'est que le
+            // repli, en anglais (il était en français quelle que soit la
+            // langue de l'interface).
             "error": format!(
-                "Bit-perfect strict : lecture refusée — ce chemin de lecture réduit la source de {} bits à {} bits. Désactivez « Bit-perfect strict » dans les réglages de la zone pour jouer avec conversion.",
+                "Strict bit-perfect: playback refused — this playback path reduces the source from {} bits to {} bits. Turn off “Strict bit-perfect” in the zone settings to play with conversion.",
                 self.demandee_bits, self.sortie_bits
             ),
         })

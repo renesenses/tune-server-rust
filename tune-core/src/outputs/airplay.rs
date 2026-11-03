@@ -1,6 +1,12 @@
 #[path = "airplay_timing.rs"]
 mod timing;
 
+#[path = "airplay_controle.rs"]
+mod controle;
+
+#[path = "airplay_flux_progressif.rs"]
+mod flux_progressif;
+
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -120,6 +126,23 @@ impl HorlogeCadencementRtp {
         Some(duree)
     }
 
+    /// #6673 — la boucle a attendu le decodeur au-dela de `tolere` : decaler
+    /// l'origine du retard, comme pour une pause, au lieu de servir en rafale
+    /// les echeances tombees dans le passe.
+    fn rattraper_un_retard(
+        &mut self,
+        maintenant: tokio::time::Instant,
+        trames: u64,
+        tolere: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        let retard = maintenant.saturating_duration_since(self.echeance(trames));
+        if retard <= tolere {
+            return None;
+        }
+        self.origine += retard;
+        Some(retard)
+    }
+
     fn echeance(&self, trames: u64) -> tokio::time::Instant {
         self.origine + std::time::Duration::from_micros(trames * 1_000_000 / SAMPLE_RATE as u64)
     }
@@ -142,6 +165,12 @@ pub struct AirplayOutput {
     stop_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     rtsp_session: Arc<Mutex<Option<RtspSession>>>,
     rtp: Arc<CurseurRtpAirplay>,
+    echec: Arc<std::sync::Mutex<Option<String>>>,
+    generation: Arc<AtomicU64>,
+    /// L'appareil s'annonce AirPlay 2 ou exige un appairage (bits `features`
+    /// / `sf` du mDNS) alors qu'il est servi par ce chemin AirPlay 1 (RAOP),
+    /// qui ne fait aucun appairage. Sert à dire la vraie cause d'un 403.
+    appairage_airplay2_requis: bool,
 }
 
 struct RtspSession {
@@ -150,7 +179,81 @@ struct RtspSession {
     session_id: Option<String>,
     server_port: u16,
     timing_port: u16,
+    /// #6751 — le port de contrôle que le récepteur annonce dans sa réponse
+    /// au SETUP : la destination des paquets sync. 0 s'il n'en annonce pas.
+    control_port: u16,
     auxiliary_udp: Option<timing::AuxiliaryUdp>,
+    /// #6885 — ce que l'émetteur dit de lui-même dans l'URI et le SDP.
+    identite: IdentiteSessionRaop,
+}
+
+/// #6885 — l'identité qu'un émetteur AirPlay 1 donne de lui-même au
+/// récepteur : l'adresse LOCALE de la connexion RTSP (celle que voit le
+/// récepteur), l'adresse du récepteur, et un identifiant de session tiré une
+/// fois par connexion. Tune annonçait `rtsp://127.0.0.1/1` et
+/// `o=iTunes 1 O IN IP4 127.0.0.1` / `c=IN IP4 127.0.0.1` (avec une lettre
+/// « O » à la place de la version « 0 »), quelle que soit la connexion.
+///
+/// Forme retenue, celle d'OwnTone (`src/outputs/raop.c`) et de l'exemple
+/// iTunes de la spécification AirTunes v2 non officielle :
+/// `rtsp://<ip_locale>/<id>` (`[ip]` en IPv6), `o=iTunes <id> 0 IN IP4|IP6
+/// <ip_locale>`, `c=IN IP4|IP6 <ip_récepteur>`. libraop met aussi
+/// l'adresse locale (getsockname) dans `o=` et le récepteur dans `c=`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IdentiteSessionRaop {
+    id: u32,
+    locale: std::net::IpAddr,
+    recepteur: std::net::IpAddr,
+}
+
+impl IdentiteSessionRaop {
+    fn new(id: u32, locale: std::net::IpAddr, recepteur: std::net::IpAddr) -> Self {
+        // Une socket IPv6 double pile rend `::ffff:a.b.c.d` pour une
+        // connexion IPv4 : c'est une adresse IPv4, l'annoncer comme telle.
+        Self {
+            id,
+            locale: locale.to_canonical(),
+            recepteur: recepteur.to_canonical(),
+        }
+    }
+
+    /// Identifiant numérique tiré au hasard, comme iTunes, libraop et OwnTone.
+    fn tirer_id() -> u32 {
+        let mut octets = [0_u8; 4];
+        getrandom::getrandom(&mut octets).expect("OS RNG unavailable");
+        u32::from_be_bytes(octets)
+    }
+
+    fn uri(&self) -> String {
+        match self.locale {
+            std::net::IpAddr::V4(ip) => format!("rtsp://{ip}/{}", self.id),
+            // L'affichage d'une `Ipv6Addr` ne porte pas d'identifiant de
+            // zone (`%eth0`) : il n'a rien à faire dans l'URI.
+            std::net::IpAddr::V6(ip) => format!("rtsp://[{ip}]/{}", self.id),
+        }
+    }
+
+    fn sdp_announce(&self) -> String {
+        format!(
+            "v=0\r\n\
+             o=iTunes {id} 0 IN {famille_locale} {locale}\r\n\
+             s=iTunes\r\n\
+             c=IN {famille_recepteur} {recepteur}\r\n\
+             t=0 0\r\n\
+             m=audio 0 RTP/AVP 96\r\n\
+             a=rtpmap:96 L16/{SAMPLE_RATE}/{CHANNELS}\r\n\
+             a=fmtp:96 {FRAMES_PER_PACKET} 0 {BYTES_PER_SAMPLE} 40 10 14 {CHANNELS} 255 0 0 {SAMPLE_RATE}\r\n",
+            id = self.id,
+            famille_locale = famille_sdp(&self.locale),
+            locale = self.locale,
+            famille_recepteur = famille_sdp(&self.recepteur),
+            recepteur = self.recepteur,
+        )
+    }
+}
+
+fn famille_sdp(ip: &std::net::IpAddr) -> &'static str {
+    if ip.is_ipv4() { "IP4" } else { "IP6" }
 }
 
 impl AirplayOutput {
@@ -172,11 +275,59 @@ impl AirplayOutput {
             stop_tx: Arc::new(Mutex::new(None)),
             rtsp_session: Arc::new(Mutex::new(None)),
             rtp: Arc::new(CurseurRtpAirplay::default()),
+            echec: Arc::new(std::sync::Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
+            appairage_airplay2_requis: false,
         }
+    }
+
+    /// Déclare que l'appareil exige l'appairage AirPlay 2 (HomeKit, « pair-setup
+    /// transitoire ») que ce chemin AirPlay 1 ne fait pas. Un 403 au ANNOUNCE ou
+    /// au SETUP est alors expliqué par ce manque, pas par « un autre émetteur ».
+    pub fn avec_appairage_airplay2_requis(mut self, requis: bool) -> Self {
+        self.appairage_airplay2_requis = requis;
+        self
     }
 }
 
 impl AirplayOutput {
+    // Lecture non consommatrice : aucune commande RTSP supplémentaire, aucune
+    // réponse volée au parseur et aucune attente sur une connexion encore ouverte.
+    fn relever_fermeture_rtsp_7259(&self) {
+        if !self.playing.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(session) = self.rtsp_session.try_lock() else {
+            return;
+        };
+        let Some(session) = session.as_ref() else {
+            return;
+        };
+        let mut octet = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+        let raison = match socket2::SockRef::from(&session.stream).peek(&mut octet) {
+            Ok(0) => Some("AirPlay : le récepteur a fermé la connexion de contrôle.".to_string()),
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Some(format!("AirPlay : connexion de contrôle interrompue : {e}"))
+            }
+            _ => None,
+        };
+        if let Some(raison) = raison {
+            *self.echec.lock().unwrap_or_else(|e| e.into_inner()) = Some(raison);
+            self.playing.store(false, Ordering::SeqCst);
+            self.paused.store(false, Ordering::SeqCst);
+            if let Ok(mut stop) = self.stop_tx.try_lock()
+                && let Some(stop) = stop.take()
+            {
+                let _ = stop.send(());
+            }
+        }
+    }
+
     /// Rend a l'appareil la session ouverte par un ANNOUNCE accepte quand la
     /// suite du dialogue RTSP echoue.
     ///
@@ -217,13 +368,23 @@ impl RtspSession {
         let stream = tokio::net::TcpStream::connect((host, port))
             .await
             .map_err(|e| format!("airplay connect {host}:{port}: {e}"))?;
+        let locale = stream
+            .local_addr()
+            .map_err(|e| format!("airplay local address: {e}"))?;
+        let recepteur = stream
+            .peer_addr()
+            .map_err(|e| format!("airplay peer address: {e}"))?;
+        let identite =
+            IdentiteSessionRaop::new(IdentiteSessionRaop::tirer_id(), locale.ip(), recepteur.ip());
         Ok(Self {
             stream,
             cseq: 0,
             session_id: None,
             server_port: 0,
             timing_port: 0,
+            control_port: 0,
             auxiliary_udp: None,
+            identite,
         })
     }
 
@@ -258,10 +419,18 @@ impl RtspSession {
 
         let mut reader = BufReader::new(&mut self.stream);
         let mut status_line = String::new();
-        reader
+        let lus = reader
             .read_line(&mut status_line)
             .await
             .map_err(|e| format!("rtsp read status: {e}"))?;
+        // #6751 — un canal fermé par l'appareil sans réponse rendait le code
+        // 0 (« TEARDOWN refused by device: 0 ») : ce n'est pas un refus, c'est
+        // une connexion close. Le dire.
+        if lus == 0 {
+            return Err(format!(
+                "rtsp {method}: connection closed by the device before any response"
+            ));
+        }
 
         let status_code: u32 = status_line
             .split_whitespace()
@@ -303,48 +472,47 @@ impl RtspSession {
         Ok((status_code, resp_headers, body_str))
     }
 
-    async fn announce(&mut self) -> Result<(), String> {
-        let sdp = format!(
-            "v=0\r\n\
-             o=iTunes 1 O IN IP4 127.0.0.1\r\n\
-             s=iTunes\r\n\
-             c=IN IP4 127.0.0.1\r\n\
-             t=0 0\r\n\
-             m=audio 0 RTP/AVP 96\r\n\
-             a=rtpmap:96 L16/{SAMPLE_RATE}/{CHANNELS}\r\n\
-             a=fmtp:96 {FRAMES_PER_PACKET} 0 {BYTES_PER_SAMPLE} 40 10 14 {CHANNELS} 255 0 0 {SAMPLE_RATE}\r\n"
-        );
+    async fn announce(&mut self, appairage_requis: bool) -> Result<(), String> {
+        let sdp = self.identite.sdp_announce();
+        let uri = self.identite.uri();
 
         let (code, _, _) = self
             .send_request(
                 "ANNOUNCE",
-                "rtsp://127.0.0.1/1",
+                &uri,
                 &[("Content-Type", "application/sdp")],
                 Some(&sdp),
             )
             .await?;
 
+        if code == 403 && appairage_requis {
+            return Err(pairing_required_message("ANNOUNCE"));
+        }
         if code != 200 {
-            return Err(format!("ANNOUNCE failed: {code}"));
+            return Err(announce_failure_message(code));
         }
         Ok(())
     }
 
-    async fn setup(&mut self, control_port: u16, timing_port: u16) -> Result<(), String> {
+    async fn setup(
+        &mut self,
+        control_port: u16,
+        timing_port: u16,
+        appairage_requis: bool,
+    ) -> Result<(), String> {
         let transport = format!(
             "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port={};timing_port={}",
             control_port, timing_port
         );
 
+        let uri = self.identite.uri();
         let (code, headers, _) = self
-            .send_request(
-                "SETUP",
-                "rtsp://127.0.0.1/1",
-                &[("Transport", &transport)],
-                None,
-            )
+            .send_request("SETUP", &uri, &[("Transport", &transport)], None)
             .await?;
 
+        if code == 403 && appairage_requis {
+            return Err(pairing_required_message("SETUP"));
+        }
         if code != 200 {
             return Err(setup_failure_message(code));
         }
@@ -361,6 +529,9 @@ impl RtspSession {
                     if let Some(port_str) = param.strip_prefix("timing_port=") {
                         self.timing_port = port_str.parse().unwrap_or(0);
                     }
+                    if let Some(port_str) = param.strip_prefix("control_port=") {
+                        self.control_port = port_str.parse().unwrap_or(0);
+                    }
                 }
             }
         }
@@ -375,9 +546,8 @@ impl RtspSession {
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
         }
-        let (code, _, _) = self
-            .send_request("RECORD", "rtsp://127.0.0.1/1", &headers, None)
-            .await?;
+        let uri = self.identite.uri();
+        let (code, _, _) = self.send_request("RECORD", &uri, &headers, None).await?;
 
         if code != 200 {
             return Err(format!("RECORD failed: {code}"));
@@ -392,8 +562,9 @@ impl RtspSession {
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
         }
+        let uri = self.identite.uri();
         let (code, _, _) = self
-            .send_request("SET_PARAMETER", "rtsp://127.0.0.1/1", &headers, Some(&body))
+            .send_request("SET_PARAMETER", &uri, &headers, Some(&body))
             .await?;
 
         if code != 200 {
@@ -411,8 +582,9 @@ impl RtspSession {
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
         }
+        let uri = self.identite.uri();
         let (code, _, _) = self
-            .send_request("TEARDOWN", "rtsp://127.0.0.1/1", &headers, None)
+            .send_request("TEARDOWN", &uri, &headers, None)
             .await
             .map_err(|error| format!("AirPlay TEARDOWN request failed: {error}"))?;
         if !(200..300).contains(&code) {
@@ -428,9 +600,8 @@ impl RtspSession {
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
         }
-        let (code, _, _) = self
-            .send_request("FLUSH", "rtsp://127.0.0.1/1", &headers, None)
-            .await?;
+        let uri = self.identite.uri();
+        let (code, _, _) = self.send_request("FLUSH", &uri, &headers, None).await?;
         if code != 200 {
             return Err(format!("FLUSH failed: {code}"));
         }
@@ -440,6 +611,37 @@ impl RtspSession {
 
 fn entete_rtp_info(sequence: u16, timestamp: u32) -> String {
     format!("seq={sequence};rtptime={timestamp}")
+}
+
+/// Code stable d'un refus de connexion par le récepteur AirPlay (403 Forbidden).
+pub const CODE_AIRPLAY_RECEIVER_FORBIDDEN: &str = "airplay_receiver_forbidden";
+
+fn announce_failure_message(code: u32) -> String {
+    if code == 403 {
+        return format!(
+            "{CODE_AIRPLAY_RECEIVER_FORBIDDEN}: AirPlay connection refused by the receiver (403 Forbidden): \
+             the receiver requires AirPlay 2 pairing or a password and refuses legacy AirPlay 1 (RAOP) connections; \
+             for macOS AirPlay Receiver, pair using AirPlay 2 and verify that 'Allow AirPlay for' is set to \
+             'Everyone on the same network' (System Settings → General → AirDrop & Handoff)"
+        );
+    }
+    format!("AirPlay ANNOUNCE failed: {code}")
+}
+
+/// Code stable : l'appareil exige l'appairage AirPlay 2 que Tune ne fait pas
+/// sur le chemin AirPlay 1 (RAOP).
+pub const CODE_AIRPLAY2_PAIRING_REQUIRED: &str = "airplay2_pairing_required";
+
+/// 403 d'un appareil qui s'annonce AirPlay 2 / exige l'appairage, servi par le
+/// chemin AirPlay 1 : la cause est l'appairage absent, pas un autre émetteur.
+fn pairing_required_message(etape: &str) -> String {
+    format!(
+        "{CODE_AIRPLAY2_PAIRING_REQUIRED}: AirPlay connection refused by the device at {etape} (403): \
+         this speaker is an AirPlay 2 device that requires AirPlay 2 pairing (HomeKit transient \
+         pair-setup), which Tune does not perform on its AirPlay 1 (RAOP) output. Tune uses its \
+         AirPlay 2 helper (airplay-daemon) for such speakers, but it is missing or unavailable in \
+         this installation; install a Tune build that includes airplay-daemon"
+    )
 }
 
 fn setup_failure_message(code: u32) -> String {
@@ -571,6 +773,10 @@ impl OutputTarget for AirplayOutput {
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         self.stop().await.ok();
+        let generation_courante = {
+            let _echec = self.echec.lock().unwrap_or_else(|e| e.into_inner());
+            self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        };
         self.rtp.reinitialiser();
 
         // Establish RTSP session
@@ -586,7 +792,7 @@ impl OutputTarget for AirplayOutput {
         let (control_port, timing_port) = auxiliary.ports();
         session.auxiliary_udp = Some(auxiliary);
 
-        if let Err(reason) = session.announce().await {
+        if let Err(reason) = session.announce(self.appairage_airplay2_requis).await {
             if let Some(auxiliary) = session.auxiliary_udp.take() {
                 auxiliary.close().await;
             }
@@ -602,7 +808,10 @@ impl OutputTarget for AirplayOutput {
         // session parce que le canal de controle se ferme (RFC 2326, l'etat
         // de session est independant de la connexion) : c'est donc NOUS qui
         // fabriquions l'« appareil occupe » de la tentative suivante (#2217).
-        if let Err(raison) = session.setup(control_port, timing_port).await {
+        if let Err(raison) = session
+            .setup(control_port, timing_port, self.appairage_airplay2_requis)
+            .await
+        {
             self.rendre_session_annoncee(&mut session, "SETUP", &raison)
                 .await;
             return Err(raison);
@@ -620,6 +829,15 @@ impl OutputTarget for AirplayOutput {
             .map_err(|e| format!("udp connect {target_addr}: {e}"))?;
         udp.set_nonblocking(true)
             .map_err(|e| format!("udp nonblocking: {e}"))?;
+        // #6751 — sync et retransmissions passent par le port de contrôle que
+        // le récepteur a annoncé.
+        let controle = (session.control_port != 0)
+            .then(|| {
+                session.auxiliary_udp.as_ref().map(|aux| {
+                    aux.controle_vers(std::net::SocketAddr::new(peer.ip(), session.control_port))
+                })
+            })
+            .flatten();
 
         *self.rtsp_session.lock().await = Some(session);
 
@@ -629,6 +847,7 @@ impl OutputTarget for AirplayOutput {
         *self.current_uri.lock().await = Some(media.url.to_string());
         self.position_ms.store(0, Ordering::SeqCst);
         self.duration_ms.store(0, Ordering::SeqCst);
+        *self.echec.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.playing.store(true, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
 
@@ -641,11 +860,14 @@ impl OutputTarget for AirplayOutput {
         let position_ms = self.position_ms.clone();
         let rtp = self.rtp.clone();
         let name = self.name.clone();
+        let echec = self.echec.clone();
+        let generation = self.generation.clone();
 
         tokio::spawn(async move {
             let result = stream_to_airplay(
                 &url,
                 udp,
+                controle,
                 &playing,
                 &paused,
                 &position_ms,
@@ -654,10 +876,14 @@ impl OutputTarget for AirplayOutput {
             )
             .await;
 
+            let mut echec = echec.lock().unwrap_or_else(|e| e.into_inner());
+            if generation.load(Ordering::SeqCst) != generation_courante {
+                return;
+            }
             if let Err(e) = result {
                 warn!(device = %name, error = %e, "airplay_stream_error");
+                *echec = Some(e);
             }
-
             playing.store(false, Ordering::SeqCst);
             info!(device = %name, "airplay_stream_ended");
         });
@@ -743,7 +969,13 @@ impl OutputTarget for AirplayOutput {
         Ok(())
     }
 
+    fn take_output_failure(&self) -> Option<String> {
+        self.relever_fermeture_rtsp_7259();
+        self.echec.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
     async fn get_status(&self) -> Result<OutputStatus, String> {
+        self.relever_fermeture_rtsp_7259();
         let state = if self.playing.load(Ordering::Relaxed) {
             if self.paused.load(Ordering::Relaxed) {
                 TransportState::Paused
@@ -779,15 +1011,84 @@ impl OutputTarget for AirplayOutput {
     }
 }
 
+// Chemin de sortie audio : regrouper ces arguments en structure toucherait la lecture pour un gain de forme (clippy 1.98).
+#[allow(clippy::too_many_arguments)]
 async fn stream_to_airplay(
     url: &str,
     udp: UdpSocket,
+    controle: Option<controle::ControleRaop>,
     playing: &AtomicBool,
     paused: &AtomicBool,
     position_ms: &AtomicU64,
     stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
     rtp: &CurseurRtpAirplay,
 ) -> Result<(), String> {
+    let ssrc: u32 = rand_random();
+    // #6751 — sync et retransmissions passent par le port de contrôle ; le
+    // flux progressif (#6673) et le repli complet partagent cet émetteur.
+    let udp = controle::EmetteurRaop::new(
+        tokio::net::UdpSocket::from_std(udp).map_err(|e| format!("tokio udp: {e}"))?,
+        controle,
+    );
+
+    // #6673 — voie A : le décodeur progressif alimente la boucle RTP au fil
+    // de l'eau. Le premier paquet part dès le premier bloc décodé, et non plus
+    // après le téléchargement et le décodage de toute la piste.
+    let debut = std::time::Instant::now();
+    let mut flux = flux_progressif::FluxPcmAirplay::ouvrir(url);
+    let issue = diffuser_flux(
+        &mut flux,
+        &udp,
+        playing,
+        paused,
+        position_ms,
+        stop_rx,
+        ssrc,
+        rtp,
+    )
+    .await;
+    if let Some(ms) = issue.premier_paquet_ms(debut) {
+        info!(
+            premier_paquet_ms = ms,
+            "airplay_flux_progressif_premier_paquet"
+        );
+    }
+    if let Some(echec) = issue.echec {
+        return Err(echec);
+    }
+    if flux.octets_rendus() > 0 || issue.interrompu {
+        if let Some(e) = flux.echec() {
+            warn!(error = %e, "airplay_flux_progressif_interrompu");
+        }
+        return Ok(());
+    }
+
+    // Rien n'a été décodé (format que le décodeur progressif ne lit pas sur
+    // cette source) : le chemin d'avant, qui télécharge et décode tout.
+    warn!(
+        error = flux.echec().unwrap_or("flux vide"),
+        "airplay_flux_progressif_repli_telechargement_complet"
+    );
+    drop(flux);
+    let pcm_be = decoder_la_piste_entiere(url).await?;
+    let issue = diffuser_pcm(
+        &pcm_be,
+        &udp,
+        playing,
+        paused,
+        position_ms,
+        stop_rx,
+        ssrc,
+        rtp,
+    )
+    .await;
+
+    issue.echec.map_or(Ok(()), Err)
+}
+
+/// Le chemin d'avant #6673, gardé en repli : télécharger, décoder TOUTE la
+/// piste, adapter canaux et cadence, convertir en L16.
+async fn decoder_la_piste_entiere(url: &str) -> Result<Vec<u8>, String> {
     // Resolve URL to a local file path (downloading HTTP URLs if needed)
     let (local_path, _tmp_guard) = url_to_local_path(url).await?;
 
@@ -842,24 +1143,45 @@ async fn stream_to_airplay(
     }
 
     // Convert i32 samples to i16, then to big-endian bytes for AirPlay RTP
-    let pcm_be = pcm_i32_to_l16_be(&echantillons, decoded.bit_depth);
+    Ok(pcm_i32_to_l16_be(&echantillons, decoded.bit_depth))
+}
 
-    let ssrc: u32 = rand_random();
-    let udp = tokio::net::UdpSocket::from_std(udp).map_err(|e| format!("tokio udp: {e}"))?;
+/// Ce qui alimente la boucle RTP : des blocs de PCM L16 gros-boutiste, de
+/// taille quelconque, jusqu'à `None` (fin du flux).
+trait SourcePcmAirplay {
+    async fn suivant(&mut self) -> Option<Vec<u8>>;
+}
 
-    diffuser_pcm(
-        &pcm_be,
-        &udp,
-        playing,
-        paused,
-        position_ms,
-        stop_rx,
-        ssrc,
-        rtp,
-    )
-    .await;
+impl SourcePcmAirplay for flux_progressif::FluxPcmAirplay {
+    async fn suivant(&mut self) -> Option<Vec<u8>> {
+        flux_progressif::FluxPcmAirplay::suivant(self).await
+    }
+}
 
-    Ok(())
+/// Une piste déjà décodée en entier, rendue d'un seul bloc.
+struct PisteEntiere<'a>(Option<&'a [u8]>);
+
+impl SourcePcmAirplay for PisteEntiere<'_> {
+    async fn suivant(&mut self) -> Option<Vec<u8>> {
+        self.0.take().map(<[u8]>::to_vec)
+    }
+}
+
+/// Ce que la boucle RTP a fait.
+#[derive(Debug, Default)]
+struct IssueDeDiffusion {
+    /// Arrêt (stop, `playing` à faux) avant la fin du flux.
+    interrompu: bool,
+    /// Quand le premier paquet est parti.
+    premier_paquet: Option<std::time::Instant>,
+    echec: Option<String>,
+}
+
+impl IssueDeDiffusion {
+    fn premier_paquet_ms(&self, debut: std::time::Instant) -> Option<u128> {
+        self.premier_paquet
+            .map(|t| t.saturating_duration_since(debut).as_millis())
+    }
 }
 
 /// La sortie des paquets RTP.
@@ -869,15 +1191,7 @@ async fn stream_to_airplay(
 /// permet ni l'un ni l'autre — un datagramme trop grand y echoue en silence,
 /// journalise en debug, exactement le symptome qu'on veut interdire.
 trait SortieRtp {
-    async fn envoyer(&self, pkt: &[u8]);
-}
-
-impl SortieRtp for tokio::net::UdpSocket {
-    async fn envoyer(&self, pkt: &[u8]) {
-        if let Err(e) = self.send(pkt).await {
-            debug!(error = %e, "airplay_rtp_send_error");
-        }
-    }
+    async fn envoyer(&self, pkt: &[u8]) -> Result<(), String>;
 }
 
 /// Emet le PCM big-endian en paquets RTP, au rythme reel.
@@ -892,10 +1206,46 @@ async fn diffuser_pcm<S: SortieRtp>(
     stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
     ssrc: u32,
     rtp: &CurseurRtpAirplay,
-) {
+) -> IssueDeDiffusion {
+    diffuser_flux(
+        &mut PisteEntiere(Some(pcm_be)),
+        sortie,
+        playing,
+        paused,
+        position_ms,
+        stop_rx,
+        ssrc,
+        rtp,
+    )
+    .await
+}
+
+/// Au-delà de ce retard sur l'échéance du paquet, la boucle a attendu le
+/// décodeur (sous-alimentation) : l'horloge est recalée plutôt que de servir
+/// en rafale tout ce qui aurait dû partir pendant l'attente (#6673).
+const RETARD_TOLERE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Emet le flux en paquets RTP, au rythme reel, au fur et a mesure que la
+/// source le livre (#6673).
+// Chemin de sortie audio : regrouper ces arguments en structure toucherait la lecture pour un gain de forme (clippy 1.98).
+#[allow(clippy::too_many_arguments)]
+async fn diffuser_flux<F: SourcePcmAirplay, S: SortieRtp>(
+    source: &mut F,
+    sortie: &S,
+    playing: &AtomicBool,
+    paused: &AtomicBool,
+    position_ms: &AtomicU64,
+    stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    ssrc: u32,
+    rtp: &CurseurRtpAirplay,
+) -> IssueDeDiffusion {
     let mut total_frames: u64 = 0;
+    // `tampon[offset..]` : ce que la source a livre et qui n'est pas parti.
+    let mut tampon: Vec<u8> = Vec::new();
     let mut offset: usize = 0;
+    let mut epuise = false;
     let mut horloge = HorlogeCadencementRtp::new(tokio::time::Instant::now());
+    let mut premier_paquet = None;
 
     // Pourquoi un booleen plutot qu'une seconde lecture du receiver :
     // `oneshot::Receiver::try_recv()` CONSOMME. La boucle rend le stop, puis
@@ -905,10 +1255,33 @@ async fn diffuser_pcm<S: SortieRtp>(
     // canal consommable ne se deduit pas deux fois : on le retient.
     let mut interrompu = false;
 
-    'paquets: while offset + BYTES_PER_PACKET <= pcm_be.len() {
+    'paquets: loop {
         // Check for stop signal (non-blocking)
         if stop_rx.try_recv().is_ok() {
             interrompu = true;
+            break;
+        }
+
+        // Remplir jusqu'a un paquet plein, ou jusqu'a la fin du flux. Un
+        // Stop pendant l'attente du decodeur sort tout de suite.
+        while !epuise && tampon.len() - offset < BYTES_PER_PACKET {
+            if offset > 0 {
+                tampon.drain(..offset);
+                offset = 0;
+            }
+            tokio::select! {
+                biased;
+                _ = &mut *stop_rx => {
+                    interrompu = true;
+                    break 'paquets;
+                }
+                bloc = source.suivant() => match bloc {
+                    Some(bloc) => tampon.extend_from_slice(&bloc),
+                    None => epuise = true,
+                },
+            }
+        }
+        if tampon.len() - offset < BYTES_PER_PACKET {
             break;
         }
 
@@ -937,8 +1310,16 @@ async fn diffuser_pcm<S: SortieRtp>(
                 "airplay_horloge_recalee_apres_pause"
             );
         }
+        if let Some(retard) =
+            horloge.rattraper_un_retard(tokio::time::Instant::now(), total_frames, RETARD_TOLERE)
+        {
+            debug!(
+                retard_ms = retard.as_millis(),
+                "airplay_horloge_recalee_apres_attente_du_decodeur"
+            );
+        }
 
-        let audio_buf = &pcm_be[offset..offset + BYTES_PER_PACKET];
+        let audio_buf = &tampon[offset..offset + BYTES_PER_PACKET];
         let Some((seq, timestamp, marqueur)) = rtp.reserver(FRAMES_PER_PACKET as u32, paused)
         else {
             // Pause a croise la frontiere entre la garde ci-dessus et la
@@ -946,7 +1327,14 @@ async fn diffuser_pcm<S: SortieRtp>(
             continue 'paquets;
         };
         let pkt = build_rtp_packet(seq, timestamp, ssrc, audio_buf, marqueur);
-        sortie.envoyer(&pkt).await;
+        if let Err(echec) = sortie.envoyer(&pkt).await {
+            return IssueDeDiffusion {
+                interrompu: true,
+                premier_paquet,
+                echec: Some(echec),
+            };
+        }
+        premier_paquet.get_or_insert_with(std::time::Instant::now);
 
         total_frames += FRAMES_PER_PACKET as u64;
         offset += BYTES_PER_PACKET;
@@ -970,7 +1358,7 @@ async fn diffuser_pcm<S: SortieRtp>(
     // borne par rien. Trois conditions, aucune deduite : la boucle a bien
     // epuise ses paquets pleins, la lecture n'a pas ete interrompue, et il
     // reste de quoi remplir au moins une trame.
-    let reste = pcm_be.len() - offset;
+    let reste = tampon.len() - offset;
     if !interrompu
         && playing.load(Ordering::Relaxed)
         && (BYTES_PER_FRAME..BYTES_PER_PACKET).contains(&reste)
@@ -989,12 +1377,24 @@ async fn diffuser_pcm<S: SortieRtp>(
             }
         };
         if let Some((seq, timestamp, marqueur)) = reservation {
-            let pkt = build_rtp_packet(seq, timestamp, ssrc, &pcm_be[offset..fin], marqueur);
-            sortie.envoyer(&pkt).await;
+            let pkt = build_rtp_packet(seq, timestamp, ssrc, &tampon[offset..fin], marqueur);
+            if let Err(echec) = sortie.envoyer(&pkt).await {
+                return IssueDeDiffusion {
+                    interrompu: true,
+                    premier_paquet,
+                    echec: Some(echec),
+                };
+            }
+            premier_paquet.get_or_insert_with(std::time::Instant::now);
             total_frames += trames as u64;
             position_ms.store(total_frames * 1000 / SAMPLE_RATE as u64, Ordering::Relaxed);
             debug!(trames, "airplay_dernier_paquet_partiel");
         }
+    }
+    IssueDeDiffusion {
+        interrompu: interrompu || !playing.load(Ordering::Relaxed),
+        premier_paquet,
+        echec: None,
     }
 }
 
@@ -1019,9 +1419,41 @@ mod tests {
         assert!(message.contains("retry"));
     }
 
+    /// Xiaomi Sound 2 Max sous Windows (sans airplay-daemon) : un 403 au
+    /// SETUP d'un appareil AirPlay 2 dit l'appairage manquant, pas « un autre
+    /// émetteur ».
+    #[test]
+    fn pairing_required_403_names_missing_airplay2_pairing() {
+        let message = pairing_required_message("SETUP");
+        assert!(message.starts_with(CODE_AIRPLAY2_PAIRING_REQUIRED));
+        assert!(message.contains("SETUP (403)"));
+        assert!(message.contains("AirPlay 2 pairing"));
+        assert!(message.contains("airplay-daemon"));
+        assert!(!message.contains("another sender"));
+    }
+
     #[test]
     fn setup_other_status_keeps_the_rtsp_code() {
         assert_eq!(setup_failure_message(453), "AirPlay SETUP failed: 453");
+    }
+
+    #[test]
+    fn announce_403_explains_macos_receiver_permission() {
+        let message = announce_failure_message(403);
+        assert!(message.contains(CODE_AIRPLAY_RECEIVER_FORBIDDEN));
+        assert!(message.contains("403 Forbidden"));
+        assert!(message.contains("AirPlay 2"));
+        assert!(message.contains("pairing"));
+        assert!(message.contains("Everyone on the same network"));
+        assert!(message.contains("AirDrop & Handoff"));
+    }
+
+    #[test]
+    fn announce_other_status_keeps_the_rtsp_code() {
+        assert_eq!(
+            announce_failure_message(453),
+            "AirPlay ANNOUNCE failed: 453"
+        );
     }
 
     #[tokio::test]
@@ -1057,7 +1489,10 @@ mod tests {
             .unwrap();
 
         assert!(error.contains("TEARDOWN refused by device: 403"));
-        assert!(request.starts_with("TEARDOWN rtsp://127.0.0.1/1 RTSP/1.0"));
+        assert!(request.starts_with(&format!(
+            "TEARDOWN rtsp://127.0.0.1/{} RTSP/1.0",
+            session.identite.id
+        )));
         assert!(request.contains("Session: stale-session\r\n"));
     }
 
@@ -1126,13 +1561,21 @@ mod tests {
     }
 
     async fn dialogue_airplay(refus: Vec<(&'static str, &'static str)>) -> (String, Vec<String>) {
+        dialogue_airplay_appairage(refus, false).await
+    }
+
+    async fn dialogue_airplay_appairage(
+        refus: Vec<(&'static str, &'static str)>,
+        appairage_requis: bool,
+    ) -> (String, Vec<String>) {
         let (port, recepteur) = faux_recepteur(refus).await;
         let sortie = AirplayOutput::new(
             "Faux recepteur".into(),
             format!("airplay-127.0.0.1-{port}"),
             "127.0.0.1".into(),
             port,
-        );
+        )
+        .avec_appairage_airplay2_requis(appairage_requis);
         let erreur = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             sortie.play_media(&PlayMedia {
@@ -1158,6 +1601,43 @@ mod tests {
     /// la `RtspSession` : le socket TCP se ferme, et rien n'a jamais rendu la
     /// session. C'est le sender qui fabrique l'« appareil occupe » de la
     /// tentative suivante.
+    /// Rapport du 01/11 (Xiaomi Sound 2 Max, Windows sans airplay-daemon) :
+    /// l'enceinte AirPlay 2 accepte l'ANNOUNCE, refuse le SETUP par 403, puis
+    /// refuse aussi le TEARDOWN de rattrapage. Annoncée AirPlay 2, elle doit
+    /// recevoir le diagnostic « appairage AirPlay 2 manquant ». La contre-
+    /// épreuve (même dialogue, appareil non marqué) est le témoin suivant,
+    /// qui garde le message « autre émetteur ».
+    #[tokio::test]
+    async fn un_setup_refuse_par_une_enceinte_airplay2_dit_l_appairage_manquant() {
+        let (erreur, methodes) = dialogue_airplay_appairage(
+            vec![("SETUP", "403 Forbidden"), ("TEARDOWN", "403 Forbidden")],
+            true,
+        )
+        .await;
+
+        assert!(
+            erreur.starts_with(CODE_AIRPLAY2_PAIRING_REQUIRED),
+            "obtenu : {erreur}"
+        );
+        assert!(erreur.contains("SETUP (403)"), "obtenu : {erreur}");
+        assert!(erreur.contains("airplay-daemon"), "obtenu : {erreur}");
+        assert!(!erreur.contains("another sender"), "obtenu : {erreur}");
+        assert_eq!(methodes, vec!["ANNOUNCE", "SETUP", "TEARDOWN"]);
+    }
+
+    #[tokio::test]
+    async fn un_announce_refuse_par_une_enceinte_airplay2_dit_l_appairage_manquant() {
+        let (erreur, methodes) =
+            dialogue_airplay_appairage(vec![("ANNOUNCE", "403 Forbidden")], true).await;
+
+        assert!(
+            erreur.starts_with(CODE_AIRPLAY2_PAIRING_REQUIRED),
+            "obtenu : {erreur}"
+        );
+        assert!(erreur.contains("ANNOUNCE (403)"), "obtenu : {erreur}");
+        assert_eq!(methodes, vec!["ANNOUNCE"]);
+    }
+
     #[tokio::test]
     async fn un_setup_refuse_rend_la_session_ouverte_par_l_announce() {
         let (erreur, methodes) = dialogue_airplay(vec![("SETUP", "403 Forbidden")]).await;
@@ -1186,17 +1666,37 @@ mod tests {
 
     /// La contre-epreuve du rattrapage : un ANNOUNCE refuse n'a rien ouvert.
     /// Envoyer un TEARDOWN pour une session inexistante serait du bruit sur le
-    /// canal de controle d'un appareil qui vient deja de nous dire non.
+    /// canal de controle d'un appareil qui vient deja de nous dire non (#2217).
+    /// Sur 403 (récepteur macOS restreint à l'utilisateur actuel), l'erreur
+    /// guide l'utilisateur vers le bon réglage réseau (#6788).
     #[tokio::test]
     async fn un_announce_refuse_n_envoie_aucun_teardown() {
         let (erreur, methodes) = dialogue_airplay(vec![("ANNOUNCE", "403 Forbidden")]).await;
 
-        assert!(erreur.contains("ANNOUNCE failed: 403"), "obtenu : {erreur}");
+        assert!(
+            erreur.contains(CODE_AIRPLAY_RECEIVER_FORBIDDEN)
+                && erreur.contains("403 Forbidden")
+                && erreur.contains("Everyone on the same network"),
+            "le 403 sur ANNOUNCE doit être nommé et guider l'utilisateur (#6788), obtenu : {erreur}"
+        );
         assert_eq!(
             methodes,
             vec!["ANNOUNCE"],
             "rien n'a ete ouvert : il n'y a rien a rendre"
         );
+    }
+
+    /// #6788 — un récepteur AirPlay (macOS Monterey+) refusant l'ANNOUNCE par
+    /// 403 Forbidden doit remonter un diagnostic actionnable nommant le réglage
+    /// 'Allow AirPlay for: Everyone on the same network'.
+    #[tokio::test]
+    async fn announce_403_sur_recepteur_simule_guide_l_utilisateur() {
+        let (erreur, methodes) = dialogue_airplay(vec![("ANNOUNCE", "403 Forbidden")]).await;
+        assert!(erreur.contains(CODE_AIRPLAY_RECEIVER_FORBIDDEN));
+        assert!(erreur.contains("403 Forbidden"));
+        assert!(erreur.contains("Everyone on the same network"));
+        assert!(erreur.contains("AirDrop & Handoff"));
+        assert_eq!(methodes, vec!["ANNOUNCE"]);
     }
 
     #[test]
@@ -1284,8 +1784,9 @@ mod tests {
     }
 
     impl SortieRtp for SortieDeTest {
-        async fn envoyer(&self, pkt: &[u8]) {
+        async fn envoyer(&self, pkt: &[u8]) -> Result<(), String> {
             self.0.lock().unwrap().push(pkt.len() - RTP_HEADER_SIZE);
+            Ok(())
         }
     }
 
@@ -1584,3 +2085,19 @@ mod tests {
 #[cfg(test)]
 #[path = "airplay_timing_tests_2217.rs"]
 mod timing_tests_2217;
+
+#[cfg(test)]
+#[path = "airplay_controle_tests_6751.rs"]
+mod controle_tests_6751;
+
+#[cfg(test)]
+#[path = "airplay_flux_progressif_tests_6673.rs"]
+mod flux_progressif_tests_6673;
+
+#[cfg(test)]
+#[path = "airplay_identite_tests_6885.rs"]
+mod identite_tests_6885;
+
+#[cfg(test)]
+#[path = "airplay_fermeture_tests_7259.rs"]
+mod fermeture_tests_7259;

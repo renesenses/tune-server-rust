@@ -46,6 +46,21 @@ pub enum TuneError {
     #[error("{0}")]
     Unsupported(String),
 
+    /// Le service a répondu en REFUSANT les identifiants saisis.
+    ///
+    /// **Ce n'est ni une panne ni un texte libre** (renesenses/tune-server-rust#7068).
+    /// Un mauvais mot de passe Qobuz sortait en
+    /// `qobuz login: 401 {"status":"error","code":401,"message":"Invalid
+    /// username\/email and password combination"}` : le corps JSON du service,
+    /// recopié tel quel dans la réponse, puis affiché brut par le client. Le
+    /// message est libre et traduit côté client ; la frontière HTTP doit donc
+    /// décider sur la VARIANTE (`code: "invalid_credentials"`), pas sur le texte.
+    ///
+    /// Le texte porté est court et sans JSON du service — le détail brut va au
+    /// journal, jamais dans la réponse.
+    #[error("{0}")]
+    Credentials(String),
+
     #[error("{0}")]
     Other(String),
 }

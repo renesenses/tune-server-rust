@@ -65,7 +65,7 @@
       "name": "Eversolo",
       "models": [
         { "name": "DMP-A6", "quirks": {} },
-        { "name": "DMP-A8", "quirks": {} },
+        { "name": "DMP-A8", "quirks": { "reprise_par_nouveau_flux": true } },
         { "name": "DMP-A10", "quirks": {} }
       ]
     },

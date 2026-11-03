@@ -166,7 +166,14 @@ impl Banc {
     /// Rend le corps **brut** : les refus du PATCH sont du texte, ceux des
     /// routes de volume du JSON. Un test qui n'accepterait qu'une des deux
     /// formes laisserait l'autre porte sans preuve.
-    async fn envoyer(&self, methode: &str, path: &str, body: Value) -> (StatusCode, String) {
+    async fn envoyer(&self, methode: &str, path: &str, mut body: Value) -> (StatusCode, String) {
+        // #6721 — ces contrats gardent la résolution en dB, pas la garde
+        // contre les montées brusques : toute consigne y est CONFIRMÉE.
+        if let Some(obj) = body.as_object_mut()
+            && (obj.contains_key("volume") || obj.contains_key("volume_db"))
+        {
+            obj.insert("confirm_increase".into(), json!(true));
+        }
         let requete = Request::builder()
             .method(methode)
             .uri(path)

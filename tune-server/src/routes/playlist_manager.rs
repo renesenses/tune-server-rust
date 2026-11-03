@@ -366,15 +366,14 @@ async fn transferer_par_le_greffon(
     _body: &TransferRequest,
     _profil: i64,
 ) -> axum::response::Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "greffon_requis",
-            "detail": "Le transfert de playlists passe par le greffon « Playlists converter », \
-                       et ce serveur est compilé sans greffons WASM (`plugins-wasm`).",
-        })),
-    )
-        .into_response()
+    // `detail` : les clients d'avant le lisaient ; il porte la même phrase.
+    let mut corps = crate::message_api::corps_refus(
+        "greffon_requis",
+        "api.playlists.transferPluginNotCompiled",
+        &[],
+    );
+    corps["detail"] = corps["message"].clone();
+    (StatusCode::NOT_IMPLEMENTED, Json(corps)).into_response()
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -427,16 +426,13 @@ async fn transferer_par_le_greffon(
 #[cfg(feature = "plugins-wasm")]
 fn refus_du_greffon(statut: StatusCode, corps: Value) -> axum::response::Response {
     if corps["error"] == "plugin not found" {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": "greffon_requis",
-                "detail": "Le transfert de playlists passe par le greffon « Playlists converter », \
-                           qui n'est pas chargé sur ce serveur (désactivé, ou absent du dossier \
-                           des greffons).",
-            })),
-        )
-            .into_response();
+        let mut corps = crate::message_api::corps_refus(
+            "greffon_requis",
+            "api.playlists.transferPluginNotLoaded",
+            &[],
+        );
+        corps["detail"] = corps["message"].clone();
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(corps)).into_response();
     }
     let detail = corps["error"]
         .as_str()
@@ -741,13 +737,25 @@ struct MergeSource {
 async fn merge_playlists(
     State(state): State<AppState>,
     profile: ActiveProfile,
+    headers: axum::http::HeaderMap,
     Json(body): Json<MergeRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let cible = body
         .target_service
         .as_deref()
         .unwrap_or("local")
         .to_string();
+
+    // Une fusion dont une source vit ailleurs que la cible apparie ses titres
+    // d'un catalogue à l'autre : c'est un transfert, soumis au même droit que
+    // `POST /transfer`. La fusion « au même endroit » (bibliothèque →
+    // bibliothèque, ou playlists d'un service vers ce même service) reste
+    // gratuite. Le contrôle se joue avant toute lecture et toute écriture.
+    if fusion_hors_de_la_cible(&body, &cible)
+        && let Err(refus) = refus_premium_du_transfert(&state, &headers).await
+    {
+        return refus;
+    }
 
     // Les sources, lues chacune chez elle. Une seule erreur de lecture arrête
     // tout : fusionner la moitié d'une playlist sans le dire serait pire.
@@ -761,6 +769,13 @@ async fn merge_playlists(
     } else {
         fusion_vers_le_service(&state, &body, &cible, pistes).await
     }
+}
+
+/// Une source au moins vit-elle ailleurs que sur la cible ?
+fn fusion_hors_de_la_cible(body: &MergeRequest, cible: &str) -> bool {
+    body.playlists
+        .iter()
+        .any(|source| source.service.as_deref().unwrap_or("local") != cible)
 }
 
 /// Une piste vue depuis sa source, réduite à ce qui sert à l'apparier.

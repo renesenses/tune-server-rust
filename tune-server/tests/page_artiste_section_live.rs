@@ -152,11 +152,91 @@ async fn le_tableau_nu_garde_les_lives_avec_leur_type_secondaire() {
     assert_eq!(weld["release_secondary_types"], serde_json::json!(["live"]));
 }
 
-/// TÉMOIN — sans type secondaire, pas de section « Live » : la clé est absente.
+/// TÉMOIN — sans type secondaire, seul le TITRE range dans « Live » (#6464) :
+/// « Live Rust » et « Live EP » le disent, « Weld » non et reste un album.
+/// Avant #6464, la section était absente dans ce cas.
 #[tokio::test]
-async fn sans_type_secondaire_la_section_live_est_absente() {
+async fn sans_type_secondaire_seul_le_titre_range_dans_live_6464() {
     let app = bibliotheque(false);
     let (_, body) = get(&app, "/api/v1/library/artists/1/albums?sections=1").await;
-    assert!(body.get("live").is_none(), "{body}");
-    assert_eq!(titres(&body["albums"]).len(), 5);
+    assert_eq!(
+        titres(&body["live"]),
+        vec!["Live EP", "Live Rust"],
+        "{body}"
+    );
+    assert_eq!(
+        titres(&body["albums"]),
+        vec!["Harvest", "Remixes", "Weld"],
+        "{body}"
+    );
+    for a in body["live"].as_array().unwrap() {
+        assert_eq!(a["live_by_title"], true, "{a}");
+    }
+}
+
+/// #6464 — la règle provisoire par le titre (FabienM, fil 2302 point 4) :
+///
+/// | id | titre                     | primaire | secondaires       | section  |
+/// |----|---------------------------|----------|-------------------|----------|
+/// | 1  | MTV Unplugged             | ep       | —                 | live     |
+/// | 2  | Live Through This         | album    | —                 | albums   |
+/// | 3  | Live Remixes              | album    | compilation;remix | albums   |
+/// | 4  | Live at Leeds             | album    | live              | live     |
+///
+/// Un EP live va dans « Live » ; « live » verbe n'y va pas ; un type
+/// secondaire CONNU sans `live` n'est pas contredit par le titre ; le drapeau
+/// `live_by_title` dit quand la règle provisoire a décidé.
+#[tokio::test]
+async fn la_regle_du_titre_complete_les_types_sans_les_contredire_6464() {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    exec(
+        &state,
+        "INSERT INTO artists (id, name) VALUES (1, 'Divers')",
+    );
+    let albums: [(i64, &str, &str, Option<&str>); 4] = [
+        (1, "MTV Unplugged", "ep", None),
+        (2, "Live Through This", "album", None),
+        (3, "Live Remixes", "album", Some("compilation;remix")),
+        (4, "Live at Leeds", "album", Some("live")),
+    ];
+    for (id, titre, primaire, secondaires) in albums {
+        exec(
+            &state,
+            &format!(
+                "INSERT INTO albums (id, title, artist_id, release_type, release_secondary_types, year, source) \
+                 VALUES ({id}, '{titre}', 1, '{primaire}', {}, 2000, 'local')",
+                secondaires.map_or("NULL".to_string(), |t| format!("'{t}'"))
+            ),
+        );
+        exec(
+            &state,
+            &format!(
+                "INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms, format) \
+                 VALUES ({id}, 't{id}', {id}, 1, '/m/{id}.flac', 240000, 'flac')"
+            ),
+        );
+    }
+    let app = tune_server::routes::router(state);
+    let (status, body) = get(&app, "/api/v1/library/artists/1/albums?sections=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        titres(&body["live"]),
+        vec!["Live at Leeds", "MTV Unplugged"],
+        "seuls le live typé et l'EP « Unplugged » vont dans « Live » ; un type \
+         secondaire connu sans `live` n'est pas contredit par le titre — {body}"
+    );
+    assert_eq!(
+        titres(&body["albums"]),
+        vec!["Live Remixes", "Live Through This"],
+        "un type secondaire CONNU sans `live` (Live Remixes) n'est pas contredit \
+         par le titre, et « live » verbe (Live Through This) ne range rien — {body}"
+    );
+    let live = body["live"].as_array().unwrap();
+    let drapeau = |t: &str| live.iter().find(|a| a["title"] == t).unwrap()["live_by_title"].clone();
+    assert_eq!(drapeau("MTV Unplugged"), true);
+    assert_eq!(
+        drapeau("Live at Leeds"),
+        Value::Null,
+        "le type secondaire a décidé, pas le titre"
+    );
 }

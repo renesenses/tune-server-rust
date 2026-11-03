@@ -1,0 +1,39 @@
+[package]
+name = "tune-laissez-passer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Laissez-passer d'ecoute a distance lie au compte mozaiklabs : format, jeu de cles, verification hors ligne"
+
+# Une seule regle pour le relais (`tune-bridge`) et le serveur (`tune-core`) :
+# `tune-bridge` ne depend pas de `tune-core`, cette caisse est leur dependance
+# commune. Pas de tokio, pas de reseau : elle verifie, elle ne va rien chercher.
+#
+# Aucune caisse nouvelle dans l'arbre : `ring` (rustls, jsonwebtoken),
+# `minisign-verify` (mise a jour du serveur), `base64` et `blake2` sont deja
+# dans Cargo.lock.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22"
+ring = "0.17"
+minisign-verify = "0.2"
+blake2 = { version = "0.10", optional = true }
+
+[features]
+# Fabrique de laissez-passer et de jeux de cles signes, pour les TESTS et pour
+# l'outil qui ecrit `vecteurs/`. Jamais activee par un binaire livre : le
+# relais et le serveur verifient, seul le site signe.
+fabrique = ["dep:blake2"]
+
+[dev-dependencies]
+tune-laissez-passer = { path = ".", features = ["fabrique"] }
+
+[[example]]
+name = "generer_vecteurs"
+required-features = ["fabrique"]
+
+[[test]]
+name = "vecteurs"
+path = "tests/vecteurs.rs"

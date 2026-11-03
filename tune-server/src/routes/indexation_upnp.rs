@@ -385,6 +385,39 @@ pub fn cle_d_identite_album(udn: &str, titre: &str, artiste: Option<&str>) -> St
     format!("{udn}|{:016x}", fnv1a64(matiere.as_bytes()))
 }
 
+/// **Cet item DIDL est-il une station de radio ?** (#6500)
+///
+/// Deux signes, et seulement deux, tous deux lus dans le DIDL :
+///
+/// 1. la classe UPnP `object.item.audioItem.audioBroadcast` (ou une classe qui
+///    en dérive) — la façon normalisée de dire « flux diffusé » ;
+/// 2. la forme qu'a une station dans le serveur média d'un **Tune** :
+///    `id="radio/<n>"` sous `parentID="radios"`. Ce rayon publie ses stations
+///    en `musicTrack` quand on le PARCOURT (`RADIO_CLASSE_BROWSE`,
+///    `tune-core/src/upnp_server.rs`, pour le Marantz ND8006) : la classe ne
+///    les trahit donc pas, et c'est par là qu'elles sont entrées sur le `.18`
+///    (31 stations, `upnp_object_id = radio/<n>`, relevé du 19/10/2026).
+///
+/// Ni la durée nulle ni l'absence de taille ne sont des signes : sept vraies
+/// pistes UPnP du `.18` ont une durée nulle.
+pub(crate) fn est_une_station_de_radio(item: &Value) -> bool {
+    let classe_diffusee = item.get("class").and_then(Value::as_str).is_some_and(|c| {
+        c.trim()
+            .to_ascii_lowercase()
+            .starts_with("object.item.audioitem.audiobroadcast")
+    });
+    let station_de_tune = item
+        .get("parent_id")
+        .and_then(Value::as_str)
+        .is_some_and(|p| p == "radios")
+        && item
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| id.strip_prefix("radio/"))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|o| o.is_ascii_digit()));
+    classe_diffusee || station_de_tune
+}
+
 /// Ce que l'indexation retient d'un item DIDL.
 #[derive(Debug, Clone)]
 struct PisteDistante {
@@ -405,6 +438,8 @@ struct PisteDistante {
     numero_de_piste: Option<i32>,
     /// `upnp:originalDiscNumber` — même règle.
     numero_de_disque: Option<i32>,
+    annee: Option<i32>,
+    genres: Vec<String>,
 }
 
 fn texte(v: &Value, cle: &str) -> Option<String> {
@@ -444,6 +479,17 @@ impl PisteDistante {
             protocol_info: texte(item, "protocol_info"),
             numero_de_piste: numero(item, "track_number"),
             numero_de_disque: numero(item, "disc_number"),
+            annee: numero(item, "year").filter(|y| *y <= 9999),
+            genres: item
+                .get("genres")
+                .and_then(Value::as_array)
+                .map(|g| {
+                    g.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -469,6 +515,8 @@ struct Bilan {
     mises_a_jour: usize,
     sans_url: usize,
     sans_taille: usize,
+    /// #6500 — les stations de radio croisées et écartées.
+    radios_ecartees: usize,
     albums_ajoutes: usize,
     /// #4581 — les coquilles distantes retirées par cette passe.
     albums_vides_retires: usize,
@@ -506,11 +554,10 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
     let Some(ms) = serveurs.get(id).cloned() else {
         return Json(json!({
             "indexe": false,
-            "raison": "serveur inconnu",
-            "detail": format!(
-                "aucun serveur multimédia enregistré sous « {id} » — \
-                 la liste vit dans GET /api/v1/network/media-servers"
-            ),
+            "code": "unknown_server",
+            "raison": crate::message_api::texte("api.upnp.unknownServer", &[]),
+            "detail": crate::message_api::texte("api.upnp.unknownServerDetail", &[("id", id.to_string())]),
+            "message_key": "api.upnp.unknownServerDetail",
         }));
     };
     drop(serveurs);
@@ -600,6 +647,7 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
             "ajoutees": bilan.ajoutees,
             "mises_a_jour": bilan.mises_a_jour,
             "ecartees_sans_url_de_lecture": bilan.sans_url,
+            "ecartees_radios": bilan.radios_ecartees,
             "sans_res_size": bilan.sans_taille,
         },
         "albums_ajoutes": bilan.albums_ajoutes,
@@ -706,6 +754,13 @@ async fn recolter(
         bilan.items_vus += items.len();
 
         for item in &items {
+            // #6500 — une station n'est pas une piste : la ranger dans
+            // `tracks` la mettait en tête de Bibliothèque > Pistes (pas
+            // d'artiste, donc triée la première), sans durée ni album.
+            if est_une_station_de_radio(item) {
+                bilan.radios_ecartees += 1;
+                continue;
+            }
             let Some(piste) = PisteDistante::depuis_item(item) else {
                 bilan.erreurs.push(format!(
                     "{nom} : une piste sans titre ne peut pas être identifiée"
@@ -990,6 +1045,16 @@ fn ecrire(
         ligne.format = piste.format();
         ligne.sample_rate = piste.sample_rate;
         ligne.bit_depth = piste.bit_depth;
+        // Métadonnées annoncées par la source, comme le titre et l'artiste.
+        // Une source qui ne les annonce pas ne doit pas effacer les valeurs conservées.
+        if let Some(annee) = piste.annee {
+            ligne.year = Some(annee);
+        }
+        if !piste.genres.is_empty() {
+            ligne.genre = piste.genres.first().cloned();
+            ligne.genres =
+                Some(serde_json::to_string(&piste.genres).expect("genres sérialisables"));
+        }
         // `channels` est un `i32` NON optionnel dont `to_json` dérive une
         // pastille AFFICHÉE. Un serveur muet sur `nrAudioChannels` ne prouve
         // rien : on retombe sur le défaut du modèle (2) plutôt que d'affirmer
@@ -1274,6 +1339,8 @@ mod tests {
             protocol_info: Some("http-get:*:audio/x-flac:DLNA.ORG_PN=FLAC".into()),
             numero_de_piste: None,
             numero_de_disque: None,
+            annee: None,
+            genres: Vec::new(),
         };
         assert_eq!(p.format().as_deref(), Some("flac"));
         p.protocol_info = None;
@@ -1302,6 +1369,8 @@ mod tests {
             protocol_info: None,
             numero_de_piste: numero,
             numero_de_disque: numero.map(|_| 1),
+            annee: None,
+            genres: Vec::new(),
         };
         let pistes = vec![
             p("Alive", Some(3)),
@@ -1411,6 +1480,8 @@ mod tests {
             protocol_info: None,
             numero_de_piste: numero,
             numero_de_disque: None,
+            annee: None,
+            genres: Vec::new(),
         };
         let revision = |state: &AppState| {
             state
@@ -1501,6 +1572,8 @@ mod tests {
             protocol_info: None,
             numero_de_piste: None,
             numero_de_disque: None,
+            annee: None,
+            genres: Vec::new(),
         };
         // La première piste n'annonce pas d'image, la suivante oui.
         let pistes = vec![p("A", None), p("B", Some(url.clone())), p("C", Some(url))];

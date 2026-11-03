@@ -86,10 +86,37 @@ pub struct QobuzService {
     /// production, de sorte qu'une base d'essai ne puisse jamais recevoir
     /// d'identifiants.
     base_forcee: Option<String>,
+    /// #6336 — toutes les adresses du service, connexion comprise, déplacées
+    /// vers un serveur simulé. `None` en production : seul
+    /// [`QobuzService::avec_bases_de_test`] la pose, et il n'existe que dans
+    /// les constructions de tests (feature `services-factices`).
+    bases_de_test: Option<BasesQobuz>,
+}
+
+/// #6336 — les trois adresses qu'un essai remplace : l'API directe, le relais,
+/// et la configuration distante relue avant chaque connexion.
+#[derive(Clone, Debug)]
+pub struct BasesQobuz {
+    pub api: String,
+    pub proxy: String,
+    pub config_distante: String,
 }
 
 /// Une lecture de favoris partagée par les demandes qui l'attendent.
-type FavorisEnVol = tokio::sync::OnceCell<Result<Vec<serde_json::Value>, String>>;
+type FavorisEnVol = tokio::sync::OnceCell<Result<ListePaginee, String>>;
+
+/// Une liste paginée relue chez Qobuz, et si elle est COMPLÈTE (#5997).
+///
+/// `incomplete` porte le motif quand la liste ne peut pas être tenue pour
+/// entière : moins d'éléments que le `total` annoncé (Qobuz sert parfois des
+/// pages plus courtes qu'il ne l'annonce, #6616), une réponse sans la clé
+/// attendue, ou une page pleine sans `total`. L'affichage s'en contente ; le
+/// miroir des favoris, lui, ne doit rien retirer sur une telle lecture.
+#[derive(Clone, Debug)]
+struct ListePaginee {
+    items: Vec<serde_json::Value>,
+    incomplete: Option<String>,
+}
 
 /// Une réponse éditoriale, et l'instant où elle a été obtenue.
 struct EntreeCache {
@@ -204,6 +231,21 @@ impl AttemptError {
             Self::Http { status, .. } => Some(*status),
             Self::Network(_) | Self::Json(_) => None,
         }
+    }
+}
+
+/// Ce que `POST /streaming/qobuz/auth` rend quand la connexion échoue
+/// (renesenses/tune-server-rust#7068).
+///
+/// Un refus d'identifiants (401 du service) devient [`TuneError::Credentials`] :
+/// la variante, pas le texte, dit au client qu'il s'agit d'un mauvais e-mail ou
+/// mot de passe, et le corps JSON du service ne sort plus dans la réponse (il
+/// reste dans le journal, `qobuz_login_failed`). Toute autre panne — réseau,
+/// 5xx, JSON illisible — garde son texte, c'est une panne et non un refus.
+fn erreur_de_connexion(err: &AttemptError) -> TuneError {
+    match err.statut_http() {
+        Some(401) => TuneError::Credentials("qobuz login: invalid credentials".to_string()),
+        _ => TuneError::Other(format!("qobuz login: {err}")),
     }
 }
 
@@ -360,6 +402,11 @@ const CATEGORIES_RECHERCHE: [&str; 4] = ["tracks", "albums", "artists", "playlis
 /// grand `limit`.
 const TAILLE_PAGE_RECHERCHE: usize = 50;
 
+/// #6231 — pages de `/album/search` examinées au plus pour une recherche dans
+/// un genre (6 × 50 = 300 résultats). Qobuz ne filtre pas par genre : au-delà,
+/// la recherche coûterait trop d'allers-retours pour une saisie au clavier.
+const PAGES_RECHERCHE_GENRE: usize = 6;
+
 /// Plafond d'une recherche « Tous » (#2160).
 ///
 /// « Tous » ne peut pas vouloir dire « tout le catalogue » : une requête
@@ -472,7 +519,130 @@ fn log_favorite_result(
     }
 }
 
+/// Un album du catalogue d'un label qu'on peut montrer : écoutable et déjà
+/// sorti. Les précommandes (`streamable` vrai mais date future) rendent « no
+/// url » (502) à la lecture (garde du LMS, `_isReleased`).
+fn sorti_et_ecoutable(item: &serde_json::Value, maintenant: u64) -> bool {
+    let streamable = item["streamable"].as_bool() != Some(false);
+    let released = item["released_at"]
+        .as_u64()
+        .map_or(true, |ts| ts <= maintenant);
+    streamable && released
+}
+
+fn secondes_d_epoque() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 impl QobuzService {
+    /// #6934 — UNE page du catalogue d'un label, par son identifiant : un
+    /// seul `label/get` (`extra=albums`, `limit`, `offset`). Le nom et le logo
+    /// viennent de la même réponse (le logo par [`logos_labels::image_de_label`],
+    /// la lecture du lot L). Sans les précommandes, comme
+    /// [`Self::albums_du_label`] ; `total` reste celui que Qobuz annonce.
+    pub(crate) async fn page_du_label(
+        &self,
+        label_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<LabelPage, TuneError> {
+        let lim = limit.to_string();
+        let off = offset.to_string();
+        let data = self
+            .api_get(
+                "/label/get",
+                &[
+                    ("label_id", label_id),
+                    ("extra", "albums"),
+                    ("limit", &lim),
+                    ("offset", &off),
+                ],
+            )
+            .await?;
+        let maintenant = secondes_d_epoque();
+        let albums = data["albums"]["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|it| sorti_et_ecoutable(it, maintenant))
+                    .map(Self::map_album)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let id = data["id"]
+            .as_u64()
+            .map(|id| id.to_string())
+            .or_else(|| data["id"].as_str().map(Into::into))
+            .unwrap_or_else(|| label_id.to_string());
+        Ok(LabelPage {
+            id,
+            name: data["name"].as_str().unwrap_or("").trim().to_string(),
+            image_url: logos_labels::image_de_label(&data),
+            total: data["albums"]["total"].as_u64().unwrap_or(0) as usize,
+            offset,
+            limit,
+            albums,
+        })
+    }
+
+    /// Le catalogue d'un label (`label/get`, `extra=albums`), paginé et borné
+    /// à 500 albums, sans les précommandes. Partagé par la page d'un label
+    /// ([`StreamingService::get_album_label`]) et la découverte des artistes
+    /// du même label (#6782, [`crate::library::artistes_du_label`]).
+    pub(crate) async fn albums_du_label(
+        &self,
+        label_id: &str,
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
+        // Bounded pagination: big majors (e.g. Columbia) expose 10k+ albums.
+        // We cap at MAX and the app offers a text filter over the loaded set.
+        const MAX: usize = 500;
+        const PAGE: usize = 50;
+        let now = secondes_d_epoque();
+        let mut albums: Vec<StreamAlbum> = Vec::new();
+        let mut offset: usize = 0;
+        loop {
+            let off = offset.to_string();
+            let lim = PAGE.to_string();
+            let data = self
+                .api_get(
+                    "/label/get",
+                    &[
+                        ("label_id", label_id),
+                        ("extra", "albums"),
+                        ("limit", &lim),
+                        ("offset", &off),
+                    ],
+                )
+                .await?;
+            let items = data["albums"]["items"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let n = items.len();
+            // A label's full catalogue includes not-yet-released pre-orders
+            // (streamable=true but a future release date) whose tracks resolve
+            // to "no url" (502) on playback. Keep only released + streamable
+            // albums (mirrors the LMS plugin's `_isReleased` check).
+            albums.extend(
+                items
+                    .iter()
+                    .filter(|it| sorti_et_ecoutable(it, now))
+                    .map(Self::map_album),
+            );
+            let total = data["albums"]["total"].as_u64().unwrap_or(0) as usize;
+            offset += n;
+            if n < PAGE || offset >= total || albums.len() >= MAX {
+                break;
+            }
+        }
+        albums.truncate(MAX);
+        Ok(albums)
+    }
+
     /// Écrire un favori exige le jeton utilisateur : l'app_id seul identifie
     /// l'application, pas le compte. Sans jeton, Qobuz accepte la requête sans
     /// rien enregistrer — un succès en trompe-l'œil. On refuse avant d'émettre.
@@ -569,6 +739,28 @@ impl QobuzService {
             cache_album: Mutex::new(HashMap::new()),
             favoris_en_vol: Mutex::new(HashMap::new()),
             base_forcee: None,
+            bases_de_test: None,
+        }
+    }
+
+    /// #6336 — un service dont TOUTES les adresses, connexion et configuration
+    /// distante comprises, sont celles de `bases`. Réservé aux bancs d'essai
+    /// (`tune-server/tests/services_remplacables_6336.rs`) : aucun binaire
+    /// publié ne le compile.
+    #[cfg(any(test, feature = "services-factices"))]
+    pub fn avec_bases_de_test(app_id: String, app_secret: String, bases: BasesQobuz) -> Self {
+        let mut svc = Self::new(app_id, app_secret);
+        svc.bases_de_test = Some(bases);
+        svc
+    }
+
+    /// (primaire, secours) pour la CONNEXION et, hors `base_forcee`, pour
+    /// l'API : l'ordre de production, sur les adresses d'essai s'il y en a.
+    fn bases_ordonnees(&self) -> (&str, &str) {
+        match self.bases_de_test {
+            Some(ref b) if self.proxy_first => (b.proxy.as_str(), b.api.as_str()),
+            Some(ref b) => (b.api.as_str(), b.proxy.as_str()),
+            None => endpoint_order(self.proxy_first),
         }
     }
 
@@ -576,9 +768,20 @@ impl QobuzService {
     /// l'API Qobuz. Réservé aux essais : il n'existe aucun chemin de
     /// production qui construise un service ainsi.
     #[cfg(test)]
-    fn avec_base_forcee(base: impl Into<String>) -> Self {
+    pub(crate) fn avec_base_forcee(base: impl Into<String>) -> Self {
         let mut svc = Self::new(String::from("app-id-essai"), String::from("secret-essai"));
         svc.base_forcee = Some(base.into());
+        svc
+    }
+
+    /// Comme [`Self::avec_base_forcee`], avec un jeton utilisateur FACTICE :
+    /// le service se comporte comme un compte connecté, sans qu'aucun
+    /// identifiant réel n'entre dans un essai. Utilisé hors de ce module par
+    /// les essais des favoris radio → playlist Qobuz.
+    #[cfg(test)]
+    pub(crate) fn connecte_a_base_forcee(base: impl Into<String>) -> Self {
+        let mut svc = Self::avec_base_forcee(base);
+        svc.user_auth_token = Some(String::from("jeton-essai"));
         svc
     }
 
@@ -590,7 +793,7 @@ impl QobuzService {
     fn bases_api(&self) -> (&str, &str) {
         match self.base_forcee {
             Some(ref base) => (base.as_str(), base.as_str()),
-            None => endpoint_order(self.proxy_first),
+            None => self.bases_ordonnees(),
         }
     }
 
@@ -604,7 +807,11 @@ impl QobuzService {
     }
 
     async fn refresh_credentials(&mut self) {
-        match self.client.get(REMOTE_CONFIG_URL).send().await {
+        let url = self
+            .bases_de_test
+            .as_ref()
+            .map_or(REMOTE_CONFIG_URL, |b| b.config_distante.as_str());
+        match self.client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(data) = resp.json::<serde_json::Value>().await {
                     let qobuz = &data["qobuz"];
@@ -1088,18 +1295,10 @@ impl QobuzService {
         Ok(data)
     }
 
-    async fn api_get_all_pages(
-        &self,
-        path: &str,
-        base_params: &[(&str, &str)],
-        items_key: &str,
-    ) -> Result<Vec<serde_json::Value>, String> {
-        self.api_get_all_pages_bornee(path, base_params, items_key, usize::MAX)
-            .await
-    }
-
-    /// Comme `api_get_all_pages`, mais cesse de paginer une fois `plafond`
-    /// éléments atteints. Voir `remaining_page_offsets_bornees` (#1969).
+    /// Toutes les pages d'une liste Qobuz, en cessant de paginer une fois
+    /// `plafond` éléments atteints. Voir `remaining_page_offsets_bornees`
+    /// (#1969). Les favoris passent par [`Self::liste_paginee`], qui dit en
+    /// plus si la liste est complète (#5997).
     async fn api_get_all_pages_bornee(
         &self,
         path: &str,
@@ -1107,6 +1306,21 @@ impl QobuzService {
         items_key: &str,
         plafond: usize,
     ) -> Result<Vec<serde_json::Value>, String> {
+        Ok(self
+            .liste_paginee(path, base_params, items_key, plafond)
+            .await?
+            .items)
+    }
+
+    /// La pagination de `api_get_all_pages_bornee`, qui dit en plus si la
+    /// liste rendue est complète (#5997, voir [`ListePaginee`]).
+    async fn liste_paginee(
+        &self,
+        path: &str,
+        base_params: &[(&str, &str)],
+        items_key: &str,
+        plafond: usize,
+    ) -> Result<ListePaginee, String> {
         use futures_util::StreamExt;
         const PAGE_SIZE: usize = 50;
         const MAX_CONCURRENT_PAGES: usize = 4;
@@ -1157,9 +1371,34 @@ impl QobuzService {
             }
         }
 
+        // #5997 — ce que la première page permet de dire de la complétude.
+        let total_annonce = data[items_key]["total"].as_u64().map(|t| t as usize);
+        let cle_presente = data.get(items_key).map(|v| v.is_object()).unwrap_or(false);
+        let complete = |recus: usize| -> Option<String> {
+            if !cle_presente {
+                return Some(format!("qobuz: réponse sans « {items_key} »"));
+            }
+            match total_annonce {
+                Some(t) if recus < t => Some(format!(
+                    "qobuz: lecture de « {items_key} » incomplète ({recus} sur {t})"
+                )),
+                Some(_) => None,
+                // Sans total, une page pleine peut avoir une suite qu'on n'a
+                // pas demandée.
+                None if recus >= PAGE_SIZE => Some(format!(
+                    "qobuz: lecture de « {items_key} » sans total annoncé"
+                )),
+                None => None,
+            }
+        };
+
         let offsets = remaining_page_offsets_bornees(count, total, PAGE_SIZE, plafond);
         if offsets.is_empty() {
-            return Ok(all_items);
+            let incomplete = complete(all_items.len());
+            return Ok(ListePaginee {
+                items: all_items,
+                incomplete,
+            });
         }
 
         // `buffered` preserves page order, so the merged list matches what the
@@ -1191,7 +1430,11 @@ impl QobuzService {
             all_items.extend(page?);
         }
 
-        Ok(all_items)
+        let incomplete = complete(all_items.len());
+        Ok(ListePaginee {
+            items: all_items,
+            incomplete,
+        })
     }
 
     /// Rôles Qobuz d'écriture pure (comparés sans espaces) : un intervenant qui
@@ -1354,6 +1597,29 @@ impl QobuzService {
     /// Les demandes concurrentes d'un même type partagent UNE requête en vol
     /// (voir `favoris_en_vol`) ; aucune réponse n'est gardée après elle.
     async fn favoris_bruts(&self, type_qobuz: &str) -> Result<Vec<serde_json::Value>, TuneError> {
+        Ok(self.lecture_des_favoris(type_qobuz).await?.items)
+    }
+
+    /// Les favoris d'un type, seulement si Qobuz les a servis EN ENTIER
+    /// (#5997) : `Err` sur une lecture incomplète (voir [`ListePaginee`]).
+    ///
+    /// C'est la lecture du miroir des favoris : un favori `synchro` que le
+    /// service ne nomme plus y est retiré de Tune. Une liste coupée à la
+    /// troisième page aurait retiré tout ce qui la dépasse, à chaque
+    /// rafraîchissement.
+    async fn favoris_complets(
+        &self,
+        type_qobuz: &str,
+    ) -> Result<Vec<serde_json::Value>, TuneError> {
+        let lecture = self.lecture_des_favoris(type_qobuz).await?;
+        if let Some(motif) = lecture.incomplete {
+            warn!(type_qobuz, motif = %motif, "qobuz_favoris_lecture_incomplete_5997");
+            return Err(motif.into());
+        }
+        Ok(lecture.items)
+    }
+
+    async fn lecture_des_favoris(&self, type_qobuz: &str) -> Result<ListePaginee, TuneError> {
         let vol = {
             let mut en_vol = self
                 .favoris_en_vol
@@ -1366,10 +1632,11 @@ impl QobuzService {
         };
         let reponse = vol
             .get_or_init(|| async {
-                self.api_get_all_pages(
+                self.liste_paginee(
                     "/favorite/getUserFavorites",
                     &[("type", type_qobuz)],
                     type_qobuz,
+                    usize::MAX,
                 )
                 .await
             })
@@ -1638,6 +1905,34 @@ impl QobuzService {
             .as_array()
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// #6231 — l'album appartient-il au genre `genre_id` ? Qobuz donne à
+    /// chaque album son genre et la lignée de ce genre (`genre.path`, du plus
+    /// large au plus fin : `[112, 119]` pour Pop/Rock › Rock). Un genre parent
+    /// couvre donc ses sous-genres.
+    fn album_du_genre(item: &serde_json::Value, genre_id: &str) -> bool {
+        let genre = &item["genre"];
+        let egal = |v: &serde_json::Value| {
+            v.as_u64().map(|n| n.to_string()).as_deref() == Some(genre_id)
+                || v.as_str() == Some(genre_id)
+        };
+        egal(&genre["id"])
+            || genre["path"]
+                .as_array()
+                .is_some_and(|chemin| chemin.iter().any(egal))
+    }
+
+    /// #6231 — les albums d'une page de `/album/search` qui appartiennent au
+    /// genre, et le nombre de résultats examinés.
+    fn albums_du_genre(page: &serde_json::Value, genre_id: &str) -> (Vec<StreamAlbum>, usize) {
+        let items = Self::elements(page, "albums");
+        let albums = items
+            .iter()
+            .filter(|i| Self::album_du_genre(i, genre_id))
+            .map(Self::map_album)
+            .collect();
+        (albums, items.len())
     }
 
     /// Ce qu'une page rend pour une catégorie, et ce que Qobuz annonce en tout.
@@ -1947,6 +2242,28 @@ impl QobuzService {
             .unwrap_or_default()
     }
 
+    /// Les playlists de l'utilisateur, si la réponse les contient TOUTES
+    /// (#6461) : autant d'éléments que le `total` annoncé, sinon `Err`.
+    pub(crate) fn playlists_completes(
+        data: &serde_json::Value,
+    ) -> Result<Vec<StreamPlaylist>, TuneError> {
+        let recus = data["playlists"]["items"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0) as u64;
+        match data["playlists"]["total"].as_u64() {
+            Some(total) if recus >= total => Ok(Self::map_user_playlists(data)),
+            Some(total) => {
+                warn!(recus, total, "qobuz_playlists_lecture_incomplete_6461");
+                Err(format!("qobuz: lecture des playlists incomplète ({recus} sur {total})").into())
+            }
+            None => {
+                warn!(recus, "qobuz_playlists_sans_total_6461");
+                Err("qobuz: lecture des playlists sans total annoncé".into())
+            }
+        }
+    }
+
     /// Map a Qobuz playlist item (editorial selection or search hit) to
     /// StreamPlaylist.
     fn map_featured_playlist(item: &serde_json::Value) -> StreamPlaylist {
@@ -2000,10 +2317,10 @@ impl QobuzService {
         &mut self,
         username: &str,
         password: &str,
-    ) -> Result<AuthStatus, String> {
+    ) -> Result<AuthStatus, TuneError> {
         self.refresh_credentials().await;
 
-        let (primary, fallback) = endpoint_order(self.proxy_first);
+        let (primary, fallback) = self.bases_ordonnees();
         let data = match self.login_at(primary, username, password).await {
             Ok(d) => d,
             Err(err) if err.transient() => {
@@ -2012,12 +2329,12 @@ impl QobuzService {
                     .await
                     .map_err(|e| {
                         info!(error = %e, "qobuz_login_failed");
-                        format!("qobuz login: {e}")
+                        erreur_de_connexion(&e)
                     })?
             }
             Err(err) => {
                 info!(error = %err, "qobuz_login_failed");
-                return Err(format!("qobuz login: {err}"));
+                return Err(erreur_de_connexion(&err));
             }
         };
 
@@ -2397,7 +2714,7 @@ impl StreamingService for QobuzService {
         self.stored_username = Some(username.to_string());
         self.stored_password = Some(password.to_string());
 
-        Ok(self.login_internal(username, password).await?)
+        self.login_internal(username, password).await
     }
 
     async fn auth_status(&self) -> AuthStatus {
@@ -2490,6 +2807,15 @@ impl StreamingService for QobuzService {
                         "qobuz_format_fallback"
                     );
                     if let Ok(url) = self.fetch_track_url(track_id, fid).await {
+                        // #6401 — la même ligne que le repli après une sonde
+                        // de flux en échec (`qobuz_repli_qualite`).
+                        info!(
+                            track_id,
+                            format_demande = format_id,
+                            erreur = %e,
+                            format_obtenu = fid,
+                            "qobuz_repli_qualite"
+                        );
                         return Ok(url);
                     }
                 }
@@ -2663,6 +2989,52 @@ impl StreamingService for QobuzService {
             .await
     }
 
+    /// #6231 — la recherche du catalogue, restreinte au genre. Qobuz ignore
+    /// tout filtre de genre sur `/album/search` (mesuré le 13/10/2026 :
+    /// `genre_id`, `genre_ids`, `genre` rendent la même liste) : on garde les
+    /// albums du genre parmi ses résultats, page par page, jusqu'à `limit`
+    /// albums ou [`PAGES_RECHERCHE_GENRE`] pages examinées.
+    async fn search_genre_albums(
+        &self,
+        genre_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<RechercheDansUnGenre, TuneError> {
+        let voulu = limit.clamp(1, TAILLE_PAGE_DETAIL);
+        let mut albums: Vec<StreamAlbum> = Vec::new();
+        let mut examined = 0usize;
+        for rang in 0..PAGES_RECHERCHE_GENRE {
+            let page = self
+                .api_get_page(
+                    "/album/search",
+                    &[("query", query)],
+                    rang * TAILLE_PAGE_RECHERCHE,
+                    TAILLE_PAGE_RECHERCHE,
+                )
+                .await?;
+            let (trouves, vus) = Self::albums_du_genre(&page, genre_id);
+            examined += vus;
+            albums.extend(trouves);
+            let total = page["albums"]["total"].as_u64().unwrap_or(0) as usize;
+            if albums.len() >= voulu || vus < TAILLE_PAGE_RECHERCHE || examined >= total {
+                break;
+            }
+        }
+        dedoublonner_par_id(&mut albums, |a| a.id.as_str());
+        albums.truncate(voulu);
+        info!(
+            genre_id,
+            examined,
+            found = albums.len(),
+            "qobuz_genre_search"
+        );
+        Ok(RechercheDansUnGenre {
+            albums,
+            examined,
+            genre_filter: "results",
+        })
+    }
+
     /// Une rubrique éditoriale — palmarès, distinctions de la presse,
     /// discothèque idéale, Qobuzissimes… — restreinte à un genre (#3481).
     ///
@@ -2784,61 +3156,25 @@ impl StreamingService for QobuzService {
             .or_else(|| album["label"]["id"].as_str().map(Into::into))
             .ok_or_else(|| TuneError::NotFound("album has no label".into()))?;
         let name = album["label"]["name"].as_str().unwrap_or("").into();
-        // Bounded pagination: big majors (e.g. Columbia) expose 10k+ albums.
-        // We cap at MAX and the app offers a text filter over the loaded set.
-        const MAX: usize = 500;
-        const PAGE: usize = 50;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let mut albums: Vec<StreamAlbum> = Vec::new();
-        let mut offset: usize = 0;
-        loop {
-            let off = offset.to_string();
-            let lim = PAGE.to_string();
-            let data = self
-                .api_get(
-                    "/label/get",
-                    &[
-                        ("label_id", &label_id),
-                        ("extra", "albums"),
-                        ("limit", &lim),
-                        ("offset", &off),
-                    ],
-                )
-                .await?;
-            let items = data["albums"]["items"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let n = items.len();
-            // A label's full catalogue includes not-yet-released pre-orders
-            // (streamable=true but a future release date) whose tracks resolve
-            // to "no url" (502) on playback. Keep only released + streamable
-            // albums (mirrors the LMS plugin's `_isReleased` check).
-            albums.extend(
-                items
-                    .iter()
-                    .filter(|it| {
-                        let streamable = it["streamable"].as_bool() != Some(false);
-                        let released = it["released_at"].as_u64().map_or(true, |ts| ts <= now);
-                        streamable && released
-                    })
-                    .map(Self::map_album),
-            );
-            let total = data["albums"]["total"].as_u64().unwrap_or(0) as usize;
-            offset += n;
-            if n < PAGE || offset >= total || albums.len() >= MAX {
-                break;
-            }
-        }
-        albums.truncate(MAX);
+        let albums = self.albums_du_label(&label_id).await?;
         Ok(LabelInfo {
             id: label_id,
             name,
             albums,
         })
+    }
+
+    async fn get_label(
+        &self,
+        label_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<LabelPage, TuneError> {
+        self.page_du_label(label_id, limit, offset).await
+    }
+
+    async fn get_label_catalogue(&self, label_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
+        self.albums_du_label(label_id).await
     }
 
     async fn get_playlist_tags(&self) -> Result<Vec<PlaylistTag>, TuneError> {
@@ -3073,6 +3409,13 @@ impl StreamingService for QobuzService {
         })
     }
 
+    /// #6481 — les livrets numériques de l'album (`goodies` de `album/get`),
+    /// depuis la réponse déjà mise en cache par `detail_album`.
+    async fn get_album_booklets(&self, album_id: &str) -> Result<Vec<StreamBooklet>, TuneError> {
+        let data = self.detail_album(album_id).await?;
+        Ok(livrets_qobuz(&data))
+    }
+
     /// #4993 — crédits d'une piste Qobuz : la chaîne `performers` de
     /// `/track/get`.
     async fn get_track_credits(&self, track_id: &str) -> Result<Vec<StreamCredit>, TuneError> {
@@ -3101,6 +3444,19 @@ impl StreamingService for QobuzService {
             .into_iter()
             .flat_map(|p| Self::credits_de_l_item(p, true))
             .collect())
+    }
+
+    /// #6480 — la critique Qobuz de l'album (`description` de `album/get`),
+    /// ramenée à du texte. Même réponse que la fiche et les crédits, déjà mise
+    /// en cache par `detail_album` : aucun appel de plus. `description` est un
+    /// champ de CATALOGUE — la condition de cette mise en cache (aucun mappeur
+    /// ne lit les champs du compte) tient.
+    async fn get_album_description(
+        &self,
+        album_id: &str,
+    ) -> Result<Option<StreamAlbumDescription>, TuneError> {
+        let data = self.detail_album(album_id).await?;
+        Ok(super::presentation_album::presentation_qobuz(&data))
     }
 
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
@@ -3138,9 +3494,45 @@ impl StreamingService for QobuzService {
         ))
     }
 
+    /// #5997 — la même liste datée, mais `Err` si Qobuz ne l'a pas servie en
+    /// entier : c'est elle que le miroir réconcilie.
+    async fn favoris_dates_complets(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        if !matches!(fav_type, "tracks" | "albums" | "artists") {
+            return Ok(None);
+        }
+        let items = self.favoris_complets(fav_type).await?;
+        Ok(Some(
+            items
+                .iter()
+                .map(|brut| Self::favori_date(brut, fav_type))
+                .collect(),
+        ))
+    }
+
     /// #5997 — favoris en miroir : la vérité est chez le service.
     fn favoris_miroir(&self) -> bool {
         true
+    }
+
+    /// #6461 — `/playlist/getUserPlaylists` rend les playlists possédées ET
+    /// suivies ; `map_user_playlists` les distingue par le propriétaire.
+    ///
+    /// `detail_pagine` coupe à `PLAFOND_ELEMENTS_DETAIL`, ou quand Qobuz sert
+    /// des pages plus courtes qu'il ne l'annonce, et rend quand même `Ok`
+    /// (relecture de #6616). Ici, moins d'éléments que le `total` annoncé — ou
+    /// pas de `total` du tout — est une lecture INCOMPLÈTE, donc une erreur.
+    async fn playlists_de_la_bibliotheque(&self) -> Option<Result<Vec<StreamPlaylist>, TuneError>> {
+        let data = match self
+            .detail_pagine("/playlist/getUserPlaylists", &[], "playlists")
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => return Some(Err(e.into())),
+        };
+        Some(Self::playlists_completes(&data))
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
@@ -3247,9 +3639,14 @@ impl StreamingService for QobuzService {
     /// n'avait jamais demandé `tracks`, et qui laissait croire que les deux
     /// cas étaient couverts.
     ///
-    /// Aucun tri n'est appliqué : l'ordre est celui que Qobuz rend. Classer
-    /// nous-mêmes sur une popularité que Qobuz ne donne pas reviendrait à
-    /// fabriquer le « best of » au lieu de le relayer.
+    /// Aucun tri n'est appliqué ICI : l'ordre est celui que Qobuz rend, et
+    /// c'est le catalogue dans l'ordre d'un album, pas une popularité
+    /// (Kiwanuka, 26/10/2026 : dix pistes de FUDGE). Nous n'inventons pas de
+    /// « best of » : la route (`tune-streaming-http`,
+    /// `service_artist_top_tracks`, #7107) classe ensuite sur des sources
+    /// réelles — total de la communauté, écoutes de ce serveur, puis
+    /// `artist.getTopTracks` de Last.fm (`titres_phares_lastfm`) — et ne
+    /// retombe sur l'ordre de Qobuz qu'en dernier.
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         match self.pistes_extra_artiste(artist_id, "tracks").await {
             Ok(pistes) if !pistes.is_empty() => return Ok(pistes),
@@ -3513,6 +3910,38 @@ fn md5_hex(input: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #6231 — la forme RÉELLE de `/album/search` (relevée le 13/10/2026,
+    /// « roxy music ») : chaque album porte `genre.id` et `genre.path`.
+    #[test]
+    fn recherche_dans_un_genre_6231_garde_les_albums_du_genre_et_de_ses_sous_genres() {
+        let page = json!({"albums": {"total": 3, "items": [
+            {"id": "a1", "title": "Avalon", "artist": {"name": "Roxy Music"},
+             "genre": {"id": 119, "name": "Rock", "path": [112, 119]}},
+            {"id": "a2", "title": "Kind of Blue", "artist": {"name": "Miles Davis"},
+             "genre": {"id": 80, "name": "Jazz", "path": [80]}},
+            {"id": "a3", "title": "Sans genre", "artist": {"name": "X"}}
+        ]}});
+        // Le genre fin.
+        let (rock, vus) = QobuzService::albums_du_genre(&page, "119");
+        assert_eq!(vus, 3, "tous les résultats sont examinés");
+        assert_eq!(
+            rock.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["a1"]
+        );
+        // Le genre parent couvre son sous-genre (Pop/Rock › Rock).
+        let (pop_rock, _) = QobuzService::albums_du_genre(&page, "112");
+        assert_eq!(pop_rock.len(), 1);
+        assert_eq!(pop_rock[0].title, "Avalon");
+        // CONTRE-ÉPREUVE : un autre genre n'attrape pas Roxy Music.
+        let (jazz, _) = QobuzService::albums_du_genre(&page, "80");
+        assert_eq!(
+            jazz.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["a2"]
+        );
+        let (rien, _) = QobuzService::albums_du_genre(&page, "64");
+        assert!(rien.is_empty(), "un album sans genre n'est d'aucun genre");
+    }
 
     #[test]
     fn search_playlists_read_from_the_search_payload() {
@@ -7518,5 +7947,214 @@ mod tests_playlists_proprietaire_2097 {
         assert_eq!(v[0]["editable"], json!(true));
         assert_eq!(v[1]["editable"], json!(false));
         assert!(v[2].get("editable").is_none());
+    }
+
+    /// #6461 — le miroir ne reçoit les playlists de Qobuz que si la lecture
+    /// est COMPLÈTE : une lecture tronquée lui ferait retirer le cœur de tout
+    /// ce qui dépasse la coupe (relecture de #6616).
+    #[test]
+    fn une_lecture_tronquee_des_playlists_est_une_erreur_6461() {
+        let complete = reponse();
+        let pl = QobuzService::playlists_completes(&complete).expect("lecture complète");
+        assert_eq!(pl.len(), 3);
+        assert_eq!(pl[1].editable, Some(false));
+
+        let mut tronquee = reponse();
+        tronquee["playlists"]["total"] = json!(5001);
+        assert!(
+            QobuzService::playlists_completes(&tronquee).is_err(),
+            "3 éléments pour 5001 annoncés : la lecture doit être déclarée incomplète"
+        );
+
+        let mut sans_total = reponse();
+        sans_total["playlists"]
+            .as_object_mut()
+            .unwrap()
+            .remove("total");
+        assert!(QobuzService::playlists_completes(&sans_total).is_err());
+    }
+
+    /// Le même contrat par le connecteur réel, contre un Qobuz simulé qui
+    /// annonce 7 playlists et n'en sert que 3 : `playlists_de_la_bibliotheque`
+    /// rend `Err`, jamais une liste partielle.
+    #[tokio::test]
+    async fn qobuz_ne_rend_jamais_une_liste_de_playlists_partielle_6461() {
+        use axum::{Json, Router};
+        let app = Router::new().fallback(|| async {
+            let mut r = reponse();
+            r["playlists"]["total"] = json!(7);
+            Json(r)
+        });
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let svc = QobuzService::connecte_a_base_forcee(format!("http://{adresse}"));
+        let lecture = svc
+            .playlists_de_la_bibliotheque()
+            .await
+            .expect("Qobuz relit ses playlists");
+        assert!(
+            lecture.is_err(),
+            "une liste partielle a été rendue comme complète : {lecture:?}"
+        );
+    }
+}
+
+/// Les livrets PDF d'un album Qobuz, depuis `goodies` de `album/get` (#6481).
+///
+/// Forme relevée par la sonde `raw-keys` sur le .18 le 19/10/2026 (Kind of
+/// Blue, 5099749522428, un élément) : chaque élément porte `id`,
+/// `file_format_id`, `name`, `description`, `url` et `original_url`. Les
+/// VALEURS des adresses ne sortent pas de la sonde : on ne retient donc qu'un
+/// élément dont l'adresse est en `https`, chez Qobuz, et désigne un PDF
+/// (extension `.pdf`, ou `file_format_id` 21, le livret numérique). Toute autre
+/// forme est écartée plutôt que proposée à l'ouverture.
+pub(crate) fn livrets_qobuz(album: &serde_json::Value) -> Vec<StreamBooklet> {
+    let Some(goodies) = album["goodies"].as_array() else {
+        return vec![];
+    };
+    goodies
+        .iter()
+        .filter_map(|g| {
+            let url = [&g["url"], &g["original_url"]]
+                .into_iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .find(|u| adresse_de_livret_qobuz(u, g["file_format_id"].as_u64()))?;
+            let nom = g["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .unwrap_or("Livret");
+            Some(StreamBooklet {
+                name: nom.to_string(),
+                url: url.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// `https://<…>.qobuz.com/…` et un PDF.
+fn adresse_de_livret_qobuz(url: &str, format: Option<u64>) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let hote_qobuz = u
+        .host_str()
+        .is_some_and(|h| h == "qobuz.com" || h.ends_with(".qobuz.com"));
+    let pdf = u.path().to_ascii_lowercase().ends_with(".pdf") || format == Some(21);
+    u.scheme() == "https" && hote_qobuz && pdf
+}
+
+#[cfg(test)]
+mod tests_livrets_qobuz_6481 {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn le_livret_qobuz_est_lu_dans_goodies() {
+        let album = json!({"goodies": [{
+            "id": 153842, "file_format_id": 21, "name": "Livret Numérique",
+            "description": "", "url": "https://static.qobuz.com/goodies/42/000153842.pdf",
+            "original_url": "https://static.qobuz.com/goodies/42/000153842.pdf"
+        }]});
+        assert_eq!(
+            livrets_qobuz(&album),
+            vec![StreamBooklet {
+                name: "Livret Numérique".into(),
+                url: "https://static.qobuz.com/goodies/42/000153842.pdf".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn sans_goodies_ou_goodies_vide_aucun_livret() {
+        assert!(livrets_qobuz(&json!({"id": "1"})).is_empty());
+        assert!(livrets_qobuz(&json!({"goodies": []})).is_empty());
+    }
+
+    #[test]
+    fn une_adresse_douteuse_n_est_pas_proposee() {
+        let album = json!({"goodies": [
+            {"name": "http", "url": "http://static.qobuz.com/goodies/a.pdf"},
+            {"name": "ailleurs", "url": "https://qobuz.com.exemple.net/a.pdf"},
+            {"name": "script", "url": "javascript:alert(1)//.pdf"},
+            {"name": "video", "file_format_id": 3, "url": "https://static.qobuz.com/goodies/a.mp4"},
+            {"name": "", "url": "", "original_url": "https://static.qobuz.com/goodies/b.pdf"}
+        ]});
+        assert_eq!(
+            livrets_qobuz(&album),
+            vec![StreamBooklet {
+                name: "Livret".into(),
+                url: "https://static.qobuz.com/goodies/b.pdf".into(),
+            }]
+        );
+    }
+}
+
+/// #6736 — le logo d'un label, rapproché par l'album ou par `catalog/search` (#7064).
+#[path = "qobuz_logos_labels.rs"]
+mod logos_labels;
+
+/// #6934 — une page du catalogue d'un label (`label/get`), sur un Qobuz simulé
+/// qui rend une réponse reconstituée (aucun appel réel, aucun jeton).
+#[cfg(test)]
+#[path = "qobuz_page_du_label_tests.rs"]
+mod page_du_label_tests;
+
+/// renesenses/tune-server-rust#7068 — un mauvais mot de passe Qobuz sortait en
+/// `qobuz login: 401 {"status":"error","code":401,"message":"Invalid
+/// username\/email and password combination"}` : le JSON du service, recopié
+/// tel quel dans la réponse.
+///
+/// Contre-épreuve : remplacer le bras `Some(401)` de `erreur_de_connexion` par
+/// le formatage brut fait rougir `refus_401_devient_un_code_sans_json_du_service`.
+#[cfg(test)]
+mod tests_erreur_de_connexion_7068 {
+    use super::*;
+
+    #[test]
+    fn refus_401_devient_un_code_sans_json_du_service() {
+        let brut = AttemptError::Http {
+            status: 401,
+            body: r#"{"status":"error","code":401,"message":"Invalid username\/email and password combination"}"#
+                .to_string(),
+        };
+        let e = erreur_de_connexion(&brut);
+        assert!(
+            matches!(e, TuneError::Credentials(_)),
+            "un refus 401 doit être une erreur d'identifiants, pas : {e:?}"
+        );
+        let texte = e.to_string();
+        assert!(
+            !texte.contains('{') && !texte.contains("Invalid username"),
+            "le JSON du service ne doit pas sortir dans la réponse : {texte}"
+        );
+    }
+
+    #[test]
+    fn une_panne_n_est_pas_un_refus_d_identifiants() {
+        for brut in [
+            AttemptError::Http {
+                status: 500,
+                body: "boom".into(),
+            },
+            AttemptError::Http {
+                status: 403,
+                body: "akamai".into(),
+            },
+            AttemptError::Network("timeout".into()),
+            AttemptError::Json("eof".into()),
+        ] {
+            let e = erreur_de_connexion(&brut);
+            assert!(
+                matches!(e, TuneError::Other(_)),
+                "{brut} ne doit pas passer pour un mauvais mot de passe : {e:?}"
+            );
+        }
     }
 }

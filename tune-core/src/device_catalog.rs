@@ -83,6 +83,12 @@ pub struct DeviceQuirks {
     /// **Framework only** (déjà exposé en flag zone/`[device_delays]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dlna_play_delay_ms: Option<u64>,
+    /// #6264 — après une longue pause, le lecteur relit mal sa mémoire (bruit
+    /// blanc) : la reprise relance le morceau par un NOUVEAU flux, à la
+    /// position mémorisée, au lieu d'un `Play` sur place. **Câblé** par la
+    /// préconfiguration (`reprise_nouveau_flux`).
+    #[serde(default)]
+    pub reprise_par_nouveau_flux: bool,
 }
 
 /// Un modèle du catalogue.
@@ -125,6 +131,7 @@ impl DeviceQuirks {
         self.pcm_only |= marque.pcm_only;
         self.dlna_wav24 |= marque.dlna_wav24;
         self.dlna_native_flac |= marque.dlna_native_flac;
+        self.reprise_par_nouveau_flux |= marque.reprise_par_nouveau_flux;
         self.max_sample_rate = self.max_sample_rate.or(marque.max_sample_rate);
         if self.force_mime.is_none() {
             self.force_mime = marque.force_mime.clone();

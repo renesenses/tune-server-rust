@@ -68,6 +68,11 @@ pub struct SpotifyService {
     /// jeton révoqué produisait des 401 indéfiniment sans que rien ne tente
     /// de le renouveler.
     token_rejected: AtomicBool,
+    /// #6933 — les portées que Spotify dit avoir ACCORDÉES (champ `scope`
+    /// de la réponse du jeton, à l'échange comme au rafraîchissement).
+    /// `None` : inconnues (liaison restaurée d'une version qui ne les gardait
+    /// pas, pas encore rafraîchie).
+    portees: Option<String>,
 }
 
 impl Default for SpotifyService {
@@ -348,6 +353,7 @@ impl SpotifyService {
             token_expires: None,
             enabled_override: None,
             token_rejected: AtomicBool::new(false),
+            portees: None,
         }
     }
 
@@ -445,6 +451,14 @@ impl SpotifyService {
     pub fn jeton_d_acces(&self) -> Option<String> {
         self.access_token.clone()
     }
+    /// #6933 — la liaison porte-t-elle la portée `streaming`, sans laquelle
+    /// Spotify refuse la connexion de librespot (`INVALID_CREDENTIALS`) ?
+    /// `None` : on ne le sait pas.
+    pub fn porte_la_lecture(&self) -> Option<bool> {
+        self.portees
+            .as_deref()
+            .map(|p| p.split_whitespace().any(|x| x == "streaming"))
+    }
 
     /// #6018 — l'identifiant API Web de l'appareil Connect nommé `nom`.
     pub async fn appareil_par_nom(&self, nom: &str) -> Result<Option<String>, String> {
@@ -482,13 +496,7 @@ impl SpotifyService {
                 break;
             }
         }
-        let appareil = appareil.ok_or_else(|| {
-            format!(
-                "L'appareil Spotify Connect « {nom} » n'apparaît pas : librespot n'a pas pu se \
-                 connecter au compte. Spotify Premium est exigé ; reconnecter Spotify dans les \
-                 Réglages si le compte a été relié avant la version qui lit Spotify."
-            )
-        })?;
+        let appareil = appareil.ok_or_else(|| motif_appareil_absent(nom))?;
         let resp = self
             .client
             .put(format!(
@@ -517,10 +525,7 @@ impl SpotifyService {
             _ => {
                 let detail = resp.text().await.unwrap_or_default();
                 if statut == 403 {
-                    Err(format!(
-                        "Spotify refuse la lecture : un compte Spotify Premium est exigé, et la \
-                         connexion doit porter les droits de lecture (se reconnecter). {detail}"
-                    ))
+                    Err(motif_refus_403(&detail))
                 } else {
                     Err(format!(
                         "Spotify a refusé la lecture (HTTP {statut}) : {detail}"
@@ -817,6 +822,7 @@ impl StreamingService for SpotifyService {
 
             self.access_token = data["access_token"].as_str().map(Into::into);
             self.refresh_token = data["refresh_token"].as_str().map(Into::into);
+            self.portees = data["scope"].as_str().map(Into::into);
             let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
             self.token_expires =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(expires_in));
@@ -859,6 +865,7 @@ impl StreamingService for SpotifyService {
         self.username = None;
         self.user_id = None;
         self.token_expires = None;
+        self.portees = None;
         self.token_rejected.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -1186,6 +1193,9 @@ impl StreamingService for SpotifyService {
             if let Some(rt) = data["refresh_token"].as_str() {
                 self.refresh_token = Some(rt.into());
             }
+            if let Some(portees) = data["scope"].as_str() {
+                self.portees = Some(portees.into());
+            }
             let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
             self.token_expires =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(expires_in));
@@ -1204,6 +1214,7 @@ impl StreamingService for SpotifyService {
                 "refresh_token": self.refresh_token,
                 "username": self.username,
                 "user_id": self.user_id,
+                "scope": self.portees,
             })
         })
     }
@@ -1214,6 +1225,7 @@ impl StreamingService for SpotifyService {
             self.refresh_token = tokens["refresh_token"].as_str().map(Into::into);
             self.username = tokens["username"].as_str().map(Into::into);
             self.user_id = tokens["user_id"].as_str().map(Into::into);
+            self.portees = tokens["scope"].as_str().map(Into::into);
             // L'échéance reste `None` : la ligne persistée ne dit ni quand le
             // jeton a été émis ni combien de temps il vit (`save_tokens`
             // n'écrit que les jetons et l'identité). Inventer `now + 3600`
@@ -1265,6 +1277,45 @@ fn spotify_needs_refresh(
             .map(|d| d.as_secs() < 300)
             .unwrap_or(true),
         None => has_access && has_refresh,
+    }
+}
+
+/// #6933 — l'appareil librespot n'apparaît pas dans `/me/player/devices`.
+/// La raison est celle que librespot a écrite (voir
+/// `spotify_lecture::motif_echec_librespot`) ; ce motif-ci ne présume pas
+/// d'un problème de liaison.
+pub fn motif_appareil_absent(nom: &str) -> String {
+    format!(
+        "L'appareil Spotify Connect « {nom} » n'apparaît pas : librespot ne s'est pas connecté \
+         au compte (Spotify Premium est exigé)."
+    )
+}
+
+/// #6933 — un 403 de `/me/player/play` n'est PAS un problème de connexion
+/// dans le cas général : compte sans Premium, titre indisponible dans le pays,
+/// restriction de l'appareil. Seule une portée manquante se règle en
+/// reconnectant le compte.
+fn motif_refus_403(detail: &str) -> String {
+    let corps: serde_json::Value = serde_json::from_str(detail).unwrap_or_default();
+    let raison = corps["error"]["reason"].as_str().unwrap_or("");
+    let message = corps["error"]["message"].as_str().unwrap_or(detail);
+    let bas = message.to_lowercase();
+    if raison == "PREMIUM_REQUIRED" || bas.contains("premium") {
+        format!("Spotify refuse la lecture : un compte Spotify Premium est exigé. ({message})")
+    } else if bas.contains("scope") {
+        format!(
+            "Spotify refuse la lecture : la liaison du compte ne porte pas les droits de \
+             lecture ; reconnecter Spotify une fois dans les Réglages. ({message})"
+        )
+    } else {
+        format!(
+            "Spotify refuse la lecture de ce titre (HTTP 403{}) : {message}",
+            if raison.is_empty() {
+                String::new()
+            } else {
+                format!(", {raison}")
+            }
+        )
     }
 }
 
@@ -2238,5 +2289,81 @@ mod tests {
                 "portée OAuth manquante : {portee}"
             );
         }
+    }
+
+    /// #6933 — le rafraîchissement garde les portées ACCORDÉES par Spotify
+    /// (champ `scope`), et la sauvegarde les transmet : c'est ce qui permet
+    /// de dire si « reconnecter » réglera un refus de librespot.
+    #[tokio::test]
+    async fn spotify_6933_les_portees_accordees_sont_gardees() {
+        let app = axum::Router::new().route(
+            "/api/token",
+            axum::routing::post(|| async {
+                axum::Json(json!({
+                    "access_token": "neuf",
+                    "expires_in": 3600,
+                    "scope": "user-read-private streaming user-modify-playback-state"
+                }))
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", ecoute.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
+        let mut svc =
+            SpotifyService::with_config(Some("client-essai"), None, 8888).avec_doublure(&base);
+        assert!(svc.restore_tokens(&json!({"access_token": "vieux", "refresh_token": "r"})));
+        assert_eq!(
+            svc.porte_la_lecture(),
+            None,
+            "portées inconnues avant rafraîchissement"
+        );
+        assert!(svc.refresh_if_needed().await.unwrap());
+        assert_eq!(
+            svc.porte_la_lecture(),
+            Some(true),
+            "portées accordées au rafraîchissement non gardées"
+        );
+
+        let sauvegarde = svc.save_tokens().unwrap();
+        let mut relu = SpotifyService::new();
+        assert!(relu.restore_tokens(&sauvegarde));
+        assert_eq!(
+            relu.porte_la_lecture(),
+            Some(true),
+            "portées perdues à la sauvegarde"
+        );
+
+        let mut ancien = SpotifyService::new();
+        assert!(ancien.restore_tokens(&json!({
+            "access_token": "a", "refresh_token": "r", "scope": "user-read-private user-library-read"
+        })));
+        assert_eq!(ancien.porte_la_lecture(), Some(false));
+    }
+
+    /// #6933 — un 403 de région ou de contenu n'invite pas à se reconnecter ;
+    /// seule une portée manquante le fait.
+    #[test]
+    fn spotify_6933_un_403_ne_demande_de_se_reconnecter_que_pour_une_portee() {
+        let region = motif_refus_403(
+            &json!({"error": {"status": 403, "message": "Player command failed: Restriction violated", "reason": "UNKNOWN"}}).to_string(),
+        );
+        assert!(!region.to_lowercase().contains("reconnect"), "{region}");
+        assert!(region.contains("Restriction violated"), "{region}");
+        let premium = motif_refus_403(
+            &json!({"error": {"status": 403, "message": "Player command failed: Premium required", "reason": "PREMIUM_REQUIRED"}}).to_string(),
+        );
+        assert!(
+            premium.contains("Premium") && !premium.to_lowercase().contains("reconnect"),
+            "{premium}"
+        );
+        let portee = motif_refus_403(
+            &json!({"error": {"status": 403, "message": "Insufficient client scope"}}).to_string(),
+        );
+        assert!(portee.contains("reconnecter"), "{portee}");
+        assert!(
+            !motif_appareil_absent("Tune")
+                .to_lowercase()
+                .contains("reconnect")
+        );
     }
 }

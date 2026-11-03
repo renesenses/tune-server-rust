@@ -18,7 +18,7 @@ use super::traits::{
     OutputSignalPathStatus, OutputStatus, OutputTarget, ProfondeurPcm, PuitsDEchantillons,
     RingStarvation, TransformationsReelles, TransportState,
 };
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
 use crate::poller::TRACK_END_NOTIFY;
 
@@ -432,11 +432,15 @@ mod bras_asio;
 mod bras_coreaudio;
 #[cfg(target_os = "windows")]
 mod bras_wasapi;
+// #6734 — le chemin natif S32 de Linux (ALSA `hw:`), sur l'étage, le puits et
+// la chaîne des bras Windows exclusifs.
+#[cfg(target_os = "linux")]
+mod bras_alsa_natif;
 
 // REF-8 (#2219) : l'étage natif des bras Windows exclusifs — octets source
 // → mots `i32` alignés à gauche → `PuitsNatif` — et le puits de tout
 // `NativePcmRing`. Même `cfg` que les aides qu'il appelle : jugé sur Shrek.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 mod etage_natif;
 
 // #5204 — l'enchaînement sans blanc en mode exclusif : quel bras enchaîne, la
@@ -446,7 +450,7 @@ mod enchainement_exclusif;
 // #5204 — la boucle d'un bras natif exclusif et son enchaînement, générique
 // sur la source : jugée sur Shrek avec des pistes en mémoire. #5451 : sa
 // réserve et sa frontière servent aussi le bras CoreAudio (macOS).
-#[cfg(any(target_os = "windows", target_os = "macos", test))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
 mod chaine_native;
 // #5204 — la route native du bras ASIO et son enchaînement par la boucle
 // commune, sortis de `bras_asio.rs` (que seule l'étape « ASIO » de la CI
@@ -487,6 +491,8 @@ pub(crate) type CreneauDisposition =
 pub(crate) static SANS_DISPOSITION: CreneauDisposition = std::sync::Mutex::new(None);
 use periode::{avec_periode, config_de_flux, garde_de_prechargement};
 pub(crate) use reaffectation::CreneauReaffectation;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(crate) use reaffectation::voies_pilotees_permises;
 
 // ---------------------------------------------------------------------------
 // Gapless: pending next track for seamless chaining
@@ -688,6 +694,26 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// #6522, #6524 — un traitement est-il ARMÉ dans les réglages enregistrés
+    /// de la zone qui joue (égaliseur, correction de pièce, crossfeed, greffon
+    /// natif, repli mono) ? Posé par l'orchestrateur à côté de `pure_bypass`.
+    ///
+    /// Le verdict PURE ne peut pas se lire dans la chaîne vivante : PURE la
+    /// VIDE (les chargeurs de l'orchestrateur rendent `None` en PURE), donc
+    /// sous PURE la chaîne dit toujours « rien d'armé ». Seuls les réglages
+    /// disent ce que PURE contourne. Lu par `signal_path_status`.
+    pure_contourne_un_reglage: Arc<AtomicBool>,
+    /// #6211 — la lecture en cours est-elle un flux SANS FIN (radio) ? Posé
+    /// par l'orchestrateur à chaque lecture, d'après `live_stream`. Armé, le
+    /// préampli gardé d'un égaliseur coupé s'éteint en fondu au lieu de
+    /// valoir jusqu'à une piste suivante qui ne viendra pas.
+    flux_sans_fin: AtomicBool,
+    /// #6741 — le volume de l'auditeur (millièmes, celui d'avant la sourdine)
+    /// au moment où l'égaliseur a été activé ; `u32::MAX` : aucun. Couper
+    /// l'égaliseur fait remonter le préampli gardé vers le niveau d'avant,
+    /// jamais au-delà : si le volume a été monté entre-temps, la remontée
+    /// s'arrête au rapport `avant / courant` (`EqProcessor::borner_la_remontee`).
+    volume_avant_egaliseur: AtomicU32,
     /// #3973 — « bit-perfect strict » de la zone qui joue sur cette sortie.
     /// Armé, une conversion de fréquence (ouverture cpal ou changement de
     /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
@@ -1242,6 +1268,9 @@ impl LocalOutput {
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
+            flux_sans_fin: AtomicBool::new(false),
+            volume_avant_egaliseur: AtomicU32::new(u32::MAX),
+            pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
             seconde_sortie: std::sync::Mutex::new(Vec::new()),
             mono_downmix: Arc::new(AtomicBool::new(false)),
@@ -1282,17 +1311,95 @@ impl LocalOutput {
         self.faire_porter_la_compensation(&mut eq);
         {
             let mut emplacement = self.eq.lock().unwrap();
+            self.noter_le_volume_avant_l_egaliseur(&emplacement, &eq);
             // #5215 (décision du 10/10) — l'égaliseur reste coupé : le
-            // préampli gardé à la coupure vaut aussi pour cette piste, sans
-            // retour à 0 dB. Jamais sous PURE, qui ne doit rien laisser monté.
+            // préampli gardé à la coupure passe sur cette piste sans saut, et sa
+            // rampe s'y poursuit vers le niveau d'avant l'égaliseur (#6524 b,
+            // #6741). Jamais sous PURE, qui ne doit rien laisser monté.
             if eq.is_none() && !self.pure_bypass.load(Ordering::Relaxed) {
                 eq = emplacement
                     .as_ref()
                     .and_then(|p| p.reporter_le_preampli_garde());
             }
+            self.eteindre_si_flux_sans_fin(&mut eq);
+            self.borner_la_remontee(&mut eq);
             *emplacement = eq;
         }
         self.recalculer_la_compensation();
+    }
+
+    /// #6741 — le volume que l'auditeur a demandé (celui d'avant la sourdine
+    /// si elle est mise), en millièmes.
+    fn volume_de_l_auditeur(&self) -> u32 {
+        if self.muted.load(Ordering::SeqCst) {
+            self.pre_mute_volume.load(Ordering::SeqCst)
+        } else {
+            self.user_volume.load(Ordering::SeqCst)
+        }
+    }
+
+    /// #6741 — retenir le volume au moment où un égaliseur ACTIF arrive sur
+    /// une chaîne qui n'en portait pas : c'est le « niveau d'avant
+    /// l'égaliseur ». Une chaîne qui garde encore le préampli d'une coupure
+    /// garde aussi sa référence : on n'était pas revenu au niveau d'avant.
+    fn noter_le_volume_avant_l_egaliseur(
+        &self,
+        emplacement: &Option<super::super::audio::eq::EqProcessor>,
+        neuf: &Option<super::super::audio::eq::EqProcessor>,
+    ) {
+        let arrive = neuf.as_ref().is_some_and(|p| !p.est_neutre());
+        let deja = emplacement
+            .as_ref()
+            .is_some_and(|p| !p.est_neutre() || p.preampli_garde().is_some());
+        if arrive && !deja {
+            self.volume_avant_egaliseur
+                .store(self.volume_de_l_auditeur(), Ordering::SeqCst);
+        }
+    }
+
+    /// #6741 — le rapport `volume d'avant l'égaliseur / volume courant`, borné
+    /// à 1 : la remontée d'un préampli gardé ne dépasse jamais le niveau
+    /// d'avant l'égaliseur. Ce rapport est exact ICI : le volume de la sortie
+    /// locale est un gain numérique linéaire (`effective_volume_units`). 0
+    /// (gain gardé) sans référence ; 1 à volume nul (rien ne sort).
+    fn borne_de_remontee(&self) -> f64 {
+        let avant = self.volume_avant_egaliseur.load(Ordering::SeqCst);
+        let courant = self.volume_de_l_auditeur();
+        if avant == u32::MAX {
+            0.0
+        } else if courant == 0 {
+            1.0
+        } else {
+            (f64::from(avant) / f64::from(courant)).min(1.0)
+        }
+    }
+
+    fn borner_la_remontee(&self, eq: &mut Option<super::super::audio::eq::EqProcessor>) {
+        if let Some(eq) = eq.as_mut() {
+            eq.borner_la_remontee(self.borne_de_remontee());
+        }
+    }
+
+    /// #6741 — un geste de volume recalcule la borne du préampli gardé : un
+    /// volume baissé sous celui d'avant l'égaliseur le laisse revenir à 0 dB,
+    /// un volume monté arrête sa remontée au niveau d'avant. Sans saut : la
+    /// rampe repart du gain atteint.
+    fn reborner_le_preampli_garde(&self) {
+        if let Ok(mut eq) = self.eq.lock() {
+            self.borner_la_remontee(&mut eq);
+        }
+    }
+
+    /// #6741 — ce qu'un égaliseur coupé applique encore (voyant de la sortie).
+    pub fn preampli_garde(&self) -> Option<super::super::audio::eq::PreampliGarde> {
+        if self.pure_bypass.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.eq
+            .lock()
+            .ok()?
+            .as_ref()
+            .and_then(|p| p.preampli_garde())
     }
 
     /// #5227 — confier à l'égaliseur qu'on installe la compensation de SON
@@ -1383,6 +1490,7 @@ impl LocalOutput {
         self.faire_porter_la_compensation(&mut eq);
         {
             let mut emplacement = self.eq.lock().unwrap();
+            self.noter_le_volume_avant_l_egaliseur(&emplacement, &eq);
             let precedent = emplacement.take();
             *emplacement = if self.pure_bypass.load(Ordering::Relaxed) {
                 // PURE : la chaîne est contournée, rien à fondre — et rien ne
@@ -1392,11 +1500,33 @@ impl LocalOutput {
                 // #5215 — héritage des filtres ET, si le niveau bouge
                 // (coupure, activation, préampli déplacé), fondu enchaîné de
                 // `RAMPE_DE_BASCULE_MS` au lieu d'une marche instantanée.
-                super::super::audio::eq::EqProcessor::prendre_la_releve(eq, precedent)
+                let mut releve =
+                    super::super::audio::eq::EqProcessor::prendre_la_releve(eq, precedent);
+                self.eteindre_si_flux_sans_fin(&mut releve);
+                self.borner_la_remontee(&mut releve);
+                releve
             };
         }
         // Verrou relâché : la compensation relit l'égaliseur ET le crossfeed.
         self.recalculer_la_compensation();
+    }
+
+    /// #6211 — dire à la sortie si la lecture qui commence est un flux sans
+    /// fin (radio). Posé AVANT `set_eq` par l'orchestrateur.
+    pub fn set_flux_sans_fin(&self, sans_fin: bool) {
+        self.flux_sans_fin.store(sans_fin, Ordering::Relaxed);
+    }
+
+    /// #6211 — sur un flux sans fin, l'extinction du préampli gardé part dès
+    /// la coupure ; sur une piste, après le fondu de la courbe. Partout,
+    /// la rampe va vers le niveau d'avant l'égaliseur, jamais au-delà (#6741 ;
+    /// décision du 21/10, dans `EqProcessor`).
+    fn eteindre_si_flux_sans_fin(&self, eq: &mut Option<super::super::audio::eq::EqProcessor>) {
+        if self.flux_sans_fin.load(Ordering::Relaxed)
+            && let Some(eq) = eq.as_mut()
+        {
+            eq.eteindre_le_preampli_garde();
+        }
     }
 
     pub fn has_eq(&self) -> bool {
@@ -1534,6 +1664,35 @@ impl LocalOutput {
         self.recalculer_la_compensation();
     }
 
+    /// #6522, #6524 — dire à la sortie si les réglages ENREGISTRÉS de la zone
+    /// qui joue arment un traitement que PURE contourne. Posé par
+    /// l'orchestrateur à chaque lecture, à chaque bascule PURE et à chaque
+    /// réglage poussé à chaud, d'après `Orchestrator::pure_contourne_un_reglage`.
+    pub fn set_pure_contourne_un_reglage(&self, arme: bool) {
+        self.pure_contourne_un_reglage
+            .store(arme, Ordering::Relaxed);
+    }
+
+    /// Publie le contrat de signal comme le fait le callback Windows (même
+    /// fonction, mêmes emplacements de la sortie), pour les tests : sans carte
+    /// son, c'est la seule façon de lire le verdict que lit le poller après
+    /// une vraie bascule de l'orchestrateur.
+    #[cfg(test)]
+    pub(crate) fn publier_le_contrat_pour_test(&self) {
+        publish_windows_signal_path_status(
+            &self.signal_path_status,
+            true,
+            true,
+            false,
+            1000,
+            &self.eq,
+            &self.convolver,
+            &self.crossfeed,
+            &self.pure_bypass,
+            &self.mono_downmix,
+        );
+    }
+
     /// #3973 — armer (ou désarmer) « bit-perfect strict » pour la zone qui
     /// joue sur cette sortie. Posé par l'orchestrateur à chaque lecture, à
     /// côté de `set_pure_bypass`.
@@ -1639,6 +1798,31 @@ impl LocalOutput {
     /// #6044 — le dernier bloc converti est-il passé par la matrice ?
     pub fn reaffectation_appliquee(&self) -> bool {
         self.reaffectation.appliquee()
+    }
+
+    /// #6230 — la matrice posée demande-t-elle un autre nombre de voies que
+    /// celui de l'ouverture en cours ? Vrai seulement sur le chemin partagé,
+    /// le seul qui pilote ses voies, et jamais sans règle armée : une règle
+    /// qui passe de 6 → 6 à 6 → 2 en pleine lecture, une piste enchaînée à
+    /// laquelle la règle de la zone s'applique, ou une règle retirée (ou une
+    /// entrée en PURE) après une ouverture pilotée. L'orchestrateur rouvre
+    /// alors la sortie à la position courante.
+    pub fn les_voies_imposent_de_rouvrir(&self) -> bool {
+        let Some(pilotage) = self.reaffectation.pilotage() else {
+            return false;
+        };
+        let Some(reel) = self.transformations_reelles.lock().ok().and_then(|t| *t) else {
+            return false;
+        };
+        let (source, ouvertes) = (reel.entree().canaux(), reel.ouvert().canaux);
+        let voulues = if self.pure_bypass.load(Ordering::Relaxed)
+            || self.dop_active.load(Ordering::Relaxed)
+        {
+            None
+        } else {
+            self.reaffectation.voies_de_la_matrice(source)
+        };
+        reaffectation::rouvrir_pour_les_voies(voulues, pilotage, ouvertes, source)
     }
 
     /// #6057 — poser la disposition DÉCLARÉE par le fichier de la piste
@@ -1786,6 +1970,15 @@ impl LocalOutput {
         self.crossfeed.lock().unwrap().is_some()
     }
 
+    /// #6256 — l'étage casque installé porte-t-il le greffon natif tiers `id` ?
+    pub fn crossfeed_porte_l_etage_tiers(&self, id: &str) -> bool {
+        self.crossfeed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|cf| cf.porte_l_etage_tiers(id))
+    }
+
     pub fn has_convolver(&self) -> bool {
         self.convolver_config.lock().unwrap().is_some()
     }
@@ -1882,7 +2075,7 @@ pub struct RingBuf {
 /// 24-bit words bits 31..8, and 32-bit words use the whole value. This is the
 /// representation expected by an ASIO I32 callback and lets WASAPI recover
 /// the original little-endian word by copying the high 2/3/4 bytes.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 pub(crate) struct NativePcmRing {
     buf: Box<[UnsafeCell<i32>]>,
     write: AtomicU64,
@@ -1894,12 +2087,12 @@ pub(crate) struct NativePcmRing {
 
 // SAFETY: same strict SPSC contract and Acquire/Release cursor discipline as
 // `RingBuf`; the only difference is the `i32` cell payload.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 unsafe impl Send for NativePcmRing {}
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 unsafe impl Sync for NativePcmRing {}
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 impl NativePcmRing {
     pub(crate) fn new(capacity: usize) -> Self {
@@ -2190,10 +2383,10 @@ impl RingBuf {
         let r = self.read.load(Ordering::Acquire);
         let free = cap - (w.wrapping_sub(r)) as usize;
         let n = samples.len().min(free);
-        for i in 0..n {
+        for (i, &sample) in samples[..n].iter().enumerate() {
             let idx = (w as usize + i) % cap;
             // SAFETY: producteur unique, case libre (i < free), index borné.
-            unsafe { *self.buf[idx].get() = samples[i] };
+            unsafe { *self.buf[idx].get() = sample };
         }
         self.write.store(w + n as u64, Ordering::Release);
         // Fil 1908 — ce qui attend le pilote, pour la position audible.
@@ -2216,11 +2409,11 @@ impl RingBuf {
         let avail = (w.wrapping_sub(r)) as usize;
         let n = out.len().min(avail);
         let cap = self.capacity();
-        for i in 0..n {
+        for (i, slot) in out[..n].iter_mut().enumerate() {
             let idx = (r as usize + i) % cap;
             // SAFETY: consommateur unique, case publiée par le Release de
             // `push` que le Acquire ci-dessus a observé.
-            out[i] = map(unsafe { *self.buf[idx].get() });
+            *slot = map(unsafe { *self.buf[idx].get() });
         }
         self.read.store(r + n as u64, Ordering::Release);
         // #3205 : `n < out.len()` ICI, c'est exactement le `read < data.len()`
@@ -2517,17 +2710,14 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
                 WAVE_FORMAT_IEEE_FLOAT => {
                     // Signal to pcm_bytes_to_f32 that the data is already
                     // IEEE float.  We use 0 as a sentinel value.
-                    if channels > 0 {
-                        let container_bytes = block_align / channels;
-                        // 32-bit float -> sentinel 0; 64-bit float -> unsupported
-                        if container_bytes == 4 {
-                            bit_depth = 0; // sentinel: IEEE float 32-bit
-                        } else {
-                            // 64-bit float — cannot handle, fall through to
-                            // compressed decode path
-                            return None;
-                        }
+                    // Zéro canal : pas de conteneur lisible.
+                    let container_bytes = block_align.checked_div(channels)?;
+                    // 32-bit float -> sentinel 0; 64-bit float -> unsupported
+                    if container_bytes == 4 {
+                        bit_depth = 0; // sentinel: IEEE float 32-bit
                     } else {
+                        // 64-bit float — cannot handle, fall through to
+                        // compressed decode path
                         return None;
                     }
                 }
@@ -2987,6 +3177,10 @@ fn periode_muette<T: Copy>(ring: &RingBuf, output: &mut [T], zero: T) {
 /// `cpal::Device::build_output_stream`. Les réunir ici est ce qui rend le
 /// témoin de #3814 possible, et évite qu'un correctif ne soit posé que dans
 /// une des deux.
+// Le rappel temps réel du pilote : chaque argument est un état partagé
+// distinct que les fermetures `cpal` capturent une à une (six appelants). Les
+// regrouper imposerait de remanier ces fermetures sur le chemin temps réel.
+#[allow(clippy::too_many_arguments)]
 fn render_local_shared_f32_callback(
     ring: &RingBuf,
     volume: &AtomicU32,
@@ -3100,6 +3294,9 @@ where
 /// as orchestrator.rs already does). Only used as a fallback after both
 /// f32 attempts fail, so the f32 happy path is untouched (Pascal, XMOS
 /// USB Audio 2.0 → Totaldac).
+// Même raison que `render_local_shared_f32_callback` : les états partagés
+// passent tels quels dans la fermeture du flux entier, par format (9 appels).
+#[allow(clippy::too_many_arguments)]
 fn build_int_stream<T>(
     device: &cpal::Device,
     cfg: &cpal::StreamConfig,
@@ -3224,11 +3421,28 @@ impl FormatDeSortie {
 ///
 /// La cadence source n'est ajoutée que si elle diffère : inutile de tenter
 /// deux fois exactement la même ouverture.
+#[cfg(test)]
 pub(crate) fn cascade_de_formats(
     principal: &cpal::StreamConfig,
     source: &cpal::StreamConfig,
 ) -> Vec<(cpal::StreamConfig, FormatDeSortie)> {
-    let mut cadences = vec![principal.clone()];
+    cascade_de_formats_avec_la_matrice(None, principal, source)
+}
+
+/// #6230 — [`cascade_de_formats`], précédée des voies que demande une matrice
+/// de réaffectation armée (`matrice`, à la cadence retenue). Sans matrice, la
+/// cascade est exactement celle d'avant.
+pub(crate) fn cascade_de_formats_avec_la_matrice(
+    matrice: Option<&cpal::StreamConfig>,
+    principal: &cpal::StreamConfig,
+    source: &cpal::StreamConfig,
+) -> Vec<(cpal::StreamConfig, FormatDeSortie)> {
+    let mut cadences: Vec<cpal::StreamConfig> = matrice
+        .filter(|m| m.sample_rate != principal.sample_rate || m.channels != principal.channels)
+        .into_iter()
+        .cloned()
+        .collect();
+    cadences.push(principal.clone());
     if source.sample_rate != principal.sample_rate || source.channels != principal.channels {
         cadences.push(source.clone());
     }
@@ -3532,6 +3746,9 @@ fn flush_local_dsp(
     queue
 }
 
+// Un argument par étage de traitement (EQ, convolution, crossfeed…), chacun
+// sous son propre verrou ; 41 appels, dont les témoins de chaque étage.
+#[allow(clippy::too_many_arguments)]
 fn apply_local_dsp(
     samples: &mut [f32],
     eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
@@ -3545,29 +3762,28 @@ fn apply_local_dsp(
     if dop || pure_bypass.load(Ordering::Relaxed) {
         return;
     }
-    if let Ok(mut e) = eq.lock() {
-        if let Some(ref mut p) = *e {
-            p.process_interleaved(samples);
-            // #5215 — l'égaliseur coupé a fini son fondu et ne garde aucun
-            // préampli : on le retire, la chaîne redevient celle d'un EQ absent.
-            if p.est_neutre_au_repos() {
-                *e = None;
-            }
+    if let Ok(mut e) = eq.lock()
+        && let Some(ref mut p) = *e
+    {
+        p.process_interleaved(samples);
+        // #5215 — l'égaliseur coupé a fini son fondu et ne garde aucun
+        // préampli : on le retire, la chaîne redevient celle d'un EQ absent.
+        if p.est_neutre_au_repos() {
+            *e = None;
         }
     }
-    if let Ok(mut conv) = convolver.lock() {
-        if let Some(ref mut c) = *conv {
-            c.process_interleaved(samples);
-        }
+    if let Ok(mut conv) = convolver.lock()
+        && let Some(ref mut c) = *conv
+    {
+        c.process_interleaved(samples);
     }
     // Crossfeed is a headphone (local DAC) effect and only makes sense on a
     // stereo stream — the difference-based algorithm needs L/R pairs.
-    if channels == 2 {
-        if let Ok(mut cf) = crossfeed.lock() {
-            if let Some(ref mut c) = *cf {
-                c.process_interleaved(samples);
-            }
-        }
+    if channels == 2
+        && let Ok(mut cf) = crossfeed.lock()
+        && let Some(ref mut c) = *cf
+    {
+        c.process_interleaved(samples);
     }
     // Repli mono EN DERNIER (#2362) : les trois traitements ci-dessus ont tous
     // besoin de leur contexte stéréo — le crossfeed travaille sur la
@@ -3591,19 +3807,25 @@ fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
         0 => {
             // IEEE Float 32-bit — reinterpret bytes as f32 directly
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
         16 => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| {
                 let sample = i16::from_le_bytes([c[0], c[1]]);
                 sample as f32 / 32768.0
             })
             .collect(),
         24 => bytes
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| {
                 let sample =
                     ((c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16)) << 8 >> 8; // sign-extend
@@ -3611,7 +3833,9 @@ fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
             })
             .collect(),
         32 => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let sample = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                 sample as f32 / 2147483648.0
@@ -3620,7 +3844,9 @@ fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
         _ => {
             // Fall back to 16-bit
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| {
                     let sample = i16::from_le_bytes([c[0], c[1]]);
                     sample as f32 / 32768.0
@@ -3633,22 +3859,28 @@ fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
 /// Decode little-endian signed PCM into the left-aligned integer words used by
 /// [`NativePcmRing`]. No arithmetic is performed: every source bit keeps the
 /// same relative position and the unused low bits are zero.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 pub(crate) fn pcm_bytes_to_native_i32(bytes: &[u8], bit_depth: u16) -> Vec<i32> {
     match bit_depth {
         16 => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])) << 16)
             .collect(),
         24 => bytes
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| {
                 let word = ((c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16)) << 8 >> 8;
                 word << 8
             })
             .collect(),
         32 => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         _ => Vec::new(),
@@ -3678,7 +3910,7 @@ pub(crate) fn native_i32_to_pcm_bytes(samples: &[i32], bit_depth: u16, out: &mut
     count * bytes_per_sample
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn f32_to_native_i32(samples: &[f32], bit_depth: u16) -> Vec<i32> {
     let (scale, max, shift) = match bit_depth {
         16 => (32_768.0, i16::MAX as f64, 16),
@@ -3696,7 +3928,7 @@ fn f32_to_native_i32(samples: &[f32], bit_depth: u16) -> Vec<i32> {
         .collect()
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn local_dsp_is_identity(
     eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
@@ -3719,7 +3951,7 @@ fn local_dsp_is_identity(
         && crossfeed.lock().is_ok_and(|guard| guard.is_none())
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn local_dsp_runtime_state(
     eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
@@ -3757,10 +3989,38 @@ fn local_dsp_runtime_state(
     else {
         return OutputDspState::Unknown;
     };
-    if eq.is_some() || convolver.is_some() || crossfeed.is_some() {
+    // #6524 (b) — un égaliseur coupé qui ne garde plus rien et n'a plus de
+    // fondu est l'identité exacte : il ne touche pas le signal, il ne doit pas
+    // faire dire « DSP appliqué » le temps que la boucle le retire. Un neutre
+    // qui porte encore un gain (fondu, préampli en extinction), lui, l'applique.
+    let eq_agit = eq.as_ref().is_some_and(|p| !p.est_neutre_au_repos());
+    if eq_agit || convolver.is_some() || crossfeed.is_some() {
         OutputDspState::Applied
     } else {
         OutputDspState::Inactive
+    }
+}
+
+/// #6522, #6524 — corrige le « rien à contourner » de
+/// `local_dsp_runtime_state` par les réglages enregistrés de la zone.
+///
+/// Sous PURE, la chaîne vivante est vide PAR CONSTRUCTION : l'orchestrateur y
+/// installe les `None` que ses chargeurs rendent en PURE. Son « rien d'armé »
+/// ne prouve donc rien. Quand les réglages arment un traitement
+/// (`reglage_arme`), PURE le contourne : le verdict est `BypassedPure`. Les
+/// autres verdicts ne sont pas touchés.
+///
+/// Chemin complet du type : l'import court n'existe que sous Windows et en
+/// test, et `signal_path_status` est compilé partout.
+fn verdict_pure_selon_les_reglages(
+    dsp: super::traits::OutputDspState,
+    reglage_arme: bool,
+) -> super::traits::OutputDspState {
+    use super::traits::OutputDspState;
+    if reglage_arme && dsp == OutputDspState::PureSansObjet {
+        OutputDspState::BypassedPure
+    } else {
+        dsp
     }
 }
 
@@ -3771,7 +4031,7 @@ fn local_dsp_runtime_state(
 /// décident si le producteur peut conserver les octets source ou doit faire un
 /// aller-retour en espace flottant. DoP force les deux contournements à
 /// l'unité : toucher son marqueur rendrait le flux illisible par le DAC.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 #[allow(clippy::too_many_arguments)]
 fn windows_signal_path_status(
     native_transport: bool,
@@ -3822,7 +4082,7 @@ fn windows_signal_path_status(
     }
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 #[allow(clippy::too_many_arguments)]
 fn publish_windows_signal_path_status(
     slot: &std::sync::Mutex<Option<OutputSignalPathStatus>>,
@@ -3860,7 +4120,7 @@ fn publish_windows_signal_path_status(
     status
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 struct PreparedNativePcm {
     samples: Vec<i32>,
     dop: bool,
@@ -3871,13 +4131,12 @@ struct PreparedNativePcm {
 /// ASIO natif) : la réaffectation de la zone ou de l'album (#6044), à défaut
 /// la disposition déclarée par le fichier (#6057). Le périphérique est ouvert
 /// aux canaux de la source, donc la matrice va de N à N.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 pub(super) type AdaptationNative<'a> = (&'a CreneauReaffectation, &'a CreneauDisposition);
 
 /// La disposition déclarée déplace-t-elle une voie, à nombre de canaux égal ?
 /// Mesuré par la fonction même qui l'appliquerait (#4969) : une disposition
 /// qui recopie chaque voie à sa place ne doit pas coûter le bit-perfect.
-#[cfg(any(target_os = "windows", test))]
 fn disposition_deplace_une_voie(
     disposition: &crate::audio::disposition_canaux::Disposition,
     canaux: u16,
@@ -3901,12 +4160,62 @@ fn disposition_deplace_une_voie(
 /// puis adaptation des canaux, puis volume — et n'est plus bit-perfect. Jamais
 /// sur un porteur DoP, ni en PURE pour la matrice, comme l'étage de
 /// conversion (`adaptation_retenue`).
-#[cfg(any(target_os = "windows", test))]
+// #6230 — la production passe par `prepare_windows_native_pcm` (l'étage
+// natif, voies ouvertes comprises) ; cette forme à voies égales reste celle
+// des témoins d'empreinte.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn prepare_windows_native_pcm_a_voies_egales(
+    bytes: &[u8],
+    bit_depth: u16,
+    channels: u16,
+    must_classify_24_bit: bool,
+    dop_latched: bool,
+    volume_units: u32,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
+    adaptation: Option<AdaptationNative<'_>>,
+) -> Option<PreparedNativePcm> {
+    prepare_windows_native_pcm(
+        bytes,
+        bit_depth,
+        channels,
+        channels,
+        must_classify_24_bit,
+        dop_latched,
+        volume_units,
+        eq,
+        convolver,
+        crossfeed,
+        pure_bypass,
+        mono_downmix,
+        adaptation,
+    )
+}
+
+/// #6230 — la préparation vers un transport ouvert sur
+/// `sortie` voies, qui peut différer des `channels` de la source quand la
+/// grille de réaffectation pilote l'ouverture (une grille 6 → 2 ouvre 2
+/// voies). À `sortie == channels`, le rendu est exactement celui d'avant.
+///
+/// Quand les voies diffèrent, aucun mot ne peut partir brut : le bloc prend
+/// la branche flottante et la matrice (ou, à défaut, l'adaptation par défaut
+/// ou la disposition déclarée) le porte de `channels` à `sortie` voies. Un
+/// porteur DoP ne se laisse pas adapter (#3233) : s'il en survient un, le
+/// bloc part en SILENCE sur les `sortie` voies plutôt qu'en bruit plein
+/// échelle. L'ouverture ne pilote jamais un flux dont l'amorce est un DoP
+/// (`CreneauReaffectation::voies_a_demander`) : ce cas ne se produit pas en
+/// lecture ordinaire.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 #[allow(clippy::too_many_arguments)]
 fn prepare_windows_native_pcm(
     bytes: &[u8],
     bit_depth: u16,
     channels: u16,
+    sortie: u16,
     must_classify_24_bit: bool,
     dop_latched: bool,
     volume_units: u32,
@@ -3923,29 +4232,37 @@ fn prepare_windows_native_pcm(
     }
 
     let dop = dop_latched || (bit_depth == 24 && is_dop_pcm(bytes, bit_depth, channels));
+    let pure = pure_bypass.load(Ordering::Relaxed);
     let (matrice, declaree) = match adaptation {
         Some((reaffectation, disposition)) => {
-            let (matrice, declaree) = adaptation_retenue_pour(
-                reaffectation,
-                disposition,
-                channels,
-                channels,
-                dop,
-                pure_bypass.load(Ordering::Relaxed),
-            );
+            let (matrice, declaree) =
+                adaptation_retenue_pour(reaffectation, disposition, channels, sortie, dop, pure);
             reaffectation.noter(matrice.is_some());
             (
                 matrice,
-                declaree.filter(|d| disposition_deplace_une_voie(d, channels)),
+                declaree
+                    .filter(|d| sortie != channels || disposition_deplace_une_voie(d, channels)),
             )
         }
         None => (None, None),
     };
-    let canaux_adaptes = matrice.is_some() || declaree.is_some();
+    let canaux_adaptes = matrice.is_some() || declaree.is_some() || sortie != channels;
     let bit_perfect = dop
         || (volume_units == 1000
             && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass, mono_downmix)
             && !canaux_adaptes);
+    if dop && sortie != channels {
+        let trames = bytes.len() / (usize::from(channels.max(1)) * usize::from(bit_depth / 8));
+        warn!(
+            channels,
+            sortie, "native_dop_carrier_refused_on_piloted_channels"
+        );
+        return Some(PreparedNativePcm {
+            samples: vec![0; trames * usize::from(sortie)],
+            dop: false,
+            bit_perfect: false,
+        });
+    }
     let samples = if bit_perfect {
         pcm_bytes_to_native_i32(bytes, bit_depth)
     } else {
@@ -3961,18 +4278,13 @@ fn prepare_windows_native_pcm(
             false,
         );
         if canaux_adaptes {
-            match crate::audio::carte_des_canaux::adapter_vers_la_sortie(
-                &float,
+            float = adapter_les_voies_natives(
+                float,
                 channels,
-                channels,
+                sortie,
                 matrice.as_deref(),
                 declaree.as_deref(),
-            ) {
-                Ok(adapte) => float = adapte,
-                Err(error) => {
-                    warn!(channels, error = %error, "native_channel_adaptation_rejected");
-                }
-            }
+            );
         }
         let volume = volume_units as f32 / 1000.0;
         if volume != 1.0 {
@@ -3988,6 +4300,36 @@ fn prepare_windows_native_pcm(
         dop,
         bit_perfect,
     })
+}
+
+/// #6230 — porter des échantillons flottants de `channels` à `sortie` voies
+/// sur un transport natif : la matrice, sinon la disposition déclarée, sinon
+/// l'adaptation par défaut. Un refus (aucune règle connue pour ces tailles)
+/// est dit au journal ; à nombre égal le bloc part alors tel quel, sinon il
+/// part en silence plutôt qu'avec un nombre de voies faux, qui décalerait
+/// toutes les trames de l'anneau.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+fn adapter_les_voies_natives(
+    float: Vec<f32>,
+    channels: u16,
+    sortie: u16,
+    matrice: Option<&crate::audio::reaffectation_canaux::Matrice>,
+    declaree: Option<&crate::audio::disposition_canaux::Disposition>,
+) -> Vec<f32> {
+    match crate::audio::carte_des_canaux::adapter_vers_la_sortie(
+        &float, channels, sortie, matrice, declaree,
+    ) {
+        Ok(adapte) => adapte,
+        Err(error) => {
+            warn!(channels, sortie, error = %error, "native_channel_adaptation_rejected");
+            if sortie == channels {
+                float
+            } else {
+                let trames = float.len() / usize::from(channels.max(1));
+                vec![0.0; trames * usize::from(sortie)]
+            }
+        }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -4383,7 +4725,17 @@ impl Etage for EtageDeConversion<'_> {
     }
 
     fn transformations(&self) -> TransformationsReelles {
+        // #6057 — la réorganisation à nombre égal que `convertir` applique.
+        let reordonne = reorganisation_a_nombre_egal(
+            self.pcm.reaffectation,
+            self.pcm.disposition,
+            self.spec.canaux(),
+            self.sortie.canaux,
+            self.pcm.dop_active.load(Ordering::Relaxed),
+            self.pcm.pure_bypass.load(Ordering::Relaxed),
+        );
         TransformationsReelles::nouvelles(self.spec, self.sortie, self.dsp_actif())
+            .avec_reorganisation_canaux(reordonne)
     }
 }
 
@@ -4535,6 +4887,29 @@ fn adaptation_retenue_pour(
             .filter(|d| d.canaux() == source)
     };
     (matrice, declaree)
+}
+
+/// #6057 — à nombre de canaux égal, l'étage réordonne-t-il des voies selon la
+/// disposition déclarée par le fichier ? La MÊME décision que l'adaptation
+/// (`adaptation_retenue_pour` : jamais sur un porteur DoP, la matrice de
+/// réaffectation d'abord), mesurée par la fonction qui l'applique
+/// (`disposition_deplace_une_voie`) : une disposition qui recopie chaque voie
+/// à sa place ne réordonne rien. À nombre de canaux différent, c'est une
+/// adaptation de canaux, que `TransformationsReelles` dit déjà.
+fn reorganisation_a_nombre_egal(
+    reaffectation: &CreneauReaffectation,
+    disposition: &CreneauDisposition,
+    source: u16,
+    sortie: u16,
+    dop: bool,
+    pure: bool,
+) -> bool {
+    if source != sortie {
+        return false;
+    }
+    let (matrice, declaree) =
+        adaptation_retenue_pour(reaffectation, disposition, source, sortie, dop, pure);
+    matrice.is_none() && declaree.is_some_and(|d| disposition_deplace_une_voie(&d, source))
 }
 
 /// REF-6b (#2219) — pose dans le créneau de `LocalOutput` ce que l'étage fait
@@ -4967,16 +5342,15 @@ pub(crate) fn ouverture_encore_voulue(force_silent: bool, stop_recu: bool) -> bo
 
 /// #4177 — la pause doit-elle RENDRE le périphérique ?
 ///
-/// Règle pure : sous Windows, en mode exclusif (WASAPI exclusif comme ASIO,
-/// les deux tiennent le point de sortie pour eux seuls), et seulement quand un
-/// flux joue. Le chemin partagé (mixeur Windows), macOS et Linux ne changent
-/// pas : leur pause reste un booléen, et une pause sans flux n'a rien à rendre.
+/// Sous Windows, tout flux actif rend son endpoint en pause : même une session
+/// WASAPI partagée peut empêcher un moteur ASIO de changer de cadence (#7244).
+/// macOS/Linux restent inchangés ; sans flux, il n'y a rien à rendre.
 pub(crate) fn la_pause_rend_le_peripherique(
     windows: bool,
-    exclusive_mode: bool,
+    _exclusive_mode: bool,
     playing: bool,
 ) -> bool {
-    windows && exclusive_mode && playing
+    windows && playing
 }
 
 #[async_trait::async_trait]
@@ -5232,9 +5606,11 @@ impl OutputTarget for LocalOutput {
         if let Ok(mut slot) = self.transformations_reelles.lock() {
             *slot = None;
         }
+        // #6230 — l'ouverture d'avant ne décrit plus rien.
+        self.reaffectation.noter_l_ouverture(None);
         let open_failure = self.open_failure.clone();
         let transformations_reelles = self.transformations_reelles.clone();
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         let signal_path_status = self.signal_path_status.clone();
         let track_ended_naturally = self.track_ended_naturally.clone();
         let track_ended_generation = self.track_ended_generation.clone();
@@ -5750,7 +6126,20 @@ impl OutputTarget for LocalOutput {
                 // jusque-là échouer la première et unique tentative, et la
                 // zone s'arrêtait sans cause affichée. Tout ce qui vient d'un
                 // serveur multimédia arrive par cette branche.
-                let tentatives = cascade_de_formats(&output_config, &source_config);
+                // #6230 — une matrice armée qui change le nombre de voies les
+                // demande d'abord ; un refus laisse la cascade d'avant.
+                let voies_de_la_matrice = reaffectation
+                    .voies_de_la_matrice(dec_ch)
+                    .filter(|_| !pure_bypass.load(Ordering::Relaxed));
+                let config_de_la_matrice = voies_de_la_matrice.map(|voies| cpal::StreamConfig {
+                    channels: voies,
+                    ..output_config.clone()
+                });
+                let tentatives = cascade_de_formats_avec_la_matrice(
+                    config_de_la_matrice.as_ref(),
+                    &output_config,
+                    &source_config,
+                );
                 let anneaux: std::cell::RefCell<Option<Arc<RingBuf>>> =
                     std::cell::RefCell::new(None);
                 let ouverture = ouvrir_premier_format_accepte(&tentatives, |cfg, format| {
@@ -5861,6 +6250,7 @@ impl OutputTarget for LocalOutput {
                 }
                 let output_sr = actual_config.sample_rate;
                 let output_ch = actual_config.channels;
+                reaffectation.constater_l_ouverture(voies_de_la_matrice, output_ch, &device_name);
 
                 info!(
                     device = %device_name,
@@ -5895,11 +6285,24 @@ impl OutputTarget for LocalOutput {
                         &mono_downmix,
                     );
                     if let Ok(mut slot) = transformations_reelles.lock() {
-                        *slot = Some(TransformationsReelles::nouvelles(
-                            entree,
-                            FormatOuvert::new(output_sr, output_ch),
-                            dsp_actif,
-                        ));
+                        // #6057 — `conformer_la_piste_decodee` applique la
+                        // disposition déclarée, même à nombre égal.
+                        let reordonne = reorganisation_a_nombre_egal(
+                            &reaffectation,
+                            &disposition,
+                            dec_ch,
+                            output_ch,
+                            false,
+                            pure_bypass.load(Ordering::Relaxed),
+                        );
+                        *slot = Some(
+                            TransformationsReelles::nouvelles(
+                                entree,
+                                FormatOuvert::new(output_sr, output_ch),
+                                dsp_actif,
+                            )
+                            .avec_reorganisation_canaux(reordonne),
+                        );
                     }
                     info!(
                         dec_sr,
@@ -6218,6 +6621,7 @@ impl OutputTarget for LocalOutput {
                 // R6 bis (#2219) : le bras vit dans `local/bras_coreaudio.rs`.
                 // Tout ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
                 bras_coreaudio::jouer_via_coreaudio(bras_coreaudio::EntreesCoreAudio {
+                    transformations_reelles,
                     device_name,
                     url,
                     sample_rate,
@@ -6270,6 +6674,7 @@ impl OutputTarget for LocalOutput {
                 // R6 bis (#2219) : le bras vit dans `local/bras_asio.rs`. Tout
                 // ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
                 bras_asio::jouer_via_asio(bras_asio::EntreesAsio {
+                    transformations_reelles,
                     device_name,
                     url,
                     sample_rate,
@@ -6326,6 +6731,7 @@ impl OutputTarget for LocalOutput {
                 // R6 bis (#2219) : le bras vit dans `local/bras_wasapi.rs`.
                 // Tout ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
                 bras_wasapi::jouer_via_wasapi(bras_wasapi::EntreesWasapi {
+                    transformations_reelles,
                     device_name,
                     endpoint_id,
                     audio_backend,
@@ -6370,6 +6776,130 @@ impl OutputTarget for LocalOutput {
                 });
                 return;
             }
+            // ------- #6734 — chemin natif S32 (Linux, ALSA hw:) -------
+            //
+            // Une source PCM entière 32 bits, au volume unité, sans DSP, sur
+            // un PCM `hw:` qui annonce S32 : les mots partent entiers jusqu'au
+            // DAC, sans l'anneau `f32` qui en gardait 24 bits. Tout refus —
+            // règle ou périphérique — retombe sur le chemin partagé ci-dessous,
+            // inchangé. Voir `local/bras_alsa_natif.rs`.
+            #[cfg(target_os = "linux")]
+            {
+                let conditions = bras_alsa_natif::ConditionsDuNatif {
+                    spec,
+                    volume_units: volume.load(Ordering::SeqCst),
+                    dsp_identite: local_dsp_is_identity(
+                        &eq,
+                        &convolver,
+                        &crossfeed,
+                        &pure_bypass,
+                        &mono_downmix,
+                    ),
+                    voies_pilotees: reaffectation
+                        .voies_a_demander(
+                            spec,
+                            header_buf.get(data_offset..).unwrap_or_default(),
+                            pure_bypass.load(Ordering::Relaxed),
+                            dop_active.load(Ordering::Relaxed),
+                        )
+                        .is_some_and(|voies| voies != channels),
+                    fondu_ms: fondu_ms.load(Ordering::Relaxed),
+                };
+                match bras_alsa_natif::chemin_natif_s32(&conditions) {
+                    Ok(()) => {
+                        let demande = DemandeDOuverture {
+                            spec,
+                            voies_de_la_matrice: None,
+                            device_name: &device_name,
+                            endpoint_id: endpoint_id.as_deref(),
+                            origin_host: origin_host.as_deref(),
+                            audio_backend: &audio_backend,
+                            exclusive: exclusive_mode,
+                            strict_bitperfect,
+                            stop_rx: &stop_rx,
+                            paused: &paused,
+                            force_silent: &force_silent,
+                            volume: &volume,
+                            device_gone: &device_gone,
+                            starvation: &starvation,
+                            soft_mute: soft_mute.clone(),
+                            position_ms: &position_ms,
+                        };
+                        match bras_alsa_natif::BackendAlsaNatif::tenter(&demande) {
+                            Ok(backend) => {
+                                bras_alsa_natif::jouer_via_alsa_natif(
+                                    backend,
+                                    bras_alsa_natif::ContexteAlsaNatif {
+                                        device_name: &device_name,
+                                        spec,
+                                        data_offset,
+                                        header_buf: &header_buf,
+                                        reader,
+                                        seek_offset,
+                                        // Même calcul que le chemin partagé.
+                                        octets_a_sauter: if seek_offset > 0 && !pre_seeked {
+                                            (seek_offset as f64 / 1000.0 * sample_rate as f64)
+                                                as u64
+                                                * channels as u64
+                                                * bytes_per_sample as u64
+                                        } else {
+                                            0
+                                        },
+                                        my_generation,
+                                        volume: &volume,
+                                        user_volume: &user_volume_ref,
+                                        rg_factor: &rg_factor_ref,
+                                        playing: &playing,
+                                        force_silent: &force_silent,
+                                        stop_rx: &stop_rx,
+                                        open_failure: &open_failure,
+                                        signal_path_status: &signal_path_status,
+                                        transformations_reelles: &transformations_reelles,
+                                        position_ms: &position_ms,
+                                        play_generation: &play_generation,
+                                        track_ended_naturally: &track_ended_naturally,
+                                        track_ended_generation: &track_ended_generation,
+                                        eq: &eq,
+                                        convolver: &convolver,
+                                        crossfeed: &crossfeed,
+                                        pure_bypass: &pure_bypass,
+                                        mono_downmix: &mono_downmix,
+                                        reaffectation: &reaffectation,
+                                        disposition: &disposition,
+                                        dop_active: &dop_active,
+                                        next_media: &next_media_ref,
+                                        chain_exhausted: &chain_exhausted_ref,
+                                        current_uri: &uri_ref,
+                                        track_title: &title_ref,
+                                        track_artist: &artist_ref,
+                                        duration_ms: &duration_ms_arc,
+                                        seek_offset_ms: &seek_offset_arc,
+                                    },
+                                );
+                                return;
+                            }
+                            Err(motif) => info!(
+                                device = %device_name,
+                                motif = %motif,
+                                "local_audio_alsa_natif_s32_ecarte_a_l_ouverture"
+                            ),
+                        }
+                    }
+                    // Seul un 32 bits mérite une ligne : pour le reste, le
+                    // chemin partagé EST le bon, il n'y a rien à expliquer.
+                    Err(motif)
+                        if motif
+                            != bras_alsa_natif::MotifDuCheminPartage::SourcePasEntiere32Bits =>
+                    {
+                        info!(
+                            device = %device_name,
+                            motif = motif.code(),
+                            "local_audio_alsa_natif_s32_non_retenu"
+                        );
+                    }
+                    Err(_) => {}
+                }
+            }
             // ------- Open cpal device (shared mode) -------
             //
             // R8 (#2219) : la résolution du périphérique, la décision de
@@ -6377,8 +6907,18 @@ impl OutputTarget for LocalOutput {
             // `BackendCpal::ouvrir` (`local/backend.rs`). `play_url` ne crée
             // plus d'anneau et n'en passe plus d'`Arc` (D2) : il reçoit un
             // backend, lui demande son format, son puits et une observation.
+            // #6230 — une matrice armée qui change le nombre de voies (6 → 2)
+            // les demande au périphérique ; sinon rien ne change. L'amorce
+            // lue avec l'en-tête suffit à écarter un porteur DoP.
+            let voies_de_la_matrice = reaffectation.voies_a_demander(
+                spec,
+                header_buf.get(data_offset..).unwrap_or_default(),
+                pure_bypass.load(Ordering::Relaxed),
+                dop_active.load(Ordering::Relaxed),
+            );
             let demande = DemandeDOuverture {
                 spec,
+                voies_de_la_matrice,
                 device_name: &device_name,
                 endpoint_id: endpoint_id.as_deref(),
                 origin_host: origin_host.as_deref(),
@@ -6425,6 +6965,7 @@ impl OutputTarget for LocalOutput {
 
             let output_sr = sortie.cadence;
             let output_ch = sortie.canaux;
+            reaffectation.constater_l_ouverture(voies_de_la_matrice, output_ch, &device_name);
 
             info!(
                 device = %device_name,
@@ -6681,11 +7222,6 @@ impl OutputTarget for LocalOutput {
                 );
             }
 
-            // Tracks whether the HTTP read loop exited because the source
-            // reached EOF (true) vs. a stop signal or read error (false).
-            // Only when http_eof=true do we signal track_ended_naturally.
-            let mut http_eof = false;
-
             // ── La boucle producteur, une seule pour les deux pistes ───────
             //
             // Elle ne sait rien de cpal : elle lit un `Read`, décode par
@@ -6749,8 +7285,10 @@ impl OutputTarget for LocalOutput {
             );
             total_bytes_read = compteurs.total_bytes_read;
             total_frames_fed = compteurs.total_frames_fed;
-            match fin {
-                FinDeBoucle::FinDeFlux => http_eof = true,
+            // Only a clean EOF reaches the continuation below; every other
+            // producer outcome returns before signalling a natural end.
+            let mut http_eof = match fin {
+                FinDeBoucle::FinDeFlux => true,
                 FinDeBoucle::Interrompue => {
                     // Un Stop / puits mort n'est pas une piste courte a
                     // demarrer une derniere fois, ni un flux vide (#4220).
@@ -6771,7 +7309,7 @@ impl OutputTarget for LocalOutput {
                     return;
                 }
                 FinDeBoucle::Abandon => return,
-            }
+            };
 
             if http_eof {
                 report_incomplete_local_pcm_probe(etage.pcm_kind, etage.en_attente.len());
@@ -7179,17 +7717,17 @@ impl OutputTarget for LocalOutput {
             // Hand the poller something to say when the device disappeared
             // mid-playback (#1626) — same channel as the open-failure path, so
             // the zone shows a clear message instead of silently stopping.
-            if device_gone.load(Ordering::Relaxed) {
-                if let Ok(mut slot) = open_failure.lock() {
-                    // Ne pas écraser un constat déjà posé : le blocage de
-                    // l'anneau (#3108) dit la même panne AVEC la position où
-                    // l'écran s'est figé, et il est arrivé le premier.
-                    if slot.is_none() {
-                        *slot = Some(format!(
-                            "Sortie « {device_name} » : {}.",
-                            OpenFailure::DeviceGone.user_message()
-                        ));
-                    }
+            if device_gone.load(Ordering::Relaxed)
+                && let Ok(mut slot) = open_failure.lock()
+            {
+                // Ne pas écraser un constat déjà posé : le blocage de
+                // l'anneau (#3108) dit la même panne AVEC la position où
+                // l'écran s'est figé, et il est arrivé le premier.
+                if slot.is_none() {
+                    *slot = Some(format!(
+                        "Sortie « {device_name} » : {}.",
+                        OpenFailure::DeviceGone.user_message()
+                    ));
                 }
             }
 
@@ -7214,7 +7752,7 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn pause(&self) -> Result<(), String> {
-        // #4177 — en exclusif Windows (WASAPI exclusif ou ASIO), la pause ne
+        // #4177/#7244 — sous Windows (partagé, exclusif ou ASIO), la pause ne
         // posait qu'un booléen : le fil de rendu poussait du silence et le
         // périphérique restait PRIS — plus un son d'aucune autre application
         // sur ce point de sortie tant que Tune était en pause (Jean Valjean,
@@ -7233,7 +7771,7 @@ impl OutputTarget for LocalOutput {
                 device = %self.device_name,
                 backend = %self.audio_backend,
                 position_ms,
-                "local_audio_exclusive_device_released_on_pause"
+                "local_audio_device_released_on_pause"
             );
             self.stop().await?;
             // `stop()` remet la position à zéro ; une pause, elle, la garde :
@@ -7392,6 +7930,7 @@ impl OutputTarget for LocalOutput {
         if v > 0 {
             self.muted.store(false, Ordering::SeqCst);
         }
+        self.reborner_le_preampli_garde();
         Ok(())
     }
 
@@ -7414,6 +7953,7 @@ impl OutputTarget for LocalOutput {
             self.muted.store(false, Ordering::SeqCst);
         }
         self.recompute_effective_volume();
+        self.reborner_le_preampli_garde();
         Ok(())
     }
 
@@ -7502,10 +8042,16 @@ impl OutputTarget for LocalOutput {
     }
 
     fn signal_path_status(&self) -> Option<OutputSignalPathStatus> {
-        self.signal_path_status
+        let mut status = self
+            .signal_path_status
             .lock()
             .ok()
-            .and_then(|status| status.clone())
+            .and_then(|status| status.clone())?;
+        status.dsp = verdict_pure_selon_les_reglages(
+            status.dsp,
+            self.pure_contourne_un_reglage.load(Ordering::Relaxed),
+        );
+        Some(status)
     }
 
     /// REF-6b (#2219) : ce que l'étage courant a déclaré par
@@ -7515,7 +8061,16 @@ impl OutputTarget for LocalOutput {
         // #2211 — le fondu se déclare pendant le recouvrement, et lui seul.
         let fondu = self.fondu_actif.load(Ordering::Relaxed);
         let mesure = self.transformations_reelles.lock().ok().and_then(|t| *t);
-        mesure.map(|t| t.avec_fondu_enchaine(fondu))
+        // #6741 — un égaliseur coupé qui applique encore son préampli le dit :
+        // le voyant nomme ce gain au lieu d'un « DSP appliqué » ambigu.
+        let garde = self.preampli_garde();
+        mesure.map(|t| {
+            let t = t.avec_fondu_enchaine(fondu);
+            match garde {
+                Some(g) => t.avec_preampli_garde(g.db, g.en_retour),
+                None => t,
+            }
+        })
     }
 
     fn ring_starvation(&self) -> Option<OutputRingStarvation> {
@@ -7754,7 +8309,7 @@ fn feed_ring_abortable_with_stall_timeout(
         if stop_rx.try_recv().is_ok() {
             return true;
         }
-        if abort.map_or(false, |a| a.load(Ordering::Relaxed)) {
+        if abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
             return true;
         }
         // If paused, wait without feeding
@@ -7762,7 +8317,7 @@ fn feed_ring_abortable_with_stall_timeout(
             if stop_rx.try_recv().is_ok() {
                 return true;
             }
-            if abort.map_or(false, |a| a.load(Ordering::Relaxed)) {
+            if abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -7816,6 +8371,9 @@ mod cadence_du_flux_compresse;
 mod decodage_en_continu;
 #[cfg(test)]
 mod decodage_en_continu_5439;
+// #6925 — le M4A d'un podcast, `moov` en tête, décodé pendant le téléchargement.
+#[cfg(test)]
+mod podcast_m4a_en_continu_6925;
 // #5550 — le même chemin, sur une source 24 bits : bit-perfect jusqu'au puits.
 #[cfg(test)]
 mod decodage_en_continu_24bits_5550;
@@ -7869,6 +8427,11 @@ mod gapless_pure_reechantillonne_5416;
 // refermer le flux ; sinon elle rouvre le périphérique.
 #[cfg(test)]
 mod gapless_exclusif_5204;
+
+// #6842 — la chaîne native s'arrête sur un puits mort et le dit ; le vidage
+// du bras WASAPI est borné.
+#[cfg(test)]
+mod famine_native_6842;
 
 // #5204, seconde tranche — ASIO exclusif : la route native enchaîne à format
 // égal par la boucle commune, sans refermer le pilote.
@@ -8147,3 +8710,13 @@ mod transformations_reelles_de_l_etage_ref6b;
 /// #6057 — l'étage route par la disposition déclarée par le fichier.
 #[cfg(test)]
 mod disposition_declaree_tests;
+#[cfg(test)]
+mod voies_exclusives_6230;
+
+// #7093 — publication du format réel des sorties exclusives flottantes.
+#[cfg(any(
+    all(target_os = "windows", feature = "asio"),
+    target_os = "macos",
+    test
+))]
+mod etage_exclusif_observe_7093;

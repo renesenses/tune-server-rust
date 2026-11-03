@@ -62,14 +62,19 @@ impl PlaybackOrchestrator {
         };
         let caps = {
             let locked = output.lock().await;
-            let Some(dlna) = locked
-                .as_any()
-                .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
-            else {
+            let sortie = locked.as_any();
+            if let Some(dlna) = sortie.downcast_ref::<crate::outputs::dlna::DlnaOutput>() {
+                dlna.probe_capabilities().await
+            } else if let Some(oh) =
+                sortie.downcast_ref::<crate::outputs::openhome::OpenHomeOutput>()
+            {
+                // #6718 — un renderer OpenHome annonce ce qu'il lit
+                // (`Playlist:1 ProtocolInfo`) : on le lit, comme un Sink.
+                oh.probe_capabilities().await
+            } else {
                 let t = locked.output_type();
                 return super::capacite_lpcm_par_sortie::repli_sans_sonde(Some(t), hi_res);
-            };
-            dlna.probe_capabilities().await
+            }
         };
         if !caps.probed {
             return false;
@@ -88,50 +93,66 @@ impl PlaybackOrchestrator {
         accepte
     }
 
-    /// #4573 — combien de canaux ce renderer ANNONCE-t-il, au plus ?
-    ///
-    /// `None` veut toujours dire « on ne sait pas », et jamais « deux » :
-    /// sortie absente du registre, sortie qui n'est pas un `DlnaOutput` donc
-    /// sans Sink à lire, sonde inconcluante, ou Sink lu mais sans aucun
-    /// `channels=` — le cas du Denon AVR-X1600H de Xavier pour `audio/flac:*`.
-    /// C'est la règle de [`crate::audio::canaux_reseau_4573`] : on ne réduit
-    /// une piste multicanale que sur une déclaration.
-    ///
-    /// Les réponses CONCLUANTES sont mémorisées par renderer — une sonde SOAP
-    /// par session, pas par morceau. Une sonde inconcluante ne l'est pas : la
-    /// lecture suivante re-sonde, comme pour `dlna_accepte_lpcm`.
-    pub async fn canaux_annonces_du_renderer(&self, device_id: &str) -> Option<u16> {
+    /// Canaux annoncés pour le MIME servi. L'absence de limite explicite
+    /// reste inconnue ; une limite LPCM ne s'applique jamais au FLAC.
+    /// Les réponses concluantes sont mémorisées par appareil ET format.
+    pub async fn canaux_annonces_du_renderer(&self, device_id: &str, mime: &str) -> Option<u16> {
         if device_id.is_empty() {
             return None;
         }
-        if let Some(connu) = self.dlna_canaux_max.lock().await.get(device_id) {
-            return *connu;
+        // #6599 — chaque issue de cette fonction laisse sa ligne au journal.
+        // Le rapport de l'Eversolo A6 montrait trois réductions à deux canaux
+        // sans AUCUNE ligne de sonde pour l'A6 : la réponse venait du cache,
+        // muet, d'une sonde faite avant la fenêtre du rapport. On ne pouvait
+        // plus dire d'où venait le 2.
+        let cache_key = (device_id.to_string(), mime.to_string());
+        let en_cache = self.dlna_canaux_max.lock().await.get(&cache_key).copied();
+        if let Some(connu) = en_cache {
+            tracing::info!(
+                device_id,
+                mime,
+                canaux_max = ?connu,
+                origine = "cache",
+                "dlna_canaux_annonces_en_cache"
+            );
+            return connu;
         }
         let arc = { self.outputs.lock().await.get(device_id) };
-        let output = arc?;
+        let Some(output) = arc else {
+            tracing::info!(device_id, "dlna_canaux_sortie_absente_du_registre");
+            return None;
+        };
         let caps = {
             let locked = output.lock().await;
-            let dlna = locked
+            let Some(dlna) = locked
                 .as_any()
-                .downcast_ref::<crate::outputs::dlna::DlnaOutput>()?;
+                .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
+            else {
+                tracing::info!(device_id, "dlna_canaux_sortie_sans_sink_upnp");
+                return None;
+            };
             dlna.probe_capabilities().await
         };
         if !caps.probed {
             // Inconcluante : surtout ne pas mémoriser. Un renderer injoignable
             // une fois ne doit pas être réputé muet sur ses canaux pour la
             // session entière.
+            tracing::info!(
+                device_id,
+                raison = caps.reason.unwrap_or("inconnue"),
+                "dlna_canaux_sonde_inconcluante"
+            );
             return None;
         }
-        let canaux = caps.canaux_max;
+        let canaux = crate::outputs::dlna::advertised_channels_for_mime(&caps.sink, mime);
         tracing::info!(
             device_id,
+            mime,
             canaux_max = ?canaux,
+            origine = "sonde",
             "dlna_canaux_annonces_sondes"
         );
-        self.dlna_canaux_max
-            .lock()
-            .await
-            .insert(device_id.to_string(), canaux);
+        self.dlna_canaux_max.lock().await.insert(cache_key, canaux);
         canaux
     }
 }
@@ -321,6 +342,7 @@ impl PlaybackOrchestrator {
             channels: Some(channels as u32),
             origin_url: None,
             bitrate_kbps: None,
+            format_source: None,
             cover_url: None,
             file_size,
         })
@@ -639,6 +661,36 @@ impl PlaybackOrchestrator {
         let cover_url = req.cover_url.clone();
         let duration_ms = req.duration_ms;
         let source = source_apparente;
+        // #6471 (FabienM, fil 2302 point 17) — une PAGE de piste Bandcamp au
+        // lieu d'une URL de flux : c'est ce que nomme une version Bandcamp des
+        // « Autres versions ». On lit la page pour en tirer le flux du jour, et
+        // la page devient la référence qui permettra de le resigner. Si la
+        // page ne donne rien, on refuse en le disant : l'envoyer à la sortie
+        // lui ferait lire du HTML.
+        let flux_de_page: Option<(String, String)> = if source == "bandcamp"
+            && super::bandcamp_resignature::est_une_page_de_piste_bandcamp(audio_url)
+        {
+            match super::bandcamp_resignature::flux_de_la_page_de_piste(&self.services, audio_url)
+                .await
+            {
+                Ok(flux) => {
+                    info!(zone_id = req.zone_id, page = %audio_url, "bandcamp_page_de_piste_resolue");
+                    Some((flux, audio_url.to_string()))
+                }
+                Err(e) => {
+                    warn!(zone_id = req.zone_id, page = %audio_url, error = %e, "bandcamp_page_de_piste_illisible");
+                    return Err(format!(
+                        "Lecture impossible : la page Bandcamp {audio_url} ne donne pas de flux jouable ({e})"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let audio_url: &str = flux_de_page
+            .as_ref()
+            .map(|(flux, _)| flux.as_str())
+            .unwrap_or(audio_url);
         // La qualité Bandcamp est LUE DANS L'URL, jamais déduite du nom du
         // service. L'écoute libre est du `mp3-128` ; un fichier ACHETÉ entre
         // par la même porte en `flac`, `alac` ou `mp3-320`, et l'étiqueter
@@ -686,6 +738,7 @@ impl PlaybackOrchestrator {
             req.album_ref
                 .clone()
                 .filter(|r| !r.trim().is_empty())
+                .or_else(|| flux_de_page.as_ref().map(|(_, page)| page.clone()))
                 .or_else(|| {
                     crate::db::reference_d_album::reference_d_album_bandcamp(&self.db, audio_url)
                 })
@@ -969,6 +1022,7 @@ impl PlaybackOrchestrator {
             // renderer réseau : les trois portent le MÊME flux source, et
             // c'est LUI que le chemin du signal doit annoncer (#2074).
             bitrate_kbps: bc_quality.as_ref().and_then(|q| q.bitrate_kbps),
+            format_source: None,
         })
     }
 
@@ -1015,8 +1069,8 @@ impl PlaybackOrchestrator {
         });
 
         info!(
+            hote = %hote_pour_le_journal(audio_url),
             source = "radio",
-            url = %audio_url,
             "radio_decode_to_wav_for_local_output"
         );
 
@@ -1087,14 +1141,13 @@ impl PlaybackOrchestrator {
                 Ok(Err(e)) => {
                     warn!(error = %e, "radio_local_decode_failed");
                     emit_radio_playback_error(&err_bus, err_zone, &err_station, &e);
-                    // Verdict DÉFINITIF ou simple panne ? Les deux préfixes
-                    // ci-dessous portent déjà, chacun dans son commentaire, la
+                    // Verdict DÉFINITIF ou simple panne ? Les préfixes que
+                    // reconnaît `echec_radio_definitif` portent, chacun dans son commentaire, la
                     // phrase « ne guérira pas en réessayant » — mais personne
                     // ne la lisait hors de la boucle de reconnexion interne.
                     // Une coupure réseau, elle, n'entre pas ici : la reprise
                     // légitime d'un flux qui tombe continue de marcher.
-                    let definitif = e.starts_with(super::radio::RADIO_NOT_AUDIO)
-                        || e.starts_with(super::radio::RADIO_HLS_UNSUPPORTED);
+                    let definitif = super::radio::echec_radio_definitif(&e);
                     if let (true, Some(sid)) = (definitif, refus_source_id.as_deref()) {
                         warn!(
                             zone_id = err_zone,
@@ -1172,7 +1225,11 @@ impl PlaybackOrchestrator {
         };
         let (session_id, tx, data_ready, session) =
             self.streamer.create_radio_session(wav_info, 256).await;
-        info!(url = %audio_url, "bandcamp_decode_to_wav_for_oaat_output");
+        info!(
+            hote = %hote_pour_le_journal(audio_url),
+            source = "bandcamp",
+            "bandcamp_decode_to_wav_for_oaat_output"
+        );
         let bc_url = audio_url.to_string();
         let bc_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
         let bc_levels_tx = if let Some(ref bus) = self.event_bus {
@@ -1364,6 +1421,7 @@ impl PlaybackOrchestrator {
             channels: out_ch,
             origin_url: Some(audio_url.to_string()),
             bitrate_kbps: None,
+            format_source: None,
         })
     }
 
@@ -1466,7 +1524,11 @@ impl PlaybackOrchestrator {
                             "zone.playback_error",
                             serde_json::json!({
                                 "zone_id": zone_id,
-                                "error": format!("Impossible de décoder la piste DSD : {e}"),
+                                // #7077 — code stable traduit par le client ; `error`
+                                // n'en est que le repli anglais, `cause` le détail.
+                                "code": "track_decode_failed",
+                                "error": "The track could not be decoded.",
+                                "cause": format!("DSD: {e}"),
                             }),
                         );
                     }
@@ -1516,11 +1578,13 @@ impl PlaybackOrchestrator {
         let strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
         let resultat = self
             .anticiper_le_dop(
+                req.zone_id,
                 &track,
                 fichier.clone(),
                 zone_max_sample_rate,
                 false,
                 strict,
+                None,
                 None,
             )
             .await;
@@ -1547,19 +1611,29 @@ impl PlaybackOrchestrator {
         }
     }
 
-    async fn relayer_direct_au_navigateur(&self, req: &PlayRequest, d: Directe<'_>) -> FluxDirect {
-        let Directe {
-            audio_url,
-            mime_type,
-            duration_ms,
-            ..
-        } = d;
+    /// Relaie une URL distante TELLE QUELLE par une session du mandataire de
+    /// Tune, et rend l'adresse `http://` de Tune à jouer avec l'identifiant
+    /// de la session.
+    ///
+    /// Le chemin d'un flux direct vers un onglet (#2076, #2158), et celui
+    /// d'un épisode de podcast vers un renderer réseau (#6468) : un renderer
+    /// DLNA n'ouvre souvent pas le HTTPS d'un hébergeur, le mandataire si.
+    /// Aucun transcodage : les octets passent verbatim, le conteneur suit
+    /// l'URL et le MIME annoncé.
+    pub async fn relayer_un_flux_distant(
+        &self,
+        audio_url: &str,
+        mime_type: &str,
+        duration_ms: Option<i64>,
+        sample_rate: Option<u32>,
+        bit_depth: Option<u16>,
+    ) -> (String, String) {
         let conteneur = conteneur_depuis_url(audio_url, mime_type);
         let info = StreamInfo {
             format: conteneur.to_string(),
             mime_type: mime_type.to_string(),
-            sample_rate: req.sample_rate.unwrap_or(44_100),
-            bit_depth: req.bit_depth.unwrap_or(16),
+            sample_rate: sample_rate.unwrap_or(44_100),
+            bit_depth: bit_depth.unwrap_or(16),
             channels: 2,
             file_size: None,
             duration_ms: duration_ms.map(|d| d as u64),
@@ -1574,8 +1648,34 @@ impl PlaybackOrchestrator {
             .streamer
             .get_stream_url(&session_id, &server_ip, conteneur);
         info!(
-            url = %audio_url,
+            hote = %hote_pour_le_journal(audio_url),
             conteneur,
+            stream_id = %session_id,
+            "direct_proxy_session"
+        );
+        (stream_url, session_id)
+    }
+
+    async fn relayer_direct_au_navigateur(&self, req: &PlayRequest, d: Directe<'_>) -> FluxDirect {
+        let Directe {
+            audio_url,
+            mime_type,
+            duration_ms,
+            ..
+        } = d;
+        let (stream_url, session_id) = self
+            .relayer_un_flux_distant(
+                audio_url,
+                mime_type,
+                duration_ms,
+                req.sample_rate,
+                req.bit_depth,
+            )
+            .await;
+        info!(
+            hote = %hote_pour_le_journal(audio_url),
+            source = req.source.as_deref().unwrap_or("podcast"),
+            stream_id = %session_id,
             "direct_proxy_for_browser_output"
         );
         (
@@ -1617,7 +1717,8 @@ impl PlaybackOrchestrator {
             warn!(
                 zone_id,
                 age_secs,
-                url = %audio_url,
+                hote = %hote_pour_le_journal(audio_url),
+                source = "bandcamp",
                 "bandcamp_signature_perimee_sans_reference"
             );
             return None;
@@ -1705,7 +1806,8 @@ impl PlaybackOrchestrator {
             .streamer
             .get_stream_url(&session_id, &server_ip, bc_codec);
         info!(
-            url = %audio_url,
+            hote = %hote_pour_le_journal(audio_url),
+            source = "bandcamp",
             browser = is_browser_output,
             codec = bc_codec,
             resignable,
@@ -1806,7 +1908,11 @@ impl PlaybackOrchestrator {
             let (session_id, tx, data_ready, session) =
                 self.streamer.create_radio_session(wav_info, 256).await;
             retenir_le_codec_de_la_station(&self.db, &session, req.source_id.as_deref());
-            info!(url = %audio_url, "radio_proxy_transcode_for_dlna");
+            info!(
+                hote = %hote_pour_le_journal(audio_url),
+                source = "radio",
+                "radio_proxy_transcode_for_dlna"
+            );
             // #4407 — le poste de relève : un changement d'égaliseur est posé
             // dans CE flux au paquet suivant, sans nouvelle session UPnP.
             let en_vol = super::eq_en_vol::EqEnVol::pour_la_radio();
@@ -1864,8 +1970,7 @@ impl PlaybackOrchestrator {
                     Ok(Err(e)) => {
                         warn!(error = %e, "radio_dlna_decode_failed");
                         emit_radio_playback_error(&err_bus, err_zone, &err_station, &e);
-                        let definitif = e.starts_with(super::radio::RADIO_NOT_AUDIO)
-                            || e.starts_with(super::radio::RADIO_HLS_UNSUPPORTED);
+                        let definitif = super::radio::echec_radio_definitif(&e);
                         if let (true, Some(sid)) = (definitif, refus_source_id.as_deref()) {
                             warn!(
                                 zone_id = err_zone,
@@ -2252,6 +2357,19 @@ fn track_id_dans_une_url_audio_de_tune(url: &str) -> Option<i64> {
         .parse::<i64>()
         .ok()
         .filter(|id| *id > 0)
+}
+
+/// L'hôte seul d'une URL de flux, pour le journal (#6468).
+///
+/// L'URL d'un flux de service (Bandcamp, podcast privé, radio, onglet) porte
+/// souvent dans son chemin ou sa requête une signature ou un jeton d'écoute :
+/// le journal, que les testeurs joignent au forum, n'en reçoit que l'hôte.
+/// Une URL illisible rend `?`, jamais l'URL brute.
+pub(crate) fn hote_pour_le_journal(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
 }
 
 /// Cet hôte d'URL est-il une adresse de CETTE machine ?

@@ -1,0 +1,206 @@
+#7154 — Nettoyage mécanique Clippy rc9
+
+Base : batch/bugs-rc9-20261025, b5aa9e8696f446a96ecb5ae39ae102b495e1acb5.
+Identité : Bertrand Clech / OpenAI Codex / bertrand-20261026-rc9-lot5-a7c9.
+
+Les changements sont découpés par module/zone. Aucun allow/expect ajouté,
+aucun changement de version, aucun test désactivé. Les fichiers des PR actives,
+les périmètres Oxygen/tags utilisateur et les flux radio ICY/HLS sont conservés.
+poller/tick.rs est également conservé pour éviter le chantier de reprise radio.
+
+La ligne CI sélectionne plusieurs paquets. Pour le seul paquet tune-core,
+les features serveur (dj, plugins-wasm, etc.) ne sont pas des features valides.
+La validation utilise toutes ses features présentes dans ci.yml, plus
+plugin-http que la dépendance tune-server active dans la vraie CI :
+
+cargo clippy -p tune-core --all-targets --no-default-features \
+  --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dst,journal-de-test,isolement-disque-de-test,services-factices,ecoute-directe,plugin-http \
+  -- -D warnings
+
+Référence : 193 erreurs lib, 249 lib test (périmètres qui se recoupent).
+Après corrections : 107 erreurs lib.
+Après corrections : 133 erreurs lib test.
+Le Clippy strict global RESTE ROUGE. 134 diagnostics uniques
+par code/fichier/ligne/colonne sont inventoriés ci-dessous ; ces décomptes
+ne s'additionnent pas aux comptes par cible.
+
+Preuves exécutées sur Shrek, quatre jobs Cargo, une commande Rust à la fois :
+- rustfmt des seuls fichiers modifiés, skip_children=true, puis --check : vert.
+- cargo test -p tune-core --test integration_contracts aucune_fuite_de_temporaires : 3/3.
+- Module exact audio/canaux_reseau_4573.rs compilé en bibliothèque autonome
+  par clippy-driver --edition=2024 --crate-type=lib --emit=metadata -D warnings : vert.
+- Contre-épreuve : ancien match réintroduit sans changer les tests ; rustc
+  compile toujours le module ; Clippy rouge à la ligne 28 :
+  "match expression looks like `matches!` macro". Restauration par copie,
+  puis Clippy vert. Ce témoin ne prétend pas rendre tout tune-core vert.
+- rustc --test sur le même module de production : ses 15 tests existants
+  passent, sans dépendance vers une sortie audio. Ce banc est autonome,
+  ce n'est pas une exécution des tests unitaires complets de tune-core.
+- Fichiers exclus comparés à la base ; sources validées rapprochées par SHA-256.
+
+Limites : batterie complète non exécutée ; aucune validation Windows/macOS/
+ARM 32 bits ni comportement audio réel pour ce nettoyage. La conversion
+rlim_t -> u64 reste intacte : elle n'est superflue que sur certaines cibles.
+La suggestion is_multiple_of sur un diviseur calculé reste intacte : le
+diviseur nul ne donne pas le même comportement que l'opérateur modulo.
+Les emprunts PostgreSQL pendant await, les API, la disposition des enums,
+les assertions constantes et les itérations sensibles sont laissés à revue.
+Le suspicious_map avec effet de bord demande une décision fonctionnelle.
+Les suggestions non automatiques non retenues sont aussi listées, sans
+suppression d'avertissement. Aucun vert sur le reste n'est revendiqué.
+
+Exclusions / chantiers actifs : 88 diagnostics, 16 fichiers
+- tune-core/src/audio/analyzer.rs:1973 — clippy::single_element_loop — for loop over a single element
+- tune-core/src/audio/decode.rs:659 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/audio/decode.rs:663 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/audio/decode.rs:670 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/audio/decode.rs:780 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/audio/decode.rs:784 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/audio/decode.rs:792 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/audio/decode.rs:1686 — clippy::unnecessary_cast — casting to the same type is unnecessary (`usize` -> `usize`)
+- tune-core/src/audio/decode.rs:1758 — clippy::unnecessary_cast — casting to the same type is unnecessary (`usize` -> `usize`)
+- tune-core/src/audio/decode.rs:1911 — clippy::too_many_arguments — this function has too many arguments (8/7)
+- tune-core/src/audio/decode.rs:1935 — clippy::too_many_arguments — this function has too many arguments (9/7)
+- tune-core/src/audio/decode.rs:1967 — clippy::too_many_arguments — this function has too many arguments (10/7)
+- tune-core/src/audio/decode.rs:2147 — clippy::too_many_arguments — this function has too many arguments (10/7)
+- tune-core/src/audio/decode.rs:2232 — clippy::too_many_arguments — this function has too many arguments (10/7)
+- tune-core/src/audio/decode.rs:2296 — clippy::unnecessary_cast — casting to the same type is unnecessary (`u32` -> `u32`)
+- tune-core/src/audio/decode.rs:2306 — clippy::redundant_pattern_matching — redundant pattern matching
+- tune-core/src/audio/decode.rs:2491 — clippy::redundant_pattern_matching — redundant pattern matching
+- tune-core/src/audio/decode.rs:2635 — clippy::unnecessary_lazy_evaluations — unnecessary closure used to substitute value for `Option::None`
+- tune-core/src/audio/decode.rs:2703 — clippy::redundant_pattern_matching — redundant pattern matching
+- tune-core/src/audio/decode.rs:3082 — clippy::manual_is_multiple_of — manual implementation of `.is_multiple_of()`
+- tune-core/src/audio/decode.rs:3101 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/audio/decode.rs:3106 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/audio/decode.rs:3113 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/audio/decode.rs:3210 — clippy::useless_conversion — useless conversion to the same type: `u32`
+- tune-core/src/audio/decode.rs:4397 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/audio/decode.rs:4447 — clippy::drop_non_drop — call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes
+- tune-core/src/audio/decode.rs:4454 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/audio/decode.rs:4487 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/audio/decode.rs:4879 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/audio/decode.rs:6069 — clippy::len_zero — length comparison to zero
+- tune-core/src/db/album_repo.rs:1760 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/db/album_repo.rs:1770 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/db/album_repo.rs:2973 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/db/album_repo.rs:4378 — clippy::collapsible_str_replace — used consecutive `str::replace` call
+- tune-core/src/db/album_repo.rs:4809 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/db/album_repo.rs:4841 — clippy::ptr_arg — writing `&Vec` instead of `&[_]` involves a new object where a slice will do
+- tune-core/src/db/migrations.rs:3071 — clippy::empty_line_after_doc_comments — empty line after doc comment
+- tune-core/src/db/migrations.rs:3203 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/db/tag_repo.rs:454 — clippy::needless_question_mark — enclosing `Ok` and `?` operator are unneeded
+- tune-core/src/db/tag_repo.rs:830 — clippy::ptr_arg — writing `&Vec` instead of `&[_]` involves a new object where a slice will do
+- tune-core/src/db/tag_repo.rs:843 — clippy::ptr_arg — writing `&Vec` instead of `&[_]` involves a new object where a slice will do
+- tune-core/src/db/track_repo.rs:2079 — dead_code — function `premiere_vue_du_fichier` is never used
+- tune-core/src/db/track_repo.rs:2175 — clippy::useless_conversion — useless conversion to the same type: `error::TuneError`
+- tune-core/src/db/track_repo.rs:2505 — clippy::useless_conversion — useless conversion to the same type: `error::TuneError`
+- tune-core/src/db/track_repo.rs:2567 — clippy::useless_conversion — useless conversion to the same type: `error::TuneError`
+- tune-core/src/db/track_repo.rs:3490 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/db/track_repo.rs:4618 — clippy::ptr_arg — writing `&Vec` instead of `&[_]` involves a new object where a slice will do
+- tune-core/src/db/track_repo.rs:7181 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/orchestrator.rs:1265 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/orchestrator/decode_radio_temoins.rs:633 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/orchestrator/radio.rs:389 — clippy::too_many_arguments — this function has too many arguments (8/7)
+- tune-core/src/orchestrator/radio_profondeur_tests.rs:182 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/orchestrator/radio_profondeur_tests.rs:206 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/orchestrator/resolve_local.rs:697 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/orchestrator/resolve_local.rs:780 — clippy::manual_checked_ops — manual checked division
+- tune-core/src/orchestrator/resolve_local.rs:986 — clippy::too_many_arguments — this function has too many arguments (8/7)
+- tune-core/src/orchestrator/resolve_local.rs:1924 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/orchestrator/resolve_local.rs:2357 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/orchestrator/resolve_local.rs:2808 — clippy::needless_borrow — this expression creates a reference which is immediately dereferenced by the compiler
+- tune-core/src/orchestrator/resolve_local.rs:2825 — clippy::useless_borrows_in_formatting — redundant reference in `format!` argument
+- tune-core/src/orchestrator/resolve_local.rs:3772 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/orchestrator/resolve_stream.rs:9 — clippy::large_enum_variant — large size difference between variants
+- tune-core/src/orchestrator/tests.rs:7704 — clippy::unnecessary_cast — casting to the same type is unnecessary (`u64` -> `u64`)
+- tune-core/src/orchestrator/tests.rs:7785 — clippy::unnecessary_cast — casting to the same type is unnecessary (`u64` -> `u64`)
+- tune-core/src/poller/tick.rs:912 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/poller/tick.rs:1358 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/poller/tick.rs:1359 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/poller/tick.rs:1509 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/poller/tick.rs:1588 — clippy::unnecessary_cast — casting to the same type is unnecessary (`i64` -> `i64`)
+- tune-core/src/poller/tick.rs:1673 — clippy::unnecessary_cast — casting to the same type is unnecessary (`i64` -> `i64`)
+- tune-core/src/poller/tick.rs:2126 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/poller/tick.rs:2788 — clippy::manual_is_multiple_of — manual implementation of `.is_multiple_of()`
+- tune-core/src/poller/tick.rs:2807 — clippy::manual_is_multiple_of — manual implementation of `.is_multiple_of()`
+- tune-core/src/poller/tick.rs:2828 — clippy::manual_is_multiple_of — manual implementation of `.is_multiple_of()`
+- tune-core/src/poller/tick.rs:2856 — clippy::manual_is_multiple_of — manual implementation of `.is_multiple_of()`
+- tune-core/src/poller/tick.rs:2980 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/poller/tick.rs:3191 — clippy::blocks_in_conditions — in an `if` condition, avoid complex blocks or closures with blocks; instead, move the block or closure higher and bind it with a `let`
+- tune-core/src/radio_hls/ts.rs:172 — clippy::needless_lifetimes — the following explicit lifetimes could be elided: 'a
+- tune-core/src/radio_hls/ts.rs:194 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/radio_hls/ts.rs:281 — clippy::chunks_exact_to_as_chunks — using `chunks_exact` with a constant chunk size
+- tune-core/src/streaming/qobuz.rs:512 — clippy::unnecessary_map_or — this `map_or` can be simplified
+- tune-core/src/streaming/qobuz.rs:1141 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/streaming/qobuz.rs:3751 — clippy::collapsible_if — this `if` statement can be collapsed
+- tune-core/src/streaming/qobuz.rs:4169 — duplicate_macro_attributes — duplicated attribute
+- tune-core/src/streaming/qobuz.rs:4189 — dead_code — function `map_track_basic` is never used
+- tune-core/src/streaming/qobuz.rs:4630 — duplicate_macro_attributes — duplicated attribute
+- tune-core/src/streaming/qobuz.rs:7368 — clippy::unnecessary_get_then_check — unnecessary use of `get("genre_ids")
+                .is_none()`
+- tune-core/src/streaming/qobuz.rs:7727 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+
+À voir par Claude : 46 diagnostics, 31 fichiers
+- tune-core/src/audio/encoder.rs:497 — clippy::manual_is_multiple_of — manual implementation of `.is_multiple_of()`
+- tune-core/src/audio/iso9660.rs:719 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/audio/ordonnancement_rt.rs:405 — clippy::useless_conversion — useless conversion to the same type: `u64`
+- tune-core/src/audio/sacd.rs:1375 — clippy::drop_non_drop — call to `std::mem::drop` with a value that does not implement `Drop`. Dropping such a type only extends its contained lifetimes
+- tune-core/src/config_backup.rs:421 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/db/album_dr_provenance_tests.rs:102 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/db/backend.rs:1508 — clippy::await_holding_refcell_ref — this `RefCell` reference is held across an await point
+- tune-core/src/db/backend.rs:1580 — clippy::await_holding_refcell_ref — this `RefCell` reference is held across an await point
+- tune-core/src/db/backend.rs:1610 — clippy::await_holding_refcell_ref — this `RefCell` reference is held across an await point
+- tune-core/src/db/engine.rs:29 — clippy::should_implement_trait — method `from_str` can be confused for the standard trait method `std::str::FromStr::from_str`
+- tune-core/src/db/play_queue_repo.rs:523 — clippy::large_enum_variant — large size difference between variants
+- tune-core/src/db/postgres_e2e.rs:241 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/library/pochette_disque_tests_5034.rs:30 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/metadata/albums_manquants.rs:161 — clippy::result_unit_err — this returns a `Result<_, ()>`
+- tune-core/src/metadata/arbre_genres.rs:96 — clippy::result_unit_err — this returns a `Result<_, ()>`
+- tune-core/src/metadata/arbre_genres.rs:116 — clippy::result_unit_err — this returns a `Result<_, ()>`
+- tune-core/src/metadata/arbre_genres.rs:194 — clippy::result_unit_err — this returns a `Result<_, ()>`
+- tune-core/src/metadata/choix_de_pressage.rs:754 — clippy::large_enum_variant — large size difference between variants
+- tune-core/src/metadata/choix_de_pressage.rs:944 — clippy::large_enum_variant — large size difference between variants
+- tune-core/src/metadata/liens_externes.rs:160 — clippy::result_unit_err — this returns a `Result<_, ()>`
+- tune-core/src/metadata/musicbrainz_release_banc_4805_c.rs:182 — clippy::explicit_counter_loop — the variable `album_id` is used as a loop counter
+- tune-core/src/orchestrator/dst_jamais_brut_au_renderer_4378_tests.rs:147 — clippy::assertions_on_constants — this assertion has a constant value
+- tune-core/src/orchestrator/sortie_de_radio_dlna_6130.rs:139 — clippy::suspicious_map — this call to `map()` won't have an effect on the call to `count()`
+- tune-core/src/orchestrator/version_de_lecture.rs:165 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/orchestrator/version_de_lecture.rs:167 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/outputs/devialet_air/simulateur.rs:75 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/outputs/devialet_air/sortie.rs:544 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/outputs/local.rs:2346 — clippy::needless_range_loop — the loop variable `i` is used to index `samples`
+- tune-core/src/outputs/local.rs:2372 — clippy::needless_range_loop — the loop variable `i` is used to index `out`
+- tune-core/src/outputs/local.rs:2673 — clippy::manual_checked_ops — manual checked division
+- tune-core/src/outputs/local.rs:3143 — clippy::too_many_arguments — this function has too many arguments (9/7)
+- tune-core/src/outputs/local.rs:3256 — clippy::too_many_arguments — this function has too many arguments (10/7)
+- tune-core/src/outputs/local.rs:3705 — clippy::too_many_arguments — this function has too many arguments (8/7)
+- tune-core/src/outputs/local/relache_peripherique_i3575.rs:134 — clippy::assertions_on_constants — this assertion has a constant value
+- tune-core/src/outputs/local/relache_peripherique_i3575.rs:139 — clippy::assertions_on_constants — this assertion has a constant value
+- tune-core/src/outputs/local/resolution.rs:25 — clippy::enum_variant_names — all variants have the same prefix: `By`
+- tune-core/src/outputs/reveil_en_retard_4357.rs:158 — dead_code — method `periode_ticks` is never used
+- tune-core/src/outputs/sendspin.rs:353 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/playback/queue.rs:311 — clippy::should_implement_trait — method `next` can be confused for the standard trait method `std::iter::Iterator::next`
+- tune-core/src/playback/queue.rs:715 — clippy::assertions_on_constants — this assertion has a constant value
+- tune-core/src/playback/queue.rs:826 — clippy::assertions_on_constants — this assertion has a constant value
+- tune-core/src/playback/queue.rs:827 — clippy::assertions_on_constants — this assertion has a constant value
+- tune-core/src/poller/decisions.rs:455 — clippy::too_many_arguments — this function has too many arguments (10/7)
+- tune-core/src/poller/fsm.rs:1290 — clippy::enum_variant_names — variant name starts with the enum's name
+- tune-core/src/streaming/favorites_mirror_tests.rs:22 — clippy::type_complexity — very complex type used. Consider factoring parts into `type` definitions
+- tune-core/src/upnp_server/dossiers.rs:241 — clippy::large_enum_variant — large size difference between variants
+
+Commits de source par module/zone :
+898a356a4 style(audio): corrections mécaniques Clippy rc9 (refs #7154)
+92fb5edcd style(cloud): corrections mécaniques Clippy rc9 (refs #7154)
+b1ab9174a style(config_backup): corrections mécaniques Clippy rc9 (refs #7154)
+e591a64d5 style(db): corrections mécaniques Clippy rc9 (refs #7154)
+7c8f583ec style(discovery): corrections mécaniques Clippy rc9 (refs #7154)
+33859760c style(library): corrections mécaniques Clippy rc9 (refs #7154)
+2c99556c5 style(license): corrections mécaniques Clippy rc9 (refs #7154)
+51f789ac1 style(metadata): corrections mécaniques Clippy rc9 (refs #7154)
+c0819b977 style(orchestrator): corrections mécaniques Clippy rc9 (refs #7154)
+6d98915e3 style(outputs): corrections mécaniques Clippy rc9 (refs #7154)
+e8ae72ef8 style(poller): corrections mécaniques Clippy rc9 (refs #7154)
+d83e132bf style(scanner): corrections mécaniques Clippy rc9 (refs #7154)
+ce594efca style(streaming): corrections mécaniques Clippy rc9 (refs #7154)
+381acbd81 style(updater): corrections mécaniques Clippy rc9 (refs #7154)
+ef8226241 style(upnp_server): corrections mécaniques Clippy rc9 (refs #7154)

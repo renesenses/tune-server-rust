@@ -95,6 +95,8 @@ pub struct Faux {
     pub prochain_id: i64,
     /// Les cercles du détenteur du jeton.
     pub circles: Vec<Value>,
+    /// #7124 : les cercles des AUTRES où je suis rangé (`member_of`).
+    pub member_of: Vec<Value>,
     pub prochain_cercle_id: i64,
     /// Le `circle_id` porté par chaque invitation envoyée (id → circle_id).
     pub rangement_des_invitations: Vec<(i64, Value)>,
@@ -215,6 +217,7 @@ impl Faux {
             dernier_corps: None,
             prochain_id: 12,
             circles: c["circles"].as_array().unwrap().clone(),
+            member_of: Vec::new(),
             prochain_cercle_id: 3,
             rangement_des_invitations: Vec::new(),
             t2: false,
@@ -268,6 +271,10 @@ impl Faux {
                 }
             }
             c["circles"] = json!(cercles);
+        }
+        // Comme site-mozaiklabs#380 : la clé n'existe que si je suis rangé chez un autre.
+        if !self.member_of.is_empty() {
+            c["member_of"] = json!(self.member_of);
         }
         c
     }
@@ -1142,10 +1149,21 @@ async fn ajouter_a_la_playlist(
             return validation("items", "The items field is invalid.");
         }
     }
-    let premier = 100 + p["items"].as_array().unwrap().len() as i64;
-    for (k, item) in items.iter().enumerate() {
+    // `100 + longueur`, comme toujours ; mais jamais un `item_id` déjà pris
+    // (après un retrait, la longueur redescend — #6688 retire puis ajoute).
+    let mut suivant = 100 + p["items"].as_array().unwrap().len() as i64;
+    for item in items.iter() {
+        while p["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["item_id"] == json!(suivant))
+        {
+            suivant += 1;
+        }
         let mut ligne = item.clone();
-        ligne["item_id"] = json!(premier + k as i64);
+        ligne["item_id"] = json!(suivant);
+        suivant += 1;
         ligne["added_by"] = json!({ "user_id": 1, "name": "Moi" });
         ligne["added_at"] = json!("2026-09-28T10:00:00Z");
         p["items"].as_array_mut().unwrap().push(ligne);

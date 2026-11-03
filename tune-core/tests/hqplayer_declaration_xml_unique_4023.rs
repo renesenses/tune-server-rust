@@ -55,33 +55,19 @@
 //!
 //! Le point 1 est le garde-fou : avant le correctif il en comptait deux.
 
-use std::time::Duration;
-
-use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tune_core::outputs::hqplayer::HqplayerOutput;
 use tune_core::outputs::traits::{OutputTarget, PlayMedia};
 
-/// Lit tout ce que le client écrit, jusqu'à ce qu'il ferme (ou 10 s de garde).
-async fn octets_recus(mut socket: TcpStream) -> String {
-    let mut vus: Vec<u8> = Vec::new();
-    let mut tampon = [0u8; 4096];
-    let garde = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match tokio::time::timeout_at(garde, socket.read(&mut tampon)).await {
-            Ok(Ok(0)) => break,                               // fermeture propre
-            Ok(Ok(n)) => vus.extend_from_slice(&tampon[..n]), // des octets
-            Ok(Err(_)) => break,                              // socket cassée
-            Err(_) => break,                                  // garde de 10 s
-        }
-    }
-    String::from_utf8_lossy(&vus).into_owned()
-}
+/// Enregistre le flux et répond aux commandes sans produire de son.
+#[path = "support/hqplayer_acquitte_7244.rs"]
+mod hqplayer_acquitte_7244;
+use hqplayer_acquitte_7244::octets_recus;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn le_play_suit_le_playlistadd_sans_seconde_declaration_xml() {
-    // Un faux HQPlayer : il accepte, il enregistre, il ne répond jamais — ce
-    // qui est aussi le cas de v6, donc le chemin fire-and-forget est le vrai.
+    // Le faux acquitte les actions et répond à Status. Les actions silencieuses
+    // v6 sont éprouvées séparément par le banc de contrôle #7244.
     let ecoute = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("écoute locale");

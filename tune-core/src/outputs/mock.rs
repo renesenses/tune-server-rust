@@ -12,6 +12,8 @@ use super::traits::{
 pub struct PlayCall {
     pub url: String,
     pub title: Option<String>,
+    /// La profondeur annoncée à la sortie (`PlayMedia::bit_depth`), #6334.
+    pub bit_depth: Option<u32>,
 }
 
 /// A mock OutputTarget for testing playback flows.
@@ -90,7 +92,17 @@ pub struct MockOutput {
     session_perdue_a_la_reprise: Arc<AtomicBool>,
     /// #6062 — posé par un `resume` refusé : la session a été perdue.
     session_perdue: Arc<AtomicBool>,
+    /// #6658 — armée, `play_media` signale son entrée (premier `Notify`) puis
+    /// attend le feu vert (second `Notify`) : la fenêtre où une sortie locale
+    /// arrête le flux précédent avant d'ouvrir le nouveau.
+    barriere_de_lecture: Arc<std::sync::Mutex<Option<BarriereDeLecture>>>,
+    /// #6932 — tant qu'il reste positif, `get_status` PANIQUE et le décompte :
+    /// la panique d'un tour du sondeur, rejouée sans vraie sortie.
+    paniques_au_statut: Arc<AtomicU64>,
 }
+
+/// #6658 — (entrée dans `play_media`, feu vert pour en sortir).
+type BarriereDeLecture = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 impl MockOutput {
     pub fn new(id: &str, name: &str) -> Self {
@@ -126,7 +138,26 @@ impl MockOutput {
             refus_de_set_next: Arc::new(std::sync::Mutex::new(None)),
             session_perdue_a_la_reprise: Arc::new(AtomicBool::new(false)),
             session_perdue: Arc::new(AtomicBool::new(false)),
+            barriere_de_lecture: Arc::new(std::sync::Mutex::new(None)),
+            paniques_au_statut: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// #6932 — les `n` prochains `get_status` paniqueront.
+    pub fn paniquer_au_statut(&self, n: u64) {
+        self.paniques_au_statut.store(n, Ordering::SeqCst);
+    }
+
+    /// #6658 — le prochain `play_media` s'arrêtera à mi-chemin : il signale
+    /// son entrée sur le premier `Notify` rendu, et n'aboutit qu'au signal du
+    /// second.
+    pub fn retenir_la_lecture(&self) -> BarriereDeLecture {
+        let barriere = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *self.barriere_de_lecture.lock().unwrap() = Some(barriere.clone());
+        barriere
     }
 
     /// #6062 — la prochaine reprise trouvera l'appareil sans session (voir
@@ -234,6 +265,15 @@ impl MockOutput {
 
     pub async fn last_play_url(&self) -> Option<String> {
         self.play_calls.lock().await.last().map(|c| c.url.clone())
+    }
+
+    /// La profondeur du dernier `play_media` (#6334).
+    pub async fn last_play_bit_depth(&self) -> Option<u32> {
+        self.play_calls
+            .lock()
+            .await
+            .last()
+            .and_then(|c| c.bit_depth)
     }
 
     /// Les titres passes a `set_next_media`, DANS L'ORDRE (#3026).
@@ -388,8 +428,14 @@ impl OutputTarget for MockOutput {
             self.play_calls.lock().await.push(PlayCall {
                 url: media.url.to_string(),
                 title: media.title.map(String::from),
+                bit_depth: media.bit_depth,
             });
             return Err(motif);
+        }
+        let barriere = self.barriere_de_lecture.lock().unwrap().take();
+        if let Some((entree, feu_vert)) = barriere {
+            entree.notify_one();
+            feu_vert.notified().await;
         }
         *self.state.lock().await = TransportState::Playing;
         *self.current_uri.lock().await = Some(media.url.to_string());
@@ -397,6 +443,7 @@ impl OutputTarget for MockOutput {
         self.play_calls.lock().await.push(PlayCall {
             url: media.url.to_string(),
             title: media.title.map(String::from),
+            bit_depth: media.bit_depth,
         });
         Ok(())
     }
@@ -455,6 +502,13 @@ impl OutputTarget for MockOutput {
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
+        if self
+            .paniques_au_statut
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            panic!("panique simulée dans get_status (#6932)");
+        }
         Ok(OutputStatus {
             state: *self.state.lock().await,
             position_ms: self.position_ms.load(Ordering::Relaxed),
@@ -489,6 +543,7 @@ impl OutputTarget for MockOutput {
         self.set_next_calls.lock().await.push(PlayCall {
             url: media.url.to_string(),
             title: media.title.map(String::from),
+            bit_depth: media.bit_depth,
         });
         let refus = self.refus_de_set_next.lock().unwrap().clone();
         if let Some(motif) = refus {

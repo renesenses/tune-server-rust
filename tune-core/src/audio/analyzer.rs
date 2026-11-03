@@ -1970,9 +1970,7 @@ mod tests {
         f.write_all(b"RIFF").unwrap();
         f.write_all(&((36 + data) as u32).to_le_bytes()).unwrap();
         f.write_all(b"WAVEfmt ").unwrap();
-        for v in [16u32] {
-            f.write_all(&v.to_le_bytes()).unwrap();
-        }
+        f.write_all(&16u32.to_le_bytes()).unwrap();
         for v in [1u16, 2] {
             f.write_all(&v.to_le_bytes()).unwrap();
         }

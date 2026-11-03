@@ -180,6 +180,20 @@ fn default_channels() -> u16 {
     2
 }
 
+impl StreamQuality {
+    /// #6334 — le codec livré est-il avec perte (AAC, MP3, Ogg, Opus) ? Sa
+    /// profondeur de bits n'existe pas alors : un AAC n'a pas « 16 bits »,
+    /// et `bit_depth` vaut 0 sans que la qualité soit pour autant incomplète.
+    /// Faux pour un codec inconnu ou ambigu (M4A) : on ne conclut rien.
+    pub fn avec_perte(&self) -> bool {
+        use crate::audio::formats::AudioFormat;
+        matches!(
+            AudioFormat::from_extension(&self.codec),
+            Some(AudioFormat::Aac | AudioFormat::Mp3 | AudioFormat::Ogg | AudioFormat::Opus)
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamUrl {
     pub url: String,
@@ -399,6 +413,27 @@ pub struct LabelInfo {
     pub albums: Vec<StreamAlbum>,
 }
 
+/// #6934 — une PAGE du catalogue d'un label, lue par son identifiant chez le
+/// service (Qobuz `label/get`, `extra=albums`) : la page « Label » et son
+/// « Voir tout ».
+///
+/// `total` est le compte que le service annonce pour tout le catalogue,
+/// précommandes comprises ; `albums` n'en garde que les albums sortis et
+/// écoutables, si bien qu'une page peut en compter moins que `limit`. La page
+/// suivante commence à `offset + limit` tant que cette somme est sous `total`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelPage {
+    pub id: String,
+    pub name: String,
+    /// Le logo du label chez le service, seulement une adresse http(s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub albums: Vec<StreamAlbum>,
+}
+
 /// An editorial playlist tag/category (Qobuz `playlist/getTags`): moods,
 /// "Focus", genres… Used to browse curated playlists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +530,21 @@ pub struct StreamCredit {
     pub disc_number: Option<u32>,
 }
 
+/// Le texte de présentation qu'un service publie pour un album (#6480) — la
+/// « critique » de Qobuz, tirée de `album/get`.
+///
+/// `description` est du TEXTE : le service l'envoie en HTML, et le serveur le
+/// ramène à des paragraphes séparés par une ligne vide
+/// ([`crate::streaming::presentation_album::texte_de_presentation`]). Aucun
+/// client n'a donc de balisage à interpréter. `language` est la langue que le
+/// service annonce pour ce texte (`fr`, `en`…), quand il la donne.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamAlbumDescription {
+    pub description: String,
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AlbumContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -507,6 +557,15 @@ pub struct AlbumContext {
     pub label_name: Option<String>,
 }
 
+/// Un livret numérique publié par le service pour un album (#6481) — les
+/// « goodies » de Qobuz. `url` est l'adresse du PDF chez le service, en
+/// `https`, à ouvrir telle quelle par le client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamBooklet {
+    pub name: String,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthStatus {
     pub authenticated: bool,
@@ -517,6 +576,30 @@ pub struct AuthStatus {
     pub user_code: Option<String>,
     pub device_code: Option<String>,
     pub expires_in: Option<u64>,
+}
+
+/// #6231 (Didier, fil 2128) — une recherche RESTREINTE à un genre.
+///
+/// Sur l'onglet Genres, la saisie ne filtrait que les nouveautés du genre ouvert,
+/// une liste courte. Cette recherche interroge le catalogue du service.
+///
+/// **Mesuré contre les API réelles le 13/10/2026** : ni `/album/search` ni
+/// `/catalog/search` de Qobuz, ni `/search/album` de Deezer n'acceptent de filtre
+/// de genre (`genre_id`, `genre_ids`, `genre` : résultats identiques). Mais les
+/// deux services disent le genre de CHAQUE album rendu (Qobuz `genre.path`,
+/// Deezer `genre_id`). Tune garde donc, parmi les résultats de la recherche du
+/// service, les albums du genre : `genre_filter = "results"`, et `examined`
+/// dit sur combien de résultats. Un service qui ne dit pas le genre de ses
+/// albums (Tidal, Spotify…) répond [`TuneError::Unsupported`], c'est-à-dire un
+/// 501 que l'écran affiche au lieu de filtrer en silence.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RechercheDansUnGenre {
+    pub albums: Vec<StreamAlbum>,
+    /// Résultats de la recherche du service examinés pour en tirer `albums`.
+    pub examined: usize,
+    /// Comment le genre est appliqué. `"results"` : sur les résultats de la
+    /// recherche du service, d'après le genre que le service donne à chaque album.
+    pub genre_filter: &'static str,
 }
 
 #[async_trait::async_trait]
@@ -745,6 +828,20 @@ pub trait StreamingService: Send + Sync {
         let _ = (genre_id, limit);
         Ok(vec![])
     }
+    /// #6231 — chercher `query` dans le catalogue, restreint au genre
+    /// `genre_id` (voir [`RechercheDansUnGenre`]). Par défaut : non pris en
+    /// charge, ce que l'écran doit DIRE.
+    async fn search_genre_albums(
+        &self,
+        genre_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<RechercheDansUnGenre, TuneError> {
+        let _ = (genre_id, query, limit);
+        Err(TuneError::Unsupported(
+            "genre search not supported for this service".into(),
+        ))
+    }
     /// Une rubrique éditoriale (`section_id`, un identifiant de
     /// [`get_featured_sections`](Self::get_featured_sections)) restreinte à un
     /// genre (#3481).
@@ -776,6 +873,25 @@ pub trait StreamingService: Send + Sync {
     /// returns it with its full catalogue. Album-based so the shared
     /// `StreamAlbum` model need not carry a label id.
     async fn get_album_label(&self, _album_id: &str) -> Result<LabelInfo, TuneError> {
+        Err(TuneError::Unsupported(
+            "labels not supported for this service".into(),
+        ))
+    }
+    /// #6934 — TOUT le catalogue d'un label (borné par le service : 500
+    /// albums chez Qobuz, sans précommandes), pour en tirer ses artistes.
+    async fn get_label_catalogue(&self, _label_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
+        Err(TuneError::Unsupported(
+            "labels not supported for this service".into(),
+        ))
+    }
+    /// #6934 — une page du catalogue d'un label, par son identifiant chez le
+    /// service. `limit` est déjà borné par la route.
+    async fn get_label(
+        &self,
+        _label_id: &str,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<LabelPage, TuneError> {
         Err(TuneError::Unsupported(
             "labels not supported for this service".into(),
         ))
@@ -812,6 +928,12 @@ pub trait StreamingService: Send + Sync {
             "album context not supported for this service".into(),
         ))
     }
+    /// Les livrets PDF que le service publie pour un album (#6481). Un
+    /// service qui n'en publie pas rend une liste vide : la fiche n'affiche
+    /// alors aucun bouton.
+    async fn get_album_booklets(&self, _album_id: &str) -> Result<Vec<StreamBooklet>, TuneError> {
+        Ok(vec![])
+    }
     /// Crédits d'une piste du service (#4993), dans la forme de
     /// [`StreamCredit`]. Un service qui n'a AUCUNE source de crédits répond
     /// `Unsupported` (501) : le client garde alors l'entrée absente, au lieu
@@ -826,6 +948,18 @@ pub trait StreamingService: Send + Sync {
     async fn get_album_credits(&self, _album_id: &str) -> Result<Vec<StreamCredit>, TuneError> {
         Err(TuneError::Unsupported(
             "credits not supported for this service".into(),
+        ))
+    }
+    /// Le texte de présentation d'un album du service (#6480). `Ok(None)` :
+    /// le service sait en publier, mais pas pour cet album. Un service qui
+    /// n'en publie JAMAIS répond `Unsupported` (501) : le client n'affiche
+    /// alors aucune section, plutôt qu'une section vide.
+    async fn get_album_description(
+        &self,
+        _album_id: &str,
+    ) -> Result<Option<StreamAlbumDescription>, TuneError> {
+        Err(TuneError::Unsupported(
+            "album description not supported for this service".into(),
         ))
     }
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
@@ -869,6 +1003,24 @@ pub trait StreamingService: Send + Sync {
         let _ = fav_type;
         Ok(None)
     }
+
+    /// #5997 — la liste datée de [`Self::get_user_favorites_dated`], mais
+    /// seulement si elle est COMPLÈTE : `Err` quand le connecteur sait que le
+    /// service ne l'a pas servie en entier (page manquante, total non tenu,
+    /// réponse sans la clé attendue).
+    ///
+    /// C'est la lecture que réconcilie le miroir des favoris : un favori
+    /// confirmé que le service ne nomme plus y est retiré de Tune, pour tous
+    /// les profils. L'écran Favoris du service, lui, garde la liste partielle
+    /// de `get_user_favorites_dated` : mieux vaut voir 100 titres sur 150 que
+    /// rien. Le défaut délègue, pour les connecteurs qui ne savent rien de
+    /// plus.
+    async fn favoris_dates_complets(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        self.get_user_favorites_dated(fav_type).await
+    }
     /// #4577 — ce service accepte-t-il qu'on ÉCRIVE ses favoris ?
     ///
     /// Bandcamp lit sa liste de souhaits sans session, mais ne l'écrit pas :
@@ -897,6 +1049,24 @@ pub trait StreamingService: Send + Sync {
     /// chaque profil, exactement comme avant.
     fn favoris_miroir(&self) -> bool {
         false
+    }
+
+    /// Les playlists de la bibliothèque du compte, possédées ET suivies, lues
+    /// EN ENTIER, chacune avec `editable` (`Some(false)` : suivie).
+    ///
+    /// #6461 (FabienM, fil 2302, point 1) : chez Qobuz, une playlist
+    /// éditoriale n'entre dans la bibliothèque que si on la met en favori, et
+    /// en sort quand on retire le cœur. Le miroir ([`crate::streaming::favorites_mirror`])
+    /// relit donc ces playlists suivies comme des favoris.
+    ///
+    /// * `None` (défaut) : le service ne sait pas le dire — les playlists
+    ///   restent poussées sans jamais être relues, comme avant ;
+    /// * `Some(Err)` : la lecture a échoué OU n'est pas complète. Le miroir
+    ///   retire une playlist que la lecture ne nomme plus : une liste tronquée
+    ///   lui ferait retirer tout ce qui dépasse la coupe. Une lecture
+    ///   incomplète n'est donc jamais rendue en `Ok`.
+    async fn playlists_de_la_bibliotheque(&self) -> Option<Result<Vec<StreamPlaylist>, TuneError>> {
+        None
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {

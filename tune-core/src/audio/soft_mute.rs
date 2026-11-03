@@ -301,6 +301,46 @@ impl SoftMuteRamp {
     }
 }
 
+impl SoftMuteRamp {
+    /// #6734 — la même rampe sur des mots **entiers 32 bits** (chemin natif
+    /// ALSA S32, `local/bras_alsa_natif.rs`), sans passer par un `f32` qui ne
+    /// garde que 24 bits de mantisse.
+    ///
+    /// Au repos et à gain unité, le tampon ressort **inchangé bit à bit** :
+    /// c'est le chemin bit-perfect. Sinon chaque mot est pondéré en `f64`
+    /// (53 bits de mantisse : le produit d'un mot 32 bits par un gain `f32`
+    /// est exact avant l'arrondi), arrondi, puis borné à la pleine échelle
+    /// `i32` — jamais de dépassement, jamais de repliement d'un mot qui
+    /// changerait de signe. Le gain avance aux frontières de trame, exactement
+    /// comme dans [`apply`](Self::apply).
+    pub fn apply_i32(&mut self, buf: &mut [i32], base_gain: f32) {
+        let ponderer = |mot: &mut i32, g: f32| {
+            let v = (f64::from(*mot) * f64::from(g)).round();
+            *mot = v.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+        };
+        if self.gain == self.target {
+            let g = base_gain * self.gain;
+            if g != 1.0 {
+                for s in buf.iter_mut() {
+                    ponderer(s, g);
+                }
+            }
+            return;
+        }
+        let ch = self.channels;
+        let mut i = 0;
+        while i < buf.len() {
+            let end = (i + ch).min(buf.len());
+            let g = base_gain * self.gain;
+            for s in &mut buf[i..end] {
+                ponderer(s, g);
+            }
+            self.gain = advance_gain(self.gain, self.target, self.step_per_frame);
+            i = end;
+        }
+    }
+}
+
 /// Un pas de rampe vers la cible, borné par elle. Seul endroit où le gain
 /// bouge : [`SoftMuteRamp::apply`] et [`SoftMuteRamp::apply_mapped`] doivent le
 /// MÊME facteur aux mêmes échantillons, sans quoi le chemin entier et le chemin

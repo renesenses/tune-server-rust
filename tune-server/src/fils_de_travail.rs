@@ -33,6 +33,10 @@ pub fn nombre_de_fils(processeurs: usize, surcharge: Option<&str>) -> usize {
 
 /// Construit le moteur multi-fils du serveur avec le nombre de fils retenu.
 pub fn construire_le_moteur() -> tokio::runtime::Runtime {
+    // #6168 — le seuil `mmap` de la glibc, AVANT que les fils de travail ne
+    // prennent leurs arènes (voir `tune_core::memoire_rendue`).
+    let seuil = tune_core::memoire_rendue::fixer_le_seuil_mmap();
+    eprintln!("tune-server: seuil mmap glibc {}", seuil.libelle());
     let processeurs = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);

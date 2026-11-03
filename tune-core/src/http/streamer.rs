@@ -68,6 +68,18 @@ pub struct RadioSourceInfo {
     pub format: Option<&'static str>,
     pub sample_rate: Option<u32>,
     pub bit_depth: Option<u16>,
+    /// #6357 — le protocole de la station quand ce n'est pas un flux continu :
+    /// `Some("hls")` pour une liste `.m3u8`. `None` : Icecast/HTTP.
+    pub transport: Option<&'static str>,
+    /// #6357 — le profil AAC réellement décodé (`AAC-LC`, `HE-AAC`,
+    /// `HE-AACv2`), quand le décodeur le sait. `None` : inconnu.
+    pub profil: Option<&'static str>,
+    /// #6357 — le débit du codec, mesuré sur les trames (kbit/s).
+    pub debit_kbps: Option<u32>,
+    /// #6821 — le débit que la station ANNONCE dans son en-tête `icy-br`
+    /// (kbit/s), lu à la connexion. `None` : en-tête absent ou illisible —
+    /// rien n'est déduit du conteneur ni de la fréquence.
+    pub bitrate_kbps: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -382,6 +394,13 @@ pub struct StreamSession {
     /// #5050 — nombre de `GET` relayés par cette session : borne le débit de
     /// la ligne de diagnostic `proxy_get_amont` (voir `diagnostic_mandataire_a_journaliser`).
     pub requetes_mandataire: std::sync::atomic::AtomicU32,
+    /// #6612 — quand un renderer a demandé une plage qui commence AU-DELÀ de
+    /// la longueur connue du flux (Yamaha R-N2000A, `bytes=4294949906-` pour
+    /// 75,7 Mo, à la reprise après une pause). En millisecondes depuis
+    /// `created_at`, plus un ; `0` = jamais. Posé par `tune-stream-http`, lu
+    /// par le sondeur, qui fait alors reprendre la zone par un NOUVEAU flux à
+    /// la position mémorisée (voir `PlaybackOrchestrator::reprendre_apres_plage_hors_fichier`).
+    plage_hors_fichier_a_ms: std::sync::atomic::AtomicU64,
     /// Comptabilité du ramasse-miettes — voir `cleanup_stale_sessions_with`.
     ///
     /// `bytes_sent` est monotone et alimenté par TOUS les chemins de sortie
@@ -399,6 +418,9 @@ pub struct StreamSession {
     /// la dernière fois. `0` = jamais : l'inactivité se confond alors avec
     /// l'âge, et une session orpheline est reprise exactement comme avant.
     pub gc_active_at_ms: std::sync::atomic::AtomicU64,
+    /// Une suivante complète attend son tour : son propriétaire garde un
+    /// bail RAII, distinct d'une lecture et borné par le plafond absolu.
+    fichiers_prepares: std::sync::atomic::AtomicU32,
     /// Number of HTTP requests currently streaming this session. The radio→WAV
     /// channel is single-consumer (`rx` behind a Mutex): a second concurrent
     /// reader would race the first for each PCM chunk and split the stream. This
@@ -577,7 +599,7 @@ impl StreamSession {
             .unwrap_or_else(|e| e.into_inner()) = Some(observateur);
     }
 
-    fn effective_output_info(&self) -> StreamInfo {
+    pub(crate) fn effective_output_info(&self) -> StreamInfo {
         let mut info = self.info.clone();
         if self.is_radio {
             info.radio_source = *self
@@ -611,6 +633,35 @@ impl StreamSession {
             0 => None,
             n => Some(n),
         }
+    }
+
+    /// #6612 — un renderer vient de demander une plage hors du fichier.
+    pub fn signaler_plage_hors_fichier(&self) {
+        let ms = self.created_at.elapsed().as_millis() as u64;
+        self.plage_hors_fichier_a_ms
+            .store(ms.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #6612 — depuis combien de temps la dernière plage hors fichier a été
+    /// demandée, si elle l'a été (et pas encore oubliée).
+    pub fn age_plage_hors_fichier(&self) -> Option<std::time::Duration> {
+        match self
+            .plage_hors_fichier_a_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            n => Some(
+                self.created_at
+                    .elapsed()
+                    .saturating_sub(std::time::Duration::from_millis(n - 1)),
+            ),
+        }
+    }
+
+    /// #6612 — la plage hors fichier a été traitée (ou n'appelle rien).
+    pub fn oublier_plage_hors_fichier(&self) {
+        self.plage_hors_fichier_a_ms
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn new(id: String, info: StreamInfo, bit_perfect: bool, buffer_size: usize) -> Self {
@@ -649,8 +700,10 @@ impl StreamSession {
             ranges_hors_trame: std::sync::atomic::AtomicU32::new(0),
             longueur_amont: std::sync::atomic::AtomicU64::new(0),
             requetes_mandataire: std::sync::atomic::AtomicU32::new(0),
+            plage_hors_fichier_a_ms: std::sync::atomic::AtomicU64::new(0),
             gc_seen_bytes: std::sync::atomic::AtomicU64::new(0),
             gc_active_at_ms: std::sync::atomic::AtomicU64::new(0),
+            fichiers_prepares: std::sync::atomic::AtomicU32::new(0),
             active_consumers: std::sync::atomic::AtomicU32::new(0),
             consumer_watch_armed: std::sync::atomic::AtomicBool::new(false),
             consumer_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -797,6 +850,19 @@ impl StreamSession {
         // Wake any older consumer currently parked so it re-checks its epoch.
         self.consumer_supersede.notify_waiters();
         epoch
+    }
+
+    /// #6130 — le SERVEUR congédie la connexion qui tient le canal : l'époque
+    /// avance sans nouveau propriétaire, la boucle du consommateur la voit
+    /// (même mécanisme sans réveil perdu que [`Self::claim_channel_consumer`])
+    /// et termine son corps HTTP sans tirer un morceau de plus. Le renderer
+    /// voit la fin du flux ; `active_consumers` retombe quand le corps tombe.
+    ///
+    /// Sert à quitter une radio sur un renderer qui ne lâche pas sa connexion
+    /// sur `Stop` (Eversolo DMP-A8 : 12 sorties de radio sur 12 au journal du
+    /// .18 du 22 au 25/10, `delai_depasse=true consommateurs_restants=1`).
+    pub fn congedier_les_consommateurs(&self) -> u64 {
+        self.claim_channel_consumer()
     }
 
     /// True while `epoch` (from `claim_channel_consumer`) is still the current
@@ -1401,14 +1467,50 @@ impl SuiviBlocIcy {
 pub struct AudioStreamer {
     sessions: Arc<Mutex<HashMap<String, Arc<StreamSession>>>>,
     port: u16,
+    /// #6658 — les dernières sessions retirées parce que leur producteur est
+    /// mort sans écrire un octet ([`Self::marquer_abandonnee`]). Bornée à
+    /// [`SESSIONS_ABANDONNEES_RETENUES`] entrées.
+    abandonnees: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
+
+/// #6658 — combien d'identifiants de sessions abandonnées le streamer
+/// retient. Il n'en faut qu'un par lecture en cours de démarrage : la borne
+/// couvre largement toutes les zones d'une installation.
+const SESSIONS_ABANDONNEES_RETENUES: usize = 64;
 
 impl AudioStreamer {
     pub fn new(port: u16) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             port,
+            abandonnees: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         }
+    }
+
+    /// #6658 — note que la session `stream_id` est retirée parce que son
+    /// producteur est mort avant d'avoir écrit un octet
+    /// (`abandonner_la_session_de_transcodage`).
+    ///
+    /// `session_alive` dit qu'une session n'existe plus, pas POURQUOI : un
+    /// Stop, un saut de piste ou une nouvelle lecture la retirent aussi. Seul
+    /// ce marqueur permet à l'orchestrateur de conclure, après l'envoi, que la
+    /// sortie a reçu un flux mort-né — et pas un flux arrêté par l'auditeur.
+    pub fn marquer_abandonnee(&self, stream_id: &str) {
+        if let Ok(mut abandonnees) = self.abandonnees.lock() {
+            if abandonnees.len() >= SESSIONS_ABANDONNEES_RETENUES {
+                abandonnees.pop_front();
+            }
+            abandonnees.push_back(stream_id.to_string());
+        }
+    }
+
+    /// #6658 — la session `stream_id` a-t-elle été abandonnée par son
+    /// producteur ? Voir [`Self::marquer_abandonnee`].
+    pub fn session_abandonnee(&self, stream_id: &str) -> bool {
+        self.abandonnees
+            .lock()
+            .map(|abandonnees| abandonnees.iter().any(|id| id == stream_id))
+            .unwrap_or(false)
     }
 
     pub async fn create_session(
@@ -1485,6 +1587,20 @@ impl AudioStreamer {
     /// (`outputs/local.rs`, `local_audio_http_fetch_failed`).
     pub async fn session_alive(&self, stream_id: &str) -> bool {
         self.sessions.lock().await.contains_key(stream_id)
+    }
+
+    /// #6612 — depuis combien de temps cette session a reçu une plage hors
+    /// fichier (voir [`StreamSession::age_plage_hors_fichier`]).
+    pub async fn age_plage_hors_fichier(&self, stream_id: &str) -> Option<std::time::Duration> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(stream_id)?.age_plage_hors_fichier()
+    }
+
+    /// #6612 — oublie la plage hors fichier de cette session.
+    pub async fn oublier_plage_hors_fichier(&self, stream_id: &str) {
+        if let Some(s) = self.sessions.lock().await.get(stream_id) {
+            s.oublier_plage_hors_fichier();
+        }
     }
     pub async fn wait_data_ready(&self, stream_id: &str, timeout_ms: u64) -> bool {
         let session = {
@@ -1806,6 +1922,17 @@ impl AudioStreamer {
             .map(|s| s.effective_output_info())
     }
 
+    pub(crate) async fn retenir_fichier_prepare(&self, sid: &str) -> Option<BailFichierPrepare> {
+        let session = self.sessions.lock().await.get(sid).cloned()?;
+        if session.file_path.lock().await.is_none() {
+            return None;
+        }
+        session
+            .fichiers_prepares
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(BailFichierPrepare(session))
+    }
+
     pub fn sessions_state(&self) -> Arc<Mutex<HashMap<String, Arc<StreamSession>>>> {
         self.sessions.clone()
     }
@@ -1829,6 +1956,28 @@ impl AudioStreamer {
         }
         let path = session.file_path.lock().await.clone()?;
         tokio::fs::metadata(path).await.ok().map(|m| m.len())
+    }
+
+    /// #6932 — le flux a-t-il été servi JUSQU'AU BOUT à son lecteur ?
+    ///
+    /// Une session fichier : les octets servis atteignent la taille du
+    /// fichier ([`Self::stream_total_bytes`]). Un flux décodé à la volée (WAV
+    /// chunké d'une conversion) n'a pas de taille : une connexion en a atteint
+    /// la fin du canal ([`StreamSession::fin_du_canal`]). Une radio, jamais.
+    pub async fn stream_servi_jusqu_au_bout(&self, stream_id: &str) -> bool {
+        let Some(session) = ({ self.sessions.lock().await.get(stream_id).cloned() }) else {
+            return false;
+        };
+        if session.is_radio {
+            return false;
+        }
+        if session.fin_du_canal().is_some() {
+            return true;
+        }
+        let servis = session
+            .bytes_sent
+            .load(std::sync::atomic::Ordering::Relaxed);
+        matches!(self.stream_total_bytes(stream_id).await, Some(total) if total > 0 && servis >= total)
     }
 
     pub async fn stream_bytes_sent(&self, stream_id: &str) -> Option<u64> {
@@ -1934,6 +2083,9 @@ impl AudioStreamer {
                 return true;
             }
             let age = s.created_at.elapsed();
+            if s.fichiers_prepares.load(Relaxed) > 0 && age <= absolute_cap {
+                return true;
+            }
             // Relire l'activité : `bytes_sent` est monotone, donc « la valeur
             // a bougé depuis le balayage précédent » suffit à dater la
             // dernière fois que des octets sont partis.
@@ -2129,6 +2281,16 @@ pub fn build_icy_metadata(
     block.push(len_byte);
     block.extend_from_slice(&payload);
     block
+}
+
+/// La suppression du propriétaire rend immédiatement la session au GC.
+pub(crate) struct BailFichierPrepare(Arc<StreamSession>);
+impl Drop for BailFichierPrepare {
+    fn drop(&mut self) {
+        self.0
+            .fichiers_prepares
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -3293,5 +3455,38 @@ mod tests {
             CanalRadio::AucuneConnexion,
             "le canal négocié doit mourir avec la session"
         );
+    }
+
+    /// #6334 — un AAC relayé tel quel ne porte plus de profondeur
+    /// (`bit_depth: 0`, et non les 16 bits d'un CD). Sa retenue n'est plus
+    /// calculée sur un débit PCM fictif (31,8 Mo) : elle tombe au plancher de
+    /// 8 Mio. Ce plancher couvre encore plus de [`RETENUE_SECONDES`] d'un AAC
+    /// 320 kbit/s (Tidal `HIGH`), le plus haut débit avec perte que livrent
+    /// les services. La reprise d'un navigateur ou d'un renderer garde donc
+    /// toute sa marge.
+    #[test]
+    fn la_retenue_d_un_aac_320_sans_profondeur_couvre_sa_fenetre_6334() {
+        let aac = StreamInfo {
+            format: "aac".into(),
+            mime_type: "audio/mp4".into(),
+            sample_rate: 44_100,
+            bit_depth: 0,
+            channels: 2,
+            ..Default::default()
+        };
+        let octets_par_seconde = 320_000 / 8;
+        assert!(
+            aac.fenetre_de_retenue() >= octets_par_seconde * RETENUE_SECONDES,
+            "retenue de {} octets : moins de {RETENUE_SECONDES} s d'un AAC 320",
+            aac.fenetre_de_retenue()
+        );
+        // Le débit nominal d'un flux compressé ne lit pas la profondeur : il
+        // vient de la taille et de la durée, comme avant.
+        let avec_taille = StreamInfo {
+            file_size: Some(14_400_000),
+            duration_ms: Some(360_000),
+            ..aac
+        };
+        assert_eq!(avec_taille.debit_nominal_octets_par_seconde(), Some(40_000));
     }
 }

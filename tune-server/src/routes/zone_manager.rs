@@ -226,6 +226,11 @@ async fn overview(State(state): State<AppState>) -> Json<Value> {
             "volume": z.volume / 100.0,
             // #1274 — lecture en dB du volume ci-dessus, `null` = silence.
             "volume_db": tune_core::audio::volume_scale::linear_to_db(z.volume / 100.0),
+            // #6787 — la loi du curseur (`volume` reste le gain).
+            "volume_curve": tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(
+                z.output_type.as_deref(),
+            )
+            .code(),
             "muted": z.muted,
             "state": match ps.state {
                 tune_core::playback::PlayState::Playing => "playing",
@@ -280,6 +285,11 @@ async fn list_managed_zones(State(state): State<AppState>) -> Json<Value> {
             "volume": z.volume / 100.0,
             // #1274 — lecture en dB du volume ci-dessus, `null` = silence.
             "volume_db": tune_core::audio::volume_scale::linear_to_db(z.volume / 100.0),
+            // #6787 — la loi du curseur (`volume` reste le gain).
+            "volume_curve": tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(
+                z.output_type.as_deref(),
+            )
+            .code(),
             "muted": z.muted,
             "state": match ps.state {
                 tune_core::playback::PlayState::Playing => "playing",
@@ -323,6 +333,10 @@ async fn hot_swap_zone(
     if let Err(e) = zone_repo.update_output_device(id, &body.output_device_id) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+    // #6774 — PURE / volume fixe désarmés par le changement d'appareil :
+    // l'état de lecture ne reste pas au-dessus de la base.
+    tune_core::audio::reglages_de_volume::aligner_la_lecture(&state.backend, &state.playback, id)
+        .await;
     if let Some(ref ot) = body.output_type {
         zone_repo.update_output_type(id, ot).ok();
     }
@@ -539,7 +553,8 @@ fn audio_calibration_unavailable_payload(group_id: i64) -> Value {
         "error": "audio_calibration_unavailable",
         "group_id": group_id,
         "synchronization": generic_group_synchronization_contract(),
-        "message": "Tune ne synchronise pas les renderers indépendants de ce groupe. Le RTT de commande ne mesure pas leur latence audio. Pour une lecture planifiée par timestamps de présentation, utilisez des points de diffusion Tune/OAAT.",
+        "message": crate::message_api::texte("api.groups.audioCalibrationUnavailable", &[]),
+        "message_key": "api.groups.audioCalibrationUnavailable",
     })
 }
 
@@ -827,7 +842,29 @@ async fn activate_zone_profile(
         };
 
         if let Some(device_id) = zc.get("output_device_id").and_then(|v| v.as_str()) {
-            zone_repo.update_output_device(zone_id, device_id).ok();
+            let ancienne = zone_repo
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|zone| zone.output_device_id);
+            // #7133 — même règle que `PATCH /zones/{id}` : l'appareil quitté
+            // se tait, si la zone l'a bien quitté.
+            if zone_repo.update_output_device(zone_id, device_id).is_ok() {
+                super::zones::couper_l_ancienne_sortie(
+                    &state,
+                    zone_id,
+                    ancienne.as_deref(),
+                    Some(device_id),
+                )
+                .await;
+            }
+            // #6774 — même règle que le hot-swap.
+            tune_core::audio::reglages_de_volume::aligner_la_lecture(
+                &state.backend,
+                &state.playback,
+                zone_id,
+            )
+            .await;
         }
         if let Some(ot) = zc.get("output_type").and_then(|v| v.as_str()) {
             zone_repo.update_output_type(zone_id, ot).ok();
@@ -920,7 +957,8 @@ async fn sync_stats(State(state): State<AppState>) -> Json<Value> {
         "max_drift_ms": max_drift_ms,
         "measurement": "reported_playback_position",
         "synchronization_guarantee": false,
-        "warning": "Les positions rapportées par des renderers indépendants ne prouvent pas une restitution audio synchronisée.",
+        "warning": crate::message_api::texte("api.groups.reportedPositionsNotSync", &[]),
+        "warning_key": "api.groups.reportedPositionsNotSync",
     }))
 }
 
@@ -1000,7 +1038,8 @@ async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
         "measurement": "control_rtt",
         "audio_latency_available": false,
         "synchronization_scope": "oaat_only",
-        "warning": "Le RTT de commande ne mesure pas la latence de restitution audio. Tune ne promet une planification synchronisée que pour ses points de diffusion OAAT.",
+        "warning": crate::message_api::texte("api.groups.controlRttNotAudioLatency", &[]),
+        "warning_key": "api.groups.controlRttNotAudioLatency",
         "measured_at": now_iso(),
     }))
 }
@@ -1105,13 +1144,13 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
             "oaat_multiroom_group_refused_unreachable_endpoints"
         );
         return Json(json!({
-            "error": format!(
-                "Ces appareils ne répondent pas comme des points de diffusion Tune : {}. \
-                 Le multiroom synchronisé relie des points de diffusion Tune entre eux ; \
-                 un lecteur DLNA ou AirPlay ne peut pas en faire partie. \
-                 Le groupe n'a pas été créé.",
-                unreachable.join(", ")
+            "error": "oaat_endpoints_unreachable",
+            "code": "oaat_endpoints_unreachable",
+            "message": crate::message_api::texte(
+                "api.groups.unreachableEndpoints",
+                &[("endpoints", unreachable.join(", "))],
             ),
+            "message_key": "api.groups.unreachableEndpoints",
             "unreachable_endpoints": unreachable,
         }));
     }

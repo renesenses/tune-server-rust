@@ -349,8 +349,9 @@ impl FrontiereExclusive for EtageNatifAsio<'_> {
     fn enchainer_a_format_egal(
         &mut self,
         suivante: AudioSpec,
+        amorce: &[u8],
     ) -> Result<(), super::enchainement_exclusif::EnchainementNatif> {
-        self.etage.enchainer_la_piste(suivante)
+        self.etage.enchainer_la_piste(suivante, amorce)
     }
 }
 
@@ -384,14 +385,30 @@ impl FrontiereExclusive for EtageDeConversion<'_> {
     fn enchainer_a_format_egal(
         &mut self,
         suivante: AudioSpec,
+        amorce: &[u8],
     ) -> Result<(), super::enchainement_exclusif::EnchainementNatif> {
-        use super::enchainement_exclusif::{EnchainementNatif, decider_l_enchainement_natif};
-        // Un étage qui convertit n'est pas celui d'un transport exclusif : il
-        // n'enchaîne pas par ici (le chemin partagé a sa propre frontière).
-        if self.needs_resample || self.needs_channel_adapt() {
+        use super::enchainement_exclusif::{EnchainementNatif, decider_l_enchainement_natif_vers};
+        // Un étage qui rééchantillonne n'est pas celui d'un transport
+        // exclusif : il n'enchaîne pas par ici (le chemin partagé a sa propre
+        // frontière). #6230 — une adaptation de canaux, elle, peut être celle
+        // de la grille qui pilote les voies : la règle la juge ci-dessous.
+        if self.needs_resample {
             return Err(EnchainementNatif::Rouvrir);
         }
-        match decider_l_enchainement_natif(self.spec, self.sortie, suivante) {
+        // Comme l'étage natif : la grille ne compte que si l'ouverture en
+        // cours est pilotée. Ouvert au format source (le bras « hog »
+        // d'aujourd'hui), une grille armée garde la règle « à format égal ».
+        let voies = if self.sortie.canaux != self.spec.canaux() {
+            self.pcm.reaffectation.voies_a_ouvrir_en_exclusif(
+                suivante,
+                amorce,
+                self.pcm.pure_bypass.load(Ordering::Relaxed),
+                self.pcm.dop_active.load(Ordering::Relaxed),
+            )
+        } else {
+            suivante.canaux()
+        };
+        match decider_l_enchainement_natif_vers(self.spec, self.sortie, suivante, voies) {
             EnchainementNatif::Rouvrir => Err(EnchainementNatif::Rouvrir),
             EnchainementNatif::Enchainer => {
                 self.en_attente.clear();

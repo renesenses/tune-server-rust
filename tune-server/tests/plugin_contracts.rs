@@ -100,6 +100,12 @@ mod sources_physiques_5065;
 #[cfg(feature = "entree-audio")]
 #[path = "entree_audio_catalogue_5296.rs"]
 mod entree_audio_catalogue_5296;
+// #7195 — « Ma collection physique » au catalogue (feature
+// `collection-physique`, dans `default`) : proposé, installé, actif, et le
+// jeton Discogs ne sort par aucune de ses routes.
+#[cfg(feature = "collection-physique")]
+#[path = "collection_physique_catalogue_7195.rs"]
+mod collection_physique_catalogue_7195;
 // Garde de la couture des FOURNISSEURS de sorties declares par un plugin.
 // Rattachee ici plutot qu en cible propre : `autotests = false` sur ce paquet,
 // donc un fichier non declare n est JAMAIS compile — vert contre rien. Et une
@@ -110,3 +116,11 @@ mod plugin_output_provider_seam;
 
 #[path = "audio_offer_contract.rs"]
 mod audio_offer_contract;
+// #6458 — les descriptions des greffons livrés et le refus `plugin_unavailable`
+// suivent la langue de la requête.
+#[path = "descriptions_greffons_langue_6458.rs"]
+mod descriptions_greffons_langue_6458;
+// tune-web-client#2527 — « Mon thème » au catalogue, son thème rangé par profil.
+#[cfg(feature = "mon-theme")]
+#[path = "mon_theme_catalogue_2527.rs"]
+mod mon_theme_catalogue_2527;

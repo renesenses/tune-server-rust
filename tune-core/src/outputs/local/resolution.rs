@@ -21,6 +21,10 @@ pub(crate) struct DeviceIdentity {
 
 /// Par quoi une zone a été rattachée à son périphérique. Le rang porté par
 /// chaque variante est l'indice dans la liste énumérée.
+// Le préfixe `By` commun est écrit tel quel dans le journal
+// (`matched_by = ?matched`, plus bas) : renommer les variantes changerait
+// les lignes que les journaux des testeurs et les recherches existantes lisent.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeviceMatch {
     /// Retrouvé par identifiant d'endpoint stable. C'est le seul appariement
@@ -504,6 +508,7 @@ pub(super) fn find_device_with_fallback(
 ///    doesn't (PipeWire handles it at the session-manager level).
 /// 2. If that also fails, assume conservative defaults: stereo, 44100+48000 Hz.
 ///    PipeWire will accept these and resample internally.
+///
 /// Probe a device's capabilities when `supported_output_configs()` is
 /// unavailable. Returns `(max_channels, sample_rates, caps_reliable)`.
 ///

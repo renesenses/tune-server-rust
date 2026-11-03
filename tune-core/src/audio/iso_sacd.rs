@@ -282,25 +282,61 @@ mod iso_status_tests_3234 {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
+    /// Budget of the probes that must SUCCEED. The budget is not what these
+    /// tests check: a short one made a slow start on a loaded CI runner look
+    /// like a failure. Only the timeout test below uses a short budget.
+    const BUDGET_LARGE: Duration = Duration::from_secs(30);
+
+    /// Writes a fake extractor. It runs `body` only for `--help` and exits 99
+    /// otherwise, so that `wait_until_executable` can run it without effects.
     fn tool(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/usr/bin/python3\nimport sys, time, os\nassert sys.argv[1:] == ['--help']\n{body}\n")).unwrap();
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ \"$*\" = --help ] || exit 99\n{body}\n"),
+        )
+        .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        wait_until_executable(&path);
         path
+    }
+
+    /// Waits until the freshly written script can be executed.
+    ///
+    /// Tests run on parallel threads of ONE process. A thread that spawns a
+    /// process while `std::fs::write` above still holds its file descriptor
+    /// gives the child a copy of that descriptor, open for writing, until the
+    /// child's `exec`. During that window `execve` of the script fails with
+    /// ETXTBSY, `probe_candidates` sees a spawn error, and counts the
+    /// candidate as absent: `Ok(false)`, the assertion failure of the CI of
+    /// #6281. Once one `exec` succeeds no writer is left (nobody reopens the
+    /// file for writing), so the probes that follow cannot hit it again.
+    fn wait_until_executable(path: &Path) {
+        for _ in 0..1000 {
+            match Command::new(path).output() {
+                Ok(output) => {
+                    assert_eq!(output.status.code(), Some(99), "{path:?}");
+                    return;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("{path:?}: {e}"),
+            }
+        }
+        panic!("{path:?} still busy for writing after 10 s");
     }
 
     #[tokio::test]
     async fn iso_status_accepts_the_same_help_output_as_extraction() {
         let dir = tempfile::tempdir().unwrap();
-        for (name, body) in [
-            ("success", "sys.exit(0)"),
-            ("help", "print('help', file=sys.stderr); sys.exit(1)"),
-        ] {
+        for (name, body) in [("success", "exit 0"), ("help", "echo help >&2; exit 1")] {
             let path = tool(dir.path(), name, body);
             assert!(
-                probe_candidates(&[path.to_str().unwrap()], Duration::from_secs(1))
+                probe_candidates(&[path.to_str().unwrap()], BUDGET_LARGE)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                "{name}"
             );
             assert!(usable_probe_output(
                 &Command::new(&path).arg("--help").output().unwrap()
@@ -312,18 +348,14 @@ mod iso_status_tests_3234 {
     async fn iso_status_ignores_missing_and_silent_failed_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing");
-        let failed = tool(dir.path(), "failed", "sys.exit(1)");
+        let failed = tool(dir.path(), "failed", "exit 1");
         let candidates = [missing.to_str().unwrap(), failed.to_str().unwrap()];
-        assert!(
-            !probe_candidates(&candidates, Duration::from_secs(1))
-                .await
-                .unwrap()
-        );
-        let found = tool(dir.path(), "found", "print('help')");
+        assert!(!probe_candidates(&candidates, BUDGET_LARGE).await.unwrap());
+        let found = tool(dir.path(), "found", "echo help");
         assert!(
             probe_candidates(
                 &[candidates[0], candidates[1], found.to_str().unwrap()],
-                Duration::from_secs(1)
+                BUDGET_LARGE
             )
             .await
             .unwrap()
@@ -334,13 +366,12 @@ mod iso_status_tests_3234 {
     async fn iso_status_timeout_is_unknown_and_kills_the_probe() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("pid");
+        // `exec` keeps the pid written by the shell: the process the probe
+        // must kill is the one named in the file.
         let path = tool(
             dir.path(),
             "slow",
-            &format!(
-                "open({:?}, 'w').write(str(os.getpid()))\ntime.sleep(30)",
-                pidfile.to_str().unwrap()
-            ),
+            &format!("echo $$ > '{}'\nexec sleep 30", pidfile.to_str().unwrap()),
         );
         let start = std::time::Instant::now();
         let result = probe_candidates(&[path.to_str().unwrap()], Duration::from_secs(1)).await;
@@ -352,6 +383,7 @@ mod iso_status_tests_3234 {
         #[cfg(target_os = "linux")]
         {
             let pid = std::fs::read_to_string(&pidfile).unwrap();
+            let pid = pid.trim();
             for _ in 0..30 {
                 if !Path::new(&format!("/proc/{pid}")).exists() {
                     return;

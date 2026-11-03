@@ -96,17 +96,40 @@ async fn en_pure_force_l_appareil_recoit_100_sans_trim_5695() {
     assert_eq!(volume_en_base(&orch, zone_id), 100.0);
 }
 
-/// Le verrou mord sur TOUS les chemins, pas seulement `POST
-/// /playback/{id}/volume` : `PUT /zones/{id}/volume` (le client web), le
-/// PATCH de zone ou le volume de groupe passaient une consigne basse telle
-/// quelle.
+/// #6721 (fil 2366, Marantz NR1200, tweeter détruit) — sous PURE verrouillé,
+/// une consigne BASSE ne devient plus un ordre de plein volume : elle est
+/// refusée, et l'appareil ne reçoit RIEN. Avant ce correctif, ce même banc
+/// voyait partir `[1.0]` vers l'appareil pour une consigne de 0,3 : c'est le
+/// « je saisis le curseur pour diminuer le volume : résultat volume à fond ».
+/// Le verrou mord toujours sur tous les chemins (#5695) : la consigne basse
+/// n'est pas appliquée non plus.
 #[tokio::test]
-async fn en_pure_force_une_consigne_basse_est_ramenee_a_100_5695() {
+async fn en_pure_force_une_consigne_basse_est_refusee_sans_rien_envoyer_6721() {
     let (orch, zone_id) = zone_devialet(true).await;
-    orch.set_volume(zone_id, 0.3, Some(APPAREIL)).await.unwrap();
-    assert_eq!(recus(&orch).await, vec![1.0]);
-    assert_eq!(volume_en_base(&orch, zone_id), 100.0);
-    assert_eq!(orch.playback.get_state(zone_id).await.volume, 1.0);
+    let avant = orch.playback.get_state(zone_id).await.volume;
+    let refus = orch.set_volume(zone_id, 0.3, Some(APPAREIL)).await;
+    assert!(
+        refus.is_err(),
+        "une consigne basse sous PURE verrouillé doit être refusée"
+    );
+    assert_eq!(
+        recus(&orch).await,
+        Vec::<f64>::new(),
+        "#6721 : un geste pour BAISSER ne doit jamais faire partir 100 % vers l'appareil"
+    );
+    assert_eq!(
+        volume_en_base(&orch, zone_id),
+        30.0,
+        "rien n'est écrit en base"
+    );
+    assert_eq!(orch.playback.get_state(zone_id).await.volume, avant);
+    // Les boutons + / − (#6541) passent par le même verrou.
+    assert!(
+        orch.set_volume_au_pas(zone_id, 0.28, Some(APPAREIL))
+            .await
+            .is_err()
+    );
+    assert_eq!(recus(&orch).await, Vec::<f64>::new());
 }
 
 /// L'armement de PURE commande le 100 % AVANT d'écrire le réglage : ce
@@ -127,7 +150,15 @@ async fn l_armement_de_pure_commande_100_sans_trim_5695() {
 #[tokio::test]
 async fn temoin_hors_pure_le_trim_fait_partir_83_pourcent() {
     let (orch, zone_id) = zone_devialet(false).await;
-    orch.set_volume(zone_id, 1.0, Some(APPAREIL)).await.unwrap();
+    // #6721 — hausse confirmée : la garde n'est pas l'objet de ce témoin.
+    orch.set_volume_avec_garde(
+        zone_id,
+        1.0,
+        Some(APPAREIL),
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let recus = recus(&orch).await;
     assert_eq!(recus.len(), 1);
     assert_eq!(

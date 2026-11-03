@@ -252,6 +252,13 @@ pub fn find_parent_genre(genre: &str) -> Option<&'static str> {
     None
 }
 
+/// Tous les noms de la hiérarchie, parents puis enfants de chacun.
+pub fn noms() -> impl Iterator<Item = &'static str> {
+    GENRE_HIERARCHY
+        .iter()
+        .flat_map(|(parent, children)| std::iter::once(*parent).chain(children.iter().copied()))
+}
+
 /// La graphie de la hiérarchie pour un nom de genre, casse indifférente
 /// (« progressive rock » → « Progressive Rock »). `None` si le nom n'y est
 /// pas. Sert à ramener deux saisies d'un même genre au MÊME texte avant la

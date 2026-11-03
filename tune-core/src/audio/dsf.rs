@@ -26,6 +26,35 @@ pub struct DsfInfo {
 }
 
 impl DsfInfo {
+    /// #7362 — taille du WAV DoP produit, en respectant le départ au bloc
+    /// précédent du lecteur DSF et la borne de fin du décodeur. Le paquetiseur
+    /// émet seulement les trames entières (deux octets DSD par canal).
+    /// Une source sans longueur connue ou incohérente garde le repli existant.
+    pub(crate) fn taille_wav_dop(&self, tranche: Option<(u64, Option<u64>)>) -> Option<u64> {
+        if self.block_size == 0
+            || self.channels == 0
+            || self.sample_rate == 0
+            || self.total_samples == 0
+            || self.data_size < self.octets_attendus()
+        {
+            return None;
+        }
+        let total = self.total_samples.div_ceil(8);
+        let bloc = u64::from(self.block_size);
+        let (debut_ms, fin_ms) = tranche.unwrap_or((0, None));
+        let cible = super::dsd_brut::octets_par_canal_pour_ms(self.sample_rate, debut_ms);
+        let atteint = (cible / bloc).min(total.div_ceil(bloc)).checked_mul(bloc)?;
+        let fin = fin_ms
+            .map(|ms| super::dsd_brut::octets_par_canal_pour_ms(self.sample_rate, ms))
+            .unwrap_or(total)
+            .min(total);
+        let trames = fin.saturating_sub(atteint) / 2;
+        trames
+            .checked_mul(u64::from(self.channels))?
+            .checked_mul(3)?
+            .checked_add(44)
+    }
+
     /// Track duration in milliseconds. `total_samples` is the per-channel DSD
     /// sample count and `sample_rate` the 1-bit rate, so duration =
     /// total_samples / sample_rate. `None` if the rate is 0. Single source of

@@ -389,6 +389,10 @@ mod linux {
     }
 
     /// Limite douce `RLIMIT_MEMLOCK` du processus en octets ; `None` = illimitée.
+    // `rlim_t` vaut `u64` sur Linux 64 bits mais `u32` (c_ulong) sur Linux
+    // 32 bits (ARMv7) : `u64::from` y est nécessaire. Le retirer casserait la
+    // compilation de ces cibles ; l'avertissement n'est vrai que sur 64 bits.
+    #[allow(clippy::useless_conversion)]
     pub fn limite_memlock() -> Option<u64> {
         let mut lim = libc::rlimit {
             rlim_cur: 0,

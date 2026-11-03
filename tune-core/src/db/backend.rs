@@ -1070,18 +1070,40 @@ impl PostgresBackend {
         }
     }
 
+    /// Marqueurs SQLite → marqueurs PostgreSQL.
+    ///
+    /// `?N` devient `$N` (#7037). Avant, seul le `?` était remplacé et ses
+    /// chiffres recopiés derrière : `?1` devenait `$11`, `?2` `$22`. Une
+    /// requête à un paramètre lié citait alors `$11`, PostgreSQL ne savait
+    /// pas typer `$2`…`$10` et refusait tout (« could not determine data type
+    /// of parameter $2 ») — c'est ce qui empêchait d'enregistrer une clé
+    /// ListenBrainz ou Last.fm (`DELETE FROM streaming_auth WHERE service = ?1`).
+    ///
+    /// Un `?` nu prend le numéro qui suit le plus grand déjà vu, comme dans
+    /// SQLite : une requête faite de `?` nus est numérotée `$1`, `$2`, … comme
+    /// avant, et un même `?N` répété désigne le même paramètre sur les deux
+    /// moteurs.
     fn translate_placeholders(sql: &str) -> String {
         let mut result = String::with_capacity(sql.len() + 32);
-        let mut idx = 1usize;
+        let mut plus_grand = 0usize;
         let mut chars = sql.chars().peekable();
         while let Some(c) = chars.next() {
             if c == '?' {
+                let mut chiffres = String::new();
+                while let Some(&d) = chars.peek() {
+                    if !d.is_ascii_digit() {
+                        break;
+                    }
+                    chiffres.push(d);
+                    chars.next();
+                }
+                let idx = chiffres.parse::<usize>().unwrap_or(plus_grand + 1);
+                plus_grand = plus_grand.max(idx);
                 result.push('$');
                 result.push_str(&idx.to_string());
-                idx += 1;
             } else if c == '\'' {
                 result.push(c);
-                while let Some(sc) = chars.next() {
+                for sc in chars.by_ref() {
                     result.push(sc);
                     if sc == '\'' {
                         break;
@@ -1377,7 +1399,7 @@ impl DbBackend for PostgresBackend {
                     .await
                     .map_err(|e| format!("pg begin tx: {e}"))?;
 
-                let tx_cell = std::cell::RefCell::new(tx);
+                let tx_cell = tokio::sync::Mutex::new(tx);
                 let handle = PgTxHandle {
                     tx: &tx_cell,
                     last_id: last_id_handle.clone(),
@@ -1404,20 +1426,31 @@ impl DbBackend for PostgresBackend {
     }
 }
 
-/// Postgres-backed transaction handle. Wraps a `RefCell`-guarded
+/// Postgres-backed transaction handle. Wraps a mutex-guarded
 /// reference to a `sqlx::Transaction` for the duration of the
 /// `write_tx` closure.
 ///
 /// Each operation inside the closure runs via `block_in_place` +
 /// `block_on` to bridge async sqlx into the sync `DbTxHandle` trait.
-/// The `RefCell` provides interior mutability so the `&self` methods
+/// The mutex provides interior mutability so the `&self` methods
 /// on `DbTxHandle` can borrow the transaction mutably (sqlx requires
 /// `&mut Transaction` for execute/fetch). Single-threaded access is
 /// guaranteed because `write_tx` is synchronous and the handle never
 /// escapes the closure.
+///
+/// #7154 — c'était un `RefCell` dont l'emprunt restait tenu pendant les
+/// `await` de sqlx (`clippy::await_holding_refcell_ref`). Le verrou de tokio
+/// est fait pour être tenu à travers un `await`, et il est pris par
+/// `try_lock` : un appel réentrant (impossible aujourd'hui) rendrait une
+/// erreur au lieu d'attendre — aucun interblocage possible — ou de paniquer
+/// comme le faisait `borrow_mut`.
+/// Erreur d'un emprunt réentrant de la transaction (voir [`PgTxHandle`]).
+#[cfg(feature = "postgres")]
+const PG_TX_REENTRANTE: &str = "pg tx: transaction déjà empruntée (appel réentrant)";
+
 #[cfg(feature = "postgres")]
 struct PgTxHandle<'a> {
-    tx: &'a std::cell::RefCell<sqlx::Transaction<'static, sqlx::Postgres>>,
+    tx: &'a tokio::sync::Mutex<sqlx::Transaction<'static, sqlx::Postgres>>,
     last_id: std::sync::Arc<std::sync::Mutex<i64>>,
     /// Même `Arc` que [`PostgresBackend::tables_avec_id`] : une table déjà
     /// sondée hors transaction ne l'est pas une seconde fois dedans.
@@ -1483,7 +1516,10 @@ impl DbTxHandle for PgTxHandle<'_> {
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let mut tx_guard = self.tx.borrow_mut();
+                let mut tx_guard = self
+                    .tx
+                    .try_lock()
+                    .map_err(|_| PG_TX_REENTRANTE.to_string())?;
                 // La sonde tourne SUR la transaction : c'est une lecture, elle
                 // ne peut pas l'avorter, et elle voit le schéma tel que la
                 // transaction le voit (une migration DDL en cours comprise).
@@ -1555,7 +1591,10 @@ impl DbTxHandle for PgTxHandle<'_> {
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let mut tx_guard = self.tx.borrow_mut();
+                let mut tx_guard = self
+                    .tx
+                    .try_lock()
+                    .map_err(|_| PG_TX_REENTRANTE.to_string())?;
                 let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned));
                 for v in &owned {
                     q = bind_sqlvalue(q, v);
@@ -1585,7 +1624,10 @@ impl DbTxHandle for PgTxHandle<'_> {
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let mut tx_guard = self.tx.borrow_mut();
+                let mut tx_guard = self
+                    .tx
+                    .try_lock()
+                    .map_err(|_| PG_TX_REENTRANTE.to_string())?;
                 let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned));
                 for v in &owned {
                     q = bind_sqlvalue(q, v);
@@ -1677,6 +1719,39 @@ fn pgrow_to_sqlvalues(row: &sqlx::postgres::PgRow) -> Result<Vec<SqlValue>, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #7037 — `?1` devenait `$11`, et PostgreSQL refusait la requête.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_7037_les_marqueurs_numerotes_gardent_leur_numero() {
+        let t = PostgresBackend::translate_placeholders;
+        assert_eq!(
+            t("DELETE FROM streaming_auth WHERE service = ?1"),
+            "DELETE FROM streaming_auth WHERE service = $1",
+            "`?1` doit devenir `$1`, pas `$11` (#7037)"
+        );
+        assert_eq!(
+            t("INSERT INTO streaming_auth (service, token_data) VALUES (?1, ?2)"),
+            "INSERT INTO streaming_auth (service, token_data) VALUES ($1, $2)"
+        );
+        // Deux chiffres, et un même numéro répété : même paramètre.
+        assert_eq!(
+            t("SELECT ?12 WHERE a = ?3 OR b = ?3"),
+            "SELECT $12 WHERE a = $3 OR b = $3"
+        );
+        // `?` nus : numérotation inchangée.
+        assert_eq!(
+            t("SELECT * FROM t WHERE a = ? AND b = ? LIMIT ?"),
+            "SELECT * FROM t WHERE a = $1 AND b = $2 LIMIT $3"
+        );
+        // Mélange : un `?` nu suit le plus grand numéro vu, comme dans SQLite.
+        assert_eq!(t("VALUES (?2, ?, ?1, ?)"), "VALUES ($2, $3, $1, $4)");
+        // Rien ne change dans une chaîne entre apostrophes.
+        assert_eq!(
+            t("SELECT 'où ?1' WHERE x = ?1"),
+            "SELECT 'où ?1' WHERE x = $1"
+        );
+    }
 
     #[test]
     fn int_types_round_trip_via_sql_value() {

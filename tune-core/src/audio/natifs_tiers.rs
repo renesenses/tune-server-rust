@@ -43,6 +43,48 @@ pub fn cle_des_profils(id: &str) -> String {
     format!("native_plugin_{id}_profiles")
 }
 
+/// #6256 — cette ligne de réglages est-elle le réglage d'une zone pour CE
+/// greffon ? Égalité exacte sur `zone_<n>_native_plugin_<id>` : un identifiant
+/// ne porte jamais de `_`, donc le réglage d'un greffon voisin dont le nom
+/// commence pareil (`<id>-pro`) ne répond pas.
+pub fn est_un_reglage_de_zone(cle: &str, id: &str) -> bool {
+    cle.strip_prefix("zone_")
+        .and_then(|reste| reste.split_once('_'))
+        .is_some_and(|(zone, suite)| {
+            !zone.is_empty()
+                && zone.bytes().all(|b| b.is_ascii_digit())
+                && suite.strip_prefix("native_plugin_") == Some(id)
+        })
+}
+
+/// #6256 — efface TOUT ce que l'hôte range pour ce greffon dans les réglages :
+/// drapeaux d'installation, version, profils nommés et réglage de chaque zone.
+/// Seules ces clés exactes sont supprimées, jamais un préfixe : les réglages
+/// d'un greffon WASM (`plugin_<nom>_<clé>`, `plugin_sdk.rs`) et ceux d'un
+/// voisin restent intacts. Rend les clés supprimées, triées.
+pub fn oublier_les_reglages(settings: &SettingsRepo, id: &str) -> Result<Vec<String>, String> {
+    if !identifiant_admissible(id) {
+        return Err("invalid plugin id".into());
+    }
+    let fixes = [
+        format!("plugin_{id}_installed"),
+        format!("plugin_{id}_enabled"),
+        format!("plugin_{id}_version"),
+        cle_des_profils(id),
+    ];
+    let mut supprimees: Vec<String> = settings
+        .all()?
+        .into_iter()
+        .map(|(cle, _)| cle)
+        .filter(|cle| fixes.contains(cle) || est_un_reglage_de_zone(cle, id))
+        .collect();
+    supprimees.sort();
+    for cle in &supprimees {
+        settings.delete(cle)?;
+    }
+    Ok(supprimees)
+}
+
 /// Un identifiant que l'hôte peut accepter pour un greffon natif tiers :
 /// valide pour le SDK et distinct des quatre emplacements intégrés. Les
 /// collisions avec d'autres familles de greffons (compilés, WASM) sont
@@ -203,6 +245,68 @@ mod tests {
         assert!(!actif(&s, "greffon-tiers"));
         assert!(etages_configures(&s, 1).is_empty());
         assert!(valider_reglage("greffon-tiers", &serde_json::json!({})).is_err());
+    }
+
+    /// #6256 — la désinstallation complète efface les réglages du greffon, et
+    /// eux seuls : ni le greffon voisin au nom proche, ni un réglage WASM.
+    #[test]
+    fn oublier_les_reglages_n_efface_que_ceux_du_greffon_6256() {
+        let s = settings();
+        let id = "greffon-tiers";
+        for (cle, valeur) in [
+            ("plugin_greffon-tiers_installed", "true"),
+            ("plugin_greffon-tiers_enabled", "true"),
+            ("plugin_greffon-tiers_version", "1.2.0"),
+            ("native_plugin_greffon-tiers_profiles", "[]"),
+            ("zone_1_native_plugin_greffon-tiers", r#"{"enabled":true}"#),
+            (
+                "zone_42_native_plugin_greffon-tiers",
+                r#"{"enabled":false}"#,
+            ),
+            // Les voisins, qui doivent survivre.
+            ("plugin_greffon-tiers-pro_installed", "true"),
+            (
+                "zone_1_native_plugin_greffon-tiers-pro",
+                r#"{"enabled":true}"#,
+            ),
+            ("native_plugin_greffon-tiers-pro_profiles", "[]"),
+            ("plugin_greffon_cle", "wasm"),
+            ("zone_1_crossfeed_enabled", "true"),
+        ] {
+            s.set(cle, valeur).unwrap();
+        }
+        let supprimees = oublier_les_reglages(&s, id).unwrap();
+        assert_eq!(
+            supprimees,
+            vec![
+                "native_plugin_greffon-tiers_profiles",
+                "plugin_greffon-tiers_enabled",
+                "plugin_greffon-tiers_installed",
+                "plugin_greffon-tiers_version",
+                "zone_1_native_plugin_greffon-tiers",
+                "zone_42_native_plugin_greffon-tiers",
+            ],
+            "toutes les lignes du greffon, aucune autre"
+        );
+        let restantes: Vec<String> = s.all().unwrap().into_iter().map(|(k, _)| k).collect();
+        for survivante in [
+            "plugin_greffon-tiers-pro_installed",
+            "zone_1_native_plugin_greffon-tiers-pro",
+            "native_plugin_greffon-tiers-pro_profiles",
+            "plugin_greffon_cle",
+            "zone_1_crossfeed_enabled",
+        ] {
+            assert!(
+                restantes.iter().any(|k| k == survivante),
+                "{survivante} appartient à un autre : il ne doit pas être effacé"
+            );
+        }
+        assert!(
+            !restantes.iter().any(|k| k.contains("greffon-tiers_")
+                || k.ends_with("native_plugin_greffon-tiers")),
+            "il reste un réglage du greffon désinstallé : {restantes:?}"
+        );
+        assert!(oublier_les_reglages(&s, "crossfeed").is_err());
     }
 
     #[test]

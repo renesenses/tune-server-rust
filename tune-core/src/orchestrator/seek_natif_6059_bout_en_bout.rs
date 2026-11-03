@@ -46,8 +46,15 @@ async fn sortie(orch: &PlaybackOrchestrator, appareil: &str) -> (usize, Vec<u64>
 
 /// Un FLAC de la bibliothèque qui joue sur la zone DLNA, par une session
 /// FICHIER (passthrough natif, cherchable par `Range`).
+///
+/// #6963 — `zone_id` est imposé, propre à chaque test : les `Seek` à juger
+/// sont rangés dans un état global par zone, et chaque base en mémoire
+/// numérote sa première zone 1. Deux tests en parallèle sur la zone 1 se
+/// marchaient dessus (le relancement natif `oublier` le `Seek` que l'autre
+/// venait de noter).
 async fn flac_natif_en_lecture(
     appareil: &str,
+    zone_id: i64,
 ) -> (PlaybackOrchestrator, i64, String, tempfile::TempDir) {
     let orch = orchestrateur();
     let dir = tempfile::tempdir().unwrap();
@@ -84,9 +91,22 @@ async fn flac_natif_en_lecture(
             &[&chemin as &dyn crate::db::backend::ToSqlValue],
         )
         .unwrap();
-    let zone_id = ZoneRepo::with_backend(orch.db.clone())
-        .create("Salon", Some("dlna"), Some(appareil))
+    orch.db
+        .execute(
+            &format!(
+                "INSERT INTO zones (id, name, output_type, output_device_id) \
+                 VALUES ({zone_id}, 'Salon', 'dlna', ?)"
+            ),
+            &[&appareil as &dyn crate::db::backend::ToSqlValue],
+        )
         .unwrap();
+    assert!(
+        ZoneRepo::with_backend(orch.db.clone())
+            .get(zone_id)
+            .unwrap()
+            .is_some(),
+        "zone {zone_id} créée"
+    );
     let mock = MockOutput::new(appareil, "R-N2000A").with_type("dlna");
     orch.outputs.lock().await.register(Box::new(mock));
     let sid = orch
@@ -124,7 +144,7 @@ async fn flac_natif_en_lecture(
 async fn seek_inoperant_relance_le_flux_natif_a_la_position_6059() {
     let _ = profil::base_de_test();
     let appareil = "dlna:uuid-rn2000a-bout-en-bout-6059";
-    let (orch, zone_id, _chemin, _dir) = flac_natif_en_lecture(appareil).await;
+    let (orch, zone_id, _chemin, _dir) = flac_natif_en_lecture(appareil, 60_593).await;
     profil::memoriser_seek_inoperant(appareil);
 
     let resultat = orch.seek(zone_id, CIBLE_MS, Some(appareil)).await;
@@ -178,11 +198,52 @@ async fn seek_inoperant_relance_le_flux_natif_a_la_position_6059() {
     );
 }
 
+/// Retour de Cyrille du 13/10 (fil 2194) : « on peut avancer à moitié ou à la
+/// fin du morceau mais difficile de sélectionner le point ». Le flux relancé
+/// à la position annonce au renderer la durée qui RESTE (sa DIDL), et cette
+/// durée devenait celle de la piste pour les clients : la barre de
+/// défilement se calait sur le reste, et l'avance suivante, bornée à cette
+/// durée, ne pouvait plus aller au-delà de l'endroit déjà atteint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apres_un_depart_natif_la_piste_garde_toute_sa_duree_6059() {
+    let _ = profil::base_de_test();
+    let appareil = "dlna:uuid-rn2000a-duree-6059";
+    let (orch, zone_id, _chemin, _dir) = flac_natif_en_lecture(appareil, 60_595).await;
+    profil::memoriser_seek_inoperant(appareil);
+    let duree_ms = SECONDES as i64 * 1000;
+
+    orch.seek(zone_id, CIBLE_MS, Some(appareil)).await.unwrap();
+    let np = orch.playback.get_state(zone_id).await.now_playing.unwrap();
+    assert_eq!(
+        np.duration_ms, duree_ms,
+        "la piste annoncée aux clients dure toute sa durée, pas ce qui reste après le départ"
+    );
+
+    // Plus loin que ce qui restait après le premier départ (3 s).
+    let plus_loin_ms = 7_000;
+    orch.seek(zone_id, plus_loin_ms, Some(appareil))
+        .await
+        .unwrap();
+    let (lectures, seeks, url) = sortie(&orch, appareil).await;
+    assert!(seeks.is_empty(), "{seeks:?}");
+    assert_eq!(lectures, 2, "deux relances natives");
+    let url = url.expect("une URL posée");
+    let depart = crate::outputs::dlna_depart_natif::depart_de_l_url(&url)
+        .unwrap_or_else(|| panic!("l'URL porte le départ : {url}"));
+    assert!(
+        depart <= plus_loin_ms && plus_loin_ms - depart < 100,
+        "la seconde avance part de {plus_loin_ms} ms, pas d'une position bornée au reste : départ {depart}"
+    );
+    let etat = orch.playback.get_state(zone_id).await;
+    assert_eq!(etat.position_ms, plus_loin_ms as i64);
+    assert_eq!(etat.now_playing.unwrap().duration_ms, duree_ms);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn renderer_sain_le_seek_part_et_sera_verifie_6059() {
     let _ = profil::base_de_test();
     let appareil = "dlna:uuid-renderer-sain-bout-en-bout-6059";
-    let (orch, zone_id, _chemin, _dir) = flac_natif_en_lecture(appareil).await;
+    let (orch, zone_id, _chemin, _dir) = flac_natif_en_lecture(appareil, 60_594).await;
     assert!(!profil::seek_inoperant(appareil));
 
     let resultat = orch.seek(zone_id, CIBLE_MS, Some(appareil)).await;

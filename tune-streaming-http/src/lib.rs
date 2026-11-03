@@ -17,6 +17,7 @@ use tune_core::favorites_sort::TriFavoris;
 use tune_core::streaming::ServiceRegistry;
 use tune_core::streaming::traits::StreamingService;
 
+mod connexion_spotify_distante;
 pub mod deezer_proxy_handler;
 pub mod etiquettes_langue;
 
@@ -28,6 +29,8 @@ pub struct StreamingHttpState {
     backend: Arc<dyn DbBackend>,
     services: Arc<Mutex<ServiceRegistry>>,
     event_bus: Arc<EventBus>,
+    /// Le client HTTP qui parle au site (écoutes de la communauté, #7026).
+    http: reqwest::Client,
 }
 
 impl StreamingHttpState {
@@ -40,7 +43,15 @@ impl StreamingHttpState {
             backend,
             services,
             event_bus,
+            http: tune_core::http::client::shared().clone(),
         }
+    }
+
+    /// Le client HTTP du serveur, au lieu du client partagé par défaut.
+    #[must_use]
+    pub fn avec_http(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
     }
 
     async fn save_tokens(&self) {
@@ -219,6 +230,7 @@ fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) ->
                 tune_core::TuneError::NotFound(_) => "not_found",
                 tune_core::TuneError::Config(_) => "config",
                 tune_core::TuneError::Unsupported(_) => "unsupported",
+                tune_core::TuneError::Credentials(_) => "credentials",
                 tune_core::TuneError::Other(_) => "other",
             };
             let message = e.to_string();
@@ -549,8 +561,20 @@ where
             "/{service}/albums/{album_id}/context",
             get(service_album_context),
         )
+        // #6934 — le catalogue d'un label par son identifiant chez le
+        // service : une page d'albums (« Voir tout »), puis ses artistes.
+        .route("/{service}/labels/{label_id}", get(service_label))
+        .route(
+            "/{service}/labels/{label_id}/artists",
+            get(service_label_artists),
+        )
         // #4993 — crédits d'une piste et d'un album de SERVICE, dans la forme
         // de `/library/tracks/{id}/credits` (501 si le service n'en a pas).
+        // #6481 — les livrets PDF que le service publie pour un album.
+        .route(
+            "/{service}/albums/{album_id}/booklets",
+            get(service_album_booklets),
+        )
         .route(
             "/{service}/tracks/{track_id}/credits",
             get(service_track_credits),
@@ -558,6 +582,12 @@ where
         .route(
             "/{service}/albums/{album_id}/credits",
             get(service_album_credits),
+        )
+        // #6480 — le texte de présentation d'un album de service (501 si le
+        // service n'en publie pas).
+        .route(
+            "/{service}/albums/{album_id}/description",
+            get(service_album_description),
         )
         .route("/{service}/playlist-tags", get(service_playlist_tags))
         .route(
@@ -574,6 +604,10 @@ where
             "/{service}/genres/{genre_id}/albums",
             get(service_genre_albums),
         )
+        .route(
+            "/{service}/genres/{genre_id}/search",
+            get(service_genre_search),
+        )
         .route("/{service}/favorites/{fav_type}", get(service_favorites))
         .route(
             "/{service}/favorites/{fav_type}/{item_id}",
@@ -588,6 +622,12 @@ where
         .route("/youtube/moods/{params}", get(youtube_mood))
         .route("/youtube/library", get(youtube_library))
         .route("/spotify/callback", get(spotify_callback))
+        // #6784 — finir la connexion Spotify depuis un téléphone.
+        .route(
+            "/spotify/connect",
+            get(connexion_spotify_distante::page_connexion)
+                .post(connexion_spotify_distante::terminer_connexion),
+        )
         .route("/tidal/callback", get(tidal_callback))
         .route_layer(axum::middleware::from_fn(contexte_diagnostic_streaming))
 }
@@ -743,14 +783,65 @@ async fn service_artist_albums(
         .await)
 }
 
+/// #7026 — les titres phares, classés par nombre total d'écoutes sur Tune
+/// (`play_count`, agrégé par le site), avec les écoutes de ce serveur
+/// (`last_played_at`) : voir [`tune_core::streaming::titres_phares_ecoutes`].
+/// Le verrou du service est rendu AVANT d'interroger le site et la base.
 async fn service_artist_top_tracks(
     State(state): State<StreamingHttpState>,
     Path((service, artist_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
+    let arc = match get_svc_actif(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let pistes = arc
+        .read()
+        .await
         .get_artist_top_tracks(&artist_id)
         .await
-        .map(dedoublonner_titres_phares))
+        .map(dedoublonner_titres_phares);
+    let pistes = match pistes {
+        Ok(p) => p,
+        Err(e) => return svc_response::<()>(Err(e)),
+    };
+    let mut items: Vec<Value> = pistes.iter().map(|p| json!(p)).collect();
+    // #7107 — la popularité Last.fm complète la liste du service (qui n'est
+    // que l'ordre d'un album) ; sans clé ou en échec, la liste ne change pas.
+    let cle = tune_core::streaming::titres_phares_lastfm::cle_lastfm(&state.backend);
+    tune_core::streaming::titres_phares_lastfm::completer(
+        &state.http,
+        &tune_core::streaming::titres_phares_lastfm::Reglages::production(&cle),
+        &service,
+        &mut items,
+        |requete| {
+            let arc = arc.clone();
+            async move {
+                arc.read()
+                    .await
+                    .search(&requete, 10)
+                    .await
+                    .map(|r| r.tracks)
+                    .unwrap_or_default()
+            }
+        },
+    )
+    .await;
+    // #7416 — les titres de l'artiste les plus écoutés ici, toutes sources,
+    // rejoignent la liste du service avant le classement.
+    tune_core::streaming::titres_phares_ecoutes::ajouter_mes_plus_ecoutes(
+        &state.backend,
+        &service,
+        &mut items,
+    );
+    tune_core::streaming::titres_phares_ecoutes::enrichir_et_classer(
+        &state.backend,
+        &state.http,
+        &service,
+        &mut items,
+    )
+    .await;
+    Json(Value::Array(items)).into_response()
 }
 
 /// Écart de durée sous lequel deux titres phares de même nom et de même
@@ -955,6 +1046,31 @@ async fn service_genre_albums(
     }
 }
 
+#[derive(Deserialize)]
+struct GenreSearchQuery {
+    q: String,
+    limit: Option<usize>,
+}
+
+/// #6231 — chercher dans le catalogue du service, restreint à un genre
+/// (`tune_core::streaming::RechercheDansUnGenre`). 501 pour un service qui ne
+/// dit pas le genre de ses albums : l'écran le DIT, au lieu de filtrer en
+/// silence les seules nouveautés.
+async fn service_genre_search(
+    State(state): State<StreamingHttpState>,
+    Path((service, genre_id)): Path<(String, String)>,
+    Query(q): Query<GenreSearchQuery>,
+) -> Response {
+    let query = q.q.trim().to_string();
+    if query.is_empty() {
+        return (StatusCode::BAD_REQUEST, "q is required").into_response();
+    }
+    let limit = q.limit.unwrap_or(50);
+    with_svc!(&state, &service, |svc| svc
+        .search_genre_albums(&genre_id, &query, limit)
+        .await)
+}
+
 async fn service_featured_sections(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
@@ -976,6 +1092,81 @@ async fn service_album_label(
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
     with_svc!(&state, &service, |svc| svc.get_album_label(&album_id).await)
+}
+
+/// Une page du catalogue d'un label : 50 albums au plus par page, la taille
+/// que la lecture complète du catalogue emploie déjà chez Qobuz.
+pub const LABEL_PAGE_MAX: usize = 50;
+
+#[derive(Deserialize)]
+struct LabelPageQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+/// #6934 — `GET /streaming/{service}/labels/{label_id}?limit=&offset=` : une
+/// page du catalogue du label ([`tune_core::streaming::traits::LabelPage`]).
+/// `limit` absent vaut [`LABEL_PAGE_MAX`], et il y est borné (au moins 1).
+/// Service sans labels : 501.
+async fn service_label(
+    State(state): State<StreamingHttpState>,
+    Path((service, label_id)): Path<(String, String)>,
+    Query(q): Query<LabelPageQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(LABEL_PAGE_MAX).clamp(1, LABEL_PAGE_MAX);
+    let offset = q.offset.unwrap_or(0);
+    with_svc!(&state, &service, |svc| svc
+        .get_label(&label_id, limit, offset)
+        .await)
+}
+
+/// #6934 — `GET /streaming/{service}/labels/{label_id}/artists` : les
+/// artistes du catalogue du label, regroupés comme la découverte de #6782
+/// (`regrouper` : un artiste par nom, sans « Various Artists », du plus grand
+/// nombre d'albums au plus petit, avec son album le plus récent) — ici SANS
+/// retirer la bibliothèque : c'est la page du label chez le service.
+///
+/// ```json
+/// { "id": "1150", "artists": [{"name": "Jan Garbarek", "qobuz_artist_id": "20",
+///   "album_count": 3, "album_phare": {"id": "…", "title": "Rarum", "year": 2002}}] }
+/// ```
+///
+/// Chez Qobuz, le catalogue passe par le cache de #6782
+/// (`CacheDecouverte::global`, même clé : l'identifiant du label) : gardé un
+/// jour, une erreur une heure, une seule lecture à la fois — la page d'un
+/// label et « Autres artistes du label » ne relisent pas deux fois les dix
+/// pages. Service sans labels : 501.
+async fn service_label_artists(
+    State(state): State<StreamingHttpState>,
+    Path((service, label_id)): Path<(String, String)>,
+) -> Response {
+    use tune_core::library::artistes_du_label::{CacheDecouverte, regrouper};
+    let arc = match get_svc_actif(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = arc.read().await;
+    let albums = if service == "qobuz" {
+        let maintenant = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        };
+        CacheDecouverte::global()
+            .albums_du_service(svc.as_ref(), &label_id, maintenant)
+            .await
+            .map(|a| a.as_ref().clone())
+            .map_err(tune_core::TuneError::Streaming)
+    } else {
+        svc.get_label_catalogue(&label_id).await
+    };
+    svc_response(albums.map(|albums| {
+        json!({
+            "id": label_id,
+            "artists": regrouper(&albums, &std::collections::HashSet::new()),
+        })
+    }))
 }
 
 async fn service_playlist_tags(
@@ -1043,6 +1234,18 @@ async fn service_album_context(
         .await)
 }
 
+/// #6481 — les livrets PDF d'un album de service (cpadiou77 et Patatorz, fil
+/// forum 2326) : `[{"name": "…", "url": "https://…pdf"}]`, vide s'il n'y en a
+/// pas.
+async fn service_album_booklets(
+    State(state): State<StreamingHttpState>,
+    Path((service, album_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_album_booklets(&album_id)
+        .await)
+}
+
 /// #4993 — crédits d'une piste de service (FabienM, fil forum 1921). Même
 /// forme JSON que `GET /library/tracks/{id}/credits` ; `track_id` est
 /// l'identifiant SUR LE SERVICE. Service sans source de crédits : 501.
@@ -1063,6 +1266,19 @@ async fn service_album_credits(
 ) -> Response {
     with_svc!(&state, &service, |svc| svc
         .get_album_credits(&album_id)
+        .await)
+}
+
+/// #6480 — le texte de présentation d'un album de service (cpadiou77, fil
+/// forum 2327). `{"description": "…", "language": "fr"}` ; `null` quand le
+/// service n'en a pas pour cet album ; 501 quand il n'en publie jamais. Le
+/// texte est déjà débarrassé de tout balisage par le serveur.
+async fn service_album_description(
+    State(state): State<StreamingHttpState>,
+    Path((service, album_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_album_description(&album_id)
         .await)
 }
 
@@ -1183,9 +1399,72 @@ async fn service_status(
     .into_response()
 }
 
+/// L'hôte par lequel le CLIENT a joint le serveur : `X-Forwarded-Host`
+/// derrière un relais ou un mandataire, sinon `Host`. Une `X-Forwarded-For`
+/// qui nomme une adresse hors de la boucle locale dit aussi que le client
+/// n'est pas sur la machine : l'hôte vu ne compte alors plus (`None`).
+fn hote_vu_par_le_client(headers: &axum::http::HeaderMap) -> Option<String> {
+    let premier = |nom: &str| {
+        headers
+            .get(nom)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(origine) = premier("x-forwarded-for") {
+        let boucle = origine
+            .trim_start_matches('[')
+            .split([']', '%'])
+            .next()
+            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
+        if !boucle {
+            return None;
+        }
+    }
+    premier("x-forwarded-host").or_else(|| premier("host"))
+}
+
+/// #6784 — les identifiants réellement passés au service.
+///
+/// Corps vide : le code d'appareil, comme avant. TIDAL, corps sans `code`,
+/// sans `device_flow` ni `poll` : c'est un démarrage PKCE, dont le rappel
+/// vise `localhost:8888`. Il n'aboutit que dans un navigateur de la machine
+/// du serveur (`rappel_pkce_aboutit`). Pour tout autre client — téléphone,
+/// autre poste, relais —, on passe au code d'appareil, qui ne dépend
+/// d'aucune adresse de retour. Le flux local reste le PKCE.
+fn identifiants_pour_le_client(
+    service: &str,
+    body: Option<Value>,
+    headers: &axum::http::HeaderMap,
+) -> Value {
+    let Some(mut credentials) = body else {
+        return json!({"device_flow": true});
+    };
+    if service == "tidal"
+        && let Some(objet) = credentials.as_object_mut()
+        && !["code", "device_flow", "poll"]
+            .iter()
+            .any(|cle| objet.contains_key(*cle))
+    {
+        let hote = hote_vu_par_le_client(headers);
+        if !tune_core::streaming::tidal::rappel_pkce_aboutit(hote.as_deref()) {
+            tracing::info!(
+                hote_vu = hote.as_deref().unwrap_or("?"),
+                "tidal_auth_code_d_appareil : le rappel PKCE vise localhost:8888 et \
+                 n'aboutirait pas chez ce client"
+            );
+            objet.insert("device_flow".into(), json!(true));
+        }
+    }
+    credentials
+}
+
 async fn service_auth(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
+    headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> Response {
     let body: Option<Value> = if raw_body.is_empty() {
@@ -1200,7 +1479,7 @@ async fn service_auth(
     };
 
     let mut svc = svc.write().await;
-    let credentials = body.unwrap_or(json!({"device_flow": true}));
+    let credentials = identifiants_pour_le_client(&service, body, &headers);
 
     match svc.authenticate(&credentials).await {
         Ok(status) => {
@@ -1242,8 +1521,35 @@ async fn service_auth(
                     "error": &err_msg,
                 }),
             );
-            (StatusCode::BAD_REQUEST, err_msg).into_response()
+            reponse_echec_auth(&service, &e)
         }
+    }
+}
+
+/// Code rendu par `POST /streaming/{service}/auth` quand le service REFUSE les
+/// identifiants (renesenses/tune-server-rust#7068). Le client le traduit.
+pub const CODE_IDENTIFIANTS_REFUSES: &str = "invalid_credentials";
+
+/// La réponse d'un échec de connexion.
+///
+/// Un refus d'identifiants ([`tune_core::TuneError::Credentials`]) rend un
+/// corps JSON STRUCTURÉ — `{"code":"invalid_credentials","service":…,"error":…}`
+/// — au lieu du texte brut de l'erreur du service (Qobuz recopiait son JSON :
+/// `qobuz login: 401 {"status":"error",…}`). Le statut reste 400, comme avant :
+/// 401 serait lu par le client comme une session perdue. Toute autre erreur
+/// garde le texte brut, comme avant.
+fn reponse_echec_auth(service: &str, e: &tune_core::TuneError) -> Response {
+    match e {
+        tune_core::TuneError::Credentials(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": CODE_IDENTIFIANTS_REFUSES,
+                "service": service,
+                "error": message,
+            })),
+        )
+            .into_response(),
+        autre => (StatusCode::BAD_REQUEST, autre.to_string()).into_response(),
     }
 }
 
@@ -1302,7 +1608,10 @@ async fn service_logout(
     state.save_tokens().await;
     // Le compte change : ses listes ne doivent pas survivre à la session.
     purge_contenu_utilisateur(&service);
-    Json(json!({ "service": service, "status": "logged_out" })).into_response()
+    // #6173 — `disconnectStreaming` (web) lit `disconnected` ; `status` reste
+    // pour les clients qui le lisaient déjà.
+    Json(json!({ "service": service, "status": "logged_out", "disconnected": true }))
+        .into_response()
 }
 
 /// Nombre de titres rendus par défaut par « Plus comme ça » sur un titre de
@@ -1608,7 +1917,8 @@ async fn service_enable(
     settings
         .set(&format!("streaming_{service}_enabled"), "true")
         .ok();
-    Json(json!({"service": service, "enabled": true})).into_response()
+    // #6173 — `enableStreamingService` (web) lit `status`.
+    Json(json!({"service": service, "enabled": true, "status": "enabled"})).into_response()
 }
 
 async fn service_disable(
@@ -1624,7 +1934,8 @@ async fn service_disable(
     settings
         .set(&format!("streaming_{service}_enabled"), "false")
         .ok();
-    Json(json!({"service": service, "enabled": false})).into_response()
+    // #6173 — `disableStreamingService` (web) lit `status`.
+    Json(json!({"service": service, "enabled": false, "status": "disabled"})).into_response()
 }
 
 async fn service_auth_url(
@@ -3095,6 +3406,40 @@ mod temoin_statut_du_refus_i859 {
         String::from_utf8_lossy(&octets).into_owned()
     }
 
+    /// #6231 — la recherche dans un genre existe, et un service qui ne dit pas
+    /// le genre de ses albums répond 501 (défaut du trait), que l'écran affiche.
+    #[tokio::test]
+    async fn recherche_dans_un_genre_6231_route_501_et_400() {
+        use tower::ServiceExt;
+        let (state, name) = etat("genre-6231", Humeur::Refuse);
+        let app = Router::new().nest("/api/v1/streaming", router().with_state(state));
+        let appel = |chemin: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri(chemin)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let r = appel(format!("/api/v1/streaming/{name}/genres/80/search?q=roxy")).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "#6231 : sans recherche par genre, 501 et non 404 ni une liste vide"
+        );
+        let r = appel(format!("/api/v1/streaming/{name}/genres/80/search?q=%20")).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::BAD_REQUEST,
+            "#6231 : saisie vide refusée"
+        );
+    }
+
     #[derive(Clone, Default)]
     struct Journal4039(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -3653,3 +3998,661 @@ mod service_desactive_jamais_appele_tests;
 
 #[cfg(test)]
 mod youtube_decouverte_tests;
+
+/// #6480 — `GET /streaming/{service}/albums/{id}/description` : le texte de
+/// présentation d'un album de service (cpadiou77, fil forum 2327).
+///
+/// Trois réponses, trois essais : le texte (200, objet), « pas pour cet
+/// album » (200, `null`), « jamais chez ce service » (501, le défaut du trait).
+#[cfg(test)]
+mod tests_presentation_album_6480 {
+    use super::*;
+    use tower::ServiceExt;
+    use tune_core::TuneError;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::streaming::traits::{
+        AuthStatus, SearchResults, StreamAlbum, StreamAlbumDescription, StreamArtist,
+        StreamPlaylist, StreamTrack, StreamUrl,
+    };
+
+    #[derive(Clone, Copy)]
+    enum Presentation {
+        /// Le service sait présenter : « a-1 » a un texte, les autres non.
+        Publiee,
+        /// Le service n'en publie jamais : défaut du trait.
+        Jamais,
+    }
+
+    struct ServicePresentation {
+        nom: String,
+        mode: Presentation,
+    }
+
+    const PANNE: &str = "hors sujet";
+
+    #[async_trait::async_trait]
+    impl StreamingService for ServicePresentation {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            &self.nom
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _e: bool) {}
+        async fn authenticate(&mut self, _c: &Value) -> Result<AuthStatus, TuneError> {
+            Ok(AuthStatus::default())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::default()
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album_description(
+            &self,
+            album_id: &str,
+        ) -> Result<Option<StreamAlbumDescription>, TuneError> {
+            match self.mode {
+                Presentation::Publiee => Ok((album_id == "a-1").then(|| StreamAlbumDescription {
+                    description: "Premier paragraphe.\n\nSecond.".into(),
+                    language: Some("fr".into()),
+                })),
+                Presentation::Jamais => Err(TuneError::Unsupported(
+                    "album description not supported for this service".into(),
+                )),
+            }
+        }
+    }
+
+    async fn appel(nom: &str, mode: Presentation, album: &str) -> (StatusCode, String) {
+        let backend: Arc<dyn DbBackend> =
+            Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(ServicePresentation {
+            nom: nom.to_string(),
+            mode,
+        }));
+        let etat = StreamingHttpState::new(
+            backend,
+            Arc::new(Mutex::new(registre)),
+            Arc::new(EventBus::new()),
+        );
+        let app = Router::new().nest("/api/v1/streaming", router().with_state(etat));
+        let r = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/v1/streaming/{nom}/albums/{album}/description"
+                    ))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let statut = r.status();
+        let octets = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        (statut, String::from_utf8_lossy(&octets).into_owned())
+    }
+
+    #[tokio::test]
+    async fn la_presentation_d_un_album_est_servie_en_texte_avec_sa_langue() {
+        let (statut, corps) = appel("presente-6480", Presentation::Publiee, "a-1").await;
+        assert_eq!(
+            statut,
+            StatusCode::OK,
+            "GET /streaming/{{service}}/albums/{{id}}/description doit exister (#6480) : {corps}"
+        );
+        let v: Value = serde_json::from_str(&corps).unwrap();
+        assert_eq!(
+            v,
+            json!({"description": "Premier paragraphe.\n\nSecond.", "language": "fr"})
+        );
+    }
+
+    #[tokio::test]
+    async fn un_album_sans_presentation_rend_null() {
+        let (statut, corps) = appel("sans-texte-6480", Presentation::Publiee, "a-2").await;
+        assert_eq!(statut, StatusCode::OK, "{corps}");
+        assert_eq!(corps, "null");
+    }
+
+    #[tokio::test]
+    async fn un_service_qui_n_en_publie_jamais_repond_501() {
+        let (statut, _) = appel("jamais-6480", Presentation::Jamais, "a-1").await;
+        assert_eq!(statut, StatusCode::NOT_IMPLEMENTED);
+    }
+}
+
+/// #6481 — `GET /streaming/{service}/albums/{id}/booklets` : les livrets PDF
+/// d'un album de service (cpadiou77 et Patatorz, fil forum 2326).
+#[cfg(test)]
+mod tests_livrets_album_6481 {
+    use super::*;
+    use tower::ServiceExt;
+    use tune_core::TuneError;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::streaming::traits::{
+        AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamBooklet, StreamPlaylist,
+        StreamTrack, StreamUrl,
+    };
+
+    struct ServiceAvecLivret {
+        nom: String,
+    }
+
+    const PANNE: &str = "hors sujet";
+
+    #[async_trait::async_trait]
+    impl StreamingService for ServiceAvecLivret {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            &self.nom
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _e: bool) {}
+        async fn authenticate(&mut self, _c: &Value) -> Result<AuthStatus, TuneError> {
+            Ok(AuthStatus::default())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::default()
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album_booklets(
+            &self,
+            album_id: &str,
+        ) -> Result<Vec<StreamBooklet>, TuneError> {
+            Ok(if album_id == "a-1" {
+                vec![StreamBooklet {
+                    name: "Livret".into(),
+                    url: "https://static.qobuz.com/goodies/1.pdf".into(),
+                }]
+            } else {
+                vec![]
+            })
+        }
+    }
+
+    async fn appel(nom: &str, album: &str) -> (StatusCode, String) {
+        let backend: Arc<dyn DbBackend> =
+            Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(ServiceAvecLivret {
+            nom: nom.to_string(),
+        }));
+        let etat = StreamingHttpState::new(
+            backend,
+            Arc::new(Mutex::new(registre)),
+            Arc::new(EventBus::new()),
+        );
+        let app = Router::new().nest("/api/v1/streaming", router().with_state(etat));
+        let r = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/streaming/{nom}/albums/{album}/booklets"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let statut = r.status();
+        let octets = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        (statut, String::from_utf8_lossy(&octets).into_owned())
+    }
+
+    #[tokio::test]
+    async fn les_livrets_d_un_album_de_service_sont_servis() {
+        let (statut, corps) = appel("livret-6481", "a-1").await;
+        assert_eq!(
+            statut,
+            StatusCode::OK,
+            "GET /streaming/{{service}}/albums/{{id}}/booklets doit exister (#6481) : {corps}"
+        );
+        let v: Value = serde_json::from_str(&corps).unwrap();
+        assert_eq!(
+            v,
+            json!([{"name": "Livret", "url": "https://static.qobuz.com/goodies/1.pdf"}])
+        );
+        let (statut, corps) = appel("sans-livret-6481", "a-2").await;
+        assert_eq!((statut, corps.as_str()), (StatusCode::OK, "[]"));
+    }
+}
+
+/// #6784 — quel flux TIDAL part, selon le client qui le demande.
+#[cfg(test)]
+mod tests_retour_oauth_6784 {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn entetes(paires: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (nom, valeur) in paires {
+            h.insert(*nom, valeur.parse().unwrap());
+        }
+        h
+    }
+
+    fn par_appareil(v: &Value) -> bool {
+        v.get("device_flow").and_then(Value::as_bool) == Some(true)
+    }
+
+    /// TÉMOIN ROUGE avant le correctif : un téléphone qui envoyait `{}`
+    /// recevait l'adresse PKCE dont le retour vise `localhost`.
+    #[test]
+    fn un_client_distant_passe_par_le_code_d_appareil() {
+        for h in [
+            entetes(&[("host", "192.168.1.18:8888")]),
+            entetes(&[("host", "tune.local:8888")]),
+            // Relais : l'hôte réel est dans X-Forwarded-Host.
+            entetes(&[
+                ("host", "127.0.0.1:8888"),
+                ("x-forwarded-host", "relais.example"),
+            ]),
+            // Mandataire local devant un client distant.
+            entetes(&[
+                ("host", "localhost:8888"),
+                ("x-forwarded-for", "203.0.113.9"),
+            ]),
+            HeaderMap::new(),
+        ] {
+            let v = identifiants_pour_le_client("tidal", Some(json!({})), &h);
+            assert!(par_appareil(&v), "{h:?} → {v}");
+        }
+    }
+
+    /// Le flux local ne change pas : navigateur de la machine du serveur, port
+    /// du rappel.
+    #[test]
+    fn le_navigateur_de_la_machine_garde_le_pkce() {
+        for h in [
+            entetes(&[("host", "localhost:8888")]),
+            entetes(&[("host", "127.0.0.1:8888")]),
+            entetes(&[("host", "localhost:8888"), ("x-forwarded-for", "127.0.0.1")]),
+        ] {
+            let v = identifiants_pour_le_client("tidal", Some(json!({})), &h);
+            assert!(!par_appareil(&v), "{h:?} → {v}");
+        }
+    }
+
+    /// Ce qui n'est pas un démarrage PKCE n'est pas touché : rappel, sondage,
+    /// demande explicite, corps vide, autres services.
+    #[test]
+    fn le_reste_passe_tel_quel() {
+        let distant = entetes(&[("host", "192.168.1.18:8888")]);
+        let rappel = json!({"code": "c", "state": "s"});
+        assert_eq!(
+            identifiants_pour_le_client("tidal", Some(rappel.clone()), &distant),
+            rappel
+        );
+        let sonde = json!({"poll": true});
+        assert_eq!(
+            identifiants_pour_le_client("tidal", Some(sonde.clone()), &distant),
+            sonde
+        );
+        assert!(par_appareil(&identifiants_pour_le_client(
+            "tidal", None, &distant
+        )));
+        let spotify = json!({"callback_url": "http://127.0.0.1:8888/cb?code=x"});
+        assert_eq!(
+            identifiants_pour_le_client("spotify", Some(spotify.clone()), &distant),
+            spotify
+        );
+    }
+}
+
+/// #6934 — `GET /streaming/{service}/labels/{id}` (une page du catalogue d'un
+/// label) et `…/labels/{id}/artists` (ses artistes), sur un faux service : ni
+/// réseau ni jeton.
+#[cfg(test)]
+mod tests_labels_6934 {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+    use tune_core::TuneError;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::streaming::traits::{
+        AuthStatus, LabelPage, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist,
+        StreamTrack, StreamUrl,
+    };
+
+    const PANNE: &str = "hors sujet";
+
+    struct ServiceALabels {
+        nom: String,
+        /// Faux : le trait par défaut (501) ; vrai : un catalogue.
+        labels: bool,
+        lectures: Arc<AtomicUsize>,
+    }
+
+    fn album(id: &str, artiste: &str, artiste_id: &str, annee: u32) -> StreamAlbum {
+        StreamAlbum {
+            id: id.into(),
+            title: format!("Titre {id}"),
+            artist: artiste.into(),
+            artist_id: Some(artiste_id.into()),
+            cover_path: None,
+            year: Some(annee),
+            track_count: 1,
+            quality: None,
+            released_at: None,
+            release_type: None,
+            ai_generated: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamingService for ServiceALabels {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            &self.nom
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _e: bool) {}
+        async fn authenticate(&mut self, _c: &Value) -> Result<AuthStatus, TuneError> {
+            Ok(AuthStatus::default())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::default()
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_label(
+            &self,
+            label_id: &str,
+            limit: usize,
+            offset: usize,
+        ) -> Result<LabelPage, TuneError> {
+            if !self.labels {
+                return Err(TuneError::Unsupported("labels not supported".into()));
+            }
+            Ok(LabelPage {
+                id: label_id.into(),
+                name: "ECM".into(),
+                image_url: Some("https://static.qobuz.test/l.jpg".into()),
+                total: 120,
+                offset,
+                limit,
+                albums: vec![album("a1", "Jan Garbarek", "20", 2002)],
+            })
+        }
+        async fn get_label_catalogue(
+            &self,
+            _label_id: &str,
+        ) -> Result<Vec<StreamAlbum>, TuneError> {
+            if !self.labels {
+                return Err(TuneError::Unsupported("labels not supported".into()));
+            }
+            self.lectures.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![
+                album("a1", "Jan Garbarek", "20", 1990),
+                album("a2", "Keith Jarrett", "1", 1975),
+                album("a3", "Jan  Garbarek", "20", 2002),
+                album("a4", "Various Artists", "99", 2010),
+            ])
+        }
+    }
+
+    async fn appel(service: ServiceALabels, chemin: &str) -> (StatusCode, Value) {
+        let backend: Arc<dyn DbBackend> =
+            Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(service));
+        let etat = StreamingHttpState::new(
+            backend,
+            Arc::new(Mutex::new(registre)),
+            Arc::new(EventBus::new()),
+        );
+        let app = Router::new().nest("/api/v1/streaming", router().with_state(etat));
+        let r = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/streaming{chemin}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let statut = r.status();
+        let octets = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let corps = serde_json::from_slice(&octets)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&octets).into_owned()));
+        (statut, corps)
+    }
+
+    fn service(nom: &str, labels: bool) -> (ServiceALabels, Arc<AtomicUsize>) {
+        let lectures = Arc::new(AtomicUsize::new(0));
+        (
+            ServiceALabels {
+                nom: nom.into(),
+                labels,
+                lectures: lectures.clone(),
+            },
+            lectures,
+        )
+    }
+
+    #[tokio::test]
+    async fn la_page_d_un_label_rend_ses_albums_et_de_quoi_paginer() {
+        let (s, _) = service("label-page-6934", true);
+        let (statut, v) = appel(s, "/label-page-6934/labels/1150?offset=50").await;
+        assert_eq!(statut, StatusCode::OK, "{v}");
+        assert_eq!(v["id"], "1150");
+        assert_eq!(v["name"], "ECM");
+        assert_eq!(v["image_url"], "https://static.qobuz.test/l.jpg");
+        assert_eq!(v["total"], 120);
+        assert_eq!(v["offset"], 50);
+        assert_eq!(v["limit"], LABEL_PAGE_MAX, "limit absent : la page entière");
+        assert_eq!(v["albums"][0]["source_id"], "a1");
+    }
+
+    #[tokio::test]
+    async fn la_taille_de_page_est_bornee() {
+        let (s, _) = service("label-borne-6934", true);
+        let (_, v) = appel(s, "/label-borne-6934/labels/1150?limit=5000").await;
+        assert_eq!(v["limit"], LABEL_PAGE_MAX);
+        let (s, _) = service("label-borne-6934", true);
+        let (_, v) = appel(s, "/label-borne-6934/labels/1150?limit=0").await;
+        assert_eq!(v["limit"], 1);
+    }
+
+    #[tokio::test]
+    async fn les_artistes_d_un_label_sont_regroupes_sans_les_collectifs() {
+        let (s, _) = service("label-artistes-6934", true);
+        let (statut, v) = appel(s, "/label-artistes-6934/labels/77/artists").await;
+        assert_eq!(statut, StatusCode::OK, "{v}");
+        assert_eq!(v["id"], "77");
+        let artistes = v["artists"].as_array().expect("une liste");
+        assert_eq!(artistes.len(), 2, "{v}");
+        assert_eq!(artistes[0]["name"], "Jan Garbarek");
+        assert_eq!(artistes[0]["album_count"], 2);
+        assert_eq!(artistes[0]["album_phare"]["id"], "a3", "le plus récent");
+        assert_eq!(artistes[1]["name"], "Keith Jarrett");
+    }
+
+    /// Chez Qobuz, le catalogue (dix pages au plus) passe par le cache de
+    /// #6782 : deux ouvertures de la page ne le relisent pas.
+    #[tokio::test]
+    async fn chez_qobuz_le_catalogue_du_label_n_est_lu_qu_une_fois() {
+        let (s, lectures) = service("qobuz", true);
+        let (statut, _) = appel(s, "/qobuz/labels/cache-6934-b209lbl/artists").await;
+        assert_eq!(statut, StatusCode::OK);
+        let (s2, lectures2) = service("qobuz", true);
+        let (statut, v) = appel(s2, "/qobuz/labels/cache-6934-b209lbl/artists").await;
+        assert_eq!(statut, StatusCode::OK);
+        assert_eq!(v["artists"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            lectures.load(Ordering::SeqCst) + lectures2.load(Ordering::SeqCst),
+            1,
+            "la seconde ouverture doit lire le cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_service_sans_labels_repond_501() {
+        let (s, _) = service("sans-label-6934", false);
+        let (statut, _) = appel(s, "/sans-label-6934/labels/1/artists").await;
+        assert_eq!(statut, StatusCode::NOT_IMPLEMENTED);
+        let (s, _) = service("sans-label-6934", false);
+        let (statut, _) = appel(s, "/sans-label-6934/labels/1").await;
+        assert_eq!(statut, StatusCode::NOT_IMPLEMENTED);
+    }
+}
+
+/// renesenses/tune-server-rust#7068 — l'échec d'une connexion rend un corps
+/// STRUCTURÉ pour un refus d'identifiants, et garde le texte brut pour le reste.
+///
+/// Contre-épreuve : faire rendre le texte brut au bras `Credentials` de
+/// `reponse_echec_auth` fait rougir `refus_d_identifiants_rend_un_code`.
+#[cfg(test)]
+mod tests_echec_de_connexion_7068 {
+    use super::*;
+
+    async fn corps(r: Response) -> (StatusCode, String) {
+        let statut = r.status();
+        let octets = axum::body::to_bytes(r.into_body(), 64 * 1024)
+            .await
+            .expect("corps lisible");
+        (statut, String::from_utf8_lossy(&octets).into_owned())
+    }
+
+    #[tokio::test]
+    async fn refus_d_identifiants_rend_un_code() {
+        let e = tune_core::TuneError::Credentials("qobuz login: invalid credentials".into());
+        let (statut, texte) = corps(reponse_echec_auth("qobuz", &e)).await;
+        // 400 comme avant : un 401 serait lu par le client comme une session perdue.
+        assert_eq!(statut, StatusCode::BAD_REQUEST);
+        let v: Value = serde_json::from_str(&texte).expect("le corps doit être du JSON structuré");
+        assert_eq!(v["code"], CODE_IDENTIFIANTS_REFUSES);
+        assert_eq!(v["service"], "qobuz");
+        assert!(!texte.contains("Invalid username"), "{texte}");
+    }
+
+    #[tokio::test]
+    async fn les_autres_echecs_gardent_leur_texte() {
+        let e = tune_core::TuneError::Other("qobuz login: 500 boom".into());
+        let (statut, texte) = corps(reponse_echec_auth("qobuz", &e)).await;
+        assert_eq!(statut, StatusCode::BAD_REQUEST);
+        assert_eq!(texte, "qobuz login: 500 boom");
+    }
+}

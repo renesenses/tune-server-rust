@@ -2,7 +2,7 @@ use super::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
-async fn status_from_peer(reply: &str) -> (OutputStatus, bool) {
+async fn status_from_peer(reply: &str) -> (Result<OutputStatus, String>, bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let reply = reply.to_owned();
@@ -26,8 +26,7 @@ async fn status_from_peer(reply: &str) -> (OutputStatus, bool) {
     );
     let status = tokio::time::timeout(std::time::Duration::from_secs(3), output.get_status())
         .await
-        .expect("Status query must terminate")
-        .expect("valid Status response");
+        .expect("Status query must terminate");
     server.await.unwrap();
     (status, output.etat_inconnu_dit.load(Ordering::Relaxed))
 }
@@ -43,6 +42,7 @@ async fn official_numeric_states_reach_the_output_contract() {
     ] {
         let reply = format!(r#"<Status state="{wire}" position="21.5" length="110" />"#);
         let (status, unknown) = status_from_peer(&reply).await;
+        let status = status.expect("état valide");
         assert_eq!(status.state, expected, "HQPlayer numeric state {wire}");
         assert!(
             !unknown,
@@ -62,6 +62,7 @@ async fn track_metadata_cannot_override_status_state() {
         r#"<Status state="0"><State>playing</State></Status>"#,
     ] {
         let (status, unknown) = status_from_peer(reply).await;
+        let status = status.expect("état valide");
         assert_eq!(status.state, TransportState::Stopped, "{reply}");
         assert!(!unknown);
     }
@@ -76,7 +77,12 @@ async fn absent_or_unknown_state_keeps_the_existing_diagnostic() {
         r#"<Status data-state="playing"/>"#,
     ] {
         let (status, unknown) = status_from_peer(reply).await;
-        assert_eq!(status.state, TransportState::Stopped, "{reply}");
+        assert!(
+            status
+                .expect_err("un état inconnu ne doit jamais devenir Stopped")
+                .contains("hqplayer_status_etat_inconnu"),
+            "{reply}"
+        );
         assert!(
             unknown,
             "missing/unknown Status.state must remain observable: {reply}"
@@ -104,6 +110,7 @@ async fn textual_status_forms_remain_supported() {
         ),
     ] {
         let (status, unknown) = status_from_peer(reply).await;
+        let status = status.expect("état valide");
         assert_eq!(status.state, expected, "{reply}");
         assert!(!unknown);
     }
@@ -117,4 +124,43 @@ fn a_state_after_a_closed_status_is_not_its_child() {
     ] {
         assert_eq!(etat_reconnu(xml), None, "{xml}");
     }
+}
+
+#[tokio::test]
+async fn unknown_status_does_not_poison_the_next_valid_poll_6515() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (read, mut write) = socket.into_split();
+        let mut lines = BufReader::new(read).lines();
+        for reply in [
+            r#"<Status state="99"/>"#,
+            r#"<Status state="2" position="12.5"/>"#,
+        ] {
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.contains("<Status") {
+                    break;
+                }
+            }
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let output = HqplayerOutput::new(
+        "test-6515".into(),
+        "Fake HQPlayer".into(),
+        "127.0.0.1".into(),
+        port,
+    );
+    assert!(output.get_status().await.is_err());
+    let recovered = tokio::time::timeout(std::time::Duration::from_secs(3), output.get_status())
+        .await
+        .expect("la sonde doit reprendre")
+        .expect("état reconnu après l'inconnu");
+    assert_eq!(recovered.state, TransportState::Playing);
+    assert_eq!(recovered.position_ms, 12_500);
+    server.await.unwrap();
 }

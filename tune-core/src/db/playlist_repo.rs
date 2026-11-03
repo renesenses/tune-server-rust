@@ -93,11 +93,25 @@ pub mod sql {
         )
     }
 
-    pub fn delete_track_at_position<D: SqlDialect>(d: &D) -> String {
+    /// Efface UNE ligne par son identifiant (`playlist_tracks.id`), et
+    /// seulement si elle appartient à la playlist désignée (#6687). Le retrait
+    /// ne compare plus jamais la colonne `position` : elle cesse d'être
+    /// `0..n-1` dès qu'un ajout à position explicite crée deux lignes de même
+    /// position, et le client, lui, désigne un RANG.
+    pub fn delete_entry<D: SqlDialect>(d: &D) -> String {
         format!(
-            "DELETE FROM playlist_tracks WHERE playlist_id = {} AND position = {}",
+            "DELETE FROM playlist_tracks WHERE id = {} AND playlist_id = {}",
             d.placeholder(1),
             d.placeholder(2)
+        )
+    }
+
+    /// Les identifiants des lignes dans l'ordre d'affichage (`position, id`),
+    /// pour le recompactage qui suit un retrait (#6687).
+    pub fn entry_ids_in_order<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, position FROM playlist_tracks WHERE playlist_id = {} ORDER BY position, id",
+            d.placeholder(1)
         )
     }
 
@@ -462,7 +476,7 @@ impl PlaylistRepo {
     ) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 3] = [&name, &description, &profile_id];
-        Ok(self.db.execute_returning_id(&sql, &params)?)
+        self.db.execute_returning_id(&sql, &params)
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Playlist>, String> {
@@ -472,7 +486,7 @@ impl PlaylistRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_playlist))
+            .map(|cols| row_to_playlist(cols)))
     }
 
     /// Read a playlist **only if it belongs to `profile_id`**.
@@ -489,7 +503,7 @@ impl PlaylistRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_playlist))
+            .map(|cols| row_to_playlist(cols)))
     }
 
     /// Les listes du profil, dans l'ordre alphabétique du serveur média
@@ -502,7 +516,7 @@ impl PlaylistRepo {
         let sql = self.dialect_sql(sql::list, sql::list);
         let params: [&dyn ToSqlValue; 1] = [&profile_id];
         let rows = self.db.query_many(&sql, &params)?;
-        let mut listes: Vec<Playlist> = rows.iter().map(row_to_playlist).collect();
+        let mut listes: Vec<Playlist> = rows.iter().map(|cols| row_to_playlist(cols)).collect();
         listes.sort_by_cached_key(|l| (crate::upnp_server::cle_alphabetique(&l.name), l.id));
         Ok(super::ordre_alphabetique::tranche(listes, limit, offset))
     }
@@ -689,29 +703,111 @@ impl PlaylistRepo {
         Ok((new_id, to_add))
     }
 
+    /// Retire les lignes de RANGS `rangs` — les indices de
+    /// [`get_entries`](Self::get_entries), ceux que le client affiche — en UNE
+    /// transaction : les rangs sont lus, les lignes effacées par leur `id`,
+    /// puis les positions recompactées `0..n-1` (#6687).
+    ///
+    /// Tout ou rien : un rang hors bornes (liste périmée côté client) n'efface
+    /// RIEN et la fonction rend `0` ; effacer quand même les autres rangs
+    /// viserait des lignes que le client n'a pas désignées. Un rang répété ne
+    /// compte qu'une fois. Rend le nombre de lignes RÉELLEMENT effacées.
     pub fn remove_tracks_at_positions(
         &self,
         playlist_id: i64,
         positions: &[i64],
     ) -> Result<usize, String> {
-        let delete_sql =
-            self.dialect_sql(sql::delete_track_at_position, sql::delete_track_at_position);
+        let entries_sql = self.dialect_sql(sql::get_entries, sql::get_entries);
+        let delete_sql = self.dialect_sql(sql::delete_entry, sql::delete_entry);
+        let ordre_sql = self.dialect_sql(sql::entry_ids_in_order, sql::entry_ids_in_order);
+        let set_sql = self.dialect_sql(sql::set_entry_position, sql::set_entry_position);
         let mut removed = 0usize;
         let removed_ref = &mut removed;
         self.db.write_tx(&mut |tx| {
-            for pos in positions {
-                let p: [&dyn ToSqlValue; 2] = [&playlist_id, pos];
-                *removed_ref += tx.execute(&delete_sql, &p)?;
+            *removed_ref = 0;
+            let ep: [&dyn ToSqlValue; 1] = [&playlist_id];
+            let lignes: Vec<PlaylistEntry> = tx
+                .query_many(&entries_sql, &ep)?
+                .iter()
+                .filter_map(|cols| row_to_entry(cols))
+                .collect();
+            let mut ids = Vec::with_capacity(positions.len());
+            for &rang in positions {
+                match usize::try_from(rang).ok().and_then(|r| lignes.get(r)) {
+                    Some(l) if !ids.contains(&l.id) => ids.push(l.id),
+                    Some(_) => {}
+                    None => return Ok(()),
+                }
             }
+            let mut effacees = 0usize;
+            for id in &ids {
+                let p: [&dyn ToSqlValue; 2] = [id, &playlist_id];
+                effacees += tx.execute(&delete_sql, &p)?;
+            }
+            if effacees > 0 {
+                Self::recompacter(tx, &ordre_sql, &set_sql, playlist_id)?;
+            }
+            *removed_ref = effacees;
             Ok(())
         })?;
         Ok(removed)
     }
 
-    pub fn remove_track(&self, playlist_id: i64, position: i64) -> Result<(), String> {
-        let sql = self.dialect_sql(sql::delete_track_at_position, sql::delete_track_at_position);
-        let params: [&dyn ToSqlValue; 2] = [&playlist_id, &position];
-        self.db.execute(&sql, &params)?;
+    /// Retire la ligne de RANG `position` (#6687) — l'indice de
+    /// [`get_entries`](Self::get_entries), plus jamais la colonne `position`.
+    /// Rend `false` quand rien n'a été effacé (rang hors bornes) : l'appelant
+    /// ne doit pas le lire comme un succès.
+    pub fn remove_track(&self, playlist_id: i64, position: i64) -> Result<bool, String> {
+        Ok(self.remove_tracks_at_positions(playlist_id, &[position])? > 0)
+    }
+
+    /// Retire la ligne d'identifiant `entry_id` (`playlist_tracks.id`, rendu
+    /// en `entry_id` par `GET /playlists/{id}/tracks`), puis recompacte les
+    /// positions, en UNE transaction (#6687). C'est la seule désignation sûre
+    /// quand deux retraits se croisent : un rang calculé sur une liste
+    /// périmée vise la ligne d'à côté, un identifiant jamais.
+    ///
+    /// Rend `false` quand rien n'a été effacé : identifiant inconnu, ou ligne
+    /// d'une AUTRE playlist (le `WHERE` porte les deux).
+    pub fn remove_entry(&self, playlist_id: i64, entry_id: i64) -> Result<bool, String> {
+        let delete_sql = self.dialect_sql(sql::delete_entry, sql::delete_entry);
+        let ordre_sql = self.dialect_sql(sql::entry_ids_in_order, sql::entry_ids_in_order);
+        let set_sql = self.dialect_sql(sql::set_entry_position, sql::set_entry_position);
+        let mut efface = false;
+        let efface_ref = &mut efface;
+        self.db.write_tx(&mut |tx| {
+            let p: [&dyn ToSqlValue; 2] = [&entry_id, &playlist_id];
+            *efface_ref = tx.execute(&delete_sql, &p)? > 0;
+            if *efface_ref {
+                Self::recompacter(tx, &ordre_sql, &set_sql, playlist_id)?;
+            }
+            Ok(())
+        })?;
+        Ok(efface)
+    }
+
+    /// Rend les positions contiguës `0..n-1`, dans l'ordre d'affichage
+    /// (`position, id`), dans la transaction en cours (#6687). Seules les
+    /// lignes dont la position change sont réécrites.
+    fn recompacter(
+        tx: &dyn super::backend::DbTxHandle,
+        ordre_sql: &str,
+        set_sql: &str,
+        playlist_id: i64,
+    ) -> Result<(), String> {
+        let p: [&dyn ToSqlValue; 1] = [&playlist_id];
+        let lignes = tx.query_many(ordre_sql, &p)?;
+        for (rang, cols) in lignes.iter().enumerate() {
+            let Some(id) = cols.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let rang = rang as i64;
+            if cols.get(1).and_then(|v| v.as_i64()) == Some(rang) {
+                continue;
+            }
+            let sp: [&dyn ToSqlValue; 3] = [&rang, &id, &playlist_id];
+            tx.execute(set_sql, &sp)?;
+        }
         Ok(())
     }
 
@@ -870,7 +966,7 @@ impl PlaylistRepo {
         let sql = self.dialect_sql(sql::get_entries, sql::get_entries);
         let params: [&dyn ToSqlValue; 1] = [&playlist_id];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().filter_map(row_to_entry).collect())
+        Ok(rows.iter().filter_map(|cols| row_to_entry(cols)).collect())
     }
 
     /// La playlist porte-t-elle au moins un titre de service ?
@@ -1073,7 +1169,7 @@ struct SqlDInsertion {
 /// INTROUVABLE de #6179 ; `None` pour une ligne de service à moitié remplie
 /// (le CHECK l'interdit, mais une base passée par un autre chemin ne doit pas
 /// faire tomber toute la liste pour une ligne).
-fn row_to_entry(cols: &Vec<SqlValue>) -> Option<PlaylistEntry> {
+fn row_to_entry(cols: &[SqlValue]) -> Option<PlaylistEntry> {
     let id = cols.first().and_then(|v| v.as_i64())?;
     let position = cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
     let texte = |i: usize| cols.get(i).and_then(|v| v.as_string());
@@ -1109,7 +1205,7 @@ fn row_to_entry(cols: &Vec<SqlValue>) -> Option<PlaylistEntry> {
     })
 }
 
-fn row_to_playlist(cols: &Vec<SqlValue>) -> Playlist {
+fn row_to_playlist(cols: &[SqlValue]) -> Playlist {
     Playlist {
         id: cols.first().and_then(|v| v.as_i64()),
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
@@ -1658,6 +1754,180 @@ mod tests {
             vec![ids[1], ids[2]],
             "pas de doublon de la piste de remplacement"
         );
+    }
+
+    // --- #6687 : retirer par rang et par identifiant de ligne -----------
+
+    /// `n` pistes locales nommées `A`, `B`, `C`… dans une playlist neuve.
+    /// Rend l'id de la playlist et les `tracks.id` dans l'ordre.
+    fn lettres(n: usize) -> (PlaylistRepo, i64, Vec<i64>) {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+        let ids: Vec<i64> = (0..n)
+            .map(|i| {
+                let nom = ((b'A' + i as u8) as char).to_string();
+                let mut t = TrackModel::new(nom.clone());
+                t.file_path = Some(format!("/6687/{nom}.flac"));
+                track_repo.create(&t).unwrap()
+            })
+            .collect();
+        let plid = repo.create("Lettres", None, 1).unwrap();
+        repo.add_tracks(plid, &ids, None).unwrap();
+        (repo, plid, ids)
+    }
+
+    /// Les positions STOCKÉES, dans l'ordre d'affichage.
+    fn positions(repo: &PlaylistRepo, plid: i64) -> Vec<i64> {
+        repo.get_entries(plid)
+            .unwrap()
+            .iter()
+            .map(|e| e.position)
+            .collect()
+    }
+
+    fn contigues(repo: &PlaylistRepo, plid: i64) {
+        let p = positions(repo, plid);
+        assert_eq!(
+            p,
+            (0..p.len() as i64).collect::<Vec<_>>(),
+            "#6687 — positions non contiguës après un retrait : {p:?}"
+        );
+    }
+
+    /// A B C D : retirer le rang 1, puis encore le rang 1 → A D. Avant
+    /// #6687, le second retrait effaçait `position = 1`, qui n'existait plus :
+    /// rien ne partait.
+    #[test]
+    fn deux_retraits_successifs_au_meme_rang_retirent_deux_lignes_6687() {
+        let (repo, plid, ids) = lettres(4);
+        assert!(repo.remove_track(plid, 1).unwrap(), "B doit partir");
+        contigues(&repo, plid);
+        assert!(repo.remove_track(plid, 1).unwrap(), "C doit partir");
+        contigues(&repo, plid);
+        assert_eq!(
+            repo.get_track_ids(plid).unwrap(),
+            vec![ids[0], ids[3]],
+            "#6687 — après deux retraits au rang 1 il doit rester A D"
+        );
+    }
+
+    /// A B C D E : retirer le rang 1 (B), puis le rang 2 (D) → A C E. Avant
+    /// #6687, le second retrait effaçait `position = 2`, c'est-à-dire C : la
+    /// MAUVAISE piste partait.
+    #[test]
+    fn retirer_rang_1_puis_rang_2_retire_la_ligne_affichee_6687() {
+        let (repo, plid, ids) = lettres(5);
+        assert!(repo.remove_track(plid, 1).unwrap());
+        contigues(&repo, plid);
+        assert!(repo.remove_track(plid, 2).unwrap());
+        contigues(&repo, plid);
+        assert_eq!(
+            repo.get_track_ids(plid).unwrap(),
+            vec![ids[0], ids[2], ids[4]],
+            "#6687 — il doit rester A C E (et pas A D E)"
+        );
+    }
+
+    /// Le lot `remove_tracks_at_positions` lit des RANGS lui aussi, et
+    /// recompacte : sur A B C D E, retirer [1] puis [1, 2] → A E.
+    #[test]
+    fn le_lot_retire_des_rangs_et_recompacte_6687() {
+        let (repo, plid, ids) = lettres(5);
+        assert_eq!(repo.remove_tracks_at_positions(plid, &[1]).unwrap(), 1);
+        contigues(&repo, plid);
+        assert_eq!(repo.remove_tracks_at_positions(plid, &[1, 2]).unwrap(), 2);
+        contigues(&repo, plid);
+        assert_eq!(repo.get_track_ids(plid).unwrap(), vec![ids[0], ids[4]]);
+    }
+
+    /// Des positions déjà trouées (deux lignes de même position après un
+    /// ajout à position explicite) : le rang reste celui de l'affichage.
+    #[test]
+    fn un_rang_designe_la_ligne_affichee_meme_sur_des_positions_trouees_6687() {
+        let (repo, plid, ids) = lettres(3);
+        // D inséré à la position 1 : deux lignes portent `position = 1`
+        // (B et D), l'ordre d'affichage les départage par `id`.
+        let mut d = TrackModel::new("D".into());
+        d.file_path = Some("/6687/D-bis.flac".into());
+        let did = crate::db::track_repo::TrackRepo::with_backend(repo.db.clone())
+            .create(&d)
+            .unwrap();
+        repo.add_tracks(plid, &[did], Some(1)).unwrap();
+        assert_eq!(positions(&repo, plid), vec![0, 1, 1, 2]);
+        // Affiché : A B D C. Le rang 2 est D.
+        assert!(repo.remove_track(plid, 2).unwrap());
+        contigues(&repo, plid);
+        assert_eq!(
+            repo.get_track_ids(plid).unwrap(),
+            vec![ids[0], ids[1], ids[2]]
+        );
+    }
+
+    /// Rang hors bornes, rang négatif, lot dont un rang est hors bornes :
+    /// RIEN n'est effacé, et la fonction le dit.
+    #[test]
+    fn un_rang_hors_bornes_n_efface_rien_et_le_dit_6687() {
+        let (repo, plid, ids) = lettres(3);
+        assert!(!repo.remove_track(plid, 3).unwrap());
+        assert!(!repo.remove_track(plid, -1).unwrap());
+        assert_eq!(repo.remove_tracks_at_positions(plid, &[0, 7]).unwrap(), 0);
+        assert_eq!(
+            repo.get_track_ids(plid).unwrap(),
+            ids,
+            "rien ne doit partir"
+        );
+    }
+
+    /// Playlist mixte — locale, titre de service, ligne introuvable — : la
+    /// ligne de service se retire par son identifiant de ligne, les autres
+    /// restent, les positions se recompactent.
+    #[test]
+    fn retirer_par_entry_id_une_ligne_de_service_dans_une_playlist_mixte_6687() {
+        let (repo, plid, ids) = lettres(2);
+        repo.add_entries_deduped(
+            plid,
+            &[
+                EntryContent::Service(titre("qobuz", "q-6687", "Qobuz")),
+                EntryContent::Missing(MissingEntry {
+                    title: Some("Disparue".into()),
+                    file_path: Some("/6687/disparue.flac".into()),
+                    ..Default::default()
+                }),
+            ],
+            None,
+        )
+        .unwrap();
+        // Une ligne retirée d'abord, pour que les positions soient trouées
+        // si rien ne recompacte.
+        assert!(repo.remove_track(plid, 0).unwrap());
+        let lignes = repo.get_entries(plid).unwrap();
+        let service = lignes
+            .iter()
+            .find(|l| l.service().is_some())
+            .expect("la ligne de service")
+            .id;
+        assert!(repo.remove_entry(plid, service).unwrap());
+        contigues(&repo, plid);
+        assert_eq!(
+            sortes(&repo, plid),
+            vec![format!("L{}", ids[1]), "?Disparue".to_string()]
+        );
+        // Une seconde fois : la ligne n'existe plus, rien n'est effacé.
+        assert!(!repo.remove_entry(plid, service).unwrap());
+    }
+
+    /// Un `entry_id` d'une AUTRE playlist n'efface rien, ni dans l'une ni
+    /// dans l'autre.
+    #[test]
+    fn un_entry_id_d_une_autre_playlist_n_efface_rien_6687() {
+        let (repo, plid, ids) = lettres(2);
+        let autre = repo.create("Autre", None, 1).unwrap();
+        repo.add_tracks(autre, &[ids[0]], None).unwrap();
+        let etrangere = repo.get_entries(autre).unwrap()[0].id;
+        assert!(!repo.remove_entry(plid, etrangere).unwrap());
+        assert_eq!(repo.get_track_ids(plid).unwrap(), ids);
+        assert_eq!(repo.get_track_ids(autre).unwrap(), vec![ids[0]]);
     }
 
     // --- #4889 : titres de service dans une playlist Tune ---------------

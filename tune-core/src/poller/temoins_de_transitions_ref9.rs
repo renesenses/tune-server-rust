@@ -114,6 +114,7 @@ fn entree_stopped(ps: &ZonePollState, o: &Observation) -> StoppedInput {
         avance_audio_couvre_l_arret: o.avance_audio_couvre_l_arret,
         horloge_de_piste_couvre_l_arret: o.horloge_de_piste_couvre_l_arret,
         dlna_dsd_reached_end: o.dlna_dsd_reached_end,
+        position_avance: false,
     }
 }
 
@@ -128,6 +129,7 @@ fn appliquer_stopped(ps: &mut ZonePollState, issue: StoppedOutcome) -> (bool, bo
             ps.playing_stall_ticks = 0;
         }
         SuppressSeekGrace | SuppressLoadGrace => ps.stopped_ticks = 0, // :1475, :1483
+        SuppressPositionAdvancing => ps.stopped_ticks = 0,             // #6717
         SuppressCooldown => {
             // tick.rs:1492-1493
             ps.gapless_cooldown -= 1;

@@ -161,11 +161,14 @@ async fn lire_zone(State(state): State<AppState>, Path(id): Path<i64>) -> Json<V
 async fn ecrire_zone(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(corps): Json<Value>,
 ) -> Response {
     // Greffon facultatif (gratuit) : écrire exige qu'il soit installé et
     // activé, comme l'égaliseur (`PUT /zones/{id}/dsp`).
-    if let Err(r) = crate::premium_audio_plugins::require_installed(&state, rc::ID_GREFFON) {
+    if let Err(r) =
+        crate::premium_audio_plugins::require_installed(&state, rc::ID_GREFFON, &headers)
+    {
         return r;
     }
     let reglage = match valider(corps) {
@@ -208,11 +211,14 @@ async fn lire_album(State(state): State<AppState>, Path(id): Path<i64>) -> Json<
 async fn ecrire_album(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(corps): Json<Value>,
 ) -> Response {
     // Greffon facultatif (gratuit) : écrire exige qu'il soit installé et
     // activé, comme l'égaliseur (`PUT /zones/{id}/dsp`).
-    if let Err(r) = crate::premium_audio_plugins::require_installed(&state, rc::ID_GREFFON) {
+    if let Err(r) =
+        crate::premium_audio_plugins::require_installed(&state, rc::ID_GREFFON, &headers)
+    {
         return r;
     }
     let reglage = match valider(corps) {
@@ -324,7 +330,13 @@ mod tests {
         assert!(!matrice_posee().await, "rien de posé avant la règle");
 
         let corps = serde_json::to_value(rc::prereglage("swap_lr").unwrap()).unwrap();
-        let reponse = ecrire_album(State(state.clone()), Path(7), Json(corps)).await;
+        let reponse = ecrire_album(
+            State(state.clone()),
+            Path(7),
+            axum::http::HeaderMap::new(),
+            Json(corps),
+        )
+        .await;
         assert_eq!(reponse.status(), StatusCode::OK);
         let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
             .await

@@ -179,15 +179,20 @@ pub fn bloc_listes(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat
 }
 
 /// Favoris du profil 1 — vocabulaire FERMÉ, aucun marqueur.
-pub fn bloc_favoris(_ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
-    any_of(
-        valeurs
-            .iter()
-            .filter_map(|k| favorite_condition(k))
-            .map(str::to_string)
-            .collect(),
-    )
-    .map(|c| (c, Vec::new()))
+///
+/// #7569 — `profil` est le profil de la REQUÊTE (`X-Profile-Id`), pas un 1
+/// gravé : c'est ce qui fait que le filtre « favoris » d'une liste lit les
+/// mêmes favoris que la vue Favoris du même profil.
+pub fn bloc_favoris(profil: i64) -> impl Fn(&mut Placeholders, &[String]) -> Option<Predicat> {
+    move |_ph, valeurs| {
+        any_of(
+            valeurs
+                .iter()
+                .filter_map(|k| favorite_condition(k, profil))
+                .collect(),
+        )
+        .map(|c| (c, Vec::new()))
+    }
 }
 
 /// Étiquette manquante — vocabulaire FERMÉ, aucun marqueur.
@@ -206,54 +211,83 @@ pub fn bloc_sans_etiquette(
     }
 }
 
-/// Les champs que compare le TEXTE LIBRE d'Oxygen (#5192), dans l'ordre du
-/// prédicat de [`condition_texte_libre`] — et, mot pour mot, ceux que le
-/// client web compare dans sa fenêtre chargée (`OxygenView.svelte`) : le
-/// titre, l'artiste, l'album, le label, les termes de chemin
-/// (`path_terms`, que `/library/tracks` rend calculés, voir
-/// [`crate::library::full_text_search::termes_de_chemin`]) et le compositeur
-/// de la piste (fil 1684 : « Ravel » trouve le Boléro joué par un orchestre).
+/// Les champs que compare le TEXTE LIBRE d'Oxygen et de la Bibliothèque
+/// (#5192), dans l'ordre du prédicat de [`condition_texte_libre`] : UN
+/// marqueur par entrée, et ce pour CHAQUE mot de la saisie (#4319).
+///
+/// Les six premiers sont, mot pour mot, ceux que le client web compare dans
+/// sa fenêtre chargée (`OxygenView.svelte`) : le titre, l'artiste, l'album,
+/// le label, les termes de chemin (`path_terms`, que `/library/tracks` rend
+/// calculés, voir [`crate::library::full_text_search::termes_de_chemin`]) et
+/// le compositeur de la piste (fil 1684 : « Ravel » trouve le Boléro joué par
+/// un orchestre).
+///
+/// #4319 (Tades, fils 1817 et 2264 : « mahler mehta » ne trouvait pas la
+/// Symphonie n° 3 dirigée par Zubin Mehta) y ajoute l'ARTISTE DE L'ALBUM et le
+/// CHEF D'ORCHESTRE. Le chef n'a pas de colonne : il vit dans trois magasins,
+/// chacun son marqueur — l'étiquette de fichier (`track_metadata`, clé
+/// `conductor`, écrite par le scan), les crédits de la piste
+/// (`track_credits`, rôle `conductor` : TPE3 des DSF, MusicBrainz, Qobuz) et
+/// la fiche d'album (`album_metadata`, clé `conductor`).
 ///
 /// Avant #5192, le serveur ne comparait que le titre et l'artiste, le
 /// navigateur les quatre premiers : les deux ne rendaient pas la même liste.
-pub const CHAMPS_DU_TEXTE_LIBRE: [&str; 6] = [
+pub const CHAMPS_DU_TEXTE_LIBRE: [&str; 10] = [
     "title",
     "artist_name",
     "album_title",
     "label",
     "path_terms",
     "composer",
+    "album_artist",
+    "conductor",
+    "conductor_credit",
+    "album_conductor",
 ];
 
-/// Le prédicat du texte libre d'Oxygen, pour la piste d'alias `t` : sous-
-/// chaîne, insensible à la casse et aux accents, de l'un des
-/// [`CHAMPS_DU_TEXTE_LIBRE`].
+/// Les mots du texte libre (#4319) : la saisie, doubles guillemets ôtés
+/// (`motif_like`), découpée aux blancs. Une saisie sans mot n'en rend aucun.
+pub fn mots_du_texte_libre(query: &str) -> Vec<String> {
+    query
+        .replace('"', "")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Le prédicat du texte libre d'Oxygen et de la Bibliothèque, pour la piste
+/// d'alias `t`.
+///
+/// 🔴 #4319 — CHAQUE MOT de la saisie doit se trouver, en sous-chaîne
+/// insensible à la casse et aux accents, dans AU MOINS UN des
+/// [`CHAMPS_DU_TEXTE_LIBRE`] : ET entre les mots, OU entre les champs. Avant,
+/// la saisie entière était cherchée d'un seul tenant, dans un seul champ :
+/// « mahler mehta » ne trouvait que l'album dont UN champ contenait les deux
+/// mots accolés, jamais celui où « Mahler » est dans le titre et « Mehta »
+/// chef d'orchestre. Une saisie d'un seul mot se comporte comme avant ; une
+/// saisie qu'un champ contenait d'un seul tenant est encore trouvée (chacun
+/// de ses mots y est). Le découpage ne fait donc qu'élargir.
 ///
 /// UNE rédaction pour les trois jumeaux — la liste (`list_filtered`), le
 /// tirage par répertoire (`random_ids_in_folder`) et les effectifs du rail
-/// (`facets::build_conditions`) — qui en tenaient chacun une copie. L'artiste
-/// et l'album passent par sous-requête : le compteur du rail n'a aucune
-/// jointure.
+/// (`facets::build_conditions`, donc `albums-detailed`) — qui en tenaient
+/// chacun une copie. L'artiste, l'album, l'artiste de l'album et le chef
+/// passent par sous-requête NON corrélée : le compteur du rail n'a aucune
+/// jointure, et chaque sous-requête n'est évaluée qu'une fois.
 ///
-/// La saisie est LITTÉRALE : ses `%` et `_` sont échappés, comme le navigateur
-/// qui fait un `includes`. Les doubles guillemets sont ôtés (`motif_like`).
-/// Rend le prédicat et les valeurs à lier, dans l'ordre des marqueurs.
+/// Chaque mot est LITTÉRAL : ses `%` et `_` sont échappés, comme le
+/// navigateur qui fait un `includes`. Rend le prédicat et les valeurs à lier,
+/// dans l'ordre des marqueurs : `CHAMPS_DU_TEXTE_LIBRE.len()` par mot.
 pub fn condition_texte_libre(
     ph: &mut Placeholders,
     query: &str,
 ) -> (String, Vec<super::backend::SqlValue>) {
-    let motif = format!(
-        "%{}%",
-        super::track_repo::echapper_jokers_like(query.replace('"', "").trim())
-    );
+    let mots = mots_du_texte_libre(query);
+    if mots.is_empty() {
+        // Comme l'ancien motif `%%` : rien n'est exclu.
+        return ("1=1".to_string(), Vec::new());
+    }
     let esc = super::track_repo::like_escape_clause();
-    let like = |ph: &mut Placeholders| format!("LIKE LOWER(unaccent({})){esc}", ph.take());
-    let titre = like(ph);
-    let artiste = like(ph);
-    let album = like(ph);
-    let label = like(ph);
-    let chemin = like(ph);
-    let compositeur = like(ph);
     // Jamais l'expression pure ici : ~60 µs par piste, et ce prédicat
     // parcourt la bibliothèque entière. SQLite : la fonction Rust enregistrée.
     let termes = match ph.engine() {
@@ -263,18 +297,55 @@ pub fn condition_texte_libre(
         // PostgreSQL : la colonne calculée et stockée (migration 076).
         Engine::Postgres => "t.path_terms".to_string(),
     };
-    let sql = format!(
-        "(LOWER(unaccent(t.title)) {titre} \
-         OR t.artist_id IN (SELECT id FROM artists WHERE LOWER(unaccent(name)) {artiste}) \
-         OR t.album_id IN (SELECT id FROM albums WHERE LOWER(unaccent(title)) {album}) \
-         OR LOWER(unaccent(t.label)) {label} \
-         OR LOWER(unaccent({termes})) {chemin} \
-         OR LOWER(unaccent(t.composer)) {compositeur})"
-    );
-    let valeurs = (0..CHAMPS_DU_TEXTE_LIBRE.len())
-        .map(|_| super::backend::SqlValue::Text(motif.clone()))
-        .collect();
-    (sql, valeurs)
+    // Les identifiants de piste des magasins ouverts : `track_credits.track_id`
+    // est du TEXTE sur un miroir PostgreSQL copié depuis SQLite, un BIGINT sur
+    // une base neuve (voir `track_id_pour_track_credits`). Les deux côtés sont
+    // projetés en texte sur PostgreSQL, ce qui tient dans les deux cas.
+    let (piste, magasin_piste, album, magasin_album) = match ph.engine() {
+        Engine::Sqlite => ("t.id", "track_id", "t.album_id", "album_id"),
+        Engine::Postgres => (
+            "CAST(t.id AS TEXT)",
+            "CAST(track_id AS TEXT)",
+            "CAST(t.album_id AS TEXT)",
+            "CAST(album_id AS TEXT)",
+        ),
+    };
+    let mut clauses = Vec::with_capacity(mots.len());
+    let mut valeurs = Vec::with_capacity(mots.len() * CHAMPS_DU_TEXTE_LIBRE.len());
+    for mot in &mots {
+        let like = |ph: &mut Placeholders| format!("LIKE LOWER(unaccent({})){esc}", ph.take());
+        let titre = like(ph);
+        let artiste = like(ph);
+        let titre_album = like(ph);
+        let label = like(ph);
+        let chemin = like(ph);
+        let compositeur = like(ph);
+        let artiste_album = like(ph);
+        let chef = like(ph);
+        let chef_credit = like(ph);
+        let chef_album = like(ph);
+        clauses.push(format!(
+            "(LOWER(unaccent(t.title)) {titre} \
+             OR t.artist_id IN (SELECT id FROM artists WHERE LOWER(unaccent(name)) {artiste}) \
+             OR t.album_id IN (SELECT id FROM albums WHERE LOWER(unaccent(title)) {titre_album}) \
+             OR LOWER(unaccent(t.label)) {label} \
+             OR LOWER(unaccent({termes})) {chemin} \
+             OR LOWER(unaccent(t.composer)) {compositeur} \
+             OR t.album_id IN (SELECT al.id FROM albums al JOIN artists ar ON ar.id = al.artist_id \
+                WHERE LOWER(unaccent(ar.name)) {artiste_album}) \
+             OR {piste} IN (SELECT {magasin_piste} FROM track_metadata \
+                WHERE key = 'conductor' AND LOWER(unaccent(value)) {chef}) \
+             OR {piste} IN (SELECT {magasin_piste} FROM track_credits \
+                WHERE LOWER(role) = 'conductor' AND LOWER(unaccent(artist_name)) {chef_credit}) \
+             OR {album} IN (SELECT {magasin_album} FROM album_metadata \
+                WHERE key = 'conductor' AND LOWER(unaccent(value)) {chef_album}))"
+        ));
+        let motif = format!("%{}%", super::track_repo::echapper_jokers_like(mot));
+        valeurs.extend(
+            (0..CHAMPS_DU_TEXTE_LIBRE.len()).map(|_| super::backend::SqlValue::Text(motif.clone())),
+        );
+    }
+    (format!("({})", clauses.join(" AND ")), valeurs)
 }
 
 /// Générateur de marqueurs positionnels, partagé par les DEUX constructeurs de
@@ -477,23 +548,39 @@ pub fn normalize_ints(values: &[i64]) -> Vec<i64> {
     out
 }
 
-/// Prédicat « cette piste est en favori » pour le profil 1. Vocabulaire FERMÉ :
+/// Prédicat « la note de l'album est parmi `c` » pour le profil `profil`
+/// (#7594). `c` est le fragment `arr.rating IN (...)` déjà construit avec ses
+/// marqueurs ; le numéro de profil est un entier, jamais du texte. Un profil
+/// non positif retombe sur le profil 1, comme [`favorite_condition`].
+pub fn rating_condition(c: &str, profil: i64) -> String {
+    let profil = if profil > 0 { profil } else { 1 };
+    format!(
+        "EXISTS (SELECT 1 FROM album_ratings arr \
+         WHERE arr.album_id = t.album_id AND arr.profile_id = {profil} AND {c})"
+    )
+}
+
+/// Prédicat « cette piste est en favori » pour le profil `profil` (un profil
+/// non positif — filtre construit sans requête — retombe sur le profil 1, le
+/// profil par défaut). Le numéro est un entier, jamais du texte : il s'écrit
+/// dans le SQL sans ouvrir de porte à l'injection. Vocabulaire FERMÉ :
 /// toute autre valeur ne filtre RIEN plutôt que de tout exclure.
 ///
 /// Vit ici, et non dans chacun des deux constructeurs de prédicats, parce que
 /// c'est exactement le genre de littéral qu'on recopie une fois de trop : une
 /// facette qui compterait autrement que la liste qu'elle filtre serait pire
 /// qu'une facette absente.
-pub fn favorite_condition(kind: &str) -> Option<&'static str> {
+pub fn favorite_condition(kind: &str, profil: i64) -> Option<String> {
+    let profil = if profil > 0 { profil } else { 1 };
     match kind {
-        "album" => Some(
-            "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-             AND f.item_type = 'album' AND f.item_id = t.album_id)",
-        ),
-        "track" => Some(
-            "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-             AND f.item_type = 'track' AND f.item_id = t.id)",
-        ),
+        "album" => Some(format!(
+            "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = {profil} \
+             AND f.item_type = 'album' AND f.item_id = t.album_id)"
+        )),
+        "track" => Some(format!(
+            "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = {profil} \
+             AND f.item_type = 'track' AND f.item_id = t.id)"
+        )),
         _ => None,
     }
 }
@@ -602,6 +689,107 @@ pub fn dr_album_in(engine: Engine, having: &str) -> String {
           WHERE {} GROUP BY tdr.album_id HAVING {having})",
         dr_tag_where(engine)
     )
+}
+
+/// #2144 (rc10) — le DR de chaque album porteur d'un tag DR, sous le jeton de
+/// la base qui l'a rendu ([`super::backend::DbBackend::jeton_des_donnees`]).
+/// Une seule entrée : une base par serveur ; l'instance fait partie du jeton.
+type DrEnCache = Option<(
+    (u64, i64),
+    std::sync::Arc<std::collections::HashMap<i64, i64>>,
+)>;
+static DR_PAR_ALBUM_EN_CACHE: std::sync::Mutex<DrEnCache> = std::sync::Mutex::new(None);
+
+/// Le DR de chaque album porteur d'un tag DR : la table dérivée
+/// [`dr_album_source`], la MÊME règle que la grille, la liste et la fiche —
+/// lue seule, une ligne par album, et gardée en mémoire tant que le jeton des
+/// données ne change pas (il change à CHAQUE écriture validée). Le rail
+/// (`facets::dr_facet`) et la liste filtrée ([`condition_dr_par_albums`])
+/// partagent cette lecture.
+///
+/// `Err` : la lecture a échoué, rien n'est gardé, la suivante réessaiera.
+pub fn dr_par_album(
+    db: &dyn super::backend::DbBackend,
+) -> Result<std::sync::Arc<std::collections::HashMap<i64, i64>>, String> {
+    // Le jeton est lu AVANT la lecture : une écriture validée entre les deux
+    // change le jeton suivant, et la carte gardée ici n'est alors plus jamais
+    // servie. L'ordre inverse pourrait garder une carte ancienne sous un
+    // jeton neuf.
+    let jeton = db.jeton_des_donnees();
+    if let Some(j) = jeton
+        && let Ok(cache) = DR_PAR_ALBUM_EN_CACHE.lock()
+        && let Some((garde, carte)) = cache.as_ref()
+        && *garde == j
+    {
+        return Ok(carte.clone());
+    }
+    let sql = format!(
+        "SELECT dr.album_id, dr.dr FROM ({}) dr",
+        dr_album_source(db.engine())
+    );
+    let carte: std::sync::Arc<std::collections::HashMap<i64, i64>> = std::sync::Arc::new(
+        db.query_many(&sql, &[])?
+            .into_iter()
+            .filter_map(|row| {
+                let mut it = row.into_iter();
+                Some((it.next()?.as_i64()?, it.next()?.as_i64()?))
+            })
+            .collect(),
+    );
+    if let Some(j) = jeton
+        && let Ok(mut cache) = DR_PAR_ALBUM_EN_CACHE.lock()
+    {
+        *cache = Some((j, carte.clone()));
+    }
+    Ok(carte)
+}
+
+/// Prédicat « l'album de CETTE piste porte l'un des DR `drs` » — alias `t`,
+/// le même ensemble que [`dr_album_in`] sur `DR_ALBUM_VALUE IN (drs)`, mais
+/// posé en liste d'albums déjà résolue (#7580).
+///
+/// # Pourquoi
+///
+/// [`dr_album_in`] est une sous-requête NON corrélée : SQLite l'évalue une
+/// fois par requête — mais elle relit À CHAQUE FOIS toutes les lignes DR de
+/// `track_metadata`, les regroupe par album et calcule leur DR (75 ms au banc
+/// de 103 500 pistes, la moitié de la page). La vue Oxygen la payait à
+/// chaque page de la liste, et deux fois par page sur le chemin
+/// `list_filtered` (le compte, puis la page). La carte de [`dr_par_album`]
+/// est gardée sous le jeton des données : la sous-requête n'est plus jouée
+/// qu'une fois entre deux écritures, et la liste cherche ses pistes par
+/// l'index de l'album.
+///
+/// Mêmes pistes rendues : un album est dans la liste si et seulement si la
+/// sous-requête l'aurait rendu (même table dérivée, même valeur ; un album
+/// NUL n'y est dans aucun des deux cas). Aucun album ne porte ces DR : `1 = 0`.
+///
+/// `None` : la carte n'a pas pu être lue ; l'appelant pose [`dr_album_in`],
+/// plus lent, jamais faux.
+pub fn condition_dr_par_albums(db: &dyn super::backend::DbBackend, drs: &[i64]) -> Option<String> {
+    let carte = match dr_par_album(db) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "filtre_dr_carte_non_lue");
+            return None;
+        }
+    };
+    let mut albums: Vec<i64> = carte
+        .iter()
+        .filter(|(_, dr)| drs.contains(dr))
+        .map(|(album, _)| *album)
+        .collect();
+    if albums.is_empty() {
+        return Some("1 = 0".to_string());
+    }
+    // Trié : le même texte pour la même sélection, d'une requête à l'autre.
+    albums.sort_unstable();
+    let liste = albums
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("t.album_id IN ({liste})"))
 }
 
 /// Prédicat « cet album n'est PAS masqué » (#1391), pour les requêtes
@@ -1034,8 +1222,11 @@ pub struct TrackFilter {
     /// modèle n'ont jamais été relevées, et un découpage inventé ici
     /// survivrait dans le contrat HTTP à la mesure qui le contredirait.
     pub dynamic_ranges: Vec<i64>,
-    /// `track` et/ou `album` (profil 1).
+    /// `track` et/ou `album`, pour le profil [`TrackFilter::profile_id`].
     pub favorites: Vec<String>,
+    /// Le profil de la requête (#7569) : celui dont `favorites` lit les
+    /// favoris. `0` (le défaut) = profil 1.
+    pub profile_id: i64,
     pub playlists: Vec<String>,
     /// `genre`, `year`, `artist`, `album` ou `cover`.
     pub untagged: Vec<String>,
@@ -1115,7 +1306,7 @@ impl TrackFilter {
             || !self.dynamic_ranges.is_empty()
             // Vocabulaires FERMÉS : une valeur inconnue ne produit aucun
             // prédicat, donc elle ne doit pas non plus activer le chemin filtré.
-            || self.favorites.iter().any(|k| favorite_condition(k).is_some())
+            || self.favorites.iter().any(|k| favorite_condition(k, 1).is_some())
             || !self.playlists.is_empty()
             || self.untagged.iter().any(|k| untagged_condition(k).is_some())
             || self.folder.as_deref().is_some_and(|s| !s.is_empty())
@@ -1335,14 +1526,14 @@ mod tests {
     #[test]
     fn les_vocabulaires_fermes_refusent_tout_le_reste() {
         for k in ["track", "album"] {
-            assert!(favorite_condition(k).is_some(), "{k}");
+            assert!(favorite_condition(k, 1).is_some(), "{k}");
         }
         for f in ["artist", "album", "genre", "year", "cover"] {
             assert!(untagged_condition(f).is_some(), "{f}");
         }
         for hostile in ["", "id", "t.genre", "1=1", "genre; DROP TABLE tracks--"] {
             assert!(untagged_condition(hostile).is_none(), "{hostile:?}");
-            assert!(favorite_condition(hostile).is_none(), "{hostile:?}");
+            assert!(favorite_condition(hostile, 1).is_none(), "{hostile:?}");
         }
     }
 
@@ -1448,16 +1639,17 @@ mod tests {
     }
     /// Fil 1684 — le prédicat du texte libre compare le compositeur, en
     /// SIXIÈME position, avec le même repli de casse et d'accents et le même
-    /// échappement que les cinq autres ; et il demande exactement autant de
+    /// échappement que les autres ; et il demande exactement autant de
     /// marqueurs qu'il rend de valeurs, sur les DEUX moteurs (piège n°2).
+    /// Un seul mot ici : le découpage en mots (#4319) a son propre témoin.
     #[test]
     fn le_texte_libre_compare_le_compositeur_sur_les_deux_moteurs() {
-        assert_eq!(CHAMPS_DU_TEXTE_LIBRE.len(), 6);
+        assert_eq!(CHAMPS_DU_TEXTE_LIBRE.len(), 10);
         assert_eq!(CHAMPS_DU_TEXTE_LIBRE[5], "composer");
         let esc = super::super::track_repo::like_escape_clause();
         for engine in [Engine::Sqlite, Engine::Postgres] {
             let mut ph = Placeholders::resuming_at(engine, 3);
-            let (sql, valeurs) = condition_texte_libre(&mut ph, "Ravél 50%");
+            let (sql, valeurs) = condition_texte_libre(&mut ph, "Ravél50%");
             assert_eq!(valeurs.len(), CHAMPS_DU_TEXTE_LIBRE.len(), "{engine:?}");
             assert_eq!(
                 ph.next_index(),
@@ -1475,13 +1667,13 @@ mod tests {
             };
             assert!(
                 sql.contains(&format!(
-                    "OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({sixieme})){esc})"
+                    "OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({sixieme})){esc} OR"
                 )),
-                "{engine:?} : le compositeur, sixième et dernier : {sql}"
+                "{engine:?} : le compositeur, sixième : {sql}"
             );
             let motif = format!(
                 "%{}%",
-                super::super::track_repo::echapper_jokers_like("Ravél 50%")
+                super::super::track_repo::echapper_jokers_like("Ravél50%")
             );
             for v in &valeurs {
                 assert!(
@@ -1492,3 +1684,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "texte_libre_mots_4319_tests.rs"]
+pub(crate) mod texte_libre_mots_4319_tests;

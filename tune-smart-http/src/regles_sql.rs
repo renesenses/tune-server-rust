@@ -67,6 +67,36 @@ const fn nombre(sql: &'static str) -> Colonne {
 pub(crate) const SQL_VERSION_DE_LA_PISTE: &str =
     "(SELECT tmv.value FROM track_metadata tmv WHERE tmv.track_id = t.id AND tmv.key = 'version')";
 
+/// #6232 (forum 2218) — l'INTERPRÈTE d'une piste : la balise ARTIST du
+/// fichier (`track_metadata['track_artist']`, écrite au scan), à défaut
+/// l'artiste de la piste en base (`t.artist_id`).
+///
+/// Pourquoi la balise : sur un album ordinaire, le scan donne à chaque piste
+/// l'artiste de l'ALBUM. « The Beatles & Genesis » écrit sur une piste d'un
+/// album des Beatles n'était donc lisible nulle part, et aucune règle ne
+/// trouvait Genesis.
+///
+/// Pourquoi le repli : une piste lue avant cette clé n'a pas la balise en
+/// base. Son artiste est alors l'interprète connu — celui de l'album pour un
+/// album ordinaire, celui de la piste pour une compilation.
+///
+/// 🔴 Une piste dont l'artiste a été CORRIGÉ dans Tune (champ tenu,
+/// `champs_tenus`, où `artist_id` / `artist_name` ne sont écrits que s'ils
+/// sont tenus) lit la base, pas la balise : la correction l'emporte sur le
+/// fichier, comme partout ailleurs.
+///
+/// Sous-requêtes corrélées sur la clé primaire `(track_id, key)` et sur
+/// `artists.id` ; alias `t` imposé. Partagée par les playlists et les
+/// collections.
+pub(crate) const SQL_INTERPRETE_DE_LA_PISTE: &str = "COALESCE(\
+     CASE WHEN EXISTS (SELECT 1 FROM track_metadata tmh WHERE tmh.track_id = t.id \
+       AND tmh.key = 'champs_tenus' \
+       AND (tmh.value LIKE '%\"artist_id\"%' OR tmh.value LIKE '%\"artist_name\"%')) \
+     THEN NULL \
+     ELSE NULLIF((SELECT tmi.value FROM track_metadata tmi WHERE tmi.track_id = t.id \
+       AND tmi.key = 'track_artist'), '') END, \
+     (SELECT tai.name FROM artists tai WHERE tai.id = t.artist_id))";
+
 /// Le vocabulaire des PISTES (playlists intelligentes).
 ///
 /// Les alias sont délibérés : l'éditeur web écrit `artist`, d'anciennes
@@ -85,6 +115,10 @@ pub(crate) fn colonne_piste(champ: &str) -> Option<Colonne> {
             "COALESCE(NULLIF(t.album_artist, ''), \
              (SELECT aal.name FROM artists aal WHERE aal.id = al.artist_id))",
         ),
+        // #6232 — « Interprète » : la balise ARTIST de la piste, distincte de
+        // « Artiste » (`ar.name`, l'artiste rangé en base, qui est celui de
+        // l'album sur un album ordinaire).
+        "track_artist" => texte(SQL_INTERPRETE_DE_LA_PISTE),
         "genre" => texte("t.genre"),
         // 🔴 Le champ que l'éditeur proposait et que le moteur ignorait
         // ENTIÈREMENT : neuf opérateurs, aucun bras.
@@ -600,6 +634,33 @@ pub(crate) fn condition_note(
 
 /// La condition à poser quand rien ne se traduit : FAUX.
 pub(crate) const FAUX: &str = "1 = 0";
+
+/// #6285 — « Verdict hi-res » : le verdict PUBLIÉ de l'album
+/// (`de_l_album`, collections, colonne `al.id`) ou de la piste (playlists,
+/// colonne `t.id`), `verifie`, `conforme`, `douteux` ou `non_analyse`.
+/// « Douteux » suit le réglage de la liste des albums : masqué, il ne retient
+/// rien et « non analysé » le retient (`faux_hires_publie`). `None` : un
+/// opérateur ou un verdict que le moteur ne connaît pas.
+pub(crate) fn condition_verdict_hires(
+    id: &str,
+    de_l_album: bool,
+    op: &str,
+    valeur: &str,
+    douteux_visible: bool,
+) -> Option<String> {
+    use tune_core::audio::faux_hires_publie::{VerdictPublie, predicat_album, predicat_piste};
+    let verdict = VerdictPublie::lire(valeur)?;
+    let p = if de_l_album {
+        predicat_album(id, verdict, douteux_visible)
+    } else {
+        predicat_piste(id, verdict, douteux_visible)
+    };
+    match op {
+        "=" => Some(p),
+        "!=" => Some(format!("NOT ({p})")),
+        _ => None,
+    }
+}
 
 /// #5530 — « Généré par IA » sur une ligne de la BIBLIOTHÈQUE.
 ///

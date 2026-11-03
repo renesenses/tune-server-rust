@@ -4,7 +4,10 @@ pub mod alac_encoder;
 pub mod analyzer;
 pub mod ape;
 pub mod audiophile;
+pub mod audit_integrite;
 pub mod autoeq;
+/// #6388 — la base AutoEq en ligne : index, recherche, copie locale.
+pub mod autoeq_base;
 pub mod canaux_declares;
 pub mod canaux_reseau_4573;
 
@@ -65,9 +68,17 @@ pub mod encoder;
 pub mod eq;
 pub mod eq_presets;
 pub mod faststart;
+/// Faux hi-res : bits effectifs et coupure spectrale (#6285).
+pub mod faux_hires;
+/// La passe de fond des faux hi-res (#6285).
+pub mod faux_hires_passe;
+/// Le verdict des faux hi-res tel qu'il se publie : liste, filtre, règles (#6285).
+pub mod faux_hires_publie;
 /// Mémoire du volume d'avant l'armement du mode bit-perfect (#2395).
 pub mod fixed_volume;
 pub mod flac_vendeur;
+/// #6353 — flux Dolby d'un Matroska, reconnus sans décodage.
+pub mod flux_dolby;
 /// #2211 — le réglage de fondu d'une zone et la consigne de chaque frontière
 /// (même album, live, DSD) que l'orchestrateur remet à la sortie locale.
 pub mod fondu_de_zone;
@@ -76,6 +87,8 @@ pub mod fondu_de_zone;
 /// de sortie n'est touché : c'est tout le sujet du ticket.
 pub mod fondu_enchaine;
 pub mod formats;
+/// #6721 — garde générale contre les montées brusques du volume.
+pub mod garde_de_hausse;
 pub mod http_range;
 pub mod image_cdda;
 /// #5299 — les fichiers audio d'une image ISO de données, lus sans la monter.
@@ -111,8 +124,10 @@ pub mod pipeline;
 /// #6044 — le greffon « Réaffectation des canaux » : réglage par zone et par
 /// album, résolution de la règle qui s'applique à une piste.
 pub mod reaffectation_canaux;
+pub mod reglages_de_volume;
 pub mod replaygain;
 pub mod repli_dsd_4354;
+pub mod reprise_nouveau_flux;
 pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]
@@ -127,10 +142,15 @@ pub mod soft_mute;
 pub mod staged_growth;
 pub mod support;
 pub mod tap;
+pub mod tempo;
 /// CLAP text tower for natural-language acoustic search (Phase 3).
 #[cfg(feature = "audio-embedding")]
 pub mod text_embedding;
 pub mod thermal;
+/// #6918 — le volume en dB d'une sortie qui règle son volume en décibels.
+pub mod volume_appareil_db;
+/// #6541 — limites de sécurité et de confort du volume d'une zone.
+pub mod volume_limites;
 /// Conversion volume linéaire ↔ décibels — le seul endroit (#1274).
 pub mod volume_scale;
 pub mod wav;

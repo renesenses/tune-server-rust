@@ -28,6 +28,7 @@ fn peripherique_publie(
         max_channels: 2,
         sample_rates: vec![44_100, 48_000],
         sample_rates_measured: false,
+        availability: None,
         backend: "Wasapi".to_string(),
         hardware_detail: hardware_detail_from_description(description, raw_name, endpoint_id),
     }
@@ -220,6 +221,7 @@ fn l_identite_qui_bascule_emporte_le_renseignement_materiel() {
         max_channels: 32,
         sample_rates: vec![44_100, 384_000],
         sample_rates_measured: false,
+        availability: None,
         backend: "Alsa".into(),
         hardware_detail: Some("greffon".into()),
     };
@@ -252,6 +254,7 @@ fn l_identite_qui_bascule_emporte_le_renseignement_materiel() {
         max_channels: 2,
         sample_rates: vec![44_100, 48_000],
         sample_rates_measured: true,
+        availability: None,
         backend: "Alsa".into(),
         hardware_detail: Some("Eversolo DAC-Z8".into()),
     };

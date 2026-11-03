@@ -201,7 +201,7 @@ pub fn depuis_une_description(service: &str, description: &Value) -> Option<Valu
 }
 
 /// Ce qu'une référence lue du cloud dit d'elle-même, pour la résolution.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Reference {
     pub title: String,
     pub artist_name: String,

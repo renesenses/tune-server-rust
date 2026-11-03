@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 use super::canaux_de_carte_6171::{CanauxDeCarte, Dispersion, PlanDeCanaux, remplir_le_tampon};
 use super::local::{NativePcmRing, RingBuf};
 use super::silence_avant_liberation_6133::{
-    BORNE_SILENCE_AVANT_LIBERATION, SilenceAvantLiberation,
+    BORNE_SILENCE_AVANT_LIBERATION, SilenceAvantLiberation, remplir_le_bloc_dsd_natif,
 };
 use super::traits::RingStarvation;
 
@@ -285,6 +285,63 @@ impl AsioExclusiveOutput {
         paused: Arc<AtomicBool>,
         canaux_de_carte: Option<&CanauxDeCarte>,
     ) -> Result<Self, String> {
+        Self::ouvrir_le_pilote(
+            device_name,
+            sample_rate,
+            bit_depth,
+            channels,
+            starvation,
+            volume,
+            paused,
+            canaux_de_carte,
+            false,
+        )
+    }
+
+    /// #6230 — ouvrir sur les voies qu'une grille de réaffectation PILOTE
+    /// (6 → 2), et non sur les canaux de la source. Même ouverture que
+    /// [`Self::new`], avec une garde de plus, AVANT toute négociation : si le
+    /// pilote déclare moins de sorties que de voies demandées, ou si leur
+    /// nombre est illisible, l'ouverture est refusée
+    /// ([`super::local::voies_pilotees_permises`]). Jamais plus de voies que
+    /// la sortie n'en déclare ; l'appelant rouvre alors au format de la
+    /// source, comme avant.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_sur_voies_pilotees(
+        device_name: &str,
+        sample_rate: u32,
+        bit_depth: u32,
+        voies: u32,
+        starvation: Arc<RingStarvation>,
+        volume: Arc<AtomicU32>,
+        paused: Arc<AtomicBool>,
+        canaux_de_carte: Option<&CanauxDeCarte>,
+    ) -> Result<Self, String> {
+        Self::ouvrir_le_pilote(
+            device_name,
+            sample_rate,
+            bit_depth,
+            voies,
+            starvation,
+            volume,
+            paused,
+            canaux_de_carte,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ouvrir_le_pilote(
+        device_name: &str,
+        sample_rate: u32,
+        bit_depth: u32,
+        channels: u32,
+        starvation: Arc<RingStarvation>,
+        volume: Arc<AtomicU32>,
+        paused: Arc<AtomicBool>,
+        canaux_de_carte: Option<&CanauxDeCarte>,
+        plafonner_aux_voies_declarees: bool,
+    ) -> Result<Self, String> {
         // Serialize device access process-wide BEFORE touching the driver: if
         // the previous exclusive session is still tearing down, block here
         // until its Drop releases the device (recovering from a poisoned lock
@@ -323,6 +380,29 @@ impl AsioExclusiveOutput {
             .description()
             .map(|d| d.name().to_string())
             .unwrap_or_else(|_| device_name.to_string());
+
+        // #6230 — des voies pilotées par une grille ne dépassent JAMAIS les
+        // sorties que le pilote déclare (`driver.channels().outs`, que cpal
+        // rend comme canaux de la configuration par défaut).
+        if plafonner_aux_voies_declarees {
+            let declarees = device
+                .default_output_config()
+                .ok()
+                .map(|c| u32::from(c.channels()));
+            if !super::local::voies_pilotees_permises(channels, declarees) {
+                info!(
+                    device = %resolved_name,
+                    voies = channels,
+                    voies_declarees = ?declarees,
+                    "asio_exclusive_voies_pilotees_refusees"
+                );
+                return Err(format!(
+                    "{resolved_name} déclare {} sortie(s) : la grille en demande {channels}",
+                    declarees
+                        .map_or_else(|| "un nombre illisible de".to_string(), |n| n.to_string())
+                ));
+            }
+        }
 
         // -- 3. Read the device's current sample rate (if we can) -----------
         let original_sample_rate = device
@@ -1065,7 +1145,7 @@ pub fn sonder_cadences_dsd(device_name: &str) -> Option<Vec<u32>> {
         let host = cpal::host_from_id(cpal::HostId::Asio).ok()?;
         let device = resoudre_peripherique_asio(&host, device_name).ok()?;
         match device.as_inner() {
-            cpal::platform::DeviceInner::Asio(asio) => Some(asio.dsd_output_rates()),
+            cpal::platform::DeviceInner::Asio(asio) => asio.try_dsd_output_rates(),
             #[allow(unreachable_patterns)]
             _ => Some(Vec::new()),
         }
@@ -1092,6 +1172,9 @@ pub struct AsioDsdNatifOutput {
     stream: Option<cpal::Stream>,
     anneau: Arc<crate::audio::dsd_brut::AnneauDsd>,
     counters: Arc<RealtimeCounters>,
+    /// #6133 — le silence armé avant la libération, comme le chemin PCM : sans
+    /// lui, le pilote rejouait le dernier bloc DSD en boucle après l'arrêt.
+    silence: Arc<SilenceAvantLiberation>,
     /// Déclaré en DERNIER : rendu après le flux et après le délai de relâche.
     #[allow(dead_code)]
     device_guard: MutexGuard<'static, ()>,
@@ -1141,13 +1224,16 @@ impl AsioDsdNatifOutput {
         let anneau_rappel = anneau.clone();
         let compteurs_rappel = counters.clone();
         let erreurs = counters.clone();
+        let silence = Arc::new(SilenceAvantLiberation::default());
+        let silence_rappel = silence.clone();
         let stream = device
             .build_output_stream_raw(
                 &config,
                 SampleFormat::DsdU8,
                 move |data: &mut cpal::Data, _: &cpal::OutputCallbackInfo| {
-                    let famine = crate::audio::dsd_brut::remplir_tampon_dsd(
+                    let famine = remplir_le_bloc_dsd_natif(
                         &anneau_rappel,
+                        &silence_rappel,
                         paused.load(Ordering::Relaxed),
                         data.bytes_mut(),
                     );
@@ -1171,6 +1257,7 @@ impl AsioDsdNatifOutput {
             stream: Some(stream),
             anneau,
             counters,
+            silence,
             device_guard,
         })
     }
@@ -1211,12 +1298,29 @@ impl AsioDsdNatifOutput {
 impl Drop for AsioDsdNatifOutput {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.take() {
-            if let Err(e) = stream.pause() {
-                warn!(error = %e, "asio_dsd_natif_pause_failed");
+            // #6133 — taire AVANT de mettre en pause, comme `release()` du
+            // chemin PCM : au `pause()`, cpal ne réécrit plus le double tampon
+            // et le pilote rejoue ce qu'il contient jusqu'à `ASIOStop`. Le
+            // silence DSD (0x69) y est écrit d'abord.
+            let confirme = self
+                .silence
+                .taire_puis_liberer(BORNE_SILENCE_AVANT_LIBERATION, || {
+                    if let Err(e) = stream.pause() {
+                        warn!(error = %e, "asio_dsd_natif_pause_failed");
+                    }
+                    // `cpal::Stream::drop` libère les tampons DSD et remet le pilote
+                    // en PCM (`kAsioSetIoFormat`).
+                    drop(stream);
+                });
+            if !confirme {
+                warn!(
+                    device = %self.device_name,
+                    blocs_muets = self.silence.blocs_muets(),
+                    borne_ms = BORNE_SILENCE_AVANT_LIBERATION.as_millis() as u64,
+                    "asio_dsd_natif_silence_avant_liberation_non_confirme — le pilote n'a pas \
+                     rappelé assez tôt : le double tampon peut encore contenir du DSD"
+                );
             }
-            // `cpal::Stream::drop` libère les tampons DSD et remet le pilote
-            // en PCM (`kAsioSetIoFormat`).
-            drop(stream);
         }
         info!(
             device = %self.device_name,

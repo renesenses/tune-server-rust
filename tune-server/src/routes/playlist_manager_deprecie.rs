@@ -158,8 +158,14 @@ async fn delete_link(State(state): State<AppState>, Path(id): Path<i64>) -> impl
 async fn sync_link(
     State(state): State<AppState>,
     profile: ActiveProfile,
+    headers: axum::http::HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
+    // La synchronisation d'un lien relève du même droit que les liens du
+    // greffon et que le transfert : refus commun, avant toute lecture.
+    if let Err(refus) = super::refus_premium_du_transfert(&state, &headers).await {
+        return refus;
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut links = load_json_setting(&settings, "playlist_links");
 

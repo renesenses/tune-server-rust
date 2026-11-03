@@ -50,6 +50,9 @@ pub(crate) enum Famille {
     /// Un marquage du SERVICE, oui ou non, sans valeur à saisir — #5530,
     /// « généré par IA » (Qobuz).
     Marquage,
+    /// #6285 — un verdict hi-res choisi dans une liste fermée : `verifie`,
+    /// `conforme`, `douteux`, `non_analyse`.
+    VerdictHiRes,
 }
 
 impl Famille {
@@ -81,6 +84,7 @@ impl Famille {
             // « non » d'abord : c'est la règle demandée (« pas d'IA »), et
             // l'éditeur part sur le premier opérateur.
             Famille::Marquage => &["is_false", "is_true"],
+            Famille::VerdictHiRes => &["=", "!="],
         }
     }
 }
@@ -128,6 +132,11 @@ pub(crate) const CRITERES: &[Critere] = &[
     // playlist, il lit l'interprète de la PISTE — c'est là que les deux
     // critères diffèrent.
     deux("album_artist", Famille::Texte),
+    // #6232 (forum 2218) — « Interprète » : la balise ARTIST de la PISTE, à
+    // défaut l'artiste de la piste en base. Dans une collection, un album
+    // passe dès qu'une de ses pistes passe : c'est ce que « Artiste » (artiste
+    // de l'album) ne savait pas faire.
+    deux("track_artist", Famille::Texte),
     deux("genre", Famille::Texte),
     deux("composer", Famille::Texte),
     deux("label", Famille::Texte),
@@ -170,6 +179,9 @@ pub(crate) const CRITERES: &[Critere] = &[
     // la piste. Seuls les contenus de SERVICE le portent : une piste de la
     // bibliothèque n'est jamais marquée.
     deux("ai_generated", Famille::Marquage),
+    // #6285 — « Verdict hi-res » : celui du badge de l'album dans une
+    // collection, celui de la piste dans une playlist (`hires_verifications`).
+    deux("hires_verdict", Famille::VerdictHiRes),
     // --- Propres aux PISTES ---
     Critere {
         collection: None,
@@ -186,6 +198,59 @@ pub(crate) const CRITERES: &[Critere] = &[
 /// Les SEULS critères qui n'existent qu'à un niveau. Les nommer ici est une
 /// décision, qui se lit dans la revue.
 pub(crate) const PROPRES_AUX_PISTES: &[&str] = &["title", "comments"];
+
+impl Famille {
+    /// Le nom de la famille, dans les mots du client (`TypeChamp` de
+    /// `smartRegles.ts`), pour un lecteur hors de cette caisse.
+    pub(crate) const fn nom(self) -> &'static str {
+        match self {
+            Famille::Texte => "text",
+            Famille::Nombre => "int",
+            Famille::Source => "source",
+            Famille::Repertoire => "folder",
+            Famille::Vide => "nullable",
+            Famille::Horodatage => "timestamp",
+            Famille::Compte => "count",
+            Famille::Credit => "credit",
+            Famille::RefCollection => "collection_ref",
+            Famille::RefPlaylist => "playlist_ref",
+            Famille::Favori => "favorite",
+            Famille::Etiquette => "tag_ref",
+            Famille::Marquage => "marquage",
+            Famille::VerdictHiRes => "hires_verdict",
+        }
+    }
+}
+
+/// Un critère tel qu'un lecteur EXTÉRIEUR le voit — le greffon « Assistant
+/// IA » (chantier assistant-ia, étape 1) en tire le schéma qu'il impose au
+/// modèle et la liste contre laquelle il valide sa réponse. Lire LE tableau
+/// au lieu d'en recopier un : une règle que le moteur ne connaît pas ne peut
+/// pas être proposée, et un critère ajouté ici l'est aussi là-bas.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CritereExpose {
+    /// Le nom dans une règle de COLLECTION, `None` s'il n'y existe pas.
+    pub collection: Option<&'static str>,
+    /// Le nom dans une règle de PLAYLIST, `None` s'il n'y existe pas.
+    pub piste: Option<&'static str>,
+    /// La famille, dans les mots du client (`text`, `int`, `timestamp`…).
+    pub famille: &'static str,
+    /// Les opérateurs que le moteur traduit pour cette famille.
+    pub operateurs: &'static [&'static str],
+}
+
+/// Tous les critères, dans l'ordre du client.
+pub fn criteres_exposes() -> Vec<CritereExpose> {
+    CRITERES
+        .iter()
+        .map(|c| CritereExpose {
+            collection: c.collection,
+            piste: c.piste,
+            famille: c.famille.nom(),
+            operateurs: c.famille.operateurs(),
+        })
+        .collect()
+}
 
 // « Note » (`rating`) a été la seule entrée d'une liste `CASSES` : les deux
 // moteurs compilaient `t.rating`, colonne absente, et l'aperçu rendait une
@@ -220,6 +285,7 @@ pub(crate) mod tests {
             (Famille::Favori, _) => json!("track"),
             (Famille::Etiquette, _) => json!("7"),
             (Famille::Marquage, _) => Value::Null,
+            (Famille::VerdictHiRes, _) => json!("verifie"),
             (Famille::Texte | Famille::Vide, _) => json!("x"),
         }
     }
@@ -613,19 +679,120 @@ pub(crate) mod tests {
         );
     }
 
-    /// Le compte du client : trente-trois définitions, dont trente et une aux
+    /// Le compte du client : trente-cinq définitions, dont trente-trois aux
     /// collections (#5530 : « Généré par IA » ; #6123 : « Note de la piste » ;
     /// #6121 : « Artiste de l'album » ; #6124 : « Année de sortie originale »
-    /// et « Version »). Si ce nombre bouge, `smartRegles.ts` doit bouger
-    /// aussi.
+    /// et « Version » ; #6232 : « Interprète » ; #6285 : « Verdict hi-res »,
+    /// que `smartRegles.ts` n'a pas encore). Si ce nombre bouge,
+    /// `smartRegles.ts` doit bouger aussi.
     #[test]
     fn le_tableau_a_la_taille_de_celui_du_client() {
-        assert_eq!(CRITERES.len(), 33);
+        assert_eq!(CRITERES.len(), 35);
         assert_eq!(
             CRITERES.iter().filter(|c| c.collection.is_some()).count(),
-            31
+            33
         );
     }
+    // ---------------------------------------------------------------------
+    // #6232 — « Interprète » (forum 2218).
+    // ---------------------------------------------------------------------
+
+    /// Le cas de Didier : sur l'album ordinaire 1 (Miles Davis), la piste 2
+    /// porte la balise ARTIST « Miles Davis & Genesis ». En base, son artiste
+    /// reste celui de l'album (le scan l'y met), et la balise vit dans
+    /// `track_metadata['track_artist']`. Les autres pistes n'ont pas la clé :
+    /// leur artiste en base répond.
+    fn avec_un_invite() -> SqliteDb {
+        let db = bibliotheque();
+        db.execute_batch(
+            "INSERT INTO track_metadata (track_id, key, value) VALUES \
+               (2,'track_artist','Miles Davis & Genesis');",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn l_interprete_d_une_piste_amene_son_album_6232() {
+        let db = avec_un_invite();
+        assert_eq!(
+            albums(&db, &regle("track_artist", "contains", json!("genesis"))),
+            vec![1]
+        );
+        // « Artiste » (l'artiste de l'album) ne la voit toujours pas : les
+        // deux critères sont distincts.
+        assert!(albums(&db, &regle("artist_name", "contains", json!("genesis"))).is_empty());
+        assert!(albums(&db, &regle("album_artist", "contains", json!("genesis"))).is_empty());
+        // Sans balise en base : l'artiste de la piste répond.
+        assert_eq!(
+            albums(&db, &regle("track_artist", "=", json!("john coltrane"))),
+            vec![2]
+        );
+        assert_eq!(
+            albums(&db, &regle("track_artist", "starts_with", json!("Miles"))),
+            vec![1]
+        );
+        // « ne contient pas » : AUCUNE piste de l'album ne contient.
+        assert_eq!(
+            albums(
+                &db,
+                &regle("track_artist", "not_contains", json!("genesis"))
+            ),
+            vec![2, 3]
+        );
+        assert!(albums(&db, &regle("track_artist", "is_null", Value::Null)).is_empty());
+    }
+
+    #[test]
+    fn l_interprete_dans_une_playlist_6232() {
+        let db = avec_un_invite();
+        assert_eq!(
+            pistes(&db, &regle("track_artist", "contains", json!("Genesis"))),
+            vec![2]
+        );
+        // « Artiste » d'une playlist lit l'artiste rangé en base : la piste
+        // n'y répond pas, c'est le défaut du fil 2218.
+        assert!(pistes(&db, &regle("artist", "contains", json!("Genesis"))).is_empty());
+        assert_eq!(
+            pistes(&db, &regle("track_artist", "=", json!("Miles Davis"))),
+            vec![1]
+        );
+        assert_eq!(
+            pistes(&db, &regle("track_artist", "!=", json!("Miles Davis"))),
+            vec![2, 3, 4]
+        );
+    }
+
+    /// Un artiste CORRIGÉ dans Tune (champ tenu) l'emporte sur la balise du
+    /// fichier, que l'écriture dans les fichiers, désactivée par défaut, ne
+    /// change pas.
+    #[test]
+    fn un_artiste_tenu_l_emporte_sur_la_balise_6232() {
+        let db = avec_un_invite();
+        db.execute_batch(
+            "INSERT INTO track_metadata (track_id, key, value) VALUES \
+               (2,'champs_tenus','{\"chemin\":\"/m/jazz/2.flac\",\"artist_id\":1,\"artist_name\":\"Miles Davis\"}');",
+        )
+        .unwrap();
+        assert!(albums(&db, &regle("track_artist", "contains", json!("genesis"))).is_empty());
+        assert!(pistes(&db, &regle("track_artist", "contains", json!("genesis"))).is_empty());
+        assert_eq!(
+            pistes(&db, &regle("track_artist", "=", json!("Miles Davis"))),
+            vec![1, 2]
+        );
+        // Une tenue qui ne porte PAS l'artiste (le titre seul) laisse la
+        // balise répondre.
+        db.execute_batch(
+            "UPDATE track_metadata SET value = '{\"chemin\":\"/m/jazz/2.flac\",\"title\":\"So What\"}' \
+             WHERE track_id = 2 AND key = 'champs_tenus';",
+        )
+        .unwrap();
+        assert_eq!(
+            pistes(&db, &regle("track_artist", "contains", json!("genesis"))),
+            vec![2]
+        );
+    }
+
     // ---------------------------------------------------------------------
     // #6124 — « Année de sortie originale » et « Version ».
     // ---------------------------------------------------------------------
@@ -1130,3 +1297,7 @@ mod anciennes_regles {
         assert_eq!(vus, 16, "le gel ne porte plus ses seize jeux de règles");
     }
 }
+
+#[cfg(test)]
+#[path = "criteres_hires_6285_tests.rs"]
+mod hires_6285;

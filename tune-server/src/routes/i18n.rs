@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 
 use crate::state::AppState;
 
-const SUPPORTED_LOCALES: &[&str] = &["en", "fr", "de", "es", "it", "zh", "ko", "ja"];
+const SUPPORTED_LOCALES: &[&str] = &[
+    "en", "fr", "de", "es", "it", "zh", "ko", "ja", "ro", "sv", "hu", "vi", "nb", "pl", "el",
+];
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -79,7 +81,7 @@ fn parse_accept_language(header: &str) -> String {
                 (part, 1.0)
             };
             // Normalize: "fr-FR" -> "fr"
-            let normalized = lang.split('-').next().unwrap_or(lang).to_lowercase();
+            let normalized = crate::i18n::base_tag(lang);
             if normalized.is_empty() {
                 None
             } else {
@@ -673,6 +675,359 @@ fn get_translations(locale: &str) -> Value {
                 "finish": "\u{5b8c}\u{4e86}",
             },
         }),
+        "hu" => json!({
+            "common": {
+                "play": "Lejátszás",
+                "pause": "Szünet",
+                "stop": "Leállítás",
+                "next": "Következő",
+                "previous": "Előző",
+                "search": "Keresés",
+                "settings": "Beállítások",
+                "library": "Gyűjtemény",
+                "artists": "Előadók",
+                "albums": "Albumok",
+                "tracks": "Számok",
+                "genres": "Műfajok",
+                "playlists": "Lejátszási listák",
+                "radios": "Rádiók",
+                "queue": "Lejátszási sor",
+                "favorites": "Kedvencek",
+                "history": "Előzmények",
+                "volume": "Hangerő",
+            },
+            "settings": {
+                "title": "Beállítások",
+                "musicDirs": "Zenei mappák",
+                "streaming": "Streamingszolgáltatások",
+                "zones": "Lejátszási zónák",
+                "system": "Rendszer",
+            },
+            "onboarding": {
+                "welcome": "Üdvözli a Tune!",
+                "addMusic": "Zene hozzáadása",
+                "connectStreaming": "Streamingszolgáltatások csatlakoztatása",
+                "setupZones": "Lejátszási zónák beállítása",
+                "createProfile": "Profil létrehozása",
+                "complete": "A beállítás kész!",
+                "skip": "Kihagyás",
+                "next": "Tovább",
+                "finish": "Kész",
+            },
+        }),
+        "vi" => json!({
+            "common": {
+                "play": "Phát",
+                "pause": "Tạm dừng",
+                "stop": "Dừng",
+                "next": "Tiếp theo",
+                "previous": "Trước",
+                "search": "Tìm kiếm",
+                "settings": "Cài đặt",
+                "library": "Thư viện",
+                "artists": "Nghệ sĩ",
+                "albums": "Album",
+                "tracks": "Bài hát",
+                "genres": "Thể loại",
+                "playlists": "Danh sách phát",
+                "radios": "Đài",
+                "queue": "Hàng đợi",
+                "favorites": "Yêu thích",
+                "history": "Lịch sử",
+                "volume": "Âm lượng",
+            },
+            "settings": {
+                "title": "Cài đặt",
+                "musicDirs": "Thư mục nhạc",
+                "streaming": "Dịch vụ streaming",
+                "zones": "Vùng phát",
+                "system": "Hệ thống",
+            },
+            "onboarding": {
+                "welcome": "Chào mừng bạn đến với Tune!",
+                "addMusic": "Thêm nhạc",
+                "connectStreaming": "Kết nối dịch vụ streaming",
+                "setupZones": "Thiết lập vùng phát",
+                "createProfile": "Tạo hồ sơ",
+                "complete": "Thiết lập hoàn tất!",
+                "skip": "Bỏ qua",
+                "next": "Tiếp",
+                "finish": "Hoàn tất",
+            },
+        }),
+        "nb" => json!({
+            "common": {
+                "play": "Spill av",
+                "pause": "Pause",
+                "stop": "Stopp",
+                "next": "Neste",
+                "previous": "Forrige",
+                "search": "Søk",
+                "settings": "Innstillinger",
+                "library": "Bibliotek",
+                "artists": "Artister",
+                "albums": "Album",
+                "tracks": "Spor",
+                "genres": "Sjangre",
+                "playlists": "Spillelister",
+                "radios": "Direkteradioer",
+                "queue": "Kø",
+                "favorites": "Favoritter",
+                "history": "Historikk",
+                "volume": "Volum",
+            },
+            "settings": {
+                "title": "Innstillinger",
+                "musicDirs": "Plasseringer",
+                "streaming": "Strømmetjenester",
+                "zones": "Soner",
+                "system": "System",
+            },
+            "onboarding": {
+                "welcome": "Velkommen til Tune Server",
+                "addMusic": "Legg til musikk",
+                "connectStreaming": "Koble til strømmetjenester",
+                "setupZones": "Sett opp soner",
+                "createProfile": "Opprett en profil",
+                "complete": "Alt klart!",
+                "skip": "Hopp over",
+                "next": "Neste",
+                "finish": "Fullfør",
+            },
+        }),
+        "pl" => json!({
+            "common": {
+                "play": "Odtwórz",
+                "pause": "Pauza",
+                "stop": "Zatrzymaj",
+                "next": "Następny",
+                "previous": "Poprzedni",
+                "search": "Szukaj",
+                "settings": "Ustawienia",
+                "library": "Biblioteka",
+                "artists": "Wykonawcy",
+                "albums": "Albumy",
+                "tracks": "Utwory",
+                "genres": "Gatunki",
+                "playlists": "Playlisty",
+                "radios": "Radia na żywo",
+                "queue": "Kolejka",
+                "favorites": "Ulubione",
+                "history": "Historia",
+                "volume": "Głośność",
+            },
+            "settings": {
+                "title": "Ustawienia",
+                "musicDirs": "Lokalizacje",
+                "streaming": "Usługi streamingowe",
+                "zones": "Strefy",
+                "system": "System",
+            },
+            "onboarding": {
+                "welcome": "Witamy w Tune Server",
+                "addMusic": "Dodaj muzykę",
+                "connectStreaming": "Połącz usługi streamingowe",
+                "setupZones": "Skonfiguruj strefy",
+                "createProfile": "Utwórz profil",
+                "complete": "Gotowe!",
+                "skip": "Pomiń",
+                "next": "Dalej",
+                "finish": "Zakończ",
+            },
+        }),
+        "el" => json!({
+            "common": {
+                "play": "Αναπαραγωγή",
+                "pause": "Παύση",
+                "stop": "Διακοπή",
+                "next": "Επόμενο",
+                "previous": "Προηγούμενο",
+                "search": "Αναζήτηση",
+                "settings": "Ρυθμίσεις",
+                "library": "Βιβλιοθήκη",
+                "artists": "Καλλιτέχνες",
+                "albums": "Άλμπουμ",
+                "tracks": "Κομμάτια",
+                "genres": "Είδη",
+                "playlists": "Λίστες αναπαραγωγής",
+                "radios": "Ραδιόφωνα",
+                "queue": "Ουρά",
+                "favorites": "Αγαπημένα",
+                "history": "Ιστορικό",
+                "volume": "Ένταση",
+            },
+            "settings": {
+                "title": "Ρυθμίσεις",
+                "musicDirs": "Φάκελοι μουσικής",
+                "streaming": "Υπηρεσίες streaming",
+                "zones": "Ζώνες",
+                "system": "Σύστημα",
+            },
+            "onboarding": {
+                "welcome": "Καλώς ήρθατε στο Tune!",
+                "addMusic": "Προσθήκη μουσικής",
+                "connectStreaming": "Σύνδεση υπηρεσιών streaming",
+                "setupZones": "Ρύθμιση ζωνών",
+                "createProfile": "Δημιουργία προφίλ",
+                "complete": "Η ρύθμιση ολοκληρώθηκε!",
+                "skip": "Παράλειψη",
+                "next": "Επόμενο",
+                "finish": "Τέλος",
+            },
+        }),
+        "ro" => json!({
+            "common": {
+                "play": "Redă",
+                "pause": "Pauză",
+                "stop": "Oprește",
+                "next": "Următorul",
+                "previous": "Anterior",
+                "search": "Căutare",
+                "settings": "Setări",
+                "library": "Bibliotecă",
+                "artists": "Artiști",
+                "albums": "Albume",
+                "tracks": "Piese",
+                "genres": "Genuri",
+                "playlists": "Playlisturi",
+                "radios": "Radiouri live",
+                "queue": "Coadă",
+                "favorites": "Favorite",
+                "history": "Istoric",
+                "volume": "Volum",
+            },
+            "settings": {
+                "title": "Setări",
+                "musicDirs": "Locații",
+                "streaming": "Servicii de streaming",
+                "zones": "Zone",
+                "system": "Sistem",
+            },
+            "onboarding": {
+                "welcome": "Bine ai venit la Tune Server",
+                "addMusic": "Adaugă muzică",
+                "connectStreaming": "Conectează serviciile de streaming",
+                "setupZones": "Configurează zonele",
+                "createProfile": "Creează un profil",
+                "complete": "Gata!",
+                "skip": "Omite",
+                "next": "Următorul",
+                "finish": "Finalizează configurarea",
+            },
+        }),
+        "sv" => json!({
+            "common": {
+                "play": "Spela",
+                "pause": "Pausa",
+                "stop": "Stoppa",
+                "next": "Nästa",
+                "previous": "Föregående",
+                "search": "Sök",
+                "settings": "Inställningar",
+                "library": "Bibliotek",
+                "artists": "Artister",
+                "albums": "Album",
+                "tracks": "Spår",
+                "genres": "Genrer",
+                "playlists": "Spellistor",
+                "radios": "Live-radio",
+                "queue": "Kö",
+                "favorites": "Favoriter",
+                "history": "Historik",
+                "volume": "Volym",
+            },
+            "settings": {
+                "title": "Inställningar",
+                "musicDirs": "Platser",
+                "streaming": "Streamingtjänster",
+                "zones": "Zoner",
+                "system": "System",
+            },
+            "onboarding": {
+                "welcome": "Välkommen till Tune Server",
+                "addMusic": "Lägg till musik",
+                "connectStreaming": "Anslut streamingtjänster",
+                "setupZones": "Konfigurera zoner",
+                "createProfile": "Skapa en profil",
+                "complete": "Klart!",
+                "skip": "Hoppa över",
+                "next": "Nästa",
+                "finish": "Slutför konfigurationen",
+            },
+        }),
         _ => json!({}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SUPPORTED_LOCALES, get_translations, parse_accept_language};
+
+    /// Chaque locale annoncée par `/locales` a ses textes : une locale listée
+    /// sans bloc rendrait `{}` puis le repli anglais.
+    ///
+    /// Contre-épreuve : retirer le bloc `"vi"` de `get_translations` fait
+    /// rougir ce test sur «vi».
+    #[test]
+    fn chaque_locale_annoncee_a_ses_textes() {
+        for locale in SUPPORTED_LOCALES {
+            let t = get_translations(locale);
+            for ns in ["common", "settings", "onboarding"] {
+                assert!(
+                    t[ns].as_object().is_some_and(|o| !o.is_empty()),
+                    "«{locale}» n'a pas d'espace «{ns}»"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn le_hongrois_et_le_vietnamien_sont_detectes() {
+        assert_eq!(parse_accept_language("hu-HU,hu;q=0.9"), "hu");
+        assert_eq!(parse_accept_language("vi-VN,vi;q=0.9,en;q=0.5"), "vi");
+        assert_eq!(get_translations("vi")["settings"]["zones"], "Vùng phát");
+        assert_eq!(parse_accept_language("pt-BR"), "en");
+    }
+
+    /// La liste que `/api/v1/i18n/locales` annonce est EXACTEMENT celle que le
+    /// serveur parle (`i18n::SUPPORTED`) : ni une langue servie mais non
+    /// annoncée (`sv`, `ro` l'étaient), ni une annoncée mais non servie.
+    ///
+    /// Contre-épreuve : retirer `"sv"` de `SUPPORTED_LOCALES` fait rougir ce
+    /// test en nommant `sv`.
+    #[test]
+    fn les_locales_annoncees_sont_celles_du_serveur() {
+        let mut annoncees: Vec<&str> = SUPPORTED_LOCALES.to_vec();
+        let mut servies: Vec<&str> = crate::i18n::SUPPORTED.to_vec();
+        annoncees.sort_unstable();
+        servies.sort_unstable();
+        assert_eq!(
+            annoncees, servies,
+            "/locales annonce autre chose que i18n::SUPPORTED"
+        );
+        assert_eq!(parse_accept_language("sv-SE,sv;q=0.9"), "sv");
+        assert_eq!(parse_accept_language("ro-RO,ro;q=0.9"), "ro");
+    }
+
+    /// Un navigateur norvégien (`no`, `nn-NO`) obtient le bokmål.
+    #[test]
+    fn no_et_nn_donnent_nb_aussi_sur_locales() {
+        assert_eq!(parse_accept_language("no,en;q=0.5"), "nb");
+        assert_eq!(parse_accept_language("nn-NO,nn;q=0.9"), "nb");
+    }
+
+    /// Le norvégien bokmål, le polonais et le grec sont des langues de
+    /// l'interface : un `Accept-Language` qui les demande les obtient.
+    ///
+    /// Contre-épreuve : retirer `"nb"`, `"pl"` et `"el"` de `SUPPORTED_LOCALES`
+    /// fait rougir ce test (les trois en-têtes retombent sur `"en"`).
+    #[test]
+    fn le_norvegien_le_polonais_et_le_grec_sont_detectes() {
+        assert_eq!(parse_accept_language("nb-NO,nb;q=0.9,en;q=0.5"), "nb");
+        assert_eq!(parse_accept_language("pl-PL,pl;q=0.9,en;q=0.5"), "pl");
+        assert_eq!(parse_accept_language("el-GR,el;q=0.9,en;q=0.5"), "el");
+        assert_eq!(get_translations("nb")["settings"]["zones"], "Soner");
+        assert_eq!(get_translations("pl")["settings"]["zones"], "Strefy");
+        assert_eq!(get_translations("el")["settings"]["zones"], "Ζώνες");
     }
 }

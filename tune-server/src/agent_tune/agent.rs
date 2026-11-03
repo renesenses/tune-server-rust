@@ -324,7 +324,10 @@ pub async fn executer(
 ) -> Result<(), Refus> {
     let sortie = sortie_locale(state, device_id).await.ok_or((
         StatusCode::NOT_FOUND,
-        format!("sortie inconnue sur cet agent : {device_id}"),
+        crate::message_api::texte(
+            "api.agent.unknownOutput",
+            &[("device_id", device_id.to_string())],
+        ),
     ))?;
     let sortie = sortie.lock().await;
     let statut = sortie
@@ -337,8 +340,7 @@ pub async fn executer(
     let pas_tenue = || {
         (
             StatusCode::CONFLICT,
-            "sortie occupée sur l'agent : une lecture locale ou un autre maître la tient"
-                .to_string(),
+            crate::message_api::texte("api.agent.outputBusy", &[]),
         )
     };
     match commande {
@@ -380,6 +382,15 @@ pub async fn executer(
             if !tenue && !libre {
                 return Err(pas_tenue());
             }
+            // #6541 — la limite de sécurité de la zone locale qui porte cette
+            // sortie tient aussi contre un maître distant.
+            let volume = match tune_core::audio::volume_limites::securite_de_l_appareil(
+                &state.backend,
+                device_id,
+            ) {
+                Some(s) => volume.min(s),
+                None => volume,
+            };
             sortie.set_volume(volume).await.map_err(erreur)
         }
         Commande::Muet { muet } => {
@@ -427,7 +438,10 @@ pub async fn etat(
 ) -> Result<EtatSortieDistante, Refus> {
     let sortie = sortie_locale(state, device_id).await.ok_or((
         StatusCode::NOT_FOUND,
-        format!("sortie inconnue sur cet agent : {device_id}"),
+        crate::message_api::texte(
+            "api.agent.unknownOutput",
+            &[("device_id", device_id.to_string())],
+        ),
     ))?;
     let sortie = sortie.lock().await;
     let mut statut = sortie

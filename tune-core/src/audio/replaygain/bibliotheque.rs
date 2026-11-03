@@ -141,6 +141,16 @@ impl CacheBibliothequeReplayGain {
         self.lire_a(backend, Instant::now(), DUREE_DU_CACHE)
     }
 
+    /// Oublier le dernier comptage : le prochain [`Self::lire`] recompte.
+    ///
+    /// #6330 — après « Tout relancer », les échecs rendus à la passe ne sont
+    /// plus des échecs ; la jauge ne doit pas les resservir une minute.
+    pub fn oublier(&self) {
+        if let Ok(mut dernier) = self.dernier.lock() {
+            *dernier = None;
+        }
+    }
+
     fn lire_a(
         &self,
         backend: &Arc<dyn DbBackend>,

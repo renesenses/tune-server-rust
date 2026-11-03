@@ -218,6 +218,16 @@ const STALL_DECLINE_MAX_TICKS: u8 = 10;
 /// advanced once, so slow starts and renderers with no position support remain
 /// outside its scope.
 const PLAYING_STALL_THRESHOLD: u8 = 30;
+/// 🔴 #6702 — le plancher en SECONDES du seuil ci-dessus, comme
+/// [`STOPPED_FAILURE_MIN_SECS`] pour le bras « arrêté » (#4480).
+///
+/// Après un tour bloqué, `tokio::time::interval` rattrape les tours manqués en
+/// rafale : sur le .18 le 21/10, trente tours « figés » en 247 ms, position du
+/// renderer égale au temps écoulé (204 s pour 204 s), renderer encore en train
+/// de jouer — et la zone coupée. La position d'un renderer DLNA avance à la
+/// seconde : des tours espacés de quelques millisecondes la voient forcément
+/// figée.
+const PLAYING_STALL_MIN_SECS: u64 = 30;
 /// Grace period (seconds) after a seek during which the poller does not
 /// overwrite the in-memory position with the value reported by the output.
 /// This prevents the progress bar from snapping back to the pre-seek
@@ -434,6 +444,24 @@ const VOLUME_GRACE_SECS: u64 = 5;
 /// fois « personne ne reçoit ce son » et « en lecture ».
 pub const DELAI_SILENCE_ETABLI: Duration = Duration::from_secs(12);
 
+/// #6066 — au-delà de ce volume, des octets tirés d'un flux disent qu'un
+/// lecteur le consomme ; en deçà, ce n'est qu'une SONDE. AVPlayer tire
+/// `bytes=0-1` (deux octets) avant de refuser un flux, un analyseur lit
+/// quelques Kio d'en-tête : rien ne joue pour autant. 16 Kio, c'est 4 s d'une
+/// radio à 32 kb/s, bien moins que ce qu'un lecteur qui joue a tiré au bout de
+/// [`DELAI_SILENCE_ETABLI`].
+///
+/// Partagé, comme le délai, par le poller (abandon d'une lecture sans
+/// destination) et la vue des zones (`browser_unattended`) : ils doivent dire
+/// la même chose au même instant.
+pub const TAILLE_MAXIMALE_D_UNE_SONDE: u64 = 16 * 1024;
+
+/// Ces octets servis prouvent-ils qu'un lecteur consomme le flux ? Jamais
+/// « un octet » (#6066) : une sonde de plage n'est pas une écoute.
+pub fn octets_d_une_ecoute(octets: u64) -> bool {
+    octets > TAILLE_MAXIMALE_D_UNE_SONDE
+}
+
 /// Pure decision predicates extracted **verbatim** from the poller `tick`
 /// loop. They contain no I/O and no state mutation, so they can be unit-tested
 /// against the *real* code path.
@@ -478,7 +506,10 @@ pub mod fsm;
 pub const ECHECS_SONDAGE_DETAILLES: u32 = 5;
 
 mod etat;
+mod tune_tested_auto;
 use etat::*;
+
+pub mod logo_de_lancement;
 
 /// Retrouver en base la station qui joue, a partir du `source_id` du
 /// now-playing.
@@ -489,10 +520,10 @@ pub(crate) fn station_du_now_playing(
     repo: &crate::db::radio_repo::RadioRepo,
     source_id: &str,
 ) -> Option<crate::db::radio_repo::RadioStation> {
-    if let Ok(id) = source_id.parse::<i64>() {
-        if let Ok(Some(station)) = repo.get(id) {
-            return Some(station);
-        }
+    if let Ok(id) = source_id.parse::<i64>()
+        && let Ok(Some(station)) = repo.get(id)
+    {
+        return Some(station);
     }
     // Et par URL de flux, qui est ce que le chemin de lecture normal écrit :
     // `POST /radios/{id}/play/{zone_id}` pose `source_id: Some(radio.url)`.
@@ -528,6 +559,7 @@ pub(crate) fn vignette_du_pas_radio(
 }
 
 pub struct PositionPoller {
+    observateur_tune_tested: std::sync::Mutex<crate::cloud::tune_tested_auto::Observateur>,
     orchestrator: Arc<PlaybackOrchestrator>,
     playback: Arc<PlaybackManager>,
     outputs: Arc<Mutex<OutputRegistry>>,
@@ -539,6 +571,11 @@ pub struct PositionPoller {
     /// piste relance aussitôt. Vit le temps du processus, HORS de
     /// ZonePollState, que chaque relance recrée.
     appareils_qui_ignorent_next: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// #6910 — zones dont le dernier suivant armé est un DSD sur un renderer
+    /// DLNA (zone → appareil). Si ce suivant n'est pas suivi
+    /// (`StuckForceEnd`), l'appareil est retenu par l'orchestrateur et la
+    /// garde de #402 lui est rendue.
+    dsd_suivant_arme: std::sync::Mutex<std::collections::HashMap<i64, String>>,
     /// #4382 — fins de piste établies par le guet de la dernière seconde
     /// (`sondage_accelere_4382`), par zone. Partagée avec les guetteurs.
     fins_precises: sondage_accelere_4382::FinsPrecises,
@@ -569,13 +606,9 @@ pub struct PositionPoller {
     /// nulle : seules celles-là peuvent être dites « figées à 0 ». Certains
     /// renderers rendent 0 en permanence tout en jouant.
     zones_a_position_prouvee: std::sync::Mutex<std::collections::HashSet<i64>>,
-    /// #5695 — zones PURE verrouillées dont le volume a déjà été réimposé et
-    /// DIT : l'avertissement part une fois par zone, pas à chaque écart.
-    volumes_pure_reimposes: std::sync::Mutex<std::collections::HashSet<i64>>,
-    /// #5695 — zones dont l'épisode « PURE verrouillé » a déjà été rattrapé
-    /// une fois (voir `volume_pure_concilie`). Une zone en sort dès qu'elle
-    /// est vue hors verrou, pour que le prochain armement soit rattrapé.
-    volumes_pure_concilies: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #6541 — dernier volume rapporté au-dessus de la limite de sécurité,
+    /// par zone : la consigne n'est recommandée qu'une fois par valeur.
+    volumes_plafonnes: std::sync::Mutex<std::collections::HashMap<i64, f64>>,
     /// #5662 — zones dont le renderer annonce 100 % sans que Tune l'adopte :
     /// l'épisode est dit une fois (`volume_100_ignore_constate`).
     volumes_100_ignores: std::sync::Mutex<std::collections::HashSet<i64>>,
@@ -608,6 +641,7 @@ impl PositionPoller {
         shared_metrics: PollerMetricsMap,
     ) -> Self {
         Self {
+            observateur_tune_tested: std::sync::Mutex::default(),
             orchestrator,
             playback,
             outputs,
@@ -615,14 +649,14 @@ impl PositionPoller {
             shared_metrics,
             event_bus: None,
             appareils_qui_ignorent_next: std::sync::Mutex::new(std::collections::HashSet::new()),
+            dsd_suivant_arme: std::sync::Mutex::new(std::collections::HashMap::new()),
             fins_precises: Default::default(),
             relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
             reprises_renderer_cale: Mutex::new(std::collections::HashMap::new()),
             zones_masquees_signalees: std::sync::Mutex::new(std::collections::HashSet::new()),
             relances_demarrage_fige: std::sync::Mutex::new(std::collections::HashMap::new()),
             zones_a_position_prouvee: std::sync::Mutex::new(std::collections::HashSet::new()),
-            volumes_pure_reimposes: std::sync::Mutex::new(std::collections::HashSet::new()),
-            volumes_pure_concilies: std::sync::Mutex::new(std::collections::HashSet::new()),
+            volumes_plafonnes: std::sync::Mutex::new(std::collections::HashMap::new()),
             volumes_100_ignores: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -658,6 +692,8 @@ impl PositionPoller {
             // Derniere valeur annoncee de `levels_available`, par zone.
             let mut niveaux_annonces: HashMap<i64, bool> = HashMap::new();
 
+            let mut paniques: u64 = 0;
+
             loop {
                 // Wake on either the regular 1-second tick OR an immediate
                 // notification from a local output that finished a track.
@@ -665,12 +701,60 @@ impl PositionPoller {
                     _ = ticker.tick() => {},
                     _ = notify.notified() => {},
                 }
-                self.tick(&mut poll_states, &mut idle_backoff, &startup_at)
-                    .await;
-                self.annoncer_bascule_des_niveaux(&mut niveaux_annonces)
-                    .await;
+                // #6932 — le tour passe par `tour_protege` : sa panique ne
+                // tue plus le sondeur de toutes les zones.
+                let tour = async {
+                    self.tick(&mut poll_states, &mut idle_backoff, &startup_at)
+                        .await;
+                    self.annoncer_bascule_des_niveaux(&mut niveaux_annonces)
+                        .await;
+                };
+                if let Err(message) = Self::tour_protege(tour).await {
+                    paniques += 1;
+                    if decisions::panique_du_tour_a_journaliser(paniques) {
+                        tracing::error!(
+                            panique = %message,
+                            paniques_total = paniques,
+                            "position_poller_tick_panicked"
+                        );
+                    }
+                }
             }
         })
+    }
+
+    /// #6932 — un tour du sondeur, protégé contre sa propre panique.
+    ///
+    /// Le sondeur est UNE tâche pour toutes les zones, lancée une seule fois
+    /// au démarrage et que personne ne surveille. Une panique dans un tour —
+    /// une seule zone, un seul relevé — tuait la tâche : plus aucune position
+    /// relevée (la barre d'avancement figée sur toutes les zones), plus aucune
+    /// fin de piste constatée (la lecture s'arrête au bout du titre en cours),
+    /// jusqu'au redémarrage du serveur. Sous Windows la panique n'allait qu'au
+    /// `tune-crash.log`, pas au journal joint aux rapports.
+    ///
+    /// La panique est rattrapée ici et rendue en `Err(message)` ; le tour
+    /// suivant repart. Les verrous tokio se libèrent au déroulement, les
+    /// verrous std empoisonnés sont déjà relus par `into_inner` dans le
+    /// sondeur.
+    ///
+    /// Le tour lui-même (relevé puis annonce de la bascule des niveaux) reste
+    /// écrit dans `spawn` : la garde `tests/poller_bascule.rs` (#2285) y
+    /// cherche l'appel à l'annonce.
+    pub(crate) async fn tour_protege(
+        tour: impl std::future::Future<Output = ()>,
+    ) -> Result<(), String> {
+        use futures_util::FutureExt;
+        std::panic::AssertUnwindSafe(tour)
+            .catch_unwind()
+            .await
+            .map_err(|charge| {
+                charge
+                    .downcast_ref::<&str>()
+                    .map(|m| m.to_string())
+                    .or_else(|| charge.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "panique sans message".to_string())
+            })
     }
 
     /// Annoncer quand une zone se met — ou cesse — de mesurer ses niveaux.
@@ -840,9 +924,14 @@ impl PositionPoller {
         zone_state: &crate::playback::ZoneState,
     ) -> Option<i64> {
         let p = Self::next_position(zone_state)?;
-        crate::orchestrator::lignes_bannies_a_enjamber(db, zone_id, p)
-            .0
-            .position_depuis(p)
+        crate::orchestrator::lignes_bannies_a_enjamber(
+            db,
+            zone_id,
+            p,
+            zone_state.session_profile_id,
+        )
+        .0
+        .position_depuis(p)
     }
 
     /// Next-track decision for a MANUAL skip (the `next` button). A manual skip
@@ -1012,6 +1101,8 @@ mod radio;
 mod titre_radio_didl_2991;
 
 mod fin_de_piste;
+// #6932 — la zone navigateur dont la piste est finie enchaîne sans son lecteur.
+mod fin_navigateur_6932;
 /// #4382 — un `Next` acquitté que le transport déclare ignoré.
 mod next_ignore_4382;
 pub(crate) mod refus_de_piste;
@@ -1028,14 +1119,27 @@ mod demarrage_fige_5522;
 #[cfg(test)]
 mod demarrage_fige_5522_tests;
 
-/// #5695 — sous PURE verrouillé, réimposer 100 % au lieu d'adopter le volume
-/// du renderer.
-mod volume_pure_5695;
+/// #6541 — au-dessus de la limite de sécurité, le volume du renderer n'est
+/// pas adopté : il est ramené sous la limite.
+mod volume_plafond_6541;
+#[cfg(test)]
+mod volume_plafond_6541_tests;
+/// #6721 — sous PURE verrouillé, le sondeur respecte une baisse faite sur
+/// l'appareil : il ne remonte jamais le volume tout seul (le banc `Banc` sert
+/// aussi à #6008, #6541 et à la sourdine).
 #[cfg(test)]
 mod volume_pure_5695_tests;
 
 /// #6233 — radio sur sortie locale : le contrat de signal relu à chaque tour.
 mod contrat_radio_locale_6233;
+mod etat_air_6912;
+#[cfg(test)]
+mod etat_air_6912_tests;
+/// #6739 — un relevé du volume de l'appareil ne remonte jamais la consigne.
+mod releve_ne_monte_pas_6739;
+/// #6739 — ses témoins, sur le vrai sondeur et le vrai orchestrateur.
+#[cfg(test)]
+mod releve_ne_monte_pas_6739_tests;
 /// #5662 — un renderer à 100 % ignoré par l'adoption est signalé au journal.
 mod volume_100_ignore_5662;
 /// #6008 — l'adoption du volume du renderer est dite au journal.
@@ -1049,6 +1153,15 @@ mod tests;
 
 #[cfg(test)]
 mod status_timeout_tests;
+
+/// #6932 — une panique dans un tour ne tue plus le sondeur.
+#[cfg(test)]
+mod sondeur_survit_a_une_panique_6932;
+
+/// Sourdine par zéro (Eversolo DMP-A8) : le silence commandé n'est pas
+/// rouvert par le volume que l'appareil remonte.
+#[cfg(test)]
+mod volume_sourdine_zero_tests;
 
 /// #3318 — l'instant où l'anneau audio se vide, et le silence que le DAC
 /// reçoit alors. La comptabilité pure, et son branchement dans `tick()`.
@@ -1224,6 +1337,11 @@ mod bascule_des_niveaux_tests {
 #[cfg(test)]
 mod repli_logo_station_tests;
 
+/// #7051 — une station jouée depuis l'annuaire, hors de « Mes radios », garde
+/// son logo quand le premier titre du flux arrive (Radio Bergeijk, fil 2443).
+#[cfg(test)]
+mod logo_de_lancement_7051_tests;
+
 /// Garde-fou #1998 : c'est le poller qui LIBÈRE l'annonce d'une zone
 /// navigateur.
 ///
@@ -1264,6 +1382,11 @@ mod annonce_navigateur_guard;
 /// `tick()` UNE fois, et compte ce qui en sort.
 #[cfg(test)]
 mod remontee_des_pannes_de_sortie_tests;
+
+/// #6790 — une sortie qui se met en pause d'elle-même (`endpoint_release`
+/// OAAT) emmène la zone en pause.
+#[cfg(test)]
+mod pause_par_l_appareil_6790_tests;
 
 #[cfg(test)]
 mod lecture_sans_destination_tests;
@@ -1324,7 +1447,12 @@ mod hqplayer_enchainement_4851;
 /// un échec : préchargement, enchaînement sans blanc et reprise désignent la
 /// même suivante que l'avance de la file.
 #[cfg(test)]
-mod suivante_bannie_5143;
+pub(crate) mod suivante_bannie_5143;
+
+/// #6735 — Répéter la piste relance un morceau plus court que les gardes
+/// anti-double-appui de `play` ; un double appui de contrôleur reste coalescé.
+#[cfg(test)]
+mod repeter_piste_courte_6735;
 
 /// #5395 — la radio artiste se recharge par la vraie fin de file, et une file
 /// qui s'achève hors radio rend la main au réglage d'auto-lecture de la zone.
@@ -1433,3 +1561,18 @@ mod zone_masquee_en_lecture_4970;
 /// l'arrivée du contrat s'annonce — une fois, et une seule.
 #[cfg(test)]
 mod annonce_du_contrat_de_signal_4559;
+
+/// #6717 — un renderer qui se dit arrêté mais dont la position avance joue :
+/// sa zone n'est plus coupée sur « flux à sec ». Le banc monte le vrai `tick`
+/// et rejoue les deux coupures du journal, plus la contre-garde.
+#[cfg(test)]
+mod arret_dementi_par_la_position_6717;
+
+#[cfg(test)]
+mod position_en_fin_openhome_6718;
+
+#[cfg(test)]
+mod cohabitation_airplay_tests_7259;
+
+#[cfg(test)]
+mod fin_upnp_6634_tests;

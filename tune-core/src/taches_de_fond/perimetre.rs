@@ -11,8 +11,17 @@
 //! | Clé                                   | Valeur                     | Vide          |
 //! |---------------------------------------|----------------------------|---------------|
 //! | `background_analysis_excluded_roots`  | tableau de racines exclues | rien d'exclu  |
+//! | `background_analysis_included_dirs`   | dossiers auxquels les analyses se limitent | partout |
+//! | `metadata_enrichment_excluded_dirs`   | dossiers que l'enrichissement ne touche pas (#7538) | rien d'exclu |
 //! | `audio_embedding_genres_included`     | genres retenus pour le CLAP | tous les genres |
 //! | `audio_embedding_genres_excluded`     | genres écartés du CLAP     | aucun écarté  |
+//!
+//! Les dossiers inclus (fil 2173 : « circonscrire l'analyse à un répertoire »)
+//! sont l'inverse des racines exclues : réglés, seules les pistes sous l'un
+//! d'eux sont analysées par les quatre passes. N'importe quel dossier, pas
+//! seulement une racine de `music_dirs` ; comparé par le même préfixe que les
+//! racines exclues. Une piste doit être DANS un dossier inclus et HORS des
+//! racines exclues.
 //!
 //! Les deux listes de genres (#6198, Thierry, plus de 550 000 pistes) ne
 //! touchent QUE la passe CLAP : ReplayGain, plage dynamique et empreintes
@@ -62,6 +71,22 @@ use crate::db::settings_repo::SettingsRepo;
 /// Les racines de bibliothèque exclues des passes qui décodent.
 pub const CLE_RACINES_EXCLUES: &str = "background_analysis_excluded_roots";
 
+/// Les dossiers auxquels les passes qui décodent se limitent (fil 2173).
+/// Vide : toute la bibliothèque.
+pub const CLE_DOSSIERS_INCLUS: &str = "background_analysis_included_dirs";
+
+/// #7538 — les dossiers EXCLUS de l'enrichissement des métadonnées
+/// (communautaire, MusicBrainz, réparations de genre). Vide : rien d'exclu.
+/// Même forme et même comparaison que les deux listes ci-dessus ; voir
+/// [`clause_hors_enrichissement`] et [`exclu_de_l_enrichissement`].
+pub const CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT: &str = "metadata_enrichment_excluded_dirs";
+
+/// Le chemin ouvrable d'une piste dans un `UPDATE tracks … WHERE` (sans
+/// alias) : le même que [`crate::db::track_repo::sql::CHEMIN_OUVRABLE`],
+/// qualifié par le nom de la table.
+pub const CHEMIN_OUVRABLE_DE_TRACKS: &str =
+    "COALESCE(NULLIF(tracks.file_path, ''), NULLIF(tracks.cue_media_path, ''))";
+
 /// Les genres auxquels la passe CLAP est réservée (#6198). Vide : tous.
 pub const CLE_GENRES_CLAP_INCLUS: &str = "audio_embedding_genres_included";
 
@@ -93,6 +118,67 @@ fn liste(backend: &Arc<dyn DbBackend>, cle: &str) -> Vec<String> {
 /// Les racines exclues, telles que réglées.
 pub fn racines_exclues(backend: &Arc<dyn DbBackend>) -> Vec<String> {
     liste(backend, CLE_RACINES_EXCLUES)
+}
+
+/// Les dossiers inclus, tels que réglés. Vide : partout.
+pub fn dossiers_inclus(backend: &Arc<dyn DbBackend>) -> Vec<String> {
+    liste(backend, CLE_DOSSIERS_INCLUS)
+}
+
+/// #7538 — les dossiers exclus de l'enrichissement, tels que réglés.
+pub fn dossiers_exclus_de_l_enrichissement(backend: &Arc<dyn DbBackend>) -> Vec<String> {
+    liste(backend, CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT)
+}
+
+/// #7538 — `" AND NOT (…)"` : écarte les pistes dont `expr` (un chemin) est
+/// sous un dossier exclu de l'enrichissement. Vide si rien n'est réglé : la
+/// requête de l'appelant reste celle d'avant le réglage, au caractère près.
+pub fn clause_hors_enrichissement(backend: &Arc<dyn DbBackend>, expr: &str) -> String {
+    clause_hors_racines(expr, &dossiers_exclus_de_l_enrichissement(backend))
+}
+
+/// #7538 — le même test en Rust, pour un chemin déjà lu : `chemin` est-il
+/// l'un des `dossiers` ou dessous ? Séparateurs normalisés des deux côtés,
+/// préfixe borné par un séparateur (`/music/Jazz2` n'est pas sous
+/// `/music/Jazz`) — exactement ce que compte [`clause_hors_racines`].
+pub fn exclu_de_l_enrichissement(chemin: &str, dossiers: &[String]) -> bool {
+    let chemin = normaliser_les_separateurs(chemin);
+    dossiers.iter().any(|d| {
+        let d = d.trim();
+        if d.is_empty() {
+            return false;
+        }
+        let base = normaliser_les_separateurs(d);
+        let base = base.trim_end_matches('/');
+        chemin == base
+            || chemin
+                .strip_prefix(base)
+                .is_some_and(|reste| reste.starts_with('/'))
+    })
+}
+
+/// #7538 — l'album a-t-il au moins une piste sous l'un des `dossiers` exclus
+/// de l'enrichissement ? Les réparations de genre (Last.fm, Discogs, par
+/// artiste, par famille) écrivent l'ALBUM puis ses pistes : un album dont une
+/// piste vit dans un dossier exclu n'est pas réparé du tout. Faux si la liste
+/// est vide (sans requête).
+pub fn album_touche_l_exclusion(
+    backend: &Arc<dyn DbBackend>,
+    album_id: i64,
+    dossiers: &[String],
+) -> bool {
+    let clause = clause_dans_les_racines(crate::db::track_repo::sql::CHEMIN_OUVRABLE, dossiers);
+    if clause.is_empty() {
+        return false;
+    }
+    backend
+        .query_one(
+            &format!("SELECT 1 FROM tracks t WHERE t.album_id = ?{clause} LIMIT 1"),
+            &[&album_id as &dyn crate::db::backend::ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Les genres retenus pour le CLAP, tels que réglés. Vide : tous.
@@ -271,14 +357,37 @@ pub fn clause_genres_exclus(genres: &[String]) -> String {
 
 /// La clause du périmètre pour ReplayGain, plage dynamique et empreintes : les
 /// racines exclues, sur `t.file_path`.
+///
+/// Fil 2173 — puis les dossiers inclus : réglés, seules les pistes sous l'un
+/// d'eux restent.
 pub fn clause_decodage(backend: &Arc<dyn DbBackend>) -> String {
-    clause_hors_racines("t.file_path", &racines_exclues(backend))
+    let mut c = clause_hors_racines("t.file_path", &racines_exclues(backend));
+    c.push_str(&clause_dans_les_racines(
+        "t.file_path",
+        &dossiers_inclus(backend),
+    ));
+    c
 }
 
-/// L'inverse de [`clause_decodage`] : `" AND (…)"` sur les pistes des racines
-/// exclues, vide si aucune racine n'est exclue.
+/// L'inverse exact de [`clause_decodage`] : `" AND (…)"` sur les pistes
+/// d'une racine exclue OU hors de tout dossier inclus. Vide si rien n'est
+/// réglé.
 pub fn clause_hors_perimetre_decodage(backend: &Arc<dyn DbBackend>) -> String {
-    clause_dans_les_racines("t.file_path", &racines_exclues(backend))
+    clause_hors_perimetre(
+        termes_des_racines("t.file_path", &racines_exclues(backend)),
+        termes_des_racines("t.file_path", &dossiers_inclus(backend)),
+    )
+}
+
+/// `" AND (exclus OR NOT (inclus))"`, chaque moitié seulement si elle est
+/// réglée. Vide si aucune ne l'est.
+fn clause_hors_perimetre(exclus: Option<String>, inclus: Option<String>) -> String {
+    match (exclus, inclus) {
+        (None, None) => String::new(),
+        (Some(e), None) => format!(" AND ({e})"),
+        (None, Some(i)) => format!(" AND NOT ({i})"),
+        (Some(e), Some(i)) => format!(" AND (({e}) OR NOT ({i}))"),
+    }
 }
 
 /// La clause du périmètre du CLAP : les racines exclues, sur le chemin
@@ -289,6 +398,11 @@ pub fn clause_clap(backend: &Arc<dyn DbBackend>) -> String {
         crate::db::track_repo::sql::CHEMIN_OUVRABLE,
         &racines_exclues(backend),
     );
+    // Fil 2173 — les dossiers inclus, sur le même chemin ouvrable.
+    c.push_str(&clause_dans_les_racines(
+        crate::db::track_repo::sql::CHEMIN_OUVRABLE,
+        &dossiers_inclus(backend),
+    ));
     c.push_str(&clause_genres_inclus(&genres_clap_inclus(backend)));
     c.push_str(&clause_genres_exclus(&genres_clap_exclus(backend)));
     c

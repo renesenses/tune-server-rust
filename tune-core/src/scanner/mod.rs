@@ -83,7 +83,9 @@ pub fn is_tune_temp_file(path: &std::path::Path) -> bool {
     // La copie de travail de « Écrire dans les fichiers » (édition d'album,
     // tranche 4) : posée à CÔTÉ du fichier, le temps d'y écrire les balises,
     // puis renommée sur lui. Le surveillant ne doit jamais en faire une piste.
-    if name.starts_with(crate::metadata::tag_writer::PREFIXE_COPIE_DE_TRAVAIL) {
+    if name.starts_with(crate::metadata::tag_writer::PREFIXE_COPIE_DE_TRAVAIL)
+        || name.starts_with(crate::metadata::tag_writer::PREFIXE_COPIE_DE_TRAVAIL_ANCIEN)
+    {
         return true;
     }
     // tmp-autorise: comparaison seule : on LIT la racine pour reconnaître nos propres temporaires.

@@ -264,11 +264,12 @@ async fn oublier_un_partage(
         .ok()
         .flatten();
     let Some(mount_path) = ligne.and_then(|r| r.first().and_then(|v| v.as_string())) else {
-        return (
+        return crate::message_api::refus(
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "partage_inconnu", "message": "Ce partage n'est plus enregistré." })),
-        )
-            .into_response();
+            "partage_inconnu",
+            "api.network.shareUnknown",
+            &[],
+        );
     };
 
     let racines = racines_dependantes(
@@ -278,17 +279,18 @@ async fn oublier_un_partage(
     if !racines.is_empty() && !q.confirmer {
         return (
             StatusCode::CONFLICT,
-            Json(json!({
-                "error": "racines_dependantes",
-                "message": format!(
-                    "{} dossier(s) de la bibliothèque se trouvent sur ce partage.",
-                    racines.len()
-                ),
-                "racines": racines,
-                // Ce que la purge emporterait si l'utilisateur retire aussi
-                // ces dossiers : il doit le voir avant d'accepter.
-                "pistes": crate::routes::system::pistes_qui_partiraient(&state, &racines),
-            })),
+            Json(crate::message_api::avec_message(
+                json!({
+                    "error": "racines_dependantes",
+                    "code": "racines_dependantes",
+                    "racines": racines,
+                    // Ce que la purge emporterait si l'utilisateur retire aussi
+                    // ces dossiers : il doit le voir avant d'accepter.
+                    "pistes": crate::routes::system::pistes_qui_partiraient(&state, &racines),
+                }),
+                "api.network.shareHasLibraryFolders",
+                &[("count", racines.len().to_string())],
+            )),
         )
             .into_response();
     }
@@ -319,20 +321,17 @@ async fn oublier_un_partage(
                 }
             }
             Ok(Err(e)) => Some(e.to_string()),
-            Err(_) => Some("délai dépassé".to_string()),
+            Err(_) => Some("timed out after 15 s".to_string()),
         };
         if let Some(cause) = echec.filter(|_| smb::est_un_point_de_montage(chemin)) {
             warn!(id, path = %mount_path, error = %cause, "smb_oubli_demontage_echoue");
-            return (
+            return crate::message_api::refus_avec_cause(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": "demontage_impossible",
-                    "message": format!(
-                        "Impossible de démonter {mount_path} : {cause}. Le partage est conservé."
-                    ),
-                })),
-            )
-                .into_response();
+                "demontage_impossible",
+                "api.network.unmountFailed",
+                &[("path", mount_path.clone())],
+                cause,
+            );
         }
         demonte = true;
     }
@@ -608,9 +607,8 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
             "part_max": PART_MAX_ABSENCE_SIMULTANEE,
             "plancher": PLANCHER_PLAFOND_ABSENCE,
             "confirmation_apres_secs": refus.confirmation_apres_secs,
-            "motif": "une bascule de cette ampleur est bien plus souvent notre propre lien réseau \
-                      qui tombe qu'une extinction simultanée. Les serveurs restent proposés ; \
-                      si le silence dure une seconde fenêtre, l'absence sera actée.",
+            "motif": crate::message_api::texte("api.network.massSwitchRefused", &[]),
+            "motif_key": "api.network.massSwitchRefused",
         });
     }
     Json(sortie)
@@ -1064,11 +1062,67 @@ fn obstacle_de_montage(e: &std::io::Error, chemin: &str) -> (&'static str, Strin
             "chemin_parent_absent",
             format!("Le dossier parent de {chemin} n'existe pas."),
         ),
+        // #6345 (fil 2278) — une racine en lecture seule : le volume système
+        // scellé de macOS, un conteneur ou une image immuable. Le dire, et
+        // donner l'issue, au lieu du « os error 30 » brut.
+        std::io::ErrorKind::ReadOnlyFilesystem => (
+            "systeme_en_lecture_seule",
+            format!(
+                "Impossible de créer le point de montage {chemin} : ce dossier est sur \
+                 un système de fichiers en lecture seule. Choisissez un point de montage \
+                 dans un dossier inscriptible, ou montez le partage par le système et \
+                 déclarez le dossier obtenu dans les dossiers de musique."
+            ),
+        ),
         _ => (
             "creation_impossible",
             format!("Impossible de créer le point de montage {chemin} : {e}"),
         ),
     }
+}
+
+/// #6345 — le dossier où Tune crée ses points de montage quand l'appelant
+/// n'en impose pas.
+///
+/// * Linux et ailleurs : `/mnt`, que l'assistant privilégié de Tune OS sait
+///   préparer (#3206).
+/// * macOS : la racine du système est un volume SCELLÉ, en lecture seule
+///   depuis Catalina ; `/mnt` n'y existe pas et ne peut pas y être créé
+///   (« Read-only file system (os error 30) », Mac mini sous Ventura, fil
+///   2278). Le dossier de Tune sous `~/Library/Application Support`, où
+///   `mount_smbfs` monte sans privilège ; sans `HOME`, le dossier de données.
+fn racine_des_montages(
+    plateforme: crate::chemins_de_donnees::Plateforme,
+    home: Option<&std::ffi::OsStr>,
+    donnees: &std::path::Path,
+) -> std::path::PathBuf {
+    use crate::chemins_de_donnees::Plateforme;
+    match plateforme {
+        Plateforme::MacOs => match home {
+            Some(h) => {
+                std::path::PathBuf::from(h).join("Library/Application Support/Tune/montages")
+            }
+            None => racine_de_repli_des_montages(donnees),
+        },
+        _ => std::path::PathBuf::from("/mnt"),
+    }
+}
+
+/// #6345 — le repli quand la racine par défaut est en lecture seule : un
+/// dossier propre à Tune sous son dossier de données.
+fn racine_de_repli_des_montages(donnees: &std::path::Path) -> std::path::PathBuf {
+    donnees.join("montages")
+}
+
+/// Le dossier de données du serveur en cours (`TUNE_DATA_DIR`, sinon celui
+/// de la base), tel que le reste du serveur le calcule.
+fn dossier_de_donnees_du_serveur(db_path: &str) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    crate::gel_executeur::dossier_de_donnees(
+        std::env::var("TUNE_DATA_DIR").ok().as_deref(),
+        db_path,
+        &cwd,
+    )
 }
 
 async fn mount_smb_share(
@@ -1077,10 +1131,17 @@ async fn mount_smb_share(
 ) -> impl IntoResponse {
     let share_safe = body.share_name.replace(['/', '\\', ' '], "_");
     let chemin_impose = body.mount_path.is_some();
-    let mut mount_path = body
-        .mount_path
-        .clone()
-        .unwrap_or_else(|| format!("/mnt/{}_{}", body.host, share_safe));
+    let nom_du_point = format!("{}_{}", body.host, share_safe);
+    let mut mount_path = body.mount_path.clone().unwrap_or_else(|| {
+        racine_des_montages(
+            crate::chemins_de_donnees::Plateforme::courante(),
+            std::env::var_os("HOME").as_deref(),
+            &dossier_de_donnees_du_serveur(&state.config.db_path),
+        )
+        .join(&nom_du_point)
+        .to_string_lossy()
+        .into_owned()
+    });
 
     // Dry run: just test reachability without mounting
     if body.dry_run {
@@ -1094,16 +1155,19 @@ async fn mount_smb_share(
         // l'etape suivante rendait 500 — un voyant vert juste avant l'etape qui
         // echoue est pire qu'aucun voyant, il envoie chercher la panne du cote
         // du reseau, precisement la seule chose qui ait ete verifiee (#1847).
-        return Json(json!({
-            "ok": reachable,
-            "host": body.host,
-            "share_name": body.share_name,
-            "message": if reachable {
-                "Serveur joignable (port 445) — identifiants et partage non vérifiés"
+        return Json(crate::message_api::avec_message(
+            json!({
+                "ok": reachable,
+                "host": body.host,
+                "share_name": body.share_name,
+            }),
+            if reachable {
+                "api.network.smbReachable"
             } else {
-                "Serveur injoignable sur le port 445"
+                "api.network.smbUnreachable"
             },
-        }))
+            &[],
+        ))
         .into_response();
     }
 
@@ -1167,6 +1231,27 @@ async fn mount_smb_share(
         {
             info!(path = %mount_path, "smb_mount_dir_par_l_assistant");
             Ok(())
+        }
+        // #6345 — racine par défaut en lecture seule (conteneur, image
+        // immuable) : un dossier de Tune sous ses données, s'il se crée. Un
+        // chemin imposé, ou repris d'un jumeau, reste celui qu'il est.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem
+                && !chemin_impose
+                && ligne_cible.is_none() =>
+        {
+            let repli =
+                racine_de_repli_des_montages(&dossier_de_donnees_du_serveur(&state.config.db_path))
+                    .join(&nom_du_point);
+            match tokio::fs::create_dir_all(&repli).await {
+                Ok(()) => {
+                    let repli = repli.to_string_lossy().into_owned();
+                    info!(defaut = %mount_path, repli = %repli, "smb_mount_dir_repli_lecture_seule");
+                    mount_path = repli;
+                    Ok(())
+                }
+                Err(_) => Err(e),
+            }
         }
         autre => autre,
     };
@@ -1726,52 +1811,87 @@ impl EchecParcours {
         match self {
             EchecParcours::ServeurInconnu(id) => (
                 StatusCode::NOT_FOUND,
-                format!(
-                    "serveur multimédia {id} inconnu du registre en mémoire — \
-                     pas encore découvert, ou oublié"
+                crate::message_api::texte(
+                    "api.network.mediaServerUnknown",
+                    &[("id", id.to_string())],
                 ),
             ),
             EchecParcours::Transport(e) => (
                 StatusCode::GATEWAY_TIMEOUT,
-                format!("{nom_du_serveur} n'a pas répondu au {action} : {e}"),
+                crate::message_api::texte(
+                    "api.network.serverNoReply",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                        ("error", e.to_string()),
+                    ],
+                ),
             ),
             EchecParcours::Statut(code) => (
                 StatusCode::BAD_GATEWAY,
-                format!("{nom_du_serveur} a répondu HTTP {code} au {action}"),
+                crate::message_api::texte(
+                    "api.network.serverHttpStatus",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                        ("code", code.to_string()),
+                    ],
+                ),
             ),
             EchecParcours::SansResultat => (
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "{nom_du_serveur} a répondu sans élément <Result> au {action} \
-                     (SOAP Fault ?)"
+                crate::message_api::texte(
+                    "api.network.serverNoResult",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                    ],
                 ),
             ),
             EchecParcours::SansCompteur => (
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "{nom_du_serveur} a répondu au {action} sans compteur \
-                     NumberReturned lisible"
+                crate::message_api::texte(
+                    "api.network.serverNoCounter",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                        ("counter", "NumberReturned".to_string()),
+                    ],
                 ),
             ),
             EchecParcours::SansTotal => (
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "{nom_du_serveur} a répondu au {action} sans compteur \
-                     TotalMatches lisible"
+                crate::message_api::texte(
+                    "api.network.serverNoCounter",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                        ("counter", "TotalMatches".to_string()),
+                    ],
                 ),
             ),
             EchecParcours::DidlIllisible { lus, annonces } => (
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "{nom_du_serveur} a rendu au {action} un DIDL que Tune ne sait \
-                     pas lire : {lus} des {annonces} éléments annoncés lus"
+                crate::message_api::texte(
+                    "api.network.serverDidlUnreadable",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                        ("read", lus.to_string()),
+                        ("announced", annonces.to_string()),
+                    ],
                 ),
             ),
             EchecParcours::PaginationInterrompue { lus, total } => (
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "{nom_du_serveur} a rendu une page vide au {action} après \
-                     {lus} des {total} éléments annoncés"
+                crate::message_api::texte(
+                    "api.network.serverEmptyPage",
+                    &[
+                        ("server", nom_du_serveur.to_string()),
+                        ("action", action.to_string()),
+                        ("read", lus.to_string()),
+                        ("total", total.to_string()),
+                    ],
                 ),
             ),
         }
@@ -2417,6 +2537,9 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                     }));
                 } else {
                     let album = extract_xml_tag(element, "upnp:album");
+                    let year = extract_xml_tag(element, "dc:date").and_then(|v| annee_didl(&v));
+                    let genres = genres_didl(element);
+
                     // A server may announce SEVERAL <res> per item — Lyrion/LMS
                     // lists the original file (download.flc, with duration) plus
                     // on-the-fly transcodes (download.pcm headerless raw PCM with
@@ -2450,11 +2573,21 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                         .and_then(|v| numero_didl(&v));
                     let disc_number = extract_xml_tag(element, "upnp:originalDiscNumber")
                         .and_then(|v| numero_didl(&v));
+                    // #6500 — la classe et le parent ne servaient à personne
+                    // et n'étaient pas rendus. L'indexation en a besoin pour
+                    // écarter une station de radio (`audioBroadcast`, ou un
+                    // `radio/N` du rayon `radios` d'un autre Tune).
+                    let class = extract_xml_tag(element, "upnp:class");
                     items.push(json!({
                         "id": id,
+                        "parent_id": parent_id,
+                        "class": class,
                         "title": title,
                         "artist": artist,
                         "album": album,
+                        "year": year,
+                        "genre": genres.first(),
+                        "genres": genres,
                         "res_url": res_url,
                         "album_art_uri": album_art_uri,
                         "duration_ms": duration_ms,
@@ -2680,6 +2813,52 @@ fn numero_didl(brut: &str) -> Option<u32> {
     chiffres.parse::<u32>().ok().filter(|n| *n > 0)
 }
 
+/// Ne pas tirer une année d'un préfixe numérique arbitraire.
+fn annee_didl(date: &str) -> Option<i32> {
+    let date = date.trim();
+    let year = date.get(..4)?;
+    if !year.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i32 = year.parse().ok().filter(|y| (1..=9999).contains(y))?;
+    let valide = match date.len() {
+        4 => true,
+        7 => {
+            date.as_bytes()[4] == b'-'
+                && date[5..]
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(|mois| chrono::NaiveDate::from_ymd_opt(year, mois, 1))
+                    .is_some()
+        }
+        10 => chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok(),
+        _ => {
+            chrono::DateTime::parse_from_rfc3339(date).is_ok()
+                || chrono::NaiveDateTime::parse_from_str(date, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
+        }
+    };
+    valide.then_some(year)
+}
+
+fn genres_didl(mut element: &str) -> Vec<String> {
+    let mut genres = Vec::new();
+    while let Some(start) = balise_ouvrante(element, 0, "upnp:genre", true) {
+        let rest = &element[start..];
+        let Some(end) = rest.find("</upnp:genre>") else {
+            break;
+        };
+        if let Some(genre) = extract_xml_tag(&rest[..end + "</upnp:genre>".len()], "upnp:genre") {
+            let genre = genre.trim().to_string();
+            if !genre.is_empty() && !genre.eq_ignore_ascii_case("null") && !genres.contains(&genre)
+            {
+                genres.push(genre);
+            }
+        }
+        element = &rest[end + "</upnp:genre>".len()..];
+    }
+    genres
+}
+
 fn extract_xml_tag(element: &str, tag: &str) -> Option<String> {
     let open_full = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -2825,7 +3004,8 @@ mod tests {
 
     use super::{
         critere_de_recherche, echapper_valeur_critere, obstacle_de_montage,
-        parse_didl_browse_response, parse_res_elements, select_best_res, xml_escape,
+        parse_didl_browse_response, parse_res_elements, racine_des_montages, select_best_res,
+        xml_escape,
     };
 
     /// Build a SOAP Browse response whose escaped DIDL contains one item with
@@ -3063,6 +3243,43 @@ mod tests {
 
     fn err(kind: std::io::ErrorKind) -> std::io::Error {
         std::io::Error::new(kind, "essai")
+    }
+
+    /// #6345 (fil 2278, Mac mini sous Ventura) — sur macOS, le point de
+    /// montage par défaut n'est plus sous `/mnt`, que le volume système scellé
+    /// interdit de créer, mais dans le dossier de Tune de l'utilisateur.
+    #[test]
+    fn sur_macos_les_montages_ne_vont_pas_sous_mnt_6345() {
+        use crate::chemins_de_donnees::Plateforme;
+        let donnees = std::path::Path::new("/donnees/tune");
+        let home = std::ffi::OsStr::new("/Users/cyrille");
+        let racine = racine_des_montages(Plateforme::MacOs, Some(home), donnees);
+        assert_eq!(
+            racine,
+            std::path::PathBuf::from("/Users/cyrille/Library/Application Support/Tune/montages"),
+            "macOS : /mnt est sur le volume système en lecture seule (os error 30)"
+        );
+        assert_eq!(
+            racine_des_montages(Plateforme::MacOs, None, donnees),
+            std::path::PathBuf::from("/donnees/tune/montages")
+        );
+        // Linux et Tune OS gardent /mnt, que l'assistant privilégié prépare.
+        assert_eq!(
+            racine_des_montages(Plateforme::Autre, Some(home), donnees),
+            std::path::PathBuf::from("/mnt")
+        );
+    }
+
+    /// #6345 — « Read-only file system (os error 30) » est nommé, avec l'issue.
+    #[test]
+    fn une_racine_en_lecture_seule_est_nommee_6345() {
+        let (motif, msg) = obstacle_de_montage(
+            &err(std::io::ErrorKind::ReadOnlyFilesystem),
+            "/mnt/192.168.1.10_Musique",
+        );
+        assert_eq!(motif, "systeme_en_lecture_seule");
+        assert!(msg.contains("/mnt/192.168.1.10_Musique"), "{msg}");
+        assert!(msg.contains("lecture seule"), "{msg}");
     }
 
     /// Le cas de Dominique Comet : serveur lance depuis son repertoire

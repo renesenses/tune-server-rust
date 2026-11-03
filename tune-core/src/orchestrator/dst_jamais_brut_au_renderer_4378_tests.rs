@@ -144,9 +144,10 @@ async fn un_dff_dst_n_est_jamais_servi_brut_a_un_renderer() {
                 assert_ne!(resolu.bit_depth, Some(1));
             }
         }
-        Err(e) => assert!(
-            cfg!(not(feature = "dst")),
-            "avec la feature `dst`, un DSDIFF DST doit se résoudre : {e}"
-        ),
+        // Sans la feature `dst`, le refus est la réponse attendue.
+        #[cfg(not(feature = "dst"))]
+        Err(_) => {}
+        #[cfg(feature = "dst")]
+        Err(e) => panic!("avec la feature `dst`, un DSDIFF DST doit se résoudre : {e}"),
     }
 }

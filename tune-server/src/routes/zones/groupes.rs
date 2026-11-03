@@ -390,6 +390,15 @@ pub(super) async fn create_group(
         tune_core::event_types::EventType::GroupCreated,
         json!({ "id": id, "name": name, "zone_ids": zone_ids }),
     );
+    // #6155 — un groupe formé autour d'une zone qui joue déjà : les autres la
+    // rejoignent tout de suite, sans attendre son prochain geste. Hors de la
+    // réponse : prévenir un renderer DLNA peut prendre plusieurs secondes.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            super::relais_de_groupe_6155::aligner_les_suiveuses(&state, leader_id).await;
+        });
+    }
     Ok((
         StatusCode::CREATED,
         Json(crate::routes::zone_manager::generic_group_view(group)),

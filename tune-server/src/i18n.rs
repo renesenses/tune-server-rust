@@ -19,7 +19,14 @@ use axum::http::HeaderMap;
 /// Languages the UI ships with. Order is irrelevant; membership gates the
 /// `Accept-Language` parse so an unsupported browser locale falls back to
 /// [`FALLBACK`].
-pub const SUPPORTED: &[&str] = &["fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv"];
+///
+/// Quinze langues depuis le norvégien bokmål, le polonais et le grec (rc9) — les mêmes que
+/// l'interface web (`tune-web-client/src/lib/locales/`). Chaque clé de
+/// `i18n_server.json` doit porter chacune d'elles : le test
+/// `chaque_cle_porte_chaque_langue` le garde.
+pub const SUPPORTED: &[&str] = &[
+    "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi", "nb", "pl", "el",
+];
 
 /// Langue de repli du serveur : l'anglais, comme le client web. Ni un en-tête
 /// absent, ni une langue que l'interface ne parle pas (`pt-BR`), ni une clé
@@ -37,12 +44,25 @@ fn table() -> &'static HashMap<String, HashMap<String, String>> {
 /// `en`, `zh-Hant-TW` → `zh`. C'est la forme sous laquelle les langues sont
 /// comparées partout côté serveur (`SUPPORTED`, blocs de notes de version…).
 pub fn base_tag(tag: &str) -> String {
-    tag.trim()
-        .split('-')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_lowercase()
+    alias_langue(
+        tag.trim()
+            .split('-')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase(),
+    )
+}
+
+/// Le norvégien s'annonce `no` (ou `nn`, nynorsk, faute de mieux) : l'interface
+/// ne parle que le bokmål, `nb`. Point unique de cet alias côté serveur — le
+/// client web fait de même (`langueParDefaut.ts`). `base` est déjà en
+/// minuscules.
+pub fn alias_langue(base: String) -> String {
+    match base.as_str() {
+        "no" | "nn" => "nb".to_string(),
+        _ => base,
+    }
 }
 
 /// Langues d'un en-tête `Accept-Language`, dans l'ordre de préférence :
@@ -119,14 +139,18 @@ pub fn lang_from_request(param: Option<&str>, headers: &HeaderMap) -> String {
 /// to French — the language the table is written in first —, then to the key
 /// itself.
 pub fn t(lang: &str, key: &str) -> String {
-    if let Some(per_lang) = table().get(key) {
-        for langue in [lang, FALLBACK, "fr"] {
-            if let Some(v) = per_lang.get(langue) {
-                return v.clone();
-            }
-        }
-    }
-    key.to_string()
+    t_opt(lang, key).unwrap_or_else(|| key.to_string())
+}
+
+/// Comme [`t`], mais `None` quand la clé n'existe pas dans la table, au lieu
+/// de rendre la clé brute. Pour un texte qui a déjà une valeur par défaut —
+/// la description qu'un greffon déclare lui-même (#6458) — et qui ne doit être
+/// remplacé que si une traduction existe.
+pub fn t_opt(lang: &str, key: &str) -> Option<String> {
+    let per_lang = table().get(key)?;
+    [lang, FALLBACK, "fr"]
+        .into_iter()
+        .find_map(|langue| per_lang.get(langue).cloned())
 }
 
 #[cfg(test)]
@@ -146,6 +170,24 @@ mod tests {
         assert_eq!(base_tag(" EN-gb "), "en");
         assert_eq!(base_tag("zh-Hant-TW"), "zh");
         assert_eq!(base_tag(""), "");
+    }
+
+    /// Un navigateur norvégien envoie `no`, `nb-NO` ou `nn-NO` : tous donnent
+    /// le bokmål. Passe par `base_tag`, donc par `langues_acceptees`,
+    /// `lang_from_header` et chaque appelant, sans les toucher.
+    ///
+    /// Contre-épreuve : retirer le bras `"no" | "nn"` de `alias_langue` fait
+    /// rougir ce test (les en-têtes `no` et `nn` retombent sur `"en"`).
+    #[test]
+    fn no_et_nn_donnent_nb() {
+        assert_eq!(base_tag("no"), "nb");
+        assert_eq!(base_tag("nn-NO"), "nb");
+        assert_eq!(base_tag("NO"), "nb");
+        assert_eq!(base_tag("nb-NO"), "nb");
+        assert_eq!(lang_from_header(&en_tetes("no,en;q=0.5")), "nb");
+        assert_eq!(lang_from_header(&en_tetes("nn-NO,nn;q=0.9,en;q=0.5")), "nb");
+        assert_eq!(langues_acceptees("no-NO,en;q=0.5"), vec!["nb", "en"]);
+        assert_eq!(base_tag("fr"), "fr");
     }
 
     #[test]
@@ -221,6 +263,114 @@ mod tests {
         assert_eq!(t("xx", "cle.qui.n.existe.pas"), "cle.qui.n.existe.pas");
     }
 
+    /// Le hongrois et le vietnamien sont des langues de l'interface : un
+    /// `Accept-Language` qui les demande doit les obtenir, et non l'anglais.
+    ///
+    /// Contre-épreuve : retirer `"hu"` et `"vi"` de `SUPPORTED` fait rougir
+    /// ce test (les deux en-têtes retombent sur `"en"`).
+    #[test]
+    fn le_hongrois_et_le_vietnamien_sont_servis() {
+        assert_eq!(lang_from_header(&en_tetes("hu-HU,hu;q=0.9,en;q=0.8")), "hu");
+        assert_eq!(lang_from_header(&en_tetes("vi-VN,vi;q=0.9,en;q=0.8")), "vi");
+        assert_eq!(
+            t("hu", "metafield.composer"),
+            "Szerző",
+            "le texte hongrois de la table"
+        );
+        assert_eq!(t("vi", "metafield.composer"), "Nhà soạn nhạc");
+        assert_eq!(
+            t("vi", "ai.zonesAvailable"),
+            "Các vùng phát khả dụng: {zones}",
+            "« zone » se dit « vùng phát », comme dans l'interface web"
+        );
+        // Une langue inconnue de l'interface retombe sur l'anglais.
+        assert_eq!(lang_from_header(&en_tetes("pt-BR")), "en");
+        assert_eq!(t("pt", "metafield.composer"), t("en", "metafield.composer"));
+    }
+
+    /// Le norvégien bokmål, le polonais et le grec sont des langues de
+    /// l'interface : un `Accept-Language` qui les demande doit les obtenir.
+    ///
+    /// Contre-épreuve : retirer `"nb"`, `"pl"` et `"el"` de `SUPPORTED` fait
+    /// rougir ce test (les trois en-têtes retombent sur `"en"`).
+    #[test]
+    fn le_norvegien_le_polonais_et_le_grec_sont_servis() {
+        assert_eq!(lang_from_header(&en_tetes("nb-NO,nb;q=0.9,en;q=0.8")), "nb");
+        assert_eq!(lang_from_header(&en_tetes("pl-PL,pl;q=0.9,en;q=0.8")), "pl");
+        assert_eq!(lang_from_header(&en_tetes("el-GR,el;q=0.9,en;q=0.8")), "el");
+        assert_eq!(t("nb", "metafield.composer"), "Komponist");
+        assert_eq!(t("pl", "metafield.composer"), "Kompozytor");
+        assert_eq!(t("el", "metafield.composer"), "Συνθέτης");
+        assert_eq!(
+            t("el", "ai.zonesAvailable"),
+            "Διαθέσιμες ζώνες: {zones}",
+            "« zone » se dit « ζώνη », comme dans l'interface web"
+        );
+    }
+
+    /// Les jetons `{…}` d'un texte : `{title}`, `{n}`…
+    fn jetons(texte: &str) -> Vec<String> {
+        let mut vus: Vec<String> = Vec::new();
+        let mut reste = texte;
+        while let Some(debut) = reste.find('{') {
+            let Some(fin) = reste[debut..].find('}') else {
+                break;
+            };
+            vus.push(reste[debut..debut + fin + 1].to_string());
+            reste = &reste[debut + fin + 1..];
+        }
+        vus.sort();
+        vus
+    }
+
+    /// Complétude de la table : chaque clé porte CHAQUE langue de
+    /// [`super::SUPPORTED`], non vide, avec les mêmes jetons `{…}` que
+    /// l'anglais. Une langue absente d'une clé se replierait en silence sur
+    /// l'anglais — exactement le défaut que l'ajout du hongrois et du
+    /// vietnamien aurait laissé passer sur les 199 clés.
+    ///
+    /// Contre-épreuve : retirer une ligne `"vi"` (ou `"hu"`) de
+    /// `i18n_server.json`, ou y supprimer un `{title}`, fait rougir ce test en
+    /// nommant la clé et la langue.
+    #[test]
+    fn chaque_cle_porte_chaque_langue() {
+        let mut manques: Vec<String> = Vec::new();
+        assert!(!super::table().is_empty(), "i18n_server.json illisible");
+        let mut cles: Vec<&String> = super::table().keys().collect();
+        cles.sort();
+        for cle in cles {
+            let par_langue = &super::table()[cle];
+            let reference = par_langue.get("en").map(|s| jetons(s));
+            for langue in super::SUPPORTED {
+                match par_langue.get(*langue) {
+                    None => manques.push(format!("{cle} : «{langue}» absente")),
+                    Some(v) if v.trim().is_empty() => {
+                        manques.push(format!("{cle} : «{langue}» vide"))
+                    }
+                    Some(v) => {
+                        if let Some(attendus) = &reference
+                            && &jetons(v) != attendus
+                        {
+                            manques.push(format!(
+                                "{cle} : «{langue}» n'a pas les jetons {attendus:?} de l'anglais"
+                            ));
+                        }
+                    }
+                }
+            }
+            for langue in par_langue.keys() {
+                if !super::SUPPORTED.contains(&langue.as_str()) {
+                    manques.push(format!("{cle} : langue «{langue}» hors de SUPPORTED"));
+                }
+            }
+        }
+        assert!(
+            manques.is_empty(),
+            "table incomplète :\n{}",
+            manques.join("\n")
+        );
+    }
+
     #[test]
     fn le_parametre_gagne_puis_l_en_tete_puis_l_anglais() {
         let h = en_tetes("de-DE,de;q=0.9");
@@ -232,5 +382,51 @@ mod tests {
         );
         assert_eq!(lang_from_request(None, &h), "de");
         assert_eq!(lang_from_request(None, &HeaderMap::new()), "en");
+    }
+
+    /// #6857 (Alesp, fil 2395) — le refus « Lecture Spotify non activée »
+    /// envoyait à « Réglages > Spotify », qui n'existe pas. Le réglage est
+    /// dans l'onglet « Accès et jetons », carte « Spotify Connect », au niveau
+    /// Avancé. Chaque langue doit nommer la carte et l'onglet tels que
+    /// l'interface les affiche (`tune-web-client/src/lib/locales/*.ts`,
+    /// `settings.tabAccess`).
+    ///
+    /// Contre-épreuve : remettre les anciennes phrases (« Réglages >
+    /// Spotify ») dans `i18n_server.json` fait tomber ce test.
+    #[test]
+    fn le_refus_spotify_donne_le_vrai_chemin_du_reglage() {
+        let onglet = [
+            ("fr", "Accès et jetons"),
+            ("en", "Access and tokens"),
+            ("de", "Zugang und Token"),
+            ("es", "Acceso y tokens"),
+            ("it", "Accesso e token"),
+            ("zh", "访问与令牌"),
+            ("ja", "アクセスとトークン"),
+            ("ko", "접근과 토큰"),
+            ("ro", "Acces și jetoane"),
+            ("sv", "Åtkomst och tokens"),
+            ("hu", "Hozzáférés és tokenek"),
+            ("vi", "Truy cập và token"),
+            ("nb", "Tilgang og tokener"),
+            ("pl", "Dostęp i tokeny"),
+            ("el", "Πρόσβαση και διακριτικά"),
+        ];
+        assert_eq!(onglet.len(), super::SUPPORTED.len());
+        for (lang, libelle) in onglet {
+            let m = t(lang, "spotify.playback.disabled");
+            assert!(
+                m.contains(libelle),
+                "{lang} : onglet « {libelle} » absent de {m:?}"
+            );
+            assert!(
+                m.contains("Spotify Connect"),
+                "{lang} : carte absente de {m:?}"
+            );
+            assert!(
+                !m.contains("> Spotify"),
+                "{lang} : ancien chemin dans {m:?}"
+            );
+        }
     }
 }

@@ -50,12 +50,25 @@ async fn get(app: &axum::Router, path: &str) -> (StatusCode, Value) {
 }
 
 async fn corps(methode: &str, path: &str, body: Value) -> Request<Body> {
+    // #6721 — ces contrats gardent le dB, pas la garde contre les montées
+    // brusques : toute consigne de volume y est CONFIRMÉE (`confirm_increase`).
+    let body = avec_confirmation(body);
     Request::builder()
         .method(methode)
         .uri(path)
         .header("Content-Type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
+}
+
+/// #6721 — ajoute `confirm_increase: true` à un corps qui porte un volume.
+fn avec_confirmation(mut body: Value) -> Value {
+    if let Some(obj) = body.as_object_mut()
+        && (obj.contains_key("volume") || obj.contains_key("volume_db"))
+    {
+        obj.insert("confirm_increase".into(), json!(true));
+    }
+    body
 }
 
 async fn post(app: &axum::Router, path: &str, body: Value) -> (StatusCode, Value) {

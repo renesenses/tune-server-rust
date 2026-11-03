@@ -158,8 +158,25 @@ pub fn decoder_rejection(path: &Path) -> Option<UnsupportedLibraryAudio> {
 /// métadonnées qui le comptera en échec, avec le message de symphonia.
 fn refus_matroska(ext: &str, path: &Path) -> Option<UnsupportedLibraryAudio> {
     use super::matroska::PisteAudio;
-    match super::matroska::sonder(path).ok()?.piste {
+    let sonde = super::matroska::sonder(path).ok()?;
+    match sonde.piste {
         PisteAudio::Decodable { .. } => None,
+        // #6353 — un flux Dolby reconnu dit ce qu'il porte, et que c'est le
+        // PASSTHROUGH vers l'ampli qui manque, pas un décodeur. La clé du
+        // rapport ne change pas.
+        PisteAudio::NonDecodable { codec } if sonde.flux_dolby.is_some() => {
+            let flux = sonde.flux_dolby.as_ref()?;
+            Some(UnsupportedLibraryAudio {
+                report_key: format!("{ext}-codec-non-decodable-{codec}"),
+                reason: format!(
+                    "Matroska : piste audio « {codec} » ({}), aucun décodeur livré ne la lit \
+                     (FLAC, PCM, Vorbis, AAC, ALAC et Opus dans Matroska sont lus) ; son envoi \
+                     tel quel à un amplificateur (passthrough) n'est pas encore pris en charge \
+                     (#6353)",
+                    flux.decrire()
+                ),
+            })
+        }
         PisteAudio::NonDecodable { codec } => Some(UnsupportedLibraryAudio {
             report_key: format!("{ext}-codec-non-decodable-{codec}"),
             reason: format!(

@@ -244,10 +244,10 @@ impl UpnpState {
     }
 
     pub fn server_ip(&self) -> String {
-        if let Some(ref ip) = self.advertised_ip {
-            if !ip.is_empty() {
-                return ip.clone();
-            }
+        if let Some(ref ip) = self.advertised_ip
+            && !ip.is_empty()
+        {
+            return ip.clone();
         }
         ssdp::get_local_ip()
             .map(|ip| ip.to_string())
@@ -840,7 +840,7 @@ fn predicat_de_classe(op: &str, valeur: &str, classe: &str, ancetres: &[&str]) -
         "!=" => Ok(classe != valeur),
         "contains" => Ok(classe.contains(valeur)),
         "doesnotcontain" => Ok(!classe.contains(valeur)),
-        "derivedfrom" => Ok(valeur == classe || ancetres.iter().any(|a| *a == valeur)),
+        "derivedfrom" => Ok(valeur == classe || ancetres.contains(&valeur)),
         _ => Err(()),
     }
 }
@@ -3705,6 +3705,11 @@ fn didl_track_item(track: &Track, parent_id: &str, base_url: &str) -> String {
         .channels(track.channels as u32)
         .artist_opt(track.artist_name.as_deref())
         .album_opt(track.album_title.as_deref())
+        .year_opt(track.year)
+        .genres(crate::db::edition_album::genres_de_piste(
+            track.genre.clone(),
+            track.genres.clone(),
+        ))
         .album_art_opt(cover_url.as_deref())
         .sample_rate_opt(advertised_sr)
         .bit_depth_opt(advertised_bd)
@@ -3764,10 +3769,10 @@ pub fn advert_location(ip: &str, port: u16) -> String {
 /// détection automatique. `None` (et non « 127.0.0.1 ») quand rien n'est
 /// joignable — annoncer du loopback est pire que ne rien annoncer.
 fn current_advert_ip(advertised_ip: Option<&str>) -> Option<String> {
-    if let Some(ip) = advertised_ip {
-        if !ip.is_empty() {
-            return Some(ip.to_string());
-        }
+    if let Some(ip) = advertised_ip
+        && !ip.is_empty()
+    {
+        return Some(ip.to_string());
     }
     ssdp::get_local_ip().map(|ip| ip.to_string())
 }
@@ -5723,6 +5728,7 @@ mod tests {
             cue_start_ms: None,
             cue_end_ms: None,
             rating: None,
+            bitrate_kbps: None,
         }
     }
 
@@ -5883,10 +5889,10 @@ mod tests {
                             "{drapeau}({oid}) publie un conteneur SANS l'attribut \
                              obligatoire restricted : <container {entete}>"
                         );
-                        if drapeau == "BrowseDirectChildren" {
-                            if let Some(id) = id_du_conteneur(entete) {
-                                suivants.push(id);
-                            }
+                        if drapeau == "BrowseDirectChildren"
+                            && let Some(id) = id_du_conteneur(entete)
+                        {
+                            suivants.push(id);
                         }
                     }
                 }

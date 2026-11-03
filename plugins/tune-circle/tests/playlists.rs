@@ -40,6 +40,8 @@ struct FauxService {
     ecritures: Arc<AtomicUsize>,
     /// Identifiants demandés à `get_track`.
     lus: Arc<Mutex<Vec<String>>>,
+    /// #7022 : temps de réponse simulé de `search` et `get_track`.
+    delai_ms: u64,
 }
 
 fn refuse(ecritures: &AtomicUsize) -> TuneError {
@@ -95,6 +97,7 @@ impl StreamingService for FauxService {
         Err(refuse(&self.ecritures))
     }
     async fn search(&self, _query: &str, _limit: usize) -> Result<SearchResults, TuneError> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.delai_ms)).await;
         Ok(SearchResults {
             tracks: self.pistes.clone(),
             albums: vec![],
@@ -103,6 +106,7 @@ impl StreamingService for FauxService {
         })
     }
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.delai_ms)).await;
         self.lus.lock().unwrap().push(track_id.to_string());
         self.pistes
             .iter()
@@ -192,6 +196,14 @@ struct Banc {
 
 /// `services` : (nom, connecté, pistes) de chaque faux service inscrit.
 async fn banc(services: Vec<(&'static str, bool, Vec<StreamTrack>)>) -> Banc {
+    banc_avec_delai(services, 0).await
+}
+
+/// #7022 : le même banc, chaque appel à un service répondant en `delai_ms`.
+async fn banc_avec_delai(
+    services: Vec<(&'static str, bool, Vec<StreamTrack>)>,
+    delai_ms: u64,
+) -> Banc {
     let faux = demarrer().await;
     let backend = base(&faux.base, Some(JETON));
     let ecritures = Arc::new(AtomicUsize::new(0));
@@ -204,6 +216,7 @@ async fn banc(services: Vec<(&'static str, bool, Vec<StreamTrack>)>) -> Banc {
             pistes,
             ecritures: ecritures.clone(),
             lus: lus.clone(),
+            delai_ms,
         }));
     }
     let lecture = Arc::new(FausseLecture::default());
@@ -239,6 +252,7 @@ async fn rebrancher(b: Banc, nom: &'static str) -> Banc {
         )],
         ecritures: b.ecritures.clone(),
         lus: b.lus.clone(),
+        delai_ms: 0,
     }));
     let app = playlists::router(Arc::new(Collaboratif {
         relais: Arc::new(Relais::new(b.backend.clone())),
@@ -272,6 +286,30 @@ fn semer_une_piste_locale(backend: &Arc<dyn DbBackend>) -> i64 {
 }
 
 // 1. Relais ------------------------------------------------------------------
+/// #7124 (site-mozaiklabs#380) : un membre partage une playlist dans le cercle
+/// d'un autre ; ses champs (`circle_name`, `circle_owner_id`, `can_remove`)
+/// sont relayés tels quels, `circle_id` reste nul pour un membre.
+#[tokio::test]
+async fn la_playlist_partagee_par_un_membre_est_relayee_telle_quelle() {
+    let b = banc(vec![]).await;
+    b.faux.etat.lock().unwrap().playlists = vec![json!({
+        "id": 8, "name": "Les trouvailles de Bruno", "circle_id": null,
+        "circle_name": "Bêta-testeurs", "circle_owner_id": 7,
+        "owner": { "user_id": 9, "name": "Bruno" }, "mine": false, "can_remove": false,
+        "version": 1, "items": []
+    })];
+    let r = appel(&b.app, "GET", "/playlists/8", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    let v = r.json();
+    assert_eq!(v["circle_name"], "Bêta-testeurs");
+    assert_eq!(v["circle_owner_id"], 7);
+    assert_eq!(v["owner"]["name"], "Bruno");
+    assert_eq!(v["can_remove"], false);
+    assert!(v["circle_id"].is_null());
+    // Contre-épreuve : une playlist inconnue reste un 404 du cloud.
+    let r = appel(&b.app, "GET", "/playlists/404", None).await;
+    assert_eq!(r.statut, StatusCode::NOT_FOUND);
+}
 
 #[tokio::test]
 async fn les_routes_de_playlist_relaient_statut_et_corps() {
@@ -534,7 +572,10 @@ async fn un_utilisateur_qobuz_rejoue_par_l_identifiant_qobuz() {
     assert_eq!(
         ligne_de(&r.json(), 51),
         json!({ "item_id": 51, "status": "matched", "source": "qobuz",
-                "source_id": "q-so-what", "method": "service_id" })
+                "source_id": "q-so-what", "method": "service_id",
+                "title": "So What", "artist_name": "Miles Davis",
+                "album_title": "Kind of Blue", "duration_ms": 562000,
+                "cover_url": null, "album_ref": null })
     );
     // La forme que lit l'écran (web#1731) : un tableau, dans l'ordre.
     let ids: Vec<Value> = r
@@ -546,6 +587,64 @@ async fn un_utilisateur_qobuz_rejoue_par_l_identifiant_qobuz() {
         .collect();
     assert_eq!(ids, vec![json!(51), json!(52), json!(53)]);
     assert_eq!(b.ecritures.load(Ordering::SeqCst), 0);
+}
+
+/// #7022 : les morceaux sont résolus PLUSIEURS À LA FOIS par la route, et
+/// la réouverture ne repasse pas chez le service. Chaque appel au service
+/// prend 300 ms ; les trois morceaux en coûtent un chacun (identifiant
+/// Qobuz, recherche, recherche) : 900 ms un par un, ~300 ms ensemble.
+#[tokio::test]
+async fn resolve_interroge_le_service_en_parallele_puis_lit_son_cache() {
+    let b = banc_avec_delai(
+        vec![(
+            "qobuz",
+            true,
+            vec![
+                piste("q-so-what", "So What", "Miles Davis", 562_000, None),
+                piste("q-bleu", "Blue in Green", "Miles Davis", 337_000, None),
+            ],
+        )],
+        300,
+    )
+    .await;
+    let debut = std::time::Instant::now();
+    let r = appel(&b.app, "POST", "/playlists/5/resolve", None).await;
+    let premier = debut.elapsed();
+    assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
+    let ids: Vec<Value> = r
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["item_id"].clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![json!(51), json!(52), json!(53)],
+        "ordre de la playlist perdu"
+    );
+    assert!(
+        premier < std::time::Duration::from_millis(700),
+        "résolution séquentielle : 3 morceaux à 300 ms ont pris {premier:?} (attendu < 700 ms)"
+    );
+    let lus = b.lus.lock().unwrap().len();
+    let debut = std::time::Instant::now();
+    let r2 = appel(&b.app, "POST", "/playlists/5/resolve", None).await;
+    let second = debut.elapsed();
+    assert_eq!(
+        r2.json(),
+        r.json(),
+        "la réouverture ne rend pas la même résolution"
+    );
+    assert_eq!(
+        b.lus.lock().unwrap().len(),
+        lus,
+        "pas de cache : la réouverture a rappelé le service"
+    );
+    assert!(
+        second < std::time::Duration::from_millis(250),
+        "pas de cache : la réouverture a pris {second:?}"
+    );
 }
 
 /// Un utilisateur Tidal SEUL, pour un morceau qui ne porte que `qobuz_id` et
@@ -587,7 +686,10 @@ async fn sans_le_service_de_la_reference_le_repli_isrc_trouve_ailleurs() {
     assert_eq!(
         ligne_de(&r.json(), 52),
         json!({ "item_id": 52, "status": "matched", "source": "tidal",
-                "source_id": "t-bon", "method": "isrc" })
+                "source_id": "t-bon", "method": "isrc",
+                "title": "Blue In Green (Remastered)", "artist_name": "Miles Davis",
+                "album_title": "Kind of Blue", "duration_ms": 337000,
+                "cover_url": null, "album_ref": null })
     );
     assert!(
         !b.lus.lock().unwrap().iter().any(|id| id == "q-bleu"),
@@ -618,7 +720,10 @@ async fn repli_texte_puis_introuvable() {
     assert_eq!(
         ligne_de(&j, 51),
         json!({ "item_id": 51, "status": "matched", "source": "deezer",
-                "source_id": "d-9", "method": "text" })
+                "source_id": "d-9", "method": "text",
+                "title": "So What", "artist_name": "Miles Davis",
+                "album_title": "Kind of Blue", "duration_ms": 562000,
+                "cover_url": null, "album_ref": null })
     );
     assert_eq!(
         ligne_de(&j, 53),
@@ -645,7 +750,7 @@ async fn une_piste_de_la_bibliotheque_est_rendue_sans_son_chemin() {
     assert_eq!(
         ligne_de(&r.json(), 51),
         json!({ "item_id": 51, "status": "matched", "source": "local",
-                "source_id": "1", "track_id": 1, "method": "isrc" })
+                "source_id": "1", "track_id": 1, "album_id": 10, "method": "isrc" })
     );
     assert!(!String::from_utf8_lossy(&r.octets).contains("/Users"));
 }
@@ -696,6 +801,208 @@ async fn jouer_sans_zone_ou_sans_rien_de_jouable_ne_lance_rien() {
     assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(r.json()["code"], "circle.nothing_playable");
     assert!(b.lecture.files.lock().unwrap().is_empty());
+}
+
+// 4 bis. Lecture par morceau (web#2219, go de Bertrand du 19/10) ---------------
+
+/// Qobuz connaît 51 par son identifiant et 52 par l'ISRC ; 53 reste introuvable.
+async fn banc_deux_jouables() -> Banc {
+    let mut bleu = piste(
+        "q-bleu",
+        "Blue in Green",
+        "Miles Davis",
+        337_000,
+        Some("USSM15900115"),
+    );
+    bleu.cover_path = Some("https://static.qobuz.com/images/covers/kob.jpg".into());
+    banc(vec![(
+        "qobuz",
+        true,
+        vec![
+            piste("q-so-what", "So What", "Miles Davis", 562_000, None),
+            bleu,
+        ],
+    )])
+    .await
+}
+
+fn file_jouee(b: &Banc) -> Vec<String> {
+    let files = b.lecture.files.lock().unwrap();
+    assert_eq!(files.len(), 1, "une seule lecture attendue");
+    files[0]
+        .1
+        .iter()
+        .map(|e| match e {
+            QueueInput::Streaming { source_id, .. } => source_id.clone(),
+            QueueInput::Local { track_id } => format!("local:{track_id}"),
+        })
+        .collect()
+}
+
+/// ▶ sur une ligne : la playlist À PARTIR de ce morceau, la suite en file.
+/// Les morceaux d'avant ne sont ni joués ni même cherchés chez le service.
+#[tokio::test]
+async fn jouer_a_partir_d_un_morceau_met_la_suite_en_file() {
+    let b = banc_deux_jouables().await;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/play",
+        Some(json!({ "zone_id": 3, "from_item_id": 52 })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
+    assert_eq!(file_jouee(&b), vec!["q-bleu"]);
+    assert_eq!(r.json()["queued"], 1);
+    assert_eq!(r.json()["missing"], json!([53]));
+    let ids: Vec<Value> = r.json()["resolution"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["item_id"].clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![json!(52), json!(53)],
+        "seuls les morceaux choisis sont résolus"
+    );
+    assert!(
+        !b.lus.lock().unwrap().iter().any(|id| id == "q-so-what"),
+        "le morceau d'avant le départ ne doit pas être cherché"
+    );
+
+    // L'identifiant opaque peut revenir en texte : même geste.
+    let b = banc_deux_jouables().await;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/play",
+        Some(json!({ "zone_id": 3, "from_item_id": "51" })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
+    assert_eq!(file_jouee(&b), vec!["q-so-what", "q-bleu"]);
+}
+
+/// « Lire ce titre seulement » : `item_ids` d'un seul morceau. Plusieurs :
+/// dans l'ordre DONNÉ (la lecture aléatoire de l'écran).
+#[tokio::test]
+async fn item_ids_ne_joue_que_ces_morceaux_dans_l_ordre_donne() {
+    let b = banc_deux_jouables().await;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/play",
+        Some(json!({ "zone_id": 3, "item_ids": [52] })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
+    assert_eq!(file_jouee(&b), vec!["q-bleu"]);
+    assert_eq!(r.json()["missing"], json!([]));
+
+    let b = banc_deux_jouables().await;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/play",
+        Some(json!({ "zone_id": 3, "item_ids": [52, 53, 51] })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
+    assert_eq!(file_jouee(&b), vec!["q-bleu", "q-so-what"]);
+    assert_eq!(r.json()["missing"], json!([53]));
+}
+
+/// Un départ introuvable chez moi : rien ne part, plutôt que de commencer
+/// sur un autre titre que celui cliqué.
+#[tokio::test]
+async fn un_depart_introuvable_ne_lance_rien() {
+    let b = banc_deux_jouables().await;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/play",
+        Some(json!({ "zone_id": 3, "from_item_id": 53 })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY, "{:?}", r.json());
+    assert_eq!(r.json()["code"], "circle.item_not_playable");
+    assert!(b.lecture.files.lock().unwrap().is_empty());
+}
+
+/// Les deux sélections ensemble, une liste vide ou un morceau qu'un autre
+/// membre a retiré : refus nommé, rien ne part.
+#[tokio::test]
+async fn une_selection_invalide_ou_perimee_ne_lance_rien() {
+    let b = banc_deux_jouables().await;
+    for (corps, code) in [
+        (
+            json!({ "zone_id": 3, "from_item_id": 51, "item_ids": [52] }),
+            "circle.invalid_selection",
+        ),
+        (
+            json!({ "zone_id": 3, "item_ids": [] }),
+            "circle.invalid_selection",
+        ),
+        (
+            json!({ "zone_id": 3, "item_ids": "51" }),
+            "circle.invalid_selection",
+        ),
+        (
+            json!({ "zone_id": 3, "from_item_id": {} }),
+            "circle.invalid_selection",
+        ),
+        (
+            json!({ "zone_id": 3, "from_item_id": 999 }),
+            "circle.unknown_item",
+        ),
+        (
+            json!({ "zone_id": 3, "item_ids": [51, 999] }),
+            "circle.unknown_item",
+        ),
+    ] {
+        let r = appel(&b.app, "POST", "/playlists/5/play", Some(corps.clone())).await;
+        assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY, "{corps}");
+        assert_eq!(r.json()["code"], code, "{corps}");
+    }
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/play",
+        Some(json!({ "zone_id": 3, "item_ids": [51, 999] })),
+    )
+    .await;
+    assert_eq!(r.json()["unknown"], json!(["999"]));
+    assert!(b.lecture.files.lock().unwrap().is_empty());
+}
+
+/// La résolution rend, pour un titre de service, de quoi l'ENFILER par les
+/// routes de file existantes (« Lire ensuite », « Ajouter à la file ») et sa
+/// pochette chez MON service ; pour une piste de ma bibliothèque, son album.
+#[tokio::test]
+async fn la_resolution_rend_de_quoi_enfiler_et_la_pochette() {
+    let b = banc_deux_jouables().await;
+    let r = appel(&b.app, "POST", "/playlists/5/resolve", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    let l = ligne_de(&r.json(), 52);
+    assert_eq!(l["source"], "qobuz");
+    assert_eq!(l["source_id"], "q-bleu");
+    assert_eq!(l["title"], "Blue in Green");
+    assert_eq!(l["artist_name"], "Miles Davis");
+    assert_eq!(l["album_title"], "Kind of Blue");
+    assert_eq!(l["duration_ms"], 337000);
+    assert_eq!(
+        l["cover_url"],
+        "https://static.qobuz.com/images/covers/kob.jpg"
+    );
+
+    let b = banc(vec![]).await;
+    semer_une_piste_locale(&b.backend);
+    let r = appel(&b.app, "POST", "/playlists/5/resolve", None).await;
+    let l = ligne_de(&r.json(), 51);
+    assert_eq!(l["track_id"], 1);
+    assert_eq!(l["album_id"], 10);
+    assert!(!String::from_utf8_lossy(&r.octets).contains("/Users"));
 }
 
 // 5. Révocation --------------------------------------------------------------

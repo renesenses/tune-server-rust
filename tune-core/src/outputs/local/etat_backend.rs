@@ -8,7 +8,7 @@ use super::*;
 ///
 /// - `"asio"`: use the ASIO host (requires `asio` cargo feature; Windows only).
 ///   Falls back to WASAPI, with a warning, if the host cannot be opened or
-///   exposes no output device.
+///   has no registered ASIO driver.
 /// - `"wasapi"`: use the default host (WASAPI on Windows)
 /// - `"auto"` (default): use WASAPI directly. **`auto` never probes ASIO.**
 /// - anything else: treated like `"wasapi"`.
@@ -32,7 +32,9 @@ pub fn select_host(backend: &str) -> cpal::Host {
         match backend_lower.as_str() {
             "asio" => match cpal::host_from_id(cpal::HostId::Asio) {
                 Ok(host) => {
-                    let device_count = host.output_devices().map(|d| d.count()).unwrap_or(0);
+                    // Loading a busy driver can fail although it is installed.
+                    // Backend selection must use the registry, without opening it.
+                    let device_count = super::parc::pilotes_asio_enregistres(&host).len();
                     let (active, fallback) = asio_outcome(Some(device_count));
                     if fallback.is_none() {
                         info!(
@@ -45,7 +47,7 @@ pub fn select_host(backend: &str) -> cpal::Host {
                     }
                     warn!(
                         fallback_reason = LocalBackendFallback::AsioNoDevices.code(),
-                        "local_audio_asio_no_devices — ASIO host OK but no output devices found, falling back to WASAPI"
+                        "local_audio_asio_no_devices — ASIO host OK but no registered drivers found, falling back to WASAPI"
                     );
                     note_observed_backend(active, fallback);
                     return cpal::default_host();
@@ -276,6 +278,10 @@ pub enum LocalBackendFallback {
     /// Windows, ou Windows compilé sans la feature `asio`. Connu à la
     /// compilation, donc affirmable sans avoir ouvert le moindre périphérique.
     AsioUnsupportedBuild,
+    /// #6452 — ASIO n'a pas été ouvert de CE démarrage : le précédent n'a pas
+    /// atteint `listening` (témoin `demarrage.pending` resté en place). Le
+    /// choix enregistré n'a pas bougé ; le démarrage suivant retentera ASIO.
+    AsioDemarragePrecedentInacheve,
 }
 
 impl LocalBackendFallback {
@@ -285,6 +291,7 @@ impl LocalBackendFallback {
             Self::AsioNoDevices => "asio_no_devices",
             Self::AsioHostUnavailable => "asio_host_unavailable",
             Self::AsioUnsupportedBuild => "asio_unsupported_build",
+            Self::AsioDemarragePrecedentInacheve => "asio_demarrage_precedent_inacheve",
         }
     }
 
@@ -303,15 +310,17 @@ impl LocalBackendFallback {
                 "ASIO demandé : cette version du serveur n'embarque pas ASIO — \
                  sortie par le backend natif de la plateforme"
             }
+            Self::AsioDemarragePrecedentInacheve => crate::demarrage_inacheve::DETAIL,
         }
     }
 
     /// Toutes les variantes. Sert la contre-épreuve permanente : un motif
     /// ajouté sans être câblé fait tomber le test qui parcourt cette liste.
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::AsioNoDevices,
         Self::AsioHostUnavailable,
         Self::AsioUnsupportedBuild,
+        Self::AsioDemarragePrecedentInacheve,
     ];
 }
 
@@ -673,7 +682,8 @@ pub fn sans_noter_le_backend_observe<T>(f: impl FnOnce() -> T) -> T {
 /// Issue d'une demande `asio` sur une cible qui embarque ASIO.
 ///
 /// `asio_devices` : `None` = l'hôte ASIO ne s'ouvre pas ; `Some(0)` = il
-/// s'ouvre mais n'expose aucune sortie ; `Some(n > 0)` = ASIO joue.
+/// s'ouvre sans pilote enregistré ; `Some(n > 0)` = ASIO reste sélectionné,
+/// même si un autre processus tient tous ses pilotes.
 ///
 /// Isolée de cpal exprès : la branche appelante vit sous
 /// `#[cfg(all(target_os = "windows", feature = "asio"))]` et ne peut être
@@ -755,6 +765,28 @@ pub fn active_backend_status(requested: &str) -> LocalBackendStatus {
         requested,
     );
     status.realtime = OBSERVED_REALTIME.read().ok().and_then(|g| g.clone());
+    appliquer_le_repli_de_demarrage(status, crate::demarrage_inacheve::repli_actif())
+}
+
+/// #6452 — sous le repli de démarrage, l'écran doit dire ce qui était DEMANDÉ
+/// et pourquoi il n'est pas ouvert.
+///
+/// Le repli remplace l'hôte à la source (`AppState::effective_audio_backend`
+/// rend `auto`) : les appelants passent donc `auto` comme demande, et
+/// `select_host("auto")` observe WASAPI sans motif. Sans cette étape, le
+/// chemin du signal et les réglages audio annonceraient « WASAPI, rien à
+/// signaler » à quelqu'un qui a choisi ASIO. `repli` est l'hôte écarté.
+pub fn appliquer_le_repli_de_demarrage(
+    mut status: LocalBackendStatus,
+    repli: Option<&str>,
+) -> LocalBackendStatus {
+    if let Some(hote) = repli {
+        let motif = LocalBackendFallback::AsioDemarragePrecedentInacheve;
+        status.requested = hote.to_lowercase();
+        status.fell_back = true;
+        status.fallback_reason = Some(motif);
+        status.fallback_detail = Some(motif.detail());
+    }
     status
 }
 

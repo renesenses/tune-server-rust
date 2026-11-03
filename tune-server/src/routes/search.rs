@@ -137,6 +137,7 @@
 //! | `all`                     | rendus                  | tous ceux authentifiés |
 //! | `qobuz` (un service)      | **vides**               | ce service          |
 //! | `local,qobuz`             | rendus                  | ce service          |
+//! | `radios` (#7045)          | `local` vide, `radios` rendu | aucun          |
 //! | valeur inconnue, ou vide  | **vides**               | aucun               |
 //!
 //! **Le paramètre absent ne change pas** : c'est la pilule « Tous », le seul
@@ -183,6 +184,7 @@ use tune_core::streaming::traits::PLAFOND_LIMITE_RECHERCHE;
 use tune_core::streaming::traits::{SearchResults, StreamTrack, StreamingService};
 
 use crate::routes::filtre_sources::FiltreSources;
+use crate::routes::radios_annuaire::{EtatAnnuaire, FiltresAnnuaire, corps_annuaire_avec_liens};
 use crate::state::AppState;
 
 /// Lancer toutes les recherches de service EN MÊME TEMPS, et ranger ce qu'elles
@@ -495,6 +497,63 @@ fn ecrire_curseur(suites: &std::collections::BTreeMap<String, usize>) -> Option<
 // la semaine à corriger ailleurs. Il n'en existe donc qu'une, et c'est elle
 // que les quatre routes appellent.
 
+/// #7045 — nombre maximal de fiches de l'annuaire rendues dans `radios_annuaire`.
+///
+/// L'annuaire compte déjà plusieurs centaines de stations et en comptera
+/// plusieurs milliers (rapport de Rémi, 25/10/2026) : la recherche globale n'en
+/// rend qu'un aperçu, `total` et `has_more` disent le reste. Le parcours
+/// complet, paginé et filtré, est `GET /radios/directory`.
+const LIMITE_RADIOS_ANNUAIRE: usize = 40;
+
+/// Le bloc `radios_annuaire` d'une recherche qui n'a rien cherché dans
+/// l'annuaire (source exclue, page de curseur, annuaire non relevé, requête
+/// vide). La clé est TOUJOURS présente : la forme ne dépend pas de l'état.
+fn radios_annuaire_vides() -> Value {
+    json!({
+        "total": 0,
+        "count": 0,
+        "has_more": false,
+        "origine": "aucun",
+        "items": [],
+    })
+}
+
+/// #7045 — les fiches de l'annuaire que la requête désigne, réduites à un
+/// aperçu borné.
+///
+/// Chaque entrée a EXACTEMENT la forme de `GET /radios/directory` (même
+/// fonction, [`corps_annuaire_avec_liens`]) : le client lit une seule fiche,
+/// quelle que soit la route. `my_radio_id` dit si la station est déjà dans
+/// « Mes radios » ; elle peut alors figurer aussi dans `radios` (le client
+/// dédoublonne sur cet identifiant). Aucun accès réseau : le relevé est lu en
+/// mémoire.
+pub(crate) fn radios_annuaire_de_la_recherche(
+    mes_radios: &[tune_core::db::radio_repo::RadioStation],
+    annuaire: &[crate::routes::radios::StationAnnuaire],
+    liens: &HashMap<i64, String>,
+    etat: &EtatAnnuaire,
+    requete: &str,
+) -> Value {
+    if requete.trim().is_empty() || annuaire.is_empty() {
+        return radios_annuaire_vides();
+    }
+    let filtres = FiltresAnnuaire {
+        q: Some(requete.to_string()),
+        limit: Some(LIMITE_RADIOS_ANNUAIRE),
+        ..Default::default()
+    };
+    let corps = corps_annuaire_avec_liens(annuaire, mes_radios, liens, &filtres, etat);
+    let total = corps["total"].as_u64().unwrap_or(0);
+    let count = corps["count"].as_u64().unwrap_or(0);
+    json!({
+        "total": total,
+        "count": count,
+        "has_more": total > count,
+        "origine": corps["origine"],
+        "items": corps["items"],
+    })
+}
+
 pub fn router() -> Router<AppState> {
     Router::new().route("/", get(federated_search))
 }
@@ -530,7 +589,20 @@ async fn federated_search(
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let track_repo = TrackRepo::with_backend(state.backend.clone());
 
-    let (artists, albums, tracks, radios) = if local_demande {
+    // #7045 — les radios ont leur propre demande : `sources=radios` les rend
+    // sans la bibliothèque. Première page seulement, comme avant (#4803).
+    let radios_demandees = filtre.radios_demandees() && !page_de_curseur;
+    let radios = if radios_demandees {
+        // Les radios ne sont pas paginées : elles appartiennent à la
+        // première page, une page de curseur les répéterait (#4803).
+        RadioRepo::with_backend(state.backend.clone())
+            .search(&p.q)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let (artists, albums, tracks) = if local_demande {
         (
             artist_repo
                 .search_page(&p.q, limit, offset)
@@ -544,19 +616,40 @@ async fn federated_search(
             track_repo
                 .search_page(&p.q, limit, offset)
                 .unwrap_or_default(),
-            // Les radios ne sont pas paginées : elles appartiennent à la
-            // première page, une page de curseur les répéterait (#4803).
-            if page_de_curseur {
-                Vec::new()
-            } else {
-                RadioRepo::with_backend(state.backend.clone())
-                    .search(&p.q)
-                    .unwrap_or_default()
-            },
         )
     } else {
         // Pas « calculer puis jeter » : les requêtes ne partent pas.
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+
+    // #7045 — l'annuaire des radios, à côté de « Mes radios » (`radios`). Même
+    // règle que `radios` : première page seulement, et seulement si le local
+    // est demandé. Clé additive : un client plus ancien l'ignore.
+    let radios_annuaire = if radios_demandees {
+        let annuaire = state
+            .annuaire_radios
+            .read()
+            .map(|a| a.clone())
+            .unwrap_or_default();
+        if annuaire.is_empty() {
+            radios_annuaire_vides()
+        } else {
+            let etat = state
+                .annuaire_etat
+                .read()
+                .map(|e| e.clone())
+                .unwrap_or_default();
+            let repo = RadioRepo::with_backend(state.backend.clone());
+            radios_annuaire_de_la_recherche(
+                &repo.list().unwrap_or_default(),
+                &annuaire,
+                &repo.liens_annuaire().unwrap_or_default(),
+                &etat,
+                &p.q,
+            )
+        }
+    } else {
+        radios_annuaire_vides()
     };
 
     // Les totaux. Un `COUNT` qui échoue ne doit pas rendre 0 alors qu'une
@@ -793,6 +886,7 @@ async fn federated_search(
             "offset": offset,
         },
         "radios": radios,
+        "radios_annuaire": radios_annuaire,
         "services": service_results,
     });
     if let (Some(suites), Some(o)) = (suites, reponse.as_object_mut()) {
@@ -833,6 +927,10 @@ fn avec_date_d_ajout(
 #[cfg(test)]
 #[path = "search_pagination_i4803_tests.rs"]
 mod tests_pagination_i4803;
+
+#[cfg(test)]
+#[path = "search_radios_annuaire_i7045_tests.rs"]
+mod tests_radios_annuaire_i7045;
 
 #[cfg(test)]
 #[path = "service_desactive_i5103_tests.rs"]

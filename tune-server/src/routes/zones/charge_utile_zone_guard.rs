@@ -64,7 +64,7 @@ fn corps_de_build_zone_json() -> &'static str {
 /// découpe déjà.
 fn corps_de_build_snapshot() -> &'static str {
     const TOUT: &str = include_str!("../ws.rs");
-    const DEBUT: &str = "async fn build_snapshot(state: &AppState)";
+    const DEBUT: &str = "async fn build_snapshot(state: &AppState, lang: &str)";
     const FIN: &str = "\nasync fn handle_socket(";
     let debut = TOUT
         .find(DEBUT)

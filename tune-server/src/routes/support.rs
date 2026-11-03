@@ -309,10 +309,11 @@ fn client_error(code: &str, message: &str) -> Response {
 fn payload_too_large(file_name: &str) -> Response {
     (
         StatusCode::PAYLOAD_TOO_LARGE,
-        Json(json!({
-            "error": "attachment_too_large",
-            "message": format!("« {file_name} » dépasse la taille maximale de 50 Mo."),
-        })),
+        Json(crate::message_api::corps_refus(
+            "attachment_too_large",
+            "api.support.attachmentTooLarge",
+            &[("file_name", file_name.to_string())],
+        )),
     )
         .into_response()
 }
@@ -536,10 +537,11 @@ fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
 
     Err((
         StatusCode::PRECONDITION_FAILED,
-        Json(json!({
-            "error": "not_connected",
-            "message": "Connecte-toi à ton compte Tune ou active ta licence premium pour utiliser le support.",
-        })),
+        Json(crate::message_api::corps_refus(
+            "not_connected",
+            "api.support.notConnected",
+            &[],
+        )),
     )
         .into_response())
 }

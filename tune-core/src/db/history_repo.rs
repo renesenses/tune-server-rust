@@ -15,8 +15,6 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
-    const RECORD_COLS: &str = "id, track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, listened_at, zone_id, context_type, context_id, context_position";
-
     /// Les mêmes colonnes, mais avec `track_id` RÉSOLU.
     ///
     /// 🔴 `listen_history.track_id` est **toujours NULL** : le seul site
@@ -118,19 +116,33 @@ pub mod sql {
             // (« column "t.id" must appear in the GROUP BY clause ») et la
             // liste revenait vide sur toute base PG (chasse PG du 25/09/2026,
             // `tune-server/tests/pg_group_by_strict_historique.rs`).
-            "SELECT h.title, h.artist_name, COUNT(*) as plays, \
-             COALESCE(MAX(t.id), MAX(t3.id), MAX(h.track_id)) as track_id, \
-             COALESCE(MAX(al.cover_path), MAX(al2.cover_path), MAX(h.cover_url)) as cover_path, \
-             COALESCE(MAX(al.title), MAX(h.album_title)) as album_title, \
-             MAX(h.source) \
-             FROM listen_history h \
-             LEFT JOIN tracks t ON h.track_id = t.id \
-             LEFT JOIN tracks t3 ON t3.title = h.title \
-             LEFT JOIN albums al ON t.album_id = al.id \
-             LEFT JOIN albums al2 ON al2.title = h.album_title AND al2.cover_path IS NOT NULL \
-             WHERE h.source != 'radio' \
-             GROUP BY h.title, h.artist_name \
-             ORDER BY plays DESC LIMIT {}",
+            // #7619 / #7634 : le compte se fait sur `listen_history` SEUL, une
+            // écoute = une ligne. L'ancienne requête comptait `COUNT(*)` APRÈS
+            // `LEFT JOIN tracks t3 ON t3.title = h.title` (autant de lignes
+            // que de pistes homonymes) et `LEFT JOIN albums al2 ON al2.title =
+            // h.album_title` (autant que d'albums homonymes) : chaque écoute
+            // était multipliée. Les rapprochements (piste, pochette, album)
+            // se font maintenant APRÈS le regroupement, en sous-requêtes
+            // scalaires (`MAX`), qui rendent au plus une valeur par groupe.
+            "WITH g AS (SELECT h.title AS title, h.artist_name AS artist_name, \
+                    COUNT(*) AS plays, MAX(h.track_id) AS tid, \
+                    MAX(h.album_title) AS alb, MAX(h.cover_url) AS cu, MAX(h.source) AS src \
+                    FROM listen_history h WHERE h.source != 'radio' \
+                    GROUP BY h.title, h.artist_name) \
+             SELECT g.title, g.artist_name, g.plays, \
+             COALESCE((SELECT MAX(t.id) FROM tracks t WHERE t.id = g.tid), \
+                      (SELECT MAX(t3.id) FROM tracks t3 WHERE t3.title = g.title), g.tid) AS track_id, \
+             COALESCE((SELECT MAX(al.cover_path) FROM albums al \
+                          JOIN tracks t ON t.album_id = al.id WHERE t.id = g.tid), \
+                      (SELECT MAX(al2.cover_path) FROM albums al2 \
+                          WHERE al2.title = g.alb AND al2.cover_path IS NOT NULL), \
+                      g.cu) AS cover_path, \
+             COALESCE((SELECT MAX(al.title) FROM albums al \
+                          JOIN tracks t ON t.album_id = al.id WHERE t.id = g.tid), \
+                      g.alb) AS album_title, \
+             g.src \
+             FROM g \
+             ORDER BY g.plays DESC LIMIT {}",
             d.placeholder(1)
         )
     }
@@ -182,6 +194,68 @@ pub mod sql {
                         OR (h.artist_name IS NULL AND a.name IS NULL)) \
              WHERE t.id IN ({id_list}) \
              GROUP BY t.id"
+        )
+    }
+
+    /// Les écoutes locales qui peuvent concerner des pistes d'un service (#7026) :
+    /// celles de ce service sous l'un des `n_ids` identifiants, ou celles d'un
+    /// des `n_artistes` interprètes (nom en minuscules). Groupées par ce qui
+    /// sert au rapprochement — l'appelant tranche, une seule requête pour la
+    /// liste entière. Placeholders : 1 = service, puis les identifiants, puis
+    /// les interprètes.
+    pub fn ecoutes_de_pistes_de_service<D: SqlDialect>(
+        d: &D,
+        n_ids: usize,
+        n_artistes: usize,
+    ) -> String {
+        let liste = |depuis: usize, n: usize| -> Option<String> {
+            (n > 0).then(|| {
+                (depuis..depuis + n)
+                    .map(|i| d.placeholder(i))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+        };
+        let par_id = liste(2, n_ids).map_or_else(
+            || "1 = 0".to_string(),
+            |ids| format!("(source = {} AND source_id IN ({ids}))", d.placeholder(1)),
+        );
+        let par_artiste = liste(2 + n_ids, n_artistes).map_or_else(
+            || "1 = 0".to_string(),
+            |noms| format!("LOWER(artist_name) IN ({noms})"),
+        );
+        format!(
+            "SELECT source, source_id, title, artist_name, duration_ms, \
+             COUNT(*), MAX(listened_at) \
+             FROM listen_history \
+             WHERE source != 'radio' AND ({par_id} OR {par_artiste}) \
+             GROUP BY source, source_id, title, artist_name, duration_ms"
+        )
+    }
+
+    /// Les écoutes d'un interprète, toutes sources (#7416) : une ligne par
+    /// enregistrement écouté (source, identifiant, titre, durée), avec son
+    /// nombre d'écoutes, la dernière, et — pour un fichier — l'identifiant de
+    /// la piste de la bibliothèque, résolu comme ailleurs dans ce fichier
+    /// (titre + album, à défaut titre + interprète : `track_id` est toujours
+    /// NULL). `COUNT(DISTINCT h.id)` : les jointures ne doivent pas multiplier
+    /// les écoutes. Placeholders : les `n_artistes` noms en minuscules.
+    pub fn ecoutes_d_un_interprete<D: SqlDialect>(d: &D, n_artistes: usize) -> String {
+        let noms = (1..=n_artistes)
+            .map(|i| d.placeholder(i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT h.source, h.source_id, h.title, h.artist_name, h.duration_ms, \
+             COUNT(DISTINCT h.id), MAX(h.listened_at), MAX(h.album_title), \
+             MAX(h.cover_url), COALESCE(MAX(t.id), MAX(t2.id)) \
+             FROM listen_history h \
+             LEFT JOIN tracks t ON h.source = 'local' AND t.title = h.title \
+                  AND t.album_id = h.album_id \
+             LEFT JOIN artists a ON h.source = 'local' AND a.name = h.artist_name \
+             LEFT JOIN tracks t2 ON t2.artist_id = a.id AND t2.title = h.title \
+             WHERE h.source != 'radio' AND LOWER(h.artist_name) IN ({noms}) \
+             GROUP BY h.source, h.source_id, h.title, h.artist_name, h.duration_ms"
         )
     }
 
@@ -241,6 +315,50 @@ pub mod sql {
              GROUP BY 1 ORDER BY 1"
         )
     }
+}
+
+/// Écart de durée sous lequel une écoute locale nommée pareil est celle d'une
+/// piste de service (#7026) — la tolérance du site pour le même rapprochement.
+pub const TOLERANCE_DUREE_ECOUTE_LOCALE_MS: i64 = 3_000;
+
+/// Une piste de service à rapprocher des écoutes locales (#7026).
+#[derive(Debug, Clone, Copy)]
+pub struct PisteDeServiceARapprocher<'a> {
+    pub source_id: &'a str,
+    pub titre: &'a str,
+    pub artiste: &'a str,
+    pub duree_ms: i64,
+}
+
+/// Titre ou interprète comparé : minuscules, lettres et chiffres seulement,
+/// espaces resserrés (« SUMMER CLOTHES! » = « summer clothes »).
+pub fn nom_rapproche(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Un enregistrement écouté d'un interprète, toutes sources (#7416) : voir
+/// [`HistoryRepo::ecoutes_d_un_interprete`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EcouteDInterprete {
+    pub source: String,
+    /// Vide pour un fichier : il se désigne par `track_id`.
+    pub source_id: String,
+    pub titre: String,
+    pub artiste: String,
+    pub album: Option<String>,
+    pub duree_ms: i64,
+    pub compte: i64,
+    pub derniere: String,
+    pub pochette: Option<String>,
+    /// La piste de la bibliothèque d'une écoute de fichier, si elle se
+    /// retrouve encore.
+    pub track_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -357,14 +475,14 @@ impl HistoryRepo {
             &rec.context_cover,
             &rec.album_ref,
         ];
-        Ok(self.db.execute_returning_id(&sql, &params)?)
+        self.db.execute_returning_id(&sql, &params)
     }
 
     pub fn recent(&self, limit: i64) -> Result<Vec<ListenRecord>, String> {
         let sql = self.dialect_sql(sql::recent, sql::recent);
         let params: [&dyn ToSqlValue; 1] = [&limit];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_listen).collect())
+        Ok(rows.iter().map(|cols| row_to_listen(cols)).collect())
     }
 
     pub fn recent_paginated(
@@ -379,7 +497,7 @@ impl HistoryRepo {
         let sql = self.dialect_sql(sql::recent_paginated, sql::recent_paginated);
         let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok((rows.iter().map(row_to_listen).collect(), total))
+        Ok((rows.iter().map(|cols| row_to_listen(cols)).collect(), total))
     }
 
     /// Current names of unambiguous local playlist contexts (#4036).
@@ -474,6 +592,128 @@ impl HistoryRepo {
             map.insert(id, (compte, derniere));
         }
         Ok(map)
+    }
+
+    /// Écoutes locales de pistes d'un service, tous profils (#7026) : pour
+    /// chaque piste, `(nombre, dernière écoute)`, ou `None` jamais écoutée.
+    ///
+    /// Une écoute est celle d'une piste si elle vient de CE service sous son
+    /// identifiant, ou si son titre et son interprète normalisés sont les
+    /// mêmes et que les durées, quand les deux sont connues, diffèrent d'au
+    /// plus [`TOLERANCE_DUREE_ECOUTE_LOCALE_MS`]. `listen_history` n'a pas
+    /// d'ISRC : le rapprochement par ISRC est celui du site.
+    pub fn ecoutes_de_pistes_de_service(
+        &self,
+        service: &str,
+        pistes: &[PisteDeServiceARapprocher<'_>],
+    ) -> Result<Vec<Option<(i64, String)>>, String> {
+        if pistes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ids: Vec<String> = pistes
+            .iter()
+            .map(|p| p.source_id.trim().to_string())
+            .filter(|i| !i.is_empty())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        // SQLite ne passe en minuscules que l'ASCII, PostgreSQL tout : les
+        // deux formes partent.
+        let mut artistes: Vec<String> = pistes
+            .iter()
+            .flat_map(|p| {
+                let a = p.artiste.trim();
+                [a.to_lowercase(), a.to_ascii_lowercase()]
+            })
+            .filter(|a| !a.is_empty())
+            .collect();
+        artistes.sort();
+        artistes.dedup();
+        let sql = self.dialect_sql(
+            |d| sql::ecoutes_de_pistes_de_service(d, ids.len(), artistes.len()),
+            |d| sql::ecoutes_de_pistes_de_service(d, ids.len(), artistes.len()),
+        );
+        let mut params: Vec<&dyn ToSqlValue> = Vec::with_capacity(1 + ids.len() + artistes.len());
+        params.push(&service);
+        params.extend(ids.iter().map(|i| i as &dyn ToSqlValue));
+        params.extend(artistes.iter().map(|a| a as &dyn ToSqlValue));
+        let lignes = self.db.query_many(&sql, &params)?;
+
+        let mut resultat: Vec<Option<(i64, String)>> = vec![None; pistes.len()];
+        for cols in lignes {
+            let texte = |i: usize| cols.get(i).and_then(|v| v.as_string()).unwrap_or_default();
+            let (source, source_id, titre, artiste) = (texte(0), texte(1), texte(2), texte(3));
+            let duree = cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0);
+            let compte = cols.get(5).and_then(|v| v.as_i64()).unwrap_or(0);
+            let Some(derniere) = cols.get(6).and_then(|v| v.as_string()) else {
+                continue;
+            };
+            let (titre_n, artiste_n) = (nom_rapproche(&titre), nom_rapproche(&artiste));
+            for (piste, case) in pistes.iter().zip(resultat.iter_mut()) {
+                let meme_id = source == service
+                    && !source_id.is_empty()
+                    && source_id == piste.source_id.trim();
+                let memes_noms = !titre_n.is_empty()
+                    && titre_n == nom_rapproche(piste.titre)
+                    && artiste_n == nom_rapproche(piste.artiste)
+                    && (duree <= 0
+                        || piste.duree_ms <= 0
+                        || (duree - piste.duree_ms).abs() <= TOLERANCE_DUREE_ECOUTE_LOCALE_MS);
+                if !(meme_id || memes_noms) {
+                    continue;
+                }
+                *case = Some(match case.take() {
+                    None => (compte, derniere.clone()),
+                    Some((n, d)) => (n + compte, d.max(derniere.clone())),
+                });
+            }
+        }
+        Ok(resultat)
+    }
+
+    /// Les écoutes d'un interprète, toutes sources et tous profils (#7416) :
+    /// une entrée par enregistrement écouté, l'interprète comparé normalisé
+    /// ([`nom_rapproche`]). Radio exclue, comme partout ici.
+    pub fn ecoutes_d_un_interprete(&self, artiste: &str) -> Result<Vec<EcouteDInterprete>, String> {
+        let cible = nom_rapproche(artiste);
+        if cible.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SQLite ne passe en minuscules que l'ASCII, PostgreSQL tout : les
+        // deux formes partent (comme `ecoutes_de_pistes_de_service`).
+        let a = artiste.trim();
+        let mut noms = vec![a.to_lowercase(), a.to_ascii_lowercase()];
+        noms.dedup();
+        let sql = self.dialect_sql(
+            |d| sql::ecoutes_d_un_interprete(d, noms.len()),
+            |d| sql::ecoutes_d_un_interprete(d, noms.len()),
+        );
+        let params: Vec<&dyn ToSqlValue> = noms.iter().map(|n| n as &dyn ToSqlValue).collect();
+        let lignes = self.db.query_many(&sql, &params)?;
+        let mut resultat = Vec::with_capacity(lignes.len());
+        for cols in lignes {
+            let texte = |i: usize| cols.get(i).and_then(|v| v.as_string());
+            let artiste_ligne = texte(3).unwrap_or_default();
+            if nom_rapproche(&artiste_ligne) != cible {
+                continue;
+            }
+            let Some(derniere) = texte(6) else {
+                continue;
+            };
+            resultat.push(EcouteDInterprete {
+                source: texte(0).unwrap_or_default(),
+                source_id: texte(1).unwrap_or_default().trim().to_string(),
+                titre: texte(2).unwrap_or_default(),
+                artiste: artiste_ligne,
+                album: texte(7).filter(|s| !s.is_empty()),
+                duree_ms: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                compte: cols.get(5).and_then(|v| v.as_i64()).unwrap_or(0),
+                derniere,
+                pochette: texte(8).filter(|s| !s.is_empty()),
+                track_id: cols.get(9).and_then(|v| v.as_i64()),
+            });
+        }
+        Ok(resultat)
     }
 
     pub fn track_plays(&self, title: &str, artist_name: Option<&str>) -> Result<i64, String> {
@@ -1115,6 +1355,20 @@ impl HistoryRepo {
             })
             .collect();
 
+        // ── #6682 — temps d'écoute radio, par station, sur la période ──
+        // À part des classements : `listen_history` n'a pas de radio, ces
+        // lignes viennent de la veille d'écoute (`radio_ecoute`). Un échec de
+        // lecture ne coûte que ce champ, pas le tableau de bord.
+        let premier_jour =
+            days.map(|d| crate::db::radio_ecoute::premier_jour(chrono::Utc::now(), d));
+        let radio_listening =
+            crate::db::radio_ecoute::RadioEcouteRepo::with_backend(self.db.clone())
+                .par_station(premier_jour.as_deref(), zone_id, profile_id, top_n)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(erreur = %e, "radio_ecoute_illisible");
+                    Vec::new()
+                });
+
         // ── Trend (daily) ──
         let trend_days = days.unwrap_or(365);
         let trend_zone_and = match zone_id {
@@ -1397,6 +1651,7 @@ impl HistoryRepo {
             top_albums,
             top_tracks,
             top_radios,
+            radio_listening,
             trend,
             hourly,
             by_zone,
@@ -1666,6 +1921,10 @@ pub struct DashboardData {
     pub top_tracks: Vec<TopTrackEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub top_radios: Vec<TopRadioEntry>,
+    /// #6682 — le temps d'écoute radio par station sur la période, à part des
+    /// classements. Absent quand aucune radio n'a été écoutée.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub radio_listening: Vec<crate::db::radio_ecoute::EcouteRadio>,
     pub trend: Vec<TrendEntry>,
     pub hourly: Vec<HourlyEntry>,
     pub by_zone: Vec<ByZoneEntry>,
@@ -1681,7 +1940,7 @@ pub struct DashboardData {
     pub on_this_day: Vec<OnThisDayEntry>,
 }
 
-fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {
+fn row_to_listen(cols: &[SqlValue]) -> ListenRecord {
     ListenRecord {
         id: cols.first().and_then(|v| v.as_i64()),
         track_id: cols.get(1).and_then(|v| v.as_i64()),

@@ -143,29 +143,57 @@ impl RadioFavoriteRepo {
         Ok(())
     }
 
+    /// Les favoris radio en CSV pour un tableur : une ligne par favori, BOM
+    /// UTF-8 et séparateur `;` — la forme des autres exports CSV destinés à
+    /// Excel (`library::export`, audit de bibliothèque).
+    ///
+    /// Servi par `GET /api/v1/radio-favorites/export`. Cette route n'existait
+    /// pas : le lien « Exporter en CSV » de l'onglet Radio des favoris tombait
+    /// sur `/{fav_id}` (DELETE seulement) et le navigateur enregistrait le
+    /// corps vide d'un 405.
+    ///
+    /// Ni `LIMIT` ni marqueur numéroté : `?1` n'est pas traduit pour
+    /// PostgreSQL (il deviendrait `$11`), et un export ne se tronque pas.
+    /// `saved_at` est une chaîne ISO-8601 en production (écrite par la route)
+    /// et un entier dans l'ancien schéma de ce module : les deux sont rendus.
     pub fn export_csv(&self) -> Result<String, String> {
-        let favs = self.list(10_000, 0)?;
+        use crate::db::backend::SqlValue;
+        fn texte(v: Option<&SqlValue>) -> String {
+            match v {
+                Some(SqlValue::Text(s)) => s.clone(),
+                Some(SqlValue::Int(i)) => i.to_string(),
+                _ => String::new(),
+            }
+        }
+
+        let rows = self.db.query_many(
+            "SELECT title, artist, station_name, cover_url, stream_url, saved_at \
+             FROM radio_favorites ORDER BY saved_at DESC, id DESC",
+            &[],
+        )?;
+
         let mut wtr = csv::WriterBuilder::new()
             .delimiter(b';')
             .from_writer(Vec::new());
 
-        wtr.write_record(["title", "artist", "station", "cover_url", "stream_url"])
-            .map_err(|e| e.to_string())?;
+        wtr.write_record([
+            "title",
+            "artist",
+            "station",
+            "cover_url",
+            "stream_url",
+            "saved_at",
+        ])
+        .map_err(|e| e.to_string())?;
 
-        for f in &favs {
-            wtr.write_record([
-                &f.title,
-                &f.artist,
-                &f.station_name,
-                f.cover_url.as_deref().unwrap_or(""),
-                f.stream_url.as_deref().unwrap_or(""),
-            ])
-            .map_err(|e| e.to_string())?;
+        for r in &rows {
+            let record: Vec<String> = (0..6).map(|i| texte(r.get(i))).collect();
+            wtr.write_record(&record).map_err(|e| e.to_string())?;
         }
 
         let bytes = wtr.into_inner().map_err(|e| e.to_string())?;
         let mut output = String::from("\u{FEFF}");
-        output.push_str(&String::from_utf8_lossy(&bytes));
+        output.push_str(&String::from_utf8(bytes).map_err(|e| e.to_string())?);
         Ok(output)
     }
 }

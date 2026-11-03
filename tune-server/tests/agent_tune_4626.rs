@@ -76,9 +76,17 @@ fn client() -> reqwest::Client {
 /// Le PCM de référence : 1 s de stéréo 16 bits à 44,1 kHz, pseudo-aléatoire
 /// (aucune régularité qu'une compression ou un arrondi pourrait épargner).
 fn pcm_de_reference() -> Vec<u8> {
+    pcm_pseudo_aleatoire(1)
+}
+
+/// Octets de PCM par seconde : stéréo 16 bits à 44,1 kHz.
+const OCTETS_PAR_SECONDE: usize = 44_100 * 4;
+
+/// `secondes` de PCM de référence (voir [`pcm_de_reference`]).
+fn pcm_pseudo_aleatoire(secondes: usize) -> Vec<u8> {
     let mut graine: u32 = 0x4626_4626;
-    let mut pcm = Vec::with_capacity(44_100 * 4);
-    for _ in 0..44_100 * 2 {
+    let mut pcm = Vec::with_capacity(OCTETS_PAR_SECONDE * secondes);
+    for _ in 0..44_100 * 2 * secondes {
         graine ^= graine << 13;
         graine ^= graine >> 17;
         graine ^= graine << 5;
@@ -135,6 +143,17 @@ struct Enregistreuse {
     volume: Arc<Mutex<f64>>,
     muet: Arc<Mutex<bool>>,
     lectures: Arc<AtomicU32>,
+    /// #6370 — chaque flux reçu, dans son PROPRE tampon, par ordre de
+    /// lecture : un téléchargement encore en cours de l'ancien flux ne peut
+    /// pas se mêler au nouveau (déplacement pendant la mise en tampon).
+    flux: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// #6370 — chaque `seek` reçu par la sortie de l'agent.
+    positions: Arc<Mutex<Vec<u64>>>,
+    /// #6630 — pour chaque flux, au même rang que `flux` : le
+    /// `Content-Length` annoncé, puis comment le corps a fini (`None` tant
+    /// qu'il coule, `Err` s'il s'est fermé avant sa longueur annoncée).
+    longueurs: Arc<Mutex<Vec<Option<u64>>>>,
+    fins: Arc<Mutex<Vec<Option<Result<(), String>>>>>,
 }
 
 impl Default for Enregistreuse {
@@ -145,6 +164,10 @@ impl Default for Enregistreuse {
             volume: Arc::default(),
             muet: Arc::default(),
             lectures: Arc::default(),
+            flux: Arc::default(),
+            positions: Arc::default(),
+            longueurs: Arc::default(),
+            fins: Arc::default(),
         }
     }
 }
@@ -181,12 +204,33 @@ impl OutputTarget for SortieLocaleSimulee {
         let mut url = reqwest::Url::parse(media.url).map_err(|e| e.to_string())?;
         let _ = url.set_host(Some("127.0.0.1"));
         let url = url.to_string();
+        let rang = {
+            let mut flux = e.flux.lock().await;
+            flux.push(Vec::new());
+            e.longueurs.lock().await.push(None);
+            e.fins.lock().await.push(None);
+            flux.len() - 1
+        };
         tokio::spawn(async move {
-            if let Ok(r) = client().get(&url).send().await
-                && let Ok(octets) = r.bytes().await
-            {
-                e.recu.lock().await.extend_from_slice(&octets);
-            }
+            // Morceau par morceau, comme une sortie qui lit son flux : un
+            // flux encore ouvert montre déjà ce qu'il a servi.
+            let fin = match client().get(&url).send().await {
+                Ok(mut r) => {
+                    e.longueurs.lock().await[rang] = r.content_length();
+                    loop {
+                        match r.chunk().await {
+                            Ok(Some(morceau)) => {
+                                e.flux.lock().await[rang].extend_from_slice(&morceau);
+                                e.recu.lock().await.extend_from_slice(&morceau);
+                            }
+                            Ok(None) => break Ok(()),
+                            Err(err) => break Err(format!("{err:?}")),
+                        }
+                    }
+                }
+                Err(err) => Err(format!("{err:?}")),
+            };
+            e.fins.lock().await[rang] = Some(fin);
         });
         Ok(())
     }
@@ -202,7 +246,10 @@ impl OutputTarget for SortieLocaleSimulee {
         *self.0.etat.lock().await = (TransportState::Stopped, None);
         Ok(())
     }
-    async fn seek(&self, _position_ms: u64) -> Result<(), String> {
+    async fn seek(&self, position_ms: u64) -> Result<(), String> {
+        // Comme `LocalOutput::seek` : la position est notée, le son ne bouge
+        // pas — un flux séquentiel ne se déplace qu'en étant relancé.
+        self.0.positions.lock().await.push(position_ms);
         Ok(())
     }
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
@@ -467,13 +514,8 @@ async fn la_route_de_lecture_du_maitre_atteint_la_sortie_de_l_agent() {
         "URL donnée à l'agent par l'orchestrateur du maître : {:?}",
         sortie_agent.etat.lock().await.1
     );
-    let debut = recu
-        .windows(4)
-        .position(|w| w == b"data")
-        .map(|p| p + 8)
-        .unwrap_or(0);
     assert!(
-        recu[debut..].starts_with(&pcm),
+        echantillons(&recu).starts_with(&pcm),
         "les échantillons reçus par l'agent doivent être ceux de la source \
          ({} octets reçus, URL : {:?})",
         recu.len(),
@@ -521,32 +563,9 @@ async fn une_piste_de_la_bibliotheque_du_maitre_arrive_intacte_chez_l_agent() {
     let (_, zone_id, _) = appaires(&maitre, &agent).await;
 
     let dossier = tempfile::tempdir().unwrap();
-    let chemin = dossier.path().join("piste.wav");
     let pcm = pcm_de_reference();
-    std::fs::write(&chemin, wav(&pcm)).unwrap();
-    let pistes = tune_core::db::track_repo::TrackRepo::with_backend(maitre.state.backend.clone());
-    let mut t = tune_core::db::models::Track::new("Piste de bibliothèque".into());
-    t.file_path = Some(chemin.to_string_lossy().into_owned());
-    t.format = Some("wav".into());
-    t.sample_rate = Some(44_100);
-    t.bit_depth = Some(16);
-    t.channels = 2;
-    t.duration_ms = 1_000;
-    t.file_size = Some(std::fs::metadata(&chemin).unwrap().len() as i64);
-    let track_id = pistes.create(&t).unwrap();
-
-    let r = client()
-        .post(maitre.url(&format!("/api/v1/zones/{zone_id}/play")))
-        .json(&json!({ "track_id": track_id }))
-        .send()
-        .await
-        .unwrap();
-    let code = r.status();
-    assert!(
-        code.is_success(),
-        "lecture : {code} {}",
-        r.text().await.unwrap()
-    );
+    let track_id = piste_de_bibliotheque(&maitre, &dossier, &pcm);
+    jouer_la_piste(&maitre, zone_id, track_id).await;
     for _ in 0..400 {
         if sortie_agent.recu.lock().await.len() >= pcm.len() {
             break;
@@ -565,17 +584,391 @@ async fn une_piste_de_la_bibliotheque_du_maitre_arrive_intacte_chez_l_agent() {
         "l'agent doit tirer le flux du MAÎTRE : {url}"
     );
     let recu = sortie_agent.recu.lock().await.clone();
-    let debut = recu
-        .windows(4)
-        .position(|w| w == b"data")
-        .map(|p| p + 8)
-        .unwrap_or(0);
     assert!(
-        recu[debut..].starts_with(&pcm),
+        echantillons(&recu).starts_with(&pcm),
         "échantillons altérés entre la bibliothèque du maître et l'agent \
          ({} octets reçus depuis {url})",
         recu.len()
     );
+}
+
+/// Inscrit dans la bibliothèque de `serveur` un WAV portant `pcm`, écrit dans
+/// `dossier`, et rend l'identifiant de la piste.
+fn piste_de_bibliotheque(serveur: &Serveur, dossier: &tempfile::TempDir, pcm: &[u8]) -> i64 {
+    let chemin = dossier.path().join("piste.wav");
+    std::fs::write(&chemin, wav(pcm)).unwrap();
+    let pistes = tune_core::db::track_repo::TrackRepo::with_backend(serveur.state.backend.clone());
+    let mut t = tune_core::db::models::Track::new("Piste de bibliothèque".into());
+    t.file_path = Some(chemin.to_string_lossy().into_owned());
+    t.format = Some("wav".into());
+    t.sample_rate = Some(44_100);
+    t.bit_depth = Some(16);
+    t.channels = 2;
+    t.duration_ms = (pcm.len() * 1000 / OCTETS_PAR_SECONDE) as i64;
+    t.file_size = Some(std::fs::metadata(&chemin).unwrap().len() as i64);
+    pistes.create(&t).unwrap()
+}
+
+/// Lance `track_id` sur la zone par la route de lecture de `serveur`.
+async fn jouer_la_piste(serveur: &Serveur, zone_id: i64, track_id: i64) {
+    let r = client()
+        .post(serveur.url(&format!("/api/v1/zones/{zone_id}/play")))
+        .json(&json!({ "track_id": track_id }))
+        .send()
+        .await
+        .unwrap();
+    let code = r.status();
+    assert!(
+        code.is_success(),
+        "lecture : {code} {}",
+        r.text().await.unwrap()
+    );
+}
+
+/// Les échantillons d'un flux WAV : ce qui suit le bloc `data`.
+fn echantillons(flux: &[u8]) -> &[u8] {
+    let debut = flux
+        .windows(4)
+        .position(|w| w == b"data")
+        .map(|p| p + 8)
+        .unwrap_or(0);
+    &flux[debut..]
+}
+
+// ---------------------------------------------------------------------------
+// #6370 — se déplacer dans la piste sur une zone d'agent
+// ---------------------------------------------------------------------------
+
+/// Durée de la piste des essais de déplacement.
+const SECONDES_6370: usize = 4;
+/// Ce qu'un flux neuf doit avoir livré pour être jugé : un quart de seconde de
+/// PCM pseudo-aléatoire, qu'aucun autre endroit de la piste ne reproduit.
+const ECHANTILLONS_MINIMUM_6370: usize = OCTETS_PAR_SECONDE / 4;
+
+/// Déplace la lecture de la zone par la route du serveur.
+async fn deplacer(serveur: &Serveur, zone_id: i64, position_ms: u64) {
+    let r = client()
+        .post(serveur.url(&format!("/api/v1/zones/{zone_id}/seek")))
+        .json(&json!({ "position_ms": position_ms }))
+        .send()
+        .await
+        .unwrap();
+    let code = r.status();
+    assert!(
+        code.is_success(),
+        "déplacement à {position_ms} ms : {code} {}",
+        r.text().await.unwrap()
+    );
+}
+
+/// Attend que la sortie ait reçu au moins `attendu` octets d'échantillons
+/// (en 16 bits) de son `n`-ième flux, et le rend.
+async fn flux_recu(sortie: &Enregistreuse, n: usize, attendu: usize) -> Vec<u8> {
+    for _ in 0..1_200 {
+        {
+            let flux = sortie.flux.lock().await;
+            if flux.len() >= n && echantillons_16_bits(&flux[n - 1]).len() >= attendu {
+                return flux[n - 1].clone();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let flux = sortie.flux.lock().await;
+    panic!(
+        "flux n° {n} jamais reçu ({attendu} octets attendus) : {} flux reçu(s), longueurs {:?}, \
+         dernière URL {:?}",
+        flux.len(),
+        flux.iter().map(|f| f.len()).collect::<Vec<_>>(),
+        sortie.etat.lock().await.1
+    );
+}
+
+/// `(format, bits par échantillon)` de l'en-tête WAV d'un flux.
+fn format_wav(flux: &[u8]) -> Option<(u16, u16)> {
+    let fmt = flux.windows(4).position(|w| w == b"fmt ")? + 8;
+    let champ = |o: usize| {
+        flux.get(fmt + o..fmt + o + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    Some((champ(0)?, champ(14)?))
+}
+
+/// Les échantillons d'un flux WAV ramenés en 16 bits : un flux décodé pour
+/// une sortie locale peut être servi sur 24 ou 32 bits entiers, dont les deux
+/// octets de poids fort sont alors ceux de la source 16 bits.
+fn echantillons_16_bits(flux: &[u8]) -> Vec<u8> {
+    let octets = match format_wav(flux) {
+        Some((1, bits)) if bits >= 16 => bits as usize / 8,
+        _ => 2,
+    };
+    echantillons(flux)
+        .chunks_exact(octets)
+        .flat_map(|e| [e[octets - 2], e[octets - 1]])
+        .collect()
+}
+
+/// Le flux neuf commence-t-il à `position_ms` de la piste ? Rend un constat
+/// lisible plutôt qu'un booléen muet.
+///
+/// Seul le DÉBUT du flux est comparé, sur ce qui en est arrivé : #6370
+/// demande que le flux commence au bon endroit. Qu'il aille jusqu'au bout de
+/// sa longueur annoncée, c'est l'objet de #6630 ([`flux_complet`]).
+fn commence_a(flux: &[u8], pcm: &[u8], position_ms: u64) -> Result<(), String> {
+    let octet = position_ms as usize * OCTETS_PAR_SECONDE / 1000;
+    let recu = echantillons_16_bits(flux);
+    let reste = &pcm[octet..];
+    if !recu.is_empty() && recu.len() <= reste.len() && reste.starts_with(&recu) {
+        return Ok(());
+    }
+    let depart = (0..pcm.len())
+        .step_by(4)
+        .find(|&o| recu.len() >= 64 && pcm[o..].starts_with(&recu[..64]));
+    Err(format!(
+        "le flux neuf devait commencer à l'octet {octet} ({position_ms} ms) de la \
+         piste ; il commence à l'octet {depart:?} ({} octets d'échantillons reçus, \
+         format WAV {:?})",
+        recu.len(),
+        format_wav(flux)
+    ))
+}
+
+/// Une zone d'agent, une piste en lecture, un déplacement : la sortie de
+/// l'agent reçoit un NOUVEAU flux qui commence à la position demandée, et le
+/// maître rapporte la position de la piste, pas celle du flux neuf.
+///
+/// Avant le correctif, le maître envoyait `Commande::Position` : la sortie
+/// locale de l'agent notait la position, ne relançait rien, et le son restait
+/// où il était (fil 1867).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_deplacement_sur_une_zone_d_agent_relance_le_flux_a_la_position_6370() {
+    let (agent, sortie_agent) = agent().await;
+    let maitre = Serveur::demarrer().await;
+    let (_, zone_id, device_id) = appaires(&maitre, &agent).await;
+    let dossier = tempfile::tempdir().unwrap();
+    let pcm = pcm_pseudo_aleatoire(SECONDES_6370);
+    let track_id = piste_de_bibliotheque(&maitre, &dossier, &pcm);
+
+    jouer_la_piste(&maitre, zone_id, track_id).await;
+    let premier = flux_recu(&sortie_agent, 1, pcm.len()).await;
+    commence_a(&premier, &pcm, 0).unwrap();
+
+    deplacer(&maitre, zone_id, 2_000).await;
+    let neuf = flux_recu(&sortie_agent, 2, ECHANTILLONS_MINIMUM_6370).await;
+    commence_a(&neuf, &pcm, 2_000).unwrap();
+    assert_eq!(
+        sortie_agent.etat.lock().await.0,
+        TransportState::Playing,
+        "le flux neuf doit être en lecture chez l'agent"
+    );
+    let statut = sortie_du_maitre(&maitre, &device_id)
+        .await
+        .lock()
+        .await
+        .get_status()
+        .await
+        .unwrap();
+    assert!(
+        statut.position_ms >= 2_000,
+        "le maître doit rapporter la position dans la PISTE (≥ 2000 ms), pas \
+         celle du flux neuf : {} ms",
+        statut.position_ms
+    );
+}
+
+/// En pause, puis déplacement : le flux est relancé à la position, comme sur
+/// une sortie locale du maître.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn en_pause_un_deplacement_sur_une_zone_d_agent_relance_le_flux_a_la_position_6370() {
+    let (agent, sortie_agent) = agent().await;
+    let maitre = Serveur::demarrer().await;
+    let (_, zone_id, _) = appaires(&maitre, &agent).await;
+    let dossier = tempfile::tempdir().unwrap();
+    let pcm = pcm_pseudo_aleatoire(SECONDES_6370);
+    let track_id = piste_de_bibliotheque(&maitre, &dossier, &pcm);
+
+    jouer_la_piste(&maitre, zone_id, track_id).await;
+    flux_recu(&sortie_agent, 1, pcm.len()).await;
+    let r = client()
+        .post(maitre.url(&format!("/api/v1/zones/{zone_id}/pause")))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "pause : {}", r.status());
+    attendre(
+        || {
+            let e = sortie_agent.clone();
+            async move { e.etat.lock().await.0 == TransportState::Paused }
+        },
+        "pause appliquée chez l'agent",
+    )
+    .await;
+
+    deplacer(&maitre, zone_id, 1_500).await;
+    let neuf = flux_recu(&sortie_agent, 2, ECHANTILLONS_MINIMUM_6370).await;
+    commence_a(&neuf, &pcm, 1_500).unwrap();
+}
+
+/// Déplacement pendant la mise en tampon : le premier flux n'est pas encore
+/// arrivé quand l'auditeur se déplace. Le DERNIER flux reçu commence à la
+/// position.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_deplacement_pendant_la_mise_en_tampon_relance_le_flux_a_la_position_6370() {
+    let (agent, sortie_agent) = agent().await;
+    let maitre = Serveur::demarrer().await;
+    let (_, zone_id, _) = appaires(&maitre, &agent).await;
+    let dossier = tempfile::tempdir().unwrap();
+    let pcm = pcm_pseudo_aleatoire(SECONDES_6370);
+    let track_id = piste_de_bibliotheque(&maitre, &dossier, &pcm);
+
+    jouer_la_piste(&maitre, zone_id, track_id).await;
+    // Seulement l'ORDRE de lecture : le flux, lui, n'est pas attendu.
+    attendre(
+        || {
+            let e = sortie_agent.clone();
+            async move { e.lectures.load(Ordering::SeqCst) > 0 }
+        },
+        "ordre de lecture reçu par l'agent",
+    )
+    .await;
+    deplacer(&maitre, zone_id, 1_000).await;
+    let neuf = flux_recu(&sortie_agent, 2, ECHANTILLONS_MINIMUM_6370).await;
+    commence_a(&neuf, &pcm, 1_000).unwrap();
+    assert_eq!(
+        sortie_agent.flux.lock().await.len(),
+        2,
+        "un seul flux neuf par déplacement"
+    );
+}
+
+/// Témoin : sur une sortie LOCALE (ici l'agent joué pour lui-même, sans
+/// maître), le déplacement relance déjà le flux à la position. Le correctif
+/// de #6370 ne doit rien y changer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn temoin_6370_un_deplacement_sur_une_sortie_locale_relance_toujours_le_flux() {
+    let (serveur, sortie_locale) = agent().await;
+    let (zone_id, _) = ZoneRepo::with_backend(serveur.state.backend.clone())
+        .get_or_create("DAC USB d'essai", Some("local"), DEVICE_LOCAL)
+        .unwrap();
+    let dossier = tempfile::tempdir().unwrap();
+    let pcm = pcm_pseudo_aleatoire(SECONDES_6370);
+    let track_id = piste_de_bibliotheque(&serveur, &dossier, &pcm);
+
+    jouer_la_piste(&serveur, zone_id, track_id).await;
+    flux_recu(&sortie_locale, 1, pcm.len()).await;
+    deplacer(&serveur, zone_id, 2_000).await;
+    let neuf = flux_recu(&sortie_locale, 2, ECHANTILLONS_MINIMUM_6370).await;
+    commence_a(&neuf, &pcm, 2_000).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// #6630 — un flux relancé à une position annonce la longueur qu'il sert
+// ---------------------------------------------------------------------------
+
+/// Attend la FIN du `n`-ième flux reçu par la sortie et le rend avec son
+/// `Content-Length`. Échoue si le corps s'est fermé avant sa longueur
+/// annoncée, ou si ce qui est arrivé n'est pas ce qui était annoncé.
+async fn flux_complet(sortie: &Enregistreuse, n: usize) -> (Vec<u8>, Option<u64>) {
+    for _ in 0..1_200 {
+        let fin = sortie.fins.lock().await.get(n - 1).cloned().flatten();
+        if let Some(fin) = fin {
+            let flux = sortie.flux.lock().await[n - 1].clone();
+            let annonce = sortie.longueurs.lock().await[n - 1];
+            if let Err(err) = fin {
+                panic!(
+                    "#6630 — le flux n° {n} s'est fermé avant sa longueur annoncée : \
+                     Content-Length {annonce:?}, {} octets reçus ({err})",
+                    flux.len()
+                );
+            }
+            if let Some(annonce) = annonce {
+                assert_eq!(
+                    flux.len() as u64,
+                    annonce,
+                    "#6630 — le flux n° {n} ne livre pas son Content-Length"
+                );
+            }
+            return (flux, annonce);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("flux n° {n} jamais terminé");
+}
+
+/// Tout le flux, échantillon pour échantillon, est-il la piste à partir de
+/// `position_ms` jusqu'à sa FIN ?
+fn est_la_piste_depuis(flux: &[u8], pcm: &[u8], position_ms: u64) -> Result<(), String> {
+    let octet = position_ms as usize * OCTETS_PAR_SECONDE / 1000;
+    let recu = echantillons_16_bits(flux);
+    if recu == pcm[octet..] {
+        return Ok(());
+    }
+    Err(format!(
+        "le flux devait porter la piste de l'octet {octet} ({position_ms} ms) à la fin, \
+         soit {} octets d'échantillons ; il en porte {} (format WAV {:?})",
+        pcm.len() - octet,
+        recu.len(),
+        format_wav(flux)
+    ))
+}
+
+/// Sortie LOCALE (flux décodé, toujours) : la lecture depuis le début est
+/// servie en entier, sous un Content-Length tenu — comme avant ; relancée à
+/// 2 s, elle annonce la longueur qu'elle sert, et la sert jusqu'au bout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sortie_locale_un_flux_relance_a_une_position_annonce_la_longueur_servie_6630() {
+    let (serveur, sortie_locale) = agent().await;
+    let (zone_id, _) = ZoneRepo::with_backend(serveur.state.backend.clone())
+        .get_or_create("DAC USB d'essai", Some("local"), DEVICE_LOCAL)
+        .unwrap();
+    let dossier = tempfile::tempdir().unwrap();
+    let pcm = pcm_pseudo_aleatoire(SECONDES_6370);
+    let track_id = piste_de_bibliotheque(&serveur, &dossier, &pcm);
+
+    jouer_la_piste(&serveur, zone_id, track_id).await;
+    let (premier, annonce) = flux_complet(&sortie_locale, 1).await;
+    assert!(
+        annonce.is_some(),
+        "depuis le début : Content-Length attendu"
+    );
+    est_la_piste_depuis(&premier, &pcm, 0).unwrap();
+
+    deplacer(&serveur, zone_id, 2_000).await;
+    let (neuf, annonce) = flux_complet(&sortie_locale, 2).await;
+    assert!(
+        annonce.is_some(),
+        "relancé à une position : Content-Length attendu"
+    );
+    est_la_piste_depuis(&neuf, &pcm, 2_000).unwrap();
+}
+
+/// Zone d'AGENT : depuis le début, le fichier est servi tel quel (voie
+/// fichier direct) ; relancé à 1,5 s, le flux est décodé à partir de la
+/// position. Les deux livrent exactement leur Content-Length.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zone_d_agent_fichier_direct_et_flux_decode_tiennent_leur_longueur_6630() {
+    let (agent, sortie_agent) = agent().await;
+    let maitre = Serveur::demarrer().await;
+    let (_, zone_id, _) = appaires(&maitre, &agent).await;
+    let dossier = tempfile::tempdir().unwrap();
+    let pcm = pcm_pseudo_aleatoire(SECONDES_6370);
+    let track_id = piste_de_bibliotheque(&maitre, &dossier, &pcm);
+
+    jouer_la_piste(&maitre, zone_id, track_id).await;
+    let (premier, annonce) = flux_complet(&sortie_agent, 1).await;
+    assert_eq!(
+        annonce,
+        Some(wav(&pcm).len() as u64),
+        "depuis le début, le fichier part tel quel"
+    );
+    assert_eq!(premier, wav(&pcm), "fichier direct altéré");
+
+    deplacer(&maitre, zone_id, 1_500).await;
+    let (neuf, annonce) = flux_complet(&sortie_agent, 2).await;
+    assert!(
+        annonce.is_some(),
+        "relancé à une position : Content-Length attendu"
+    );
+    est_la_piste_depuis(&neuf, &pcm, 1_500).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -857,10 +1250,20 @@ async fn l_agent_qui_revoque_le_maitre_fait_supprimer_ses_zones_chez_le_maitre()
     assert_eq!(r.status(), 200);
     attendre(
         || {
-            let visible = zone_visible(&maitre, &device_id).is_some();
-            async move { !visible }
+            let maitre = &maitre;
+            let device_id = &device_id;
+            let agent_id = &agent_id;
+            async move {
+                // La zone est masquée AVANT le retrait asynchrone de la sortie.
+                // Attendre la révocation entière, pas cet état intermédiaire.
+                zone_visible(maitre, device_id).is_none()
+                    && !maitre.state.outputs.lock().await.contains(device_id)
+                    && tune_server::agent_tune::maitre::agents(&maitre.state)
+                        .iter()
+                        .all(|a| &a.agent_id != agent_id)
+            }
         },
-        "la zone de l'agent qui a révoqué le maître est supprimée chez le maître",
+        "révocation incomplète : zone, sortie ou appairage encore présent chez le maître",
     )
     .await;
     assert!(!maitre.state.outputs.lock().await.contains(&device_id));

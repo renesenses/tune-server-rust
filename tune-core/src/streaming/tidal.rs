@@ -28,6 +28,56 @@ const CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
 const CLIENT_SECRET: &str = "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
 const REDIRECT_URI: &str = "http://localhost:8888/api/v1/streaming/tidal/callback";
 
+/// #6784 — le rappel PKCE de TIDAL ABOUTIT-il dans le navigateur qui a fait
+/// la demande ?
+///
+/// `REDIRECT_URI` est l'adresse déclarée pour l'application TIDAL de Tune :
+/// elle ne se reconstruit pas depuis la requête, TIDAL n'accepterait qu'une
+/// adresse enregistrée. Elle nomme `localhost:8888` — donc la machine du
+/// NAVIGATEUR. Depuis un téléphone ou un autre poste, `localhost` est ce
+/// téléphone ou ce poste, et la connexion n'aboutit jamais.
+///
+/// `hote_vu` est l'hôte par lequel le client a joint le serveur (`Host`, ou
+/// `X-Forwarded-Host` derrière un relais). Vrai seulement si c'est un nom de
+/// boucle locale ET le port de `REDIRECT_URI` : un client de la machine même,
+/// sur le port que le rappel vise. Dans tous les autres cas, l'appelant passe
+/// par le code d'appareil, qui ne dépend d'aucune adresse de retour.
+pub fn rappel_pkce_aboutit(hote_vu: Option<&str>) -> bool {
+    let Some(hote_vu) = hote_vu.map(str::trim).filter(|h| !h.is_empty()) else {
+        return false;
+    };
+    let (hote, port) = separer_hote_et_port(hote_vu);
+    let autorite_du_rappel = REDIRECT_URI
+        .split_once("://")
+        .map(|(_, reste)| reste.split('/').next().unwrap_or(reste))
+        .unwrap_or("");
+    let (_, port_du_rappel) = separer_hote_et_port(autorite_du_rappel);
+    let boucle = matches!(
+        hote.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "[::1]"
+    );
+    boucle && port.is_some() && port == port_du_rappel
+}
+
+/// `hôte[:port]`, IPv6 entre crochets compris (`[::1]:8888`).
+fn separer_hote_et_port(autorite: &str) -> (&str, Option<u16>) {
+    if autorite.starts_with('[') {
+        return match autorite.find(']') {
+            Some(fin) => (
+                &autorite[..=fin],
+                autorite[fin + 1..]
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse().ok()),
+            ),
+            None => (autorite, None),
+        };
+    }
+    match autorite.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().ok()),
+        None => (autorite, None),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -160,6 +210,10 @@ pub struct TidalService {
     /// Racine de l'API, déplacée par les seuls témoins vers un serveur factice
     /// (#4803). `None` partout ailleurs : [`API_BASE`].
     base_forcee: Option<String>,
+    /// #6336 — racine OAuth (code d'appareil, jetons), déplacée par les seuls
+    /// bancs d'essai vers un serveur factice. `None` partout ailleurs :
+    /// [`AUTH_BASE`].
+    auth_forcee: Option<String>,
 }
 
 impl Default for TidalService {
@@ -192,7 +246,29 @@ impl TidalService {
             featured_cache: std::sync::Mutex::new(None),
             enabled_override: None,
             base_forcee: None,
+            auth_forcee: None,
         }
+    }
+
+    /// #6336 — un service dont l'API et l'OAuth sont `api` et `auth`, pour
+    /// éprouver la connexion par le vrai routeur sans joindre TIDAL. Réservé
+    /// aux bancs d'essai : aucun binaire publié ne le compile.
+    #[cfg(any(test, feature = "services-factices"))]
+    pub fn avec_bases_de_test(api: String, auth: String) -> Self {
+        let mut svc = Self::new();
+        svc.base_forcee = Some(api);
+        svc.auth_forcee = Some(auth);
+        svc
+    }
+
+    /// Racine de l'API : [`API_BASE`], sauf dans un banc d'essai.
+    fn api_base(&self) -> &str {
+        self.base_forcee.as_deref().unwrap_or(API_BASE)
+    }
+
+    /// Racine OAuth : [`AUTH_BASE`], sauf dans un banc d'essai.
+    fn auth_base(&self) -> &str {
+        self.auth_forcee.as_deref().unwrap_or(AUTH_BASE)
     }
 
     /// Download all DASH segments (init + media) and concatenate them into a
@@ -225,6 +301,15 @@ impl TidalService {
             .send()
             .await
             .map_err(|e| format!("dash init download: {e}"))?
+            // #7106 — un refus du CDN (403) n'est pas un segment d'init : sans
+            // ce contrôle, son corps d'erreur ouvrait le fichier fMP4.
+            .error_for_status()
+            .map_err(|e| {
+                format!(
+                    "dash init download: HTTP {}",
+                    e.status().map(|s| s.as_u16()).unwrap_or(0)
+                )
+            })?
             .bytes()
             .await
             .map_err(|e| format!("dash init read: {e}"))?;
@@ -486,7 +571,7 @@ impl TidalService {
     ) -> Result<TokenResponse, String> {
         let resp = self
             .client
-            .post(format!("{AUTH_BASE}/token"))
+            .post(format!("{}/token", self.auth_base()))
             .form(&[
                 ("client_id", CLIENT_ID),
                 ("client_secret", CLIENT_SECRET),
@@ -592,7 +677,7 @@ impl TidalService {
 
         let resp = self
             .client
-            .post(format!("{AUTH_BASE}/token"))
+            .post(format!("{}/token", self.auth_base()))
             .form(&[
                 ("client_id", CLIENT_ID),
                 ("client_secret", CLIENT_SECRET),
@@ -740,7 +825,7 @@ impl TidalService {
 
     async fn api_get(&self, path: &str) -> Result<serde_json::Value, String> {
         let token = self.get_access_token().await?;
-        let base = self.base_forcee.as_deref().unwrap_or(API_BASE);
+        let base = self.api_base();
         let url = format!("{base}{path}");
         let resp = self
             .client
@@ -792,13 +877,70 @@ impl TidalService {
     /// Un seul point de lecture pour deux projections : la liste typée, et la
     /// liste sérialisée datée que sert la route des favoris.
     async fn favoris_bruts(&self, type_tidal: &str) -> Result<Vec<serde_json::Value>, TuneError> {
+        Ok(self.lecture_des_favoris(type_tidal).await?.0)
+    }
+
+    /// Taille d'une page de `/users/{id}/favorites/{type}`.
+    const PAGE_FAVORIS: usize = 100;
+    /// Au plus 100 pages, soit au plus 10 000 favoris d'un type.
+    const PAGES_FAVORIS_MAX: usize = 100;
+
+    /// #5997 — TOUTES les pages des favoris d'un type, et le motif si la
+    /// liste n'est pas complète.
+    ///
+    /// La lecture ne demandait que `?limit=100`, sans suite : au-delà de 100
+    /// favoris d'un type, le miroir (#5997) ne voyait pas le reste, et
+    /// retirait de Tune à chaque rafraîchissement tout favori confirmé
+    /// au-delà de la centième place. On pagine désormais jusqu'à
+    /// `totalNumberOfItems`, et on DIT quand on n'y arrive pas.
+    async fn lecture_des_favoris(
+        &self,
+        type_tidal: &str,
+    ) -> Result<(Vec<serde_json::Value>, Option<String>), TuneError> {
         let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
-        let data = self
-            .api_get(&format!(
-                "/users/{user_id}/favorites/{type_tidal}?limit=100"
-            ))
-            .await?;
-        Ok(data["items"].as_array().cloned().unwrap_or_default())
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut total: Option<usize> = None;
+        let mut derniere_page_pleine = false;
+        for _ in 0..Self::PAGES_FAVORIS_MAX {
+            // #7250 : le service peut plafonner la page sous la limite demandée.
+            // Avancer du nombre reçu évite de sauter les favoris intermédiaires.
+            let offset = items.len();
+            let data = self
+                .api_get(&format!(
+                    "/users/{user_id}/favorites/{type_tidal}?limit={}&offset={offset}",
+                    Self::PAGE_FAVORIS
+                ))
+                .await?;
+            let lot = data["items"].as_array().cloned().unwrap_or_default();
+            let recus = lot.len();
+            items.extend(lot);
+            total = data["totalNumberOfItems"].as_u64().map(|t| t as usize);
+            let limite_servie = data["limit"]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(Self::PAGE_FAVORIS);
+            derniere_page_pleine = recus >= limite_servie;
+            let fini = match total {
+                Some(t) => items.len() >= t,
+                None => !derniere_page_pleine,
+            };
+            if fini || recus == 0 {
+                break;
+            }
+        }
+        let incomplete = match total {
+            Some(t) if items.len() < t => Some(format!(
+                "tidal: lecture des favoris « {type_tidal} » incomplète ({} sur {t})",
+                items.len()
+            )),
+            Some(_) => None,
+            None if derniere_page_pleine => Some(format!(
+                "tidal: lecture des favoris « {type_tidal} » sans total annoncé"
+            )),
+            None => None,
+        };
+        Ok((items, incomplete))
     }
 
     /// La clé sous laquelle Tidal date la mise en favori — sur l'ENVELOPPE,
@@ -964,7 +1106,10 @@ impl TidalService {
         quality: &str,
     ) -> Result<serde_json::Value, String> {
         let token = self.get_access_token().await?;
-        let url = format!("{API_BASE}/tracks/{track_id}/playbackinfopostpaywall");
+        let url = format!(
+            "{}/tracks/{track_id}/playbackinfopostpaywall",
+            self.api_base()
+        );
         let params = [
             ("audioquality", quality),
             ("playbackmode", "STREAM"),
@@ -1196,7 +1341,7 @@ impl TidalService {
     /// quoi le deuxième lot d'une playlist de plus de 100 titres échouerait.
     async fn etiquette_playlist(&self, playlist_id: &str) -> Result<String, String> {
         let token = self.get_access_token().await?;
-        let url = format!("{API_BASE}/playlists/{playlist_id}");
+        let url = format!("{}/playlists/{playlist_id}", self.api_base());
         let resp = self
             .client
             .get(&url)
@@ -1225,7 +1370,7 @@ impl TidalService {
         etiquette: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         let token = self.get_access_token().await?;
-        let url = format!("{API_BASE}{path}");
+        let url = format!("{}{path}", self.api_base());
         let poser = |req: reqwest::RequestBuilder| match etiquette {
             Some(e) => req.header(reqwest::header::IF_NONE_MATCH, e),
             None => req,
@@ -1274,7 +1419,7 @@ impl TidalService {
 
     async fn api_delete(&self, path: &str) -> Result<(), String> {
         let token = self.get_access_token().await?;
-        let url = format!("{API_BASE}{path}");
+        let url = format!("{}{path}", self.api_base());
         let resp = self
             .client
             .delete(&url)
@@ -1520,7 +1665,7 @@ impl StreamingService for TidalService {
         if credentials.get("device_flow").and_then(|v| v.as_bool()) == Some(true) {
             let resp = self
                 .client
-                .post(format!("{AUTH_BASE}/device_authorization"))
+                .post(format!("{}/device_authorization", self.auth_base()))
                 .form(&[("client_id", CLIENT_ID), ("scope", "r_usr w_usr w_sub")])
                 .send()
                 .await
@@ -1582,7 +1727,7 @@ impl StreamingService for TidalService {
 
                 let resp = self
                     .client
-                    .post(format!("{AUTH_BASE}/token"))
+                    .post(format!("{}/token", self.auth_base()))
                     .form(&[
                         ("client_id", CLIENT_ID),
                         ("client_secret", CLIENT_SECRET),
@@ -1647,6 +1792,17 @@ impl StreamingService for TidalService {
                 self.refresh_user_info().await;
             }
 
+            return Ok(self.auth_status().await);
+        }
+
+        // #6784 — un SONDAGE ne démarre jamais une autorisation. `GET
+        // /streaming/tidal` et `/auth/status` appellent `authenticate({"poll":
+        // true})` toutes les 3 s pendant l'attente : sans code d'appareil en
+        // cours, ils tombaient ici et relançaient un PKCE, ce qui ÉCRASAIT le
+        // `state` attendu. Le rappel arrivé ensuite était refusé (« state
+        // mismatch »), même sur la machine du serveur. Même garde que Spotify
+        // (fil 221).
+        if credentials.get("poll").is_some() {
             return Ok(self.auth_status().await);
         }
 
@@ -1823,7 +1979,39 @@ impl StreamingService for TidalService {
 
         let mut data = None;
         let mut downgraded_fallback: Option<serde_json::Value> = None;
-        for &q in fallback_chain {
+        // #6334 — la v2 `trackManifests` d'abord (elle rend le FLAC que la v1
+        // refuse au client de Tune). Seule une réponse qui atteint la qualité
+        // demandée termine la recherche. Un FLAC CD reçu après refus du Hi-Res
+        // reste un repli : la v1 peut encore rendre du Hi-Res (#7196).
+        // Tout échec de la v2 laisse la v1 faire, comme avant.
+        match self.manifeste_v2(track_id, requested_quality).await {
+            Ok(d) => {
+                let rang = quality_rank(d["audioQuality"].as_str().unwrap_or(""));
+                if rang >= quality_rank(requested_quality) {
+                    data = Some(d);
+                } else {
+                    garder_le_meilleur_repli(&mut downgraded_fallback, d);
+                }
+            }
+            Err(e) => {
+                info!(
+                    track_id,
+                    requested = requested_quality,
+                    error = %e,
+                    "tidal_manifeste_v2_echec_repli_v1"
+                );
+            }
+        }
+        for &q in fallback_chain.iter().filter(|_| data.is_none()) {
+            // #6334 — un repli déjà en main vaut au moins cette marche : la
+            // demander rendrait au mieux la même chose, et une réponse
+            // « exacte » à une marche plus basse (`HIGH` → `HIGH`) l'emportait
+            // sur le FLAC reçu plus tôt.
+            if downgraded_fallback.as_ref().is_some_and(|fb| {
+                quality_rank(fb["audioQuality"].as_str().unwrap_or("")) >= quality_rank(q)
+            }) {
+                break;
+            }
             match self.fetch_playback_info(track_id, q).await {
                 Ok(d) => {
                     let has_manifest = d["manifest"].as_str().is_some();
@@ -1841,7 +2029,11 @@ impl StreamingService for TidalService {
                     // Check if Tidal actually returned the requested quality or
                     // downgraded silently (e.g. HI_RES_LOSSLESS → HIGH AAC).
                     let returned_quality = d["audioQuality"].as_str().unwrap_or("UNKNOWN");
-                    let returned_codec = d["codec"].as_str().unwrap_or("UNKNOWN");
+                    // #6334 — `codec` n'existe pas à la racine de la réponse
+                    // v1 : le lire rendait toujours `UNKNOWN`. Le codec est
+                    // celui que nomme le manifeste.
+                    let returned_codec = codec_annonce_par_le_manifeste(&d);
+                    let returned_codec = returned_codec.as_deref().unwrap_or("UNKNOWN");
                     let manifest_mime = d["manifestMimeType"].as_str().unwrap_or("");
                     let bit_depth = d["bitDepth"].as_u64();
                     let sample_rate = d["sampleRate"].as_u64();
@@ -1895,9 +2087,7 @@ impl StreamingService for TidalService {
                             returned = returned_quality,
                             "tidal_quality_downgraded_but_lossless"
                         );
-                        if downgraded_fallback.is_none() {
-                            downgraded_fallback = Some(d);
-                        }
+                        garder_le_meilleur_repli(&mut downgraded_fallback, d);
                     } else {
                         // Got HIGH/LOW (lossy) — save only if nothing better found
                         warn!(
@@ -1907,9 +2097,7 @@ impl StreamingService for TidalService {
                             subscription = ?self.subscription,
                             "tidal_quality_downgraded_to_lossy"
                         );
-                        if downgraded_fallback.is_none() {
-                            downgraded_fallback = Some(d);
-                        }
+                        garder_le_meilleur_repli(&mut downgraded_fallback, d);
                     }
                 }
                 Err(e) => {
@@ -1942,6 +2130,11 @@ impl StreamingService for TidalService {
             format!("tidal: no usable stream found for track {track_id} (all qualities failed)")
         })?;
 
+        // #6334 — d'où vient la réponse retenue (journalisé avec le format reçu).
+        let voie = data["voie"]
+            .as_str()
+            .unwrap_or(manifeste_v2::VOIE_V1)
+            .to_string();
         let manifest = data["manifest"].as_str().ok_or("no manifest")?;
         let manifest_mime = data["manifestMimeType"].as_str().unwrap_or("");
         let decoded =
@@ -1949,7 +2142,7 @@ impl StreamingService for TidalService {
                 .map_err(|e| format!("utf8: {e}"))?;
 
         // Parse the manifest to get URL + optional codec/mime from the manifest itself
-        let (url, dash_codec, dash_mime) = if manifest_mime == "application/dash+xml" {
+        let (url, man_codec, man_mime) = if manifest_mime == "application/dash+xml" {
             // Log raw manifest content for debugging Hi-Res issues
             debug!(
                 track_id,
@@ -2012,17 +2205,23 @@ impl StreamingService for TidalService {
                 .and_then(|u| u.as_str())
                 .ok_or("no url in manifest")?
                 .to_string();
-            (url, None, None)
+            // #6334 — le manifeste BTS nomme lui-même ce qu'il livre
+            // (`codecs` : `flac`, `mp4a.40.2` ; `mimeType` : `audio/flac`,
+            // `audio/mp4`). Les ignorer faisait déduire le codec de la seule
+            // `audioQuality`, et annoncer `application/vnd.tidal.bts` — le
+            // type du MANIFESTE — comme MIME du flux audio.
+            let (codecs, mime) = codec_et_mime_du_manifeste_bts(&manifest_json);
+            (url, codecs, mime)
         } else {
             (decoded, None, None)
         };
 
         let audio_quality = data["audioQuality"].as_str().unwrap_or("LOSSLESS");
-        let (sample_rate, bit_depth) = Self::parse_quality_metadata(&data, audio_quality);
 
-        // Determine codec: prefer DASH manifest codec, then fall back to audio quality level.
-        // DASH codecs: "flac" → FLAC, "mp4a.40.2" → AAC, "mp4a.40.5" → AAC HE
-        let codec = if let Some(ref dc) = dash_codec {
+        // Determine codec: prefer the manifest's own codec (DASH or BTS), then
+        // fall back to audio quality level.
+        // Manifest codecs: "flac" → FLAC, "mp4a.40.2" → AAC, "mp4a.40.5" → AAC HE
+        let codec = if let Some(ref dc) = man_codec {
             let dc_lower = dc.to_lowercase();
             if dc_lower == "flac" || dc_lower.starts_with("fla") {
                 "FLAC"
@@ -2031,14 +2230,14 @@ impl StreamingService for TidalService {
             } else if dc_lower.starts_with("mqa") {
                 "FLAC" // MQA is delivered as FLAC container
             } else {
-                // Unknown DASH codec — fall back to quality-based detection
+                // Unknown manifest codec — fall back to quality-based detection
                 match audio_quality {
                     "HI_RES_LOSSLESS" | "HI_RES" | "LOSSLESS" => "FLAC",
                     _ => "AAC",
                 }
             }
         } else {
-            // No DASH codec info — determine from audio quality level:
+            // No manifest codec info — determine from audio quality level:
             // HI_RES_LOSSLESS = FLAC Hi-Res, HI_RES = MQA/FLAC, LOSSLESS = FLAC CD
             // Only HIGH and below are AAC
             match audio_quality {
@@ -2047,7 +2246,25 @@ impl StreamingService for TidalService {
             }
         };
 
-        // Determine MIME type: prefer DASH manifest, then derive from codec.
+        // #6334 — un AAC n'a pas de profondeur de bits : 0, jamais le 16 d'un
+        // FLAC CD (`parse_quality_metadata` retombait sur `(44100, 16)` faute
+        // de `bitDepth`). La cadence reste celle que Tidal annonce, sinon
+        // 44,1 kHz, celle de ses AAC.
+        let (sample_rate, bit_depth) = if codec == "AAC" {
+            (
+                data["sampleRate"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(44_100),
+                0,
+            )
+        } else {
+            Self::parse_quality_metadata(&data, audio_quality)
+        };
+
+        // Determine MIME type: prefer the manifest (DASH or BTS), then derive
+        // from codec.
         // For DASH multi-segment downloads (file:// URLs), the file on disk is
         // an fMP4 container — report audio/mp4 so symphonia uses IsoMp4Reader.
         let is_dash_file = url.starts_with("file://");
@@ -2057,7 +2274,7 @@ impl StreamingService for TidalService {
         } else if codec == "FLAC" {
             // DASH might report "audio/flac" or "audio/mp4" for FLAC-in-fMP4 container.
             // For playback, report what the actual codec is.
-            if let Some(ref dm) = dash_mime {
+            if let Some(ref dm) = man_mime {
                 if dm == "audio/flac" || dm == "audio/mp4" {
                     dm.as_str()
                 } else {
@@ -2066,9 +2283,11 @@ impl StreamingService for TidalService {
             } else {
                 "audio/flac"
             }
-        } else if let Some(ref dm) = dash_mime {
+        } else if let Some(ref dm) = man_mime {
             dm.as_str()
-        } else if !manifest_mime.is_empty() && manifest_mime != "application/dash+xml" {
+        } else if manifest_mime.starts_with("audio/") {
+            // #6334 — jamais `application/vnd.tidal.bts` : c'est le type du
+            // manifeste, pas celui des octets audio.
             manifest_mime
         } else {
             "audio/mp4"
@@ -2079,7 +2298,7 @@ impl StreamingService for TidalService {
                 .as_u64()
                 .map(|_| sample_rate * (bit_depth as u32) * 2)
         } else {
-            Some(320_000) // AAC HIGH = 320kbps
+            debit_aac_de_tidal(audio_quality)
         };
 
         // Cache all URLs including file:// from DASH — prevents double-download
@@ -2121,6 +2340,7 @@ impl StreamingService for TidalService {
                 sample_rate,
                 bit_depth,
                 subscription = ?self.subscription,
+                voie = voie.as_str(),
                 "tidal_stream_url_lossy — Tidal returned AAC instead of FLAC"
             );
         } else {
@@ -2131,6 +2351,7 @@ impl StreamingService for TidalService {
                 codec,
                 sample_rate,
                 bit_depth,
+                voie = voie.as_str(),
                 "tidal_stream_url"
             );
         }
@@ -2322,6 +2543,28 @@ impl StreamingService for TidalService {
             "tracks" | "albums" | "artists" => self.favoris_bruts(fav_type).await?,
             _ => return Ok(None),
         };
+        Ok(Some(
+            enveloppes
+                .iter()
+                .filter_map(|e| Self::favori_date(e, fav_type))
+                .collect(),
+        ))
+    }
+
+    /// #5997 — la même liste datée, mais `Err` si Tidal ne l'a pas servie en
+    /// entier : c'est elle que le miroir réconcilie.
+    async fn favoris_dates_complets(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        if !matches!(fav_type, "tracks" | "albums" | "artists") {
+            return Ok(None);
+        }
+        let (enveloppes, incomplete) = self.lecture_des_favoris(fav_type).await?;
+        if let Some(motif) = incomplete {
+            warn!(fav_type, motif = %motif, "tidal_favoris_lecture_incomplete_5997");
+            return Err(motif.into());
+        }
         Ok(Some(
             enveloppes
                 .iter()
@@ -2616,6 +2859,55 @@ impl StreamingService for TidalService {
 }
 
 /// Rank audio quality levels for comparison. Higher = better.
+/// #6334 — le débit d'un AAC Tidal, tel que l'API le définit pour sa
+/// qualité : `HIGH` = 320 kbit/s, `LOW` = 96 kbit/s. Rien pour un AAC rendu
+/// sous une autre étiquette : un chiffre inventé n'est pas un débit nommé.
+fn debit_aac_de_tidal(audio_quality: &str) -> Option<u32> {
+    match audio_quality {
+        "HIGH" => Some(320_000),
+        "LOW" => Some(96_000),
+        _ => None,
+    }
+}
+
+/// #6334 — `codecs` et `mimeType` d'un manifeste BTS déjà décodé.
+fn codec_et_mime_du_manifeste_bts(
+    manifeste: &serde_json::Value,
+) -> (Option<String>, Option<String>) {
+    let champ = |cle: &str| {
+        manifeste[cle]
+            .as_str()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+    };
+    (champ("codecs"), champ("mimeType"))
+}
+
+/// #6334 — le codec que nomme le manifeste d'une réponse `playbackinfo`
+/// (BTS ou DASH), pour le journal de la cascade. `None` s'il n'en nomme pas.
+fn codec_annonce_par_le_manifeste(reponse: &serde_json::Value) -> Option<String> {
+    let brut = base64_decode(reponse["manifest"].as_str()?).ok()?;
+    let texte = String::from_utf8(brut).ok()?;
+    if reponse["manifestMimeType"].as_str() == Some("application/dash+xml") {
+        parse_dash_manifest(&texte)?.codec
+    } else {
+        codec_et_mime_du_manifeste_bts(&serde_json::from_str(&texte).ok()?).0
+    }
+}
+
+/// #6334 — garde, parmi les réponses dégradées de la cascade, celle de la
+/// MEILLEURE qualité rendue, et non la première. `HI_RES_LOSSLESS` peut
+/// revenir en `HIGH`, puis `HI_RES` en `LOSSLESS` : si la marche suivante
+/// échoue (429, délai, réponse sans manifeste), c'est le FLAC qu'il faut
+/// servir, pas l'AAC reçu en premier. À rang égal, la première reste.
+fn garder_le_meilleur_repli(repli: &mut Option<serde_json::Value>, candidat: serde_json::Value) {
+    let rang = |d: &serde_json::Value| quality_rank(d["audioQuality"].as_str().unwrap_or(""));
+    if repli.as_ref().is_none_or(|r| rang(&candidat) > rang(r)) {
+        *repli = Some(candidat);
+    }
+}
+
 fn quality_rank(quality: &str) -> u8 {
     match quality {
         "HI_RES_LOSSLESS" => 4,
@@ -2765,6 +3057,34 @@ fn resolve_tidal_url(url: &str) -> String {
     }
 }
 
+/// #7106 — la valeur d'un attribut du MPD, entités XML résolues.
+///
+/// Les URL signées du manifeste v2 (`trackManifests`, #6334) portent leur
+/// signature en paramètres de requête, écrits `&amp;` dans le XML. Lues telles
+/// quelles, elles partaient au CDN avec `amp;Signature=` : l'init et tous les
+/// segments étaient refusés (« all N DASH segments failed »). Une valeur
+/// mal formée reste lue brute, comme avant.
+fn valeur_d_attribut_mpd(attr: &quick_xml::events::attributes::Attribute<'_>) -> String {
+    let brut = String::from_utf8_lossy(&attr.value);
+    match quick_xml::escape::unescape(&brut) {
+        Ok(v) => v.into_owned(),
+        Err(_) => brut.into_owned(),
+    }
+}
+
+/// #7106 — le texte d'une référence (`&amp;`, `&#38;`) rencontrée dans un
+/// élément du MPD ; une référence inconnue est rendue telle qu'écrite.
+fn reference_xml(r: &quick_xml::events::BytesRef<'_>) -> String {
+    if let Ok(Some(c)) = r.resolve_char_ref() {
+        return c.to_string();
+    }
+    let nom = r.decode().unwrap_or_default();
+    match quick_xml::escape::resolve_predefined_entity(&nom) {
+        Some(v) => v.to_string(),
+        None => format!("&{nom};"),
+    }
+}
+
 /// Parse a DASH MPD manifest (XML) to extract stream URL, codec, and MIME type.
 ///
 /// Tidal Hi-Res FLAC streams use DASH manifests. The MPD XML typically contains
@@ -2789,6 +3109,7 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
     let mut segment_template_init: Option<String> = None;
     let mut segment_template_start_number: u32 = 1;
     let mut in_base_url = false;
+    let mut texte_base_url = String::new();
     let mut in_segment_template = false;
     // SegmentTimeline: accumulate total segment count from <S> elements.
     // Each <S d="..." r="N"/> means 1 + N segments (r = repeat count, 0-based).
@@ -2804,12 +3125,13 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                 match tag {
                     "BaseURL" => {
                         in_base_url = true;
+                        texte_base_url.clear();
                     }
                     "AdaptationSet" => {
                         // Pick up mimeType from AdaptationSet if not already set
                         for attr in e.attributes().flatten() {
                             let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            let val = valeur_d_attribut_mpd(&attr);
                             if key == "mimeType" && mime_type.is_none() {
                                 mime_type = Some(val);
                             } else if key == "codecs" && codec.is_none() {
@@ -2821,7 +3143,7 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                         // Representation attributes override AdaptationSet
                         for attr in e.attributes().flatten() {
                             let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            let val = valeur_d_attribut_mpd(&attr);
                             match key.as_str() {
                                 "codecs" => codec = Some(val),
                                 "mimeType" => mime_type = Some(val),
@@ -2833,7 +3155,7 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                         in_segment_template = true;
                         for attr in e.attributes().flatten() {
                             let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            let val = valeur_d_attribut_mpd(&attr);
                             match key.as_str() {
                                 "media" => {
                                     segment_template_media = Some(val);
@@ -2857,7 +3179,7 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                         let mut repeat: u32 = 0;
                         for attr in e.attributes().flatten() {
                             let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            let val = valeur_d_attribut_mpd(&attr);
                             if key == "r" {
                                 repeat = val.parse().unwrap_or(0);
                             }
@@ -2870,18 +3192,29 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
             }
             Ok(Event::Text(ref e)) => {
                 if in_base_url {
-                    let decoded = e.decode().unwrap_or_default();
-                    let url = decoded.trim().to_string();
-                    if !url.is_empty() {
-                        base_url = Some(url);
-                    }
+                    texte_base_url.push_str(&e.decode().unwrap_or_default());
+                }
+            }
+            // #7106 — quick-xml rend `&amp;` d'un texte comme un évènement à
+            // part : sans lui, une BaseURL signée perdait tout ce qui précède
+            // le dernier `&`.
+            Ok(Event::GeneralRef(ref e)) => {
+                if in_base_url {
+                    texte_base_url.push_str(&reference_xml(e));
                 }
             }
             Ok(Event::End(ref e)) => {
                 let local = e.local_name();
                 let tag = std::str::from_utf8(local.as_ref()).unwrap_or("");
                 match tag {
-                    "BaseURL" => in_base_url = false,
+                    "BaseURL" => {
+                        in_base_url = false;
+                        let url = texte_base_url.trim();
+                        if !url.is_empty() {
+                            base_url = Some(url.to_string());
+                        }
+                        texte_base_url.clear();
+                    }
                     "SegmentTemplate" => in_segment_template = false,
                     _ => {}
                 }
@@ -4561,6 +4894,262 @@ mod pagination_recherche_i4803 {
             envoye(&journal, 0, "offset"),
             None,
             "sans paged=true, la requête d'avant #4803, intacte"
+        );
+    }
+}
+
+/// Témoins seulement : un service pointé sur un faux Tidal en boucle locale,
+/// armé d'un jeton d'essai. Aucun identifiant ni jeton réel.
+#[cfg(test)]
+impl TidalService {
+    pub(crate) fn pour_un_faux_tidal(base: String) -> Self {
+        let mut svc = Self::new();
+        svc.base_forcee = Some(base);
+        svc.tokens = Mutex::new(TokenState {
+            access_token: Some("jeton-essai".into()),
+            refresh_token: None,
+            token_expires: None,
+        });
+        svc
+    }
+}
+
+#[cfg(test)]
+#[path = "tidal_qualite_livree_6334_tests.rs"]
+mod qualite_livree_6334_tests;
+
+// #6334 — lecture par `trackManifests` v2, repli v1.
+#[path = "tidal_manifeste_v2.rs"]
+mod manifeste_v2;
+#[cfg(test)]
+#[path = "tidal_manifeste_v2_6334_tests.rs"]
+mod manifeste_v2_6334_tests;
+
+// #7106 — URL signées du MPD v2 : entités XML résolues avant le CDN.
+#[cfg(test)]
+#[path = "tidal_dash_entites_7106_tests.rs"]
+mod dash_entites_7106_tests;
+
+// #7106 — le MPD v2 RÉEL (relevé le 26/10 sur le .18) : `token` + `info`.
+#[cfg(test)]
+#[path = "tidal_dash_mpd_reel_7106_tests.rs"]
+mod dash_mpd_reel_7106_tests;
+
+/// #5997 — les favoris Tidal sont relus EN ENTIER, et une lecture incomplète
+/// se dit au miroir au lieu de passer pour la liste entière.
+#[cfg(test)]
+mod favoris_complets_5997 {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Un TIDAL factice : `total` titres favoris annoncés, servis par pages
+    /// jusqu'à `servis` au plus.
+    async fn faux_tidal(total: usize, servis: usize) -> TidalService {
+        faux_tidal_plafonne(total, servis, 100, true).await
+    }
+
+    async fn faux_tidal_plafonne(
+        total: usize,
+        servis: usize,
+        plafond: usize,
+        annoncer_total: bool,
+    ) -> TidalService {
+        use axum::extract::{Query, State};
+        use axum::routing::get;
+        async fn favoris(
+            State((total, servis, plafond, annoncer_total)): State<(usize, usize, usize, bool)>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> axum::Json<serde_json::Value> {
+            let offset: usize = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(10);
+            let limit = limit.min(plafond);
+            let items: Vec<_> = (offset..(offset + limit).min(servis))
+                .map(|i| {
+                    json!({"created": "2026-10-01T10:00:00.000+0000",
+                        "item": {"id": i + 1, "title": format!("piste {}", i + 1)}})
+                })
+                .collect();
+            let mut reponse = json!({"limit": limit, "offset": offset, "items": items});
+            if annoncer_total {
+                reponse["totalNumberOfItems"] = json!(total);
+            }
+            axum::Json(reponse)
+        }
+        let app = axum::Router::new()
+            .route("/users/7/favorites/tracks", get(favoris))
+            .with_state((total, servis, plafond, annoncer_total));
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let mut svc = TidalService::new();
+        svc.base_forcee = Some(format!("http://{adresse}"));
+        svc.user_id = Some(7);
+        svc.tokens = Mutex::new(TokenState {
+            access_token: Some("jeton-essai".into()),
+            refresh_token: None,
+            token_expires: None,
+        });
+        svc
+    }
+
+    /// Le fournisseur peut plafonner les pages sous la limite demandée.
+    /// Les trois projections doivent conserver chaque identifiant, sans trous.
+    #[tokio::test]
+    async fn pages_plafonnees_conservent_les_357_favoris_7250() {
+        let svc = faux_tidal_plafonne(357, 357, 50, true).await;
+        let types = svc.get_user_tracks().await.expect("favoris typés");
+        let ids: Vec<_> = types.iter().map(|t| t.id.clone()).collect();
+        let attendus: Vec<_> = (1..=357).map(|id| id.to_string()).collect();
+        assert_eq!(
+            ids, attendus,
+            "#7250 : une page plafonnée ne doit sauter aucun favori"
+        );
+        let dates = svc
+            .get_user_favorites_dated("tracks")
+            .await
+            .expect("projection datée")
+            .expect("lecture datée");
+        assert_eq!(
+            dates.len(),
+            357,
+            "#7250 : tous les favoris destinés à la route HTTP"
+        );
+        let miroir = svc
+            .favoris_dates_complets("tracks")
+            .await
+            .expect("projection miroir")
+            .expect("collection complète pour le miroir");
+        assert_eq!(
+            miroir.len(),
+            357,
+            "#7250 : le miroir reçoit toute la collection"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_plafonnee_sans_total_ne_termine_pas_la_collection_7250() {
+        let svc = faux_tidal_plafonne(357, 357, 50, false).await;
+        let complets = svc
+            .favoris_dates_complets("tracks")
+            .await
+            .expect("lecture miroir")
+            .expect("favoris datés");
+        let ids: Vec<_> = complets
+            .iter()
+            .map(|v| v["source_id"].as_str().unwrap().to_string())
+            .collect();
+        let attendus: Vec<_> = (1..=357).map(|id| id.to_string()).collect();
+        assert_eq!(
+            ids, attendus,
+            "#7250 : une page pleine au plafond annoncé ne termine pas la collection"
+        );
+    }
+
+    /// 150 favoris : la lecture ne s'arrête plus à la première page de 100.
+    #[tokio::test]
+    async fn les_favoris_au_dela_de_cent_sont_relus_5997() {
+        let svc = faux_tidal(150, 150).await;
+        let complets = svc
+            .favoris_dates_complets("tracks")
+            .await
+            .expect("lecture complète")
+            .expect("Tidal date ses favoris");
+        assert_eq!(
+            complets.len(),
+            150,
+            "les favoris au-delà de 100 sont perdus"
+        );
+        assert_eq!(svc.get_user_tracks().await.unwrap().len(), 150);
+    }
+
+    /// Tidal annonce 150 favoris et n'en sert que 100 : la lecture du miroir
+    /// est une ERREUR ; l'affichage garde les 100.
+    #[tokio::test]
+    async fn une_lecture_tidal_incomplete_est_une_erreur_pour_le_miroir_5997() {
+        let svc = faux_tidal(150, 100).await;
+        let lecture = svc.favoris_dates_complets("tracks").await;
+        assert!(
+            lecture.is_err(),
+            "une liste partielle a été rendue comme complète : {} éléments",
+            lecture.ok().flatten().map(|v| v.len()).unwrap_or(0)
+        );
+        let affichage = svc
+            .get_user_favorites_dated("tracks")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(affichage.len(), 100);
+    }
+}
+
+/// #6784 — l'adresse de retour PKCE de TIDAL et le client qui la demande.
+/// Aucun appel à TIDAL : ni le démarrage du PKCE ni un sondage sans code
+/// d'appareil ne touchent le réseau.
+#[cfg(test)]
+mod retour_oauth_6784 {
+    use super::*;
+    use crate::streaming::traits::StreamingService;
+
+    #[test]
+    fn le_rappel_aboutit_sur_la_machine_du_serveur_au_port_du_rappel() {
+        for hote in [
+            "localhost:8888",
+            "127.0.0.1:8888",
+            "[::1]:8888",
+            "LOCALHOST:8888",
+        ] {
+            assert!(rappel_pkce_aboutit(Some(hote)), "{hote}");
+        }
+    }
+
+    /// TÉMOIN du défaut : depuis un téléphone, l'hôte vu est l'adresse du
+    /// serveur sur le réseau ; `localhost:8888` y désignerait le téléphone.
+    #[test]
+    fn le_rappel_n_aboutit_pas_depuis_une_autre_machine() {
+        for hote in [
+            "192.168.1.18:8888",
+            "tune.local:8888",
+            "tune.example",
+            "[fe80::1]:8888",
+            // Machine du serveur, mais pas le port que le rappel vise.
+            "localhost:9000",
+            "127.0.0.1",
+            "",
+        ] {
+            assert!(!rappel_pkce_aboutit(Some(hote)), "{hote}");
+        }
+        assert!(!rappel_pkce_aboutit(None));
+    }
+
+    /// TÉMOIN ROUGE avant le correctif : le sondage relançait un PKCE et
+    /// remplaçait le `state` attendu ; le rappel arrivé ensuite était refusé.
+    #[tokio::test]
+    async fn un_sondage_n_ecrase_pas_l_autorisation_en_cours() {
+        let mut svc = TidalService::new();
+        let depart = svc.authenticate(&serde_json::json!({})).await.unwrap();
+        assert!(depart.verification_url.is_some(), "le PKCE démarre");
+        let attendu = svc.pending_pkce.as_ref().map(|p| p.state.clone());
+        assert!(attendu.is_some());
+
+        for _ in 0..3 {
+            let sonde = svc
+                .authenticate(&serde_json::json!({"poll": true}))
+                .await
+                .unwrap();
+            assert!(!sonde.authenticated);
+            assert!(
+                sonde.verification_url.is_none(),
+                "un sondage ne rend pas une NOUVELLE autorisation"
+            );
+        }
+        assert_eq!(
+            svc.pending_pkce.as_ref().map(|p| p.state.clone()),
+            attendu,
+            "le `state` attendu par le rappel doit survivre aux sondages"
         );
     }
 }

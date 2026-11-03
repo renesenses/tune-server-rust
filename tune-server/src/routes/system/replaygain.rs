@@ -221,3 +221,125 @@ pub(crate) async fn replaygain_reanalyze(
         ),
     }
 }
+
+/// Ce que sait la route au moment du clic sur « Lancer » (#6778).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EtatDuLancement {
+    /// L'analyse ReplayGain est armée (`analysis_enabled`).
+    pub armee: bool,
+    /// L'utilisateur a suspendu la passe (`/background-tasks/replaygain/pause`).
+    pub en_pause: bool,
+    /// Une campagne est ouverte (`progression::releve().actif`).
+    pub campagne_ouverte: bool,
+    /// Pistes que la passe prendrait maintenant.
+    pub candidates: i64,
+    /// La zone qui joue, s'il y en a une : la passe lui cède (#1310).
+    pub zone_qui_joue: Option<String>,
+}
+
+/// La décision de `POST /system/replaygain/analyze`, sans effet de bord :
+/// `true` en troisième position veut dire « réveiller la boucle ».
+pub(crate) fn decider_le_lancement(e: &EtatDuLancement) -> (axum::http::StatusCode, Value, bool) {
+    use axum::http::StatusCode;
+    if !e.armee {
+        return (
+            StatusCode::CONFLICT,
+            json!({"status": "refused", "reason": "analysis_disabled"}),
+            false,
+        );
+    }
+    if e.en_pause {
+        // La pause est une décision de l'utilisateur, persistante (#4574) :
+        // « Lancer » ne la lève pas en douce. Elle se reprend par
+        // `POST /system/background-tasks/replaygain/resume`.
+        return (
+            StatusCode::CONFLICT,
+            json!({"status": "refused", "reason": "paused"}),
+            false,
+        );
+    }
+    if e.campagne_ouverte {
+        return (
+            StatusCode::CONFLICT,
+            json!({"status": "already_running"}),
+            false,
+        );
+    }
+    if e.candidates <= 0 {
+        return (
+            StatusCode::OK,
+            json!({"status": "nothing_to_do", "candidates": 0}),
+            false,
+        );
+    }
+    // La priorité à la lecture n'est pas contournée : la boucle réveillée
+    // cède encore à la zone qui joue, et la réponse le dit.
+    let attente = e.zone_qui_joue.as_ref().map(|_| "playback");
+    (
+        StatusCode::ACCEPTED,
+        json!({
+            "status": "started",
+            "candidates": e.candidates,
+            "waiting_reason": attente,
+            "playing_zone": e.zone_qui_joue,
+        }),
+        true,
+    )
+}
+
+/// `POST /system/replaygain/analyze` — lancer la passe ReplayGain à la
+/// demande (#6778, prérequis de tune-web-client#2295 ; récidive de #6330).
+///
+/// Au repos, la boucle de fond (`tune_core::audio::replaygain::spawn`) dort
+/// un quart d'heure : des pistes ajoutées juste après son endormissement
+/// attendaient jusqu'à 15 min, et la carte ReplayGain n'offrait aucun geste.
+/// Rien n'est mesuré ici : la route réveille la boucle
+/// (`reessai::reveiller_la_cascade`, le réveil de « Tout relancer »), qui
+/// prend aussitôt ses candidates, par lots, sous le verrou d'analyse.
+///
+/// Même contrat que `POST /system/dynamic-range/analyze` :
+/// - **202** `{"status":"started","candidates":n,"waiting_reason":null|"playback","playing_zone":…}` ;
+/// - **200** `{"status":"nothing_to_do","candidates":0}` ;
+/// - **409** `{"status":"already_running"}` : une campagne est ouverte ;
+/// - **409** `{"status":"refused","reason":"analysis_disabled"|"paused"}`.
+pub(crate) async fn replaygain_analyze(
+    State(state): State<AppState>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use tune_core::audio::replaygain as rg;
+    use tune_core::taches_de_fond::{Tache, est_en_pause};
+
+    let armee = rg::analysis_enabled(&state.backend);
+    let en_pause = est_en_pause(Tache::ReplayGain);
+    let campagne_ouverte = rg::progression::releve().actif;
+    // Le COUNT parcourt `tracks` : compté seulement quand il peut décider, et
+    // hors des fils de l'exécuteur.
+    let (candidates, zone_qui_joue) = if armee && !en_pause && !campagne_ouverte {
+        let backend = state.backend.clone();
+        tokio::task::spawn_blocking(move || {
+            (
+                rg::compter_les_candidats_replaygain(&backend),
+                rg::playing_zone_name(&backend),
+            )
+        })
+        .await
+        .unwrap_or((0, None))
+    } else {
+        (0, None)
+    };
+    let (statut, corps, reveiller) = decider_le_lancement(&EtatDuLancement {
+        armee,
+        en_pause,
+        campagne_ouverte,
+        candidates,
+        zone_qui_joue,
+    });
+    if reveiller {
+        rg::reessai::reveiller_la_cascade();
+    }
+    tracing::info!(status = %corps["status"], candidates, "replaygain_lancement_a_la_demande");
+    (statut, Json(corps))
+}
+
+#[cfg(test)]
+#[path = "replaygain_lancer_tests_6778.rs"]
+mod replaygain_lancer_tests_6778;

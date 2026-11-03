@@ -43,11 +43,48 @@ pub fn generate_random_queue(
          AND (NULLIF(TRIM(t.file_path), '') IS NOT NULL \
               OR NULLIF(TRIM(t.cue_media_path), '') IS NOT NULL) \
          AND {sans_bannis}) \
-         SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.autoplay_year, t.bpm \
+         SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.autoplay_year, t.bpm, \
+         t.album_id \
          FROM eligible t LEFT JOIN artists ar ON ar.id = t.artist_id \
          LEFT JOIN albums al ON al.id = t.album_id {selection}"
     );
-    db.query_many(&sql, &[]).map(|rows| rows_to_json(&rows))
+    let mut rows = db.query_many(&sql, &[])?;
+    if mode == AutoplayMode::RandomAlbum {
+        ranger_comme_la_fiche(db, &mut rows)?;
+    }
+    Ok(rows_to_json(&rows))
+}
+
+/// #6222 — l'album tiré se joue dans l'ordre de sa FICHE : celui de
+/// [`crate::db::track_repo::TrackRepo::list_by_album`], qui applique
+/// [`crate::db::track_repo::ordonner_pistes_d_un_album`]. Une compilation
+/// personnelle (un disque, numéros d'origine en double) suit donc l'ordre de
+/// ses fichiers ici aussi, et tout autre album garde disque, numéro, titre.
+/// La règle n'est pas recopiée : on reprend le rang de chaque piste dans la
+/// fiche. Une piste absente de la fiche (impossible en pratique) passe en
+/// dernier, dans l'ordre reçu.
+fn ranger_comme_la_fiche(
+    db: &Arc<dyn DbBackend>,
+    rows: &mut [Vec<crate::db::backend::SqlValue>],
+) -> Result<(), String> {
+    let Some(album_id) = rows.first().and_then(|r| r.get(8)).and_then(|v| v.as_i64()) else {
+        return Ok(());
+    };
+    let fiche = crate::db::track_repo::TrackRepo::with_backend(db.clone())
+        .list_by_album(album_id)
+        .map_err(|e| e.to_string())?;
+    let rang: std::collections::HashMap<i64, usize> = fiche
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| t.id.map(|id| (id, i)))
+        .collect();
+    rows.sort_by_key(|r| {
+        r.first()
+            .and_then(|v| v.as_i64())
+            .and_then(|id| rang.get(&id).copied())
+            .unwrap_or(usize::MAX)
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -219,13 +256,23 @@ mod tests {
                 .await
                 .unwrap();
             let db: Arc<dyn DbBackend> = Arc::new(crate::db::backend::PostgresBackend::new(pool));
+            // #6222 — « album au hasard » relit l'album par
+            // `TrackRepo::list_by_album`, dont la projection (`select_track`)
+            // lit toutes les colonnes ci-dessous : elles portent les types des
+            // migrations PostgreSQL réelles.
             db.execute_batch(&format!("CREATE TEMP TABLE zones (id BIGINT PRIMARY KEY, autoplay_enabled {initial_type} DEFAULT '0');
             CREATE TEMP TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT);
             CREATE TEMP TABLE artists (id BIGINT PRIMARY KEY, name TEXT);
-            CREATE TEMP TABLE albums (id BIGINT PRIMARY KEY, title TEXT, artist_id BIGINT, year INTEGER);
+            CREATE TEMP TABLE albums (id BIGINT PRIMARY KEY, title TEXT, artist_id BIGINT, year INTEGER,
+                cover_path TEXT);
             CREATE TEMP TABLE tracks (id BIGINT PRIMARY KEY, title TEXT, album_id BIGINT, artist_id BIGINT,
                 file_path TEXT, cue_media_path TEXT, disc_number INTEGER, track_number INTEGER,
-                duration_ms BIGINT DEFAULT 0, genre TEXT, year INTEGER, bpm DOUBLE PRECISION, source TEXT DEFAULT 'local');
+                duration_ms BIGINT DEFAULT 0, genre TEXT, year INTEGER, bpm DOUBLE PRECISION, source TEXT DEFAULT 'local',
+                album_artist TEXT, disc_subtitle TEXT, format TEXT, sample_rate INTEGER, bit_depth INTEGER,
+                channels INTEGER, file_mtime DOUBLE PRECISION, file_size BIGINT, audio_hash TEXT, source_id TEXT,
+                isrc TEXT, composer TEXT, label TEXT, musicbrainz_recording_id TEXT, cover_path TEXT, genres TEXT,
+                comments TEXT, cue_start_ms BIGINT, cue_end_ms BIGINT, rating BIGINT,
+                bitrate_kbps BIGINT);
             INSERT INTO zones (id, autoplay_enabled) VALUES (1, 0), (2, 1), (3, NULL);")).unwrap();
             if initial_type == "TEXT" {
                 db.execute_batch(
@@ -379,6 +426,89 @@ mod tests {
             let revue = (0..100).any(|_| g().contains(&bannie));
             assert!(revue, "{nom} : débannie, la piste doit ressortir");
         }
+    }
+
+    /// #6222 — l'album au hasard se joue dans l'ordre de sa fiche. Une
+    /// compilation personnelle (un disque, numéros d'origine 1, 2, 1, 2)
+    /// suit l'ordre de ses fichiers, comme `TrackRepo::list_by_album`.
+    #[test]
+    fn l_album_au_hasard_suit_l_ordre_de_la_fiche_6222() {
+        let db = db();
+        db.execute("INSERT INTO albums (id, title) VALUES (1, 'Compil')", &[])
+            .unwrap();
+        let pistes: [(i64, &str, Option<i64>, i64, &str); 5] = [
+            (1, "Ziggy", Some(1), 1, "/musique/Compil/01 - Ziggy.flac"),
+            (2, "Angie", Some(1), 2, "/musique/Compil/02 - Angie.flac"),
+            (3, "Bohemian", None, 1, "/musique/Compil/03 - Bohemian.flac"),
+            (4, "Creep", Some(0), 2, "/musique/Compil/10 - Creep.flac"),
+            (5, "Africa", Some(1), 1, "/musique/Compil/9 - Africa.flac"),
+        ];
+        for (id, titre, disque, numero, fichier) in pistes {
+            db.execute(
+                "INSERT INTO tracks (id, title, album_id, file_path, disc_number, track_number) \
+                 VALUES (?, ?, 1, ?, ?, ?)",
+                &[
+                    &id,
+                    &titre.to_string(),
+                    &fichier.to_string(),
+                    &disque,
+                    &numero,
+                ],
+            )
+            .unwrap();
+        }
+        let fiche: Vec<i64> = crate::db::track_repo::TrackRepo::with_backend(db.clone())
+            .list_by_album(1)
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.id)
+            .collect();
+        assert_eq!(
+            fiche,
+            [1, 2, 3, 5, 4],
+            "la fiche suit l'ordre naturel des fichiers"
+        );
+        let jouee = ids_de(&generate_random_queue(&db, AutoplayMode::RandomAlbum).unwrap());
+        assert_eq!(
+            jouee, fiche,
+            "l'auto-DJ doit jouer l'album dans l'ordre de sa fiche ; \
+             disque puis numéro donnait 4, 1, 3, 5, 2"
+        );
+    }
+
+    /// #6222 — un album ordinaire garde l'ordre de sa fiche : disque, puis
+    /// pistes numérotées d'abord, puis numéro, puis titre.
+    #[test]
+    fn un_album_ordinaire_au_hasard_garde_l_ordre_de_la_fiche_6222() {
+        let db = db();
+        db.execute("INSERT INTO albums (id, title) VALUES (1, 'Album')", &[])
+            .unwrap();
+        let pistes: [(i64, i64, i64, &str); 4] = [
+            (1, 2, 1, "/a/d.flac"),
+            (2, 1, 2, "/a/c.flac"),
+            (3, 1, 1, "/a/b.flac"),
+            (4, 2, 2, "/a/a.flac"),
+        ];
+        for (id, disque, numero, fichier) in pistes {
+            db.execute(
+                "INSERT INTO tracks (id, title, album_id, file_path, disc_number, track_number) \
+                 VALUES (?, ?, 1, ?, ?, ?)",
+                &[
+                    &id,
+                    &format!("T{id}"),
+                    &fichier.to_string(),
+                    &disque,
+                    &numero,
+                ],
+            )
+            .unwrap();
+        }
+        let jouee = ids_de(&generate_random_queue(&db, AutoplayMode::RandomAlbum).unwrap());
+        assert_eq!(
+            jouee,
+            [3, 2, 1, 4],
+            "un coffret reste rangé par disque puis numéro"
+        );
     }
 
     fn ids_de(tracks: &[Value]) -> Vec<i64> {

@@ -145,9 +145,27 @@ pub(crate) fn decider_l_enchainement_natif(
     ouvert: FormatOuvert,
     suivante: AudioSpec,
 ) -> EnchainementNatif {
+    decider_l_enchainement_natif_vers(source, ouvert, suivante, suivante.canaux())
+}
+
+/// #6230 — la même règle quand la suivante ouvrirait `voies` voies et non
+/// ses canaux : celles de la grille de réaffectation qui pilote l'ouverture
+/// d'un transport exclusif (une grille 6 → 2 ouvre 2 voies). On enchaîne si
+/// la suivante a le format de la courante ET si le flux ouvert porte sa
+/// cadence et ses voies ; sinon on rouvre. Sans grille, `voies` vaut les
+/// canaux de la suivante : c'est [`decider_l_enchainement_natif`], inchangée.
+#[cfg_attr(
+    not(any(target_os = "windows", target_os = "macos", test)),
+    allow(dead_code)
+)]
+pub(crate) fn decider_l_enchainement_natif_vers(
+    source: AudioSpec,
+    ouvert: FormatOuvert,
+    suivante: AudioSpec,
+    voies: u16,
+) -> EnchainementNatif {
     let meme_format_que_la_source = suivante == source;
-    let le_peripherique_le_porte =
-        suivante.cadence() == ouvert.cadence && suivante.canaux() == ouvert.canaux;
+    let le_peripherique_le_porte = suivante.cadence() == ouvert.cadence && voies == ouvert.canaux;
     if meme_format_que_la_source && le_peripherique_le_porte {
         EnchainementNatif::Enchainer
     } else {

@@ -452,6 +452,9 @@ pub fn renderer_a_l_arret_sans_avoir_joue(peak_position_ms: u64, position_prouve
 /// own an actual realtime stream, startup and seek recovery must be over,
 /// the renderer must already have proven that it reports position, and a
 /// known track end is left to the normal end-of-track machinery.
+// Prédicat pur : une condition nommée par argument, lue telle quelle par ses
+// témoins ; même choix que les deux autres décisions de ce fichier.
+#[allow(clippy::too_many_arguments)]
 pub fn dlna_playing_stall_eligible(
     output_type: &str,
     tune_is_playing: bool,
@@ -492,6 +495,45 @@ pub fn next_dlna_playing_stall_ticks(
     } else {
         previous_ticks.saturating_add(1)
     }
+}
+
+/// 🔴 #6702 — la série de tours sans progrès a-t-elle duré assez longtemps,
+/// en TEMPS RÉEL, pour couper la zone ?
+///
+/// `ticks` est le compteur que vient de rendre
+/// [`next_dlna_playing_stall_ticks`]. `depuis` date le premier tour de la
+/// série : il est posé quand la série commence (`ticks == 1`, ou première
+/// rencontre), effacé quand elle retombe à zéro. Les remises à zéro faites
+/// ailleurs dans le sondeur repartent donc d'elles-mêmes d'un instant neuf.
+///
+/// Il faut les DEUX : `PLAYING_STALL_THRESHOLD` tours (des sondages réels) et
+/// `PLAYING_STALL_MIN_SECS` secondes depuis le premier. Une rafale de tours
+/// rattrapés après un blocage du sondeur n'a pas laissé au renderer le temps
+/// d'avancer sa position d'une seconde : elle ne prouve rien.
+pub fn lecture_sans_progres_etablie(
+    ticks: u8,
+    depuis: &mut Option<std::time::Instant>,
+    maintenant: std::time::Instant,
+) -> bool {
+    if ticks == 0 {
+        *depuis = None;
+        return false;
+    }
+    if ticks == 1 || depuis.is_none() {
+        *depuis = Some(maintenant);
+    }
+    ticks >= super::PLAYING_STALL_THRESHOLD
+        && depuis.is_some_and(|t| {
+            maintenant.saturating_duration_since(t)
+                >= std::time::Duration::from_secs(super::PLAYING_STALL_MIN_SECS)
+        })
+}
+
+/// #6932 — la panique n° `paniques` d'un tour du sondeur s'écrit-elle au
+/// journal ? La première toujours, puis une sur soixante : une panique qui se
+/// répète à chaque tour (une seconde) reste visible sans noyer le journal.
+pub fn panique_du_tour_a_journaliser(paniques: u64) -> bool {
+    paniques == 1 || paniques.is_multiple_of(60)
 }
 
 /// Une relance automatique après démarrage mort est-elle permise ?
@@ -955,13 +997,108 @@ pub fn natural_end(
 /// stored. A renderer that keeps reporting a stale default (Fabien's
 /// Devialet stuck at 50%) reports the same value every tick, so `prev`
 /// never differs from `device` and the user's saved volume is preserved.
+///
+/// Une zone dont la consigne est le SILENCE (au plus
+/// [`CONSIGNE_DE_SILENCE`]) n'adopte jamais une valeur plus haute : voir
+/// [`silence_rouvert_par_l_appareil`].
+///
+/// #6739 — et jamais à la HAUSSE : un relevé plus haut que la consigne n'est
+/// pas adopté (voir [`juger_le_releve_de_volume`]). Les trois sites de
+/// `tick.rs` passent désormais par ce jugement ; ce prédicat ne sert plus
+/// qu'aux tests qui gardent la règle.
+#[cfg(test)]
 pub fn should_adopt_device_volume(
     prev_device_vol: Option<f64>,
     device_vol: f64,
     db_vol: f64,
 ) -> bool {
-    prev_device_vol.is_some_and(|prev| (device_vol - prev).abs() > 0.02)
-        && (device_vol - db_vol).abs() > 0.02
+    matches!(
+        juger_le_releve_de_volume(prev_device_vol, device_vol, db_vol, 0.0),
+        JugementDuReleve::Adopter(_)
+    )
+}
+
+/// #6739 — ce que le sondeur fait d'un volume relevé sur l'appareil.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JugementDuReleve {
+    /// Rien : premier relevé, valeur figée, ou égale à la consigne.
+    Ignorer,
+    /// L'appareil a été BAISSÉ hors de Tune (télécommande, molette) : la
+    /// consigne de la zone le reflète. La valeur est en échelle de consigne
+    /// (trim retiré) et ne dépasse jamais la consigne d'avant.
+    Adopter(f64),
+    /// L'appareil dit plus haut que la consigne : on ne l'adopte pas, on le
+    /// dit au journal. La valeur est en échelle de consigne.
+    PlusHautNonAdopte(f64),
+}
+
+/// #6739 — le facteur par lequel un relevé d'appareil se ramène à l'échelle
+/// de la consigne : le trim tel que `set_volume` l'a composé, sans jamais
+/// dépasser 1 (un trim positif est ignoré sur une sortie à volume matériel ;
+/// sur la sortie locale, compter le relevé trop haut ne fait que refuser une
+/// adoption, jamais monter).
+pub fn facteur_de_releve(trim_db: f64) -> f64 {
+    crate::orchestrator::gain_trim_factor(trim_db).min(1.0)
+}
+
+/// #6739 (fil 2366/2375, Marantz NR1200, tweeter détruit) — décision de
+/// Bertrand du 22/10 : un relevé du volume de l'appareil ne remonte JAMAIS le
+/// volume utilisateur.
+///
+/// Le cliquet : `set_volume(0,36)` partait à 96 % avec un trim de +8,5 dB ;
+/// le sondeur relisait 96 et l'adoptait comme consigne, que le geste suivant
+/// remultipliait. Baisser le curseur finissait à 100 %.
+///
+/// Règle : le relevé est d'abord ramené à l'échelle de la consigne
+/// ([`facteur_de_releve`]) ; il n'est adopté que s'il a bougé depuis le tour
+/// précédent (front, #358), qu'il diffère de la consigne de plus de 2 points
+/// ET qu'il est plus BAS. Plus haut : [`JugementDuReleve::PlusHautNonAdopte`].
+/// La consigne de silence n'est jamais rouverte
+/// ([`silence_rouvert_par_l_appareil`]).
+pub fn juger_le_releve_de_volume(
+    prev_device_vol: Option<f64>,
+    device_vol: f64,
+    db_vol: f64,
+    trim_db: f64,
+) -> JugementDuReleve {
+    let facteur = facteur_de_releve(trim_db);
+    if !device_vol.is_finite() || !db_vol.is_finite() || facteur <= 0.0 {
+        return JugementDuReleve::Ignorer;
+    }
+    let releve = device_vol / facteur;
+    let a_bouge = prev_device_vol.is_some_and(|prev| ((device_vol - prev) / facteur).abs() > 0.02);
+    if !a_bouge || (releve - db_vol).abs() <= 0.02 {
+        return JugementDuReleve::Ignorer;
+    }
+    if releve > db_vol || silence_rouvert_par_l_appareil(releve, db_vol) {
+        return JugementDuReleve::PlusHautNonAdopte(releve);
+    }
+    JugementDuReleve::Adopter(releve.clamp(0.0, db_vol.clamp(0.0, 1.0)))
+}
+
+/// Plus haut volume de zone tenu pour une consigne de silence : la
+/// sourdine du client web pose exactement `0`.
+pub const CONSIGNE_DE_SILENCE: f64 = 0.001;
+
+/// La consigne de la zone est le silence, et l'appareil remonte un volume
+/// plus haut : le sondeur ne doit PAS l'adopter.
+///
+/// Eversolo DMP-A8 sur le .18, le 21/10 : la sourdine du client web envoie
+/// `SetVolume 0`, que l'appareil acquitte et applique (plus de son), mais
+/// une à quatre minutes plus tard il remonte de nouveau son ANCIEN volume
+/// (80) sans le rendre. Le sondeur l'adoptait (`volume_adopte_du_renderer
+/// ancien=0.0 nouveau=80.0`) : la zone affichait 80 %, non muette, sur un
+/// appareil muet. Ni la pause, ni la reprise (un `Play` seul), ni une
+/// nouvelle URI ne touchent au volume : le son ne revenait qu'au prochain
+/// coup de curseur, qui renvoie un `SetVolume`.
+///
+/// Garder la consigne de silence ne commande rien et ne monte jamais le
+/// son ; la zone dit la vérité de ce que Tune a commandé, et c'est le geste
+/// de l'auditeur (sourdine levée, curseur) qui rouvre le son. Le prix,
+/// assumé : un volume relevé sur l'appareil lui-même pendant que Tune est à
+/// zéro n'est pas recopié tant que la zone n'a pas quitté le silence.
+pub fn silence_rouvert_par_l_appareil(device_vol: f64, db_vol: f64) -> bool {
+    db_vol <= CONSIGNE_DE_SILENCE && device_vol > db_vol + 0.02
 }
 
 /// The renderer now reports a duration that differs from the current
@@ -1028,6 +1165,47 @@ pub fn should_arm_gapless(
     !gapless_sent
         && effective_duration_ms > GAPLESS_WINDOW_MS
         && position_ms >= effective_duration_ms - GAPLESS_WINDOW_MS
+}
+
+/// #6477 — au-delà de ce délai entre l'armement (`SetNext`) et la retombée
+/// de position, l'enchaînement n'est pas « dès le `SetNext` ».
+pub const COUPE_AU_SETNEXT_DELAI_MAX_MS: u64 = 10_000;
+/// #6477 — en deçà de ce reste de piste au moment de la retombée, c'est une
+/// fin de piste ordinaire, pas une coupure.
+pub const COUPE_AU_SETNEXT_RESTE_MIN_MS: u64 = 10_000;
+
+/// #6477 (FiiO K17, fil 2323) — le renderer a-t-il LÂCHÉ la piste en cours
+/// dès le `SetNextAVTransportURI` ? Trois mesures indépendantes doivent
+/// concorder :
+///
+/// - la position est retombée moins de [`COUPE_AU_SETNEXT_DELAI_MAX_MS`]
+///   après l'armement (une fin ordinaire arrive ~30 s après, au bout de la
+///   fenêtre) ;
+/// - il restait au moins [`COUPE_AU_SETNEXT_RESTE_MIN_MS`] de piste au
+///   dernier sondage (un armement tardif suivi d'une fin ordinaire ne laisse
+///   que quelques secondes) ;
+/// - le flux de la piste n'a été tiré qu'EN PARTIE (`0 < servis < total`) :
+///   le renderer a abandonné sa connexion avant la fin du fichier. Un
+///   renderer qui va au bout a tout tiré ; un flux sans mesure ne prouve rien.
+///
+/// `arm_to_advance_ms` vaut `None` sans armement. Journal du K17 : armement
+/// à 374 s sur 404,7 s, retombée 1,87 s plus tard, 79,9 Mo servis sur
+/// 84,3 Mo, 30 s de musique perdues, deux pistes de suite.
+pub fn set_next_a_coupe_la_piste(
+    arm_to_advance_ms: Option<u64>,
+    prev_position_ms: u64,
+    track_duration_ms: u64,
+    servis: Option<u64>,
+    total: Option<u64>,
+) -> bool {
+    let (Some(delai_ms), Some(servis), Some(total)) = (arm_to_advance_ms, servis, total) else {
+        return false;
+    };
+    track_duration_ms > 0
+        && delai_ms <= COUPE_AU_SETNEXT_DELAI_MAX_MS
+        && track_duration_ms.saturating_sub(prev_position_ms) >= COUPE_AU_SETNEXT_RESTE_MIN_MS
+        && servis > 0
+        && servis < total
 }
 
 /// #5970 — marge laissée, après la résolution de la suivante, pour attendre
@@ -1264,6 +1442,16 @@ pub fn deviceless_radio_refresh_due(
     is_playing && source == Some("radio") && radio_poll_due(since_last_poll, interval_secs)
 }
 
+/// Faut-il relire le titre d'une radio sur le relais radio-metadata (#6516) ?
+///
+/// La zone joue, la source est une radio, et le relais a servi son dernier
+/// titre il y a au moins une période (`zone_a_relire`). Une zone dont le
+/// titre vient du diffuseur ou de l'ICY n'est jamais « à relire » : elle
+/// garde le rythme du sondeur.
+pub fn relais_radio_du(is_playing: bool, source: Option<&str>, zone_a_relire: bool) -> bool {
+    is_playing && source == Some("radio") && zone_a_relire
+}
+
 /// Une lecture sans destination doit-elle cesser d'être annoncée ?
 ///
 /// Une zone sans périphérique de sortie prépare son flux, renonce à
@@ -1286,7 +1474,8 @@ pub fn deviceless_radio_refresh_due(
 /// - le démarrage est daté (`last_play_started_at` est `#[serde(skip)]` :
 ///   après une restauration d'état il vaut `None`, et on ne conclut rien),
 ///   et il remonte à plus que [`DELAI_SILENCE_ETABLI`] ;
-/// - le streamer CONNAÎT ce flux et déclare `0` octet servi. `None`
+/// - le streamer CONNAÎT ce flux et n'en a servi au plus qu'une sonde
+///   ([`super::TAILLE_MAXIMALE_D_UNE_SONDE`], #6066). `None`
 ///   (session inconnue, disparue, requête en échec) n'est pas une preuve
 ///   de silence : on laisse la lecture tranquille.
 ///
@@ -1296,8 +1485,10 @@ pub fn lecture_sans_destination_abandonnee(
     depuis_le_demarrage: Option<std::time::Duration>,
     octets_servis: Option<u64>,
 ) -> bool {
+    // #6066 — une sonde de plage (AVPlayer : deux octets, puis le refus) ne
+    // fait pas une destination : la lecture reste sans auditeur.
     depuis_le_demarrage.is_some_and(|d| d >= super::DELAI_SILENCE_ETABLI)
-        && octets_servis == Some(0)
+        && octets_servis.is_some_and(|n| !super::octets_d_une_ecoute(n))
 }
 
 /// L'autoplay doit-il chercher DANS LE SERVICE de la piste en cours ?
@@ -2106,7 +2297,7 @@ impl SuiviFamine {
             self.retard = Some(retard);
             annonce.then(|| FamineAnneau::RappelArrete(episode(depuis, courant, cumul)))
         } else {
-            let repris = self.retard.take().and_then(|retard| {
+            self.retard.take().and_then(|retard| {
                 retard.annonce.then(|| {
                     FamineAnneau::RappelRepris(episode(
                         retard.depuis,
@@ -2114,8 +2305,7 @@ impl SuiviFamine {
                         retard.cumul_ms.saturating_add(ecoule_ms),
                     ))
                 })
-            });
-            repris
+            })
         };
         self.dernier = Some(courant);
         self.dernier_intervalle_en_retard = en_retard;
@@ -2164,4 +2354,29 @@ pub fn silence_ms(echantillons_manquants: u64, releve: OutputRingStarvation) -> 
     let ms = u128::from(echantillons_manquants) * u128::from(releve.stream_ms)
         / u128::from(releve.served_samples);
     u64::try_from(ms).unwrap_or(u64::MAX)
+}
+
+/// #7244 — a refused HQPlayer start must never enter generic restart recovery.
+pub fn echec_demarrage_hqplayer(
+    output_type: &str,
+    arret_force: bool,
+    demarrage_fige: bool,
+    position_max_ms: u64,
+) -> bool {
+    output_type == "hqplayer" && position_max_ms == 0 && (arret_force || demarrage_fige)
+}
+
+#[cfg(test)]
+mod hqplayer_demarrage_tests_7244 {
+    use super::*;
+    #[test]
+    fn hqplayer_fige_ou_arrete_a_zero_est_un_refus_sans_relance_7244() {
+        assert!(echec_demarrage_hqplayer("hqplayer", true, false, 0));
+        assert!(echec_demarrage_hqplayer("hqplayer", false, true, 0));
+        assert!(!echec_demarrage_hqplayer("hqplayer", false, false, 0));
+        assert!(!echec_demarrage_hqplayer("hqplayer", true, false, 1_000));
+        for autre in ["dlna", "local", "airplay", ""] {
+            assert!(!echec_demarrage_hqplayer(autre, true, true, 0));
+        }
+    }
 }

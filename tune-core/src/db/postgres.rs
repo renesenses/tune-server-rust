@@ -44,6 +44,7 @@ use crate::db::engine::{Engine, PostgresDialect};
 // and took the whole batch down with it — `pg_ensure_tables_failed`, once
 // per boot. A table that fails must never block the next one.
 pub(crate) const ENSURE_TABLES: &[&str] = &[
+    include_str!("../../migrations/continue_listening.sql"),
     "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL, created_at DOUBLE PRECISION)",
     "CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq",
     "CREATE TABLE IF NOT EXISTS streaming_favorites (\
@@ -83,6 +84,12 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_etat TEXT",
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_erreur TEXT",
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS isrc TEXT",
+    // #6482 — année et qualité d'un album favori de service, lues par les
+    // règles d'une collection intelligente. Sans numéro de migration (voir
+    // `favoris_annee_et_qualite_colonnes` côté SQLite).
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS year TEXT",
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS sample_rate TEXT",
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS bit_depth TEXT",
     // Only re-attach the TEXT default while the column IS still text.
     // On a database healed by migration 012 the column is BIGINT and
     // already defaults to `nextval('streaming_favorites_id_seq')`, so
@@ -213,6 +220,41 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             corps BYTEA NOT NULL,\
             fetched_at TEXT NOT NULL\
         )",
+    // Enrichissement MetaRust, lot 1 (#4805). Même régime que la ligne
+    // ci-dessus : toute base PostgreSQL, à chaque démarrage ; `PG_FULL_SCHEMA`
+    // les porte aussi, à l'identique.
+    "CREATE TABLE IF NOT EXISTS album_completude (\
+            album_id BIGINT PRIMARY KEY,\
+            release_mbid TEXT NOT NULL,\
+            attendues INTEGER NOT NULL,\
+            presentes INTEGER NOT NULL,\
+            manquantes INTEGER NOT NULL,\
+            doublons INTEGER NOT NULL,\
+            detail TEXT NOT NULL,\
+            calcule_le TEXT NOT NULL\
+        )",
+    "CREATE TABLE IF NOT EXISTS artiste_instruments (\
+            artist_mbid TEXT PRIMARY KEY,\
+            qid TEXT,\
+            instruments TEXT NOT NULL,\
+            lu_le TEXT NOT NULL\
+        )",
+    "CREATE TABLE IF NOT EXISTS propositions_discogs (\
+            album_id BIGINT NOT NULL,\
+            discogs_release_id BIGINT NOT NULL,\
+            methode TEXT NOT NULL,\
+            proposition TEXT NOT NULL,\
+            statut TEXT NOT NULL,\
+            cree_le TEXT NOT NULL,\
+            decide_le TEXT,\
+            PRIMARY KEY (album_id, discogs_release_id)\
+        )",
+    "CREATE TABLE IF NOT EXISTS bpm_estimes (\
+            file_path TEXT PRIMARY KEY,\
+            bpm DOUBLE PRECISION NOT NULL,\
+            source TEXT NOT NULL,\
+            mesure_le TEXT NOT NULL\
+        )",
 ];
 
 // Every column SQLite gains via `add_column_if_missing` that the
@@ -299,6 +341,11 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // 077, alors que `tag_item` nomme la colonne. TEXT comme côté SQLite, NULL
     // pour l'existant.
     "ALTER TABLE item_tags ADD COLUMN IF NOT EXISTS created_at TEXT",
+    // #6257 — l'ordre des etiquettes (PG 091). Ici AUSSI : l'INSERT des
+    // etiquettes NOMME la colonne. Sans rangement : toutes a 0, la liste reste
+    // rangee par nom. Sans effet sur la colonne TEXT d'une bascule : c'est la
+    // 091 qui la convertit.
+    "ALTER TABLE tags ADD COLUMN IF NOT EXISTS position BIGINT NOT NULL DEFAULT 0",
     // #4991 (b) — marque « déjà tenté, rien trouvé » de l'identification en
     // lot (PG 080). Ici AUSSI : une base de bascule ne rejoue pas la 080, et
     // la sélection de `identify-all` nomme la colonne. NULL = jamais tenté.
@@ -313,6 +360,12 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_etat TEXT",
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_erreur TEXT",
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS isrc TEXT",
+    // #6482 — année et qualité d'un album favori de service, lues par les
+    // règles d'une collection intelligente. Sans numéro de migration (voir
+    // `favoris_annee_et_qualite_colonnes` côté SQLite).
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS year TEXT",
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS sample_rate TEXT",
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS bit_depth TEXT",
     // #5402 — date de création d'un fichier (PG 084). Ici AUSSI : une base
     // de bascule ne rejoue pas la 084, et le scan comme le tri « par
     // création » nomment la colonne. DOUBLE PRECISION comme `first_seen_at`.
@@ -328,6 +381,21 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // l'INSERT et l'UPDATE des pistes la NOMMENT. Sans effet sur une colonne
     // déjà là, TEXT de bascule comprise : c'est la 088 qui la convertit.
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating BIGINT",
+    // #6332 — le débit moyen du fichier (PG 094). Ici AUSSI, même raison que
+    // `rating` : l'INSERT et l'UPDATE des pistes le NOMMENT.
+    "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS bitrate_kbps BIGINT",
+    // #6516 — le lien des radios avec l'annuaire (PG 090). Ici AUSSI : une
+    // base de bascule ne rejoue pas la 090, et le rapprochement NOMME la
+    // colonne. L'index JUSTE APRÈS la colonne.
+    "ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS external_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id)",
+    // #6474 — la provenance du nom de tri (PG 095). Ici AUSSI : une base de
+    // bascule ne rejoue pas la 095, et le scan comme l'enrichissement NOMMENT
+    // la colonne.
+    "ALTER TABLE artists ADD COLUMN IF NOT EXISTS sort_name_source TEXT",
+    // #6463 — la provenance du MBID d'artiste (PG 097). Ici AUSSI : une base
+    // de bascule ne rejoue pas la 097, et le scan comme la fiche la NOMMENT.
+    "ALTER TABLE artists ADD COLUMN IF NOT EXISTS musicbrainz_id_source TEXT",
     // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,
     // même raison : une base de bascule ne rejouera jamais la 078, alors que
     // l'écriture de la file, des favoris et de l'historique nomme la colonne.
@@ -338,6 +406,13 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // AUSSI, même raison : une base de bascule ne rejouera jamais la 087, alors
     // que l'écriture de la file nomme la colonne.
     "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT",
+    // #6466 — le conteneur de chaque élément de file (PG 092). Ici AUSSI :
+    // une base de bascule ne rejouera jamais la 092.
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_type TEXT",
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_id TEXT",
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_source TEXT",
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_title TEXT",
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_cover TEXT",
     // Section « Live » — types secondaires MusicBrainz du disque (PG 081).
     // Ici AUSSI : une base de bascule ne rejouera jamais la 081, alors que la
     // fiche artiste nomme la colonne. NULL = inconnu.

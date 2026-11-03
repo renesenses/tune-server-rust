@@ -36,22 +36,18 @@ async fn jouer(
 ) -> Response {
     match registre.jouer(&id, demande).await {
         Ok(corps) => Json(corps).into_response(),
-        Err(ErreurJouer::Inconnue) => (
+        Err(ErreurJouer::Inconnue) => crate::message_api::refus(
             StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "source_inconnue",
-                "message": format!("Aucune source « {id} » sur ce serveur."),
-            })),
-        )
-            .into_response(),
-        Err(ErreurJouer::NonJouable { greffon }) => (
+            "source_inconnue",
+            "api.sources.unknown",
+            &[("id", id.clone())],
+        ),
+        Err(ErreurJouer::NonJouable { greffon }) => crate::message_api::refus(
             StatusCode::CONFLICT,
-            Json(json!({
-                "error": "lecture_non_prise_en_charge",
-                "message": format!("Le greffon « {greffon} » ne sait pas jouer la source « {id} »."),
-            })),
-        )
-            .into_response(),
+            "lecture_non_prise_en_charge",
+            "api.sources.notPlayable",
+            &[("plugin", greffon.to_string()), ("id", id.clone())],
+        ),
         Err(ErreurJouer::Refus(r)) => (
             StatusCode::from_u16(r.statut).unwrap_or(StatusCode::CONFLICT),
             Json(json!({ "error": r.motif, "message": r.message })),

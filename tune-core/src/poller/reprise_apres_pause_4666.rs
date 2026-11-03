@@ -278,7 +278,8 @@ fn l_ancrage_d_un_etat_neuf_date_le_debut_de_piste_a_la_position_4666() {
 }
 
 /// Garde de BRANCHEMENT : dans `resume`, le bras « rétablir à la position »
-/// encadre `play_without_history` par deux `playback.seek`.
+/// passe par `retablir_a_la_position`, qui encadre `play_without_history` par
+/// deux `playback.seek` (#6612 : le corps du bras y a été déplacé tel quel).
 #[test]
 fn resume_encadre_le_retablissement_par_deux_seek_4666() {
     let src = include_str!("../orchestrator/transport.rs");
@@ -290,6 +291,17 @@ fn resume_encadre_le_retablissement_par_deux_seek_4666() {
         + prod[debut..]
             .find("dire_session_perdue")
             .expect("la fin du bras de rétablissement");
+    assert!(
+        prod[debut..fin].contains(".retablir_a_la_position("),
+        "le bras de rétablissement passe par retablir_a_la_position"
+    );
+    let debut = prod
+        .find("async fn retablir_a_la_position(")
+        .expect("retablir_a_la_position");
+    let fin = debut
+        + prod[debut..]
+            .find("\n    }\n")
+            .expect("la fin de retablir_a_la_position");
     let bras = &prod[debut..fin];
     let relecture = bras
         .find("self.play_without_history(req)")

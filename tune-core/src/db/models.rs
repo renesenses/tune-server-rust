@@ -339,6 +339,12 @@ pub struct Track {
     /// (`album_ratings`). Échelle : `metadata::note`.
     #[serde(default)]
     pub rating: Option<i32>,
+    /// #6332 — le débit MOYEN du fichier, en kbit/s, tel que le lecteur de
+    /// balises le calcule au scan (lofty `audio_bitrate`) — `tracks.bitrate_kbps`.
+    /// `None` : pas encore lu (piste antérieure à la migration 130, complétée
+    /// au rescan suivant) ou débit inconnu.
+    #[serde(default)]
+    pub bitrate_kbps: Option<i32>,
     pub label: Option<String>,
     pub musicbrainz_recording_id: Option<String>,
     pub cover_path: Option<String>,
@@ -431,6 +437,7 @@ impl Track {
             year: None,
             bpm: None,
             rating: None,
+            bitrate_kbps: None,
             label: None,
             musicbrainz_recording_id: None,
             cover_path: None,
@@ -672,6 +679,7 @@ mod tests {
             cue_start_ms: None,
             cue_end_ms: None,
             rating: None,
+            bitrate_kbps: None,
         };
         let json = serde_json::to_value(&track).unwrap();
         assert_eq!(json["title"], "So What");

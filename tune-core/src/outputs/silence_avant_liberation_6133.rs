@@ -85,10 +85,87 @@ impl SilenceAvantLiberation {
     }
 }
 
+/// #6133 — le rappel ASIO en DSD natif : le bloc d'octets DSD tiré de
+/// l'anneau, ou le silence DSD (0x69) quand la zone est en pause **ou que le
+/// silence de libération est armé**. Rend `true` en cas de famine, comme
+/// [`crate::audio::dsd_brut::remplir_tampon_dsd`].
+///
+/// Le chemin DSD natif rendait son flux par `pause()` puis abandon, sans rien
+/// armer : le pilote rejouait le dernier bloc DSD jusqu'à `ASIOStop`, le même
+/// défaut que le PCM avant le correctif #6140.
+#[inline]
+pub(crate) fn remplir_le_bloc_dsd_natif(
+    anneau: &crate::audio::dsd_brut::AnneauDsd,
+    silence: &SilenceAvantLiberation,
+    en_pause: bool,
+    tampon: &mut [u8],
+) -> bool {
+    crate::audio::dsd_brut::remplir_tampon_dsd(anneau, silence.doit_se_taire(en_pause), tampon)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// #6133, volet DSD natif : anneau plein de musique, zone pas en pause.
+    /// Silence de libération armé, le rappel écrit le silence DSD et compte
+    /// ses blocs. Sans armement, il sort la musique.
+    #[test]
+    fn dsd_natif_le_rappel_arme_ecrit_le_silence_dsd_6133() {
+        use crate::audio::dsd_brut::{AnneauDsd, SILENCE_DSD_MSB_FIRST};
+        const MUSIQUE_DSD: u8 = 0xA5;
+        let anneau = AnneauDsd::new(4096);
+        anneau.pousser(&[MUSIQUE_DSD; 4096]);
+        let garde = SilenceAvantLiberation::default();
+        let mut bloc = [0u8; 256];
+        assert!(!remplir_le_bloc_dsd_natif(
+            &anneau, &garde, false, &mut bloc
+        ));
+        assert!(
+            bloc.iter().all(|&o| o == MUSIQUE_DSD),
+            "hors arrêt, la musique sort"
+        );
+
+        // L'armement, sans attendre : `taire_puis_liberer` sur un fil à part,
+        // ce fil-ci joue le pilote.
+        let garde = Arc::new(garde);
+        let anneau = Arc::new(anneau);
+        let fil = {
+            let garde = garde.clone();
+            std::thread::spawn(move || {
+                garde.taire_puis_liberer(BORNE_SILENCE_AVANT_LIBERATION, || {})
+            })
+        };
+        let debut = Instant::now();
+        let mut blocs = Vec::new();
+        while !fil.is_finished() && debut.elapsed() < Duration::from_secs(2) {
+            let mut bloc = [0u8; 256];
+            remplir_le_bloc_dsd_natif(&anneau, &garde, false, &mut bloc);
+            blocs.push(bloc);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            fil.join().unwrap(),
+            "le silence doit être confirmé avant la libération"
+        );
+        let derniers: Vec<_> = blocs
+            .iter()
+            .rev()
+            .take(BLOCS_MUETS_REQUIS as usize)
+            .collect();
+        assert_eq!(derniers.len(), BLOCS_MUETS_REQUIS as usize);
+        for bloc in derniers {
+            assert!(
+                bloc.iter().all(|&o| o == SILENCE_DSD_MSB_FIRST),
+                "#6133 DSD : le double tampon doit finir sur le silence DSD, pas sur la musique"
+            );
+        }
+        assert!(
+            anneau.disponible() > 0,
+            "l'anneau n'est plus vidé une fois le silence armé"
+        );
+    }
 
     const MUSIQUE: i32 = 0x2000_0000;
     const TRAMES: usize = 64;

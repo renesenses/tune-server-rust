@@ -97,8 +97,27 @@ pub struct FluxPcm {
     pub lecteur: Box<dyn Read + Send>,
 }
 
+/// #6946 — ce que la source a REÇU avant de devenir du PCM, quand elle le
+/// sait : librespot décode de l'Ogg Vorbis, et le PCM qu'il rend ne dit rien
+/// de cette perte. Sans elle, le titre s'annonçait « WAV 44,1 kHz / 16 bits,
+/// sans perte », comme un CD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualiteRecue {
+    /// Le codec reçu, en minuscules (`ogg`), tel que
+    /// `AudioFormat::from_extension` le reconnaît.
+    pub codec: String,
+    /// Le débit reçu, en kbit/s, quand la source le nomme.
+    pub debit_kbps: Option<u32>,
+}
+
 /// Ce qu'un greffon inscrit pour fournir une source PCM.
 pub trait FournisseurPcm: Send + Sync {
+    /// #6946 — le codec et le débit reçus par la source avant décodage.
+    /// `None` (le CD, une entrée audio) : le PCM EST la source.
+    fn qualite_recue(&self) -> Option<QualiteRecue> {
+        None
+    }
+
     /// Ouvre l'élément `source_id` (le `source_id` de la ligne de file) à
     /// partir de `depuis_ms` millisecondes. Appelé depuis un fil bloquant :
     /// l'implémentation peut parler au matériel.

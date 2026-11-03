@@ -186,6 +186,7 @@ fn entree(consommation: fsm::ConsommationFlux, horloge: bool, avance: bool) -> f
         avance_audio_couvre_l_arret: avance,
         horloge_de_piste_couvre_l_arret: horloge,
         dlna_dsd_reached_end: false,
+        position_avance: false,
     }
 }
 

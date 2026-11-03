@@ -51,36 +51,173 @@ pub(super) fn detect_and_parse(buf: &mut Vec<u8>) -> Option<StreamInfo> {
     None
 }
 
-fn parse_wav(buf: &mut Vec<u8>) -> Option<StreamInfo> {
-    let channels = u16::from_le_bytes([buf[22], buf[23]]);
-    let sample_rate = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
-    let bits_per_sample = u16::from_le_bytes([buf[34], buf[35]]);
+/// Ce que la suite des chunks d'un RIFF/WAVE dit, jusqu'au chunk `data`.
+struct ChunksWav {
+    /// Canaux, fréquence et bits par échantillon, lus dans le chunk `fmt `
+    /// quand il précède `data` et que ses 16 premiers octets sont dans le
+    /// tampon.
+    fmt: Option<(u16, u32, u16)>,
+    /// Premier octet du corps du chunk `data`, et sa taille DÉCLARÉE.
+    data: Option<(usize, u32)>,
+}
 
-    let mut offset = 12;
-    let mut data_size: u64 = 0;
-    let mut found_data = false;
-    let mut audio_data_offset = 44usize;
-    while offset + 8 <= buf.len() {
-        let chunk_id = &buf[offset..offset + 4];
-        let chunk_size = u32::from_le_bytes([
-            buf[offset + 4],
-            buf[offset + 5],
-            buf[offset + 6],
-            buf[offset + 7],
-        ]);
+/// Parcourt les chunks d'un RIFF/WAVE à partir de l'octet 12, jusqu'au chunk
+/// `data` inclus.
+///
+/// Les chunks RIFF sont alignés sur deux octets : un chunk de taille impaire
+/// est suivi d'un octet de bourrage que sa taille ne compte pas. L'oublier
+/// décale toute la suite d'un octet, et le chunk `data` n'est plus trouvé
+/// derrière un `LIST` de taille impaire (#6497).
+fn parcourir_chunks_wav(buf: &[u8]) -> ChunksWav {
+    let mut chunks = ChunksWav {
+        fmt: None,
+        data: None,
+    };
+    let longueur = buf.len() as u64;
+    let mut offset: u64 = 12;
+    while offset + 8 <= longueur {
+        let o = offset as usize;
+        let chunk_id = &buf[o..o + 4];
+        let chunk_size = u32::from_le_bytes([buf[o + 4], buf[o + 5], buf[o + 6], buf[o + 7]]);
         if chunk_id == b"data" {
-            data_size = chunk_size as u64;
-            audio_data_offset = offset + 8;
-            buf.drain(..offset + 8);
-            found_data = true;
+            chunks.data = Some((o + 8, chunk_size));
             break;
         }
-        offset += 8 + chunk_size as usize;
+        if chunk_id == b"fmt " && chunk_size >= 16 && offset + 8 + 16 <= longueur {
+            let f = &buf[o + 8..o + 24];
+            chunks.fmt = Some((
+                u16::from_le_bytes([f[2], f[3]]),
+                u32::from_le_bytes([f[4], f[5], f[6], f[7]]),
+                u16::from_le_bytes([f[14], f[15]]),
+            ));
+        }
+        offset += 8 + chunk_size as u64 + (chunk_size as u64 & 1);
     }
-    if !found_data {
-        audio_data_offset = 44;
-        buf.drain(..44);
+    chunks
+}
+
+/// Tailles de chunk `data` qui ne sont pas des tailles : un WAV écrit en flux
+/// pose son en-tête avant de connaître sa longueur et y laisse 0 ou la
+/// sentinelle 0xFFFF_FFFF (0x7FFF_FFFF pour les flux bornés de Tune, voir
+/// `audio::wav`).
+const TAILLE_DATA_INCONNUE: [u32; 3] = [0, 0x7FFF_FFFF, 0xFFFF_FFFF];
+
+/// Chunks qu'un logiciel range couramment APRÈS le chunk `data` : étiquettes
+/// (`LIST`/INFO, `id3 `, `ID3 `) pochette comprise, bourrage, repères,
+/// métadonnées de diffusion. Ils servent à reconnaître la fin des
+/// échantillons d'un WAV dont la taille de `data` n'est pas connue.
+const CHUNKS_DE_QUEUE: [&[u8; 4]; 17] = [
+    b"LIST", b"id3 ", b"ID3 ", b"JUNK", b"junk", b"PAD ", b"bext", b"iXML", b"axml", b"cue ",
+    b"smpl", b"inst", b"acid", b"_PMX", b"DISP", b"PEAK", b"cart",
+];
+
+/// Une suite de chunks bien formés commence-t-elle à `pos` et finit-elle
+/// exactement à la fin de `octets` ? Le premier chunk doit être un chunk de
+/// queue connu, les suivants porter un identifiant ASCII imprimable. Le
+/// dernier chunk peut omettre son octet de bourrage.
+fn queue_de_chunks_a(octets: &[u8], pos: usize) -> bool {
+    let fin = octets.len() as u64;
+    let mut p = pos as u64;
+    let mut premier = true;
+    while p + 8 <= fin {
+        let i = p as usize;
+        let id = &octets[i..i + 4];
+        let reconnu = if premier {
+            CHUNKS_DE_QUEUE.iter().any(|c| &c[..] == id)
+        } else {
+            id.iter().all(|b| (0x20..=0x7E).contains(b))
+        };
+        if !reconnu {
+            return false;
+        }
+        premier = false;
+        let taille =
+            u32::from_le_bytes([octets[i + 4], octets[i + 5], octets[i + 6], octets[i + 7]]) as u64;
+        let fin_du_corps = p + 8 + taille;
+        if fin_du_corps > fin {
+            return false;
+        }
+        if fin_du_corps == fin {
+            return true;
+        }
+        p = fin_du_corps + (taille & 1);
+        if p == fin {
+            return true;
+        }
     }
+    false
+}
+
+/// Longueur des échantillons d'un WAV dont la taille de `data` n'est pas
+/// connue : jusqu'au premier chunk de queue reconnu, à une position paire
+/// comme tout chunk RIFF, sinon jusqu'à la fin du fichier.
+fn fin_des_echantillons_sans_taille(echantillons: &[u8]) -> usize {
+    let mut pos = 0usize;
+    while pos + 8 <= echantillons.len() {
+        if queue_de_chunks_a(echantillons, pos) {
+            return pos;
+        }
+        pos += 2;
+    }
+    echantillons.len()
+}
+
+/// Comme [`detect_and_parse`], pour un fichier lu EN ENTIER (lecture directe
+/// OAAT) : le tampon rendu ne contient que les échantillons du chunk `data`,
+/// rien de ce qui le suit.
+///
+/// #6497 (fil 2332) — `detect_and_parse` retire l'en-tête mais garde tout le
+/// reste du fichier. Un chunk `LIST` ou `id3 ` rangé après `data` (étiquettes
+/// et pochette, une soixantaine de kilo-octets sur chaque piste de l'album du
+/// signalement) partait donc sur le réseau comme des échantillons, à la fin
+/// de la piste : du bruit fort juste avant l'enchaînement. Jamais en FLAC, qui
+/// ne passe pas par ce chemin.
+///
+/// La tranche est bornée à la taille déclarée de `data` (octet de bourrage
+/// exclu) et à la fin réelle du fichier, puis ramenée à un nombre entier de
+/// trames. Une taille inconnue (0, 0xFFFF_FFFF d'un WAV écrit en flux) borne à
+/// la fin du fichier, chunk de queue reconnu exclu. Un WAV sans chunk `data`
+/// est refusé : l'appelant repasse par le flux HTTP, que symphonia décode
+/// borné. Le RF64 (`ds64`) n'est pas reconnu ici ([`entete_est_wav`]) et suit
+/// déjà ce repli.
+pub(super) fn detect_and_parse_fichier(buf: &mut Vec<u8>) -> Option<StreamInfo> {
+    if !entete_est_wav(buf) {
+        return detect_and_parse(buf);
+    }
+    let (debut, taille_declaree) = parcourir_chunks_wav(buf).data?;
+    let si = detect_and_parse(buf)?;
+    if si.data_offset != debut {
+        return None;
+    }
+    let longueur = if TAILLE_DATA_INCONNUE.contains(&taille_declaree) {
+        fin_des_echantillons_sans_taille(buf)
+    } else {
+        (taille_declaree as usize).min(buf.len())
+    };
+    let trame = (si.bits_per_sample as usize).div_ceil(8) * si.channels as usize;
+    let longueur = if trame > 0 {
+        longueur - longueur % trame
+    } else {
+        longueur
+    };
+    buf.truncate(longueur);
+    Some(si)
+}
+
+fn parse_wav(buf: &mut Vec<u8>) -> Option<StreamInfo> {
+    let chunks = parcourir_chunks_wav(buf);
+    // Le chunk `fmt ` fait foi quand il a été lu ; à défaut, les positions
+    // d'un en-tête canonique de 44 octets, le seul que Tune écrit.
+    let (channels, sample_rate, bits_per_sample) = chunks.fmt.unwrap_or((
+        u16::from_le_bytes([buf[22], buf[23]]),
+        u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
+        u16::from_le_bytes([buf[34], buf[35]]),
+    ));
+    let (audio_data_offset, data_size) = match chunks.data {
+        Some((debut, taille)) => (debut, taille as u64),
+        None => (44usize, 0u64),
+    };
+    buf.drain(..audio_data_offset.min(buf.len()));
 
     // A progressive transcode writes its header before the length is known and
     // fills the data chunk with a sentinel: 0x7FFF_FFFF for a bounded stream,
@@ -564,12 +701,40 @@ mod tests {
     }
 }
 
-/// Nanoseconds since UNIX epoch (controller clock domain for OAAT PTS).
+/// Horloge OAAT du contrôleur, en nanosecondes depuis l'epoch UNIX.
+///
+/// Un simple appel à `oaat_core::time::now_ns()` (oaat #34) : une horloge
+/// monotone, ancrée une seule fois sur l'horloge murale, partagée par tout le
+/// processus. Les PTS, les heures de départ (`stream_start_ns`) et les
+/// estampilles `t2`/`t3` du répondeur d'horloge de Tune sont ainsi dans le
+/// domaine où `clock_sync_once` et `clock_responder` d'oaat mesurent l'écart.
+/// Avec `SystemTime`, un saut de l'horloge murale (NTP, réglage manuel, sortie
+/// de veille) décalait d'autant l'heure de départ envoyée à l'endpoint.
 pub(crate) fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+    oaat_core::time::now_ns()
+}
+
+#[cfg(test)]
+mod horloge_unique_oaat_tests {
+    use super::now_ns;
+
+    /// Témoin : l'horloge de Tune EST celle d'oaat. Chaque lecture de
+    /// `now_ns()` tombe entre deux lectures de `oaat_core::time::now_ns()`.
+    /// Une horloge à part (`SystemTime`, ou une epoch propre à Tune) en
+    /// sortirait dès que les deux domaines divergent.
+    #[test]
+    fn l_horloge_de_tune_est_l_horloge_monotone_d_oaat() {
+        for _ in 0..10_000 {
+            let avant = oaat_core::time::now_ns();
+            let tune = now_ns();
+            let apres = oaat_core::time::now_ns();
+            assert!(
+                avant <= tune && tune <= apres,
+                "helpers::now_ns() = {tune} hors de [{avant}, {apres}] : \
+                 Tune et oaat datent dans deux domaines d'horloge"
+            );
+        }
+    }
 }
 
 /// Base de temps du cadencement OAAT.
@@ -924,7 +1089,9 @@ pub(super) fn stage_direct_track(
     duration_ms: u64,
 ) -> Option<StagedDirectTrack> {
     let mut buf = std::fs::read(file_path).ok()?;
-    let si = detect_and_parse(&mut buf)?;
+    // Fichier entier : seuls les échantillons du chunk `data` sont gardés
+    // (#6497).
+    let si = detect_and_parse_fichier(&mut buf)?;
     if si.format.is_dsd() {
         return None;
     }
@@ -1455,3 +1622,7 @@ mod mesure_de_cadence_4567 {
         assert_eq!(m.paquets_en_retard, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "bornes_du_chunk_data_6497_tests.rs"]
+mod bornes_du_chunk_data_6497_tests;

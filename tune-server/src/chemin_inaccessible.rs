@@ -148,7 +148,7 @@ mod tests {
         assert!(cle_du_conseil("/home/bertrand/Musique", true).is_none());
     }
 
-    /// Les dix langues doivent porter les deux clés : une traduction manquante
+    /// Les langues de l'interface doivent porter les deux clés : une traduction manquante
     /// renverrait la clé brute à l'écran (`browse.hint.windowsMappedDrive`).
     #[test]
     fn les_conseils_sont_traduits_dans_toutes_les_langues() {

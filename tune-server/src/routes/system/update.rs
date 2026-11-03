@@ -287,12 +287,15 @@ async fn zones_en_lecture_vivante(
             continue;
         }
         if tune_core::playback::zone_figee(&z, silence_max) {
+            // #7149 — même constat que le détecteur de fond : pas de
+            // `immobile_secs=0` pour une zone que personne n'a observée.
+            let constat = tune_core::playback::constat_de_zone_figee(&z);
             warn!(
                 zone_id = z.zone_id,
-                immobile_secs = z
-                    .derniere_avance_de_position
-                    .map(|t| t.elapsed().as_secs())
-                    .unwrap_or_default(),
+                motif = constat.motif,
+                immobile_secs = constat.immobile_secs,
+                fenetre_ouverte_secs = constat.fenetre_ouverte_secs,
+                duree_piste_secs = constat.duree_piste_secs,
                 seuil_secs = silence_max.as_secs(),
                 "update_zone_figee_ignoree"
             );
@@ -3669,7 +3672,21 @@ fn windows_update_bat(
     err_file: &str,
     exe_name: &str,
     exe_name_new: &str,
+    sans_console: bool,
 ) -> String {
+    // #6253 — un serveur lancé sans fenêtre revient sans fenêtre. Le script
+    // hérite de l'environnement du détaché : il en retire le marqueur, sans
+    // quoi le nouveau processus se croirait déjà détaché et servirait dans la
+    // console (réduite) qui le lance.
+    let relance = if sans_console {
+        format!(
+            "set \"{marqueur}=\"\r\nstart \"\" /min \"{exe}\" {drapeau}",
+            marqueur = crate::lancement_sans_console::MARQUEUR_ENFANT,
+            drapeau = crate::lancement_sans_console::DRAPEAU,
+        )
+    } else {
+        format!("start \"\" \"{exe}\"")
+    };
     format!(
         "@echo off\r\n\
          setlocal enabledelayedexpansion\r\n\
@@ -3698,7 +3715,7 @@ fn windows_update_bat(
          rename \"{new}\" \"{exe_name}\"\r\n\
          echo Starting updated server...\r\n\
          set \"TUNE_OPEN_BROWSER=0\"\r\n\
-         start \"\" \"{exe}\"\r\n\
+         {relance}\r\n\
          exit /b 0\r\n\
          :swap_failed\r\n\
          echo Tune update failed: could not replace {exe_name}.> \"{err_file}\"\r\n\
@@ -3707,7 +3724,7 @@ fn windows_update_bat(
          echo completely, delete {exe_name}, then rename {exe_name_new} to {exe_name}.>> \"{err_file}\"\r\n\
          echo Update failed - old binary locked. Details written to {err_file}\r\n\
          set \"TUNE_OPEN_BROWSER=0\"\r\n\
-         start \"\" \"{exe}\"\r\n"
+         {relance}\r\n"
     )
 }
 
@@ -3782,6 +3799,7 @@ fn install_windows(
             .file_name()
             .unwrap_or_default()
             .to_string_lossy(),
+        crate::lancement_sans_console::est_l_enfant_detache(),
     );
 
     // A stale failure marker from a previous attempt would be misleading — clear it.
@@ -4335,7 +4353,8 @@ fn marqueur_de_langue(line: &str) -> Option<String> {
 /// texte : rien à télécharger de plus, rien à parser de plus qu'un corps.
 ///
 /// Compatibilité : une release ANCIENNE n'a aucun marqueur — tout son corps
-/// est le bloc `fr`. Un préambule sans marqueur est de même le bloc `fr`, et
+/// est un seul bloc, dans la langue PRÉSUMÉE du texte ([`langue_presumee`],
+/// #6856), `fr` faute d'indice. Un préambule sans marqueur est de même le bloc `fr`, et
 /// un `<!-- lang:fr -->` explicite est accepté. Un bloc vide (marqueur laissé
 /// sans texte) est ignoré : il ne « couvre » pas la langue, elle repliera.
 fn blocs_par_langue(body: &str) -> Vec<(String, String)> {
@@ -4349,8 +4368,10 @@ fn blocs_par_langue(body: &str) -> Vec<(String, String)> {
             blocs.push((lang.to_string(), std::mem::take(texte)));
         }
     };
+    let mut vu_un_marqueur = false;
     for line in body.lines() {
         if let Some(lang) = marqueur_de_langue(line) {
+            vu_un_marqueur = true;
             clore(&courant, &mut texte, &mut blocs);
             courant = lang;
             continue;
@@ -4358,8 +4379,56 @@ fn blocs_par_langue(body: &str) -> Vec<(String, String)> {
         texte.push_str(line);
         texte.push('\n');
     }
+    // #6856 — un corps SANS AUCUN marqueur n'est pas forcément français : les
+    // notes de la rc4, de la rc6 et de la rc7 sont rédigées en anglais, sans
+    // marqueur. Étiquetées `fr`, elles étaient servies en anglais à un
+    // utilisateur français SANS repli déclaré, et l'utilisateur anglais
+    // recevait un repli « français »… en anglais. La langue se PRÉSUME sur le
+    // texte ; faute d'indice net, l'étiquette historique `fr` reste.
+    if !vu_un_marqueur && let Some(presumee) = langue_presumee(&texte) {
+        courant = presumee.to_string();
+    }
     clore(&courant, &mut texte, &mut blocs);
     blocs
+}
+
+/// #6856 — la langue d'un corps de release publié sans marqueur `<!-- lang:xx -->`,
+/// entre les deux seules langues dans lesquelles des notes ont été rédigées :
+/// le français (jusqu'à la rc3) et l'anglais (rc4, rc6, rc7). `None` faute
+/// d'indice net — un corps réduit à des titres et des noms propres.
+///
+/// Un compte de mots-outils, sans dictionnaire : un mot-outil anglais n'est
+/// pas un mot français, et inversement (« on », « no », « a » sont écartés,
+/// ambigus). Il en faut au moins trois, et deux fois plus que de l'autre
+/// langue.
+fn langue_presumee(texte: &str) -> Option<&'static str> {
+    const ANGLAIS: &[&str] = &[
+        "the", "and", "of", "to", "is", "for", "with", "when", "now", "are", "from", "that", "it",
+        "this", "longer", "no", "an", "be", "was", "your",
+    ];
+    const FRANCAIS: &[&str] = &[
+        "le", "la", "les", "des", "et", "est", "une", "un", "du", "pour", "dans", "avec", "sur",
+        "qui", "au", "aux", "ne", "pas", "plus", "quand", "vos", "votre",
+    ];
+    let (mut en, mut fr) = (0usize, 0usize);
+    for mot in texte
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|m| !m.is_empty())
+        .map(str::to_lowercase)
+    {
+        if ANGLAIS.contains(&mot.as_str()) {
+            en += 1;
+        } else if FRANCAIS.contains(&mot.as_str()) {
+            fr += 1;
+        }
+    }
+    if en >= 3 && en >= 2 * fr.max(1) {
+        Some("en")
+    } else if fr >= 3 && fr >= 2 * en.max(1) {
+        Some("fr")
+    } else {
+        None
+    }
 }
 
 /// Le texte des notes à servir pour `lang`, avec la langue effectivement
@@ -4375,6 +4444,11 @@ fn notes_dans_la_langue(body: &str, lang: &str) -> (String, String, bool) {
     if let Some((_, texte)) = blocs.iter().find(|(l, _)| l == "fr") {
         return (texte.clone(), "fr".to_string(), lang != "fr");
     }
+    // #6856 — un corps non marqué présumé dans une autre langue (l'anglais des
+    // rc4 à rc7) : servi dans SA langue, et le repli dit.
+    if let [(seule, texte)] = blocs.as_slice() {
+        return (texte.clone(), seule.clone(), true);
+    }
     (body.to_string(), "fr".to_string(), lang != "fr")
 }
 
@@ -4383,7 +4457,7 @@ fn notes_dans_la_langue(body: &str, lang: &str) -> (String, String, bool) {
 struct NotesServies {
     entries: Vec<Value>,
     /// La langue demandée si au moins une entrée est servie dedans, sinon
-    /// `fr` : c'est ce que le panneau affiche majoritairement.
+    /// celle de la plus récente (`fr` pour une liste vide).
     lang: String,
     /// `true` dès qu'une entrée n'a pas pu être servie dans la langue
     /// demandée — le client peut alors dire « notes en français ».
@@ -4480,13 +4554,21 @@ fn entrees_pour_langue(releases: &[Value], lang: &str) -> NotesServies {
             }))
         })
         .collect();
+    // Sans entrée dans la langue demandée : la langue de la première entrée
+    // (la plus récente), `fr` pour une liste vide — #6856, une rc7 anglaise
+    // n'est pas « servie en français ».
+    let servie = if une_dans_la_langue {
+        lang.to_string()
+    } else {
+        entries
+            .first()
+            .and_then(|e| e["lang"].as_str())
+            .unwrap_or("fr")
+            .to_string()
+    };
     NotesServies {
         entries,
-        lang: if une_dans_la_langue {
-            lang.to_string()
-        } else {
-            "fr".to_string()
-        },
+        lang: servie,
         fallback,
     }
 }
@@ -5895,7 +5977,57 @@ mod windows_update_bat_tests {
             r"C:\Program Files\Tune\tune-update-failed.txt",
             "tune-server.exe",
             "tune-server.new.exe",
+            false,
         )
+    }
+
+    fn script_sans_console() -> String {
+        windows_update_bat(
+            4242,
+            r"C:\Program Files\Tune\tune-server.exe",
+            r"C:\Program Files\Tune\tune-server.new.exe",
+            r"C:\Program Files\Tune\tune-update-failed.txt",
+            "tune-server.exe",
+            "tune-server.new.exe",
+            true,
+        )
+    }
+
+    /// #6253 — sans fenêtre au départ, sans fenêtre au retour : les DEUX
+    /// relances (mise à jour réussie, binaire verrouillé) passent par
+    /// `--sans-console`, après avoir retiré le marqueur hérité du détaché.
+    #[test]
+    fn un_serveur_sans_fenetre_revient_sans_fenetre_6253() {
+        let s = script_sans_console();
+        let relance = "start \"\" /min \"C:\\Program Files\\Tune\\tune-server.exe\" --sans-console";
+        assert_eq!(s.matches(relance).count(), 2, "{s}");
+        assert_eq!(
+            s.matches("set \"TUNE_SANS_CONSOLE_ENFANT=\"").count(),
+            2,
+            "le marqueur hérité doit être retiré avant chaque relance : {s}"
+        );
+        for (i, _) in s.match_indices(relance) {
+            let avant = &s[..i];
+            let dernier_retrait = avant.rfind("set \"TUNE_SANS_CONSOLE_ENFANT=\"");
+            assert!(
+                dernier_retrait.is_some(),
+                "relance sans retrait du marqueur : {s}"
+            );
+        }
+    }
+
+    /// #6253 — un serveur lancé dans sa console revient comme avant.
+    #[test]
+    fn un_serveur_en_console_revient_comme_avant_6253() {
+        let s = script();
+        assert!(!s.contains("--sans-console"), "{s}");
+        assert!(!s.contains("TUNE_SANS_CONSOLE_ENFANT"), "{s}");
+        assert_eq!(
+            s.matches("start \"\" \"C:\\Program Files\\Tune\\tune-server.exe\"")
+                .count(),
+            2,
+            "{s}"
+        );
     }
 
     /// Le script ne doit JAMAIS s'effacer lui-même.
@@ -6124,6 +6256,62 @@ mod changelog_lang_tests {
         assert_eq!(n.entries[0]["fallback"], json!(false));
         assert_eq!(n.entries[1]["lang"], json!("fr"));
         assert_eq!(n.entries[1]["fallback"], json!(true));
+    }
+
+    /// #6856 (Levente, fil 2398, rc7) — les notes des rc4, rc6 et rc7 sont
+    /// rédigées en anglais, sans marqueur. Extrait du corps de la rc7.
+    const CORPS_RC7: &str = "\
+The rc7 is available: nearly 45 new features and more than 80 fixes, in particular for DLNA, HQPlayer, ASIO and DSD, Qobuz and TIDAL, and per-zone volume.
+## Features
+- **AI assistant, with your own key**: describe a smart playlist in plain words and the assistant builds it.
+## Bug fixes
+- The queue no longer empties when the server restarts with a service track.
+";
+
+    /// Contre-épreuve : faire rendre `None` à `langue_presumee` (l'ancien
+    /// « tout corps non marqué est français ») fait tomber ce test.
+    #[test]
+    fn un_corps_anglais_sans_marqueur_n_est_pas_servi_comme_francais() {
+        let r = [release("v1.0.0-rc7", CORPS_RC7)];
+        // Interface en français : le texte anglais est servi, et le repli DIT.
+        let n = entrees_pour_langue(&r, "fr");
+        assert_eq!(n.entries[0]["lang"], json!("en"), "{}", n.entries[0]);
+        assert_eq!(n.entries[0]["fallback"], json!(true));
+        assert!(
+            n.fallback,
+            "un texte anglais n'est pas la langue d'un Français"
+        );
+        // Interface en anglais : servi en anglais, sans repli.
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.lang, "en");
+        assert!(!n.fallback);
+        assert_eq!(n.entries[0]["lang"], json!("en"));
+        // Le cas de Levente : rc7 en anglais et une 0.9 en français, interface
+        // en anglais. La 0.9 se déclare en repli, la rc7 non.
+        let r = [
+            release("v1.0.0-rc7", CORPS_RC7),
+            release("v0.9.129", CORPS_FRANCAIS_LONG),
+        ];
+        let n = entrees_pour_langue(&r, "en");
+        assert_eq!(n.entries[0]["fallback"], json!(false));
+        assert_eq!(n.entries[1]["lang"], json!("fr"));
+        assert_eq!(n.entries[1]["fallback"], json!(true));
+    }
+
+    const CORPS_FRANCAIS_LONG: &str = "\
+## Corrections
+- La lecture ne s'arrête plus au premier morceau quand la file est longue.
+- Les pochettes des compilations sont de nouveau affichées dans la bibliothèque.
+";
+
+    #[test]
+    fn la_langue_presumee_reste_prudente() {
+        use super::langue_presumee;
+        assert_eq!(langue_presumee(CORPS_RC7), Some("en"));
+        assert_eq!(langue_presumee(CORPS_FRANCAIS_LONG), Some("fr"));
+        // Trop peu d'indices : l'étiquette historique décide.
+        assert_eq!(langue_presumee("## Corrections\n- x\n"), None);
+        assert_eq!(langue_presumee("Release 1.0.0"), None);
     }
 
     #[test]
@@ -7158,5 +7346,52 @@ mod relance_apres_installation_5461 {
             installer(&p, racine.path(), "0.9.169").expect("mise à jour depuis .old supprimé");
         assert_eq!(relance, installe);
         assert_eq!(lire(&installe), "0.9.169");
+    }
+}
+
+#[cfg(test)]
+mod extraction_zip_confinee {
+    use super::extract_zip;
+    use std::io::Write;
+
+    #[test]
+    fn une_archive_piegee_reste_dans_son_dossier() {
+        let racine = tempfile::tempdir().unwrap();
+        let dest = racine.path().join("maj");
+        std::fs::create_dir_all(&dest).unwrap();
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default();
+        z.start_file("tune-server", o).unwrap();
+        z.write_all(b"binaire").unwrap();
+        z.start_file("../evade.txt", o).unwrap();
+        z.write_all(b"non").unwrap();
+        z.start_file("outil", o.unix_permissions(0o6755)).unwrap();
+        z.write_all(b"#!/bin/sh").unwrap();
+        z.add_symlink("lien", "../..", o).unwrap();
+        z.add_symlink("absolu", "/etc", o).unwrap();
+        let data = z.finish().unwrap().into_inner();
+
+        extract_zip(&data, &dest).unwrap();
+
+        assert!(dest.join("tune-server").is_file());
+        assert!(!racine.path().join("evade.txt").exists());
+        for lien in ["lien", "absolu"] {
+            let meta = std::fs::symlink_metadata(dest.join(lien));
+            assert!(
+                meta.map(|m| !m.file_type().is_symlink()).unwrap_or(true),
+                "lien symbolique {lien} restauré"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in ["outil", "tune-server"] {
+                let mode = std::fs::metadata(dest.join(f))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o7000, 0, "{f} : bits spéciaux restaurés ({mode:o})");
+            }
+        }
     }
 }

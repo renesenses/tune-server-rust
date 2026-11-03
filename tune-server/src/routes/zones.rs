@@ -43,6 +43,15 @@ struct UpdateVolume {
     /// `volume`. Ce champ ne connaît PAS l'ambiguïté 0..1 / 0..100 : un dB est
     /// un dB (#1274).
     volume_db: Option<f64>,
+    /// #6918 — dB de l'APPAREIL, sur la course d'une sortie qui règle son
+    /// volume en décibels (Devialet AIR). Exclusif avec `volume` et
+    /// `volume_db` ; hors de la course, refusé.
+    device_volume_db: Option<f64>,
+    /// #6721 — l'utilisateur CONFIRME une hausse de plus de 10 dB perçus en
+    /// une fois (`audio::garde_de_hausse`). Absent ou `false` : une telle
+    /// hausse est plafonnée au seuil. Jamais persisté.
+    #[serde(default)]
+    confirm_increase: bool,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +111,11 @@ struct PatchZone {
     /// à la requête et n'est jamais persisté avec la zone.
     #[serde(default)]
     confirm_full_volume: bool,
+    /// #6721 — l'utilisateur CONFIRME une hausse de plus de 10 dB perçus en
+    /// une fois (`audio::garde_de_hausse`). Absent ou `false` : une telle
+    /// hausse est plafonnée au seuil. Jamais persisté.
+    #[serde(default)]
+    confirm_increase: bool,
     /// When enabled, automatically generates and queues similar tracks when the queue ends.
     ///
     /// #2271 — conserve pour les clients existants. `true` vaut
@@ -333,6 +347,8 @@ fn inject_device_identity(
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.0);
     obj.insert("gain_trim_db".into(), json!(trim));
+    // #6541 — les limites de volume, toujours publiées (`null` = aucune).
+    tune_core::audio::volume_limites::publier(obj, backend, zone_id);
     let upnp_renderer = settings
         .get(&format!("zone_{zone_id}_upnp_renderer"))
         .ok()
@@ -481,6 +497,17 @@ fn inject_device_identity(
         "detected_model".into(),
         json!(detected.filter(|_| !effacee).and_then(|d| d.model.clone())),
     );
+    // #6546 — la plage MAC reconnue et sa marque, comme sur `GET /devices`.
+    // Même règle que la détection juste au-dessus : une identité récusée
+    // (#3660) ne se republie pas par la porte de l'OUI. Seuls les trois
+    // premiers octets sortent ; la MAC complète n'est pas publiée ici.
+    let (mac_prefix, mac_vendor) = tune_core::discovery::mac::plage_et_marque(
+        detected
+            .filter(|_| !effacee)
+            .and_then(|d| d.mac_address.as_deref()),
+    );
+    obj.insert("mac_prefix".into(), json!(mac_prefix));
+    obj.insert("mac_vendor".into(), json!(mac_vendor));
 }
 
 pub fn router() -> Router<AppState> {
@@ -500,6 +527,16 @@ pub fn router() -> Router<AppState> {
                 .post(rattacher_asio_6120::rattacher_zone),
         )
         .route("/{id}/volume", put(update_volume))
+        // #6541 — boutons + / − et limites de volume (sécurité, confort).
+        .route(
+            "/{id}/volume/step",
+            post(limites_de_volume_6541::pas_de_volume),
+        )
+        .route(
+            "/{id}/volume-limits",
+            get(limites_de_volume_6541::lire_les_limites)
+                .put(limites_de_volume_6541::regler_les_limites),
+        )
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
         .route("/{id}/eq/response", get(eq_response))
@@ -595,6 +632,11 @@ mod lecture;
 pub use lecture::*;
 mod presence;
 mod rattacher_asio_6120;
+// #6541 — boutons + / − et limites de volume d'une zone.
+mod limites_de_volume_6541;
+// #6721 — la garde contre les montées brusques, par le routeur public.
+#[cfg(test)]
+mod garde_de_hausse_6721_tests;
 
 // #5353 — le backend nommé par le chemin du signal est celui de LA sortie.
 mod backend_de_la_sortie_5353;
@@ -611,7 +653,11 @@ mod fusion_tests;
 #[cfg(test)]
 mod identite_appareil_tests;
 #[cfg(test)]
+mod oubli_du_dlna_decouvert_6299;
+#[cfg(test)]
 mod page_d_album_bandcamp_tests;
+#[cfg(test)]
+mod plages_mac_6546_tests;
 #[cfg(test)]
 mod sante_reseau_de_zone_tests;
 #[cfg(test)]
@@ -620,6 +666,12 @@ mod zone_masquee_en_lecture_affichee_5077;
 mod zone_sans_appareil_guard;
 #[cfg(test)]
 mod zone_supprimee_en_pause_disparait_5322;
+
+// #7133 — une zone qui change d'appareil coupe celui qu'elle quitte.
+mod ancienne_sortie_coupee_7133;
+pub(crate) use ancienne_sortie_coupee_7133::couper_l_ancienne_sortie;
+#[cfg(test)]
+mod ancienne_sortie_coupee_7133_tests;
 
 pub async fn create_zone_handler(
     state: State<AppState>,
@@ -802,6 +854,9 @@ pub(crate) fn inject_session_context(obj: &mut serde_json::Map<String, Value>, p
 ///
 /// # L'ordre de résolution, et pourquoi celui-là
 ///
+/// 0. **la ligne jouée** (`queue_items.context_*`, #6466) quand elle porte son
+///    propre conteneur : un album ajouté à la file s'ouvre lui-même, pas
+///    l'album de la session (#6465) ;
 /// 1. **le geste** (`session_context_type == "album"`). Il survit aux avances
 ///    automatiques : la deuxième piste d'un album reste une écoute d'album, là
 ///    où `current_track` change à chaque piste. C'est ce qui fait un « retour à
@@ -860,8 +915,33 @@ pub(super) async fn album_en_cours(
 
     let ps = state.playback.get_state(id).await;
 
-    // 1. Le geste.
-    if ps.session_context_type.as_deref() == Some("album")
+    // 0. Le conteneur de la LIGNE qui joue (#6466), avant celui de la session.
+    // FabienM (#6465, fil 2379 point 5) : un album lu, puis un second album
+    // ajouté à la file ; sur une piste du second, la vignette ouvrait le
+    // premier, parce que le contexte de SESSION (le dernier « Lire ») était lu
+    // d'abord. Une ligne qui porte son propre conteneur l'emporte : un album →
+    // cet album ; autre chose (titre seul, playlist, artiste) → le geste de
+    // session ne la concerne pas, on passe à la piste elle-même (étape 2).
+    let ligne = ps.now_playing.as_ref().and_then(|np| {
+        tune_core::db::contexte_de_file::contexte_de_la_piste_jouee(
+            &state.backend,
+            id,
+            ps.queue_position,
+            np.track_id,
+            np.source_id.as_deref(),
+        )
+    });
+    if let Some(c) = ligne.as_ref()
+        && c.nature == "album"
+        && let Some(album) = c.id.as_deref().filter(|s| !s.trim().is_empty())
+    {
+        let service = c.service.as_deref().unwrap_or("local");
+        return Json(reponse(id, service, album, None, "queue_context")).into_response();
+    }
+
+    // 1. Le geste — seulement pour une ligne sans conteneur propre.
+    if ligne.is_none()
+        && ps.session_context_type.as_deref() == Some("album")
         && let Some(album) = ps
             .session_context_id
             .as_deref()
@@ -1402,7 +1482,8 @@ pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) 
                 .streamer
                 .stream_bytes_sent(sid)
                 .await
-                .is_some_and(|n| n > 0),
+                // #6066 — une sonde de plage n'est pas un onglet qui joue.
+                .is_some_and(tune_core::poller::octets_d_une_ecoute),
             None => false,
         }
     } else {
@@ -1559,6 +1640,7 @@ fn output_reach_of(
 }
 
 mod signal_path;
+pub(crate) mod textes_signal;
 pub use signal_path::*;
 
 mod ecriture;
@@ -1581,6 +1663,9 @@ pub(crate) use preconfiguration::preconfigurer_zone as preconfigurer_zone_decouv
 mod groupes;
 pub use groupes::*;
 
+// #6155 — les suiveuses d'un groupe jouent ce que joue la meneuse.
+pub mod relais_de_groupe_6155;
+
 #[cfg(test)]
 mod signal_path_tests;
 
@@ -1602,10 +1687,18 @@ mod signal_path_pure_replaygain_5633_tests;
 
 // #4384 — ReplayGain sans gain tagué, et où le gain s'applique.
 #[cfg(test)]
+mod signal_path_decodeur_sortie_pull_6178_tests;
+#[cfg(test)]
 mod signal_path_gain_sortie_4384_tests;
 // #6166 — le WAV 32 bits interne d'une sortie locale n'est pas une conversion.
 #[cfg(test)]
 mod signal_path_conteneur_local_6166_tests;
+// #6334 — un AAC Tidal servi en WAV se dit AAC, sans profondeur de bits.
+#[cfg(test)]
+mod signal_path_aac_tidal_6334_tests;
+// #6946 — un titre Spotify se dit Ogg Vorbis 320 kbit/s, avec la raison.
+#[cfg(test)]
+mod signal_path_spotify_6946_tests;
 // #2029 — un DSD qui part en DoP se dit « over PCM (DoP) ».
 #[cfg(test)]
 mod signal_path_dop_2029_tests;
@@ -1649,6 +1742,10 @@ mod patch_zone_error_guard;
 /// ne traversait par la route (réseau DLNA, UPnP), écrites AVANT la découpe.
 #[cfg(test)]
 mod persister_le_patch_tests;
+
+/// #6774 — changer l'appareil d'une zone remet son trim à 0 dB.
+#[cfg(test)]
+mod reglages_suivent_l_appareil_6774_tests;
 
 /// Garde-fou #2092 : les charges utiles d'une zone ne doivent plus diverger.
 ///

@@ -65,7 +65,9 @@ async fn un_renderer_qui_cesse_d_ecouter_se_dit_une_fois_au_journal_info() {
     let base = format!("http://127.0.0.1:{port}");
     let sortie = DlnaOutput::new(
         "Tune".into(),
-        "uuid:diretta-renderer-fc802a162cc1574c".into(),
+        // #5575 — plus l'UDN Diretta : son volume est refusé AVANT l'envoi
+        // (volume décoratif), et ce banc sonde le contact par le volume.
+        "uuid:renderer-4971-fc802a162cc1574c".into(),
         "127.0.0.1".into(),
         format!("{base}/control"),
         format!("{base}/control"),

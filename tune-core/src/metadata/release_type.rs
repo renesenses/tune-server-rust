@@ -302,6 +302,71 @@ pub fn est_live(secondaires: &[String]) -> bool {
     secondaires.iter().any(|t| t == SECONDAIRE_LIVE)
 }
 
+/// Les mots qui, juste AVANT « live », en font un verbe : « Long Live Rock
+/// 'n' Roll », « I Want to Live », « We'll Live ».
+const LIVE_VERBE_SI_PRECEDE_DE: [&str; 21] = [
+    "i", "you", "we", "they", "to", "will", "would", "can", "could", "must", "shall", "should",
+    "long", "ll", "let", "gonna", "wanna", "might", "may", "never", "still",
+];
+
+/// Les mots qui, juste APRÈS « live », en font un verbe : « Live Through
+/// This », « Live Forever », « Live to Tell », « Live Your Life », « Live It
+/// Up ». « and let » couvre « Live and Let Die » sans écarter « Live and
+/// Dangerous ».
+const LIVE_VERBE_SI_SUIVI_DE: [&[&str]; 14] = [
+    &["through"],
+    &["forever"],
+    &["to"],
+    &["your"],
+    &["my"],
+    &["our"],
+    &["it"],
+    &["with"],
+    &["without"],
+    &["like"],
+    &["for"],
+    &["a"],
+    &["again"],
+    &["and", "let"],
+];
+
+/// Règle PROVISOIRE de la section « Live » par le TITRE (#6464, FabienM,
+/// fil 2302 point 4, go de Bertrand du 20/10/2026) : « si le nom de l'album
+/// contient les mots "Live" ou "unplugged", le ranger dans la section Live »,
+/// en attendant qu'un service publie une métadonnée qui le dise.
+///
+/// Les MOTS, pas les lettres : « Alive », « Olive », « Liverpool »,
+/// « Delivery », « Lively » ne déclenchent rien. Et « live » n'y compte pas
+/// quand il est employé comme VERBE (voir [`LIVE_VERBE_SI_PRECEDE_DE`] et
+/// [`LIVE_VERBE_SI_SUIVI_DE`]) : « Live Through This » (Hole) et « Live
+/// Forever » (Oasis) sont des disques studio. « unplugged » compte toujours.
+///
+/// Elle ne voit pas un live dont le titre ne le dit pas (« Waiting for
+/// Columbus », « Alive! ») : le type secondaire `live` reste la seule réponse
+/// sûre, et [`est_live`] passe avant elle.
+pub fn titre_annonce_un_live(titre: &str) -> bool {
+    let minuscules = titre.to_lowercase();
+    let mots: Vec<&str> = minuscules
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|m| !m.is_empty())
+        .collect();
+    if mots.contains(&"unplugged") {
+        return true;
+    }
+    mots.iter().enumerate().any(|(i, mot)| {
+        if *mot != "live" {
+            return false;
+        }
+        if i > 0 && LIVE_VERBE_SI_PRECEDE_DE.contains(&mots[i - 1]) {
+            return false;
+        }
+        let suite = &mots[i + 1..];
+        !LIVE_VERBE_SI_SUIVI_DE
+            .iter()
+            .any(|motif| suite.starts_with(motif))
+    })
+}
+
 /// Remplit `albums.release_type` depuis MusicBrainz, pour les disques dont le
 /// groupe de sortie est connu.
 ///

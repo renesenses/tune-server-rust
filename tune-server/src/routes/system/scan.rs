@@ -155,7 +155,113 @@ pub(crate) struct ScanLease<'a> {
 
 impl Drop for ScanLease<'_> {
     fn drop(&mut self) {
+        // L'annonce tombe AVANT le droit : après la libération, un nouveau
+        // scan peut poser la sienne, que ce `Drop` ne doit pas effacer.
+        if std::ptr::eq(self.gate, &SCAN_GATE) {
+            *SCAN_EN_COURS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         self.gate.release(self.generation);
+    }
+}
+
+impl ScanLease<'_> {
+    /// #6729 — dit QUEL scan tient le droit : son origine, le dossier d'un
+    /// scan ciblé, son heure de départ. Lu par `scan/status` et le diagnostic.
+    pub(crate) fn annoncer(&self, origine: &'static str, cible: Option<&str>) {
+        if !std::ptr::eq(self.gate, &SCAN_GATE) {
+            return;
+        }
+        tracing::info!(
+            origine,
+            cible = cible.unwrap_or("-"),
+            "scan_detenteur_du_droit"
+        );
+        *SCAN_EN_COURS.lock().unwrap_or_else(|e| e.into_inner()) = Some(ScanEnCours {
+            origine,
+            cible: cible.map(str::to_string),
+            depuis: chrono_now(),
+        });
+    }
+}
+
+/// #6729 (Tades, fil 2368) — « analyse en cours » sans dire laquelle.
+///
+/// Plusieurs gestes prennent le MÊME droit de scanner : le scan de démarrage,
+/// le bouton « Scanner » (complet ou d'un dossier), l'horaire programmé, le
+/// remontage tardif d'un partage réseau, l'ajout d'un dossier, un import, une
+/// extraction de CD. Un seul tient le droit à la fois, et l'indicateur ne
+/// disait pas lequel : un scan ciblé fini à 100 % laissait « analyse en
+/// cours » allumé par un AUTRE scan, reparti derrière lui, sans que rien ne
+/// permette de le voir.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScanEnCours {
+    /// Code stable : voir les constantes `ORIGINE_*`.
+    pub origine: &'static str,
+    /// Le dossier d'un scan ciblé ; `None` pour toute la bibliothèque.
+    pub cible: Option<String>,
+    /// Secondes Unix du départ.
+    pub depuis: String,
+}
+
+static SCAN_EN_COURS: std::sync::Mutex<Option<ScanEnCours>> = std::sync::Mutex::new(None);
+
+pub(crate) const ORIGINE_DEMARRAGE: &str = "startup";
+pub(crate) const ORIGINE_MANUELLE: &str = "manual";
+pub(crate) const ORIGINE_PROGRAMMEE: &str = "scheduled";
+pub(crate) const ORIGINE_MONTAGE_TARDIF: &str = "late_network_mount";
+pub(crate) const ORIGINE_AJOUT_DE_DOSSIER: &str = "music_dir_added";
+pub(crate) const ORIGINE_IMPORT: &str = "import";
+pub(crate) const ORIGINE_EXTRACTION_CD: &str = "cd_rip";
+
+/// Le scan qui tient le droit en ce moment, s'il est annoncé.
+pub(crate) fn scan_en_cours() -> Option<ScanEnCours> {
+    if !SCAN_GATE.is_active() {
+        return None;
+    }
+    SCAN_EN_COURS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Ce que `scan/status` et le diagnostic publient du scan en cours.
+///
+/// `stale: true` : le réglage dit « scanning » alors qu'AUCUN scan ne tient
+/// le droit — un reste (processus tué en plein scan) ; « Arrêter » le remet
+/// au repos.
+pub(crate) fn decrire_le_scan_en_cours(stocke: &str) -> Value {
+    match scan_en_cours() {
+        Some(e) => json!({
+            "origin": e.origine,
+            "path": e.cible,
+            "started_at": e.depuis,
+            "stale": false,
+        }),
+        None if SCAN_GATE.is_active() => json!({ "origin": null, "path": null, "stale": false }),
+        None if stocke == "scanning" => json!({ "origin": null, "path": null, "stale": true }),
+        None => Value::Null,
+    }
+}
+
+/// La même description, en une ligne lisible pour le rapport de diagnostic.
+pub(crate) fn ligne_du_scan_en_cours(stocke: &str) -> String {
+    let d = decrire_le_scan_en_cours(stocke);
+    if d.is_null() {
+        return stocke.to_string();
+    }
+    if d["stale"] == true {
+        return format!("{stocke} (aucun scan ne tient le droit : statut résiduel)");
+    }
+    let origine = d["origin"].as_str().unwrap_or("inconnue");
+    match d["path"].as_str() {
+        Some(p) => format!(
+            "{stocke} (origine {origine}, dossier {p}, depuis {})",
+            d["started_at"].as_str().unwrap_or("?")
+        ),
+        None => format!(
+            "{stocke} (origine {origine}, toute la bibliothèque, depuis {})",
+            d["started_at"].as_str().unwrap_or("?")
+        ),
     }
 }
 
@@ -349,6 +455,99 @@ mod scan_gate_tests {
         );
         assert_eq!(r.0["scanning"], true);
         drop(jeton);
+    }
+
+    /// #6729 — `scan/status` dit QUEL scan tient le droit, et reconnaît un
+    /// « scanning » résiduel qu'aucun scan ne tient.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn scan_status_nomme_le_scan_qui_tient_le_droit_6729() {
+        let _serialise = serialiser();
+        super::attendre_que_le_droit_de_scanner_soit_libre().await;
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let reglages =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        reglages.set("scan_status", "scanning").unwrap();
+
+        let jeton = super::try_begin_scan().expect("droit libre");
+        jeton.annoncer(super::ORIGINE_MONTAGE_TARDIF, None);
+        let r = super::scan_status(axum::extract::State(state.clone())).await;
+        assert_eq!(
+            r.0["current"]["origin"], "late_network_mount",
+            "#6729 : « analyse en cours » sans dire quel scan tient le droit : {}",
+            r.0
+        );
+        assert_eq!(r.0["current"]["stale"], false);
+        assert!(
+            super::ligne_du_scan_en_cours("scanning").contains("late_network_mount"),
+            "le diagnostic nomme l'origine"
+        );
+        drop(jeton);
+
+        let jeton = super::try_begin_scan().expect("droit libre");
+        jeton.annoncer(super::ORIGINE_MANUELLE, Some("/musique/Billy Joel"));
+        let r = super::scan_status(axum::extract::State(state.clone())).await;
+        assert_eq!(r.0["current"]["origin"], "manual");
+        assert_eq!(r.0["current"]["path"], "/musique/Billy Joel");
+        drop(jeton);
+
+        // Plus aucun détenteur : l'annonce est tombée avec le droit, et le
+        // « scanning » qui reste au réglage est dit résiduel (diagnostic).
+        assert!(super::ligne_du_scan_en_cours("scanning").contains("résiduel"));
+        // #7305 : `scan/status` ne le publie plus, il le remet au repos.
+        let r = super::scan_status(axum::extract::State(state.clone())).await;
+        assert!(r.0["current"].is_null(), "{}", r.0);
+        reglages.set("scan_status", "idle").unwrap();
+        let r = super::scan_status(axum::extract::State(state)).await;
+        assert!(r.0["current"].is_null(), "{}", r.0);
+    }
+
+    /// #7305 (Tades, fil 2504) — LE DÉFAUT : le réglage dit « scanning »,
+    /// aucun scan ne tient le droit (processus tué en plein scan). Le rapport
+    /// le disait « résiduel », et `scan/status` le publiait quand même comme
+    /// un scan en cours : l'écran restait sur « scan en cours » et il fallait
+    /// trouver « Arrêter ». Le serveur le remet au repos tout seul, et le dit
+    /// sur le bus pour faire tomber le bandeau.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn un_statut_residuel_est_remis_au_repos_par_scan_status_7305() {
+        let _serialise = serialiser();
+        super::attendre_que_le_droit_de_scanner_soit_libre().await;
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let reglages =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        reglages.set("scan_status", "scanning").unwrap();
+        let mut bus = state.event_bus.subscribe();
+
+        let r = super::scan_status(axum::extract::State(state.clone())).await;
+        assert_eq!(
+            r.0["status"], "idle",
+            "#7305 : un « scanning » qu'aucun scan ne tient est publié comme un scan en cours : {}",
+            r.0
+        );
+        assert_eq!(r.0["scanning"], false);
+        assert!(r.0["current"].is_null(), "{}", r.0);
+        assert_eq!(
+            reglages.get("scan_status").unwrap().as_deref(),
+            Some("idle"),
+            "#7305 : le reste doit être effacé du réglage, pas seulement masqué"
+        );
+        let evt = bus.try_recv().expect("library.scan.completed attendu");
+        assert_eq!(evt.event_type, "library.scan.completed");
+        assert_eq!(evt.data["stale"], true);
+
+        // Le droit est rendu : un vrai scan peut repartir aussitôt.
+        let jeton = super::try_begin_scan().expect("le droit de scanner doit être rendu");
+        // Et un scan VIVANT n'est jamais remis au repos par la lecture.
+        reglages.set("scan_status", "scanning").unwrap();
+        let r = super::scan_status(axum::extract::State(state.clone())).await;
+        assert_eq!(r.0["status"], "scanning", "{}", r.0);
+        assert_eq!(
+            reglages.get("scan_status").unwrap().as_deref(),
+            Some("scanning")
+        );
+        drop(jeton);
+        reglages.set("scan_status", "idle").unwrap();
     }
 
     /// Le verrou COMMUN aux épreuves de scan réel
@@ -1023,7 +1222,15 @@ pub(super) async fn trigger_scan(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(tune_core::scanner::walker::normalize_path);
-    if spawn_library_scan_confirmee(state, force, q.confirm_purge, targeted_req).await {
+    if spawn_library_scan_confirmee(
+        state,
+        force,
+        q.confirm_purge,
+        targeted_req,
+        ORIGINE_MANUELLE,
+    )
+    .await
+    {
         (StatusCode::ACCEPTED, Json(json!({ "status": "scanning" })))
     } else {
         (
@@ -1031,6 +1238,8 @@ pub(super) async fn trigger_scan(
             Json(json!({
                 "status": "already_scanning",
                 "scanning": true,
+                // #6729 : le scan qui tient le droit, pour que l'écran le nomme.
+                "current": decrire_le_scan_en_cours("scanning"),
             })),
         )
     }
@@ -1175,9 +1384,20 @@ pub(crate) struct ExemplairesDuLot {
     /// son original peuvent tomber dans le même lot, avant que l'index des
     /// hachages connus ne les voie.
     chemins_du_lot: std::collections::HashMap<(String, i64), Vec<String>>,
+    /// #6917 — les racines qui bornent le repli, quand l'option « même
+    /// racine seulement » est allumée ; `None` : le comportement d'avant.
+    racines: Option<Vec<String>>,
 }
 
 impl ExemplairesDuLot {
+    /// Le lot, avec la borne de racine que le réglage pose (#6917).
+    pub(crate) fn pour(db: &dyn tune_core::db::backend::DbBackend) -> Self {
+        Self {
+            racines: tune_core::library::dedoublonnage_par_racine::racines_si_active(db),
+            ..Self::default()
+        }
+    }
+
     /// La piste que l'importateur vient de lire est-elle la copie exacte
     /// d'une piste déjà connue (base ou lot) du même album ? Si oui, elle est
     /// notée comme exemplaire et le chemin du propriétaire est rendu ; sinon
@@ -1198,6 +1418,13 @@ impl ExemplairesDuLot {
         let key = (hash.clone(), aid);
         let mut candidates = connus.get(&key).cloned().unwrap_or_default();
         candidates.extend(self.chemins_du_lot.get(&key).cloned().unwrap_or_default());
+        // #6917 — option allumée, une copie d'une AUTRE racine n'est pas un
+        // exemplaire : elle entre comme sa propre piste.
+        let candidates = tune_core::library::dedoublonnage_par_racine::candidats_repliables(
+            chemin,
+            candidates,
+            self.racines.as_deref(),
+        );
         if let Some(existant) = tune_core::scanner::hasher::find_byte_identical_path(
             std::path::Path::new(chemin),
             &candidates,
@@ -1593,7 +1820,18 @@ pub(crate) async fn spawn_library_scan(
     force: bool,
     targeted_req: Option<String>,
 ) -> bool {
-    spawn_library_scan_confirmee(state, force, None, targeted_req).await
+    spawn_library_scan_par(state, force, targeted_req, ORIGINE_MANUELLE).await
+}
+
+/// [`spawn_library_scan`], en disant QUI le demande (#6729) : l'origine est
+/// publiée par `scan/status` et le diagnostic tant que ce scan tient le droit.
+pub(crate) async fn spawn_library_scan_par(
+    state: AppState,
+    force: bool,
+    targeted_req: Option<String>,
+    origine: &'static str,
+) -> bool {
+    spawn_library_scan_confirmee(state, force, None, targeted_req, origine).await
 }
 
 /// Comme `spawn_library_scan`, mais peut lever le plafond volumétrique à
@@ -1604,14 +1842,16 @@ pub(crate) async fn spawn_library_scan_confirmee(
     force: bool,
     purge_confirmee: Option<u64>,
     targeted_req: Option<String>,
+    origine: &'static str,
 ) -> bool {
-    spawn_library_scan_avec_lecteur(
+    spawn_library_scan_avec_lecteur_par(
         state,
         force,
         purge_confirmee,
         targeted_req,
         std::sync::Arc::new(tune_core::metadata::read_extended_metadata),
         DELAI_LECTURE_CREDITS,
+        origine,
     )
     .await
 }
@@ -1624,10 +1864,42 @@ async fn spawn_library_scan_avec_lecteur(
     lecteur_metadonnees: LecteurMetadonnees,
     delai_credits: std::time::Duration,
 ) -> bool {
+    spawn_library_scan_avec_lecteur_par(
+        state,
+        force,
+        purge_confirmee,
+        targeted_req,
+        lecteur_metadonnees,
+        delai_credits,
+        ORIGINE_MANUELLE,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_library_scan_avec_lecteur_par(
+    state: AppState,
+    force: bool,
+    purge_confirmee: Option<u64>,
+    targeted_req: Option<String>,
+    lecteur_metadonnees: LecteurMetadonnees,
+    delai_credits: std::time::Duration,
+    origine: &'static str,
+) -> bool {
     let Some(scan_lease) = try_begin_scan() else {
-        tracing::warn!("scan_start_rejected_already_running");
+        // #6729 : le refus nomme le scan qui tient le droit.
+        let detenteur = scan_en_cours();
+        tracing::warn!(
+            detenteur = detenteur.as_ref().map(|e| e.origine).unwrap_or("-"),
+            cible = detenteur
+                .as_ref()
+                .and_then(|e| e.cible.as_deref())
+                .unwrap_or("-"),
+            "scan_start_rejected_already_running"
+        );
         return false;
     };
+    scan_lease.annoncer(origine, targeted_req.as_deref());
     if force {
         tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
     }
@@ -1667,7 +1939,13 @@ async fn spawn_library_scan_avec_lecteur(
         let result = tokio::task::spawn_blocking(move || {
         let raw_dirs = super::get_music_dirs_list(&db);
         if raw_dirs.is_empty() {
-            tracing::warn!("scan_aborted_no_dirs — no music directories configured");
+            // #6175 — un partage monté mais non déclaré est la cause la plus
+            // probable d'un scan sans dossier : le dire ici, et à l'écran.
+            let partages = crate::partages_sans_racine::releve(&db, &raw_dirs);
+            tracing::warn!(
+                partages_sans_racine = ?partages.iter().map(|p| &p.point).collect::<Vec<_>>(),
+                "scan_aborted_no_dirs — no music directories configured"
+            );
             if let Err(e) = SettingsRepo::with_backend(db).set("scan_status", "idle") {
                 tracing::warn!(error = %e, "scan_status_reset_failed");
             }
@@ -1685,6 +1963,9 @@ async fn spawn_library_scan_avec_lecteur(
                     "updated": 0,
                     "skipped": 0,
                     "no_dirs": true,
+                    "mounted_shares_not_declared":
+                        crate::partages_sans_racine::en_json(&partages),
+                    "explanation": crate::partages_sans_racine::explication(&raw_dirs, &partages),
                 }),
             );
             return;
@@ -1722,6 +2003,8 @@ async fn spawn_library_scan_avec_lecteur(
             Some(p) => vec![p.clone()],
             None => music_dirs.clone(),
         };
+        // #6167 — ce que couvre le total : toute la bibliothèque, ou un dossier.
+        let mut portee = PorteeDuScan::new(targeted.is_none(), scan_dirs.clone());
 
         tracing::info!(
             dirs = ?scan_dirs,
@@ -1739,11 +2022,17 @@ async fn spawn_library_scan_avec_lecteur(
         // Stop from t=0. `total: 0` marks it indeterminate until discovery ends.
         event_bus.emit(
             "library.scan.started",
-            json!({ "music_dirs": &music_dirs, "phase": "indexing", "total": 0 }),
+            portee.avec(
+                json!({ "music_dirs": &music_dirs, "phase": "indexing", "total": 0 }),
+                None,
+            ),
         );
         event_bus.emit(
             "library.scan.progress",
-            json!({ "phase": "indexing", "scanned": 0i64, "added": 0i64, "total": 0i64 }),
+            portee.avec(
+                json!({ "phase": "indexing", "scanned": 0i64, "added": 0i64, "total": 0i64 }),
+                None,
+            ),
         );
 
         let exclude_patterns = crate::auto_scan::scan_exclude_patterns(&db);
@@ -1779,15 +2068,19 @@ async fn spawn_library_scan_avec_lecteur(
             &exclude_patterns,
             tune_core::scanner::walker::CADENCE_PROGRESSION_PARCOURS,
             &mut |p| {
+                let dossier = Some(p.dossier_courant);
                 event_bus.emit(
                     "library.scan.progress",
-                    json!({
-                        "phase": "indexing",
-                        "scanned": p.fichiers_vus as i64,
-                        "added": 0i64,
-                        "total": 0i64,
-                        "current_dir": p.dossier_courant,
-                    }),
+                    portee.avec(
+                        json!({
+                            "phase": "indexing",
+                            "scanned": p.fichiers_vus as i64,
+                            "added": 0i64,
+                            "total": 0i64,
+                            "current_dir": dossier,
+                        }),
+                        dossier,
+                    ),
                 );
             },
             &scan_cancel_requested,
@@ -1868,6 +2161,8 @@ async fn spawn_library_scan_avec_lecteur(
                 .collect()
         };
         let total_discovered = files.len();
+        portee.compter(&files);
+        let portee = &portee;
 
         let discovered_paths: std::collections::HashSet<String> = files
             .iter()
@@ -1994,7 +2289,8 @@ async fn spawn_library_scan_avec_lecteur(
             tracing::info!(
                 deja_pourvues = deja_pourvues.len(),
                 "scan_rattrapage_metadonnees_etendues — un fichier inchangé n'est rouvert pour \
-                 ses métadonnées étendues que s'il n'en a AUCUNE (#5043)"
+                 ses métadonnées étendues que s'il n'en a AUCUNE, ou pas encore la balise \
+                 ARTIST (#5043, #6781)"
             );
         }
 
@@ -2020,16 +2316,10 @@ async fn spawn_library_scan_avec_lecteur(
         let prefiltre_verifies = std::sync::atomic::AtomicUsize::new(0);
         let prefiltre_derniere_annonce = std::sync::Mutex::new(std::time::Instant::now());
         let annoncer_le_prefiltre = |verifies: usize, dossier: Option<String>| {
+            let ou = dossier.as_deref();
             event_bus.emit(
                 "library.scan.progress",
-                json!({
-                    "phase": "indexing",
-                    "stage": "verification",
-                    "scanned": verifies as i64,
-                    "added": 0i64,
-                    "total": total_discovered as i64,
-                    "current_dir": dossier,
-                }),
+                portee.avec(avancement_du_prefiltre(verifies, total_discovered, ou), ou),
             );
         };
         annoncer_le_prefiltre(0, files.first().and_then(|p| dossier_de(p)));
@@ -2075,6 +2365,9 @@ async fn spawn_library_scan_avec_lecteur(
             );
         }
         let pre_skipped = (total_discovered - files_to_scan.len()) as i64;
+        // #6167 — pourcentage par emplacement : les inchangés sont faits, les
+        // lots à venir sont comptés par racine (même découpe que le parcours).
+        portee.amorcer(&files_to_scan, tune_core::scanner::walker::SCAN_BATCH_SIZE);
 
         tracing::info!(
             total = total_discovered,
@@ -2085,12 +2378,15 @@ async fn spawn_library_scan_avec_lecteur(
 
         event_bus.emit(
             "library.scan.started",
-            json!({
-                "music_dirs": &music_dirs,
-                "total": total_discovered,
-                "to_scan": files_to_scan.len(),
-                "unchanged": pre_skipped,
-            }),
+            portee.avec(
+                json!({
+                    "music_dirs": &music_dirs,
+                    "total": total_discovered,
+                    "to_scan": files_to_scan.len(),
+                    "unchanged": pre_skipped,
+                }),
+                None,
+            ),
         );
 
         // Emit an immediate progress event so the panel shows "0 / total" and a
@@ -2099,18 +2395,17 @@ async fn spawn_library_scan_avec_lecteur(
         // many seconds and reads as "stuck / doing nothing" (bug #1129). The
         // per-batch emit below only fires once `processed > 0`, so without this
         // the very start of a scan has no counter at all.
+        let premier_dossier = files_to_scan.first().and_then(|p| dossier_de(p));
         event_bus.emit(
             "library.scan.progress",
-            json!({
-                "phase": "files",
-                "scanned": pre_skipped,
-                "added": 0i64,
-                "total": total_discovered as i64,
-                "inserted": 0i64,
-                "updated": 0i64,
-                "skipped": pre_skipped,
-                "current_dir": files_to_scan.first().and_then(|p| dossier_de(p)),
-            }),
+            portee.avec(
+                debut_de_la_lecture(
+                    pre_skipped as usize,
+                    total_discovered,
+                    premier_dossier.as_deref(),
+                ),
+                premier_dossier.as_deref(),
+            ),
         );
 
         // --- Batched scan + import ---
@@ -2198,6 +2493,8 @@ async fn spawn_library_scan_avec_lecteur(
                     // refusé. Un scan arrêté n'est pas un scan qui perd.
                     return tune_core::scanner::walker::EcrituresDuLot::SANS_PERTE;
                 }
+                // #6167 — les fichiers du lot comptent pour leur emplacement.
+                portee.avancer_le_lot(batch_idx);
                 // Collect tracks to batch-insert and batch-update
                 let mut to_insert: Vec<tune_core::db::models::Track> =
                     Vec::with_capacity(batch.len());
@@ -2206,7 +2503,7 @@ async fn spawn_library_scan_avec_lecteur(
                 // Lignes de ce lot qui existaient sous une source d'importation
                 // et que le scan reprend à son compte (#2939).
                 let mut a_adopter: Vec<i64> = Vec::new();
-                let mut exemplaires_du_lot = ExemplairesDuLot::default();
+                let mut exemplaires_du_lot = ExemplairesDuLot::pour(&*db);
 
                 // Collect extended metadata for tracks in this batch.
                 //
@@ -2580,19 +2877,22 @@ async fn spawn_library_scan_avec_lecteur(
 
                     event_bus.emit(
                         "library.scan.progress",
-                        json!({
-                            "phase": "files",
-                            "scanned": processed,
-                            "added": inserted,
-                            "total": total,
-                            "batch": batch_idx,
-                            "inserted": inserted,
-                            "updated": updated,
-                            "skipped": skipped,
-                            "tracks_per_second": (tracks_per_second * 10.0).round() / 10.0,
-                            "eta_seconds": eta_seconds,
-                            "current_dir": dossier_du_lot,
-                        }),
+                        portee.avec(
+                            json!({
+                                "phase": "files",
+                                "scanned": processed,
+                                "added": inserted,
+                                "total": total,
+                                "batch": batch_idx,
+                                "inserted": inserted,
+                                "updated": updated,
+                                "skipped": skipped,
+                                "tracks_per_second": (tracks_per_second * 10.0).round() / 10.0,
+                                "eta_seconds": eta_seconds,
+                                "current_dir": dossier_du_lot,
+                            }),
+                            dossier_du_lot.as_deref(),
+                        ),
                     );
                 }
 
@@ -3351,6 +3651,17 @@ async fn spawn_library_scan_avec_lecteur(
 
         event_bus.emit("library.scan.completed", rapport_scan);
 
+        // #6332 — le débit des pistes déjà en base, inchangées, que ce scan
+        // n'a pas relues : complété dans un fil à part, APRÈS que ce scan a
+        // rendu le droit de scanner, et interrompu par le scan suivant. Rien
+        // ici n'attend la passe (ni le rapport, ni un nouveau scan).
+        if !scan_cancel_requested() {
+            tune_core::library::debit_des_pistes::lancer_en_fond(
+                db.clone(),
+                crate::routes::system::scan::droit_de_scanner_tenu,
+            );
+        }
+
         // Launch batch artwork enrichment as a background task
         // This fetches covers from MusicBrainz Cover Art Archive for albums
         // that don't have embedded cover art.
@@ -3452,6 +3763,45 @@ fn statut_publie(stocke: String, droit_tenu: bool) -> String {
     }
 }
 
+/// #7305 — remet au repos un `scan_status = "scanning"` qu'AUCUN scan ne
+/// tient : le même effet que « Arrêter » sur un reste (`scan_cancel`, branche
+/// sans détenteur), sans demander le geste à l'utilisateur.
+///
+/// Le droit de scanner est PRIS le temps de la remise au repos. C'est ce qui
+/// rend l'écriture sûre : tout scan prend ce droit AVANT d'écrire
+/// « scanning » (`marquer_scan_en_cours`), et l'écrit au repos AVANT de le
+/// rendre. Tant que ce jeton est tenu, aucun scan ne peut donc démarrer entre
+/// la relecture du réglage et l'écriture de `idle` — sans lui, un scan parti
+/// dans cet intervalle se verrait déclaré au repos en pleine lecture.
+///
+/// `true` : le réglage est (désormais) au repos. `false` : un scan tient le
+/// droit (le statut n'est pas un reste), ou l'écriture a échoué.
+fn remettre_au_repos_un_statut_residuel(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    event_bus: &tune_core::event_bus::EventBus,
+) -> bool {
+    let Some(_jeton) = try_begin_scan() else {
+        return false;
+    };
+    let settings = SettingsRepo::with_backend(backend.clone());
+    if settings.get("scan_status").ok().flatten().as_deref() != Some("scanning") {
+        // Remis au repos entre-temps (fin de scan, « Arrêter ») : rien à dire.
+        return true;
+    }
+    if let Err(e) = settings.set("scan_status", "idle") {
+        tracing::warn!(error = %e, "scan_status_residuel_reset_failed");
+        return false;
+    }
+    tracing::info!("scan_status_residuel_remis_au_repos");
+    // Fait tomber le bandeau d'un client qui l'affiche encore, comme
+    // « Arrêter » sur un reste.
+    event_bus.emit(
+        "library.scan.completed",
+        json!({ "cancelled": true, "stale": true }),
+    );
+    true
+}
+
 pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     // #5086 — lu par le pool, pas par l'écrivain : un statut PUBLIÉ n'a pas à
     // attendre la fin d'une écriture, et c'est `SCAN_GATE`, plus bas, qui fait
@@ -3468,6 +3818,19 @@ pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     // `trigger_scan` refuse aussitôt en 409 `already_scanning` — vu trois fois
     // le 24/09/2026 dans `pg_scan_converge_4602`, et atteignable par un
     // utilisateur. Tant que le droit est tenu, le statut est donc « scanning ».
+    // #7305 (Tades, fil 2504) : un « scanning » qu'aucun scan ne tient est un
+    // reste (processus tué en plein scan). Le publier tel quel laissait
+    // l'écran sur « scan en cours » et demandait à l'utilisateur un geste
+    // (« Arrêter ») qu'il ne trouvait pas. Le serveur le sait faux : il le
+    // remet au repos lui-même, ici, à la première lecture du statut.
+    let status = if status == "scanning"
+        && !SCAN_GATE.is_active()
+        && remettre_au_repos_un_statut_residuel(&state.backend, &state.event_bus)
+    {
+        "idle".to_string()
+    } else {
+        status
+    };
     let status = statut_publie(status, SCAN_GATE.is_active());
     let scanning = status == "scanning";
     let result = settings
@@ -3476,10 +3839,15 @@ pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
 
+    // #6729 : QUEL scan — origine, dossier d'un scan ciblé, départ — ou
+    // `stale` quand le réglage dit « scanning » sans qu'aucun scan tienne le
+    // droit. `null` au repos.
+    let current = decrire_le_scan_en_cours(&status);
     Json(json!({
         "status": status,
         "scanning": scanning,
         "result": result,
+        "current": current,
     }))
 }
 
@@ -3742,7 +4110,7 @@ pub(crate) fn spawn_scan_scheduler(state: AppState, scan_de_demarrage: bool) {
             // Sinon un scan qui se termine mal relancerait un scan complet
             // toutes les 30 secondes.
             noter_occurrence(&settings, due);
-            if spawn_library_scan(state.clone(), false, None).await {
+            if spawn_library_scan_par(state.clone(), false, None, ORIGINE_PROGRAMMEE).await {
                 tracing::info!(
                     time = %horaire,
                     occurrence = %date_iso(due),
@@ -6014,13 +6382,229 @@ mod import_progress_tests;
 
 /// #6019 — le dossier d'un fichier, tel que l'écran l'affiche (« Dossier
 /// analysé : … »).
-fn dossier_de(path: &std::path::Path) -> Option<String> {
+pub(crate) fn dossier_de(path: &std::path::Path) -> Option<String> {
     path.parent().map(|d| d.to_string_lossy().into_owned())
+}
+
+/// L'avancement du PRÉFILTRE (la passe `stat` qui écarte les inchangés),
+/// partagé par le scan manuel (#6019) et le scan de démarrage (#6371) :
+/// `verifies` fichiers vérifiés sur `total` repérés, et le dossier en cours.
+pub(crate) fn avancement_du_prefiltre(
+    verifies: usize,
+    total: usize,
+    dossier: Option<&str>,
+) -> serde_json::Value {
+    json!({
+        "phase": "indexing",
+        "stage": "verification",
+        "scanned": verifies as i64,
+        "added": 0i64,
+        "total": total as i64,
+        "current_dir": dossier,
+    })
+}
+
+/// Le premier `phase: files`, émis dès la fin du préfiltre : les inchangés
+/// sont faits, la barre devient déterminée sans attendre le premier lot
+/// (#1129). Partagé par les deux scans (#6371) : celui de démarrage n'en
+/// émettait aucun tant qu'aucun lot n'avait été traité — et aucun si rien
+/// n'avait changé.
+pub(crate) fn debut_de_la_lecture(
+    pre_skipped: usize,
+    total: usize,
+    dossier: Option<&str>,
+) -> serde_json::Value {
+    json!({
+        "phase": "files",
+        "scanned": pre_skipped as i64,
+        "added": 0i64,
+        "total": total as i64,
+        "inserted": 0i64,
+        "updated": 0i64,
+        "skipped": pre_skipped as i64,
+        "current_dir": dossier,
+    })
 }
 
 #[cfg(test)]
 #[path = "progression_scan_manuel_tests_6019.rs"]
 mod progression_scan_manuel_tests_6019;
+
+/// #6167 (Tades, fil 2231 : « 54 % mais de quelle bibliothèque parmi les 4 ? »)
+/// — la PORTÉE d'un scan, portée par chaque `library.scan.progress`.
+///
+/// Le pourcentage couvre tous les emplacements réunis, et rien ne le disait.
+/// Les annonces du scan manuel (parcours, vérification, lots) portent désormais
+/// (pas celles de `stage: extended_metadata`, émises par `lecture_bornee`, que
+/// le client complète avec la dernière portée connue) :
+/// - `scope` : `"library"` (toute la bibliothèque) ou `"folder"` (scan ciblé) ;
+/// - `locations_total` : le nombre d'emplacements couverts ;
+/// - quand le dossier en cours est connu, `location_index` (rang 1-based dans
+///   l'ordre des réglages), `location` (la racine) et, une fois le parcours
+///   fini, `location_files` (fichiers repérés sous cette racine) et, après le
+///   pré-filtre, `location_scanned` (fichiers traités, inchangés compris) ;
+/// - pour un scan de plusieurs emplacements, une fois le parcours fini,
+///   `locations` : `[{index, location, files, scanned?}]`, chaque emplacement
+///   avec ses fichiers repérés et traités — le pourcentage de chacun, en plus
+///   du total.
+///
+/// Champs AJOUTÉS : un client qui les ignore lit les mêmes annonces qu'avant.
+pub(crate) struct PorteeDuScan {
+    bibliotheque: bool,
+    racines: Vec<String>,
+    fichiers_par_racine: Vec<Option<usize>>,
+    /// Fichiers TRAITÉS par racine (inchangés compris), une fois
+    /// [`amorcer`](Self::amorcer) appelé : la base du pourcentage par
+    /// emplacement (décision de Bertrand du 13/10).
+    faits_par_racine: Vec<std::sync::atomic::AtomicUsize>,
+    amorce: std::sync::atomic::AtomicBool,
+    /// Pour chaque lot de `scan_files_batched_avec_arret`, ses fichiers par
+    /// racine. Les lots sont recalculés par la même fonction
+    /// (`lots_alignes_sur_les_dossiers`) : un fichier illisible, absent du lot
+    /// rendu, compte quand même comme traité.
+    lots_par_racine: std::sync::OnceLock<Vec<Vec<usize>>>,
+}
+
+impl PorteeDuScan {
+    pub(crate) fn new(bibliotheque: bool, racines: Vec<String>) -> Self {
+        let n = racines.len();
+        Self {
+            bibliotheque,
+            racines,
+            fichiers_par_racine: vec![None; n],
+            faits_par_racine: (0..n)
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
+            amorce: std::sync::atomic::AtomicBool::new(false),
+            lots_par_racine: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn compter_par_racine<'a>(
+        &self,
+        chemins: impl Iterator<Item = &'a std::path::Path>,
+    ) -> Vec<usize> {
+        let mut comptes = vec![0usize; self.racines.len()];
+        for f in chemins {
+            if let Some(i) = self.rang(&f.to_string_lossy()) {
+                comptes[i] += 1;
+            }
+        }
+        comptes
+    }
+
+    /// Après le pré-filtre : les fichiers inchangés de chaque racine sont déjà
+    /// « faits » ; les lots à venir sont comptés par racine.
+    pub(crate) fn amorcer(&self, a_scanner: &[std::path::PathBuf], taille_de_lot: usize) {
+        use std::sync::atomic::Ordering;
+        let a_lire = self.compter_par_racine(a_scanner.iter().map(|p| p.as_path()));
+        for (i, fait) in self.faits_par_racine.iter().enumerate() {
+            let vus = self.fichiers_par_racine[i].unwrap_or(0);
+            fait.store(vus.saturating_sub(a_lire[i]), Ordering::Relaxed);
+        }
+        let lots =
+            tune_core::scanner::walker::lots_alignes_sur_les_dossiers(a_scanner, taille_de_lot)
+                .into_iter()
+                .map(|lot| self.compter_par_racine(lot.into_iter()))
+                .collect();
+        let _ = self.lots_par_racine.set(lots);
+        self.amorce.store(true, Ordering::Relaxed);
+    }
+
+    /// Le lot `rang_du_lot` est traité : ses fichiers comptent pour leur racine.
+    pub(crate) fn avancer_le_lot(&self, rang_du_lot: usize) {
+        use std::sync::atomic::Ordering;
+        if let Some(lot) = self.lots_par_racine.get().and_then(|l| l.get(rang_du_lot)) {
+            for (i, n) in lot.iter().enumerate() {
+                self.faits_par_racine[i].fetch_add(*n, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Fichiers traités sous la racine `i`, bornés à ses fichiers repérés ;
+    /// `None` avant [`amorcer`](Self::amorcer).
+    fn faits(&self, i: usize) -> Option<usize> {
+        use std::sync::atomic::Ordering;
+        if !self.amorce.load(Ordering::Relaxed) {
+            return None;
+        }
+        let fait = self.faits_par_racine[i].load(Ordering::Relaxed);
+        Some(match self.fichiers_par_racine[i] {
+            Some(n) => fait.min(n),
+            None => fait,
+        })
+    }
+
+    /// Le rang (0-based) de la racine qui contient `chemin` : la plus longue,
+    /// si deux racines s'emboîtent.
+    pub(crate) fn rang(&self, chemin: &str) -> Option<usize> {
+        self.racines
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| sous_le_dossier(chemin, r))
+            .max_by_key(|(_, r)| r.len())
+            .map(|(i, _)| i)
+    }
+
+    /// Compte, une fois le parcours fini, les fichiers repérés par racine.
+    pub(crate) fn compter(&mut self, fichiers: &[std::path::PathBuf]) {
+        let comptes = self.compter_par_racine(fichiers.iter().map(|p| p.as_path()));
+        self.fichiers_par_racine = comptes.into_iter().map(Some).collect();
+    }
+
+    /// `annonce` complétée des champs de portée ; `dossier` : le dossier en
+    /// cours, s'il est connu.
+    pub(crate) fn avec(&self, mut annonce: Value, dossier: Option<&str>) -> Value {
+        if let Some(o) = annonce.as_object_mut() {
+            o.insert(
+                "scope".into(),
+                json!(if self.bibliotheque {
+                    "library"
+                } else {
+                    "folder"
+                }),
+            );
+            o.insert("locations_total".into(), json!(self.racines.len()));
+            if let Some(i) = dossier.and_then(|d| self.rang(d)) {
+                o.insert("location_index".into(), json!(i + 1));
+                o.insert("location".into(), json!(self.racines[i]));
+                if let Some(n) = self.fichiers_par_racine[i] {
+                    o.insert("location_files".into(), json!(n));
+                }
+                if let Some(f) = self.faits(i) {
+                    o.insert("location_scanned".into(), json!(f));
+                }
+            }
+            // Chaque emplacement, une fois le parcours fini : ses fichiers et,
+            // après le pré-filtre, ceux qui sont traités. Le pourcentage de
+            // chacun se lit `scanned / files`, à côté du total.
+            if self.racines.len() > 1 && self.fichiers_par_racine.iter().all(Option::is_some) {
+                let emplacements: Vec<Value> = self
+                    .racines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let mut e = json!({
+                            "index": i + 1,
+                            "location": r,
+                            "files": self.fichiers_par_racine[i].unwrap_or(0),
+                        });
+                        if let Some(f) = self.faits(i) {
+                            e["scanned"] = json!(f);
+                        }
+                        e
+                    })
+                    .collect();
+                o.insert("locations".into(), Value::Array(emplacements));
+            }
+        }
+        annonce
+    }
+}
+
+#[cfg(test)]
+#[path = "portee_scan_tests_6167.rs"]
+mod portee_scan_tests_6167;
 
 #[cfg(test)]
 mod vidage_sauvegarde_5973 {

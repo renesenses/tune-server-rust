@@ -90,24 +90,13 @@ const ATTENTE_EN_LECTURE: Duration = Duration::from_secs(5);
 /// requête à 3/s. **Estimé, non mesuré** — aucune passe réelle n'a tourné.
 const SECONDES_PAR_PISTE: f64 = 1.5;
 
-/// La clé AcoustID du serveur : le réglage en base, sinon la configuration
-/// (`TUNE_ACOUSTID_API_KEY`, `tune.toml`). Vide compte comme absente.
+/// La clé AcoustID à utiliser : la clé PERSONNELLE de l'utilisateur
+/// (Réglages ▸ Clés d'API, #4805 lot 1) d'abord, sinon la clé intégrée — le
+/// réglage en base, puis la configuration (`TUNE_ACOUSTID_API_KEY`,
+/// `tune.toml`). Vide compte comme absente.
 pub(crate) fn cle_acoustid(state: &AppState) -> Option<String> {
-    SettingsRepo::with_backend(state.backend.clone())
-        .get(REGLAGE_CLE)
-        .ok()
-        .flatten()
-        .map(|k| k.trim().to_string())
-        .filter(|k| !k.is_empty())
-        .or_else(|| {
-            state
-                .config
-                .acoustid_api_key
-                .as_deref()
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-                .map(str::to_string)
-        })
+    crate::routes::system::cles_api::cle(state, tune_core::cles_api::Service::AcoustId)
+        .map(tune_core::cles_api::CleResolue::into_valeur)
 }
 
 /// Pourquoi la passe ne peut pas tourner, ou `None`.

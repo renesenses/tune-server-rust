@@ -262,6 +262,134 @@ async fn une_page_web_a_la_reconnexion_est_dite_sans_attendre() {
         .expect("le drain se termine quand le canal se ferme");
 }
 
+/// La longueur d'une trame MPEG-1 couche III à 44,1 kHz, d'après son
+/// en-tête : la seule forme que porte la fixture `test.mp3`.
+fn longueur_de_trame_mp3(entete: &[u8]) -> usize {
+    assert_eq!(entete[0], 0xFF, "synchro de trame attendue");
+    assert_eq!(entete[1] & 0xFE, 0xFA, "MPEG-1 couche III attendu");
+    assert_eq!((entete[2] >> 2) & 3, 0, "44,1 kHz attendu");
+    let kbps = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ][usize::from(entete[2] >> 4)];
+    144 * kbps * 1000 / 44_100 + usize::from((entete[2] >> 1) & 1)
+}
+
+/// Une station qui sert `corps` à sa première connexion puis la GARDE
+/// ouverte, comme un direct qui ne finit pas, jusqu'au signal du test (ou
+/// 30 s). Rend l'URL et l'émetteur du signal.
+fn station_en_direct(corps: Vec<u8>) -> (String, std::sync::mpsc::Sender<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (fermer, signal) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let Some(mut s) = listener.incoming().flatten().next() else {
+            return;
+        };
+        let mut buf = [0u8; 2048];
+        let _ = s.read(&mut buf);
+        let _ = write!(
+            s,
+            "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nicy-br: 128, 128\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let _ = s.write_all(&corps);
+        let _ = s.flush();
+        let _ = signal.recv_timeout(Duration::from_secs(30));
+    });
+    (format!("http://{addr}/tsfjazz-high.mp3"), fermer)
+}
+
+/// #7046 — TSF Jazz s'arrêtait après la publicité et ne repartait pas.
+///
+/// Forme mesurée le 26/10/2026 sur le vrai flux
+/// (`tsfjazz.ice.infomaniak.ch/tsfjazz-high.mp3`, IcecastSC 1.5.7) : le corps
+/// s'OUVRE sur un fichier MP3 complet, la publicité d'ouverture — première
+/// trame porteuse d'un en-tête LAME « Info » (1 152 trames, 481 906 octets,
+/// 30 s) — et le direct suit aussitôt, en trames nues, sur la même
+/// connexion, sans fin. symphonia prenait les 30 s de la publicité pour la
+/// durée de la station et rognait à zéro chaque trame du direct : la
+/// publicité jouait, puis plus un échantillon, sans erreur ni reconnexion.
+///
+/// La fixture reproduit cette forme, anonymisée : `test.mp3` (lui aussi un
+/// fichier LAME à en-tête « Info », ~1 s) tient le rôle de la publicité,
+/// puis ses trames audio, sans en-tête, répétées dix fois tiennent celui du
+/// direct (~10 s). La connexion reste ouverte. Le direct doit être décodé
+/// sur cette même connexion, au-delà de la publicité.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_direct_qui_suit_la_publicite_d_ouverture_est_decode_7046() {
+    // `test.mp3` : étiquette ID3v2 (10 octets + taille « syncsafe »), puis la
+    // trame « Info », puis les trames audio.
+    let id3 = 10
+        + MP3[6..10]
+            .iter()
+            .fold(0usize, |n, b| (n << 7) | usize::from(*b & 0x7F));
+    let publicite = &MP3[id3..];
+    let trame_info = longueur_de_trame_mp3(publicite);
+    assert_eq!(
+        &publicite[36..40],
+        b"Info",
+        "la fixture doit s'ouvrir, comme TSF Jazz, sur un en-tête « Info »"
+    );
+    let trames_audio = &publicite[trame_info..];
+    let mut corps = publicite.to_vec();
+    for _ in 0..10 {
+        corps.extend_from_slice(trames_audio);
+    }
+    // Ce que pèse en PCM 16 bits stéréo la publicité seule, et la station
+    // entière (1 152 échantillons par trame).
+    let mut trames = 0usize;
+    let mut i = 0usize;
+    while i < trames_audio.len() {
+        i += longueur_de_trame_mp3(&trames_audio[i..]);
+        trames += 1;
+    }
+    let pcm_de_la_publicite = trames * 1152 * 4;
+    let pcm_attendu = 11 * pcm_de_la_publicite;
+
+    let (url, fermer) = station_en_direct(corps);
+    let session = session_radio().await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let data_ready = Arc::new(tokio::sync::Notify::new());
+    let session_pour_le_decodeur = session.clone();
+    let decodeur = tokio::task::spawn_blocking(move || {
+        decode_radio_stream_to_pcm(
+            url,
+            tx,
+            data_ready,
+            session_pour_le_decodeur,
+            None,
+            None,
+            false,
+            None,
+        )
+    });
+
+    // Tout le corps est servi d'un coup : au-delà de 3 s sans morceau, le
+    // décodeur ne rendra plus rien.
+    let voulu = pcm_attendu * 3 / 4;
+    let mut octets = 0usize;
+    while octets < voulu {
+        match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+            Ok(Some(m)) => octets += m.len(),
+            Ok(None) => panic!("le décodeur a fermé le canal après {octets} octets de PCM"),
+            Err(_) => panic!(
+                "après la publicité d'ouverture, le direct n'est plus décodé : {octets} octets \
+                 de PCM servis, la publicité seule en vaut {pcm_de_la_publicite}, la station \
+                 {pcm_attendu} (au moins {voulu} attendus) — l'en-tête « Info » de la publicité \
+                 a été pris pour la fin de la station"
+            ),
+        }
+    }
+    drop(rx);
+    let _ = fermer.send(());
+    let verdict = tokio::time::timeout(Duration::from_secs(15), decodeur)
+        .await
+        .expect("le décodeur doit rendre la main après le départ du consommateur")
+        .expect("la tâche de décodage ne doit pas paniquer");
+    assert_eq!(verdict, Ok(()));
+}
+
 /// Décode la station jusqu'à `n` morceaux, en déposant `profil` dans le poste
 /// de relève après le `apres`-ième (jamais si `None`). Rend les morceaux et le
 /// nombre de relèves faites par le décodeur.
@@ -345,4 +473,306 @@ async fn un_egaliseur_depose_en_vol_est_releve_par_le_decodeur_radio_4407() {
         servi[15], etalon[15],
         "après le dépôt, le flux en cours porte l'égaliseur"
     );
+}
+
+/// Décode la station jusqu'à `octets_voulus` octets de PCM, puis s'en va.
+/// Rend le format publié, les octets non nuls, et le nombre de connexions
+/// acceptées par la station AU MOMENT où le dernier octet voulu est arrivé.
+async fn decoder_la_station_ogg(
+    content_type: &'static str,
+    corps: Vec<u8>,
+    octets_voulus: usize,
+) -> (Option<(u32, u16)>, usize, usize) {
+    let (url, connexions) = station_factice(vec![(content_type, corps)]);
+    let session = session_radio().await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let data_ready = Arc::new(tokio::sync::Notify::new());
+    let session_pour_le_decodeur = session.clone();
+    let decodeur = tokio::task::spawn_blocking(move || {
+        decode_radio_stream_to_pcm(
+            url,
+            tx,
+            data_ready,
+            session_pour_le_decodeur,
+            None,
+            None,
+            false,
+            None,
+        )
+    });
+    let mut octets = 0usize;
+    let mut non_nuls = 0usize;
+    while octets < octets_voulus {
+        match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+            Ok(Some(m)) => {
+                octets += m.len();
+                non_nuls += m.iter().filter(|b| **b != 0).count();
+            }
+            Ok(None) => {
+                let verdict = decodeur.await.expect("pas de panique");
+                panic!("le décodeur a fermé le canal après {octets} octets : {verdict:?}");
+            }
+            Err(_) => panic!("aucun PCM en 10 s après {octets} octets"),
+        }
+    }
+    let vues = connexions.load(Ordering::SeqCst);
+    let format = session.detected_output_format();
+    drop(rx);
+    let verdict = tokio::time::timeout(Duration::from_secs(15), decodeur)
+        .await
+        .expect("le décodeur rend la main après le départ du consommateur")
+        .expect("pas de panique");
+    assert_eq!(verdict, Ok(()));
+    (format, non_nuls, vues)
+}
+
+/// Ogg Vorbis servi sous `application/ogg`, sur une adresse sans extension
+/// (un montage Icecast `/live`) : symphonia le décode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_decodeur_radio_rend_le_pcm_d_un_ogg_vorbis() {
+    let corps = crate::ogg_factice::ogg_vorbis(1, &[("TITLE", "Vorbis")]);
+    let (format, non_nuls, _) = decoder_la_station_ogg("application/ogg", corps, 3 * 32_768).await;
+    let (cadence, canaux) = format.expect("le format sondé est publié");
+    assert!(
+        cadence >= 44_100 && canaux >= 1,
+        "format publié : {format:?}"
+    );
+    assert!(non_nuls > 1_000, "le PCM Vorbis n'est pas du silence");
+}
+
+/// Ogg Opus servi sous `audio/ogg; codecs=opus` : symphonia n'a pas de
+/// décodeur Opus, la station ne jouait pas (« radio decoder init failed:
+/// unsupported audio codec »). libopus la décode, à 48 kHz stéréo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_decodeur_radio_rend_le_pcm_d_un_ogg_opus() {
+    let corps = crate::ogg_factice::ogg_opus(2, 3.0, &[("TITLE", "Opus")]);
+    let (format, non_nuls, _) =
+        decoder_la_station_ogg("audio/ogg; codecs=opus", corps, 3 * 32_768).await;
+    assert_eq!(format, Some((48_000, 2)), "Opus se publie en 48 kHz stéréo");
+    assert!(non_nuls > 1_000, "le PCM Opus n'est pas du silence");
+}
+
+/// Ogg chaîné, à la manière d'Icecast : un flux logique par titre. Passer au
+/// titre suivant ne doit PAS coûter une reconnexion. Opus : un titre d'une
+/// seconde, puis un de quatre ; à 1,5 s de PCM reçu, la station n'a vu
+/// qu'UNE connexion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_ogg_opus_chaine_passe_au_titre_suivant_sans_se_reconnecter() {
+    let mut corps = crate::ogg_factice::ogg_opus(10, 1.0, &[("TITLE", "A - Un")]);
+    corps.extend(crate::ogg_factice::ogg_opus(
+        11,
+        4.0,
+        &[("TITLE", "B - Deux")],
+    ));
+    // 1,5 s à 48 kHz, stéréo, 16 bits.
+    let (_, non_nuls, connexions) =
+        decoder_la_station_ogg("application/ogg", corps, 48_000 * 4 * 3 / 2).await;
+    assert_eq!(
+        connexions, 1,
+        "le changement de flux logique a provoqué une reconnexion"
+    );
+    assert!(non_nuls > 1_000);
+}
+
+/// Le même passage en Vorbis : trois titres de ~2 s ; à 3 s de PCM reçu,
+/// toujours une seule connexion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_ogg_vorbis_chaine_passe_au_titre_suivant_sans_se_reconnecter() {
+    let mut corps = Vec::new();
+    for (serial, titre) in [(20, "Un"), (21, "Deux"), (22, "Trois")] {
+        corps.extend(crate::ogg_factice::ogg_vorbis(serial, &[("TITLE", titre)]));
+    }
+    let (format, _, _) = decoder_la_station_ogg("application/ogg", corps.clone(), 32_768).await;
+    let (cadence, canaux) = format.expect("format publié");
+    let trois_secondes = cadence as usize * usize::from(canaux) * 2 * 3;
+    let (_, non_nuls, connexions) =
+        decoder_la_station_ogg("application/ogg", corps, trois_secondes).await;
+    assert_eq!(
+        connexions, 1,
+        "le changement de flux logique a provoqué une reconnexion"
+    );
+    assert!(non_nuls > 1_000);
+}
+
+/// L'énergie relative de `signal` (mono) à `hz`, par Goertzel.
+fn puissance_a(signal: &[f32], cadence: u32, hz: f32) -> f64 {
+    let k = 2.0 * (std::f64::consts::TAU * f64::from(hz) / f64::from(cadence)).cos();
+    let (mut s1, mut s2) = (0f64, 0f64);
+    for x in signal {
+        let s0 = f64::from(*x) + k * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    (s1 * s1 + s2 * s2 - k * s1 * s2) / (signal.len() as f64).powi(2)
+}
+
+/// L'énergie au-dessus de 12 kHz rapportée à celle sous 12 kHz, sur une
+/// grille de 250 Hz.
+fn part_au_dessus_de_12_khz(signal: &[f32], cadence: u32) -> f64 {
+    let (mut haut, mut bas) = (0f64, 0f64);
+    let mut hz = 250.0f32;
+    while hz < (cadence / 2) as f32 - 250.0 {
+        let p = puissance_a(signal, cadence, hz);
+        if hz > 12_000.0 {
+            haut += p
+        } else {
+            bas += p
+        }
+        hz += 250.0;
+    }
+    haut / bas.max(f64::MIN_POSITIVE)
+}
+
+/// #6357 — l'échantillon HE-AAC FABRIQUÉ (SBR implicite, cœur à 24 kHz) est
+/// bien du HE-AAC : `rusty_aac` le sort à 48 kHz, avec de l'énergie
+/// au-dessus de 12 kHz, que le cœur ne peut pas porter.
+#[test]
+fn l_echantillon_he_aac_fabrique_se_decode_a_48_khz_avec_ses_aigus() {
+    let adts = crate::radio_hls::fabrique_tests::trames_he_aac(1.0);
+    let mut decodeur = rusty_aac::AacDecoder::new();
+    let (mut pcm, mut cadence, mut canaux) = (Vec::new(), 0, 0);
+    let mut i = 0;
+    while i + 7 <= adts.len() {
+        let longueur = rusty_aac::parse_adts(&adts[i..])
+            .expect("en-tête ADTS")
+            .frame_length;
+        let trame = decodeur
+            .decode(&adts[i..i + longueur], None)
+            .expect("trame HE-AAC");
+        cadence = trame.sample_rate;
+        canaux = trame.channels;
+        pcm.extend(trame.samples.iter().step_by(usize::from(trame.channels)));
+        i += longueur;
+    }
+    assert_eq!(
+        cadence, 48_000,
+        "le SBR double la fréquence du cœur (24 kHz)"
+    );
+    assert_eq!(
+        canaux, 2,
+        "un cœur mono HE-AAC sort en stéréo (PS implicite)"
+    );
+    let part = part_au_dessus_de_12_khz(&pcm[4096..], cadence);
+    assert!(part > 1e-3, "le SBR doit reconstruire des aigus : {part:e}");
+}
+
+/// #6357 — LE TÉMOIN DU BRANCHEMENT. Un faux direct HLS sur 127.0.0.1
+/// (liste maîtresse `mp4a.40.5`, liste média, segments MPEG-TS de HE-AAC à
+/// SBR implicite, comme la BBC hors Royaume-Uni) passe par le décodeur de
+/// PRODUCTION, `decode_radio_stream_to_pcm`, jusqu'au PCM :
+///
+/// * le format publié est 48 kHz stéréo — la sortie du SBR — et non les
+///   24 kHz que l'en-tête ADTS annonce (le piège de l'étude §4.4 : un WAV à
+///   24 kHz sur du PCM à 48 kHz jouerait à demi-vitesse) ;
+/// * le PCM servi porte des aigus au-dessus de 12 kHz ;
+/// * la source publiée dit HLS, HE-AAC, et son débit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_station_hls_he_aac_est_decodee_jusqu_au_pcm_a_48_khz() {
+    use crate::http::streamer::{AudioStreamer, StreamInfo};
+    use crate::radio_hls::fabrique_tests as fab;
+
+    // Trois segments de 2 s, puis un direct immobile.
+    let adts = fab::trames_he_aac(6.0);
+    let mut trames = Vec::new();
+    let mut i = 0;
+    while i + 7 <= adts.len() {
+        let n = rusty_aac::parse_adts(&adts[i..]).unwrap().frame_length;
+        trames.push(adts[i..i + n].to_vec());
+        i += n;
+    }
+    let par_segment = trames.len() / 3;
+    let segments: Vec<Vec<u8>> = trames
+        .chunks(par_segment)
+        .take(3)
+        .enumerate()
+        .map(|(n, t)| fab::segment_ts(&t.concat(), (n * 7 % 16) as u8, true))
+        .collect();
+    let routeur: Arc<fab::Routeur> = Arc::new(move |chemin: &str, _rang: usize| {
+        match chemin {
+        "/bbc/master.m3u8" => fab::ok(
+            fab::TYPE_LISTE,
+            b"#EXTM3U\n#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=101760,CODECS=\"mp4a.40.5\"\naudio=96000.m3u8\n".to_vec(),
+        ),
+        "/bbc/audio=96000.m3u8" => fab::ok(
+            fab::TYPE_LISTE,
+            fab::liste_media(
+                2,
+                500,
+                &(0..3).map(|n| (format!("s-{}.ts", 500 + n), String::new(), false)).collect::<Vec<_>>(),
+                false,
+            ),
+        ),
+        _ => match chemin
+            .strip_prefix("/bbc/s-")
+            .and_then(|r| r.strip_suffix(".ts"))
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            Some(n) if (500..503).contains(&n) => fab::ok(fab::TYPE_TS, segments[n - 500].clone()),
+            _ => fab::introuvable(),
+        },
+    }
+    });
+    let serveur = fab::ServeurHls::lancer(routeur);
+    let url = format!("{}/bbc/master.m3u8", serveur.base);
+
+    let streamer = Arc::new(AudioStreamer::new(0));
+    let info = StreamInfo {
+        format: "wav".to_string(),
+        mime_type: "audio/wav".to_string(),
+        ..StreamInfo::default()
+    };
+    let (id, _tx_session, _ready, session) = streamer.create_radio_session(info, 4).await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let data_ready = Arc::new(tokio::sync::Notify::new());
+    let (session_d, ready_d) = (session.clone(), data_ready.clone());
+    let decodeur = tokio::task::spawn_blocking(move || {
+        decode_radio_stream_to_pcm(url, tx, ready_d, session_d, None, None, false, None)
+    });
+
+    tokio::time::timeout(Duration::from_secs(15), data_ready.notified())
+        .await
+        .expect("le premier morceau doit réveiller le consommateur en moins de 15 s");
+    assert_eq!(
+        session.detected_output_format(),
+        Some((48_000, 2)),
+        "le format publié doit être celui du HE-AAC décodé (48 kHz stéréo), \
+         pas celui du cœur AAC-LC que dit l'en-tête ADTS (24 kHz mono)"
+    );
+    let source = streamer
+        .stream_output_wire(&id)
+        .await
+        .and_then(|w| w.radio_source)
+        .expect("la source radio est publiée");
+    assert_eq!(source.transport, Some("hls"));
+    assert_eq!(source.profil, Some("HE-AAC"));
+    assert_eq!(source.format, Some("aac"));
+    assert!(source.debit_kbps.is_some_and(|k| k > 0), "{source:?}");
+
+    // Deux secondes de PCM 16 bits stéréo : la voie gauche, en flottants.
+    let mut octets = Vec::new();
+    while octets.len() < 2 * 48_000 * 4 {
+        let morceau = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("un morceau de PCM doit arriver en moins de 10 s")
+            .expect("le décodeur ne doit pas fermer le canal");
+        octets.extend(morceau);
+    }
+    let gauche: Vec<f32> = octets
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|t| f32::from(i16::from_le_bytes([t[0], t[1]])) / 32768.0)
+        .collect();
+    let part = part_au_dessus_de_12_khz(&gauche[8192..], 48_000);
+    assert!(
+        part > 1e-3,
+        "le PCM servi doit porter les aigus reconstruits par le SBR : {part:e}"
+    );
+
+    drop(rx);
+    let verdict = tokio::time::timeout(Duration::from_secs(15), decodeur)
+        .await
+        .expect("le décodeur doit rendre la main après le départ du consommateur")
+        .expect("la tâche de décodage ne doit pas paniquer");
+    assert_eq!(verdict, Ok(()));
 }

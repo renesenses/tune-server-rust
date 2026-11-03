@@ -83,6 +83,7 @@ impl PlaybackOrchestrator {
             .clone()
             .ok_or_else(|| format!("source « {source} » : source_id requis"))?;
         let depuis_ms = req.seek_ms.unwrap_or(0);
+        let qualite = fournisseur.qualite_recue();
         // #5079 — une lecture EXPLICITE (pas un pré-armement gapless, qui
         // doit laisser finir la piste qui joue) arrête d'abord les pompes que
         // la zone fait encore tourner : un seul bras de lecture ne sert pas
@@ -225,6 +226,17 @@ impl PlaybackOrchestrator {
         let url = self
             .streamer
             .get_stream_url(&session_id, &self.server_ip(), "wav");
+        // #6915 — un flux ouvert à `depuis_ms` COMMENCE à cette position : un
+        // renderer réseau compte sa position à partir du début de CE flux.
+        // Sans le départ dans l'URL, le sondeur reprenait « 0:05 » pour la
+        // position de la piste, et la relance suivante (changement
+        // d'égaliseur) repartait près du début. Même mécanique que le flux
+        // natif décalé de #6059 (`outputs::dlna_depart_natif`).
+        let url = if depuis_ms > 0 {
+            crate::outputs::dlna_depart_natif::url_avec_depart(&url, depuis_ms)
+        } else {
+            url
+        };
         Ok(ResolvedStream {
             url,
             mime_type: "audio/wav".into(),
@@ -240,7 +252,10 @@ impl PlaybackOrchestrator {
             bit_depth: Some(format.bits as u32),
             channels: Some(format.canaux as u32),
             origin_url: None,
-            bitrate_kbps: None,
+            // #6946 — ce que la source a reçu avant d'en faire du PCM (Spotify :
+            // Ogg Vorbis 320 kbit/s). Le fil, lui, reste le WAV ci-dessus.
+            bitrate_kbps: qualite.as_ref().and_then(|q| q.debit_kbps),
+            format_source: qualite.map(|q| q.codec),
         })
     }
 
@@ -301,6 +316,7 @@ impl PlaybackOrchestrator {
             format: Some("wav"),
             sample_rate: Some(format.frequence),
             bit_depth: Some(format.bits),
+            ..Default::default()
         });
         if let Some(etat) = flux.etat.clone() {
             inscrire_direct(&session_id, etat);
@@ -340,16 +356,16 @@ impl PlaybackOrchestrator {
             let fin = tokio::task::spawn_blocking(move || {
                 let mut premier = true;
                 pomper_sans_fin(&mut *lecteur, |t| {
-                    if let Some(n) = &niveaux {
-                        if !crate::audio::tap::send_windowed_pcm(
+                    if let Some(n) = &niveaux
+                        && !crate::audio::tap::send_windowed_pcm(
                             n,
                             &t,
                             format.bits,
                             format.canaux,
                             format.frequence,
-                        ) {
-                            niveaux = None;
-                        }
+                        )
+                    {
+                        niveaux = None;
                     }
                     let ok = rt.block_on(tx.send(t)).is_ok();
                     if premier {
@@ -417,6 +433,7 @@ impl PlaybackOrchestrator {
             channels: Some(format.canaux as u32),
             origin_url: None,
             bitrate_kbps: None,
+            format_source: None,
         })
     }
 

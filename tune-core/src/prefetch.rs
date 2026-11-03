@@ -84,6 +84,8 @@ pub struct PrefetchedTrack {
 /// Thread-safe prefetch engine shared across async tasks.
 pub struct PrefetchEngine {
     buffer: Mutex<Option<PrefetchedTrack>>,
+    /// Le fMP4 DASH est entier avant le décodage du tampon PCM (#7247).
+    dash_complet: Mutex<Option<(String, String, crate::streaming::StreamUrl)>>,
     /// Cancellation token: set to true to abort an in-progress prefetch.
     cancel: Mutex<bool>,
     /// The queue position that was prefetched, so callers can detect
@@ -101,9 +103,28 @@ impl PrefetchEngine {
     pub fn new() -> Self {
         Self {
             buffer: Mutex::new(None),
+            dash_complet: Mutex::new(None),
             cancel: Mutex::new(false),
             prefetched_position: Mutex::new(None),
         }
+    }
+
+    pub(crate) async fn prendre_dash_complet(
+        &self,
+        source: &str,
+        source_id: &str,
+    ) -> Option<crate::streaming::StreamUrl> {
+        let mut garde = self.dash_complet.lock().await;
+        let (service, id, flux) = garde.as_ref()?;
+        if service != source || id != source_id {
+            return None;
+        }
+        let existe = flux
+            .url
+            .strip_prefix("file://")
+            .is_some_and(|p| std::path::Path::new(p).is_file());
+        let (_, _, flux) = garde.take()?;
+        existe.then_some(flux)
     }
 
     /// Read the current prefetch mode from settings.
@@ -238,6 +259,20 @@ impl PrefetchEngine {
                 return;
             }
 
+            // HQPlayer doit recevoir le fichier complet préparé par sa tâche,
+            // pas un deuxième téléchargement réduit à trente secondes de PCM.
+            if source == "tidal"
+                && crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+                    .get(zone_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|z| {
+                        z.output_type.as_deref() == Some("hqplayer") && z.gapless_enabled
+                    })
+            {
+                return;
+            }
+
             let title = item.title.clone();
             let artist = item.artist_name.clone();
             let album = item.album_title.clone();
@@ -306,42 +341,16 @@ impl PrefetchEngine {
                 }
             };
             let mut svc = svc.write().await;
-            let mut flux = match svc.get_track_url(&source_id, None).await {
-                Ok(data) => data,
-                Err(e) => {
-                    // Try refresh once on auth errors
-                    let msg = e.to_string();
-                    if msg.contains("401") || msg.contains("403") {
-                        if svc.refresh_if_needed().await.unwrap_or(false) {
-                            match svc.get_track_url(&source_id, None).await {
-                                Ok(data) => data,
-                                Err(e2) => {
-                                    warn!(error = %e2, "prefetch_get_url_failed_after_refresh");
-                                    return;
-                                }
-                            }
-                        } else {
-                            warn!(error = %e, "prefetch_get_url_auth_failed");
-                            return;
-                        }
-                    } else {
-                        warn!(error = %e, "prefetch_get_url_failed");
-                        return;
-                    }
-                }
-            };
-            // #5283 — même règle que la lecture : une cadence annoncée nulle
-            // est complétée, ou la piste n'est pas préchargée.
-            crate::streaming::cadence_du_flux::completer_la_cadence(
-                &mut flux, &**svc, &source, &source_id,
-            )
-            .await;
-            if flux.quality.sample_rate == 0 {
-                warn!(source = %source, source_id = %source_id, "prefetch_sample_rate_unknown_skipped");
-                return;
+            match resoudre_le_flux_a_precharger(&mut **svc, &source, &source_id).await {
+                Some(flux) => flux,
+                None => return,
             }
-            flux
         };
+
+        if source == "tidal" && stream_data.url.starts_with("file://") {
+            *self.dash_complet.lock().await =
+                Some((source.clone(), source_id.clone(), stream_data.clone()));
+        }
 
         // Fetch track metadata if not provided
         let (track_title, track_artist, track_album, track_cover, actual_duration) =
@@ -581,6 +590,7 @@ impl PrefetchEngine {
             info!("prefetch_buffer_cleared");
         }
         *buf = None;
+        *self.dash_complet.lock().await = None;
 
         *self.prefetched_position.lock().await = None;
     }
@@ -633,6 +643,65 @@ fn is_streaming_source(source: &str) -> bool {
         source,
         "tidal" | "qobuz" | "deezer" | "youtube" | "spotify" | "amazon"
     )
+}
+
+/// Le flux que le préchargement décode pour la piste suivante, ou `None`
+/// quand il n'y a rien à précharger (service en erreur, cadence inconnue).
+///
+/// `get_track_url` sans préférence de qualité (le maximum du service), un
+/// rafraîchissement du jeton sur 401/403, puis — #6401 — le même repli
+/// Qobuz en 16/44,1 que la lecture explicite : un flux HR que le CDN refuse
+/// au démarrage est redemandé une fois au format 6. Sans lui, la piste
+/// repliée par la lecture n'était jamais préchargée (téléchargement HR en
+/// échec) et le blanc revenait à chaque titre concerné.
+pub(crate) async fn resoudre_le_flux_a_precharger(
+    svc: &mut dyn crate::streaming::StreamingService,
+    source: &str,
+    source_id: &str,
+) -> Option<crate::streaming::StreamUrl> {
+    let flux = match svc.get_track_url(source_id, None).await {
+        Ok(data) => data,
+        Err(e) => {
+            // Try refresh once on auth errors
+            let msg = e.to_string();
+            if msg.contains("401") || msg.contains("403") {
+                if svc.refresh_if_needed().await.unwrap_or(false) {
+                    match svc.get_track_url(source_id, None).await {
+                        Ok(data) => data,
+                        Err(e2) => {
+                            warn!(error = %e2, "prefetch_get_url_failed_after_refresh");
+                            return None;
+                        }
+                    }
+                } else {
+                    warn!(error = %e, "prefetch_get_url_auth_failed");
+                    return None;
+                }
+            } else {
+                warn!(error = %e, "prefetch_get_url_failed");
+                return None;
+            }
+        }
+    };
+    let mut flux = crate::streaming::qobuz_repli_qualite::retenir_le_flux_du_service(
+        source,
+        &*svc,
+        crate::http::client::shared(),
+        source_id,
+        None,
+        flux,
+    )
+    .await
+    .flux;
+    // #5283 — même règle que la lecture : une cadence annoncée nulle
+    // est complétée, ou la piste n'est pas préchargée.
+    crate::streaming::cadence_du_flux::completer_la_cadence(&mut flux, &*svc, source, source_id)
+        .await;
+    if flux.quality.sample_rate == 0 {
+        warn!(source = %source, source_id = %source_id, "prefetch_sample_rate_unknown_skipped");
+        return None;
+    }
+    Some(flux)
 }
 
 #[cfg(test)]

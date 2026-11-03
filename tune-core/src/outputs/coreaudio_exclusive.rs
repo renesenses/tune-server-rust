@@ -309,6 +309,16 @@ fn rollback_exclusive_setup<H: ExclusiveSetupHal>(hal: &mut H, prepared: &Prepar
     }
 }
 
+/// #6230 — les voies que le périphérique déclare : celles de son format
+/// physique en place, lu sans rien réserver ni changer. `None` si le
+/// périphérique est introuvable ou son format illisible.
+fn voies_declarees<H: ExclusiveSetupHal>(hal: &mut H, requested_name: &str) -> Option<u32> {
+    let (device_id, _) = hal.resolve_output_device(requested_name).ok()?;
+    hal.physical_format(device_id)
+        .ok()
+        .map(|format| format.mChannelsPerFrame)
+}
+
 fn prepare_exclusive_device<H: ExclusiveSetupHal>(
     hal: &mut H,
     requested_name: &str,
@@ -574,6 +584,47 @@ impl ExclusiveOutput {
             volume,
             paused,
         })
+    }
+
+    /// #6230 — ouvrir sur les voies qu'une grille de réaffectation PILOTE
+    /// (6 → 2), et non sur les canaux de la source. Même ouverture que
+    /// [`Self::new`], précédée d'une garde, AVANT le hog et toute
+    /// négociation : si le format physique en place sur le périphérique
+    /// porte moins de voies que demandé, ou s'il est illisible, l'ouverture
+    /// est refusée ([`super::local::voies_pilotees_permises`]). Jamais plus de
+    /// voies que la sortie n'en déclare ; l'appelant rouvre alors au format
+    /// de la source, comme avant.
+    pub(crate) fn new_sur_voies_pilotees(
+        device_name: &str,
+        sample_rate: u32,
+        bit_depth: u32,
+        voies: u32,
+        starvation: Arc<RingStarvation>,
+        volume: Arc<std::sync::atomic::AtomicU32>,
+        paused: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        let declarees = voies_declarees(&mut SystemCoreAudioHal, device_name);
+        if !super::local::voies_pilotees_permises(voies, declarees) {
+            info!(
+                device = %device_name,
+                voies,
+                voies_declarees = ?declarees,
+                "coreaudio_exclusive_voies_pilotees_refusees"
+            );
+            return Err(format!(
+                "{device_name} déclare {} voie(s) : la grille en demande {voies}",
+                declarees.map_or_else(|| "un nombre illisible de".to_string(), |n| n.to_string())
+            ));
+        }
+        Self::new(
+            device_name,
+            sample_rate,
+            bit_depth,
+            voies,
+            starvation,
+            volume,
+            paused,
+        )
     }
 
     /// Démarre le rendu : l'AudioUnit commence à tirer dans l'anneau.

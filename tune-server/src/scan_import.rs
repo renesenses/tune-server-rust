@@ -92,6 +92,8 @@ pub(crate) struct VerdictAlbum {
 /// - `various_artists`: LA règle, appliquée au dossier entier (sans balise),
 ///   dit « compilation » — deux artistes principaux distincts. Un dossier
 ///   d'un seul artiste (plusieurs disques, des invités) n'est pas touché.
+///   [`TrackImporter::begin_batch`] l'écarte encore quand deux albums du
+///   dossier partagent un numéro de piste (#6460, `parutions_distinctes`).
 /// - `use_folder_title`: additionally ≥2 distinct album tags → the per-track
 ///   album tags are unrelated, so the folder name is the real album title. A
 ///   genuine various-artists album with ONE album tag (e.g. "Woodstock") keeps
@@ -152,6 +154,41 @@ pub(crate) struct PreuvesDuDossier {
     /// en `(None, None, None)` : il fait savoir que le dossier existe sans y
     /// apporter d'artiste.
     par_dossier: HashSet<(Option<String>, Option<String>, Option<String>)>,
+    /// #6460 — `(disque, piste)` → le premier titre d'album (en minuscules)
+    /// vu sous ce numéro dans le dossier. Une entrée par numéro, pas par
+    /// fichier.
+    numeros: HashMap<(u32, u32), String>,
+    /// #6460 — deux titres d'album du dossier partagent un numéro de piste :
+    /// ce sont deux parutions distinctes rangées ensemble, pas une
+    /// compilation faite main (dont les numéros ne se répètent pas).
+    parutions_distinctes: bool,
+}
+
+impl PreuvesDuDossier {
+    /// Note le numéro `(disque, piste)` d'une piste de l'album `album`. Rend
+    /// `true` la seule fois où le dossier se révèle fait de parutions
+    /// distinctes. Une piste sans numéro (absent ou 0) ne prouve rien.
+    fn noter_numero(&mut self, album: &str, disque: Option<u32>, piste: Option<u32>) -> bool {
+        let album = album.trim().to_lowercase();
+        let Some(piste) = piste.filter(|n| *n > 0) else {
+            return false;
+        };
+        if self.parutions_distinctes || album.is_empty() {
+            return false;
+        }
+        let cle = (disque.filter(|d| *d > 0).unwrap_or(1), piste);
+        match self.numeros.get(&cle) {
+            Some(deja) if *deja != album => {
+                self.parutions_distinctes = true;
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.numeros.insert(cle, album);
+                false
+            }
+        }
+    }
 }
 
 /// Ce que ce scan PRÉSENTE et ce qu'il ÉCARTE.
@@ -256,6 +293,8 @@ pub fn build_track_row(
     track.bpm = meta.bpm;
     // #6123 — la note du fichier, déjà ramenée sur 0 à 5 (`metadata::note`).
     track.rating = meta.rating.map(i32::from);
+    // #6332 — le débit moyen du fichier, lu au scan et jusqu'ici jeté.
+    track.bitrate_kbps = meta.bitrate_kbps.and_then(|b| i32::try_from(b).ok());
     track.label = meta.label.clone();
     track.isrc = meta.isrc.clone();
     track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
@@ -686,6 +725,9 @@ impl TrackImporter {
                 if preuve.compilation { Some(true) } else { None },
                 preuve.artiste.clone(),
             ));
+            if p.noter_numero(&album, preuve.disque, preuve.piste) {
+                tracing::info!(dossier = %dossier, "dossier_de_parutions_distinctes");
+            }
             p.par_dossier
                 .insert((preuve.album_artist, preuve.artiste, Some(album)));
         }
@@ -802,6 +844,9 @@ impl TrackImporter {
                 continue;
             }
             if let Some(album) = meta.album.as_deref() {
+                if p.noter_numero(album, meta.disc_number, meta.track_number) {
+                    tracing::info!(dossier = %dossier(sf), "dossier_de_parutions_distinctes");
+                }
                 p.par_album.insert((
                     album.to_string(),
                     meta.album_artist.clone(),
@@ -840,6 +885,19 @@ impl TrackImporter {
                 )
             })
         }));
+        // 🔴 #6460 (Bertrand, 25/10/2026) — deux albums d'un même dossier qui
+        // ont des numéros de piste en commun sont deux parutions distinctes
+        // (« MoonDial » et un album de Lyle Mays rangés ensemble) : le verdict
+        // du dossier ne s'applique pas, chacun est jugé sur ses seules pistes
+        // et garde son artiste. Une anthologie faite main, numérotée sans
+        // doublon, reste une compilation sous le nom de son dossier.
+        for (dir, p) in &self.preuves {
+            if p.parutions_distinctes
+                && let Some(verdict) = self.folder_comp.get_mut(dir)
+            {
+                *verdict = (false, false);
+            }
+        }
 
         // 2 bis. La graphie de reference des albums ecrits de plusieurs facons.
         let mut graphies: HashMap<(String, String), Vec<&str>> = HashMap::new();
@@ -1563,6 +1621,13 @@ impl TrackImporter {
             .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME)
             .to_string();
 
+        // #3179 — ARTIST désigne la piste, ALBUMARTIST l'album. Un nom
+        // déduit du chemin n'est pas une balise et ne crée pas un invité.
+        let artiste_de_piste_tague =
+            !meta.artist_from_path && meta.artist.as_deref().is_some_and(|a| !a.trim().is_empty());
+        let meme_artiste = tune_core::db::artist_repo::cle_artiste(&album_artist_name)
+            == tune_core::db::artist_repo::cle_artiste(&track_artist_name);
+
         // L'artiste d'album neutre ne prend pas l'identifiant MusicBrainz de
         // l'artiste de la piste (fil 1881) : ce n'est pas lui.
         let album_artist_mbid = if is_compilation || artiste_d_album_neutre {
@@ -1570,7 +1635,12 @@ impl TrackImporter {
         } else {
             meta.musicbrainz_album_artist_id
                 .as_deref()
-                .or(meta.musicbrainz_artist_id.as_deref())
+                // Le MBID de l'invité ne devient pas celui de l'artiste
+                // d'album : le dépôt rapproche d'abord par MBID (#3179).
+                .or(meta
+                    .musicbrainz_artist_id
+                    .as_deref()
+                    .filter(|_| meme_artiste))
         };
         let album_artist_entry = if let Some(cached) = self.artist_cache.get(&album_artist_name) {
             Some(Arc::clone(cached))
@@ -1580,7 +1650,14 @@ impl TrackImporter {
                 .get_or_create(
                     &album_artist_name,
                     album_artist_mbid,
-                    meta.album_artist_sort.as_deref(),
+                    // #6474 — ALBUMARTISTSORT, à défaut l'ARTISTSORT de la
+                    // piste quand elle est de l'artiste de l'album.
+                    tune_core::db::artist_repo::nom_de_tri_de_l_artiste_d_album(
+                        meta.album_artist_sort.as_deref(),
+                        meta.artist_sort.as_deref(),
+                        &album_artist_name,
+                        &track_artist_name,
+                    ),
                 )
                 .ok()
                 .map(Arc::new);
@@ -1592,7 +1669,7 @@ impl TrackImporter {
         };
         let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
 
-        let track_artist = if (is_compilation || artiste_d_album_neutre)
+        let track_artist = if (is_compilation || artiste_d_album_neutre || artiste_de_piste_tague)
             && track_artist_name != album_artist_name
         {
             if let Some(cached) = self.artist_cache.get(&track_artist_name) {
@@ -1603,7 +1680,9 @@ impl TrackImporter {
                     .get_or_create(
                         &track_artist_name,
                         meta.musicbrainz_artist_id.as_deref(),
-                        None,
+                        // #6474 — ARTISTSORT nourrit le nom de tri de
+                        // l'artiste de la piste (il restait vide).
+                        meta.artist_sort.as_deref(),
                     )
                     .ok()
                     .map(Arc::new);
@@ -1715,21 +1794,38 @@ impl TrackImporter {
                 self.album_cache.insert(key.clone(), Arc::clone(&a));
                 Some(a)
             } else {
-                let result = self.album_repo.get_or_create_for_folder_with_track(
-                    &key.0,
-                    &key.1,
-                    key.2,
-                    key.3,
-                    meta.musicbrainz_release_id.as_deref(),
-                    // Le numéro de piste sert UNIQUEMENT à décider si ce
-                    // dossier est l'éclat d'une compilation déjà indexée
-                    // (#1440) : un numéro déjà pris ⇒ homonyme, pas éclat.
-                    meta.track_number.map(|n| n as i32),
-                    // Le numéro de DISQUE sert UNIQUEMENT à rattacher un dossier
-                    // `CD02` au coffret que `CD01` a ouvert (C4) : un numéro
-                    // déjà pris ⇒ seconde extraction, pas second disque.
-                    meta.disc_number.map(|n| n as i32),
-                );
+                // #6460 — un dossier de parutions distinctes : chacune a sa
+                // ligne, désignée par le dossier ET son titre.
+                let parutions_distinctes = self
+                    .preuves
+                    .get(&album_dir)
+                    .is_some_and(|p| p.parutions_distinctes);
+                let result = if parutions_distinctes {
+                    self.album_repo.get_or_create_for_folder_and_title(
+                        &key.0,
+                        &key.1,
+                        key.2,
+                        key.3,
+                        meta.musicbrainz_release_id.as_deref(),
+                    )
+                } else {
+                    self.album_repo.get_or_create_for_folder_with_track(
+                        &key.0,
+                        &key.1,
+                        key.2,
+                        key.3,
+                        meta.musicbrainz_release_id.as_deref(),
+                        // Le numéro de piste sert UNIQUEMENT à décider si ce
+                        // dossier est l'éclat d'une compilation déjà indexée
+                        // (#1440) : un numéro déjà pris ⇒ homonyme, pas éclat.
+                        meta.track_number.map(|n| n as i32),
+                        // Le numéro de DISQUE sert UNIQUEMENT à rattacher un
+                        // dossier `CD02` au coffret que `CD01` a ouvert (C4) :
+                        // un numéro déjà pris ⇒ seconde extraction, pas second
+                        // disque.
+                        meta.disc_number.map(|n| n as i32),
+                    )
+                };
                 if let Err(ref e) = result {
                     tracing::warn!(
                         album = %key.1,
@@ -2412,6 +2508,7 @@ mod tests {
             year: Some(1959),
             bpm: Some(136.0),
             rating: Some(4),
+            bitrate_kbps: Some(1_411),
             label: Some("Columbia".into()),
             isrc: Some("USSM15900001".into()),
             musicbrainz_recording_id: Some("rec-1".into()),
@@ -2457,6 +2554,11 @@ mod tests {
             track.rating,
             Some(4),
             "la note des balises n'atteint pas la ligne (#6123)"
+        );
+        assert_eq!(
+            track.bitrate_kbps,
+            Some(1_411),
+            "le débit lu au scan n'atteint pas la ligne (#6332)"
         );
         assert_eq!(track.isrc.as_deref(), Some("USSM15900001"));
         assert_eq!(track.comments.as_deref(), Some("remaster"));
@@ -3440,8 +3542,8 @@ mod tests {
             );
         }
 
-        // TÉMOIN — un VRAI artiste d'album et `COMPILATION=0` : inchangé,
-        // l'artiste d'album fait l'album et ses pistes.
+        // #3179 — un VRAI artiste d'album et `COMPILATION=0` :
+        // ALBUMARTIST garde l'album, chaque ARTIST garde sa piste.
         let rendu = importer_avec_artiste_de_piste(
             &trois("Coffret Reiner", "Fritz Reiner", Some(false)),
             &racine.join("cache-reiner"),
@@ -3449,7 +3551,7 @@ mod tests {
         for (chemin, (aa, compilation, artiste, _)) in &rendu {
             assert_eq!(
                 (aa.as_str(), *compilation, artiste.as_str()),
-                ("Fritz Reiner", false, "Fritz Reiner"),
+                ("Fritz Reiner", false, artiste_attendu(chemin)),
                 "témoin artiste d'album réel ({chemin})"
             );
         }
@@ -3955,3 +4057,15 @@ mod pochettes_bornees_tests_5202;
 #[cfg(test)]
 #[path = "scan_import_majorite_tests_5454.rs"]
 mod majorite_tests_5454;
+
+#[cfg(test)]
+#[path = "scan_import_nom_de_tri_tests_6474.rs"]
+mod nom_de_tri_tests_6474;
+
+#[cfg(test)]
+#[path = "scan_import_moondial_tests_6460.rs"]
+mod moondial_tests_6460;
+
+#[cfg(test)]
+#[path = "scan_import_artistes_piste_tests_3179.rs"]
+mod artistes_piste_tests_3179;

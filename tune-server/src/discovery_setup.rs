@@ -20,6 +20,14 @@ use crate::state::AppState;
 #[path = "discovery_media_server_tests_3786.rs"]
 mod media_server_tests_3786;
 
+#[cfg(test)]
+#[path = "renderer_allume_avant_le_serveur_tests_6961.rs"]
+mod renderer_allume_avant_le_serveur_tests_6961;
+
+#[cfg(all(test, feature = "oaat"))]
+#[path = "deux_pi_verox_oaat_airplay_tests_6947.rs"]
+mod deux_pi_verox_oaat_airplay_tests_6947;
+
 /// Resolve a UPnP service `controlURL` (from the device description) into an
 /// absolute URL usable by the SOAP client.
 ///
@@ -131,6 +139,15 @@ fn register_discovered_output(
     annonce: AnnonceAppareil,
 ) {
     registry.register(output);
+    annoncer_sortie_mdns(event_bus, dev, device_type, annonce);
+}
+
+fn annoncer_sortie_mdns(
+    event_bus: &EventBus,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+    device_type: &str,
+    annonce: AnnonceAppareil,
+) {
     let charge = serde_json::json!({
         "device_id": &dev.id,
         "name": &dev.name,
@@ -881,6 +898,8 @@ async fn handle_ssdp_discovered(
                 urls_evenements_dlna(&dev.host, dev.port, &evt_urls),
             )
             .with_upnp_silence(crate::config::resolve_upnp_silence(db, &dev.id))
+            // #5575 — reconnaître un volume décoratif.
+            .with_modele(dev.model.clone())
             .with_rendering_control_scpd(scpd_rendering_control(dev))
             .with_av_transport_scpd(scpd_av_transport(dev));
             let mut reg = outputs.lock().await;
@@ -990,7 +1009,14 @@ async fn handle_ssdp_discovered(
         // zones meant the toggle was set on a zone that was never the one
         // playing, so Tidal FLAC kept being transcoded to WAV).
         seen_hosts.insert(dev.host.clone());
-        let _ = zone_repo.update_device_id(existing_zone_id, &dev.id);
+        let _ = zone_repo.changer_d_appareil(
+            existing_zone_id,
+            &dev.id,
+            tune_core::audio::reglages_de_volume::Rattachement::SansPreuve {
+                origine: "ssdp_reconnexion_par_adresse",
+                mac: dev.mac_address.as_deref(),
+            },
+        );
         let _ = zone_repo.set_host(existing_zone_id, &dev.host);
         set_zone_online(event_bus, db, &dev.id, true);
         let vol = zone_repo
@@ -1046,7 +1072,14 @@ async fn handle_ssdp_discovered(
         // Place APRES les deux barreaux existants : il ne prend jamais la
         // place d'un rattrapage qui fonctionne deja.
         seen_hosts.insert(dev.host.clone());
-        let _ = zone_repo.update_device_id(zid, &dev.id);
+        let _ = zone_repo.changer_d_appareil(
+            zid,
+            &dev.id,
+            tune_core::audio::reglages_de_volume::Rattachement::SansPreuve {
+                origine: "ssdp_reancrage_par_mac",
+                mac: dev.mac_address.as_deref(),
+            },
+        );
         let _ = zone_repo.set_identity(zid, &dev.host, dev.mac_address.as_deref());
         // Une zone SUPPRIMEE se re-ancre sans se demasquer : la suppression
         // reste une suppression, et `is_device_hidden` redevient operant des le
@@ -1217,6 +1250,70 @@ async fn handle_ssdp_discovered(
 /// les suivants, le démarrage sondait un par un.
 const SONDE_RENDERER_BORNE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// #6961 — où envoyer le `M-SEARCH` unicast de recours, et combien de temps
+/// attendre sa réponse. Injectable pour qu'un banc tienne un faux répondeur
+/// sans privilège sur le port 1900.
+#[derive(Debug, Clone, Copy)]
+struct RecoursUnicast {
+    port_ssdp: u16,
+    budget: std::time::Duration,
+}
+
+impl RecoursUnicast {
+    const PRODUCTION: Self = Self {
+        port_ssdp: tune_core::discovery::redecouverte::PORT_SSDP,
+        budget: tune_core::discovery::redecouverte::BUDGET_REPONSE,
+    };
+}
+
+async fn sonder_a(
+    device_id: &str,
+    location: &str,
+    borne: std::time::Duration,
+) -> Option<tune_core::discovery::device::DiscoveredDevice> {
+    tokio::time::timeout(
+        borne,
+        tune_core::discovery::ssdp::probe_renderer(device_id, location),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+/// #6961 — la `LOCATION` mémorisée ne répond plus : on demande à l'appareil,
+/// par un `M-SEARCH` unicast filtré sur son UDN, où il est désormais, et on
+/// sonde cette nouvelle adresse.
+///
+/// C'est le cas du NanoPlayer de Silviu : allumé avant le serveur, il ne
+/// s'annonce plus, et le port tiré à son redémarrage n'est plus celui du
+/// magasin. Sans ce recours, sa zone restait hors ligne jusqu'à ce qu'on
+/// redémarre l'appareil — seul geste qui lui faisait émettre un `NOTIFY`.
+async fn retrouver_par_unicast(
+    kr: &KnownRenderer,
+    borne: std::time::Duration,
+    recours: RecoursUnicast,
+) -> Option<tune_core::discovery::device::DiscoveredDevice> {
+    let nouvelle = tune_core::discovery::redecouverte::location_actuelle_par_unicast(
+        &kr.location,
+        recours.port_ssdp,
+        &kr.device_id,
+        recours.budget,
+    )
+    .await?;
+    if nouvelle == kr.location {
+        return None;
+    }
+    let dev = sonder_a(&kr.device_id, &nouvelle, borne).await?;
+    info!(
+        id = %kr.device_id,
+        name = %kr.name,
+        ancienne = %kr.location,
+        nouvelle = %nouvelle,
+        "known_renderer_retrouve_par_msearch_unicast"
+    );
+    Some(dev)
+}
+
 /// Sonde tous les renderers connus EN MÊME TEMPS, chacun borné, et rend les
 /// résultats dans l'ordre reçu — l'appelant applique ensuite séquentiellement.
 /// La durée totale est celle de la sonde la plus lente, plus la borne au pire,
@@ -1224,18 +1321,16 @@ const SONDE_RENDERER_BORNE: std::time::Duration = std::time::Duration::from_secs
 async fn sonder_les_renderers_en_parallele(
     renderers: Vec<KnownRenderer>,
     borne: std::time::Duration,
+    recours: RecoursUnicast,
 ) -> Vec<(
     KnownRenderer,
     Option<tune_core::discovery::device::DiscoveredDevice>,
 )> {
     futures_util::future::join_all(renderers.into_iter().map(|kr| async move {
-        let sonde = tokio::time::timeout(
-            borne,
-            tune_core::discovery::ssdp::probe_renderer(&kr.device_id, &kr.location),
-        )
-        .await
-        .ok()
-        .flatten();
+        let sonde = match sonder_a(&kr.device_id, &kr.location, borne).await {
+            Some(dev) => Some(dev),
+            None => retrouver_par_unicast(&kr, borne, recours).await,
+        };
         (kr, sonde)
     }))
     .await
@@ -1255,7 +1350,14 @@ async fn sonder_les_renderers_en_parallele(
 /// so we skip it and let live discovery handle the newcomer. Best-effort per
 /// device; failures are logged and never block boot. Mirrors
 /// `routes::devices::reregister_manual_devices`.
+///
+/// #6961 — quand la `LOCATION` mémorisée ne répond plus, un `M-SEARCH`
+/// unicast vers son hôte demande la nouvelle (voir [`retrouver_par_unicast`]).
 pub async fn reregister_known_renderers(state: &AppState) {
+    reregister_known_renderers_avec(state, RecoursUnicast::PRODUCTION).await;
+}
+
+async fn reregister_known_renderers_avec(state: &AppState, recours: RecoursUnicast) {
     let stored = load_known_renderers(&state.backend);
     if stored.is_empty() {
         return;
@@ -1317,7 +1419,7 @@ pub async fn reregister_known_renderers(state: &AppState) {
     // enregistrement, déduplicat par hôte) reste séquentielle et
     // déterministe : deux registres de renderers persistés coexistent, avec
     // des verdicts d'identité qui ne doivent pas courir l'un contre l'autre.
-    let sondes = sonder_les_renderers_en_parallele(renderers, SONDE_RENDERER_BORNE).await;
+    let sondes = sonder_les_renderers_en_parallele(renderers, SONDE_RENDERER_BORNE, recours).await;
     for (kr, sonde) in sondes {
         match sonde {
             Some(dev) => {
@@ -1340,7 +1442,9 @@ pub async fn reregister_known_renderers(state: &AppState) {
                     manufacturer: dev.manufacturer.as_deref().unwrap_or_default(),
                     model_name: dev.model.as_deref().unwrap_or_default(),
                 };
-                // Précondition : `probe_renderer` a lu `kr.location` mot pour mot.
+                // Précondition : `probe_renderer` a lu `kr.location` mot pour mot,
+                // ou la `LOCATION` que l'appareil a lui-même rendue à un
+                // M-SEARCH filtré sur cet UDN (#6961) — la même identité.
                 let verdict = compare_at_same_location(kr.identity(), observed);
                 match verdict {
                     IdentityVerdict::NoDisagreement | IdentityVerdict::SameHardware(_) => {
@@ -1561,12 +1665,32 @@ pub fn spawn_mdns_handler(
                                     // v2 zone if daemon absent").
                                     airplay_v2_fallback = true;
                                 }
+                                // Un appareil AirPlay 2, ou dont le mDNS (bits
+                                // `features`/`sf`) exige l'appairage, servi par le
+                                // chemin AirPlay 1 qui n'en fait aucun : son 403
+                                // dira l'appairage manquant, pas « un autre
+                                // émetteur » (Xiaomi Sound 2 Max sous Windows).
+                                let appairage_requis = is_v2
+                                    || dev
+                                        .capabilities
+                                        .get("airplay_requires_pairing")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                if appairage_requis {
+                                    warn!(
+                                        name = %dev.name,
+                                        airplay_version = dev.airplay_version.as_deref().unwrap_or("?"),
+                                        daemon = tune_core::outputs::airplay2::daemon_available(),
+                                        "airplay_appairage_requis_servi_en_airplay1"
+                                    );
+                                }
                                 let ap = tune_core::outputs::airplay::AirplayOutput::new(
                                     dev.name.clone(),
                                     dev.id.clone(),
                                     dev.host.clone(),
                                     dev.port,
-                                );
+                                )
+                                .avec_appairage_airplay2_requis(appairage_requis);
                                 (Some(Box::new(ap)), "airplay")
                             }
                         }
@@ -1586,6 +1710,11 @@ pub fn spawn_mdns_handler(
                                 dev.host.clone(),
                                 dev.port,
                                 dev.id.clone(),
+                            )
+                            .avec_volume_annonce(
+                                dev.capabilities
+                                    .get("oaat_volume_type")
+                                    .and_then(|v| v.as_str()),
                             );
                             (Some(Box::new(oaat)), "oaat")
                         }
@@ -1657,330 +1786,18 @@ pub fn spawn_mdns_handler(
                     };
 
                     if let Some(output) = output {
-                        let mut reg = outputs.lock().await;
-                        register_discovered_output(
-                            &mut reg,
-                            output,
+                        enregistrer_la_sortie_mdns_et_sa_zone(
+                            &outputs,
+                            &db,
                             &event_bus,
+                            &playback,
                             &dev,
+                            output,
                             output_type_str,
+                            airplay_v2_fallback,
                             annonce,
-                        );
-                        info!(name = %dev.name, host = %dev.host, port = dev.port, r#type = output_type_str, "mdns_output_registered");
-
-                        let zone_repo =
-                            tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
-                        // Honour a user deletion: deleting a zone soft-hides it
-                        // (is_hidden=1). The SSDP handler already skips hidden
-                        // devices; the mDNS handler did not, so an AirPlay/
-                        // Chromecast/BluOS device (e.g. Fabien's Beosound Stage)
-                        // was reconnected — or, with no device_id match, re-created
-                        // via auto_create — at startup, resurrecting the deleted
-                        // zone even with "create zones automatically" OFF. Skip the
-                        // whole reconnect/create block for hidden devices.
-                        if zone_repo.is_device_hidden(&dev.id) {
-                            info!(name = %dev.name, id = %dev.id, "mdns_zone_hidden_skipping");
-                        } else if let Some((zid, was_hidden)) =
-                            legacy_zone_to_reanchor(&zone_repo, &dev)
-                        {
-                            // Zone creee AVANT #1528, donc enregistree sous
-                            // l'ancien identifiant derive de l'adresse. On la
-                            // re-ancre sur le nouvel identifiant durable — c'est
-                            // ce qui remplace la migration SQL, qui n'aurait pas
-                            // pu calculer ces identifiants (ils ne sont connus
-                            // qu'a la decouverte) et aurait fait perdre toutes
-                            // les zones d'un coup.
-                            //
-                            // Une zone supprimee reste supprimee : on deplace
-                            // son identifiant sans la remettre en ligne, sinon
-                            // la mise a jour ressusciterait ce que
-                            // l'utilisateur avait efface.
-                            let _ = zone_repo.update_output_device(zid, &dev.id);
-                            if !was_hidden {
-                                set_zone_online(&event_bus, &db, &dev.id, true);
-                            }
-                            info!(
-                                name = %dev.name,
-                                id = %dev.id,
-                                zone_id = zid,
-                                hidden = was_hidden,
-                                "mdns_zone_reanchored_from_legacy_id"
-                            );
-                        } else if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
-                            set_zone_online(&event_bus, &db, &dev.id, true);
-                            if let Some(zone_id) = zone.id {
-                                let vol = zone.volume / 100.0;
-                                playback.set_volume(zone_id, vol).await;
-                            }
-                            info!(name = %dev.name, id = %dev.id, "mdns_zone_reconnected");
-                            event_bus.emit(
-                                "device.reconnected",
-                                serde_json::json!({
-                                    "device_id": &dev.id,
-                                    "name": &dev.name,
-                                }),
-                            );
-                        } else if airplay_v2_fallback {
-                            // No existing zone for this device and the legacy
-                            // AirPlay fallback can never play on it (v2 pairing
-                            // required → ANNOUNCE 403): don't auto-create a
-                            // guaranteed-dead zone, and don't let it capture an
-                            // existing same-name/same-host zone of another
-                            // protocol either (forum #1183).
-                            info!(name = %dev.name, id = %dev.id, "mdns_zone_skipped_airplay_v2_fallback");
-                        } else {
-                            let existing = zone_repo.list().unwrap_or_default();
-
-                            // When a higher-priority protocol discovers a device at the
-                            // same host as an existing zone (e.g. BluOS vs AirPlay for a
-                            // Bluesound Node), upgrade the zone to the better protocol
-                            // instead of creating a duplicate.
-                            let upgrade_zone = existing.iter().find(|z| {
-                                if let Some(ref old_dev_id) = z.output_device_id {
-                                    // Match by host: device IDs are formatted as
-                                    // "{type}-{host}-{port}", extract the host part
-                                    // from the existing zone's device_id.
-                                    let old_host = old_dev_id.splitn(3, '-').nth(1).unwrap_or("");
-                                    let is_same_host = old_host == dev.host;
-                                    if !is_same_host {
-                                        return false;
-                                    }
-                                    // Only upgrade if new protocol has higher priority
-                                    let old_prio = match z.output_type.as_deref() {
-                                        Some("oaat") => OutputType::Oaat.priority(),
-                                        Some("openhome") => OutputType::Openhome.priority(),
-                                        Some("bluos") => OutputType::Bluos.priority(),
-                                        Some("squeezebox") => OutputType::Squeezebox.priority(),
-                                        Some("dlna") => OutputType::Dlna.priority(),
-                                        Some("chromecast") => OutputType::Chromecast.priority(),
-                                        Some("airplay") => OutputType::Airplay.priority(),
-                                        _ => 0,
-                                    };
-                                    dev.device_type.priority() > old_prio
-                                } else {
-                                    false
-                                }
-                            });
-
-                            if let Some(z) = upgrade_zone
-                                && let Some(zid) = z.id
-                            {
-                                // Remove the old lower-priority output
-                                if let Some(ref old_dev_id) = z.output_device_id {
-                                    reg.remove(old_dev_id);
-                                }
-                                let _ = zone_repo.update_output_device(zid, &dev.id);
-                                let _ = zone_repo.update_output_type(zid, output_type_str);
-                                set_zone_online(&event_bus, &db, &dev.id, true);
-                                info!(
-                                    name = %dev.name,
-                                    id = %dev.id,
-                                    old_id = ?z.output_device_id,
-                                    old_type = ?z.output_type,
-                                    new_type = output_type_str,
-                                    "mdns_zone_upgraded_to_higher_priority"
-                                );
-                            } else {
-                                // Check if a zone with the same name exists but different
-                                // device_id (device_id may have changed after a firmware
-                                // update / re-pairing).
-                                let same_name_zone = existing.iter().find(|z| z.name == dev.name);
-                                // #4520 — la sortie que la zone quitte est-elle
-                                // encore EN SERVICE ? Un Endpoint OAAT qui
-                                // redemarre s'annonce sous un nouvel identifiant,
-                                // au meme hote : re-ancrer en pleine lecture
-                                // laissait le sondeur surveiller la nouvelle
-                                // sortie, inactive, et couper la bonne.
-                                let ancienne_en_service = match same_name_zone
-                                    .and_then(|z| z.output_device_id.as_deref())
-                                {
-                                    Some(ancien) if ancien != dev.id => {
-                                        let etat = match reg.get(ancien) {
-                                            // Verrou tenu = sortie occupee par
-                                            // l'orchestrateur : en service.
-                                            Some(sortie) => match sortie.try_lock() {
-                                                Ok(s) => Some(
-                                                    s.get_status().await.map(|st| st.state).ok(),
-                                                ),
-                                                Err(_) => Some(None),
-                                            },
-                                            None => None,
-                                        };
-                                        reancrage_a_differer(
-                                            reg.type_of(ancien).as_deref(),
-                                            reg.host_of(ancien).as_deref(),
-                                            output_type_str,
-                                            &dev.host,
-                                            etat,
-                                        )
-                                    }
-                                    _ => false,
-                                };
-                                if ancienne_en_service {
-                                    info!(
-                                        name = %dev.name,
-                                        id = %dev.id,
-                                        old_id = ?same_name_zone.and_then(|z| z.output_device_id.clone()),
-                                        "mdns_zone_device_update_deferred_while_in_use"
-                                    );
-                                } else if let Some(z) = same_name_zone
-                                    && let Some(zid) = z.id
-                                {
-                                    let _ = zone_repo.update_output_device(zid, &dev.id);
-                                    let _ = zone_repo.update_output_type(zid, output_type_str);
-                                    set_zone_online(&event_bus, &db, &dev.id, true);
-                                    info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
-                                } else if let Some(zid) =
-                                    zone_repo.find_hidden_id_by_name(&dev.name)
-                                {
-                                    // Une zone SUPPRIMEE portant ce nom. Le
-                                    // garde-fou `is_device_hidden` en haut de
-                                    // ce bloc ne l'a pas vue : il teste le
-                                    // nouvel identifiant, la ligne masquee
-                                    // porte l'ancien. Et le rattrapage par nom
-                                    // juste au-dessus ne pouvait pas la voir non
-                                    // plus — `list()` filtre les masquees.
-                                    // Sans ce cas, la zone renaissait a neuf a
-                                    // chaque changement d'adresse (#1528).
-                                    //
-                                    // On la re-ancre sur le nouvel identifiant
-                                    // SANS la demasquer : la suppression reste
-                                    // une suppression, et le garde-fou redevient
-                                    // operant des le tour suivant.
-                                    let _ = zone_repo.update_output_device(zid, &dev.id);
-                                    info!(name = %dev.name, id = %dev.id, zone_id = zid, "mdns_hidden_zone_reanchored");
-                                } else if let Some((zid, masquee)) = zone_reseau_a_reancrer_par_mac(
-                                    &zone_repo,
-                                    &dev,
-                                    output_type_str,
-                                ) {
-                                    // #3919 — les trois filets par NOM viennent
-                                    // d'echouer ensemble : la zone a ete
-                                    // renommee. Sans ce quatrieme, le flux
-                                    // tombe dans `auto_create` et laisse les
-                                    // reglages sur une ligne orpheline. La MAC,
-                                    // elle, n'a pas bouge.
-                                    //
-                                    // Une zone SUPPRIMEE se re-ancre sans se
-                                    // demasquer, comme au-dessus : la
-                                    // suppression reste une suppression, et le
-                                    // garde-fou `is_device_hidden` redevient
-                                    // operant des le tour suivant.
-                                    let _ = zone_repo.update_output_device(zid, &dev.id);
-                                    let _ = zone_repo.set_identity(
-                                        zid,
-                                        &dev.host,
-                                        dev.mac_address.as_deref(),
-                                    );
-                                    if !masquee {
-                                        set_zone_online(&event_bus, &db, &dev.id, true);
-                                    }
-                                    info!(
-                                        name = %dev.name,
-                                        id = %dev.id,
-                                        zone_id = zid,
-                                        hidden = masquee,
-                                        mac = ?dev.mac_address,
-                                        "mdns_zone_reancree_par_mac"
-                                    );
-                                } else {
-                                    // Cross-protocol dedup (forum #1183): the
-                                    // same physical device may already be a
-                                    // zone through another protocol — e.g. a
-                                    // Samsung S95BA TV present as a (renamed)
-                                    // DLNA zone that also announces AirPlay
-                                    // over mDNS. Match against the output
-                                    // registry (same name + same host across
-                                    // protocols) AND against existing zones by
-                                    // the REAL host of their registered output
-                                    // (`host_of`, robust for DLNA `uuid:…`
-                                    // device_ids the old "{type}-{host}-{port}"
-                                    // parsing mangled) or by case-insensitive
-                                    // name. Skip zone creation on conflict.
-                                    let registry_conflicts = reg.conflicting_outputs_same_host(
-                                        &dev.name,
-                                        output_type_str,
-                                        &dev.host,
-                                    );
-                                    let zone_conflict = physical_zone_conflict(
-                                        &zone_repo,
-                                        &existing,
-                                        |id| reg.host_of(id),
-                                        &dev.name,
-                                        &dev.host,
-                                        dev.mac_address.as_deref(),
-                                        output_type_str,
-                                    );
-                                    if !registry_conflicts.is_empty() || zone_conflict.is_some() {
-                                        info!(
-                                            name = %dev.name,
-                                            id = %dev.id,
-                                            host = %dev.host,
-                                            r#type = output_type_str,
-                                            registry_conflicts = ?registry_conflicts,
-                                            conflicting_zone = ?zone_conflict,
-                                            "mdns_zone_skipped_conflicting_protocol"
-                                        );
-                                    } else {
-                                        // Check zone_auto_create setting (#3529 :
-                                        // lecture unique, portée par `ZoneRepo`).
-                                        let auto_create = zone_repo.zone_auto_create_autorise();
-                                        if !auto_create {
-                                            info!(name = %dev.name, id = %dev.id, "mdns_zone_auto_create_disabled_skipping");
-                                        } else {
-                                            // Auto-created zones start dormant; the
-                                            // free-tier cap is enforced at first play.
-                                            {
-                                                match zone_repo.get_or_create(
-                                                    &dev.name,
-                                                    Some(output_type_str),
-                                                    &dev.id,
-                                                ) {
-                                                    Ok((zid, true)) => {
-                                                        // Persist the physical identity so later
-                                                        // discoveries of the SAME device under
-                                                        // another protocol/UUID find this zone.
-                                                        let _ = zone_repo.set_identity(
-                                                            zid,
-                                                            &dev.host,
-                                                            dev.mac_address.as_deref(),
-                                                        );
-                                                        event_bus.emit_typed(
-                                                            EventType::ZoneCreated,
-                                                            charge_utile_zone_creee(
-                                                                &zone_repo,
-                                                                zid,
-                                                                serde_json::json!({
-                                                                    "zone_id": zid,
-                                                                    "name": dev.name,
-                                                                    "device_id": dev.id,
-                                                                    "type": output_type_str,
-                                                                }),
-                                                            ),
-                                                        );
-                                                        info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
-                                                    }
-                                                    Ok((zid, false)) => {
-                                                        let _ = zone_repo.set_identity(
-                                                            zid,
-                                                            &dev.host,
-                                                            dev.mac_address.as_deref(),
-                                                        );
-                                                        set_zone_online(
-                                                            &event_bus, &db, &dev.id, true,
-                                                        );
-                                                        info!(name = %dev.name, zone_id = zid, "mdns_zone_already_existed");
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(name = %dev.name, device = %dev.id, error = %e, "mdns_zone_create_failed");
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        )
+                        .await;
                     }
                 }
                 MdnsEvent::DeviceLost(id) => {
@@ -2011,6 +1828,434 @@ pub fn spawn_mdns_handler(
     }
 
     handle
+}
+
+/// Enregistre la sortie d'un appareil annoncé par mDNS, puis rattache ou crée
+/// sa zone : reconnexion, montée de priorité, ré-ancrages, dédoublonnage entre
+/// protocoles et création automatique.
+///
+/// Sorti de la boucle de `spawn_mdns_handler` pour qu'un banc puisse rejouer
+/// une suite d'annonces sur une vraie base, sans réseau (#6947).
+#[allow(clippy::too_many_arguments)]
+async fn enregistrer_la_sortie_mdns_et_sa_zone(
+    outputs: &Arc<tokio::sync::Mutex<OutputRegistry>>,
+    db: &Arc<dyn DbBackend>,
+    event_bus: &Arc<EventBus>,
+    playback: &Arc<tune_core::playback::PlaybackManager>,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+    output: Box<dyn tune_core::outputs::OutputTarget>,
+    output_type_str: &str,
+    airplay_v2_fallback: bool,
+    annonce: AnnonceAppareil,
+) {
+    use tune_core::discovery::device::OutputType;
+    // Le TXT de volume peut changer sans nouvelle connexion. Actualiser la
+    // sortie OAAT existante conserve sa tâche et ses commandes en vol.
+    #[cfg(feature = "oaat")]
+    let conservee = if dev.device_type == OutputType::Oaat {
+        let existante = { outputs.lock().await.get(&dev.id) };
+        if let Some(ref sortie) = existante {
+            let sortie = sortie.lock().await;
+            if let Some(oaat) = sortie
+                .as_any()
+                .downcast_ref::<tune_core::outputs::oaat::OaatOutput>()
+            {
+                if oaat.a_la_meme_adresse(&dev.host, dev.port) && sortie.name() == dev.name {
+                    oaat.actualiser_volume_annonce(
+                        dev.capabilities
+                            .get("oaat_volume_type")
+                            .and_then(|v| v.as_str()),
+                    );
+                    drop(sortie);
+                    existante.clone()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut reg = outputs.lock().await;
+    #[cfg(feature = "oaat")]
+    let conserver = conservee.as_ref().is_some_and(|ancienne| {
+        reg.get(&dev.id)
+            .is_some_and(|actuelle| Arc::ptr_eq(ancienne, &actuelle))
+    });
+    #[cfg(not(feature = "oaat"))]
+    let conserver = false;
+    if conserver {
+        annoncer_sortie_mdns(event_bus, dev, output_type_str, annonce);
+    } else {
+        register_discovered_output(&mut reg, output, event_bus, dev, output_type_str, annonce);
+    }
+    info!(name = %dev.name, host = %dev.host, port = dev.port, r#type = output_type_str, "mdns_output_registered");
+
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
+    // Honour a user deletion: deleting a zone soft-hides it
+    // (is_hidden=1). The SSDP handler already skips hidden
+    // devices; the mDNS handler did not, so an AirPlay/
+    // Chromecast/BluOS device (e.g. Fabien's Beosound Stage)
+    // was reconnected — or, with no device_id match, re-created
+    // via auto_create — at startup, resurrecting the deleted
+    // zone even with "create zones automatically" OFF. Skip the
+    // whole reconnect/create block for hidden devices.
+    if zone_repo.is_device_hidden(&dev.id) {
+        info!(name = %dev.name, id = %dev.id, "mdns_zone_hidden_skipping");
+    } else if let Some((zid, was_hidden)) = legacy_zone_to_reanchor(&zone_repo, dev) {
+        // Zone creee AVANT #1528, donc enregistree sous
+        // l'ancien identifiant derive de l'adresse. On la
+        // re-ancre sur le nouvel identifiant durable — c'est
+        // ce qui remplace la migration SQL, qui n'aurait pas
+        // pu calculer ces identifiants (ils ne sont connus
+        // qu'a la decouverte) et aurait fait perdre toutes
+        // les zones d'un coup.
+        //
+        // Une zone supprimee reste supprimee : on deplace
+        // son identifiant sans la remettre en ligne, sinon
+        // la mise a jour ressusciterait ce que
+        // l'utilisateur avait efface.
+        let _ = zone_repo.changer_d_appareil(
+            zid,
+            &dev.id,
+            tune_core::audio::reglages_de_volume::Rattachement::SansPreuve {
+                origine: "mdns_reancrage_identifiant_herite",
+                mac: dev.mac_address.as_deref(),
+            },
+        );
+        if !was_hidden {
+            set_zone_online(event_bus, db, &dev.id, true);
+        }
+        info!(
+            name = %dev.name,
+            id = %dev.id,
+            zone_id = zid,
+            hidden = was_hidden,
+            "mdns_zone_reanchored_from_legacy_id"
+        );
+    } else if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
+        set_zone_online(event_bus, db, &dev.id, true);
+        if let Some(zone_id) = zone.id {
+            let vol = zone.volume / 100.0;
+            playback.set_volume(zone_id, vol).await;
+        }
+        info!(name = %dev.name, id = %dev.id, "mdns_zone_reconnected");
+        event_bus.emit(
+            "device.reconnected",
+            serde_json::json!({
+                "device_id": &dev.id,
+                "name": &dev.name,
+            }),
+        );
+    } else if airplay_v2_fallback {
+        // No existing zone for this device and the legacy
+        // AirPlay fallback can never play on it (v2 pairing
+        // required → ANNOUNCE 403): don't auto-create a
+        // guaranteed-dead zone, and don't let it capture an
+        // existing same-name/same-host zone of another
+        // protocol either (forum #1183).
+        info!(name = %dev.name, id = %dev.id, "mdns_zone_skipped_airplay_v2_fallback");
+    } else {
+        let existing = zone_repo.list().unwrap_or_default();
+
+        // When a higher-priority protocol discovers a device at the
+        // same host as an existing zone (e.g. BluOS vs AirPlay for a
+        // Bluesound Node), upgrade the zone to the better protocol
+        // instead of creating a duplicate.
+        let upgrade_zone =
+            zone_a_monter_en_priorite(&existing, |id| reg.host_of(id), &dev.host, dev.device_type);
+        // #6393 — la montée vers OAAT que permet désormais
+        // l'hôte du registre ne coupe pas une lecture en
+        // cours : elle attend une annonce suivante.
+        let montee_reportee = match upgrade_zone.and_then(|z| z.id) {
+            Some(zid) if dev.device_type == OutputType::Oaat => {
+                playback.get_state(zid).await.state == tune_core::playback::PlayState::Playing
+            }
+            _ => false,
+        };
+        if montee_reportee {
+            info!(
+                name = %dev.name,
+                id = %dev.id,
+                zone = ?upgrade_zone.map(|z| z.name.as_str()),
+                "mdns_montee_de_priorite_reportee_zone_en_lecture"
+            );
+        }
+        let upgrade_zone = upgrade_zone.filter(|_| !montee_reportee);
+
+        if let Some(z) = upgrade_zone
+            && let Some(zid) = z.id
+        {
+            // Remove the old lower-priority output
+            if let Some(ref old_dev_id) = z.output_device_id {
+                reg.remove(old_dev_id);
+            }
+            let _ = zone_repo.changer_d_appareil(
+                zid,
+                &dev.id,
+                tune_core::audio::reglages_de_volume::Rattachement::SansPreuve {
+                    origine: "mdns_montee_de_priorite",
+                    mac: dev.mac_address.as_deref(),
+                },
+            );
+            let _ = zone_repo.update_output_type(zid, output_type_str);
+            set_zone_online(event_bus, db, &dev.id, true);
+            info!(
+                name = %dev.name,
+                id = %dev.id,
+                old_id = ?z.output_device_id,
+                old_type = ?z.output_type,
+                new_type = output_type_str,
+                "mdns_zone_upgraded_to_higher_priority"
+            );
+        } else {
+            // Check if a zone with the same name exists but different
+            // device_id (device_id may have changed after a firmware
+            // update / re-pairing).
+            //
+            // #6947 — une zone OAAT n'est pas « la même » qu'un
+            // récepteur AirPlay du même nom, ni l'inverse : chacun
+            // garde la sienne.
+            let same_name_zone = existing.iter().find(|z| {
+                z.name == dev.name
+                    && !oaat_et_airplay_sont_deux_sorties(
+                        z.output_type.as_deref().unwrap_or(""),
+                        output_type_str,
+                    )
+            });
+            // #4520 — la sortie que la zone quitte est-elle
+            // encore EN SERVICE ? Un Endpoint OAAT qui
+            // redemarre s'annonce sous un nouvel identifiant,
+            // au meme hote : re-ancrer en pleine lecture
+            // laissait le sondeur surveiller la nouvelle
+            // sortie, inactive, et couper la bonne.
+            let ancienne_en_service =
+                match same_name_zone.and_then(|z| z.output_device_id.as_deref()) {
+                    Some(ancien) if ancien != dev.id => {
+                        let etat = match reg.get(ancien) {
+                            // Verrou tenu = sortie occupee par
+                            // l'orchestrateur : en service.
+                            Some(sortie) => match sortie.try_lock() {
+                                Ok(s) => Some(s.get_status().await.map(|st| st.state).ok()),
+                                Err(_) => Some(None),
+                            },
+                            None => None,
+                        };
+                        reancrage_a_differer(
+                            reg.type_of(ancien).as_deref(),
+                            reg.host_of(ancien).as_deref(),
+                            output_type_str,
+                            &dev.host,
+                            etat,
+                        )
+                    }
+                    _ => false,
+                };
+            // #6947 — une zone montée vers un protocole
+            // préféré ne redescend pas parce qu'une
+            // annonce moins bonne porte son nom.
+            let retrogradation = same_name_zone.is_some_and(|z| {
+                let ancienne_enregistree = z
+                    .output_device_id
+                    .as_deref()
+                    .is_some_and(|a| a != dev.id && reg.type_of(a).is_some());
+                retrogradation_par_meme_nom(
+                    z.output_type.as_deref(),
+                    ancienne_enregistree,
+                    dev.device_type,
+                )
+            });
+            if ancienne_en_service {
+                info!(
+                    name = %dev.name,
+                    id = %dev.id,
+                    old_id = ?same_name_zone.and_then(|z| z.output_device_id.clone()),
+                    "mdns_zone_device_update_deferred_while_in_use"
+                );
+            } else if retrogradation {
+                info!(
+                    name = %dev.name,
+                    id = %dev.id,
+                    old_id = ?same_name_zone.and_then(|z| z.output_device_id.clone()),
+                    old_type = ?same_name_zone.and_then(|z| z.output_type.clone()),
+                    new_type = output_type_str,
+                    "mdns_zone_meme_nom_retrogradation_refusee"
+                );
+            } else if let Some(z) = same_name_zone
+                && let Some(zid) = z.id
+            {
+                let _ = zone_repo.changer_d_appareil(
+                    zid,
+                    &dev.id,
+                    tune_core::audio::reglages_de_volume::Rattachement::SansPreuve {
+                        origine: "mdns_meme_nom",
+                        mac: dev.mac_address.as_deref(),
+                    },
+                );
+                let _ = zone_repo.update_output_type(zid, output_type_str);
+                set_zone_online(event_bus, db, &dev.id, true);
+                info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
+            } else if let Some(zid) = zone_repo.find_hidden_id_by_name(&dev.name) {
+                // Une zone SUPPRIMEE portant ce nom. Le
+                // garde-fou `is_device_hidden` en haut de
+                // ce bloc ne l'a pas vue : il teste le
+                // nouvel identifiant, la ligne masquee
+                // porte l'ancien. Et le rattrapage par nom
+                // juste au-dessus ne pouvait pas la voir non
+                // plus — `list()` filtre les masquees.
+                // Sans ce cas, la zone renaissait a neuf a
+                // chaque changement d'adresse (#1528).
+                //
+                // On la re-ancre sur le nouvel identifiant
+                // SANS la demasquer : la suppression reste
+                // une suppression, et le garde-fou redevient
+                // operant des le tour suivant.
+                let _ = zone_repo.changer_d_appareil(
+                    zid,
+                    &dev.id,
+                    tune_core::audio::reglages_de_volume::Rattachement::SansPreuve {
+                        origine: "mdns_zone_masquee_meme_nom",
+                        mac: dev.mac_address.as_deref(),
+                    },
+                );
+                info!(name = %dev.name, id = %dev.id, zone_id = zid, "mdns_hidden_zone_reanchored");
+            } else if let Some((zid, masquee)) =
+                zone_reseau_a_reancrer_par_mac(&zone_repo, dev, output_type_str)
+            {
+                // #3919 — les trois filets par NOM viennent
+                // d'echouer ensemble : la zone a ete
+                // renommee. Sans ce quatrieme, le flux
+                // tombe dans `auto_create` et laisse les
+                // reglages sur une ligne orpheline. La MAC,
+                // elle, n'a pas bouge.
+                //
+                // Une zone SUPPRIMEE se re-ancre sans se
+                // demasquer, comme au-dessus : la
+                // suppression reste une suppression, et le
+                // garde-fou `is_device_hidden` redevient
+                // operant des le tour suivant.
+                let _ = zone_repo.changer_d_appareil(
+                    zid,
+                    &dev.id,
+                    tune_core::audio::reglages_de_volume::Rattachement::SansPreuve {
+                        origine: "mdns_reancrage_par_mac",
+                        mac: dev.mac_address.as_deref(),
+                    },
+                );
+                let _ = zone_repo.set_identity(zid, &dev.host, dev.mac_address.as_deref());
+                if !masquee {
+                    set_zone_online(event_bus, db, &dev.id, true);
+                }
+                info!(
+                    name = %dev.name,
+                    id = %dev.id,
+                    zone_id = zid,
+                    hidden = masquee,
+                    mac = ?dev.mac_address,
+                    "mdns_zone_reancree_par_mac"
+                );
+            } else {
+                // Cross-protocol dedup (forum #1183): the
+                // same physical device may already be a
+                // zone through another protocol — e.g. a
+                // Samsung S95BA TV present as a (renamed)
+                // DLNA zone that also announces AirPlay
+                // over mDNS. Match against the output
+                // registry (same name + same host across
+                // protocols) AND against existing zones by
+                // the REAL host of their registered output
+                // (`host_of`, robust for DLNA `uuid:…`
+                // device_ids the old "{type}-{host}-{port}"
+                // parsing mangled) or by case-insensitive
+                // name. Skip zone creation on conflict.
+                let mut registry_conflicts =
+                    reg.conflicting_outputs_same_host(&dev.name, output_type_str, &dev.host);
+                // #6947 — l'endpoint OAAT et le récepteur AirPlay
+                // d'une même machine ne sont pas des doublons.
+                registry_conflicts.retain(|id| {
+                    !oaat_et_airplay_sont_deux_sorties(
+                        reg.type_of(id).as_deref().unwrap_or(""),
+                        output_type_str,
+                    )
+                });
+                let zone_conflict = physical_zone_conflict(
+                    &zone_repo,
+                    &existing,
+                    |id| reg.host_of(id),
+                    &dev.name,
+                    &dev.host,
+                    dev.mac_address.as_deref(),
+                    output_type_str,
+                );
+                if !registry_conflicts.is_empty() || zone_conflict.is_some() {
+                    info!(
+                        name = %dev.name,
+                        id = %dev.id,
+                        host = %dev.host,
+                        r#type = output_type_str,
+                        registry_conflicts = ?registry_conflicts,
+                        conflicting_zone = ?zone_conflict,
+                        "mdns_zone_skipped_conflicting_protocol"
+                    );
+                } else {
+                    // Check zone_auto_create setting (#3529 :
+                    // lecture unique, portée par `ZoneRepo`).
+                    let auto_create = zone_repo.zone_auto_create_autorise();
+                    if !auto_create {
+                        info!(name = %dev.name, id = %dev.id, "mdns_zone_auto_create_disabled_skipping");
+                    } else {
+                        // Auto-created zones start dormant; the
+                        // free-tier cap is enforced at first play.
+                        {
+                            match zone_repo.get_or_create(&dev.name, Some(output_type_str), &dev.id)
+                            {
+                                Ok((zid, true)) => {
+                                    // Persist the physical identity so later
+                                    // discoveries of the SAME device under
+                                    // another protocol/UUID find this zone.
+                                    let _ = zone_repo.set_identity(
+                                        zid,
+                                        &dev.host,
+                                        dev.mac_address.as_deref(),
+                                    );
+                                    event_bus.emit_typed(
+                                        EventType::ZoneCreated,
+                                        charge_utile_zone_creee(
+                                            &zone_repo,
+                                            zid,
+                                            serde_json::json!({
+                                                "zone_id": zid,
+                                                "name": dev.name,
+                                                "device_id": dev.id,
+                                                "type": output_type_str,
+                                            }),
+                                        ),
+                                    );
+                                    info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
+                                }
+                                Ok((zid, false)) => {
+                                    let _ = zone_repo.set_identity(
+                                        zid,
+                                        &dev.host,
+                                        dev.mac_address.as_deref(),
+                                    );
+                                    set_zone_online(event_bus, db, &dev.id, true);
+                                    info!(name = %dev.name, zone_id = zid, "mdns_zone_already_existed");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(name = %dev.name, device = %dev.id, error = %e, "mdns_zone_create_failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// For every AirPlay zone, probe port 11000 to see if the device supports
@@ -2140,11 +2385,122 @@ fn physical_zone_conflict(
         // Same-type matches are the reconnect path (get_by_device_id /
         // zone_id_by_host handle those); only a DIFFERENT protocol on the
         // same physical device is a duplicate.
-        if !ztype.is_empty() && !ztype.eq_ignore_ascii_case(new_type) {
+        if !ztype.is_empty()
+            && !ztype.eq_ignore_ascii_case(new_type)
+            && !oaat_et_airplay_sont_deux_sorties(&ztype, new_type)
+        {
             return Some(name);
         }
     }
     None
+}
+
+/// La zone qu'un protocole de priorité SUPÉRIEURE, découvert par mDNS au même
+/// hôte, reprend au lieu d'en créer une seconde (`mdns_montee_de_priorite`).
+///
+/// L'hôte de la zone existante se lisait seulement dans son identifiant, au
+/// format `{type}-{host}-{port}`. Un renderer DLNA porte son UDN SSDP
+/// (`uuid:…`), qui ne contient aucune adresse : la montée ne voyait donc
+/// jamais la zone DLNA d'un appareil Verox, et l'endpoint OAAT annoncé ensuite
+/// au même hôte tombait dans la déduplication entre protocoles
+/// (`mdns_zone_skipped_conflicting_protocol`). Il n'avait jamais de zone,
+/// alors qu'OAAT est le protocole préféré (#6393, constat 1 du 14/10).
+///
+/// Pour un endpoint OAAT, l'hôte vient AUSSI du registre des sorties
+/// (`host_of`), comme pour la déduplication. Les autres protocoles gardent la
+/// seule découpe de l'identifiant : élargir leur montée changerait des zones
+/// existantes (BluOS, Chromecast) sans mesure de terrain.
+fn zone_a_monter_en_priorite<'a>(
+    zones: &'a [tune_core::db::zone_repo::Zone],
+    resolve_host: impl Fn(&str) -> Option<String>,
+    dev_host: &str,
+    nouveau: tune_core::discovery::device::OutputType,
+) -> Option<&'a tune_core::db::zone_repo::Zone> {
+    use tune_core::discovery::device::OutputType;
+    zones.iter().find(|z| {
+        let Some(ref old_dev_id) = z.output_device_id else {
+            return false;
+        };
+        // Device IDs formatted as "{type}-{host}-{port}": the host part.
+        let old_host = old_dev_id.splitn(3, '-').nth(1).unwrap_or("");
+        let is_same_host = old_host == dev_host
+            || (nouveau == OutputType::Oaat
+                && resolve_host(old_dev_id).is_some_and(|h| h.eq_ignore_ascii_case(dev_host)));
+        if !is_same_host {
+            return false;
+        }
+        // #6947 — l'endpoint OAAT ne prend pas la zone du récepteur AirPlay :
+        // ce sont deux sorties, chacune garde la sienne.
+        if oaat_et_airplay_sont_deux_sorties(
+            z.output_type.as_deref().unwrap_or(""),
+            &nouveau.to_string(),
+        ) {
+            return false;
+        }
+        // Only upgrade if new protocol has higher priority
+        nouveau.priority() > priorite_du_type_de_zone(z.output_type.as_deref())
+    })
+}
+
+/// La priorité du protocole enregistré sur une zone (`zones.output_type`) ;
+/// 0 pour un type inconnu ou absent.
+fn priorite_du_type_de_zone(type_zone: Option<&str>) -> u8 {
+    use tune_core::discovery::device::OutputType;
+    match type_zone {
+        Some("oaat") => OutputType::Oaat.priority(),
+        Some("openhome") => OutputType::Openhome.priority(),
+        Some("bluos") => OutputType::Bluos.priority(),
+        Some("squeezebox") => OutputType::Squeezebox.priority(),
+        Some("dlna") => OutputType::Dlna.priority(),
+        Some("chromecast") => OutputType::Chromecast.priority(),
+        Some("airplay") => OutputType::Airplay.priority(),
+        _ => 0,
+    }
+}
+
+/// #6947 — refuser le ré-ancrage « même nom » qui ferait redescendre une zone
+/// vers un protocole de priorité inférieure tant que sa sortie actuelle est
+/// encore enregistrée.
+///
+/// Le cas du Verox : son endpoint OAAT reprend, par montée de priorité, la
+/// zone AirPlay « Zone 6 » du même hôte, et en garde le nom. Le récepteur
+/// AirPlay de la machine s'annonce ensuite toujours sous « Zone 6 » : le filet
+/// « même nom » lui rendait la zone, de type `airplay`, et l'annonce OAAT
+/// suivante la remontait. La zone oscillait entre les deux protocoles.
+///
+/// Une sortie actuelle disparue du registre laisse le ré-ancrage se faire,
+/// comme avant : la zone ne reste pas accrochée à un appareil parti.
+fn retrogradation_par_meme_nom(
+    type_zone: Option<&str>,
+    ancienne_enregistree: bool,
+    nouvelle: tune_core::discovery::device::OutputType,
+) -> bool {
+    // #7371 — au redémarrage, mDNS peut précéder SSDP : l'absence
+    // temporaire du renderer dans le registre n'autorise pas AirPlay à
+    // reprendre une zone choisie en DLNA (entrée NET du TEAC).
+    (type_zone == Some("dlna") && nouvelle == tune_core::discovery::device::OutputType::Airplay)
+        || (ancienne_enregistree && priorite_du_type_de_zone(type_zone) > nouvelle.priority())
+}
+
+/// #6947 — un endpoint OAAT et un récepteur AirPlay sont deux sorties, même
+/// quand ils tournent sur la même machine, et chacun a droit à sa zone.
+///
+/// Le dédoublonnage entre protocoles suppose qu'un même hôte sous deux
+/// protocoles est UN appareil vu deux fois (Bluesound Node en BluOS et en
+/// AirPlay, téléviseur en DLNA et en AirPlay). Il ne vaut pas pour une machine
+/// qui fait tourner un endpoint OAAT : c'est un lecteur logiciel (Verox sur
+/// Raspberry Pi), et son récepteur AirPlay en est un autre, que d'autres
+/// applications utilisent (Roon les voit). Comparés à l'adresse, le récepteur
+/// AirPlay de chaque Pi était écarté au profit de la zone OAAT
+/// (`mdns_zone_skipped_conflicting_protocol`), ou la zone AirPlay était reprise
+/// par l'endpoint OAAT et en gardait le nom (« Zone 6 »).
+///
+/// Seule la paire OAAT / AirPlay est concernée : seuls les endpoints Tune
+/// annoncent OAAT. Les autres paires gardent le dédoublonnage d'avant.
+fn oaat_et_airplay_sont_deux_sorties(type_a: &str, type_b: &str) -> bool {
+    let oaat = |t: &str| t.eq_ignore_ascii_case("oaat");
+    let airplay = |t: &str| t.eq_ignore_ascii_case("airplay") || t.eq_ignore_ascii_case("airplay2");
+    (oaat(type_a) && airplay(type_b)) || (airplay(type_a) && oaat(type_b))
 }
 
 fn find_cross_protocol_zone_conflict<'a>(
@@ -2156,7 +2512,10 @@ fn find_cross_protocol_zone_conflict<'a>(
 ) -> Option<&'a tune_core::db::zone_repo::Zone> {
     zones.iter().find(|z| {
         let zone_type = z.output_type.as_deref().unwrap_or("");
-        if zone_type.is_empty() || zone_type.eq_ignore_ascii_case(new_type) {
+        if zone_type.is_empty()
+            || zone_type.eq_ignore_ascii_case(new_type)
+            || oaat_et_airplay_sont_deux_sorties(zone_type, new_type)
+        {
             return false;
         }
         let same_host = z
@@ -2989,10 +3348,93 @@ mod reancrage_4520 {
             .find("\"mdns_zone_device_update_deferred_while_in_use\"")
             .expect("le report est journalisé");
         let ecrit = source[differe..]
-            .find("zone_repo.update_output_device(zid,&dev.id)")
+            .find("zone_repo.changer_d_appareil(zid,&dev.id,")
             .map(|i| i + differe)
             .expect("l'écriture suit le report");
         assert!(regle < differe && differe < ecrit);
+    }
+}
+
+#[cfg(test)]
+mod retrogradation_meme_nom_6947 {
+
+    #[test]
+    fn teac_7371_une_zone_dlna_garde_son_protocole_avant_le_retour_ssdp() {
+        assert!(
+            super::retrogradation_par_meme_nom(
+                Some("dlna"),
+                false,
+                tune_core::discovery::device::OutputType::Airplay
+            ),
+            "l'annonce AirPlay reprend la zone DLNA quand SSDP n'a pas encore enregistré la sortie"
+        );
+    }
+    use super::retrogradation_par_meme_nom;
+    use tune_core::discovery::device::OutputType;
+
+    /// Le cas du Verox : la zone, montée en OAAT, porte le nom de l'ancien
+    /// récepteur AirPlay ; l'annonce `_raop` « Zone 6 » ne la reprend pas.
+    #[test]
+    fn une_zone_oaat_n_est_pas_reprise_par_l_airplay_du_meme_nom() {
+        assert!(
+            retrogradation_par_meme_nom(Some("oaat"), true, OutputType::Airplay),
+            "la zone OAAT redescend en AirPlay sur une annonce du même nom (#6947)"
+        );
+        assert!(retrogradation_par_meme_nom(
+            Some("dlna"),
+            true,
+            OutputType::Chromecast
+        ));
+    }
+
+    /// Contre-épreuves : même protocole, protocole meilleur, sortie actuelle
+    /// partie, zone sans type — le filet « même nom » agit comme avant.
+    #[test]
+    fn hors_du_cas_le_filet_meme_nom_agit_comme_avant() {
+        assert!(!retrogradation_par_meme_nom(
+            Some("airplay"),
+            true,
+            OutputType::Airplay
+        ));
+        assert!(!retrogradation_par_meme_nom(
+            Some("airplay"),
+            true,
+            OutputType::Oaat
+        ));
+        assert!(!retrogradation_par_meme_nom(
+            Some("oaat"),
+            false,
+            OutputType::Airplay
+        ));
+        assert!(!retrogradation_par_meme_nom(
+            None,
+            true,
+            OutputType::Airplay
+        ));
+    }
+
+    /// Le branchement : le filet « même nom » consulte la règle AVANT de
+    /// réécrire l'identifiant de la zone.
+    #[test]
+    fn le_filet_meme_nom_consulte_la_regle_avant_d_ecrire() {
+        // Coupé AVANT la définition de la règle : ce module porte les mêmes
+        // littéraux et satisferait la garde à lui seul.
+        let complet: String = include_str!("discovery_setup.rs")
+            .split_whitespace()
+            .collect();
+        let source = &complet[..complet
+            .find("fnpriorite_du_type_de_zone(")
+            .expect("la règle est définie dans ce fichier")];
+        let regle = source
+            .find("retrogradation_par_meme_nom(z.output_type.as_deref(),")
+            .expect("le filet même nom appelle la règle");
+        let refus = source
+            .find("}elseifretrogradation{")
+            .expect("le refus est une branche du filet");
+        let ecrit = source
+            .find("origine:\"mdns_meme_nom\"")
+            .expect("le ré-ancrage même nom existe");
+        assert!(regle < refus && refus < ecrit);
     }
 }
 
@@ -3001,6 +3443,7 @@ mod tests {
     use super::{
         AnnonceAppareil, find_cross_protocol_zone_conflict, may_reanchor, refus_nommes,
         register_discovered_output, resolve_control_url, statut_du_fournisseur,
+        zone_a_monter_en_priorite,
     };
 
     /// LAT-Z3 : la règle de la fenêtre — jamais lancée → due ; lancée il y a
@@ -3047,7 +3490,12 @@ mod tests {
             })
             .collect();
         let depart = std::time::Instant::now();
-        let sondes = super::sonder_les_renderers_en_parallele(renderers, borne).await;
+        // Recours unicast vers un port fermé : seule la sonde HTTP est mesurée.
+        let recours = super::RecoursUnicast {
+            port_ssdp: 9,
+            budget: std::time::Duration::from_millis(50),
+        };
+        let sondes = super::sonder_les_renderers_en_parallele(renderers, borne, recours).await;
         let duree = depart.elapsed();
         assert!(
             duree < borne * 2,
@@ -3223,6 +3671,58 @@ mod tests {
                 "airplay",
             )
             .is_none()
+        );
+    }
+
+    /// 🔴 #6393 (constat 1 du 14/10, Verox) — la zone DLNA d'un appareil
+    /// porte son UDN (`uuid:…`). L'endpoint OAAT annoncé ensuite au même hôte
+    /// doit la reprendre (montée de priorité), au lieu d'être écarté par la
+    /// déduplication entre protocoles et de rester sans zone.
+    #[test]
+    fn un_endpoint_oaat_reprend_la_zone_dlna_uuid_du_meme_hote() {
+        let zones = vec![zone(
+            "cm4 [Verox]-UPnP/AV",
+            "dlna",
+            "uuid:07ea1b2c-3d4e-5f60-7182-93a4b5c6d7e8",
+        )];
+        let resolve = |id: &str| {
+            (id == "uuid:07ea1b2c-3d4e-5f60-7182-93a4b5c6d7e8").then(|| "192.168.75.59".to_string())
+        };
+        assert_eq!(
+            zone_a_monter_en_priorite(&zones, resolve, "192.168.75.59", OutputType::Oaat)
+                .map(|z| z.name.as_str()),
+            Some("cm4 [Verox]-UPnP/AV"),
+            "#6393 : l'endpoint OAAT doit reprendre la zone DLNA du même hôte"
+        );
+        // Un autre hôte : rien.
+        assert!(
+            zone_a_monter_en_priorite(&zones, resolve, "192.168.75.60", OutputType::Oaat).is_none()
+        );
+        // Les autres protocoles gardent la seule découpe de l'identifiant :
+        // un UDN ne les fait pas monter (BluOS n'est pas élargi ici).
+        assert!(
+            zone_a_monter_en_priorite(&zones, resolve, "192.168.75.59", OutputType::Bluos)
+                .is_none()
+        );
+    }
+
+    /// La montée d'avant reste intacte : identifiant `{type}-{host}-{port}`,
+    /// protocole supérieur au même hôte ; jamais vers un protocole inférieur
+    /// ou égal.
+    #[test]
+    fn la_montee_par_l_identifiant_reste_intacte() {
+        let zones = vec![zone("Node", "airplay", "airplay-192.168.1.42-7000")];
+        let aucun = |_: &str| None;
+        assert!(
+            zone_a_monter_en_priorite(&zones, aucun, "192.168.1.42", OutputType::Bluos).is_some()
+        );
+        assert!(
+            zone_a_monter_en_priorite(&zones, aucun, "192.168.1.42", OutputType::Airplay).is_none()
+        );
+        let oaat = vec![zone("Salon", "oaat", "oaat-192.168.1.42-9740")];
+        assert!(
+            zone_a_monter_en_priorite(&oaat, aucun, "192.168.1.42", OutputType::Oaat).is_none(),
+            "une zone OAAT ne remonte jamais vers OAAT"
         );
     }
 
@@ -4771,3 +5271,68 @@ mod reancrage_par_mac {
         );
     }
 }
+
+#[cfg(all(test, feature = "oaat"))]
+mod volume_7333_mdns_tests {
+    use super::*;
+    use tune_core::outputs::{OutputTarget, oaat::OaatOutput};
+
+    #[tokio::test]
+    async fn une_mise_a_jour_mdns_de_volume_conserve_la_sortie_et_publie_le_refus_7333() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let mut dev = tune_core::discovery::device::DiscoveredDevice::new(
+            "oaat:7333-fictif".into(),
+            "Banc 7333".into(),
+            tune_core::discovery::device::OutputType::Oaat,
+            "127.0.0.1".into(),
+            9,
+        );
+        let sortie = OaatOutput::new(dev.name.clone(), dev.host.clone(), dev.port, dev.id.clone())
+            .avec_volume_annonce(Some("hw"));
+        assert!(sortie.capabilities().can_set_volume);
+        state.outputs.lock().await.register(Box::new(sortie));
+        let avant = state.outputs.lock().await.get(&dev.id).unwrap();
+        dev.capabilities
+            .insert("oaat_volume_type".into(), serde_json::json!("fixed"));
+        let nouvelle =
+            OaatOutput::new(dev.name.clone(), dev.host.clone(), dev.port, dev.id.clone())
+                .avec_volume_annonce(Some("fixed"));
+        let mut events = state.event_bus.subscribe();
+        enregistrer_la_sortie_mdns_et_sa_zone(
+            &state.outputs,
+            &state.backend,
+            &state.event_bus,
+            &state.playback,
+            &dev,
+            Box::new(nouvelle),
+            "oaat",
+            false,
+            AnnonceAppareil::MiseAJour,
+        )
+        .await;
+        let apres = state.outputs.lock().await.get(&dev.id).unwrap();
+        assert!(
+            Arc::ptr_eq(&avant, &apres),
+            "#7333 : la mise à jour du volume remplace la sortie et perd la connexion active"
+        );
+        let caps = crate::routes::zones::output_capabilities(&state, Some(&dev.id))
+            .await
+            .unwrap();
+        assert!(!caps.can_set_volume);
+        assert!(!caps.can_mute);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let ev = events.recv().await.unwrap();
+                if ev.event_type == EventType::DeviceUpdated.as_str() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("la mise à jour reste publiée aux clients");
+    }
+}
+
+#[cfg(test)]
+#[path = "discovery_setup/decouverte_volume_6774_tests.rs"]
+mod decouverte_volume_6774_tests;

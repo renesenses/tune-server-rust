@@ -181,7 +181,11 @@ impl RadioRepo {
     pub fn get(&self, id: i64) -> Result<Option<RadioStation>, String> {
         let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_radio))
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(|cols| row_to_radio(cols)))
     }
 
     /// Retrouver une station par l'URL exacte de son flux — c'est ce que le
@@ -189,17 +193,21 @@ impl RadioRepo {
     pub fn get_by_url(&self, url: &str) -> Result<Option<RadioStation>, String> {
         let sql = self.dialect_sql(sql::get_by_url, sql::get_by_url);
         let params: [&dyn ToSqlValue; 1] = [&url];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_radio))
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(|cols| row_to_radio(cols)))
     }
 
     pub fn list(&self) -> Result<Vec<RadioStation>, String> {
         let rows = self.db.query_many(&sql::list_all(), &[])?;
-        Ok(rows.iter().map(row_to_radio).collect())
+        Ok(rows.iter().map(|cols| row_to_radio(cols)).collect())
     }
 
     pub fn favorites(&self) -> Result<Vec<RadioStation>, String> {
         let rows = self.db.query_many(&sql::favorites(), &[])?;
-        Ok(rows.iter().map(row_to_radio).collect())
+        Ok(rows.iter().map(|cols| row_to_radio(cols)).collect())
     }
 
     pub fn create(&self, station: &RadioStation) -> Result<i64, String> {
@@ -216,7 +224,7 @@ impl RadioRepo {
             &station.bitrate,
             &i64::from(station.is_favorite),
         ];
-        Ok(self.db.execute_returning_id(&sql, &params)?)
+        self.db.execute_returning_id(&sql, &params)
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
@@ -263,7 +271,7 @@ impl RadioRepo {
         let sql = self.dialect_sql(sql::search, sql::search);
         let params: [&dyn ToSqlValue; 3] = [&like, &like, &like];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_radio).collect())
+        Ok(rows.iter().map(|cols| row_to_radio(cols)).collect())
     }
 
     pub fn update(&self, station: &RadioStation) -> Result<(), String> {
@@ -307,13 +315,78 @@ impl RadioRepo {
     }
 }
 
+/// #6516 — le lien d'une station de « Mes radios » avec sa fiche de
+/// l'annuaire radio-metadata.fr : `radio_stations.external_id` (SQLite 126 /
+/// PG 090), NULL tant qu'aucun rapprochement n'a réussi.
+///
+/// Gardé HORS de [`RadioStation`] : la colonne ne sert qu'au rapprochement, et
+/// l'ajouter à la structure toucherait chacune de ses quarante constructions.
+pub mod sql_annuaire {
+    use super::SqlDialect;
+
+    pub fn liens() -> &'static str {
+        "SELECT id, external_id FROM radio_stations WHERE external_id IS NOT NULL"
+    }
+
+    pub fn lien_de<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT external_id FROM radio_stations WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn lier<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE radio_stations SET external_id = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+}
+
+impl RadioRepo {
+    /// Les liens station → fiche d'annuaire déjà enregistrés.
+    pub fn liens_annuaire(&self) -> Result<std::collections::HashMap<i64, String>, String> {
+        let rows = self.db.query_many(sql_annuaire::liens(), &[])?;
+        Ok(rows
+            .iter()
+            .filter_map(|c| {
+                let id = c.first().and_then(|v| v.as_i64())?;
+                let ext = c.get(1).and_then(|v| v.as_string())?;
+                (!ext.trim().is_empty()).then_some((id, ext))
+            })
+            .collect())
+    }
+
+    /// Le lien d'UNE station avec sa fiche, s'il est posé. Le sondeur le lit à
+    /// chaque rafraîchissement du titre : une seule ligne, par sa clé.
+    pub fn lien_annuaire(&self, id: i64) -> Result<Option<String>, String> {
+        let sql = self.dialect_sql(sql_annuaire::lien_de, sql_annuaire::lien_de);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .and_then(|c| c.first().and_then(|v| v.as_string()))
+            .filter(|s| !s.trim().is_empty()))
+    }
+
+    /// Enregistre (ou retire, avec `None`) le lien d'une station avec sa fiche.
+    pub fn lier_a_l_annuaire(&self, id: i64, external_id: Option<&str>) -> Result<(), String> {
+        let sql = self.dialect_sql(sql_annuaire::lier, sql_annuaire::lier);
+        let ext: Option<String> = external_id.map(str::to_string);
+        let params: [&dyn ToSqlValue; 2] = [&ext, &id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+}
+
 /// #5716 — le codec de sonde (`mp3`, `aac`, `ogg`…) dans la forme des
 /// codecs saisis ou servis par l'annuaire (`MP3`, `AAC`, `OGG`).
 fn libelle_du_codec(codec: &str) -> String {
     codec.trim().to_ascii_uppercase()
 }
 
-fn row_to_radio(cols: &Vec<SqlValue>) -> RadioStation {
+fn row_to_radio(cols: &[SqlValue]) -> RadioStation {
     RadioStation {
         id: cols.first().and_then(|v| v.as_i64()),
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
@@ -464,7 +537,7 @@ mod tests {
         assert!(uk.len() >= 2, "should find at least 2 UK stations");
 
         let bbc = repo.search("BBC").unwrap();
-        assert!(bbc.len() >= 1, "should find at least 1 BBC station");
+        assert!(!bbc.is_empty(), "should find at least 1 BBC station");
     }
 
     #[test]

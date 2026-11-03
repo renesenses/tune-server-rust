@@ -24,6 +24,7 @@
 //! | `all`                    | rendu             | tous ceux authentifies |
 //! | `qobuz` (un service)     | **vide**          | ce service             |
 //! | `streaming`              | **vide**          | tous ceux authentifies |
+//! | `radios` (#7045)         | **vide**, radios rendues | aucun           |
 //! | `local,qobuz`            | rendu             | ce service             |
 //! | valeur inconnue, ou vide | **vide**          | aucun                  |
 //!
@@ -105,6 +106,16 @@ pub(crate) const JETON_TOUTES: &str = "all";
 /// disent deux choses differentes, et c'est voulu.
 pub(crate) const JETON_SERVICES: &str = "streaming";
 
+/// #7045 — « les radios SEULES » : « Mes radios » et l'annuaire, sans la
+/// bibliotheque ni les services.
+///
+/// L'ecran de recherche tient son local de `/library/search` et ses services de
+/// `sources=streaming` : il lui manquait le moyen de demander les radios sans
+/// refaire, a chaque frappe, les huit requetes SQL du bloc local. Meme raison
+/// d'etre que [`JETON_SERVICES`]. `local` et `all` rendent toujours les radios
+/// avec le reste : ce jeton n'enleve rien, il permet de ne demander qu'elles.
+pub(crate) const JETON_RADIOS: &str = "radios";
+
 /// La lecture de `sources`, faite une seule fois.
 ///
 /// `None` = parametre absent = « Tous ». `Some(liste)` = selection explicite,
@@ -144,6 +155,17 @@ impl FiltreSources {
         match &self.0 {
             None => true,
             Some(liste) => liste.iter().any(|s| s == JETON_LOCAL || s == JETON_TOUTES),
+        }
+    }
+
+    /// Les radios (« Mes radios » et l'annuaire) entrent-elles dans cette
+    /// reponse ? Oui avec le local, et oui avec le jeton `radios` seul.
+    pub(crate) fn radios_demandees(&self) -> bool {
+        match &self.0 {
+            None => true,
+            Some(liste) => liste
+                .iter()
+                .any(|s| s == JETON_LOCAL || s == JETON_TOUTES || s == JETON_RADIOS),
         }
     }
 
@@ -226,5 +248,34 @@ mod tests_jeton_services {
         let f = FiltreSources::depuis(Some("local, streaming"));
         assert!(f.local_demande());
         assert!(f.service_demande("qobuz"));
+    }
+}
+
+#[cfg(test)]
+mod tests_jeton_radios_i7045 {
+    use super::*;
+
+    #[test]
+    fn radios_seules_ne_rendent_ni_le_local_ni_un_service() {
+        let f = FiltreSources::depuis(Some(JETON_RADIOS));
+        assert!(f.radios_demandees());
+        assert!(!f.local_demande(), "la bibliotheque ne doit pas etre lue");
+        for s in ["qobuz", "tidal", "youtube", "bandcamp"] {
+            assert!(!f.service_demande(s), "{s} ne doit pas repondre");
+        }
+    }
+
+    #[test]
+    fn local_all_et_absent_rendent_toujours_les_radios() {
+        assert!(FiltreSources::tout().radios_demandees());
+        assert!(FiltreSources::depuis(Some(JETON_LOCAL)).radios_demandees());
+        assert!(FiltreSources::depuis(Some(JETON_TOUTES)).radios_demandees());
+    }
+
+    #[test]
+    fn un_service_ou_streaming_ne_rend_pas_les_radios() {
+        assert!(!FiltreSources::depuis(Some("qobuz")).radios_demandees());
+        assert!(!FiltreSources::depuis(Some(JETON_SERVICES)).radios_demandees());
+        assert!(!FiltreSources::depuis(Some("")).radios_demandees());
     }
 }

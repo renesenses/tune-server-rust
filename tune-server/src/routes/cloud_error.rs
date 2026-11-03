@@ -190,7 +190,7 @@ mod tests {
     #[tokio::test]
     async fn le_message_suit_la_langue_de_l_interface() {
         let mut vus = std::collections::HashSet::new();
-        for langue in ["fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv"] {
+        for langue in crate::i18n::SUPPORTED {
             let resp = reponse(
                 &limite(Some(120)),
                 &accept_language(langue),

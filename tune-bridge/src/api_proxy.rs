@@ -7,7 +7,8 @@ use axum::response::{IntoResponse, Response};
 use tokio::sync::oneshot;
 use tracing::warn;
 
-use crate::state::{PendingResponse, RelayState};
+use crate::state::{Attente, PendingResponse, RelayState};
+use crate::trafic::{Categorie, Erreur};
 
 pub async fn proxy_api(
     State(state): State<Arc<RelayState>>,
@@ -17,10 +18,14 @@ pub async fn proxy_api(
     uri: Uri,
     body: axum::body::Bytes,
 ) -> Response {
+    let debut = std::time::Instant::now();
     // Validate server exists
     let conn = match state.servers.get(&server_id) {
         Some(c) => c,
-        None => return StatusCode::NOT_FOUND.into_response(),
+        None => {
+            state.trafic.erreur(Erreur::ServeurAbsent);
+            return StatusCode::NOT_FOUND.into_response();
+        }
     };
 
     // Auth : jeton de pont, sur son PROPRE en-tete.
@@ -46,10 +51,13 @@ pub async fn proxy_api(
             .then(|| jeton_de_requete(uri.query()))
             .flatten()
     });
-    let token = match token {
-        Some(t) if state.server_for_token(&t).as_deref() == Some(&server_id) => t,
-        _ => return StatusCode::UNAUTHORIZED.into_response(),
+    // Jeton de session d'ecoute a distance (#6603), ou ancien jeton du pont
+    // pendant la coexistence. Voir `RelayState::autoriser`.
+    let acces = match state.autoriser(token.as_deref(), &server_id) {
+        Ok(a) => a,
+        Err(rejet) => return rejet.en_reponse(),
     };
+    let token = token.unwrap_or_default();
     // Le jeton ne doit JAMAIS atteindre le serveur (journaux d'acces,
     // historiques) : on retire les parametres qui le portent, et eux seuls.
     let requete = requete_sans_jeton(uri.query(), &token);
@@ -57,7 +65,10 @@ pub async fn proxy_api(
     let request_id = uuid::Uuid::new_v4().to_string();
 
     // Build relay headers (forward relevant ones)
-    let relay_headers = entetes_a_relayer(&headers);
+    let mut relay_headers = entetes_a_relayer(&headers);
+    if let crate::sessions::Acces::Session(s) = &acces {
+        ajouter_appareil_distant(&mut relay_headers, s);
+    }
 
     let body_str = if body.is_empty() {
         None
@@ -79,20 +90,47 @@ pub async fn proxy_api(
 
     // Register pending response
     let (tx, rx) = oneshot::channel::<PendingResponse>();
-    conn.pending.lock().await.insert(request_id.clone(), tx);
+    conn.pending
+        .lock()
+        .await
+        .insert(request_id.clone(), Attente::nouvelle(tx, Categorie::Api));
+
+    // Ce qui entre : le corps de la requete du navigateur. Ce qui sort : le
+    // message vers le serveur (#6512).
+    let compteurs = conn.trafic.clone();
+    state.trafic.entree(&compteurs, Categorie::Api, body.len());
+    let message = request_msg.to_string();
 
     // Send to server
-    if conn.ws_tx.send(request_msg.to_string()).await.is_err() {
+    if conn.ws_tx.send(message.clone()).await.is_err() {
         conn.pending.lock().await.remove(&request_id);
+        state.trafic.erreur(Erreur::ServeurAbsent);
         return StatusCode::BAD_GATEWAY.into_response();
     }
+    state
+        .trafic
+        .sortie(&compteurs, Categorie::Api, message.len());
 
     drop(conn);
 
     // Wait for response with timeout
     match tokio::time::timeout(Duration::from_secs(30), rx).await {
-        Ok(Ok(resp)) => crate::stream_proxy::reponse_relayee(resp),
+        Ok(Ok(resp)) => crate::sessions::habiller(
+            crate::stream_proxy::reponse_relayee_comptee(
+                resp,
+                Some(crate::stream_proxy::Comptage {
+                    trafic: state.trafic.clone(),
+                    serveur: compteurs,
+                    categorie: Categorie::Api,
+                    cle: path,
+                    range: None,
+                    debut,
+                }),
+            ),
+            &acces,
+        ),
         Ok(Err(_)) => {
+            state.trafic.erreur(Erreur::CanalRompu);
             warn!(request_id = %request_id, "response channel dropped");
             StatusCode::BAD_GATEWAY.into_response()
         }
@@ -100,6 +138,7 @@ pub async fn proxy_api(
             if let Some(conn) = state.servers.get(&server_id) {
                 conn.pending.lock().await.remove(&request_id);
             }
+            state.trafic.erreur(Erreur::Delai);
             warn!(request_id = %request_id, "relay request timeout (30s)");
             StatusCode::GATEWAY_TIMEOUT.into_response()
         }
@@ -113,8 +152,14 @@ pub async fn proxy_api(
 /// - `range`, `if-range` : lecture partielle ;
 /// - `if-none-match`, `if-modified-since`, `cache-control` : les validateurs
 ///   de cache, sans lesquels chaque pochette repart en entier ;
-/// - `x-tune-profile` : le profil actif. Sans lui, le serveur rend favoris et
-///   historique du profil par defaut a tout le monde.
+/// - `x-profile-id` : le profil actif, sous le nom que le serveur lit
+///   (`ActiveProfile`, `tune-server/src/routes/active_profile.rs`) et que
+///   tous les clients envoient (web, Flutter, iOS). Sans lui, le serveur se
+///   rabat sur le profil par defaut, et la garde de `/profiles/{id}/favorites`
+///   repond « profile not found » des que le chemin nomme un autre profil
+///   (#6479). La liste portait jusqu'ici `x-tune-profile`, un nom qu'aucun
+///   client n'envoie et que le serveur ne lit pas : l'en-tete reel etait
+///   donc retire en route.
 ///
 /// Ni `cookie` (la session du navigateur vise le domaine du pont, pas le
 /// serveur), ni `x-bridge-token` (il ne concerne que le relais).
@@ -127,7 +172,7 @@ pub const ENTETES_RELAYES: [&str; 9] = [
     "if-none-match",
     "if-modified-since",
     "cache-control",
-    "x-tune-profile",
+    "x-profile-id",
 ];
 
 /// Les en-tetes de la requete du navigateur a transmettre au serveur.
@@ -149,6 +194,45 @@ pub fn entetes_a_relayer(headers: &HeaderMap) -> serde_json::Map<String, serde_j
         relayes.insert(key.to_string(), serde_json::Value::String(v.to_string()));
     }
     relayes
+}
+
+/// En-tetes que le RELAIS pose vers le serveur pour une session ouverte par
+/// laissez-passer (#6603) : l'appareil connecte a distance, pour que le
+/// serveur l'affiche. Information, pas controle. Hors de
+/// [`ENTETES_RELAYES`] : un navigateur ne peut pas les poser lui-meme.
+pub const ENTETE_APPAREIL_ID: &str = "x-tune-appareil-distant";
+pub const ENTETE_APPAREIL_NOM: &str = "x-tune-appareil-distant-nom";
+
+/// Pose les en-tetes de l'appareil distant. Le nom, choisi par
+/// l'utilisateur, est encode en pourcent : un en-tete n'est pas de l'UTF-8.
+pub fn ajouter_appareil_distant(
+    relayes: &mut serde_json::Map<String, serde_json::Value>,
+    session: &crate::sessions::Session,
+) {
+    relayes.insert(
+        ENTETE_APPAREIL_ID.to_string(),
+        serde_json::Value::String(session.did.clone()),
+    );
+    if let Some(nom) = session.nom_appareil() {
+        relayes.insert(
+            ENTETE_APPAREIL_NOM.to_string(),
+            serde_json::Value::String(encoder_pourcent(&nom)),
+        );
+    }
+}
+
+/// Encode en pourcent tout ce qui n'est pas alphanumerique ASCII, `-`, `_`,
+/// `.` ou `~`.
+pub fn encoder_pourcent(texte: &str) -> String {
+    let mut sortie = String::with_capacity(texte.len());
+    for o in texte.bytes() {
+        if o.is_ascii_alphanumeric() || matches!(o, b'-' | b'_' | b'.' | b'~') {
+            sortie.push(o as char);
+        } else {
+            sortie.push_str(&format!("%{o:02X}"));
+        }
+    }
+    sortie
 }
 
 /// Noms des parametres d'URL qui peuvent porter le jeton de pont.

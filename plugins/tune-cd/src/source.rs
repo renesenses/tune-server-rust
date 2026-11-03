@@ -13,6 +13,12 @@
 //! * absente — greffon arrêté (`teardown`).
 //!
 //! « Jouer » délègue à `POST /jouer` du greffon (`routes::jouer_disque`).
+//!
+//! #6596 — à l'INSERTION d'un disque (passage à `disque` vu par la
+//! surveillance, pas le premier tour au démarrage), l'évènement
+//! [`EVT_DISQUE_INSERE`] part en plus de `sources.changed` : le client y
+//! propose « Charger en mémoire ». L'insertion ne joue rien et ne touche à
+//! aucune file : c'est l'utilisateur qui charge, puis qui lance la lecture.
 
 use std::sync::Arc;
 
@@ -22,19 +28,30 @@ use tune_core::sources_physiques::{
     DemandeJouer, EtatSource, JoueurSource, RefusSource, RegistreSources, Source, TypeSource,
 };
 
+use tune_core::event_bus::EventBus;
+
 use crate::discid::disc_id;
 use crate::lecteur::{LecteurDisque, Presence, plateforme_prise_en_charge};
+use crate::memoire::MemoireCd;
 use crate::musicbrainz::Consultation;
 use crate::routes::{EtatRoutes, jouer_disque};
 
 /// L'identifiant de la source ET le nom du greffon.
 pub const ID: &str = "cd";
 
+/// #6596 — un disque vient d'être inséré : `{ disc_id, nom, album, artiste,
+/// pistes, pochette, memoire: { disponible, actif } }`.
+pub const EVT_DISQUE_INSERE: &str = "cd.disque.insere";
+
 pub struct PublicationSource {
     pub registre: Arc<RegistreSources>,
     pub lecteur: Option<Arc<dyn LecteurDisque>>,
     pub consultation: Arc<dyn Consultation>,
     pub joueur: Arc<dyn JoueurSource>,
+    /// #6596 — pour [`EVT_DISQUE_INSERE`]. `None` : pas d'annonce.
+    pub bus: Option<EventBus>,
+    /// #6596 — l'annonce dit si « Charger en mémoire » est possible.
+    pub memoire: Option<Arc<MemoireCd>>,
 }
 
 impl PublicationSource {
@@ -46,7 +63,15 @@ impl PublicationSource {
             lecteur: routes.lecteur.clone(),
             consultation: routes.consultation.clone(),
             joueur: Arc::new(JoueurCd(routes.clone())),
+            bus: None,
+            memoire: routes.memoire.clone(),
         }
+    }
+
+    /// #6596 — le bus sur lequel annoncer l'insertion.
+    pub fn avec_bus(mut self, bus: Option<EventBus>) -> Self {
+        self.bus = bus;
+        self
     }
 
     /// Sans lecteur, la surveillance ne tourne pas : la source se déclare
@@ -82,8 +107,9 @@ impl PublicationSource {
         );
     }
 
-    /// Met la source à jour d'après la présence vue au lecteur.
-    pub async fn publier(&self, presence: Presence) {
+    /// Met la source à jour d'après la présence vue au lecteur. `insertion` :
+    /// le disque vient d'arriver (#6596), on l'annonce aussi.
+    pub async fn publier(&self, presence: Presence, insertion: bool) {
         match presence {
             Presence::AucunLecteur => self.publier_aucun_lecteur(),
             Presence::Vide => self.inscrire(EtatSource::Vide, "Lecteur CD".into(), json!({}), true),
@@ -99,29 +125,73 @@ impl PublicationSource {
                     self.inscrire(EtatSource::Vide, "Lecteur CD".into(), json!({}), true);
                     return;
                 };
-                let infos = self.consultation.consulter(&disc_id(&toc)).await;
-                let album = infos
-                    .as_ref()
-                    .map(|i| i.titre.clone())
-                    .filter(|t| !t.is_empty());
-                let artiste = infos
-                    .as_ref()
-                    .map(|i| i.artiste.clone())
-                    .filter(|a| !a.is_empty());
-                let nom = match (&artiste, &album) {
-                    (Some(a), Some(t)) => format!("{a} — {t}"),
-                    (None, Some(t)) => t.clone(),
-                    _ => "CD audio".into(),
-                };
-                let detail = json!({
-                    "album": album,
-                    "artiste": artiste,
-                    "pistes": toc.pistes_audio().count(),
-                    "pochette": infos.as_ref().and_then(|i| i.pochette.clone()),
-                });
-                self.inscrire(EtatSource::Disque, nom, detail, true);
+                self.publier_le_disque(&toc, insertion, false).await;
             }
         }
+    }
+
+    /// #6410 — le disque est sorti du lecteur, mais il est ENTIER en mémoire
+    /// et la lecture continue (comme sur Daphile) : la source dit qu'elle a
+    /// ce disque, jouable, avec `detail.en_memoire = true`. Publier « vide »
+    /// laissait croire qu'il n'y avait plus rien à écouter pendant que la
+    /// zone jouait. La TOC est celle de la mémoire : le lecteur n'est plus lu.
+    pub async fn publier_disque_garde(&self, toc: &crate::toc::Toc) {
+        self.publier_le_disque(toc, false, true).await;
+    }
+
+    async fn publier_le_disque(&self, toc: &crate::toc::Toc, insertion: bool, en_memoire: bool) {
+        let infos = self.consultation.consulter(&disc_id(toc)).await;
+        let album = infos
+            .as_ref()
+            .map(|i| i.titre.clone())
+            .filter(|t| !t.is_empty());
+        let artiste = infos
+            .as_ref()
+            .map(|i| i.artiste.clone())
+            .filter(|a| !a.is_empty());
+        let nom = match (&artiste, &album) {
+            (Some(a), Some(t)) => format!("{a} — {t}"),
+            (None, Some(t)) => t.clone(),
+            _ => "CD audio".into(),
+        };
+        let mut detail = json!({
+            "album": album,
+            "artiste": artiste,
+            "pistes": toc.pistes_audio().count(),
+            "pochette": infos.as_ref().and_then(|i| i.pochette.clone()),
+        });
+        if en_memoire {
+            detail["en_memoire"] = json!(true);
+        }
+        self.inscrire(EtatSource::Disque, nom.clone(), detail.clone(), true);
+        if insertion {
+            self.annoncer_insertion(disc_id(toc), nom, detail);
+        }
+    }
+
+    /// #6596 — l'annonce de l'insertion : de quoi proposer « Charger en
+    /// mémoire » sans rien relire.
+    fn annoncer_insertion(&self, disc: String, nom: String, detail: Value) {
+        let Some(bus) = &self.bus else {
+            return;
+        };
+        let memoire = match &self.memoire {
+            Some(m) => json!({ "disponible": true, "actif": m.reglages().actif }),
+            None => json!({ "disponible": false, "actif": false }),
+        };
+        tracing::info!(disc_id = %disc, "cd_disque_insere_annonce");
+        bus.emit(
+            EVT_DISQUE_INSERE,
+            json!({
+                "disc_id": disc,
+                "nom": nom,
+                "album": detail["album"],
+                "artiste": detail["artiste"],
+                "pistes": detail["pistes"],
+                "pochette": detail["pochette"],
+                "memoire": memoire,
+            }),
+        );
     }
 
     fn inscrire(&self, etat: EtatSource, nom: String, detail: Value, jouable: bool) {
@@ -318,6 +388,105 @@ mod tests {
         assert_eq!(changements(&mut rx), 1);
     }
 
+    /// Les annonces d'insertion reçues depuis le dernier appel.
+    fn insertions(
+        rx: &mut tokio::sync::broadcast::Receiver<tune_core::event_bus::TuneEvent>,
+    ) -> Vec<Value> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|e| e.event_type == EVT_DISQUE_INSERE)
+            .map(|e| e.data)
+            .collect()
+    }
+
+    /// #6596 — l'insertion d'un disque l'ANNONCE (`cd.disque.insere`, de quoi
+    /// proposer « Charger en mémoire »), et ne fait rien d'autre : aucune
+    /// file posée, aucune zone arrêtée, la zone qui jouait la radio la joue
+    /// encore, et le chargement ne part pas d'office. Le disque déjà là au
+    /// démarrage n'est pas annoncé.
+    #[tokio::test]
+    async fn l_insertion_annonce_le_disque_sans_toucher_a_la_file_ni_a_la_lecture() {
+        use crate::discid::tests::ATTENDU;
+        use crate::memoire::{MemoireCd, Reglages};
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let registre = Arc::new(RegistreSources::new());
+        let lecteur = Arc::new(LecteurSimule::new(toc_du_vecteur()));
+        lecteur.ejecter();
+        let hote = Arc::new(HoteTemoin::default());
+        hote.sources.lock().await.insert(4, "radio".into());
+        let memoire = Arc::new(MemoireCd::new(Reglages {
+            actif: true,
+            plafond_octets: u64::MAX,
+        }));
+        let routes = EtatRoutes {
+            lecteur: Some(lecteur.clone()),
+            hote: hote.clone(),
+            consultation: Arc::new(Fixture),
+            zones: Arc::default(),
+            reveil: Arc::default(),
+            memoire: Some(memoire.clone()),
+            backend: None,
+            extraction: None,
+        };
+        let publication =
+            Arc::new(PublicationSource::new(registre.clone(), &routes).avec_bus(Some(bus.clone())));
+        let mut s = Surveillant::new(lecteur.clone(), hote.clone(), routes.zones.clone())
+            .avec_publication(publication.clone())
+            .avec_memoire(memoire.clone());
+
+        assert!(s.un_tour().await.is_empty());
+        assert!(
+            insertions(&mut rx).is_empty(),
+            "lecteur vide : rien à annoncer"
+        );
+
+        lecteur.inserer();
+        assert!(
+            s.un_tour().await.is_empty(),
+            "l'insertion a arrêté une zone"
+        );
+        let annonces = insertions(&mut rx);
+        assert_eq!(annonces.len(), 1, "{annonces:?}");
+        let a = &annonces[0];
+        assert_eq!(a["disc_id"], ATTENDU);
+        assert_eq!(a["nom"], "Dark Tranquillity — Fiction");
+        assert_eq!(a["pistes"], 10);
+        assert_eq!(a["memoire"], json!({ "disponible": true, "actif": true }));
+
+        assert!(
+            hote.files.lock().await.is_empty(),
+            "l'insertion a posé une file"
+        );
+        assert!(
+            hote.arrets.lock().await.is_empty(),
+            "l'insertion a arrêté une zone"
+        );
+        assert_eq!(
+            hote.sources.lock().await.get(&4).map(String::as_str),
+            Some("radio"),
+            "la zone 4 ne joue plus sa radio"
+        );
+        assert!(routes.zones.lock().await.is_empty());
+        assert!(
+            memoire.courant().is_none(),
+            "l'insertion a lancé le chargement d'office"
+        );
+        assert_eq!(lecteur.appels(), 0, "l'insertion a lu des secteurs");
+
+        // Les tours suivants, disque toujours là : plus d'annonce.
+        s.un_tour().await;
+        assert!(insertions(&mut rx).is_empty());
+
+        // Le disque déjà inséré au démarrage du greffon n'est pas annoncé.
+        let mut s2 = Surveillant::new(lecteur.clone(), hote.clone(), routes.zones.clone())
+            .avec_publication(publication);
+        s2.un_tour().await;
+        assert!(
+            insertions(&mut rx).is_empty(),
+            "disque du démarrage annoncé"
+        );
+    }
+
     /// #5161 — le lecteur est branché APRÈS le démarrage du greffon : tant
     /// qu'il n'est pas là, la source `cd` est listée `indisponible` (#5065,
     /// étape 3) ; branché, la surveillance le voit, la source passe à
@@ -486,5 +655,92 @@ mod tests {
                 .await,
             Err(ErreurJouer::NonJouable { .. })
         ));
+    }
+
+    /// #6410 — un disque ENTIER en mémoire, éjecté pendant la lecture : la
+    /// lecture continue depuis la mémoire, et la source le dit. Elle publie
+    /// ce disque, jouable (`detail.en_memoire`), et non « vide » ; « Jouer »
+    /// le sert depuis la mémoire, lecteur vide. La mémoire rendue (plus
+    /// aucune zone ne joue le disque), la source revient à « vide ».
+    #[tokio::test]
+    async fn la_source_cd_dit_qu_elle_joue_le_disque_garde_en_memoire() {
+        use crate::ejection::TOURS_AVANT_LIBERATION;
+        use crate::ejection::tests::petite_toc;
+        use crate::fournisseur::SOURCE;
+        use crate::hote::HoteLecture;
+        use crate::memoire::{Fin, Reglages};
+
+        let orch = Arc::new(orchestrateur());
+        let registre = orch.sources_physiques().clone();
+        registre.brancher_bus(Arc::new(EventBus::new()));
+        let lecteur = Arc::new(LecteurSimule::new(petite_toc()));
+        let hote = Arc::new(HoteTemoin::default());
+        let memoire = Arc::new(MemoireCd::new(Reglages {
+            actif: true,
+            plafond_octets: u64::MAX,
+        }));
+        let routes = EtatRoutes {
+            lecteur: Some(lecteur.clone()),
+            hote: hote.clone(),
+            consultation: Arc::new(Fixture),
+            zones: Arc::default(),
+            reveil: Arc::default(),
+            memoire: Some(memoire.clone()),
+            backend: None,
+            extraction: None,
+        };
+        let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
+        let mut s = Surveillant::new(lecteur.clone(), hote.clone(), routes.zones.clone())
+            .avec_publication(publication)
+            .avec_memoire(memoire.clone());
+        hote.sources.lock().await.insert(7, SOURCE.into());
+        routes.zones.lock().await.insert(7);
+
+        s.un_tour().await;
+        assert_eq!(registre.source(ID).unwrap().etat, EtatSource::Disque);
+        let l: Arc<dyn LecteurDisque> = lecteur.clone();
+        let fin = memoire
+            .chargement(&l, &petite_toc(), &disc_id(&petite_toc()), 0, 0)
+            .and_then(|c| c.attendre_la_fin());
+        assert_eq!(fin, Some(Fin::Termine), "le disque est entier en mémoire");
+
+        lecteur.ejecter();
+        s.un_tour().await;
+        let cd = registre.source(ID).unwrap();
+        assert_eq!(
+            cd.etat,
+            EtatSource::Disque,
+            "#6410 — la lecture continue depuis la mémoire, la source publie « {:?} »",
+            cd.etat
+        );
+        assert_eq!(cd.detail["en_memoire"], true, "{}", cd.detail);
+        assert_eq!(cd.detail["pistes"], 3);
+
+        // « Jouer » le disque gardé : servi depuis la mémoire, lecteur vide.
+        let v = registre
+            .jouer(
+                ID,
+                DemandeJouer {
+                    zone_id: 3,
+                    piste: Some(2),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("#6410 — jouer le disque gardé : {e:?}"));
+        assert_eq!(v["piste"], 2);
+        assert_eq!(v["disc_id"], disc_id(&petite_toc()));
+
+        // Plus personne ne joue le disque : mémoire rendue, source « vide ».
+        hote.arreter(7).await;
+        hote.arreter(3).await;
+        for _ in 0..TOURS_AVANT_LIBERATION {
+            s.un_tour().await;
+        }
+        assert!(memoire.disque_garde().is_none(), "mémoire rendue");
+        assert_eq!(
+            registre.source(ID).unwrap().etat,
+            EtatSource::Vide,
+            "la mémoire rendue, la source revient à ce que voit le lecteur"
+        );
     }
 }

@@ -1,0 +1,30 @@
+{
+  "cas": [
+    "valide.json",
+    "valide_p256.json",
+    "expire.json",
+    "expire_dans_la_tolerance.json",
+    "expire_en_secours.json",
+    "mauvaise_signature.json",
+    "charge_modifiee.json",
+    "mauvais_alg_none.json",
+    "mauvais_alg_hs256.json",
+    "mauvais_alg_es256.json",
+    "mauvais_typ.json",
+    "entete_avec_jwk.json",
+    "kid_inconnu.json",
+    "mauvaise_audience.json",
+    "mauvais_emetteur.json",
+    "mauvais_serveur.json",
+    "mauvaise_version.json",
+    "duree_trop_longue.json",
+    "pas_encore_valide.json",
+    "cnf_mauvaise_taille.json",
+    "cle_appareil_differente.json",
+    "defi_autre_serveur.json",
+    "defi_autre_valeur.json",
+    "jeu_non_signe_par_la_racine.json"
+  ],
+  "defi_serveur": "defi_serveur.json",
+  "racine": "cles_de_test.json"
+}

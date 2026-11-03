@@ -77,6 +77,8 @@ pub struct EntreeAudioPlugin {
     controleur: Option<Arc<Controleur>>,
     /// La tâche qui tient les sources `entree:*` du registre à jour (#5065).
     publication: Option<tokio::task::JoinHandle<()>>,
+    /// La tâche qui arrête la capture quand la zone passe à autre chose.
+    suivi_des_zones: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl EntreeAudioPlugin {
@@ -85,6 +87,7 @@ impl EntreeAudioPlugin {
             services,
             controleur: None,
             publication: None,
+            suivi_des_zones: None,
         }
     }
 }
@@ -148,6 +151,9 @@ impl TunePlugin for EntreeAudioPlugin {
         );
         self.publication = Some(tokio::spawn(publication.tourner()));
         ctx.register_router(routes::router(etat_routes));
+        // Stop de la zone, ou autre source : la capture s'arrête aussitôt.
+        self.suivi_des_zones =
+            Some(controleur.suivre_les_zones(self.services.playback.subscribe()));
         self.controleur = Some(controleur);
         Ok(())
     }
@@ -163,6 +169,9 @@ impl TunePlugin for EntreeAudioPlugin {
             .orchestrator
             .sources_physiques()
             .retirer_greffon(source::GREFFON);
+        if let Some(h) = self.suivi_des_zones.take() {
+            h.abort();
+        }
         if let Some(c) = self.controleur.take() {
             c.arreter_capture();
         }
@@ -357,5 +366,122 @@ mod bout_en_bout {
             assert_eq!(p[1][0], p[0][0].wrapping_add(8), "trou ou doublon");
         }
         c.arreter_capture();
+    }
+
+    /// L'hôte réduit à l'état de lecture RÉEL (`PlaybackManager`) : `jouer`
+    /// fait ce que fait l'orchestrateur à l'arrivée du flux, poser le
+    /// `NowPlaying` « entree-audio » et passer la zone en lecture.
+    struct HoteEtatReel(Arc<PlaybackManager>);
+
+    #[async_trait::async_trait]
+    impl crate::hote::HoteLecture for HoteEtatReel {
+        async fn jouer(&self, zone_id: i64, e: crate::hote::ElementDirect) -> Result<(), String> {
+            self.0
+                .play(
+                    zone_id,
+                    tune_core::playback::NowPlaying {
+                        title: e.titre(),
+                        source: SOURCE.into(),
+                        source_id: Some(e.entree.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            Ok(())
+        }
+        async fn arreter(&self, zone_id: i64) {
+            self.0.stop(zone_id).await;
+        }
+        async fn source_en_cours(&self, zone_id: i64) -> Option<String> {
+            self.0
+                .get_state(zone_id)
+                .await
+                .now_playing
+                .map(|np| np.source)
+        }
+        async fn position_ms(&self, _: i64) -> Option<i64> {
+            None
+        }
+        async fn ecoute_l_entree(&self, zone_id: i64) -> bool {
+            crate::hote::zone_ecoute_l_entree(&self.0, zone_id).await
+        }
+    }
+
+    async fn arretee_sous(c: &Controleur, delai: Duration) -> bool {
+        let fin = std::time::Instant::now() + delai;
+        while std::time::Instant::now() < fin {
+            if c.instantane().is_none() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        c.instantane().is_none()
+    }
+
+    /// Sur les événements du VRAI `PlaybackManager` (ceux que `setup`
+    /// branche) : la pause garde la capture, le Stop de la zone la rend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn le_stop_de_la_zone_rend_le_peripherique() {
+        let playback = Arc::new(PlaybackManager::new());
+        let c = Controleur::new(
+            Simulees::avec("Yeti X", 48_000),
+            Arc::new(HoteEtatReel(playback.clone())),
+        );
+        *c.amorce.lock().unwrap() = Duration::from_millis(100);
+        *c.delai_avant_arret.lock().unwrap() = Duration::from_millis(100);
+        let suivi = c.suivre_les_zones(playback.subscribe());
+        c.jouer("Yeti X", 5).await.unwrap();
+        assert!(crate::hote::zone_ecoute_l_entree(&playback, 5).await);
+
+        playback.pause(5).await;
+        assert!(
+            !arretee_sous(&c, Duration::from_millis(500)).await,
+            "la pause a coupé la capture"
+        );
+
+        playback.stop(5).await;
+        // `stop` garde le NowPlaying « entree-audio » (pour l'écran) : c'est
+        // l'état, pas la source, qui dit que la zone n'écoute plus.
+        assert_eq!(
+            playback
+                .get_state(5)
+                .await
+                .now_playing
+                .map(|np| np.source)
+                .as_deref(),
+            Some(SOURCE)
+        );
+        assert!(
+            arretee_sous(&c, Duration::from_secs(2)).await,
+            "la capture tourne encore après le Stop de la zone"
+        );
+        suivi.abort();
+    }
+
+    /// Une piste de la bibliothèque lancée sur la zone : la capture s'arrête.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn une_piste_lancee_sur_la_zone_rend_le_peripherique() {
+        let playback = Arc::new(PlaybackManager::new());
+        let c = Controleur::new(
+            Simulees::avec("Yeti X", 48_000),
+            Arc::new(HoteEtatReel(playback.clone())),
+        );
+        *c.amorce.lock().unwrap() = Duration::from_millis(100);
+        *c.delai_avant_arret.lock().unwrap() = Duration::from_millis(100);
+        let suivi = c.suivre_les_zones(playback.subscribe());
+        c.jouer("Yeti X", 6).await.unwrap();
+        playback
+            .play(
+                6,
+                tune_core::playback::NowPlaying {
+                    title: "Une piste".into(),
+                    source: "local".into(),
+                    track_id: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(arretee_sous(&c, Duration::from_secs(2)).await);
+        suivi.abort();
     }
 }

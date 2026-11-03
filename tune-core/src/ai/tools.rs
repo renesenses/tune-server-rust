@@ -77,7 +77,10 @@ pub fn all_tools() -> Vec<Tool> {
         },
         Tool {
             name: "set_volume".into(),
-            description: "Set the playback volume on the active zone.".into(),
+            description: "Set the playback volume on the active zone. Lowering is always \
+                          allowed; raising is limited to a few points above the current \
+                          volume per call (the result says the highest value allowed)."
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

@@ -470,7 +470,10 @@ pub(crate) fn dezipper(zip: &Path, dans: &Path) -> Result<usize, String> {
             .map_err(|e| format!("extraction : {e}"))?;
         // `enclosed_name` refuse `..` et les chemins absolus.
         let Some(relatif) = entree.enclosed_name() else {
-            tracing::warn!(nom = %entree.name(), "bandcamp_zip_entree_refusee");
+            tracing::warn!(
+                nom = %String::from_utf8_lossy(entree.name_raw()),
+                "bandcamp_zip_entree_refusee"
+            );
             continue;
         };
         let cible = dans.join(relatif);
@@ -642,5 +645,41 @@ mod tests {
         assert_eq!(n, 2);
         assert!(tmp.join("01 - Un.flac").exists());
         assert!(!scratch.path().join("evasion.txt").exists());
+    }
+
+    #[test]
+    fn le_zip_ne_restaure_ni_lien_symbolique_ni_bit_suid() {
+        let scratch = tune_core::test_scratch::scratch_dir("tune_bc_zip_liens");
+        let tmp = scratch.path().join("achat");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let chemin = tmp.join("a.zip");
+        {
+            let f = std::fs::File::create(&chemin).unwrap();
+            let mut w = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file("01 - Un.flac", opts.unix_permissions(0o6755))
+                .unwrap();
+            std::io::Write::write_all(&mut w, b"fLaC").unwrap();
+            w.add_symlink("sortie", "../..", opts).unwrap();
+            w.add_symlink("absolu", "/etc", opts).unwrap();
+            w.finish().unwrap();
+        }
+        dezipper(&chemin, &tmp).unwrap();
+        for lien in ["sortie", "absolu"] {
+            let meta = std::fs::symlink_metadata(tmp.join(lien));
+            assert!(
+                meta.map(|m| !m.file_type().is_symlink()).unwrap_or(true),
+                "lien symbolique {lien} restauré"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tmp.join("01 - Un.flac"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o7000, 0, "bits spéciaux restaurés : {mode:o}");
+        }
     }
 }

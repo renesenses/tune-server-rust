@@ -210,6 +210,14 @@ struct BalisesImage {
     /// La note de la piste (#6123) : celle d'UN enregistrement.
     note: Option<i32>,
     commentaire: Option<String>,
+
+    // #6459 — titre, interprète, album et artiste de l'album du fichier. Ils
+    // ne servent QUE là où la feuille ne dit rien (ou ne dit qu'une valeur de
+    // remplissage d'EAC) : voir [`combler_par_les_balises_ce_que_la_feuille_tait`].
+    titre: Option<String>,
+    artiste: Option<String>,
+    album: Option<String>,
+    artiste_album: Option<String>,
 }
 
 impl BalisesImage {
@@ -242,8 +250,115 @@ impl BalisesImage {
             bpm: m.bpm.filter(|b| *b > 0.0),
             note: m.rating.map(i32::from),
             commentaire: texte(m.comment),
+
+            titre: texte(m.title),
+            artiste: texte(m.artist),
+            album: texte(m.album),
+            artiste_album: texte(m.album_artist),
         }
     }
+}
+
+/// #6459 — une valeur que la feuille porte sans rien dire : ce qu'EAC écrit
+/// quand le disque a été rippé sans métadonnées (`TITLE "Unknown Title"`,
+/// `PERFORMER "Unknown Artist"`, pistes `TITLE "Track01"`), quelle qu'en soit
+/// la casse. Décision de Bertrand du 18/10/2026 : ces valeurs comptent comme
+/// VIDES. La règle #5463 (la feuille prime sur les balises) ne vaut que pour
+/// une feuille qui porte de vraies valeurs.
+///
+/// Lulu (fil 2310) : des FLAC par piste étiquetés après coup, la feuille
+/// d'EAC laissée dans le dossier — la passe CUE renommait l'album « Unknown
+/// Title », ses pistes « Track01 », et leur donnait « Unknown Artist ».
+fn valeur_de_remplissage_eac(valeur: &str) -> bool {
+    let v = valeur.trim();
+    if v.eq_ignore_ascii_case("unknown title") || v.eq_ignore_ascii_case(ARTISTE_INCONNU) {
+        return true;
+    }
+    // `Track01`, `Track 1`, `TRACK 12`…
+    let Some(reste) = v
+        .get(..5)
+        .filter(|t| t.eq_ignore_ascii_case("track"))
+        .map(|_| v[5..].trim_start())
+    else {
+        return false;
+    };
+    !reste.is_empty() && reste.chars().all(|c| c.is_ascii_digit())
+}
+
+/// La valeur de la feuille, sauf si elle est vide ou de remplissage.
+fn valeur_de_la_feuille(valeur: &Option<String>) -> Option<String> {
+    valeur
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && !valeur_de_remplissage_eac(v))
+        .map(str::to_string)
+}
+
+/// #6459 — l'album tel que la feuille le décrit VRAIMENT, puis complété par
+/// les balises là où elle se tait :
+///
+/// - les valeurs de remplissage d'EAC sont retirées (titre et interprète de
+///   l'album, titre et interprète de chaque piste) ;
+/// - l'artiste de l'album manquant vient des balises (`ALBUMARTIST` de la
+///   première image, à défaut l'`ARTIST` commun à toutes les images) ; le
+///   TITRE de l'album, lui, reste vide ici : il ne sert qu'à nommer un album
+///   neuf et à réparer un « Unknown Title » (voir [`titre_des_balises`]),
+///   jamais à renommer un album dont la feuille ne dit rien ;
+/// - le titre et l'interprète d'une piste manquants viennent de SON fichier,
+///   seulement quand elle l'occupe en entier : sur une image découpée, ces
+///   balises parlent du fichier, pas de la tranche.
+///
+/// Une feuille qui porte de vraies valeurs ressort inchangée : elle prime.
+fn combler_par_les_balises_ce_que_la_feuille_tait(
+    album: &AlbumCue,
+    balises: &HashMap<PathBuf, BalisesImage>,
+) -> AlbumCue {
+    let mut net = album.clone();
+    net.titre = valeur_de_la_feuille(&album.titre);
+    net.interprete = valeur_de_la_feuille(&album.interprete);
+    let premiere = album.pistes.first().and_then(|p| balises.get(&p.media));
+    if net.interprete.is_none() {
+        net.interprete = premiere.and_then(|b| b.artiste_album.clone()).or_else(|| {
+            let mut artistes = album
+                .pistes
+                .iter()
+                .map(|p| balises.get(&p.media).and_then(|b| b.artiste.as_deref()));
+            let un = artistes.next().flatten()?;
+            artistes.all(|a| a == Some(un)).then(|| un.to_string())
+        });
+    }
+    let tranches = tranches_par_fichier(album);
+    for piste in &mut net.pistes {
+        piste.titre = valeur_de_la_feuille(&piste.titre);
+        piste.interprete = valeur_de_la_feuille(&piste.interprete);
+        let entier = occupe_le_fichier_entier(
+            piste,
+            tranches.get(piste.media.as_path()).copied().unwrap_or(1),
+        );
+        if !entier {
+            continue;
+        }
+        let Some(b) = balises.get(&piste.media) else {
+            continue;
+        };
+        if piste.titre.is_none() {
+            piste.titre.clone_from(&b.titre);
+        }
+        if piste.interprete.is_none() {
+            piste.interprete.clone_from(&b.artiste);
+        }
+    }
+    net
+}
+
+/// #6459 — le titre d'album des balises de la première image, quand la
+/// feuille n'en porte pas de vrai.
+fn titre_des_balises(album: &AlbumCue, balises: &HashMap<PathBuf, BalisesImage>) -> Option<String> {
+    album
+        .pistes
+        .first()
+        .and_then(|p| balises.get(&p.media))
+        .and_then(|b| b.album.clone())
 }
 
 /// Lit les balises du fichier image. Muet sur une image de CD brute, qui n'en
@@ -693,6 +808,26 @@ fn ecrire_album_avec(
     if album.pistes.is_empty() {
         return;
     }
+    // Les balises de chaque image, lues une fois (#5463). Pas pour une image
+    // SACD : son Master TOC a déjà tout dit, et lofty n'y lit rien.
+    let mut balises: HashMap<PathBuf, BalisesImage> = HashMap::new();
+    let mut etendues: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
+    if imposition.is_none() {
+        for piste in &album.pistes {
+            if !balises.contains_key(&piste.media) {
+                balises.insert(piste.media.clone(), lire_balises_image(&piste.media));
+                etendues.insert(piste.media.clone(), lire_etendues_image(&piste.media));
+            }
+        }
+    }
+    // #6459 — une valeur de remplissage d'EAC n'écrase jamais une balise.
+    let nettoye;
+    let album = if imposition.is_none() {
+        nettoye = combler_par_les_balises_ce_que_la_feuille_tait(album, &balises);
+        &nettoye
+    } else {
+        album
+    };
     let nom_artiste = album
         .interprete
         .as_deref()
@@ -709,13 +844,48 @@ fn ecrire_album_avec(
     };
     let artist_id = artiste.id;
 
+    // #6459 — quand l'import ordinaire a DÉJÀ rangé la parution sous son
+    // dossier (`album_folder` : `Parution/` pour un dossier `CD1/`), la
+    // feuille du disque rejoint cet album, avec son artiste. Sans cela, elle
+    // créait un album à elle, sous « Unknown Artist » quand la feuille ne
+    // nomme personne, et l'album de la parution se vidait.
+    //
+    // Sans album de la parution en base, rien ne change : chaque disque naît
+    // en album à part, et c'est la passe des coffrets automatiques
+    // (#5317/#6554) qui décide, par interprète, de les réunir. Une image SACD
+    // garde l'identité que lui donne son Master TOC.
+    let dossier_album = match imposition {
+        Some(_) => None,
+        // `album_folder` ne lit que le PARENT du chemin qu'on lui donne : le
+        // nom de fichier inventé n'y sert qu'à désigner ce dossier.
+        None => super::album_folder::album_folder(&dossier.join("album.cue").to_string_lossy())
+            .map(PathBuf::from)
+            .filter(|parution| parution.as_path() != dossier)
+            .filter(|parution| {
+                matches!(
+                    album_repo.find_id_by_folder(&parution.to_string_lossy()),
+                    Ok(Some(_))
+                )
+            }),
+    };
+    let dossier = dossier_album.as_deref().unwrap_or(dossier);
+
     // Le titre d'album manquant retombe sur le nom du dossier : une feuille
     // sans `TITLE` reste un album, et un album sans nom est introuvable.
+    //
+    // #6459 — une feuille sans vrai `TITLE` laisse d'abord parler l'`ALBUM`
+    // des balises.
+    let titre_balises = album
+        .titre
+        .is_none()
+        .then(|| titre_des_balises(album, &balises))
+        .flatten();
     let titre_album = album
         .titre
         .clone()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
+        .or_else(|| titre_balises.clone())
         .or_else(|| {
             dossier
                 .file_name()
@@ -723,18 +893,6 @@ fn ecrire_album_avec(
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "Album".to_string());
-    // Les balises de chaque image, lues une fois (#5463). Pas pour une image
-    // SACD : son Master TOC a déjà tout dit, et lofty n'y lit rien.
-    let mut balises: HashMap<PathBuf, BalisesImage> = HashMap::new();
-    let mut etendues: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
-    if imposition.is_none() {
-        for piste in &album.pistes {
-            if !balises.contains_key(&piste.media) {
-                balises.insert(piste.media.clone(), lire_balises_image(&piste.media));
-                etendues.insert(piste.media.clone(), lire_etendues_image(&piste.media));
-            }
-        }
-    }
     let annee = album
         .annee
         .as_deref()
@@ -802,7 +960,16 @@ fn ecrire_album_avec(
                 .iter()
                 .any(|c| c == "title")
     };
-    if let (Some(id), Some(titre_feuille)) = (ligne_album, album.titre.as_deref())
+    //
+    // #6459 — une feuille sans vrai `TITLE` ne renomme rien, SAUF un album
+    // qu'une passe d'avant a titré d'une valeur de remplissage d'EAC
+    // (« Unknown Title ») : les balises le réparent.
+    let titre_qui_fait_foi = album.titre.clone().or_else(|| {
+        titre_balises
+            .clone()
+            .filter(|_| valeur_de_remplissage_eac(&ligne.title))
+    });
+    if let (Some(id), Some(titre_feuille)) = (ligne_album, titre_qui_fait_foi.as_deref())
         && !titre_tenu(id)
     {
         let titre_feuille = titre_feuille.trim();
@@ -1922,8 +2089,11 @@ mod tests {
         let (dossier, _) = album_simple(d.path());
         let db = base();
 
-        let (_, premier, _) =
-            inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        let (_, premier, _) = inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         let (_, second, _) = inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
 
         assert_eq!(premier.pistes_creees, 2);
@@ -1941,7 +2111,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base();
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         assert_eq!(TrackRepo::with_backend(db.clone()).count().unwrap(), 2);
 
         fs::remove_file(&image).unwrap();
@@ -1969,7 +2143,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, _) = album_simple(d.path());
         let db = base();
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         let repo = TrackRepo::with_backend(db.clone());
         assert_eq!(repo.count().unwrap(), 2);
 
@@ -1998,7 +2176,7 @@ mod tests {
         let (dossier, _) = album_simple(&racine);
         let db = base();
         let rac = vec![racine.to_string_lossy().into_owned()];
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &rac);
+        inventorier_et_ecrire(db.clone(), std::slice::from_ref(&dossier), &rac);
         let repo = TrackRepo::with_backend(db.clone());
         assert_eq!(repo.count().unwrap(), 2);
 
@@ -2024,7 +2202,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base();
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         let repo = TrackRepo::with_backend(db.clone());
         assert_eq!(repo.count().unwrap(), 2);
 
@@ -2083,7 +2265,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base_fichier(d.path());
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         assert_eq!(debuts(&db, &image), vec![0, 1_000], "montage");
 
         fs::write(
@@ -2094,7 +2280,7 @@ mod tests {
         let vus = vec![image.clone()];
         let (_, refuse, _) = inventorier_ecrire_et_confronter(
             db.clone(),
-            &[dossier.clone()],
+            std::slice::from_ref(&dossier),
             &racines(d.path()),
             &ConfrontationDuScan {
                 fichiers_vus: &vus,
@@ -2130,7 +2316,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base_fichier(d.path());
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         fs::remove_file(dossier.join("album.cue")).unwrap();
 
         let rien: Vec<PathBuf> = Vec::new();
@@ -2680,5 +2870,318 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(album.musicbrainz_release_id.as_deref(), Some("mbid-choisi"));
+    }
+
+    /// #6459 — un FLAC par piste, `fichier` et `titre` de chacun.
+    const PISTES_6459: [(&str, &str); 2] = [
+        ("01 - Song One.flac", "Song One"),
+        ("02 - Song Two.flac", "Song Two"),
+    ];
+
+    /// La feuille qu'EAC laisse quand le disque a été rippé sans
+    /// métadonnées : un `FILE` par piste, rien que des valeurs de remplissage.
+    const FEUILLE_EAC_PAR_DEFAUT: &str = "PERFORMER \"Unknown Artist\"\nTITLE \"Unknown Title\"\nFILE \"01 - Song One.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Track01\"\n    PERFORMER \"Unknown Artist\"\n    INDEX 01 00:00:00\nFILE \"02 - Song Two.flac\" WAVE\n  TRACK 02 AUDIO\n    TITLE \"TRACK 02\"\n    PERFORMER \"unknown artist\"\n    INDEX 01 00:00:00\n";
+
+    /// Un dossier de FLAC par piste bien étiquetés (Natalia Mateo, Heart of
+    /// Darkness), avec `feuille` à côté. Rend le dossier.
+    fn album_par_piste_6459(racine: &Path, feuille: &str) -> PathBuf {
+        let dossier = racine.join("Natalia Mateo - Heart of Darkness");
+        fs::create_dir_all(&dossier).unwrap();
+        for (n, (fichier, titre)) in PISTES_6459.iter().enumerate() {
+            let numero = (n + 1).to_string();
+            flac_etiquete(
+                &dossier.join(fichier),
+                &[
+                    ("TITLE", titre),
+                    ("ARTIST", "Natalia Mateo"),
+                    ("ALBUMARTIST", "Natalia Mateo"),
+                    ("ALBUM", "Heart of Darkness"),
+                    ("TRACKNUMBER", numero.as_str()),
+                ],
+            );
+        }
+        fs::write(dossier.join("Unknown Artist - Unknown Title.cue"), feuille).unwrap();
+        dossier
+    }
+
+    /// (titre, artiste, album, artiste de l'album) de chaque piste du dossier.
+    fn pistes_6459(
+        db: &Arc<dyn DbBackend>,
+        dossier: &Path,
+    ) -> Vec<(String, String, String, String)> {
+        let pistes = TrackRepo::with_backend(db.clone());
+        let albums = AlbumRepo::with_backend(db.clone());
+        PISTES_6459
+            .iter()
+            .map(|(fichier, _)| {
+                let t = pistes
+                    .get_by_path(&dossier.join(fichier).to_string_lossy())
+                    .unwrap()
+                    .expect("la piste du fichier doit exister");
+                let a = albums.get(t.album_id.unwrap()).unwrap().unwrap();
+                (
+                    t.title,
+                    t.artist_name.unwrap_or_default(),
+                    a.title,
+                    a.artist_name.unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    fn attendu_6459() -> Vec<(String, String, String, String)> {
+        PISTES_6459
+            .iter()
+            .map(|(_, titre)| {
+                (
+                    titre.to_string(),
+                    "Natalia Mateo".to_string(),
+                    "Heart of Darkness".to_string(),
+                    "Natalia Mateo".to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn les_valeurs_de_remplissage_d_eac_sont_reconnues_6459() {
+        for v in [
+            "Unknown Title",
+            "unknown artist",
+            "  UNKNOWN ARTIST ",
+            "Track01",
+            "Track 1",
+            "TRACK 12",
+            "track07",
+        ] {
+            assert!(valeur_de_remplissage_eac(v), "{v:?}");
+        }
+        for v in [
+            "Track",
+            "Tracks 1",
+            "Track 1 (live)",
+            "Unknown Pleasures",
+            "The Unknown Artist Band",
+            "Back on Track",
+            "",
+        ] {
+            assert!(!valeur_de_remplissage_eac(v), "{v:?}");
+        }
+    }
+
+    /// 🔴 #6459 (Lulu, fil 2310) — des FLAC par piste bien étiquetés et la
+    /// feuille d'EAC laissée par défaut : album, artiste et titres viennent
+    /// des balises, jamais de « Unknown Title », « Unknown Artist », « Track01 ».
+    #[test]
+    fn une_feuille_eac_par_defaut_n_ecrase_pas_les_balises_6459() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = album_par_piste_6459(d.path(), FEUILLE_EAC_PAR_DEFAUT);
+        let db = base();
+        let (_, bilan, _) = inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
+        assert_eq!(bilan.echecs, 0, "bilan : {bilan:?}");
+        assert_eq!(
+            bilan.pistes_creees + bilan.pistes_mises_a_jour,
+            2,
+            "bilan : {bilan:?}"
+        );
+        assert_eq!(pistes_6459(&db, &dossier), attendu_6459());
+    }
+
+    /// #6459 — une bibliothèque déjà abîmée par une passe précédente (album
+    /// « Unknown Title » d'« Unknown Artist », pistes « Track01 ») se répare
+    /// au scan suivant : les mêmes balises reprennent la main.
+    #[test]
+    fn une_bibliotheque_abimee_par_la_feuille_eac_se_repare_au_scan_6459() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = album_par_piste_6459(d.path(), FEUILLE_EAC_PAR_DEFAUT);
+        let db = base();
+        let inconnu = ArtistRepo::with_backend(db.clone())
+            .get_or_create(ARTISTE_INCONNU, None, None)
+            .unwrap()
+            .id
+            .unwrap();
+        let album = AlbumRepo::with_backend(db.clone())
+            .get_or_create_for_folder(
+                &dossier.to_string_lossy(),
+                "Unknown Title",
+                inconnu,
+                None,
+                None,
+            )
+            .unwrap();
+        let repo = TrackRepo::with_backend(db.clone());
+        for (n, (fichier, _)) in PISTES_6459.iter().enumerate() {
+            let chemin = dossier.join(fichier).to_string_lossy().into_owned();
+            let mut t = Track::new(format!("Track{:02}", n + 1));
+            t.file_path = Some(chemin.clone());
+            t.cue_media_path = Some(chemin);
+            t.cue_start_ms = Some(0);
+            t.album_id = album.id;
+            t.artist_id = Some(inconnu);
+            t.track_number = n as i32 + 1;
+            t.duration_ms = 1000;
+            repo.create(&t).unwrap();
+        }
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
+        assert_eq!(pistes_6459(&db, &dossier), attendu_6459());
+    }
+
+    /// La règle #5463 tient toujours : une feuille qui porte de VRAIES valeurs
+    /// l'emporte sur les balises du fichier, même sur des FLAC par piste.
+    #[test]
+    fn une_feuille_aux_vraies_valeurs_l_emporte_toujours_6459() {
+        let feuille = FEUILLE_EAC_PAR_DEFAUT
+            .replace(
+                "PERFORMER \"Unknown Artist\"\nTITLE \"Unknown Title\"",
+                "PERFORMER \"Natalia Mateo Quartet\"\nTITLE \"Heart of Darkness (Live)\"",
+            )
+            .replace("TITLE \"Track01\"", "TITLE \"Feuille Un\"")
+            .replace("TITLE \"TRACK 02\"", "TITLE \"Feuille Deux\"")
+            .replace(
+                "PERFORMER \"Unknown Artist\"",
+                "PERFORMER \"Natalia Mateo Quartet\"",
+            )
+            .replace(
+                "PERFORMER \"unknown artist\"",
+                "PERFORMER \"Natalia Mateo Quartet\"",
+            );
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = album_par_piste_6459(d.path(), &feuille);
+        let db = base();
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
+        let quartet = "Natalia Mateo Quartet".to_string();
+        let live = "Heart of Darkness (Live)".to_string();
+        assert_eq!(
+            pistes_6459(&db, &dossier),
+            vec![
+                (
+                    "Feuille Un".to_string(),
+                    quartet.clone(),
+                    live.clone(),
+                    quartet.clone()
+                ),
+                ("Feuille Deux".to_string(), quartet.clone(), live, quartet),
+            ]
+        );
+    }
+
+    /// 🔴 #6459 (Lulu, fil 2310) — une parution rangée en `CD1/`, `CD2/`, une
+    /// feuille par disque, reste UN album : celui que l'import ordinaire a
+    /// rangé sous le dossier de la parution (`album_folder`), avec son artiste.
+    ///
+    /// La passe CUE identifiait l'album par le dossier de la FEUILLE
+    /// (`…/CD1`). Aucune ligne n'y était rangée, la feuille sans `PERFORMER`
+    /// cherchait l'album sous « Unknown Artist », et chaque disque naissait en
+    /// album à part : « Wagner - Ouvertures » d'« Unknown Artist », en double,
+    /// pendant que l'album de la parution, celui de Wagner, se vidait.
+    #[test]
+    fn la_feuille_d_un_dossier_de_disque_vise_l_album_de_la_parution_6459() {
+        const DISQUE: &str = "TITLE \"Ouvertures\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Rienzi\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Tannhäuser\"\n    INDEX 01 00:01:00\n";
+        let d = tempfile::TempDir::new().unwrap();
+        let parution = d.path().join("Wagner - Ouvertures");
+        let disques: Vec<PathBuf> = ["CD1", "CD2"].iter().map(|n| parution.join(n)).collect();
+        for disque in &disques {
+            fs::create_dir_all(disque).unwrap();
+            ecrire_wav(&disque.join("image.wav"), 4_000);
+            fs::write(disque.join("album.cue"), DISQUE).unwrap();
+        }
+
+        let db = base();
+        let album_repo = AlbumRepo::with_backend(db.clone());
+        let wagner = ArtistRepo::with_backend(db.clone())
+            .get_or_create("Richard Wagner", None, None)
+            .unwrap()
+            .id
+            .unwrap();
+        // L'état que laisse l'import ordinaire : la parution est un album,
+        // rangé sous SON dossier, pas sous celui d'un disque.
+        let album = album_repo
+            .get_or_create_for_folder(
+                &parution.to_string_lossy(),
+                "Ouvertures",
+                wagner,
+                None,
+                None,
+            )
+            .unwrap()
+            .id
+            .unwrap();
+
+        let (_, bilan, _) = inventorier_et_ecrire(db.clone(), &disques, &racines(d.path()));
+        assert_eq!(bilan.echecs, 0, "bilan : {bilan:?}");
+
+        let pistes = TrackRepo::with_backend(db.clone());
+        for disque in &disques {
+            let image = disque.join("image.wav").to_string_lossy().into_owned();
+            for debut in [0, 1_000] {
+                let piste = pistes
+                    .get_by_cue_identity(&image, debut)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("piste {image}@{debut} absente"));
+                assert_eq!(
+                    piste.album_id,
+                    Some(album),
+                    "la feuille de {} a rangé sa piste dans un autre album que celui de la parution",
+                    disque.display()
+                );
+            }
+        }
+        let apres = album_repo.get(album).unwrap().unwrap();
+        assert_eq!(
+            apres.artist_id,
+            Some(wagner),
+            "l'album de la parution a perdu son artiste"
+        );
+    }
+
+    /// #6459, la limite — sans album de la parution en base, la feuille d'un
+    /// dossier `CD1/` ne remonte pas : chaque disque reste un album à part,
+    /// que la passe des coffrets automatiques (#5317/#6554) réunit ou non.
+    #[test]
+    fn sans_album_de_la_parution_chaque_disque_reste_un_album_6459() {
+        const DISQUE: &str = "TITLE \"Ouvertures\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Rienzi\"\n    INDEX 01 00:00:00\n";
+        let d = tempfile::TempDir::new().unwrap();
+        let parution = d.path().join("Wagner - Ouvertures");
+        let disques: Vec<PathBuf> = ["CD1", "CD2"].iter().map(|n| parution.join(n)).collect();
+        for disque in &disques {
+            fs::create_dir_all(disque).unwrap();
+            ecrire_wav(&disque.join("image.wav"), 4_000);
+            fs::write(disque.join("album.cue"), DISQUE).unwrap();
+        }
+
+        let db = base();
+        let (_, bilan, _) = inventorier_et_ecrire(db.clone(), &disques, &racines(d.path()));
+        assert_eq!(bilan.echecs, 0, "bilan : {bilan:?}");
+
+        let album_repo = AlbumRepo::with_backend(db.clone());
+        assert_eq!(
+            album_repo
+                .find_id_by_folder(&parution.to_string_lossy())
+                .unwrap(),
+            None,
+            "la passe CUE a créé un album sous le dossier de la parution"
+        );
+        for disque in &disques {
+            assert!(
+                album_repo
+                    .find_id_by_folder(&disque.to_string_lossy())
+                    .unwrap()
+                    .is_some(),
+                "le disque {} n'a pas son album",
+                disque.display()
+            );
+        }
     }
 }

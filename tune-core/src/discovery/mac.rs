@@ -76,6 +76,41 @@ pub fn oui_prefix(mac: &str) -> Option<String> {
     Some(mac[..8].to_string())
 }
 
+/// #6546 — ce que la MAC d'un appareil dit de lui, pour l'affichage : la plage
+/// reconnue (`AA:BB:CC`) et la marque que la table lui associe.
+///
+/// * MAC lisible, plage dans la table → `(Some(plage), Some(marque))` ;
+/// * MAC lisible, plage hors table → `(Some(plage), None)` ;
+/// * pas de MAC, ou chaîne illisible (Chromecast range parfois un UUID dans
+///   `mac_address`) → `(None, None)`.
+///
+/// Seuls les trois premiers octets sortent : c'est ce que l'écran montre à la
+/// place de la MAC complète.
+pub fn plage_et_marque(mac: Option<&str>) -> (Option<String>, Option<&'static str>) {
+    let Some(mac) = mac else {
+        return (None, None);
+    };
+    match oui_prefix(mac) {
+        Some(plage) => (Some(plage), vendor_for_mac(mac)),
+        None => (None, None),
+    }
+}
+
+/// #6546 — la table OUI audio entière, groupée par marque, pour la consulter.
+///
+/// Marques triées par nom (ordre des octets, stable d'une langue à l'autre),
+/// plages de chaque marque dans l'ordre de la table, qui est triée. Rien n'est
+/// recopié : c'est une vue sur [`OUI_AUDIO`], la même que celle que lit
+/// [`vendor_for_mac`].
+pub fn plages_par_marque() -> Vec<(&'static str, Vec<&'static str>)> {
+    let mut groupes: std::collections::BTreeMap<&'static str, Vec<&'static str>> =
+        std::collections::BTreeMap::new();
+    for (plage, marque) in OUI_AUDIO {
+        groupes.entry(marque).or_default().push(plage);
+    }
+    groupes.into_iter().collect()
+}
+
 /// Look the `ip` up in the OS ARP cache.
 ///
 /// Returns a normalised MAC, or `None` when the entry is absent/incomplete.
@@ -204,6 +239,48 @@ mod tests {
         dev.manufacturer = None;
         enrich_identity(&mut dev);
         assert_eq!(dev.manufacturer.as_deref(), Some("Sonos"));
+    }
+
+    /// #6546 — les trois cas d'affichage : plage connue, plage hors table,
+    /// pas de MAC.
+    #[test]
+    fn plage_et_marque_distingue_les_trois_cas() {
+        let sonos = OUI_AUDIO.iter().find(|(_, b)| *b == "Sonos").unwrap();
+        let mac = format!("{}:11:22:33", sonos.0).to_lowercase();
+        assert_eq!(
+            plage_et_marque(Some(&mac)),
+            (Some(sonos.0.to_string()), Some("Sonos"))
+        );
+        // 02:… est localement administrée : jamais dans le registre IEEE.
+        assert_eq!(
+            plage_et_marque(Some("02:00:00:00:00:01")),
+            (Some("02:00:00".to_string()), None)
+        );
+        assert_eq!(plage_et_marque(None), (None, None));
+        assert_eq!(
+            plage_et_marque(Some("3f1c5a2e-uuid-chromecast")),
+            (None, None)
+        );
+    }
+
+    /// #6546 — la vue groupée couvre la table exactement : chaque plage une
+    /// fois, sous la marque que `vendor_for_mac` lui donne.
+    #[test]
+    fn plages_par_marque_couvre_la_table_sans_rien_perdre() {
+        let groupes = plages_par_marque();
+        let total: usize = groupes.iter().map(|(_, p)| p.len()).sum();
+        assert_eq!(total, OUI_AUDIO.len());
+        assert!(
+            groupes.windows(2).all(|w| w[0].0 < w[1].0),
+            "marques triées"
+        );
+        for (marque, plages) in &groupes {
+            assert!(!plages.is_empty());
+            assert!(plages.windows(2).all(|w| w[0] < w[1]), "plages triées");
+            for p in plages {
+                assert_eq!(vendor_for_mac(&format!("{p}:00:00:00")), Some(*marque));
+            }
+        }
     }
 
     /// #3589 — le site ne garde que l'OUI ; le serveur tronque lui-même.

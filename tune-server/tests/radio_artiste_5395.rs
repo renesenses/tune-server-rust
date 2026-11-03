@@ -256,3 +256,56 @@ async fn les_refus_sont_dits_et_ne_touchent_pas_la_file() {
     assert!(file(&state).is_empty());
     assert!(tune_core::playback::radio_artiste::lire_contexte(&state.backend, 1).is_none());
 }
+
+/// #6465 — la radio d'artiste lancée après un album ne garde pas le contexte
+/// de cet album : ses titres s'écrivaient sous lui dans l'Historique et la
+/// vignette « en cours » y renvoyait (fil 2302, points 8 et 9).
+#[tokio::test]
+async fn la_radio_efface_le_contexte_de_l_album_joue_avant_6465() {
+    let (state, app) = banc().await;
+    state
+        .playback
+        .set_session_context(
+            1,
+            Some("album".into()),
+            Some("101".into()),
+            Some("local".into()),
+            None,
+            None,
+        )
+        .await;
+    let (status, corps) = radio(
+        &app,
+        1,
+        json!({"artist": "Graine", "service": "qobuz-simule", "artist_id": "g"}),
+    )
+    .await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "{corps}");
+    let etat = state.playback.get_state(1).await;
+    assert_eq!(
+        (etat.session_context_type, etat.session_context_id),
+        (None, None),
+        "la radio d'artiste a gardé le contexte de l'album 101"
+    );
+}
+
+/// #6465 — le refus « radio vide » ne touche pas la session en cours.
+#[tokio::test]
+async fn une_radio_vide_laisse_le_contexte_en_place_6465() {
+    let (state, app) = banc().await;
+    state
+        .playback
+        .set_session_context(
+            1,
+            Some("album".into()),
+            Some("101".into()),
+            Some("local".into()),
+            None,
+            None,
+        )
+        .await;
+    let (status, _) = radio(&app, 1, json!({"artist": "Inconnu au bataillon"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let etat = state.playback.get_state(1).await;
+    assert_eq!(etat.session_context_id.as_deref(), Some("101"));
+}

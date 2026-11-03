@@ -255,7 +255,7 @@ fn enregistrements(donnees: &[u8]) -> Vec<Enregistrement> {
         }
         let nom_brut = r[33..33 + longueur_nom].to_vec();
         // Octet de bourrage quand la longueur du nom est paire.
-        let debut_su = 33 + longueur_nom + usize::from(longueur_nom % 2 == 0);
+        let debut_su = 33 + longueur_nom + usize::from(longueur_nom.is_multiple_of(2));
         let usage_systeme = if debut_su < longueur {
             r[debut_su..].to_vec()
         } else {
@@ -284,7 +284,9 @@ fn nom_iso(brut: &[u8]) -> String {
 /// Le nom Joliet : UCS-2 grand-boutiste, même nettoyage.
 fn nom_joliet(brut: &[u8]) -> String {
     let unites: Vec<u16> = brut
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_be_bytes([c[0], c[1]]))
         .collect();
     let texte = String::from_utf16_lossy(&unites);
@@ -472,7 +474,12 @@ fn chercher_session(
         let n = PAR_LECTURE.min(dernier - secteur);
         let mut tampon = vec![0u8; (n * SECTEUR) as usize];
         lire_a(fichier, secteur * SECTEUR, &mut tampon)?;
-        for (i, s) in tampon.chunks_exact(SECTEUR as usize).enumerate() {
+        for (i, s) in tampon
+            .as_chunks::<{ SECTEUR as usize }>()
+            .0
+            .iter()
+            .enumerate()
+        {
             if &s[..7] != SIGNATURE_PRIMAIRE {
                 continue;
             }
@@ -707,9 +714,10 @@ pub fn lire_index(image: &Path) -> io::Result<IndexImage> {
 // ─── Cache des index ────────────────────────────────────────────────────
 
 type CleCache = (PathBuf, u64, Option<std::time::SystemTime>);
+type CacheDesIndex = Mutex<Vec<(CleCache, Arc<IndexImage>)>>;
 
-fn cache() -> &'static Mutex<Vec<(CleCache, Arc<IndexImage>)>> {
-    static CACHE: OnceLock<Mutex<Vec<(CleCache, Arc<IndexImage>)>>> = OnceLock::new();
+fn cache() -> &'static CacheDesIndex {
+    static CACHE: OnceLock<CacheDesIndex> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 

@@ -148,6 +148,67 @@ pub fn resolve_alarm_days(alarm: &serde_json::Value) -> Vec<u32> {
     parse_days(alarm.get("days").and_then(|v| v.as_str()))
 }
 
+// ─── Source ────────────────────────────────────────────────────
+
+/// Les natures de source qu'un réveil enregistre (#7047).
+pub const NATURES_DE_SOURCE: [&str; 3] = ["radio", "playlist", "album"];
+
+/// Contrôle strict de la source d'un réveil, à l'ENREGISTREMENT (#7047).
+///
+/// alec_eiffel (1.0.0-rc7) : un réveil posé sur FIP depuis l'écran de lecture
+/// a sonné à 21:31 avec `source="playlist:"`, puis `unknown service:
+/// playlist`. La route l'avait enregistré sans source : nature `playlist` par
+/// défaut, identifiant vide. Rien ne pouvait jouer ce réveil, et rien ne
+/// l'avait dit au moment où l'utilisateur le posait.
+///
+/// La règle : une source vide ou mal formée est refusée à l'enregistrement,
+/// jamais découverte à l'heure du réveil.
+/// - la nature est l'une de [`NATURES_DE_SOURCE`] ;
+/// - l'identifiant n'est pas vide et ne contient ni blanc ni caractère de
+///   contrôle (les identifiants opaques de #3715, `qobuz:playlist:abc`,
+///   restent acceptés) ;
+/// - une radio se joue par son URL (`resolve_direct_url`) : `http(s)://`
+///   suivi d'un hôte.
+///
+/// Rend la source normalisée (nature en minuscules, blancs de bord retirés).
+pub fn valider_source(
+    source_type: Option<&str>,
+    source_id: Option<&str>,
+) -> Result<(String, String), String> {
+    let nature = source_type
+        .map(str::trim)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if nature.is_empty() {
+        return Err("source_type is missing".into());
+    }
+    if !NATURES_DE_SOURCE.contains(&nature.as_str()) {
+        return Err(format!(
+            "source_type {nature:?} is not one of {NATURES_DE_SOURCE:?}"
+        ));
+    }
+    let id = source_id.map(str::trim).unwrap_or("");
+    if id.is_empty() {
+        return Err(format!("source_id is empty for a {nature} alarm"));
+    }
+    if id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!("source_id {id:?} contains blanks"));
+    }
+    if nature == "radio" {
+        let hote = id
+            .strip_prefix("http://")
+            .or_else(|| id.strip_prefix("https://"))
+            .map(|reste| reste.split(['/', '?', '#']).next().unwrap_or(""))
+            .unwrap_or("");
+        if hote.is_empty() {
+            return Err(format!(
+                "source_id {id:?} is not a radio stream URL (http:// or https://)"
+            ));
+        }
+    }
+    Ok((nature, id.to_string()))
+}
+
 /// Parse multi_zone_ids JSON array string into a Vec of zone IDs.
 fn parse_multi_zone_ids(alarm: &serde_json::Value) -> Vec<i64> {
     alarm
@@ -409,6 +470,81 @@ impl AlarmScheduler {
         self.sonner(alarm, true).await
     }
 
+    /// #7058 — un contenu de bibliothèque devient une file ordonnée ; son
+    /// type n'est jamais le nom d'un service de streaming.
+    fn contenu_du_reveil(
+        &self,
+        source: &str,
+        id: &str,
+        profil: Option<i64>,
+    ) -> Result<Option<Vec<crate::db::play_queue_repo::QueueInput>>, String> {
+        use crate::db::play_queue_repo::QueueInput;
+        use crate::db::playlist_repo::{EntryContent, PlaylistRepo};
+        if !matches!(source, "album" | "playlist") {
+            return Ok(None);
+        }
+        let id = id
+            .parse::<i64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or("identifiant de contenu du réveil invalide")?;
+        let pistes: Vec<QueueInput> = if source == "album" {
+            crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
+                .list_by_album(id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter_map(|t| t.id.map(|track_id| QueueInput::Local { track_id }))
+                .collect()
+        } else {
+            let repo = PlaylistRepo::with_backend(self.db.clone());
+            let profil = profil.ok_or("profil du réveil absent")?;
+            repo.get_for_profile(id, profil)?
+                .ok_or("playlist du réveil introuvable")?;
+            repo.get_entries(id)?
+                .into_iter()
+                .filter_map(|e| match e.content {
+                    EntryContent::Local(track_id) => Some(QueueInput::Local { track_id }),
+                    EntryContent::Missing(_) => None,
+                    EntryContent::Service(t) => Some(QueueInput::Streaming {
+                        source: t.source,
+                        source_id: t.source_id,
+                        title: t.title,
+                        artist: t.artist.unwrap_or_default(),
+                        album: t.album,
+                        cover_url: t.cover_url,
+                        duration_ms: t.duration_ms.unwrap_or(0),
+                        track_number: None,
+                        disc_number: None,
+                        album_ref: t.album_source_id,
+                        artist_ref: None,
+                    }),
+                })
+                .collect()
+        };
+        if pistes.is_empty() {
+            return Err("contenu du réveil sans piste jouable".into());
+        }
+        Ok(Some(pistes))
+    }
+
+    async fn jouer_le_contenu_du_reveil(
+        &self,
+        zone: i64,
+        pistes: &[crate::db::play_queue_repo::QueueInput],
+    ) -> Result<crate::orchestrator::PlayResult, String> {
+        let file = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
+        file.clear(zone)?;
+        if let Err(e) = file.append(zone, pistes) {
+            let _ = file.clear(zone);
+            return Err(e);
+        }
+        if file.count_all(zone)? == 0 {
+            return Err("contenu du réveil sans piste jouable".into());
+        }
+        self.orchestrator.clear_prefetch().await;
+        self.orchestrator.play_from_queue(zone, 0).await
+    }
+
     /// `essai` : `true` pour le bouton d'essai, `false` pour le planificateur.
     ///
     /// Décision de Bertrand du 05/10 (#5669) : quand un réveil sonne sur une
@@ -434,6 +570,13 @@ impl AlarmScheduler {
                 .unwrap_or_default()
         } else {
             source_id.to_string()
+        };
+        let contenu = match self.contenu_du_reveil(source_type, &source_id_str, alarm_profile_id) {
+            Ok(contenu) => contenu,
+            Err(e) => {
+                warn!(alarm_id, error = %e, "alarm_source_error");
+                return ZonesDuReveil::default();
+            }
         };
         let volume = alarm["volume"].as_f64().unwrap_or(0.5);
         let volume = if volume > 1.0 { volume / 100.0 } else { volume };
@@ -522,7 +665,11 @@ impl AlarmScheduler {
                 .playback
                 .set_session_profile(target_zone, alarm_profile_id)
                 .await;
-            if let Err(e) = self.orchestrator.play(req).await {
+            let lecture = match &contenu {
+                Some(pistes) => self.jouer_le_contenu_du_reveil(target_zone, pistes).await,
+                None => self.orchestrator.play(req).await,
+            };
+            if let Err(e) = lecture {
                 // Rien ne joue la source du réveil : pas de fondu sur la zone.
                 warn!(alarm_id, zone_id = target_zone, error = %e, "alarm_play_error");
                 continue;
@@ -731,6 +878,52 @@ mod tests {
     }
 
     #[test]
+    fn valider_source_accepte_radio_playlist_album() {
+        assert_eq!(
+            valider_source(
+                Some(" Radio "),
+                Some(" https://icecast.radiofrance.fr/fip-hifi.aac ")
+            ),
+            Ok((
+                "radio".into(),
+                "https://icecast.radiofrance.fr/fip-hifi.aac".into()
+            ))
+        );
+        assert!(valider_source(Some("radio"), Some("http://127.0.0.1:8000/live")).is_ok());
+        // Identifiants opaques de #3715 : acceptés tels quels.
+        for id in ["42", "000123", "playlist:abc", "qobuz:playlist:abc"] {
+            assert_eq!(
+                valider_source(Some("playlist"), Some(id)),
+                Ok(("playlist".into(), id.into()))
+            );
+        }
+        assert!(valider_source(Some("album"), Some("17")).is_ok());
+    }
+
+    #[test]
+    fn valider_source_refuse_vide_ou_mal_formee() {
+        for (t, id) in [
+            (None, Some("https://stream.fip.fr/fip.aac")),
+            (Some(""), Some("https://stream.fip.fr/fip.aac")),
+            (Some("podcast"), Some("https://stream.fip.fr/fip.aac")),
+            // Le réveil d'alec_eiffel : `playlist:` sans identifiant.
+            (Some("playlist"), None),
+            (Some("playlist"), Some("")),
+            (Some("album"), Some("   ")),
+            (Some("radio"), None),
+            (Some("radio"), Some("")),
+            (Some("radio"), Some("FIP")),
+            (Some("radio"), Some("stream.fip.fr/fip.aac")),
+            (Some("radio"), Some("https://")),
+            (Some("radio"), Some("ftp://stream.fip.fr/fip.aac")),
+            (Some("radio"), Some("https://stream.fip.fr/fip aac")),
+            (Some("playlist"), Some("12 13")),
+        ] {
+            assert!(valider_source(t, id).is_err(), "{t:?} / {id:?} accepté");
+        }
+    }
+
+    #[test]
     fn parse_multi_zone_ids_valid() {
         let alarm = serde_json::json!({ "multi_zone_ids": "[1,3,5]" });
         assert_eq!(parse_multi_zone_ids(&alarm), vec![1, 3, 5]);
@@ -767,3 +960,6 @@ mod tests {
 
 #[cfg(test)]
 mod reprise_en_main_5669;
+
+#[cfg(test)]
+mod contenus_album_playlist_7058;

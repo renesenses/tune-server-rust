@@ -11,12 +11,47 @@ pub struct M3UEntry {
     pub extra_attrs: HashMap<String, String>,
 }
 
+/// #6998 — Audirvana exporte l'identité Qobuz, pas une URL audio.
+/// La conserver sans interroger le service ni chercher un fichier homonyme.
+pub fn entree_qobuz_audirvana(
+    chemin: &str,
+    titre: Option<&str>,
+    artiste: Option<&str>,
+    duree_ms: Option<i64>,
+) -> Option<crate::db::playlist_repo::ServiceEntry> {
+    let (schema, reste) = chemin.trim().split_once("://")?;
+    if !schema.eq_ignore_ascii_case("qobuz") {
+        return None;
+    }
+    let id = reste.strip_prefix("track/")?;
+    if id.is_empty() || !id.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(crate::db::playlist_repo::ServiceEntry {
+        source: "qobuz".into(),
+        source_id: id.into(),
+        title: titre
+            .filter(|t| !t.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Qobuz {id}")),
+        artist: artiste.map(str::to_owned),
+        album: None,
+        album_source_id: None,
+        duration_ms: duree_ms.filter(|d| *d >= 0),
+        cover_url: None,
+    })
+}
+
 pub fn parse_m3u_content(raw: &[u8], force_utf8: bool) -> Vec<M3UEntry> {
     let text = decode(raw, force_utf8);
     parse_text(&text)
 }
 
-fn decode(raw: &[u8], force_utf8: bool) -> String {
+/// Décodage d'un fichier de playlist : BOM UTF-8 retiré, repli Latin-1 si
+/// les octets ne sont pas de l'UTF-8 (sauf `force_utf8`). Partagé avec
+/// l'import au scan (`playlist_scan`, #7503) pour que les deux chemins lisent
+/// un même fichier de la même façon.
+pub(crate) fn decode(raw: &[u8], force_utf8: bool) -> String {
     if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return String::from_utf8_lossy(&raw[3..]).into_owned();
     }
@@ -140,8 +175,11 @@ fn parse_extinf(line: &str) -> (i32, Option<String>, Option<String>, HashMap<Str
     let rest = &line[8..]; // skip "#EXTINF:"
 
     let mut attrs = HashMap::new();
-    let attr_re = regex::Regex::new(r#"(\w[\w-]*)="([^"]*)""#).unwrap();
-    for cap in attr_re.captures_iter(rest) {
+    // Le fichier importé peut porter des centaines de milliers d'EXTINF :
+    // compiler une seule fois le même motif, pas une fois par piste.
+    static ATTRS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"(\w[\w-]*)="([^"]*)""#).unwrap());
+    for cap in ATTRS.captures_iter(rest) {
         attrs.insert(cap[1].to_lowercase(), cap[2].to_string());
     }
 

@@ -213,7 +213,11 @@ pub async fn subscribe(
     let _guard = state.upnp_index_lock.try_lock().map_err(|_| {
         (
             StatusCode::CONFLICT,
-            Json(json!({"error": "Une indexation est en cours. Réessayez après sa fin."})),
+            Json(crate::message_api::corps_refus(
+                "upnp_indexing_in_progress",
+                "api.upnp.indexingInProgress",
+                &[],
+            )),
         )
     })?;
     let server = state
@@ -225,7 +229,11 @@ pub async fn subscribe(
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
-                Json(json!({"error": "serveur inconnu"})),
+                Json(crate::message_api::corps_refus(
+                    "unknown_server",
+                    "api.upnp.unknownServer",
+                    &[],
+                )),
             )
         })?;
     let key = serde_json::to_string(&(&udn, &request.container)).map_err(error)?;
@@ -273,7 +281,11 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
     let _guard = state.upnp_index_lock.try_lock().map_err(|_| {
         (
             StatusCode::CONFLICT,
-            Json(json!({"error": "Une indexation est en cours. Réessayez après sa fin."})),
+            Json(crate::message_api::corps_refus(
+                "upnp_indexing_in_progress",
+                "api.upnp.indexingInProgress",
+                &[],
+            )),
         )
     })?;
     let mut source = sources(state.backend.as_ref())
@@ -303,9 +315,11 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
             {
                 return Err((
                     StatusCode::CONFLICT,
-                    Json(
-                        json!({"error": "Le bilan a changé. Relisez le nombre de suppressions avant de confirmer."}),
-                    ),
+                    Json(crate::message_api::corps_refus(
+                        "upnp_review_changed",
+                        "api.upnp.reviewChanged",
+                        &[],
+                    )),
                 ));
             }
             // Confirmation is bound to this exact complete snapshot, and expires
@@ -313,7 +327,11 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
             if now_seconds() - source.last_attempt > 3600 {
                 return Err((
                     StatusCode::CONFLICT,
-                    Json(json!({"error": "Bilan expiré : relancez la synchronisation."})),
+                    Json(crate::message_api::corps_refus(
+                        "upnp_review_expired",
+                        "api.upnp.reviewExpired",
+                        &[],
+                    )),
                 ));
             }
             let removed = hors_executeur(&state, &source, |db, s| remove_missing(db, s, true))

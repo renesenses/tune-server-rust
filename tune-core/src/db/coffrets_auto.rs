@@ -63,6 +63,62 @@ pub const CLE_COFFRET: &str = "coffret";
 /// d'identités ([`Coffret::cle`]).
 pub const CLE_REFUS: &str = "coffrets_auto_refuses";
 
+// ---------------------------------------------------------------------------
+// Le réglage « Coffrets automatiques » — #6554 (fil 2294, Marco Polo et Gros
+// Bidon). Go de Bertrand du 19/10/2026.
+// ---------------------------------------------------------------------------
+
+/// Clé, dans `settings`, du réglage de bibliothèque « Réunir et ranger les
+/// coffrets automatiquement ».
+///
+/// Didier range tous ses albums à plusieurs disques en `Album/CD 1`,
+/// `Album/CD 2`… : ils paraissaient TOUS sous Coffrets, alors que ce sont de
+/// simples albums en plusieurs disques. Marco, lui, tient à la réunion
+/// automatique. D'où un réglage, ACTIF par défaut : rien ne change pour qui
+/// n'y touche pas.
+///
+/// Désactivé :
+///
+/// - la [`passe`] ne réunit plus rien (au démarrage, après un scan, après le
+///   surveillant de fichiers) ;
+/// - [`lister`] ne range plus sous Coffrets un album qui n'est que réparti
+///   disque par disque dans des dossiers : il n'y montre que les coffrets
+///   MARQUÉS — composés à la main, ou réunis automatiquement avant que le
+///   réglage soit coupé (on doit pouvoir les y retrouver pour les défaire).
+///
+/// Ce que le réglage ne touche PAS : le scan, qui fait d'`Album/CD 1` et
+/// `Album/CD 2` UN album à deux disques quand leurs balises portent le même
+/// album (C4). C'est ce que disent les fichiers, pas une devinette de Tune ;
+/// les couper en deux albums homonymes serait pire.
+pub const CLE_REGLAGE_AUTO: &str = "library_auto_box_sets";
+
+/// Valeur quand la clé est absente : **actif**, le comportement d'avant.
+pub const REGLAGE_AUTO_DEFAUT: bool = true;
+
+/// Lit une valeur stockée. Seules les formes « fausses » usuelles coupent la
+/// réunion : une valeur absente ou illisible garde le comportement d'avant.
+pub fn reglage_auto_depuis_valeur(valeur: Option<&str>) -> bool {
+    match valeur {
+        None => REGLAGE_AUTO_DEFAUT,
+        Some(v) => !matches!(
+            v.trim().trim_matches('"').to_ascii_lowercase().as_str(),
+            "false" | "0" | "no" | "off"
+        ),
+    }
+}
+
+/// Tune réunit-il et range-t-il les coffrets automatiquement ? Une base
+/// illisible répond le défaut (actif) : c'est ce que faisait Tune jusqu'ici.
+pub fn reunion_automatique_active(db: &Arc<dyn DbBackend>) -> bool {
+    match SettingsRepo::with_backend(db.clone()).get(CLE_REGLAGE_AUTO) {
+        Ok(v) => reglage_auto_depuis_valeur(v.as_deref()),
+        Err(e) => {
+            tracing::warn!(erreur = %e, "coffrets_auto_reglage_illisible");
+            REGLAGE_AUTO_DEFAUT
+        }
+    }
+}
+
 /// Qui a composé le coffret.
 pub const ORIGINE_AUTO: &str = "auto";
 pub const ORIGINE_MANUEL: &str = "manuel";
@@ -893,7 +949,13 @@ fn tenu_a_la_main(id: i64, inv: &Inventaire) -> bool {
 }
 
 /// LA PASSE — au démarrage et après chaque scan. Ne relit aucun fichier.
+///
+/// #6554 — réglage « Coffrets automatiques » coupé ([`CLE_REGLAGE_AUTO`]) :
+/// elle ne lit ni n'écrit rien. Les coffrets déjà réunis le restent.
 pub fn passe(db: &Arc<dyn DbBackend>) -> Result<RapportPasse, TuneError> {
+    if !reunion_automatique_active(db) {
+        return Ok(RapportPasse::default());
+    }
     let inv = inventaire(db)?;
     let refuses = refus(db);
     // Un échec de lecture rend l'ensemble VIDE — même choix que le
@@ -1074,17 +1136,78 @@ pub struct CoffretListe {
     pub disques: i64,
 }
 
-/// Les coffrets : tout album MARQUÉ, plus tout album dont les pistes portent
-/// au moins deux numéros de disque ET vivent dans au moins deux dossiers.
+/// #6411 (fil 2294, décision de Bertrand du 22/10/2026 : regroupement
+/// AUTOMATIQUE) — le nombre de disques à partir duquel un album UNIQUE est
+/// un coffret d'un seul tenant, quand chacun de ses disques porte son propre
+/// nom ([`coffret_d_un_seul_tenant`]).
+///
+/// Pourquoi 3 : le double album ordinaire — studio et instrumental
+/// (Gloryhammer), concert en deux parties, « original » et « bonus » — a
+/// DEUX disques, souvent nommés. Le compter comme coffret, c'est ce que
+/// Didier et Dominique refusent dans le fil (« un multi-disques doit rester
+/// tel quel »). À partir de trois disques nommés chacun autrement, c'est
+/// l'objet que le fil décrit : *The Studio Albums 1978-1991* de Dire Straits,
+/// six albums, un sous-titre par disque.
+pub const SEUIL_DISQUES_COFFRET_D_UN_SEUL_TENANT: usize = 3;
+
+/// #6411 — un album unique est-il un coffret ? `noms` donne, disque par
+/// disque, le nom du disque (balise `DISCSUBTITLE`, feuille CUE, ou nom
+/// posé par Tune ou à la main ; `None` s'il n'en a pas).
+///
+/// Oui si, et seulement si :
+///
+/// 1. il a au moins [`SEUIL_DISQUES_COFFRET_D_UN_SEUL_TENANT`] disques ;
+/// 2. CHAQUE disque a un nom — une intégrale d'opéra en six disques
+///    anonymes reste un album, comme un coffret de disques numérotés que
+///    rien ne distingue ;
+/// 3. les noms sont tous DIFFÉRENTS (casse, accents et espaces près) — six
+///    disques « Bonus » ne sont pas six albums.
+///
+/// Le rangement des fichiers n'y entre pas (un dossier ou un par disque), ni
+/// leur forme (fichiers ou images CUE) : c'est ce que disent les balises.
+pub fn coffret_d_un_seul_tenant(noms: &[Option<String>]) -> bool {
+    if noms.len() < SEUIL_DISQUES_COFFRET_D_UN_SEUL_TENANT {
+        return false;
+    }
+    let mut vus = HashSet::new();
+    noms.iter().all(|n| {
+        let cle = n.as_deref().map(str::trim).unwrap_or_default();
+        !cle.is_empty()
+            && vus.insert(
+                crate::db::engine::fold_diacritics(cle)
+                    .to_lowercase()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+    })
+}
+
+/// Les coffrets : tout album MARQUÉ ; tout album dont les pistes portent au
+/// moins deux numéros de disque ET vivent dans au moins deux dossiers ; et
+/// (#6411) tout album unique d'au moins trois disques nommés chacun
+/// autrement ([`coffret_d_un_seul_tenant`]), en un dossier ou plusieurs.
 ///
 /// ⚠️ Le second critère exclut à dessein le double album rangé dans UN
 /// dossier (pistes 1-01 à 2-12) : c'est un album, pas un coffret rangé disque
-/// par disque. Les albums masqués (#1391) n'y figurent pas.
+/// par disque. Le troisième ne le reprend pas : deux disques ne suffisent
+/// jamais, et des disques sans nom non plus. Les albums masqués (#1391) n'y
+/// figurent pas.
+///
+/// La pochette d'un coffret d'un seul tenant n'est pas touchée : c'est celle
+/// de l'album, la jaquette MAJORITAIRE de ses pistes (#5454). Rien n'est
+/// écrit en base : il est reconnu à chaque lecture, sans geste.
 ///
 /// 🔴 La bibliothèque **LOCALE** seulement, et cela se lit sur la SOURCE des
 /// deux côtés — la piste ET l'album. Le chemin de fichier ne tenait pas ce
 /// rôle : une source distante peut en porter un.
+///
+/// #6554 — réglage « Coffrets automatiques » coupé ([`CLE_REGLAGE_AUTO`]) :
+/// seul le premier critère reste. Un album à plusieurs disques rangé
+/// `Album/CD 1`, `Album/CD 2` n'est plus un coffret ; les albums marqués
+/// (composés à la main, ou réunis automatiquement auparavant) le restent.
 pub fn lister(db: &Arc<dyn DbBackend>) -> Result<Vec<CoffretListe>, TuneError> {
+    let disque_par_disque_compte = reunion_automatique_active(db);
     // Le chemin de [`chemin_ouvrable`] : un coffret réuni depuis des feuilles
     // CUE n'a aucune piste à `file_path` (#5317).
     let sql = format!(
@@ -1099,6 +1222,11 @@ pub fn lister(db: &Arc<dyn DbBackend>) -> Result<Vec<CoffretListe>, TuneError> {
         c = chemin_ouvrable!()
     );
     let marques = marqueurs(db)?;
+    let d_un_seul_tenant = if disque_par_disque_compte {
+        coffrets_d_un_seul_tenant(db)?
+    } else {
+        HashSet::new()
+    };
     let mut rendu = Vec::new();
     for r in db.query_many(&sql, &[])? {
         let Some(id) = r.first().and_then(|v| v.as_i64()) else {
@@ -1108,9 +1236,10 @@ pub fn lister(db: &Arc<dyn DbBackend>) -> Result<Vec<CoffretListe>, TuneError> {
         let premier = r.get(2).and_then(|v| v.as_string()).unwrap_or_default();
         let dernier = r.get(3).and_then(|v| v.as_string()).unwrap_or_default();
         let origine = marques.get(&id).map(|m| m.origine.clone());
-        let range_disque_par_disque =
-            disques >= 2 && !meme_dossier(dossier_de(&premier), dossier_de(&dernier));
-        if origine.is_some() || range_disque_par_disque {
+        let range_disque_par_disque = disque_par_disque_compte
+            && disques >= 2
+            && !meme_dossier(dossier_de(&premier), dossier_de(&dernier));
+        if origine.is_some() || range_disque_par_disque || d_un_seul_tenant.contains(&id) {
             rendu.push(CoffretListe {
                 album_id: id,
                 origine,
@@ -1119,6 +1248,39 @@ pub fn lister(db: &Arc<dyn DbBackend>) -> Result<Vec<CoffretListe>, TuneError> {
         }
     }
     Ok(rendu)
+}
+
+/// #6411 — les albums locaux qui sont des coffrets d'un seul tenant
+/// ([`coffret_d_un_seul_tenant`]). Un disque est nommé dès qu'une de ses
+/// pistes porte un nom de disque ; une piste sans numéro de disque compte
+/// pour le disque 1, comme partout ailleurs.
+fn coffrets_d_un_seul_tenant(db: &Arc<dyn DbBackend>) -> Result<HashSet<i64>, TuneError> {
+    let sql = format!(
+        "SELECT t.album_id, COALESCE(t.disc_number, 1), \
+                MAX(NULLIF(TRIM(t.disc_subtitle), '')) \
+         FROM tracks t JOIN albums a ON a.id = t.album_id \
+         WHERE {piste_locale} AND {album_local} \
+           AND {c} IS NOT NULL AND {caches} \
+         GROUP BY t.album_id, COALESCE(t.disc_number, 1)",
+        piste_locale = crate::db::track_repo::sql::PISTE_LOCALE,
+        album_local = crate::db::track_repo::sql::est_local("a"),
+        caches = super::facet_filter::hidden_albums_excluded(),
+        c = chemin_ouvrable!()
+    );
+    let mut noms: HashMap<i64, Vec<Option<String>>> = HashMap::new();
+    for r in db.query_many(&sql, &[])? {
+        let Some(id) = r.first().and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        noms.entry(id)
+            .or_default()
+            .push(r.get(2).and_then(|v| v.as_string()));
+    }
+    Ok(noms
+        .into_iter()
+        .filter(|(_, n)| coffret_d_un_seul_tenant(n))
+        .map(|(id, _)| id)
+        .collect())
 }
 
 #[cfg(test)]

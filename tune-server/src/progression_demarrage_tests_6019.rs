@@ -105,3 +105,64 @@ async fn le_scan_de_demarrage_annonce_son_parcours_6019() {
          avant la passe `stat` : {indexation:?}"
     );
 }
+
+/// #6371 (Tades, fil 2283, ~550 000 pistes : « pas d'avancement chiffré
+/// depuis le démarrage de Tune ») — le PRÉFILTRE du scan de démarrage
+/// s'annonce comme celui du scan manuel : vérifiés sur repérés (`total` non
+/// nul), et un premier `phase: files` dès sa fin. Avant, un seul `indexing`
+/// à `total: 0`, puis plus rien tant qu'aucun lot n'avait été traité — et
+/// rien du tout sur une bibliothèque inchangée, le cas de chaque démarrage.
+///
+/// Contre-épreuve : rendre à `spawn_auto_scan` son seul `indexing` à
+/// `total: 0` (sans `avancement_du_prefiltre` ni `debut_de_la_lecture`) fait
+/// tomber ce témoin sur ses deux assertions.
+#[tokio::test(flavor = "multi_thread")]
+async fn le_prefiltre_du_scan_de_demarrage_annonce_son_avancement_6371() {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
+    let base = tune_core::test_scratch::scratch_dir("prefiltre-6371-base");
+    let racine = tune_core::test_scratch::scratch_dir_in(
+        std::env::current_dir().unwrap(),
+        "prefiltre-6371-musique",
+    );
+    let etat = crate::state::AppState::new(
+        &base.join("tune-epreuve.db").to_string_lossy(),
+        0,
+        Default::default(),
+    )
+    .expect("AppState sur base de fichier");
+    let db = etat.backend.clone();
+    SettingsRepo::with_backend(db.clone())
+        .set(
+            "music_dirs",
+            &serde_json::to_string(&[racine.to_string_lossy()]).unwrap(),
+        )
+        .unwrap();
+    album_dans(&racine, "Dutilleux", None, None);
+    scan_de_demarrage_sur(&db, &Arc::new(EventBus::new())).await;
+
+    // Second démarrage, bibliothèque inchangée.
+    let bus = Arc::new(EventBus::new());
+    let mut rx = bus.subscribe();
+    scan_de_demarrage_sur(&db, &bus).await;
+
+    let mut progressions = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if ev.event_type == "library.scan.progress" {
+            progressions.push(ev.data);
+        }
+    }
+    assert!(
+        progressions.iter().any(|p| p["phase"] == "indexing"
+            && p["stage"] == "verification"
+            && p["total"].as_i64() == Some(2)),
+        "#6371 : le préfiltre du scan de démarrage n'annonce ni total ni avancement : \
+         {progressions:?}"
+    );
+    assert!(
+        progressions.iter().any(|p| p["phase"] == "files"
+            && p["total"].as_i64() == Some(2)
+            && p["scanned"].as_i64() == Some(2)),
+        "#6371 : aucun `phase: files` à la fin du préfiltre — sur une bibliothèque \
+         inchangée, la barre ne devient jamais déterminée : {progressions:?}"
+    );
+}

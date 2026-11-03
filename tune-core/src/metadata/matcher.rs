@@ -242,11 +242,16 @@ pub async fn lookup_artist(name: &str) -> Option<String> {
     }
     let client = crate::http::client::shared();
     let query = super::mb_artist_query(name);
+    // La base partagée (`musicbrainz.org` en service) : une doublure locale
+    // la remplace dans les témoins de #6463, jamais en production.
     let resp = client
-        .get(format!("{MB_API}/artist"))
+        .get(format!(
+            "{}/artist",
+            super::musicbrainz_release::base_musicbrainz()
+        ))
         .query(&[
             ("query", &query),
-            ("limit", &"1".to_string()),
+            ("limit", &super::MB_ARTIST_CANDIDATES.to_string()),
             ("fmt", &"json".to_string()),
         ])
         .header("User-Agent", MB_UA)
@@ -259,13 +264,8 @@ pub async fn lookup_artist(name: &str) -> Option<String> {
         _ => return None,
     };
 
-    let artists = data.get("artists")?.as_array()?;
-    let best = artists.first()?;
-    let score = best.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
-    if score < 90 {
-        return None;
-    }
-    best.get("id").and_then(|v| v.as_str()).map(String::from)
+    // #6463 — le premier résultat n'est pas forcément l'artiste cherché.
+    super::mb_choisir_artiste(&data, name)
 }
 
 /// Batch-match artists without MBID by searching MusicBrainz.
@@ -327,8 +327,17 @@ pub async fn batch_match_artist_mbids_scoped(
 
     for (i, (artist_id, name)) in artists.iter().enumerate() {
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        if let Some(mbid) = lookup_artist(name).await {
-            repo.update_mbid(*artist_id, &mbid).ok();
+        // #7535 — un MBID déjà porté par une autre fiche n'est pas posé
+        // (`poser_mbid` le journalise) et ne compte pas comme trouvé.
+        if let Some(mbid) = lookup_artist(name).await
+            && repo
+                .poser_mbid(
+                    *artist_id,
+                    &mbid,
+                    crate::db::artist_repo::ProvenanceMbid::Nom,
+                )
+                .unwrap_or(false)
+        {
             matched += 1;
             tracing::debug!(artist_id, name = %name, mbid = %mbid, "artist_mbid_matched");
         }

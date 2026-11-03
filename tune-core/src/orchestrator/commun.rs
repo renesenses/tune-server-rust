@@ -1,5 +1,14 @@
 use super::*;
 
+/// `(nature, id, service, titre, pochette)` du conteneur d'une écoute.
+pub(super) type ContexteResolu = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 impl PlaybackOrchestrator {
     /// Duplicate-network-play detector. Returns `true` when `(source,
     /// source_id)` was recorded as this zone's last network play within
@@ -147,6 +156,9 @@ impl PlaybackOrchestrator {
         annonce: Option<bool>,
         mime_type: &str,
     ) -> String {
+        if erreur.starts_with("hqplayer_output_start_failed:") {
+            return crate::outputs::hqplayer::MESSAGE_ECHEC_DE_SORTIE.into();
+        }
         if dsd_mode == "native" && annonce == Some(false) && est_dsd_brut(mime_type) {
             return format!(
                 "Output device error: le mode DSD de cette zone est réglé sur « natif » \
@@ -160,6 +172,16 @@ impl PlaybackOrchestrator {
     }
 
     pub(super) async fn resolve_stream(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
+        if let Some(resolu) = self.reprendre_preparation_fichier(req).await {
+            return resolu;
+        }
+        self.resolve_stream_frais(req).await
+    }
+
+    pub(super) async fn resolve_stream_frais(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<ResolvedStream, String> {
         // #4407 — le traitement lu AVANT la résolution : si un réglage change
         // pendant qu'elle tourne, l'empreinte notée est l'ancienne, et le
         // prochain changement relancera. Jamais l'inverse.
@@ -269,18 +291,13 @@ impl PlaybackOrchestrator {
     /// manifest, or on any fetch/parse failure — so the caller keeps the
     /// original URL.
     ///
-    /// `.m3u8` est écarté du déréférencement, et ce n'est PAS parce que « le
-    /// manifeste EST le flux, consommé directement par le lecteur » — ce que
-    /// cette phrase affirmait jusqu'à #2307, en annonçant une capacité qui
-    /// n'a jamais existé. Tune n'a aucun chargeur de segments HLS : le seul
-    /// lecteur de flux radio est `decode_radio_stream_to_pcm`, un GET unique
-    /// poussé dans symphonia. Et déréférencer ne servirait à rien non plus :
-    /// une playlist HLS ne porte que des chemins de segments RELATIFS, donc
-    /// le filtre `http(s)` ci-dessous n'y trouverait rien à rendre (constat
-    /// déjà écrit noir sur blanc dans la migration 86, qui a retiré BBC
-    /// Radio 3 pour cette raison). La garde reste donc telle quelle ; c'est
-    /// la LECTURE qui refuse HLS, en le NOMMANT — voir
-    /// [`RADIO_HLS_UNSUPPORTED`].
+    /// `.m3u8` est écarté du déréférencement : une liste HLS n'est pas une
+    /// playlist à déréférencer vers UN flux, c'est un direct découpé en
+    /// segments (aux chemins RELATIFS, que le filtre `http(s)` ci-dessous
+    /// n'aurait de toute façon rien trouvé à rendre). Depuis #6357, c'est le
+    /// lecteur radio (`decode_radio_stream_to_pcm`) qui la reconnaît et la
+    /// confie au chargeur de segments `crate::radio_hls` ; ce qu'il ne lit
+    /// pas encore est refusé en le NOMMANT — voir [`RADIO_HLS_UNSUPPORTED`].
     pub(super) async fn resolve_playlist_url(&self, url: &str) -> Option<String> {
         let path = url
             .split(['?', '#'])
@@ -368,14 +385,38 @@ impl PlaybackOrchestrator {
     where
         F: Fn(&str) -> Option<String>,
     {
+        self.reglages_sortie_locale_selon_le_repli(
+            environnement,
+            crate::demarrage_inacheve::repli_actif(),
+        )
+    }
+
+    /// Même résolution, le repli de démarrage (#6452) en PARAMÈTRE : muter le
+    /// repli global depuis un test changerait l'hôte de tous les autres.
+    ///
+    /// Sous le repli, ce démarrage n'ouvre pas ASIO : la sortie reconstruite à
+    /// la volée doit partir, elle aussi, sur l'hôte par défaut et en partagé —
+    /// sinon le premier appui sur Lecture rouvrirait le pilote que le
+    /// démarrage vient d'écarter (`AsioExclusiveOutput`).
+    pub fn reglages_sortie_locale_selon_le_repli<F>(
+        &self,
+        environnement: F,
+        repli: Option<&str>,
+    ) -> (bool, String)
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let reglages = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
-        let backend = reglages
+        let demande_hote = reglages
             .get("local_audio_backend")
             .ok()
             .flatten()
             .filter(|v| !v.trim().is_empty())
             .or_else(|| crate::config::resolve_local_audio_backend(&environnement))
             .unwrap_or_else(|| "auto".to_string());
+        let repli_applique = repli.is_some()
+            && crate::demarrage_inacheve::hote_susceptible_de_bloquer(&demande_hote);
+        let backend = crate::demarrage_inacheve::hote_de_ce_demarrage(demande_hote, repli);
         let demande = reglages
             .get("local_exclusive_mode")
             .ok()
@@ -386,6 +427,16 @@ impl PlaybackOrchestrator {
                     .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
                     .unwrap_or(false)
             });
+        let arme_par_asio = reglages
+            .get(crate::config::REGLAGE_EXCLUSIF_ARME_PAR_ASIO)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+        let demande = crate::demarrage_inacheve::exclusif_de_ce_demarrage(
+            demande,
+            arme_par_asio,
+            repli_applique,
+        );
         // ASIO est exclusif par nature, et c'est une notion Windows (#1268,
         // #3192). La règle vit dans `tune-core::config` et n'est pas recopiée
         // ici : une seule écriture pour les deux chemins.
@@ -510,11 +561,33 @@ impl PlaybackOrchestrator {
         }
         // Pas de chemin local vivant. Le redémarrage n'a de sens que si quelque
         // chose joue : sinon la prochaine lecture appliquera l'état toute seule.
-        let Some(np) = self.playback.get_state(zone_id).await.now_playing else {
+        //
+        // 🔴 #7556 — « quelque chose joue » se lit dans `state`, PAS dans
+        // `now_playing`. `PlaybackManager::stop` garde `now_playing` pour que
+        // l'interface montre où la lecture s'est arrêtée : sur une zone
+        // ARRÊTÉE après une radio, la bascule voyait encore la station,
+        // refabriquait le flux et la relance (`replay_zone_at_position` →
+        // `play`) remettait la radio en route sans geste de lecture (.18,
+        // zone 10, 31/10). Une bascule de réglage ne lance JAMAIS de lecture.
+        let etat = self.playback.get_state(zone_id).await;
+        let Some(np) = etat.now_playing else {
             return PorteeDuReglage::RienNeJoue;
         };
+        if etat.state == crate::playback::PlayState::Stopped {
+            info!(zone_id, "pure_bascule_zone_arretee_rien_n_est_lance");
+            return PorteeDuReglage::RienNeJoue;
+        }
         let pure = self.zone_audiophile(zone_id);
         match self.traitement_que_pure_gouverne(zone_id, np.track_id) {
+            // #7556 — zone EN PAUSE : la relance la remettrait en lecture. On
+            // garde le flux ; la bascule portera sur la piste suivante.
+            Some(traitement) if etat.state != crate::playback::PlayState::Playing => {
+                info!(
+                    zone_id,
+                    pure, traitement, "pure_bascule_zone_en_pause_flux_conserve"
+                );
+                PorteeDuReglage::PisteSuivante
+            }
             Some(traitement) => {
                 info!(
                     zone_id,
@@ -536,6 +609,35 @@ impl PlaybackOrchestrator {
                 PorteeDuReglage::Immediate
             }
         }
+    }
+
+    /// #6466 — le conteneur d'UNE écoute : celui que porte l'élément de file
+    /// joué (`queue_items.context_*`, posé par « Lire ensuite », « Ajouter à
+    /// la file » et le transfert de zone), et à défaut celui de la SESSION de
+    /// la zone (le dernier « Lire »), comme avant. Rend `(nature, id,
+    /// service, titre, pochette)`.
+    pub(super) fn contexte_de_l_ecoute(
+        &self,
+        etat: &crate::playback::ZoneState,
+        track_id: Option<i64>,
+        source_id: Option<&str>,
+    ) -> ContexteResolu {
+        if let Some(c) = crate::db::contexte_de_file::contexte_de_la_piste_jouee(
+            &self.db,
+            etat.zone_id,
+            etat.queue_position,
+            track_id,
+            source_id,
+        ) {
+            return (Some(c.nature), c.id, c.service, c.titre, c.pochette);
+        }
+        (
+            etat.session_context_type.clone(),
+            etat.session_context_id.clone(),
+            etat.session_context_source.clone(),
+            etat.session_context_title.clone(),
+            etat.session_context_cover.clone(),
+        )
     }
 
     // Un argument par colonne écrite ; une structure changerait tous les appelants pour un gain de forme (clippy 1.98).
@@ -601,6 +703,12 @@ impl PlaybackOrchestrator {
             album_ref,
         })
         .ok();
+
+        if let Err(e) = crate::db::listening_resume::started(
+            &self.db, zone_id, &contexte, source, source_id, title, album, cover_url,
+        ) {
+            tracing::warn!(zone_id, error = %e, "reprise_non_enregistree");
+        }
 
         // NOTE: scrobbling is intentionally NOT dispatched here. It used to fire
         // at play-start, which (a) scrobbled a track the instant it began — so
@@ -710,6 +818,8 @@ impl PlaybackOrchestrator {
         // (`play_without_history`) ne doit pas doublonner la ligne.
         if attente.record_history && attente.source != "radio" {
             let etat = self.playback.get_state(zone_id).await;
+            let contexte =
+                self.contexte_de_l_ecoute(&etat, attente.track_id, attente.source_id.as_deref());
             let album_id = attente.track_id.and_then(|tid| {
                 TrackRepo::with_backend(self.db.clone())
                     .get(tid)
@@ -729,12 +839,12 @@ impl PlaybackOrchestrator {
                 attente.cover_path.as_deref(),
                 etat.session_profile_id,
                 ContexteEcoute {
-                    nature: etat.session_context_type.as_deref(),
-                    id: etat.session_context_id.as_deref(),
+                    nature: contexte.0.as_deref(),
+                    id: contexte.1.as_deref(),
                     rang: rang_a_retenir(etat.shuffle, etat.queue_position),
-                    service: etat.session_context_source.as_deref(),
-                    titre: etat.session_context_title.as_deref(),
-                    pochette: etat.session_context_cover.as_deref(),
+                    service: contexte.2.as_deref(),
+                    titre: contexte.3.as_deref(),
+                    pochette: contexte.4.as_deref(),
                 },
                 None,
             );
@@ -771,15 +881,57 @@ impl PlaybackOrchestrator {
             confirmations.noter(zone_id, stream_id, joue && en_attente);
         }
         if !en_attente {
+            if joue {
+                self.memoriser_position_du_lecteur(zone_id, stream_id, position_ms)
+                    .await;
+            }
             return SignalDuLecteur::RienEnAttente;
         }
         if !joue {
             return SignalDuLecteur::PasEncoreDeLecture;
         }
         if self.confirmer_lecture_navigateur(zone_id, stream_id).await {
+            self.memoriser_position_du_lecteur(zone_id, stream_id, position_ms)
+                .await;
             SignalDuLecteur::Confirmee
         } else {
             SignalDuLecteur::RienEnAttente
+        }
+    }
+
+    /// Position MESURÉE par le lecteur du flux courant, jamais une horloge estimée.
+    async fn memoriser_position_du_lecteur(&self, zone_id: i64, stream_id: &str, position_ms: i64) {
+        let state = self.playback.get_state(zone_id).await;
+        if position_ms <= 0
+            || state.state != PlayState::Playing
+            || !state
+                .now_playing
+                .as_ref()
+                .is_some_and(|np| np.stream_id.as_deref() == Some(stream_id))
+            || ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .is_none_or(|zone| zone.output_type.as_deref() != Some("browser"))
+        {
+            return;
+        }
+        self.playback.update_position(zone_id, position_ms).await;
+        let state = self.playback.get_state(zone_id).await;
+        let _ = crate::db::listening_resume::track_position(&self.db, &state);
+        if let Some(np) = state
+            .now_playing
+            .as_ref()
+            .filter(|np| np.source == "podcast")
+            && let Some(url) = np.source_id.as_deref()
+        {
+            let _ = crate::db::listening_resume::podcast_position_avec_duree(
+                &self.db,
+                zone_id,
+                url,
+                state.position_ms,
+                np.duration_ms,
+            );
         }
     }
 
@@ -804,6 +956,22 @@ impl PlaybackOrchestrator {
         muted: bool,
         device_id: Option<&str>,
     ) -> OutputCommandResult<()> {
+        let zone_air = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .filter(|z| {
+                z.output_type.as_deref() == Some(crate::outputs::devialet_air::TYPE_DE_SORTIE)
+            });
+        let file_air = zone_air
+            .as_ref()
+            .and_then(|z| z.output_device_id.as_deref())
+            .map(|did| self.volume_coalesceur.file(did, zone_id));
+        if let Some(ref zone) = zone_air {
+            self.playback
+                .marquer_geste_air(zone_id, zone.volume / 100.0, zone.muted)
+                .await;
+        }
         if let Some(did) = device_id {
             let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
                 OutputCommandError::failed(
@@ -812,6 +980,16 @@ impl PlaybackOrchestrator {
                 )
             })?;
             output.lock().await.checked_set_mute(muted).await?;
+        }
+        let _tenue_air = if let Some(ref file) = file_air {
+            Some(file.etat.lock().await)
+        } else {
+            None
+        };
+        if let Some(ref zone) = zone_air {
+            self.playback
+                .marquer_geste_air(zone_id, zone.volume / 100.0, zone.muted)
+                .await;
         }
         self.playback.set_mute(zone_id, muted).await;
         ZoneRepo::with_backend(self.db.clone())
@@ -844,6 +1022,11 @@ impl PlaybackOrchestrator {
             .await;
     }
 
+    /// #6932 — voir [`AudioStreamer::stream_servi_jusqu_au_bout`].
+    pub async fn streamer_servi_jusqu_au_bout(&self, stream_id: &str) -> bool {
+        self.streamer.stream_servi_jusqu_au_bout(stream_id).await
+    }
+
     /// Taille totale du flux (voir [`AudioStreamer::stream_total_bytes`]).
     pub async fn streamer_total_bytes(&self, stream_id: &str) -> Option<u64> {
         self.streamer.stream_total_bytes(stream_id).await
@@ -851,7 +1034,19 @@ impl PlaybackOrchestrator {
 
     pub(super) async fn persist_position(&self, zone_id: i64) {
         let state = self.playback.get_state(zone_id).await;
+        let _ = crate::db::listening_resume::track_position(&self.db, &state);
         if let Some(ref np) = state.now_playing {
+            if np.source == "podcast" {
+                if let Some(url) = np.source_id.as_deref() {
+                    let _ = crate::db::listening_resume::podcast_position_avec_duree(
+                        &self.db,
+                        zone_id,
+                        url,
+                        state.position_ms,
+                        np.duration_ms,
+                    );
+                }
+            }
             ZoneRepo::with_backend(self.db.clone())
                 .save_playback_position(
                     zone_id,

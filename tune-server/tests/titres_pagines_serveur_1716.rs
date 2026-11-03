@@ -277,7 +277,7 @@ async fn recherche_provenance_et_comptes_comme_le_navigateur() {
 #[tokio::test(flavor = "multi_thread")]
 async fn un_parametre_invalide_est_refuse() {
     let (_d, _state, app) = etat().await;
-    for requete in ["sort=plays", "sort=nimporte", "order=up", "counts=albums"] {
+    for requete in ["sort=dr", "sort=nimporte", "order=up", "counts=albums"] {
         let (statut, _) = get(&app, requete).await;
         assert_eq!(statut, StatusCode::BAD_REQUEST, "{requete}");
     }
@@ -285,4 +285,26 @@ async fn un_parametre_invalide_est_refuse() {
     assert_eq!(statut, StatusCode::OK);
     assert_eq!(v["sort"], Value::Null);
     assert_eq!(v["order"], "desc");
+}
+
+/// #1470 : les clés émises par le client passent la route et trient l'historique.
+#[tokio::test(flavor = "multi_thread")]
+async fn i1470_la_route_accepte_et_applique_les_tris_d_ecoutes() {
+    let (_d, state, app) = etat().await;
+    state
+        .backend
+        .execute_batch(
+            "INSERT INTO listen_history (title, artist_name, source, listened_at) VALUES
+             ('été 1', 'Artiste 2', 'local', '2026-10-01T10:00:00Z'),
+             ('été 1', 'Artiste 2', 'local', '2026-10-02T10:00:00Z'),
+             ('Piste 2', 'Artiste 2', 'local', '2026-10-10T10:00:00Z');",
+        )
+        .unwrap();
+    for (cle, attendu) in [("plays", [1, 2]), ("lastPlayed", [2, 1])] {
+        let (statut, v) = get(&app, &format!("sort={cle}&order=desc&limit=2")).await;
+        assert_eq!(statut, StatusCode::OK, "sort={cle} doit être accepté");
+        assert_eq!(v["sort"], cle);
+        assert_eq!(ids(&v), attendu, "sort={cle} doit suivre l'historique");
+        assert_eq!(v["total"], (ALBUMS - 1) * PISTES_PAR_ALBUM);
+    }
 }

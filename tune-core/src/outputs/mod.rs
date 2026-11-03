@@ -22,6 +22,7 @@ pub mod capacite_dsd_natif;
 pub mod chromecast;
 #[cfg(all(target_os = "macos", feature = "local-audio"))]
 pub mod coreaudio_exclusive;
+pub mod devialet_air;
 pub mod didl;
 pub mod dlna;
 pub mod dlna_annonce_suivante;

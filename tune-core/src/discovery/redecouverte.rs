@@ -133,6 +133,24 @@ pub async fn rechercher_location_par_unicast(
     None
 }
 
+/// #6961 — la `LOCATION` actuelle d'un renderer, demandée à l'hôte de sa
+/// `LOCATION` mémorisée.
+///
+/// Pour le démarrage : un renderer allumé AVANT le serveur ne s'annonce plus
+/// (son `NOTIFY` est parti à son propre démarrage, quand personne n'écoutait),
+/// et s'il a tiré un nouveau port en redémarrant, la sonde HTTP de l'adresse
+/// mémorisée échoue. On lui demande alors directement où il est, comme
+/// [`redecouvrir`] le fait pour une sortie déjà enregistrée.
+pub async fn location_actuelle_par_unicast(
+    location_connue: &str,
+    port_ssdp: u16,
+    device_id: &str,
+    budget: Duration,
+) -> Option<String> {
+    let ip = host_from_location(location_connue)?;
+    rechercher_location_par_unicast(&ip, port_ssdp, device_id, budget).await
+}
+
 /// Relit le descriptif à `location` et en tire les URLs de contrôle absolues.
 ///
 /// Refuse un descriptif sans `AVTransport` ni `RenderingControl` : ce n'est

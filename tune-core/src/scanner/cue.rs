@@ -437,7 +437,9 @@ pub fn parse_cue_bytes(bytes: &[u8]) -> CueSheet {
         let (le, be) = (&bytes[..2] == b"\xff\xfe", &bytes[..2] == b"\xfe\xff");
         if le || be {
             let units: Vec<u16> = bytes[2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| {
                     if le {
                         u16::from_le_bytes([c[0], c[1]])

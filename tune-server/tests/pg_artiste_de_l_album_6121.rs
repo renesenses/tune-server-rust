@@ -168,3 +168,99 @@ async fn pg_6121_artiste_de_l_album_dans_les_collections_et_les_playlists() {
 
     menage(&state);
 }
+
+/// #6232 (forum 2218) — « Interprète » : la balise ARTIST de la piste
+/// (`track_metadata['track_artist']`), à défaut l'artiste de la piste, et une
+/// tenue d'artiste qui l'emporte (`LIKE` sur le JSON de `champs_tenus`). Le
+/// SQL est neuf : sous-requêtes corrélées dans un `CASE`, lues par les deux
+/// moteurs. Même routeur, même étape de CI que #6121.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_6232_interprete_dans_les_collections_et_les_playlists() {
+    const M: &str = "interprete-6232";
+    let Some(url) = url_pg() else {
+        eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
+        return;
+    };
+    let state = etat_postgres(&url);
+    let b = state.backend.clone();
+    let menage_6232 = || {
+        for sql in [
+            format!(
+                "DELETE FROM track_metadata WHERE track_id IN (SELECT t.id FROM tracks t \
+                 JOIN albums al ON t.album_id = al.id WHERE al.title LIKE '{M}%')"
+            ),
+            format!(
+                "DELETE FROM tracks WHERE album_id IN (SELECT id FROM albums WHERE title LIKE '{M}%')"
+            ),
+            format!("DELETE FROM albums WHERE title LIKE '{M}%'"),
+            format!("DELETE FROM artists WHERE name LIKE '{M}%'"),
+        ] {
+            b.execute(&sql, &[])
+                .unwrap_or_else(|e| panic!("ménage « {sql} » : {e}"));
+        }
+    };
+    menage_6232();
+
+    let beatles_nom = format!("{M} Beatles");
+    let beatles = b
+        .execute_returning_id(
+            "INSERT INTO artists (name) VALUES (?)",
+            &[&beatles_nom as &dyn ToSqlValue],
+        )
+        .expect("artiste");
+    let titre_album = format!("{M} Abbey Road");
+    let album = b
+        .execute_returning_id(
+            "INSERT INTO albums (title, artist_id) VALUES (?, ?)",
+            &[&titre_album as &dyn ToSqlValue, &beatles],
+        )
+        .expect("album");
+    let piste = |titre: &str| {
+        let chemin = format!("/m/{M}/{titre}.flac");
+        b.execute_returning_id(
+            "INSERT INTO tracks (album_id, artist_id, title, file_path) VALUES (?, ?, ?, ?)",
+            &[&album as &dyn ToSqlValue, &beatles, &titre, &chemin],
+        )
+        .expect("piste")
+    };
+    let come = piste("Come Together");
+    piste("Something");
+    let balise = format!("{M} Beatles & Genesis");
+    b.execute(
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'track_artist', ?)",
+        &[&come as &dyn ToSqlValue, &balise],
+    )
+    .expect("balise ARTIST");
+
+    let regle = |op: &str, v: &str| json!({"field": "track_artist", "op": op, "value": v});
+    let coll = "/api/v1/library/smart-collections/preview";
+    let pl = "/api/v1/library/smart-playlists/preview";
+
+    // 1. La balise d'UNE piste amène l'album, et la piste.
+    let r = apercu(&state, coll, regle("contains", "genesis")).await;
+    assert_eq!(titres(&r["albums"]), vec![titre_album.clone()], "{r}");
+    let r = apercu(&state, pl, regle("contains", "genesis")).await;
+    assert_eq!(
+        titres(&r["tracks"]),
+        vec!["Come Together".to_string()],
+        "{r}"
+    );
+    assert_eq!(r["regles_refusees"], json!([]), "{r}");
+    // 2. Sans balise : l'artiste de la piste répond.
+    let r = apercu(&state, pl, regle("=", &beatles_nom)).await;
+    assert_eq!(titres(&r["tracks"]), vec!["Something".to_string()], "{r}");
+    // 3. « ne contient pas » : aucune piste de l'album ne contient.
+    let r = apercu(&state, coll, regle("not_contains", "genesis")).await;
+    assert!(!titres(&r["albums"]).contains(&titre_album), "{r}");
+    // 4. Un artiste tenu à la main l'emporte sur la balise.
+    let tenue = format!(r#"{{"chemin":"/m/{M}/Come Together.flac","artist_id":{beatles}}}"#);
+    b.execute(
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'champs_tenus', ?)",
+        &[&come as &dyn ToSqlValue, &tenue],
+    )
+    .expect("tenue");
+    let r = apercu(&state, pl, regle("contains", "genesis")).await;
+    assert_eq!(titres(&r["tracks"]), Vec::<String>::new(), "{r}");
+
+    menage_6232();
+}

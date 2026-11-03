@@ -266,7 +266,17 @@ async fn le_scan_complet_ne_rouvre_pas_un_fichier_qui_a_deja_ses_metadonnees_ete
     // Une métadonnée étendue en base, d'une valeur que le fichier ne porte
     // pas : si le scan rouvre le fichier, il l'écrase par `Ludwig van
     // Beethoven`.
-    poser(&etat.backend, id, &[("composer", TEMOIN_NON_ROUVERT)]);
+    // #6781 : `track_artist` aussi — la piste a été relue depuis #6232. Sans
+    // elle, le scan complet la rouvre pour poser sa balise ARTIST (voir
+    // l'épreuve 3 bis).
+    poser(
+        &etat.backend,
+        id,
+        &[
+            ("composer", TEMOIN_NON_ROUVERT),
+            ("track_artist", TEMOIN_NON_ROUVERT),
+        ],
+    );
 
     scan_manuel(&etat, true).await;
 
@@ -276,6 +286,33 @@ async fn le_scan_complet_ne_rouvre_pas_un_fichier_qui_a_deja_ses_metadonnees_ete
         "un fichier INCHANGÉ qui a déjà ses métadonnées étendues ne doit pas être rouvert : \
          sinon le second passage sur toute la bibliothèque (47 079 pistes sur le .18) se \
          repaierait à CHAQUE scan complet au lieu d'une seule fois (#5043). Lignes lues : {:?}",
+        cles(&etat.backend, id)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3 bis. #6781 (Didier, fil 2218) — une piste relue AVANT la clé
+//    `track_artist` (#6232, rc7) a ses crédits mais pas sa balise ARTIST. Le
+//    scan complet la déclarait pourvue et ne la rouvrait jamais : le critère
+//    « Interprète de la piste » lisait le repli, l'artiste de l'ALBUM.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn le_scan_complet_pose_la_balise_artist_d_une_piste_relue_avant_6232() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
+    let (_racine, etat, id) = bibliotheque_dantan("avant-6232").await;
+
+    // L'état d'une bibliothèque relue en rc6 : des crédits, pas de
+    // `track_artist`.
+    poser(&etat.backend, id, &[("composer", COMPOSITEUR)]);
+
+    scan_manuel(&etat, true).await;
+
+    assert_eq!(
+        valeur(&etat.backend, id, "track_artist").as_deref(),
+        Some("Berliner Philharmoniker"),
+        "le scan COMPLET doit rouvrir une piste relue avant #6232 pour y poser la balise          ARTIST : sans elle, « Interprète de la piste » ne la trouve jamais (#6781). Lignes          lues : {:?}",
         cles(&etat.backend, id)
     );
 }

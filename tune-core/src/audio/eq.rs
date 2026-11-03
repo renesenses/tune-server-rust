@@ -30,6 +30,58 @@ pub const RAMPE_DE_BASCULE_MS: u32 = 300;
 /// biquad hérite de l'historique et ne claque pas.
 pub const SEUIL_DE_RAMPE_DB: f64 = 1.0;
 
+/// #6211 — durée du fondu qui éteint le préampli GARDÉ d'un égaliseur coupé
+/// sur un flux SANS FIN (radio).
+///
+/// Décision de Bertrand du 19/10 : la règle #5215 (le préampli gardé vaut
+/// jusqu'à la piste suivante) n'a pas de fin sur une radio, qui n'a pas de
+/// piste suivante — le niveau restait baissé jusqu'à la relance de la
+/// station (fil 2242). Sur un flux sans fin, le gain gardé revient donc à
+/// 0 dB par une rampe (linéaire en dB) de quelques secondes : assez lente
+/// pour ne faire entendre aucune marche, assez courte pour que « remettre à
+/// plat » rende le niveau d'avant l'égaliseur.
+///
+/// #6524 (b) — la même rampe vaut aussi pour une PISTE, une fois la courbe
+/// effacée (fondu de [`RAMPE_DE_BASCULE_MS`] à niveau constant, #5215), mais
+/// sans jamais monter (arbitrage de Bertrand du 21/10) : elle ne retire que
+/// la part d'un gain gardé SUPÉRIEURE à 1, `min(g, 1)`. Un préampli négatif,
+/// le cas normal, reste gardé jusqu'au prochain geste de l'auditeur, comme
+/// le veut #5215 : le niveau ne remonte jamais tout seul.
+///
+/// Décision de Bertrand du 21/10 vers 18 h : « jamais de hausse » vaut
+/// PARTOUT, radio comprise. Elle remplace celle du 19/10 sur ce seul point :
+/// sur une radio aussi, la rampe va de `g` à `min(g, 1)`.
+///
+/// Décision du 22/10 (#6741) : un gain gardé INFÉRIEUR à 1 remonte à son
+/// tour vers le niveau d'avant l'égaliseur, sans jamais le dépasser (voir
+/// [`REMONTEE_DB_PAR_SECONDE`]). La part supérieure à 1 s'éteint comme avant.
+pub const EXTINCTION_SUR_FLUX_SANS_FIN_MS: u32 = 3_000;
+
+/// #6741 — vitesse de la REMONTÉE du préampli gardé vers le niveau d'avant
+/// l'égaliseur, en dB par seconde.
+///
+/// Décision de Bertrand du 22/10 (suite de #6211 et #6524) : couper
+/// l'égaliseur rend le niveau d'avant, sans jamais le dépasser et jamais par
+/// un saut. La décision du 21/10 (« jamais de hausse », #6708) laissait un
+/// préampli négatif appliqué jusqu'au prochain geste ; il remonte désormais
+/// par une rampe linéaire en dB, à cette vitesse, et jamais plus vite que
+/// [`EXTINCTION_SUR_FLUX_SANS_FIN_MS`] : −8,4 dB reviennent en 4,2 s. La
+/// cible est bornée au niveau d'avant l'égaliseur, volume compris (voir
+/// [`EqProcessor::borner_la_remontee`]).
+pub const REMONTEE_DB_PAR_SECONDE: f64 = 2.0;
+
+/// #6211 — extinction en cours du préampli gardé : `depart` est le gain par
+/// coefficient au début de la rampe, `vers` celui de la fin
+/// (`min(depart, 1)` au-dessus de 1, #6524 b ; la borne de remontée en
+/// dessous, #6741), `fait`/`total` comptent
+/// des trames.
+struct Extinction {
+    depart: Vec<f32>,
+    vers: Vec<f32>,
+    total: usize,
+    fait: usize,
+}
+
 /// Fondu enchaîné en cours : le signal passe de `depart` (l'égaliseur qu'on
 /// quitte, ou le signal SEC quand `None`) au traitement courant.
 struct Fondu {
@@ -37,6 +89,17 @@ struct Fondu {
     total: usize,
     fait: usize,
     tampon: Vec<f32>,
+}
+
+/// #6741 — le gain qu'un égaliseur COUPÉ applique encore (voir
+/// [`EqProcessor::preampli_garde`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreampliGarde {
+    /// En dB : négatif pour un préampli gardé, le cas normal.
+    pub db: f64,
+    /// Vrai pendant la rampe qui le ramène vers le niveau d'avant
+    /// l'égaliseur ; faux quand il est gardé jusqu'au prochain réglage.
+    pub en_retour: bool,
 }
 
 pub struct EqProcessor {
@@ -53,9 +116,22 @@ pub struct EqProcessor {
     gain_moyen_db: f64,
     /// #5215 (décision du 10/10) — gain linéaire par canal que porte un
     /// égaliseur COUPÉ en vol : le préampli (et la compensation portée) de
-    /// celui qu'on quitte, pour que le niveau perçu ne bouge pas. `None` :
-    /// identité, le neutre se retire une fois son fondu fini.
+    /// celui qu'on quitte, pour que le niveau perçu ne bouge pas pendant le
+    /// fondu de la courbe ; ensuite il revient vers le niveau d'avant
+    /// l'égaliseur sans le dépasser (#6524 b, #6741). `None` : identité, le
+    /// neutre se retire une fois son fondu fini.
     gain_garde: Option<Vec<f32>>,
+    /// #6211 — sur un flux sans fin, la part du préampli gardé supérieure à
+    /// 1 s'éteint en fondu (voir [`Self::eteindre_le_preampli_garde`]).
+    /// #6741 — la même rampe fait aussi REMONTER un gain gardé inférieur à 1,
+    /// jusqu'à la borne de [`Self::borner_la_remontee`].
+    extinction: Option<Extinction>,
+    /// #6741 — rapport « volume d'avant l'égaliseur / volume courant » : la
+    /// remontée d'un gain gardé ne le franchit jamais. 1,0 quand le volume
+    /// n'a pas monté. 0 (le défaut) tant que la sortie n'a posé aucune borne :
+    /// sans niveau d'avant connu, le gain reste gardé jusqu'au prochain
+    /// réglage, comme le voulait la décision du 21/10 (#6708).
+    borne_de_remontee: f32,
     clipping: CompteurDEcretage,
     closed: AtomicBool,
 }
@@ -109,6 +185,9 @@ impl EqProcessor {
             compensation: 1.0,
             gain_moyen_db,
             gain_garde: None,
+            extinction: None,
+            // #6741 — 0 : sans borne posée par la sortie, rien ne remonte.
+            borne_de_remontee: 0.0,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
@@ -121,6 +200,11 @@ impl EqProcessor {
     /// retirait jusqu'ici une réserve de −12,56 dB : +12 dB d'un coup au
     /// casque (Levente Toth, fil 1974), puis en 200 ms. Désormais le niveau
     /// perçu reste celui de l'instant ; seule la courbe s'efface, par le fondu.
+    ///
+    /// #6524 (b) — le fondu de la courbe fini, la part de ce gain supérieure
+    /// à 1 s'éteint en [`EXTINCTION_SUR_FLUX_SANS_FIN_MS`] (voir
+    /// `process_interleaved`) ; une part inférieure à 1 remonte vers le niveau
+    /// d'avant l'égaliseur, sans le dépasser (#6741).
     fn neutre(precedent: &Self) -> Self {
         let canaux = precedent.channels.max(1);
         let gains: Vec<f32> = (0..canaux)
@@ -141,6 +225,8 @@ impl EqProcessor {
             compensation: 1.0,
             gain_moyen_db: 0.0,
             gain_garde: (!identite).then_some(gains),
+            extinction: None,
+            borne_de_remontee: precedent.borne_de_remontee,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
@@ -255,8 +341,9 @@ impl EqProcessor {
     /// #5215 (décision de Bertrand du 10/10, seconde partie) — tant que
     /// l'égaliseur reste COUPÉ, le préampli gardé vaut pour TOUTES les pistes
     /// suivantes, sans saut. Rend, pour la piste qui commence, un neutre qui
-    /// porte le même gain, sans fondu (début de piste : rien à fondre). `None`
-    /// quand `self` n'est pas un neutre qui garde un préampli.
+    /// porte le gain atteint, sans fondu (début de piste : rien à fondre) ; la
+    /// part supérieure à 1 y reprend son extinction (#6524 b). `None` quand
+    /// `self` n'est pas un neutre qui garde un préampli.
     ///
     /// Un gain identique sur tous les canaux (le cas d'un préampli) est rangé
     /// en un seul coefficient : il vaut alors quel que soit le nombre de
@@ -278,7 +365,7 @@ impl EqProcessor {
             // que de décaler les canaux.
             vec![gains.iter().sum::<f32>() / gains.len() as f32]
         };
-        Some(Self {
+        let mut reporte = Self {
             engine: Engine::Neutre,
             sample_rate,
             channels,
@@ -286,9 +373,177 @@ impl EqProcessor {
             compensation: 1.0,
             gain_moyen_db: 0.0,
             gain_garde: Some(gains),
+            extinction: None,
+            borne_de_remontee: self.borne_de_remontee,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
+        };
+        // #6524 (b) — la part du gain reporté supérieure à 1 reprend son
+        // rampe là où la piste précédente l'a laissée, vers la même borne (#6741).
+        reporte.eteindre_sans_hausse();
+        Some(reporte)
+    }
+
+    /// #6211 — sur un flux SANS FIN (radio), l'extinction part dès la
+    /// coupure, par une rampe de [`EXTINCTION_SUR_FLUX_SANS_FIN_MS`], linéaire
+    /// en dB. Décision de Bertrand du 21/10 (elle remplace celle du 19/10 sur
+    /// ce point) : la rampe va de `g` à `min(g, 1)`. Depuis le 22/10 (#6741),
+    /// un préampli négatif remonte aussi, jusqu'au niveau d'avant
+    /// l'égaliseur et jamais au-delà ([`Self::borner_la_remontee`]) ; revenu à
+    /// 0 dB, le neutre se retire ([`Self::est_neutre_au_repos`]).
+    ///
+    /// Sans effet sur un égaliseur actif, sur un neutre qui ne garde rien, ou
+    /// quand une extinction est déjà en cours. Sur une radio elle part dès la
+    /// coupure ; sur tout flux, elle part aussi à la fin du fondu de la
+    /// courbe (#6524 b).
+    pub fn eteindre_le_preampli_garde(&mut self) {
+        self.lancer_l_extinction();
+    }
+
+    /// #6524 (b) puis #6741 : à la fin du fondu de la courbe, la part du gain
+    /// gardé supérieure à 1 s'éteint, et une part inférieure à 1 remonte
+    /// jusqu'à la borne de [`Self::borner_la_remontee`], jamais au-delà.
+    fn eteindre_sans_hausse(&mut self) {
+        self.lancer_l_extinction();
+    }
+
+    /// La rampe du gain gardé vers sa cible, radio comme piste : `min(g, 1)`
+    /// pour la part supérieure à 1 (décision du 21/10), et, depuis le 22/10
+    /// (#6741), une REMONTÉE vers le niveau d'avant l'égaliseur pour un gain
+    /// inférieur à 1, bornée par [`Self::borner_la_remontee`].
+    fn lancer_l_extinction(&mut self) {
+        if !self.est_neutre() || self.extinction.is_some() {
+            return;
+        }
+        let Some(depart) = self.gain_garde.clone() else {
+            return;
+        };
+        self.lancer_la_rampe(depart);
+    }
+
+    /// #6741 — la cible d'un gain gardé : jamais au-dessus de 1 (le niveau
+    /// d'avant l'égaliseur à volume égal), jamais au-dessus de la borne de
+    /// volume, et jamais en dessous du gain courant pour un gain inférieur à
+    /// 1 — la remontée ne fait jamais baisser le niveau.
+    fn cible_du_gain_garde(&self, g: f32) -> f32 {
+        if g >= 1.0 {
+            return 1.0;
+        }
+        self.borne_de_remontee.min(1.0).max(g)
+    }
+
+    fn lancer_la_rampe(&mut self, depart: Vec<f32>) {
+        let vers: Vec<f32> = depart
+            .iter()
+            .map(|&g| self.cible_du_gain_garde(g))
+            .collect();
+        if depart.iter().zip(&vers).all(|(d, v)| (d - v).abs() < 1e-6) {
+            self.extinction = None;
+            self.gain_garde = (!depart.iter().all(|g| (g - 1.0).abs() < 1e-6)).then_some(depart);
+            return;
+        }
+        // Une remontée va à `REMONTEE_DB_PAR_SECONDE` ; la rampe ne dure
+        // jamais moins que celle de l'extinction.
+        let ecart_db = depart
+            .iter()
+            .zip(&vers)
+            .filter(|(d, v)| v > d && **d > 0.0)
+            .map(|(d, v)| 20.0 * f64::from(v / d).log10())
+            .fold(0.0_f64, f64::max);
+        let ms = f64::from(EXTINCTION_SUR_FLUX_SANS_FIN_MS)
+            .max(ecart_db / REMONTEE_DB_PAR_SECONDE * 1000.0);
+        let total = (f64::from(self.sample_rate) * ms / 1000.0).max(1.0) as usize;
+        self.extinction = Some(Extinction {
+            depart,
+            vers,
+            total,
+            fait: 0,
+        });
+    }
+
+    /// #6741 — borner la remontée du gain gardé au niveau d'avant
+    /// l'égaliseur, volume compris.
+    ///
+    /// `borne` est le rapport du volume d'avant l'activation de l'égaliseur au
+    /// volume courant. À volume inchangé, il vaut 1 : le gain gardé remonte
+    /// jusqu'au signal sec. Si l'auditeur a monté le volume pendant que
+    /// l'égaliseur jouait (pour compenser son préampli), le signal sec
+    /// dépasserait le niveau d'avant : la remontée s'arrête alors à `borne`,
+    /// et le reste est gardé jusqu'au prochain réglage. Une borne nulle,
+    /// négative ou illisible ne libère rien.
+    ///
+    /// Appelée à l'installation et à chaque geste de volume. Elle ne fait
+    /// jamais baisser le gain (la cible n'est jamais sous le gain courant), et
+    /// ne fait jamais sauter le niveau : une rampe en cours repart du gain
+    /// atteint, vers la nouvelle cible. Sans effet hors d'un égaliseur coupé.
+    pub fn borner_la_remontee(&mut self, borne: f64) {
+        // Une borne illisible ne libère rien : le gain reste gardé.
+        let borne = if borne.is_finite() && borne > 0.0 {
+            borne.min(1.0) as f32
+        } else {
+            0.0
+        };
+        if (borne - self.borne_de_remontee).abs() < 1e-5 {
+            return;
+        }
+        self.borne_de_remontee = borne;
+        if !self.est_neutre() || self.fondu.is_some() {
+            // Pendant le fondu de la courbe, la borne sert à la fin du fondu.
+            return;
+        }
+        let atteint: Option<Vec<f32>> = match self.extinction.take() {
+            Some(ext) => {
+                let coefs = ext.depart.len().max(1);
+                Some(
+                    (0..coefs)
+                        .map(|c| Self::gain_de_la_rampe(&ext, 0, c))
+                        .collect(),
+                )
+            }
+            None => self.gain_garde.clone(),
+        };
+        if let Some(depart) = atteint {
+            self.lancer_la_rampe(depart);
+        }
+    }
+
+    /// #6741 — ce qu'un égaliseur coupé applique encore, pour le voyant :
+    /// `None` hors d'un neutre qui garde un gain ; sinon le gain gardé en dB
+    /// (le plus éloigné de 0 dB sur les canaux) et s'il est en train de
+    /// revenir vers sa cible.
+    pub fn preampli_garde(&self) -> Option<PreampliGarde> {
+        if !self.est_neutre() {
+            return None;
+        }
+        let gains: Vec<f32> = match &self.extinction {
+            Some(ext) => {
+                let coefs = ext.depart.len().max(1);
+                (0..coefs)
+                    .map(|c| Self::gain_de_la_rampe(ext, 0, c))
+                    .collect()
+            }
+            None => self.gain_garde.clone()?,
+        };
+        let db = gains
+            .iter()
+            .filter(|g| **g > 0.0)
+            .map(|g| 20.0 * f64::from(*g).log10())
+            .fold(0.0_f64, |a, b| if b.abs() > a.abs() { b } else { a });
+        Some(PreampliGarde {
+            db,
+            en_retour: self.extinction.is_some(),
         })
+    }
+
+    fn gain_de_la_rampe(ext: &Extinction, trame: usize, c: usize) -> f32 {
+        let t = ((ext.fait + trame) as f32 / ext.total as f32).min(1.0);
+        // Linéaire en dB : g^(1 - t) · v^t, de g (t = 0) à v (t = 1).
+        ext.depart[c].powf(1.0 - t) * ext.vers[c].powf(t)
+    }
+
+    /// #6211 — le préampli gardé est-il en train de s'éteindre ?
+    pub fn en_extinction(&self) -> bool {
+        self.extinction.is_some()
     }
 
     /// #5215 — égaliseur coupé dont le fondu est fini ET qui ne garde aucun
@@ -378,10 +633,22 @@ impl EqProcessor {
         fondu.fait += samples.len() / canaux;
         if fondu.fait < fondu.total {
             self.fondu = Some(fondu);
+        } else {
+            // #6524 (b) — la courbe s'est effacée à niveau constant (#5215) :
+            // la part du gain gardé supérieure à 1 s'éteint maintenant, en
+            // fondu, et un gain inférieur à 1 remonte jusqu'à sa borne (#6741),
+            // jamais au-delà du niveau d'avant l'égaliseur. Sans effet hors d'un neutre qui garde
+            // un gain supérieur à 1.
+            self.eteindre_sans_hausse();
         }
         stats
     }
     fn traiter_sans_fondu(&mut self, samples: &mut [f32]) -> EqProcessStats {
+        // #6211 — un neutre (compensation 1,0) dont le préampli s'éteint.
+        if self.extinction.is_some() {
+            self.appliquer_l_extinction(samples);
+            return EqProcessStats::default();
+        }
         let stats = match &mut self.engine {
             Engine::Bundled(p) => p.process_interleaved(samples),
             Engine::Native(p) => record_native(&mut self.clipping, p.process_f32(samples)),
@@ -405,6 +672,30 @@ impl EqProcessor {
             }
         }
         stats
+    }
+
+    /// #6211 — applique le préampli gardé en le ramenant vers 0 dB, trame par
+    /// trame, puis retient le gain atteint (un report vers une piste suivante
+    /// part de là). Rampe finie : plus rien de gardé.
+    fn appliquer_l_extinction(&mut self, samples: &mut [f32]) {
+        let Some(mut ext) = self.extinction.take() else {
+            return;
+        };
+        let canaux = usize::from(self.channels.max(1));
+        let coefs = ext.depart.len().max(1);
+        let gain_a = Self::gain_de_la_rampe;
+        for (j, s) in samples.iter_mut().enumerate() {
+            *s *= gain_a(&ext, j / canaux + 1, j % coefs);
+        }
+        ext.fait += samples.len() / canaux;
+        if ext.fait >= ext.total {
+            // Ce qui reste gardé (borné par le volume, #6741), ou rien.
+            self.gain_garde =
+                (!ext.vers.iter().all(|v| (v - 1.0).abs() < 1e-6)).then_some(ext.vers);
+        } else {
+            self.gain_garde = Some((0..coefs).map(|c| gain_a(&ext, 0, c)).collect());
+            self.extinction = Some(ext);
+        }
     }
 
     /// #6130 — l'étage tel que le journal le décrit : moteur et fréquence à
@@ -532,6 +823,47 @@ mod rampe_de_bascule_5215 {
             ..Default::default()
         };
         EqProcessor::new(&profil, 48_000, 2)
+    }
+
+    /// #6524 (b), arbitrage de Bertrand du 21/10 : « jamais de hausse ». Sur
+    /// une piste, la rampe qui suit le fondu de la coupure ne retire que la
+    /// part d'un gain gardé SUPÉRIEURE à 1 : 2,0 revient à 1 (le neutre se
+    /// retire), 0,5 reste 0,5 et le niveau ne monte jamais.
+    #[test]
+    fn la_rampe_d_une_piste_ne_retire_que_le_gain_superieur_a_1_6524() {
+        for garde in [2.0_f32, 0.5] {
+            let mut neutre = EqProcessor::prendre_la_releve(None, Some(egaliseur(-6.0)))
+                .expect("la coupure en vol rend un neutre");
+            neutre.gain_garde = Some(vec![garde; 2]);
+            let mut sorties = Vec::new();
+            // 40 blocs de 0,1 s : fondu (0,3 s) puis extinction (3 s) finis.
+            for _ in 0..40 {
+                let mut bloc = vec![0.25_f32; 4_800 * 2];
+                neutre.process_interleaved(&mut bloc);
+                sorties.extend(bloc);
+            }
+            let fin = garde.min(1.0);
+            let gain = sorties.last().unwrap() / 0.25;
+            assert!(
+                (gain - fin).abs() < 1e-3,
+                "gain gardé {garde} : {gain} au bout de 4 s, attendu {fin} (min(g, 1))"
+            );
+            if garde <= 1.0 {
+                let apres_le_fondu = &sorties[4_800 * 2 * 3..];
+                let plus_haut = apres_le_fondu.iter().fold(0.0_f32, |m, s| m.max(*s));
+                assert!(
+                    plus_haut <= 0.25 * garde + 1e-6,
+                    "gain gardé {garde} : le niveau est monté à {} (jamais de hausse)",
+                    plus_haut / 0.25
+                );
+                assert_eq!(neutre.gain_garde.as_deref(), Some(&[garde, garde][..]));
+            } else {
+                assert!(
+                    neutre.est_neutre_au_repos(),
+                    "gain gardé {garde} ramené à 1 : le neutre doit être au repos"
+                );
+            }
+        }
     }
 
     /// Un cran de curseur reste IMMÉDIAT (#1725) : pas de fondu sous le seuil.

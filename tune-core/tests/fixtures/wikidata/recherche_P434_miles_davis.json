@@ -1,0 +1,19 @@
+{
+ "batchcomplete": "",
+ "query": {
+  "searchinfo": {
+   "totalhits": 1
+  },
+  "search": [
+   {
+    "ns": 0,
+    "title": "Q93341",
+    "pageid": 95528,
+    "size": 297784,
+    "wordcount": 912,
+    "snippet": "Miles Davis",
+    "timestamp": "2026-09-27T08:10:37Z"
+   }
+  ]
+ }
+}

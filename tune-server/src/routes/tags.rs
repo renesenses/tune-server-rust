@@ -1,7 +1,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,6 +23,14 @@ struct CreateTag {
 struct UpdateTag {
     name: Option<String>,
     color: Option<String>,
+}
+
+/// `PUT /tags/order` (#6257, web#2166) : l'ordre voulu, du premier au
+/// dernier. Voir [`TagRepo::reorder`] pour ce qui arrive aux identifiants
+/// inconnus, aux doublons et aux etiquettes absentes de la liste.
+#[derive(Deserialize)]
+struct ReorderTags {
+    ids: Vec<i64>,
 }
 
 #[derive(Deserialize)]
@@ -95,6 +103,9 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_tags).post(create_tag))
         .route("/search", get(search_tags))
+        // #6257 — segment fixe : il passe AVANT `/{id}` (le routeur prefere
+        // toujours le segment litteral au parametre).
+        .route("/order", put(reorder_tags))
         .route("/{id}", get(get_tag).put(update_tag).delete(delete_tag))
         .route("/{id}/items", get(list_tag_items).post(add_tag_item))
         .route("/{id}/items/batch", post(batch_tag_items))
@@ -162,6 +173,20 @@ async fn create_tag(
     }
     match repo.create(&body.name, body.color.as_deref()) {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// Enregistre l'ordre des etiquettes (#6257, web#2166). Toutes les listes
+/// d'etiquettes (`/tags`, `/tags/search`, `/tags/for/…`, `/tags/for-streaming`)
+/// le suivent ensuite.
+async fn reorder_tags(
+    State(state): State<AppState>,
+    Json(body): Json<ReorderTags>,
+) -> impl IntoResponse {
+    let repo = TagRepo::with_backend(state.backend.clone());
+    match repo.reorder(&body.ids) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -715,3 +740,7 @@ async fn tags_for_item(
 #[cfg(test)]
 #[path = "tags_date_de_depot_tests_5478.rs"]
 mod tags_date_de_depot_tests_5478;
+
+#[cfg(test)]
+#[path = "tags_ordre_tests_6257.rs"]
+mod tags_ordre_tests_6257;

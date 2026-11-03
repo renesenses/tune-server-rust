@@ -369,6 +369,7 @@ async fn codec_amont_radio_annonce_une_seule_relecture_de_zone() {
         format: Some("mp3"),
         sample_rate: Some(44_100),
         bit_depth: Some(16),
+        ..Default::default()
     });
     assert_eq!(
         banc.streamer
@@ -414,6 +415,7 @@ async fn codec_amont_radio_annonce_une_seule_relecture_de_zone() {
         format: Some("flac"),
         sample_rate: Some(48_000),
         bit_depth: Some(16),
+        ..Default::default()
     });
     banc.sortie(4_000, None).await;
     banc.tic().await;
@@ -476,6 +478,7 @@ fn un_nouveau_stream_radio_ne_reutilise_pas_le_codec_precedent() {
         format: Some("mp3"),
         sample_rate: Some(44_100),
         bit_depth: Some(16),
+        ..Default::default()
     };
     assert!(ps.codec_radio_a_change(Some("ancien"), Some(mp3)));
     assert!(ps.codec_radio_a_change(Some("nouveau"), None));

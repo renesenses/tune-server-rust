@@ -36,7 +36,7 @@ pub(super) const INSEREE: &str = "Freddie Freeloader";
 
 /// Un WAV minuscule mais réel : `resolve_stream` ouvre le fichier, un
 /// chemin qui ne mène à rien ne s'armerait pas.
-fn ecrire_wav(chemin: &std::path::Path) {
+pub(super) fn ecrire_wav(chemin: &std::path::Path) {
     use std::io::Write;
     let octets_data: u32 = 44_100 * 4 / 5; // 200 ms, 16 bits stéréo
     let mut v: Vec<u8> = Vec::new();

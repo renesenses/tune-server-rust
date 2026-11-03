@@ -173,6 +173,11 @@ use crate::state::AppState;
 /// La passe par empreinte AcoustID (#4805, idée 4) : `?mode=acoustid`.
 pub(crate) mod acoustid;
 
+/// La mesure A de #4805 : la passe rejouée sur une COPIE de bibliothèque
+/// (essai ignoré, lancé à la main).
+#[cfg(test)]
+mod mesure_a;
+
 /// La clé de `settings` qui porte l'avancement, sur le modèle de
 /// `enrich_all_status`. En base et non en mémoire : une passe de 2 h 23
 /// survit à plus d'un rechargement de page, et l'écran doit retrouver où elle
@@ -380,10 +385,12 @@ pub(super) fn refus_premium() -> Value {
         "error": "premium_required",
         "premium": false,
         "feature": "auto_enrichment",
-        "message": "L'identification de toute la bibliothèque est une fonction Premium.",
+        "message": crate::message_api::texte("api.library.identificationPremium", &[]),
+        "message_key": "api.library.identificationPremium",
         "gratuit": {
             "route": "POST /library/albums/{id}/reidentify",
-            "message": "Identifier un album à la main reste gratuit et sans limite.",
+            "message": crate::message_api::texte("api.library.manualIdentificationFree", &[]),
+            "message_key": "api.library.manualIdentificationFree",
         },
         "upgrade": "Premium unlocks unlimited auto enrichment",
     })
@@ -566,7 +573,8 @@ pub(super) async fn identification_lot_start(
             Json(json!({
                 "code": "identification_en_pause",
                 "error": "identification_en_pause",
-                "message": "L'identification est suspendue. Reprenez-la avant de la relancer.",
+                "message": crate::message_api::texte("api.library.identificationPaused", &[]),
+                "message_key": "api.library.identificationPaused",
                 "reprendre": "POST /system/taches-de-fond/identification/reprendre",
             })),
         );
@@ -590,7 +598,8 @@ pub(super) async fn identification_lot_start(
             Json(json!({
                 "code": "identification_deja_en_cours",
                 "error": "identification_deja_en_cours",
-                "message": "Une identification de la bibliothèque est déjà en cours.",
+                "message": crate::message_api::texte("api.library.identificationRunning", &[]),
+                "message_key": "api.library.identificationRunning",
                 "etat": deja,
             })),
         );
@@ -718,10 +727,20 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
             musicbrainz_release::rate_limit_delay().await;
         }
 
-        match identifier_album(&state, album_id, None).await {
+        match identifier_album(
+            &state,
+            album_id,
+            None,
+            musicbrainz_release::OrigineDeLaRecherche::Lot,
+        )
+        .await
+        {
             Ok(issue) => {
                 // #4805 D — `ambiguous` est compté à part, et rien n'est posé.
                 compte.enregistrer(&issue);
+                // La mesure A (#4805) garde le verdict de chaque album.
+                #[cfg(test)]
+                mesure_a::noter(album_id, &issue);
                 // #4991 (b) — un album que MusicBrainz n'a pas passe derrière
                 //    les albums jamais tentés au prochain lancement.
                 consigner_la_tentative(
@@ -730,6 +749,9 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
                     issue.verdict,
                     issue.refus_musicbrainz,
                 );
+                // #4805 (13/10) — un refus de MusicBrainz attend la passe de
+                //    nuit ; une réponse sort l'album de sa liste.
+                nuit::noter_le_verdict(&state.backend, album_id, issue.refus_musicbrainz);
                 // #4805 — les crédits du pressage posé, lus aussitôt dans la
                 //    release gardée en base, sur une tâche à part.
                 super::credits_apres_identification::apres_identification(
@@ -1411,6 +1433,10 @@ mod tests {
         );
     }
 }
+
+// #4805 (13/10/2026) — la passe de nuit des albums refusés par MusicBrainz.
+#[path = "identification_nuit.rs"]
+pub(crate) mod nuit;
 
 // #4805, étape C — la passe artistes par le réseau, sous le même pilote.
 #[path = "identification_artistes.rs"]

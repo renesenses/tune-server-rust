@@ -278,6 +278,9 @@ pub(crate) async fn rattacher_zone(
         )
             .into_response();
     }
+    // #6774 — PURE / volume fixe désarmés par le changement d'appareil.
+    tune_core::audio::reglages_de_volume::aligner_la_lecture(&state.backend, &state.playback, id)
+        .await;
     info!(
         zone_id = id,
         ancien = %ancien,

@@ -1100,7 +1100,7 @@ mod tests {
         tampon.set_position(0);
         let mut z = zip::ZipArchive::new(tampon).unwrap();
         let noms: Vec<String> = (0..z.len())
-            .map(|i| z.by_index(i).unwrap().name().to_string())
+            .map(|i| z.by_index(i).unwrap().name().unwrap().into_owned())
             .collect();
         assert_eq!(
             noms,

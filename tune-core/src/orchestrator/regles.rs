@@ -250,7 +250,13 @@ pub fn needs_transcode_for_output_applies(
 /// DLNA renderer. Enable with `TUNE_DASH_WARM_CACHE=1`.
 /// Facteur linéaire d'un trim de gain par renderer (`zone_{id}_gain_trim_db`).
 /// Clampe à ±12 dB — au-delà, on harmonise plus rien, on casse.
-pub(super) fn gain_trim_factor(trim_db: f64) -> f64 {
+///
+/// #6739 — un trim illisible (NaN, infini) vaut 0 dB : `NaN.clamp(..)` reste
+/// NaN, et une consigne NaN n'a rien à faire sur le fil d'un amplificateur.
+pub fn gain_trim_factor(trim_db: f64) -> f64 {
+    if !trim_db.is_finite() {
+        return 1.0;
+    }
     10f64.powf(trim_db.clamp(-12.0, 12.0) / 20.0)
 }
 
@@ -273,6 +279,70 @@ pub fn gain_trim_db_enregistre(db: &Arc<dyn crate::db::backend::DbBackend>, zone
 /// ne fait jamais dépasser l'unité, quel que soit le volume.
 pub fn volume_avec_trim(volume: f64, trim_db: f64) -> f64 {
     (volume * gain_trim_factor(trim_db)).clamp(0.0, 1.0)
+}
+
+/// #6739 — la sortie règle-t-elle son volume par un gain NUMÉRIQUE de Tune ?
+///
+/// Seule la sortie locale (`local`, y compris ses bras exclusifs ASIO,
+/// WASAPI, CoreAudio) applique la consigne comme une amplitude dans le PCM,
+/// bornée à l'unité : un trim y est un vrai gain en dB. Toutes les autres —
+/// DLNA, OpenHome, AirPlay, Chromecast, BluOS, Sonos, Squeezebox, HQPlayer,
+/// greffons — transmettent la consigne à un appareil qui la lit sur SA
+/// propre échelle (le plus souvent 0..100, pas une amplitude linéaire). Une
+/// sortie inconnue est tenue pour matérielle : c'est le côté sûr.
+pub fn sortie_a_volume_logiciel(output_type: &str) -> bool {
+    output_type == "local"
+}
+
+/// #6739 — la valeur que reçoit l'appareil, selon la nature de son volume.
+///
+/// Fil 2366/2375 (Marantz NR1200 en DLNA, tweeter détruit) : un trim de
+/// +8,5 dB multipliait linéairement le POURCENTAGE envoyé au renderer —
+/// consigne 0,36, ordre `SetVolume 96`. Toute consigne au-dessus de 38 %
+/// partait à 100 %.
+///
+/// Règle : sur une sortie à volume matériel, un trim POSITIF n'augmente
+/// jamais la consigne envoyée — il est ignoré côté appareil (journal
+/// `trim_positif_ignore_volume_materiel`). Un trim négatif reste appliqué :
+/// il ne fait que baisser. Sur la sortie locale, rien ne change : le trim est
+/// un gain numérique, et [`volume_avec_trim`] borne le résultat à l'unité.
+pub fn volume_appareil_avec_trim(volume: f64, trim_db: f64, volume_materiel: bool) -> f64 {
+    let volume = if volume.is_finite() { volume } else { 0.0 };
+    if volume_materiel && trim_db.is_finite() && trim_db > 0.0 {
+        volume.clamp(0.0, 1.0)
+    } else {
+        volume_avec_trim(volume, trim_db)
+    }
+}
+
+/// #6721 — sous PURE verrouillé (« Forcer à 100 % »), une consigne de volume
+/// sous 100 % est REFUSÉE ; elle n'est plus convertie en un ordre à 100 %.
+///
+/// Fil 2366 (Marantz NR1200, tweeter détruit) : « je saisis le curseur pour
+/// diminuer le volume : résultat volume à fond ». Depuis #5695, `set_volume`
+/// remplaçait toute consigne par 1,0 dès que la zone était en PURE
+/// verrouillé, et l'envoyait à l'appareil : un geste pour BAISSER devenait un
+/// ordre de plein volume. Le test `en_pure_force_une_consigne_basse_est_
+/// ramenee_a_100_5695` le gardait comme voulu.
+///
+/// Règle : une commande de volume ne monte jamais au-delà de ce qu'elle
+/// demande. Le 100 % de PURE ne part que d'un geste qui le demande (armement
+/// confirmé, `set_volume_pure_force`, ou consigne à 1,0). Rien n'est envoyé à
+/// l'appareil, rien n'est écrit ; l'appelant reçoit une erreur qui le dit.
+pub fn refuser_une_baisse_sous_pure_verrouille(
+    zone_id: i64,
+    volume: f64,
+    pure_force: bool,
+) -> OutputCommandResult<()> {
+    if !pure_force || volume >= 1.0 - 1e-6 {
+        return Ok(());
+    }
+    tracing::warn!(zone_id, demande = volume, "volume_refuse_pure_verrouille");
+    Err(OutputCommandError::failed(
+        OutputCommand::SetVolume,
+        "le mode PURE de cette zone tient le volume à 100 % : la consigne est refusée, \
+         rien n'a été envoyé à l'appareil. Désactivez « Forcer à 100 % » pour régler le volume.",
+    ))
 }
 
 /// Niveau à donner à une sortie locale qui vient de naître, d'après ce que la
@@ -320,6 +390,11 @@ pub async fn ensemencer_le_volume_local(
             && crate::audio::audiophile::volume_lock_enabled(db, id)
     });
     let stored = volume_de_graine(zone.volume, zone.fixed_volume || pure_force, trim_db);
+    // #6541 — la graine ne naît pas au-dessus de la limite de sécurité (sauf
+    // en PURE ou à volume fixe, où la limite n'a pas cours).
+    let stored = zone.id.map_or(stored, |id| {
+        crate::audio::volume_limites::lire_effectives(db, id).borner_appareil(stored)
+    });
     if let Err(e) = crate::outputs::OutputTarget::set_volume(sortie, stored).await {
         warn!(device_id = %device_id, error = %e, "local_output_volume_seed_failed");
     } else {
@@ -1280,6 +1355,33 @@ pub(super) fn est_sortie_locale(output_device_id: Option<&str>) -> bool {
     output_device_id.is_some_and(|id| id.starts_with("local:"))
 }
 
+/// `output_type` d'une zone qui joue sur la sortie d'un AGENT Tune (#4626) :
+/// le maître la tient par `tune-server/src/agent_tune`, qui reprend cette
+/// constante. Elle vit ici parce que l'orchestrateur doit la reconnaître
+/// (#6370) et ne dépend pas du serveur.
+pub const TYPE_SORTIE_AGENT_TUNE: &str = "tune_agent";
+/// Préfixe du `device_id` d'une sortie d'agent chez le maître.
+pub const PREFIXE_SORTIE_AGENT_TUNE: &str = "tune-agent:";
+
+/// #6370 — faut-il servir à une sortie d'agent un flux DÉCODÉ qui commence à
+/// la position demandée ?
+///
+/// L'agent ne prête que sa sortie LOCALE (`agent_tune::TYPES_EXPOSES`), qui lit
+/// son flux d'un bout à l'autre et ne sait pas s'y déplacer : son `seek` ne
+/// fait que noter la position. Un déplacement s'y joue donc en relançant le
+/// flux, comme pour une sortie locale du maître. Mais la lecture ordinaire
+/// d'une piste de la bibliothèque part en passthrough, servie depuis l'OCTET
+/// 0 — `seek_ms` n'y est pas lu (#2893). Une relance à une position non nulle
+/// prend donc le bras qui décode, le seul qui démarre à `seek_ms`. Une lecture
+/// depuis le début ne change pas de bras.
+pub(super) fn agent_relance_a_la_position(
+    output_device_id: Option<&str>,
+    seek_ms: Option<u64>,
+) -> bool {
+    output_device_id.is_some_and(|id| id.starts_with(PREFIXE_SORTIE_AGENT_TUNE))
+        && seek_ms.is_some_and(|ms| ms > 0)
+}
+
 /// Une zone navigateur doit-elle recevoir la source décodée en WAV ? Oui pour
 /// tout format que `<audio>` ne décode pas — DSD avant tout (Reivax66, 0.9.44),
 /// WavPack, APE, WMA, AIFF, ALAC, et Matroska (#3633 : `<audio>` n'ouvre pas
@@ -1546,6 +1648,26 @@ mod lecture_locale_tests {
         assert!(!sera_du_flac(Some(AudioFormat::Mp3), false));
         assert!(!sera_du_flac(None, true), "format inconnu : aucune cible");
         assert!(!sera_du_flac(None, false));
+    }
+
+    #[test]
+    fn seule_une_relance_a_une_position_non_nulle_decode_pour_un_agent_6370() {
+        let agent = Some("tune-agent:abc:local:hw:1,0");
+        assert!(agent_relance_a_la_position(agent, Some(2_000)));
+        assert!(
+            !agent_relance_a_la_position(agent, Some(0)),
+            "une lecture depuis le début garde son bras"
+        );
+        assert!(!agent_relance_a_la_position(agent, None));
+        assert!(
+            !agent_relance_a_la_position(Some("local:hw:1,0"), Some(2_000)),
+            "la sortie locale du maître a déjà sa règle"
+        );
+        assert!(!agent_relance_a_la_position(
+            Some("uuid:renderer"),
+            Some(2_000)
+        ));
+        assert!(!agent_relance_a_la_position(None, Some(2_000)));
     }
 
     #[test]

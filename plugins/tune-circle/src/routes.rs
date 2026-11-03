@@ -15,6 +15,12 @@
 //! CONTACTS, et les cercles leurs classements privés par le propriétaire.
 //! Purement additif ; `GET /` y gagne la clé `circles`, relayée telle quelle.
 //!
+//! #7124 (décision du 26/10/2026) : `GET /` gagne aussi `member_of` — les cercles
+//! des AUTRES où je suis rangé (`[{ owner_id, owner_name, circle_name }]`, liens
+//! actifs seulement, clé absente si je ne suis rangé nulle part), relayée telle
+//! quelle comme `circles`. Un membre peut aussi partager une playlist dans un
+//! cercle où il est rangé : `POST /playlists` part inchangé, le cloud juge.
+//!
 //! | Tune (`/api/v1/ext/circle`)                  | mozaiklabs (`/api/v1/circle`)          |
 //! |----------------------------------------------|----------------------------------------|
 //! | `POST /invitations` `{ "email", "circle_id"? }` | `POST /invitations`                 |
@@ -42,6 +48,23 @@
 //! | `GET /contacts/{user_id}/library/albums/{album_id}/tracks` | idem                               |
 //! | `GET /contacts/{user_id}/library/tracks?…`             | idem, requête comprise                 |
 //! | `GET /library-sync`                                    | — (état LOCAL de la copie en ligne)    |
+//!
+//! rc8 (#6900), l'écran de Levente et le globe opt-in, dans [`crate::globe`] :
+//! `GET /contacts/{user_id}/library/summary`, `GET|PUT|DELETE /me/location`,
+//! `GET /contacts/locations`, relayés à l'identique.
+//!
+//! rc9 (#7122), la carte publique anonyme, dans [`crate::globe`] : `GET
+//! /world/points`, `GET|PUT|DELETE /me/public-map-opt-out`, relayés à
+//! l'identique.
+//!
+//! #6935, inviter sans e-mail, dans [`crate::sans_email`] : `POST
+//! /invitations/by-pseudo`, `GET|POST /invitation-links`, `DELETE
+//! /invitation-links/{id}`, `POST /invitations/{id}/block`, `GET /blocks`,
+//! `DELETE /blocks/{user_id}`, relayés à l'identique.
+//!
+//! rc9 (#7130), les notifications de Tune web, dans [`crate::notifications`] :
+//! `GET /notifications`, `POST /notifications/{id}/read`, `POST
+//! /notifications/read-all`, `GET|PUT /notifications/preferences`.
 //!
 //! T4, l'écoute chez un contact (#5327), Premium : `POST
 //! /contacts/{user_id}/listen`, dans [`crate::ecoute`].
@@ -97,6 +120,9 @@ pub const CODE_REPONSE_ILLISIBLE: &str = "circle.unreadable_response";
 pub const CODE_SERVEUR_NON_LIE: &str = "circle.server_not_linked";
 
 pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
+    // rc9 (#7130) : les notifications de Tune web, dans [`crate::notifications`].
+    let notifications = crate::notifications::router(relais.clone());
+    let messagerie = crate::messagerie::router(relais.clone());
     let etat_de_la_copie = Router::new()
         .route("/library-sync", get(etat_de_la_copie_en_ligne))
         .with_state(Arc::new(EtatDeLaCopie {
@@ -109,6 +135,22 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
         .route("/invitations/{id}", delete(retirer))
         .route("/invitations/{id}/accept", post(accepter))
         .route("/invitations/{id}/decline", post(refuser))
+        // #6935 : inviter sans e-mail, dans [`crate::sans_email`].
+        .route(
+            "/invitations/by-pseudo",
+            post(crate::sans_email::inviter_par_pseudo),
+        )
+        .route("/invitations/{id}/block", post(crate::sans_email::bloquer))
+        .route(
+            "/invitation-links",
+            get(crate::sans_email::liens).post(crate::sans_email::creer_lien),
+        )
+        .route(
+            "/invitation-links/{id}",
+            delete(crate::sans_email::revoquer_lien),
+        )
+        .route("/blocks", get(crate::sans_email::bloques))
+        .route("/blocks/{user_id}", delete(crate::sans_email::debloquer))
         .route("/members/{user_id}", delete(revoquer))
         .route("/circles", post(creer_cercle))
         .route(
@@ -142,8 +184,162 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
             "/contacts/{user_id}/library/tracks",
             get(bibliotheque_pistes),
         )
+        // Tune Circle rc8 (#6900) : l'écran de Levente et le globe opt-in.
+        .route(
+            "/contacts/{user_id}/library/summary",
+            get(crate::globe::resume_de_la_bibliotheque),
+        )
+        .route(
+            "/me/location",
+            get(crate::globe::mon_lieu)
+                .put(crate::globe::poser_mon_lieu)
+                .delete(crate::globe::retirer_mon_lieu),
+        )
+        .route("/contacts/locations", get(crate::globe::lieux_des_contacts))
+        // rc9 (#7122) : la carte publique anonyme et son interrupteur.
+        .route("/world/points", get(crate::globe::points_du_monde))
+        .route(
+            "/me/public-map-opt-out",
+            get(crate::globe::mon_retrait_de_la_carte)
+                .put(crate::globe::me_retirer_de_la_carte)
+                .delete(crate::globe::revenir_sur_la_carte),
+        )
         .with_state(relais)
         .merge(etat_de_la_copie)
+        .merge(notifications)
+        .merge(messagerie)
+}
+
+// #6521 — les vignettes des pochettes partagées avec le cercle -----------------
+
+/// L'état des routes de vignettes.
+pub struct EtatDesVignettes {
+    pub relais: Arc<Relais>,
+    pub vignettes: Arc<crate::vignettes::Vignettes>,
+}
+
+/// | Tune (`/api/v1/ext/circle`)                                   | mozaiklabs (`/api/v1/circle`) |
+/// |---------------------------------------------------------------|-------------------------------|
+/// | `GET /artwork-sharing` → `{ enabled }`                        | — (réglage LOCAL)             |
+/// | `PUT /artwork-sharing` `{ enabled }` → `{ enabled, purged }`  | — ; couper efface chez le cloud (`DELETE …/thumbnails`) |
+/// | `GET /contacts/{user_id}/library/albums/{album_id}/thumbnail` | idem, image relayée, `If-None-Match` compris |
+pub fn router_des_vignettes(
+    relais: Arc<Relais>,
+    vignettes: Arc<crate::vignettes::Vignettes>,
+) -> Router<()> {
+    Router::new()
+        .route(
+            "/artwork-sharing",
+            get(etat_du_partage_des_pochettes).put(regler_le_partage_des_pochettes),
+        )
+        .route(
+            "/contacts/{user_id}/library/albums/{album_id}/thumbnail",
+            get(vignette_d_un_contact),
+        )
+        .with_state(Arc::new(EtatDesVignettes { relais, vignettes }))
+}
+
+async fn etat_du_partage_des_pochettes(State(e): State<Arc<EtatDesVignettes>>) -> Response {
+    Json(json!({
+        "enabled": crate::vignettes::reglage_actif(&e.vignettes.reglages()),
+        "default": true,
+    }))
+    .into_response()
+}
+
+/// `{ "enabled": bool }` et rien d'autre : un autre corps est un 422.
+async fn regler_le_partage_des_pochettes(
+    State(e): State<Arc<EtatDesVignettes>>,
+    corps: Bytes,
+) -> Response {
+    let Some(actif) = serde_json::from_slice::<Value>(&corps)
+        .ok()
+        .and_then(|v| v.get("enabled").and_then(Value::as_bool))
+    else {
+        return refus(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({ "code": "circle.invalid_body" }),
+        );
+    };
+    let efface = e.vignettes.regler(actif).await;
+    Json(json!({ "enabled": actif, "purged": !actif && efface })).into_response()
+}
+
+/// La vignette de la pochette d'un album de contact, relayée. Le cloud juge le
+/// droit (règle du catalogue, 404 sinon) ; seuls 200 JPEG/WebP et 304
+/// passent avec des octets ou un ETag, le reste est un refus nommé.
+async fn vignette_d_un_contact(
+    State(e): State<Arc<EtatDesVignettes>>,
+    Path((user_id, album_id)): Path<(String, String)>,
+    entetes: axum::http::HeaderMap,
+) -> Response {
+    if !identifiant_valide(&user_id) || !identifiant_valide(&album_id) {
+        return introuvable();
+    }
+    use crate::relais::IssueImage;
+    let cache = (
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, max-age=3600"),
+    );
+    match e
+        .relais
+        .lire_image(
+            "GET /contacts/{user_id}/library/albums/{album_id}/thumbnail",
+            &[
+                "contacts",
+                &user_id,
+                "library",
+                "albums",
+                &album_id,
+                "thumbnail",
+            ],
+            entetes.get(header::IF_NONE_MATCH),
+        )
+        .await
+    {
+        IssueImage::NonConnecte => en_reponse(Issue::NonConnecte),
+        IssueImage::Indisponible => en_reponse(Issue::Indisponible { statut_amont: None }),
+        IssueImage::Image {
+            corps,
+            type_mime,
+            etag,
+        } => {
+            let mut r = (StatusCode::OK, Body::from(corps)).into_response();
+            let h = r.headers_mut();
+            h.insert(header::CONTENT_TYPE, type_mime);
+            h.insert(cache.0, cache.1);
+            h.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                axum::http::HeaderValue::from_static("nosniff"),
+            );
+            if let Some(v) = etag {
+                h.insert(header::ETAG, v);
+            }
+            r
+        }
+        IssueImage::Inchangee { etag } => {
+            let mut r = StatusCode::NOT_MODIFIED.into_response();
+            r.headers_mut().insert(cache.0, cache.1);
+            if let Some(v) = etag {
+                r.headers_mut().insert(header::ETAG, v);
+            }
+            r
+        }
+        IssueImage::Refus { statut: 404, .. } => introuvable(),
+        IssueImage::Refus {
+            statut,
+            retry_after,
+        } => {
+            let mut r = refus(
+                StatusCode::from_u16(statut).unwrap_or(StatusCode::BAD_GATEWAY),
+                json!({ "code": CODE_REPONSE_ILLISIBLE }),
+            );
+            if let Some(v) = retry_after {
+                r.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+            r
+        }
+    }
 }
 
 pub(crate) fn refus(statut: StatusCode, corps: Value) -> Response {
@@ -479,7 +675,11 @@ async fn relire_le_partage(relais: &Relais) {
 /// serveur partagé. Sans `server_id` local, `null` part et le cloud répond 422.
 /// Les 404 du cloud deviennent `circle.server_not_linked` (serveur pas encore
 /// lié au compte) ou `circle.not_found` (cercle d'un autre).
-async fn partager(State(relais): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
+async fn partager(
+    State(relais): State<Arc<Relais>>,
+    Path(id): Path<String>,
+    vignettes: Option<axum::Extension<Arc<crate::vignettes::Vignettes>>>,
+) -> Response {
     if !identifiant_valide(&id) {
         return introuvable();
     }
@@ -494,6 +694,10 @@ async fn partager(State(relais): State<Arc<Relais>>, Path(id): Path<String>) -> 
         .await;
     if reussie(&issue) {
         ecrire_le_partage(&relais, true);
+        // #6733 : ne pas attendre le prochain passage des pochettes.
+        if let Some(axum::Extension(vignettes)) = vignettes {
+            vignettes.reveiller();
+        }
         // Une bibliothèque jamais poussée part entière au prochain cycle —
         // sans quoi les contacts parcourraient un catalogue vide ou troué.
         let jamais_poussee = relais

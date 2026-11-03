@@ -11,6 +11,9 @@ use std::sync::Arc;
 #[path = "radio_profondeur_tests.rs"]
 mod radio_profondeur_tests;
 
+#[path = "journal_sans_url_6468_tests.rs"]
+mod journal_sans_url_6468_tests;
+
 #[tokio::test]
 async fn local_stream_watch_reports_only_an_unconsumed_live_session_once() {
     use crate::http::streamer::{AudioStreamer, StreamInfo};
@@ -284,16 +287,17 @@ fn le_controle_hls_ne_touche_pas_la_liste_noire_page_web() {
     assert!(!is_hls_manifest("http://example.net/live", "text/html"));
 }
 
-/// L'ÉPREUVE : la fonction de production qui lit réellement les radios,
-/// appelée telle quelle, refuse un manifeste HLS — et le refuse AVANT le
-/// réseau.
+/// #6357 — la fonction de production qui lit réellement les radios, appelée
+/// telle quelle, confie une liste `.m3u8` au chargeur HLS : elle ne la
+/// refuse plus (#2307 la refusait avant le réseau) et ne la traite pas non
+/// plus comme un flux Icecast.
 ///
 /// L'adresse pointe sur `127.0.0.1:9` (discard), qui refuse la connexion
-/// instantanément. Si la garde disparaissait, le décodeur ouvrirait le
-/// réseau et rendrait `radio HTTP fetch failed: …` : l'assertion tombe.
-/// Le test ne peut donc pas passer pour une mauvaise raison.
+/// instantanément. Le chargeur HLS rend alors `radio HLS: …` ; le chemin
+/// Icecast aurait rendu `radio HTTP fetch failed: …`, l'ancienne porte
+/// `radio_hls_unsupported`. Le témoin distingue les trois.
 #[tokio::test]
-async fn le_decodeur_de_production_refuse_le_hls_avant_tout_appel_reseau() {
+async fn le_decodeur_de_production_confie_le_hls_au_chargeur_de_segments() {
     use crate::http::streamer::{AudioStreamer, StreamInfo};
     let streamer = Arc::new(AudioStreamer::new(0));
     let info = StreamInfo {
@@ -305,9 +309,7 @@ async fn le_decodeur_de_production_refuse_le_hls_avant_tout_appel_reseau() {
     // Appelée EXACTEMENT comme la production l'appelle : ses trois sites
     // (sortie locale, OAAT, DLNA proxifiée) l'enveloppent dans
     // `spawn_blocking`, parce que symphonia et `reqwest::blocking` sont
-    // synchrones. Le test emprunte donc le même chemin, et un sabotage de
-    // la garde y produit la vraie erreur réseau plutôt qu'une panique de
-    // runtime qui masquerait ce qui s'est passé.
+    // synchrones.
     let erreur = tokio::task::spawn_blocking(move || {
         decode_radio_stream_to_pcm(
             "http://127.0.0.1:9/live/master.m3u8?token=abc".to_string(),
@@ -322,11 +324,14 @@ async fn le_decodeur_de_production_refuse_le_hls_avant_tout_appel_reseau() {
     })
     .await
     .expect("la tâche de décodage ne doit pas paniquer")
-    .expect_err("un manifeste HLS ne doit jamais être accepté comme flux");
+    .expect_err("une station injoignable échoue à la première connexion");
     assert!(
-        erreur.starts_with(RADIO_HLS_UNSUPPORTED),
-        "le décodeur doit refuser en NOMMANT HLS, pas en laissant symphonia \
-         échouer sur un message obscur : {erreur}"
+        erreur.starts_with("radio HLS"),
+        "une liste .m3u8 doit passer par le chargeur HLS : {erreur}"
+    );
+    assert!(
+        !erreur.starts_with(RADIO_HLS_UNSUPPORTED),
+        "le HLS n'est plus refusé d'office : {erreur}"
     );
 }
 
@@ -2595,6 +2600,48 @@ fn les_reglages_de_sortie_locale_viennent_de_la_base() {
         (true, "asio".to_string()),
         "TUNE_LOCAL_AUDIO_BACKEND doit servir de repli comme dans \
          tune-server/src/config.rs"
+    );
+}
+
+/// #6452 — sous le repli de démarrage, la sortie recréée à la volée part sur
+/// l'hôte par défaut et en PARTAGÉ, et la base garde « asio ».
+///
+/// C'est le test qui rougit sans le repli : `recreate_local_and_play`
+/// rouvrirait ASIO, en exclusif, au premier appui sur Lecture, c'est-à-dire
+/// le pilote que le démarrage venait d'écarter.
+#[test]
+fn le_repli_de_demarrage_ecarte_asio_de_la_sortie_recreee() {
+    let orch = test_orchestrator();
+    let reglages = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    // Ce qu'écrit le choix d'ASIO dans les réglages : l'hôte, l'écho de
+    // l'exclusif et son témoin (#4184).
+    reglages.set("local_audio_backend", "asio").unwrap();
+    reglages.set("local_exclusive_mode", "true").unwrap();
+    reglages
+        .set(crate::config::REGLAGE_EXCLUSIF_ARME_PAR_ASIO, "true")
+        .unwrap();
+
+    assert_eq!(
+        orch.reglages_sortie_locale_selon_le_repli(|_| None, Some("asio")),
+        (false, "auto".to_string()),
+        "sous le repli, la sortie recréée doit ouvrir l'hôte par défaut, en partagé"
+    );
+    // Le choix enregistré n'a pas bougé.
+    assert_eq!(
+        reglages.get("local_audio_backend").unwrap().as_deref(),
+        Some("asio")
+    );
+    // Sans repli, ASIO comme avant (exclusif par nature sous Windows).
+    let (_, hote) = orch.reglages_sortie_locale_selon_le_repli(|_| None, None);
+    assert_eq!(hote, "asio");
+
+    // Un exclusif demandé par l'utilisateur lui-même reste honoré.
+    reglages
+        .delete(crate::config::REGLAGE_EXCLUSIF_ARME_PAR_ASIO)
+        .unwrap();
+    assert_eq!(
+        orch.reglages_sortie_locale_selon_le_repli(|_| None, Some("asio")),
+        (true, "auto".to_string())
     );
 }
 
@@ -6540,7 +6587,15 @@ async fn test_set_volume() {
     orch.playback.play(zone_id, np).await;
 
     // Set volume to 80%
-    orch.set_volume(zone_id, 0.8, None).await.unwrap();
+    // #6721 — hausse confirmée : la garde n'est pas l'objet de ce test.
+    orch.set_volume_avec_garde(
+        zone_id,
+        0.8,
+        None,
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let state = orch.playback.get_state(zone_id).await;
     assert!((state.volume - 0.8).abs() < f64::EPSILON);
 
@@ -6550,7 +6605,14 @@ async fn test_set_volume() {
     assert!((state.volume - 0.0).abs() < f64::EPSILON);
 
     // Set volume to 1.0 (max)
-    orch.set_volume(zone_id, 1.0, None).await.unwrap();
+    orch.set_volume_avec_garde(
+        zone_id,
+        1.0,
+        None,
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let state = orch.playback.get_state(zone_id).await;
     assert!((state.volume - 1.0).abs() < f64::EPSILON);
 }
@@ -6579,7 +6641,15 @@ async fn le_trim_ne_touche_pas_le_volume_utilisateur() {
         .set(&format!("zone_{zone_id}_gain_trim_db"), "-6")
         .unwrap();
 
-    orch.set_volume(zone_id, 0.8, None).await.unwrap();
+    // #6721 — hausse confirmée : la garde n'est pas l'objet de ce test.
+    orch.set_volume_avec_garde(
+        zone_id,
+        0.8,
+        None,
+        crate::audio::garde_de_hausse::Hausse::Confirmee,
+    )
+    .await
+    .unwrap();
     let state = orch.playback.get_state(zone_id).await;
     assert!((state.volume - 0.8).abs() < f64::EPSILON);
     let zone = zone_repo.get(zone_id).unwrap().unwrap();
@@ -7677,6 +7747,66 @@ async fn le_dop_d_une_piste_iso_ne_sert_que_la_piste_depuis_le_deplacement() {
     assert!(
         recu[44..] == attendu[..],
         "le DoP servi n'est pas celui de la piste à partir du déplacement"
+    );
+}
+
+/// 🔴 #6630 — le DoP d'une piste d'ISO entamée par un déplacement ANNONCE la
+/// longueur qu'il sert : la session (donc le `Content-Length`) porte la durée
+/// restante de la tranche, pas celle de la piste entière. Sans cela, le
+/// client recevait un `Content-Length` trop long et un corps fermé plus tôt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_dop_d_une_piste_iso_entamee_annonce_la_longueur_servie_6630() {
+    use crate::audio::sacd::fabrique::{ImageFabriquee, ecrire, octets_attendus};
+    let orch = test_orchestrator();
+    let dossier = tempfile::tempdir().unwrap();
+    let iso = dossier.path().join("Kind of Blue.iso");
+    let bornes = ecrire(&iso, &ImageFabriquee::deux_pistes());
+    let isos = vec![crate::audio::sacd::IsoSacdLu {
+        chemin: iso.clone(),
+        disque: crate::audio::sacd::lire_disque(&iso).unwrap(),
+    }];
+    let mut bilan = crate::scanner::cue_bibliotheque::BilanCue::default();
+    crate::scanner::cue_bibliotheque::ecrire_les_iso_sacd(&orch.db, &isos, &mut bilan);
+    let (debut, fin) = bornes[0];
+    let piste = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone())
+        .get_by_cue_identity(
+            &iso.to_string_lossy(),
+            crate::audio::sacd::trames_en_ms(debut) as i64,
+        )
+        .unwrap()
+        .unwrap();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("DAC DoP", Some("local"), Some("local:dac-6630"))
+        .unwrap();
+    zones.update_dsd_mode(zone_id, "dop").unwrap();
+    let mut req = requete_locale_3234(zone_id, piste.id.unwrap());
+    req.output_device_id = Some("local:dac-6630".into());
+    req.seek_ms = Some(crate::audio::sacd::trames_en_ms(debut + 1) as u64);
+
+    let resolu = match orch.resolve_local_track(&req).await {
+        Ok(r) => r,
+        Err(e) => panic!("le DoP d'une piste d'ISO doit se résoudre : {e}"),
+    };
+    let info = orch
+        .streamer
+        .stream_output_wire(resolu.stream_id.as_deref().unwrap())
+        .await
+        .expect("session DoP");
+    let servis = 44
+        + crate::audio::dsd_to_dop::DsdToDoP::new(2, false)
+            .feed(&octets_attendus(debut + 1, fin))
+            .len() as u64;
+    let annonce = info.wav_content_length().expect("Content-Length annoncé");
+    // Tolérance : 2 ms de DoP (176,4 kHz, 2 × 24 bits), l'arrondi des trames
+    // SACD en millisecondes. La piste entière en annonce une trame de plus
+    // (1/75 s, plus de 14 000 octets).
+    let tolerance = 2 * 176_400 * 6 / 1000;
+    assert!(
+        annonce.abs_diff(servis) <= tolerance,
+        "#6630 — le DoP entamé annonce {annonce} octets pour {servis} servis \
+         (durée de session {:?} ms) : la longueur de la piste entière, pas celle servie",
+        info.duration_ms
     );
 }
 
@@ -9464,6 +9594,153 @@ async fn toute_bascule_pure_annonce_la_zone_au_client_5683() {
     assert!(annoncee(&mut rx3, zone3));
 }
 
+// ── #7556 — une bascule de réglage ne lance JAMAIS de lecture ────────────────
+
+/// `play_media` reçus par la sortie factice d'une zone réseau.
+async fn lectures_envoyees_7556(orch: &PlaybackOrchestrator, device_id: &str) -> usize {
+    let arc = orch.outputs.lock().await.get(device_id).expect("sortie");
+    let sortie = arc.lock().await;
+    sortie
+        .as_any()
+        .downcast_ref::<crate::outputs::mock::MockOutput>()
+        .expect("mock")
+        .play_call_count()
+        .await
+}
+
+/// LE défaut du .18 (zone 10, 31/10), version piste : une zone DLNA dont le
+/// flux porte un égaliseur est ARRÊTÉE, puis on bascule PURE. `stop` garde
+/// `now_playing` (l'interface montre où la lecture s'est arrêtée) ; la
+/// bascule le prenait pour « quelque chose joue », refabriquait le flux, et
+/// la relance remettait la piste en lecture. Après : rien n'est lancé, la
+/// zone reste arrêtée, la bascule portera sur la prochaine lecture.
+///
+/// Même règle pour l'égaliseur, qui passe par la même relance.
+#[tokio::test]
+async fn bascule_pure_sur_une_zone_arretee_ne_lance_rien_7556() {
+    use crate::orchestrator::PorteeDuReglage;
+    let device_id = "dlna:uuid-7556-piste";
+    let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    orch.playback.update_position(zone_id, 42_000).await;
+    orch.stop(zone_id, None).await;
+    let avant = orch.playback.get_state(zone_id).await;
+    assert_eq!(avant.state, PlayState::Stopped, "prémisse : zone arrêtée");
+    assert!(
+        avant.now_playing.is_some(),
+        "prémisse du défaut : l'arrêt garde `now_playing` pour l'affichage"
+    );
+    let lectures_avant = lectures_envoyees_7556(&orch, device_id).await;
+
+    regler_pure(&orch, zone_id, true);
+    assert_eq!(
+        orch.apply_audiophile_change_portee(zone_id).await,
+        PorteeDuReglage::RienNeJoue,
+        "zone arrêtée : la bascule s'applique à la prochaine lecture, rien n'est relancé"
+    );
+    regler_pure(&orch, zone_id, false);
+    assert_eq!(
+        orch.apply_eq_change_portee(zone_id).await,
+        PorteeDuReglage::RienNeJoue,
+        "zone arrêtée : un changement d'égaliseur ne relance rien non plus"
+    );
+    assert!(
+        !orch.eq_replay_gen.lock().unwrap().contains_key(&zone_id),
+        "aucune relance ne doit être armée sur une zone arrêtée"
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    let apres = orch.playback.get_state(zone_id).await;
+    assert_eq!(
+        apres.state,
+        PlayState::Stopped,
+        "la zone doit rester arrêtée"
+    );
+    assert_eq!(
+        apres.track_generation, avant.track_generation,
+        "aucune lecture ne doit avoir été refaite"
+    );
+    assert_eq!(
+        lectures_envoyees_7556(&orch, device_id).await,
+        lectures_avant,
+        "aucune commande de lecture ne doit partir vers la sortie"
+    );
+}
+
+/// #7556 — zone EN PAUSE : la bascule ne la remet pas en lecture. Le flux en
+/// pause est gardé, la bascule portera sur la piste suivante.
+#[tokio::test]
+async fn bascule_pure_sur_une_zone_en_pause_la_laisse_en_pause_7556() {
+    use crate::orchestrator::PorteeDuReglage;
+    let device_id = "dlna:uuid-7556-pause";
+    let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    orch.playback.update_position(zone_id, 42_000).await;
+    let _ = orch.pause(zone_id, None).await;
+    let avant = orch.playback.get_state(zone_id).await;
+    assert_eq!(avant.state, PlayState::Paused, "prémisse : zone en pause");
+    let lectures_avant = lectures_envoyees_7556(&orch, device_id).await;
+
+    regler_pure(&orch, zone_id, true);
+    assert_eq!(
+        orch.apply_audiophile_change_portee(zone_id).await,
+        PorteeDuReglage::PisteSuivante
+    );
+    regler_pure(&orch, zone_id, false);
+    assert_ne!(
+        orch.apply_eq_change_portee(zone_id).await,
+        PorteeDuReglage::Relance,
+        "zone en pause : l'égaliseur ne relance pas le flux"
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    let apres = orch.playback.get_state(zone_id).await;
+    assert_eq!(
+        apres.state,
+        PlayState::Paused,
+        "la zone doit rester en pause"
+    );
+    assert_eq!(apres.track_generation, avant.track_generation);
+    assert_eq!(
+        lectures_envoyees_7556(&orch, device_id).await,
+        lectures_avant,
+        "aucune commande de lecture ne doit partir vers la sortie"
+    );
+}
+
+/// #7556, contre-épreuve : la zone JOUE, la bascule refabrique bien le flux
+/// (relance à la position courante, nouvelle lecture envoyée à la sortie).
+#[tokio::test]
+async fn bascule_pure_sur_une_zone_qui_joue_refabrique_le_flux_7556() {
+    use crate::orchestrator::PorteeDuReglage;
+    let device_id = "dlna:uuid-7556-joue";
+    let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    orch.playback.update_position(zone_id, 42_000).await;
+    let generation_avant = orch.playback.get_state(zone_id).await.track_generation;
+    let lectures_avant = lectures_envoyees_7556(&orch, device_id).await;
+
+    regler_pure(&orch, zone_id, true);
+    assert_eq!(
+        orch.apply_audiophile_change_portee(zone_id).await,
+        PorteeDuReglage::Relance
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    let apres = orch.playback.get_state(zone_id).await;
+    assert_ne!(
+        apres.track_generation, generation_avant,
+        "le flux doit avoir été refabriqué"
+    );
+    assert!(
+        lectures_envoyees_7556(&orch, device_id).await > lectures_avant,
+        "la relance doit être partie vers la sortie"
+    );
+}
+
 // ── #3973 — « bit-perfect strict » : les sites de la résolution ──────────────
 
 /// Une piste FLAC 192 kHz / 24 bits (le fichier n'est pas ouvert : la décision
@@ -10176,6 +10453,7 @@ async fn une_session_abandonnee_avant_l_envoi_arrete_la_zone_au_lieu_de_jouer_un
         channels: Some(2),
         origin_url: None,
         bitrate_kbps: None,
+        format_source: None,
     };
     let habillage = super::transport::Habillage {
         album: None,
@@ -10215,4 +10493,177 @@ async fn une_session_abandonnee_avant_l_envoi_arrete_la_zone_au_lieu_de_jouer_un
         message.contains("flux"),
         "le message doit dire que le flux du service n'a pas pu être ouvert : {message}"
     );
+}
+
+/// #6658 — banc commun : une sortie factice dont `play_media` s'arrête à
+/// mi-chemin (la fenêtre où une sortie locale relâche le flux précédent), et
+/// une session de flux Qobuz VIVANTE au moment de la garde #5522.
+async fn banc_session_morte_pendant_l_envoi_6658(
+    device_id: &'static str,
+) -> (
+    PlaybackOrchestrator,
+    String,
+    super::PlayRequest,
+    super::ResolvedStream,
+    BarriereMock,
+) {
+    use crate::http::streamer::StreamInfo;
+
+    let orch = test_orchestrator();
+    let mock = MockOutput::new(device_id, "Sortie 6658");
+    let barriere = mock.retenir_la_lecture();
+    orch.outputs.lock().await.register(Box::new(mock));
+
+    let info = StreamInfo {
+        format: "wav".to_string(),
+        mime_type: "audio/wav".to_string(),
+        ..StreamInfo::default()
+    };
+    let (sid, _tx, _ready) = orch.streamer.create_session(info, false, 1).await;
+    // `_tx` est lâché ici : la session reste inscrite (son émetteur de
+    // maintien vit avec elle), comme une session dont le producteur n'a pas
+    // encore écrit.
+
+    let req = super::PlayRequest {
+        zone_id: 2,
+        output_device_id: Some(device_id.into()),
+        track_id: None,
+        source: Some("qobuz".into()),
+        source_id: Some("25822841".into()),
+        title: Some("No Amount of Loving".into()),
+        artist_name: None,
+        album_title: None,
+        cover_url: None,
+        duration_ms: Some(180_000),
+        seek_ms: None,
+        temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: None,
+        track_number: None,
+        disc_number: None,
+        album_ref: None,
+    };
+    let resolved = super::ResolvedStream {
+        url: format!("http://127.0.0.1:8888/stream/{sid}.wav"),
+        mime_type: "audio/wav".into(),
+        title: "No Amount of Loving".into(),
+        artist: None,
+        album: None,
+        duration_ms: Some(180_000),
+        source: "qobuz".into(),
+        cover_url: None,
+        stream_id: Some(sid.clone()),
+        file_size: None,
+        sample_rate: Some(192_000),
+        bit_depth: Some(24),
+        channels: Some(2),
+        origin_url: None,
+        bitrate_kbps: None,
+        format_source: None,
+    };
+    (orch, sid, req, resolved, barriere)
+}
+
+type BarriereMock = (
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
+
+/// #6658 — la course du fil 2350 : la session est vivante quand la garde
+/// #5522 la regarde, puis son producteur l'abandonne PENDANT l'envoi à la
+/// sortie (téléchargement Qobuz coupé après un octet). La sortie, qui ouvre
+/// `/stream/<id>` à la fin de l'envoi, tirerait un 404, et la zone resterait
+/// « en lecture » à 0:00 sans un mot. Attendu : la sortie est arrêtée,
+/// `output_sent` est faux et le bandeau dit que le flux n'a pas pu être
+/// ouvert — le chemin d'erreur ordinaire.
+#[tokio::test]
+async fn une_session_abandonnee_pendant_l_envoi_arrete_la_sortie_et_le_dit_6658() {
+    let device_id = "mock-6658-course";
+    let (orch, sid, req, resolved, (entree, feu_vert)) =
+        banc_session_morte_pendant_l_envoi_6658(device_id).await;
+    let habillage = super::transport::Habillage {
+        album: None,
+        cover_path: None,
+    };
+
+    let envoi = orch.envoyer_a_la_sortie(
+        &req,
+        &resolved,
+        &habillage,
+        false,
+        std::time::Instant::now(),
+        0,
+    );
+    let producteur = async {
+        // La garde #5522 est passée : la sortie est entrée dans son envoi.
+        entree.notified().await;
+        assert!(orch.streamer.session_alive(&sid).await);
+        // Le producteur meurt maintenant, avant que la sortie n'ouvre le flux.
+        abandonner_la_session_de_transcodage(&orch.streamer, &sid, None).await;
+        feu_vert.notify_one();
+    };
+    let ((output_sent, output_error), ()) = tokio::join!(envoi, producteur);
+
+    let outputs = orch.outputs.lock().await;
+    let out = outputs.get(device_id).unwrap();
+    let guard = out.lock().await;
+    let mock = guard
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("mock output");
+    assert!(
+        !output_sent,
+        "un flux mort pendant l'envoi ne compte pas comme envoyé : c'est ce \
+         qui arrête la zone avec un bandeau"
+    );
+    assert!(
+        mock.stop_call_count() >= 1,
+        "la sortie qui tient un flux mort doit être arrêtée"
+    );
+    let message = output_error.expect("un message pour le bandeau de la zone");
+    assert!(
+        message.contains("n'a pas pu être ouvert") && message.contains("qobuz"),
+        "le message dit que le flux du service n'a pas pu être ouvert : {message}"
+    );
+}
+
+/// #6658 — contre-témoin : une session RETIRÉE pendant l'envoi sans que son
+/// producteur l'ait abandonnée (Stop, saut de piste, nouvelle lecture) n'est
+/// pas un échec de cette lecture. La sortie n'est pas arrêtée, aucun bandeau.
+#[tokio::test]
+async fn une_session_retiree_sans_abandon_pendant_l_envoi_n_arrete_rien_6658() {
+    let device_id = "mock-6658-retrait";
+    let (orch, sid, req, resolved, (entree, feu_vert)) =
+        banc_session_morte_pendant_l_envoi_6658(device_id).await;
+    let habillage = super::transport::Habillage {
+        album: None,
+        cover_path: None,
+    };
+
+    let envoi = orch.envoyer_a_la_sortie(
+        &req,
+        &resolved,
+        &habillage,
+        false,
+        std::time::Instant::now(),
+        0,
+    );
+    let retrait = async {
+        entree.notified().await;
+        orch.streamer.remove_session(&sid).await;
+        feu_vert.notify_one();
+    };
+    let ((output_sent, output_error), ()) = tokio::join!(envoi, retrait);
+
+    let outputs = orch.outputs.lock().await;
+    let out = outputs.get(device_id).unwrap();
+    let guard = out.lock().await;
+    let mock = guard
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("mock output");
+    assert!(output_sent, "l'envoi a abouti : {output_error:?}");
+    assert_eq!(output_error, None);
+    assert_eq!(mock.stop_call_count(), 0, "rien ne doit arrêter la sortie");
 }

@@ -105,6 +105,8 @@ fn au_seuil_d_echec(consommation: ConsommationFlux) -> StoppedInput {
         // la piste ne tranche pas.
         horloge_de_piste_couvre_l_arret: false,
         dlna_dsd_reached_end: false,
+        // #6717 : position figée — le renderer est vraiment arrêté.
+        position_avance: false,
     }
 }
 

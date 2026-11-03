@@ -46,6 +46,15 @@ pub mod titre_radio_2991;
 #[path = "dlna_volume_illisible_5662.rs"]
 pub(crate) mod volume_illisible_5662;
 
+/// #5575 — renderer qui acquitte `SetVolume` sans jamais l'appliquer.
+#[path = "dlna_volume_decoratif_5575.rs"]
+pub(crate) mod volume_decoratif_5575;
+
+/// #6008 (rc7, fil 2401) — une hausse de l'appareil corrigée aussi hors de la
+/// fenêtre d'après pose, sur un appareil qui porte la règle.
+#[path = "dlna_volume_hors_fenetre_6008.rs"]
+pub(crate) mod hors_fenetre_6008;
+
 #[cfg(test)]
 #[path = "dlna_journal_volume_tests_5575.rs"]
 mod journal_volume_tests_5575;
@@ -528,6 +537,9 @@ pub struct DlnaOutput {
     /// #4971 — boîte noire du contact SOAP : derniers échanges, perte et
     /// retour du renderer portés au journal INFO une fois par bascule.
     contact: std::sync::Mutex<super::dlna_contact::JournalDeContact>,
+    /// #6599 — empreinte du dernier Sink porté au journal : chaque renderer
+    /// y laisse son `GetProtocolInfo` une fois, puis à chaque changement.
+    sink_journalise: std::sync::Mutex<Option<u64>>,
     /// Bornes et mémoire de la redécouverte ciblée (#3829).
     redecouverte: Redecouverte,
     client: Client,
@@ -570,6 +582,8 @@ pub struct DlnaOutput {
     /// #5662 — un épisode de réponses `GetVolume` illisibles est en cours :
     /// la ligne `dlna_volume_illisible` a déjà été écrite.
     volume_illisible: AtomicBool,
+    /// #5575 — `modelName` du descriptif UPnP, quand l'enregistrement le connaît.
+    modele: Option<String>,
     /// Niveau de DIDL appris pour CET appareil (0 = complet, 1 = minimal,
     /// 2 = vide). La pile Platinum de l'Eversolo ne lit qu'un segment TCP de
     /// requête : le DIDL complet déborde et finit en « 500 sans corps », le
@@ -624,14 +638,21 @@ pub struct DlnaOutput {
     /// Dernier volume que **Tune** a posé, en pour-cent. `u64::MAX` = jamais.
     /// Seule valeur disponible en mode silence si le renderer n'a jamais
     /// poussé de `Volume`.
+    ///
+    /// #6472 / #6008 — c'est aussi la SEULE consigne que la réimposition après
+    /// pose d'URI repose. Une valeur lue sur l'appareil n'y entre jamais : un
+    /// renderer qui rapporte 0 pendant une radio (Reivax66, fil 2307) ou qui
+    /// remonte seul à 80 % entre deux pistes (Cabasse Abyss, fil 2315) faisait
+    /// de cette lecture la consigne de la piste suivante.
     dernier_volume_pct: AtomicU64,
-    /// #6008 — le volume que l'appareil tenait avant la dernière pose d'URI,
-    /// en pour-cent : le dernier que Tune a posé, ou à défaut le dernier lu
-    /// hors de la fenêtre qui suit une pose. `u64::MAX` = inconnu.
-    volume_connu_pct: AtomicU64,
     /// #6008 — instant de la dernière pose d'URI acceptée. Ouvre la fenêtre
     /// pendant laquelle un volume remonté par l'appareil est corrigé.
     uri_posee_a: std::sync::Mutex<Option<std::time::Instant>>,
+    /// #6008 (rc7, fil 2401) — instant du dernier `SetVolume` DEMANDÉ par
+    /// Tune. Hors de la fenêtre d'après pose, une hausse n'est corrigée
+    /// qu'au-delà d'une grâce qui suit cette demande : une lecture faite
+    /// pendant un glissement de curseur n'est pas un saut de l'appareil.
+    volume_demande_a: std::sync::Mutex<Option<std::time::Instant>>,
     /// #5793 — URL du SCPD de `RenderingControl`, telle que le descriptif de
     /// l'appareil l'annonce. `None` : sortie construite sans descriptif, le
     /// profil standard s'applique.
@@ -805,6 +826,7 @@ impl DlnaOutput {
             budget_reveil_ms: AtomicU64::new(BUDGET_REVEIL_STANDBY.as_millis() as u64),
             item_id_seq: AtomicU64::new(1),
             volume_illisible: AtomicBool::new(false),
+            modele: None,
             didl_niveau_appris: NiveauDidlAppris::neuf(),
             muted: AtomicBool::new(false),
             micromega_ip,
@@ -816,8 +838,8 @@ impl DlnaOutput {
             incoherence_depuis: tokio::sync::Mutex::new(None),
             derniere_position_ms: AtomicU64::new(u64::MAX),
             dernier_volume_pct: AtomicU64::new(u64::MAX),
-            volume_connu_pct: AtomicU64::new(u64::MAX),
             uri_posee_a: std::sync::Mutex::new(None),
+            volume_demande_a: std::sync::Mutex::new(None),
             scpd_rendering_control: std::sync::RwLock::new(None),
             profil_volume: tokio::sync::OnceCell::new(),
             scpd_av_transport: std::sync::RwLock::new(None),
@@ -831,7 +853,15 @@ impl DlnaOutput {
             duree_annoncee: tokio::sync::Mutex::new(None),
             pose_courante: std::sync::Mutex::new(None),
             contact: std::sync::Mutex::new(super::dlna_contact::JournalDeContact::default()),
+            sink_journalise: std::sync::Mutex::new(None),
         }
+    }
+
+    /// #5575 — le `modelName` du descriptif : il reconnaît un renderer dont le
+    /// volume est décoratif ([`volume_decoratif_5575`]).
+    pub fn with_modele(mut self, modele: Option<String>) -> Self {
+        self.modele = modele.filter(|m| !m.trim().is_empty());
+        self
     }
 
     pub fn with_play_delay(self, delay_ms: u64) -> Self {
@@ -877,6 +907,7 @@ impl DlnaOutput {
     /// répondeur SSDP sans privilège sur le port 1900. Aucun appelant de
     /// production : les défauts sont [`redecouverte::PORT_SSDP`] et
     /// [`redecouverte::BUDGET_REPONSE`].
+    #[cfg(test)]
     pub(crate) fn with_redecouverte(self, port_ssdp: u16, budget: std::time::Duration) -> Self {
         self.redecouverte
             .port_ssdp
@@ -1040,6 +1071,15 @@ impl DlnaOutput {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = url.filter(|u| !u.trim().is_empty());
         self
+    }
+
+    /// #6910 — ce que le SCPD a dit de `SetNextAVTransportURI`, s'il a déjà
+    /// été lu, SANS jamais aller sur le réseau ; `Inconnue` sinon.
+    pub fn annonce_suivante_retenue(&self) -> AnnonceSuivante {
+        self.annonce_suivante
+            .get()
+            .copied()
+            .unwrap_or(AnnonceSuivante::Inconnue)
     }
 
     /// #3967 — ce que le SCPD d'`AVTransport` dit de `SetNextAVTransportURI`,
@@ -1351,8 +1391,17 @@ impl DlnaOutput {
     async fn memoriser_volume(&self, niveau_pct: u64, niveau_appareil: u32) {
         let niveau_pct = niveau_pct.min(100);
         self.dernier_volume_pct.store(niveau_pct, Ordering::Relaxed);
-        self.volume_connu_pct.store(niveau_pct, Ordering::Relaxed);
         self.event_state.lock().await.volume = Some(niveau_appareil);
+    }
+
+    /// Banc #6472 : fait comme si la dernière pose d'URI datait d'au-delà de
+    /// [`FENETRE_VOLUME_APRES_URI`], pour lire le volume hors de la fenêtre.
+    #[cfg(test)]
+    pub(crate) fn vieillir_la_pose_d_uri(&self) {
+        let mut pose = self.uri_posee_a.lock().unwrap_or_else(|e| e.into_inner());
+        *pose = pose.and_then(|t| {
+            t.checked_sub(FENETRE_VOLUME_APRES_URI + std::time::Duration::from_secs(1))
+        });
     }
 
     /// #6008 — ouvre la fenêtre de surveillance du volume : une URI vient
@@ -1362,9 +1411,10 @@ impl DlnaOutput {
             Some(std::time::Instant::now());
     }
 
-    /// #6008 — le volume que l'appareil tenait avant la pose, en fraction.
+    /// #6008 — la dernière consigne de volume de Tune, en fraction. Jamais une
+    /// lecture de l'appareil (#6472) : `None` tant que Tune n'a rien posé.
     fn volume_connu(&self) -> Option<f64> {
-        match self.volume_connu_pct.load(Ordering::Relaxed) {
+        match self.dernier_volume_pct.load(Ordering::Relaxed) {
             u64::MAX => None,
             v => Some(v as f64 / 100.0),
         }
@@ -1397,25 +1447,28 @@ impl DlnaOutput {
     /// #6008 — le volume LU sur l'appareil, corrigé s'il a remonté de
     /// lui-même juste après une pose d'URI.
     ///
-    /// Hors de la fenêtre [`FENETRE_VOLUME_APRES_URI`], la lecture devient le
-    /// volume connu et passe telle quelle. Dans la fenêtre, un écart avec le
-    /// volume connu ne vient pas de Tune (ses commandes mettent le volume
-    /// connu à jour) : l'appareil a bougé seul. Une HAUSSE d'au moins
+    /// Hors de la fenêtre [`FENETRE_VOLUME_APRES_URI`], la lecture passe telle
+    /// quelle, et elle ne devient PAS la consigne (#6472) : seule une commande
+    /// de Tune la fixe. Dans la fenêtre, un écart avec la consigne ne vient
+    /// pas de Tune (ses commandes la mettent à jour) : l'appareil a bougé seul. Une HAUSSE d'au moins
     /// [`HAUSSE_QUI_APPREND`] apprend la règle ; un appareil qui la porte voit
     /// toute hausse de plus de 2 points corrigée sur-le-champ, et le sondeur
     /// reçoit le volume réimposé, pas le saut.
-    async fn volume_apres_controle_d_uri(&self, lu: f64) -> f64 {
+    ///
+    /// #6008 (rc7, fil 2401) — sur un appareil qui PORTE déjà la règle, la
+    /// hausse se corrige aussi hors de la fenêtre, tant que Tune lit : voir
+    /// [`hors_fenetre_6008`].
+    async fn volume_apres_controle_d_uri(&self, lu: f64, lecture_de_tune: bool) -> f64 {
         let dans_la_fenetre = self
             .uri_posee_a
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some_and(|t| t.elapsed() <= FENETRE_VOLUME_APRES_URI);
         let connu = self.volume_connu();
-        let (true, Some(connu)) = (dans_la_fenetre, connu) else {
-            self.volume_connu_pct.store(
-                (lu * 100.0).round().clamp(0.0, 100.0) as u64,
-                Ordering::Relaxed,
-            );
+        if !dans_la_fenetre {
+            return self.volume_hors_fenetre(lu, connu, lecture_de_tune).await;
+        }
+        let Some(connu) = connu else {
             return lu;
         };
         // Seule une HAUSSE se corrige : une baisse dans la fenêtre est plus
@@ -2712,20 +2765,20 @@ impl OutputTarget for DlnaOutput {
                 // then audio/L16) if we have not tried it yet.
                 if !tried_fallback {
                     tried_fallback = true;
-                    if let Some(fb) = fallback_mime_from_sink(&sink) {
-                        if !fb.eq_ignore_ascii_case(&attempt_mime) {
-                            warn!(
-                                device = %self.name,
-                                advertised_mime = %attempt_mime,
-                                fallback_mime = %fb,
-                                sink = ?sink,
-                                "dlna_set_uri_714_pcm_fallback_retry"
-                            );
-                            attempt_mime = fb;
-                            mime_est_un_alias = false;
-                            replis += 1;
-                            continue;
-                        }
+                    if let Some(fb) = fallback_mime_from_sink(&sink)
+                        && !fb.eq_ignore_ascii_case(&attempt_mime)
+                    {
+                        warn!(
+                            device = %self.name,
+                            advertised_mime = %attempt_mime,
+                            fallback_mime = %fb,
+                            sink = ?sink,
+                            "dlna_set_uri_714_pcm_fallback_retry"
+                        );
+                        attempt_mime = fb;
+                        mime_est_un_alias = false;
+                        replis += 1;
+                        continue;
                     }
                 }
             }
@@ -3134,6 +3187,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
+        self.noter_demande_de_volume();
         if let Some(ip) = &self.micromega_ip {
             let target_vol = volume * 100.0;
             let msg = format!("GET /volume HTTP/1.0\r\n\r\nvolume={target_vol:.1}\r\n");
@@ -3156,6 +3210,20 @@ impl OutputTarget for DlnaOutput {
                 }
             }
             return Ok(());
+        }
+        // #5575 — un renderer qui acquitte sans appliquer : dire non, plutôt
+        // qu'un curseur qui bouge sur un son qui ne change pas.
+        if volume_decoratif_5575::volume_decoratif(&self.device_id, self.modele.as_deref())
+            && volume_decoratif_5575::refuser_la_consigne(volume)
+        {
+            warn!(
+                device = %self.name,
+                device_id = %self.device_id,
+                modele = self.modele.as_deref().unwrap_or("-"),
+                volume,
+                "dlna_volume_decoratif_refuse"
+            );
+            return Err(volume_decoratif_5575::message_de_refus(&self.name));
         }
         let level = (volume * 100.0).round() as u32;
         // #5793 — la plage et le canal sont ceux que l'appareil annonce dans
@@ -3332,7 +3400,10 @@ impl OutputTarget for DlnaOutput {
             // #6008 — même en silence : un saut de volume se corrige. Aucune
             // action ne part tant que l'appareil ne remonte pas son volume.
             let volume = match evt_volume {
-                Some(_) => self.volume_apres_controle_d_uri(volume).await,
+                Some(_) => {
+                    let de_tune = self.lecture_de_tune(etat, evt_uri.as_deref());
+                    self.volume_apres_controle_d_uri(volume, de_tune).await
+                }
                 None => volume,
             };
             return Ok(OutputStatus {
@@ -3416,7 +3487,8 @@ impl OutputTarget for DlnaOutput {
                 // dispense pas d'avoir un volume juste.
                 None => self.lire_volume().await?,
             };
-            let volume = self.volume_apres_controle_d_uri(volume).await;
+            let de_tune = self.lecture_de_tune(etat, current_uri.as_deref());
+            let volume = self.volume_apres_controle_d_uri(volume, de_tune).await;
 
             return Ok(OutputStatus {
                 state: etat,
@@ -3442,8 +3514,10 @@ impl OutputTarget for DlnaOutput {
         // un quart du trafic SOAP envoyé au renderer, pour une valeur que
         // personne ne lisait (#2263). L'état coupé se lit maintenant en local.
         let volume = self.lire_volume().await?;
-        let volume = self.volume_apres_controle_d_uri(volume).await;
         let state = etat_du_transport(&transport_resp);
+        let de_tune =
+            self.lecture_de_tune(state, extract_tag(&position_resp, "TrackURI").as_deref());
+        let volume = self.volume_apres_controle_d_uri(volume, de_tune).await;
 
         let position_ms = extract_tag(&position_resp, "RelTime")
             .map(|t| Self::parse_time(&t))
@@ -3703,6 +3777,30 @@ pub(super) fn meme_url(retenue: &str, posee: &str) -> bool {
 }
 
 impl DlnaOutput {
+    /// #6335 — efface la suivante que l'appareil tient (`SetNextAVTransportURI`
+    /// vide, la forme qu'AVTransport:1 donne à « plus de suivante »).
+    ///
+    /// Pour la façade MediaRenderer d'une zone : quand elle retire la suivante
+    /// qu'elle avait confiée à la file, le sondeur a pu l'armer déjà chez
+    /// l'appareil, qui l'enchaînerait alors tout seul. Le sondeur, lui, ne
+    /// désarme jamais une préparation dont la suivante a quitté la file
+    /// (`gapless_arm_outdated(Some, None)`), et ce sens-là protège le gapless
+    /// ordinaire : seul l'appelant qui SAIT que la suivante est retirée efface.
+    pub async fn effacer_la_suivante(&self) -> Result<(), String> {
+        let resp = self
+            .av_action(
+                "SetNextAVTransportURI",
+                "<InstanceID>0</InstanceID><NextURI></NextURI><NextURIMetaData></NextURIMetaData>",
+            )
+            .await?;
+        if resp.contains("UPnPError") || resp.contains("<errorCode>") {
+            warn!(device = %self.name, response = %resp, "dlna_suivante_non_effacee");
+            return Err(format!("SetNextAVTransportURI vide refusé : {resp}"));
+        }
+        info!(device = %self.name, "dlna_suivante_effacee");
+        Ok(())
+    }
+
     pub async fn get_protocol_info(&self) -> Result<Vec<String>, String> {
         let body = self
             .soap_action(
@@ -3713,13 +3811,65 @@ impl DlnaOutput {
             )
             .await?;
         let sink = extract_tag(&body, "Sink").unwrap_or_default();
-        Ok(sink
+        let sink: Vec<String> = sink
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .collect())
+            .collect();
+        self.journaliser_le_sink(&sink);
+        Ok(sink)
+    }
+
+    /// #6599 — porter le Sink sondé au journal INFO, une fois par renderer et
+    /// par contenu. Le rapport de l'Eversolo A6 (fil 2356) ne contenait le
+    /// Sink d'AUCUN renderer : la cible à deux canaux ne pouvait être ni
+    /// confirmée ni contredite.
+    fn journaliser_le_sink(&self, sink: &[String]) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        sink.hash(&mut h);
+        let empreinte = h.finish();
+        {
+            let mut deja = self
+                .sink_journalise
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *deja == Some(empreinte) {
+                return;
+            }
+            *deja = Some(empreinte);
+        }
+        info!(
+            device = %self.name,
+            device_id = %self.device_id,
+            entrees = sink.len(),
+            canaux_max = ?canaux_annonces_par_le_sink(sink),
+            sink = %sink_pour_le_journal(sink),
+            "dlna_sink_sonde"
+        );
     }
 }
+
+/// #6599 — le Sink en une ligne de journal bornée : les entrées séparées par
+/// une virgule, coupées au-delà de [`SINK_JOURNAL_MAX`] octets avec le nombre
+/// d'entrées omises. Un Sink de renderer haut de gamme dépasse souvent cent
+/// entrées ; la ligne doit rester lisible dans un rapport.
+pub fn sink_pour_le_journal(sink: &[String]) -> String {
+    let mut ligne = String::new();
+    for (i, entree) in sink.iter().enumerate() {
+        let sep = if i == 0 { "" } else { "," };
+        if ligne.len() + sep.len() + entree.len() > SINK_JOURNAL_MAX {
+            ligne.push_str(&format!(" … (+{} entrées)", sink.len() - i));
+            return ligne;
+        }
+        ligne.push_str(sep);
+        ligne.push_str(entree);
+    }
+    ligne
+}
+
+/// Borne d'une ligne [`sink_pour_le_journal`], en octets.
+pub const SINK_JOURNAL_MAX: usize = 6000;
 
 #[derive(Debug, Clone, Default)]
 pub struct DsdCapability {
@@ -3870,17 +4020,9 @@ pub struct RendererCapabilities {
     pub aac: bool,
     pub mp3: bool,
     pub dsd: bool,
-    /// #4573 — le nombre de canaux le plus élevé que le Sink ANNONCE, tous
-    /// formats confondus (`audio/L16;rate=…;channels=2`).
-    ///
-    /// `None` quand aucune entrée ne porte `channels=` : c'est « on ne sait
-    /// pas », et surtout pas « deux ». La différence commande tout : on ne
-    /// réduit une piste multicanale que sur une déclaration, jamais sur une
-    /// ignorance.
-    ///
-    /// Mesuré par Xavier Joly le 20/09/2026 sur un Denon AVR-X1600H : LPCM
-    /// annoncé en `channels=1` et `channels=2` seulement, `audio/flac:*` sans
-    /// `channels=` — un FLAC 5.1 n'y passera jamais tel quel.
+    /// Maximum des valeurs explicites, tous formats confondus, pour le
+    /// diagnostic uniquement. Ce résumé ne limite pas un format : la lecture
+    /// utilise `advertised_channels_for_mime` sur les entrées du Sink.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canaux_max: Option<u16>,
     /// Raw Sink entries, for an advanced/debug view.
@@ -3888,7 +4030,7 @@ pub struct RendererCapabilities {
 }
 
 impl RendererCapabilities {
-    fn inconclusive(reason: &'static str) -> Self {
+    pub(crate) fn inconclusive(reason: &'static str) -> Self {
         Self {
             reason: Some(reason),
             ..Self::default()
@@ -3922,9 +4064,41 @@ pub fn canaux_annonces_par_le_sink(sink: &[String]) -> Option<u16> {
     max
 }
 
+/// Limite annoncée pour le format servi, sans emprunter celle d'un autre
+/// codec. Un FLAC sans `channels=` reste inconnu même si le LPCM est stéréo.
+pub fn advertised_channels_for_mime(sink: &[String], mime: &str) -> Option<u16> {
+    let normalize = |mime: &str| {
+        mime.trim()
+            .to_ascii_lowercase()
+            .replace("audio/x-", "audio/")
+    };
+    let mime = normalize(mime);
+    sink.iter()
+        .filter_map(|entry| {
+            let fields: Vec<_> = entry.splitn(4, ':').collect();
+            if fields.len() != 4 || !fields[0].eq_ignore_ascii_case("http-get") {
+                return None;
+            }
+            let mut parameters = fields[2].split(';');
+            if normalize(parameters.next()?) != mime {
+                return None;
+            }
+            parameters
+                .filter_map(|parameter| {
+                    let (name, value) = parameter.trim().split_once('=')?;
+                    if !name.trim().eq_ignore_ascii_case("channels") {
+                        return None;
+                    }
+                    value.trim().parse::<u16>().ok().filter(|n| *n > 0)
+                })
+                .max()
+        })
+        .max()
+}
+
 /// Pure Sink → capabilities mapping (unit-tested; `probe_capabilities` wraps it
 /// around the SOAP call).
-fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities {
+pub(crate) fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities {
     // Param-aware match: LPCM entries carry `;rate=…;channels=…` after the MIME
     // (`audio/L16;rate=44100;channels=2`), so we compare the base MIME only.
     // Also accepts the `audio/x-…` legacy variant and the `*` wildcard, like
@@ -3991,7 +4165,12 @@ fn protocol_sink_supports_mime(mime: &str, protocols: &[String]) -> bool {
     for proto in protocols {
         let fields: Vec<&str> = proto.split(':').collect();
         if fields.len() >= 3 {
-            let proto_mime = fields[2].trim().to_lowercase();
+            let proto_mime = fields[2]
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
             if proto_mime == mime_lower || proto_mime == mime_alt || proto_mime == "*" {
                 return true;
             }
@@ -5945,7 +6124,30 @@ mod tests {
 /// #4573 — les canaux ANNONCÉS par le Sink, lus sur des chaînes réelles.
 #[cfg(test)]
 mod canaux_annonces_4573 {
-    use super::{canaux_annonces_par_le_sink, renderer_caps_from_sink};
+    use super::{
+        SINK_JOURNAL_MAX, canaux_annonces_par_le_sink, renderer_caps_from_sink,
+        sink_pour_le_journal,
+    };
+
+    /// #6599 — la ligne du Sink garde chaque entrée lisible et reste bornée.
+    #[test]
+    fn le_sink_au_journal_est_entier_puis_borne() {
+        let court = vec![
+            "http-get:*:audio/L16;rate=44100;channels=2:*".to_string(),
+            "http-get:*:audio/flac:*".to_string(),
+        ];
+        assert_eq!(
+            sink_pour_le_journal(&court),
+            "http-get:*:audio/L16;rate=44100;channels=2:*,http-get:*:audio/flac:*"
+        );
+        let long: Vec<String> = (0..1000)
+            .map(|i| format!("http-get:*:audio/L16;rate={i};channels=2:*"))
+            .collect();
+        let ligne = sink_pour_le_journal(&long);
+        assert!(ligne.len() <= SINK_JOURNAL_MAX + 40, "{}", ligne.len());
+        assert!(ligne.ends_with("entrées)"), "{ligne}");
+        assert!(ligne.starts_with("http-get:*:audio/L16;rate=0;channels=2:*,"));
+    }
 
     fn v(entrees: &[&str]) -> Vec<String> {
         entrees.iter().map(|e| e.to_string()).collect()
@@ -5954,7 +6156,7 @@ mod canaux_annonces_4573 {
     /// Le Sink relevé par Xavier Joly sur le Denon AVR-X1600H (20/09/2026) :
     /// LPCM en 1 et 2 canaux, FLAC sans `channels=`.
     #[test]
-    fn le_denon_de_xavier_annonce_deux_canaux_au_plus() {
+    fn sink_summary_reports_highest_explicit_count() {
         let sink = v(&[
             "http-get:*:audio/L16;rate=44100;channels=1:*",
             "http-get:*:audio/L16;rate=44100;channels=2:*",
@@ -5965,7 +6167,10 @@ mod canaux_annonces_4573 {
         assert_eq!(canaux_annonces_par_le_sink(&sink), Some(2));
         let caps = renderer_caps_from_sink(sink);
         assert_eq!(caps.canaux_max, Some(2));
-        assert!(caps.flac, "le FLAC reste annoncé — mais en deux canaux");
+        assert!(
+            caps.flac,
+            "le FLAC est annoncé, sans précision sur ses canaux"
+        );
     }
 
     /// 🔴 Aucune entrée ne porte `channels=` : c'est « on ne sait pas », et la
@@ -6004,5 +6209,36 @@ mod canaux_annonces_4573 {
     fn la_casse_et_les_espaces_ne_trompent_pas_la_lecture() {
         let sink = v(&["HTTP-GET:*:AUDIO/L16;RATE=44100; CHANNELS=6 :*"]);
         assert_eq!(canaux_annonces_par_le_sink(&sink), Some(6));
+    }
+}
+
+#[cfg(test)]
+mod multichannel_7275 {
+    use super::advertised_channels_for_mime;
+
+    #[test]
+    fn lpcm_limit_does_not_cap_flac() {
+        let sink = [
+            "http-get:*:audio/L16;rate=48000;channels=2:*".into(),
+            "http-get:*:audio/flac:*".into(),
+            "http-get:*:audio/mp4:DLNA.ORG_PN=AAC_MULT5_ISO".into(),
+        ];
+        assert_eq!(advertised_channels_for_mime(&sink, "audio/flac"), None);
+        assert_eq!(advertised_channels_for_mime(&sink, "audio/L16"), Some(2));
+    }
+
+    #[test]
+    fn each_codec_keeps_its_channels_and_aliases() {
+        let sink = [
+            "http-get:*:audio/L24;channels=8:*".into(),
+            "http-get:*:audio/x-flac; channels = 2 :*".into(),
+            "http-get:*:AUDIO/FLAC;CHANNELS=6:*".into(),
+            "http-get:*:audio/flac:profil;channels=16".into(),
+            "http-get:*:video/flac;channels=32:*".into(),
+            "rtsp-rtp-udp:*:audio/flac;channels=64:*".into(),
+        ];
+        assert_eq!(advertised_channels_for_mime(&sink, "audio/flac"), Some(6));
+        assert_eq!(advertised_channels_for_mime(&sink, "audio/L24"), Some(8));
+        assert_eq!(advertised_channels_for_mime(&sink, "audio/wav"), None);
     }
 }

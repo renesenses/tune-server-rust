@@ -93,6 +93,9 @@ async fn playlist_locale(app: &axum::Router, nom: &str) -> i64 {
 #[tokio::test]
 async fn les_alias_des_liens_repondent_encore_et_se_disent_deprecies() {
     let state = etat();
+    // La synchronisation d'un lien demande le droit Premium (voir
+    // `la_synchro_d_un_lien_demande_le_droit`).
+    state.license.set_account_premium(true, None).await;
     let app = tune_server::routes::router(state.clone());
     let pl = playlist_locale(&app, "Liee").await;
 
@@ -227,4 +230,49 @@ async fn les_routes_qui_ne_sont_pas_des_doublons_ne_sont_pas_depreciees() {
             "{methode} {route} n'est pas un doublon et ne doit pas se dire dépréciée"
         );
     }
+}
+
+/// La synchronisation d'un lien relève du même droit que les liens du greffon
+/// et que le transfert : sans lui, refus commun 402 (`playlist_transfer`),
+/// rien n'est horodaté, et la réponse se dit toujours dépréciée. Avec lui, la
+/// route répond comme avant.
+#[tokio::test]
+async fn la_synchro_d_un_lien_demande_le_droit() {
+    let state = etat();
+    state.license.set_account_premium(false, None).await;
+    let app = tune_server::routes::router(state.clone());
+    let pl = playlist_locale(&app, "Liee").await;
+    let (st, _, lien) = appel(
+        &app,
+        "POST",
+        "/api/v1/playlist-manager/links",
+        Some(json!({
+            "local_playlist_id": pl,
+            "service": "qobuz",
+            "service_playlist_id": "123",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "création : {lien}");
+    let id = lien["id"].as_i64().unwrap();
+    let chemin = format!("/api/v1/playlist-manager/links/{id}/sync");
+
+    let (st, h, refus) = appel(&app, "POST", &chemin, None).await;
+    assert_eq!(st, StatusCode::PAYMENT_REQUIRED, "sans le droit : {refus}");
+    assert_eq!(refus["error"], "premium_required", "{refus}");
+    assert_eq!(refus["code"], "playlist_transfer", "{refus}");
+    assert_deprecie("POST /links/{id}/sync (refus)", &h, LIEN_LIENS);
+    assert!(
+        reglage_json(&state, "playlist_links")[0]["last_synced_at"].is_null(),
+        "le refus a horodaté le lien"
+    );
+
+    state.license.set_account_premium(true, None).await;
+    let (st, _, synchro) = appel(&app, "POST", &chemin, None).await;
+    assert_eq!(st, StatusCode::OK, "avec le droit : {synchro}");
+    assert_eq!(synchro["link_id"], id);
+    assert!(
+        !reglage_json(&state, "playlist_links")[0]["last_synced_at"].is_null(),
+        "avec le droit, la synchro écrit sa date"
+    );
 }

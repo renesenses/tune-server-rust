@@ -127,6 +127,7 @@ async fn envoyer_un_dsd128_decime(
         channels: Some(2),
         origin_url: None,
         bitrate_kbps: None,
+        format_source: None,
     };
     let habillage = super::transport::Habillage {
         album: None,

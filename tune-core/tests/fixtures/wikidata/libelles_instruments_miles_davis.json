@@ -1,0 +1,61 @@
+{
+ "entities": {
+  "Q8338": {
+   "type": "item",
+   "id": "Q8338",
+   "labels": {
+    "fr": {
+     "language": "fr",
+     "value": "trompette"
+    },
+    "en": {
+     "language": "en",
+     "value": "trumpet"
+    }
+   }
+  },
+  "Q163829": {
+   "type": "item",
+   "id": "Q163829",
+   "labels": {
+    "en": {
+     "language": "en",
+     "value": "synthesizer"
+    },
+    "fr": {
+     "language": "fr",
+     "value": "synthétiseur"
+    }
+   }
+  },
+  "Q1444": {
+   "type": "item",
+   "id": "Q1444",
+   "labels": {
+    "en": {
+     "language": "en",
+     "value": "organ"
+    },
+    "fr": {
+     "language": "fr",
+     "value": "orgue"
+    }
+   }
+  },
+  "Q382616": {
+   "type": "item",
+   "id": "Q382616",
+   "labels": {
+    "fr": {
+     "language": "fr",
+     "value": "bugle"
+    },
+    "en": {
+     "language": "en",
+     "value": "flugelhorn"
+    }
+   }
+  }
+ },
+ "success": 1
+}

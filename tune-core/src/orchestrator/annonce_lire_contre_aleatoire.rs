@@ -81,6 +81,7 @@ fn flux_local_resolu(sample_rate: Option<u32>, bit_depth: Option<u32>) -> Resolv
         channels: Some(2),
         origin_url: None,
         bitrate_kbps: None,
+        format_source: None,
     }
 }
 

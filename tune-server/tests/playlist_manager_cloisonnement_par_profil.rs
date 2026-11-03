@@ -336,6 +336,9 @@ async fn exporter_la_playlist_d_un_autre_profil_ne_rend_aucun_titre() {
 #[tokio::test]
 async fn synchroniser_un_lien_vers_la_playlist_d_un_autre_profil_n_ecrit_rien() {
     let state = etat();
+    // La synchronisation demande le droit Premium : sans lui, les deux appels
+    // s'arrêteraient au refus, et l'essai ne prouverait plus le cloisonnement.
+    state.license.set_account_premium(true, None).await;
     let app = appli(&state);
     let (id, t1, t2) = playlist_du_profil_1(&state, &app).await;
 

@@ -162,6 +162,83 @@ fn bug_report_url(state: &AppState) -> String {
 /// The community endpoint caps the thread body at 50k chars; keep headroom.
 const BUG_REPORT_MAX_BODY_CHARS: usize = 49_000;
 
+/// Ramène le corps du fil sous la limite du site en retirant les lignes de
+/// journal les PLUS ANCIENNES (#7468).
+///
+/// La section « Recent Logs » est la dernière du rapport et ses lignes vont de
+/// la plus ancienne à la plus récente : couper la fin du texte (ce que faisait
+/// `.take(N)`) retirait l'instant même du défaut signalé. On garde donc l'en-tête
+/// du rapport et la fin du journal, et une phrase dit ce qui a été retiré et
+/// quelle période reste présente. Sans section de journal reconnaissable, repli
+/// sur l'ancienne coupe de la fin, signalée aussi.
+fn couper_le_rapport(complet: &str, max: usize) -> String {
+    if complet.chars().count() <= max {
+        return complet.to_string();
+    }
+    let repli = || {
+        let garde: String = complet.chars().take(max).collect();
+        format!("{garde}\n\n_…report truncated…_")
+    };
+    let Some(debut_section) = complet.rfind("\n## Recent Logs") else {
+        return repli();
+    };
+    let section = &complet[debut_section..];
+    let Some(ouverture) = section.find("```\n") else {
+        return repli();
+    };
+    let apres_ouverture = debut_section + ouverture + 4;
+    let Some(fermeture) = complet[apres_ouverture..].rfind("\n```") else {
+        return repli();
+    };
+    let fin_journal = apres_ouverture + fermeture;
+    let avant = &complet[..debut_section + ouverture];
+    let lignes: Vec<&str> = complet[apres_ouverture..fin_journal].lines().collect();
+    let suite = &complet[fin_journal..];
+
+    // Phrase de coupe : sa longueur est majorée avant de savoir combien de
+    // lignes partent (le nombre y tient sur autant de chiffres que le total).
+    let phrase = |retirees: usize, restantes: &[&str]| {
+        let periode = periode_couverte(&restantes.join("\n"))
+            .map(|p| format!(" ; période conservée : {p}"))
+            .unwrap_or_default();
+        format!(
+            "_Rapport raccourci pour tenir dans la limite du site : les {retirees} lignes de journal les plus anciennes sur {} ont été retirées{periode}._\n",
+            lignes.len()
+        )
+    };
+    let fixe = avant.chars().count()
+        + suite.chars().count()
+        + phrase(lignes.len(), &lignes).chars().count()
+        + 5;
+    let Some(budget) = max.checked_sub(fixe) else {
+        return repli();
+    };
+    // On retire par l'avant jusqu'à tenir.
+    let mut taille: usize = lignes.iter().map(|l| l.chars().count() + 1).sum();
+    let mut premiere = 0;
+    while taille > budget && premiere < lignes.len() {
+        taille -= lignes[premiere].chars().count() + 1;
+        premiere += 1;
+    }
+    let restantes = &lignes[premiere..];
+    format!(
+        "{avant}{}```\n{}{suite}",
+        phrase(premiere, restantes),
+        restantes.join("\n")
+    )
+}
+
+/// Le `User-Agent` du client, borné et sans caractère de contrôle, pour tenir
+/// sur une ligne du rapport (#7468).
+fn navigateur_lisible(brut: &str) -> String {
+    brut.chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Relevé de la famine de l'anneau audio, sortie par sortie (#3205).
 ///
 /// Ce qui est compté : un rappel du pilote à qui l'anneau a rendu MOINS
@@ -271,7 +348,8 @@ fn ligne_famine(output_id: &str, etat: EtatDuReleve<'_>) -> Option<Value> {
         EtatDuReleve::Occupee => Some(json!({
             "output_id": output_id,
             "mesure": "indisponible",
-            "raison": "sortie verrouillée au moment du relevé (elle jouait, ou le sondeur la lisait)",
+            "raison": crate::message_api::texte("api.diagnostics.outputLocked", &[]),
+            "raison_key": "api.diagnostics.outputLocked",
         })),
         EtatDuReleve::Mesure { nom, famine } => Some(json!({
             "output_id": output_id,
@@ -713,12 +791,8 @@ fn groupe_json(motif: &str, cle: &str, zones: &[&ZoneVue]) -> Value {
         "cle": cle,
         "en_ligne": en_ligne,
         "fusionnable": fusionnable,
-        "fusion_refusee_motif": (!fusionnable).then_some(
-            "deux protocoles de découverte différents sur le même hôte : \
-             SSDP/DLNA et mDNS/AirPlay n'ont aucun identifiant commun, et la \
-             fusion serait refusée (409 zones_distinctes). Supprimez la zone \
-             dont vous ne voulez pas ; ses réglages ne sont pas reportés.",
-        ),
+        "fusion_refusee_motif": (!fusionnable)
+            .then(|| crate::message_api::texte("api.diagnostics.mergeRefusedDifferentProtocols", &[])),
         "zones": zones.iter().map(|z| json!({
             "id": z.id,
             "name": z.name,
@@ -888,7 +962,12 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let cpu_temp_c = temperature_processeur().await;
     // #5410 — sans température lisible, les analyses de fond sont bridées à
     // un fichier à la fois : l'écran doit le dire.
-    let analyses_bridees = bridage_des_analyses().await;
+    // #6713 — sauf si l'utilisateur a levé ce bridage : le motif passe alors
+    // dans `analyses_bridage_leve`, et `analyses_bridees` est nul.
+    let (analyses_bridees, analyses_bridage_leve) = repartir_le_bridage(
+        bridage_des_analyses().await,
+        tune_core::taches_de_fond::vitesse::bridage_leve(&state.backend),
+    );
 
     // #3205 — le seul chiffre qui dise si l'audio a réellement sauté.
     let ring_starvation = releve_famine_anneau(&state).await;
@@ -931,6 +1010,10 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "analyses_bridees": analyses_bridees,
         "analyses_bridees_largeur": analyses_bridees
             .map(|_| tune_core::audio::thermal::LARGEUR_SANS_THERMOMETRE),
+        // #6713 — le motif quand la température est illisible MAIS que
+        // l'utilisateur a levé le bridage (Réglages, niveau Expert) : les
+        // analyses tournent à la vitesse réglée. `null` sinon.
+        "analyses_bridage_leve": analyses_bridage_leve,
         "db_backend": db_backend,
         "active_zones": zone_count,
         "zone_poller_metrics": zone_poller_metrics,
@@ -973,6 +1056,10 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // pas leur zone. Le journal porte `dsp_ecretage` au premier écrêtage
         // d'une piste et à sa fin.
         "dsp_ecretage": tune_core::audio::ecretage::releve(),
+        // #6255 — les derniers `bruit_suspect_reseau` : ce que le serveur a
+        // envoyé à un lecteur réseau et qui s'entendra comme du bruit.
+        "bruit_suspect_reseau": tune_core::http::bruit_reseau::derniers(),
+        "bruit_suspect_reseau_actif": tune_core::http::bruit_reseau::actif(),
         // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
         // une ligne WARN que l'utilisateur ne verra jamais.
         "asio_warm_scan": crate::startup::asio_warm_status(),
@@ -983,6 +1070,7 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // donnaient jusqu'ici le même écran vide.
         "output_providers": crate::discovery_setup::provider_status_snapshot(),
         "scan_status": {
+            "current": super::scan::decrire_le_scan_en_cours(&scan_status),
             "status": scan_status,
             "tracks": tracks,
             "albums": albums,
@@ -1030,15 +1118,32 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
 ///
 /// Réutilise la lecture sysfs du garde thermique
 /// (`tune_core::audio::thermal::cpu_package_temp_celsius`) : paquet CPU quand
-/// il est identifiable, sinon maximum des zones. La lecture est synchrone et
-/// certains pilotes `hwmon` (disques) peuvent tarder : elle passe par
-/// `spawn_blocking` et abandonne au-delà de 300 ms. Le rapport de diagnostic
+/// il est identifiable, sinon maximum des zones. Quand le serveur tourne,
+/// c'est la médiane des relevés de fond (#5320) : lire la sonde ICI tombait
+/// sur la pointe que provoque la collecte de l'écran. Sans échantillonneur,
+/// la lecture est synchrone et certains pilotes `hwmon` (disques) peuvent
+/// tarder : elle passe par `spawn_blocking` et abandonne au-delà de 300 ms.
+/// Le rapport de diagnostic
 /// ne doit jamais attendre un capteur.
 async fn temperature_processeur() -> Option<f64> {
     let lecture = tokio::task::spawn_blocking(tune_core::audio::thermal::cpu_package_temp_celsius);
     match tokio::time::timeout(std::time::Duration::from_millis(300), lecture).await {
         Ok(Ok(Some(c))) => Some((c * 10.0).round() / 10.0),
         _ => None,
+    }
+}
+
+/// #6713 — `(analyses_bridees, analyses_bridage_leve)` : le motif d'une
+/// température illisible va au premier quand le bridage s'applique (le
+/// défaut), au second quand l'utilisateur l'a levé. Jamais aux deux.
+fn repartir_le_bridage(
+    motif: Option<&'static str>,
+    bridage_leve: bool,
+) -> (Option<&'static str>, Option<&'static str>) {
+    if bridage_leve {
+        (None, motif)
+    } else {
+        (motif, None)
     }
 }
 
@@ -1523,6 +1628,21 @@ fn selectionner_lignes(
     (lignes, vraiment_ecartees)
 }
 
+/// Les dernières lignes du journal pour le diagnostic de l'assistant IA
+/// (23/10/2026), déjà nettoyées par `anonymiser` comme l'export : le greffon
+/// les filtre et les pseudonymise encore avant tout envoi.
+#[cfg(feature = "assistant-ia")]
+pub(crate) async fn journal_pour_assistant(max_lines: usize) -> Vec<String> {
+    let Json(mut journaux) = collect_recent_logs(max_lines).await;
+    tune_core::confidentialite::anonymiser_json(&mut journaux);
+    journaux["logs"]
+        .as_str()
+        .unwrap_or("")
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
 pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
     // #5124 — « Exporter les journaux » : le fichier finit collé dans un fil.
     // Même nettoyage que le rapport de bogue, par la même fonction.
@@ -1605,6 +1725,9 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     let log_path = crate::config::default_log_file_path()
         .to_string_lossy()
         .into_owned();
+    // #6866 — l'erreur d'un fichier présent mais illisible, gardée pour la fin :
+    // elle ne dispense plus des replis.
+    let mut fichier_illisible: Option<String> = None;
 
     // Read only a bounded tail, off the async runtime. Reading the whole file
     // with read_to_string both blocked a Tokio worker (same trap as
@@ -1621,8 +1744,12 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
         let a_lire = max_lines.saturating_mul(CANDIDATE_FACTOR).max(max_lines);
         let tail =
             tokio::task::spawn_blocking(move || read_log_tail(&path, a_lire, LOG_TAIL_BYTES)).await;
-        match tail {
-            Ok(Ok(brutes)) => {
+        // Une tâche annulée se traite comme un fichier absent : on tente les replis.
+        match tail
+            .unwrap_or(Err(LogTailError::Missing))
+            .map_err(suite_d_un_fichier_non_lu)
+        {
+            Ok(brutes) => {
                 let lues = brutes.len();
                 let (lines, ecartees) = selectionner_lignes(brutes, max_lines);
                 if !ecartees.is_empty() {
@@ -1646,16 +1773,12 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
                     "set_aside": ecartees,
                 }));
             }
-            Ok(Err(LogTailError::Unreadable(e))) => {
-                return Json(json!({
-                    "logs": format!("Log file exists but could not be read: {e}\nPath: {log_path}"),
-                    "lines": 0,
-                    "source": "file_unreadable",
-                    "path": log_path,
-                }));
+            Err(illisible) => {
+                if let Some(ref e) = illisible {
+                    tracing::warn!(path = %log_path, error = %e, "log_export_fichier_illisible_replis_tentes");
+                }
+                fichier_illisible = illisible;
             }
-            // Missing file or a cancelled blocking task: try the fallbacks.
-            Ok(Err(LogTailError::Missing)) | Err(_) => {}
         }
     }
 
@@ -1827,14 +1950,56 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     #[cfg(not(target_os = "linux"))]
     let tentatives = format!("Chemins et sources essayés :\n  - fichier : {log_path}");
 
-    Json(json!({
-        "logs": format!(
-            "Aucun journal accessible. Si Tune tourne en service, la commande \
-             ci-dessous le donne en direct :\n  journalctl -u tune -n 2000 --no-pager\n\n{tentatives}"
-        ),
-        "lines": 0,
-        "source": "none",
-    }))
+    reponse_sans_journal(&log_path, fichier_illisible.as_deref(), &tentatives)
+}
+
+/// #6866 — ce que l'export fait d'un fichier qu'il n'a pas pu lire : `Err(None)`
+/// pour un fichier absent, `Err(Some(erreur))` pour un fichier présent mais
+/// illisible. Dans les deux cas, l'export tente ENSUITE les replis
+/// (journalctl, syslog).
+///
+/// Tune OS, fil 2400 (rc7) : `tune.service` tourne en `User=tune` avec
+/// `ProtectHome=yes`, et le journal par défaut est sous `/home/tune`. Le
+/// service n'y écrit rien (tout part à journald) et l'export recevait
+/// `EACCES` — pas `NotFound`. Il rendait alors « Log file exists but could
+/// not be read: Permission denied » (230 octets) et s'arrêtait là : le repli
+/// `journalctl -u tune`, écrit justement pour Tune OS, n'était jamais tenté.
+fn suite_d_un_fichier_non_lu(e: LogTailError) -> Option<String> {
+    match e {
+        LogTailError::Missing => None,
+        LogTailError::Unreadable(erreur) => Some(erreur),
+    }
+}
+
+/// La réponse quand aucune source n'a rien donné. Un fichier illisible le dit
+/// — sans prétendre qu'il « existe » : `EACCES` sous `ProtectHome` ne dit rien
+/// de son existence — et rappelle la commande qui donne le journal en direct.
+fn reponse_sans_journal(
+    log_path: &str,
+    fichier_illisible: Option<&str>,
+    tentatives: &str,
+) -> Json<Value> {
+    let commande = "journalctl -u tune -n 2000 --no-pager";
+    match fichier_illisible {
+        Some(e) => Json(json!({
+            "logs": format!(
+                "Fichier journal inaccessible au serveur ({e}), et aucun autre journal \
+                 trouvé. Si Tune tourne en service, la commande ci-dessous le donne en \
+                 direct :\n  {commande}\n\n{tentatives}"
+            ),
+            "lines": 0,
+            "source": "file_unreadable",
+            "path": log_path,
+        })),
+        None => Json(json!({
+            "logs": format!(
+                "Aucun journal accessible. Si Tune tourne en service, la commande \
+                 ci-dessous le donne en direct :\n  {commande}\n\n{tentatives}"
+            ),
+            "lines": 0,
+            "source": "none",
+        })),
+    }
 }
 
 // --- Log level management ---
@@ -2127,6 +2292,44 @@ fn ligne_albums_masques(compte: Option<i64>) -> String {
     }
 }
 
+/// #6378 — les zones masquées, avec leur appareil, leur motif et leur date de
+/// masquage. Le titre `## Zones (N)` ne compte que les zones visibles : un
+/// testeur dont la seule zone était masquée envoyait un « Zones (0) » qui ne
+/// disait rien de la zone qu'il utilisait. Un motif NUL est un masquage
+/// d'avant la migration 112, que la réparation automatique ne touche pas.
+fn lignes_zones_masquees(
+    masquees: &Result<Vec<tune_core::db::zone_repo::ZoneMasquee>, String>,
+) -> String {
+    let liste = match masquees {
+        Ok(liste) => liste,
+        Err(e) => return format!("- Zones masquées : illisibles ({e})\n"),
+    };
+    let mut md = format!("- Zones masquées : {}\n", liste.len());
+    for z in liste {
+        let protocole = if z.protocole.is_empty() {
+            "?"
+        } else {
+            z.protocole.as_str()
+        };
+        let appareil = if z.device_id.is_empty() {
+            "?"
+        } else {
+            z.device_id.as_str()
+        };
+        let motif = z
+            .motif
+            .as_deref()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or("inconnu (masquage d'avant la migration 112)");
+        let date = z.masquee_le.as_deref().unwrap_or("date inconnue");
+        md.push_str(&format!(
+            "  - zone {} « {} » ({protocole}) — appareil {appareil} — motif : {motif} — masquée le {date}\n",
+            z.id, z.name
+        ));
+    }
+    md
+}
+
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
@@ -2152,6 +2355,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     let version_interface =
         tune_core::interface_web::version_interface(&crate::config::resolve_web_dir());
     let music_dirs = super::get_music_dirs_list(&state.backend);
+    let partages_sans_racine = crate::partages_sans_racine::releve(&state.backend, &music_dirs);
     let scan_status = settings
         .get("scan_status")
         .ok()
@@ -2169,6 +2373,10 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         .iter()
         .map(|z| json!({ "id": z.id, "name": z.name, "output_type": z.output_type }))
         .collect();
+    // #6378 — `count()` et `list()` ignorent les zones masquées : sans cette
+    // lecture, « Zones (0) » ne distingue pas « aucune zone » de « la seule
+    // zone utilisée est masquée ».
+    let zones_masquees = zone_repo.zones_masquees();
 
     // Streaming services status
     let registry = state.services.lock().await;
@@ -2307,7 +2515,18 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         md.push_str(&ligne_portraits_d_artistes(p));
     }
     md.push_str(&format!("- Music dirs: {}\n", music_dirs.join(", ")));
-    md.push_str(&format!("- Scan status: {scan_status}\n"));
+    // #6175 — `Music dirs:` vide à côté de deux partages « Monté » : le rapport
+    // de Daniel LEVY ne reliait pas les deux, la cause tient en une ligne.
+    if let Some(phrase) =
+        crate::partages_sans_racine::explication(&music_dirs, &partages_sans_racine)
+    {
+        md.push_str(&format!("- Partages SMB sans dossier déclaré: {phrase}\n"));
+    }
+    // #6729 : QUEL scan tient le statut, ou « résiduel » si aucun.
+    md.push_str(&format!(
+        "- Scan status: {}\n",
+        super::scan::ligne_du_scan_en_cours(&scan_status)
+    ));
     // #4319 — « je le vois dans Répertoires, la recherche ne le trouve pas ».
     // Le nombre d'entrées INDEXÉES tranche entre « le mot ne correspond pas »
     // et « la ligne manque à l'index ». Muet sur PostgreSQL, qui indexe par
@@ -2359,6 +2578,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             z["output_type"].as_str().unwrap_or("?")
         ));
     }
+    md.push_str(&lignes_zones_masquees(&zones_masquees));
     md.push_str(&format!(
         "- Zone settings not persisted: {zone_settings_ignored}\n"
     ));
@@ -2589,6 +2809,21 @@ confondre avec la famine de l'anneau, comptee au-dessus)\n\n",
 journal porte `dsp_ecretage` au premier ecretage d'une piste et a sa fin, \
 jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
     );
+    // #6255 — ce que le serveur a ENVOYÉ aux lecteurs réseau et qui
+    // s'entendra comme du bruit (reprise hors trame, décodage décalé, en-tête
+    // au milieu). Le lecteur ne le dit jamais : sans cette section, le bruit
+    // blanc du .18 du 13/10 ne laissait rien dans le rapport.
+    let bruit_reseau = tune_core::http::bruit_reseau::derniers();
+    md.push_str(&tune_core::http::bruit_reseau::section_du_rapport(
+        &bruit_reseau,
+        |id| {
+            zones
+                .iter()
+                .find(|z| z["id"].as_i64() == Some(id))
+                .and_then(|z| z["name"].as_str())
+                .map(str::to_string)
+        },
+    ));
     md.push_str("## Database\n");
     // #3182 : c'était `format!("- Engine: sqlite\n")` — un `format!` sans
     // argument, donc une chaîne littérale, et toute installation PostgreSQL
@@ -2684,6 +2919,9 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
                 "sources": p.sources,
             })),
             "music_dirs": music_dirs,
+            // #6175 — les partages SMB actifs qu'aucun dossier ne couvre.
+            "mounted_shares_not_declared":
+                crate::partages_sans_racine::en_json(&partages_sans_racine),
             "scan_status": scan_status,
             // #4319 — ce que la RECHERCHE voit, à côté de ce que la
             // bibliothèque contient. Absent sur PostgreSQL.
@@ -2708,6 +2946,18 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         "zones": {
             "count": zone_count,
             "items": zones,
+            // #6378 — `null` si la table n'a pas pu être lue.
+            "hidden": zones_masquees.as_ref().ok().map(|liste| liste
+                .iter()
+                .map(|z| json!({
+                    "id": z.id,
+                    "name": z.name,
+                    "output_type": z.protocole,
+                    "device_id": z.device_id,
+                    "motif": z.motif,
+                    "masquee_le": z.masquee_le,
+                }))
+                .collect::<Vec<_>>()),
         },
         "zone_settings_ignored": zone_settings_ignored,
         "asio_warm_scan": asio_warm_scan,
@@ -2729,6 +2979,8 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         "dsp_egaliseur": dsp_egaliseur,
         // Le pendant JSON de la section « DSP — ecretage » (#2218).
         "dsp_ecretage": dsp_ecretage,
+        // Le pendant JSON de la section « Lecteurs reseau — bruit suspect ».
+        "bruit_suspect_reseau": bruit_reseau,
         "database": {
             // #3182 : même mensonge que la ligne markdown ci-dessus, dans le
             // corps JSON que le client lit.
@@ -2774,6 +3026,13 @@ pub(super) async fn bug_report_markdown(
 pub(super) struct BugReportSubmitBody {
     #[serde(default)]
     description: String,
+    /// Le résumé de l'assistant IA (diagnostic), montré à l'utilisateur.
+    #[serde(default)]
+    resume_ia: Option<String>,
+    /// La case « joindre le résumé de l'assistant » : DÉCOCHÉE par défaut
+    /// (décision de Bertrand du 23/10/2026). Sans elle, le résumé est ignoré.
+    #[serde(default)]
+    joindre_resume_ia: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2843,6 +3102,8 @@ async fn lire_captures(
     mut multipart: axum::extract::Multipart,
 ) -> Result<(String, Vec<CaptureJointe>), axum::response::Response> {
     let mut description = String::new();
+    let mut resume_ia: Option<String> = None;
+    let mut joindre_resume_ia = false;
     let mut images: Vec<CaptureJointe> = Vec::new();
 
     loop {
@@ -2898,14 +3159,24 @@ async fn lire_captures(
                     Ok(v) => v,
                     Err(e) => return Err(refus_de_capture("invalid_field", &e.to_string())),
                 };
-                if name == "description" {
-                    description = value;
+                match name.as_str() {
+                    "description" => description = value,
+                    "resume_ia" => resume_ia = Some(value),
+                    "joindre_resume_ia" => joindre_resume_ia = value.trim() == "true",
+                    _ => {}
                 }
             }
         }
     }
 
-    Ok((description, images))
+    Ok((
+        tune_core::bug_report::description_avec_resume_ia(
+            description,
+            resume_ia.as_deref(),
+            joindre_resume_ia,
+        ),
+        images,
+    ))
 }
 
 /// POST /system/bug-report/submit — build the local bug report (diagnostics +
@@ -2946,6 +3217,14 @@ pub(super) async fn submit_bug_report(
     use axum::RequestExt;
     use axum::response::IntoResponse;
 
+    // #7468 — le navigateur du client qui envoie : déjà dans la requête.
+    let navigateur = req
+        .headers()
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(navigateur_lisible)
+        .filter(|s| !s.is_empty());
+
     let est_multipart = req
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -2963,12 +3242,19 @@ pub(super) async fn submit_bug_report(
         }
     } else {
         match req.extract::<Json<BugReportSubmitBody>, _>().await {
-            Ok(Json(b)) => (b.description, Vec::new()),
+            Ok(Json(b)) => (
+                tune_core::bug_report::description_avec_resume_ia(
+                    b.description,
+                    b.resume_ia.as_deref(),
+                    b.joindre_resume_ia,
+                ),
+                Vec::new(),
+            ),
             Err(rej) => return rej.into_response(),
         }
     };
 
-    let (code, corps) = envoyer_le_rapport(state, description, images).await;
+    let (code, corps) = envoyer_le_rapport(state, description, images, navigateur).await;
     let mut resp = (code, Json(&corps)).into_response();
     // #5068 — le délai du site, aussi sous sa forme standard.
     if let Some(secs) = corps.get("retry_after").and_then(Value::as_u64) {
@@ -2990,6 +3276,7 @@ async fn envoyer_le_rapport(
     state: AppState,
     description: String,
     images: Vec<CaptureJointe>,
+    navigateur: Option<String>,
 ) -> (axum::http::StatusCode, Value) {
     use axum::http::StatusCode;
 
@@ -3017,6 +3304,10 @@ async fn envoyer_le_rapport(
     }
 
     // Compose the thread body: the user's own words first, then diagnostics.
+    let report_md = match &navigateur {
+        Some(n) => format!("**Navigateur de l'interface** : {n}\n\n{report_md}"),
+        None => report_md,
+    };
     let full_markdown = if description.is_empty() {
         report_md
     } else {
@@ -3034,17 +3325,9 @@ async fn envoyer_le_rapport(
         .map(|l| format!("Bug: {}", l.chars().take(80).collect::<String>()))
         .unwrap_or_else(|| format!("Bug report — Tune {version} ({platform})"));
 
-    // The site caps the body at 50k chars — truncate the tail (oldest logs) if
-    // the report runs long rather than getting rejected wholesale.
-    let body_md = if full_markdown.chars().count() > BUG_REPORT_MAX_BODY_CHARS {
-        let kept: String = full_markdown
-            .chars()
-            .take(BUG_REPORT_MAX_BODY_CHARS)
-            .collect();
-        format!("{kept}\n\n_…report truncated…_")
-    } else {
-        full_markdown
-    };
+    // The site caps the body at 50k chars. On retire les lignes de journal les
+    // plus ANCIENNES (#7468) : le défaut est dans les dernières minutes.
+    let body_md = couper_le_rapport(&full_markdown, BUG_REPORT_MAX_BODY_CHARS);
 
     let instance_id = tune_core::db::settings_repo::SettingsRepo::with_backend(backend)
         .get("instance_id")
@@ -3256,7 +3539,8 @@ pub(super) async fn rearm_asio_warm_scan(
             Json(json!({
                 "status": "rearmed",
                 "retry": "next_restart",
-                "message": "Le balayage ASIO sera retenté une fois au prochain démarrage de Tune.",
+                "message": crate::message_api::texte("api.asio.rearmed", &[]),
+                "message_key": "api.asio.rearmed",
                 "asio_warm_scan": crate::startup::asio_warm_status(),
             })),
         ),
@@ -3265,7 +3549,8 @@ pub(super) async fn rearm_asio_warm_scan(
             Json(json!({
                 "status": "already_ready",
                 "retry": "next_restart",
-                "message": "Le balayage ASIO est déjà autorisé au prochain démarrage.",
+                "message": crate::message_api::texte("api.asio.alreadyReady", &[]),
+                "message_key": "api.asio.alreadyReady",
                 "asio_warm_scan": crate::startup::asio_warm_status(),
             })),
         ),
@@ -3273,7 +3558,8 @@ pub(super) async fn rearm_asio_warm_scan(
             StatusCode::CONFLICT,
             Json(json!({
                 "error": "asio_warm_scan_disabled_by_env",
-                "message": "Retirez TUNE_DISABLE_ASIO_SCAN puis redémarrez Tune ; le réarmement ne contourne pas ce coupe-circuit.",
+                "message": crate::message_api::texte("api.asio.disabledByEnv", &[]),
+                "message_key": "api.asio.disabledByEnv",
                 "asio_warm_scan": crate::startup::asio_warm_status(),
             })),
         ),
@@ -3281,7 +3567,8 @@ pub(super) async fn rearm_asio_warm_scan(
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({
                 "error": "asio_not_supported",
-                "message": "Le préchauffage ASIO ne concerne que Windows.",
+                "message": crate::message_api::texte("api.asio.windowsOnly", &[]),
+                "message_key": "api.asio.windowsOnly",
                 "asio_warm_scan": crate::startup::asio_warm_status(),
             })),
         ),
@@ -3427,12 +3714,11 @@ pub(super) async fn api_insights(State(state): State<AppState>) -> Json<Value> {
                 "severity": "warning",
                 "type": "zone_playback_beyond_duration",
                 "zone_id": zone_id,
-                "message": format!(
-                    "Zone {zone_id} : l'appareil annonce toujours la lecture alors que la \
-                     position a atteint la fin de la piste. Soit la lecture est bloquee, soit \
-                     la duree connue est fausse — voir lecture_annoncee_au_dela_de_la_duree \
-                     dans le journal."
+                "message": crate::message_api::texte(
+                    "api.diagnostics.playbackBeyondDuration",
+                    &[("zone_id", zone_id.to_string())],
                 ),
+                "message_key": "api.diagnostics.playbackBeyondDuration",
             }));
         }
     }
@@ -3670,6 +3956,62 @@ mod log_tail_tests {
     }
 
     #[test]
+    fn la_coupe_du_rapport_retire_les_lignes_les_plus_anciennes() {
+        let lignes: Vec<String> = (0..2000)
+            .map(|i| {
+                format!(
+                    "2026-10-29T12:{:02}:{:02} INFO ligne-{i:04}",
+                    i / 60 % 60,
+                    i % 60
+                )
+            })
+            .collect();
+        let rapport = format!(
+            "description\n\n---\n\n# Bug Report\n- Version: x\n\n## Recent Logs (3000 dernières lignes)\n```\n{}\n```\n",
+            lignes.join("\n")
+        );
+        let max = 10_000;
+        assert!(rapport.chars().count() > max);
+        let coupe = couper_le_rapport(&rapport, max);
+        assert!(coupe.chars().count() <= max, "{}", coupe.chars().count());
+        // l'en-tête reste, la fin du journal reste, le début part
+        assert!(coupe.contains("# Bug Report"));
+        assert!(
+            coupe.contains("ligne-1999"),
+            "la ligne la plus récente doit rester"
+        );
+        assert!(
+            !coupe.contains("ligne-0000"),
+            "la plus ancienne doit partir"
+        );
+        assert!(coupe.contains("lignes de journal les plus anciennes"));
+        assert!(coupe.contains("période conservée"));
+        assert!(!coupe.contains("report truncated"));
+        assert!(coupe.trim_end().ends_with("```"));
+    }
+
+    #[test]
+    fn la_coupe_du_rapport_ne_touche_pas_un_rapport_court() {
+        let r = "court\n## Recent Logs\n```\na\n```\n";
+        assert_eq!(couper_le_rapport(r, 49_000), r);
+    }
+
+    #[test]
+    fn la_coupe_sans_section_de_journal_garde_le_repli() {
+        let r = "x".repeat(300);
+        let c = couper_le_rapport(&r, 100);
+        assert!(c.starts_with(&"x".repeat(100)));
+        assert!(c.contains("report truncated"));
+    }
+
+    #[test]
+    fn le_navigateur_est_borne_et_sans_controle() {
+        let n = navigateur_lisible(&format!("Mozilla\n\t{}", "a".repeat(500)));
+        assert!(n.chars().count() <= 200);
+        assert!(!n.contains('\n'));
+    }
+
+    #[test]
     fn tail_window_drops_truncated_first_line_and_caps_lines() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.log");
@@ -3695,6 +4037,62 @@ mod log_tail_tests {
         std::fs::write(&path, "a\nb\n").unwrap();
         let lines = read_log_tail(path.to_str().unwrap(), 1000, 1024).unwrap();
         assert_eq!(lines, ["a", "b"]);
+    }
+    /// #6866 (Tune OS, fil 2400) — le journal sous `/home/tune`, que
+    /// `ProtectHome=yes` rend inaccessible : `EACCES`, pas `NotFound`. Un
+    /// fichier illisible ne dispense plus des replis (journalctl, syslog).
+    ///
+    /// Contre-épreuve : faire rendre `None` à `suite_d_un_fichier_non_lu`
+    /// pour `Unreadable` (l'erreur perdue) fait tomber ce test. Le `return`
+    /// anticipé de l'ancien code ne peut plus s'écrire : la branche ne reçoit
+    /// que `Err(Option<String>)` et tombe dans les replis.
+    #[cfg(unix)]
+    #[test]
+    fn un_fichier_illisible_laisse_place_aux_replis() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home-tune");
+        std::fs::create_dir(&home).unwrap();
+        let path = home.join("tune-server.log");
+        std::fs::write(&path, "ligne\n").unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let lu = read_log_tail(path.to_str().unwrap(), 10, 1024);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let Err(e) = lu else {
+            // Compte root : les droits ne s'appliquent pas, la prémisse manque.
+            eprintln!("prémisse absente (droits ignorés) : test sans objet");
+            return;
+        };
+        assert!(
+            matches!(e, LogTailError::Unreadable(_)),
+            "prémisse : EACCES se lit comme illisible, pas comme absent ({e:?})"
+        );
+        assert!(
+            suite_d_un_fichier_non_lu(e).is_some(),
+            "l'erreur est gardée pour la réponse finale"
+        );
+        assert_eq!(suite_d_un_fichier_non_lu(LogTailError::Missing), None);
+    }
+
+    /// Ce que rend l'export quand AUCUN repli n'a rien donné après un fichier
+    /// illisible : la cause, sans « exists », et la commande qui marche.
+    #[test]
+    fn la_reponse_finale_dit_le_fichier_inaccessible_et_la_commande() {
+        let Json(v) = reponse_sans_journal(
+            "/home/tune/.local/state/tune/tune-server.log",
+            Some("Permission denied (os error 13)"),
+            "Chemins et sources essayés : …",
+        );
+        assert_eq!(v["source"], "file_unreadable");
+        assert_eq!(v["lines"], 0);
+        assert_eq!(v["path"], "/home/tune/.local/state/tune/tune-server.log");
+        let logs = v["logs"].as_str().unwrap();
+        assert!(logs.contains("Permission denied"), "{logs}");
+        assert!(logs.contains("journalctl -u tune"), "{logs}");
+        assert!(!logs.contains("exists"), "{logs}");
+
+        let Json(v) = reponse_sans_journal("/x.log", None, "t");
+        assert_eq!(v["source"], "none");
     }
 }
 
@@ -4949,5 +5347,80 @@ mod tests_refus_du_rapport_5590 {
             "{ligne}"
         );
         assert!(!ligne.contains("retry_after"), "{ligne}");
+    }
+}
+
+#[cfg(test)]
+mod zones_masquees_au_rapport_6378 {
+    use super::lignes_zones_masquees;
+    use tune_core::db::zone_repo::ZoneMasquee;
+
+    fn masquee(id: i64, nom: &str, motif: Option<&str>, le: Option<&str>) -> ZoneMasquee {
+        ZoneMasquee {
+            id,
+            name: nom.into(),
+            device_id: format!("uuid:{id}"),
+            protocole: "dlna".into(),
+            host: "10.0.0.3".into(),
+            mac: None,
+            motif: motif.map(Into::into),
+            masquee_le: le.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn chaque_zone_masquee_porte_son_appareil_son_motif_et_sa_date() {
+        let md = lignes_zones_masquees(&Ok(vec![
+            masquee(1, "Diretta Renderer", None, None),
+            masquee(
+                4,
+                "Garage",
+                Some("suppression_utilisateur"),
+                Some("2026-10-12 10:00:00"),
+            ),
+        ]));
+        assert!(md.starts_with("- Zones masquées : 2\n"), "{md}");
+        assert!(
+            md.contains(
+                "zone 1 « Diretta Renderer » (dlna) — appareil uuid:1 — motif : inconnu (masquage d'avant la migration 112) — masquée le date inconnue"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains("zone 4 « Garage » (dlna) — appareil uuid:4 — motif : suppression_utilisateur — masquée le 2026-10-12 10:00:00"),
+            "{md}"
+        );
+        assert!(!md.contains("10.0.0.3"), "l'hôte n'est pas recopié : {md}");
+    }
+
+    #[test]
+    fn aucune_zone_masquee_se_dit_et_une_lecture_ratee_aussi() {
+        assert_eq!(lignes_zones_masquees(&Ok(vec![])), "- Zones masquées : 0\n");
+        assert_eq!(
+            lignes_zones_masquees(&Err("no such column".into())),
+            "- Zones masquées : illisibles (no such column)\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_bridage_leve_6713 {
+    use super::repartir_le_bridage;
+
+    /// #6713 — par défaut, le motif reste dans `analyses_bridees` (#6450) ;
+    /// bridage levé, il passe dans `analyses_bridage_leve`, jamais aux deux.
+    #[test]
+    fn le_motif_va_a_un_seul_champ_selon_le_reglage() {
+        assert_eq!(
+            repartir_le_bridage(Some("temperature_illisible"), false),
+            (Some("temperature_illisible"), None)
+        );
+        assert_eq!(
+            repartir_le_bridage(Some("temperature_figee"), true),
+            (None, Some("temperature_figee"))
+        );
+        // Température lisible : rien à dire, réglage ou non.
+        assert_eq!(repartir_le_bridage(None, true), (None, None));
+        assert_eq!(repartir_le_bridage(None, false), (None, None));
     }
 }

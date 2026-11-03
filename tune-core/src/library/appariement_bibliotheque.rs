@@ -154,6 +154,7 @@ mod tests {
             cue_start_ms: None,
             cue_end_ms: None,
             rating: None,
+            bitrate_kbps: None,
         }
     }
 

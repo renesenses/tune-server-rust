@@ -116,14 +116,17 @@ impl Banc {
         let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
         outputs.lock().await.register(Box::new(faux.sortie()));
         let playback = Arc::new(PlaybackManager::new());
-        let orchestrator = Arc::new(PlaybackOrchestrator::new(
+        let bus = Arc::new(EventBus::new());
+        let mut orchestrator = PlaybackOrchestrator::new(
             db.clone(),
             playback.clone(),
             Arc::new(AudioStreamer::new(0)),
             Arc::new(Mutex::new(ServiceRegistry::new())),
             outputs.clone(),
             None,
-        ));
+        );
+        orchestrator.event_bus = Some(bus.clone());
+        let orchestrator = Arc::new(orchestrator);
         let poller = PositionPoller::new(
             orchestrator,
             playback.clone(),
@@ -131,7 +134,7 @@ impl Banc {
             db.clone(),
             Arc::new(Mutex::new(HashMap::new())),
         )
-        .with_event_bus(Arc::new(EventBus::new()));
+        .with_event_bus(bus);
 
         playback
             .play(
@@ -303,4 +306,110 @@ async fn lire_ensuite_dans_la_fenetre_remplace_la_suivante_chez_hqplayer() {
     banc.tic().await;
     assert_eq!(banc.ecran().await, (1, INSEREE.to_string()));
     assert!(banc.relances().is_empty(), "{:?}", banc.relances());
+}
+
+#[path = "hqplayer_preparation_7247.rs"]
+mod preparation_7247;
+#[tokio::test]
+async fn hqplayer_fige_ne_recoit_aucune_relance_et_affiche_son_refus_7244() {
+    let mut banc = Banc::monter().await;
+    let mut recu = banc.poller.event_bus.as_ref().unwrap().subscribe();
+    banc.a(0);
+    banc.poller
+        .zones_a_position_prouvee
+        .lock()
+        .unwrap()
+        .insert(banc.zone_id);
+    banc.poll_states
+        .get_mut(&banc.zone_id)
+        .unwrap()
+        .fige_a_zero_depuis = Some(Instant::now() - Duration::from_secs(9));
+    banc.tic().await;
+    assert!(
+        !banc
+            .faux
+            .recu()
+            .iter()
+            .any(|c| c.starts_with("<Play ") || c.starts_with("<Play/")),
+        "#7244 : le sondeur ne doit pas relancer un moteur HQPlayer muet : {:?}",
+        banc.faux.recu()
+    );
+    assert_eq!(
+        banc.playback.get_state(banc.zone_id).await.state,
+        PlayState::Stopped
+    );
+    let erreur = std::iter::from_fn(|| recu.try_recv().ok())
+        .find(|e| e.event_type == "zone.playback_error")
+        .expect("#7244 : refus visible");
+    assert_eq!(erreur.data["code"], "hqplayer_output_start_failed");
+    assert_eq!(erreur.data["fatal"], true);
+    assert_eq!(
+        erreur.data["error"],
+        crate::outputs::hqplayer::MESSAGE_ECHEC_DE_SORTIE
+    );
+    assert_eq!(
+        banc.playback.get_state(banc.zone_id).await.queue_position,
+        0
+    );
+    banc.tic().await;
+    assert!(
+        !banc
+            .faux
+            .recu()
+            .iter()
+            .any(|c| c.starts_with("<Play ") || c.starts_with("<Play/"))
+    );
+}
+
+#[tokio::test]
+async fn hqplayer_play_acquitte_sans_demarrage_arrete_la_zone_et_dit_pourquoi_7244() {
+    let banc = Banc::monter().await;
+    banc.playback.stop(banc.zone_id).await;
+    banc.faux.regler(|e| {
+        e.etat = 0;
+        e.refuse_la_sortie = true;
+    });
+    let mut recu = banc.poller.event_bus.as_ref().unwrap().subscribe();
+    let resultat = banc
+        .poller
+        .orchestrator
+        .play_from_queue(banc.zone_id, 0)
+        .await
+        .unwrap();
+    assert!(
+        !resultat.output_sent,
+        "#7244 : un Play acquitté ne prouve pas le démarrage du moteur"
+    );
+    assert_eq!(
+        resultat.error.as_deref(),
+        Some(crate::outputs::hqplayer::MESSAGE_ECHEC_DE_SORTIE),
+        "#7244 : le refus doit montrer la phrase HQPlayer sans identifiant interne"
+    );
+    assert_eq!(
+        banc.playback.get_state(banc.zone_id).await.state,
+        PlayState::Stopped
+    );
+    let erreur = std::iter::from_fn(|| recu.try_recv().ok())
+        .find(|e| e.event_type == "zone.playback_error")
+        .expect("#7244 : refus visible par le vrai orchestrateur");
+    assert_eq!(erreur.data["code"], "hqplayer_output_start_failed");
+    assert_eq!(erreur.data["fatal"], true);
+    assert_eq!(
+        erreur.data["error"],
+        crate::outputs::hqplayer::MESSAGE_ECHEC_DE_SORTIE
+    );
+    assert!(
+        !erreur.data["error"]
+            .as_str()
+            .unwrap()
+            .contains("hqplayer_output_start_failed")
+    );
+    assert_eq!(
+        banc.faux
+            .recu()
+            .iter()
+            .filter(|c| c.starts_with("<Play ") || c.starts_with("<Play/"))
+            .count(),
+        1
+    );
 }

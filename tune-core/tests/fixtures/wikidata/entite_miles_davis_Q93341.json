@@ -1,0 +1,454 @@
+{
+ "entities": {
+  "Q93341": {
+   "type": "item",
+   "id": "Q93341",
+   "labels": {
+    "en": {
+     "language": "en",
+     "value": "Miles Davis"
+    },
+    "fr": {
+     "language": "fr",
+     "value": "Miles Davis"
+    }
+   },
+   "claims": {
+    "P1303": [
+     {
+      "mainsnak": {
+       "snaktype": "value",
+       "property": "P1303",
+       "hash": "d24c81cd8406787826ffcf90605fa06f9b2dae72",
+       "datavalue": {
+        "value": {
+         "entity-type": "item",
+         "numeric-id": 8338,
+         "id": "Q8338"
+        },
+        "type": "wikibase-entityid"
+       },
+       "datatype": "wikibase-item"
+      },
+      "type": "statement",
+      "id": "Q93341$0D2F1B5F-AE24-4434-923E-576F8CF46EF7",
+      "rank": "normal",
+      "references": [
+       {
+        "hash": "c202436ee4a9acda76e2c7ffa5da08467c4484e7",
+        "snaks": {
+         "P854": [
+          {
+           "snaktype": "value",
+           "property": "P854",
+           "hash": "925e75a5414b723d84b1c5d915b2be16b658037f",
+           "datavalue": {
+            "value": "https://www.milesdavis.com/biography/",
+            "type": "string"
+           },
+           "datatype": "url"
+          }
+         ],
+         "P813": [
+          {
+           "snaktype": "value",
+           "property": "P813",
+           "hash": "6f330ee26e2cd535ff3bb4a64a7381e0ca5de56a",
+           "datavalue": {
+            "value": {
+             "time": "+2020-01-06T00:00:00Z",
+             "timezone": 0,
+             "before": 0,
+             "after": 0,
+             "precision": 11,
+             "calendarmodel": "http://www.wikidata.org/entity/Q1985727"
+            },
+            "type": "time"
+           },
+           "datatype": "time"
+          }
+         ],
+         "P1065": [
+          {
+           "snaktype": "value",
+           "property": "P1065",
+           "hash": "e0991f098bce0baf688f932be023ffb39c65061b",
+           "datavalue": {
+            "value": "https://web.archive.org/web/20200106160433/https://www.milesdavis.com/biography/",
+            "type": "string"
+           },
+           "datatype": "url"
+          }
+         ],
+         "P2960": [
+          {
+           "snaktype": "value",
+           "property": "P2960",
+           "hash": "cc4df158ea22dcb7b54c20acbba783b1f1c1d7cf",
+           "datavalue": {
+            "value": {
+             "time": "+2020-01-06T00:00:00Z",
+             "timezone": 0,
+             "before": 0,
+             "after": 0,
+             "precision": 11,
+             "calendarmodel": "http://www.wikidata.org/entity/Q1985727"
+            },
+            "type": "time"
+           },
+           "datatype": "time"
+          }
+         ]
+        },
+        "snaks-order": [
+         "P854",
+         "P813",
+         "P1065",
+         "P2960"
+        ]
+       },
+       {
+        "hash": "8114447badf309a8658bb919e232628b5ab870bd",
+        "snaks": {
+         "P248": [
+          {
+           "snaktype": "value",
+           "property": "P248",
+           "hash": "924369042898feb358e4215e7b29320894193ed0",
+           "datavalue": {
+            "value": {
+             "entity-type": "item",
+             "numeric-id": 99181182,
+             "id": "Q99181182"
+            },
+            "type": "wikibase-entityid"
+           },
+           "datatype": "wikibase-item"
+          }
+         ],
+         "P813": [
+          {
+           "snaktype": "value",
+           "property": "P813",
+           "hash": "5d20b450b1aa6c2cd42bb1d1b137f4d841b595e1",
+           "datavalue": {
+            "value": {
+             "time": "+2020-09-24T00:00:00Z",
+             "timezone": 0,
+             "before": 0,
+             "after": 0,
+             "precision": 11,
+             "calendarmodel": "http://www.wikidata.org/entity/Q1985727"
+            },
+            "type": "time"
+           },
+           "datatype": "time"
+          }
+         ],
+         "P8300": [
+          {
+           "snaktype": "value",
+           "property": "P8300",
+           "hash": "10b2f9780e4405954c10ed63bb42c8d60086c10e",
+           "datavalue": {
+            "value": "347",
+            "type": "string"
+           },
+           "datatype": "external-id"
+          }
+         ]
+        },
+        "snaks-order": [
+         "P248",
+         "P813",
+         "P8300"
+        ]
+       }
+      ]
+     },
+     {
+      "mainsnak": {
+       "snaktype": "value",
+       "property": "P1303",
+       "hash": "95d7fb0fe3eb3000dd3668d1e70d62ced61cc3a3",
+       "datavalue": {
+        "value": {
+         "entity-type": "item",
+         "numeric-id": 163829,
+         "id": "Q163829"
+        },
+        "type": "wikibase-entityid"
+       },
+       "datatype": "wikibase-item"
+      },
+      "type": "statement",
+      "id": "Q93341$C7D6A08E-52F1-406B-9639-42841F1C22A9",
+      "rank": "normal",
+      "references": [
+       {
+        "hash": "0ecc9add602b64a70b40d5cf335563ba041122b8",
+        "snaks": {
+         "P248": [
+          {
+           "snaktype": "value",
+           "property": "P248",
+           "hash": "924369042898feb358e4215e7b29320894193ed0",
+           "datavalue": {
+            "value": {
+             "entity-type": "item",
+             "numeric-id": 99181182,
+             "id": "Q99181182"
+            },
+            "type": "wikibase-entityid"
+           },
+           "datatype": "wikibase-item"
+          }
+         ],
+         "P813": [
+          {
+           "snaktype": "value",
+           "property": "P813",
+           "hash": "5d20b450b1aa6c2cd42bb1d1b137f4d841b595e1",
+           "datavalue": {
+            "value": {
+             "time": "+2020-09-24T00:00:00Z",
+             "timezone": 0,
+             "before": 0,
+             "after": 0,
+             "precision": 11,
+             "calendarmodel": "http://www.wikidata.org/entity/Q1985727"
+            },
+            "type": "time"
+           },
+           "datatype": "time"
+          }
+         ],
+         "P8300": [
+          {
+           "snaktype": "value",
+           "property": "P8300",
+           "hash": "ec6b4c11cf0d830b42484ae306e5c294e6296ad0",
+           "datavalue": {
+            "value": "917",
+            "type": "string"
+           },
+           "datatype": "external-id"
+          }
+         ]
+        },
+        "snaks-order": [
+         "P248",
+         "P813",
+         "P8300"
+        ]
+       }
+      ]
+     },
+     {
+      "mainsnak": {
+       "snaktype": "value",
+       "property": "P1303",
+       "hash": "d8cdb4d09ed2423c296b404830d772fea4ef4409",
+       "datavalue": {
+        "value": {
+         "entity-type": "item",
+         "numeric-id": 1444,
+         "id": "Q1444"
+        },
+        "type": "wikibase-entityid"
+       },
+       "datatype": "wikibase-item"
+      },
+      "type": "statement",
+      "id": "Q93341$1DBC462E-1F64-4A72-8DD1-BC425A215F46",
+      "rank": "normal",
+      "references": [
+       {
+        "hash": "8114447badf309a8658bb919e232628b5ab870bd",
+        "snaks": {
+         "P248": [
+          {
+           "snaktype": "value",
+           "property": "P248",
+           "hash": "924369042898feb358e4215e7b29320894193ed0",
+           "datavalue": {
+            "value": {
+             "entity-type": "item",
+             "numeric-id": 99181182,
+             "id": "Q99181182"
+            },
+            "type": "wikibase-entityid"
+           },
+           "datatype": "wikibase-item"
+          }
+         ],
+         "P813": [
+          {
+           "snaktype": "value",
+           "property": "P813",
+           "hash": "5d20b450b1aa6c2cd42bb1d1b137f4d841b595e1",
+           "datavalue": {
+            "value": {
+             "time": "+2020-09-24T00:00:00Z",
+             "timezone": 0,
+             "before": 0,
+             "after": 0,
+             "precision": 11,
+             "calendarmodel": "http://www.wikidata.org/entity/Q1985727"
+            },
+            "type": "time"
+           },
+           "datatype": "time"
+          }
+         ],
+         "P8300": [
+          {
+           "snaktype": "value",
+           "property": "P8300",
+           "hash": "10b2f9780e4405954c10ed63bb42c8d60086c10e",
+           "datavalue": {
+            "value": "347",
+            "type": "string"
+           },
+           "datatype": "external-id"
+          }
+         ]
+        },
+        "snaks-order": [
+         "P248",
+         "P813",
+         "P8300"
+        ]
+       }
+      ]
+     },
+     {
+      "mainsnak": {
+       "snaktype": "value",
+       "property": "P1303",
+       "hash": "15a50429d572e7ce410815e2488584c03796d13e",
+       "datavalue": {
+        "value": {
+         "entity-type": "item",
+         "numeric-id": 382616,
+         "id": "Q382616"
+        },
+        "type": "wikibase-entityid"
+       },
+       "datatype": "wikibase-item"
+      },
+      "type": "statement",
+      "id": "Q93341$f05856b4-4e79-761a-9635-3a95d65549ec",
+      "rank": "normal",
+      "references": [
+       {
+        "hash": "d4bd87b862b12d99d26e86472d44f26858dee639",
+        "snaks": {
+         "P143": [
+          {
+           "snaktype": "value",
+           "property": "P143",
+           "hash": "f30cbd35620c4ea6d0633aaf0210a8916130469b",
+           "datavalue": {
+            "value": {
+             "entity-type": "item",
+             "numeric-id": 8447,
+             "id": "Q8447"
+            },
+            "type": "wikibase-entityid"
+           },
+           "datatype": "wikibase-item"
+          }
+         ]
+        },
+        "snaks-order": [
+         "P143"
+        ]
+       }
+      ]
+     }
+    ],
+    "P434": [
+     {
+      "mainsnak": {
+       "snaktype": "value",
+       "property": "P434",
+       "hash": "44e83cdb566a8c6104f4dc7acfcbaa63e9f912cf",
+       "datavalue": {
+        "value": "561d854a-6a28-4aa7-8c99-323e6ce46c2a",
+        "type": "string"
+       },
+       "datatype": "external-id"
+      },
+      "type": "statement",
+      "qualifiers": {
+       "P1810": [
+        {
+         "snaktype": "value",
+         "property": "P1810",
+         "hash": "87a424df02a3676d5f22ce90d124af073b973f22",
+         "datavalue": {
+          "value": "Miles Davis (jazz trumpeter, bandleader, songwriter)",
+          "type": "string"
+         },
+         "datatype": "string"
+        }
+       ]
+      },
+      "qualifiers-order": [
+       "P1810"
+      ],
+      "id": "q93341$61513B65-A1DB-4412-BDF3-32A30DCE6713",
+      "rank": "normal",
+      "references": [
+       {
+        "hash": "e919e0e9153491d1a44aa34d63407f7f6dbeabda",
+        "snaks": {
+         "P248": [
+          {
+           "snaktype": "value",
+           "property": "P248",
+           "hash": "623cc8f0e2f65afe4d66b91962d354a2f3aa9a27",
+           "datavalue": {
+            "value": {
+             "entity-type": "item",
+             "numeric-id": 14005,
+             "id": "Q14005"
+            },
+            "type": "wikibase-entityid"
+           },
+           "datatype": "wikibase-item"
+          }
+         ],
+         "P813": [
+          {
+           "snaktype": "value",
+           "property": "P813",
+           "hash": "1c8bf3bcfcd5d213354d1b94046d0c74e616c7d1",
+           "datavalue": {
+            "value": {
+             "time": "+2022-04-12T00:00:00Z",
+             "timezone": 0,
+             "before": 0,
+             "after": 0,
+             "precision": 11,
+             "calendarmodel": "http://www.wikidata.org/entity/Q1985727"
+            },
+            "type": "time"
+           },
+           "datatype": "time"
+          }
+         ]
+        },
+        "snaks-order": [
+         "P248",
+         "P813"
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  }
+ }
+}

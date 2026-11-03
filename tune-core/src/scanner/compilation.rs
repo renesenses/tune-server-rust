@@ -154,20 +154,6 @@ pub fn track_number_is_free(track_number: Option<i32>, taken: &[i32]) -> bool {
     }
 }
 
-/// Noms de fichier sous lesquels une pochette accompagne un dossier d'album.
-/// Ordre = priorité ; le premier trouvé gagne.
-const COVER_FILE_NAMES: &[&str] = &[
-    "cover.jpg",
-    "cover.jpeg",
-    "cover.png",
-    "folder.jpg",
-    "folder.jpeg",
-    "folder.png",
-    "front.jpg",
-    "front.jpeg",
-    "front.png",
-];
-
 /// Écart maximal, en bits, entre deux empreintes réputées porter la MÊME
 /// pochette.
 ///
@@ -230,8 +216,7 @@ impl CoverFingerprint {
 /// Une image qu'on n'arrive pas à décoder ne donne pas d'empreinte : sans
 /// signal, l'appelant ne regroupe ni ne sépare, ce qui est le côté prudent.
 pub fn folder_cover_fingerprint(folder: &str) -> Option<CoverFingerprint> {
-    for name in COVER_FILE_NAMES {
-        let path = Path::new(folder).join(name);
+    for path in crate::library::artwork::images_de_pochette_dans(Path::new(folder)) {
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };

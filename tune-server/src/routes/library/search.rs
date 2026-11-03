@@ -316,15 +316,36 @@ pub(super) async fn acoustic_search(
     }
     let limit = body.limit.unwrap_or(50).clamp(1, 200) as usize;
 
+    // #3836 — une requête qui est un nom de genre, dans une langue de la
+    // table versionnée des genres équivalents, se croise avec les ÉTIQUETTES
+    // de genre : « Rock progressif » fait passer devant les pistes balisées
+    // « Progressive Rock », « Rock progressif » ou « Prog Rock ». Rien n'est
+    // réécrit, ni en base ni dans les fichiers.
+    let groupe = tune_core::library::genres_equivalents::groupe_de(query);
+
     // La tour texte du CLAP est entraînée en anglais : une requête libre en
     // français recale mal. Si l'utilisateur a configuré une clé API IA
     // (anthropic/openai/gemini), on traduit sa requête (cache local, une
     // seule traduction par requête) ; sans clé ou en cas d'échec, requête
     // brute — comportement historique, les presets anglais ne changent pas.
+    //
+    // Étape 2 du chantier « Assistant IA » : avec le greffon, la traduction
+    // passe par le fournisseur de l'assistant — sa clé scellée (l'ancienne
+    // clé en clair y est migrée), son plafond, son comptage.
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let effective_query = tune_core::ai::translate::translate_query(&settings, query)
+    #[cfg(feature = "assistant-ia")]
+    let effective_query = {
+        let passerelle = crate::plugins::passerelle_assistant(&state.backend);
+        tune_core::ai::translate::translate_query_avec(&settings, query, |q| async move {
+            passerelle
+                .traduire(tune_core::ai::translate::PROMPT, &q)
+                .await
+        })
         .await
-        .unwrap_or_else(|| query.to_string());
+    };
+    #[cfg(not(feature = "assistant-ia"))]
+    let effective_query = tune_core::ai::translate::translate_query(&settings, query).await;
+    let effective_query = effective_query.unwrap_or_else(|| query.to_string());
     if effective_query != query {
         tracing::info!(query = %query, translated = %effective_query, "acoustic_query_translated");
     }
@@ -342,8 +363,19 @@ pub(super) async fn acoustic_search(
     // Sur-échantillonne (2× limit) : le dédoublonnage ci-dessous retire des
     // entrées, et il doit s'appliquer AVANT la troncature à `limit` pour ne pas
     // renvoyer moins de résultats que demandé.
-    let ranked = embedding_store::rank_by_vector(&state.backend, &qvec, limit * 2, None);
-    if ranked.is_empty() {
+    let etiquetees: Vec<i64> = groupe
+        .map(|g| tune_core::library::genres_equivalents::pistes_du_groupe(&state.backend, g))
+        .unwrap_or_default();
+    // Croiser exige le cosinus des pistes étiquetées où qu'elles soient dans
+    // le classement : on le garde alors en entier (il est déjà calculé en
+    // entier par `rank_by_vector`, seule la troncature change).
+    let profondeur = if etiquetees.is_empty() {
+        limit * 2
+    } else {
+        usize::MAX
+    };
+    let ranked = embedding_store::rank_by_vector(&state.backend, &qvec, profondeur, None);
+    if ranked.is_empty() && etiquetees.is_empty() {
         // Une liste vide couvrait deux situations opposées : bibliothèque pas
         // encore analysée, ou requête sans correspondance. L'utilisateur ne
         // pouvait pas savoir s'il devait reformuler ou attendre (retour Fabien).
@@ -367,8 +399,21 @@ pub(super) async fn acoustic_search(
         })));
     }
 
-    let scores: HashMap<i64, f32> = ranked.iter().copied().collect();
-    let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
+    let classees: Vec<_> =
+        tune_core::library::genres_equivalents::croiser(&ranked, &etiquetees, limit)
+            .into_iter()
+            .take(limit * 2)
+            .collect();
+    let scores: HashMap<i64, f32> = classees
+        .iter()
+        .filter_map(|p| p.similarite.map(|s| (p.id, s)))
+        .collect();
+    let du_genre: std::collections::HashSet<i64> = classees
+        .iter()
+        .filter(|p| p.du_genre)
+        .map(|p| p.id)
+        .collect();
+    let ids: Vec<i64> = classees.iter().map(|p| p.id).collect();
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .get_multiple(&ids)
         .unwrap_or_default();
@@ -392,19 +437,33 @@ pub(super) async fn acoustic_search(
         let Some(id) = v.get("id").and_then(Value::as_i64) else {
             continue;
         };
-        let Some(s) = scores.get(&id) else {
+        let Some(obj) = v.as_object_mut() else {
             continue;
         };
-        if let Some(obj) = v.as_object_mut() {
+        if let Some(s) = scores.get(&id) {
             obj.insert("similarity".into(), json!(s));
+        }
+        if groupe.is_some() {
+            obj.insert("genre_match".into(), json!(du_genre.contains(&id)));
         }
     }
 
-    Ok(Json(json!({
+    let mut corps = json!({
         "query": query,
         "count": items.len(),
         "tracks": items,
-    })))
+    });
+    if let Some(g) = groupe {
+        // Ce que l'écran affiche : le genre reconnu sous son nom canonique,
+        // ses graphies regroupées, et combien de pistes en portent l'étiquette.
+        corps["genre"] = json!({
+            "canonical": g.canonique,
+            "spellings": g.graphies(),
+            "tagged_tracks": etiquetees.len(),
+            "table_version": tune_core::library::genres_equivalents::version(),
+        });
+    }
+    Ok(Json(corps))
 }
 
 /// Stub for builds without the `audio-embedding` feature: the text tower isn't
@@ -612,6 +671,10 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     // route. Sans cette ligne, l'ecran Ambiance ne peut ni conseiller l'anglais
     // ni renvoyer aux reglages — c'est le silence que JeromeQ a rencontre
     // (fil 1751). Le serveur SAIT ; il le dit ici.
+    #[cfg(feature = "assistant-ia")]
+    let translation_available =
+        crate::plugins::passerelle_assistant(&state.backend).traduction_disponible();
+    #[cfg(not(feature = "assistant-ia"))]
     let translation_available = tune_core::ai::translate::cle_disponible(
         &tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone()),
     );

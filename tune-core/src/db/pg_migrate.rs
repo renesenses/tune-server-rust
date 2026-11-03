@@ -224,6 +224,11 @@ const MIGRATION_TABLES: &[&str] = &[
 /// donc pas encore au moment de la premiere passe (#5389). Les colonnes sont
 /// alors deja typees (BIGINT, BYTEA…) : `column_casts` lit ces types.
 const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
+    // Reprises (#7280), créées par le script 100 : conserver leur file et position.
+    "listening_resumes",
+    // Temps d'écoute radio par station (#6682, script 096) : sans cette
+    // ligne, « Mon écoute » repartirait de zéro à la bascule.
+    "radio_ecoutes",
     // Exemplaires d'une meme piste et repertoire prefere par album (#5034,
     // script PG 073) : le choix de l'utilisateur etait perdu a la bascule.
     "track_copies",
@@ -244,6 +249,10 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
 /// des deux listes — c'est ainsi que `file_first_seen` s'etait perdue (#5389).
 #[cfg_attr(not(test), allow(dead_code))]
 const TABLES_NON_COPIEES: &[(&str, &str)] = &[
+    (
+        "hires_verifications",
+        "verdicts des faux hi-res (#6285) : mesures recalculables, la passe de fond les refait",
+    ),
     (
         "_migrations",
         "tenue des versions du schema SQLite ; PostgreSQL a sa propre `schema_version`",
@@ -267,6 +276,22 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
         "musicbrainz_release_cache",
         "reponses MusicBrainz gardees (#4805) : un cache de 90 jours, que la passe \
          des credits reconstitue",
+    ),
+    (
+        "album_completude",
+        "constat de completude (#4805, lot MetaRust) : recalcule depuis la release gardee",
+    ),
+    (
+        "artiste_instruments",
+        "instruments Wikidata des artistes (#4805) : un cache que la passe des credits reconstitue",
+    ),
+    (
+        "propositions_discogs",
+        "propositions Discogs a valider (#4805) : se redemandent ; aucune n'a ete appliquee sans decision",
+    ),
+    (
+        "bpm_estimes",
+        "BPM estimes (Wikidata ou signal, #4805) : se remesurent ; les balises BPM restent dans `tracks`",
     ),
 ];
 
@@ -403,7 +428,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     cue_end_ms BIGINT,
     -- Note de la piste (#6123). TEXT ici comme les autres colonnes numeriques :
     -- la copie lie tout en texte ; la migration 088 la convertit en BIGINT.
-    rating TEXT
+    rating TEXT,
+    -- Debit moyen du fichier (#6332). TEXT pour la copie, comme `rating` ;
+    -- la migration 094 le convertit en BIGINT.
+    bitrate_kbps TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -786,6 +814,14 @@ CREATE TABLE IF NOT EXISTS item_tags (
 -- CREATE IF NOT EXISTS ci-dessus ne la corrige pas. Même raison que
 -- `streaming_favorites.first_seen_at` plus haut.
 ALTER TABLE item_tags ADD COLUMN IF NOT EXISTS created_at TEXT;
+-- Ordre des etiquettes choisi par l'utilisateur (#6257, PG 091 / SQLite 127).
+-- TEXT pour la copie ; la 091, rejouee juste apres, la convertit en BIGINT et
+-- garde l'ordre copie. En ALTER pour la meme raison qu'au-dessus.
+ALTER TABLE tags ADD COLUMN IF NOT EXISTS position TEXT;
+-- Fratrie de rayons rangée à la main (#6779, PG 098 / SQLite 134). TEXT pour
+-- la copie ; la 098, rejouée juste après, la convertit en BIGINT et garde
+-- l'ordre copié. En ALTER pour la même raison qu'au-dessus.
+ALTER TABLE collection_folders ADD COLUMN IF NOT EXISTS manual_order TEXT;
 -- Marque « déjà tenté, rien trouvé » de l'identification en lot (#4991,
 -- PG 080 / SQLite 116). En ALTER pour la même raison qu'au-dessus.
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS identification_tentee_le TEXT;
@@ -797,6 +833,11 @@ ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT;
 ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_etat TEXT;
 ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_erreur TEXT;
 ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS isrc TEXT;
+-- Année et qualité d'un album favori de service (#6482). Sans numéro de
+-- migration, comme côté SQLite (`favoris_annee_et_qualite_colonnes`).
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS year TEXT;
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS sample_rate TEXT;
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS bit_depth TEXT;
 -- Référence d'album d'une piste de service (fil 2121, PG 078 / SQLite 114) :
 -- l'adresse de la page Bandcamp qui permet de resigner une URL de flux
 -- expirée. En ALTER pour la même raison que juste au-dessus : les trois tables
@@ -807,6 +848,12 @@ ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_ref TEXT;
 -- L'artiste d'une piste de service chez son service (#6079, PG 087 / SQLite
 -- 122). En ALTER pour la même raison que juste au-dessus.
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT;
+-- Le conteneur de chaque élément de file (#6466, PG 092 / SQLite 128).
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_type TEXT;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_id TEXT;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_source TEXT;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_title TEXT;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_cover TEXT;
 
 -- Etiquettes posees sur un objet de STREAMING (#3699). Une base creee par la
 -- bascule SQLite -> PostgreSQL enregistre `schema_version = 99` et ne rejoue
@@ -1094,6 +1141,40 @@ CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (
     corps BYTEA NOT NULL,
     fetched_at TEXT NOT NULL
 );
+-- Enrichissement MetaRust, lot 1 (#4805). Mêmes types qu'`ENSURE_TABLES` ;
+-- non copiées à la bascule (voir TABLES_NON_COPIEES).
+CREATE TABLE IF NOT EXISTS album_completude (
+    album_id BIGINT PRIMARY KEY,
+    release_mbid TEXT NOT NULL,
+    attendues INTEGER NOT NULL,
+    presentes INTEGER NOT NULL,
+    manquantes INTEGER NOT NULL,
+    doublons INTEGER NOT NULL,
+    detail TEXT NOT NULL,
+    calcule_le TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS artiste_instruments (
+    artist_mbid TEXT PRIMARY KEY,
+    qid TEXT,
+    instruments TEXT NOT NULL,
+    lu_le TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS propositions_discogs (
+    album_id BIGINT NOT NULL,
+    discogs_release_id BIGINT NOT NULL,
+    methode TEXT NOT NULL,
+    proposition TEXT NOT NULL,
+    statut TEXT NOT NULL,
+    cree_le TEXT NOT NULL,
+    decide_le TEXT,
+    PRIMARY KEY (album_id, discogs_release_id)
+);
+CREATE TABLE IF NOT EXISTS bpm_estimes (
+    file_path TEXT PRIMARY KEY,
+    bpm DOUBLE PRECISION NOT NULL,
+    source TEXT NOT NULL,
+    mesure_le TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS upnp_library_sources (
     source_key TEXT PRIMARY KEY,
     udn TEXT NOT NULL,
@@ -1259,6 +1340,17 @@ CREATE INDEX IF NOT EXISTS idx_tracks_audio_pcm_key ON tracks(audio_pcm_key);
 -- tracks: note de la piste lue dans ses balises (SQLite migration v124 / PG
 -- 088, #6123). TEXT pour la copie ; la 088, rejouee juste apres, la convertit.
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating TEXT;
+-- tracks: debit moyen du fichier en kbit/s (SQLite migration v130 / PG 094,
+-- #6332). TEXT pour la copie ; la 094, rejouee juste apres, le convertit.
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS bitrate_kbps TEXT;
+-- radio_stations: lien avec la fiche de l'annuaire (SQLite migration v126 /
+-- PG 090, #6516). TEXT des deux côtés : la copie texte n'a rien à convertir.
+ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS external_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id);
+-- artists: provenance du nom de tri (SQLite migration v131 / PG 095, #6474).
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS sort_name_source TEXT;
+-- artists: provenance du MBID (SQLite migration v133 / PG 097, #6463).
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS musicbrainz_id_source TEXT;
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE
@@ -1700,6 +1792,7 @@ fn conflict_clause(table: &str) -> &'static str {
     // (settings), we need to handle ON CONFLICT differently.
     match table {
         "settings" => "ON CONFLICT (key) DO NOTHING",
+        "listening_resumes" => "ON CONFLICT (zone_id, context_type, context_id, source) DO NOTHING",
         "track_metadata" => "ON CONFLICT (track_id, key) DO NOTHING",
         "album_metadata" => "ON CONFLICT (album_id, key) DO NOTHING",
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",
@@ -1742,6 +1835,8 @@ fn conflict_clause(table: &str) -> &'static str {
         "lyrics_cache" => "ON CONFLICT (track_id) DO NOTHING",
         "album_preferred_roots" => "ON CONFLICT (album_id) DO NOTHING",
         "track_audio_embedding" => "ON CONFLICT (track_id) DO NOTHING",
+        // Pas de colonne `id` : la clef est le quadruplet (#6682).
+        "radio_ecoutes" => "ON CONFLICT (jour, station_url, zone_id, profile_id) DO NOTHING",
         // For tables with BIGSERIAL PK, conflict on id
         _ => "ON CONFLICT (id) DO NOTHING",
     }
@@ -2266,6 +2361,93 @@ mod tests {
             "clause ON CONFLICT sans clef correspondante — la bascule perdrait ces tables :\n{}",
             ecarts.join("\n")
         );
+    }
+
+    /// La vraie bascule conserve clé, ordre de service et position, même
+    /// rejouée ; la sentinelle historique 99 est dépassée par la 100.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_reprise_7280_conserve_la_file_et_sa_clef() {
+        use crate::db::listening_resume::Resume;
+        use crate::db::play_queue_repo::QueueInput;
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_reprise_bascule_r8m2";
+        let cible = base_jetable(&url, BASE).await;
+        let sqlite = sqlite_de_depart();
+        let item = |source: &str, id: &str| QueueInput::Streaming {
+            source: source.into(),
+            source_id: id.into(),
+            title: id.into(),
+            artist: "Artiste".into(),
+            album: None,
+            cover_url: None,
+            duration_ms: 100000,
+            track_number: None,
+            disc_number: None,
+            album_ref: None,
+            artist_ref: None,
+        };
+        let reprise = Resume {
+            resume_key: "cle-reprise".into(),
+            context_type: "playlist".into(),
+            context_id: "mixte".into(),
+            source: "qobuz".into(),
+            title: "Ma playlist".into(),
+            last_track_title: "Deuxième".into(),
+            cover_path: None,
+            album_id: None,
+            position: 1,
+            shuffled: true,
+            queue_row_ids: vec![42, 41],
+            position_ms: 56789,
+            updated_at: "2026-10-28T10:00:00Z".into(),
+            items: vec![
+                item("qobuz", "non-numerique-a"),
+                item("tidal", "non-numerique-b"),
+            ],
+        };
+        let payload = serde_json::to_value(&reprise).unwrap();
+        sqlite.connection().lock().unwrap().execute(
+            "INSERT INTO listening_resumes (resume_key, zone_id, context_type, context_id, source, payload, updated_at) VALUES ('cle-reprise', 1, 'playlist', 'mixte', 'qobuz', ?1, '2026-10-28T10:00:00Z')",
+            rusqlite::params![payload.to_string()],
+        ).unwrap();
+        for _ in 0..2 {
+            let result = migrate_sqlite_to_pg(&sqlite, &cible).await.unwrap();
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .all(|e| !e.starts_with("listening_resumes:")),
+                "{:?}",
+                result.errors
+            );
+            let mut c = PgConnection::connect(&cible).await.unwrap();
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT resume_key, payload FROM listening_resumes")
+                    .fetch_all(&mut c)
+                    .await
+                    .unwrap();
+            assert_eq!(rows.len(), 1, "la bascule ne perd ni ne double la reprise");
+            assert_eq!(rows[0].0, "cle-reprise");
+            let relue: Resume = serde_json::from_str(&rows[0].1).unwrap();
+            assert_eq!(
+                serde_json::to_value(relue).unwrap(),
+                payload,
+                "l'ordre, les identifiants de service et la position doivent survivre"
+            );
+            let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            assert_eq!(
+                version, 100,
+                "la bascule ne doit pas rester sur la sentinelle 99"
+            );
+            c.close().await.ok();
+        }
+        supprimer_base(&url, BASE).await;
     }
 
     /// #5389 : la date d'ajout (`file_first_seen`) passe la bascule, a

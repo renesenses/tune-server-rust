@@ -114,6 +114,20 @@ pub fn cle_genre(genre: &str) -> Option<&'static str> {
         "funk" => "radio.genre.funk",
         "folk" => "radio.genre.folk",
         "ambient" | "ambiant" => "radio.genre.ambient",
+        // Taxonomie de radio-metadata.fr (#7445) : les codes courts exacts de
+        // l'annuaire (`holiday`, `oldies`, `soundtracks`, `news`) et les
+        // variantes des autres sources.
+        "holiday" | "holidays" | "christmas" | "noël" | "noel" => "radio.genre.holiday",
+        "oldies" | "oldie" => "radio.genre.oldies",
+        "soundtrack"
+        | "soundtracks"
+        | "bande originale"
+        | "bandes originales"
+        | "bande originale de film"
+        | "bandes originales de films"
+        | "film"
+        | "films" => "radio.genre.soundtrack",
+        "news" | "talk" | "info" | "information" => "radio.genre.news",
         _ => return None,
     };
     Some(cle)
@@ -134,6 +148,16 @@ pub fn enrichir_station(station: &mut Value, lang: &str) {
         .and_then(code_pays)
     {
         objet.insert("country_code".into(), Value::String(code.into()));
+    } else if let Some(code) = objet
+        .get("country")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|c| c.len() == 2 && c.chars().all(|ch| ch.is_ascii_alphabetic()))
+    {
+        // #6516 — l'annuaire v2 écrit déjà le pays en code ISO (`FR`) : une
+        // station ajoutée depuis l'annuaire le garde tel quel.
+        let code = code.to_ascii_uppercase();
+        objet.insert("country_code".into(), Value::String(code));
     }
     if let Some(cle) = objet
         .get("genre")
@@ -217,6 +241,45 @@ mod tests {
         ] {
             assert_eq!(cle_genre(genre), Some(attendue), "genre {genre}");
         }
+    }
+
+    #[test]
+    fn les_quatre_genres_de_radio_metadata_ont_une_cle() {
+        for (genre, attendue) in [
+            ("holiday", "radio.genre.holiday"),
+            ("Christmas", "radio.genre.holiday"),
+            ("Noël", "radio.genre.holiday"),
+            ("noel", "radio.genre.holiday"),
+            ("oldies", "radio.genre.oldies"),
+            ("soundtracks", "radio.genre.soundtrack"),
+            ("soundtrack", "radio.genre.soundtrack"),
+            ("Bande originale", "radio.genre.soundtrack"),
+            ("Bandes originales", "radio.genre.soundtrack"),
+            ("Film", "radio.genre.soundtrack"),
+            ("news", "radio.genre.news"),
+            ("Talk", "radio.genre.news"),
+            ("Info", "radio.genre.news"),
+            ("Information", "radio.genre.news"),
+        ] {
+            assert_eq!(cle_genre(genre), Some(attendue), "genre {genre}");
+        }
+    }
+
+    #[test]
+    fn les_quatre_nouvelles_cles_sont_traduites_dans_les_quinze_langues() {
+        for cle in [
+            "radio.genre.holiday",
+            "radio.genre.oldies",
+            "radio.genre.soundtrack",
+            "radio.genre.news",
+        ] {
+            for lang in crate::i18n::SUPPORTED.iter().copied() {
+                let t = crate::i18n::t(lang, cle);
+                assert!(!t.is_empty() && t != cle, "{cle} manque en {lang}");
+            }
+        }
+        assert_eq!(crate::i18n::t("fr", "radio.genre.news"), "Info");
+        assert_eq!(crate::i18n::t("de", "radio.genre.news"), "Nachrichten");
     }
 
     #[test]

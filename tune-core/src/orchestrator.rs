@@ -791,9 +791,27 @@ fn spawn_braked_levels_sink(
     tokio::sync::mpsc::Sender<Vec<u8>>,
     tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
 ) {
+    spawn_braked_levels_sink_depuis(playback, zone_id, levels_tx, consomme_ms, 0)
+}
+
+/// #6456 — le même frein, pour un décodage qui part de `depart_ms` sur
+/// l'horloge de la PISTE (un déplacement) : l'avance décodée se compte
+/// depuis là, comme la position rapportée par la zone. Compté depuis 0, un
+/// décodage relancé à 10 min prenait 10 min d'avance de plus que le
+/// plafond avant de freiner — toute la piste retenue dans la file.
+fn spawn_braked_levels_sink_depuis(
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    consomme_ms: Arc<std::sync::atomic::AtomicI64>,
+    depart_ms: i64,
+) -> (
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+    tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+) {
     // Position DÉCODÉE, alimentée par le relais ci-dessous : c'est elle
     // que le bridage compare à la position rapportée par la zone.
-    let avance_ms = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let avance_ms = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(depart_ms.max(0)));
     // Relais : le décodeur ne sait pas compter son avance, mais chaque
     // fenêtre porte sa durée.
     let (relais_tx, mut relais_rx) =
@@ -881,15 +899,35 @@ fn spawn_local_file_levels_decode(
     play_seq: u64,
     path: String,
 ) {
+    spawn_local_file_levels_decode_depuis(bus, playback, zone_id, play_seq, path, 0, 0);
+}
+
+/// #6456 — [`spawn_local_file_levels_decode`], depuis une position : le
+/// fichier est décodé à partir de `debut_fichier_ms` (son horloge à lui : le
+/// déplacement, plus le début de la tranche d'une image ou d'une feuille
+/// CUE), et les fenêtres sont datées et freinées à partir de `depart_ms`,
+/// la position dans la PISTE. C'est le décodage-pour-niveaux du DoP : le
+/// flux DoP est un porteur DSD emballé, d'où aucun niveau ne se lit, si bien
+/// que le DSD est converti ici en PCM pour les seules aiguilles.
+fn spawn_local_file_levels_decode_depuis(
+    bus: Arc<EventBus>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    play_seq: u64,
+    path: String,
+    debut_fichier_ms: u64,
+    depart_ms: u64,
+) {
+    let depart_ms = i64::try_from(depart_ms).unwrap_or(i64::MAX);
     tokio::spawn(async move {
         let cadence = playback.clone();
         let (levels_tx, consomme_ms) =
-            spawn_paced_levels_forwarder_mesure(bus, playback, zone_id, play_seq, 0);
+            spawn_paced_levels_forwarder_mesure(bus, playback, zone_id, play_seq, depart_ms);
         let (sink_tx, relais_tx) =
-            spawn_braked_levels_sink(cadence, zone_id, levels_tx, consomme_ms);
+            spawn_braked_levels_sink_depuis(cadence, zone_id, levels_tx, consomme_ms, depart_ms);
         let ready = std::sync::Arc::new(tokio::sync::Notify::new());
         let result = tokio::task::spawn_blocking(move || {
-            crate::audio::decode::decode_to_pcm_streaming_with_levels(
+            crate::audio::decode::decode_to_pcm_streaming_seeked(
                 &path,
                 None,
                 None,
@@ -898,6 +936,7 @@ fn spawn_local_file_levels_decode(
                 LEVELS_DECODE_CHUNK,
                 ready,
                 relais_tx,
+                debut_fichier_ms as f64 / 1000.0,
             )
         })
         .await;
@@ -1155,13 +1194,19 @@ pub struct PlaybackOrchestrator {
     /// left None in tests → no gating). Enforced at zone activation in `play`.
     pub license: Option<Arc<crate::license::LicenseManager>>,
     gapless_sessions: Mutex<HashMap<i64, String>>,
+    browser_next: navigateur_suivante_5975::PreparationsNavigateur,
     /// #3365 — la qualité annoncée de la piste pré-armée, rangée à côté de
     /// `gapless_sessions` et reprise par `advance_queue_metadata` quand la
     /// zone adopte ce flux. Carte annexe plutôt qu'un changement de forme de
     /// `gapless_sessions`, dont vit l'épreuve de #3442.
     qualites_pre_armees: Mutex<HashMap<i64, QualitePreArmee>>,
     pub prefetch: Arc<PrefetchEngine>,
+    preparations_fichiers: std::sync::Mutex<HashMap<i64, preparation_fichier_7247::Preparation>>,
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
+    /// #6910 — renderers DLNA qui ont lâché un suivant DSD armé (acquitté,
+    /// jamais suivi : HiFi Rose RS130, #402). La garde DSD leur est rendue
+    /// pour la vie du processus.
+    appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Cache of MIME types that each DLNA renderer does NOT support.
     /// Key: device_id, Value: set of unsupported MIME types (e.g. "audio/flac").
     /// Only negative results are cached — if a MIME is not in the set, it's
@@ -1171,25 +1216,29 @@ pub struct PlaybackOrchestrator {
     /// `device_id|profondeur`. Les sondes inconcluantes n'y entrent pas.
     dlna_lpcm_accepte: Mutex<HashMap<String, bool>>,
     /// #4573 — ce que le Sink du renderer ANNONCE en nombre de canaux, par
-    /// `device_id`. `Some(None)` veut dire « le Sink a été lu, il ne porte
+    /// `(device_id, mime)`. `Some(None)` veut dire « le Sink a été lu, il ne porte
     /// aucun `channels=` » : une ignorance MESURÉE, qui ne fait rien réduire
     /// mais qu'il est inutile de re-sonder à chaque piste. Une sonde
     /// INCONCLUANTE (SOAP en échec, Sink vide) n'entre jamais dans cette
     /// table — même règle que `dlna_lpcm_accepte` : un renderer endormi au
     /// démarrage ne doit pas se voir coller un verdict pour la session.
-    dlna_canaux_max: Mutex<HashMap<String, Option<u16>>>,
+    dlna_canaux_max: Mutex<HashMap<(String, String), Option<u16>>>,
     /// Zones dont une résolution gapless est en cours : les sessions créées
     /// pendant cette fenêtre pré-chargent la piste SUIVANTE — leur attacher
     /// un forwarder de niveaux daterait les fenêtres avec l'horloge de la
     /// piste courante (stamps d'une piste sur la position d'une autre). Les
     /// niveaux de la piste suivante démarrent à l'avance gapless, voir
     /// [`Self::advance_queue_metadata`]. Verrou std : accès courts.
-    levels_prewarm: std::sync::Mutex<std::collections::HashSet<i64>>,
+    levels_prewarm: std::sync::Mutex<std::collections::HashMap<i64, usize>>,
     /// #5050 (fil 2236) — zones posées en pause par un transfert, sans que
     /// rien n'ait été envoyé à leur appareil : leur reprise rétablit la piste
     /// à la position (voir `transfert_en_pause_5050`). Verrou std : accès
     /// courts.
     transferts_en_pause: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #6612 — la dernière reprise SUR PLACE d'un renderer réseau, par zone :
+    /// (position, instant). Voir `plage_hors_fichier_6612`. Verrou std :
+    /// accès courts.
+    reprises_sur_place: std::sync::Mutex<std::collections::HashMap<i64, (u64, std::time::Instant)>>,
     /// Anti-rebond du redémarrage de flux déclenché par un changement
     /// d'égaliseur sur un chemin NON local (#1710, lot 2).
     ///
@@ -1273,8 +1322,9 @@ pub struct PlaybackOrchestrator {
     /// 3 min 12 s de journal, zéro abandon.
     ///
     /// Seuls les verdicts DÉFINITIFS entrent ici : `radio_not_audio` (le
-    /// serveur rend une page web) et `radio_hls_unsupported` (Tune ne sait pas
-    /// lire ce format). Une coupure réseau n'y entre pas — la reprise
+    /// serveur rend une page web), `radio_hls_unsupported` (Tune ne sait pas
+    /// lire cette forme de HLS) et `radio_flux_interdit` (le diffuseur refuse
+    /// l'accès, #6357) — voir `echec_radio_definitif`. Une coupure réseau n'y entre pas — la reprise
     /// légitime d'un flux qui tombe doit continuer de marcher.
     ///
     /// L'entrée est posée par la tâche de décodage et **effacée à chaque
@@ -1337,16 +1387,19 @@ struct AnnonceNavigateurDifferee {
 
 /// Portée RAII de la résolution gapless d'une zone (voir `levels_prewarm`).
 struct LevelsPrewarmScope<'a> {
-    set: &'a std::sync::Mutex<std::collections::HashSet<i64>>,
+    set: &'a std::sync::Mutex<std::collections::HashMap<i64, usize>>,
     zone_id: i64,
 }
 
 impl Drop for LevelsPrewarmScope<'_> {
     fn drop(&mut self) {
-        self.set
-            .lock()
-            .expect("levels_prewarm lock")
-            .remove(&self.zone_id);
+        let mut comptes = self.set.lock().expect("levels_prewarm lock");
+        if let Some(nombre) = comptes.get_mut(&self.zone_id) {
+            *nombre -= 1;
+            if *nombre == 0 {
+                comptes.remove(&self.zone_id);
+            }
+        }
     }
 }
 
@@ -1414,6 +1467,7 @@ impl PlayResult {
     }
 }
 
+#[derive(Clone)]
 pub struct ResolvedStream {
     pub url: String,
     pub mime_type: String,
@@ -1427,7 +1481,9 @@ pub struct ResolvedStream {
     pub file_size: Option<u64>,
     /// Audio sample rate in Hz for the output stream (e.g. 176400 for DSD64->PCM).
     pub sample_rate: Option<u32>,
-    /// Output bit depth (e.g. 24 for DSD->PCM).
+    /// Output bit depth (e.g. 24 for DSD->PCM). #6334 — `None` for a lossy
+    /// service codec, even decoded to WAV: this is what the SOURCE announces.
+    /// What reaches an output's `PlayMedia` is `profondeur_du_fil`.
     pub bit_depth: Option<u32>,
     /// Number of audio channels.
     pub channels: Option<u32>,
@@ -1446,8 +1502,15 @@ pub struct ResolvedStream {
     /// et la règle écrite dans `tune-bandcamp` veut que ce débit soit
     /// « annoncé comme tel partout où il apparaît ».
     pub bitrate_kbps: Option<u32>,
+    /// #6334 — le codec que le SERVICE a livré (`aac`, `flac`…), en
+    /// minuscules, quand il le nomme. Distinct de `mime_type`, qui décrit le
+    /// CONTENEUR servi : un AAC décodé pour une sortie qui exige du WAV part
+    /// en `audio/wav`, et l'annonce ne doit pas en faire un WAV « CD ».
+    /// `None` hors services de streaming : la source y est nommée ailleurs.
+    pub format_source: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ResolvedQueueItem {
     pub url: String,
     pub mime_type: String,
@@ -1696,14 +1759,20 @@ impl PlaybackOrchestrator {
             event_bus: None,
             license: None,
             gapless_sessions: Mutex::new(HashMap::new()),
+            browser_next: Mutex::new(HashMap::new()),
             qualites_pre_armees: Mutex::new(HashMap::new()),
             prefetch: Arc::new(PrefetchEngine::new()),
+            preparations_fichiers: Default::default(),
             dsd_capabilities: Mutex::new(HashMap::new()),
+            appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            ),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
             dlna_canaux_max: Mutex::new(HashMap::new()),
-            levels_prewarm: std::sync::Mutex::new(std::collections::HashSet::new()),
+            levels_prewarm: std::sync::Mutex::new(std::collections::HashMap::new()),
             transferts_en_pause: std::sync::Mutex::new(std::collections::HashSet::new()),
+            reprises_sur_place: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
             traitement_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1791,6 +1860,8 @@ mod transport;
 mod repli_de_peripherique;
 
 mod resolve_stream;
+// #7148 — la sentinelle de streaming : résolution et décodage réels, sans son.
+pub mod sentinelle_streaming;
 // #6130 — quitter une radio sur une sortie DLNA : Stop, puis attendre le renderer.
 mod sortie_de_radio_dlna_6130;
 // #6130 — le contexte d'un flux de conversion, pour son journal.
@@ -1806,6 +1877,10 @@ mod resolve_local;
 pub(crate) mod seek_natif_6059;
 #[cfg(test)]
 mod seek_natif_6059_bout_en_bout;
+// #6333 — Devialet : une avance en Hi-Res relance le flux natif à la position.
+mod deplacement_hi_res_6333;
+#[cfg(test)]
+mod deplacement_hi_res_6333_bout_en_bout;
 
 // #2742 — le crossfeed des pistes de la bibliothèque sur une zone réseau.
 mod crossfeed_bibliotheque_reseau;
@@ -1817,6 +1892,10 @@ mod compensation_reseau_5071_tests;
 #[cfg(test)]
 mod repli_dsd_4354_tests;
 
+// #6772 — l'avance sans blanc relance le préchargement de la piste suivante.
+#[cfg(test)]
+mod prechargement_apres_avance_6772_tests;
+
 // #5871 — la préparation DSP ne fait plus la queue derrière l'écrivain.
 #[cfg(test)]
 mod prepa_lecture_5871_tests;
@@ -1824,6 +1903,10 @@ mod prepa_lecture_5871_tests;
 // #5080 — un flux de service à traitement actif part en WAV progressif.
 #[cfg(test)]
 mod service_wav_progressif_5080;
+
+// #6718 — la même chose vers un renderer OpenHome qui annonce le LPCM.
+#[cfg(test)]
+mod service_wav_progressif_openhome_6718;
 
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
@@ -1834,6 +1917,16 @@ pub use dsp::PorteeDuReglage;
 // #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
 #[cfg(test)]
 mod volume_pure_5695_tests;
+// #6541 — limites de sécurité et de confort, tenues sur tous les chemins.
+#[cfg(test)]
+mod volume_limites_6541_tests;
+// #6721 — garde générale contre les montées brusques, sur tous les chemins.
+#[cfg(test)]
+mod garde_de_hausse_6721_tests;
+// #6774 — PURE verrouillé et volume fixe ne suivent pas la zone sur un
+// autre appareil.
+#[cfg(test)]
+mod securite_volume_changement_d_appareil_6774_tests;
 // #4407 — l'égaliseur remplacé en vol dans un flux réseau fabriqué par Tune.
 mod eq_en_vol;
 #[cfg(test)]
@@ -1842,11 +1935,24 @@ mod eq_en_vol_4407_tests;
 // bibliothèque native de test.
 #[cfg(test)]
 mod greffon_natif_tiers_tests;
+// #6780 — PURE contourne aussi la réaffectation des canaux armée de la zone.
+#[cfg(all(test, feature = "local-audio"))]
+mod pure_reaffectation_6780_tests;
+// #6256 — la désinstallation d'un greffon natif tiers ne rebâtit que les
+// zones qui l'utilisent.
+#[cfg(all(test, feature = "local-audio"))]
+mod purge_greffon_tiers_6256_tests;
+// #6522, #6524 — le verdict PURE de la sortie locale suit les réglages
+// enregistrés, dans l'état que la vraie bascule produit.
+#[cfg(all(test, feature = "local-audio"))]
+mod verdict_pure_reglages_6522_tests;
 
 /// Fil 2062 / #5550 — durée d'une piste UPnP lue dans les en-têtes du flux.
 mod duree_du_flux_2062;
 #[cfg(test)]
 mod duree_du_flux_2062_tests;
+#[cfg(test)]
+mod prefetch_wav_annonce_6990_tests;
 mod resolve_direct;
 /// #2264 — la règle de version appliquée à la lecture.
 mod version_de_lecture;
@@ -1864,6 +1970,7 @@ mod serveur_source_absent_4362;
 /// `resolve_direct`, pour que les deux ne puissent pas diverger.
 pub mod verdict_upnp;
 
+mod navigateur_suivante_5975;
 mod queue;
 pub use queue::{Enjambee, lignes_bannies_a_enjamber};
 
@@ -1876,7 +1983,10 @@ pub use bandcamp::*;
 mod bandcamp_resignature;
 
 mod qualite_pre_armee;
-pub(crate) use qualite_pre_armee::{QualitePreArmee, format_du_mime, format_nomme_par_la_source};
+pub(crate) use qualite_pre_armee::{
+    QualitePreArmee, debit_annonce_par_le_service, format_du_mime, format_livre_par_le_service,
+    format_nomme_par_la_source, profondeur_annoncee_par_le_service, profondeur_du_fil,
+};
 
 /// Ce qu'on ANNONCE au renderer pour une piste de serveur média : le MIME ne
 /// se devine plus dans la seule URL, qui pour un `<res>` de Tune ne porte
@@ -1934,7 +2044,8 @@ async fn arm_local_stream_consumer_watch(
             format = %session.info.format,
             mime_type = %session.info.mime_type,
             file_path = ?file_path,
-            proxy_url = ?proxy_url,
+            // L'hôte seul : l'URL amont d'un mandataire est souvent signée (#6468).
+            proxy_hote = ?proxy_url.as_deref().map(resolve_direct::hote_pour_le_journal),
             active_consumers,
             "local_stream_never_consumed"
         );
@@ -2030,6 +2141,14 @@ mod mesure_saut_cd_5079;
 /// FLAC (ou le catalogue) ; inconnue, elle est refusée par une erreur nommée.
 #[cfg(test)]
 mod qobuz_cadence_nulle_5283_tests;
+#[cfg(test)]
+mod tidal_aac_annonce_6334_tests;
+
+/// #6401 — le préchargement sans blanc et la sonde de niveaux après une
+/// avance sans blanc passent par le même repli Qobuz en 16/44,1 que la
+/// lecture.
+#[cfg(test)]
+mod qobuz_repli_prechargement_6401_tests;
 
 /// #4384 — la crête d'une zone locale se lit après son DSP.
 #[cfg(test)]
@@ -2038,6 +2157,9 @@ mod crete_apres_dsp_4384;
 /// l'alimentation de l'anneau.
 #[cfg(test)]
 mod niveaux_a_la_sortie_1908;
+/// #6456 — le DoP publie les niveaux de la piste, depuis la position servie.
+#[cfg(test)]
+mod niveaux_du_dop_6456;
 /// #3818 — les niveaux ne meurent plus à 31-32 s sur une position figée.
 #[cfg(test)]
 mod niveaux_frein_3818;
@@ -2056,6 +2178,9 @@ mod niveaux_source_pcm_5078;
 mod resolution_annoncee_tests;
 #[cfg(test)]
 mod saut_de_piste_pcm_5079;
+// #6915 — un CD rouvert à la position : le renderer la rapporte à la piste.
+#[cfg(test)]
+mod depart_du_cd_6915;
 /// #6018 — un titre Spotify joué par librespot, jusqu'à la session de la zone.
 #[cfg(all(test, unix))]
 mod spotify_6018_tests;
@@ -2107,6 +2232,11 @@ mod tests;
 #[cfg(test)]
 mod bit_depth_cap_tests;
 
+/// #6909 — le pré-transcodage DASH honore « WAV/LPCM » et « 16 bits » de la
+/// zone (Marantz NR1602, fil 2410).
+#[cfg(test)]
+mod reglages_dash_6909_tests;
+
 #[cfg(test)]
 mod dop_routing_tests;
 
@@ -2143,7 +2273,16 @@ mod curseur_intact_4283;
 /// reprise rétablit à la position au lieu de reprendre « sur place ».
 #[cfg(test)]
 mod pause_rend_le_peripherique_4177;
+#[cfg(test)]
+mod reprise_nouveau_flux_6264_tests;
 
+/// #6612 — une plage hors du fichier à la reprise : nouveau flux, à la position.
+pub(crate) mod plage_hors_fichier_6612;
+
+/// #6380 — la Lecture qui suit un redémarrage ramène le renderer réseau à la
+/// position restaurée (piste Qobuz ; sortie locale inchangée).
+#[cfg(test)]
+mod reprise_au_redemarrage_6380;
 /// Fil 2095 — le rétablissement d'une session morte ramène le renderer
 /// réseau à la position de la pause.
 #[cfg(test)]
@@ -2156,6 +2295,10 @@ mod reprise_renderer_cale_2125;
 /// (Chromecast) refuse la reprise ; la lecture est rétablie à la position.
 #[cfg(test)]
 mod reprise_session_perdue_par_la_sortie_6062;
+/// #6476 — fil 2322 : après une reconnexion de Squeezelite, Lecture renvoie
+/// le flux (`strm s`) au lieu d'un `strm u` seul sur un lecteur sans flux.
+#[cfg(test)]
+mod reprise_slimproto_apres_reconnexion_6476;
 /// #6017 — fil 2194 : avancer dans une piste de la bibliothèque convertie à
 /// la volée recrée le flux à la position au lieu d'un `Seek` SOAP refusé.
 #[cfg(test)]
@@ -2170,11 +2313,16 @@ mod seek_de_reprise_caduc_5476;
 mod seek_de_reprise_conditionnel_5050;
 // #5050 (fil 2236) — transfert depuis une zone en pause : la cible est posée
 // en pause sans rien recevoir.
+/// #6466 — l'historique par conteneurs : le conteneur de chaque élément de
+/// file, et le transfert de zone sans doublon.
+#[cfg(test)]
+mod historique_conteneurs_tests_6466;
 /// #6130 — quitter une radio sur une sortie DLNA : `Stop`, attente du départ
 /// du consommateur radio, puis `SetAVTransportURI`.
 #[cfg(test)]
 mod sortie_de_radio_dlna_6130_tests;
 mod transfert_en_pause_5050;
+pub use transfert_en_pause_5050::ErreurDeTransfert;
 
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).
@@ -2235,3 +2383,8 @@ mod refus_asio_bloque_4556;
 /// ont ete rejoues sur la requete qui l'a pris.
 #[cfg(test)]
 mod refus_amont_4366;
+
+mod preparation_fichier_7247;
+
+#[cfg(test)]
+mod deplacement_qobuz_6982_tests;

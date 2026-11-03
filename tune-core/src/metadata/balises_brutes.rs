@@ -153,6 +153,34 @@ pub fn date_valide(brut: &str) -> Option<String> {
     Some(v.chars().take(32).collect())
 }
 
+/// web#2206 (Jean Valjean, fil 2300) — une date de sortie PLUS PRÉCISE que
+/// l'année : `AAAA-MM` ou `AAAA-MM-JJ`, lue dans la balise de date
+/// d'enregistrement (`DATE` Vorbis/APE, `TDRC` ID3v2.4, `©day` MP4), que
+/// MusicBrainz Picard et la plupart des éditeurs remplissent avec la date de
+/// sortie de l'édition. Une année seule ne rend rien : elle est déjà
+/// `year`, et la recopier ferait passer « 1975 » pour une date complète. Un
+/// horodatage (`1975-09-12T00:00:00Z`, MP4) est réduit au jour.
+pub fn date_precise(brut: &str) -> Option<String> {
+    let v = brut.trim();
+    let b = v.as_bytes();
+    let chiffres =
+        |r: std::ops::Range<usize>| b.get(r).is_some_and(|s| s.iter().all(u8::is_ascii_digit));
+    if !(chiffres(0..4) && b.get(4) == Some(&b'-') && chiffres(5..7)) || v.starts_with("0000") {
+        return None;
+    }
+    let mois: u32 = v[5..7].parse().ok()?;
+    if !(1..=12).contains(&mois) {
+        return None;
+    }
+    if b.get(7) == Some(&b'-') && chiffres(8..10) {
+        let jour: u32 = v[8..10].parse().ok()?;
+        if (1..=31).contains(&jour) {
+            return Some(v[..10].to_string());
+        }
+    }
+    Some(v[..7].to_string())
+}
+
 /// La date de sortie originale parmi des paires `(clé, valeur)` : la
 /// première date valide des [`CLES_DATE_ORIGINALE`], dans leur ordre, sinon
 /// la première année valide des [`CLES_ANNEE_ORIGINALE`].

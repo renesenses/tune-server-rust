@@ -116,6 +116,70 @@ refus_pertinents() {
   done < <(printf '%s\n' "$message" | awk 'BEGIN { RS=""; ORS=sprintf("%c", 28) } { print }')
 }
 
+# ── Contre quelle reference verifier l'existence d'un fichier ? ────────────
+#
+# Le 2026-10-26, le workflow faisait son checkout sur `release/v0.9`, figee
+# depuis le 30/08 : un fichier cree depuis passait pour « introuvable » et
+# declenchait une fausse alerte. L'arbre de travail ne dit RIEN de ce que
+# l'issue a livre ; on lit donc des REFERENCES git, dans cet ordre :
+#
+#   1. le tag `vX.Y.Z…` cite par le commentaire de cloture (s'il existe) ;
+#   2. sinon le dernier tag de release publie (`REF_RELEASE`, releves par le
+#      workflow via `releases/latest`) ;
+#   et, en complement, 3. la branche `batch/*` que le commentaire nomme.
+#
+# Seule une absence de TOUTES ces references est une vraie absence.
+readonly MOTIF_TAG='v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+)*'
+readonly MOTIF_LOT='batch/[A-Za-z0-9._-]*[A-Za-z0-9_]'
+
+# Rend les references (une par ligne) contre lesquelles verifier. Vide si le
+# depot n'en offre aucune : l'appelant retombe alors sur l'arbre de travail.
+references_de_verification() {
+  local corps="$1" depot="$2" tag lot
+  local tag_cite="" tag_publie="${REF_RELEASE:-}"
+
+  while IFS= read -r tag; do
+    [ -n "$tag" ] || continue
+    if git -C "$depot" rev-parse --verify --quiet "refs/tags/$tag^{commit}" >/dev/null; then
+      tag_cite="$tag"
+      break
+    fi
+  done < <(printf '%s\n' "$corps" | grep -oE "$MOTIF_TAG" || true)
+
+  if [ -n "$tag_cite" ]; then
+    printf '%s\n' "$tag_cite"
+  elif printf '%s\n' "$tag_publie" | grep -qE "^${MOTIF_TAG}\$" \
+    && git -C "$depot" rev-parse --verify --quiet "refs/tags/$tag_publie^{commit}" >/dev/null
+  then
+    printf '%s\n' "$tag_publie"
+  fi
+
+  while IFS= read -r lot; do
+    [ -n "$lot" ] || continue
+    if git -C "$depot" rev-parse --verify --quiet "refs/remotes/origin/$lot^{commit}" >/dev/null; then
+      printf 'origin/%s\n' "$lot"
+    elif git -C "$depot" rev-parse --verify --quiet "refs/heads/$lot^{commit}" >/dev/null; then
+      printf '%s\n' "$lot"
+    fi
+  done < <(printf '%s\n' "$corps" | grep -oE "$MOTIF_LOT" | sort -u || true)
+}
+
+# Le fichier cite existe-t-il ? Contre les references ci-dessus ; a defaut de
+# reference, contre l'arbre de travail (comportement historique).
+fichier_existe() {
+  local corps="$1" depot="$2" fichier="$3" ref references
+  references=$(references_de_verification "$corps" "$depot")
+  if [ -z "$references" ]; then
+    [ -e "$depot/$fichier" ]
+    return
+  fi
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    git -C "$depot" cat-file -e "$ref:$fichier" 2>/dev/null && return 0
+  done <<< "$references"
+  return 1
+}
+
 # Analyse un commentaire de fermeture. Ecrit son rapport sur STDOUT.
 #
 # `depot` permet aux cas de preuve de travailler sur un faux depot ; en usage
@@ -168,8 +232,9 @@ analyser() {
         problemes=$((problemes + 1))
       fi
 
-      # 3. Le fichier cite doit exister dans le depot.
-      if [ "$depot" != "-" ] && [ ! -e "$depot/$fichier" ]; then
+      # 3. Le fichier cite doit exister dans le depot, a la bonne reference
+      #    (voir `references_de_verification`).
+      if [ "$depot" != "-" ] && ! fichier_existe "$corps" "$depot" "$fichier"; then
         printf 'PREUVE INVALIDE  le fichier cite est introuvable : %s\n' "$fichier"
         problemes=$((problemes + 1))
       fi
@@ -328,6 +393,69 @@ autotest() {
   fi
 
   rm -rf "$depot_test"
+
+  # ── Reference de verification (#7065) ─────────────────────────────────────
+  #
+  # L'arbre de travail est volontairement FIGE sur un vieux commit, comme
+  # `release/v0.9` : le fichier n'y est pas, il n'existe qu'au tag rc8 et sur
+  # une branche de lot. C'est exactement la panne du 26/10.
+  local depot_ref
+  depot_ref=$(mktemp -d "${TMPDIR:-/tmp}/verifier-fermeture-ref.XXXXXX")
+  git -C "$depot_ref" init -q -b main
+  git -C "$depot_ref" config user.name 'Contre-epreuve'
+  git -C "$depot_ref" config user.email 'contre-epreuve@example.invalid'
+  mkdir -p "$depot_ref/src"
+  printf 'fn ancien_symbole() {}\n' > "$depot_ref/src/ancien.rs"
+  git -C "$depot_ref" add -A
+  git -C "$depot_ref" commit -q -m 'ancien (#9980)'
+  git -C "$depot_ref" tag v0.9.99
+  git -C "$depot_ref" checkout -q -b figee
+  git -C "$depot_ref" checkout -q main
+  printf 'fn nouveau_symbole() {}\n' > "$depot_ref/src/nouveau.rs"
+  git -C "$depot_ref" add -A
+  git -C "$depot_ref" commit -q -m 'nouveau (#9981)'
+  git -C "$depot_ref" tag v1.0.0-rc8
+  git -C "$depot_ref" checkout -q -b batch/lot-test
+  printf 'fn lot_symbole() {}\n' > "$depot_ref/src/lot.rs"
+  git -C "$depot_ref" add -A
+  git -C "$depot_ref" commit -q -m 'lot (#9982)'
+  git -C "$depot_ref" checkout -q figee
+
+  cas_ref() {
+    local libelle="$1" code_attendu="$2" corps="$3" code
+    REF_RELEASE="${4:-}" analyser "$corps" "$depot_ref" >/dev/null 2>&1
+    code=$?
+    if [ "$code" -eq "$code_attendu" ]; then
+      printf '  ok    %s\n' "$libelle"
+    else
+      printf '  ECHEC %s (attendu %d, obtenu %d)\n' "$libelle" "$code_attendu" "$code"
+      echecs=$((echecs + 1))
+    fi
+  }
+
+  cas_ref 'fichier recent present au tag cite par le commentaire' 0 \
+    'Livré en v1.0.0-rc8. Vérifié par contenu : `fn nouveau_symbole` — src/nouveau.rs:1.'
+  cas_ref 'fichier recent present au dernier tag publie' 0 \
+    'Livré. Vérifié par contenu : `fn nouveau_symbole` — src/nouveau.rs:1.' v1.0.0-rc8
+  cas_ref 'fichier recent present sur la branche de lot nommee' 0 \
+    'Livré dans batch/lot-test. Vérifié par contenu : `fn lot_symbole` — src/lot.rs:1.'
+  cas_ref 'fichier ancien toujours trouve (tag cite)' 0 \
+    'Livré en v0.9.99. Vérifié par contenu : `fn ancien_symbole` — src/ancien.rs:1.'
+  cas_ref 'fichier absent partout : alerte maintenue (tag cite)' 1 \
+    'Livré en v1.0.0-rc8. Vérifié par contenu : `fn fantome_symbole` — src/fantome.rs:1.'
+  cas_ref 'fichier absent partout : alerte maintenue (dernier tag publie)' 1 \
+    'Livré. Vérifié par contenu : `fn fantome_symbole` — src/fantome.rs:1.' v1.0.0-rc8
+  cas_ref 'fichier absent partout : alerte maintenue (branche de lot)' 1 \
+    'Livré dans batch/lot-test. Vérifié par contenu : `fn fantome_symbole` — src/fantome.rs:1.'
+  cas_ref 'fichier recent sans aucune reference : introuvable' 1 \
+    'Livré. Vérifié par contenu : `fn nouveau_symbole` — src/nouveau.rs:1.'
+  cas_ref 'tag cite inexistant : repli sur le dernier tag publie' 0 \
+    'Livré en v9.9.9. Vérifié par contenu : `fn nouveau_symbole` — src/nouveau.rs:1.' v1.0.0-rc8
+  cas_ref 'tag cite prioritaire sur le dernier tag publie' 1 \
+    'Livré en v0.9.99. Vérifié par contenu : `fn nouveau_symbole` — src/nouveau.rs:1.' v1.0.0-rc8
+
+  rm -rf "$depot_ref"
+
 
   if [ "$echecs" -gt 0 ]; then
     printf '\n%d cas de preuve en echec.\n' "$echecs"

@@ -954,6 +954,22 @@ pub fn build_album_query(
             continue;
         }
 
+        // #6285 — le verdict hi-res PUBLIÉ de l'album, celui de son badge
+        // dans la liste. Un verdict ou un opérateur inconnu rend FAUX.
+        if field == "hires_verdict" {
+            conditions.push(
+                crate::regles_sql::condition_verdict_hires(
+                    "al.id",
+                    true,
+                    op,
+                    &value,
+                    ctx.resolver.hires_douteux_visible(),
+                )
+                .unwrap_or_else(|| crate::regles_sql::FAUX.to_string()),
+            );
+            continue;
+        }
+
         // #5547 — la note de l'ALBUM pour le profil actif (`album_ratings`).
         if field == "rating" {
             if let Some(c) =
@@ -972,6 +988,11 @@ pub fn build_album_query(
             // l'album (`ar`, joint sur `al.artist_id`). Même lecture que
             // `regles_sql::colonne_piste`.
             "album_artist" => "COALESCE(NULLIF(t.album_artist, ''), ar.name)",
+            // #6232 (forum 2218) — « Interprète » : l'album passe dès qu'UNE
+            // de ses pistes porte l'interprète cherché (balise ARTIST, à
+            // défaut l'artiste de la piste). Critère de PISTE : « ne contient
+            // pas » demande qu'AUCUNE piste ne contienne.
+            "track_artist" => crate::regles_sql::SQL_INTERPRETE_DE_LA_PISTE,
             "album" | "album_title" | "title" => "al.title",
             "composer" => "t.composer",
             "label" => "al.label",
@@ -1012,6 +1033,7 @@ pub fn build_album_query(
                 | "artist"
                 | "artist_name"
                 | "album_artist"
+                | "track_artist"
                 | "album"
                 | "album_title"
                 | "title"
@@ -1184,13 +1206,18 @@ pub(crate) fn sql_albums_de_collection(
         // `al.is_compilation` (#1957) est dans le GROUP BY comme les autres
         // colonnes d'album : PostgreSQL refuse une colonne ni groupée ni
         // agrégée, SQLite l'accepterait. Écrire pour les deux.
+        //
+        // web#2206 — `release_date` et `original_date` en fin de ligne : le
+        // tri « Date de sortie » d'une collection ouverte se fait à l'écran,
+        // sur ces albums ; sans elles il retombait sur l'année.
         "SELECT al.id, al.title, ar.name, al.year, al.cover_path, al.genre, \
-         COUNT(t.id) AS track_count, al.is_compilation \
+         COUNT(t.id) AS track_count, al.is_compilation, al.release_date, al.original_date \
          FROM albums al \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
          LEFT JOIN tracks t ON t.album_id = al.id \
          {} \
-         GROUP BY al.id, al.title, ar.name, al.year, al.cover_path, al.genre, al.is_compilation \
+         GROUP BY al.id, al.title, ar.name, al.year, al.cover_path, al.genre, al.is_compilation, \
+         al.release_date, al.original_date \
          {} {}",
         where_clause, order, limit_clause
     )
@@ -1226,6 +1253,9 @@ fn execute_album_query(
                 // une collection intelligente rend le drapeau comme la liste
                 // d'albums. NUL ⇒ `false`, jamais `null`.
                 "is_compilation": tune_core::db::album_repo::drapeau_compilation(r.get(7)),
+                // web#2206 — mêmes noms que `Album` (la liste de la bibliothèque).
+                "release_date": r.get(8).and_then(|v| v.as_string()),
+                "original_date": r.get(9).and_then(|v| v.as_string()),
             })
         })
         .collect())
@@ -2407,7 +2437,7 @@ mod tests {
                          id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
                          item_type TEXT, service TEXT, service_id TEXT, title TEXT,
                          artist TEXT, album TEXT, cover_url TEXT, created_at TEXT,
-                         position TEXT)",
+                         position TEXT, year TEXT, sample_rate TEXT, bit_depth TEXT)",
                     &[],
                 )
                 .expect("favoris");
@@ -2678,7 +2708,8 @@ mod tests {
                  CREATE TABLE IF NOT EXISTS streaming_favorites (
                      id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
                      item_type TEXT, service TEXT, service_id TEXT, title TEXT,
-                     artist TEXT, album TEXT, cover_url TEXT, created_at TEXT);
+                     artist TEXT, album TEXT, cover_url TEXT, created_at TEXT,
+                     year TEXT, sample_rate TEXT, bit_depth TEXT);
                  INSERT INTO artists (id, name) VALUES (1, 'Miles Davis');
                  INSERT INTO albums (id, title, artist_id, year) VALUES
                      (10, 'Kind of Blue', 1, 1959), (11, 'Bitches Brew', 1, 1970);
@@ -2899,5 +2930,36 @@ mod genre_couvrant_2149 {
                 .as_i64();
             assert_eq!(n, Some(80), "le compte ne change pas : {regle}");
         }
+    }
+}
+
+/// web#2206 (Jean Valjean, fil 2300) — les albums d'une collection
+/// intelligente portent leur date de sortie : le tri « Date de sortie » de la
+/// collection ouverte se fait à l'écran, sur ces lignes, et retombait sur
+/// l'année faute d'elles.
+#[cfg(test)]
+mod date_de_sortie_2206 {
+    use std::sync::Arc;
+
+    use crate::SmartHttpState;
+
+    #[test]
+    fn les_albums_d_une_collection_portent_leurs_dates() {
+        let db = crate::criteres::tests::bibliotheque();
+        db.execute_batch(
+            "UPDATE albums SET release_date = '1997-03-10', original_date = '1959-08-17' WHERE id = 1;",
+        )
+        .unwrap();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let etat = SmartHttpState::new(backend);
+        let Ok(lignes) = super::execute_album_query(&etat, "", "ORDER BY al.id ASC", "") else {
+            panic!("la requête des albums de la collection échoue");
+        };
+        let kind = lignes.iter().find(|a| a["id"] == 1).expect("album 1");
+        assert_eq!(kind["release_date"], "1997-03-10", "{kind}");
+        assert_eq!(kind["original_date"], "1959-08-17", "{kind}");
+        let giant = lignes.iter().find(|a| a["id"] == 2).expect("album 2");
+        assert!(giant["release_date"].is_null(), "{giant}");
+        assert!(giant["original_date"].is_null(), "{giant}");
     }
 }

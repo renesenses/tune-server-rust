@@ -1,0 +1,42 @@
+{
+  "appareil_ed25519": {
+    "cnf": {
+      "alg": "Ed25519",
+      "pk": "n0lDnp2wlbxBEe0l01eV2DG8VaBH9LHX9q7jd3u0EiA"
+    },
+    "did": "app_ed_01",
+    "graine_hex": "5454545454545454545454545454545454545454545454545454545454545454"
+  },
+  "appareil_p256": {
+    "cnf": {
+      "alg": "P-256",
+      "pk": "BGule3oM9BLm_Qf6E27ObqvknMVua4taLB-FPykPOxOrBTW_F9Fr0vddlbykS_WR_hy8UU2n1TgUaMrXXWCVKBo"
+    },
+    "did": "app_p256_01",
+    "pkcs8": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgOhJ4xg2SwebhtfXJvFmCS3GbP-zyHnfwGk1e9H5YOCKhRANCAARrpXt6DPQS5v0H-hNuzm6r5JzFbmuLWiwfhT8pDzsTqwU1vxfRa9L3XZW8pEv1kf4cvFFNp9U4FGjK111glSga"
+  },
+  "autre_appareil_ed25519": {
+    "cnf": {
+      "alg": "Ed25519",
+      "pk": "xoImN8fTEOxXYnvgC6JZ0lN0n0qvZERwz_vlOjX3MkI"
+    },
+    "graine_hex": "5555555555555555555555555555555555555555555555555555555555555555"
+  },
+  "autre_racine_minisign": "RWRhdXRyZVJBQ/gMzNzkrhwHriCKKt+ZoxCuQgfgMG+gI2EQsGgnu7jQ",
+  "avertissement": "CLES DE TEST PUBLIQUES. Ne jamais les utiliser hors des tests.",
+  "racine_graine_hex": "5252525252525252525252525252525252525252525252525252525252525252",
+  "racine_id_hex": "74756e6554455354",
+  "racine_minisign": "RWR0dW5lVEVTVCASy5DKYOjl2Nr2biJy0iM+BIbVV+jGYUHtiSAXfX63",
+  "serveur": {
+    "graine_hex": "5656565656565656565656565656565656565656565656565656565656565656",
+    "pk": "iN9VZBNTiwAgFelhmwG9tcxIxyFWRXklY_VGD3MHp2M",
+    "server_id": "6f1c1f5e-2b0a-4c2e-9d3b-7a51c0de0001"
+  },
+  "site": {
+    "graine_hex": "5151515151515151515151515151515151515151515151515151515151515151",
+    "kid": "test-2026-10",
+    "pk": "wFDFY3pE-oYp__PMzOIwDLNipj2Z2V_FQUUmb0MyRFo",
+    "valable_au": 2106345600,
+    "valable_du": 1790812800
+  }
+}

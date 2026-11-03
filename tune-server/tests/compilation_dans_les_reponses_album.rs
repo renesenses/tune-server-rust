@@ -74,6 +74,10 @@ const CLES_SMART_COLLECTION: &[&str] = &[
     "genre",
     "track_count",
     "is_compilation",
+    // web#2206 — les dates de sortie, pour le tri « Date de sortie » de la
+    // collection ouverte.
+    "release_date",
+    "original_date",
 ];
 
 /// Idem pour l'album qu'une playlist intelligente déduit de ses pistes.

@@ -129,6 +129,57 @@ impl ProfilCloud {
     }
 }
 
+/// Les sept thèmes du client web (`V2_THEMES`, `tune-web-client/src/lib/v2Theme.ts`)
+/// que la page de connexion de mozaiklabs.fr sait reproduire. Liste blanche : un
+/// identifiant qui n'y figure pas n'est jamais recopié dans l'URL.
+pub const THEMES_PAGE_CONNEXION: &[&str] = &[
+    "black-green",
+    "black-blue",
+    "midnight-orange",
+    "brown",
+    "dark-grey",
+    "clear-white",
+    "clear-grey",
+];
+
+/// Langue et thème de l'interface Tune demandés pour la page de connexion.
+/// Chaque champ est `None` quand la valeur reçue est absente ou invalide :
+/// une page de connexion garde alors sa langue et sa palette d'origine, sans
+/// que la connexion échoue.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PageConnexion {
+    pub langue: Option<String>,
+    pub theme: Option<String>,
+}
+
+impl PageConnexion {
+    /// Valide les deux valeurs brutes. `langues` est la liste des langues que
+    /// le serveur parle (`i18n::SUPPORTED`) ; l'étiquette est ramenée à sa base
+    /// en minuscules (`fr-FR` → `fr`), et seule cette base — jamais le texte
+    /// reçu — est conservée. Le thème doit être, au caractère près, l'un de
+    /// [`THEMES_PAGE_CONNEXION`].
+    pub fn valider(ui_locales: Option<&str>, theme: Option<&str>, langues: &[&str]) -> Self {
+        let langue = ui_locales
+            .map(|brut| {
+                brut.trim()
+                    .split('-')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+            })
+            .and_then(|base| {
+                langues
+                    .iter()
+                    .find(|l| **l == base)
+                    .map(|l| (*l).to_string())
+            });
+        let theme = theme
+            .and_then(|brut| THEMES_PAGE_CONNEXION.iter().find(|t| **t == brut))
+            .map(|t| (*t).to_string());
+        Self { langue, theme }
+    }
+}
+
 pub struct MozaikAuth {
     pub client_id: String,
     base_url: String,
@@ -150,14 +201,40 @@ impl MozaikAuth {
     /// Public client: no secret is transmitted, only the S256 `code_challenge`
     /// and a CSRF `state`.
     pub fn authorize_url(&self, redirect_uri: &str, challenge: &str, state: &str) -> String {
-        format!(
+        self.authorize_url_avec_page(redirect_uri, challenge, state, &PageConnexion::default())
+    }
+
+    /// [`Self::authorize_url`] + la langue et le thème de l'interface Tune, pour
+    /// que la page de connexion de mozaiklabs.fr s'affiche comme elle
+    /// (`ui_locales` et `theme`, lus par renesenses/site-mozaiklabs#376).
+    ///
+    /// PKCE, `state`, `client_id` et `redirect_uri` sont écrits exactement comme
+    /// avant : la page de connexion n'a pas d'autre effet. Les deux ajouts ne
+    /// viennent que d'un [`PageConnexion`], donc de valeurs déjà validées.
+    pub fn authorize_url_avec_page(
+        &self,
+        redirect_uri: &str,
+        challenge: &str,
+        state: &str,
+        page: &PageConnexion,
+    ) -> String {
+        let mut url = format!(
             "{}/oauth/authorize?client_id={}&redirect_uri={}&response_type=code&code_challenge={}&code_challenge_method=S256&state={}",
             self.base_url,
             urlencoding::encode(&self.client_id),
             urlencoding::encode(redirect_uri),
             urlencoding::encode(challenge),
             urlencoding::encode(state),
-        )
+        );
+        if let Some(langue) = &page.langue {
+            url.push_str("&ui_locales=");
+            url.push_str(&urlencoding::encode(langue));
+        }
+        if let Some(theme) = &page.theme {
+            url.push_str("&theme=");
+            url.push_str(&urlencoding::encode(theme));
+        }
+        url
     }
 
     /// Exchange an authorization code for an access/refresh token pair using
@@ -433,6 +510,84 @@ mod tests {
         assert!(url.contains(&format!("state={}", pkce.state)));
         // No client secret ever leaks into the public authorize request.
         assert!(!url.contains("client_secret"));
+    }
+
+    #[test]
+    fn page_connexion_valeur_valide_recopiee() {
+        let page = PageConnexion::valider(Some("fr"), Some("midnight-orange"), &["fr", "en"]);
+        assert_eq!(page.langue.as_deref(), Some("fr"));
+        assert_eq!(page.theme.as_deref(), Some("midnight-orange"));
+        let auth = MozaikAuth::new("cid".into(), None);
+        let url = auth.authorize_url_avec_page("http://127.0.0.1:8888/cb", "chal", "st", &page);
+        assert!(
+            url.ends_with("&state=st&ui_locales=fr&theme=midnight-orange"),
+            "{url}"
+        );
+    }
+
+    #[test]
+    fn page_connexion_etiquette_regionale_ramenee_a_sa_base() {
+        let page = PageConnexion::valider(Some(" FR-ch "), None, &["fr", "en"]);
+        assert_eq!(page.langue.as_deref(), Some("fr"));
+    }
+
+    #[test]
+    fn page_connexion_sans_parametre_url_inchangee() {
+        let auth = MozaikAuth::new("cid".into(), None);
+        let sans = auth.authorize_url("http://127.0.0.1:8888/cb", "chal", "st");
+        let page = PageConnexion::valider(None, None, &["fr", "en"]);
+        assert_eq!(page, PageConnexion::default());
+        assert_eq!(
+            auth.authorize_url_avec_page("http://127.0.0.1:8888/cb", "chal", "st", &page),
+            sans
+        );
+        assert!(!sans.contains("ui_locales") && !sans.contains("theme"));
+    }
+
+    #[test]
+    fn page_connexion_injection_ignoree() {
+        let auth = MozaikAuth::new("cid".into(), None);
+        let pieges = [
+            ("fr&redirect_uri=https://evil.example", "brown&state=x"),
+            ("fr%26state=x", "brown;}body{display:none"),
+            ("../../etc", "black-green&client_id=autre"),
+            ("fr\r\nLocation: https://evil.example", "Black-Green"),
+            ("xx", "pas-un-theme"),
+            ("", ""),
+        ];
+        for (langue, theme) in pieges {
+            let page = PageConnexion::valider(Some(langue), Some(theme), &["fr", "en"]);
+            assert_eq!(page.theme, None, "thème accepté : {theme:?}");
+            let url = auth.authorize_url_avec_page("http://127.0.0.1:8888/cb", "chal", "st", &page);
+            assert!(!url.contains("evil"), "{url}");
+            assert!(!url.contains("theme="), "{url}");
+            assert_eq!(url.matches("state=").count(), 1, "{url}");
+            assert_eq!(url.matches("client_id=").count(), 1, "{url}");
+        }
+    }
+
+    #[test]
+    fn page_connexion_pkce_et_state_intacts() {
+        let auth = MozaikAuth::new("cid".into(), None);
+        let pkce = PkceSession::generate();
+        let page = PageConnexion::valider(Some("de"), Some("brown"), &["de"]);
+        let url = auth.authorize_url_avec_page(
+            "http://127.0.0.1:9000/cb",
+            &pkce.challenge,
+            &pkce.state,
+            &page,
+        );
+        assert!(url.contains(&format!(
+            "code_challenge={}&code_challenge_method=S256&state={}",
+            pkce.challenge, pkce.state
+        )));
+        assert!(!url.contains("client_secret"));
+    }
+
+    #[test]
+    fn themes_page_connexion_alignes_sur_le_client_web() {
+        assert_eq!(THEMES_PAGE_CONNEXION.len(), 7);
+        assert!(THEMES_PAGE_CONNEXION.contains(&"dark-grey"));
     }
 
     #[test]

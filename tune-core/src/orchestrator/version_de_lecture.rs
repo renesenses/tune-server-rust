@@ -156,15 +156,18 @@ struct Decision {
     version: VersionJouee,
 }
 
+/// Cache daté d'un service, par (service, clé).
+type CacheDuService<V> = Arc<std::sync::Mutex<HashMap<(String, String), (Instant, V)>>>;
+
 /// La mémoire de la règle de version : les choix explicites en attente et
 /// les réponses des services. Verrous std : jamais tenus à travers un await.
 #[derive(Default)]
 pub(crate) struct EtatDesVersions {
     epingles: std::sync::Mutex<HashMap<i64, (Identite, Instant)>>,
     /// (service, requête) → pistes rendues.
-    recherches: Arc<std::sync::Mutex<HashMap<(String, String), (Instant, Vec<StreamTrack>)>>>,
+    recherches: CacheDuService<Vec<StreamTrack>>,
     /// (service, identifiant) → la fiche de la piste demandée.
-    fiches: Arc<std::sync::Mutex<HashMap<(String, String), (Instant, Option<StreamTrack>)>>>,
+    fiches: CacheDuService<Option<StreamTrack>>,
 }
 
 fn lire_cache<K: std::hash::Hash + Eq, V: Clone>(

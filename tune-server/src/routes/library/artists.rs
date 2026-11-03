@@ -6,11 +6,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::state::AppState;
+use tune_core::cloud::ecoutes_communaute::{self, Genre};
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
 
-use super::{Pagination, api_cache_get, api_cache_set, artwork_cache_dir, now_iso_utc};
+use super::{api_cache_get, api_cache_set, artwork_cache_dir, now_iso_utc};
 
 #[derive(Deserialize)]
 pub(super) struct LangQuery {
@@ -41,39 +42,71 @@ pub(crate) struct ArtisteVue {
 /// l'écran de fusion (C3). Rien n'est fusionné : les homonymes existent, et
 /// deux fiches aux MBID différents sont peut-être deux artistes — le rapport
 /// le dit (`mbid_distincts`). Le plus ancien d'abord dans chaque groupe.
+///
+/// #7535 — s'y ajoutent les fiches qui portent le MÊME MBID sous deux noms
+/// de clés différentes (« Phil Selway » / « Philip Selway », un MBID trouvé
+/// par le nom avant que [`ArtistRepo::poser_mbid`] ne le refuse) : groupe de
+/// clé `mbid:<MBID>`, `motif` `mbid`. Un MBID partagé par des fiches d'une
+/// seule clé est déjà dans le groupe de graphie (`motif` `graphie`). Rien
+/// n'est fusionné : l'utilisateur tranche par la même route d'absorption.
 pub(crate) fn grouper_les_artistes_homographes(artistes: &[ArtisteVue]) -> Vec<Value> {
     use std::collections::{BTreeMap, BTreeSet};
+    use tune_core::db::artist_repo::cle_artiste;
+    fn groupe(cle: String, motif: &str, mut v: Vec<&ArtisteVue>) -> Value {
+        v.sort_by_key(|a| a.id);
+        let mbids: BTreeSet<String> = v
+            .iter()
+            .filter_map(|a| a.musicbrainz_id.as_deref())
+            .map(|m| m.trim().to_lowercase())
+            .filter(|m| !m.is_empty())
+            .collect();
+        json!({
+            "cle": cle,
+            "motif": motif,
+            "mbid_distincts": mbids.len() > 1,
+            "albums": v.iter().map(|a| a.albums).sum::<i64>(),
+            "artistes": v.iter().map(|a| json!({
+                "id": a.id,
+                "name": a.name,
+                "musicbrainz_id": a.musicbrainz_id,
+                "albums": a.albums,
+            })).collect::<Vec<_>>(),
+        })
+    }
     let mut par_cle: BTreeMap<String, Vec<&ArtisteVue>> = BTreeMap::new();
+    let mut par_mbid: BTreeMap<String, Vec<&ArtisteVue>> = BTreeMap::new();
     for a in artistes {
-        let cle = tune_core::db::artist_repo::cle_artiste(&a.name);
+        let cle = cle_artiste(&a.name);
         if cle.is_empty() {
             continue;
         }
         par_cle.entry(cle).or_default().push(a);
+        if let Some(m) = a
+            .musicbrainz_id
+            .as_deref()
+            .map(|m| m.trim().to_lowercase())
+            .filter(|m| !m.is_empty())
+        {
+            par_mbid.entry(m).or_default().push(a);
+        }
     }
     let mut groupes: Vec<Value> = par_cle
         .into_iter()
         .filter(|(_, v)| v.len() >= 2)
-        .map(|(cle, mut v)| {
-            v.sort_by_key(|a| a.id);
-            let mbids: BTreeSet<&str> = v
-                .iter()
-                .filter_map(|a| a.musicbrainz_id.as_deref())
-                .filter(|m| !m.trim().is_empty())
-                .collect();
-            json!({
-                "cle": cle,
-                "mbid_distincts": mbids.len() > 1,
-                "albums": v.iter().map(|a| a.albums).sum::<i64>(),
-                "artistes": v.iter().map(|a| json!({
-                    "id": a.id,
-                    "name": a.name,
-                    "musicbrainz_id": a.musicbrainz_id,
-                    "albums": a.albums,
-                })).collect::<Vec<_>>(),
-            })
-        })
+        .map(|(cle, v)| groupe(cle, "graphie", v))
         .collect();
+    groupes.extend(
+        par_mbid
+            .into_iter()
+            .filter(|(_, v)| {
+                v.iter()
+                    .map(|a| cle_artiste(&a.name))
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    >= 2
+            })
+            .map(|(mbid, v)| groupe(format!("mbid:{mbid}"), "mbid", v)),
+    );
     // Les plus sûrs d'abord (MBID non contradictoires), puis les plus fournis.
     groupes.sort_by(|x, y| {
         let sx = (
@@ -94,7 +127,7 @@ pub(crate) fn grouper_les_artistes_homographes(artistes: &[ArtisteVue]) -> Vec<V
 ///
 /// La phase 0 (`GET /library/artists/doublons`) nomme les groupes de même
 /// clé (`cle_artiste`). Ici l'utilisateur tranche, un couple à la fois, et le
-/// serveur vérifie : même clé, pas deux MBID différents (le drapeau
+/// serveur vérifie : même clé (ou, #7535, même MBID), pas deux MBID différents (le drapeau
 /// `mbid_distincts` de la phase 0), aucun des deux n'est l'artiste inconnu.
 /// Le survivant est celui que l'URL nomme `cible` — l'écran propose le plus
 /// ancien, comme la liste de la phase 0. Rien n'est automatique.
@@ -131,7 +164,22 @@ pub(super) async fn absorber_artiste(
                 .to_string(),
         );
     }
-    if cle_artiste(&artiste_cible.name) != cle_artiste(&artiste_doublon.name) {
+    // #7535 — deux noms de clés différentes passent s'ils portent le MÊME
+    // MBID (le groupe `mbid:` de la liste) : l'utilisateur l'a vu et tranche.
+    let meme_mbid = |a: &Option<String>, b: &Option<String>| {
+        let n = |m: &Option<String>| {
+            m.as_deref()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+        };
+        n(a).is_some() && n(a) == n(b)
+    };
+    if cle_artiste(&artiste_cible.name) != cle_artiste(&artiste_doublon.name)
+        && !meme_mbid(
+            &artiste_cible.musicbrainz_id,
+            &artiste_doublon.musicbrainz_id,
+        )
+    {
         return super::refus(
             StatusCode::CONFLICT,
             "cles_differentes",
@@ -205,13 +253,65 @@ pub(super) async fn artists_doublons(State(state): State<AppState>) -> Json<Valu
     }))
 }
 
+/// `GET /library/artists` : la pagination, et `provenances=1` (tune-web-client#1716).
+#[derive(Deserialize)]
+pub(super) struct ArtistsQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    /// `1` / `true` : chaque artiste porte `provenances`, ses albums et pistes
+    /// visibles par clé de provenance. Absent : la réponse d'avant, au
+    /// caractère près, et aucune requête de plus.
+    provenances: Option<String>,
+}
+
+fn veut_les_sources(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "true"))
+}
+
+/// Pose `provenances` sur chaque artiste de la page — tune-web-client#1716.
+///
+/// L'onglet Artistes chargeait toute la bibliothèque (pistes ET albums) pour
+/// calculer ces sources dans le navigateur. Elles viennent maintenant d'ici,
+/// pour la page seulement. Un artiste sans album ni piste visible reçoit `{}` :
+/// le client le lit comme « aucune source », comme avant.
+fn joindre_les_sources(
+    items: &mut [Value],
+    sources: &tune_core::db::artist_repo::SourcesDesArtistes,
+) {
+    for item in items {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let id = obj.get("id").and_then(Value::as_i64);
+        let s = id.and_then(|id| sources.get(&id));
+        obj.insert("provenances".into(), json!(s.cloned().unwrap_or_default()));
+    }
+}
+
 pub(super) async fn list_artists(
     State(state): State<AppState>,
-    Query(p): Query<Pagination>,
+    Query(p): Query<ArtistsQuery>,
 ) -> Json<Value> {
-    let repo = ArtistRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
+    // Les lectures sont synchrones (rusqlite) : hors de l'exécuteur, comme
+    // `GET /library/tracks` (#5138). Les sources parcourent les pistes.
+    let avec_sources = veut_les_sources(p.provenances.as_deref());
+    match tokio::task::spawn_blocking(move || {
+        lire_la_page_d_artistes(&state, limit, offset, avec_sources)
+    })
+    .await
+    {
+        Ok(corps) => Json(corps),
+        Err(e) => {
+            tracing::error!(error = %e, "list_artists_tache_bloquante_perdue");
+            Json(json!({"items": [], "total": 0, "limit": limit, "offset": offset}))
+        }
+    }
+}
+
+fn lire_la_page_d_artistes(state: &AppState, limit: i64, offset: i64, avec_sources: bool) -> Value {
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let total = repo.count().unwrap_or(0);
     let items = match repo.list(limit, offset) {
         Ok(artists) => artists,
@@ -226,7 +326,22 @@ pub(super) async fn list_artists(
             Vec::new()
         }
     };
-    Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
+    if !avec_sources {
+        return json!({"items": items, "total": total, "limit": limit, "offset": offset});
+    }
+    let ids: Vec<i64> = items.iter().filter_map(|a| a.id).collect();
+    // Un échec ne pose PAS `provenances` : un `{}` dirait « aucune source » à
+    // tort, alors que son absence fait retomber le client sur son calcul.
+    let sources = match repo.sources_des_artistes(&ids) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "list_artists_sources_query_failed");
+            return json!({"items": items, "total": total, "limit": limit, "offset": offset});
+        }
+    };
+    let mut items: Vec<Value> = items.iter().map(|a| json!(a)).collect();
+    joindre_les_sources(&mut items, &sources);
+    json!({"items": items, "total": total, "limit": limit, "offset": offset})
 }
 
 pub(super) async fn get_artist(
@@ -240,6 +355,24 @@ pub(super) async fn get_artist(
             if let (Some(obj), Ok(Some(prov))) = (j.as_object_mut(), repo.bio_provenance(id)) {
                 obj.insert("bio_provenance".into(), prov);
             }
+            // #6463 — d'où vient le MBID (`balise`, `nom`, `pressage`,
+            // `manuel`, ou null : inconnu). La fiche s'en sert pour proposer
+            // « Détacher l'identité » et dire qu'elle a été détachée.
+            if let Some(obj) = j.as_object_mut() {
+                let provenance = repo.provenance_du_mbid(id).ok().flatten();
+                obj.insert(
+                    "musicbrainz_id_source".into(),
+                    json!(provenance.map(|p| p.as_str())),
+                );
+            }
+            // #6738 — le total des écoutes de la communauté, absent sous le seuil.
+            ecoutes_communaute::annoter_un(
+                &state.backend,
+                &state.http_client,
+                Genre::Artiste,
+                &mut j,
+            )
+            .await;
             Json(j).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -442,6 +575,82 @@ fn repli_sur_la_bio_stockee(
     }
 }
 
+// ── #6555 — les similaires d'un artiste de la BIBLIOTHÈQUE (fil 2341) ──────
+//
+// Bilou : « lorsque on sélectionne un artiste et que l'on clique sur un des
+// choix d'artistes similaires […] il faut remonter à l'artiste initial puis
+// redescendre ». La fiche d'un artiste de la bibliothèque lit ses
+// similaires (« À propos ») par `GET /library/artists/{id}/metadata`. Cette
+// route, et sa sœur `/similar`, interrogeaient `https://mozaiklabs.fr/api/
+// {mbid}` : une adresse MORTE (404), le cloud vit sous `/api/v1/artists`.
+// Elles retombaient sur la fiche locale, SANS similaires. La fiche n'en
+// montrait donc qu'après « Enrichir » (Last.fm), en mémoire seulement : ouvrir
+// un voisin rechargeait la fiche, et ses propres similaires n'y étaient pas.
+//
+// Même correction que #1730 pour `/metadata/artists/{id}/similar` : le
+// client du cloud (`ArtistEnrichmentClient`), qui porte l'adresse de
+// référence et lit le réglage `artist_enrichment_api` ; et, pour un artiste
+// sans MBID (neuf sur dix en bibliothèque), la résolution EXACTE par le nom.
+
+/// Délai du cloud pour une fiche : elle charge ses similaires sans bloquer
+/// la discographie, mais une fiche ouverte ne doit pas attendre une minute.
+const DELAI_CLOUD_FICHE_SECS: u64 = 10;
+
+pub(super) fn client_cloud(
+    state: &AppState,
+) -> tune_core::metadata::artist_enrichment::ArtistEnrichmentClient {
+    let base = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get("artist_enrichment_api")
+        .ok()
+        .flatten();
+    tune_core::metadata::artist_enrichment::ArtistEnrichmentClient::new(
+        base.as_deref(),
+        DELAI_CLOUD_FICHE_SECS,
+    )
+}
+
+/// Le MBID sous lequel le cloud connaît l'artiste : le sien, ou celui que la
+/// recherche EXACTE par le nom rend. La résolution est gardée 24 h, un échec
+/// aussi : une fiche ouverte dix fois ne coûte qu'une recherche.
+pub(super) async fn mbid_cloud(
+    state: &AppState,
+    client: &mut tune_core::metadata::artist_enrichment::ArtistEnrichmentClient,
+    artiste: &tune_core::db::models::Artist,
+) -> Option<String> {
+    if let Some(m) = artiste
+        .musicbrainz_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        return Some(m.to_string());
+    }
+    // #6463 — une identité détachée par l'utilisateur ne se retrouve pas par
+    // le nom : la fiche du cloud serait celle de l'homonyme qu'il a écarté.
+    if let Some(id) = artiste.id
+        && ArtistRepo::with_backend(state.backend.clone())
+            .identite_detachee(id)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let cle = format!("cache:meta-nom:{}", artiste.name.trim().to_lowercase());
+    if let Some(v) = api_cache_get(&state.backend, &cle)
+        && v.is_object()
+    {
+        return v.get("mbid").and_then(|m| m.as_str()).map(str::to_owned);
+    }
+    let trouve = client.resolve_mbid(&artiste.name).await;
+    api_cache_set(&state.backend, &cle, &json!({ "mbid": trouve }));
+    trouve
+}
+
+/// Une fiche du cloud digne de ce nom : `{"data": {…}}`. Un `{}` (ancienne
+/// réponse illisible gardée en cache) n'en est pas une.
+fn fiche_cloud_valide(v: &Value) -> bool {
+    v.get("data").is_some_and(|d| d.is_object())
+}
+
 pub(super) async fn artist_similar(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -451,26 +660,24 @@ pub(super) async fn artist_similar(
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(ref mbid) = artist.musicbrainz_id else {
+    let mut client = client_cloud(&state);
+    let Some(mbid) = mbid_cloud(&state, &mut client, &artist).await else {
         return Json(json!({"artist": artist.name, "artists": []})).into_response();
     };
     let cache_key = format!("cache:similar:{mbid}");
-    if let Some(cached) = api_cache_get(&state.backend, &cache_key) {
+    if let Some(cached) = api_cache_get(&state.backend, &cache_key)
+        && cached
+            .get("artists")
+            .is_some_and(|a| a.as_array().is_some_and(|a| !a.is_empty()))
+    {
         return Json(cached).into_response();
     }
-    match state
-        .http_client
-        .get(format!("https://mozaiklabs.fr/api/{mbid}/similar"))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            let data: Value = resp.json().await.unwrap_or(json!({}));
-            api_cache_set(&state.backend, &cache_key, &data);
-            Json(data).into_response()
-        }
-        _ => Json(json!({"mbid": mbid, "artists": []})).into_response(),
+    let voisins = client.get_similar(&mbid).await;
+    let data = json!({"artist": artist.name, "mbid": mbid, "artists": voisins});
+    if !voisins.is_empty() {
+        api_cache_set(&state.backend, &cache_key, &data);
     }
+    Json(data).into_response()
 }
 
 pub(super) async fn artist_metadata(
@@ -482,27 +689,28 @@ pub(super) async fn artist_metadata(
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(ref mbid) = artist.musicbrainz_id else {
+    let mut client = client_cloud(&state);
+    let Some(mbid) = mbid_cloud(&state, &mut client, &artist).await else {
         return Json(json!(artist)).into_response();
     };
     let cache_key = format!("cache:meta:{mbid}");
-    if let Some(cached) = api_cache_get(&state.backend, &cache_key) {
+    if let Some(cached) = api_cache_get(&state.backend, &cache_key)
+        && fiche_cloud_valide(&cached)
+    {
         return Json(cached).into_response();
     }
-    match state
-        .http_client
-        .get(format!("https://mozaiklabs.fr/api/{mbid}"))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            let data: Value = resp.json().await.unwrap_or(json!({}));
-            api_cache_set(&state.backend, &cache_key, &data);
-            Json(data).into_response()
+    match client.get_artist(&mbid).await {
+        Some(fiche) if fiche_cloud_valide(&fiche.fields) => {
+            api_cache_set(&state.backend, &cache_key, &fiche.fields);
+            Json(fiche.fields).into_response()
         }
         _ => Json(json!(artist)).into_response(),
     }
 }
+
+#[cfg(test)]
+#[path = "similaires_en_chaine_tests_6555.rs"]
+mod similaires_en_chaine_tests_6555;
 
 /// Paramètres de `GET /library/artists/{id}/albums`.
 #[derive(Deserialize)]
@@ -513,6 +721,8 @@ pub(super) struct ArtistAlbumsQuery {
     /// forme pour tout le monde casserait ce qui marche.
     sections: Option<String>,
 }
+
+use tune_core::metadata::release_type;
 
 pub(super) async fn artist_albums(
     State(state): State<AppState>,
@@ -550,12 +760,27 @@ pub(super) async fn artist_albums(
                     o.insert("release_secondary_types".into(), json!(types));
                 }
             }
-            (
-                types.is_some_and(|t| tune_core::metadata::release_type::est_live(t)),
-                v,
-            )
+            // #6464 — règle PROVISOIRE par le titre (« Live », « unplugged »),
+            // seulement quand aucun type secondaire n'est connu : une réponse
+            // explicite (`live` ou non) n'est jamais contredite par le titre.
+            let par_le_type = types.is_some_and(|t| release_type::est_live(t));
+            let par_le_titre = types.is_none() && release_type::titre_annonce_un_live(&a.title);
+            if par_le_titre && let Some(o) = v.as_object_mut() {
+                o.insert("live_by_title".into(), json!(true));
+            }
+            (par_le_type || par_le_titre, v)
         })
         .collect();
+    // #6738 — les écoutes de la communauté de chaque album de la fiche.
+    let (lives, mut valeurs): (Vec<bool>, Vec<Value>) = items.into_iter().unzip();
+    ecoutes_communaute::annoter(
+        &state.backend,
+        &state.http_client,
+        Genre::Album,
+        &mut valeurs,
+    )
+    .await;
+    let items: Vec<(bool, Value)> = lives.into_iter().zip(valeurs).collect();
 
     // Même lecture du drapeau que `proposals.rs` et `reports.rs`.
     if !q
@@ -712,6 +937,8 @@ pub(super) async fn artist_tracks(
     // Passer par `Vec<Value>` lui donne au passage `channel_badge` (additif).
     let mut items: Vec<Value> = items.iter().map(|t| t.to_json()).collect();
     super::albums::attacher_banni(&state, profile.id(), &mut items);
+    // #6738 — « So What (128) » : les écoutes de la communauté.
+    ecoutes_communaute::annoter(&state.backend, &state.http_client, Genre::Piste, &mut items).await;
     Json(json!(items))
 }
 
@@ -957,6 +1184,113 @@ pub(super) struct ArtistUpdate {
     musicbrainz_id: Option<String>,
 }
 
+/// Un MBID vide ou réduit à des espaces n'en est pas un.
+fn mbid_utilisable(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+}
+
+/// `POST /library/artists/{id}/detacher-identite` — « Détacher l'identité »
+/// (#6463, décision de Bertrand du 23/10).
+///
+/// « Ange » (fil 2394) portait le MBID d'une chanteuse homonyme, et avec lui
+/// son portrait. Le geste retire le MBID, marque la provenance `manuel`
+/// (détachée par l'utilisateur : aucune passe automatique — scan, recherche
+/// par le nom, pressage, enrichissement — ne le réattache), efface le
+/// portrait et la bio que ce MBID avait rapportés, et relance la recherche
+/// d'image de CET artiste quand son portrait est parti (même garde que le
+/// bouton « Enrichir les images d'artistes » : Premium ou quota du jour).
+///
+/// Pour lui redonner une identité : `PUT /library/artists/{id}` avec un
+/// `musicbrainz_id` (provenance `manuel` aussi).
+pub(super) async fn detacher_identite(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = ArtistRepo::with_backend(state.backend.clone());
+    let artiste = match repo.get(id) {
+        Ok(Some(a)) => a,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let mbid_retire = mbid_utilisable(artiste.musicbrainz_id.as_deref());
+    if let Err(e) = repo.poser_mbid_manuel(id, None) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let (image_effacee, bio_effacee) = if mbid_retire.is_some() {
+        match repo.oublier_ce_que_le_mbid_a_apporte(id) {
+            Ok(effacees) => effacees,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        (false, false)
+    };
+    tracing::info!(
+        artist_id = id,
+        artist = %artiste.name,
+        mbid = mbid_retire.as_deref().unwrap_or(""),
+        image_effacee,
+        bio_effacee,
+        "artiste_identite_detachee"
+    );
+
+    let enrichissement_image = if !image_effacee {
+        "inutile"
+    } else {
+        match crate::routes::system::gate_enrichment(&state).await {
+            Ok(_) => {
+                let db = state.backend.clone();
+                let portee = tune_core::metadata::enrich_scope::EnrichScope {
+                    dir: format!("artiste:{id}"),
+                    album_ids: Default::default(),
+                    artist_ids: [id].into_iter().collect(),
+                    track_count: 0,
+                };
+                tokio::spawn(async move {
+                    tune_core::library::artwork::batch_enrich_artist_artwork_scoped(
+                        db,
+                        artwork_cache_dir(),
+                        Some(portee),
+                    )
+                    .await;
+                });
+                "lance"
+            }
+            Err(_) => "refuse",
+        }
+    };
+
+    let mut corps = match repo.get(id) {
+        Ok(Some(a)) => json!(a),
+        _ => json!({"id": id}),
+    };
+    if let Some(obj) = corps.as_object_mut() {
+        obj.insert("musicbrainz_id_source".into(), json!("manuel"));
+        obj.insert("mbid_retire".into(), json!(mbid_retire));
+        obj.insert("image_effacee".into(), json!(image_effacee));
+        obj.insert("bio_effacee".into(), json!(bio_effacee));
+        obj.insert("enrichissement_image".into(), json!(enrichissement_image));
+    }
+    Json(corps).into_response()
+}
+
 pub(super) async fn update_artist(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -986,8 +1320,17 @@ pub(super) async fn update_artist(
     if let Some(ref v) = body.bio {
         artist.bio = if v.is_empty() { None } else { Some(v.clone()) };
     }
-    if let Some(ref v) = body.musicbrainz_id {
-        artist.musicbrainz_id = if v.is_empty() { None } else { Some(v.clone()) };
+    // #6463 — un MBID saisi, ou effacé, est une décision de l'utilisateur :
+    // provenance `manuel`. Seulement s'il CHANGE : renvoyer le même MBID avec
+    // un autre champ ne fige pas une provenance `nom` à vérifier.
+    let mbid_avant = mbid_utilisable(artist.musicbrainz_id.as_deref());
+    let mbid_saisi = body
+        .musicbrainz_id
+        .as_deref()
+        .map(|v| mbid_utilisable(Some(v)))
+        .filter(|nouveau| *nouveau != mbid_avant);
+    if let Some(ref nouveau) = mbid_saisi {
+        artist.musicbrainz_id = nouveau.clone();
     }
 
     if let Err(e) = repo.update(&artist) {
@@ -996,6 +1339,21 @@ pub(super) async fn update_artist(
             Json(json!({"error": format!("update failed: {e}")})),
         )
             .into_response();
+    }
+    if let Some(ref nouveau) = mbid_saisi {
+        if let Err(e) = repo.poser_mbid_manuel(id, nouveau.as_deref()) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("update failed: {e}")})),
+            )
+                .into_response();
+        }
+        // Le portrait et la bio de l'ANCIEN MBID ne décrivent plus l'artiste.
+        if mbid_avant.is_some()
+            && let Err(e) = repo.oublier_ce_que_le_mbid_a_apporte(id)
+        {
+            tracing::warn!(artist_id = id, error = %e, "artist_mbid_images_bio_oubli_echec");
+        }
     }
     if let Err(e) =
         repo.oublier_provenance_si_bio_reecrite(id, bio_avant.as_deref(), artist.bio.as_deref())
@@ -1475,8 +1833,40 @@ mod tests_artistes_homographes {
             })
             .collect();
         assert!(!ids.contains(&60) && !ids.contains(&70));
+        assert!(g.iter().all(|x| x["motif"] == "graphie"));
+    }
+
+    /// #7535 : deux noms de clés différentes qui portent le même MBID
+    /// (casse et blancs à part) forment un groupe `mbid:`, proposé à la
+    /// fusion. Contre-épreuves : deux MBID différents ne groupent rien, et
+    /// un MBID partagé sous UNE clé reste dans son seul groupe de graphie.
+    #[test]
+    fn deux_noms_d_un_meme_mbid_sont_proposes_7535() {
+        let artistes = vec![
+            a(7, "Philip Selway", Some("mb-selway"), 16),
+            a(90, "Phil Selway", Some(" MB-SELWAY "), 1),
+            a(20, "Thom Yorke", Some("mb-yorke"), 5),
+            a(21, "Thomas Yorke", Some("mb-autre"), 1),
+            a(30, "Ayo", Some("mb-ayo"), 2),
+            a(31, "Ayọ", Some("mb-ayo"), 1),
+        ];
+        let g = grouper_les_artistes_homographes(&artistes);
+        assert_eq!(g.len(), 2, "{g:#?}");
+        let selway: Vec<&serde_json::Value> = g.iter().filter(|x| x["motif"] == "mbid").collect();
+        assert_eq!(selway.len(), 1, "{g:#?}");
+        assert_eq!(selway[0]["cle"], "mbid:mb-selway");
+        assert_eq!(selway[0]["mbid_distincts"], false);
+        assert_eq!(selway[0]["artistes"][0]["id"], 7, "le plus ancien d'abord");
+        assert_eq!(selway[0]["artistes"][1]["id"], 90);
+        let ayo: Vec<&serde_json::Value> = g.iter().filter(|x| x["cle"] == "ayo").collect();
+        assert_eq!(ayo.len(), 1);
+        assert_eq!(ayo[0]["motif"], "graphie");
     }
 }
 
 #[cfg(test)]
 mod tests_absorption;
+
+#[cfg(test)]
+#[path = "identite_artiste_tests_6463.rs"]
+mod identite_artiste_tests_6463;

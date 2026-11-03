@@ -33,8 +33,17 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_session_gc(state);
     spawn_dash_temp_gc();
     spawn_position_poller(state);
+    // #6155 — les zones d'un groupe suivent sa meneuse (lecture, pause,
+    // reprise, arrêt). Un test de câblage garde la ligne.
+    crate::routes::zones::relais_de_groupe_6155::lancer_le_relais_de_groupe(state);
     spawn_token_refresher(state);
     spawn_tune_tested_refresher(state);
+    // #6285 — la passe des faux hi-res. Elle DORT tant que son réglage n'est
+    // pas armé (`analyse_faux_hires_active`), et sinon cède à la pause, à la
+    // chaleur, à la lecture et au créneau unique des analyses.
+    tokio::spawn(tune_core::audio::faux_hires_passe::courir(
+        state.backend.clone(),
+    ));
     spawn_upnp_advertiser(state, config).await;
     // Renderers UPnP par zone (#1750) : annonceur propre, relu à chaque
     // cycle — l'opt-in d'une zone prend effet sans redémarrage.
@@ -50,13 +59,23 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_telemetry_reporter(state);
     spawn_heartbeat(state);
     spawn_bio_sync(state);
+    spawn_verification_mbid_artistes(state);
     spawn_reprise_favoris_streaming(state);
     spawn_veille_favoris_miroir(state);
+    // #6682 — « Mon écoute » : le temps d'écoute radio par station, mesuré
+    // sur ce qui JOUE, quel que soit le chemin qui a lancé la station.
+    tokio::spawn(tune_core::db::radio_ecoute::veille(
+        state.backend.clone(),
+        state.playback.clone(),
+    ));
     // CRD-5 : passe automatique des crédits, bornée par tour et reprenable par
     // curseur, derrière le même droit premium que les biographies. Une garde
     // dans `credits.rs` tient cette ligne : l'ordonnanceur de scan a été du
     // code mort pendant des mois pour une ligne comme celle-ci.
     crate::routes::library::credits::spawn_passe_automatique_credits(state);
+    // #4805 (13/10/2026) — la passe de nuit des albums refusés par
+    // MusicBrainz. Éteinte par défaut ; un test de câblage garde la ligne.
+    crate::routes::library::identification_lot::nuit::spawn_passe_de_nuit(state);
     spawn_community_sync(state);
     spawn_replaygain_analysis(state);
     spawn_lyrics_catchup(state);
@@ -64,10 +83,24 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_audio_embedding(state);
     spawn_radio_logo_refresh(state);
     spawn_rattrapage_vignettes_podcasts(state);
+    // #7064 — les labels déjà en base qui sont des lignes de copyright.
+    spawn_normalisation_des_labels(state);
     spawn_cloud_library_sync(state);
     // Sauvegarde cloud automatique des personnalisations (#5654). Un test de
     // câblage garde la ligne.
     crate::routes::system::sauvegarde_cloud::spawn(state);
+    // « Mes écoutes, tous serveurs » (#6510) : l'envoi des écoutes au compte,
+    // opt-in et désactivé par défaut. Un test de câblage garde la ligne.
+    tune_core::cloud::ecoutes_au_compte::spawn(state.backend.clone(), state.http_client.clone());
+    // Notes et écoutes de la communauté (#6545) : consentement séparé,
+    // désactivé par défaut. Un test de câblage garde la ligne.
+    tune_core::cloud::notes_communautaires::spawn(state.backend.clone(), state.http_client.clone());
+    // Résultats d'analyse de la communauté (#5594) : recevoir et contribuer,
+    // deux options désactivées par défaut. Un test de câblage garde la ligne.
+    tune_core::cloud::mesures_communautaires::spawn(
+        state.backend.clone(),
+        state.http_client.clone(),
+    );
     spawn_local_audio_rescan(state);
     // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
     // `spawn_scan_scheduler` était du code mort, la bascule des clients écrivait
@@ -110,6 +143,10 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     );
     spawn_mp3_duration_repair(state);
     spawn_rattrapage_genres_d_album(state);
+    // #6773 — noms de tri des artistes : rattrapage MusicBrainz des fiches
+    // déjà identifiées, puis déduction « Nom, Prénom ». Un test de câblage
+    // garde la ligne.
+    spawn_rattrapage_noms_de_tri(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config);
     spawn_social_sharing_listener(state);
@@ -118,6 +155,51 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_oaat_stall_supervisor(state);
     #[cfg(feature = "cloud-relay")]
     spawn_relay_client(state).await;
+    #[cfg(feature = "ecoute-directe")]
+    spawn_ecoute_directe(state).await;
+}
+
+/// Le droit Premium de l'écoute à distance, relu à CHAQUE ouverture de
+/// session directe : le même droit que celui qui lance le client du relais
+/// (`Feature::CloudRelay`).
+#[cfg(feature = "ecoute-directe")]
+struct DroitsParLicence(std::sync::Arc<tune_core::license::LicenseManager>);
+
+#[cfg(feature = "ecoute-directe")]
+#[async_trait::async_trait]
+impl tune_core::cloud::ecoute_directe::DroitsDirect for DroitsParLicence {
+    async fn ecoute_distante_permise(&self) -> bool {
+        self.0
+            .check_feature(tune_core::license::Feature::CloudRelay)
+            .await
+    }
+}
+
+/// #6785 — point d'écoute direct (pair-à-pair), ÉTEINT par défaut : rien
+/// n'écoute tant que `TUNE_ECOUTE_DIRECTE` ou le réglage
+/// `ecoute_directe_active` ne l'allume pas, et jamais sans le droit Premium
+/// de l'écoute à distance.
+#[cfg(feature = "ecoute-directe")]
+async fn spawn_ecoute_directe(state: &AppState) {
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    if !tune_core::cloud::ecoute_directe::active(&reglages) {
+        info!("ecoute_directe_desactivee");
+        return;
+    }
+    if !state
+        .license
+        .check_feature(tune_core::license::Feature::CloudRelay)
+        .await
+    {
+        info!("ecoute_directe_requiert_premium");
+        return;
+    }
+    let droits = std::sync::Arc::new(DroitsParLicence(state.license.clone()));
+    if let Err(e) =
+        tune_core::cloud::ecoute_directe::lancer(state.backend.clone(), state.port, droits).await
+    {
+        warn!(erreur = %e, "ecoute_directe_non_lancee");
+    }
 }
 
 /// Supervise OAAT zones and recover a stalled one with a stop+play restart.
@@ -205,6 +287,109 @@ fn spawn_rattrapage_genres_d_album(state: &AppState) {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         if let Err(e) = tune_core::db::genre_album_pistes::rattraper_les_genres_tenus(&backend) {
             warn!(error = %e, "rattrapage_genres_tenus_5314_echoue");
+        }
+    });
+}
+
+/// #6773 — le réglage qui marque le rattrapage MusicBrainz des noms de tri
+/// comme fini, et son curseur de reprise.
+const RATTRAPAGE_NOMS_DE_TRI_FAIT: &str = "rattrapage_noms_de_tri_6773_fait";
+const RATTRAPAGE_NOMS_DE_TRI_CURSEUR: &str = "rattrapage_noms_de_tri_6773_curseur";
+/// Fiches par tour : au créneau d'une requête par seconde, un peu plus d'une
+/// minute de MusicBrainz, puis la main aux autres passes.
+const RATTRAPAGE_NOMS_DE_TRI_PAR_TOUR: usize = 60;
+
+/// #6773 — les noms de tri des artistes qui n'en ont pas.
+///
+/// 1. La DÉDUCTION « Nom, Prénom » (sans réseau) pour les artistes sans MBID
+///    ni nom de tri, à chaque démarrage : une requête sur une base déjà
+///    rattrapée.
+/// 2. Le RATTRAPAGE MusicBrainz, UNE fois : les artistes déjà identifiés
+///    (MBID connu) avant que l'identification pose le nom de tri. Mêmes
+///    gardes que la passe automatique des crédits : droit d'enrichissement
+///    automatique, pause « Enrichissement », limiteur MusicBrainz partagé.
+///    Curseur en base : un arrêt ou une panne reprend où il s'était arrêté.
+fn spawn_rattrapage_noms_de_tri(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        let backend = state.backend.clone();
+        let deduction = backend.clone();
+        match tokio::task::spawn_blocking(move || {
+            tune_core::metadata::noms_de_tri::deduire_les_noms_de_tri(&deduction)
+        })
+        .await
+        {
+            Ok(Err(e)) => warn!(error = %e, "noms_de_tri_deduction_echouee"),
+            Err(e) => warn!(error = %e, "noms_de_tri_deduction_echouee"),
+            Ok(Ok(_)) => {}
+        }
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+        if reglages
+            .get(RATTRAPAGE_NOMS_DE_TRI_FAIT)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        loop {
+            if !state
+                .license
+                .check_feature(tune_core::license::Feature::AutoEnrichment)
+                .await
+            {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                continue;
+            }
+            if tune_core::taches_de_fond::est_en_pause(
+                tune_core::taches_de_fond::Tache::Enrichissement,
+            ) {
+                tokio::time::sleep(tune_core::taches_de_fond::CADENCE_RELECTURE_PAUSE).await;
+                continue;
+            }
+            let apres = reglages
+                .get(RATTRAPAGE_NOMS_DE_TRI_CURSEUR)
+                .ok()
+                .flatten()
+                .and_then(|c| c.parse::<i64>().ok())
+                .unwrap_or(0);
+            let bilan = match tune_core::metadata::noms_de_tri::rattraper_par_musicbrainz(
+                &backend,
+                apres,
+                RATTRAPAGE_NOMS_DE_TRI_PAR_TOUR,
+                tune_core::metadata::noms_de_tri::interroger_la_fiche_musicbrainz,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "noms_de_tri_rattrapage_echoue");
+                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                    continue;
+                }
+            };
+            info!(
+                traitees = bilan.traitees,
+                poses = bilan.poses,
+                ecartees = bilan.ecartees,
+                pannes = bilan.pannes,
+                fin_de_liste = bilan.fin_de_liste,
+                "noms_de_tri_rattrapage_tour"
+            );
+            reglages
+                .set(
+                    RATTRAPAGE_NOMS_DE_TRI_CURSEUR,
+                    &bilan.dernier_id.to_string(),
+                )
+                .ok();
+            if bilan.fin_de_liste {
+                reglages.set(RATTRAPAGE_NOMS_DE_TRI_FAIT, "1").ok();
+                return;
+            }
+            // Une panne MusicBrainz : on laisse le limiteur se calmer.
+            let pause = if bilan.pannes > 0 { 600 } else { 5 };
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
         }
     });
 }
@@ -720,6 +905,8 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                                 &state.backend,
                                 &d.id,
                             ))
+                            // #5575 — reconnaître un volume décoratif.
+                            .with_modele(Some(desc.model_name.clone()))
                             // #5793 — plage de volume et canaux lus dans le SCPD.
                             .with_rendering_control_scpd(
                                 desc.scpd_urls().get("renderingcontrol").map(|p| {
@@ -1435,6 +1622,19 @@ fn spawn_telemetry_reporter(state: &AppState) {
 /// memoire. Elles sont locales et n'appellent personne.
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// L'adresse de production du battement.
+const BASE_DU_BATTEMENT: &str = "https://mozaiklabs.fr";
+
+/// `POST {base}/api/v1/heartbeat`. La base est celle de production, sauf dans
+/// un banc compilé avec `services-factices` qui en a déclaré une autre : hors
+/// de cette feature, `base_substituee` rend toujours `None` (#6336).
+fn url_du_battement() -> String {
+    let base =
+        tune_core::services_factices::base_substituee(tune_core::services_factices::MOZAIKLABS)
+            .unwrap_or_else(|| BASE_DU_BATTEMENT.to_string());
+    format!("{base}/api/v1/heartbeat")
+}
+
 /// Reprise rapprochée après un battement — ou une revalidation de clé — en
 /// échec : 1 min, puis 5, puis 15, puis la cadence horaire. Sans elle, un
 /// hôte injoignable au démarrage (réseau pas encore monté, coupure) laissait
@@ -1511,7 +1711,10 @@ pub fn plan_du_tour(settings: &tune_core::db::settings_repo::SettingsRepo) -> He
 /// comment here used to claim the loop ran "ALWAYS regardless of
 /// TUNE_TELEMETRY", and the code agreed with it: the opt-out cut nothing.
 /// The account premium refresh keeps running either way, see [`heartbeat_plan`].
-fn spawn_heartbeat(state: &AppState) {
+///
+/// `pub` pour les bancs d'essai (#6336) : ils lancent CETTE boucle, contre un
+/// faux mozaiklabs, et lisent son verdict par le vrai routeur.
+pub fn spawn_heartbeat(state: &AppState) {
     let backend = state.backend.clone();
     let services = state.services.clone();
     let outputs = state.outputs.clone();
@@ -1828,7 +2031,7 @@ fn spawn_heartbeat(state: &AppState) {
                 &settings,
                 tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
                 client
-                    .post("https://mozaiklabs.fr/api/v1/heartbeat")
+                    .post(url_du_battement())
                     .header("Accept", "application/json")
                     .json(&payload),
             )
@@ -2216,6 +2419,14 @@ async fn refresh_account_premium(
             .await
             .ok();
         }
+        // Clé du serveur (#6603) : inscrite sur le compte si elle ne l'est
+        // pas encore — un serveur relié avant la version qui l'inscrit.
+        tune_core::cloud::cle_serveur::inscrire_depuis_les_reglages(
+            backend,
+            tune_core::http::client::shared(),
+        )
+        .await
+        .ok();
 
         // 🔴 C'est ICI que le défaut devenait permanent.
         //
@@ -2529,6 +2740,47 @@ fn spawn_veille_favoris_miroir(state: &AppState) {
     });
 }
 
+/// #6463, B — délai avant la vérification des MBID d'artiste : le démarrage
+/// et les passes qui le suivent d'abord.
+const VERIFICATION_MBID_DELAI_SECS: u64 = 180;
+/// Après un tour arrêté par MusicBrainz injoignable, on retente plus tard.
+const VERIFICATION_MBID_RELANCE_SECS: u64 = 3600;
+
+/// #6463, B — la reprise des MBID d'artiste faux, en tâche de fond : une
+/// fois, jusqu'au bout de la liste, reprise après chaque arrêt. La règle et
+/// les gardes de débit, de pause et de disjoncteur sont dans
+/// `tune_core::metadata::verification_mbid_artistes` ; ici, le DROIT : la
+/// passe ne part qu'avec l'enrichissement automatique (`AutoEnrichment`),
+/// comme la descente des bios communautaires.
+fn spawn_verification_mbid_artistes(state: &AppState) {
+    let license = state.license.clone();
+    let db = state.backend.clone();
+    tokio::spawn(async move {
+        use tune_core::metadata::verification_mbid_artistes as v;
+        tokio::time::sleep(std::time::Duration::from_secs(VERIFICATION_MBID_DELAI_SECS)).await;
+        loop {
+            if v::lire_l_etat(&db).fin {
+                return;
+            }
+            if !license
+                .check_feature(tune_core::license::Feature::AutoEnrichment)
+                .await
+            {
+                info!("verification_mbid_artistes_sans_droit_d_enrichissement");
+                return;
+            }
+            let etat = v::executer_un_tour(&db, v::lire_la_fiche_musicbrainz).await;
+            if etat.fin {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                VERIFICATION_MBID_RELANCE_SECS,
+            ))
+            .await;
+        }
+    });
+}
+
 fn spawn_bio_sync(state: &AppState) {
     let license = state.license.clone();
     let db = state.backend.clone();
@@ -2575,6 +2827,20 @@ const RATTRAPAGE_VIGNETTES_PODCASTS_DELAI_SECS: u64 = 45;
 /// #5214 — au démarrage, met en cache la vignette des abonnements qui n'en ont
 /// pas encore (ceux d'avant le correctif, ou dont le téléchargement a échoué).
 /// Aucun abonnement : aucune requête.
+/// #7064 — une fois au démarrage : les labels déjà en base qui sont des
+/// lignes de copyright (« 2003 EMI Records Ltd. ») perdent l'année et le ℗/©
+/// de tête. La lecture des balises s'en charge pour les fichiers relus ; cette
+/// passe rattrape les autres. Idempotente, et rien d'autre ne bouge.
+fn spawn_normalisation_des_labels(state: &AppState) {
+    let db = state.backend.clone();
+    tokio::task::spawn_blocking(move || {
+        match tune_core::library::noms_de_labels::normaliser_les_labels_en_base(&db) {
+            Ok(lignes) => tracing::info!(lignes, "labels_normalises_au_demarrage"),
+            Err(e) => tracing::warn!(error = %e, "labels_normalises_au_demarrage_echec"),
+        }
+    });
+}
+
 fn spawn_rattrapage_vignettes_podcasts(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -2607,14 +2873,20 @@ fn spawn_radio_logo_refresh(state: &AppState) {
                 annuaire_injoignable = bilan.annuaire_injoignable,
                 "radio_logos_backfilled_at_startup"
             );
-            if !bilan.annuaire_injoignable {
-                return;
-            }
-            let Some(secs) = delais.next() else {
-                tracing::warn!("radio_logos_directory_unreachable_giving_up");
-                return;
+            // #6516 — l'annuaire se relève CHAQUE JOUR (cache local, `ETag`).
+            // Relevé réussi : rendez-vous dans 24 h. Échec : les relances
+            // rapprochées d'avant, puis le rythme quotidien — une panne ne
+            // fait plus abandonner le relevé pour toute la vie du serveur.
+            let attente = if bilan.annuaire_a_jour {
+                delais = RATTRAPAGE_LOGOS_DELAIS_SECS.iter();
+                crate::routes::radios_annuaire::PERIODE_DE_RELEVE
+            } else if let Some(secs) = delais.next() {
+                std::time::Duration::from_secs(*secs)
+            } else {
+                tracing::warn!("radio_logos_directory_unreachable_retry_tomorrow");
+                crate::routes::radios_annuaire::PERIODE_DE_RELEVE
             };
-            tokio::time::sleep(std::time::Duration::from_secs(*secs)).await;
+            tokio::time::sleep(attente).await;
         }
     });
 }
@@ -2868,7 +3140,27 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Vec<tune_core::outputs::local::AudioDevice>>,
 {
-    if any_local_output_playing(state).await {
+    parc_local_sans_couper_la_lecture_selon_os(state, std::env::consts::OS, enumerer).await
+}
+
+/// Le système est explicite pour vérifier la règle Linux sans sonder de
+/// matériel, y compris quand les tests ciblés tournent sur le Mac (#7263).
+#[cfg(feature = "local-audio")]
+async fn parc_local_sans_couper_la_lecture_selon_os<F, Fut>(
+    state: &AppState,
+    os: &str,
+    enumerer: F,
+) -> Vec<tune_core::outputs::local::AudioDevice>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Vec<tune_core::outputs::local::AudioDevice>>,
+{
+    // #7263 — les routes de lecture du parc doivent respecter la même
+    // garde Linux que le rescan périodique : FIP sur un renderer réseau ne
+    // justifie pas de rouvrir les greffons ALSA à chaque lecture de la fiche.
+    let lecture_locale = any_local_output_playing(state).await;
+    let lecture_reseau_sous_linux = os == "linux" && any_zone_playing(state).await;
+    if lecture_locale || lecture_reseau_sous_linux {
         tune_core::outputs::local::cached_audio_devices()
     } else {
         enumerer().await
@@ -2879,13 +3171,17 @@ where
 #[path = "parc_local_pendant_la_lecture_6119_tests.rs"]
 mod parc_local_pendant_la_lecture_6119_tests;
 
+#[cfg(all(test, feature = "local-audio"))]
+#[path = "sortie_locale_disparue_6551_tests.rs"]
+mod sortie_locale_disparue_6551_tests;
+
 /// Whether ANY zone (local or network) is currently playing, read from the
 /// in-memory playback state — no device or network probing. Used on Linux to
 /// suppress the periodic audio re-enumeration during a listening session:
 /// re-probing PipeWire while music plays for hours drives runaway pipewire
 /// memory growth (JeromeQ, #1257). Network renderers don't use PipeWire, but a
 /// long radio session to one is exactly when the useless re-probing piles up.
-#[cfg(all(feature = "local-audio", target_os = "linux"))]
+#[cfg(feature = "local-audio")]
 async fn any_zone_playing(state: &AppState) -> bool {
     state
         .playback
@@ -2978,6 +3274,70 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
         None => return,
     };
 
+    appliquer_le_parc_local(state, &devices, &configured_backend, is_asio_configured).await;
+}
+
+/// Ce que le rescan à chaud peut dire d'une sortie locale ABSENTE de son
+/// balayage (#6551).
+#[cfg(feature = "local-audio")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PorteeDuRescanLocal {
+    /// Le balayage couvre l'hôte de cette sortie : son absence veut dire
+    /// qu'elle a disparu (AirPods éloignés, DAC USB débranché).
+    Balayee,
+    /// Le balayage ne PEUT pas la voir : son absence ne prouve rien, et la
+    /// retirer du registre appellerait le `Drop` du pilote ASIO (`abort()`,
+    /// DEvir, 19/06).
+    HorsDePortee,
+}
+
+/// #6551 — la sortie absente du balayage a-t-elle disparu, ou le balayage
+/// ne pouvait-il simplement pas la voir ?
+///
+/// Le rescan à chaud n'ouvre JAMAIS l'hôte ASIO : il force WASAPI quand ASIO
+/// est configuré, et seule la valeur `asio` ouvre cet hôte
+/// (`plan_audio_enumeration`, `select_host`). Une sortie ASIO est donc
+/// toujours hors de sa portée ; toute autre sortie locale y est.
+///
+/// `sortie` vaut `(hôte d'origine, backend d'ouverture)` d'une `LocalOutput`,
+/// ou `None` pour une sortie `local:` d'un autre type : on ne sait pas ce qui
+/// l'a énumérée, on la garde.
+///
+/// La garde qu'elle remplace (`was_in_scan_scope`, 19/06) cherchait le nom de
+/// la sortie dans le balayage même dont elle était absente : elle était
+/// toujours fausse, et AUCUNE sortie disparue n'était retirée, sur aucune
+/// plateforme — la zone restait « en ligne » (alec_eiffel, fil 2340).
+#[cfg(feature = "local-audio")]
+pub(crate) fn portee_du_rescan_local(sortie: Option<(Option<&str>, &str)>) -> PorteeDuRescanLocal {
+    let Some((origine, backend_d_ouverture)) = sortie else {
+        return PorteeDuRescanLocal::HorsDePortee;
+    };
+    let asio = match origine.map(str::trim).filter(|o| !o.is_empty()) {
+        Some(o) => o.eq_ignore_ascii_case("asio"),
+        // Origine inconnue : le backend d'ouverture vaut alors le réglage tel
+        // quel (`openable_local_backend`), `asio` compris.
+        None => backend_d_ouverture.eq_ignore_ascii_case("asio"),
+    };
+    if asio {
+        PorteeDuRescanLocal::HorsDePortee
+    } else {
+        PorteeDuRescanLocal::Balayee
+    }
+}
+
+/// Le parc que vient de rendre le balayage, appliqué au registre et aux zones :
+/// enregistrer les nouvelles sorties, retirer les disparues et mettre leurs
+/// zones hors ligne, remettre en ligne celles qui reviennent.
+///
+/// Séparé de [`rescan_local_audio_devices`] pour qu'un test puisse lui donner
+/// un parc sans matériel (#6551).
+#[cfg(feature = "local-audio")]
+pub(crate) async fn appliquer_le_parc_local(
+    state: &AppState,
+    devices: &[tune_core::outputs::local::AudioDevice],
+    configured_backend: &str,
+    is_asio_configured: bool,
+) {
     {
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
         // #2269 — l'identité des sorties locales, AVANT d'enregistrer ou de
@@ -3071,7 +3431,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
 
         let mut registered_count = 0;
 
-        for dev in &devices {
+        for dev in devices {
             let device_id = format!("local:{}", dev.name);
 
             // Already registered — still ensure a zone exists (may have been deleted)
@@ -3093,7 +3453,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             // machine disparaissait sur un périphérique que personne n'avait
             // demandé en exclusif (jfpaquet, Asus Essence STX II).
             let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
-                &configured_backend,
+                configured_backend,
                 Some(dev.backend.as_str()),
                 state.requested_exclusive_mode(),
                 // #5353 — le `true` écrit par le choix d'ASIO n'est pas une
@@ -3104,7 +3464,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
                 dev.name.clone(),
                 (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
                 statut_exclusif.effective,
-                &configured_backend,
+                configured_backend,
             )
             .with_origin_host(&dev.backend);
             outputs.register(Box::new(local_out));
@@ -3121,21 +3481,16 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             new_devices_to_zone.push((device_id, dev.name.clone(), dev.is_default));
         }
 
-        // Remove WASAPI devices that have disappeared (USB DAC unplugged),
-        // but only if not actively playing.
-        // On Windows, only remove devices that were found in the current
-        // scan backend (WASAPI). Devices registered by ASIO at startup
-        // won't appear in WASAPI scans — don't remove them, as dropping
+        // Remove devices that have disappeared (AirPods out of range, USB DAC
+        // unplugged), but only if not actively playing.
+        // Devices registered by ASIO at startup never appear in this scan
+        // (it never opens the ASIO host) — don't remove them, as dropping
         // ASIO outputs can crash the process via the driver FFI.
         for old_id in &existing_ids {
             if new_device_ids.contains(old_id) {
                 continue;
             }
 
-            // Only remove if the device name matches one we could have
-            // discovered with the current scan backend.  If the scan used
-            // WASAPI but this device was registered by ASIO at startup,
-            // it won't be in new_device_ids but we must NOT remove it.
             // If the scan returned nothing, skip all removals — an empty
             // result means the backend couldn't enumerate (e.g. WASAPI held
             // exclusively by foobar2000), not that everything disappeared.
@@ -3143,24 +3498,31 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
                 debug!("local_audio_rescan_empty_skipping_all_removals");
                 break;
             }
-            let old_name = old_id.strip_prefix("local:").unwrap_or(old_id);
-            let was_in_scan_scope = devices.iter().any(|d| d.name == old_name);
-            if !was_in_scan_scope {
-                debug!(device_id = %old_id, "local_audio_skipping_removal_different_backend");
-                continue;
-            }
 
-            let is_playing = if let Some(output) = outputs.get(old_id) {
+            // #6551 — l'absence ne vaut disparition que pour une sortie que ce
+            // balayage pouvait voir : on le demande à l'hôte qui l'a énumérée.
+            let (portee, is_playing) = if let Some(output) = outputs.get(old_id) {
                 let output = output.lock().await;
-                match output.get_status().await {
+                let portee = portee_du_rescan_local(
+                    output
+                        .as_any()
+                        .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+                        .map(|l| (l.origin_host(), l.audio_backend())),
+                );
+                let is_playing = match output.get_status().await {
                     Ok(status) => {
                         status.state == tune_core::outputs::traits::TransportState::Playing
                     }
                     Err(_) => false,
-                }
+                };
+                (portee, is_playing)
             } else {
-                false
+                (PorteeDuRescanLocal::HorsDePortee, false)
             };
+            if portee == PorteeDuRescanLocal::HorsDePortee {
+                debug!(device_id = %old_id, "local_audio_skipping_removal_different_backend");
+                continue;
+            }
 
             if !is_playing {
                 outputs.remove(old_id);
@@ -3209,12 +3571,27 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
         .map(str::to_owned);
 
         for (device_id, dev_name, is_default) in &new_devices_to_zone {
+            let zone_connue = zone_repo.get_by_device_id(device_id).ok().flatten();
+            // #6551 — une zone mise hors ligne par la phase 2a revient en
+            // ligne d'elle-même avec son appareil, et les télécommandes le
+            // savent (miroir de l'événement `online: false`).
+            let revient_en_ligne = zone_connue.as_ref().is_some_and(|z| !z.online);
+            if revient_en_ligne {
+                state.event_bus.emit_typed(
+                    tune_core::event_types::EventType::ZoneUpdated,
+                    serde_json::json!({ "device_id": device_id, "online": true }),
+                );
+                info!(device_id = %device_id, "local_audio_zone_back_online");
+            }
             // When ASIO is configured, don't create new zones for WASAPI
             // devices discovered by the fallback rescan. Users should only
             // see ASIO zones (e.g. "HoloAudio ASIO Driver"), not confusing
             // generic WASAPI names like "Haut-parleurs" for the same DAC.
             // Only update online status for WASAPI zones that already exist.
             if is_asio_configured {
+                if zone_connue.is_some() {
+                    let _ = zone_repo.set_online_by_device(device_id, true);
+                }
                 continue;
             }
             // #1770 : même règle qu'au démarrage — l'étiquette générique ne se
@@ -3231,11 +3608,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             // système. Les autres sorties restent enregistrées pour que
             // l'interface puisse les proposer à la création manuelle. Une zone
             // déjà connue est reconnectée normalement.
-            let zone_exists = zone_repo
-                .get_by_device_id(device_id)
-                .ok()
-                .flatten()
-                .is_some();
+            let zone_exists = zone_connue.is_some();
             let is_system_default = system_default_device_id.as_deref() == Some(device_id.as_str());
             let action =
                 crate::startup::local_zone_action(zone_exists, auto_create, is_system_default);
@@ -3459,6 +3832,29 @@ mod tests_licence_proprietaire_battement {
         }
     }
 
+    /// #7064 — sans cet appel, la normalisation des labels déjà en base serait
+    /// du code mort : « 2003 EMI Records Ltd. » resterait dans l'onglet Labels
+    /// tant qu'aucun scan ne relit le fichier.
+    #[test]
+    fn la_normalisation_des_labels_est_lancee_7064() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains("spawn_normalisation_des_labels(state);"),
+            "la normalisation des labels n'est plus lancee au demarrage"
+        );
+        let passe = source
+            .find("fn spawn_normalisation_des_labels")
+            .expect("spawn_normalisation_des_labels a disparu");
+        assert!(
+            source[passe..].contains("noms_de_labels::normaliser_les_labels_en_base(&db)"),
+            "la passe de démarrage n'appelle plus la normalisation en base"
+        );
+    }
+
     /// #5654 — sans cet appel, la sauvegarde automatique serait du code mort :
     /// l'écran dirait « active » et rien ne partirait jamais.
     #[test]
@@ -3471,6 +3867,91 @@ mod tests_licence_proprietaire_battement {
         assert!(
             source[debut..fin].contains("routes::system::sauvegarde_cloud::spawn(state);"),
             "la passe de sauvegarde cloud n'est plus lancee au demarrage"
+        );
+    }
+
+    /// #6773 — sans cet appel, le rattrapage des noms de tri serait du code
+    /// mort : les artistes déjà identifiés resteraient rangés à leur prénom.
+    #[test]
+    fn le_rattrapage_des_noms_de_tri_est_lance_6773() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains(concat!("spawn_rattrapage_noms_", "de_tri(state);")),
+            "le rattrapage des noms de tri n'est plus lancé au démarrage"
+        );
+    }
+
+    /// #6510 — sans cet appel, l'envoi des écoutes au compte serait du code
+    /// mort : la bascule dirait « activé » et rien ne partirait jamais.
+    #[test]
+    fn l_envoi_des_ecoutes_au_compte_est_lance() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains(concat!(
+                "tune_core::cloud::ecoutes_au_compte::",
+                "spawn(state.backend.clone(), state.http_client.clone());"
+            )),
+            "l'envoi des écoutes au compte n'est plus lancé au démarrage"
+        );
+    }
+
+    /// #6463, B — sans cet appel, la reprise des MBID faux serait du code
+    /// mort : « Christophe » et « Ange » garderaient leur MBID.
+    #[test]
+    fn la_verification_des_mbid_d_artiste_est_lancee() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains(concat!("spawn_verification_", "mbid_artistes(state);")),
+            "la vérification des MBID d'artiste n'est plus lancée au démarrage"
+        );
+    }
+
+    /// #6545 — sans cet appel, le partage communautaire serait du code mort :
+    /// la bascule dirait « activé » et rien ne partirait jamais.
+    #[test]
+    fn le_partage_communautaire_est_lance() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains(concat!(
+                "tune_core::cloud::notes_communautaires::",
+                "spawn(state.backend.clone(), state.http_client.clone());"
+            )),
+            "le partage communautaire n'est plus lancé au démarrage"
+        );
+    }
+
+    /// #5594 — sans cet appel, les mesures communautaires seraient du code
+    /// mort : les options diraient « activé » et rien ne partirait jamais.
+    #[test]
+    fn les_mesures_communautaires_sont_lancees() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        let corps: String = source[debut..fin].split_whitespace().collect();
+        assert!(
+            corps.contains(concat!(
+                "tune_core::cloud::mesures_communautaires::",
+                "spawn(state.backend.clone(),state.http_client.clone(),);"
+            )),
+            "les mesures communautaires ne sont plus lancées au démarrage"
         );
     }
 

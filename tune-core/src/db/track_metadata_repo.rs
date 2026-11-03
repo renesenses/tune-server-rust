@@ -308,7 +308,7 @@ mod tests {
 
         let meta = repo.get_all(1).unwrap();
         assert_eq!(meta.len(), 1);
-        assert!(meta.get("composer").is_none());
+        assert!(!meta.contains_key("composer"));
         assert_eq!(meta.get("conductor").unwrap(), "Karajan");
     }
 
@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&1).unwrap(), "Sonates");
         assert_eq!(map.get(&2).unwrap(), "Bonus");
-        assert!(map.get(&3).is_none());
+        assert!(!map.contains_key(&3));
     }
 
     #[test]

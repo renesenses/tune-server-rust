@@ -66,7 +66,7 @@ fn profil() -> crate::audio::eq::EqProfile {
 
 fn rms_db(pcm: &[u8]) -> f64 {
     let (mut e, mut n) = (0.0f64, 0u64);
-    for s in pcm.chunks_exact(2) {
+    for s in pcm.as_chunks::<2>().0 {
         let v = i16::from_le_bytes([s[0], s[1]]) as f64 / 32_768.0;
         e += v * v;
         n += 1;
@@ -75,7 +75,9 @@ fn rms_db(pcm: &[u8]) -> f64 {
 }
 
 fn au_rail(pcm: &[u8]) -> usize {
-    pcm.chunks_exact(2)
+    pcm.as_chunks::<2>()
+        .0
+        .iter()
         .map(|s| i16::from_le_bytes([s[0], s[1]]))
         .filter(|&v| v == i16::MAX || v == i16::MIN)
         .count()

@@ -175,6 +175,9 @@ pub fn elaguer_les_releves(dossier: &Path, garder: usize) {
 pub struct Veille {
     origine: Instant,
     battement_ms: AtomicU64,
+    /// #7506 — instant (depuis `origine`) de la dernière reprise après une
+    /// suspension du processus : l'âge du battement ne compte pas avant.
+    reprise_ms: AtomicU64,
     seuil: Duration,
     dossier: PathBuf,
     handle: tokio::runtime::Handle,
@@ -193,6 +196,7 @@ impl Veille {
         let veille = Arc::new(Veille {
             origine: Instant::now(),
             battement_ms: AtomicU64::new(0),
+            reprise_ms: AtomicU64::new(0),
             seuil,
             dossier,
             handle: handle.clone(),
@@ -216,12 +220,17 @@ impl Veille {
             .spawn(move || {
                 let mut episode: Option<Episode> = None;
                 let mut releves = 0usize;
+                // Mesuré APRÈS le tour : le temps d'écrire un relevé (fenêtre
+                // de mesure comprise) n'est pas un retard du sommeil.
+                let mut fin_du_tour = Instant::now();
                 loop {
                     std::thread::sleep(periode_veille);
+                    let retard = fin_du_tour.elapsed().saturating_sub(periode_veille);
                     let Some(v) = pour_la_veille.upgrade() else {
                         return;
                     };
-                    v.tour(&mut episode, &mut releves);
+                    v.tour(&mut episode, &mut releves, retard);
+                    fin_du_tour = Instant::now();
                 }
             });
         veille
@@ -233,11 +242,35 @@ impl Veille {
     }
 
     fn age_du_battement(&self) -> Duration {
-        let dernier = Duration::from_millis(self.battement_ms.load(Ordering::Relaxed));
+        let battement = self.battement_ms.load(Ordering::Relaxed);
+        let reprise = self.reprise_ms.load(Ordering::Relaxed);
+        let dernier = Duration::from_millis(battement.max(reprise));
         self.origine.elapsed().saturating_sub(dernier)
     }
 
-    fn tour(&self, episode: &mut Option<Episode>, releves: &mut usize) {
+    /// `retard` : ce que le tour de veille a pris en plus de sa propre
+    /// cadence.
+    ///
+    /// #7506 (fil 2553, Surface sous Windows) : un tour en retard d'au moins
+    /// le seuil, c'est le PROCESSUS entier qui n'a pas tourné, pas
+    /// l'exécuteur — un gel de tokio laisse ce `std::thread` tourner à sa
+    /// cadence. C'est la mise en veille de la machine : sous Windows,
+    /// `Instant` (QueryPerformanceCounter) compte le temps de veille, et le
+    /// premier tour après le réveil lisait « battement vieux de 2643726 ms »
+    /// avec 0 fil au travail. Ce tour est écarté, et l'âge repart de la
+    /// reprise : un vrai gel qui suivrait est relevé `seuil` plus tard.
+    fn tour(&self, episode: &mut Option<Episode>, releves: &mut usize, retard: Duration) {
+        if retard >= self.seuil {
+            self.reprise_ms
+                .store(self.origine.elapsed().as_millis() as u64, Ordering::Relaxed);
+            tracing::info!(
+                suspension_ms = retard.as_millis() as u64,
+                episode_en_cours = episode.is_some(),
+                "gel_executeur_suspension_du_processus_ecartee"
+            );
+            *episode = None;
+            return;
+        }
         let age = self.age_du_battement();
         if age < self.seuil {
             if let Some(e) = episode.take() {
@@ -294,10 +327,23 @@ pub fn demarrer_en_production(dossier: PathBuf) -> Arc<Veille> {
 }
 
 fn ecrire_le_releve(dossier: &Path, texte: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+    ecrire_le_releve_avec(dossier, |fichier| fichier.write_all(texte.as_bytes()))
+}
+
+/// Le nom public n'apparaît qu'une fois le relevé COMPLET. Un lecteur du
+/// rapport de bogue peut parcourir ce dossier pendant l'écriture (#6346).
+/// Le temporaire est sur le même disque et ne porte pas le nom d'un relevé.
+fn ecrire_le_releve_avec(
+    dossier: &Path,
+    ecrire: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<PathBuf, String> {
     let horodatage = horodatage().replace([':', '-'], "");
     let chemin = dossier.join(format!("{PREFIXE_RELEVE}{horodatage}{SUFFIXE_RELEVE}"));
     std::fs::create_dir_all(dossier).map_err(|e| e.to_string())?;
-    std::fs::write(&chemin, texte).map_err(|e| e.to_string())?;
+    let mut temporaire = tempfile::NamedTempFile::new_in(dossier).map_err(|e| e.to_string())?;
+    ecrire(temporaire.as_file_mut()).map_err(|e| e.to_string())?;
+    temporaire.persist(&chemin).map_err(|e| e.to_string())?;
     elaguer_les_releves(dossier, PLAFOND_RELEVES);
     Ok(chemin)
 }
@@ -581,7 +627,15 @@ mod tests {
         let mut trouve = Vec::new();
         while debut.elapsed() < Duration::from_millis(3500) && trouve.is_empty() {
             std::thread::sleep(Duration::from_millis(50));
-            trouve = fichiers(dir.path());
+            // Seuls les noms définitifs sont des relevés : le temporaire
+            // d'une écriture en cours n'est pas encore publié.
+            trouve = fichiers(dir.path())
+                .into_iter()
+                .filter(|p| {
+                    let nom = p.file_name().unwrap().to_string_lossy();
+                    nom.starts_with(PREFIXE_RELEVE) && nom.ends_with(SUFFIXE_RELEVE)
+                })
+                .collect();
         }
         assert_eq!(trouve.len(), 1, "un relevé attendu PENDANT le gel");
         let texte = std::fs::read_to_string(&trouve[0]).unwrap();
@@ -601,6 +655,66 @@ mod tests {
         );
         drop(veille);
         rt.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// Un lecteur arrive exactement entre deux écritures : il ne voit aucun
+    /// relevé partiel. Les canaux imposent cet ordre sans délai ni retry.
+    #[test]
+    fn un_releve_n_est_visible_qu_apres_son_ecriture_complete_6346() {
+        use std::io::Write;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (commence, debut) = mpsc::channel();
+        let (reprendre, reprise) = mpsc::channel();
+        let chemin = dir.path().to_path_buf();
+        let auteur = std::thread::spawn(move || {
+            ecrire_le_releve_avec(&chemin, |fichier| {
+                fichier.write_all("gel_executeur — debut\n".as_bytes())?;
+                commence.send(()).unwrap();
+                reprise.recv().unwrap();
+                fichier.write_all(b"== lectures SQLite en cours ==\nfin\n")
+            })
+        });
+        debut.recv().unwrap();
+        let pendant = derniers_releves(dir.path(), 10);
+        // Libérer puis joindre le fil AVANT les assertions, même si le témoin
+        // rougit : aucune écriture détachée ne survit au dossier temporaire.
+        reprendre.send(()).unwrap();
+        let publie = auteur.join().unwrap().unwrap();
+        assert_eq!(
+            pendant,
+            (vec![], 0),
+            "un relevé incomplet a été publié pendant son écriture"
+        );
+        let (releves, total) = derniers_releves(dir.path(), 10);
+        assert_eq!(total, 1);
+        assert_eq!(releves.len(), 1);
+        assert_eq!(
+            releves[0].1,
+            "gel_executeur — debut\n== lectures SQLite en cours ==\nfin\n"
+        );
+        assert!(publie.is_file());
+        assert_eq!(
+            fichiers(dir.path()).len(),
+            1,
+            "temporaire laissé sur disque"
+        );
+    }
+
+    #[test]
+    fn une_ecriture_de_releve_interrompue_ne_publie_rien_6346() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let erreur = ecrire_le_releve_avec(dir.path(), |fichier| {
+            fichier.write_all(b"debut seulement")?;
+            Err(std::io::Error::other("ecriture interrompue pour le temoin"))
+        })
+        .unwrap_err();
+        assert!(erreur.contains("ecriture interrompue pour le temoin"));
+        assert_eq!(derniers_releves(dir.path(), 10), (vec![], 0));
+        assert!(fichiers(dir.path()).is_empty(), "temporaire non nettoyé");
     }
 
     /// Fil 2117/2124 : `TUNE_DATA_DIR` d'abord (Tune OS le pose), une valeur
@@ -724,6 +838,63 @@ mod tests {
         assert!(md.contains("… (coupé)"), "{md}");
         assert!(md.len() < 2 * PLAFOND_RELEVE_JOINT, "{}", md.len());
         assert!(section_du_rapport(None, 2).contains("veille non démarrée"));
+    }
+
+    fn veille_sans_fils(rt: &tokio::runtime::Runtime, dossier: &Path, depuis: Duration) -> Veille {
+        Veille {
+            // Le battement date de `depuis` : l'exécuteur n'a pas battu depuis.
+            origine: Instant::now().checked_sub(depuis).unwrap(),
+            battement_ms: AtomicU64::new(0),
+            reprise_ms: AtomicU64::new(0),
+            seuil: Duration::from_secs(5),
+            dossier: dossier.to_path_buf(),
+            handle: rt.handle().clone(),
+            fenetre: Duration::ZERO,
+        }
+    }
+
+    /// #7506 — le premier tour après une veille de la machine arrive avec le
+    /// retard de la veille : aucun relevé, et l'âge repart de la reprise.
+    #[test]
+    fn un_tour_de_veille_en_retard_est_une_suspension_pas_un_gel_7506() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let veille = veille_sans_fils(&rt, dir.path(), Duration::from_secs(2644));
+        let (mut episode, mut releves) = (None, 0usize);
+        veille.tour(&mut episode, &mut releves, Duration::from_secs(2643));
+        assert!(
+            fichiers(dir.path()).is_empty(),
+            "relevé écrit pour une veille"
+        );
+        assert!(episode.is_none());
+        assert!(veille.age_du_battement() < veille.seuil);
+        // Le tour suivant, à l'heure, ne voit toujours rien.
+        veille.tour(&mut episode, &mut releves, Duration::ZERO);
+        assert!(fichiers(dir.path()).is_empty());
+        assert_eq!(releves, 0);
+        rt.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// Contre-épreuve : le même battement vieux, lu par un tour À L'HEURE
+    /// (l'exécuteur seul est pris), reste un gel relevé.
+    #[test]
+    fn un_battement_vieux_lu_par_un_tour_a_l_heure_reste_un_gel_7506() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let veille = veille_sans_fils(&rt, dir.path(), Duration::from_secs(60));
+        let (mut episode, mut releves) = (None, 0usize);
+        veille.tour(&mut episode, &mut releves, Duration::from_millis(3));
+        assert_eq!(releves, 1, "un vrai gel doit rester relevé");
+        assert_eq!(fichiers(dir.path()).len(), 1);
+        rt.shutdown_timeout(Duration::from_secs(5));
     }
 
     /// Un exécuteur qui tourne : aucun relevé.

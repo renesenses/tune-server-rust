@@ -116,6 +116,10 @@ async fn lire_pendant_un_lot_de_scan_passe_a_la_prochaine_cession_190() {
 
 /// Sans écriture de file en attente, la cession reste celle de la connexion :
 /// le lot garde sa porte et sa transaction.
+///
+/// L'absence d'attente est posée, pas lue : le compteur d'attente est global
+/// au processus, et un test voisin qui écrit une file pouvait le lever entre
+/// la cession et l'assertion (rouge intermittent en CI, 23/10).
 #[test]
 fn sans_file_en_attente_le_lot_garde_sa_porte_190() {
     let db = SqliteDb::open_in_memory().expect("SQLite en mémoire");
@@ -123,8 +127,9 @@ fn sans_file_en_attente_le_lot_garde_sa_porte_190() {
     let backend: Arc<dyn DbBackend> = Arc::new(db);
     let mut porte = Some(crate::sqlite_write_gate::scan_batch());
     backend.execute_batch("BEGIN IMMEDIATE").expect("BEGIN");
-    let a_cede = crate::sqlite_write_gate::ceder_le_lot(backend.as_ref(), &mut porte, "scan:lot");
-    assert!(!a_cede || crate::sqlite_write_gate::file_en_attente());
+    let a_cede =
+        crate::sqlite_write_gate::ceder_le_lot_si(backend.as_ref(), &mut porte, "scan:lot", false);
+    assert!(!a_cede, "sans file en attente, le lot ne cède pas sa porte");
     assert!(porte.is_some(), "la porte reste tenue par le lot");
     backend.execute_batch("COMMIT").expect("COMMIT");
 }

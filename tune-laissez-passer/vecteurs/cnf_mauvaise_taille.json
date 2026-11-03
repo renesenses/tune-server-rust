@@ -1,0 +1,19 @@
+{
+  "attendu": {
+    "code": "cle_appareil",
+    "resultat": "refuse"
+  },
+  "contexte": {
+    "grace_expiration": 0,
+    "maintenant": 1793000000,
+    "server_id": "6f1c1f5e-2b0a-4c2e-9d3b-7a51c0de0001"
+  },
+  "defi": {
+    "defi": "c2Vzc2lvbi1kZWZpLWRlLXRlc3QtMDEyMzQ1Njc4OTAx",
+    "signature": "RViENs3a2oEShmYoVcnKtpRhTeITKAEbXRLpLOeL_IB535Lz14CUFPctu7VuXP4EcCvw8HhiTptRJDAbLmJdCg"
+  },
+  "description": "cnf.pk de 31 octets pour une clé Ed25519.",
+  "laissez_passer": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6InR1bmUtcGFzcytqd3QifQ.eyJpc3MiOiJodHRwczovL21vemFpa2xhYnMuZnIiLCJhdWQiOiJ0dW5lLXJlbW90ZSIsInN1YiI6ImNwdF84ZjJhNjEiLCJzaWQiOiI2ZjFjMWY1ZS0yYjBhLTRjMmUtOWQzYi03YTUxYzBkZTAwMDEiLCJkaWQiOiJhcHBfZWRfMDEiLCJjbmYiOnsiYWxnIjoiRWQyNTUxOSIsInBrIjoiQndjSEJ3Y0hCd2NIQndjSEJ3Y0hCd2NIQndjSEJ3Y0hCd2NIQndjSEJ3In0sInAycCI6ZmFsc2UsImlhdCI6MTc5Mjk5OTQwMCwibmJmIjoxNzkyOTk5NDAwLCJleHAiOjE3OTMwMDMwMDAsImp0aSI6Imp0aS0wMDAxIiwidiI6MX0.AgWBLKL0oBoTxZ0M8nulHSwzcM9NEOqHBpIjF1d7nGt-_YEvMfJg8PixUtuU8Cbw7k2otV2PnLE34EwsGFaUAA",
+  "nom": "cnf_mauvaise_taille",
+  "publication": "jeu_de_cles.json"
+}

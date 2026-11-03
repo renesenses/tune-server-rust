@@ -41,6 +41,9 @@ pub mod gain_approche;
 /// #2713 — la crête vraie versionnée, et le rattrapage des crêtes mesurées
 /// par l'ancien algorithme.
 pub mod rattrapage_crete;
+/// #6330 — « Tout relancer » rend à la cascade les pistes en échec, et la
+/// réveille si elle dort au repos.
+pub mod reessai;
 /// Refaire, sur demande, les mesures prises avant le correctif du vrai pic
 /// (#5882) : la campagne qui les rend à la passe, par lots.
 pub mod remesure;
@@ -1126,7 +1129,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                     &mut dernier_repos,
                     etat.motif_de_repos(),
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
+                // #6330 — « Tout relancer » écourte ce repos : des pistes
+                // rendues à la passe n'attendent pas un quart d'heure.
+                reessai::dormir_au_repos(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
             } else {
                 // More to do — loop again promptly.
                 tokio::time::sleep(pause_entre_deux_tours(&backend)).await;
@@ -2741,6 +2746,11 @@ pub enum GainSource {
     /// (#5519), faute de tout ReplayGain : voir [`gain_approche`]. Une
     /// mesure réelle (tag ou analyse) le remplace dès qu'elle existe.
     FooDrApprox,
+    /// Reçu de la communauté (#5594) : mesuré par au moins deux autres
+    /// installations sur le MÊME signal PCM (clé FLAC exacte), avec la même
+    /// version d'algorithme. Ne comble qu'un vide ; une mesure locale ou un
+    /// tag ne sont jamais remplacés.
+    Community,
 }
 
 impl GainSource {
@@ -2750,6 +2760,7 @@ impl GainSource {
             Self::FileTags => "file_tags",
             Self::Analysis => "analysis",
             Self::FooDrApprox => "foo_dr_approx",
+            Self::Community => "community",
         }
     }
 
@@ -2759,6 +2770,7 @@ impl GainSource {
             Self::FileTags => "tags du fichier",
             Self::Analysis => "analyse Tune",
             Self::FooDrApprox => "approché (foo_dr)",
+            Self::Community => "communauté (mesure partagée)",
         }
     }
 }
@@ -3137,6 +3149,14 @@ fn gain_source_from_meta(
         .is_some_and(|v| v.trim() == SOURCE_ANALYSIS)
     {
         return Some(GainSource::Analysis);
+    }
+    // #5594 — une valeur reçue de la communauté le dit : la prendre pour un
+    // tag du fichier serait un affichage inventé.
+    if meta
+        .get(source_key)
+        .is_some_and(|v| v.trim() == crate::cloud::mesures_communautaires::SOURCE_COMMUNAUTE)
+    {
+        return Some(GainSource::Community);
     }
     // Repli pour les bibliothèques analysées AVANT que ce témoin existe — la
     // quasi-totalité du parc installé. La passe n'analyse QUE les pistes
@@ -5639,7 +5659,7 @@ mod tests {
             .unwrap();
         let largeur = crate::taches_de_fond::vitesse::largeur_courante(&interne);
         assert!(
-            largeur >= 2 && largeur < 6,
+            (2..6).contains(&largeur),
             "le test parle de plusieurs fichiers en vol sur un lot plus large : largeur={largeur}"
         );
         // La garde qui suit les `largeur` premiers lancements est la première

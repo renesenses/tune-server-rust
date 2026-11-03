@@ -42,6 +42,12 @@ pub struct OaatMultiroomOutput {
     stop_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(feature = "oaat")]
     zone: SharedZone,
+    /// #6393 (point 4) — les `endpoint_release` de tous les endpoints du
+    /// groupe, chacun avec son `endpoint_id`. Pris au premier `play_media`
+    /// (il faut un runtime tokio pour la tâche qui les écoute).
+    #[cfg(feature = "oaat")]
+    liberations:
+        std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<oaat_controller::ZoneEndpointRelease>>>,
 }
 
 impl OaatMultiroomOutput {
@@ -49,19 +55,22 @@ impl OaatMultiroomOutput {
         let device_id = format!("oaat-group:{group_id}");
 
         #[cfg(feature = "oaat")]
-        let zone = {
+        let (zone, liberations) = {
             let config = oaat_controller::ControllerConfig {
                 controller_id: uuid::Uuid::new_v4().to_string(),
                 controller_name: "Tune Server".into(),
-                features: vec![],
+                // #6393 (point 4) — un endpoint n'envoie `endpoint_release`
+                // qu'au contrôleur qui l'annonce (RFC OAAT §7.3.1).
+                features: vec![oaat_core::message::FEATURE_ENDPOINT_RELEASE.into()],
                 clock_port: super::helpers::oaat_clock_port(),
                 tls: false,
             };
-            Arc::new(Mutex::new(oaat_controller::Zone::new(
-                group_id.clone(),
-                name.clone(),
-                config,
-            )))
+            let mut zone = oaat_controller::Zone::new(group_id.clone(), name.clone(), config);
+            let liberations = zone.take_release_rx();
+            (
+                Arc::new(Mutex::new(zone)),
+                std::sync::Mutex::new(liberations),
+            )
         };
 
         Self {
@@ -83,6 +92,8 @@ impl OaatMultiroomOutput {
             stop_tx: Mutex::new(None),
             #[cfg(feature = "oaat")]
             zone,
+            #[cfg(feature = "oaat")]
+            liberations,
         }
     }
 
@@ -203,6 +214,39 @@ impl OaatMultiroomOutput {
     }
 }
 
+/// #6393 (point 4) — `endpoint_release` dans un groupe : l'endpoint qui a
+/// rendu son DAC à une autre source de l'appareil quitte le groupe
+/// (`remove_endpoint_and_notify`, qui prévient les autres de la nouvelle
+/// composition), et les autres continuent de jouer.
+///
+/// La tâche tient la zone par un `Weak` : le canal vit dans la zone, et une
+/// référence forte l'empêcherait de jamais se fermer.
+#[cfg(feature = "oaat")]
+fn retirer_les_endpoints_liberes(
+    mut liberations: tokio::sync::mpsc::Receiver<oaat_controller::ZoneEndpointRelease>,
+    zone: std::sync::Weak<Mutex<oaat_controller::Zone>>,
+    device_name: String,
+) {
+    tokio::spawn(async move {
+        while let Some(liberation) = liberations.recv().await {
+            let Some(zone) = zone.upgrade() else { break };
+            let retire = zone
+                .lock()
+                .await
+                .remove_endpoint_and_notify(&liberation.endpoint_id)
+                .await;
+            info!(
+                device = %device_name,
+                endpoint_id = %liberation.endpoint_id,
+                stream_id = %liberation.release.stream_id,
+                reason = ?liberation.release.reason,
+                retire,
+                "oaat-multiroom: l'endpoint a rendu sa sortie, retiré du groupe"
+            );
+        }
+    });
+}
+
 /// Ce que Tune garantit structurellement pour un groupe OAAT.
 ///
 /// Le contrôleur envoie un PTS absolu dans chaque paquet et les points de
@@ -251,6 +295,16 @@ impl OutputTarget for OaatMultiroomOutput {
         use oaat_core::wire::PacketFlags;
 
         self.stop().await.ok();
+
+        // #6393 (point 4) — une seule tâche par groupe, lancée ici parce que
+        // `new()` peut tourner hors runtime.
+        if let Some(liberations) = self.liberations.lock().ok().and_then(|mut l| l.take()) {
+            retirer_les_endpoints_liberes(
+                liberations,
+                Arc::downgrade(&self.zone),
+                self.name.clone(),
+            );
+        }
 
         let url = media.url.to_owned();
         let title = media.title.unwrap_or("Unknown").to_owned();

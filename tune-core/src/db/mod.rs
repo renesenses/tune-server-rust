@@ -11,6 +11,8 @@ pub mod backend;
 pub mod champs_tenus;
 pub mod coffrets_auto;
 pub mod collection_folder_repo;
+/// Le conteneur de chaque élément de file (#6466).
+pub mod contexte_de_file;
 /// Un disque par dossier pour un album sans DISCNUMBER réparti en dossiers frères.
 pub mod disques_par_dossier;
 /// Les dossiers « Collections » suivent leurs albums (#5527, #5528).
@@ -30,6 +32,7 @@ pub mod home_queries;
 pub mod ignored_device_repo;
 /// Lectures SQLite en cours, pour le relevé d'un gel de l'exécuteur (#5677).
 pub mod lectures_en_cours;
+pub mod listening_resume;
 /// Registre DURABLE des serveurs multimédia (#2219, phase 1) — sur le modèle
 /// de `network_mounts` : l'intention d'un côté, le constat de l'autre.
 pub mod media_server_repo;
@@ -58,7 +61,11 @@ pub mod postgres;
 #[cfg(all(test, feature = "postgres"))]
 mod postgres_e2e;
 pub mod profile_repo;
+/// #6682 — le temps d'écoute radio par station (« Mon écoute »).
+pub mod radio_ecoute;
 pub mod radio_repo;
+/// #6500 — les stations de radio indexées comme pistes par l'UPnP, retirées.
+pub mod radios_indexees_upnp_6500;
 pub mod rating_repo;
 /// Fil 2138 — rattrapage unique des dates d'ajout figées au premier scan.
 pub mod rattrapage_dates_ajout_2138;
@@ -95,6 +102,9 @@ mod filtre_dr_190_tests;
 mod lenteur_albums_4800_tests;
 #[cfg(test)]
 mod lenteur_pistes_5138_tests;
+/// #7535 — un MBID trouvé par le nom n'est plus posé s'il est déjà porté.
+#[cfg(test)]
+mod mbid_deja_porte_7535_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
 #[cfg(test)]
@@ -103,4 +113,9 @@ mod replieur_wal_tests;
 /// `listen_history.album_id`, preuves d'équivalence et de migration.
 #[cfg(test)]
 mod reprendre_l_ecoute_2130_tests;
+#[cfg(test)]
+mod top_titres_index_tests;
 pub mod upnp_revision;
+/// #5974 — un vidage qui échoue ne s'annonce plus réussi.
+#[cfg(test)]
+mod vidage_5974_tests;

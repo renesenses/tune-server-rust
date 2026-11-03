@@ -36,3 +36,5 @@ symphonia = { workspace = true }
 # trait `StreamingService` (`async_trait`, `serde_json::Value`).
 async-trait = { workspace = true }
 serde_json = { workspace = true }
+# Fichiers synthétiques du banc DLNA multicanal, effacés à la fin du test.
+tempfile = "3"

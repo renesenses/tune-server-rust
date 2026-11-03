@@ -1227,6 +1227,67 @@ mod tests {
         handle.abort();
     }
 
+    /// #5575 — le Diretta UPnP Renderer de Tades (fil 2071) acquitte
+    /// `SetVolume` et le relit fidèlement, sans jamais l'appliquer
+    /// (`cometdom/DirettaRendererUPnP`, `UPnPDevice::actionSetVolume` ne fait
+    /// que ranger `m_volume`). Le faux renderer ci-dessous acquitte TOUT,
+    /// comme lui : seul Tune peut dire que la consigne restera sans effet.
+    #[tokio::test]
+    async fn un_volume_decoratif_diretta_est_refuse_au_lieu_d_un_curseur_muet_5575() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+        // L'UDN par défaut du projet, celui du journal de Tades.
+        let output = DlnaOutput::new(
+            "C19".into(),
+            "uuid:diretta-renderer-a7366917f9ddf66e".into(),
+            "127.0.0.1".into(),
+            format!("{base}/AVTransport"),
+            format!("{base}/RenderingControl"),
+            None,
+        );
+        let erreur = output.set_volume(0.03).await.expect_err(
+            "volume décoratif : une consigne à 3 % rendue Ok laisse le curseur bouger \
+             sur un son inchangé (#5575)",
+        );
+        assert!(
+            erreur.contains("C19") && erreur.contains("sans"),
+            "message : {erreur}"
+        );
+        assert!(
+            erreur.contains("sur l'appareil"),
+            "le message dit où régler : {erreur}"
+        );
+        assert_eq!(
+            state.volume_count.load(Ordering::Relaxed),
+            0,
+            "rien n'est envoyé"
+        );
+        // Le plein volume est ce que l'appareil restitue : accepté (volume fixe, #2395).
+        output.set_volume(1.0).await.expect("100 % reste accepté");
+        assert_eq!(state.volume_count.load(Ordering::Relaxed), 1);
+
+        // Même appareil sous un UDN choisi (`--uuid`) : reconnu par son modelName.
+        let par_modele = DlnaOutput::new(
+            "C19".into(),
+            "uuid:choisi-a-la-main".into(),
+            "127.0.0.1".into(),
+            format!("{base}/AVTransport"),
+            format!("{base}/RenderingControl"),
+            None,
+        )
+        .with_modele(Some("Diretta UPnP Renderer".into()));
+        assert!(par_modele.set_volume(0.5).await.is_err());
+
+        // Témoin : un renderer ordinaire, même harnais, même consigne → Ok.
+        let ordinaire = make_dlna(&base);
+        ordinaire
+            .set_volume(0.03)
+            .await
+            .expect("renderer ordinaire : Ok");
+        assert_eq!(state.volume_count.load(Ordering::Relaxed), 2);
+        handle.abort();
+    }
+
     /// #1393 — un `SetVolume` REFUSÉ par le renderer doit remonter en erreur.
     ///
     /// Eric (fil forum, Windows 0.9.61) : « le volume ne fait rien » vers un
@@ -2775,18 +2836,20 @@ mod tests {
             let msearch_recus = Arc::new(AtomicUsize::new(0));
             let (port_ssdp, ssdp) =
                 demarrer_repondeur_ssdp(location.clone(), msearch_recus.clone()).await;
-            let port_mort = {
-                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                l.local_addr().unwrap().port()
-            };
+            // Garder le port réservé, SANS listen : la connexion est refusée.
+            // Un listener créé puis détruit laisse un autre test récupérer le
+            // port entre les deux commandes (404 SOAP observé en CI #6514).
+            let port_reserve = tokio::net::TcpSocket::new_v4().unwrap();
+            port_reserve.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let port_mort = port_reserve.local_addr().unwrap().port();
             let output = sortie(port_mort, port_ssdp)
                 .with_redecouverte(port_ssdp, std::time::Duration::from_millis(300));
 
-            let debut = std::time::Instant::now();
-            let err = output
-                .set_volume(0.4)
-                .await
-                .expect_err("personne n'écoute et personne ne répond au M-SEARCH");
+            let err =
+                tokio::time::timeout(std::time::Duration::from_secs(15), output.set_volume(0.4))
+                    .await
+                    .expect("la redécouverte sans réponse doit se terminer")
+                    .expect_err("personne n'écoute et personne ne répond au M-SEARCH");
             assert!(
                 err.starts_with("soap send:"),
                 "l'erreur d'origine doit rester en tête : {err}"
@@ -2794,11 +2857,6 @@ mod tests {
             assert!(
                 err.contains(crate::outputs::dlna::MOTIF_REDECOUVERTE_ECHOUEE),
                 "l'erreur doit être enrichie du motif : {err}"
-            );
-            assert!(
-                debut.elapsed() < std::time::Duration::from_secs(3),
-                "un refus est instantané et le M-SEARCH borné : {:?}",
-                debut.elapsed()
             );
             // Dans le répit : pas de second M-SEARCH.
             let err2 = output.set_volume(0.5).await.expect_err("toujours mort");

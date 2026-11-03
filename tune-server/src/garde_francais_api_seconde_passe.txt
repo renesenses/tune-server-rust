@@ -1,0 +1,10 @@
+# Exceptions de la garde `garde_francais_api` (#7077).
+#
+# Une ligne par chaîne française encore présente dans un champ exposé de l'API :
+#   fichier relatif au dépôt | début de la première ligne du texte | motif
+# La garde rougit sur toute chaîne absente de cette liste ET sur toute ligne qui
+# ne correspond plus à rien : la liste ne peut que diminuer. Corriger une
+# chaîne (code stable + clé de i18n_server.json via crate::message_api), puis
+# retirer sa ligne. N'y AJOUTER une ligne que pour une raison écrite dans le motif.
+
+tune-server/src/boot_status.rs | Tune démarre : {phase} | démarrage : tenu par #7073 (b209alex), ne pas y toucher ici

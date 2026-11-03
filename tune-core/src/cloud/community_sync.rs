@@ -173,46 +173,162 @@ pub async fn pull_community_enrichments(
 
     let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
     let total = data["tracks"].as_array().map(|a| a.len()).unwrap_or(0);
+    let enrichissements = lire_les_enrichissements(&data);
 
-    let mut applied = 0usize;
-    if let Some(arr) = data["tracks"].as_array() {
-        for t in arr {
-            let mb_id = match t["musicbrainz_recording_id"].as_str() {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-            let genre = t["genre"].as_str().map(|s| s.to_string());
-            let year = t["year"].as_i64().map(|v| v as i32);
-            let composer = t["composer"].as_str().map(|s| s.to_string());
-            let label = t["label"].as_str().map(|s| s.to_string());
-            let isrc = t["isrc"].as_str().map(|s| s.to_string());
-
-            let result = backend.execute(
-                "UPDATE tracks SET \
-                 genre = COALESCE(genre, ?), \
-                 year = COALESCE(year, ?), \
-                 composer = COALESCE(composer, ?), \
-                 label = COALESCE(label, ?), \
-                 isrc = COALESCE(isrc, ?) \
-                 WHERE musicbrainz_recording_id = ? \
-                 AND (genre IS NULL OR year IS NULL OR composer IS NULL)",
-                &[
-                    &genre as &dyn ToSqlValue,
-                    &year as &dyn ToSqlValue,
-                    &composer as &dyn ToSqlValue,
-                    &label as &dyn ToSqlValue,
-                    &isrc as &dyn ToSqlValue,
-                    &mb_id as &dyn ToSqlValue,
-                ],
-            );
-            if result.is_ok() {
-                applied += 1;
-            }
-        }
-    }
+    let applied = appliquer_les_enrichissements(backend, enrichissements).await;
 
     info!(pulled = total, applied, "community_enrichments_pulled");
     Ok(applied)
+}
+
+/// Un enrichissement reçu du nuage, déjà lu dans le JSON.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Enrichissement {
+    pub(crate) mb_id: String,
+    pub(crate) genre: Option<String>,
+    pub(crate) year: Option<i32>,
+    pub(crate) composer: Option<String>,
+    pub(crate) label: Option<String>,
+    pub(crate) isrc: Option<String>,
+}
+
+/// Les enrichissements de la réponse `/enriched`. Une entrée sans MBID est
+/// sautée, comme avant.
+pub(crate) fn lire_les_enrichissements(data: &serde_json::Value) -> Vec<Enrichissement> {
+    let Some(arr) = data["tracks"].as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|t| {
+            Some(Enrichissement {
+                mb_id: t["musicbrainz_recording_id"].as_str()?.to_string(),
+                genre: t["genre"].as_str().map(|s| s.to_string()),
+                year: t["year"].as_i64().map(|v| v as i32),
+                composer: t["composer"].as_str().map(|s| s.to_string()),
+                label: t["label"].as_str().map(|s| s.to_string()),
+                isrc: t["isrc"].as_str().map(|s| s.to_string()),
+            })
+        })
+        .collect()
+}
+
+/// #6702 — taille d'un lot d'enrichissements : une transaction courte.
+pub(crate) const LOT_ENRICHISSEMENTS: usize = 50;
+
+/// #6702 — pause entre deux lots, pour rendre la main à l'exécuteur et au
+/// verrou d'écriture.
+pub(crate) const PAUSE_ENTRE_LOTS: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// #6702 — la mise à jour d'UNE piste par son MBID.
+///
+/// Le filtre plié `LOWER(TRIM(…)) = LOWER(TRIM(?))` est l'expression exacte de
+/// l'index `idx_tracks_mbid_recording_norm` (migration 122, PG 086) : SQLite
+/// et PostgreSQL vont droit aux lignes. L'égalité stricte qui suit garde le
+/// sens d'avant à l'identique (même casse, mêmes espaces). Sans le filtre plié,
+/// chaque `UPDATE` balayait toute la table `tracks` : 1000 balayages de plus de
+/// 100 000 lignes sur le .18, de 23 à 52 s d'écriture d'affilée.
+///
+/// #7538 — le genre passe par
+/// [`crate::metadata::enrichment::GENRE_COMBLE_PAR_L_ENRICHISSEMENT`] : ni le
+/// tableau `genres` d'une piste, ni le genre de son album ne sont remplacés
+/// par celui du nuage. Et la requête jouée reçoit la clause des dossiers
+/// exclus de l'enrichissement ([`sql_appliquer_enrichissement`]).
+pub(crate) const SQL_APPLIQUER_ENRICHISSEMENT: &str = concat!(
+    "UPDATE tracks SET genre = ",
+    crate::metadata::enrichment::genre_comble_par_l_enrichissement!(),
+    ", \
+     year = COALESCE(year, ?), \
+     composer = COALESCE(composer, ?), \
+     label = COALESCE(label, ?), \
+     isrc = COALESCE(isrc, ?) \
+     WHERE LOWER(TRIM(musicbrainz_recording_id)) = LOWER(TRIM(?)) \
+     AND musicbrainz_recording_id = ? \
+     AND (genre IS NULL OR year IS NULL OR composer IS NULL)"
+);
+
+/// #7538 — [`SQL_APPLIQUER_ENRICHISSEMENT`] et la clause des dossiers exclus
+/// de l'enrichissement, lue une fois par lot. Rien de réglé : la requête
+/// constante, au caractère près.
+pub(crate) fn sql_appliquer_enrichissement(backend: &Arc<dyn DbBackend>) -> String {
+    format!(
+        "{SQL_APPLIQUER_ENRICHISSEMENT}{}",
+        crate::taches_de_fond::perimetre::clause_hors_enrichissement(
+            backend,
+            crate::taches_de_fond::perimetre::CHEMIN_OUVRABLE_DE_TRACKS,
+        )
+    )
+}
+
+fn parametres(e: &Enrichissement) -> [&dyn ToSqlValue; 7] {
+    [
+        &e.genre as &dyn ToSqlValue,
+        &e.year as &dyn ToSqlValue,
+        &e.composer as &dyn ToSqlValue,
+        &e.label as &dyn ToSqlValue,
+        &e.isrc as &dyn ToSqlValue,
+        &e.mb_id as &dyn ToSqlValue,
+        &e.mb_id as &dyn ToSqlValue,
+    ]
+}
+
+/// #6702 — applique UN lot, sur un fil bloquant : une transaction courte.
+/// Rend le nombre d'enrichissements appliqués sans erreur, compté comme
+/// avant (une entrée sans piste correspondante compte aussi).
+///
+/// Si la transaction échoue (une ligne en erreur, ou le `COMMIT`), le lot est
+/// annulé puis rejoué entrée par entrée : chaque enrichissement reste
+/// indépendant des autres, comme dans la boucle d'avant. Le rejeu est sûr :
+/// `COALESCE` ne remplit que ce qui est vide.
+pub(crate) fn appliquer_un_lot(backend: &Arc<dyn DbBackend>, lot: &[Enrichissement]) -> usize {
+    // Écrivain de FOND (#4681) : pendant une lecture, il laisse d'abord passer
+    // les écrivains de premier plan qui attendent (sondeur, file, historique).
+    let _fond = crate::taches_de_fond::priorite::politique::marquer_le_fil_de_fond();
+    let mut appliques = 0usize;
+    let sql = sql_appliquer_enrichissement(backend);
+    let en_transaction = backend.write_tx(&mut |tx| {
+        appliques = 0;
+        for e in lot {
+            tx.execute(&sql, &parametres(e))?;
+            appliques += 1;
+        }
+        Ok(())
+    });
+    if en_transaction.is_ok() {
+        return appliques;
+    }
+    lot.iter()
+        .filter(|e| backend.execute(&sql, &parametres(e)).is_ok())
+        .count()
+}
+
+/// #6702 — applique les enrichissements par lots de [`LOT_ENRICHISSEMENTS`].
+///
+/// Chaque lot part sur `spawn_blocking` : aucun fil de l'exécuteur ne porte
+/// les écritures SQLite synchrones. Entre deux lots, le verrou d'écriture est
+/// rendu et la tâche dort [`PAUSE_ENTRE_LOTS`] : le sondeur, qui enregistre la
+/// position des zones par ce même verrou, passe entre deux lots au lieu
+/// d'attendre la fin des 1000 écritures.
+pub(crate) async fn appliquer_les_enrichissements(
+    backend: &Arc<dyn DbBackend>,
+    enrichissements: Vec<Enrichissement>,
+) -> usize {
+    let mut applied = 0usize;
+    let mut restants = enrichissements;
+    let mut premier = true;
+    while !restants.is_empty() {
+        if !premier {
+            tokio::time::sleep(PAUSE_ENTRE_LOTS).await;
+        }
+        premier = false;
+        let reste = restants.split_off(restants.len().min(LOT_ENRICHISSEMENTS));
+        let lot = std::mem::replace(&mut restants, reste);
+        let b = backend.clone();
+        match tokio::task::spawn_blocking(move || appliquer_un_lot(&b, &lot)).await {
+            Ok(n) => applied += n,
+            Err(e) => warn!(error = %e, "community_enrichments_lot_failed"),
+        }
+    }
+    applied
 }
 
 /// Resolve MusicBrainz recording IDs for local tracks that don't have one, by
@@ -242,9 +358,12 @@ pub async fn resolve_missing_mbids(
     let cutoff = now_epoch_secs()
         .saturating_sub(RESOLVE_RETRY_SECS)
         .to_string();
+    // #7538 — une piste d'un dossier exclu de l'enrichissement n'est pas
+    // candidate : ni MBID, ni genre venus du nuage.
     let rows = backend
         .query_many(
-            "SELECT t.id, ar.name, al.title, t.title \
+            &format!(
+                "SELECT t.id, ar.name, al.title, t.title \
              FROM tracks t \
              LEFT JOIN artists ar ON t.artist_id = ar.id \
              LEFT JOIN albums al ON t.album_id = al.id \
@@ -254,8 +373,13 @@ pub async fn resolve_missing_mbids(
                AND NOT EXISTS ( \
                  SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'mb_resolve_tried' AND m.value >= ? \
-               ) \
+               ){} \
              LIMIT 100",
+                crate::taches_de_fond::perimetre::clause_hors_enrichissement(
+                    backend,
+                    crate::db::track_repo::sql::CHEMIN_OUVRABLE,
+                )
+            ),
             &[&cutoff as &dyn ToSqlValue],
         )
         .map_err(|e| format!("query: {e}"))?;
@@ -318,10 +442,13 @@ pub async fn resolve_missing_mbids(
             let track_id = ids[idx];
 
             let result = backend.execute(
-                "UPDATE tracks SET \
-                 musicbrainz_recording_id = ?, \
-                 genre = COALESCE(genre, ?) \
-                 WHERE id = ? AND (musicbrainz_recording_id IS NULL OR musicbrainz_recording_id = '')",
+                concat!(
+                    "UPDATE tracks SET \
+                     musicbrainz_recording_id = ?, \
+                     genre = ",
+                    crate::metadata::enrichment::genre_comble_par_l_enrichissement!(),
+                    " WHERE id = ? AND (musicbrainz_recording_id IS NULL OR musicbrainz_recording_id = '')"
+                ),
                 &[
                     &mbid as &dyn ToSqlValue,
                     &genre as &dyn ToSqlValue,
@@ -371,16 +498,23 @@ pub async fn pull_community_extra(
     let cutoff = now_epoch_secs()
         .saturating_sub(EXTRA_RESWEEP_SECS)
         .to_string();
+    // #7538 — ni les métadonnées étendues du nuage sur un dossier exclu.
     let rows = backend
         .query_many(
-            "SELECT t.id, t.musicbrainz_recording_id \
+            &format!(
+                "SELECT t.id, t.musicbrainz_recording_id \
              FROM tracks t \
              WHERE t.musicbrainz_recording_id IS NOT NULL AND t.musicbrainz_recording_id != '' \
                AND NOT EXISTS ( \
                  SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'mb_extra_synced' AND m.value >= ? \
-               ) \
+               ){} \
              LIMIT 100",
+                crate::taches_de_fond::perimetre::clause_hors_enrichissement(
+                    backend,
+                    crate::db::track_repo::sql::CHEMIN_OUVRABLE,
+                )
+            ),
             &[&cutoff as &dyn ToSqlValue],
         )
         .map_err(|e| format!("query: {e}"))?;
@@ -654,3 +788,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         }
     });
 }
+
+#[cfg(test)]
+#[path = "community_sync_tests.rs"]
+mod tests;

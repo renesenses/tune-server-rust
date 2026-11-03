@@ -225,6 +225,29 @@ pub mod sql {
         )
     }
 
+    /// #6399 — une FENÊTRE de [`get_ordered`] : `LIMIT` puis `OFFSET`.
+    /// `q.id` départage deux lignes de même position, comme [`get_at`] : la
+    /// fenêtre suivante ne doit ni répéter ni sauter une ligne.
+    pub fn get_ordered_window<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE q.zone_id = {} ORDER BY q.position, q.id LIMIT {} OFFSET {}",
+            unified_select_base(),
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    /// #6399 — le seul drapeau `is_current`, dans l'ordre de la fenêtre : de
+    /// quoi situer la ligne en cours et compter la file sans la jointure.
+    pub fn current_flags_ordered<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT q.is_current FROM queue_items q WHERE q.zone_id = {} \
+             ORDER BY q.position, q.id",
+            d.placeholder(1)
+        )
+    }
+
     pub fn get_at<D: SqlDialect>(d: &D) -> String {
         format!(
             // `ORDER BY q.position` ne DEPARTAGE RIEN quand deux lignes portent
@@ -330,6 +353,14 @@ pub mod sql {
             "UPDATE queue_items SET position = {} WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2)
+        )
+    }
+
+    /// #6526 — les identifiants de ligne de la file d'une zone.
+    pub fn ids_de_la_zone<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id FROM queue_items WHERE zone_id = {}",
+            d.placeholder(1)
         )
     }
 
@@ -488,7 +519,12 @@ impl QueueEntry {
 }
 
 /// An item to enqueue, source-agnostic. Used by the unified `insert_at`/`append`.
-#[derive(Debug, Clone)]
+// `Streaming` est construit par champs nommés dans une trentaine de fichiers de
+// quatre caisses (dont orchestrator/tests.rs, en PR ouverte) : le mettre en
+// `Box` les réécrirait tous. Une valeur ne vit que le temps d'un ajout à la
+// file, jamais en masse : la taille de l'enum ne coûte rien de mesurable.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueueInput {
     Local {
         track_id: i64,
@@ -631,10 +667,10 @@ impl PlayQueueRepo {
         let params: [&dyn ToSqlValue; 1] = [&zone_id];
         let rows = self.db.query_many(&sql, &params)?;
         if !rows.is_empty() {
-            return Ok(rows.iter().map(row_to_queue_item).collect());
+            return Ok(rows.iter().map(|cols| row_to_queue_item(cols)).collect());
         }
         let strong = self.db.query_many_strong(&sql, &params)?;
-        Ok(strong.iter().map(row_to_queue_item).collect())
+        Ok(strong.iter().map(|cols| row_to_queue_item(cols)).collect())
     }
 
     pub fn get_current(&self, zone_id: i64) -> Result<Option<QueueItem>, String> {
@@ -644,7 +680,7 @@ impl PlayQueueRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_queue_item))
+            .map(|cols| row_to_queue_item(cols)))
     }
 
     /// Le sous-ensemble de `ids` qui possède encore une ligne dans `tracks`,
@@ -1030,10 +1066,45 @@ impl PlayQueueRepo {
         let params: [&dyn ToSqlValue; 1] = [&zone_id];
         let rows = self.db.query_many(&sql, &params)?;
         if !rows.is_empty() {
-            return Ok(rows.iter().map(row_to_queue_entry).collect());
+            return Ok(rows.iter().map(|cols| row_to_queue_entry(cols)).collect());
         }
         let strong = self.db.query_many_strong(&sql, &params)?;
-        Ok(strong.iter().map(row_to_queue_entry).collect())
+        Ok(strong.iter().map(|cols| row_to_queue_entry(cols)).collect())
+    }
+
+    /// #6399 — `limit` lignes de la file à partir du rang `offset`, dans
+    /// l'ordre de [`Self::get_ordered`]. Une file de 40 000 titres ne se relit
+    /// plus en entier pour en afficher cent.
+    pub fn get_ordered_window(
+        &self,
+        zone_id: i64,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<QueueEntry>, String> {
+        let sql = self.dialect_sql(sql::get_ordered_window, sql::get_ordered_window);
+        let params: [&dyn ToSqlValue; 3] = [&zone_id, &limit, &offset];
+        let rows = self.db.query_many(&sql, &params)?;
+        if !rows.is_empty() || offset > 0 {
+            return Ok(rows.iter().map(|cols| row_to_queue_entry(cols)).collect());
+        }
+        let strong = self.db.query_many_strong(&sql, &params)?;
+        Ok(strong.iter().map(|cols| row_to_queue_entry(cols)).collect())
+    }
+
+    /// #6399 — `(rang de la ligne en cours, longueur)` de la file, sans lire
+    /// ses titres. Le rang est celui de [`Self::get_ordered_window`].
+    pub fn current_index_and_length(&self, zone_id: i64) -> Result<(Option<i64>, i64), String> {
+        let sql = self.dialect_sql(sql::current_flags_ordered, sql::current_flags_ordered);
+        let params: [&dyn ToSqlValue; 1] = [&zone_id];
+        let mut rows = self.db.query_many(&sql, &params)?;
+        if rows.is_empty() {
+            rows = self.db.query_many_strong(&sql, &params)?;
+        }
+        let courant = rows
+            .iter()
+            .position(|r| r.first().and_then(|v| v.as_i64()).unwrap_or(0) != 0)
+            .map(|p| p as i64);
+        Ok((courant, rows.len() as i64))
     }
 
     /// The single queue entry at `position` (source-agnostic), if any.
@@ -1044,7 +1115,7 @@ impl PlayQueueRepo {
             .db
             .query_one(&sql, &params)?
             .as_ref()
-            .map(row_to_queue_entry))
+            .map(|cols| row_to_queue_entry(cols)))
     }
 
     /// Insert items at `position` (or append when None) in the unified space,
@@ -1311,6 +1382,60 @@ impl PlayQueueRepo {
         })
     }
 
+    /// La file entière, lue sur la connexion d'ÉCRITURE (#6526).
+    ///
+    /// `get_ordered` lit d'abord la connexion de lecture, qui peut retarder
+    /// d'une écriture sur l'autre : un ordre calculé dessus juste après un
+    /// ajout serait refusé par [`Self::reordonner`] pour une ligne manquante.
+    pub fn get_ordered_fort(&self, zone_id: i64) -> Result<Vec<QueueEntry>, String> {
+        let sql = self.dialect_sql(sql::get_ordered, sql::get_ordered);
+        let params: [&dyn ToSqlValue; 1] = [&zone_id];
+        let rows = self.db.query_many_strong(&sql, &params)?;
+        Ok(rows.iter().map(|cols| row_to_queue_entry(cols)).collect())
+    }
+
+    /// Réécrit l'ORDRE de la file selon `ids`, identifiants de ligne
+    /// (`queue_items.id`) dans le nouvel ordre — l'aléatoire de #6526.
+    ///
+    /// Les lignes ne sont ni supprimées ni recréées : seule leur `position`
+    /// change, renumérotée en `0..N-1`. Elles gardent donc leur identifiant et
+    /// leur marque « en cours », qui suit son titre. `ids` doit être une
+    /// permutation EXACTE des lignes de la zone, relues dans la transaction
+    /// d'écriture : une file qui a changé entre-temps (ajout ou retrait
+    /// concurrent) est refusée, sans rien écrire, plutôt que d'en perdre ou
+    /// d'en dupliquer une ligne.
+    pub fn reordonner(&self, zone_id: i64, ids: &[i64]) -> Result<(), String> {
+        let mut voulus = ids.to_vec();
+        voulus.sort_unstable();
+        let ids_sql = self.dialect_sql(sql::ids_de_la_zone, sql::ids_de_la_zone);
+        let set_pos_sql = self.dialect_sql(sql::set_position_by_id, sql::set_position_by_id);
+        self.db.write_tx(&mut |tx| {
+            // La vérification se fait DANS la transaction d'écriture : entre
+            // elle et la renumérotation, aucun autre écrivain ne passe.
+            let p1: [&dyn ToSqlValue; 1] = [&zone_id];
+            let mut actuels: Vec<i64> = tx
+                .query_many(&ids_sql, &p1)?
+                .iter()
+                .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
+                .collect();
+            actuels.sort_unstable();
+            if actuels != voulus {
+                return Err(format!(
+                    "file de la zone {zone_id} modifiée pendant le réordonnancement \
+                     ({} lignes en base, {} dans l'ordre demandé)",
+                    actuels.len(),
+                    voulus.len()
+                ));
+            }
+            for (i, id) in ids.iter().enumerate() {
+                let pos = i as i64;
+                let p: [&dyn ToSqlValue; 2] = [&pos, id];
+                tx.execute(&set_pos_sql, &p)?;
+            }
+            Ok(())
+        })
+    }
+
     /// « Vider la suite » (#4169) : retire tout ce qui SUIT l'ordinal
     /// `position` dans la file unifiée — locale et de service confondues,
     /// puisque les deux vivent dans la même table — et laisse intact ce qui
@@ -1563,7 +1688,7 @@ impl PlayQueueRepo {
     }
 }
 
-fn row_to_queue_item(cols: &Vec<SqlValue>) -> QueueItem {
+fn row_to_queue_item(cols: &[SqlValue]) -> QueueItem {
     QueueItem {
         id: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
         zone_id: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
@@ -1583,7 +1708,7 @@ fn row_to_queue_item(cols: &Vec<SqlValue>) -> QueueItem {
 }
 
 /// Maps a row from `sql::unified_select_base()` (22 columns) to a QueueEntry.
-fn row_to_queue_entry(cols: &Vec<SqlValue>) -> QueueEntry {
+fn row_to_queue_entry(cols: &[SqlValue]) -> QueueEntry {
     QueueEntry {
         id: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
         zone_id: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),

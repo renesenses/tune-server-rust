@@ -39,11 +39,13 @@ pub(super) fn echec_ecriture(
         erreur = %erreur,
         "zone_patch_write_failed"
     );
-    (
+    crate::message_api::refus_avec_cause(
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("écriture impossible du champ « {champ} » : {erreur}"),
+        "zone_field_write_failed",
+        "api.zones.fieldWriteFailed",
+        &[("field", champ.to_string())],
+        erreur,
     )
-        .into_response()
 }
 
 /// La requête elle-même est fautive : **journaliser**, puis 400.
@@ -58,11 +60,13 @@ pub(super) fn refus_de_valeur(
     raison: &str,
 ) -> axum::response::Response {
     warn!(zone_id, champ, valeur, raison, "zone_patch_rejected");
-    (
+    crate::message_api::refus_avec_cause(
         StatusCode::BAD_REQUEST,
-        format!("champ « {champ} » : {raison} (reçu : « {valeur} »)"),
+        "zone_field_invalid",
+        "api.zones.fieldInvalid",
+        &[("field", champ.to_string()), ("value", valeur.to_string())],
+        raison,
     )
-        .into_response()
 }
 
 pub(super) async fn patch_zone(
@@ -107,6 +111,17 @@ pub(super) async fn patch_zone(
         persister_le_patch(&state, &repo, id, &zone_before, command_device_id, &body).await
     {
         return reponse;
+    }
+    // #7133 — la zone a changé d'appareil : celui qu'elle quitte se tait,
+    // sans quoi il continue de jouer à côté du nouveau.
+    if let Some(ref nouvelle) = body.output_device_id {
+        couper_l_ancienne_sortie(
+            &state,
+            id,
+            zone_before.output_device_id.as_deref(),
+            Some(nouvelle),
+        )
+        .await;
     }
 
     if body.brand.is_some() || body.model.is_some() {
@@ -279,10 +294,19 @@ async fn commander_la_sortie(
     // du pour-cent entier ou des dB. L'orchestrateur la reçoit en `f64` et la
     // garde telle quelle dans l'état de lecture, vers le device et en base
     // (la colonne n'arrondit plus au pour-cent depuis #2886).
+    // #6721 — `confirm_increase` laisse passer une hausse de plus de 10 dB ;
+    // sans lui, elle est plafonnée (la zone rendue dit le volume retenu).
     if let Some(volume) = volume_demande
         && let Err(error) = state
             .orchestrator
-            .set_volume(id, volume, command_device_id)
+            .set_volume_avec_garde(
+                id,
+                volume,
+                command_device_id,
+                tune_core::audio::garde_de_hausse::Hausse::depuis_confirmation(
+                    body.confirm_increase,
+                ),
+            )
             .await
     {
         return Err(crate::routes::playback::output_command_error_response(
@@ -352,6 +376,22 @@ async fn persister_le_patch(
     body: &PatchZone,
 ) -> Result<(), axum::response::Response> {
     persister_la_zone_et_sa_sortie(state, repo, id, body)?;
+    // #6774 — un changement d'appareil a pu désarmer PURE ou le volume fixe
+    // et ramener le volume de la zone : l'état de lecture en mémoire suit la
+    // base (il ne fait que baisser), et la suite du PATCH lit la zone RELUE.
+    let zone_relue;
+    let zone_before = if body.output_device_id.is_some() {
+        tune_core::audio::reglages_de_volume::aligner_la_lecture(
+            &state.backend,
+            &state.playback,
+            id,
+        )
+        .await;
+        zone_relue = repo.get(id).ok().flatten();
+        zone_relue.as_ref().unwrap_or(zone_before)
+    } else {
+        zone_before
+    };
     persister_le_volume_fixe(state, repo, id, zone_before, command_device_id, body).await?;
     persister_la_lecture(state, repo, id, body)?;
     persister_le_reseau(state, repo, id, body).await?;
@@ -422,6 +462,17 @@ async fn persister_le_volume_fixe(
 ) -> Result<(), axum::response::Response> {
     lier_ecrire_a!(state, id, $);
     if let Some(fixed) = body.fixed_volume {
+        // #6774 — le même PATCH vient de changer d'appareil et de désarmer le
+        // volume fixe : le réarmer exige la confirmation, comme tout armement.
+        // Sans elle, la demande est ignorée — la zone reste désarmée et
+        // l'utilisateur réarme lui-même.
+        if fixed_volume_confirmation_required(zone_before, body) {
+            warn!(
+                zone_id = id,
+                "fixed_volume_rearmement_ignore_changement_d_appareil"
+            );
+            return Ok(());
+        }
         // #2395 — le mode bit-perfect fait UN saut, annoncé et réversible.
         //
         // Seules les TRANSITIONS agissent : un PATCH qui réaffirme l'état
@@ -972,16 +1023,18 @@ pub(super) async fn create_zone(
             output_type = ?output_type,
             "create_zone_sans_appareil_refuse"
         );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "detail": format!(
-                    "zone_sans_appareil:La zone « {} » n'aurait aucune sortie : choisissez un appareil découvert avant de la créer.",
-                    body.name
-                )
-            })),
-        )
-            .into_response();
+        // `detail` garde sa forme historique `zone_sans_appareil:<phrase>`,
+        // que lisaient les clients d'avant ; la phrase est désormais traduite.
+        let mut corps = crate::message_api::corps_refus(
+            "zone_sans_appareil",
+            "api.zones.noOutputDevice",
+            &[("name", body.name.clone())],
+        );
+        corps["detail"] = json!(format!(
+            "zone_sans_appareil:{}",
+            corps["message"].as_str().unwrap_or_default()
+        ));
+        return (StatusCode::BAD_REQUEST, Json(corps)).into_response();
     }
 
     // If device already has a zone (visible OR hidden), return it (no premium check needed).
@@ -1318,6 +1371,18 @@ pub(super) async fn delete_zone(
                 etat_lecture = ?lecture,
                 "zone_deleted_by_user"
             );
+            // #6299 — l'utilisateur a supprimé la zone d'un renderer DLNA
+            // découvert : on cesse de le re-sonder à chaque démarrage. C'est le
+            // seul geste qui reste pour un appareil parti du réseau, que
+            // Réglages › Appareils ne liste plus. S'il est toujours là, le
+            // SSDP le réannonce.
+            if let Some(appareil) = visee
+                .as_ref()
+                .filter(|z| z.output_type.as_deref() == Some("dlna"))
+                .and_then(|z| z.output_device_id.as_deref())
+            {
+                crate::routes::devices::forget_discovered_dlna(&state.backend, appareil);
+            }
             state.event_bus.emit_typed(
                 tune_core::event_types::EventType::ZoneDeleted,
                 json!({"id": id}),
@@ -1351,7 +1416,11 @@ pub(super) async fn fusionner_zones(
     if doublon == cible {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "meme_zone", "message": "une zone ne se fusionne pas dans elle-même"})),
+            Json(crate::message_api::corps_refus(
+                "meme_zone",
+                "api.zones.mergeSelf",
+                &[],
+            )),
         )
             .into_response();
     }
@@ -1370,11 +1439,15 @@ pub(super) async fn fusionner_zones(
     if cle_doublon.is_none() || cle_doublon != cle_cible {
         return (
             StatusCode::CONFLICT,
-            Json(json!({
-                "error": "zones_distinctes",
-                "message": "les deux zones ne désignent pas le même appareil : la fusion est refusée",
-                "cles": [cle_doublon, cle_cible],
-            })),
+            Json(crate::message_api::avec_message(
+                json!({
+                    "error": "zones_distinctes",
+                    "code": "zones_distinctes",
+                    "cles": [cle_doublon, cle_cible],
+                }),
+                "api.zones.mergeDifferentDevices",
+                &[],
+            )),
         )
             .into_response();
     }
@@ -1418,19 +1491,44 @@ pub(super) async fn update_volume(
     // #1274 — l'arbitrage `volume` / `volume_db` et la conversion des dB
     // vivent dans `volume_scale`, pas ici. Cette route ne fait que ramener sa
     // convention historique sur 0..1 avant de la lui passer.
-    let volume_f = match tune_core::audio::volume_scale::demande_lineaire(lineaire, body.volume_db)
-    {
-        Ok(v) => v,
-        Err(motif) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid_volume", "message": motif })),
-            )
-                .into_response();
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let zone = repo.get(id).ok().flatten();
+    // #6918 — la course en dB de la sortie, si elle en a une.
+    let course = tune_core::audio::volume_appareil_db::course_de_la_sortie(
+        &state.backend,
+        zone.as_ref().and_then(|z| z.output_type.as_deref()),
+    );
+    let volume_f = if let Some(device_db) = body.device_volume_db {
+        // #6918 — des dB d'appareil ramenés à la fraction, qui suit ensuite
+        // le chemin de toute consigne : limites #6541, garde #6721, trim.
+        match tune_core::audio::volume_appareil_db::demande_de_la_requete(
+            course,
+            lineaire,
+            body.volume_db,
+            device_db,
+        ) {
+            Ok(v) => v,
+            Err(motif) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_device_volume_db", "message": motif })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match tune_core::audio::volume_scale::demande_lineaire(lineaire, body.volume_db) {
+            Ok(v) => v,
+            Err(motif) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_volume", "message": motif })),
+                )
+                    .into_response();
+            }
         }
     };
-    let repo = ZoneRepo::with_backend(state.backend.clone());
-    let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
+    let device_id = zone.and_then(|z| z.output_device_id);
     // #1274 — la consigne en dB doit avoir un endroit où arriver. Si la
     // sortie de la zone ne parle au périphérique qu'en entiers, un dB sous son
     // premier pas ne baisse pas le son : il l'éteint. On le refuse en le
@@ -1447,10 +1545,34 @@ pub(super) async fn update_volume(
 
     match state
         .orchestrator
-        .set_volume(id, volume_f, device_id.as_deref())
+        .set_volume_avec_garde(
+            id,
+            volume_f,
+            device_id.as_deref(),
+            tune_core::audio::garde_de_hausse::Hausse::depuis_confirmation(body.confirm_increase),
+        )
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // #6721 — 204 comme avant pour une consigne appliquée telle quelle ;
+        // 200 et le gain retenu quand la garde l'a plafonnée, pour que le
+        // client propose de confirmer (`confirm_increase`).
+        Ok(retenu) if retenu.hausse_plafonnee => {
+            let mut corps = serde_json::Map::new();
+            retenu.inserer(&mut corps);
+            corps.insert(
+                "volume_db".into(),
+                json!(tune_core::audio::volume_scale::linear_to_db(retenu.retenu)),
+            );
+            corps.insert(
+                "volume_curve".into(),
+                json!(
+                    tune_core::audio::volume_scale::echelle_de_la_zone(&state.backend, id).code()
+                ),
+            );
+            tune_core::audio::volume_appareil_db::inserer(&mut corps, course, retenu.retenu);
+            (StatusCode::OK, Json(serde_json::Value::Object(corps))).into_response()
+        }
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => crate::routes::playback::output_command_error_response(error),
     }
 }
@@ -1487,5 +1609,64 @@ pub(super) async fn rename_zone(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod teac_7371 {
+    use super::*;
+
+    #[tokio::test]
+    async fn la_zone_demandee_en_dlna_reste_attachee_a_la_sortie_dlna() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let airplay = repo
+            .create("TEAC NT-505X", Some("airplay"), Some("airplay-teac"))
+            .unwrap();
+        repo.set_host(airplay, "192.0.2.50").unwrap();
+        let dlna = tune_core::outputs::dlna::DlnaOutput::new(
+            "TEAC NT-505X".into(),
+            "uuid:teac-dlna".into(),
+            "192.0.2.50".into(),
+            "http://192.0.2.50/av".into(),
+            "http://192.0.2.50/rc".into(),
+            None,
+        );
+        state.outputs.lock().await.register(Box::new(dlna));
+        let response = create_zone(
+            State(state.clone()),
+            Json(CreateZone {
+                name: "TEAC DLNA".into(),
+                output_type: Some("dlna".into()),
+                output_device_id: Some("uuid:teac-dlna".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert!(response.status().is_success());
+        let zone = repo
+            .get_by_device_id("uuid:teac-dlna")
+            .unwrap()
+            .expect("la zone DLNA demandée doit exister");
+        assert_ne!(zone.id, Some(airplay));
+        assert_eq!(zone.output_type.as_deref(), Some("dlna"));
+        assert_eq!(
+            state
+                .outputs
+                .lock()
+                .await
+                .type_of(zone.output_device_id.as_deref().unwrap())
+                .as_deref(),
+            Some("dlna"),
+            "le routage de cette zone doit résoudre la sortie DLNA"
+        );
+        assert_eq!(
+            repo.get(airplay)
+                .unwrap()
+                .unwrap()
+                .output_device_id
+                .as_deref(),
+            Some("airplay-teac")
+        );
     }
 }

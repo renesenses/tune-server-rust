@@ -1,3 +1,4 @@
+use super::transport::Entree;
 use super::*;
 
 /// Verdict de [`PlaybackOrchestrator::enjamber_les_pistes_bannies`] (#4806).
@@ -23,6 +24,32 @@ impl Enjambee {
     }
 }
 
+/// Le flux que vise la sonde de niveaux d'une piste de service devenue
+/// courante par avance sans blanc : la qualité de la zone, puis — #6401 — le
+/// même repli Qobuz en 16/44,1 que la lecture. Sans lui, la piste que la
+/// lecture avait repliée au format 6 voyait sa sonde viser le flux HR que le
+/// CDN refuse : aiguilles figées sur toute la piste.
+pub(super) async fn flux_de_la_sonde_de_niveaux(
+    svc: &dyn StreamingService,
+    source: &str,
+    source_id: &str,
+    provider_quality: Option<&str>,
+) -> Option<StreamUrl> {
+    let flux = svc.get_track_url(source_id, provider_quality).await.ok()?;
+    Some(
+        crate::streaming::qobuz_repli_qualite::retenir_le_flux_du_service(
+            source,
+            svc,
+            crate::http::client::shared(),
+            source_id,
+            provider_quality,
+            flux,
+        )
+        .await
+        .flux,
+    )
+}
+
 /// #5143 — LE cœur de « la prochaine piste jouable » : depuis `position`,
 /// les lignes de file bannies pour le profil des sélections automatiques
 /// (locales par `track_id`, de service par `source` + `source_id`), et où
@@ -34,17 +61,25 @@ impl Enjambee {
 /// armement sans blanc, via `PositionPoller::prochaine_position_jouable`.
 /// Chacun parcourait la file à sa façon : la suivante préchargée était B
 /// (banni) quand l'avance jouait C.
+///
+/// #6824 — `profil_de_session` est le profil de la session d'écoute de la zone
+/// (`ZoneState::session_profile_id`, posé par la route de lecture d'après
+/// `X-Profile-Id`). C'est lui qui a banni le titre et lui que la file barre
+/// (`GET /zones/{id}/queue`, `ActiveProfile`). Le profil actif du serveur
+/// n'est que le repli d'une zone sans session (redémarrage, alarme sans
+/// profil) — voir [`crate::db::hidden_repo::profil_des_bannis_de_la_zone`].
 pub fn lignes_bannies_a_enjamber(
     db: &Arc<dyn crate::db::backend::DbBackend>,
     zone_id: i64,
     position: i64,
+    profil_de_session: Option<i64>,
 ) -> (Enjambee, Vec<crate::db::play_queue_repo::QueueEntry>) {
     let queue_repo = PlayQueueRepo::with_backend(db.clone());
     let Ok(total) = queue_repo.count_all(zone_id) else {
         return (Enjambee::Rien, Vec::new());
     };
     let bans = crate::db::hidden_repo::HiddenRepo::with_backend(db.clone());
-    let profil = crate::db::hidden_repo::profil_de_selection_automatique(db);
+    let profil = crate::db::hidden_repo::profil_des_bannis_de_la_zone(db, profil_de_session);
     let mut p = position.max(0);
     let mut enjambees = Vec::new();
     while p < total {
@@ -81,6 +116,9 @@ impl PlaybackOrchestrator {
         // #3365 — la qualité rangée avec ce flux part avec lui.
         self.ranger_la_qualite_pre_armee(zone_id, None).await;
         if let Some(ref sid) = old_sid {
+            if self.session_fichier_retenue(zone_id).as_ref() == Some(sid) {
+                return;
+            }
             self.streamer.remove_session(sid).await;
             debug!(zone_id, stream_id = %sid, "gapless_session_cleaned_up");
         }
@@ -119,6 +157,7 @@ impl PlaybackOrchestrator {
         target_fmt: String,
     ) {
         let db = self.db.clone();
+        let playback = self.playback.clone();
         tokio::spawn(async move {
             // Locate the current queue position and the item right after it.
             let qrepo = PlayQueueRepo::with_backend(db.clone());
@@ -131,7 +170,8 @@ impl PlaybackOrchestrator {
             };
             // #5143 — la suivante que l'avance jouera : une bannie est
             // enjambée, jamais transcodée pour rien.
-            let Some(next_pos) = lignes_bannies_a_enjamber(&db, zone_id, cur_pos + 1)
+            let session = playback.get_state(zone_id).await.session_profile_id;
+            let Some(next_pos) = lignes_bannies_a_enjamber(&db, zone_id, cur_pos + 1, session)
                 .0
                 .position_depuis(cur_pos + 1)
             else {
@@ -238,6 +278,7 @@ impl PlaybackOrchestrator {
         }
         let db = self.db.clone();
         let services = self.services.clone();
+        let playback = self.playback.clone();
         tokio::spawn(async move {
             // Find the current track in the streaming queue, then the next item.
             let sq = PlayQueueRepo::with_backend(db.clone())
@@ -255,7 +296,8 @@ impl PlaybackOrchestrator {
             let Some(cur_pos) = sq[cur_idx]["position"].as_i64() else {
                 return;
             };
-            let Some(next_pos) = lignes_bannies_a_enjamber(&db, zone_id, cur_pos + 1)
+            let session = playback.get_state(zone_id).await.session_profile_id;
+            let Some(next_pos) = lignes_bannies_a_enjamber(&db, zone_id, cur_pos + 1, session)
                 .0
                 .position_depuis(cur_pos + 1)
             else {
@@ -301,8 +343,14 @@ impl PlaybackOrchestrator {
             }
 
             let sr = stream_data.quality.sample_rate;
-            let bd = stream_data.quality.bit_depth.clamp(16, 24);
-            let key_bd = if out_fmt == "wav" { 16 } else { bd };
+            // #6909 — même plafond 16 bits que la lecture (`profondeur_dash`).
+            let reglages =
+                super::resolve_stream::reglages_dash(&db, zone_id, stream_data.quality.bit_depth);
+            let key_bd = super::resolve_stream::profondeur_dash(
+                out_fmt,
+                stream_data.quality.bit_depth,
+                reglages,
+            );
             // Pas de racine de cache utilisable pour ce compte (#5133) : rien
             // à chauffer.
             let Some(cp) = crate::transcode_cache::cache_path_streaming(
@@ -333,7 +381,7 @@ impl PlaybackOrchestrator {
                     crate::audio::decode::decode_to_pcm(&dash_file_c, Some(sr), Some(2), 0.0, 0.0)?;
                 let mut pcm_bytes = decoded.pcm_bytes();
                 let mut actual_bd = decoded.bit_depth;
-                if is_wav && actual_bd > 16 {
+                if (is_wav || key_bd == 16) && actual_bd > 16 {
                     pcm_bytes = crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
                     actual_bd = 16;
                 }
@@ -575,7 +623,8 @@ impl PlaybackOrchestrator {
     /// `source_id` vaut un id local banni n'est pas enjambée pour autant, et
     /// inversement — voir [`HiddenRepo::ligne_bannie`].
     pub async fn enjamber_les_pistes_bannies(&self, zone_id: i64, position: i64) -> Enjambee {
-        let (verdict, enjambees) = lignes_bannies_a_enjamber(&self.db, zone_id, position);
+        let session = self.playback.get_state(zone_id).await.session_profile_id;
+        let (verdict, enjambees) = lignes_bannies_a_enjamber(&self.db, zone_id, position, session);
         for entry in &enjambees {
             info!(
                 zone_id,
@@ -609,6 +658,96 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
+        self.play_from_queue_inner(zone_id, position, true, Entree::Geste, None)
+            .await
+    }
+
+    /// Reprendre un contexte à sa position explicite (#7280).
+    /// Ce geste explicite ne doit pas être absorbé comme un double appui.
+    pub async fn replay_context_from_queue(
+        &self,
+        zone_id: i64,
+        position: i64,
+        seek_ms: u64,
+    ) -> Result<PlayResult, String> {
+        self.playback.oublier_le_deplacement(zone_id).await;
+        let result = self
+            .play_from_queue_inner(
+                zone_id,
+                position,
+                true,
+                Entree::RepriseDeContexte,
+                Some(seek_ms),
+            )
+            .await?;
+        let zone = ZoneRepo::with_backend(self.db.clone()).get(zone_id)?;
+        let browser_ready = zone
+            .as_ref()
+            .is_some_and(|z| z.output_type.as_deref() == Some("browser"))
+            && result.error.is_none()
+            && result.stream_url.is_some();
+        if seek_ms > 0 && (result.output_sent || browser_ready) {
+            // Le navigateur reçoit la position par l'état de zone ; sa
+            // confirmation d'écoute reste différée jusqu'au signal du lecteur.
+            self.playback.seek(zone_id, seek_ms as i64).await;
+            if result.output_sent {
+                // Le décodeur part déjà à l'offset ; une session fichier/proxy
+                // sur renderer réseau exige le rattrapage éprouvé de #2893.
+                if let Some(zone) = zone {
+                    self.seek_output_after_replay(
+                        zone_id,
+                        zone.output_device_id.as_deref(),
+                        zone.output_type.as_deref(),
+                        seek_ms,
+                    )
+                    .await;
+                }
+                self.persist_position(zone_id).await;
+            }
+        }
+        Ok(result)
+    }
+
+    /// #6735 — `play_from_queue` pour l'enchaînement du sondeur à la fin
+    /// constatée d'une piste. Seule différence : les gardes anti-double-appui
+    /// (`RETAP_DEDUP_WINDOW`, `DUPLICATE_NET_PLAY_WINDOW`) ne s'appliquent
+    /// pas, pour que Répéter la piste relance un morceau plus court qu'elles.
+    pub async fn play_from_queue_en_fin_de_piste(
+        &self,
+        zone_id: i64,
+        position: i64,
+    ) -> Result<PlayResult, String> {
+        self.play_from_queue_inner(zone_id, position, true, Entree::FinDePiste, None)
+            .await
+    }
+
+    /// #6466 (fil 2302 point 15) — `play_from_queue` SANS écrire
+    /// l'historique : le transfert de zone relance sur la cible une piste que
+    /// la zone d'origine a déjà écrite. « La piste transférée est notée avec
+    /// la zone d'origine, pas la peine de la dupliquer avec la zone de
+    /// destination. Seuls les titres suivants seront notés avec la nouvelle
+    /// zone. »
+    ///
+    /// La relance passe par les étapes d'entrée de `play()` (plafond de
+    /// zones, re-tap) : seule l'écriture de l'historique est retirée — voir
+    /// [`play_transfere_sans_historique`](Self::play_transfere_sans_historique).
+    pub async fn play_from_queue_sans_historique(
+        &self,
+        zone_id: i64,
+        position: i64,
+    ) -> Result<PlayResult, String> {
+        self.play_from_queue_inner(zone_id, position, false, Entree::Geste, None)
+            .await
+    }
+
+    async fn play_from_queue_inner(
+        &self,
+        zone_id: i64,
+        position: i64,
+        historique: bool,
+        entree: Entree,
+        seek_ms: Option<u64>,
+    ) -> Result<PlayResult, String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
         let output_device_id = ZoneRepo::with_backend(self.db.clone())
@@ -641,7 +780,7 @@ impl PlaybackOrchestrator {
                 album_title: entry.album_title.clone(),
                 cover_url: entry.cover_path.clone(),
                 duration_ms: entry.duration_ms,
-                seek_ms: None,
+                seek_ms,
                 temp_file_path: None,
                 sample_rate: None,
                 bit_depth: None,
@@ -718,7 +857,7 @@ impl PlaybackOrchestrator {
                 album_title: album,
                 cover_url: cover,
                 duration_ms,
-                seek_ms: None,
+                seek_ms,
                 temp_file_path: None,
                 sample_rate: None,
                 bit_depth: None,
@@ -735,8 +874,22 @@ impl PlaybackOrchestrator {
         self.playback
             .update_queue_info(zone_id, position, total)
             .await;
-        let result = self.play(req).await?;
-        Ok(result)
+        self.play_par_l_entree(req, historique, entree).await
+    }
+
+    /// Précharge, en tâche de fond, la piste qui suit la piste COURANTE de la
+    /// zone (`PrefetchEngine::prefetch_next`). Appelé quand une piste devient
+    /// courante : au démarrage (`play_inner`) et à l'avance sans blanc (#6772).
+    pub(crate) fn lancer_le_prechargement(&self, zone_id: i64) {
+        let prefetch = self.prefetch.clone();
+        let db = self.db.clone();
+        let services = self.services.clone();
+        let playback = self.playback.clone();
+        tokio::spawn(async move {
+            prefetch
+                .prefetch_next(db, services, playback, zone_id)
+                .await;
+        });
     }
 
     pub async fn advance_queue_metadata(&self, zone_id: i64, position: i64) -> Result<(), String> {
@@ -959,10 +1112,25 @@ impl PlaybackOrchestrator {
         // pour un renderer qui se contredit et le curseur serait resté collé à
         // la fin de la piste précédente pendant tout un album enchaîné (#3229).
         self.playback.reset_position(zone_id, 0).await;
+        // #6230 — la piste enchaînée a sa propre règle de réaffectation
+        // (album, nombre de canaux) : la reposer sur la sortie locale, et la
+        // rouvrir si le nombre de voies change. Sans règle armée, rien ne
+        // bouge : le gapless ordinaire reste intact.
+        self.refresh_zone_reaffectation(zone_id).await;
         // Le déplacement éventuel appartenait à la piste d'avant : sa grâce ne
         // court pas sur celle-ci (#4682).
         self.playback.oublier_le_deplacement(zone_id).await;
         self.playback.emit_position(zone_id, 0);
+
+        // #6772 — l'avance sans blanc est un changement de piste qui contourne
+        // `play_inner`, le seul autre lanceur du préchargement. Sans cette
+        // ligne, rien ne préparait la piste N+2 après une avance adoptée : sa
+        // préparation sans blanc partait de zéro (DASH hi-res TIDAL), sortait
+        // de son budget de 10 s, et une transition sur deux avait un blanc.
+        // Même lanceur, mêmes gardes (radio #3342, bannie #5143), que le
+        // démarrage — et APRÈS `update_queue_info` / `update_now_playing`, pour
+        // que la suivante se calcule depuis la piste devenue courante.
+        self.lancer_le_prechargement(zone_id);
 
         // Une avance gapless est une nouvelle écoute confirmée par le sondeur
         // (position remise à zéro, durée changée ou transition Playing après
@@ -972,6 +1140,8 @@ impl PlaybackOrchestrator {
         // est celui que la file vient réellement d'atteindre.
         if let Some((title, artist, album, cover, duration_ms)) = ecoute {
             let etat = self.playback.get_state(zone_id).await;
+            let contexte =
+                self.contexte_de_l_ecoute(&etat, advance_track_id, advance_source_id.as_deref());
             let album_id = advance_track_id.and_then(|track_id| {
                 TrackRepo::with_backend(self.db.clone())
                     .get(track_id)
@@ -991,12 +1161,12 @@ impl PlaybackOrchestrator {
                 cover.as_deref(),
                 etat.session_profile_id,
                 ContexteEcoute {
-                    nature: etat.session_context_type.as_deref(),
-                    id: etat.session_context_id.as_deref(),
+                    nature: contexte.0.as_deref(),
+                    id: contexte.1.as_deref(),
                     rang: rang_a_retenir(etat.shuffle, etat.queue_position),
-                    service: etat.session_context_source.as_deref(),
-                    titre: etat.session_context_title.as_deref(),
-                    pochette: etat.session_context_cover.as_deref(),
+                    service: contexte.2.as_deref(),
+                    titre: contexte.3.as_deref(),
+                    pochette: contexte.4.as_deref(),
                 },
                 None,
             );
@@ -1116,7 +1286,8 @@ impl PlaybackOrchestrator {
                         let svc = svc.clone();
                         drop(registry);
                         let svc = svc.read().await;
-                        svc.get_track_url(&source_id, provider_quality).await.ok()
+                        flux_de_la_sonde_de_niveaux(&**svc, &source, &source_id, provider_quality)
+                            .await
                     };
                     let Some(data) = resolved else {
                         debug!(zone_id, source = %source, "gapless_streaming_levels_url_unresolved");
@@ -1307,6 +1478,8 @@ impl PlaybackOrchestrator {
             ),
         )
         .await;
+        // #6334 — vers `PlayMedia` (SetNext) : la profondeur du fil.
+        let profondeur_fil = profondeur_du_fil(&resolved);
         let raw_cover = cover.or(resolved.cover_url);
         Ok(ResolvedQueueItem {
             url: resolved.url,
@@ -1321,7 +1494,7 @@ impl PlaybackOrchestrator {
             duration_ms: resolved.duration_ms.map(|d| d as u64),
             stream_id: resolved.stream_id,
             sample_rate: resolved.sample_rate,
-            bit_depth: resolved.bit_depth,
+            bit_depth: profondeur_fil,
             channels: resolved.channels,
             file_size: resolved.file_size,
             file_path: None,

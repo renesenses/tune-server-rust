@@ -37,6 +37,9 @@ use super::*;
 use super::periode::{avec_periode, config_de_flux, garde_de_prechargement};
 use crate::outputs::traits::PuitsNatif;
 
+#[path = "open_retry_7207.rs"]
+mod open_retry_7207;
+
 /// Ce que `play_url` sait au moment d'ouvrir, et rien de plus.
 ///
 /// Les `Arc` sont EMPRUNTÉS : le backend clone ceux que son rappel temps réel
@@ -46,6 +49,11 @@ use crate::outputs::traits::PuitsNatif;
 pub(super) struct DemandeDOuverture<'a> {
     /// Le format de la SOURCE (R5) : cadence, profondeur, canaux.
     pub(super) spec: AudioSpec,
+    /// #6230 — les voies que la matrice de réaffectation armée demande
+    /// ([`CreneauReaffectation::voies_a_demander`]). Seul le chemin cpal
+    /// partagé les lit : il les tente d'abord, puis retombe sur sa cascade
+    /// ordinaire. Les transports exclusifs ouvrent au format de la source.
+    pub(super) voies_de_la_matrice: Option<u16>,
     pub(super) device_name: &'a str,
     /// Identifiant d'endpoint réglé sur la zone (WASAPI, ALSA `hw:…`).
     pub(super) endpoint_id: Option<&'a str>,
@@ -97,7 +105,10 @@ pub(super) enum RefusDOuverture {
         cause: OpenFailure,
         premiere_erreur: String,
         seconde_erreur: String,
+        last_error: String,
     },
+    /// L'utilisateur a arrêté ou remplacé la lecture pendant la reprise.
+    Cancelled,
     /// Un transport exclusif a refusé l'ouverture (CoreAudio, ASIO, WASAPI).
     /// Aucun repli vers un autre endpoint ni vers le mode partagé. N'existe
     /// que là où un transport exclusif existe — même `cfg` que
@@ -166,11 +177,13 @@ impl RefusDOuverture {
                 cause,
                 premiere_erreur,
                 seconde_erreur,
+                last_error,
             } => {
                 warn!(
                     device = %device_name,
                     first_error = %premiere_erreur,
                     second_error = %seconde_erreur,
+                    last_error = %last_error,
                     hint = %cause.log_hint(),
                     "audio_stream_build_failed_all_formats"
                 );
@@ -185,6 +198,7 @@ impl RefusDOuverture {
                     ));
                 }
             }
+            RefusDOuverture::Cancelled => {}
             #[cfg(any(target_os = "windows", target_os = "macos", test))]
             RefusDOuverture::OuvertureExclusiveRefusee { backend, erreur } => {
                 record_exclusive_open_failure(backend, device_name, erreur, open_failure);
@@ -219,11 +233,13 @@ impl std::fmt::Display for RefusDOuverture {
                 cause,
                 premiere_erreur,
                 seconde_erreur,
+                last_error,
             } => write!(
                 f,
-                "{} ({premiere_erreur} ; {seconde_erreur})",
+                "{} ({premiere_erreur} ; {seconde_erreur} ; {last_error})",
                 cause.log_hint()
             ),
+            RefusDOuverture::Cancelled => f.write_str("opening_cancelled"),
             #[cfg(any(target_os = "windows", target_os = "macos", test))]
             RefusDOuverture::OuvertureExclusiveRefusee { backend, erreur } => {
                 write!(f, "{backend}: {erreur}")
@@ -800,27 +816,62 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                 )
             };
 
-        let ring_cap = (output_config.sample_rate as usize) * (output_config.channels as usize) * 2;
-        starvation.begin_stream(output_config.sample_rate, output_config.channels);
-        let ring_buf = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
-        ring_buf.clear(); // Defensive: zero-fill before callback can read
-        // Minimum buffer: ~200ms of audio before the callback starts reading.
-        // sr * ch / 5 = 200ms of interleaved samples.
-        // #3208 — compté en PÉRIODES dès qu'une période est imposée ; sinon ce
-        // compte-ci, au sample près.
-        let min_buffer_ms =
-            (output_config.sample_rate as usize) * (output_config.channels as usize) / 5;
-        let min_buffer = garde_de_prechargement(&output_config, min_buffer_ms);
-        let stream_result = build_stream(
-            &output_config,
-            ring_buf.clone(),
-            volume.clone(),
-            paused.clone(),
-            silent_cb_outer.clone(),
-            data_started_shared.clone(),
-            min_buffer,
-            soft_mute.clone(),
-        );
+        // #6230 — une matrice de réaffectation armée qui change le nombre de
+        // voies (grille 6 → 2) les demande d'abord, à la cadence retenue. Un
+        // refus n'arrête rien : la cascade ordinaire reprend telle qu'avant,
+        // et le chemin du signal dira que la matrice n'est pas appliquée.
+        let config_de_la_matrice = demande
+            .voies_de_la_matrice
+            .filter(|&voies| voies != output_config.channels)
+            .map(|voies| cpal::StreamConfig {
+                channels: voies,
+                ..output_config.clone()
+            });
+        let ouvrir_a = |cfg: &cpal::StreamConfig| {
+            let ring_cap = (cfg.sample_rate as usize) * (cfg.channels as usize) * 2;
+            starvation.begin_stream(cfg.sample_rate, cfg.channels);
+            let ring_buf = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
+            ring_buf.clear(); // Defensive: zero-fill before callback can read
+            data_started_shared.store(false, Ordering::SeqCst);
+            // Minimum buffer: ~200ms of audio before the callback starts reading.
+            // sr * ch / 5 = 200ms of interleaved samples.
+            // #3208 — compté en PÉRIODES dès qu'une période est imposée ; sinon ce
+            // compte-ci, au sample près.
+            let min_buffer_ms = (cfg.sample_rate as usize) * (cfg.channels as usize) / 5;
+            let min_buffer = garde_de_prechargement(cfg, min_buffer_ms);
+            let stream_result = build_stream(
+                cfg,
+                ring_buf.clone(),
+                volume.clone(),
+                paused.clone(),
+                silent_cb_outer.clone(),
+                data_started_shared.clone(),
+                min_buffer,
+                soft_mute.clone(),
+            );
+            (stream_result, ring_buf)
+        };
+        let par_la_matrice = config_de_la_matrice
+            .as_ref()
+            .and_then(|cfg| match ouvrir_a(cfg) {
+                (Ok(s), ring) => Some((s, cfg.clone(), ring)),
+                (Err(e), _) => {
+                    info!(
+                        device = %device_name,
+                        voies = cfg.channels,
+                        error = %e,
+                        "local_reaffectation_voies_refusees_en_flottant"
+                    );
+                    None
+                }
+            });
+        let (stream_result, output_config, ring_buf) = match par_la_matrice {
+            Some((s, cfg, ring)) => (Ok(s), cfg, ring),
+            None => {
+                let (stream_result, ring_buf) = ouvrir_a(&output_config);
+                (stream_result, output_config, ring_buf)
+            }
+        };
 
         let mut recopie_possible = true;
         let (stream, actual_config, ring) = match stream_result {
@@ -860,68 +911,110 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                         // float (bit-perfect integer-only DAC). Cascade integer
                         // formats — i32 then i16 — at the chosen rate, then the
                         // source rate. First one the device accepts wins.
-                        let mut candidates: Vec<cpal::StreamConfig> = vec![output_config.clone()];
+                        // #6230 — les voies de la matrice d'abord, en entier
+                        // aussi : un DAC bit-perfect refuse le flottant.
+                        let mut candidates: Vec<cpal::StreamConfig> =
+                            config_de_la_matrice.iter().cloned().collect();
+                        candidates.push(output_config.clone());
                         if source_cfg.sample_rate != output_config.sample_rate
                             || source_cfg.channels != output_config.channels
                         {
                             candidates.push(source_cfg.clone());
                         }
-                        let mut built: Option<(cpal::Stream, cpal::StreamConfig, Arc<RingBuf>)> =
-                            None;
-                        'int_cascade: for cand in &candidates {
-                            let cap = (cand.sample_rate as usize) * (cand.channels as usize) * 2;
-                            let min_buf_ms =
-                                (cand.sample_rate as usize) * (cand.channels as usize) / 5;
-                            let min_buf = garde_de_prechargement(cand, min_buf_ms);
-                            for is_i32 in [true, false] {
-                                starvation.begin_stream(cand.sample_rate, cand.channels);
-                                let r = Arc::new(RingBuf::new_metered(cap, starvation.clone()));
-                                r.clear();
-                                data_started_shared.store(false, Ordering::SeqCst);
-                                let res = if is_i32 {
-                                    build_int_stream::<i32>(
-                                        &device,
-                                        cand,
-                                        r.clone(),
-                                        volume.clone(),
-                                        paused.clone(),
-                                        silent_cb_outer.clone(),
-                                        data_started_shared.clone(),
-                                        min_buf,
-                                        device_gone.clone(),
-                                        soft_mute.clone(),
-                                    )
-                                } else {
-                                    build_int_stream::<i16>(
-                                        &device,
-                                        cand,
-                                        r.clone(),
-                                        volume.clone(),
-                                        paused.clone(),
-                                        silent_cb_outer.clone(),
-                                        data_started_shared.clone(),
-                                        min_buf,
-                                        device_gone.clone(),
-                                        soft_mute.clone(),
-                                    )
-                                };
-                                if let Ok(s) = res {
-                                    info!(
-                                        format = if is_i32 { "i32" } else { "i16" },
-                                        sample_rate = cand.sample_rate,
-                                        "local_audio_fallback_to_integer_format"
-                                    );
-                                    built = Some((s, cand.clone(), r));
-                                    break 'int_cascade;
+                        // Même endpoint et mêmes configurations pendant toute la reprise :
+                        // ni rééchantillonnage ajouté, ni recherche d'une autre sortie.
+                        let opened_endpoint =
+                            device.id().map(|id| id.to_string()).unwrap_or_default();
+                        let retry_enabled =
+                            open_retry_7207::supports_open_retry(host_id_name, &opened_endpoint);
+                        let built = open_retry_7207::retry_open(
+                            retry_enabled,
+                            || {
+                                let mut last_error = second_err.to_string();
+                                for cand in &candidates {
+                                    let cap =
+                                        (cand.sample_rate as usize) * (cand.channels as usize) * 2;
+                                    let min_buf_ms =
+                                        (cand.sample_rate as usize) * (cand.channels as usize) / 5;
+                                    let min_buf = garde_de_prechargement(cand, min_buf_ms);
+                                    for is_i32 in [true, false] {
+                                        starvation.begin_stream(cand.sample_rate, cand.channels);
+                                        let r =
+                                            Arc::new(RingBuf::new_metered(cap, starvation.clone()));
+                                        r.clear();
+                                        data_started_shared.store(false, Ordering::SeqCst);
+                                        let res = if is_i32 {
+                                            build_int_stream::<i32>(
+                                                &device,
+                                                cand,
+                                                r.clone(),
+                                                volume.clone(),
+                                                paused.clone(),
+                                                silent_cb_outer.clone(),
+                                                data_started_shared.clone(),
+                                                min_buf,
+                                                device_gone.clone(),
+                                                soft_mute.clone(),
+                                            )
+                                        } else {
+                                            build_int_stream::<i16>(
+                                                &device,
+                                                cand,
+                                                r.clone(),
+                                                volume.clone(),
+                                                paused.clone(),
+                                                silent_cb_outer.clone(),
+                                                data_started_shared.clone(),
+                                                min_buf,
+                                                device_gone.clone(),
+                                                soft_mute.clone(),
+                                            )
+                                        };
+                                        match res {
+                                            Ok(s) => {
+                                                info!(
+                                                    format = if is_i32 { "i32" } else { "i16" },
+                                                    sample_rate = cand.sample_rate,
+                                                    "local_audio_fallback_to_integer_format"
+                                                );
+                                                return Ok((s, cand.clone(), r));
+                                            }
+                                            Err(e) => {
+                                                last_error = e.to_string();
+                                                warn!(
+                                                    device = %device_name,
+                                                    format = if is_i32 { "i32" } else { "i16" },
+                                                    sample_rate = cand.sample_rate,
+                                                    error = %e,
+                                                    "local_audio_integer_open_failed"
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                        }
+                                Err(last_error)
+                            },
+                            |delay| {
+                                if force_silent.load(Ordering::SeqCst) {
+                                    return false;
+                                }
+                                if !delay.is_zero() {
+                                    warn!(device = %device_name, delay_ms = delay.as_millis(),
+                                        "local_audio_integer_open_retry");
+                                }
+                                matches!(
+                                    demande.stop_rx.recv_timeout(delay),
+                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                                ) && !force_silent.load(Ordering::SeqCst)
+                            },
+                        );
                         match built {
-                            Some(t) => {
+                            Some(Ok(t)) => {
                                 recopie_possible = false;
                                 t
                             }
-                            None => {
+                            None => return Err(RefusDOuverture::Cancelled),
+                            Some(Err(last_error)) => {
                                 // Every format was refused, so the fault is
                                 // the device itself, not the encoding. Name
                                 // the likely cause: the raw ALSA string
@@ -932,7 +1025,7 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                                 // reach the daemon — typically a server
                                 // started outside the user session, or a
                                 // USB DAC that went away.
-                                let cause = classify_open_failure(&first_err.to_string());
+                                let cause = classify_open_failure(&last_error);
                                 // #3575 — quand cpal a DÉTRUIT le motif,
                                 // aller chercher dans /proc qui tient le
                                 // nœud PCM, au lieu d'attendre un
@@ -946,6 +1039,7 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                                     cause,
                                     premiere_erreur: first_err.to_string(),
                                     seconde_erreur: second_err.to_string(),
+                                    last_error,
                                 });
                             }
                         }

@@ -550,3 +550,47 @@ async fn pg_5077_chaque_chemin_pose_son_motif_et_la_reparation_est_sure() {
     chaque_chemin_pose_son_motif(db);
     pool.close().await;
 }
+
+// ── #6378 : le rapport de bogue voit toutes les zones masquées ──────────
+
+#[test]
+fn zones_masquees_6378_rend_chaque_zone_masquee_motif_nul_compris() {
+    let db = base_migree();
+    let repo = ZoneRepo::with_backend(db.clone());
+    let visible = zone(&repo, &db, "Salon", "dlna", "uuid:salon", "10.0.0.2");
+    // Le cas du fil 2284 : la seule zone utilisée, masquée sans motif lisible.
+    let diretta = zone(
+        &repo,
+        &db,
+        "Diretta Renderer",
+        "dlna",
+        "uuid:diretta",
+        "10.0.0.3",
+    );
+    db.execute(
+        "UPDATE zones SET is_hidden = 1 WHERE id = ?",
+        &[&diretta as &dyn crate::db::backend::ToSqlValue],
+    )
+    .unwrap();
+    let supprimee = zone(&repo, &db, "Garage", "airplay", "garage,1", "10.0.0.4");
+    repo.delete(supprimee).unwrap();
+
+    // Ce que le rapport comptait seul : la zone visible.
+    assert_eq!(repo.count().unwrap(), 1);
+
+    let masquees = repo.zones_masquees().unwrap();
+    let ids: Vec<i64> = masquees.iter().map(|z| z.id).collect();
+    assert_eq!(
+        ids,
+        vec![diretta, supprimee],
+        "zone visible {visible} exclue"
+    );
+    let d = &masquees[0];
+    assert_eq!(d.name, "Diretta Renderer");
+    assert_eq!(d.device_id, "uuid:diretta");
+    assert_eq!(d.protocole, "dlna");
+    assert_eq!(d.motif, None, "motif NUL rendu tel quel");
+    let g = &masquees[1];
+    assert_eq!(g.motif.as_deref(), Some("suppression_utilisateur"));
+    assert!(g.masquee_le.is_some(), "la date de masquage est rendue");
+}

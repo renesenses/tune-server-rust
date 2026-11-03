@@ -49,8 +49,12 @@ pub fn erreur_cadence_inconnue(service: &str) -> String {
 }
 
 /// La qualité annoncée est-elle incomplète (cadence ou profondeur nulle) ?
+///
+/// #6334 — la profondeur d'un codec avec perte (AAC…) n'existe pas : un 0 n'y
+/// manque pas, il y est vrai. Le compléter par le catalogue réécrirait le
+/// « 16 bits » d'un FLAC CD sur un AAC 320.
 pub fn qualite_incomplete(q: &StreamQuality) -> bool {
-    q.sample_rate == 0 || q.bit_depth == 0
+    q.sample_rate == 0 || (q.bit_depth == 0 && !q.avec_perte())
 }
 
 /// D'où vient la cadence retenue — pour le journal.
@@ -85,7 +89,7 @@ pub fn completer_la_qualite(
         if qualite.sample_rate == 0 {
             qualite.sample_rate = cat.sample_rate;
         }
-        if qualite.bit_depth == 0 && cat.bit_depth > 0 {
+        if qualite.bit_depth == 0 && cat.bit_depth > 0 && !qualite.avec_perte() {
             qualite.bit_depth = cat.bit_depth;
         }
         return OrigineDeLaCadence::Catalogue;
@@ -266,5 +270,42 @@ mod tests {
         };
         completer_la_qualite(&mut q, Some(&flac_96_24()), None);
         assert_eq!((q.sample_rate, q.bit_depth), (44_100, 24));
+    }
+
+    /// #6334 — un AAC sans profondeur n'est pas « incomplet » : rien à aller
+    /// chercher, et surtout pas le 16 bits du catalogue Tidal.
+    #[test]
+    fn un_aac_sans_profondeur_est_complet_6334() {
+        let aac = StreamQuality {
+            codec: "AAC".into(),
+            sample_rate: 44_100,
+            bit_depth: 0,
+            bitrate: Some(320_000),
+            channels: 2,
+        };
+        assert!(!qualite_incomplete(&aac));
+        assert!(
+            qualite_incomplete(&StreamQuality {
+                codec: "FLAC".into(),
+                ..aac.clone()
+            }),
+            "un FLAC sans profondeur, lui, reste à compléter (#5283)"
+        );
+    }
+
+    #[test]
+    fn le_catalogue_ne_prete_pas_sa_profondeur_a_un_aac_6334() {
+        let mut q = StreamQuality {
+            codec: "AAC".into(),
+            ..nulle()
+        };
+        let cat = StreamQuality {
+            sample_rate: 44_100,
+            bit_depth: 16,
+            ..nulle()
+        };
+        let o = completer_la_qualite(&mut q, None, Some(&cat));
+        assert_eq!(o, OrigineDeLaCadence::Catalogue);
+        assert_eq!((q.sample_rate, q.bit_depth), (44_100, 0));
     }
 }

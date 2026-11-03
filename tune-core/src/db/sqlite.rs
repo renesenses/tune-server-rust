@@ -616,7 +616,11 @@ CREATE TABLE IF NOT EXISTS artists (
     bio_lang TEXT,
     bio_fetched_at TEXT,
     image_path TEXT,
-    image_source TEXT
+    image_source TEXT,
+    sort_name_source TEXT,
+    -- Provenance du MBID (migration 133, #6463) : balise, nom, pressage,
+    -- manuel ; NULL = inconnue.
+    musicbrainz_id_source TEXT
 );
 
 CREATE TABLE IF NOT EXISTS albums (
@@ -738,7 +742,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     cue_end_ms INTEGER,
     -- Note de la piste lue dans ses balises, 0 a 5 (#6123, migration 124).
     -- NULL = le fichier n'en porte pas. Echelle : `metadata::note`.
-    rating INTEGER
+    rating INTEGER,
+    -- Debit moyen du fichier en kbit/s, lu au scan (#6332, migration 130).
+    -- NULL = pas encore lu (complete au rescan) ou inconnu.
+    bitrate_kbps INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -893,6 +900,9 @@ CREATE TABLE IF NOT EXISTS zones (
 -- `artist_ref` : l'artiste chez le service (`StreamTrack.artist_id`), pour
 -- « Aller à l'artiste » depuis la file (#6079). Jumelle de la migration
 -- SQLite 123 et de la PG 087.
+-- `context_*` : le conteneur (album, playlist, artiste, ou `track` pour un
+-- titre ajouté seul) dont l'élément a été enfilé (#6466). NULL = le contexte
+-- de session de la zone. Jumelle de la migration SQLite 128 et de la PG 092.
 CREATE TABLE IF NOT EXISTS queue_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     zone_id INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
@@ -909,7 +919,12 @@ CREATE TABLE IF NOT EXISTS queue_items (
     track_number INTEGER,
     disc_number INTEGER,
     album_ref TEXT,
-    artist_ref TEXT
+    artist_ref TEXT,
+    context_type TEXT,
+    context_id TEXT,
+    context_source TEXT,
+    context_title TEXT,
+    context_cover TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_track_credits_track_id ON track_credits(track_id);
@@ -1016,6 +1031,44 @@ CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (
     fetched_at TEXT NOT NULL
 );
 
+-- Enrichissement MetaRust, lot 1 (#4805) — d'après MetaRust, de Xavier Joly.
+-- Complétude d'album, instruments Wikidata des artistes, propositions
+-- Discogs, BPM estimés. Sans migration numérotée, comme
+-- `musicbrainz_release_cache` : présentes AUSSI dans le rattrapage de
+-- `run_migrations` (bases existantes).
+CREATE TABLE IF NOT EXISTS album_completude (
+    album_id INTEGER PRIMARY KEY,
+    release_mbid TEXT NOT NULL,
+    attendues INTEGER NOT NULL,
+    presentes INTEGER NOT NULL,
+    manquantes INTEGER NOT NULL,
+    doublons INTEGER NOT NULL,
+    detail TEXT NOT NULL,
+    calcule_le TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS artiste_instruments (
+    artist_mbid TEXT PRIMARY KEY,
+    qid TEXT,
+    instruments TEXT NOT NULL,
+    lu_le TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS propositions_discogs (
+    album_id INTEGER NOT NULL,
+    discogs_release_id INTEGER NOT NULL,
+    methode TEXT NOT NULL,
+    proposition TEXT NOT NULL,
+    statut TEXT NOT NULL,
+    cree_le TEXT NOT NULL,
+    decide_le TEXT,
+    PRIMARY KEY (album_id, discogs_release_id)
+);
+CREATE TABLE IF NOT EXISTS bpm_estimes (
+    file_path TEXT PRIMARY KEY,
+    bpm REAL NOT NULL,
+    source TEXT NOT NULL,
+    mesure_le TEXT NOT NULL
+);
+
 -- « Ces deux albums ne sont pas des doublons » (#1276) — miroir de la
 -- migration SQLite 91, présent AUSSI ici pour que le rapprochement d'albums
 -- (grouped / merge-duplicates) tourne sur une base née de `init_schema` seul,
@@ -1049,13 +1102,15 @@ CREATE INDEX IF NOT EXISTS idx_ignored_devices_host ON ignored_devices(host);
 
 -- Dossiers de collections (#4853) — miroir de la migration SQLite 108. Voir
 -- la migration pour la doctrine : `(kind, collection_id)` en clef primaire,
--- une collection dans UN SEUL dossier, `NULL` = racine.
+-- une collection dans UN SEUL dossier, `NULL` = racine. `manual_order`
+-- (migration 134, #6779) : fratrie rangée à la main ; 0 = alphabétique.
 CREATE TABLE IF NOT EXISTS collection_folders (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     parent_id INTEGER,
     position INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    manual_order INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_collection_folders_parent ON collection_folders(parent_id);
 CREATE TABLE IF NOT EXISTS collection_folder_items (

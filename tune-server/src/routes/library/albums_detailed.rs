@@ -58,13 +58,14 @@ const ARTISTE_DE_CARTE: &str = "COALESCE(CASE WHEN COALESCE(al.is_compilation, 0
      THEN ar_al.name END, t.album_artist, ar.name)";
 
 pub(super) async fn albums_detailed(
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(q): Query<FacetQuery>,
     RawQuery(raw): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
     // Même lecture des facettes multi-valeurs que le rail (#2168) : les cartes
     // doivent compter exactement ce que le rail annonce.
-    let q = q.hydrate(raw.as_deref())?;
+    let q = q.hydrate(raw.as_deref())?.pour_profil(profile.id());
     // #5438 — la résolution de la collection, le total et la page sont des
     // lectures synchrones : hors de l'exécuteur, comme le rail.
     hors_executeur("albums_detailed", move || lire_les_cartes(&state, q))
@@ -676,5 +677,195 @@ mod tests {
             Vec::<i64>::new(),
             "témoin : aucun compositeur ne correspond"
         );
+    }
+
+    /// #4319 (Tades, fil 2264) — dans la portée « Mahler Mehta »,
+    /// `albums-detailed?folder=…&q=mahler mehta` rend la 2 ET la 3. Pour la 3,
+    /// « Mahler » n'est que dans le titre de l'album et « Mehta » que dans le
+    /// chef d'orchestre de l'étiquette : la saisie entière, cherchée d'un seul
+    /// tenant, ne la trouvait pas. Témoin : un mot absent exclut.
+    #[tokio::test]
+    async fn la_recherche_par_mots_trouve_la_3_par_le_chef_d_orchestre_4319() {
+        use crate::state::AppState;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use tune_core::db::backend::ToSqlValue;
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Mahler Mehta'), (2, 'Los Angeles Philharmonic')",
+            &[],
+        )
+        .expect("artistes");
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES \
+             (1, 'Mahler - Symphony No. 2', 1), (2, 'Mahler - Symphony No. 3', 2)",
+            &[],
+        )
+        .expect("albums");
+        for (id, titre, artiste, album, chemin) in [
+            (
+                1,
+                "Allegro maestoso",
+                1,
+                1,
+                "/m/XX/Mahler Mehta/Deux/a.flac",
+            ),
+            (2, "Kräftig", 2, 2, "/m/XX/Mahler Mehta/Trois/a.flac"),
+        ] {
+            b.execute(
+                "INSERT INTO tracks (id, title, artist_id, album_id, source, file_path) \
+                 VALUES (?1, ?2, ?3, ?4, 'local', ?5)",
+                &[
+                    &(id as i64) as &dyn ToSqlValue,
+                    &titre,
+                    &(artiste as i64),
+                    &(album as i64),
+                    &chemin,
+                ],
+            )
+            .expect("piste");
+        }
+        b.execute(
+            "INSERT INTO track_metadata (track_id, key, value) VALUES (2, 'conductor', 'Zubin Mehta')",
+            &[],
+        )
+        .expect("chef");
+        let albums = |q: &'static str| {
+            let state = state.clone();
+            async move {
+                let reponse = super::super::router()
+                    .with_state(state)
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!(
+                                "/albums-detailed?limit=10&folder=%2Fm%2FXX%2FMahler%20Mehta&q={q}"
+                            ))
+                            .body(Body::empty())
+                            .expect("requête"),
+                    )
+                    .await
+                    .expect("réponse");
+                let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+                    .await
+                    .expect("corps");
+                let v: Value = serde_json::from_slice(&octets).expect("json");
+                let mut ids: Vec<i64> = v["items"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("items absents : {v}"))
+                    .iter()
+                    .filter_map(|c| c["album_id"].as_i64())
+                    .collect();
+                ids.sort_unstable();
+                ids
+            }
+        };
+        assert_eq!(
+            albums("mahler%20mehta").await,
+            vec![1, 2],
+            "« mahler mehta » : la 2 par l'artiste, la 3 par le titre et le chef"
+        );
+        assert_eq!(
+            albums("mahler%203%20mehta").await,
+            vec![2],
+            "« mahler 3 mehta »"
+        );
+        assert_eq!(
+            albums("mahler%203%20karajan").await,
+            Vec::<i64>::new(),
+            "témoin : Karajan ne dirige rien ici"
+        );
+    }
+}
+
+#[cfg(test)]
+mod portee_repertoires_7283 {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use tune_core::db::backend::ToSqlValue;
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    #[tokio::test]
+    async fn deux_racines_du_meme_album_restent_dans_le_repertoire_selectionne_7283() {
+        let racines = if cfg!(windows) {
+            [
+                r"C:\disque\Musique",
+                r"D:\nas\Musique",
+                r"C:\disque\Musique bis",
+            ]
+        } else {
+            ["/disque/Musique", "/nas/Musique", "/disque/Musique bis"]
+        };
+        let sep = std::path::MAIN_SEPARATOR;
+        let config = crate::config::TuneConfig {
+            music_dirs: racines.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        };
+        let state = crate::state::AppState::new(":memory:", 0, config).unwrap();
+        let backend = &state.backend;
+        backend
+            .execute(
+                "INSERT INTO artists (id, name) VALUES (1, 'Artiste 7283')",
+                &[],
+            )
+            .unwrap();
+        for (indice, racine) in racines.iter().enumerate() {
+            let id = indice as i64 + 1;
+            backend.execute(
+                "INSERT INTO albums (id, title, artist_id, folder_path) VALUES (?1, 'Même album 7283', 1, ?2)",
+                &[&id as &dyn ToSqlValue, &format!("{racine}{sep}Album")],
+            ).unwrap();
+            for numero in 1..=2i64 {
+                backend.execute(
+                    "INSERT INTO tracks (title, album_id, artist_id, album_artist, file_path, source, track_number, disc_number, duration_ms, format, sample_rate, bit_depth) VALUES ('Même piste', ?1, 1, 'Artiste 7283', ?2, 'local', ?3, 1, 1000, 'flac', 44100, 16)",
+                    &[&id as &dyn ToSqlValue, &format!("{racine}{sep}Album{sep}{numero:02}.flac"), &numero],
+                ).unwrap();
+            }
+        }
+        let settings = SettingsRepo::with_backend(backend.clone());
+        for option in ["false", "true"] {
+            settings
+                .set("library_dedup_same_root_only", option)
+                .unwrap();
+            for (indice, folder) in racines.iter().enumerate() {
+                let attendu = indice as i64 + 1;
+                let uri = format!(
+                    "/albums-detailed?folder={}&limit=1&offset=0",
+                    urlencoding::encode(folder)
+                );
+                let response = super::super::router()
+                    .with_state(state.clone())
+                    .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{uri}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let data: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    data["total"], 1,
+                    "#7283 : la sélection de {folder} compte des albums d'une autre racine ; option={option}, réponse={data}"
+                );
+                assert_eq!(
+                    data["items"].as_array().unwrap().len(),
+                    1,
+                    "#7283 : album répété ; {data}"
+                );
+                assert_eq!(
+                    data["items"][0]["album_id"], attendu,
+                    "#7283 : album hors du répertoire sélectionné ; {data}"
+                );
+                assert_eq!(
+                    data["items"][0]["track_count"], 2,
+                    "#7283 : pistes des autres racines agrégées ; {data}"
+                );
+            }
+        }
+        // Aucun filtre : trois entrées distinctes, le témoin ne doit pas
+        // masquer globalement les copies pour faire réussir la portée.
+        let data = super::lire_les_cartes(&state, super::FacetQuery::default());
+        assert_eq!(data["total"], json!(3));
     }
 }

@@ -60,9 +60,10 @@ use tune_core::outputs::traits::OutputCapabilities;
 use crate::state::AppState;
 
 /// `output_type` des sorties qu'un maître tient d'un agent.
-pub const TYPE_DE_SORTIE: &str = "tune_agent";
+/// Un seul exemplaire, dans l'orchestrateur, qui doit la reconnaître (#6370).
+pub const TYPE_DE_SORTIE: &str = tune_core::orchestrator::TYPE_SORTIE_AGENT_TUNE;
 /// Préfixe du `device_id` côté maître : `tune-agent:{agent_id}:{device_id de l'agent}`.
-pub const PREFIXE_DEVICE_ID: &str = "tune-agent:";
+pub const PREFIXE_DEVICE_ID: &str = tune_core::orchestrator::PREFIXE_SORTIE_AGENT_TUNE;
 /// L'en-tête qui porte le jeton d'appairage, du maître vers l'agent.
 pub const ENTETE_JETON: &str = "x-tune-agent-jeton";
 /// Identité stable de CE serveur dans le rôle maître/agent.

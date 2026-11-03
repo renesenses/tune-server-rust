@@ -123,6 +123,31 @@ impl DffInfo {
         Ok(())
     }
 
+    /// Taille du porteur WAV/DoP pour le DSD brut : le départ s'arrondit
+    /// à l'octet DSD, puis seules les trames DoP entières sont émises.
+    /// Le DST et les en-têtes non exploitables gardent le repli existant.
+    pub(crate) fn taille_wav_dop(&self, tranche: Option<(u64, Option<u64>)>) -> Option<u64> {
+        if self.ensure_raw_dsd().is_err()
+            || self.channels == 0
+            || self.sample_rate == 0
+            || !self.data_size.is_multiple_of(self.channels as u64)
+        {
+            return None;
+        }
+        let total = self.data_size / self.channels as u64;
+        let (debut_ms, fin_ms) = tranche.unwrap_or((0, None));
+        let atteint =
+            super::dsd_brut::octets_par_canal_pour_ms(self.sample_rate, debut_ms).min(total);
+        let fin = fin_ms
+            .map(|ms| super::dsd_brut::octets_par_canal_pour_ms(self.sample_rate, ms))
+            .unwrap_or(total)
+            .min(total);
+        (fin.saturating_sub(atteint) / 2)
+            .checked_mul(self.channels as u64)?
+            .checked_mul(3)?
+            .checked_add(44)
+    }
+
     /// Track duration in milliseconds from the DSDIFF header. DSD is 1 bit per
     /// sample, so samples-per-channel = data_size*8/channels, and
     /// duration = samples-per-channel / sample_rate. `None` if the header can't

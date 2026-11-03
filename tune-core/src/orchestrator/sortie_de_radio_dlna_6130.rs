@@ -131,6 +131,19 @@ impl PlaybackOrchestrator {
                     false
                 }
             };
+        // Le DMP-A8 ne lâche PAS la radio sur `Stop` : il ne ferme qu'après
+        // le `Play` suivant (12/12 au journal du .18, 22–25/10, toujours
+        // `delai_depasse=true`). L'attente seule ne garantissait donc jamais
+        // ce qu'elle devait garantir. Le serveur ferme lui-même le direct :
+        // la connexion radio ne peut plus être ouverte au `SetAVTransportURI`.
+        let mut congedies = 0usize;
+        for s in sessions
+            .iter()
+            .filter(|s| s.is_radio && s.active_consumers.load(Ordering::Relaxed) > 0)
+        {
+            s.congedier_les_consommateurs();
+            congedies += 1;
+        }
         let (attente, delai_depasse) =
             attendre_le_depart_des_consommateurs(&sessions, DELAI_FERMETURE_RADIO).await;
         let bilan = BilanSortieDeRadio {
@@ -144,6 +157,7 @@ impl PlaybackOrchestrator {
             stop_envoye = bilan.stop_envoye,
             radio_fermee_en_ms = bilan.radio_fermee_en_ms,
             delai_depasse = bilan.delai_depasse,
+            radios_fermees_par_le_serveur = congedies,
             consommateurs_restants = consommateurs(&sessions),
             "dlna_sortie_de_radio"
         );

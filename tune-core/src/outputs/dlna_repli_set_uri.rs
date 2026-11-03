@@ -121,6 +121,11 @@ struct Appareil {
     /// `Some` : Tune réimpose le dernier volume après chaque
     /// `SetAVTransportURI`.
     volume_remonte_a_l_uri: Option<String>,
+    /// #6477 — date à laquelle Tune a vu cet appareil LÂCHER la piste en
+    /// cours dès le `SetNextAVTransportURI` pour jouer la suivante (FiiO K17).
+    /// `Some` : plus de `SetNext` vers lui, la fin de piste joue la suivante
+    /// par `SetAVTransportURI` + `Play`.
+    set_next_coupe_la_piste: Option<String>,
 }
 
 /// La forme rangée en base, sous `settings[dlna_compat_set_uri:<udn>]`.
@@ -136,6 +141,9 @@ struct Enregistrement {
     /// #6008 — voir [`Appareil::volume_remonte_a_l_uri`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     volume_remonte_a_l_uri: Option<String>,
+    /// #6477 — voir [`Appareil::set_next_coupe_la_piste`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    set_next_coupe_la_piste: Option<String>,
 }
 
 /// Mémoire process : UDN → profils appris, doublée d'une copie en base.
@@ -211,6 +219,9 @@ fn appareil<'a>(m: &'a mut HashMap<String, Appareil>, udn: &str) -> &'a mut Appa
             if a.volume_remonte_a_l_uri.is_none() {
                 a.volume_remonte_a_l_uri = e.volume_remonte_a_l_uri;
             }
+            if a.set_next_coupe_la_piste.is_none() {
+                a.set_next_coupe_la_piste = e.set_next_coupe_la_piste;
+            }
         }
     }
     a
@@ -226,6 +237,7 @@ fn ecrire_maintenant(db: &Arc<dyn DbBackend>, udn: &str) -> Result<(), String> {
             profils: a.profils.clone().into_iter().collect(),
             seek_inoperant: a.seek_inoperant.clone(),
             volume_remonte_a_l_uri: a.volume_remonte_a_l_uri.clone(),
+            set_next_coupe_la_piste: a.set_next_coupe_la_piste.clone(),
         })
     });
     let repo = SettingsRepo::with_backend(db.clone());
@@ -233,7 +245,8 @@ fn ecrire_maintenant(db: &Arc<dyn DbBackend>, udn: &str) -> Result<(), String> {
         Some(e)
             if !e.profils.is_empty()
                 || e.seek_inoperant.is_some()
-                || e.volume_remonte_a_l_uri.is_some() =>
+                || e.volume_remonte_a_l_uri.is_some()
+                || e.set_next_coupe_la_piste.is_some() =>
         {
             let json = serde_json::to_string(&e).map_err(|e| e.to_string())?;
             repo.set(&cle_reglage(udn), &json)
@@ -371,6 +384,40 @@ pub fn memoriser_volume_remonte_a_l_uri(udn: &str) -> bool {
     nouveau
 }
 
+/// #6477 — cet appareil lâche-t-il la piste en cours dès qu'il reçoit un
+/// `SetNextAVTransportURI` ? Appris par [`memoriser_set_next_coupe_la_piste`],
+/// persistant, oublié comme les profils (version logicielle changée,
+/// « Réinitialiser la compatibilité »).
+pub fn set_next_coupe_la_piste(udn: &str) -> bool {
+    APPAREILS
+        .lock()
+        .ok()
+        .is_some_and(|mut m| appareil(&mut m, udn).set_next_coupe_la_piste.is_some())
+}
+
+/// #6477 — retient que cet appareil lâche la piste en cours au `SetNext`.
+/// Idempotent ; rend `true` la première fois.
+pub fn memoriser_set_next_coupe_la_piste(udn: &str) -> bool {
+    let nouveau = match APPAREILS.lock() {
+        Ok(mut m) => {
+            let a = appareil(&mut m, udn);
+            if a.set_next_coupe_la_piste.is_some() {
+                false
+            } else {
+                a.set_next_coupe_la_piste =
+                    Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+                true
+            }
+        }
+        Err(_) => false,
+    };
+    if nouveau {
+        info!(device_id = %udn, "dlna_set_next_coupe_la_piste_appris");
+        persister(udn);
+    }
+    nouveau
+}
+
 /// À la découverte d'un appareil : relit ses profils en base, et les OUBLIE
 /// si sa version logicielle a changé depuis qu'ils ont été appris — une mise
 /// à jour peut avoir corrigé le refus, ou en avoir créé un autre.
@@ -387,7 +434,8 @@ pub fn charger_pour_appareil(udn: &str, firmware: Option<&str>) {
             && ancien != courant
             && (!a.profils.is_empty()
                 || a.seek_inoperant.is_some()
-                || a.volume_remonte_a_l_uri.is_some())
+                || a.volume_remonte_a_l_uri.is_some()
+                || a.set_next_coupe_la_piste.is_some())
         {
             info!(
                 device_id = %udn,
@@ -399,6 +447,7 @@ pub fn charger_pour_appareil(udn: &str, firmware: Option<&str>) {
             a.profils.clear();
             a.seek_inoperant = None;
             a.volume_remonte_a_l_uri = None;
+            a.set_next_coupe_la_piste = None;
             a_persister = true;
         }
         if let Some(courant) = firmware
@@ -407,7 +456,8 @@ pub fn charger_pour_appareil(udn: &str, firmware: Option<&str>) {
             a.firmware = Some(courant.to_string());
             a_persister |= !a.profils.is_empty()
                 || a.seek_inoperant.is_some()
-                || a.volume_remonte_a_l_uri.is_some();
+                || a.volume_remonte_a_l_uri.is_some()
+                || a.set_next_coupe_la_piste.is_some();
         }
         if !a.profils.is_empty() {
             info!(
@@ -444,6 +494,10 @@ pub struct CompatibiliteAppareil {
     /// (absent : jamais vu).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_reimpose_depuis: Option<String>,
+    /// #6477 — depuis quand Tune n'envoie plus de `SetNext` à l'appareil,
+    /// qui lâchait la piste en cours à sa réception (absent : jamais vu).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_next_evite_depuis: Option<String>,
 }
 
 /// Ce que Tune a appris pour cet appareil, relu en base au besoin.
@@ -454,12 +508,14 @@ pub fn compatibilite_de(udn: &str) -> CompatibiliteAppareil {
         profils: Vec::new(),
         seek_inoperant_depuis: None,
         volume_reimpose_depuis: None,
+        set_next_evite_depuis: None,
     };
     if let Ok(mut m) = APPAREILS.lock() {
         let a = appareil(&mut m, udn);
         sortie.firmware = a.firmware.clone();
         sortie.seek_inoperant_depuis = a.seek_inoperant.clone();
         sortie.volume_reimpose_depuis = a.volume_remonte_a_l_uri.clone();
+        sortie.set_next_evite_depuis = a.set_next_coupe_la_piste.clone();
         sortie.profils = a
             .profils
             .iter()
@@ -485,10 +541,12 @@ pub fn reinitialiser_compatibilite(udn: &str) -> Result<usize, String> {
             let a = appareil(&mut m, udn);
             let n = a.profils.len()
                 + usize::from(a.seek_inoperant.is_some())
-                + usize::from(a.volume_remonte_a_l_uri.is_some());
+                + usize::from(a.volume_remonte_a_l_uri.is_some())
+                + usize::from(a.set_next_coupe_la_piste.is_some());
             a.profils.clear();
             a.seek_inoperant = None;
             a.volume_remonte_a_l_uri = None;
+            a.set_next_coupe_la_piste = None;
             n
         }
         Err(e) => return Err(e.to_string()),

@@ -20,9 +20,10 @@
 //! détruisant : aucun fil n'est détaché (#4220).
 //!
 //! Formats pris ici : ceux que la boucle symphonia décode sur une source qui
-//! ne se rembobine pas — FLAC et MP3. Les autres (M4A dont l'atome `moov` est
-//! en fin de fichier, Ogg-Opus décodé par libopus, AAC ADTS…) gardent la
-//! branche compressée d'avant, qui charge tout.
+//! ne se rembobine pas — FLAC, MP3, et (#6925) le M4A « optimisé pour le
+//! web », dont l'atome `moov` précède `mdat`. Les autres (M4A dont l'atome
+//! `moov` est en fin de fichier, Ogg-Opus décodé par libopus, AAC ADTS…)
+//! gardent la branche compressée d'avant, qui charge tout.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +62,64 @@ pub(super) fn extension_decodable_en_continu(debut: &[u8]) -> Option<&'static st
             return Some("mp3");
         }
     }
+    if m4a_moov_en_tete(debut) {
+        return Some("m4a");
+    }
     None
+}
+
+/// #6925 — un conteneur MP4 (`ftyp` en tête) dont l'atome `moov` arrive
+/// AVANT `mdat`, lu dans le premier bloc du corps.
+///
+/// Laguespa, fil 2415 (rc7, Linux, sortie locale) : un épisode de podcast
+/// Radio France est un `.m4a` d'une heure (87 Mo, `ftyp` puis `moov` au
+/// 28e octet). La branche compressée d'avant le téléchargeait EN ENTIER
+/// avant le premier son ; à huit secondes, la garde du démarrage figé
+/// (#5522) relançait la zone. Le démuxeur MP4 de symphonia lit un tel
+/// fichier sans rembobiner : il s'arrête à `mdat` quand la source ne se
+/// déplace pas, puis lit les échantillons dans l'ordre.
+///
+/// Rend `false` (branche d'avant) dès qu'un `mdat` ou un `moof` précède
+/// `moov`, ou que le bloc ne montre pas `moov` : un `moov` en fin de fichier
+/// ne se lit pas sans rembobiner.
+fn m4a_moov_en_tete(debut: &[u8]) -> bool {
+    if debut.len() < 8 || &debut[4..8] != b"ftyp" {
+        return false;
+    }
+    let mut pos = 0usize;
+    // Quelques atomes de tête au plus : `ftyp`, parfois `free`/`wide`/`uuid`.
+    for _ in 0..8 {
+        let Some(entete) = debut.get(pos..pos + 8) else {
+            return false;
+        };
+        let taille = u32::from_be_bytes([entete[0], entete[1], entete[2], entete[3]]) as u64;
+        match &entete[4..8] {
+            b"moov" => return true,
+            b"mdat" | b"moof" => return false,
+            _ => {}
+        }
+        let taille = match taille {
+            // Jusqu'à la fin du fichier : rien après.
+            0 => return false,
+            // Taille sur 64 bits, juste après le type.
+            1 => match debut.get(pos + 8..pos + 16) {
+                Some(t) => u64::from_be_bytes(t.try_into().unwrap_or([0; 8])),
+                None => return false,
+            },
+            t => t,
+        };
+        if taille < 8 {
+            return false;
+        }
+        pos = match usize::try_from(taille)
+            .ok()
+            .and_then(|t| pos.checked_add(t))
+        {
+            Some(p) => p,
+            None => return false,
+        };
+    }
+    false
 }
 
 /// Le corps HTTP, précédé de ce que `play_url` en a déjà lu, vu par symphonia.

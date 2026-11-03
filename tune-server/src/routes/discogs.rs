@@ -6,8 +6,6 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use tune_core::db::settings_repo::SettingsRepo;
-
 use crate::state::AppState;
 
 const DISCOGS_API: &str = "https://api.discogs.com";
@@ -23,15 +21,12 @@ pub fn router() -> Router<AppState> {
         .route("/masters/{id}", get(discogs_master))
 }
 
-fn discogs_token(state: &AppState) -> Option<String> {
-    // Check the DB first (set via web UI), then fall back to env/toml config.
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    settings
-        .get("discogs_token")
-        .ok()
-        .flatten()
-        .filter(|t| !t.is_empty())
-        .or_else(|| state.config.discogs_token.clone().filter(|t| !t.is_empty()))
+/// Le jeton Discogs à utiliser : le PERSONNEL (Réglages ▸ Clés d'API, #4805
+/// lot 1) d'abord, puis le réglage historique, puis `tune.toml` /
+/// l'environnement.
+pub(crate) fn discogs_token(state: &AppState) -> Option<String> {
+    crate::routes::system::cles_api::cle(state, tune_core::cles_api::Service::Discogs)
+        .map(tune_core::cles_api::CleResolue::into_valeur)
 }
 
 async fn discogs_get(

@@ -22,6 +22,9 @@ services:
       # (`POST /api/v1/circle/listen/verify`). Meme valeur que
       # TUNE_BRIDGE_SERVICE_TOKEN cote site. AUCUN repli : sans lui, aucune
       # ecoute de contact n'est servie (503, circle_ecoute_fermee au demarrage).
+      # Le meme jeton porte, chaque minute, les agregats de trafic du pont
+      # vers `POST /api/v1/bridge/traffic` (#6512). Sans lui, ils restent sur
+      # le pont, 24 h au plus (bridge_trafic_non_envoye au demarrage).
       - TUNE_BRIDGE_SERVICE_TOKEN=${TUNE_BRIDGE_SERVICE_TOKEN:-}
       # Ecoute chez un contact : FERMEE (decision produit du 10/10). Ce
       # n'est PAS le jeton ci-dessus qui l'ouvre : seul `1`/`true`/`on`/`yes`

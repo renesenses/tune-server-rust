@@ -14,7 +14,7 @@ use tune_core::db::backend::DbBackend;
 use tune_core::db::play_queue_repo::PlayQueueRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::orchestrator::{PlayRequest, PlaybackOrchestrator};
-use tune_core::playback::PlaybackManager;
+use tune_core::playback::{PlayState, PlaybackManager};
 
 use crate::fournisseur::SOURCE;
 
@@ -42,6 +42,13 @@ pub trait HoteLecture: Send + Sync {
     async fn arreter(&self, zone_id: i64);
     /// La `source` de ce que la zone joue ou tient en pause, s'il y a lieu.
     async fn source_en_cours(&self, zone_id: i64) -> Option<String>;
+    /// #6410 — la zone joue encore le disque, ou le tient en PAUSE. Une zone
+    /// arrêtée (bouton Stop, fin de la file) garde sa ligne `now_playing`
+    /// pour la reprise : `source_en_cours` ne suffit pas à dire qu'elle a
+    /// fini.
+    async fn lit_le_disque(&self, zone_id: i64) -> bool {
+        self.source_en_cours(zone_id).await.as_deref() == Some(SOURCE)
+    }
 }
 
 pub struct HoteOrchestrateur {
@@ -129,10 +136,17 @@ impl HoteLecture for HoteOrchestrateur {
     }
 
     async fn source_en_cours(&self, zone_id: i64) -> Option<String> {
-        self.playback
-            .get_state(zone_id)
-            .await
-            .now_playing
-            .map(|np| np.source)
+        let etat = self.playback.get_state(zone_id).await;
+        // #7104 — Stop conserve now_playing pour la reprise, mais ne tient
+        // plus le disque. Une pause le réserve encore, comme une lecture.
+        if etat.state == tune_core::playback::PlayState::Stopped {
+            return None;
+        }
+        etat.now_playing.map(|np| np.source)
+    }
+
+    async fn lit_le_disque(&self, zone_id: i64) -> bool {
+        let etat = self.playback.get_state(zone_id).await;
+        etat.state != PlayState::Stopped && etat.now_playing.is_some_and(|np| np.source == SOURCE)
     }
 }

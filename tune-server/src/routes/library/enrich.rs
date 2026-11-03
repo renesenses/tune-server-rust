@@ -68,9 +68,15 @@ const COL_FILE_PATH: usize = 4;
 /// est lié puis ignoré) : rien n'est décodé, rien n'est écrit dans le fichier
 /// de l'utilisateur. Le `mb_id` obtenu est celui du TITRE de la tranche, donc
 /// propre à elle : aucune identité ne conflue.
-fn sql_candidats_enrichissement() -> String {
+///
+/// #7538 — une piste sous un dossier exclu de l'enrichissement n'est jamais
+/// candidate (clause vide si rien n'est réglé).
+fn sql_candidats_enrichissement(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> String {
     let chemin = tune_core::db::track_repo::sql::CHEMIN_OUVRABLE;
     let a_un_fichier = tune_core::db::track_repo::sql::A_UN_FICHIER;
+    let exclus = tune_core::taches_de_fond::perimetre::clause_hors_enrichissement(backend, chemin);
     format!(
         // artist_name / album_title are NOT columns of `tracks` — they are
         // only derived via joins (artists.name / albums.title). Selecting
@@ -97,7 +103,7 @@ fn sql_candidats_enrichissement() -> String {
            OR t.label IS NULL OR t.label = '' \
            OR t.composer IS NULL OR t.composer = '' \
            OR (t.artist_id IS NOT NULL AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')) \
-         )"
+         ){exclus}"
     )
 }
 
@@ -208,7 +214,7 @@ pub(crate) async fn demarrer_enrich_all(
     // si cette sélection échoue. Aucun appel MusicBrainz n'a lieu ici.
     let backend_selection = state.backend.clone();
     let selection = tokio::task::spawn_blocking(move || {
-        backend_selection.query_many(&sql_candidats_enrichissement(), &[])
+        backend_selection.query_many(&sql_candidats_enrichissement(&backend_selection), &[])
     })
     .await;
     let track_rows = match selection {
@@ -516,6 +522,15 @@ pub(crate) async fn demarrer_enrich_all(
                 let backend_ecriture = backend2.clone();
                 let album_id = row.get(10).and_then(|v| v.as_i64());
                 let mb_id = mb_id.clone();
+                // #6463 — l'enregistrement vient des balises (MBID de piste
+                // déjà là) : ses crédits valent un pressage identifié. Trouvé
+                // par une recherche titre + artiste : c'est le NOM qui l'a
+                // désigné, et la vérification de fond pourra le revoir.
+                let provenance_artiste = if existing_mb_id.is_some() {
+                    tune_core::db::artist_repo::ProvenanceMbid::Pressage
+                } else {
+                    tune_core::db::artist_repo::ProvenanceMbid::Nom
+                };
                 tune_core::taches_de_fond::priorite::hors_du_fil_async(
                     tune_core::taches_de_fond::Tache::Enrichissement.id(),
                     move || {
@@ -536,14 +551,46 @@ pub(crate) async fn demarrer_enrich_all(
                                 (artist_id, details.musicbrainz_artist_id.as_ref())
                         {
                             let ambid_val: Option<String> = Some(artist_mbid.clone());
+                            let source_val: Option<&str> = Some(provenance_artiste.as_str());
+                            // #6463 — la provenance avec le MBID, et jamais
+                            // sur une fiche dont l'utilisateur a saisi ou
+                            // détaché l'identité.
                             backend_ecriture
                                 .execute(
-                                    "UPDATE artists SET musicbrainz_id = \
-                                     COALESCE(musicbrainz_id, ?) WHERE id = ?",
-                                    &[&ambid_val as &dyn ToSqlValue, &aid as &dyn ToSqlValue],
+                                    &format!(
+                                        "UPDATE artists SET musicbrainz_id = ?, \
+                                         musicbrainz_id_source = ? WHERE id = ? \
+                                         AND musicbrainz_id IS NULL AND {}",
+                                        tune_core::db::artist_repo::PAS_UN_MBID_MANUEL
+                                    ),
+                                    &[
+                                        &ambid_val as &dyn ToSqlValue,
+                                        &source_val as &dyn ToSqlValue,
+                                        &aid as &dyn ToSqlValue,
+                                    ],
                                 )
                                 .ok();
                             mbid_artiste_pose = Some(aid);
+                        }
+                        // #6474, point 2 — le nom de tri MusicBrainz de
+                        // l'artiste de la piste, tiré des crédits que cette
+                        // réponse porte déjà : posé si la fiche n'en a pas,
+                        // jamais sur une balise ni une saisie. APRÈS le MBID,
+                        // qui le rattache.
+                        if let Some(aid) = artist_id {
+                            match tune_core::metadata::artistes_du_pressage::poser_le_nom_de_tri(
+                                &backend_ecriture,
+                                aid,
+                                &details.artist_credits,
+                            ) {
+                                Ok(true) => {
+                                    debug!(artist_id = aid, "enrich_nom_de_tri_musicbrainz")
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    warn!(artist_id = aid, error = %e, "enrich_nom_de_tri_echec")
+                                }
+                            }
                         }
                         (result, details, mbid_artiste_pose)
                     },
@@ -666,7 +713,44 @@ pub(super) async fn enrich_all_status(State(state): State<AppState>) -> Json<Val
         // only `status` while idle made the typed response false and forced
         // callers to paper over missing fields (#1897).
         .unwrap_or(json!({"status": "idle", "enriched": 0, "total": 0}));
-    Json(result)
+    Json(statut_reel(
+        result,
+        tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::Enrichissement),
+        state
+            .background_tasks
+            .snapshot()
+            .iter()
+            .any(|t| t.id == "enrich_all"),
+    ))
+}
+
+/// #6282 — le réglage `enrich_all_status` dit « running » du lancement de la
+/// passe à sa fin, et RIEN entre les deux ne le réécrit quand elle se gare.
+/// Kimon (fil 2259) : enrichissement suspendu, la carte de l'écran État du
+/// serveur disait « en pause » et les Réglages « En cours… » au même instant,
+/// sur « 0 sur 110 781 ».
+///
+/// Le statut servi est donc l'état RÉEL, pas le réglage tel quel :
+/// * `paused` quand la passe vit mais que l'enrichissement est suspendu —
+///   elle est garée à sa frontière ;
+/// * `interrupted` quand le réglage dit « running » sans aucune passe au
+///   registre : un arrêt du serveur l'a tuée avant sa fin (la reprise de
+///   #5469 en relancera une, qui réécrira « running »).
+///
+/// Sur une passe ouverte (« running » en base), `paused` est aussi servi en
+/// booléen, pour un client qui lit le statut comme `running | done | idle`.
+/// Un relevé `done` ou `idle` est servi tel quel.
+fn statut_reel(mut releve: Value, en_pause: bool, passe_vivante: bool) -> Value {
+    let running = releve.get("status").and_then(Value::as_str) == Some("running");
+    if running && let Some(obj) = releve.as_object_mut() {
+        if !passe_vivante {
+            obj.insert("status".into(), json!("interrupted"));
+        } else if en_pause {
+            obj.insert("status".into(), json!("paused"));
+        }
+        obj.insert("paused".into(), json!(passe_vivante && en_pause));
+    }
+    releve
 }
 
 // ── MusicBrainz helper functions (HTTP autonome ; l'analyse des reponses est
@@ -871,6 +955,9 @@ async fn mb_fetch_recording_details(
         release_id,
         release_group_id,
         musicbrainz_artist_id,
+        // #6474 — les crédits et leur `sort-name`, déjà dans la réponse
+        // (`inc=artist-credits`) : aucune requête de plus.
+        artist_credits: tune_core::metadata::musicbrainz_release::credits_d_artiste(&data),
     })
 }
 
@@ -1058,7 +1145,7 @@ mod tests_candidats_cue {
 
     fn candidats(backend: &Arc<dyn DbBackend>) -> Vec<Vec<tune_core::db::backend::SqlValue>> {
         backend
-            .query_many(&sql_candidats_enrichissement(), &[])
+            .query_many(&sql_candidats_enrichissement(backend), &[])
             .expect("la requête de candidats doit s'exécuter sur les deux moteurs")
     }
 
@@ -1102,6 +1189,24 @@ mod tests_candidats_cue {
             vec![20, 21],
             "les deux tranches vivent sous le répertoire de leur image ; la piste ordinaire non"
         );
+    }
+
+    /// #7538 — un dossier exclu de l'enrichissement ne donne aucun candidat,
+    /// tranches CUE comprises (situées par leur image) ; le reste reste.
+    #[test]
+    fn un_dossier_exclu_ne_donne_aucun_candidat_7538() {
+        let backend = base();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set(
+                tune_core::taches_de_fond::perimetre::CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT,
+                r#"["/music/Jazz/Live 1975"]"#,
+            )
+            .unwrap();
+        let ids: Vec<i64> = candidats(&backend)
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect();
+        assert_eq!(ids, vec![10], "les deux tranches de l'image exclue sortent");
     }
 }
 

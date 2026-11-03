@@ -389,7 +389,7 @@ fn l_enchainement_rearme_la_quarantaine_24_bits_5204() {
     assert!(!etage.quarantaine_24_bits_ouverte());
     assert_eq!(etage.en_attente().len(), 2);
 
-    assert!(etage.enchainer_la_piste(format).is_ok());
+    assert!(etage.enchainer_la_piste(format, &[]).is_ok());
     assert!(
         etage.quarantaine_24_bits_ouverte(),
         "la nouvelle piste doit être classée PCM/DoP pour elle-même"
@@ -399,7 +399,7 @@ fn l_enchainement_rearme_la_quarantaine_24_bits_5204() {
 
     assert!(
         etage
-            .enchainer_la_piste(spec(48_000, ProfondeurPcm::Entier24, 2))
+            .enchainer_la_piste(spec(48_000, ProfondeurPcm::Entier24, 2), &[])
             .is_err()
     );
 }

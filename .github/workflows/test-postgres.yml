@@ -183,6 +183,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5997 -- --nocapture --test-threads=1
 
+      # #5998 — vue Répertoires : les deux requêtes partent de l'index du
+      # chemin et rendent les mêmes lignes. Sans cette étape, l'épreuve
+      # prendrait son saut annoncé.
+      - name: Répertoires par l'index du chemin sur PostgreSQL (#5998)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5998 -- --nocapture --test-threads=1
+
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -201,6 +209,11 @@ jobs:
       # albums par titre et par artiste, listes de lecture) : le tri se fait en
       # Rust, et doit rendre le même ordre, les mêmes pages et le même saut par
       # lettre que sur SQLite.
+      - name: Étiqueter tout le résultat d'un filtre Oxygen sur PostgreSQL (#7128)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test etiquetage_par_filtre_7128 -- --nocapture --test-threads=1
+
       - name: Ordre alphabetique des listes REST sur PostgreSQL (#4956)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -238,6 +251,21 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_musicbrainz_release_cache -- --nocapture
 
+      # #6463 — provenance du MBID des artistes et reprise des MBID faux par
+      # vérification : la migration et les écritures de la passe, sur une
+      # vraie base. Sans cette étape, le témoin prendrait son saut annoncé.
+      - name: Provenance du MBID des artistes sur PostgreSQL (#6463)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_6463 -- --nocapture --test-threads=1
+
+      # #7535 : un MBID trouvé par le nom n'est plus posé s'il est déjà porté
+      # par une autre fiche (garde NOT EXISTS de poser_mbid, $4/$5).
+      - name: MBID déjà porté refusé sur PostgreSQL (#7535)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_un_mbid_trouve_par_le_nom_deja_porte -- --nocapture --test-threads=1
+
       - name: Provenance du DR album sur PostgreSQL (#3924)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -263,6 +291,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_4853 -- --nocapture
 
+      # #6332 — le débit de la piste (`tracks.bitrate_kbps`, PG 094) sur une
+      # VRAIE base : écrit à l'insertion, relu, puis complété au rescan pour
+      # une piste existante (FLAC relu, DSF calculé en SQL). Le témoin vide
+      # `tracks` : il tourne seul, dans sa propre étape.
+      - name: Débit de la piste sur PostgreSQL (#6332)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_le_debit_aller_retour_et_complement_6332 -- --nocapture --test-threads=1
+
       - name: Titres de service dans les playlists sur PostgreSQL (#4889)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -277,6 +314,16 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_6179 -- --nocapture
+
+      # #6545 — notes de la communauté : l'instantané des notes d'album
+      # (`LIMIT ?` lié, `CAST(… AS BIGINT)`, jointures), l'upsert et le retrait
+      # d'une note, l'empreinte et le consentement gardés dans `settings`, et
+      # la lecture artiste/album de la route, contre un faux site. Tables
+      # TEMPORAIRES copiées des vraies : rien n'est écrit dans la base.
+      - name: Notes de la communauté sur PostgreSQL (#6545)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_6545 -- --nocapture
 
       # #5003 — les gardes de migration lisent le schéma COURANT : un schéma
       # voisin portant les mêmes tables (tout-TEXT, ou déjà BIGINT) ne doit
@@ -611,6 +658,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test exemplaires_par_repertoire_4907 -- --nocapture --test-threads=1
 
+      # #6917 -- ne dedoublonner que les copies d'une meme racine de musique :
+      # le vrai scan et le nettoyage sur deux racines, option allumee puis
+      # eteinte. Le meme fichier tourne sur SQLite dans `ci.yml`.
+      - name: Dedoublonnage par racine sur PostgreSQL (#6917)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test dedoublonnage_par_racine_6917 -- --nocapture --test-threads=1
+
       # #3569 -- les E2E historiques de `postgres_e2e.rs`, ENFIN executees.
       #
       # Quinze epreuves sur dix-neuf n'avaient jamais tourne sur AUCUNE porte.
@@ -750,11 +805,22 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_etiquette_collection_5026 -- --nocapture --test-threads=1
 
+      # #6257 — l'ordre des étiquettes : la 091 pose `tags.position` en
+      # BIGINT, `PUT /tags/order` l'écrit, les listes le suivent ; une neuve
+      # se range par nom tant que rien n'est réordonné. Sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Ordre des étiquettes sur PostgreSQL (#6257)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_ordre_etiquettes_6257 -- --nocapture --test-threads=1
+
       # #6121 — la règle « Artiste de l'album » : COALESCE sur la balise
       # ALBUMARTIST dans les collections, sous-requête corrélée sur
       # `al.artist_id` dans les playlists. Les deux aperçus par le vrai
       # routeur ; sans cette étape, l'épreuve prendrait son « saut annoncé ».
-      - name: Règle Artiste de l'album sur PostgreSQL (#6121)
+      # #6232 — même fichier : la règle « Interprète » (balise ARTIST de la
+      # piste dans `track_metadata`, tenue d'artiste lue par `LIKE`).
+      - name: Règle Artiste de l'album sur PostgreSQL (#6121, #6232)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_artiste_de_l_album_6121 -- --nocapture --test-threads=1
@@ -773,6 +839,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_ne_contient_pas_6250 -- --nocapture --test-threads=1
+
+      # #6287 — la requête textuelle des règles intelligentes : la négation
+      # (`NOT COALESCE((a), 1 = 0)`), les parenthèses du ET et du OU, et la
+      # règle crédit, par la vraie route. Sans cette étape, l'épreuve
+      # prendrait son « saut annoncé ».
+      - name: Requête textuelle des règles intelligentes sur PostgreSQL (#6287)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_requete_textuelle_6287 -- --nocapture --test-threads=1
 
       # #6122 — « dans les N derniers jours » : des littéraux calculés à chaque
       # requête (secondes pour `file_mtime`, ISO pour `listened_at`) au lieu de

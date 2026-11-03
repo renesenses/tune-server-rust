@@ -85,7 +85,7 @@ fn unpack(bytes: &[u8], target: &str) -> Result<(Package, BTreeMap<String, Vec<u
     let mut portable_names = BTreeSet::new();
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|e| e.to_string())?;
-        let name = file.name().to_string();
+        let name = file.name().map_err(|e| e.to_string())?.into_owned();
         if !safe_path(&name)
             || file.is_dir()
             || file
@@ -389,6 +389,29 @@ pub fn deactivate(root: &Path, id: &str) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.to_string()),
     }
+}
+/// #6256 — retire du disque le dossier du greffon, `root/<id>` : toutes ses
+/// versions, son état actif et ce qu'il y a rangé. Rien d'autre n'est touché.
+///
+/// Refuse un `root/<id>` qui n'est pas un vrai dossier (lien symbolique,
+/// fichier) : le suivre supprimerait hors du dossier des greffons. À
+/// l'intérieur, `remove_dir_all` ne suit pas les liens symboliques, il les
+/// retire eux-mêmes. Rend `false` si le dossier n'existait déjà plus.
+pub fn remove(root: &Path, id: &str) -> Result<bool, String> {
+    if !valid_id(id) {
+        return Err("invalid plugin id".into());
+    }
+    let directory = root.join(id);
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err("plugin directory is not a plain directory: nothing removed".into());
+    }
+    fs::remove_dir_all(&directory).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 pub fn version_directory(root: &Path, id: &str) -> Result<PathBuf, String> {
     if !valid_id(id) {

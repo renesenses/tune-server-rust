@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::plugin_sdk::{PluginLoader, PluginRegistrations, TunePlugin};
 
 use crate::state::AppState;
@@ -191,6 +192,8 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
                 services: state.services.clone(),
                 orchestrator: state.orchestrator.clone(),
                 playback: state.playback.clone(),
+                // #6521 : les vignettes partagées avec le cercle.
+                artwork_dir: crate::routes::library::artwork_cache_dir(),
             },
         )))
         .await;
@@ -209,6 +212,54 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
         )))
         .await;
 
+    // Assistant IA, étape 1 (chantier assistant-ia). Toujours compilé, gratuit.
+    // La base ; le DOSSIER de la base, où vit la clé maîtresse qui scelle la
+    // clé d'API de l'utilisateur (hors de la base elle-même) ; et les critères
+    // du moteur des règles intelligentes, pour que le schéma imposé au modèle
+    // soit celui du moteur et rien d'autre.
+    #[cfg(feature = "assistant-ia")]
+    loader
+        .register(Box::new(tune_assistant_ia::AssistantIaPlugin::new(
+            tune_assistant_ia::HostServices {
+                backend: state.backend.clone(),
+                dossier_secret: dossier_de_la_base(),
+                criteres: criteres_du_moteur(),
+                diagnostic: Some(collecte_diagnostic(state.clone())),
+            },
+        )))
+        .await;
+
+    // « Ma collection physique » (#7195). Le greffon ne parle à aucun tiers
+    // lui-même : Discogs (jeton résolu ici, jamais remis au greffon),
+    // MusicBrainz, les services et la bibliothèque passent par son hôte.
+    #[cfg(feature = "collection-physique")]
+    loader
+        .register(Box::new(
+            tune_collection_physique::CollectionPhysiquePlugin::new(
+                tune_collection_physique::HostServices {
+                    backend: state.backend.clone(),
+                    hote: std::sync::Arc::new(HoteDeLaCollection {
+                        state: state.clone(),
+                    }),
+                },
+            ),
+        ))
+        .await;
+
+    // Sortie AES67 (#7336) — Premium, Linux seul (Bertrand, 30/10/2026),
+    // EXPÉRIMENTALE et DÉSACTIVÉE par défaut dans la rc10 (31/10/2026) : opt-in
+    // et hors catalogue, la porte de `setup_all` la laisse dormante (aucun
+    // socket, aucune zone) tant que le réglage « Expérimental › Sortie AES67 »
+    // du client web n'a pas posé `plugin_aes67_installed`. Le
+    // greffon ne reçoit rien à la construction : la licence lui arrive par le
+    // contexte (`PluginContext::license`), la base aussi ; ses flux deviennent
+    // des sorties par `register_output_provider`, avec le cycle de vie de
+    // zone des sorties découvertes.
+    #[cfg(all(feature = "aes67", target_os = "linux"))]
+    loader
+        .register(Box::new(tune_aes67::Aes67Plugin::new()))
+        .await;
+
     // Pont Roon (#3914) — Premium. La licence est passée pour que le greffon
     // refuse lui-même (402) ; le cache d'illustrations, pour y ranger les
     // images de l'archive sous le même condensat que tout le reste.
@@ -222,6 +273,427 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
             },
         )))
         .await;
+
+    // « Mon thème » (tune-web-client#2527, rc10) : le thème de chaque profil,
+    // rangé dans `settings`. Le profil d'une requête est jugé par l'hôte,
+    // avec l'extracteur de toutes les routes.
+    #[cfg(feature = "mon-theme")]
+    loader
+        .register(Box::new(tune_mon_theme::MonThemePlugin::new(
+            tune_mon_theme::HostServices {
+                backend: state.backend.clone(),
+                hote: std::sync::Arc::new(HoteDuTheme {
+                    state: state.clone(),
+                }),
+            },
+        )))
+        .await;
+}
+
+/// L'hôte de « Mon thème » (#2527) : le profil d'une requête, jugé comme
+/// partout (`X-Profile-Id` permis seulement à son titulaire quand
+/// l'authentification est active, puis l'appelant, puis le profil global).
+#[cfg(feature = "mon-theme")]
+struct HoteDuTheme {
+    state: AppState,
+}
+
+#[cfg(feature = "mon-theme")]
+#[async_trait::async_trait]
+impl tune_mon_theme::Hote for HoteDuTheme {
+    async fn profil_actif(&self, parts: &mut axum::http::request::Parts) -> i64 {
+        use axum::extract::FromRequestParts;
+        match tune_http_types::ActiveProfile::from_request_parts(parts, &self.state).await {
+            Ok(p) => p.id(),
+            Err(never) => match never {},
+        }
+    }
+}
+
+/// L'hôte de « Ma collection physique » (#7195).
+///
+/// * Discogs : le jeton est résolu ICI, à chaque appel, par le juge des Clés
+///   d'API (`cles_api::cle` : le personnel, scellé dans le coffre, avant
+///   l'intégré). Il part dans l'en-tête `Authorization` et nulle part
+///   ailleurs : ni dans l'URL, ni dans un journal, ni dans une réponse au
+///   greffon. Chaque appel attend le limiteur Discogs PARTAGÉ et lui rend
+///   compte de la réponse (un 429 le ralentit pour tout le serveur).
+/// * MusicBrainz : le transport et le limiteur partagés.
+/// * Services : Qobuz et TIDAL s'ils sont UTILISABLES (activés et
+///   connectés), par leur recherche ordinaire.
+/// * Bibliothèque : les albums LOCAUX, masqués exclus.
+#[cfg(feature = "collection-physique")]
+struct HoteDeLaCollection {
+    state: AppState,
+}
+
+#[cfg(feature = "collection-physique")]
+impl HoteDeLaCollection {
+    async fn service(
+        &self,
+        nom: &str,
+    ) -> Option<Arc<tokio::sync::RwLock<Box<dyn tune_core::streaming::traits::StreamingService>>>>
+    {
+        let service = self.state.services.lock().await.get(nom)?;
+        let utilisable = service.read().await.utilisable().await;
+        utilisable.then_some(service)
+    }
+}
+
+#[cfg(feature = "collection-physique")]
+#[async_trait::async_trait]
+impl tune_collection_physique::Hote for HoteDeLaCollection {
+    fn jeton_discogs(&self) -> tune_collection_physique::Jeton {
+        use tune_collection_physique::Jeton;
+        use tune_core::cles_api::{Origine, Service};
+        match crate::routes::system::cles_api::cle(&self.state, Service::Discogs) {
+            None => Jeton::Aucun,
+            Some(c) if c.origine == Origine::Personnelle => Jeton::Personnel,
+            Some(_) => Jeton::Integre,
+        }
+    }
+
+    async fn discogs(
+        &self,
+        chemin: &str,
+        params: &[(&str, String)],
+    ) -> Result<tune_collection_physique::Reponse, tune_collection_physique::Panne> {
+        use tune_collection_physique::{Panne, Reponse};
+        use tune_core::http::fetch::{CLE_DISCOGS, DISCOGS};
+        let jeton = crate::routes::system::cles_api::cle(
+            &self.state,
+            tune_core::cles_api::Service::Discogs,
+        );
+        DISCOGS.acquire(CLE_DISCOGS).await;
+        let mut req = self
+            .state
+            .http_client
+            .get(format!(
+                "{}{chemin}",
+                tune_core::metadata::discogs_propositions::BASE_DISCOGS
+            ))
+            .query(params)
+            .header(
+                reqwest::header::USER_AGENT,
+                tune_core::metadata::musicbrainz_release::MB_UA,
+            )
+            .timeout(std::time::Duration::from_secs(20));
+        if let Some(j) = &jeton {
+            req = req.header(
+                reqwest::header::AUTHORIZATION,
+                format!("Discogs token={}", j.valeur()),
+            );
+        }
+        let r = req.send().await.map_err(|e| {
+            tracing::debug!(
+                target: "plugin",
+                erreur = %tune_core::http::client::decrire_erreur_http(&e),
+                "collection_physique_discogs_sans_reponse"
+            );
+            Panne
+        })?;
+        DISCOGS.constater_reponse(CLE_DISCOGS, &r);
+        match r.status().as_u16() {
+            200..=299 => r
+                .json::<serde_json::Value>()
+                .await
+                .map(Reponse::Json)
+                .map_err(|_| Panne),
+            404 => Ok(Reponse::Introuvable),
+            401 | 403 => Ok(Reponse::Refusee),
+            429 => Ok(Reponse::Limite),
+            statut => {
+                tracing::debug!(target: "plugin", statut, "collection_physique_discogs_statut");
+                Err(Panne)
+            }
+        }
+    }
+
+    async fn musicbrainz(
+        &self,
+        chemin: &str,
+        params: &[(&str, String)],
+    ) -> Result<tune_collection_physique::Reponse, tune_collection_physique::Panne> {
+        use tune_collection_physique::{Panne, Reponse};
+        use tune_core::metadata::musicbrainz_release::{
+            RefusMusicBrainz, parcourir_sur_musicbrainz, rate_limit_delay,
+        };
+        rate_limit_delay().await;
+        match parcourir_sur_musicbrainz(chemin, params).await {
+            Ok(v) => Ok(Reponse::Json(v)),
+            Err(RefusMusicBrainz::Statut(400 | 404)) => Ok(Reponse::Introuvable),
+            Err(RefusMusicBrainz::Statut(429 | 503)) => Ok(Reponse::Limite),
+            Err(_) => Err(Panne),
+        }
+    }
+
+    async fn services_connectes(&self) -> Vec<String> {
+        let mut rendus = Vec::new();
+        for nom in tune_collection_physique::synchro::SERVICES {
+            if self.service(nom).await.is_some() {
+                rendus.push(nom.to_string());
+            }
+        }
+        rendus
+    }
+
+    async fn chercher_albums(
+        &self,
+        service: &str,
+        requete: &str,
+    ) -> Result<
+        Vec<tune_collection_physique::correspondance::AlbumDeService>,
+        tune_collection_physique::Panne,
+    > {
+        let Some(s) = self.service(service).await else {
+            return Ok(Vec::new());
+        };
+        let resultats = s.read().await.search(requete, 10).await.map_err(|e| {
+            tracing::debug!(target: "plugin", service, erreur = %e, "collection_physique_recherche_echouee");
+            tune_collection_physique::Panne
+        })?;
+        Ok(resultats
+            .albums
+            .into_iter()
+            .map(
+                |a| tune_collection_physique::correspondance::AlbumDeService {
+                    id: a.id,
+                    titre: a.title,
+                    artiste: a.artist,
+                },
+            )
+            .collect())
+    }
+
+    async fn albums_locaux(
+        &self,
+    ) -> Result<Vec<tune_collection_physique::correspondance::AlbumLocal>, String> {
+        let repo = tune_core::db::album_repo::AlbumRepo::with_backend(self.state.backend.clone());
+        const PAGE: i64 = 1_000;
+        let mut rendus = Vec::new();
+        let mut offset = 0;
+        loop {
+            // `include_hidden = false` : un album masqué n'est pas « dans ma
+            // bibliothèque » pour l'écran.
+            let page = repo
+                .list_filtered(PAGE, offset, "title", "asc", None, None, None, false, None)
+                .map_err(|e| e.to_string())?;
+            let n = page.len() as i64;
+            for a in page {
+                let local = a.source.is_empty() || a.source == "local";
+                if !local {
+                    continue;
+                }
+                let qualite = a.quality();
+                rendus.push(tune_collection_physique::correspondance::AlbumLocal {
+                    id: a.id.unwrap_or_default(),
+                    titre: a.title,
+                    artiste: a.artist_name,
+                    code_barre: a.barcode,
+                    mb_release: a.musicbrainz_release_id,
+                    mb_groupe: a.musicbrainz_release_group_id,
+                    qualite,
+                    format: a.format,
+                    sample_rate: a.sample_rate,
+                    bit_depth: a.bit_depth,
+                    pochette: a.cover_path,
+                });
+            }
+            if n < PAGE {
+                return Ok(rendus);
+            }
+            offset += PAGE;
+        }
+    }
+
+    /// Une pochette du CDN de Discogs, pour le cache du greffon (01/11/2026).
+    /// L'adresse est revérifiée ici (`https`, hôte d'images de Discogs) : le
+    /// serveur ne va chercher rien d'autre. User-Agent du serveur, aucun
+    /// jeton (il ne sort pas vers le CDN), aucune redirection suivie hors de
+    /// ces hôtes, et 8 Mo au plus.
+    async fn image_discogs(
+        &self,
+        url: &str,
+    ) -> Result<tune_collection_physique::Image, tune_collection_physique::Panne> {
+        use tune_collection_physique::{Image, Panne};
+        const IMAGE_MAX: usize = 8 * 1024 * 1024;
+        if tune_collection_physique::discogs::vignette_discogs(url).as_deref() != Some(url) {
+            return Ok(Image::Introuvable);
+        }
+        let r = self
+            .state
+            .http_client
+            .get(url)
+            .header(
+                reqwest::header::USER_AGENT,
+                tune_core::metadata::musicbrainz_release::MB_UA,
+            )
+            .header(
+                reqwest::header::ACCEPT,
+                "image/jpeg,image/png,image/webp;q=0.8",
+            )
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::debug!(
+                    target: "plugin",
+                    erreur = %tune_core::http::client::decrire_erreur_http(&e),
+                    "collection_physique_pochette_sans_reponse"
+                );
+                Panne
+            })?;
+        let final_ok =
+            tune_collection_physique::discogs::vignette_discogs(r.url().as_str()).is_some();
+        match r.status().as_u16() {
+            200..=299 if final_ok => {
+                if r.content_length().is_some_and(|n| n as usize > IMAGE_MAX) {
+                    return Ok(Image::Introuvable);
+                }
+                let octets = r.bytes().await.map_err(|_| Panne)?;
+                if octets.len() > IMAGE_MAX {
+                    return Ok(Image::Introuvable);
+                }
+                Ok(Image::Octets(octets.to_vec()))
+            }
+            200..=299 => Ok(Image::Introuvable),
+            404 | 403 | 410 => Ok(Image::Introuvable),
+            429 | 503 => Ok(Image::Limite),
+            statut => {
+                tracing::debug!(target: "plugin", statut, "collection_physique_pochette_statut");
+                Err(Panne)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "assistant-ia")]
+/// La passerelle de l'Assistant IA (étape 2) : l'ancien `/ai/query` et la
+/// traduction des ambiances y prennent la clé (coffre du greffon, après
+/// migration de l'ancienne clé en clair), le plafond et le fournisseur de
+/// l'assistant. Même base et même dossier de clé maîtresse que le greffon.
+pub(crate) fn passerelle_assistant(
+    backend: &Arc<dyn tune_core::db::backend::DbBackend>,
+) -> tune_assistant_ia::Passerelle {
+    tune_assistant_ia::Passerelle::new(backend.clone(), &dossier_de_la_base())
+}
+
+/// Le diagnostic de l'assistant (23/10/2026) : ce que l'hôte rassemble sur
+/// une zone, en LECTURE SEULE. Le greffon filtre, anonymise et pseudonymise
+/// avant tout envoi, et montre le texte exact avant chaque envoi.
+#[cfg(feature = "assistant-ia")]
+fn collecte_diagnostic(state: AppState) -> tune_assistant_ia::diagnostic::Collecte {
+    Arc::new(move |zone_id| {
+        let state = state.clone();
+        Box::pin(async move { Ok(contexte_diagnostic(&state, zone_id).await) })
+    })
+}
+
+#[cfg(feature = "assistant-ia")]
+async fn contexte_diagnostic(
+    state: &AppState,
+    zone_id: Option<i64>,
+) -> tune_assistant_ia::diagnostic::ContexteBrut {
+    use axum::response::IntoResponse;
+    use std::collections::BTreeMap;
+    use tune_core::db::backend::SqlValue;
+
+    let mut noms: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut ajouter = |cat: &str, v: Option<String>| {
+        if let Some(v) = v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            noms.entry(cat.to_string()).or_default().push(v);
+        }
+    };
+    for z in tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .list()
+        .unwrap_or_default()
+    {
+        ajouter("zone", Some(z.name));
+    }
+    for d in state.scanner.devices().await {
+        ajouter("appareil", Some(d.name));
+        ajouter("hote", Some(d.host));
+    }
+    ajouter("hote", Some(tune_core::discovery::system_hostname()));
+    // Les titres récents : ils peuvent apparaître dans le journal.
+    let texte = |v: Option<&SqlValue>| v.and_then(|x| x.as_string());
+    for l in state
+        .backend
+        .query_many(
+            "SELECT title, artist_name, album_title FROM listen_history ORDER BY id DESC LIMIT 100",
+            &[],
+        )
+        .unwrap_or_default()
+    {
+        ajouter("piste", texte(l.first()));
+        ajouter("artiste", texte(l.get(1)));
+        ajouter("album", texte(l.get(2)));
+    }
+    let zone = match zone_id {
+        Some(id) => {
+            let rep = crate::routes::zones::get_zone(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(id),
+            )
+            .await
+            .into_response();
+            if rep.status().is_success() {
+                axum::body::to_bytes(rep.into_body(), 4 << 20)
+                    .await
+                    .ok()
+                    .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o).ok())
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    if let Some(np) = zone.as_ref().and_then(|z| z.get("current_track")) {
+        let champ = |k: &str| np.get(k).and_then(|v| v.as_str()).map(String::from);
+        ajouter("piste", champ("title"));
+        ajouter("artiste", champ("artist").or_else(|| champ("artist_name")));
+        ajouter("album", champ("album").or_else(|| champ("album_title")));
+    }
+    let journal = crate::routes::system::diagnostics::journal_pour_assistant(1000).await;
+    tune_assistant_ia::diagnostic::ContexteBrut {
+        zone,
+        journal,
+        systeme: serde_json::json!({
+            "version": tune_core::version(),
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        }),
+        noms,
+    }
+}
+
+#[cfg(feature = "assistant-ia")]
+/// Le dossier de la base retenue au démarrage (Docker : `/data`), sinon celui
+/// de `TUNE_DB_PATH`, sinon le dossier courant — là où `tune.db` se pose.
+fn dossier_de_la_base() -> std::path::PathBuf {
+    let base = crate::chemins_de_donnees::base_retenue()
+        .map(String::from)
+        .or_else(|| std::env::var("TUNE_DB_PATH").ok())
+        .unwrap_or_else(|| "tune.db".into());
+    std::path::Path::new(&base)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+#[cfg(feature = "assistant-ia")]
+/// Les critères du moteur des règles intelligentes, dans la forme du greffon.
+fn criteres_du_moteur() -> Vec<tune_assistant_ia::CritereMoteur> {
+    tune_smart_http::criteres::criteres_exposes()
+        .into_iter()
+        .map(|c| tune_assistant_ia::CritereMoteur {
+            collection: c.collection.map(String::from),
+            piste: c.piste.map(String::from),
+            famille: c.famille.to_string(),
+            operateurs: c.operateurs.iter().map(|s| s.to_string()).collect(),
+        })
+        .collect()
 }
 
 /// Builds the plugins an out-of-tree binary wants registered.
@@ -439,27 +911,131 @@ pub(crate) fn persist_wasm_archive(_data: &[u8]) -> Result<String, String> {
     Err("plugin runtime not built (plugins-wasm feature disabled)".to_string())
 }
 
-/// Remove an installed wasm plugin's directory. `Ok(false)` when nothing was
-/// on disk (including builds without the runtime).
+/// What an uninstall did on disk (see `plugins_host::Removal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Retrait {
+    /// Nothing on disk (including builds without the runtime).
+    Absent,
+    /// The plugin's folder was deleted.
+    Supprime,
+    /// Shipped with the installation, read-only: untouched, to be disabled
+    /// and hidden by the caller ([`masquer_greffon`]).
+    FourniEnLectureSeule,
+}
+
+/// A removal that failed, reduced to a stable code the API can translate. The
+/// OS message and path stay in the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetraitImpossible {
+    pub code: &'static str,
+}
+
+/// Remove an installed wasm plugin, wherever it lives (user root, then the
+/// shipped root). A shipped, read-only folder is not an error: it comes back
+/// as [`Retrait::FourniEnLectureSeule`].
 #[cfg(feature = "plugins-wasm")]
-pub(crate) fn remove_wasm_dir(id: &str) -> Result<bool, String> {
-    crate::plugins_host::remove_plugin_dir(id)
+pub(crate) fn remove_wasm_dir(id: &str) -> Result<Retrait, RetraitImpossible> {
+    use crate::plugins_host::Removal;
+    match crate::plugins_host::remove_plugin_dir(id) {
+        Ok(Removal::Absent) => Ok(Retrait::Absent),
+        Ok(Removal::Removed) => Ok(Retrait::Supprime),
+        Ok(Removal::ReadOnlyShipped) => Ok(Retrait::FourniEnLectureSeule),
+        Err(e) => {
+            tracing::warn!(id = %id, code = e.code, detail = %e.detail, "plugin_uninstall_failed");
+            Err(RetraitImpossible { code: e.code })
+        }
+    }
 }
 
 #[cfg(not(feature = "plugins-wasm"))]
-pub(crate) fn remove_wasm_dir(_id: &str) -> Result<bool, String> {
-    Ok(false)
+pub(crate) fn remove_wasm_dir(_id: &str) -> Result<Retrait, RetraitImpossible> {
+    Ok(Retrait::Absent)
 }
 
-/// The on-disk wasm plugins directory, when the runtime is built.
+/// Every wasm plugin on disk, all roots merged (one entry per id). Empty in a
+/// build without the runtime.
 #[cfg(feature = "plugins-wasm")]
-pub(crate) fn wasm_plugins_dir() -> Option<std::path::PathBuf> {
-    Some(crate::plugins_host::plugins_dir())
+pub(crate) async fn scan_wasm_plugins() -> Result<Vec<tune_core::plugins::PluginInfo>, String> {
+    crate::plugins_host::scan_all_roots().await
 }
 
 #[cfg(not(feature = "plugins-wasm"))]
-pub(crate) fn wasm_plugins_dir() -> Option<std::path::PathBuf> {
+pub(crate) async fn scan_wasm_plugins() -> Result<Vec<tune_core::plugins::PluginInfo>, String> {
+    Ok(Vec::new())
+}
+
+/// The folder holding the manifest of `id`, in the first root that has one.
+#[cfg(feature = "plugins-wasm")]
+pub(crate) fn wasm_plugin_dir(id: &str) -> Option<std::path::PathBuf> {
+    crate::plugins_host::plugin_roots()
+        .into_iter()
+        .map(|root| root.join(id))
+        .find(|dir| dir.join("manifest.json").exists())
+}
+
+#[cfg(not(feature = "plugins-wasm"))]
+pub(crate) fn wasm_plugin_dir(_id: &str) -> Option<std::path::PathBuf> {
     None
+}
+
+/// Message translation key for a [`RetraitImpossible::code`]; a code we do not
+/// know falls to the generic one, never to a raw OS message.
+pub(crate) fn cle_erreur_de_retrait(code: &str) -> &'static str {
+    match code {
+        "permission_denied" => "plugin.uninstall.permission_denied",
+        "read_only" => "plugin.uninstall.read_only",
+        "unsafe_id" => "plugin.uninstall.unsafe_id",
+        _ => "plugin.uninstall.failed",
+    }
+}
+
+/// 4xx/5xx answer for a failed uninstall: stable `code`, and a sentence in the
+/// caller's language (`detail` and `message` carry the same text, for clients
+/// that read either) — no path, no OS error number.
+pub(crate) fn reponse_retrait_impossible(
+    lang: &str,
+    e: &RetraitImpossible,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let texte = crate::i18n::t(lang, cle_erreur_de_retrait(e.code));
+    let statut = if e.code == "unsafe_id" {
+        axum::http::StatusCode::BAD_REQUEST
+    } else {
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (
+        statut,
+        axum::Json(serde_json::json!({
+            "error": "uninstall_failed",
+            "code": e.code,
+            "detail": texte,
+            "message": texte,
+        })),
+    )
+        .into_response()
+}
+
+fn cle_masque(id: &str) -> String {
+    format!("plugin_{id}_hidden")
+}
+
+/// Has this (shipped, undeletable) plugin been uninstalled by the user? The
+/// flag lives in the settings database, i.e. under the data folder.
+pub(crate) fn greffon_masque(settings: &SettingsRepo, id: &str) -> bool {
+    settings.get(&cle_masque(id)).ok().flatten().as_deref() == Some("true")
+}
+
+/// Uninstall of a shipped read-only plugin: persist "hidden" and "disabled" so
+/// it neither shows up nor loads again — and so the generic uninstall cleanup,
+/// which drops the `enabled` key (default: enabled), cannot revive it.
+pub(crate) fn masquer_greffon(settings: &SettingsRepo, id: &str) {
+    settings.set(&cle_masque(id), "true").ok();
+    settings.set(&format!("plugin_{id}_enabled"), "false").ok();
+}
+
+/// Installing a plugin again brings back a hidden shipped one.
+pub(crate) fn demasquer_greffon(settings: &SettingsRepo, id: &str) {
+    settings.delete(&cle_masque(id)).ok();
 }
 
 /// Probe-child dispatch for the wasm runtime (see
@@ -486,8 +1062,13 @@ struct ScanDuDisque {
 impl tune_cd::extraction::ScanCible for ScanDuDisque {
     async fn scanner(&self, dossier: String) -> bool {
         let cible = tune_core::scanner::walker::normalize_path(&dossier);
-        crate::routes::system::scan::spawn_library_scan(self.state.clone(), false, Some(cible))
-            .await
+        crate::routes::system::scan::spawn_library_scan_par(
+            self.state.clone(),
+            false,
+            Some(cible),
+            crate::routes::system::scan::ORIGINE_EXTRACTION_CD,
+        )
+        .await
     }
 }
 
@@ -559,3 +1140,7 @@ fn membres_de_collection(
     }
     m
 }
+
+#[cfg(all(test, feature = "collection-physique"))]
+#[path = "plugins_tests_jeton_discogs_7195.rs"]
+mod tests_jeton_discogs_7195;

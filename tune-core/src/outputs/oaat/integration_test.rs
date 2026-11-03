@@ -12,6 +12,59 @@ mod tests {
     use crate::outputs::traits::{OutputTarget, PlayMedia};
     #[tokio::test]
     async fn oaat_connect_and_stream() {
+        verifier_demarrage_7331(0, false).await;
+    }
+
+    #[tokio::test]
+    async fn demarrage_7331_preparation_lente() {
+        verifier_demarrage_7331(3000, false).await;
+    }
+
+    #[tokio::test]
+    async fn demarrage_7331_endpoint_ancien_sans_horloge() {
+        verifier_demarrage_7331(0, true).await;
+    }
+
+    #[tokio::test]
+    async fn demarrage_7331_stop_pendant_negociation_lente() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let output = OaatOutput::new(
+            "lent".into(),
+            "127.0.0.1".into(),
+            tcp.local_addr().unwrap().port(),
+            "lent-7331".into(),
+        );
+        output
+            .play_media(&PlayMedia {
+                url: "http://127.0.0.1:9/absent",
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (mut connexion, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), tcp.accept())
+                .await
+                .expect("aucune connexion au faux endpoint")
+                .unwrap();
+        let mut buf = [0; 8192];
+        let n = connexion.read(&mut buf).await.unwrap();
+        assert!(n > 0, "Hello absent");
+        // Le faux endpoint ne répond pas : stop doit annuler la négociation,
+        // fermer la socket, et empêcher les tentatives suivantes.
+        output.stop().await.unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), connexion.read(&mut buf))
+            .await
+            .expect("stop n'a pas interrompu la négociation")
+            .unwrap();
+        assert_eq!(n, 0, "la connexion OAAT reste active après stop");
+        assert!(
+            !output.diagnostics_snapshot()["connected"]
+                .as_bool()
+                .unwrap()
+        );
+    }
+
+    async fn verifier_demarrage_7331(preparation_ms: u64, sans_horloge: bool) {
         // Bind control (TCP), audio (UDP), clock (UDP) on random ports
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let control_port = tcp.local_addr().unwrap().port();
@@ -32,6 +85,8 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     let mut count = 0u32;
+                    // (PTS du premier paquet, horloge oaat à sa réception)
+                    let mut premier: Option<(u64, u64)> = None;
                     loop {
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(5),
@@ -39,14 +94,24 @@ mod tests {
                         )
                         .await
                         {
-                            Ok(Ok(n)) if n >= AUDIO_HEADER_SIZE => count += 1,
+                            Ok(Ok(n)) if n >= AUDIO_HEADER_SIZE => {
+                                count += 1;
+                                if premier.is_none() {
+                                    let recu_ns = oaat_core::time::now_ns();
+                                    let hdr: [u8; AUDIO_HEADER_SIZE] =
+                                        buf[..AUDIO_HEADER_SIZE].try_into().unwrap();
+                                    if let Ok(h) = AudioPacketHeader::decode(&hdr) {
+                                        premier = Some((h.pts_ns, recu_ns));
+                                    }
+                                }
+                            }
                             _ => break,
                         }
                         if count >= 10 {
                             break;
                         }
                     }
-                    count
+                    (count, premier)
                 })
             };
 
@@ -56,8 +121,19 @@ mod tests {
                 loop {
                     match clock_udp.recv_from(&mut buf).await {
                         Ok((n, peer)) if n >= 28 => {
-                            // Echo back as response (simplified)
-                            let _ = clock_udp.send_to(&buf[..n], peer).await;
+                            if !sans_horloge {
+                                use oaat_core::wire::{ClockSyncPacket, ClockSyncType};
+                                let t2 = oaat_core::time::now_ns();
+                                let requete: [u8; ClockSyncPacket::SIZE] =
+                                    buf[..ClockSyncPacket::SIZE].try_into().unwrap();
+                                let mut reponse = ClockSyncPacket::decode(&requete).unwrap();
+                                reponse.kind = ClockSyncType::Response;
+                                reponse.t2 = t2;
+                                reponse.t3 = oaat_core::time::now_ns();
+                                let mut paquet = [0; ClockSyncPacket::SIZE];
+                                reponse.encode(&mut paquet);
+                                let _ = clock_udp.send_to(&paquet, peer).await;
+                            }
                         }
                         _ => break,
                     }
@@ -98,7 +174,8 @@ mod tests {
                             },
                             audio_port,
                             clock_port,
-                            buffer_size_ms: 100,
+                            buffer_size_ms: if sans_horloge { 10_000 } else { 100 },
+                            features: vec![],
                         });
                         let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
 
@@ -118,6 +195,10 @@ mod tests {
                                 match msg {
                                     Message::FormatPropose(fp) => {
                                         got_format = true;
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            preparation_ms,
+                                        ))
+                                        .await;
                                         let accept = Message::FormatAccept(FormatAccept {
                                             stream_id: fp.stream_id,
                                         });
@@ -133,8 +214,8 @@ mod tests {
                 }
             }
 
-            let audio_count = audio_rx.await.unwrap_or(0);
-            (got_format, got_play, audio_count)
+            let (audio_count, premier) = audio_rx.await.unwrap_or((0, None));
+            (got_format, got_play, audio_count, premier)
         });
 
         // Start HTTP server with a short WAV
@@ -161,6 +242,7 @@ mod tests {
         );
 
         let url = format!("http://127.0.0.1:{http_port}/test.wav");
+        let avant_play_ns = oaat_core::time::now_ns();
         let result = output
             .play_media(&PlayMedia {
                 url: &url,
@@ -172,11 +254,44 @@ mod tests {
         assert!(result.is_ok());
 
         // Wait for mock to finish
-        let (got_format, got_play, audio_packets) =
-            tokio::time::timeout(std::time::Duration::from_secs(8), mock_handle)
+        let (got_format, got_play, audio_packets, premier) =
+            tokio::time::timeout(std::time::Duration::from_secs(12), mock_handle)
                 .await
                 .expect("mock timed out")
                 .expect("mock panicked");
+
+        // L'heure de départ envoyée à l'endpoint (PTS du premier paquet,
+        // ancré après préparation, avec avance réseau) est datée dans l'horloge
+        // monotone d'oaat, celle de la synchro d'horloge : elle tombe entre
+        // « avant play » et « réception » lus sur `oaat_core::time::now_ns()`,
+        // décalés des bornes de l'avance compatible (500 ms à 4 s).
+        let (pts_premier, recu_ns) = premier.expect("aucun en-tête audio décodable reçu");
+        let commande_premier_paquet_ns = recu_ns.saturating_sub(avant_play_ns);
+        let avance_ns = pts_premier.saturating_sub(recu_ns);
+        eprintln!(
+            "7331 préparation={preparation_ms}ms ancien={sans_horloge}: commande→paquet={commande_premier_paquet_ns}ns avance_PTS={avance_ns}ns"
+        );
+        if preparation_ms == 0 && !sans_horloge {
+            assert!(
+                commande_premier_paquet_ns < 2_000_000_000,
+                "un endpoint rapide subit encore le plancher de deux secondes"
+            );
+        }
+        assert!(
+            commande_premier_paquet_ns >= preparation_ms * 1_000_000,
+            "le paquet est parti avant la fin de la préparation"
+        );
+        assert!(
+            avance_ns > 300_000_000,
+            "la préparation lente a consommé l'avance PTS avant le premier paquet"
+        );
+        assert!(
+            avant_play_ns + 500_000_000 <= pts_premier && pts_premier <= recu_ns + 4_000_000_000,
+            "PTS du premier paquet {pts_premier} hors de [{}, {}] : l'heure de départ \
+             n'est pas dans le domaine d'horloge d'oaat",
+            avant_play_ns + 500_000_000,
+            recu_ns + 4_000_000_000
+        );
 
         assert!(got_format, "endpoint should receive FormatPropose");
         assert!(got_play, "endpoint should receive Play");
@@ -276,6 +391,7 @@ mod tests {
                 audio_port,
                 clock_port,
                 buffer_size_ms: 100,
+                features: vec![],
             });
             stream.write_all(&FrameCodec::encode(&ack)).await.unwrap();
 
@@ -497,6 +613,7 @@ mod tests {
                 audio_port,
                 clock_port,
                 buffer_size_ms: 100,
+                features: vec![],
             });
             stream.write_all(&FrameCodec::encode(&ack)).await.unwrap();
 
@@ -731,6 +848,7 @@ mod tests {
                             audio_port,
                             clock_port,
                             buffer_size_ms: 100,
+                            features: vec![],
                         });
                         let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
 
@@ -1140,6 +1258,7 @@ mod tests {
                 audio_port,
                 clock_port,
                 buffer_size_ms: 100,
+                features: vec![],
             });
             let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
 
@@ -1397,6 +1516,7 @@ mod tests {
                 audio_port,
                 clock_port,
                 buffer_size_ms: 100,
+                features: vec![],
             });
             let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
             loop {
@@ -1691,6 +1811,7 @@ mod tests {
                 audio_port,
                 clock_port,
                 buffer_size_ms: 100,
+                features: vec![],
             });
             let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
             loop {
@@ -1956,6 +2077,7 @@ mod tests {
                             audio_port,
                             clock_port,
                             buffer_size_ms: 100,
+                            features: vec![],
                         });
                         let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
 
@@ -2081,6 +2203,439 @@ mod tests {
     ///
     /// Le test compte les connexions entrantes : elles doivent se figer après
     /// `stop()`. Sans le correctif, le compteur continue de monter.
+    /// `endpoint_release` (RFC OAAT §7.3.1) : l'endpoint rend son DAC à une
+    /// autre source de l'appareil. La zone passe en pause, et la reprise
+    /// renégocie le MÊME flux (même `stream_id`, même format) avant `play`,
+    /// parce que l'endpoint a fermé son DAC.
+    #[tokio::test]
+    async fn endpoint_release_met_en_pause_et_la_reprise_renegocie() {
+        use oaat_core::format::AudioFormat;
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_port = tcp.local_addr().unwrap().port();
+        let audio_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let audio_port = audio_udp.local_addr().unwrap().port();
+        let clock_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let clock_port = clock_udp.local_addr().unwrap().port();
+
+        // Ce que l'endpoint voit passer : (type, stream_id).
+        let (evenements_tx, mut evenements) =
+            tokio::sync::mpsc::unbounded_channel::<(&'static str, String)>();
+
+        let mock_handle = tokio::spawn(async move {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                while audio_udp.recv(&mut buf).await.is_ok() {}
+            });
+            tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                while let Ok((n, peer)) = clock_udp.recv_from(&mut buf).await {
+                    let _ = clock_udp.send_to(&buf[..n], peer).await;
+                }
+            });
+
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let mut codec = FrameCodec::new();
+            let mut read_buf = [0u8; 8192];
+            let mut hello_vu = false;
+            let mut libere = false;
+            let mut propositions = 0u32;
+            loop {
+                let n = match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    stream.read(&mut read_buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => n,
+                };
+                codec.feed(&read_buf[..n]);
+                while let Ok(Some(msg)) = codec.decode_next() {
+                    match msg {
+                        Message::Hello(h) if !hello_vu => {
+                            hello_vu = true;
+                            assert!(
+                                h.features.iter().any(|f| f == FEATURE_ENDPOINT_RELEASE),
+                                "Tune doit annoncer endpoint_release"
+                            );
+                            let ack = Message::HelloAck(HelloAck {
+                                protocol_version: oaat_core::PROTOCOL_VERSION,
+                                endpoint_id: "mock-ep-release".into(),
+                                endpoint_name: "Mock DAC".into(),
+                                capabilities: EndpointCapabilities {
+                                    pcm_max_rate: 192000,
+                                    pcm_max_bits: 32,
+                                    dsd_max_rate: None,
+                                    channels_max: 2,
+                                    formats: vec![AudioFormat::PcmS16le, AudioFormat::PcmS24le],
+                                    volume: None,
+                                    gapless: true,
+                                    seek: false,
+                                },
+                                audio_port,
+                                clock_port,
+                                buffer_size_ms: 100,
+                                features: vec![FEATURE_ENDPOINT_RELEASE.into()],
+                            });
+                            let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
+                        }
+                        Message::FormatPropose(fp) => {
+                            propositions += 1;
+                            let _ = evenements_tx.send(("format_propose", fp.stream_id.clone()));
+                            if propositions > 1 {
+                                // #6790 — à la reprise, l'autre source tient
+                                // encore le DAC : l'accord se fait attendre.
+                                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                            }
+                            let accept = Message::FormatAccept(FormatAccept {
+                                stream_id: fp.stream_id,
+                            });
+                            let _ = stream.write_all(&FrameCodec::encode(&accept)).await;
+                        }
+                        Message::Play(p) => {
+                            let _ = evenements_tx.send(("play", p.stream_id.clone()));
+                            if !libere {
+                                // Une autre source prend le DAC peu après.
+                                libere = true;
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                let release = Message::EndpointRelease(EndpointRelease {
+                                    stream_id: p.stream_id,
+                                    reason: ReleaseReason::LocalSource,
+                                });
+                                let _ = stream.write_all(&FrameCodec::encode(&release)).await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        // 5 s d'audio : la piste joue encore pendant tout le test.
+        let wav = make_test_wav_body(44100 * 4 * 5);
+        let http_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http_tcp.local_addr().unwrap().port();
+        let http_handle = tokio::spawn(async move {
+            if let Ok((mut s, _)) = http_tcp.accept().await {
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\n\r\n",
+                    wav.len()
+                );
+                let _ = s.write_all(hdr.as_bytes()).await;
+                let _ = s.write_all(&wav).await;
+            }
+        });
+
+        let output = OaatOutput::new(
+            "Mock DAC".into(),
+            "127.0.0.1".into(),
+            control_port,
+            "mock-ep-release".into(),
+        );
+        let url = format!("http://127.0.0.1:{http_port}/test.wav");
+        output
+            .play_media(&PlayMedia {
+                url: &url,
+                mime_type: "audio/wav",
+                title: Some("Test"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        async fn suivant(
+            evenements: &mut tokio::sync::mpsc::UnboundedReceiver<(&'static str, String)>,
+        ) -> (&'static str, String) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), evenements.recv())
+                .await
+                .expect("l'endpoint n'a rien reçu")
+                .expect("endpoint simulé arrêté")
+        }
+        let (quoi, flux) = suivant(&mut evenements).await;
+        assert_eq!(quoi, "format_propose");
+        assert_eq!(suivant(&mut evenements).await, ("play", flux.clone()));
+
+        // La libération met la zone en pause.
+        let echeance = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let etat = output.get_status().await.unwrap().state;
+            if etat == crate::outputs::traits::TransportState::Paused {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < echeance,
+                "la zone devrait être en pause après endpoint_release, état {etat:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // #6790 (1) — la sortie remet sa pause au poller, UNE fois, pour que
+        // la ZONE passe `paused` ; `get_status()` seul ne la faisait pas suivre.
+        let echeance = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !output.take_paused_by_device() {
+            assert!(
+                tokio::time::Instant::now() < echeance,
+                "#6790 : après endpoint_release la sortie doit signaler sa pause à la zone"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !output.take_paused_by_device(),
+            "la pause de l'appareil se remet une seule fois"
+        );
+
+        // La pause a duré : 3 minutes chez spockfish entre la libération et
+        // la reprise. Le dernier paquet date d'alors.
+        let il_y_a_3_min = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 180_000;
+        output
+            .diag
+            .last_packet_epoch_ms
+            .store(il_y_a_3_min, std::sync::atomic::Ordering::SeqCst);
+
+        // La reprise renégocie le même flux, puis joue.
+        output.resume().await.unwrap();
+        assert_eq!(
+            suivant(&mut evenements).await,
+            ("format_propose", flux.clone())
+        );
+
+        // #6790 (2) — pendant que l'endpoint attend son DAC, le superviseur
+        // des blocages (`playing && !paused && last_packet_age_ms > 30 s`)
+        // ne doit pas voir une zone bloquée : il la relançait sans position,
+        // et la piste repartait de 0:00.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let diag = output.diagnostics_snapshot();
+        assert_eq!(diag["playing"], true);
+        assert_eq!(diag["paused"], false, "la reprise a bien levé la pause");
+        let age = diag["last_packet_age_ms"].as_u64().unwrap();
+        assert!(
+            age < 30_000,
+            "#6790 : pendant la renégociation de reprise, l'horloge du dernier paquet \
+             doit repartir de la reprise (âge {age} ms) — sinon le superviseur relance la zone depuis 0:00"
+        );
+
+        assert_eq!(suivant(&mut evenements).await, ("play", flux));
+
+        output.stop().await.ok();
+        mock_handle.abort();
+        http_handle.abort();
+    }
+
+    /// Un endpoint de groupe simulé : poignée de main avec `endpoint_release`,
+    /// accepte tout format, compte ses paquets audio, et — s'il est `liberer`
+    /// — rend sa sortie 300 ms après `play`. Ce qu'il reçoit d'utile part sur
+    /// `evenements`.
+    async fn faux_endpoint_de_groupe(
+        endpoint_id: &'static str,
+        liberer: bool,
+    ) -> (
+        u16,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+    ) {
+        use oaat_core::format::AudioFormat;
+        use std::sync::atomic::Ordering;
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_port = tcp.local_addr().unwrap().port();
+        let audio_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let audio_port = audio_udp.local_addr().unwrap().port();
+        let clock_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let clock_port = clock_udp.local_addr().unwrap().port();
+        let paquets = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let compteur = paquets.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            while audio_udp.recv(&mut buf).await.is_ok() {
+                compteur.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            while let Ok((n, peer)) = clock_udp.recv_from(&mut buf).await {
+                let _ = clock_udp.send_to(&buf[..n], peer).await;
+            }
+        });
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = tcp.accept().await else {
+                return;
+            };
+            let mut codec = FrameCodec::new();
+            let mut read_buf = [0u8; 8192];
+            let mut libere = false;
+            loop {
+                let n = match stream.read(&mut read_buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                codec.feed(&read_buf[..n]);
+                while let Ok(Some(msg)) = codec.decode_next() {
+                    match msg {
+                        Message::Hello(h) => {
+                            if h.features.iter().any(|f| f == FEATURE_ENDPOINT_RELEASE) {
+                                let _ = tx.send("hello_avec_release");
+                            }
+                            let ack = Message::HelloAck(HelloAck {
+                                protocol_version: oaat_core::PROTOCOL_VERSION,
+                                endpoint_id: endpoint_id.into(),
+                                endpoint_name: endpoint_id.into(),
+                                capabilities: EndpointCapabilities {
+                                    pcm_max_rate: 192000,
+                                    pcm_max_bits: 32,
+                                    dsd_max_rate: None,
+                                    channels_max: 2,
+                                    formats: vec![AudioFormat::PcmS16le, AudioFormat::PcmS24le],
+                                    volume: None,
+                                    gapless: true,
+                                    seek: false,
+                                },
+                                audio_port,
+                                clock_port,
+                                buffer_size_ms: 100,
+                                features: vec![FEATURE_ENDPOINT_RELEASE.into()],
+                            });
+                            let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
+                        }
+                        Message::FormatPropose(fp) => {
+                            let accept = Message::FormatAccept(FormatAccept {
+                                stream_id: fp.stream_id,
+                            });
+                            let _ = stream.write_all(&FrameCodec::encode(&accept)).await;
+                        }
+                        Message::Play(p) => {
+                            let _ = tx.send("play");
+                            if liberer && !libere {
+                                libere = true;
+                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                let release = Message::EndpointRelease(EndpointRelease {
+                                    stream_id: p.stream_id,
+                                    reason: ReleaseReason::LocalSource,
+                                });
+                                let _ = stream.write_all(&FrameCodec::encode(&release)).await;
+                                let _ = tx.send("release_envoye");
+                            }
+                        }
+                        Message::ZoneRelease(_) => {
+                            let _ = tx.send("zone_release");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        (control_port, paquets, rx)
+    }
+
+    /// #6393 (point 4) — dans un groupe OAAT, l'endpoint qui rend sa sortie
+    /// (`endpoint_release`) quitte le groupe, et lui seul : les autres
+    /// continuent de recevoir l'audio, et le groupe reste en lecture.
+    #[tokio::test]
+    async fn multiroom_une_liberation_ne_retire_que_cet_endpoint() {
+        use crate::outputs::oaat::OaatMultiroomOutput;
+        use std::sync::atomic::Ordering;
+
+        let (port_a, paquets_a, mut ev_a) = faux_endpoint_de_groupe("ep-a", false).await;
+        let (port_b, _paquets_b, mut ev_b) = faux_endpoint_de_groupe("ep-b", true).await;
+
+        // 6 s d'audio : le groupe joue pendant tout le test.
+        let wav = make_test_wav_body(44100 * 4 * 6);
+        let http_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http_tcp.local_addr().unwrap().port();
+        let http_handle = tokio::spawn(async move {
+            if let Ok((mut s, _)) = http_tcp.accept().await {
+                // Lire la requête, et garder la connexion ouverte après
+                // l'envoi : fermer un socket dont la requête n'a pas été lue
+                // part en RST, et le client perd la fin du corps.
+                let mut requete = [0u8; 2048];
+                let _ = s.read(&mut requete).await;
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\n\r\n",
+                    wav.len()
+                );
+                let _ = s.write_all(hdr.as_bytes()).await;
+                let _ = s.write_all(&wav).await;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+
+        let groupe = OaatMultiroomOutput::new(
+            "Groupe".into(),
+            "groupe-6393".into(),
+            vec![("127.0.0.1".into(), port_a), ("127.0.0.1".into(), port_b)],
+        );
+        let url = format!("http://127.0.0.1:{http_port}/test.wav");
+        groupe
+            .play_media(&PlayMedia {
+                url: &url,
+                mime_type: "audio/wav",
+                title: Some("Test"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        async fn attendre(
+            ev: &mut tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+            quoi: &'static str,
+            message: &str,
+        ) {
+            let echeance = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match tokio::time::timeout_at(echeance, ev.recv()).await {
+                    Ok(Some(e)) if e == quoi => return,
+                    Ok(Some(_)) => continue,
+                    _ => panic!("{message}"),
+                }
+            }
+        }
+        attendre(
+            &mut ev_b,
+            "hello_avec_release",
+            "#6393 : le groupe doit annoncer endpoint_release, sinon l'endpoint ne le dit jamais",
+        )
+        .await;
+        attendre(&mut ev_a, "play", "ep-a n'a pas reçu play").await;
+        attendre(&mut ev_b, "release_envoye", "ep-b n'a pas rendu sa sortie").await;
+        attendre(
+            &mut ev_b,
+            "zone_release",
+            "#6393 : l'endpoint qui a rendu sa sortie doit quitter le groupe (zone_release)",
+        )
+        .await;
+
+        let ids: Vec<String> = groupe.zone_snapshot().await["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["endpoint_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["ep-a".to_string()], "seul ep-b quitte le groupe");
+
+        // ep-a continue de jouer.
+        let avant = paquets_a.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let apres = paquets_a.load(Ordering::SeqCst);
+        assert!(
+            apres > avant + 10,
+            "ep-a doit continuer de recevoir l'audio après le départ d'ep-b ({avant} -> {apres})"
+        );
+        assert_eq!(
+            groupe.get_status().await.unwrap().state,
+            crate::outputs::traits::TransportState::Playing,
+            "le groupe reste en lecture"
+        );
+
+        groupe.stop().await.ok();
+        http_handle.abort();
+    }
+
     #[tokio::test]
     async fn stop_cancels_the_connection_retry_loop() {
         use std::sync::Arc;
@@ -2289,6 +2844,7 @@ mod tests {
                                             audio_port,
                                             clock_port,
                                             buffer_size_ms: 100,
+                                            features: vec![],
                                         });
                                         let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
                                     }
@@ -2966,6 +3522,7 @@ mod tests {
             packets_lost: 0,
             packets_recovered: 0,
             bit_perfect: true,
+            underruns: 0,
         })
     }
 

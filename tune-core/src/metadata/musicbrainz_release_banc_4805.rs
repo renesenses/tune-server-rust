@@ -330,13 +330,13 @@ where
         .await
         .ok()?;
     let mut trouves = parse_search_results(&data, titre, artiste);
-    if trouves.is_empty() {
-        if let Some(nettoye) = titre_de_requete(titre) {
-            let data = interroger(requete_lucene(&nettoye, artiste), FETCH)
-                .await
-                .ok()?;
-            trouves = parse_search_results(&data, titre, artiste);
-        }
+    if trouves.is_empty()
+        && let Some(nettoye) = titre_de_requete(titre)
+    {
+        let data = interroger(requete_lucene(&nettoye, artiste), FETCH)
+            .await
+            .ok()?;
+        trouves = parse_search_results(&data, titre, artiste);
     }
     Some(!trouves.is_empty())
 }
@@ -499,7 +499,15 @@ async fn enregistrer() {
         eprintln!("TUNE_BANC_4805_ENREGISTRER=1 absent : rien n'est enregistré");
         return;
     }
-    let reponses: RefCell<BTreeMap<String, Value>> = RefCell::new(BTreeMap::new());
+    // Les réponses déjà enregistrées sont gardées : seules les requêtes
+    // nouvelles partent (#4805, mesure A : une requête qui change ne doit pas
+    // faire réenregistrer, donc dériver, tout le banc).
+    let deja: BTreeMap<String, Value> = std::fs::read_to_string(chemin_fixture())
+        .ok()
+        .and_then(|brut| serde_json::from_str::<Value>(&brut).ok())
+        .and_then(|f| serde_json::from_value(f["reponses"].clone()).ok())
+        .unwrap_or_default();
+    let reponses: RefCell<BTreeMap<String, Value>> = RefCell::new(deja);
 
     async fn interroger_mb(requete: &str) -> Value {
         for essai in 0..3 {

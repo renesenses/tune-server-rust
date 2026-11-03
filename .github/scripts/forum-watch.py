@@ -33,6 +33,12 @@ GIST_TOKEN = os.environ.get("GIST_TOKEN", GITHUB_TOKEN)
 REPO = os.environ["GITHUB_REPOSITORY"]
 
 
+# Règle de Bertrand (22/10/2026) : toute issue ouverte porte un type, une
+# priorité, une zone et un statut. Le robot ne sait pas trier : il pose des
+# valeurs par défaut prudentes, que le tri remplace ensuite.
+ETIQUETTES_DE_TRI = ("bug", "P3", "zone:support", "statut:a-verifier")
+
+
 def forum_thread_url(slug):
     """URL publique d'un fil du forum.
 
@@ -281,7 +287,7 @@ def main():
         )
         title = f"[Forum] {t.get('title','(no title)')}"
         try:
-            issue = create_github_issue(title, body, ["forum-feedback", "new-thread"])
+            issue = create_github_issue(title, body, ["forum-feedback", "new-thread", *ETIQUETTES_DE_TRI])
             print(f"Created issue #{issue['number']}: {title}")
             created += 1
         except Exception as e:
@@ -297,7 +303,7 @@ def main():
         )
         title = f"[Forum reply] {t.get('title','(no title)')[:60]}"
         try:
-            issue = create_github_issue(title, body, ["forum-feedback", "new-reply"])
+            issue = create_github_issue(title, body, ["forum-feedback", "new-reply", *ETIQUETTES_DE_TRI])
             print(f"Created issue #{issue['number']}: {title}")
             created += 1
         except Exception as e:

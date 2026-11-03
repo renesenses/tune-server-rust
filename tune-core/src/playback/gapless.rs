@@ -2,7 +2,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::orchestrator::PlaybackOrchestrator;
-use crate::outputs::traits::{OutputStatus, PlayMedia, TransportState};
+use crate::outputs::traits::{AnnonceSuivante, OutputStatus, PlayMedia, TransportState};
 
 const PREBUFFER_THRESHOLD_MS: u64 = 15_000;
 
@@ -215,6 +215,36 @@ pub fn est_dsd(marqueur: &str) -> bool {
     m.contains("dsd") || m.contains("dsf") || m.contains("dff")
 }
 
+/// #6910 — un renderer DLNA TIENT-il un suivant en DSD brut ?
+///
+/// La garde de #402 refusait d'armer tout suivant DSD sur DLNA : le HiFi Rose
+/// RS130 acquittait `SetNextAVTransportURI` pour un flux DSD sans jamais y
+/// passer, et l'album se coupait après la piste 1. Elle mordait aussi sur les
+/// renderers qui lisent le DSD natif ET enchaînent (fil 2412, The Wall pistes
+/// 2-3 : un blanc entre deux pistes enchaînées sur le disque).
+///
+/// Vrai **seulement** si les trois conditions tiennent :
+///
+/// 1. le renderer annonce le DSD dans son `GetProtocolInfo` — un sondage
+///    CONCLUANT (`Some(true)`) ; `None` (pas sondé, sondage échoué) et
+///    `Some(false)` (DSD brut forcé par le mode « natif » sur un renderer qui
+///    ne l'annonce pas, comme l'Eversolo DMP-A8) gardent la garde ;
+/// 2. son SCPD d'AVTransport annonce `SetNextAVTransportURI`
+///    ([`AnnonceSuivante::Annoncee`]) ; `Inconnue` garde la garde ;
+/// 3. il n'a pas déjà lâché un suivant DSD armé depuis le démarrage de Tune
+///    (`deja_lache`) : un renderer comme le RS130, qui annonce les deux et ne
+///    suit pas, ne perd qu'UNE transition, puis retrouve la garde.
+///
+/// Une seule définition, lue par le sondeur (`prepare_gapless`) et par la
+/// promesse de la file ([`enchainement_sans_blanc`]).
+pub fn dsd_suivant_tenu_sur_dlna(
+    annonce_dsd: Option<bool>,
+    annonce_suivante: AnnonceSuivante,
+    deja_lache: bool,
+) -> bool {
+    annonce_dsd == Some(true) && annonce_suivante == AnnonceSuivante::Annoncee && !deja_lache
+}
+
 /// Ce qu'une ligne de file peut promettre à la ligne **affichée** juste après elle.
 ///
 /// C'est la question exacte que pose le badge « Gapless » de la file : entre
@@ -253,6 +283,9 @@ pub struct EnchainementAffiche<'a> {
     pub successeur_format: Option<&'a str>,
     /// La ligne affichée juste après a-t-elle un fichier local ?
     pub successeur_est_fichier_local: bool,
+    /// #6910 — [`dsd_suivant_tenu_sur_dlna`] pour la sortie de la zone : le
+    /// sondeur armera-t-il un suivant DSD sur ce renderer DLNA ?
+    pub dsd_suivant_tenu: bool,
 }
 
 /// Vrai **seulement** si l'enchaînement vers la ligne affichée suivante se fera
@@ -266,7 +299,7 @@ pub struct EnchainementAffiche<'a> {
 /// | l'ordre affiché n'est pas l'ordre joué | — (aléatoire / répétition-une) |
 /// | zone `gapless_enabled = 0` | le poller n'entre pas dans la branche d'armement |
 /// | sortie qui ne chaîne pas depuis sa boucle | `gapless_skipped_exclusive_output` |
-/// | suivant DSD sur DLNA (#402) | `gapless_skipped_dsd_next_dlna` |
+/// | suivant DSD sur un DLNA qui ne le tient pas (#402, #6910) | `gapless_skipped_dsd_next_dlna` |
 /// | suivant sans fichier local sur OAAT DSD natif | `gapless_local_file_skipped_no_local_next` |
 pub fn enchainement_sans_blanc(i: &EnchainementAffiche<'_>) -> bool {
     // L'ordre affiché doit ÊTRE l'ordre joué. Sous aléatoire, la ligne d'en
@@ -289,8 +322,9 @@ pub fn enchainement_sans_blanc(i: &EnchainementAffiche<'_>) -> bool {
     // #402 — un renderer DLNA accepte `SetNextAVTransportURI` pour un flux DSD
     // et ne le consomme jamais (HiFi Rose RS130, Benjithom). Le poller refuse
     // d'armer ; la file ne le promet donc pas. Le même DSD sur une sortie
-    // locale garde sa chaîne interne et reste promis.
-    if i.output_type == "dlna" && i.successeur_format.is_some_and(est_dsd) {
+    // locale garde sa chaîne interne et reste promis. #6910 : sauf renderer
+    // qui annonce le DSD et `SetNext` et n'a pas lâché de suivant DSD.
+    if i.output_type == "dlna" && i.successeur_format.is_some_and(est_dsd) && !i.dsd_suivant_tenu {
         return false;
     }
     // OAAT en DSD natif / PCM direct lit le `.dsf` suivant sur le disque : un
@@ -317,6 +351,7 @@ mod tests {
             successeur_reel: Some(1),
             successeur_format: Some("flac"),
             successeur_est_fichier_local: true,
+            dsd_suivant_tenu: false,
         }
     }
 
@@ -383,6 +418,35 @@ mod tests {
         let mut local_dsd = ligne();
         local_dsd.successeur_format = Some("dsf");
         assert!(enchainement_sans_blanc(&local_dsd));
+    }
+
+    /// #6910 — le renderer DSD natif qui annonce `SetNext` : le suivant DSD
+    /// est promis. Le refus de #402 reste pour tous les autres.
+    #[test]
+    fn dsd_sur_dlna_promis_au_renderer_qui_le_tient_6910() {
+        let mut dlna = ligne();
+        dlna.output_type = "dlna";
+        dlna.successeur_format = Some("dsf");
+        dlna.dsd_suivant_tenu = true;
+        assert!(
+            enchainement_sans_blanc(&dlna),
+            "#6910 : renderer qui annonce le DSD et SetNext — le suivant DSD doit être promis"
+        );
+    }
+
+    /// #6910 — chaque condition manquante garde la garde de #402.
+    #[test]
+    fn dsd_suivant_tenu_exige_les_trois_conditions_6910() {
+        use AnnonceSuivante::*;
+        assert!(dsd_suivant_tenu_sur_dlna(Some(true), Annoncee, false));
+        // DSD non sondé, ou brut forcé sur un renderer qui ne l'annonce pas.
+        assert!(!dsd_suivant_tenu_sur_dlna(None, Annoncee, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(Some(false), Annoncee, false));
+        // SCPD illisible ou action absente.
+        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), Inconnue, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), NonAnnoncee, false));
+        // Le renderer a déjà lâché un suivant DSD armé (RS130, #402).
+        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), Annoncee, true));
     }
 
     #[test]

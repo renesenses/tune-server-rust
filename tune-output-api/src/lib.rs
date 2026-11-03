@@ -196,6 +196,15 @@ impl VolumeResolution {
     }
 }
 
+/// Plage de commandes en pour-cent réellement annoncée par une sortie.
+/// Le pas est compté depuis `min`, sans imposer une grille partant de zéro.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumePercentRange {
+    pub min: u8,
+    pub max: u8,
+    pub step: u8,
+}
+
 /// Capacités déclarées par une sortie.
 ///
 /// `version == 0` signifie « plugin ancien, contrat inconnu ». Le serveur le
@@ -222,6 +231,9 @@ pub struct OutputCapabilities {
     /// et rien ne change pour la sortie qui ne le déclare pas.
     #[serde(default)]
     pub volume_resolution: VolumeResolution,
+    /// `None` : plage non annoncée, sans inventer les limites de l'appareil.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_percent_range: Option<VolumePercentRange>,
 }
 
 impl OutputCapabilities {
@@ -244,6 +256,7 @@ impl OutputCapabilities {
             formats: Vec::new(),
             channel_layouts: Vec::new(),
             volume_resolution: VolumeResolution::Continuous,
+            volume_percent_range: None,
         }
     }
 
@@ -2003,6 +2016,12 @@ pub struct TransformationsReelles {
     /// #2211 — un fondu enchaîné superpose deux pistes en ce moment même.
     /// Faux hors du recouvrement : le fondu ne touche le signal que là.
     fondu_enchaine: bool,
+    /// #6057 — la sortie a réordonné des voies à nombre de canaux égal,
+    /// selon la disposition que le fichier déclare.
+    reorganisation_canaux: bool,
+    /// tune-server-rust#6741 — un égaliseur COUPÉ applique encore son
+    /// préampli : `(centièmes de dB, en retour)`. `None` hors de ce cas.
+    preampli_garde: Option<(i32, bool)>,
 }
 
 impl TransformationsReelles {
@@ -2016,7 +2035,48 @@ impl TransformationsReelles {
             ouvert,
             dsp_actif,
             fondu_enchaine: false,
+            reorganisation_canaux: false,
+            preampli_garde: None,
         }
+    }
+
+    /// tune-server-rust#6741 — la même déclaration, en disant qu'un
+    /// égaliseur coupé applique encore son préampli (`db`, négatif dans le
+    /// cas normal), et s'il est en train de revenir au niveau d'avant
+    /// l'égaliseur. Additif, comme [`Self::avec_reorganisation_canaux`].
+    #[must_use]
+    pub fn avec_preampli_garde(mut self, db: f64, en_retour: bool) -> Self {
+        self.preampli_garde = db
+            .is_finite()
+            .then(|| ((db * 100.0).round() as i32, en_retour));
+        self
+    }
+
+    /// tune-server-rust#6741 — le préampli qu'un égaliseur coupé applique
+    /// encore, en dB, et s'il revient vers le niveau d'avant l'égaliseur.
+    #[must_use]
+    pub fn preampli_garde(&self) -> Option<(f64, bool)> {
+        self.preampli_garde
+            .map(|(centiemes, en_retour)| (f64::from(centiemes) / 100.0, en_retour))
+    }
+
+    /// #6057 — la même déclaration, en disant si la sortie RÉORDONNE des
+    /// voies sans en changer le nombre : un DFF dont la liste `CHNL` n'est
+    /// pas dans l'ordre de la sortie, un WAV dont le masque place les
+    /// latéraux là où la sortie attend les arrière. Additif : `nouvelles` le
+    /// pose à faux, et une sortie qui ne réordonne rien n'a rien à changer.
+    #[must_use]
+    pub const fn avec_reorganisation_canaux(mut self, actif: bool) -> Self {
+        self.reorganisation_canaux = actif;
+        self
+    }
+
+    /// #6057 — des voies ont-elles changé de place, à nombre de canaux égal ?
+    /// Chaque échantillon garde sa valeur mais quitte sa voie : le flux livré
+    /// n'est plus celui de la source, le verdict bit-perfect tombe.
+    #[must_use]
+    pub const fn reorganisation_canaux(&self) -> bool {
+        self.reorganisation_canaux
     }
 
     /// #2211 — la même déclaration, en disant si un fondu enchaîné mélange
@@ -2226,6 +2286,21 @@ pub trait OutputTarget: Send + Sync {
     /// which is correct for every output that reports failures synchronously.
     fn take_output_failure(&self) -> Option<String> {
         None
+    }
+
+    /// #6790 — the output paused ON ITS OWN, without a command from the host.
+    ///
+    /// An OAAT endpoint that hands its DAC to another player of the device
+    /// sends `endpoint_release`: the output stops sending audio and reports
+    /// `Paused`, but nothing told the zone, which stayed `playing` with a
+    /// frozen position. The poller reads this on each tick of a playing zone
+    /// and pauses the zone as a user pause would (saved position, `paused`
+    /// state), without sending a second pause to the output.
+    ///
+    /// Returned **once**: the implementation clears it. Default `false`: no
+    /// other output pauses by itself.
+    fn take_paused_by_device(&self) -> bool {
+        false
     }
 
     /// #4177 — la sortie a-t-elle RENDU son périphérique pendant la pause ?

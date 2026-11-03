@@ -1,0 +1,19 @@
+{
+  "attendu": {
+    "code": "duree",
+    "resultat": "refuse"
+  },
+  "contexte": {
+    "grace_expiration": 0,
+    "maintenant": 1793000000,
+    "server_id": "6f1c1f5e-2b0a-4c2e-9d3b-7a51c0de0001"
+  },
+  "defi": {
+    "defi": "c2Vzc2lvbi1kZWZpLWRlLXRlc3QtMDEyMzQ1Njc4OTAx",
+    "signature": "RViENs3a2oEShmYoVcnKtpRhTeITKAEbXRLpLOeL_IB535Lz14CUFPctu7VuXP4EcCvw8HhiTptRJDAbLmJdCg"
+  },
+  "description": "exp - iat = 2 h : au-delà de la durée maximale d'1 h.",
+  "laissez_passer": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6InR1bmUtcGFzcytqd3QifQ.eyJpc3MiOiJodHRwczovL21vemFpa2xhYnMuZnIiLCJhdWQiOiJ0dW5lLXJlbW90ZSIsInN1YiI6ImNwdF84ZjJhNjEiLCJzaWQiOiI2ZjFjMWY1ZS0yYjBhLTRjMmUtOWQzYi03YTUxYzBkZTAwMDEiLCJkaWQiOiJhcHBfZWRfMDEiLCJjbmYiOnsiYWxnIjoiRWQyNTUxOSIsInBrIjoibjBsRG5wMndsYnhCRWUwbDAxZVYyREc4VmFCSDlMSFg5cTdqZDN1MEVpQSJ9LCJwMnAiOmZhbHNlLCJpYXQiOjE3OTI5OTk0MDAsIm5iZiI6MTc5Mjk5OTQwMCwiZXhwIjoxNzkzMDA2NjAwLCJqdGkiOiJqdGktMDAwMSIsInYiOjF9.3KGfHNzBP19y2B5i8f-zl7wYSbSUlpd21TvChXGiqypRxivt9xLxZLX30OS0y0OUEVDARHqvIkzVPAoj1p9qCw",
+  "nom": "duree_trop_longue",
+  "publication": "jeu_de_cles.json"
+}

@@ -136,6 +136,10 @@ pub enum StoppedOutcome {
     FailureStop,
     /// Below threshold, or above threshold without a natural end — accumulate.
     Waiting,
+    /// #6717 — le renderer annonce `Stopped`, mais sa position dépasse le pic
+    /// atteint jusque-là : il joue. Le tour ne compte pas comme un arrêt et
+    /// la série en cours est effacée ; voir [`arret_dementi_par_la_position`].
+    SuppressPositionAdvancing,
 }
 
 impl StoppedOutcome {
@@ -210,6 +214,10 @@ pub struct StoppedInput {
     /// reports `ended_naturally`, so without this the track only ends after
     /// `STOPPED_TICKS_THRESHOLD` polls (~5s gap).
     pub dlna_dsd_reached_end: bool,
+    /// #6717 — `Stopped` démenti par la position : la position rapportée sur
+    /// ce tour dépasse le pic d'avant le tour. Voir
+    /// [`arret_dementi_par_la_position`].
+    pub position_avance: bool,
 }
 
 /// Pure reproduction of the `TransportState::Stopped` arm's decision tree.
@@ -255,6 +263,11 @@ pub fn classify_stopped(i: &StoppedInput) -> StoppedOutcome {
         // reliable end-of-track signal — advance now, ~4s before the
         // Stopped counter would.
         return DsdDlnaReachedEnd;
+    }
+    if i.position_avance {
+        // #6717 — un renderer dont la position avance n'est pas arrêté, quoi
+        // qu'en dise son transport : aucun tour d'arrêt ne s'accumule.
+        return SuppressPositionAdvancing;
     }
     // Fallthrough: the arm increments stopped_ticks, then branches on it.
     let stopped_ticks = i.stopped_ticks.saturating_add(1);
@@ -417,6 +430,31 @@ pub fn arret_assez_long_pour_couper(
         Some(d) => d.as_secs() >= plancher_secs,
         None => true,
     }
+}
+
+/// 🔴 #6717 — un `Stopped` que la position DÉMENT.
+///
+/// Le renderer dit « arrêté », mais la position qu'il rapporte sur ce même
+/// tour dépasse le pic atteint jusque-là sur la piste : il joue. Un renderer
+/// réellement arrêté rend une position figée, ou zéro ; aucun ne la fait
+/// progresser. La radio applique déjà la même règle (Yamaha R-N2000A, flux
+/// MP3 ICEcast).
+///
+/// Le terrain (Windows rc6, renderer `GStreamer souphttpsrc 1.14.4`) : deux
+/// coupures `playback_failure_stopping_zone` à `peak_pos=130000` pour
+/// `wall_secs=129`, puis `peak_pos=159000` pour `wall_secs=161`. Au moment
+/// de couper, la position atteinte égalait le temps écoulé depuis le début
+/// de la piste, alors que la série `Stopped` durait depuis 32 s et 36 s : la
+/// position avait continué d'avancer pendant tout l'« arrêt ». La famine de
+/// #4480 suppose une position FIGÉE depuis le premier arrêt — l'avance
+/// d'audio (`avance_ms` ≈ 30 s, le tampon plein d'un renderer qui joue) ne
+/// diminuait pas, l'arrêt grandissait, et la zone était coupée au bout de
+/// 30 s.
+///
+/// Comparé au PIC et non au dernier échantillon : une position qui oscille
+/// ne dément rien, seule une position qui gagne du terrain le fait.
+pub fn arret_dementi_par_la_position(pic_avant_ms: u64, position_ms: u64) -> bool {
+    position_ms > pic_avant_ms
 }
 
 /// 🔴 #4480 — de combien l'audio DÉJÀ LIVRÉE devance la position annoncée.
@@ -597,6 +635,7 @@ mod tests {
             // Base : rien qui prouve un fichier servi en entier (#4661).
             horloge_de_piste_couvre_l_arret: false,
             dlna_dsd_reached_end: false,
+            position_avance: false,
         }
     }
 
@@ -621,9 +660,14 @@ mod tests {
 
     #[test]
     fn volume_adopted_on_real_device_change() {
-        // The knob moved on the device (0.50 -> 0.62) and now differs from
-        // the saved volume — adopt it.
+        // The knob moved DOWN on the device (0.50 -> 0.20) and now differs
+        // from the saved volume — adopt it. #6739 : jamais à la hausse.
         assert!(super::super::decisions::should_adopt_device_volume(
+            Some(0.5),
+            0.2,
+            0.3
+        ));
+        assert!(!super::super::decisions::should_adopt_device_volume(
             Some(0.5),
             0.62,
             0.3
@@ -1230,6 +1274,10 @@ use super::{ArmedNext, ZonePollState};
 /// Ce qui fait passer [`EtatDeLecture`] d'une variante à l'autre. Le numéro
 /// est celui de la ligne dans la table du document ; la ligne `tick.rs:`
 /// est le site où `tick` l'appelle.
+// `TransitionDetectee` répète le nom de l'enum, mais ce nom est écrit tel quel
+// dans le journal (`transition_inattendue … transition={t:?}`) et dans la table
+// de docs/refonte/ref9-etats-du-sondeur.md : le renommer changerait les deux.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Transition {
     /// 1 — génération changée : tout est rabattu (bloc
