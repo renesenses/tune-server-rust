@@ -5690,6 +5690,12 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "listening_resumes",
         include_str!("../../migrations/postgres/100_listening_resumes.sql"),
     ),
+    // #7619 / #7656 : la clé de curseur existe aussi dans la chaîne migrée.
+    (
+        101,
+        "tracks_cle_tri",
+        include_str!("../../migrations/postgres/101_tracks_cle_tri.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -9240,7 +9246,8 @@ mod tests {
         // 99 reste réservée à la sentinelle des anciennes bascules : entrée
         // sans effet pour garder la chaîne contiguë, jamais un changement DDL.
         // 100 : listening_resumes (#7280), jumelle de la SQLite 135.
-        assert_eq!(pg_latest_version(), 100, "latest PG migration must be 100");
+        // 101 : tracks.cle_tri et son index de curseur (#7619 / #7656).
+        assert_eq!(pg_latest_version(), 101, "latest PG migration must be 101");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
