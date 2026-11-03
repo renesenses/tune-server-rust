@@ -696,9 +696,14 @@ impl PlaybackOrchestrator {
         // `is_some()` check served that empty title verbatim, wiping Now Playing
         // (DEvir: `auto_next title=Shine...` followed by `orchestrator_play
         // title=`). Falling through to get_track() refetches the real metadata
-        // from the service. The network call only fires when the title is
-        // missing, so the happy path is unchanged.
-        let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
+        // from the service. #7738 : un titre Qobuz importé peut avoir un titre
+        // et une durée, mais aucun artiste, album ni pochette. Compléter aussi
+        // ce cas ; une fiche Qobuz complète garde le chemin sans requête.
+        let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty())
+            && (service_name != "qobuz"
+                || [&req.artist_name, &req.album_title, &req.cover_url]
+                    .into_iter()
+                    .all(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty())));
         let (title, artist, album, mut duration_ms, cover_path) = if has_title {
             (
                 req.title.clone().unwrap_or_default(),
@@ -1595,7 +1600,11 @@ impl PlaybackOrchestrator {
                 // device → same FLAC/WAV decision, so inherit it).
                 self.spawn_warm_next_streaming(req.zone_id, source_id.to_string(), w.enc_format);
 
-                let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
+                let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty())
+                    && (service_name != "qobuz"
+                        || [&req.artist_name, &req.album_title, &req.cover_url]
+                            .into_iter()
+                            .all(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty())));
                 let (title, artist, album, duration_ms, cover_path) = if has_title {
                     (
                         req.title.clone().unwrap_or_default(),
@@ -1827,7 +1836,11 @@ impl PlaybackOrchestrator {
                 .streamer
                 .get_stream_url(&session_id, &server_ip, "flac");
 
-            let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
+            let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty())
+                && (service_name != "qobuz"
+                    || [&req.artist_name, &req.album_title, &req.cover_url]
+                        .into_iter()
+                        .all(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty())));
             let (title, artist, album, duration_ms, cover_path) = if has_title {
                 (
                     req.title.clone().unwrap_or_default(),
