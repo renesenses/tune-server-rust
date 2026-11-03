@@ -208,13 +208,21 @@ pub mod sql {
     /// côtés. L'interprète de la piste est relu par sous-requête pour ne
     /// dépendre d'aucun alias de la requête englobante. `piste` et `ecoute`
     /// sont des alias écrits par l'appelant, jamais une saisie.
+    ///
+    /// Une écoute dont `track_id` désigne la piste lui revient aussi, même
+    /// sans interprète enregistré : c'était la seule règle avant #7769, et
+    /// la retirer faisait perdre ces écoutes (`pg_date_relative_6122`). Une
+    /// seule ligne d'écoute ne compte qu'une fois : c'est un `OR` dans la
+    /// même condition. Sur les écoutes de la production, `track_id` vide, le
+    /// nombre reste celui de la Bibliothèque.
     pub fn ecoute_de_la_piste(piste: &str, ecoute: &str) -> String {
         let interprete =
             format!("(SELECT ae.name FROM artists ae WHERE ae.id = {piste}.artist_id)");
         format!(
-            "{ecoute}.source != 'radio' AND {ecoute}.title = {piste}.title \
-             AND ({ecoute}.artist_name = {interprete} \
-                  OR ({ecoute}.artist_name IS NULL AND {interprete} IS NULL))"
+            "{ecoute}.source != 'radio' AND ({ecoute}.track_id = {piste}.id \
+             OR ({ecoute}.title = {piste}.title \
+                 AND ({ecoute}.artist_name = {interprete} \
+                      OR ({ecoute}.artist_name IS NULL AND {interprete} IS NULL))))"
         )
     }
 

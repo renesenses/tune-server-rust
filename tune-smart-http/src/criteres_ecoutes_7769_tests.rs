@@ -165,3 +165,55 @@ fn les_collections_comptent_les_ecoutes_comme_la_bibliotheque_7769() {
         "une valeur illisible ne vaut plus 0"
     );
 }
+
+/// Une écoute dont `track_id` désigne la piste lui revient, même sans
+/// interprète enregistré : c'était la règle d'avant #7769, et la jointure
+/// par titre + interprète seule perdait ces écoutes (`pg_date_relative_6122`
+/// rougissait). « Solo » d'Autre (piste 4) reçoit une telle écoute ;
+/// l'homonyme d'un autre interprète, sans `track_id`, ne compte toujours pas.
+#[test]
+fn une_ecoute_rattachee_par_track_id_compte_sans_interprete_7769() {
+    let db = avec_ecoutes_a_ne_pas_compter();
+    db.execute_batch(
+        "INSERT INTO listen_history (track_id, title, listened_at) VALUES \
+           (4,'Solo','2024-07-02T10:00:00Z');",
+    )
+    .unwrap();
+    assert_eq!(
+        pistes(&db, &regle("play_count", "=", json!(1))),
+        vec![2, 4],
+        "l'écoute rattachée par track_id n'est pas comptée"
+    );
+    assert_eq!(pistes(&db, &regle("play_count", "=", json!(0))), vec![3]);
+    assert_eq!(
+        pistes(&db, &regle("last_played_at", ">", json!("2024-07-01"))),
+        vec![4],
+        "la dernière écoute rattachée par track_id est perdue"
+    );
+    let ctx = RefCtx::root(&EmptyResolver, Some(1));
+    let (w, _o, _l) = build_album_query(
+        &regle("last_played_at", ">", json!("2024-07-01")),
+        "all",
+        "title",
+        "asc",
+        None,
+        &ctx,
+    );
+    let sql = format!(
+        "SELECT al.id FROM albums al \
+         LEFT JOIN artists ar ON al.artist_id = ar.id \
+         LEFT JOIN tracks t ON t.album_id = al.id \
+         {w} GROUP BY al.id ORDER BY al.id"
+    );
+    let albums: Vec<i64> = db
+        .query_many(&sql, &[])
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"))
+        .iter()
+        .map(|r| r[0].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        albums,
+        vec![3],
+        "collections : la dernière écoute rattachée par track_id est perdue"
+    );
+}

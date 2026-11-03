@@ -633,7 +633,7 @@ fn condition_hors_colonne(
     value_raw: Option<&Value>,
 ) -> Option<String> {
     // 🔴 #7769 — les écoutes de la piste par la règle de la Bibliothèque
-    // (titre + interprète), et non par `listen_history.track_id`, toujours
+    // (titre + interprète), et non par `listen_history.track_id` seul, toujours
     // NULL : ces règles ne retenaient aucune piste, « jamais » les retenait
     // toutes.
     let ecoute = tune_core::db::history_repo::sql::ecoute_de_la_piste("t", "he");
@@ -1520,13 +1520,14 @@ mod tests {
     }
 
     /// « Jamais écoutée » : un compte nul des écoutes rattachées à la piste
-    /// par titre + interprète (#7769), plus `track_id`, toujours NULL. Le
-    /// comportement est tenu par `ecoutes_7769_tests`.
+    /// par titre + interprète (#7769), ou par `track_id` quand il est
+    /// renseigné — jamais par `track_id` seul, toujours NULL en production.
+    /// Le comportement est tenu par `ecoutes_7769_tests`.
     #[test]
     fn jamais_ecoutee_compte_les_ecoutes_de_la_piste() {
         let w = where_of(r#"[{"field":"play_count","op":"equals","value":"0"}]"#);
         assert!(w.contains("FROM listen_history he"), "{w}");
-        assert!(!w.contains("track_id"), "{w}");
+        assert!(w.contains("OR (he.title = t.title"), "{w}");
         assert!(w.ends_with("= 0"), "{w}");
     }
 

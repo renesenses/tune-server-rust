@@ -1278,8 +1278,8 @@ pub(crate) mod tests {
 /// forum #2127) départage désormais les éditions par l'album et l'ISRC — la
 /// ligne gelée correspondante a été mise à jour avec elle. De même les deux
 /// lignes « nombre d'écoutes » (#7769) : elles comptaient par
-/// `listen_history.track_id`, toujours NULL, et comptent désormais comme la
-/// Bibliothèque.
+/// `listen_history.track_id` seul, toujours NULL, et comptent désormais comme
+/// la Bibliothèque, `track_id` ne servant plus qu'en plus quand il est rempli.
 #[cfg(test)]
 mod anciennes_regles {
     use crate::smart_playlists::build_smart_query_rapport;
