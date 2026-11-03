@@ -60,14 +60,13 @@ pub(super) async fn completer(state: &AppState, items: &mut [Value]) {
             continue;
         }
         let mut cache = state.metadonnees_playlists.0.lock().await;
-        if cache.len() >= 4096 {
-            if let Some(ancienne) = cache
+        if cache.len() >= 4096
+            && let Some(ancienne) = cache
                 .iter()
                 .min_by_key(|(_, (date, _))| *date)
                 .map(|(id, _)| id.clone())
-            {
-                cache.remove(&ancienne);
-            }
+        {
+            cache.remove(&ancienne);
         }
         cache.insert(id.clone(), (Instant::now(), piste.clone()));
         connus.insert(id, piste);
