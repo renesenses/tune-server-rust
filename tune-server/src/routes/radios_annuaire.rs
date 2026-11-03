@@ -1112,9 +1112,15 @@ async fn choisir_le_flux(
 
 /// `POST /radios/directory/{external_id}/play/{zone_id}` — l'écoute en un clic
 /// d'une fiche qui n'est pas dans « Mes radios ». Rien n'est ajouté.
+///
+/// #7587 — corps facultatif `{"stream_url": …}` : le flux choisi sur la fiche,
+/// parmi ceux qu'elle publie (422 `flux_hors_fiche` sinon, comme #7177). La
+/// règle de pays (#7199) s'applique encore : un flux choisi mais interdit dans
+/// le pays d'écoute cède la place au meilleur flux autorisé.
 async fn jouer(
     State(state): State<AppState>,
     Path((external_id, zone_id)): Path<(String, i64)>,
+    corps: Option<Json<CorpsFluxPrefere>>,
 ) -> Response {
     let Some(fiche) = fiche_par_id(&state, &external_id) else {
         return (
@@ -1123,10 +1129,26 @@ async fn jouer(
         )
             .into_response();
     };
-    let flux = match super::radios::geofencing::stream_for_directory(&state, &fiche, None) {
-        Ok(flux) => flux,
-        Err(response) => return response.into_response(),
-    };
+    let choisi = corps.map(|Json(c)| c.stream_url);
+    if let Some(url) = choisi.as_deref() {
+        let voulu = flux_normalise(url);
+        if !fiche
+            .flux_proposes()
+            .iter()
+            .any(|f| flux_normalise(&f.url) == voulu)
+        {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "flux_hors_fiche"})),
+            )
+                .into_response();
+        }
+    }
+    let flux =
+        match super::radios::geofencing::stream_for_directory(&state, &fiche, choisi.as_deref()) {
+            Ok(flux) => flux,
+            Err(response) => return response.into_response(),
+        };
     Json(
         super::radios::jouer_un_flux(
             &state,
