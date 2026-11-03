@@ -4824,6 +4824,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(TRACKS_TITLE_INDEX) {
         warn!(error = %e, "sqlite_tracks_title_index_failed");
     }
+    // #7619 (L1) — la clé de tri des pistes et son index : même passe, sans
+    // numéro de migration (aucune collision possible avec un lot voisin).
+    // La colonne naît NULL ; `TrackRepo::assurer_les_cles_de_tri` la remplit.
+    add_column_if_missing(db, "tracks", "cle_tri", "TEXT");
+    if let Err(e) = db.execute_batch(crate::db::track_repo::cle_de_tri::INDEX_CLE_TRI) {
+        warn!(error = %e, "sqlite_tracks_cle_tri_index_failed");
+    }
     // #2149 — collections à règle de genre : même passe — voir la constante.
     if let Err(e) = db.execute_batch(TRACKS_ALBUM_GENRE_INDEX) {
         warn!(error = %e, "sqlite_tracks_album_genre_index_failed");
@@ -5902,6 +5909,16 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // finale SQLite.
     if let Err(e) = sqlx::raw_sql(TRACKS_TITLE_INDEX).execute(pool).await {
         warn!(error = %e, "pg_tracks_title_index_failed");
+    }
+    // #7619 (L1) — même colonne et même index que la passe finale SQLite ;
+    // `COLLATE "C"` : l'ordre des octets, celui de SQLite et de la clé.
+    for sql in [
+        crate::db::track_repo::cle_de_tri::COLONNE_CLE_TRI_PG,
+        crate::db::track_repo::cle_de_tri::INDEX_CLE_TRI,
+    ] {
+        if let Err(e) = sqlx::raw_sql(sql).execute(pool).await {
+            warn!(error = %e, "pg_tracks_cle_tri_failed");
+        }
     }
     // #5998 — même passe que la passe finale SQLite, même raison.
     if let Err(e) = sqlx::raw_sql(crate::db::track_repo::INDEX_CHEMIN_DOSSIER_PG)

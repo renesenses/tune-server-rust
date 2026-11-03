@@ -384,6 +384,11 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // #6332 — le débit moyen du fichier (PG 094). Ici AUSSI, même raison que
     // `rating` : l'INSERT et l'UPDATE des pistes le NOMMENT.
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS bitrate_kbps BIGINT",
+    // #7619 (L1) — la clé de tri de la vue des pistes, sans numéro de
+    // migration (passe rejouée au démarrage). `COLLATE "C"` : l'ordre des
+    // octets, celui de SQLite. L'index JUSTE APRÈS la colonne.
+    "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE \"C\"",
+    "CREATE INDEX IF NOT EXISTS idx_tracks_cle_tri ON tracks(cle_tri, id)",
     // #6516 — le lien des radios avec l'annuaire (PG 090). Ici AUSSI : une
     // base de bascule ne rejoue pas la 090, et le rapprochement NOMME la
     // colonne. L'index JUSTE APRÈS la colonne.

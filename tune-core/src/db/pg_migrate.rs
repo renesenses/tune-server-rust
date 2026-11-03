@@ -1343,6 +1343,9 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating TEXT;
 -- tracks: debit moyen du fichier en kbit/s (SQLite migration v130 / PG 094,
 -- #6332). TEXT pour la copie ; la 094, rejouee juste apres, le convertit.
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS bitrate_kbps TEXT;
+-- tracks: cle de tri de la vue des pistes (#7619, L1, sans numero). Copiee
+-- telle quelle ; recalculee de toute facon par `assurer_les_cles_de_tri`.
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE "C";
 -- radio_stations: lien avec la fiche de l'annuaire (SQLite migration v126 /
 -- PG 090, #6516). TEXT des deux côtés : la copie texte n'a rien à convertir.
 ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS external_id TEXT;

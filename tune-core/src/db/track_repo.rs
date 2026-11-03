@@ -718,6 +718,8 @@ mod like_escape_tests {
     }
 }
 
+/// #7619 (L1) — la clé de tri pré-calculée et le curseur de la liste.
+pub mod cle_de_tri;
 /// Modifier un champ sur tout le résultat d'un filtre d'Oxygen (#7539).
 mod edition_par_filtre;
 /// Poser ou retirer une étiquette sur tout le résultat d'un filtre d'Oxygen
@@ -3167,6 +3169,30 @@ impl TrackRepo {
         conditions.extend(crate::db::facet_filter::socle_de_la_vue_des_pistes(engine));
 
         (conditions, owned_params)
+    }
+
+    /// [`Self::conditions_du_filtre`] avec le socle ENSEMBLISTE
+    /// ([`crate::db::facet_filter::socle_ensembliste_de_la_vue_des_pistes`]) au
+    /// lieu des sous-requêtes corrélées — #7619 (L1). Mêmes pistes, et une
+    /// page qui lit l'index de la clé de tri s'arrête à `limit` au lieu
+    /// d'évaluer le socle sur toute la table.
+    pub(crate) fn conditions_du_filtre_ensemblistes(
+        &self,
+        f: &TrackFilter,
+        ph: &mut Placeholders,
+    ) -> (Vec<String>, Vec<SqlValue>) {
+        let engine = self.db.engine();
+        let (mut conditions, valeurs) = self.conditions_du_filtre(f, ph);
+        // Le socle ferme TOUJOURS la liste, et il n'a aucun marqueur : le
+        // remplacer ne décale aucune valeur liée.
+        let socle = crate::db::facet_filter::socle_de_la_vue_des_pistes(engine);
+        let n = conditions.len();
+        if n >= socle.len() && conditions[n - socle.len()..] == socle[..] {
+            conditions.truncate(n - socle.len());
+            conditions
+                .extend(crate::db::facet_filter::socle_ensembliste_de_la_vue_des_pistes(engine));
+        }
+        (conditions, valeurs)
     }
 
     /// Filtered track listing with optional WHERE clauses.

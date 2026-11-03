@@ -950,6 +950,9 @@ mod routage_tests {
 mod banc_rail_5993;
 
 #[cfg(test)]
+#[path = "curseur_7619_tests.rs"]
+mod curseur_7619_tests;
+#[cfg(test)]
 #[path = "facettes_lentes_2144_tests.rs"]
 mod facettes_lentes_2144_tests;
 
