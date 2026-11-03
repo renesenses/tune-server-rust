@@ -642,6 +642,9 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // lecture et rien d'écrit sur une base déjà passée. Avant la boucle de
     // synchronisation, qui ne les ramènera plus.
     tune_core::db::radios_indexees_upnp_6500::passe_journalisee(&state.backend);
+    // #7695 — de même pour les photos et vidéos d'un partage multimédia
+    // (DNG d'un portable Windows), rangées dans `tracks` avant le correctif.
+    tune_core::db::photos_indexees_upnp_7695::passe_journalisee(&state.backend);
     restore_zone_volumes(state).await;
     restaurer_la_lecture(state, config).await;
     restore_oaat_groups(state).await;
@@ -663,6 +666,11 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
         // #4626 — les sorties prêtées par les agents Tune appairés.
         crate::agent_tune::maitre::reinscrire_les_agents(&state_clone).await;
     });
+    // #6961 — la resonde ci-dessus ne part qu'UNE fois. Une zone DLNA/OpenHome
+    // restée hors ligne (appareil injoignable à cet instant précis, réseau de
+    // la machine pas encore prêt) est réévaluée ensuite, à intervalles, au
+    // lieu d'attendre un `NOTIFY` qu'un renderer déjà allumé n'émet pas.
+    crate::discovery_setup::spawn_reevaluation_des_zones_hors_ligne(state);
 
     // Re-probe auto-discovered DLNA renderers from their persisted LOCATION,
     // so one with a lazy SSDP responder (Cyrus Stream X2) comes back online

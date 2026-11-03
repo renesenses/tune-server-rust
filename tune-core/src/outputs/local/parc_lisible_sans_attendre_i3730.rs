@@ -44,7 +44,7 @@
 //! un parc pendant que l'autre en compte les lignes. L'ordre est donc imposé
 //! ici, dans un seul corps.
 
-use super::{AudioDevice, SCAN_GUARD, cached_audio_devices, publier_le_parc};
+use super::{AudioDevice, SCAN_GUARD, age_du_parc_publie, cached_audio_devices, publier_le_parc};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -125,4 +125,14 @@ fn lire_le_parc_n_attend_pas_l_enumeration_en_cours() {
     // enflerait à chaque balayage.
     publier_le_parc(&[un_peripherique("Haut-Parleurs")]);
     assert_eq!(cached_audio_devices().len(), 1);
+
+    // ── 3. #7263 : chaque publication date le parc ──────────────────────
+    // La fiche de diagnostic sert le parc publié tant qu'il est récent ;
+    // un âge qui ne bougerait pas à la publication la ferait rebalayer
+    // à chaque appel, ou jamais.
+    let age = age_du_parc_publie().expect("un parc vient d'être publié : son âge est connu");
+    assert!(
+        age < Duration::from_secs(5),
+        "le parc vient d'être publié : {age:?}"
+    );
 }
