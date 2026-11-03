@@ -1939,3 +1939,10 @@ path = "tests/messages_seconde_passe_7077.rs"
 [[test]]
 name = "raccourcis_windows_sans_console_7637"
 path = "tests/raccourcis_windows_sans_console_7637.rs"
+
+# #7726 — retirer la licence libère la machine auprès du site de licences
+# (faux site local), et efface la clé même quand le site ne répond pas.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "licence_retrait_libere_la_machine_7726"
+path = "tests/licence_retrait_libere_la_machine_7726.rs"
