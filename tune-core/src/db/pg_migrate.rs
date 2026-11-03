@@ -226,6 +226,9 @@ const MIGRATION_TABLES: &[&str] = &[
 const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Reprises (#7280), créées par le script 100 : conserver leur file et position.
     "listening_resumes",
+    // Écoutes importées (#7763, script 101) : sans cette ligne, les écoutes
+    // reportées de Roon, Plex ou d'une liste m3u seraient perdues à la bascule.
+    "imported_plays",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",
@@ -1837,6 +1840,8 @@ fn conflict_clause(table: &str) -> &'static str {
         "track_audio_embedding" => "ON CONFLICT (track_id) DO NOTHING",
         // Pas de colonne `id` : la clef est le quadruplet (#6682).
         "radio_ecoutes" => "ON CONFLICT (jour, station_url, zone_id, profile_id) DO NOTHING",
+        // Pas de colonne `id` : la clef primaire est la piste (#7763).
+        "imported_plays" => "ON CONFLICT (track_id) DO NOTHING",
         // For tables with BIGSERIAL PK, conflict on id
         _ => "ON CONFLICT (id) DO NOTHING",
     }

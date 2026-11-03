@@ -17,6 +17,8 @@ pub mod contexte_de_file;
 pub mod disques_par_dossier;
 /// Les dossiers « Collections » suivent leurs albums (#5527, #5528).
 pub mod dossiers_des_collections;
+/// #7763 — les écoutes importées (Roon, Plex, m3u), à part de l'historique.
+pub mod ecoutes_importees;
 pub mod edition_album;
 pub mod engine;
 pub mod facet_filter;
