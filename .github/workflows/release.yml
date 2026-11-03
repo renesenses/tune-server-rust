@@ -177,7 +177,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding","dst"]}
-            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
+            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,aes67,mon-theme
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -188,7 +188,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding","dst"]}
-            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
+            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,aes67,mon-theme
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -380,7 +380,7 @@ jobs:
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding","dst"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,aes67,mon-theme
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
@@ -394,12 +394,12 @@ jobs:
       - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","asio","postgres","plugins-wasm","audio-embedding","dst"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,aes67,mon-theme
 
       - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
         # plugin-catalog: {"features":"all","base":["postgres","plugins-wasm","audio-embedding","dst"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,aes67,mon-theme
 
       # Garde-fou #3355 : le relais cloud doit etre DANS chaque binaire livre,
       # pas seulement dans la ligne `--features` qui l'a construit.
@@ -501,7 +501,7 @@ jobs:
               || echo "::warning::apt indisponible — airplay-daemon sera absent de cet artefact"
           fi
           if cargo install --git https://github.com/renesenses/airplay2-rs \
-               --rev a7d7ad6637507eaedd61de7461574adfb7b0a987 \
+               --rev 83a7def6ab39d3709fa47a40eb90993b64afe9b4 \
                airplay-daemon --target ${{ matrix.target }} \
                --root "$RUNNER_TEMP/apd" --locked; then
             echo "airplay-daemon built for ${{ matrix.target }}"
@@ -509,39 +509,27 @@ jobs:
             echo "::warning::airplay-daemon failed to build for ${{ matrix.target }} — this artifact will fall back to AirPlay 1"
           fi
 
-      # #6872 — librespot (MIT, Spotify Connect) livré À CÔTÉ de tune-server,
-      # là où Tune le cherche en premier (`spotify_connect::trouver_le_binaire`,
-      # #6933) : un librespot posé ailleurs par l'utilisateur ne passe plus
-      # avant le sien. Version épinglée, construite ici depuis crates.io.
-      #
-      # Best-effort, comme airplay-daemon : le vrai binaire ou RIEN — jamais un
-      # fichier vide (Tune le prendrait pour librespot). Linux x86_64 natif
-      # seulement pour l'instant : macOS exige signature et notarisation de ce
-      # binaire de plus, Windows n'a aucun binaire amont, les cibles ARM sont
-      # croisées. Fonctionnalités : TLS rustls (aucune dépendance à OpenSSL
-      # sur la machine cible), Zeroconf intégré (libmdns, pour que
-      # l'application Spotify puisse relier librespot), aucun backend audio
-      # (Tune lit le PCM par `--backend pipe`, toujours compilé).
-      - name: Build librespot (Linux x86_64)
-        if: "runner.os == 'Linux' && !matrix.cross"
+      # #6872: same pinned source, features and notices on every shipped target.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
+      - name: Ensure the cargo-about CLI (#6872)
         shell: bash
         run: |
-          LRS_VERSION=0.8.0
-          if timeout 1200 cargo install librespot --version "$LRS_VERSION" --locked \
-               --no-default-features --features "rustls-tls-webpki-roots,with-libmdns" \
-               --target ${{ matrix.target }} --root "$RUNNER_TEMP/lrs"; then
-            "$RUNNER_TEMP/lrs/bin/librespot" --version
-            LIC="$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/librespot-"$LRS_VERSION" | head -n 1)/LICENSE"
-            if [ -f "$LIC" ]; then
-              cp "$LIC" "$RUNNER_TEMP/lrs/LIBRESPOT-LICENSE.txt"
-            else
-              echo "::warning::licence MIT de librespot introuvable ($LIC) — librespot n'est pas livré sans elle"
-              rm -rf "$RUNNER_TEMP/lrs"
-            fi
-          else
-            echo "::warning::librespot n'a pas pu être construit pour ${{ matrix.target }} — cette archive sera livrée sans lui (lecture Spotify indisponible)"
-            rm -rf "$RUNNER_TEMP/lrs"
+          # install-action has no prebuilt cargo-about 0.9.3 for Intel macOS;
+          # its cargo-binstall fallback then compiles it without the `cli`
+          # feature and `cargo about` does not exist.
+          if ! cargo about --version >/dev/null 2>&1; then
+            cargo install cargo-about --version 0.9.3 --locked --features cli
           fi
+          cargo about --version
+      - name: Build librespot (all targets)
+        shell: bash
+        run: |
+          CROSS=()
+          if [ "${{ matrix.cross }}" = "true" ]; then CROSS=(--cross); fi
+          python scripts/build-librespot.py --target ${{ matrix.target }} \
+            --output "$RUNNER_TEMP/lrs" --work "$RUNNER_TEMP/lrs-source" "${CROSS[@]}"
 
       - name: Import signing certificate
         if: runner.os == 'macOS'
@@ -589,8 +577,8 @@ jobs:
           if [ -f "$RUNNER_TEMP/lrs/bin/librespot" ] && [ -f "$RUNNER_TEMP/lrs/LIBRESPOT-LICENSE.txt" ]; then
             cp "$RUNNER_TEMP/lrs/bin/librespot" package/
             chmod 755 package/librespot
-            cp "$RUNNER_TEMP/lrs/LIBRESPOT-LICENSE.txt" package/
-            LIBRESPOT="librespot LIBRESPOT-LICENSE.txt"
+            cp "$RUNNER_TEMP/lrs/"LIBRESPOT-*.txt package/
+            LIBRESPOT="librespot LIBRESPOT-LICENSE.txt LIBRESPOT-THIRD-PARTY.txt"
           fi
           # ffmpeg minimal (#1524) : à côté de tune-server, là où resolve_tool()
           # regarde en premier. Sa licence LGPL voyage avec lui.
@@ -661,6 +649,8 @@ jobs:
               echo "::error::codesign --timestamp a echoue 5 fois sur $cible — serveur d'horodatage Apple injoignable"
               return 1
             }
+            sign_horodate package/librespot fr.mozaiklabs.librespot ""
+            codesign --verify --strict --verbose=2 package/librespot
             sign_horodate package/tune-server fr.mozaiklabs.tune-server "$DROITS"
             if [ -n "$DAEMON" ]; then
               sign_horodate "package/$DAEMON" fr.mozaiklabs.airplay-daemon ""
@@ -759,6 +749,7 @@ jobs:
             $targets += "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe"
           }
 
+          $targets += "$env:RUNNER_TEMP\lrs\bin\librespot.exe"
           foreach ($t in $targets) {
             # /tr = horodatage : c'est lui qui fait qu'une signature reste
             # valide APRÈS l'expiration du certificat. Sans lui, tout ce qui a
@@ -776,6 +767,8 @@ jobs:
         shell: pwsh
         run: |
           mkdir package\web
+          copy "$env:RUNNER_TEMP\lrs\bin\librespot.exe" package\
+          copy "$env:RUNNER_TEMP\lrs\LIBRESPOT-*.txt" package\
           copy target\${{ matrix.target }}\release\tune-server.exe package\
           # Bundle airplay-daemon.exe next to tune-server.exe if it built.
           if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
@@ -799,6 +792,7 @@ jobs:
           copy tune-server\tests\fixtures\plugins\playlists-converter\manifest.json package\plugins\playlists-converter\
           cd package
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\ plugins\
+          7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} librespot.exe LIBRESPOT-LICENSE.txt LIBRESPOT-THIRD-PARTY.txt
           if (Test-Path "airplay-daemon.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} airplay-daemon.exe }
           if (Test-Path "ffmpeg.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} ffmpeg.exe FFMPEG-LICENSE.txt }
           cd ..
@@ -866,6 +860,9 @@ jobs:
             SetOverwrite on
             SetOutPath "`$INSTDIR"
             File "target\${{ matrix.target }}\release\tune-server.exe"
+            File "package\librespot.exe"
+            File "package\LIBRESPOT-LICENSE.txt"
+            File "package\LIBRESPOT-THIRD-PARTY.txt"
             $daemonFile
             $ffmpegFile
             SetOutPath "`$INSTDIR\web"
@@ -989,6 +986,8 @@ jobs:
               cp "$RUNNER_TEMP/ffbundle/FFMPEG-LICENSE.txt" "$APP/Contents/Resources/"
             fi
           fi
+          cp package/librespot "$APP/Contents/Resources/"
+          cp package/LIBRESPOT-*.txt "$APP/Contents/Resources/"
           cp -r web/* "$APP/Contents/Resources/web/"
           # Bundle the Party (WASM) plugin beside tune-server inside the .app so
           # the plugins-wasm runtime discovers it (plugins/ resolves exe-relative,
@@ -1178,6 +1177,8 @@ jobs:
                 exit 1
               fi
             }
+            codesign --verify --strict --verbose=2 "$APP/Contents/Resources/librespot"
+            verifie_identifiant "$APP/Contents/Resources/librespot" fr.mozaiklabs.librespot
             verifie_identifiant "$APP/Contents/Resources/tune-server" fr.mozaiklabs.tune-server
             verifie_identifiant "$APP" fr.mozaiklabs.tune-server
             if [ -f "$APP/Contents/Resources/airplay-daemon" ]; then
@@ -1508,12 +1509,39 @@ jobs:
   # ANNULÉ ne crée donc rien non plus. Les deux égalités suffiraient à elles
   # seules ; elles sont écrites en clair pour que la porte se lise sans
   # connaître cette règle.
+  # ─── Le mini-lecteur de bureau (tune-widget) ──────────────────────────
+  #
+  # Go de Bertrand du 31/10/2026 : le mini-lecteur part avec la release. Il
+  # n'est PAS dans la matrice `build` : c'est un workspace Tauri isole
+  # (`tune-widget/`, exclu du workspace racine), avec sa propre recette
+  # signee et notarisee, `widget.yml`, qu'on appelle telle quelle plutot que
+  # de la recopier ici — deux recettes divergeraient au premier correctif.
+  #
+  # Ses artefacts (`tune-widget-<tag>-macos-*.dmg`,
+  # `tune-widget-<tag>-windows-x86_64-setup.exe`) sont ramasses par le job
+  # `release` avec les autres `*.dmg` / `*.exe`, et entrent donc dans
+  # SHA256SUMS et sa signature minisign. Leur prefixe les tient hors de la
+  # liste blanche `tune-server-` du client de mise a jour
+  # (`find_archive_asset`) et de la page /download.
+  #
+  # Il est dans les `needs` de `release` : une release qui annonce le
+  # mini-lecteur ne part pas sans lui. Le plafond de duree vit dans
+  # widget.yml (GitHub refuse `timeout-minutes` sur un job `uses:`).
+  widget:
+    name: Build desktop mini-player
+    needs: preflight
+    uses: ./.github/workflows/widget.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+    secrets: inherit
+
   release:
     name: Create Release
-    needs: [preflight, build]
+    needs: [preflight, build, widget]
     if: >-
       needs.preflight.result == 'success'
       && needs.build.result == 'success'
+      && needs.widget.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # Create Release — 1 min ; marge pour les 3 essais minisign (10 min 40 au pire)
     steps:

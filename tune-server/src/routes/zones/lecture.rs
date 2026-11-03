@@ -1,44 +1,59 @@
 use super::*;
 
-/// #2369 — ce que la zone OBTIENDRA d'une source DSD, à côté de ce qu'elle a
-/// DEMANDÉ (`dsd_mode`).
+/// Diagnostic de capacité de la sortie, sans ouvrir ni sonder le pilote.
 ///
-/// Le sélecteur propose « natif » et « dop ». Sur une sortie locale, les deux
-/// emballaient le DSD en DoP : aucun chemin natif n'existait dans
-/// `tune-core/src/outputs/local.rs` (#5643 en ouvre un, par ASIO : valeur
-/// `natif`). L'écran affichait donc « natif » pendant
-/// que du DoP partait, et le testeur qui bascule d'un mode à l'autre refait
-/// deux fois le même essai. `dsd_mode` reste ce qui est réglé ; ce champ dit
-/// ce qui part.
-///
-/// Une SEULE fonction pour les deux sites jumeaux (`list_zones` et
-/// `get_zone`) : c'est une copie qui dérive qui avait fait répondre deux
-/// choses différentes à la même question sur la même zone (#2189).
-///
-/// Les deux entrées sont celles-là mêmes dont se sert `resolve_local_track` —
-/// le préfixe `local:` de `output_device_id`, et `is_network_output_type` sur
-/// `output_type` — pour que le panneau ne puisse pas contredire le chemin
-/// audio.
-fn dsd_transport_value(zone: &Zone, dsd_mode: &str) -> Value {
-    let is_local = zone
+/// #7372 — avant la première résolution DSD, l'absence de cache ne prouve
+/// ni l'absence de DSD natif ni un pilote occupé. `null` signifie que le
+/// transport reste indéterminé ; le client dispose du motif pour le dire.
+/// Une capacité déclarée ne garantit pas toutes les cadences de toutes les
+/// pistes : les contraintes de piste/zone restent décidées par la résolution.
+fn diagnostic_transport_dsd(zone: &Zone, dsd_mode: &str) -> (Value, Value) {
+    use tune_core::outputs::capacite_dsd_natif::{self, CapaciteConnue};
+    let nom_local = zone
         .output_device_id
         .as_deref()
-        .is_some_and(|id| id.starts_with("local:"));
+        .and_then(|id| id.strip_prefix("local:"));
     let is_network = tune_core::orchestrator::is_network_output_type(zone.output_type.as_deref());
-    // #5643 — « natif » quand la sortie est un pilote ASIO dont la capacité
-    // DSD est DÉJÀ connue (sondée une fois par la résolution d'une piste).
-    // Lu, jamais sondé : une route de lecture ne touche pas au pilote.
-    let natif_annonce =
-        tune_core::outputs::capacite_dsd_natif::natif_annonce(zone.output_device_id.as_deref());
-    json!(
-        tune_core::orchestrator::transport_dsd_publie(
-            is_local,
-            is_network,
-            dsd_mode,
-            natif_annonce
-        )
-        .as_str()
+    if let Some(nom) = nom_local.filter(|_| dsd_mode == "native") {
+        // Un seul instantané pour le transport et son motif : un sondage
+        // concurrent ne peut pas produire deux réponses contradictoires.
+        return match capacite_dsd_natif::connue(nom) {
+            None => (Value::Null, json!("capacite_non_sondee")),
+            Some(CapaciteConnue::SortieNonAsio) => {
+                (json!("natif_servi_en_dop"), json!("sortie_non_asio"))
+            }
+            Some(CapaciteConnue::Asio { cadences }) if cadences.is_empty() => {
+                (json!("natif_servi_en_dop"), json!("pilote_sans_dsd"))
+            }
+            Some(CapaciteConnue::Asio { .. }) => (json!("natif"), Value::Null),
+        };
+    }
+    (
+        json!(
+            tune_core::orchestrator::transport_dsd_publie(
+                nom_local.is_some(),
+                is_network,
+                dsd_mode,
+                false,
+            )
+            .as_str()
+        ),
+        Value::Null,
     )
+}
+
+#[cfg(test)]
+fn dsd_transport_value(zone: &Zone, dsd_mode: &str) -> Value {
+    diagnostic_transport_dsd(zone, dsd_mode).0
+}
+
+/// Liste et détail publient le même diagnostic, y compris les valeurs nulles
+/// qui effacent un ancien motif après changement de sortie ou de mode.
+fn injecter_transport_dsd(obj: &mut serde_json::Map<String, Value>, zone: &Zone, mode: &str) {
+    let (transport, motif) = diagnostic_transport_dsd(zone, mode);
+    obj.insert("dsd_transport".into(), transport);
+    obj.insert("dsd_transport_reason".into(), motif);
+    obj.insert("dsd_transport_scope".into(), json!("output_capability"));
 }
 
 pub(super) async fn sync_status(State(state): State<AppState>) -> Json<Value> {
@@ -503,7 +518,7 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             // réglage de la zone, et il se lit comme `dop_active` juste
             // au-dessus.
             let dsd_mode = zone_repo.get_dsd_mode(zone_id);
-            obj.insert("dsd_transport".into(), dsd_transport_value(z, &dsd_mode));
+            injecter_transport_dsd(obj, z, &dsd_mode);
             // #2672 — les neuf réglages du panneau « Avancé · renderer »,
             // `dsd_mode` compris, par l'injecteur partagé avec `get_zone` et
             // `build_zone_json`.
@@ -709,10 +724,7 @@ pub(crate) async fn get_zone(
                 // Voir la note au site jumeau : le mode demandé n'est pas le
                 // transport obtenu (#2369), et cet état déduit reste ici.
                 let dsd_mode = repo.get_dsd_mode(id);
-                obj.insert(
-                    "dsd_transport".into(),
-                    dsd_transport_value(&zone, &dsd_mode),
-                );
+                injecter_transport_dsd(obj, &zone, &dsd_mode);
                 // #2672 — même injecteur que la liste et `build_zone_json`.
                 crate::routes::zones::injecter_reglages_renderer(obj, &repo, id);
                 // Meme correction que dans la liste : la valeur serialisee
@@ -786,5 +798,128 @@ pub(crate) async fn get_zone(
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod asio_7372 {
+    use super::*;
+    use tune_core::outputs::capacite_dsd_natif::{self, CapaciteConnue};
+
+    #[tokio::test]
+    async fn un_sondage_absent_ne_prouve_pas_un_repli_dop() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let id = repo
+            .create(
+                "Topping témoin inconnu",
+                Some("local"),
+                Some("local:7372-inconnu"),
+            )
+            .unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        assert!(!capacite_dsd_natif::natif_annonce(
+            zone.output_device_id.as_deref()
+        ));
+        assert_eq!(
+            dsd_transport_value(&zone, "native"),
+            Value::Null,
+            "une capacité ASIO non sondée est présentée comme un repli DoP avéré"
+        );
+        assert_eq!(dsd_transport_value(&zone, "dop"), json!("dop"));
+        assert_eq!(dsd_transport_value(&zone, "pcm"), json!("pcm"));
+    }
+
+    #[tokio::test]
+    async fn liste_et_detail_publient_la_cause_connue_sans_sonder_le_pilote() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let cas = [
+            (
+                "7372-api-inconnu",
+                None,
+                Value::Null,
+                json!("capacite_non_sondee"),
+            ),
+            (
+                "7372-api-non-asio",
+                Some(CapaciteConnue::SortieNonAsio),
+                json!("natif_servi_en_dop"),
+                json!("sortie_non_asio"),
+            ),
+            (
+                "7372-api-sans-dsd",
+                Some(CapaciteConnue::Asio { cadences: vec![] }),
+                json!("natif_servi_en_dop"),
+                json!("pilote_sans_dsd"),
+            ),
+            (
+                "7372-api-natif",
+                Some(CapaciteConnue::Asio {
+                    cadences: vec![2_822_400],
+                }),
+                json!("natif"),
+                Value::Null,
+            ),
+        ];
+        for (nom, capacite, transport, motif) in cas {
+            if let Some(c) = capacite.clone() {
+                capacite_dsd_natif::retenir(nom, c);
+            }
+            let id = repo
+                .create(nom, Some("local"), Some(&format!("local:{nom}")))
+                .unwrap();
+            repo.update_dsd_mode(id, "native").unwrap();
+            let response = get_zone(State(state.clone()), Path(id))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
+                .await
+                .unwrap();
+            let detail: Value = serde_json::from_slice(&bytes).unwrap();
+            let Json(liste) = list_zones(State(state.clone())).await;
+            let entree = liste
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|z| z["id"] == id)
+                .unwrap();
+            for valeur in [&detail, entree] {
+                assert_eq!(
+                    valeur.get("dsd_transport"),
+                    Some(&transport),
+                    "transport erroné : {nom}"
+                );
+                assert_eq!(
+                    valeur.get("dsd_transport_scope"),
+                    Some(&json!("output_capability"))
+                );
+                assert_eq!(
+                    valeur.get("dsd_transport_reason"),
+                    Some(&motif),
+                    "motif de capacité DSD absent ou erroné : {nom}"
+                );
+            }
+            repo.update_dsd_mode(id, "dop").unwrap();
+            let response = get_zone(State(state.clone()), Path(id))
+                .await
+                .into_response();
+            let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
+                .await
+                .unwrap();
+            let apres: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(apres["dsd_transport"], "dop");
+            assert_eq!(
+                apres.get("dsd_transport_reason"),
+                Some(&Value::Null),
+                "un motif de repli natif ne doit pas survivre au choix explicite DoP"
+            );
+            assert_eq!(
+                capacite_dsd_natif::connue(nom),
+                capacite,
+                "GET ne doit pas sonder ni altérer le pilote"
+            );
+        }
     }
 }

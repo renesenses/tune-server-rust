@@ -50,7 +50,8 @@
 //! Wikimedia partagé, une clé par site. Discogs sans jeton :
 //! [`LIMITEUR_DISCOGS_SANS_JETON`], une requête toutes les 2,5 s. Sites
 //! officiels : [`LIMITEUR_SITES`], une par seconde et par hôte. La passe reste
-//! celle de l'index : paresseuse, bornée à `PASSE_MAX` labels.
+//! celle de l'index : paresseuse, un label après l'autre, par tranches de
+//! `PASSE_MAX` labels (#7414).
 //!
 //! # Garde réseau
 //!

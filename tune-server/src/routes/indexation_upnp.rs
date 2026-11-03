@@ -438,6 +438,8 @@ struct PisteDistante {
     numero_de_piste: Option<i32>,
     /// `upnp:originalDiscNumber` — même règle.
     numero_de_disque: Option<i32>,
+    annee: Option<i32>,
+    genres: Vec<String>,
 }
 
 fn texte(v: &Value, cle: &str) -> Option<String> {
@@ -477,6 +479,17 @@ impl PisteDistante {
             protocol_info: texte(item, "protocol_info"),
             numero_de_piste: numero(item, "track_number"),
             numero_de_disque: numero(item, "disc_number"),
+            annee: numero(item, "year").filter(|y| *y <= 9999),
+            genres: item
+                .get("genres")
+                .and_then(Value::as_array)
+                .map(|g| {
+                    g.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -541,11 +554,10 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
     let Some(ms) = serveurs.get(id).cloned() else {
         return Json(json!({
             "indexe": false,
-            "raison": "serveur inconnu",
-            "detail": format!(
-                "aucun serveur multimédia enregistré sous « {id} » — \
-                 la liste vit dans GET /api/v1/network/media-servers"
-            ),
+            "code": "unknown_server",
+            "raison": crate::message_api::texte("api.upnp.unknownServer", &[]),
+            "detail": crate::message_api::texte("api.upnp.unknownServerDetail", &[("id", id.to_string())]),
+            "message_key": "api.upnp.unknownServerDetail",
         }));
     };
     drop(serveurs);
@@ -1033,6 +1045,16 @@ fn ecrire(
         ligne.format = piste.format();
         ligne.sample_rate = piste.sample_rate;
         ligne.bit_depth = piste.bit_depth;
+        // Métadonnées annoncées par la source, comme le titre et l'artiste.
+        // Une source qui ne les annonce pas ne doit pas effacer les valeurs conservées.
+        if let Some(annee) = piste.annee {
+            ligne.year = Some(annee);
+        }
+        if !piste.genres.is_empty() {
+            ligne.genre = piste.genres.first().cloned();
+            ligne.genres =
+                Some(serde_json::to_string(&piste.genres).expect("genres sérialisables"));
+        }
         // `channels` est un `i32` NON optionnel dont `to_json` dérive une
         // pastille AFFICHÉE. Un serveur muet sur `nrAudioChannels` ne prouve
         // rien : on retombe sur le défaut du modèle (2) plutôt que d'affirmer
@@ -1317,6 +1339,8 @@ mod tests {
             protocol_info: Some("http-get:*:audio/x-flac:DLNA.ORG_PN=FLAC".into()),
             numero_de_piste: None,
             numero_de_disque: None,
+            annee: None,
+            genres: Vec::new(),
         };
         assert_eq!(p.format().as_deref(), Some("flac"));
         p.protocol_info = None;
@@ -1345,6 +1369,8 @@ mod tests {
             protocol_info: None,
             numero_de_piste: numero,
             numero_de_disque: numero.map(|_| 1),
+            annee: None,
+            genres: Vec::new(),
         };
         let pistes = vec![
             p("Alive", Some(3)),
@@ -1454,6 +1480,8 @@ mod tests {
             protocol_info: None,
             numero_de_piste: numero,
             numero_de_disque: None,
+            annee: None,
+            genres: Vec::new(),
         };
         let revision = |state: &AppState| {
             state
@@ -1544,6 +1572,8 @@ mod tests {
             protocol_info: None,
             numero_de_piste: None,
             numero_de_disque: None,
+            annee: None,
+            genres: Vec::new(),
         };
         // La première piste n'annonce pas d'image, la suivante oui.
         let pistes = vec![p("A", None), p("B", Some(url.clone())), p("C", Some(url))];

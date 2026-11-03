@@ -1194,6 +1194,7 @@ pub struct PlaybackOrchestrator {
     /// left None in tests → no gating). Enforced at zone activation in `play`.
     pub license: Option<Arc<crate::license::LicenseManager>>,
     gapless_sessions: Mutex<HashMap<i64, String>>,
+    browser_next: navigateur_suivante_5975::PreparationsNavigateur,
     /// #3365 — la qualité annoncée de la piste pré-armée, rangée à côté de
     /// `gapless_sessions` et reprise par `advance_queue_metadata` quand la
     /// zone adopte ce flux. Carte annexe plutôt qu'un changement de forme de
@@ -1202,6 +1203,10 @@ pub struct PlaybackOrchestrator {
     pub prefetch: Arc<PrefetchEngine>,
     preparations_fichiers: std::sync::Mutex<HashMap<i64, preparation_fichier_7247::Preparation>>,
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
+    /// #6910 — renderers DLNA qui ont lâché un suivant DSD armé (acquitté,
+    /// jamais suivi : HiFi Rose RS130, #402). La garde DSD leur est rendue
+    /// pour la vie du processus.
+    appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Cache of MIME types that each DLNA renderer does NOT support.
     /// Key: device_id, Value: set of unsupported MIME types (e.g. "audio/flac").
     /// Only negative results are cached — if a MIME is not in the set, it's
@@ -1505,6 +1510,7 @@ pub struct ResolvedStream {
     pub format_source: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ResolvedQueueItem {
     pub url: String,
     pub mime_type: String,
@@ -1753,10 +1759,14 @@ impl PlaybackOrchestrator {
             event_bus: None,
             license: None,
             gapless_sessions: Mutex::new(HashMap::new()),
+            browser_next: Mutex::new(HashMap::new()),
             qualites_pre_armees: Mutex::new(HashMap::new()),
             prefetch: Arc::new(PrefetchEngine::new()),
             preparations_fichiers: Default::default(),
             dsd_capabilities: Mutex::new(HashMap::new()),
+            appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            ),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
             dlna_canaux_max: Mutex::new(HashMap::new()),
@@ -1960,6 +1970,7 @@ mod serveur_source_absent_4362;
 /// `resolve_direct`, pour que les deux ne puissent pas diverger.
 pub mod verdict_upnp;
 
+mod navigateur_suivante_5975;
 mod queue;
 pub use queue::{Enjambee, lignes_bannies_a_enjamber};
 

@@ -105,3 +105,15 @@ Not proven, needs a Windows host with a DSD-capable ASIO driver:
 
 Not proven: what real drivers answer to `ASIOCanSampleRate` in DSD mode, and
 whether the switch there and back sends `kAsioResetRequest`.
+
+## #7372 — distinguish an unavailable DSD probe from a negative capability
+
+`Device::try_dsd_output_rates()` preserves `None` for a busy device or a
+failed probe, including failure to restore PCM. Tune uses this variant so
+its capability cache does not turn a transient failure into a permanent
+empty rate list. An explicit format/rate refusal still returns `Some([])`.
+The historical vector-returning method remains available for compatibility.
+The driver-call sequence lives in `dsd::probe_dsd_rates`, exercised through
+the existing portable `tune-core/tests/asio_dsd_5643.rs` target. These tests
+use closures, never a device; Windows + ASIO compilation and hardware
+verification remain separate requirements.

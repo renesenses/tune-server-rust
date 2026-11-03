@@ -10,6 +10,7 @@ pub mod ecoutes_au_compte;
 pub mod ecoutes_communaute;
 pub mod library_reconcile;
 pub mod library_sync;
+pub mod logos_labels_partages;
 pub mod mesures_communautaires;
 pub mod metadata_proposals;
 pub mod notes_communautaires;

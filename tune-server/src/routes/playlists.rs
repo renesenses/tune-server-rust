@@ -458,16 +458,12 @@ async fn add_tracks(
             incomplets,
             "playlist_add_tracks_refused_incomplete_streaming"
         );
-        return (
+        return crate::message_api::refus(
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "Cette demande ne porte que des titres de service incomplets \
-                 ({incomplets}) : il leur faut une source (autre que « local »), \
-                 un identifiant chez le service et un titre pour entrer dans \
-                 une playlist."
-            ),
-        )
-            .into_response();
+            "playlist_incomplete_service_tracks",
+            "api.playlists.incompleteServiceTracks",
+            &[("count", incomplets.to_string())],
+        );
     }
 
     let lignes: Vec<EntryContent> = body
@@ -530,20 +526,22 @@ async fn remove_track(
         (Some(entry_id), _) => repo.remove_entry(id, entry_id),
         (None, Some(rang)) => repo.remove_track(id, rang),
         (None, None) => {
-            return (
+            return crate::message_api::refus(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "Il faut désigner la ligne à retirer : `entry_id` (préféré) ou `position` (rang).",
-            )
-                .into_response();
+                "playlist_entry_required",
+                "api.playlists.entryRequired",
+                &[],
+            );
         }
     };
     match retire {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (
+        Ok(false) => crate::message_api::refus(
             StatusCode::NOT_FOUND,
-            "Aucune ligne de cette playlist ne correspond : rien n'a été retiré.",
-        )
-            .into_response(),
+            "playlist_entry_not_found",
+            "api.playlists.noMatchingEntry",
+            &[],
+        ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -566,11 +564,12 @@ async fn remove_tracks_batch(
     // #6687 — tout ou rien : un rang hors bornes n'efface rien, et un lot
     // qui n'a rien effacé est un `404`, pas un succès.
     match repo.remove_tracks_at_positions(id, &body.positions) {
-        Ok(0) => (
+        Ok(0) => crate::message_api::refus(
             StatusCode::NOT_FOUND,
-            "Aucune ligne retirée : un rang au moins est hors de la playlist.",
-        )
-            .into_response(),
+            "playlist_position_out_of_range",
+            "api.playlists.positionOutOfRange",
+            &[],
+        ),
         Ok(removed) => Json(json!({"removed": removed})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -592,12 +591,12 @@ async fn reorder_tracks(
             // Une liste qui n'est pas une permutation exacte des rangs actuels
             // (liste périmée côté client) n'écrit RIEN : réécrire quand même
             // perdrait ou dupliquerait des lignes.
-            Ok(false) => (
+            Ok(false) => crate::message_api::refus(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "`positions` doit être une permutation exacte des rangs actuels \
-                 de la playlist (0..n-1) ; rien n'a été modifié.",
-            )
-                .into_response(),
+                "playlist_positions_not_permutation",
+                "api.playlists.positionsNotPermutation",
+                &[],
+            ),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
     }

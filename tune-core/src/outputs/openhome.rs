@@ -28,6 +28,11 @@ pub struct OpenHomeOutput {
     event_sub_ids: tokio::sync::Mutex<Vec<String>>,
     client: Client,
     current_oh_id: tokio::sync::Mutex<Option<u32>>,
+    /// #6753 — les entrées que `set_next_media` a rangées dans la liste du
+    /// renderer et qu'il n'a pas encore atteintes. Une pause ou un arrêt les
+    /// retire : sinon le renderer les enchaîne seul après les pistes qu'un
+    /// autre point de contrôle (Kazoo) a insérées dans la même liste.
+    pending_next_oh_ids: tokio::sync::Mutex<Vec<u32>>,
 }
 
 impl OpenHomeOutput {
@@ -64,6 +69,7 @@ impl OpenHomeOutput {
                 .build()
                 .unwrap_or_default(),
             current_oh_id: tokio::sync::Mutex::new(None),
+            pending_next_oh_ids: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -223,6 +229,52 @@ impl OpenHomeOutput {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn playlist_delete_id(&self, id: u32) -> Result<(), String> {
+        if let Some(url) = self.svc_url("playlist") {
+            self.soap_call(url, SVC_PLAYLIST, "DeleteId", &[("Value", &id.to_string())])
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// L'entrée que le renderer lit en ce moment (`Playlist Id`), `None`
+    /// sans service Playlist, sur échec ou pour `0` (aucune entrée).
+    async fn playlist_current_id(&self) -> Option<u32> {
+        let url = self.svc_url("playlist")?;
+        let resp = self.soap_call(url, SVC_PLAYLIST, "Id", &[]).await.ok()?;
+        extract_tag(&resp, "Value")
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|id| *id != 0)
+    }
+
+    /// #6753 — retire de la liste du renderer les suivantes armées par Tune
+    /// et pas encore atteintes. Sans cela, une file Tune en pause laisse sa
+    /// suivante dans la liste partagée : quand un autre point de contrôle y
+    /// insère ses pistes, le renderer enchaîne ensuite sur celle de Tune et
+    /// le testeur croit que Tune « reprend la zone ».
+    ///
+    /// L'entrée en cours n'est jamais retirée (le renderer a pu avancer sur
+    /// la suivante en gapless). Un échec est écrit au journal sans faire
+    /// échouer la pause ni l'arrêt.
+    async fn retirer_suivantes_armees(&self) {
+        let pending = std::mem::take(&mut *self.pending_next_oh_ids.lock().await);
+        if pending.is_empty() {
+            return;
+        }
+        let courante = self.playlist_current_id().await;
+        for id in pending {
+            if Some(id) == courante {
+                continue;
+            }
+            match self.playlist_delete_id(id).await {
+                Ok(()) => info!(device = %self.name, oh_id = id, "oh_next_retire_a_la_pause"),
+                Err(e) => {
+                    warn!(device = %self.name, oh_id = id, error = %e, "oh_next_retire_echec")
+                }
+            }
+        }
     }
 
     /// #6718 — ce que le renderer ANNONCE savoir lire, au format d'un Sink
@@ -475,6 +527,7 @@ impl OutputTarget for OpenHomeOutput {
         );
 
         self.playlist_delete_all().await?;
+        self.pending_next_oh_ids.lock().await.clear();
 
         let new_id = self.playlist_insert(0, media.url, &metadata).await?;
         if let Some(id) = new_id {
@@ -490,7 +543,9 @@ impl OutputTarget for OpenHomeOutput {
     }
 
     async fn pause(&self) -> Result<(), String> {
-        self.oh_pause().await
+        self.oh_pause().await?;
+        self.retirer_suivantes_armees().await;
+        Ok(())
     }
 
     async fn resume(&self) -> Result<(), String> {
@@ -500,6 +555,7 @@ impl OutputTarget for OpenHomeOutput {
     async fn stop(&self) -> Result<(), String> {
         self.unsubscribe_events().await;
         self.oh_stop().await?;
+        self.retirer_suivantes_armees().await;
         *self.current_oh_id.lock().await = None;
         info!(device = %self.name, "oh_stop");
         Ok(())
@@ -682,10 +738,14 @@ impl OutputTarget for OpenHomeOutput {
             && id != 0
         {
             *self.current_oh_id.lock().await = Some(id);
+            // Une suivante déjà atteinte est la piste en cours : elle n'est
+            // plus « en attente » (#6753).
+            self.pending_next_oh_ids.lock().await.retain(|p| *p != id);
         }
         let after_id = self.current_oh_id.lock().await.unwrap_or(0);
         let new_id = self.playlist_insert(after_id, media.url, &metadata).await?;
         if let Some(id) = new_id {
+            self.pending_next_oh_ids.lock().await.push(id);
             info!(device = %self.name, url = media.url, oh_id = id, "oh_set_next");
         }
         Ok(())

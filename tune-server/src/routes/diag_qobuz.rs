@@ -60,14 +60,21 @@ pub async fn cles_brutes(
     let album_id = p.album_id.as_deref().filter(|s| !s.is_empty());
     let track_id = p.track_id.as_deref().filter(|s| !s.is_empty());
     if album_id.is_none() && track_id.is_none() {
-        return erreur(StatusCode::BAD_REQUEST, "album_id ou track_id requis");
+        return crate::message_api::refus(
+            StatusCode::BAD_REQUEST,
+            "album_or_track_id_required",
+            "api.diagQobuz.albumOrTrackRequired",
+            &[],
+        );
     }
     if album_id.is_some_and(|id| !identifiant_valide(id))
         || track_id.is_some_and(|id| !identifiant_valide(id))
     {
-        return erreur(
+        return crate::message_api::refus(
             StatusCode::BAD_REQUEST,
-            "identifiant invalide (alphanumérique, 64 caractères au plus)",
+            "invalid_identifier",
+            "api.diagQobuz.invalidId",
+            &[],
         );
     }
 
