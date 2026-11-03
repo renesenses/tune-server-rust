@@ -1534,6 +1534,17 @@ fn assembler_les_etapes_lang(
             etape["code"] = json!("dsd_pcm_repli");
             etape["detail"] = json!(repli.raison());
         }
+        // #7265 — la zone demandait du DoP, la sortie WASAPI ne pouvait pas le
+        // porter : la piste part en PCM, et l'étape dit pourquoi au lieu de
+        // laisser croire à une conversion choisie.
+        if is_dsd
+            && !dop_sur_le_fil
+            && let Some(ecart) =
+                tune_core::audio::dop_ecarte_7265::ecart_de_la_zone(zone.id.unwrap_or(0))
+        {
+            etape["code"] = json!("dsd_dop_ecarte");
+            etape["detail"] = json!(ecart.raison());
+        }
         if flac_ffmpeg_vers_le_reseau {
             // Le POURQUOI, lisible et stable : sans lui, un FLAC → FLAC de
             // même résolution ressemble à une erreur d'affichage.
