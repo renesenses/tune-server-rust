@@ -9,6 +9,8 @@
 //! third-party ASIO driver.
 
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -496,6 +498,181 @@ unsafe fn format_du_mixeur(audio_client: *mut std::ffi::c_void) -> Option<String
     ))
 }
 
+/// #7265 — la cadence et les voies du mixeur partagé (`GetMixFormat`).
+///
+/// # Safety
+/// `audio_client` doit être un `IAudioClient` valide.
+#[cfg(target_os = "windows")]
+unsafe fn cadence_et_voies_du_mixeur(audio_client: *mut std::ffi::c_void) -> Option<(u32, u16)> {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    type GetMixFormatFn =
+        unsafe extern "system" fn(*mut c_void, *mut *mut ffi::WAVEFORMATEX) -> ffi::HRESULT;
+    let vtable = unsafe { *(audio_client as *const *const *const c_void) };
+    let get_mix_format: GetMixFormatFn = unsafe { std::mem::transmute(*vtable.add(8)) };
+    let mut format: *mut ffi::WAVEFORMATEX = ptr::null_mut();
+    let hr = unsafe { get_mix_format(audio_client, &mut format) };
+    if hr != ffi::S_OK || format.is_null() {
+        return None;
+    }
+    let entete: ffi::WAVEFORMATEX = unsafe { ptr::read_unaligned(format) };
+    unsafe { ffi::CoTaskMemFree(format as *mut c_void) };
+    Some((entete.nSamplesPerSec, entete.nChannels))
+}
+
+/// #7265 — la sortie WASAPI peut-elle porter un DoP à `cadence_dop` sur
+/// `voies` ? Posée par l'orchestrateur AVANT de choisir le DoP, pour qu'un
+/// refus devienne une conversion en PCM et non une zone arrêtée.
+///
+/// - `exclusif` : `IsFormatSupported(EXCLUSIVE)` sur les formats 24 bits
+///   valides de la négociation #3837 (le porteur DoP exige 24 bits : un repli
+///   16 bits l'effacerait). Endpoint occupé ⇒ [`AccueilDuDop::Inconnu`] ;
+/// - partagé : le format du mixeur de Windows, auquel la sortie s'ouvrira.
+///
+/// Sur un fil dédié, borné à deux secondes : la sonde exige un appartement
+/// COM STA, et le fil appelant peut être MTA. Ne joue aucun son,
+/// n'initialise aucun flux.
+#[cfg(target_os = "windows")]
+pub(crate) fn sonder_l_accueil_du_dop(
+    device_name: &str,
+    endpoint_id: Option<&str>,
+    cadence_dop: u32,
+    voies: u16,
+    exclusif: bool,
+) -> crate::audio::dop_ecarte_7265::AccueilDuDop {
+    use crate::audio::dop_ecarte_7265::AccueilDuDop;
+    let demande = endpoint_id.unwrap_or(device_name).to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let lance = std::thread::Builder::new()
+        .name("tune-sonde-dop-7265".into())
+        .spawn(move || {
+            let _ = tx.send(sonder_l_accueil_du_dop_sur_ce_fil(
+                &demande,
+                cadence_dop,
+                voies,
+                exclusif,
+            ));
+        });
+    if lance.is_err() {
+        return AccueilDuDop::Inconnu;
+    }
+    // Un pilote qui ne répond pas (le cas d'ASIO chez ce même testeur, #6452)
+    // ne doit pas retenir la lecture : au-delà de deux secondes, on ne sait
+    // pas, et le DoP est tenté comme avant.
+    rx.recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap_or(AccueilDuDop::Inconnu)
+}
+
+#[cfg(target_os = "windows")]
+fn sonder_l_accueil_du_dop_sur_ce_fil(
+    demande: &str,
+    cadence_dop: u32,
+    voies: u16,
+    exclusif: bool,
+) -> crate::audio::dop_ecarte_7265::AccueilDuDop {
+    use crate::audio::dop_ecarte_7265::AccueilDuDop;
+    use ffi::*;
+    use std::ffi::c_void;
+    use std::ptr;
+
+    /// `AUDCLNT_E_UNSUPPORTED_FORMAT` : la réponse prêtée aux formats de moins
+    /// de 24 bits valides, qu'on ne présente jamais au pilote.
+    const FORMAT_NON_SUPPORTE: i32 = 0x88890008u32 as i32;
+
+    let Ok(_com) = ComApartmentGuard::initialize_sta() else {
+        return AccueilDuDop::Inconnu;
+    };
+    let Ok(resolved) = resolve_wasapi_endpoint(demande) else {
+        return AccueilDuDop::Inconnu;
+    };
+    unsafe {
+        let mut enumerator: *mut c_void = ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_MMDEVICE_ENUMERATOR,
+            ptr::null_mut(),
+            CLSCTX_ALL,
+            &IID_IMMDEVICE_ENUMERATOR,
+            &mut enumerator,
+        );
+        if hr != S_OK {
+            return AccueilDuDop::Inconnu;
+        }
+        let mut device: *mut c_void = ptr::null_mut();
+        {
+            type GetDeviceFn =
+                unsafe extern "system" fn(*mut c_void, *const u16, *mut *mut c_void) -> HRESULT;
+            let vtable = *(enumerator as *const *const *const c_void);
+            let get_device: GetDeviceFn = std::mem::transmute(*vtable.add(5));
+            let endpoint_wide: Vec<u16> = resolved
+                .id
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let hr = get_device(enumerator, endpoint_wide.as_ptr(), &mut device);
+            release(enumerator);
+            if hr != S_OK {
+                return AccueilDuDop::Inconnu;
+            }
+        }
+        let audio_client = match activate_audio_client(device) {
+            Ok(client) => client,
+            Err(_) => {
+                release(device);
+                return AccueilDuDop::Inconnu;
+            }
+        };
+
+        let accueil = if exclusif {
+            let mut occupe = false;
+            let resultat =
+                negocier_format_et_masque(24, u32::from(voies), cadence_dop, |candidat, masque| {
+                    if candidat.bits_valides < 24 {
+                        return ResultatSonde::Refuse {
+                            hr: FORMAT_NON_SUPPORTE,
+                            propose: None,
+                        };
+                    }
+                    let reponse = sonder_format_exclusif(
+                        audio_client,
+                        candidat,
+                        u32::from(voies),
+                        cadence_dop,
+                        masque,
+                    );
+                    if let ResultatSonde::Refuse { hr, .. } = reponse {
+                        occupe |= message_peripherique_occupe(hr).is_some();
+                    }
+                    reponse
+                });
+            match resultat {
+                Ok(_) => AccueilDuDop::Accepte,
+                Err(_) if occupe => AccueilDuDop::Inconnu,
+                Err(detail) => AccueilDuDop::ExclusifRefuse { detail },
+            }
+        } else {
+            match cadence_et_voies_du_mixeur(audio_client) {
+                Some((cadence, voies_mixeur)) => AccueilDuDop::MixeurPartage {
+                    cadence,
+                    voies: voies_mixeur,
+                },
+                None => AccueilDuDop::Inconnu,
+            }
+        };
+        release(audio_client);
+        release(device);
+        info!(
+            device = %resolved.name,
+            cadence_dop,
+            voies,
+            exclusif,
+            accueil = ?accueil,
+            "wasapi_accueil_du_dop_sonde (#7265)"
+        );
+        accueil
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -508,6 +685,11 @@ pub struct WasapiExclusiveOutput {
     channels: u32,
     ring: Arc<NativePcmRing>,
     paused: Arc<AtomicBool>,
+    /// #7264 — le volume effectif de la zone, appliqué par le fil de rendu
+    /// aux mots tirés de l'anneau (`pop_pcm_bytes_au_gain`). `None` : rendu
+    /// à l'unité, identique au bit près à la sérialisation seule.
+    #[cfg(target_os = "windows")]
+    volume_au_rendu: Option<Arc<AtomicU32>>,
     #[cfg(target_os = "windows")]
     audio_client: *mut std::ffi::c_void,
     #[cfg(target_os = "windows")]
@@ -955,6 +1137,7 @@ impl WasapiExclusiveOutput {
                 channels,
                 ring,
                 paused,
+                volume_au_rendu: None,
                 audio_client,
                 render_client,
                 event_handle: event,
@@ -974,11 +1157,28 @@ impl WasapiExclusiveOutput {
         }
     }
 
+    /// #7264 — le volume que le fil de rendu applique, relu à chaque
+    /// période. À poser avant [`Self::start`].
+    #[cfg(target_os = "windows")]
+    pub(crate) fn regler_le_volume_au_rendu(&mut self, volume: Arc<AtomicU32>) {
+        self.volume_au_rendu = Some(volume);
+    }
+
     /// Start the render thread that feeds audio from the ring buffer
     /// to the WASAPI exclusive output.
     #[cfg(target_os = "windows")]
     pub fn start(&mut self) -> Result<(), String> {
         use ffi::*;
+
+        // #7264 — le gain du rendu, au repos à la consigne courante : ni
+        // fondu d'ouverture, ni mot pondéré à 100 %.
+        let mut gain = super::local::gain_au_rendu_7264::GainAuRendu::nouveau(
+            self.volume_au_rendu
+                .clone()
+                .unwrap_or_else(|| Arc::new(AtomicU32::new(1000))),
+            self.sample_rate,
+            self.channels,
+        );
 
         // Exclusive event-driven rendering uses two endpoint buffers. Prime
         // the first one completely before Start so the driver never begins on
@@ -1004,7 +1204,8 @@ impl WasapiExclusiveOutput {
             let written = if self.paused.load(Ordering::Relaxed) {
                 0
             } else {
-                self.ring.pop_pcm_bytes(out, self.bit_depth as u16)
+                self.ring
+                    .pop_pcm_bytes_au_gain(out, self.bit_depth as u16, &mut gain)
             };
             out[written..].fill(0);
 
@@ -1189,15 +1390,17 @@ impl WasapiExclusiveOutput {
                         continue;
                     }
 
-                    // Native words are already left-aligned and volume/DSP
-                    // have already been resolved by the producer. The
-                    // callback performs serialization only: no float, scale,
-                    // rounding or truncation can alter a bit-perfect word.
+                    // Native words are already left-aligned and DSP has been
+                    // resolved by the producer. #7264: the software volume is
+                    // applied HERE, after the 2 s ring, so a gesture is heard
+                    // on the next period (plus a 20 ms ramp). At unity, ramp
+                    // at rest, or inside a DoP passage, words are serialized
+                    // untouched: bit-perfect is preserved.
                     let out_slice = std::slice::from_raw_parts_mut(
                         buf,
                         (buffer_frame_count * frame_bytes) as usize,
                     );
-                    let written = ring.pop_pcm_bytes(out_slice, bit_depth);
+                    let written = ring.pop_pcm_bytes_au_gain(out_slice, bit_depth, &mut gain);
                     if written < out_slice.len() {
                         underruns.fetch_add(1, Ordering::Relaxed);
                     }

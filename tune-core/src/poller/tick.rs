@@ -292,6 +292,14 @@ impl PositionPoller {
             // the race where orchestrator.play() sets Playing between the
             // initial states read and the device poll response.
             let fresh_states = self.playback.all_states().await;
+            // #7418 — l'appareil qui avait mis la zone en pause rejoue notre
+            // flux (Play à la télécommande) : la zone reprend avec lui.
+            if self
+                .suivre_la_reprise_de_l_appareil(zone_id, &device_id, &status, &fresh_states)
+                .await
+            {
+                continue;
+            }
             let already_playing = fresh_states
                 .iter()
                 .any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
@@ -477,6 +485,8 @@ impl PositionPoller {
             }
 
             let zone_id = zone_state.zone_id;
+            // #7418 — la zone joue : une pause de l'appareil d'avant est close.
+            self.oublier_la_pause_de_l_appareil(zone_id);
             let device_id = match self.get_zone_device_id(zone_id) {
                 Some(id) => id,
                 // Pas de peripherique de sortie : une zone navigateur, par
@@ -2277,6 +2287,12 @@ impl PositionPoller {
                 ps.octets_du_demarrage = None;
             }
 
+            // #7418 — la série `Paused` ne se compte que d'affilée.
+            if status.state != TransportState::Paused {
+                ps.pause_appareil_ticks = 0;
+            }
+            let mut pause_de_l_appareil = false;
+
             match status.state {
                 TransportState::Stopped if !tune_is_playing || !tune_has_track => {
                     // Tune is not playing on this zone — ignore device Stopped.
@@ -4015,6 +4031,20 @@ impl PositionPoller {
                     ps.stopped_ticks = 0;
                     ps.transition(fsm::Transition::ArretEfface);
                     ps.playing_stall_ticks = 0;
+                    // #7418 — la zone joue, l'appareil est en pause : une
+                    // pause faite sur l'appareil (télécommande, autre entrée).
+                    // Laisser la zone `Playing` laissait la surveillance de
+                    // lecture relancer au premier `Stopped` qui suivait.
+                    ps.pause_appareil_ticks = ps.pause_appareil_ticks.saturating_add(1);
+                    pause_de_l_appareil = pause_de_l_appareil_7418::pause_de_l_appareil_etablie(
+                        all_zones
+                            .iter()
+                            .find(|z| z.id == Some(zone_id))
+                            .and_then(|z| z.output_type.as_deref())
+                            .unwrap_or(""),
+                        ps.pause_appareil_ticks,
+                        in_seek_grace,
+                    );
                 }
             }
 
@@ -4041,6 +4071,14 @@ impl PositionPoller {
                     ),
                 },
             );
+
+            // #7418 — la zone suit la pause de son appareil, comme #6790.
+            if pause_de_l_appareil {
+                poll_states.remove(&zone_id);
+                self.suivre_la_pause_de_l_appareil(zone_id, &device_id)
+                    .await;
+                continue;
+            }
 
             let output_type = all_zones
                 .iter()
@@ -4300,6 +4338,15 @@ impl PositionPoller {
                         .unwrap_or(""),
                     "track_end_gap"
                 );
+                // #6910 — la fin de piste arrive ici alors qu'une suivante
+                // était armée (ou que son avance s'est bloquée) : le renderer
+                // n'y est pas passé de lui-même. Si c'était un suivant DSD sur
+                // DLNA, il retrouve la garde de #402.
+                if etat.is_some_and(|p| p.gapless_sent)
+                    || motif_fin_de_piste == decisions::motif_fin::AVANCE_GAPLESS_BLOQUEE
+                {
+                    self.constater_le_suivant_non_suivi(zone_id);
+                }
                 poll_states.remove(&zone_id);
                 self.handle_track_end(zone_id, zone_state).await;
             }

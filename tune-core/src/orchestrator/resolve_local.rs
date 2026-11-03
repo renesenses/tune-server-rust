@@ -473,6 +473,57 @@ impl PlaybackOrchestrator {
         (mode, annonce)
     }
 
+    /// #6910 — le renderer DLNA `device_id` tient-il un suivant en DSD brut ?
+    /// Voir [`crate::playback::gapless::dsd_suivant_tenu_sur_dlna`].
+    ///
+    /// Lit le cache de [`Self::sonder_dsd`] SANS resonder le réseau : appelée
+    /// depuis le sondeur et depuis la file, elle ne doit jamais attendre un
+    /// renderer. Un cache vide vaut « je ne sais pas », donc la garde.
+    pub async fn dsd_suivant_tenu_sur_dlna(
+        &self,
+        device_id: &str,
+        annonce_suivante: crate::outputs::traits::AnnonceSuivante,
+    ) -> bool {
+        let annonce_dsd = self
+            .dsd_capabilities
+            .lock()
+            .await
+            .get(device_id)
+            .map(|cap| cap.supports_dsf || cap.supports_dff);
+        let deja_lache = self
+            .appareils_qui_lachent_le_dsd_suivant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(device_id);
+        crate::playback::gapless::dsd_suivant_tenu_sur_dlna(
+            annonce_dsd,
+            annonce_suivante,
+            deja_lache,
+        )
+    }
+
+    /// #6910 — `device_id` a lâché un suivant DSD armé : la garde de #402 lui
+    /// est rendue jusqu'au redémarrage. Vrai à la première fois seulement.
+    pub fn retenir_dsd_suivant_lache(&self, device_id: &str) -> bool {
+        self.appareils_qui_lachent_le_dsd_suivant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(device_id.to_string())
+    }
+
+    /// Banc : ce que le `GetProtocolInfo` du renderer aurait dit du DSD.
+    #[cfg(test)]
+    pub(crate) async fn retenir_annonce_dsd_pour_banc(
+        &self,
+        device_id: &str,
+        cap: crate::outputs::dlna::DsdCapability,
+    ) {
+        self.dsd_capabilities
+            .lock()
+            .await
+            .insert(device_id.to_string(), cap);
+    }
+
     /// Ce que la zone veut faire d'une piste DSD sur une sortie RÉSEAU —
     /// UNE décision, lue par les deux chemins qui servent un renderer.
     ///
@@ -1081,6 +1132,42 @@ impl PlaybackOrchestrator {
                         .await;
                 }
                 Err(motif) => motif_natif = Some(motif),
+            }
+        }
+
+        // #7265 — avant de promettre un DoP à une sortie locale, lui demander
+        // si elle peut le porter. WASAPI partagé : le mixeur de Windows est-il
+        // à la cadence du DoP ? WASAPI exclusif : le pilote prend-il 24 bits à
+        // cette cadence ? Un « non » faisait refuser la piste plus loin (fil
+        // de lecture ou ouverture exclusive) ; il devient une conversion en
+        // PCM, dite au journal et au chemin du signal. Un « je ne sais pas »
+        // (autre plateforme, ASIO, pilote occupé) ne change rien.
+        if source_format == Some(AudioFormat::Dsd) && is_local_output {
+            crate::audio::dop_ecarte_7265::oublier(req.zone_id);
+            if transport != TransportDsd::Pcm
+                && let Some((cadence, canaux)) = sonder_l_entete_dsd(file_path)
+            {
+                let cadence_dop = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(cadence);
+                let voies = u16::try_from(canaux).unwrap_or(u16::MAX);
+                let accueil = self
+                    .accueil_du_dop_local(req.output_device_id.as_deref(), cadence_dop, voies)
+                    .await;
+                if let Some(ecart) =
+                    crate::audio::dop_ecarte_7265::decider(&accueil, cadence_dop, voies)
+                {
+                    warn!(
+                        zone_id = req.zone_id,
+                        dsd_mode = %dsd_mode,
+                        cadence_dop,
+                        voies,
+                        motif = ecart.code(),
+                        accueil = ?accueil,
+                        raison = %ecart.raison(),
+                        "dsd_dop_ecarte_converti_en_pcm"
+                    );
+                    crate::audio::dop_ecarte_7265::enregistrer(req.zone_id, ecart);
+                    transport = TransportDsd::Pcm;
+                }
             }
         }
         let dop_requested = transport != TransportDsd::Pcm;
@@ -1749,6 +1836,46 @@ impl PlaybackOrchestrator {
             browser_needs_wav,
             dsp_progressif_wav,
             flux_wav_reseau,
+        }
+    }
+
+    /// #7265 — ce que la sortie locale `device_id` répond sur un porteur DoP
+    /// à `cadence_dop` (WASAPI partagé ou exclusif). La sonde est bloquante
+    /// (COM) : elle part sur un fil de `spawn_blocking`. `Inconnu` partout
+    /// ailleurs, et alors rien ne change.
+    async fn accueil_du_dop_local(
+        &self,
+        device_id: Option<&str>,
+        cadence_dop: u32,
+        voies: u16,
+    ) -> crate::audio::dop_ecarte_7265::AccueilDuDop {
+        use crate::audio::dop_ecarte_7265::AccueilDuDop;
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = device_id else {
+                return AccueilDuDop::Inconnu;
+            };
+            let Some(sortie) = ({ self.outputs.lock().await.get(device_id) }) else {
+                return AccueilDuDop::Inconnu;
+            };
+            let sonde = {
+                let sortie = sortie.lock().await;
+                sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                    .and_then(crate::outputs::local::LocalOutput::sonde_du_dop)
+            };
+            let Some(sonde) = sonde else {
+                return AccueilDuDop::Inconnu;
+            };
+            tokio::task::spawn_blocking(move || sonde.sonder(cadence_dop, voies))
+                .await
+                .unwrap_or(AccueilDuDop::Inconnu)
+        }
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = (device_id, cadence_dop, voies);
+            AccueilDuDop::Inconnu
         }
     }
 

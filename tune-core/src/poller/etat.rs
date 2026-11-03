@@ -142,6 +142,10 @@ pub(super) struct ZonePollState {
     /// que le flux servi était manifestement incomplet (voir
     /// STALL_DECLINE_MAX_TICKS). Remis à zéro à chaque changement de piste.
     pub(super) stall_declines: u8,
+    /// #7418 — tours consécutifs où l'appareil s'est dit `Paused` alors que la
+    /// zone joue : une pause faite sur l'appareil (télécommande WiiM, autre
+    /// entrée). Voir `pause_de_l_appareil_7418`.
+    pub(super) pause_appareil_ticks: u8,
     pub(super) radio_stopped_ticks: u8,
     /// Last position (ms) the renderer reported on the previous radio poll.
     /// An advancing position means the renderer is actually streaming even
@@ -308,6 +312,7 @@ impl ZonePollState {
             depassement_duree_ticks: 0,
             depassement_duree_signale: false,
             stall_declines: 0,
+            pause_appareil_ticks: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
