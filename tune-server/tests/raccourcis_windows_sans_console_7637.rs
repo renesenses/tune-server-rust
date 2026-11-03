@@ -10,7 +10,9 @@ use std::fs;
 use std::path::Path;
 
 fn workflow() -> String {
-    let racine = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("racine");
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("racine");
     fs::read_to_string(racine.join(".github/workflows/release.yml")).expect("release.yml")
 }
 
@@ -34,10 +36,7 @@ fn contenu_bat(yml: &str, nom: &str) -> String {
 #[test]
 fn bureau_et_entree_principale_lancent_sans_console() {
     let yml = workflow();
-    for lnk in [
-        "Tune Server\\Tune Server.lnk",
-        "$DESKTOP\\Tune Server.lnk",
-    ] {
+    for lnk in ["Tune Server\\Tune Server.lnk", "$DESKTOP\\Tune Server.lnk"] {
         let l = raccourci(&yml, lnk).unwrap_or_else(|| panic!("raccourci {lnk} absent"));
         assert!(
             l.contains("start-tune-server-sans-console.bat"),
@@ -69,7 +68,10 @@ fn contre_epreuve_les_deux_lanceurs_different_par_le_drapeau() {
 fn le_journal_reste_ouvrable_et_l_ancien_raccourci_est_retire() {
     let yml = workflow();
     let j = raccourci(&yml, "Journal de Tune Server.lnk").expect("raccourci du journal");
-    assert!(j.contains("notepad.exe") && j.contains("tune-server.log"), "{j}");
+    assert!(
+        j.contains("notepad.exe") && j.contains("tune-server.log"),
+        "{j}"
+    );
     assert!(
         yml.contains("Delete \"`$SMPROGRAMS\\Tune Server\\Tune Server (sans console).lnk\""),
         "l'ancien raccourci doit être supprimé à la mise à jour"
