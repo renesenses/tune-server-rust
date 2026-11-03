@@ -116,6 +116,55 @@ async fn messagerie_6902_relaie_les_sept_gestes_et_le_curseur_sans_cache() {
 }
 
 #[tokio::test]
+async fn messagerie_rc11_relaie_les_trois_routes_du_cercle_sans_cache() {
+    let (url, e) = demarrer().await;
+    let a = app(base(&url, Some(JETON)));
+    for (methode, chemin, corps) in [
+        ("POST", "/circles/5/conversation", None),
+        (
+            "POST",
+            "/circles/5/conversation/messages",
+            Some(json!({"body":"Bonsoir le cercle"})),
+        ),
+        (
+            "PUT",
+            "/circles/5/messaging",
+            Some(json!({"write":"owner"})),
+        ),
+    ] {
+        let r = appel(&a, methode, chemin, corps.clone()).await;
+        assert_eq!(
+            r.statut,
+            StatusCode::OK,
+            "route manquante : {methode} {chemin}"
+        );
+        assert_eq!(r.entetes[header::CACHE_CONTROL], "no-store");
+        assert_eq!(r.octets, b"{ \"conversations\" : [] }");
+        let c = e.lock().unwrap();
+        let (m, u, b, auth) = c.appels.last().unwrap();
+        assert_eq!(m.as_str(), methode);
+        assert_eq!(u, &format!("/api/v1/circle{chemin}"));
+        assert_eq!(b, &corps.unwrap_or(Value::Null));
+        assert_eq!(auth, &format!("Bearer {JETON}"));
+    }
+    // Contre-épreuve : un identifiant non numérique ne part jamais au site.
+    let avant = e.lock().unwrap().appels.len();
+    for (methode, chemin, corps) in [
+        ("POST", "/circles/abc/conversation", None),
+        (
+            "POST",
+            "/circles/1x/conversation/messages",
+            Some(json!({"body":"x"})),
+        ),
+        ("PUT", "/circles/-1/messaging", Some(json!({"write":"all"}))),
+    ] {
+        let r = appel(&a, methode, chemin, corps).await;
+        assert_eq!(r.statut, StatusCode::NOT_FOUND, "{methode} {chemin}");
+    }
+    assert_eq!(e.lock().unwrap().appels.len(), avant);
+}
+
+#[tokio::test]
 async fn messagerie_6902_relaie_les_refus_et_le_204_du_site() {
     let (url, e) = demarrer().await;
     let db = base(&url, Some(JETON));
