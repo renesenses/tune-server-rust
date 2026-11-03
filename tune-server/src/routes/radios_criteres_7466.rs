@@ -18,6 +18,10 @@
 //! de 48 kHz — la profondeur en bits n'est publiée nulle part), `favorites_only`,
 //! `rated_min` (la note moyenne radio-metadata.fr, `avg_rating`) et
 //! `metadata_plus` (la fiche a une clé radio-metadata.fr : le badge Metadata+).
+//! #7718 — `quality_min`, un niveau de qualité de flux sans distinction de
+//! format (voir [`NiveauQualite`]) : la station passe si l'UN de ses flux est
+//! au moins de ce niveau. Un flux sans perte passe tout niveau avec perte,
+//! même sans débit publié, comme dans le rangement des flux du client web.
 //! `language` n'est PAS proposé : ni l'annuaire ni le catalogue livré ne
 //! portent cette donnée, et un filtre sans donnée écarterait tout.
 
@@ -36,6 +40,52 @@ pub const SUGGESTIONS_MAX: usize = 200;
 
 /// Au-delà, c'est de la haute résolution.
 const FREQUENCE_HIRES: i32 = 48_000;
+
+/// La fréquence d'un CD, celle que suppose un flux sans perte muet.
+const FREQUENCE_CD: i32 = 44_100;
+
+/// #7718 — le niveau de qualité minimal demandé par `quality_min`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NiveauQualite {
+    /// Un flux avec perte d'au moins ce débit (kbit/s), ou un flux sans perte.
+    Debit(i32),
+    /// Un flux sans perte d'au moins cette fréquence (Hz). La profondeur en
+    /// bits n'est publiée nulle part : « 24/96 » se juge sur les 96 kHz.
+    SansPerte(i32),
+}
+
+impl NiveauQualite {
+    /// `48`…`320` (kbit/s), `flac_16_44`, `flac_24_48`, `flac_24_96`,
+    /// `flac_24_192`. Vide, `unknown` ou illisible : aucun filtre.
+    pub fn depuis(texte: &str) -> Option<Self> {
+        let t = texte.trim().to_ascii_lowercase();
+        match t.as_str() {
+            "flac_16_44" => Some(Self::SansPerte(FREQUENCE_CD)),
+            "flac_24_48" => Some(Self::SansPerte(48_000)),
+            "flac_24_96" => Some(Self::SansPerte(96_000)),
+            "flac_24_192" => Some(Self::SansPerte(192_000)),
+            _ => t.parse::<i32>().ok().filter(|d| *d > 0).map(Self::Debit),
+        }
+    }
+
+    /// Le flux est-il au moins de ce niveau ?
+    fn atteint(self, flux: &FluxProfil) -> bool {
+        match self {
+            Self::Debit(min) => flux.sans_perte || flux.debit.is_some_and(|d| d >= min),
+            Self::SansPerte(min) => {
+                flux.sans_perte && flux.frequence.unwrap_or(FREQUENCE_CD) >= min
+            }
+        }
+    }
+}
+
+/// Ce qu'on sait d'un flux pour juger sa qualité.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct FluxProfil {
+    sans_perte: bool,
+    debit: Option<i32>,
+    frequence: Option<i32>,
+}
 
 /// Un nombre JSON, écrit en nombre ou en texte (`4.7` ou `"4.7"`).
 pub fn nombre(v: &Value) -> Option<f64> {
@@ -114,7 +164,8 @@ struct Profil<'a> {
     genres_en_clair: bool,
     pays: Option<String>,
     codecs: Vec<String>,
-    debit_max: Option<i32>,
+    /// #7718 — chaque flux, jugé un par un.
+    flux: Vec<FluxProfil>,
     frequence_max: Option<i32>,
     note_centiemes: Option<i32>,
     favori: bool,
@@ -128,6 +179,8 @@ pub struct Criteres {
     pub pays: Option<String>,
     pub codec: Option<String>,
     pub debit_min: Option<i32>,
+    /// #7718 — `quality_min`.
+    pub qualite_min: Option<NiveauQualite>,
     pub sans_perte: bool,
     pub hires: bool,
     pub favoris: bool,
@@ -167,12 +220,20 @@ impl Criteres {
             pays: texte(country).map(|p| code_iso(p).unwrap_or_else(|| p.to_ascii_uppercase())),
             codec: texte(codec).map(famille_codec),
             debit_min: bitrate_min.filter(|b| *b > 0),
+            qualite_min: None,
             sans_perte: lossless == Some(true),
             hires: hires == Some(true),
             favoris: favorites_only == Some(true),
             note_min: rated_min.filter(|n| n.is_finite() && *n > 0.0),
             metadata_plus: metadata_plus == Some(true),
         }
+    }
+
+    /// #7718 — le niveau `quality_min`, à part pour ne pas allonger
+    /// [`Self::depuis`].
+    pub fn avec_qualite_min(mut self, quality_min: Option<&str>) -> Self {
+        self.qualite_min = quality_min.and_then(NiveauQualite::depuis);
+        self
     }
 
     /// Aucun critère : la requête est celle d'avant #7466.
@@ -208,7 +269,10 @@ impl Criteres {
             .is_none_or(|c| p.codecs.iter().any(|x| x == c))
             && self
                 .debit_min
-                .is_none_or(|min| p.debit_max.is_some_and(|d| d >= min))
+                .is_none_or(|min| p.flux.iter().any(|x| NiveauQualite::Debit(min).atteint(x)))
+            && self
+                .qualite_min
+                .is_none_or(|n| p.flux.iter().any(|x| n.atteint(x)))
             && (!self.sans_perte || p.codecs.iter().any(|c| est_sans_perte(c)))
             && (!self.hires || p.frequence_max.is_some_and(|f| f > FREQUENCE_HIRES))
             && (!self.favoris || p.favori)
@@ -278,22 +342,32 @@ fn profil_de_fiche(f: &StationAnnuaire, favori: Option<bool>) -> Profil<'_> {
         }
     }
     // Une fiche v1 sans flux détaillé ne dit son format que par `quality`.
-    if f.quality
+    let qualite_flac = f
+        .quality
         .as_deref()
-        .is_some_and(|q| q.eq_ignore_ascii_case("flac"))
-    {
+        .is_some_and(|q| q.eq_ignore_ascii_case("flac"));
+    if qualite_flac {
         ajouter("flac");
     }
+    // Le flux principal tel que la fiche le décrit, puis le détail des flux.
+    let principal = FluxProfil {
+        sans_perte: qualite_flac || f.codec.as_deref().is_some_and(est_sans_perte),
+        debit: f.bitrate,
+        frequence: None,
+    };
+    let flux = std::iter::once(principal)
+        .chain(f.flux.iter().map(|x| FluxProfil {
+            sans_perte: x.codec.as_deref().is_some_and(est_sans_perte),
+            debit: x.bitrate,
+            frequence: x.sample_rate,
+        }))
+        .collect();
     Profil {
         genres: f.genres_ou_genre(),
         genres_en_clair: false,
         pays: f.country.clone(),
         codecs,
-        debit_max: f
-            .bitrate
-            .into_iter()
-            .chain(f.flux.iter().filter_map(|x| x.bitrate))
-            .max(),
+        flux,
         frequence_max: f.flux.iter().filter_map(|x| x.sample_rate).max(),
         note_centiemes: f.note_centiemes,
         favori: favori == Some(true),
@@ -320,16 +394,26 @@ fn profil_de_station<'a>(st: &'a RadioStation, fiche: Option<&'a StationAnnuaire
         .map(str::to_string)
         .or_else(|| flux.and_then(|x| x.codec.clone()))
         .or_else(|| principale.and_then(|f| f.codec.clone()));
+    let ecoute = FluxProfil {
+        sans_perte: codec.as_deref().is_some_and(est_sans_perte)
+            || principale.is_some_and(|f| {
+                f.quality
+                    .as_deref()
+                    .is_some_and(|q| q.eq_ignore_ascii_case("flac"))
+            }),
+        debit: st
+            .bitrate
+            .filter(|b| *b > 0)
+            .or_else(|| flux.and_then(|x| x.bitrate))
+            .or_else(|| principale.and_then(|f| f.bitrate)),
+        frequence: flux.and_then(|x| x.sample_rate),
+    };
     Profil {
         genres: st.genre.as_deref().into_iter().collect(),
         genres_en_clair: true,
         pays: st.country.clone(),
         codecs: codec.map(|c| famille_codec(&c)).into_iter().collect(),
-        debit_max: st
-            .bitrate
-            .filter(|b| *b > 0)
-            .or_else(|| flux.and_then(|x| x.bitrate))
-            .or_else(|| principale.and_then(|f| f.bitrate)),
+        flux: vec![ecoute],
         frequence_max: flux.and_then(|x| x.sample_rate),
         note_centiemes: fiche.and_then(|f| f.note_centiemes),
         favori: st.is_favorite,

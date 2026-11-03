@@ -797,6 +797,8 @@ pub fn router() -> Router<AppState> {
             "/dr/gravure",
             get(graver_dr::statut).post(graver_dr::lancer),
         )
+        // #7719 — arrêter la gravure en cours, entre deux fichiers.
+        .route("/dr/gravure/cancel", post(graver_dr::annuler))
         // 25/09/2026 — le compositeur des CRÉDITS descend dans la colonne ET
         // dans la balise du fichier. La balise est indispensable : `update_batch`
         // reconstruit `tracks.composer` à partir du fichier seul dès qu'un scan
