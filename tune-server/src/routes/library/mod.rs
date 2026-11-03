@@ -386,6 +386,7 @@ pub fn router() -> Router<AppState> {
         .route("/albums/grouped", get(albums::albums_grouped))
         // #7617 — les œuvres : segments statiques AVANT `/albums/{id}`.
         .route("/albums/works", get(oeuvres::lister_oeuvres))
+        .route("/albums/works/members", get(oeuvres::membres_des_oeuvres))
         .route(
             "/albums/works/settings",
             get(oeuvres::lire_reglage).put(oeuvres::ecrire_reglage),

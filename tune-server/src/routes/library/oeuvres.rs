@@ -6,6 +6,7 @@
 //! | méthode | chemin | rôle |
 //! |---|---|---|
 //! | `GET` | `/library/albums/works` | la bibliothèque en œuvres, paginée (`limit`, `offset`) |
+//! | `GET` | `/library/albums/works/members` | les œuvres de plusieurs versions, compactes (`work_id`, `preferred_id`, `ids`) : pour la grille |
 //! | `GET` | `/library/albums/{id}/versions` | l'œuvre de l'album `id`, avec toutes ses versions |
 //! | `GET` | `/library/albums/works/settings` | le réglage : `{"enabled": bool}` |
 //! | `PUT` | `/library/albums/works/settings` | l'activer ou le désactiver (`{"enabled": false}`) |
@@ -503,6 +504,35 @@ pub(crate) async fn lister_oeuvres(
         "offset": debut,
         "items": items,
     })))
+}
+
+/// `GET /library/albums/works/members` — les seules œuvres de PLUSIEURS
+/// versions, sous forme compacte : ce qu'il faut à une grille qui a déjà ses
+/// albums pour n'en montrer qu'un par œuvre.
+pub(crate) async fn membres_des_oeuvres(State(state): State<AppState>) -> Json<Value> {
+    let actif = regroupement_actif(&state);
+    if !actif {
+        return Json(json!({ "enabled": false, "works": [] }));
+    }
+    let albums = albums_visibles(&state);
+    let versions = versions_des_albums(&state);
+    let candidats: Vec<Candidat> = albums
+        .iter()
+        .filter_map(|a| candidat(a, &versions))
+        .collect();
+    let oeuvres = regrouper(&candidats, true, &distinctes(&state), &preferees(&state));
+    let works: Vec<Value> = oeuvres
+        .iter()
+        .filter(|o| o.versions.len() > 1)
+        .map(|o| {
+            json!({
+                "work_id": o.work_id,
+                "preferred_id": o.preferee,
+                "ids": o.versions.iter().map(|v| v.id).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Json(json!({ "enabled": true, "works": works }))
 }
 
 /// `GET /library/albums/{id}/versions` — l'œuvre d'un album.

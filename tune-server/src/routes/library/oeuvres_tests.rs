@@ -545,3 +545,38 @@ async fn la_liste_des_albums_reste_inchangee() {
         "GET /library/albums garde un album par ligne : {corps}"
     );
 }
+
+#[tokio::test]
+async fn route_members_rend_les_seules_oeuvres_de_plusieurs_versions() {
+    let b = banc();
+    let (statut, corps) = appeler(
+        &b.state,
+        "GET",
+        "/api/v1/library/albums/works/members",
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    let works = corps["works"].as_array().unwrap();
+    assert_eq!(works.len(), 2, "{corps}");
+    let abbey = works
+        .iter()
+        .find(|w| w["ids"].as_array().unwrap().contains(&json!(b.abbey)))
+        .unwrap();
+    assert_eq!(abbey["preferred_id"], json!(b.abbey_remaster));
+    appeler(
+        &b.state,
+        "PUT",
+        "/api/v1/library/albums/works/settings",
+        Some(json!({"enabled": false})),
+    )
+    .await;
+    let (_, corps) = appeler(
+        &b.state,
+        "GET",
+        "/api/v1/library/albums/works/members",
+        None,
+    )
+    .await;
+    assert_eq!(corps, json!({"enabled": false, "works": []}));
+}
