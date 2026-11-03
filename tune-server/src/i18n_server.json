@@ -4334,6 +4334,23 @@
     "pl": "Klucz zapisany. Premium włączy się po weryfikacji online (sprawdź połączenie i klucz).",
     "el": "Το κλειδί αποθηκεύτηκε. Το Premium θα ενεργοποιηθεί μόλις επικυρωθεί online (ελέγξτε τη σύνδεση και το κλειδί)."
   },
+  "api.license.removed_offline": {
+    "fr": "Licence retirée de ce serveur, mais mozaiklabs.fr n'a pas pu être prévenu : l'activation sur un autre serveur peut être refusée pour un temps.",
+    "en": "License removed from this server, but mozaiklabs.fr could not be notified: activating it on another server may be refused for a while.",
+    "de": "Lizenz von diesem Server entfernt, aber mozaiklabs.fr konnte nicht benachrichtigt werden: die Aktivierung auf einem anderen Server kann eine Zeit lang abgelehnt werden.",
+    "es": "Licencia retirada de este servidor, pero no se pudo avisar a mozaiklabs.fr: la activación en otro servidor puede rechazarse durante un tiempo.",
+    "it": "Licenza rimossa da questo server, ma non è stato possibile avvisare mozaiklabs.fr: l'attivazione su un altro server potrebbe essere rifiutata per un po'.",
+    "zh": "已从此服务器移除许可证，但无法通知 mozaiklabs.fr：在另一台服务器上激活可能会暂时被拒绝。",
+    "ja": "このサーバーからライセンスを削除しましたが、mozaiklabs.fr に通知できませんでした。別のサーバーでの有効化はしばらく拒否される場合があります。",
+    "ko": "이 서버에서 라이선스를 제거했지만 mozaiklabs.fr에 알리지 못했습니다. 다른 서버에서의 활성화가 한동안 거부될 수 있습니다.",
+    "ro": "Licența a fost eliminată de pe acest server, dar mozaiklabs.fr nu a putut fi anunțat: activarea pe alt server poate fi refuzată o vreme.",
+    "sv": "Licensen togs bort från den här servern, men mozaiklabs.fr kunde inte meddelas: aktivering på en annan server kan nekas en stund.",
+    "hu": "A licenc eltávolítva erről a szerverről, de a mozaiklabs.fr értesítése nem sikerült: egy másik szerveren az aktiválás egy ideig elutasításra kerülhet.",
+    "vi": "Đã gỡ giấy phép khỏi máy chủ này nhưng không thể thông báo cho mozaiklabs.fr: việc kích hoạt trên máy chủ khác có thể bị từ chối trong một thời gian.",
+    "nb": "Lisensen er fjernet fra denne serveren, men mozaiklabs.fr kunne ikke varsles: aktivering på en annen server kan bli avvist en stund.",
+    "pl": "Licencję usunięto z tego serwera, ale nie udało się powiadomić mozaiklabs.fr: aktywacja na innym serwerze może być przez pewien czas odrzucana.",
+    "el": "Η άδεια αφαιρέθηκε από αυτόν τον διακομιστή, αλλά δεν ήταν δυνατή η ειδοποίηση του mozaiklabs.fr: η ενεργοποίηση σε άλλον διακομιστή μπορεί να απορρίπτεται για λίγο."
+  },
   "api.network.shareUnknown": {
     "fr": "Ce partage n'est plus enregistré.",
     "en": "This share is no longer registered.",
