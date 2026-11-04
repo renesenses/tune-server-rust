@@ -1117,6 +1117,100 @@ pub fn est_une_image_de_pochette(chemin: &Path) -> bool {
         .is_some_and(|n| crate::library::artwork::rang_de_pochette(n).is_some())
 }
 
+/// #6077 — pochette de DERNIER recours d'un album resté sans pochette : la
+/// plus grande image de ses dossiers
+/// ([`super::artwork::plus_grande_image_des_dossiers`]).
+///
+/// À n'appeler qu'APRÈS les autres sources : la jaquette intégrée et l'image
+/// de dossier reconnue (lues par le scan), puis la recherche en ligne quand
+/// elle a lieu (`batch_enrich_artwork_scoped`). Un album qui a déjà une
+/// pochette, de quelque source que ce soit, n'est jamais touché.
+///
+/// La pochette est posée comme une image de dossier ([`SourcePochette::Dossier`]),
+/// avec son fichier et son empreinte : elle suit le disque comme les autres
+/// (#5034), et disparaît avec son fichier.
+///
+/// Rend vrai si une pochette a été posée.
+pub fn poser_pochette_de_dernier_recours(
+    db: &std::sync::Arc<dyn DbBackend>,
+    album_id: i64,
+    cache_dir: &Path,
+) -> bool {
+    let repo = AlbumRepo::with_backend(db.clone());
+    let deja_illustre = repo
+        .etat_pochette(album_id)
+        .ok()
+        .flatten()
+        .is_none_or(|e| e.cover_path.as_deref().is_some_and(|c| !c.is_empty()));
+    if deja_illustre {
+        return false;
+    }
+    let pistes = pistes_de_l_album(db, album_id);
+    let mut dossiers: Vec<&Path> = Vec::new();
+    for p in &pistes {
+        if crate::audio::iso9660::est_chemin_virtuel(&p.to_string_lossy()) {
+            continue;
+        }
+        if let Some(d) = p.parent()
+            && !dossiers.contains(&d)
+        {
+            dossiers.push(d);
+        }
+    }
+    let Some(image) = super::artwork::plus_grande_image_des_dossiers(&dossiers) else {
+        return false;
+    };
+    let Ok(octets) = super::artwork::lire_l_image(&image) else {
+        return false;
+    };
+    let condensat = content_hash(&octets);
+    if find_cached(cache_dir, &condensat).is_none() {
+        let ext = image.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
+        std::fs::create_dir_all(cache_dir).ok();
+        if save_to_cache(&octets, cache_dir, &condensat, ext).is_none() {
+            warn!(album_id, image = %image.display(), "pochette_dernier_recours_cache_echoue");
+            return false;
+        }
+    }
+    let fichier = image.to_string_lossy().into_owned();
+    match repo.poser_pochette_du_disque(
+        album_id,
+        &condensat,
+        SourcePochette::Dossier,
+        &fichier,
+        empreinte_du_fichier(&image).as_deref(),
+    ) {
+        Ok(()) => {
+            info!(album_id, image = %fichier, "pochette_dernier_recours_posee (#6077)");
+            true
+        }
+        Err(e) => {
+            warn!(album_id, error = %e, "pochette_dernier_recours_echouee");
+            false
+        }
+    }
+}
+
+/// #6077 — [`poser_pochette_de_dernier_recours`] pour tous les albums locaux
+/// encore sans pochette. Rend le nombre de pochettes posées.
+pub fn pochettes_de_dernier_recours(db: &std::sync::Arc<dyn DbBackend>, cache_dir: &Path) -> usize {
+    let albums = match AlbumRepo::with_backend(db.clone()).list_without_cover() {
+        Ok(a) => a,
+        Err(e) => {
+            warn!(error = %e, "pochettes_dernier_recours_liste_illisible");
+            return 0;
+        }
+    };
+    let posees = albums
+        .iter()
+        .filter(|(id, ..)| poser_pochette_de_dernier_recours(db, *id, cache_dir))
+        .count();
+    if posees > 0 {
+        info!(posees, "pochettes_dernier_recours_posees (#6077)");
+    }
+    posees
+}
+
 #[cfg(test)]
 #[path = "pochette_disque_tests_5034.rs"]
 mod tests;
@@ -1128,3 +1222,7 @@ mod tests_5682;
 #[cfg(test)]
 #[path = "pochette_disque_tests_5685.rs"]
 mod tests_5685;
+
+#[cfg(test)]
+#[path = "pochette_dernier_recours_tests_6077.rs"]
+mod tests_dernier_recours_6077;

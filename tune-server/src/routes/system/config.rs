@@ -4549,8 +4549,11 @@ pub(super) async fn set_license(
 }
 
 pub(super) async fn delete_license(State(state): State<AppState>) -> Json<Value> {
-    state.license.clear_license().await;
-    Json(json!({ "status": "ok", "tier": "free" }))
+    let remote_released = crate::routes::cloud::retirer_la_licence(&state).await;
+    Json(crate::routes::cloud::reponse_de_retrait(
+        json!({ "status": "ok", "tier": "free" }),
+        remote_released,
+    ))
 }
 
 /// Nom convivial de CETTE machine — la réponse à « à quel serveur je parle ? ».

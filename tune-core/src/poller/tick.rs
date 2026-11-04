@@ -292,6 +292,14 @@ impl PositionPoller {
             // the race where orchestrator.play() sets Playing between the
             // initial states read and the device poll response.
             let fresh_states = self.playback.all_states().await;
+            // #7418 — l'appareil qui avait mis la zone en pause rejoue notre
+            // flux (Play à la télécommande) : la zone reprend avec lui.
+            if self
+                .suivre_la_reprise_de_l_appareil(zone_id, &device_id, &status, &fresh_states)
+                .await
+            {
+                continue;
+            }
             let already_playing = fresh_states
                 .iter()
                 .any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
@@ -477,6 +485,8 @@ impl PositionPoller {
             }
 
             let zone_id = zone_state.zone_id;
+            // #7418 — la zone joue : une pause de l'appareil d'avant est close.
+            self.oublier_la_pause_de_l_appareil(zone_id);
             let device_id = match self.get_zone_device_id(zone_id) {
                 Some(id) => id,
                 // Pas de peripherique de sortie : une zone navigateur, par
@@ -2277,6 +2287,12 @@ impl PositionPoller {
                 ps.octets_du_demarrage = None;
             }
 
+            // #7418 — la série `Paused` ne se compte que d'affilée.
+            if status.state != TransportState::Paused {
+                ps.pause_appareil_ticks = 0;
+            }
+            let mut pause_de_l_appareil = false;
+
             match status.state {
                 TransportState::Stopped if !tune_is_playing || !tune_has_track => {
                     // Tune is not playing on this zone — ignore device Stopped.
@@ -2565,7 +2581,76 @@ impl PositionPoller {
                         fsm_actual = Some(fsm::StoppedOutcome::Waiting);
                         ps.stopped_ticks += 1;
                         ps.transition(fsm::Transition::RendererArrete);
-                        if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
+                        // #7700 — « suivant » à la télécommande d'un appareil
+                        // DLNA : il lâche notre piste en milieu de lecture.
+                        // Sans ce constat, l'arrêt attendait 30 s puis
+                        // relançait la même piste à la position atteinte.
+                        let notre_flux = zone_state
+                            .now_playing
+                            .as_ref()
+                            .and_then(|np| np.stream_id.as_deref());
+                        let tenue = decisions::qui_tient_le_renderer(
+                            status.current_uri.as_deref(),
+                            notre_flux,
+                        );
+                        let depart_de_l_appareil = suivant_de_l_appareil_7700::depart_de_l_appareil(
+                            &suivant_de_l_appareil_7700::ArretRapporte {
+                                output_type: all_zones
+                                    .iter()
+                                    .find(|z| z.id == Some(zone_id))
+                                    .and_then(|z| z.output_type.as_deref())
+                                    .unwrap_or(""),
+                                realtime: status.realtime,
+                                zone_en_lecture: zone_state.state == PlayState::Playing,
+                                played_enough,
+                                duree_ms: track_duration_ms,
+                                tours: ps.stopped_ticks,
+                                pic_ms: ps.peak_position_ms,
+                                position_ms: status.position_ms,
+                                tenue: &tenue,
+                            },
+                        );
+                        let suivant_de_l_appareil = if depart_de_l_appareil {
+                            let (pas_a_sec, audio_servi_ms, octets_servis, octets_total) = self
+                                .reserve_du_renderer_7700(
+                                    notre_flux,
+                                    ps.peak_position_ms,
+                                    tenue == decisions::TenueDuRenderer::LecteurInterne,
+                                )
+                                .await;
+                            // Une ligne par arrêt : la série d'un renderer à
+                            // sec, non retenue, ne la répète pas à chaque tour.
+                            if pas_a_sec
+                                || ps.stopped_ticks
+                                    == suivant_de_l_appareil_7700::TOURS_D_ARRET_DU_SUIVANT
+                            {
+                                info!(
+                                    zone_id,
+                                    retenu = pas_a_sec,
+                                    position_ms = status.position_ms,
+                                    peak_pos = ps.peak_position_ms,
+                                    track_dur = track_duration_ms,
+                                    stopped_ticks = ps.stopped_ticks,
+                                    current_uri = status.current_uri.as_deref().unwrap_or(""),
+                                    tenue = ?tenue,
+                                    audio_servi_ms = audio_servi_ms.unwrap_or(0),
+                                    bytes_sent = octets_servis.unwrap_or(0),
+                                    bytes_total = octets_total.unwrap_or(0),
+                                    "dlna_suivant_de_l_appareil"
+                                );
+                            }
+                            pas_a_sec
+                        } else {
+                            false
+                        };
+                        if suivant_de_l_appareil {
+                            fsm_actual = Some(fsm::StoppedOutcome::SuivantDeLAppareil);
+                            track_ended = true;
+                            motif_fin_de_piste = decisions::motif_fin::SUIVANT_DE_L_APPAREIL;
+                            ps.transition(fsm::Transition::FinConstateeAvantLeSeuil {
+                                motif: MotifFin::SuivantDeLAppareil,
+                            });
+                        } else if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
                             // When repeat mode is active (One or All) on DLNA,
                             // be more lenient about accepting track-end: if the
                             // renderer has reported Stopped and we've seen any
@@ -4015,6 +4100,20 @@ impl PositionPoller {
                     ps.stopped_ticks = 0;
                     ps.transition(fsm::Transition::ArretEfface);
                     ps.playing_stall_ticks = 0;
+                    // #7418 — la zone joue, l'appareil est en pause : une
+                    // pause faite sur l'appareil (télécommande, autre entrée).
+                    // Laisser la zone `Playing` laissait la surveillance de
+                    // lecture relancer au premier `Stopped` qui suivait.
+                    ps.pause_appareil_ticks = ps.pause_appareil_ticks.saturating_add(1);
+                    pause_de_l_appareil = pause_de_l_appareil_7418::pause_de_l_appareil_etablie(
+                        all_zones
+                            .iter()
+                            .find(|z| z.id == Some(zone_id))
+                            .and_then(|z| z.output_type.as_deref())
+                            .unwrap_or(""),
+                        ps.pause_appareil_ticks,
+                        in_seek_grace,
+                    );
                 }
             }
 
@@ -4041,6 +4140,14 @@ impl PositionPoller {
                     ),
                 },
             );
+
+            // #7418 — la zone suit la pause de son appareil, comme #6790.
+            if pause_de_l_appareil {
+                poll_states.remove(&zone_id);
+                self.suivre_la_pause_de_l_appareil(zone_id, &device_id)
+                    .await;
+                continue;
+            }
 
             let output_type = all_zones
                 .iter()

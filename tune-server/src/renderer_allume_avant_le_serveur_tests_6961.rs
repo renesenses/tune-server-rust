@@ -13,6 +13,7 @@
 //! magasin le mémorise à un AUTRE port, fermé.
 
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tune_core::db::zone_repo::ZoneRepo;
 
 const UDN: &str = "uuid:4e616e6f-506c-6179-6572-000000006961";
@@ -50,6 +51,14 @@ fn description() -> String {
 
 /// Sert la description sur `127.0.0.1:<port éphémère>` ; rend ce port.
 async fn servir_la_description() -> u16 {
+    servir_la_description_quand(Arc::new(AtomicBool::new(true))).await
+}
+
+/// Comme [`servir_la_description`], mais l'appareil ne répond que quand
+/// `allume` est vrai : sinon la connexion est refermée sans réponse, et la
+/// sonde échoue tout de suite — l'appareil injoignable à l'instant de la
+/// resonde de démarrage.
+async fn servir_la_description_quand(allume: Arc<AtomicBool>) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -57,6 +66,10 @@ async fn servir_la_description() -> u16 {
             let Ok((mut sock, _)) = listener.accept().await else {
                 return;
             };
+            if !allume.load(Ordering::SeqCst) {
+                drop(sock);
+                continue;
+            }
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut req = Vec::new();
@@ -204,4 +217,110 @@ async fn le_recours_unicast_ignore_un_autre_appareil() {
         sondes[0].1.is_none(),
         "un répondeur d'un autre UDN ne doit pas être pris pour l'appareil mémorisé"
     );
+}
+
+/// Un renderer injoignable à l'instant de la resonde UNIQUE de démarrage
+/// (réseau de la machine pas encore prêt, appareil occupé), qui répond
+/// ensuite. Il ne s'annonce pas : sans réévaluation, rien ne le recherchait
+/// plus et sa zone restait hors ligne jusqu'au redémarrage de l'appareil.
+#[tokio::test]
+async fn une_zone_restee_hors_ligne_apres_la_resonde_de_demarrage_est_reevaluee() {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let allume = Arc::new(AtomicBool::new(false));
+    let location = format!(
+        "http://127.0.0.1:{}/description.xml",
+        servir_la_description_quand(allume.clone()).await
+    );
+    // Répondeur SSDP muet : le recours unicast n'obtient rien non plus.
+    let muet = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let recours = RecoursUnicast {
+        port_ssdp: muet.local_addr().unwrap().port(),
+        budget: std::time::Duration::from_millis(300),
+    };
+
+    let zones = ZoneRepo::with_backend(state.backend.clone());
+    let zone_id = zones.create("NanoPlayer", Some("dlna"), Some(UDN)).unwrap();
+    zones.set_online_by_device(UDN, false).unwrap();
+    persist_known_renderer(
+        &state.backend,
+        UDN,
+        &location,
+        "NanoPlayer",
+        "",
+        "JF Light Industries",
+        "NanoPlayer",
+    );
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        reregister_known_renderers_avec(&state, recours),
+    )
+    .await
+    .expect("la resonde de démarrage doit se terminer");
+    assert!(
+        !zones.get_by_device_id(UDN).unwrap().unwrap().online,
+        "préalable du banc : l'appareil injoignable au démarrage laisse la zone hors ligne"
+    );
+
+    // L'appareil répond désormais, sans rien annoncer.
+    allume.store(true, Ordering::SeqCst);
+    let rattaches = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        reevaluer_les_zones_hors_ligne_avec(&state, recours),
+    )
+    .await
+    .expect("la réévaluation doit se terminer");
+
+    let zone = zones
+        .get_by_device_id(UDN)
+        .unwrap()
+        .expect("zone conservée");
+    assert_eq!(zone.id, Some(zone_id), "la MÊME zone, pas un doublon");
+    assert!(
+        zone.online,
+        "#6961 : le renderer, injoignable à la resonde de démarrage puis joignable, n'a jamais \
+         été réévalué — sa zone est restée hors ligne jusqu'au redémarrage de l'appareil"
+    );
+    assert_eq!(rattaches, 1);
+    assert!(
+        state.outputs.lock().await.contains(UDN),
+        "la sortie du renderer doit être enregistrée"
+    );
+}
+
+/// Garde-fou : la réévaluation ne sonde QUE les zones DLNA/OpenHome hors
+/// ligne. Une zone en ligne, ou d'un autre type, n'est jamais sondée.
+#[tokio::test]
+async fn la_reevaluation_ne_sonde_que_les_zones_hors_ligne() {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let zones = ZoneRepo::with_backend(state.backend.clone());
+    zones.create("NanoPlayer", Some("dlna"), Some(UDN)).unwrap();
+    zones
+        .create("AirPlay", Some("airplay"), Some("airplay:salon"))
+        .unwrap();
+    let location = format!("http://127.0.0.1:{}/description.xml", port_ferme());
+    persist_known_renderer(&state.backend, UDN, &location, "NanoPlayer", "", "", "");
+    persist_known_renderer(
+        &state.backend,
+        "airplay:salon",
+        "http://127.0.0.1:1/x.xml",
+        "AirPlay",
+        "",
+        "",
+        "",
+    );
+
+    zones.set_online_by_device(UDN, true).unwrap();
+    zones.set_online_by_device("airplay:salon", false).unwrap();
+    assert!(
+        renderers_des_zones_hors_ligne(&state).is_empty(),
+        "zone DLNA en ligne et zone non DLNA : rien à sonder"
+    );
+
+    zones.set_online_by_device(UDN, false).unwrap();
+    let a_sonder: Vec<String> = renderers_des_zones_hors_ligne(&state)
+        .into_iter()
+        .map(|kr| kr.device_id)
+        .collect();
+    assert_eq!(a_sonder, [UDN.to_string()]);
 }

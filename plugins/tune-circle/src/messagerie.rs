@@ -21,6 +21,13 @@ use std::sync::Arc;
 
 pub fn router(relais: Arc<Relais>) -> Router<()> {
     Router::new()
+        .route("/general-circles", get(cercles_generaux))
+        .route(
+            "/general-circles/{id}/membership",
+            post(rejoindre).delete(quitter),
+        )
+        .route("/general-circles/{id}/conversation", post(ouvrir_cercle))
+        .route("/conversations/{id}/name-consent", post(consentir))
         .route("/conversations", get(liste))
         .route("/contacts/{id}/conversation", post(ouvrir))
         .route("/conversations/{id}/messages", get(messages).post(envoyer))
@@ -173,6 +180,82 @@ async fn signaler(State(r): State<Arc<Relais>>, Path(id): Path<String>, corps: B
             "POST /conversations/{id}/reports",
             Method::POST,
             &["conversations", &id, "reports"],
+            Some(&corps),
+        )
+        .await,
+    )
+}
+
+async fn cercles_generaux(State(r): State<Arc<Relais>>) -> Response {
+    en_reponse(
+        r.appeler(
+            "GET /general-circles",
+            Method::GET,
+            &["general-circles"],
+            None,
+        )
+        .await,
+    )
+}
+
+async fn rejoindre(State(r): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
+    if !id_valide(&id) {
+        return introuvable();
+    }
+    en_reponse(
+        r.appeler(
+            "POST /general-circles/{id}/membership",
+            Method::POST,
+            &["general-circles", &id, "membership"],
+            None,
+        )
+        .await,
+    )
+}
+
+async fn quitter(State(r): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
+    if !id_valide(&id) {
+        return introuvable();
+    }
+    en_reponse(
+        r.appeler(
+            "DELETE /general-circles/{id}/membership",
+            Method::DELETE,
+            &["general-circles", &id, "membership"],
+            None,
+        )
+        .await,
+    )
+}
+
+async fn ouvrir_cercle(State(r): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
+    if !id_valide(&id) {
+        return introuvable();
+    }
+    en_reponse(
+        r.appeler(
+            "POST /general-circles/{id}/conversation",
+            Method::POST,
+            &["general-circles", &id, "conversation"],
+            None,
+        )
+        .await,
+    )
+}
+
+async fn consentir(State(r): State<Arc<Relais>>, Path(id): Path<String>, corps: Bytes) -> Response {
+    if !id_valide(&id) {
+        return introuvable();
+    }
+    let corps = match corps_json(&corps, false) {
+        Ok(c) => c,
+        Err(()) => return corps_invalide(),
+    };
+    en_reponse(
+        r.appeler(
+            "POST /conversations/{id}/name-consent",
+            Method::POST,
+            &["conversations", &id, "name-consent"],
             Some(&corps),
         )
         .await,
