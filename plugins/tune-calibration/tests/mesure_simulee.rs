@@ -415,3 +415,108 @@ fn une_entree_a_la_mauvaise_cadence_est_refusee() {
     assert!(e.contains("44100"), "{e}");
     assert!(hote.journal().volumes.is_empty());
 }
+
+/// Tout le greffon est Premium (décision du 04/11/2026) : sans licence, ou
+/// avec un compte gratuit, CHAQUE route répond le refus nommé
+/// `premium_required` (402) et aucune mesure ne part — rien n'est joué ;
+/// avec Premium, les mêmes routes servent.
+#[test]
+fn sans_premium_refus_nomme_avec_premium_les_routes_servent() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use tune_calibration_greffon::routes::{EtatRoutes, router};
+    use tune_core::license::LicenseManager;
+
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let b = banc(&sim, 1.0, Some(63.0), "premium");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let appeler =
+        |licence: Option<Arc<LicenseManager>>, methode: &str, chemin: &str, corps: &str| {
+            let app = router(EtatRoutes {
+                controleur: b.controleur.clone(),
+                license: licence,
+            });
+            let req = Request::builder()
+                .method(methode)
+                .uri(chemin)
+                .header("content-type", "application/json")
+                .body(Body::from(corps.to_string()))
+                .unwrap();
+            rt.block_on(async move {
+                let r = app.oneshot(req).await.unwrap();
+                let code = r.status();
+                let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    code,
+                    serde_json::from_slice::<serde_json::Value>(&octets).unwrap_or_default(),
+                )
+            })
+        };
+    let corps_mesure = format!(r#"{{"entree":"{MICRO}","duree_s":2.0}}"#);
+    let routes = [
+        ("GET", "/microphones", ""),
+        (
+            "POST",
+            "/microphones/etalonnages",
+            r#"{"nom":"x","texte":"20 0\n20000 0"}"#,
+        ),
+        ("POST", "/zones/7/mesures", corps_mesure.as_str()),
+        ("GET", "/mesures", ""),
+        ("GET", "/mesures/inconnue", ""),
+        ("GET", "/mesures/inconnue/resultat", ""),
+        ("GET", "/mesures/inconnue/ri.wav", ""),
+        ("DELETE", "/mesures/inconnue", ""),
+    ];
+
+    let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    tune_core::db::migrations::run_migrations(&db).unwrap();
+    let licence = Arc::new(LicenseManager::new(Arc::new(db)));
+
+    // Sans licence fournie, puis avec un compte gratuit : refus nommé partout.
+    for (cas, l) in [
+        ("sans licence", None),
+        ("compte gratuit", Some(licence.clone())),
+    ] {
+        for (m, chemin, corps) in routes {
+            let (code, v) = appeler(l.clone(), m, chemin, corps);
+            assert_eq!(
+                code,
+                StatusCode::PAYMENT_REQUIRED,
+                "{cas} : {m} {chemin} → {v}"
+            );
+            assert_eq!(v["error"], "premium_required", "{cas} : {m} {chemin} → {v}");
+            assert_eq!(v["code"], "room_correction", "{cas} : {m} {chemin}");
+        }
+    }
+    assert!(
+        b.hote.journal().joues.is_empty(),
+        "une mesure est partie sans Premium"
+    );
+    assert!(b.controleur.mesures().is_empty());
+
+    // Avec Premium : les routes servent, la mesure part.
+    rt.block_on(licence.set_account_premium(true, None));
+    let (code, v) = appeler(Some(licence.clone()), "GET", "/microphones", "");
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let (code, v) = appeler(Some(licence.clone()), "GET", "/mesures/inconnue", "");
+    assert_eq!(code, StatusCode::NOT_FOUND, "{v}");
+    let (code, v) = appeler(
+        Some(licence.clone()),
+        "POST",
+        "/zones/7/mesures",
+        &corps_mesure,
+    );
+    assert_eq!(code, StatusCode::ACCEPTED, "{v}");
+    let id = v["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        attendre_fin(&b.controleur, &id, Duration::from_secs(60)),
+        Etat::Terminee
+    );
+}

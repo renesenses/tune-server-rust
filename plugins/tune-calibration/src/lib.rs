@@ -89,6 +89,11 @@ impl TunePlugin for CalibrationPlugin {
     fn catalogued(&self) -> bool {
         true
     }
+    /// Tout le greffon est Premium (04/11/2026) : le cadenas avant le clic ;
+    /// la décision réelle est `routes::premium`.
+    fn required_feature(&self) -> Option<tune_core::license::Feature> {
+        Some(routes::DROIT)
+    }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
         let hote: Arc<dyn HoteZone> = Arc::new(HoteOrchestrateur {
@@ -112,8 +117,14 @@ impl TunePlugin for CalibrationPlugin {
             pile = controleur.peripheriques.pile(),
             "calibration_greffon_pret"
         );
+        if !ctx.feature_licensed(routes::DROIT).await {
+            // Chargé quand même : le refus porte sur les routes, et l'écran
+            // doit pouvoir dire pourquoi il reste verrouillé.
+            tracing::info!("calibration_chargee_sans_premium");
+        }
         ctx.register_router(routes::router(routes::EtatRoutes {
             controleur: controleur.clone(),
+            license: ctx.license.clone(),
         }));
         self.controleur = Some(controleur);
         Ok(())
