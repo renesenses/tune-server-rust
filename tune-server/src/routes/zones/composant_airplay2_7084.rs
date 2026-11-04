@@ -32,7 +32,9 @@ pub(crate) fn injecter_composant_airplay2_manquant(
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use tune_core::outputs::airplay2::composant_manquant_7084::{retablir, signaler};
+    use tune_core::outputs::airplay2::composant_manquant_7084::{
+        CODE_AIRPLAY2_COMPONENT_MISSING, retablir, signaler,
+    };
 
     const MANIA: &str = "airplay-mania-7084-zone";
 
