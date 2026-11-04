@@ -589,16 +589,31 @@ impl SpotifyService {
             .clone()
             .ok_or("Spotify n'est pas connecté")?;
         let mut appareil = None;
+        let mut derniere_erreur = None;
         for essai in 0..20 {
             if essai > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
-            appareil = self.appareil_par_nom(nom).await?;
+            // #7659 — `api_get` rend désormais un refus (429, 5xx…) en erreur :
+            // un refus passager vaut « appareil pas encore visible », seul le
+            // jeton rejeté arrête l'attente.
+            match self.appareil_par_nom(nom).await {
+                Ok(trouve) => {
+                    derniere_erreur = None;
+                    appareil = trouve;
+                }
+                Err(e) if e == "token expired" => return Err(e),
+                Err(e) => derniere_erreur = Some(e),
+            }
             if appareil.is_some() {
                 break;
             }
         }
-        let appareil = appareil.ok_or_else(|| motif_appareil_absent(nom))?;
+        let appareil = match (appareil, derniere_erreur) {
+            (Some(appareil), _) => appareil,
+            (None, Some(e)) => return Err(e),
+            (None, None) => return Err(motif_appareil_absent(nom)),
+        };
         let resp = self
             .client
             .put(format!(

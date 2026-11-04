@@ -150,3 +150,63 @@ async fn la_page_suivante_part_de_l_offset_demande_7659() {
     assert!(!seconde.has_more);
     assert_eq!(d.recues.lock().unwrap().as_slice(), &[(10, 0), (10, 20)]);
 }
+
+/// Doublure de `/me/player/devices` : `refus` réponses 429 d'abord, puis
+/// l'appareil `Tune` ; `/me/player/play` accepte.
+async fn service_appareils(refus: usize) -> (SpotifyService, Arc<Mutex<usize>>) {
+    let appels: Arc<Mutex<usize>> = Arc::default();
+    let app = axum::Router::new()
+        .route(
+            "/v1/me/player/devices",
+            axum::routing::get(
+                move |axum::extract::State(n): axum::extract::State<Arc<Mutex<usize>>>| async move {
+                    let mut n = n.lock().unwrap();
+                    *n += 1;
+                    if *n <= refus {
+                        return (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            axum::Json(json!({"error": {"status": 429, "message": "API rate limit exceeded"}})),
+                        );
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({"devices": [{"id": "dev-tune", "name": "Tune"}]})),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/v1/me/player/play",
+            axum::routing::put(|| async { axum::http::StatusCode::NO_CONTENT }),
+        )
+        .with_state(appels.clone());
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", ecoute.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
+    let mut svc =
+        SpotifyService::with_config(Some("client-essai"), None, 8888).avec_doublure(&base);
+    svc.access_token = Some("jeton".into());
+    (svc, appels)
+}
+
+#[tokio::test]
+async fn un_refus_passager_n_arrete_pas_l_attente_de_l_appareil_7659() {
+    // Le contrôle de statut d'`api_get` ne doit pas fragiliser la lecture :
+    // un 429 pendant l'attente de l'appareil librespot se réessaie.
+    let (svc, appels) = service_appareils(1).await;
+    svc.lancer_sur_l_appareil("Tune", "x", 0)
+        .await
+        .expect("#7659 : un 429 de /me/player/devices doit être réessayé, pas arrêter la lecture");
+    assert_eq!(*appels.lock().unwrap(), 2);
+}
+
+#[tokio::test]
+async fn un_refus_persistant_donne_le_message_de_spotify_7659() {
+    let (svc, appels) = service_appareils(usize::MAX).await;
+    let erreur = svc
+        .lancer_sur_l_appareil("Tune", "x", 0)
+        .await
+        .expect_err("refus à chaque essai");
+    assert!(erreur.contains("429"), "{erreur}");
+    assert_eq!(*appels.lock().unwrap(), 20);
+}
