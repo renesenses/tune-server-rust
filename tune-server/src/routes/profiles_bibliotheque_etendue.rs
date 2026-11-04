@@ -2,9 +2,9 @@
 //!
 //! Activé, la Bibliothèque du client montre aussi les albums, artistes et
 //! pistes mis en favori chez les services connectés (Qobuz, TIDAL…), et le
-//! filtre Source permet d'en choisir un. Il remplace le bouton « Bibliothèque
-//! + favoris » qui vivait sur l'appareil (`localStorage`) et ne valait que pour
-//! les albums.
+//! filtre Source permet d'en choisir un. Il remplace le bouton
+//! « Bibliothèque + favoris » qui vivait sur l'appareil (`localStorage`) et ne
+//! valait que pour les albums.
 //!
 //! Le réglage est tenu **par profil**, comme les favoris de service eux-mêmes,
 //! sous la clé `profile_{id}_bibliotheque_etendue`. **Une clé absente vaut
