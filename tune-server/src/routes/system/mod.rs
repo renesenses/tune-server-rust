@@ -58,6 +58,8 @@ mod replaygain;
 /// garde thermique (#4681).
 pub(crate) mod ce_qui_tourne;
 pub mod scan;
+/// État de suivi d'une mise à jour qui n'aboutit pas (#7600).
+pub(crate) mod suivi_de_mise_a_jour_7600;
 /// Pause et reprise des traitements de fond (#4574) — voir le module.
 pub(crate) mod taches_de_fond;
 mod tags;
