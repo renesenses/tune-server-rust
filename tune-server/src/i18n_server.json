@@ -3943,6 +3943,23 @@
     "pl": "Ten folder i jego podfoldery nie zawierają utworów do odtworzenia.",
     "el": "Αυτός ο φάκελος και οι υποφάκελοί του δεν έχουν κομμάτι για αναπαραγωγή."
   },
+  "api.playback.zoneOutputCommandFailed": {
+    "fr": "Zone « {zone} » : l'appareil n'a pas exécuté la commande ({command}). Cause : {cause}",
+    "en": "Zone \"{zone}\": the device did not carry out the command ({command}). Cause: {cause}",
+    "de": "Zone „{zone}“: Das Gerät hat den Befehl ({command}) nicht ausgeführt. Ursache: {cause}",
+    "es": "Zona «{zone}»: el dispositivo no ejecutó la orden ({command}). Causa: {cause}",
+    "it": "Zona «{zone}»: il dispositivo non ha eseguito il comando ({command}). Causa: {cause}",
+    "zh": "区域“{zone}”：设备未执行该命令（{command}）。原因：{cause}",
+    "ja": "ゾーン「{zone}」：デバイスがコマンド（{command}）を実行しませんでした。原因：{cause}",
+    "ko": "영역 \"{zone}\": 장치가 명령({command})을 실행하지 않았습니다. 원인: {cause}",
+    "ro": "Zona „{zone}”: dispozitivul nu a executat comanda ({command}). Cauză: {cause}",
+    "sv": "Zon ”{zone}”: enheten utförde inte kommandot ({command}). Orsak: {cause}",
+    "hu": "„{zone}” zóna: az eszköz nem hajtotta végre a parancsot ({command}). Ok: {cause}",
+    "vi": "Vùng \"{zone}\": thiết bị không thực hiện lệnh ({command}). Nguyên nhân: {cause}",
+    "nb": "Sone «{zone}»: enheten utførte ikke kommandoen ({command}). Årsak: {cause}",
+    "pl": "Strefa „{zone}”: urządzenie nie wykonało polecenia ({command}). Przyczyna: {cause}",
+    "el": "Ζώνη «{zone}»: η συσκευή δεν εκτέλεσε την εντολή ({command}). Αιτία: {cause}"
+  },
   "api.playback.queueEmptyNothingToSave": {
     "fr": "La file d'attente est vide : il n'y a rien à enregistrer.",
     "en": "The queue is empty: there is nothing to save.",
