@@ -224,6 +224,17 @@ pub fn verifier_rapide(chemin: &Path, mut continuer: impl FnMut() -> bool) -> Op
         ));
         resultat.position_trames = lieu.echantillon;
         resultat.localisation = Some(localiser(lieu));
+    } else if let Some(lieu) = &constat.fin_absente {
+        // Ogg aux pages toutes justes sans page de fin : coupé pile entre deux
+        // pages ou écrit sans le drapeau. Ni sain ni corrompu.
+        resultat.verdict = Verdict::NonVerifiable;
+        resultat.code = "fin_de_flux_absente".into();
+        resultat.erreur = Some(format!(
+            "Pages justes, mais aucune page de fin de flux : fichier coupé après la page n° {} ou écrit sans marque de fin",
+            lieu.numero.saturating_sub(1)
+        ));
+        resultat.position_trames = lieu.echantillon;
+        resultat.localisation = Some(localiser(lieu));
     }
     Some(resultat)
 }

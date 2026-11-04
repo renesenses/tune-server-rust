@@ -165,17 +165,129 @@ fn ogg_tronque_est_signale_tronque_pas_corrompu() {
         let debuts = sain(nom).debuts;
         let n = debuts.len() / 2;
         let octets = fixture(nom);
-        for coupe in [debuts[n] + 40, debuts[n]] {
-            let c = constat(&octets[..coupe as usize]);
-            assert_eq!(
-                c.fautes, 0,
-                "{nom} coupé à {coupe} : tronqué pris pour corrompu : {c:?}"
+        // Coupé au milieu d'une page : tronqué.
+        let coupe = debuts[n] + 40;
+        let c = constat(&octets[..coupe as usize]);
+        assert_eq!(
+            c.fautes, 0,
+            "{nom} coupé à {coupe} : tronqué pris pour corrompu : {c:?}"
+        );
+        let lieu = c
+            .tronque
+            .unwrap_or_else(|| panic!("{nom} coupé à {coupe} non signalé"));
+        assert_eq!(lieu.numero, n as u64, "{nom} coupé à {coupe}");
+        // Coupé pile entre deux pages : seule manque la page de fin, signalée
+        // à part (voir le témoin suivant).
+        let c = constat(&octets[..debuts[n] as usize]);
+        assert_eq!(c.fautes, 0, "{nom} coupé entre deux pages : {c:?}");
+        assert!(c.tronque.is_none(), "{nom} : {c:?}");
+        let lieu = c
+            .fin_absente
+            .unwrap_or_else(|| panic!("{nom} coupé à {} non signalé", debuts[n]));
+        assert_eq!(
+            (lieu.numero, lieu.octet),
+            (n as u64, debuts[n]),
+            "{nom} : fin de flux absente mal située"
+        );
+    }
+}
+
+#[test]
+fn ogg_sans_drapeau_de_fin_n_est_ni_tronque_ni_fautif() {
+    for nom in OGG {
+        let debuts = sain(nom).debuts;
+        let mut octets = fixture(nom);
+        let derniere = *debuts.last().unwrap() as usize;
+        assert_ne!(octets[derniere + 5] & 0x04, 0, "{nom} : fixture sans EOS");
+        // Drapeau EOS retiré et CRC-32 de la page recalculé : la page reste
+        // juste, seul manque le drapeau.
+        octets[derniere + 5] &= !0x04;
+        octets[derniere + 22..derniere + 26].fill(0);
+        let crc = octets[derniere..].iter().fold(0, |c, &o| crc32(c, o));
+        octets[derniere + 22..derniere + 26].copy_from_slice(&crc.to_le_bytes());
+        let c = constat(&octets);
+        assert_eq!(c.fautes, 0, "{nom} : page juste signalée fautive : {c:?}");
+        assert!(
+            c.tronque.is_none(),
+            "{nom} : un Ogg aux pages entières sans drapeau de fin déclaré tronqué : {c:?}"
+        );
+        let lieu = c.fin_absente.expect("drapeau de fin absent non signalé");
+        assert_eq!(lieu.octet, octets.len() as u64, "{nom}");
+        // Dans le rapport : ni sain ni corrompu, sous un code à part.
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("sans_fin.ogg");
+        std::fs::write(&chemin, &octets).unwrap();
+        let r = super::super::verifier_rapide(&chemin, || true).unwrap();
+        assert_eq!(
+            (&r.verdict, r.code.as_str()),
+            (&super::super::Verdict::NonVerifiable, "fin_de_flux_absente"),
+            "{nom} : {r:?}"
+        );
+    }
+}
+
+/// Bit modifié dans la fréquence, les canaux et la profondeur de STREAMINFO
+/// (octets 18 à 21 depuis le début du fichier, après « fLaC » et l'en-tête de
+/// bloc), que ne protège aucun CRC.
+#[test]
+fn flac_streaminfo_abime_n_est_pas_un_fichier_tronque() {
+    for nom in FLAC {
+        for (octet, masque) in [(19, 0x10), (20, 0x02), (20, 0x01), (21, 0x10)] {
+            let mut octets = fixture(nom);
+            assert_eq!(&octets[..4], b"fLaC", "{nom}");
+            octets[octet] ^= masque;
+            let c = constat(&octets);
+            assert!(
+                c.tronque.is_none(),
+                "{nom} entier, octet {octet} de STREAMINFO modifié : signalé tronqué : {c:?}"
             );
-            let lieu = c
-                .tronque
-                .unwrap_or_else(|| panic!("{nom} coupé à {coupe} non signalé"));
-            assert_eq!(lieu.numero, n as u64, "{nom} coupé à {coupe}");
+            let faute = c.premiere_faute.as_ref().unwrap_or_else(|| {
+                panic!("{nom} : octet {octet} de STREAMINFO modifié non signalé : {c:?}")
+            });
+            assert_eq!(faute.code, "entete_illisible", "{nom} : {c:?}");
         }
+    }
+}
+
+/// Une zone illisible de plusieurs Mio (STREAMINFO abîmé, reste du fichier
+/// sans trame reconnue, ou Ogg dont la suite n'a plus de page) : la pause est
+/// entendue en cours de recherche et le tampon reste borné.
+#[test]
+fn une_zone_illisible_ne_tient_ni_la_pause_ni_la_memoire() {
+    const TAILLE: usize = 8 << 20;
+    let mut f = fixture("test.flac");
+    f[19] ^= 0x10;
+    let mut o = fixture("test.ogg");
+    let fin_premiere = 27 + usize::from(o[26]);
+    let corps: usize = o[27..fin_premiere].iter().map(|&n| usize::from(n)).sum();
+    o.truncate(fin_premiere + corps);
+    for (nom, mut octets) in [("flac", f), ("ogg", o)] {
+        octets.resize(octets.len() + TAILLE, 0x55);
+        // Pause demandée après quelques appels : rendue avant la fin.
+        let mut appels = 0;
+        let analyse = analyser(&octets[..], || {
+            appels += 1;
+            appels < 8
+        })
+        .unwrap();
+        assert!(
+            matches!(analyse, Analyse::Interrompu),
+            "{nom} : pause ignorée pendant la recherche : {analyse:?}"
+        );
+        // Sans pause : la recherche va au bout avec un tampon borné.
+        let mut lecteur = Lecteur::new(&octets[..]);
+        let analyse = match &octets[..4] {
+            b"fLaC" => flac(&mut lecteur, 4, &mut || true),
+            _ => ogg(&mut lecteur, &mut || true),
+        }
+        .unwrap();
+        assert!(matches!(analyse, Analyse::Constat(_)), "{nom}");
+        assert!(
+            lecteur.tampon.len() <= 3 * BLOC,
+            "{nom} : {} octets gardés en mémoire pour {} lus",
+            lecteur.tampon.len(),
+            octets.len()
+        );
     }
 }
 

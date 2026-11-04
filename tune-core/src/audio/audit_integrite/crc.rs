@@ -129,6 +129,10 @@ pub(super) struct Constat {
     /// Le fichier s'arrête avant sa fin annoncée : la trame ou la page où il
     /// est coupé. Distinct d'une faute de somme de contrôle.
     pub tronque: Option<Lieu>,
+    /// Ogg : toutes les pages sont entières et justes, mais un flux logique
+    /// n'a pas de page de fin (drapeau EOS) ; la position qui suit la
+    /// dernière page lue.
+    pub fin_absente: Option<Lieu>,
     /// Début de chaque trame ou page reconnue, pour les témoins.
     #[cfg(test)]
     pub debuts: Vec<u64>,
@@ -142,6 +146,7 @@ impl Constat {
             fautes: 0,
             premiere_faute: None,
             tronque: None,
+            fin_absente: None,
             #[cfg(test)]
             debuts: Vec::new(),
         }
@@ -383,6 +388,98 @@ fn premier_echantillon(e: &Entete, nominal: u64) -> u64 {
     }
 }
 
+/// Longueur maximale d'un en-tête de trame FLAC, CRC-8 compris.
+const ENTETE_MAX: u64 = 16;
+
+/// Pas, en octets, auquel une recherche octet par octet (synchro FLAC, page
+/// Ogg) rend la main à `continuer` et oublie ce qu'elle a dépassé : une zone
+/// illisible de plusieurs Go ne tient ni la pause ni la mémoire.
+const ETAPE: u64 = 1 << 16;
+
+/// Le début d'une synchro FLAC.
+fn entete_commence(o: &[u8]) -> bool {
+    o.len() == 2 && o[0] == 0xFF && o[1] & 0xFE == 0xF8
+}
+
+/// Où finit une trame FLAC.
+struct Fin {
+    /// Début de la trame suivante, ou fin des données audio.
+    q: u64,
+    /// L'en-tête de la trame suivante ; `None` en fin de fichier.
+    suivante: Option<Entete>,
+    /// CRC-16 de `[p, q)` : nul si la trame est intacte.
+    crc: u16,
+    /// Une position où la trame en cours pourrait finir intacte (CRC-16 nul
+    /// devant une synchro) : l'en-tête qui suit est alors l'abîmé.
+    fin_intacte: Option<u64>,
+}
+
+/// Cherche la fin de la trame qui commence en `p` : l'en-tête valide suivant
+/// dont la numérotation avance, une étiquette ID3v1 finale ou la fin du
+/// fichier. `None` si `continuer` a rendu faux.
+fn chercher_fin_de_trame<R: Read>(
+    l: &mut Lecteur<R>,
+    p: u64,
+    courant: &Entete,
+    nominal: u64,
+    flux: &Flux,
+    continuer: &mut impl FnMut() -> bool,
+) -> io::Result<Option<Fin>> {
+    let debut = premier_echantillon(courant, nominal);
+    let mut crc = l
+        .tranche(p, courant.longueur)
+        .iter()
+        .fold(0, |c, &o| crc16(c, o));
+    let mut q = p + courant.longueur as u64;
+    let mut fin_intacte = None;
+    let suivante = loop {
+        // Le CRC-16 se calcule au fil de l'eau : rien avant `q` n'est relu.
+        if (q - p) % ETAPE == 0 {
+            if !continuer() {
+                return Ok(None);
+            }
+            l.oublier(q);
+        }
+        if !l.disponible(q, 1)? {
+            break None;
+        }
+        let o = l.octet(q);
+        // Une étiquette ID3v1 finale (128 octets) n'est pas une trame.
+        if o == b'T' && l.disponible(q, 128)? && !l.disponible(q, 129)? && l.tranche(q, 3) == b"TAG"
+        {
+            break None;
+        }
+        if o == 0xFF {
+            if let Some(e) = entete(l.au_plus(q, 22)?, flux) {
+                let suite = premier_echantillon(&e, nominal);
+                // La numérotation doit avancer, et de peu : un faux en-tête
+                // au CRC-8 juste n'a presque jamais ce numéro.
+                if e.variable == courant.variable
+                    && suite > debut
+                    && suite <= debut.saturating_add(64 * courant.bloc.max(nominal))
+                {
+                    break Some(e);
+                }
+            }
+            if crc == 0
+                && fin_intacte.is_none()
+                && q >= p + courant.longueur as u64 + 2
+                && entete_commence(l.au_plus(q, 2)?)
+            {
+                fin_intacte = Some(q);
+            }
+        }
+        crc = crc16(crc, o);
+        q += 1;
+    };
+    Ok(Some(Fin {
+        q,
+        suivante,
+        crc,
+        fin_intacte,
+    }))
+}
+
 fn flac<R: Read>(
     l: &mut Lecteur<R>,
     mut pos: u64,
@@ -449,13 +546,34 @@ fn flac<R: Read>(
     // Première trame : normalement juste après les métadonnées.
     let mut p = pos;
     let mut courant = loop {
+        if (p - pos) % ETAPE == 0 {
+            if !continuer() {
+                return Ok(Analyse::Interrompu);
+            }
+            l.oublier(p);
+        }
         if !l.disponible(p, 1)? {
-            // Aucune trame : coupé juste après les métadonnées.
-            constat.tronque = Some(Lieu {
+            let lieu = Lieu {
                 numero: 0,
                 octet: pos,
                 echantillon: Some(0),
-            });
+            };
+            // STREAMINFO n'a pas de CRC : un octet abîmé de sa fréquence, de
+            // ses canaux ou de sa profondeur fait rejeter tous les en-têtes.
+            // Le fichier n'est coupé que s'il s'arrête après les métadonnées
+            // ou au milieu d'un premier en-tête.
+            if p - pos < ENTETE_MAX && (p == pos || entete_commence(l.au_plus(pos, 2)?)) {
+                constat.tronque = Some(lieu);
+            } else {
+                constat.faute(
+                    lieu,
+                    "entete_illisible",
+                    format!(
+                        "Aucune trame cohérente avec STREAMINFO dans les {} octets qui suivent les métadonnées",
+                        p - pos
+                    ),
+                );
+            }
             return Ok(Analyse::Constat(constat));
         }
         if let Some(e) = entete(l.au_plus(p, 22)?, &flux) {
@@ -483,49 +601,16 @@ fn flac<R: Read>(
         l.oublier(p);
         constat.noter_debut(p);
         let debut = premier_echantillon(&courant, nominal);
-        let mut crc = l
-            .tranche(p, courant.longueur)
-            .iter()
-            .fold(0, |c, &o| crc16(c, o));
-        let mut q = p + courant.longueur as u64;
-        // Une position où la trame en cours pourrait finir intacte (CRC-16
-        // nul devant une synchro) : l'en-tête qui suit est alors l'abîmé.
-        let mut fin_intacte = None;
-        let suivante = loop {
-            if !l.disponible(q, 1)? {
-                break None;
-            }
-            let o = l.octet(q);
-            // Une étiquette ID3v1 finale (128 octets) n'est pas une trame.
-            if o == b'T'
-                && l.disponible(q, 128)?
-                && !l.disponible(q, 129)?
-                && l.tranche(q, 3) == b"TAG"
-            {
-                break None;
-            }
-            if o == 0xFF {
-                if let Some(e) = entete(l.au_plus(q, 22)?, &flux) {
-                    let suite = premier_echantillon(&e, nominal);
-                    // La numérotation doit avancer, et de peu : un faux
-                    // en-tête au CRC-8 juste n'a presque jamais ce numéro.
-                    if e.variable == courant.variable
-                        && suite > debut
-                        && suite <= debut.saturating_add(64 * courant.bloc.max(nominal))
-                    {
-                        break Some((q, e));
-                    }
-                }
-                if crc == 0 && fin_intacte.is_none() && q >= p + courant.longueur as u64 + 2 {
-                    let synchro = l.au_plus(q, 2)?;
-                    if synchro.len() == 2 && synchro[1] & 0xFE == 0xF8 {
-                        fin_intacte = Some(q);
-                    }
-                }
-            }
-            crc = crc16(crc, o);
-            q += 1;
+        let Some(Fin {
+            q,
+            suivante,
+            crc,
+            fin_intacte,
+        }) = chercher_fin_de_trame(l, p, &courant, nominal, &flux, continuer)?
+        else {
+            return Ok(Analyse::Interrompu);
         };
+        let suivante = suivante.map(|e| (q, e));
         let attendu = debut + courant.bloc;
         match suivante {
             Some((q, e)) => {
@@ -637,6 +722,12 @@ fn ogg<R: Read>(l: &mut Lecteur<R>, continuer: &mut impl FnMut() -> bool) -> io:
             let mut q = p + 1;
             while l.disponible(q, 4)? && l.tranche(q, 4) != b"OggS" {
                 q += 1;
+                if (q - p) % ETAPE == 0 {
+                    if !continuer() {
+                        return Ok(Analyse::Interrompu);
+                    }
+                    l.oublier(q);
+                }
             }
             if !apres_faute {
                 constat.faute(
@@ -732,18 +823,24 @@ fn ogg<R: Read>(l: &mut Lecteur<R>, continuer: &mut impl FnMut() -> bool) -> io:
         numero += 1;
         p += taille as u64;
     }
-    // Un flux sans page de fin : le fichier s'arrête avant elle.
+    // Toutes les pages sont entières, mais un flux n'a pas de page de fin :
+    // coupé pile entre deux pages, ou écrit par un outil qui omet le drapeau
+    // (RFC 3533 l'exige). Rien ne permet de trancher : ni tronqué ni fautif.
     if constat.tronque.is_none()
         && !apres_faute
         && let Some(s) = series.values().find(|s| !s.fin)
     {
-        constat.tronque = Some(Lieu {
+        constat.fin_absente = Some(Lieu {
             numero,
             octet: p,
             echantillon: s.granule,
         });
     }
-    if series.is_empty() && constat.premiere_faute.is_none() && constat.tronque.is_none() {
+    if series.is_empty()
+        && constat.premiere_faute.is_none()
+        && constat.tronque.is_none()
+        && constat.fin_absente.is_none()
+    {
         constat.faute(
             Lieu {
                 numero: 0,
