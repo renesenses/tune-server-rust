@@ -20,6 +20,9 @@ mod seek_en_double_193_tests;
 mod session_locale_tests;
 #[path = "playback/session_message.rs"]
 mod session_message;
+#[cfg(test)]
+#[path = "playback/titre_indisponible_7778_tests.rs"]
+mod titre_indisponible_7778_tests;
 // #6332 — le débit d'une piste locale dans l'état de zone.
 #[cfg(test)]
 #[path = "playback/debit_lecture_en_cours_6332_tests.rs"]
@@ -295,6 +298,21 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
                 "error": code_cadence,
                 "code": code_cadence,
                 "message": motif,
+            })),
+        )
+            .into_response();
+    }
+    // #7778 (point 3) — le service refuse CETTE piste (`no url` de Qobuz :
+    // aucune adresse de flux pour ce compte, cette région). 422 au code
+    // stable, phrase traduite : sans cette branche, « no url » ne contenait
+    // aucun mot du fourre-tout ci-dessous et finissait en 500 brut.
+    if tune_core::poller::refus_propre_a_la_piste(&e) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "track_unavailable",
+                "code": "track_unavailable",
+                "message": crate::i18n::t(lang, "playback.track_unavailable"),
             })),
         )
             .into_response();
