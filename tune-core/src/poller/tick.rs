@@ -10,6 +10,12 @@ impl PositionPoller {
         let states = self.playback.all_states().await;
         for s in &states {
             if s.state == PlayState::Playing && s.position_ms > 0 {
+                // #7852 — le point de décision unique de l'écoute validée :
+                // historique, compteur d'écoutes et « Reprendre l'écoute »
+                // naissent ici, au seuil min(30 s, 50 %), pas au démarrage.
+                // Avant `track_position`, qui ne fait que suivre une reprise
+                // déjà créée.
+                self.orchestrator.valider_l_ecoute(s);
                 if let Err(e) = crate::db::listening_resume::track_position(&self.db, s) {
                     tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_titre_non_enregistree");
                 }
