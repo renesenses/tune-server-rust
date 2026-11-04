@@ -15,8 +15,10 @@
 //!   contenu aigu faible d'un CD suréchantillonné.
 //!
 //! Idée reprise d'Aède / FlacCompagnon
-//! (<https://craft-and-code.github.io/FlacCompagnon/>, licence MIT) ; aucune
-//! ligne de code n'en est reprise, seulement le principe des deux signatures.
+//! (<https://craft-and-code.github.io/FlacCompagnon/> ; la bibliothèque
+//! `flaccompagnon-core` est sous licence MPL-2.0, le dépôt et l'application
+//! sous MIT) ; aucune ligne de code n'en est reprise, seulement le principe
+//! des deux signatures.
 //!
 //! # Ce que le verdict ne prétend pas
 //!
