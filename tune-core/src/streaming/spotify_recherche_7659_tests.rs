@@ -54,7 +54,7 @@ async fn recherche_double(
         let items: Vec<_> = (offset..(offset + limit).min(total))
             .map(|i| element(cat, i))
             .collect();
-        let next = (offset + limit < total).then(|| "https://api.spotify.com/v1/search?next");
+        let next = (offset + limit < total).then_some("https://api.spotify.com/v1/search?next");
         json!({"items": items, "total": total, "offset": offset, "limit": limit, "next": next})
     };
     (
