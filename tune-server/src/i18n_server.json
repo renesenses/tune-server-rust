@@ -203,6 +203,23 @@
     "pl": "Przechwytuj wejście audio (USB, S/PDIF, optyczne) i przesyłaj je na żywo do strefy",
     "el": "Καταγραφή εισόδου ήχου (USB, S/PDIF, οπτική) και ζωντανή μετάδοση σε μια ζώνη"
   },
+  "plugin.description.calibration": {
+    "fr": "Mesurer la réponse de la pièce d'écoute avec un micro USB étalonné (balayage, réponse impulsionnelle, RT60)",
+    "en": "Measure the listening room's response with a calibrated USB microphone (sweep, impulse response, RT60)",
+    "de": "Den Frequenzgang des Hörraums mit einem kalibrierten USB-Mikrofon messen (Sweep, Impulsantwort, RT60)",
+    "es": "Medir la respuesta de la sala de escucha con un micrófono USB calibrado (barrido, respuesta al impulso, RT60)",
+    "it": "Misurare la risposta della stanza d'ascolto con un microfono USB calibrato (sweep, risposta all'impulso, RT60)",
+    "zh": "使用校准过的 USB 麦克风测量聆听房间的响应（扫频、脉冲响应、RT60）",
+    "ja": "校正済み USB マイクでリスニングルームの特性を測定（スイープ、インパルス応答、RT60）",
+    "ko": "보정된 USB 마이크로 청취실 응답 측정(스윕, 임펄스 응답, RT60)",
+    "ro": "Măsurarea răspunsului camerei de audiție cu un microfon USB calibrat (baleiaj, răspuns la impuls, RT60)",
+    "sv": "Mät lyssningsrummets respons med en kalibrerad USB-mikrofon (svep, impulssvar, RT60)",
+    "hu": "A hallgatószoba válaszának mérése kalibrált USB-mikrofonnal (söprés, impulzusválasz, RT60)",
+    "vi": "Đo đáp tuyến của phòng nghe bằng micro USB đã hiệu chuẩn (quét tần, đáp ứng xung, RT60)",
+    "nb": "Mål lytterommets respons med en kalibrert USB-mikrofon (sveip, impulsrespons, RT60)",
+    "pl": "Zmierz odpowiedź pokoju odsłuchowego skalibrowanym mikrofonem USB (przemiatanie, odpowiedź impulsowa, RT60)",
+    "el": "Μέτρηση της απόκρισης του χώρου ακρόασης με βαθμονομημένο μικρόφωνο USB (σάρωση, κρουστική απόκριση, RT60)"
+  },
   "plugin.description.pont-roon": {
     "fr": "Pont Roon (Premium) : crédits, images d'artistes et pochettes récoltés sur un Core Roon",
     "en": "Roon bridge (Premium): credits, artist images and covers gathered from a Roon Core",
