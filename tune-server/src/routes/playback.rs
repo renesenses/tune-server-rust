@@ -720,6 +720,54 @@ pub(crate) fn file_pour_un_titre_de_service(
     }
 }
 
+/// #6465 — la demande relance-t-elle un titre DÉJÀ dans la file, sans rien
+/// désigner d'autre ?
+///
+/// C'est la forme qu'envoie la barre de transport quand la zone est arrêtée
+/// (`playback-controls.ts`) : `{track_id}` pour une piste de la bibliothèque,
+/// `{source, source_id}` pour un titre de service. La file est alors gardée
+/// (#4298 pour la bibliothèque, #2569 pour un service) : c'est une reprise
+/// après Stop, pas un nouveau geste. Le contexte de session doit être gardé
+/// avec elle, sinon le titre en cours et toute la suite de l'album ou de la
+/// playlist s'inscrivent dans l'Historique comme des titres isolés.
+///
+/// Mêmes décisions que plus bas dans `play` : `demande_nue` puis
+/// `file_conservee` pour la bibliothèque, [`file_pour_un_titre_de_service`]
+/// pour un service. Une base illisible rend `false` : dans le doute, le
+/// contexte suit la règle d'avant (ce geste remplace le précédent).
+fn relance_dans_la_file(
+    body: &PlayRequest,
+    lecture: Result<&[tune_core::db::play_queue_repo::QueueEntry], &str>,
+) -> bool {
+    let sans_contenant = body.context_type.is_none()
+        && body.album_id.is_none()
+        && body.artist_id.is_none()
+        && body.folder.is_none()
+        && body.playlist_id.is_none()
+        && body.track_ids.is_none()
+        && body.start_index.is_none()
+        && body.streaming_album_id.is_none()
+        && body.streaming_playlist_id.is_none()
+        && !body.queue_follows;
+    if !sans_contenant {
+        return false;
+    }
+    match (
+        body.track_id,
+        body.source.as_deref(),
+        body.source_id.as_deref(),
+    ) {
+        (Some(track_id), _, _) => lecture
+            .map(|entries| entries.iter().any(|e| e.track_id == Some(track_id)))
+            .unwrap_or(false),
+        (None, Some(source), Some(source_id)) => matches!(
+            file_pour_un_titre_de_service(lecture, Some(source), source_id, false),
+            FileDejaChargee::Garder { .. }
+        ),
+        _ => false,
+    }
+}
+
 /// Whether the server would accept the manual "next" action as an actual
 /// advance instead of stopping the zone at the end of the queue.
 ///
@@ -2615,28 +2663,42 @@ async fn play(
     //
     // Le corps VIDE (retour au-dessus) ne passe pas ici : une reprise apres
     // Stop n'est pas un nouveau geste, elle garde le contexte en cours.
-    let (contexte_type, contexte_id, contexte_service) = contexte_de_lecture(&body);
-    let (contexte_titre, contexte_pochette) = nom_du_contexte(
-        &state,
-        contexte_type.as_deref(),
-        contexte_id.as_deref(),
-        contexte_service.as_deref(),
-    )
-    .await;
-    state
-        .playback
-        .set_session_context(
-            zone_id,
-            contexte_type,
-            contexte_id,
-            contexte_service,
-            contexte_titre,
-            contexte_pochette,
-        )
-        .await;
-
+    //
+    // #6465 — la relance d'un titre deja dans la file non plus : la barre de
+    // transport envoie `{track_id}` ou `{source, source_id}`, pas un corps
+    // vide, et la file est gardee plus bas. Voir `relance_dans_la_file`.
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
+    let relance = relance_dans_la_file(
+        &body,
+        queue_repo
+            .get_ordered(zone_id)
+            .as_deref()
+            .map_err(String::as_str),
+    );
+    if relance {
+        info!(zone_id, "relance_dans_la_file_contexte_garde_6465");
+    } else {
+        let (contexte_type, contexte_id, contexte_service) = contexte_de_lecture(&body);
+        let (contexte_titre, contexte_pochette) = nom_du_contexte(
+            &state,
+            contexte_type.as_deref(),
+            contexte_id.as_deref(),
+            contexte_service.as_deref(),
+        )
+        .await;
+        state
+            .playback
+            .set_session_context(
+                zone_id,
+                contexte_type,
+                contexte_id,
+                contexte_service,
+                contexte_titre,
+                contexte_pochette,
+            )
+            .await;
+    }
 
     // #5372 — un titre de service lancé SEUL (recherche, tuile, historique) :
     // s'il n'est pas déjà dans la file, jouer son ALBUM à partir de lui, comme
