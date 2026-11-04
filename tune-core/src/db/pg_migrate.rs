@@ -442,7 +442,8 @@ CREATE TABLE IF NOT EXISTS track_credits (
     role TEXT DEFAULT 'performer',
     instrument TEXT,
     position TEXT DEFAULT 0,
-    artist_mbid TEXT
+    artist_mbid TEXT,
+    source TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_metadata (
@@ -1254,6 +1255,11 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_type TEXT;
 -- crédité par son MBID, et le curseur de reprise de la passe.
 ALTER TABLE track_credits ADD COLUMN IF NOT EXISTS artist_mbid TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS credits_mb_at TEXT;
+
+-- Source d'un crédit de piste (SQLite migration v136, #7765) : manuel,
+-- musicbrainz, balises, discogs ou roon ; NUL = ligne ancienne. Tous les
+-- écrivains de crédits et les passes « à faire » NOMMENT cette colonne.
+ALTER TABLE track_credits ADD COLUMN IF NOT EXISTS source TEXT;
 
 -- Source de la pochette d'album (SQLite migration v111, #5034). Sans défaut :
 -- NUL = inconnue, l'état de toute ligne d'avant la migration.
