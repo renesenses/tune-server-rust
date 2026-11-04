@@ -17,6 +17,9 @@ use crate::outputs::traits::{
     OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState,
 };
 
+pub mod composant_manquant_7084;
+mod session_en_panne_7823;
+
 const DAEMON_BINARY: &str = "airplay-daemon";
 const TRANSPORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -41,6 +44,10 @@ pub struct Airplay2Output {
     /// Copie locale du flux en cours de lecture, que le daemon lit (#2169).
     /// Retiree a la piste suivante et a l'arret.
     copie_du_flux: Arc<Mutex<Option<PathBuf>>>,
+    /// Cause de la panne de session (setup échoué, délai dépassé) : tant
+    /// qu'elle est posée, pause et reprise sont refusées sans rien écrire au
+    /// daemon. Effacée par `play_media` et `stop` (#7823).
+    panne: Arc<Mutex<Option<String>>>,
 }
 
 /// Pairing progress for an AirPlay 2 receiver, updated by the daemon stdout
@@ -114,6 +121,7 @@ impl Airplay2Output {
             transport_command: Mutex::new(()),
             pending_transport: Arc::new(Mutex::new(None)),
             copie_du_flux: Arc::new(Mutex::new(None)),
+            panne: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -127,6 +135,7 @@ impl Airplay2Output {
         let device_name = self.name.clone();
         let pairing = self.pairing.clone();
         let pending_transport = self.pending_transport.clone();
+        let panne = self.panne.clone();
 
         tokio::spawn(async move {
             let mut line = String::new();
@@ -159,12 +168,14 @@ impl Airplay2Output {
                                 None
                             }
                             "playing" => {
+                                *panne.lock().await = None;
                                 playing.store(true, Ordering::SeqCst);
                                 paused.store(false, Ordering::SeqCst);
                                 debug!(device = %device_name, "airplay2: playing");
                                 Some(TransportConfirmation::Playing)
                             }
                             "paused" => {
+                                *panne.lock().await = None;
                                 playing.store(true, Ordering::SeqCst);
                                 paused.store(true, Ordering::SeqCst);
                                 debug!(device = %device_name, "airplay2: paused");
@@ -184,6 +195,13 @@ impl Airplay2Output {
                             }
                             "error" => {
                                 let msg = ev["message"].as_str().unwrap_or("unknown").to_string();
+                                // #7823 — un `play` sans session : rien ne joue,
+                                // et les commandes suivantes ne doivent plus partir.
+                                if session_en_panne_7823::casse_la_session(&msg) {
+                                    playing.store(false, Ordering::SeqCst);
+                                    paused.store(false, Ordering::SeqCst);
+                                    *panne.lock().await = Some(msg.clone());
+                                }
                                 let pending = pending_transport.lock().await.take();
                                 if let Some(pending) = pending {
                                     let _ = pending.response.send(Err(msg.clone()));
@@ -242,7 +260,16 @@ impl Airplay2Output {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| format!("airplay-daemon spawn failed: {e}"))?;
+            .map_err(|e| {
+                // #7084 — fichier introuvable : le composant a disparu
+                // (antivirus), pas une panne obscure du lancement.
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    composant_manquant_7084::signaler(&self.device_id);
+                    return composant_manquant_7084::message_composant_manquant();
+                }
+                format!("airplay-daemon spawn failed: {e}")
+            })?;
+        composant_manquant_7084::retablir(&self.device_id);
 
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
@@ -351,12 +378,31 @@ impl Airplay2Output {
         }
     }
 
+    /// #7084 — le démon ne dit sa position qu'en réponse à `status` ; sans
+    /// cette demande, la position publiée restait à 0 et l'écran se recalait
+    /// en boucle entre 0 et 2 s. La réponse arrive par le lecteur
+    /// d'événements, qui met `position_ms` à jour : on n'attend rien ici, et
+    /// on ne prend ni le verrou de transport ni un démon occupé à démarrer.
+    async fn demander_la_position(&self) {
+        let Ok(mut proc) = self.process.try_lock() else {
+            return;
+        };
+        if let Some(daemon) = proc.as_mut()
+            && let Err(error) = daemon.send_cmd(&serde_json::json!({"cmd": "status"})).await
+        {
+            debug!(device = %self.name, error = %error, "airplay2: status request failed");
+        }
+    }
+
     async fn send_transport_command(
         &self,
         command: &'static str,
         expected: TransportConfirmation,
     ) -> Result<(), String> {
         let _command_guard = self.transport_command.lock().await;
+        if let Some(cause) = self.panne.lock().await.clone() {
+            return Err(self.recepteur_muet(&cause));
+        }
         let (response, receiver) = oneshot::channel();
         *self.pending_transport.lock().await = Some(PendingTransport { expected, response });
 
@@ -366,16 +412,26 @@ impl Airplay2Output {
         }
 
         match tokio::time::timeout(TRANSPORT_COMMAND_TIMEOUT, receiver).await {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => result.map_err(|cause| {
+                if session_en_panne_7823::casse_la_session(&cause) {
+                    self.recepteur_muet(&cause)
+                } else {
+                    cause
+                }
+            }),
             Ok(Err(_)) => Err(format!(
                 "airplay2: daemon response channel closed after {command}"
             )),
             Err(_) => {
                 self.pending_transport.lock().await.take();
-                Err(format!(
-                    "airplay2: daemon did not confirm {command} within {} ms",
+                // Le daemon traite ses commandes une à une : celle-ci reste
+                // dans sa file. Lui en écrire d'autres les empilerait (#7823).
+                let cause = format!(
+                    "daemon did not confirm {command} within {} ms",
                     TRANSPORT_COMMAND_TIMEOUT.as_millis()
-                ))
+                );
+                *self.panne.lock().await = Some(cause.clone());
+                Err(self.recepteur_muet(&cause))
             }
         }
     }
@@ -464,6 +520,7 @@ impl OutputTarget for Airplay2Output {
         // c'est ce fichier que le daemon ouvre : le traitement serveur de
         // #1216 est conserve, puisque c'est bien le flux servi qui est copie.
         let path = lisible.chemin.to_string_lossy().into_owned();
+        *self.panne.lock().await = None;
         if let Err(error) = self
             .send(&serde_json::json!({
                 "cmd": "play",
@@ -505,6 +562,7 @@ impl OutputTarget for Airplay2Output {
     async fn stop(&self) -> Result<(), String> {
         self.playing.store(false, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
+        *self.panne.lock().await = None;
         self.send(&serde_json::json!({"cmd": "stop"})).await.ok();
         self.send(&serde_json::json!({"cmd": "disconnect"}))
             .await
@@ -566,6 +624,10 @@ impl OutputTarget for Airplay2Output {
         } else {
             TransportState::Stopped
         };
+
+        if state == TransportState::Playing {
+            self.demander_la_position().await;
+        }
 
         Ok(OutputStatus {
             state,
@@ -935,6 +997,14 @@ mod transport_tests {
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
                 let name = command["cmd"].as_str().unwrap().to_string();
+                // #7084 — le relevé de position de `get_status` n'est pas une
+                // commande de transport : le vrai démon y répond `status`.
+                if name == "status" {
+                    let event = serde_json::json!({"event": "status", "position_s": 0.0});
+                    let line = format!("{}\n", serde_json::to_string(&event).unwrap());
+                    daemon_stdout.write_all(line.as_bytes()).await.unwrap();
+                    continue;
+                }
                 recorded.lock().await.push(name.clone());
 
                 let event = match name.as_str() {
@@ -1226,6 +1296,9 @@ mod transport_tests {
         assert_eq!(*commands.lock().await, vec!["play", "pause", "resume"]);
     }
 }
+
+#[cfg(test)]
+mod position_relevee_tests_7084;
 
 #[cfg(test)]
 mod daemon_path_tests {
