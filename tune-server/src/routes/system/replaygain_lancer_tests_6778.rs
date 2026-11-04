@@ -15,11 +15,15 @@ use serde_json::Value;
 use tower::ServiceExt;
 use tune_core::db::settings_repo::SettingsRepo;
 
+/// La campagne et le rang au travail sont globaux au processus : les témoins
+/// montés de ce fichier les prennent tour à tour.
+static ETAT_GLOBAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn etat() -> EtatDuLancement {
     EtatDuLancement {
         armee: true,
         en_pause: false,
-        campagne_ouverte: false,
+        au_travail: false,
         candidates: 12,
         zone_qui_joue: None,
     }
@@ -73,7 +77,7 @@ fn les_refus_et_le_rien_a_faire_ne_reveillent_rien_6778() {
         ),
         (
             EtatDuLancement {
-                campagne_ouverte: true,
+                au_travail: true,
                 ..etat()
             },
             StatusCode::CONFLICT,
@@ -122,6 +126,7 @@ async fn lancer(state: &AppState) -> (StatusCode, Value) {
 #[tokio::test]
 async fn la_route_montee_lance_la_passe_et_reveille_la_boucle_6778() {
     use tune_core::audio::replaygain as rg;
+    let _garde = ETAT_GLOBAL.lock().await;
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
 
     // Installation neuve : `replaygain_mode` absent vaut « off ».
@@ -166,4 +171,73 @@ async fn la_route_montee_lance_la_passe_et_reveille_la_boucle_6778() {
         rg::reessai::nombre_de_reveils() > avant,
         "#6778 : « Lancer » a répondu 202 sans réveiller la boucle de fond"
     );
+}
+
+async fn progression(state: &AppState) -> Value {
+    let response = crate::routes::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/replaygain/progress")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&body).unwrap_or(Value::Null)
+}
+
+/// #7724 (testeur Premium, Windows, ~600 000 pistes) — la carte disait « au
+/// repos » (`working:false`) et « Lancer » répondait « tourne déjà » (409
+/// `already_running`) : la route lisait la campagne ouverte, qui le reste
+/// quand la passe cède à la lecture, à la garde thermique ou à la plage
+/// dynamique « En premier ». Ici : campagne ouverte, personne au travail,
+/// plus aucune candidate.
+#[tokio::test]
+async fn une_campagne_ouverte_sans_personne_au_travail_n_est_pas_en_cours_7724() {
+    use tune_core::audio::replaygain as rg;
+    use tune_core::taches_de_fond::ordre::{Rang, noter_rang_au_travail};
+    let _garde = ETAT_GLOBAL.lock().await;
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    SettingsRepo::with_backend(state.backend.clone())
+        .set(rg::MODE_KEY, "track")
+        .unwrap();
+    if tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::ReplayGain) {
+        eprintln!("#7724 : pause tenue par un autre banc, témoin sauté");
+        return;
+    }
+    rg::progression::reinitialiser_pour_les_essais();
+    // Une passe interrompue : campagne ouverte sur 3 pistes, puis la boucle a
+    // cédé (lecture, chaleur, autre rang) sans la refermer.
+    rg::progression::ouvrir_si_besoin(|| 3);
+    noter_rang_au_travail(None);
+    assert_eq!(rg::compter_les_candidats_replaygain(&state.backend), 0);
+
+    let avant = progression(&state).await;
+    assert_eq!(avant["working"], false, "{avant}");
+
+    let (s, c) = lancer(&state).await;
+    let apres = progression(&state).await;
+    rg::progression::reinitialiser_pour_les_essais();
+    assert_ne!(
+        c["status"], "already_running",
+        "#7724 : « Lancer » répond « tourne déjà » alors que la carte publie \
+         working:false — {s} {c}"
+    );
+    assert_eq!(s, StatusCode::OK, "{c}");
+    assert_eq!(c["status"], "nothing_to_do", "{c}");
+    assert_eq!(
+        apres["active"], false,
+        "#7724 : plus rien à mesurer, la campagne doit être refermée — {apres}"
+    );
+    assert_eq!(apres["working"], false, "{apres}");
+
+    // Le refus demeure quand la passe décode vraiment.
+    rg::progression::ouvrir_si_besoin(|| 3);
+    noter_rang_au_travail(Some(Rang::ReplayGain));
+    let (s, c) = lancer(&state).await;
+    noter_rang_au_travail(None);
+    rg::progression::reinitialiser_pour_les_essais();
+    assert_eq!(s, StatusCode::CONFLICT, "{c}");
+    assert_eq!(c["status"], "already_running", "{c}");
 }
