@@ -5,6 +5,9 @@
 //! - `POST /library/integrity?changed_only=true` : seuls les fichiers changés
 //!   depuis l'audit précédent (chemin, taille ou date de modification) sont
 //!   relus ; les autres reprennent son résultat, sans être décodés.
+//! - `POST /library/integrity?mode=quick` : mode rapide (#7847), sommes de
+//!   contrôle des trames FLAC et des pages Ogg sans décoder ; `mode=full`
+//!   (par défaut) décode tout et vérifie le MD5.
 //! - Rappel périodique : `library_integrity_reminder_days`, éteint par défaut
 //!   (voir `tune_core::audio::audit_integrite::rappel`).
 use crate::state::AppState;
@@ -25,7 +28,7 @@ use std::{
 };
 use tune_core::{
     audio::audit_integrite::{
-        self, Resultat, Verdict,
+        self, Mode, Resultat, Verdict,
         rappel::{self, Rappel},
     },
     db::{
@@ -78,6 +81,9 @@ pub(super) struct Etat {
     /// rappel périodique part de là.
     #[serde(default)]
     dernier_audit_termine: Option<String>,
+    /// Complet (décodage et MD5) ou rapide (sommes du conteneur, #7847).
+    #[serde(default)]
+    mode: Mode,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Ligne {
@@ -93,6 +99,10 @@ struct Ligne {
     /// La génération de l'audit qui a réellement décodé le fichier.
     #[serde(default)]
     verifie_par: Option<String>,
+    /// Le mode de l'audit qui a lu le fichier ; complet pour les lignes
+    /// d'avant #7847.
+    #[serde(default)]
+    mode: Mode,
 }
 
 /// L'état publié par `GET` et `POST /library/integrity` : l'état persistant
@@ -219,6 +229,10 @@ pub(super) struct Lancement {
     /// Ne relire que les fichiers changés depuis l'audit précédent.
     #[serde(default)]
     changed_only: bool,
+    /// `full` (par défaut) ou `quick`. Une reprise garde le mode de l'audit
+    /// repris.
+    #[serde(default)]
+    mode: Mode,
 }
 
 /// Prépare l'état d'un lancement : reprise de l'audit en cours, ou nouvel
@@ -242,6 +256,7 @@ fn preparer(db: &Arc<dyn DbBackend>, options: &Lancement) -> Result<Etat, String
             dernier_id: ligne[1].as_i64().unwrap_or(0),
             modifies_seulement: options.changed_only,
             reference,
+            mode: options.mode,
             debut: Some(chrono::Utc::now().to_rfc3339()),
             dernier_audit_termine: etat.dernier_audit_termine.take(),
             ..Default::default()
@@ -366,7 +381,8 @@ fn date_secondes(meta: &std::fs::Metadata) -> Option<f64> {
 /// ce fichier, s'il est INCHANGÉ depuis — même chemin, même taille, même date
 /// de modification. Un fichier absent, nouveau, modifié pendant l'audit de
 /// référence, ou dont le résultat ne porte pas de date (audit d'avant cette
-/// option) est relu.
+/// option) est relu. Un audit complet ne reprend jamais un résultat du mode
+/// rapide, qui n'a pas vérifié le MD5 ; un audit rapide reprend les deux.
 fn resultat_reutilisable(
     db: &Arc<dyn DbBackend>,
     etat: &Etat,
@@ -391,7 +407,8 @@ fn resultat_reutilisable(
             .date
             .zip(date_secondes(meta))
             .is_some_and(|(a, b)| (a - b).abs() < 0.001)
-        && avant.resultat.code != "modifie_pendant_audit";
+        && avant.resultat.code != "modifie_pendant_audit"
+        && !(etat.mode == Mode::Complet && avant.mode == Mode::Rapide);
     // `chemin` et `taille` repris de la référence : égaux aux valeurs du
     // disque, puisque `inchange` l'exige.
     Ok(inchange.then(|| Ligne {
@@ -449,7 +466,8 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
                 )?;
                 continue;
             }
-            let Some(mut resultat) = audit_integrite::verifier(Path::new(&chemin), continuer)
+            let Some(mut resultat) =
+                audit_integrite::verifier_selon(etat.mode, Path::new(&chemin), continuer)
             else {
                 etat.status = "paused".into();
                 return sauver(db, etat, None);
@@ -465,6 +483,9 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
                     erreur: None,
                     position_trames: None,
                     trames_decodees: resultat.trames_decodees,
+                    localisation: None,
+                    fautes: None,
+                    unites_controlees: resultat.unites_controlees,
                 };
             }
             enregistrer(
@@ -478,6 +499,7 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
                     resultat,
                     date: avant.as_ref().and_then(date_secondes),
                     verifie_par: Some(etat.generation.clone()),
+                    mode: etat.mode,
                 },
                 false,
             )?;
@@ -578,6 +600,9 @@ fn cellule(s: &str) -> String {
     };
     format!("\"{prefixe}{}\"", s.replace('"', "\"\""))
 }
+fn texte(n: Option<u64>) -> String {
+    n.map(|n| n.to_string()).unwrap_or_default()
+}
 fn ligne_csv(l: &Ligne) -> String {
     [
         l.chemin.clone(),
@@ -595,6 +620,23 @@ fn ligne_csv(l: &Ligne) -> String {
             .unwrap_or_default(),
         l.resultat.trames_decodees.to_string(),
         l.taille_sans_nouvelle_date.to_string(),
+        match l.mode {
+            Mode::Complet => "complet",
+            Mode::Rapide => "rapide",
+        }
+        .into(),
+        l.resultat
+            .localisation
+            .as_ref()
+            .map(|p| match p.unite {
+                audit_integrite::Unite::Trame => "trame",
+                audit_integrite::Unite::Page => "page",
+            })
+            .unwrap_or_default()
+            .into(),
+        texte(l.resultat.localisation.as_ref().map(|p| p.numero)),
+        texte(l.resultat.localisation.as_ref().map(|p| p.octet)),
+        texte(l.resultat.fautes),
     ]
     .iter()
     .map(|s| cellule(s))
@@ -605,7 +647,7 @@ fn ligne_csv(l: &Ligne) -> String {
 pub(super) async fn csv(State(state): State<AppState>) -> Response {
     match bloquant(move || {
         let etat = lire(&state.backend)?;
-        let mut csv = String::from("\u{feff}chemin,état,code,erreur,position_trames,trames_décodées,taille_sans_nouvelle_date\r\n");
+        let mut csv = String::from("\u{feff}chemin,état,code,erreur,position_trames,trames_décodées,taille_sans_nouvelle_date,mode,unité_fautive,numéro,octet,fautes\r\n");
         let mut offset = 0;
         loop { let rows = lignes(&state.backend, &etat, offset, 1000, None)?; if rows.is_empty() { break; } offset += rows.len() as u64; for l in rows { csv.push_str(&ligne_csv(&l)); } }
         Ok(csv)
@@ -642,6 +684,7 @@ mod tests {
             resultat: Resultat::defaut("decodage", "tronqué", Some(4096), 4096),
             date: None,
             verifie_par: None,
+            mode: Mode::Complet,
         };
         sauver(&db, &etat, Some(&ligne)).unwrap();
         let relu = lire(&db).unwrap();
@@ -689,6 +732,7 @@ mod tests {
             resultat: Resultat::defaut("illisible", "absent", None, 0),
             date: None,
             verifie_par: None,
+            mode: Mode::Complet,
         };
         assert!(enregistrer(&db, &mut etat, &ligne, false).is_err());
         assert_eq!(
