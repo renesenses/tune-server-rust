@@ -12,6 +12,9 @@ use tune_core::updater::{ReleaseAsset, ReleaseInfo, UpdateChannel, UpdateChecker
 
 use crate::state::AppState;
 
+#[path = "installation_sure_7756.rs"]
+mod installation_sure;
+
 use super::paquet_macos::{self, VoieMiseAJour};
 
 /// An in-progress library scan older than this is treated as stale (a scan
@@ -3016,6 +3019,27 @@ pub(super) async fn update_install(
             }
 
             let is_zip = asset.name.to_lowercase().ends_with(".zip");
+            // #7756 — sous Unix, la taille du binaire annoncée par l'archive
+            // (comparée au `.new` écrit) et la place vérifiée AVANT d'extraire.
+            let mut taille_annoncee = None;
+            if !cfg!(windows) {
+                match installation_sure::contenu_de_l_archive(&archive_bytes, is_zip, "tune-server")
+                    .and_then(|contenu| {
+                        installation_sure::verifier_la_place(
+                            &tmp_dir,
+                            contenu.totale + installation_sure::MARGE_DE_PLACE,
+                            installation_sure::place_libre,
+                        )?;
+                        Ok(contenu.binaire)
+                    }) {
+                    Ok(taille) => taille_annoncee = taille,
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&tmp_dir);
+                        set_phase(&format!("failed: {e}"));
+                        return;
+                    }
+                }
+            }
             if let Err(e) = extract_archive(&archive_bytes, &tmp_dir, is_zip) {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 set_phase(&format!("failed: Extraction failed: {e}"));
@@ -3102,6 +3126,7 @@ pub(super) async fn update_install(
                         &std::env::current_exe,
                         &new_binary,
                         &tmp_dir,
+                        &installation_sure::Controles::de_cette_machine(taille_annoncee),
                     )
                     .map(|relance| (relance, None))
                 }
@@ -3649,6 +3674,7 @@ fn installer_unix_et_designer_la_relance(
     lire_exe: &dyn Fn() -> std::io::Result<std::path::PathBuf>,
     new_binary: &std::path::Path,
     tmp_dir: &std::path::Path,
+    controles: &installation_sure::Controles,
 ) -> Result<std::path::PathBuf, String> {
     let exe_lu = lire_exe().map_err(|e| format!("Cannot determine current exe: {e}"))?;
     let binaire = crate::binaire_installe::chemin_d_installation(&exe_lu);
@@ -3658,7 +3684,7 @@ fn installer_unix_et_designer_la_relance(
         en_cours = %en_cours.display(),
         "update_install_starting"
     );
-    install_unix(&binaire, &en_cours, new_binary, tmp_dir)?;
+    install_unix(&binaire, &en_cours, new_binary, tmp_dir, controles)?;
     Ok(binaire)
 }
 
@@ -3669,11 +3695,16 @@ fn installer_unix_et_designer_la_relance(
 /// binaire qui tourne (processus relancé depuis `.old` par une version
 /// affectée), on n'y touche pas : ni suppression, ni renommage par-dessus.
 /// Le neuf remplace `binaire`, qui ne tourne pas, sans sauvegarde.
+///
+/// #7756 — rien ne touche à l'ancien binaire tant que le neuf n'est pas
+/// écrit sur le disque (`sync_all`) et validé ([`installation_sure`]) ; un
+/// échec après la mise de côté, `web/` compris, remet l'ancien en place.
 fn install_unix(
     binaire: &std::path::Path,
     en_cours: &std::path::Path,
     new_binary: &std::path::Path,
     tmp_dir: &std::path::Path,
+    controles: &installation_sure::Controles,
 ) -> Result<(), String> {
     let exe_dir = binaire
         .parent()
@@ -3688,8 +3719,22 @@ fn install_unix(
             .map_err(|e| format!("chmod: {e}"))?;
     }
 
+    // Place : le `.new` et la copie de `web/` s'écrivent à côté de l'ancien.
+    let taille_neuve = std::fs::metadata(new_binary)
+        .map_err(|e| format!("read new binary: {e}"))?
+        .len();
+    let besoin = taille_neuve
+        + installation_sure::taille_du_dossier(&tmp_dir.join("web"))
+        + installation_sure::MARGE_DE_PLACE;
+    installation_sure::verifier_la_place(exe_dir, besoin, controles.place_libre)?;
+
     let staging = binaire.with_extension("new");
-    std::fs::copy(new_binary, &staging).map_err(|e| format!("copy new binary: {e}"))?;
+    installation_sure::ecrire_durablement(new_binary, &staging)?;
+    if let Err(e) = installation_sure::valider_binaire(&staging, controles) {
+        std::fs::remove_file(&staging).ok();
+        error!(error = %e, "update_new_binary_rejected");
+        return Err(format!("{e} — previous binary kept"));
+    }
 
     let sauvegarde_en_cours = old_exe == en_cours;
     let sauvegarde_faite = if sauvegarde_en_cours || !binaire.exists() {
@@ -3703,19 +3748,43 @@ fn install_unix(
         if old_exe.exists() {
             std::fs::remove_file(&old_exe).ok();
         }
-        std::fs::rename(binaire, &old_exe).map_err(|e| format!("rename current to .old: {e}"))?;
+        if let Err(e) = std::fs::rename(binaire, &old_exe) {
+            std::fs::remove_file(&staging).ok();
+            return Err(format!("rename current to .old: {e}"));
+        }
         true
+    };
+
+    // Remet l'ancien sous le nom d'installation après un échec.
+    let restaurer = |cause: String| -> String {
+        if !sauvegarde_faite {
+            return cause;
+        }
+        let retour = std::fs::rename(&old_exe, binaire);
+        installation_sure::synchroniser_dossier(exe_dir);
+        match retour {
+            Ok(()) => format!("{cause} — previous binary restored"),
+            Err(e) => {
+                error!(error = %e, "update_rollback_failed");
+                format!(
+                    "{cause} — previous binary NOT restored ({e}), it is at {}",
+                    old_exe.display()
+                )
+            }
+        }
     };
 
     if let Err(e) = std::fs::rename(&staging, binaire) {
         error!(error = %e, "rename_new_to_current_failed, rolling back");
-        if sauvegarde_faite {
-            std::fs::rename(&old_exe, binaire).ok();
-        }
-        return Err(format!("rename .new to current: {e}"));
+        std::fs::remove_file(&staging).ok();
+        return Err(restaurer(format!("rename .new to current: {e}")));
     }
+    installation_sure::synchroniser_dossier(exe_dir);
 
-    update_web_dir(exe_dir, tmp_dir)?;
+    if let Err(e) = (controles.mettre_a_jour_web)(exe_dir, tmp_dir) {
+        error!(error = %e, "update_web_failed, rolling back binary");
+        return Err(restaurer(e));
+    }
 
     Ok(())
 }
@@ -7481,7 +7550,16 @@ mod relance_apres_installation_5461 {
     fn installer(p: &RefCell<Processus>, racine: &Path, version: &str) -> Result<PathBuf, String> {
         let (neuf, extraction) = archive(racine, version);
         let lire = || -> std::io::Result<PathBuf> { Ok(p.borrow().exe()) };
-        installer_unix_et_designer_la_relance(&lire, &neuf, &extraction)
+        // Des « binaires » texte : seuls la taille et le retour en arrière
+        // sont contrôlés ici (#7756 a ses propres témoins).
+        let controles = super::installation_sure::Controles {
+            taille_attendue: None,
+            place_libre: |_| Ok(u64::MAX),
+            architecture: None,
+            essai: |_| Ok(()),
+            mettre_a_jour_web: super::update_web_dir,
+        };
+        installer_unix_et_designer_la_relance(&lire, &neuf, &extraction, &controles)
     }
 
     /// La relance fait un `exec` : le processus exécute désormais ce fichier.
