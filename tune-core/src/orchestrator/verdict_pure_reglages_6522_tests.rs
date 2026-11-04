@@ -28,7 +28,11 @@ fn orchestrateur() -> PlaybackOrchestrator {
     db.init_schema().unwrap();
     crate::db::migrations::run_migrations(&db).unwrap();
     let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
-    PlaybackOrchestrator::new(
+    // #7632 — la convolution est un droit Premium, et un orchestrateur sans
+    // licence n'y a pas droit : ce banc, qui arme une RI, porte un compte
+    // Premium (rien d'autre n'y dépend de la licence).
+    let licence = crate::license::licence_premium_pour_test(db.clone());
+    let mut orch = PlaybackOrchestrator::new(
         db,
         Arc::new(crate::playback::PlaybackManager::new()),
         Arc::new(crate::http::streamer::AudioStreamer::new(0)),
@@ -39,7 +43,9 @@ fn orchestrateur() -> PlaybackOrchestrator {
             crate::outputs::registry::OutputRegistry::new(),
         )),
         None,
-    )
+    );
+    orch.license = Some(licence);
+    orch
 }
 
 /// Une zone locale sur `local:DAC`, sortie enregistrée, sans aucun réglage.

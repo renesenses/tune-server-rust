@@ -146,7 +146,8 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
             audio_backend,
         )
         .await;
-        let signal_path = crate::routes::zones::signal_path_sous_licence(
+        let signal_path = crate::routes::zones::signal_path_sous_licence_lang(
+            lang,
             &state.license,
             crate::routes::zones::build_signal_path_lang(
                 lang,

@@ -329,8 +329,11 @@ async fn sans_premium_la_correction_par_egaliseur_n_est_pas_annoncee_7632() {
     assert!(etape(&sp).is_some());
 }
 
+/// Sans Premium, la RI n'est plus convoluée (décision du 04/11/2026) :
+/// l'étape la dit réglée mais non appliquée, état `unlicensed` ; avec
+/// Premium, appliquée.
 #[test]
-fn sans_premium_la_ri_reste_dite_7632() {
+fn sans_premium_la_ri_est_dite_non_appliquee_7632() {
     let (backend, zone, ps) = zone_en_lecture();
     let ri = tune_core::test_scratch::scratch_file("ri-7632-licence", ".wav");
     ecrire_ri(ri.path(), FIL_HZ, 64);
@@ -339,7 +342,24 @@ fn sans_premium_la_ri_reste_dite_7632() {
         &format!("ir_path_{}", zone.id.unwrap()),
         &ri.as_str(),
     );
-    let sp = correction_de_piece_sous_licence(Some(chemin(&backend, &zone, &ps)), false).unwrap();
-    assert_eq!(sp["room_correction"]["kind"], "ir", "{sp}");
+    let sp = correction_de_piece_sous_licence_lang("fr", Some(chemin(&backend, &zone, &ps)), false)
+        .unwrap();
+    let rc = &sp["room_correction"];
+    assert_eq!(rc["kind"], "ir", "{sp}");
+    assert_eq!(rc["status"], "unlicensed", "{rc}");
+    assert_eq!(rc["applied"], false, "{rc}");
+    let e = etape(&sp).expect("l'étape doit DIRE la RI non appliquée");
+    assert_eq!(e["status"], "unlicensed", "{e}");
+    assert_eq!(e["bit_perfect"], true, "{e}");
+    assert!(
+        e["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Premium"),
+        "{e}"
+    );
+
+    let sp = correction_de_piece_sous_licence_lang("fr", Some(chemin(&backend, &zone, &ps)), true)
+        .unwrap();
     assert_eq!(sp["room_correction"]["status"], "applied", "{sp}");
 }
