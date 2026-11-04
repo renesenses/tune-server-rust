@@ -1757,6 +1757,9 @@ pub fn spawn_mdns_handler(
                                     dev.id.clone(),
                                     ap_dev_id,
                                 );
+                                tune_core::outputs::airplay2::composant_manquant_7084::retablir(
+                                    &dev.id,
+                                );
                                 info!(name = %dev.name, "airplay2_output_registered");
                                 (Some(Box::new(ap2)), "airplay2")
                             } else {
@@ -1783,6 +1786,19 @@ pub fn spawn_mdns_handler(
                                         .get("airplay_requires_pairing")
                                         .and_then(|v| v.as_bool())
                                         .unwrap_or(false);
+                                // #7084 — servie ici FAUTE de composant AirPlay 2
+                                // (antivirus) : la zone et la lecture le disent.
+                                let composant_manquant =
+                                    is_v2 && !tune_core::outputs::airplay2::daemon_available();
+                                if composant_manquant {
+                                    tune_core::outputs::airplay2::composant_manquant_7084::signaler(
+                                        &dev.id,
+                                    );
+                                } else {
+                                    tune_core::outputs::airplay2::composant_manquant_7084::retablir(
+                                        &dev.id,
+                                    );
+                                }
                                 if appairage_requis {
                                     warn!(
                                         name = %dev.name,
@@ -1797,7 +1813,8 @@ pub fn spawn_mdns_handler(
                                     dev.host.clone(),
                                     dev.port,
                                 )
-                                .avec_appairage_airplay2_requis(appairage_requis);
+                                .avec_appairage_airplay2_requis(appairage_requis)
+                                .avec_composant_airplay2_manquant(composant_manquant);
                                 (Some(Box::new(ap)), "airplay")
                             }
                         }
