@@ -1986,6 +1986,9 @@ mod dsp;
 mod volume_coalescent;
 #[cfg(test)]
 mod volume_coalescent_5662_tests;
+// #7633 — le volume OpenHome n'attend plus le relevé du sondeur.
+#[cfg(test)]
+mod volume_openhome_sans_attendre_7633_tests;
 pub use dsp::PorteeDuReglage;
 // #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
 #[cfg(test)]

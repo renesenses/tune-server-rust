@@ -3034,7 +3034,15 @@ impl PlaybackOrchestrator {
                 .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
             return Ok(retenu_final);
         };
-        let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+        // #7633 — un renderer OpenHome reçoit son volume sans le verrou de
+        // la sortie : le sondeur le tient pendant ses relevés SOAP (jusqu'à
+        // cinq à la suite sans évènements), et la consigne partait des
+        // secondes après le geste.
+        let (output, envoi_direct) = {
+            let registre = self.outputs.lock().await;
+            (registre.get(did), registre.envoi_de_volume(did))
+        };
+        let output = output.ok_or_else(|| {
             OutputCommandError::failed(
                 OutputCommand::SetVolume,
                 format!("output {did} is not registered"),
@@ -3046,7 +3054,9 @@ impl PlaybackOrchestrator {
         // Capacité absente : refus AVANT toute mutation, comme avant. Si une
         // commande de volume est déjà en vol sur cette file, elle a passé ce
         // contrôle : ne pas attendre le verrou de la sortie qu'elle tient.
-        if !file.etat.lock().await.en_vol {
+        // Un envoi direct OpenHome n'existe que si le renderer publie son
+        // service Volume : la capacité est acquise.
+        if envoi_direct.is_none() && !file.etat.lock().await.en_vol {
             output
                 .lock()
                 .await
@@ -3077,22 +3087,22 @@ impl PlaybackOrchestrator {
             );
             return Ok(retenu_final);
         }
-        let sortie = output.lock().await;
-        let device_volume = if pure_force {
-            1.0
-        } else {
+        let consigne_appareil = |output_type: &str| {
+            if pure_force {
+                return 1.0;
+            }
             // #6739 — la nature du volume de la sortie décide du trim : sur
             // une sortie à volume matériel (DLNA, OpenHome, AirPlay…), un trim
             // POSITIF n'augmente jamais la consigne envoyée. Lue ici, à notre
-            // tour, sous le verrou que prend de toute façon l'envoi.
+            // tour.
             let trim_db = gain_trim_db_enregistre(&self.db, zone_id);
-            let volume_materiel = !sortie_a_volume_logiciel(sortie.output_type());
+            let volume_materiel = !sortie_a_volume_logiciel(output_type);
             if volume_materiel && trim_db > 0.0 {
                 warn!(
                     zone_id,
                     trim_db,
                     volume,
-                    output_type = sortie.output_type(),
+                    output_type,
                     device_id = did,
                     "trim_positif_ignore_volume_materiel"
                 );
@@ -3100,16 +3110,35 @@ impl PlaybackOrchestrator {
             // Un trim positif ne fait pas passer la limite de sécurité.
             limites.borner_appareil(volume_appareil_avec_trim(volume, trim_db, volume_materiel))
         };
-        info!(
-            zone_id,
-            volume,
-            device_volume,
-            pure_force,
-            device_id = did,
-            "device_set_volume_sending"
-        );
-        let resultat = sortie.checked_set_volume(device_volume).await;
-        drop(sortie);
+        let resultat = match envoi_direct {
+            Some(envoi) => {
+                let device_volume = consigne_appareil("openhome");
+                info!(
+                    zone_id,
+                    volume,
+                    device_volume,
+                    pure_force,
+                    device_id = did,
+                    "device_set_volume_sending"
+                );
+                envoi.set_volume(device_volume).await.map_err(|message| {
+                    OutputCommandError::failed(OutputCommand::SetVolume, message)
+                })
+            }
+            None => {
+                let sortie = output.lock().await;
+                let device_volume = consigne_appareil(sortie.output_type());
+                info!(
+                    zone_id,
+                    volume,
+                    device_volume,
+                    pure_force,
+                    device_id = did,
+                    "device_set_volume_sending"
+                );
+                sortie.checked_set_volume(device_volume).await
+            }
+        };
         let issue = {
             let mut etat = file.etat.lock().await;
             etat.en_vol = false;
