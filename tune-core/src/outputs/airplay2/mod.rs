@@ -17,6 +17,8 @@ use crate::outputs::traits::{
     OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState,
 };
 
+pub mod composant_manquant_7084;
+
 const DAEMON_BINARY: &str = "airplay-daemon";
 const TRANSPORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -242,7 +244,16 @@ impl Airplay2Output {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| format!("airplay-daemon spawn failed: {e}"))?;
+            .map_err(|e| {
+                // #7084 — fichier introuvable : le composant a disparu
+                // (antivirus), pas une panne obscure du lancement.
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    composant_manquant_7084::signaler(&self.device_id);
+                    return composant_manquant_7084::message_composant_manquant();
+                }
+                format!("airplay-daemon spawn failed: {e}")
+            })?;
+        composant_manquant_7084::retablir(&self.device_id);
 
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
@@ -348,6 +359,22 @@ impl Airplay2Output {
             daemon.send_cmd(cmd).await
         } else {
             Err("daemon not running".into())
+        }
+    }
+
+    /// #7084 — le démon ne dit sa position qu'en réponse à `status` ; sans
+    /// cette demande, la position publiée restait à 0 et l'écran se recalait
+    /// en boucle entre 0 et 2 s. La réponse arrive par le lecteur
+    /// d'événements, qui met `position_ms` à jour : on n'attend rien ici, et
+    /// on ne prend ni le verrou de transport ni un démon occupé à démarrer.
+    async fn demander_la_position(&self) {
+        let Ok(mut proc) = self.process.try_lock() else {
+            return;
+        };
+        if let Some(daemon) = proc.as_mut()
+            && let Err(error) = daemon.send_cmd(&serde_json::json!({"cmd": "status"})).await
+        {
+            debug!(device = %self.name, error = %error, "airplay2: status request failed");
         }
     }
 
@@ -566,6 +593,10 @@ impl OutputTarget for Airplay2Output {
         } else {
             TransportState::Stopped
         };
+
+        if state == TransportState::Playing {
+            self.demander_la_position().await;
+        }
 
         Ok(OutputStatus {
             state,
@@ -935,6 +966,14 @@ mod transport_tests {
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
                 let name = command["cmd"].as_str().unwrap().to_string();
+                // #7084 — le relevé de position de `get_status` n'est pas une
+                // commande de transport : le vrai démon y répond `status`.
+                if name == "status" {
+                    let event = serde_json::json!({"event": "status", "position_s": 0.0});
+                    let line = format!("{}\n", serde_json::to_string(&event).unwrap());
+                    daemon_stdout.write_all(line.as_bytes()).await.unwrap();
+                    continue;
+                }
                 recorded.lock().await.push(name.clone());
 
                 let event = match name.as_str() {
@@ -1226,6 +1265,9 @@ mod transport_tests {
         assert_eq!(*commands.lock().await, vec!["play", "pause", "resume"]);
     }
 }
+
+#[cfg(test)]
+mod position_relevee_tests_7084;
 
 #[cfg(test)]
 mod daemon_path_tests {
