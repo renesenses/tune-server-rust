@@ -1020,6 +1020,28 @@ pub struct CorpsFluxPrefere {
     pub stream_url: String,
 }
 
+/// #7587 — le corps de l'écoute en un clic : le flux y est FACULTATIF. `{}`,
+/// `null`, un corps absent ou un `stream_url` vide laissent le choix au
+/// serveur, comme avant #7587.
+#[derive(Debug, Default, Deserialize)]
+pub struct CorpsEcoute {
+    #[serde(default)]
+    pub stream_url: Option<String>,
+}
+
+/// Le flux publié de `fiche` dont l'adresse est `url`, à la normalisation
+/// près ; `None` : ce flux n'est pas de la fiche (#7177, #7587).
+fn flux_publie_par_la_fiche(
+    fiche: &StationAnnuaire,
+    url: &str,
+) -> Option<super::radios::FluxAnnuaire> {
+    let voulu = flux_normalise(url);
+    fiche
+        .flux_proposes()
+        .into_iter()
+        .find(|f| flux_normalise(&f.url) == voulu)
+}
+
 /// #7177 (web#2443) — pose `url` comme flux de `station`, s'il est l'un des
 /// flux publiés de `fiche`, avec son format et son débit. `false` : ce flux
 /// n'est pas de la fiche, rien ne change.
@@ -1033,12 +1055,7 @@ pub fn poser_le_flux_prefere(
     station: &mut RadioStation,
     url: &str,
 ) -> bool {
-    let voulu = flux_normalise(url);
-    let Some(flux) = fiche
-        .flux_proposes()
-        .into_iter()
-        .find(|f| flux_normalise(&f.url) == voulu)
-    else {
+    let Some(flux) = flux_publie_par_la_fiche(fiche, url) else {
         return false;
     };
     station.url = flux.url;
@@ -1114,14 +1131,36 @@ async fn choisir_le_flux(
 /// d'une fiche qui n'est pas dans « Mes radios ». Rien n'est ajouté.
 ///
 /// #7587 — corps facultatif `{"stream_url": …}` : le flux choisi sur la fiche,
-/// parmi ceux qu'elle publie (422 `flux_hors_fiche` sinon, comme #7177). La
-/// règle de pays (#7199) s'applique encore : un flux choisi mais interdit dans
-/// le pays d'écoute cède la place au meilleur flux autorisé.
+/// parmi ceux qu'elle publie (422 `flux_hors_fiche` sinon, comme #7177). Pas
+/// de corps, `{}`, `null` ou un `stream_url` vide : le serveur choisit seul,
+/// comme avant. La règle de pays (#7199) s'applique dans tous les cas : un
+/// flux choisi mais interdit dans le pays d'écoute cède la place au meilleur
+/// flux autorisé ; sans flux autorisé, le refus structuré part avant toute
+/// sortie.
+///
+/// Le corps est lu à la main : `Option<Json<…>>` rejetterait, avant la garde
+/// #7199, un corps vide envoyé avec `Content-Type: application/json`.
 async fn jouer(
     State(state): State<AppState>,
     Path((external_id, zone_id)): Path<(String, i64)>,
-    corps: Option<Json<CorpsFluxPrefere>>,
+    corps: axum::body::Bytes,
 ) -> Response {
+    let choisi = if corps.iter().all(u8::is_ascii_whitespace) {
+        None
+    } else {
+        match serde_json::from_slice::<Option<CorpsEcoute>>(&corps) {
+            Ok(c) => c
+                .and_then(|c| c.stream_url)
+                .filter(|u| !u.trim().is_empty()),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "corps_invalide", "detail": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    };
     let Some(fiche) = fiche_par_id(&state, &external_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1129,20 +1168,14 @@ async fn jouer(
         )
             .into_response();
     };
-    let choisi = corps.map(|Json(c)| c.stream_url);
-    if let Some(url) = choisi.as_deref() {
-        let voulu = flux_normalise(url);
-        if !fiche
-            .flux_proposes()
-            .iter()
-            .any(|f| flux_normalise(&f.url) == voulu)
-        {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"error": "flux_hors_fiche"})),
-            )
-                .into_response();
-        }
+    if let Some(url) = choisi.as_deref()
+        && flux_publie_par_la_fiche(&fiche, url).is_none()
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "flux_hors_fiche"})),
+        )
+            .into_response();
     }
     let flux =
         match super::radios::geofencing::stream_for_directory(&state, &fiche, choisi.as_deref()) {
