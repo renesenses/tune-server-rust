@@ -489,7 +489,7 @@ impl SpotifyService {
     /// #7659 — une page brute de `/v1/search`, et la limite réellement servie.
     ///
     /// Un `400 Invalid limit` reçu au-dessus du plafond du mode développement
-    /// fait adopter ce plafond, puis la même page est redemandée une fois :
+    /// fait adopter ce plafond, puis la même page est redemandée UNE fois :
     /// la recherche aboutit pour les deux sortes d'applications, sans deviner
     /// laquelle est configurée.
     async fn recherche(
@@ -498,27 +498,36 @@ impl SpotifyService {
         limit: usize,
         offset: usize,
     ) -> Result<(serde_json::Value, usize), String> {
-        loop {
-            let borne = self.borne_de_recherche(limit);
-            let reponse = self
-                .api_get(&format!(
-                    "/search?q={}&type=track,album,artist&limit={borne}&offset={offset}",
-                    urlencoding::encode(query)
-                ))
-                .await;
-            match reponse {
-                Err(e) if refus_de_limite(&e) && borne > PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT => {
-                    self.plafond_recherche
-                        .store(PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT, Ordering::Relaxed);
-                    warn!(
-                        refusee = borne,
-                        adoptee = PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT,
-                        "spotify_search_limit_lowered"
-                    );
-                }
-                r => return r.map(|data| (data, borne)),
+        let borne = self.borne_de_recherche(limit);
+        match self.page_brute(query, borne, offset).await {
+            Err(e) if refus_de_limite(&e) && borne > PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT => {
+                self.plafond_recherche
+                    .store(PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT, Ordering::Relaxed);
+                warn!(
+                    refusee = borne,
+                    adoptee = PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT,
+                    "spotify_search_limit_lowered"
+                );
+                let borne = self.borne_de_recherche(limit);
+                self.page_brute(query, borne, offset)
+                    .await
+                    .map(|data| (data, borne))
             }
+            r => r.map(|data| (data, borne)),
         }
+    }
+
+    async fn page_brute(
+        &self,
+        query: &str,
+        borne: usize,
+        offset: usize,
+    ) -> Result<serde_json::Value, String> {
+        self.api_get(&format!(
+            "/search?q={}&type=track,album,artist&limit={borne}&offset={offset}",
+            urlencoding::encode(query)
+        ))
+        .await
     }
 
     fn resultats_de_recherche(data: &serde_json::Value) -> SearchResults {
