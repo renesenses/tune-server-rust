@@ -191,6 +191,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5998 -- --nocapture --test-threads=1
 
+      # #7856 — contrôle parental : stockage, révision optimiste, droits du
+      # superviseur et filtre relu de la base. Sans cette étape, l'épreuve
+      # prendrait son saut annoncé.
+      - name: Contrôle parental sur PostgreSQL (#7856)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7856 -- --nocapture --test-threads=1
+
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
