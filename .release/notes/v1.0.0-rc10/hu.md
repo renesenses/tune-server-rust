@@ -1,0 +1,33 @@
+Tune 1.0.0-rc10, a Tune 1.0 tizedik kiadásjelöltje.
+
+- **Saját fizikai gyűjtemény**: egy új bővítmény összeveti Discogs-gyűjteményét a könyvtárával és a streamingszolgáltatásokkal, a szerveren gyorsítótárazott borítók rácsában. Saját bejegyzés jelenik meg az oldalsávban, közvetlenül a Tune Circle után.
+- **Saját téma**: a felület összes színe szabadon választható, profilonként. Bővítmény is adhat témát, a sajátját pedig elküldheti egy Tune Circle-kapcsolatnak, aki egy kattintással alkalmazza.
+- **Crosstalk**: a hangfalak közötti áthallást csökkentő bővítmény beállítóképernyőjével együtt bekerül a bővítménykatalógusba; ugyanabban a zónában kikapcsolja a crossfeedet, és ezt jelzi.
+- **Mappák**: egy mappa az összes almappájával együtt lejátszható vagy a sorhoz adható, sorrendben; a Könyvtár Mappa szűrője az almappákba is lelép, és felajánlja a visszatérést a teljes könyvtárhoz.
+- **Rádió**: a Saját rádiók és a Címtár „További szűrők” sávjával feltételek szerint kereshet; négy új műfaj érkezik a címtárba.
+- **Rádió lejátszás közben**: az állomás adásfolyamai minőség szerint rendezettek; a Most szól nézet mutatja az állomás logóját és egy „Saját rádiók” gombot; a hallgatási ország a Beállítások › Általános alatt adható meg.
+- **Kiadók**: megjelennek a lemezkiadók logói, a mozaiklabs.fr megosztásában; a szerver állapotoldala követi az albumborítók és kiadólogók letöltését.
+- **Hangerő**: a csúszka dB-skálás, a kényelmi és a biztonsági határ színesen látszik, a biztonsági határ fölötti kényelmi határt pedig elutasítja.
+- **Oxygen és metaadatok**: egy mező módosítása egy teljes szűrt találaton; mappák kizárása az automatikus metaadat-kiegészítésből.
+- **Tune Circle**: nagyítás a földgömb egy területére a Világ nézetben; a Tune Circle-lejátszási listák saját jelölést kapnak a Lejátszási listák szűrőiben; egy szolgáltatás lejátszási listája az adatlapjáról megosztható.
+- **Asztali widget**: a mini ablak a webes felület mini nézetét használja, és keresést kap előadókra, Qobuzra és TIDAL-ra, bélyegképekkel és billentyűzetes vezérléssel.
+- **AES67-kimenet**: kísérleti kimenet AES67-kompatibilis Dante és Ravenna hanghálózatok felé, alapértelmezetten kikapcsolva, a Beállítások › Kísérleti menüben.
+- **Ez a böngésző**: a következő szám már a vége előtt előkészül a simább átmenetért, a szerver „Ez a böngésző” zónája pedig előzetes beállítás nélkül is játszik.
+- **Hallgatás folytatása**: a kártya megnevezi a folytatott albumot, lejátszási listát vagy epizódot, a befejezett hallgatás pedig lekerül a listáról.
+- **Előzmények és népszerű számok**: egy megnyitott album vagy lejátszási lista számai a legújabbtól a legrégebbiig sorakoznak; egy előadó népszerű számai kiegészülnek azokkal, amelyeket Ön a leggyakrabban hallgat, minden forrásból.
+- **Könyvtár**: a DR és az eredeti megjelenési év szerinti szűrés nagy könyvtáraknál jóval gyorsabb; a számlista oszlopai átméretezhetők, és minden képernyő megjegyzi a szélességüket; az akusztikai elemzés elmagyarázza a tempóját és mutatja az előrehaladást.
+- **Hangszínszabályzó**: a frekvencia és a Q szabadon beírható, és a bevitel végén érvényesül; az importált előbeállítások törlése megerősítést kér; a térkorrekció és a DAC-kalibráció a teljes hangszínszabályzó-profilt alkalmazza.
+- **Lejátszási listák**: a .m3u, .m3u8 és .dpl importálása a Lejátszásilista-kezelőben található, és a valós számmennyiséget jelzi; az Importálás, az Átvitel és az Összehasonlítás megmondja, miért nem sikerül.
+- **Borítók**: a beágyazott borítót minden címkéből kiolvassa, előlapot előre véve; a fájl újraolvasása után folytatódik az online keresés; egy Qobuz-lejátszási lista téglalap alakú képe teljes egészében látszik.
+- **Üzenetek**: a még franciául maradt utolsó hibaüzenetek a felület nyelvére fordítva jelennek meg; a kapcsolatot elutasító AirPlay 2 hangszóró hiányzó párosítást jelez; a Qobuz által elutasított alkalmazásazonosító már nem hibás jelszóként jelenik meg.
+- **Licenc**: a képernyő jelzi, hogy a Premium a Mozaiklabs-fiókjából származik, kulcs kérése nélkül.
+- **Kezdőlap**: az „Egyéb változatok” már nem akad el a streamingszolgáltatásokra várva.
+- **ASIO**: ha a DSD-támogatás nem ellenőrizhető, a Tune ezt jelzi, és elmagyarázza, mire képes a kimenet.
+- **Hibajavítás, lejátszás**: a PURE és a hangszínszabályzó közötti váltás már nem indít újra egy leállított zónát; a „Alapértelmezett ismétlés” kikapcsolása valóban kikapcsolja a zóna ismétlését; a kompatibilis számok közötti átmenetek folyamatosak maradnak.
+- **Hibajavítás, OpenHome**: a szünet és a leállítás eltávolítja a lejátszóból az előkészített következő számot, a záró pozíció pedig megmarad a következőre váltás alatt.
+- **Hibajavítás, rádió**: ismeretlen hallgatási ország esetén a választott adásfolyamot már nem cseréli 96 kbit/s-os folyamra; a konzolról hozzáadott állomás megtartja a kapcsolatot az adatlapjával; egy elszigetelt hiba már nem függeszti fel a rádiós metaadatokat; a „Legutóbb hallgatott” a helyes dátumot mutatja; a rádiókedvencekből létrehozott Qobuz-lejátszási lista azonnal megjelenik.
+- **Hibajavítás, könyvtár és profilok**: a kedvencek és az értékelések szűrője az aktív profilt követi; a „Legtöbbet hallgatott” már nem számol többször egy hallgatást; a kiegészítés már nem cserél le meglévő műfajt; az UPnP-számok megtartják évüket és műfajaikat; egy már kiosztott MusicBrainz-azonosítót nem oszt ki másodszor.
+- **Hibajavítás, gyűjtemények és lejátszási listák**: az elutasított mentést jelzi, egy hibás mappa már nem üríti ki a listát, és a lejátszási listák minden oldalát beolvassa.
+- **Hibajavítás, bővítmények és fiók**: egy aktív natív bővítmény eltávolítása tartósan letiltja azt; a Mozaiklabs-fiókhoz való első kapcsolódás e-mail-cím nélkül is az egyetlen profilhoz kötődik.
+- **Hibajavítás, egyéb**: a lejátszási listák beolvasáskori importja megmondja, miért nem importál; a beállítások olvasási hibáját jelzi az alapértékek használata helyett; a számítógép alvó állapotát már nem jelzi lefagyásként; a régi felület már nem marad meg egy szerverfrissítés után; a VU-mérős sáv 1280 és 1800 px között már nem lóg ki; a WASAPI mód a Windows alapbeállításánál is látható marad; a hangot küldéskor már nem tömöríti.
+- **Biztonság**: megerősítő javítások.

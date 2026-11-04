@@ -23,13 +23,14 @@ pub mod genres_equivalents;
 /// Regrouper les exemplaires d'un même enregistrement entre sources, et
 /// choisir celui qu'on joue (#2264).
 pub mod groupes_versions;
+/// #7089 — les logos de labels pris sur le web ouvert (Commons, Wikipédia,
+/// site officiel, Discogs), après un rapprochement MusicBrainz sûr.
+pub mod images_rapides;
 pub mod importer;
 pub mod ingest;
 pub mod local_path;
 /// Le logo d'un label de la bibliothèque, lu chez Qobuz (#6736).
 pub mod logos_labels;
-/// #7089 — les logos de labels pris sur le web ouvert (Commons, Wikipédia,
-/// site officiel, Discogs), après un rapprochement MusicBrainz sûr.
 pub mod logos_web;
 pub mod lyrics_pass;
 pub mod m3u_parser;

@@ -196,6 +196,15 @@ jobs:
     if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 75  # test — 37 à 45 min observées début novembre (45 dépassé, PR #7711 et #7727)
+    # 02/11 (train rc10) : le runner tuait le job en pleine compilation (143)
+    # ou le coupait a 45 min. Sans info de debogage et a 2 compilations en
+    # parallele, memoire et disque restent sous les limites du runner.
+    # Aucun test n'est retire ni affaibli.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
