@@ -2253,10 +2253,6 @@ impl PlaybackOrchestrator {
                     .downcast_ref::<crate::outputs::local::LocalOutput>()
                 {
                     local_output.set_pure_bypass(zone_audiophile);
-                    // #7632 — le droit de convoluer, posé à chaque lecture
-                    // comme PURE : sans Premium, l'IR mémorisée ne bâtit
-                    // aucun moteur pour la piste qui démarre.
-                    local_output.set_convolution_autorisee(self.correction_ir_autorisee());
                     // #3973 — « bit-perfect strict » de la zone, posé à chaque
                     // lecture comme PURE : c'est lui que `play_url` transmet à
                     // l'ouverture cpal (`DemandeDOuverture::strict_bitperfect`).
@@ -2313,6 +2309,10 @@ impl PlaybackOrchestrator {
                     // `false` en mode PURE, donc la promesse bit-perfect tient
                     // sans garde supplémentaire, exactement comme pour l'EQ.
                     local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+                    // #7632 — le droit de convoluer, posé à chaque lecture
+                    // comme PURE : sans Premium, l'IR mémorisée ne bâtit
+                    // aucun moteur pour la piste qui démarre.
+                    local_output.set_convolution_autorisee(self.correction_ir_autorisee());
                     // #6044 — la réaffectation des canaux : la règle de l'album
                     // prime sur celle de la zone, et aucune ne s'applique en
                     // PURE (`regle_effective_with` le vérifie). Les canaux de
