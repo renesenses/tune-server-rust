@@ -2,7 +2,7 @@
 
 Claude - Mozaiklabs, 31 octobre – 4 novembre 2026. **État : étude close, § 6 mesuré sur Shrek le 2 novembre ; intégration engagée (go du 4 novembre).** Branche
 `etude/7614-surechantillonnage-b209` (base `batch/bugs-rc10-20261030`).
-Prototype : `plugins/tune-surechantillonnage/` (crate autonome, hors serveur).
+Prototype : il est maintenant dans `sdk/tune-plugin-surechantillonnage/` (PR #7853, empilée sur #7851). Cette PR ne porte plus que la note.
 Mesures reproductibles : `cargo run --release --bin banc` dans la crate ;
 gabarits : `cargo test --release`.
 
