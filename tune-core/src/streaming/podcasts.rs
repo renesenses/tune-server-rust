@@ -1641,6 +1641,24 @@ mod tests {
             "sans pays du client, le pays retenu du palmarès doit partir : {premiere}"
         );
     }
+
+    /// #7819 — les épisodes d'un flux Atom se lisent comme ceux d'un RSS.
+    #[test]
+    fn un_flux_atom_donne_ses_episodes() {
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>P</title>
+<entry><title>E1</title><published>2026-11-01T08:00:00Z</published>
+<link rel="alternate" href="https://ex.test/page1"/>
+<link rel="enclosure" type="audio/mpeg" href="https://ex.test/e1.mp3"/>
+<summary>Résumé 1</summary></entry>
+<entry><title>Sans audio</title><link rel="alternate" href="https://ex.test/p2"/></entry>
+</feed>"#;
+        let episodes = parse_rss(xml, 10).unwrap();
+        assert_eq!(episodes.len(), 1, "{episodes:?}");
+        assert_eq!(episodes[0].title, "E1");
+        assert_eq!(episodes[0].audio_url, "https://ex.test/e1.mp3");
+        assert_eq!(episodes[0].published, "2026-11-01T08:00:00Z");
+        assert_eq!(episodes[0].description, "Résumé 1");
+    }
 }
 
 #[cfg(test)]
@@ -1720,23 +1738,5 @@ mod palmares_doublons_7225 {
                 .collect::<Vec<_>>(),
             ["apple-1", "apple-2"]
         );
-    }
-
-    /// #7819 — les épisodes d'un flux Atom se lisent comme ceux d'un RSS.
-    #[test]
-    fn un_flux_atom_donne_ses_episodes() {
-        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>P</title>
-<entry><title>E1</title><published>2026-11-01T08:00:00Z</published>
-<link rel="alternate" href="https://ex.test/page1"/>
-<link rel="enclosure" type="audio/mpeg" href="https://ex.test/e1.mp3"/>
-<summary>Résumé 1</summary></entry>
-<entry><title>Sans audio</title><link rel="alternate" href="https://ex.test/p2"/></entry>
-</feed>"#;
-        let episodes = parse_rss(xml, 10).unwrap();
-        assert_eq!(episodes.len(), 1, "{episodes:?}");
-        assert_eq!(episodes[0].title, "E1");
-        assert_eq!(episodes[0].audio_url, "https://ex.test/e1.mp3");
-        assert_eq!(episodes[0].published, "2026-11-01T08:00:00Z");
-        assert_eq!(episodes[0].description, "Résumé 1");
     }
 }
