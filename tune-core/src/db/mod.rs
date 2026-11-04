@@ -107,6 +107,9 @@ mod lenteur_pistes_5138_tests;
 /// #7535 — un MBID trouvé par le nom n'est plus posé s'il est déjà porté.
 #[cfg(test)]
 mod mbid_deja_porte_7535_tests;
+/// #7694 — la règle des dossiers miroirs ne fond pas deux qualités.
+#[cfg(test)]
+mod miroirs_de_qualite_7694_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
 #[cfg(test)]

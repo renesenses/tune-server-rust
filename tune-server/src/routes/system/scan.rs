@@ -3553,7 +3553,8 @@ async fn spawn_library_scan_avec_lecteur_par(
 
         // Turn any .m3u/.m3u8/.pls files found in the scanned dirs into local
         // playlists (Bertrand). Runs after import so every track is in the DB to
-        // match against; idempotent by playlist name so a re-scan never dupes.
+        // match against; a file already imported and unchanged is skipped, even
+        // if its playlist was deleted (#7723), so a re-scan never brings it back.
         if !scan_cancel_requested() {
             let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &scan_dirs);
             if pl.playlists_created > 0 {
