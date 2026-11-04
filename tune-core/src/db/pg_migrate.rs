@@ -226,6 +226,9 @@ const MIGRATION_TABLES: &[&str] = &[
 const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Reprises (#7280), créées par le script 100 : conserver leur file et position.
     "listening_resumes",
+    // Clés des clients Subsonic (#7855, script 101) : sans cette ligne, chaque
+    // client devrait être réappairé après la bascule.
+    "cles_clients",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",

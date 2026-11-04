@@ -2702,6 +2702,11 @@ CREATE INDEX IF NOT EXISTS idx_radio_ecoutes_jour ON radio_ecoutes(jour);
         up: "",
     },
     Migration { version: 135, name: "listening_resumes", up: include_str!("../../migrations/continue_listening.sql") },
+    // #7855 — les clés des clients Subsonic : seule l'empreinte SHA-256 est
+    // stockée. Numérotée 136 / PG 101 le 04/11 depuis le lot
+    // `batch/bugs-rc11-20261101` (dernière : 135 / PG 100) ; d'autres PR
+    // ouvertes réclament aussi 136 / 101, la fusion groupée renumérote.
+    Migration { version: 136, name: "cles_clients", up: include_str!("../../migrations/cles_clients.sql") },
 ];
 
 /// Migration 127 (#6257) : `tags.position`, 0 pour toutes les etiquettes
@@ -5682,6 +5687,12 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         100,
         "listening_resumes",
         include_str!("../../migrations/postgres/100_listening_resumes.sql"),
+    ),
+    // Jumelle de la SQLite 136 (#7855) : les clés des clients Subsonic.
+    (
+        101,
+        "cles_clients",
+        include_str!("../../migrations/postgres/101_cles_clients.sql"),
     ),
 ];
 
@@ -9223,7 +9234,8 @@ mod tests {
         // 99 reste réservée à la sentinelle des anciennes bascules : entrée
         // sans effet pour garder la chaîne contiguë, jamais un changement DDL.
         // 100 : listening_resumes (#7280), jumelle de la SQLite 135.
-        assert_eq!(pg_latest_version(), 100, "latest PG migration must be 100");
+        // 101 : cles_clients (#7855), jumelle de la SQLite 136.
+        assert_eq!(pg_latest_version(), 101, "latest PG migration must be 101");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

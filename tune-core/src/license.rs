@@ -80,6 +80,10 @@ pub enum Feature {
     /// par le greffon `tune-aes67` (`TunePlugin::required_feature`), qui
     /// refuse lui-même ses routes et ses sorties sans ce droit.
     Aes67,
+    /// « Accès Subsonic » (#7855) : exposer la bibliothèque aux clients
+    /// Subsonic / OpenSubsonic. Premium, désactivé par défaut (Bertrand,
+    /// 04/11/2026).
+    Subsonic,
 }
 
 impl Feature {
@@ -116,6 +120,7 @@ impl Feature {
             Feature::PontRoon,
             Feature::Concerts,
             Feature::Aes67,
+            Feature::Subsonic,
         ]
     }
 
@@ -142,6 +147,7 @@ impl Feature {
             Feature::PontRoon => "Roon Bridge",
             Feature::Concerts => "Concerts",
             Feature::Aes67 => "AES67 Output",
+            Feature::Subsonic => "Subsonic Access",
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
@@ -185,6 +191,7 @@ impl Feature {
             Feature::PontRoon => "pont_roon",
             Feature::Concerts => "concerts",
             Feature::Aes67 => "aes67_output",
+            Feature::Subsonic => "subsonic",
             Feature::PlaylistTransfer => "playlist_transfer",
             Feature::AdvancedAlarms => "advanced_alarms",
             Feature::MultiProfiles => "multi_profiles",
@@ -220,7 +227,11 @@ impl Feature {
             // Note: Dé-ploc IS available, so it is deliberately NOT listed here.
             // AES67 (#7336) : expérimentale dans la rc10, désactivée par défaut,
             // jamais essayée sur un vrai récepteur Dante/Ravenna.
-            Feature::SocialSharing | Feature::WeeklyDigest | Feature::Aes67 => false,
+            // Subsonic (#7855) : le socle seul (étape 1 sur 3), sans écran de
+            // réglage dans le client web ni navigation de la bibliothèque.
+            Feature::SocialSharing | Feature::WeeklyDigest | Feature::Aes67 | Feature::Subsonic => {
+                false
+            }
             _ => true,
         }
     }
@@ -1452,7 +1463,7 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentyeight_features() {
+    fn all_premium_has_twentynine_features() {
         // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
         // premium doit être un acte conscient, pas un effet de bord. Passé de
         // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
@@ -1460,8 +1471,9 @@ mod tests {
         // `PontRoon` (16/09/2026, décision de Bertrand) ; puis à 27 avec
         // `Concerts` (#2363) — sa propre tuile, incluse dans Premium (Bertrand,
         // 30/08 et 25/09/2026) ; puis à 28 avec `Aes67` (#7336, Bertrand,
-        // 30/10/2026).
-        assert_eq!(Feature::all_premium().len(), 28);
+        // 30/10/2026) ; puis à 29 avec `Subsonic` (#7855, Bertrand,
+        // 04/11/2026).
+        assert_eq!(Feature::all_premium().len(), 29);
     }
 
     #[test]
