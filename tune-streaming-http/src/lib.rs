@@ -546,6 +546,8 @@ where
             get(service_track_similar),
         )
         .route("/{service}/featured", get(service_featured))
+        // #7822 — les mixes personnels du compte, lisibles comme des playlists.
+        .route("/{service}/mixes", get(service_mixes))
         .route(
             "/{service}/featured/sections",
             get(service_featured_sections),
@@ -998,6 +1000,16 @@ async fn service_featured(
     Path(service): Path<String>,
 ) -> Response {
     with_svc_editorial!(&state, &service, |svc| svc.get_featured().await)
+}
+
+/// #7822 — `GET /streaming/{service}/mixes` : les mixes du compte, liste
+/// vide pour un service qui n'en a pas. Contenu personnel : pas de cache
+/// navigateur (`with_svc!`, pas `with_svc_editorial!`).
+async fn service_mixes(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_user_mixes().await)
 }
 
 async fn service_new_releases(
@@ -4012,6 +4024,9 @@ mod temoin_rubriques_dans_la_langue_demandee {
 
 #[cfg(test)]
 mod service_desactive_jamais_appele_tests;
+
+#[cfg(test)]
+mod mixes_du_compte_7822_tests;
 
 #[cfg(test)]
 mod youtube_decouverte_tests;
