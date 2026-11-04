@@ -43,7 +43,8 @@ pub mod sql {
     /// Sans `album_id` sur la ligne, on préfère ne rien résoudre.
     const RECORD_COLS_RESOLUS: &str = "h.id, COALESCE(h.track_id, t.id) as track_id, h.title, \
          h.artist_name, h.album_title, h.source, h.source_id, h.album_id, h.duration_ms, \
-         h.listened_at, h.zone_id, h.context_type, h.context_id, h.context_position, h.cover_url";
+         h.listened_at, h.zone_id, h.context_type, h.context_id, h.context_position, h.cover_url, \
+         h.context_source, h.album_ref";
 
     /// La jointure qui résout `track_id`, commune aux deux listes.
     const JOINTURE_PISTE: &str = " FROM listen_history h \
@@ -2045,12 +2046,19 @@ fn row_to_listen(cols: &[SqlValue]) -> ListenRecord {
         context_type: cols.get(11).and_then(|v| v.as_string()),
         context_id: cols.get(12).and_then(|v| v.as_string()),
         context_position: cols.get(13).and_then(|v| v.as_i64()),
-        context_source: None,
+        // #7778 (point 6) — l'album d'un titre de service, et l'espace de
+        // noms du contexte : sans eux, le client ne pouvait proposer « Aller
+        // à l'album » que pour une écoute lancée depuis cet album.
+        context_source: cols.get(15).and_then(|v| v.as_string()),
         context_title: None,
         context_cover: None,
-        album_ref: None,
+        album_ref: cols.get(16).and_then(|v| v.as_string()),
     }
 }
+
+#[cfg(test)]
+#[path = "historique_album_de_service_7778_tests.rs"]
+mod historique_album_de_service_7778_tests;
 
 #[cfg(test)]
 mod tests {
