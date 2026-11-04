@@ -231,3 +231,57 @@ fn ui_messages_are_versioned_scoped_and_reject_unknown_commands() {
         .is_err()
     );
 }
+
+#[test]
+fn rate_request_keeps_layout_and_encoding_and_bounds_the_ratio() {
+    use tune_plugin_sdk::rate::*;
+    let input = AudioFormat::new(44_100, ChannelLayout::Stereo, SampleEncoding::F32).unwrap();
+    let request = RateRequest::new(input, 705_600, 1024).unwrap();
+    let output = request.output_format();
+    assert_eq!(output.sample_rate(), 705_600);
+    assert_eq!(output.layout(), ChannelLayout::Stereo);
+    assert_eq!(output.encoding(), SampleEncoding::F32);
+    assert_eq!(request.max_output_frames(), 16 * 1024 + 1);
+    assert_eq!(
+        RateRequest::new(input, 768_001, 1024),
+        Err(Error::InvalidFormat),
+        "the output rate goes through AudioFormat::new"
+    );
+    let low = AudioFormat::new(8_000, ChannelLayout::Mono, SampleEncoding::F32).unwrap();
+    assert_eq!(
+        RateRequest::new(low, 768_000, 1024),
+        Err(Error::UnsupportedFormat),
+        "×96 exceeds MAX_RATIO"
+    );
+    assert_eq!(
+        RateRequest::new(input, 48_000, 0),
+        Err(Error::BlockTooLarge)
+    );
+}
+
+#[test]
+fn rate_frame_accounting_reference() {
+    use tune_plugin_sdk::rate::*;
+    assert_eq!(expected_output_frames(44_100, 352_800, 1), 8);
+    assert_eq!(expected_output_frames(44_100, 48_000, 44_100), 48_000);
+    assert_eq!(expected_output_frames(44_100, 48_000, 1), 1);
+    // 147 input frames at 44.1 kHz are exactly 160 frames at 48 kHz.
+    assert_eq!(expected_output_frames(44_100, 48_000, 147), 160);
+    for n in [1usize, 2, 146, 147, 1000, 4096] {
+        let cap = max_output_frames(44_100, 48_000, n) as u64;
+        assert!(cap > expected_output_frames(44_100, 48_000, n as u64));
+    }
+    // A day at 768 kHz does not overflow.
+    assert_eq!(
+        expected_output_frames(48_000, 768_000, 48_000 * 86_400),
+        768_000 * 86_400
+    );
+}
+
+#[test]
+fn rate_change_capability_is_not_offered_before_a_host_adapter_exists() {
+    assert!(
+        !reference_host_capabilities().contains_key(tune_plugin_sdk::rate::AUDIO_RATE_CHANGE),
+        "a capability enters the reference host only with its adapter and matrix witness"
+    );
+}
