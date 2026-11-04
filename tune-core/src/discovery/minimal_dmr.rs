@@ -43,6 +43,22 @@ pub struct ProbeResult {
     pub rendering_control_url: Option<String>,
 }
 
+impl ProbeResult {
+    /// Les URL de contrôle sous les clés que produit le descriptif UPnP
+    /// (`xml_parser::service_key` : `avtransport`, `renderingcontrol`), les
+    /// seules que lit l'enregistrement de la sortie. Écrites `AVTransport` et
+    /// `RenderingControl`, un appareil trouvé par ce repli recevait sa zone
+    /// sans jamais avoir de sortie de lecture (#7279).
+    pub fn service_urls(&self) -> std::collections::HashMap<String, String> {
+        let mut urls = std::collections::HashMap::new();
+        urls.insert("avtransport".to_string(), self.av_transport_url.clone());
+        if let Some(ref rc) = self.rendering_control_url {
+            urls.insert("renderingcontrol".to_string(), rc.clone());
+        }
+        urls
+    }
+}
+
 fn soap_body(ns: &str, action: &str, params: &[(&str, &str)]) -> String {
     let mut parts = String::new();
     for (k, v) in params {
@@ -221,6 +237,29 @@ async fn probe_common_paths(client: &Client, base: &str, name: &str) -> Option<P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn les_cles_du_repli_sont_celles_du_descriptif_7279() {
+        let probe = ProbeResult {
+            name: "Innuos".into(),
+            av_transport_url: "http://192.0.2.7:49152/AVTransport/ctrl".into(),
+            rendering_control_url: Some("http://192.0.2.7:49152/RenderingControl/ctrl".into()),
+        };
+        let urls = probe.service_urls();
+        for service in [
+            "urn:schemas-upnp-org:service:AVTransport:1",
+            "urn:schemas-upnp-org:service:RenderingControl:1",
+        ] {
+            let cle = crate::discovery::xml_parser::service_key(service);
+            assert!(
+                urls.contains_key(&cle),
+                "#7279 : le repli MinimalDMR range {service} sous une autre clé que \
+                 « {cle} » ({:?}) ; l'enregistrement de la sortie ne la trouve pas et \
+                 l'appareil a une zone sans sortie de lecture",
+                urls.keys().collect::<Vec<_>>()
+            );
+        }
+    }
 
     #[test]
     fn soap_body_basic() {
