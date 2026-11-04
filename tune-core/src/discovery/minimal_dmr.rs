@@ -261,6 +261,31 @@ mod tests {
         }
     }
 
+    /// Le témoin ci-dessus garde `service_urls()` ; celui-ci garde son appel :
+    /// la découverte doit ranger les URL du repli par cette fonction, et non
+    /// par des clés écrites à la main comme avant #7279.
+    #[test]
+    fn la_decouverte_range_le_repli_par_service_urls_7279() {
+        let ssdp = include_str!("ssdp.rs");
+        let appels = ssdp.matches("probe.service_urls()").count();
+        assert!(
+            appels >= 1,
+            "#7279 : la découverte ne range plus les URL du repli MinimalDMR par \
+             `probe.service_urls()` ; des clés écrites à la main redonnent une zone \
+             sans sortie de lecture"
+        );
+        for cle_a_la_main in [
+            "\"AVTransport\".to_string()",
+            "\"RenderingControl\".to_string()",
+        ] {
+            assert!(
+                !ssdp.contains(cle_a_la_main),
+                "#7279 : ssdp.rs range une URL sous la clé {cle_a_la_main} ; \
+                 l'enregistrement de la sortie lit `avtransport` et `renderingcontrol`"
+            );
+        }
+    }
+
     #[test]
     fn soap_body_basic() {
         let body = soap_body(AVT_NS, "Play", &[("InstanceID", "0"), ("Speed", "1")]);

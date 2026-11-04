@@ -14,14 +14,17 @@ use serde_json::json;
 use tune_core::db::zone_repo::Zone;
 use tune_core::discovery::device::DiscoveredDevice;
 
-/// Les deux services sans lesquels une sortie DLNA ne s'enregistre pas
-/// (`handle_ssdp_discovered`).
-const SERVICES_DE_RENDU: [&str; 2] = ["avtransport", "renderingcontrol"];
+use crate::discovery_setup::SERVICES_DE_RENDU;
 
-/// Pose `sortie_absente` sur une zone DLNA ou OpenHome et, quand la découverte
-/// voit l'appareil sans que sa sortie soit enregistrée, `raison_sortie_absente`
-/// et `services_manquants`. Rien n'est posé pour les autres types : la règle
-/// des zones locales est [`super::rattacher_asio_6120::injecter_sortie_absente`].
+/// Pose `sortie_reseau_absente` sur une zone DLNA ou OpenHome et, quand la
+/// découverte voit l'appareil sans que sa sortie soit enregistrée,
+/// `raison_sortie_absente` et `services_manquants`. Rien n'est posé pour les
+/// autres types : la règle des zones locales est
+/// [`super::rattacher_asio_6120::injecter_sortie_absente`].
+///
+/// Pas `sortie_absente` : le client web propose « Rattacher » (à une sortie
+/// ASIO, #6120) sur toute zone qui le porte à `true`, geste que le serveur
+/// refuse pour une zone réseau.
 pub(crate) fn injecter_raison_sortie_reseau_absente(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     zone: &Zone,
@@ -36,7 +39,7 @@ pub(crate) fn injecter_raison_sortie_reseau_absente(
         return;
     };
     let absente = !sorties_enregistrees.contains(device_id);
-    obj.insert("sortie_absente".into(), json!(absente));
+    obj.insert("sortie_reseau_absente".into(), json!(absente));
     if !absente {
         return;
     }
@@ -132,7 +135,7 @@ mod tests {
         let vus = [appareil(json!({"avtransport": "/av"}))];
         let obj = injecter(&zone("dlna"), &vus, &[]);
         assert_eq!(
-            obj.get("sortie_absente"),
+            obj.get("sortie_reseau_absente"),
             Some(&json!(true)),
             "#7279 : la zone de l'Innuos est publiée sans dire que sa sortie de lecture manque"
         );
@@ -153,18 +156,31 @@ mod tests {
             json!({"avtransport": "/av", "renderingcontrol": "/rc"}),
         )];
         let obj = injecter(&zone("dlna"), &vus, &[UDN]);
-        assert_eq!(obj.get("sortie_absente"), Some(&json!(false)));
+        assert_eq!(obj.get("sortie_reseau_absente"), Some(&json!(false)));
         assert!(obj.get("raison_sortie_absente").is_none());
     }
 
     #[test]
     fn un_appareil_hors_ligne_n_a_pas_de_raison_inventee_7279() {
         let obj = injecter(&zone("dlna"), &[], &[]);
-        assert_eq!(obj.get("sortie_absente"), Some(&json!(true)));
+        assert_eq!(obj.get("sortie_reseau_absente"), Some(&json!(true)));
         assert!(
             obj.get("raison_sortie_absente").is_none(),
             "un appareil que la découverte ne voit pas est hors ligne, rien de plus"
         );
+    }
+
+    #[test]
+    fn une_zone_reseau_ne_propose_pas_le_rattachement_asio_7279() {
+        for ty in ["dlna", "openhome"] {
+            let obj = injecter(&zone(ty), &[], &[]);
+            assert!(
+                obj.get("sortie_absente").is_none(),
+                "#7279 : la zone {ty} porte `sortie_absente` ; le client web y \
+                 propose « Rattacher » à une sortie ASIO, que le serveur refuse \
+                 pour une zone réseau"
+            );
+        }
     }
 
     #[test]

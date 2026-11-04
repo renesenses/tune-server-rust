@@ -48,6 +48,10 @@ mod deux_pi_verox_oaat_airplay_tests_6947;
 /// rien.
 pub(crate) const SERVICES_EVENEMENTS_DLNA: [&str; 2] = ["avtransport", "renderingcontrol"];
 
+/// Les deux services sans lesquels une sortie DLNA ne s'enregistre pas
+/// (`handle_ssdp_discovered`) ; `GET /zones` publie ceux qui manquent (#7279).
+pub(crate) const SERVICES_DE_RENDU: [&str; 2] = ["avtransport", "renderingcontrol"];
+
 /// `eventSubURL` absolues des services abonnables, à partir des chemins bruts
 /// du descripteur.
 ///
@@ -964,7 +968,7 @@ async fn handle_ssdp_discovered(
     // qui ne pouvait rien jouer, absente de la liste des appareils de lecture,
     // et sans un mot dans le journal (Innuos Zenith, fil 2495).
     if !registered {
-        let manquants: Vec<&str> = ["avtransport", "renderingcontrol"]
+        let manquants: Vec<&str> = SERVICES_DE_RENDU
             .into_iter()
             .filter(|cle| !svc_urls.contains_key(*cle))
             .collect();
