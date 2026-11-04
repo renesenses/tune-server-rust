@@ -491,18 +491,40 @@ async fn discover_podcasts(
 async fn top_podcasts(
     State(state): State<AppState>,
     Query(q): Query<TopQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let svc = PodcastService::with_client(state.http_client.clone())
         .avec_relais_podcast_index(RelaisPodcastIndex::du_compte(&state.backend));
-    match svc.top_podcasts(q.genre, &q.country).await {
+    let lang = crate::i18n::lang_from_header(&headers);
+    reponse_du_top(&svc, q.genre, &q.country, &lang).await
+}
+
+/// #7778 (point 9) — un palmarès qu'Apple ne rend pas (502 Bad Gateway du
+/// fil 2637) n'est pas une panne de Tune : la liste s'affiche vide, avec
+/// `unavailable` et une phrase traduite. Avant, `AppError::internal` en
+/// faisait une erreur 500.
+async fn reponse_du_top(
+    svc: &PodcastService,
+    genre: Option<u32>,
+    country: &str,
+    lang: &str,
+) -> Result<Json<Value>, AppError> {
+    match svc.top_podcasts(genre, country).await {
         Ok(podcasts) => Ok(Json(json!({
-            "genre": q.genre,
+            "genre": genre,
             "count": podcasts.len(),
             "items": podcasts,
         }))),
         Err(e) => {
-            warn!(genre = ?q.genre, error = %e, "top_podcasts_failed");
-            Err(AppError::internal(e))
+            warn!(genre = ?genre, error = %e, "top_podcasts_failed");
+            Ok(Json(json!({
+                "genre": genre,
+                "count": 0,
+                "items": [],
+                "unavailable": true,
+                "code": "top_podcasts_unavailable",
+                "message": crate::i18n::t(lang, "podcasts.top.unavailable"),
+            })))
         }
     }
 }
@@ -1316,6 +1338,9 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+#[path = "podcasts/palmares_indisponible_7778_tests.rs"]
+mod palmares_indisponible_7778_tests;
 #[cfg(test)]
 #[path = "podcasts/reprise_navigateur_7354_tests.rs"]
 mod reprise_navigateur_7354_tests;
