@@ -632,6 +632,7 @@ mod lecture;
 pub use lecture::*;
 mod presence;
 mod rattacher_asio_6120;
+mod sortie_reseau_absente_7279;
 // #6541 — boutons + / − et limites de volume d'une zone.
 mod limites_de_volume_6541;
 // #6721 — la garde contre les montées brusques, par le routeur public.
