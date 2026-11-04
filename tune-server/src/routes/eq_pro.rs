@@ -628,8 +628,8 @@ fn analyser_import(
         return Err(refus_import(
             "profile_too_large",
             format!(
-                "profil trop volumineux ({} octets) : un fichier AutoEq ParametricEQ \
-                 en fait quelques centaines",
+                "fichier trop volumineux ({} octets) : un fichier d'égaliseur \
+                 (AutoEq, Equalizer APO ou OPRA) en fait quelques kilo-octets",
                 texte.len()
             ),
             json!({ "max_bytes": TAILLE_MAX_PROFIL }),
@@ -640,10 +640,19 @@ fn analyser_import(
     // OPRA) fautive. Jamais de préréglage à moitié construit : rien n'est
     // écrit avant que le fichier entier soit lu sans faute.
     let profil = tune_core::audio::autoeq::analyser_fichier(texte).map_err(|e| {
+        // Seule la clé qui désigne un endroit part : `line` pour un texte,
+        // `band` pour un profil OPRA, rien quand l'erreur vise le fichier entier.
+        let mut endroit = serde_json::Map::new();
+        if let Some(ligne) = e.ligne() {
+            endroit.insert("line".into(), json!(ligne));
+        }
+        if let Some(bande) = e.bande() {
+            endroit.insert("band".into(), json!(bande));
+        }
         refus_import(
             e.cle(),
             format!("fichier d'égaliseur illisible — {e}"),
-            json!({ "line": e.ligne(), "band": e.bande() }),
+            Value::Object(endroit),
         )
     })?;
 

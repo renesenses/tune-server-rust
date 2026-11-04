@@ -14,6 +14,10 @@ use tower::ServiceExt;
 const HD_650: &str = include_str!("../../tune-core/tests/fixtures/autoeq/sennheiser_hd_650.txt");
 const APO: &str =
     include_str!("../../tune-core/tests/fixtures/egaliseur_6385/apo_rew_stereo_lg_tv.txt");
+const APO_SHP9500: &str =
+    include_str!("../../tune-core/tests/fixtures/egaliseur_6385/apo_philips_shp9500.txt");
+const APO_HYPERX: &str =
+    include_str!("../../tune-core/tests/fixtures/egaliseur_6385/apo_hyperx_cloud_ii_device.txt");
 const OPRA: &str = include_str!(
     "../../tune-core/tests/fixtures/egaliseur_6385/opra_sennheiser_hd650_oratory1990.json"
 );
@@ -147,24 +151,101 @@ async fn une_ligne_invalide_rend_une_erreur_nommee_sur_les_deux_routes() {
     assert_eq!(nombre_de_prereglages(&app).await, 0);
 }
 
-/// Le fichier Equalizer APO réel tel que publié : sa ligne `Device:` est
-/// refusée en nommant la ligne 1. Sans elle, ses 35 bandes dépassent les 31
-/// de l'égaliseur : refus chiffré, jamais de troncature.
+/// Une configuration Equalizer APO réelle, telle que publiée : l'aperçu rend
+/// ses bandes, leur gain, leur Q et le préampli sans rien écrire, puis
+/// l'import crée le préréglage qui porte exactement ces bandes.
 #[tokio::test]
-async fn le_fichier_apo_reel_est_refuse_nommement_et_sans_troncature() {
+async fn une_configuration_apo_reelle_se_previsualise_puis_simporte() {
     let app = app_premium().await;
-    let (status, corps) = post(&app, APERCU, json!({ "text": APO })).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "corps : {corps}");
-    assert_eq!(corps["code"], "unrecognized_line");
-    assert_eq!(corps["line"], 1);
+    let (status, apercu) = post(&app, APERCU, json!({ "text": APO_SHP9500 })).await;
+    assert_eq!(status, StatusCode::OK, "corps : {apercu}");
+    assert_eq!(apercu["format"], "parametric_eq");
+    assert_eq!(apercu["band_count"], 10);
+    assert!(proche(&apercu["preamp_db"], -12.5), "corps : {apercu}");
+    assert_eq!(apercu["ignored_filter_count"], 0);
+    let b = &apercu["bands"];
+    // `Filter: ON LSC Fc 35 Hz Gain 7 dB Q 0.71`
+    assert_eq!(b[0]["type"], "low_shelf");
+    assert!(proche(&b[0]["freq"], 35.0) && proche(&b[0]["gain"], 7.0) && proche(&b[0]["q"], 0.71));
+    // `Filter: ON PK Fc 2300 Hz Gain 4 dB Q 1.4`
+    assert_eq!(b[5]["type"], "peak");
+    assert!(proche(&b[5]["freq"], 2300.0) && proche(&b[5]["gain"], 4.0) && proche(&b[5]["q"], 1.4));
+    // `Filter: ON HSC Fc 11000 Hz Gain 0 dB Q 0.71`
+    assert_eq!(b[9]["type"], "high_shelf");
+    assert!(
+        proche(&b[9]["freq"], 11000.0) && proche(&b[9]["gain"], 0.0) && proche(&b[9]["q"], 0.71)
+    );
+    assert_eq!(
+        nombre_de_prereglages(&app).await,
+        0,
+        "l'aperçu a écrit un préréglage"
+    );
 
-    let sans_device = APO.split_once('\n').unwrap().1;
+    let (status, cree) = post(
+        &app,
+        IMPORT,
+        json!({ "text": APO_SHP9500, "name": "SHP9500" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "corps : {cree}");
+    assert!(proche(&cree["preamp_db"], -12.5), "corps : {cree}");
+    assert_eq!(
+        cree["preset"]["bands"], apercu["bands"],
+        "l'aperçu montre ce que l'import enregistre"
+    );
+    assert_eq!(nombre_de_prereglages(&app).await, 1);
+}
+
+/// Un fichier APO réel qui commence par `Device:` s'importe : la ligne est
+/// écartée et NOMMÉE (`device_selection`, ligne 1), le préampli et les bandes
+/// suivent.
+#[tokio::test]
+async fn la_ligne_device_dun_fichier_apo_reel_est_nommee_et_non_bloquante() {
+    let app = app_premium().await;
     for chemin in [APERCU, IMPORT] {
-        let (status, corps) = post(&app, chemin, json!({ "text": sans_device })).await;
+        let (status, corps) = post(&app, chemin, json!({ "text": APO_HYPERX })).await;
+        assert!(status.is_success(), "{chemin} : {status} {corps}");
+        assert_eq!(corps["band_count"], 10, "{chemin} : {corps}");
+        assert!(proche(&corps["preamp_db"], -6.4), "{chemin} : {corps}");
+        assert_eq!(corps["ignored_filter_count"], 1, "{chemin} : {corps}");
+        let ecartee = &corps["ignored_filters"][0];
+        assert_eq!(ecartee["line"], 1, "{chemin} : {corps}");
+        assert_eq!(ecartee["reason"], "device_selection", "{chemin} : {corps}");
+        assert!(ecartee["filter_type"].is_null(), "{chemin} : {corps}");
+        // L'aperçu rend `bands` ; l'import, le préréglage créé.
+        let bandes = if chemin == IMPORT {
+            &corps["preset"]["bands"]
+        } else {
+            &corps["bands"]
+        };
+        let b = &bandes[5];
+        // `Filter 6: ON HSC Fc 10000 Hz Gain -7.0 dB Q 0.70`
+        assert_eq!(b["type"], "high_shelf", "{chemin} : {corps}");
+        assert!(proche(&b["freq"], 10000.0) && proche(&b["gain"], -7.0) && proche(&b["q"], 0.7));
+    }
+    assert_eq!(nombre_de_prereglages(&app).await, 1);
+}
+
+/// Le fichier Equalizer APO réel de REW tel que publié : son `Device:` de tête
+/// est écarté, mais ses 35 bandes dépassent les 31 de l'égaliseur : refus
+/// chiffré, jamais de troncature. Un refus de fichier entier ne désigne ni
+/// ligne ni bande.
+#[tokio::test]
+async fn le_fichier_apo_reel_trop_long_est_refuse_sans_troncature() {
+    let app = app_premium().await;
+    for chemin in [APERCU, IMPORT] {
+        let (status, corps) = post(&app, chemin, json!({ "text": APO })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{chemin} : {corps}");
         assert_eq!(corps["code"], "too_many_bands", "{chemin} : {corps}");
         assert_eq!(corps["band_count"], 35);
         assert_eq!(corps["max_bands"], 31);
     }
+    let (status, corps) = post(&app, APERCU, json!({ "text": "Preamp: -3 dB\n" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "corps : {corps}");
+    assert_eq!(corps["code"], "no_active_filter");
+    assert!(
+        corps.get("line").is_none() && corps.get("band").is_none(),
+        "aucun endroit à désigner : {corps}"
+    );
     assert_eq!(nombre_de_prereglages(&app).await, 0);
 }

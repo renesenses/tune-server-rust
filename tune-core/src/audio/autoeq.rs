@@ -118,7 +118,8 @@ pub struct ProfilAutoEq {
     pub ignores: Vec<FiltreIgnore>,
 }
 
-/// Une ligne `Filter …` comprise mais qui ne produit pas de bande.
+/// Une ligne `Filter …` (ou l'en-tête `Device:` d'Equalizer APO) comprise
+/// mais qui ne produit pas de bande.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FiltreIgnore {
     /// Le numéro de la ligne dans le texte, à partir de 1 comme dans un
@@ -140,6 +141,10 @@ pub struct FiltreIgnore {
 pub enum RaisonIgnore {
     /// `Filter n: OFF` — le filtre est désactivé dans le fichier.
     Desactive,
+    /// #6385 — `Device: …` en tête d'une configuration Equalizer APO : le
+    /// périphérique Windows auquel APO l'appliquait. Tune applique le profil à
+    /// la zone choisie ; la ligne est écartée, et NOMMÉE.
+    Peripherique,
 }
 
 impl RaisonIgnore {
@@ -148,6 +153,7 @@ impl RaisonIgnore {
     pub fn cle(self) -> &'static str {
         match self {
             Self::Desactive => "disabled",
+            Self::Peripherique => "device_selection",
         }
     }
 }
@@ -156,6 +162,10 @@ impl std::fmt::Display for RaisonIgnore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Desactive => write!(f, "filtre désactivé dans le fichier (« OFF »)"),
+            Self::Peripherique => write!(
+                f,
+                "périphérique d'Equalizer APO (« Device: ») : le profil s'applique à la zone choisie"
+            ),
         }
     }
 }
@@ -390,13 +400,18 @@ pub fn analyser_fichier(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
 /// Analyse un profil AutoEq au format ParametricEQ.
 ///
 /// Accepte les fins de ligne `\n` et `\r\n`, les lignes vides, et les
-/// commentaires `#`, Preamp, Filter et les sélections stéréo Channel L/R/all.
-/// Les autres configurations APO restent refusées, jamais ignorées.
+/// commentaires `#`, Preamp, Filter et les sélections stéréo Channel L/R/all,
+/// ainsi qu'UNE ligne `Device:` en tête d'une configuration Equalizer APO
+/// (écartée et nommée, #6385). Un second `Device:`, ou un `Device:` après un
+/// réglage, découperait le fichier par périphérique : il reste refusé. Les
+/// autres configurations APO restent refusées, jamais ignorées.
 pub fn analyser(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
     let mut preamp_db = 0.0;
     let mut bandes = Vec::new();
     let mut ignores: Vec<FiltreIgnore> = Vec::new();
     let mut canaux: Option<Vec<u16>> = None;
+    // Vrai dès qu'une ligne utile (ou un premier `Device:`) a été lue.
+    let mut entete_passee = false;
 
     for (index, brute) in texte.lines().enumerate() {
         let ligne = index + 1;
@@ -406,6 +421,17 @@ pub fn analyser(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
         }
 
         let minuscules = contenu.to_ascii_lowercase();
+        let commande = contenu.split_once(':').map(|(c, _)| c.trim());
+        if commande.is_some_and(|c| c.eq_ignore_ascii_case("device")) && !entete_passee {
+            entete_passee = true;
+            ignores.push(FiltreIgnore {
+                ligne,
+                type_filtre: None,
+                raison: RaisonIgnore::Peripherique,
+            });
+            continue;
+        }
+        entete_passee = true;
         if let Some((commande, valeur)) = contenu.split_once(':')
             && commande.trim().eq_ignore_ascii_case("channel")
         {
