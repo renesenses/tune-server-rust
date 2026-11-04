@@ -132,6 +132,9 @@ pub mod motif_fin {
     /// position épinglée sur sa durée, URI de la piste finie, `SetNext`
     /// accepté — sans attendre `END_MARGIN_MS` sur l'horloge de Tune.
     pub const POSITION_EPINGLEE_PISTE_FINIE_DLNA: &str = "position_pinned_finished_uri_dlna";
+    /// #7700 — l'appareil DLNA a quitté notre piste en milieu de lecture
+    /// (« suivant » à sa télécommande) avec de l'audio encore en main.
+    pub const SUIVANT_DE_L_APPAREIL: &str = "dlna_device_skipped_track";
 }
 
 /// Sondages à tenir avant de prononcer la fin « position au-delà de la fin ».
@@ -200,6 +203,10 @@ pub fn plancher_de_detection_ms(motif: &str) -> u64 {
         // Un sondage pour voir la position inchangée sur la durée rapportée
         // (au moins un de plus quand le bout caché par l'arrondi est long).
         motif_fin::POSITION_EPINGLEE_PISTE_FINIE_DLNA => tick,
+        // #7700 — deux sondages `Stopped` d'affilée.
+        motif_fin::SUIVANT_DE_L_APPAREIL => {
+            super::suivant_de_l_appareil_7700::TOURS_D_ARRET_DU_SUIVANT as u64 * tick
+        }
         _ => 0,
     }
 }

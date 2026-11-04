@@ -1399,6 +1399,12 @@ mod pause_de_l_appareil_7418;
 #[cfg(test)]
 mod pause_de_l_appareil_7418_tests;
 
+/// #7700 — un « suivant » pressé sur l'appareil DLNA (télécommande Eversolo)
+/// enchaîne la file de Tune en quelques secondes.
+mod suivant_de_l_appareil_7700;
+#[cfg(test)]
+mod suivant_de_l_appareil_7700_tests;
+
 #[cfg(test)]
 mod lecture_sans_destination_tests;
 
