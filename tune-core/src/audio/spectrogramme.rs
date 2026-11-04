@@ -228,13 +228,13 @@ impl Accumulateur {
             // Deux voisines n'en font plus qu'une : la mémoire reste bornée,
             // la résolution en temps est divisée par deux.
             let anciennes = std::mem::take(&mut self.tranches);
-            let mut paires = anciennes.chunks_exact(2);
-            for paire in paires.by_ref() {
-                let mut a = paire[0].clone();
-                max_en_place(&mut a, &paire[1]);
-                self.tranches.push(a);
+            let (paires, reste) = anciennes.as_chunks::<2>();
+            for [a, b] in paires {
+                let mut fusion = a.clone();
+                max_en_place(&mut fusion, b);
+                self.tranches.push(fusion);
             }
-            self.tranches.extend(paires.remainder().iter().cloned());
+            self.tranches.extend(reste.iter().cloned());
             self.trames_par_tranche *= 2;
         }
     }
