@@ -69,7 +69,13 @@ pub fn tache_suspendable(id: &str) -> Option<Tache> {
         "enrich_all" | "bios" | "credits_enrich_auto" | "types_de_sortie" | "credits_releases" => {
             Some(Tache::Enrichissement)
         }
-        "artist_artwork" | "artwork" => Some(Tache::ImagesArtistes),
+        // `album_artwork` : la passe des pochettes d'albums (inscrite sous
+        // `artwork` avant l'écran des images, 01/11/2026) ; elle attend son
+        // tour sur `Tache::ImagesArtistes`, comme les portraits.
+        "artist_artwork" | "artwork" | "album_artwork" => Some(Tache::ImagesArtistes),
+        // `label_logos` n'est PAS rangé ici : la passe Qobuz ne consulte
+        // aucune pause, et la carte « Enrichissement » se dirait en cours
+        // pendant une passe de logos.
         "identification_lot" => Some(Tache::Identification),
         // La plage dynamique à la demande (#4185).
         "dynamic_range" => Some(Tache::PlageDynamique),
@@ -134,6 +140,46 @@ impl BackgroundTasks {
             tasks: self.clone(),
             id,
         }
+    }
+
+    /// Comme [`Self::begin`], mais SEULEMENT si aucune tâche `id` n'est
+    /// inscrite : `None` quand elle tourne déjà. La vérification et
+    /// l'inscription se font sous le même verrou, si bien que deux clics
+    /// simultanés ne lancent qu'une passe (écran « État du serveur »,
+    /// 01/11/2026 : `label_logos`, `album_artwork`).
+    pub fn try_begin(
+        &self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        kind: impl Into<String>,
+    ) -> Option<TaskGuard> {
+        let id = id.into();
+        {
+            let mut map = self.inner.lock().unwrap();
+            if map.contains_key(&id) {
+                return None;
+            }
+            map.insert(
+                id.clone(),
+                BackgroundTask {
+                    id: id.clone(),
+                    label: label.into(),
+                    kind: kind.into(),
+                    progress: None,
+                    paused: false,
+                },
+            );
+        }
+        self.emit();
+        Some(TaskGuard {
+            tasks: self.clone(),
+            id,
+        })
+    }
+
+    /// La tâche `id` est-elle inscrite, et où en est-elle ?
+    pub fn get(&self, id: &str) -> Option<BackgroundTask> {
+        self.inner.lock().unwrap().get(id).cloned()
     }
 
     /// Attach/refresh granular progress on an already-registered task. No-op if

@@ -12,6 +12,9 @@ use tune_core::updater::{ReleaseAsset, ReleaseInfo, UpdateChannel, UpdateChecker
 
 use crate::state::AppState;
 
+#[path = "installation_sure_7756.rs"]
+mod installation_sure;
+
 use super::paquet_macos::{self, VoieMiseAJour};
 
 /// An in-progress library scan older than this is treated as stale (a scan
@@ -2557,7 +2560,7 @@ pub(super) async fn update_install(
     {
         let phase = state.update_phase.lock().unwrap();
         if let Some(ref p) = *phase
-            && !p.starts_with("failed")
+            && suivi::bloque_une_nouvelle_tentative(Some(p))
         {
             return (
                 StatusCode::CONFLICT,
@@ -2578,6 +2581,9 @@ pub(super) async fn update_install(
     // can present as guidance rather than a failure.
     if running_in_docker() {
         info!("update_skipped_docker");
+        // #7600 — la raison est aussi posée sur la route de suivi : un écran
+        // qui n'a pas lu cette réponse ne tourne plus dans le vide.
+        noter_l_echec(&state, raison::DOCKER, DOCKER_UPDATE_HINT);
         return (StatusCode::OK, Json(docker_update_result())).into_response();
     }
 
@@ -2663,6 +2669,11 @@ pub(super) async fn update_install(
         );
         let _ = SettingsRepo::with_backend(state.backend.clone())
             .set("last_update_result", &refusal.to_string());
+        noter_l_echec(
+            &state,
+            raison::PACKAGE_MANAGED,
+            refusal["message"].as_str().unwrap_or(HOMEBREW_UPDATE_HINT),
+        );
         // 409 et non 200. Le refus n'est pas une erreur du serveur, mais rendu
         // en 200 il était INDISCERNABLE d'un succès pour son unique
         // consommateur — le client web, qui ne teste que `res.ok` — et laissait
@@ -2680,14 +2691,17 @@ pub(super) async fn update_install(
         && dir.join(".no-auto-update").exists()
     {
         warn!("update_blocked_no_auto_update_flag");
+        let message =
+            "Update blocked: .no-auto-update flag file exists. Remove it to allow updates.";
+        noter_l_echec(&state, raison::PACKAGE_MANAGED, message);
         return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "status": "blocked",
-                    "message": "Update blocked: .no-auto-update flag file exists. Remove it to allow updates."
-                })),
-            )
-                .into_response();
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "blocked",
+                "message": message
+            })),
+        )
+            .into_response();
     }
 
     // Guard: the install stages the new binary next to the running one, so a
@@ -2703,18 +2717,20 @@ pub(super) async fn update_install(
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "the account running Tune".into());
         warn!(dir = %dir.display(), user = %user, error = %e, "update_blocked_dir_not_writable");
+        let message = format!(
+            "Tune cannot install the update: the folder holding the binary ({}) is not writable by {user} ({e}). Fix the ownership of that folder — e.g. sudo chown -R {user} {} — or install the new version by hand, then retry.",
+            dir.display(),
+            dir.display()
+        );
+        noter_l_echec(&state, raison::NOT_WRITABLE, &message);
         return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "status": "not_writable",
-                    "message": format!(
-                        "Tune cannot install the update: the folder holding the binary ({}) is not writable by {user} ({e}). Fix the ownership of that folder — e.g. sudo chown -R {user} {} — or install the new version by hand, then retry.",
-                        dir.display(),
-                        dir.display()
-                    )
-                })),
-            )
-                .into_response();
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "not_writable",
+                "message": message
+            })),
+        )
+            .into_response();
     }
 
     // Guard: don't restart while a library scan is running. A full cold scan of
@@ -2780,16 +2796,20 @@ pub(super) async fn update_install(
     let release = match checker.check().await {
         Ok(Some(r)) => r,
         Ok(None) => {
+            let message = "Already running the latest version";
+            suivi::noter_a_jour(&state.update_phase, &state.update_issue, message);
             return (
                 StatusCode::OK,
-                Json(json!({"status": "up_to_date", "message": "Already running the latest version"})),
+                Json(json!({"status": "up_to_date", "message": message})),
             )
                 .into_response();
         }
         Err(e) => {
+            let message = format!("Failed to check for updates: {e}");
+            noter_l_echec(&state, raison::CHECK_FAILED, &message);
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"status": "error", "message": format!("Failed to check for updates: {e}")})),
+                Json(json!({"status": "error", "message": message})),
             )
                 .into_response();
         }
@@ -2798,9 +2818,11 @@ pub(super) async fn update_install(
     let asset = match find_archive_asset(&release) {
         Some(a) => a.clone(),
         None => {
+            let message = "No compatible archive found for this platform";
+            noter_l_echec(&state, raison::NO_ASSET, message);
             return (
                 StatusCode::NOT_FOUND,
-                Json(json!({"status": "error", "message": "No compatible archive found for this platform"})),
+                Json(json!({"status": "error", "message": message})),
             )
                 .into_response();
         }
@@ -2858,17 +2880,16 @@ pub(super) async fn update_install(
         .map(|a| a.browser_download_url.clone());
 
     // 2. Mark phase = downloading and spawn the background task
-    {
-        let mut phase = state.update_phase.lock().unwrap();
-        *phase = Some("downloading".into());
-    }
+    suivi::poser_la_phase(&state.update_phase, &state.update_issue, "downloading");
 
     let version = release.version.clone();
     let response_version = version.clone();
     let http_client = state.http_client.clone();
     let update_phase = state.update_phase.clone();
+    let update_issue = state.update_issue.clone();
+    let (phase_suivie, issue_suivie) = (update_phase.clone(), update_issue.clone());
 
-    tokio::spawn(async move {
+    let tache = tokio::spawn(async move {
         let set_phase = |p: &str| {
             // Log every phase, and warn on failures — set_phase was previously
             // silent, so a failed install (e.g. permission denied when Tune is
@@ -2879,7 +2900,8 @@ pub(super) async fn update_install(
             } else {
                 info!(phase = %p, "update_phase");
             }
-            *update_phase.lock().unwrap() = Some(p.to_string());
+            // #7600 — un échec retient sa raison, lue par la route de suivi.
+            suivi::poser_la_phase(&update_phase, &update_issue, p);
         };
 
         // --- Download ---
@@ -3016,6 +3038,27 @@ pub(super) async fn update_install(
             }
 
             let is_zip = asset.name.to_lowercase().ends_with(".zip");
+            // #7756 — sous Unix, la taille du binaire annoncée par l'archive
+            // (comparée au `.new` écrit) et la place vérifiée AVANT d'extraire.
+            let mut taille_annoncee = None;
+            if !cfg!(windows) {
+                match installation_sure::contenu_de_l_archive(&archive_bytes, is_zip, "tune-server")
+                    .and_then(|contenu| {
+                        installation_sure::verifier_la_place(
+                            &tmp_dir,
+                            contenu.totale + installation_sure::MARGE_DE_PLACE,
+                            installation_sure::place_libre,
+                        )?;
+                        Ok(contenu.binaire)
+                    }) {
+                    Ok(taille) => taille_annoncee = taille,
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&tmp_dir);
+                        set_phase(&format!("failed: {e}"));
+                        return;
+                    }
+                }
+            }
             if let Err(e) = extract_archive(&archive_bytes, &tmp_dir, is_zip) {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 set_phase(&format!("failed: Extraction failed: {e}"));
@@ -3102,6 +3145,7 @@ pub(super) async fn update_install(
                         &std::env::current_exe,
                         &new_binary,
                         &tmp_dir,
+                        &installation_sure::Controles::de_cette_machine(taille_annoncee),
                     )
                     .map(|relance| (relance, None))
                 }
@@ -3247,6 +3291,13 @@ pub(super) async fn update_install(
             relancer_le_serveur(&state, &current_exe, relance_par_le_paquet.as_deref()).await;
         }
     });
+    // #7600 — une tâche qui meurt sans poser d'échec ne laisse plus « en
+    // cours » pour toujours.
+    tokio::spawn(suivi::surveiller_la_tache(
+        tache,
+        phase_suivie,
+        issue_suivie,
+    ));
 
     // Return immediately — client polls /system/update/status
     Json(json!({
@@ -3649,6 +3700,7 @@ fn installer_unix_et_designer_la_relance(
     lire_exe: &dyn Fn() -> std::io::Result<std::path::PathBuf>,
     new_binary: &std::path::Path,
     tmp_dir: &std::path::Path,
+    controles: &installation_sure::Controles,
 ) -> Result<std::path::PathBuf, String> {
     let exe_lu = lire_exe().map_err(|e| format!("Cannot determine current exe: {e}"))?;
     let binaire = crate::binaire_installe::chemin_d_installation(&exe_lu);
@@ -3658,7 +3710,7 @@ fn installer_unix_et_designer_la_relance(
         en_cours = %en_cours.display(),
         "update_install_starting"
     );
-    install_unix(&binaire, &en_cours, new_binary, tmp_dir)?;
+    install_unix(&binaire, &en_cours, new_binary, tmp_dir, controles)?;
     Ok(binaire)
 }
 
@@ -3669,11 +3721,16 @@ fn installer_unix_et_designer_la_relance(
 /// binaire qui tourne (processus relancé depuis `.old` par une version
 /// affectée), on n'y touche pas : ni suppression, ni renommage par-dessus.
 /// Le neuf remplace `binaire`, qui ne tourne pas, sans sauvegarde.
+///
+/// #7756 — rien ne touche à l'ancien binaire tant que le neuf n'est pas
+/// écrit sur le disque (`sync_all`) et validé ([`installation_sure`]) ; un
+/// échec après la mise de côté, `web/` compris, remet l'ancien en place.
 fn install_unix(
     binaire: &std::path::Path,
     en_cours: &std::path::Path,
     new_binary: &std::path::Path,
     tmp_dir: &std::path::Path,
+    controles: &installation_sure::Controles,
 ) -> Result<(), String> {
     let exe_dir = binaire
         .parent()
@@ -3688,8 +3745,22 @@ fn install_unix(
             .map_err(|e| format!("chmod: {e}"))?;
     }
 
+    // Place : le `.new` et la copie de `web/` s'écrivent à côté de l'ancien.
+    let taille_neuve = std::fs::metadata(new_binary)
+        .map_err(|e| format!("read new binary: {e}"))?
+        .len();
+    let besoin = taille_neuve
+        + installation_sure::taille_du_dossier(&tmp_dir.join("web"))
+        + installation_sure::MARGE_DE_PLACE;
+    installation_sure::verifier_la_place(exe_dir, besoin, controles.place_libre)?;
+
     let staging = binaire.with_extension("new");
-    std::fs::copy(new_binary, &staging).map_err(|e| format!("copy new binary: {e}"))?;
+    installation_sure::ecrire_durablement(new_binary, &staging)?;
+    if let Err(e) = installation_sure::valider_binaire(&staging, controles) {
+        std::fs::remove_file(&staging).ok();
+        error!(error = %e, "update_new_binary_rejected");
+        return Err(format!("{e} — previous binary kept"));
+    }
 
     let sauvegarde_en_cours = old_exe == en_cours;
     let sauvegarde_faite = if sauvegarde_en_cours || !binaire.exists() {
@@ -3703,19 +3774,43 @@ fn install_unix(
         if old_exe.exists() {
             std::fs::remove_file(&old_exe).ok();
         }
-        std::fs::rename(binaire, &old_exe).map_err(|e| format!("rename current to .old: {e}"))?;
+        if let Err(e) = std::fs::rename(binaire, &old_exe) {
+            std::fs::remove_file(&staging).ok();
+            return Err(format!("rename current to .old: {e}"));
+        }
         true
+    };
+
+    // Remet l'ancien sous le nom d'installation après un échec.
+    let restaurer = |cause: String| -> String {
+        if !sauvegarde_faite {
+            return cause;
+        }
+        let retour = std::fs::rename(&old_exe, binaire);
+        installation_sure::synchroniser_dossier(exe_dir);
+        match retour {
+            Ok(()) => format!("{cause} — previous binary restored"),
+            Err(e) => {
+                error!(error = %e, "update_rollback_failed");
+                format!(
+                    "{cause} — previous binary NOT restored ({e}), it is at {}",
+                    old_exe.display()
+                )
+            }
+        }
     };
 
     if let Err(e) = std::fs::rename(&staging, binaire) {
         error!(error = %e, "rename_new_to_current_failed, rolling back");
-        if sauvegarde_faite {
-            std::fs::rename(&old_exe, binaire).ok();
-        }
-        return Err(format!("rename .new to current: {e}"));
+        std::fs::remove_file(&staging).ok();
+        return Err(restaurer(format!("rename .new to current: {e}")));
     }
+    installation_sure::synchroniser_dossier(exe_dir);
 
-    update_web_dir(exe_dir, tmp_dir)?;
+    if let Err(e) = (controles.mettre_a_jour_web)(exe_dir, tmp_dir) {
+        error!(error = %e, "update_web_failed, rolling back binary");
+        return Err(restaurer(e));
+    }
 
     Ok(())
 }
@@ -4075,9 +4170,24 @@ mod web_swap_tests {
     }
 }
 
+use super::suivi_de_mise_a_jour_7600::{self as suivi, raison};
+
+/// Pose un échec explicite sur la route de suivi (#7600).
+fn noter_l_echec(state: &AppState, raison: &'static str, message: &str) {
+    suivi::noter_l_echec(&state.update_phase, &state.update_issue, raison, message);
+}
+
 /// GET /system/update/status
 pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> {
     let phase = state.update_phase.lock().unwrap().clone();
+    // #7600 — `status`, `reason`, `message` : l'état lisible par une machine,
+    // et la raison de tout échec ou refus.
+    let issue = state
+        .update_issue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let etat = suivi::etat_de_suivi(phase.as_deref(), issue.as_ref());
     // La progression d'une mise à jour Homebrew est sur le DISQUE, hors du
     // Cellar, parce qu'elle doit traverser le redémarrage : `update_phase` est
     // en mémoire et le processus qui l'a posée n'existe plus quand l'écran
@@ -4157,6 +4267,9 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
         "current_version": tune_core::version(),
         "phase": phase,
         "update_in_progress": phase.is_some() && !is_failed,
+        "status": etat["status"],
+        "reason": etat["reason"],
+        "message": etat["message"],
         "last_update_result": last_update_result,
         "available_update": available_update,
         // #2266 — d'ou vient ce serveur. Un FAIT, pas un bouton : l'ecran peut
@@ -7481,7 +7594,16 @@ mod relance_apres_installation_5461 {
     fn installer(p: &RefCell<Processus>, racine: &Path, version: &str) -> Result<PathBuf, String> {
         let (neuf, extraction) = archive(racine, version);
         let lire = || -> std::io::Result<PathBuf> { Ok(p.borrow().exe()) };
-        installer_unix_et_designer_la_relance(&lire, &neuf, &extraction)
+        // Des « binaires » texte : seuls la taille et le retour en arrière
+        // sont contrôlés ici (#7756 a ses propres témoins).
+        let controles = super::installation_sure::Controles {
+            taille_attendue: None,
+            place_libre: |_| Ok(u64::MAX),
+            architecture: None,
+            essai: |_| Ok(()),
+            mettre_a_jour_web: super::update_web_dir,
+        };
+        installer_unix_et_designer_la_relance(&lire, &neuf, &extraction, &controles)
     }
 
     /// La relance fait un `exec` : le processus exécute désormais ce fichier.
