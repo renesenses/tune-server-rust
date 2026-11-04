@@ -75,6 +75,8 @@ pub mod playlist_manager;
 pub mod playlists;
 pub mod plugins;
 pub mod podcasts;
+/// Contrôle parental, étape 1 (#7856).
+pub mod politique_parentale;
 pub mod profil_par_appareil;
 pub mod profiles;
 pub mod radios;
@@ -644,6 +646,11 @@ pub fn router_with_plugins(
         });
 
     let api = api
+        // #7856 — sous l'authentification : le profil appelant est connu.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            politique_parentale::filtrer_les_listes,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::auth_middleware,

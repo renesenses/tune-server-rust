@@ -176,6 +176,13 @@ pub fn router() -> Router<AppState> {
             get(get_profile).put(update_profile).delete(delete_profile),
         )
         .route("/{id}/activate", post(activate_profile))
+        // #7856 — la politique du contrôle parental, réservée au superviseur.
+        .route(
+            "/{id}/politique-parentale",
+            get(super::politique_parentale::lire)
+                .put(super::politique_parentale::poser)
+                .delete(super::politique_parentale::retirer),
+        )
         .route("/{id}/favorites", get(list_favorites))
         .route("/{id}/favorites/add", post(add_favorite))
         .route("/{id}/favorites/remove", post(remove_favorite))
