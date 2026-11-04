@@ -133,9 +133,13 @@ async fn en_pause_la_position_n_est_pas_demandee_7084() {
 /// le message « composant AirPlay 2 manquant », et la zone est signalée.
 #[tokio::test]
 async fn un_demon_introuvable_dit_le_composant_manquant_7084() {
-    let absent = std::env::temp_dir()
-        .join("tune-7084-absent")
-        .join(daemon_exe_name());
+    // Un dossier à soi, supprimé à la fin du test (#3030), dans lequel le
+    // démon n'existe pas.
+    let dossier = crate::test_scratch::scratch_dir("tune-7084-absent");
+    let absent = dossier.path().join(daemon_exe_name());
+    // La substitution vaut pour tout le processus de test de tune-core : aucun
+    // autre test de la caisse ne lance le démon aujourd'hui ; un test qui le
+    // ferait devra déclarer son propre substitut avant de lancer la lecture.
     crate::services_factices::substituer_programme(DAEMON_BINARY, absent.to_str().unwrap());
     let device_id = "airplay-mania-7084-absent";
     let output = sortie(device_id);
