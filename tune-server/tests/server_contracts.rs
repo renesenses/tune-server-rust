@@ -17,8 +17,6 @@ mod annonce_forum_bornes;
 mod auth_security;
 #[path = "autoeq_import_route.rs"]
 mod autoeq_import_route;
-#[path = "import_egaliseur_6385.rs"]
-mod import_egaliseur_6385;
 #[path = "bandcamp_file_de_zone_i2702.rs"]
 mod bandcamp_file_de_zone_i2702;
 #[path = "bios_bilan_visible.rs"]
@@ -65,6 +63,8 @@ mod enrich_artiste_langue_entete;
 mod enrichissement_repertoire;
 #[path = "eq_refus_premium_localise.rs"]
 mod eq_refus_premium_localise;
+#[path = "import_egaliseur_6385.rs"]
+mod import_egaliseur_6385;
 // Etiqueter un album de STREAMING : les deux espaces d'identifiants (#3699).
 #[path = "etiquettes_streaming_3699.rs"]
 mod etiquettes_streaming_3699;
