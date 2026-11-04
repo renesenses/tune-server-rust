@@ -2560,7 +2560,7 @@ pub(super) async fn update_install(
     {
         let phase = state.update_phase.lock().unwrap();
         if let Some(ref p) = *phase
-            && !p.starts_with("failed")
+            && suivi::bloque_une_nouvelle_tentative(Some(p))
         {
             return (
                 StatusCode::CONFLICT,
@@ -2581,6 +2581,9 @@ pub(super) async fn update_install(
     // can present as guidance rather than a failure.
     if running_in_docker() {
         info!("update_skipped_docker");
+        // #7600 — la raison est aussi posée sur la route de suivi : un écran
+        // qui n'a pas lu cette réponse ne tourne plus dans le vide.
+        noter_l_echec(&state, raison::DOCKER, DOCKER_UPDATE_HINT);
         return (StatusCode::OK, Json(docker_update_result())).into_response();
     }
 
@@ -2666,6 +2669,11 @@ pub(super) async fn update_install(
         );
         let _ = SettingsRepo::with_backend(state.backend.clone())
             .set("last_update_result", &refusal.to_string());
+        noter_l_echec(
+            &state,
+            raison::PACKAGE_MANAGED,
+            refusal["message"].as_str().unwrap_or(HOMEBREW_UPDATE_HINT),
+        );
         // 409 et non 200. Le refus n'est pas une erreur du serveur, mais rendu
         // en 200 il était INDISCERNABLE d'un succès pour son unique
         // consommateur — le client web, qui ne teste que `res.ok` — et laissait
@@ -2683,14 +2691,17 @@ pub(super) async fn update_install(
         && dir.join(".no-auto-update").exists()
     {
         warn!("update_blocked_no_auto_update_flag");
+        let message =
+            "Update blocked: .no-auto-update flag file exists. Remove it to allow updates.";
+        noter_l_echec(&state, raison::PACKAGE_MANAGED, message);
         return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "status": "blocked",
-                    "message": "Update blocked: .no-auto-update flag file exists. Remove it to allow updates."
-                })),
-            )
-                .into_response();
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "blocked",
+                "message": message
+            })),
+        )
+            .into_response();
     }
 
     // Guard: the install stages the new binary next to the running one, so a
@@ -2706,18 +2717,20 @@ pub(super) async fn update_install(
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "the account running Tune".into());
         warn!(dir = %dir.display(), user = %user, error = %e, "update_blocked_dir_not_writable");
+        let message = format!(
+            "Tune cannot install the update: the folder holding the binary ({}) is not writable by {user} ({e}). Fix the ownership of that folder — e.g. sudo chown -R {user} {} — or install the new version by hand, then retry.",
+            dir.display(),
+            dir.display()
+        );
+        noter_l_echec(&state, raison::NOT_WRITABLE, &message);
         return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "status": "not_writable",
-                    "message": format!(
-                        "Tune cannot install the update: the folder holding the binary ({}) is not writable by {user} ({e}). Fix the ownership of that folder — e.g. sudo chown -R {user} {} — or install the new version by hand, then retry.",
-                        dir.display(),
-                        dir.display()
-                    )
-                })),
-            )
-                .into_response();
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "not_writable",
+                "message": message
+            })),
+        )
+            .into_response();
     }
 
     // Guard: don't restart while a library scan is running. A full cold scan of
@@ -2783,16 +2796,20 @@ pub(super) async fn update_install(
     let release = match checker.check().await {
         Ok(Some(r)) => r,
         Ok(None) => {
+            let message = "Already running the latest version";
+            suivi::noter_a_jour(&state.update_phase, &state.update_issue, message);
             return (
                 StatusCode::OK,
-                Json(json!({"status": "up_to_date", "message": "Already running the latest version"})),
+                Json(json!({"status": "up_to_date", "message": message})),
             )
                 .into_response();
         }
         Err(e) => {
+            let message = format!("Failed to check for updates: {e}");
+            noter_l_echec(&state, raison::CHECK_FAILED, &message);
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"status": "error", "message": format!("Failed to check for updates: {e}")})),
+                Json(json!({"status": "error", "message": message})),
             )
                 .into_response();
         }
@@ -2801,9 +2818,11 @@ pub(super) async fn update_install(
     let asset = match find_archive_asset(&release) {
         Some(a) => a.clone(),
         None => {
+            let message = "No compatible archive found for this platform";
+            noter_l_echec(&state, raison::NO_ASSET, message);
             return (
                 StatusCode::NOT_FOUND,
-                Json(json!({"status": "error", "message": "No compatible archive found for this platform"})),
+                Json(json!({"status": "error", "message": message})),
             )
                 .into_response();
         }
@@ -2861,17 +2880,16 @@ pub(super) async fn update_install(
         .map(|a| a.browser_download_url.clone());
 
     // 2. Mark phase = downloading and spawn the background task
-    {
-        let mut phase = state.update_phase.lock().unwrap();
-        *phase = Some("downloading".into());
-    }
+    suivi::poser_la_phase(&state.update_phase, &state.update_issue, "downloading");
 
     let version = release.version.clone();
     let response_version = version.clone();
     let http_client = state.http_client.clone();
     let update_phase = state.update_phase.clone();
+    let update_issue = state.update_issue.clone();
+    let (phase_suivie, issue_suivie) = (update_phase.clone(), update_issue.clone());
 
-    tokio::spawn(async move {
+    let tache = tokio::spawn(async move {
         let set_phase = |p: &str| {
             // Log every phase, and warn on failures — set_phase was previously
             // silent, so a failed install (e.g. permission denied when Tune is
@@ -2882,7 +2900,8 @@ pub(super) async fn update_install(
             } else {
                 info!(phase = %p, "update_phase");
             }
-            *update_phase.lock().unwrap() = Some(p.to_string());
+            // #7600 — un échec retient sa raison, lue par la route de suivi.
+            suivi::poser_la_phase(&update_phase, &update_issue, p);
         };
 
         // --- Download ---
@@ -3272,6 +3291,13 @@ pub(super) async fn update_install(
             relancer_le_serveur(&state, &current_exe, relance_par_le_paquet.as_deref()).await;
         }
     });
+    // #7600 — une tâche qui meurt sans poser d'échec ne laisse plus « en
+    // cours » pour toujours.
+    tokio::spawn(suivi::surveiller_la_tache(
+        tache,
+        phase_suivie,
+        issue_suivie,
+    ));
 
     // Return immediately — client polls /system/update/status
     Json(json!({
@@ -4144,9 +4170,24 @@ mod web_swap_tests {
     }
 }
 
+use super::suivi_de_mise_a_jour_7600::{self as suivi, raison};
+
+/// Pose un échec explicite sur la route de suivi (#7600).
+fn noter_l_echec(state: &AppState, raison: &'static str, message: &str) {
+    suivi::noter_l_echec(&state.update_phase, &state.update_issue, raison, message);
+}
+
 /// GET /system/update/status
 pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> {
     let phase = state.update_phase.lock().unwrap().clone();
+    // #7600 — `status`, `reason`, `message` : l'état lisible par une machine,
+    // et la raison de tout échec ou refus.
+    let issue = state
+        .update_issue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let etat = suivi::etat_de_suivi(phase.as_deref(), issue.as_ref());
     // La progression d'une mise à jour Homebrew est sur le DISQUE, hors du
     // Cellar, parce qu'elle doit traverser le redémarrage : `update_phase` est
     // en mémoire et le processus qui l'a posée n'existe plus quand l'écran
@@ -4226,6 +4267,9 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
         "current_version": tune_core::version(),
         "phase": phase,
         "update_in_progress": phase.is_some() && !is_failed,
+        "status": etat["status"],
+        "reason": etat["reason"],
+        "message": etat["message"],
         "last_update_result": last_update_result,
         "available_update": available_update,
         // #2266 — d'ou vient ce serveur. Un FAIT, pas un bouton : l'ecran peut
