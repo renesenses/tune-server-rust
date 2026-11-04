@@ -1,5 +1,5 @@
 [workspace]
-members = ["tune-plugin-sdk", "tune-plugin-testkit", "cargo-tune-plugin", "tune-plugin-audio-support", "tune-plugin-equalizer", "tune-plugin-crossfeed", "tune-plugin-converter", "tune-plugin-declick", "tune-plugin-channel-remap", "tune-plugin-abi", "tune-plugin-native"]
+members = ["tune-plugin-sdk", "tune-plugin-testkit", "cargo-tune-plugin", "tune-plugin-audio-support", "tune-plugin-equalizer", "tune-plugin-crossfeed", "tune-plugin-converter", "tune-plugin-declick", "tune-plugin-channel-remap", "tune-plugin-abi", "tune-plugin-native", "tune-plugin-surechantillonnage"]
 resolver = "2"
 
 [workspace.package]
@@ -14,3 +14,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tune-plugin-sdk = { path = "tune-plugin-sdk" }
 tune-plugin-testkit = { path = "tune-plugin-testkit" }
+
+# #7614 : les gabarits du suréchantillonneur conçoivent des noyaux de 4 096 ×
+# 16 coefficients et leur phase minimale par FFT ; sans optimisation, les
+# tests de la crate prennent plusieurs minutes.
+[profile.dev.package.tune-plugin-surechantillonnage]
+opt-level = 2
