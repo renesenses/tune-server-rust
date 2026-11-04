@@ -415,3 +415,117 @@ fn une_entree_a_la_mauvaise_cadence_est_refusee() {
     assert!(e.contains("44100"), "{e}");
     assert!(hote.journal().volumes.is_empty());
 }
+
+/// C2 de bout en bout, par les routes : la mesure du salon sec donne un
+/// égaliseur qui coupe ses modes (42 et 68 Hz) sans rien relever, vérifié sur
+/// la VRAIE réponse de la pièce simulée (pas sur la mesure qui l'a produit) ;
+/// les bornes sont refusées ; le profil de pièce est enregistré pour la zone
+/// mesurée et rien d'autre n'est touché.
+#[test]
+fn la_mesure_simulee_donne_un_egaliseur_qui_coupe_les_modes_sans_relever() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use tune_calibration::eq::{Band, bands_response_db};
+    use tune_calibration_greffon::routes::{EtatRoutes, router};
+
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let b = banc(&sim, 1.0, Some(63.0), "correction");
+    let id = b.controleur.lancer(demande(7)).expect("lancée");
+    assert_eq!(
+        attendre_fin(&b.controleur, &id, Duration::from_secs(60)),
+        Etat::Terminee
+    );
+    let app = router(EtatRoutes {
+        controleur: b.controleur.clone(),
+    });
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let poster = |chemin: String, corps: serde_json::Value| {
+        let app = app.clone();
+        rt.block_on(async move {
+            let r = app
+                .oneshot(
+                    Request::post(chemin)
+                        .header("content-type", "application/json")
+                        .body(Body::from(corps.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let code = r.status();
+            let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                code,
+                serde_json::from_slice::<serde_json::Value>(&octets).unwrap(),
+            )
+        })
+    };
+
+    let (code, p) = poster(format!("/mesures/{id}/correction"), serde_json::json!({}));
+    assert_eq!(code, StatusCode::OK, "{p}");
+    let bandes: Vec<Band> = serde_json::from_value(p["bandes"].clone()).unwrap();
+    assert!(!bandes.is_empty(), "{p}");
+    assert!(
+        bandes.iter().all(|b| b.gain <= 0.0),
+        "relance proposée : {bandes:?}"
+    );
+    assert!(bandes.len() <= 8);
+    assert_eq!(
+        p["egaliseur"]["bands"].as_array().unwrap().len(),
+        bandes.len()
+    );
+
+    // Vérification sur la pièce vraie : modes + égaliseur proposé.
+    let fs = FREQUENCE_MESURE as f64;
+    let grille = tune_calibration::analysis::LogResponse::grid(20.0, 300.0, 48);
+    let vraie = bands_response_db(fs, &sim.modes_as_bands(), &grille);
+    let eq = bands_response_db(fs, &bandes, &grille);
+    let a = |v: &[f64], f: f64| v[grille.iter().position(|g| *g >= f).unwrap()];
+    for f in [42.0, 68.0] {
+        let apres = a(&vraie, f) + a(&eq, f);
+        assert!(
+            apres < a(&vraie, f) - 3.0,
+            "mode {f} Hz : {:.1} dB avant, {apres:.1} dB après ({bandes:?})",
+            a(&vraie, f)
+        );
+    }
+    assert!(
+        eq.iter().all(|g| *g <= 1e-9),
+        "l'égaliseur relève quelque part entre 20 et 300 Hz : {:.2} dB",
+        eq.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+    );
+    assert!(p["coupe_cumulee_db"].as_f64().unwrap() >= -12.0 - 1e-6);
+
+    // Bornes : refus motivé, pas d'écrêtage silencieux.
+    let (code, e) = poster(
+        format!("/mesures/{id}/correction"),
+        serde_json::json!({ "f_max_hz": 2000.0 }),
+    );
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{e}");
+    assert_eq!(e["error"], "correction_refusee");
+    let (code, _) = poster("/mesures/inconnue/correction".into(), serde_json::json!({}));
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    assert!(
+        b.hote.journal().profils.is_empty(),
+        "une proposition n'écrit rien"
+    );
+
+    // Le profil de pièce de la zone 7.
+    let (code, r) = poster(
+        format!("/mesures/{id}/correction/profil"),
+        serde_json::json!({ "nom": "Salon", "cible": { "type": "plate", "pente_db_oct": -0.5 } }),
+    );
+    assert_eq!(code, StatusCode::CREATED, "{r}");
+    assert_eq!(r["appliquer"], "/api/v1/room-correction/profiles/7/apply");
+    let j = b.hote.journal();
+    assert_eq!(j.profils.len(), 1);
+    assert_eq!(j.profils[0].zone_id, "7");
+    assert_eq!(j.profils[0].name, "Salon");
+    assert!(!j.profils[0].filters.is_empty());
+    assert!(j.profils[0].filters.iter().all(|f| f.gain_db <= 0.0));
+}
