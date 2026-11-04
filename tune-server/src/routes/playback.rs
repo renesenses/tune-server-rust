@@ -1,6 +1,8 @@
 #[cfg(test)]
 #[path = "playback/album_ref_bandcamp_2121_tests.rs"]
 mod album_ref_bandcamp_2121_tests;
+#[path = "playback/echec_de_sortie_7823.rs"]
+mod echec_de_sortie_7823;
 #[cfg(test)]
 #[path = "playback/journal_pause_reprise_tests.rs"]
 mod journal_pause_reprise_tests;
@@ -3756,7 +3758,7 @@ async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl 
         .await
     {
         Ok(()) => Json(build_zone_json(&state, zone_id).await).into_response(),
-        Err(error) => output_command_error_response(error),
+        Err(error) => echec_de_sortie_7823::reponse_d_echec_de_zone(&state, zone_id, error),
     }
 }
 
@@ -3943,17 +3945,27 @@ async fn resume(
     }
 
     let device_id = get_zone_device_id(&state, zone_id);
+    // La session perdue a déjà sa phrase traduite, que l'événement porte à
+    // l'identique : elle garde sa réponse (#4193). Les autres refus nomment
+    // la zone (#7823).
+    let session_perdue = std::sync::atomic::AtomicBool::new(false);
     match state
         .orchestrator
         .resume_with_session_error_message(
             zone_id,
             device_id.as_deref(),
-            |title, position, cause| session_message::lost_session(&lang, title, position, cause),
+            |title, position, cause| {
+                session_perdue.store(true, std::sync::atomic::Ordering::Relaxed);
+                session_message::lost_session(&lang, title, position, cause)
+            },
         )
         .await
     {
         Ok(()) => Json(build_zone_json(&state, zone_id).await).into_response(),
-        Err(error) => output_command_error_response(error),
+        Err(error) if session_perdue.load(std::sync::atomic::Ordering::Relaxed) => {
+            output_command_error_response(error)
+        }
+        Err(error) => echec_de_sortie_7823::reponse_d_echec_de_zone(&state, zone_id, error),
     }
 }
 
