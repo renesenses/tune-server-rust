@@ -295,6 +295,43 @@ fn correction_piece_egaliseur_lang(
     })
 }
 
+/// #7632 — le greffon calibration est Premium en entier (décision du
+/// 04/11/2026). Sans le droit `RoomCorrection`, l'égaliseur posé par un
+/// profil de pièce n'est plus PRÉSENTÉ comme une « Correction de pièce » :
+/// ni étape `room_correction`, ni résumé. L'égaliseur, lui, filtre toujours
+/// et reste décrit par l'étape DSP — on n'annonce rien d'appliqué au titre
+/// de la calibration, sans pour autant prétendre le signal intact.
+///
+/// La RI (`kind: "ir"`) n'est pas concernée : le convolueur l'applique quelle
+/// que soit la licence, et l'étape le dit.
+pub fn correction_de_piece_sous_licence(
+    signal_path: Option<Value>,
+    premium: bool,
+) -> Option<Value> {
+    let mut sp = signal_path?;
+    if premium || sp.get("room_correction").and_then(|r| r.get("kind")) != Some(&json!("eq")) {
+        return Some(sp);
+    }
+    if let Some(o) = sp.as_object_mut() {
+        o.insert("room_correction".into(), Value::Null);
+        if let Some(etapes) = o.get_mut("steps").and_then(Value::as_array_mut) {
+            etapes.retain(|e| e.get("code") != Some(&json!("room_correction")));
+        }
+    }
+    Some(sp)
+}
+
+/// [`correction_de_piece_sous_licence`] avec la licence de l'hôte.
+pub async fn signal_path_sous_licence(
+    license: &tune_core::license::LicenseManager,
+    signal_path: Option<Value>,
+) -> Option<Value> {
+    let premium = license
+        .check_feature(tune_core::license::Feature::RoomCorrection)
+        .await;
+    correction_de_piece_sous_licence(signal_path, premium)
+}
+
 /// Description du traitement EQ réellement configuré, y compris le headroom
 /// automatique.
 ///

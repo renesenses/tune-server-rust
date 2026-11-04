@@ -488,14 +488,18 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             super::injecter_backend_de_sortie(obj, &backend_configure, backend_sortie.as_deref());
             // #6120 — une zone locale dont la sortie n'est pas enregistrée.
             super::rattacher_asio_6120::injecter_sortie_absente(obj, z, &registered_output_ids);
-            let signal_path = build_signal_path(
-                &ps,
-                z,
-                &state.backend,
-                renderer_label,
-                audio_backend_de_la_zone,
-                wire.as_ref(),
-            );
+            let signal_path = signal_path_sous_licence(
+                &state.license,
+                build_signal_path(
+                    &ps,
+                    z,
+                    &state.backend,
+                    renderer_label,
+                    audio_backend_de_la_zone,
+                    wire.as_ref(),
+                ),
+            )
+            .await;
             obj.insert("signal_path".into(), json!(signal_path));
             // #1395 — quel backend local tourne VRAIMENT sur cette zone, face à
             // celui qui est réglé. Absent des zones non locales.
@@ -702,14 +706,18 @@ pub(crate) async fn get_zone(
                     &zone,
                     &registered_output_ids,
                 );
-                let signal_path = build_signal_path(
-                    &ps,
-                    &zone,
-                    &state.backend,
-                    renderer_label,
-                    audio_backend_de_la_zone,
-                    wire.as_ref(),
-                );
+                let signal_path = signal_path_sous_licence(
+                    &state.license,
+                    build_signal_path(
+                        &ps,
+                        &zone,
+                        &state.backend,
+                        renderer_label,
+                        audio_backend_de_la_zone,
+                        wire.as_ref(),
+                    ),
+                )
+                .await;
                 obj.insert("signal_path".into(), json!(signal_path));
                 // #1395 — voir la note au site jumeau (`list_zones`).
                 if let Some(status) =

@@ -285,3 +285,61 @@ fn un_profil_de_piece_sans_greffon_egaliseur_est_dit_non_applique_7632() {
     assert_eq!(rc["status"], "equalizer_off", "{rc}");
     assert_eq!(rc["applied"], false, "{rc}");
 }
+
+/// Le greffon calibration est Premium en entier (04/11/2026) : sans le droit
+/// `RoomCorrection`, l'égaliseur posé par un profil de pièce n'est plus
+/// annoncé comme correction de pièce ; avec Premium, il l'est. La RI, que le
+/// convolueur applique quelle que soit la licence, reste dite.
+#[tokio::test]
+async fn sans_premium_la_correction_par_egaliseur_n_est_pas_annoncee_7632() {
+    let (backend, zone, ps) = zone_en_lecture();
+    let zid = zone.id.unwrap();
+    appliquer_profil_de_piece(&backend, zid);
+    let licence = tune_core::license::LicenseManager::new(backend.clone());
+
+    let sp = signal_path_sous_licence(&licence, Some(chemin(&backend, &zone, &ps)))
+        .await
+        .unwrap();
+    assert!(
+        sp["room_correction"].is_null(),
+        "compte gratuit : {}",
+        sp["room_correction"]
+    );
+    assert!(
+        etape(&sp).is_none(),
+        "étape annoncée sans Premium : {:?}",
+        etape(&sp)
+    );
+    // L'égaliseur filtre toujours : l'étape DSP reste, le signal n'est pas dit intact.
+    assert!(
+        sp["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "DSP"),
+        "l'égaliseur doit rester décrit : {sp}"
+    );
+
+    licence.set_account_premium(true, None).await;
+    let sp = signal_path_sous_licence(&licence, Some(chemin(&backend, &zone, &ps)))
+        .await
+        .unwrap();
+    assert_eq!(sp["room_correction"]["kind"], "eq", "{sp}");
+    assert_eq!(sp["room_correction"]["status"], "applied", "{sp}");
+    assert!(etape(&sp).is_some());
+}
+
+#[test]
+fn sans_premium_la_ri_reste_dite_7632() {
+    let (backend, zone, ps) = zone_en_lecture();
+    let ri = tune_core::test_scratch::scratch_file("ri-7632-licence", ".wav");
+    ecrire_ri(ri.path(), FIL_HZ, 64);
+    regler(
+        &backend,
+        &format!("ir_path_{}", zone.id.unwrap()),
+        &ri.as_str(),
+    );
+    let sp = correction_de_piece_sous_licence(Some(chemin(&backend, &zone, &ps)), false).unwrap();
+    assert_eq!(sp["room_correction"]["kind"], "ir", "{sp}");
+    assert_eq!(sp["room_correction"]["status"], "applied", "{sp}");
+}

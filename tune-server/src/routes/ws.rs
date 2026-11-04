@@ -146,15 +146,19 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
             audio_backend,
         )
         .await;
-        let signal_path = crate::routes::zones::build_signal_path_lang(
-            lang,
-            &ps,
-            z,
-            &state.backend,
-            renderer_label,
-            audio_backend_de_la_zone,
-            wire.as_ref(),
-        );
+        let signal_path = crate::routes::zones::signal_path_sous_licence(
+            &state.license,
+            crate::routes::zones::build_signal_path_lang(
+                lang,
+                &ps,
+                z,
+                &state.backend,
+                renderer_label,
+                audio_backend_de_la_zone,
+                wire.as_ref(),
+            ),
+        )
+        .await;
         let output_capabilities =
             crate::routes::zones::output_capabilities(state, z.output_device_id.as_deref()).await;
         // #3514 — la meme decision que celle que la route applique, calculee

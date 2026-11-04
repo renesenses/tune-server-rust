@@ -17,16 +17,24 @@
 //!   `POST /api/v1/room-correction/profiles/{zone}/apply`.
 //!
 //! Aucune lecture ne part sans le `POST` explicite de l'utilisateur.
+//!
+//! **Tout le greffon est Premium** (décision de Bertrand du 04/11/2026) :
+//! chaque route passe par [`garde_premium`], posée sur le routeur entier —
+//! une route ajoutée plus tard ne peut pas l'oublier. Sans le droit
+//! [`DROIT`], la réponse est un refus nommé `premium_required` (402), avant
+//! toute lecture du micro et tout son joué.
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, header};
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::license::{Feature, LicenseManager};
 
 use crate::correction::{DemandeCorrection, Proposition, proposer};
 use crate::generateur::Voies;
@@ -35,6 +43,49 @@ use crate::mesure::{Controleur, Demande};
 #[derive(Clone)]
 pub struct EtatRoutes {
     pub controleur: Arc<Controleur>,
+    /// La licence de l'hôte (`PluginContext::license`). `None` : aucune
+    /// licence fournie, ce qui ne vaut PAS Premium.
+    pub license: Option<Arc<LicenseManager>>,
+}
+
+/// Le droit qui ouvre le greffon : celui de la correction de pièce.
+pub const DROIT: Feature = Feature::RoomCorrection;
+
+/// LE point de décision du payant, comme `tune_concerts::acces`.
+///
+/// ⚠️ Une licence ABSENTE ne vaut pas une autorisation : un hôte qui ne la
+/// branche pas (essais, construction future) ouvrirait sinon le greffon à
+/// tout le monde.
+pub async fn premium(license: Option<&LicenseManager>) -> bool {
+    match license {
+        Some(l) => l.check_feature(DROIT).await,
+        None => false,
+    }
+}
+
+/// Le refus nommé, dans la forme de `premium_guard::corps_du_refus` du
+/// serveur : `error` stable, `code` du droit, `message` en anglais (le client
+/// traduit le `code`).
+pub fn refus_premium() -> Response {
+    (
+        StatusCode::PAYMENT_REQUIRED,
+        Json(json!({
+            "error": "premium_required",
+            "code": DROIT.code(),
+            "feature": DROIT.display_name(),
+            "message": format!("{} requires Tune Premium", DROIT.display_name()),
+        })),
+    )
+        .into_response()
+}
+
+async fn garde_premium(State(etat): State<EtatRoutes>, requete: Request, suite: Next) -> Response {
+    if premium(etat.license.as_deref()).await {
+        suite.run(requete).await
+    } else {
+        tracing::info!(chemin = %requete.uri().path(), "calibration_refusee_sans_premium");
+        refus_premium()
+    }
 }
 
 pub fn router(etat: EtatRoutes) -> Router<()> {
@@ -48,6 +99,7 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
         .route("/mesures/{id}/ri.wav", get(ri_wav))
         .route("/mesures/{id}/correction", post(correction))
         .route("/mesures/{id}/correction/profil", post(correction_profil))
+        .route_layer(from_fn_with_state(etat.clone(), garde_premium))
         .with_state(etat)
 }
 
