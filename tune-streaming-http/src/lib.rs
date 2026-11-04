@@ -231,6 +231,7 @@ fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) ->
                 tune_core::TuneError::Config(_) => "config",
                 tune_core::TuneError::Unsupported(_) => "unsupported",
                 tune_core::TuneError::Credentials(_) => "credentials",
+                tune_core::TuneError::AppRefused(_) => "app_refused",
                 tune_core::TuneError::Other(_) => "other",
             };
             let message = e.to_string();
@@ -1530,6 +1531,13 @@ async fn service_auth(
 /// identifiants (renesenses/tune-server-rust#7068). Le client le traduit.
 pub const CODE_IDENTIFIANTS_REFUSES: &str = "invalid_credentials";
 
+/// Code rendu par `POST /streaming/{service}/auth` quand le service refuse
+/// l'APPLICATION Tune et non le compte (01/11/2026, `app_id` Qobuz refusé) :
+/// ressaisir le mot de passe n'y change rien. Distinct de
+/// [`CODE_IDENTIFIANTS_REFUSES`], que le client traduit en « mot de passe
+/// incorrect ».
+pub const CODE_APPLICATION_REFUSEE: &str = "service_app_refused";
+
 /// La réponse d'un échec de connexion.
 ///
 /// Un refus d'identifiants ([`tune_core::TuneError::Credentials`]) rend un
@@ -1544,6 +1552,15 @@ fn reponse_echec_auth(service: &str, e: &tune_core::TuneError) -> Response {
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "code": CODE_IDENTIFIANTS_REFUSES,
+                "service": service,
+                "error": message,
+            })),
+        )
+            .into_response(),
+        tune_core::TuneError::AppRefused(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": CODE_APPLICATION_REFUSEE,
                 "service": service,
                 "error": message,
             })),
@@ -4646,6 +4663,22 @@ mod tests_echec_de_connexion_7068 {
         assert_eq!(v["code"], CODE_IDENTIFIANTS_REFUSES);
         assert_eq!(v["service"], "qobuz");
         assert!(!texte.contains("Invalid username"), "{texte}");
+    }
+
+    /// 01/11/2026 — Qobuz refuse l'`app_id` : le client ne doit PAS lire
+    /// `invalid_credentials` (« mot de passe incorrect »).
+    #[tokio::test]
+    async fn refus_de_l_application_n_est_pas_un_refus_d_identifiants() {
+        let e = tune_core::TuneError::AppRefused("qobuz login: app refused".into());
+        let (statut, texte) = corps(reponse_echec_auth("qobuz", &e)).await;
+        assert_eq!(statut, StatusCode::BAD_REQUEST);
+        let v: Value = serde_json::from_str(&texte).expect("le corps doit être du JSON structuré");
+        assert_eq!(
+            v["code"], CODE_APPLICATION_REFUSEE,
+            "un refus de l'application doit porter son propre code : {texte}"
+        );
+        assert_ne!(v["code"], CODE_IDENTIFIANTS_REFUSES, "{texte}");
+        assert_eq!(v["service"], "qobuz");
     }
 
     #[tokio::test]
