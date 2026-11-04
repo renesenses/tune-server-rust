@@ -38,6 +38,9 @@ mod note_balises_6123_tests;
 pub mod reidentify;
 // Le type de sortie d'un disque — album, EP, single (#4767).
 pub mod release_type;
+pub mod source_des_credits;
+#[cfg(test)]
+mod credits_source_7765_tests;
 pub mod suggestions;
 // Le MBID des artistes par une recherche MusicBrainz confirmée (#4805, étape C).
 pub mod artistes_par_le_reseau;
