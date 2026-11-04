@@ -24,6 +24,10 @@ mod media_server_tests_3786;
 #[path = "renderer_allume_avant_le_serveur_tests_6961.rs"]
 mod renderer_allume_avant_le_serveur_tests_6961;
 
+#[cfg(test)]
+#[path = "discovery_setup/renderer_sans_services_de_rendu_tests_7279.rs"]
+mod renderer_sans_services_de_rendu_tests_7279;
+
 #[cfg(all(test, feature = "oaat"))]
 #[path = "deux_pi_verox_oaat_airplay_tests_6947.rs"]
 mod deux_pi_verox_oaat_airplay_tests_6947;
@@ -952,6 +956,28 @@ async fn handle_ssdp_discovered(
             dev.manufacturer.as_deref().unwrap_or_default(),
             dev.model.as_deref().unwrap_or_default(),
         );
+    }
+
+    // #7279 — sans sortie enregistrée, pas de zone. La chaîne de rattachement
+    // et de création ci-dessous ne regardait pas `registered` : un renderer
+    // sans AVTransport ou sans RenderingControl recevait une zone « en ligne »
+    // qui ne pouvait rien jouer, absente de la liste des appareils de lecture,
+    // et sans un mot dans le journal (Innuos Zenith, fil 2495).
+    if !registered {
+        let manquants: Vec<&str> = ["avtransport", "renderingcontrol"]
+            .into_iter()
+            .filter(|cle| !svc_urls.contains_key(*cle))
+            .collect();
+        let annonces: Vec<&String> = svc_urls.keys().collect();
+        warn!(
+            id = %dev.id,
+            name = %dev.name,
+            host = %dev.host,
+            manquants = ?manquants,
+            annonces = ?annonces,
+            "ssdp_renderer_sans_services_de_rendu"
+        );
+        return;
     }
 
     let skip_keywords = [
