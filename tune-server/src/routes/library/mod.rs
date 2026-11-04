@@ -676,6 +676,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/stats", get(stats::library_stats))
         .route("/labels", get(labels::list_labels))
+        // Écran « État du serveur » (01/11/2026) : avant `/labels/{nom}/…`,
+        // qui ne capture de toute façon pas ces chemins (segment `artists`).
+        .route("/labels/logos/enrich", post(labels::lancer_logos))
+        .route("/labels/logos/status", get(labels::statut_logos))
         .route("/labels/{nom}/artists", get(labels::artistes_du_label))
         .route("/artwork/{hash}", get(artwork::serve_artwork))
         .route("/artwork/proxy", get(artwork::proxy_artwork))

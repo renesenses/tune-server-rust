@@ -1090,6 +1090,22 @@ impl HistoryRepo {
             Engine::Sqlite => SqliteDialect.extract_hour(col),
             Engine::Postgres => PostgresDialect.extract_hour(col),
         };
+        // #7634 — `+colonne` interdit à SQLite de servir ce terme par un index.
+        //
+        // Sans lui, les classements et « Par zone » regroupaient par
+        // `idx_listen_history_artist` / `_album` / `_track` / `_zone` pour
+        // s'épargner un tri : le moteur parcourait alors TOUT l'historique
+        // dans l'ordre de l'index, une lecture de table par écoute, au lieu de
+        // ne lire que la période par `idx_listen_history_listened_at`.
+        // Banc de 500 000 écoutes, 7 jours : 1,3 à 1,7 s par classement,
+        // 0,36 à 0,59 s pour les zones ; 4 à 8 ms une fois l'index de date
+        // retenu. Le regroupement est le même (une valeur reste une valeur) ;
+        // PostgreSQL, qui n'a ni ce travers ni cet opérateur sur du texte,
+        // reçoit la colonne nue.
+        let sans_index = |col: &str| match self.db.engine() {
+            Engine::Sqlite => format!("+{col}"),
+            Engine::Postgres => col.to_string(),
+        };
 
         let mut simple_conditions: Vec<String> = Vec::new();
         if let Some(d) = days {
@@ -1190,8 +1206,9 @@ impl HistoryRepo {
         let artists_sql = format!(
             "SELECT lh.artist_name, COUNT(*) as plays, CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms
              FROM listen_history lh
-             {simple_where} {no_radio_and} lh.artist_name IS NOT NULL
-             GROUP BY lh.artist_name ORDER BY plays DESC LIMIT {top_n}",
+             {simple_where} {no_radio_and} {artiste} IS NOT NULL
+             GROUP BY {artiste} ORDER BY plays DESC, lh.artist_name LIMIT {top_n}",
+            artiste = sans_index("lh.artist_name"),
         );
         let artistes_bruts = self.db.query_many(&artists_sql, &[])?;
         let noms_artistes: Vec<String> = artistes_bruts
@@ -1237,9 +1254,11 @@ impl HistoryRepo {
             "SELECT h.album_title, h.artist_name, MAX(h.cover_url) as cover_url, COUNT(*) as plays,
                     MAX(h.source) as source, MAX(h.source_id) as source_id
              FROM listen_history h
-             {where_clause} {no_radio_and_h} h.album_title IS NOT NULL
-             GROUP BY h.album_title, h.artist_name
-             ORDER BY plays DESC LIMIT {top_n}",
+             {where_clause} {no_radio_and_h} {album} IS NOT NULL
+             GROUP BY {album}, {artiste}
+             ORDER BY plays DESC, h.album_title, h.artist_name LIMIT {top_n}",
+            album = sans_index("h.album_title"),
+            artiste = sans_index("h.artist_name"),
         );
         let albums_bruts = self.db.query_many(&albums_sql, &[])?;
         let titres_albums: Vec<String> = albums_bruts
@@ -1276,8 +1295,10 @@ impl HistoryRepo {
                     MAX(lh.cover_url) as cover_url,
                     MAX(lh.source) as source, MAX(lh.source_id) as source_id
              FROM listen_history lh
-             {simple_where} {no_radio_and} lh.title IS NOT NULL
-             GROUP BY lh.title, lh.artist_name ORDER BY plays DESC LIMIT {top_n}"
+             {simple_where} {no_radio_and} {titre} IS NOT NULL
+             GROUP BY {titre}, {artiste} ORDER BY plays DESC, lh.title, lh.artist_name LIMIT {top_n}",
+            titre = sans_index("lh.title"),
+            artiste = sans_index("lh.artist_name"),
         );
         // Ce bloc portait DEUX sous-requêtes corrélées sur `tracks` (47 118
         // lignes), l'une pour retrouver l'identifiant de piste, l'autre pour la
@@ -1418,7 +1439,8 @@ impl HistoryRepo {
              FROM listen_history h
              LEFT JOIN zones z ON z.id = h.zone_id
              {where_clause}
-             GROUP BY h.zone_id, z.name ORDER BY plays DESC"
+             GROUP BY {zone}, z.name ORDER BY plays DESC",
+            zone = sans_index("h.zone_id"),
         );
         let by_zone: Vec<ByZoneEntry> = self
             .db
@@ -1561,8 +1583,25 @@ impl HistoryRepo {
 
         // ── Streak ──
         let streak_day_expr = dialect_day("listened_at");
-        let streak_sql =
-            format!("SELECT DISTINCT {streak_day_expr} as d FROM listen_history ORDER BY 1");
+        // #7634 — sur SQLite, les jours d'écoute se lisent par SAUTS dans
+        // `idx_listen_history_listened_at` : un jour, puis la première écoute
+        // du lendemain ou après, et ainsi de suite. Une recherche d'index par
+        // jour écouté (1 096 sur trois ans) au lieu d'un `DISTINCT` qui
+        // parcourt tout l'historique : 0,3 à 0,5 s → 6 ms sur le banc de
+        // 500 000 écoutes, mêmes jours. PostgreSQL garde le `DISTINCT`.
+        let streak_sql = match self.db.engine() {
+            Engine::Sqlite => "WITH RECURSIVE jours(d) AS (
+                    SELECT DATE(MIN(listened_at)) FROM listen_history
+                    UNION ALL
+                    SELECT (SELECT DATE(MIN(listened_at)) FROM listen_history
+                             WHERE listened_at >= DATE(jours.d, '+1 day'))
+                      FROM jours WHERE jours.d IS NOT NULL)
+                 SELECT d FROM jours WHERE d IS NOT NULL"
+                .to_string(),
+            Engine::Postgres => {
+                format!("SELECT DISTINCT {streak_day_expr} as d FROM listen_history ORDER BY 1")
+            }
+        };
         let all_days: Vec<String> = self
             .db
             .query_many(&streak_sql, &[])
@@ -1610,15 +1649,60 @@ impl HistoryRepo {
             Engine::Sqlite => "CAST(strftime('%Y', listened_at) AS INTEGER)",
             Engine::Postgres => "EXTRACT(YEAR FROM listened_at::timestamp)::int",
         };
+        // #7634 — le `LIKE '%-MM-JJ%'` ne peut pas servir d'index : seul, il
+        // parcourait tout l'historique (et SQLite le faisait dans l'ordre de
+        // `idx_listen_history_track`, une lecture de table par écoute :
+        // 1,3 à 1,9 s sur le banc de 500 000 écoutes). Il est désormais
+        // précédé d'une plage de dates PAR ANNÉE passée, que l'index de
+        // `listened_at` sert directement (3 ms). Le `LIKE` reste : les lignes
+        // retenues sont exactement celles d'avant.
+        let annees_passees = self
+            .db
+            .query_one("SELECT MIN(listened_at) FROM listen_history", &[])
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+            .and_then(|premier| premier.get(0..4).and_then(|a| a.parse::<i32>().ok()))
+            .zip(current_year.parse::<i32>().ok())
+            .map(|(premiere, courante)| premiere.max(courante - 100)..courante);
+        let plages = match (annees_passees, today_md.len() == 5) {
+            (Some(annees), true) if !annees.is_empty() => {
+                let lendemain = chrono::NaiveDate::parse_from_str(
+                    &format!("2000-{today_md}"),
+                    "%Y-%m-%d",
+                )
+                .ok()
+                .and_then(|d| d.succ_opt())
+                .map(|d| d.format("%m-%d").to_string());
+                lendemain.map(|lendemain| {
+                    let annees: Vec<String> = annees
+                        .map(|a| {
+                            // 31/12 : le lendemain tombe l'année suivante.
+                            let fin = if lendemain == "01-01" { a + 1 } else { a };
+                            format!(
+                                "(listened_at >= '{a:04}-{today_md}' AND listened_at < '{fin:04}-{lendemain}')"
+                            )
+                        })
+                        .collect();
+                    format!("({}) AND", annees.join(" OR "))
+                })
+            }
+            // Aucune année passée dans l'historique : rien à montrer.
+            (Some(_), true) => Some("1 = 0 AND".to_string()),
+            _ => None,
+        }
+        .unwrap_or_default();
         // Agrégats hors du `GROUP BY` : même raison que `sql::top_tracks`
         // (PostgreSQL refuse une colonne nue, « Ce jour-là » revenait vide).
         let otd_sql = format!(
             "SELECT title, artist_name, MAX(album_title), NULL, MAX(listened_at),
                     MAX({yr_expr}) as yr
              FROM listen_history
-             WHERE listened_at LIKE {ph} AND {yr_expr} < {current_year}
-             GROUP BY title, artist_name
-             ORDER BY yr DESC LIMIT 10"
+             WHERE {plages} listened_at LIKE {ph} AND {yr_expr} < {current_year}
+             GROUP BY {titre}, {artiste}
+             ORDER BY yr DESC LIMIT 10",
+            titre = sans_index("title"),
+            artiste = sans_index("artist_name"),
         );
         let on_this_day: Vec<OnThisDayEntry> = self
             .db
