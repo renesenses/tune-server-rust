@@ -178,3 +178,110 @@ fn une_ri_illisible_est_dite_illisible_7632() {
     assert_eq!(rc["applied"], false, "{rc}");
     assert!(rc["reason"].as_str().is_some_and(|r| !r.is_empty()), "{rc}");
 }
+
+/// C2 : le profil de pièce de la zone, appliqué à l'égaliseur comme le fait
+/// `POST /room-correction/profiles/{zone}/apply` (profil complet, #7642).
+fn appliquer_profil_de_piece(backend: &Arc<dyn tune_core::db::backend::DbBackend>, zid: i64) {
+    use tune_core::room_correction::{CorrectionFilter, FilterType, RoomProfile};
+    let profil = RoomProfile {
+        name: "Salon".into(),
+        zone_id: zid.to_string(),
+        filters: [(42.0, -7.0, 6.0), (68.0, -5.0, 5.0)]
+            .into_iter()
+            .map(|(f, g, q)| CorrectionFilter {
+                frequency_hz: f,
+                gain_db: g,
+                q_factor: q,
+                filter_type: FilterType::Peaking,
+            })
+            .collect(),
+        created_at: "2026-11-04T10:00:00Z".into(),
+        measurement_data: None,
+    };
+    tune_core::room_correction::save_profile(backend, &profil).unwrap();
+    let eq = tune_core::room_correction::profil_eq_de_correction(&profil.filters);
+    regler(
+        backend,
+        &format!("zone_{zid}_eq_profile"),
+        &serde_json::to_string(&eq).unwrap(),
+    );
+    regler(backend, "plugin_equalizer_installed", "true");
+}
+
+#[test]
+fn un_profil_de_piece_applique_a_l_egaliseur_est_dit_applique_7632() {
+    let (backend, zone, ps) = zone_en_lecture();
+    let zid = zone.id.unwrap();
+    appliquer_profil_de_piece(&backend, zid);
+
+    let sp = chemin(&backend, &zone, &ps);
+    let rc = &sp["room_correction"];
+    assert_eq!(rc["kind"], "eq", "{rc}");
+    assert_eq!(rc["status"], "applied", "{rc}");
+    assert_eq!(rc["applied"], true, "{rc}");
+    let e = etape(&sp).expect("l'étape Correction de pièce manque");
+    assert_eq!(e["kind"], "eq", "{e}");
+    assert!(
+        e["description"].as_str().unwrap_or_default().contains('2'),
+        "{e}"
+    );
+}
+
+#[test]
+fn sous_pure_le_profil_de_piece_est_dit_contourne_7632() {
+    let (backend, zone, ps) = zone_en_lecture();
+    let zid = zone.id.unwrap();
+    appliquer_profil_de_piece(&backend, zid);
+    regler(
+        &backend,
+        &format!("zone_{zid}_audiophile"),
+        r#"{"enabled":true}"#,
+    );
+
+    let sp = chemin(&backend, &zone, &ps);
+    let rc = &sp["room_correction"];
+    assert_eq!(rc["kind"], "eq", "{rc}");
+    assert_eq!(rc["status"], "bypassed_pure", "{rc}");
+    assert_eq!(rc["applied"], false, "{rc}");
+    let e = etape(&sp).expect("sous PURE, l'étape doit DIRE la correction contournée");
+    assert_eq!(e["status"], "bypassed_pure", "{e}");
+    assert_eq!(e["bit_perfect"], true, "{e}");
+}
+
+#[test]
+fn un_egaliseur_retouche_depuis_n_est_plus_la_correction_de_piece_7632() {
+    let (backend, zone, ps) = zone_en_lecture();
+    let zid = zone.id.unwrap();
+    appliquer_profil_de_piece(&backend, zid);
+    // L'utilisateur a retouché une bande à la main : ce n'est plus le profil.
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let mut eq: tune_core::audio::eq::EqProfile = serde_json::from_str(
+        &settings
+            .get(&format!("zone_{zid}_eq_profile"))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    eq.bands[0].gain = -3.0;
+    regler(
+        &backend,
+        &format!("zone_{zid}_eq_profile"),
+        &serde_json::to_string(&eq).unwrap(),
+    );
+
+    let sp = chemin(&backend, &zone, &ps);
+    assert!(sp["room_correction"].is_null(), "{}", sp["room_correction"]);
+}
+
+#[test]
+fn un_profil_de_piece_sans_greffon_egaliseur_est_dit_non_applique_7632() {
+    let (backend, zone, ps) = zone_en_lecture();
+    let zid = zone.id.unwrap();
+    appliquer_profil_de_piece(&backend, zid);
+    regler(&backend, "plugin_equalizer_installed", "false");
+
+    let sp = chemin(&backend, &zone, &ps);
+    let rc = &sp["room_correction"];
+    assert_eq!(rc["status"], "equalizer_off", "{rc}");
+    assert_eq!(rc["applied"], false, "{rc}");
+}
