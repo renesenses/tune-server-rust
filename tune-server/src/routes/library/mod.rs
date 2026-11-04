@@ -57,6 +57,8 @@ mod labels;
 /// #6481 — le livret PDF rangé dans le dossier d'un album.
 mod livrets;
 mod lyrics_pass;
+/// #7849 — notes personnelles en Markdown (artiste, album, piste).
+mod notes;
 mod proposals;
 mod query_multi;
 mod ratings;
@@ -765,6 +767,14 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/lyrics", get(tracks::track_lyrics))
         .route("/ratings/export", get(ratings::export_ratings))
         .route("/ratings/import", post(ratings::import_ratings))
+        // #7849 — notes personnelles, privées au profil de l'appelant.
+        .route("/notes", get(notes::list_notes))
+        .route(
+            "/notes/{item_type}/{item_id}",
+            get(notes::get_note)
+                .put(notes::put_note)
+                .delete(notes::delete_note),
+        )
         // Lot 2 de l'enrichissement d'après MetaRust (#4805) : les passes de
         // lot, à la main. Suspendues par la tâche de fond `enrichment`.
         .route("/bpm-all", post(passes_metarust::bpm_lot_start))
@@ -962,6 +972,10 @@ mod facettes_lentes_2144_tests;
 #[cfg(test)]
 #[path = "liste_dr_7580_tests.rs"]
 mod liste_dr_7580_tests;
+
+#[cfg(test)]
+#[path = "notes_et_repartitions_7849_tests.rs"]
+mod notes_et_repartitions_7849_tests;
 
 #[cfg(test)]
 #[path = "banc_repertoires_5998.rs"]
