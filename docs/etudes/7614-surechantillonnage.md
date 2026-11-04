@@ -1,6 +1,6 @@
 # Étude #7614 — greffon de suréchantillonnage haute qualité (rc11)
 
-Claude - Mozaiklabs, 31 octobre – 1er novembre 2026. **État : livraison anticipée, § 6 (mesures) à compléter.** Branche
+Claude - Mozaiklabs, 31 octobre – 4 novembre 2026. **État : étude close, § 6 mesuré sur Shrek le 2 novembre ; intégration engagée (go du 4 novembre).** Branche
 `etude/7614-surechantillonnage-b209` (base `batch/bugs-rc10-20261030`).
 Prototype : `plugins/tune-surechantillonnage/` (crate autonome, hors serveur).
 Mesures reproductibles : `cargo run --release --bin banc` dans la crate ;
@@ -146,8 +146,9 @@ la discontinuité est sous −150 dB. Avec `σ_t = portée/10 = 25,6` échantill
 | precision-longue | 4 096 | 2,89 GMAC/s | 6,29 GMAC/s | 46,4 ms | 256 Kio / 512 Kio / +20 Kio |
 | resolution | 48 | 0,03 GMAC/s | 0,07 GMAC/s | 0,53 ms | 3 Kio / 6 Kio / +20 Kio |
 
-Un cœur Xeon E5-2630 v4 (Shrek, AVX2+FMA, 2,2 GHz) atteint ~5 GMAC/s f64 en
-pratique sur ce produit scalaire ; un Raspberry Pi 4 (NEON f64 ×2, 1,5 GHz)
+Un cœur Xeon E5-2630 v4 (Shrek, AVX2+FMA, 2,2 GHz) atteint 3,5 GMAC/s f64
+mesurés sur ce produit scalaire (§ 6.1 ; l'estimation initiale de ~5 était
+optimiste) ; un Raspberry Pi 4 (NEON f64 ×2, 1,5 GHz)
 plutôt 0,5 à 1 GMAC/s. D'où le test de la machine (§ 5). Une mise en œuvre
 par convolution rapide partitionnée (comme le convolveur de pièce) ramènerait
 le coût du « précision » de 1 024 à quelques dizaines d'opérations par
@@ -202,35 +203,120 @@ relancera le test (changement de machine, de gouverneur CPU).
 
 ## 6. Mesures
 
-**À compléter.** Au moment de cette livraison (1er novembre, demandée
-avant l'échéance), le banc n'a pas encore tourné : la compilation de la crate
-sur Shrek attend l'admission du garde de stockage (48 Gio de RAM disponible
-requis ; 28 puis 36 Gio constatés). Aucun chiffre mesuré n'est donc reporté
-ici ; les valeurs des § 3 et 4 sont les valeurs **de conception** (modèle
-gaussien, formules de Kaiser, intégrales des NTF), que les gabarits de
-`tests/gabarits.rs` verrouillent et que le banc doit confirmer.
+**Banc passé sur Shrek le 2 novembre 2026** (07 h 55 – 08 h 13, heure de
+Paris). Machine : 2 × Xeon E5-2630 v4 (10 cœurs / 20 fils par socle,
+2,2 GHz, turbo 3,1 GHz ; L1d 32 Kio, L2 256 Kio par cœur, L3 25 Mio par
+socle), AVX2+FMA, Linux, rustc stable, profil `release` (opt 3, LTO thin,
+une unité). Machine partagée : passage complet sous une charge montée de 9 à
+41 (sur 40 fils), trois passages « débit » sous charge 8 à 12, tous les bancs
+sous `nice -n 10`, un fil (huit au plus pour le débit en parallèle). Aucun
+son : tout reste en mémoire. Tableaux complets dans le corps de #7644.
 
-Ce qui sera produit par `cargo run --release --bin banc` et reporté ici :
+Commandes, dans la crate :
 
-- par conception et pour 44,1 → 352,8, 48 → 384 et 44,1 → 384 : −0,1 / −3 /
-  −6 dB, ondulation ≤ 20 kHz, atténuation à Nyquist, au-delà de Nyquist et
-  au-delà de 1,5 Nyquist, rejet des images par balayage 20 Hz–20 kHz, THD+N
-  (20 Hz–20 kHz et jusqu'à vers/2), latence théorique, au pic et à mi-énergie,
-  MAC par trame, mémoire des phases (`resume.md`, `reponse_*.csv/svg`,
-  `impulsion_*.csv/svg`, `balayage_*.csv`, `reponses_comparees_441_3528.svg`,
-  `transition_comparee_441_3528.svg`) ;
-- par formeur, à 44,1 et 352,8 kHz, 16 bits : gain total théorique, bruit
-  total, bruit 20 Hz–20 kHz, bruit pondéré Terhardt (`ntf_*.csv/svg`,
-  `bruit_*.csv/svg`) ;
-- le test de la machine sur Shrek (Xeon E5-2630 v4, AVX2+FMA) pour les six
-  couples (`machine.csv`).
+```
+nice -n 10 cargo build --release -j4 --examples --bins
+nice -n 10 target/release/examples/banc_machine <dossier>          # §§ 6.1 à 6.3
+nice -n 10 target/release/examples/banc_machine <dossier> --debit  # § 6.1 seul
+nice -n 10 target/release/banc <dossier>                           # resume.md, CSV, SVG
+nice -n 10 cargo test --release -j4 --no-fail-fast
+```
 
-Attendus de conception à confirmer : polyvalent −0,1 dB ≈ 20,0 kHz et
-≥ 120 dB à Nyquist ; précision ≥ 145 dB au-delà de Nyquist, ondulation
-< 10⁻³ dB ; résolution −6 dB à Nyquist, −3 dB ≈ 21,2 kHz, ≥ 100 dB au-delà de
-33 kHz ; TPDF 16 bits à −96,3 dBFS ; `wannamaker9f` ≥ 10 dB de gain pondéré à
-44,1 kHz ; binomiaux d'ordre 2 et 4 ≈ 25 et 45 dB de gain 20 Hz–20 kHz à
-352,8 kHz ; THD+N 24 bits TPDF ≈ −150 dB.
+`examples/banc_machine.rs` ne fait que composer l'API publique de la crate.
+
+### 6.1 Débit du produit scalaire polyphase (f64, un fil, GMAC/s)
+
+| chemin | L | 48 | 256 | 1 024 | 2 048 | 4 096 |
+|---|---|---|---|---|---|---|
+| avx2+fma | ×8 | 2,85 – 3,11 | 5,88 – 6,47 | 3,58 – 3,91 | 4,55 – 4,86 | 2,99 – 3,25 |
+| avx2+fma | ×16 | 2,89 – 3,18 | 3,52 – 3,73 | 3,44 – 3,75 | 3,19 – 3,35 | 3,02 – 3,39 |
+| scalaire (8 accumulateurs) | ×8 | 1,75 – 2,02 | 2,25 – 2,50 | 2,37 – 2,66 | 2,15 – 2,32 | 2,17 – 2,41 |
+| scalaire | ×16 | 1,92 – 2,13 | 2,21 – 2,47 | 2,38 – 2,63 | 2,23 – 2,44 | 2,03 – 2,27 |
+
+Fourchette de trois passages (médiane de 3 × 2 s chacun). AVX2 ≈ 1,5 × le
+scalaire. **Valeur retenue pour ce Xeon : 3,5 GMAC/s par cœur** (portées 256
+à 2 048), 3,0 à 4 096, 2,3 sans AVX2. La valeur « ~5 GMAC/s » du § 3.3 était
+optimiste. Pas de coude de cache net entre 1 024 et 4 096 (−15 % à ×16) ; à
+×8 la courbe n'est pas monotone, ce qui désigne l'alignement des phases plus
+que la taille (hypothèse non vérifiée : alias de 4 Kio). Huit fils
+simultanés : 20 à 41 GMAC/s au total.
+
+### 6.2 Interpolateur complet, stéréo : facteur temps réel et latence
+
+| conception | ×8 (44,1 → 352,8) | ×16 (44,1 → 705,6) | 48 → 384 | 48 → 768 | latence au pic, linéaire / minimale (44,1) |
+|---|---|---|---|---|---|
+| resolution (48) | 57,5 | 24,5 | 40,3 | 20,9 | 0,54 / 0,085 ms |
+| polyvalent (256) | 17,0 | 11,0 | 19,1 | 10,8 | 2,90 / 0,108 ms |
+| precision (1 024) | 5,6 | 3,1 | 5,8 | 2,6 | 11,6 / 0,113 ms |
+| precision-longue (4 096) | 1,0 | 0,5 | 0,9 | 0,4 | 46,4 / 0,113 ms |
+
+Les variantes en phase minimale coûtent le même prix (même portée). Avec la
+marge d'admission ×3 du § 5, ce Xeon admet `resolution` et `polyvalent`
+partout, `precision` à ×8 et à la marge à ×16 (le banc d'origine, passé sous
+plus forte charge, le refuse à 705,6 et 768 kHz), et **refuse
+`precision-longue` en polyphase direct à toutes les cadences** : la
+convolution rapide (I7) est nécessaire pour le 4 096 dès ×8 et pour le 1 024
+à ×16.
+
+### 6.3 Propriétés des filtres (44,1 kHz, ×8 et ×16)
+
+- **Délai de groupe.** Constant en phase linéaire. En phase minimale,
+  0,07 à 0,10 ms en basse fréquence ; excursion de 20 Hz à 20 kHz : 117 µs
+  (48), 635 µs (256), 440 µs (1 024), 449 µs (4 096). Sous 10 kHz elle reste
+  ≤ 26 µs, à 15 kHz ≤ 85 µs : l'essentiel se loge entre 15 et 20 kHz.
+- **Pré-écho** (phase linéaire), étendue à −120 dB sous le pic :
+  0,47 ms (48), 2,3 ms (256), 9,6 ms (1 024), 35,5 ms (4 096) ; énergie plus
+  d'1 ms avant le pic : −51 dB (256), −32 dB (1 024), −30 dB (4 096). En phase
+  minimale, rien au-delà de 0,1 ms avant le pic à mieux que −113 dB.
+- **Gain unitaire par phase** tenu partout à mieux que 0,03 ppm
+  (2·10⁻⁷ dB), phase minimale comprise.
+- **Réponse mesurée contre conçue** : écart ≤ 1,3·10⁻² dB pour polyvalent,
+  precision, precision-longue et leurs variantes (erreur de la méthode à la
+  crête à 21 kHz). `polyvalent` : −0,087 dB à 20 kHz, −20,5 dB à 21 kHz ;
+  `resume.md` : −0,1 dB à 20 015 Hz et 135,7 dB à Nyquist ; `precision`
+  146,5 dB, `precision-longue` 145,4 dB au-delà de Nyquist ; `resolution`
+  −6 dB à Nyquist. **Pour `resolution`, la mesure à la crête n'est pas
+  valable** : l'image passe et s'ajoute ; il manque au banc la mesure du seul
+  fondamental.
+
+### 6.4 Bruit de quantification (dBFS ; puissance rapportée à 1, ajouter 3,0 dB en convention AES17)
+
+| cadence | formeur | 16 b, 20 Hz–20 kHz | 16 b, 20 kHz–Fs/2 | 24 b, 20 Hz–20 kHz | 24 b, 20 kHz–Fs/2 |
+|---|---|---|---|---|---|
+| 44,1 | TPDF seul | −96,8 | −106,5 | −144,9 | −154,7 |
+| 44,1 | wannamaker9f | −82,0 | −80,0 | −130,1 | −128,2 |
+| 88,2 | TPDF seul | −99,8 | −99,0 | −147,9 | −147,1 |
+| 88,2 | ordre2 | −101,7 | −88,7 | −149,8 | −136,9 |
+| 176,4 | ordre2 | −116,0 | −88,6 | −164,2 | −136,7 |
+| 352,8 | TPDF seul | −105,8 | −96,9 | −154,0 | −145,0 |
+| 352,8 | ordre2 | −130,8 | −88,6 | −179,0 | −136,7 |
+| 352,8 | ordre4 | −151,4 | −77,9 | −199,7 | −126,0 |
+| 768 | ordre4 | −181,6 | −77,9 | −229,7 | −126,1 |
+
+Lecture : aux cadences ≥ 176,4 kHz, l'ordre 2 gagne ~25 dB et l'ordre 4
+~45 dB dans la bande audible sur le TPDF, comme prévu au § 4 ; le bruit
+ultrasonore reste à −88,6 (ordre 2), −83,3 (ordre 3) et −77,9 dBFS (ordre 4)
+à 16 bits, au moins 15 dB sous un plafond de −60 dBFS, et vers −126 dBFS à
+24 bits. **À 88,2 et 96 kHz, les binomiaux ne gagnent presque rien** (au
+plus 3 dB, l'ordre 4 rien) : à ×2, le TPDF seul suffit. À 44,1 kHz, les
+formeurs psychoacoustiques montent le bruit non pondéré (c'est leur
+principe) ; leur gain se lit sur la mesure pondérée Terhardt de `resume.md`.
+
+### 6.5 Ce que le banc ne mesure pas encore
+
+La phase intermédiaire (absente du catalogue), la réponse à un échelon,
+l'intermodulation 19 + 20 kHz, le gain du seul fondamental pour un filtre qui
+laisse passer des images, le chemin scalaire dans l'interpolateur complet
+(pas de forçage du chemin), la convolution rapide (absente).
+
+**Tests de la crate** : 3 rouges sur 30 au passage du 2 novembre,
+`phase_minimale::module_conserve_et_energie_devant` (écart 1,0002·10⁻⁴ dB
+pour un seuil de 10⁻⁴), `gabarits::polyvalent_apodise_avant_nyquist`
+(gabarit demandant ≤ 0,01 dB jusqu'à 20 kHz alors que la conception met
+−0,1 dB à 20,0 kHz : gabarit contradictoire avec la conception) et
+`gabarits::thd_n_numerique_sous_le_plancher_24_bits` (−153,5 dB pour
+< −160 dB). Ils sont à trancher à l'entrée de la crate dans le workspace
+(I2) : corriger le gabarit contradictoire, ou la conception.
 
 ## 7. Intégration proposée
 
@@ -325,6 +411,27 @@ jour appliqué sur ces chemins.
 - **Q7 — Mesures.** Quelles mesures manquent au banc pour votre jugement
   (réponse à un échelon, pré-écho en dB, délai de groupe en fonction de la
   fréquence, intermodulation 19+20 kHz) ?
+
+### 9 bis. Réponses reçues (2 novembre) et ce que les mesures en font
+
+Le membre de la communauté a répondu aux sept questions par une note de
+conception reçue le 2 novembre (résumée dans #7614). Confrontées au banc du
+§ 6 :
+
+| question | réponse reçue | après mesure | statut |
+|---|---|---|---|
+| Q1 | garder 0,468 Fs et la gaussienne | rien ne s'y oppose (§ 6.3) | **close** |
+| Q2 | phase intermédiaire fixe, après mesure du délai de groupe | **la mesure ne la justifie pas** : excursion de 117 à 635 µs, concentrée entre 15 et 20 kHz ; catalogue initial en linéaire et minimale seulement, l'intermédiaire reste à décider à l'écoute | **changée**, à confirmer par le membre de la communauté |
+| Q3 | binomiaux aux cadences hautes, plafond ultrasonore −60 dBFS | confirmé (≤ −77,9 dBFS à 16 bits, ordre 4) ; **nuance** : à 88,2/96 kHz les binomiaux ne gagnent rien, TPDF seul à ×2 | **close avec nuance** |
+| Q4 | 1 024 en Auto, 4 096 et plus en Expert, convolution rapide partout | confirmé et renforcé : 4 096 direct < temps réel sur ce Xeon, 1 024 à la marge à ×16 | **close** ; la convolution rapide devient un préalable du 4 096 (I7) |
+| Q5 | suivre la famille de la source | retenu (pas de second étage rationnel par défaut) | **close** |
+| Q6 | TPDF seul à 24 bits | confirmé : −145 dBFS (44,1) à −154 dBFS (352,8) dans la bande | **close** |
+| Q7 | délai de groupe, pré-écho fenêtré, bruit ultrasonore à 24 bits ; intermodulation en analogique ou pas | les trois premières mesurées (§ 6.3, 6.4) ; échelon et fondamental seul encore absents | **close** pour le catalogue initial |
+
+Prérequis relevés par la même note : ordre volume / dither (audit du
+2 novembre : défaut en WASAPI exclusif et ASIO natif, #7703, PR #7705),
+continuité DSD (#7704, PR #7707), cadence DSD maximale du périphérique, et
+changement de cadence dans le SDK (étape I2, engagée).
 
 ## 10. Références
 
