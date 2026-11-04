@@ -33,13 +33,16 @@
 //!   pas fusionnés : l'identification les a déjà dits distincts ;
 //! * avec « Split albums by quality » (`quality_split`, actif par défaut),
 //!   deux éditions que l'IMPORT a séparées ne sont pas réunies (#7839) :
-//!   qualités connues sans rien en commun (DSD et CD, #7694), années connues
-//!   différentes, ou dossiers connus différents qui ne sont pas frères (deux
-//!   extractions distinctes). Les dossiers frères restent fusionnables : des
-//!   disques aux noms libres (« Nocturnes/Le jour », « Nocturnes/La nuit »)
-//!   ou un coffret `CD01/CD02` sont un seul album. Les éditions laissées à
-//!   part forment leur propre groupe : leurs vrais doublons fusionnent entre
-//!   eux. Réglage coupé, rien ne change ;
+//!   qualités connues sans rien en commun (DSD et CD, #7694), ou années
+//!   connues différentes — sauf dans le MÊME dossier, où l'année seule ne
+//!   sépare pas (l'enrichissement a pu la changer sur une des deux lignes).
+//!   L'import tient aussi compte de l'année sans `quality_split` ; la fusion ne
+//!   la regarde qu'avec, pour ne rien changer au réglage coupé. Le dossier ne
+//!   sépare PAS à lui seul : l'import réunit les dossiers miroirs (#4907), les
+//!   compilations éparpillées et les disques d'un coffret, que la fusion doit
+//!   continuer à réparer. Les éditions laissées à part forment leur propre
+//!   groupe : leurs vrais doublons fusionnent entre eux. Réglage coupé, rien
+//!   ne change ;
 //! * un album tenu par une édition manuelle (`album_metadata.edition_manuelle`,
 //!   C3) n'est jamais le PERDANT : il devient l'album conservé. Deux albums
 //!   édités à la main dans le même groupe : le groupe est laissé tel quel ;
@@ -52,7 +55,6 @@
 //! déclencheur et le titre), en plus du bilan `album_absorbe` d'`absorber`.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 use std::sync::Arc;
 
 use super::absorption::table_absente;
@@ -109,7 +111,7 @@ pub struct BilanDesDoublons {
     /// Albums laissés à part : groupe à plusieurs éditions manuelles.
     pub edites_a_la_main: usize,
     /// Éditions gardées en plus de la première : séparées à l'import
-    /// (qualité, année ou dossier, avec `quality_split`) — #7839.
+    /// (qualité ou année, avec `quality_split`) — #7839.
     pub editions_separees: usize,
     /// Fusions prévues mais non faites : plafond automatique dépassé.
     pub suspendus: usize,
@@ -124,7 +126,7 @@ struct Membre {
     pistes: i64,
     release: Option<String>,
     edite: bool,
-    /// `albums.folder_path` : le dossier qui identifie l'édition à l'import.
+    /// `albums.folder_path` : dans le même dossier, l'année seule ne sépare pas.
     dossier: Option<String>,
     annee: Option<i64>,
     /// Les scores [`score_qualite`](crate::library::quality::score_qualite)
@@ -492,46 +494,28 @@ impl FusionDesDoublons {
 /// Pourquoi l'import a fait de `a` et `b` deux éditions, avec
 /// `quality_split` actif — `None` s'il les aurait réunis (#7839).
 ///
-/// Les mêmes clés que `scan_import` et
-/// [`AlbumRepo::get_or_create_for_folder_de_qualite`] : le dossier de
-/// l'album, l'année, et la qualité (règle des dossiers miroirs, #7694). Une
-/// valeur inconnue d'un côté ne sépare jamais : un album indexé avant que les
-/// dossiers soient relevés reste fusionnable, comme avant.
+/// La qualité (règle des dossiers miroirs, #7694) et l'année, deux clés de
+/// `scan_import`. Le dossier n'en est pas une ici : l'import réunit des
+/// dossiers différents (miroirs, compilations éparpillées, coffrets), et deux
+/// lignes du même dossier sont un vrai doublon même si l'enrichissement a
+/// donné une autre année à l'une. Une valeur inconnue d'un côté ne sépare
+/// jamais : un album indexé avant que la qualité soit relevée reste
+/// fusionnable, comme avant.
 fn separes_a_l_import(a: &Membre, b: &Membre) -> Option<&'static str> {
     if !a.qualites.is_empty() && !b.qualites.is_empty() && a.qualites.is_disjoint(&b.qualites) {
         return Some("qualites_sans_rien_en_commun");
+    }
+    if let (Some(x), Some(y)) = (&a.dossier, &b.dossier)
+        && x.trim_end_matches('/') == y.trim_end_matches('/')
+    {
+        return None;
     }
     if let (Some(x), Some(y)) = (a.annee, b.annee)
         && x != y
     {
         return Some("annees_differentes");
     }
-    if let (Some(x), Some(y)) = (&a.dossier, &b.dossier)
-        && !dossiers_d_une_meme_edition(x, y)
-    {
-        return Some("dossiers_distincts");
-    }
     None
-}
-
-/// Deux dossiers d'album qui peuvent porter la même édition : le même, l'un
-/// sous l'autre (`Album` et `Album/CD2`), ou deux frères sous un vrai parent
-/// — les disques d'un coffret (`CD01`, `CD02`, voir
-/// [`crate::scanner::compilation::sont_des_disques_du_meme_coffret`]) comme
-/// des disques aux noms libres (`Nocturnes/Le jour`, `Nocturnes/La nuit`).
-fn dossiers_d_une_meme_edition(a: &str, b: &str) -> bool {
-    let (pa, pb) = (
-        Path::new(a.trim_end_matches('/')),
-        Path::new(b.trim_end_matches('/')),
-    );
-    if pa == pb || pa.starts_with(pb) || pb.starts_with(pa) {
-        return true;
-    }
-    // Comme le coffret : la racine du système de fichiers n'est pas un parent.
-    match (pa.parent(), pb.parent()) {
-        (Some(x), Some(y)) => x == y && !x.as_os_str().is_empty() && x.parent().is_some(),
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -814,20 +798,61 @@ mod tests {
         assert!(existe(&db, a) && !existe(&db, b));
     }
 
-    /// Deux extractions de même qualité dans deux dossiers sans parent
-    /// commun : l'import en a fait deux albums, la fusion les laisse.
+    /// Le même album, même qualité, sous deux racines (règle des dossiers
+    /// miroirs, #4907) : l'import en fait UN album ; deux lignes nées avant
+    /// cette règle sont toujours réunies par la fusion.
     #[test]
-    fn deux_rips_de_meme_qualite_dans_deux_dossiers_restent_deux_albums_7839() {
+    fn deux_dossiers_miroirs_de_meme_qualite_fusionnent_7839() {
         let db = base();
         quality_split(&db, true);
         let x = artiste(&db, "X");
-        let a = edition(&db, "Blue Train", x, "/m/Rips 2009/Blue Train", None, CD, 5);
-        let b = edition(&db, "Blue Train", x, "/m/Rips 2021/Blue Train", None, CD, 5);
+        let a = edition(
+            &db,
+            "Blue Train",
+            x,
+            "/nas/Musique/X/Blue Train",
+            Some(1957),
+            CD,
+            5,
+        );
+        let b = edition(
+            &db,
+            "Blue Train",
+            x,
+            "/mnt/sauvegarde/X/Blue Train",
+            Some(1957),
+            CD,
+            5,
+        );
         let bilan = FusionDesDoublons::with_backend(db.clone())
             .fusionner(Declencheur::Nettoyage)
             .unwrap();
-        assert!(existe(&db, a) && existe(&db, b), "{bilan:?}");
-        assert_eq!(bilan.editions_separees, 1);
+        assert_eq!(
+            (bilan.fusionnes, bilan.editions_separees),
+            (1, 0),
+            "#7839 : deux dossiers miroirs de même qualité laissés à part — {bilan:?}"
+        );
+        assert!(existe(&db, a) && !existe(&db, b));
+    }
+
+    /// Deux lignes du même dossier, même qualité, dont l'une a reçu une autre
+    /// année : un vrai doublon, le dossier prime sur l'année.
+    #[test]
+    fn le_meme_dossier_prime_sur_une_annee_differente_7839() {
+        let db = base();
+        quality_split(&db, true);
+        let x = artiste(&db, "X");
+        let a = edition(&db, "Blue Train", x, "/m/X/Blue Train", Some(1957), CD, 5);
+        let b = edition(&db, "Blue Train", x, "/m/X/Blue Train/", Some(1997), CD, 1);
+        let bilan = FusionDesDoublons::with_backend(db.clone())
+            .fusionner(Declencheur::FinDeScan)
+            .unwrap();
+        assert_eq!(
+            bilan.fusionnes, 1,
+            "#7839 : deux lignes du même dossier et de même qualité laissées à part \
+             pour une année différente — {bilan:?}"
+        );
+        assert!(existe(&db, a) && !existe(&db, b));
     }
 
     /// Deux années connues et différentes, dossiers frères de même qualité :
@@ -901,25 +926,5 @@ mod tests {
             "{bilan:?}"
         );
         assert!(existe(&db, dsd) && !existe(&db, cd));
-    }
-
-    #[test]
-    fn dossiers_d_une_meme_edition_freres_imbriques_ou_non() {
-        assert!(dossiers_d_une_meme_edition("/m/A/Album", "/m/A/Album/"));
-        assert!(dossiers_d_une_meme_edition("/m/A/Album", "/m/A/Album/CD2"));
-        assert!(dossiers_d_une_meme_edition(
-            "/m/A/Coffret/CD01",
-            "/m/A/Coffret/CD02"
-        ));
-        assert!(dossiers_d_une_meme_edition(
-            "/m/A/Nocturnes/Le jour",
-            "/m/A/Nocturnes/La nuit"
-        ));
-        assert!(!dossiers_d_une_meme_edition(
-            "/m/DSD/A/Album",
-            "/m/CD/A/Album"
-        ));
-        // Deux dossiers posés à la racine n'ont rien qui les relie.
-        assert!(!dossiers_d_une_meme_edition("/Album 1", "/Album 2"));
     }
 }
