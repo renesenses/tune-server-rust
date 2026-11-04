@@ -5,7 +5,10 @@
 use axum::extract::State;
 use serde_json::Value;
 
-use super::{noter_a_jour, noter_l_echec, poser_la_phase, raison, surveiller_la_tache};
+use super::{
+    PREFIXE_DOCKER, bloque_une_nouvelle_tentative, noter_a_jour, noter_l_echec, poser_la_phase,
+    raison, surveiller_la_tache,
+};
 use crate::routes::system::update::{UpdateBlame, update_status};
 use crate::state::AppState;
 
@@ -82,7 +85,7 @@ async fn chaque_refus_avant_telechargement_se_lit_sur_la_route_de_suivi_7600() {
 #[tokio::test]
 async fn un_echec_en_arriere_plan_porte_la_raison_de_son_etape_7600() {
     let signature = format!("failed: {}", UpdateBlame::Untrusted.user_message());
-    let cas: [(&str, &str, &str); 6] = [
+    let cas: [(&str, &str, &str); 5] = [
         (
             "downloading",
             "failed: Download failed: HTTP 404",
@@ -108,12 +111,12 @@ async fn un_echec_en_arriere_plan_porte_la_raison_de_son_etape_7600() {
             "failed: Install crashed: index out of bounds",
             raison::INSTALL_CRASHED,
         ),
-        (
-            "installing",
-            "failed: Running in Docker — update by pulling the new image",
-            raison::DOCKER,
-        ),
     ];
+    let docker = format!("failed: {PREFIXE_DOCKER} — update by pulling the new image");
+    let cas: Vec<(&str, &str, &str)> = cas
+        .into_iter()
+        .chain([("installing", docker.as_str(), raison::DOCKER)])
+        .collect();
     for (etape, echec, attendue) in cas {
         let state = etat();
         poser_la_phase(&state.update_phase, &state.update_issue, "downloading");
@@ -156,6 +159,10 @@ async fn une_tache_qui_panique_ne_laisse_plus_d_etat_en_cours_7600() {
             .as_str()
             .is_some_and(|m| m.contains("downloading")),
         "le message nomme l'étape interrompue : {corps}"
+    );
+    assert!(
+        !bloque_une_nouvelle_tentative(corps["phase"].as_str()),
+        "après `task_aborted`, un nouveau clic ne doit plus être refusé en `already_in_progress` : {corps}"
     );
 }
 
@@ -281,8 +288,28 @@ fn update_install_branche_chaque_refus_sur_la_route_de_suivi_7600() {
             "update_install doit appeler `{appel}` {attendu} fois"
         );
     }
+    assert_eq!(
+        corps
+            .matches("suivi::bloque_une_nouvelle_tentative(Some(p))")
+            .count(),
+        1,
+        "la garde `already_in_progress` doit passer par `bloque_une_nouvelle_tentative`"
+    );
     assert!(
         !corps.contains("*update_phase.lock().unwrap() = Some("),
         "la tâche ne doit plus écrire la phase sans sa raison"
+    );
+}
+
+/// La garde Docker de secours de la tâche n'est reconnue que par le début de
+/// sa phrase : si `update.rs` la réécrit, sa raison retomberait sans bruit
+/// sur `install_failed`.
+#[test]
+fn la_phrase_docker_de_la_tache_est_celle_que_le_suivi_reconnait_7600() {
+    let attendu = format!("\"failed: {PREFIXE_DOCKER}");
+    assert_eq!(
+        corps_de_update_install().matches(attendu.as_str()).count(),
+        1,
+        "la garde Docker de la tâche doit écrire une phase commençant par `failed: {PREFIXE_DOCKER}`"
     );
 }

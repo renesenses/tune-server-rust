@@ -2496,7 +2496,7 @@ pub(super) async fn update_install(
     {
         let phase = state.update_phase.lock().unwrap();
         if let Some(ref p) = *phase
-            && !p.starts_with("failed")
+            && suivi::bloque_une_nouvelle_tentative(Some(p))
         {
             return (
                 StatusCode::CONFLICT,

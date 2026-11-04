@@ -1,6 +1,6 @@
 //! #7600 — ce que la route de suivi dit d'une mise à jour qui n'aboutit pas.
 //!
-//! Sandro (rc8.1, Linux) clique « Mettre à jour » : le bouton reste sur
+//! Signalé en rc8.1 sous Linux : après « Mettre à jour », le bouton reste sur
 //! « Chargement » et rien ne se passe. L'écran ne lit, pendant toute
 //! l'attente, que `GET /system/update/status`. Or trois familles de cas n'y
 //! laissaient rien de lisible :
@@ -99,6 +99,16 @@ pub(crate) fn noter_a_jour(phase: &Phase, issue: &Issue, message: &str) {
     *p = None;
 }
 
+/// Début de la phrase de la garde Docker de secours de la tâche
+/// (`update.rs`) : seule phrase reconnue telle quelle, gardée par un témoin.
+pub(crate) const PREFIXE_DOCKER: &str = "Running in Docker";
+
+/// La garde `already_in_progress` de `update_install` : une phase posée et
+/// non `failed…` refuse une nouvelle tentative.
+pub(crate) fn bloque_une_nouvelle_tentative(phase: Option<&str>) -> bool {
+    phase.is_some_and(|p| !p.starts_with("failed"))
+}
+
 /// La raison d'un échec posé en arrière-plan, d'après l'étape où il survient.
 ///
 /// Les échecs de la tâche écrivent `failed: <phrase>` juste après avoir posé
@@ -106,7 +116,7 @@ pub(crate) fn noter_a_jour(phase: &Phase, issue: &Issue, message: &str) {
 /// l'étape qui dit la famille, sans avoir à reconnaître chaque phrase.
 pub(crate) fn raison_de_l_etape(precedente: Option<&str>, nouvelle: &str) -> &'static str {
     let detail = nouvelle.strip_prefix("failed:").unwrap_or(nouvelle).trim();
-    if detail.starts_with("Running in Docker") {
+    if detail.starts_with(PREFIXE_DOCKER) {
         return raison::DOCKER;
     }
     if detail.starts_with("Install crashed") {
