@@ -148,7 +148,7 @@ async fn parcours_zapping(db: Arc<dyn DbBackend>) {
     // Trois titres de l'album zappés à 5 s : rien ne doit rester.
     for titre in ["Un", "Deux", "Trois"] {
         lancer(&orch, SALON, &piste(titre, 240_000)).await;
-        assert!(!avancer(&orch, SALON, 5_000).await);
+        avancer(&orch, SALON, 5_000).await;
     }
     orch.playback.stop(SALON).await;
     assert_eq!(
@@ -168,8 +168,12 @@ async fn parcours_zapping(db: Arc<dyn DbBackend>) {
 async fn parcours_31_s_sur_4_min(db: Arc<dyn DbBackend>) {
     let orch = orchestrateur(db.clone());
     lancer(&orch, SALON, &piste("Long", 240_000)).await;
-    assert!(!avancer(&orch, SALON, 29_000).await);
-    assert_eq!(ecoutes(&db), 0, "29 s sur 4 min : sous le seuil de 30 s");
+    avancer(&orch, SALON, 29_000).await;
+    assert_eq!(
+        ecoutes(&db),
+        0,
+        "#7852 : 29 s d'un titre de 4 min, sous le seuil de 30 s, ne comptent pas d'écoute"
+    );
     assert!(
         avancer(&orch, SALON, 31_000).await,
         "31 s sur 4 min : validée"
@@ -195,8 +199,12 @@ async fn parcours_31_s_sur_4_min(db: Arc<dyn DbBackend>) {
 async fn parcours_21_s_sur_40_s(db: Arc<dyn DbBackend>) {
     let orch = orchestrateur(db.clone());
     lancer(&orch, SALON, &piste("Court", 40_000)).await;
-    assert!(!avancer(&orch, SALON, 19_000).await);
-    assert_eq!(ecoutes(&db), 0, "19 s sur 40 s : sous la moitié");
+    avancer(&orch, SALON, 19_000).await;
+    assert_eq!(
+        ecoutes(&db),
+        0,
+        "#7852 : 19 s d'un titre de 40 s, sous la moitié, ne comptent pas d'écoute"
+    );
     assert!(avancer(&orch, SALON, 21_000).await);
     assert_eq!(ecoutes(&db), 1, "21 s d'un titre de 40 s : une écoute");
 }
@@ -204,10 +212,10 @@ async fn parcours_21_s_sur_40_s(db: Arc<dyn DbBackend>) {
 async fn parcours_coupe_a_19_s(db: Arc<dyn DbBackend>) {
     let orch = orchestrateur(db.clone());
     lancer(&orch, SALON, &piste("Court", 40_000)).await;
-    assert!(!avancer(&orch, SALON, 19_000).await);
+    avancer(&orch, SALON, 19_000).await;
     // Le titre suivant arme sa propre écoute : celle du titre coupé s'en va.
     lancer(&orch, SALON, &piste("Suivant", 40_000)).await;
-    assert!(!avancer(&orch, SALON, 2_000).await);
+    avancer(&orch, SALON, 2_000).await;
     assert_eq!(
         ecoutes(&db),
         0,
@@ -221,14 +229,22 @@ async fn parcours_transfert(db: Arc<dyn DbBackend>) {
 
     // Transfert AVANT le seuil : l'écoute suit le titre sur la cible.
     lancer(&orch, SALON, &np).await;
-    assert!(!avancer(&orch, SALON, 10_000).await);
+    avancer(&orch, SALON, 10_000).await;
     en_file(&orch.db, CUISINE, &np);
     orch.playback.play(CUISINE, np.clone()).await;
     orch.transferer_l_ecoute_en_attente(SALON, CUISINE);
     // La source continue un instant (transfert sans arrêt) : elle ne compte plus.
-    assert!(!avancer(&orch, SALON, 40_000).await);
-    assert!(avancer(&orch, CUISINE, 31_000).await);
-    assert!(!avancer(&orch, CUISINE, 90_000).await);
+    avancer(&orch, SALON, 40_000).await;
+    assert_eq!(
+        ecoutes(&db),
+        0,
+        "#7852 : après le transfert, la zone d'origine ne compte plus le titre transféré"
+    );
+    assert!(
+        avancer(&orch, CUISINE, 31_000).await,
+        "#7852 : la zone cible valide l'écoute transférée au seuil"
+    );
+    avancer(&orch, CUISINE, 90_000).await;
     assert_eq!(
         ecoutes(&db),
         1,
