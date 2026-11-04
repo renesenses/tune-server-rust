@@ -139,7 +139,7 @@ async fn la_reprise_d_un_album_bandcamp_retrouve_son_titre_malgre_une_signature_
     }));
     let db = &state.backend;
     let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone())
-        .create("Salon 7778", None, None)
+        .create("Zone 7778", None, None)
         .unwrap();
     // La file de l'écoute d'origine : le deuxième titre seul, signé la veille.
     let ancienne = url_signee(PISTES[1], 1_799_900_000);

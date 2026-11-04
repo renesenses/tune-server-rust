@@ -7484,7 +7484,7 @@ async fn une_piste_qui_ne_demarre_pas_est_annoncee_a_l_auditeur() {
 /// `message_piste_non_demarree` fait tomber ce test.
 #[test]
 fn un_titre_refuse_par_le_service_est_nomme_et_non_dit_no_url_7778() {
-    let msg = Orchestrator::message_piste_non_demarree("suivante", "no url");
+    let msg = super::PlaybackOrchestrator::message_piste_non_demarree("suivante", "no url");
     assert!(
         !msg.contains("no url"),
         "#7778 : le motif brut « no url » ne doit pas être montré à l'auditeur : {msg}"
@@ -7495,7 +7495,7 @@ fn un_titre_refuse_par_le_service_est_nomme_et_non_dit_no_url_7778() {
     );
     // Une autre cause reste dite telle quelle.
     assert!(
-        Orchestrator::message_piste_non_demarree("suivante", "track not found")
+        super::PlaybackOrchestrator::message_piste_non_demarree("suivante", "track not found")
             .contains("track not found")
     );
 }

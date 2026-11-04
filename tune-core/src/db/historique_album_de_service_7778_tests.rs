@@ -21,12 +21,12 @@ fn l_historique_rend_l_album_du_service_d_un_titre_lance_hors_album_7778() {
     repo.record(&ListenRecord {
         title: "Titre phare".into(),
         source: "qobuz".into(),
-        source_id: Some("453649358".into()),
+        source_id: Some("titre-qobuz-7778".into()),
         duration_ms: 240_000,
         context_type: Some("artist".into()),
         context_id: Some("artiste-7778".into()),
         context_source: Some("qobuz".into()),
-        album_ref: Some("iol01ns87bl3d".into()),
+        album_ref: Some("album-qobuz-7778".into()),
         ..Default::default()
     })
     .unwrap();
@@ -36,7 +36,7 @@ fn l_historique_rend_l_album_du_service_d_un_titre_lance_hors_album_7778() {
     for ecoute in [&recent[0], &page[0]] {
         assert_eq!(
             ecoute.album_ref.as_deref(),
-            Some("iol01ns87bl3d"),
+            Some("album-qobuz-7778"),
             "#7778 : l'historique doit rendre l'album du service, sans quoi le client ne peut \
              pas proposer « Aller à l'album »"
         );
