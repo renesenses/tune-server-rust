@@ -523,6 +523,8 @@ pub(super) enum MotifFin {
     FinNaturelleLocale,
     DsdDlnaPicAtteint,
     HorlogeMuraleSurSondeEnEchec,
+    /// #7700 — « suivant » pressé sur l'appareil DLNA.
+    SuivantDeLAppareil,
 }
 
 #[cfg(test)]
@@ -537,6 +539,7 @@ impl MotifFin {
             MotifFin::FinNaturelleLocale => decisions::motif_fin::FIN_NATURELLE_LOCALE,
             MotifFin::DsdDlnaPicAtteint => decisions::motif_fin::DSD_DLNA_PIC_ATTEINT,
             MotifFin::HorlogeMuraleSurSondeEnEchec => "dlna_poll_failed_wall_clock",
+            MotifFin::SuivantDeLAppareil => decisions::motif_fin::SUIVANT_DE_L_APPAREIL,
         }
     }
 }
