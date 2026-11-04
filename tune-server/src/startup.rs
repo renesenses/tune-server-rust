@@ -587,6 +587,10 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
             .as_deref(),
     ));
     ouvrir_le_registre_des_executions(state);
+    // #7195 — le jeton Discogs saisi dans « Jetons de service » avant
+    // l'unification devient le jeton PERSONNEL (coffre des Clés d'API) :
+    // « Ma collection physique » le voit, sans ressaisie.
+    crate::routes::system::cles_api::adopter_le_jeton_discogs_des_jetons_de_service(state);
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
     // #3688 — les zones qui sont notre PROPRE facade MediaRenderer revenue
@@ -638,6 +642,9 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // lecture et rien d'écrit sur une base déjà passée. Avant la boucle de
     // synchronisation, qui ne les ramènera plus.
     tune_core::db::radios_indexees_upnp_6500::passe_journalisee(&state.backend);
+    // #7695 — de même pour les photos et vidéos d'un partage multimédia
+    // (DNG d'un portable Windows), rangées dans `tracks` avant le correctif.
+    tune_core::db::photos_indexees_upnp_7695::passe_journalisee(&state.backend);
     restore_zone_volumes(state).await;
     restaurer_la_lecture(state, config).await;
     restore_oaat_groups(state).await;
@@ -659,6 +666,11 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
         // #4626 — les sorties prêtées par les agents Tune appairés.
         crate::agent_tune::maitre::reinscrire_les_agents(&state_clone).await;
     });
+    // #6961 — la resonde ci-dessus ne part qu'UNE fois. Une zone DLNA/OpenHome
+    // restée hors ligne (appareil injoignable à cet instant précis, réseau de
+    // la machine pas encore prêt) est réévaluée ensuite, à intervalles, au
+    // lieu d'attendre un `NOTIFY` qu'un renderer déjà allumé n'émet pas.
+    crate::discovery_setup::spawn_reevaluation_des_zones_hors_ligne(state);
 
     // Re-probe auto-discovered DLNA renderers from their persisted LOCATION,
     // so one with a lazy SSDP responder (Cyrus Stream X2) comes back online
@@ -2962,6 +2974,23 @@ pub(crate) enum IssueMontage {
 /// Un essai de montage d'UN partage, son issue écrite sur sa ligne.
 async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMontage {
     let (host, share, path, id) = (p.host.clone(), p.share.clone(), p.path.clone(), p.id);
+    // Une ligne ne remonte que sous une racine du serveur, avec un hôte, un
+    // partage et des identifiants acceptables : les mêmes règles que le
+    // montage interactif (`routes/network.rs`). Sinon, rien n'est lancé.
+    let racines = crate::routes::network::racines_des_montages(state);
+    let refus = if !crate::smb::est_confine(std::path::Path::new(&path), &racines) {
+        Some("mount point outside the server's mount directory")
+    } else {
+        crate::smb::verifier_hote(&host)
+            .and_then(|_| crate::smb::verifier_partage(&share))
+            .and_then(|_| crate::smb::verifier_identifiants(&p.user, &p.pass))
+            .err()
+    };
+    if let Some(motif) = refus {
+        warn!(host = %host, share = %share, path = %path, motif, "network_share_remount_refused");
+        noter_montage(state, id, "failed", Some(motif), None).await;
+        return IssueMontage::Definitif;
+    }
     // Deja monte (redemarrage du seul service, systeme reste debout) :
     // ne pas empiler un second montage sur le meme point.
     //
@@ -3023,7 +3052,7 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
             // l'echelle et part au journal avec la cause.
             let res = tokio::time::timeout(
                 crate::smb::ESSAI_TIMEOUT,
-                crate::smb::commande_de_montage(
+                crate::smb::lancer_un_essai(
                     crate::privilege::euid(),
                     &crate::privilege::sudo(),
                     &unc,
@@ -3031,8 +3060,7 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
                     u,
                     &pass,
                     dialecte,
-                )
-                .lancer(),
+                ),
             )
             .await;
             let arreter = match &res {

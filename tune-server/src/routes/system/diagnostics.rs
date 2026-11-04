@@ -913,8 +913,11 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
             // dans le greffon ALSA de PipeWire ne doit pas figer le serveur.
             // #6119 — jamais pendant qu'une sortie locale joue : la page Zones
             // charge cette fiche, et sonder ASIO y coupait la lecture WASAPI.
+            // #7263 — et pas un inventaire complet par appel : l'écran « État du
+            // serveur » interroge cette fiche toutes les 5 s ; le parc publié de
+            // moins de 5 min suffit pour en donner les noms.
             let devs: Vec<String> =
-                crate::background::parc_local_sans_couper_la_lecture(&state, || {
+                crate::background::parc_local_pour_le_diagnostic(&state, || {
                     tune_core::outputs::local::list_audio_devices_with_backend_bounded(
                         audio_backend_pref,
                     )
@@ -2333,6 +2336,9 @@ fn lignes_zones_masquees(
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
+    tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
+        state.backend.clone(),
+    ));
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
@@ -3327,6 +3333,11 @@ async fn envoyer_le_rapport(
 
     // The site caps the body at 50k chars. On retire les lignes de journal les
     // plus ANCIENNES (#7468) : le défaut est dans les dernières minutes.
+    // Le diagnostic est déjà nettoyé (`generate_bug_report`). Les mots du
+    // testeur, le résumé joint et le titre passent par la porte commune des
+    // identifiants d'accès distant : un lien ou un journal collé y passe aussi.
+    let full_markdown = tune_core::confidentialite::masquer_acces_distant(&full_markdown);
+    let title = tune_core::confidentialite::masquer_acces_distant(&title);
     let body_md = couper_le_rapport(&full_markdown, BUG_REPORT_MAX_BODY_CHARS);
 
     let instance_id = tune_core::db::settings_repo::SettingsRepo::with_backend(backend)

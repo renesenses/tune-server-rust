@@ -1815,7 +1815,10 @@ pub(crate) fn marquer_scan_en_cours(
 /// gestes de RÉPARATION de bibliothèque. Aucun d'eux ne doit pouvoir autoriser
 /// une suppression de masse. Seul `trigger_scan`, qui porte une intention
 /// explicite de l'utilisateur, passe par `spawn_library_scan_confirmee`.
-pub(crate) async fn spawn_library_scan(
+///
+/// `pub` pour `tune-ffi` : l'hôte mobile (app iOS revenue au premier plan)
+/// relance un scan incrémental par `tune_server_scan`, sans passer par HTTP.
+pub async fn spawn_library_scan(
     state: AppState,
     force: bool,
     targeted_req: Option<String>,
@@ -3550,7 +3553,8 @@ async fn spawn_library_scan_avec_lecteur_par(
 
         // Turn any .m3u/.m3u8/.pls files found in the scanned dirs into local
         // playlists (Bertrand). Runs after import so every track is in the DB to
-        // match against; idempotent by playlist name so a re-scan never dupes.
+        // match against; a file already imported and unchanged is skipped, even
+        // if its playlist was deleted (#7723), so a re-scan never brings it back.
         if !scan_cancel_requested() {
             let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &scan_dirs);
             if pl.playlists_created > 0 {
@@ -3706,6 +3710,20 @@ async fn spawn_library_scan_avec_lecteur_par(
                 motif = suite_du_scan.motif().unwrap_or("none"),
                 "auto_enrichment_after_scan_skipped (needs Premium + enrich_on_scan)"
             );
+            // #6077 — sans recherche en ligne, le dernier recours vient
+            // tout de suite : la plus grande image des dossiers des albums
+            // restés sans pochette. Avec elle, c'est `batch_enrich_artwork`
+            // qui l'applique, après la recherche.
+            if !scan_cancel_requested() {
+                let dernier_recours_db = db.clone();
+                let dernier_recours_cache = cache_dir.clone();
+                handle.spawn_blocking(move || {
+                    tune_core::library::pochette_disque::pochettes_de_dernier_recours(
+                        &dernier_recours_db,
+                        &dernier_recours_cache,
+                    );
+                });
+            }
         }
         }).await;
         if let Err(e) = result {

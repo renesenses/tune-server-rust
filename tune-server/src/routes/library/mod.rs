@@ -676,6 +676,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/stats", get(stats::library_stats))
         .route("/labels", get(labels::list_labels))
+        // Écran « État du serveur » (01/11/2026) : avant `/labels/{nom}/…`,
+        // qui ne capture de toute façon pas ces chemins (segment `artists`).
+        .route("/labels/logos/enrich", post(labels::lancer_logos))
+        .route("/labels/logos/status", get(labels::statut_logos))
         .route("/labels/{nom}/artists", get(labels::artistes_du_label))
         .route("/artwork/{hash}", get(artwork::serve_artwork))
         .route("/artwork/proxy", get(artwork::proxy_artwork))
@@ -797,6 +801,8 @@ pub fn router() -> Router<AppState> {
             "/dr/gravure",
             get(graver_dr::statut).post(graver_dr::lancer),
         )
+        // #7719 — arrêter la gravure en cours, entre deux fichiers.
+        .route("/dr/gravure/cancel", post(graver_dr::annuler))
         // 25/09/2026 — le compositeur des CRÉDITS descend dans la colonne ET
         // dans la balise du fichier. La balise est indispensable : `update_batch`
         // reconstruit `tracks.composer` à partir du fichier seul dès qu'un scan
@@ -952,6 +958,10 @@ mod banc_rail_5993;
 #[cfg(test)]
 #[path = "facettes_lentes_2144_tests.rs"]
 mod facettes_lentes_2144_tests;
+
+#[cfg(test)]
+#[path = "liste_dr_7580_tests.rs"]
+mod liste_dr_7580_tests;
 
 #[cfg(test)]
 #[path = "banc_repertoires_5998.rs"]

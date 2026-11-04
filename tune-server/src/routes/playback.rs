@@ -970,7 +970,15 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
 
 async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &PlayResult) -> Value {
     let mut zone = build_zone_json(state, zone_id).await;
-    if let Some(ref err) = result.error {
+    // #7247 : un Play remplacé par un choix plus récent n'est pas un refus ;
+    // ce marqueur interne ne s'affiche pas à l'auditeur (« Cannot play:
+    // superseded by a newer play »). Les vrais refus et les avertissements
+    // d'une sortie qui a accepté Play restent publiés.
+    if let Some(err) = result
+        .error
+        .as_deref()
+        .filter(|err| *err != tune_core::orchestrator::PLAY_SUPERSEDED)
+    {
         zone.as_object_mut()
             .unwrap()
             .insert("error".into(), json!(err));
@@ -4830,6 +4838,29 @@ async fn get_queue(
         output_device_id.as_deref(),
     )
     .await;
+    // #6910 — le sondeur arme un suivant DSD sur le renderer DLNA qui annonce
+    // le DSD et `SetNext` : la file le promet alors, sur la même règle. Rien
+    // n'est lu sur le réseau ici : seulement ce que le SCPD a déjà dit.
+    let dsd_suivant_tenu = match output_device_id.as_deref() {
+        Some(device_id) if output_type == "dlna" => {
+            let sortie = { state.outputs.lock().await.get(device_id) };
+            let annonce_suivante = match sortie {
+                Some(arc) => arc
+                    .lock()
+                    .await
+                    .as_any()
+                    .downcast_ref::<tune_core::outputs::dlna::DlnaOutput>()
+                    .map(|d| d.annonce_suivante_retenue())
+                    .unwrap_or(tune_core::outputs::traits::AnnonceSuivante::Inconnue),
+                None => tune_core::outputs::traits::AnnonceSuivante::Inconnue,
+            };
+            state
+                .orchestrator
+                .dsd_suivant_tenu_sur_dlna(device_id, annonce_suivante)
+                .await
+        }
+        _ => false,
+    };
     // L'ordre RÉELLEMENT joué se lit sur la file telle qu'elle est MAINTENANT,
     // pas sur la longueur que l'état de zone traînait.
     let mut zs = ps.clone();
@@ -4898,6 +4929,7 @@ async fn get_queue(
                     ),
                     successeur_format: suivant.and_then(|s| s.format.as_deref()),
                     successeur_est_fichier_local: suivant.is_some_and(|s| s.file_path.is_some()),
+                    dsd_suivant_tenu,
                 },
             );
             if let Some(obj) = v.as_object_mut() {
@@ -10521,3 +10553,7 @@ mod lecture_d_une_playlist_a_lignes_introuvables_6179 {
 #[cfg(test)]
 #[path = "playback/echec_transfert_6155_tests.rs"]
 mod echec_transfert_6155_tests;
+
+#[cfg(test)]
+#[path = "playback/remplacement_volontaire_7247_tests.rs"]
+mod remplacement_volontaire_7247_tests;

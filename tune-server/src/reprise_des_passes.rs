@@ -95,7 +95,7 @@ impl Passe {
     pub fn id(self) -> &'static str {
         match self {
             Passe::Metadonnees => "enrich_all",
-            Passe::PochettesAlbums => "artwork",
+            Passe::PochettesAlbums => "album_artwork",
             Passe::ImagesArtistes => "artist_artwork",
         }
     }
