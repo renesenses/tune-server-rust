@@ -103,7 +103,11 @@ mod tests {
             while let Ok(Some(ligne)) = lignes.next_line().await {
                 let commande: serde_json::Value = serde_json::from_str(&ligne).unwrap();
                 let nom = commande["cmd"].as_str().unwrap().to_string();
-                notees.lock().await.push(nom.clone());
+                // `status` est la lecture de position ajoutée par #7084 après
+                // un `play` : elle ne pilote rien, on ne compte que les ordres.
+                if nom != "status" {
+                    notees.lock().await.push(nom.clone());
+                }
                 let evenement = reponse(&nom, plays);
                 if nom == "play" {
                     plays += 1;
