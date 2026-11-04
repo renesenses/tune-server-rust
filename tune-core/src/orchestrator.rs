@@ -2058,6 +2058,7 @@ pub use bandcamp::*;
 
 /// Fil 2121 — resigner une URL de flux Bandcamp expirée depuis sa page.
 mod bandcamp_resignature;
+pub use bandcamp_resignature::identifiant_de_piste as identifiant_de_piste_bandcamp;
 
 mod qualite_pre_armee;
 pub(crate) use qualite_pre_armee::{
