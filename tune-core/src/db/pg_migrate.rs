@@ -217,6 +217,9 @@ const MIGRATION_TABLES: &[&str] = &[
     "metadata_reports",
     // Paroles deja trouvees (les identifiants de pistes sont conserves).
     "lyrics_cache",
+    // Contrôle parental (#7856) : sans cette ligne, un profil supervisé
+    // retrouverait des listes sans filtre après la bascule.
+    "politiques_parentales",
 ];
 
 /// Tables copiees APRES `run_pg_migrations` : elles ne sont creees que par
@@ -1131,6 +1134,15 @@ CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_t
 CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
 CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
 CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
+-- Contrôle parental (#7856). Sans script numéroté : présente ici (bascule) ET
+-- dans `ENSURE_TABLES`, mêmes types (migrations/politiques_parentales.sql).
+CREATE TABLE IF NOT EXISTS politiques_parentales (
+ profile_id BIGINT PRIMARY KEY,
+ superviseur_id BIGINT NOT NULL,
+ revision BIGINT NOT NULL,
+ politique_json TEXT NOT NULL,
+ maj_le TEXT NOT NULL
+);
 -- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3 de
 -- MetaRust). Sans script numéroté : présente ici (bascule) ET dans
 -- `ENSURE_TABLES` (toute base, à chaque démarrage). Non copiée à la bascule :
@@ -1793,6 +1805,7 @@ fn conflict_clause(table: &str) -> &'static str {
     match table {
         "settings" => "ON CONFLICT (key) DO NOTHING",
         "listening_resumes" => "ON CONFLICT (zone_id, context_type, context_id, source) DO NOTHING",
+        "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
         "track_metadata" => "ON CONFLICT (track_id, key) DO NOTHING",
         "album_metadata" => "ON CONFLICT (album_id, key) DO NOTHING",
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",

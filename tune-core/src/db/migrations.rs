@@ -4772,6 +4772,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // interrogent à chaque lancement. PG : migration 086.
     index_des_identifiants_d_enregistrement(db);
 
+    // Politiques du contrôle parental (#7856) — SANS numéro de migration, sur
+    // le modèle du miroir des favoris : la 136 est demandée par plusieurs PR
+    // du même lot. Idempotent. PG : `ENSURE_TABLES` et `PG_FULL_SCHEMA`.
+    if let Err(e) = db.execute_batch(super::politique_parentale::SQL_TABLE) {
+        tracing::warn!(error = %e, "politiques_parentales_table_failed");
+    }
+
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
     // ci-dessus : une base venue de n'importe quelle version anterieure doit

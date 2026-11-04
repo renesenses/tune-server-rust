@@ -58,6 +58,8 @@ pub mod photos_indexees_upnp_7695;
 pub mod play_queue_repo;
 pub mod playlist_repo;
 pub mod playlists_reconcile;
+/// Contrôle parental, étape 1 (#7856) : politique d'un profil supervisé.
+pub mod politique_parentale;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(all(test, feature = "postgres"))]

@@ -45,6 +45,8 @@ use crate::db::engine::{Engine, PostgresDialect};
 // per boot. A table that fails must never block the next one.
 pub(crate) const ENSURE_TABLES: &[&str] = &[
     include_str!("../../migrations/continue_listening.sql"),
+    // #7856 — contrôle parental, sans script numéroté (voir `politique_parentale`).
+    include_str!("../../migrations/politiques_parentales.sql"),
     "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL, created_at DOUBLE PRECISION)",
     "CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq",
     "CREATE TABLE IF NOT EXISTS streaming_favorites (\
