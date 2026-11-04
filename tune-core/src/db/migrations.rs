@@ -2702,6 +2702,14 @@ CREATE INDEX IF NOT EXISTS idx_radio_ecoutes_jour ON radio_ecoutes(jour);
         up: "",
     },
     Migration { version: 135, name: "listening_resumes", up: include_str!("../../migrations/continue_listening.sql") },
+    // #7849 — notes personnelles en Markdown (artiste, album, piste) par
+    // profil, avec la reprise des notes d'album de `album_ratings.note`, qui
+    // reste en place. Jumelle PG : 101.
+    Migration {
+        version: 136,
+        name: "notes_personnelles",
+        up: include_str!("../../migrations/notes_personnelles.sql"),
+    },
 ];
 
 /// Migration 127 (#6257) : `tags.position`, 0 pour toutes les etiquettes
@@ -5682,6 +5690,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         100,
         "listening_resumes",
         include_str!("../../migrations/postgres/100_listening_resumes.sql"),
+    ),
+    // Jumelle de la SQLite 136 (#7849) : `notes_personnelles`, avec la
+    // reprise des notes d'album de `album_ratings.note`.
+    (
+        101,
+        "notes_personnelles",
+        include_str!("../../migrations/postgres/101_notes_personnelles.sql"),
     ),
 ];
 
@@ -9223,7 +9238,9 @@ mod tests {
         // 99 reste réservée à la sentinelle des anciennes bascules : entrée
         // sans effet pour garder la chaîne contiguë, jamais un changement DDL.
         // 100 : listening_resumes (#7280), jumelle de la SQLite 135.
-        assert_eq!(pg_latest_version(), 100, "latest PG migration must be 100");
+        // 101 : `notes_personnelles` (#7849), jumelle de la SQLite 136. Crée
+        // la table des notes, que les routes `/library/notes` NOMMENT.
+        assert_eq!(pg_latest_version(), 101, "latest PG migration must be 101");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

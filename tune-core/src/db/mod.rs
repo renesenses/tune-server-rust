@@ -41,6 +41,8 @@ pub mod metadata_report_repo;
 pub mod migration_status;
 pub mod migrations;
 pub mod models;
+/// #7849 — les notes personnelles en Markdown (artiste, album, piste).
+pub mod notes_personnelles;
 /// L'ordre alphabétique des listes paginées (#4956) : tri en Rust, découpe.
 pub(crate) mod ordre_alphabetique;
 #[cfg(all(test, feature = "postgres"))]
@@ -69,6 +71,8 @@ pub mod radio_repo;
 /// #6500 — les stations de radio indexées comme pistes par l'UPnP, retirées.
 pub mod radios_indexees_upnp_6500;
 pub mod rating_repo;
+/// #7849 — répartitions de la bibliothèque (codec, fréquence, décennie, rôle).
+pub mod repartitions_bibliotheque;
 /// Fil 2138 — rattrapage unique des dates d'ajout figées au premier scan.
 pub mod rattrapage_dates_ajout_2138;
 pub mod rattrapage_metadonnees_5043;
@@ -107,6 +111,9 @@ mod lenteur_pistes_5138_tests;
 /// #7535 — un MBID trouvé par le nom n'est plus posé s'il est déjà porté.
 #[cfg(test)]
 mod mbid_deja_porte_7535_tests;
+/// #7849 — notes personnelles et répartitions, SQLite et PostgreSQL.
+#[cfg(test)]
+mod notes_et_repartitions_7849_tests;
 /// #7694 — la règle des dossiers miroirs ne fond pas deux qualités.
 #[cfg(test)]
 mod miroirs_de_qualite_7694_tests;
