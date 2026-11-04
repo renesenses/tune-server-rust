@@ -8,6 +8,8 @@ pub mod audit_integrite;
 pub mod autoeq;
 /// #6388 — la base AutoEq en ligne : index, recherche, copie locale.
 pub mod autoeq_base;
+/// #6385 — les profils d'égaliseur OPRA (JSON), lus vers le même modèle.
+pub mod opra;
 pub mod canaux_declares;
 pub mod canaux_reseau_4573;
 

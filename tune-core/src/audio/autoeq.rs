@@ -233,6 +233,59 @@ pub enum ErreurAutoEq {
         borne_basse: f64,
         borne_haute: f64,
     },
+    /// #6385 — un profil OPRA (JSON) mal formé, ou qui demande ce que
+    /// l'égaliseur ne joue pas. Un fichier JSON n'a pas de ligne utile à
+    /// montrer : l'erreur nomme la bande (à partir de 1) quand elle en vise
+    /// une, et porte la même clé stable que son équivalent texte.
+    Opra {
+        bande: Option<usize>,
+        cle: &'static str,
+        detail: String,
+    },
+}
+
+impl ErreurAutoEq {
+    /// La clé stable que porte la réponse HTTP (`code`), à traduire côté
+    /// client — sur le modèle de [`RaisonIgnore::cle`]. Une phrase française
+    /// figée par le serveur ne se traduit pas ; une clé, si.
+    pub fn cle(&self) -> &'static str {
+        match self {
+            Self::AucuneBande => "no_active_filter",
+            Self::CanauxInvalides { .. } => "unsupported_channel",
+            Self::PreampParCanal { .. } => "per_channel_preamp",
+            Self::LigneIncomprise { .. } => "unrecognized_line",
+            Self::EtatManquant { .. } => "missing_on_off",
+            Self::TypeInconnu { .. } => "unknown_filter_type",
+            Self::ChampManquant { .. } => "missing_field",
+            Self::NombreInvalide { .. } => "invalid_number",
+            Self::ValeurHorsDomaine { .. } => "value_out_of_range",
+            Self::Opra { cle, .. } => cle,
+        }
+    }
+
+    /// La ligne fautive du texte (à partir de 1), quand l'erreur en vise une.
+    pub fn ligne(&self) -> Option<usize> {
+        match self {
+            Self::AucuneBande | Self::Opra { .. } => None,
+            Self::CanauxInvalides { ligne, .. }
+            | Self::PreampParCanal { ligne }
+            | Self::LigneIncomprise { ligne }
+            | Self::EtatManquant { ligne }
+            | Self::TypeInconnu { ligne, .. }
+            | Self::ChampManquant { ligne, .. }
+            | Self::NombreInvalide { ligne, .. }
+            | Self::ValeurHorsDomaine { ligne, .. } => Some(*ligne),
+        }
+    }
+
+    /// La bande fautive d'un profil OPRA (à partir de 1), quand l'erreur en
+    /// vise une.
+    pub fn bande(&self) -> Option<usize> {
+        match self {
+            Self::Opra { bande, .. } => *bande,
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ErreurAutoEq {
@@ -240,7 +293,7 @@ impl std::fmt::Display for ErreurAutoEq {
         match self {
             Self::AucuneBande => write!(
                 f,
-                "aucun filtre actif : ce texte n'est pas un profil AutoEq au format ParametricEQ"
+                "aucun filtre actif : ce fichier n'est ni un profil AutoEq ParametricEQ, ni une configuration Equalizer APO, ni un profil OPRA"
             ),
             Self::CanauxInvalides { ligne, valeur } => write!(
                 f,
@@ -262,7 +315,7 @@ impl std::fmt::Display for ErreurAutoEq {
             }
             Self::TypeInconnu { ligne, type_filtre } => write!(
                 f,
-                "ligne {ligne} : type de filtre « {type_filtre} » inconnu (attendu PK, LS, LSC, LSQ, HS, HSC ou HSQ)"
+                "ligne {ligne} : type de filtre « {type_filtre} » inconnu (attendu PK, PEQ, LS, LSC, LSQ, HS, HSC, HSQ, LP, LPQ, HP, HPQ ou NO)"
             ),
             Self::ChampManquant { ligne, champ } => {
                 write!(f, "ligne {ligne} : champ « {champ} » absent")
@@ -285,6 +338,16 @@ impl std::fmt::Display for ErreurAutoEq {
                 f,
                 "ligne {ligne} : « {champ} » vaut {valeur}, hors du domaine reproductible [{borne_basse} ; {borne_haute}]"
             ),
+            Self::Opra {
+                bande: Some(bande),
+                detail,
+                ..
+            } => write!(f, "profil OPRA, bande {bande} : {detail}"),
+            Self::Opra {
+                bande: None,
+                detail,
+                ..
+            } => write!(f, "profil OPRA : {detail}"),
         }
     }
 }
@@ -296,11 +359,33 @@ impl std::error::Error for ErreurAutoEq {}
 /// Elles sont recopiées ici pour REFUSER ce qui les dépasse plutôt que de le
 /// rogner en silence : un fichier qui demande +40 dB ne serait pas reproduit,
 /// et l'utilisateur mérite de l'apprendre à l'import, pas à l'oreille.
-const GAIN_MAX_DB: f64 = 24.0;
-const Q_MIN: f64 = 0.1;
-const Q_MAX: f64 = 30.0;
+pub(crate) const GAIN_MAX_DB: f64 = 24.0;
+pub(crate) const Q_MIN: f64 = 0.1;
+pub(crate) const Q_MAX: f64 = 30.0;
 /// Au-delà, aucune fréquence d'échantillonnage ne place le filtre sous Nyquist.
-const FREQ_MAX_HZ: f64 = 192_000.0;
+pub(crate) const FREQ_MAX_HZ: f64 = 192_000.0;
+
+/// #6385 — le format d'un fichier d'égaliseur importé, reconnu à son contenu.
+///
+/// Un profil OPRA est un objet JSON ; AutoEq ParametricEQ et Equalizer APO
+/// partagent la même grammaire texte, lue par [`analyser`].
+pub fn format_du_fichier(texte: &str) -> &'static str {
+    if texte.trim_start().starts_with('{') {
+        "opra"
+    } else {
+        "parametric_eq"
+    }
+}
+
+/// #6385 — analyse un fichier d'égaliseur, quel que soit son format :
+/// AutoEq ParametricEQ, Equalizer APO ([`analyser`]) ou OPRA
+/// ([`super::opra::analyser`]).
+pub fn analyser_fichier(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
+    match format_du_fichier(texte) {
+        "opra" => super::opra::analyser(texte),
+        _ => analyser(texte),
+    }
+}
 
 /// Analyse un profil AutoEq au format ParametricEQ.
 ///

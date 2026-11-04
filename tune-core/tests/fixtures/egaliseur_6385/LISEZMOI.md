@@ -1,0 +1,13 @@
+# Fichiers d'égaliseur réels — #6385
+
+Deux fichiers publiés, repris tels quels (aucun octet modifié), pour éprouver
+l'import sur autre chose que du texte écrit à la main. Les profils AutoEq
+ParametricEQ sont dans `../autoeq/`.
+
+| Fichier | Format | Origine | Licence |
+|---|---|---|---|
+| `apo_rew_stereo_lg_tv.txt` | Equalizer APO `config.txt` (filtres générés par REW, sections `Channel: L` / `Channel: R`, ligne `Device:` en tête) | <https://github.com/giuliojiang/EqualizerAPO-configurations>, `config.txt`, commit `c8a30b261e4cf89dc08f71a64d1c41beb9591962` | GPL-2.0 (licence du dépôt d'origine) |
+| `opra_sennheiser_hd650_oratory1990.json` | OPRA `info.json` (schéma `schemas/eq_info.json`) | <https://github.com/opra-project/OPRA>, `database/vendors/sennheiser/products/hd650/eq/oratory1990_harman_target/info.json`, commit `d2d2c334752ec69db117a7e083deb9b6b2405ce2` | CC BY-SA 4.0 (jeu de données OPRA), auteur de la correction : oratory1990 |
+
+Ces fichiers ne servent qu'aux tests : ils ne sont ni compilés dans Tune ni
+distribués avec lui.
