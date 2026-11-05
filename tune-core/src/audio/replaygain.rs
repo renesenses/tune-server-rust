@@ -945,6 +945,12 @@ pub async fn un_tour_de_cascade(backend: &Arc<dyn DbBackend>) -> TourDeCascade {
         if n > 0 {
             return TourDeCascade::Travail(n);
         }
+        // #7915 — plus rien pour ce rang : clore sa campagne (durée au
+        // journal). Une pause tombée en plein lot, ou un lot qui a cédé à la
+        // lecture, n'est PAS une fin : voir juste en dessous.
+        if !est_en_pause(tache) && !any_zone_playing(backend) {
+            crate::taches_de_fond::avancement::clore(tache);
+        }
         // #5469 — un lot qui rend 0 n'est pas forcément au repos : la pause a
         // pu tomber APRÈS la garde ci-dessus et AVANT le premier fichier (le
         // lot a trouvé ses candidats, puis sa garde de lancement a vu la
@@ -1857,7 +1863,9 @@ async fn empreinter_la_piste(backend: &Arc<dyn DbBackend>, track_id: i64, chemin
 /// l'écrire. `None` si la tâche a été interrompue : rien à poser.
 async fn calculer_l_empreinte(track_id: i64, chemin: &str) -> Option<String> {
     let chemin_owned = chemin.to_string();
-    let calcul = tokio::task::spawn_blocking(move || {
+    // #7915 — sur un fil en priorité processeur basse, pas sur le pool
+    // bloquant ordinaire.
+    let calcul = crate::taches_de_fond::basse_priorite::en_priorite_basse(move || {
         // #4681 — E/S basses si une zone joue.
         let _basse = crate::taches_de_fond::priorite::politique::baisser_pendant_la_lecture();
         crate::audio::empreinte::empreinte_du_fichier(&chemin_owned)
@@ -2009,6 +2017,12 @@ pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
     if rows.is_empty() {
         return 0;
     }
+    // #7915 — ReplayGain coupé (le défaut), cette passe décode toute la
+    // bibliothèque : elle publie son propre avancement.
+    crate::taches_de_fond::avancement::ouvrir_si_besoin(
+        crate::taches_de_fond::Tache::Empreintes,
+        || compter_les_candidats_a_empreinter(backend).unwrap_or(0),
+    );
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
     // #5519 — la même largeur que la passe nominale, les mêmes gardes avant
@@ -2062,6 +2076,10 @@ pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
         |avancee| {
             if avancee {
                 done += 1;
+                crate::taches_de_fond::avancement::avancer(
+                    crate::taches_de_fond::Tache::Empreintes,
+                    1,
+                );
             }
             true
         },
@@ -2320,6 +2338,11 @@ pub async fn rattraper_un_lot_de_dr(backend: &Arc<dyn DbBackend>) -> usize {
         debug!("dr_rattrapage_rien_a_faire");
         return 0;
     }
+    // #7915 — même raison que les empreintes : publier l'avancement.
+    crate::taches_de_fond::avancement::ouvrir_si_besoin(
+        crate::taches_de_fond::Tache::PlageDynamique,
+        || compter_les_candidats_dr(backend),
+    );
 
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
@@ -2355,6 +2378,10 @@ pub async fn rattraper_un_lot_de_dr(backend: &Arc<dyn DbBackend>) -> usize {
                 if reportee {
                     deferred += 1;
                 }
+                crate::taches_de_fond::avancement::avancer(
+                    crate::taches_de_fond::Tache::PlageDynamique,
+                    1,
+                );
                 true
             }
             SuitePiste::Cedee => false,
