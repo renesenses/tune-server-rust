@@ -488,6 +488,8 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             super::injecter_backend_de_sortie(obj, &backend_configure, backend_sortie.as_deref());
             // #6120 — une zone locale dont la sortie n'est pas enregistrée.
             super::rattacher_asio_6120::injecter_sortie_absente(obj, z, &registered_output_ids);
+            // #7084 — composant AirPlay 2 absent : la zone le dit.
+            super::composant_airplay2_7084::injecter_composant_airplay2_manquant(obj, z);
             let signal_path = signal_path_sous_licence(
                 &state.license,
                 build_signal_path(
@@ -706,6 +708,7 @@ pub(crate) async fn get_zone(
                     &zone,
                     &registered_output_ids,
                 );
+                super::composant_airplay2_7084::injecter_composant_airplay2_manquant(obj, &zone);
                 let signal_path = signal_path_sous_licence(
                     &state.license,
                     build_signal_path(
