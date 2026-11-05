@@ -866,6 +866,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_requete_textuelle_6287 -- --nocapture --test-threads=1
 
+      # #7848 — la grammaire de requêtes compilée en SQL paramétré : le même
+      # jeu de pistes et de crédits rend les mêmes pistes que sur SQLite (rôles
+      # en EXISTS, plages, négation, valeurs piégées). Sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Grammaire de requêtes sur PostgreSQL (#7848)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7848 -- --nocapture --test-threads=1
+
       # #6122 — « dans les N derniers jours » : des littéraux calculés à chaque
       # requête (secondes pour `file_mtime`, ISO pour `listened_at`) au lieu de
       # `DATETIME('now', …)`, propre à SQLite. Sans cette étape, l'épreuve
