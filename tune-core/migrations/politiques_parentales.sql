@@ -4,4 +4,4 @@ CREATE TABLE IF NOT EXISTS politiques_parentales (
  revision BIGINT NOT NULL,
  politique_json TEXT NOT NULL,
  maj_le TEXT NOT NULL
-);
+)
