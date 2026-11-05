@@ -12,7 +12,8 @@ pub mod compile;
 
 pub use analyse::{ErreurDeRequete, Expr, analyser};
 pub use compile::{
-    Condition, Contexte, FROM_DES_PISTES, compiler, nombre_de_pistes, pistes_correspondantes,
+    Condition, Contexte, FROM_DES_PISTES, LIMITE_MAX, compiler, nombre_de_pistes,
+    pistes_correspondantes,
 };
 
 #[cfg(test)]

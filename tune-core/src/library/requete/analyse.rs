@@ -8,6 +8,7 @@
 //! et       := unaire ( "AND"? unaire )*        ET implicite entre deux conditions
 //! unaire   := ( "NOT" | "-" ) unaire | primaire
 //! primaire := "(" ou ")" | champ ":" valeur | "loved" | terme | "texte entre guillemets"
+//!            (`loved:` prend true/yes/1 ou false/no/0, avec ou sans « = »)
 //! valeur   := ( ">=" | "<=" | ">" | "<" | "=" )? atome | atome? ".." atome?
 //! ```
 //!
@@ -524,9 +525,11 @@ impl Analyseur {
                     ));
                 }
             },
+            // `loved:true` et `loved:=true` se valent, comme `title:` et
+            // `title:=` pour l'égalité ; < et > n'ont pas de sens.
             Champ::Aime => match valeur.to_ascii_lowercase().as_str() {
-                "true" | "yes" | "1" if comparaison.is_none() => Test::Booleen(true),
-                "false" | "no" | "0" if comparaison.is_none() => Test::Booleen(false),
+                "true" | "yes" | "1" if egal_ou_rien(comparaison) => Test::Booleen(true),
+                "false" | "no" | "0" if egal_ou_rien(comparaison) => Test::Booleen(false),
                 _ => {
                     return Err(erreur(debut_valeur, "true ou false", "valeur de « loved »"));
                 }
@@ -553,6 +556,10 @@ fn decouper_champ(mot: &str) -> Option<(&str, &str)> {
     } else {
         None
     }
+}
+
+fn egal_ou_rien(comparaison: Option<Comparaison>) -> bool {
+    matches!(comparaison, None | Some(Comparaison::Egal))
 }
 
 fn separer_comparaison(valeur: &str) -> (Option<Comparaison>, &str) {

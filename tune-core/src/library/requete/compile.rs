@@ -23,6 +23,10 @@ pub const FROM_DES_PISTES: &str = "tracks t \
      LEFT JOIN albums al ON al.id = t.album_id \
      LEFT JOIN artists ar ON ar.id = t.artist_id";
 
+/// La plus grande page que rend [`pistes_correspondantes`]. Une limite
+/// négative n'y veut jamais dire « sans limite », comme en SQLite.
+pub const LIMITE_MAX: i64 = 1_000;
+
 /// Ce dont la compilation a besoin en plus de l'arbre.
 #[derive(Debug, Clone, Copy)]
 pub struct Contexte {
@@ -62,6 +66,7 @@ pub fn compiler(expr: &Expr, contexte: Contexte) -> Condition {
 }
 
 /// Les identifiants des pistes qui satisfont la requête, triés, paginés.
+/// La limite est ramenée dans `0..=LIMITE_MAX`.
 pub fn pistes_correspondantes(
     db: &dyn DbBackend,
     expr: &Expr,
@@ -80,7 +85,9 @@ pub fn pistes_correspondantes(
         "SELECT t.id FROM {FROM_DES_PISTES} WHERE {} ORDER BY t.id LIMIT ? OFFSET ?",
         condition.sql
     );
-    condition.parametres.push(SqlValue::Int(limite));
+    condition
+        .parametres
+        .push(SqlValue::Int(limite.clamp(0, LIMITE_MAX)));
     condition.parametres.push(SqlValue::Int(decalage.max(0)));
     let lignes = db.query_many(&sql, &condition.liens())?;
     Ok(lignes
@@ -176,7 +183,7 @@ impl Compilateur {
                 match test {
                     Test::Contient(v) => self.texte_plie(colonne, v, true),
                     Test::Est(v) => self.texte_plie(colonne, v, false),
-                    _ => FAUX.to_string(),
+                    _ => impossible("un champ texte comparé avec < ou >"),
                 }
             }
             Champ::Nombre(n) => self.nombre(n, test),
@@ -251,12 +258,12 @@ impl Compilateur {
                     bornes.push(format!("{colonne} <= {lien}"));
                 }
                 if bornes.is_empty() {
-                    FAUX.to_string()
+                    impossible("une plage sans borne")
                 } else {
                     format!("({})", bornes.join(" AND "))
                 }
             }
-            _ => FAUX.to_string(),
+            _ => impossible("un champ numérique avec un test de texte"),
         }
     }
 
@@ -266,7 +273,7 @@ impl Compilateur {
         let (valeur, contient) = match test {
             Test::Contient(v) => (v, true),
             Test::Est(v) => (v, false),
-            _ => return FAUX.to_string(),
+            _ => return impossible("un rôle avec une plage ou une comparaison"),
         };
         let roles: Vec<&str> = role
             .valeurs_en_base()
@@ -284,6 +291,14 @@ impl Compilateur {
 
 /// Condition toujours fausse, portable (pas de littéral booléen en SQLite).
 const FAUX: &str = "(1 = 0)";
+
+/// Une combinaison que l'analyseur refuse. En production elle ne rend rien
+/// (`FAUX`) ; en debug elle échoue, pour qu'une évolution de l'analyseur ne
+/// produise pas en silence une requête vide.
+fn impossible(quoi: &str) -> String {
+    debug_assert!(false, "combinaison refusée par l'analyseur : {quoi}");
+    FAUX.to_string()
+}
 
 fn colonne_texte(champ: ChampTexte) -> &'static str {
     match champ {

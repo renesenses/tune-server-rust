@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use super::analyse::{Champ, ChampNombre, ChampTexte, Comparaison, Expr, Role, Test, analyser};
 use super::compile::{
-    Contexte, FROM_DES_PISTES, compiler, nombre_de_pistes, pistes_correspondantes,
+    Contexte, FROM_DES_PISTES, LIMITE_MAX, compiler, nombre_de_pistes, pistes_correspondantes,
 };
 use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
 use crate::db::engine::Engine;
@@ -109,6 +109,13 @@ fn l_analyseur_rend_l_arbre_attendu_7848() {
             test: Test::Booleen(true),
         }
     );
+    assert_eq!(
+        analyser("loved:=false").unwrap(),
+        Expr::Condition {
+            champ: Champ::Aime,
+            test: Test::Booleen(false),
+        }
+    );
     // Un nom de champ ne commence pas par un chiffre : `12:30` est un terme.
     assert_eq!(analyser("12:30").unwrap(), terme("12:30"));
 }
@@ -131,6 +138,7 @@ fn une_requete_mal_formee_dit_ou_et_quoi_7848() {
         ("OR a", 0, "une condition"),
         ("title:>abc", 6, ":="),
         ("loved:peut-etre", 6, "true"),
+        ("loved:>true", 7, "true"),
         ("year:\"1960\"", 5, "nombre"),
     ];
     for (requete, position, attendu) in cas {
@@ -533,10 +541,39 @@ async fn pg_7848_le_compilateur_rend_les_pistes_attendues() {
         "DELETE FROM albums WHERE title LIKE '%(q7848)'",
         "DELETE FROM artists WHERE name LIKE '%(q7848)'",
     ] {
-        b.execute(sql, &[])
-            .unwrap_or_else(|e| panic!("{sql} : {e}"));
+        b.execute(sql, &[]).unwrap_or_else(|e| {
+            panic!(
+                "{sql} : {e} (le schéma vient des scripts numérotés : appliquer \
+                 tune-core/migrations/postgres/*.sql, comme l'étape « Apply PG \
+                 migrations » de test-postgres.yml)"
+            )
+        });
     }
     scenario(b.as_ref());
+}
+
+/// Une limite négative veut dire « sans limite » en SQLite : elle est
+/// ramenée à 0, et une limite trop grande à `LIMITE_MAX`.
+#[test]
+fn la_limite_de_page_est_bornee_7848() {
+    let db = sqlite();
+    db.execute_batch(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1500)
+         INSERT INTO tracks (title, file_path, format, year)
+         SELECT 'Borne ' || i, '/borne/' || i || '.flac', 'FLAC', 1970 FROM n;",
+    )
+    .unwrap();
+    let expr = analyser("title:borne").unwrap();
+    assert_eq!(nombre_de_pistes(db.as_ref(), &expr, 1).unwrap(), 1500);
+    let page = |limite| {
+        pistes_correspondantes(db.as_ref(), &expr, 1, limite, 0)
+            .unwrap()
+            .len() as i64
+    };
+    assert_eq!(page(-1), 0, "une limite négative ne rend pas tout");
+    assert_eq!(page(0), 0);
+    assert_eq!(page(10), 10);
+    assert_eq!(page(i64::MAX), LIMITE_MAX);
 }
 
 // --------------------------------------------------------------------- banc
