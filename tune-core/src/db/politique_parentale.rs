@@ -233,17 +233,32 @@ pub fn peut_gerer(db: &Arc<dyn DbBackend>, appelant: i64, cible: i64) -> Result<
     if appelant == cible || lire(db, appelant)?.is_some() {
         return Ok(false);
     }
-    let admin = db
-        .query_one_strong(
-            "SELECT is_admin FROM profiles WHERE id = ?",
-            &[&appelant as &dyn ToSqlValue],
-        )?
-        .and_then(|row| row.first().and_then(|v| v.as_i64()))
-        .is_some_and(|n| n != 0);
+    let admin = est_administrateur(db, appelant)?;
     Ok(match lire(db, cible)? {
         Some(p) => admin || p.superviseur_id == appelant,
         None => admin,
     })
+}
+
+/// Le profil a le rôle administrateur. Un tel profil ne se place pas sous
+/// supervision : [`poser`] est refusé par les routes pour lui.
+pub fn est_administrateur(db: &Arc<dyn DbBackend>, profile_id: i64) -> Result<bool, String> {
+    Ok(db
+        .query_one_strong(
+            "SELECT is_admin FROM profiles WHERE id = ?",
+            &[&profile_id as &dyn ToSqlValue],
+        )?
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+        .is_some_and(|n| n != 0))
+}
+
+/// L'erreur dit que la table `politiques_parentales` n'existe pas (création
+/// échouée au démarrage) : aucune politique ne peut alors être posée, et les
+/// listes passent telles quelles. Toute autre erreur reste une erreur.
+pub fn table_absente(erreur: &str) -> bool {
+    let e = erreur.to_ascii_lowercase();
+    e.contains("politiques_parentales")
+        && (e.contains("no such table") || e.contains("does not exist"))
 }
 
 /// Minuscules, espaces repliés : « The  Doors » et « the doors » se valent.
@@ -277,8 +292,24 @@ pub struct Filtre {
 
 const CLES_NOM_D_ARTISTE: &[&str] = &["artist_name", "artist", "album_artist", "album_artist_name"];
 const CLES_ID_D_ARTISTE: &[&str] = &["artist_id", "album_artist_id"];
-const CLES_DE_RADIO: &[&str] = &["id", "stream_url", "url", "radio_id", "uuid", "stationuuid"];
+const CLES_DE_RADIO: &[&str] = &[
+    "id",
+    "stream_url",
+    "url",
+    "radio_id",
+    "uuid",
+    "stationuuid",
+    "external_id",
+    "my_radio_id",
+];
 const CLES_DE_PODCAST: &[&str] = &["feed_url", "feedUrl", "url"];
+/// Les tableaux d'une réponse de radios qui portent des stations : `items`
+/// (« Mes radios », recherche, annuaire) et `annuaire` (recherche). Les autres
+/// (pays, genres, flux d'une station) ne sont pas fouillés.
+const TABLEAUX_DE_RADIOS: &[&str] = &["items", "annuaire"];
+/// Les tableaux d'une réponse de podcasts qui portent des podcasts : `items`
+/// (recherche, top, catalogue), `curated` et `top` (découverte).
+const TABLEAUX_DE_PODCASTS: &[&str] = &["items", "curated", "top"];
 
 fn texte(v: &Value) -> Option<String> {
     match v {
@@ -398,6 +429,18 @@ impl Filtre {
                     }
                 }
                 retires
+            }
+            // Radios et podcasts : seuls les tableaux connus de la racine.
+            Value::Object(o) if matches!(liste, Liste::Radios | Liste::Podcasts) => {
+                let cles = if liste == Liste::Radios {
+                    TABLEAUX_DE_RADIOS
+                } else {
+                    TABLEAUX_DE_PODCASTS
+                };
+                o.iter_mut()
+                    .filter(|(cle, enfant)| cles.contains(&cle.as_str()) && enfant.is_array())
+                    .map(|(_, enfant)| self.parcourir(enfant, liste, false))
+                    .sum()
             }
             Value::Object(_) => self.parcourir_l_objet(v, liste),
             _ => 0,

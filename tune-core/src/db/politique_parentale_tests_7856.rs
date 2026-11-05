@@ -46,6 +46,9 @@ fn verifier(db: Arc<dyn DbBackend>) {
         .unwrap();
     }
 
+    assert!(est_administrateur(&db, ADMIN).unwrap());
+    assert!(!est_administrateur(&db, ENFANT).unwrap());
+
     // Sans politique : rien n'est lu, et seul l'administrateur peut en poser.
     assert!(
         lire(&db, ENFANT).unwrap().is_none(),
@@ -161,6 +164,39 @@ fn politique_parentale_7856_table_posee_par_les_migrations() {
     );
 }
 
+/// Table absente (création échouée au démarrage) : l'erreur se reconnaît, et
+/// se distingue d'une politique présente mais illisible.
+#[test]
+fn politique_parentale_7856_table_absente_reconnue() {
+    let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE profiles (id INTEGER PRIMARY KEY, username TEXT, is_admin INTEGER DEFAULT 0)",
+    )
+    .unwrap();
+    let db: Arc<dyn DbBackend> = Arc::new(db);
+    let e = lire(&db, ENFANT).expect_err("sans table, la lecture échoue");
+    assert!(
+        table_absente(&e),
+        "erreur de table absente non reconnue : {e}"
+    );
+    assert!(table_absente(
+        r#"error returned from database: relation "politiques_parentales" does not exist"#
+    ));
+
+    db.execute_batch(SQL_TABLE).unwrap();
+    db.execute(
+        "INSERT INTO politiques_parentales (profile_id, superviseur_id, revision, politique_json, maj_le) \
+         VALUES (2, 1, 1, '{illisible', '')",
+        &[],
+    )
+    .unwrap();
+    let e = lire(&db, ENFANT).expect_err("une politique illisible est une erreur");
+    assert!(
+        !table_absente(&e),
+        "une politique illisible n'est pas une table absente : {e}"
+    );
+}
+
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_7856_politique_parentale_postgres() {
@@ -180,7 +216,11 @@ async fn pg_7856_politique_parentale_postgres() {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::raw_sql(&ddl).execute(&pool).await.unwrap();
+    // `AssertSqlSafe` : `ddl` vient de la constante `SQL_TABLE`, aucune entrée.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(ddl))
+        .execute(&pool)
+        .await
+        .unwrap();
     let db: Arc<dyn DbBackend> = Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
     verifier(db);
     pool.close().await;
@@ -223,14 +263,56 @@ fn politique_parentale_7856_filtre_des_listes() {
     ]);
     assert_eq!(filtre.filtrer(&mut radios, Liste::Radios), 1);
     assert_eq!(radios.as_array().unwrap().len(), 2);
+    // Recherche : `items` (Mes radios) et `annuaire` ; une fiche d'annuaire
+    // gardée par son flux garde ses flux.
     let mut recherche_radio = json!({"items": [{"id": 14, "stream_url": "x"}],
-        "suggestions": [{"radio_id": "rm-1", "name": "Annuaire", "streams": [{"url": "https://flux.example/permis"}]}]});
+    "annuaire": [
+        {"external_id": "rm-1", "name": "Hors liste", "stream_url": "https://flux.example/non"},
+        {"external_id": "rm-2", "name": "Permise", "stream_url": "https://flux.example/permis",
+         "streams": [{"url": "https://flux.example/autre"}]}
+    ]});
     assert_eq!(filtre.filtrer(&mut recherche_radio, Liste::Radios), 2);
+    assert_eq!(recherche_radio["annuaire"][0]["external_id"], "rm-2");
+    assert_eq!(
+        recherche_radio["annuaire"][0]["streams"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Annuaire : seuls `items` sont des stations ; les pays, les genres et
+    // tout autre tableau ou objet de la réponse ne sont pas touchés, même
+    // quand leurs objets portent un `id` ou une `url`.
+    let mut annuaire = json!({"total": 2, "items": [
+            {"external_id": "rm-3", "stream_url": "https://flux.example/non"},
+            {"external_id": "rm-4", "my_radio_id": 12, "stream_url": "https://flux.example/z"}
+        ],
+        "countries": [{"code": "FR", "count": 2}],
+        "genres": [{"id": "jazz", "count": 1}],
+        "attribution": {"name": "x", "url": "https://annuaire.example"},
+        "liens": [{"id": 99, "url": "https://ailleurs.example"}]});
+    assert_eq!(filtre.filtrer(&mut annuaire, Liste::Radios), 1);
+    assert_eq!(annuaire["items"].as_array().unwrap().len(), 1);
+    assert_eq!(annuaire["items"][0]["external_id"], "rm-4");
+    assert_eq!(annuaire["total"], 1);
+    assert_eq!(annuaire["genres"].as_array().unwrap().len(), 1);
+    assert_eq!(annuaire["liens"].as_array().unwrap().len(), 1);
+    assert_eq!(annuaire["attribution"]["url"], "https://annuaire.example");
 
     // Podcasts : par adresse du flux.
     let mut podcasts = json!([{"id": 1, "feed_url": "https://rss.example/permis.xml"}, {"id": 2, "feed_url": "https://rss.example/autre.xml"}]);
     assert_eq!(filtre.filtrer(&mut podcasts, Liste::Podcasts), 1);
     assert_eq!(podcasts[0]["id"], 1);
+    // Découverte : `curated` et `top` ; les genres ne sont pas des podcasts.
+    let mut decouverte = json!({
+        "curated": [{"feed_url": "https://rss.example/autre.xml"}],
+        "top": [{"feed_url": "https://rss.example/permis.xml"}, {"url": "https://rss.example/x.xml"}],
+        "genres": [{"id": 1, "name": "Arts", "url": "https://genres.example"}]
+    });
+    assert_eq!(filtre.filtrer(&mut decouverte, Liste::Podcasts), 2);
+    assert_eq!(decouverte["top"].as_array().unwrap().len(), 1);
+    assert_eq!(decouverte["genres"].as_array().unwrap().len(), 1);
 
     // Sans liste blanche, rien n'est restreint.
     let libre = Filtre::depuis(&PolitiqueParentale::default());
