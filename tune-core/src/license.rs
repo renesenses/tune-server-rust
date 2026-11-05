@@ -67,13 +67,12 @@ pub enum Feature {
     /// « en plugin PREMIUM »).
     PontRoon,
     /// « Concerts » (#2363) : les dates à venir des artistes de la
-    /// bibliothèque, autour de la commune saisie. Sa propre tuile, incluse
-    /// dans Premium, sans achat séparé (Bertrand, 30/08 et 25/09/2026).
+    /// bibliothèque, autour de la commune saisie.
     ///
-    /// Le greffon `tune-concerts` la déclare par
-    /// `TunePlugin::required_feature` : le payant est une propriété du
-    /// GREFFON, pas d'un chemin d'URL, et la décision (complet / refusé,
-    /// bientôt réduit pour les comptes gratuits) tient chez lui.
+    /// N'est plus Premium depuis #7865 (Bertrand, 04/11/2026) : hors de
+    /// [`Feature::all_premium`], et le greffon `tune-concerts` ne la déclare
+    /// plus. La variante reste pour lire les droits déjà enregistrés ou
+    /// renvoyés par le site avec le code `concerts`.
     Concerts,
     /// « Sortie AES67 » (#7336) : diffuser une zone en flux RTP multicast
     /// vers des récepteurs AES67. Premium (Bertrand, 30/10/2026). Déclarée
@@ -114,7 +113,8 @@ impl Feature {
             Feature::Declick,
             Feature::AcousticAnalysis,
             Feature::PontRoon,
-            Feature::Concerts,
+            // `Concerts` n'est plus Premium (#7865, Bertrand, 04/11/2026) : la
+            // variante reste pour lire les droits déjà enregistrés.
             Feature::Aes67,
         ]
     }
@@ -1304,7 +1304,7 @@ fn is_expired(timestamp: &str, days: i64) -> bool {
 pub const URL_OFFRE_PREMIUM: &str = "https://mozaiklabs.fr/pricing";
 
 // Descendu de `tune-server/src/premium_guard.rs`, qui le ré-exporte : un
-// greffon natif (« Concerts », #2363) décide lui-même de son refus et ne peut
+// greffon natif (« Concerts » à l'origine, #2363) décide lui-même de son refus et ne peut
 // pas dépendre de `tune-server` — l'inverse ferait un cycle. Une seule forme
 // de refus de module pour l'hôte et pour les greffons, pas deux.
 /// Pourquoi un **module payant** (SKU séparé, ex. « diretta ») est indisponible.
@@ -1452,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentyeight_features() {
+    fn all_premium_has_twentyseven_features() {
         // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
         // premium doit être un acte conscient, pas un effet de bord. Passé de
         // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
@@ -1460,8 +1460,9 @@ mod tests {
         // `PontRoon` (16/09/2026, décision de Bertrand) ; puis à 27 avec
         // `Concerts` (#2363) — sa propre tuile, incluse dans Premium (Bertrand,
         // 30/08 et 25/09/2026) ; puis à 28 avec `Aes67` (#7336, Bertrand,
-        // 30/10/2026).
-        assert_eq!(Feature::all_premium().len(), 28);
+        // 30/10/2026) ; puis revenu à 27 sans `Concerts` (#7865, Bertrand,
+        // 04/11/2026 : le module n'est plus Premium).
+        assert_eq!(Feature::all_premium().len(), 27);
     }
 
     #[test]
