@@ -1,4 +1,4 @@
-//! #6285 — la passe de fond : candidats, périmètre, bridage thermique, et un
+//! #6285 — la passe de fond : candidats, périmètre, largeur selon la chaleur, et un
 //! lot de bout en bout sur de VRAIS fichiers WAV écrits par le test à partir
 //! de signaux synthétiques. Aucun son joué.
 
@@ -56,57 +56,32 @@ fn wav_24(chemin: &std::path::Path, sample_rate: u32, echantillons: &[i32]) {
     std::fs::write(chemin, f).unwrap();
 }
 
-/// 🔴 #6450 (décision de Bertrand du 20/10/2026) : sans température lisible,
-/// la passe décode UN fichier à la fois, quelle que soit la vitesse réglée.
+/// 🔴 #6450 : sans température lisible, la passe garde la vitesse réglée
+/// (le bridage à un fichier de #5410 est retiré), et le réglage de #6713
+/// n'y change rien.
 #[test]
-fn sans_temperature_lisible_la_passe_est_bridee_a_un_fichier_6285() {
-    let db = base();
-    SettingsRepo::with_backend(db.clone())
-        .set(vitesse::CLE_REGLAGE, vitesse::Vitesse::Rapide.id())
-        .unwrap();
-    for motif in [MotifIllisible::AucunCapteur, MotifIllisible::Figee] {
-        assert_eq!(
-            largeur_de_la_passe(&db, &LectureThermique::Illisible(motif)),
-            1,
-            "température illisible ({motif:?}) : un fichier à la fois, même en vitesse rapide"
-        );
-    }
-    assert_eq!(
-        largeur_de_la_passe(&db, &LectureThermique::Lisible(45.0)),
-        vitesse::Vitesse::Rapide.largeur(vitesse::coeurs()),
-        "température lisible : la vitesse réglée"
-    );
-}
-
-/// #6713 — le réglage « lever le bridage » rend la vitesse réglée à la passe
-/// quand la température est illisible ; désactivé (le défaut), elle reste
-/// bridée à un fichier.
-#[test]
-fn le_bridage_leve_par_le_reglage_rend_la_vitesse_reglee_6713() {
+fn sans_temperature_lisible_la_passe_garde_la_vitesse_reglee_6450() {
     let db = base();
     let reglages = SettingsRepo::with_backend(db.clone());
     reglages
         .set(vitesse::CLE_REGLAGE, vitesse::Vitesse::Rapide.id())
         .unwrap();
-    let illisible = LectureThermique::Illisible(MotifIllisible::AucunCapteur);
-    assert!(!vitesse::bridage_leve(&db), "désactivé par défaut");
-    assert_eq!(largeur_de_la_passe(&db, &illisible), 1);
-
-    reglages.set(vitesse::CLE_LEVER_LE_BRIDAGE, "true").unwrap();
-    assert!(vitesse::bridage_leve(&db));
+    let rapide = vitesse::Vitesse::Rapide.largeur(vitesse::coeurs());
+    for leve in ["false", "true"] {
+        reglages.set(vitesse::CLE_LEVER_LE_BRIDAGE, leve).unwrap();
+        for motif in [MotifIllisible::AucunCapteur, MotifIllisible::Figee] {
+            assert_eq!(
+                largeur_de_la_passe(&db, &LectureThermique::Illisible(motif)),
+                rapide,
+                "température illisible ({motif:?}, réglage #6713 = {leve}) : \
+                 la passe est bridée au lieu de garder la vitesse réglée"
+            );
+        }
+    }
     assert_eq!(
-        largeur_de_la_passe(&db, &illisible),
-        vitesse::Vitesse::Rapide.largeur(vitesse::coeurs()),
-        "bridage levé : la vitesse réglée"
-    );
-
-    reglages
-        .set(vitesse::CLE_LEVER_LE_BRIDAGE, "false")
-        .unwrap();
-    assert_eq!(
-        largeur_de_la_passe(&db, &illisible),
-        1,
-        "réglage retiré : bridé"
+        largeur_de_la_passe(&db, &LectureThermique::Lisible(45.0)),
+        rapide,
+        "température lisible : la vitesse réglée"
     );
 }
 
