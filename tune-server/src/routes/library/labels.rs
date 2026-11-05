@@ -14,7 +14,8 @@
 //! Discogs. Chaque serveur les récupère lui-même, pour son usage local
 //! d'identification. Ils ont leur propre index et leur propre passe, bornée
 //! de même, qui ne tourne pas quand la tâche de fond « Enrichissement » est en
-//! pause. Ordre de préférence : ces sources, puis Qobuz. Chaque logo est rendu
+//! pause — sauf quand l'utilisateur la demande (« Lancer la passe », #7414).
+//! Ordre de préférence : ces sources, puis Qobuz. Chaque logo est rendu
 //! avec sa source et sa licence connue (`image_credit`).
 
 use std::collections::{HashMap, HashSet};
@@ -34,7 +35,7 @@ use tune_core::library::artistes_du_label::{
 use tune_core::library::logos_labels::{
     Attribution, CacheLogosLabels, CatalogueDeLabels, Demande, LabelAConsulter, LabelDuCatalogue,
     LogosPartages, PASSE_MAX, PAUSE_ENTRE_LABELS, PROPOSITIONS_PAR_PASSE, ProposeAuPartage,
-    PropositionDeLogo, SourceDuLogo, Statut, StatutDeLicence, cle_de_label,
+    PropositionDeLogo, Relance, SourceDuLogo, Statut, StatutDeLicence, cle_de_label,
 };
 use tune_core::library::logos_web::{CatalogueLogosWeb, FICHIER_INDEX_WEB, transport_du_serveur};
 use tune_core::streaming::StreamingService;
@@ -72,9 +73,13 @@ pub(crate) fn cache_web_de(dossier: &Path) -> Arc<CacheLogosLabels> {
 
 /// #7089 — le catalogue des logos du web, ou `None` quand la tâche de fond
 /// « Enrichissement » est en pause (ou, dans un banc, sans racine d'essai) —
-/// et alors, aucune passe.
-pub(crate) fn catalogue_web(state: &AppState) -> Option<Arc<dyn CatalogueDeLabels>> {
-    if tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::Enrichissement) {
+/// et alors, aucune passe. #7414 — une [`Relance::Demandee`] passe outre la
+/// pause : c'est l'utilisateur qui la demande.
+pub(crate) fn catalogue_web(
+    state: &AppState,
+    relance: Relance,
+) -> Option<Arc<dyn CatalogueDeLabels>> {
+    if relance == Relance::Ordinaire && !enrichissement_actif() {
         return None;
     }
     let transport = transport_du_serveur(state.http_client.clone())?;
@@ -253,8 +258,9 @@ pub(crate) fn lancer_passe(
     demandes: Vec<Demande>,
     pause: Duration,
     continuer: fn() -> bool,
+    relance: Relance,
 ) -> Option<tokio::task::JoinHandle<usize>> {
-    let a_faire = cache.a_resoudre(&demandes, maintenant(), usize::MAX);
+    let a_faire = cache.a_resoudre_selon(&demandes, maintenant(), usize::MAX, relance);
     if a_faire.is_empty() {
         return None;
     }
@@ -322,8 +328,9 @@ pub(crate) fn lancer_passe_web(
     demandes: Vec<Demande>,
     pause: Duration,
     continuer: fn() -> bool,
+    relance: Relance,
 ) -> Option<tokio::task::JoinHandle<usize>> {
-    let a_faire = web.a_resoudre(&demandes, maintenant(), usize::MAX);
+    let a_faire = web.a_resoudre_selon(&demandes, maintenant(), usize::MAX, relance);
     let proposer = partage
         .as_ref()
         .is_some_and(|p| p.peut_proposer() && !web.a_proposer(1).is_empty());
@@ -447,7 +454,7 @@ pub(super) async fn list_labels(State(state): State<AppState>) -> Json<Value> {
     // L'ouverture de l'onglet lance toujours la passe (#6736, #7414), mais
     // par le même chemin que `POST /library/labels/logos/enrich` : inscrite
     // au registre sous `label_logos`, une seule à la fois.
-    let sources = SourcesDeLogos::du_serveur(&state).await;
+    let sources = SourcesDeLogos::du_serveur(&state, Relance::Ordinaire).await;
     lancer_passes_logos(&state, labels, sources);
     Json(Value::Array(items))
 }
@@ -473,17 +480,21 @@ pub(crate) struct SourcesDeLogos {
     pub(crate) qobuz: Option<Arc<dyn CatalogueDeLabels>>,
     pub(crate) partage: Option<Arc<dyn LogosPartages>>,
     pub(crate) pause: Duration,
+    /// #7414 — qui lance la passe.
+    pub(crate) relance: Relance,
 }
 
 impl SourcesDeLogos {
-    /// Celles du serveur : le web (sauf Enrichissement en pause), Qobuz
-    /// (seulement avec un compte connecté), le partage communautaire.
-    pub(crate) async fn du_serveur(state: &AppState) -> Self {
+    /// Celles du serveur : le web (sauf Enrichissement en pause, pour une
+    /// [`Relance::Ordinaire`]), Qobuz (seulement avec un compte connecté), le
+    /// partage communautaire.
+    pub(crate) async fn du_serveur(state: &AppState, relance: Relance) -> Self {
         Self {
-            web: catalogue_web(state),
+            web: catalogue_web(state, relance),
             qobuz: catalogue_qobuz(state).await,
             partage: partage_de(state),
             pause: PAUSE_ENTRE_LABELS,
+            relance,
         }
     }
 }
@@ -543,10 +554,11 @@ pub(crate) fn lancer_passes_logos(
     let cache = cache_de(&dossier);
     let web = cache_web_de(&dossier);
     let debut = maintenant();
+    let relance = sources.relance;
     let (demandes_w, demandes_q) = (demandes_web(&labels), demandes_qobuz(&labels));
     // Ce que chaque passe va demander : c'est le total de l'avancement.
     let suivis_web: Vec<String> = if sources.web.is_some() {
-        web.a_resoudre(&demandes_w, debut, usize::MAX)
+        web.a_resoudre_selon(&demandes_w, debut, usize::MAX, relance)
             .into_iter()
             .map(|d| d.nom)
             .collect()
@@ -555,7 +567,7 @@ pub(crate) fn lancer_passes_logos(
     };
     let suivis_qobuz: Vec<String> = if sources.qobuz.is_some() {
         cache
-            .a_resoudre(&demandes_q, debut, usize::MAX)
+            .a_resoudre_selon(&demandes_q, debut, usize::MAX, relance)
             .into_iter()
             .map(|d| d.nom)
             .collect()
@@ -571,7 +583,12 @@ pub(crate) fn lancer_passes_logos(
             sources.partage,
             demandes_w,
             sources.pause,
-            enrichissement_actif,
+            // Demandée, la passe du web ne s'arrête pas sur la pause.
+            match relance {
+                Relance::Ordinaire => enrichissement_actif,
+                Relance::Demandee => toujours,
+            },
+            relance,
         ));
     }
     if let Some(catalogue) = sources.qobuz {
@@ -581,6 +598,7 @@ pub(crate) fn lancer_passes_logos(
             demandes_q,
             sources.pause,
             toujours,
+            relance,
         ));
     }
     if passes.is_empty() {
@@ -640,23 +658,30 @@ pub(crate) fn lancer_passes_logos(
 
 /// `POST /library/labels/logos/enrich` — lance la passe des logos.
 ///
+/// #7414 — c'est une [`Relance::Demandee`] : elle interroge le web et le
+/// partage même Enrichissement en pause, et redemande les labels notés « sans
+/// logo ». En pause, la réponse le dit (`"forced": true`,
+/// `"reason": "enrichment_paused"`).
+///
 /// - 202 `{"status": "accepted", "labels_to_process": N}` ;
 /// - 409 `{"status": "already_running"}` : une passe tourne, rien de plus ;
-/// - 200 `{"status": "skipped", "reason": "nothing_to_do" | "paused" |
-///   "no_source"}`.
+/// - 200 `{"status": "skipped", "reason": "nothing_to_do" | "no_source"}`.
 pub(super) async fn lancer_logos(State(state): State<AppState>) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let labels = AlbumRepo::with_backend(state.backend.clone())
         .labels_de_la_bibliotheque()
         .ou_defaut_journalise();
-    let sources = SourcesDeLogos::du_serveur(&state).await;
+    let sources = SourcesDeLogos::du_serveur(&state, Relance::Demandee).await;
     match lancer_passes_logos(&state, labels, sources) {
-        LancementLogos::Lancee { a_traiter } => (
-            StatusCode::ACCEPTED,
-            Json(json!({"status": "accepted", "labels_to_process": a_traiter})),
-        )
-            .into_response(),
+        LancementLogos::Lancee { a_traiter } => {
+            let mut corps = json!({"status": "accepted", "labels_to_process": a_traiter});
+            if !enrichissement_actif() {
+                corps["forced"] = json!(true);
+                corps["reason"] = json!("enrichment_paused");
+            }
+            (StatusCode::ACCEPTED, Json(corps)).into_response()
+        }
         LancementLogos::DejaEnCours => (
             StatusCode::CONFLICT,
             Json(json!({
@@ -668,13 +693,9 @@ pub(super) async fn lancer_logos(State(state): State<AppState>) -> axum::respons
         LancementLogos::RienAFaire => {
             Json(json!({"status": "skipped", "reason": "nothing_to_do"})).into_response()
         }
+        // Demandée, la passe ne manque jamais du web à cause de la pause.
         LancementLogos::SansSource => {
-            let raison = if enrichissement_actif() {
-                "no_source"
-            } else {
-                "paused"
-            };
-            Json(json!({"status": "skipped", "reason": raison})).into_response()
+            Json(json!({"status": "skipped", "reason": "no_source"})).into_response()
         }
     }
 }
@@ -1026,6 +1047,7 @@ mod tests {
             demandes_qobuz(&liste),
             Duration::ZERO,
             toujours,
+            Relance::Ordinaire,
         )
         .expect("une passe")
         .await
@@ -1045,6 +1067,7 @@ mod tests {
                 demandes_qobuz(&liste),
                 Duration::ZERO,
                 toujours,
+                Relance::Ordinaire,
             )
             .is_none(),
             "tout est connu, absence comprise : plus aucun appel"
@@ -1074,6 +1097,7 @@ mod tests {
             demandes.clone(),
             Duration::ZERO,
             jamais,
+            Relance::Ordinaire,
         )
         .expect("des labels à demander")
         .await
@@ -1115,10 +1139,17 @@ mod tests {
                 album_du_catalogue: None,
             })
             .collect();
-        lancer_passe(cache, panne.clone(), demandes, Duration::ZERO, toujours)
-            .unwrap()
-            .await
-            .unwrap();
+        lancer_passe(
+            cache,
+            panne.clone(),
+            demandes,
+            Duration::ZERO,
+            toujours,
+            Relance::Ordinaire,
+        )
+        .unwrap()
+        .await
+        .unwrap();
         assert_eq!(panne.0.load(Ordering::SeqCst), PASSE_MAX);
     }
 
@@ -1129,7 +1160,7 @@ mod tests {
     /// Un faux MusicBrainz / Wikidata / Commons sous une seule racine, au
     /// format que [`tune_core::library::logos_web::Transport::sous_base`]
     /// attend. Journalise les chemins demandés.
-    async fn web_simule() -> (String, Arc<Mutex<Vec<String>>>) {
+    pub(super) async fn web_simule() -> (String, Arc<Mutex<Vec<String>>>) {
         use axum::extract::{Path as Chemin, Query};
         use axum::routing::get;
         let journal = Arc::new(Mutex::new(Vec::new()));
@@ -1147,9 +1178,16 @@ mod tests {
                 "/mb/release/{id}",
                 get(move |Chemin(id): Chemin<String>| {
                     j1.lock().unwrap().push(format!("release/{id}"));
+                    // #7414 — une release `pause-7414-…` porte le label du
+                    // même nom : chaque banc a le sien, sous la même racine.
+                    let (label_id, nom) = if id.starts_with("pause-7414-") {
+                        (format!("mb-{id}"), id.clone())
+                    } else {
+                        ("mb-bn-7089".to_string(), "Blue Note 7089".to_string())
+                    };
                     async move {
                         Json(json!({"id": id, "label-info": [
-                            {"label": {"id": "mb-bn-7089", "name": "Blue Note 7089"}}]}))
+                            {"label": {"id": label_id, "name": nom}}]}))
                     }
                 }),
             )
@@ -1207,6 +1245,8 @@ mod tests {
     /// rend le logo libre ET son attribution — douteux compris.
     #[tokio::test(flavor = "multi_thread")]
     async fn la_liste_rend_le_logo_libre_de_commons_avec_son_attribution_7089() {
+        // La passe du web lit la pause de l'Enrichissement (#7414).
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         let (racine, journal) = web_simule().await;
         tune_core::services_factices::substituer_base(
             tune_core::library::logos_web::BASE_FACTICE,
@@ -1780,6 +1820,7 @@ mod tests {
             demandes_de(&["ECM Records", "Verve", "Warp"]),
             Duration::ZERO,
             toujours,
+            Relance::Ordinaire,
         )
         .expect("une passe")
         .await
@@ -1824,6 +1865,7 @@ mod tests {
                 demandes_de(&["ECM Records", "Verve", "Warp"]),
                 Duration::ZERO,
                 toujours,
+                Relance::Ordinaire,
             )
             .is_none()
         );
@@ -1868,6 +1910,7 @@ mod tests {
             demandes_de(&["Verve"]),
             Duration::ZERO,
             toujours,
+            Relance::Ordinaire,
         )
         .expect("une passe")
         .await
@@ -1901,6 +1944,7 @@ mod tests {
             demandes_de(&["ECM Records", "Verve"]),
             Duration::ZERO,
             toujours,
+            Relance::Ordinaire,
         )
         .expect("une passe")
         .await
@@ -1998,6 +2042,7 @@ mod passe_explicite_des_logos {
             qobuz: None,
             partage: None,
             pause: Duration::ZERO,
+            relance: Relance::Ordinaire,
         }
     }
 
@@ -2047,6 +2092,8 @@ mod passe_explicite_des_logos {
     /// range son bilan ; le statut compte les labels avec et sans logo.
     #[tokio::test(flavor = "multi_thread")]
     async fn la_passe_s_inscrit_avance_refuse_un_doublon_et_range_son_bilan() {
+        // La passe du web lit la pause de l'Enrichissement (#7414).
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         let dossier = tune_core::test_scratch::scratch_dir("labels-etat-passe");
         let chemin = dossier.path().join("tune.db");
         let (app, state) = demarrer(chemin.to_str().unwrap());
@@ -2129,6 +2176,7 @@ mod passe_explicite_des_logos {
             qobuz: None,
             partage: None,
             pause: Duration::ZERO,
+            relance: Relance::Ordinaire,
         };
         assert_eq!(
             lancer_passes_logos(&state, labels_de(&state), sans),
@@ -2168,5 +2216,102 @@ mod passe_explicite_des_logos {
         let (code, corps) = requete(&app, "GET", "/api/v1/library/labels/logos/artists").await;
         assert_eq!(code, StatusCode::OK, "{corps}");
         assert_eq!(corps["name"], "logos", "{corps}");
+    }
+
+    /// #7414 — « Lancer la passe » (État du serveur) avec l'Enrichissement en
+    /// pause et un label noté « sans logo » il y a une heure (avant un
+    /// correctif de la source). Avant : « Rien à traiter pour l'instant ».
+    /// Attendu : l'ouverture de l'onglet respecte la pause et ne lance rien ;
+    /// la route interroge le web quand même, le dit, redemande le label et
+    /// inscrit son logo. Faux MusicBrainz / Wikidata / Commons, sans réseau.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lancer_la_passe_en_pause_redemande_le_web_et_trouve_le_logo_7414() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
+        let (racine, _journal) = super::tests::web_simule().await;
+        tune_core::services_factices::substituer_base(
+            tune_core::library::logos_web::BASE_FACTICE,
+            &racine,
+        );
+        let dossier = tune_core::test_scratch::scratch_dir("labels-7414-pause");
+        let chemin = dossier.path().join("tune.db");
+        let (app, state) = demarrer(chemin.to_str().unwrap());
+        let label = nom("pause-7414").replace(' ', "-");
+        state
+            .backend
+            .execute(
+                "INSERT INTO albums (title, artist_id, source, track_count, label, musicbrainz_release_id) \
+                 VALUES ('Sans logo', NULL, 'local', 0, ?, ?)",
+                &[&label as &dyn ToSqlValue, &label],
+            )
+            .unwrap();
+        let web = cache_web_de(&crate::routes::library::artwork_cache_dir());
+        web.inscrire(
+            &label,
+            tune_core::library::logos_labels::EntreeLogo {
+                statut: Statut::Absent,
+                qobuz_label_id: None,
+                mb_label_id: None,
+                attribution: None,
+                image: None,
+                verifie_le: maintenant() - 3600,
+                communaute: false,
+                partage: false,
+            },
+        );
+        tune_core::taches_de_fond::mettre_en_pause(
+            &state.backend,
+            tune_core::taches_de_fond::Tache::Enrichissement,
+        )
+        .unwrap();
+
+        // L'ouverture de l'onglet respecte la pause : rien ne part.
+        let (code, _) = requete(&app, "GET", "/api/v1/library/labels").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(state.background_tasks.get(TACHE_LOGOS_LABELS).is_none());
+        assert_eq!(web.entree(&label).unwrap().statut, Statut::Absent);
+
+        // « Lancer la passe » : elle part, et le dit. Une passe d'un autre
+        // banc peut tenir l'index du web : on relance tant que le logo n'est
+        // pas inscrit.
+        let debut = std::time::Instant::now();
+        let mut premiere = None;
+        while web.entree(&label).unwrap().statut != Statut::Trouve {
+            let (code, corps) = requete(&app, "POST", "/api/v1/library/labels/logos/enrich").await;
+            if code != StatusCode::CONFLICT {
+                assert_eq!(
+                    code,
+                    StatusCode::ACCEPTED,
+                    "🔴 « Lancer la passe » ne lance rien quand l'Enrichissement est en \
+                     pause et que le label est noté « sans logo » (#7414) : {corps}"
+                );
+                premiere.get_or_insert(corps);
+            }
+            assert!(
+                debut.elapsed() < Duration::from_secs(60),
+                "🔴 la passe demandée n'a pas inscrit le logo du web (#7414) : {:?}",
+                web.entree(&label)
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let premiere = premiere.expect("au moins une passe acceptée");
+        assert_eq!(premiere["labels_to_process"], 1, "{premiere}");
+        assert_eq!(premiere["forced"], true, "{premiere}");
+        assert_eq!(premiere["reason"], "enrichment_paused", "{premiere}");
+
+        let (_, liste) = requete(&app, "GET", "/api/v1/library/labels").await;
+        let l = liste
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["name"] == label.as_str())
+            .cloned()
+            .unwrap();
+        assert!(
+            l["image_url"]
+                .as_str()
+                .is_some_and(|u| u.starts_with("/api/v1/library/artwork/")),
+            "{l}"
+        );
+        assert_eq!(l["image_credit"]["source"], "commons", "{l}");
     }
 }
