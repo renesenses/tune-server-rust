@@ -57,7 +57,9 @@
     "correction_piece_active": "Correction de pièce : réponse impulsionnelle de {0} taps à {1} Hz, latence {2} ms",
     "correction_piece_pure": "Correction de pièce contournée par PURE",
     "correction_piece_cadence": "Correction de pièce IGNORÉE : réponse impulsionnelle à {0} Hz, flux à {1} Hz (pas de rééchantillonnage, #5190)",
-    "correction_piece_illisible": "Correction de pièce IGNORÉE : réponse impulsionnelle illisible ({0})"
+    "correction_piece_illisible": "Correction de pièce IGNORÉE : réponse impulsionnelle illisible ({0})",
+    "correction_piece_eq_active": "Correction de pièce : égaliseur paramétrique, {0} bandes (profil « {1} »)",
+    "correction_piece_eq_inactive": "Correction de pièce enregistrée mais NON appliquée : greffon égaliseur désactivé"
   },
   "en": {
     "pregain": "auto pre-gain {0} dB",
@@ -117,7 +119,9 @@
     "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
     "correction_piece_pure": "Room correction bypassed by PURE",
     "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
-    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})",
+    "correction_piece_eq_active": "Room correction: parametric equalizer, {0} bands (profile “{1}”)",
+    "correction_piece_eq_inactive": "Room correction saved but NOT applied: equalizer plugin disabled"
   },
   "de": {
     "pregain": "automatische Vorverstärkung {0} dB",
@@ -177,7 +181,9 @@
     "correction_piece_active": "Raumkorrektur: Impulsantwort mit {0} Taps bei {1} Hz, {2} ms Latenz",
     "correction_piece_pure": "Raumkorrektur durch PURE umgangen",
     "correction_piece_cadence": "Raumkorrektur ÜBERSPRUNGEN: Impulsantwort bei {0} Hz, Stream bei {1} Hz (kein Resampling, #5190)",
-    "correction_piece_illisible": "Raumkorrektur ÜBERSPRUNGEN: Impulsantwort nicht lesbar ({0})"
+    "correction_piece_illisible": "Raumkorrektur ÜBERSPRUNGEN: Impulsantwort nicht lesbar ({0})",
+    "correction_piece_eq_active": "Raumkorrektur: parametrischer Equalizer, {0} Bänder (Profil „{1}“)",
+    "correction_piece_eq_inactive": "Raumkorrektur gespeichert, aber NICHT angewendet: Equalizer-Plugin deaktiviert"
   },
   "es": {
     "pregain": "preganancia automática {0} dB",
@@ -237,7 +243,9 @@
     "correction_piece_active": "Corrección de sala: respuesta impulsiva de {0} taps a {1} Hz, latencia {2} ms",
     "correction_piece_pure": "Corrección de sala omitida por PURE",
     "correction_piece_cadence": "Corrección de sala IGNORADA: respuesta impulsiva a {0} Hz, flujo a {1} Hz (sin remuestreo, #5190)",
-    "correction_piece_illisible": "Corrección de sala IGNORADA: respuesta impulsiva ilegible ({0})"
+    "correction_piece_illisible": "Corrección de sala IGNORADA: respuesta impulsiva ilegible ({0})",
+    "correction_piece_eq_active": "Corrección de sala: ecualizador paramétrico, {0} bandas (perfil «{1}»)",
+    "correction_piece_eq_inactive": "Corrección de sala guardada pero NO aplicada: complemento ecualizador desactivado"
   },
   "it": {
     "pregain": "pre-guadagno automatico {0} dB",
@@ -297,7 +305,9 @@
     "correction_piece_active": "Correzione ambientale: risposta all'impulso di {0} tap a {1} Hz, latenza {2} ms",
     "correction_piece_pure": "Correzione ambientale bypassata da PURE",
     "correction_piece_cadence": "Correzione ambientale IGNORATA: risposta all'impulso a {0} Hz, flusso a {1} Hz (nessun ricampionamento, #5190)",
-    "correction_piece_illisible": "Correzione ambientale IGNORATA: risposta all'impulso illeggibile ({0})"
+    "correction_piece_illisible": "Correzione ambientale IGNORATA: risposta all'impulso illeggibile ({0})",
+    "correction_piece_eq_active": "Correzione ambientale: equalizzatore parametrico, {0} bande (profilo «{1}»)",
+    "correction_piece_eq_inactive": "Correzione ambientale salvata ma NON applicata: plugin equalizzatore disattivato"
   },
   "zh": {
     "pregain": "自动预增益 {0} dB",
@@ -357,7 +367,9 @@
     "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
     "correction_piece_pure": "Room correction bypassed by PURE",
     "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
-    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})",
+    "correction_piece_eq_active": "Room correction: parametric equalizer, {0} bands (profile “{1}”)",
+    "correction_piece_eq_inactive": "Room correction saved but NOT applied: equalizer plugin disabled"
   },
   "ja": {
     "pregain": "自動プリアンプ {0} dB",
@@ -417,7 +429,9 @@
     "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
     "correction_piece_pure": "Room correction bypassed by PURE",
     "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
-    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})",
+    "correction_piece_eq_active": "Room correction: parametric equalizer, {0} bands (profile “{1}”)",
+    "correction_piece_eq_inactive": "Room correction saved but NOT applied: equalizer plugin disabled"
   },
   "ko": {
     "pregain": "자동 프리게인 {0} dB",
@@ -477,7 +491,9 @@
     "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
     "correction_piece_pure": "Room correction bypassed by PURE",
     "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
-    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})",
+    "correction_piece_eq_active": "Room correction: parametric equalizer, {0} bands (profile “{1}”)",
+    "correction_piece_eq_inactive": "Room correction saved but NOT applied: equalizer plugin disabled"
   },
   "ro": {
     "pregain": "pre-amplificare automată {0} dB",
@@ -537,7 +553,9 @@
     "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
     "correction_piece_pure": "Room correction bypassed by PURE",
     "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
-    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})",
+    "correction_piece_eq_active": "Room correction: parametric equalizer, {0} bands (profile “{1}”)",
+    "correction_piece_eq_inactive": "Room correction saved but NOT applied: equalizer plugin disabled"
   },
   "sv": {
     "pregain": "automatisk förförstärkning {0} dB",
@@ -597,7 +615,9 @@
     "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
     "correction_piece_pure": "Room correction bypassed by PURE",
     "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
-    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})",
+    "correction_piece_eq_active": "Room correction: parametric equalizer, {0} bands (profile “{1}”)",
+    "correction_piece_eq_inactive": "Room correction saved but NOT applied: equalizer plugin disabled"
   },
   "vi": {
     "pregain": "tiền khuếch đại tự động {0} dB",
@@ -657,7 +677,9 @@
     "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
     "correction_piece_pure": "Room correction bypassed by PURE",
     "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
-    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})",
+    "correction_piece_eq_active": "Room correction: parametric equalizer, {0} bands (profile “{1}”)",
+    "correction_piece_eq_inactive": "Room correction saved but NOT applied: equalizer plugin disabled"
   },
   "hu": {
     "pregain": "automatikus előerősítés {0} dB",
@@ -717,7 +739,9 @@
     "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
     "correction_piece_pure": "Room correction bypassed by PURE",
     "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
-    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})",
+    "correction_piece_eq_active": "Room correction: parametric equalizer, {0} bands (profile “{1}”)",
+    "correction_piece_eq_inactive": "Room correction saved but NOT applied: equalizer plugin disabled"
   },
   "nb": {
     "pregain": "automatisk forsterkning før behandling {0} dB",
@@ -777,7 +801,9 @@
     "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
     "correction_piece_pure": "Room correction bypassed by PURE",
     "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
-    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})",
+    "correction_piece_eq_active": "Room correction: parametric equalizer, {0} bands (profile “{1}”)",
+    "correction_piece_eq_inactive": "Room correction saved but NOT applied: equalizer plugin disabled"
   },
   "pl": {
     "pregain": "automatyczne wzmocnienie wstępne {0} dB",
@@ -837,7 +863,9 @@
     "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
     "correction_piece_pure": "Room correction bypassed by PURE",
     "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
-    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})",
+    "correction_piece_eq_active": "Room correction: parametric equalizer, {0} bands (profile “{1}”)",
+    "correction_piece_eq_inactive": "Room correction saved but NOT applied: equalizer plugin disabled"
   },
   "el": {
     "pregain": "αυτόματη προ-ενίσχυση {0} dB",
@@ -897,6 +925,8 @@
     "correction_piece_active": "Room correction: {0}-tap impulse response at {1} Hz, {2} ms latency",
     "correction_piece_pure": "Room correction bypassed by PURE",
     "correction_piece_cadence": "Room correction SKIPPED: impulse response at {0} Hz, stream at {1} Hz (no resampling, #5190)",
-    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})"
+    "correction_piece_illisible": "Room correction SKIPPED: unreadable impulse response ({0})",
+    "correction_piece_eq_active": "Room correction: parametric equalizer, {0} bands (profile “{1}”)",
+    "correction_piece_eq_inactive": "Room correction saved but NOT applied: equalizer plugin disabled"
   }
 }
