@@ -96,6 +96,9 @@ async fn recent_history(
             let name = item.id.and_then(|id| names.get(&id));
             let mut value = json!(item);
             value["context_name"] = json!(name);
+            // #7778 (point 6) : l'album du service, sous la clé que le client
+            // lit déjà sur la file ; `album_ref` reste hors du JSON.
+            value["album_id_service"] = json!(item.album_id_service());
             value
         })
         .collect();
@@ -485,6 +488,10 @@ async fn export_csv(
         csv,
     )
 }
+
+#[cfg(test)]
+#[path = "historique_album_de_service_7778_tests.rs"]
+mod historique_album_de_service_7778_tests;
 
 #[cfg(test)]
 #[path = "top_artistes_image_i5165_tests.rs"]
