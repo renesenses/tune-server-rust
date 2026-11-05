@@ -163,7 +163,8 @@ async fn podcast_navigateur_7354_recul_10_0_300_et_reprises_explicites_sans_doub
         (5000, 10, 0),
         (320000, 10, 310000),
         (320000, 0, 320000),
-        (320000, 300, 20000),
+        // #7840 — un recul enregistré à 300 s (ancienne borne) recule de 60 s.
+        (320000, 300, 260000),
     ] {
         signaler(&b, &sid, position).await;
         let r = listening_resume::recent(&b.state.backend, Some(b.zone), 10)
