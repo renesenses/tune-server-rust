@@ -9,7 +9,12 @@
 //! * `GET  /mesures/{id}/resultat` — le résultat (409 tant qu'elle n'est pas
 //!   terminée) ;
 //! * `GET  /mesures/{id}/ri.wav` — la réponse impulsionnelle (WAV float32) ;
-//! * `DELETE /mesures/{id}` — annuler.
+//! * `DELETE /mesures/{id}` — annuler ;
+//! * `POST /mesures/{id}/correction` — proposer un égaliseur (C2) : cible,
+//!   zone de correction, bandes ; rien n'est écrit ;
+//! * `POST /mesures/{id}/correction/profil` — même calcul, enregistré comme
+//!   profil de pièce de la zone ; il s'applique ensuite par
+//!   `POST /api/v1/room-correction/profiles/{zone}/apply`.
 //!
 //! Aucune lecture ne part sans le `POST` explicite de l'utilisateur.
 //!
@@ -31,6 +36,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tune_core::license::{Feature, LicenseManager};
 
+use crate::correction::{DemandeCorrection, Proposition, proposer};
 use crate::generateur::Voies;
 use crate::mesure::{Controleur, Demande};
 
@@ -91,6 +97,8 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
         .route("/mesures/{id}", get(avancement).delete(annuler))
         .route("/mesures/{id}/resultat", get(resultat))
         .route("/mesures/{id}/ri.wav", get(ri_wav))
+        .route("/mesures/{id}/correction", post(correction))
+        .route("/mesures/{id}/correction/profil", post(correction_profil))
         .route_layer(from_fn_with_state(etat.clone(), garde_premium))
         .with_state(etat)
 }
@@ -338,4 +346,120 @@ async fn annuler(State(etat): State<EtatRoutes>, Path(id): Path<String>) -> Resp
                 .into_response()
         }
     }
+}
+
+/// La proposition C2 pour une mesure terminée, avec ce que la mesure dit de
+/// la zone (égaliseur ou IR actifs pendant la mesure, PURE).
+fn proposition_pour(
+    etat: &EtatRoutes,
+    id: &str,
+    demande: &DemandeCorrection,
+) -> Result<(i64, Proposition), Response> {
+    let Some(m) = etat.controleur.mesure(id) else {
+        return Err(refus(
+            StatusCode::NOT_FOUND,
+            "mesure_inconnue",
+            format!("aucune mesure « {id} »"),
+        ));
+    };
+    let Some(r) = m.resultat() else {
+        return Err(refus(
+            StatusCode::CONFLICT,
+            "mesure_sans_resultat",
+            "la mesure n'est pas terminée".into(),
+        ));
+    };
+    let reponse = tune_calibration::analysis::LogResponse {
+        freqs: r.reponse.freqs_hz.clone(),
+        magnitude_db: r.reponse.db.clone(),
+    };
+    let mut p = proposer(&reponse, demande)
+        .map_err(|e| refus(StatusCode::UNPROCESSABLE_ENTITY, "correction_refusee", e))?;
+    let t = &r.traitements_zone;
+    if t.egaliseur || t.correction_ir {
+        p.avertissements.push(
+            "l'égaliseur ou la correction IR de la zone était actif pendant la mesure : la proposition s'y ajoute, refaire la mesure sans eux"
+                .into(),
+        );
+    }
+    if t.pure {
+        p.avertissements.push(
+            "la zone est en PURE : aucune correction ne s'y entend tant que PURE est actif".into(),
+        );
+    }
+    Ok((m.demande.zone_id, p))
+}
+
+async fn correction(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeCorrection>,
+) -> Response {
+    match proposition_pour(&etat, &id, &d) {
+        Ok((zone_id, p)) => {
+            let mut v = serde_json::to_value(&p).unwrap_or(Value::Null);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("id".into(), json!(id));
+                o.insert("zone_id".into(), json!(zone_id));
+            }
+            Json(v).into_response()
+        }
+        Err(r) => r,
+    }
+}
+
+#[derive(Deserialize)]
+struct DemandeProfil {
+    #[serde(flatten)]
+    demande: DemandeCorrection,
+    nom: Option<String>,
+}
+
+async fn correction_profil(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeProfil>,
+) -> Response {
+    let (zone_id, p) = match proposition_pour(&etat, &id, &d.demande) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if p.bandes.is_empty() {
+        return refus(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "correction_vide",
+            "aucune bande à enregistrer : rien à couper dans la zone".into(),
+        );
+    }
+    let nom = d
+        .nom
+        .map(|n| n.trim().chars().take(80).collect::<String>())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| format!("Calibration {id}"));
+    let profil = p.profil_de_zone(zone_id, &nom, &chrono::Utc::now().to_rfc3339());
+    let hote = etat.controleur.hote.clone();
+    let a_ecrire = profil.clone();
+    let ecrit = tokio::task::spawn_blocking(move || hote.enregistrer_profil_piece(&a_ecrire))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    if let Err(e) = ecrit {
+        return refus(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "profil_non_enregistre",
+            e,
+        );
+    }
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "id": id,
+            "zone_id": zone_id,
+            "profil": profil,
+            "proposition": p,
+            // L'application est un second geste, par la route qui écrit
+            // l'égaliseur de la zone et rafraîchit la sortie qui joue.
+            "appliquer": format!("/api/v1/room-correction/profiles/{zone_id}/apply"),
+        })),
+    )
+        .into_response()
 }

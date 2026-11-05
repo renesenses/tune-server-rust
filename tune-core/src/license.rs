@@ -2463,3 +2463,22 @@ mod tests {
         );
     }
 }
+
+/// #7632 — un gestionnaire de licence PREMIUM pour les tests, sans runtime :
+/// le compte SSO Premium est posé en base, vérifié à l'instant, AVANT la
+/// construction (comme au redémarrage d'un serveur dont le compte est
+/// Premium).
+#[cfg(test)]
+pub(crate) fn licence_premium_pour_test(db: Arc<dyn DbBackend>) -> Arc<LicenseManager> {
+    let settings = SettingsRepo::with_backend(db.clone());
+    settings.set("mozaik_premium", "true").unwrap();
+    settings
+        .set(
+            "mozaik_premium_checked",
+            &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        )
+        .unwrap();
+    let licence = Arc::new(LicenseManager::new(db));
+    assert!(licence.premium_snapshot(), "licence de test non Premium");
+    licence
+}

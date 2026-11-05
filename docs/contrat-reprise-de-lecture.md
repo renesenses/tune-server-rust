@@ -17,7 +17,7 @@ Album/playlist : la vignette est celle du conteneur ; le libellé visible est le
 Titre seul : vignette du titre, reprise à sa position mémorisée, sans recul (décision de Bertrand du 28/10 à 20 h).
 `POST /podcasts/play/{zone_id}` accepte en plus `podcast_id` (flux RSS ou identifiant stable) ; les clients envoient l’image du podcast, avant celle propre à l’épisode. Une seule entrée par podcast identifié, mise à jour avec son dernier épisode démarré. Ancien client : repli sur le nom transmis.
 
-Podcast : relancer le même épisode à `max(0, position_ms - X * 1000)`. Le réglage serveur `continue_listening_rewind_seconds`, exposé par `GET/PATCH /system/config`, est un entier de 0 à 300 ; défaut : **10 secondes**, confirmé par la décision de coordination du 28/10 (section « SESSION REPRISE (n° 4) — DÉCISION 28/10 sur le recul des podcasts »). La position est persistée pendant l'écoute et lors d'une pause/arrêt.
+Podcast : relancer le même épisode à `max(0, position_ms - X * 1000)`. Le réglage serveur `continue_listening_rewind_seconds`, exposé par `GET/PATCH /system/config`, est un entier de 0 à 60 (décision du 04/11, #7840 : au-delà, le PATCH est refusé et une valeur déjà enregistrée au-dessus est relue à 60) ; défaut : **10 secondes**, confirmé par la décision de coordination du 28/10 (section « SESSION REPRISE (n° 4) — DÉCISION 28/10 sur le recul des podcasts »). La position est persistée pendant l'écoute et lors d'une pause/arrêt.
 Un objet absent ou périmé rend une erreur ; aucun repli silencieux vers un album ou une piste locale d'identifiant homonyme.
 
 ## Compatibilité

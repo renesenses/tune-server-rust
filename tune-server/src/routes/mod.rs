@@ -65,6 +65,8 @@ mod pochettes_upnp;
 // Retrait d'une bibliotheque UPnP par serveur media (#4624).
 pub mod retrait_upnp;
 pub mod synchronisation_upnp;
+// Titres de démonstration proposés au premier démarrage (#7858).
+pub mod titres_demo;
 // `panne_sql` a demenage dans `tune-http-types` : les caisses de routes
 // extraites (`tune-smart-http`…) l'empruntent aussi, et une caisse extraite ne
 // peut pas dependre de `tune-server` sans fabriquer un cycle.

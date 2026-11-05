@@ -141,6 +141,8 @@ pub mod sacd;
 mod sacd_lecture_5297_tests;
 /// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
 pub mod soft_mute;
+/// Le spectrogramme d'une piste en PNG, calculé sur le PCM décodé (#7857).
+pub mod spectrogramme;
 pub mod staged_growth;
 pub mod support;
 pub mod tap;

@@ -1182,8 +1182,9 @@ async fn pg_6285_les_verdicts_des_faux_hires() {
         bits_effectifs: Some(16),
         coupure_hz: Some(20_000.0),
         silencieux: false,
+        ..Default::default()
     };
-    enregistrer(&db, 1, &Ok(mesure)).unwrap();
+    enregistrer(&db, 1, &Ok(mesure.clone())).unwrap();
     enregistrer(&db, 1, &Ok(mesure)).unwrap();
     enregistrer(&db, 3, &Err("illisible".into())).unwrap();
     assert_eq!(compter_les_candidats(&db), 0);

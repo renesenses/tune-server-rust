@@ -2309,6 +2309,10 @@ impl PlaybackOrchestrator {
                     // `false` en mode PURE, donc la promesse bit-perfect tient
                     // sans garde supplémentaire, exactement comme pour l'EQ.
                     local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+                    // #7632 — le droit de convoluer, posé à chaque lecture
+                    // comme PURE : sans Premium, l'IR mémorisée ne bâtit
+                    // aucun moteur pour la piste qui démarre.
+                    local_output.set_convolution_autorisee(self.correction_ir_autorisee());
                     // #6044 — la réaffectation des canaux : la règle de l'album
                     // prime sur celle de la zone, et aucune ne s'applique en
                     // PURE (`regle_effective_with` le vérifie). Les canaux de
@@ -3517,7 +3521,21 @@ impl PlaybackOrchestrator {
             .collect()
     }
 
-    pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
+    /// #7636 — la zone lâche un renderer qu'un autre point de contrôle tient
+    /// (Kazoo sur un Linn) : elle s'arrête côté Tune, sans envoyer à l'appareil
+    /// ni `Stop` ni `play_media`. Sa liste de lecture, que l'autre point de
+    /// contrôle vient de charger, reste intacte ; l'état « stopped » enregistré
+    /// empêche aussi le sondeur de « reprendre » cette lecture comme la sienne.
+    pub async fn ceder_la_zone_a_un_tiers(&self, zone_id: i64) {
+        if let Some(sid) = self.arreter_l_etat_de_la_zone(zone_id).await {
+            self.streamer.remove_session(&sid).await;
+        }
+    }
+
+    /// La moitié de [`Self::stop`] qui ne parle pas à l'appareil : l'état de
+    /// la zone, sa position, ses préparations. Rend l'identifiant du flux
+    /// qu'elle servait.
+    async fn arreter_l_etat_de_la_zone(&self, zone_id: i64) -> Option<String> {
         // #5476 — rend caduc un Seek de reprise détaché encore en attente.
         self.playback.marquer_commande_de_transport(zone_id).await;
         // #5050 — arrêtée : la pose d'un transfert en pause ne vaut plus.
@@ -3542,6 +3560,11 @@ impl PlaybackOrchestrator {
             .as_ref()
             .and_then(|np| np.stream_id.clone());
         self.playback.stop(zone_id).await;
+        old_stream_id
+    }
+
+    pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
+        let old_stream_id = self.arreter_l_etat_de_la_zone(zone_id).await;
 
         // Resolve device_id: prefer explicit, fall back to zone DB
         let resolved_did = match device_id {

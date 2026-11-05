@@ -6178,7 +6178,9 @@ async fn bascule_pure_avec_egaliseur_sur_dlna_refabrique_le_flux() {
 /// lui.
 #[tokio::test]
 async fn le_predicat_voit_chacun_des_quatre_traitements_que_pure_gouverne() {
-    let orch = test_orchestrator();
+    let mut orch = test_orchestrator();
+    // #7632 — la correction de pièce n'est un traitement que sous Premium.
+    orch.license = Some(crate::license::licence_premium_pour_test(orch.db.clone()));
     let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
     let zr = ZoneRepo::with_backend(orch.db.clone());
     let zone_vide = zr.create("Vide", Some("dlna"), Some("dlna:vide")).unwrap();
