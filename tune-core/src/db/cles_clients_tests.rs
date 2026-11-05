@@ -80,3 +80,23 @@ fn deux_cles_sont_differentes_7855() {
     assert_ne!(a.secret, b.secret);
     assert_ne!(a.cle.id, b.cle.id);
 }
+
+#[test]
+fn la_cle_d_un_profil_supprime_ne_s_authentifie_plus_7855() {
+    let db = base();
+    db.execute(
+        "INSERT INTO profiles (id, username) VALUES (2, 'banc7855')",
+        &[],
+    )
+    .unwrap();
+    let repo = ClesClientsRepo::with_backend(db.clone());
+    let creee = repo.creer(2, "Symfonium").unwrap();
+    assert!(repo.authentifier(&creee.secret).unwrap().is_some());
+
+    db.execute("DELETE FROM profiles WHERE id = 2", &[])
+        .unwrap();
+    assert!(
+        repo.authentifier(&creee.secret).unwrap().is_none(),
+        "la clé d'un profil supprimé doit être refusée"
+    );
+}

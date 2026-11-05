@@ -5,4 +5,5 @@ CREATE TABLE IF NOT EXISTS cles_clients (
  empreinte_sha256 TEXT NOT NULL UNIQUE,
  cree_le TEXT NOT NULL,
  revoquee_le TEXT
-)
+);
+CREATE INDEX IF NOT EXISTS idx_cles_clients_profile ON cles_clients(profile_id)

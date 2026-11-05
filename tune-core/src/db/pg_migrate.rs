@@ -2444,8 +2444,11 @@ mod tests {
                 .fetch_one(&mut c)
                 .await
                 .unwrap();
+            // Comparée à la dernière migration PG déclarée, pas à un nombre
+            // écrit à la main : chaque nouvelle migration (#7855) le cassait.
             assert_eq!(
-                version, 100,
+                version,
+                crate::db::migrations::pg_latest_version(),
                 "la bascule ne doit pas rester sur la sentinelle 99"
             );
             c.close().await.ok();

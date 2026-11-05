@@ -132,8 +132,9 @@ impl ClesClientsRepo {
         Ok(true)
     }
 
-    /// La clé active qui correspond à `secret`, ou `None` (inconnue ou
-    /// révoquée). Le secret n'est ni journalisé ni stocké.
+    /// La clé active qui correspond à `secret`, ou `None` (inconnue,
+    /// révoquée, ou dont le profil a été supprimé). Le secret n'est ni
+    /// journalisé ni stocké.
     pub fn authentifier(&self, secret: &str) -> Result<Option<CleClient>, String> {
         if secret.is_empty() {
             return Ok(None);
@@ -141,7 +142,9 @@ impl ClesClientsRepo {
         let attendue = empreinte(secret);
         let row = self.db.query_one(
             &format!(
-                "SELECT {COLONNES}, empreinte_sha256 FROM cles_clients WHERE empreinte_sha256 = ? AND revoquee_le IS NULL"
+                "SELECT {COLONNES}, empreinte_sha256 FROM cles_clients \
+                 WHERE empreinte_sha256 = ? AND revoquee_le IS NULL \
+                 AND EXISTS (SELECT 1 FROM profiles WHERE profiles.id = cles_clients.profile_id)"
             ),
             &[&attendue as &dyn ToSqlValue],
         )?;

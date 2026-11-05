@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS cles_clients (
  cree_le TEXT NOT NULL,
  revoquee_le TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_cles_clients_profile ON cles_clients(profile_id);
 
 INSERT INTO schema_version (version, name) VALUES (101, 'cles_clients')
 ON CONFLICT (version) DO NOTHING;
