@@ -1083,6 +1083,17 @@ fn recalculer_les_compilations(state: &AppState) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "compilations_recalcul_impossible"),
     }
+    // #6459 — meme principe pour les albums retrogrades sous « Unknown
+    // Artist » : la base garde l'artiste de leurs pistes.
+    match tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+        .rendre_leur_artiste_aux_albums_inconnus()
+    {
+        Ok(bilan) if bilan.rendus > 0 => {
+            info!(?bilan, "albums_inconnus_rendus_au_demarrage");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "albums_inconnus_reprise_impossible"),
+    }
 }
 
 /// Re-rattache les favoris orphelins aux items vivants retrouvés par identité

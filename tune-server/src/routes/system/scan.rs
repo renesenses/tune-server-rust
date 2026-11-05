@@ -3343,6 +3343,18 @@ async fn spawn_library_scan_avec_lecteur_par(
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "post_scan_compilations_recalcul_echoue"),
             }
+            // #6459 — un album rétrogradé sous « Unknown Artist » par une
+            // relecture passée reprend l'artiste que ses pistes portent en
+            // base : ses fichiers inchangés ne seront pas relus.
+            match tune_core::db::album_repo::AlbumRepo::with_backend(db.clone())
+                .rendre_leur_artiste_aux_albums_inconnus()
+            {
+                Ok(bilan) if bilan.rendus > 0 => {
+                    tracing::info!(?bilan, "post_scan_albums_inconnus_rendus")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "post_scan_albums_inconnus_echoue"),
+            }
         }
 
         // Une réparation d'attribution ne se fonde que sur une vue complète et

@@ -244,6 +244,21 @@ pub mod sql {
          ORDER BY a.id, t.id"
     }
 
+    /// #6459 — les albums locaux rangés sous « Unknown Artist » (ou sans
+    /// artiste), hors compilations, avec la balise `album_artist` et l'artiste
+    /// de chacune de leurs pistes.
+    pub fn albums_inconnus_a_reprendre() -> &'static str {
+        "SELECT a.id, a.title, t.album_artist, t.artist_id, tar.name \
+         FROM albums a \
+         JOIN tracks t ON t.album_id = a.id \
+         LEFT JOIN artists ar ON ar.id = a.artist_id \
+         LEFT JOIN artists tar ON tar.id = t.artist_id \
+         WHERE (ar.id IS NULL OR LOWER(TRIM(ar.name)) IN ('', 'unknown artist')) \
+           AND COALESCE(a.is_compilation, 0) = 0 \
+           AND COALESCE(a.source, 'local') = 'local' \
+         ORDER BY a.id, t.id"
+    }
+
     /// Les numéros de disque distincts déjà rangés sous un album (C4).
     pub fn disc_numbers_of<D: SqlDialect>(d: &D) -> String {
         format!(
@@ -1150,6 +1165,20 @@ pub struct BilanRecalculCompilations {
     /// Laissés tels quels : drapeau ou artiste tenu à la main (C3).
     pub manuels: usize,
     /// Laissés tels quels : sous « Various Artists » sans artiste à rendre.
+    pub indecis: usize,
+    pub erreurs: usize,
+}
+
+/// Bilan de [`AlbumRepo::rendre_leur_artiste_aux_albums_inconnus`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BilanArtistesRendus {
+    /// Albums sous « Unknown Artist » examinés.
+    pub examines: usize,
+    /// Albums rendus à leur artiste.
+    pub rendus: usize,
+    /// Laissés tels quels : artiste tenu à la main (C3).
+    pub manuels: usize,
+    /// Laissés tels quels : pas d'artiste unique et nommé dans la base.
     pub indecis: usize,
     pub erreurs: usize,
 }
@@ -2451,6 +2480,172 @@ impl AlbumRepo {
         self.mark_compilation(album_id)
     }
 
+    /// #6459 — vrai si donner `artist_id` à `album` remplacerait un artiste
+    /// NOMMÉ par « Unknown Artist » (ou un nom vide, ou un artiste disparu).
+    ///
+    /// C'est la règle de [`Self::reclaim_unknown_artist`], lue dans l'autre
+    /// sens : un fichier relu sans balise d'artiste ne rétrograde jamais un
+    /// album déjà résolu. « Various Artists » n'est pas concerné : il vient du
+    /// verdict compilation, qui a ses propres règles.
+    pub fn retrograderait_l_artiste(&self, album: &Album, artist_id: i64) -> bool {
+        fn inconnu(nom: Option<&str>) -> bool {
+            nom.map(str::trim).is_none_or(|n| {
+                n.is_empty() || n.eq_ignore_ascii_case(crate::db::artist_repo::UNKNOWN_ARTIST_NAME)
+            })
+        }
+        if album.artist_id == Some(artist_id) || inconnu(album.artist_name.as_deref()) {
+            return false;
+        }
+        let sql = self.dialect_sql(sql::get_artist_name, sql::get_artist_name);
+        let params: [&dyn ToSqlValue; 1] = [&artist_id];
+        let demande = self
+            .db
+            .query_one_strong(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|row| row.first()?.as_string());
+        inconnu(demande.as_deref())
+    }
+
+    /// [`Self::retrograderait_l_artiste`] pour un album désigné par son
+    /// identifiant, lu par la connexion d'écriture (le scan tient sa
+    /// transaction de lot).
+    fn retrograderait_l_artiste_de(&self, album_id: i64, artist_id: i64) -> bool {
+        let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        self.db
+            .query_one_strong(&sql, &params)
+            .ok()
+            .flatten()
+            .is_some_and(|row| self.retrograderait_l_artiste(&row_to_album(&row), artist_id))
+    }
+
+    /// #6459 — rend son artiste, SANS relire un fichier, à un album local
+    /// rangé sous « Unknown Artist » alors que la base sait qui il est.
+    ///
+    /// Un scan ordinaire saute les fichiers inchangés : un album rétrogradé
+    /// par une relecture passée le restait jusqu'à ce que ses fichiers
+    /// changent. La base garde ce qu'il faut : la balise `album_artist` et
+    /// l'artiste propre de chaque piste. Un album est repris si :
+    ///
+    /// - son artiste n'est pas tenu à la main (C3) ;
+    /// - il n'est pas marqué compilation ;
+    /// - ses pistes portent toutes la même balise `album_artist` non vide
+    ///   (aucune autre), ou, sans aucune balise, toutes le même artiste de
+    ///   piste nommé ;
+    /// - cet artiste n'est ni « Unknown Artist » ni « Various Artists ».
+    ///
+    /// Sinon il est laissé tel quel (`indecis`). Idempotente : jouée au
+    /// démarrage et après chaque scan, comme
+    /// [`Self::recalculer_les_compilations`].
+    pub fn rendre_leur_artiste_aux_albums_inconnus(
+        &self,
+    ) -> Result<BilanArtistesRendus, TuneError> {
+        use crate::library::regle_compilation::est_artistes_divers;
+        use std::collections::BTreeMap;
+
+        fn nomme(nom: &str) -> bool {
+            let n = nom.trim();
+            !n.is_empty()
+                && !n.eq_ignore_ascii_case(crate::db::artist_repo::UNKNOWN_ARTIST_NAME)
+                && !est_artistes_divers(n)
+        }
+
+        struct Ligne {
+            id: i64,
+            titre: String,
+            balises: BTreeMap<String, String>,
+            artistes_de_piste: BTreeMap<i64, String>,
+            piste_sans_artiste_nomme: bool,
+        }
+
+        let rows = self
+            .db
+            .query_many_strong(sql::albums_inconnus_a_reprendre(), &[])?;
+        let mut albums: Vec<Ligne> = Vec::new();
+        for r in &rows {
+            let Some(id) = r.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            if albums.last().is_none_or(|a| a.id != id) {
+                albums.push(Ligne {
+                    id,
+                    titre: r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    balises: BTreeMap::new(),
+                    artistes_de_piste: BTreeMap::new(),
+                    piste_sans_artiste_nomme: false,
+                });
+            }
+            let Some(a) = albums.last_mut() else { continue };
+            if let Some(b) = r
+                .get(2)
+                .and_then(|v| v.as_string())
+                .map(|b| b.trim().to_string())
+                .filter(|b| !b.is_empty())
+            {
+                a.balises.entry(b.to_lowercase()).or_insert(b);
+            }
+            match (
+                r.get(3).and_then(|v| v.as_i64()),
+                r.get(4).and_then(|v| v.as_string()),
+            ) {
+                (Some(aid), Some(nom)) if nomme(&nom) => {
+                    a.artistes_de_piste.insert(aid, nom);
+                }
+                _ => a.piste_sans_artiste_nomme = true,
+            }
+        }
+
+        let meta = crate::db::album_metadata_repo::AlbumMetadataRepo::with_backend(self.db.clone());
+        let artistes = crate::db::artist_repo::ArtistRepo::with_backend(self.db.clone());
+        let update_sql = self.dialect_sql(sql::set_artist_id, sql::set_artist_id);
+        let mut bilan = BilanArtistesRendus {
+            examines: albums.len(),
+            ..Default::default()
+        };
+        for a in &albums {
+            let tenus = meta.champs_edites_a_la_main(a.id).unwrap_or_default();
+            if tenus.iter().any(|c| c == "artist") {
+                bilan.manuels += 1;
+                continue;
+            }
+            let balises: Vec<&String> = a.balises.values().collect();
+            let pistes: Vec<(&i64, &String)> = a.artistes_de_piste.iter().collect();
+            let nouvel_artiste = match (balises.as_slice(), pistes.as_slice()) {
+                ([b], _) if nomme(b) => artistes
+                    .get_or_create(b, None, None)
+                    .ok()
+                    .and_then(|x| x.id),
+                ([], [(aid, _)]) if !a.piste_sans_artiste_nomme => Some(**aid),
+                _ => None,
+            };
+            let Some(nouvel_artiste) = nouvel_artiste else {
+                bilan.indecis += 1;
+                continue;
+            };
+            let params: [&dyn ToSqlValue; 2] = [&nouvel_artiste, &a.id];
+            match self.db.execute(&update_sql, &params) {
+                Ok(_) => {
+                    bilan.rendus += 1;
+                    tracing::info!(
+                        album_id = a.id,
+                        album = %a.titre,
+                        nouvel_artiste_id = nouvel_artiste,
+                        "album_artist_rendu_depuis_unknown"
+                    );
+                }
+                Err(e) => {
+                    bilan.erreurs += 1;
+                    tracing::warn!(album_id = a.id, error = %e, "album_artist_rendu_echoue");
+                }
+            }
+        }
+        if bilan.rendus > 0 || bilan.erreurs > 0 {
+            tracing::info!(?bilan, "albums_inconnus_rendus_a_leur_artiste");
+        }
+        Ok(bilan)
+    }
+
     /// #4896 — reprend le titre et/ou l'artiste d'une ligne album d'après les
     /// balises de ses pistes, que le surveillant de fichiers vient de relire
     /// (voir `auto_scan::realigner_albums_sur_les_balises`, qui décide).
@@ -2473,6 +2668,7 @@ impl AlbumRepo {
         }
         if let Some(artist_id) = artist_id
             && !self.tenu_a_la_main(album_id, "artist")
+            && !self.retrograderait_l_artiste_de(album_id, artist_id)
         {
             let sql = self.dialect_sql(sql::set_artist_id, sql::set_artist_id);
             let params: [&dyn ToSqlValue; 2] = [&artist_id, &album_id];

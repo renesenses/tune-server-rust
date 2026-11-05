@@ -466,6 +466,10 @@ pub struct TrackImporter {
     /// pendant ce scan. Une ligne reprise pour une clé ne l'est jamais pour
     /// une autre : ce serait fondre deux parutions en une.
     albums_en_cache: HashSet<i64>,
+    /// #6459 — lignes album reprises AVEC leur artiste nommé pour un fichier
+    /// relu sans balise d'artiste : leur clé dit « Unknown Artist », la ligne
+    /// garde le sien. Ce n'est pas un défaut du cache.
+    albums_gardes_sous_leur_artiste: HashSet<i64>,
     /// #7694 — les qualités (`score_qualite`) des fichiers lus pendant ce
     /// scan, par dossier d'album. La règle des dossiers miroirs les compare
     /// avant que le lot n'écrive ses pistes en base.
@@ -616,6 +620,7 @@ impl TrackImporter {
             types_de_sortie_poses: HashSet::new(),
             types_secondaires_poses: HashSet::new(),
             albums_en_cache: HashSet::new(),
+            albums_gardes_sous_leur_artiste: HashSet::new(),
             qualites_par_dossier: HashMap::new(),
             decisions_journalisees: HashSet::new(),
             comp_decision: HashMap::new(),
@@ -976,6 +981,13 @@ impl TrackImporter {
     ///   l'identité (`quality_split`) ;
     /// - aucune autre clé ne la tient déjà pendant ce scan ;
     /// - son artiste n'est pas tenu à la main (C3) : alors rien ne change.
+    ///
+    /// #6459 — un fichier relu sans balise d'artiste (clé « Unknown
+    /// Artist ») ne rétrograde jamais une ligne qui a un artiste nommé : elle
+    /// est reprise TELLE QUELLE, sans écriture, quel que soit
+    /// `quality_split`. Sans quoi l'album entier passait sous « Unknown
+    /// Artist » et aucun scan suivant ne le réparait, ses fichiers étant
+    /// inchangés.
     fn album_du_fichier_a_reprendre(&mut self, chemin: &str, cle: &CleDAlbum) -> Option<Album> {
         let (dossier, titre, artiste, annee, mbid) = cle;
         let mut ancien = self.album_repo.album_du_fichier(chemin).ok().flatten()?;
@@ -996,6 +1008,17 @@ impl TrackImporter {
             && f != *dossier
         {
             return None;
+        }
+        if self.album_repo.retrograderait_l_artiste(&ancien, *artiste) {
+            tracing::info!(
+                album_id = id,
+                album = %titre,
+                artiste_garde = ?ancien.artist_name,
+                demande_artiste_id = artiste,
+                "album_garde_son_artiste_fichier_sans_artiste"
+            );
+            self.albums_gardes_sous_leur_artiste.insert(id);
+            return Some(ancien);
         }
         // `false` : l'artiste est tenu à la main, la ligne ne bouge pas.
         if !self
@@ -1801,7 +1824,11 @@ impl TrackImporter {
         let album = if let Some(ref key) = album_key {
             if let Some(cached) = self.album_cache.get(key) {
                 let c = Arc::clone(cached);
-                if c.artist_id != Some(key.2) {
+                if c.artist_id != Some(key.2)
+                    && !c
+                        .id
+                        .is_some_and(|id| self.albums_gardes_sous_leur_artiste.contains(&id))
+                {
                     tracing::warn!(
                         album = %key.1,
                         cache_key_artist_id = key.2,
@@ -4112,3 +4139,7 @@ mod editions_miroirs_tests_7694;
 #[cfg(test)]
 #[path = "scan_import_artistes_piste_tests_3179.rs"]
 mod artistes_piste_tests_3179;
+
+#[cfg(test)]
+#[path = "scan_import_artiste_garde_tests_6459.rs"]
+mod artiste_garde_tests_6459;
