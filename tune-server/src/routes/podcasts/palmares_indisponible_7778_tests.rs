@@ -33,7 +33,10 @@ async fn faux_apple_en_502() -> String {
 #[tokio::test]
 async fn un_palmares_apple_en_502_s_affiche_vide_avec_un_message_7778() {
     let base = faux_apple_en_502().await;
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let client = tune_core::http::client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
     let svc = PodcastService::with_apple_bases(client, &base, &base);
     // Pays propre au banc : le cache du palmarès est global au processus.
     let corps = match reponse_du_top(&svc, None, "zz", "fr").await {
