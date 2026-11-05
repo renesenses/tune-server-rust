@@ -320,6 +320,7 @@ async fn parcourir(
 ///
 /// Sans partage (`None`), c'est exactement [`lancer_passe`]. Rend la tâche et
 /// le nombre de logos inscrits (partage compris), pour les essais.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lancer_passe_web(
     web: Arc<CacheLogosLabels>,
     qobuz: Arc<CacheLogosLabels>,
