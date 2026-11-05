@@ -1679,7 +1679,7 @@ name = "pg_credits_4984"
 path = "tests/pg_credits_4984.rs"
 required-features = ["postgres"]
 
-# #7765 — la source des crédits de piste sur PostgreSQL : migration 101 et son
+# #7765 — la source des crédits de piste sur PostgreSQL : migration 102 et son
 # attribution, écriture MusicBrainz qui garde les balises, filtres « à faire ».
 [[test]]
 name = "pg_credits_source_7765"

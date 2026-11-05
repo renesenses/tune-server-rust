@@ -1,4 +1,4 @@
-//! #7765 — `track_credits.source` : la migration 136 et son attribution
+//! #7765 — `track_credits.source` : la migration 137 et son attribution
 //! unique, l'écriture MusicBrainz qui ne purge que ses lignes, l'import Roon
 //! qui complète une piste créditée par ses seules balises.
 //!
@@ -60,7 +60,7 @@ fn ligne(nom: &str) -> LigneCredit {
 
 /// Base ANCIENNE : `track_credits` sans `source`,
 /// avec trois crédits déjà écrits — un sur une piste importée de Roon, un
-/// pourvu d'un MBID d'artiste (passe MusicBrainz), un sans rien. La 136 les
+/// pourvu d'un MBID d'artiste (passe MusicBrainz), un sans rien. La 137 les
 /// attribue `roon`, `musicbrainz` et NULL, une seule fois.
 #[test]
 fn la_migration_136_pose_la_source_et_attribue_une_fois_les_lignes_existantes() {
@@ -76,7 +76,7 @@ fn la_migration_136_pose_la_source_et_attribue_une_fois_les_lignes_existantes() 
 
     // `track_credits` telle que la 107 la laissait (avec `artist_mbid`, sans
     // `source`) et `track_metadata` telle que la 34 la créait, remplies AVANT
-    // le schéma : toutes les migrations se jouent ensuite, la 136 comprise.
+    // le schéma : toutes les migrations se jouent ensuite, la 137 comprise.
     let ancienne = SqliteDb::open_in_memory().unwrap();
     ancienne
         .execute_batch(
@@ -107,7 +107,7 @@ fn la_migration_136_pose_la_source_et_attribue_une_fois_les_lignes_existantes() 
         !colonnes(&ancienne, "track_credits")
             .iter()
             .any(|c| c == "source"),
-        "le banc n'a pas reconstitué une base d'avant la 136"
+        "le banc n'a pas reconstitué une base d'avant la 137"
     );
     ancienne.init_schema().unwrap();
     run_migrations(&ancienne).unwrap();
@@ -115,7 +115,7 @@ fn la_migration_136_pose_la_source_et_attribue_une_fois_les_lignes_existantes() 
         colonnes(&ancienne, "track_credits")
             .iter()
             .any(|c| c == "source"),
-        "base ancienne : `track_credits.source` manque après la 136"
+        "base ancienne : `track_credits.source` manque après la 137"
     );
 
     let b: Arc<dyn DbBackend> = Arc::new(ancienne);
@@ -136,8 +136,8 @@ fn la_migration_136_pose_la_source_et_attribue_une_fois_les_lignes_existantes() 
         "piste 3 « Sans origine » : ni Roon ni MBID, la source reste inconnue"
     );
 
-    // La jumelle PG existe, est enregistrée au rang 101 et marque ce numéro.
-    let sql_pg = include_str!("../../migrations/postgres/101_credits_source.sql");
+    // La jumelle PG existe, est enregistrée au rang 102 et marque ce numéro.
+    let sql_pg = include_str!("../../migrations/postgres/102_credits_source.sql");
     // `PG_MIGRATIONS` n'existe que sous la fonctionnalité `postgres` : on lit
     // son entrée dans le source, blancs retirés, pour ne dépendre ni de la mise
     // en forme ni de la fonctionnalité.
@@ -147,11 +147,11 @@ fn la_migration_136_pose_la_source_et_attribue_une_fois_les_lignes_existantes() 
         .collect();
     assert!(
         migrations.contains(
-            "(101,\"credits_source\",include_str!(\"../../migrations/postgres/101_credits_source.sql\"),)"
+            "(102,\"credits_source\",include_str!(\"../../migrations/postgres/102_credits_source.sql\"),)"
         ),
-        "101_credits_source.sql n'est pas enregistrée au rang 101 dans PG_MIGRATIONS"
+        "102_credits_source.sql n'est pas enregistrée au rang 102 dans PG_MIGRATIONS"
     );
-    assert!(sql_pg.contains("VALUES (101, 'credits_source')"));
+    assert!(sql_pg.contains("VALUES (102, 'credits_source')"));
     for attendu in [
         "ADD COLUMN IF NOT EXISTS source TEXT",
         "ON track_credits(track_id, source)",
@@ -167,7 +167,7 @@ fn la_migration_136_pose_la_source_et_attribue_une_fois_les_lignes_existantes() 
 }
 
 /// Rejouée sur une base déjà à jour, la migration ne réattribue rien : une
-/// ligne NULL après la 136 le reste.
+/// ligne NULL après la 137 le reste.
 #[test]
 fn un_redemarrage_ne_reattribue_pas_les_sources() {
     let db = SqliteDb::open_in_memory().unwrap();

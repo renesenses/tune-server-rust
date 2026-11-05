@@ -1,10 +1,10 @@
--- 101_credits_source.sql
+-- 102_credits_source.sql
 --
 -- #7765 (lot 2, PR 1) : d'où vient un crédit de piste. `track_credits.source`
 -- vaut 'manuel', 'musicbrainz', 'balises', 'discogs' ou 'roon'. NULL : ligne
 -- ancienne, source inconnue. Chaque écrivain pose sa source et ne purge que
 -- ses lignes et les lignes NULL ; les passes « à faire » ignorent 'balises'.
--- Jumelle de la migration SQLite 136.
+-- Jumelle de la migration SQLite 137.
 --
 -- Attribution UNE fois des lignes existantes (décision du 03/11) : 'roon' si
 -- la piste porte `track_metadata.credits_source = 'roon'`, sinon
@@ -29,7 +29,7 @@ UPDATE track_credits SET source = CASE
     ELSE NULL END
     WHERE source IS NULL;
 
-INSERT INTO schema_version (version, name) VALUES (101, 'credits_source')
+INSERT INTO schema_version (version, name) VALUES (102, 'credits_source')
     ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

@@ -3,7 +3,7 @@
 //! Jumeau des témoins SQLite (`tune-core/src/metadata/credits_source_7765_tests.rs`
 //! et `tune-server/src/routes/library/credits.rs`) :
 //!
-//! - la migration 101 a posé `track_credits.source` et s'est inscrite ;
+//! - la migration 102 a posé `track_credits.source` et s'est inscrite ;
 //! - son attribution unique, rejouée telle qu'écrite dans le script mais
 //!   bornée aux pistes du banc, donne `roon`, `musicbrainz` ou NULL ;
 //! - l'écriture MusicBrainz (`ecrire_credits_piste`) laisse la ligne
@@ -30,7 +30,7 @@ use tune_server::state::AppState;
 const MARQUE: &str = "credits-source-7765";
 
 /// Le script de la jumelle PG, pour en rejouer l'attribution telle qu'écrite.
-const SCRIPT_101: &str = include_str!("../../tune-core/migrations/postgres/101_credits_source.sql");
+const SCRIPT_101: &str = include_str!("../../tune-core/migrations/postgres/102_credits_source.sql");
 
 fn url_pg() -> Option<String> {
     std::env::var("TUNE_TEST_PG_URL").ok()
@@ -121,7 +121,7 @@ async fn pg_7765_la_source_des_credits_attribuee_ecrite_et_filtree() {
     let b: &dyn DbBackend = state.backend.as_ref();
     menage(b);
 
-    // La migration 101 est jouée : colonne posée, version inscrite.
+    // La migration 102 est jouée : colonne posée, version inscrite.
     assert_eq!(
         entier(
             b,
@@ -130,16 +130,16 @@ async fn pg_7765_la_source_des_credits_attribuee_ecrite_et_filtree() {
             &[],
         ),
         1,
-        "`track_credits.source` manque sur PostgreSQL (migration 101)"
+        "`track_credits.source` manque sur PostgreSQL (migration 102)"
     );
     assert_eq!(
         entier(
             b,
-            "SELECT COUNT(*) FROM schema_version WHERE version = 101 AND name = 'credits_source'",
+            "SELECT COUNT(*) FROM schema_version WHERE version = 102 AND name = 'credits_source'",
             &[],
         ),
         1,
-        "schema_version n'inscrit pas la 101 `credits_source`"
+        "schema_version n'inscrit pas la 102 `credits_source`"
     );
 
     // Attribution unique : l'UPDATE du script, borné aux pistes du banc.
@@ -162,7 +162,7 @@ async fn pg_7765_la_source_des_credits_attribuee_ecrite_et_filtree() {
     credit(b, inconnue, "Inconnu", Some(""), None);
     let debut = SCRIPT_101
         .find("UPDATE track_credits")
-        .expect("UPDATE dans la 101");
+        .expect("UPDATE dans la 102");
     let fin = debut
         + SCRIPT_101[debut..]
             .find("WHERE source IS NULL;")
@@ -172,7 +172,7 @@ async fn pg_7765_la_source_des_credits_attribuee_ecrite_et_filtree() {
         &SCRIPT_101[debut..fin]
     );
     b.execute(&attribution, &[])
-        .unwrap_or_else(|e| panic!("attribution de la 101 sur PostgreSQL : {e}\n{attribution}"));
+        .unwrap_or_else(|e| panic!("attribution de la 102 sur PostgreSQL : {e}\n{attribution}"));
     assert_eq!(sources(b, roon)[0].1.as_deref(), Some(ROON), "piste Roon");
     assert_eq!(
         sources(b, mb)[0].1.as_deref(),
