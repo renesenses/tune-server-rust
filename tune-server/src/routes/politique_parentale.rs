@@ -17,7 +17,9 @@
 //! (une requête par clé primaire) ; sans politique, le corps de la réponse
 //! passe tel quel, sans être relu. Si la table manque (création échouée au
 //! démarrage), aucune politique ne peut exister : la liste passe, et l'écart
-//! est journalisé. Une politique présente mais illisible refuse la liste.
+//! est journalisé. Une politique présente mais illisible refuse la liste ;
+//! sa lecture rend 500, mais son superviseur peut encore la retirer (DELETE)
+//! ou la remplacer (PUT), la règle d'accès ne lisant pas son contenu.
 //!
 //! Le profil appelant est celui d'[`ActiveProfile`] : avec l'authentification
 //! active, celui du compte connecté.

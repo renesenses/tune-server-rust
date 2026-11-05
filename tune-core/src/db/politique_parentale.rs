@@ -229,15 +229,29 @@ pub fn retirer(
 /// Jamais le profil lui-même, ni un profil lui-même supervisé. Une politique
 /// existante appartient à son superviseur et aux administrateurs ; la
 /// première se pose par un administrateur, qui en devient le superviseur.
+///
+/// Ne lit que le superviseur, jamais le contenu : une politique illisible
+/// (contenu corrompu) reste retirable ou remplaçable par qui la gère.
 pub fn peut_gerer(db: &Arc<dyn DbBackend>, appelant: i64, cible: i64) -> Result<bool, String> {
-    if appelant == cible || lire(db, appelant)?.is_some() {
+    if appelant == cible || superviseur(db, appelant)?.is_some() {
         return Ok(false);
     }
     let admin = est_administrateur(db, appelant)?;
-    Ok(match lire(db, cible)? {
-        Some(p) => admin || p.superviseur_id == appelant,
+    Ok(match superviseur(db, cible)? {
+        Some(s) => admin || s == appelant,
         None => admin,
     })
+}
+
+/// Le superviseur de la politique d'un profil, ou `None` : profil non
+/// supervisé. Ne lit pas le contenu de la politique.
+pub fn superviseur(db: &Arc<dyn DbBackend>, profile_id: i64) -> Result<Option<i64>, String> {
+    Ok(db
+        .query_one_strong(
+            "SELECT superviseur_id FROM politiques_parentales WHERE profile_id = ?",
+            &[&profile_id as &dyn ToSqlValue],
+        )?
+        .map(|row| row.first().and_then(|v| v.as_i64()).unwrap_or(0)))
 }
 
 /// Le profil a le rôle administrateur. Un tel profil ne se place pas sous

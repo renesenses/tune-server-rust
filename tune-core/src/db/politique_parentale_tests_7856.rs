@@ -131,6 +131,24 @@ fn verifier(db: Arc<dyn DbBackend>) {
 
     assert_eq!(retirer(&db, ENFANT, 2).unwrap(), Ecriture::Faite(0));
     assert!(lire(&db, ENFANT).unwrap().is_none());
+
+    // Une politique illisible (contenu corrompu) reste gérable : son
+    // superviseur peut la retirer, le profil supervisé toujours pas.
+    db.execute(
+        "INSERT INTO politiques_parentales \
+         (profile_id, superviseur_id, revision, politique_json, maj_le) \
+         VALUES (?, ?, 1, '{corrompu', '')",
+        &[&AUTRE as &dyn ToSqlValue, &ADMIN],
+    )
+    .unwrap();
+    assert!(lire(&db, AUTRE).is_err(), "contenu illisible");
+    assert!(
+        peut_gerer(&db, ADMIN, AUTRE).unwrap(),
+        "une politique illisible reste gérable par son superviseur"
+    );
+    assert!(!peut_gerer(&db, AUTRE, AUTRE).unwrap());
+    assert_eq!(retirer(&db, AUTRE, 1).unwrap(), Ecriture::Faite(0));
+    assert!(lire(&db, AUTRE).unwrap().is_none());
 }
 
 fn sqlite() -> Arc<dyn DbBackend> {
