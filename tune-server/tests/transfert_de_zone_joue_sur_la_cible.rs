@@ -149,3 +149,94 @@ async fn le_transfert_envoie_la_lecture_a_l_appareil_cible() {
         Some("Canopée".to_string())
     );
 }
+
+// ─── #7852 : un transfert de zone ne compte qu'une écoute ───────────────────
+//
+// Par la vraie route `POST /zones/{source}/transfer/{cible}` : l'ordre de
+// `do_transfer` (cible lancée, écoute en attente déplacée, source arrêtée)
+// est celui qui compte. Le point de décision du sondeur est consulté à la
+// main, comme le ferait un tour.
+
+fn ecoutes(state: &AppState) -> i64 {
+    state
+        .backend
+        .query_one("SELECT COUNT(*) FROM listen_history", &[])
+        .unwrap()
+        .unwrap()[0]
+        .as_i64()
+        .unwrap()
+}
+
+/// Un tour du sondeur sur la zone, la position posée à `position_ms`.
+async fn tour_a(state: &AppState, zone: i64, position_ms: i64) -> bool {
+    state.playback.update_position(zone, position_ms).await;
+    let etat = state.playback.get_state(zone).await;
+    state.orchestrator.valider_l_ecoute(&etat)
+}
+
+#[tokio::test]
+async fn transfert_avant_le_seuil_une_seule_ecoute_validee_sur_la_cible_7852() {
+    let (app, state, source, cible, _dir) = deux_zones_dont_une_joue().await;
+    assert!(
+        state.orchestrator.ecoute_en_attente(source),
+        "témoin : le lancement arme l'écoute de la source"
+    );
+    assert_eq!(ecoutes(&state), 0, "rien n'est écrit avant le seuil");
+
+    let (status, corps) = poster(
+        &app,
+        &format!("/api/v1/zones/{source}/transfer/{cible}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "transfert : {corps}");
+    assert!(
+        !state.orchestrator.ecoute_en_attente(source),
+        "#7852 : l'écoute en attente doit quitter la zone d'origine"
+    );
+    assert!(
+        state.orchestrator.ecoute_en_attente(cible),
+        "#7852 : l'écoute en attente doit suivre le titre sur la cible"
+    );
+    assert_eq!(ecoutes(&state), 0);
+
+    assert!(
+        tour_a(&state, cible, 31_000).await,
+        "la cible valide au seuil"
+    );
+    assert!(!tour_a(&state, cible, 45_000).await);
+    assert!(!tour_a(&state, source, 45_000).await);
+    assert_eq!(
+        ecoutes(&state),
+        1,
+        "#7852 : un titre transféré avant le seuil compte une seule écoute"
+    );
+}
+
+#[tokio::test]
+async fn transfert_apres_le_seuil_rien_n_est_reecrit_sur_la_cible_7852() {
+    let (app, state, source, cible, _dir) = deux_zones_dont_une_joue().await;
+    assert!(
+        tour_a(&state, source, 31_000).await,
+        "la source valide au seuil"
+    );
+    assert_eq!(ecoutes(&state), 1);
+
+    let (status, corps) = poster(
+        &app,
+        &format!("/api/v1/zones/{source}/transfer/{cible}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "transfert : {corps}");
+    assert!(
+        !state.orchestrator.ecoute_en_attente(cible),
+        "#7852 : une écoute déjà validée ne se réarme pas sur la cible"
+    );
+    assert!(!tour_a(&state, cible, 60_000).await);
+    assert_eq!(
+        ecoutes(&state),
+        1,
+        "#7852 : un titre transféré après le seuil ne compte pas deux fois"
+    );
+}
