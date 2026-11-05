@@ -29,6 +29,8 @@ async fn demon_dont_le_recepteur_avance(output: &Airplay2Output) -> Arc<Mutex<Ve
         child: None,
         stdin: Box::new(server_stdin),
     });
+    // Un daemon de banc deja relie au recepteur (#7441).
+    *output.pairing.lock().await = PairingPhase::Connected;
     output.start_event_reader(BufReader::new(server_stdout));
 
     let commandes = Arc::new(Mutex::new(Vec::new()));

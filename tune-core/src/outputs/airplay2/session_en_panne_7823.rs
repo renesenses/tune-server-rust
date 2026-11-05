@@ -24,7 +24,9 @@ use super::Airplay2Output;
 
 /// Les erreurs du daemon (`airplay-daemon`, commandes `connect` et `play`)
 /// qui disent qu'aucune session ne joue. `pause failed` ou `resume failed`
-/// n'en sont pas : la session peut encore exister.
+/// n'en sont pas : la session peut encore exister. Une connexion fermée
+/// pendant la pause (« Broken pipe ») se rouvre, elle : voir
+/// `reprise_apres_coupure_7921`.
 pub(super) fn casse_la_session(message: &str) -> bool {
     [
         "setup failed",
@@ -57,7 +59,7 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::sync::Mutex;
 
-    use super::super::{Airplay2Output, DaemonProcess};
+    use super::super::{Airplay2Output, DaemonProcess, PairingPhase};
     use crate::outputs::traits::{OutputTarget, PlayMedia, TransportState};
 
     fn recepteur() -> Airplay2Output {
@@ -93,6 +95,8 @@ mod tests {
             child: None,
             stdin: Box::new(server_stdin),
         });
+        // Un daemon de banc deja relie au recepteur (#7441).
+        *sortie.pairing.lock().await = PairingPhase::Connected;
         sortie.start_event_reader(BufReader::new(server_stdout));
 
         let recues = Arc::new(Mutex::new(Vec::new()));
@@ -150,7 +154,10 @@ mod tests {
         })
         .await;
 
-        sortie.play_media(&piste()).await.unwrap();
+        // #7441 — `play` attend le verdict du daemon : le setup échoué est
+        // rendu par `play_media` lui-même.
+        let erreur = sortie.play_media(&piste()).await.unwrap_err();
+        assert!(erreur.contains("setup failed"), "{erreur}");
         assert_eq!(
             etat_apres_le_play(&sortie).await,
             TransportState::Stopped,
@@ -219,7 +226,7 @@ mod tests {
         })
         .await;
 
-        sortie.play_media(&piste()).await.unwrap();
+        assert!(sortie.play_media(&piste()).await.is_err());
         assert_eq!(etat_apres_le_play(&sortie).await, TransportState::Stopped);
         assert!(sortie.pause().await.is_err());
 
