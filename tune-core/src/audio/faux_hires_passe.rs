@@ -195,7 +195,11 @@ pub fn mesurer_un_fichier(chemin: &str, duree_ms: i64) -> Result<Mesure, String>
     let Some((_, premier)) = decodees.first() else {
         return Err(premiere_erreur.unwrap_or_else(|| "aucune tranche décodée".into()));
     };
-    let (canaux, sample_rate, bits) = (premier.channels, premier.sample_rate, premier.bit_depth as u32);
+    let (canaux, sample_rate, bits) = (
+        premier.channels,
+        premier.sample_rate,
+        premier.bit_depth as u32,
+    );
     let tranches: Vec<(f64, &[i32])> = decodees
         .iter()
         .filter(|(_, pcm)| pcm.channels == canaux && pcm.sample_rate == sample_rate)

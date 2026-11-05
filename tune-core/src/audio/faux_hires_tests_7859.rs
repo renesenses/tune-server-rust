@@ -82,7 +82,10 @@ fn une_coupure_sur_un_tiers_du_morceau_est_detectee_7859() {
         m.part_coupee()
     );
     let f = m.coupure_hz.expect("la coupure retenue");
-    assert!((f - 20_000.0).abs() < 400.0, "coupure retenue {f:.0} Hz : {m:?}");
+    assert!(
+        (f - 20_000.0).abs() < 400.0,
+        "coupure retenue {f:.0} Hz : {m:?}"
+    );
     // Les fenêtres en cause sont celles du dernier tiers, et seulement elles.
     let debut_du_tiers = 2.0 * SEGMENT as f64 / 96_000.0;
     let trame_s = TAILLE_FFT as f64 / 96_000.0;
@@ -107,7 +110,10 @@ fn quelques_fenetres_coupees_ne_suffisent_pas_7859() {
         .collect();
     segments.insert(4, (rose(96_000, 20_000.0, 40), 0.0));
     let m = mesurer(&quantifier(&bout_a_bout(&segments), 24), 1, 96_000, 24);
-    assert!(m.part_coupee() > 0.0 && m.part_coupee() < PART_COUPEE_MIN, "{m:?}");
+    assert!(
+        m.part_coupee() > 0.0 && m.part_coupee() < PART_COUPEE_MIN,
+        "{m:?}"
+    );
     assert_eq!(juger(&m), Verdict::Verifie, "{m:?}");
 }
 
@@ -176,8 +182,19 @@ fn les_fenetres_sont_reparties_sur_toute_la_duree_7859() {
 fn les_fenetres_en_cause_portent_leur_position_dans_le_morceau_7859() {
     let pleine = quantifier(&rose(96_000, 47_000.0, 71), 24);
     let coupee = quantifier(&rose(96_000, 20_000.0, 72), 24);
-    let m = mesurer_des_tranches(&[(0.0, pleine.as_slice()), (120.0, coupee.as_slice())], 1, 96_000, 24);
-    assert!(matches!(juger(&m), Verdict::Douteux(Raison::BandeDeCd { .. })), "{m:?}");
-    assert!(m.fenetres_coupees.iter().all(|c| c.debut_s >= 120.0), "{m:?}");
+    let m = mesurer_des_tranches(
+        &[(0.0, pleine.as_slice()), (120.0, coupee.as_slice())],
+        1,
+        96_000,
+        24,
+    );
+    assert!(
+        matches!(juger(&m), Verdict::Douteux(Raison::BandeDeCd { .. })),
+        "{m:?}"
+    );
+    assert!(
+        m.fenetres_coupees.iter().all(|c| c.debut_s >= 120.0),
+        "{m:?}"
+    );
     assert!(m.fenetres_jugees as usize <= FENETRES_MAX);
 }

@@ -245,7 +245,11 @@ fn fenetres(trames: usize, max: usize) -> Vec<Range<usize>> {
     let n = (trames / largeur).clamp(1, max);
     (0..n)
         .map(|w| {
-            let debut = if n == 1 { 0 } else { w * (trames - largeur) / (n - 1) };
+            let debut = if n == 1 {
+                0
+            } else {
+                w * (trames - largeur) / (n - 1)
+            };
             debut..debut + largeur
         })
         .collect()
@@ -435,9 +439,19 @@ pub(crate) fn coupure_du_spectre_moyen(
     bits_declares: u32,
 ) -> Option<f64> {
     let un_seul = |trames: usize, _max: usize| {
-        if trames == 0 { Vec::new() } else { vec![0..trames] }
+        if trames == 0 {
+            Vec::new()
+        } else {
+            vec![0..trames]
+        }
     };
-    let m = mesurer_selon(&[(0.0, echantillons)], canaux, sample_rate, bits_declares, un_seul);
+    let m = mesurer_selon(
+        &[(0.0, echantillons)],
+        canaux,
+        sample_rate,
+        bits_declares,
+        un_seul,
+    );
     m.fenetres_coupees
         .first()
         .map(|c| c.coupure_hz)

@@ -209,10 +209,10 @@ async fn un_lot_range_les_verdicts_des_vrais_fichiers_6285() {
 }
 
 /// 🔴 #7859 — de bout en bout, sur toute la durée : un 24/96 de 72 s dont
-/// les 48 premières secondes montent à 47 kHz et les 24 dernières sont
-/// coupées à 20 kHz. L'ancienne passe ne décodait que 30 s à partir de 30 s ;
-/// les tranches couvrent tout le morceau, et la ligne rangée garde les
-/// colonnes de `hires_verifications` (verdict, raison, coupure, bits).
+/// les 24 premières secondes sont coupées à 20 kHz et le reste monte à
+/// 47 kHz. L'ancienne passe ne décodait que 30 s à partir de 30 s, en pleine
+/// bande ; les tranches couvrent tout le morceau, et la ligne rangée garde
+/// les colonnes de `hires_verifications` (verdict, raison, coupure, bits).
 #[tokio::test]
 async fn la_passe_mesure_toute_la_duree_et_range_dans_la_meme_table_7859() {
     let db = base();
@@ -220,26 +220,25 @@ async fn la_passe_mesure_toute_la_duree_et_range_dans_la_meme_table_7859() {
     let pleine = quantifier(&rose(96_000, 47_000.0, 81), 24);
     let coupee = quantifier(&rose(96_000, 20_000.0, 82), 24);
     let total = 72 * 96_000;
-    let bascule = 48 * 96_000;
+    let bascule = 24 * 96_000;
     let pcm: Vec<i32> = (0..total)
         .map(|i| {
-            let source = if i < bascule { &pleine } else { &coupee };
+            let source = if i < bascule { &coupee } else { &pleine };
             source[i % source.len()]
         })
         .collect();
-    let chemin = dossier.join("coupe_a_la_fin.wav");
+    let chemin = dossier.join("coupe_au_debut.wav");
     wav_24(&chemin, 96_000, &pcm);
     piste(&db, 1, &chemin.to_string_lossy(), "wav", "local");
     db.execute("UPDATE tracks SET duration_ms = 72000 WHERE id = 1", &[])
         .unwrap();
 
-    let tranches = tranches_a_decoder(72_000);
-    assert_eq!(tranches.len(), TRANCHES);
-    assert!(tranches[0].0 < 6.0 && tranches[TRANCHES - 1].0 + TRANCHE_S > 66.0, "{tranches:?}");
-
     let debut = std::time::Instant::now();
     assert_eq!(un_lot(&db, 1).await, 1);
-    eprintln!("faux_hires_7859 : 72 s en 24/96 mesurées en {:?}", debut.elapsed());
+    eprintln!(
+        "faux_hires_7859 : 72 s en 24/96 mesurées en {:?}",
+        debut.elapsed()
+    );
     let r = db
         .query_one(
             "SELECT verdict, raison, coupure_hz, bits_effectifs, sample_rate, bits_declares \
@@ -248,7 +247,11 @@ async fn la_passe_mesure_toute_la_duree_et_range_dans_la_meme_table_7859() {
         )
         .unwrap()
         .unwrap();
-    assert_eq!(r[0].as_string().as_deref(), Some("douteux"), "{r:?}");
+    assert_eq!(
+        r[0].as_string().as_deref(),
+        Some("douteux"),
+        "les 24 premières secondes sont coupées à 20 kHz : la passe doit les voir — {r:?}"
+    );
     assert_eq!(r[1].as_string().as_deref(), Some("bande_de_cd"), "{r:?}");
     let f = r[2].as_f64().unwrap();
     assert!((f - 20_000.0).abs() < 400.0, "coupure rangée {f}");
@@ -256,10 +259,16 @@ async fn la_passe_mesure_toute_la_duree_et_range_dans_la_meme_table_7859() {
     assert_eq!(r[4].as_i64(), Some(96_000));
     assert_eq!(r[5].as_i64(), Some(24));
 
-    // Le détail par fenêtres : les fenêtres en cause sont toutes après 48 s.
+    // Le détail par fenêtres : les fenêtres en cause sont toutes avant 24 s.
     let m = mesurer_un_fichier(&chemin.to_string_lossy(), 72_000).unwrap();
     assert!(!m.fenetres_coupees.is_empty(), "{m:?}");
-    assert!(m.fenetres_coupees.iter().all(|c| c.fin_s > 48.0), "{m:?}");
+    assert!(m.fenetres_coupees.iter().all(|c| c.debut_s < 24.0), "{m:?}");
+    let tranches = tranches_a_decoder(72_000);
+    assert_eq!(tranches.len(), TRANCHES);
+    assert!(
+        tranches[0].0 < 6.0 && tranches[TRANCHES - 1].0 + TRANCHE_S > 66.0,
+        "{tranches:?}"
+    );
 }
 
 /// #7859 — MESURE, pas un témoin : le temps d'analyse d'un morceau de 5 min
@@ -271,7 +280,9 @@ async fn la_passe_mesure_toute_la_duree_et_range_dans_la_meme_table_7859() {
 fn temps_d_analyse_7859() {
     let dossier = crate::test_scratch::scratch_dir("faux-hires-7859-temps");
     let segment = quantifier(&rose(96_000, 47_000.0, 91), 24);
-    let pcm: Vec<i32> = (0..300 * 96_000).map(|i| segment[i % segment.len()]).collect();
+    let pcm: Vec<i32> = (0..300 * 96_000)
+        .map(|i| segment[i % segment.len()])
+        .collect();
     let chemin = dossier.join("cinq_minutes.wav");
     wav_24(&chemin, 96_000, &pcm);
     let chemin = chemin.to_string_lossy().to_string();
@@ -292,7 +303,10 @@ fn temps_d_analyse_7859() {
     eprintln!(
         "faux_hires_7859 temps : avant (30 s, spectre moyen) {duree_avant:?} -> {avant:?} ; \
          après ({} tranches de {} s, {} fenêtres) {duree_apres:?} -> {:?}",
-        TRANCHES, TRANCHE_S, m.fenetres_jugees, juger(&m)
+        TRANCHES,
+        TRANCHE_S,
+        m.fenetres_jugees,
+        juger(&m)
     );
 }
 
@@ -300,8 +314,14 @@ fn temps_d_analyse_7859() {
 /// le début.
 #[test]
 fn une_piste_courte_se_decode_en_une_tranche_7859() {
-    assert_eq!(tranches_a_decoder(0), vec![(0.0, TRANCHES as f64 * TRANCHE_S)]);
-    assert_eq!(tranches_a_decoder(45_000), vec![(0.0, TRANCHES as f64 * TRANCHE_S)]);
+    assert_eq!(
+        tranches_a_decoder(0),
+        vec![(0.0, TRANCHES as f64 * TRANCHE_S)]
+    );
+    assert_eq!(
+        tranches_a_decoder(45_000),
+        vec![(0.0, TRANCHES as f64 * TRANCHE_S)]
+    );
     let longue = tranches_a_decoder(300_000);
     assert_eq!(longue.len(), TRANCHES);
     assert!(longue.iter().all(|&(d, l)| d >= 0.0 && d + l <= 300.0));
