@@ -2336,6 +2336,9 @@ fn lignes_zones_masquees(
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
+    tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
+        state.backend.clone(),
+    ));
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
@@ -3330,6 +3333,11 @@ async fn envoyer_le_rapport(
 
     // The site caps the body at 50k chars. On retire les lignes de journal les
     // plus ANCIENNES (#7468) : le défaut est dans les dernières minutes.
+    // Le diagnostic est déjà nettoyé (`generate_bug_report`). Les mots du
+    // testeur, le résumé joint et le titre passent par la porte commune des
+    // identifiants d'accès distant : un lien ou un journal collé y passe aussi.
+    let full_markdown = tune_core::confidentialite::masquer_acces_distant(&full_markdown);
+    let title = tune_core::confidentialite::masquer_acces_distant(&title);
     let body_md = couper_le_rapport(&full_markdown, BUG_REPORT_MAX_BODY_CHARS);
 
     let instance_id = tune_core::db::settings_repo::SettingsRepo::with_backend(backend)
@@ -3785,6 +3793,11 @@ pub(super) async fn api_docs() -> Json<Value> {
         ("POST", "/system/import/roon", "Import from Roon"),
         ("POST", "/system/import/jriver", "Import from JRiver XML"),
         ("POST", "/system/import/plex", "Import from Plex"),
+        (
+            "POST",
+            "/system/import/m3u-plays",
+            "Add N plays to every track of an m3u list (?plays=N, ?preview=true)",
+        ),
         // Library
         (
             "GET",

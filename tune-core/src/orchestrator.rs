@@ -1292,6 +1292,11 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     annonces_navigateur: std::sync::Mutex<HashMap<i64, AnnonceNavigateurDifferee>>,
+    /// #7852 — l'écoute armée au démarrage du titre de chaque zone, écrite
+    /// par le sondeur au seuil min(30 s, 50 %). Voir `ecoute_validee_7852`.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    ecoutes_en_attente: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEnAttente>>,
     /// #6066 — ce que les LECTEURS des zones navigateur ont dit de leur
     /// lecture (`POST /zones/{id}/browser-playing`). Voir
     /// `confirmation_navigateur_6066`.
@@ -1587,6 +1592,10 @@ struct StreamingDsp {
     /// #4407 — le poste où la route dépose un nouvel égaliseur, relevé au
     /// bloc suivant (voir [`eq_en_vol::EqEnVol`]). `None` : aucun.
     en_vol: Option<std::sync::Arc<eq_en_vol::EqEnVol>>,
+    /// #7642 — trames de l'amorce de latence du convolveur encore à retirer
+    /// du flux ([`Self::process_flux`]). `None` tant que le flux n'a pas
+    /// commencé : la première trame est armée à `latency_frames()`.
+    convolveur_reste_a_jeter: Option<usize>,
 }
 
 impl StreamingDsp {
@@ -1686,6 +1695,11 @@ impl StreamingDsp {
         if let Some(conv) = self.convolver.as_mut() {
             conv.process_pcm(pcm, bit_depth);
         }
+        self.etages_apres_convolveur(pcm, bit_depth);
+    }
+
+    /// Les étages qui suivent le convolveur, dans l'ordre de [`Self::process`].
+    fn etages_apres_convolveur(&mut self, pcm: &mut [u8], bit_depth: u16) {
         // Le crossfeed en DERNIER, comme sur la sortie locale, où il est
         // appliqué après le convolveur (`local.rs`) : il élargit ou resserre
         // l'image d'un signal déjà corrigé, il ne corrige pas.
@@ -1697,6 +1711,53 @@ impl StreamingDsp {
         if let Some(comp) = self.compensation.as_mut() {
             comp.process_pcm(pcm, bit_depth);
         }
+    }
+
+    /// #7642 — [`Self::process`] pour un flux livré en tampons SUCCESSIFS
+    /// (relais du bras progressif).
+    ///
+    /// `process` convient à un appel unique sur la piste entière (bras DASH
+    /// et HTTPS) ; enchaîné tampon après tampon, son convolveur, traité comme
+    /// une piste entière à chaque appel, coupait la queue de l'IR à chaque
+    /// frontière (voir `Convolver::process_pcm_en_flux`). Ici le convolveur
+    /// garde son état d'un tampon à l'autre ; le tampon peut raccourcir au
+    /// début du flux, et [`Self::terminer_flux`] rend la fin retenue. Sans
+    /// convolveur, identique à `process` octet pour octet.
+    fn process_flux(&mut self, pcm: &mut Vec<u8>, bit_depth: u16) {
+        let Some(conv) = self.convolver.as_mut() else {
+            self.process(pcm, bit_depth);
+            return;
+        };
+        let reste = self
+            .convolveur_reste_a_jeter
+            .get_or_insert_with(|| conv.latency_frames());
+        // Les étages d'avant le convolveur, dans l'ordre de `process`.
+        if let Some(poste) = self.en_vol.as_ref() {
+            poste.relever(&mut self.eq, self.sample_rate, self.channels);
+        }
+        if let Some(factor) = self.replaygain {
+            crate::audio::replaygain::apply_gain_pcm(pcm, bit_depth, factor);
+        }
+        if let Some(eq) = self.eq.as_mut() {
+            eq.process_pcm(pcm, bit_depth);
+        }
+        conv.process_pcm_en_flux(pcm, bit_depth, reste);
+        self.etages_apres_convolveur(pcm, bit_depth);
+    }
+
+    /// #7642 — fin du flux de [`Self::process_flux`] : les trames que la
+    /// latence du convolveur retenait encore, passées par les étages qui le
+    /// suivent. Vide sans convolveur.
+    fn terminer_flux(&mut self, bit_depth: u16) -> Vec<u8> {
+        let Some(conv) = self.convolver.as_mut() else {
+            return Vec::new();
+        };
+        let reste = self
+            .convolveur_reste_a_jeter
+            .get_or_insert_with(|| conv.latency_frames());
+        let mut queue = conv.terminer_pcm_en_flux(bit_depth, reste);
+        self.etages_apres_convolveur(&mut queue, bit_depth);
+        queue
     }
 }
 
@@ -1726,14 +1787,29 @@ fn spawn_streaming_dsp_relay(
     let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     tokio::spawn(async move {
         let mut header_pending = skip_header;
+        let mut complet = true;
         while let Some(mut chunk) = up_rx.recv().await {
             if header_pending {
                 header_pending = false;
             } else {
-                dsp.process(&mut chunk, bit_depth);
+                // #7642 — tampons SUCCESSIFS d'un même flux : l'état du
+                // convolveur doit passer d'un tampon à l'autre.
+                dsp.process_flux(&mut chunk, bit_depth);
+                if chunk.is_empty() {
+                    // Tout le tampon était l'amorce de latence du convolveur.
+                    continue;
+                }
             }
             if downstream.send(chunk).await.is_err() {
+                complet = false;
                 break;
+            }
+        }
+        // Fin du flux amont : rendre ce que le convolveur retenait encore.
+        if complet && !header_pending {
+            let queue = dsp.terminer_flux(bit_depth);
+            if !queue.is_empty() {
+                let _ = downstream.send(queue).await;
             }
         }
     });
@@ -1779,6 +1855,7 @@ impl PlaybackOrchestrator {
             eq_en_vol_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
+            ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
             confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
@@ -1850,6 +1927,9 @@ impl PlaybackOrchestrator {
 
 mod commun;
 mod confirmation_navigateur_6066;
+pub mod ecoute_validee_7852;
+#[cfg(test)]
+mod ecoute_validee_7852_tests;
 pub use confirmation_navigateur_6066::SignalDuLecteur;
 
 /// #4598 — ré-énumérer le parc local avant de refuser une zone locale.
@@ -1887,6 +1967,8 @@ mod crossfeed_bibliotheque_reseau;
 // #5071 — témoins de bout en bout de la compensation de niveau réseau.
 #[cfg(test)]
 mod compensation_reseau_5071_tests;
+#[cfg(test)]
+mod convolveur_en_flux_7642_tests;
 
 // #4354 — repli à 176,4 kHz d'un DSD décimé qui manque son pré-tampon.
 #[cfg(test)]
@@ -1913,6 +1995,9 @@ mod dsp;
 mod volume_coalescent;
 #[cfg(test)]
 mod volume_coalescent_5662_tests;
+// #7633 — le volume OpenHome n'attend plus le relevé du sondeur.
+#[cfg(test)]
+mod volume_openhome_sans_attendre_7633_tests;
 pub use dsp::PorteeDuReglage;
 // #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
 #[cfg(test)]
@@ -1935,6 +2020,10 @@ mod eq_en_vol_4407_tests;
 // bibliothèque native de test.
 #[cfg(test)]
 mod greffon_natif_tiers_tests;
+// #7616 — un étage tiers sur zone RÉSEAU : relais `StreamingDsp` et
+// ré-encodage des pistes de la bibliothèque (#2742, cas 1 à 3).
+#[cfg(test)]
+mod greffon_natif_tiers_reseau_7616_tests;
 // #6780 — PURE contourne aussi la réaffectation des canaux armée de la zone.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_6780_tests;
@@ -1946,6 +2035,9 @@ mod purge_greffon_tiers_6256_tests;
 // enregistrés, dans l'état que la vraie bascule produit.
 #[cfg(all(test, feature = "local-audio"))]
 mod verdict_pure_reglages_6522_tests;
+// #7632 — la convolution par RI est un droit Premium (RoomCorrection).
+#[cfg(test)]
+mod convolution_sous_licence_7632_tests;
 
 /// Fil 2062 / #5550 — durée d'une piste UPnP lue dans les en-têtes du flux.
 mod duree_du_flux_2062;

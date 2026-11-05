@@ -8,6 +8,19 @@ use std::sync::Arc;
 
 pub const REWIND_KEY: &str = "continue_listening_rewind_seconds";
 pub const DEFAULT_REWIND: u64 = 10;
+/// #7840 — recul maximal (décision du 04/11) : au-delà, la reprise d'un
+/// épisode ferait réentendre une minute ou plus de ce qui vient d'être écouté.
+pub const REWIND_MAX: u64 = 60;
+
+/// Recul réellement appliqué pour la valeur enregistrée du réglage : 10 s si
+/// elle est absente ou illisible, ramenée à 60 s si elle a été enregistrée
+/// au-dessus (l'ancienne borne acceptait jusqu'à 300 s).
+pub fn effective_rewind(stored: Option<&str>) -> u64 {
+    stored
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REWIND)
+        .min(REWIND_MAX)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resume {
@@ -280,7 +293,7 @@ pub fn mark_current_shuffled(db: &Arc<dyn DbBackend>, zone_id: i64) -> Result<()
 }
 
 pub fn rewind(position_ms: i64, seconds: u64) -> u64 {
-    (position_ms.max(0) as u64).saturating_sub(seconds.min(300) * 1000)
+    (position_ms.max(0) as u64).saturating_sub(seconds.min(REWIND_MAX) * 1000)
 }
 
 /// Ne met à jour qu'un titre seul réellement démarré et encore courant.

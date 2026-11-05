@@ -10,6 +10,8 @@ pub mod autoeq;
 pub mod autoeq_base;
 pub mod canaux_declares;
 pub mod canaux_reseau_4573;
+/// #6385 — les profils d'égaliseur OPRA (JSON), lus vers le même modèle.
+pub mod opra;
 
 pub mod bitperfect_strict;
 /// #4969 — la carte des canaux de SORTIE (réaffectation, disposition,
@@ -141,6 +143,8 @@ pub mod sacd;
 mod sacd_lecture_5297_tests;
 /// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
 pub mod soft_mute;
+/// Le spectrogramme d'une piste en PNG, calculé sur le PCM décodé (#7857).
+pub mod spectrogramme;
 pub mod staged_growth;
 pub mod support;
 pub mod tap;

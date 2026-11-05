@@ -662,6 +662,13 @@ pub mod sql {
         "SELECT a.id, a.title, ar.name FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.bio IS NULL OR a.bio = '') AND a.source = 'local' ORDER BY a.id"
     }
 
+    /// Écran « État du serveur » (01/11/2026) : les albums LOCAUX et ceux
+    /// d'entre eux sans pochette, en une lecture. Même filtre que
+    /// [`list_without_cover`] : les deux nombres ne divergent pas.
+    pub fn compter_pochettes_locales() -> &'static str {
+        "SELECT COUNT(*), COUNT(CASE WHEN a.cover_path IS NULL OR a.cover_path = '' THEN 1 END) FROM albums a WHERE a.source = 'local'"
+    }
+
     pub fn count_with_bio() -> &'static str {
         "SELECT COUNT(*) FROM albums WHERE bio IS NOT NULL AND bio != ''"
     }
@@ -3092,6 +3099,18 @@ impl AlbumRepo {
         }
     }
 
+    /// `(albums locaux, albums locaux sans pochette)` — voir
+    /// [`sql::compter_pochettes_locales`].
+    pub fn compter_pochettes_locales(&self) -> Result<(i64, i64), TuneError> {
+        match self.db.query_one(sql::compter_pochettes_locales(), &[])? {
+            None => Ok((0, 0)),
+            Some(cols) => Ok((
+                cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+            )),
+        }
+    }
+
     pub fn count_with_bio(&self) -> Result<i64, TuneError> {
         match self.db.query_one(sql::count_with_bio(), &[])? {
             None => Ok(0),
@@ -3738,6 +3757,37 @@ impl AlbumRepo {
         Ok(par_id)
     }
 
+    /// #7725 — le plus grand nombre de canaux des pistes de chaque album de
+    /// `ids`, en une requête groupée par paquet. Un album absent de la table
+    /// rendue n'a aucune piste dont le nombre de canaux soit connu.
+    pub fn canaux_max_par_album(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, i64>, TuneError> {
+        let mut par_id = std::collections::HashMap::new();
+        for chunk in ids.chunks(5000) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT album_id, MAX(channels) FROM tracks \
+                  WHERE album_id IN ({id_list}) AND channels IS NOT NULL \
+                  GROUP BY album_id"
+            );
+            for row in &self.db.query_many(&sql, &[])? {
+                if let (Some(id), Some(n)) = (
+                    row.first().and_then(|v| v.as_i64()),
+                    row.get(1).and_then(|v| v.as_i64()),
+                ) {
+                    par_id.insert(id, n);
+                }
+            }
+        }
+        Ok(par_id)
+    }
+
     /// Module de l'arithmetique du tri aleatoire : 2^31 - 1, premier de
     /// Mersenne.
     ///
@@ -4164,7 +4214,10 @@ impl AlbumRepo {
         // de `Album::quality()`, sur les mêmes champs d'album. Avant, `hires`
         // gardait tout album dont UNE piste dépassait 44,1 kHz (DSD compris)
         // et `cd` exigeait 44,1 kHz / 16 bits pile.
-        if let Some(pred) = quality.and_then(|q| Album::quality_sql(q, "a")) {
+        // #7725 : Multicanal se lit sur les pistes, l'album n'a pas de canaux.
+        if quality == Some(Album::QUALITE_MULTICANAL) {
+            wheres.push(Album::multicanal_sql_album("a"));
+        } else if let Some(pred) = quality.and_then(|q| Album::quality_sql(q, "a")) {
             wheres.push(pred);
         }
         // `COALESCE` : une base migrée depuis SQLite peut porter des NULL, et

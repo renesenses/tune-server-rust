@@ -226,6 +226,15 @@ const MIGRATION_TABLES: &[&str] = &[
 const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Reprises (#7280), créées par le script 100 : conserver leur file et position.
     "listening_resumes",
+    // Écoutes importées (#7763, script 101) : sans cette ligne, les écoutes
+    // reportées de Roon, Plex ou d'une liste m3u seraient perdues à la bascule.
+    "imported_plays",
+    // Notes personnelles (#7849), créées par le script 103. Le script en
+    // reprend les notes d'album ; la copie, qui suit, n'écrase pas.
+    "notes_personnelles",
+    // Clés des clients Subsonic (#7855, script 104) : sans cette ligne, chaque
+    // client devrait être réappairé après la bascule.
+    "cles_clients",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",
@@ -442,7 +451,8 @@ CREATE TABLE IF NOT EXISTS track_credits (
     role TEXT DEFAULT 'performer',
     instrument TEXT,
     position TEXT DEFAULT 0,
-    artist_mbid TEXT
+    artist_mbid TEXT,
+    source TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_metadata (
@@ -1255,6 +1265,11 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_type TEXT;
 ALTER TABLE track_credits ADD COLUMN IF NOT EXISTS artist_mbid TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS credits_mb_at TEXT;
 
+-- Source d'un crédit de piste (SQLite migration v136, #7765) : manuel,
+-- musicbrainz, balises, discogs ou roon ; NUL = ligne ancienne. Tous les
+-- écrivains de crédits et les passes « à faire » NOMMENT cette colonne.
+ALTER TABLE track_credits ADD COLUMN IF NOT EXISTS source TEXT;
+
 -- Source de la pochette d'album (SQLite migration v111, #5034). Sans défaut :
 -- NUL = inconnue, l'état de toute ligne d'avant la migration.
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS cover_source TEXT;
@@ -1793,6 +1808,7 @@ fn conflict_clause(table: &str) -> &'static str {
     match table {
         "settings" => "ON CONFLICT (key) DO NOTHING",
         "listening_resumes" => "ON CONFLICT (zone_id, context_type, context_id, source) DO NOTHING",
+        "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "track_metadata" => "ON CONFLICT (track_id, key) DO NOTHING",
         "album_metadata" => "ON CONFLICT (album_id, key) DO NOTHING",
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",
@@ -1837,6 +1853,8 @@ fn conflict_clause(table: &str) -> &'static str {
         "track_audio_embedding" => "ON CONFLICT (track_id) DO NOTHING",
         // Pas de colonne `id` : la clef est le quadruplet (#6682).
         "radio_ecoutes" => "ON CONFLICT (jour, station_url, zone_id, profile_id) DO NOTHING",
+        // Pas de colonne `id` : la clef primaire est la piste (#7763).
+        "imported_plays" => "ON CONFLICT (track_id) DO NOTHING",
         // For tables with BIGSERIAL PK, conflict on id
         _ => "ON CONFLICT (id) DO NOTHING",
     }
@@ -2441,8 +2459,16 @@ mod tests {
                 .fetch_one(&mut c)
                 .await
                 .unwrap();
+            // Le dernier script embarqué, et non un numéro en dur : chaque
+            // nouvelle migration PostgreSQL cassait sinon ce témoin (#7763).
+            let derniere = crate::db::migrations::PG_MIGRATIONS
+                .iter()
+                .map(|(v, _, _)| *v)
+                .max()
+                .unwrap();
+            assert!(derniere > 99, "aucun script au-dela de la sentinelle 99");
             assert_eq!(
-                version, 100,
+                version, derniere,
                 "la bascule ne doit pas rester sur la sentinelle 99"
             );
             c.close().await.ok();

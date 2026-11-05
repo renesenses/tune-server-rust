@@ -166,10 +166,13 @@ pub(super) async fn import(
         return r;
     }
 
-    let (snapshot, secret) = match body {
+    let (mut snapshot, secret) = match body {
         ImportRequest::Wrapped { snapshot, secret } => (*snapshot, secret),
         ImportRequest::Bare(snapshot) => (*snapshot, None),
     };
+    // Mêmes clés protégées que `PATCH /system/config` : sans admin effectif,
+    // écartées de la restauration et nommées dans `report.warnings`.
+    let ecartees = super::config::ecarter_les_cles_protegees(&state, &mut snapshot.settings);
 
     info!(
         version = %snapshot.version,
@@ -185,11 +188,14 @@ pub(super) async fn import(
         snapshot,
         secret.as_deref(),
     ) {
-        Ok(report) => Json(json!({
+        Ok(mut report) => {
+            report.warnings.extend(ecartees);
+            Json(json!({
             "success": true,
             "report": report,
-        }))
-        .into_response(),
+            }))
+            .into_response()
+        }
         Err(e) => {
             warn!(error = %e, "config_backup_import_failed");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()

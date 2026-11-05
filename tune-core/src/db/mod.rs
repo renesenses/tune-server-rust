@@ -9,6 +9,7 @@ pub mod album_repo;
 pub mod artist_repo;
 pub mod backend;
 pub mod champs_tenus;
+pub mod cles_clients;
 pub mod coffrets_auto;
 pub mod collection_folder_repo;
 /// Le conteneur de chaque élément de file (#6466).
@@ -17,6 +18,8 @@ pub mod contexte_de_file;
 pub mod disques_par_dossier;
 /// Les dossiers « Collections » suivent leurs albums (#5527, #5528).
 pub mod dossiers_des_collections;
+/// #7763 — les écoutes importées (Roon, Plex, m3u), à part de l'historique.
+pub mod ecoutes_importees;
 pub mod edition_album;
 pub mod engine;
 pub mod facet_filter;
@@ -41,6 +44,8 @@ pub mod metadata_report_repo;
 pub mod migration_status;
 pub mod migrations;
 pub mod models;
+/// #7849 — les notes personnelles en Markdown (artiste, album, piste).
+pub mod notes_personnelles;
 /// L'ordre alphabétique des listes paginées (#4956) : tri en Rust, découpe.
 pub(crate) mod ordre_alphabetique;
 #[cfg(all(test, feature = "postgres"))]
@@ -75,6 +80,8 @@ pub mod rattrapage_metadonnees_5043;
 /// La référence d'album d'une piste Bandcamp, retrouvée dans la file, les
 /// favoris ou l'historique pour resigner son URL de flux (fil 2121).
 pub mod reference_d_album;
+/// #7849 — répartitions de la bibliothèque (codec, fréquence, décennie, rôle).
+pub mod repartitions_bibliotheque;
 /// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
 pub(crate) mod replieur_wal;
 pub mod settings_repo;
@@ -110,6 +117,9 @@ mod mbid_deja_porte_7535_tests;
 /// #7694 — la règle des dossiers miroirs ne fond pas deux qualités.
 #[cfg(test)]
 mod miroirs_de_qualite_7694_tests;
+/// #7849 — notes personnelles et répartitions, SQLite et PostgreSQL.
+#[cfg(test)]
+mod notes_et_repartitions_7849_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
 #[cfg(test)]
@@ -118,6 +128,8 @@ mod replieur_wal_tests;
 /// `listen_history.album_id`, preuves d'équivalence et de migration.
 #[cfg(test)]
 mod reprendre_l_ecoute_2130_tests;
+#[cfg(test)]
+mod tableau_de_bord_7634_tests;
 #[cfg(test)]
 mod top_titres_index_tests;
 pub mod upnp_revision;
