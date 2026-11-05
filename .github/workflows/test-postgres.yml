@@ -128,9 +128,28 @@ jobs:
 
     env:
       CARGO_TERM_COLOR: always
+      # Depuis le 05/11, GitHub arrête la machine en pleine compilation
+      # (« The runner has received a shutdown signal », code 143) : la
+      # machine gratuite manque de mémoire et de disque sur ce job. Deux
+      # compilations à la fois au lieu de quatre, et pas d'informations de
+      # débogage : les tests n'en ont pas besoin, et c'est elles qui pèsent
+      # le plus en mémoire à l'édition de liens et sur le disque.
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
 
     steps:
       - uses: actions/checkout@v4
+
+      # Libère ~25 Gio sur la machine GitHub (outils préinstallés dont ce job
+      # n'a pas besoin), avant que la compilation ne remplisse le disque.
+      - name: Libérer de la place sur le disque
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
 
       - uses: dtolnay/rust-toolchain@stable
 
