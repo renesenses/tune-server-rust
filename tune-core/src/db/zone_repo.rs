@@ -3076,7 +3076,10 @@ impl ZoneRepo {
         }?;
         // #7937 — plus aucune zone, plus aucun groupe : sinon les zones
         // recréées (même numéro, voir `delete`) retombent dans leurs groupes.
-        crate::zones::groupes_enregistres::vider_les_groupes_enregistres(&self.db)?;
+        // Un échec ici ne défait pas le masquage, déjà écrit : il est dit.
+        if let Err(e) = crate::zones::groupes_enregistres::vider_les_groupes_enregistres(&self.db) {
+            tracing::warn!(error = %e, "zones_supprimees_groupes_non_vides");
+        }
         Ok(masquees)
     }
 
@@ -3097,8 +3100,13 @@ impl ZoneRepo {
     /// sous ce numéro — elle retombait alors dans son ancien groupe.
     pub fn delete(&self, id: i64) -> Result<usize, String> {
         let masquees = self.masquer(id, MotifMasquage::SuppressionUtilisateur)?;
-        if masquees > 0 {
-            crate::zones::groupes_enregistres::retirer_des_groupes_enregistres(&self.db, &[id])?;
+        // Un échec ici ne défait pas le masquage, déjà écrit : il est dit, et
+        // `POST /zones` refera le ménage si la zone est recréée.
+        if masquees > 0
+            && let Err(e) =
+                crate::zones::groupes_enregistres::retirer_des_groupes_enregistres(&self.db, &[id])
+        {
+            tracing::warn!(zone_id = id, error = %e, "zone_supprimee_groupes_non_reecrits");
         }
         Ok(masquees)
     }
