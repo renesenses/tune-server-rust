@@ -41,11 +41,17 @@ pub struct ImportReport {
     pub total_rows: usize,
     pub matched: usize,
     pub unmatched: usize,
+    /// Pistes déjà en bibliothèque dont le nombre d'écoutes a reçu celles de
+    /// l'export (#7763).
     pub play_counts_updated: usize,
+    /// Pistes déjà en bibliothèque dont la note a pris celle de l'export.
     pub ratings_updated: usize,
-    /// Reste `0` tant que l'import ne reporte pas l'historique d'écoute de
-    /// l'export sur la bibliothèque : `ImportedTrack::last_played` est LU par
-    /// les analyseurs, mais rien ne l'écrit encore.
+    /// Le total des écoutes ajoutées (#7763), toutes pistes confondues.
+    #[serde(default)]
+    pub plays_added: usize,
+    /// Reste `0`, à dessein : les écoutes importées s'ajoutent au COMPTE d'une
+    /// piste (`db::ecoutes_importees`), elles n'entrent pas dans l'historique
+    /// — une entrée datée d'une écoute que Tune n'a pas vue serait fausse.
     pub history_entries_added: usize,
     pub playlists_created: usize,
 }
@@ -65,6 +71,15 @@ const ROON_ARTIST_HEADERS: &[&str] = &["artist", "artist name", "artist_name", "
 const ROON_ALBUM_HEADERS: &[&str] = &["album", "album title", "album_title"];
 const ROON_PLAY_COUNT_HEADERS: &[&str] = &["play count", "play_count", "plays", "playcount"];
 const ROON_RATING_HEADERS: &[&str] = &["rating", "stars", "user rating", "user_rating"];
+/// #7763 — la date de dernière écoute. Même réserve que les autres colonnes :
+/// aucun export réel de Roon n'a été recoupé contre ces noms.
+const ROON_LAST_PLAYED_HEADERS: &[&str] = &[
+    "last played",
+    "last_played",
+    "lastplayed",
+    "last played date",
+    "date last played",
+];
 
 fn detect_header(headers: &[String], candidates: &[&str]) -> Option<usize> {
     for (i, h) in headers.iter().enumerate() {
@@ -95,6 +110,7 @@ pub fn parse_roon_csv(raw: &str) -> Vec<ImportedTrack> {
     let col_album = detect_header(&headers, ROON_ALBUM_HEADERS);
     let col_play = detect_header(&headers, ROON_PLAY_COUNT_HEADERS);
     let col_rating = detect_header(&headers, ROON_RATING_HEADERS);
+    let col_last_played = detect_header(&headers, ROON_LAST_PLAYED_HEADERS);
 
     if col_title.is_none() && col_path.is_none() {
         warn!(headers = ?headers, "import_roon_csv_no_usable_headers");
@@ -164,6 +180,13 @@ pub fn parse_roon_csv(raw: &str) -> Vec<ImportedTrack> {
                 t.rating = Some(r.clamp(1, 5));
             }
         }
+        if let Some(i) = col_last_played {
+            t.last_played = record
+                .get(i)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+        }
 
         if t.title.is_some() || t.file_path.is_some() {
             tracks.push(t);
@@ -202,6 +225,8 @@ pub fn parse_plex_xml(raw: &str) -> Vec<ImportedTrack> {
                         }
                         "parenttitle" => t.album = Some(val),
                         "viewcount" => t.play_count = val.parse().unwrap_or(0),
+                        // #7763 — horodatage Unix de la dernière écoute.
+                        "lastviewedat" => t.last_played = Some(val),
                         "userrating" => {
                             if let Ok(r) = val.parse::<f64>() {
                                 let stars = (r / 2.0 + 0.5) as i32;
@@ -474,6 +499,22 @@ mod tests {
         assert_eq!(tracks[0].artist.as_deref(), Some("Artist"));
         assert_eq!(tracks[0].album.as_deref(), Some("Album"));
         assert_eq!(tracks[0].play_count, 3);
+    }
+
+    /// #7763 — la date de dernière écoute est lue, pour que l'import puisse
+    /// la reporter.
+    #[test]
+    fn la_derniere_ecoute_est_lue_par_les_deux_analyseurs_7763() {
+        let xml = r#"<MediaContainer><Track title="Song" viewCount="3" lastViewedAt="1700000000" /></MediaContainer>"#;
+        assert_eq!(
+            parse_plex_xml(xml)[0].last_played.as_deref(),
+            Some("1700000000")
+        );
+        let csv =
+            "Title,Artist,Play Count,Last Played\nSo What,Miles Davis,4,2026-10-02 10:00:00\n";
+        let t = &parse_roon_csv(csv)[0];
+        assert_eq!(t.play_count, 4);
+        assert_eq!(t.last_played.as_deref(), Some("2026-10-02 10:00:00"));
     }
 
     #[test]

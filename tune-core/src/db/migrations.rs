@@ -2702,6 +2702,22 @@ CREATE INDEX IF NOT EXISTS idx_radio_ecoutes_jour ON radio_ecoutes(jour);
         up: "",
     },
     Migration { version: 135, name: "listening_resumes", up: include_str!("../../migrations/continue_listening.sql") },
+    // #7763 (go de Bertrand du 03/11) — les écoutes IMPORTÉES (Roon, Plex,
+    // liste m3u), une ligne par piste, à part de `listen_history` : un import
+    // ne fabrique aucune fausse entrée d'historique. Le nombre affiché d'une
+    // piste est la somme des deux (`HistoryRepo::plays_for_tracks`). Naît
+    // vide. Jumelle PG : 101.
+    Migration {
+        version: 136,
+        name: "imported_plays",
+        up: "
+CREATE TABLE IF NOT EXISTS imported_plays (
+    track_id INTEGER PRIMARY KEY,
+    play_count INTEGER NOT NULL DEFAULT 0,
+    last_played_at TEXT
+);
+",
+    },
 ];
 
 /// Migration 127 (#6257) : `tags.position`, 0 pour toutes les etiquettes
@@ -5682,6 +5698,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         100,
         "listening_resumes",
         include_str!("../../migrations/postgres/100_listening_resumes.sql"),
+    ),
+    // Jumelle de la SQLite 136 (#7763) : `imported_plays`, les écoutes
+    // importées par piste. Naît vide.
+    (
+        101,
+        "imported_plays",
+        include_str!("../../migrations/postgres/101_imported_plays.sql"),
     ),
 ];
 
@@ -9223,7 +9246,9 @@ mod tests {
         // 99 reste réservée à la sentinelle des anciennes bascules : entrée
         // sans effet pour garder la chaîne contiguë, jamais un changement DDL.
         // 100 : listening_resumes (#7280), jumelle de la SQLite 135.
-        assert_eq!(pg_latest_version(), 100, "latest PG migration must be 100");
+        // 101 : `imported_plays` (#7763), jumelle de la SQLite 136. Crée la
+        // table des écoutes importées, que le compte d'écoutes NOMME.
+        assert_eq!(pg_latest_version(), 101, "latest PG migration must be 101");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

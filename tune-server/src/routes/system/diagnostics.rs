@@ -3793,6 +3793,11 @@ pub(super) async fn api_docs() -> Json<Value> {
         ("POST", "/system/import/roon", "Import from Roon"),
         ("POST", "/system/import/jriver", "Import from JRiver XML"),
         ("POST", "/system/import/plex", "Import from Plex"),
+        (
+            "POST",
+            "/system/import/m3u-plays",
+            "Add N plays to every track of an m3u list (?plays=N, ?preview=true)",
+        ),
         // Library
         (
             "GET",

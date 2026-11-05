@@ -654,6 +654,28 @@ impl HistoryRepo {
             let derniere = cols.get(2).and_then(|v| v.as_string());
             map.insert(id, (compte, derniere));
         }
+        // #7763 — les écoutes importées (Roon, Plex, m3u) s'ajoutent à celles
+        // de l'historique, sans y figurer ; la dernière écoute est la plus
+        // récente des deux. Une table illisible (banc qui crée ses tables à
+        // la main) laisse les comptes de l'historique tels quels.
+        match crate::db::ecoutes_importees::EcoutesImporteesRepo::with_backend(self.db.clone())
+            .par_piste(track_ids)
+        {
+            Ok(importees) => {
+                for (id, (n, date)) in importees {
+                    let Some((compte, derniere)) = map.get_mut(&id) else {
+                        continue;
+                    };
+                    *compte += n;
+                    if let Some(date) = date
+                        && derniere.as_ref().is_none_or(|d| date > *d)
+                    {
+                        *derniere = Some(date);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "ecoutes_importees_illisibles"),
+        }
         Ok(map)
     }
 
