@@ -651,6 +651,7 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     persist_initial_settings(state, config);
     resolve_ytdlp(state).await;
     restore_convolvers(state).await;
+    surveiller_le_droit_de_convoluer(state);
     warm_sqlite_cache(state);
     crate::routes::synchronisation_upnp::start(state.clone());
 
@@ -1379,6 +1380,34 @@ async fn restore_convolvers(state: &AppState) {
             }
         }
     }
+}
+
+/// #7632 — la convolution par RI est un droit Premium (`RoomCorrection`).
+/// Le droit change hors de toute lecture (validation de licence, compte SSO,
+/// expiration) : cette tâche le relit toutes les deux secondes et, quand il
+/// bascule, le rend aux sorties (`appliquer_le_droit_de_convoluer`) — la
+/// convolution s'éteint en fondu sur une sortie locale, un flux réseau qui la
+/// portait est relancé à sa position. Relecture `premium_snapshot`, sans
+/// verrou bloquant.
+fn surveiller_le_droit_de_convoluer(state: &AppState) {
+    let orchestrateur = state.orchestrator.clone();
+    tokio::spawn(async move {
+        let mut avant = orchestrateur.correction_ir_autorisee();
+        let mut intervalle = tokio::time::interval(std::time::Duration::from_secs(2));
+        intervalle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            intervalle.tick().await;
+            let maintenant = orchestrateur.correction_ir_autorisee();
+            if maintenant != avant {
+                avant = maintenant;
+                let relances = orchestrateur.appliquer_le_droit_de_convoluer().await;
+                info!(
+                    autorisee = maintenant,
+                    relances, "droit_de_convoluer_change"
+                );
+            }
+        }
+    });
 }
 
 /// Touch key tables so SQLite page cache is warm for the first UI load.
@@ -2974,6 +3003,23 @@ pub(crate) enum IssueMontage {
 /// Un essai de montage d'UN partage, son issue écrite sur sa ligne.
 async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMontage {
     let (host, share, path, id) = (p.host.clone(), p.share.clone(), p.path.clone(), p.id);
+    // Une ligne ne remonte que sous une racine du serveur, avec un hôte, un
+    // partage et des identifiants acceptables : les mêmes règles que le
+    // montage interactif (`routes/network.rs`). Sinon, rien n'est lancé.
+    let racines = crate::routes::network::racines_des_montages(state);
+    let refus = if !crate::smb::est_confine(std::path::Path::new(&path), &racines) {
+        Some("mount point outside the server's mount directory")
+    } else {
+        crate::smb::verifier_hote(&host)
+            .and_then(|_| crate::smb::verifier_partage(&share))
+            .and_then(|_| crate::smb::verifier_identifiants(&p.user, &p.pass))
+            .err()
+    };
+    if let Some(motif) = refus {
+        warn!(host = %host, share = %share, path = %path, motif, "network_share_remount_refused");
+        noter_montage(state, id, "failed", Some(motif), None).await;
+        return IssueMontage::Definitif;
+    }
     // Deja monte (redemarrage du seul service, systeme reste debout) :
     // ne pas empiler un second montage sur le meme point.
     //
@@ -3035,7 +3081,7 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
             // l'echelle et part au journal avec la cause.
             let res = tokio::time::timeout(
                 crate::smb::ESSAI_TIMEOUT,
-                crate::smb::commande_de_montage(
+                crate::smb::lancer_un_essai(
                     crate::privilege::euid(),
                     &crate::privilege::sudo(),
                     &unc,
@@ -3043,8 +3089,7 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
                     u,
                     &pass,
                     dialecte,
-                )
-                .lancer(),
+                ),
             )
             .await;
             let arreter = match &res {

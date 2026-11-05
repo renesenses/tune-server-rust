@@ -140,6 +140,10 @@ pub enum StoppedOutcome {
     /// atteint jusque-là : il joue. Le tour ne compte pas comme un arrêt et
     /// la série en cours est effacée ; voir [`arret_dementi_par_la_position`].
     SuppressPositionAdvancing,
+    /// #7700 — l'appareil DLNA a quitté notre piste en milieu de lecture
+    /// avec de l'audio en main : « suivant » à sa télécommande. Absent de
+    /// [`classify_stopped`], qui ne mesure pas le flux.
+    SuivantDeLAppareil,
 }
 
 impl StoppedOutcome {
@@ -151,6 +155,7 @@ impl StoppedOutcome {
                 | StoppedOutcome::LocalEndedNaturally
                 | StoppedOutcome::DsdDlnaReachedEnd
                 | StoppedOutcome::NaturalEndAdvance
+                | StoppedOutcome::SuivantDeLAppareil
         )
     }
 

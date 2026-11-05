@@ -631,7 +631,10 @@ pub(super) async fn register_dlna_output_from_device(
             crate::startup::create_oh_listener().await,
             crate::discovery_setup::urls_evenements_dlna(&dev.host, dev.port, &evt_urls),
         )
-        .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &dev.id));
+        .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &dev.id))
+        // #6335 — l'annonce de `SetNextAVTransportURI`, même source que la
+        // découverte.
+        .with_av_transport_scpd(crate::discovery_setup::scpd_av_transport(dev));
         let mut outputs = state.outputs.lock().await;
         outputs.register(Box::new(dlna));
         info!(name = %dev.name, id = %dev.id, "dlna_output_registered_on_zone_create");
@@ -680,8 +683,15 @@ pub(super) async fn register_dlna_output_from_device(
                                 &desc.event_sub_urls(),
                             ),
                         )
-                        .with_upnp_silence(
-                            crate::config::resolve_upnp_silence(&state.backend, &dev.id),
+                        .with_upnp_silence(crate::config::resolve_upnp_silence(
+                            &state.backend,
+                            &dev.id,
+                        ))
+                        // #6335 — l'annonce de `SetNextAVTransportURI`.
+                        .with_av_transport_scpd(
+                            crate::discovery_setup::scpd_av_transport_du_descriptif(
+                                &dev.host, dev.port, &desc,
+                            ),
                         );
                         let mut outputs = state.outputs.lock().await;
                         outputs.register(Box::new(dlna));
@@ -1222,3 +1232,7 @@ pub(super) async fn zone_image_delete(
 #[cfg(test)]
 #[path = "partage_photo_appareil_2109.rs"]
 mod partage_photo_appareil_2109;
+
+#[cfg(test)]
+#[path = "annonce_de_la_suivante_6335_tests.rs"]
+mod annonce_de_la_suivante_6335_tests;

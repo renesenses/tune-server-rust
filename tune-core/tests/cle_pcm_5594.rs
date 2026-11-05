@@ -19,6 +19,21 @@ use tune_core::db::backend::{DbBackend, ToSqlValue};
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::taches_de_fond::cle_pcm::{Bilan, LOT, rattraper};
 
+/// Les essais qui lancent une passe la tiennent seuls.
+///
+/// La pause de « ReplayGain » est un drapeau du PROCESSUS
+/// (`taches_de_fond::est_en_pause`), et c'est le contrat voulu : un clic sur
+/// « Pause » arrête toutes les passes du serveur. Mais `la_pause_arrete_la_passe`
+/// la pose pendant que les autres essais de ce binaire tournent en parallèle :
+/// leur passe s'arrêtait alors à la frontière d'un lot (`interrupted: true`,
+/// rien de lu), au hasard de l'ordonnancement.
+fn exclusif() -> std::sync::MutexGuard<'static, ()> {
+    static VERROU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    VERROU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn fixture(nom: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -130,6 +145,7 @@ const CLE_TEST_FLAC: &str = "flac-md5-v1:e3d5a52400c85f978eebd475ec8a10bf:44100:
 /// FLAC introuvable.
 #[test]
 fn le_rattrapage_pose_la_cle_et_rien_qu_elle() {
+    let _seul = exclusif();
     let tmp = tempfile::TempDir::new().unwrap();
     let d = tmp.path();
     let b = base();
@@ -231,6 +247,7 @@ fn le_rattrapage_pose_la_cle_et_rien_qu_elle() {
 /// sa clé suit le nouveau signal — y compris vers « pas de clé ».
 #[test]
 fn un_fichier_change_est_relu() {
+    let _seul = exclusif();
     let tmp = tempfile::TempDir::new().unwrap();
     let b = base();
     let p = copie(tmp.path(), "a.flac", "test.flac");
@@ -260,6 +277,7 @@ fn un_fichier_change_est_relu() {
 /// la suivante reprend exactement les restantes.
 #[test]
 fn le_rattrapage_traverse_plusieurs_lots_et_reprend_ou_il_s_est_arrete() {
+    let _seul = exclusif();
     let tmp = tempfile::TempDir::new().unwrap();
     let b = base();
     let p = copie(tmp.path(), "a.flac", "test.flac");
@@ -308,6 +326,7 @@ fn le_rattrapage_traverse_plusieurs_lots_et_reprend_ou_il_s_est_arrete() {
 #[test]
 fn la_pause_arrete_la_passe() {
     use tune_core::taches_de_fond::{Tache, mettre_en_pause, reprendre};
+    let _seul = exclusif();
     let tmp = tempfile::TempDir::new().unwrap();
     let b = base();
     let p = copie(tmp.path(), "a.flac", "test.flac");

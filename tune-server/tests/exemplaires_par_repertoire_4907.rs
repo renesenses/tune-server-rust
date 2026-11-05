@@ -5,6 +5,10 @@
 //! 96 kHz/24 bits). Le banc lance `POST /system/scan` et relit les routes
 //! que les clients lisent.
 //!
+//! Avec « Split albums by quality » (actif par défaut), la racine `hires` est
+//! une AUTRE édition : un second album, depuis #7694 (5db33a4e6, l'import) et
+//! #7839 (la fusion des doublons ne la réunit plus).
+//!
 //! Témoins, dans l'ordre de l'issue :
 //!
 //! 1. la copie identique devient un EXEMPLAIRE (`track_copies`) — sur la base
@@ -317,19 +321,24 @@ async fn jouer(state: &AppState, etiquette: &str) {
     assert_eq!(vues(state).await, reference);
     assert_eq!(compte(db, "SELECT COUNT(*) FROM track_copies"), 3);
 
-    // ── Une AUTRE qualité, même dossier sous une troisième racine : même
-    //    album, une ligne sœur masquée à l'affichage (comportement #1362).
+    // ── Une AUTRE qualité, même dossier sous une troisième racine : avec
+    //    `quality_split` (actif par défaut), une AUTRE édition, donc un second
+    //    album (#7694, 5db33a4e6 ; la fusion des doublons ne la réunit plus,
+    //    #7839). L'album d'origine et ses références ne bougent pas.
     music_dirs(state, &[&nas, &sauvegarde, &hires]);
     scanner(state).await;
     let avec_hires = vues(state).await;
     eprintln!("[{etiquette}] + hires : {avec_hires:?}");
-    assert_eq!(avec_hires.albums_en_base, 1, "{avec_hires:?}");
-    assert_eq!(avec_hires.albums_route, 1);
+    assert_eq!(
+        avec_hires.albums_en_base, 2,
+        "{etiquette} : l'édition 96/24 doit rester un album à part (#7694) — {avec_hires:?}"
+    );
+    assert_eq!(avec_hires.albums_route, 2);
     assert_eq!(avec_hires.pistes_de_l_album, 3, "{avec_hires:?}");
     assert_eq!(avec_hires.track_count_de_l_album, 3, "{avec_hires:?}");
     assert_eq!(references(db), refs_avant);
 
-    // La fiche d'album dit ses exemplaires : un par racine.
+    // La fiche d'album dit ses exemplaires : un par racine qui le porte.
     let album = compte(db, "SELECT MIN(id) FROM albums");
     let fiche = lire(state, &format!("/api/v1/library/albums/{album}")).await;
     let ex = fiche["exemplaires"]
@@ -337,16 +346,30 @@ async fn jouer(state: &AppState, etiquette: &str) {
         .expect("champ `exemplaires`")
         .clone();
     eprintln!("[{etiquette}] exemplaires : {ex:?}");
-    assert_eq!(ex.len(), 3, "{ex:?}");
+    assert_eq!(ex.len(), 2, "{ex:?}");
     let r = |i: usize| ex[i]["racine"].as_str().unwrap_or_default().to_string();
     assert_eq!(r(0), nas.to_string_lossy());
     assert_eq!(ex[0]["pistes"], 3);
-    assert_eq!(r(2), hires.to_string_lossy());
-    assert_eq!(ex[2]["sample_rate"], 96_000);
+    assert_eq!(r(1), sauvegarde.to_string_lossy());
     assert!(
         ex.iter()
             .all(|e| e["joignable"] == true && e["prefere"] == false)
     );
+    // L'édition hi-res : son propre album, son exemplaire sous `hires`.
+    let album_hires = compte(db, "SELECT MAX(id) FROM albums");
+    assert_ne!(album_hires, album);
+    let fiche = lire(state, &format!("/api/v1/library/albums/{album_hires}")).await;
+    let ex_hires = fiche["exemplaires"]
+        .as_array()
+        .expect("champ `exemplaires`")
+        .clone();
+    eprintln!("[{etiquette}] exemplaires hi-res : {ex_hires:?}");
+    assert_eq!(ex_hires.len(), 1, "{ex_hires:?}");
+    assert_eq!(
+        ex_hires[0]["racine"].as_str().unwrap_or_default(),
+        hires.to_string_lossy()
+    );
+    assert_eq!(ex_hires[0]["sample_rate"], 96_000);
 
     // ── Routes : répertoire préféré de l'album.
     let route = format!("/api/v1/library/albums/{album}/repertoire-prefere");
@@ -454,7 +477,7 @@ async fn jouer(state: &AppState, etiquette: &str) {
         "{etiquette} : il doit rester UNE copie (piste 3) — la 1 est promue, la 2 supprimée"
     );
     assert_eq!(apres.pistes_de_l_album, 3, "{apres:?}");
-    assert_eq!(apres.albums_en_base, 1, "{apres:?}");
+    assert_eq!(apres.albums_en_base, 2, "{apres:?}");
     assert_eq!(
         references(db),
         refs_avant,

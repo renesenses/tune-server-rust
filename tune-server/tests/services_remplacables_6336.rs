@@ -245,7 +245,13 @@ fn faux_montage_smb(dossier: &Path) -> PathBuf {
         &format!(
             r#"#!/bin/sh
 entree=$(cat)
-echo "ARGS $* ENTREE $entree" >> '{journal}'
+identifiants=""
+for a in "$@"; do
+  case "$a" in
+    *credentials=*) f=${{a#*credentials=}}; f=${{f%%,*}}; identifiants=$(cat "$f" | tr '\n' ' ') ;;
+  esac
+done
+echo "ARGS $* ENTREE $entree IDENTIFIANTS $identifiants" >> '{journal}'
 case "$*" in
   *//127.0.0.1/refuse*) echo 'mount error(13): Permission denied' >&2; exit 32 ;;
 esac
@@ -257,6 +263,17 @@ exit 0
     let faux = chemin.to_str().unwrap();
     tune_core::services_factices::substituer_programme("mount.cifs", faux);
     tune_core::services_factices::substituer_programme(&tune_server::privilege::sudo(), faux);
+    // Le point de montage est choisi par le serveur, sous sa racine : celle du
+    // banc vit dans le dossier jetable. Sous `SUBSTITUTIONS`, un seul test à
+    // la fois la lit.
+    // SAFETY : les tests de ce binaire qui lisent la variable se suivent sous
+    // le verrou `SUBSTITUTIONS`.
+    unsafe {
+        std::env::set_var(
+            tune_server::routes::network::VARIABLE_RACINE_DES_MONTAGES,
+            dossier.join("montages"),
+        );
+    }
     journal
 }
 
@@ -274,7 +291,7 @@ async fn monter_un_partage_smb_lance_le_montage_et_enregistre_le_partage_6336() 
     let _une_substitution_a_la_fois = SUBSTITUTIONS.lock().await;
     let dossier = tune_core::test_scratch::scratch_dir("tune-6336-smb");
     let journal = faux_montage_smb(&dossier);
-    let point = dossier.join("point-musique");
+    let point = dossier.join("montages").join("127.0.0.1_musique");
     let etat = etat(&dossier);
     let app = tune_server::routes::router(etat.clone());
 
@@ -287,7 +304,6 @@ async fn monter_un_partage_smb_lance_le_montage_et_enregistre_le_partage_6336() 
             "share_name": "musique",
             "username": "temoin",
             "password": "mot-de-passe-factice-6336",
-            "mount_path": point.to_str().unwrap(),
         })),
     )
     .await;
@@ -297,8 +313,9 @@ async fn monter_un_partage_smb_lance_le_montage_et_enregistre_le_partage_6336() 
     assert!(point.is_dir(), "le point de montage doit avoir été créé");
 
     // Le programme de montage a bien été lancé, sur ce partage et ce point,
-    // avec le mot de passe (en option en root, sur l'entrée de l'assistant
-    // sinon) — et une seule fois : la négociation libre a réussi.
+    // avec le mot de passe (dans le fichier `credentials=` en root, sur
+    // l'entrée de l'assistant sinon) — et une seule fois : la négociation
+    // libre a réussi.
     let appels = lignes_du_journal(&journal, &format!("{} ", point.display()));
     assert_eq!(appels.len(), 1, "un seul essai attendu : {appels:?}");
     assert!(appels[0].contains("//127.0.0.1/musique"), "{appels:?}");
@@ -321,7 +338,7 @@ async fn un_refus_d_identifiants_smb_arrete_l_echelle_et_le_dit_6336() {
     let _une_substitution_a_la_fois = SUBSTITUTIONS.lock().await;
     let dossier = tune_core::test_scratch::scratch_dir("tune-6336-smb-refus");
     let journal = faux_montage_smb(&dossier);
-    let point = dossier.join("point-refuse");
+    let point = dossier.join("montages").join("127.0.0.1_refuse");
     let app = tune_server::routes::router(etat(&dossier));
 
     let (statut, corps) = appeler(
@@ -333,7 +350,6 @@ async fn un_refus_d_identifiants_smb_arrete_l_echelle_et_le_dit_6336() {
             "share_name": "refuse",
             "username": "temoin",
             "password": "mauvais-mot-de-passe-factice",
-            "mount_path": point.to_str().unwrap(),
         })),
     )
     .await;

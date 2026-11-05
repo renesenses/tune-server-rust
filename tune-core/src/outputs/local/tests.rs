@@ -410,10 +410,10 @@ fn un_changement_de_format_gapless_rebat_ou_desactive_le_convolveur() {
     ));
     let active = std::sync::Mutex::new(None);
 
-    assert!(rebuild_local_convolver(&config, &active, 48_000, 2).unwrap());
+    assert!(rebuild_local_convolver(&config, &active, &AtomicBool::new(true), 48_000, 2).unwrap());
     assert_eq!(active.lock().unwrap().as_ref().unwrap().channels(), 2);
 
-    let error = rebuild_local_convolver(&config, &active, 96_000, 2)
+    let error = rebuild_local_convolver(&config, &active, &AtomicBool::new(true), 96_000, 2)
         .expect_err("l'IR 48 kHz ne doit jamais corriger un flux 96 kHz");
     assert!(
         error.contains("48000") && error.contains("96000"),
@@ -424,7 +424,7 @@ fn un_changement_de_format_gapless_rebat_ou_desactive_le_convolveur() {
         "l'ancien moteur ne doit pas survivre au changement de cadence"
     );
 
-    assert!(rebuild_local_convolver(&config, &active, 48_000, 6).unwrap());
+    assert!(rebuild_local_convolver(&config, &active, &AtomicBool::new(true), 48_000, 6).unwrap());
     assert_eq!(
         active.lock().unwrap().as_ref().unwrap().channels(),
         6,
