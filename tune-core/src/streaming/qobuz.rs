@@ -189,6 +189,18 @@ const TTL_ALBUM: Duration = Duration::from_secs(300);
 /// des centaines d'albums : ici on évince la plus ancienne.
 const MAX_ALBUMS_CACHE: usize = 32;
 
+/// Attente maximale de la réponse de Qobuz pour UNE tentative de lecture de
+/// l'API (connexion comprise), avant de passer à l'autre adresse — #7760.
+///
+/// Le client garde sa limite de 45 s, mais elle valait par tentative : une
+/// adresse qui accepte la connexion sans jamais répondre retenait chaque
+/// lecture 45 s avant le repli, et les widgets de l'accueil abandonnent à
+/// 8 s (`DELAI_MS` du client web). Un compte SANS favoris tombait ainsi en
+/// « délai » au lieu d'afficher sa liste vide. Deux tentatives de 3 s tiennent
+/// nettement sous ces 8 s. Seules les lectures (`api_get_at`) sont bornées :
+/// la connexion et les écritures gardent leurs limites.
+const DELAI_REPONSE_LECTURE: Duration = Duration::from_secs(3);
+
 /// (primary, fallback) API bases for the given endpoint order.
 ///
 /// `proxy_first == false` (default, all users): direct Qobuz API first,
@@ -993,9 +1005,22 @@ impl QobuzService {
             req = req.header("X-User-Auth-Token", token.as_str());
         }
 
-        let resp = req
-            .send()
+        // #7760 — l'attente de la RÉPONSE est bornée par tentative ; le corps,
+        // lui, garde la limite du client (une longue liste peut peser).
+        let resp = tokio::time::timeout(DELAI_REPONSE_LECTURE, req.send())
             .await
+            .map_err(|_| {
+                warn!(
+                    base,
+                    path,
+                    delai_ms = DELAI_REPONSE_LECTURE.as_millis() as u64,
+                    "qobuz_api_no_response_in_time_7760"
+                );
+                AttemptError::Network(format!(
+                    "no response within {} ms",
+                    DELAI_REPONSE_LECTURE.as_millis()
+                ))
+            })?
             .map_err(|e| AttemptError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -8217,6 +8242,12 @@ mod logos_labels;
 #[cfg(test)]
 #[path = "qobuz_page_du_label_tests.rs"]
 mod page_du_label_tests;
+
+/// #7760 — un compte sans favoris rend sa liste vide avant le délai du widget,
+/// même quand l'adresse principale de Qobuz ne répond pas.
+#[cfg(test)]
+#[path = "qobuz_delai_favoris_7760_tests.rs"]
+mod delai_favoris_7760_tests;
 
 /// renesenses/tune-server-rust#7068 — un mauvais mot de passe Qobuz sortait en
 /// `qobuz login: 401 {"status":"error","code":401,"message":"Invalid
