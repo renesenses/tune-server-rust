@@ -2756,6 +2756,12 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "notes_personnelles",
         up: include_str!("../../migrations/notes_personnelles.sql"),
     },
+    // #7855 — les clés des clients Subsonic : seule l'empreinte SHA-256 est
+    // stockée. Numérotée 136 / PG 101 le 04/11 depuis le lot, puis 139 / PG 104 à sa
+    // fusion groupée, après 136 à 138 / PG 101 à 103. Base d'origine :
+    // `batch/bugs-rc11-20261101` (dernière : 135 / PG 100) ; d'autres PR
+    // ouvertes réclament aussi 136 / 101, la fusion groupée renumérote.
+    Migration { version: 139, name: "cles_clients", up: include_str!("../../migrations/cles_clients.sql") },
 ];
 
 /// SQL de l'attribution unique de la migration 137 (#7765) — jouée une seule
@@ -5784,6 +5790,12 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         103,
         "notes_personnelles",
         include_str!("../../migrations/postgres/103_notes_personnelles.sql"),
+    ),
+    // Jumelle de la SQLite 139 (#7855) : les clés des clients Subsonic.
+    (
+        104,
+        "cles_clients",
+        include_str!("../../migrations/postgres/104_cles_clients.sql"),
     ),
 ];
 
@@ -9325,13 +9337,15 @@ mod tests {
         // 99 reste réservée à la sentinelle des anciennes bascules : entrée
         // sans effet pour garder la chaîne contiguë, jamais un changement DDL.
         // 100 : listening_resumes (#7280), jumelle de la SQLite 135.
+        // 101 : imported_plays (#7763), 102 : credits_source (#7765), 103 :
+        // notes_personnelles (#7849), 104 : cles_clients (#7855), jumelle de la SQLite 139.
         // 101 : `imported_plays` (#7763), jumelle de la SQLite 136. Crée la
         // table des écoutes importées, que le compte d'écoutes NOMME.
         // 102 : `credits_source` (#7765), jumelle de la SQLite 137. Pose la
         // source des crédits de piste, que tous leurs écrivains NOMMENT.
         // 103 : `notes_personnelles` (#7849), jumelle de la SQLite 138. Crée
         // la table des notes, que les routes `/library/notes` NOMMENT.
-        assert_eq!(pg_latest_version(), 103, "latest PG migration must be 103");
+        assert_eq!(pg_latest_version(), 104, "latest PG migration must be 104");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

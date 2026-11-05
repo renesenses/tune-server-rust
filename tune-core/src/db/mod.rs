@@ -9,6 +9,7 @@ pub mod album_repo;
 pub mod artist_repo;
 pub mod backend;
 pub mod champs_tenus;
+pub mod cles_clients;
 pub mod coffrets_auto;
 pub mod collection_folder_repo;
 /// Le conteneur de chaque élément de file (#6466).
