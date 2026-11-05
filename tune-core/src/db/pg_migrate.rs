@@ -2446,7 +2446,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                version, 100,
+                version,
+                crate::db::migrations::pg_latest_version(),
                 "la bascule ne doit pas rester sur la sentinelle 99"
             );
             c.close().await.ok();

@@ -71,14 +71,14 @@ pub mod radio_repo;
 /// #6500 — les stations de radio indexées comme pistes par l'UPnP, retirées.
 pub mod radios_indexees_upnp_6500;
 pub mod rating_repo;
-/// #7849 — répartitions de la bibliothèque (codec, fréquence, décennie, rôle).
-pub mod repartitions_bibliotheque;
 /// Fil 2138 — rattrapage unique des dates d'ajout figées au premier scan.
 pub mod rattrapage_dates_ajout_2138;
 pub mod rattrapage_metadonnees_5043;
 /// La référence d'album d'une piste Bandcamp, retrouvée dans la file, les
 /// favoris ou l'historique pour resigner son URL de flux (fil 2121).
 pub mod reference_d_album;
+/// #7849 — répartitions de la bibliothèque (codec, fréquence, décennie, rôle).
+pub mod repartitions_bibliotheque;
 /// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
 pub(crate) mod replieur_wal;
 pub mod settings_repo;
@@ -111,12 +111,12 @@ mod lenteur_pistes_5138_tests;
 /// #7535 — un MBID trouvé par le nom n'est plus posé s'il est déjà porté.
 #[cfg(test)]
 mod mbid_deja_porte_7535_tests;
-/// #7849 — notes personnelles et répartitions, SQLite et PostgreSQL.
-#[cfg(test)]
-mod notes_et_repartitions_7849_tests;
 /// #7694 — la règle des dossiers miroirs ne fond pas deux qualités.
 #[cfg(test)]
 mod miroirs_de_qualite_7694_tests;
+/// #7849 — notes personnelles et répartitions, SQLite et PostgreSQL.
+#[cfg(test)]
+mod notes_et_repartitions_7849_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
 #[cfg(test)]
