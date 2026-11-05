@@ -107,14 +107,14 @@ pub fn message_titres_sautes(sautes: &[TitreSaute]) -> Option<String> {
 /// La position qui précède `position` dans l'ordre de lecture, ou `None` au
 /// début. En aléatoire, on remonte le tirage ; sinon l'ordre de la file.
 fn position_avant(etat: &crate::playback::ZoneState, position: i64) -> Option<i64> {
-    if etat.shuffle && !etat.shuffle_order.is_empty() {
-        if let Some(rang) = etat
+    if etat.shuffle
+        && !etat.shuffle_order.is_empty()
+        && let Some(rang) = etat
             .shuffle_order
             .iter()
             .position(|&p| p as i64 == position)
-        {
-            return rang.checked_sub(1).map(|r| etat.shuffle_order[r] as i64);
-        }
+    {
+        return rang.checked_sub(1).map(|r| etat.shuffle_order[r] as i64);
     }
     (position > 0).then(|| position - 1)
 }
