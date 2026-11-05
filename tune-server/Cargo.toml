@@ -1929,6 +1929,12 @@ path = "tests/requete_textuelle_6287.rs"
 name = "services_remplacables_6336"
 path = "tests/services_remplacables_6336.rs"
 
+# #7447 — le bouton « Pair » d'Audio / Network Devices contre un faux démon
+# AirPlay 2. Binaire à lui seul, pour la même raison que le banc #6336.
+[[test]]
+name = "jumelage_airplay2_7447"
+path = "tests/jumelage_airplay2_7447.rs"
+
 # #4681 — « ce qui tourne » (`GET /system/background-tasks/running`) par le
 # vrai routeur. Binaire à lui seul : le témoin de lecture et l'avancement de
 # la cascade sont des états de PROCESSUS.
