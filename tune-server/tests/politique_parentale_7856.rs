@@ -6,7 +6,9 @@
 //! - une radio ou un podcast hors liste blanche disparaît de ses listes ;
 //! - le profil supervisé ne peut ni lire, ni modifier, ni retirer sa
 //!   politique (403) ;
-//! - une révision périmée est refusée (409).
+//! - une révision périmée est refusée (409) ;
+//! - un profil administrateur ne se place pas sous supervision (422) ;
+//! - sans table de politiques, les listes passent (aucune erreur 500).
 //!
 //! Le même contrat est éprouvé sur PostgreSQL au niveau du stockage par
 //! `tune_core::db::politique_parentale` (`pg_7856_*`).
@@ -349,5 +351,56 @@ async fn une_revision_perimee_est_refusee_7856() {
         listes(&app, ENFANT).await,
         listes(&app, ADMIN).await,
         "retirée, la politique ne filtre plus"
+    );
+}
+
+#[tokio::test]
+async fn un_profil_administrateur_ne_se_place_pas_sous_supervision_7856() {
+    let (app, state) = app();
+    state
+        .backend
+        .execute(
+            "INSERT INTO profiles (id, username, display_name, is_admin) VALUES (3, 'second', 'Second', 1)",
+            &[],
+        )
+        .unwrap();
+    let (statut, corps) = appel(
+        &app,
+        "PUT",
+        "/api/v1/profiles/3/politique-parentale",
+        ADMIN,
+        Some(json!({"revision": 0, "politique": politique()})),
+    )
+    .await;
+    assert_eq!(
+        statut,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "politique posée sur un administrateur : {corps}"
+    );
+    assert_eq!(corps["error"], "profil_administrateur_non_supervisable");
+    let (statut, _) = appel(
+        &app,
+        "GET",
+        "/api/v1/profiles/3/politique-parentale",
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::NOT_FOUND, "rien n'a été écrit");
+}
+
+#[tokio::test]
+async fn sans_table_les_listes_passent_7856() {
+    let (app, state) = app();
+    let avant = listes(&app, ENFANT).await;
+    state
+        .backend
+        .execute("DROP TABLE politiques_parentales", &[])
+        .unwrap();
+    // `listes` exige un statut de succès sur chaque route.
+    assert_eq!(
+        listes(&app, ENFANT).await,
+        avant,
+        "sans table, les listes doivent passer telles quelles"
     );
 }

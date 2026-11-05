@@ -7,10 +7,17 @@
 //! périmée est refusée (409). La règle d'accès est
 //! [`tune_core::db::politique_parentale::peut_gerer`].
 //!
+//! Un profil administrateur ne se place pas sous supervision : poser sa
+//! politique est refusé (422, `profil_administrateur_non_supervisable`).
+//!
 //! Le filtrage est une couche posée sur l'API : pour les seules routes de
 //! listes (bibliothèque, recherche, radios, podcasts) et un profil qui a une
 //! politique, la réponse est relue et les éléments bloqués en sont retirés.
-//! Sans politique, la réponse passe telle quelle, sans être relue.
+//! Chaque GET d'une de ces routes coûte une lecture de la politique du profil
+//! (une requête par clé primaire) ; sans politique, le corps de la réponse
+//! passe tel quel, sans être relu. Si la table manque (création échouée au
+//! démarrage), aucune politique ne peut exister : la liste passe, et l'écart
+//! est journalisé. Une politique présente mais illisible refuse la liste.
 //!
 //! Le profil appelant est celui d'[`ActiveProfile`] : avec l'authentification
 //! active, celui du compte connecté.
@@ -103,6 +110,16 @@ pub(crate) async fn poser(
     if let Err(r) = controler(&state, appelant, cible) {
         return r;
     }
+    match pp::est_administrateur(&state.backend, cible) {
+        Ok(false) => {}
+        Ok(true) => {
+            return refus(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "profil_administrateur_non_supervisable",
+            );
+        }
+        Err(e) => return interne(e),
+    }
     if let Err(code) = demande.politique.valider() {
         return refus(StatusCode::UNPROCESSABLE_ENTITY, code);
     }
@@ -186,6 +203,11 @@ pub(crate) async fn filtrer_les_listes(
     let politique = match pp::lire(&state.backend, profil) {
         Ok(Some(p)) => p.politique,
         Ok(None) => return next.run(req).await,
+        // Sans table, aucune politique n'a pu être posée.
+        Err(e) if pp::table_absente(&e) => {
+            tracing::warn!(error = %e, "politique_parentale_table_absente");
+            return next.run(req).await;
+        }
         // Une politique illisible ne doit pas laisser passer la liste entière.
         Err(e) => return interne(e),
     };
