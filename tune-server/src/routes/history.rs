@@ -90,12 +90,26 @@ async fn recent_history(
     let (items, total) = repo.recent_paginated(limit, offset).unwrap_or_default();
     let ids: Vec<i64> = items.iter().filter_map(|item| item.id).collect();
     let names = repo.playlist_context_names(&ids).ou_defaut_journalise();
+    // #7769 — le nombre d'écoutes, compté comme la Bibliothèque. Si la base
+    // échoue, la clé n'est pas posée : un zéro dû à une panne se lirait
+    // « jamais jouée » (même choix que `attacher_ecoutes`).
+    let plays = match repo.plays_for_listens(&items) {
+        Ok(plays) => Some(plays),
+        Err(e) => {
+            tracing::error!(error = %e, "ecoutes_de_l_historique_illisibles");
+            None
+        }
+    };
     let items: Vec<Value> = items
         .into_iter()
-        .map(|item| {
+        .enumerate()
+        .map(|(i, item)| {
             let name = item.id.and_then(|id| names.get(&id));
             let mut value = json!(item);
             value["context_name"] = json!(name);
+            if let Some(compte) = plays.as_ref().and_then(|p| p.get(i)) {
+                value["play_count"] = json!(compte);
+            }
             value
         })
         .collect();

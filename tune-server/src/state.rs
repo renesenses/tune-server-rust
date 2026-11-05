@@ -83,6 +83,10 @@ pub struct AppState {
     /// correction), lue par le SERVEUR et copiée dans `<données>/cache/autoeq`.
     /// Champ public : un banc d'essai y pose un catalogue à faux réseau.
     pub autoeq: Arc<tune_core::audio::autoeq_base::CatalogueAutoEq>,
+    /// #7858 — le dossier des titres de démonstration, `<données>/demo-tracks`.
+    /// `None` pour une base en mémoire. Champ public : un banc y pose un
+    /// dossier temporaire.
+    pub dossier_titres_demo: Option<std::path::PathBuf>,
     pub port: u16,
     /// Origine du compteur `uptime_seconds` : un `Instant` capturé à la
     /// construction de l'état, donc AU DÉMARRAGE DU PROCESSUS. Il repart
@@ -677,6 +681,7 @@ impl AppState {
             autoeq: Arc::new(tune_core::audio::autoeq_base::CatalogueAutoEq::production(
                 dossier_autoeq(db_path),
             )),
+            dossier_titres_demo: crate::routes::titres_demo::dossier_par_defaut(db_path),
             port,
             started_at: Instant::now(),
             process_started_at: time::OffsetDateTime::now_utc(),
