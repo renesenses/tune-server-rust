@@ -1292,6 +1292,11 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     annonces_navigateur: std::sync::Mutex<HashMap<i64, AnnonceNavigateurDifferee>>,
+    /// #7852 — l'écoute armée au démarrage du titre de chaque zone, écrite
+    /// par le sondeur au seuil min(30 s, 50 %). Voir `ecoute_validee_7852`.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    ecoutes_en_attente: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEnAttente>>,
     /// #6066 — ce que les LECTEURS des zones navigateur ont dit de leur
     /// lecture (`POST /zones/{id}/browser-playing`). Voir
     /// `confirmation_navigateur_6066`.
@@ -1850,6 +1855,7 @@ impl PlaybackOrchestrator {
             eq_en_vol_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
+            ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
             confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
@@ -1921,6 +1927,9 @@ impl PlaybackOrchestrator {
 
 mod commun;
 mod confirmation_navigateur_6066;
+pub mod ecoute_validee_7852;
+#[cfg(test)]
+mod ecoute_validee_7852_tests;
 pub use confirmation_navigateur_6066::SignalDuLecteur;
 
 /// #4598 — ré-énumérer le parc local avant de refuser une zone locale.
@@ -1986,6 +1995,9 @@ mod dsp;
 mod volume_coalescent;
 #[cfg(test)]
 mod volume_coalescent_5662_tests;
+// #7633 — le volume OpenHome n'attend plus le relevé du sondeur.
+#[cfg(test)]
+mod volume_openhome_sans_attendre_7633_tests;
 pub use dsp::PorteeDuReglage;
 // #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
 #[cfg(test)]
@@ -2023,6 +2035,9 @@ mod purge_greffon_tiers_6256_tests;
 // enregistrés, dans l'état que la vraie bascule produit.
 #[cfg(all(test, feature = "local-audio"))]
 mod verdict_pure_reglages_6522_tests;
+// #7632 — la convolution par RI est un droit Premium (RoomCorrection).
+#[cfg(test)]
+mod convolution_sous_licence_7632_tests;
 
 /// Fil 2062 / #5550 — durée d'une piste UPnP lue dans les en-têtes du flux.
 mod duree_du_flux_2062;

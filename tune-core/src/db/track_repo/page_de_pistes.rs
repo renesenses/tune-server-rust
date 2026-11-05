@@ -130,7 +130,8 @@ const JOINTURE_ECOUTES: &str = " LEFT JOIN (SELECT title, artist_name, \
        FROM listen_history WHERE source != 'radio' \
        GROUP BY title, artist_name) ec \
      ON ec.title = t.title \
-    AND (ec.artist_name = ar.name OR (ec.artist_name IS NULL AND ar.name IS NULL))";
+    AND (ec.artist_name = ar.name OR (ec.artist_name IS NULL AND ar.name IS NULL)) \
+     LEFT JOIN imported_plays ip ON ip.track_id = t.id";
 
 /// Comment une valeur « vide » se reconnaît, pour la ranger en FIN de liste
 /// dans les deux sens : une cellule vide en tête d'un tri descendant cacherait
@@ -201,9 +202,21 @@ impl ColonneDeTri {
             Self::Modifie => ("t.file_mtime".into(), Vide::Nul),
             // 0 écoute est un compte, pas une cellule vide : rien ne va en fin
             // de liste, une piste jamais jouée se range avec les zéros.
-            Self::Ecoutes => ("COALESCE(ec.n, 0)".into(), Vide::Nul),
+            // #7763 : plus les écoutes importées (`imported_plays`), comme
+            // `plays_for_tracks`.
+            Self::Ecoutes => (
+                "(COALESCE(ec.n, 0) + COALESCE(ip.play_count, 0))".into(),
+                Vide::Nul,
+            ),
             // Jamais jouée : pas de date, en fin de liste dans les deux sens.
-            Self::DerniereEcoute => ("ec.derniere".into(), Vide::Nul),
+            // La plus récente de l'historique et de l'import (#7763).
+            Self::DerniereEcoute => (
+                "(CASE WHEN ip.last_played_at IS NOT NULL \
+                   AND (ec.derniere IS NULL OR ip.last_played_at > ec.derniere) \
+                 THEN ip.last_played_at ELSE ec.derniere END)"
+                    .into(),
+                Vide::Nul,
+            ),
         }
     }
 
@@ -635,6 +648,44 @@ mod tests {
         let desc = titres(&repo.page_de_pistes(&d).unwrap());
         assert_eq!(desc.first().map(String::as_str), Some("Azur 100%"));
         assert_eq!(desc.last().map(String::as_str), Some("Été indien"));
+    }
+
+    /// #7763 — les écoutes importées comptent dans les tris « # écoutes » et
+    /// « Dernière écoute », comme dans les nombres affichés.
+    #[test]
+    fn i7763_le_tri_par_ecoutes_compte_les_ecoutes_importees() {
+        let (repo, ar, al) = base();
+        bibliotheque(&repo, &ar, &al);
+        historique(repo.db.as_ref());
+        // « Orphelin » (Éla Ferré) n'a aucune écoute d'historique.
+        let orphelin = repo
+            .page_de_pistes(&demande())
+            .unwrap()
+            .pistes
+            .into_iter()
+            .find(|t| t.title == "Orphelin")
+            .and_then(|t| t.id)
+            .unwrap();
+        crate::db::ecoutes_importees::EcoutesImporteesRepo::with_backend(repo.db.clone())
+            .ajouter(orphelin, 10, Some("2026-12-01T00:00:00Z"))
+            .unwrap();
+
+        let mut d = demande();
+        d.descendant = true;
+        d.tri = Some(ColonneDeTri::Ecoutes);
+        let page = repo.page_de_pistes(&d).unwrap();
+        assert_eq!(page.total, 7, "la jointure ne multiplie pas les lignes");
+        assert_eq!(
+            titres(&page)[..2],
+            ["Orphelin", "Dancing Queen"],
+            "10 écoutes importées passent devant 3 écoutes d'historique"
+        );
+        d.tri = Some(ColonneDeTri::DerniereEcoute);
+        assert_eq!(
+            titres(&repo.page_de_pistes(&d).unwrap())[..3],
+            ["Orphelin", "Été indien", "Dancing Queen"],
+            "la date importée la plus récente passe en tête"
+        );
     }
 
     /// tune-web-client#1470 — « # écoutes » et « Dernière écoute » : l'ordre

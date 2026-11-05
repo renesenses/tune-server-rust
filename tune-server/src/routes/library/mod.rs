@@ -66,6 +66,8 @@ mod reports;
 // fichiers de CETTE machine.
 pub(crate) mod reveler;
 mod search;
+/// #7857 — le spectrogramme d'une piste, en PNG, généré à la demande.
+mod spectrogramme;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
 // source de la même façon. Un seul point de vérité, partagé (#2147).
@@ -77,6 +79,8 @@ pub(crate) mod stats;
 mod tracks;
 pub(crate) mod write_tags;
 
+/// Les versions d'un même album regroupées sous une fiche (#7617).
+mod oeuvres;
 /// Les versions d'une piste regroupées par enregistrement (#2264).
 mod versions_groupes;
 use axum::Router;
@@ -382,6 +386,18 @@ pub fn router() -> Router<AppState> {
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
+        // #7617 — les œuvres : segments statiques AVANT `/albums/{id}`.
+        .route("/albums/works", get(oeuvres::lister_oeuvres))
+        .route("/albums/works/members", get(oeuvres::membres_des_oeuvres))
+        .route(
+            "/albums/works/settings",
+            get(oeuvres::lire_reglage).put(oeuvres::ecrire_reglage),
+        )
+        .route(
+            "/albums/works/preferred",
+            axum::routing::put(oeuvres::ecrire_preferee),
+        )
+        .route("/albums/{id}/versions", get(oeuvres::versions_de_l_album))
         // tune-web-client#1875 — admin, depuis cette machine seulement.
         .route("/reveal/available", get(reveler::revelation_disponible))
         .route("/albums/{id}/reveal", post(reveler::reveler_album))
@@ -496,6 +512,7 @@ pub fn router() -> Router<AppState> {
         // la demande (lecture seule, plafonnée, sans image).
         .route("/tracks/{id}/file-tags", get(tracks::track_file_tags))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
+        .route("/tracks/{id}/spectrogramme.png", get(spectrogramme::png))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))
         // #2264 — les mêmes candidats, regroupés par enregistrement, avec la
@@ -962,6 +979,10 @@ mod facettes_lentes_2144_tests;
 #[cfg(test)]
 #[path = "liste_dr_7580_tests.rs"]
 mod liste_dr_7580_tests;
+
+#[cfg(test)]
+#[path = "filtre_qualite_7725_tests.rs"]
+mod filtre_qualite_7725_tests;
 
 #[cfg(test)]
 #[path = "banc_repertoires_5998.rs"]

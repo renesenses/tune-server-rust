@@ -935,6 +935,81 @@ async fn export_multi_format(
     Ok((axum::http::StatusCode::OK, headers, content))
 }
 
+/// Ce qu'une ligne de .m3u désigne dans la bibliothèque LOCALE.
+pub(crate) enum LigneM3u {
+    Trouvee(i64),
+    Absente,
+    /// La recherche a échoué (base) : ce n'est pas « absente » (#2798).
+    ErreurDeRecherche(String),
+}
+
+/// Le rapprochement d'une ligne de .m3u avec une piste locale, partagé par
+/// l'import de liste de lecture (`import_m3u_file`) et l'import d'écoutes
+/// (#7763, `system::import`), pour qu'une ligne « trouvée » veuille dire la
+/// même chose dans les deux.
+///
+/// Chemin exact d'abord, dans un index chargé UNE fois (une seule requête,
+/// toutes sources : `file_path` est unique) ; puis une recherche plein texte
+/// par nom de fichier, BORNÉE : une liste géante qui ne correspond pas aux
+/// chemins de la bibliothèque ne lance pas une recherche coûteuse par ligne
+/// (Dominique : grosse .m3u qui fige l'écran).
+pub(crate) struct RapprochementLocalM3u<'a> {
+    track_repo: &'a TrackRepo,
+    path_to_id: std::collections::HashMap<String, tune_core::db::track_repo::InfoFichier>,
+    recherches: u32,
+    /// Vrai dès qu'une ligne n'a pas été cherchée faute de budget.
+    pub(crate) recherche_plafonnee: bool,
+    /// Lignes trouvées par la recherche par nom de fichier, et non par leur
+    /// chemin exact : le premier résultat, qui peut être une autre piste.
+    /// L'import d'écoutes les compte à part (#7763).
+    pub(crate) trouvees_par_recherche: u32,
+}
+
+impl<'a> RapprochementLocalM3u<'a> {
+    pub(crate) const MAX_SEARCH_FALLBACKS: u32 = 500;
+
+    /// NOT `unwrap_or_default()` on the index: an index we failed to read used
+    /// to become an empty map, so EVERY line fell through to "not found"
+    /// (#2798). The caller refuses before writing anything.
+    pub(crate) fn nouveau(track_repo: &'a TrackRepo) -> Result<Self, String> {
+        let path_to_id = track_repo
+            .get_all_file_info_by_path()
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            track_repo,
+            path_to_id,
+            recherches: 0,
+            recherche_plafonnee: false,
+            trouvees_par_recherche: 0,
+        })
+    }
+
+    pub(crate) fn piste(&mut self, line: &str) -> LigneM3u {
+        if let Some(info) = self.path_to_id.get(line) {
+            return LigneM3u::Trouvee(info.id);
+        }
+        if self.recherches >= Self::MAX_SEARCH_FALLBACKS {
+            self.recherche_plafonnee = true;
+            return LigneM3u::Absente;
+        }
+        self.recherches += 1;
+        let filename = std::path::Path::new(line)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(line);
+        match self.track_repo.search(filename, 1) {
+            Ok(results) => match results.first().and_then(|t| t.id) {
+                Some(id) => {
+                    self.trouvees_par_recherche += 1;
+                    LigneM3u::Trouvee(id)
+                }
+                None => LigneM3u::Absente,
+            },
+            Err(e) => LigneM3u::ErreurDeRecherche(e.to_string()),
+        }
+    }
+}
+
 async fn import_m3u_file(
     State(state): State<AppState>,
     profile: ActiveProfile,
@@ -1014,8 +1089,8 @@ async fn import_m3u_file(
     // (`file_path TEXT UNIQUE`). Restreindre à `source = 'local'` faisait
     // retomber sur la recherche FTS — ou sur « introuvable » — une piste que la
     // base tenait pourtant sous une source d'importation (#2939).
-    let path_to_id = match track_repo.get_all_file_info_by_path() {
-        Ok(map) => map,
+    let mut locales = match RapprochementLocalM3u::nouveau(&track_repo) {
+        Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "m3u_import_file_index_unavailable");
             return (
@@ -1026,13 +1101,6 @@ async fn import_m3u_file(
         }
     };
 
-    // The FTS fallback (filename→search) stays for paths that don't match
-    // exactly, but is BOUNDED: a fully-mismatched huge playlist can't run an
-    // unbounded number of costly searches. Beyond the cap, unmatched lines are
-    // recorded as not-found without searching (logged once).
-    const MAX_SEARCH_FALLBACKS: u32 = 500;
-    let mut search_fallbacks = 0u32;
-    let mut fallback_capped = false;
     // A search that ERRORS is not a line "absent from the library" — counting
     // it as not-found told the user their file was wrong when the database had
     // failed (#2798). Its own bucket, so total = matched + not_found +
@@ -1063,40 +1131,20 @@ async fn import_m3u_file(
             continue;
         }
 
-        // Exact path match (O(1) map lookup).
-        if let Some(info) = path_to_id.get(line) {
-            entrees.push(EntryContent::Local(info.id));
-            matched += 1;
-            continue;
-        }
-
-        // Filename-stem FTS fallback, bounded.
-        if search_fallbacks < MAX_SEARCH_FALLBACKS {
-            search_fallbacks += 1;
-            let filename = std::path::Path::new(line)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(line);
-            match track_repo.search(filename, 1) {
-                Ok(results) => {
-                    if let Some(track) = results.first()
-                        && let Some(id) = track.id
-                    {
-                        entrees.push(EntryContent::Local(id));
-                        matched += 1;
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    if lookup_errors == 0 {
-                        tracing::warn!(error = %e, "m3u_import_file_lookup_error");
-                    }
-                    lookup_errors += 1;
-                    continue;
-                }
+        match locales.piste(line) {
+            LigneM3u::Trouvee(id) => {
+                entrees.push(EntryContent::Local(id));
+                matched += 1;
+                continue;
             }
-        } else {
-            fallback_capped = true;
+            LigneM3u::ErreurDeRecherche(e) => {
+                if lookup_errors == 0 {
+                    tracing::warn!(error = %e, "m3u_import_file_lookup_error");
+                }
+                lookup_errors += 1;
+                continue;
+            }
+            LigneM3u::Absente => {}
         }
 
         not_found_count += 1;
@@ -1105,11 +1153,12 @@ async fn import_m3u_file(
         }
     }
 
+    let fallback_capped = locales.recherche_plafonnee;
     if fallback_capped {
         tracing::warn!(
             total_entries,
             matched,
-            search_cap = MAX_SEARCH_FALLBACKS,
+            search_cap = RapprochementLocalM3u::MAX_SEARCH_FALLBACKS,
             "m3u_import_search_fallback_capped — many entries don't match library paths; \
              fuzzy search skipped past the cap to avoid a long-running import"
         );
