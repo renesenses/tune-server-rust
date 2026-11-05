@@ -138,9 +138,17 @@ fn la_migration_136_pose_la_source_et_attribue_une_fois_les_lignes_existantes() 
 
     // La jumelle PG existe, est enregistrée au rang 101 et marque ce numéro.
     let sql_pg = include_str!("../../migrations/postgres/101_credits_source.sql");
-    let migrations = include_str!("../db/migrations.rs");
+    // `PG_MIGRATIONS` n'existe que sous la fonctionnalité `postgres` : on lit
+    // son entrée dans le source, blancs retirés, pour ne dépendre ni de la mise
+    // en forme ni de la fonctionnalité.
+    let migrations: String = include_str!("../db/migrations.rs")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     assert!(
-        migrations.contains("101_credits_source.sql") && migrations.contains("(\n        101,"),
+        migrations.contains(
+            "(101,\"credits_source\",include_str!(\"../../migrations/postgres/101_credits_source.sql\"),)"
+        ),
         "101_credits_source.sql n'est pas enregistrée au rang 101 dans PG_MIGRATIONS"
     );
     assert!(sql_pg.contains("VALUES (101, 'credits_source')"));
