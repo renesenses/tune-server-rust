@@ -442,7 +442,7 @@ pub(crate) fn coupure_du_spectre_moyen(
         if trames == 0 {
             Vec::new()
         } else {
-            vec![0..trames]
+            std::iter::once(0..trames).collect()
         }
     };
     let m = mesurer_selon(
