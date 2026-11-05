@@ -295,3 +295,22 @@ fn une_compilation_et_un_album_sans_artiste_unique_ne_bougent_pas() {
     );
     assert_eq!(artiste_de(&db, id).as_deref(), Some(UNKNOWN_ARTIST_NAME));
 }
+
+#[test]
+fn une_relecture_sans_artiste_garde_l_artiste_balise_en_artist_seul() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = base();
+    let mut balises = fichiers(tmp.path(), true);
+    for f in &mut balises {
+        f.metadata.as_mut().unwrap().album_artist = None;
+    }
+    scanner(&db, tmp.path(), &balises, true);
+    let avant = rangement(&db, &balises);
+    assert_eq!(avant[0].1.as_deref(), Some(ARTISTE));
+    scanner(&db, tmp.path(), &fichiers(tmp.path(), false), true);
+    let apres = rangement(&db, &balises);
+    assert!(
+        apres.iter().all(|r| r == &avant[0]),
+        "#6459 — un album balisé en ARTIST seul a été rétrogradé : après {apres:?}"
+    );
+}

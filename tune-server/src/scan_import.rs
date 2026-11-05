@@ -988,7 +988,12 @@ impl TrackImporter {
     /// `quality_split`. Sans quoi l'album entier passait sous « Unknown
     /// Artist » et aucun scan suivant ne le réparait, ses fichiers étant
     /// inchangés.
-    fn album_du_fichier_a_reprendre(&mut self, chemin: &str, cle: &CleDAlbum) -> Option<Album> {
+    fn album_du_fichier_a_reprendre(
+        &mut self,
+        chemin: &str,
+        cle: &CleDAlbum,
+        lu_depuis_le_chemin: bool,
+    ) -> Option<Album> {
         let (dossier, titre, artiste, annee, mbid) = cle;
         let mut ancien = self.album_repo.album_du_fichier(chemin).ok().flatten()?;
         let id = ancien.id?;
@@ -1009,7 +1014,10 @@ impl TrackImporter {
         {
             return None;
         }
-        if self.album_repo.retrograderait_l_artiste(&ancien, *artiste) {
+        if self
+            .album_repo
+            .retrograderait_l_artiste(&ancien, *artiste, lu_depuis_le_chemin)
+        {
             tracing::info!(
                 album_id = id,
                 album = %titre,
@@ -1839,7 +1847,9 @@ impl TrackImporter {
                     );
                 }
                 Some(c)
-            } else if let Some(reprise) = self.album_du_fichier_a_reprendre(&sf.path, key) {
+            } else if let Some(reprise) =
+                self.album_du_fichier_a_reprendre(&sf.path, key, meta.artist_from_path)
+            {
                 // #5837 — la ligne que ce fichier occupe déjà, reprise sous
                 // son nouvel artiste : voir `album_du_fichier_a_reprendre`.
                 let a = Arc::new(reprise);

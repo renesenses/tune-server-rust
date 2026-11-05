@@ -259,6 +259,17 @@ pub mod sql {
          ORDER BY a.id, t.id"
     }
 
+    /// #6459 — chemin, balise `album_artist` et artiste de chaque piste d'un
+    /// album.
+    pub fn balises_d_artiste_des_pistes<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT t.file_path, t.album_artist, tar.name FROM tracks t \
+             LEFT JOIN artists tar ON tar.id = t.artist_id \
+             WHERE t.album_id = {}",
+            d.placeholder(1)
+        )
+    }
+
     /// Les numéros de disque distincts déjà rangés sous un album (C4).
     pub fn disc_numbers_of<D: SqlDialect>(d: &D) -> String {
         format!(
@@ -2481,19 +2492,35 @@ impl AlbumRepo {
     }
 
     /// #6459 — vrai si donner `artist_id` à `album` remplacerait un artiste
-    /// NOMMÉ par « Unknown Artist » (ou un nom vide, ou un artiste disparu).
+    /// NOMMÉ, que la base rattache à une balise, par « Unknown Artist » (ou un
+    /// nom vide, ou un artiste disparu).
     ///
     /// C'est la règle de [`Self::reclaim_unknown_artist`], lue dans l'autre
     /// sens : un fichier relu sans balise d'artiste ne rétrograde jamais un
     /// album déjà résolu. « Various Artists » n'est pas concerné : il vient du
     /// verdict compilation, qui a ses propres règles.
-    pub fn retrograderait_l_artiste(&self, album: &Album, artist_id: i64) -> bool {
+    ///
+    /// L'artiste actuel n'est gardé que si une piste de l'album le porte en
+    /// balise `album_artist`, ou comme artiste de piste — et, quand
+    /// `lu_depuis_le_chemin` (le fichier relu n'a pas de balises lisibles),
+    /// seulement si ce nom n'est pas un dossier de son chemin. Sans quoi un
+    /// faux artiste tiré d'un nom de dossier ou de montage par une version
+    /// antérieure (#6737) ne pourrait plus jamais être effacé.
+    pub fn retrograderait_l_artiste(
+        &self,
+        album: &Album,
+        artist_id: i64,
+        lu_depuis_le_chemin: bool,
+    ) -> bool {
         fn inconnu(nom: Option<&str>) -> bool {
             nom.map(str::trim).is_none_or(|n| {
                 n.is_empty() || n.eq_ignore_ascii_case(crate::db::artist_repo::UNKNOWN_ARTIST_NAME)
             })
         }
-        if album.artist_id == Some(artist_id) || inconnu(album.artist_name.as_deref()) {
+        let (Some(album_id), Some(actuel)) = (album.id, album.artist_name.as_deref()) else {
+            return false;
+        };
+        if album.artist_id == Some(artist_id) || inconnu(Some(actuel)) {
             return false;
         }
         let sql = self.dialect_sql(sql::get_artist_name, sql::get_artist_name);
@@ -2504,12 +2531,35 @@ impl AlbumRepo {
             .ok()
             .flatten()
             .and_then(|row| row.first()?.as_string());
-        inconnu(demande.as_deref())
+        if !inconnu(demande.as_deref()) {
+            return false;
+        }
+        let actuel = actuel.trim();
+        let meme = |nom: Option<String>| nom.is_some_and(|n| n.trim().eq_ignore_ascii_case(actuel));
+        let sql = self.dialect_sql(
+            sql::balises_d_artiste_des_pistes,
+            sql::balises_d_artiste_des_pistes,
+        );
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        self.db
+            .query_many_strong(&sql, &params)
+            .unwrap_or_default()
+            .iter()
+            .any(|r| {
+                let chemin = r.first().and_then(|v| v.as_string()).unwrap_or_default();
+                let dossier_du_chemin = chemin
+                    .split(['/', '\\'])
+                    .any(|d| d.trim().eq_ignore_ascii_case(actuel));
+                meme(r.get(1).and_then(|v| v.as_string()))
+                    || (meme(r.get(2).and_then(|v| v.as_string()))
+                        && !(lu_depuis_le_chemin && dossier_du_chemin))
+            })
     }
 
     /// [`Self::retrograderait_l_artiste`] pour un album désigné par son
     /// identifiant, lu par la connexion d'écriture (le scan tient sa
-    /// transaction de lot).
+    /// transaction de lot). Sans savoir comment le fichier a été lu, la
+    /// règle la plus stricte s'applique.
     fn retrograderait_l_artiste_de(&self, album_id: i64, artist_id: i64) -> bool {
         let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
         let params: [&dyn ToSqlValue; 1] = [&album_id];
@@ -2517,7 +2567,7 @@ impl AlbumRepo {
             .query_one_strong(&sql, &params)
             .ok()
             .flatten()
-            .is_some_and(|row| self.retrograderait_l_artiste(&row_to_album(&row), artist_id))
+            .is_some_and(|row| self.retrograderait_l_artiste(&row_to_album(&row), artist_id, true))
     }
 
     /// #6459 — rend son artiste, SANS relire un fichier, à un album local
