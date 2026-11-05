@@ -159,6 +159,9 @@ impl PlaybackOrchestrator {
         if erreur.starts_with("hqplayer_output_start_failed:") {
             return crate::outputs::hqplayer::MESSAGE_ECHEC_DE_SORTIE.into();
         }
+        if erreur.starts_with("hqplayer_control_unsolicited_response:") {
+            return crate::outputs::hqplayer::MESSAGE_OCTETS_NON_SOLLICITES.into();
+        }
         if dsd_mode == "native" && annonce == Some(false) && est_dsd_brut(mime_type) {
             return format!(
                 "Output device error: le mode DSD de cette zone est réglé sur « natif » \
