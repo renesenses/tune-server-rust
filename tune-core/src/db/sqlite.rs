@@ -757,7 +757,10 @@ CREATE TABLE IF NOT EXISTS track_credits (
     instrument TEXT,
     position INTEGER DEFAULT 0,
     -- Identifiant MusicBrainz de l'artiste credite (migration 107, #4767).
-    artist_mbid TEXT
+    artist_mbid TEXT,
+    -- D'ou vient le credit (migration 136, #7765) : manuel, musicbrainz,
+    -- balises, discogs ou roon. NULL = ligne ancienne, source inconnue.
+    source TEXT
 );
 
 -- Persistent per-file first-seen-in-library timestamp, keyed by path.

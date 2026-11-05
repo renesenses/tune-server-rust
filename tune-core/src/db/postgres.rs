@@ -396,6 +396,11 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // #6463 — la provenance du MBID d'artiste (PG 097). Ici AUSSI : une base
     // de bascule ne rejoue pas la 097, et le scan comme la fiche la NOMMENT.
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS musicbrainz_id_source TEXT",
+    // #7765 — la source d'un crédit de piste (PG 101). Ici AUSSI : tous les
+    // écrivains de crédits et les passes « à faire » NOMMENT la colonne.
+    // L'index JUSTE APRÈS la colonne.
+    "ALTER TABLE track_credits ADD COLUMN IF NOT EXISTS source TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_track_credits_track_source ON track_credits(track_id, source)",
     // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,
     // même raison : une base de bascule ne rejouera jamais la 078, alors que
     // l'écriture de la file, des favoris et de l'historique nomme la colonne.

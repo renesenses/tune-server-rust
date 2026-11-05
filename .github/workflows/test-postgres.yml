@@ -795,6 +795,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_4984 -- --nocapture --test-threads=1
 
+      # #7765 — la SOURCE des crédits de piste (migration PG 101). Attribution
+      # unique des lignes existantes, purge limitée à la source réécrite et
+      # filtre « à faire » qui ignore les balises, joués sur la VRAIE base.
+      # Sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Source des crédits de piste sur PostgreSQL (#7765)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_source_7765 -- --nocapture --test-threads=1
+
       # #5007 — la purge des artistes orphelins. PostgreSQL refusait le DELETE
       # entier par `albums_artist_id_fkey` dès qu'un artiste d'album n'avait
       # aucune piste à lui : plus aucun orphelin purgé. Sans cette étape, le
