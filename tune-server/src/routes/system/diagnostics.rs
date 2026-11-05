@@ -963,14 +963,9 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let rss_mb = get_rss_mb();
     // #5189 — température du processeur pour l'écran « État du serveur ».
     let cpu_temp_c = temperature_processeur().await;
-    // #5410 — sans température lisible, les analyses de fond sont bridées à
-    // un fichier à la fois : l'écran doit le dire.
-    // #6713 — sauf si l'utilisateur a levé ce bridage : le motif passe alors
-    // dans `analyses_bridage_leve`, et `analyses_bridees` est nul.
-    let (analyses_bridees, analyses_bridage_leve) = repartir_le_bridage(
-        bridage_des_analyses().await,
-        tune_core::taches_de_fond::vitesse::bridage_leve(&state.backend),
-    );
+    // #6450 — sans température lisible, les analyses de fond gardent leur
+    // vitesse, sans garde thermique : l'écran doit l'avertir.
+    let temperature_illisible = motif_de_temperature_illisible().await;
 
     // #3205 — le seul chiffre qui dise si l'audio a réellement sauté.
     let ring_starvation = releve_famine_anneau(&state).await;
@@ -1007,16 +1002,12 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // Windows sans zone thermique, conteneur, machine virtuelle) ou si la
         // lecture tarde. #5410 : Windows lit ses zones thermiques ACPI.
         "cpu_temp_c": cpu_temp_c,
-        // #5410 — `null` quand la garde thermique mesure ; sinon le motif
-        // (`temperature_illisible`, `temperature_figee`) : les analyses de
-        // fond tournent alors à `analyses_bridees_largeur` fichier à la fois.
-        "analyses_bridees": analyses_bridees,
-        "analyses_bridees_largeur": analyses_bridees
-            .map(|_| tune_core::audio::thermal::LARGEUR_SANS_THERMOMETRE),
-        // #6713 — le motif quand la température est illisible MAIS que
-        // l'utilisateur a levé le bridage (Réglages, niveau Expert) : les
-        // analyses tournent à la vitesse réglée. `null` sinon.
-        "analyses_bridage_leve": analyses_bridage_leve,
+        // #6450 — `null` quand la garde thermique mesure ; sinon le motif
+        // (`temperature_illisible`, `temperature_figee`) : un avertissement,
+        // les analyses de fond tournent à la vitesse réglée sans garde
+        // thermique. Remplace `analyses_bridees` et `analyses_bridage_leve`
+        // (#5410, #6713) : une température illisible ne bride plus.
+        "temperature_illisible": temperature_illisible,
         "db_backend": db_backend,
         "active_zones": zone_count,
         "zone_poller_metrics": zone_poller_metrics,
@@ -1136,30 +1127,16 @@ async fn temperature_processeur() -> Option<f64> {
     }
 }
 
-/// #6713 — `(analyses_bridees, analyses_bridage_leve)` : le motif d'une
-/// température illisible va au premier quand le bridage s'applique (le
-/// défaut), au second quand l'utilisateur l'a levé. Jamais aux deux.
-fn repartir_le_bridage(
-    motif: Option<&'static str>,
-    bridage_leve: bool,
-) -> (Option<&'static str>, Option<&'static str>) {
-    if bridage_leve {
-        (None, motif)
-    } else {
-        (motif, None)
-    }
-}
-
-/// #5410 — le motif du bridage des analyses de fond, ou `None` quand la
-/// température est lisible. Même lecture que celle des analyses
+/// #5410, #6450 — pourquoi la température manque, ou `None` quand elle est
+/// lisible. Même lecture que celle des analyses
 /// (`tune_core::audio::thermal::lecture_thermique`, relue au plus toutes les
 /// 15 s), passée hors de l'exécuteur et abandonnée au-delà de 300 ms comme
 /// la température : un capteur lent ne retient pas le rapport. Un abandon
 /// rend `None` (rien n'est affirmé).
-async fn bridage_des_analyses() -> Option<&'static str> {
+async fn motif_de_temperature_illisible() -> Option<&'static str> {
     let lecture = tokio::task::spawn_blocking(|| {
         tune_core::audio::thermal::lecture_thermique()
-            .motif_du_bridage()
+            .motif_illisible()
             .map(|m| m.id())
     });
     match tokio::time::timeout(std::time::Duration::from_millis(300), lecture).await {
@@ -5416,27 +5393,5 @@ mod zones_masquees_au_rapport_6378 {
             lignes_zones_masquees(&Err("no such column".into())),
             "- Zones masquées : illisibles (no such column)\n"
         );
-    }
-}
-
-#[cfg(test)]
-mod tests_bridage_leve_6713 {
-    use super::repartir_le_bridage;
-
-    /// #6713 — par défaut, le motif reste dans `analyses_bridees` (#6450) ;
-    /// bridage levé, il passe dans `analyses_bridage_leve`, jamais aux deux.
-    #[test]
-    fn le_motif_va_a_un_seul_champ_selon_le_reglage() {
-        assert_eq!(
-            repartir_le_bridage(Some("temperature_illisible"), false),
-            (Some("temperature_illisible"), None)
-        );
-        assert_eq!(
-            repartir_le_bridage(Some("temperature_figee"), true),
-            (None, Some("temperature_figee"))
-        );
-        // Température lisible : rien à dire, réglage ou non.
-        assert_eq!(repartir_le_bridage(None, true), (None, None));
-        assert_eq!(repartir_le_bridage(None, false), (None, None));
     }
 }

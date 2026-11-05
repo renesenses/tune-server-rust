@@ -506,8 +506,9 @@ pub(super) async fn get_config(
             json!(tune_core::taches_de_fond::vitesse::Vitesse::default().id()),
         ),
         // #6713 — lever le bridage des analyses quand la température est
-        // illisible. Désactivé par défaut, publié avec son défaut pour que le
-        // client distingue « éteint » de « pas lu ».
+        // illisible. Sans effet depuis #6450 (plus de bridage sur une
+        // température illisible) ; publié avec son défaut pour les clients
+        // qui le lisent encore.
         (
             tune_core::taches_de_fond::vitesse::CLE_LEVER_LE_BRIDAGE,
             json!(tune_core::taches_de_fond::vitesse::LEVER_LE_BRIDAGE_DEFAUT),
@@ -1384,12 +1385,8 @@ fn normaliser_levee_du_bridage(
             )));
         }
     };
-    if valeur {
-        tracing::warn!(
-            "analyses_bridage_leve_par_reglage — sans température lisible, les analyses de fond \
-             tourneront à la vitesse réglée (choix de l'utilisateur, #6713)"
-        );
-    }
+    // #6450 : sans effet, une température illisible ne bride plus. La
+    // valeur reste acceptée et gardée pour les clients qui l'écrivent.
     values.insert(CLE_LEVER_LE_BRIDAGE.to_string(), json!(valeur));
     Ok(())
 }
