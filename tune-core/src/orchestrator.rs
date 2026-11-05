@@ -2027,6 +2027,9 @@ mod greffon_natif_tiers_reseau_7616_tests;
 // #6780 — PURE contourne aussi la réaffectation des canaux armée de la zone.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_6780_tests;
+// #7932 — PURE contourne aussi la réaffectation des canaux de l'album joué.
+#[cfg(all(test, feature = "local-audio"))]
+mod pure_reaffectation_album_7932_tests;
 // #6256 — la désinstallation d'un greffon natif tiers ne rebâtit que les
 // zones qui l'utilisent.
 #[cfg(all(test, feature = "local-audio"))]

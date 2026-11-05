@@ -778,6 +778,7 @@ impl PlaybackOrchestrator {
             let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
                 return RapportEqAChaud::echoue(device_id, EchecEqLocal::SortieAbsenteDuRegistre);
             };
+            let track_id = self.piste_en_cours(zone_id).await;
             let output = output_arc.lock().await;
             let Some(local_output) = output
                 .as_any()
@@ -787,7 +788,7 @@ impl PlaybackOrchestrator {
             };
             // #6522 — armer ou désarmer l'égaliseur (ou la correction de pièce,
             // qui passe par ici) sous PURE change ce que PURE contourne.
-            self.poser_ce_que_pure_contourne(zone_id, local_output);
+            self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
             // Pas de flux en cours : la prochaine lecture rebâtira l'EQ de
             // toute façon, et bâtir pour un format inconnu donnerait des
             // coefficients faux.
@@ -1519,13 +1520,14 @@ impl PlaybackOrchestrator {
                 return None;
             }
             let output_arc = { self.outputs.lock().await.get(&device_id) }?;
+            let track_id = self.piste_en_cours(zone_id).await;
             let output = output_arc.lock().await;
             let local_output = output
                 .as_any()
                 .downcast_ref::<crate::outputs::local::LocalOutput>()?;
             // #6522 — crossfeed et greffons natifs passent par ici : sous PURE,
             // ce que PURE contourne change avec eux.
-            self.poser_ce_que_pure_contourne(zone_id, local_output);
+            self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
             // Pas de flux en cours : la prochaine lecture rebâtira le crossfeed
             // de toute façon, et le bâtir pour un taux inconnu donnerait une
             // ligne à retard de la mauvaise longueur.
@@ -1630,7 +1632,7 @@ impl PlaybackOrchestrator {
                 if local_output.flux_en_demarrage() {
                     let pure = self.zone_audiophile(zone_id);
                     local_output.set_pure_bypass(pure);
-                    self.poser_ce_que_pure_contourne(zone_id, local_output);
+                    self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
                     info!(zone_id, pure, "zone_pure_reportee_au_flux_qui_demarre");
                     return true;
                 }
@@ -1641,7 +1643,7 @@ impl PlaybackOrchestrator {
             local_output.set_pure_bypass(pure);
             // #6522, #6524 — le verdict PURE suit les RÉGLAGES, que la bascule
             // ne change pas ; la chaîne, elle, va être vidée juste en dessous.
-            self.poser_ce_que_pure_contourne(zone_id, local_output);
+            self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
             // Mêmes expressions que le bloc du chemin de lecture, à dessein :
             // toutes trois rendent `None`/1.0 en PURE, donc l'état repoussé est
             // celui qu'une lecture démarrée maintenant produirait.
@@ -1972,11 +1974,37 @@ impl PlaybackOrchestrator {
     /// `channel-remap`), que PURE coupe aussi (`regle_effective_with` rend
     /// `None` en PURE) : elle n'était pas comptée, et le bouclier disait
     /// « rien à contourner » pendant que PURE la contournait.
+    ///
+    /// #7932 — et la règle de réaffectation de l'ALBUM de la piste en cours,
+    /// que PURE coupe de même : sans elle, une zone sans règle propre mais
+    /// dont l'album joué a la sienne (ampli AV en 7.1) voyait son bouclier se
+    /// vider au premier bloc publié par la sortie exclusive (WASAPI exclusif,
+    /// ASIO). Sans piste connue, seule la règle de zone est lue.
     #[cfg(feature = "local-audio")]
-    pub(super) fn pure_contourne_un_reglage(&self, zone_id: i64) -> bool {
+    pub(super) fn pure_contourne_un_reglage(&self, zone_id: i64, track_id: Option<i64>) -> bool {
         self.traitement_que_pure_gouverne(zone_id, None).is_some()
             || Self::zone_mono_downmix_configure_with(&self.db, zone_id)
             || Self::reaffectation_de_zone_armee_with(&self.db, zone_id)
+            || track_id.is_some_and(|tid| Self::reaffectation_d_album_armee_with(&self.db, tid))
+    }
+
+    /// #7932 — la règle de réaffectation de l'ALBUM de cette piste est-elle
+    /// armée pour ses canaux ? Même décision que la lecture
+    /// (`reaffectation_canaux::regle_effective_with`), PURE mis à part.
+    #[cfg(feature = "local-audio")]
+    fn reaffectation_d_album_armee_with(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        track_id: i64,
+    ) -> bool {
+        use crate::audio::reaffectation_canaux as rc;
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
+        if !crate::audio::premium_plugins::enabled(&settings, rc::ID_GREFFON) {
+            return false;
+        }
+        let (album_id, canaux) = rc::album_et_canaux_de_la_piste(db, track_id);
+        album_id.is_some_and(|a| {
+            rc::resoudre(None, rc::lire(&settings, &rc::cle_d_album(a)), canaux).is_some()
+        })
     }
 
     /// #6780 — la règle de réaffectation des canaux de la ZONE est-elle
@@ -2001,9 +2029,23 @@ impl PlaybackOrchestrator {
     pub(super) fn poser_ce_que_pure_contourne(
         &self,
         zone_id: i64,
+        track_id: Option<i64>,
         local_output: &crate::outputs::local::LocalOutput,
     ) {
-        local_output.set_pure_contourne_un_reglage(self.pure_contourne_un_reglage(zone_id));
+        local_output
+            .set_pure_contourne_un_reglage(self.pure_contourne_un_reglage(zone_id, track_id));
+    }
+
+    /// #7932 — la piste en cours de la zone, pour
+    /// [`Self::poser_ce_que_pure_contourne`]. À lire AVANT le verrou de la
+    /// sortie : `get_state` prend ses propres verrous.
+    #[cfg(feature = "local-audio")]
+    async fn piste_en_cours(&self, zone_id: i64) -> Option<i64> {
+        self.playback
+            .get_state(zone_id)
+            .await
+            .now_playing
+            .and_then(|np| np.track_id)
     }
 
     /// Build the room-correction FIR convolver for a zone's TRANSCODED stream,
@@ -2619,6 +2661,7 @@ impl PlaybackOrchestrator {
             let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
                 return false;
             };
+            let track_id = self.piste_en_cours(zone_id).await;
             let output = output_arc.lock().await;
             let Some(local_output) = output
                 .as_any()
@@ -2628,7 +2671,7 @@ impl PlaybackOrchestrator {
             };
             let mono = self.zone_mono_downmix(zone_id);
             local_output.set_mono_downmix(mono);
-            self.poser_ce_que_pure_contourne(zone_id, local_output);
+            self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
             info!(
                 zone_id,
                 device_id = %device_id,
