@@ -1103,13 +1103,23 @@ impl PositionPoller {
             // ── #7636 — un autre point de contrôle tient le renderer OpenHome ──
             //
             // Kazoo a chargé sa liste et la joue. Tant que la zone se croit en
-            // lecture, la moindre relance automatique de la suite de ce tour
-            // repasse par `play_media`, dont le `DeleteAll` efface cette liste.
-            // Pendant les relevés qui précèdent le verdict, le tour s'arrête
-            // ici ; au troisième, la zone lâche l'appareil sans lui envoyer
-            // d'ordre. Voir
+            // lecture, la suite de ce tour prend le morceau de Kazoo pour le
+            // sien : à sa fin, elle enchaîne sur la piste suivante de la file
+            // (`play_media`, dont le `DeleteAll` efface cette liste, puis
+            // l'`Insert` de la suivante armée). Pendant les relevés qui
+            // précèdent le verdict, le tour s'arrête donc ici, position
+            // comprise : celle que rapporte l'appareil est celle de Kazoo, pas
+            // la nôtre. Au troisième, la zone lâche l'appareil sans lui envoyer
+            // d'ordre. Juste après un chargement fait par Tune, l'URI
+            // rapportée peut être encore l'ancienne : rien n'est compté avant
+            // `decisions::DELAI_AVANT_DE_JUGER_LA_TENUE_SECS`, et la série
+            // repart de zéro. Voir
             // `decisions::renderer_tenu_par_un_autre_point_de_controle`.
-            if zone_state.state == PlayState::Playing {
+            if zone_state.state == PlayState::Playing
+                && !decisions::tenue_jugeable(ps.track_loaded_at.elapsed().as_secs())
+            {
+                ps.tenue_etrangere_ticks = 0;
+            } else if zone_state.state == PlayState::Playing {
                 let output_type = all_zones
                     .iter()
                     .find(|z| z.id == Some(zone_id))

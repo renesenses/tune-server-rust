@@ -90,6 +90,18 @@ pub fn renderer_tenu_par_un_autre_point_de_controle(
 /// peut montrer un instant l'URI précédente.
 pub const RELEVES_AVANT_DE_CEDER: u8 = 3;
 
+/// #7636 — après un « Lire » fait dans Tune, le Linn peut rapporter encore
+/// quelques secondes l'URI du morceau que Kazoo jouait (événement Info en
+/// retard). Avant ce délai, compté depuis le chargement de la piste, une URI
+/// étrangère ne compte pas : la zone ne lâche pas sa propre lecture.
+pub const DELAI_AVANT_DE_JUGER_LA_TENUE_SECS: u64 = 10;
+
+/// #7636 — la piste chargée par Tune l'est-elle depuis assez longtemps pour
+/// qu'une URI étrangère dise qu'un autre point de contrôle a pris la main ?
+pub fn tenue_jugeable(secs_depuis_le_chargement: u64) -> bool {
+    secs_depuis_le_chargement >= DELAI_AVANT_DE_JUGER_LA_TENUE_SECS
+}
+
 /// Retrouver, dans l'URI qu'un renderer déclare jouer, le `stream_id` de la
 /// session Tune qu'il tire.
 ///
