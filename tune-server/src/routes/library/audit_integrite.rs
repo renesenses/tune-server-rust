@@ -77,8 +77,8 @@ pub(super) struct Etat {
     /// Début de cet audit (RFC 3339).
     #[serde(default)]
     debut: Option<String>,
-    /// Fin du dernier audit TERMINÉ (RFC 3339), d'un audit à l'autre : le
-    /// rappel périodique part de là.
+    /// Fin du dernier audit complet TERMINÉ (RFC 3339), d'un audit à l'autre :
+    /// le rappel périodique part de là. Un audit rapide ne la change pas.
     #[serde(default)]
     dernier_audit_termine: Option<String>,
     /// Complet (décodage et MD5) ou rapide (sommes du conteneur, #7847).
@@ -429,7 +429,11 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
         let lot = db.query_many(&format!("SELECT id, chemin, taille, date FROM ({selection}) candidats WHERE id > ? AND id <= ? ORDER BY id LIMIT 100"), &[&etat.curseur, &etat.dernier_id])?;
         if lot.is_empty() {
             etat.status = "completed".into();
-            etat.dernier_audit_termine = Some(chrono::Utc::now().to_rfc3339());
+            // Le rappel attend un audit qui a vérifié le MD5 : un audit
+            // rapide ne le repousse pas.
+            if etat.mode == Mode::Complet {
+                etat.dernier_audit_termine = Some(chrono::Utc::now().to_rfc3339());
+            }
             sauver(db, etat, None)?;
             // La référence n'a plus d'usage. Un échec ne fait que la laisser
             // en place jusqu'au prochain lancement, qui la supprime.

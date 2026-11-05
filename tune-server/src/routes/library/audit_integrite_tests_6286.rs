@@ -336,6 +336,10 @@ async fn le_mode_rapide_nomme_la_trame_et_ne_sert_pas_de_preuve_au_complet() {
 
     let rapide = banc.auditer_en(false, Mode::Rapide);
     assert_eq!(rapide.mode, Mode::Rapide);
+    assert_eq!(
+        rapide.dernier_audit_termine, None,
+        "un audit rapide, sans MD5, a repoussé le rappel"
+    );
     let rapport = banc.rapport(&rapide);
     assert_eq!(rapport["sain.flac"].resultat.verdict, Verdict::Sain);
     assert_eq!(rapport["sain.flac"].mode, Mode::Rapide);
@@ -365,7 +369,12 @@ async fn le_mode_rapide_nomme_la_trame_et_ne_sert_pas_de_preuve_au_complet() {
     assert_eq!(rapport["octet.flac"].resultat.code, "md5_incorrect");
 
     // Rapide « fichiers changés seulement » : tout est repris du complet.
+    assert!(complet.dernier_audit_termine.is_some());
     let reprise = banc.auditer_en(true, Mode::Rapide);
     assert_eq!(reprise.reutilises, 4);
+    assert_eq!(
+        reprise.dernier_audit_termine, complet.dernier_audit_termine,
+        "le rappel part du dernier audit complet"
+    );
     assert_eq!(banc.rapport(&reprise)["octet.flac"].mode, Mode::Complet);
 }
