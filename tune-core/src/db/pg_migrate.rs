@@ -232,6 +232,9 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Notes personnelles (#7849), créées par le script 103. Le script en
     // reprend les notes d'album ; la copie, qui suit, n'écrase pas.
     "notes_personnelles",
+    // Clés des clients Subsonic (#7855, script 104) : sans cette ligne, chaque
+    // client devrait être réappairé après la bascule.
+    "cles_clients",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",
