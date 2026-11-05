@@ -40,7 +40,10 @@ async fn envoyer(app: &Router, requete: Request<Body>) -> (StatusCode, Value) {
     let octets = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    (statut, serde_json::from_slice(&octets).unwrap_or(Value::Null))
+    (
+        statut,
+        serde_json::from_slice(&octets).unwrap_or(Value::Null),
+    )
 }
 
 async fn regler_serveur(app: &Router, actif: bool) -> Value {
@@ -54,7 +57,11 @@ async fn regler_serveur(app: &Router, actif: bool) -> Value {
             .unwrap(),
     )
     .await;
-    assert_eq!(statut, StatusCode::OK, "le PATCH doit être accepté : {corps}");
+    assert_eq!(
+        statut,
+        StatusCode::OK,
+        "le PATCH doit être accepté : {corps}"
+    );
     corps
 }
 
@@ -83,7 +90,9 @@ async fn port_libre_tcp_et_udp() -> u16 {
 }
 
 async fn tcp_libre(port: u16) -> bool {
-    tokio::net::TcpListener::bind(("0.0.0.0", port)).await.is_ok()
+    tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .is_ok()
 }
 
 async fn udp_libre(port: u16) -> bool {
@@ -133,7 +142,10 @@ async fn le_reglage_ouvre_et_rend_les_ports_squeezebox_7374() {
     // SAFETY : seule épreuve de ce binaire, posée avant toute tâche qui lit
     // l'environnement.
     unsafe {
-        std::env::set_var(tune_core::slimproto::VARIABLE_PORT, port_slimproto.to_string());
+        std::env::set_var(
+            tune_core::slimproto::VARIABLE_PORT,
+            port_slimproto.to_string(),
+        );
         std::env::set_var("TUNE_CLI_PORT", port_cli.to_string());
     }
 
@@ -150,7 +162,11 @@ async fn le_reglage_ouvre_et_rend_les_ports_squeezebox_7374() {
 
     // ---- 1. Rallumé : les trois volets écoutent.
     let reponse = regler_serveur(&app, true).await;
-    assert_eq!(reponse["slimproto_server_applied"], json!(true), "{reponse}");
+    assert_eq!(
+        reponse["slimproto_server_applied"],
+        json!(true),
+        "{reponse}"
+    );
     assert_eq!(reponse["slimproto_server_restart_required"], json!(false));
     assert!(
         sous_peu(|| tcp_ecoute(port_slimproto)).await,
@@ -175,7 +191,11 @@ async fn le_reglage_ouvre_et_rend_les_ports_squeezebox_7374() {
 
     // ---- 2. Coupé : les ports sont rendus DÈS la réponse.
     let reponse = regler_serveur(&app, false).await;
-    assert_eq!(reponse["slimproto_server_applied"], json!(true), "{reponse}");
+    assert_eq!(
+        reponse["slimproto_server_applied"],
+        json!(true),
+        "{reponse}"
+    );
     assert!(
         tcp_libre(port_slimproto).await,
         "réglage coupé, le port TCP SlimProto doit être rendu dès la réponse : \
@@ -201,11 +221,18 @@ async fn le_reglage_ouvre_et_rend_les_ports_squeezebox_7374() {
     assert_eq!(etat["slimproto_server_enabled"], json!(false), "{etat}");
     assert!(etat["slimproto"].is_null(), "rien n'est ouvert : {etat}");
     assert!(etat["lms_cli"].is_null(), "rien n'est ouvert : {etat}");
-    assert!(etat["slimproto_udp"].is_null(), "rien n'est ouvert : {etat}");
+    assert!(
+        etat["slimproto_udp"].is_null(),
+        "rien n'est ouvert : {etat}"
+    );
 
     // Couper deux fois ne change rien.
     let reponse = regler_serveur(&app, false).await;
-    assert_eq!(reponse["slimproto_server_applied"], json!(false), "{reponse}");
+    assert_eq!(
+        reponse["slimproto_server_applied"],
+        json!(false),
+        "{reponse}"
+    );
 
     // ---- 3. Un autre serveur (un LMS) tient le port TCP : Tune ne tombe pas,
     // et l'état le dit.
@@ -245,7 +272,11 @@ async fn le_reglage_ouvre_et_rend_les_ports_squeezebox_7374() {
     // ---- 4. Le LMS s'arrête : rallumer le réglage reprend l'écoute.
     drop(lms);
     let reponse = regler_serveur(&app, true).await;
-    assert_eq!(reponse["slimproto_server_applied"], json!(true), "{reponse}");
+    assert_eq!(
+        reponse["slimproto_server_applied"],
+        json!(true),
+        "{reponse}"
+    );
     assert!(
         sous_peu(|| tcp_ecoute(port_slimproto)).await,
         "une fois le port libéré, rallumer le réglage doit reprendre l'écoute"

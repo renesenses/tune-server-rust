@@ -84,7 +84,9 @@ pub async fn eteindre() -> bool {
     let _ = tache.await;
     ETAT.effacer();
     if tournait {
-        info!("lms_cli_server_stopped — le pont de commande est fermé et son port est rendu (#7374)");
+        info!(
+            "lms_cli_server_stopped — le pont de commande est fermé et son port est rendu (#7374)"
+        );
     }
     tournait
 }

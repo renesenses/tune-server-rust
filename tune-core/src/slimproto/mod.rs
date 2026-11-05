@@ -1677,7 +1677,10 @@ impl SlimProtoServer {
         }
         self.players.lock().await.clear();
         if !macs.is_empty() {
-            info!(platines = macs.len(), "slimproto_players_disconnected_by_shutdown");
+            info!(
+                platines = macs.len(),
+                "slimproto_players_disconnected_by_shutdown"
+            );
         }
     }
 
