@@ -1146,10 +1146,7 @@ pub(super) async fn album_bio(
     // une interface en francais stocke tout en francais, et le ressert ensuite
     // a tout le monde.
     let prov = album_repo.bio_provenance(id).ok().flatten();
-    let bio_lang = prov
-        .as_ref()
-        .and_then(|p| p.get("lang").and_then(|v| v.as_str()));
-    let stored_ok = super::artists::langue_convient(bio_lang, lang);
+    let stored_ok = super::artists::bio_stockee_convient(prov.as_ref(), lang);
 
     if let Some(ref bio) = album.bio
         && !bio.is_empty()
@@ -1178,10 +1175,13 @@ pub(super) async fn album_bio(
     });
     let artist_q = artist_name.as_deref().unwrap_or("");
     let cache_key = format!("cache:albumbio:{}:{artist_q}:{lang}", album.title);
-    if let Some(cached) = super::api_cache_get(&state.backend, &cache_key) {
+    // #7027 : une entree de cache dans une autre langue n'est plus resservie.
+    if let Some(cached) = super::api_cache_get(&state.backend, &cache_key)
+        && super::artists::reponse_dans_la_langue(&cached, lang)
+    {
         return Json(cached).into_response();
     }
-    match state
+    let reponse_du_site = state
         .http_client
         .get("https://mozaiklabs.fr/api/v1/albums/bio")
         // `lang` est transmis au site, qui ne le recevait pas : il ne servait
@@ -1195,45 +1195,31 @@ pub(super) async fn album_bio(
             ("lang", lang),
         ])
         .send()
-        .await
+        .await;
+    if let Ok(resp) = reponse_du_site
+        && resp.status().is_success()
     {
-        Ok(resp) if resp.status().is_success() => {
-            let data: Value = resp.json().await.unwrap_or(json!({}));
-            // Provenance comprise (CC BY-SA des extraits Wikipédia) : cf.
-            // `super::artists::reponse_du_proxy`.
-            let out = super::artists::reponse_du_proxy("album", &album.title, &data);
-            if out.get("bio").map(|b| !b.is_null()).unwrap_or(false) {
-                super::api_cache_set(&state.backend, &cache_key, &out);
-            }
-            Json(out).into_response()
+        let data: Value = resp.json().await.unwrap_or(json!({}));
+        // Provenance comprise (CC BY-SA des extraits Wikipédia) : cf.
+        // `super::artists::reponse_du_proxy`.
+        let out = super::artists::reponse_du_proxy("album", &album.title, &data);
+        if super::artists::a_une_bio(&out) && super::artists::reponse_dans_la_langue(&out, lang) {
+            super::api_cache_set(&state.backend, &cache_key, &out);
+            return Json(out).into_response();
         }
-        _ => repli_sur_la_bio_stockee(&album.title, album.bio.as_deref(), prov),
     }
-}
-
-/// Ressert la bio d'album stockee quand la langue demandee n'a rien donne.
-///
-/// « Une biographie en francais vaut mieux qu'un panneau vide » -- #1849 le dit,
-/// et c'est juste : refuser une bio dans la mauvaise langue serait remplacer un
-/// defaut par un pire. La provenance part avec elle, donc le client sait dans
-/// quelle langue elle est et peut le signaler. Pendant du
-/// `repli_sur_la_bio_stockee` de la route artiste, dont seule la cle JSON
-/// (`album` au lieu de `artist`) differe.
-fn repli_sur_la_bio_stockee(
-    titre: &str,
-    bio: Option<&str>,
-    prov: Option<Value>,
-) -> axum::response::Response {
-    match bio.filter(|b| !b.is_empty()) {
-        Some(b) => Json(json!({
-            "album": titre,
-            "bio": b,
-            "source": prov.as_ref().and_then(|p| p.get("source")).and_then(Value::as_str),
-            "bio_provenance": prov,
-        }))
-        .into_response(),
-        None => Json(json!({"album": titre, "bio": null, "source": null})).into_response(),
-    }
+    // Ni bio stockee, ni cache, ni site dans la langue demandee : `bio` nul et
+    // le repli dit (#7027), au lieu de ressortir la bio stockee dans une autre
+    // langue. Cf. `super::artists::sans_bio_dans_la_langue`.
+    let mut out = super::artists::sans_bio_dans_la_langue(
+        "album",
+        &album.title,
+        lang,
+        album.bio.as_deref(),
+        prov.as_ref(),
+    );
+    out["source"] = Value::Null;
+    Json(out).into_response()
 }
 
 pub(super) async fn album_similar(

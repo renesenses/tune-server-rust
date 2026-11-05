@@ -1679,6 +1679,13 @@ name = "pg_credits_4984"
 path = "tests/pg_credits_4984.rs"
 required-features = ["postgres"]
 
+# #7027 — une bio rangée sans langue (`bio_lang` vide ou NULL) n'est jamais
+# servie comme de l'anglais, sur PostgreSQL.
+[[test]]
+name = "pg_bio_langue_7027"
+path = "tests/pg_bio_langue_7027.rs"
+required-features = ["postgres"]
+
 # #5026 — la règle « Étiquette » élargie (pistes étiquetées, albums de service
 # étiquetés) sur PostgreSQL : aperçu, collection et compteur par le vrai routeur.
 [[test]]

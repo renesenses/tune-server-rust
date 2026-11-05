@@ -359,3 +359,198 @@ async fn album_une_locale_non_supportee_retombe_sur_l_anglais() {
 
     assert_eq!(body["bio"].as_str(), Some(BIO_EN));
 }
+
+// === 4. #7027 : jamais du français présenté comme de l'anglais ============
+//
+// Arcade Fire, rc10, interface en anglais : la bio revenait en français. Deux
+// écritures rangent une bio AVEC une source mais SANS langue : la bio
+// éditoriale d'un service de streaming (fiche artiste Qobuz, copiée dans
+// l'artiste local du même nom) et le fonds communautaire. `langue_convient`
+// acceptait une langue inconnue, et le repli ressortait la bio stockée quelle
+// que soit sa langue. Ces cas gardent : l'anglais est servi s'il existe ;
+// sinon `bio` est nul et `repli` le dit ; le texte français n'est jamais rendu.
+
+/// Le site de biographies injoignable : les requêtes sortantes passent par un
+/// proxy fermé. Aucun appel réseau réel, en local comme en CI.
+fn site_injoignable(state: &mut Etat) {
+    let ferme = std::net::TcpListener::bind("127.0.0.1:0").expect("port libre");
+    let adresse = ferme.local_addr().expect("adresse");
+    drop(ferme);
+    state.http_client = tune_core::http::client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{adresse}")).expect("proxy valide"))
+        .build()
+        .expect("client HTTP du témoin");
+}
+
+fn app_site_injoignable() -> (axum::Router, Etat) {
+    let mut state = Etat::new(":memory:", 0, Default::default()).unwrap();
+    site_injoignable(&mut state);
+    let router = tune_server::routes::router(state.clone());
+    (router, state)
+}
+
+/// La bio d'un service de streaming, telle que `tune-streaming-http` la range :
+/// source `qobuz`, langue vide.
+fn artiste_avec_bio_de_service(state: &Etat, texte: &str) {
+    state
+        .backend
+        .execute(
+            "INSERT INTO artists (id, name) VALUES (?, ?)",
+            &[&1i64 as &dyn ToSqlValue, &NOM as &dyn ToSqlValue],
+        )
+        .expect("insertion de l'artiste");
+    ArtistRepo::with_backend(state.backend.clone())
+        .update_bio_full(1, texte, "qobuz", None, "", "")
+        .expect("bio de service sans langue");
+}
+
+fn album_avec_bio_de_service(state: &Etat, texte: &str) {
+    state
+        .backend
+        .execute(
+            "INSERT INTO albums (id, title) VALUES (?, ?)",
+            &[&1i64 as &dyn ToSqlValue, &TITRE as &dyn ToSqlValue],
+        )
+        .expect("insertion de l'album");
+    AlbumRepo::with_backend(state.backend.clone())
+        .update_bio_full(1, texte, "qobuz", None, "", "")
+        .expect("bio de service sans langue");
+}
+
+/// Aucun champ de la réponse ne porte le texte français.
+fn sans_francais(body: &Value) {
+    assert!(
+        !body.to_string().contains(BIO_FR),
+        "du français a été rendu à une interface anglaise : {body}"
+    );
+}
+
+/// **Le témoin de #7027.** Bio française rangée sans langue, interface
+/// anglaise, version anglaise en cache : l'anglais est servi.
+#[tokio::test]
+async fn artiste_une_bio_de_service_sans_langue_ne_passe_plus_pour_de_l_anglais_7027() {
+    let (app, state) = app_et_etat();
+    artiste_avec_bio_de_service(&state, BIO_FR);
+    cache_artiste(&state, "en", BIO_EN);
+
+    let (status, body) = bio_artiste(&app, "", Some("en")).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["bio"].as_str(),
+        Some(BIO_EN),
+        "une bio française rangée sans langue a été servie à une interface \
+         anglaise (#7027) : {body}"
+    );
+}
+
+#[tokio::test]
+async fn album_une_bio_de_service_sans_langue_ne_passe_plus_pour_de_l_anglais_7027() {
+    let (app, state) = app_et_etat();
+    album_avec_bio_de_service(&state, BIO_FR);
+    cache_album(&state, "en", BIO_EN);
+
+    let (status, body) = bio_album(&app, "", Some("en")).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["bio"].as_str(),
+        Some(BIO_EN),
+        "une bio française rangée sans langue a été servie à une interface \
+         anglaise (#7027) : {body}"
+    );
+}
+
+/// Bio française (langue connue), pas de version anglaise, site injoignable :
+/// rien n'est servi et le repli le dit, avec la langue disponible.
+#[tokio::test]
+async fn artiste_sans_version_anglaise_le_repli_est_dit_7027() {
+    let (app, state) = app_site_injoignable();
+    artiste_avec_bio(&state, 1, "fr", BIO_FR);
+
+    let (status, body) = bio_artiste(&app, "", Some("en")).await;
+
+    assert_eq!(status, StatusCode::OK);
+    sans_francais(&body);
+    assert!(body["bio"].is_null(), "bio attendue nulle : {body}");
+    assert_eq!(body["repli"]["raison"], "langue_indisponible", "{body}");
+    assert_eq!(body["repli"]["langue_demandee"], "en", "{body}");
+    assert_eq!(body["repli"]["langue_disponible"], "fr", "{body}");
+}
+
+#[tokio::test]
+async fn album_sans_version_anglaise_le_repli_est_dit_7027() {
+    let (app, state) = app_site_injoignable();
+    album_avec_bio(&state, 1, "fr", BIO_FR);
+
+    let (status, body) = bio_album(&app, "", Some("en")).await;
+
+    assert_eq!(status, StatusCode::OK);
+    sans_francais(&body);
+    assert!(body["bio"].is_null(), "bio attendue nulle : {body}");
+    assert_eq!(body["repli"]["raison"], "langue_indisponible", "{body}");
+    assert_eq!(body["repli"]["langue_disponible"], "fr", "{body}");
+}
+
+/// Bio de service sans langue, site injoignable : rien n'est servi, et la
+/// langue disponible est dite inconnue.
+#[tokio::test]
+async fn artiste_bio_sans_langue_et_site_injoignable_7027() {
+    let (app, state) = app_site_injoignable();
+    artiste_avec_bio_de_service(&state, BIO_FR);
+
+    let (_, body) = bio_artiste(&app, "", Some("en")).await;
+
+    sans_francais(&body);
+    assert!(body["bio"].is_null(), "{body}");
+    assert_eq!(body["repli"]["raison"], "langue_indisponible", "{body}");
+    assert!(body["repli"]["langue_disponible"].is_null(), "{body}");
+}
+
+/// Une entrée de cache rangée sous la clé anglaise mais annoncée en français
+/// (le site l'avait rendue ainsi avant le contrôle) n'est plus resservie.
+#[tokio::test]
+async fn artiste_un_cache_anglais_qui_contient_du_francais_est_ignore_7027() {
+    let (app, state) = app_site_injoignable();
+    artiste_avec_bio(&state, 1, "fr", BIO_FR);
+    SettingsRepo::with_backend(state.backend.clone())
+        .set(
+            &format!("cache:artistbio:{NOM}:en"),
+            &json!({
+                "artist": NOM,
+                "bio": BIO_FR,
+                "source": "community",
+                "bio_provenance": {"source": "community", "lang": "fr"},
+            })
+            .to_string(),
+        )
+        .expect("ecriture de l'entree de cache");
+
+    let (_, body) = bio_artiste(&app, "", Some("en")).await;
+
+    sans_francais(&body);
+    assert!(body["bio"].is_null(), "{body}");
+    assert_eq!(body["repli"]["langue_disponible"], "fr", "{body}");
+}
+
+/// Non-régression : un texte écrit à la main (sans provenance) reste servi,
+/// quelle que soit la langue de l'interface. Aucune source ne le remplace.
+#[tokio::test]
+async fn artiste_une_bio_ecrite_a_la_main_reste_servie_7027() {
+    let (app, state) = app_site_injoignable();
+    state
+        .backend
+        .execute(
+            "INSERT INTO artists (id, name, bio) VALUES (?, ?, ?)",
+            &[
+                &1i64 as &dyn ToSqlValue,
+                &NOM as &dyn ToSqlValue,
+                &"Mon texte à moi." as &dyn ToSqlValue,
+            ],
+        )
+        .expect("insertion de l'artiste");
+
+    let (_, body) = bio_artiste(&app, "", Some("en")).await;
+
+    assert_eq!(body["bio"].as_str(), Some("Mon texte à moi."), "{body}");
+}
