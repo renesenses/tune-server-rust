@@ -163,6 +163,18 @@ Conception du FIR (`fir::mixed_phase_design` + régularisation Kirkeby si invers
 
 Positions fixes pondérées et moyenne spatiale (prototype prêt) 1 j ; MMM optionnel (RTA par tranches, magnitude seule) 1,5 j ; profils par position d'écoute et bascule 1 j ; import des filtres REW (texte) et des mesures (texte/WAV), export complet 1 j ; EQ par canal si écart G/D > seuil 0,5 j ; UI 1 j.
 
+### C5 — Simulation des modes sans micro (rc11, #7919)
+
+Pour qui n'a pas de micro, ou avant d'en sortir un : à partir des dimensions d'une pièce rectangulaire, de la qualité de chaque surface (réfléchissante, amortie, traitée) et des positions de l'auditeur et des enceintes, le greffon (`plugins/tune-calibration/src/modes.rs`) calcule :
+
+- les **modes** axiaux, tangentiels et obliques jusqu'à 300 Hz, f = c/2·√((nx/L)² + (ny/l)² + (nz/h)²), c = 343 m/s ;
+- leur **amortissement** : absorption dans le grave 0,05 / 0,20 / 0,50 selon le niveau de la surface ; δ = c/(8V)·Σ ε·α·S (Morse et Bolt, repris par Kuttruff, *Room Acoustics*, ch. 3), ε = 2 sur les surfaces que le mode frappe de face, 1 sur celles qu'il rase ; Q = π·f/δ, T60 = 6,91/δ ;
+- leur **couplage** aux positions : Σ ψ(enceinte)·ψ(auditeur), ψ = Π cos(nπx/L) ; nul sur un nœud ;
+- la **réponse estimée** à la place d'écoute : somme modale (fonction de Green d'une source ponctuelle, modes comptés jusqu'à 600 Hz pour ne pas tronquer le haut de la plage) plus le son direct ; le mode (0, 0, 0) n'est pas compté (la montée en chambre de pression dépend de la chute de l'enceinte, inconnue) ;
+- une **correction** par le moteur de C2 (`correction::proposer`), coupes seules, avec des bornes plus serrées que sur mesure : 3 bandes et 4 dB de coupe cumulée par défaut, 4 bandes et 6 dB au plus, zone limitée à 300 Hz ; au-delà, la demande est refusée, pas écrêtée. Tout ce qui sort est marqué « estimation » et le dit en premier avertissement.
+
+Routes : `POST /simulations`, `POST /simulations/{id}/correction`, `POST /simulations/{id}/correction/profil` sous `/api/v1/ext/calibration`, Premium comme le reste du greffon. Le profil s'applique comme celui de C2. Les simulations sont gardées en mémoire (32 au plus). Aucun son n'est joué.
+
 **Total** : C1 9 j + C1-bis 7 j + C2 5 j + C3 6 j + C4 6 j ≈ **33 jours d'agent**, plus les campagnes de mesure réelles de Bertrand (une demi-journée par étape). Chemin recommandé pour la rc11 : **C1 + C2 sur micro USB** (14 j) ; rc12 : C1-bis, C3, C4.
 
 ---

@@ -641,3 +641,183 @@ fn sans_premium_refus_nomme_avec_premium_les_routes_servent() {
         Etat::Terminee
     );
 }
+
+/// C5 (#7919) : la simulation sans micro, par les routes. Sans Premium (sans
+/// licence ou compte gratuit), les trois routes rendent `premium_required` ;
+/// avec Premium, la simulation donne les modes de la pièce 5 × 4 × 2,5 m, la
+/// correction ne fait que couper sous le plafond prudent et se dit
+/// estimation, le profil est enregistré pour la zone — et rien n'est joué.
+#[test]
+fn la_simulation_sans_micro_est_premium_et_ne_propose_que_des_coupes_prudentes() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use tune_calibration_greffon::modes::{BANDES_DEFAUT_ESTIMATION, COUPE_DEFAUT_DB_ESTIMATION};
+    use tune_calibration_greffon::routes::{EtatRoutes, router};
+    use tune_core::license::LicenseManager;
+
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let b = banc(&sim, 1.0, Some(63.0), "simulation-c5");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let poster = |licence: Option<Arc<LicenseManager>>, chemin: &str, corps: serde_json::Value| {
+        let app = router(EtatRoutes {
+            controleur: b.controleur.clone(),
+            license: licence,
+        });
+        let req = Request::post(chemin)
+            .header("content-type", "application/json")
+            .body(Body::from(corps.to_string()))
+            .unwrap();
+        rt.block_on(async move {
+            let r = app.oneshot(req).await.unwrap();
+            let code = r.status();
+            let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                code,
+                serde_json::from_slice::<serde_json::Value>(&octets).unwrap_or_default(),
+            )
+        })
+    };
+    let piece = |zone: Option<i64>| {
+        serde_json::json!({
+            "piece": { "longueur_m": 5.0, "largeur_m": 4.0, "hauteur_m": 2.5 },
+            "surfaces": {
+                "avant": "reflechissante", "arriere": "reflechissante",
+                "gauche": "amortie", "droite": "amortie",
+                "sol": "reflechissante", "plafond": "traitee"
+            },
+            "auditeur": { "x": 3.2, "y": 1.6, "z": 1.1 },
+            "enceintes": [ { "x": 0.6, "y": 0.9, "z": 0.9 }, { "x": 0.6, "y": 3.1, "z": 0.9 } ],
+            "zone_id": zone,
+        })
+    };
+
+    let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    tune_core::db::migrations::run_migrations(&db).unwrap();
+    let licence = Arc::new(LicenseManager::new(Arc::new(db)));
+    for (cas, l) in [
+        ("sans licence", None),
+        ("compte gratuit", Some(licence.clone())),
+    ] {
+        for chemin in [
+            "/simulations",
+            "/simulations/sim-1/correction",
+            "/simulations/sim-1/correction/profil",
+        ] {
+            let (code, v) = poster(l.clone(), chemin, piece(Some(7)));
+            assert_eq!(code, StatusCode::PAYMENT_REQUIRED, "{cas} : {chemin} → {v}");
+            assert_eq!(v["error"], "premium_required", "{cas} : {chemin} → {v}");
+        }
+    }
+
+    rt.block_on(licence.set_account_premium(true, None));
+    let l = || Some(licence.clone());
+    let (code, s) = poster(l(), "/simulations", piece(Some(7)));
+    assert_eq!(code, StatusCode::CREATED, "{s}");
+    assert_eq!(s["estimation"], true);
+    let id = s["id"].as_str().unwrap().to_string();
+    let modes = s["modes"].as_array().unwrap();
+    let premiers: Vec<f64> = modes
+        .iter()
+        .filter(|m| m["type"] == "axial")
+        .take(3)
+        .map(|m| m["frequence_hz"].as_f64().unwrap())
+        .collect();
+    for (f, attendu) in premiers.iter().zip([34.3, 42.9, 68.6]) {
+        assert!((f - attendu).abs() < 0.1, "axiaux {premiers:?}");
+    }
+    assert!(modes.iter().any(|m| m["type"] == "tangentiel"));
+    assert!(modes.iter().any(|m| m["type"] == "oblique"));
+    assert!(s["reponse"]["db"].as_array().unwrap().len() > 100);
+
+    let (code, p) = poster(
+        l(),
+        &format!("/simulations/{id}/correction"),
+        serde_json::json!({}),
+    );
+    assert_eq!(code, StatusCode::OK, "{p}");
+    assert_eq!(p["estimation"], true);
+    assert_eq!(p["zone_id"], 7);
+    let gains: Vec<f64> = p["bandes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["gain"].as_f64().unwrap())
+        .collect();
+    assert!(!gains.is_empty(), "{p}");
+    assert!(
+        gains.iter().all(|g| *g <= 0.0),
+        "relance proposée : {gains:?}"
+    );
+    assert!(gains.len() <= BANDES_DEFAUT_ESTIMATION, "{gains:?}");
+    assert!(p["gain_max_db"].as_f64().unwrap() <= 1e-9);
+    assert!(p["coupe_cumulee_db"].as_f64().unwrap() >= -COUPE_DEFAUT_DB_ESTIMATION - 1e-6);
+    assert!(
+        p["avertissements"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("estimation sans micro")
+    );
+
+    // Ce qu'une mesure permet (12 dB, 8 bandes) est refusé sur une estimation.
+    let (code, e) = poster(
+        l(),
+        &format!("/simulations/{id}/correction"),
+        serde_json::json!({ "coupe_max_db": 12.0 }),
+    );
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{e}");
+    assert_eq!(e["error"], "correction_refusee");
+    let (code, _) = poster(
+        l(),
+        "/simulations/sim-999/correction",
+        serde_json::json!({}),
+    );
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    let (code, e) = poster(
+        l(),
+        "/simulations",
+        serde_json::json!({
+            "piece": { "longueur_m": 5.0, "largeur_m": 4.0, "hauteur_m": 2.5 },
+            "auditeur": { "x": 9.0, "y": 1.0, "z": 1.0 },
+            "enceintes": [ { "x": 1.0, "y": 1.0, "z": 1.0 } ],
+        }),
+    );
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{e}");
+    assert_eq!(e["error"], "simulation_invalide");
+    assert!(
+        b.hote.journal().profils.is_empty(),
+        "une proposition n'écrit rien"
+    );
+
+    // Sans zone : le profil la demande.
+    let (_, s2) = poster(l(), "/simulations", piece(None));
+    let id2 = s2["id"].as_str().unwrap();
+    let (code, e) = poster(
+        l(),
+        &format!("/simulations/{id2}/correction/profil"),
+        serde_json::json!({}),
+    );
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{e}");
+    assert_eq!(e["error"], "zone_requise");
+
+    let (code, r) = poster(
+        l(),
+        &format!("/simulations/{id}/correction/profil"),
+        serde_json::json!({}),
+    );
+    assert_eq!(code, StatusCode::CREATED, "{r}");
+    assert_eq!(r["estimation"], true);
+    assert_eq!(r["appliquer"], "/api/v1/room-correction/profiles/7/apply");
+    let j = b.hote.journal();
+    assert_eq!(j.profils.len(), 1);
+    assert_eq!(j.profils[0].zone_id, "7");
+    assert_eq!(j.profils[0].name, format!("Estimation {id}"));
+    assert!(j.profils[0].filters.iter().all(|f| f.gain_db <= 0.0));
+    assert!(j.joues.is_empty(), "une simulation a joué quelque chose");
+}
