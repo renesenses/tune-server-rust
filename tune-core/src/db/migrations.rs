@@ -2718,7 +2718,45 @@ CREATE TABLE IF NOT EXISTS imported_plays (
 );
 ",
     },
+    // #7765 (lot 2, PR 1) — d'où vient un crédit de piste :
+    // `track_credits.source`, `'manuel'`, `'musicbrainz'`, `'balises'`,
+    // `'discogs'` ou `'roon'` (`metadata::source_des_credits`). NULL : ligne
+    // ancienne, source inconnue.
+    //
+    // Sans elle, la passe MusicBrainz purgeait TOUS les crédits d'une piste
+    // avant d'écrire, et les passes « à faire » tenaient toute ligne pour un
+    // crédit : dès que les balises rempliront la table (#7766), elles
+    // effaceraient les crédits des fichiers et sauteraient presque toutes les
+    // pistes.
+    //
+    // Attribution UNE fois des lignes existantes (décision du 03/11) : `roon`
+    // si la piste porte `track_metadata.credits_source = 'roon'`, sinon
+    // `musicbrainz` si `artist_mbid` est renseigné, sinon NULL.
+    //
+    // Numérotée 137 / PG 102 à sa fusion dans le lot rc11 (#7772 y a pris
+    // 136 / PG 101) : les gardes de contiguïté (`migration_count_matches`,
+    // `pg_migrations_are_contiguous_and_include_numeric_heals`) refusent un
+    // trou. #7772 (SQLite 136 / PG 101) et #7656 (PG 101) réclament les mêmes
+    // numéros : celle qui fusionne après l'autre se renumérote.
+    //
+    // Colonne, index et attribution posés dans le bloc de version, PAS dans
+    // `up` : même règle qu'à la 107. La colonne seule est reposée par la
+    // passe finale. Jumelle PG : 102.
+    Migration {
+        version: 137,
+        name: "credits_source",
+        up: "",
+    },
 ];
+
+/// SQL de l'attribution unique de la migration 137 (#7765) — jouée une seule
+/// fois, dans le bloc de version. Même texte que la jumelle PG 102.
+pub(crate) const SQL_ATTRIBUTION_SOURCE_DES_CREDITS: &str = "UPDATE track_credits SET source = CASE \
+     WHEN EXISTS (SELECT 1 FROM track_metadata m WHERE m.track_id = track_credits.track_id \
+         AND m.key = 'credits_source' AND m.value = 'roon') THEN 'roon' \
+     WHEN artist_mbid IS NOT NULL AND artist_mbid <> '' THEN 'musicbrainz' \
+     ELSE NULL END \
+     WHERE source IS NULL";
 
 /// Migration 127 (#6257) : `tags.position`, 0 pour toutes les etiquettes
 /// existantes (« jamais placee ») — la liste reste alphabetique tant que
@@ -4141,6 +4179,20 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
                 "INTEGER NOT NULL DEFAULT 0",
             );
         }
+        if migration.version == 137 {
+            // #7765 — la source des crédits, puis l'attribution UNE fois des
+            // lignes existantes. L'index vient APRES la colonne qu'il nomme.
+            add_column_if_missing(db, "track_credits", "source", "TEXT");
+            if let Err(e) = db.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_track_credits_track_source \
+                 ON track_credits(track_id, source)",
+            ) {
+                warn!(erreur = %e, "migration_136_index_source");
+            }
+            if let Err(e) = db.execute_batch(SQL_ATTRIBUTION_SOURCE_DES_CREDITS) {
+                warn!(erreur = %e, "migration_136_attribution_source");
+            }
+        }
         if migration.version == 12 {
             upgrade_fts5_tables(db);
         }
@@ -4754,6 +4806,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         "manual_order",
         "INTEGER NOT NULL DEFAULT 0",
     );
+    // La source des crédits (migration 137, #7765) — posée ICI aussi : tous
+    // les écrivains de `track_credits` et les passes « à faire » la NOMMENT.
+    // Pas d'attribution ici : elle ne se joue qu'une fois, à la 137. PG : 102.
+    add_column_if_missing(db, "track_credits", "source", "TEXT");
     // Index de `listen_history.album_id` (migration 115, fil 2130) — posé ICI
     // aussi : une base arrivée sans lui reste juste, mais « Reprendre
     // l'écoute » y redevient lent. PG : migration 079.
@@ -5705,6 +5761,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         101,
         "imported_plays",
         include_str!("../../migrations/postgres/101_imported_plays.sql"),
+    ),
+    // Jumelle de la SQLite 137 (#7765) : `track_credits.source`, la source
+    // d'un crédit, avec l'attribution unique des lignes existantes.
+    (
+        102,
+        "credits_source",
+        include_str!("../../migrations/postgres/102_credits_source.sql"),
     ),
 ];
 
@@ -9248,7 +9311,9 @@ mod tests {
         // 100 : listening_resumes (#7280), jumelle de la SQLite 135.
         // 101 : `imported_plays` (#7763), jumelle de la SQLite 136. Crée la
         // table des écoutes importées, que le compte d'écoutes NOMME.
-        assert_eq!(pg_latest_version(), 101, "latest PG migration must be 101");
+        // 102 : `credits_source` (#7765), jumelle de la SQLite 137. Pose la
+        // source des crédits de piste, que tous leurs écrivains NOMMENT.
+        assert_eq!(pg_latest_version(), 102, "latest PG migration must be 102");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
