@@ -978,5 +978,9 @@ mod facettes_lentes_2144_tests;
 mod liste_dr_7580_tests;
 
 #[cfg(test)]
+#[path = "filtre_qualite_7725_tests.rs"]
+mod filtre_qualite_7725_tests;
+
+#[cfg(test)]
 #[path = "banc_repertoires_5998.rs"]
 mod banc_repertoires_5998;
