@@ -77,6 +77,8 @@ pub(crate) mod stats;
 mod tracks;
 pub(crate) mod write_tags;
 
+/// Les versions d'un même album regroupées sous une fiche (#7617).
+mod oeuvres;
 /// Les versions d'une piste regroupées par enregistrement (#2264).
 mod versions_groupes;
 use axum::Router;
@@ -382,6 +384,18 @@ pub fn router() -> Router<AppState> {
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
+        // #7617 — les œuvres : segments statiques AVANT `/albums/{id}`.
+        .route("/albums/works", get(oeuvres::lister_oeuvres))
+        .route("/albums/works/members", get(oeuvres::membres_des_oeuvres))
+        .route(
+            "/albums/works/settings",
+            get(oeuvres::lire_reglage).put(oeuvres::ecrire_reglage),
+        )
+        .route(
+            "/albums/works/preferred",
+            axum::routing::put(oeuvres::ecrire_preferee),
+        )
+        .route("/albums/{id}/versions", get(oeuvres::versions_de_l_album))
         // tune-web-client#1875 — admin, depuis cette machine seulement.
         .route("/reveal/available", get(reveler::revelation_disponible))
         .route("/albums/{id}/reveal", post(reveler::reveler_album))
