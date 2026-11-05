@@ -2065,6 +2065,11 @@ pub mod verdict_upnp;
 mod navigateur_suivante_5975;
 mod queue;
 pub use queue::{Enjambee, lignes_bannies_a_enjamber};
+// #7895 — « Suivant » et « Précédent » enjambent les titres refusés par le service.
+mod enjamber_les_refus;
+pub use enjamber_les_refus::{SensDuGeste, message_titres_sautes};
+#[cfg(test)]
+mod enjamber_les_refus_7895_tests;
 
 mod history;
 
