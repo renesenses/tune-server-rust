@@ -2747,6 +2747,15 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "credits_source",
         up: "",
     },
+    // #7849 — notes personnelles en Markdown (artiste, album, piste) par
+    // profil, avec la reprise des notes d'album de `album_ratings.note`, qui
+    // reste en place. Jumelle PG : 103. Numérotée 138 / PG 103 à sa fusion
+    // dans le lot rc11, après imported_plays (136 / 101) et credits_source (137 / 102).
+    Migration {
+        version: 138,
+        name: "notes_personnelles",
+        up: include_str!("../../migrations/notes_personnelles.sql"),
+    },
 ];
 
 /// SQL de l'attribution unique de la migration 137 (#7765) — jouée une seule
@@ -5768,6 +5777,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         102,
         "credits_source",
         include_str!("../../migrations/postgres/102_credits_source.sql"),
+    ),
+    // Jumelle de la SQLite 138 (#7849) : `notes_personnelles`, avec la
+    // reprise des notes d'album de `album_ratings.note`.
+    (
+        103,
+        "notes_personnelles",
+        include_str!("../../migrations/postgres/103_notes_personnelles.sql"),
     ),
 ];
 
@@ -9313,7 +9329,9 @@ mod tests {
         // table des écoutes importées, que le compte d'écoutes NOMME.
         // 102 : `credits_source` (#7765), jumelle de la SQLite 137. Pose la
         // source des crédits de piste, que tous leurs écrivains NOMMENT.
-        assert_eq!(pg_latest_version(), 102, "latest PG migration must be 102");
+        // 103 : `notes_personnelles` (#7849), jumelle de la SQLite 138. Crée
+        // la table des notes, que les routes `/library/notes` NOMMENT.
+        assert_eq!(pg_latest_version(), 103, "latest PG migration must be 103");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
