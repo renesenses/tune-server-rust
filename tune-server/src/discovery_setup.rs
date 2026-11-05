@@ -102,6 +102,21 @@ pub(crate) fn scpd_av_transport(
         .map(|p| resolve_control_url(&dev.host, dev.port, p))
 }
 
+/// #6335 — la même URL, lue dans un descriptif relu par HTTP (ajout manuel,
+/// nouveau sondage, balayage, création de zone). Sans elle, la sortie rend
+/// `AnnonceSuivante::Inconnue` jusqu'à la prochaine découverte SSDP, et aucun
+/// suivant DSD n'est armé sur un renderer qui sait pourtant enchaîner.
+pub(crate) fn scpd_av_transport_du_descriptif(
+    host: &str,
+    port: u16,
+    desc: &tune_core::discovery::xml_parser::DeviceDescription,
+) -> Option<String> {
+    desc.scpd_urls()
+        .get("avtransport")
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| resolve_control_url(host, port, p))
+}
+
 pub(crate) fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
     if control_url.starts_with("http://") || control_url.starts_with("https://") {
         control_url.to_string()
