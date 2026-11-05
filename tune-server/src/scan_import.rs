@@ -22,6 +22,15 @@ use tune_core::library::regle_compilation::{IndicesCompilation, Jugement, MotifC
 use tune_core::metadata::TrackMetadata;
 use tune_core::scanner::walker::ScannedFile;
 
+/// #3179 — ARTIST désigne la piste, ALBUMARTIST l'album : une piste dont la
+/// balise ARTIST est posée garde cet artiste. Un nom déduit du chemin n'est
+/// pas une balise et ne crée pas un invité. Partagé par le scan
+/// (`TrackImporter::import`) et le surveillant
+/// (`auto_scan::build_track_from_metadata_opts`), qui divergeaient (#7933).
+pub(crate) fn artiste_de_piste_tague(meta: &TrackMetadata) -> bool {
+    !meta.artist_from_path && meta.artist.as_deref().is_some_and(|a| !a.trim().is_empty())
+}
+
 /// True when an `album_artist` value denotes a various-artists compilation.
 /// Le vocabulaire est celui de LA règle
 /// ([`tune_core::library::regle_compilation::est_artistes_divers`]).
@@ -1628,8 +1637,7 @@ impl TrackImporter {
 
         // #3179 — ARTIST désigne la piste, ALBUMARTIST l'album. Un nom
         // déduit du chemin n'est pas une balise et ne crée pas un invité.
-        let artiste_de_piste_tague =
-            !meta.artist_from_path && meta.artist.as_deref().is_some_and(|a| !a.trim().is_empty());
+        let artiste_de_piste_tague = artiste_de_piste_tague(meta);
         let meme_artiste = tune_core::db::artist_repo::cle_artiste(&album_artist_name)
             == tune_core::db::artist_repo::cle_artiste(&track_artist_name);
 
