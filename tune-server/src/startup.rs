@@ -651,6 +651,7 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     persist_initial_settings(state, config);
     resolve_ytdlp(state).await;
     restore_convolvers(state).await;
+    surveiller_le_droit_de_convoluer(state);
     warm_sqlite_cache(state);
     crate::routes::synchronisation_upnp::start(state.clone());
 
@@ -1379,6 +1380,34 @@ async fn restore_convolvers(state: &AppState) {
             }
         }
     }
+}
+
+/// #7632 — la convolution par RI est un droit Premium (`RoomCorrection`).
+/// Le droit change hors de toute lecture (validation de licence, compte SSO,
+/// expiration) : cette tâche le relit toutes les deux secondes et, quand il
+/// bascule, le rend aux sorties (`appliquer_le_droit_de_convoluer`) — la
+/// convolution s'éteint en fondu sur une sortie locale, un flux réseau qui la
+/// portait est relancé à sa position. Relecture `premium_snapshot`, sans
+/// verrou bloquant.
+fn surveiller_le_droit_de_convoluer(state: &AppState) {
+    let orchestrateur = state.orchestrator.clone();
+    tokio::spawn(async move {
+        let mut avant = orchestrateur.correction_ir_autorisee();
+        let mut intervalle = tokio::time::interval(std::time::Duration::from_secs(2));
+        intervalle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            intervalle.tick().await;
+            let maintenant = orchestrateur.correction_ir_autorisee();
+            if maintenant != avant {
+                avant = maintenant;
+                let relances = orchestrateur.appliquer_le_droit_de_convoluer().await;
+                info!(
+                    autorisee = maintenant,
+                    relances, "droit_de_convoluer_change"
+                );
+            }
+        }
+    });
 }
 
 /// Touch key tables so SQLite page cache is warm for the first UI load.

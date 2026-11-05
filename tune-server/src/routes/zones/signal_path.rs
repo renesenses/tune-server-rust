@@ -295,41 +295,99 @@ fn correction_piece_egaliseur_lang(
     })
 }
 
-/// #7632 — le greffon calibration est Premium en entier (décision du
-/// 04/11/2026). Sans le droit `RoomCorrection`, l'égaliseur posé par un
-/// profil de pièce n'est plus PRÉSENTÉ comme une « Correction de pièce » :
-/// ni étape `room_correction`, ni résumé. L'égaliseur, lui, filtre toujours
-/// et reste décrit par l'étape DSP — on n'annonce rien d'appliqué au titre
-/// de la calibration, sans pour autant prétendre le signal intact.
+/// #7632 — la correction de pièce est un droit Premium (`RoomCorrection`,
+/// décisions du 04/11/2026). Sans ce droit :
 ///
-/// La RI (`kind: "ir"`) n'est pas concernée : le convolueur l'applique quelle
-/// que soit la licence, et l'étape le dit.
-pub fn correction_de_piece_sous_licence(
+/// * l'égaliseur posé par un profil de pièce (`kind: "eq"`) n'est plus
+///   PRÉSENTÉ comme une « Correction de pièce » — ni étape, ni résumé.
+///   L'égaliseur, lui, filtre toujours et reste décrit par l'étape DSP ;
+/// * la RI (`kind: "ir"`) n'est plus convoluée (l'orchestrateur et la sortie
+///   locale la retirent, `correction_ir_autorisee`) : l'étape le DIT, état
+///   `unlicensed`, `applied: false`, au lieu de l'annoncer appliquée.
+pub fn correction_de_piece_sous_licence_lang(
+    lang: &str,
     signal_path: Option<Value>,
     premium: bool,
 ) -> Option<Value> {
     let mut sp = signal_path?;
-    if premium || sp.get("room_correction").and_then(|r| r.get("kind")) != Some(&json!("eq")) {
+    if premium {
         return Some(sp);
     }
-    if let Some(o) = sp.as_object_mut() {
-        o.insert("room_correction".into(), Value::Null);
-        if let Some(etapes) = o.get_mut("steps").and_then(Value::as_array_mut) {
-            etapes.retain(|e| e.get("code") != Some(&json!("room_correction")));
+    let kind = sp
+        .get("room_correction")
+        .and_then(|r| r.get("kind"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let Some(o) = sp.as_object_mut() else {
+        return Some(sp);
+    };
+    match kind.as_deref() {
+        Some("eq") => {
+            o.insert("room_correction".into(), Value::Null);
+            if let Some(etapes) = o.get_mut("steps").and_then(Value::as_array_mut) {
+                etapes.retain(|e| e.get("code") != Some(&json!("room_correction")));
+            }
         }
+        Some("ir") => {
+            let description = ts(lang, "correction_piece_sans_licence");
+            if let Some(rc) = o.get_mut("room_correction").and_then(Value::as_object_mut) {
+                rc.insert("status".into(), json!("unlicensed"));
+                rc.insert("applied".into(), json!(false));
+                rc.insert("reason".into(), json!("unlicensed"));
+            }
+            if let Some(etapes) = o.get_mut("steps").and_then(Value::as_array_mut) {
+                for e in etapes
+                    .iter_mut()
+                    .filter(|e| e.get("code") == Some(&json!("room_correction")))
+                {
+                    e["status"] = json!("unlicensed");
+                    e["applied"] = json!(false);
+                    e["bit_perfect"] = json!(true);
+                    e["reason"] = json!("unlicensed");
+                    e["description"] = json!(description);
+                }
+            }
+        }
+        _ => {}
     }
     Some(sp)
 }
 
-/// [`correction_de_piece_sous_licence`] avec la licence de l'hôte.
-pub async fn signal_path_sous_licence(
+/// [`correction_de_piece_sous_licence_lang`] dans la langue de la requête.
+pub fn correction_de_piece_sous_licence(
+    signal_path: Option<Value>,
+    premium: bool,
+) -> Option<Value> {
+    correction_de_piece_sous_licence_lang(
+        super::textes_signal::langue_courante(),
+        signal_path,
+        premium,
+    )
+}
+
+/// [`correction_de_piece_sous_licence_lang`] avec la licence de l'hôte.
+pub async fn signal_path_sous_licence_lang(
+    lang: &str,
     license: &tune_core::license::LicenseManager,
     signal_path: Option<Value>,
 ) -> Option<Value> {
     let premium = license
         .check_feature(tune_core::license::Feature::RoomCorrection)
         .await;
-    correction_de_piece_sous_licence(signal_path, premium)
+    correction_de_piece_sous_licence_lang(lang, signal_path, premium)
+}
+
+/// [`signal_path_sous_licence_lang`] dans la langue de la requête.
+pub async fn signal_path_sous_licence(
+    license: &tune_core::license::LicenseManager,
+    signal_path: Option<Value>,
+) -> Option<Value> {
+    signal_path_sous_licence_lang(
+        super::textes_signal::langue_courante(),
+        license,
+        signal_path,
+    )
+    .await
 }
 
 /// Description du traitement EQ réellement configuré, y compris le headroom

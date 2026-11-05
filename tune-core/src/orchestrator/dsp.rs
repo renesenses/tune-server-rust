@@ -2026,7 +2026,96 @@ impl PlaybackOrchestrator {
     /// partagée avec [`Self::zone_has_active_ir`] et
     /// [`Self::traitement_que_pure_gouverne`]. `None` si la clé est absente ou
     /// vide ; l'existence du fichier n'est PAS vérifiée ici.
+    ///
+    /// #7632 — `None` aussi SANS le droit Premium `RoomCorrection`
+    /// ([`Self::correction_ir_autorisee`]) : la convolution par RI n'est
+    /// alors ni cuite dans le flux réseau, ni comptée dans son empreinte, ni
+    /// présentée comme un traitement que PURE gouverne. Même place que la
+    /// garde du crossfeed (`crossfeed_configure_sous_licence`).
     pub(super) fn chemin_ir_configure(&self, zone_id: i64) -> Option<String> {
+        if !self.correction_ir_autorisee() {
+            return None;
+        }
+        self.chemin_ir_enregistre(zone_id)
+    }
+
+    /// #7632 — la licence vient de changer : chaque sortie locale reçoit le
+    /// droit de convoluer (retiré, son moteur s'éteint EN FONDU, sans clic,
+    /// `LocalOutput::set_convolution_autorisee`) ; chaque zone réseau qui JOUE
+    /// un flux où une RI était cuite est relancée à sa position, comme une
+    /// bascule PURE (`schedule_eq_replay`), et repart sans convolution.
+    /// Rend le nombre de zones réseau relancées. Appelé par l'hôte quand il
+    /// voit le droit changer (tune-server, `surveiller_le_droit_de_convoluer`).
+    pub async fn appliquer_le_droit_de_convoluer(self: &std::sync::Arc<Self>) -> usize {
+        let autorisee = self.correction_ir_autorisee();
+        #[cfg(feature = "local-audio")]
+        {
+            let sorties: Vec<_> = {
+                let registre = self.outputs.lock().await;
+                registre
+                    .list()
+                    .into_iter()
+                    .filter(|id| id.starts_with("local:"))
+                    .filter_map(|id| registre.get(&id))
+                    .collect()
+            };
+            for sortie in sorties {
+                let sortie = sortie.lock().await;
+                if let Some(locale) = sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                {
+                    locale.set_convolution_autorisee(autorisee);
+                }
+            }
+        }
+        if autorisee {
+            // Accordé : la piste suivante bâtit le moteur ; relancer un flux
+            // pour l'entendre plus tôt n'est pas demandé.
+            return 0;
+        }
+        let zones = ZoneRepo::with_backend(self.db.clone())
+            .list()
+            .unwrap_or_default();
+        let mut relancees = 0;
+        for zone in zones {
+            let Some(zone_id) = zone.id else { continue };
+            let reseau = zone
+                .output_device_id
+                .as_deref()
+                .is_some_and(|d| !d.starts_with("local:"));
+            let ri_cuite = !self.zone_audiophile(zone_id)
+                && self
+                    .chemin_ir_enregistre(zone_id)
+                    .is_some_and(|p| std::path::Path::new(&p).exists());
+            if !reseau || !ri_cuite {
+                continue;
+            }
+            let etat = self.playback.get_state(zone_id).await;
+            if etat.state == crate::playback::PlayState::Playing
+                && etat.now_playing.is_some()
+                && self.schedule_eq_replay(zone_id)
+            {
+                tracing::info!(zone_id, "convolution_retiree_flux_reseau_relance");
+                relancees += 1;
+            }
+        }
+        relancees
+    }
+
+    /// #7632 — le droit de convoluer : Premium (`RoomCorrection`, décision du
+    /// 04/11/2026). ⚠️ Un orchestrateur SANS licence n'y a pas droit : une
+    /// absence ne vaut pas Premium (contrairement au crossfeed, dont la garde
+    /// laisse passer l'orchestrateur des tests).
+    pub fn correction_ir_autorisee(&self) -> bool {
+        self.license
+            .as_ref()
+            .is_some_and(|license| license.premium_snapshot())
+    }
+
+    /// Le chemin `ir_path_{zone}` enregistré, sans aucune garde (ni PURE, ni
+    /// licence) : ce que l'utilisateur a réglé, pas ce qui s'entend.
+    pub(super) fn chemin_ir_enregistre(&self, zone_id: i64) -> Option<String> {
         crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
             .get(&format!("ir_path_{zone_id}"))
             .ok()
