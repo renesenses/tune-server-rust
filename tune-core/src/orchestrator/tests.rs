@@ -2904,6 +2904,9 @@ async fn avance_gapless_ecrit_la_piste_atteinte_dans_l_historique() {
     orch.advance_queue_metadata(zone_id, 1)
         .await
         .expect("l'avance gapless doit aboutir");
+    // #7852 : l'avance arme l'écoute de la piste atteinte, écrite au seuil.
+    assert_eq!(lignes_historique(&orch), 0);
+    assert!(orch.amener_au_seuil(zone_id).await);
 
     let history = crate::db::history_repo::HistoryRepo::with_backend(orch.db.clone())
         .recent(10)
@@ -6748,7 +6751,9 @@ async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
             None,
             crate::orchestrator::ContexteEcoute::default(),
             album_ref,
-        )
+        );
+        // #7852 : l'écoute armée est écrite au seuil, réputé franchi ici.
+        assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
     };
     let derniere = || {
         orch.db
@@ -6829,6 +6834,10 @@ async fn test_record_listen() {
         },
         None,
     );
+    // #7852 : rien n'est écrit avant le seuil ; réputé franchi ici, le test
+    // porte sur les colonnes écrites.
+    assert_eq!(lignes_historique(&orch), 0);
+    assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
 
     let repo = HistoryRepo::with_backend(orch.db.clone());
     let history = repo.recent(10).unwrap();
@@ -7012,6 +7021,9 @@ async fn zone_navigateur_l_annonce_attend_que_l_onglet_tire_le_flux() {
         orch.confirmer_lecture_navigateur(zone_id, &sid).await,
         "l'onglet consomme le flux : l'annonce doit partir"
     );
+    // #7852 : la confirmation arme l'écoute, le seuil l'écrit.
+    assert!(orch.ecoute_en_attente(zone_id));
+    assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
     assert_eq!(
         lignes_historique(&orch),
         1,
@@ -7218,6 +7230,8 @@ async fn zone_navigateur_le_lecteur_qui_joue_confirme_6066() {
         crate::orchestrator::SignalDuLecteur::Confirmee,
         "le lecteur de la zone dit jouer ce flux : l'annonce part"
     );
+    // #7852 : la confirmation arme l'écoute, le seuil l'écrit.
+    assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
     assert_eq!(lignes_historique(&orch), 1);
 
     assert_eq!(
@@ -9083,6 +9097,8 @@ async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
     );
 
     // L'historique — l'autre moitié du fil : la rangée « Récemment joué ».
+    // #7852 : écrit au seuil de l'écoute.
+    assert!(orch.amener_au_seuil(zone_id).await);
     let titre_historise = orch
         .db
         .query_one(

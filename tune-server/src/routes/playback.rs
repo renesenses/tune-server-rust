@@ -6734,6 +6734,12 @@ pub(crate) async fn do_transfer(
         };
     }
 
+    // #7852 — l'écoute pas encore validée suit le titre sur la cible, une fois
+    // la cible lancée : une seule écoute pour le titre transféré.
+    state
+        .orchestrator
+        .transferer_l_ecoute_en_attente(from_zone, target_zone);
+
     if stop_source {
         state.orchestrator.stop(from_zone, None).await;
     }
