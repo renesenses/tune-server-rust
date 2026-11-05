@@ -242,7 +242,61 @@ pub fn dsd_suivant_tenu_sur_dlna(
     annonce_suivante: AnnonceSuivante,
     deja_lache: bool,
 ) -> bool {
-    annonce_dsd == Some(true) && annonce_suivante == AnnonceSuivante::Annoncee && !deja_lache
+    refus_dsd_suivant_sur_dlna(annonce_dsd, annonce_suivante, deja_lache).is_none()
+}
+
+/// #6335 — POURQUOI un suivant DSD n'est pas armé sur un renderer DLNA.
+///
+/// La ligne `gapless_skipped_dsd_next_dlna` ne portait que la zone et le type
+/// MIME : un renderer qui n'annonce pas le DSD, un sondage qui n'a pas abouti
+/// et un SCPD jamais lu laissaient la même trace. C'est pourtant ce qui sépare
+/// une limite de l'appareil d'un défaut de Tune.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusDsdSuivant {
+    /// `GetProtocolInfo` pas sondé, ou sondage sans réponse (`None`).
+    DsdNonSonde,
+    /// Le renderer n'annonce pas le DSD (`Some(false)`).
+    DsdNonAnnonce,
+    /// SCPD d'AVTransport ni connu ni lu : Tune ne sait pas si
+    /// `SetNextAVTransportURI` est permis.
+    SuivanteInconnue,
+    /// Le SCPD d'AVTransport ne porte pas `SetNextAVTransportURI`.
+    SuivanteNonAnnoncee,
+    /// Le renderer a déjà lâché un suivant DSD armé depuis le démarrage.
+    DejaLache,
+}
+
+impl RefusDsdSuivant {
+    /// Le mot du journal.
+    pub fn raison(self) -> &'static str {
+        match self {
+            RefusDsdSuivant::DsdNonSonde => "dsd_non_sonde",
+            RefusDsdSuivant::DsdNonAnnonce => "dsd_non_annonce",
+            RefusDsdSuivant::SuivanteInconnue => "setnext_inconnu",
+            RefusDsdSuivant::SuivanteNonAnnoncee => "setnext_non_annonce",
+            RefusDsdSuivant::DejaLache => "deja_lache",
+        }
+    }
+}
+
+/// #6335 — la première des trois conditions de [`dsd_suivant_tenu_sur_dlna`]
+/// qui manque, `None` si le suivant DSD peut être armé.
+pub fn refus_dsd_suivant_sur_dlna(
+    annonce_dsd: Option<bool>,
+    annonce_suivante: AnnonceSuivante,
+    deja_lache: bool,
+) -> Option<RefusDsdSuivant> {
+    match annonce_dsd {
+        None => return Some(RefusDsdSuivant::DsdNonSonde),
+        Some(false) => return Some(RefusDsdSuivant::DsdNonAnnonce),
+        Some(true) => {}
+    }
+    match annonce_suivante {
+        AnnonceSuivante::Inconnue => return Some(RefusDsdSuivant::SuivanteInconnue),
+        AnnonceSuivante::NonAnnoncee => return Some(RefusDsdSuivant::SuivanteNonAnnoncee),
+        AnnonceSuivante::Annoncee => {}
+    }
+    deja_lache.then_some(RefusDsdSuivant::DejaLache)
 }
 
 /// Ce qu'une ligne de file peut promettre à la ligne **affichée** juste après elle.
@@ -447,6 +501,34 @@ mod tests {
         assert!(!dsd_suivant_tenu_sur_dlna(Some(true), NonAnnoncee, false));
         // Le renderer a déjà lâché un suivant DSD armé (RS130, #402).
         assert!(!dsd_suivant_tenu_sur_dlna(Some(true), Annoncee, true));
+    }
+
+    /// #6335 — le refus nomme la condition qui manque, une par cas.
+    #[test]
+    fn le_refus_dsd_suivant_nomme_la_condition_manquante_6335() {
+        use AnnonceSuivante::*;
+        let r = |dsd, suivante, lache| refus_dsd_suivant_sur_dlna(dsd, suivante, lache);
+        assert_eq!(r(Some(true), Annoncee, false), None);
+        assert_eq!(
+            r(None, Annoncee, false).map(RefusDsdSuivant::raison),
+            Some("dsd_non_sonde")
+        );
+        assert_eq!(
+            r(Some(false), Annoncee, false).map(RefusDsdSuivant::raison),
+            Some("dsd_non_annonce")
+        );
+        assert_eq!(
+            r(Some(true), Inconnue, false).map(RefusDsdSuivant::raison),
+            Some("setnext_inconnu")
+        );
+        assert_eq!(
+            r(Some(true), NonAnnoncee, false).map(RefusDsdSuivant::raison),
+            Some("setnext_non_annonce")
+        );
+        assert_eq!(
+            r(Some(true), Annoncee, true).map(RefusDsdSuivant::raison),
+            Some("deja_lache")
+        );
     }
 
     #[test]

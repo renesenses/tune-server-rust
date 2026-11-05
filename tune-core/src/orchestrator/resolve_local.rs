@@ -510,6 +510,20 @@ impl PlaybackOrchestrator {
         device_id: &str,
         annonce_suivante: crate::outputs::traits::AnnonceSuivante,
     ) -> bool {
+        self.refus_dsd_suivant_sur_dlna(device_id, annonce_suivante)
+            .await
+            .is_none()
+    }
+
+    /// #6335 — la condition qui manque pour armer un suivant DSD sur
+    /// `device_id`, `None` s'il peut l'être. Mêmes lectures, sans réseau, que
+    /// [`Self::dsd_suivant_tenu_sur_dlna`] ; voir
+    /// [`crate::playback::gapless::refus_dsd_suivant_sur_dlna`].
+    pub async fn refus_dsd_suivant_sur_dlna(
+        &self,
+        device_id: &str,
+        annonce_suivante: crate::outputs::traits::AnnonceSuivante,
+    ) -> Option<crate::playback::gapless::RefusDsdSuivant> {
         let annonce_dsd = self
             .dsd_capabilities
             .lock()
@@ -521,7 +535,7 @@ impl PlaybackOrchestrator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(device_id);
-        crate::playback::gapless::dsd_suivant_tenu_sur_dlna(
+        crate::playback::gapless::refus_dsd_suivant_sur_dlna(
             annonce_dsd,
             annonce_suivante,
             deja_lache,

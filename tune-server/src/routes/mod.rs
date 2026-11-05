@@ -65,6 +65,8 @@ mod pochettes_upnp;
 // Retrait d'une bibliotheque UPnP par serveur media (#4624).
 pub mod retrait_upnp;
 pub mod synchronisation_upnp;
+// Titres de démonstration proposés au premier démarrage (#7858).
+pub mod titres_demo;
 // `panne_sql` a demenage dans `tune-http-types` : les caisses de routes
 // extraites (`tune-smart-http`…) l'empruntent aussi, et une caisse extraite ne
 // peut pas dependre de `tune-server` sans fabriquer un cycle.
@@ -75,6 +77,8 @@ pub mod playlist_manager;
 pub mod playlists;
 pub mod plugins;
 pub mod podcasts;
+/// Contrôle parental, étape 1 (#7856).
+pub mod politique_parentale;
 pub mod profil_par_appareil;
 pub mod profiles;
 pub mod radios;
@@ -102,6 +106,7 @@ pub mod sonos;
 pub mod soundcloud;
 pub mod spotify_connect;
 pub mod squeezebox;
+pub mod subsonic;
 // Le transport HTTP des flux ne depend d'aucun etat propre au serveur. Il vit
 // dans une branche soeur du graphe de compilation, tout en gardant le chemin
 // historique `routes::stream_handler` pour les appelants internes et externes.
@@ -584,6 +589,8 @@ pub fn router_with_plugins(
         .nest("/smart-ai", smart_ai::router())
         .nest("/ai", ai::router())
         .nest("/developer", developer_api::router())
+        // #7855 — le réglage « Accès Subsonic » et les clés des clients.
+        .nest("/subsonic", subsonic::gestion::router())
         .nest("/skins", skins::router())
         .route(
             "/services/tokens",
@@ -644,6 +651,11 @@ pub fn router_with_plugins(
         });
 
     let api = api
+        // #7856 — sous l'authentification : le profil appelant est connu.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            politique_parentale::filtrer_les_listes,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::auth_middleware,
@@ -735,6 +747,12 @@ pub fn router_with_plugins(
         "/agent-tune",
         agent_tune::router_entre_serveurs().with_state(state.clone()),
     );
+    // #7855 — l'API Subsonic / OpenSubsonic. À la RACINE, hors de la couche
+    // d'authentification : un client Subsonic n'a pas de session Tune. Sa
+    // propre garde contrôle le réglage (404 s'il est éteint), la licence et
+    // la clé. Toujours montée : sinon `/rest/…` tomberait dans le repli
+    // statique et répondrait `index.html` en 200.
+    app = app.nest("/rest", subsonic::router_rest(state.clone()));
 
     // Mount all installed skins on /{skin_id}
     for (skin_id, skin_path) in mountable_skins {

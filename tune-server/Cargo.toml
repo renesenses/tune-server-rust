@@ -6,10 +6,10 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "collection-physique", "mon-theme", "aes67"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "collection-physique", "mon-theme", "aes67", "calibration"]
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
-local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture"]
+local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture", "tune-calibration-greffon?/capture"]
 asio = ["tune-core/asio"]
 # #4378 : lecture des DSDIFF compressés DST. Hors `default`, mais livrée par
 # toutes les lignes de build publiées (licence de `dst-decoder` acceptée le
@@ -78,6 +78,10 @@ circle = ["dep:tune-circle"]
 # l'exécution (`default_enabled = false`), au catalogue depuis #5296 (la
 # rubrique Sources du client web le consomme, #5065).
 entree-audio = ["dep:tune-entree-audio"]
+# Calibration de la pièce (#7632, C1) : mesure par balayage avec un micro
+# USB. Opt-in à l'exécution (`default_enabled = false`), au catalogue. Tire
+# `tune-entree-audio` pour la capture et la caisse pure `tune-calibration`.
+calibration = ["dep:tune-calibration-greffon"]
 # Assistant IA, étape 1 (chantier assistant-ia) : playlists par phrase et
 # suggestions d'album, avec la clé de l'UTILISATEUR. Gratuit, dans `default`
 # et chargé par défaut (`default_enabled`) : rien ne part tant qu'aucun
@@ -129,6 +133,7 @@ tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }
 tune-cd = { path = "../plugins/tune-cd", optional = true }
 tune-circle = { path = "../plugins/tune-circle", optional = true }
 tune-entree-audio = { path = "../plugins/tune-entree-audio", optional = true }
+tune-calibration-greffon = { path = "../plugins/tune-calibration", optional = true }
 tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tune-pont-roon = { path = "../plugins/tune-pont-roon", optional = true }
 tune-assistant-ia = { path = "../plugins/tune-assistant-ia", optional = true }
@@ -282,6 +287,11 @@ path = "tests/sendspin_mode_transition.rs"
 [[test]]
 name = "agent_tune_4626"
 path = "tests/agent_tune_4626.rs"
+# #7855 — le socle Subsonic : réglage, licence, clés, garde de `/rest`.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "subsonic_socle_7855"
+path = "tests/subsonic_socle_7855.rs"
 
 # #7335 — les écritures des dossiers de collections refusées par la base ne
 # répondent plus 201/200. Cible propre (pas un `mod` de `server_contracts`) :
@@ -902,6 +912,13 @@ path = "tests/comptes_par_source_2147.rs"
 [[test]]
 name = "podcasts_abonnement_identifiant_3542"
 path = "tests/podcasts_abonnement_identifiant_3542.rs"
+
+# #7819 : ajouter un podcast par la seule adresse de son flux. Le banc sert un
+# flux RSS et une page HTML sur la boucle locale. `autotests = false` : sans
+# cette entrée, le fichier ne serait jamais compilé.
+[[test]]
+name = "podcast_ajout_par_adresse_7819"
+path = "tests/podcast_ajout_par_adresse_7819.rs"
 
 # #3226 generalise : `sources` gouverne desormais AUSSI le bloc local de
 # `/home/other-versions`, `/home/artist-releases` et
@@ -1667,6 +1684,13 @@ name = "pg_credits_4984"
 path = "tests/pg_credits_4984.rs"
 required-features = ["postgres"]
 
+# #7765 — la source des crédits de piste sur PostgreSQL : migration 102 et son
+# attribution, écriture MusicBrainz qui garde les balises, filtres « à faire ».
+[[test]]
+name = "pg_credits_source_7765"
+path = "tests/pg_credits_source_7765.rs"
+required-features = ["postgres"]
+
 # #5026 — la règle « Étiquette » élargie (pistes étiquetées, albums de service
 # étiquetés) sur PostgreSQL : aperçu, collection et compteur par le vrai routeur.
 [[test]]
@@ -1694,6 +1718,12 @@ path = "tests/artiste_par_nom_6245.rs"
 [[test]]
 name = "album_par_titre_6270"
 path = "tests/album_par_titre_6270.rs"
+
+# #7769 — listes intelligentes et Historique comptent les écoutes comme la
+# Bibliothèque (titre + interprète ; `listen_history.track_id` reste vide).
+[[test]]
+name = "ecoutes_listes_et_historique_7769"
+path = "tests/ecoutes_listes_et_historique_7769.rs"
 
 # #2574 — `tests/piste_artiste_par_id.rs` existait sans cible : jamais
 # compilé (`autotests = false`). Rattaché avec #6245, son voisin direct.
@@ -1921,6 +1951,10 @@ path = "tests/licence_sso_remplacables_6336.rs"
 [[test]]
 name = "profils_panne_de_base_6454"
 path = "tests/profils_panne_de_base_6454.rs"
+
+[[test]]
+name = "politique_parentale_7856"
+path = "tests/politique_parentale_7856.rs"
 
 # #6212 / #6634 — la gravure du Dynamic Range cède à la lecture et n'écrit pas
 # dans le fichier joué, par la route montée. Binaire à lui seul : le témoin de

@@ -336,6 +336,17 @@ pub(super) async fn get_config(
             config.insert(k, Value::String(v));
         }
     }
+    // #7840 — une valeur enregistrée sous l'ancienne borne (jusqu'à 300 s)
+    // se relit comme le recul réellement appliqué : 60 s au plus.
+    if let Some(v) = config.get_mut(tune_core::db::listening_resume::REWIND_KEY) {
+        let brut = match &*v {
+            Value::String(s) => s.clone(),
+            autre => autre.to_string(),
+        };
+        *v = json!(tune_core::db::listening_resume::effective_rewind(Some(
+            &brut
+        )));
+    }
     let defaults: Vec<(&str, Value)> = vec![
         ("api_port", json!(state.port)),
         ("stream_port", json!(state.port)),
@@ -1834,9 +1845,12 @@ pub(super) async fn update_config(
         return Ok(refus);
     }
     if let Some(value) = values.get(tune_core::db::listening_resume::REWIND_KEY) {
-        if value.as_u64().is_none_or(|n| n > 300) {
+        if value
+            .as_u64()
+            .is_none_or(|n| n > tune_core::db::listening_resume::REWIND_MAX)
+        {
             return Err(AppError::bad_request(
-                "continue_listening_rewind_seconds : entier de 0 à 300 attendu",
+                "continue_listening_rewind_seconds : entier de 0 à 60 attendu",
             ));
         }
     }

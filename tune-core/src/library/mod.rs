@@ -48,6 +48,8 @@ pub mod quality;
 pub mod regle_compilation;
 /// Où vit la règle de choix des versions : par profil, puis globale (#2264).
 pub mod regle_de_version;
+/// La grammaire de requêtes de la bibliothèque et son compilateur SQL (#7848).
+pub mod requete;
 pub mod smart_collections;
 pub mod track_matcher;
 /// Les exemplaires d'un enregistrement qui sont en base (#2264).

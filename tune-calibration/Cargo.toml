@@ -1,0 +1,33 @@
+[package]
+name = "tune-calibration"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "Calibration de la pièce d'écoute (#7632) : balayage de Farina, déconvolution, réponse en fréquence, RT60, étalonnage micro, égaliseur paramétrique automatique. Traitement du signal pur : aucun son joué ni capté, aucun périphérique."
+
+# Née prototype hors workspace (`tools/tune-calibration`, étude #7632, PR
+# #7639/#7640), cette caisse est entrée dans le workspace avec le chantier C1
+# (go de Bertrand du 01/11/2026). Elle reste PURE : pas d'axum, pas de cpal,
+# pas de base. Le greffon `plugins/tune-calibration` la branche sur les zones,
+# la capture et les routes. Édition 2021 : celle du prototype, inchangée.
+#
+# `realfft` et `rustfft` sont déjà dans le graphe de `tune-core` (convolueur) :
+# aucune caisse nouvelle. Toutes MIT/Apache-2.0 (porte `cargo deny`).
+
+[lib]
+name = "tune_calibration"
+path = "src/lib.rs"
+
+[[bin]]
+name = "calib-demo"
+path = "src/bin/calib_demo.rs"
+
+[dependencies]
+realfft = "3.5"
+rustfft = "6.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[test]]
+name = "pieces_simulees"
+path = "tests/pieces_simulees.rs"
