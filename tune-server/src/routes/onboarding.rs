@@ -29,6 +29,7 @@ pub fn router() -> Router<AppState> {
         .route("/step/profile", post(step_profile))
         .route("/step/complete", post(step_complete))
         .route("/skip", post(skip_onboarding))
+        .merge(super::titres_demo::router())
 }
 
 /// Le statut « terminé » que l'on peut AFFIRMER de cette installation.
@@ -91,6 +92,9 @@ async fn onboarding_status(State(state): State<AppState>) -> Json<Value> {
     // `COUNT(*)` à chaque appel d'une route appelée au montage de chaque
     // page, pour rien, serait payé par tout le monde.
     let mut rattrape = false;
+    // #7858 : les titres de démonstration ne se proposent qu'à un assistant
+    // non terminé, bibliothèque vide — avec le compte déjà demandé ici.
+    let mut demo_proposee = false;
     let complete = if onboarding_termine(complete_stocke, current_step, 0) {
         true
     } else {
@@ -101,6 +105,7 @@ async fn onboarding_status(State(state): State<AppState>) -> Json<Value> {
         if rattrape {
             tracing::info!(pistes, "onboarding_statut_rattrape_bibliotheque_pleine");
         }
+        demo_proposee = !rattrape && super::titres_demo::proposables(&state, pistes);
         rattrape
     };
 
@@ -126,6 +131,7 @@ async fn onboarding_status(State(state): State<AppState>) -> Json<Value> {
         "complete_rattrape": rattrape,
         "current_step": current_step,
         "steps": steps,
+        "demo_tracks_offered": demo_proposee,
     }))
 }
 

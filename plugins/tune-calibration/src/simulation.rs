@@ -261,6 +261,8 @@ pub struct Journal {
     pub joues: Vec<ElementBalayage>,
     pub arrets: usize,
     pub erreurs_ouverture: Vec<String>,
+    /// Les profils de pièce enregistrés (C2).
+    pub profils: Vec<tune_core::room_correction::RoomProfile>,
 }
 
 pub struct HoteSimule {
@@ -351,5 +353,13 @@ impl HoteZone for HoteSimule {
 
     fn traitements(&self, _zone_id: i64) -> TraitementsDeZone {
         self.traitements.clone()
+    }
+
+    fn enregistrer_profil_piece(
+        &self,
+        profil: &tune_core::room_correction::RoomProfile,
+    ) -> Result<(), String> {
+        self.journal().profils.push(profil.clone());
+        Ok(())
     }
 }

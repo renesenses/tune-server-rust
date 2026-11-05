@@ -695,6 +695,13 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// #7632 — la convolution par RI est un droit Premium (`RoomCorrection`,
+    /// décision du 04/11/2026). Faux par défaut : une sortie à qui personne
+    /// n'a dit que le droit est accordé ne convolue pas. Posé par
+    /// l'orchestrateur à chaque lecture et quand la licence change
+    /// ([`Self::set_convolution_autorisee`]). Faux, la configuration reste
+    /// mémorisée mais aucun moteur n'est construit.
+    convolution_autorisee: Arc<AtomicBool>,
     /// #6522, #6524 — un traitement est-il ARMÉ dans les réglages enregistrés
     /// de la zone qui joue (égaliseur, correction de pièce, crossfeed, greffon
     /// natif, repli mono) ? Posé par l'orchestrateur à côté de `pure_bypass`.
@@ -1264,6 +1271,7 @@ impl LocalOutput {
             current_format: Arc::new(AtomicU32::new(0)),
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
+            convolution_autorisee: Arc::new(AtomicBool::new(false)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
             flux_sans_fin: AtomicBool::new(false),
             volume_avant_egaliseur: AtomicU32::new(u32::MAX),
@@ -1615,7 +1623,9 @@ impl LocalOutput {
     pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
         let config = super::super::audio::convolver::ConvolverConfig::from_wav(path)?;
         *self.convolver_config.lock().unwrap() = Some(config.clone());
-        let current_format = self.current_format();
+        let current_format = self
+            .current_format()
+            .filter(|_| self.convolution_autorisee.load(Ordering::Relaxed));
         let active = match current_format {
             Some((sample_rate, channels)) => {
                 match config.build_for(1024, sample_rate, channels as usize) {
@@ -1647,6 +1657,32 @@ impl LocalOutput {
         *self.convolver_config.lock().unwrap() = None;
         *self.convolver.lock().unwrap() = None;
         tracing::info!(device = %self.device_name, "convolver_cleared");
+    }
+
+    /// #7632 — accorder ou retirer le droit de convoluer (Premium
+    /// `RoomCorrection`). Retiré pendant la lecture, le moteur en place
+    /// s'éteint EN FONDU ([`Convolver::eteindre_en_fondu`], 20 ms) : pas de
+    /// clic, et plus aucune convolution ensuite ; à la piste suivante il n'est
+    /// pas reconstruit. Accordé, il le sera à la prochaine lecture (le faire
+    /// flux en cours ferait sauter le temps de sa latence). Rend vrai si
+    /// l'état a changé.
+    pub fn set_convolution_autorisee(&self, autorisee: bool) -> bool {
+        let avant = self
+            .convolution_autorisee
+            .swap(autorisee, Ordering::Relaxed);
+        if avant && !autorisee {
+            let trames = self
+                .current_format()
+                .map(|(taux, _)| (taux as usize / 50).max(1))
+                .unwrap_or(0);
+            if let Ok(mut c) = self.convolver.lock()
+                && let Some(conv) = c.as_mut()
+            {
+                conv.eteindre_en_fondu(trames);
+                tracing::info!(device = %self.device_name, trames, "convolution_eteinte_sans_licence");
+            }
+        }
+        avant != autorisee
     }
 
     /// Enable/disable PURE (audiophile) bypass of the room-correction convolver
@@ -3817,13 +3853,16 @@ fn finish_windows_exclusive_probe(
 fn rebuild_local_convolver(
     config: &std::sync::Mutex<Option<crate::audio::convolver::ConvolverConfig>>,
     active: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    autorisee: &AtomicBool,
     sample_rate: u32,
     channels: u16,
 ) -> Result<bool, String> {
     let config = config
         .lock()
         .map_err(|_| "verrou de configuration du convolveur empoisonné".to_string())?
-        .clone();
+        .clone()
+        // #7632 — sans le droit Premium, aucun moteur : l'IR reste mémorisée.
+        .filter(|_| autorisee.load(Ordering::Relaxed));
     let next = match config {
         Some(config) => match config.build_for(1024, sample_rate, channels as usize) {
             Ok(convolver) => Some(convolver),
@@ -5828,6 +5867,7 @@ impl OutputTarget for LocalOutput {
         let current_format = self.current_format.clone();
         let convolver_config = self.convolver_config.clone();
         let convolver = self.convolver.clone();
+        let convolution_autorisee = self.convolution_autorisee.clone();
         let pure_bypass = self.pure_bypass.clone();
         // #3973 — lu UNE fois par piste, comme le reste de ce que
         // l'orchestrateur pose avant `play_url`.
@@ -6507,7 +6547,13 @@ impl OutputTarget for LocalOutput {
                 // forme de f32 — `is_dop_pcm`, qui inspecte des octets PCM
                 // bruts, n'a rien a y examiner.
                 current_format.store(LocalOutput::pack_format(dec_sr, dec_ch), Ordering::Relaxed);
-                match rebuild_local_convolver(&convolver_config, &convolver, dec_sr, dec_ch) {
+                match rebuild_local_convolver(
+                    &convolver_config,
+                    &convolver,
+                    &convolution_autorisee,
+                    dec_sr,
+                    dec_ch,
+                ) {
                     Ok(true) => info!(
                         sample_rate = dec_sr,
                         channels = dec_ch,
@@ -6688,7 +6734,13 @@ impl OutputTarget for LocalOutput {
                 LocalOutput::pack_format(sample_rate, channels),
                 Ordering::Relaxed,
             );
-            match rebuild_local_convolver(&convolver_config, &convolver, sample_rate, channels) {
+            match rebuild_local_convolver(
+                &convolver_config,
+                &convolver,
+                &convolution_autorisee,
+                sample_rate,
+                channels,
+            ) {
                 Ok(true) => info!(sample_rate, channels, "local_convolver_built_for_stream"),
                 Ok(false) => {}
                 Err(error) => warn!(
@@ -7601,6 +7653,7 @@ impl OutputTarget for LocalOutput {
                     match rebuild_local_convolver(
                         &convolver_config,
                         &convolver,
+                        &convolution_autorisee,
                         sample_rate,
                         channels,
                     ) {
@@ -8529,6 +8582,9 @@ pub(crate) use crate::audio::resample::{rubato_resample_chunk, rubato_resample_t
 
 #[cfg(test)]
 mod tests;
+// #7632 — la convolution par RI est un droit Premium, éteinte sans clic.
+#[cfg(test)]
+mod convolution_sous_licence_7632;
 
 #[cfg(test)]
 mod open_failure_tests;
