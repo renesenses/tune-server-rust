@@ -623,6 +623,51 @@ fn est_notre_propre_renderer(
     !hote.is_empty() && nos_adresses.iter().any(|a| a == hote)
 }
 
+/// L'hôte d'une LOCATION SSDP, sans schéma, port ni chemin.
+fn hote_de_location(location: &str) -> &str {
+    location
+        .split("://")
+        .nth(1)
+        .and_then(|reste| reste.split('/').next())
+        .map(|hp| hp.split(':').next().unwrap_or(hp))
+        .unwrap_or_default()
+}
+
+/// #7875 — un renderer UPnP tiers qui tourne sur CETTE machine.
+///
+/// Rend la LOCATION (ou l'hôte) à journaliser quand l'annonce porte une de
+/// nos adresses, par l'hôte de l'appareil ou par celui de sa LOCATION, sans
+/// être une façade Tune (`/upnp/renderer/`). Les façades restent l'affaire
+/// d'[`est_notre_propre_renderer`] et de l'UDN : la nôtre est écartée, celle
+/// d'un autre Tune lancé sur la même machine reste une zone.
+///
+/// Un renderer d'une autre adresse du réseau n'est jamais concerné. La boucle
+/// locale (`127.x`, `localhost`) non plus : un renderer tiers de la machine
+/// s'annonce en multicast sous l'adresse de son interface réseau, et une
+/// LOCATION en boucle locale est celle d'un faux renderer de banc d'essai,
+/// qui doit rester une zone.
+fn renderer_tiers_sur_cette_machine<'a>(
+    hote: &'a str,
+    location: Option<&'a str>,
+    nos_adresses: &[String],
+) -> Option<&'a str> {
+    if location.is_some_and(|loc| loc.contains(tune_core::upnp_renderer::RENDERER_MOUNT)) {
+        return None;
+    }
+    let boucle_locale = |h: &str| {
+        h.eq_ignore_ascii_case("localhost")
+            || h.parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    };
+    let est_a_nous =
+        |h: &str| !h.is_empty() && !boucle_locale(h) && nos_adresses.iter().any(|a| a == h);
+    let par_location = location.filter(|loc| est_a_nous(hote_de_location(loc)));
+    if par_location.is_some() {
+        return par_location;
+    }
+    est_a_nous(hote).then_some(location.unwrap_or(hote))
+}
+
 /// Les UDN de nos propres façades (`upnp_renderer_udn_<zone>`), tels que
 /// `renderer_udn` les persiste à la première annonce. Contrairement aux
 /// adresses, ils ne dépendent d'aucune énumération d'interfaces.
@@ -791,6 +836,26 @@ async fn handle_ssdp_discovered(
             id = %dev.id,
             name = %dev.name,
             "ssdp_notre_facade_reconnue_par_udn_ignoree"
+        );
+        return;
+    }
+
+    // #7875 — troisième rideau : un renderer UPnP qui n'est PAS notre façade
+    // mais tourne sur cette machine (upmpdcli, gmediarender… sur un NUC Tune
+    // OS). Il joue sur la même carte que la sortie locale : en zone DLNA, il
+    // doublait cette sortie avec un chemin du signal réseau au lieu du chemin
+    // local. Un AUTRE serveur Tune sur cette machine garde sa zone.
+    if let Some(loc) = renderer_tiers_sur_cette_machine(
+        &dev.host,
+        dev.location.as_deref(),
+        &nos_adresses(config.advertised_ip.as_deref()),
+    ) {
+        warn!(
+            id = %dev.id,
+            name = %dev.name,
+            host = %dev.host,
+            location = %loc,
+            "ssdp_renderer_sur_cette_machine_ecarte — la sortie locale de la machine est à utiliser"
         );
         return;
     }
@@ -5460,3 +5525,7 @@ mod volume_7333_mdns_tests {
 #[cfg(test)]
 #[path = "discovery_setup/decouverte_volume_6774_tests.rs"]
 mod decouverte_volume_6774_tests;
+
+#[cfg(test)]
+#[path = "discovery_setup/renderer_sur_cette_machine_7875_tests.rs"]
+mod renderer_sur_cette_machine_7875_tests;
