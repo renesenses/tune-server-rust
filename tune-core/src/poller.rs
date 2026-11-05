@@ -1476,6 +1476,11 @@ pub(crate) mod suivante_bannie_5143;
 #[cfg(test)]
 mod repeter_piste_courte_6735;
 
+/// #7902 — une file de WAV de 4 s aux formats changeants va au bout sur un
+/// renderer DLNA qui rend sa position à la seconde.
+#[cfg(test)]
+mod file_courte_dlna_formats_7902;
+
 /// #5395 — la radio artiste se recharge par la vraie fin de file, et une file
 /// qui s'achève hors radio rend la main au réglage d'auto-lecture de la zone.
 #[cfg(test)]
