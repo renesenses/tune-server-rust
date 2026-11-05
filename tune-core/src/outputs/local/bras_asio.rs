@@ -58,6 +58,10 @@ use super::{
 use crate::outputs::asio_exclusive::AsioExclusiveOutput;
 use crate::outputs::traits::PuitsNatif;
 
+/// #7934 — le volume que reçoit l'étage natif : l'unité. Le volume de la
+/// zone est appliqué par le rappel ASIO, après l'anneau.
+const VOLUME_A_L_UNITE: u32 = 1000;
+
 /// Ce que le bras lisait du contexte de `play_url` — trente-quatre valeurs,
 /// toutes déjà possédées par le fil de lecture. Elles sont DÉPLACÉES, jamais
 /// empruntées : la pompe HTTP du bras (`std::thread::spawn(move …)`) prend
@@ -793,6 +797,13 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
         mono_downmix: &mono_downmix,
         bit_perfect_state: None,
     };
+    // #7934 — sur la route native, l'étage reçoit l'UNITÉ : le volume de la
+    // zone est appliqué par le rappel ASIO aux mots tirés de l'anneau de deux
+    // secondes (`pop_mapped_au_gain`), comme le WASAPI exclusif depuis #7264.
+    // L'étage marque ses passages intacts (DoP) dans l'anneau pour que le
+    // rendu ne les pondère jamais.
+    let volume_de_l_etage = AtomicU32::new(VOLUME_A_L_UNITE);
+    let anneau_natif = backend.sortie.native_ring().clone();
     // D1 : le backend dit quel puits il fournit ; la route suit.
     let mut route = match backend.puits() {
         Puits::Natif(puits) => Route::Native {
@@ -808,7 +819,7 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
                 etage: EtageNatif::monter(
                     spec,
                     FormatOuvert::new(backend.format_ouvert().cadence, voies_de_l_etage),
-                    &volume,
+                    &volume_de_l_etage,
                     &eq,
                     &convolver,
                     &crossfeed,
@@ -816,7 +827,8 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
                     &mono_downmix,
                 )
                 .avec_l_adaptation_des_canaux(&reaffectation, &disposition)
-                .avec_publication(&transformations_reelles),
+                .avec_publication(&transformations_reelles)
+                .avec_le_gain_au_rendu(anneau_natif),
                 recu: Vec::new(),
                 contrat: contrat(),
                 reliquat_force_brut: None,

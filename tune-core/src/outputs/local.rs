@@ -447,6 +447,9 @@ mod etage_natif;
 // l'anneau natif, et non plus dans le producteur deux secondes en amont.
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 pub(crate) mod gain_au_rendu_7264;
+// #7934 — le même remède sur les rappels natifs ASIO : témoins portables.
+#[cfg(test)]
+mod gain_au_rendu_asio_7934;
 
 // #5204 — l'enchaînement sans blanc en mode exclusif : quel bras enchaîne, la
 // règle de la frontière à format égal, et la lecture de l'en-tête suivant
@@ -2423,6 +2426,58 @@ impl NativePcmRing {
         self.starvation.record(out.len() / bytes_per_sample, count);
         self.starvation.noter_en_attente(available - count);
         count * bytes_per_sample
+    }
+
+    /// #7934 — [`Self::pop_mapped`] avec le volume logiciel appliqué au
+    /// rendu, pour les rappels natifs ASIO (I32, I24, I16) : le même défaut
+    /// que #7264 sur WASAPI, l'étage ASIO pondérait dans le producteur avant
+    /// l'anneau de deux secondes. `bits` est la profondeur à laquelle le mot
+    /// est pondéré puis borné ; mêmes marques de passage intact, mêmes
+    /// compteurs, aucune allocation.
+    pub(crate) fn pop_mapped_au_gain<T>(
+        &self,
+        out: &mut [T],
+        bits: u16,
+        gain: &mut gain_au_rendu_7264::GainAuRendu,
+        mut map: impl FnMut(i32) -> T,
+    ) -> usize {
+        gain.relire_la_consigne();
+
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        let n = out.len().min(w.wrapping_sub(r) as usize);
+        let cap = self.capacity();
+        let mut prochaine = u64::MAX;
+        while let Some((position, intact)) = self.prochaine_marque() {
+            if position > r {
+                prochaine = position;
+                break;
+            }
+            gain.entrer_dans_le_passage(intact);
+            self.consommer_la_marque();
+        }
+        for (i, target) in out[..n].iter_mut().enumerate() {
+            let position = r + i as u64;
+            while position >= prochaine {
+                if let Some((_, intact)) = self.prochaine_marque() {
+                    gain.entrer_dans_le_passage(intact);
+                    self.consommer_la_marque();
+                }
+                prochaine = match self.prochaine_marque() {
+                    Some((suivante, _)) => suivante,
+                    None => u64::MAX,
+                };
+            }
+            let idx = (r as usize + i) % cap;
+            // SAFETY: same SPSC publication contract as `pop_mapped`.
+            let mot = unsafe { *self.buf[idx].get() };
+            *target = map(gain.rendre(mot, bits, position));
+        }
+        self.read.store(r + n as u64, Ordering::Release);
+        self.starvation.record(out.len(), n);
+        self.starvation
+            .noter_en_attente(w.wrapping_sub(r) as usize - n);
+        n
     }
 }
 
