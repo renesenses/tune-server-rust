@@ -29,6 +29,14 @@
 //!   Sinon la cible valide une seule fois. Une seule écoute dans tous les cas.
 //! - La position est celle de la zone, comme pour le scrobble : un saut en
 //!   avant au-delà du seuil valide l'écoute.
+//! - Arrêt : l'attente n'est PAS vidée par `stop`. Une zone arrêtée n'est pas
+//!   « en lecture », le point de décision ne la valide donc pas ; et si le
+//!   même titre repart, il est bien écouté : il valide au seuil, une fois.
+//!   Un autre titre remplace l'attente (`est_le_titre_joue` l'écarte de
+//!   toute façon). Le transfert de zone compte sur cet ordre : il déplace
+//!   l'attente vers la cible avant d'arrêter la source.
+//! - Redémarrage du serveur : l'attente vit en mémoire ; un titre joué moins
+//!   que son seuil au moment d'un redémarrage n'est pas compté.
 use super::{ContexteEcoute, PlaybackOrchestrator};
 use crate::playback::{PlayState, ZoneState};
 

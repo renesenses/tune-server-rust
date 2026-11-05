@@ -7,10 +7,14 @@
 //! avancer la zone (`playback.update_position`, ce que fait le sondeur), puis
 //! appelle le point de décision (`valider_l_ecoute`) comme le tour du sondeur.
 //!
-//! CONTRE-ÉPREUVE : remplacer le corps de `ecoute_validee` par `true` (ce qui
-//! revient à écrire au démarrage, la conduite d'avant) fait rougir
-//! `zapping_a_5_s_rien_n_est_ecrit_7852` et
-//! `titre_de_40_s_coupe_a_19_s_rien_n_est_ecrit_7852`.
+//! CONTRE-ÉPREUVE (mesurée) : remplacer le corps de `ecoute_validee` par
+//! `true` (ce qui revient à écrire au démarrage, la conduite d'avant) fait
+//! rougir six témoins : `zapping_a_5_s_rien_n_est_ecrit_7852`,
+//! `titre_de_40_s_coupe_a_19_s_rien_n_est_ecrit_7852`,
+//! `trente_et_une_s_d_un_titre_de_4_min_est_ecrit_7852` (29 s ne comptent
+//! pas), `vingt_et_une_s_d_un_titre_de_40_s_est_ecrit_7852` (19 s ne
+//! comptent pas), `transfert_de_zone_une_seule_ecoute_7852` et
+//! `le_seuil_est_min_30_s_ou_la_moitie_7852`.
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
