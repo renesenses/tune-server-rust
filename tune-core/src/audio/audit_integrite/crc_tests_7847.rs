@@ -291,6 +291,49 @@ fn une_zone_illisible_ne_tient_ni_la_pause_ni_la_memoire() {
     }
 }
 
+/// Une première trame valide suivie de plusieurs Mio sans synchro : c'est la
+/// recherche de la fin de cette trame qui traverse la zone, et elle aussi
+/// entend la pause et garde un tampon borné.
+#[test]
+fn la_fin_d_une_trame_cherchee_loin_ne_tient_ni_la_pause_ni_la_memoire() {
+    const TAILLE: usize = 8 << 20;
+    let debuts = sain("test.flac").debuts;
+    let mut octets = fixture("test.flac");
+    octets.truncate(debuts[1] as usize);
+    octets.resize(octets.len() + TAILLE, 0x55);
+    // Sans pause : `continuer` est consulté tout au long de la zone, et le
+    // tampon reste borné.
+    let mut appels = 0u64;
+    let mut lecteur = Lecteur::new(&octets[..]);
+    let analyse = flac(&mut lecteur, 4, &mut || {
+        appels += 1;
+        true
+    })
+    .unwrap();
+    assert!(matches!(analyse, Analyse::Constat(_)), "{analyse:?}");
+    assert!(
+        appels >= TAILLE as u64 / ETAPE,
+        "fin de trame : pause jamais consultée pendant la recherche ({appels} appels pour {TAILLE} octets)"
+    );
+    assert!(
+        lecteur.tampon.len() <= 3 * BLOC,
+        "fin de trame : {} octets gardés en mémoire pour {} lus",
+        lecteur.tampon.len(),
+        octets.len()
+    );
+    // Pause demandée à mi-chemin : rendue avant la fin.
+    let mut n = 0u64;
+    let analyse = analyser(&octets[..], || {
+        n += 1;
+        n < appels / 2
+    })
+    .unwrap();
+    assert!(
+        matches!(analyse, Analyse::Interrompu),
+        "fin de trame : pause ignorée pendant la recherche : {analyse:?}"
+    );
+}
+
 #[test]
 fn ni_flac_ni_ogg_n_est_pas_applicable() {
     let wav = b"RIFF\x24\0\0\0WAVEfmt ".to_vec();
