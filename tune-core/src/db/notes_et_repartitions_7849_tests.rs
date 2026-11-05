@@ -404,7 +404,7 @@ fn migration_reprend_les_notes_d_album_7849() {
     .unwrap();
     semer_notes_d_album(b.as_ref());
     executer(b.as_ref(), NOTES_SUR_CINQ);
-    assert_eq!(current_version(&db).unwrap(), 135);
+    assert_eq!(current_version(&db).unwrap(), 137);
     run_migrations(&db).unwrap();
     assert_eq!(current_version(&db).unwrap(), latest_version());
     verifier_reprise(b.as_ref());
