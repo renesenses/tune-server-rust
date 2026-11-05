@@ -908,6 +908,13 @@ path = "tests/comptes_par_source_2147.rs"
 name = "podcasts_abonnement_identifiant_3542"
 path = "tests/podcasts_abonnement_identifiant_3542.rs"
 
+# #7819 : ajouter un podcast par la seule adresse de son flux. Le banc sert un
+# flux RSS et une page HTML sur la boucle locale. `autotests = false` : sans
+# cette entrée, le fichier ne serait jamais compilé.
+[[test]]
+name = "podcast_ajout_par_adresse_7819"
+path = "tests/podcast_ajout_par_adresse_7819.rs"
+
 # #3226 generalise : `sources` gouverne desormais AUSSI le bloc local de
 # `/home/other-versions`, `/home/artist-releases` et
 # `/library/tracks/{id}/versions`, la ou il ne filtrait que la boucle des
@@ -1699,6 +1706,12 @@ path = "tests/artiste_par_nom_6245.rs"
 [[test]]
 name = "album_par_titre_6270"
 path = "tests/album_par_titre_6270.rs"
+
+# #7769 — listes intelligentes et Historique comptent les écoutes comme la
+# Bibliothèque (titre + interprète ; `listen_history.track_id` reste vide).
+[[test]]
+name = "ecoutes_listes_et_historique_7769"
+path = "tests/ecoutes_listes_et_historique_7769.rs"
 
 # #2574 — `tests/piste_artiste_par_id.rs` existait sans cible : jamais
 # compilé (`autotests = false`). Rattaché avec #6245, son voisin direct.
