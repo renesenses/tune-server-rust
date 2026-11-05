@@ -155,10 +155,10 @@ pub mod text_embedding;
 pub mod thermal;
 /// #6918 — le volume en dB d'une sortie qui règle son volume en décibels.
 pub mod volume_appareil_db;
-/// #6541 — limites de sécurité et de confort du volume d'une zone.
-pub mod volume_limites;
 /// #7841 — trim et limites de chaque zone, tels que le rapport de diagnostic les montre.
 pub mod volume_au_rapport;
+/// #6541 — limites de sécurité et de confort du volume d'une zone.
+pub mod volume_limites;
 /// Conversion volume linéaire ↔ décibels — le seul endroit (#1274).
 pub mod volume_scale;
 pub mod wav;
