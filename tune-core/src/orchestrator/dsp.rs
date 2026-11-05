@@ -803,12 +803,21 @@ impl PlaybackOrchestrator {
             // geste même qu'on vient de rendre possible — bouger un curseur en
             // écoutant — claque à chaque cran.
             local_output.replace_eq_live(eq);
+            // #4176 — « Remettre à plat » sur un égaliseur coupé enregistre un
+            // profil aux bandes neutres : c'est le « prochain réglage » qui
+            // rend le niveau. Le gain gardé remonte jusqu'au signal sec, en
+            // rampe, même si le volume a monté pendant que l'égaliseur jouait.
+            let remis_a_plat = !actif && self.egaliseur_enregistre_a_plat(zone_id, taux, canaux);
+            if remis_a_plat {
+                local_output.liberer_le_preampli_garde();
+            }
             info!(
                 zone_id,
                 device_id = %device_id,
                 sample_rate = taux,
                 channels = canaux,
                 actif,
+                remis_a_plat,
                 "zone_eq_refreshed_live"
             );
             RapportEqAChaud {
@@ -1872,6 +1881,26 @@ impl PlaybackOrchestrator {
     /// le profil est désactivé.
     pub(super) fn eq_profile_configure(&self, zone_id: i64) -> Option<crate::audio::eq::EqProfile> {
         Self::eq_profile_configure_with(&self.db, zone_id)
+    }
+
+    /// #4176 — le profil ENREGISTRÉ de la zone est-il à plat : aucune bande
+    /// qui filtre, activé ou non (« Remettre à plat » sur un égaliseur coupé
+    /// l'enregistre désactivé) ? Même critère que le moteur, qui ne reste pas
+    /// actif sur des bandes toutes neutres. Un profil absent ou illisible
+    /// n'est pas une remise à plat.
+    #[cfg(feature = "local-audio")]
+    fn egaliseur_enregistre_a_plat(&self, zone_id: i64, taux: u32, canaux: u16) -> bool {
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let Some(mut profil) = settings
+            .get(&format!("zone_{zone_id}_eq_profile"))
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<crate::audio::eq::EqProfile>(&s).ok())
+        else {
+            return false;
+        };
+        profil.enabled = true;
+        !tune_plugin_equalizer::EqProcessor::new(&profil, taux, canaux).is_enabled()
     }
 
     /// Même lecture, sans orchestrateur.
