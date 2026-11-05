@@ -1,6 +1,7 @@
 mod album_order;
 mod albums;
 mod audit_integrite;
+mod bio_liens;
 /// #4806 — le drapeau `banned` des listes de pistes, partagé avec les
 /// playlists et la recherche fédérée qui vivent hors de ce module.
 pub(crate) use albums::attacher_banni;
@@ -324,7 +325,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/artists/{id}/albums", get(artists::artist_albums))
         .route("/artists/{id}/tracks", get(artists::artist_tracks))
-        .route("/artists/{id}/bio", get(artists::artist_bio))
+        // #7910 : `bio_liens` appelle (artists::artist_bio) et ajoute `bio_segments`.
+        .route("/artists/{id}/bio", get(bio_liens::artist_bio))
         .route("/artists/{id}/similar", get(artists::artist_similar))
         .route("/artists/{id}/metadata", get(artists::artist_metadata))
         // #6463 — « Détacher l'identité » : retire le MBID, provenance `manuel`.
@@ -753,7 +755,8 @@ pub fn router() -> Router<AppState> {
             post(duplicates::retirer_album_doublon),
         )
         .route("/activity", get(stats::library_activity))
-        .route("/albums/{id}/bio", get(albums::album_bio))
+        // #7910 : `bio_liens` appelle (albums::album_bio) et ajoute `bio_segments`.
+        .route("/albums/{id}/bio", get(bio_liens::album_bio))
         .route("/albums/{id}/similar", get(albums::album_similar))
         .route(
             "/albums/{id}/artwork/rescan",

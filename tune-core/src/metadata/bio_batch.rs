@@ -9,6 +9,8 @@ pub struct BioResult {
     pub source_url: Option<String>,
     pub license: String, // e.g. "CC-BY-SA-4.0"
     pub lang: String,    // "fr" | "en"
+    /// Liens d'origine de la source, filtrés (#7910) : vide hors Last.fm.
+    pub liens: Vec<super::bio_segments::LienExterne>,
 }
 
 /// Fetch artist bio from Wikipedia FR via Wikidata, with Last.fm fallback.
@@ -129,6 +131,7 @@ async fn fetch_bio_via_wikidata(
         )),
         license: "CC-BY-SA-4.0".to_string(),
         lang: wiki_lang.to_string(),
+        liens: Vec::new(),
     })
 }
 
@@ -200,6 +203,7 @@ fn bio_lastfm_depuis_json(
         source_url,
         license: "CC-BY-SA-3.0".to_string(),
         lang: lang.to_ascii_lowercase(),
+        liens: super::bio_segments::liens_depuis_html(bio),
     })
 }
 
@@ -325,6 +329,7 @@ async fn fetch_album_bio_wikipedia(
         )),
         license: "CC-BY-SA-4.0".to_string(),
         lang: lang.to_string(),
+        liens: Vec::new(),
     })
 }
 
@@ -477,6 +482,7 @@ async fn fetch_artist_bio_theaudiodb(
         source_url,
         license: "TheAudioDB".to_string(),
         lang: bio_lang,
+        liens: Vec::new(),
     })
 }
 
@@ -517,6 +523,7 @@ async fn fetch_album_bio_theaudiodb(
         source_url,
         license: "TheAudioDB".to_string(),
         lang: bio_lang,
+        liens: Vec::new(),
     })
 }
 
@@ -671,7 +678,7 @@ pub async fn batch_enrich_artist_bios_scoped(
 
         match fetch_artist_bio(&client, mbid, name, &lastfm_key, lang).await {
             Some(bio) => {
-                artist_repo
+                if artist_repo
                     .update_bio_full(
                         *artist_id,
                         &bio.text,
@@ -680,7 +687,16 @@ pub async fn batch_enrich_artist_bios_scoped(
                         &bio.license,
                         &bio.lang,
                     )
-                    .ok();
+                    .is_ok()
+                {
+                    super::bio_segments::ranger_liens_externes(
+                        &db,
+                        super::bio_segments::GenreDeLien::Artiste,
+                        *artist_id,
+                        &bio.text,
+                        &bio.liens,
+                    );
+                }
                 enriched += 1;
                 info!(
                     artist_id,
@@ -800,7 +816,7 @@ pub async fn batch_enrich_album_bios_scoped(
 
         match result {
             Some(bio) => {
-                album_repo
+                if album_repo
                     .update_bio_full(
                         *album_id,
                         &bio.text,
@@ -809,7 +825,16 @@ pub async fn batch_enrich_album_bios_scoped(
                         &bio.license,
                         &bio.lang,
                     )
-                    .ok();
+                    .is_ok()
+                {
+                    super::bio_segments::ranger_liens_externes(
+                        &db,
+                        super::bio_segments::GenreDeLien::Album,
+                        *album_id,
+                        &bio.text,
+                        &bio.liens,
+                    );
+                }
                 enriched += 1;
                 info!(
                     album_id,
