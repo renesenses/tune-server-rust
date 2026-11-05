@@ -40,6 +40,54 @@ fn sans_leader_id_la_meneuse_est_la_premiere_zone() {
 }
 
 #[test]
+fn lancer_sur_une_suiveuse_en_fait_la_meneuse_7717() {
+    // Le groupe formé depuis la fiche de la Chromecast (zone 5) : elle mène.
+    let mut groupes = vec![json!({ "id": 1, "leader_id": 5, "zone_ids": [5, 2] })];
+    assert!(
+        mener_les_groupes_de(&mut groupes, 2),
+        "une lecture lancée sur la zone 2 doit en faire la meneuse du groupe"
+    );
+    assert_eq!(
+        zones_suiveuses(&groupes, 2),
+        vec![5],
+        "la Chromecast suit la zone 2 où la lecture a été lancée (#7717)"
+    );
+    assert!(
+        zones_suiveuses(&groupes, 5).is_empty(),
+        "une seule meneuse : la Chromecast ne renvoie pas la lecture"
+    );
+    assert!(
+        !mener_les_groupes_de(&mut groupes, 2),
+        "déjà meneuse : rien ne change, rien n'est réécrit"
+    );
+}
+
+#[test]
+fn mener_ne_touche_que_les_groupes_de_la_zone_7717() {
+    let mut groupes = vec![
+        json!({ "id": 1, "leader_id": 5, "zone_ids": [5, 2] }),
+        json!({ "id": 2, "leader_zone_id": 8, "zone_ids": [8, 9] }),
+        json!({ "id": 3, "zone_ids": [4, 6] }),
+    ];
+    assert!(!mener_les_groupes_de(&mut groupes, 42), "zone hors groupe");
+    assert!(mener_les_groupes_de(&mut groupes, 9));
+    assert_eq!(groupes[1]["leader_id"], json!(9));
+    assert_eq!(
+        groupes[1]["leader_zone_id"],
+        json!(9),
+        "la forme de /zone-manager/groups dit la même meneuse"
+    );
+    assert_eq!(
+        groupes[0]["leader_id"],
+        json!(5),
+        "l'autre groupe garde sa meneuse"
+    );
+    assert!(mener_les_groupes_de(&mut groupes, 6));
+    assert_eq!(zones_suiveuses(&groupes, 6), vec![4]);
+    assert!(groupes[2].get("leader_zone_id").is_none());
+}
+
+#[test]
 fn la_meneuse_lance_une_piste_la_suiveuse_muette_la_rejoint() {
     // Le cas de Pierre : le Phantom joue, la KEF ne fait rien.
     assert_eq!(

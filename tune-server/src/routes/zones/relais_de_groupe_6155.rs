@@ -28,8 +28,19 @@
 //! un arrêt fugace de la meneuse entre deux pistes ne coupe pas les
 //! suiveuses ([`DELAI_AVANT_D_ARRETER`]).
 //!
-//! Seuls les gestes de la MENEUSE sont relayés : une commande donnée sur une
-//! suiveuse ne vaut que pour elle.
+//! Seuls les gestes de la MENEUSE sont relayés : une pause, une reprise, un
+//! arrêt, un suivant ou un précédent donnés sur une suiveuse ne valent que
+//! pour elle.
+//!
+//! #7717 — une exception : une NOUVELLE lecture lancée sur une zone du groupe
+//! (`POST /zones/{id}/play`, saut dans la file), depuis n'importe quel client,
+//! fait de cette zone la meneuse ([`prendre_la_tete_du_groupe`]). Le groupe
+//! formé depuis la fiche de la Chromecast suivait la Chromecast seule : une
+//! lecture lancée ensuite sur l'autre zone partait sur elle seule, et la
+//! Chromecast gardait son ancien titre. La meneuse change dans la route, avant
+//! le lancement, jamais sur l'événement `started` : la suiveuse qui rejoint
+//! émet elle aussi `started`, elle deviendrait meneuse à son tour et les deux
+//! zones se renverraient la lecture.
 
 use std::time::Duration;
 
@@ -95,15 +106,8 @@ impl Instantane {
 pub(crate) fn zones_suiveuses(groupes: &[Value], meneuse: i64) -> Vec<i64> {
     let mut suiveuses = Vec::new();
     for groupe in groupes {
-        let zones: Vec<i64> = groupe["zone_ids"]
-            .as_array()
-            .map(|ids| ids.iter().filter_map(Value::as_i64).collect())
-            .unwrap_or_default();
-        let tete = groupe["leader_id"]
-            .as_i64()
-            .or_else(|| groupe["leader_zone_id"].as_i64())
-            .or_else(|| zones.first().copied());
-        if tete != Some(meneuse) {
+        let zones = zones_du_groupe(groupe);
+        if meneuse_du_groupe(groupe) != Some(meneuse) {
             continue;
         }
         for id in zones {
@@ -113,6 +117,20 @@ pub(crate) fn zones_suiveuses(groupes: &[Value], meneuse: i64) -> Vec<i64> {
         }
     }
     suiveuses
+}
+
+fn zones_du_groupe(groupe: &Value) -> Vec<i64> {
+    groupe["zone_ids"]
+        .as_array()
+        .map(|ids| ids.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default()
+}
+
+fn meneuse_du_groupe(groupe: &Value) -> Option<i64> {
+    groupe["leader_id"]
+        .as_i64()
+        .or_else(|| groupe["leader_zone_id"].as_i64())
+        .or_else(|| zones_du_groupe(groupe).first().copied())
 }
 
 /// Le geste qui ramène `suiveuse` sur `meneuse`, ou `None` si elle y est déjà.
@@ -137,6 +155,49 @@ fn groupes_enregistres(state: &AppState) -> Vec<Value> {
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// #7717 — fait de `zone` la meneuse de chaque groupe qui la compte et qu'elle
+/// ne mène pas déjà. Rend `true` si un groupe a changé de meneuse.
+///
+/// `leader_id` est la clé que lit [`zones_suiveuses`] en premier ;
+/// `leader_zone_id` (forme de `/zone-manager/groups`) suit quand il existe,
+/// pour que les deux lectures du groupe disent la même meneuse.
+pub(crate) fn mener_les_groupes_de(groupes: &mut [Value], zone: i64) -> bool {
+    let mut change = false;
+    for groupe in groupes.iter_mut() {
+        if !zones_du_groupe(groupe).contains(&zone) || meneuse_du_groupe(groupe) == Some(zone) {
+            continue;
+        }
+        let Some(objet) = groupe.as_object_mut() else {
+            continue;
+        };
+        objet.insert("leader_id".into(), Value::from(zone));
+        if objet.contains_key("leader_zone_id") {
+            objet.insert("leader_zone_id".into(), Value::from(zone));
+        }
+        change = true;
+    }
+    change
+}
+
+/// #7717 — une lecture lancée par un utilisateur sur `zone` : si `zone` est
+/// dans un groupe qu'elle ne mène pas, elle en devient la meneuse, et le
+/// relais y fera suivre les autres zones au `started` qui vient.
+///
+/// Appelé par les routes de lancement AVANT de lancer, jamais par le relais.
+pub(crate) fn prendre_la_tete_du_groupe(state: &AppState, zone: i64) {
+    let mut groupes = groupes_enregistres(state);
+    if !mener_les_groupes_de(&mut groupes, zone) {
+        return;
+    }
+    let Ok(texte) = serde_json::to_string(&groupes) else {
+        return;
+    };
+    match SettingsRepo::with_backend(state.backend.clone()).set("zone_groups", &texte) {
+        Ok(()) => info!(zone, "zone_group_leader_changed"),
+        Err(error) => warn!(zone, %error, "zone_group_leader_change_failed"),
+    }
 }
 
 /// Ramène chaque suiveuse de `meneuse` sur ce que joue la meneuse, maintenant.

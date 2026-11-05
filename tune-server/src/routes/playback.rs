@@ -2437,6 +2437,10 @@ async fn play(
         .playback
         .set_session_profile(zone_id, Some(profile.id()))
         .await;
+    // #7717 — lancée sur une zone d'un groupe, depuis n'importe quel client,
+    // la lecture fait de cette zone la meneuse : le relais y fait suivre les
+    // autres zones du groupe.
+    crate::routes::zones::relais_de_groupe_6155::prendre_la_tete_du_groupe(&state, zone_id);
     // #2264 — un choix fait dans « Autres versions » prime sur la règle de
     // version : épinglé pour la lecture qui suit, qu'elle passe par la file
     // ou non. Une liste ou un conteneur n'est pas un choix de version.
@@ -5742,6 +5746,8 @@ async fn queue_jump(
     if let Err(refus) = refuser_un_entier_negatif("position", body.position) {
         return refus;
     }
+    // #7717 — un saut dans la file est un lancement : comme `play`.
+    crate::routes::zones::relais_de_groupe_6155::prendre_la_tete_du_groupe(&state, zone_id);
     match state
         .orchestrator
         .play_from_queue(zone_id, body.position)
