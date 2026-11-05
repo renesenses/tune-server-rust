@@ -1,5 +1,6 @@
 use super::textes_signal::{formater as fs, texte as ts};
 use super::*;
+use tune_core::audio::volume_scale::EchelleDeVolume;
 
 pub fn build_signal_path_pub(
     ps: &ZoneState,
@@ -1608,7 +1609,7 @@ fn assembler_les_etapes_lang(
         reaffectation_ignoree,
         compensation_reseau_db,
         crossfeed_du_flux,
-        ui_volume,
+        curseur_pourcent,
         volume_full,
         correction_piece,
         ..
@@ -1969,7 +1970,7 @@ fn assembler_les_etapes_lang(
             // contredire le verdict (#2053).
             OutputVolumeState::Applied => steps.push(json!({
                 "name": "Volume",
-                "description": fs(lang, "software_volume", &[&((ui_volume * 100.0).round() as i32).to_string()]),
+                "description": fs(lang, "software_volume", &[&curseur_pourcent.to_string()]),
                 "bit_perfect": true,
             })),
             OutputVolumeState::BypassedDop => steps.push(json!({
@@ -1982,7 +1983,7 @@ fn assembler_les_etapes_lang(
     } else if !volume_full {
         steps.push(json!({
             "name": "Volume",
-            "description": format!("Volume {}%", (ui_volume * 100.0).round() as i32),
+            "description": format!("Volume {}%", curseur_pourcent),
             "bit_perfect": true,
         }));
     }
@@ -3003,7 +3004,9 @@ struct Traitements {
     /// #5114 — le flux servi porte le crossfeed dans ses octets, tel que la
     /// session le publie (`StreamInfo::crossfeed`). `false` sans session.
     crossfeed_du_flux: bool,
-    ui_volume: f64,
+    /// #7762 — la POSITION du curseur (0..100) que le client affiche pour ce
+    /// gain, selon la loi de la zone (`volume_curve`). Jamais le gain lui-même.
+    curseur_pourcent: i32,
     volume_full: bool,
     /// #7632 — la correction de pièce de la zone (`ir_path_{zone}`), décrite.
     correction_piece: Option<CorrectionPiece>,
@@ -3078,8 +3081,18 @@ fn relever_les_traitements_lang(
     // face à un curseur ailleurs, jusqu'à ce qu'on touche le volume — le PUT
     // réécrit alors les deux sources (#1504 Jean Valjean, même symptôme
     // Bebelalu55 #1480). Une seule source pour les deux affichages.
+    //
+    // #7762 — `zone.volume / 100` est un GAIN, pas le curseur : depuis le
+    // curseur `db60` (#6787), une sortie locale ou navigateur à 50 % joue au
+    // gain 0,0316, et le panneau affichait « Volume logiciel 3 % » face à un
+    // curseur à 50. Le pourcentage affiché est la position que le client
+    // dérive de ce gain par la loi de la zone (`volume_curve`), arrondie
+    // comme lui ; le gain ne sert qu'à dire si le volume est plein.
     let ui_volume = (zone.volume / 100.0).clamp(0.0, 1.0);
     let volume_full = zone.fixed_volume || ui_volume >= 1.0 || ui_volume <= 0.0; // 0.0 means no software vol set
+    let curseur_pourcent =
+        (EchelleDeVolume::de_la_sortie(zone.output_type.as_deref()).position(ui_volume) * 100.0)
+            .round() as i32;
     Traitements {
         configured_dsp_enabled,
         dsp_enabled,
@@ -3090,7 +3103,7 @@ fn relever_les_traitements_lang(
         reaffectation_ignoree: None,
         compensation_reseau_db,
         crossfeed_du_flux,
-        ui_volume,
+        curseur_pourcent,
         volume_full,
         correction_piece: zone_correction_piece_lang(
             lang,

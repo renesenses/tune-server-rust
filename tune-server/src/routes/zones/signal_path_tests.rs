@@ -553,8 +553,10 @@ fn local_runtime_zone(
 /// toutes les autres plateformes. Elle vaut aussi ici.
 #[test]
 fn software_volume_alone_does_not_announce_a_transcode() {
+    // #7762 — `zone.volume` est le GAIN ; sur cette sortie locale le curseur
+    // suit la loi db60 : le curseur à 85 vaut `gain_perceptif(0.85)`.
     let (zone, ps, backend) = local_runtime_zone(
-        85.0,
+        tune_core::audio::volume_scale::gain_perceptif(0.85) * 100.0,
         OutputVolumeState::Applied,
         vec![OutputSignalReason::SoftwareVolume],
     );

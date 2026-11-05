@@ -1671,6 +1671,10 @@ pub mod relais_de_groupe_6155;
 #[cfg(test)]
 mod signal_path_tests;
 
+// #7762 — le chemin du signal affiche la position du curseur db60, pas le gain.
+#[cfg(test)]
+mod curseur_db60_7762_tests;
+
 // #5081 — l'ombre de la tête sur l'étape crossfeed du chemin du signal.
 #[cfg(test)]
 mod signal_path_ombre_5081_tests;
