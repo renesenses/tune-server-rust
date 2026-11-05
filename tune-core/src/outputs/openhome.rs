@@ -99,55 +99,26 @@ impl OpenHomeOutput {
         action: &str,
         args: &[(&str, &str)],
     ) -> Result<String, String> {
-        let mut body_args = String::new();
-        for (k, v) in args {
-            let escaped = quick_xml::escape::escape(*v);
-            body_args.push_str(&format!("<{k}>{escaped}</{k}>"));
-        }
+        appel_soap(&self.client, &self.name, url, service_type, action, args)
+            .await
+            .map(|(_, texte)| texte)
+    }
 
-        let envelope = format!(
-            r#"<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-  <s:Body>
-    <u:{action} xmlns:u="{service_type}">
-      {body_args}
-    </u:{action}>
-  </s:Body>
-</s:Envelope>"#
-        );
-
-        let soap_action = format!("{service_type}#{action}");
-        let mut last_err = String::new();
-
-        for attempt in 0..=SOAP_MAX_RETRIES {
-            if attempt > 0 {
-                let delay = 200 * (1 << (attempt - 1));
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                debug!(device = %self.name, action, attempt, "oh_soap_retry");
-            }
-
-            match self
-                .client
-                .post(url)
-                .header("Content-Type", r#"text/xml; charset="utf-8""#)
-                .header("SOAPAction", format!("\"{soap_action}\""))
-                .body(envelope.clone())
-                .send()
-                .await
-            {
-                Ok(resp) => match resp.text().await {
-                    Ok(text) => return Ok(text),
-                    Err(e) => last_err = format!("oh read: {e}"),
-                },
-                Err(e) if e.is_connect() || e.is_timeout() => {
-                    last_err = format!("oh send: {e}");
-                }
-                Err(e) => return Err(format!("oh send: {e}")),
-            }
-        }
-
-        warn!(device = %self.name, action, error = %last_err, "oh_soap_all_retries_failed");
-        Err(last_err)
+    /// #7633 — de quoi envoyer `SetVolume` au renderer SANS passer par le
+    /// verrou de la sortie. `None` sans service Volume.
+    ///
+    /// Le sondeur tient ce verrou pendant tout `get_status` : jusqu'à cinq
+    /// appels SOAP à la suite quand les évènements du renderer n'arrivent
+    /// pas (pare-feu Windows, #4677). Un changement de volume qui attendait
+    /// derrière lui partait avec 1 à 2 s de retard, et le Linn jouait encore
+    /// l'ancienne valeur (« 50 reste trop fort après 70 »).
+    pub fn envoi_de_volume(&self) -> Option<EnvoiDeVolume> {
+        Some(EnvoiDeVolume {
+            name: self.name.clone(),
+            url: self.svc_url("volume")?.clone(),
+            client: self.client.clone(),
+            event_state: self.event_state.clone(),
+        })
     }
 
     async fn oh_play(&self) -> Result<(), String> {
@@ -586,27 +557,25 @@ impl OutputTarget for OpenHomeOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        let level = (volume * 100.0).round().clamp(0.0, 100.0) as u32;
-        if let Some(url) = self.svc_url("volume") {
-            self.soap_call(
-                url,
-                SVC_VOLUME,
-                "SetVolume",
-                &[("Value", &level.to_string())],
-            )
-            .await?;
-            self.event_state.lock().await.volume = Some(level);
-        } else {
-            return Err("volume not supported by this OpenHome renderer".into());
-        }
-        Ok(())
+        self.envoi_de_volume()
+            .ok_or_else(|| "volume not supported by this OpenHome renderer".to_string())?
+            .set_volume(volume)
+            .await
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
         let val = if muted { "1" } else { "0" };
         if let Some(url) = self.svc_url("volume") {
-            self.soap_call(url, SVC_VOLUME, "SetMute", &[("Value", val)])
-                .await?;
+            // #7633 — une faute SOAP n'est pas une réussite.
+            commande_soap(
+                &self.client,
+                &self.name,
+                url,
+                SVC_VOLUME,
+                "SetMute",
+                &[("Value", val)],
+            )
+            .await?;
             self.event_state.lock().await.muted = Some(muted);
         } else {
             return Err("mute not supported by this OpenHome renderer".into());
@@ -750,6 +719,138 @@ impl OutputTarget for OpenHomeOutput {
         }
         Ok(())
     }
+}
+
+/// #7633 — l'envoi du volume d'un renderer OpenHome, détaché de
+/// l'[`OpenHomeOutput`] : l'orchestrateur le garde à part (registre des
+/// sorties) et l'appelle sans prendre le verrou de la sortie, que le sondeur
+/// tient pendant ses relevés. La file de `volume_coalescent` garantit
+/// toujours une seule commande en vol et la dernière valeur gagnante.
+#[derive(Clone)]
+pub struct EnvoiDeVolume {
+    name: String,
+    url: String,
+    client: Client,
+    event_state: Arc<tokio::sync::Mutex<EventState>>,
+}
+
+impl EnvoiDeVolume {
+    /// `SetVolume round(volume × 100)`. La valeur n'est retenue en mémoire
+    /// que si le renderer l'a acceptée : une faute SOAP (statut HTTP d'erreur
+    /// ou `<s:Fault>`) est une erreur, et l'orchestrateur rétablit alors la
+    /// dernière valeur acceptée.
+    pub async fn set_volume(&self, volume: f64) -> Result<(), String> {
+        let level = (volume * 100.0).round().clamp(0.0, 100.0) as u32;
+        commande_soap(
+            &self.client,
+            &self.name,
+            &self.url,
+            SVC_VOLUME,
+            "SetVolume",
+            &[("Value", &level.to_string())],
+        )
+        .await?;
+        self.event_state.lock().await.volume = Some(level);
+        Ok(())
+    }
+}
+
+/// Un appel SOAP, avec ses reprises sur échec de connexion ou délai dépassé.
+/// Rend le statut HTTP et le corps de la réponse, quels qu'ils soient.
+async fn appel_soap(
+    client: &Client,
+    device: &str,
+    url: &str,
+    service_type: &str,
+    action: &str,
+    args: &[(&str, &str)],
+) -> Result<(reqwest::StatusCode, String), String> {
+    let mut body_args = String::new();
+    for (k, v) in args {
+        let escaped = quick_xml::escape::escape(*v);
+        body_args.push_str(&format!("<{k}>{escaped}</{k}>"));
+    }
+
+    let envelope = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:{action} xmlns:u="{service_type}">
+      {body_args}
+    </u:{action}>
+  </s:Body>
+</s:Envelope>"#
+    );
+
+    let soap_action = format!("{service_type}#{action}");
+    let mut last_err = String::new();
+
+    for attempt in 0..=SOAP_MAX_RETRIES {
+        if attempt > 0 {
+            let delay = 200 * (1 << (attempt - 1));
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            debug!(device, action, attempt, "oh_soap_retry");
+        }
+
+        match client
+            .post(url)
+            .header("Content-Type", r#"text/xml; charset="utf-8""#)
+            .header("SOAPAction", format!("\"{soap_action}\""))
+            .body(envelope.clone())
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.text().await {
+                    Ok(text) => return Ok((status, text)),
+                    Err(e) => last_err = format!("oh read: {e}"),
+                }
+            }
+            Err(e) if e.is_connect() || e.is_timeout() => {
+                last_err = format!("oh send: {e}");
+            }
+            Err(e) => return Err(format!("oh send: {e}")),
+        }
+    }
+
+    warn!(device, action, error = %last_err, "oh_soap_all_retries_failed");
+    Err(last_err)
+}
+
+/// #7633 — un appel SOAP qui COMMANDE (volume, sourdine) : un statut HTTP
+/// d'erreur ou une `Fault` dans la réponse est un refus du renderer, pas une
+/// réussite. Avant, `soap_call` rendait `Ok` sur un 500, et la valeur refusée
+/// passait pour appliquée.
+async fn commande_soap(
+    client: &Client,
+    device: &str,
+    url: &str,
+    service_type: &str,
+    action: &str,
+    args: &[(&str, &str)],
+) -> Result<String, String> {
+    let (status, texte) = appel_soap(client, device, url, service_type, action, args).await?;
+    if let Some(refus) = refus_soap(status, &texte) {
+        warn!(device, action, %status, error = %refus, "oh_soap_refus");
+        return Err(refus);
+    }
+    Ok(texte)
+}
+
+/// Le refus porté par une réponse SOAP, s'il y en a un.
+fn refus_soap(status: reqwest::StatusCode, texte: &str) -> Option<String> {
+    if !status.is_success() || texte.contains("Fault>") {
+        let detail = extract_tag(texte, "errorDescription")
+            .or_else(|| extract_tag(texte, "faultstring"))
+            .unwrap_or_default();
+        return Some(
+            format!("oh soap fault: HTTP {} {detail}", status.as_u16())
+                .trim_end()
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Extrait le texte d'une balise d'une réponse SOAP.

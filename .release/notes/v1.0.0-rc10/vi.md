@@ -1,0 +1,33 @@
+Tune 1.0.0-rc10, bản ứng viên phát hành thứ mười của Tune 1.0.
+
+- **Bộ sưu tập vật lý của tôi**: một tiện ích mới so sánh bộ sưu tập Discogs của bạn với thư viện và các dịch vụ phát trực tuyến, trong một lưới bìa đĩa được lưu đệm trên máy chủ. Một mục riêng xuất hiện trên thanh bên, ngay sau Tune Circle.
+- **Giao diện của tôi**: chọn mọi màu sắc của giao diện, theo từng hồ sơ. Một tiện ích cũng có thể cung cấp giao diện, và bạn có thể gửi giao diện của mình cho một liên hệ Tune Circle để họ áp dụng chỉ bằng một cú nhấp.
+- **Crosstalk**: tiện ích giảm hiện tượng xuyên âm giữa các loa được thêm vào danh mục tiện ích mở rộng, kèm màn hình cài đặt; trên cùng một vùng, nó tắt crossfeed và thông báo điều đó.
+- **Thư mục**: phát hoặc thêm vào hàng đợi một thư mục cùng toàn bộ thư mục con, theo thứ tự; bộ lọc Thư mục trong Thư viện đi xuống các thư mục con và cho phép quay lại toàn bộ thư viện.
+- **Radio**: thanh «Thêm bộ lọc» trong Radio của tôi và Danh bạ cho phép tìm theo tiêu chí; danh bạ có thêm bốn thể loại mới.
+- **Radio khi phát**: các luồng của một đài được sắp xếp theo chất lượng; màn hình Đang phát hiển thị logo của đài và nút «Radio của tôi»; quốc gia nghe được đặt trong Cài đặt › Chung.
+- **Hãng đĩa**: logo các hãng đĩa được hiển thị, do mozaiklabs.fr chia sẻ; trang trạng thái máy chủ theo dõi tiến độ lấy bìa album và logo hãng đĩa.
+- **Âm lượng**: thanh trượt chia vạch theo dB, giới hạn thoải mái và giới hạn an toàn được tô màu, và giới hạn thoải mái cao hơn giới hạn an toàn sẽ bị từ chối.
+- **Oxygen và siêu dữ liệu**: sửa một trường trên toàn bộ kết quả đã lọc; loại trừ thư mục khỏi việc tự động bổ sung siêu dữ liệu.
+- **Tune Circle**: phóng to một vùng trên quả địa cầu trong chế độ Thế giới; danh sách phát Tune Circle có nhãn riêng trong bộ lọc Danh sách phát; danh sách phát của một dịch vụ có thể được chia sẻ từ trang chi tiết của nó.
+- **Tiện ích màn hình**: cửa sổ mini dùng chế độ xem mini của giao diện web và có thêm tìm kiếm nghệ sĩ, Qobuz và TIDAL, với ảnh thu nhỏ và điều hướng bằng bàn phím.
+- **Đầu ra AES67**: một đầu ra thử nghiệm tới các mạng âm thanh Dante và Ravenna tương thích AES67, mặc định tắt, nằm trong Cài đặt › Thử nghiệm.
+- **Trình duyệt này**: bài tiếp theo được chuẩn bị trước khi bài hiện tại kết thúc để chuyển tiếp mượt hơn, và vùng «Trình duyệt này» của máy chủ phát được mà không cần thiết lập trước.
+- **Tiếp tục nghe**: thẻ nêu tên album, danh sách phát hoặc tập được tiếp tục, và lượt nghe đã xong sẽ rời khỏi danh sách.
+- **Lịch sử và bài nổi bật**: các bài của một album hoặc danh sách phát đang mở được xếp từ mới nhất đến cũ nhất; bài nổi bật của một nghệ sĩ được bổ sung những bài bạn nghe nhiều nhất, từ mọi nguồn.
+- **Thư viện**: bộ lọc theo DR và theo năm phát hành gốc nhanh hơn nhiều với thư viện lớn; các cột của danh sách bài có thể đổi độ rộng và mỗi màn hình ghi nhớ độ rộng đó; phân tích âm học giải thích nhịp xử lý và hiển thị tiến độ.
+- **Bộ cân bằng**: nhập tự do tần số và hệ số Q, được xác nhận khi nhập xong; xóa các thiết lập sẵn đã nhập cần xác nhận; hiệu chỉnh phòng nghe và hiệu chuẩn DAC áp dụng toàn bộ hồ sơ cân bằng.
+- **Danh sách phát**: nhập .m3u, .m3u8 và .dpl nằm trong Trình quản lý danh sách phát và báo đúng số bài; Nhập, Chuyển và So sánh cho biết lý do khi thất bại.
+- **Bìa đĩa**: bìa nhúng được đọc từ mọi thẻ, ưu tiên mặt trước; tìm kiếm trực tuyến tiếp nối sau khi đọc lại tệp; ảnh chữ nhật của danh sách phát Qobuz được hiển thị trọn vẹn.
+- **Thông báo**: những thông báo lỗi cuối cùng còn bằng tiếng Pháp đã được dịch sang ngôn ngữ giao diện; loa AirPlay 2 từ chối kết nối sẽ báo thiếu ghép nối; mã ứng dụng bị Qobuz từ chối không còn bị hiển thị như mật khẩu sai.
+- **Giấy phép**: màn hình cho biết Premium đến từ tài khoản Mozaiklabs của bạn, không yêu cầu khóa.
+- **Trang chủ**: «Phiên bản khác» không còn bị treo khi chờ các dịch vụ phát trực tuyến.
+- **ASIO**: khi không thể kiểm tra khả năng hỗ trợ DSD, Tune sẽ thông báo và giải thích khả năng của đầu ra.
+- **Sửa lỗi phát nhạc**: chuyển giữa PURE và bộ cân bằng không còn khởi động lại một vùng đã dừng; bỏ chọn «Lặp lại theo mặc định» thực sự tắt lặp lại cho vùng; chuyển tiếp giữa các bài tương thích vẫn liền mạch.
+- **Sửa lỗi OpenHome**: tạm dừng và dừng sẽ gỡ bài tiếp theo đã chuẩn bị khỏi đầu phát, và vị trí kết thúc được giữ trong lúc chuyển sang bài tiếp theo.
+- **Sửa lỗi radio**: khi không rõ quốc gia nghe, luồng đã chọn không còn bị thay bằng luồng 96 kbit/s; đài thêm từ bảng điều khiển giữ liên kết với trang chi tiết của nó; một lỗi đơn lẻ không còn làm tạm ngưng siêu dữ liệu radio; «Nghe gần đây» hiển thị đúng ngày; danh sách phát Qobuz tạo từ đài yêu thích xuất hiện ngay.
+- **Sửa lỗi thư viện và hồ sơ**: bộ lọc yêu thích và đánh giá theo hồ sơ đang dùng; «Nghe nhiều nhất» không còn đếm một lượt nghe nhiều lần; việc bổ sung không còn thay thế thể loại sẵn có; bài UPnP giữ năm và thể loại; mã MusicBrainz đã được dùng không còn bị gán lần thứ hai.
+- **Sửa lỗi bộ sưu tập và danh sách phát**: việc lưu bị từ chối được thông báo, một thư mục lỗi không còn làm trống danh sách, và mọi trang danh sách phát đều được đọc.
+- **Sửa lỗi tiện ích và tài khoản**: gỡ cài đặt một tiện ích gốc đang bật sẽ vô hiệu hóa nó lâu dài; liên kết đầu tiên với tài khoản Mozaiklabs được gắn vào hồ sơ duy nhất kể cả khi không có địa chỉ email.
+- **Sửa lỗi khác**: nhập danh sách phát khi quét cho biết vì sao không nhập; lỗi đọc cài đặt được báo thay vì quay về giá trị mặc định; chế độ ngủ của máy tính không còn bị báo là treo; giao diện cũ không còn tồn tại sau khi cập nhật máy chủ; thanh đồng hồ VU không còn tràn màn hình trong khoảng 1280–1800 px; chế độ WASAPI vẫn hiển thị với cài đặt mặc định của Windows; âm thanh không còn bị nén khi gửi.
+- **Bảo mật**: các bản sửa lỗi gia cố.

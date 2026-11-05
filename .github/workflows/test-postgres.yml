@@ -183,6 +183,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5997 -- --nocapture --test-threads=1
 
+      # #7852 — écoute validée au seuil min(30 s, 50 %) : zapping, 31 s sur
+      # 4 min, 21 s sur 40 s, transfert de zone, sur un vrai PostgreSQL. Sans
+      # cette étape, les témoins prendraient leur saut annoncé.
+      - name: Écoute validée au seuil sur PostgreSQL (#7852)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres _7852 -- --nocapture --test-threads=1
+
       # #5998 — vue Répertoires : les deux requêtes partent de l'index du
       # chemin et rendent les mêmes lignes. Sans cette étape, l'épreuve
       # prendrait son saut annoncé.
@@ -258,6 +266,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_6463 -- --nocapture --test-threads=1
+
+      # #7849 : notes personnelles et répartitions de la bibliothèque sur une
+      # vraie base : script 103 (reprise des notes d'album, rejouable),
+      # séparation par profil, recherche, répartitions. Le témoin retire la
+      # table et vide les tables qu'il lit : il tourne seul, dans son étape.
+      - name: Notes personnelles et répartitions sur PostgreSQL (#7849)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7849 -- --nocapture --test-threads=1
 
       # #7535 : un MBID trouvé par le nom n'est plus posé s'il est déjà porté
       # par une autre fiche (garde NOT EXISTS de poser_mbid, $4/$5).
@@ -787,6 +804,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_4984 -- --nocapture --test-threads=1
 
+      # #7765 — la SOURCE des crédits de piste (migration PG 102). Attribution
+      # unique des lignes existantes, purge limitée à la source réécrite et
+      # filtre « à faire » qui ignore les balises, joués sur la VRAIE base.
+      # Sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Source des crédits de piste sur PostgreSQL (#7765)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_source_7765 -- --nocapture --test-threads=1
+
       # #5007 — la purge des artistes orphelins. PostgreSQL refusait le DELETE
       # entier par `albums_artist_id_fkey` dès qu'un artiste d'album n'avait
       # aucune piste à lui : plus aucun orphelin purgé. Sans cette étape, le
@@ -848,6 +874,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_requete_textuelle_6287 -- --nocapture --test-threads=1
+
+      # #7848 — la grammaire de requêtes compilée en SQL paramétré : le même
+      # jeu de pistes et de crédits rend les mêmes pistes que sur SQLite (rôles
+      # en EXISTS, plages, négation, valeurs piégées). Sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Grammaire de requêtes sur PostgreSQL (#7848)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7848 -- --nocapture --test-threads=1
 
       # #6122 — « dans les N derniers jours » : des littéraux calculés à chaque
       # requête (secondes pour `file_mtime`, ISO pour `listened_at`) au lieu de

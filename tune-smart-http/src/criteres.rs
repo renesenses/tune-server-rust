@@ -299,6 +299,10 @@ pub(crate) mod tests {
     /// | 2 `So What` | 1 | 1 | 1 écoute, 2019-03 |
     /// | 3 `Giant Steps` | 2 Giant Steps (1, Atlantic, non) | 2 Coltrane | album étiqueté 8 ; fichier 2019-01 |
     /// | 4 `Solo` | 3 Seul (1, —, non) | 3 Autre | artiste étiqueté 9 ; genre Rock |
+    ///
+    /// Les écoutes sont écrites comme en production : titre et interprète,
+    /// `track_id` vide (#7769). Le remplir cachait que les règles d'écoutes
+    /// ne retenaient rien.
     pub(crate) fn bibliotheque() -> SqliteDb {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
@@ -320,11 +324,11 @@ pub(crate) mod tests {
              INSERT INTO album_ratings (album_id, profile_id, rating) VALUES \
                (1,1,5),(2,1,2),(2,2,5); \
              INSERT INTO track_credits (track_id, artist_name, role) VALUES (1,'Teo Macero','producer'); \
-             INSERT INTO listen_history (track_id, title, listened_at) VALUES \
-               (1,'Blue in Green','2024-06-01T10:00:00Z'), \
-               (1,'Blue in Green','2024-06-02T10:00:00Z'), \
-               (1,'Blue in Green','2024-06-03T10:00:00Z'), \
-               (2,'So What','2019-03-01T10:00:00Z');",
+             INSERT INTO listen_history (title, artist_name, listened_at) VALUES \
+               ('Blue in Green','Miles Davis','2024-06-01T10:00:00Z'), \
+               ('Blue in Green','Miles Davis','2024-06-02T10:00:00Z'), \
+               ('Blue in Green','Miles Davis','2024-06-03T10:00:00Z'), \
+               ('So What','Miles Davis','2019-03-01T10:00:00Z');",
         )
         .unwrap();
         db
@@ -1184,8 +1188,8 @@ pub(crate) mod tests {
             "INSERT INTO albums (id, title, artist_id, track_count) VALUES (4,'Récent',3,1); \
              INSERT INTO tracks (id, album_id, artist_id, title, file_path, file_mtime) VALUES \
                (5,4,3,'Neuf','/m/neuf/5.flac',{mtime}); \
-             INSERT INTO listen_history (track_id, title, listened_at) VALUES \
-               (3,'Giant Steps','{deux}'), (4,'Solo','{quarante}');",
+             INSERT INTO listen_history (title, artist_name, listened_at) VALUES \
+               ('Giant Steps','John Coltrane','{deux}'), ('Solo','Autre','{quarante}');",
             mtime = il_y_a(5).timestamp(),
             deux = iso(2),
             quarante = iso(40),
@@ -1272,7 +1276,10 @@ pub(crate) mod tests {
 ///
 /// Seule retouche voulue depuis : la clause « Favori · est · Piste » (#5997,
 /// forum #2127) départage désormais les éditions par l'album et l'ISRC — la
-/// ligne gelée correspondante a été mise à jour avec elle.
+/// ligne gelée correspondante a été mise à jour avec elle. De même les deux
+/// lignes « nombre d'écoutes » (#7769) : elles comptaient par
+/// `listen_history.track_id` seul, toujours NULL, et comptent désormais comme
+/// la Bibliothèque, `track_id` ne servant plus qu'en plus quand il est rempli.
 #[cfg(test)]
 mod anciennes_regles {
     use crate::smart_playlists::build_smart_query_rapport;
@@ -1301,3 +1308,7 @@ mod anciennes_regles {
 #[cfg(test)]
 #[path = "criteres_hires_6285_tests.rs"]
 mod hires_6285;
+
+#[cfg(test)]
+#[path = "criteres_ecoutes_7769_tests.rs"]
+mod ecoutes_7769;

@@ -89,21 +89,41 @@ pub(super) fn select_stream(
     } else {
         fiche.flux.clone()
     };
+    let choisi = |f: &FluxAnnuaire| {
+        preferred.is_some_and(|p| super::flux_normalise(p) == super::flux_normalise(&f.url))
+    };
+    // #7199 : sans flux libre, l'adresse enregistrée n'est pas un choix de
+    // l'auditeur mais le repli posé à l'ajout (« c'est sa lecture qui sera
+    // refusée ») ; pays inconnu, on refuse et on demande le pays. Avec un
+    // flux libre, l'ajout aurait enregistré celui-ci : une adresse restreinte
+    // ne peut venir que d'un choix explicite (#7177), que #7658 respecte.
+    let flux_libre = streams.iter().any(|f| f.restricted_to_countries.is_empty());
     streams
         .into_iter()
         .rev()
         .filter(|f| {
             f.restricted_to_countries.is_empty()
-                || country.as_deref().is_some_and(|c| {
-                    f.restricted_to_countries
+                || match country.as_deref() {
+                    Some(c) => f
+                        .restricted_to_countries
                         .iter()
-                        .any(|allowed| allowed.eq_ignore_ascii_case(c))
-                })
+                        .any(|allowed| allowed.eq_ignore_ascii_case(c)),
+                    // #7658/#7660 : pays d'écoute non renseigné. Le flux que
+                    // l'auditeur a choisi lui-même reste le sien : on ne le
+                    // remplace pas en silence par le seul flux sans
+                    // restriction (BBC : « nonuk » HE-AAC 96 kbit/s au lieu
+                    // du 320 kbit/s choisi). S'il est vraiment bloqué chez
+                    // lui, la lecture échoue et il en choisit un autre.
+                    None => {
+                        flux_libre
+                            && choisi(f)
+                            && !f.restricted_to_countries.iter().any(|c| c == "invalid")
+                    }
+                }
         })
         .max_by_key(|f| {
             (
-                preferred
-                    .is_some_and(|p| super::flux_normalise(p) == super::flux_normalise(&f.url)),
+                choisi(f),
                 f.primary,
                 f.codec.as_deref().is_some_and(|c| {
                     c.eq_ignore_ascii_case("flac") || c.eq_ignore_ascii_case("alac")
@@ -158,7 +178,8 @@ pub(super) fn stream_for_saved(
     let fiches = state.annuaire_radios.read().ok();
     let fiche = fiches.as_ref().and_then(|fiches| {
         fiches.iter().find(|f| match link {
-            Some(id) => f.external_id.as_ref() == Some(id),
+            // #7500 — ou l'ancienne clé `mozaiklabs:ID` d'une fiche numérotée depuis.
+            Some(id) => f.porte_la_cle(id),
             None => super::super::radios_annuaire::flux_de_la_fiche(f, &radio.url),
         })
     });

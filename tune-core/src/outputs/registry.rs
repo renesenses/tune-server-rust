@@ -13,6 +13,10 @@ pub struct OutputRegistry {
     /// `name`/`output_type`/`host` are sync trait methods, so they're captured
     /// cheaply at `register` time.
     meta: HashMap<String, (String, String, Option<String>)>,
+    /// #7633 — device_id → envoi du volume d'un renderer OpenHome, pris à
+    /// `register`. L'orchestrateur l'appelle sans le verrou de la sortie,
+    /// que le sondeur tient pendant ses relevés SOAP.
+    envois_de_volume: HashMap<String, super::openhome::EnvoiDeVolume>,
 }
 
 impl Default for OutputRegistry {
@@ -26,6 +30,7 @@ impl OutputRegistry {
         Self {
             outputs: HashMap::new(),
             meta: HashMap::new(),
+            envois_de_volume: HashMap::new(),
         }
     }
 
@@ -39,7 +44,21 @@ impl OutputRegistry {
                 output.host().map(|h| h.to_string()),
             ),
         );
+        match output
+            .as_any()
+            .downcast_ref::<super::openhome::OpenHomeOutput>()
+            .and_then(super::openhome::OpenHomeOutput::envoi_de_volume)
+        {
+            Some(envoi) => self.envois_de_volume.insert(id.clone(), envoi),
+            None => self.envois_de_volume.remove(&id),
+        };
         self.outputs.insert(id, Arc::new(Mutex::new(output)));
+    }
+
+    /// #7633 — l'envoi du volume de cette sortie qui ne demande pas son
+    /// verrou, quand elle en a un (renderer OpenHome avec service Volume).
+    pub fn envoi_de_volume(&self, device_id: &str) -> Option<super::openhome::EnvoiDeVolume> {
+        self.envois_de_volume.get(device_id).cloned()
     }
 
     /// device_ids of registered outputs that share `name` (case-insensitive) but
@@ -120,6 +139,7 @@ impl OutputRegistry {
     pub fn remove(&mut self, device_id: &str) {
         self.outputs.remove(device_id);
         self.meta.remove(device_id);
+        self.envois_de_volume.remove(device_id);
     }
 
     pub fn list(&self) -> Vec<String> {

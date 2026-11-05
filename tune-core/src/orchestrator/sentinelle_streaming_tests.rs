@@ -8,6 +8,7 @@
 //! elle-même, sur le .18.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -20,8 +21,13 @@ use crate::streaming::{
 
 /// Un WAV PCM 16 bits stéréo de `secondes`, sinusoïde à 440 Hz.
 fn wav(secondes: u32) -> Vec<u8> {
+    wav_de(44_100 * secondes, 8000.0)
+}
+
+/// Un WAV PCM 16 bits stéréo à 44,1 kHz de `trames` trames, sinusoïde à
+/// 440 Hz d'amplitude `amplitude` (0 : silence numérique).
+fn wav_de(trames: u32, amplitude: f32) -> Vec<u8> {
     let cadence = 44_100u32;
-    let trames = cadence * secondes;
     let donnees = trames * 4;
     let mut v = Vec::with_capacity(44 + donnees as usize);
     v.extend_from_slice(b"RIFF");
@@ -37,7 +43,8 @@ fn wav(secondes: u32) -> Vec<u8> {
     v.extend_from_slice(b"data");
     v.extend_from_slice(&donnees.to_le_bytes());
     for i in 0..trames {
-        let s = ((i as f32 * 440.0 * std::f32::consts::TAU / cadence as f32).sin() * 8000.0) as i16;
+        let s =
+            ((i as f32 * 440.0 * std::f32::consts::TAU / cadence as f32).sin() * amplitude) as i16;
         v.extend_from_slice(&s.to_le_bytes());
         v.extend_from_slice(&s.to_le_bytes());
     }
@@ -46,19 +53,23 @@ fn wav(secondes: u32) -> Vec<u8> {
 
 /// Un serveur HTTP d'essai : `/sain.wav` sert un WAV, SAUF si la requête
 /// contient `amp;` (403, comme le CDN de TIDAL le 26/10) ; `/illisible.flac`
-/// sert des octets qui ne sont pas un FLAC ; `/page.flac` une page HTML.
+/// sert des octets qui ne sont pas un FLAC ; `/page.flac` une page HTML ;
+/// `/tete-html.flac` une page HTML annoncée `audio/flac` (Qobuz, #7805) ;
+/// `/instable.wav` des octets illisibles à la PREMIÈRE requête, puis le WAV.
 async fn serveur() -> String {
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("port d'essai");
     let adresse = ecoute.local_addr().expect("adresse");
     let son = Arc::new(wav(4));
+    let instables = Arc::new(AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
             let Ok((mut flux, _)) = ecoute.accept().await else {
                 return;
             };
             let son = son.clone();
+            let instables = instables.clone();
             tokio::spawn(async move {
                 let mut tampon = vec![0u8; 8192];
                 let mut lu = 0;
@@ -82,6 +93,16 @@ async fn serveur() -> String {
                     ("200 OK", "audio/wav", (*son).clone())
                 } else if cible.starts_with("/illisible.flac") {
                     ("200 OK", "audio/flac", vec![0x5Au8; 64 * 1024])
+                } else if cible.starts_with("/instable.wav") {
+                    if instables.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ("200 OK", "audio/wav", vec![0x5Au8; 64 * 1024])
+                    } else {
+                        ("200 OK", "audio/wav", (*son).clone())
+                    }
+                } else if cible.starts_with("/tete-html.flac") {
+                    let mut page = b"<!DOCTYPE html><html><body>".to_vec();
+                    page.resize(4096, b' ');
+                    ("200 OK", "audio/flac", page)
                 } else if cible.starts_with("/page.flac") {
                     (
                         "200 OK",
@@ -190,6 +211,141 @@ async fn un_dash_assemble_sur_disque_se_decode_et_un_fichier_vide_rougit() {
         .await
         .expect_err("un DASH vide doit rougir");
     assert_eq!(echec.cause, Cause::Resolution);
+}
+
+/// Le fichier MP4 fragmenté d'essai : un `ftyp` + `moov` de 725 octets, puis
+/// six segments `moof` + `mdat` (3 s d'AAC stéréo à 44,1 kHz) et un `mfra`.
+fn mp4_fragmente() -> Vec<u8> {
+    std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/aac320_frag.mp4"
+    ))
+    .expect("tests/fixtures/aac320_frag.mp4")
+}
+/// La fin de l'en-tête, puis la fin de chaque segment (le dernier avec le `mfra`).
+const FIN_DE_L_EN_TETE: usize = 725;
+const FINS_DES_SEGMENTS: [usize; 6] = [36_521, 77_835, 122_248, 160_292, 198_340, 238_382];
+
+#[tokio::test]
+async fn un_mp4_reduit_a_son_en_tete_rougit_en_decodage() {
+    let entete = crate::test_scratch::scratch_file("tune-sentinelle-entete-7805", ".mp4");
+    std::fs::write(entete.path(), &mp4_fragmente()[..FIN_DE_L_EN_TETE]).expect("écriture");
+    let echec = sonder_un_flux(&flux(format!("file://{}", entete.as_str()), "AAC"))
+        .await
+        .expect_err("#7805 : un en-tête MP4 seul n'est pas un flux qui se lit");
+    assert_eq!(echec.cause, Cause::Decodage, "{echec:?}");
+}
+
+#[tokio::test]
+async fn un_dash_qui_grandit_pendant_la_sonde_compte_sa_taille_finale() {
+    // #7805 : avec TUNE_DASH_STREAM_DECODE, TIDAL rend le chemin dès l'en-tête
+    // écrit, enregistre une poignée de croissance, et ajoute les segments
+    // pendant que le décodeur les attend. Ici, le premier segment arrive seul
+    // (1,02 s, moins que les 3 s décodées), puis tout le reste d'un bloc : le
+    // décodeur attend donc forcément la fin de l'écriture.
+    let complet = mp4_fragmente();
+    assert_eq!(complet.len(), FINS_DES_SEGMENTS[5]);
+    let dash = crate::test_scratch::scratch_file("tune-dash-7805", ".mp4");
+    std::fs::write(dash.path(), &complet[..FIN_DE_L_EN_TETE]).expect("écriture");
+    let chemin = dash.as_str().into_owned();
+    let croissance = crate::audio::dash_growth::DashGrowth::new(FIN_DE_L_EN_TETE as u64);
+    crate::audio::dash_growth::register(&chemin, croissance.clone());
+    let redacteur = {
+        let chemin = chemin.clone();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&chemin)
+                .expect("ouverture en ajout");
+            let mut debut = FIN_DE_L_EN_TETE;
+            for fin in [FINS_DES_SEGMENTS[0], FINS_DES_SEGMENTS[5]] {
+                std::thread::sleep(Duration::from_millis(40));
+                f.write_all(&complet[debut..fin])
+                    .expect("ajout d'un segment");
+                f.flush().expect("flush");
+                croissance.advance(fin as u64);
+                debut = fin;
+            }
+            croissance.finish();
+        })
+    };
+    let d = sonder_un_flux(&flux(format!("file://{chemin}"), "AAC"))
+        .await
+        .expect("un DASH avec ses segments se décode");
+    redacteur.join().expect("rédacteur");
+    assert_eq!(d.sample_rate, 44_100);
+    assert_eq!(
+        d.octets_lus, FINS_DES_SEGMENTS[5] as u64,
+        "#7805 : octets_lus doit être la taille après décodage, pas celle de l'en-tête ({FIN_DE_L_EN_TETE})"
+    );
+}
+
+#[tokio::test]
+async fn un_dash_avec_un_segment_verdit() {
+    // Deux segments : un seul (45 056 trames, 1,02 s) frôle le seuil d'une seconde.
+    let deux = crate::test_scratch::scratch_file("tune-sentinelle-deux-segments-7805", ".mp4");
+    std::fs::write(deux.path(), &mp4_fragmente()[..FINS_DES_SEGMENTS[1]]).expect("écriture");
+    let d = sonder_un_flux(&flux(format!("file://{}", deux.as_str()), "AAC"))
+        .await
+        .expect("un DASH avec ses premiers segments se décode");
+    assert!(d.echantillons / 2 >= 44_100, "{d:?}");
+    assert_eq!(d.octets_lus, FINS_DES_SEGMENTS[1] as u64);
+}
+
+#[tokio::test]
+async fn moins_d_une_seconde_ou_du_silence_rougit_en_decodage() {
+    let court = crate::test_scratch::scratch_file("tune-sentinelle-court-7805", ".wav");
+    std::fs::write(court.path(), wav_de(22_050, 8000.0)).expect("écriture");
+    let echec = sonder_un_flux(&flux(format!("file://{}", court.as_str()), "WAV"))
+        .await
+        .expect_err("#7805 : une demi-seconde décodée ne suffit pas à dire « ok »");
+    assert_eq!(echec.cause, Cause::Decodage, "{echec:?}");
+
+    let muet = crate::test_scratch::scratch_file("tune-sentinelle-muet-7805", ".wav");
+    std::fs::write(muet.path(), wav_de(2 * 44_100, 0.0)).expect("écriture");
+    let echec = sonder_un_flux(&flux(format!("file://{}", muet.as_str()), "WAV"))
+        .await
+        .expect_err("#7805 : du silence numérique ne suffit pas à dire « ok »");
+    assert_eq!(echec.cause, Cause::Decodage, "{echec:?}");
+}
+
+#[tokio::test]
+async fn un_echec_de_decodage_dit_les_premiers_octets_et_les_en_tetes() {
+    let base = serveur().await;
+    let echec = sonder_un_flux(&flux(
+        format!("{base}/tete-html.flac?sig=SECRET123"),
+        "FLAC",
+    ))
+    .await
+    .expect_err("une page HTML annoncée audio/flac ne se décode pas");
+    assert_eq!(echec.cause, Cause::Decodage, "{echec:?}");
+    for attendu in [
+        "3c 21 44 4f 43 54 59 50 45 20 68 74 6d 6c 3e 3c",
+        "Content-Type : audio/flac",
+        "Content-Length : 4096",
+        "octets lus : 4096",
+    ] {
+        assert!(
+            echec.detail.contains(attendu),
+            "#7805 : le détail doit contenir « {attendu} » : {}",
+            echec.detail
+        );
+    }
+    assert!(
+        !echec.detail.contains("SECRET123") && !echec.detail.contains("127.0.0.1"),
+        "l'adresse signée ne part jamais dans le détail : {}",
+        echec.detail
+    );
+}
+
+#[tokio::test]
+async fn un_echec_a_la_sonde_du_format_est_reessaye_une_fois() {
+    let base = serveur().await;
+    let d = sonder_un_flux(&flux(format!("{base}/instable.wav"), "WAV"))
+        .await
+        .expect("#7805 : un premier GET illisible puis un sain doit verdir au second essai");
+    assert_eq!(d.sample_rate, 44_100);
 }
 
 /// Un service factice qui rend l'URL qu'on lui donne, ou une erreur.
@@ -361,21 +517,31 @@ fn le_statut_global_ne_verdit_ni_sans_sonde_ni_sur_un_non_couvert() {
     );
 }
 
-#[test]
-fn les_transitions_disent_le_premier_echec_et_le_retour() {
-    let avant = RapportSentinelle {
+fn tour(tidal: Etat) -> RapportSentinelle {
+    RapportSentinelle {
         horodatage: 1,
         statut: "ok".into(),
         raison: None,
-        resultats: vec![ligne("qobuz", Etat::Ok), ligne("tidal", Etat::Ok)],
+        resultats: vec![ligne("qobuz", Etat::Ok), ligne("tidal", tidal)],
         transitions: Vec::new(),
-    };
-    let t = transitions(
-        Some(&avant),
-        &[ligne("qobuz", Etat::Ok), ligne("tidal", Etat::Echec)],
+    }
+}
+
+fn courant(tidal: Etat) -> Vec<ResultatSonde> {
+    vec![ligne("qobuz", Etat::Ok), ligne("tidal", tidal)]
+}
+
+#[test]
+fn les_transitions_disent_le_second_echec_de_suite_et_le_retour() {
+    let (ok, echec) = (tour(Etat::Ok), tour(Etat::Echec));
+    // Un premier tour raté après un `ok` ne se publie pas encore.
+    assert!(
+        transitions(Some(&ok), Some(&ok), &courant(Etat::Echec)).is_empty(),
+        "#7805 : un raté isolé ne doit pas publier ok → echec"
     );
+    // Le second tour raté de suite publie `ok → echec`.
     assert_eq!(
-        t,
+        transitions(Some(&echec), Some(&ok), &courant(Etat::Echec)),
         vec![Transition {
             service: "service:tidal".into(),
             avant: Some(Etat::Ok),
@@ -383,25 +549,31 @@ fn les_transitions_disent_le_premier_echec_et_le_retour() {
         }]
     );
     // Un échec qui DURE ne se redit pas.
-    let pendant = RapportSentinelle {
-        resultats: vec![ligne("qobuz", Etat::Ok), ligne("tidal", Etat::Echec)],
-        ..avant.clone()
-    };
-    assert!(
-        transitions(
-            Some(&pendant),
-            &[ligne("qobuz", Etat::Ok), ligne("tidal", Etat::Echec)]
-        )
-        .is_empty()
-    );
-    // Le retour à la normale se dit.
+    assert!(transitions(Some(&echec), Some(&echec), &courant(Etat::Echec)).is_empty());
+    // Le retour à la normale d'un échec annoncé se dit.
     assert_eq!(
-        transitions(
-            Some(&pendant),
-            &[ligne("qobuz", Etat::Ok), ligne("tidal", Etat::Ok)]
-        )
-        .len(),
-        1
+        transitions(Some(&echec), Some(&echec), &courant(Etat::Ok)),
+        vec![Transition {
+            service: "service:tidal".into(),
+            avant: Some(Etat::Echec),
+            apres: Etat::Ok,
+        }]
+    );
+    // Un service vu pour la première fois en échec se dit tout de suite.
+    assert_eq!(transitions(None, None, &courant(Etat::Echec)).len(), 2);
+}
+
+#[test]
+fn un_echec_isole_suivi_d_un_succes_ne_publie_aucune_transition() {
+    // Qobuz (#7805) : ok, echec, ok sur la même piste.
+    let (ok, echec) = (tour(Etat::Ok), tour(Etat::Echec));
+    assert!(
+        transitions(Some(&ok), Some(&ok), &courant(Etat::Echec)).is_empty(),
+        "#7805 : le raté isolé ne doit rien publier"
+    );
+    assert!(
+        transitions(Some(&echec), Some(&ok), &courant(Etat::Ok)).is_empty(),
+        "#7805 : le retour après un raté jamais annoncé ne doit rien publier"
     );
 }
 
