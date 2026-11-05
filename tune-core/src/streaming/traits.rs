@@ -869,6 +869,12 @@ pub trait StreamingService: Send + Sync {
         let _ = section_id;
         Ok(vec![])
     }
+    /// #7822 — les mixes personnels du compte (TIDAL : My Daily Discovery,
+    /// My Mix 1 à 8…), servis comme des playlists : leur identifiant se lit
+    /// par `get_playlist_tracks`. Vide pour un service qui n'en a pas.
+    async fn get_user_mixes(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+        Ok(vec![])
+    }
     /// Browse the record label of an album: resolves the album's label and
     /// returns it with its full catalogue. Album-based so the shared
     /// `StreamAlbum` model need not carry a label id.
