@@ -940,14 +940,18 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
                 backend_sortie.as_deref(),
             );
         }
-        let signal_path = crate::routes::zones::build_signal_path_pub(
-            &zone_state,
-            zone,
-            &state.backend,
-            renderer_label,
-            audio_backend,
-            wire.as_ref(),
-        );
+        let signal_path = crate::routes::zones::signal_path_sous_licence(
+            &state.license,
+            crate::routes::zones::build_signal_path_pub(
+                &zone_state,
+                zone,
+                &state.backend,
+                renderer_label,
+                audio_backend,
+                wire.as_ref(),
+            ),
+        )
+        .await;
         v.as_object_mut()
             .unwrap()
             .insert("signal_path".into(), json!(signal_path));
