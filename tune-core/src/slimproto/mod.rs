@@ -976,6 +976,99 @@ fn retenir_etat_ecoute(etat: EtatEcouteSlimProto) {
     }
 }
 
+fn effacer_etat_ecoute() {
+    if let Ok(mut g) = ETAT_ECOUTE.write() {
+        *g = None;
+    }
+}
+
+/// Une tâche détachée, abandonnée quand sa poignée disparaît.
+///
+/// #7374 — les tâches d'une session de platine (battement et écriture) étaient
+/// lancées par `tokio::spawn` nu : abandonner la session les laissait tourner,
+/// et la tâche d'écriture gardait la moitié écriture de la connexion. La
+/// platine restait connectée à un serveur éteint.
+struct AbandonALaFin(tokio::task::JoinHandle<()>);
+
+impl Drop for AbandonALaFin {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Le serveur TCP SlimProto en cours, s'il tourne (#7374).
+///
+/// Même modèle que le répondeur UDP de [`discovery`] : garder la poignée permet
+/// d'éteindre le serveur sans redémarrer Tune et, surtout, de **rendre le
+/// port** 3483 à un Lyrion/LMS installé sur la même machine.
+struct ServeurTcpArme {
+    tache: tokio::task::JoinHandle<()>,
+    serveur: Arc<SlimProtoServer>,
+}
+
+static SERVEUR_TCP: StdMutex<Option<ServeurTcpArme>> = StdMutex::new(None);
+
+fn verrou_serveur_tcp() -> StdMutexGuard<'static, Option<ServeurTcpArme>> {
+    SERVEUR_TCP.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Le serveur TCP SlimProto écoute-t-il en ce moment ?
+///
+/// Une tâche terminée ne compte pas : un bind refusé (un LMS tient le port)
+/// termine la tâche, et c'est justement le cas où une nouvelle tentative doit
+/// rester possible.
+pub fn serveur_tcp_arme() -> bool {
+    verrou_serveur_tcp()
+        .as_ref()
+        .is_some_and(|s| !s.tache.is_finished())
+}
+
+/// Arme le serveur TCP SlimProto. Vrai si une écoute a été lancée.
+///
+/// Un second appel alors que le serveur tourne ne fait rien : deux serveurs sur
+/// le même port, c'est le second qui échoue au bind et un journal qui accuse à
+/// tort un LMS voisin. Un bind refusé reste un service dégradé, jamais un
+/// démarrage de Tune en échec : la cause est journalisée et retenue dans
+/// [`etat_ecoute`] (#2938).
+pub fn armer_serveur_tcp(serveur: Arc<SlimProtoServer>) -> bool {
+    let mut place = verrou_serveur_tcp();
+    if place.as_ref().is_some_and(|s| !s.tache.is_finished()) {
+        debug!("slimproto_server_deja_arme — second armement ignoré (#7374)");
+        return false;
+    }
+    let lance = Arc::clone(&serveur);
+    let tache = tokio::spawn(async move {
+        if let Err(e) = lance.spawn().await {
+            error!(error = %e, "slimproto_server_failed");
+        }
+    });
+    *place = Some(ServeurTcpArme { tache, serveur });
+    true
+}
+
+/// Éteint le serveur TCP SlimProto et rend le port. Vrai si quelque chose
+/// tournait.
+///
+/// Au retour, le port est libre : la tâche est attendue jusqu'à sa fin, donc
+/// jusqu'à la fermeture de l'écoute. Les platines connectées sont déconnectées
+/// et leurs zones passent hors ligne, comme à une déconnexion normale.
+pub async fn eteindre_serveur_tcp() -> bool {
+    let arme = verrou_serveur_tcp().take();
+    let Some(ServeurTcpArme { tache, serveur }) = arme else {
+        effacer_etat_ecoute();
+        return false;
+    };
+    let tournait = !tache.is_finished();
+    tache.abort();
+    let _ = tache.await;
+    serveur.deconnecter_les_platines().await;
+    effacer_etat_ecoute();
+    if tournait {
+        info!("slimproto_server_stopped — l'écoute TCP est fermée et le port est rendu (#7374)");
+    }
+    tournait
+}
+
 /// Essaie de se connecter au port pour savoir QUI le tient.
 ///
 /// On sonde la boucle locale d'abord ; puis, si on la connait, l'adresse LAN du
@@ -1125,12 +1218,16 @@ impl SlimProtoServer {
         });
         info!(port = port_obtenu, "slimproto_server_started");
 
+        // #7374 — les sessions vivent dans un `JoinSet` : abandonner cette
+        // boucle les abandonne toutes, et les connexions se ferment avec elle.
+        let mut sessions = tokio::task::JoinSet::new();
         loop {
+            while sessions.try_join_next().is_some() {}
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     info!(peer = %peer, "slimproto_client_connected");
                     let server = Arc::clone(&self);
-                    tokio::spawn(async move {
+                    sessions.spawn(async move {
                         if let Err(e) = server.handle_client(stream, peer).await {
                             debug!(peer = %peer, error = %e, "slimproto_client_handler_error");
                         }
@@ -1341,9 +1438,12 @@ impl SlimProtoServer {
                 .insert(mac_str.clone(), heartbeat_tx.clone());
         }
 
+        // #7374 — gardées par `AbandonALaFin` : une session abandonnée (serveur
+        // éteint par le réglage) ne laisse ni battement ni écriture derrière
+        // elle.
         let heartbeat_handle = {
             let tx = heartbeat_tx.clone();
-            tokio::spawn(async move {
+            AbandonALaFin(tokio::spawn(async move {
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
                 loop {
@@ -1352,7 +1452,7 @@ impl SlimProtoServer {
                         break; // channel closed, client gone
                     }
                 }
-            })
+            }))
         };
 
         // Split the TCP stream for concurrent read/write.
@@ -1363,7 +1463,7 @@ impl SlimProtoServer {
         // Writer task: drains heartbeat_rx and sends messages to the player.
         let writer_clone = Arc::clone(&writer);
         let mac_for_writer = mac_str.clone();
-        let writer_handle = tokio::spawn(async move {
+        let writer_handle = AbandonALaFin(tokio::spawn(async move {
             while let Some(msg) = heartbeat_rx.recv().await {
                 let mut w = writer_clone.lock().await;
                 // Reassemble a TcpStream is not possible with split halves,
@@ -1373,7 +1473,7 @@ impl SlimProtoServer {
                     break;
                 }
             }
-        });
+        }));
 
         // Reader loop: read messages from the player until disconnect.
         let players = Arc::clone(&self.players);
@@ -1466,9 +1566,9 @@ impl SlimProtoServer {
         };
 
         // Cleanup: abort heartbeat, close writer channel.
-        heartbeat_handle.abort();
+        drop(heartbeat_handle);
         drop(heartbeat_tx);
-        writer_handle.abort();
+        drop(writer_handle);
 
         // Mark the zone offline and drop its output before removing the player.
         self.unregister_player_zone(&mac_str).await;
@@ -1563,6 +1663,22 @@ impl SlimProtoServer {
             playback,
         );
         state.outputs.lock().await.register(Box::new(output));
+    }
+
+    /// Déconnecte toutes les platines enregistrées : zone hors ligne, sortie
+    /// retirée, platine oubliée (#7374).
+    ///
+    /// Appelée après l'abandon des sessions, qui n'ont pas pu faire elles-mêmes
+    /// le ménage de fin de [`handle_client`](Self::handle_client).
+    async fn deconnecter_les_platines(&self) {
+        let macs: Vec<String> = self.players.lock().await.keys().cloned().collect();
+        for mac in &macs {
+            self.unregister_player_zone(mac).await;
+        }
+        self.players.lock().await.clear();
+        if !macs.is_empty() {
+            info!(platines = macs.len(), "slimproto_players_disconnected_by_shutdown");
+        }
     }
 
     /// Mark the zone offline and remove its output when a player disconnects.

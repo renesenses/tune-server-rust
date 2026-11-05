@@ -5,10 +5,11 @@
 //! playback, zone, and library APIs.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::PlayerRegistry;
@@ -31,6 +32,61 @@ static ETAT: super::ecoute::JournalEcoute = super::ecoute::JournalEcoute::new();
 /// Dernier bind CLI ; absent avant tentative et après arrêt de l'écoute.
 pub fn etat_ecoute() -> Option<super::EtatEcoute> {
     ETAT.lire()
+}
+
+/// Le pont de commande en cours, s'il tourne (#7374).
+///
+/// Même modèle que le répondeur UDP de [`super::discovery`] : la poignée permet
+/// d'éteindre le pont sans redémarrer Tune et de rendre le port 9090 à un
+/// Lyrion/LMS installé sur la même machine.
+static PONT: StdMutex<Option<JoinHandle<()>>> = StdMutex::new(None);
+
+fn verrou() -> std::sync::MutexGuard<'static, Option<JoinHandle<()>>> {
+    PONT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Le pont de commande écoute-t-il en ce moment ?
+pub fn est_arme() -> bool {
+    verrou().as_ref().is_some_and(|h| !h.is_finished())
+}
+
+/// Arme le pont de commande, avec le repli de port de #4361. Vrai si une
+/// écoute a été lancée ; un second appel alors qu'il tourne ne fait rien.
+pub fn armer(state: Arc<CliState>) -> bool {
+    armer_tache(start_cli_server(state))
+}
+
+/// Même armement, sur un port explicite et sans repli (bancs d'essai).
+pub fn armer_sur_port(state: Arc<CliState>, port: u16) -> bool {
+    armer_tache(start_cli_server_sur_port(state, port))
+}
+
+fn armer_tache(pont: impl std::future::Future<Output = ()> + Send + 'static) -> bool {
+    let mut place = verrou();
+    if place.as_ref().is_some_and(|h| !h.is_finished()) {
+        debug!("lms_cli_server_deja_arme — second armement ignoré (#7374)");
+        return false;
+    }
+    *place = Some(tokio::spawn(pont));
+    true
+}
+
+/// Éteint le pont de commande et rend son port. Vrai si quelque chose
+/// tournait. Au retour, le port est libre et les connexions sont fermées.
+pub async fn eteindre() -> bool {
+    let tache = verrou().take();
+    let Some(tache) = tache else {
+        ETAT.effacer();
+        return false;
+    };
+    let tournait = !tache.is_finished();
+    tache.abort();
+    let _ = tache.await;
+    ETAT.effacer();
+    if tournait {
+        info!("lms_cli_server_stopped — le pont de commande est fermé et son port est rendu (#7374)");
+    }
+    tournait
 }
 
 /// State shared across CLI connections.
@@ -164,12 +220,15 @@ pub async fn start_cli_server_sur_port(state: Arc<CliState>, port: u16) {
 
 /// La boucle d'acceptation, commune aux deux entrées.
 async fn servir(listener: TcpListener, state: Arc<CliState>) {
+    // #7374 — abandonner la boucle abandonne aussi les connexions ouvertes.
+    let mut connexions = tokio::task::JoinSet::new();
     loop {
+        while connexions.try_join_next().is_some() {}
         match listener.accept().await {
             Ok((stream, peer)) => {
                 info!(peer = %peer, "lms_cli_client_connected");
                 let state = state.clone();
-                tokio::spawn(async move {
+                connexions.spawn(async move {
                     if let Err(e) = handle_cli_client(stream, peer, state).await {
                         debug!(peer = %peer, error = %e, "lms_cli_client_error");
                     }
