@@ -3838,6 +3838,9 @@ fn windows_update_bat(
     // serveur sorti, AVANT le binaire. Le premier dossier est celui servi :
     // s'il ne bascule pas, rien d'autre n'est touché (`:web_failed`, ancienne
     // version relancée telle quelle). Le repli, lui, est au mieux.
+    // `move` d'un dossier vers un nom qui existe encore le range DEDANS : un
+    // `rmdir` resté partiel (fichier tenu par un antivirus) est donc suivi
+    // d'un `if exist` qui arrête avant le `move`.
     let mut bascule_web = String::new();
     let mut restaure_web = String::new();
     let mut nettoie_web = String::new();
@@ -3851,6 +3854,7 @@ fn windows_update_bat(
         bascule_web.push_str(&format!(
             "if not exist \"{neuf}\" goto web_done_{i}\r\n\
              if exist \"{ancien}\" rmdir /s /q \"{ancien}\"\r\n\
+             if exist \"{ancien}\" {echec}\r\n\
              if not exist \"{cible}\" goto web_place_{i}\r\n\
              move \"{cible}\" \"{ancien}\" >nul 2>&1\r\n\
              if exist \"{cible}\" {echec}\r\n\
@@ -3864,6 +3868,7 @@ fn windows_update_bat(
         restaure_web.push_str(&format!(
             "if not exist \"{ancien}\" goto web_restored_{i}\r\n\
              rmdir /s /q \"{cible}\"\r\n\
+             if exist \"{cible}\" goto web_restored_{i}\r\n\
              move \"{ancien}\" \"{cible}\" >nul 2>&1\r\n\
              :web_restored_{i}\r\n"
         ));
@@ -6555,6 +6560,33 @@ mod windows_update_bat_tests {
             .map(|i| echec + i)
             .unwrap_or(usize::MAX);
         assert!(restaure < relance, "ancien web/ non restauré : {s}");
+    }
+
+    /// Un `rmdir` resté partiel n'est jamais suivi d'un `move` vers le même
+    /// nom : `move` y rangerait le dossier dedans (`web.old\\web`), et
+    /// l'ancienne version relancée n'aurait plus d'interface.
+    #[test]
+    fn un_rmdir_partiel_n_emboite_pas_les_dossiers_7750() {
+        let s = script_avec_web();
+        let lignes: Vec<&str> = s.split("\r\n").collect();
+        for (n, ligne) in lignes.iter().enumerate() {
+            let Some(i) = ligne.find("rmdir /s /q ") else {
+                continue;
+            };
+            let dossier = &ligne[i + "rmdir /s /q ".len()..];
+            let suivante = lignes.get(n + 1).copied().unwrap_or("");
+            if lignes[n + 1..]
+                .iter()
+                .take_while(|l| !l.starts_with(':'))
+                .any(|l| l.contains(&format!(" {dossier}")) && l.contains("move "))
+            {
+                assert!(
+                    suivante.starts_with(&format!("if exist {dossier} ")),
+                    "après `{ligne}`, un `move` vers {dossier} suit sans \
+                     vérifier que le rmdir a abouti : {s}"
+                );
+            }
+        }
     }
 
     /// Sans `web/` dans l'archive, le script reste celui du seul binaire.
