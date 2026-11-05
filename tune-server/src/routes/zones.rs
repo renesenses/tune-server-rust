@@ -634,6 +634,7 @@ mod presence;
 mod rattacher_asio_6120;
 // #7084 — zone AirPlay 2 servie sans son composant `airplay-daemon`.
 mod composant_airplay2_7084;
+mod sortie_reseau_absente_7279;
 // #6541 — boutons + / − et limites de volume d'une zone.
 mod limites_de_volume_6541;
 // #6721 — la garde contre les montées brusques, par le routeur public.
