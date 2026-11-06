@@ -443,6 +443,11 @@ mod bras_alsa_natif;
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 mod etage_natif;
 
+// #7264 — le volume logiciel du WASAPI exclusif appliqué au RENDU, après
+// l'anneau natif, et non plus dans le producteur deux secondes en amont.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+pub(crate) mod gain_au_rendu_7264;
+
 // #5204 — l'enchaînement sans blanc en mode exclusif : quel bras enchaîne, la
 // règle de la frontière à format égal, et la lecture de l'en-tête suivant
 // (partagée avec le chemin cpal). Pur, compilé partout.
@@ -690,6 +695,13 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// #7632 — la convolution par RI est un droit Premium (`RoomCorrection`,
+    /// décision du 04/11/2026). Faux par défaut : une sortie à qui personne
+    /// n'a dit que le droit est accordé ne convolue pas. Posé par
+    /// l'orchestrateur à chaque lecture et quand la licence change
+    /// ([`Self::set_convolution_autorisee`]). Faux, la configuration reste
+    /// mémorisée mais aucun moteur n'est construit.
+    convolution_autorisee: Arc<AtomicBool>,
     /// #6522, #6524 — un traitement est-il ARMÉ dans les réglages enregistrés
     /// de la zone qui joue (égaliseur, correction de pièce, crossfeed, greffon
     /// natif, repli mono) ? Posé par l'orchestrateur à côté de `pure_bypass`.
@@ -1259,6 +1271,7 @@ impl LocalOutput {
             current_format: Arc::new(AtomicU32::new(0)),
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
+            convolution_autorisee: Arc::new(AtomicBool::new(false)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
             flux_sans_fin: AtomicBool::new(false),
             volume_avant_egaliseur: AtomicU32::new(u32::MAX),
@@ -1610,7 +1623,9 @@ impl LocalOutput {
     pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
         let config = super::super::audio::convolver::ConvolverConfig::from_wav(path)?;
         *self.convolver_config.lock().unwrap() = Some(config.clone());
-        let current_format = self.current_format();
+        let current_format = self
+            .current_format()
+            .filter(|_| self.convolution_autorisee.load(Ordering::Relaxed));
         let active = match current_format {
             Some((sample_rate, channels)) => {
                 match config.build_for(1024, sample_rate, channels as usize) {
@@ -1642,6 +1657,32 @@ impl LocalOutput {
         *self.convolver_config.lock().unwrap() = None;
         *self.convolver.lock().unwrap() = None;
         tracing::info!(device = %self.device_name, "convolver_cleared");
+    }
+
+    /// #7632 — accorder ou retirer le droit de convoluer (Premium
+    /// `RoomCorrection`). Retiré pendant la lecture, le moteur en place
+    /// s'éteint EN FONDU ([`Convolver::eteindre_en_fondu`], 20 ms) : pas de
+    /// clic, et plus aucune convolution ensuite ; à la piste suivante il n'est
+    /// pas reconstruit. Accordé, il le sera à la prochaine lecture (le faire
+    /// flux en cours ferait sauter le temps de sa latence). Rend vrai si
+    /// l'état a changé.
+    pub fn set_convolution_autorisee(&self, autorisee: bool) -> bool {
+        let avant = self
+            .convolution_autorisee
+            .swap(autorisee, Ordering::Relaxed);
+        if avant && !autorisee {
+            let trames = self
+                .current_format()
+                .map(|(taux, _)| (taux as usize / 50).max(1))
+                .unwrap_or(0);
+            if let Ok(mut c) = self.convolver.lock()
+                && let Some(conv) = c.as_mut()
+            {
+                conv.eteindre_en_fondu(trames);
+                tracing::info!(device = %self.device_name, trames, "convolution_eteinte_sans_licence");
+            }
+        }
+        avant != autorisee
     }
 
     /// Enable/disable PURE (audiophile) bypass of the room-correction convolver
@@ -1698,6 +1739,42 @@ impl LocalOutput {
     pub fn sort_par_asio_exclusif(&self) -> bool {
         enchainement_exclusif::bras_de_cette_plateforme(self.exclusive_mode, &self.audio_backend)
             == enchainement_exclusif::BrasDeLecture::AsioExclusif
+    }
+
+    /// #7265 — de quoi demander à cette sortie si elle peut porter un DoP,
+    /// relevé sous le verrou de la sortie ; la sonde elle-même
+    /// ([`SondeDuDop::sonder`]) se fait ensuite SANS lui, car elle parle au
+    /// pilote (COM) et un pilote bloqué ne doit pas geler la zone.
+    ///
+    /// La question ne vaut que pour WASAPI — partagé (format du mixeur) ou
+    /// exclusif (`IsFormatSupported`) : ASIO, CoreAudio, ALSA et un backend
+    /// « asio » rendent `None`, donc le comportement d'avant.
+    pub fn sonde_du_dop(&self) -> Option<SondeDuDop> {
+        #[cfg(target_os = "windows")]
+        {
+            let exclusif = match enchainement_exclusif::bras_de_cette_plateforme(
+                self.exclusive_mode,
+                &self.audio_backend,
+            ) {
+                enchainement_exclusif::BrasDeLecture::WasapiExclusif => true,
+                // Le partagé ne passe par le mixeur de Windows qu'hors ASIO.
+                enchainement_exclusif::BrasDeLecture::CpalPartage
+                    if !self.audio_backend.eq_ignore_ascii_case("asio") =>
+                {
+                    false
+                }
+                _ => return None,
+            };
+            Some(SondeDuDop {
+                device_name: self.device_name.clone(),
+                endpoint_id: self.endpoint_id.clone(),
+                exclusif,
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
     }
 
     /// #5643 — le nom du périphérique, tel que la sortie l'ouvrira (la clé de
@@ -2028,6 +2105,56 @@ pub struct RingBuf {
     starvation: Arc<RingStarvation>,
 }
 
+/// #7265 — une question « ce DoP passe-t-il ? » prête à poser à une sortie
+/// WASAPI, détachée de la sortie (voir [`LocalOutput::sonde_du_dop`]).
+#[derive(Debug, Clone)]
+pub struct SondeDuDop {
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    device_name: String,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    endpoint_id: Option<String>,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    exclusif: bool,
+}
+
+impl SondeDuDop {
+    /// Bloquant, borné à deux secondes : au-delà, `Inconnu` (le DoP est tenté
+    /// comme avant). En exclusif, une réponse concluante est retenue par
+    /// périphérique et par format (`dop_ecarte_7265`).
+    pub fn sonder(
+        &self,
+        cadence_dop: u32,
+        voies: u16,
+    ) -> crate::audio::dop_ecarte_7265::AccueilDuDop {
+        #[cfg(target_os = "windows")]
+        {
+            use crate::audio::dop_ecarte_7265 as ecart;
+            if self.exclusif
+                && let Some(connu) =
+                    ecart::accueil_exclusif_connu(&self.device_name, cadence_dop, voies)
+            {
+                return connu;
+            }
+            let accueil = super::wasapi_exclusive::sonder_l_accueil_du_dop(
+                &self.device_name,
+                self.endpoint_id.as_deref(),
+                cadence_dop,
+                voies,
+                self.exclusif,
+            );
+            if self.exclusif {
+                ecart::retenir_accueil_exclusif(&self.device_name, cadence_dop, voies, &accueil);
+            }
+            accueil
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (cadence_dop, voies);
+            crate::audio::dop_ecarte_7265::AccueilDuDop::Inconnu
+        }
+    }
+}
+
 /// Integer SPSC ring used by Windows exclusive backends when the source must
 /// cross the callback boundary without touching floating point.
 ///
@@ -2043,7 +2170,22 @@ pub(crate) struct NativePcmRing {
     /// Même compteur de famine que `RingBuf` (#3205) : les backends exclusifs
     /// Windows drainent cet anneau-ci.
     starvation: Arc<RingStarvation>,
+    /// #7264 — les débuts et fins de passages intacts (DoP, reliquat brut)
+    /// posés par le producteur, à la position d'écriture : `position << 1 |
+    /// intact`. File SPSC bornée, lue par le rendu au gain
+    /// ([`Self::pop_pcm_bytes_au_gain`]).
+    marques: [AtomicU64; MARQUES_DE_PASSAGE],
+    marques_ecrites: AtomicU64,
+    marques_lues: AtomicU64,
+    /// Le dernier état marqué — lu et écrit par le seul producteur.
+    dernier_passage_intact: AtomicBool,
 }
+
+/// #7264 — places de la file des marques de passage. Une marque par
+/// changement DoP ↔ PCM dans le même flux (une frontière de piste) : 64 dans
+/// les deux secondes de l'anneau supposeraient des pistes de 30 ms.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+const MARQUES_DE_PASSAGE: usize = 64;
 
 // SAFETY: same strict SPSC contract and Acquire/Release cursor discipline as
 // `RingBuf`; the only difference is the `i32` cell payload.
@@ -2069,6 +2211,10 @@ impl NativePcmRing {
             write: AtomicU64::new(0),
             read: AtomicU64::new(0),
             starvation,
+            marques: std::array::from_fn(|_| AtomicU64::new(0)),
+            marques_ecrites: AtomicU64::new(0),
+            marques_lues: AtomicU64::new(0),
+            dernier_passage_intact: AtomicBool::new(false),
         }
     }
 
@@ -2090,6 +2236,58 @@ impl NativePcmRing {
             // freshly-created ring.
             unsafe { *cell.get() = 0 };
         }
+        self.marques_ecrites.store(0, Ordering::SeqCst);
+        self.marques_lues.store(0, Ordering::SeqCst);
+        self.dernier_passage_intact.store(false, Ordering::SeqCst);
+    }
+
+    /// #7264 — **le producteur** dit si les mots qu'il va pousser forment un
+    /// passage intact (DoP, reliquat forcé brut) que le rendu au gain ne doit
+    /// jamais pondérer. La marque prend la position d'écriture courante : elle
+    /// vaut pour tout ce qui sera poussé ensuite, jusqu'à la marque suivante.
+    /// Sans changement d'état, rien n'est écrit.
+    ///
+    /// File pleine (64 changements en attente, impossible à une frontière de
+    /// piste par marque) : le producteur attend que le rendu en consomme, au
+    /// plus trois secondes — l'anneau entier en dure deux. Passé ce délai, le
+    /// rendu est mort ; la marque est abandonnée et l'étage s'arrêtera sur sa
+    /// propre famine (#6842).
+    pub(crate) fn marquer_passage_intact(&self, intact: bool) {
+        if self.dernier_passage_intact.load(Ordering::Relaxed) == intact {
+            return;
+        }
+        let ecrites = self.marques_ecrites.load(Ordering::Relaxed);
+        let debut = std::time::Instant::now();
+        while ecrites.wrapping_sub(self.marques_lues.load(Ordering::Acquire))
+            >= MARQUES_DE_PASSAGE as u64
+        {
+            if debut.elapsed() > std::time::Duration::from_secs(3) {
+                warn!("native_ring_marque_de_passage_abandonnee (#7264)");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let position = self.write.load(Ordering::Acquire);
+        self.marques[(ecrites % MARQUES_DE_PASSAGE as u64) as usize]
+            .store(position << 1 | u64::from(intact), Ordering::Relaxed);
+        self.marques_ecrites.store(ecrites + 1, Ordering::Release);
+        self.dernier_passage_intact.store(intact, Ordering::Relaxed);
+    }
+
+    /// La prochaine marque non lue, `(position, intact)`.
+    fn prochaine_marque(&self) -> Option<(u64, bool)> {
+        let lues = self.marques_lues.load(Ordering::Relaxed);
+        if lues == self.marques_ecrites.load(Ordering::Acquire) {
+            return None;
+        }
+        let marque =
+            self.marques[(lues % MARQUES_DE_PASSAGE as u64) as usize].load(Ordering::Relaxed);
+        Some((marque >> 1, marque & 1 == 1))
+    }
+
+    fn consommer_la_marque(&self) {
+        let lues = self.marques_lues.load(Ordering::Relaxed);
+        self.marques_lues.store(lues + 1, Ordering::Release);
     }
 
     pub(crate) fn push(&self, samples: &[i32]) -> usize {
@@ -2163,6 +2361,66 @@ impl NativePcmRing {
         // chiffre doit se comparer d'un backend à l'autre (#3205).
         self.starvation.record(out.len() / bytes_per_sample, count);
         // Fil 1908 — ce qui reste pour le pilote, en échantillons.
+        self.starvation.noter_en_attente(available - count);
+        count * bytes_per_sample
+    }
+
+    /// #7264 — [`Self::pop_pcm_bytes`] avec le volume logiciel appliqué ICI,
+    /// au rendu, et non dans le producteur deux secondes plus tôt. Même
+    /// sérialisation par les octets hauts, mêmes compteurs ; un mot n'est
+    /// pondéré que hors passage intact et quand le gain n'est pas l'unité —
+    /// à 100 %, rampe au repos, la sortie est celle de `pop_pcm_bytes` au
+    /// bit près. Aucune allocation : le fil de rendu l'appelle à chaque
+    /// période.
+    pub(crate) fn pop_pcm_bytes_au_gain(
+        &self,
+        out: &mut [u8],
+        bit_depth: u16,
+        gain: &mut gain_au_rendu_7264::GainAuRendu,
+    ) -> usize {
+        let bytes_per_sample = usize::from(bit_depth / 8);
+        if !matches!(bit_depth, 16 | 24 | 32) {
+            return 0;
+        }
+        gain.relire_la_consigne();
+
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        let available = w.wrapping_sub(r) as usize;
+        let count = available.min(out.len() / bytes_per_sample);
+        let cap = self.capacity();
+        // Les marques déjà dépassées, puis la position de la suivante (un
+        // seul test par mot tant qu'elle n'est pas atteinte).
+        let mut prochaine = u64::MAX;
+        while let Some((position, intact)) = self.prochaine_marque() {
+            if position > r {
+                prochaine = position;
+                break;
+            }
+            gain.entrer_dans_le_passage(intact);
+            self.consommer_la_marque();
+        }
+        for i in 0..count {
+            let position = r + i as u64;
+            while position >= prochaine {
+                if let Some((_, intact)) = self.prochaine_marque() {
+                    gain.entrer_dans_le_passage(intact);
+                    self.consommer_la_marque();
+                }
+                prochaine = match self.prochaine_marque() {
+                    Some((suivante, _)) => suivante,
+                    None => u64::MAX,
+                };
+            }
+            let idx = (r as usize + i) % cap;
+            // SAFETY: same SPSC publication contract as `pop_mapped`.
+            let mot = unsafe { *self.buf[idx].get() };
+            let native = gain.rendre(mot, bit_depth, position).to_le_bytes();
+            let offset = i * bytes_per_sample;
+            out[offset..offset + bytes_per_sample].copy_from_slice(&native[4 - bytes_per_sample..]);
+        }
+        self.read.store(r + count as u64, Ordering::Release);
+        self.starvation.record(out.len() / bytes_per_sample, count);
         self.starvation.noter_en_attente(available - count);
         count * bytes_per_sample
     }
@@ -3599,13 +3857,16 @@ fn finish_windows_exclusive_probe(
 fn rebuild_local_convolver(
     config: &std::sync::Mutex<Option<crate::audio::convolver::ConvolverConfig>>,
     active: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    autorisee: &AtomicBool,
     sample_rate: u32,
     channels: u16,
 ) -> Result<bool, String> {
     let config = config
         .lock()
         .map_err(|_| "verrou de configuration du convolveur empoisonné".to_string())?
-        .clone();
+        .clone()
+        // #7632 — sans le droit Premium, aucun moteur : l'IR reste mémorisée.
+        .filter(|_| autorisee.load(Ordering::Relaxed));
     let next = match config {
         Some(config) => match config.build_for(1024, sample_rate, channels as usize) {
             Ok(convolver) => Some(convolver),
@@ -5663,6 +5924,7 @@ impl OutputTarget for LocalOutput {
         let current_format = self.current_format.clone();
         let convolver_config = self.convolver_config.clone();
         let convolver = self.convolver.clone();
+        let convolution_autorisee = self.convolution_autorisee.clone();
         let pure_bypass = self.pure_bypass.clone();
         // #3973 — lu UNE fois par piste, comme le reste de ce que
         // l'orchestrateur pose avant `play_url`.
@@ -6342,7 +6604,13 @@ impl OutputTarget for LocalOutput {
                 // forme de f32 — `is_dop_pcm`, qui inspecte des octets PCM
                 // bruts, n'a rien a y examiner.
                 current_format.store(LocalOutput::pack_format(dec_sr, dec_ch), Ordering::Relaxed);
-                match rebuild_local_convolver(&convolver_config, &convolver, dec_sr, dec_ch) {
+                match rebuild_local_convolver(
+                    &convolver_config,
+                    &convolver,
+                    &convolution_autorisee,
+                    dec_sr,
+                    dec_ch,
+                ) {
                     Ok(true) => info!(
                         sample_rate = dec_sr,
                         channels = dec_ch,
@@ -6523,7 +6791,13 @@ impl OutputTarget for LocalOutput {
                 LocalOutput::pack_format(sample_rate, channels),
                 Ordering::Relaxed,
             );
-            match rebuild_local_convolver(&convolver_config, &convolver, sample_rate, channels) {
+            match rebuild_local_convolver(
+                &convolver_config,
+                &convolver,
+                &convolution_autorisee,
+                sample_rate,
+                channels,
+            ) {
                 Ok(true) => info!(sample_rate, channels, "local_convolver_built_for_stream"),
                 Ok(false) => {}
                 Err(error) => warn!(
@@ -7436,6 +7710,7 @@ impl OutputTarget for LocalOutput {
                     match rebuild_local_convolver(
                         &convolver_config,
                         &convolver,
+                        &convolution_autorisee,
                         sample_rate,
                         channels,
                     ) {
@@ -8364,6 +8639,9 @@ pub(crate) use crate::audio::resample::{rubato_resample_chunk, rubato_resample_t
 
 #[cfg(test)]
 mod tests;
+// #7632 — la convolution par RI est un droit Premium, éteinte sans clic.
+#[cfg(test)]
+mod convolution_sous_licence_7632;
 
 #[cfg(test)]
 mod open_failure_tests;

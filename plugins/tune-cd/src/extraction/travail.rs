@@ -62,12 +62,8 @@ pub fn provisoire(chemin: &Path) -> PathBuf {
 /// notable (début et fin de piste, progression au plus une fois par
 /// [`INTERVALLE_PROGRESSION`]).
 pub fn executer(plan: &Plan, travail: &Travail, publier: &dyn Fn()) -> Result<(), ErreurTravail> {
-    std::fs::create_dir_all(&plan.dossier).map_err(|e| {
-        ErreurTravail::new(
-            "ecriture",
-            format!("Création du dossier {} : {e}", plan.dossier.display()),
-        )
-    })?;
+    std::fs::create_dir_all(&plan.dossier)
+        .map_err(|e| ErreurTravail::ecriture(&plan.dossier, &e))?;
     if let Some(p) = &plan.pochette {
         ecrire_pochette_du_dossier(&plan.dossier, p);
     }
@@ -125,8 +121,15 @@ enum Sortie {
     Wav(BufWriter<std::fs::File>),
 }
 
-fn erreur_ecriture(e: impl std::fmt::Display) -> ErreurTravail {
-    ErreurTravail::new("ecriture", e.to_string())
+/// #7105 — une écriture refusée sur `chemin`, avec sa cause.
+fn sur(chemin: &Path) -> impl Fn(std::io::Error) -> ErreurTravail + '_ {
+    move |e| ErreurTravail::ecriture(chemin, &e)
+}
+
+/// L'encodeur FLAC ne touche pas au disque : sa panne n'est pas une
+/// écriture refusée.
+fn erreur_encodage(e: impl std::fmt::Display) -> ErreurTravail {
+    ErreurTravail::new("encodage", format!("Encodage FLAC impossible : {e}"))
 }
 
 /// L'en-tête d'un WAV PCM 16 bits stéréo 44,1 kHz de `octets` octets.
@@ -162,7 +165,7 @@ fn extraire_piste(
         ));
     }
     if let Some(parent) = piste.chemin.parent() {
-        std::fs::create_dir_all(parent).map_err(erreur_ecriture)?;
+        std::fs::create_dir_all(parent).map_err(sur(parent))?;
     }
     let part = provisoire(&piste.chemin);
     let secteurs = piste.fin - piste.debut;
@@ -170,16 +173,16 @@ fn extraire_piste(
     let mut sortie = match plan.format {
         Format::Flac => {
             let mut enc = AudioEncoder::new("flac", 44_100, 16, 2);
-            enc.start_sync().map_err(erreur_ecriture)?;
+            enc.start_sync().map_err(erreur_encodage)?;
             Sortie::Flac(enc)
         }
         Format::Wav => {
             let taille = u32::try_from(octets)
                 .ok()
                 .filter(|o| *o <= u32::MAX - 36)
-                .ok_or_else(|| erreur_ecriture("piste trop longue pour un WAV"))?;
-            let mut w = BufWriter::new(std::fs::File::create(&part).map_err(erreur_ecriture)?);
-            w.write_all(&entete_wav(taille)).map_err(erreur_ecriture)?;
+                .ok_or_else(|| ErreurTravail::new("ecriture", "Piste trop longue pour un WAV."))?;
+            let mut w = BufWriter::new(std::fs::File::create(&part).map_err(sur(&part))?);
+            w.write_all(&entete_wav(taille)).map_err(sur(&part))?;
             Sortie::Wav(w)
         }
     };
@@ -211,8 +214,8 @@ fn extraire_piste(
         };
         ar.ajouter(&bloc);
         match &mut sortie {
-            Sortie::Flac(enc) => enc.write_sync(&bloc).map_err(erreur_ecriture)?,
-            Sortie::Wav(w) => w.write_all(&bloc).map_err(erreur_ecriture)?,
+            Sortie::Flac(enc) => enc.write_sync(&bloc).map_err(erreur_encodage)?,
+            Sortie::Wav(w) => w.write_all(&bloc).map_err(sur(&part))?,
         }
         lba += n;
         let lus = lba - piste.debut;
@@ -229,22 +232,22 @@ fn extraire_piste(
     travail.modifier(|e| e.pistes[i].statut = StatutPiste::Ecriture);
     match sortie {
         Sortie::Flac(mut enc) => {
-            let flac = enc.finish_sync().map_err(erreur_ecriture)?;
-            std::fs::write(&part, flac).map_err(erreur_ecriture)?;
+            let flac = enc.finish_sync().map_err(erreur_encodage)?;
+            std::fs::write(&part, flac).map_err(sur(&part))?;
         }
         Sortie::Wav(w) => {
             w.into_inner()
-                .map_err(|e| erreur_ecriture(e.error()))?
+                .map_err(|e| sur(&part)(e.into_error()))?
                 .sync_all()
-                .map_err(erreur_ecriture)?;
+                .map_err(sur(&part))?;
         }
     }
     balises::ecrire(&part, plan.format, &piste.balises, plan.pochette.as_deref())
         .map_err(|m| ErreurTravail::new("balises", m))?;
     if plan.ecraser && piste.chemin.exists() {
-        std::fs::remove_file(&piste.chemin).map_err(erreur_ecriture)?;
+        std::fs::remove_file(&piste.chemin).map_err(sur(&piste.chemin))?;
     }
-    std::fs::rename(&part, &piste.chemin).map_err(erreur_ecriture)?;
+    std::fs::rename(&part, &piste.chemin).map_err(sur(&piste.chemin))?;
     let (v1, v2) = ar.resultat();
     travail.modifier(|e| {
         e.pistes[i].accuraterip_v1 = Some(accuraterip::hex(v1));

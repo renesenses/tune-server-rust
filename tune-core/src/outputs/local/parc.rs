@@ -742,6 +742,26 @@ pub(super) static DERNIER_PARC: std::sync::Mutex<Vec<AudioDevice>> =
 /// parc à moitié écrit.
 pub(super) fn publier_le_parc(parc: &[AudioDevice]) {
     *DERNIER_PARC.lock().unwrap_or_else(|e| e.into_inner()) = parc.to_vec();
+    *DERNIERE_PUBLICATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+}
+
+/// #7263 — l'instant où [`DERNIER_PARC`] a été rempli pour la dernière fois.
+static DERNIERE_PUBLICATION: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// #7263 — l'âge du dernier parc publié, `None` si rien n'a encore été
+/// énuméré dans ce processus. Ne prend jamais le verrou d'énumération.
+///
+/// Sert aux lecteurs qui n'ont besoin que des NOMS (la fiche de diagnostic,
+/// interrogée toutes les 5 s par l'écran « État du serveur ») pour décider
+/// s'il faut vraiment rebalayer le matériel.
+pub fn age_du_parc_publie() -> Option<std::time::Duration> {
+    DERNIERE_PUBLICATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(|instant| instant.elapsed())
 }
 
 /// Poser un parc CONNU, comme si l'énumération venait de le rendre (#3322).
@@ -1076,53 +1096,70 @@ pub(super) fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     continue;
                 }
 
-                let (max_channels, sample_rates, caps_reliable) =
-                    match device.supported_output_configs() {
-                        Ok(configs) => {
-                            let mut max_ch = 0u16;
-                            let mut rates = Vec::new();
-                            for config in configs {
-                                max_ch = max_ch.max(config.channels());
-                                let min = config.min_sample_rate();
-                                let max = config.max_sample_rate();
-                                for &rate in
-                                    &[44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
-                                {
-                                    if rate >= min && rate <= max && !rates.contains(&rate) {
-                                        rates.push(rate);
-                                    }
+                // #7263 — un greffon logiciel sans matériel (`jack`, `oss`,
+                // `speexrate`…) n'est jamais OUVERT pour l'inventaire : la
+                // sonde chargeait sa bibliothèque dans le processus, et c'est
+                // pendant celle de `jack` que le serveur de JeromeQ mourait.
+                let supposer = || {
+                    info!(
+                        device = %raw_name,
+                        endpoint_id = %endpoint_id,
+                        "local_audio_device_probe_skipped_software_plugin"
+                    );
+                    (2u16, vec![44100u32, 48000], false)
+                };
+                let sonder = || match device.supported_output_configs() {
+                    Ok(configs) => {
+                        let mut max_ch = 0u16;
+                        let mut rates = Vec::new();
+                        for config in configs {
+                            max_ch = max_ch.max(config.channels());
+                            let min = config.min_sample_rate();
+                            let max = config.max_sample_rate();
+                            for &rate in
+                                &[44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
+                            {
+                                if rate >= min && rate <= max && !rates.contains(&rate) {
+                                    rates.push(rate);
                                 }
                             }
-                            rates.sort();
-
-                            // PipeWire's ALSA plugin can return Ok but with an
-                            // empty iterator — treat it like an error and fall
-                            // through to the fallback probe below.
-                            if max_ch == 0 || rates.is_empty() {
-                                debug!(
-                                    device = %raw_name,
-                                    "local_audio_device_supported_configs_empty"
-                                );
-                                probe_device_fallback_caps(&device, &raw_name)
-                            } else {
-                                // Ces capacités viennent bien d'une énumération —
-                                // ce qui ne veut PAS dire qu'elles ont été
-                                // mesurées : sur WASAPI l'énumération est
-                                // fabriquée (#2862, voir `sample_rate_evidence`).
-                                // `caps_reliable` répond seulement « pas la
-                                // supposition de dernier recours », ce qui reste
-                                // vrai ici et suffit au dédoublonnage Linux.
-                                (max_ch, rates, true)
-                            }
                         }
-                        Err(_) => {
+                        rates.sort();
+
+                        // PipeWire's ALSA plugin can return Ok but with an
+                        // empty iterator — treat it like an error and fall
+                        // through to the fallback probe below.
+                        if max_ch == 0 || rates.is_empty() {
                             debug!(
                                 device = %raw_name,
-                                "local_audio_device_supported_configs_failed"
+                                "local_audio_device_supported_configs_empty"
                             );
                             probe_device_fallback_caps(&device, &raw_name)
+                        } else {
+                            // Ces capacités viennent bien d'une énumération —
+                            // ce qui ne veut PAS dire qu'elles ont été
+                            // mesurées : sur WASAPI l'énumération est
+                            // fabriquée (#2862, voir `sample_rate_evidence`).
+                            // `caps_reliable` répond seulement « pas la
+                            // supposition de dernier recours », ce qui reste
+                            // vrai ici et suffit au dédoublonnage Linux.
+                            (max_ch, rates, true)
                         }
-                    };
+                    }
+                    Err(_) => {
+                        debug!(
+                            device = %raw_name,
+                            "local_audio_device_supported_configs_failed"
+                        );
+                        probe_device_fallback_caps(&device, &raw_name)
+                    }
+                };
+                let (max_channels, sample_rates, caps_reliable) =
+                    crate::outputs::pseudo_peripherique_alsa::capacites_a_l_inventaire(
+                        &endpoint_id,
+                        sonder,
+                        supposer,
+                    );
 
                 let is_default = raw_name == default_name;
                 // Ce que vaut la liste qu'on s'apprête à publier. Sur WASAPI

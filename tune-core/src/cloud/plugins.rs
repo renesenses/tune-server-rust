@@ -46,6 +46,13 @@ pub struct MarketplacePlugin {
     pub platforms: Option<String>,
     #[serde(default)]
     pub install_type: Option<String>,
+    /// Identifiant du manifeste du greffon (`id` de `manifest.json`), publié
+    /// par le catalogue (#7428). C'est la clé qui relie une fiche du
+    /// catalogue au greffon présent sur ce serveur, quels que soient le
+    /// `slug` et le nom affiché de la fiche. Absent sur les fiches qui ne le
+    /// publient pas encore.
+    #[serde(default)]
+    pub plugin_id: Option<String>,
 }
 
 impl MarketplacePlugin {
@@ -401,6 +408,30 @@ mod tests {
             serde_json::from_str(r#"{"name":"x","slug":"x","platforms":"  "}"#)
                 .expect("désérialisation");
         assert!(champ_vide.is_installable());
+    }
+
+    /// #7428 — le serveur relaie le catalogue au client web : l'identifiant
+    /// de manifeste publié par le catalogue doit être lu, puis renvoyé tel
+    /// quel. Une fiche qui ne le publie pas (le relevé du 29/08) le laisse vide.
+    #[test]
+    fn l_identifiant_de_manifeste_du_catalogue_est_lu_et_relaye_7428() {
+        let fiche: MarketplacePlugin = serde_json::from_str(
+            r#"{"name":"tune-plugin-party","slug":"party-mode","display_name":"Mode Party","plugin_id":"party"}"#,
+        )
+        .expect("désérialisation");
+        assert_eq!(fiche.plugin_id.as_deref(), Some("party"));
+        let relayee = serde_json::to_value(&fiche).expect("sérialisation");
+        assert_eq!(relayee["plugin_id"], "party", "le champ doit être relayé");
+
+        let nul: MarketplacePlugin =
+            serde_json::from_str(r#"{"name":"x","slug":"x","plugin_id":null}"#)
+                .expect("désérialisation");
+        assert!(nul.plugin_id.is_none());
+
+        assert!(
+            catalogue_releve().iter().all(|p| p.plugin_id.is_none()),
+            "une fiche sans identifiant reste sans identifiant"
+        );
     }
 
     /// Sert `CATALOGUE_RELEVE` une seule fois, sur un port local, puis rend

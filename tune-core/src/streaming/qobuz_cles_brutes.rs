@@ -253,6 +253,29 @@ pub fn arbre_des_cles(document: &Value) -> Value {
     racine.rendre()
 }
 
+/// L'arbre des NOMS de clés et des types, SANS AUCUNE valeur (#7414) : pour
+/// les fiches de label, dont rien n'a besoin de sortir au-delà de la forme.
+/// Même arbre que [`arbre_des_cles`], dont on retire `valeurs` et `masque`
+/// (y compris les booléens).
+pub fn arbre_des_types(document: &Value) -> Value {
+    fn retirer(v: &mut Value) {
+        match v {
+            Value::Object(m) => {
+                m.remove("valeurs");
+                m.remove("masque");
+                for enfant in m.values_mut() {
+                    retirer(enfant);
+                }
+            }
+            Value::Array(a) => a.iter_mut().for_each(retirer),
+            _ => {}
+        }
+    }
+    let mut arbre = arbre_des_cles(document);
+    retirer(&mut arbre);
+    arbre
+}
+
 /// Les chemins (`tracks.items[].parental_warning`) des clés dont le NOM
 /// contient un fragment notable — de quoi lire en une ligne si un candidat
 /// au marquage IA existe, sans parcourir l'arbre.
@@ -300,6 +323,53 @@ mod tests {
             "label_url": "https://www.qobuz.com/label/FUITE",
             "tag_opaque": "Zm9vYmFyRlVJVEVGVUlURUZVSVRFRlVJVEU="
         })
+    }
+
+    /// Une fiche `label/get` FACTICE (#7414), piégée : toute valeur porte
+    /// `FUITE`, ou est un booléen / un nombre qui ne doit pas sortir.
+    fn label_factice() -> Value {
+        json!({
+            "id": 9300,
+            "name": "FUITE nom du label",
+            "slug": "fuite-slug",
+            "albums_count": 4242,
+            "is_ai_generated": true,
+            "image": { "small": "https://static.qobuz.com/FUITE-s.jpg",
+                       "large": "https://static.qobuz.com/FUITE-l.jpg" },
+            "description": "FUITE description",
+            "user_auth_token": "FUITE-jeton",
+            "albums": { "total": 1, "items": [
+                { "id": "FUITE-alb", "label": { "id": 9300, "name": "FUITE nom du label" },
+                  "streamable": true } ] }
+        })
+    }
+
+    #[test]
+    fn la_fiche_de_label_ne_rend_que_les_noms_et_les_types() {
+        let arbre = arbre_des_types(&label_factice());
+        let texte = arbre.to_string();
+        for interdit in [
+            "FUITE", "http", "9300", "4242", "true", "false", "valeurs", "masque",
+        ] {
+            assert!(!texte.contains(interdit), "{interdit} dans : {texte}");
+        }
+        assert_eq!(arbre["cles"]["name"]["type"], "chaine");
+        assert_eq!(arbre["cles"]["albums_count"]["type"], "nombre");
+        assert_eq!(arbre["cles"]["is_ai_generated"]["type"], "booleen");
+        assert_eq!(arbre["cles"]["image"]["cles"]["large"]["type"], "chaine");
+        assert_eq!(arbre["cles"]["user_auth_token"]["type"], "chaine");
+        assert_eq!(
+            arbre["cles"]["albums"]["cles"]["items"]["elements"]["cles"]["label"]["cles"]["name"]["type"],
+            "chaine"
+        );
+    }
+
+    /// Contre-épreuve : l'arbre ordinaire, lui, rend bien des valeurs sur la
+    /// même fiche — le témoin ci-dessus ne passe donc pas par hasard.
+    #[test]
+    fn contre_epreuve_l_arbre_ordinaire_rend_des_valeurs() {
+        let texte = arbre_des_cles(&label_factice()).to_string();
+        assert!(texte.contains("valeurs"), "{texte}");
     }
 
     #[test]
