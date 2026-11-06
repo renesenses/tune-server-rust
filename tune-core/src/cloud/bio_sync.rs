@@ -186,6 +186,30 @@ pub fn bio_source(source: &Option<String>) -> &str {
     }
 }
 
+/// Les sources dont une bio n'est JAMAIS envoyée au fonds communautaire
+/// (#8022) : les textes éditoriaux des services de streaming. Ils restent la
+/// propriété du service (ou de ses auteurs) ; la bibliothèque de l'utilisateur
+/// les garde pour lui, elle ne les republie pas.
+pub const SOURCES_JAMAIS_ENVOYEES: &[&str] = &[
+    "qobuz",
+    "tidal",
+    "deezer",
+    "spotify",
+    "amazon",
+    "apple_music",
+    "youtube",
+    "soundcloud",
+    "bandcamp",
+];
+
+/// Une bio de cette source peut-elle partir vers le fonds communautaire ?
+/// Non pour une source de [`SOURCES_JAMAIS_ENVOYEES`], casse et espaces mis
+/// à part.
+pub fn source_envoyable_au_fonds(source: Option<&str>) -> bool {
+    let s = source.unwrap_or("").trim().to_ascii_lowercase();
+    !SOURCES_JAMAIS_ENVOYEES.contains(&s.as_str())
+}
+
 #[derive(Debug, Deserialize)]
 struct AlbumByTitleBiosWrapper {
     #[serde(default)]
@@ -229,7 +253,7 @@ async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
     let artist_repo = ArtistRepo::with_backend(db.clone());
     let album_repo = AlbumRepo::with_backend(db.clone());
 
-    let artists = match artist_repo.artists_with_bio_and_mbid() {
+    let mut artists = match artist_repo.artists_with_bio_and_mbid() {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "bio_sync_artist_query_failed");
@@ -237,13 +261,16 @@ async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
         }
     };
 
-    let albums = match album_repo.albums_with_bio() {
+    let mut albums = match album_repo.albums_with_bio() {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "bio_sync_album_query_failed");
             return;
         }
     };
+    // #8022 : jamais une bio d'un service de streaming vers le fonds.
+    artists.retain(|(_, _, _, source, ..)| source_envoyable_au_fonds(source.as_deref()));
+    albums.retain(|(_, _, _, _, source, ..)| source_envoyable_au_fonds(source.as_deref()));
 
     if artists.is_empty() && albums.is_empty() {
         return;
@@ -1060,6 +1087,97 @@ mod tests {
             Some("Une biographie communautaire."),
             "la bio renvoyee par le cloud sous la cle `bios` doit etre appliquee"
         );
+    }
+
+    /// Serveur de test qui accepte les envois et garde chaque corps reçu.
+    async fn mock_qui_garde_les_corps() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::Router;
+        use axum::routing::post;
+
+        let corps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let etat = corps.clone();
+        let app = Router::new()
+            .route(
+                "/upload",
+                post(
+                    move |axum::extract::State(c): axum::extract::State<
+                        Arc<std::sync::Mutex<Vec<String>>>,
+                    >,
+                          recu: String| async move {
+                        c.lock().unwrap().push(recu);
+                        axum::http::StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(etat);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://127.0.0.1:{port}"), corps)
+    }
+
+    /// #8022 — témoin dédié : une bio de source `qobuz` (ou d'un autre service
+    /// de streaming) ne part JAMAIS vers le fonds communautaire ; une bio
+    /// Wikipédia de la même base part. Textes factices.
+    #[tokio::test]
+    async fn une_bio_de_service_de_streaming_ne_part_jamais_vers_le_fonds_8022() {
+        use crate::db::models::{Album, Artist};
+
+        let db = fresh_db();
+        let artistes = ArtistRepo::with_backend(db.clone());
+        let mut libre = Artist::new("Artiste Libre".into());
+        libre.musicbrainz_id = Some("mbid-libre".into());
+        let id_libre = artistes.create(&libre).unwrap();
+        artistes
+            .update_bio_full(
+                id_libre,
+                "BIO-LIBRE-TEMOIN",
+                "wikipedia",
+                None,
+                "CC-BY-SA-4.0",
+                "fr",
+            )
+            .unwrap();
+        for (i, source) in ["qobuz", "Qobuz", "tidal"].iter().enumerate() {
+            let mut a = Artist::new(format!("Artiste Service {i}"));
+            a.musicbrainz_id = Some(format!("mbid-service-{i}"));
+            let id = artistes.create(&a).unwrap();
+            artistes
+                .update_bio_full(id, "BIO-SERVICE-TEMOIN", source, None, "", "fr")
+                .unwrap();
+        }
+        let albums = AlbumRepo::with_backend(db.clone());
+        let mut album = Album::new("Album Service".into());
+        album.artist_id = Some(id_libre);
+        let id_album = albums.create(&album).unwrap();
+        albums
+            .update_bio_full(id_album, "NOTE-SERVICE-TEMOIN", "qobuz", None, "", "fr")
+            .unwrap();
+
+        let (base, corps) = mock_qui_garde_les_corps().await;
+        upload_bios_to(&db, &format!("{base}/upload")).await;
+
+        let recus = corps.lock().unwrap().join("\n");
+        assert!(
+            recus.contains("BIO-LIBRE-TEMOIN"),
+            "la bio Wikipédia doit partir : le banc doit voir un envoi ({recus})"
+        );
+        assert!(
+            !recus.contains("BIO-SERVICE-TEMOIN") && !recus.contains("NOTE-SERVICE-TEMOIN"),
+            "une bio de source qobuz/tidal est partie vers le fonds communautaire : {recus}"
+        );
+    }
+
+    #[test]
+    fn source_envoyable_au_fonds_refuse_les_services() {
+        assert!(source_envoyable_au_fonds(Some("wikipedia")));
+        assert!(source_envoyable_au_fonds(None));
+        assert!(!source_envoyable_au_fonds(Some("qobuz")));
+        assert!(!source_envoyable_au_fonds(Some(" QOBUZ ")));
+        assert!(!source_envoyable_au_fonds(Some("tidal")));
     }
 
     #[tokio::test]

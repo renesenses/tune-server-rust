@@ -25,6 +25,8 @@ mod bios_bilan_visible;
 mod bios_langue_album;
 #[path = "bios_langue_entete.rs"]
 mod bios_langue_entete;
+#[path = "bios_qobuz_8022.rs"]
+mod bios_qobuz_8022;
 #[path = "bit_perfect_sortie_pull_2189.rs"]
 mod bit_perfect_sortie_pull_2189;
 #[path = "bump_natifs_android.rs"]
