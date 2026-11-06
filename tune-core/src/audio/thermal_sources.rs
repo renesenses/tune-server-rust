@@ -32,6 +32,7 @@
 //! Windows.
 
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
@@ -183,6 +184,37 @@ pub fn lire_et_journaliser(sources: &[&dyn SourceDeTemperature]) -> Option<f64> 
     temp_c
 }
 
+/// Au plus une lecture des sources par cet intervalle, comme la garde
+/// (`thermal::RELECTURE`).
+pub const RELECTURE_DES_SOURCES: Duration = Duration::from_secs(15);
+
+/// La dernière lecture des sources, et quand elle a eu lieu.
+pub type DerniereLecture = Option<(Instant, Option<f64>)>;
+
+/// Rend la lecture gardée si elle a moins de `delai`, sinon relit par `lire`
+/// et la garde. Une absence de température se garde comme une valeur : sur
+/// une machine où toutes les sources échouent, c'est justement elle qu'il ne
+/// faut pas redemander à chaque requête.
+///
+/// Sous Windows, les deux sources WMI ouvrent chacune une connexion : sans
+/// cette mémoire, chaque rapport de diagnostic relançait les quatre sources
+/// et dépassait son délai de 300 ms, rendant l'avertissement intermittent.
+pub fn relire_au_besoin(
+    derniere: &mut DerniereLecture,
+    maintenant: Instant,
+    delai: Duration,
+    lire: impl FnOnce() -> Option<f64>,
+) -> Option<f64> {
+    if let Some((quand, valeur)) = *derniere
+        && maintenant.saturating_duration_since(quand) < delai
+    {
+        return valeur;
+    }
+    let valeur = lire();
+    *derniere = Some((maintenant, valeur));
+    valeur
+}
+
 /// Lecture des zones thermiques par PDH et WMI (#5410, #6450). Aucune
 /// dépendance nouvelle : le crate `windows` est déjà tiré par cpal, il ne
 /// gagne que des fonctionnalités (`Win32_System_Performance`, `…_Wmi`,
@@ -193,11 +225,28 @@ pub fn lire_et_journaliser(sources: &[&dyn SourceDeTemperature]) -> Option<f64> 
 /// (`thermal_source_echec`, `thermal_source_retenue`).
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_sources {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
     use crate::audio::thermal::{celsius_depuis_dixiemes_de_kelvin, celsius_depuis_kelvins};
 
-    /// Les zones thermiques, par la première source lisible ; journalise les
-    /// essais au changement.
+    /// Partagée par la garde et l'écran (`cpu_package_temp_celsius`).
+    static DERNIERE: Mutex<super::DerniereLecture> = Mutex::new(None);
+
+    /// Les zones thermiques, par la première source lisible, relues au plus
+    /// toutes les [`super::RELECTURE_DES_SOURCES`] ; journalise les essais au
+    /// changement.
     pub(crate) fn temperature_celsius() -> Option<f64> {
+        let mut derniere = DERNIERE.lock().unwrap_or_else(|e| e.into_inner());
+        super::relire_au_besoin(
+            &mut derniere,
+            Instant::now(),
+            super::RELECTURE_DES_SOURCES,
+            lire_les_sources,
+        )
+    }
+
+    fn lire_les_sources() -> Option<f64> {
         let pdh_precise = pdh::Compteur {
             nom: "pdh_high_precision_temperature",
             chemin: windows::core::w!("\\Thermal Zone Information(*)\\High Precision Temperature"),
@@ -366,6 +415,10 @@ pub(crate) mod windows_sources {
         const DELAI_PAR_INSTANCE_MS: i32 = 5_000;
         /// `E_ACCESSDENIED`.
         const E_ACCES_REFUSE: HRESULT = HRESULT(0x8007_0005_u32 as i32);
+        /// `WBEM_S_TIMEDOUT` : un code de SUCCÈS que `Next` rend quand
+        /// l'instance n'est pas arrivée dans le délai. Ce n'est pas la fin de
+        /// l'énumération : le prendre pour elle écrirait `aucune_instance`.
+        const WBEM_S_DELAI_DEPASSE: HRESULT = HRESULT(0x0004_0004);
 
         pub(super) struct Requete {
             pub nom: &'static str,
@@ -489,6 +542,11 @@ pub(crate) mod windows_sources {
                     // requête étant semi-synchrone.
                     if code.is_err() {
                         return Err(echec("IEnumWbemClassObject::Next", code));
+                    }
+                    if code == WBEM_S_DELAI_DEPASSE {
+                        return Err(EchecDeSource::Erreur(format!(
+                            "IEnumWbemClassObject::Next : délai dépassé ({DELAI_PAR_INSTANCE_MS} ms)"
+                        )));
                     }
                     let Some(objet) = objets[0].take().filter(|_| rendus == 1) else {
                         break;

@@ -593,13 +593,12 @@ impl LectureThermique {
 /// n'est pas une température trop haute. Une température lue et trop haute,
 /// elle, arrête toujours les analyses par leur garde ([`ThermalGate`], au-delà
 /// de [`PAUSE_ABOVE_C`]) ; rien ici ne la contourne.
-pub fn largeur_selon_la_chaleur(largeur: usize, lecture: &LectureThermique) -> usize {
-    let largeur = largeur.max(1);
-    match lecture {
-        LectureThermique::Lisible(_) => largeur,
-        // #6450 : plus de bridage à un fichier sur l'inconnu.
-        LectureThermique::Illisible(_) => largeur,
-    }
+///
+/// La lecture reste en paramètre exprès : les appelants (`vitesse`,
+/// `faux_hires_passe`) et leurs témoins disent ainsi sur quelle lecture la
+/// largeur est décidée, et une règle future n'aura pas à les retoucher.
+pub fn largeur_selon_la_chaleur(largeur: usize, _lecture: &LectureThermique) -> usize {
+    largeur.max(1)
 }
 
 /// Lectures nécessaires avant de déclarer une zone figée.
@@ -768,6 +767,9 @@ pub fn cpu_package_temp_celsius() -> Option<f64> {
     )
 }
 
+/// Windows (#6450) : la même lecture que la garde, gardée 15 s par
+/// `sources::windows_sources` ; le rapport ne relance pas les quatre sources
+/// (connexions WMI comprises) à chaque requête.
 #[cfg(target_os = "windows")]
 pub fn cpu_package_temp_celsius() -> Option<f64> {
     cpu_temp_celsius()

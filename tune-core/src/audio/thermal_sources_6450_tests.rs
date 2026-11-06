@@ -8,14 +8,17 @@
 //! * chaque source essayée laisse son motif d'échec ;
 //! * sans aucune source lisible, la température est inconnue (et les
 //!   analyses gardent leur vitesse, voir `thermal_repli_5410_tests.rs`) ;
-//! * le journal ne parle qu'au changement de constat.
+//! * le journal ne parle qu'au changement de constat ;
+//! * les sources ne sont pas relues à chaque requête, même quand elles
+//!   échouent toutes.
 
 use super::super::{
     LectureThermique, MotifIllisible, ThermalGate, Verdict, celsius_depuis_dixiemes_de_kelvin,
     celsius_depuis_kelvins, largeur_selon_la_chaleur, lecture_de,
 };
 use super::{
-    EchecDeSource, Essai, SourceDeTemperature, journaliser_si_change, premiere_source_lisible,
+    EchecDeSource, Essai, RELECTURE_DES_SOURCES, SourceDeTemperature, journaliser_si_change,
+    premiere_source_lisible, relire_au_besoin,
 };
 
 /// Une source simulée : ce qu'elle rend, et combien de fois elle a été lue.
@@ -211,4 +214,47 @@ fn le_journal_ne_parle_qu_au_changement_de_constat_6450() {
         ),
     ];
     assert!(journaliser_si_change(&refus, &mut dernier), "nouveau motif");
+}
+
+#[test]
+fn les_sources_ne_sont_relues_qu_apres_l_intervalle_meme_illisibles_6450() {
+    let debut = std::time::Instant::now();
+    let lectures = std::cell::Cell::new(0u32);
+    let lire = || {
+        lectures.set(lectures.get() + 1);
+        None
+    };
+    let mut derniere = None;
+
+    assert_eq!(
+        relire_au_besoin(&mut derniere, debut, RELECTURE_DES_SOURCES, lire),
+        None
+    );
+    let peu_apres = debut + std::time::Duration::from_secs(1);
+    assert_eq!(
+        relire_au_besoin(&mut derniere, peu_apres, RELECTURE_DES_SOURCES, lire),
+        None
+    );
+    assert_eq!(
+        lectures.get(),
+        1,
+        "aucune source lisible : la seconde requête, une seconde après, ne doit pas relancer \
+         les quatre sources (connexions WMI comprises)"
+    );
+
+    let plus_tard = debut + RELECTURE_DES_SOURCES;
+    relire_au_besoin(&mut derniere, plus_tard, RELECTURE_DES_SOURCES, || {
+        lectures.set(lectures.get() + 1);
+        Some(52.0)
+    });
+    assert_eq!(
+        lectures.get(),
+        2,
+        "l'intervalle passé, les sources sont relues"
+    );
+    assert_eq!(
+        relire_au_besoin(&mut derniere, plus_tard, RELECTURE_DES_SOURCES, lire),
+        Some(52.0),
+        "la valeur relue est gardée"
+    );
 }
