@@ -277,6 +277,11 @@ pub(super) struct PlayEpisodeRequest {
     pub(super) duration_ms: Option<u64>,
     #[serde(default)]
     pub(super) seek_ms: Option<u64>,
+    /// #7894 — le type que le flux déclare pour l'épisode (`mime_type` des
+    /// épisodes listés). Facultatif : sans lui, l'extension de l'adresse, puis
+    /// l'hébergeur, le disent.
+    #[serde(default)]
+    pub(super) mime_type: Option<String>,
 }
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -798,7 +803,24 @@ pub(super) async fn play_episode(
         .as_ref()
         .is_some_and(|z| z.output_type.as_deref() == Some("browser"));
     let device_id = zone.and_then(|z| z.output_device_id);
-    let mime_type = guess_audio_mime(&body.audio_url);
+    let reseau = match device_id.as_deref() {
+        Some(did) => match { state.outputs.lock().await.get(did) } {
+            Some(arc) => tune_core::orchestrator::is_network_output_type(Some(
+                arc.lock().await.output_type(),
+            )),
+            None => false,
+        },
+        None => false,
+    };
+    let (mime_type, origine_du_type) =
+        type_de_l_episode(&state, body.mime_type.as_deref(), &body.audio_url, reseau).await;
+    info!(
+        zone_id,
+        mime_type = %mime_type,
+        origine = origine_du_type,
+        "podcast_type_annonce"
+    );
+    let mime_type = mime_type.as_str();
     // #5214 — la pochette « en cours », que Lecture en cours et l'Historique
     // du client reprennent : la vignette en cache quand elle existe. La sortie
     // (`PlayMedia` plus bas) garde l'URL distante, qu'un appareil de rendu va
@@ -1280,20 +1302,120 @@ async fn rf_episodes(
 }
 
 fn guess_audio_mime(url: &str) -> &'static str {
+    mime_par_extension(url).unwrap_or("audio/mpeg")
+}
+
+/// Le type que dit l'extension de l'adresse, ou `None` si elle ne dit rien.
+fn mime_par_extension(url: &str) -> Option<&'static str> {
     let lower = url.to_lowercase();
-    let path = lower.split('?').next().unwrap_or(&lower);
+    let path = lower.split(['?', '#']).next().unwrap_or(&lower);
     if path.ends_with(".mp3") {
-        "audio/mpeg"
+        Some("audio/mpeg")
     } else if path.ends_with(".m4a") || path.ends_with(".aac") || path.ends_with(".mp4") {
-        "audio/mp4"
+        Some("audio/mp4")
     } else if path.ends_with(".ogg") || path.ends_with(".opus") {
-        "audio/ogg"
+        Some("audio/ogg")
     } else if path.ends_with(".flac") {
-        "audio/flac"
+        Some("audio/flac")
     } else if path.ends_with(".wav") {
-        "audio/wav"
+        Some("audio/wav")
     } else {
-        "audio/mpeg"
+        None
+    }
+}
+
+/// #7894 — un type audio déclaré (flux RSS, hébergeur), ramené à
+/// l'orthographe qu'un appareil de rendu DLNA reconnaît ; `None` s'il ne
+/// désigne pas de l'audio.
+fn normaliser_type_audio(declare: &str) -> Option<String> {
+    let t = declare
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let t = match t.as_str() {
+        "audio/x-m4a" | "audio/m4a" | "audio/x-mp4" | "audio/aac-mp4" => "audio/mp4",
+        "audio/mp3" | "audio/x-mp3" | "audio/x-mpeg" | "audio/mpeg3" | "audio/x-mpeg-3" => {
+            "audio/mpeg"
+        }
+        "audio/x-wav" | "audio/wave" => "audio/wav",
+        "audio/x-flac" => "audio/flac",
+        autre if autre.starts_with("audio/") && autre.len() > "audio/".len() => autre,
+        _ => return None,
+    };
+    Some(t.to_string())
+}
+
+/// Délai borné de la question posée à l'hébergeur : elle retarde le départ.
+const DELAI_TYPE_DE_L_HEBERGEUR: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// #7894 — le type de l'épisode à annoncer à la sortie, et d'où il vient.
+///
+/// Le point 9 de #7778 : un épisode lancé sur un appareil DLNA « démarrait »
+/// sans un son, l'appareil retombait en `NO_MEDIA_PRESENT`. Le type était
+/// déduit de l'extension seule, `audio/mpeg` par défaut : un M4A servi sous
+/// une adresse sans extension partait annoncé MP3, et un renderer strict
+/// lâche une URI dont le type annoncé ne correspond pas. Ordre retenu :
+/// 1. le type que le flux déclare (`enclosure@type`), passé par le client ;
+/// 2. l'extension de l'adresse ;
+/// 3. pour un appareil réseau, le `Content-Type` que l'hébergeur rend, demandé
+///    une fois avec un délai borné ;
+/// 4. `audio/mpeg`, comme avant.
+async fn type_de_l_episode(
+    state: &AppState,
+    declare: Option<&str>,
+    url: &str,
+    reseau: bool,
+) -> (String, &'static str) {
+    if let Some(t) = declare.and_then(normaliser_type_audio) {
+        return (t, "flux");
+    }
+    if let Some(t) = mime_par_extension(url) {
+        return (t.to_string(), "extension");
+    }
+    if reseau && let Some(t) = type_de_l_hebergeur(&state.http_client, url).await {
+        return (t, "hebergeur");
+    }
+    ("audio/mpeg".to_string(), "defaut")
+}
+
+/// Le `Content-Type` audio que l'hébergeur rend pour `url` : un `HEAD`, puis
+/// un `GET` du premier octet si le `HEAD` est refusé. `None` sur échec, délai
+/// dépassé ou type qui n'est pas de l'audio.
+async fn type_de_l_hebergeur(client: &reqwest::Client, url: &str) -> Option<String> {
+    let lire = |r: reqwest::Response| {
+        r.status()
+            .is_success()
+            .then(|| {
+                r.headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(normaliser_type_audio)
+            })
+            .flatten()
+    };
+    if let Ok(r) = client
+        .head(url)
+        .timeout(DELAI_TYPE_DE_L_HEBERGEUR)
+        .send()
+        .await
+        && let Some(t) = lire(r)
+    {
+        return Some(t);
+    }
+    match client
+        .get(url)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .timeout(DELAI_TYPE_DE_L_HEBERGEUR)
+        .send()
+        .await
+    {
+        Ok(r) => lire(r),
+        Err(e) => {
+            warn!(error = %e, "podcast_type_hebergeur_illisible");
+            None
+        }
     }
 }
 #[cfg(test)]
@@ -1400,3 +1522,7 @@ mod tests {
 #[cfg(test)]
 #[path = "podcasts/reprise_navigateur_7354_tests.rs"]
 mod reprise_navigateur_7354_tests;
+
+#[cfg(test)]
+#[path = "podcasts/type_de_l_episode_7894_tests.rs"]
+mod type_de_l_episode_7894_tests;
