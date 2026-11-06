@@ -3847,13 +3847,37 @@ async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl 
     let device_id = get_zone_device_id(&state, zone_id);
     match state
         .orchestrator
-        .pause(zone_id, device_id.as_deref())
+        .pause_avec_issue(zone_id, device_id.as_deref())
         .await
     {
-        Ok(()) => Json(build_zone_json(&state, zone_id).await).into_response(),
+        Ok(tune_core::orchestrator::IssueDePause::EnPause) => {
+            Json(build_zone_json(&state, zone_id).await).into_response()
+        }
+        // #7894 — l'appareil ne jouait rien : la zone est arrêtée (reprise
+        // possible), et on le dit au lieu d'un 502.
+        Ok(tune_core::orchestrator::IssueDePause::RienNeJouait) => {
+            let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .map(|z| z.name)
+                .unwrap_or_else(|| format!("#{zone_id}"));
+            let mut corps = build_zone_json(&state, zone_id).await;
+            corps["code"] = json!("nothing_playing_on_device");
+            Json(crate::message_api::avec_message(
+                corps,
+                "api.playback.nothingPlayingOnDevice",
+                &[("zone", zone)],
+            ))
+            .into_response()
+        }
         Err(error) => echec_de_sortie_7823::reponse_d_echec_de_zone(&state, zone_id, error),
     }
 }
+
+#[cfg(test)]
+#[path = "playback/pause_sans_media_7894_tests.rs"]
+mod pause_sans_media_7894_tests;
 
 async fn resume(
     State(state): State<AppState>,
@@ -3895,7 +3919,14 @@ async fn resume(
             temp_file_path: None,
             sample_rate: None,
             bit_depth: None,
-            media_format: None,
+            // #7894 — un épisode garde le type retenu à son lancement : sous
+            // une adresse sans extension, l'orchestrateur ne saurait que
+            // l'annoncer MP3, et l'appareil retomberait en silence.
+            media_format: if np.source == "podcast" {
+                np.format.clone()
+            } else {
+                None
+            },
             track_number: None,
             disc_number: None,
             album_ref: None,
