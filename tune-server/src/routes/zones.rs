@@ -637,6 +637,7 @@ mod lecture;
 pub use lecture::*;
 mod presence;
 mod rattacher_asio_6120;
+mod sortie_reseau_absente_7279;
 mod tune_tested;
 // #7084 — zone AirPlay 2 servie sans son composant `airplay-daemon`.
 mod composant_airplay2_7084;

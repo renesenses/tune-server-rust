@@ -1691,6 +1691,13 @@ name = "pg_credits_source_7765"
 path = "tests/pg_credits_source_7765.rs"
 required-features = ["postgres"]
 
+# #7027 — une bio rangée sans langue (`bio_lang` vide ou NULL) n'est jamais
+# servie comme de l'anglais, sur PostgreSQL.
+[[test]]
+name = "pg_bio_langue_7027"
+path = "tests/pg_bio_langue_7027.rs"
+required-features = ["postgres"]
+
 # #5026 — la règle « Étiquette » élargie (pistes étiquetées, albums de service
 # étiquetés) sur PostgreSQL : aperçu, collection et compteur par le vrai routeur.
 [[test]]
@@ -1977,6 +1984,12 @@ path = "tests/ecoutes_communaute_6738.rs"
 [[test]]
 name = "groupe_dlna_joue_sur_les_deux_6155"
 path = "tests/groupe_dlna_joue_sur_les_deux_6155.rs"
+
+# #7937 — un groupe défait ne revient ni par une zone recréée, ni par un
+# regroupement, ni au redémarrage.
+[[test]]
+name = "degrouper_zones_7937"
+path = "tests/degrouper_zones_7937.rs"
 
 # #7077, seconde passe — un refus jadis composé en français suit la langue de
 # l'interface (code stable + phrase traduite). `autotests = false` plus haut :
