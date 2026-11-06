@@ -1697,6 +1697,13 @@ name = "pg_credits_source_7765"
 path = "tests/pg_credits_source_7765.rs"
 required-features = ["postgres"]
 
+# #7027 — une bio rangée sans langue (`bio_lang` vide ou NULL) n'est jamais
+# servie comme de l'anglais, sur PostgreSQL.
+[[test]]
+name = "pg_bio_langue_7027"
+path = "tests/pg_bio_langue_7027.rs"
+required-features = ["postgres"]
+
 # #5026 — la règle « Étiquette » élargie (pistes étiquetées, albums de service
 # étiquetés) sur PostgreSQL : aperçu, collection et compteur par le vrai routeur.
 [[test]]
@@ -1935,6 +1942,12 @@ path = "tests/requete_textuelle_6287.rs"
 name = "services_remplacables_6336"
 path = "tests/services_remplacables_6336.rs"
 
+# #7447 — le bouton « Pair » d'Audio / Network Devices contre un faux démon
+# AirPlay 2. Binaire à lui seul, pour la même raison que le banc #6336.
+[[test]]
+name = "jumelage_airplay2_7447"
+path = "tests/jumelage_airplay2_7447.rs"
+
 # #4681 — « ce qui tourne » (`GET /system/background-tasks/running`) par le
 # vrai routeur. Binaire à lui seul : le témoin de lecture et l'avancement de
 # la cascade sont des états de PROCESSUS.
@@ -1958,6 +1971,10 @@ path = "tests/licence_sso_remplacables_6336.rs"
 name = "profils_panne_de_base_6454"
 path = "tests/profils_panne_de_base_6454.rs"
 
+[[test]]
+name = "politique_parentale_7856"
+path = "tests/politique_parentale_7856.rs"
+
 # #6212 / #6634 — la gravure du Dynamic Range cède à la lecture et n'écrit pas
 # dans le fichier joué, par la route montée. Binaire à lui seul : le témoin de
 # lecture et la politique des freins sont des états de PROCESSUS. `autotests =
@@ -1979,6 +1996,12 @@ path = "tests/ecoutes_communaute_6738.rs"
 [[test]]
 name = "groupe_dlna_joue_sur_les_deux_6155"
 path = "tests/groupe_dlna_joue_sur_les_deux_6155.rs"
+
+# #7937 — un groupe défait ne revient ni par une zone recréée, ni par un
+# regroupement, ni au redémarrage.
+[[test]]
+name = "degrouper_zones_7937"
+path = "tests/degrouper_zones_7937.rs"
 
 # #7077, seconde passe — un refus jadis composé en français suit la langue de
 # l'interface (code stable + phrase traduite). `autotests = false` plus haut :

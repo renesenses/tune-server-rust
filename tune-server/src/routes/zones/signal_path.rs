@@ -3078,8 +3078,20 @@ fn relever_les_traitements_lang(
     // face à un curseur ailleurs, jusqu'à ce qu'on touche le volume — le PUT
     // réécrit alors les deux sources (#1504 Jean Valjean, même symptôme
     // Bebelalu55 #1480). Une seule source pour les deux affichages.
-    let ui_volume = (zone.volume / 100.0).clamp(0.0, 1.0);
-    let volume_full = zone.fixed_volume || ui_volume >= 1.0 || ui_volume <= 0.0; // 0.0 means no software vol set
+    //
+    // #7762 — « une seule source » veut aussi dire « la même LECTURE » :
+    // `zone.volume` est le GAIN (#6787), et la page le montre comme POSITION
+    // du curseur de la zone. Sur une sortie logicielle (curseur `db60`), 50 %
+    // du curseur valent −30 dB, soit un gain de 0,0316 : l'étape affichait
+    // « Volume logiciel 3 % » face au curseur à 50 % (rc10, WASAPI exclusif,
+    // fil 2623). On affiche la position, lue par la même loi que
+    // `volume_curve` (`EchelleDeVolume::de_la_sortie`) ; une sortie réseau
+    // reste linéaire, son curseur EST le nombre envoyé.
+    let gain = (zone.volume / 100.0).clamp(0.0, 1.0);
+    let ui_volume =
+        tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(zone.output_type.as_deref())
+            .position(gain);
+    let volume_full = zone.fixed_volume || gain >= 1.0 || gain <= 0.0; // 0.0 means no software vol set
     Traitements {
         configured_dsp_enabled,
         dsp_enabled,
