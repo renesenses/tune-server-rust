@@ -57,6 +57,8 @@ mod labels;
 /// #6481 — le livret PDF rangé dans le dossier d'un album.
 mod livrets;
 mod lyrics_pass;
+/// #7849 — notes personnelles en Markdown (artiste, album, piste).
+mod notes;
 mod proposals;
 mod query_multi;
 mod ratings;
@@ -124,6 +126,15 @@ pub(super) fn api_cache_get(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     key: &str,
 ) -> Option<Value> {
+    api_cache_get_ttl(backend, key, API_CACHE_TTL_SECS)
+}
+
+/// Comme [`api_cache_get`], avec une durée de vie choisie par l'appelant.
+pub(super) fn api_cache_get_ttl(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    key: &str,
+    ttl_secs: i64,
+) -> Option<Value> {
     use tune_core::db::backend::ToSqlValue;
     use tune_core::db::engine::Engine;
     // `strftime` n'existe pas sur PostgreSQL : la requête SQLite y tombait
@@ -139,13 +150,13 @@ pub(super) fn api_cache_get(
         Engine::Sqlite => backend.query_one(
             "SELECT value FROM settings WHERE key = ? AND \
              CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', updated_at) AS INTEGER) < ?",
-            &[&key as &dyn ToSqlValue, &API_CACHE_TTL_SECS as &dyn ToSqlValue],
+            &[&key as &dyn ToSqlValue, &ttl_secs as &dyn ToSqlValue],
         ),
         Engine::Postgres => backend.query_one(
             "SELECT value FROM settings WHERE key = $1 AND updated_at > \
              to_char((now() - make_interval(secs => CAST($2 AS DOUBLE PRECISION))) \
              AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
-            &[&key as &dyn ToSqlValue, &API_CACHE_TTL_SECS as &dyn ToSqlValue],
+            &[&key as &dyn ToSqlValue, &ttl_secs as &dyn ToSqlValue],
         ),
     }
     .ok()?
@@ -782,6 +793,14 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/lyrics", get(tracks::track_lyrics))
         .route("/ratings/export", get(ratings::export_ratings))
         .route("/ratings/import", post(ratings::import_ratings))
+        // #7849 — notes personnelles, privées au profil de l'appelant.
+        .route("/notes", get(notes::list_notes))
+        .route(
+            "/notes/{item_type}/{item_id}",
+            get(notes::get_note)
+                .put(notes::put_note)
+                .delete(notes::delete_note),
+        )
         // Lot 2 de l'enrichissement d'après MetaRust (#4805) : les passes de
         // lot, à la main. Suspendues par la tâche de fond `enrichment`.
         .route("/bpm-all", post(passes_metarust::bpm_lot_start))
@@ -973,6 +992,9 @@ mod routage_tests {
 mod banc_rail_5993;
 
 #[cfg(test)]
+#[path = "curseur_7619_tests.rs"]
+mod curseur_7619_tests;
+#[cfg(test)]
 #[path = "facettes_lentes_2144_tests.rs"]
 mod facettes_lentes_2144_tests;
 
@@ -983,6 +1005,10 @@ mod liste_dr_7580_tests;
 #[cfg(test)]
 #[path = "filtre_qualite_7725_tests.rs"]
 mod filtre_qualite_7725_tests;
+
+#[cfg(test)]
+#[path = "notes_et_repartitions_7849_tests.rs"]
+mod notes_et_repartitions_7849_tests;
 
 #[cfg(test)]
 #[path = "banc_repertoires_5998.rs"]

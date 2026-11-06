@@ -2654,6 +2654,10 @@ mod ringbuf_tests;
 #[cfg(test)]
 mod horloge_du_pilote_muet_3814;
 
+// #7703 — la quantification finale native est dithérée, après le volume.
+#[cfg(test)]
+mod quantification_finale_7703;
+
 /// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
 ///
 /// `decode_compressed_stream` rendait `None` pour QUATRE causes distinctes, et
@@ -4131,6 +4135,27 @@ pub(crate) fn native_i32_to_pcm_bytes(samples: &[i32], bit_depth: u16, out: &mut
     count * bytes_per_sample
 }
 
+/// La quantification FINALE des chemins natifs exclusifs (WASAPI, route native
+/// ASIO, queue du DSP et reliquat de l'étage natif) : les flottants y arrivent
+/// après le DSP et après le volume logiciel, et repartent en mots de la
+/// profondeur de la source.
+///
+/// #7703 — c'était un arrondi nu. À volume réduit, une piste 16 bits
+/// requantifiée à 16 bits sans dither garde une erreur CORRÉLÉE au signal :
+/// à −30 dB il ne reste que quelques bits utiles, et la distorsion de
+/// quantification s'entend dans les fins de notes (prérequis 1 de la note
+/// « Upsampler Pro », #7614 : le gain en flottant, puis le dither comme
+/// dernière opération avant le puits). Le TPDF ±1 LSB du dépôt
+/// (`audio::dither`) s'ajoute désormais AVANT l'arrondi, à 16 et 24 bits.
+///
+/// À 32 bits, rien : un `f32` n'a que 24 bits de mantisse, le mot 32 bits est
+/// déjà plus fin que le signal qu'il porte (réponse Q6 de la note : TPDF seul,
+/// et à 24 bits).
+///
+/// Le chemin bit-perfect ne passe jamais ici (`pcm_bytes_to_native_i32`), le
+/// DoP non plus : aucun bruit n'est ajouté à un flux que Tune ne modifie pas.
+/// La graine dérive du contenu du bloc (même règle que `Dither::depuis_contenu`) :
+/// même bloc, même bruit, et aucune raie à la période du bloc.
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn f32_to_native_i32(samples: &[f32], bit_depth: u16) -> Vec<i32> {
     let (scale, max, shift) = match bit_depth {
@@ -4140,13 +4165,45 @@ fn f32_to_native_i32(samples: &[f32], bit_depth: u16) -> Vec<i32> {
         _ => return Vec::new(),
     };
     let min = -scale;
+    // « Pas de requantification, pas de dither » (règle de `audio::dither`) :
+    // un bloc dont chaque échantillon tombe déjà sur un mot exact — gain
+    // unité, matrice qui choisit ou coupe des voies, reliquat porté tel quel —
+    // sort à l'identité, sans bruit. Décidé par BLOC, pas par échantillon :
+    // dans un bloc réellement requantifié, tous les échantillons reçoivent le
+    // même bruit, et sa puissance ne dépend pas du signal.
+    let exact = samples
+        .iter()
+        .all(|s| (f64::from(*s) * scale).fract() == 0.0);
+    let mut dither = (bit_depth < 32 && !exact)
+        .then(|| crate::audio::dither::Dither::depuis_graine(graine_du_bloc_flottant(samples)));
     samples
         .iter()
         .map(|sample| {
-            let word = (f64::from(*sample) * scale).round().clamp(min, max) as i64;
+            let ideal = f64::from(*sample) * scale;
+            let bruit = dither.as_mut().map_or(0.0, |d| d.tirer());
+            let word = crate::audio::dither::quantifier_avec(ideal, bruit, min, max);
             (word << shift) as i32
         })
         .collect()
+}
+
+/// #7703 — graine du dither de [`f32_to_native_i32`] : FNV-1a sur la longueur
+/// et au plus 256 échantillons prélevés à pas constant. Bornée : le rendu ne
+/// lit pas tout le bloc pour tirer une graine.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+fn graine_du_bloc_flottant(samples: &[f32]) -> u64 {
+    const PREMIER: u64 = 0x0000_0100_0000_01b3;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ 0x4e41_5449_4600_7703;
+    for octet in (samples.len() as u64).to_le_bytes() {
+        h = (h ^ u64::from(octet)).wrapping_mul(PREMIER);
+    }
+    let pas = samples.len().div_ceil(256).max(1);
+    for s in samples.iter().step_by(pas) {
+        for octet in s.to_bits().to_le_bytes() {
+            h = (h ^ u64::from(octet)).wrapping_mul(PREMIER);
+        }
+    }
+    h
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux", test))]

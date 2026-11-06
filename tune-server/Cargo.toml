@@ -287,6 +287,11 @@ path = "tests/sendspin_mode_transition.rs"
 [[test]]
 name = "agent_tune_4626"
 path = "tests/agent_tune_4626.rs"
+# #7855 — le socle Subsonic : réglage, licence, clés, garde de `/rest`.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "subsonic_socle_7855"
+path = "tests/subsonic_socle_7855.rs"
 
 # #7335 — les écritures des dossiers de collections refusées par la base ne
 # répondent plus 201/200. Cible propre (pas un `mod` de `server_contracts`) :
@@ -1679,6 +1684,20 @@ name = "pg_credits_4984"
 path = "tests/pg_credits_4984.rs"
 required-features = ["postgres"]
 
+# #7765 — la source des crédits de piste sur PostgreSQL : migration 102 et son
+# attribution, écriture MusicBrainz qui garde les balises, filtres « à faire ».
+[[test]]
+name = "pg_credits_source_7765"
+path = "tests/pg_credits_source_7765.rs"
+required-features = ["postgres"]
+
+# #7027 — une bio rangée sans langue (`bio_lang` vide ou NULL) n'est jamais
+# servie comme de l'anglais, sur PostgreSQL.
+[[test]]
+name = "pg_bio_langue_7027"
+path = "tests/pg_bio_langue_7027.rs"
+required-features = ["postgres"]
+
 # #5026 — la règle « Étiquette » élargie (pistes étiquetées, albums de service
 # étiquetés) sur PostgreSQL : aperçu, collection et compteur par le vrai routeur.
 [[test]]
@@ -1940,6 +1959,10 @@ path = "tests/licence_sso_remplacables_6336.rs"
 name = "profils_panne_de_base_6454"
 path = "tests/profils_panne_de_base_6454.rs"
 
+[[test]]
+name = "politique_parentale_7856"
+path = "tests/politique_parentale_7856.rs"
+
 # #6212 / #6634 — la gravure du Dynamic Range cède à la lecture et n'écrit pas
 # dans le fichier joué, par la route montée. Binaire à lui seul : le témoin de
 # lecture et la politique des freins sont des états de PROCESSUS. `autotests =
@@ -1961,6 +1984,12 @@ path = "tests/ecoutes_communaute_6738.rs"
 [[test]]
 name = "groupe_dlna_joue_sur_les_deux_6155"
 path = "tests/groupe_dlna_joue_sur_les_deux_6155.rs"
+
+# #7937 — un groupe défait ne revient ni par une zone recréée, ni par un
+# regroupement, ni au redémarrage.
+[[test]]
+name = "degrouper_zones_7937"
+path = "tests/degrouper_zones_7937.rs"
 
 # #7077, seconde passe — un refus jadis composé en français suit la langue de
 # l'interface (code stable + phrase traduite). `autotests = false` plus haut :

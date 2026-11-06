@@ -798,10 +798,12 @@ pub fn rejeter(backend: &Arc<dyn DbBackend>, album_id: i64, discogs_id: u64) -> 
     Ok(())
 }
 
+/// Les crédits qui comptent : #7765, ceux lus dans les balises n'empêchent
+/// pas Discogs de créditer la piste.
 fn nombre_de_credits(backend: &Arc<dyn DbBackend>, track_id: i64) -> i64 {
     backend
         .query_one(
-            "SELECT COUNT(*) FROM track_credits WHERE track_id = ?",
+            super::source_des_credits::CREDITS_D_UNE_PISTE,
             &[&track_id as &dyn ToSqlValue],
         )
         .ok()
@@ -854,7 +856,13 @@ fn crediter_les_pistes_sans_credit(
         if mb[i].lignes.is_empty() || nombre_de_credits(backend, track_id) > 0 {
             continue;
         }
-        if ecrire_credits_piste(backend, track_id, &mb[i].lignes) > 0 {
+        if ecrire_credits_piste(
+            backend,
+            track_id,
+            super::source_des_credits::DISCOGS,
+            &mb[i].lignes,
+        ) > 0
+        {
             n += 1;
         }
     }
@@ -1153,6 +1161,53 @@ mod tests {
         assert_eq!(
             chercher_par(&b, 5, transport_enregistre).await.unwrap_err(),
             Empechement::DejaIdentifie
+        );
+    }
+
+    /// #7765 — une piste qui n'a que des crédits lus dans les BALISES reçoit
+    /// les crédits Discogs, posés `discogs` ; sa ligne de balises reste. Une
+    /// piste déjà créditée par MusicBrainz n'est pas touchée.
+    #[tokio::test]
+    async fn une_piste_creditee_par_ses_seules_balises_recoit_les_credits_discogs() {
+        use crate::metadata::source_des_credits::{BALISES, DISCOGS};
+        let b = base();
+        album_sans_mbid(&b);
+        b.execute_batch(
+            "INSERT INTO track_credits (track_id, artist_name, role, source) VALUES
+                (50, 'Rick Astley', 'performer', 'balises'),
+                (51, 'Rick Astley', 'performer', 'musicbrainz');",
+        )
+        .unwrap();
+        chercher_par(&b, 5, transport_enregistre).await.unwrap();
+        let bilan = accepter(&b, 5, 249504, true).unwrap();
+        assert_eq!(
+            bilan.pistes_creditees, 1,
+            "piste 50 « Never Gonna Give You Up » : ses seuls crédits de balises la font passer pour déjà créditée"
+        );
+        let sources = |id: i64| -> Vec<Option<String>> {
+            b.query_many(
+                "SELECT source FROM track_credits WHERE track_id = ? ORDER BY id",
+                &[&id as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r.first().and_then(|v| v.as_string()))
+            .collect()
+        };
+        let s50 = sources(50);
+        assert_eq!(
+            s50.first().cloned().flatten().as_deref(),
+            Some(BALISES),
+            "{s50:?}"
+        );
+        assert!(
+            s50.len() > 1 && s50[1..].iter().all(|s| s.as_deref() == Some(DISCOGS)),
+            "piste 50 : les crédits Discogs doivent porter `discogs` : {s50:?}"
+        );
+        assert_eq!(
+            sources(51).len(),
+            1,
+            "piste 51 déjà créditée : rien d'ajouté"
         );
     }
 }
