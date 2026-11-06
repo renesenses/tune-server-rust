@@ -2038,7 +2038,8 @@ impl PlaybackOrchestrator {
 
     /// #7932 — la piste en cours de la zone, pour
     /// [`Self::poser_ce_que_pure_contourne`]. À lire AVANT le verrou de la
-    /// sortie : `get_state` prend ses propres verrous.
+    /// sortie, et après avoir relâché celui du registre `outputs` :
+    /// `get_state` prend ses propres verrous.
     #[cfg(feature = "local-audio")]
     async fn piste_en_cours(&self, zone_id: i64) -> Option<i64> {
         self.playback
@@ -2851,6 +2852,11 @@ impl PlaybackOrchestrator {
             );
             let armee = matrice.is_some();
             local_output.set_reaffectation(matrice);
+            // #7932 — le verdict PURE dépend de la règle d'album de la piste :
+            // à l'avance sans blanc (`advance_queue_metadata`), seul chemin
+            // qui change de piste sans `send_to_output`, et après une règle
+            // modifiée à chaud, il est reposé pour la piste qui joue.
+            self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
             // #6230 — une règle qui change le nombre de voies (6 → 6 devenue
             // 6 → 2, ou retirée après une ouverture pilotée) rouvre la sortie.
             let rouvrir = self.les_voies_imposent_de_rouvrir(zone_id, local_output);

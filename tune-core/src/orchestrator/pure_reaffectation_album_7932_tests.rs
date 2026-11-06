@@ -174,3 +174,127 @@ async fn une_regle_d_album_qui_ne_s_applique_pas_reste_rien_a_contourner_7932() 
         );
     }
 }
+
+/// Le verdict que le sondeur lit au bloc suivant, sans rien basculer.
+async fn verdict_publie(orch: &PlaybackOrchestrator) -> OutputDspState {
+    let arc = orch.outputs.lock().await.get(SORTIE).unwrap();
+    let sortie = arc.lock().await;
+    let local = sortie
+        .as_any()
+        .downcast_ref::<crate::outputs::local::LocalOutput>()
+        .unwrap();
+    local.publier_le_contrat_pour_test();
+    local.signal_path_status().unwrap().dsp
+}
+
+/// Une deuxième piste stéréo, sur l'album 2, et la file « piste 1, piste 2 »
+/// de la zone : de quoi enchaîner sans blanc d'un album à l'autre.
+fn file_de_deux_albums(orch: &PlaybackOrchestrator, zone_id: i64) {
+    let chemin = "/nulle/part/piste2.flac".to_string();
+    orch.db
+        .execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+             duration_ms, sample_rate, bit_depth, channels) \
+             VALUES (2, 'Piste 2', 2, 1, ?, 'flac', 60000, 44100, 16, 2)",
+            &[&chemin as &dyn ToSqlValue],
+        )
+        .unwrap();
+    crate::db::play_queue_repo::PlayQueueRepo::with_backend(orch.db.clone())
+        .set_queue(zone_id, &[1, 2])
+        .unwrap();
+}
+
+/// Revue de la PR 7976 — l'avance sans blanc (`advance_queue_metadata`)
+/// change de piste sans passer par `send_to_output` : le verdict, qui dépend
+/// désormais de l'album joué, doit y être reposé. Album réglé puis album sans
+/// règle : « rien à contourner » sur le second (le choix de #4176).
+#[tokio::test]
+async fn l_avance_sans_blanc_vers_un_album_sans_regle_repose_le_verdict_7932() {
+    let orch = orchestrateur();
+    bibliotheque(&orch);
+    let zone_id = zone_locale_qui_joue(&orch).await;
+    file_de_deux_albums(&orch, zone_id);
+    SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &crate::audio::reaffectation_canaux::cle_d_album(1),
+            REGLE_ECHANGE,
+        )
+        .unwrap();
+    assert_eq!(
+        verdict_apres_la_bascule_pure(&orch, zone_id).await,
+        OutputDspState::BypassedPure,
+        "départ : l'album 1 a sa règle, PURE la coupe"
+    );
+
+    orch.advance_queue_metadata(zone_id, 1).await.unwrap();
+
+    assert_eq!(
+        verdict_publie(&orch).await,
+        OutputDspState::PureSansObjet,
+        "#7932 : après l'avance sans blanc vers l'album 2, sans règle, le \
+         verdict de l'album 1 est resté affiché (« contourné ») au lieu de \
+         « rien à contourner »"
+    );
+}
+
+/// Le sens inverse : album sans règle puis album réglé — l'icône ne doit pas
+/// rester vide sur le second (le défaut #7932 lui-même).
+#[tokio::test]
+async fn l_avance_sans_blanc_vers_un_album_regle_repose_le_verdict_7932() {
+    let orch = orchestrateur();
+    bibliotheque(&orch);
+    let zone_id = zone_locale_qui_joue(&orch).await;
+    file_de_deux_albums(&orch, zone_id);
+    SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &crate::audio::reaffectation_canaux::cle_d_album(2),
+            REGLE_ECHANGE,
+        )
+        .unwrap();
+    assert_eq!(
+        verdict_apres_la_bascule_pure(&orch, zone_id).await,
+        OutputDspState::PureSansObjet,
+        "départ : l'album 1 n'a pas de règle, rien à contourner"
+    );
+
+    orch.advance_queue_metadata(zone_id, 1).await.unwrap();
+
+    assert_eq!(
+        verdict_publie(&orch).await,
+        OutputDspState::BypassedPure,
+        "#7932 : après l'avance sans blanc vers l'album 2, réglé, le verdict de \
+         l'album 1 est resté affiché (« rien à contourner ») alors que PURE \
+         coupe la règle de l'album 2"
+    );
+}
+
+/// Le départ d'une lecture sous PURE déjà actif (`send_to_output`) pose le
+/// verdict avec la piste qu'il lance, sans bascule PURE.
+#[tokio::test]
+async fn le_depart_de_lecture_pose_le_verdict_de_l_album_lance_7932() {
+    let orch = orchestrateur();
+    bibliotheque(&orch);
+    let zone_id = zone_locale_qui_joue(&orch).await;
+    SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &crate::audio::reaffectation_canaux::cle_d_album(1),
+            REGLE_ECHANGE,
+        )
+        .unwrap();
+    {
+        let arc = orch.outputs.lock().await.get(SORTIE).unwrap();
+        let sortie = arc.lock().await;
+        let local = sortie
+            .as_any()
+            .downcast_ref::<crate::outputs::local::LocalOutput>()
+            .unwrap();
+        local.set_pure_bypass(true);
+        orch.poser_ce_que_pure_contourne(zone_id, Some(1), local);
+    }
+    assert_eq!(
+        verdict_publie(&orch).await,
+        OutputDspState::BypassedPure,
+        "#7932 : au départ de la lecture d'un album réglé sous PURE, le verdict \
+         doit dire « contourné »"
+    );
+}
