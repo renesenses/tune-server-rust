@@ -88,11 +88,9 @@ pub fn score(d: &Disque, c: &AlbumDeService, par: Requete) -> u32 {
     } else {
         let (a, b) = (mots(&d.titre), mots(&c.titre));
         let union = a.union(&b).count();
-        if union == 0 {
-            0
-        } else {
-            (a.intersection(&b).count() * 50 / union) as u32
-        }
+        (a.intersection(&b).count() * 50)
+            .checked_div(union)
+            .unwrap_or(0) as u32
     };
     let artiste = if cles_d_artiste(d).contains(&artiste_normalise(&c.artiste)) {
         30
@@ -170,7 +168,7 @@ impl Moteur {
                     break;
                 }
             }
-            du_service.sort_by(|a, b| (b.exact, b.score).cmp(&(a.exact, a.score)));
+            du_service.sort_by_key(|p| std::cmp::Reverse((p.exact, p.score)));
             du_service.retain(|p| p.score > 0);
             du_service.truncate(CANDIDATS_PAR_SERVICE);
             resultat.propositions.extend(du_service);
@@ -178,7 +176,7 @@ impl Moteur {
         // Stable : à égalité, l'ordre des services.
         resultat
             .propositions
-            .sort_by(|a, b| (b.exact, b.score).cmp(&(a.exact, a.score)));
+            .sort_by_key(|p| std::cmp::Reverse((p.exact, p.score)));
         tracing::info!(
             target: "plugin",
             release,

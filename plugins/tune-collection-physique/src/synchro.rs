@@ -137,11 +137,8 @@ pub trait Hote: Send + Sync {
     async fn image_discogs(&self, url: &str) -> Result<Image, Panne>;
     /// Les services connectés où « Chercher sur les services » (#7928)
     /// cherche un disque : tous ceux qui ont une recherche d'albums (Qobuz,
-    /// TIDAL, Spotify, Deezer…), pas seulement ceux de [`SERVICES`]. Par
-    /// défaut, ceux de [`SERVICES`].
-    async fn services_de_recherche(&self) -> Vec<String> {
-        self.services_connectes().await
-    }
+    /// TIDAL, Spotify, Deezer…), pas seulement ceux de [`SERVICES`].
+    async fn services_de_recherche(&self) -> Vec<String>;
 }
 
 /// L'espacement des appels du greffon.
