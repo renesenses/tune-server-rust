@@ -173,25 +173,35 @@ pub(super) fn rendre_une_periode_native_s32(
     min_buffer_samples: usize,
     output: &mut [i32],
 ) -> usize {
+    use crate::audio::dop_continu::{haut_i32, repos_i32};
     ramp.arm(armed_ms);
     let silence = paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed);
+    // #7704 — sur un porteur DoP : trames de repos, jamais des zéros.
     if ramp.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-        output.fill(0);
+        ramp.dop.combler(output, 0, repos_i32);
         ring.starvation.record_silent_period(output.len());
         return 0;
     }
     if !data_started.load(Ordering::Acquire) {
         if ring.available() < min_buffer_samples {
-            output.fill(0);
+            ramp.dop.combler(output, 0, repos_i32);
             ring.starvation.record_silent_period(output.len());
             return 0;
         }
         data_started.store(true, Ordering::Release);
     }
-    let read = ring.pop(output);
+    let debut = ramp
+        .dop
+        .raccorder(ring.premier_en_attente(), output, haut_i32, repos_i32);
+    if debut > 0 {
+        ring.starvation.record_silent_period(debut);
+    }
+    let read = ring.pop(&mut output[debut..]);
+    let fin = debut + read;
+    ramp.dop.observer(&output[debut..fin], haut_i32);
     let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
-    ramp.apply_i32(&mut output[..read], v);
-    output[read..].fill(0);
+    ramp.apply_i32(&mut output[debut..fin], v);
+    ramp.dop.combler(&mut output[fin..], 0, repos_i32);
     read
 }
 
@@ -762,3 +772,8 @@ pub(super) fn jouer_via_alsa_natif(mut backend: BackendAlsaNatif<'_>, ctx: Conte
 #[cfg(test)]
 #[path = "chemin_natif_s32_6734.rs"]
 mod chemin_natif_s32_6734;
+
+// #7704 — le rappel S32 garde le porteur DoP continu.
+#[cfg(test)]
+#[path = "dop_continu_s32_7704.rs"]
+mod dop_continu_s32_7704;

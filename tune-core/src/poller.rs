@@ -1150,6 +1150,14 @@ mod releve_ne_monte_pas_6739;
 /// #6739 — ses témoins, sur le vrai sondeur et le vrai orchestrateur.
 #[cfg(test)]
 mod releve_ne_monte_pas_6739_tests;
+/// #6721 — le relevé de l'appareil devient le repère de la garde de hausse.
+#[cfg(test)]
+mod repere_de_hausse_6721_tests;
+/// #8031 — un relevé pendant la sourdine n'est ni adopté ni pris pour repère.
+mod sourdine_8031;
+/// #8031 — ses témoins, sur le vrai sondeur et le vrai orchestrateur.
+#[cfg(test)]
+mod sourdine_8031_tests;
 /// #5662 — un renderer à 100 % ignoré par l'adoption est signalé au journal.
 mod volume_100_ignore_5662;
 /// #6008 — l'adoption du volume du renderer est dite au journal.
