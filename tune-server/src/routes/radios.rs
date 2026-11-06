@@ -1992,19 +1992,24 @@ pub(crate) async fn jouer_un_flux(
 
     // #7717 — une radio lancée sur une zone d'un groupe en fait la meneuse
     // (« Mes radios » comme l'annuaire). La réponse est un 200 même quand la
-    // radio ne part pas : la tête se rend ici, sur l'échec.
+    // radio ne part pas : la tête se rend ici, sur l'échec ou le refus de la
+    // sortie.
     let remplacees =
         crate::routes::zones::relais_de_groupe_6155::prendre_la_tete_du_groupe(state, zone_id);
-    let (output_sent, output_error, stream_url) = match state.orchestrator.play(play_req).await {
+    let lancement = state.orchestrator.play(play_req).await;
+    let partie = lancement
+        .as_ref()
+        .is_ok_and(|result| result.sortie_refusee().is_none());
+    if !partie {
+        crate::routes::zones::relais_de_groupe_6155::rendre_la_tete_du_groupe(
+            state,
+            zone_id,
+            &remplacees,
+        );
+    }
+    let (output_sent, output_error, stream_url) = match lancement {
         Ok(result) => (result.output_sent, result.error, result.stream_url),
-        Err(e) => {
-            crate::routes::zones::relais_de_groupe_6155::rendre_la_tete_du_groupe(
-                state,
-                zone_id,
-                &remplacees,
-            );
-            (false, Some(e), None)
-        }
+        Err(e) => (false, Some(e), None),
     };
 
     // #3164 — meme regle que les charges utiles de zone : cette reponse rendait
