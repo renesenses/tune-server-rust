@@ -22,10 +22,18 @@ use tune_core::taches_de_fond::avancement;
 
 const PISTES: i64 = 6;
 
+/// Les deux témoins lisent l'avancement, un état de PROCESSUS : ils ne
+/// tournent jamais en même temps.
+static UN_A_LA_FOIS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Des pistes FLAC dont le fichier répond et reste indécodable : chacune
 /// traverse la passe des empreintes (marque « pas d'empreinte possible »)
 /// sans qu'aucun décodeur ne travaille longtemps.
 fn bibliotheque(dossier: &std::path::Path) -> Arc<dyn DbBackend> {
+    bibliotheque_de(dossier, PISTES)
+}
+
+fn bibliotheque_de(dossier: &std::path::Path, pistes: i64) -> Arc<dyn DbBackend> {
     let db = SqliteDb::open_in_memory().expect("base mémoire");
     db.execute_batch(
         "CREATE TABLE zones (id INTEGER PRIMARY KEY, name TEXT, last_play_state TEXT);
@@ -38,7 +46,7 @@ fn bibliotheque(dossier: &std::path::Path) -> Arc<dyn DbBackend> {
                                       value TEXT NOT NULL, PRIMARY KEY (track_id, key));",
     )
     .expect("schéma");
-    for i in 1..=PISTES {
+    for i in 1..=pistes {
         let fichier = dossier.join(format!("{i}.flac"));
         std::fs::write(&fichier, b"pas du flac").expect("fichier temoin");
         let chemin = fichier.to_string_lossy().to_string();
@@ -54,6 +62,7 @@ fn bibliotheque(dossier: &std::path::Path) -> Arc<dyn DbBackend> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn les_empreintes_publient_leur_avancement_replaygain_coupe_7915() {
+    let _seul = UN_A_LA_FOIS.lock().await;
     avancement::reinitialiser_pour_les_essais();
     let tmp = tempfile::tempdir().expect("dossier temporaire");
     let backend = bibliotheque(tmp.path());
@@ -94,4 +103,67 @@ async fn les_empreintes_publient_leur_avancement_replaygain_coupe_7915() {
     assert!(!fin.active, "la campagne doit se fermer au repos : {fin:?}");
     assert_eq!(fin.processed, PISTES, "{fin:?}");
     assert_eq!(fin.remaining, 0, "{fin:?}");
+}
+
+/// Les pistes de la base simulée volumineuse.
+const PISTES_D_UNE_GROSSE_BASE: i64 = 2_000;
+
+/// #7915, consigne du 05/11 — chercher une passe qui recommence sans fin
+/// après le scan, sur une base volumineuse simulée.
+///
+/// La vraie cascade tourne, ReplayGain coupé, jusqu'au repos sur 2 000 pistes
+/// (80 lots de 25 par passe). Si une passe reprenait des pistes déjà traitées
+/// (marque non posée, sélection qui repart du début sans rien retirer), le
+/// total des pistes rendues par les tours dépasserait les candidates, la
+/// campagne compterait plus que son total, ou le repos ne viendrait jamais.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_grosse_base_va_au_repos_sans_reprendre_une_piste_7915() {
+    let _seul = UN_A_LA_FOIS.lock().await;
+    avancement::reinitialiser_pour_les_essais();
+    let tmp = tempfile::tempdir().expect("dossier temporaire");
+    let backend = bibliotheque_de(tmp.path(), PISTES_D_UNE_GROSSE_BASE);
+
+    // Deux passes (empreintes, puis plage dynamique), 80 lots chacune : une
+    // marge large, mais finie. Au-delà, la cascade ne s'arrête pas.
+    let tours_permis = 4 * (PISTES_D_UNE_GROSSE_BASE as usize / 25) + 20;
+    let mut rendues = 0usize;
+    let mut tours = 0usize;
+    loop {
+        match un_tour_de_cascade(&backend).await {
+            TourDeCascade::Travail(n) => rendues += n,
+            TourDeCascade::Repos => break,
+            autre => panic!("aucune pause n'est posée : {autre:?}"),
+        }
+        tours += 1;
+        assert!(
+            tours <= tours_permis,
+            "🔴 LA CASCADE NE S'ARRÊTE PAS (#7915) : {tours} tours, {rendues} pistes \
+             rendues pour {PISTES_D_UNE_GROSSE_BASE} pistes — une passe reprend sans fin \
+             les mêmes pistes."
+        );
+    }
+
+    let empreintes = avancement::releve(Tache::Empreintes).expect("campagne des empreintes");
+    let dr = avancement::releve(Tache::PlageDynamique).expect("campagne de la plage dynamique");
+    for (nom, c) in [("empreintes", &empreintes), ("plage dynamique", &dr)] {
+        assert!(!c.active, "{nom} : la campagne se ferme au repos : {c:?}");
+        assert_eq!(
+            c.total, PISTES_D_UNE_GROSSE_BASE,
+            "{nom} : le total compte toutes les pistes, une fois : {c:?}"
+        );
+        assert_eq!(
+            c.processed, PISTES_D_UNE_GROSSE_BASE,
+            "🔴 PISTE REPRISE (#7915) — {nom} : chaque piste est traitée une fois \
+             et une seule : {c:?}"
+        );
+    }
+    assert_eq!(
+        rendues,
+        2 * PISTES_D_UNE_GROSSE_BASE as usize,
+        "🔴 PISTE REPRISE (#7915) : les tours ont rendu {rendues} pistes, une par \
+         piste et par passe en attendu"
+    );
+
+    // Au repos, la cascade y reste : rien ne repart au tour suivant.
+    assert_eq!(un_tour_de_cascade(&backend).await, TourDeCascade::Repos);
 }

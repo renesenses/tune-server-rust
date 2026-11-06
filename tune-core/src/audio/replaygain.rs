@@ -5668,8 +5668,13 @@ mod tests {
         );
     }
 
-    /// Même coupure à la vitesse par défaut (deux fichiers à la fois) : ce qui
-    /// est déjà en vol finit, mais RIEN de neuf ne part après la coupure.
+    /// Même coupure avec plusieurs fichiers à la fois : ce qui est déjà en vol
+    /// finit, mais RIEN de neuf ne part après la coupure.
+    ///
+    /// #7915 — le test règle la vitesse `fast` : la largeur de `normal`, le
+    /// défaut, dépend désormais de la machine (un fichier à la fois sur 4 fils
+    /// logiques ou moins, comme les machines de la CI), et ce témoin n'a de
+    /// sens qu'avec plusieurs fichiers en vol.
     ///
     /// La coupure tombe au PREMIER témoin posé, quelle que soit la piste : à
     /// deux fichiers à la fois, l'ordre d'arrivée n'est pas celui du lot (la
@@ -5679,10 +5684,13 @@ mod tests {
     /// un défaut (done=5 en CI, 02/10). Au premier témoin, aucun fichier n'est
     /// encore rendu : seuls les `largeur` déjà en vol peuvent finir.
     #[tokio::test]
-    async fn switching_off_mid_batch_stops_launching_at_normal_speed() {
+    async fn switching_off_mid_batch_stops_launching_with_several_in_flight() {
         let (_tmp, _db, interne) = sweep_db_fichiers_presents(6);
         SettingsRepo::with_backend(interne.clone())
             .set(MODE_KEY, "track")
+            .unwrap();
+        SettingsRepo::with_backend(interne.clone())
+            .set(crate::taches_de_fond::vitesse::CLE_REGLAGE, "fast")
             .unwrap();
         let largeur = crate::taches_de_fond::vitesse::largeur_courante(&interne);
         assert!(

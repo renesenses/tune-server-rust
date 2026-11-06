@@ -79,18 +79,29 @@ where
     rx.await.map_err(|_| Interrompu)
 }
 
+/// Le `nice` à poser : jamais plus prioritaire que le fil ne l'est déjà. Un
+/// serveur lancé en root avec `Nice=15` (systemd, Docker sur un NAS) ne doit
+/// pas voir ses analyses REMONTER à 10.
+#[cfg(any(target_os = "linux", test))]
+fn nice_cible(courant: i32) -> i32 {
+    courant.max(NICE_DES_ANALYSES)
+}
+
 /// Baisser, pour toute sa vie, la priorité du fil courant. Réservé aux fils
 /// créés par [`en_priorite_basse`].
 fn baisser_le_fil_courant() {
     #[cfg(target_os = "linux")]
-    // SAFETY: `gettid` n'a pas d'argument ; `setpriority` et `ioprio_set`
-    // visent le seul fil courant (PRIO_PROCESS avec un tid, IOPRIO_WHO_PROCESS).
+    // SAFETY: `gettid` n'a pas d'argument ; `getpriority`, `setpriority` et
+    // `ioprio_set` visent le seul fil courant (PRIO_PROCESS avec un tid,
+    // IOPRIO_WHO_PROCESS).
     unsafe {
         let tid = libc::syscall(libc::SYS_gettid);
+        // Un échec de lecture rend -1 : la cible reste alors 10.
+        let courant = libc::getpriority(libc::PRIO_PROCESS as _, tid as libc::id_t);
         libc::setpriority(
             libc::PRIO_PROCESS as _,
             tid as libc::id_t,
-            NICE_DES_ANALYSES,
+            nice_cible(courant),
         );
         const IOPRIO_CLASS_BE: libc::c_long = 2;
         const IOPRIO_CLASS_SHIFT: libc::c_long = 13;
@@ -119,6 +130,15 @@ pub fn nice_du_fil_courant() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Un fil déjà plus bas que 10 y reste ; un fil normal descend à 10.
+    #[test]
+    fn le_nice_ne_remonte_jamais_7915() {
+        assert_eq!(nice_cible(0), NICE_DES_ANALYSES);
+        assert_eq!(nice_cible(-1), NICE_DES_ANALYSES);
+        assert_eq!(nice_cible(15), 15);
+        assert_eq!(nice_cible(19), 19);
+    }
 
     #[tokio::test]
     async fn le_travail_rend_son_resultat() {

@@ -3535,10 +3535,10 @@ async fn spawn_library_scan_avec_lecteur_par(
             );
         }
 
+        etapes.fin("orphelins_et_favoris");
         // Rebuild FTS indexes so search reflects the current library state.
         // The FTS tables are contentless (content='') and rely on triggers,
         // but manual DB edits or batch operations can leave them stale.
-        etapes.fin("orphelins_et_favoris");
         // A full rebuild after scan guarantees consistency.
         // FTS rebuild + WAL checkpoint are SQLite-specific operations
         if db.engine() == tune_core::db::engine::Engine::Sqlite {
