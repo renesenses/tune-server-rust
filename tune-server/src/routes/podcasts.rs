@@ -1377,7 +1377,8 @@ async fn type_de_l_episode(
     if reseau && let Some(t) = type_de_l_hebergeur(&state.http_client, url).await {
         return (t, "hebergeur");
     }
-    ("audio/mpeg".to_string(), "defaut")
+    // Ni le flux, ni l'adresse, ni l'hébergeur : le repli d'avant.
+    (guess_audio_mime(url).to_string(), "defaut")
 }
 
 /// Le `Content-Type` audio que l'hébergeur rend pour `url` : un `HEAD`, puis
