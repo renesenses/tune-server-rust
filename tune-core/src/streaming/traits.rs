@@ -664,7 +664,8 @@ pub trait StreamingService: Send + Sync {
     /// perdre la moitié de la première page à Tidal, Deezer, Spotify, Amazon
     /// et YouTube dès que l'écran demande `paged=true` — le chemin non paginé
     /// leur passe la limite du client, 100 (`SEARCH_FEDEREE_LIMIT` du client
-    /// web). Seul `0` est traduit ([`limite_hors_pagination`]) : c'est le
+    /// web). Spotify a depuis son propre `search_page`, borné au plafond de
+    /// son API (#7659). Seul `0` est traduit ([`limite_hors_pagination`]) : c'est le
     /// « Tous » de la route, et `limit=0` dans l'URL d'un service qui ne
     /// pagine pas rend une page vide ou un refus (#2160).
     ///
@@ -867,6 +868,12 @@ pub trait StreamingService: Send + Sync {
     }
     async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let _ = section_id;
+        Ok(vec![])
+    }
+    /// #7822 — les mixes personnels du compte (TIDAL : My Daily Discovery,
+    /// My Mix 1 à 8…), servis comme des playlists : leur identifiant se lit
+    /// par `get_playlist_tracks`. Vide pour un service qui n'en a pas.
+    async fn get_user_mixes(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         Ok(vec![])
     }
     /// Browse the record label of an album: resolves the album's label and
