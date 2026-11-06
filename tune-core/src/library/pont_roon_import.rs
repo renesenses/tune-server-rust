@@ -583,15 +583,18 @@ fn ranger(data: &[u8], images: Option<&ImagesRoon<'_>>) -> Option<String> {
 }
 
 fn a_des_credits(backend: &Arc<dyn DbBackend>, track_id: i64) -> bool {
-    // #4984 — l'entier : `track_id` est BIGINT sur PostgreSQL.
+    // #4984 — l'entier : `track_id` est BIGINT sur PostgreSQL. #7765 — les
+    // crédits lus dans les balises ne comptent pas : Roon complète la piste.
     backend
         .query_one(
-            "SELECT 1 FROM track_credits WHERE track_id = ? LIMIT 1",
+            crate::metadata::source_des_credits::CREDITS_D_UNE_PISTE,
             &[&track_id as &dyn ToSqlValue],
         )
         .ok()
         .flatten()
-        .is_some()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+        > 0
 }
 
 /// Même écriture que `credits::ecrire_credits` — identifiants en CHAÎNE pour
@@ -614,14 +617,15 @@ fn ecrire(
         let pos = pos as i32;
         if backend
             .execute(
-                "INSERT INTO track_credits (track_id, artist_id, artist_name, role, instrument, position) \
-                 VALUES (?, ?, ?, ?, NULL, ?)",
+                "INSERT INTO track_credits (track_id, artist_id, artist_name, role, instrument, position, source) \
+                 VALUES (?, ?, ?, ?, NULL, ?, ?)",
                 &[
                     &id as &dyn ToSqlValue,
                     &artist_id as &dyn ToSqlValue,
                     nom as &dyn ToSqlValue,
                     &ROLE as &dyn ToSqlValue,
                     &pos as &dyn ToSqlValue,
+                    &crate::metadata::source_des_credits::ROON as &dyn ToSqlValue,
                 ],
             )
             .is_ok()

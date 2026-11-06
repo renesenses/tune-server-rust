@@ -10,6 +10,8 @@ pub mod autoeq;
 pub mod autoeq_base;
 pub mod canaux_declares;
 pub mod canaux_reseau_4573;
+/// #6385 — les profils d'égaliseur OPRA (JSON), lus vers le même modèle.
+pub mod opra;
 
 pub mod bitperfect_strict;
 /// #4969 — la carte des canaux de SORTIE (réaffectation, disposition,

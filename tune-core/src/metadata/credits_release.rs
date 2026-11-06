@@ -249,9 +249,15 @@ pub fn apparier(mb: &[PisteMb], locales: &[PisteLocale]) -> Vec<(i64, usize)> {
 ///
 /// Idempotente : rejouée avec les mêmes lignes, elle laisse exactement les
 /// mêmes lignes en base.
+///
+/// #7765 — `source` (voir [`super::source_des_credits`]) est posée sur chaque
+/// ligne écrite, et la purge ne prend que les lignes de CETTE source et les
+/// lignes de source inconnue : les crédits lus dans les fichiers, importés de
+/// Roon ou venus d'une autre passe restent en place.
 pub fn ecrire_credits_piste(
     backend: &Arc<dyn DbBackend>,
     track_id: i64,
+    source: &str,
     lignes: &[LigneCredit],
 ) -> usize {
     // #4984 — l'entier, pas sa chaîne : sur PostgreSQL `track_id` est BIGINT,
@@ -259,8 +265,8 @@ pub fn ecrire_credits_piste(
     // purge n'avait jamais lieu : chaque réécriture AJOUTAIT ses crédits.
     backend
         .execute(
-            "DELETE FROM track_credits WHERE track_id = ?",
-            &[&track_id as &dyn ToSqlValue],
+            "DELETE FROM track_credits WHERE track_id = ? AND (source = ? OR source IS NULL)",
+            &[&track_id as &dyn ToSqlValue, &source as &dyn ToSqlValue],
         )
         .ok();
     let artistes = crate::db::artist_repo::ArtistRepo::with_backend(backend.clone());
@@ -279,8 +285,8 @@ pub fn ecrire_credits_piste(
         let artist_id: Option<i64> = fiche.and_then(|a| a.id);
         let ok = backend
             .execute(
-                "INSERT INTO track_credits (track_id, artist_id, artist_name, role, instrument, position, artist_mbid) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO track_credits (track_id, artist_id, artist_name, role, instrument, position, artist_mbid, source) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 &[
                     &track_id as &dyn ToSqlValue,
                     &artist_id as &dyn ToSqlValue,
@@ -289,6 +295,7 @@ pub fn ecrire_credits_piste(
                     &ligne.instrument as &dyn ToSqlValue,
                     &pos as &dyn ToSqlValue,
                     &ligne.artist_mbid as &dyn ToSqlValue,
+                    &source as &dyn ToSqlValue,
                 ],
             )
             .is_ok();
@@ -363,7 +370,13 @@ pub fn appliquer_release(
         if lignes.is_empty() {
             continue;
         }
-        if ecrire_credits_piste(backend, track_id, lignes) > 0 {
+        if ecrire_credits_piste(
+            backend,
+            track_id,
+            super::source_des_credits::MUSICBRAINZ,
+            lignes,
+        ) > 0
+        {
             bilan.pistes_creditees += 1;
         }
     }
