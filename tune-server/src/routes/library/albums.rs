@@ -1145,11 +1145,19 @@ pub(super) async fn album_bio(
     // `batch_enrich_album_bios(.., &lang)`) : une bibliotheque enrichie depuis
     // une interface en francais stocke tout en francais, et le ressert ensuite
     // a tout le monde.
-    let prov = album_repo.bio_provenance(id).ok().flatten();
-    let bio_lang = prov
-        .as_ref()
-        .and_then(|p| p.get("lang").and_then(|v| v.as_str()));
-    let stored_ok = super::artists::langue_convient(bio_lang, lang);
+    // #7027 : une provenance absente veut dire « écrite à la main » et reste
+    // servie. Une erreur de lecture n'est pas une absence : la langue est
+    // alors inconnue, et la bio stockée ne passe pas pour celle demandée.
+    let (prov, stored_ok) = match album_repo.bio_provenance(id) {
+        Ok(prov) => {
+            let ok = super::artists::bio_stockee_convient(prov.as_ref(), lang);
+            (prov, ok)
+        }
+        Err(e) => {
+            tracing::warn!(id, error = %e, "album_bio_provenance_illisible");
+            (None, false)
+        }
+    };
 
     if let Some(ref bio) = album.bio
         && !bio.is_empty()
@@ -1178,10 +1186,20 @@ pub(super) async fn album_bio(
     });
     let artist_q = artist_name.as_deref().unwrap_or("");
     let cache_key = format!("cache:albumbio:{}:{artist_q}:{lang}", album.title);
-    if let Some(cached) = super::api_cache_get(&state.backend, &cache_key) {
+    // #7027 : une entree de cache dans une autre langue n'est plus resservie.
+    if let Some(cached) = super::api_cache_get(&state.backend, &cache_key)
+        && super::artists::reponse_dans_la_langue(&cached, lang)
+    {
         return Json(cached).into_response();
     }
-    match state
+    let cle_repli = super::artists::cle_du_repli(&cache_key);
+    if let Some(cached) =
+        super::api_cache_get_ttl(&state.backend, &cle_repli, super::artists::TTL_REPLI_SECS)
+        && super::artists::a_une_bio(&cached)
+    {
+        return Json(cached).into_response();
+    }
+    let reponse_du_site = state
         .http_client
         .get("https://mozaiklabs.fr/api/v1/albums/bio")
         // `lang` est transmis au site, qui ne le recevait pas : il ne servait
@@ -1195,44 +1213,60 @@ pub(super) async fn album_bio(
             ("lang", lang),
         ])
         .send()
-        .await
-    {
+        .await;
+    // Provenance comprise (CC BY-SA des extraits Wikipédia) : cf.
+    // `super::artists::reponse_du_proxy`.
+    let reponse_du_site = match reponse_du_site {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
-            // Provenance comprise (CC BY-SA des extraits Wikipédia) : cf.
-            // `super::artists::reponse_du_proxy`.
-            let out = super::artists::reponse_du_proxy("album", &album.title, &data);
-            if out.get("bio").map(|b| !b.is_null()).unwrap_or(false) {
-                super::api_cache_set(&state.backend, &cache_key, &out);
-            }
+            Some(super::artists::reponse_du_proxy(
+                "album",
+                &album.title,
+                &data,
+            ))
+        }
+        _ => None,
+    };
+    // #8022 : le site n'a rien dans la langue demandée — la note Qobuz, pour
+    // un compte connecté et un album retrouvé par code-barres ou ISRC.
+    let du_service = if super::artists::site_dans_la_langue(reponse_du_site.as_ref(), lang) {
+        None
+    } else {
+        super::editorial_service::note_d_album(&state, &album)
+            .await
+            .map(|e| super::editorial_service::corps("album", &album.title, &e))
+    };
+    let autre_langue = super::artists::bio_stockee_dans_une_autre_langue(
+        "album",
+        &album.title,
+        album.bio.as_deref(),
+        prov.as_ref(),
+        lang,
+    );
+    // Ordre : bio stockee dans la langue, cache, site dans la langue, puis une
+    // autre langue connue avec `repli` (#7027). Cf. `choisir_apres_le_site`.
+    match super::artists::choisir_apres_le_site_et_le_service(
+        "album",
+        &album.title,
+        lang,
+        reponse_du_site,
+        du_service,
+        autre_langue,
+        album.bio.as_deref(),
+        prov.as_ref(),
+    ) {
+        super::artists::Issue::DansLaLangue(out) => {
+            super::api_cache_set(&state.backend, &cache_key, &out);
             Json(out).into_response()
         }
-        _ => repli_sur_la_bio_stockee(&album.title, album.bio.as_deref(), prov),
-    }
-}
-
-/// Ressert la bio d'album stockee quand la langue demandee n'a rien donne.
-///
-/// « Une biographie en francais vaut mieux qu'un panneau vide » -- #1849 le dit,
-/// et c'est juste : refuser une bio dans la mauvaise langue serait remplacer un
-/// defaut par un pire. La provenance part avec elle, donc le client sait dans
-/// quelle langue elle est et peut le signaler. Pendant du
-/// `repli_sur_la_bio_stockee` de la route artiste, dont seule la cle JSON
-/// (`album` au lieu de `artist`) differe.
-fn repli_sur_la_bio_stockee(
-    titre: &str,
-    bio: Option<&str>,
-    prov: Option<Value>,
-) -> axum::response::Response {
-    match bio.filter(|b| !b.is_empty()) {
-        Some(b) => Json(json!({
-            "album": titre,
-            "bio": b,
-            "source": prov.as_ref().and_then(|p| p.get("source")).and_then(Value::as_str),
-            "bio_provenance": prov,
-        }))
-        .into_response(),
-        None => Json(json!({"album": titre, "bio": null, "source": null})).into_response(),
+        super::artists::Issue::Repli(out) => {
+            super::api_cache_set(&state.backend, &cle_repli, &out);
+            Json(out).into_response()
+        }
+        super::artists::Issue::Vide(mut out) => {
+            out["source"] = Value::Null;
+            Json(out).into_response()
+        }
     }
 }
 

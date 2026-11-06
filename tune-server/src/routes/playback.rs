@@ -4257,9 +4257,16 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
         .update_queue_info(zone_id, next_pos, current.queue_length)
         .await;
     drop(decision);
+    // #7895 — un titre refusé par le service est enjambé, comme en fin de
+    // piste : la lecture passe au prochain titre jouable.
+    let suivant = tune_core::orchestrator::SensDuGeste::Suivant;
     let s = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = s.orchestrator.play_from_queue(zone_id, next_pos).await {
+        if let Err(e) = s
+            .orchestrator
+            .jouer_en_enjambant_les_refus(zone_id, next_pos, suivant)
+            .await
+        {
             tracing::warn!(zone_id, error = %e, "next_play_failed");
             // #3270 (point 2) — la réponse HTTP est déjà partie en disant
             // « playing » ; c'est ici, et seulement ici, que l'échec devient
@@ -4438,9 +4445,15 @@ async fn previous(
 
     let prev_pos = position_precedente(&current);
 
+    // #7895 — même règle que « Suivant », en reculant.
+    let precedent = tune_core::orchestrator::SensDuGeste::Precedent;
     let s = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = s.orchestrator.play_from_queue(zone_id, prev_pos).await {
+        if let Err(e) = s
+            .orchestrator
+            .jouer_en_enjambant_les_refus(zone_id, prev_pos, precedent)
+            .await
+        {
             tracing::warn!(zone_id, error = %e, "prev_play_failed");
             // #3270 (point 2) — jumeau du site de `next`, ligne pour ligne.
             s.orchestrator
@@ -9434,6 +9447,17 @@ mod demarrage_detache_annonce_3270 {
         format!("play_from{}queue(", "_")
     }
 
+    /// #7895 — `next` et `previous` démarrent par ce second nom, qui enjambe
+    /// les titres refusés ; il compte comme un démarrage.
+    fn aiguille_demarrage_enjambant() -> String {
+        format!("jouer_en{}les_refus(", "_enjambant_")
+    }
+
+    /// Le bloc démarre-t-il une piste, par l'un ou l'autre nom ?
+    fn demarre_une_piste(bloc: &str) -> bool {
+        bloc.contains(&aiguille_demarrage()) || bloc.contains(&aiguille_demarrage_enjambant())
+    }
+
     /// Le nom de l'annonce, idem.
     fn aiguille_annonce() -> String {
         format!("dire_piste{}demarree(", "_non_")
@@ -9442,7 +9466,6 @@ mod demarrage_detache_annonce_3270 {
     /// Les blocs `tokio::spawn` de `source` qui démarrent une piste sans
     /// annoncer l'échec, rendus par numéro de ligne (1-indexé).
     fn demarrages_detaches_muets(source: &str) -> Vec<usize> {
-        let demarrage = aiguille_demarrage();
         let annonce = aiguille_annonce();
         let spawn = format!("tokio::{}(async move {{", "spawn");
 
@@ -9459,7 +9482,7 @@ mod demarrage_detache_annonce_3270 {
                 fin -= 1;
             }
             let bloc = &source[debut..fin];
-            if bloc.contains(&demarrage) && !bloc.contains(&annonce) {
+            if demarre_une_piste(bloc) && !bloc.contains(&annonce) {
                 muets.push(source[..debut].lines().count());
             }
             curseur = debut + spawn.len();
@@ -9469,7 +9492,6 @@ mod demarrage_detache_annonce_3270 {
 
     /// Combien de démarrages détachés ce fichier porte, muets ou non.
     fn nombre_de_demarrages_detaches(source: &str) -> usize {
-        let demarrage = aiguille_demarrage();
         let spawn = format!("tokio::{}(async move {{", "spawn");
         let mut total = 0usize;
         let mut curseur = 0usize;
@@ -9479,7 +9501,7 @@ mod demarrage_detache_annonce_3270 {
             while fin > debut && !source.is_char_boundary(fin) {
                 fin -= 1;
             }
-            if source[debut..fin].contains(&demarrage) {
+            if demarre_une_piste(&source[debut..fin]) {
                 total += 1;
             }
             curseur = debut + spawn.len();

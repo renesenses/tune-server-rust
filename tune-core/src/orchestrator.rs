@@ -2076,6 +2076,11 @@ pub mod verdict_upnp;
 mod navigateur_suivante_5975;
 mod queue;
 pub use queue::{Enjambee, lignes_bannies_a_enjamber};
+// #7895 — « Suivant » et « Précédent » enjambent les titres refusés par le service.
+mod enjamber_les_refus;
+pub use enjamber_les_refus::{SensDuGeste, message_titres_sautes};
+#[cfg(test)]
+mod enjamber_les_refus_7895_tests;
 
 mod history;
 
@@ -2414,6 +2419,10 @@ mod seek_de_reprise_caduc_5476;
 /// renderer qui n'est pas à la position de la pause.
 #[cfg(test)]
 mod seek_de_reprise_conditionnel_5050;
+/// #7422 — fil 2535 : avancer dans un titre Qobuz converti (canal sans
+/// `Range`) sur une zone DLNA recrée le flux à la position.
+#[cfg(test)]
+mod seek_service_sans_range_7422;
 // #5050 (fil 2236) — transfert depuis une zone en pause : la cible est posée
 // en pause sans rien recevoir.
 /// #6466 — l'historique par conteneurs : le conteneur de chaque élément de

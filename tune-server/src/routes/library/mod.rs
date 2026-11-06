@@ -21,6 +21,7 @@ pub(crate) mod credits_mb;
 // #4805 — les crédits d'un album lus juste après son identification.
 mod credits_apres_identification;
 mod duplicates;
+mod editorial_service;
 // Le mode « Modifier » de la fiche album (GO du 25/09/2026).
 mod edition;
 mod edition_balises;
@@ -126,6 +127,15 @@ pub(super) fn api_cache_get(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     key: &str,
 ) -> Option<Value> {
+    api_cache_get_ttl(backend, key, API_CACHE_TTL_SECS)
+}
+
+/// Comme [`api_cache_get`], avec une durée de vie choisie par l'appelant.
+pub(super) fn api_cache_get_ttl(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    key: &str,
+    ttl_secs: i64,
+) -> Option<Value> {
     use tune_core::db::backend::ToSqlValue;
     use tune_core::db::engine::Engine;
     // `strftime` n'existe pas sur PostgreSQL : la requête SQLite y tombait
@@ -141,13 +151,13 @@ pub(super) fn api_cache_get(
         Engine::Sqlite => backend.query_one(
             "SELECT value FROM settings WHERE key = ? AND \
              CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', updated_at) AS INTEGER) < ?",
-            &[&key as &dyn ToSqlValue, &API_CACHE_TTL_SECS as &dyn ToSqlValue],
+            &[&key as &dyn ToSqlValue, &ttl_secs as &dyn ToSqlValue],
         ),
         Engine::Postgres => backend.query_one(
             "SELECT value FROM settings WHERE key = $1 AND updated_at > \
              to_char((now() - make_interval(secs => CAST($2 AS DOUBLE PRECISION))) \
              AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
-            &[&key as &dyn ToSqlValue, &API_CACHE_TTL_SECS as &dyn ToSqlValue],
+            &[&key as &dyn ToSqlValue, &ttl_secs as &dyn ToSqlValue],
         ),
     }
     .ok()?
