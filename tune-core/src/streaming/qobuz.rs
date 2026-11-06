@@ -55,6 +55,9 @@ pub struct QobuzService {
     user_auth_token: Option<String>,
     username: Option<String>,
     subscription: Option<String>,
+    /// #8022 — la langue du magasin du compte (`fr`, `en`…), lue à la
+    /// connexion : celle d'un texte éditorial qui n'annonce pas la sienne.
+    langue_magasin: Option<String>,
     /// Endpoint order: `false` (default) = direct Qobuz API first with the
     /// mozaiklabs proxy as fallback; `true` = proxy first with direct as
     /// fallback (founder accounts, signalled by the cloud license via the
@@ -628,6 +631,298 @@ fn secondes_d_epoque() -> u64 {
         .unwrap_or(0)
 }
 
+// ── #8022 — correspondance d'un album ou d'un artiste LOCAL ──────────────
+
+/// ISRC interrogés au plus pour retrouver un album sans code-barres.
+const ISRC_EXAMINES: usize = 2;
+
+/// Un code-barres réduit à ses chiffres, sans les zéros de tête : l'UPC-A à 12
+/// chiffres et l'EAN-13 qui le prolonge d'un `0` désignent le même disque.
+/// Moins de 8 chiffres, ou un caractère qui n'est ni chiffre ni espace ni
+/// tiret : pas un code-barres.
+pub(crate) fn code_barres_normalise(brut: &str) -> Option<String> {
+    let brut = brut.trim();
+    if brut.is_empty()
+        || !brut
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == ' ' || c == '-')
+    {
+        return None;
+    }
+    let chiffres: String = brut.chars().filter(char::is_ascii_digit).collect();
+    if chiffres.len() < 8 {
+        return None;
+    }
+    let sans_zeros = chiffres.trim_start_matches('0');
+    (!sans_zeros.is_empty()).then(|| sans_zeros.to_string())
+}
+
+/// Les ISRC valides (12 caractères alphanumériques), en majuscules, sans
+/// doublon, dans l'ordre reçu.
+pub(crate) fn isrcs_normalises(isrcs: &[String]) -> Vec<String> {
+    let mut vus: Vec<String> = Vec::new();
+    for i in isrcs {
+        let i: String = i
+            .trim()
+            .chars()
+            .filter(|c| *c != '-')
+            .collect::<String>()
+            .to_ascii_uppercase();
+        if i.len() == 12 && i.chars().all(|c| c.is_ascii_alphanumeric()) && !vus.contains(&i) {
+            vus.push(i);
+        }
+    }
+    vus
+}
+
+fn id_qobuz(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn album_retrouve(album: &serde_json::Value) -> Option<AlbumRetrouve> {
+    Some(AlbumRetrouve {
+        id: id_qobuz(&album["id"])?,
+        artist_id: id_qobuz(&album["artist"]["id"]),
+        artist_name: album["artist"]["name"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+    })
+}
+
+fn sans_doublon(mut v: Vec<AlbumRetrouve>) -> Vec<AlbumRetrouve> {
+    let mut vus = std::collections::HashSet::new();
+    v.retain(|a| vus.insert(a.id.clone()));
+    v
+}
+
+/// Les albums de `/album/search` dont le code-barres est EXACTEMENT `upc`
+/// (normalisé). La recherche plein texte rend aussi des voisins : seul le
+/// champ `upc` fait foi.
+pub(crate) fn albums_par_upc(data: &serde_json::Value, upc: &str) -> Vec<AlbumRetrouve> {
+    let items = data["albums"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    sans_doublon(
+        items
+            .iter()
+            .filter(|a| {
+                a["upc"]
+                    .as_str()
+                    .and_then(code_barres_normalise)
+                    .is_some_and(|u| u == upc)
+            })
+            .filter_map(album_retrouve)
+            .collect(),
+    )
+}
+
+/// Les albums des titres de `/track/search` dont l'ISRC est EXACTEMENT `isrc`.
+pub(crate) fn albums_par_isrc(data: &serde_json::Value, isrc: &str) -> Vec<AlbumRetrouve> {
+    let items = data["tracks"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    sans_doublon(
+        items
+            .iter()
+            .filter(|t| {
+                t["isrc"]
+                    .as_str()
+                    .is_some_and(|i| i.trim().eq_ignore_ascii_case(isrc))
+            })
+            .filter_map(|t| album_retrouve(&t["album"]))
+            .collect(),
+    )
+}
+
+/// L'identifiant de l'UNIQUE artiste de `/artist/search` qui porte ce nom,
+/// casse et espaces de bord mis à part. Deux homonymes : rien.
+pub(crate) fn artiste_unique_du_nom(data: &serde_json::Value, nom: &str) -> Option<String> {
+    let voulu = nom.trim().to_lowercase();
+    let items = data["artists"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut ids: Vec<String> = items
+        .iter()
+        .filter(|a| {
+            a["name"]
+                .as_str()
+                .is_some_and(|n| n.trim().to_lowercase() == voulu)
+        })
+        .filter_map(|a| id_qobuz(&a["id"]))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    (ids.len() == 1).then(|| ids.remove(0))
+}
+
+/// La biographie d'une réponse `/artist/get`, en texte (même nettoyage que la
+/// note d'album, [`super::presentation_album::texte_de_presentation`] : il
+/// décode aussi les entités, ce que `strip_html_tags` ne fait pas), avec la
+/// langue que Qobuz annonce (`biography.language`).
+pub(crate) fn bio_editoriale_de(
+    data: &serde_json::Value,
+    artist_id: &str,
+) -> Option<TexteEditorial> {
+    let bio = &data["biography"];
+    let html = bio["content"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| bio["summary"].as_str())?;
+    let texte = super::presentation_album::texte_de_presentation(html)?;
+    let langue = bio["language"]
+        .as_str()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string);
+    Some(TexteEditorial {
+        texte,
+        langue,
+        url: Some(format!("https://open.qobuz.com/artist/{artist_id}")),
+    })
+}
+
+/// La langue du magasin d'un compte, depuis l'objet `user` de la connexion :
+/// `language_code` s'il y est, sinon la partie langue de `store`
+/// (`fr-fr`, `gb-en` : pays puis langue).
+pub(crate) fn langue_du_magasin_de(user: &serde_json::Value) -> Option<String> {
+    let propre = |s: &str| {
+        let s = s.trim().to_ascii_lowercase();
+        (s.len() == 2 && s.chars().all(|c| c.is_ascii_alphabetic())).then_some(s)
+    };
+    if let Some(l) = user["language_code"].as_str().and_then(propre) {
+        return Some(l);
+    }
+    user["store"]
+        .as_str()
+        .and_then(|s| s.split(['-', '_']).nth(1))
+        .and_then(propre)
+}
+
+#[cfg(test)]
+mod tests_editorial_8022 {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn le_code_barres_ignore_les_zeros_de_tete() {
+        assert_eq!(
+            code_barres_normalise("0123456789012"),
+            code_barres_normalise("123456789012")
+        );
+        assert_eq!(code_barres_normalise("12-34 5678"), Some("12345678".into()));
+        assert_eq!(code_barres_normalise("ABC12345678"), None);
+        assert_eq!(code_barres_normalise("1234"), None);
+    }
+
+    #[test]
+    fn deux_albums_au_meme_code_barres_ne_sont_pas_une_correspondance_sure() {
+        let data = json!({"albums": {"items": [
+            {"id": "a", "upc": "0123456789012", "artist": {"id": 1, "name": "X"}},
+            {"id": "b", "upc": "123456789012", "artist": {"id": 2, "name": "Y"}},
+            {"id": "c", "upc": "999999999999", "artist": {"id": 3, "name": "Z"}},
+        ]}});
+        let upc = code_barres_normalise("0123456789012").unwrap();
+        assert_eq!(albums_par_upc(&data, &upc).len(), 2);
+    }
+
+    #[test]
+    fn un_seul_artiste_du_nom_exact() {
+        let data = json!({"artists": {"items": [
+            {"id": 1, "name": "Nom Factice"},
+            {"id": 2, "name": "Nom Factice Trio"},
+        ]}});
+        assert_eq!(
+            artiste_unique_du_nom(&data, "nom factice"),
+            Some("1".into())
+        );
+        let deux = json!({"artists": {"items": [
+            {"id": 1, "name": "Nom Factice"},
+            {"id": 2, "name": "NOM FACTICE"},
+        ]}});
+        assert_eq!(artiste_unique_du_nom(&deux, "Nom Factice"), None);
+    }
+
+    #[test]
+    fn langue_du_magasin_depuis_l_utilisateur() {
+        assert_eq!(
+            langue_du_magasin_de(&json!({"store": "fr-fr"})).as_deref(),
+            Some("fr")
+        );
+        assert_eq!(
+            langue_du_magasin_de(&json!({"store": "gb-en"})).as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            langue_du_magasin_de(&json!({"language_code": "de", "store": "fr-fr"})).as_deref(),
+            Some("de")
+        );
+        assert_eq!(langue_du_magasin_de(&json!({})), None);
+    }
+
+    #[test]
+    fn la_bio_est_du_texte_avec_sa_langue_et_son_lien() {
+        let data = json!({"biography": {"content": "<p>Un &amp; deux</p>", "language": "fr"}});
+        let b = bio_editoriale_de(&data, "42").unwrap();
+        assert_eq!(b.texte, "Un & deux");
+        assert_eq!(b.langue.as_deref(), Some("fr"));
+        assert_eq!(b.url.as_deref(), Some("https://open.qobuz.com/artist/42"));
+        assert_eq!(bio_editoriale_de(&json!({}), "42"), None);
+    }
+
+    /// ISRC : l'album doit porter TOUS les ISRC interrogés ; deux albums
+    /// communs, rien.
+    #[tokio::test]
+    async fn par_isrc_l_album_commun_a_tous_les_titres() {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::collections::HashMap;
+
+        let app = Router::new().route(
+            "/track/search",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                let isrc = q.get("query").cloned().unwrap_or_default();
+                let albums: &[&str] = match isrc.as_str() {
+                    "XXA0D2600001" => &["compil", "studio"],
+                    "XXA0D2600002" => &["studio", "live"],
+                    "XXA0D2600003" => &["compil", "studio", "live"],
+                    _ => &[],
+                };
+                let items: Vec<_> = albums
+                    .iter()
+                    .map(|a| json!({"isrc": isrc, "album": {"id": a, "artist": {"id": 1, "name": "X"}}}))
+                    .collect();
+                Json(json!({"tracks": {"items": items}}))
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = ecoute.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let svc = QobuzService::avec_base_forcee(format!("http://{adresse}"));
+
+        let deux = vec!["XXA0D2600001".to_string(), "xxa0d2600002".to_string()];
+        let r = svc.album_par_codes(None, &deux).await.unwrap();
+        assert_eq!(r.map(|a| a.id).as_deref(), Some("studio"));
+
+        let ambigu = vec!["XXA0D2600001".to_string(), "XXA0D2600003".to_string()];
+        assert_eq!(svc.album_par_codes(None, &ambigu).await.unwrap(), None);
+
+        let inconnu = vec!["XXA0D2600009".to_string()];
+        assert_eq!(svc.album_par_codes(None, &inconnu).await.unwrap(), None);
+    }
+}
+
 impl QobuzService {
     /// #6934 — UNE page du catalogue d'un label, par son identifiant : un
     /// seul `label/get` (`extra=albums`, `limit`, `offset`). Le nom et le logo
@@ -819,6 +1114,7 @@ impl QobuzService {
             user_auth_token: None,
             username: None,
             subscription: None,
+            langue_magasin: None,
             proxy_first: false,
             stored_username: None,
             stored_password: None,
@@ -2434,6 +2730,7 @@ impl QobuzService {
         self.user_auth_token = data["user_auth_token"].as_str().map(Into::into);
         self.username = data["user"]["display_name"].as_str().map(Into::into);
         self.subscription = data["user"]["credential"]["label"].as_str().map(Into::into);
+        self.langue_magasin = langue_du_magasin_de(&data["user"]);
         // A fresh session clears the expiry flag, whether this login came from
         // the user or from `auto_relogin`.
         self.session_expired = false;
@@ -3571,6 +3868,87 @@ impl StreamingService for QobuzService {
         Ok(super::presentation_album::presentation_qobuz(&data))
     }
 
+    /// #8022 — voir [`albums_par_upc`] et [`albums_par_isrc`] : une seule
+    /// réponse possible, sinon rien.
+    async fn album_par_codes(
+        &self,
+        upc: Option<&str>,
+        isrcs: &[String],
+    ) -> Result<Option<AlbumRetrouve>, TuneError> {
+        if let Some(upc) = upc.and_then(code_barres_normalise) {
+            let data = self
+                .api_get("/album/search", &[("query", upc.as_str()), ("limit", "10")])
+                .await?;
+            let trouves = albums_par_upc(&data, &upc);
+            if trouves.len() == 1 {
+                return Ok(trouves.into_iter().next());
+            }
+        }
+        let mut communs: Option<Vec<AlbumRetrouve>> = None;
+        for isrc in isrcs_normalises(isrcs).iter().take(ISRC_EXAMINES) {
+            let data = self
+                .api_get(
+                    "/track/search",
+                    &[("query", isrc.as_str()), ("limit", "25")],
+                )
+                .await?;
+            let ici = albums_par_isrc(&data, isrc);
+            communs = Some(match communs {
+                None => ici,
+                Some(avant) => avant
+                    .into_iter()
+                    .filter(|a| ici.iter().any(|b| b.id == a.id))
+                    .collect(),
+            });
+            if communs.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(None);
+            }
+        }
+        Ok(communs
+            .filter(|c| c.len() == 1)
+            .and_then(|c| c.into_iter().next()))
+    }
+
+    async fn artiste_par_nom_exact(&self, nom: &str) -> Result<Option<String>, TuneError> {
+        let nom = nom.trim();
+        if nom.is_empty() {
+            return Ok(None);
+        }
+        let data = self
+            .api_get("/artist/search", &[("query", nom), ("limit", "25")])
+            .await?;
+        Ok(artiste_unique_du_nom(&data, nom))
+    }
+
+    async fn bio_editoriale_artiste(
+        &self,
+        artist_id: &str,
+    ) -> Result<Option<TexteEditorial>, TuneError> {
+        let data = self
+            .api_get_avec_statut("/artist/get", &[("artist_id", artist_id)])
+            .await
+            .map_err(erreur_de_fiche)?;
+        Ok(bio_editoriale_de(&data, artist_id))
+    }
+
+    async fn note_editoriale_album(
+        &self,
+        album_id: &str,
+    ) -> Result<Option<TexteEditorial>, TuneError> {
+        Ok(self
+            .get_album_description(album_id)
+            .await?
+            .map(|d| TexteEditorial {
+                texte: d.description,
+                langue: d.language,
+                url: Some(format!("https://open.qobuz.com/album/{album_id}")),
+            }))
+    }
+
+    fn langue_du_magasin(&self) -> Option<String> {
+        self.langue_magasin.clone()
+    }
+
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         let items = self.favoris_bruts("tracks").await?;
         Ok(items.iter().map(Self::map_track).collect())
@@ -3968,6 +4346,7 @@ impl StreamingService for QobuzService {
             "user_auth_token": token,
             "username": self.username,
             "subscription": self.subscription,
+            "langue_magasin": self.langue_magasin,
             "app_id": self.app_id,
             "app_secret": self.app_secret,
             "stored_username": self.stored_username,
@@ -3979,6 +4358,7 @@ impl StreamingService for QobuzService {
             self.user_auth_token = Some(t.into());
             self.username = tokens["username"].as_str().map(Into::into);
             self.subscription = tokens["subscription"].as_str().map(Into::into);
+            self.langue_magasin = tokens["langue_magasin"].as_str().map(Into::into);
             if let Some(id) = tokens["app_id"].as_str() {
                 self.app_id = id.into();
             }

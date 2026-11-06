@@ -9,6 +9,7 @@ pub mod album_repo;
 pub mod artist_repo;
 pub mod backend;
 pub mod champs_tenus;
+pub mod cles_clients;
 pub mod coffrets_auto;
 pub mod collection_folder_repo;
 /// Le conteneur de chaque élément de file (#6466).
@@ -43,6 +44,8 @@ pub mod metadata_report_repo;
 pub mod migration_status;
 pub mod migrations;
 pub mod models;
+/// #7849 — les notes personnelles en Markdown (artiste, album, piste).
+pub mod notes_personnelles;
 /// L'ordre alphabétique des listes paginées (#4956) : tri en Rust, découpe.
 pub(crate) mod ordre_alphabetique;
 #[cfg(all(test, feature = "postgres"))]
@@ -60,6 +63,8 @@ pub mod photos_indexees_upnp_7695;
 pub mod play_queue_repo;
 pub mod playlist_repo;
 pub mod playlists_reconcile;
+/// Contrôle parental, étape 1 (#7856) : politique d'un profil supervisé.
+pub mod politique_parentale;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(all(test, feature = "postgres"))]
@@ -77,6 +82,8 @@ pub mod rattrapage_metadonnees_5043;
 /// La référence d'album d'une piste Bandcamp, retrouvée dans la file, les
 /// favoris ou l'historique pour resigner son URL de flux (fil 2121).
 pub mod reference_d_album;
+/// #7849 — répartitions de la bibliothèque (codec, fréquence, décennie, rôle).
+pub mod repartitions_bibliotheque;
 /// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
 pub(crate) mod replieur_wal;
 pub mod settings_repo;
@@ -106,12 +113,17 @@ mod filtre_dr_190_tests;
 mod lenteur_albums_4800_tests;
 #[cfg(test)]
 mod lenteur_pistes_5138_tests;
+#[cfg(test)]
+mod liste_par_curseur_7619_tests;
 /// #7535 — un MBID trouvé par le nom n'est plus posé s'il est déjà porté.
 #[cfg(test)]
 mod mbid_deja_porte_7535_tests;
 /// #7694 — la règle des dossiers miroirs ne fond pas deux qualités.
 #[cfg(test)]
 mod miroirs_de_qualite_7694_tests;
+/// #7849 — notes personnelles et répartitions, SQLite et PostgreSQL.
+#[cfg(test)]
+mod notes_et_repartitions_7849_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
 #[cfg(test)]

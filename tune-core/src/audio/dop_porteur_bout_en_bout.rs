@@ -217,9 +217,12 @@ fn verifier_le_porteur(
 ) {
     let attendu_trames = octets_par_canal / 2;
     let octets_par_trame = 3 * canaux;
+    // #7704 — une trame de repos clôt un compte impair : le flux reste pair.
+    let trames_au_dac =
+        crate::audio::dsd_to_dop::trames_dop_avec_cloture(attendu_trames as u64) as usize;
     assert_eq!(
         octets.len(),
-        attendu_trames * octets_par_trame,
+        trames_au_dac * octets_par_trame,
         "{source} : le chemin a rendu {} octets pour {} trames attendues — \
          des octets DSD ont été perdus en route",
         octets.len(),
@@ -251,6 +254,17 @@ fn verifier_le_porteur(
                 "{source} : trame {f}, canal {ch} — la charge utile DSD ne se \
                  relit pas ; un octet a été perdu, deux canaux échangés ou la \
                  phase de trame rompue"
+            );
+        }
+    }
+    // #7704 — la trame de clôture : repos 0x69, marqueur 0xFA.
+    if trames_au_dac > attendu_trames {
+        let base = attendu_trames * octets_par_trame;
+        for ch in 0..canaux {
+            assert_eq!(
+                &octets[base + 3 * ch..base + 3 * ch + 3],
+                &[0x69, 0x69, 0xFA],
+                "{source} : trame de clôture, canal {ch}"
             );
         }
     }

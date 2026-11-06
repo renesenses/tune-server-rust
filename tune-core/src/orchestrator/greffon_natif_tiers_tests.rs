@@ -105,6 +105,9 @@ impl Processor for Gain {
         }
         Ok(ProcessReport { changed: g != 1.0, ..Default::default() })
     }
+    fn diagnostics(&self) -> Settings {
+        serde_json::json!({"gain": self.gain})
+    }
     fn reset(&mut self, _: ResetReason) {}
     fn latency_frames(&self) -> u32 {
         0
@@ -450,5 +453,28 @@ async fn pure_contourne_le_greffon_sur_la_sortie_locale(orch: &PlaybackOrchestra
         local.signal_path_status().unwrap().dsp,
         OutputDspState::BypassedPure,
         "greffon natif armé + PURE = « DSP contourné par PURE » (#6522)"
+    );
+}
+
+/// `POST /audio-plugins/{id}/diagnostics` : l'hôte rend ce que la VRAIE
+/// bibliothèque calcule pour un réglage, sans l'enregistrer ; un réglage
+/// qu'elle refuse est refusé.
+#[test]
+fn les_diagnostics_d_un_reglage_viennent_du_greffon() {
+    let (id, _dossier) = enregistrer_la_bibliotheque_de_test();
+    let d = crate::audio::natifs_tiers::diagnostics_du_reglage(
+        &id,
+        &serde_json::json!({"enabled": true, "gain": 0.25}),
+    )
+    .unwrap();
+    assert_eq!(d, serde_json::json!({"gain": 0.25}));
+    let refus = crate::audio::natifs_tiers::diagnostics_du_reglage(
+        &id,
+        &serde_json::json!({"enabled": true, "gain": 2.0}),
+    )
+    .unwrap_err();
+    assert!(refus.contains("refused"), "{refus}");
+    assert!(
+        crate::audio::natifs_tiers::valider_reglage(&id, &serde_json::json!({"gain": 0.5})).is_ok()
     );
 }
