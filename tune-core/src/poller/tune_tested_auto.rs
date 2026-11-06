@@ -1,5 +1,6 @@
 use super::PositionPoller;
 use crate::cloud::tune_tested_auto::{AppareilObserve, FormatObserve};
+use crate::cloud::tune_tested_proposition as proposition;
 use crate::db::settings_repo::SettingsRepo;
 use crate::playback::ZoneState;
 
@@ -13,13 +14,34 @@ impl PositionPoller {
         if etat.now_playing.as_ref().is_some_and(|np| {
             np.duration_ms > 0 && progression >= (np.duration_ms as u64).saturating_sub(1000).max(1)
         }) {
-            self.noter_tune_tested(etat, device_id, true).await;
+            // Appelé sur l'avance gapless : l'enchaînement est constaté.
+            self.noter_tune_tested_avec(etat, device_id, true, true)
+                .await;
         }
     }
 
     pub(super) async fn noter_tune_tested(&self, etat: &ZoneState, device_id: &str, succes: bool) {
+        self.noter_tune_tested_avec(etat, device_id, succes, false)
+            .await;
+    }
+
+    async fn noter_tune_tested_avec(
+        &self,
+        etat: &ZoneState,
+        device_id: &str,
+        succes: bool,
+        gapless: bool,
+    ) {
         let settings = SettingsRepo::with_backend(self.db.clone());
-        if !crate::cloud::telemetry::TelemetryReporter::is_enabled_for(&settings) {
+        // #7922 — le compte sans erreur de la zone ne dépend pas du
+        // consentement à la télémétrie : il reste local jusqu'à l'envoi
+        // confirmé par l'utilisateur. Une erreur le remet à zéro avant toute
+        // lecture de la sortie, qui peut être occupée.
+        if !succes && proposition::noter_erreur(&settings, etat.zone_id, device_id).is_err() {
+            tracing::debug!("tune_tested_compteur_non_conserve");
+        }
+        let telemetrie = crate::cloud::telemetry::TelemetryReporter::is_enabled_for(&settings);
+        if !telemetrie && !succes {
             return;
         }
         let sortie = { self.outputs.lock().await.get(device_id) };
@@ -85,21 +107,49 @@ impl PositionPoller {
                     e["model"].as_str()?.to_owned(),
                 ))
             });
+        let cle_piste = (
+            etat.track_generation,
+            // L'avance gapless invalide les niveaux, y compris en
+            // répétition d'une piste, sans changer track_generation.
+            self.playback
+                .levels_gen(etat.zone_id)
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if succes
+            && proposition::noter_lecture(
+                &settings,
+                etat.zone_id,
+                proposition::LectureRendue {
+                    device_id,
+                    protocole_brut: &protocole,
+                    identite: identite
+                        .as_ref()
+                        .map(|(marque, modele)| (marque.as_str(), modele.as_str())),
+                    // Les deux appelants n'acceptent qu'une fin observée à
+                    // moins d'une seconde de la durée de la piste.
+                    millisecondes: etat
+                        .now_playing
+                        .as_ref()
+                        .map_or(0, |np| np.duration_ms.max(0) as u64),
+                    format: format.clone(),
+                    gapless,
+                    cle_piste,
+                },
+            )
+            .is_err()
+        {
+            tracing::debug!("tune_tested_compteur_non_conserve");
+        }
+        if !telemetrie {
+            return;
+        }
         let resultat = self
             .observateur_tune_tested
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .terminer_avec_identite(
                 &settings,
-                (
-                    etat.zone_id,
-                    etat.track_generation,
-                    // L'avance gapless invalide les niveaux, y compris en
-                    // répétition d'une piste, sans changer track_generation.
-                    self.playback
-                        .levels_gen(etat.zone_id)
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                ),
+                (etat.zone_id, cle_piste.0, cle_piste.1),
                 AppareilObserve {
                     protocole: &protocole,
                     identite_detectee: identite

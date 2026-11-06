@@ -408,3 +408,46 @@ async fn tune_tested_auto_identite_decouverte_sans_adresse_ni_nom_convivial() {
         );
     }
 }
+
+#[tokio::test]
+async fn tune_tested_7922_sondeur_compte_sans_telemetrie_puis_remet_a_zero_sur_panne() {
+    let banc = Banc::monter(Some("échec de sortie synthétique")).await;
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(banc.poller.db.clone());
+    settings.set("telemetry_enabled", "false").unwrap();
+    settings
+        .set(&format!("zone_{}_brand", banc.zone_id), "Test Audio")
+        .unwrap();
+    settings
+        .set(&format!("zone_{}_model", banc.zone_id), "DAC 7922")
+        .unwrap();
+    let etat = banc.playback.get_state(banc.zone_id).await;
+    // Quinze pistes de 4 minutes enchaînées : une heure sans erreur.
+    for _ in 0..15 {
+        banc.poller
+            .noter_fin_tune_tested(&etat, DEVICE_ID, 240_000)
+            .await;
+        banc.playback.bump_levels_gen(banc.zone_id);
+    }
+    let compte =
+        crate::cloud::tune_tested_proposition::etat(&settings, banc.zone_id, Some(DEVICE_ID));
+    assert_eq!(
+        compte.seconds_without_error, 3600,
+        "le compte sans erreur ne dépend pas du consentement à la télémétrie"
+    );
+    assert!(compte.eligible);
+    let apercu = compte.preview.unwrap();
+    assert_eq!(apercu.output_type, "local");
+    assert!(apercu.gapless_observed);
+    assert!(
+        settings.get("telemetry_tune_tested_v1").unwrap().is_none(),
+        "sans consentement, aucune télémétrie n'est écrite"
+    );
+    // La panne réelle de la sortie, relevée par le sondeur.
+    banc.un_tick().await;
+    assert_eq!(
+        crate::cloud::tune_tested_proposition::etat(&settings, banc.zone_id, Some(DEVICE_ID))
+            .seconds_without_error,
+        0,
+        "l'échec de transport relevé par le sondeur doit remettre le compte à zéro"
+    );
+}
