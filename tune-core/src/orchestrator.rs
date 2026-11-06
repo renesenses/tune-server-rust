@@ -1292,6 +1292,11 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     annonces_navigateur: std::sync::Mutex<HashMap<i64, AnnonceNavigateurDifferee>>,
+    /// #7852 — l'écoute armée au démarrage du titre de chaque zone, écrite
+    /// par le sondeur au seuil min(30 s, 50 %). Voir `ecoute_validee_7852`.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    ecoutes_en_attente: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEnAttente>>,
     /// #6066 — ce que les LECTEURS des zones navigateur ont dit de leur
     /// lecture (`POST /zones/{id}/browser-playing`). Voir
     /// `confirmation_navigateur_6066`.
@@ -1353,6 +1358,10 @@ pub struct PlaybackOrchestrator {
     pub(crate) sources_physiques: Arc<crate::sources_physiques::RegistreSources>,
     /// #5662 — les files de volume par (sortie, zone) : voir `volume_coalescent`.
     pub(crate) volume_coalesceur: volume_coalescent::CoalesceurDeVolume,
+    /// #6721 — le dernier niveau connu de l'appareil de chaque zone : le
+    /// repère de la garde contre les montées brusques ne le dépasse jamais.
+    /// Voir `repere_de_hausse_6721`.
+    pub(crate) niveaux_des_appareils: repere_de_hausse_6721::NiveauxDesAppareils,
     /// #2264 — la mémoire de la règle de version : choix explicites en
     /// attente, réponses des services. Voir `version_de_lecture`.
     pub(crate) versions: version_de_lecture::EtatDesVersions,
@@ -1850,6 +1859,7 @@ impl PlaybackOrchestrator {
             eq_en_vol_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
+            ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
             confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
@@ -1859,6 +1869,7 @@ impl PlaybackOrchestrator {
             sources_url: crate::source_url::SourcesUrl::default(),
             sources_physiques: Arc::default(),
             volume_coalesceur: volume_coalescent::CoalesceurDeVolume::default(),
+            niveaux_des_appareils: Default::default(),
             versions: Default::default(),
         }
     }
@@ -1921,6 +1932,9 @@ impl PlaybackOrchestrator {
 
 mod commun;
 mod confirmation_navigateur_6066;
+pub mod ecoute_validee_7852;
+#[cfg(test)]
+mod ecoute_validee_7852_tests;
 pub use confirmation_navigateur_6066::SignalDuLecteur;
 
 /// #4598 — ré-énumérer le parc local avant de refuser une zone locale.
@@ -1983,9 +1997,18 @@ mod service_wav_progressif_openhome_6718;
 
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
+mod repere_de_hausse_6721;
+#[cfg(test)]
+mod repere_de_hausse_6721_tests;
 mod volume_coalescent;
 #[cfg(test)]
 mod volume_coalescent_5662_tests;
+// #7633 — le volume OpenHome n'attend plus le relevé du sondeur.
+#[cfg(test)]
+mod volume_openhome_sans_attendre_7633_tests;
+// #7841 — l'échelle de volume OpenHome lue, la sourdine sans le verrou.
+#[cfg(test)]
+mod volume_openhome_echelle_7841_tests;
 pub use dsp::PorteeDuReglage;
 // #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
 #[cfg(test)]
@@ -2023,6 +2046,9 @@ mod purge_greffon_tiers_6256_tests;
 // enregistrés, dans l'état que la vraie bascule produit.
 #[cfg(all(test, feature = "local-audio"))]
 mod verdict_pure_reglages_6522_tests;
+// #7632 — la convolution par RI est un droit Premium (RoomCorrection).
+#[cfg(test)]
+mod convolution_sous_licence_7632_tests;
 
 /// Fil 2062 / #5550 — durée d'une piste UPnP lue dans les en-têtes du flux.
 mod duree_du_flux_2062;
@@ -2050,6 +2076,11 @@ pub mod verdict_upnp;
 mod navigateur_suivante_5975;
 mod queue;
 pub use queue::{Enjambee, lignes_bannies_a_enjamber};
+// #7895 — « Suivant » et « Précédent » enjambent les titres refusés par le service.
+mod enjamber_les_refus;
+pub use enjamber_les_refus::{SensDuGeste, message_titres_sautes};
+#[cfg(test)]
+mod enjamber_les_refus_7895_tests;
 
 mod history;
 
@@ -2388,6 +2419,10 @@ mod seek_de_reprise_caduc_5476;
 /// renderer qui n'est pas à la position de la pause.
 #[cfg(test)]
 mod seek_de_reprise_conditionnel_5050;
+/// #7422 — fil 2535 : avancer dans un titre Qobuz converti (canal sans
+/// `Range`) sur une zone DLNA recrée le flux à la position.
+#[cfg(test)]
+mod seek_service_sans_range_7422;
 // #5050 (fil 2236) — transfert depuis une zone en pause : la cible est posée
 // en pause sans rien recevoir.
 /// #6466 — l'historique par conteneurs : le conteneur de chaque élément de

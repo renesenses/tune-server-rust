@@ -14,6 +14,7 @@ use tune_core::db::play_queue_repo::PlayQueueRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::orchestrator::{PlayRequest, PlaybackOrchestrator};
 use tune_core::playback::PlaybackManager;
+use tune_core::room_correction::RoomProfile;
 use tune_core::source_pcm::FormatPcm;
 
 use crate::fournisseur::SOURCE;
@@ -53,6 +54,10 @@ pub trait HoteZone: Send + Sync {
     /// Arrête la zone, comme le bouton Stop.
     fn arreter(&self, zone_id: i64);
     fn traitements(&self, zone_id: i64) -> TraitementsDeZone;
+    /// Enregistre le profil de pièce de la zone (`room_profile_{zone}`, C2) :
+    /// il ne touche pas au son tant qu'on ne l'applique pas par
+    /// `POST /room-correction/profiles/{zone}/apply`.
+    fn enregistrer_profil_piece(&self, profil: &RoomProfile) -> Result<(), String>;
 }
 
 pub struct HoteOrchestrateur {
@@ -166,5 +171,9 @@ impl HoteZone for HoteOrchestrateur {
             pure,
             volume_fixe,
         }
+    }
+
+    fn enregistrer_profil_piece(&self, profil: &RoomProfile) -> Result<(), String> {
+        tune_core::room_correction::save_profile(&self.backend, profil)
     }
 }

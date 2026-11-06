@@ -197,6 +197,69 @@ pub mod sql {
         )
     }
 
+    /// La condition qui rattache une écoute `h` à une piste `t` (#7769) : la
+    /// règle de [`plays_for_tracks`], écrite pour servir DANS une autre
+    /// requête — les listes et collections intelligentes, qui comptaient par
+    /// `h.track_id = t.id`, une colonne toujours NULL. « = 0 » y rendait
+    /// toute la bibliothèque et « < 1 » rien du tout.
+    ///
+    /// Même règle, donc même nombre que la colonne de la Bibliothèque : hors
+    /// radio, même titre, et même interprète ou interprète absent des deux
+    /// côtés. L'interprète de la piste est relu par sous-requête pour ne
+    /// dépendre d'aucun alias de la requête englobante. `piste` et `ecoute`
+    /// sont des alias écrits par l'appelant, jamais une saisie.
+    ///
+    /// Une écoute dont `track_id` désigne la piste lui revient aussi, même
+    /// sans interprète enregistré : c'était la seule règle avant #7769, et
+    /// la retirer faisait perdre ces écoutes (`pg_date_relative_6122`). Une
+    /// seule ligne d'écoute ne compte qu'une fois : c'est un `OR` dans la
+    /// même condition. Sur les écoutes de la production, `track_id` vide, le
+    /// nombre reste celui de la Bibliothèque.
+    pub fn ecoute_de_la_piste(piste: &str, ecoute: &str) -> String {
+        let interprete =
+            format!("(SELECT ae.name FROM artists ae WHERE ae.id = {piste}.artist_id)");
+        format!(
+            "{ecoute}.source != 'radio' AND ({ecoute}.track_id = {piste}.id \
+             OR ({ecoute}.title = {piste}.title \
+                 AND ({ecoute}.artist_name = {interprete} \
+                      OR ({ecoute}.artist_name IS NULL AND {interprete} IS NULL))))"
+        )
+    }
+
+    /// Le nombre d'écoutes de la piste `piste`, en sous-requête corrélée :
+    /// `0` pour une piste jamais écoutée, jamais NULL (#7769).
+    pub fn ecoutes_de_la_piste(piste: &str) -> String {
+        format!(
+            "(SELECT COUNT(*) FROM listen_history he WHERE {})",
+            ecoute_de_la_piste(piste, "he")
+        )
+    }
+
+    /// La dernière écoute de la piste `piste`, NULL si elle n'a jamais été
+    /// écoutée (#7769) — le `MAX(listened_at)` de [`plays_for_tracks`].
+    pub fn derniere_ecoute_de_la_piste(piste: &str) -> String {
+        format!(
+            "(SELECT MAX(he.listened_at) FROM listen_history he WHERE {})",
+            ecoute_de_la_piste(piste, "he")
+        )
+    }
+
+    /// Le nombre d'écoutes de chaque couple titre + interprète d'une page de
+    /// l'Historique (#7769). Grouper par `artist_name` met les interprètes
+    /// absents ensemble : c'est la règle « absent des deux côtés » de
+    /// [`plays_for_tracks`]. Placeholders : les `n_titres` titres.
+    pub fn ecoutes_par_titre<D: SqlDialect>(d: &D, n_titres: usize) -> String {
+        let titres = (1..=n_titres)
+            .map(|i| d.placeholder(i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT title, artist_name, COUNT(*) FROM listen_history \
+             WHERE source != 'radio' AND title IN ({titres}) \
+             GROUP BY title, artist_name"
+        )
+    }
+
     /// Les écoutes locales qui peuvent concerner des pistes d'un service (#7026) :
     /// celles de ce service sous l'un des `n_ids` identifiants, ou celles d'un
     /// des `n_artistes` interprètes (nom en minuscules). Groupées par ce qui
@@ -591,7 +654,67 @@ impl HistoryRepo {
             let derniere = cols.get(2).and_then(|v| v.as_string());
             map.insert(id, (compte, derniere));
         }
+        // #7763 — les écoutes importées (Roon, Plex, m3u) s'ajoutent à celles
+        // de l'historique, sans y figurer ; la dernière écoute est la plus
+        // récente des deux. Une table illisible (banc qui crée ses tables à
+        // la main) laisse les comptes de l'historique tels quels.
+        match crate::db::ecoutes_importees::EcoutesImporteesRepo::with_backend(self.db.clone())
+            .par_piste(track_ids)
+        {
+            Ok(importees) => {
+                for (id, (n, date)) in importees {
+                    let Some((compte, derniere)) = map.get_mut(&id) else {
+                        continue;
+                    };
+                    *compte += n;
+                    if let Some(date) = date
+                        && derniere.as_ref().is_none_or(|d| date > *d)
+                    {
+                        *derniere = Some(date);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "ecoutes_importees_illisibles"),
+        }
         Ok(map)
+    }
+
+    /// Le nombre d'écoutes de chaque écoute d'une page de l'Historique
+    /// (#7769), dans l'ordre de `ecoutes` : la colonne « # Plays » restait
+    /// vide parce que la liste n'envoyait aucun nombre.
+    ///
+    /// Même règle que [`Self::plays_for_tracks`] — hors radio, même titre,
+    /// même interprète ou absent des deux côtés — donc, pour une écoute de la
+    /// bibliothèque, le même nombre que la colonne de la Bibliothèque. Une
+    /// seule requête pour la page ; aucune sur une page vide.
+    pub fn plays_for_listens(&self, ecoutes: &[ListenRecord]) -> Result<Vec<i64>, String> {
+        if ecoutes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut titres: Vec<&str> = ecoutes.iter().map(|e| e.title.as_str()).collect();
+        titres.sort_unstable();
+        titres.dedup();
+        let sql = self.dialect_sql(
+            |d| sql::ecoutes_par_titre(d, titres.len()),
+            |d| sql::ecoutes_par_titre(d, titres.len()),
+        );
+        let params: Vec<&dyn ToSqlValue> = titres.iter().map(|t| t as &dyn ToSqlValue).collect();
+        let mut comptes: HashMap<(String, Option<String>), i64> = HashMap::new();
+        for cols in self.db.query_many(&sql, &params)? {
+            let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
+            let artiste = cols.get(1).and_then(|v| v.as_string());
+            let compte = cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0);
+            comptes.insert((titre, artiste), compte);
+        }
+        Ok(ecoutes
+            .iter()
+            .map(|e| {
+                comptes
+                    .get(&(e.title.clone(), e.artist_name.clone()))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .collect())
     }
 
     /// Écoutes locales de pistes d'un service, tous profils (#7026) : pour

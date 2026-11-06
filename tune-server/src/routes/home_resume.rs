@@ -37,12 +37,13 @@ pub(super) async fn resume_listening(
         else {
             return Err(AppError::bad_request("épisode de reprise absent"));
         };
-        let seconds = SettingsRepo::with_backend(state.backend.clone())
-            .get(resumes::REWIND_KEY)
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(resumes::DEFAULT_REWIND);
+        let seconds = resumes::effective_rewind(
+            SettingsRepo::with_backend(state.backend.clone())
+                .get(resumes::REWIND_KEY)
+                .ok()
+                .flatten()
+                .as_deref(),
+        );
         let request = super::super::podcasts::PlayEpisodeRequest {
             audio_url: source_id.clone(),
             title: Some(title.clone()),
@@ -529,9 +530,10 @@ mod config_tests {
         for (value, ok) in [
             (json!(17), true),
             (json!(0), true),
-            (json!(300), true),
+            (json!(60), true),
             (json!(-1), false),
-            (json!(301), false),
+            (json!(61), false),
+            (json!(300), false),
             (json!(1.5), false),
             (json!("10"), false),
         ] {
@@ -559,9 +561,40 @@ mod config_tests {
                 .get(resumes::REWIND_KEY)
                 .unwrap()
                 .as_deref(),
-            Some("300"),
+            Some("60"),
             "un réglage refusé ne doit pas être écrit"
         );
+    }
+
+    /// #7840 — une valeur enregistrée sous l'ancienne borne (0–300 s) est
+    /// relue à 60 s, et la reprise d'un épisode ne recule pas plus.
+    #[tokio::test]
+    async fn recul_podcast_7840_une_valeur_enregistree_a_300_est_relue_a_60() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set(resumes::REWIND_KEY, "300")
+            .unwrap();
+        let get = crate::routes::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/system/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(get.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(
+            body[resumes::REWIND_KEY],
+            60,
+            "un recul enregistré à 300 s doit être relu à 60 s"
+        );
+        assert_eq!(resumes::effective_rewind(Some("300")), 60);
+        assert_eq!(resumes::effective_rewind(Some("60")), 60);
+        assert_eq!(resumes::effective_rewind(Some("0")), 0);
+        assert_eq!(resumes::effective_rewind(None), 10);
+        assert_eq!(resumes::effective_rewind(Some("n'importe quoi")), 10);
     }
 }
 
@@ -865,10 +898,12 @@ mod replay_tests {
             saved.position_ms, 42000,
             "la position du titre seul doit être persistée"
         );
+        // #7401 — les voisins sans contexte explicite viennent du même
+        // geste (/play puis sa suite) : la reprise les garde.
         assert_eq!(
             saved.items.len(),
-            1,
-            "le titre seul ne reprend pas les voisins"
+            2,
+            "un titre joué dans sa file garde la file de son geste (#7401)"
         );
         state.playback.seek(zone, 17000).await;
         let response = resume_listening(
@@ -890,11 +925,11 @@ mod replay_tests {
             Some("deux"),
             "la reprise doit rejouer le dernier titre démarré, pas la tête de la file"
         );
-        assert_eq!(s.queue_position, 0);
+        assert_eq!(s.queue_position, 1);
         assert_eq!(
             q.get_ordered(zone).unwrap().len(),
-            1,
-            "la reprise du titre seul exclut les titres voisins"
+            2,
+            "la reprise ne s'arrête pas après le titre : la file du geste suit (#7401)"
         );
     }
 }

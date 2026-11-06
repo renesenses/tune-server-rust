@@ -695,6 +695,13 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// #7632 — la convolution par RI est un droit Premium (`RoomCorrection`,
+    /// décision du 04/11/2026). Faux par défaut : une sortie à qui personne
+    /// n'a dit que le droit est accordé ne convolue pas. Posé par
+    /// l'orchestrateur à chaque lecture et quand la licence change
+    /// ([`Self::set_convolution_autorisee`]). Faux, la configuration reste
+    /// mémorisée mais aucun moteur n'est construit.
+    convolution_autorisee: Arc<AtomicBool>,
     /// #6522, #6524 — un traitement est-il ARMÉ dans les réglages enregistrés
     /// de la zone qui joue (égaliseur, correction de pièce, crossfeed, greffon
     /// natif, repli mono) ? Posé par l'orchestrateur à côté de `pure_bypass`.
@@ -1264,6 +1271,7 @@ impl LocalOutput {
             current_format: Arc::new(AtomicU32::new(0)),
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
+            convolution_autorisee: Arc::new(AtomicBool::new(false)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
             flux_sans_fin: AtomicBool::new(false),
             volume_avant_egaliseur: AtomicU32::new(u32::MAX),
@@ -1615,7 +1623,9 @@ impl LocalOutput {
     pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
         let config = super::super::audio::convolver::ConvolverConfig::from_wav(path)?;
         *self.convolver_config.lock().unwrap() = Some(config.clone());
-        let current_format = self.current_format();
+        let current_format = self
+            .current_format()
+            .filter(|_| self.convolution_autorisee.load(Ordering::Relaxed));
         let active = match current_format {
             Some((sample_rate, channels)) => {
                 match config.build_for(1024, sample_rate, channels as usize) {
@@ -1647,6 +1657,32 @@ impl LocalOutput {
         *self.convolver_config.lock().unwrap() = None;
         *self.convolver.lock().unwrap() = None;
         tracing::info!(device = %self.device_name, "convolver_cleared");
+    }
+
+    /// #7632 — accorder ou retirer le droit de convoluer (Premium
+    /// `RoomCorrection`). Retiré pendant la lecture, le moteur en place
+    /// s'éteint EN FONDU ([`Convolver::eteindre_en_fondu`], 20 ms) : pas de
+    /// clic, et plus aucune convolution ensuite ; à la piste suivante il n'est
+    /// pas reconstruit. Accordé, il le sera à la prochaine lecture (le faire
+    /// flux en cours ferait sauter le temps de sa latence). Rend vrai si
+    /// l'état a changé.
+    pub fn set_convolution_autorisee(&self, autorisee: bool) -> bool {
+        let avant = self
+            .convolution_autorisee
+            .swap(autorisee, Ordering::Relaxed);
+        if avant && !autorisee {
+            let trames = self
+                .current_format()
+                .map(|(taux, _)| (taux as usize / 50).max(1))
+                .unwrap_or(0);
+            if let Ok(mut c) = self.convolver.lock()
+                && let Some(conv) = c.as_mut()
+            {
+                conv.eteindre_en_fondu(trames);
+                tracing::info!(device = %self.device_name, trames, "convolution_eteinte_sans_licence");
+            }
+        }
+        avant != autorisee
     }
 
     /// Enable/disable PURE (audiophile) bypass of the room-correction convolver
@@ -2277,6 +2313,17 @@ impl NativePcmRing {
         self.pop_mapped(out, |sample| sample)
     }
 
+    /// #7704 — le prochain mot à tirer, SANS le consommer (consommateur seul).
+    pub(crate) fn premier_en_attente(&self) -> Option<i32> {
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        (w != r).then(|| {
+            let idx = r as usize % self.capacity();
+            // SAFETY: même contrat SPSC que `pop_mapped` : case publiée.
+            unsafe { *self.buf[idx].get() }
+        })
+    }
+
     /// Drain directly into a backend-owned callback buffer while converting
     /// each native word in place.  Keeping the mapping inside the ring avoids
     /// the temporary `Vec` that ASIO used to allocate on every audio period.
@@ -2582,6 +2629,18 @@ impl RingBuf {
         self.pop_mapped(out, |sample| sample)
     }
 
+    /// #7704 — le prochain échantillon à tirer, SANS le consommer
+    /// (consommateur seul).
+    pub(crate) fn premier_en_attente(&self) -> Option<f32> {
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        (w != r).then(|| {
+            let idx = r as usize % self.capacity();
+            // SAFETY: consommateur unique, case publiée par le Release de `push`.
+            unsafe { *self.buf[idx].get() }
+        })
+    }
+
     /// Drain and transform directly into the device callback's native slice.
     /// This is deliberately generic and allocation-free so integer ASIO
     /// callbacks do not need a floating-point scratch `Vec` per period.
@@ -2617,6 +2676,14 @@ mod ringbuf_tests;
 // juger le résultat par le `SuiviFamine` du sondeur.
 #[cfg(test)]
 mod horloge_du_pilote_muet_3814;
+
+// #7704 — le rappel partagé garde le porteur DoP continu.
+#[cfg(test)]
+mod dop_continu_7704;
+
+// #7703 — la quantification finale native est dithérée, après le volume.
+#[cfg(test)]
+mod quantification_finale_7703;
 
 /// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
 ///
@@ -3378,10 +3445,14 @@ fn render_local_shared_f32_callback(
     // à zéro, le gain glisse sur quelques dizaines de millisecondes. `arm(0)`
     // — DoP, PURE, sortie exclusive — rend exactement la coupure franche
     // d'avant.
+    use crate::audio::dop_continu::{haut_f32, repos_f32};
     ramp.arm(armed_ms);
     let silence = paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed);
+    // #7704 — sur un porteur DoP, chaque période muette est faite de trames
+    // de repos (0x69, marqueurs alternés), jamais de zéros.
     if ramp.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-        periode_muette(ring, output, 0.0);
+        ramp.dop.combler(output, 0.0, repos_f32);
+        ring.starvation().record_silent_period(output.len());
         return 0;
     }
     // Wait for a minimum amount of data before starting to read from the ring
@@ -3389,16 +3460,27 @@ fn render_local_shared_f32_callback(
     // samples during track transitions.
     if !data_started.load(Ordering::Acquire) {
         if ring.available() < min_buffer_samples {
-            periode_muette(ring, output, 0.0);
+            ramp.dop.combler(output, 0.0, repos_f32);
+            ring.starvation().record_silent_period(output.len());
             return 0;
         }
         data_started.store(true, Ordering::Release);
     }
-    let read = ring.pop(output);
+    // #7704 — à la reprise, une trame de repos si la première trame réelle
+    // répéterait le dernier marqueur émis.
+    let debut = ramp
+        .dop
+        .raccorder(ring.premier_en_attente(), output, haut_f32, repos_f32);
+    if debut > 0 {
+        ring.starvation().record_silent_period(debut);
+    }
+    let read = ring.pop(&mut output[debut..]);
+    let fin = debut + read;
+    ramp.dop.observer(&output[debut..fin], haut_f32);
     let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
-    ramp.apply(&mut output[..read], v);
-    if read < output.len() {
-        output[read..].fill(0.0);
+    ramp.apply(&mut output[debut..fin], v);
+    if fin < output.len() {
+        ramp.dop.combler(&mut output[fin..], 0.0, repos_f32);
     }
     read
 }
@@ -3817,13 +3899,16 @@ fn finish_windows_exclusive_probe(
 fn rebuild_local_convolver(
     config: &std::sync::Mutex<Option<crate::audio::convolver::ConvolverConfig>>,
     active: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    autorisee: &AtomicBool,
     sample_rate: u32,
     channels: u16,
 ) -> Result<bool, String> {
     let config = config
         .lock()
         .map_err(|_| "verrou de configuration du convolveur empoisonné".to_string())?
-        .clone();
+        .clone()
+        // #7632 — sans le droit Premium, aucun moteur : l'IR reste mémorisée.
+        .filter(|_| autorisee.load(Ordering::Relaxed));
     let next = match config {
         Some(config) => match config.build_for(1024, sample_rate, channels as usize) {
             Ok(convolver) => Some(convolver),
@@ -4092,6 +4177,27 @@ pub(crate) fn native_i32_to_pcm_bytes(samples: &[i32], bit_depth: u16, out: &mut
     count * bytes_per_sample
 }
 
+/// La quantification FINALE des chemins natifs exclusifs (WASAPI, route native
+/// ASIO, queue du DSP et reliquat de l'étage natif) : les flottants y arrivent
+/// après le DSP et après le volume logiciel, et repartent en mots de la
+/// profondeur de la source.
+///
+/// #7703 — c'était un arrondi nu. À volume réduit, une piste 16 bits
+/// requantifiée à 16 bits sans dither garde une erreur CORRÉLÉE au signal :
+/// à −30 dB il ne reste que quelques bits utiles, et la distorsion de
+/// quantification s'entend dans les fins de notes (prérequis 1 de la note
+/// « Upsampler Pro », #7614 : le gain en flottant, puis le dither comme
+/// dernière opération avant le puits). Le TPDF ±1 LSB du dépôt
+/// (`audio::dither`) s'ajoute désormais AVANT l'arrondi, à 16 et 24 bits.
+///
+/// À 32 bits, rien : un `f32` n'a que 24 bits de mantisse, le mot 32 bits est
+/// déjà plus fin que le signal qu'il porte (réponse Q6 de la note : TPDF seul,
+/// et à 24 bits).
+///
+/// Le chemin bit-perfect ne passe jamais ici (`pcm_bytes_to_native_i32`), le
+/// DoP non plus : aucun bruit n'est ajouté à un flux que Tune ne modifie pas.
+/// La graine dérive du contenu du bloc (même règle que `Dither::depuis_contenu`) :
+/// même bloc, même bruit, et aucune raie à la période du bloc.
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn f32_to_native_i32(samples: &[f32], bit_depth: u16) -> Vec<i32> {
     let (scale, max, shift) = match bit_depth {
@@ -4101,13 +4207,45 @@ fn f32_to_native_i32(samples: &[f32], bit_depth: u16) -> Vec<i32> {
         _ => return Vec::new(),
     };
     let min = -scale;
+    // « Pas de requantification, pas de dither » (règle de `audio::dither`) :
+    // un bloc dont chaque échantillon tombe déjà sur un mot exact — gain
+    // unité, matrice qui choisit ou coupe des voies, reliquat porté tel quel —
+    // sort à l'identité, sans bruit. Décidé par BLOC, pas par échantillon :
+    // dans un bloc réellement requantifié, tous les échantillons reçoivent le
+    // même bruit, et sa puissance ne dépend pas du signal.
+    let exact = samples
+        .iter()
+        .all(|s| (f64::from(*s) * scale).fract() == 0.0);
+    let mut dither = (bit_depth < 32 && !exact)
+        .then(|| crate::audio::dither::Dither::depuis_graine(graine_du_bloc_flottant(samples)));
     samples
         .iter()
         .map(|sample| {
-            let word = (f64::from(*sample) * scale).round().clamp(min, max) as i64;
+            let ideal = f64::from(*sample) * scale;
+            let bruit = dither.as_mut().map_or(0.0, |d| d.tirer());
+            let word = crate::audio::dither::quantifier_avec(ideal, bruit, min, max);
             (word << shift) as i32
         })
         .collect()
+}
+
+/// #7703 — graine du dither de [`f32_to_native_i32`] : FNV-1a sur la longueur
+/// et au plus 256 échantillons prélevés à pas constant. Bornée : le rendu ne
+/// lit pas tout le bloc pour tirer une graine.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+fn graine_du_bloc_flottant(samples: &[f32]) -> u64 {
+    const PREMIER: u64 = 0x0000_0100_0000_01b3;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ 0x4e41_5449_4600_7703;
+    for octet in (samples.len() as u64).to_le_bytes() {
+        h = (h ^ u64::from(octet)).wrapping_mul(PREMIER);
+    }
+    let pas = samples.len().div_ceil(256).max(1);
+    for s in samples.iter().step_by(pas) {
+        for octet in s.to_bits().to_le_bytes() {
+            h = (h ^ u64::from(octet)).wrapping_mul(PREMIER);
+        }
+    }
+    h
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
@@ -5828,6 +5966,7 @@ impl OutputTarget for LocalOutput {
         let current_format = self.current_format.clone();
         let convolver_config = self.convolver_config.clone();
         let convolver = self.convolver.clone();
+        let convolution_autorisee = self.convolution_autorisee.clone();
         let pure_bypass = self.pure_bypass.clone();
         // #3973 — lu UNE fois par piste, comme le reste de ce que
         // l'orchestrateur pose avant `play_url`.
@@ -6507,7 +6646,13 @@ impl OutputTarget for LocalOutput {
                 // forme de f32 — `is_dop_pcm`, qui inspecte des octets PCM
                 // bruts, n'a rien a y examiner.
                 current_format.store(LocalOutput::pack_format(dec_sr, dec_ch), Ordering::Relaxed);
-                match rebuild_local_convolver(&convolver_config, &convolver, dec_sr, dec_ch) {
+                match rebuild_local_convolver(
+                    &convolver_config,
+                    &convolver,
+                    &convolution_autorisee,
+                    dec_sr,
+                    dec_ch,
+                ) {
                     Ok(true) => info!(
                         sample_rate = dec_sr,
                         channels = dec_ch,
@@ -6688,7 +6833,13 @@ impl OutputTarget for LocalOutput {
                 LocalOutput::pack_format(sample_rate, channels),
                 Ordering::Relaxed,
             );
-            match rebuild_local_convolver(&convolver_config, &convolver, sample_rate, channels) {
+            match rebuild_local_convolver(
+                &convolver_config,
+                &convolver,
+                &convolution_autorisee,
+                sample_rate,
+                channels,
+            ) {
                 Ok(true) => info!(sample_rate, channels, "local_convolver_built_for_stream"),
                 Ok(false) => {}
                 Err(error) => warn!(
@@ -7601,6 +7752,7 @@ impl OutputTarget for LocalOutput {
                     match rebuild_local_convolver(
                         &convolver_config,
                         &convolver,
+                        &convolution_autorisee,
                         sample_rate,
                         channels,
                     ) {
@@ -8529,6 +8681,9 @@ pub(crate) use crate::audio::resample::{rubato_resample_chunk, rubato_resample_t
 
 #[cfg(test)]
 mod tests;
+// #7632 — la convolution par RI est un droit Premium, éteinte sans clic.
+#[cfg(test)]
+mod convolution_sous_licence_7632;
 
 #[cfg(test)]
 mod open_failure_tests;

@@ -1124,6 +1124,11 @@ mod demarrage_fige_5522;
 #[cfg(test)]
 mod demarrage_fige_5522_tests;
 
+/// #7636 — la liste qu'un autre point de contrôle a chargée dans un renderer
+/// OpenHome reste intacte : le banc, vrai sondeur et sortie factice.
+#[cfg(test)]
+mod liste_d_un_autre_point_de_controle_7636_tests;
+
 /// #6541 — au-dessus de la limite de sécurité, le volume du renderer n'est
 /// pas adopté : il est ramené sous la limite.
 mod volume_plafond_6541;
@@ -1145,6 +1150,9 @@ mod releve_ne_monte_pas_6739;
 /// #6739 — ses témoins, sur le vrai sondeur et le vrai orchestrateur.
 #[cfg(test)]
 mod releve_ne_monte_pas_6739_tests;
+/// #6721 — le relevé de l'appareil devient le repère de la garde de hausse.
+#[cfg(test)]
+mod repere_de_hausse_6721_tests;
 /// #5662 — un renderer à 100 % ignoré par l'adoption est signalé au journal.
 mod volume_100_ignore_5662;
 /// #6008 — l'adoption du volume du renderer est dite au journal.

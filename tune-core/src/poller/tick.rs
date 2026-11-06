@@ -10,6 +10,12 @@ impl PositionPoller {
         let states = self.playback.all_states().await;
         for s in &states {
             if s.state == PlayState::Playing && s.position_ms > 0 {
+                // #7852 — le point de décision unique de l'écoute validée :
+                // historique, compteur d'écoutes et « Reprendre l'écoute »
+                // naissent ici, au seuil min(30 s, 50 %), pas au démarrage.
+                // Avant `track_position`, qui ne fait que suivre une reprise
+                // déjà créée.
+                self.orchestrator.valider_l_ecoute(s);
                 if let Err(e) = crate::db::listening_resume::track_position(&self.db, s) {
                     tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_titre_non_enregistree");
                 }
@@ -1099,6 +1105,61 @@ impl PositionPoller {
                     }
                 }
             };
+
+            // ── #7636 — un autre point de contrôle tient le renderer OpenHome ──
+            //
+            // Kazoo a chargé sa liste et la joue. Tant que la zone se croit en
+            // lecture, la suite de ce tour prend le morceau de Kazoo pour le
+            // sien : à sa fin, elle enchaîne sur la piste suivante de la file
+            // (`play_media`, dont le `DeleteAll` efface cette liste, puis
+            // l'`Insert` de la suivante armée). Pendant les relevés qui
+            // précèdent le verdict, le tour s'arrête donc ici, position
+            // comprise : celle que rapporte l'appareil est celle de Kazoo, pas
+            // la nôtre. Au troisième, la zone lâche l'appareil sans lui envoyer
+            // d'ordre. Juste après un chargement fait par Tune, l'URI
+            // rapportée peut être encore l'ancienne : rien n'est compté avant
+            // `decisions::DELAI_AVANT_DE_JUGER_LA_TENUE_SECS`, et la série
+            // repart de zéro. Voir
+            // `decisions::renderer_tenu_par_un_autre_point_de_controle`.
+            if zone_state.state == PlayState::Playing
+                && !decisions::tenue_jugeable(ps.track_loaded_at.elapsed().as_secs())
+            {
+                ps.tenue_etrangere_ticks = 0;
+            } else if zone_state.state == PlayState::Playing {
+                let output_type = all_zones
+                    .iter()
+                    .find(|z| z.id == Some(zone_id))
+                    .and_then(|z| z.output_type.as_deref())
+                    .unwrap_or("");
+                let notre_flux = zone_state
+                    .now_playing
+                    .as_ref()
+                    .and_then(|np| np.stream_id.as_deref());
+                let tenue =
+                    decisions::qui_tient_le_renderer(status.current_uri.as_deref(), notre_flux);
+                if decisions::renderer_tenu_par_un_autre_point_de_controle(
+                    output_type,
+                    &tenue,
+                    notre_flux.is_some(),
+                ) {
+                    ps.tenue_etrangere_ticks = ps.tenue_etrangere_ticks.saturating_add(1);
+                    if ps.tenue_etrangere_ticks >= decisions::RELEVES_AVANT_DE_CEDER {
+                        warn!(
+                            zone_id,
+                            device = %device_id,
+                            uri = ?status.current_uri,
+                            "renderer_cede_a_un_autre_point_de_controle — la zone lâche l'appareil sans lui envoyer d'ordre"
+                        );
+                        poll_states.remove(&zone_id);
+                        self.orchestrator.ceder_la_zone_a_un_tiers(zone_id).await;
+                        if let Some(ref bus) = self.event_bus {
+                            bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+                        }
+                    }
+                    continue;
+                }
+                ps.tenue_etrangere_ticks = 0;
+            }
 
             // ── #6612 — plage hors fichier après une reprise : nouveau flux ──
             //

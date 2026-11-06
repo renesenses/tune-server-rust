@@ -686,7 +686,11 @@ pub async fn register_manual_device(
             .with_upnp_silence(crate::config::resolve_upnp_silence(
                 &state.backend,
                 &device_id,
-            ));
+            ))
+            // #6335 — l'annonce de `SetNextAVTransportURI`.
+            .with_av_transport_scpd(
+                crate::discovery_setup::scpd_av_transport_du_descriptif(&dev.host, dev.port, &desc),
+            );
             state.outputs.lock().await.register(Box::new(dlna));
 
             let zone_id = ensure_zone(state, &device_name, "dlna", &device_id);
@@ -922,7 +926,7 @@ pub fn persist_discovered_dlna(backend: &Arc<dyn DbBackend>, entry: &DiscoveredD
 /// Le type porte maintenant la decision, pas le texte : ajouter une cause
 /// oblige a dire ce qu'on en fait, et un message ne peut plus en couvrir deux.
 #[derive(Debug)]
-enum ReprobeFailure {
+pub(crate) enum ReprobeFailure {
     /// L'appareil n'a pas repondu, ou mal : la panne peut etre passagere, on
     /// retente avec le backoff.
     Unreachable(String),
@@ -1128,7 +1132,7 @@ async fn reprobe_dlna_with_backoff(state: &AppState, dev: DiscoveredDlnaDevice) 
 
 /// Probe a persisted DLNA renderer at its stored LOCATION and, if the
 /// descriptor's UUID still matches, register the output + re-attach its zone.
-async fn register_discovered_dlna(
+pub(crate) async fn register_discovered_dlna(
     state: &AppState,
     dev: &DiscoveredDlnaDevice,
 ) -> Result<String, ReprobeFailure> {
@@ -1263,6 +1267,10 @@ async fn register_discovered_dlna(
     .with_upnp_silence(crate::config::resolve_upnp_silence(
         &state.backend,
         &dev.uuid,
+    ))
+    // #6335 — l'annonce de `SetNextAVTransportURI`.
+    .with_av_transport_scpd(crate::discovery_setup::scpd_av_transport_du_descriptif(
+        &dev.host, dev.port, &desc,
     ));
     // Registry is keyed by device_id (the uuid): a later multicast discovery
     // replaces this entry rather than duplicating it.
@@ -1415,7 +1423,13 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
                             &desc.event_sub_urls(),
                         ),
                     )
-                    .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &d.id));
+                    .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &d.id))
+                    // #6335 — l'annonce de `SetNextAVTransportURI`.
+                    .with_av_transport_scpd(
+                        crate::discovery_setup::scpd_av_transport_du_descriptif(
+                            &d.host, d.port, &desc,
+                        ),
+                    );
                     outputs.register(Box::new(dlna));
                     registered += 1;
                 }
