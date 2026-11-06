@@ -3059,11 +3059,18 @@ impl PlaybackOrchestrator {
         } else {
             crate::audio::volume_limites::lire_effectives(&self.db, zone_id)
         };
+        // #6721 — le repère des deux gardes : le plus bas de la mémoire de la
+        // zone et du dernier niveau connu de l'appareil (`repere_de_hausse_6721`).
+        // La mémoire peut être plus haute que ce que l'appareil joue
+        // (démarrage, baisse à la télécommande non adoptée) : « baisser » au
+        // curseur depuis la mémoire ferait alors MONTER l'appareil d'un coup.
+        let memoire = self.playback.get_state(zone_id).await.volume;
+        let niveau_de_l_appareil = self.niveaux_des_appareils.connu(zone_id);
+        let repere = super::repere_de_hausse_6721::repere_de_hausse(memoire, niveau_de_l_appareil);
         let volume = if limites.est_vide() {
             volume
         } else {
-            let actuel = self.playback.get_state(zone_id).await.volume;
-            let retenu = limites.borner(volume, actuel, origine);
+            let retenu = limites.borner(volume, repere, origine);
             if retenu < volume {
                 info!(
                     zone_id,
@@ -3086,7 +3093,7 @@ impl PlaybackOrchestrator {
         let (volume, hausse_plafonnee) = if pure_force {
             (volume, false)
         } else {
-            let actuel = self.playback.get_state(zone_id).await.volume;
+            let actuel = repere;
             let echelle = crate::audio::volume_scale::EchelleDeVolume::de_la_sortie(
                 zone.as_ref().and_then(|z| z.output_type.as_deref()),
             );
@@ -3097,6 +3104,8 @@ impl PlaybackOrchestrator {
                     actuel,
                     demande = volume,
                     retenu,
+                    memoire,
+                    niveau_de_l_appareil,
                     seuil_db = crate::audio::garde_de_hausse::SEUIL_DE_HAUSSE_DB,
                     volume_curve = echelle.code(),
                     "volume_hausse_plafonnee_par_la_garde"
@@ -3234,6 +3243,8 @@ impl PlaybackOrchestrator {
             let plus_recent = etat.dernier_ticket != ticket;
             match resultat {
                 Ok(()) => {
+                    // #6721 — l'appareil a accepté : c'est son niveau connu.
+                    self.niveaux_des_appareils.noter(zone_id, volume);
                     let lever_l_erreur = std::mem::take(&mut etat.echec_depuis_succes);
                     etat.confirme = if plus_recent { Some(volume) } else { None };
                     if lever_l_erreur && !plus_recent {

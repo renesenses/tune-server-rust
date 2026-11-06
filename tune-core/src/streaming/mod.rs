@@ -4,6 +4,7 @@ pub mod appariement_favoris_radio;
 pub mod cadence_du_flux;
 pub mod deezer;
 pub mod deezer_decrypt;
+pub mod editorial_bibliotheque;
 pub mod favorites_date;
 pub mod favorites_identity;
 pub mod favorites_import;

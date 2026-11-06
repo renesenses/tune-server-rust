@@ -2350,11 +2350,32 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     let zone_count = zone_repo.count().unwrap_or(0);
     let zone_settings_ignored = tune_core::db::zone_repo::zone_settings_ignored();
     let asio_warm_scan = crate::startup::asio_warm_status();
+    // #7841 — la ligne Markdown du volume de chaque zone, dans l'ordre de
+    // `zones`.
+    let mut zones_volume_md: Vec<Option<String>> = Vec::new();
     let zones: Vec<Value> = zone_repo
         .list()
         .unwrap_or_default()
         .iter()
-        .map(|z| json!({ "id": z.id, "name": z.name, "output_type": z.output_type }))
+        .map(|z| {
+            // #7841 — le trim et les limites de la zone, pour qu'un rapport
+            // suffise à dire pourquoi un volume de 30 ne s'entend plus.
+            let volume = z.id.map(|id| {
+                tune_core::audio::volume_au_rapport::lire(
+                    &state.backend,
+                    id,
+                    z.volume / 100.0,
+                    z.output_type.as_deref().unwrap_or(""),
+                )
+            });
+            zones_volume_md.push(volume.as_ref().map(|v| v.ligne_markdown()));
+            json!({
+                "id": z.id,
+                "name": z.name,
+                "output_type": z.output_type,
+                "volume": volume,
+            })
+        })
         .collect();
     // #6378 — `count()` et `list()` ignorent les zones masquées : sans cette
     // lecture, « Zones (0) » ne distingue pas « aucune zone » de « la seule
@@ -2554,12 +2575,15 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push('\n');
 
     md.push_str(&format!("## Zones ({zone_count})\n"));
-    for z in &zones {
+    for (i, z) in zones.iter().enumerate() {
         md.push_str(&format!(
             "- {} ({})\n",
             z["name"].as_str().unwrap_or("?"),
             z["output_type"].as_str().unwrap_or("?")
         ));
+        if let Some(Some(volume)) = zones_volume_md.get(i) {
+            md.push_str(&format!("  - {volume}\n"));
+        }
     }
     md.push_str(&lignes_zones_masquees(&zones_masquees));
     md.push_str(&format!(
@@ -5393,5 +5417,59 @@ mod zones_masquees_au_rapport_6378 {
             lignes_zones_masquees(&Err("no such column".into())),
             "- Zones masquées : illisibles (no such column)\n"
         );
+    }
+}
+
+/// #7841 — Linn Klimax en OpenHome : « à 30, plus de son ». Le rapport ne
+/// disait de chaque zone que son nom et son type ; un trim de −12 dB ou une
+/// limite de sécurité, qui font partir 30 % bien plus bas, n'y paraissaient
+/// pas. L'épreuve lit le rapport tel que le testeur le colle (Markdown) et
+/// son JSON.
+#[cfg(test)]
+mod volume_des_zones_au_rapport_7841 {
+    use super::*;
+    use tune_core::db::zone_repo::ZoneRepo;
+
+    #[tokio::test]
+    async fn le_rapport_dit_le_trim_et_la_limite_de_chaque_zone() {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("AppState");
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zone_id = repo
+            .create("Klimax", Some("openhome"), Some("uuid:linn-7841"))
+            .unwrap();
+        repo.update_volume(zone_id, 30.0).unwrap();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings
+            .set(&format!("zone_{zone_id}_gain_trim_db"), "-12")
+            .unwrap();
+        settings
+            .set(
+                &tune_core::audio::volume_limites::cle_securite(zone_id),
+                "0.25",
+            )
+            .unwrap();
+
+        let Json(rapport) = generate_bug_report(State(state)).await;
+
+        let md = rapport["markdown"].as_str().unwrap_or_default();
+        let ligne = md
+            .lines()
+            .find(|l| l.contains("gain trim"))
+            .unwrap_or_else(|| panic!("#7841 : aucune ligne de trim dans le rapport :\n{md}"));
+        for attendu in [
+            "volume 30 %",
+            "gain trim -12.0 dB",
+            "safety limit 25 %",
+            "device setpoint 7.5 %",
+        ] {
+            assert!(ligne.contains(attendu), "{attendu} absent de : {ligne}");
+        }
+        let zone = rapport["zones"]["items"]
+            .as_array()
+            .and_then(|z| z.iter().find(|z| z["id"] == json!(zone_id)))
+            .cloned()
+            .expect("la zone dans le JSON du rapport");
+        assert_eq!(zone["volume"]["gain_trim_db"], json!(-12.0));
+        assert_eq!(zone["volume"]["limite_securite"], json!(0.25));
     }
 }

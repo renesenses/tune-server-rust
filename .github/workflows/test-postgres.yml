@@ -109,7 +109,9 @@ jobs:
     # du 01/09/2026 — le job tenait en 6 min 21 et 6 min 31 sur les deux
     # dernieres executions reelles, et `tune-server` ajoute une compilation
     # froide de ~4 min. Un plafond ne peut que faire echouer plus tot.
-    timeout-minutes: 75
+    # 100 depuis le 06/11 : les passages réussis du lot rc11 prenaient déjà
+    # 52 à 75 min, au ras du plafond de 75, qui a coupé #7989 à 75 min.
+    timeout-minutes: 100
 
     services:
       postgres:
@@ -128,9 +130,29 @@ jobs:
 
     env:
       CARGO_TERM_COLOR: always
+      # Depuis le 05/11, GitHub arrête la machine en pleine compilation
+      # (« The runner has received a shutdown signal », code 143) : la
+      # machine gratuite manque de mémoire et de disque sur ce job. Pas
+      # d'informations de débogage : les tests n'en ont pas besoin, et c'est
+      # elles qui pèsent le plus en mémoire à l'édition de liens et sur le
+      # disque. Trois compilations à la fois (deux, essayées le 05/11, ont
+      # dépassé le plafond de durée ; quatre est la valeur par défaut).
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
 
     steps:
       - uses: actions/checkout@v4
+
+      # Libère ~25 Gio sur la machine GitHub (outils préinstallés dont ce job
+      # n'a pas besoin), avant que la compilation ne remplisse le disque.
+      - name: Libérer de la place sur le disque
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -199,6 +221,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5998 -- --nocapture --test-threads=1
 
+      # #7856 — contrôle parental : stockage, révision optimiste, droits du
+      # superviseur et filtre relu de la base. Sans cette étape, l'épreuve
+      # prendrait son saut annoncé.
+      - name: Contrôle parental sur PostgreSQL (#7856)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7856 -- --nocapture --test-threads=1
+
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -266,6 +296,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_6463 -- --nocapture --test-threads=1
+
+      # #7849 : notes personnelles et répartitions de la bibliothèque sur une
+      # vraie base : script 103 (reprise des notes d'album, rejouable),
+      # séparation par profil, recherche, répartitions. Le témoin retire la
+      # table et vide les tables qu'il lit : il tourne seul, dans son étape.
+      - name: Notes personnelles et répartitions sur PostgreSQL (#7849)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7849 -- --nocapture --test-threads=1
 
       # #7535 : un MBID trouvé par le nom n'est plus posé s'il est déjà porté
       # par une autre fiche (garde NOT EXISTS de poser_mbid, $4/$5).
@@ -795,6 +834,24 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_4984 -- --nocapture --test-threads=1
 
+      # #7765 — la SOURCE des crédits de piste (migration PG 102). Attribution
+      # unique des lignes existantes, purge limitée à la source réécrite et
+      # filtre « à faire » qui ignore les balises, joués sur la VRAIE base.
+      # Sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Source des crédits de piste sur PostgreSQL (#7765)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_source_7765 -- --nocapture --test-threads=1
+
+      # #7027 — une bio rangée sans langue (`bio_lang` NULL ou vide, écrite
+      # par le streaming ou le fonds communautaire) n'est jamais servie comme
+      # de l'anglais. La cause porte sur la VALEUR de `bio_lang` : il faut le
+      # moteur ; sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Biographie sans langue jamais servie comme de l'anglais sur PostgreSQL (#7027)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_bio_langue_7027 -- --nocapture --test-threads=1
+
       # #5007 — la purge des artistes orphelins. PostgreSQL refusait le DELETE
       # entier par `albums_artist_id_fkey` dès qu'un artiste d'album n'avait
       # aucune piste à lui : plus aucun orphelin purgé. Sans cette étape, le
@@ -856,6 +913,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_requete_textuelle_6287 -- --nocapture --test-threads=1
+
+      # #7848 — la grammaire de requêtes compilée en SQL paramétré : le même
+      # jeu de pistes et de crédits rend les mêmes pistes que sur SQLite (rôles
+      # en EXISTS, plages, négation, valeurs piégées). Sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Grammaire de requêtes sur PostgreSQL (#7848)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7848 -- --nocapture --test-threads=1
 
       # #6122 — « dans les N derniers jours » : des littéraux calculés à chaque
       # requête (secondes pour `file_mtime`, ISO pour `listened_at`) au lieu de

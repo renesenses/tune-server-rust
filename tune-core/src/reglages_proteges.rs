@@ -67,6 +67,9 @@ const PREFIXES_PROTEGES: &[&str] = &[
     "cloud_server_",
     "sauvegarde_cloud_",
     "developer_",
+    // #7855 : l'accès Subsonic ouvre une surface réseau, et il est Premium ;
+    // il ne s'allume que par sa route dédiée.
+    "subsonic_",
 ];
 
 /// Suffixes qui désignent un chemin, un exécutable ou l'adresse d'un service.
