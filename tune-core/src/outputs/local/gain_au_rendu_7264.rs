@@ -298,7 +298,8 @@ mod tests {
     }
 
     /// La rampe ne fait jamais de marche : d'une trame à la suivante, l'écart
-    /// est d'au plus un pas de rampe (+1 d'arrondi), monotone vers la cible.
+    /// est d'au plus un pas de rampe (+1 d'arrondi, +2 du TPDF de #7703),
+    /// monotone vers la cible.
     #[test]
     fn la_rampe_du_volume_glisse_sans_marche() {
         let anneau = anneau_de_deux_secondes();
@@ -312,13 +313,17 @@ mod tests {
                 rendre_une_periode(&anneau, &mut gain)
                     .chunks_exact(2)
                     .map(|t| {
-                        assert_eq!(t[0], t[1], "même facteur pour les voies d'une trame");
+                        // #7703 : chaque voie reçoit son tirage TPDF (±1 LSB).
+                        assert!(
+                            (t[0] - t[1]).abs() <= 2,
+                            "même facteur pour les voies d'une trame : {t:?}"
+                        );
                         t[0]
                     }),
             );
         }
         let trames_de_rampe = (CADENCE * RAMPE_DU_VOLUME_MS / 1000) as f64;
-        let pas_max = (f64::from(0x40_0000) / trames_de_rampe).ceil() as i32 + 1;
+        let pas_max = (f64::from(0x40_0000) / trames_de_rampe).ceil() as i32 + 3;
         for fenetre in gauche.windows(2) {
             assert!(fenetre[1] <= fenetre[0], "monotone vers le silence");
             assert!(
@@ -461,8 +466,10 @@ mod tests {
             "50 % du curseur db60 doivent sortir à −30 dB, mesuré {db:.2} dB \
              ({effectif} millièmes)"
         );
+        // #7703 : le mot pondéré porte le TPDF (±1 LSB) ; le gain, lui, est
+        // constant.
         assert!(
-            rendu.iter().all(|&m| m == rendu[0]),
+            rendu.iter().all(|&m| (m - rendu[0]).abs() <= 2),
             "gain constant, sans rampe"
         );
     }
