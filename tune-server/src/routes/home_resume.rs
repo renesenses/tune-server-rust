@@ -52,6 +52,8 @@ pub(super) async fn resume_listening(
             cover_url: cover_url.clone(),
             duration_ms: Some((*duration_ms).max(0) as u64),
             seek_ms: Some(resumes::rewind(r.position_ms, seconds)),
+            // Sans type gardé, l'extension puis l'hébergeur le disent (#7894).
+            mime_type: None,
         };
         let response = super::super::podcasts::play_episode(
             State(state.clone()),
