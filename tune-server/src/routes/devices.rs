@@ -21,6 +21,8 @@ use tune_core::outputs::dlna::DlnaOutput;
 
 use crate::state::AppState;
 
+mod jumelage_airplay_7447;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_devices))
@@ -686,7 +688,11 @@ pub async fn register_manual_device(
             .with_upnp_silence(crate::config::resolve_upnp_silence(
                 &state.backend,
                 &device_id,
-            ));
+            ))
+            // #6335 — l'annonce de `SetNextAVTransportURI`.
+            .with_av_transport_scpd(
+                crate::discovery_setup::scpd_av_transport_du_descriptif(&dev.host, dev.port, &desc),
+            );
             state.outputs.lock().await.register(Box::new(dlna));
 
             let zone_id = ensure_zone(state, &device_name, "dlna", &device_id);
@@ -922,7 +928,7 @@ pub fn persist_discovered_dlna(backend: &Arc<dyn DbBackend>, entry: &DiscoveredD
 /// Le type porte maintenant la decision, pas le texte : ajouter une cause
 /// oblige a dire ce qu'on en fait, et un message ne peut plus en couvrir deux.
 #[derive(Debug)]
-enum ReprobeFailure {
+pub(crate) enum ReprobeFailure {
     /// L'appareil n'a pas repondu, ou mal : la panne peut etre passagere, on
     /// retente avec le backoff.
     Unreachable(String),
@@ -1128,7 +1134,7 @@ async fn reprobe_dlna_with_backoff(state: &AppState, dev: DiscoveredDlnaDevice) 
 
 /// Probe a persisted DLNA renderer at its stored LOCATION and, if the
 /// descriptor's UUID still matches, register the output + re-attach its zone.
-async fn register_discovered_dlna(
+pub(crate) async fn register_discovered_dlna(
     state: &AppState,
     dev: &DiscoveredDlnaDevice,
 ) -> Result<String, ReprobeFailure> {
@@ -1263,6 +1269,10 @@ async fn register_discovered_dlna(
     .with_upnp_silence(crate::config::resolve_upnp_silence(
         &state.backend,
         &dev.uuid,
+    ))
+    // #6335 — l'annonce de `SetNextAVTransportURI`.
+    .with_av_transport_scpd(crate::discovery_setup::scpd_av_transport_du_descriptif(
+        &dev.host, dev.port, &desc,
     ));
     // Registry is keyed by device_id (the uuid): a later multicast discovery
     // replaces this entry rather than duplicating it.
@@ -1415,7 +1425,13 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
                             &desc.event_sub_urls(),
                         ),
                     )
-                    .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &d.id));
+                    .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &d.id))
+                    // #6335 — l'annonce de `SetNextAVTransportURI`.
+                    .with_av_transport_scpd(
+                        crate::discovery_setup::scpd_av_transport_du_descriptif(
+                            &d.host, d.port, &desc,
+                        ),
+                    );
                     outputs.register(Box::new(dlna));
                     registered += 1;
                 }
@@ -2117,85 +2133,21 @@ async fn list_ignored_devices(State(state): State<AppState>) -> impl IntoRespons
 // Device Pairing
 // ---------------------------------------------------------------------------
 
+/// Corps facultatif : le client web envoie `POST /pair` sans corps (#7447).
+/// `friendly_name` reste accepté, sans effet sur le jumelage.
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct PairRequest {
     friendly_name: Option<String>,
 }
 
+/// `POST /devices/{id}/pair` — voir `jumelage_airplay_7447`.
 async fn pair_device(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
-    Json(body): Json<PairRequest>,
+    _body: Option<Json<PairRequest>>,
 ) -> impl IntoResponse {
-    // Check if this is an AirPlay 2 device — trigger PIN display
-    let is_airplay2 = device_id.starts_with("airplay2:");
-    let host = if is_airplay2 {
-        let outputs = state.outputs.lock().await;
-        if let Some(arc) = outputs.get(&device_id) {
-            let o = arc.lock().await;
-            o.host().map(|h| h.to_string())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    if is_airplay2 {
-        if let Some(host) = host {
-            let url = format!("http://{}:7000/pair-pin-start", host);
-            let client = tune_core::http::client::shared();
-            match client
-                .post(&url)
-                .timeout(std::time::Duration::from_secs(5))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    tracing::info!(device = %device_id, "airplay2_pair_pin_start_triggered");
-                    return Json(json!({
-                        "status": "awaiting_pin",
-                        "device_id": device_id,
-                        "message": "Enter the 4-digit PIN shown on the device screen",
-                    }))
-                    .into_response();
-                }
-                Ok(resp) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        Json(json!({
-                            "error": format!("device returned HTTP {}", resp.status()),
-                        })),
-                    )
-                        .into_response();
-                }
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        Json(json!({
-                            "error": format!("failed to reach device: {e}"),
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
-    }
-
-    // Non-AirPlay 2: simple pair registration
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let key = format!("device_pair_{device_id}");
-    let data = json!({
-        "device_id": device_id,
-        "friendly_name": body.friendly_name,
-        "paired_at": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        "status": "paired",
-    });
-    settings.set(&key, &data.to_string()).ok();
-    (StatusCode::CREATED, Json(data)).into_response()
+    jumelage_airplay_7447::jumeler(&state, &device_id).await
 }
 
 #[derive(Deserialize)]
@@ -2203,97 +2155,22 @@ struct PairPinRequest {
     pin: String,
 }
 
+/// `POST /devices/{id}/pair/pin` — le code parvient au récepteur (#7447).
 async fn pair_device_pin(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
     Json(body): Json<PairPinRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    // Check if there's a pending pin
-    let pending_key = format!("device_pair_pin_{device_id}");
-    let expected = settings.get(&pending_key).ok().flatten();
-    if let Some(ref expected_pin) = expected {
-        if expected_pin != &body.pin {
-            return (StatusCode::FORBIDDEN, Json(json!({"error": "invalid PIN"}))).into_response();
-        }
-    }
-    // Mark device as paired
-    let key = format!("device_pair_{device_id}");
-    let data = json!({
-        "device_id": device_id,
-        "paired_at": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        "status": "paired",
-        "pin_verified": true,
-    });
-    settings.set(&key, &data.to_string()).ok();
-    settings.delete(&pending_key).ok();
-    Json(data).into_response()
+    jumelage_airplay_7447::confier_le_code(&state, &device_id, &body.pin).await
 }
 
-/// Trigger AirPlay 2 PIN display on an Apple TV.
-/// The device shows a 4-digit PIN that the user enters via POST /pair/pin.
+/// Demande au récepteur AirPlay 2 d'afficher son code, par le composant
+/// AirPlay 2 (#7447) ; le code se saisit ensuite par `POST /pair/pin`.
 async fn airplay2_pair_pin_start(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
 ) -> impl IntoResponse {
-    // Find the device's host from the output registry
-    let host = {
-        let outputs = state.outputs.lock().await;
-        if let Some(arc) = outputs.get(&device_id) {
-            let o = arc.lock().await;
-            o.host().map(|h| h.to_string())
-        } else {
-            None
-        }
-    };
-    let host = match host {
-        Some(h) => h,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "device not found or not connected"})),
-            )
-                .into_response();
-        }
-    };
-    let port = 7000u16;
-
-    // POST /pair-pin-start to the Apple TV
-    let url = format!("http://{}:{}/pair-pin-start", host, port);
-    let client = tune_core::http::client::shared();
-    match client
-        .post(&url)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            tracing::info!(device = %device_id, host = %host, "airplay2_pair_pin_start_sent");
-            Json(json!({
-                "status": "pin_requested",
-                "device_id": device_id,
-                "message": "Check the device screen for a 4-digit PIN",
-            }))
-            .into_response()
-        }
-        Ok(resp) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "error": format!("device returned HTTP {}", resp.status()),
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "error": format!("failed to reach device: {e}"),
-            })),
-        )
-            .into_response(),
-    }
+    jumelage_airplay_7447::demander_le_code(&state, &device_id).await
 }
 
 #[cfg(test)]

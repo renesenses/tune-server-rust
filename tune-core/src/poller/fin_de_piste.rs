@@ -1299,14 +1299,20 @@ impl PositionPoller {
                             || url_lc.ends_with(".dff");
                         if next_is_dsd {
                             let annonce_suivante = output.annonce_la_suivante().await;
-                            if !self
+                            // #6335 — la ligne dit laquelle des conditions a
+                            // manqué : limite du renderer, sondage sans
+                            // réponse ou SCPD jamais lu par Tune.
+                            if let Some(refus) = self
                                 .orchestrator
-                                .dsd_suivant_tenu_sur_dlna(device_id, annonce_suivante)
+                                .refus_dsd_suivant_sur_dlna(device_id, annonce_suivante)
                                 .await
                             {
                                 info!(
                                     zone_id,
+                                    device_id,
                                     mime = %resolved.mime_type,
+                                    raison = refus.raison(),
+                                    annonce_suivante = ?annonce_suivante,
                                     "gapless_skipped_dsd_next_dlna"
                                 );
                                 return GaplessPrep::DsdNextSkipped;

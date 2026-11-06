@@ -3174,8 +3174,8 @@ pub(super) async fn update_install(
             }
 
             // Success: install_windows/install_unix have copied the binary + web/
-            // into the install dir (the Windows .bat swap works entirely within
-            // exe_dir), so the extraction dir is no longer needed. Removing it here
+            // into the install dir (on Windows, staged next to their targets for
+            // the .bat swap), so the extraction dir is no longer needed. Removing it here
             // stops the per-version accumulation.
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
@@ -3196,7 +3196,8 @@ pub(super) async fn update_install(
 
         // --- Restart ---
         //
-        // Le nouveau binaire est en place sur le disque : la mise à jour est
+        // Le nouveau binaire est en place sur le disque (sous Windows : posé à
+        // côté, avec web/, pour la bascule du script) : la mise à jour est
         // acquise. Il ne reste que l'échange d'image, et c'est LUI, et lui
         // seul, qui coupe le son. On ne le fait pas au milieu d'un morceau
         // (#2954) — pas même quand la requête portait `force`, qui décrivait
@@ -3821,6 +3822,7 @@ fn install_unix(
 /// Les deux invariants que verrouillent les tests : le chemin nominal se
 /// termine par `exit /b 0` avant `:swap_failed`, et le script ne se supprime
 /// jamais lui-même.
+#[allow(clippy::too_many_arguments)]
 fn windows_update_bat(
     pid: u32,
     exe: &str,
@@ -3829,7 +3831,52 @@ fn windows_update_bat(
     exe_name: &str,
     exe_name_new: &str,
     sans_console: bool,
+    web: &[DossierWebEnAttente],
 ) -> String {
+    // #7750, #7754 — le `web/` servi ne se renomme pas tant que le serveur
+    // tourne (« Accès refusé. (os error 5) ») : il bascule ici, une fois le
+    // serveur sorti, AVANT le binaire. Le premier dossier est celui servi :
+    // s'il ne bascule pas, rien d'autre n'est touché (`:web_failed`, ancienne
+    // version relancée telle quelle). Le repli, lui, est au mieux.
+    // `move` d'un dossier vers un nom qui existe encore le range DEDANS : un
+    // `rmdir` resté partiel (fichier tenu par un antivirus) est donc suivi
+    // d'un `if exist` qui arrête avant le `move`.
+    let mut bascule_web = String::new();
+    let mut restaure_web = String::new();
+    let mut nettoie_web = String::new();
+    for (i, d) in web.iter().enumerate() {
+        let (cible, neuf, ancien) = (&d.cible, &d.neuf, &d.ancien);
+        let echec = if i == 0 {
+            "goto web_failed".to_string()
+        } else {
+            format!("goto web_done_{i}")
+        };
+        bascule_web.push_str(&format!(
+            "if not exist \"{neuf}\" goto web_done_{i}\r\n\
+             if exist \"{ancien}\" rmdir /s /q \"{ancien}\"\r\n\
+             if exist \"{ancien}\" {echec}\r\n\
+             if not exist \"{cible}\" goto web_place_{i}\r\n\
+             move \"{cible}\" \"{ancien}\" >nul 2>&1\r\n\
+             if exist \"{cible}\" {echec}\r\n\
+             :web_place_{i}\r\n\
+             move \"{neuf}\" \"{cible}\" >nul 2>&1\r\n\
+             if exist \"{cible}\" goto web_done_{i}\r\n\
+             if exist \"{ancien}\" move \"{ancien}\" \"{cible}\" >nul 2>&1\r\n\
+             {echec}\r\n\
+             :web_done_{i}\r\n"
+        ));
+        restaure_web.push_str(&format!(
+            "if not exist \"{ancien}\" goto web_restored_{i}\r\n\
+             rmdir /s /q \"{cible}\"\r\n\
+             if exist \"{cible}\" goto web_restored_{i}\r\n\
+             move \"{ancien}\" \"{cible}\" >nul 2>&1\r\n\
+             :web_restored_{i}\r\n"
+        ));
+        nettoie_web.push_str(&format!(
+            "if exist \"{ancien}\" rmdir /s /q \"{ancien}\"\r\n"
+        ));
+    }
+    let web_servi = web.first().map(|d| d.cible.as_str()).unwrap_or("web");
     // #6253 — un serveur lancé sans fenêtre revient sans fenêtre. Le script
     // hérite de l'environnement du détaché : il en retire le marqueur, sans
     // quoi le nouveau processus se croirait déjà détaché et servirait dans la
@@ -3862,6 +3909,8 @@ fn windows_update_bat(
          goto wait_loop\r\n\
          :do_swap\r\n\
          timeout /t 1 /nobreak >nul\r\n\
+         echo Replacing web interface...\r\n\
+         {bascule_web}\
          echo Replacing binary...\r\n\
          del \"{exe}\"\r\n\
          if exist \"{exe}\" (\r\n\
@@ -3871,26 +3920,56 @@ fn windows_update_bat(
          )\r\n\
          if exist \"{exe}\" goto swap_failed\r\n\
          rename \"{new}\" \"{exe_name}\"\r\n\
+         {nettoie_web}\
          echo Starting updated server...\r\n\
          set \"TUNE_OPEN_BROWSER=0\"\r\n\
          {relance}\r\n\
          exit /b 0\r\n\
+         :web_failed\r\n\
+         echo Tune update failed: could not replace the web folder {web_servi}.> \"{err_file}\"\r\n\
+         echo It was still in use. Nothing was replaced: Tune keeps its current version.>> \"{err_file}\"\r\n\
+         echo Retry the update, or install it with the setup file.>> \"{err_file}\"\r\n\
+         echo Update failed - web folder locked. Details written to {err_file}\r\n\
+         goto relaunch_old\r\n\
          :swap_failed\r\n\
+         {restaure_web}\
          echo Tune update failed: could not replace {exe_name}.> \"{err_file}\"\r\n\
          echo The old binary was still locked by a running process.>> \"{err_file}\"\r\n\
          echo The new version is staged next to it as {exe_name_new} — close Tune>> \"{err_file}\"\r\n\
          echo completely, delete {exe_name}, then rename {exe_name_new} to {exe_name}.>> \"{err_file}\"\r\n\
          echo Update failed - old binary locked. Details written to {err_file}\r\n\
+         :relaunch_old\r\n\
          set \"TUNE_OPEN_BROWSER=0\"\r\n\
          {relance}\r\n"
     )
 }
 
-/// La bascule Windows préparée : binaire posé à côté, script écrit, rien de
-/// lancé. Le lancement attend que la relance soit libre (#7750).
+/// Un dossier `web/` dont la copie neuve attend, à côté, la sortie du
+/// serveur pour basculer (#7750, #7754) : `cible` est remplacé par `neuf`,
+/// l'ancien étant parqué en `ancien` le temps de la bascule.
+struct DossierWebEnAttente {
+    cible: String,
+    neuf: String,
+    ancien: String,
+}
+
+impl DossierWebEnAttente {
+    fn de(cible: &std::path::Path) -> Self {
+        Self {
+            cible: cible.display().to_string(),
+            neuf: cible.with_extension("new").display().to_string(),
+            ancien: cible.with_extension("old").display().to_string(),
+        }
+    }
+}
+
+/// La bascule Windows préparée : binaire et `web/` posés à côté, script
+/// écrit, rien de lancé ni remplacé. Le lancement attend que la relance soit
+/// libre (#7750).
 struct BasculeWindows {
     bat: std::path::PathBuf,
     binaire_pose: std::path::PathBuf,
+    web_en_attente: Vec<std::path::PathBuf>,
 }
 
 impl BasculeWindows {
@@ -3906,10 +3985,13 @@ impl BasculeWindows {
         Ok(())
     }
 
-    /// Le script n'a pas pu partir : on retire le binaire posé, pour qu'aucun
-    /// reste ne passe pour une mise à jour en attente.
+    /// Le script n'a pas pu partir : on retire le binaire et les `web/` posés,
+    /// pour qu'aucun reste ne passe pour une mise à jour en attente.
     fn abandonner(&self) {
         let _ = std::fs::remove_file(&self.binaire_pose);
+        for cible in &self.web_en_attente {
+            let _ = std::fs::remove_dir_all(cible.with_extension("new"));
+        }
     }
 }
 
@@ -3921,13 +4003,37 @@ fn install_windows(
     let exe_dir = current_exe
         .parent()
         .ok_or_else(|| "Cannot determine binary directory".to_string())?;
+    preparer_la_bascule_windows(current_exe, new_binary, tmp_dir, &cibles_web(exe_dir))
+}
+
+/// La préparation de `install_windows`, les dossiers `web/` à remplacer
+/// donnés explicitement (testable sans toucher au CWD ni à `TUNE_WEB_DIR`).
+fn preparer_la_bascule_windows(
+    current_exe: &std::path::Path,
+    new_binary: &std::path::Path,
+    tmp_dir: &std::path::Path,
+    cibles: &[std::path::PathBuf],
+) -> Result<BasculeWindows, String> {
+    let exe_dir = current_exe
+        .parent()
+        .ok_or_else(|| "Cannot determine binary directory".to_string())?;
 
     let new_staging = current_exe.with_extension("new.exe");
     std::fs::copy(new_binary, &new_staging).map_err(|e| format!("copy new binary: {e}"))?;
     info!(staging = %new_staging.display(), "update_win_binary_staged");
 
-    update_web_dir(exe_dir, tmp_dir)?;
-    info!("update_win_web_swapped");
+    // #7750, #7754 — le `web/` servi n'est PAS remplacé ici : le serveur
+    // tourne encore et Windows refuse de renommer ce dossier (« swap new web/
+    // into place: Accès refusé. (os error 5) », fil 2617). On pose la copie
+    // neuve à côté ; le script la bascule après la sortie du serveur.
+    let web_en_attente = match preparer_le_web(&tmp_dir.join("web"), cibles) {
+        Ok(preparees) => preparees,
+        Err(e) => {
+            let _ = std::fs::remove_file(&new_staging);
+            return Err(e);
+        }
+    };
+    info!(dirs = web_en_attente.len(), "update_win_web_staged");
 
     // Wait for OUR specific PID to exit, not any process named tune-server.exe.
     // Matching by image name hangs forever whenever a second tune-server.exe is
@@ -3988,18 +4094,27 @@ fn install_windows(
             .unwrap_or_default()
             .to_string_lossy(),
         crate::lancement_sans_console::est_l_enfant_detache(),
+        &web_en_attente
+            .iter()
+            .map(|c| DossierWebEnAttente::de(c))
+            .collect::<Vec<_>>(),
     );
 
-    // A stale failure marker from a previous attempt would be misleading — clear it.
-    let _ = std::fs::remove_file(&err_file);
-    std::fs::write(&bat_path, bat_content).map_err(|e| format!("write update.bat: {e}"))?;
-    info!(bat = %bat_path.display(), "update_win_bat_written");
-
-    // #7750 — pas de lancement ici : voir `lancer_la_bascule_une_fois_libre`.
-    Ok(BasculeWindows {
+    let bascule = BasculeWindows {
         bat: bat_path,
         binaire_pose: new_staging,
-    })
+        web_en_attente,
+    };
+    // A stale failure marker from a previous attempt would be misleading — clear it.
+    let _ = std::fs::remove_file(&err_file);
+    if let Err(e) = std::fs::write(&bascule.bat, bat_content) {
+        bascule.abandonner();
+        return Err(format!("write update.bat: {e}"));
+    }
+    info!(bat = %bascule.bat.display(), "update_win_bat_written");
+
+    // #7750 — pas de lancement ici : voir `lancer_la_bascule_une_fois_libre`.
+    Ok(bascule)
 }
 
 /// Search a file for a byte pattern without loading it all into memory.
@@ -4049,6 +4164,28 @@ fn update_web_dir(exe_dir: &std::path::Path, tmp_dir: &std::path::Path) -> Resul
         return Ok(());
     }
 
+    let cibles = cibles_web(exe_dir);
+    let target_web = &cibles[0];
+
+    // Atomic swap: the old remove-then-copy left a BROKEN web/ (missing
+    // index.html → no UI at all) whenever the copy failed partway — e.g.
+    // stale root-owned files from a manual deploy (Bertrand, .15, v0.9.2
+    // update). Stage a FULL copy next to the target, then swap via two
+    // renames: at every instant the target is either the complete old web
+    // or the complete new one. Rollback restores the old on a failed swap.
+    swap_dir_atomic(&new_web, target_web)?;
+
+    for exe_web in &cibles[1..] {
+        swap_dir_atomic(&new_web, exe_web).ok();
+    }
+
+    info!(dir = %target_web.display(), "web_directory_updated");
+    Ok(())
+}
+
+/// Les dossiers `web/` à remplacer : d'abord celui que le serveur sert
+/// (CWD/web ou `TUNE_WEB_DIR`), puis exe_dir/web s'il est distinct (repli).
+fn cibles_web(exe_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let target_web = if let Ok(custom) = std::env::var("TUNE_WEB_DIR") {
         let p = std::path::PathBuf::from(&custom);
         if p.is_absolute() {
@@ -4063,22 +4200,53 @@ fn update_web_dir(exe_dir: &std::path::Path, tmp_dir: &std::path::Path) -> Resul
             .map(|d| d.join("web"))
             .unwrap_or_else(|_| exe_dir.join("web"))
     };
-
-    // Atomic swap: the old remove-then-copy left a BROKEN web/ (missing
-    // index.html → no UI at all) whenever the copy failed partway — e.g.
-    // stale root-owned files from a manual deploy (Bertrand, .15, v0.9.2
-    // update). Stage a FULL copy next to the target, then swap via two
-    // renames: at every instant the target is either the complete old web
-    // or the complete new one. Rollback restores the old on a failed swap.
-    swap_dir_atomic(&new_web, &target_web)?;
-
     let exe_web = exe_dir.join("web");
     if exe_web != target_web {
-        swap_dir_atomic(&new_web, &exe_web).ok();
+        vec![target_web, exe_web]
+    } else {
+        vec![target_web]
     }
+}
 
-    info!(dir = %target_web.display(), "web_directory_updated");
-    Ok(())
+/// Windows (#7750, #7754) : prépare la copie complète du nouveau `web/` à
+/// côté de chaque cible (`web.new`, même volume → le renommage final est
+/// atomique), SANS toucher au `web/` servi. Tant que le serveur tourne,
+/// Windows refuse de renommer ce dossier (« Accès refusé. (os error 5) ») :
+/// la bascule est faite par `tune-update.bat`, après la sortie du serveur.
+///
+/// Rend les cibles effectivement préparées, la première étant celle servie.
+/// Un échec sur la cible servie arrête la mise à jour ; sur le repli, il est
+/// ignoré, comme dans `update_web_dir`.
+fn preparer_le_web(
+    new_web: &std::path::Path,
+    cibles: &[std::path::PathBuf],
+) -> Result<Vec<std::path::PathBuf>, String> {
+    if !new_web.exists() {
+        info!("no web/ directory in archive, skipping web update");
+        return Ok(Vec::new());
+    }
+    let mut preparees = Vec::new();
+    for (i, cible) in cibles.iter().enumerate() {
+        let staged = cible.with_extension("new");
+        let copie = (|| {
+            if staged.exists() {
+                std::fs::remove_dir_all(&staged).map_err(|e| format!("clear staged web: {e}"))?;
+            }
+            copy_dir_all(new_web, &staged).map_err(|e| format!("stage new web/: {e}"))
+        })();
+        match copie {
+            Ok(()) => preparees.push(cible.clone()),
+            Err(e) if i == 0 => {
+                std::fs::remove_dir_all(&staged).ok();
+                return Err(e);
+            }
+            Err(e) => {
+                std::fs::remove_dir_all(&staged).ok();
+                warn!(dir = %cible.display(), error = %e, "update_win_web_fallback_not_staged");
+            }
+        }
+    }
+    Ok(preparees)
 }
 
 /// Replace `target` with a copy of `src` without ever leaving a partial
@@ -4366,7 +4534,12 @@ pub fn record_post_update_result(state: &AppState) {
             "last_update_result",
             &json!({
                 "status": "failed",
-                "reason": "binary_locked",
+                // #7754 — le script dit aussi quand c'est `web/` qui résistait.
+                "reason": if detail.contains("could not replace the web folder") {
+                    "web_locked"
+                } else {
+                    "binary_locked"
+                },
                 "detail": detail,
                 "current_version": current,
             })
@@ -6184,7 +6357,7 @@ mod homebrew_guard_tests {
 
 #[cfg(test)]
 mod windows_update_bat_tests {
-    use super::windows_update_bat;
+    use super::{DossierWebEnAttente, windows_update_bat};
 
     fn script() -> String {
         windows_update_bat(
@@ -6195,6 +6368,7 @@ mod windows_update_bat_tests {
             "tune-server.exe",
             "tune-server.new.exe",
             false,
+            &[],
         )
     }
 
@@ -6207,6 +6381,7 @@ mod windows_update_bat_tests {
             "tune-server.exe",
             "tune-server.new.exe",
             true,
+            &[],
         )
     }
 
@@ -6310,6 +6485,117 @@ mod windows_update_bat_tests {
              vivant (#7750) : {suite}"
         );
     }
+
+    const WEB: &str = r"C:\Users\t\AppData\Local\Programs\Tune Server\web";
+
+    fn script_avec_web() -> String {
+        windows_update_bat(
+            4242,
+            r"C:\Program Files\Tune\tune-server.exe",
+            r"C:\Program Files\Tune\tune-server.new.exe",
+            r"C:\Program Files\Tune\tune-update-failed.txt",
+            "tune-server.exe",
+            "tune-server.new.exe",
+            false,
+            &[DossierWebEnAttente::de(std::path::Path::new(WEB))],
+        )
+    }
+
+    /// #7750, #7754 — le `web/` servi bascule dans le script, donc APRÈS la
+    /// sortie du serveur (fin de l'attente du PID) et AVANT le binaire : en
+    /// marche, Windows refuse de le renommer (« Accès refusé. (os error 5) »).
+    #[test]
+    fn le_web_bascule_apres_la_sortie_du_serveur_avant_le_binaire_7750() {
+        let s = script_avec_web();
+        let sortie = s.find(":do_swap").expect("pas de bascule");
+        let parque = s
+            .find(&format!("move \"{WEB}\" \"{WEB}.old\""))
+            .unwrap_or_else(|| panic!("le script ne bascule pas web/ (#7754) : {s}"));
+        let place = s
+            .find(&format!("move \"{WEB}.new\" \"{WEB}\""))
+            .unwrap_or_else(|| panic!("le script ne met pas le web/ neuf en place : {s}"));
+        let binaire = s
+            .find("del \"C:\\Program Files\\Tune\\tune-server.exe\"")
+            .unwrap();
+        assert!(
+            sortie < parque && parque < place && place < binaire,
+            "web/ doit basculer après la sortie du serveur et avant le binaire : {s}"
+        );
+    }
+
+    /// #7754 — un `web/` qui résiste ne laisse pas un binaire neuf servir
+    /// l'ancienne interface : rien d'autre n'est touché, le rapport le dit,
+    /// et l'ancienne version repart.
+    #[test]
+    fn un_web_verrouille_ne_touche_pas_au_binaire_7754() {
+        let s = script_avec_web();
+        assert!(
+            s.contains(&format!("if exist \"{WEB}\" goto web_failed")),
+            "un web/ qui résiste ne mène pas à :web_failed : le binaire \
+             neuf servirait l'ancienne interface (#7754) : {s}"
+        );
+        let echec = s.find(":web_failed").expect("pas de branche d'échec web/");
+        let fin = echec + s[echec..].find(":swap_failed").unwrap();
+        let branche = &s[echec..fin];
+        assert!(!branche.contains("del "), "{branche}");
+        assert!(!branche.contains("rename "), "{branche}");
+        assert!(
+            branche.contains("could not replace the web folder"),
+            "{branche}"
+        );
+        assert!(branche.contains("tune-update-failed.txt"), "{branche}");
+        assert!(branche.contains("goto relaunch_old"), "{branche}");
+    }
+
+    /// #7754 — binaire verrouillé après la bascule de `web/` : l'ancien
+    /// `web/` est remis, pour que l'ancienne version relancée serve SON
+    /// interface.
+    #[test]
+    fn un_binaire_verrouille_remet_l_ancien_web_7754() {
+        let s = script_avec_web();
+        let echec = s.find(":swap_failed").unwrap();
+        let relance = s.find(":relaunch_old").unwrap();
+        let restaure = s[echec..]
+            .find(&format!("move \"{WEB}.old\" \"{WEB}\""))
+            .map(|i| echec + i)
+            .unwrap_or(usize::MAX);
+        assert!(restaure < relance, "ancien web/ non restauré : {s}");
+    }
+
+    /// Un `rmdir` resté partiel n'est jamais suivi d'un `move` vers le même
+    /// nom : `move` y rangerait le dossier dedans (`web.old\\web`), et
+    /// l'ancienne version relancée n'aurait plus d'interface.
+    #[test]
+    fn un_rmdir_partiel_n_emboite_pas_les_dossiers_7750() {
+        let s = script_avec_web();
+        let lignes: Vec<&str> = s.split("\r\n").collect();
+        for (n, ligne) in lignes.iter().enumerate() {
+            let Some(i) = ligne.find("rmdir /s /q ") else {
+                continue;
+            };
+            let dossier = &ligne[i + "rmdir /s /q ".len()..];
+            let suivante = lignes.get(n + 1).copied().unwrap_or("");
+            if lignes[n + 1..]
+                .iter()
+                .take_while(|l| !l.starts_with(':'))
+                .any(|l| l.contains(&format!(" {dossier}")) && l.contains("move "))
+            {
+                assert!(
+                    suivante.starts_with(&format!("if exist {dossier} ")),
+                    "après `{ligne}`, un `move` vers {dossier} suit sans \
+                     vérifier que le rmdir a abouti : {s}"
+                );
+            }
+        }
+    }
+
+    /// Sans `web/` dans l'archive, le script reste celui du seul binaire.
+    #[test]
+    fn sans_web_le_script_ne_touche_a_aucun_dossier() {
+        let s = script();
+        assert!(!s.contains("move "), "{s}");
+        assert!(!s.contains("rmdir "), "{s}");
+    }
 }
 
 /// #7750 — sous Windows, la mise à jour arrêtait le serveur sans l'installer
@@ -6318,7 +6604,7 @@ mod windows_update_bat_tests {
 /// fin de la lecture.
 #[cfg(test)]
 mod bascule_windows_7750_tests {
-    use super::{install_windows, lancer_la_bascule_une_fois_libre};
+    use super::{install_windows, lancer_la_bascule_une_fois_libre, preparer_la_bascule_windows};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tune_core::playback::{NowPlaying, PlaybackManager};
@@ -6416,6 +6702,64 @@ mod bascule_windows_7750_tests {
         assert!(
             !bascule.binaire_pose.exists(),
             "un lancement abandonné ne doit pas laisser le binaire posé"
+        );
+    }
+
+    /// L'étape fautive du fil 2617 (#7750, #7754) : à la préparation, le
+    /// serveur tourne et sert `web/` ; Windows refuse alors de le renommer
+    /// (« swap new web/ into place: Accès refusé. (os error 5) »). La
+    /// préparation ne doit donc RIEN renommer du `web/` servi : elle pose la
+    /// copie neuve à côté (`web.new`), que le script bascule après la sortie.
+    #[test]
+    fn le_web_servi_n_est_pas_remplace_a_la_preparation_7750() {
+        let dossier = tempfile::tempdir().unwrap();
+        let exe = dossier.path().join("tune-server.exe");
+        std::fs::write(&exe, b"ancienne").unwrap();
+        // Le web/ servi, avec un fichier « ouvert » par le serveur en marche.
+        let web = dossier.path().join("web");
+        std::fs::create_dir_all(web.join("assets")).unwrap();
+        std::fs::write(web.join("index.html"), b"interface ancienne").unwrap();
+        std::fs::write(web.join("assets/servi.js"), b"ouvert").unwrap();
+        let archive = dossier.path().join("extrait");
+        std::fs::create_dir_all(archive.join("web")).unwrap();
+        std::fs::write(archive.join("web/index.html"), b"interface neuve").unwrap();
+        let nouveau = archive.join("tune-server.exe");
+        std::fs::write(&nouveau, b"nouvelle").unwrap();
+
+        let bascule =
+            preparer_la_bascule_windows(&exe, &nouveau, &archive, std::slice::from_ref(&web))
+                .expect("la préparation doit réussir sans toucher au web/ servi");
+
+        assert!(
+            std::fs::read(web.join("index.html")).ok().as_deref()
+                == Some(&b"interface ancienne"[..])
+                && web.join("assets/servi.js").exists()
+                && !dossier.path().join("web.old").exists(),
+            "le dossier web/ servi a été renommé pendant la préparation, \
+             serveur encore en marche : sous Windows, « swap new web/ into \
+             place: Accès refusé. (os error 5) » et la mise à jour échoue \
+             (#7750, #7754)"
+        );
+        assert_eq!(
+            std::fs::read(dossier.path().join("web.new/index.html")).unwrap(),
+            b"interface neuve",
+            "la copie neuve de web/ doit attendre à côté, pour le script"
+        );
+        assert_eq!(bascule.web_en_attente, vec![web.clone()]);
+        let script = std::fs::read_to_string(&bascule.bat).unwrap();
+        assert!(
+            script.contains(&format!("move \"{}.new\"", web.display())),
+            "le script ne bascule pas web/ : {script}"
+        );
+
+        bascule.abandonner();
+        assert!(
+            !dossier.path().join("web.new").exists(),
+            "un lancement abandonné ne doit pas laisser le web/ posé"
+        );
+        assert_eq!(
+            std::fs::read(web.join("index.html")).unwrap(),
+            b"interface ancienne"
         );
     }
 }

@@ -204,6 +204,15 @@ pub fn empreinte(etages: &[(String, Value)]) -> String {
 /// d'un étage stéréo à 48 kHz, jetée aussitôt). La sémantique des champs
 /// appartient au greffon ; l'hôte ne la devine pas.
 pub fn valider_reglage(id: &str, reglage: &Value) -> Result<(), String> {
+    diagnostics_du_reglage(id, reglage).map(drop)
+}
+
+/// Ce que le greffon calcule pour ce réglage (`Processor::diagnostics`),
+/// sans rien jouer ni enregistrer : le même étage que [`valider_reglage`],
+/// préparé puis jeté. Un écran de réglage y lit une grandeur que seul le
+/// greffon sait calculer (un gain déduit, une courbe) ; l'hôte la relaie
+/// telle quelle, sans en connaître les champs.
+pub fn diagnostics_du_reglage(id: &str, reglage: &Value) -> Result<Value, String> {
     if !reglage.is_object() {
         return Err("settings must be a JSON object".into());
     }
@@ -212,7 +221,7 @@ pub fn valider_reglage(id: &str, reglage: &Value) -> Result<(), String> {
     }
     let fournisseur = fournisseur_dsp(id).ok_or("native plugin not loaded")?;
     tune_plugin_native::stage::Stage::prepare(fournisseur, 48_000, 2, reglage)
-        .map(drop)
+        .map(|etage| etage.info)
         .map_err(|e| format!("settings refused by the plugin: {e}"))
 }
 
@@ -258,6 +267,7 @@ mod tests {
         assert!(!actif(&s, "greffon-tiers"));
         assert!(etages_configures(&s, 1).is_empty());
         assert!(valider_reglage("greffon-tiers", &serde_json::json!({})).is_err());
+        assert!(diagnostics_du_reglage("greffon-tiers", &serde_json::json!({})).is_err());
     }
 
     /// #6256 — la désinstallation complète efface les réglages du greffon, et

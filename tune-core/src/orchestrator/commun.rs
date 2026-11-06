@@ -1018,13 +1018,25 @@ impl PlaybackOrchestrator {
                 .await;
         }
         if let Some(did) = device_id {
-            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+            // #7841 — comme le volume depuis #7633 : un renderer OpenHome reçoit
+            // sa sourdine sans le verrou de la sortie, que le sondeur tient
+            // pendant ses relevés SOAP.
+            let (output, envoi_direct) = {
+                let registre = self.outputs.lock().await;
+                (registre.get(did), registre.envoi_de_volume(did))
+            };
+            let output = output.ok_or_else(|| {
                 OutputCommandError::failed(
                     OutputCommand::SetMute,
                     format!("output {did} is not registered"),
                 )
             })?;
-            output.lock().await.checked_set_mute(muted).await?;
+            match envoi_direct {
+                Some(envoi) => envoi.set_mute(muted).await.map_err(|message| {
+                    OutputCommandError::failed(OutputCommand::SetMute, message)
+                })?,
+                None => output.lock().await.checked_set_mute(muted).await?,
+            }
         }
         let _tenue_air = if let Some(ref file) = file_air {
             Some(file.etat.lock().await)

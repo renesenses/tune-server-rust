@@ -151,6 +151,45 @@ impl Banc {
             .await;
     }
 
+    /// #6721 — un geste NON confirmé (curseur, pas) par le VRAI orchestrateur,
+    /// puis la grâce de volume écoulée.
+    pub(super) async fn consigne_gardee(&self, volume: f64) {
+        self.poller
+            .orchestrator
+            .set_volume(self.zone_id, volume, Some(APPAREIL))
+            .await
+            .unwrap();
+        self.poller
+            .playback
+            .ecouler_la_grace_de_volume(self.zone_id)
+            .await;
+    }
+
+    /// #8031 — la sourdine par le VRAI orchestrateur (`SetMute`, #6700).
+    pub(super) async fn sourdine(&self, muted: bool) {
+        self.poller
+            .orchestrator
+            .set_mute(self.zone_id, muted, Some(APPAREIL))
+            .await
+            .unwrap();
+    }
+
+    /// #8031 — la grâce qui suit un changement de sourdine, écoulée.
+    pub(super) async fn ecouler_la_grace_de_sourdine(&self) {
+        self.poller
+            .playback
+            .ecouler_la_grace_de_sourdine(self.zone_id)
+            .await;
+    }
+
+    /// #8031 — les évènements du gestionnaire de lecture (ce que les clients
+    /// reçoivent : `playback.volume`, `playback.muted`).
+    pub(super) fn evenements(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::playback::PlaybackEvent> {
+        self.poller.playback.subscribe()
+    }
+
     pub(super) async fn commandes_depuis(&self, deja: usize) -> Vec<f64> {
         self.avec_mock(async |m| m.volume_calls().await[deja..].to_vec())
             .await
@@ -182,6 +221,37 @@ impl Banc {
             m.set_position(position);
         })
         .await;
+        self.poller
+            .tick(&mut self.poll_states, &mut self.idle, &Instant::now())
+            .await;
+    }
+
+    /// #8031 — la zone joue une webradio (site d'adoption « radio »).
+    pub(super) async fn en_radio(&self) {
+        self.poller
+            .playback
+            .play(
+                self.zone_id,
+                NowPlaying {
+                    title: "FIP".into(),
+                    source: "radio".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+    }
+
+    /// #8031 — un tour sur une zone radio : l'étranglement du sondage radio
+    /// (`RADIO_POLL_INTERVAL_SECS`) est échu, l'appareil est relu.
+    pub(super) async fn tic_radio(&mut self) {
+        if let Some(ps) = self.poll_states.get_mut(&self.zone_id)
+            && let Some(avant) = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(RADIO_POLL_INTERVAL_SECS + 1))
+        {
+            ps.last_radio_poll = avant;
+        }
+        self.avec_mock(async |m| m.set_state(TransportState::Playing).await)
+            .await;
         self.poller
             .tick(&mut self.poll_states, &mut self.idle, &Instant::now())
             .await;
