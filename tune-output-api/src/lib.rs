@@ -2316,6 +2316,19 @@ pub trait OutputTarget: Send + Sync {
         false
     }
 
+    /// #7894 — la dernière `pause()` a trouvé l'appareil SANS média : il ne
+    /// jouait rien (renderer UPnP en `NO_MEDIA_PRESENT`), il n'y avait donc
+    /// rien à mettre en pause.
+    ///
+    /// La sortie rend alors `Ok(())` et répond `true` ici ; l'hôte arrête la
+    /// zone (piste et position gardées, reprise possible) et le dit, au lieu
+    /// d'annoncer une pause qui n'existe pas ou de rendre un échec de sortie.
+    ///
+    /// Rendu **une fois** : l'implémentation l'efface. Défaut `false`.
+    fn take_nothing_playing_on_pause(&self) -> bool {
+        false
+    }
+
     /// #5050 — la position que l'appareil DÉCLARE jouer, lue chez lui à
     /// l'instant de l'appel.
     ///
