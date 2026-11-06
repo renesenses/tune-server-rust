@@ -108,9 +108,57 @@ async fn playlists_d_un_compte_vide_arrivent_avant_le_delai_du_widget_7760() {
     assert!(playlists.is_empty(), "un compte vide rend une liste vide");
 }
 
-/// Deux tentatives bornées tiennent ensemble sous le délai du widget, avec
-/// de la marge pour le corps et la route.
-#[test]
-fn deux_tentatives_tiennent_sous_le_delai_du_widget_7760() {
-    assert!(DELAI_REPONSE_LECTURE * 2 < DELAI_DU_WIDGET - Duration::from_secs(1));
+/// Un Qobuz qui sert l'adresse de lecture d'une piste au bout de `attente`.
+async fn qobuz_lent_pour_la_lecture(attente: Duration) -> String {
+    let app = Router::new().route(
+        "/track/getFileUrl",
+        get(move || async move {
+            tokio::time::sleep(attente).await;
+            Json(json!({
+                "url": "https://flux.essai/piste.flac",
+                "mime_type": "audio/flac",
+                "sampling_rate": 96,
+                "bit_depth": 24,
+                "format_id": 27
+            }))
+        }),
+    );
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("port libre");
+    let adresse = ecoute.local_addr().expect("adresse locale");
+    tokio::spawn(async move {
+        let _ = axum::serve(ecoute, app).await;
+    });
+    format!("http://{adresse}")
+}
+
+/// La borne de #7760 ne vaut QUE pour les listes du compte : l'adresse de
+/// lecture d'une piste attend encore au-delà de 3 s. Bornée, une adresse
+/// principale lente ferait descendre l'échelle de qualité (27 → 7 → 6) ou
+/// échouer la lecture, alors que Qobuz allait répondre.
+#[tokio::test]
+async fn l_adresse_de_lecture_d_une_piste_n_est_pas_bornee_7760() {
+    let attente = DELAI_REPONSE_LISTE_DU_COMPTE + Duration::from_secs(1);
+    let bases = BasesQobuz {
+        api: qobuz_lent_pour_la_lecture(attente).await,
+        proxy: adresse_muette().await,
+        config_distante: adresse_muette().await,
+    };
+    let mut svc = QobuzService::avec_bases_de_test(
+        String::from("app-id-essai"),
+        String::from("secret-essai"),
+        bases,
+    );
+    svc.user_auth_token = Some(String::from("jeton-essai"));
+
+    let flux = svc.fetch_track_url("123", "27").await.unwrap_or_else(|e| {
+        panic!(
+            "#7760 : l'adresse de lecture d'une piste a été abandonnée alors que Qobuz \
+             répondait en {} ms — la borne des listes du compte ne doit pas la toucher : {e}",
+            attente.as_millis()
+        )
+    });
+    assert_eq!(flux.url, "https://flux.essai/piste.flac");
+    assert_eq!(flux.quality.bit_depth, 24, "la qualité demandée est servie");
 }

@@ -189,17 +189,25 @@ const TTL_ALBUM: Duration = Duration::from_secs(300);
 /// des centaines d'albums : ici on évince la plus ancienne.
 const MAX_ALBUMS_CACHE: usize = 32;
 
-/// Attente maximale de la réponse de Qobuz pour UNE tentative de lecture de
-/// l'API (connexion comprise), avant de passer à l'autre adresse — #7760.
+/// Attente maximale de la réponse de Qobuz pour UNE tentative de lecture
+/// d'une liste du COMPTE (connexion comprise), avant de passer à l'autre
+/// adresse — #7760.
 ///
 /// Le client garde sa limite de 45 s, mais elle valait par tentative : une
 /// adresse qui accepte la connexion sans jamais répondre retenait chaque
 /// lecture 45 s avant le repli, et les widgets de l'accueil abandonnent à
 /// 8 s (`DELAI_MS` du client web). Un compte SANS favoris tombait ainsi en
 /// « délai » au lieu d'afficher sa liste vide. Deux tentatives de 3 s tiennent
-/// nettement sous ces 8 s. Seules les lectures (`api_get_at`) sont bornées :
-/// la connexion et les écritures gardent leurs limites.
-const DELAI_REPONSE_LECTURE: Duration = Duration::from_secs(3);
+/// nettement sous ces 8 s.
+///
+/// Ne sont bornées QUE les deux lectures de ces widgets : les favoris
+/// (`lecture_des_favoris`, `/favorite/getUserFavorites`) et les playlists
+/// du compte (`get_user_playlists`, `/playlist/getUserPlaylists`). Tout le
+/// reste garde la limite du client : l'adresse de lecture des pistes
+/// (`/track/getFileUrl`, dont un échec ferait descendre l'échelle de
+/// qualité), la recherche, les fiches, l'éditorial, la connexion et les
+/// écritures.
+const DELAI_REPONSE_LISTE_DU_COMPTE: Duration = Duration::from_secs(3);
 
 /// (primary, fallback) API bases for the given endpoint order.
 ///
@@ -953,6 +961,20 @@ impl QobuzService {
             .map_err(|(_, message)| message)
     }
 
+    /// Comme [`Self::api_get`], mais chaque tentative attend sa réponse au
+    /// plus `borne` (`None` : la limite du client). Voir
+    /// [`DELAI_REPONSE_LISTE_DU_COMPTE`] pour les seuls appelants bornés.
+    async fn api_get_borne(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+        borne: Option<Duration>,
+    ) -> Result<serde_json::Value, String> {
+        self.api_get_avec_statut_borne(path, params, borne)
+            .await
+            .map_err(|(_, message)| message)
+    }
+
     /// Comme [`Self::api_get`], mais rend AUSSI le code HTTP du refus — le
     /// jumeau de [`Self::api_post_avec_statut`], pour la même raison : la
     /// logique de repli n'est écrite qu'une fois, et le code est lu sur
@@ -966,15 +988,28 @@ impl QobuzService {
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, (Option<u16>, String)> {
+        self.api_get_avec_statut_borne(path, params, None).await
+    }
+
+    /// [`Self::api_get_avec_statut`] avec une attente de réponse bornée par
+    /// tentative (`None` : la limite du client).
+    async fn api_get_avec_statut_borne(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+        borne: Option<Duration>,
+    ) -> Result<serde_json::Value, (Option<u16>, String)> {
         let (primary, fallback) = self.bases_api();
-        match self.api_get_at(primary, path, params).await {
+        match self.api_get_at(primary, path, params, borne).await {
             Ok(v) => Ok(v),
             Err(err) if err.transient() => {
                 log_fallback(self.proxy_first, path, &err);
-                self.api_get_at(fallback, path, params).await.map_err(|e| {
-                    info!(path, error = %e, "qobuz_fallback_api_error");
-                    (e.statut_http(), format!("qobuz {path}: {e}"))
-                })
+                self.api_get_at(fallback, path, params, borne)
+                    .await
+                    .map_err(|e| {
+                        info!(path, error = %e, "qobuz_fallback_api_error");
+                        (e.statut_http(), format!("qobuz {path}: {e}"))
+                    })
             }
             Err(err) => {
                 info!(path, error = %err, "qobuz_api_error");
@@ -983,12 +1018,14 @@ impl QobuzService {
         }
     }
 
-    /// One GET attempt against a specific API base.
+    /// One GET attempt against a specific API base. `borne` caps the wait for
+    /// the response headers (`None`: the client's own limit).
     async fn api_get_at(
         &self,
         base: &str,
         path: &str,
         params: &[(&str, &str)],
+        borne: Option<Duration>,
     ) -> Result<serde_json::Value, AttemptError> {
         let url = format!("{base}{path}");
         let app_id = self.app_id.as_str();
@@ -1005,23 +1042,22 @@ impl QobuzService {
             req = req.header("X-User-Auth-Token", token.as_str());
         }
 
-        // #7760 — l'attente de la RÉPONSE est bornée par tentative ; le corps,
-        // lui, garde la limite du client (une longue liste peut peser).
-        let resp = tokio::time::timeout(DELAI_REPONSE_LECTURE, req.send())
-            .await
-            .map_err(|_| {
+        // #7760 — pour les seules listes du compte, l'attente de la RÉPONSE
+        // est bornée par tentative ; le corps, lui, garde la limite du client
+        // (une longue liste peut peser).
+        let envoi = match borne {
+            None => req.send().await,
+            Some(borne) => tokio::time::timeout(borne, req.send()).await.map_err(|_| {
                 warn!(
                     base,
                     path,
-                    delai_ms = DELAI_REPONSE_LECTURE.as_millis() as u64,
-                    "qobuz_api_no_response_in_time_7760"
+                    delai_ms = borne.as_millis() as u64,
+                    "qobuz_api_no_response_in_time"
                 );
-                AttemptError::Network(format!(
-                    "no response within {} ms",
-                    DELAI_REPONSE_LECTURE.as_millis()
-                ))
-            })?
-            .map_err(|e| AttemptError::Network(e.to_string()))?;
+                AttemptError::Network(format!("no response within {} ms", borne.as_millis()))
+            })?,
+        };
+        let resp = envoi.map_err(|e| AttemptError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -1041,12 +1077,25 @@ impl QobuzService {
         offset: usize,
         limit: usize,
     ) -> Result<serde_json::Value, String> {
+        self.api_get_page_borne(path, base_params, offset, limit, None)
+            .await
+    }
+
+    /// [`Self::api_get_page`] avec une attente de réponse bornée (#7760).
+    async fn api_get_page_borne(
+        &self,
+        path: &str,
+        base_params: &[(&str, &str)],
+        offset: usize,
+        limit: usize,
+        borne: Option<Duration>,
+    ) -> Result<serde_json::Value, String> {
         let offset_str = offset.to_string();
         let limit_str = limit.to_string();
         let mut params: Vec<(&str, &str)> = base_params.to_vec();
         params.push(("limit", &limit_str));
         params.push(("offset", &offset_str));
-        self.api_get(path, &params).await
+        self.api_get_borne(path, &params, borne).await
     }
 
     /// Fetch all pages from a paginated Qobuz endpoint.
@@ -1347,11 +1396,23 @@ impl QobuzService {
         base_params: &[(&str, &str)],
         cle: &str,
     ) -> Result<serde_json::Value, String> {
+        self.detail_pagine_borne(path, base_params, cle, None).await
+    }
+
+    /// [`Self::detail_pagine`] dont chaque page attend sa réponse au plus
+    /// `borne` par tentative (#7760, voir [`DELAI_REPONSE_LISTE_DU_COMPTE`]).
+    async fn detail_pagine_borne(
+        &self,
+        path: &str,
+        base_params: &[(&str, &str)],
+        cle: &str,
+        borne: Option<Duration>,
+    ) -> Result<serde_json::Value, String> {
         use futures_util::StreamExt;
         const MAX_PAGES_CONCURRENTES: usize = 4;
 
         let mut data = self
-            .api_get_page(path, base_params, 0, TAILLE_PAGE_DETAIL)
+            .api_get_page_borne(path, base_params, 0, TAILLE_PAGE_DETAIL, borne)
             .await?;
         let compte = data[cle]["items"].as_array().map(Vec::len).unwrap_or(0);
         let total = data[cle]["total"].as_u64().unwrap_or(0) as usize;
@@ -1388,7 +1449,7 @@ impl QobuzService {
         let pages: Vec<Result<Vec<serde_json::Value>, String>> =
             futures_util::stream::iter(offsets.into_iter().map(|offset| async move {
                 let page = self
-                    .api_get_page(path, base_params, offset, TAILLE_PAGE_DETAIL)
+                    .api_get_page_borne(path, base_params, offset, TAILLE_PAGE_DETAIL, borne)
                     .await?;
                 Ok(page[cle]["items"].as_array().cloned().unwrap_or_default())
             }))
@@ -1439,12 +1500,28 @@ impl QobuzService {
         items_key: &str,
         plafond: usize,
     ) -> Result<ListePaginee, String> {
+        self.liste_paginee_borne(path, base_params, items_key, plafond, None)
+            .await
+    }
+
+    /// [`Self::liste_paginee`] dont chaque page attend sa réponse au plus
+    /// `borne` par tentative (#7760, voir [`DELAI_REPONSE_LISTE_DU_COMPTE`]).
+    async fn liste_paginee_borne(
+        &self,
+        path: &str,
+        base_params: &[(&str, &str)],
+        items_key: &str,
+        plafond: usize,
+        borne: Option<Duration>,
+    ) -> Result<ListePaginee, String> {
         use futures_util::StreamExt;
         const PAGE_SIZE: usize = 50;
         const MAX_CONCURRENT_PAGES: usize = 4;
 
         // First page: learn `total` and keep the first-page diagnostics.
-        let data = self.api_get_page(path, base_params, 0, PAGE_SIZE).await?;
+        let data = self
+            .api_get_page_borne(path, base_params, 0, PAGE_SIZE, borne)
+            .await?;
 
         let mut all_items: Vec<serde_json::Value> = data[items_key]["items"]
             .as_array()
@@ -1524,7 +1601,7 @@ impl QobuzService {
         let pages: Vec<Result<Vec<serde_json::Value>, String>> =
             futures_util::stream::iter(offsets.into_iter().map(|offset| async move {
                 let data = self
-                    .api_get_page(path, base_params, offset, PAGE_SIZE)
+                    .api_get_page_borne(path, base_params, offset, PAGE_SIZE, borne)
                     .await?;
                 let items = data[items_key]["items"]
                     .as_array()
@@ -1750,11 +1827,13 @@ impl QobuzService {
         };
         let reponse = vol
             .get_or_init(|| async {
-                self.liste_paginee(
+                // #7760 — liste du compte : réponse bornée par tentative.
+                self.liste_paginee_borne(
                     "/favorite/getUserFavorites",
                     &[("type", type_qobuz)],
                     type_qobuz,
                     usize::MAX,
+                    Some(DELAI_REPONSE_LISTE_DU_COMPTE),
                 )
                 .await
             })
@@ -3705,8 +3784,14 @@ impl StreamingService for QobuzService {
         // est plus rare qu'un coffret, mais il existe — un compte de longue
         // date dépasse le demi-millier de playlists — et la correction ne
         // coûte rien : sans page suivante, c'est exactement l'appel d'avant.
+        // #7760 — liste du compte : réponse bornée par tentative.
         let data = self
-            .detail_pagine("/playlist/getUserPlaylists", &[], "playlists")
+            .detail_pagine_borne(
+                "/playlist/getUserPlaylists",
+                &[],
+                "playlists",
+                Some(DELAI_REPONSE_LISTE_DU_COMPTE),
+            )
             .await?;
         Ok(Self::map_user_playlists(&data))
     }
