@@ -743,24 +743,53 @@ async fn service_artist(
     // Best-effort: persist a streaming editorial bio (e.g. Qobuz) into a
     // name-matched local artist that has none yet, so the library keeps it.
     // Fire-and-forget so the browse response is never delayed.
-    if let Ok(ref artist) = result {
-        if let Some(bio) = artist.bio.clone() {
-            if bio.len() > 50 {
-                let backend = state.backend.clone();
-                let name = artist.name.clone();
-                let svc_name = service.clone();
-                tokio::spawn(async move {
-                    let repo = tune_core::db::artist_repo::ArtistRepo::with_backend(backend);
-                    if let Ok(Some(local)) = repo.get_by_name(&name) {
-                        if let Some(id) = local.id {
-                            if local.bio.as_deref().unwrap_or("").is_empty() {
-                                let _ = repo.update_bio_full(id, &bio, &svc_name, None, "", "");
-                            }
-                        }
-                    }
-                });
+    //
+    // #8022 : la bio est rangée AVEC sa langue (celle que le service annonce,
+    // sinon celle du magasin du compte) et le lien vers la page du service.
+    // Elle était rangée sans langue, donc jamais servie depuis #7027 — et,
+    // tenant la place, elle empêchait la fiche locale d'en recevoir une
+    // autre. Langue inconnue : rien n'est rangé.
+    if let Ok(ref artist) = result
+        && artist.bio.as_deref().is_some_and(|b| b.len() > 50)
+    {
+        let backend = state.backend.clone();
+        let name = artist.name.clone();
+        let artist_id = artist.id.clone();
+        let svc_name = service.clone();
+        let arc = arc.clone();
+        tokio::spawn(async move {
+            let repo = tune_core::db::artist_repo::ArtistRepo::with_backend(backend);
+            let Ok(Some(local)) = repo.get_by_name(&name) else {
+                return;
+            };
+            let Some(id) = local.id else { return };
+            if !local.bio.as_deref().unwrap_or("").is_empty() {
+                return;
             }
-        }
+            let (texte, magasin) = {
+                let svc = arc.read().await;
+                (
+                    svc.bio_editoriale_artiste(&artist_id).await,
+                    svc.langue_du_magasin(),
+                )
+            };
+            let Ok(Some(texte)) = texte else { return };
+            let langue = texte
+                .langue
+                .as_deref()
+                .and_then(tune_core::streaming::editorial_bibliotheque::langue_de_base)
+                .or_else(|| {
+                    magasin
+                        .as_deref()
+                        .and_then(tune_core::streaming::editorial_bibliotheque::langue_de_base)
+                });
+            let Some(langue) = langue else {
+                tracing::debug!(id, "bio_de_service_sans_langue_non_rangee");
+                return;
+            };
+            let bio = tune_core::streaming::editorial_bibliotheque::borner(&texte.texte);
+            let _ = repo.update_bio_full(id, &bio, &svc_name, texte.url, "", &langue);
+        });
     }
 
     svc_response(result)

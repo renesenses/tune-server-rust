@@ -469,6 +469,15 @@ pub(super) async fn artist_bio(
         }
         _ => None,
     };
+    // #8022 : le site n'a rien dans la langue demandée — le texte Qobuz, pour
+    // un compte connecté et une correspondance sûre, avant tout repli.
+    let du_service = if site_dans_la_langue(reponse_du_site.as_ref(), lang) {
+        None
+    } else {
+        super::editorial_service::bio_d_artiste(&state, &artist)
+            .await
+            .map(|e| super::editorial_service::corps("artist", &artist.name, &e))
+    };
     let autre_langue = bio_stockee_dans_une_autre_langue(
         "artist",
         &artist.name,
@@ -476,11 +485,12 @@ pub(super) async fn artist_bio(
         prov.as_ref(),
         lang,
     );
-    match choisir_apres_le_site(
+    match choisir_apres_le_site_et_le_service(
         "artist",
         &artist.name,
         lang,
         reponse_du_site,
+        du_service,
         autre_langue,
         artist.bio.as_deref(),
         prov.as_ref(),
@@ -727,8 +737,48 @@ pub(super) fn choisir_apres_le_site(
     bio_stockee: Option<&str>,
     prov: Option<&Value>,
 ) -> Issue {
+    choisir_apres_le_site_et_le_service(
+        cle,
+        nom,
+        demandee,
+        site,
+        None,
+        autre_langue_stockee,
+        bio_stockee,
+        prov,
+    )
+}
+
+/// Le site a-t-il rendu une bio dans la langue demandée ? Sinon, le service
+/// de streaming connecté est interrogé (#8022).
+pub(super) fn site_dans_la_langue(site: Option<&Value>, demandee: &str) -> bool {
+    site.is_some_and(|out| a_une_bio(out) && reponse_dans_la_langue(out, demandee))
+}
+
+/// [`choisir_apres_le_site`], avec le texte éditorial d'un service de
+/// streaming connecté (#8022, `service`, déjà sous la forme d'un corps de
+/// réponse) inséré dans l'ordre : (a) site dans la langue ; (b) service dans
+/// la langue ; (c) bio stockée dans une autre langue connue ; (d) site dans
+/// une autre langue ; (e) service dans une autre langue ; (f) rien.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn choisir_apres_le_site_et_le_service(
+    cle: &str,
+    nom: &str,
+    demandee: &str,
+    site: Option<Value>,
+    service: Option<Value>,
+    autre_langue_stockee: Option<Value>,
+    bio_stockee: Option<&str>,
+    prov: Option<&Value>,
+) -> Issue {
     let site = site.filter(a_une_bio);
     if let Some(out) = &site
+        && reponse_dans_la_langue(out, demandee)
+    {
+        return Issue::DansLaLangue(out.clone());
+    }
+    let service = service.filter(a_une_bio);
+    if let Some(out) = &service
         && reponse_dans_la_langue(out, demandee)
     {
         return Issue::DansLaLangue(out.clone());
@@ -737,6 +787,11 @@ pub(super) fn choisir_apres_le_site(
         return Issue::Repli(corps);
     }
     if let Some(out) = site
+        && let Some(langue) = langue_annoncee(&out)
+    {
+        return Issue::Repli(avec_repli(out, demandee, &langue));
+    }
+    if let Some(out) = service
         && let Some(langue) = langue_annoncee(&out)
     {
         return Issue::Repli(avec_repli(out, demandee, &langue));
